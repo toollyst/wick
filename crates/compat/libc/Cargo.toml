@@ -1,0 +1,47 @@
+# Compatibility build of libc for wick (docs/ARCHITECTURE.md).
+# On Linux it re-exports the original crate unchanged. On macOS it adds the
+# Linux-only items Firecracker uses, with the same names and signatures.
+[package]
+workspace = "../../../lib/firecracker"
+name = "libc"
+version = "0.2.189"
+authors = ["toollyst contributors"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "libc 0.2.189 plus macOS and Windows stand-ins for the Linux-only items Firecracker uses."
+
+[lib]
+bench = false
+doctest = false
+
+[features]
+default = ["std"]
+std = ["upstream/std"]
+use_std = ["upstream/use_std"]
+align = ["upstream/align"]
+const-extern-fn = ["upstream/const-extern-fn"]
+extra_traits = ["upstream/extra_traits"]
+
+[dependencies]
+# Same source as the crates.io 0.2.189 release (src/ and build.rs identical, checked 2026-11-09).
+upstream = { package = "libc", git = "https://github.com/rust-lang/libc", tag = "0.2.189", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Wdk_System_SystemServices",
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Console",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
