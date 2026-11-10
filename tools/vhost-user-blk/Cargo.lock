@@ -463,6 +463,7 @@ dependencies = [
  "thiserror 1.0.69",
  "userfaultfd 0.9.0 (git+https://github.com/bytecodealliance/userfaultfd-rs?tag=v0.9.0)",
  "wick-os",
+ "windows-sys",
 ]
 
 [[package]]
