@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 12:34:23 +0900
+Subject: [PATCH] snapshot: memory files keep holes on every host
+
+Why: Linux file systems keep unwritten ranges of a snapshot memory file as
+holes. APFS and NTFS fill or round them, which breaks diff snapshots and
+wastes space.
+
+What: snapshot memory is written through `platform::fs`'s hole-keeping
+writer, which restores holes the host file system filled.
+
+Test: full and diff snapshots, `snapshot-editor rebase`, and a restore in
+another process.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vmm/src/vstate/vm.rs | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/vmm/src/vstate/vm.rs b/src/vmm/src/vstate/vm.rs
+index 4c61c83d3782114459a072f3e4c578e1152ccf7e..1a534ba1fd48b34aa91814cf946873268c28a5cb 100644
+--- a/src/vmm/src/vstate/vm.rs
++++ b/src/vmm/src/vstate/vm.rs
+@@ -665,21 +665,30 @@ impl KvmVm {
+             }
+         }
+ 
++        // wick: what the file grows by stays a hole, as on Linux; see `platform::fs`.
++        crate::platform::fs::keep_holes(&file).map_err(|e| MemoryBackingFile("keep_holes", e))?;
+         // Set the length of the file to the full size of the memory area.
+         file.set_len(expected_size)
+             .map_err(|e| MemoryBackingFile("set_length", e))?;
+ 
++        // wick: pages that are not written keep what they had (holes stay holes) on every
++        // host; see `platform::fs`.
++        let mut writer = crate::platform::fs::SparseWriter::new(&mut file)
++            .map_err(|e| MemoryBackingFile("map_holes", e))?;
+         match snapshot_type {
+             SnapshotType::Diff => {
+                 let dirty_bitmap = self.get_dirty_bitmap()?;
+-                self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
++                self.guest_memory().dump_dirty(&mut writer, &dirty_bitmap)?;
+             }
+             SnapshotType::Full => {
+-                self.guest_memory().dump(&mut file)?;
++                self.guest_memory().dump(&mut writer)?;
+                 self.reset_dirty_bitmap();
+                 self.guest_memory().reset_dirty();
+             }
+         };
++        writer
++            .finish()
++            .map_err(|e| MemoryBackingFile("restore_holes", e))?;
+ 
+         file.flush()
+             .map_err(|err| MemoryBackingFile("flush", err))?;
