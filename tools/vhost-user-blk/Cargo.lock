@@ -531,7 +531,7 @@ dependencies = [
  "libc 0.2.189",
  "log",
  "vhost 0.17.0",
- "vhost-user-backend 0.23.0 (git+https://github.com/rust-vmm/vhost?tag=vhost-v0.17.0)",
+ "vhost-user-backend 0.23.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "virtio-bindings",
  "virtio-queue",
  "vm-memory 0.18.0",
@@ -542,12 +542,13 @@ dependencies = [
 [[package]]
 name = "vhost-user-backend"
 version = "0.23.0"
-source = "git+https://github.com/rust-vmm/vhost?tag=vhost-v0.17.0#4cc2d89ce4897fd90c4bbaf920a5f89a4420547c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "555753b65bc33837bd011f981e2c6d52d8ddc330d92c2deb9aa3f0b378a58bcc"
 dependencies = [
  "libc 0.2.189",
  "log",
  "userfaultfd 0.9.0",
- "vhost 0.17.0 (git+https://github.com/rust-vmm/vhost?tag=vhost-v0.17.0)",
+ "vhost 0.17.0",
  "virtio-bindings",
  "virtio-queue",
  "vm-memory 0.18.0",

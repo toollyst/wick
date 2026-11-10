@@ -35,12 +35,6 @@ deny = [
 ]
 skip = [
     { crate = "bitflags@1.3.2", reason = "vmm-sys-util 0.15 uses bitflags 1, as in upstream's Cargo.lock" },
-    # The original userfaultfd (Linux; compat/vhost-user-backend's upstream can
-    # use it) and its bindgen build: the same pairs as upstream's Cargo.lock.
-    { crate = "shlex@1.3.0", reason = "upstream v1.18.0's Cargo.lock has shlex 1 and 2" },
-    { crate = "syn@2.0.119", reason = "upstream v1.18.0's Cargo.lock has syn 2 and 3" },
-    { crate = "thiserror@1.0.69", reason = "upstream v1.18.0's Cargo.lock has thiserror 1 and 2" },
-    { crate = "thiserror-impl@1.0.69", reason = "upstream v1.18.0's Cargo.lock has thiserror 1 and 2" },
 ]
 
 [sources]
@@ -50,7 +44,6 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     # The compatibility crates' originals, the commits lib/firecracker's
     # Cargo.lock uses (tools/linux/check-dependency-sources.py).
-    "https://github.com/bytecodealliance/userfaultfd-rs",
     "https://github.com/rust-lang/libc",
     "https://github.com/rust-vmm/vhost",
     "https://github.com/rust-vmm/vm-memory",

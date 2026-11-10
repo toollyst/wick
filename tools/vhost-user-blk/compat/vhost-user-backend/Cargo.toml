@@ -21,9 +21,9 @@ postcopy = ["upstream/postcopy"]
 xen = ["upstream/xen"]
 
 [target.'cfg(not(windows))'.dependencies]
-# The commit of vhost-user-backend-v0.23.0 (the crates.io release), under the
-# vhost-v0.17.0 tag that crates/compat/vhost uses, so both share one vhost.
-upstream = { package = "vhost-user-backend", git = "https://github.com/rust-vmm/vhost", tag = "vhost-v0.17.0" }
+# The crates.io release itself: its vhost is the patched crates/compat/vhost,
+# so the backend has one vhost.
+upstream = { package = "vhost-user-backend", version = "=0.23.0" }
 
 [target.'cfg(windows)'.dependencies]
 wick-os = { path = "../../../../crates/compat/os" }
