@@ -13,3 +13,4 @@
 0011-vmm-memory-in-whole-host-pages-16-KiB-on-Apple-silic.patch
 0012-tests-upstream-unit-tests-on-non-Linux-hosts.patch
 0013-examples-seccomp-and-uffd-examples-build-on-every-ho.patch
+0014-build-Cargo.lock-for-wick-s-dependencies.patch
