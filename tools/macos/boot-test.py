@@ -960,6 +960,12 @@ def main():
     for name, ok, detail in results:
         print(f"{'PASS' if ok else 'FAIL'}  {name}: {detail.splitlines()[0]}")
     failed = sum(not ok for _, ok, _ in results)
+    if not failed:
+        # Snapshots and disk images take hundreds of MiB a run; kept only
+        # when a stage failed, to look into.
+        for name in os.listdir(args.out):
+            if name.endswith((".mem", ".state", ".img")):
+                os.unlink(os.path.join(args.out, name))
     print(f"\n{len(results) - failed} passed, {failed} failed; logs in {args.out}")
     sys.exit(1 if failed else 0)
 
