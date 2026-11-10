@@ -1,0 +1,25 @@
+# The standard library with the Unix extension modules on Windows, for wick
+# (docs/ARCHITECTURE.md). Upstream crates that build
+# on Windows declare `#[cfg(windows)] extern crate wick_std as std;` at their
+# root, so their `std::os::unix` and `std::os::fd` paths resolve to wick's
+# implementation (wick-os) and the rest of `std` is the real one.
+[package]
+workspace = "../../../lib/firecracker"
+name = "wick-std"
+version = "0.1.0"
+authors = ["toollyst contributors"]
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "std with std::os::{unix, fd} from wick-os on Windows."
+
+[lib]
+name = "wick_std"
+bench = false
+doctest = false
+
+[target.'cfg(windows)'.dependencies]
+wick-os = { path = "../os" }
+
+[lints]
+workspace = true
