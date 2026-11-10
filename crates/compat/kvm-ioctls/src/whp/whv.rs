@@ -165,6 +165,20 @@ pub(crate) unsafe fn WHvEmulatorCreateEmulator(
     }
 }
 
+/// `WHvEmulatorDestroyEmulator` from `winhvemulation.dll`, loaded at first use.
+///
+/// # Safety
+/// As the Windows function.
+pub(crate) unsafe fn WHvEmulatorDestroyEmulator(emulator: *mut core::ffi::c_void) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut core::ffi::c_void) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Emulation, c"WHvEmulatorDestroyEmulator")) {
+        // SAFETY: the address of `WHvEmulatorDestroyEmulator`, whose signature `F` is.
+        Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(emulator) },
+        None => unavailable(Dll::Emulation),
+    }
+}
+
 /// `WHvEmulatorTryIoEmulation` from `winhvemulation.dll`, loaded at first use.
 ///
 /// # Safety
