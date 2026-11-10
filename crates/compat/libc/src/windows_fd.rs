@@ -1215,6 +1215,9 @@ pub type rlim_t = u64;
 pub const RLIM_INFINITY: rlim_t = u64::MAX;
 /// `getrlimit` resource: open descriptors (Linux value).
 pub const RLIMIT_NOFILE: c_int = 7;
+/// `getrlimit` resource: the size of files written (Linux value). Windows has
+/// no such limit: `getrlimit` reports `RLIM_INFINITY`.
+pub const RLIMIT_FSIZE: c_int = 1;
 
 /// `struct rlimit`.
 #[repr(C)]
