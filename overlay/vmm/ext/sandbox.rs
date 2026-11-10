@@ -52,8 +52,8 @@ pub enum SandboxError {
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    FILES_ANYWHERE, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, PROFILE, SYSCALLS, apply, denied_syscall,
-    files_in_jail, profile, select,
+    FILES_ANYWHERE, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MIG_ROUTINES, PROFILE, SYSCALLS, apply,
+    denied_syscall, files_in_jail, profile, select,
 };
 
 /// Whether a SIGSYS is the host sandbox denying a system call (upstream's
@@ -106,12 +106,14 @@ mod macos {
 (allow signal (target self))
 (allow process-info* (target self))
 (allow sysctl-read)
-; System calls: only those in SYSCALLS, and Mach traps: only those in
-; MACH_TRAPS. Any other one fails and raises SIGSYS, on which Firecracker exits
-; as for a seccomp violation (upstream's filters trap, and its SIGSYS handler
-; exits with the bad-syscall code).
+; System calls: only those in SYSCALLS, Mach traps: only those in MACH_TRAPS,
+; kernel MIG routines: only those in MIG_ROUTINES. Any other one fails and
+; raises SIGSYS, on which Firecracker exits as for a seccomp violation
+; (upstream's filters trap, and its SIGSYS handler exits with the bad-syscall
+; code).
 (deny syscall-unix (with send-signal SIGSYS))
 (deny syscall-mach (with send-signal SIGSYS))
+(deny syscall-mig (with send-signal SIGSYS))
 "#;
 
     /// The system calls the sandbox allows (`SYS_<name>`, <sys/syscall.h>):
@@ -173,6 +175,30 @@ mod macos {
         "host_create_mach_voucher_trap", "mach_reply_port", "task_self_trap", "thread_self_trap",
     ];
 
+    /// The kernel's MIG routines the sandbox allows: the services of kernel
+    /// objects a Mach message (`mach_msg2_trap`) reaches, by the kernel's
+    /// names for them. Those a Firecracker process calls once sandboxed,
+    /// measured over `tools/macos/boot-test.sh` (the sandbox reporting each
+    /// one): the clock `nanosleep` waits on, semaphores, mapping and
+    /// inspecting its own memory, and its own task's special ports; plus the
+    /// ones of the same kind Apple's hardened services allow (the clock
+    /// service `nanosleep` looks up once, memory entries, copying and
+    /// reallocating its own memory, its own task's and port's information,
+    /// restartable ranges, vouchers), so that a path the tests do not take is
+    /// not killed for them. Not in it: setting special or exception ports,
+    /// other tasks' threads or state, host special ports, XPC connections.
+    pub const MIG_ROUTINES: &[&str] = &[
+        // Measured.
+        "clock_get_time", "semaphore_create", "semaphore_destroy", "mach_vm_map_external",
+        "mach_vm_remap_external", "mach_vm_region", "task_get_special_port_from_user",
+        // Of the same kind, allowed by Apple's hardened services.
+        "host_get_clock_service", "_mach_make_memory_entry", "mach_memory_entry_ownership",
+        "mach_vm_copy", "mach_vm_reallocate", "vm_reallocate", "host_info", "task_info_from_user",
+        "mach_port_set_attributes", "mach_port_request_notification",
+        "mach_port_get_context_from_user", "task_restartable_ranges_register",
+        "mach_voucher_attr_command",
+    ];
+
     /// Mach traps of [`MACH_TRAPS`]' kind that only newer macOS releases have
     /// (allowed where Seatbelt knows them). Measured: libmalloc's deferred
     /// reclamation.
@@ -220,7 +246,7 @@ mod macos {
         rule
     }
 
-    /// The allow rules for [`SYSCALLS`] and [`MACH_TRAPS`].
+    /// The allow rules for [`SYSCALLS`], [`MACH_TRAPS`] and [`MIG_ROUTINES`].
     fn syscall_rule() -> String {
         let mut rule = String::from("(allow syscall-unix (syscall-number");
         for name in SYSCALLS {
@@ -228,7 +254,14 @@ mod macos {
             rule.push_str(name);
         }
         rule.push_str("))\n");
-        rule + &mach_trap_rule()
+        rule.push_str(&mach_trap_rule());
+        rule.push_str("(allow syscall-mig (kernel-mig-routine");
+        for name in MIG_ROUTINES {
+            rule.push(' ');
+            rule.push_str(name);
+        }
+        rule.push_str("))\n");
+        rule
     }
 
     /// Set once the sandbox is installed, for [`denied_syscall`].
@@ -359,7 +392,7 @@ mod macos {
         #[test]
         fn test_unlisted_syscalls_raise_sigsys() {
             use std::os::unix::process::ExitStatusExt;
-            for name in ["exec_child", "unlisted_child", "unlisted_trap_child"] {
+            for name in ["exec_child", "unlisted_child", "unlisted_trap_child", "unlisted_mig_child"] {
                 let out = child(name, &[]);
                 assert_eq!(
                     out.status.signal(),
@@ -458,6 +491,47 @@ mod macos {
             unsafe { pid_for_task(task, &mut pid) };
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
+        }
+
+        #[test]
+        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        fn unlisted_mig_child() {
+            unsafe extern "C" {
+                static mach_task_self_: libc::mach_port_t;
+                // <mach/task.h>: a MIG routine of the task, not in MIG_ROUTINES.
+                fn task_threads(
+                    task: libc::mach_port_t,
+                    threads: *mut *mut libc::mach_port_t,
+                    count: *mut libc::c_uint,
+                ) -> libc::c_int;
+            }
+            // SAFETY: set by libSystem before main, never written after.
+            let task = unsafe { mach_task_self_ };
+            select(Policy::Default);
+            apply().unwrap();
+            let (mut threads, mut count) = (std::ptr::null_mut(), 0);
+            // SAFETY: valid output pointers.
+            unsafe { task_threads(task, &mut threads, &mut count) };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        #[test]
+        fn test_mig_routine_names_are_known() {
+            let mut names = MIG_ROUTINES.to_vec();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), MIG_ROUTINES.len());
+            for needed in ["clock_get_time", "mach_vm_map_external", "semaphore_create"] {
+                assert!(MIG_ROUTINES.contains(&needed), "{needed}");
+            }
+            for denied in [
+                "task_threads", "task_set_special_port", "task_set_exception_ports",
+                "thread_set_exception_ports", "host_get_special_port", "thread_get_state",
+                "thread_set_state", "mach_port_is_connection_for_service",
+            ] {
+                assert!(!MIG_ROUTINES.contains(&denied), "{denied}");
+            }
         }
 
         #[test]
