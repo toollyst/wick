@@ -31,7 +31,9 @@ entitlement: use `tools/macos/run.sh` to run Firecracker and
 `tools/macos/test.sh` for tests. `tools/macos/boot-test.sh` runs scenario
 tests against upstream's aarch64 CI guest (boot, SMP, block, vsock,
 networking, snapshots, userfaultfd, PCI, vhost-user); run it before sending a
-change to the macOS backends. Windows builds cross-compile from macOS or
+change to the macOS backends. `tools/macos/jailer-test.sh` (it asks for sudo)
+starts Firecracker through the jailer and checks the jail from outside; run it
+before a change to the jailer's macOS backend or the Seatbelt profile. Windows builds cross-compile from macOS or
 Linux with mingw-w64:
 `AWS_LC_SYS_NO_ASM=1 cargo build -p firecracker --target x86_64-pc-windows-gnu`.
 Natively on Windows (MSVC), `cargo build -p firecracker` runs in a Visual

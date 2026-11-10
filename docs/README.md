@@ -69,6 +69,7 @@ cd ../..
 
 tools/macos/test.sh                     # upstream's vmm unit tests with Hypervisor.framework (macOS)
 tools/macos/boot-test.sh                # scenario tests in a real guest (macOS), before any change to a macOS backend
+sudo -v && tools/macos/jailer-test.sh   # the jailer's scenario tests (macOS, as root)
 tools/patches.sh export                 # after committing a change on branch `wick` in lib/firecracker
 tools/patches.sh check                  # what CI checks about patches/
 ```
@@ -81,6 +82,7 @@ tools/patches.sh check                  # what CI checks about patches/
 | [`tools/macos/run.sh`](../tools/macos/run.sh) | Builds, signs with the Hypervisor.framework entitlement and runs `firecracker` |
 | [`tools/macos/test.sh`](../tools/macos/test.sh) | Runs unit tests with the entitlement (through [`sign-and-run.sh`](../tools/macos/sign-and-run.sh) as the cargo runner) |
 | [`tools/macos/boot-test.sh`](../tools/macos/boot-test.sh) | Scenario tests against upstream's aarch64 CI guest: boot, SMP, block, vsock, net, vmnet, snapshots, diff, uffd, PCI, vhost-user |
+| [`tools/macos/jailer-test.sh`](../tools/macos/jailer-test.sh) | The jailer's scenario tests, as root: refused options, uid/gid and chroot, files outside the jail, daemonize, jetsam limit, a jailed guest booted, snapshot, restored and killed past its memory limit |
 | [`tools/windows/boot-test.ps1`](../tools/windows/boot-test.ps1) | Scenario tests against upstream's x86_64 CI guest on WHP: boot, SMP, block, vsock, net ([steps](../tools/windows/README.md)) |
 | [`tools/windows/winprobe.c`](../tools/windows/winprobe.c) | Measures the Windows mechanisms the sandbox and jailer backends use |
 | [`tools/gen-windows-sources.sh`](../tools/gen-windows-sources.sh) | Generates the Windows builds of the rust-vmm crates (`--check` in CI) |

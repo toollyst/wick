@@ -157,6 +157,32 @@ example. In the guest, give `eth0` another address on that network:
 
 Older macOS releases need root for vmnet.framework; a Unix datagram endpoint never does.
 
+## 6. Run it jailed (macOS)
+
+In production Firecracker runs under the
+[jailer](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md), with the same command line
+on macOS as on Linux. It needs root, chroots into `<chroot-base-dir>/firecracker/<id>/root` and drops to
+`--uid`/`--gid`; paths in the configuration are then inside the jail:
+
+```sh
+(cd lib/firecracker && cargo build --locked --release -p jailer)
+JAIL=/private/var/wick/firecracker/vm1/root
+sudo mkdir -p $JAIL && sudo cp -c ~/wick-vm/vmlinux-6.1.188 ~/wick-vm/ubuntu-24.04.squashfs $JAIL/
+sed "s|$HOME/wick-vm/|/|" ~/wick-vm/vm.json | sudo tee $JAIL/vm.json >/dev/null
+sudo chown -R 4271:4271 $JAIL
+sudo lib/firecracker/build/cargo_target/release/jailer --id vm1 \
+  --exec-file lib/firecracker/build/cargo_target/release/firecracker \
+  --uid 4271 --gid 4271 --chroot-base-dir /private/var/wick \
+  --cgroup memory.limit_in_bytes=1073741824 \
+  -- --api-sock /run/firecracker.socket --config-file /vm.json
+```
+
+The API socket is then `$JAIL/run/firecracker.socket`. On macOS `--cgroup` takes the memory limit
+(`memory.limit_in_bytes`, or `memory.max` with `--cgroup-version 2`): the VMM is killed when it uses more, guest
+memory included. The jailer refuses what macOS cannot enforce: `--netns`, `--new-pid-ns` and other cgroup
+controllers. Networking inside a jail is a Unix datagram endpoint in the jail, since the sandbox denies IP
+networking and vmnet needs root. [SECURITY.md](../SECURITY.md) has how each control is held.
+
 ## Windows (preview)
 
 wick on Windows uses the Windows Hypervisor Platform and x86_64 guests. Turn the feature on first (in
