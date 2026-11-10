@@ -32,6 +32,9 @@
 //!   asked for: a pipe's room for writing cannot be queried, so
 //!   [`EventSet::OUT`] fails with `ERROR_NOT_SUPPORTED`.
 //!
+//! - another [`Epoll`] (a nested epoll): readable while it has something to
+//!   report; a forwarder thread waits on its completion port (see `Nest`).
+//!
 //! Like Linux, regular files cannot be registered (`EPERM`).
 //! [`EventSet::ONE_SHOT`] is supported.
 //!
@@ -108,6 +111,122 @@ enum Kind {
     Pipe {
         event: RawFd,
     },
+    /// Another [`Epoll`]; `wake` is its [`Nest`]'s event.
+    Epoll {
+        wake: RawFd,
+    },
+}
+
+/// What lets an [`Epoll`] be registered in another one (a nested epoll, as
+/// the vsock muxer registers its own in the event loop's).
+///
+/// A completion port is not a waitable object: a wait packet on one ends the
+/// process with `STATUS_THREADPOOL_HANDLE_EXCEPTION`. So once an instance is
+/// nested, a forwarder thread waits on its port in its place, keeps the
+/// packets for the instance's next [`Epoll::wait`], and sets `wake`, the
+/// manual-reset event the outer instance watches. The instance is readable
+/// while `wake` is set; its [`Epoll::wait`] resets it, then waits on it in
+/// place of the port. The forwarder waits for that before it waits on the
+/// port again: a level-triggered source still ready posts again, without
+/// spinning while nobody takes the packets.
+#[derive(Debug)]
+struct Nest {
+    poller: Arc<Poller>,
+    wake: OwnedHandle,
+    /// Set (auto-reset) when the packets were taken.
+    taken: OwnedHandle,
+    pending: Mutex<Vec<Fired>>,
+    active: AtomicBool,
+    stop: AtomicBool,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+fn new_event(manual: bool) -> io::Result<OwnedHandle> {
+    // SAFETY: creates an unnamed event, not signalled.
+    let ev = unsafe { CreateEventW(std::ptr::null(), i32::from(manual), 0, std::ptr::null()) };
+    if ev.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the event was just created and is owned here.
+    Ok(unsafe { OwnedHandle::from_raw_handle(ev as RawHandle) })
+}
+
+/// The instances that may be nested, by descriptor (their port's handle).
+fn nests() -> &'static Mutex<HashMap<RawFd, std::sync::Weak<Nest>>> {
+    static NESTS: std::sync::OnceLock<Mutex<HashMap<RawFd, std::sync::Weak<Nest>>>> =
+        std::sync::OnceLock::new();
+    NESTS.get_or_init(Mutex::default)
+}
+
+impl Nest {
+    fn new(poller: Arc<Poller>) -> io::Result<Arc<Self>> {
+        Ok(Arc::new(Nest {
+            poller,
+            wake: new_event(true)?,
+            taken: new_event(false)?,
+            pending: Mutex::default(),
+            active: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            thread: Mutex::default(),
+        }))
+    }
+
+    fn wake_fd(&self) -> RawFd {
+        from_handle(self.wake.as_raw_handle())
+    }
+
+    /// Starts the forwarder, once.
+    fn start(self: &Arc<Self>) -> io::Result<()> {
+        let mut thread = self.thread.lock().unwrap();
+        if thread.is_some() {
+            return Ok(());
+        }
+        let nest = self.clone();
+        *thread = Some(
+            std::thread::Builder::new()
+                .name("wick-epoll-nest".into())
+                .spawn(move || nest.forward())?,
+        );
+        self.active.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn forward(&self) {
+        let mut events = Events::new();
+        while !self.stop.load(Ordering::Acquire) {
+            events.clear();
+            if self.poller.wait(&mut events, None).is_err() {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            if events.is_empty() {
+                // A notification (`Drop`), or the instance's own wait has
+                // the port for a moment.
+                continue;
+            }
+            {
+                let mut pending = self.pending.lock().unwrap();
+                pending.extend(events.iter().map(|ev| Fired::from(&ev)));
+                // SAFETY: the event outlives the thread.
+                unsafe { SetEvent(self.wake.as_raw_handle()) };
+            }
+            // SAFETY: as above; woken by `take` or `Drop`.
+            unsafe { WaitForSingleObject(self.taken.as_raw_handle(), u32::MAX) };
+        }
+    }
+
+    /// The packets kept so far; the instance is not readable for them again.
+    fn take(&self) -> Vec<Fired> {
+        let fired = {
+            let mut pending = self.pending.lock().unwrap();
+            // SAFETY: the events are open while `self` is.
+            unsafe { ResetEvent(self.wake.as_raw_handle()) };
+            std::mem::take(&mut *pending)
+        };
+        // SAFETY: as above.
+        unsafe { SetEvent(self.taken.as_raw_handle()) };
+        fired
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -317,6 +436,13 @@ fn kind_of(fd: RawFd) -> io::Result<Kind> {
     if is_socket(fd) {
         return Ok(Kind::Socket);
     }
+    let nest = nests().lock().unwrap().get(&fd).and_then(std::sync::Weak::upgrade);
+    if let Some(nest) = nest {
+        nest.start()?;
+        return Ok(Kind::Epoll {
+            wake: nest.wake_fd(),
+        });
+    }
     let h = handle(fd);
     // SAFETY: queries a handle value; an invalid one gives FILE_TYPE_UNKNOWN.
     match unsafe { GetFileType(h) } {
@@ -414,20 +540,29 @@ impl From<&Event> for Fired {
 /// An epoll instance backed by an I/O completion port.
 #[derive(Debug)]
 pub struct Epoll {
-    poller: Poller,
+    poller: Arc<Poller>,
     interests: Mutex<HashMap<RawFd, Interest>>,
     /// Locked after `interests`.
     links: Mutex<HashMap<RawFd, Links>>,
+    nest: Arc<Nest>,
 }
 
 impl Epoll {
     /// Creates a new instance.
     pub fn new() -> io::Result<Self> {
-        Ok(Epoll {
-            poller: Poller::new()?,
+        let poller = Arc::new(Poller::new()?);
+        let nest = Nest::new(poller.clone())?;
+        let epoll = Epoll {
+            poller,
             interests: Mutex::default(),
             links: Mutex::default(),
-        })
+            nest,
+        };
+        nests()
+            .lock()
+            .unwrap()
+            .insert(epoll.as_raw_fd(), Arc::downgrade(&epoll.nest));
+        Ok(epoll)
     }
 
     fn mode(events: EventSet) -> PollMode {
@@ -472,10 +607,10 @@ impl Epoll {
                     self.poller
                         .add_waitable(handle(fd) as RawHandle, readable, mode)
                 }
-                Kind::Pipe { event } => {
+                Kind::Pipe { event: ev } | Kind::Epoll { wake: ev } => {
                     let readable = Event::new(key(fd, SUB_MAIN), read, false);
                     self.poller
-                        .add_waitable(handle(event) as RawHandle, readable, mode)
+                        .add_waitable(handle(ev) as RawHandle, readable, mode)
                 }
             }
         }
@@ -494,7 +629,9 @@ impl Epoll {
                 self.poller.remove_waitable(waitable(space)).and(r)
             }
             Kind::Console | Kind::Waitable => self.poller.remove_waitable(waitable(fd)),
-            Kind::Pipe { event } => self.poller.remove_waitable(waitable(event)),
+            Kind::Pipe { event: ev } | Kind::Epoll { wake: ev } => {
+                self.poller.remove_waitable(waitable(ev))
+            }
         }
     }
 
@@ -513,6 +650,10 @@ impl Epoll {
                         return Err(os_error(ERROR_FILE_NOT_FOUND));
                     }
                     _ => {}
+                }
+                if fd == self.as_raw_fd() {
+                    // An instance in itself, as on Linux.
+                    return Err(einval());
                 }
                 let kind = match old {
                     Some(old) => old.kind,
@@ -638,12 +779,28 @@ impl Epoll {
         loop {
             self.rearm()?;
             // What is ready already, without waiting for its packet.
-            let ready = self.sweep();
+            let nested = self.nest.active.load(Ordering::Acquire);
+            let mut ready = if nested { self.nest.take() } else { Vec::new() };
+            ready.extend(self.sweep());
             if !ready.is_empty() {
                 let count = self.collect(&ready, events)?;
                 if count > 0 {
                     return Ok(count);
                 }
+            }
+            if nested {
+                // The forwarder has the port (see `Nest`).
+                let left = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+                let ms = left.map_or(u32::MAX, |l| {
+                    u32::try_from(l.as_millis()).unwrap_or(u32::MAX - 1)
+                });
+                // SAFETY: the event is open while `self` is.
+                let woken =
+                    unsafe { WaitForSingleObject(self.nest.wake.as_raw_handle(), ms) } == WAIT_OBJECT_0;
+                if !woken {
+                    return Ok(0);
+                }
+                continue;
             }
             fired.clear();
             let left = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
@@ -722,6 +879,12 @@ impl Epoll {
                         out.push(fired(SUB_MAIN, true, false, false));
                     }
                 }
+                // A manual-reset event: checked directly.
+                Kind::Epoll { wake } => {
+                    if want_in && signalled(wake) {
+                        out.push(fired(SUB_MAIN, true, false, false));
+                    }
+                }
             }
         }
         out
@@ -741,7 +904,11 @@ impl Epoll {
             }
             // An eventfd's packet only wakes the wait: its state now is in
             // the sweep that follows (the packet may predate a read).
-            if ev.packet && matches!(interest.kind, Kind::EventFd { .. }) && !interest.edge() {
+            // The same for a nested instance, whose wait resets its event.
+            if ev.packet
+                && matches!(interest.kind, Kind::EventFd { .. } | Kind::Epoll { .. })
+                && !interest.edge()
+            {
                 continue;
             }
             let mut bits = EventSet::empty();
@@ -835,6 +1002,20 @@ fn waitable(fd: RawFd) -> std::os::windows::io::BorrowedHandle<'static> {
 impl AsRawFd for Epoll {
     fn as_raw_fd(&self) -> RawFd {
         from_handle(self.poller.as_raw_handle())
+    }
+}
+
+impl Drop for Epoll {
+    fn drop(&mut self) {
+        nests().lock().unwrap().remove(&self.as_raw_fd());
+        let thread = self.nest.thread.lock().unwrap().take();
+        if let Some(thread) = thread {
+            self.nest.stop.store(true, Ordering::Release);
+            let _ = self.poller.notify();
+            // SAFETY: the event is open while `self` is.
+            unsafe { SetEvent(self.nest.taken.as_raw_handle()) };
+            let _ = thread.join();
+        }
     }
 }
 
@@ -1253,5 +1434,52 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(ERROR_NOT_SUPPORTED as i32));
         close_handle(r);
         close_handle(w);
+    }
+    #[test]
+    fn test_nested_epoll() {
+        let outer = Epoll::new().unwrap();
+        let inner = Epoll::new().unwrap();
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        inner
+            .ctl(ControlOperation::Add, evt.as_raw_fd(), EpollEvent::new(EventSet::IN, 5))
+            .unwrap();
+        outer
+            .ctl(ControlOperation::Add, inner.as_raw_fd(), EpollEvent::new(EventSet::IN, 1))
+            .unwrap();
+        assert!(wait_now(&outer).is_empty(), "nothing ready inside");
+        let writer = {
+            let evt = evt.try_clone().unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                evt.write(1).unwrap();
+            })
+        };
+        let mut events = [EpollEvent::default(); 4];
+        assert_eq!(outer.wait(2000, &mut events).unwrap(), 1, "woken by the inner source");
+        assert_eq!(events[0].data(), 1);
+        assert_eq!(events[0].event_set(), EventSet::IN);
+        writer.join().unwrap();
+        // Level-triggered: still ready while the inner source is.
+        assert_eq!(wait_now(&outer), vec![(1, EventSet::IN)]);
+        assert_eq!(wait_now(&inner), vec![(5, EventSet::IN)]);
+        evt.read().unwrap();
+        assert!(wait_now(&inner).is_empty());
+        assert!(wait_now(&outer).is_empty(), "the inner source was read");
+        // A source added after the nesting wakes the outer one too.
+        let late = EventFd::new(EFD_NONBLOCK).unwrap();
+        inner
+            .ctl(ControlOperation::Add, late.as_raw_fd(), EpollEvent::new(EventSet::IN, 6))
+            .unwrap();
+        late.write(1).unwrap();
+        assert_eq!(outer.wait(2000, &mut events).unwrap(), 1);
+        outer
+            .ctl(ControlOperation::Delete, inner.as_raw_fd(), EpollEvent::default())
+            .unwrap();
+        assert!(wait_now(&outer).is_empty());
+        assert_eq!(wait_now(&inner), vec![(6, EventSet::IN)]);
+        // The instances go before the eventfds they watch (a handle closed
+        // while registered is undefined behaviour for the thread pool wait).
+        drop(outer);
+        drop(inner);
     }
 }
