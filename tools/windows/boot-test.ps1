@@ -16,6 +16,13 @@
 #   net    virtio-net over the Windows endpoint (Unix stream, 32-bit
 #          big-endian length before each frame): a switch here answers ARP,
 #          ICMP echo and UDP echo and checks every checksum the guest sends
+#   snapshot  full snapshot of a 2 vCPU guest (data drive, vsock) restored in
+#          a new process: shell state, clock, drives, vsock
+#   diff   diff snapshot with dirty page tracking (holes kept), merged by
+#          snapshot-editor and restored
+#   pci    the snapshot stage over virtio-pci with MSI-X (--enable-pci)
+#   vhost-user  a vhost-user-blk drive served by tools/vhost-user-blk in
+#          another process: read md5, a write reaches the image
 #
 # Before each reset the guest kernel log must be free of stalls, BUGs, oopses
 # and warnings.
@@ -68,7 +75,6 @@ $BootArgs = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i804
 # (docs/ROADMAP.md, "Platform status"); listed in the summary, not run.
 $NotImplemented = @(
     @('uffd', 'the Uffd memory backend'),
-    @('vhost-user', 'vhost-user devices'),
     @('hugepages', 'huge pages (large pages)'),
     @('jailer', 'the jailer (AppContainer, Job Objects)')
 )
@@ -1316,12 +1322,18 @@ function Stage-Net {
     return "Unix stream endpoint: ARP, ICMP (1400 B, 200 back to back), UDP echo, checksums valid ($($switch.Counts))"
 }
 
+# A helper binary: next to firecracker.exe or this script, else where the
+# build (and CI's artifact) puts it.
 function Find-Tool([string]$exe) {
-    $c = Join-Path (Split-Path -Parent $Fc) $exe
-    if (Test-Path $c) { return $c }
-    $c = Join-Path $PSScriptRoot $exe
-    if (Test-Path $c) { return $c }
-    Fail "$exe not found next to $Fc or this script"
+    $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $candidates = @(
+        (Join-Path (Split-Path -Parent $Fc) $exe),
+        (Join-Path $PSScriptRoot $exe),
+        (Join-Path $root "lib\firecracker\build\cargo_target\release\$exe"),
+        (Join-Path $root "lib\firecracker\build\vhost-user-blk\release\$exe")
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+    Fail "$exe not found (looked in: $($candidates -join ', '))"
 }
 
 # A guest service on vsock port 52 that echoes, and the host waiting for it.
@@ -1424,6 +1436,47 @@ function Stage-Diff {
     return "Diff snapshot ($([math]::Round($allocated / 1MB)) MiB allocated of 256), snapshot-editor rebase, restore"
 }
 
+# A vhost-user-blk drive served by tools/vhost-user-blk in another process:
+# guest memory and eventfds cross the process boundary.
+function Stage-VhostUser {
+    $vub = Find-Tool 'vhost-user-blk.exe'
+    $dir = Join-Path $Scratch 'vhost-user'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $img = Join-Path $dir 'vub.img'
+    [Wick.Util]::WriteRandom($img, 8MB)
+    $want = [Wick.Util]::Md5File($img, -1)
+    $sock = Join-Path $SockDir 'vub'
+    if (Test-Path $sock) { [IO.File]::Delete($sock) }
+    $log = Join-Path (Join-Path $Results 'vhost-user') 'backend.txt'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
+    $backend = New-Object Wick.Vm($vub, "`"$sock`" `"$img`"", $log)
+    $script:Vms += $backend
+    $until = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not (Test-Path $sock)) {
+        if ($backend.Exited -or [DateTime]::UtcNow -gt $until) { Fail "vhost-user backend did not start ($($backend.ExitReason()))" }
+        Start-Sleep -Milliseconds 20
+    }
+    $cfg = Base-Config 2
+    $cfg['drives'] += [ordered]@{ drive_id = 'vub'; socket = $sock; is_root_device = $false }
+    $vm = Start-Vm 'vhost-user' $cfg
+    Wait-Shell $vm
+    $out = $vm.Sh('md5sum /dev/vdb')
+    Check ((Get-Fields $out)[0] -eq $want) "guest md5 over vhost-user '$out', host $want"
+    $vm.Sh('echo vhost-user-$((6*7)) | dd of=/dev/vdb bs=512 seek=8 conv=fsync,notrunc 2>/dev/null') | Out-Null
+    Save-Dmesg $vm 'vhost-user'
+    $vm.Reboot()
+    $backend.Kill()
+    $fs = [IO.File]::Open($img, 'Open', 'Read', 'ReadWrite')
+    try {
+        $fs.Position = 4096
+        $b = New-Object byte[] 14
+        [void]$fs.Read($b, 0, 14)
+    } finally { $fs.Dispose() }
+    $got = [Text.Encoding]::ASCII.GetString($b)
+    Check ($got -eq "vhost-user-42`n") "the guest's write is not in the backend's image: '$got'"
+    return 'vhost-user-blk backend in another process: read md5, write reaches the image'
+}
+
 $Stages = [ordered]@{
     boot     = { Stage-Boot }
     smp      = { Stage-Smp }
@@ -1433,6 +1486,7 @@ $Stages = [ordered]@{
     snapshot = { Stage-Snapshot }
     diff     = { Stage-Diff }
     pci      = { Stage-Snapshot -Pci }
+    'vhost-user' = { Stage-VhostUser }
 }
 
 # --- run ------------------------------------------------------------------------

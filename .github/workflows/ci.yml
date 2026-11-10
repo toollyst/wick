@@ -298,6 +298,12 @@ jobs:
       - name: Build snapshot-editor
         working-directory: lib/firecracker
         run: cargo build -p snapshot-editor --release
+      # The boot test's vhost-user stage serves a drive with it.
+      - name: Build the vhost-user-blk test backend
+        working-directory: tools/vhost-user-blk
+        env:
+          CARGO_TARGET_DIR: ../../lib/firecracker/build/vhost-user-blk
+        run: cargo build --release --locked
       # The host capability probe (tools/windows/winprobe.c), built with the
       # same MSVC toolchain the binary uses.
       - name: Build winprobe
@@ -314,6 +320,7 @@ jobs:
           path: |
             lib/firecracker/build/cargo_target/release/firecracker.exe
             lib/firecracker/build/cargo_target/release/snapshot-editor.exe
+            lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe
             winprobe.exe
             tools/windows/boot-test.ps1
             tools/windows/README.md
