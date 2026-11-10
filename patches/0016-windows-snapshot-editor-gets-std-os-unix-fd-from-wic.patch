@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qmfflwj <qmfflwj@gmail.com>
+Date: Tue, 10 Nov 2026 23:20:17 +0900
+Subject: [PATCH] windows: snapshot-editor gets std::os::{unix, fd} from
+ wick-std
+
+snapshot-editor's memory rebase uses std::os::fd, as the crates the
+windows patch gives wick-std do; its root now declares it too, so the
+tool builds on Windows (the Windows boot test merges diff snapshots
+with it).
+---
+ Cargo.lock                      | 1 +
+ src/snapshot-editor/Cargo.toml  | 4 ++++
+ src/snapshot-editor/src/main.rs | 4 ++++
+ 3 files changed, 9 insertions(+)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index a6dc5a393c079170d316ca70ad2ba3c0d3d63c5b..3a14850c5a6147d595359122c3554d1576201e39 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1609,6 +1609,7 @@ dependencies = [
+  "utils",
+  "vmm",
+  "vmm-sys-util 0.15.0",
++ "wick-std",
+  "wick-version",
+ ]
+ 
+diff --git a/src/snapshot-editor/Cargo.toml b/src/snapshot-editor/Cargo.toml
+index 657d579e1f41fd10c6249e1c4ab04eb3bd3e42fe..a1224a952ec913782ba91476d34270fec0961fe7 100644
+--- a/src/snapshot-editor/Cargo.toml
++++ b/src/snapshot-editor/Cargo.toml
+@@ -26,6 +26,10 @@ vmm-sys-util = "0.15.0"
+ # wick: wick's release version, <upstream>[+wick.<N>] (crates/version).
+ wick-version = { path = "../../../../crates/version" }
+ 
++# wick: std::os::{unix, fd} on Windows (`extern crate wick_std as std` at the root).
++[target.'cfg(windows)'.dependencies]
++wick-std = { path = "../../../../crates/compat/std" }
++
+ [target.'cfg(target_arch = "aarch64")'.dependencies]
+ clap-num = "1.2.0"
+ 
+diff --git a/src/snapshot-editor/src/main.rs b/src/snapshot-editor/src/main.rs
+index f2dc39bf3ab8b3bbdd29515f8f51d038ebc40ead..92a713ec5bed3e66d0ef388094cdf7f4df18d36e 100644
+--- a/src/snapshot-editor/src/main.rs
++++ b/src/snapshot-editor/src/main.rs
+@@ -1,6 +1,10 @@
+ // Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++// wick: std::os::{unix, fd} on Windows from wick's POSIX layer.
++#[cfg(windows)]
++extern crate wick_std as std;
++
+ use clap::{Parser, Subcommand};
+ 
+ mod edit_memory;
