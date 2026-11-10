@@ -100,12 +100,12 @@ fn hv_get(hv: hv_vcpu_t, reg: CpuReg) -> Result<u64> {
 /// Writes a register of `hv`, which belongs to the calling thread.
 fn hv_set(hv: hv_vcpu_t, reg: CpuReg, v: u64) -> Result<()> {
     // SAFETY: `hv` belongs to the calling thread.
-    check(unsafe {
+    check(super::interrupting(|| unsafe {
         match reg {
             CpuReg::Redist(o) => hv_gic_set_redistributor_reg(hv, o, v),
             CpuReg::Icc(r) => hv_gic_set_icc_reg(hv, r, v),
         }
-    })
+    }))
 }
 
 /// The per-vCPU GIC state kept for other threads.
@@ -277,7 +277,7 @@ pub(crate) fn dist_set(offset: u64, value: u32) -> Result<()> {
         u64::from(value)
     };
     // SAFETY: plain call.
-    check(unsafe { hv_gic_set_distributor_reg(reg, v) })
+    check(super::interrupting(|| unsafe { hv_gic_set_distributor_reg(reg, v) }))
 }
 
 /// The Hypervisor.framework register and the bit position of `offset`'s
@@ -312,7 +312,7 @@ pub(crate) fn reroute_spis(affinity: u64) -> Result<()> {
         check(unsafe { hv_gic_get_distributor_reg(reg, &mut route) })?;
         if route & IRM != 0 || packed_affinity(route) == affinity {
             // SAFETY: plain call.
-            check(unsafe { hv_gic_set_distributor_reg(reg, route) })?;
+            check(super::interrupting(|| unsafe { hv_gic_set_distributor_reg(reg, route) }))?;
         }
     }
     Ok(())

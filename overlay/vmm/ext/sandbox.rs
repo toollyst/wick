@@ -52,7 +52,8 @@ pub enum SandboxError {
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    FILES_ANYWHERE, PROFILE, SYSCALLS, apply, denied_syscall, files_in_jail, profile, select,
+    FILES_ANYWHERE, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, PROFILE, SYSCALLS, apply, denied_syscall,
+    files_in_jail, profile, select,
 };
 
 /// Whether a SIGSYS is the host sandbox denying a system call (upstream's
@@ -105,10 +106,12 @@ mod macos {
 (allow signal (target self))
 (allow process-info* (target self))
 (allow sysctl-read)
-; System calls: only those in SYSCALLS. Any other one fails and raises SIGSYS,
-; on which Firecracker exits as for a seccomp violation (upstream's filters
-; trap, and its SIGSYS handler exits with the bad-syscall code).
+; System calls: only those in SYSCALLS, and Mach traps: only those in
+; MACH_TRAPS. Any other one fails and raises SIGSYS, on which Firecracker exits
+; as for a seccomp violation (upstream's filters trap, and its SIGSYS handler
+; exits with the bad-syscall code).
 (deny syscall-unix (with send-signal SIGSYS))
+(deny syscall-mach (with send-signal SIGSYS))
 "#;
 
     /// The system calls the sandbox allows (`SYS_<name>`, <sys/syscall.h>):
@@ -143,6 +146,38 @@ mod macos {
         "ulock_wait", "ulock_wake", "abort_with_payload", "os_fault_with_payload", "ulock_wait2",
     ];
 
+    /// The Mach traps the sandbox allows (`MSC_<name>`, XNU's
+    /// osfmk/kern/syscall_sw.c), the other way into the kernel on macOS. Those
+    /// a Firecracker process makes once sandboxed, measured over
+    /// `tools/macos/boot-test.sh` (the sandbox reporting each one): memory and
+    /// port rights of its own task, semaphores, `mach_msg2_trap` (Mach
+    /// messages, also to libdispatch and Hypervisor.framework) and the special
+    /// reply port; plus the ones of the same kind Apple's own hardened services
+    /// allow (allocating memory, port guards and types, the task, thread and
+    /// host self ports, the timebase, thread switching, vouchers), so that a
+    /// path the tests do not take is not killed for them. Not in it: anything
+    /// reaching another task (`task_for_pid`, `pid_for_task`,
+    /// `task_name_for_pid`), IOKit, swap control, debugging.
+    pub const MACH_TRAPS: &[&str] = &[
+        // Measured.
+        "_kernelrpc_mach_vm_deallocate_trap", "_kernelrpc_mach_vm_protect_trap",
+        "_kernelrpc_mach_vm_map_trap", "_kernelrpc_mach_port_deallocate_trap",
+        "_kernelrpc_mach_port_mod_refs_trap", "_kernelrpc_mach_port_construct_trap",
+        "_kernelrpc_mach_port_destruct_trap", "semaphore_signal_trap", "semaphore_wait_trap",
+        "semaphore_timedwait_trap", "mach_msg2_trap", "thread_get_special_reply_port",
+        // Of the same kind, allowed by Apple's hardened services.
+        "_kernelrpc_mach_vm_allocate_trap", "_kernelrpc_mach_port_guard_trap",
+        "_kernelrpc_mach_port_type_trap", "_kernelrpc_mach_port_insert_right_trap",
+        "_kernelrpc_mach_port_request_notification_trap", "host_self_trap",
+        "mach_timebase_info_trap", "syscall_thread_switch", "mach_generate_activity_id",
+        "host_create_mach_voucher_trap", "mach_reply_port", "task_self_trap", "thread_self_trap",
+    ];
+
+    /// Mach traps of [`MACH_TRAPS`]' kind that only newer macOS releases have
+    /// (allowed where Seatbelt knows them). Measured: libmalloc's deferred
+    /// reclamation.
+    pub const MACH_TRAPS_IF_DEFINED: &[&str] = &["mach_vm_reclaim_update_kernel_accounting_trap"];
+
     /// File rule without the jailer: guest kernels, disks, snapshots, logs,
     /// metrics and the API socket are chosen by the operator, also after
     /// start-up (hot-plug, snapshots), as on Linux without the jailer.
@@ -170,6 +205,22 @@ mod macos {
         Ok(format!("{PROFILE}{}{files}", syscall_rule()))
     }
 
+    fn mach_trap_rule() -> String {
+        let mut rule = String::from("(allow syscall-mach (machtrap-number");
+        for name in MACH_TRAPS {
+            rule.push_str(" MSC_");
+            rule.push_str(name);
+        }
+        rule.push_str("))\n");
+        for name in MACH_TRAPS_IF_DEFINED {
+            rule.push_str(&format!(
+                "(when (defined? 'MSC_{name}) (allow syscall-mach (machtrap-number MSC_{name})))\n"
+            ));
+        }
+        rule
+    }
+
+    /// The allow rules for [`SYSCALLS`] and [`MACH_TRAPS`].
     fn syscall_rule() -> String {
         let mut rule = String::from("(allow syscall-unix (syscall-number");
         for name in SYSCALLS {
@@ -177,7 +228,7 @@ mod macos {
             rule.push_str(name);
         }
         rule.push_str("))\n");
-        rule
+        rule + &mach_trap_rule()
     }
 
     /// Set once the sandbox is installed, for [`denied_syscall`].
@@ -308,7 +359,7 @@ mod macos {
         #[test]
         fn test_unlisted_syscalls_raise_sigsys() {
             use std::os::unix::process::ExitStatusExt;
-            for name in ["exec_child", "unlisted_child"] {
+            for name in ["exec_child", "unlisted_child", "unlisted_trap_child"] {
                 let out = child(name, &[]);
                 assert_eq!(
                     out.status.signal(),
@@ -388,6 +439,44 @@ mod macos {
             unsafe { libc::getppid() };
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
+        }
+
+        #[test]
+        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        fn unlisted_trap_child() {
+            unsafe extern "C" {
+                // <mach/mach_init.h>: the task's own port, what mach_task_self() reads.
+                static mach_task_self_: libc::mach_port_t;
+                fn pid_for_task(task: libc::mach_port_t, pid: *mut libc::c_int) -> libc::c_int;
+            }
+            // SAFETY: set by libSystem before main, never written after.
+            let task = unsafe { mach_task_self_ };
+            select(Policy::Default);
+            apply().unwrap();
+            let mut pid = 0;
+            // SAFETY: valid output pointer; the trap is not in MACH_TRAPS.
+            unsafe { pid_for_task(task, &mut pid) };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        #[test]
+        fn test_mach_trap_names_are_known() {
+            let mut names = MACH_TRAPS.to_vec();
+            names.extend(MACH_TRAPS_IF_DEFINED);
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), MACH_TRAPS.len() + MACH_TRAPS_IF_DEFINED.len());
+            for needed in ["mach_msg2_trap", "_kernelrpc_mach_vm_map_trap", "semaphore_wait_trap"] {
+                assert!(MACH_TRAPS.contains(&needed), "{needed}");
+            }
+            for denied in [
+                "task_for_pid", "pid_for_task", "task_name_for_pid", "iokit_user_client_trap",
+                "macx_swapon", "macx_swapoff", "macx_triggers", "debug_control_port_for_pid",
+                "mach_msg_overwrite_trap",
+            ] {
+                assert!(!names.contains(&denied), "{denied}");
+            }
         }
 
         #[test]
