@@ -685,7 +685,10 @@ mod tests {
         let mut s = std::string::String::new();
         f.read_to_string(&mut s).unwrap();
         assert_eq!(s, "wick");
-        // No name left in the temporary directory once created.
+        // Nothing is left in the temporary directory once the last handle
+        // is closed (the name may stay until then on file systems without
+        // POSIX delete semantics).
+        drop(f);
         let pid = std::format!("wick-memfd-{}-", std::process::id());
         let left = std::fs::read_dir(std::env::temp_dir())
             .unwrap()

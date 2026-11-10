@@ -1115,6 +1115,15 @@ pub unsafe fn msync(addr: *mut c_void, len: size_t, flags: c_int) -> c_int {
 mod tests {
     use super::*;
 
+    /// The tests below place mappings at addresses they freed a moment
+    /// before, and check that freed ranges are no longer mapped: another
+    /// test mapping memory in parallel could take those addresses, so
+    /// they run one at a time.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn map(addr: usize, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> usize {
         // SAFETY: test mappings, unmapped by the tests.
         let p = unsafe { mmap(addr as *mut c_void, len, prot, flags, fd, off) };
@@ -1126,6 +1135,7 @@ mod tests {
 
     #[test]
     fn test_firecracker_guest_memory_pattern() {
+        let _serial = serial();
         // Reserve with PROT_NONE, trim head and tail, map the middle fixed.
         let len = 4 << 20;
         let p = map(0, len + (2 << 20), PROT_NONE, ANON | MAP_NORESERVE, -1, 0);
@@ -1186,6 +1196,7 @@ mod tests {
 
     #[test]
     fn test_hotplug_slot_pattern() {
+        let _serial = serial();
         // vstate/memory.rs: a slot is mapped PROT_NONE over part of the
         // guest memory, then plugged with mprotect and unplugged again.
         let len = 4 << 20;
@@ -1226,6 +1237,7 @@ mod tests {
 
     #[test]
     fn test_placeholder_becomes_memory_on_mprotect() {
+        let _serial = serial();
         let p = map(0, 1 << 20, PROT_NONE, ANON, -1, 0);
         // SAFETY: our mapping.
         unsafe {
@@ -1240,6 +1252,7 @@ mod tests {
 
     #[test]
     fn test_shared_anonymous_and_file() {
+        let _serial = serial();
         use std::io::Write;
         use std::os::windows::io::AsRawHandle;
         let path = std::env::temp_dir().join(std::format!("wick-mm-{}", std::process::id()));
@@ -1367,6 +1380,7 @@ mod tests {
 
     #[test]
     fn test_hugetlb_refused() {
+        let _serial = serial();
         // SAFETY: fails.
         let p = unsafe {
             mmap(
