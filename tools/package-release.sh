@@ -14,6 +14,13 @@
 #       release-T-darwin-aarch64/LICENSE, NOTICE
 #   <out>/wick-T-darwin-aarch64.tgz.sha256.txt
 #       "<hex>  wick-T-darwin-aarch64.tgz"  (checked with `shasum -a 256 -c`)
+#   <out>/wick-T-darwin-aarch64.cdx.json
+#       the SBOM: CycloneDX 1.5, every crate the binary is built from on
+#       aarch64-apple-darwin, as Cargo.lock pins it (cargo-cyclonedx, the
+#       version in tools/common.sh)
+#
+# The build is `cargo build --locked` with upstream's toolchain
+# (lib/firecracker/rust-toolchain.toml).
 #
 # The binary needs macOS 15 or later on Apple silicon (hv_gic_*). The signature
 # is ad hoc; a copy downloaded by a browser gets a quarantine attribute that has
@@ -35,6 +42,11 @@ out="${2:-dist}"
 version="$(wick_version)"
 [[ "$tag" == "v$version" ]] \
     || die "tag $tag is not v$version (patches/base $(upstream_base), patches/version $(wick_number))"
+command -v cargo-cyclonedx >/dev/null \
+    || die "cargo-cyclonedx not found: cargo install --locked cargo-cyclonedx --version $CARGO_CYCLONEDX_VERSION"
+cyclonedx="$(cargo-cyclonedx cyclonedx --version)"
+[[ "$cyclonedx" == *" $CARGO_CYCLONEDX_VERSION" ]] \
+    || die "need cargo-cyclonedx $CARGO_CYCLONEDX_VERSION, found '$cyclonedx'"
 
 name="wick-$tag-darwin-aarch64"
 bin_name="firecracker-$tag-darwin-aarch64"
@@ -55,8 +67,9 @@ reported="${reported%%$'\n'*}"
 
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
+fc="$ROOT/lib/firecracker"
 stage="$(mktemp -d)"
-trap 'rm -rf "$stage"' EXIT
+trap 'rm -rf "$stage"; rm -f "$fc"/src/*/*_bin.cdx.json' EXIT
 mkdir "$stage/$dir"
 cp "$bin" "$stage/$dir/$bin_name"
 cp "$ROOT/LICENSE" "$ROOT/NOTICE" "$stage/$dir/"
@@ -69,5 +82,19 @@ codesign --verify --strict "$stage/$dir/$bin_name" || die "signature broken by c
 (cd "$out" && shasum -a 256 "$name.tgz" >"$name.tgz.sha256.txt" \
     && shasum -a 256 -c "$name.tgz.sha256.txt" >/dev/null)
 
+# The SBOM, from Cargo.lock. cargo-cyclonedx writes one file per binary next
+# to each package's manifest and has no --locked: the lockfile must come out
+# unchanged. The timestamp is the commit's (SOURCE_DATE_EPOCH); tools/sbom.py
+# checks every component against Cargo.lock.
+lock="$(shasum -a 256 "$fc/Cargo.lock")"
+rm -f "$fc"/src/*/*_bin.cdx.json
+(cd "$fc" && SOURCE_DATE_EPOCH="$(git -C "$ROOT" log -1 --format=%ct)" \
+    cargo cyclonedx -qq --manifest-path src/firecracker/Cargo.toml --describe binaries \
+        --target aarch64-apple-darwin --spec-version 1.5 --format json)
+[[ "$(shasum -a 256 "$fc/Cargo.lock")" == "$lock" ]] || die "cargo-cyclonedx changed Cargo.lock"
+python3 -I "$ROOT/tools/sbom.py" "$fc/src/firecracker/firecracker_bin.cdx.json" "$out/$name.cdx.json" \
+    "$ROOT" "$fc/Cargo.lock" || die "the SBOM does not match Cargo.lock"
+
 echo "$out/$name.tgz"
 echo "$out/$name.tgz.sha256.txt"
+echo "$out/$name.cdx.json"

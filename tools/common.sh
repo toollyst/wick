@@ -82,3 +82,7 @@ cargo_deny_version() {
     [[ -n "$v" ]] || die "cannot find the cargo-deny version in lib/firecracker/tools/devctr/Dockerfile"
     echo "$v"
 }
+
+# The cargo-cyclonedx version that writes the release SBOM
+# (tools/package-release.sh).
+CARGO_CYCLONEDX_VERSION=0.5.9
