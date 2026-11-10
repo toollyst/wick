@@ -1,0 +1,117 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build and test wick on Linux, macOS and Windows (CONTRIBUTING.md, "Tests").
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patches:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Apply the patch series
+        run: tools/setup.sh
+      - name: Check the patch series
+        run: tools/patches.sh check
+      - name: Check generated Windows sources
+        run: |
+          (cd lib/firecracker && cargo fetch -q)
+          tools/gen-kvm-bindings-windows.sh --check
+          tools/gen-windows-sources.sh --check
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: tools/setup.sh
+      - name: Report KVM availability
+        run: ls -l /dev/kvm || echo "no /dev/kvm on ${{ matrix.runner }}"
+      - name: Install build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libseccomp-dev
+      - name: Build firecracker
+        working-directory: lib/firecracker
+        run: cargo build -p firecracker
+
+  # macOS (Apple silicon): build, lint and the compatibility crates' tests.
+  # Booting a guest needs Hypervisor.framework, which hosted runners do not
+  # expose, so L3 runs on a Mac (tools/macos/run.sh).
+  macos:
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: tools/setup.sh
+      - name: Install clippy
+        working-directory: lib/firecracker
+        run: rustup component add clippy
+      - name: Build firecracker
+        working-directory: lib/firecracker
+        run: cargo build -p firecracker --bin firecracker
+      - name: Clippy
+        working-directory: lib/firecracker
+        run: cargo clippy -p vmm -p firecracker -p wick-ext --lib --bins --tests -- -D warnings
+      - name: Compatibility crate tests
+        working-directory: lib/firecracker
+        run: |
+          for c in libc vmm-sys-util memfd userfaultfd kvm-ioctls; do
+            cargo test --manifest-path "../../crates/compat/$c/Cargo.toml"
+          done
+      - name: Host sandbox test
+        working-directory: lib/firecracker
+        run: cargo test -p vmm --lib ext::sandbox
+
+  # Windows: the POSIX layer and the crates built over it, tested natively,
+  # and the firecracker binary on the WHP backend.
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: tools/setup.sh
+      # Upstream tests put sockets and files under /tmp, which Windows
+      # resolves to \tmp on the current drive.
+      - name: Create \tmp on the working drive
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path "$((Get-Location).Drive.Name):\tmp" | Out-Null
+      - name: Compatibility crate tests
+        working-directory: lib/firecracker
+        run: |
+          for c in os std libc vmm-sys-util memfd event-manager micro-http; do
+            cargo test --manifest-path "../../crates/compat/$c/Cargo.toml"
+          done
+          cargo test --manifest-path ../../crates/compat/vm-memory/Cargo.toml \
+            --features backend-mmap,backend-bitmap,backend-atomic
+          cargo test --manifest-path ../../crates/compat/vhost/Cargo.toml \
+            --features vhost-user-frontend,vhost-user-backend
+      - name: Build firecracker (WHP backend)
+        working-directory: lib/firecracker
+        run: cargo build -p firecracker
