@@ -147,6 +147,8 @@ pub(crate) struct VcpuShared {
     /// mapped page; `run()` reads `immediate_exit` from it.
     pub(crate) run: KvmRunPage,
     vtimer_masked: AtomicBool,
+    /// The `VmInner::vtimer_gen` whose offset the vCPU has (`u64::MAX`: none yet).
+    vtimer_gen: AtomicU64,
     in_run: AtomicBool,
     power: Mutex<Power>,
     cv: Condvar,
@@ -168,6 +170,7 @@ impl VcpuShared {
             hv: AtomicU64::new(NOT_CREATED),
             run: KvmRunPage::new(),
             vtimer_masked: AtomicBool::new(false),
+            vtimer_gen: AtomicU64::new(u64::MAX),
             in_run: AtomicBool::new(false),
             power: Mutex::new(Power::default()),
             cv: Condvar::new(),
@@ -191,6 +194,11 @@ impl VcpuShared {
             NOT_CREATED => None,
             hv => Some(hv),
         }
+    }
+
+    /// Whether the Hypervisor.framework vCPU exists.
+    pub(crate) fn is_created(&self) -> bool {
+        self.hv().is_some()
     }
 
     /// Wakes the vCPU if it waits in `WFI` or powered off.
@@ -332,8 +340,8 @@ impl VcpuFd {
                 HV_SYS_REG_MPIDR_EL1,
                 self.shared.mpidr,
             ))?;
-            check(hv_vcpu_set_vtimer_offset(hv, vm.vtimer_offset))?;
         }
+        self.apply_vtimer_offset(hv, &vm)?;
         // The GIC registers exist once MPIDR_EL1 is set.
         let gic_created = vm.gic.lock().unwrap().created;
         if gic_created {
@@ -351,6 +359,7 @@ impl VcpuFd {
         }
         self.shared.hv.store(hv, Ordering::Release);
         drop(gic);
+        vm.vcpu_created();
         Ok(hv)
     }
 
@@ -386,9 +395,8 @@ impl VcpuFd {
         let v = match regs::decode(id) {
             Some(Reg::Sys(HV_SYS_REG_MPIDR_EL1)) => self.shared.mpidr,
             // SAFETY: plain call.
-            Some(Reg::VirtualCount) => {
-                unsafe { mach_absolute_time() }.wrapping_sub(vm.vtimer_offset)
-            }
+            Some(Reg::VirtualCount) => unsafe { mach_absolute_time() }
+                .wrapping_sub(vm.vtimer_offset.load(Ordering::Acquire)),
             // SAFETY: plain call.
             Some(Reg::PhysicalCount) => unsafe { mach_absolute_time() },
             _ => {
@@ -490,15 +498,28 @@ impl VcpuFd {
                     bytes.copy_from_slice(&data[..16]);
                     check(set_simd_fp_reg(hv, i, &bytes))
                 }
-                Reg::VirtualCount => check(hv_vcpu_set_vtimer_offset(
-                    hv,
-                    mach_absolute_time().wrapping_sub(v),
-                )),
+                Reg::VirtualCount => {
+                    let vm = self.vm()?;
+                    vm.set_virtual_count(v);
+                    self.apply_vtimer_offset(hv, &vm)
+                }
                 Reg::Aarch32Spsr if v == 0 => Ok(()),
                 Reg::PsciVersion if v == regs::PSCI_VERSION_0_2 => Ok(()),
                 Reg::PhysicalCount | Reg::Aarch32Spsr | Reg::PsciVersion => err(libc::EINVAL),
             }
         }
+    }
+
+    /// Gives the vCPU the VM's counter offset if it changed since.
+    fn apply_vtimer_offset(&self, hv: hv_vcpu_t, vm: &VmInner) -> Result<()> {
+        let generation = vm.vtimer_gen.load(Ordering::Acquire);
+        if self.shared.vtimer_gen.load(Ordering::Relaxed) == generation {
+            return Ok(());
+        }
+        // SAFETY: `hv` belongs to this thread.
+        check(unsafe { hv_vcpu_set_vtimer_offset(hv, vm.vtimer_offset.load(Ordering::Acquire)) })?;
+        self.shared.vtimer_gen.store(generation, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Fails with `ENOEXEC` before `KVM_ARM_VCPU_INIT`, as KVM does.
@@ -519,9 +540,15 @@ impl VcpuFd {
         if data.len() < size {
             return err(libc::EINVAL);
         }
-        regs::decode(reg_id).ok_or_else(|| Error::new(libc::ENOENT))?;
+        let reg = regs::decode(reg_id).ok_or_else(|| Error::new(libc::ENOENT))?;
         match self.live()? {
             Some(hv) => self.set_reg_now(hv, reg_id, &data[..size])?,
+            // The counter is the VM's, and counts from the time of the write.
+            None if reg == Reg::VirtualCount => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[..8]);
+                self.vm()?.set_virtual_count(u64::from_le_bytes(buf));
+            }
             None => {
                 let mut pending = self.shared.pending.lock().unwrap();
                 pending.retain(|(id, _)| *id != reg_id);
@@ -919,6 +946,7 @@ impl VcpuFd {
                 return self.stopped(hv, gic);
             }
             self.update_vtimer(hv)?;
+            self.apply_vtimer_offset(hv, &vm)?;
 
             self.shared.in_run.store(true, Ordering::Release);
             // SAFETY: `hv` belongs to this thread.

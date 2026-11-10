@@ -44,7 +44,7 @@ const SYSREG: u64 = KVM_REG_ARM64 | KVM_REG_ARM64_SYSREG as u64;
 const KVM_REG_ARM_FW: u64 = 0x0014 << 16;
 
 /// KVM's encoding of `KVM_REG_ARM_TIMER_CNT`: `ARM64_SYS_REG(3, 3, 14, 3, 2)`.
-const KVM_TIMER_CNT: u16 = 0xdf1a;
+pub(crate) const KVM_TIMER_CNT: u16 = 0xdf1a;
 /// KVM's encoding of `KVM_REG_ARM_TIMER_CVAL`: `ARM64_SYS_REG(3, 3, 14, 0, 2)`.
 const KVM_TIMER_CVAL: u16 = 0xdf02;
 /// KVM's encoding of `KVM_REG_ARM_TIMER_CTL`: `ARM64_SYS_REG(3, 3, 14, 3, 1)`.
@@ -103,7 +103,7 @@ fn core_id(size: u64, off: u64) -> u64 {
     CORE | size | off
 }
 
-fn sys_id(enc: u16) -> u64 {
+pub(crate) fn sys_id(enc: u16) -> u64 {
     SYSREG | KVM_REG_SIZE_U64 | u64::from(enc)
 }
 

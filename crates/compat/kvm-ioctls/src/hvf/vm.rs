@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::raw::{c_int, c_ulong};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::Duration;
@@ -143,7 +143,17 @@ pub(crate) struct VmInner {
     pub(crate) vcpus: Mutex<Vec<Arc<VcpuShared>>>,
     pub(crate) gic: Mutex<GicConfig>,
     /// Value of `mach_absolute_time()` at which the guest counter reads 0.
-    pub(crate) vtimer_offset: u64,
+    /// One for the VM, as KVM's: writing a vCPU's `TIMER_CNT` sets it for all.
+    pub(crate) vtimer_offset: AtomicU64,
+    /// Incremented when `vtimer_offset` changes; vCPUs apply the new offset
+    /// before they next run.
+    pub(crate) vtimer_gen: AtomicU64,
+    /// vCPUs created with `create_vcpu` whose Hypervisor.framework vCPU does
+    /// not exist yet (it is created on the first `run()`).
+    uncreated: AtomicUsize,
+    /// SPIs raised while the vCPU they are routed to did not exist: made
+    /// pending when it does (see [`VmInner::raise_spi`]).
+    deferred_spis: Mutex<Vec<u32>>,
     /// Register values of a freshly created Hypervisor.framework vCPU, read
     /// once from a scratch vCPU (see `VcpuFd::get_one_reg`).
     pub(crate) reset_regs: OnceLock<std::result::Result<HashMap<u64, Vec<u8>>, i32>>,
@@ -296,8 +306,9 @@ impl VmInner {
 
     /// Raises the interrupt behind `gsi` and wakes waiting vCPUs.
     pub(crate) fn inject(&self, gsi: u32) {
-        match self.route(gsi) {
-            Some(Route::Spi(intid)) => {
+        // Errors are not reported, as KVM's irqfd does not report them.
+        let _ = match self.route(gsi) {
+            Some(Route::Spi(intid)) => self.raise_spi(intid, || {
                 // A pulse, like KVM's irqfd: an edge for edge-triggered SPIs, and a
                 // level that is dropped again for level-triggered ones.
                 // SAFETY: plain calls; invalid ids are reported as errors.
@@ -305,16 +316,89 @@ impl VmInner {
                     hv_gic_set_spi(intid, true);
                     hv_gic_set_spi(intid, false);
                 }
-            }
-            Some(Route::Msi { address, data }) => {
+                HV_SUCCESS
+            }),
+            Some(Route::Msi { address, data }) => self.raise_spi(data, || {
                 // SAFETY: plain call; a bad address or SPI is reported as an error.
-                unsafe { hv_gic_send_msi(address, data) };
-            }
-            None => {}
-        }
+                unsafe { hv_gic_send_msi(address, data) }
+            }),
+            None => HV_SUCCESS,
+        };
         for vcpu in self.vcpus.lock().unwrap().iter() {
             vcpu.wake();
         }
+    }
+
+    /// Raises SPI `intid` with `raise`, as KVM would deliver it.
+    ///
+    /// Hypervisor.framework routes an SPI to the vCPU its `GICD_IROUTER`
+    /// names only once that vCPU exists, and drops one raised before: on a
+    /// snapshot restore the devices are kicked, and their interrupts raised,
+    /// before the vCPUs first run. Such an SPI is recorded instead and made
+    /// pending when its vCPU is created ([`Self::vcpu_created`]), where KVM
+    /// keeps it pending in the distributor.
+    pub(crate) fn raise_spi(&self, intid: u32, raise: impl FnOnce() -> hv_return_t) -> hv_return_t {
+        if self.uncreated.load(Ordering::Acquire) == 0 {
+            return raise();
+        }
+        let mut deferred = self.deferred_spis.lock().unwrap();
+        if self.spi_target_exists(intid) {
+            return raise();
+        }
+        if !deferred.contains(&intid) {
+            deferred.push(intid);
+        }
+        HV_SUCCESS
+    }
+
+    /// Whether the vCPU SPI `intid` is routed to exists. An id the GIC does
+    /// not have counts as routed, so that raising it reports the error.
+    fn spi_target_exists(&self, intid: u32) -> bool {
+        const IRM: u64 = 1 << 31;
+        let mut route = 0;
+        // SAFETY: plain call with a valid output.
+        if unsafe { hv_gic_get_distributor_reg(0x6000 + 8 * intid, &mut route) } != HV_SUCCESS {
+            return true;
+        }
+        let affinity = super::gic::packed_affinity(route);
+        self.vcpus.lock().unwrap().iter().any(|v| {
+            v.is_created()
+                && (route & IRM != 0 || super::gic::packed_affinity(v.mpidr) == affinity)
+        })
+    }
+
+    /// Clears SPI `intid` if it is waiting for its vCPU (`GICD_ICPENDR`).
+    pub(crate) fn clear_deferred_spi(&self, intid: u32) {
+        self.deferred_spis.lock().unwrap().retain(|&i| i != intid);
+    }
+
+    /// A vCPU's Hypervisor.framework vCPU now exists, with the SPI routes that
+    /// name it written again: makes pending the SPIs that waited for it.
+    pub(crate) fn vcpu_created(&self) {
+        let mut deferred = self.deferred_spis.lock().unwrap();
+        self.uncreated.fetch_sub(1, Ordering::AcqRel);
+        deferred.retain(|&intid| {
+            if !self.spi_target_exists(intid) {
+                return true;
+            }
+            // SAFETY: plain call; GICD_ISPENDR<n> is write-1-to-set.
+            unsafe {
+                hv_gic_set_distributor_reg(0x200 + 4 * (intid / 32), 1 << (intid % 32))
+            };
+            false
+        });
+        drop(deferred);
+        for vcpu in self.vcpus.lock().unwrap().iter() {
+            vcpu.wake();
+        }
+    }
+
+    /// Sets the guest counter of every vCPU to read `count` now.
+    pub(crate) fn set_virtual_count(&self, count: u64) {
+        // SAFETY: plain call.
+        let offset = unsafe { mach_absolute_time() }.wrapping_sub(count);
+        self.vtimer_offset.store(offset, Ordering::Release);
+        self.vtimer_gen.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Waits for irqfds and injects their interrupts. The thread holds the VM
@@ -472,7 +556,10 @@ impl VmFd {
             vcpus: Mutex::new(Vec::new()),
             gic: Mutex::new(GicConfig::default()),
             // SAFETY: plain call.
-            vtimer_offset: unsafe { mach_absolute_time() },
+            vtimer_offset: AtomicU64::new(unsafe { mach_absolute_time() }),
+            vtimer_gen: AtomicU64::new(0),
+            uncreated: AtomicUsize::new(0),
+            deferred_spis: Mutex::new(Vec::new()),
             reset_regs: OnceLock::new(),
             gic_cpu_reset: OnceLock::new(),
         });
@@ -744,7 +831,7 @@ impl VmFd {
         self.fd.check()?;
         let address = u64::from(msi.address_hi) << 32 | u64::from(msi.address_lo);
         // SAFETY: plain call; a bad address or SPI is reported as an error.
-        check(unsafe { hv_gic_send_msi(address, msi.data) })?;
+        check(self.inner.raise_spi(msi.data, || unsafe { hv_gic_send_msi(address, msi.data) }))?;
         Ok(1)
     }
 
@@ -761,6 +848,7 @@ impl VmFd {
         }
         let (fd, shared) = VcpuShared::new(id)?;
         vcpus.push(shared.clone());
+        self.inner.uncreated.fetch_add(1, Ordering::AcqRel);
         Ok(VcpuFd::new(self.inner.clone(), shared, fd, true))
     }
 
@@ -861,4 +949,134 @@ fn vtimer_thread(vm: Weak<VmInner>) {
 
 fn io_err(e: std::io::Error) -> super::Error {
     super::Error::new(e.raw_os_error().unwrap_or(libc::EIO))
+}
+
+#[cfg(test)]
+mod tests {
+    use kvm_bindings::{
+        KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL,
+        KVM_DEV_ARM_VGIC_GRP_DIST_REGS, KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
+    };
+
+    use super::*;
+    use crate::Kvm;
+
+    fn set_attr(dev: &DeviceFd, group: u32, attr: u64, value: u64) -> Result<()> {
+        dev.set_device_attr(&kvm_device_attr {
+            group,
+            attr,
+            addr: std::ptr::from_ref(&value) as u64,
+            flags: 0,
+        })
+    }
+
+    fn spi_pending(intid: u32) -> bool {
+        let mut v = 0;
+        // SAFETY: plain call with a valid output.
+        check(unsafe { hv_gic_get_distributor_reg(0x200 + 4 * (intid / 32), &mut v) }).unwrap();
+        v & (1 << (intid % 32)) != 0
+    }
+
+    #[test]
+    fn test_spi_raised_before_its_vcpu_exists() {
+        // Interrupts raised and pending state restored before the vCPU first
+        // runs (a snapshot restore kicks the devices then) are not lost.
+        let vm = Kvm::new().unwrap().create_vm().unwrap();
+        let mut dev = kvm_create_device {
+            type_: kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
+            fd: 0,
+            flags: 0,
+        };
+        let gic = vm.create_device(&mut dev).unwrap();
+        let dist = 0x4000_0000 - 0x1_0000;
+        set_attr(&gic, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_VGIC_V3_ADDR_TYPE_DIST.into(), dist).unwrap();
+        let redist = dist - (32 << 20);
+        set_attr(&gic, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_VGIC_V3_ADDR_TYPE_REDIST.into(), redist)
+            .unwrap();
+        set_attr(&gic, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_CTRL_INIT.into(), 0).unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        let mut kvi = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        vcpu.vcpu_init(&kvi).unwrap();
+
+        // Raised: waits for vCPU 0, which SPI 40 is routed to.
+        let raised = vm.inner.raise_spi(40, || panic!("raised before its vCPU exists"));
+        assert_eq!(raised, HV_SUCCESS);
+        // Restored pending, then cleared: forgotten. Restored pending: waits.
+        let ispendr1 = u64::from(0x204u32);
+        let icpendr1 = u64::from(0x284u32);
+        let write = |offset: u64, value: u32| {
+            gic.set_device_attr(&kvm_device_attr {
+                group: KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
+                attr: offset,
+                addr: std::ptr::from_ref(&value) as u64,
+                flags: 0,
+            })
+            .unwrap()
+        };
+        write(ispendr1, 1 << (41 - 32));
+        write(icpendr1, 1 << (41 - 32));
+        write(ispendr1, 1 << (42 - 32));
+        assert_eq!(*vm.inner.deferred_spis.lock().unwrap(), [40, 42]);
+        assert!(!spi_pending(40) && !spi_pending(42));
+
+        // The vCPU's first run creates it: both become pending.
+        std::thread::spawn(move || {
+            vcpu.set_kvm_immediate_exit(1);
+            assert_eq!(vcpu.run().unwrap_err().errno(), libc::EINTR);
+            assert!(vm.inner.deferred_spis.lock().unwrap().is_empty());
+            assert!(spi_pending(40) && !spi_pending(41) && spi_pending(42));
+            // Once every vCPU exists, interrupts are raised directly.
+            let mut direct = false;
+            vm.inner.raise_spi(43, || {
+                direct = true;
+                HV_SUCCESS
+            });
+            assert!(direct);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn test_virtual_count_is_the_vms() {
+        // As on KVM, writing one vCPU's TIMER_CNT sets the counter of every
+        // vCPU, from the time of the write (not the time a vCPU first runs).
+        let vm = Kvm::new().unwrap().create_vm().unwrap();
+        let mut kvi = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        let vcpus: Vec<_> = (0..2)
+            .map(|i| {
+                let v = vm.create_vcpu(i).unwrap();
+                v.vcpu_init(&kvi).unwrap();
+                v
+            })
+            .collect();
+        let id = super::super::regs::sys_id(super::super::regs::KVM_TIMER_CNT);
+        let start = 1u64 << 40;
+        vcpus[0].set_one_reg(id, &start.to_le_bytes()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let counts: Vec<u64> = vcpus
+            .into_iter()
+            .map(|mut vcpu| {
+                std::thread::spawn(move || {
+                    vcpu.set_kvm_immediate_exit(1);
+                    vcpu.run().unwrap_err();
+                    let mut buf = [0u8; 8];
+                    vcpu.get_one_reg(id, &mut buf).unwrap();
+                    u64::from_le_bytes(buf)
+                })
+                .join()
+                .unwrap()
+            })
+            .collect();
+        let mut freq = 0u64;
+        // SAFETY: reads CNTFRQ_EL0, readable at EL0.
+        unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
+        let elapsed = |c: u64| (c - start) as f64 / freq as f64;
+        for c in &counts {
+            assert!((0.1..2.0).contains(&elapsed(*c)), "{:.3}s", elapsed(*c));
+        }
+        assert!((elapsed(counts[1]) - elapsed(counts[0])).abs() < 0.05, "{counts:?}");
+    }
 }

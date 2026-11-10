@@ -221,7 +221,7 @@ impl DeviceFd {
             if group == KVM_DEV_ARM_VGIC_GRP_DIST_REGS {
                 let offset = attr.attr & 0xffff_ffff;
                 return if write {
-                    gic::dist_set(offset, get32())
+                    dist_write(vm, offset, get32())
                 } else {
                     gic::dist_get(offset).map(put32)
                 };
@@ -302,6 +302,33 @@ impl AsRawFd for DeviceFd {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
+}
+
+/// Writes distributor register `offset`. Pending SPIs restored while the
+/// vCPU they are routed to does not exist yet wait for it, as interrupts
+/// raised then do (see `VmInner::raise_spi`).
+fn dist_write(vm: &VmInner, offset: u64, value: u32) -> Result<()> {
+    const ISPENDR_SPIS: std::ops::Range<u64> = 0x204..0x280;
+    const ICPENDR_SPIS: std::ops::Range<u64> = 0x284..0x300;
+    let set_bits = || (0..32u32).filter(move |b| value & (1 << b) != 0);
+    if ISPENDR_SPIS.contains(&offset) {
+        let first = u32::try_from(offset - 0x200).unwrap() * 8;
+        let reg = u32::try_from(offset).unwrap();
+        for bit in set_bits() {
+            // SAFETY: plain call; GICD_ISPENDR<n> is write-1-to-set.
+            check(vm.raise_spi(first + bit, || unsafe {
+                hv_gic_set_distributor_reg(reg, 1 << bit)
+            }))?;
+        }
+        return Ok(());
+    }
+    if ICPENDR_SPIS.contains(&offset) {
+        let first = u32::try_from(offset - 0x280).unwrap() * 8;
+        for bit in set_bits() {
+            vm.clear_deferred_spi(first + bit);
+        }
+    }
+    gic::dist_set(offset, value)
 }
 
 #[cfg(test)]
