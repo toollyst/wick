@@ -628,6 +628,9 @@ namespace Wick {
         public List<string> Bad = new List<string>();
         public int Frames, Arp, Icmp, Udp;
         public string ReadError;
+        // Set before the guest reboots: Firecracker exits and closes the
+        // endpoint, which is then no error.
+        public volatile bool Closing;
 
         public Switch(string endpoint, int ms) {
             var until = DateTime.UtcNow.AddMilliseconds(ms);
@@ -653,7 +656,7 @@ namespace Wick {
                 while (!stop) {
                     int n = conn.Recv(hdr, 0, 1, 200);
                     if (n < 0) continue;
-                    if (n == 0) { if (!stop) ReadError = "the endpoint closed the connection"; return; }
+                    if (n == 0) { if (!stop && !Closing) ReadError = "the endpoint closed the connection"; return; }
                     conn.RecvExact(hdr, 1, 3, 5000);
                     int len = (hdr[0] << 24) | (hdr[1] << 16) | (hdr[2] << 8) | hdr[3];
                     if (len < 14 || len > 65536 + 22) {
@@ -670,7 +673,7 @@ namespace Wick {
                     }
                 }
             } catch (Exception e) {
-                if (!stop) ReadError = e.Message;
+                if (!stop && !Closing) ReadError = e.Message;
             }
         }
 
@@ -1315,6 +1318,7 @@ function Stage-Net {
         $out = $vm.Sh('echo udp-$((6*7)) | socat -t 3 - UDP:10.0.0.1:7')
         Check ($out -eq 'udp-42') "UDP echo '$out'"
         Save-Dmesg $vm 'net'
+        $switch.Closing = $true
         $vm.Reboot()
     } finally {
         $switch.Close()
