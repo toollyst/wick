@@ -1,0 +1,5 @@
+[submodule "lib/firecracker"]
+	path = lib/firecracker
+	url = https://github.com/firecracker-microvm/firecracker.git
+	shallow = true
+	ignore = all
