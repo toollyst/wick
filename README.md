@@ -72,7 +72,7 @@ overlay/vmm/       new vmm modules (vmm::ext, vmm::platform), compiled into upst
 crates/compat/     Linux-only dependencies on macOS and Windows (libc, kvm-ioctls, vmm-sys-util, ...)
 crates/ext/        wick's own features, behind vmm::ext
 crates/version/    the version the binaries report, <upstream> or <upstream>+wick.<N> (patches/base + patches/version)
-tools/             setup, patch export/check, rebase, generators, macOS run/test, Windows boot test and probe, release
+tools/             setup, patch export/check, rebase, generators, macOS run/test/boot test, Windows boot test and probe, release
 ```
 
 - Upstream code changes only through `patches/`, and every change carries a

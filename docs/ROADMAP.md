@@ -16,7 +16,13 @@ Windows.
 ## macOS (Hypervisor.framework, aarch64 guests)
 
 Boots with 1 and 2 vCPUs; serial I/O, virtio-blk (Sync and Async), reboot and
-shutdown, API socket, Seatbelt sandbox, dirty page tracking.
+shutdown, API socket, Seatbelt sandbox, dirty page tracking. Every row marked
+done is checked end to end by `tools/macos/boot-test.sh` against upstream's
+aarch64 CI kernel and rootfs. Its first run found interrupts raised before
+the vCPUs first run (a snapshot restore kicks the devices then) dropped by
+Hypervisor.framework, which left vsock and PCI devices without interrupts
+after a restore, and a guest counter set per vCPU at its creation instead of
+once for the VM (RCU stalls after a Uffd restore); both are fixed.
 
 | Area | Interface | macOS backend | State |
 |---|---|---|---|

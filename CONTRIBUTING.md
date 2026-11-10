@@ -13,7 +13,10 @@ cargo build -p firecracker            # cargo always runs in lib/firecracker
 macOS needs Apple silicon and macOS 15 or later (`MACOSX_DEPLOYMENT_TARGET=15.0`).
 Binaries that create a VM must be signed with the Hypervisor.framework
 entitlement: use `tools/macos/run.sh` to run Firecracker and
-`tools/macos/test.sh` for tests. Windows builds cross-compile from macOS or
+`tools/macos/test.sh` for tests. `tools/macos/boot-test.sh` runs scenario
+tests against upstream's aarch64 CI guest (boot, SMP, block, vsock,
+networking, snapshots, userfaultfd, PCI, vhost-user); run it before sending a
+change to the macOS backends. Windows builds cross-compile from macOS or
 Linux with mingw-w64:
 `AWS_LC_SYS_NO_ASM=1 cargo build -p firecracker --target x86_64-pc-windows-gnu`.
 Natively on Windows (MSVC), `cargo build -p firecracker` works as is; release

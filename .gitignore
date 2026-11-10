@@ -1,3 +1,5 @@
 # Build output (cargo builds in lib/firecracker/build/).
 /dist/
 .DS_Store
+# tools/macos/boot-test.sh results.
+/build/
