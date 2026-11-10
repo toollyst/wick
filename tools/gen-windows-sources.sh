@@ -42,6 +42,7 @@ EXCLUDED_TESTS=(
     "vhost vhost_user/frontend.rs test_frontend_set_device_state_fd_with_return_fd it opens /dev/null, which Windows names NUL"
     "micro_http common/mod.rs test_display_connection_error it compares Linux strerror text, and Windows describes OS error codes in its own words"
     "micro_http common/mod.rs test_display_server_error it compares Linux strerror text, and Windows describes OS error codes in its own words"
+    "micro_http server.rs test_kill_switch it races the server: once the server thread has handled the kill switch it drops the server, and the connect that follows is refused (the race is upstream's; Windows AF_UNIX connects lose it more often); src/lib.rs tests the kill switch without the race"
 )
 
 upstream_src() {
