@@ -216,7 +216,7 @@ jobs:
   # expose, so L3 runs on a Mac (tools/macos/run.sh).
   macos:
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
@@ -232,7 +232,7 @@ jobs:
         run: cargo build -p firecracker --bin firecracker
       - name: Clippy
         working-directory: lib/firecracker
-        run: cargo clippy -p vmm -p firecracker -p wick-ext --lib --bins --tests -- -D warnings
+        run: cargo clippy -p vmm -p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings
       - name: Compatibility crate tests
         working-directory: lib/firecracker
         run: |
@@ -243,9 +243,19 @@ jobs:
           # macOS runners (virtual machines) do not have; tools/macos/test.sh
           # runs them, and tools/macos/boot-test.sh the scenarios.
           cargo test --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- --skip hvf::vm::tests::
-      - name: Host sandbox test
+      - name: Host sandbox and jail hand-over tests
         working-directory: lib/firecracker
-        run: cargo test -p vmm --lib ext::sandbox
+        run: cargo test -p vmm --lib "ext::"
+      # The jailer's tests run as root, as upstream's do (they set resource
+      # limits and change owners); the runners have passwordless sudo.
+      - name: Jailer unit tests
+        working-directory: lib/firecracker
+        run: |
+          bin=$(cargo test -p jailer --no-run --message-format=json |
+            jq -r 'select(.profile.test == true and .target.name == "jailer") | .executable')
+          sudo env RUST_TEST_THREADS=1 "$bin"
+      - name: Jailer scenario tests (without a VM)
+        run: tools/macos/jailer-test.sh --no-vm
 
   # Windows: the POSIX layer and the crates built over it, tested natively,
   # and the firecracker binary on the WHP backend.
