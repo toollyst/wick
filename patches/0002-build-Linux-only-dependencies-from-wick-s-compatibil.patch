@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 12:34:15 +0900
+Subject: [PATCH] build: Linux-only dependencies from wick's compatibility
+ crates
+
+Why: Firecracker's dependencies (libc, kvm-ioctls, vmm-sys-util, memfd,
+userfaultfd, vm-memory, event-manager, vhost, micro_http) are Linux-only.
+Replacing them below their APIs keeps upstream code unchanged.
+
+What: the workspace gains crates/compat/* and crates/ext as members, and
+[patch.crates-io] points each dependency at its compatibility crate. On
+Linux every compatibility crate re-exports the original crate at the same
+version tag, so a Linux build is upstream's. micro_http comes by path
+because a [patch] of its git source would also replace the compatibility
+crate's own dependency on the original.
+
+Test: `cargo tree -p vmm -i libc` on Linux resolves to the original libc
+source; `cargo build -p firecracker` on macOS and Windows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.toml                 | 20 +++++++++++++++++++-
+ src/firecracker/Cargo.toml |  4 +++-
+ src/vmm/Cargo.toml         |  4 +++-
+ 3 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index a1c9ad79621ecd33017cb6eaedd3630e35d10db0..69b2156b99babd1668345113cf0b11a79cda813c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,5 +1,7 @@
+ [workspace]
+-members = ["src/*"]
++# wick: the compatibility crates and wick-ext live outside this tree
++# (crates/ in the wick repository) and build in this workspace.
++members = ["src/*", "../../crates/compat/*", "../../crates/ext"]
+ # We exclude the jailer below so that it does not get build by default. This is because "cargo build" compiles
+ # for the gnu target, and the jailer needs a statically compiled binary to work correctly.
+ # See https://github.com/firecracker-microvm/firecracker/commit/3bf285c8f8a815149923c562dd7edaffcaf10c4e
+@@ -41,3 +43,19 @@ strip = "none"
+ 
+ [profile.bench]
+ strip = "debuginfo"
++
++# wick: compatibility builds of the Linux-only dependencies (docs/ARCHITECTURE.md in
++# the wick repository). On Linux they re-export the original crates unchanged.
++[patch.crates-io]
++vmm-sys-util = { path = "../../crates/compat/vmm-sys-util" }
++userfaultfd = { path = "../../crates/compat/userfaultfd" }
++libc = { path = "../../crates/compat/libc" }
++memfd = { path = "../../crates/compat/memfd" }
++kvm-ioctls = { path = "../../crates/compat/kvm-ioctls" }
++# wick: the upstream crate at the kvm-ioctls tag (one copy of kvm-bindings), with
++# 64-bit c_ulong/c_long on Windows (crates/compat/kvm-bindings).
++kvm-bindings = { path = "../../crates/compat/kvm-bindings" }
++# wick: the upstream crates, built over wick's POSIX layer on Windows.
++vm-memory = { path = "../../crates/compat/vm-memory" }
++event-manager = { path = "../../crates/compat/event-manager" }
++vhost = { path = "../../crates/compat/vhost" }
+diff --git a/src/firecracker/Cargo.toml b/src/firecracker/Cargo.toml
+index 224328cf80fd96f2925d41442b84b7c03c4932d5..8d2806f99b0ed1fc04d5cd15a1377d4dbf1c5be5 100644
+--- a/src/firecracker/Cargo.toml
++++ b/src/firecracker/Cargo.toml
+@@ -27,7 +27,9 @@ event-manager = "0.4.2"
+ wick-ext = { path = "../../../../crates/ext" }
+ libc = "0.2.186"
+ log-instrument = { path = "../log-instrument", optional = true }
+-micro_http = { git = "https://github.com/firecracker-microvm/micro-http" }
++# wick: by path, built over wick's POSIX layer on Windows (a [patch] of the
++# git source would also replace the compatibility crate's own upstream dependency).
++micro_http = { path = "../../../../crates/compat/micro-http" }
+ serde = { version = "1.0.228", features = ["derive"] }
+ serde_derive = "1.0.136"
+ serde_json = "1.0.150"
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index fd48bd2ae56da058667a17b8503f2880cb53f489..9c4b0075713de085b96135d42f19d231a463edca 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -41,7 +41,9 @@ linux-loader = { version = "0.14.0", features = ["bzimage"] }
+ log = { version = "0.4.31", features = ["std", "serde"] }
+ log-instrument = { path = "../log-instrument", optional = true }
+ memfd = "0.6.5"
+-micro_http = { git = "https://github.com/firecracker-microvm/micro-http" }
++# wick: by path, built over wick's POSIX layer on Windows (a [patch] of the
++# git source would also replace the compatibility crate's own upstream dependency).
++micro_http = { path = "../../../../crates/compat/micro-http" }
+ semver = { version = "1.0.28", features = ["serde"] }
+ serde = { version = "1.0.228", features = ["derive", "rc"] }
+ serde_json = "1.0.150"

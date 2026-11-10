@@ -1,3 +1,4 @@
 # Applied in this order to upstream Firecracker v1.18.0 (patches/base)
 # by tools/setup.sh. Written by tools/patches.sh export; do not edit.
 0001-vmm-api-extension-point-for-wick-features.patch
+0002-build-Linux-only-dependencies-from-wick-s-compatibil.patch
