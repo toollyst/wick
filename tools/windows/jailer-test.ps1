@@ -18,7 +18,10 @@ param(
     [string[]]$Stage = @('refuse', 'isolation', 'boot', 'limits', 'cpu'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
-    [string]$Probe = ''
+    [string]$Probe = '',
+    # The cpu stage measures the CPU rate cap (accepted with
+    # wick.cpu_cap=unsafe) instead of checking that cpu.max is refused.
+    [switch]$CpuCap
 )
 $ErrorActionPreference = 'Stop'
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -239,13 +242,21 @@ function Stage-Limits {
     "memory.max below the guest's memory: Firecracker cannot map it and exits"
 }
 
-# cpu.max is the job's CPU rate hard cap. It holds the rate, but a guest under
-# it can stop taking interrupts for good (WHP, measured: about 1 run in 3 at a
-# quarter of a CPU, never without the cap; the vCPU thread spins inside the
-# hypervisor and a keystroke gets no echo). Open in docs/ROADMAP.md (M5).
+# cpu.max is the job's CPU rate hard cap, which the jailer refuses for now:
+# under it a jailed guest can stop taking interrupts for good (WHP, measured:
+# about 1 run in 3 at a quarter of a CPU, never without the cap, never with
+# the same cap on a Firecracker started outside the jailer; the vCPU thread
+# spins inside the hypervisor and a keystroke gets no echo). docs/ROADMAP.md,
+# M5. -CpuCap measures it, through the jailer's opt-in.
 function Stage-Cpu {
     $base = New-Base 'cpu'
-    $vm = Start-JailedVm $base 'cpu' @('--cgroup-version', '2', '--cgroup', 'cpu.max=25000 100000')
+    if (-not $CpuCap) {
+        $r = Invoke-Jailer @('--id', 'c', '--exec-file', $Fc, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--cgroup-version', '2', '--cgroup', 'cpu.max=25000 100000')
+        Check ($r[0] -ne 0 -and $r[1] -match 'refused on Windows for now') "cpu.max: exit $($r[0]), $($r[1])"
+        Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue)) 'cpu.max started Firecracker'
+        return 'cpu.max is refused, naming the stall under the CPU rate cap (-CpuCap measures it)'
+    }
+    $vm = Start-JailedVm $base 'cpu' @('--cgroup-version', '2', '--cgroup', 'wick.cpu_cap=unsafe', '--cgroup', 'cpu.max=25000 100000')
     try {
         Wait-Shell $vm
         $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$base*" } | Select-Object -First 1
@@ -260,7 +271,7 @@ function Stage-Cpu {
         $used = ($fcp.TotalProcessorTime - $t0).TotalSeconds / ([DateTime]::Now - $w0).TotalSeconds
         Check ($used -le 0.4) "cpu.max of a quarter CPU: Firecracker used $([math]::Round($used * 100))% of one CPU"
         $vm.Send('reboot -ff')
-        "cpu.max=25000 100000 held a spinning guest to $([math]::Round($used * 100))% of a CPU"
+        "cpu.max=25000 100000 (unsafe opt-in) held a spinning guest to $([math]::Round($used * 100))% of a CPU"
     } finally { Stop-Jailed }
 }
 

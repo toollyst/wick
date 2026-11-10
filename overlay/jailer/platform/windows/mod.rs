@@ -33,7 +33,7 @@
 //!   grants full access, inherited, to the jail's SID, the user, SYSTEM and
 //!   the administrators; it has a low mandatory label.
 //! - **cgroups are a Job Object** ([`cgroup`](super::cgroup)): job memory
-//!   limit, CPU rate hard cap, active process limit; the job kills
+//!   limit, CPU rate hard cap (refused for now, see `cgroup`), active process limit; the job kills
 //!   Firecracker when the jailer goes and limits its UI access.
 //! - **No exec**: the jailer starts Firecracker suspended in the job with the
 //!   tokens, waits for it, removes the jail's drive and exits with its status.
@@ -188,6 +188,13 @@ pub enum HostError {
     UnsupportedCgroup(String),
     #[error("--cgroup {0}: {1}")]
     CgroupValue(String, &'static str),
+    #[error(
+        "--cgroup {0} is refused on Windows for now: under the Job Object CPU rate hard cap that \
+         would enforce it, a jailed guest can stop taking interrupts for good (measured on WHP: \
+         about 1 run in 3 at a quarter of a CPU; docs/ROADMAP.md, M5). The jailer never accepts \
+         a limit that breaks the microVM. To measure it, add --cgroup wick.cpu_cap=unsafe."
+    )]
+    CpuCapStalls(String),
     #[error(
         "--resource-limit {0} is not supported on Windows: {1}. The jailer never accepts a limit \
          it cannot enforce."

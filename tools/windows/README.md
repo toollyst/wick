@@ -10,7 +10,7 @@
   as the jailed binary, may not read the user's files or SAM, write outside
   its jail, reach another jail's files, API socket or process, or open the
   operator's; the operator reaches the API socket), `boot` (a 2 vCPU guest
-  in the jail), `limits` (`memory.max`), `cpu` (`cpu.max`), and a check
+  in the jail), `limits` (`memory.max`), `cpu` (`cpu.max` refused), and a check
   that every jail's drive letter was removed. It needs the boot test's
   guest files (`-Assets`, default `C:\wbt`) and `rustc` for the probe:
 
@@ -18,8 +18,10 @@
   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir C:\wjt
   ```
 
-  The `cpu` stage fails in about 1 run in 3: under the job's CPU hard cap a
-  WHP guest can stop taking interrupts (docs/ROADMAP.md, M5).
+  The jailer refuses CPU limits for now: under the job's CPU rate hard cap a
+  jailed WHP guest can stop taking interrupts (docs/ROADMAP.md, M5).
+  `-CpuCap` makes the `cpu` stage measure the cap through the jailer's
+  opt-in, `--cgroup wick.cpu_cap=unsafe`; it fails in about 1 run in 3.
 
 CI builds both on every push and uploads them as the artifact
 `wick-windows-x86_64-<commit>`: `lib/firecracker/build/cargo_target/release/firecracker.exe`,
