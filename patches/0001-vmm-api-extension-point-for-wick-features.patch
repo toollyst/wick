@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 12:34:13 +0900
+Subject: [PATCH] vmm, api: extension point for wick features
+
+Why: wick adds features that upstream does not have (desktop networking,
+host folder sharing, a capability query, ...). They must not be scattered
+through upstream code, so upstream calls one fixed set of hooks and the
+features live outside lib/firecracker.
+
+What: vmm declares `ext` (overlay/vmm/ext), the RPC interface routes
+extension requests, the config file accepts an `extensions` section,
+the builder lets extensions attach devices at boot, the API server accepts
+`PUT /extensions/{name}`, and the firecracker binary registers wick-ext.
+
+Test: `cargo test -p vmm ext::` and `cargo test -p wick-ext`; an unknown
+extension name is rejected with a 400.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/Cargo.toml                       |  2 ++
+ src/firecracker/src/api_server/parsed_request.rs |  6 ++++++
+ src/firecracker/src/main.rs                      |  3 +++
+ src/vmm/src/builder.rs                           |  6 ++++++
+ src/vmm/src/lib.rs                               |  3 +++
+ src/vmm/src/resources.rs                         |  6 ++++++
+ src/vmm/src/rpc_interface.rs                     | 13 +++++++++++++
+ 7 files changed, 39 insertions(+)
+
+diff --git a/src/firecracker/Cargo.toml b/src/firecracker/Cargo.toml
+index 7806f68411b26519d2dee0b8805840bffbeb6936..224328cf80fd96f2925d41442b84b7c03c4932d5 100644
+--- a/src/firecracker/Cargo.toml
++++ b/src/firecracker/Cargo.toml
+@@ -23,6 +23,8 @@ gdb = ["vmm/gdb"]
+ [dependencies]
+ displaydoc = "0.2.6"
+ event-manager = "0.4.2"
++# wick: features of wick.
++wick-ext = { path = "../../../../crates/ext" }
+ libc = "0.2.186"
+ log-instrument = { path = "../log-instrument", optional = true }
+ micro_http = { git = "https://github.com/firecracker-microvm/micro-http" }
+diff --git a/src/firecracker/src/api_server/parsed_request.rs b/src/firecracker/src/api_server/parsed_request.rs
+index eb07247d0e58c6cdcca08d79c71371df927ec82c..d9ba5a08ad70019aa1f68b18093929ad75c8df3d 100644
+--- a/src/firecracker/src/api_server/parsed_request.rs
++++ b/src/firecracker/src/api_server/parsed_request.rs
+@@ -114,6 +114,12 @@ impl TryFrom<&Request> for ParsedRequest {
+             (Method::Put, "snapshot", Some(body)) => parse_put_snapshot(body, path_tokens.next()),
+             (Method::Put, "vsock", Some(body)) => parse_put_vsock(body),
+             (Method::Put, "entropy", Some(body)) => parse_put_entropy(body),
++            // wick: extension point of wick.
++            (Method::Put, vmm::ext::API_PATH, Some(body)) => {
++                vmm::ext::parse_put(path_tokens.next(), body.raw())
++                    .map(ParsedRequest::new_sync)
++                    .map_err(|err| RequestError::Generic(StatusCode::BadRequest, err.to_string()))
++            }
+             (Method::Put, "hotplug", Some(body)) if path_tokens.next() == Some("memory") => {
+                 parse_put_memory_hotplug(body)
+             }
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index 0d3b813cfdc70d8492e280b9dff7b53ba0053332..ecb68b30b8753345a34dcf1d810d42b947d09f26 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -122,6 +122,9 @@ fn main_exec() -> Result<(), MainError> {
+     // Initialize the logger.
+     LOGGER.init().map_err(MainError::SetLogger)?;
+ 
++    // wick: register wick's extension.
++    wick_ext::register();
++
+     // First call to this function updates the value to current
+     // host page size.
+     _ = host_page_size();
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index 12eac0d6eef2f55720e7dc9c82ea675f00a4efcb..ddb1a48b504ae2e0cd5d154243f6dbfe00212b3d 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -134,6 +134,9 @@ pub enum StartMicrovmError {
+     VcpuFdCloneError(#[from] crate::vstate::vcpu::CopyKvmFdError),
+     /// Error with the KvmVm object: {0}
+     KvmVm(#[from] VmError),
++    // wick: extension point of wick.
++    /// Extension error: {0}
++    Extension(#[from] crate::ext::ExtError),
+ }
+ 
+ /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
+@@ -314,6 +317,9 @@ pub fn build_microvm_for_boot(
+         )?;
+     }
+ 
++    // wick: extension point of wick.
++    crate::ext::attach_boot_devices(&mut device_manager, &vm, &mut boot_cmdline, event_manager)?;
++
+     #[cfg(target_arch = "aarch64")]
+     device_manager.attach_legacy_devices_aarch64(
+         &kvm_vm,
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 479291b96da3b64ebcdc0502cfdc9a950874f099..2cfbc8e25a09b4d661571f8d28f61e7eea94ec82 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -83,6 +83,9 @@ pub(crate) mod device_manager;
+ pub mod devices;
+ /// minimalist HTTP/TCP/IPv4 stack named DUMBO
+ pub mod dumbo;
++// wick: extension point of wick.
++#[path = "../../../../../overlay/vmm/ext/mod.rs"]
++pub mod ext;
+ /// Support for GDB debugging the guest
+ #[cfg(feature = "gdb")]
+ pub mod gdb;
+diff --git a/src/vmm/src/resources.rs b/src/vmm/src/resources.rs
+index 7731899dba32e3354d335335ed24b71a9857a539..cbf75d8fccd0214207abb745e6b5f55f236b79c5 100644
+--- a/src/vmm/src/resources.rs
++++ b/src/vmm/src/resources.rs
+@@ -69,6 +69,9 @@ pub enum ResourcesError {
+     PmemConfig(#[from] PmemConfigError),
+     /// Memory hotplug config error: {0}
+     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
++    // wick: extension point of wick.
++    /// Extension error: {0}
++    Extension(#[from] crate::ext::ExtError),
+ }
+ 
+ #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+@@ -249,6 +252,9 @@ impl VmResources {
+             resources.set_enclave_config(enclave);
+         }
+ 
++        // wick: extension point of wick.
++        crate::ext::configure_from_json(config_json)?;
++
+         Ok(resources)
+     }
+ 
+diff --git a/src/vmm/src/rpc_interface.rs b/src/vmm/src/rpc_interface.rs
+index cee31d619ffa4dfa0ebe6322f343521970b62347..e13128fe30d0257c8055b54c380de93f4081fa4f 100644
+--- a/src/vmm/src/rpc_interface.rs
++++ b/src/vmm/src/rpc_interface.rs
+@@ -157,6 +157,9 @@ pub enum VmmAction {
+     UpdateMachineConfiguration(MachineConfigUpdate),
+     /// Hot-unplug a device.
+     HotUnplugDevice(VirtioDeviceId),
++    // wick: extension point of wick.
++    /// Request for a wick extension (`PUT /extensions/{name}`).
++    Extension(crate::ext::ExtRequest),
+ }
+ 
+ /// Wrapper for all errors associated with VMM actions.
+@@ -214,6 +217,9 @@ pub enum VmmActionError {
+     VsockConfig(#[from] VsockConfigError),
+     /// Enclave config error: {0}
+     EnclaveConfig(#[from] EnclaveConfigError),
++    // wick: extension point of wick.
++    /// Extension error: {0}
++    Extension(#[from] crate::ext::ExtError),
+     /// Device ID in use
+     DeviceIdInUse,
+     /// Device not found
+@@ -537,6 +543,8 @@ impl<'a> PrebootApiController<'a> {
+             | HotUnplugDevice(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
+             #[cfg(target_arch = "x86_64")]
+             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
++            // wick: extension point of wick.
++            Extension(request) => crate::ext::configure(request),
+         }
+     }
+ 
+@@ -910,6 +918,8 @@ impl RuntimeApiController {
+             | SetMemoryHotplugDevice(_)
+             | StartMicroVm
+             | UpdateMachineConfiguration(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
++            // wick: extension point of wick.
++            Extension(request) => crate::ext::update(request),
+         }
+     }
+ 
+@@ -973,6 +983,9 @@ impl RuntimeApiController {
+         &mut self,
+         create_params: &CreateSnapshotParams,
+     ) -> Result<VmmData, VmmActionError> {
++        // wick: extension point of wick.
++        crate::ext::check_snapshot()?;
++
+         if create_params.snapshot_type == SnapshotType::Diff {
+             log_dev_preview_warning("Virtual machine diff snapshots", None);
+         }
