@@ -17,6 +17,9 @@ use crate::JailerError;
 /// Environment variable through which Firecracker takes the jail over
 /// (`vmm::ext::jail::ENV`).
 const JAIL_ENV: &str = "WICK_JAIL";
+/// Environment variable with the CPU limit for Firecracker to apply to itself
+/// (`vmm::ext::jail::CPU_ENV`).
+const JAIL_CPU_ENV: &str = "WICK_JAIL_CPU";
 /// Firecracker's temporary directory in the jail. On macOS eventfds are
 /// unlinked FIFOs and memfds unlinked files (crates/compat), made in the
 /// temporary directory; on Linux both are kernel objects, so upstream's jail
@@ -71,9 +74,9 @@ pub enum HostError {
     )]
     Unsupported(&'static str, &'static str),
     #[error(
-        "--cgroup {0} is not supported on macOS (supported: memory.max with --cgroup-version 2, \
-         memory.limit_in_bytes with --cgroup-version 1). The jailer never accepts a limit it \
-         cannot enforce."
+        "--cgroup {0} is not supported on macOS (supported: memory.max and cpu.max with \
+         --cgroup-version 2, memory.limit_in_bytes, cpu.cfs_quota_us and cpu.cfs_period_us with \
+         --cgroup-version 1). The jailer never accepts a limit it cannot enforce."
     )]
     UnsupportedCgroup(String),
     #[error("--cgroup {0}: {1}")]
@@ -109,6 +112,8 @@ impl From<HostError> for JailerError {
 static OLD_ROOT: OnceLock<OwnedFd> = OnceLock::new();
 /// The jetsam memory limit in MiB, from the memory cgroup.
 static MEMORY_LIMIT_MIB: Mutex<Option<i32>> = Mutex::new(None);
+/// The CPU limit in percent of one CPU, from the CPU cgroup.
+static CPU_LIMIT_PERCENT: Mutex<Option<u8>> = Mutex::new(None);
 
 pub(crate) fn set_old_root(fd: OwnedFd) -> Result<(), HostError> {
     OLD_ROOT
@@ -118,6 +123,10 @@ pub(crate) fn set_old_root(fd: OwnedFd) -> Result<(), HostError> {
 
 pub(crate) fn set_memory_limit_mib(limit: Option<i32>) {
     *MEMORY_LIMIT_MIB.lock().unwrap() = limit;
+}
+
+pub(crate) fn set_cpu_limit_percent(limit: Option<u8>) {
+    *CPU_LIMIT_PERCENT.lock().unwrap() = limit;
 }
 
 /// `--netns`: macOS has no network namespaces.
@@ -162,8 +171,8 @@ pub fn copy_midr_el1_info() -> Result<(), JailerError> {
 /// so the jailed user never had a chance to write the binary run as root),
 /// checks it takes the jail over, and replaces the jailer with it
 /// (`POSIX_SPAWN_SETEXEC`: same PID) with only the standard descriptors,
-/// `WICK_JAIL` as its whole environment and the jetsam memory limit. Returns
-/// only on failure.
+/// `WICK_JAIL` (and `WICK_JAIL_CPU` for a CPU limit) as its whole environment
+/// and the jetsam memory limit. Returns only on failure.
 pub fn exec_command(
     exec_file_path: &Path,
     chroot_dir: &Path,
@@ -199,10 +208,13 @@ fn exec(
     env_var.extend_from_slice(chroot_dir.as_os_str().as_bytes());
     let mut tmp_var = b"TMPDIR=".to_vec();
     tmp_var.extend_from_slice(JAIL_TMP.to_bytes());
-    let env = [
+    let mut env = vec![
         CString::new(env_var).map_err(|e| HostError::Spawn("WICK_JAIL", io::Error::other(e)))?,
         CString::new(tmp_var).expect("no NUL"),
     ];
+    if let Some(percent) = *CPU_LIMIT_PERCENT.lock().unwrap() {
+        env.push(CString::new(format!("{JAIL_CPU_ENV}={percent}")).expect("no NUL"));
+    }
     let mut argv_ptrs: Vec<*mut libc::c_char> = argv.iter().map(|a| a.as_ptr().cast_mut()).collect();
     argv_ptrs.push(std::ptr::null_mut());
     let mut envp_ptrs: Vec<*mut libc::c_char> = env.iter().map(|a| a.as_ptr().cast_mut()).collect();

@@ -33,7 +33,7 @@ rootfs; on Windows, by [`tools/windows/boot-test.ps1`](../tools/windows/boot-tes
 | vhost-user | upstream | works (vhost-user-blk backend in another process) | built, validation pending |
 | hugepages | upstream | planned (uffd granularity) | built (`MEM_LARGE_PAGES`, needs "Lock pages in memory"), validation pending |
 | seccomp | upstream | Seatbelt | process mitigation policies |
-| jailer | upstream | in place: upstream's jailer; chroot, uid/gid, memory cgroup, resource limits, daemonize (CPU cgroups planned) | planned |
+| jailer | upstream | in place: upstream's jailer; chroot, uid/gid, memory and CPU cgroups, resource limits, daemonize | planned |
 
 ## M1. Foundation
 
@@ -139,7 +139,7 @@ the Windows column is what has been measured for it on a WHP machine.
 | network namespace | in place: Seatbelt denies IP networking; `--netns` is refused | planned: Windows Filtering Platform. An AppContainer would block IP networking (verified) but WHP refuses an AppContainer (`E_ACCESSDENIED`, verified), so the jailer cannot use one |
 | uid/gid | in place: dropped by Firecracker right after its chroot, exec'd from a root-owned copy the jailed user never could write | a restricted token without the user's SID, at low integrity, with an initial impersonation token for process start-up that Firecracker reverts first thing (the Chromium sandbox's pattern): WHP works, the user's files are denied (verified) |
 | cgroups memory | in place: `memory.max` / `memory.limit_in_bytes` → jetsam limit at the exec, the jailer's priority kept (a guest past the limit kills the VMM; measured) | Job Object commit limit (kills at the limit; verified). Shared sections are not charged to the job: memfd-backed memory goes through a jailer broker |
-| cgroups CPU | planned: vCPU time quota in the VMM run loop; `cpu.*` is refused until then | Job Object hard cap (verified) |
+| cgroups CPU | in place: `cpu.max` / `cpu.cfs_quota_us` + `cpu.cfs_period_us` → a kernel CPU limit on the whole VMM, applied by Firecracker right after the exec (macOS keeps it with the task an exec replaces); the budget refills each second rather than each period; whole percents, 1% to 255% of one CPU, anything else refused; the allow-list denies the call that would lift it, and `--no-seccomp` is refused with it (four spinning threads held to 10%: measured; a jailed guest's spinning vCPUs: `jailer-test.sh cpu`) | Job Object hard cap (verified) |
 | hugepages | 2 MiB fault/copy granularity in the uffd kernel side (no host superpages on Apple silicon) | `MEM_LARGE_PAGES` / `SEC_LARGE_PAGES` (verified); the privilege is stripped inside an AppContainer, so the jailer creates the section |
 
 Neither macOS nor Windows filters system calls per thread. Threads of one process share an address space, so on

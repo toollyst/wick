@@ -74,10 +74,11 @@ The same as upstream Firecracker's
 | Jailer: chroot | upstream | **in place:** upstream's jailer; `chroot(2)`, entered by Firecracker right after the exec, and a Seatbelt file rule limited to the jail | planned: AppContainer + jail directory ACL |
 | Jailer: network namespace | upstream | Seatbelt denies IP networking; `--netns` is refused | planned: AppContainer without capabilities |
 | Jailer: uid/gid | upstream | **in place:** dropped right after the chroot, checked that root cannot be regained | planned: per-VM AppContainer SID |
-| Jailer: cgroups (memory, CPU) | upstream | memory **in place** (jetsam limit, killed at the limit as by the OOM killer); CPU planned (`cpu.*` refused) | planned: Job Object limits |
+| Jailer: cgroups (memory, CPU) | upstream | memory **in place** (jetsam limit, killed at the limit as by the OOM killer); CPU **in place** (`cpu.max` / `cpu.cfs_quota_us` → a kernel CPU limit on the whole VMM, throttled once it used its share of each second); other controllers refused | planned: Job Object limits |
 
 The sandbox is installed where upstream installs its seccomp filters and keeps upstream's flags: on by default, off
-with `--no-seccomp`. `--seccomp-filter FILE` is refused outside Linux, because a BPF filter cannot be enforced there;
+with `--no-seccomp`. On macOS a process may lift its own CPU limit and the allow-list is what denies that, so a
+jailed Firecracker with a CPU limit refuses `--no-seccomp`. `--seccomp-filter FILE` is refused outside Linux, because a BPF filter cannot be enforced there;
 wick never accepts a security flag it cannot honor. If the host sandbox cannot be installed, Firecracker fails to
 start rather than running without it.
 
