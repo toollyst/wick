@@ -7,7 +7,10 @@
 
 CI builds both on every push and uploads them as the artifact
 `wick-windows-x86_64-<commit>`: `lib/firecracker/build/cargo_target/release/firecracker.exe`,
-`winprobe.exe`, `tools/windows/boot-test.ps1` and this file, at those paths.
+`snapshot-editor.exe` and `examples/uffd_on_demand_handler.exe` next to it,
+`lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe` (the
+vhost-user test backend), `winprobe.exe`, `tools/windows/boot-test.ps1` and
+this file, at those paths.
 
 ## Running it on a Windows PC
 
@@ -41,7 +44,7 @@ the firmware, and nothing else installed: the script is Windows PowerShell 5.1.
    powershell -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1
    ```
 
-   About five minutes; the first run downloads 145 MB (kernel and rootfs).
+   About ten minutes; the first run downloads 145 MB (kernel and rootfs).
    It prints PASS or FAIL per stage with the reason and ends with the path
    of `results-<time>.zip` in `%LOCALAPPDATA%\wick-boot-test`.
    `-Stage boot,net` runs some stages; `-SelfTest` checks the script itself
@@ -70,14 +73,21 @@ warnings, and the reset must end Firecracker with exit status 0.
 | `block` | an Async read-only drive (md5 of 8 MiB), a Sync and an Async writable drive (the host file holds what the guest wrote), a write to a read-only drive fails |
 | `vsock` | host to guest `CONNECT 52` with a 4 MiB echo read back by length; guest to host through `<uds>_53` |
 | `net` | virtio-net over the Windows endpoint (a Unix stream, each frame preceded by its 32-bit big-endian length): a switch in the script answers ARP, ICMP echo (1400 bytes, 200 back to back) and UDP echo, and checks the checksum of every frame the guest sends |
+| `snapshot` | a full snapshot of a 2 vCPU guest with a data drive and vsock, restored in a new Firecracker process: shell state, the clock on both vCPUs, both drives, vsock |
+| `diff` | a diff snapshot with dirty page tracking (its file keeps its holes), merged into the full one by `snapshot-editor edit-memory rebase` and restored |
+| `uffd` | the `snapshot` stage's snapshot restored with the Uffd memory backend, its pages served by upstream's `uffd_on_demand_handler` in another process |
+| `pci` | the `snapshot` stage over virtio-pci with MSI-X (`--enable-pci`) |
+| `vhost-user` | a vhost-user-blk drive served by `vhost-user-blk.exe` in another process: the guest reads its content, a guest write reaches the image |
+| `hugepages` | guest memory on 2 MiB large pages (`huge_pages: "2M"`): boots and keeps 160 MiB written to it. Needs "Lock pages in memory" for the account (`secpol.msc`, Local Policies, User Rights Assignment; sign out and in), as hugetlbfs on Linux needs huge pages reserved |
+
+`uffd` needs the `snapshot` stage's files: run it after `snapshot` (as `all` does).
 
 The results folder holds, per stage, the VM config, the serial console, the
 Firecracker log at debug level and the guest kernel log, plus `host.txt`
 (Windows build, CPU, WHP state) and `summary.txt`.
 
 Not implemented on Windows yet, listed as `N/A` in the summary and not run:
-snapshots (full, diff, Uffd), PCI, vhost-user, huge pages and the jailer
-(docs/ROADMAP.md).
+the jailer (docs/ROADMAP.md).
 
 If WHP is not usable, every stage fails with the reason the script found
 before starting, for example "the Windows hypervisor is not running".
