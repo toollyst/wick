@@ -23,6 +23,8 @@
 #   uffd   the snapshot stage's snapshot restored with the Uffd backend,
 #          served by upstream's uffd_on_demand_handler
 #   pci    the snapshot stage over virtio-pci with MSI-X (--enable-pci)
+#   restores  one snapshot restored 20 times, each paused and snapshotted
+#          again (vCPU races at restore and at the pause)
 #   vhost-user  a vhost-user-blk drive served by tools/vhost-user-blk in
 #          another process: read md5, a write reaches the image
 #   hugepages  guest memory on 2 MiB large pages (needs "Lock pages in
@@ -78,9 +80,8 @@ $BootArgs = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i804
 # What upstream Firecracker does that wick does not do on Windows yet
 # (docs/ROADMAP.md, "Platform status"); listed in the summary, not run.
 # (The leading comma keeps a one-entry list a list of pairs.)
-$NotImplemented = @(
-    , @('jailer', 'checked by tools\windows\jailer-test.ps1')
-)
+# The jailer has its own test, tools\windows\jailer-test.ps1.
+$NotImplemented = @()
 
 # --- helpers (C# 5: what Windows PowerShell 5.1 compiles) ---------------------
 
@@ -1403,6 +1404,44 @@ function Stage-Snapshot([switch]$Pci) {
     return "Full snapshot, restore in a new process: shell state, clock on both vCPUs, root and data drives, vsock$over"
 }
 
+# One snapshot restored many times, each restore paused and snapshotted
+# again, the counterpart of the macOS stage: races between vCPU threads at
+# restore (a vCPU created while another makes an interrupt pending) and at
+# the pause before a snapshot (a vCPU kicked between two runs).
+function Stage-Restores([int]$Rounds = 20) {
+    $dir = Join-Path $Scratch 'restores'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $uds = Join-Path $SockDir 'rs.v'
+    if (Test-Path $uds) { [IO.File]::Delete($uds) }
+    $cfg = Base-Config 2
+    $cfg['vsock'] = [ordered]@{ guest_cid = 3; uds_path = $uds }
+    $vm = Start-Vm 'rs0' $cfg -Api
+    Wait-Shell $vm
+    Start-GuestEcho $vm $uds
+    $vm.Sh('A=before-$((6*7))') | Out-Null
+    $state = Join-Path $dir 'rs.state'; $mem = Join-Path $dir 'rs.mem'
+    $again = Join-Path $dir 'rs2.state'; $againMem = Join-Path $dir 'rs2.mem'
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+    Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $state; mem_file_path = $mem }) | Out-Null
+    $vm.Kill()
+    for ($i = 1; $i -le $Rounds; $i++) {
+        if (Test-Path $uds) { [IO.File]::Delete($uds) }
+        $vm = Start-Vm "rs$i" $null '' -Api
+        Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
+            snapshot_path = $state
+            mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = $mem }
+            resume_vm     = $true
+        }) | Out-Null
+        try { $out = $vm.Sh('echo restored $A', 20000, $true) } catch { Fail "restore $i of ${Rounds}: $($_.Exception.Message)" }
+        Check ($out -eq 'restored before-42') "restore ${i}: '$out'"
+        Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+        Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $again; mem_file_path = $againMem }) | Out-Null
+        $vm.Kill()
+    }
+    Remove-Item $mem, $againMem -ErrorAction SilentlyContinue
+    return "$Rounds restores of one snapshot, each paused and snapshotted again"
+}
+
 # A diff snapshot on top of a full one (dirty page tracking), merged with
 # snapshot-editor and restored.
 function Stage-Diff {
@@ -1553,6 +1592,7 @@ $Stages = [ordered]@{
     diff     = { Stage-Diff }
     uffd     = { Stage-Uffd }
     pci      = { Stage-Snapshot -Pci }
+    restores = { Stage-Restores }
     'vhost-user' = { Stage-VhostUser }
     hugepages = { Stage-Hugepages }
 }
@@ -1695,8 +1735,10 @@ foreach ($s in $Summary) {
     if ($short.Length -gt 400) { $short = $short.Substring(0, 400) + ' ...' }
     $lines += "{0,-5} {1}: {2}" -f $s.Result, $s.Stage, $short
 }
-$lines += ''
-$lines += 'Not implemented on Windows yet (docs/ROADMAP.md), not run:'
+if ($NotImplemented.Count -gt 0) {
+    $lines += ''
+    $lines += 'Not implemented on Windows yet (docs/ROADMAP.md), not run:'
+}
 foreach ($n in $NotImplemented) { $lines += "N/A   {0}: {1}" -f $n[0], $n[1] }
 $failed = @($Summary | Where-Object { $_.Result -eq 'FAIL' }).Count
 $lines += ''

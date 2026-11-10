@@ -79,7 +79,8 @@ What is left on macOS belongs to other milestones: hugepages (M5), the jailer (M
 Platform, and the Windows column of [At a glance](#at-a-glance) says "works" for each row it covers.
 
 **Every boot test stage but `hugepages` passes on real hardware** (AMD Ryzen 9 7900, Windows 11 Pro build 26300):
-boot, smp, block, vsock, net, snapshot, diff, uffd, pci and vhost-user. `hugepages` needs the account to hold "Lock
+boot, smp, block, vsock, net, snapshot, diff, uffd, pci, restores (20 restores, each paused and snapshotted
+again) and vhost-user. `hugepages` needs the account to hold "Lock
 pages in memory", which that machine's does not yet. The vmm library and the firecracker binary build and link for
 `x86_64-pc-windows-gnu` (cross) and `x86_64-pc-windows-msvc` (native, the binary CI publishes).
 
