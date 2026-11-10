@@ -20,9 +20,19 @@
 //!
 //! - a [`Redirect`]ed socket: the socket it currently names, else itself (a
 //!   listening socket that hands its traffic to the connection it accepted).
+//! - the read end of a pipe (a standard input redirected from another
+//!   process): Windows pipes have no readiness to wait for, and a pending
+//!   read would hold up every other call on a synchronous handle, so a
+//!   watcher thread checks the pipe with `PeekNamedPipe` (which consumes
+//!   nothing and does not wait) and signals an event the wait is woken by.
+//!   It checks every millisecond after it saw data, backing off to every
+//!   16 ms while the pipe stays empty. The pipe is readable when it has data
+//!   and, as on Linux, reports [`EventSet::IN`] with [`EventSet::HANG_UP`]
+//!   once every writer closed and it is empty. Only [`EventSet::IN`] can be
+//!   asked for: a pipe's room for writing cannot be queried, so
+//!   [`EventSet::OUT`] fails with `ERROR_NOT_SUPPORTED`.
 //!
-//! Like Linux, regular files cannot be registered (`EPERM`). Pipes have no
-//! readiness to wait for on Windows, and fail with `ERROR_NOT_SUPPORTED`.
+//! Like Linux, regular files cannot be registered (`EPERM`).
 //! [`EventSet::ONE_SHOT`] is supported.
 //!
 //! [`EventSet::EDGE_TRIGGERED`] is supported for sockets. IOCP readiness is
@@ -50,8 +60,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroUsize;
-use std::os::windows::io::{AsRawHandle, BorrowedSocket, RawHandle};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::windows::io::{AsRawHandle, BorrowedSocket, FromRawHandle, OwnedHandle, RawHandle};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -65,7 +75,8 @@ use windows_sys::Win32::Networking::WinSock::{
     getsockopt, WSAPoll, POLLERR, POLLHUP, POLLRDNORM, POLLWRNORM, SOL_SOCKET, SO_TYPE,
     WSAPOLLFD,
 };
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent, WaitForSingleObject};
 use windows_sys::Win32::Storage::FileSystem::{
     GetFileType, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE,
 };
@@ -93,6 +104,10 @@ enum Kind {
     },
     Console,
     Waitable,
+    /// The read end of a pipe; `event` is its [`PipeWatch`]'s event.
+    Pipe {
+        event: RawFd,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +137,110 @@ impl Interest {
 struct Links {
     drain: Option<Arc<AtomicU64>>,
     redirect: Option<Arc<Redirect>>,
+    pipe: Option<PipeWatch>,
+}
+
+/// What a pipe's read end holds now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipeState {
+    Empty,
+    Data,
+    /// Every writer closed and nothing is left (end of file); also a pipe
+    /// that cannot be queried, so that its reader sees the error.
+    Closed,
+}
+
+fn pipe_state(fd: RawFd) -> PipeState {
+    let mut avail = 0u32;
+    // SAFETY: queries the pipe without reading; no buffer is passed.
+    let ok = unsafe {
+        PeekNamedPipe(
+            handle(fd),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut avail,
+            std::ptr::null_mut(),
+        )
+    };
+    match (ok != 0, avail) {
+        (true, 0) => PipeState::Empty,
+        (true, _) => PipeState::Data,
+        (false, _) => PipeState::Closed,
+    }
+}
+
+/// The thread that watches a registered pipe (see the module docs) and the
+/// manual-reset event it sets while the pipe is readable. Dropping it stops
+/// the thread.
+#[derive(Debug)]
+struct PipeWatch {
+    event: OwnedHandle,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// A handle value that may move to the watcher thread.
+#[derive(Clone, Copy)]
+struct SendHandle(HANDLE);
+// SAFETY: kernel handles may be used from any thread.
+unsafe impl Send for SendHandle {}
+
+impl PipeWatch {
+    const FAST: Duration = Duration::from_millis(1);
+    const SLOW: Duration = Duration::from_millis(16);
+
+    fn start(fd: RawFd) -> io::Result<Self> {
+        // SAFETY: creates an unnamed manual-reset event, not signalled.
+        let ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if ev.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the event was just created and is owned here.
+        let event = unsafe { OwnedHandle::from_raw_handle(ev as RawHandle) };
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stop = stop.clone();
+            let ev = SendHandle(ev);
+            std::thread::Builder::new()
+                .name("wick-epoll-pipe".into())
+                .spawn(move || {
+                    let ev = ev;
+                    let mut interval = Self::FAST;
+                    while !stop.load(Ordering::Acquire) {
+                        if pipe_state(fd) == PipeState::Empty {
+                            interval = (interval * 2).min(Self::SLOW);
+                        } else {
+                            // The reader resets it when it finds the pipe
+                            // empty (see `Epoll::collect`).
+                            // SAFETY: the event outlives the thread.
+                            unsafe { SetEvent(ev.0) };
+                            interval = Self::FAST;
+                        }
+                        std::thread::park_timeout(interval);
+                    }
+                })?
+        };
+        Ok(PipeWatch {
+            event,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn event_fd(&self) -> RawFd {
+        from_handle(self.event.as_raw_handle())
+    }
+}
+
+impl Drop for PipeWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(t) = self.thread.take() {
+            t.thread().unpark();
+            let _ = t.join();
+        }
+    }
 }
 
 /// Makes epoll watch, for a socket, the socket it names: a listening socket
@@ -213,7 +332,8 @@ fn kind_of(fd: RawFd) -> io::Result<Kind> {
             }
         }
         FILE_TYPE_DISK => Err(io::Error::from_raw_os_error(libc::EPERM)),
-        FILE_TYPE_PIPE => Err(os_error(ERROR_NOT_SUPPORTED)),
+        // The watcher and its event are set up by `Epoll::ctl`.
+        FILE_TYPE_PIPE => Ok(Kind::Pipe { event: -1 }),
         _ => Ok(Kind::Waitable),
     }
 }
@@ -352,6 +472,11 @@ impl Epoll {
                     self.poller
                         .add_waitable(handle(fd) as RawHandle, readable, mode)
                 }
+                Kind::Pipe { event } => {
+                    let readable = Event::new(key(fd, SUB_MAIN), read, false);
+                    self.poller
+                        .add_waitable(handle(event) as RawHandle, readable, mode)
+                }
             }
         }
     }
@@ -369,6 +494,7 @@ impl Epoll {
                 self.poller.remove_waitable(waitable(space)).and(r)
             }
             Kind::Console | Kind::Waitable => self.poller.remove_waitable(waitable(fd)),
+            Kind::Pipe { event } => self.poller.remove_waitable(waitable(event)),
         }
     }
 
@@ -419,6 +545,20 @@ impl Epoll {
                     interest.armed = target.unwrap_or(fd);
                     interest.generation = generation;
                     link.redirect = Some(r);
+                }
+                if let Kind::Pipe { .. } = kind {
+                    if events.contains(EventSet::OUT) {
+                        return Err(os_error(ERROR_NOT_SUPPORTED));
+                    }
+                    // A modified registration keeps its watcher.
+                    let watch = match links.get_mut(&fd).and_then(|l| l.pipe.take()) {
+                        Some(w) => w,
+                        None => PipeWatch::start(fd)?,
+                    };
+                    interest.kind = Kind::Pipe {
+                        event: watch.event_fd(),
+                    };
+                    link.pipe = Some(watch);
                 }
                 if let Some(old) = old {
                     self.disarm(fd, &old)?;
@@ -576,6 +716,12 @@ impl Epoll {
                 // Console readiness is checked when collected; other handles
                 // may be auto-reset, which a check would consume.
                 Kind::Console | Kind::Waitable => {}
+                // Checked directly, as it consumes nothing.
+                Kind::Pipe { .. } => {
+                    if want_in && pipe_state(*fd) != PipeState::Empty {
+                        out.push(fired(SUB_MAIN, true, false, false));
+                    }
+                }
             }
         }
         out
@@ -618,6 +764,16 @@ impl Epoll {
                     }
                 }
                 (Kind::EventFd { .. }, SUB_SPACE) => bits |= EventSet::OUT,
+                (Kind::Pipe { event }, _) => match pipe_state(fd) {
+                    PipeState::Data => bits |= EventSet::IN,
+                    PipeState::Closed => bits |= EventSet::IN | EventSet::HANG_UP,
+                    PipeState::Empty => {
+                        // A packet from before the reader emptied the pipe:
+                        // the watcher sets the event again on new data.
+                        // SAFETY: the event is open while registered.
+                        unsafe { ResetEvent(handle(event)) };
+                    }
+                },
                 (Kind::Console, _) => {
                     if console_ready(handle(fd)) {
                         bits |= EventSet::IN;
@@ -968,5 +1124,134 @@ mod tests {
         let mut all = [EpollEvent::default(); 8];
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(epoll.wait(1000, &mut all).unwrap(), 4);
+    }
+
+    /// An anonymous pipe: (read end, write end).
+    fn pipe() -> (RawFd, RawFd) {
+        let (mut r, mut w): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: two out-pointers to handles.
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::System::Pipes::CreatePipe(&mut r, &mut w, std::ptr::null(), 0)
+            },
+            0
+        );
+        (from_handle(r as RawHandle), from_handle(w as RawHandle))
+    }
+
+    fn pipe_write(fd: RawFd, bytes: &[u8]) {
+        let mut n = 0;
+        // SAFETY: a valid buffer.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::WriteFile(
+                handle(fd),
+                bytes.as_ptr(),
+                u32::try_from(bytes.len()).unwrap(),
+                &mut n,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(ok != 0 && n as usize == bytes.len());
+    }
+
+    fn pipe_read(fd: RawFd, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        let mut n = 0;
+        // SAFETY: a valid buffer.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::ReadFile(
+                handle(fd),
+                buf.as_mut_ptr(),
+                u32::try_from(len).unwrap(),
+                &mut n,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0);
+        buf.truncate(n as usize);
+        buf
+    }
+
+    fn close_handle(fd: RawFd) {
+        // SAFETY: closes a handle the test owns.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle(fd)) };
+    }
+
+    #[test]
+    fn test_pipe_in_and_hang_up() {
+        let epoll = Epoll::new().unwrap();
+        let (r, w) = pipe();
+        epoll
+            .ctl(ControlOperation::Add, r, EpollEvent::new(EventSet::IN, 5))
+            .unwrap();
+        assert!(wait_now(&epoll).is_empty());
+        pipe_write(w, b"ab");
+        let mut events = [EpollEvent::default(); 4];
+        assert_eq!(epoll.wait(1000, &mut events).unwrap(), 1);
+        assert_eq!((events[0].data(), events[0].event_set()), (5, EventSet::IN));
+        // Level-triggered: still readable until read.
+        assert_eq!(epoll.wait(1000, &mut events).unwrap(), 1);
+        assert_eq!(pipe_read(r, 8), b"ab");
+        assert_eq!(epoll.wait(100, &mut events).unwrap(), 0);
+        // The writer leaves: end of file, as Linux reports it.
+        close_handle(w);
+        assert_eq!(epoll.wait(1000, &mut events).unwrap(), 1);
+        assert_eq!(events[0].event_set(), EventSet::IN | EventSet::HANG_UP);
+        epoll
+            .ctl(ControlOperation::Delete, r, EpollEvent::default())
+            .unwrap();
+        close_handle(r);
+    }
+
+    #[test]
+    fn test_pipe_wakes_a_blocked_wait() {
+        let epoll = Epoll::new().unwrap();
+        let (r, w) = pipe();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                r,
+                EpollEvent::new(EventSet::IN | EventSet::ONE_SHOT, 1),
+            )
+            .unwrap();
+        let start = std::time::Instant::now();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            pipe_write(w, b"x");
+            w
+        });
+        let mut events = [EpollEvent::default(); 4];
+        assert_eq!(epoll.wait(5000, &mut events).unwrap(), 1);
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(150) && took < Duration::from_secs(1), "{took:?}");
+        // One-shot: not again until modified.
+        assert!(wait_now(&epoll).is_empty());
+        epoll
+            .ctl(
+                ControlOperation::Modify,
+                r,
+                EpollEvent::new(EventSet::IN, 1),
+            )
+            .unwrap();
+        assert_eq!(epoll.wait(1000, &mut events).unwrap(), 1);
+        close_handle(writer.join().unwrap());
+        drop(epoll);
+        close_handle(r);
+    }
+
+    #[test]
+    fn test_pipe_out_not_supported() {
+        let epoll = Epoll::new().unwrap();
+        let (r, w) = pipe();
+        let err = epoll
+            .ctl(
+                ControlOperation::Add,
+                r,
+                EpollEvent::new(EventSet::IN | EventSet::OUT, 0),
+            )
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(ERROR_NOT_SUPPORTED as i32));
+        close_handle(r);
+        close_handle(w);
     }
 }
