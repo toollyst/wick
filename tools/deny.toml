@@ -1,0 +1,78 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# wick's cargo-deny policy, for lib/firecracker's Cargo.lock (with wick's
+# patches) and tools/vhost-user-blk's. tools/check-dependencies.sh runs it,
+# and upstream's own lib/firecracker/deny.toml as well, so wick never accepts
+# what upstream would refuse. The advisories, licenses and banned crates below
+# are upstream's (lib/firecracker/deny.toml at patches/base); wick adds a
+# closed list of sources and refuses duplicate crates. Warnings are errors.
+#
+# Carried over from upstream's file with this SHA-256; when a new upstream base
+# changes it, carry the change over here and update the line
+# (tools/check-dependencies.sh refuses a mismatch):
+# upstream-deny-sha256: 66088ba8cfebf5b9ab8c44defaaceb09e3e533005df3bac81153b875094e7cf8
+
+[graph]
+# Every target (Linux, macOS, Windows) and every feature, as upstream.
+all-features = true
+
+[advisories]
+# Upstream's settings. No advisory is ignored: upstream ignores none.
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+version = 2
+# Upstream's list; every one of these may be combined with Apache-2.0.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Unicode-3.0",
+]
+# The test backend allows fewer crates than Firecracker; an allowed license no
+# crate uses is not a problem.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "deny"
+# Upstream's ban.
+deny = [
+    { name = "serde_derive", version = ">1.0.171, < 1.0.184" },
+]
+skip = [
+    # More than one version in upstream's Cargo.lock at patches/base.
+    { crate = "bitflags@1.3.2", reason = "upstream v1.18.0's Cargo.lock has bitflags 1 and 2" },
+    { crate = "itertools@0.12.1", reason = "upstream v1.18.0's Cargo.lock has itertools 0.12 and 0.15" },
+    { crate = "shlex@1.3.0", reason = "upstream v1.18.0's Cargo.lock has shlex 1 and 2" },
+    { crate = "syn@2.0.119", reason = "upstream v1.18.0's Cargo.lock has syn 2 and 3" },
+    { crate = "thiserror@1.0.69", reason = "upstream v1.18.0's Cargo.lock has thiserror 1 and 2" },
+    { crate = "thiserror-impl@1.0.69", reason = "upstream v1.18.0's Cargo.lock has thiserror 1 and 2" },
+    # crates/compat/kvm-bindings and the upstream crate it wraps.
+    { crate = "kvm-bindings@0.14.1", reason = "wick's compatibility crate wraps the crate of the same version" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    # Upstream's own git dependency (src/vmm/Cargo.toml, src/firecracker/Cargo.toml).
+    "https://github.com/firecracker-microvm/micro-http",
+    # The compatibility crates (crates/compat) re-export the original crate from
+    # its release tag; tools/linux/check-dependency-sources.py checks that each is
+    # byte for byte the crates.io release upstream's Cargo.lock uses.
+    "https://github.com/bytecodealliance/userfaultfd-rs",
+    "https://github.com/lucab/memfd-rs",
+    "https://github.com/rust-lang/libc",
+    "https://github.com/rust-vmm/event-manager",
+    "https://github.com/rust-vmm/kvm",
+    "https://github.com/rust-vmm/vhost",
+    "https://github.com/rust-vmm/vm-memory",
+    "https://github.com/rust-vmm/vmm-sys-util",
+]

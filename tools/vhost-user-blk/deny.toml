@@ -1,0 +1,49 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# cargo-deny policy for the vhost-user-blk test backend's Cargo.lock: the same
+# advisories, licenses and bans as tools/deny.toml (upstream's, from
+# lib/firecracker/deny.toml), with the sources and duplicates of this graph.
+# tools/check-dependencies.sh runs it.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Unicode-3.0",
+]
+# Fewer crates than Firecracker: an allowed license no crate uses is not a problem.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "deny"
+deny = [
+    { name = "serde_derive", version = ">1.0.171, < 1.0.184" },
+]
+skip = [
+    { crate = "bitflags@1.3.2", reason = "vmm-sys-util 0.15 uses bitflags 1, as in upstream's Cargo.lock" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    # The compatibility crates' originals, the commits lib/firecracker's
+    # Cargo.lock uses (tools/linux/check-dependency-sources.py).
+    "https://github.com/rust-lang/libc",
+    "https://github.com/rust-vmm/vmm-sys-util",
+]
