@@ -1,0 +1,112 @@
+// Copyright 2026 toollyst contributors.
+// SPDX-License-Identifier: Apache-2.0
+
+#![allow(clippy::undocumented_unsafe_blocks)]
+
+use std::ffi::{OsStr, OsString};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::Shutdown;
+
+use super::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, dup};
+use super::unix::ffi::{OsStrExt, OsStringExt};
+use super::unix::fs::{FileExt, MetadataExt};
+use super::unix::net::{UnixListener, UnixStream};
+
+fn temp_path(name: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("wick-os-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+#[test]
+fn test_pair() {
+    let (mut a, mut b) = UnixStream::pair().unwrap();
+    a.write_all(b"ping").unwrap();
+    let mut buf = [0u8; 4];
+    b.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"ping");
+    b.write_all(b"pong").unwrap();
+    a.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"pong");
+    a.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(b.read(&mut buf).unwrap(), 0);
+}
+
+#[test]
+fn test_listener() {
+    let path = temp_path("listener.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    assert_eq!(listener.local_addr().unwrap().as_pathname(), Some(path.as_path()));
+    let mut client = UnixStream::connect(&path).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    assert_eq!(client.peer_addr().unwrap().as_pathname(), Some(path.as_path()));
+    assert_eq!(super::peer_pid(server.as_raw_fd()).unwrap(), std::process::id());
+    client.write_all(b"hello").unwrap();
+    let mut buf = [0u8; 5];
+    server.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"hello");
+    drop(listener);
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn test_nonblocking() {
+    let (a, _b) = UnixStream::pair().unwrap();
+    a.set_nonblocking(true).unwrap();
+    let mut buf = [0u8; 1];
+    let err = (&a).read(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn test_socket_fd_round_trip() {
+    let (a, mut b) = UnixStream::pair().unwrap();
+    let copy = dup(a.as_raw_fd()).unwrap();
+    drop(a);
+    let mut a = unsafe { UnixStream::from_raw_fd(copy) };
+    a.write_all(b"x").unwrap();
+    let mut buf = [0u8; 1];
+    b.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"x");
+    let fd: OwnedFd = a.into();
+    let a = UnixStream::from(fd);
+    let raw = a.into_raw_fd();
+    drop(unsafe { OwnedFd::from_raw_fd(raw) });
+}
+
+#[test]
+fn test_file_ext_keeps_position() {
+    let path = temp_path("file");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(b"0123456789").unwrap();
+    file.seek(SeekFrom::Start(2)).unwrap();
+    let mut buf = [0u8; 3];
+    file.read_exact_at(&mut buf, 5).unwrap();
+    assert_eq!(&buf, b"567");
+    file.write_all_at(b"ab", 0).unwrap();
+    assert_eq!(file.stream_position().unwrap(), 2);
+    assert_eq!(file.read_at(&mut buf, 10).unwrap(), 0);
+    assert_eq!(file.read_at(&mut buf, 100).unwrap(), 0);
+    let mut all = Vec::new();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.read_to_end(&mut all).unwrap();
+    assert_eq!(all, b"ab23456789");
+    assert_eq!(file.metadata().unwrap().size(), 10);
+    let fd = file.into_raw_fd();
+    drop(unsafe { std::fs::File::from_raw_fd(fd) });
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn test_os_str_bytes() {
+    assert_eq!(OsStr::from_bytes(b"abc"), OsStr::new("abc"));
+    assert_eq!(OsStr::new("ü").as_bytes(), "ü".as_bytes());
+    assert_eq!(OsString::from_vec(b"xyz".to_vec()), OsString::from("xyz"));
+    assert_eq!(OsString::from("é").into_vec(), "é".as_bytes());
+}

@@ -1,0 +1,28 @@
+# `std::os::unix` and `std::os::fd` for wick (docs/ARCHITECTURE.md,
+# "Windows의 POSIX 계층"). On Unix it re-exports std. On Windows it defines the same
+# traits and types on top of handles and Winsock.
+[package]
+workspace = "../../../lib/firecracker"
+name = "wick-os"
+version = "0.1.0"
+authors = ["toollyst contributors"]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "wick_os"
+bench = false
+doctest = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true
