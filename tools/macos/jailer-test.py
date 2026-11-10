@@ -7,7 +7,8 @@ with sudo).
 Each stage starts Firecracker through the jailer, the way an operator would,
 and checks from the outside what the jail holds: the process's user, group and
 root directory, which files and sockets it can reach, the memory limit and its
-jetsam priority, daemonization and the options the jailer must refuse. The
+jetsam priority, the CPU limit, daemonization and the options the jailer must
+refuse. The
 stages marked "VM" boot upstream's aarch64 CI guest and need
 Hypervisor.framework; the others run on any Mac (CI runs them on GitHub's
 macOS runners, which have no Hypervisor.framework).
@@ -118,6 +119,34 @@ class MemoryStatusEntry(ctypes.Structure):
                 ("user_data", ctypes.c_uint64), ("limit", ctypes.c_int32), ("state", ctypes.c_uint32)]
 
 
+class CpuUsageAttr(ctypes.Structure):
+    """proc_policy_cpuusage_attr_t (sys/process_policy.h)."""
+    _fields_ = [("action", ctypes.c_uint32), ("percentage", ctypes.c_uint32),
+                ("interval", ctypes.c_uint64), ("deadline", ctypes.c_uint64)]
+
+
+def cpu_limit(pid):
+    """(action, percent of one CPU, interval in s) of `pid`'s CPU limit (PROC_POLICY_ACTION_GET)."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    f = libc.__process_policy
+    f.argtypes = [ctypes.c_int] * 4 + [ctypes.POINTER(CpuUsageAttr), ctypes.c_int, ctypes.c_uint64]
+    a = CpuUsageAttr()
+    # SCOPE_PROCESS, ACTION_GET, RESOURCE_USAGE, RUSAGE_CPU.
+    r = f(1, 11, 4, 3, ctypes.byref(a), pid, 0)
+    check(r == 0, f"process_policy GET for {pid}: errno {ctypes.get_errno()}")
+    return a.action, a.percentage, a.interval
+
+
+def cpu_seconds(pid):
+    """User plus system CPU time of `pid`, from ps (10 ms resolution)."""
+    out = subprocess.run(["ps", "-o", "time=", "-p", str(pid)], capture_output=True, text=True).stdout
+    check(out.strip() != "", f"ps time for {pid}")
+    total = 0.0
+    for part in out.strip().split(":"):
+        total = total * 60 + float(part)
+    return total
+
+
 def jetsam(pid):
     """(priority, limit in MiB) of `pid` (MEMORYSTATUS_CMD_GET_PRIORITY_LIST)."""
     libc = ctypes.CDLL(None, use_errno=True)
@@ -146,7 +175,11 @@ def stage_refuse(ctx):
         (["--netns", "/var/run/netns/x"], "--netns is not supported on macOS"),
         (["--new-pid-ns"], "--new-pid-ns is not supported on macOS"),
         (["--cgroup", "cpuset.cpus=0"], "--cgroup cpuset.cpus=0 is not supported on macOS"),
-        (["--cgroup-version", "2", "--cgroup", "cpu.max=50000 100000"], "is not supported on macOS"),
+        (["--cgroup-version", "2", "--cgroup", "cpu.weight=100"], "is not supported on macOS"),
+        (["--cgroup", "cpu.shares=512"], "is not supported on macOS"),
+        # CPU limits macOS cannot enforce as asked: never loosened.
+        (["--cgroup-version", "2", "--cgroup", "cpu.max=1000 1000000"], "below 1% of one CPU"),
+        (["--cgroup-version", "2", "--cgroup", "cpu.max=300000 100000"], "above 255% of one CPU"),
     ]
     for i, (extra, want) in enumerate(cases):
         rc, out = run_jailer(ctx, jailer_base(ctx, f"refuse{i}") + extra)
@@ -154,6 +187,10 @@ def stage_refuse(ctx):
     # A binary without the hand-over would run unjailed as root.
     rc, out = run_jailer(ctx, jailer_base(ctx, "refuse-exec", "/bin/sleep") + ["--", "60"])
     check(rc != 0 and "cannot take the jail over" in out, f"/bin/sleep: exit {rc}, {out!r}")
+    # Without the sandbox Firecracker could lift its own CPU limit.
+    rc, out = run_jailer(ctx, jailer_base(ctx, "refuse-cpu") + [
+        "--cgroup", "cpu.cfs_quota_us=50000", "--", "--api-sock", "/run/firecracker.socket", "--no-seccomp"])
+    check(rc != 0 and "holds only with the sandbox" in out, f"CPU limit, --no-seccomp: exit {rc}, {out!r}")
     # Firecracker refuses a hand-over it cannot complete (not root).
     fc = os.path.join(ctx.base, "fc-nobody")
     shutil.copy(ctx.firecracker, fc)
@@ -162,7 +199,8 @@ def stage_refuse(ctx):
                         fc, "--no-api"], capture_output=True, text=True, timeout=20)
     out = (p.stdout + p.stderr).strip()
     check(p.returncode != 0 and "NotRoot" in out, f"WICK_JAIL as nobody: exit {p.returncode}, {out!r}")
-    return f"{len(cases)} options and a binary without the hand-over refused; hand-over needs root"
+    return (f"{len(cases)} options, a CPU limit without the sandbox and a binary without the "
+            "hand-over refused; hand-over needs root")
 
 
 def stage_jail(ctx):
@@ -236,16 +274,26 @@ def stage_daemonize(ctx):
 
 
 def stage_limits(ctx):
-    """The memory cgroup becomes a jetsam limit; the jetsam priority is the jailer's."""
+    """The memory cgroup becomes a jetsam limit (the jailer's jetsam priority kept), the CPU cgroup a CPU limit."""
     jail = Jail(ctx, "limits")
     vm = JailedVm(ctx, "limits", jail, ["--cgroup", "memory.limit_in_bytes=314572800",
+                                        "--cgroup", "cpu.cfs_quota_us=150000",
+                                        "--cgroup", "cpu.cfs_period_us=200000",
                                         "--resource-limit", "no-file=512"])
     prio, limit = jetsam(vm.proc.pid)
     own_prio, _ = jetsam(os.getpid())
     check(limit == 300, f"jetsam limit {limit} MiB")
     check(prio == own_prio, f"jetsam priority {prio}, the jailer's parent has {own_prio}")
+    # THROTTLE (1), 75% of one CPU, refilled every second.
+    check(cpu_limit(vm.proc.pid) == (1, 75, 1), f"v1 CPU limit {cpu_limit(vm.proc.pid)}")
     vm.kill()
-    return f"jetsam limit 300 MiB, priority {prio} kept"
+    jail = Jail(ctx, "limits2")
+    vm = JailedVm(ctx, "limits2", jail, ["--cgroup-version", "2", "--cgroup", "memory.max=209715200",
+                                         "--cgroup", "cpu.max=250000 100000"])
+    check(jetsam(vm.proc.pid)[1] == 200, f"v2 jetsam limit {jetsam(vm.proc.pid)[1]} MiB")
+    check(cpu_limit(vm.proc.pid) == (1, 250, 1), f"v2 CPU limit {cpu_limit(vm.proc.pid)}")
+    vm.kill()
+    return f"jetsam limit 300 MiB (v1), 200 MiB (v2), priority {prio} kept; CPU 75% (v1), 250% (v2)"
 
 
 def stage_boot(ctx):
@@ -307,6 +355,27 @@ def stage_memory(ctx):
     return "guest writes 700 MiB; " + ", ".join(results)
 
 
+def stage_cpu(ctx):
+    """VM: two guest vCPUs spinning use no more of the host than the CPU cgroup allows."""
+    used = {}
+    for name, percent in (("cpu-free", None), ("cpu50", 50)):
+        jail = Jail(ctx, name, [ctx.kernel, ctx.rootfs])
+        cg = ["--cgroup-version", "2", "--cgroup", f"cpu.max={percent * 1000} 100000"] if percent else []
+        vm = JailedVm(ctx, name, jail, cg, config=jail_config(vcpus=2))
+        vm.shell()
+        vm.sh("for i in 1 2; do (while :; do :; done) & done; echo spinning")
+        time.sleep(2)
+        t0, c0 = time.time(), cpu_seconds(vm.proc.pid)
+        time.sleep(8)
+        used[name] = 100 * (cpu_seconds(vm.proc.pid) - c0) / (time.time() - t0)
+        vm.kill()
+    free, limited = used["cpu-free"], used["cpu50"]
+    # The unlimited VM shows the guest could use more than the limit.
+    check(free > 120, f"unlimited VM used {free:.0f}% of one CPU: the host is too busy to measure")
+    check(limited <= 60, f"VM limited to 50% used {limited:.0f}% of one CPU")
+    return f"2 vCPUs spinning: {free:.0f}% of one CPU unlimited, {limited:.0f}% with cpu.max 50%"
+
+
 STAGES = {
     "refuse": stage_refuse,
     "jail": stage_jail,
@@ -314,8 +383,9 @@ STAGES = {
     "limits": stage_limits,
     "boot": stage_boot,
     "memory": stage_memory,
+    "cpu": stage_cpu,
 }
-VM_STAGES = ("boot", "memory")
+VM_STAGES = ("boot", "memory", "cpu")
 
 
 class Context:
