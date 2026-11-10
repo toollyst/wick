@@ -22,7 +22,10 @@ binaries are still called `firecracker` and `jailer`.
 
 - **Linux**: upstream Firecracker. The compatibility crates re-export the
   original crates, and the platform interfaces' Linux backends are upstream's
-  own code (io_uring, TAP).
+  own code (io_uring, TAP). CI runs upstream's unit tests (x86_64 with KVM,
+  aarch64) and integration tests for plain upstream and for wick on the same
+  machine and requires the same result test by test, and boots a guest with
+  the musl release binary on KVM.
 - **macOS**: boots and runs guests. Serial, API socket, virtio-blk (Sync and
   Async), vsock, virtio-net (vmnet or a Unix datagram endpoint), PCI with
   MSI-X, full and diff snapshots, userfaultfd-backed restore, vhost-user, and
@@ -72,7 +75,7 @@ overlay/vmm/       new vmm modules (vmm::ext, vmm::platform), compiled into upst
 crates/compat/     Linux-only dependencies on macOS and Windows (libc, kvm-ioctls, vmm-sys-util, ...)
 crates/ext/        wick's own features, behind vmm::ext
 crates/version/    the version the binaries report, <upstream> or <upstream>+wick.<N> (patches/base + patches/version)
-tools/             setup, patch export/check, rebase, generators, macOS run/test/boot test, Windows boot test and probe, release
+tools/             setup, patch export/check, rebase, generators, Linux tests against upstream and boot test, macOS run/test/boot test, Windows boot test and probe, release
 ```
 
 - Upstream code changes only through `patches/`, and every change carries a

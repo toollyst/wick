@@ -122,16 +122,29 @@ Mac before tagging.
 
 | Level | What | Where |
 |---|---|---|
-| L1 | upstream unit tests + compatibility crate tests | CI (three OSes), Docker |
-| L2 | upstream integration tests that work on nested KVM | Linux with KVM |
+| L1 | upstream unit tests + compatibility crate tests | CI (three OSes); on Linux x86_64 (KVM) and aarch64 against plain upstream |
+| L2 | upstream integration tests that work on nested KVM | Linux CI against plain upstream: a subset on every push, the functional and security suites weekly |
 | L2' | all of upstream's tests, including performance | a Linux machine, before a release |
 | L3 | API-driven scenarios: boot and serial, vsock, block, shutdown | Linux CI, a Mac, a Windows PC |
 
-- Linux results must match upstream's **by test name**. Upstream tests that
-  share global state and only flake when run in parallel
-  (`balloon::device::tests::test_hinting_*`,
-  `vsock::unix::muxer::tests::test_vsock_basic_metrics`) are re-run with
-  `--test-threads=1`.
+- On Linux, wick must match plain upstream (`patches/base`, no patches)
+  **test by test**, run the same way on the same machine.
+  `tools/linux/unit-tests.sh` runs upstream's unit tests as upstream's CI
+  does (its development container, as root, musl, `RUST_TEST_THREADS=1`,
+  `cargo test --all` and `--examples`) and `tools/linux/compare-unit-tests.py`
+  compares the results by package, target and name;
+  `tools/linux/integration-tests.sh` and
+  `tools/linux/compare-integration-tests.py` do the same for upstream's
+  pytest suites (`tools/test.sh` on upstream's musl release build). A test
+  that passes on upstream and fails on wick is a wick bug: fix it, never
+  exclude it. Tests that fail on plain upstream on the CI runner are listed,
+  with the reason, in `tools/linux/unit-test-exclusions.txt` and
+  `tools/linux/integration-test-exclusions.txt`.
+- `tools/linux/boot-test.sh` is `tools/windows/boot-test.ps1` for Linux: it
+  boots upstream's CI guest with the musl release binary (seccomp filters on
+  every thread) and checks serial I/O, SMP, the Async (io_uring) block engine
+  and vsock.
 - Upstream tests left out on purpose: `test_licenses.py::test_for_valid_licenses`
-  (wick's copyright headers) and `tests/integration_tests/performance/`
-  (baselines measured on AWS bare metal).
+  (wick's copyright headers), `tests/integration_tests/performance/`
+  (baselines measured on AWS bare metal), and in CI the 5.10 and 6.18 guest
+  kernel variants of the integration tests (6.1, upstream's default, runs).
