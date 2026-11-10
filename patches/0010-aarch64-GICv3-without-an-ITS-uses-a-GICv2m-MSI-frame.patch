@@ -9,7 +9,9 @@ PCI MSI-X.
 What: the GICv3 layout follows Hypervisor.framework's, the ITS is
 optional, and without it MSIs go to the GIC's MSI frame, described in the
 FDT as `arm,gic-v2m-frame`. GIC state save/restore includes the frame's
-SPIs. With an ITS nothing changes.
+SPIs. With an ITS nothing changes. On Linux, where KVM has no MSI frame,
+a GICv3 whose ITS cannot be created fails as upstream's does (and
+create_gic falls back to GICv2 as upstream's does).
 
 Test: `--enable-pci` with virtio-pci block and net devices on macOS, and a
 snapshot restore with PCI.
@@ -17,10 +19,10 @@ snapshot restore with PCI.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/vmm/src/arch/aarch64/fdt.rs               |  9 +-
- src/vmm/src/arch/aarch64/gic/gicv3/mod.rs     | 48 +++++++++-
+ src/vmm/src/arch/aarch64/gic/gicv3/mod.rs     | 51 +++++++++-
  .../arch/aarch64/gic/gicv3/regs/dist_regs.rs  | 96 ++++++++++++++++++-
  .../src/arch/aarch64/gic/gicv3/regs/mod.rs    | 63 +++++++++---
- 4 files changed, 196 insertions(+), 20 deletions(-)
+ 4 files changed, 199 insertions(+), 20 deletions(-)
 
 diff --git a/src/vmm/src/arch/aarch64/fdt.rs b/src/vmm/src/arch/aarch64/fdt.rs
 index 74791d2b6894650b99c246110fe227a972c3de6d..2797b2187ddbea4d4e65e24fd77e825da0e8de3c 100644
@@ -43,7 +45,7 @@ index 74791d2b6894650b99c246110fe227a972c3de6d..2797b2187ddbea4d4e65e24fd77e825d
          fdt.property_u32("phandle", MSI_PHANDLE)?;
          fdt.property_array_u64("reg", msi_properties)?;
 diff --git a/src/vmm/src/arch/aarch64/gic/gicv3/mod.rs b/src/vmm/src/arch/aarch64/gic/gicv3/mod.rs
-index 5d131cf7b76e07eabf6eff683a417e3e13dfbe16..b5d8481ca373a24ee4e568220397f6949480d1f9 100644
+index 5d131cf7b76e07eabf6eff683a417e3e13dfbe16..cbe750866090185bf85ae9d8ad96415c30765538 100644
 --- a/src/vmm/src/arch/aarch64/gic/gicv3/mod.rs
 +++ b/src/vmm/src/arch/aarch64/gic/gicv3/mod.rs
 @@ -31,6 +31,11 @@ impl GICv3 {
@@ -86,7 +88,7 @@ index 5d131cf7b76e07eabf6eff683a417e3e13dfbe16..b5d8481ca373a24ee4e568220397f694
      }
  
      pub fn init_device_attributes(gic_device: &Self) -> Result<(), GicError> {
-@@ -167,12 +178,43 @@ impl GICv3 {
+@@ -167,12 +178,46 @@ impl GICv3 {
          Ok(())
      }
  
@@ -121,9 +123,12 @@ index 5d131cf7b76e07eabf6eff683a417e3e13dfbe16..b5d8481ca373a24ee4e568220397f694
 -        Self::init_its(vm, &mut device)?;
 +        // wick: the ITS is optional. Hypervisor.framework (macOS) has none;
 +        // MSIs then go through its MSI frame, and without either no MSI
-+        // controller is advertised to the guest.
++        // controller is advertised to the guest. KVM has no MSI frame: on
++        // Linux a GIC without an ITS fails here, as it does upstream.
 +        match Self::init_its(vm, &mut device) {
-+            Err(GicError::CreateGIC(err)) if err.errno() == libc::ENODEV => {
++            Err(GicError::CreateGIC(err))
++                if err.errno() == libc::ENODEV && cfg!(not(target_os = "linux")) =>
++            {
 +                device.msi_properties = Self::init_msi_frame(&device)?
 +            }
 +            other => other?,
