@@ -26,3 +26,13 @@ x86_64 integration_tests/security/test_vulnerabilities.py::test_spectre_meltdown
 x86_64 integration_tests/security/test_vulnerabilities.py::test_vulnerabilities_on_host
 x86_64 integration_tests/security/test_vulnerabilities.py::test_check_vulnerability_files_ab
 x86_64 integration_tests/security/test_vulnerabilities.py::test_spectre_meltdown_checker_on_guest
+
+# Static CPU templates by CPU model. Upstream's framework knows a template is
+# supported only on the AWS instance CPUs it lists
+# (tests/framework/utils_cpu_templates.py: Cascade Lake, Ice Lake 8375C,
+# Milan, Neoverse V1); on any other CPU it expects starting with the C3
+# template to fail. GitHub's Intel runners (Xeon Platinum 8370C, an Ice Lake
+# that list does not name) start it fine, so plain upstream fails the C3 case
+# there (run 42850041081: 2 of 2, PCI on and off); on the AMD runners the
+# expectation holds and it passes.
+x86_64 integration_tests/functional/test_cmd_line_start.py::test_config_machine_config_params
