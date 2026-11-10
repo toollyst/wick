@@ -23,6 +23,8 @@
 #   pci    the snapshot stage over virtio-pci with MSI-X (--enable-pci)
 #   vhost-user  a vhost-user-blk drive served by tools/vhost-user-blk in
 #          another process: read md5, a write reaches the image
+#   hugepages  guest memory on 2 MiB large pages (needs "Lock pages in
+#          memory" for this account)
 #
 # Before each reset the guest kernel log must be free of stalls, BUGs, oopses
 # and warnings.
@@ -75,7 +77,6 @@ $BootArgs = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i804
 # (docs/ROADMAP.md, "Platform status"); listed in the summary, not run.
 $NotImplemented = @(
     @('uffd', 'the Uffd memory backend'),
-    @('hugepages', 'huge pages (large pages)'),
     @('jailer', 'the jailer (AppContainer, Job Objects)')
 )
 
@@ -1477,6 +1478,27 @@ function Stage-VhostUser {
     return 'vhost-user-blk backend in another process: read md5, write reaches the image'
 }
 
+# Guest memory on 2 MiB large pages (machine-config huge_pages "2M"). Large
+# pages need the "Lock pages in memory" right (SeLockMemoryPrivilege), as
+# hugetlbfs on Linux needs huge pages reserved by an administrator.
+function Stage-Hugepages {
+    $priv = (whoami /priv | Select-String 'SeLockMemoryPrivilege') -ne $null
+    Check $priv ("this account lacks 'Lock pages in memory' (SeLockMemoryPrivilege): an administrator grants it in " +
+        "secpol.msc, Local Policies, User Rights Assignment, then sign out and in")
+    $cfg = Base-Config 2
+    $cfg['machine-config']['huge_pages'] = '2M'
+    $vm = Start-Vm 'hugepages' $cfg
+    Wait-Shell $vm
+    $mem = [int]$vm.Sh("awk '/MemTotal/ {print `$2}' /proc/meminfo")
+    Check ($mem -gt 200000 -and $mem -le 262144) "MemTotal $mem kB for 256 MiB"
+    # Touches most of guest memory.
+    $out = $vm.Sh('mount -t tmpfs -o size=200m tmpfs /tmp && head -c 160m /dev/urandom > /tmp/f && md5sum /tmp/f > /tmp/a && md5sum /tmp/f | cmp - /tmp/a && echo same', 120000, $true)
+    Check ($out -eq 'same') "160 MiB in guest memory read back differently: '$out'"
+    Save-Dmesg $vm 'hugepages'
+    $vm.Reboot()
+    return '2 vCPUs on 2 MiB large pages: boots, 160 MiB written and read back'
+}
+
 $Stages = [ordered]@{
     boot     = { Stage-Boot }
     smp      = { Stage-Smp }
@@ -1487,6 +1509,7 @@ $Stages = [ordered]@{
     diff     = { Stage-Diff }
     pci      = { Stage-Snapshot -Pci }
     'vhost-user' = { Stage-VhostUser }
+    hugepages = { Stage-Hugepages }
 }
 
 # --- run ------------------------------------------------------------------------
