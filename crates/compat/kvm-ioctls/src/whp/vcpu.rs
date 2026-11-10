@@ -37,6 +37,15 @@ use super::whv::WHV_PARTITION_HANDLE;
 use super::vm::VmInner;
 use super::{emulate, err, regs, Handle, IoEventAddress, Result, VcpuExit};
 
+/// Size of the xAPIC state WHP exchanges (the APIC register page).
+const LAPIC_PAGE: usize = 4096;
+/// Size of `kvm_lapic_state` (`KVM_APIC_REG_SIZE`).
+const LAPIC_REGS: usize = 1024;
+/// Longest a vCPU that WHP reported halted waits before it re-enters the
+/// guest: WHP's local APIC timer fires inside the hypervisor without telling
+/// the run loop, so the wait is bounded (see the `X64Halt` exit).
+const HALT_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// A heap-allocated `kvm_run`, shared (as KVM's `mmap` of the vCPU fd is)
 /// through [`super::KvmRunWrapper`].
 pub(crate) struct KvmRunPage(Box<UnsafeCell<kvm_run>>);
@@ -84,6 +93,41 @@ pub(crate) struct VcpuShared {
     tsc_khz: AtomicU64,
     /// Mirror of `kvm_run.immediate_exit`, written from any thread.
     immediate_exit: AtomicU8,
+    /// Odd while the run loop is between its last `immediate_exit` check
+    /// and the return of `WHvRunVirtualProcessor`: a kick in that window
+    /// cancels again until the run returns (see [`VcpuShared::kick`]).
+    run_seq: AtomicU64,
+}
+
+impl VcpuShared {
+    /// KVM's kick: `immediate_exit` is already set; makes a run in flight,
+    /// or one about to start, return.
+    ///
+    /// `WHvCancelRunVirtualProcessor` only stops a run that is in the
+    /// hypervisor, so a cancel that lands between the run loop's check of
+    /// `immediate_exit` and its entry into the guest would be lost and the
+    /// vCPU would run on until its next exit (an idle guest may not exit for
+    /// a long time: WHP handles its APIC timer and `HLT` itself). While the
+    /// run loop is in that window the cancel is repeated until the run
+    /// returns. Both sides use sequentially consistent operations: either
+    /// the run loop sees `immediate_exit`, or the kick sees the window open.
+    fn kick(&self) {
+        let _ = super::ffi::cancel_run(self.part, self.index);
+        let seq = self.run_seq.load(Ordering::SeqCst);
+        if seq % 2 == 1 {
+            let mut spins = 0u32;
+            while self.run_seq.load(Ordering::SeqCst) == seq {
+                let _ = super::ffi::cancel_run(self.part, self.index);
+                spins += 1;
+                if spins < 64 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            }
+        }
+        self.inner.wake_halted();
+    }
 }
 
 // SAFETY: the partition handle is thread-agnostic; everything else is behind a
@@ -116,6 +160,12 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
     let index = u32::try_from(id).map_err(|_| Error::new(libc::EINVAL))?;
     // SAFETY: creates a virtual processor in this VM's partition.
     super::ffi::hr(unsafe { whv::WHvCreateVirtualProcessor(inner.part, index, 0) })?;
+    // An application processor waits for the guest's INIT/SIPI, which WHP's
+    // local APIC handles, as KVM's APs do; only the BSP (vCPU 0) runs from
+    // the registers Firecracker sets.
+    if index != 0 {
+        regs::startup_suspend(inner.part, index)?;
+    }
     let handle = Handle::new()?;
     let shared = Arc::new(VcpuShared {
         index,
@@ -127,6 +177,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         pending: Mutex::new(None),
         tsc_khz: AtomicU64::new(0),
         immediate_exit: AtomicU8::new(0),
+        run_seq: AtomicU64::new(0),
     });
     {
         let mut vcpus = ALL_VCPUS.lock().unwrap();
@@ -134,13 +185,41 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         vcpus.push(Arc::downgrade(&shared));
     }
     inner.vcpus.lock().unwrap().push(Arc::downgrade(&shared));
-    Ok(VcpuFd { shared })
+    Ok(VcpuFd { shared, own: None })
+}
+
+/// KVM's `create_vcpu_from_rawfd` for a duplicate (`dup`) of a vCPU's
+/// descriptor: another `VcpuFd` of the same vCPU, which owns `fd`.
+/// Firecracker keeps one per vCPU thread to kick it (`immediate_exit`).
+/// `EBADF` if `fd` is not a duplicate of one of this VM's vCPUs.
+pub(crate) fn from_duplicate(inner: &VmInner, fd: RawFd) -> Result<VcpuFd> {
+    use windows_sys::Win32::Foundation::{CompareObjectHandles, HANDLE};
+    // Owned from here on: closed if no vCPU matches.
+    let own = Handle(super::ffi::OwnedHandle(fd as isize as HANDLE));
+    let shared = inner
+        .vcpus
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(Weak::upgrade)
+        // SAFETY: plain call on two open handles.
+        .find(|v| unsafe { CompareObjectHandles(v.handle.0.0, own.0.0) } != 0);
+    match shared {
+        Some(shared) => Ok(VcpuFd {
+            shared,
+            own: Some(own),
+        }),
+        None => err(libc::EBADF),
+    }
 }
 
 /// Wrapper over a WHP virtual processor.
 #[derive(Debug)]
 pub struct VcpuFd {
     shared: Arc<VcpuShared>,
+    /// The descriptor of a `VcpuFd` made from a duplicate
+    /// ([`from_duplicate`]); `None` for the one `create_vcpu` returned.
+    own: Option<Handle>,
 }
 
 impl VcpuFd {
@@ -261,46 +340,72 @@ impl VcpuFd {
 
     // ---- LAPIC ----
 
-    /// Reads the local APIC register page. The xAPIC interrupt-controller
-    /// state WHP returns is the architectural APIC register page, which is
-    /// what `kvm_lapic_state` holds.
-    pub fn get_lapic(&self) -> Result<kvm_lapic_state> {
-        let mut state = kvm_lapic_state { regs: [0; 1024] };
+    /// The xAPIC state WHP exchanges: the architectural 4 KiB register page
+    /// (each register at its MMIO offset, 16 bytes apart), of which
+    /// `kvm_lapic_state` is the first KiB, the part that holds registers.
+    fn lapic_page(&self) -> Result<(Box<[u8; LAPIC_PAGE]>, u32)> {
+        let mut page = Box::new([0u8; LAPIC_PAGE]);
         let mut written = 0u32;
         // SAFETY: valid output buffer of the given size.
         super::ffi::hr(unsafe {
             whv::WHvGetVirtualProcessorInterruptControllerState(
                 self.part(),
                 self.vp(),
-                state.regs.as_mut_ptr().cast(),
-                1024,
+                page.as_mut_ptr().cast(),
+                LAPIC_PAGE as u32,
                 &mut written,
             )
         })?;
+        // Anything shorter is not the register page this conversion assumes.
+        if (written as usize) < LAPIC_REGS {
+            return err(libc::EIO);
+        }
+        Ok((page, written))
+    }
+
+    /// Reads the local APIC registers.
+    pub fn get_lapic(&self) -> Result<kvm_lapic_state> {
+        let (page, _) = self.lapic_page()?;
+        let mut state = kvm_lapic_state {
+            regs: [0; LAPIC_REGS],
+        };
+        for (dst, src) in state.regs.iter_mut().zip(page.iter()) {
+            *dst = *src as std::os::raw::c_char;
+        }
         Ok(state)
     }
+
+    /// Writes the local APIC registers; the rest of the page WHP keeps is
+    /// written back as it was.
     pub fn set_lapic(&self, klapic: &kvm_lapic_state) -> Result<()> {
-        // SAFETY: the register page is valid for its size.
+        let (mut page, size) = self.lapic_page()?;
+        for (dst, src) in page.iter_mut().zip(klapic.regs.iter()) {
+            *dst = *src as u8;
+        }
+        // SAFETY: the register page is valid for `size` bytes.
         super::ffi::hr(unsafe {
             whv::WHvSetVirtualProcessorInterruptControllerState(
                 self.part(),
                 self.vp(),
-                klapic.regs.as_ptr().cast(),
-                1024,
+                page.as_ptr().cast(),
+                size,
             )
         })
     }
 
     // ---- vCPU events ----
 
-    /// WHP delivers interrupts through its own local APIC, so at a quiescent
-    /// save point there are no pending events to report.
+    /// Not implemented yet: the pending exception, interrupt, NMI and SMI
+    /// state lives in WHP's pending-interruption and interrupt-state
+    /// registers, which this does not map yet. Only snapshots use it
+    /// (planned on Windows, docs/ROADMAP.md), and they fail loudly here
+    /// rather than save a state with pending events dropped.
     pub fn get_vcpu_events(&self) -> Result<kvm_vcpu_events> {
-        // SAFETY: a zeroed `kvm_vcpu_events` is a valid "nothing pending".
-        Ok(unsafe { std::mem::zeroed() })
+        err(libc::ENOTSUP)
     }
+    /// See [`Self::get_vcpu_events`].
     pub fn set_vcpu_events(&self, _events: &kvm_vcpu_events) -> Result<()> {
-        Ok(())
+        err(libc::ENOTSUP)
     }
 
     // ---- run control ----
@@ -310,15 +415,28 @@ impl VcpuFd {
         unsafe { &mut *self.shared.run.ptr() }
     }
 
-    /// Sets the immediate-exit flag; a `1` also cancels an in-flight run so the
-    /// kick works without a POSIX signal.
+    /// Sets the immediate-exit flag; a `1` also makes a run in flight return
+    /// (the kick, without a POSIX signal; see [`VcpuShared::kick`]).
     pub fn set_kvm_immediate_exit(&mut self, val: u8) {
-        self.shared.immediate_exit.store(val, Ordering::Release);
+        self.shared.immediate_exit.store(val, Ordering::SeqCst);
         // SAFETY: single-byte write to the shared `kvm_run`, as KVM's mmap.
         unsafe { (*self.shared.run.ptr()).immediate_exit = val };
         if val == 1 {
-            let _ = super::ffi::cancel_run(self.part(), self.vp());
+            self.shared.kick();
         }
+    }
+
+    /// One `WHvRunVirtualProcessor`, unless a kick came first (`None`).
+    fn enter(&self) -> Result<Option<whv::WHV_RUN_VP_EXIT_CONTEXT>> {
+        let shared = &self.shared;
+        shared.run_seq.fetch_add(1, Ordering::SeqCst);
+        let result = if shared.immediate_exit.load(Ordering::SeqCst) != 0 {
+            Ok(None)
+        } else {
+            super::ffi::run_vp(self.part(), self.vp()).map(Some)
+        };
+        shared.run_seq.fetch_add(1, Ordering::SeqCst);
+        result
     }
 
     /// Runs the vCPU until the next exit.
@@ -349,17 +467,27 @@ impl VcpuFd {
         }
 
         loop {
-            if self.shared.immediate_exit.load(Ordering::Acquire) != 0 {
+            let Some(ctx) = self.enter()? else {
                 return err(libc::EINTR);
-            }
-            let ctx = super::ffi::run_vp(part, vp)?;
+            };
             let instr_len = u64::from(ctx.VpContext._bitfield & 0x0f);
             let rip = ctx.VpContext.Rip;
 
             match ctx.ExitReason {
                 whv::WHvRunVpExitReasonNone => continue,
                 whv::WHvRunVpExitReasonCanceled => return err(libc::EINTR),
-                whv::WHvRunVpExitReasonX64Halt => return Ok(VcpuExit::Hlt),
+                // KVM's local APIC is in the kernel, and x86 Firecracker
+                // treats an HLT exit as fatal: the vCPU waits here for an
+                // interrupt instead. With its local APIC emulated, WHP
+                // halts the vCPU itself (newer Windows builds never report
+                // HLT); where it does report one, `RIP` is past the `HLT`,
+                // so re-entering is a wake-up the guest's idle loop checks.
+                // Re-entry waits for an interrupt request or a kick, or at
+                // most `HALT_POLL`, since WHP's APIC timer fires unseen.
+                whv::WHvRunVpExitReasonX64Halt => {
+                    self.shared.inner.wait_halted(HALT_POLL);
+                    continue;
+                }
 
                 whv::WHvRunVpExitReasonX64IoPortAccess => {
                     // SAFETY: the union arm matches the exit reason.
@@ -603,7 +731,7 @@ impl VcpuFd {
 
 impl AsRawFd for VcpuFd {
     fn as_raw_fd(&self) -> RawFd {
-        self.shared.handle.as_raw_fd()
+        self.own.as_ref().unwrap_or(&self.shared.handle).as_raw_fd()
     }
 }
 

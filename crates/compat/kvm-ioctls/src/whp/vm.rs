@@ -12,8 +12,8 @@
 //! local APIC with `WHvRequestInterrupt`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 
 use wick_os::fd::{AsRawFd, RawFd};
 use kvm_bindings::{
@@ -47,6 +47,9 @@ struct IoEvent {
     addr: IoEventAddress,
     len: u32,
     datamatch: Option<u64>,
+    /// The eventfd's descriptor, to match on unregister (the duplicate's
+    /// differs).
+    fd: RawFd,
     /// A duplicate of the eventfd, signalled on a match.
     eventfd: EventFd,
 }
@@ -88,12 +91,19 @@ pub(crate) struct VmInner {
     irqfds: Mutex<Vec<IrqFd>>,
     pub(crate) irqchip: Mutex<Irqchip>,
     pub(crate) vcpus: Mutex<Vec<Weak<VcpuShared>>>,
-    /// The irqfd watcher thread wakes on this to stop.
+    /// The irqfd watcher thread wakes on this to stop (with `stop` set) or
+    /// to watch the irqfds registered since it last looked.
     stop_evt: EventFd,
     stop: AtomicBool,
     watcher: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Set once `create_irq_chip` has run.
     pub(crate) has_irqchip: AtomicBool,
+    /// Bumped on every interrupt request and kick, for vCPUs that WHP
+    /// reported halted (see `WHvRunVpExitReasonX64Halt` in the run loop).
+    halt_wake: (Mutex<u64>, Condvar),
+    /// The last `WHvRequestInterrupt` failure reported, so each kind is
+    /// reported once.
+    request_failure: AtomicI32,
 }
 
 // SAFETY: the partition handle is an opaque value WHP accepts from any thread;
@@ -137,16 +147,48 @@ impl VmInner {
     }
 
     /// Injects an interrupt described by an MSI address/data pair.
+    ///
+    /// WHP's local APIC takes the request whether or not the target vCPU is
+    /// running, and keeps it as KVM's in-kernel APIC does (vCPUs exist from
+    /// `create_vcpu`, before any device can raise an interrupt). A request
+    /// WHP refuses is lost, as KVM loses an MSI to an APIC that does not
+    /// exist; there is no caller to return the error to (irqfds, the PIT),
+    /// so it is reported on standard error, once per error code.
     pub(crate) fn inject_msi(&self, address: u64, data: u32) {
         let control = super::irqchip::interrupt_control(address, data);
         // SAFETY: a valid interrupt control of its size.
-        unsafe {
+        let hres = unsafe {
             whv::WHvRequestInterrupt(
                 self.part,
                 &control,
                 u32::try_from(std::mem::size_of_val(&control)).unwrap(),
+            )
+        };
+        if hres != 0 && self.request_failure.swap(hres, Ordering::Relaxed) != hres {
+            eprintln!(
+                "wick: WHvRequestInterrupt(destination {}, vector {:#x}) failed: HRESULT {:#010x}; \
+                 the interrupt is lost",
+                control.Destination, control.Vector, hres as u32
             );
         }
+        self.wake_halted();
+    }
+
+    /// Wakes vCPUs waiting in [`Self::wait_halted`].
+    pub(crate) fn wake_halted(&self) {
+        let (lock, cv) = &self.halt_wake;
+        *lock.lock().unwrap() += 1;
+        cv.notify_all();
+    }
+
+    /// Waits for the next [`Self::wake_halted`], at most `timeout`.
+    pub(crate) fn wait_halted(&self, timeout: std::time::Duration) {
+        let (lock, cv) = &self.halt_wake;
+        let guard = lock.lock().unwrap();
+        let seen = *guard;
+        let _unused = cv
+            .wait_timeout_while(guard, timeout, |n| *n == seen)
+            .unwrap();
     }
 }
 
@@ -232,6 +274,8 @@ impl VmInner {
             stop: AtomicBool::new(false),
             watcher: Mutex::new(None),
             has_irqchip: AtomicBool::new(false),
+            halt_wake: (Mutex::new(0), Condvar::new()),
+            request_failure: AtomicI32::new(0),
         })
     }
 }
@@ -338,6 +382,7 @@ impl VmFd {
             addr: *addr,
             len: 0,
             datamatch: has_datamatch.then_some(datamatch_val),
+            fd: fd.as_raw_fd(),
             eventfd,
         });
         Ok(())
@@ -355,11 +400,8 @@ impl VmFd {
         let want = has_datamatch.then_some(datamatch_val);
         let mut ioevents = self.inner.ioevents.write().unwrap();
         let before = ioevents.len();
-        ioevents.retain(|ev| {
-            !(ev.addr == *addr
-                && ev.datamatch == want
-                && ev.eventfd.as_raw_fd() == fd.as_raw_fd())
-        });
+        ioevents
+            .retain(|ev| !(ev.addr == *addr && ev.datamatch == want && ev.fd == fd.as_raw_fd()));
         if ioevents.len() == before {
             return err(libc::ENOENT);
         }
@@ -375,6 +417,9 @@ impl VmFd {
             eventfd,
         });
         self.ensure_watcher();
+        // The watcher waits on the irqfds it knew of: it looks again now,
+        // so a signal right after registration is delivered at once.
+        let _ = self.inner.stop_evt.write(1);
         Ok(())
     }
 
@@ -386,6 +431,8 @@ impl VmFd {
         if irqfds.len() == before {
             return err(libc::ENOENT);
         }
+        drop(irqfds);
+        let _ = self.inner.stop_evt.write(1);
         Ok(())
     }
 
@@ -416,12 +463,15 @@ impl VmFd {
         super::vcpu::create(self.inner.clone(), id)
     }
 
-    /// Not supported: Firecracker creates raw-fd vCPUs only on aarch64.
+    /// Another handle of the vCPU whose descriptor `fd` duplicates (Firecracker
+    /// makes one per vCPU thread, from `dup`, to kick it); `EBADF` for any
+    /// other descriptor.
     ///
     /// # Safety
-    /// Never called on x86_64.
-    pub unsafe fn create_vcpu_from_rawfd(&self, _fd: RawFd) -> Result<VcpuFd> {
-        err(libc::ENOTSUP)
+    /// `fd` must be a valid descriptor; ownership moves to the returned handle
+    /// (it is closed on error too).
+    pub unsafe fn create_vcpu_from_rawfd(&self, fd: RawFd) -> Result<VcpuFd> {
+        super::vcpu::from_duplicate(&self.inner, fd)
     }
 
     /// Accepted: WHP manages the TSS/identity map itself, so there is nothing
@@ -530,11 +580,12 @@ impl AsRawFd for VmFd {
 }
 
 /// Waits on every registered irqfd; when one signals, raises its GSI. Woken
-/// by `stop_evt` to exit, and polls the irqfd set each cycle so newly
-/// registered fds are picked up.
+/// by `stop_evt` to exit (`stop` set) or to pick up the irqfds registered or
+/// removed since.
 fn watch_irqfds(inner: &Arc<VmInner>) {
     use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-    let Ok(epoll) = Epoll::new() else { return };
+    // Without it no device interrupt would ever be delivered.
+    let epoll = Epoll::new().expect("wick: the irqfd watcher cannot create its epoll");
     let mut registered: HashMap<RawFd, (u32, u64)> = HashMap::new();
     let stop_fd = inner.stop_evt.as_raw_fd();
     let _ = epoll.ctl(
@@ -575,7 +626,9 @@ fn watch_irqfds(inner: &Arc<VmInner>) {
         for ev in &events[..n] {
             let fd = ev.data() as RawFd;
             if fd == stop_fd {
-                return;
+                let _ = read_eventfd(fd);
+                // Stopping, or the irqfd set changed: the loop looks again.
+                continue;
             }
             // Drain the eventfd and raise its GSI (edge: raise then lower).
             if let Some(&(gsi, _)) = registered.get(&fd) {

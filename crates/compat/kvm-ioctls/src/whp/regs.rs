@@ -18,7 +18,7 @@ use super::whv;
 use super::whv::{WHV_PARTITION_HANDLE, WHV_REGISTER_NAME};
 
 use super::ffi::{self, as_u64, reg64};
-use super::{err, Result};
+use super::{err, Error, Result};
 
 // ---- general purpose registers (kvm_regs) ----
 
@@ -427,22 +427,47 @@ fn fxsave_from_fpu(fpu: &kvm_fpu, b: &mut [u8]) {
     }
 }
 
-// ---- MP state (runnable / halted) ----
+// ---- MP state ----
+
+/// `WHV_INTERNAL_ACTIVITY_REGISTER.StartupSuspend`: the vCPU waits for a
+/// start-up IPI (an application processor after reset).
+pub(crate) const ACTIVITY_STARTUP_SUSPEND: u64 = 1 << 0;
+/// `WHV_INTERNAL_ACTIVITY_REGISTER.HaltSuspend`: the vCPU executed `HLT`.
+pub(crate) const ACTIVITY_HALT_SUSPEND: u64 = 1 << 1;
+
+/// The KVM MP state of an internal activity register value.
+pub(crate) fn mp_state_from_activity(activity: u64) -> u32 {
+    if activity & ACTIVITY_STARTUP_SUSPEND != 0 {
+        // KVM's state for a vCPU that waits for a SIPI.
+        kvm_bindings::KVM_MP_STATE_INIT_RECEIVED
+    } else if activity & ACTIVITY_HALT_SUSPEND != 0 {
+        kvm_bindings::KVM_MP_STATE_HALTED
+    } else {
+        kvm_bindings::KVM_MP_STATE_RUNNABLE
+    }
+}
+
+/// The internal activity register value for a KVM MP state. `EINVAL` for
+/// the states KVM rejects on x86 and for the transient `SIPI_RECEIVED`,
+/// which WHP has no equivalent of.
+pub(crate) fn activity_from_mp_state(mp_state: u32) -> Result<u64> {
+    match mp_state {
+        kvm_bindings::KVM_MP_STATE_RUNNABLE => Ok(0),
+        kvm_bindings::KVM_MP_STATE_UNINITIALIZED | kvm_bindings::KVM_MP_STATE_INIT_RECEIVED => {
+            Ok(ACTIVITY_STARTUP_SUSPEND)
+        }
+        kvm_bindings::KVM_MP_STATE_HALTED => Ok(ACTIVITY_HALT_SUSPEND),
+        _ => Err(Error::new(libc::EINVAL)),
+    }
+}
 
 pub(crate) fn get_mp_state(
     part: WHV_PARTITION_HANDLE,
     vp: u32,
 ) -> Result<kvm_bindings::kvm_mp_state> {
-    // SAFETY: reads the internal-activity register.
     let value = ffi::get_register(part, vp, whv::WHvRegisterInternalActivityState)?;
-    // Bit 0 of the internal activity state is "halted"; map to KVM's states.
-    let halted = as_u64(&value) & 1 != 0;
     Ok(kvm_bindings::kvm_mp_state {
-        mp_state: if halted {
-            kvm_bindings::KVM_MP_STATE_HALTED
-        } else {
-            kvm_bindings::KVM_MP_STATE_RUNNABLE
-        },
+        mp_state: mp_state_from_activity(as_u64(&value)),
     })
 }
 
@@ -451,12 +476,29 @@ pub(crate) fn set_mp_state(
     vp: u32,
     state: kvm_bindings::kvm_mp_state,
 ) -> Result<()> {
-    let halted = state.mp_state == kvm_bindings::KVM_MP_STATE_HALTED;
+    let activity = activity_from_mp_state(state.mp_state)?;
     ffi::set_register(
         part,
         vp,
         whv::WHvRegisterInternalActivityState,
-        reg64(u64::from(halted)),
+        reg64(activity),
+    )
+}
+
+/// Puts application processor `vp` in the wait-for-SIPI state, KVM's state
+/// for a vCPU other than the BSP after creation: it starts where the guest's
+/// SIPI says, whatever its registers hold. Left alone if WHP created it so.
+pub(crate) fn startup_suspend(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<()> {
+    let value = ffi::get_register(part, vp, whv::WHvRegisterInternalActivityState)?;
+    let activity = as_u64(&value);
+    if activity & ACTIVITY_STARTUP_SUSPEND != 0 {
+        return Ok(());
+    }
+    ffi::set_register(
+        part,
+        vp,
+        whv::WHvRegisterInternalActivityState,
+        reg64(activity | ACTIVITY_STARTUP_SUSPEND),
     )
 }
 
@@ -662,6 +704,38 @@ mod tests {
         assert_eq!(back.l, s.l);
         assert_eq!(back.g, s.g);
         assert_eq!(back.present, 1);
+    }
+
+    #[test]
+    fn test_mp_state_mapping() {
+        use kvm_bindings::{
+            KVM_MP_STATE_HALTED, KVM_MP_STATE_INIT_RECEIVED, KVM_MP_STATE_RUNNABLE,
+            KVM_MP_STATE_SIPI_RECEIVED, KVM_MP_STATE_UNINITIALIZED,
+        };
+        assert_eq!(mp_state_from_activity(0), KVM_MP_STATE_RUNNABLE);
+        assert_eq!(
+            mp_state_from_activity(ACTIVITY_STARTUP_SUSPEND),
+            KVM_MP_STATE_INIT_RECEIVED
+        );
+        assert_eq!(mp_state_from_activity(ACTIVITY_HALT_SUSPEND), KVM_MP_STATE_HALTED);
+        // Waiting for a SIPI comes first, as in KVM.
+        assert_eq!(
+            mp_state_from_activity(ACTIVITY_STARTUP_SUSPEND | ACTIVITY_HALT_SUSPEND),
+            KVM_MP_STATE_INIT_RECEIVED
+        );
+        for state in [KVM_MP_STATE_RUNNABLE, KVM_MP_STATE_INIT_RECEIVED, KVM_MP_STATE_HALTED] {
+            let activity = activity_from_mp_state(state).unwrap();
+            assert_eq!(mp_state_from_activity(activity), state);
+        }
+        assert_eq!(
+            activity_from_mp_state(KVM_MP_STATE_UNINITIALIZED).unwrap(),
+            ACTIVITY_STARTUP_SUSPEND
+        );
+        assert_eq!(
+            activity_from_mp_state(KVM_MP_STATE_SIPI_RECEIVED).unwrap_err().errno(),
+            libc::EINVAL
+        );
+        assert_eq!(activity_from_mp_state(99).unwrap_err().errno(), libc::EINVAL);
     }
 
     #[test]
