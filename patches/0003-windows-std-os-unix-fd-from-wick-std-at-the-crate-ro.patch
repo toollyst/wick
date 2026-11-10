@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 12:34:16 +0900
+Subject: [PATCH] windows: std::os::{unix, fd} from wick-std at the crate roots
+
+Why: upstream code uses std::os::unix and std::os::fd (RawFd, AsRawFd,
+UnixStream, ...), which do not exist on Windows.
+
+What: utils, vmm and firecracker depend on wick-std on Windows and declare
+`extern crate wick_std as std;` at their roots, so `std::os::{unix, fd}`
+resolve to wick-os (the same traits over Windows handles) and everything
+else to the real std. Other targets are unaffected.
+
+Test: `cargo build -p firecracker --target x86_64-pc-windows-gnu`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/Cargo.toml  | 4 ++++
+ src/firecracker/src/lib.rs  | 4 ++++
+ src/firecracker/src/main.rs | 4 ++++
+ src/utils/Cargo.toml        | 4 ++++
+ src/utils/src/lib.rs        | 4 ++++
+ src/vmm/Cargo.toml          | 4 ++++
+ src/vmm/src/lib.rs          | 4 ++++
+ 7 files changed, 28 insertions(+)
+
+diff --git a/src/firecracker/Cargo.toml b/src/firecracker/Cargo.toml
+index 8d2806f99b0ed1fc04d5cd15a1377d4dbf1c5be5..37c2a2a3a62a03a8d755047702451e9f1bbb50cb 100644
+--- a/src/firecracker/Cargo.toml
++++ b/src/firecracker/Cargo.toml
+@@ -38,6 +38,10 @@ utils = { path = "../utils" }
+ vmm = { path = "../vmm" }
+ vmm-sys-util = { version = "0.15.0", features = ["with-serde"] }
+ 
++# wick: std::os::{unix, fd} on Windows (`extern crate wick_std as std` at the roots).
++[target.'cfg(windows)'.dependencies]
++wick-std = { path = "../../../../crates/compat/std" }
++
+ [build-dependencies]
+ seccompiler = { path = "../seccompiler" }
+ serde = { version = "1.0.228" }
+diff --git a/src/firecracker/src/lib.rs b/src/firecracker/src/lib.rs
+index 93298c08989f077ad02c091a7a3d4a27a5c89383..b793599ed52f02bc1b4edf7e60b8a01cd0bb299a 100644
+--- a/src/firecracker/src/lib.rs
++++ b/src/firecracker/src/lib.rs
+@@ -1,4 +1,8 @@
+ // Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++// wick: std::os::{unix, fd} on Windows from wick's POSIX layer.
++#[cfg(windows)]
++extern crate wick_std as std;
++
+ pub mod api_server;
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index ecb68b30b8753345a34dcf1d810d42b947d09f26..a92dbf32c7e0591a9d34513950da87d589c7bd52 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -7,6 +7,10 @@ compile_error!(
+      Build with the dev profile instead: `cargo build --features fuzzing`"
+ );
+ 
++// wick: std::os::{unix, fd} on Windows from wick's POSIX layer.
++#[cfg(windows)]
++extern crate wick_std as std;
++
+ mod api_server;
+ mod api_server_adapter;
+ mod generated;
+diff --git a/src/utils/Cargo.toml b/src/utils/Cargo.toml
+index 6a8713c09549e667f53d30e0cb5e20901bf440c1..ab16020423d4c0e857ffab51888568bfa9f951a7 100644
+--- a/src/utils/Cargo.toml
++++ b/src/utils/Cargo.toml
+@@ -18,5 +18,9 @@ libc = "0.2.186"
+ log-instrument = { path = "../log-instrument", optional = true }
+ thiserror = "2.0.18"
+ 
++# wick: std::os::{unix, fd} on Windows (`extern crate wick_std as std` at the root).
++[target.'cfg(windows)'.dependencies]
++wick-std = { path = "../../../../crates/compat/std" }
++
+ [lints]
+ workspace = true
+diff --git a/src/utils/src/lib.rs b/src/utils/src/lib.rs
+index 5c0b8271b5c7025c050feb87fcc8965ef2b97c0d..a6ee889b5fa72e07f76e17aa9503e362643056d9 100644
+--- a/src/utils/src/lib.rs
++++ b/src/utils/src/lib.rs
+@@ -1,6 +1,10 @@
+ // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++// wick: std::os::{unix, fd} on Windows from wick's POSIX layer.
++#[cfg(windows)]
++extern crate wick_std as std;
++
+ pub mod arg_parser;
+ pub mod time;
+ pub mod validators;
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index 9c4b0075713de085b96135d42f19d231a463edca..33b58da06b30c2e452bc4bf149a24d4381ac39ef 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -62,6 +62,10 @@ vm-superio = "0.8.1"
+ vmm-sys-util = { version = "0.15.0", features = ["with-serde"] }
+ zerocopy = { version = "0.8.50" }
+ 
++# wick: std::os::{unix, fd} on Windows (`extern crate wick_std as std` at the root).
++[target.'cfg(windows)'.dependencies]
++wick-std = { path = "../../../../crates/compat/std" }
++
+ [target.'cfg(target_arch = "aarch64")'.dependencies]
+ vm-fdt = "0.3.0"
+ 
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 2cfbc8e25a09b4d661571f8d28f61e7eea94ec82..52394b6e08637d8fd59e51d7a349d711fba9fbf0 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -12,6 +12,10 @@
+ #![warn(clippy::undocumented_unsafe_blocks)]
+ #![allow(clippy::blanket_clippy_restriction_lints)]
+ 
++// wick: std::os::{unix, fd} on Windows from wick's POSIX layer.
++#[cfg(windows)]
++extern crate wick_std as std;
++
+ /// Implements platform specific functionality.
+ /// Supported platforms: x86_64 and aarch64.
+ pub mod arch;

@@ -2,3 +2,4 @@
 # by tools/setup.sh. Written by tools/patches.sh export; do not edit.
 0001-vmm-api-extension-point-for-wick-features.patch
 0002-build-Linux-only-dependencies-from-wick-s-compatibil.patch
+0003-windows-std-os-unix-fd-from-wick-std-at-the-crate-ro.patch
