@@ -59,7 +59,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Networking::WinSock::{
     FROM_PROTOCOL_INFO, INVALID_SOCKET, MSG_PEEK, SOCKET_ERROR, WSA_FLAG_NO_HANDLE_INHERIT,
-    WSADuplicateSocketW, WSAENOBUFS, WSAEWOULDBLOCK, WSAGetLastError, WSAPROTOCOL_INFOW,
+    WSA_FLAG_OVERLAPPED, WSADuplicateSocketW, WSAENOBUFS, WSAEWOULDBLOCK, WSAGetLastError, WSAPROTOCOL_INFOW,
     WSASocketW, recv, send,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
@@ -540,7 +540,7 @@ fn decode(entries: &[u8], count: usize) -> Result<Vec<(u32, RawFd)>> {
                         FROM_PROTOCOL_INFO,
                         &info,
                         0,
-                        WSA_FLAG_NO_HANDLE_INHERIT,
+                        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
                     )
                 };
                 if s == INVALID_SOCKET {

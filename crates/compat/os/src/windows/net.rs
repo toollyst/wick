@@ -24,9 +24,9 @@ use std::{fmt, mem, ptr};
 use windows_sys::Win32::Networking::WinSock::{
     AF_UNIX, FIONBIO, INVALID_SOCKET, SD_BOTH, SD_RECEIVE, SD_SEND, SIO_AF_UNIX_GETPEERPID,
     SO_ERROR, SO_RCVTIMEO, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR,
-    SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSADATA, WSAGetLastError, WSAIoctl, WSASocketW,
-    WSAStartup, accept, bind, connect, getpeername, getsockname, getsockopt, ioctlsocket, listen,
-    recv, send, setsockopt, shutdown,
+    SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSADATA, WSAGetLastError,
+    WSAIoctl, WSASocketW, WSAStartup, accept, bind, connect, getpeername, getsockname, getsockopt,
+    ioctlsocket, listen, recv, send, setsockopt, shutdown,
 };
 
 use super::fd::{
@@ -72,7 +72,7 @@ fn new_socket() -> io::Result<OwnedFd> {
             0,
             ptr::null(),
             0,
-            WSA_FLAG_NO_HANDLE_INHERIT,
+            WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
         )
     };
     if s == INVALID_SOCKET {
