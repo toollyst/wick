@@ -1,0 +1,596 @@
+// Copyright 2026 toollyst contributors.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+//! The WHP partition behind `VmFd`.
+//!
+//! A partition is created with the local APIC emulated by WHP and the CPUID
+//! and MSR exits Firecracker needs, its processor count set to the maximum up
+//! front (WHP fixes it before the partition is set up; fewer vCPUs may be
+//! created). Guest RAM is mapped with `WHvMapGpaRange`. The I/O APIC, the
+//! 8259 PICs and the 8254 PIT live in [`super::irqchip`]; GSIs raised by
+//! devices (through `irqfd`s) or by `set_irq_line` are routed by it to the
+//! local APIC with `WHvRequestInterrupt`.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
+
+use wick_os::fd::{AsRawFd, RawFd};
+use kvm_bindings::{
+    kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2, kvm_userspace_memory_region,
+    KvmIrqRouting, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
+};
+use vmm_sys_util::errno::Error;
+use vmm_sys_util::eventfd::EventFd;
+use windows_sys::Win32::System::Hypervisor as whv;
+use windows_sys::Win32::System::Hypervisor::WHV_PARTITION_HANDLE;
+
+use super::ffi;
+use super::irqchip::Irqchip;
+use super::vcpu::{VcpuFd, VcpuShared};
+use super::{err, Cap, DeviceFd, Handle, IoEventAddress, Result};
+
+/// Largest number of vCPUs a partition is set up for.
+pub(crate) const MAX_VCPUS: usize = 32;
+
+/// One mapped guest-memory slot.
+#[derive(Debug)]
+struct Slot {
+    guest_phys: u64,
+    size: u64,
+    log_dirty: bool,
+}
+
+/// A registered ioeventfd.
+#[derive(Debug)]
+struct IoEvent {
+    addr: IoEventAddress,
+    len: u32,
+    datamatch: Option<u64>,
+    /// A duplicate of the eventfd, signalled on a match.
+    eventfd: EventFd,
+}
+
+impl IoEvent {
+    fn matches(&self, addr: &IoEventAddress, data: &[u8]) -> bool {
+        if self.addr != *addr {
+            return false;
+        }
+        if self.len != 0 && self.len as usize != data.len() {
+            return false;
+        }
+        match self.datamatch {
+            None => true,
+            Some(want) => {
+                let mut buf = [0u8; 8];
+                buf[..data.len().min(8)].copy_from_slice(&data[..data.len().min(8)]);
+                u64::from_le_bytes(buf) == want
+            }
+        }
+    }
+}
+
+/// An irqfd: an eventfd whose signal raises `gsi`.
+#[derive(Debug)]
+struct IrqFd {
+    gsi: u32,
+    /// The eventfd's descriptor, to match on unregister.
+    fd: RawFd,
+    eventfd: EventFd,
+}
+
+/// The partition and everything attached to it.
+#[derive(Debug)]
+pub(crate) struct VmInner {
+    pub(crate) part: WHV_PARTITION_HANDLE,
+    memory: Mutex<HashMap<u32, Slot>>,
+    ioevents: RwLock<Vec<IoEvent>>,
+    irqfds: Mutex<Vec<IrqFd>>,
+    pub(crate) irqchip: Mutex<Irqchip>,
+    pub(crate) vcpus: Mutex<Vec<Weak<VcpuShared>>>,
+    /// The irqfd watcher thread wakes on this to stop.
+    stop_evt: EventFd,
+    stop: AtomicBool,
+    watcher: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Set once `create_irq_chip` has run.
+    pub(crate) has_irqchip: AtomicBool,
+}
+
+// SAFETY: the partition handle is an opaque value WHP accepts from any thread;
+// all mutable state is behind locks.
+unsafe impl Send for VmInner {}
+// SAFETY: as above.
+unsafe impl Sync for VmInner {}
+
+impl Drop for VmInner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.stop_evt.write(1);
+        if let Some(h) = self.watcher.lock().unwrap().take() {
+            let _ = h.join();
+        }
+        // SAFETY: deletes the partition this VM owns, after its vCPUs are gone.
+        unsafe { whv::WHvDeletePartition(self.part) };
+    }
+}
+
+impl VmInner {
+    /// If a guest access at `addr` of `data` matches an ioeventfd, signals it
+    /// and returns true (the access is consumed, no exit to Firecracker).
+    pub(crate) fn match_ioevent(&self, addr: &IoEventAddress, data: &[u8]) -> bool {
+        let ioevents = self.ioevents.read().unwrap();
+        for ev in ioevents.iter() {
+            if ev.matches(addr, data) {
+                let _ = ev.eventfd.write(1);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Raises `gsi`: the irqchip routes it to the local APIC.
+    pub(crate) fn raise_gsi(&self, gsi: u32, level: bool) {
+        let msi = self.irqchip.lock().unwrap().raise_gsi(gsi, level);
+        if let Some(msi) = msi {
+            self.inject_msi(msi.0, msi.1);
+        }
+    }
+
+    /// Injects an interrupt described by an MSI address/data pair.
+    pub(crate) fn inject_msi(&self, address: u64, data: u32) {
+        let control = super::irqchip::interrupt_control(address, data);
+        // SAFETY: a valid interrupt control of its size.
+        unsafe {
+            whv::WHvRequestInterrupt(
+                self.part,
+                &control,
+                u32::try_from(std::mem::size_of_val(&control)).unwrap(),
+            );
+        }
+    }
+}
+
+/// Finds a mapped VM's inner state from any live VM (for the vCPU thread's
+/// ioeventfd/irqchip callbacks, which are reached through the VcpuShared).
+impl VmFd {
+    pub(crate) fn create() -> Result<VmFd> {
+        let part = ffi::create_partition()?;
+        let inner = VmInner::setup(part).inspect_err(|_| {
+            // SAFETY: cleans up the partition we just created on failure.
+            unsafe { whv::WHvDeletePartition(part) };
+        })?;
+        let fd = Handle::new()?;
+        Ok(VmFd {
+            inner: Arc::new(inner),
+            fd,
+        })
+    }
+}
+
+impl VmInner {
+    fn setup(part: WHV_PARTITION_HANDLE) -> Result<VmInner> {
+        // Processor count must be set before the partition is set up.
+        let count = u32::try_from(MAX_VCPUS).unwrap();
+        // SAFETY: a u32 property value for ProcessorCount.
+        unsafe {
+            ffi::set_partition_property(
+                part,
+                whv::WHvPartitionPropertyCodeProcessorCount,
+                &count,
+            )?;
+        }
+        // Emulate the local APIC in WHP (xAPIC).
+        let apic_mode: i32 = whv::WHvX64LocalApicEmulationModeXApic;
+        // SAFETY: an i32 property value for LocalApicEmulationMode.
+        unsafe {
+            ffi::set_partition_property(
+                part,
+                whv::WHvPartitionPropertyCodeLocalApicEmulationMode,
+                &apic_mode,
+            )?;
+        }
+        // Exit on CPUID and MSR accesses so the backend can answer them
+        // (X64CpuidExit | X64MsrExit).
+        let exits_bits: u64 = (1 << 0) | (1 << 1);
+        // SAFETY: a u64 value for ExtendedVmExits.
+        unsafe {
+            ffi::set_partition_property(
+                part,
+                whv::WHvPartitionPropertyCodeExtendedVmExits,
+                &exits_bits,
+            )?;
+        }
+        // The CPUID leaves the backend intercepts (to apply Firecracker's
+        // configured CPUID); others use WHP's own virtualised values.
+        const CPUID_EXITS: &[u32] = &[
+            0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0xa, 0xb, 0xd, 0xf, 0x10, 0x14, 0x15, 0x16,
+            0x1f, 0x4000_0000, 0x4000_0001, 0x8000_0000, 0x8000_0001, 0x8000_0002, 0x8000_0003,
+            0x8000_0004, 0x8000_0005, 0x8000_0006, 0x8000_0007, 0x8000_0008, 0x8000_001d,
+            0x8000_001e,
+        ];
+        // SAFETY: an array of u32 CPUID function numbers.
+        ffi::hr(unsafe {
+            whv::WHvSetPartitionProperty(
+                part,
+                whv::WHvPartitionPropertyCodeCpuidExitList,
+                CPUID_EXITS.as_ptr().cast(),
+                u32::try_from(std::mem::size_of_val(CPUID_EXITS)).unwrap(),
+            )
+        })?;
+        // SAFETY: completes partition setup.
+        ffi::hr(unsafe { whv::WHvSetupPartition(part) })?;
+
+        let stop_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(io_err)?;
+        Ok(VmInner {
+            part,
+            memory: Mutex::new(HashMap::new()),
+            ioevents: RwLock::new(Vec::new()),
+            irqfds: Mutex::new(Vec::new()),
+            irqchip: Mutex::new(Irqchip::new()),
+            vcpus: Mutex::new(Vec::new()),
+            stop_evt,
+            stop: AtomicBool::new(false),
+            watcher: Mutex::new(None),
+            has_irqchip: AtomicBool::new(false),
+        })
+    }
+}
+
+fn io_err(e: std::io::Error) -> Error {
+    Error::new(e.raw_os_error().unwrap_or(libc::EINVAL))
+}
+
+/// Wrapper over a WHP partition.
+#[derive(Debug)]
+pub struct VmFd {
+    inner: Arc<VmInner>,
+    fd: Handle,
+}
+
+impl VmFd {
+    /// Maps, remaps or unmaps a guest-memory slot (a zero `memory_size`
+    /// unmaps the slot).
+    ///
+    /// # Safety
+    /// `region.userspace_addr` must point to `region.memory_size` bytes of
+    /// valid host memory that stays mapped while the region is registered.
+    pub unsafe fn set_user_memory_region(
+        &self,
+        region: kvm_userspace_memory_region,
+    ) -> Result<()> {
+        let mut memory = self.inner.memory.lock().unwrap();
+        // Remove a previous mapping in this slot.
+        if let Some(old) = memory.remove(&region.slot) {
+            // SAFETY: unmaps a range this VM mapped.
+            ffi::hr(unsafe {
+                whv::WHvUnmapGpaRange(self.inner.part, old.guest_phys, old.size)
+            })?;
+        }
+        if region.memory_size == 0 {
+            return Ok(());
+        }
+        let readonly = region.flags & KVM_MEM_READONLY != 0;
+        let log_dirty = region.flags & KVM_MEM_LOG_DIRTY_PAGES != 0;
+        let mut flags = whv::WHvMapGpaRangeFlagRead | whv::WHvMapGpaRangeFlagExecute;
+        if !readonly {
+            flags |= whv::WHvMapGpaRangeFlagWrite;
+        }
+        if log_dirty {
+            flags |= whv::WHvMapGpaRangeFlagTrackDirtyPages;
+        }
+        // SAFETY: the caller's contract for `userspace_addr`/`memory_size`.
+        ffi::hr(unsafe {
+            whv::WHvMapGpaRange(
+                self.inner.part,
+                region.userspace_addr as *const core::ffi::c_void,
+                region.guest_phys_addr,
+                region.memory_size,
+                flags,
+            )
+        })?;
+        memory.insert(
+            region.slot,
+            Slot {
+                guest_phys: region.guest_phys_addr,
+                size: region.memory_size,
+                log_dirty,
+            },
+        );
+        Ok(())
+    }
+
+    /// The dirty-page bitmap of a slot (one bit per guest page), cleared by
+    /// the query.
+    pub fn get_dirty_log(&self, slot: u32, memory_size: usize) -> Result<Vec<u64>> {
+        let memory = self.inner.memory.lock().unwrap();
+        let s = memory.get(&slot).ok_or_else(|| Error::new(libc::ENOENT))?;
+        if !s.log_dirty {
+            return err(libc::EINVAL);
+        }
+        let page = 4096usize;
+        let pages = memory_size.div_ceil(page);
+        let words = pages.div_ceil(64);
+        let mut bitmap = vec![0u64; words];
+        // SAFETY: a bitmap buffer of `words` u64s for `memory_size` bytes.
+        ffi::hr(unsafe {
+            whv::WHvQueryGpaRangeDirtyBitmap(
+                self.inner.part,
+                s.guest_phys,
+                memory_size as u64,
+                bitmap.as_mut_ptr(),
+                u32::try_from(words * 8).unwrap(),
+            )
+        })?;
+        Ok(bitmap)
+    }
+
+    /// Registers an eventfd that is signalled on a matching guest I/O write.
+    pub fn register_ioevent<T: Into<u64>>(
+        &self,
+        fd: &EventFd,
+        addr: &IoEventAddress,
+        datamatch: T,
+    ) -> Result<()> {
+        let datamatch_val = datamatch.into();
+        let has_datamatch = std::mem::size_of::<T>() > 0;
+        let eventfd = fd.try_clone().map_err(io_err)?;
+        self.inner.ioevents.write().unwrap().push(IoEvent {
+            addr: *addr,
+            len: 0,
+            datamatch: has_datamatch.then_some(datamatch_val),
+            eventfd,
+        });
+        Ok(())
+    }
+
+    /// Removes an eventfd registered with [`Self::register_ioevent`].
+    pub fn unregister_ioevent<T: Into<u64>>(
+        &self,
+        fd: &EventFd,
+        addr: &IoEventAddress,
+        datamatch: T,
+    ) -> Result<()> {
+        let datamatch_val = datamatch.into();
+        let has_datamatch = std::mem::size_of::<T>() > 0;
+        let want = has_datamatch.then_some(datamatch_val);
+        let mut ioevents = self.inner.ioevents.write().unwrap();
+        let before = ioevents.len();
+        ioevents.retain(|ev| {
+            !(ev.addr == *addr
+                && ev.datamatch == want
+                && ev.eventfd.as_raw_fd() == fd.as_raw_fd())
+        });
+        if ioevents.len() == before {
+            return err(libc::ENOENT);
+        }
+        Ok(())
+    }
+
+    /// Routes `fd` to raise `gsi` when signalled.
+    pub fn register_irqfd(&self, fd: &EventFd, gsi: u32) -> Result<()> {
+        let eventfd = fd.try_clone().map_err(io_err)?;
+        self.inner.irqfds.lock().unwrap().push(IrqFd {
+            gsi,
+            fd: fd.as_raw_fd(),
+            eventfd,
+        });
+        self.ensure_watcher();
+        Ok(())
+    }
+
+    /// Stops routing `fd` to `gsi`.
+    pub fn unregister_irqfd(&self, fd: &EventFd, gsi: u32) -> Result<()> {
+        let mut irqfds = self.inner.irqfds.lock().unwrap();
+        let before = irqfds.len();
+        irqfds.retain(|i| !(i.gsi == gsi && i.fd == fd.as_raw_fd()));
+        if irqfds.len() == before {
+            return err(libc::ENOENT);
+        }
+        Ok(())
+    }
+
+    /// Sets the GSI routing table (legacy IOAPIC pins and MSI entries).
+    pub fn set_gsi_routing(&self, irq_routing: &KvmIrqRouting) -> Result<()> {
+        self.inner
+            .irqchip
+            .lock()
+            .unwrap()
+            .set_gsi_routing(irq_routing.as_slice());
+        Ok(())
+    }
+
+    /// Raises or lowers a legacy IRQ line.
+    pub fn set_irq_line(&self, irq: u32, active: bool) -> Result<()> {
+        self.inner.raise_gsi(irq, active);
+        Ok(())
+    }
+
+    /// Reports an MSI as a direct interrupt request.
+    pub fn signal_msi(&self, msi: kvm_bindings::kvm_msi) -> Result<std::os::raw::c_int> {
+        self.inner.inject_msi(u64::from(msi.address_lo) | (u64::from(msi.address_hi) << 32), msi.data);
+        Ok(1)
+    }
+
+    /// Creates vCPU `id`.
+    pub fn create_vcpu(&self, id: u64) -> Result<VcpuFd> {
+        super::vcpu::create(self.inner.clone(), id)
+    }
+
+    /// Not supported: Firecracker creates raw-fd vCPUs only on aarch64.
+    ///
+    /// # Safety
+    /// Never called on x86_64.
+    pub unsafe fn create_vcpu_from_rawfd(&self, _fd: RawFd) -> Result<VcpuFd> {
+        err(libc::ENOTSUP)
+    }
+
+    /// Accepted: WHP manages the TSS/identity map itself, so there is nothing
+    /// to place (the guest's page tables use whatever Firecracker set up).
+    pub fn set_tss_address(&self, _offset: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Accepted, like `set_tss_address`.
+    pub fn set_identity_map_address(&self, _address: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Creates the userspace I/O APIC, PICs and (later) PIT.
+    pub fn create_irq_chip(&self) -> Result<()> {
+        self.inner.irqchip.lock().unwrap().enable();
+        self.inner.has_irqchip.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Creates the 8254 PIT.
+    pub fn create_pit2(&self, pit_config: kvm_pit_config) -> Result<()> {
+        self.inner.irqchip.lock().unwrap().create_pit(pit_config, &self.inner);
+        Ok(())
+    }
+
+    /// The PIT state.
+    pub fn get_pit2(&self) -> Result<kvm_pit_state2> {
+        Ok(self.inner.irqchip.lock().unwrap().pit_state())
+    }
+
+    /// Restores the PIT state.
+    pub fn set_pit2(&self, pitstate: &kvm_pit_state2) -> Result<()> {
+        self.inner
+            .irqchip
+            .lock()
+            .unwrap()
+            .set_pit_state(pitstate, &self.inner);
+        Ok(())
+    }
+
+    /// The guest clock (reference time).
+    pub fn get_clock(&self) -> Result<kvm_clock_data> {
+        Ok(self.inner.irqchip.lock().unwrap().clock())
+    }
+
+    /// Restores the guest clock.
+    pub fn set_clock(&self, clock: &kvm_clock_data) -> Result<()> {
+        self.inner.irqchip.lock().unwrap().set_clock(clock);
+        Ok(())
+    }
+
+    /// The state of one interrupt chip (PIC master/slave or IOAPIC).
+    pub fn get_irqchip(&self, irqchip: &mut kvm_irqchip) -> Result<()> {
+        self.inner.irqchip.lock().unwrap().get_chip(irqchip);
+        Ok(())
+    }
+
+    /// Restores the state of one interrupt chip.
+    pub fn set_irqchip(&self, irqchip: &kvm_irqchip) -> Result<()> {
+        self.inner.irqchip.lock().unwrap().set_chip(irqchip);
+        Ok(())
+    }
+
+    /// Not supported on x86_64.
+    pub fn create_device(
+        &self,
+        _device: &mut kvm_bindings::kvm_create_device,
+    ) -> Result<DeviceFd> {
+        DeviceFd::unsupported()
+    }
+
+    /// Size of the `kvm_run` area.
+    pub fn run_size(&self) -> usize {
+        std::mem::size_of::<kvm_bindings::kvm_run>()
+    }
+
+    pub fn check_extension_raw(&self, c: u64) -> i32 {
+        super::cap::supported(c)
+    }
+
+    pub fn check_extension_int(&self, c: Cap) -> i32 {
+        self.check_extension_raw(u64::from(c as u32))
+    }
+
+    pub fn check_extension(&self, c: Cap) -> bool {
+        self.check_extension_int(c) > 0
+    }
+
+    /// Starts the thread that waits on registered irqfds and raises their
+    /// GSIs, if it is not already running.
+    fn ensure_watcher(&self) {
+        let mut watcher = self.inner.watcher.lock().unwrap();
+        if watcher.is_some() {
+            return;
+        }
+        let inner = self.inner.clone();
+        *watcher = Some(std::thread::spawn(move || watch_irqfds(&inner)));
+    }
+}
+
+impl AsRawFd for VmFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+/// Waits on every registered irqfd; when one signals, raises its GSI. Woken
+/// by `stop_evt` to exit, and polls the irqfd set each cycle so newly
+/// registered fds are picked up.
+fn watch_irqfds(inner: &Arc<VmInner>) {
+    use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+    let Ok(epoll) = Epoll::new() else { return };
+    let mut registered: HashMap<RawFd, (u32, u64)> = HashMap::new();
+    let stop_fd = inner.stop_evt.as_raw_fd();
+    let _ = epoll.ctl(
+        ControlOperation::Add,
+        stop_fd,
+        EpollEvent::new(EventSet::IN, stop_fd as u64),
+    );
+    while !inner.stop.load(Ordering::Acquire) {
+        // Reconcile the registered set with the current irqfds.
+        {
+            let irqfds = inner.irqfds.lock().unwrap();
+            let current: HashMap<RawFd, (u32, u64)> = irqfds
+                .iter()
+                .map(|i| (i.eventfd.as_raw_fd(), (i.gsi, i.eventfd.as_raw_fd() as u64)))
+                .collect();
+            for fd in registered.keys().copied().collect::<Vec<_>>() {
+                if !current.contains_key(&fd) {
+                    let _ = epoll.ctl(ControlOperation::Delete, fd, EpollEvent::default());
+                    registered.remove(&fd);
+                }
+            }
+            for (&fd, &(gsi, _)) in &current {
+                if let std::collections::hash_map::Entry::Vacant(e) = registered.entry(fd) {
+                    let _ = epoll.ctl(
+                        ControlOperation::Add,
+                        fd,
+                        EpollEvent::new(EventSet::IN, fd as u64),
+                    );
+                    e.insert((gsi, fd as u64));
+                }
+            }
+        }
+        let mut events = [EpollEvent::default(); 16];
+        let n = match epoll.wait(1000, &mut events) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        for ev in &events[..n] {
+            let fd = ev.data() as RawFd;
+            if fd == stop_fd {
+                return;
+            }
+            // Drain the eventfd and raise its GSI (edge: raise then lower).
+            if let Some(&(gsi, _)) = registered.get(&fd) {
+                // Read to clear the signal (the eventfd keeps a counter).
+                let _ = read_eventfd(fd);
+                inner.raise_gsi(gsi, true);
+                inner.raise_gsi(gsi, false);
+            }
+        }
+    }
+}
+
+/// Clears an eventfd's counter.
+fn read_eventfd(fd: RawFd) -> bool {
+    let mut buf = [0u8; 8];
+    // SAFETY: a valid buffer; the fd is an eventfd this VM owns.
+    unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) > 0 }
+}

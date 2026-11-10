@@ -1,0 +1,38 @@
+# Compatibility build of kvm-ioctls for wick
+# (docs/ARCHITECTURE.md).
+# On Linux it re-exports the crates.io kvm-ioctls 0.25.0 unchanged. On macOS it
+# implements the subset of the API Firecracker uses on Hypervisor.framework, and
+# on Windows the same subset on the Windows Hypervisor Platform (WHP).
+[package]
+workspace = "../../../lib/firecracker"
+name = "kvm-ioctls"
+version = "0.25.0"
+authors = ["toollyst contributors"]
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[lib]
+bench = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Same source as the crates.io 0.25.0 release (src/ is identical, checked 2026-11-09).
+# kvm-bindings is patched to the same tag in the root Cargo.toml so there is one copy.
+upstream = { package = "kvm-ioctls", git = "https://github.com/rust-vmm/kvm", tag = "kvm-ioctls-v0.25.0" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+kvm-bindings = { version = "0.14.0", features = ["fam-wrappers"] }
+libc = "0.2.186"
+vmm-sys-util = "0.15.0"
+
+[target.'cfg(windows)'.dependencies]
+wick-os = { path = "../os" }
+kvm-bindings = { version = "0.14.0", features = ["fam-wrappers"] }
+libc = "0.2.186"
+vmm-sys-util = "0.15.0"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Hypervisor",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
