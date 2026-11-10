@@ -31,7 +31,7 @@ crates/compat/        compatibility builds of Linux-only dependencies
 crates/ext/           wick-ext: wick's features behind vmm::ext
 crates/version/       wick-version: the version the binaries report
 tools/                setup, patch workflow, generators, macOS run/test/boot test, vhost-user-blk test backend, Windows boot test and probe, release
-docs/                 this document and the roadmap
+docs/                 the documentation (docs/README.md is the index)
 ```
 
 `tools/setup.sh` checks out lib/firecracker at the release in `patches/base`

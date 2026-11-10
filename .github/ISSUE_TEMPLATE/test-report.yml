@@ -1,0 +1,38 @@
+name: Test report
+description: The result of a boot test on your machine, pass or fail. Especially wanted for Windows PCs with WHP.
+labels: [test-report]
+body:
+  - type: dropdown
+    id: test
+    attributes:
+      label: Test
+      options:
+        - tools/windows/boot-test.ps1 (Windows)
+        - tools/macos/boot-test.sh (macOS)
+        - Something else (describe below)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: wick commit or firecracker --version
+      description: The commit you built, or the CI run the firecracker.exe artifact came from.
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: OS version and CPU
+      placeholder: Windows 11 24H2 on Intel Core i7-1360P
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Result
+      description: >-
+        The PASS/FAIL summary the test printed. For boot-test.ps1, please also attach the
+        results-<time>.zip it writes.
+      render: console
+    validations:
+      required: true

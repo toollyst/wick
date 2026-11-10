@@ -1,5 +1,20 @@
 # Contributing to wick
 
+Thanks for looking. wick runs on three operating systems and many machines, and nobody has all of them, so some of
+the most useful contributions need no code at all:
+
+- **Test runs on hardware we don't have.** A Windows PC with the Windows Hypervisor Platform
+  (`tools/windows/boot-test.ps1`), Linux on aarch64 with KVM, a Mac with an M3 or M4. Open an issue with the result,
+  pass or fail.
+- **Bug reports.** Anything that works with upstream Firecracker on Linux and behaves differently with wick on
+  another host is a bug, unless the [roadmap](docs/ROADMAP.md) says that feature is not there yet.
+- **Fixes and features.** For anything bigger than a fix, open an issue first so we can agree on the shape. wick has
+  firm rules about where code goes and how upstream may change (below), and it is cheaper to talk before code.
+
+Security issues go through private reporting, not issues: see [SECURITY.md](SECURITY.md).
+[docs/README.md](docs/README.md) is the map of the repository, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+explains the design.
+
 ## Getting started
 
 ```sh
@@ -135,3 +150,14 @@ Mac before tagging.
 - Upstream tests left out on purpose: `test_licenses.py::test_for_valid_licenses`
   (wick's copyright headers) and `tests/integration_tests/performance/`
   (baselines measured on AWS bare metal).
+
+## Pull requests
+
+- One change per pull request, with a test that fails without it: a unit test in the crate, an interface test in
+  `platform::<iface>::tests` that runs against every backend, or a scenario in the boot tests.
+- Say which hosts you built and tested on. A change to a macOS backend needs a `tools/macos/boot-test.sh` run; a
+  change to a Windows backend that you could not run on a WHP machine should say so, and someone with one will.
+- Run the checks CI runs: `tools/patches.sh check`, the build and clippy for your host, and the compatibility crates'
+  tests (`.github/workflows/ci.yml` has the exact commands).
+
+By contributing, you agree that your work is licensed under the project's license (Apache-2.0).

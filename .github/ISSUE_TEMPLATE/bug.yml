@@ -1,0 +1,46 @@
+name: Bug report
+description: Something works with upstream Firecracker on Linux but not with wick, or doesn't work as documented.
+labels: [bug]
+body:
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host
+      options:
+        - macOS (Apple silicon)
+        - Windows (WHP)
+        - Linux (KVM)
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: >-
+        What you ran (API calls or the config file), what you expected, and what you got.
+        Paste Firecracker's log and the guest's serial output if you have them.
+      render: console
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: firecracker --version
+      placeholder: Firecracker v1.18.0
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: OS version and CPU
+      placeholder: macOS 15.5 on Apple M2, or Windows 11 24H2 on AMD Ryzen 7 7840U
+    validations:
+      required: true
+  - type: input
+    id: guest
+    attributes:
+      label: Guest kernel and rootfs
+      description: Upstream's CI images (which ones), or your own.
+  - type: markdown
+    attributes:
+      value: Security problems go through private reporting (see SECURITY.md), not here.

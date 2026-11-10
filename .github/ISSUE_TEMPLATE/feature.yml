@@ -1,0 +1,22 @@
+name: Feature request
+description: Something wick should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you're trying to do
+      description: >-
+        The problem first, then the solution you have in mind. If upstream Firecracker does it on Linux,
+        say how; wick's answer is usually the same semantics on the other hosts.
+    validations:
+      required: true
+  - type: dropdown
+    id: hosts
+    attributes:
+      label: Hosts
+      multiple: true
+      options:
+        - macOS
+        - Windows
+        - Linux

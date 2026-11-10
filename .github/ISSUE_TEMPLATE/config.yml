@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/toollyst/wick/security/advisories/new
+    about: Report privately. Please don't open a public issue.
+  - name: A bug in upstream Firecracker on Linux
+    url: https://github.com/firecracker-microvm/firecracker/issues
+    about: If it also happens with upstream Firecracker on Linux, it belongs to the Firecracker project.
