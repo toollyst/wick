@@ -1,0 +1,76 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Release (CONTRIBUTING.md, "Releases"): pushing a tag vX.Y.Z-wick.N builds the
+# macOS (Apple silicon) binary, signs it with the Hypervisor.framework
+# entitlement and publishes it as a GitHub Release in the upstream Firecracker
+# release layout (tools/package-release.sh). Hosted runners cannot run HVF
+# guests, so the guest smoke test runs on a Mac before the tag is pushed.
+name: release
+
+on:
+  push:
+    tags: ["v*-wick.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and upload, e.g. v1.18.0-wick.1"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  darwin-aarch64:
+    # hv_gic_* needs the macOS 15 SDK.
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          submodules: true
+      - name: Tag must be on main
+        run: |
+          git fetch -q origin main
+          git merge-base --is-ancestor "$(git rev-parse HEAD)" origin/main \
+            || { echo "::error::$TAG is not on main"; exit 1; }
+      - name: Apply and check the patch series
+        run: |
+          tools/setup.sh
+          tools/patches.sh check
+      - name: Build, sign and package
+        run: tools/package-release.sh "$TAG" dist
+      - name: Verify the package
+        run: |
+          cd dist
+          name="wick-$TAG-darwin-aarch64"
+          shasum -a 256 -c "$name.tgz.sha256.txt"
+          tar -xzf "$name.tgz"
+          bin="release-$TAG-darwin-aarch64/firecracker-$TAG-darwin-aarch64"
+          codesign --verify --strict "$bin"
+          codesign -d --entitlements - "$bin" 2>/dev/null | grep -q com.apple.security.hypervisor
+          "$bin" --version
+          rm -rf "release-$TAG-darwin-aarch64"
+      - name: Publish the release
+        run: |
+          notes="wick $TAG, built from upstream Firecracker $(cat patches/base).
+
+          - wick-$TAG-darwin-aarch64.tgz: macOS 15+ on Apple silicon (Hypervisor.framework),
+            ad-hoc signed with the com.apple.security.hypervisor entitlement. If a browser
+            downloaded it, clear the quarantine attribute: xattr -d com.apple.quarantine <file>.
+          - Check: shasum -a 256 -c wick-$TAG-darwin-aarch64.tgz.sha256.txt"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tgz dist/*.sha256.txt --clobber
+          else
+            gh release create "$TAG" dist/*.tgz dist/*.sha256.txt \
+              --title "$TAG" --notes "$notes" --verify-tag
+          fi
