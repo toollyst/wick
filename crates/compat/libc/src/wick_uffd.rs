@@ -839,37 +839,70 @@ fn words(buf: &[u8; proto::RECORD]) -> [u64; 4] {
     w
 }
 
-/// Receives a `HELLO` and its descriptor on the kernel end.
+/// Receives a record on the kernel end: `None` when every user descriptor
+/// is closed, else the descriptor of a `HELLO`. A record that is not a
+/// `HELLO`, or comes without a descriptor, is ignored; descriptors not kept
+/// are closed. A signal or a record sent in pieces does not end the
+/// userfaultfd.
 fn recv_hello(fd: c_int) -> Option<Option<c_int>> {
     let mut buf = [0u8; proto::RECORD];
-    let mut cmsg = [0u64; 8];
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: buf.len(),
-    };
-    // SAFETY: a zeroed msghdr is valid; the buffers outlive the call.
-    let n = unsafe {
-        let mut msg: libc::msghdr = core::mem::zeroed();
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cmsg.as_mut_ptr().cast();
-        msg.msg_controllen = core::mem::size_of_val(&cmsg) as _;
-        let n = libc::recvmsg(fd, &mut msg, libc::MSG_WAITALL);
-        if n == proto::RECORD as isize {
-            let c = libc::CMSG_FIRSTHDR(&msg);
-            if !c.is_null() && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let peer = *(libc::CMSG_DATA(c).cast::<c_int>());
-                return Some((words(&buf)[0] == proto::HELLO).then_some(peer));
+    let mut fds: Vec<c_int> = Vec::new();
+    let mut done = 0;
+    while done < buf.len() {
+        let mut cmsg = [0u64; 64];
+        let mut iov = libc::iovec {
+            iov_base: buf[done..].as_mut_ptr().cast(),
+            iov_len: buf.len() - done,
+        };
+        // SAFETY: a zeroed msghdr is valid; the buffers outlive the call, and
+        // the control messages read are those the kernel wrote.
+        let n = unsafe {
+            let mut msg: libc::msghdr = core::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg.as_mut_ptr().cast();
+            msg.msg_controllen = core::mem::size_of_val(&cmsg) as _;
+            let n = libc::recvmsg(fd, &mut msg, libc::MSG_WAITALL);
+            let mut c = if n > 0 {
+                libc::CMSG_FIRSTHDR(&msg)
+            } else {
+                ptr::null_mut()
+            };
+            while !c.is_null() {
+                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                    let data = libc::CMSG_DATA(c);
+                    let len = ((*c).cmsg_len as usize).saturating_sub(data as usize - c as usize);
+                    for i in 0..len / core::mem::size_of::<c_int>() {
+                        fds.push(ptr::read_unaligned(data.cast::<c_int>().add(i)));
+                    }
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
             }
+            n
+        };
+        if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
         }
-        n
-    };
-    if n <= 0 {
-        None
-    } else {
-        // A record without a descriptor: ignored.
-        Some(None)
+        if n <= 0 {
+            for fd in fds {
+                // SAFETY: descriptors received here and not kept.
+                unsafe { libc::close(fd) };
+            }
+            return None;
+        }
+        done += n as usize;
     }
+    let mut fds = fds.into_iter();
+    let peer = if words(&buf)[0] == proto::HELLO {
+        fds.next()
+    } else {
+        None
+    };
+    for fd in fds {
+        // SAFETY: descriptors received here and not kept.
+        unsafe { libc::close(fd) };
+    }
+    Some(peer)
 }
 
 /// Serves `[OP_COPY, dst, len, _]`, whose `len` bytes of data follow on
@@ -1242,6 +1275,8 @@ pub mod syscalls {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     fn map(pages: u64) -> u64 {
@@ -1473,5 +1508,90 @@ mod tests {
         let chan = channel(user);
         assert_eq!(request(chan, [proto::OP_WAKE, mem, ps, 0], &[]), (0, 0));
         close(&[chan, user]);
+    }
+
+    /// Whether the peer of `fd` closed it, within five seconds.
+    fn peer_closed(fd: c_int) -> bool {
+        if !readable(fd) {
+            return false;
+        }
+        let mut b = 0u8;
+        // SAFETY: reads one byte.
+        unsafe { libc::read(fd, (&mut b as *mut u8).cast(), 1) == 0 }
+    }
+
+    #[test]
+    fn test_records_close_descriptors_not_kept() {
+        let (_, user) = create(0, false, true).unwrap();
+        // A record that is not a HELLO: its descriptor is closed.
+        let [a, b] = socketpair();
+        send_record(user, [0x99, 0, 0, 0], proto::RECORD, &[b]);
+        // A HELLO with two: the first is the channel, the second is closed.
+        let [c, d] = socketpair();
+        let [e, f] = socketpair();
+        send_record(user, [proto::HELLO, 0, 0, 0], proto::RECORD, &[d, f]);
+        assert!(served(c));
+        close(&[b, d, f]);
+        assert!(peer_closed(a), "descriptor of a record not a HELLO kept");
+        assert!(peer_closed(e), "second descriptor of a HELLO kept");
+        assert!(served(c));
+        close(&[a, c, e, user]);
+    }
+
+    unsafe extern "C" {
+        fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> c_int;
+    }
+
+    /// Sends `sig` to every userfaultfd serving thread.
+    fn signal_serving_threads(sig: c_int) {
+        let mut list: libc::thread_act_array_t = ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: lists this task's threads; the list and its ports are
+        // released below.
+        unsafe {
+            let task = mach_task_self_;
+            assert_eq!(libc::task_threads(task, &mut list, &mut count), 0);
+            for i in 0..count as usize {
+                let port = *list.add(i);
+                let t = libc::pthread_from_mach_thread_np(port);
+                let mut name = [0 as libc::c_char; 64];
+                if t != 0 && libc::pthread_getname_np(t, name.as_mut_ptr(), name.len()) == 0 {
+                    let name = core::ffi::CStr::from_ptr(name.as_ptr());
+                    if name.to_bytes() == b"userfaultfd" {
+                        libc::pthread_kill(t, sig);
+                    }
+                }
+                mach_port_deallocate(task, port);
+            }
+            let size = count as usize * core::mem::size_of::<libc::thread_act_t>();
+            libc::vm_deallocate(task, list as libc::vm_address_t, size as libc::vm_size_t);
+        }
+    }
+
+    extern "C" fn ignore(_: c_int) {}
+
+    #[test]
+    fn test_signals_and_split_records() {
+        // A handler that interrupts the serving threads' system calls.
+        // SAFETY: installs a handler that does nothing, without SA_RESTART.
+        unsafe {
+            let mut act: libc::sigaction = core::mem::zeroed();
+            act.sa_sigaction = ignore as *const () as usize;
+            libc::sigemptyset(&mut act.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGUSR2, &act, ptr::null_mut()), 0);
+        }
+        let (_, user) = create(0, false, true).unwrap();
+        let [mine, theirs] = socketpair();
+        // Half a HELLO, and signals while the serving thread waits for the rest.
+        send_record(user, [proto::HELLO, 0, 0, 0], 16, &[theirs]);
+        let until = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < until {
+            signal_serving_threads(libc::SIGUSR2);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(write_full(user, &[0; 16]));
+        // The HELLO arrived whole: the channel is served.
+        assert!(served(mine));
+        close(&[theirs, mine, user]);
     }
 }
