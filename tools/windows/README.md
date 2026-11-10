@@ -4,6 +4,22 @@
   Firecracker's x86_64 CI guest, the counterpart of `tools/macos/boot-test.py`.
 - `winprobe.c` (`winprobe.exe` in CI's artifact): measures the host
   mechanisms the sandbox and jailer backends use.
+- `jailer-test.ps1`: the jailer on WHP hardware, the counterpart of
+  `tools/macos/jailer-test.py`. Stages: `refuse` (what Windows cannot
+  enforce is refused), `isolation` (`jail-probe.rs`, run through the jailer
+  as the jailed binary, may not read the user's files or SAM, write outside
+  its jail, reach another jail's files, API socket or process, or open the
+  operator's; the operator reaches the API socket), `boot` (a 2 vCPU guest
+  in the jail), `limits` (`memory.max`), `cpu` (`cpu.max`), and a check
+  that every jail's drive letter was removed. It needs the boot test's
+  guest files (`-Assets`, default `C:\wbt`) and `rustc` for the probe:
+
+  ```
+  powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir C:\wjt
+  ```
+
+  The `cpu` stage fails in about 1 run in 3: under the job's CPU hard cap a
+  WHP guest can stop taking interrupts (docs/ROADMAP.md, M5).
 
 CI builds both on every push and uploads them as the artifact
 `wick-windows-x86_64-<commit>`: `lib/firecracker/build/cargo_target/release/firecracker.exe`,
