@@ -395,17 +395,15 @@ impl VcpuFd {
 
     // ---- vCPU events ----
 
-    /// Not implemented yet: the pending exception, interrupt, NMI and SMI
-    /// state lives in WHP's pending-interruption and interrupt-state
-    /// registers, which this does not map yet. Only snapshots use it
-    /// (planned on Windows, docs/ROADMAP.md), and they fail loudly here
-    /// rather than save a state with pending events dropped.
+    /// The event the vCPU is delivering, its interrupt shadow and NMI mask,
+    /// from WHP's pending-interruption and interrupt-state registers (see
+    /// `regs`).
     pub fn get_vcpu_events(&self) -> Result<kvm_vcpu_events> {
-        err(libc::ENOTSUP)
+        regs::get_vcpu_events(self.part(), self.vp())
     }
-    /// See [`Self::get_vcpu_events`].
-    pub fn set_vcpu_events(&self, _events: &kvm_vcpu_events) -> Result<()> {
-        err(libc::ENOTSUP)
+    /// Restores what [`Self::get_vcpu_events`] returns.
+    pub fn set_vcpu_events(&self, events: &kvm_vcpu_events) -> Result<()> {
+        regs::set_vcpu_events(self.part(), self.vp(), events)
     }
 
     // ---- run control ----

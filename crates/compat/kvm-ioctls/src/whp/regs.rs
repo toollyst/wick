@@ -502,6 +502,136 @@ pub(crate) fn startup_suspend(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<()>
     )
 }
 
+// ---- vCPU events (kvm_vcpu_events) ----
+//
+// KVM keeps the event a vCPU is about to deliver (an exception, an NMI or an
+// external interrupt already taken from the interrupt controller) and its
+// interrupt shadow and NMI mask in `kvm_vcpu_events`. WHP keeps the same in
+// two registers:
+//
+// - `WHvRegisterPendingInterruption` (`WHV_X64_PENDING_INTERRUPTION_REGISTER`):
+//   bit 0 pending, bits 1-3 type (0 external interrupt, 2 NMI, 3 hardware
+//   exception, 4 software interrupt, 5-6 software exceptions, VMX's
+//   encoding), bit 4 error code valid, bits 16-31 vector, bits 32-63 error
+//   code;
+// - `WHvRegisterInterruptState` (`WHV_X64_INTERRUPT_STATE_REGISTER`): bit 0
+//   interrupt shadow (after `STI` or `MOV SS`), bit 1 NMIs masked.
+//
+// An NMI that is pending but not yet being delivered has no WHP register
+// (WHP delivers NMIs through the LAPIC at once), so `nmi.pending` reads as 0;
+// one restored from a KVM snapshot is delivered as the pending event when no
+// other event is.
+
+const PI_PENDING: u64 = 1;
+const PI_TYPE_SHIFT: u32 = 1;
+const PI_DELIVER_ERROR_CODE: u64 = 1 << 4;
+const PI_VECTOR_SHIFT: u32 = 16;
+const PI_ERROR_CODE_SHIFT: u32 = 32;
+const PI_TYPE_INTERRUPT: u64 = 0;
+const PI_TYPE_NMI: u64 = 2;
+const PI_TYPE_EXCEPTION: u64 = 3;
+const PI_TYPE_SOFTWARE_INTERRUPT: u64 = 4;
+const IS_INTERRUPT_SHADOW: u64 = 1;
+const IS_NMI_MASKED: u64 = 1 << 1;
+const NMI_VECTOR: u64 = 2;
+
+/// `kvm_vcpu_events` from the two WHP registers.
+pub(crate) fn events_from_whp(pending: u64, state: u64) -> kvm_bindings::kvm_vcpu_events {
+    // SAFETY: plain data, all zeros is "no event".
+    let mut e: kvm_bindings::kvm_vcpu_events = unsafe { std::mem::zeroed() };
+    if pending & PI_PENDING != 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        let vector = (pending >> PI_VECTOR_SHIFT) as u8;
+        match (pending >> PI_TYPE_SHIFT) & 0x7 {
+            PI_TYPE_INTERRUPT => {
+                e.interrupt.injected = 1;
+                e.interrupt.nr = vector;
+            }
+            PI_TYPE_SOFTWARE_INTERRUPT => {
+                e.interrupt.injected = 1;
+                e.interrupt.nr = vector;
+                e.interrupt.soft = 1;
+            }
+            PI_TYPE_NMI => e.nmi.injected = 1,
+            // Hardware and software exceptions.
+            _ => {
+                e.exception.injected = 1;
+                e.exception.nr = vector;
+                e.exception.has_error_code = u8::from(pending & PI_DELIVER_ERROR_CODE != 0);
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    e.exception.error_code = (pending >> PI_ERROR_CODE_SHIFT) as u32;
+                }
+            }
+        }
+    }
+    if state & IS_INTERRUPT_SHADOW != 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            e.interrupt.shadow = kvm_bindings::KVM_X86_SHADOW_INT_STI as u8;
+        }
+    }
+    e.nmi.masked = u8::from(state & IS_NMI_MASKED != 0);
+    e.flags = kvm_bindings::KVM_VCPUEVENT_VALID_SHADOW | kvm_bindings::KVM_VCPUEVENT_VALID_NMI_PENDING;
+    e
+}
+
+/// The two WHP register values (pending interruption, interrupt state) for
+/// `kvm_vcpu_events`. SMM and triple fault state is not representable;
+/// `EINVAL` if it is set, as KVM rejects what it does not support.
+pub(crate) fn events_to_whp(e: &kvm_bindings::kvm_vcpu_events) -> Result<(u64, u64)> {
+    if (e.flags & kvm_bindings::KVM_VCPUEVENT_VALID_SMM != 0 && (e.smi.smm != 0 || e.smi.pending != 0))
+        || (e.flags & kvm_bindings::KVM_VCPUEVENT_VALID_TRIPLE_FAULT != 0 && e.triple_fault.pending != 0)
+    {
+        return Err(Error::new(libc::EINVAL));
+    }
+    let pending = if e.exception.injected != 0 || e.exception.pending != 0 {
+        PI_PENDING
+            | (PI_TYPE_EXCEPTION << PI_TYPE_SHIFT)
+            | if e.exception.has_error_code != 0 { PI_DELIVER_ERROR_CODE } else { 0 }
+            | (u64::from(e.exception.nr) << PI_VECTOR_SHIFT)
+            | (u64::from(e.exception.error_code) << PI_ERROR_CODE_SHIFT)
+    } else if e.nmi.injected != 0
+        || (e.flags & kvm_bindings::KVM_VCPUEVENT_VALID_NMI_PENDING != 0 && e.nmi.pending != 0)
+    {
+        PI_PENDING | (PI_TYPE_NMI << PI_TYPE_SHIFT) | (NMI_VECTOR << PI_VECTOR_SHIFT)
+    } else if e.interrupt.injected != 0 {
+        let kind = if e.interrupt.soft != 0 { PI_TYPE_SOFTWARE_INTERRUPT } else { PI_TYPE_INTERRUPT };
+        PI_PENDING | (kind << PI_TYPE_SHIFT) | (u64::from(e.interrupt.nr) << PI_VECTOR_SHIFT)
+    } else {
+        0
+    };
+    let mut state = 0;
+    if e.flags & kvm_bindings::KVM_VCPUEVENT_VALID_SHADOW != 0 && e.interrupt.shadow != 0 {
+        state |= IS_INTERRUPT_SHADOW;
+    }
+    if e.nmi.masked != 0 {
+        state |= IS_NMI_MASKED;
+    }
+    Ok((pending, state))
+}
+
+const EVENT_NAMES: [WHV_REGISTER_NAME; 2] =
+    [whv::WHvRegisterPendingInterruption, whv::WHvRegisterInterruptState];
+
+pub(crate) fn get_vcpu_events(
+    part: WHV_PARTITION_HANDLE,
+    vp: u32,
+) -> Result<kvm_bindings::kvm_vcpu_events> {
+    let mut values = [unsafe { std::mem::zeroed() }; 2];
+    ffi::get_registers(part, vp, &EVENT_NAMES, &mut values)?;
+    Ok(events_from_whp(as_u64(&values[0]), as_u64(&values[1])))
+}
+
+pub(crate) fn set_vcpu_events(
+    part: WHV_PARTITION_HANDLE,
+    vp: u32,
+    e: &kvm_bindings::kvm_vcpu_events,
+) -> Result<()> {
+    let (pending, state) = events_to_whp(e)?;
+    ffi::set_registers(part, vp, &EVENT_NAMES, &[reg64(pending), reg64(state)])
+}
+
 // ---- CPUID ----
 
 /// The host CPUID leaves the guest may use. WHP applies its own masking when
@@ -736,6 +866,68 @@ mod tests {
             libc::EINVAL
         );
         assert_eq!(activity_from_mp_state(99).unwrap_err().errno(), libc::EINVAL);
+    }
+
+    #[test]
+    fn test_vcpu_events_roundtrip() {
+        use kvm_bindings::{kvm_vcpu_events, KVM_VCPUEVENT_VALID_NMI_PENDING, KVM_VCPUEVENT_VALID_SHADOW};
+        let zero: kvm_vcpu_events = unsafe { std::mem::zeroed() };
+
+        // Nothing pending.
+        assert_eq!(events_to_whp(&zero).unwrap(), (0, 0));
+        let e = events_from_whp(0, 0);
+        assert_eq!((e.exception.injected, e.interrupt.injected, e.nmi.injected), (0, 0, 0));
+        assert_eq!(e.flags, KVM_VCPUEVENT_VALID_SHADOW | KVM_VCPUEVENT_VALID_NMI_PENDING);
+
+        // A page fault with its error code, an interrupt shadow, NMIs masked.
+        let mut pf = zero;
+        pf.exception.injected = 1;
+        pf.exception.nr = 14;
+        pf.exception.has_error_code = 1;
+        pf.exception.error_code = 0x6;
+        pf.interrupt.shadow = 1;
+        pf.nmi.masked = 1;
+        pf.flags = KVM_VCPUEVENT_VALID_SHADOW;
+        let (pending, state) = events_to_whp(&pf).unwrap();
+        assert_eq!(pending, 1 | (3 << 1) | (1 << 4) | (14 << 16) | (0x6 << 32));
+        assert_eq!(state, 0b11);
+        let back = events_from_whp(pending, state);
+        assert_eq!(
+            (back.exception.injected, back.exception.nr, back.exception.has_error_code, back.exception.error_code),
+            (1, 14, 1, 0x6)
+        );
+        assert_ne!(back.interrupt.shadow, 0);
+        assert_eq!(back.nmi.masked, 1);
+
+        // An external interrupt taken from the LAPIC, and a software one.
+        for soft in [0u8, 1] {
+            let mut irq = zero;
+            irq.interrupt.injected = 1;
+            irq.interrupt.nr = 0xec;
+            irq.interrupt.soft = soft;
+            let (pending, state) = events_to_whp(&irq).unwrap();
+            assert_eq!(pending, 1 | (if soft == 1 { 4 << 1 } else { 0 }) | (0xec << 16));
+            assert_eq!(state, 0);
+            let back = events_from_whp(pending, state);
+            assert_eq!((back.interrupt.injected, back.interrupt.nr, back.interrupt.soft), (1, 0xec, soft));
+        }
+
+        // An NMI being delivered, and one only pending in a KVM snapshot.
+        let mut nmi = zero;
+        nmi.nmi.injected = 1;
+        let (pending, _) = events_to_whp(&nmi).unwrap();
+        assert_eq!(pending, 1 | (2 << 1) | (2 << 16));
+        assert_eq!(events_from_whp(pending, 0).nmi.injected, 1);
+        let mut queued = zero;
+        queued.nmi.pending = 1;
+        queued.flags = KVM_VCPUEVENT_VALID_NMI_PENDING;
+        assert_eq!(events_to_whp(&queued).unwrap().0, pending);
+
+        // SMM is not representable.
+        let mut smm = zero;
+        smm.flags = kvm_bindings::KVM_VCPUEVENT_VALID_SMM;
+        smm.smi.smm = 1;
+        assert_eq!(events_to_whp(&smm).unwrap_err().errno(), libc::EINVAL);
     }
 
     #[test]
