@@ -16,3 +16,4 @@
 0014-build-Cargo.lock-for-wick-s-dependencies.patch
 0015-version-binaries-report-upstream-wick.-N.patch
 0016-windows-snapshot-editor-gets-std-os-unix-fd-from-wic.patch
+0017-windows-the-uffd-example-handlers-build-on-Windows.patch
