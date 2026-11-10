@@ -14,10 +14,13 @@
 //! | `cpu.max` (`<quota> [<period>]`) | `cpu.cfs_quota_us`, `cpu.cfs_period_us` | CPU rate hard cap, `quota / period` CPUs of all the host's; refused for now (below) |
 //! | `pids.max` | `pids.max` | active process limit |
 //!
-//! A CPU limit is refused for now: under the job's CPU rate hard cap a jailed
-//! WHP guest can stop taking interrupts for good (about 1 run in 3 at a
-//! quarter of a CPU; never with the same cap on a Firecracker started outside
-//! the jailer). `--cgroup wick.cpu_cap=unsafe` accepts it, to measure it.
+//! A CPU limit is refused for now: a guest that boots under the job's CPU
+//! rate hard cap can stop taking interrupts for good (about 1 run in 3 at a
+//! quarter of a CPU). Linux calibrates its LAPIC timer against the PIT at
+//! boot (a WHP partition has no TSC deadline timer, which lets a KVM guest
+//! skip that); throttled, it finds the timer far too slow and disables it
+//! ("APIC frequency too slow"). The same cap applied 2 s after Firecracker started
+//! never stalled. `--cgroup wick.cpu_cap=unsafe` accepts it, to measure it.
 //!
 //! Every other controller and property is refused, never accepted without
 //! effect. Windows has no cgroup hierarchy, so the v2 hierarchy is a path that
