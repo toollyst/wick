@@ -707,7 +707,8 @@ impl VcpuFd {
 
     fn advance_pc(&self, hv: hv_vcpu_t) -> Result<()> {
         let pc = self.reg(hv, HV_REG_PC)?;
-        self.set_reg(hv, HV_REG_PC, pc + 4)
+        // A guest can run code in the last page of the address space.
+        self.set_reg(hv, HV_REG_PC, pc.wrapping_add(4))
     }
 
     fn complete_mmio_read(&mut self, hv: hv_vcpu_t) -> Result<()> {
