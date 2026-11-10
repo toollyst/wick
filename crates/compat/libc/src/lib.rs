@@ -41,6 +41,10 @@ pub use timerfd::*;
 
 #[cfg(windows)]
 extern crate std;
+/// The kernel side of userfaultfd (a wick API, not part of `libc`).
+#[cfg(windows)]
+#[path = "windows_uffd.rs"]
+pub mod wick_uffd;
 #[cfg(windows)]
 mod windows_errno;
 // Explicit, so they take precedence over the CRT values of `upstream`.
@@ -98,7 +102,8 @@ pub use windows_linux::{
 mod windows_socket;
 #[cfg(windows)]
 pub use windows_socket::{
-    getsockopt, setsockopt, socklen_t, AF_INET, AF_INET6, AF_UNIX, AF_UNSPEC, SOCK_DGRAM,
+    getsockopt, nfds_t, poll, pollfd, setsockopt, socklen_t, ucred, POLLERR, POLLHUP, POLLIN, POLLNVAL,
+    POLLOUT, POLLPRI, SO_PEERCRED, AF_INET, AF_INET6, AF_UNIX, AF_UNSPEC, SOCK_DGRAM,
     SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET, SO_DOMAIN, SO_ERROR, SO_KEEPALIVE, SO_RCVBUF,
     SO_REUSEADDR, SO_SNDBUF, SO_TYPE,
 };

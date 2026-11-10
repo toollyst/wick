@@ -560,6 +560,19 @@ impl VcpuFd {
                 whv::WHvRunVpExitReasonMemoryAccess => {
                     // SAFETY: the union arm matches the exit reason.
                     let mem = unsafe { ctx.Anonymous.MemoryAccess };
+                    // Guest RAM that is a missing userfaultfd page: WHP
+                    // honours its host PAGE_NOACCESS and exits at the
+                    // access, which re-runs once the handler filled it, as
+                    // KVM resolves the stage-2 fault through the host page.
+                    if libc::wick_uffd::active() {
+                        if let Some(host) = self.shared.inner.host_addr(mem.Gpa) {
+                            // SAFETY: the access-info bitfield overlaps the u32.
+                            let write = unsafe { mem.AccessInfo.AsUINT32 } & 0x3 == 1;
+                            if libc::wick_uffd::fault(host, write) {
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(exit) = self.mmio(&ctx.VpContext, &mem, scratch, mmio_completion)? {
                         return Ok(exit);
                     }

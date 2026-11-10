@@ -1107,11 +1107,109 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
     0
 }
 
-/// `madvise`.
+/// Moves the anonymous private mapping `[start, start + len)` (all of one
+/// mapping) into a pagefile-backed section mapped at the same address, and
+/// maps the section a second time: the alias, returned, through which
+/// `wick_uffd` fills pages. The pages `resident` marks (one byte per page,
+/// bit 0) keep their content; the others read as zeros.
+pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<usize, c_int> {
+    let mut t = table().lock().unwrap();
+    match t.get(&start) {
+        Some(r)
+            if r.len == len
+                && matches!(r.kind, Kind::Private { file: None })
+                && r.holes.is_empty()
+                && r.noaccess.is_empty() => {}
+        _ => return Err(crate::EINVAL),
+    }
+    let hi = u32::try_from((len as u64) >> 32).unwrap();
+    #[allow(clippy::cast_possible_truncation)]
+    let lo = len as u32;
+    // SAFETY: creates a pagefile-backed section.
+    let s = unsafe {
+        CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, hi, lo, std::ptr::null())
+    };
+    if s.is_null() {
+        return Err(crate::ENOMEM);
+    }
+    let section = Arc::new(Owned(s));
+    let view = |base: usize, flags| {
+        // SAFETY: maps our section, anywhere (`base` 0) or over a placeholder.
+        unsafe {
+            MapViewOfFile3(
+                s,
+                proc(),
+                base as *const c_void,
+                0,
+                len,
+                flags,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
+        .Value as usize
+    };
+    let alias = view(0, 0);
+    if alias == 0 {
+        return Err(crate::ENOMEM);
+    }
+    for (i, &b) in resident.iter().enumerate() {
+        if b & 1 != 0 {
+            // SAFETY: a resident page of the mapping, into the alias.
+            unsafe { std::ptr::copy_nonoverlapping((start + i * PAGE) as *const u8, (alias + i * PAGE) as *mut u8, PAGE) };
+        }
+    }
+    let unmap = |a: usize| {
+        // SAFETY: unmaps a view made here.
+        unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void }, 0) };
+    };
+    // SAFETY: gives the private allocation back as a placeholder.
+    if unsafe { VirtualFree(start as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        unmap(alias);
+        return Err(crate::EINVAL);
+    }
+    if view(start, MEM_REPLACE_PLACEHOLDER) != start {
+        // The address space stays reserved; the memory is gone.
+        t.get_mut(&start).unwrap().kind = Kind::Placeholder;
+        unmap(alias);
+        return Err(crate::ENOMEM);
+    }
+    t.get_mut(&start).unwrap().kind = Kind::View {
+        _section: section,
+        file: None,
+    };
+    Ok(alias)
+}
+
+/// Unmaps an alias made by [`uffd_alias`].
+pub(crate) fn uffd_unalias(alias: usize) {
+    // SAFETY: unmaps the alias view.
+    unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, 0) };
+}
+
+/// `madvise`. Discarding registered userfaultfd memory makes its pages
+/// missing again (`wick_uffd::discarding`), as on Linux.
 ///
 /// # Safety
 /// Same contract as `madvise(2)`.
 pub unsafe fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
+    if (advice == MADV_DONTNEED || advice == MADV_FREE) && crate::wick_uffd::active() {
+        let end = (addr as usize).saturating_add(len.div_ceil(PAGE) * PAGE);
+        return crate::wick_uffd::discarding(addr as u64, (end - addr as usize) as u64, || {
+            // SAFETY: the caller's contract.
+            unsafe { madvise_plain(addr, len, advice) }
+        });
+    }
+    // SAFETY: the caller's contract.
+    unsafe { madvise_plain(addr, len, advice) }
+}
+
+/// `madvise` without the userfaultfd side.
+///
+/// # Safety
+/// Same contract as `madvise(2)`.
+unsafe fn madvise_plain(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
     let start = addr as usize;
     if !start.is_multiple_of(PAGE) {
         return fail(crate::EINVAL, -1);

@@ -442,6 +442,8 @@ fn write_handle(h: HANDLE, buf: *const c_void, count: usize, at: Option<i64>) ->
 /// # Safety
 /// `buf` must be valid for `count` bytes of writes.
 pub unsafe fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
+    // Windows fails a read into missing userfaultfd pages; Linux waits.
+    crate::wick_uffd::prefault(buf as u64, count as u64, true);
     if let Some(timer) = crate::windows_time::lookup(fd) {
         // SAFETY: the caller's contract.
         let b = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), count) };
@@ -472,6 +474,7 @@ fn errno() -> c_int {
 /// # Safety
 /// `buf` must be valid for `count` bytes of reads.
 pub unsafe fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
+    crate::wick_uffd::prefault(buf as u64, count as u64, false);
     if let Some(limit) = grow_limit(fd) {
         let mut pos = 0i64;
         // SAFETY: queries the position.
@@ -521,6 +524,7 @@ pub unsafe fn pread(fd: c_int, buf: *mut c_void, count: size_t, offset: off_t) -
         set_errno(crate::EINVAL);
         return -1;
     }
+    crate::wick_uffd::prefault(buf as u64, count as u64, true);
     let h = handle(fd);
     keeping_position(h, || read_handle(h, buf, count, Some(offset)))
 }
@@ -541,6 +545,7 @@ pub unsafe fn pwrite(fd: c_int, buf: *const c_void, count: size_t, offset: off_t
         },
         None => count,
     };
+    crate::wick_uffd::prefault(buf as u64, count as u64, false);
     let h = handle(fd);
     keeping_position(h, || write_handle(h, buf, count, Some(offset)))
 }

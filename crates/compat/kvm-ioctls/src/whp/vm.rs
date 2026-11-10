@@ -38,6 +38,8 @@ pub(crate) const MAX_VCPUS: usize = 32;
 struct Slot {
     guest_phys: u64,
     size: u64,
+    /// The host address mapped at `guest_phys`.
+    host: u64,
     log_dirty: bool,
 }
 
@@ -125,6 +127,15 @@ impl Drop for VmInner {
 }
 
 impl VmInner {
+    /// The host address of guest RAM at `gpa`, if a slot maps it.
+    pub(crate) fn host_addr(&self, gpa: u64) -> Option<u64> {
+        let memory = self.memory.lock().unwrap();
+        memory
+            .values()
+            .find(|s| gpa >= s.guest_phys && gpa < s.guest_phys + s.size)
+            .map(|s| s.host + (gpa - s.guest_phys))
+    }
+
     /// If a guest access at `addr` of `data` matches an ioeventfd, signals it
     /// and returns true (the access is consumed, no exit to Firecracker).
     pub(crate) fn match_ioevent(&self, addr: &IoEventAddress, data: &[u8]) -> bool {
@@ -337,6 +348,7 @@ impl VmFd {
             Slot {
                 guest_phys: region.guest_phys_addr,
                 size: region.memory_size,
+                host: region.userspace_addr,
                 log_dirty,
             },
         );
