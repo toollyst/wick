@@ -485,6 +485,7 @@ impl VcpuFd {
 
         // Complete a read deferred from the previous exit.
         let mut mmio_completion = false;
+        let mut ram_retries = 0u32;
         if let Some(pending) = self.shared.pending.lock().unwrap().take() {
             match pending {
                 Pending::Mmio => mmio_completion = true,
@@ -601,13 +602,23 @@ impl VcpuFd {
                     // honours its host PAGE_NOACCESS and exits at the
                     // access, which re-runs once the handler filled it, as
                     // KVM resolves the stage-2 fault through the host page.
+                    // A page filled between the exit and the check (by the
+                    // handler, or for another vCPU) is not reported: the
+                    // access re-runs, never as MMIO, which would read zeros.
                     if libc::wick_uffd::active() {
                         if let Some(host) = self.shared.inner.host_addr(mem.Gpa) {
                             // SAFETY: the access-info bitfield overlaps the u32.
                             let write = unsafe { mem.AccessInfo.AsUINT32 } & 0x3 == 1;
                             if libc::wick_uffd::fault(host, write) {
+                                ram_retries = 0;
                                 continue;
                             }
+                            ram_retries += 1;
+                            if ram_retries < 1_000_000 {
+                                std::thread::yield_now();
+                                continue;
+                            }
+                            eprintln!("whp: guest RAM at {:#x} stays inaccessible", mem.Gpa);
                         }
                     }
                     if let Some(exit) = self.mmio(&ctx.VpContext, &mem, scratch, mmio_completion)? {
