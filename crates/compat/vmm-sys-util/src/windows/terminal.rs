@@ -11,14 +11,13 @@
 //! A handle that is not a console is left alone and the mode calls succeed,
 //! as the original does for a descriptor that is not a TTY.
 //!
-//! Console handles have no non-blocking mode; `set_non_block(true)` fails
-//! with `ERROR_NOT_SUPPORTED`. Readiness comes from [`crate::epoll`].
+//! `set_non_block` sets `O_NONBLOCK` with the compatibility `fcntl`, as the
+//! original does: pipes become non-blocking; consoles have no non-blocking
+//! mode, and their readiness comes from [`crate::epoll`].
 
 use std::io::StdinLock;
 
 use wick_os::fd::{RawFd, from_handle, handle};
-use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
-use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::System::Console::{
     CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
     ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
@@ -68,28 +67,39 @@ pub unsafe trait Terminal {
         })
     }
 
-    /// Sets the console to blocking (`false`) mode; non-blocking does not
-    /// exist for consoles.
-    #[allow(clippy::cast_possible_wrap)]
+    /// Sets `O_NONBLOCK` as the original does, with the compatibility
+    /// `fcntl`: a pipe becomes non-blocking (`PIPE_NOWAIT`), and a read with
+    /// nothing to read fails with `EAGAIN`; on a console the flag is kept but
+    /// a console read still waits for input (consoles have no non-blocking
+    /// mode; readiness comes from [`crate::epoll`]).
     fn set_non_block(&self, non_block: bool) -> Result<()> {
-        if non_block {
-            return Err(Error::new(ERROR_NOT_SUPPORTED as i32));
+        let fd = self.tty_fd();
+        // SAFETY: plain calls on the caller's descriptor.
+        let old = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if old < 0 {
+            return Err(Error::last());
+        }
+        let new = if non_block {
+            old | libc::O_NONBLOCK
+        } else {
+            old & !libc::O_NONBLOCK
+        };
+        // SAFETY: as above.
+        if new != old && unsafe { libc::fcntl(fd, libc::F_SETFL, new) } < 0 {
+            return Err(Error::last());
         }
         Ok(())
     }
 
-    /// Reads up to `out.len()` bytes from the console.
+    /// Reads up to `out.len()` bytes, with the compatibility `read`
+    /// (`EAGAIN` from a non-blocking pipe with nothing to read).
     fn read_raw(&self, out: &mut [u8]) -> Result<usize> {
-        let mut n = 0u32;
-        let len = u32::try_from(out.len()).unwrap_or(u32::MAX);
-        // SAFETY: the buffer is valid for `len` bytes.
-        let ok = unsafe {
-            ReadFile(handle(self.tty_fd()), out.as_mut_ptr(), len, &mut n, std::ptr::null_mut())
-        };
-        if ok == 0 {
+        // SAFETY: the buffer is valid for `out.len()` bytes.
+        let n = unsafe { libc::read(self.tty_fd(), out.as_mut_ptr().cast(), out.len()) };
+        if n < 0 {
             return Err(Error::last());
         }
-        Ok(n as usize)
+        Ok(n.unsigned_abs())
     }
 }
 
@@ -128,6 +138,21 @@ mod tests {
         let pipe = Fd(from_handle(r as RawHandle));
         pipe.set_raw_mode().unwrap();
         pipe.set_canon_mode().unwrap();
+        // Non-blocking, as Firecracker sets its standard input before the
+        // vCPUs start: nothing to read is EAGAIN, data reads.
+        pipe.set_non_block(true).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(pipe.read_raw(&mut buf).unwrap_err().errno(), libc::EAGAIN);
+        let mut n = 0u32;
+        // SAFETY: writes from a valid buffer to the pipe created above.
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::Storage::FileSystem::WriteFile(w, b"hi".as_ptr(), 2, &mut n, std::ptr::null_mut())
+            },
+            0
+        );
+        assert_eq!(pipe.read_raw(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"hi");
         pipe.set_non_block(false).unwrap();
         // SAFETY: closes the handles the test created.
         unsafe {

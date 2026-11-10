@@ -18,3 +18,4 @@
 0016-jailer-Linux-only-primitives-behind-a-backend-per-ho.patch
 0017-windows-snapshot-editor-gets-std-os-unix-fd-from-wic.patch
 0018-windows-the-uffd-example-handlers-build-on-Windows.patch
+0019-windows-the-serial-input-takes-an-empty-non-blocking.patch
