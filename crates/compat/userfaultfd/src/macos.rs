@@ -229,17 +229,39 @@ pub struct Uffd {
     /// The userfaultfd of this process this object made, if it made one.
     owner: Option<usize>,
     /// The request channel of an object made with `from_raw_fd`.
-    channel: OnceLock<Mutex<RawFd>>,
+    channel: OnceLock<Mutex<Channel>>,
+}
+
+/// A request channel to the serving thread.
+#[derive(Debug)]
+struct Channel {
+    /// Our end.
+    fd: RawFd,
+    /// The end sent to the serving thread with `HELLO`, until it has answered
+    /// a request. macOS can discard a descriptor that is only referenced by a
+    /// message in flight (the receiver then gets a socket whose peer is gone),
+    /// so the sender keeps it open until the receiver certainly holds it.
+    sent: Option<RawFd>,
+}
+
+impl Channel {
+    fn close(&mut self) {
+        // SAFETY: descriptors this channel owns.
+        unsafe {
+            libc::close(self.fd);
+            if let Some(fd) = self.sent.take() {
+                libc::close(fd);
+            }
+        }
+    }
 }
 
 impl Drop for Uffd {
     fn drop(&mut self) {
-        // SAFETY: descriptors this object owns.
-        unsafe {
-            libc::close(self.fd);
-            if let Some(channel) = self.channel.get() {
-                libc::close(*channel.lock().unwrap());
-            }
+        // SAFETY: the descriptor this object owns.
+        unsafe { libc::close(self.fd) };
+        if let Some(channel) = self.channel.get() {
+            channel.lock().unwrap().close();
         }
     }
 }
@@ -261,8 +283,7 @@ impl IntoRawFd for Uffd {
     fn into_raw_fd(self) -> RawFd {
         let fd = self.fd;
         if let Some(channel) = self.channel.get() {
-            // SAFETY: the channel this object owns.
-            unsafe { libc::close(*channel.lock().unwrap()) };
+            channel.lock().unwrap().close();
         }
         mem::forget(self);
         fd
@@ -337,7 +358,7 @@ type Reply = std::result::Result<u64, (i32, u64)>;
 impl Uffd {
     /// The request channel, set up on first use: a socket pair whose other
     /// end is sent to the serving thread with `HELLO`.
-    fn channel(&self) -> nix::Result<&Mutex<RawFd>> {
+    fn channel(&self) -> nix::Result<&Mutex<Channel>> {
         if let Some(c) = self.channel.get() {
             return Ok(c);
         }
@@ -375,34 +396,35 @@ impl Uffd {
             (*c).cmsg_type = libc::SCM_RIGHTS;
             (*c).cmsg_len = libc::CMSG_LEN(mem::size_of::<RawFd>() as u32) as _;
             *(libc::CMSG_DATA(c).cast::<RawFd>()) = theirs;
-            let n = libc::sendmsg(self.fd, &msg, 0);
-            libc::close(theirs);
-            n
+            libc::sendmsg(self.fd, &msg, 0)
+        };
+        let mut channel = Channel {
+            fd: mine,
+            sent: Some(theirs),
         };
         if sent != proto::RECORD as isize {
             let e = Errno::last();
-            // SAFETY: our end, not shared yet.
-            unsafe { libc::close(mine) };
+            channel.close();
             return Err(e);
         }
-        match self.channel.set(Mutex::new(mine)) {
-            Ok(()) => {}
-            Err(other) => {
-                // Another thread set one up first.
-                // SAFETY: ours, unused.
-                unsafe { libc::close(*other.lock().unwrap()) };
-            }
+        if let Err(other) = self.channel.set(Mutex::new(channel)) {
+            // Another thread set one up first.
+            other.into_inner().unwrap().close();
         }
         Ok(self.channel.get().unwrap())
     }
 
     /// Sends a request (with `payload`) and returns the reply.
     fn request(&self, head: [u64; 4], payload: &[u8]) -> nix::Result<Reply> {
-        let channel = self.channel()?.lock().unwrap();
-        write_all(*channel, &record(head))?;
-        write_all(*channel, payload)?;
+        let mut channel = self.channel()?.lock().unwrap();
+        write_all(channel.fd, &record(head))?;
+        write_all(channel.fd, payload)?;
         let mut reply = [0u8; proto::RECORD];
-        read_all(*channel, &mut reply)?;
+        read_all(channel.fd, &mut reply)?;
+        if let Some(fd) = channel.sent.take() {
+            // SAFETY: the serving thread holds its own copy now.
+            unsafe { libc::close(fd) };
+        }
         let [result, count, _, _] = words(&reply);
         let result = result as i64;
         Ok(if result < 0 {
