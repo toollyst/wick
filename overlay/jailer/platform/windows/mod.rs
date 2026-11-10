@@ -24,8 +24,14 @@
 //!   token with the user's SID, for the loader to initialise; Firecracker
 //!   reverts to the lockdown token first thing (`vmm::ext::jail`), the
 //!   pattern of the Chromium sandbox.
-//! - **The jail directory** grants the restricted token (`RESTRICTED`) full
-//!   access, inherited, and has a low mandatory label.
+//! - **Each jail has a SID of its own** (random), the Windows counterpart of a
+//!   per-microVM uid: the token's only restricting SID that its directory
+//!   grants. The other restricting SIDs are those every process of the
+//!   session has (Everyone, Users, Authenticated Users, Interactive, the
+//!   logon SID), so they open nothing a process of the session could not.
+//! - **The jail directory** is protected from what its parent grants and
+//!   grants full access, inherited, to the jail's SID, the user, SYSTEM and
+//!   the administrators; it has a low mandatory label.
 //! - **cgroups are a Job Object** ([`cgroup`](super::cgroup)): job memory
 //!   limit, CPU rate hard cap, active process limit; the job kills
 //!   Firecracker when the jailer goes and limits its UI access.
@@ -46,11 +52,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, STILL_ACTIVE,
     LocalFree, SetHandleInformation,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW,
     SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
@@ -58,12 +66,12 @@ use windows_sys::Win32::Security::{
     GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, GetTokenInformation,
     LABEL_SECURITY_INFORMATION, LUA_TOKEN, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
     SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS,
-    TOKEN_DEFAULT_DACL, TOKEN_GROUPS,
+    TOKEN_DEFAULT_DACL, TOKEN_GROUPS, TOKEN_QUERY,
     TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenImpersonation,
-    TokenIntegrityLevel, TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION, ACL,
+    TokenIntegrityLevel, TokenUser, PROTECTED_DACL_SECURITY_INFORMATION, ACL,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DDD_EXACT_MATCH_ON_REMOVE, DDD_REMOVE_DEFINITION, DefineDosDeviceW, GetLogicalDrives,
+    DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION, DefineDosDeviceW, GetLogicalDrives,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -84,7 +92,8 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    GetExitCodeProcess, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, SetThreadToken, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
@@ -108,22 +117,56 @@ const HANDOVER_MARK: &[u8] = b"wick-jail-handover:v1\0";
 /// there on Windows (crates/compat/memfd); on Linux they are kernel objects.
 const JAIL_TMP: &str = "tmp";
 
-/// Restricting SIDs of the lockdown token: what any process of the session
-/// may have, never the user's own SID. `RESTRICTED` (S-1-5-12) is the one the
-/// jail directory and the token's default DACL grant.
-const RESTRICTING_SIDS: [&str; 5] = [
+/// Restricting SIDs of the lockdown token besides the jail's own
+/// ([`vm_sid`]): what any process of the session may have, never the user's
+/// own SID. Each grants only what every process of the session is granted
+/// anyway; the jail's SID is the only one its directory grants.
+const RESTRICTING_SIDS: [&str; 4] = [
     "S-1-1-0",      // Everyone
     "S-1-5-32-545", // Users
-    "S-1-5-12",     // RESTRICTED
     "S-1-5-11",     // Authenticated Users
     "S-1-5-4",      // Interactive
 ];
+
+/// The SID of this jail, which only its tokens have (as a restricting SID):
+/// the Windows counterpart of a per-microVM uid. Random, in the resource
+/// manager authority (S-1-9), where no account lives. Without one, every
+/// jailed process had the same restricting SIDs and the jail directories
+/// granted them all: one microVM could read and write another's jail and
+/// connect to its API socket (measured with tools/windows/jail-probe.rs).
+fn vm_sid() -> &'static str {
+    static SID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SID.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        // `RandomState` keys come from the system's random number generator.
+        let word = |n: u64| {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u64(n);
+            h.finish()
+        };
+        let (a, b) = (word(1), word(2));
+        #[allow(clippy::cast_possible_truncation)]
+        let parts = [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32];
+        format!("S-1-9-{}-{}-{}-{}", parts[0], parts[1], parts[2], parts[3])
+    })
+}
+
 /// The default DACL of both tokens: what the process creates (its own process
-/// and threads first) is open to SYSTEM, the restricted SID and the owner.
-const DEFAULT_DACL: &str = "D:(A;;GA;;;SY)(A;;GA;;;RC)(A;;GA;;;OW)";
-/// The jail directory: full access for the restricted token, inherited, on
-/// top of what the directory inherits from its parent.
-const JAIL_DACL: &str = "D:AI(A;OICI;FA;;;RC)";
+/// and threads first) is open to SYSTEM, the jail's SID and the owner.
+fn default_dacl() -> String {
+    format!("D:(A;;GA;;;SY)(A;;GA;;;{})(A;;GA;;;OW)", vm_sid())
+}
+
+/// The jail directory, protected from what its parent grants (`C:\`'s
+/// Authenticated Users: Modify would let every jail in): full access for
+/// SYSTEM, the administrators, the user (who also needs `WRITE_OWNER` for
+/// the label below) and the jail's SID, inherited.
+fn jail_dacl(user: &str) -> String {
+    format!(
+        "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{})",
+        vm_sid()
+    )
+}
 /// Low mandatory label, inherited, no write up.
 const JAIL_LABEL: &str = "S:(ML;OICI;NW;;;LW)";
 /// Low integrity.
@@ -338,10 +381,17 @@ pub(crate) fn enter_jail(path: &Path) -> Result<(), JailerError> {
     let root = plain(path);
     let fail = |what, err| HostError::Jail(root.clone(), what, err);
     std::fs::create_dir_all(&root).map_err(|e| fail("create the directory", e))?;
-    set_security(&root, JAIL_DACL, false).map_err(|e| fail("grant the restricted token", e))?;
+    let user = user_sid().map_err(|e| fail("the user's SID", e))?;
+    set_security(&root, &jail_dacl(&user), false)
+        .map_err(|e| fail("grant the jail's SID", e))?;
     set_security(&root, JAIL_LABEL, true).map_err(|e| fail("set the low integrity label", e))?;
     std::fs::create_dir_all(root.join(JAIL_TMP)).map_err(|e| fail("create tmp", e))?;
     let drive = map_drive(&root).map_err(JailerError::from)?;
+    // A step that fails from here on ends the jailer through `exit`, which
+    // runs this: the drive goes with it (a killed jailer's goes at the next
+    // jailer's sweep).
+    // SAFETY: registers a handler that only takes a lock and removes a mapping.
+    unsafe { atexit(unmap_at_exit) };
     std::env::set_current_dir(format!("{drive}\\")).map_err(JailerError::ChdirNewRoot)?;
     let mut jail = JAIL.lock().unwrap();
     if jail.is_some() {
@@ -382,7 +432,7 @@ fn set_security(path: &Path, sddl: &str, label: bool) -> io::Result<()> {
         let info = if label {
             LABEL_SECURITY_INFORMATION
         } else {
-            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
         };
         let (dacl, sacl): (*const ACL, *const ACL) =
             if label { (std::ptr::null(), acl) } else { (acl, std::ptr::null()) };
@@ -407,6 +457,7 @@ fn set_security(path: &Path, sddl: &str, label: bool) -> io::Result<()> {
 
 /// Maps the highest free drive letter to `root`.
 fn map_drive(root: &Path) -> Result<String, HostError> {
+    sweep_drives(root);
     // SAFETY: plain call.
     let used = unsafe { GetLogicalDrives() };
     let target = wide(root);
@@ -417,22 +468,111 @@ fn map_drive(root: &Path) -> Result<String, HostError> {
         let drive = format!("{}:", letter as char);
         // SAFETY: NUL-terminated device name and target.
         if unsafe { DefineDosDeviceW(0, wide(&drive).as_ptr(), target.as_ptr()) } != 0 {
+            record_drive(&drive, root);
             return Ok(drive);
         }
     }
     Err(HostError::NoDriveLetter)
 }
 
+unsafe extern "C" {
+    /// The C runtime's: `std::process::exit` and returning from `main` run
+    /// the handlers.
+    fn atexit(f: extern "C" fn()) -> i32;
+}
+
+extern "C" fn unmap_at_exit() {
+    if let Ok(jail) = JAIL.try_lock() {
+        if let Some(jail) = jail.as_ref() {
+            unmap_drive(jail);
+        }
+    }
+}
+
 /// Removes the jail's drive mapping.
 fn unmap_drive(jail: &Jail) {
+    remove_drive(&jail.drive, &jail.root.to_string_lossy());
+}
+
+/// Removes the mapping of `drive` to `target` (only that definition) and its
+/// record.
+fn remove_drive(drive: &str, target: &str) {
+    // The definition is stored as the NT path `\??\<target>`, which an exact
+    // match compares raw: without DDD_RAW_TARGET_PATH nothing matched and the
+    // mapping stayed.
+    let raw = format!(r"\??\{target}");
     // SAFETY: NUL-terminated device name and target; removes our definition only.
     unsafe {
         DefineDosDeviceW(
-            DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
-            wide(&jail.drive).as_ptr(),
-            wide(&jail.root).as_ptr(),
+            DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
+            wide(drive).as_ptr(),
+            wide(&raw).as_ptr(),
         )
     };
+    if let Some(dir) = drives_dir(Path::new(target)) {
+        let _ = std::fs::remove_file(dir.join(&drive[..1]));
+    }
+}
+
+/// Where the jailer records the drives it mapped, in the chroot base
+/// directory of the jail `root` (`<base>\<exec>\<id>\root`; upstream clears
+/// the environment, so no profile directory is known): `DefineDosDevice`
+/// mappings last as long as the logon session, so a jailer that was killed
+/// (or failed after mapping) would leave its letter taken until sign-out.
+/// Each record, named by the letter, holds the jailer's pid and start time
+/// and the target; the next jailer of the base removes the mappings of
+/// jailers that are gone.
+fn drives_dir(root: &Path) -> Option<PathBuf> {
+    let dir = root.ancestors().nth(3)?.join(".wick-drives");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// A process's start time, `None` if it is not running.
+fn start_time(pid: u32) -> Option<u64> {
+    // SAFETY: plain call; the handle is closed below.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        return None;
+    }
+    // SAFETY: a handle we own.
+    let h = unsafe { OwnedHandle::from_raw_handle(h) };
+    let mut times = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let [created, exited, kernel, user] = &mut times;
+    // SAFETY: four out-parameters.
+    if unsafe { GetProcessTimes(h.as_raw_handle(), created, exited, kernel, user) } == 0 {
+        return None;
+    }
+    let mut code = 0u32;
+    // SAFETY: as above.
+    if unsafe { GetExitCodeProcess(h.as_raw_handle(), &mut code) } == 0 || code != STILL_ACTIVE.cast_unsigned() {
+        return None;
+    }
+    Some(u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
+}
+
+fn record_drive(drive: &str, root: &Path) {
+    let Some(dir) = drives_dir(root) else { return };
+    let pid = std::process::id();
+    let started = start_time(pid).unwrap_or(0);
+    let _ = std::fs::write(dir.join(&drive[..1]), format!("{pid} {started}\n{}", root.display()));
+}
+
+/// Removes the recorded mappings of the base of `root` whose jailer is gone.
+fn sweep_drives(root: &Path) {
+    let Some(dir) = drives_dir(root) else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    for e in entries.flatten() {
+        let letter = e.file_name().to_string_lossy().into_owned();
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        let Some((owner, target)) = text.split_once('\n') else { continue };
+        let mut owner = owner.split(' ').map(|w| w.parse::<u64>().ok());
+        let (Some(Some(pid)), Some(Some(started))) = (owner.next(), owner.next()) else { continue };
+        let alive = u32::try_from(pid).ok().and_then(start_time) == Some(started);
+        if !alive {
+            remove_drive(&format!("{letter}:"), target);
+        }
+    }
 }
 
 /// A SID from its string form, freed with `LocalFree`.
@@ -454,6 +594,31 @@ impl Drop for Sid {
         // SAFETY: allocated by ConvertStringSidToSidW.
         unsafe { LocalFree(self.0) };
     }
+}
+
+/// The user's SID, as a string.
+fn user_sid() -> io::Result<String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: our own token.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a token handle we own.
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let user = token_info(token.as_raw_handle(), TokenUser).map_err(io::Error::other)?;
+    let mut text: *mut u16 = std::ptr::null_mut();
+    // SAFETY: the buffer holds a TOKEN_USER; an out-pointer.
+    if unsafe { ConvertSidToStringSidW((*user.as_ptr().cast::<TOKEN_USER>()).User.Sid, &mut text) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a NUL-terminated string allocated by the conversion.
+    let sid = unsafe {
+        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+        LocalFree(text.cast());
+        s
+    };
+    Ok(sid)
 }
 
 /// A token information class, in a buffer of the size the token asks for.
@@ -507,7 +672,12 @@ fn tokens() -> Result<Tokens, HostError> {
     // SAFETY: the buffer holds a TOKEN_USER.
     let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
 
-    let sids: Vec<Sid> = RESTRICTING_SIDS.iter().map(|s| Sid::new(s)).collect::<Result<_, _>>()?;
+    let sids: Vec<Sid> = RESTRICTING_SIDS
+        .iter()
+        .copied()
+        .chain(Some(vm_sid()))
+        .map(Sid::new)
+        .collect::<Result<_, _>>()?;
     let mut restricting: Vec<SID_AND_ATTRIBUTES> =
         sids.iter().map(|s| SID_AND_ATTRIBUTES { Sid: s.0, Attributes: 0 }).collect();
     restricting.push(SID_AND_ATTRIBUTES { Sid: logon, Attributes: 0 });
@@ -562,7 +732,7 @@ fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedH
     // SAFETY: a NUL-terminated SDDL string and an out-pointer.
     if unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            wide(DEFAULT_DACL).as_ptr(),
+            wide(&default_dacl()).as_ptr(),
             SDDL_REVISION_1,
             &mut sd,
             std::ptr::null_mut(),
