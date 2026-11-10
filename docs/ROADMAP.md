@@ -129,7 +129,7 @@ since no program can start inside a chroot there (dyld maps the system libraries
 
 | Control | macOS | Windows |
 | --- | --- | --- |
-| System call filter | Seatbelt `syscall-unix` allow-lists (kernel-enforced, process-wide; verified) | win32k lockdown, ACG, strict handle checks, extension-point and image-load policies (verified with Firecracker's run-time needs) |
+| System call filter | in place: a Seatbelt `syscall-unix` allow-list, process-wide, measured over every boot-test stage; any other call raises SIGSYS and Firecracker exits with upstream's bad-syscall code | win32k lockdown, ACG, strict handle checks, extension-point and image-load policies (verified with Firecracker's run-time needs) |
 | chroot | in place: `chroot(2)` by the jailer, and by Firecracker first thing after the exec; Seatbelt file rule limited to the jail | AppContainer + jail directory ACL (user files denied, verified) |
 | network namespace | in place: Seatbelt denies IP networking; `--netns` is refused | AppContainer without capabilities (internet and loopback blocked, `AF_UNIX` API socket works; verified) |
 | uid/gid | in place: dropped by Firecracker right after its chroot, exec'd from a root-owned copy the jailed user never could write | per-VM AppContainer SID |
