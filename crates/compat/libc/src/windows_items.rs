@@ -199,3 +199,49 @@ pub unsafe fn sigismember(set: *const sigset_t, signum: crate::c_int) -> crate::
 
 /// `pthread_t`: the value of a thread handle.
 pub type pthread_t = usize;
+
+/// Process ids (Windows process ids fit).
+pub type pid_t = i32;
+/// User ids (no Windows equivalent; 0 where one is reported).
+pub type uid_t = u32;
+/// Group ids (no Windows equivalent; 0 where one is reported).
+pub type gid_t = u32;
+
+/// `kill`: `SIGKILL` and `SIGTERM` end process `pid` with exit status
+/// 128 + the signal, as the shell reports a process killed by it; signal 0
+/// checks that it exists. Windows cannot deliver other signals to another
+/// process, nor signal process groups: those fail with `EINVAL`. `ESRCH` if
+/// there is no such process, `EPERM` if this one may not end it.
+///
+/// # Safety
+/// No requirements; `unsafe` like the libc function.
+pub unsafe fn kill(pid: pid_t, sig: crate::c_int) -> crate::c_int {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+    };
+    let terminate = sig == SIGKILL || sig == crate::SIGTERM;
+    if pid <= 0 || !(terminate || sig == 0) {
+        crate::windows_fd::set_errno(crate::EINVAL);
+        return -1;
+    }
+    let access = if terminate { PROCESS_TERMINATE } else { PROCESS_QUERY_LIMITED_INFORMATION };
+    // SAFETY: plain call.
+    let h = unsafe { OpenProcess(access, 0, pid.cast_unsigned()) };
+    if h.is_null() {
+        // SAFETY: plain call.
+        let e = unsafe { GetLastError() };
+        crate::windows_fd::set_errno(if e == ERROR_ACCESS_DENIED { crate::EPERM } else { crate::ESRCH });
+        return -1;
+    }
+    // SAFETY: a process handle opened above.
+    let ok = !terminate || unsafe { TerminateProcess(h, (128 + sig).cast_unsigned()) } != 0;
+    // SAFETY: as above.
+    unsafe { CloseHandle(h) };
+    if ok {
+        0
+    } else {
+        crate::windows_fd::set_errno(crate::EPERM);
+        -1
+    }
+}

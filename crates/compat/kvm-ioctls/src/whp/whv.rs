@@ -165,6 +165,20 @@ pub(crate) unsafe fn WHvEmulatorCreateEmulator(
     }
 }
 
+/// `WHvEmulatorDestroyEmulator` from `winhvemulation.dll`, loaded at first use.
+///
+/// # Safety
+/// As the Windows function.
+pub(crate) unsafe fn WHvEmulatorDestroyEmulator(emulator: *mut core::ffi::c_void) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut core::ffi::c_void) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Emulation, c"WHvEmulatorDestroyEmulator")) {
+        // SAFETY: the address of `WHvEmulatorDestroyEmulator`, whose signature `F` is.
+        Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(emulator) },
+        None => unavailable(Dll::Emulation),
+    }
+}
+
 /// `WHvEmulatorTryIoEmulation` from `winhvemulation.dll`, loaded at first use.
 ///
 /// # Safety
@@ -507,6 +521,40 @@ pub(crate) unsafe fn WHvSetPartitionProperty(
                 propertycode,
                 propertybuffer,
                 propertybuffersizeinbytes,
+            )
+        },
+        None => unavailable(Dll::Platform),
+    }
+}
+
+/// `WHvGetPartitionProperty` from `winhvplatform.dll`, loaded at first use.
+///
+/// # Safety
+/// As the Windows function.
+pub(crate) unsafe fn WHvGetPartitionProperty(
+    partition: WHV_PARTITION_HANDLE,
+    propertycode: WHV_PARTITION_PROPERTY_CODE,
+    propertybuffer: *mut core::ffi::c_void,
+    propertybuffersizeinbytes: u32,
+    writtensizeinbytes: *mut u32,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(
+        WHV_PARTITION_HANDLE,
+        WHV_PARTITION_PROPERTY_CODE,
+        *mut core::ffi::c_void,
+        u32,
+        *mut u32,
+    ) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvGetPartitionProperty")) {
+        // SAFETY: the address of `WHvGetPartitionProperty`, whose signature `F` is.
+        Some(p) => unsafe {
+            std::mem::transmute::<usize, F>(p)(
+                partition,
+                propertycode,
+                propertybuffer,
+                propertybuffersizeinbytes,
+                writtensizeinbytes,
             )
         },
         None => unavailable(Dll::Platform),

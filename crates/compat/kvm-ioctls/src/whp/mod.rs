@@ -31,6 +31,7 @@ pub mod cap;
 mod emulate;
 mod ffi;
 mod irqchip;
+mod pvclock;
 mod regs;
 mod vcpu;
 mod vm;

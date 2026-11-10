@@ -27,12 +27,14 @@ set -euo pipefail
 source "$(dirname "$0")/common.sh"
 cd "$WICK_ROOT"
 
-# crate  compat dir  source match (tag or rev in the cargo source id)
+# crate  compat dir  source match (tag or rev in the cargo source id of a git
+# source, or the version of a crates.io one)
 CRATES=(
     "vm-memory    crates/compat/vm-memory      v0.18.0"
     "event-manager crates/compat/event-manager v0.4.2"
     "micro_http   crates/compat/micro-http     7975fe0e59000e8c41cb1d58fbd39ffa102e5b27"
     "vhost        crates/compat/vhost          vhost-v0.17.0"
+    "vhost-user-backend tools/vhost-user-blk/compat/vhost-user-backend 0.23.0"
 )
 
 # crate  file  test  reason
@@ -52,7 +54,10 @@ upstream_src() {
 import json, sys
 name, match = sys.argv[1], sys.argv[2]
 for p in json.load(sys.stdin)["packages"]:
-    if p["name"] == name and (p.get("source") or "").startswith("git+") and match in p["source"]:
+    src = p.get("source") or ""
+    git = src.startswith("git+") and match in src
+    registry = src.startswith("registry+") and p["version"] == match
+    if p["name"] == name and (git or registry):
         print(p["manifest_path"].rsplit("/", 1)[0] + "/src"); break
 ' "$name" "$match"
 }

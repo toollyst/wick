@@ -16,3 +16,8 @@
 0014-build-Cargo.lock-for-wick-s-dependencies.patch
 0015-version-binaries-report-upstream-wick.-N.patch
 0016-jailer-Linux-only-primitives-behind-a-backend-per-ho.patch
+0017-windows-snapshot-editor-gets-std-os-unix-fd-from-wic.patch
+0018-windows-the-uffd-example-handlers-build-on-Windows.patch
+0019-windows-the-serial-input-takes-an-empty-non-blocking.patch
+0020-windows-the-jailer-builds-on-Windows-its-Unix-only-s.patch
+0021-wick-a-diff-snapshot-writes-whole-hole-units.patch

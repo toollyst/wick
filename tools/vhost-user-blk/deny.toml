@@ -45,5 +45,7 @@ allow-git = [
     # The compatibility crates' originals, the commits lib/firecracker's
     # Cargo.lock uses (tools/linux/check-dependency-sources.py).
     "https://github.com/rust-lang/libc",
+    "https://github.com/rust-vmm/vhost",
+    "https://github.com/rust-vmm/vm-memory",
     "https://github.com/rust-vmm/vmm-sys-util",
 ]

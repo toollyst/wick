@@ -1,6 +1,6 @@
 # Compatibility build of userfaultfd for wick (docs/ARCHITECTURE.md).
 # On Linux it re-exports the original crate unchanged. On macOS it implements the
-# API with the kernel side in wick's libc (wick_uffd).
+# API with the kernel side in wick's libc (wick_uffd), and so on Windows.
 [package]
 workspace = "../../../lib/firecracker"
 name = "userfaultfd"
@@ -9,7 +9,7 @@ authors = ["toollyst contributors"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "userfaultfd 0.9.0: the original crate on Linux, an implementation on macOS."
+description = "userfaultfd 0.9.0: the original crate on Linux, an implementation on macOS and Windows."
 
 [lib]
 bench = false
@@ -39,3 +39,4 @@ libc = { version = "0.2.186", features = ["extra_traits"] }
 
 [target.'cfg(windows)'.dependencies]
 wick-os = { path = "../os" }
+windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }

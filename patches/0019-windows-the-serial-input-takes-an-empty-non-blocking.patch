@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qmfflwj <qmfflwj@gmail.com>
+Date: Wed, 11 Nov 2026 00:46:39 +0900
+Subject: [PATCH] windows: the serial input takes an empty non-blocking pipe as
+ EWOULDBLOCK
+
+Firecracker makes its standard input non-blocking and reads it when the
+guest has room for input. On Linux an empty non-blocking pipe reads as
+EWOULDBLOCK and the serial waits for input again; on Windows std reads it
+as ERROR_NO_DATA, which the serial took as a closed peer and detached its
+input from.
+---
+ src/vmm/src/devices/legacy/serial.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/vmm/src/devices/legacy/serial.rs b/src/vmm/src/devices/legacy/serial.rs
+index d11dfc27512ef90c4b76d5dbef8133064cf05b0c..6e7f596788c89af0c7dc6479c352e88ddf8295a6 100644
+--- a/src/vmm/src/devices/legacy/serial.rs
++++ b/src/vmm/src/devices/legacy/serial.rs
+@@ -349,6 +349,12 @@ impl<I: Read + AsRawFd + Send + Debug> MutEventSubscriber
+                     Some(errno) if errno == libc::EWOULDBLOCK => {
+                         self.handle_ewouldblock(ops);
+                     }
++                    // wick: std reads a non-blocking Windows pipe with nothing in it as
++                    // ERROR_NO_DATA, Linux's EWOULDBLOCK on a non-blocking pipe.
++                    #[cfg(windows)]
++                    Some(232) => {
++                        self.handle_ewouldblock(ops);
++                    }
+                     Some(errno) if errno == libc::ENOTTY => {
+                         error!("The serial device does not have the input source attached.");
+                         unregister_source(ops, &input_fd);

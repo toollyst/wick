@@ -9,6 +9,9 @@ use std::io;
 
 use crate::platform::fs::HoleKeeper;
 
+/// A page: Linux files have holes of any page.
+pub const HOLE_UNIT: usize = 4096;
+
 /// Linux files keep their holes.
 pub fn keep_holes(_file: &File) -> io::Result<()> {
     Ok(())

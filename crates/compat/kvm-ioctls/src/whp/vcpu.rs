@@ -35,7 +35,7 @@ use super::whv;
 use super::whv::WHV_PARTITION_HANDLE;
 
 use super::vm::VmInner;
-use super::{emulate, err, regs, Handle, IoEventAddress, Result, VcpuExit};
+use super::{emulate, err, pvclock, regs, Handle, IoEventAddress, Result, VcpuExit};
 
 /// Size of the xAPIC state WHP exchanges (the APIC register page).
 const LAPIC_PAGE: usize = 4096;
@@ -91,6 +91,8 @@ pub(crate) struct VcpuShared {
     cpuid: Mutex<Vec<kvm_cpuid_entry2>>,
     pending: Mutex<Option<Pending>>,
     tsc_khz: AtomicU64,
+    /// The last `MSR_KVM_SYSTEM_TIME_NEW` value.
+    system_time_msr: AtomicU64,
     /// Mirror of `kvm_run.immediate_exit`, written from any thread.
     immediate_exit: AtomicU8,
     /// Odd while the run loop is between its last `immediate_exit` check
@@ -176,6 +178,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         cpuid: Mutex::new(Vec::new()),
         pending: Mutex::new(None),
         tsc_khz: AtomicU64::new(0),
+        system_time_msr: AtomicU64::new(0),
         immediate_exit: AtomicU8::new(0),
         run_seq: AtomicU64::new(0),
     });
@@ -297,10 +300,42 @@ impl VcpuFd {
     // ---- MSRs and CPUID ----
 
     pub fn get_msrs(&self, msrs: &mut Msrs) -> Result<usize> {
-        regs::get_msrs(self.part(), self.vp(), msrs)
+        let n = regs::get_msrs(self.part(), self.vp(), msrs)?;
+        // The kvm-clock MSRs are this backend's (see `pvclock`).
+        for e in msrs.as_mut_slice() {
+            match e.index {
+                pvclock::MSR_SYSTEM_TIME => e.data = self.shared.system_time_msr.load(Ordering::Acquire),
+                pvclock::MSR_WALL_CLOCK => e.data = self.shared.inner.pvclock.lock().unwrap().wall_msr,
+                _ => {}
+            }
+        }
+        Ok(n)
     }
     pub fn set_msrs(&self, msrs: &Msrs) -> Result<usize> {
-        regs::set_msrs(self.part(), self.vp(), msrs)
+        let n = regs::set_msrs(self.part(), self.vp(), msrs)?;
+        for e in msrs.as_slice() {
+            self.write_kvm_msr(e.index, e.data);
+        }
+        Ok(n)
+    }
+
+    /// A write of a kvm-clock MSR, by the guest or a restore; other MSRs are
+    /// left alone. Returns whether `index` is one.
+    fn write_kvm_msr(&self, index: u32, value: u64) -> bool {
+        let inner = &self.shared.inner;
+        let now = || inner.irqchip.lock().unwrap().clock().clock;
+        match index {
+            pvclock::MSR_SYSTEM_TIME => {
+                self.shared.system_time_msr.store(value, Ordering::Release);
+                pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, |gpa| inner.host_addr(gpa), now);
+                true
+            }
+            pvclock::MSR_WALL_CLOCK => {
+                pvclock::wall_clock(&inner.pvclock, value, |gpa| inner.host_addr(gpa), now());
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn set_cpuid2(&self, cpuid: &CpuId) -> Result<()> {
@@ -319,11 +354,13 @@ impl VcpuFd {
 
     pub fn get_tsc_khz(&self) -> Result<u32> {
         let v = self.shared.tsc_khz.load(Ordering::Relaxed);
-        if v == 0 {
-            // Not queryable from WHP; the caller treats this as "unknown".
-            err(libc::ENOTSUP)
-        } else {
-            Ok(v as u32)
+        if v != 0 {
+            return Ok(v as u32);
+        }
+        // The guest TSC runs at the host's frequency, which WHP reports.
+        match pvclock::tsc_hz() / 1000 {
+            0 => err(libc::ENOTSUP),
+            khz => Ok(u32::try_from(khz).unwrap_or(u32::MAX)),
         }
     }
     pub fn set_tsc_khz(&self, freq: u32) -> Result<()> {
@@ -395,17 +432,15 @@ impl VcpuFd {
 
     // ---- vCPU events ----
 
-    /// Not implemented yet: the pending exception, interrupt, NMI and SMI
-    /// state lives in WHP's pending-interruption and interrupt-state
-    /// registers, which this does not map yet. Only snapshots use it
-    /// (planned on Windows, docs/ROADMAP.md), and they fail loudly here
-    /// rather than save a state with pending events dropped.
+    /// The event the vCPU is delivering, its interrupt shadow and NMI mask,
+    /// from WHP's pending-interruption and interrupt-state registers (see
+    /// `regs`).
     pub fn get_vcpu_events(&self) -> Result<kvm_vcpu_events> {
-        err(libc::ENOTSUP)
+        regs::get_vcpu_events(self.part(), self.vp())
     }
-    /// See [`Self::get_vcpu_events`].
-    pub fn set_vcpu_events(&self, _events: &kvm_vcpu_events) -> Result<()> {
-        err(libc::ENOTSUP)
+    /// Restores what [`Self::get_vcpu_events`] returns.
+    pub fn set_vcpu_events(&self, events: &kvm_vcpu_events) -> Result<()> {
+        regs::set_vcpu_events(self.part(), self.vp(), events)
     }
 
     // ---- run control ----
@@ -450,6 +485,7 @@ impl VcpuFd {
 
         // Complete a read deferred from the previous exit.
         let mut mmio_completion = false;
+        let mut ram_retries = 0u32;
         if let Some(pending) = self.shared.pending.lock().unwrap().take() {
             match pending {
                 Pending::Mmio => mmio_completion = true,
@@ -562,6 +598,29 @@ impl VcpuFd {
                 whv::WHvRunVpExitReasonMemoryAccess => {
                     // SAFETY: the union arm matches the exit reason.
                     let mem = unsafe { ctx.Anonymous.MemoryAccess };
+                    // Guest RAM that is a missing userfaultfd page: WHP
+                    // honours its host PAGE_NOACCESS and exits at the
+                    // access, which re-runs once the handler filled it, as
+                    // KVM resolves the stage-2 fault through the host page.
+                    // A page filled between the exit and the check (by the
+                    // handler, or for another vCPU) is not reported: the
+                    // access re-runs, never as MMIO, which would read zeros.
+                    if libc::wick_uffd::active() {
+                        if let Some(host) = self.shared.inner.host_addr(mem.Gpa) {
+                            // SAFETY: the access-info bitfield overlaps the u32.
+                            let write = unsafe { mem.AccessInfo.AsUINT32 } & 0x3 == 1;
+                            if libc::wick_uffd::fault(host, write) {
+                                ram_retries = 0;
+                                continue;
+                            }
+                            ram_retries += 1;
+                            if ram_retries < 1_000_000 {
+                                std::thread::yield_now();
+                                continue;
+                            }
+                            eprintln!("whp: guest RAM at {:#x} stays inaccessible", mem.Gpa);
+                        }
+                    }
                     if let Some(exit) = self.mmio(&ctx.VpContext, &mem, scratch, mmio_completion)? {
                         return Ok(exit);
                     }
@@ -580,6 +639,14 @@ impl VcpuFd {
                     // SAFETY: the union arm matches the exit reason.
                     let m = unsafe { ctx.Anonymous.MsrAccess };
                     self.handle_msr(&m, rip + instr_len)?;
+                    continue;
+                }
+
+                whv::WHvRunVpExitReasonHypercall => {
+                    // SAFETY: the union arm matches the exit reason.
+                    let h = unsafe { ctx.Anonymous.Hypercall };
+                    let result = self.kvm_hypercall(h.Rax, h.Rbx, h.Rcx);
+                    regs::set_gpr_rax_rip(part, vp, result, rip + instr_len)?;
                     continue;
                 }
 
@@ -691,7 +758,7 @@ impl VcpuFd {
     ) -> Result<()> {
         let function = c.Rax as u32;
         let index = c.Rcx as u32;
-        let (eax, ebx, ecx, edx) = {
+        let (eax, mut ebx, mut ecx, edx) = {
             let table = self.shared.cpuid.lock().unwrap();
             table
                 .iter()
@@ -708,7 +775,89 @@ impl VcpuFd {
                     c.DefaultResultRdx as u32,
                 ))
         };
+        // The bits KVM computes from the vCPU's state at each CPUID
+        // (kvm_update_cpuid_runtime): OSXSAVE and OSPKE follow CR4, and the
+        // XSAVE area sizes follow XCR0 and IA32_XSS. A fixed value makes a
+        // guest kernel find its XSAVE layout inconsistent and turn XSAVE off,
+        // after which user space dies on XGETBV.
+        match (function, index) {
+            (0x1, _) => {
+                let cr4 = self.register(whv::WHvX64RegisterCr4)?;
+                ecx = (ecx & !(1 << 27)) | if cr4 & (1 << 18) != 0 { 1 << 27 } else { 0 };
+                // TSC_DEADLINE, whatever the configured CPUID says
+                // (Firecracker sets it, as KVM always emulates the mode): WHP's
+                // local APIC has no TSC-deadline mode where the partition
+                // lacks TscDeadlineTmrSupport, and a guest that used it would
+                // never get a local timer interrupt (measured: LOC stayed 0
+                // and sleep never returned). Linux then uses the one-shot
+                // mode, which WHP's local APIC emulates.
+                if !self.shared.inner.tsc_deadline {
+                    ecx &= !(1 << 24);
+                }
+            }
+            (0x7, 0) => {
+                let cr4 = self.register(whv::WHvX64RegisterCr4)?;
+                ecx = (ecx & !(1 << 4)) | if cr4 & (1 << 22) != 0 { 1 << 4 } else { 0 };
+            }
+            (0xd, 0) => {
+                let xcr0 = self.register(whv::WHvX64RegisterXCr0)?;
+                ebx = regs::xsave_size(xcr0, false);
+            }
+            (0xd, 1) if eax & (1 << 3) != 0 => {
+                let xcr0 = self.register(whv::WHvX64RegisterXCr0)?;
+                let xss = self.register(whv::WHvX64RegisterXss).unwrap_or(0);
+                ebx = regs::xsave_size(xcr0 | xss, true);
+            }
+            _ => {}
+        }
         regs::set_cpuid_result(self.part(), self.vp(), eax, ebx, ecx, edx, rip_after)
+    }
+
+    /// A KVM hypercall (`kvm_emulate_hypercall`): `nr` in RAX, arguments in
+    /// RBX, RCX; returns RAX. The ones KVM answers that a Firecracker guest
+    /// makes: `KVM_HC_VAPIC_POLL_IRQ` (nothing to do) and
+    /// `KVM_HC_CLOCK_PAIRING` (the host's wall clock with the guest TSC of
+    /// the same moment, which ptp_kvm keeps the guest's time in step with);
+    /// anything else is `-KVM_ENOSYS`, as KVM answers an unknown one.
+    fn kvm_hypercall(&self, nr: u64, a0: u64, a1: u64) -> u64 {
+        const KVM_ENOSYS: i64 = 1000;
+        const KVM_EOPNOTSUPP: i64 = 95;
+        const KVM_EFAULT: i64 = 14;
+        const KVM_HC_VAPIC_POLL_IRQ: u64 = 1;
+        const KVM_HC_CLOCK_PAIRING: u64 = 9;
+        const KVM_CLOCK_PAIRING_WALLCLOCK: u64 = 0;
+        let neg = |e: i64| (-e).cast_unsigned();
+        match nr {
+            KVM_HC_VAPIC_POLL_IRQ => 0,
+            KVM_HC_CLOCK_PAIRING => {
+                if a1 != KVM_CLOCK_PAIRING_WALLCLOCK {
+                    return neg(KVM_EOPNOTSUPP);
+                }
+                let Some(at) = self.shared.inner.host_addr(a0) else {
+                    return neg(KVM_EFAULT);
+                };
+                let Ok(tsc) = self.register(whv::WHvX64RegisterTsc) else {
+                    return neg(KVM_EOPNOTSUPP);
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                // struct kvm_clock_pairing { s64 sec; s64 nsec; u64 tsc; u32 flags; u32 pad[9]; }
+                let mut out = [0u8; 64];
+                out[0..8].copy_from_slice(&now.as_secs().to_le_bytes());
+                out[8..16].copy_from_slice(&u64::from(now.subsec_nanos()).to_le_bytes());
+                out[16..24].copy_from_slice(&tsc.to_le_bytes());
+                // SAFETY: guest RAM the guest named for the result.
+                unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), at as *mut u8, out.len()) };
+                0
+            }
+            _ => neg(KVM_ENOSYS),
+        }
+    }
+
+    /// One 64-bit register of this vCPU.
+    fn register(&self, name: whv::WHV_REGISTER_NAME) -> Result<u64> {
+        Ok(super::ffi::as_u64(&super::ffi::get_register(self.part(), self.vp(), name)?))
     }
 
     /// Answers an MSR intercept. WHP only exits for MSRs it does not model, so
@@ -721,10 +870,18 @@ impl VcpuFd {
     ) -> Result<()> {
         // SAFETY: the access-info bitfield overlaps the u32.
         let is_write = unsafe { m.AccessInfo.AsUINT32 } & 1 != 0;
+        let index = m.MsrNumber;
         if is_write {
+            let value = (m.Rdx << 32) | (m.Rax & 0xffff_ffff);
+            self.write_kvm_msr(index, value);
             regs::set_rip(self.part(), self.vp(), rip_after)
         } else {
-            regs::set_msr_result(self.part(), self.vp(), 0, rip_after)
+            let value = match index {
+                pvclock::MSR_SYSTEM_TIME => self.shared.system_time_msr.load(Ordering::Acquire),
+                pvclock::MSR_WALL_CLOCK => self.shared.inner.pvclock.lock().unwrap().wall_msr,
+                _ => 0,
+            };
+            regs::set_msr_result(self.part(), self.vp(), value, rip_after)
         }
     }
 }

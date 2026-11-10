@@ -1,4 +1,5 @@
-# A test backend for tools/macos/boot-test.sh; not part of any release.
+# A test backend for tools/macos/boot-test.sh and tools/windows/boot-test.ps1;
+# not part of any release.
 [package]
 name = "vhost-user-blk"
 version = "0.0.0"
@@ -9,7 +10,6 @@ publish = false
 [workspace]
 
 [dependencies]
-vhost-user-backend = "=0.23.0"
 vhost = { version = "0.17.0", features = ["vhost-user-backend"] }
 virtio-queue = "0.18.0"
 virtio-bindings = "0.2.7"
@@ -17,8 +17,13 @@ vm-memory = { version = "0.18.0", features = ["backend-mmap", "backend-atomic"] 
 vmm-sys-util = "0.15.0"
 libc = "0.2.186"
 
+# Upstream 0.23.0; on Windows its source over wick's POSIX layer.
+vhost-user-backend = { path = "compat/vhost-user-backend" }
+
 # The compatibility crates Firecracker builds with (docs/ARCHITECTURE.md).
 [patch.crates-io]
 vmm-sys-util = { path = "../../crates/compat/vmm-sys-util" }
 libc = { path = "../../crates/compat/libc" }
 userfaultfd = { path = "../../crates/compat/userfaultfd" }
+vhost = { path = "../../crates/compat/vhost" }
+vm-memory = { path = "../../crates/compat/vm-memory" }

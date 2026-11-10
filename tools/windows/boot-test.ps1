@@ -16,6 +16,17 @@
 #   net    virtio-net over the Windows endpoint (Unix stream, 32-bit
 #          big-endian length before each frame): a switch here answers ARP,
 #          ICMP echo and UDP echo and checks every checksum the guest sends
+#   snapshot  full snapshot of a 2 vCPU guest (data drive, vsock) restored in
+#          a new process: shell state, clock, drives, vsock
+#   diff   diff snapshot with dirty page tracking (holes kept), merged by
+#          snapshot-editor and restored
+#   uffd   the snapshot stage's snapshot restored with the Uffd backend,
+#          served by upstream's uffd_on_demand_handler
+#   pci    the snapshot stage over virtio-pci with MSI-X (--enable-pci)
+#   vhost-user  a vhost-user-blk drive served by tools/vhost-user-blk in
+#          another process: read md5, a write reaches the image
+#   hugepages  guest memory on 2 MiB large pages (needs "Lock pages in
+#          memory" for this account)
 #
 # Before each reset the guest kernel log must be free of stalls, BUGs, oopses
 # and warnings.
@@ -66,14 +77,9 @@ $BootArgs = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i804
 
 # What upstream Firecracker does that wick does not do on Windows yet
 # (docs/ROADMAP.md, "Platform status"); listed in the summary, not run.
+# (The leading comma keeps a one-entry list a list of pairs.)
 $NotImplemented = @(
-    @('snapshot', 'full snapshots and restore'),
-    @('diff', 'diff snapshots, snapshot-editor rebase'),
-    @('uffd', 'the Uffd memory backend'),
-    @('pci', 'PCI / MSI-X (--enable-pci)'),
-    @('vhost-user', 'vhost-user devices'),
-    @('hugepages', 'huge pages (large pages)'),
-    @('jailer', 'the jailer (AppContainer, Job Objects)')
+    , @('jailer', 'the jailer (restricted token, Job Objects)')
 )
 
 # --- helpers (C# 5: what Windows PowerShell 5.1 compiles) ---------------------
@@ -416,7 +422,58 @@ namespace Wick {
         }
     }
 
+    // Firecracker's API: one HTTP/1.1 request per connection on its socket.
+    public static class Api {
+        public static string Call(string sock, string method, string path, string body, int ms, out int status) {
+            using (var s = USock.Connect(sock)) {
+                byte[] b = body == null ? new byte[0] : Encoding.UTF8.GetBytes(body);
+                var head = new StringBuilder();
+                head.Append(method).Append(' ').Append(path).Append(" HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n");
+                if (body != null) head.Append("Content-Type: application/json\r\nContent-Length: ").Append(b.Length).Append("\r\n");
+                head.Append("\r\n");
+                s.SendAll(Encoding.ASCII.GetBytes(head.ToString()));
+                if (b.Length > 0) s.SendAll(b);
+                var got = new MemoryStream();
+                var chunk = new byte[16384];
+                int headerEnd = -1, length = 0;
+                while (headerEnd < 0 || got.Length < headerEnd + length) {
+                    int n = s.Recv(chunk, 0, chunk.Length, ms);
+                    if (n < 0) throw new Failure(method + " " + path + ": no answer within " + (ms / 1000) + " s");
+                    if (n == 0) break;
+                    got.Write(chunk, 0, n);
+                    if (headerEnd < 0) {
+                        string sofar = Encoding.ASCII.GetString(got.ToArray());
+                        int at = sofar.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                        if (at >= 0) {
+                            headerEnd = at + 4;
+                            var m = Regex.Match(sofar.Substring(0, at), @"(?im)^content-length:\s*(\d+)");
+                            if (m.Success) length = int.Parse(m.Groups[1].Value);
+                        }
+                    }
+                }
+                string all = Encoding.UTF8.GetString(got.ToArray());
+                var sl = Regex.Match(all, @"^HTTP/1\.[01] (\d{3})");
+                if (!sl.Success) throw new Failure(method + " " + path + ": not an HTTP answer: '" + all + "'");
+                status = int.Parse(sl.Groups[1].Value);
+                int bodyAt = all.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                return bodyAt >= 0 ? all.Substring(bodyAt + 4) : "";
+            }
+        }
+    }
+
     public static class Util {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint GetCompressedFileSizeW(string path, out uint high);
+
+        // Bytes the file system allocates for `path` (sparse files: without holes).
+        public static long Allocated(string path) {
+            uint high;
+            uint low = GetCompressedFileSizeW(path, out high);
+            if (low == 0xFFFFFFFF && Marshal.GetLastWin32Error() != 0)
+                throw new Failure("GetCompressedFileSize " + path + ": error " + Marshal.GetLastWin32Error());
+            return ((long)high << 32) | low;
+        }
+
         public static string Md5(byte[] data, int len) {
             using (var md5 = MD5.Create()) return Hex(md5.ComputeHash(data, 0, len));
         }
@@ -571,6 +628,9 @@ namespace Wick {
         public List<string> Bad = new List<string>();
         public int Frames, Arp, Icmp, Udp;
         public string ReadError;
+        // Set before the guest reboots: Firecracker exits and closes the
+        // endpoint, which is then no error.
+        public volatile bool Closing;
 
         public Switch(string endpoint, int ms) {
             var until = DateTime.UtcNow.AddMilliseconds(ms);
@@ -596,7 +656,7 @@ namespace Wick {
                 while (!stop) {
                     int n = conn.Recv(hdr, 0, 1, 200);
                     if (n < 0) continue;
-                    if (n == 0) { if (!stop) ReadError = "the endpoint closed the connection"; return; }
+                    if (n == 0) { if (!stop && !Closing) ReadError = "the endpoint closed the connection"; return; }
                     conn.RecvExact(hdr, 1, 3, 5000);
                     int len = (hdr[0] << 24) | (hdr[1] << 16) | (hdr[2] << 8) | hdr[3];
                     if (len < 14 || len > 65536 + 22) {
@@ -613,7 +673,7 @@ namespace Wick {
                     }
                 }
             } catch (Exception e) {
-                if (!stop) ReadError = e.Message;
+                if (!stop && !Closing) ReadError = e.Message;
             }
         }
 
@@ -917,6 +977,62 @@ namespace Wick {
                 try { File.Delete(uds); } catch (Exception) { }
             }
         }
+
+        // Api.Call against a stand-in for Firecracker's API server, which
+        // answers in two writes as micro_http may.
+        public static string ApiTest(string dir) {
+            string sock = Path.Combine(dir, "st.api");
+            var listener = USock.Listen(sock);
+            var requests = new List<string>();
+            var server = new Thread(delegate() {
+                try {
+                    for (int i = 0; i < 2; i++) {
+                        var c = listener.Accept(10000);
+                        var req = new StringBuilder();
+                        var buf = new byte[4096];
+                        int n;
+                        while (true) {
+                            n = c.Recv(buf, 0, buf.Length, 5000);
+                            if (n <= 0) break;
+                            req.Append(Encoding.UTF8.GetString(buf, 0, n));
+                            string r = req.ToString();
+                            int end = r.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                            if (end < 0) continue;
+                            var m = Regex.Match(r, @"(?im)^content-length:\s*(\d+)");
+                            int len = m.Success ? int.Parse(m.Groups[1].Value) : 0;
+                            if (Encoding.UTF8.GetByteCount(r) >= end + 4 + len) break;
+                        }
+                        lock (requests) requests.Add(req.ToString());
+                        if (i == 0) {
+                            c.SendAll(Encoding.ASCII.GetBytes("HTTP/1.1 204 \r\nServer: Firecracker API\r\n\r\n"));
+                        } else {
+                            string body = "{\"fault_message\":\"bad\"}";
+                            c.SendAll(Encoding.ASCII.GetBytes("HTTP/1.1 400 \r\nContent-Type: application/json\r\nContent-Length: " + body.Length + "\r\n\r\n"));
+                            Thread.Sleep(50);
+                            c.SendAll(Encoding.ASCII.GetBytes(body));
+                        }
+                        c.Dispose();
+                    }
+                } catch (Exception) { }
+            });
+            server.IsBackground = true;
+            server.Start();
+            try {
+                int status;
+                string body = Api.Call(sock, "PATCH", "/vm", "{\"state\":\"Paused\"}", 10000, out status);
+                Check(status == 204 && body == "", "204: " + status + " '" + body + "'");
+                body = Api.Call(sock, "GET", "/", null, 10000, out status);
+                Check(status == 400 && body == "{\"fault_message\":\"bad\"}", "400: " + status + " '" + body + "'");
+                server.Join(5000);
+                Check(requests.Count == 2, "requests: " + requests.Count);
+                Check(requests[0].StartsWith("PATCH /vm HTTP/1.1\r\n") && requests[0].Contains("Content-Length: 18\r\n") && requests[0].EndsWith("{\"state\":\"Paused\"}"), "request: " + requests[0]);
+                Check(!requests[1].Contains("Content-Length"), "GET with a body: " + requests[1]);
+                return "Api: request with a body, status, body read by Content-Length across writes";
+            } finally {
+                listener.Dispose();
+                try { File.Delete(sock); } catch (Exception) { }
+            }
+        }
     }
 }
 '@
@@ -959,9 +1075,9 @@ function Get-Failure($record) {
     return $null
 }
 
-function Base-Config([int]$vcpus, [int]$mem = 256) {
+function Base-Config([int]$vcpus, [int]$mem = 256, [string]$bootArgs = $BootArgs) {
     return [ordered]@{
-        'boot-source'    = [ordered]@{ kernel_image_path = $Kernel; boot_args = $BootArgs }
+        'boot-source'    = [ordered]@{ kernel_image_path = $Kernel; boot_args = $bootArgs }
         'drives'         = @([ordered]@{ drive_id = 'rootfs'; path_on_host = $Rootfs; is_root_device = $true; is_read_only = $true })
         'machine-config' = [ordered]@{ vcpu_count = $vcpus; mem_size_mib = $mem }
     }
@@ -969,18 +1085,73 @@ function Base-Config([int]$vcpus, [int]$mem = 256) {
 
 # Starts Firecracker for stage `$name` with `$config`; the VM is killed and its
 # logs kept when the stage ends.
-function Start-Vm([string]$name, $config) {
+# `$config` may be $null (a VM restored through the API). With -Api the VM gets
+# an API socket, returned as the `ApiSock` note property and waited for.
+function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api) {
     $dir = Join-Path $Results $name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $cfgPath = Join-Path $dir 'vm-config.json'
     $logPath = Join-Path $dir 'firecracker.log'
-    $config | ConvertTo-Json -Depth 8 | Set-Content -Encoding ASCII $cfgPath
     # Firecracker opens the log file, it does not create it.
     New-Item -ItemType File -Force -Path $logPath | Out-Null
-    $fcArgs = "--no-api --config-file `"$cfgPath`" --log-path `"$logPath`" --level Debug --show-level --show-log-origin"
+    $fcArgs = "--log-path `"$logPath`" --level Debug --show-level --show-log-origin"
+    if ($config) {
+        $cfgPath = Join-Path $dir 'vm-config.json'
+        $config | ConvertTo-Json -Depth 8 | Set-Content -Encoding ASCII $cfgPath
+        $fcArgs += " --config-file `"$cfgPath`""
+    }
+    $sock = $null
+    if ($Api) {
+        $sock = Join-Path $SockDir "$name.api"
+        if (Test-Path $sock) { [IO.File]::Delete($sock) }
+        $fcArgs += " --api-sock `"$sock`""
+    } else {
+        $fcArgs += ' --no-api'
+    }
+    if ($extra) { $fcArgs += " $extra" }
     $vm = New-Object Wick.Vm($Fc, $fcArgs, (Join-Path $dir 'console.txt'))
     $script:Vms += $vm
+    if ($sock) {
+        $until = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not (Test-Path $sock)) {
+            if ($vm.Exited -or [DateTime]::UtcNow -gt $until) { Fail "no API socket ($($vm.ExitReason()))" }
+            Start-Sleep -Milliseconds 20
+        }
+    }
+    $vm | Add-Member -NotePropertyName ApiSock -NotePropertyValue $sock
     return $vm
+}
+
+# One API request; fails unless the status is 2xx. Returns the body.
+function Invoke-Api($vm, [string]$method, [string]$path, $body = $null) {
+    $json = if ($null -ne $body) { $body | ConvertTo-Json -Depth 8 -Compress } else { $null }
+    $status = 0
+    $out = [Wick.Api]::Call($vm.ApiSock, $method, $path, $json, 120000, [ref]$status)
+    Check ($status -ge 200 -and $status -lt 300) "$method $path -> $status $out"
+    return $out
+}
+
+function Get-Fields([string]$out) { return @($out -split '\s+' | Where-Object { $_ }) }
+
+# What a restored guest must still have: its shell state, a clock that runs at
+# host speed on every vCPU, its root drive and (if given) its data drive.
+function Test-Restored($vm, [string]$bashMd5, [string]$data) {
+    $out = $vm.Sh('echo restored $A')
+    Check ($out -eq 'restored before-42') "after restore: '$out'"
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $out = $vm.Sh('taskset -c 0 cat /proc/uptime; sleep 1; taskset -c 1 cat /proc/uptime')
+    $host_dt = $sw.Elapsed.TotalSeconds
+    $lines = @($out -split "`n" | Where-Object { $_.Trim() })
+    Check ($lines.Count -eq 2) "uptime on both CPUs after restore: '$out'"
+    $a = [double]::Parse((Get-Fields $lines[0])[0], [Globalization.CultureInfo]::InvariantCulture)
+    $b = [double]::Parse((Get-Fields $lines[1])[0], [Globalization.CultureInfo]::InvariantCulture)
+    Check (($b - $a) -gt 0.9 -and ($b - $a) -le $host_dt + 0.1) ("guest clock advanced {0:N2} s across vCPUs in {1:N2} s after restore" -f ($b - $a), $host_dt)
+    $out = $vm.Sh('md5sum /usr/bin/bash')
+    Check ($out -eq $bashMd5) "root drive after restore: '$out', before '$bashMd5'"
+    if ($data) {
+        $out = $vm.Sh('echo 3 > /proc/sys/vm/drop_caches; md5sum /dev/vdb')
+        $want = [Wick.Util]::Md5File($data, -1)
+        Check ((Get-Fields $out)[0] -eq $want) "data drive after restore: '$out', host $want"
+    }
 }
 
 # Waits for init and the shell; explains a Firecracker that never got there.
@@ -1147,6 +1318,7 @@ function Stage-Net {
         $out = $vm.Sh('echo udp-$((6*7)) | socat -t 3 - UDP:10.0.0.1:7')
         Check ($out -eq 'udp-42') "UDP echo '$out'"
         Save-Dmesg $vm 'net'
+        $switch.Closing = $true
         $vm.Reboot()
     } finally {
         $switch.Close()
@@ -1157,12 +1329,232 @@ function Stage-Net {
     return "Unix stream endpoint: ARP, ICMP (1400 B, 200 back to back), UDP echo, checksums valid ($($switch.Counts))"
 }
 
+# A helper binary: next to firecracker.exe or this script, else where the
+# build (and CI's artifact) puts it.
+function Find-Tool([string]$exe) {
+    $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $candidates = @(
+        (Join-Path (Split-Path -Parent $Fc) $exe),
+        (Join-Path $PSScriptRoot $exe),
+        (Join-Path $root "lib\firecracker\build\cargo_target\release\$exe"),
+        (Join-Path $root "lib\firecracker\build\cargo_target\release\examples\$exe"),
+        (Join-Path $root "lib\firecracker\build\vhost-user-blk\release\$exe")
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+    Fail "$exe not found (looked in: $($candidates -join ', '))"
+}
+
+# A guest service on vsock port 52 that echoes, and the host waiting for it.
+function Start-GuestEcho($vm, [string]$uds) {
+    $vm.Sh('command -v socat >/dev/null') | Out-Null
+    $vm.Sh('(socat VSOCK-LISTEN:52,fork EXEC:cat >/dev/null 2>&1 &)') | Out-Null
+    [Wick.Vsock]::WaitListening($uds, 52, 10000)
+}
+
+# Full snapshot of a 2 vCPU guest with a data drive and vsock, restored in a
+# new Firecracker process; over virtio-pci with -Pci.
+function Stage-Snapshot([switch]$Pci) {
+    $tag = if ($Pci) { 'pci' } else { 'snapshot' }
+    $extra = if ($Pci) { '--enable-pci' } else { '' }
+    $bootArgs = if ($Pci) { $BootArgs -replace ' pci=off', '' } else { $BootArgs }
+    $dir = Join-Path $Scratch $tag
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $uds = Join-Path $SockDir "$tag.v"
+    if (Test-Path $uds) { [IO.File]::Delete($uds) }
+    $data = Join-Path $dir 'data.img'
+    [Wick.Util]::WriteRandom($data, 4MB)
+    $cfg = Base-Config 2 256 $bootArgs
+    $cfg['drives'] += [ordered]@{ drive_id = 'data'; path_on_host = $data; is_root_device = $false; is_read_only = $true; io_engine = 'Async' }
+    $cfg['vsock'] = [ordered]@{ guest_cid = 3; uds_path = $uds }
+    $vm = Start-Vm "$tag-1" $cfg $extra -Api
+    Wait-Shell $vm
+    if ($Pci) {
+        $n = [int]$vm.Sh('ls /sys/bus/pci/devices | wc -l')
+        Check ($n -ge 3) "$n PCI devices for root, data and vsock"
+        $msix = $vm.Sh("grep -c -i 'PCI-MSI' /proc/interrupts; true")
+        Check ([int]$msix -ge 1) "no PCI-MSI interrupts in the guest: '$msix'"
+    }
+    Start-GuestEcho $vm $uds
+    $vm.Sh('A=before-$((6*7))') | Out-Null
+    $bashMd5 = $vm.Sh('md5sum /usr/bin/bash')
+    $state = Join-Path $dir 'vm.state'
+    $mem = Join-Path $dir 'vm.mem'
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+    Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $state; mem_file_path = $mem }) | Out-Null
+    $vm.Kill()
+    [IO.File]::Delete($uds)
+    $size = (Get-Item $mem).Length
+    Check ($size -eq 256MB) "memory file is $size bytes"
+
+    $vm = Start-Vm "$tag-2" $null $extra -Api
+    Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
+        snapshot_path = $state
+        mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = $mem }
+        resume_vm     = $true
+    }) | Out-Null
+    Test-Restored $vm $bashMd5 $data
+    [Wick.Vsock]::Echo($uds, 52, 1MB)
+    Save-Dmesg $vm "$tag-2"
+    $vm.Reboot()
+    if (-not $Pci) {
+        $script:SnapshotFiles = @{ State = $state; Mem = $mem; Data = $data; Uds = $uds; BashMd5 = $bashMd5 }
+    }
+    $over = if ($Pci) { ' over virtio-pci (MSI-X)' } else { '' }
+    return "Full snapshot, restore in a new process: shell state, clock on both vCPUs, root and data drives, vsock$over"
+}
+
+# A diff snapshot on top of a full one (dirty page tracking), merged with
+# snapshot-editor and restored.
+function Stage-Diff {
+    $editor = Find-Tool 'snapshot-editor.exe'
+    $dir = Join-Path $Scratch 'diff'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $cfg = Base-Config 2
+    $cfg['machine-config']['track_dirty_pages'] = $true
+    $vm = Start-Vm 'diff-1' $cfg -Api
+    Wait-Shell $vm
+    $vm.Sh('A=before-$((6*7))') | Out-Null
+    $bashMd5 = $vm.Sh('md5sum /usr/bin/bash')
+    $base = Join-Path $dir 'base.mem'
+    $diff = Join-Path $dir 'diff.mem'
+    $state = Join-Path $dir 'diff.state'
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+    Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = (Join-Path $dir 'full.state'); mem_file_path = $base }) | Out-Null
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Resumed' } | Out-Null
+    $vm.Sh('B=second-$((7*7)); cat /usr/bin/* > /dev/null 2>&1; true', 120000, $true) | Out-Null
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+    Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Diff'; snapshot_path = $state; mem_file_path = $diff }) | Out-Null
+    $vm.Kill()
+    $size = (Get-Item $diff).Length
+    $allocated = [Wick.Util]::Allocated($diff)
+    Check ($size -eq 256MB) "diff file is $size bytes"
+    Check ($allocated -gt 0 -and $allocated -lt 200MB) "diff file allocates $([math]::Round($allocated / 1MB)) MiB of 256 (holes lost?)"
+    $out = & $editor edit-memory rebase --memory-path $base --diff-path $diff 2>&1 | Out-String
+    Check ($LASTEXITCODE -eq 0) "snapshot-editor rebase: exit $LASTEXITCODE $($out.Trim())"
+
+    $vm = Start-Vm 'diff-2' $null -Api
+    Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
+        snapshot_path = $state
+        mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = $base }
+        resume_vm     = $true
+    }) | Out-Null
+    Test-Restored $vm $bashMd5 $null
+    $out = $vm.Sh('echo $B')
+    Check ($out -eq 'second-49') "diff state after restore: '$out'"
+    Save-Dmesg $vm 'diff-2'
+    $vm.Reboot()
+    return "Diff snapshot ($([math]::Round($allocated / 1MB)) MiB allocated of 256), snapshot-editor rebase, restore"
+}
+
+# The snapshot stage's snapshot restored with the Uffd memory backend, its
+# pages served by upstream's uffd_on_demand_handler in another process.
+function Stage-Uffd {
+    $handlerExe = Find-Tool 'uffd_on_demand_handler.exe'
+    $f = $script:SnapshotFiles
+    Check ($null -ne $f) "needs the snapshot stage's files (-Stage snapshot,uffd)"
+    # The snapshot's vsock socket path is reused as it was.
+    if (Test-Path $f.Uds) { [IO.File]::Delete($f.Uds) }
+    $sock = Join-Path $SockDir 'uffd'
+    if (Test-Path $sock) { [IO.File]::Delete($sock) }
+    $log = Join-Path (Join-Path $Results 'uffd') 'handler.txt'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
+    $handler = New-Object Wick.Vm($handlerExe, "`"$sock`" `"$($f.Mem)`"", $log)
+    $script:Vms += $handler
+    $until = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not (Test-Path $sock)) {
+        if ($handler.Exited -or [DateTime]::UtcNow -gt $until) { Fail "uffd handler did not start ($($handler.ExitReason()))" }
+        Start-Sleep -Milliseconds 20
+    }
+    $vm = Start-Vm 'uffd' $null '' -Api
+    Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
+        snapshot_path = $f.State
+        mem_backend   = [ordered]@{ backend_type = 'Uffd'; backend_path = $sock }
+        resume_vm     = $true
+    }) | Out-Null
+    Test-Restored $vm $f.BashMd5 $f.Data
+    [Wick.Vsock]::Echo($f.Uds, 52, 1MB)
+    # Fresh pages after the restore.
+    $out = $vm.Sh('head -c 64m /dev/zero | md5sum', 120000, $true)
+    Check ((Get-Fields $out)[0] -eq '7f614da9329cd3aebf59b91aadc30bf0') "64 MiB of zeros: '$out'"
+    Save-Dmesg $vm 'uffd'
+    $vm.Reboot()
+    return 'restore with the Uffd backend served by uffd_on_demand_handler: shell state, clock, drives, vsock'
+}
+
+# A vhost-user-blk drive served by tools/vhost-user-blk in another process:
+# guest memory and eventfds cross the process boundary.
+function Stage-VhostUser {
+    $vub = Find-Tool 'vhost-user-blk.exe'
+    $dir = Join-Path $Scratch 'vhost-user'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $img = Join-Path $dir 'vub.img'
+    [Wick.Util]::WriteRandom($img, 8MB)
+    $want = [Wick.Util]::Md5File($img, -1)
+    $sock = Join-Path $SockDir 'vub'
+    if (Test-Path $sock) { [IO.File]::Delete($sock) }
+    $log = Join-Path (Join-Path $Results 'vhost-user') 'backend.txt'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
+    $backend = New-Object Wick.Vm($vub, "`"$sock`" `"$img`"", $log)
+    $script:Vms += $backend
+    $until = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not (Test-Path $sock)) {
+        if ($backend.Exited -or [DateTime]::UtcNow -gt $until) { Fail "vhost-user backend did not start ($($backend.ExitReason()))" }
+        Start-Sleep -Milliseconds 20
+    }
+    $cfg = Base-Config 2
+    $cfg['drives'] += [ordered]@{ drive_id = 'vub'; socket = $sock; is_root_device = $false }
+    $vm = Start-Vm 'vhost-user' $cfg
+    Wait-Shell $vm
+    $out = $vm.Sh('md5sum /dev/vdb')
+    Check ((Get-Fields $out)[0] -eq $want) "guest md5 over vhost-user '$out', host $want"
+    $vm.Sh('echo vhost-user-$((6*7)) | dd of=/dev/vdb bs=512 seek=8 conv=fsync,notrunc 2>/dev/null') | Out-Null
+    Save-Dmesg $vm 'vhost-user'
+    $vm.Reboot()
+    $backend.Kill()
+    $fs = [IO.File]::Open($img, 'Open', 'Read', 'ReadWrite')
+    try {
+        $fs.Position = 4096
+        $b = New-Object byte[] 14
+        [void]$fs.Read($b, 0, 14)
+    } finally { $fs.Dispose() }
+    $got = [Text.Encoding]::ASCII.GetString($b)
+    Check ($got -eq "vhost-user-42`n") "the guest's write is not in the backend's image: '$got'"
+    return 'vhost-user-blk backend in another process: read md5, write reaches the image'
+}
+
+# Guest memory on 2 MiB large pages (machine-config huge_pages "2M"). Large
+# pages need the "Lock pages in memory" right (SeLockMemoryPrivilege), as
+# hugetlbfs on Linux needs huge pages reserved by an administrator.
+function Stage-Hugepages {
+    $priv = (whoami /priv | Select-String 'SeLockMemoryPrivilege') -ne $null
+    Check $priv ("this account lacks 'Lock pages in memory' (SeLockMemoryPrivilege): an administrator grants it in " +
+        "secpol.msc, Local Policies, User Rights Assignment, then sign out and in")
+    $cfg = Base-Config 2
+    $cfg['machine-config']['huge_pages'] = '2M'
+    $vm = Start-Vm 'hugepages' $cfg
+    Wait-Shell $vm
+    $mem = [int]$vm.Sh("awk '/MemTotal/ {print `$2}' /proc/meminfo")
+    Check ($mem -gt 200000 -and $mem -le 262144) "MemTotal $mem kB for 256 MiB"
+    # Touches most of guest memory.
+    $out = $vm.Sh('mount -t tmpfs -o size=200m tmpfs /tmp && head -c 160m /dev/urandom > /tmp/f && md5sum /tmp/f > /tmp/a && md5sum /tmp/f | cmp - /tmp/a && echo same', 120000, $true)
+    Check ($out -eq 'same') "160 MiB in guest memory read back differently: '$out'"
+    Save-Dmesg $vm 'hugepages'
+    $vm.Reboot()
+    return '2 vCPUs on 2 MiB large pages: boots, 160 MiB written and read back'
+}
+
 $Stages = [ordered]@{
-    boot  = { Stage-Boot }
-    smp   = { Stage-Smp }
-    block = { Stage-Block }
-    vsock = { Stage-Vsock }
-    net   = { Stage-Net }
+    boot     = { Stage-Boot }
+    smp      = { Stage-Smp }
+    block    = { Stage-Block }
+    vsock    = { Stage-Vsock }
+    net      = { Stage-Net }
+    snapshot = { Stage-Snapshot }
+    diff     = { Stage-Diff }
+    uffd     = { Stage-Uffd }
+    pci      = { Stage-Snapshot -Pci }
+    'vhost-user' = { Stage-VhostUser }
+    hugepages = { Stage-Hugepages }
 }
 
 # --- run ------------------------------------------------------------------------
@@ -1173,6 +1565,7 @@ if ($SelfTest) {
     $tests = [ordered]@{
         switch = { [Wick.SelfTest]::SwitchTest($dir) }
         vsock  = { [Wick.SelfTest]::VsockTest($dir) }
+        api    = { [Wick.SelfTest]::ApiTest($dir) }
         shell  = {
             # The serial-console protocol, against a POSIX shell on a pipe.
             $sh = @("$env:ProgramFiles\Git\bin\sh.exe", "$env:ProgramFiles\Git\usr\bin\sh.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -1233,6 +1626,9 @@ if ((Join-Path $SockDir 'v.sock_53').Length -gt 100) {
         throw "socket paths under $SockDir would be too long for AF_UNIX; pass a short -WorkDir such as C:\wbt"
     }
 }
+# Snapshot memory files (256 MiB each) stay out of the results archive.
+$Scratch = Join-Path $WorkDir "scratch-$stamp"
+New-Item -ItemType Directory -Force -Path $Scratch | Out-Null
 $Summary = New-Object System.Collections.ArrayList
 $Vms = @()
 
@@ -1316,6 +1712,7 @@ foreach ($f in @(Get-ChildItem -Force -Path $SockDir -ErrorAction SilentlyContin
     try { [IO.File]::Delete($f.FullName) } catch { }
 }
 Remove-Item -Recurse -Force $SockDir -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $Scratch -ErrorAction SilentlyContinue
 Get-ChildItem -Recurse -Path $Results -Filter '*.img' -ErrorAction SilentlyContinue |
     Remove-Item -Force -ErrorAction SilentlyContinue
 $zip = "$Results.zip"

@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qmfflwj <qmfflwj@gmail.com>
+Date: Tue, 10 Nov 2026 23:38:37 +0900
+Subject: [PATCH] windows: the uffd example handlers build on Windows
+
+The example roots declare wick_std as std, as the firecracker crate's do,
+and the handler finds its peer with SO_PEERCRED on Windows too: the
+compatibility libc answers it from SIO_AF_UNIX_GETPEERPID. Windows' poll,
+kill and mmap of the memory file come from the same libc. The lock file
+records the userfaultfd crate's windows-sys dependency.
+---
+ Cargo.lock                                         | 1 +
+ src/firecracker/examples/uffd/fault_all_handler.rs | 4 ++++
+ src/firecracker/examples/uffd/malicious_handler.rs | 4 ++++
+ src/firecracker/examples/uffd/on_demand_handler.rs | 4 ++++
+ src/firecracker/examples/uffd/uffd_utils.rs        | 5 +++--
+ 5 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 3a14850c5a6147d595359122c3554d1576201e39..fcbd9288282b5ffd059ea3639cca5ab87994906f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1789,6 +1789,7 @@ dependencies = [
+  "thiserror 1.0.69",
+  "userfaultfd 0.9.0 (git+https://github.com/bytecodealliance/userfaultfd-rs?tag=v0.9.0)",
+  "wick-os",
++ "windows-sys",
+ ]
+ 
+ [[package]]
+diff --git a/src/firecracker/examples/uffd/fault_all_handler.rs b/src/firecracker/examples/uffd/fault_all_handler.rs
+index ca7601ebf25da8e8ccee83c185855aee79844345..02c6e07d063aad6ef41ab4120b765d48b69505fb 100644
+--- a/src/firecracker/examples/uffd/fault_all_handler.rs
++++ b/src/firecracker/examples/uffd/fault_all_handler.rs
+@@ -5,6 +5,10 @@
+ //! which loads the whole region from the backing memory file
+ //! when a page fault occurs.
+ 
++// wick: std::os::{unix, fd} on Windows from wick's POSIX layer.
++#[cfg(windows)]
++extern crate wick_std as std;
++
+ mod uffd_utils;
+ 
+ use std::fs::File;
+diff --git a/src/firecracker/examples/uffd/malicious_handler.rs b/src/firecracker/examples/uffd/malicious_handler.rs
+index 9af94e057aabde3376cdce9cdfcb73736b3ee3af..ed1a0be613e4611aa8be046d8474103a910199d9 100644
+--- a/src/firecracker/examples/uffd/malicious_handler.rs
++++ b/src/firecracker/examples/uffd/malicious_handler.rs
+@@ -4,6 +4,10 @@
+ //! Provides functionality for a malicious page fault handler
+ //! which panics when a page fault occurs.
+ 
++// wick: std::os::{unix, fd} on Windows from wick's POSIX layer.
++#[cfg(windows)]
++extern crate wick_std as std;
++
+ mod uffd_utils;
+ 
+ use std::fs::File;
+diff --git a/src/firecracker/examples/uffd/on_demand_handler.rs b/src/firecracker/examples/uffd/on_demand_handler.rs
+index 3101aa19253a7cc7ecf0490d778202484e6906cc..7543f4d727aabfd28b778aab61ee1e28a1d480d1 100644
+--- a/src/firecracker/examples/uffd/on_demand_handler.rs
++++ b/src/firecracker/examples/uffd/on_demand_handler.rs
+@@ -5,6 +5,10 @@
+ //! which loads the whole region from the backing memory file
+ //! when a page fault occurs.
+ 
++// wick: std::os::{unix, fd} on Windows from wick's POSIX layer.
++#[cfg(windows)]
++extern crate wick_std as std;
++
+ mod uffd_utils;
+ 
+ use std::fs::File;
+diff --git a/src/firecracker/examples/uffd/uffd_utils.rs b/src/firecracker/examples/uffd/uffd_utils.rs
+index b95a6f4e262451522f1da15d3cc8a68684326bff..7ac7e4cc45ba01308cfcd6153c7321928e593927 100644
+--- a/src/firecracker/examples/uffd/uffd_utils.rs
++++ b/src/firecracker/examples/uffd/uffd_utils.rs
+@@ -232,8 +232,9 @@ impl Runtime {
+         }
+     }
+ 
+-    // wick: the peer's pid: SO_PEERCRED on Linux, LOCAL_PEERPID on macOS.
+-    #[cfg(target_os = "linux")]
++    // wick: the peer's pid: SO_PEERCRED on Linux and Windows (the
++    // compatibility libc's, from SIO_AF_UNIX_GETPEERPID), LOCAL_PEERPID on macOS.
++    #[cfg(any(target_os = "linux", windows))]
+     fn peer_pid(&self) -> libc::pid_t {
+         let mut creds: libc::ucred = libc::ucred {
+             pid: 0,

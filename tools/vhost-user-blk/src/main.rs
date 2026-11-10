@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // A minimal vhost-user-blk backend on the rust-vmm crates, to test Firecracker's
-// vhost-user frontend in tools/macos/boot-test.sh (QEMU's macOS build has no
-// vhost-user-blk export).
+// vhost-user frontend in tools/macos/boot-test.sh and tools/windows/boot-test.ps1
+// (QEMU's macOS and Windows builds have no vhost-user-blk export).
 //   vhost-user-blk <socket> <image>
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::sync::{Arc, RwLock};
 
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
@@ -51,7 +54,7 @@ impl Blk {
                 VIRTIO_BLK_T_IN => {
                     for d in data {
                         let mut buf = vec![0u8; d.len() as usize];
-                        self.file.read_exact_at(&mut buf, off).unwrap_or_else(|_| st = VIRTIO_BLK_S_IOERR as u8);
+                        read_exact_at(&self.file, &mut buf, off).unwrap_or_else(|_| st = VIRTIO_BLK_S_IOERR as u8);
                         mem.write_slice(&buf, d.addr()).unwrap();
                         off += u64::from(d.len());
                         written += d.len();
@@ -61,7 +64,7 @@ impl Blk {
                     for d in data {
                         let mut buf = vec![0u8; d.len() as usize];
                         mem.read_slice(&mut buf, d.addr()).unwrap();
-                        if self.file.write_all_at(&buf, off).is_err() {
+                        if write_all_at(&self.file, &buf, off).is_err() {
                             st = VIRTIO_BLK_S_IOERR as u8;
                         }
                         off += u64::from(d.len());
@@ -163,4 +166,43 @@ fn main() {
     std::io::stdout().flush().unwrap();
     let r = daemon.serve(&socket);
     println!("vhost-user-blk: done ({} requests): {r:?}", blk.read().unwrap().requests);
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    file.read_exact_at(buf, off)
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    file.write_all_at(buf, off)
+}
+
+// Windows' positioned I/O (`seek_read`, `seek_write`) may transfer less.
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match file.seek_read(buf, off)? {
+            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n => {
+                buf = &mut buf[n..];
+                off += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, mut buf: &[u8], mut off: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match file.seek_write(buf, off)? {
+            0 => return Err(std::io::ErrorKind::WriteZero.into()),
+            n => {
+                buf = &buf[n..];
+                off += n as u64;
+            }
+        }
+    }
+    Ok(())
 }

@@ -36,7 +36,7 @@ use windows_sys::Win32::System::Ioctl::{
 
 use crate::windows_fd::{wick_wsa_startup, handle, set_errno};
 use crate::windows_socket::{AF_INET, AF_INET6, AF_UNIX};
-use crate::{c_char, c_int, c_void, off_t};
+use crate::{c_char, c_int, c_void, off_t, size_t, ssize_t};
 
 /// `long` of the Linux LP64 ABI.
 #[allow(non_camel_case_types)]
@@ -666,9 +666,141 @@ pub unsafe fn memfd_create(_name: *const c_char, flags: core::ffi::c_uint) -> c_
     fd
 }
 
+/// `off64_t`: `off_t` is already 64 bits.
+pub type off64_t = off_t;
+
+/// `sendfile64`, with the Linux semantics for any pair of descriptors, as
+/// macOS's (`linux_items`): copies up to `count` bytes from `in_fd` to
+/// `out_fd` at its current position.
+/// - with `offset`, reads from `*offset`, advances `*offset` and leaves the
+///   position of `in_fd` alone;
+/// - without, reads from the position of `in_fd` and advances it.
+///
+/// Returns the number of bytes copied (0 at the end of `in_fd`), at most
+/// `0x7fff_f000` per call as on Linux.
+///
+/// # Safety
+/// Same contract as `sendfile(2)`: `offset` is null or valid for reads and
+/// writes.
+pub unsafe fn sendfile64(out_fd: c_int, in_fd: c_int, offset: *mut off64_t, count: size_t) -> ssize_t {
+    const MAX_PER_CALL: usize = 0x7fff_f000;
+    const CHUNK: usize = 1 << 20;
+    let count = count.min(MAX_PER_CALL);
+    if !offset.is_null() && unsafe { *offset } < 0 {
+        set_errno(crate::EINVAL);
+        return -1;
+    }
+    let mut buf = std::vec![0u8; count.min(CHUNK)];
+    let mut done = 0usize;
+    while done < count {
+        let want = (count - done).min(buf.len());
+        // SAFETY: `buf` has room for `want` bytes; `offset` per the contract.
+        let n = unsafe {
+            if offset.is_null() {
+                crate::read(in_fd, buf.as_mut_ptr().cast(), want)
+            } else {
+                crate::pread(in_fd, buf.as_mut_ptr().cast(), want, *offset)
+            }
+        };
+        if n < 0 {
+            if done > 0 {
+                break;
+            }
+            return -1;
+        }
+        if n == 0 {
+            break;
+        }
+        let n = n.unsigned_abs();
+        let mut written = 0usize;
+        while written < n {
+            // SAFETY: writes bytes read into `buf` above.
+            let w = unsafe { crate::write(out_fd, buf[written..n].as_ptr().cast(), n - written) };
+            if w < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == crate::EINTR {
+                    continue;
+                }
+                // Bytes read but not written are given back to the input.
+                #[allow(clippy::cast_possible_wrap)]
+                let unread = (n - written) as off_t;
+                // SAFETY: `offset` per the contract; otherwise seeks `in_fd` back.
+                unsafe {
+                    if offset.is_null() {
+                        crate::lseek(in_fd, -unread, crate::SEEK_CUR);
+                    } else {
+                        #[allow(clippy::cast_possible_wrap)]
+                        {
+                            *offset += written as off_t;
+                        }
+                    }
+                }
+                done += written;
+                if done > 0 {
+                    return ssize_t::try_from(done).unwrap_or(ssize_t::MAX);
+                }
+                set_errno(errno);
+                return -1;
+            }
+            written += w.unsigned_abs();
+        }
+        if !offset.is_null() {
+            // SAFETY: `offset` per the contract.
+            #[allow(clippy::cast_possible_wrap)]
+            unsafe {
+                *offset += n as off_t;
+            }
+        }
+        done += n;
+        if n < want {
+            break;
+        }
+    }
+    ssize_t::try_from(done).unwrap_or(ssize_t::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sendfile64() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::windows::io::AsRawHandle;
+
+        let dir = std::env::temp_dir();
+        let src_path = dir.join(std::format!("wick-sendfile-src-{}", std::process::id()));
+        let dst_path = dir.join(std::format!("wick-sendfile-dst-{}", std::process::id()));
+        let open = |p: &std::path::Path| {
+            std::fs::File::options().create(true).truncate(true).read(true).write(true).open(p).unwrap()
+        };
+        let (mut src, mut dst) = (open(&src_path), open(&dst_path));
+        let fd = |f: &std::fs::File| crate::windows_fd::to_fd_pub(f.as_raw_handle());
+        src.write_all(b"0123456789").unwrap();
+        src.seek(SeekFrom::Start(1)).unwrap();
+        dst.write_all(b"ab").unwrap();
+        let mut off: off64_t = 4;
+        // SAFETY: valid descriptors and offset.
+        let n = unsafe { sendfile64(fd(&dst), fd(&src), &mut off, 3) };
+        assert_eq!((n, off), (3, 7));
+        assert_eq!(src.stream_position().unwrap(), 1, "input position untouched");
+        // Without an offset: from the input position, which advances.
+        // SAFETY: as above.
+        let n = unsafe { sendfile64(fd(&dst), fd(&src), core::ptr::null_mut(), 2) };
+        assert_eq!(n, 2);
+        assert_eq!(src.stream_position().unwrap(), 3);
+        // At the end.
+        let mut off: off64_t = 10;
+        // SAFETY: as above.
+        assert_eq!(unsafe { sendfile64(fd(&dst), fd(&src), &mut off, 5) }, 0);
+        let mut out = std::string::String::new();
+        dst.seek(SeekFrom::Start(0)).unwrap();
+        dst.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "ab45612");
+        drop((src, dst));
+        std::fs::remove_file(src_path).unwrap();
+        std::fs::remove_file(dst_path).unwrap();
+    }
 
     #[test]
     fn test_memfd_create() {

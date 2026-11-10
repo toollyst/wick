@@ -29,8 +29,22 @@
 //! `uid:gid`. The binary it execs as root is a root-owned copy next to the
 //! jail, never one the jailed user could have written, and must carry the
 //! hand-over mark (any other binary would run unjailed as root).
+//!
+//! Windows has no chroot, no user switch for a non-elevated jailer and no
+//! exec; its backend ([`windows`]) makes the jail's root a drive of its own
+//! (upstream's absolute paths resolve inside it), confines Firecracker with a
+//! restricted low integrity token in place of `uid:gid` and with a Job Object
+//! in place of cgroups, and starts it, waits for it and exits with its
+//! status. Upstream's Unix-only steps around those (file modes and owners,
+//! resource limits, daemonizing) go through the same backend on Windows
+//! (patch 0019).
 
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::*;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::*;

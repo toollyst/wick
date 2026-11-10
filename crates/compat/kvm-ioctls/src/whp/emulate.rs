@@ -64,18 +64,27 @@ struct EmuCtx {
     have_completion: bool,
 }
 
-/// A send-safe wrapper over the process-wide emulator handle.
-#[derive(Clone, Copy)]
+/// An emulator handle, destroyed with the thread that made it.
 struct EmuHandle(*mut core::ffi::c_void);
-// SAFETY: the WHP emulator handle may be used from any thread.
-unsafe impl Send for EmuHandle {}
-unsafe impl Sync for EmuHandle {}
 
-/// The process-wide emulator (its callbacks are stateless; per-call state is
-/// passed as the context pointer).
+impl Drop for EmuHandle {
+    fn drop(&mut self) {
+        // SAFETY: an emulator this thread created and no longer uses.
+        unsafe { whv::WHvEmulatorDestroyEmulator(self.0) };
+    }
+}
+
+/// This thread's emulator. An emulator instance holds the state of the
+/// instruction it is emulating and is not safe to share: one per vCPU
+/// thread, as QEMU's WHPX keeps one per vCPU. A process-wide one, shared by
+/// two vCPUs emulating MMIO at once, completed one vCPU's instruction with
+/// the other's state (a guest with 2 vCPUs and an Async drive had its
+/// kernel memory corrupted within seconds; 1 vCPU never did).
 fn emulator() -> Result<*mut core::ffi::c_void> {
-    static EMU: OnceLock<Result<EmuHandle>> = OnceLock::new();
-    EMU.get_or_init(|| {
+    thread_local! {
+        static EMU: OnceLock<Result<EmuHandle>> = const { OnceLock::new() };
+    }
+    EMU.with(|emu| emu.get_or_init(|| {
         let callbacks = whv::WHV_EMULATOR_CALLBACKS {
             Size: u32::try_from(std::mem::size_of::<whv::WHV_EMULATOR_CALLBACKS>()).unwrap(),
             Reserved: 0,
@@ -92,7 +101,7 @@ fn emulator() -> Result<*mut core::ffi::c_void> {
     })
     .as_ref()
     .map(|h| h.0)
-    .map_err(|e| *e)
+    .map_err(|e| *e))
 }
 
 /// Emulates the MMIO instruction that caused `mem`. `scratch` is an 8-byte

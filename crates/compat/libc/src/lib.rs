@@ -41,6 +41,10 @@ pub use timerfd::*;
 
 #[cfg(windows)]
 extern crate std;
+/// The kernel side of userfaultfd (a wick API, not part of `libc`).
+#[cfg(windows)]
+#[path = "windows_uffd.rs"]
+pub mod wick_uffd;
 #[cfg(windows)]
 mod windows_errno;
 // Explicit, so they take precedence over the CRT values of `upstream`.
@@ -74,7 +78,7 @@ pub use windows_fd::{
 #[cfg(windows)]
 pub use windows_fd::{
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, O_CLOEXEC,
-    O_NOFOLLOW, O_NONBLOCK, RLIM_INFINITY, RLIMIT_NOFILE, S_IFIFO, S_IFSOCK, SEEK_CUR, SEEK_DATA, SEEK_END, SEEK_HOLE,
+    O_NOFOLLOW, O_NONBLOCK, RLIM_INFINITY, RLIMIT_FSIZE, RLIMIT_NOFILE, S_IFIFO, S_IFSOCK, SEEK_CUR, SEEK_DATA, SEEK_END, SEEK_HOLE,
     SEEK_SET, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, _SC_CLK_TCK, _SC_NPROCESSORS_CONF, _SC_NPROCESSORS_ONLN, _SC_OPEN_MAX,
     _SC_PAGE_SIZE, _SC_PAGESIZE, _SC_PHYS_PAGES, wick_fd, fdatasync, fsync, ftruncate, getrlimit,
     pread, pwrite, readv, rlim_t, rlimit, sysconf, uname, utsname, writev,
@@ -87,7 +91,7 @@ mod windows_linux;
 #[rustfmt::skip]
 pub use windows_linux::{
     accept, bind, c_long, c_ulong, connect, fallocate, getpeername, getsockname, ioctl, listen,
-    memfd_create, prctl, sa_family_t, sockaddr_ll, sockaddr_storage, sockaddr_un, socket, syscall,
+    memfd_create, off64_t, prctl, sa_family_t, sendfile64, sockaddr_ll, sockaddr_storage, sockaddr_un, socket, syscall,
     Ioctl, AF_PACKET, BLKIOMIN, BLKIOOPT, BLKPBSZGET, BLKSSZGET, EFD_CLOEXEC, EFD_NONBLOCK,
     EFD_SEMAPHORE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
     MFD_ALLOW_SEALING, MFD_CLOEXEC, PR_GET_SECCOMP, PR_SET_NO_NEW_PRIVS, SECCOMP_SET_MODE_FILTER,
@@ -98,7 +102,8 @@ pub use windows_linux::{
 mod windows_socket;
 #[cfg(windows)]
 pub use windows_socket::{
-    getsockopt, setsockopt, socklen_t, AF_INET, AF_INET6, AF_UNIX, AF_UNSPEC, SOCK_DGRAM,
+    getsockopt, nfds_t, poll, pollfd, setsockopt, socklen_t, ucred, POLLERR, POLLHUP, POLLIN, POLLNVAL,
+    POLLOUT, POLLPRI, SO_PEERCRED, AF_INET, AF_INET6, AF_UNIX, AF_UNSPEC, SOCK_DGRAM,
     SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET, SO_DOMAIN, SO_ERROR, SO_KEEPALIVE, SO_RCVBUF,
     SO_REUSEADDR, SO_SNDBUF, SO_TYPE,
 };

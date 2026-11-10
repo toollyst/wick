@@ -47,6 +47,161 @@ pub const SO_RCVBUF: c_int = 8;
 pub const SO_KEEPALIVE: c_int = 9;
 /// The address family.
 pub const SO_DOMAIN: c_int = 39;
+/// The credentials of the peer of an `AF_UNIX` socket ([`ucred`]).
+pub const SO_PEERCRED: c_int = 17;
+
+/// `struct ucred`: the peer's process id; Windows has no user and group
+/// ids, reported as 0.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ucred {
+    /// Process id.
+    pub pid: crate::pid_t,
+    /// User id.
+    pub uid: crate::uid_t,
+    /// Group id.
+    pub gid: crate::gid_t,
+}
+
+/// `SO_PEERCRED`, from `SIO_AF_UNIX_GETPEERPID`.
+unsafe fn peer_cred(fd: c_int, value: *mut c_void, len: *mut socklen_t) -> c_int {
+    let size = socklen_t::try_from(std::mem::size_of::<ucred>()).unwrap();
+    // SAFETY: the caller's contract.
+    if value.is_null() || len.is_null() || unsafe { *len } < size {
+        set_errno(crate::EINVAL);
+        return -1;
+    }
+    let (mut pid, mut n) = (0u32, 0u32);
+    // SAFETY: the output buffer is a `u32`.
+    let rc = unsafe {
+        ws::WSAIoctl(
+            socket(fd),
+            ws::SIO_AF_UNIX_GETPEERPID,
+            std::ptr::null(),
+            0,
+            (&raw mut pid).cast(),
+            4,
+            &mut n,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if rc == SOCKET_ERROR {
+        return wsa_fail();
+    }
+    let cred = ucred { pid: pid.cast_signed(), uid: 0, gid: 0 };
+    // SAFETY: the caller's contract; checked above.
+    unsafe {
+        value.cast::<ucred>().write_unaligned(cred);
+        *len = size;
+    }
+    0
+}
+
+/// `nfds_t` (Linux: 64 bits).
+#[allow(non_camel_case_types)]
+pub type nfds_t = u64;
+
+/// `struct pollfd`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct pollfd {
+    /// The descriptor; negative: ignored.
+    pub fd: c_int,
+    /// Requested events.
+    pub events: crate::c_short,
+    /// Returned events.
+    pub revents: crate::c_short,
+}
+
+/// Readable.
+pub const POLLIN: crate::c_short = 0x1;
+/// Urgent data.
+pub const POLLPRI: crate::c_short = 0x2;
+/// Writable.
+pub const POLLOUT: crate::c_short = 0x4;
+/// Error.
+pub const POLLERR: crate::c_short = 0x8;
+/// Hang-up.
+pub const POLLHUP: crate::c_short = 0x10;
+/// Not an open descriptor (here: not a socket).
+pub const POLLNVAL: crate::c_short = 0x20;
+
+/// `poll`, over `WSAPoll`: sockets, with the Linux event bits. Windows can
+/// wait for the readiness of sockets only; any other descriptor is reported
+/// `POLLNVAL` (epoll serves the others, see `vmm-sys-util`).
+///
+/// # Safety
+/// `fds` must be valid for `nfds` entries.
+pub unsafe fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int {
+    startup();
+    let Ok(n) = usize::try_from(nfds) else {
+        set_errno(crate::EINVAL);
+        return -1;
+    };
+    // SAFETY: the caller's contract.
+    let fds = unsafe { std::slice::from_raw_parts_mut(fds, n) };
+    let mut ready = 0;
+    let mut polled = std::vec::Vec::new();
+    let mut at = std::vec::Vec::new();
+    for (i, p) in fds.iter_mut().enumerate() {
+        p.revents = 0;
+        if p.fd < 0 {
+            continue;
+        }
+        if !crate::windows_fd::is_socket(p.fd) {
+            p.revents = POLLNVAL;
+            ready += 1;
+            continue;
+        }
+        let mut events = 0;
+        if p.events & (POLLIN | POLLPRI) != 0 {
+            events |= ws::POLLRDNORM;
+        }
+        if p.events & POLLOUT != 0 {
+            events |= ws::POLLWRNORM;
+        }
+        polled.push(ws::WSAPOLLFD { fd: socket(p.fd), events, revents: 0 });
+        at.push(i);
+    }
+    let wait = if ready > 0 { 0 } else { timeout };
+    if polled.is_empty() {
+        if wait != 0 {
+            let ms = if wait < 0 { u32::MAX } else { wait.cast_unsigned() };
+            // SAFETY: plain call.
+            unsafe { windows_sys::Win32::System::Threading::Sleep(ms) };
+        }
+        return ready;
+    }
+    // SAFETY: a valid array.
+    let rc = unsafe { ws::WSAPoll(polled.as_mut_ptr(), u32::try_from(polled.len()).unwrap(), wait) };
+    if rc == SOCKET_ERROR {
+        return wsa_fail();
+    }
+    for (w, &i) in polled.iter().zip(&at) {
+        let mut r = 0;
+        if w.revents & (ws::POLLRDNORM | ws::POLLRDBAND) != 0 {
+            r |= POLLIN;
+        }
+        if w.revents & ws::POLLWRNORM != 0 {
+            r |= POLLOUT;
+        }
+        if w.revents & ws::POLLERR != 0 {
+            r |= POLLERR;
+        }
+        if w.revents & ws::POLLHUP != 0 {
+            r |= POLLHUP;
+        }
+        if w.revents & ws::POLLNVAL != 0 {
+            r |= POLLNVAL;
+        }
+        fds[i].revents = r;
+        if r != 0 {
+            ready += 1;
+        }
+    }
+    ready
+}
 
 fn winsock_option(name: c_int) -> Option<c_int> {
     Some(match name {
@@ -95,6 +250,10 @@ pub unsafe fn getsockopt(
     if level != SOL_SOCKET {
         set_errno(crate::ENOPROTOOPT);
         return -1;
+    }
+    if name == SO_PEERCRED {
+        // SAFETY: the caller's contract.
+        return unsafe { peer_cred(fd, value, len) };
     }
     // SAFETY: the caller's contract.
     if value.is_null() || len.is_null() || unsafe { *len } < 4 {
@@ -166,6 +325,68 @@ pub unsafe fn setsockopt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn fd_of(s: &impl std::os::windows::io::AsRawSocket) -> c_int {
+        s.as_raw_socket() as u32 as c_int
+    }
+
+    #[test]
+    fn test_poll_sockets() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut a = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (b, _) = listener.accept().unwrap();
+        let mut fds = [
+            pollfd { fd: fd_of(&b), events: POLLIN, revents: 0 },
+            pollfd { fd: -1, events: POLLIN, revents: 7 },
+        ];
+        // Nothing to read yet.
+        // SAFETY: a valid array.
+        assert_eq!(unsafe { poll(fds.as_mut_ptr(), 2, 0) }, 0);
+        assert_eq!(fds[1].revents, 0, "negative descriptors are ignored");
+        a.write_all(b"x").unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { poll(fds.as_mut_ptr(), 2, 5000) }, 1);
+        assert_eq!(fds[0].revents & POLLIN, POLLIN);
+        // Writable.
+        let mut w = [pollfd { fd: fd_of(&a), events: POLLOUT, revents: 0 }];
+        // SAFETY: as above.
+        assert_eq!(unsafe { poll(w.as_mut_ptr(), 1, 0) }, 1);
+        assert_eq!(w[0].revents, POLLOUT);
+        // A peer that closed: hang-up or readable at end of file.
+        drop(a);
+        // SAFETY: as above.
+        assert_eq!(unsafe { poll(fds.as_mut_ptr(), 1, 5000) }, 1);
+        assert_ne!(fds[0].revents & (POLLIN | POLLHUP), 0);
+        // A file is not pollable.
+        let f = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let mut nv = [pollfd {
+            fd: crate::windows_fd::to_fd_pub(std::os::windows::io::AsRawHandle::as_raw_handle(&f)),
+            events: POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: as above.
+        assert_eq!(unsafe { poll(nv.as_mut_ptr(), 1, -1) }, 1);
+        assert_eq!(nv[0].revents, POLLNVAL);
+    }
+
+    #[test]
+    fn test_kill() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        let pid = crate::pid_t::try_from(child.id()).unwrap();
+        // SAFETY: plain calls.
+        unsafe {
+            assert_eq!(crate::kill(pid, 0), 0);
+            assert_eq!(crate::kill(pid, crate::SIGUSR1), -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EINVAL));
+            assert_eq!(crate::kill(pid, crate::SIGKILL), 0);
+        }
+        assert_eq!(child.wait().unwrap().code(), Some(137));
+    }
 
     #[test]
     fn test_options_have_linux_numbers_and_values() {

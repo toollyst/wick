@@ -102,6 +102,39 @@ pub(crate) unsafe fn set_partition_property<T>(
     })
 }
 
+/// A register value aligned on 16 bytes. The header declares
+/// `WHV_UINT128` (and so `WHV_REGISTER_VALUE`) `DECLSPEC_ALIGN(16)` and WHP
+/// reads and writes the arrays with aligned SSE moves; `windows-sys`'s type
+/// is only 8-aligned, and an array that happened to be misaligned faulted in
+/// `WHvSetVirtualProcessorRegisters` (a snapshot restore's vCPU events).
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct Aligned(WHV_REGISTER_VALUE);
+
+/// Aligned room for `n` register values: on the stack for the usual few.
+enum Room {
+    Stack([Aligned; 64], usize),
+    Heap(Vec<Aligned>),
+}
+
+impl Room {
+    fn new(n: usize) -> Self {
+        let zero = Aligned(reg64(0));
+        if n <= 64 {
+            Room::Stack([zero; 64], n)
+        } else {
+            Room::Heap(vec![zero; n])
+        }
+    }
+
+    fn slice(&mut self) -> &mut [Aligned] {
+        match self {
+            Room::Stack(a, n) => &mut a[..*n],
+            Room::Heap(v) => v,
+        }
+    }
+}
+
 /// Reads several registers of a vCPU.
 pub(crate) fn get_registers(
     part: WHV_PARTITION_HANDLE,
@@ -110,16 +143,23 @@ pub(crate) fn get_registers(
     values: &mut [WHV_REGISTER_VALUE],
 ) -> Result<()> {
     debug_assert_eq!(names.len(), values.len());
-    // SAFETY: both arrays have `names.len()` elements.
+    let mut room = Room::new(values.len());
+    let aligned = room.slice();
+    // SAFETY: both arrays have `names.len()` elements; `Aligned` is a
+    // `WHV_REGISTER_VALUE` aligned as WHP requires.
     hr(unsafe {
         whv::WHvGetVirtualProcessorRegisters(
             part,
             vp,
             names.as_ptr(),
             u32::try_from(names.len()).unwrap(),
-            values.as_mut_ptr(),
+            aligned.as_mut_ptr().cast(),
         )
-    })
+    })?;
+    for (v, a) in values.iter_mut().zip(aligned.iter()) {
+        *v = a.0;
+    }
+    Ok(())
 }
 
 /// Writes several registers of a vCPU.
@@ -130,14 +170,19 @@ pub(crate) fn set_registers(
     values: &[WHV_REGISTER_VALUE],
 ) -> Result<()> {
     debug_assert_eq!(names.len(), values.len());
-    // SAFETY: both arrays have `names.len()` elements.
+    let mut room = Room::new(values.len());
+    let aligned = room.slice();
+    for (a, v) in aligned.iter_mut().zip(values) {
+        *a = Aligned(*v);
+    }
+    // SAFETY: both arrays have `names.len()` elements, aligned (`Aligned`).
     hr(unsafe {
         whv::WHvSetVirtualProcessorRegisters(
             part,
             vp,
             names.as_ptr(),
             u32::try_from(names.len()).unwrap(),
-            values.as_ptr(),
+            aligned.as_ptr().cast(),
         )
     })
 }
@@ -178,17 +223,21 @@ pub(crate) fn as_u64(value: &WHV_REGISTER_VALUE) -> u64 {
 
 /// Runs a vCPU until it exits, returning the exit context.
 pub(crate) fn run_vp(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<WHV_RUN_VP_EXIT_CONTEXT> {
-    let mut ctx: WHV_RUN_VP_EXIT_CONTEXT = unsafe { std::mem::zeroed() };
+    // Aligned as the header's type (see `Aligned`).
+    #[repr(C, align(16))]
+    struct Exit(WHV_RUN_VP_EXIT_CONTEXT);
+    // SAFETY: all-zero is a valid exit context.
+    let mut ctx = Exit(unsafe { std::mem::zeroed() });
     // SAFETY: valid output buffer of the given size.
     hr(unsafe {
         whv::WHvRunVirtualProcessor(
             part,
             vp,
-            (&raw mut ctx).cast(),
-            u32::try_from(std::mem::size_of_val(&ctx)).unwrap(),
+            (&raw mut ctx.0).cast(),
+            u32::try_from(std::mem::size_of_val(&ctx.0)).unwrap(),
         )
     })?;
-    Ok(ctx)
+    Ok(ctx.0)
 }
 
 /// Asks a running vCPU to exit `WHvRunVirtualProcessor` as soon as possible.

@@ -7,7 +7,9 @@
 pub mod ioctl;
 mod errors;
 pub mod epoll;
+pub mod event;
 pub mod eventfd;
+pub mod seek_hole;
 pub mod signal;
 pub mod sock_ctrl_msg;
 pub mod tempdir;

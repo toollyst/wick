@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qmfflwj <qmfflwj@gmail.com>
+Date: Wed, 11 Nov 2026 02:59:16 +0900
+Subject: [PATCH] wick: a diff snapshot writes whole hole units
+
+NTFS frees sparse files only in 64 KiB units: a dirty 4 KiB page left
+zeros in the rest of its unit, which a diff layer would carry as data.
+Pages are dumped in groups of platform::fs::HOLE_UNIT (one page on Linux
+and macOS), the clean ones with their contents.
+---
+ src/vmm/src/vstate/memory.rs | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src/vmm/src/vstate/memory.rs b/src/vmm/src/vstate/memory.rs
+index 4c68a9bcc9975dbabe7545d6eff390b6f039308b..54925b8e96860902360981c04f353e867c9349ee 100644
+--- a/src/vmm/src/vstate/memory.rs
++++ b/src/vmm/src/vstate/memory.rs
+@@ -457,11 +457,24 @@ impl<'a> GuestMemorySlot<'a> {
+             return Err(MemoryError::DirtyBitmapTooSmall);
+         }
+ 
++        // wick: pages go in groups of the file's hole unit (1 page on Linux, 16 on
++        // Windows), each written whole if one of its pages is dirty; see
++        // `platform::fs::HOLE_UNIT`.
++        let group = (crate::platform::fs::HOLE_UNIT / page_size).clamp(1, 64);
++        let mut group_dirty = false;
+         for (i, v) in kvm_bitmap.iter().enumerate() {
+             for j in 0..64 {
+-                let is_kvm_page_dirty = ((v >> j) & 1u64) != 0u64;
+                 let page_offset = ((i * 64) + j) * page_size;
+-                let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
++                if j % group == 0 {
++                    let mask = u64::MAX >> (64 - group);
++                    group_dirty = (v >> j) & mask != 0
++                        || (0..group)
++                            .map(|k| page_offset + k * page_size)
++                            .take_while(|o| *o < self.slice.len())
++                            .any(|o| firecracker_bitmap.dirty_at(o));
++                }
++                let is_kvm_page_dirty = group_dirty;
++                let is_firecracker_page_dirty = false;
+ 
+                 // We process 64 pages at a time, however the number of pages
+                 // in the slot might not be a multiple of 64. We need to break

@@ -347,12 +347,12 @@ jobs:
       - name: Compatibility crate tests
         working-directory: lib/firecracker
         run: |
-          for c in os std libc vmm-sys-util memfd event-manager micro-http kvm-ioctls; do
-            cargo test --manifest-path "../../crates/compat/$c/Cargo.toml"
+          for c in os std libc vmm-sys-util memfd event-manager micro-http kvm-ioctls userfaultfd; do
+            cargo test --locked --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
-          cargo test --manifest-path ../../crates/compat/vm-memory/Cargo.toml \
+          cargo test --locked --manifest-path ../../crates/compat/vm-memory/Cargo.toml \
             --features backend-mmap,backend-bitmap,backend-atomic
-          cargo test --manifest-path ../../crates/compat/vhost/Cargo.toml \
+          cargo test --locked --manifest-path ../../crates/compat/vhost/Cargo.toml \
             --features vhost-user-frontend,vhost-user-backend
       # The boot test's own helpers (serial-console protocol, vsock, network
       # switch) against stand-ins, in Windows PowerShell 5.1 as users run it;
@@ -369,10 +369,31 @@ jobs:
           "$env:ProgramFiles\NASM" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Build firecracker (WHP backend)
         working-directory: lib/firecracker
-        run: cargo build -p firecracker --release
+        run: cargo build --locked -p firecracker --release
       - name: Smoke-test the binary
         working-directory: lib/firecracker
         run: build/cargo_target/release/firecracker.exe --version
+      # The boot test's diff stage merges snapshots with it.
+      - name: Build snapshot-editor
+        working-directory: lib/firecracker
+        run: cargo build --locked -p snapshot-editor --release
+      # Upstream's jailer with the Windows backend (overlay/jailer/platform):
+      # its tests (tokens, job limits) and the binary.
+      - name: Jailer tests and build
+        working-directory: lib/firecracker
+        run: |
+          cargo test --locked -p jailer
+          cargo build --locked -p jailer --release
+      # The boot test's uffd stage serves a snapshot's pages with it.
+      - name: Build the uffd page fault handler example
+        working-directory: lib/firecracker
+        run: cargo build --locked -p firecracker --example uffd_on_demand_handler --release
+      # The boot test's vhost-user stage serves a drive with it.
+      - name: Build the vhost-user-blk test backend
+        working-directory: tools/vhost-user-blk
+        env:
+          CARGO_TARGET_DIR: ../../lib/firecracker/build/vhost-user-blk
+        run: cargo build --release --locked
       # The host capability probe (tools/windows/winprobe.c), built with the
       # same MSVC toolchain the binary uses.
       - name: Build winprobe
@@ -388,6 +409,10 @@ jobs:
           name: wick-windows-x86_64-${{ github.sha }}
           path: |
             lib/firecracker/build/cargo_target/release/firecracker.exe
+            lib/firecracker/build/cargo_target/release/snapshot-editor.exe
+            lib/firecracker/build/cargo_target/release/jailer.exe
+            lib/firecracker/build/cargo_target/release/examples/uffd_on_demand_handler.exe
+            lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe
             winprobe.exe
             tools/windows/boot-test.ps1
             tools/windows/README.md
