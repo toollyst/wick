@@ -284,6 +284,9 @@ foreach ($s in $Stage) {
     try {
         $msg = & "Stage-$((Get-Culture).TextInfo.ToTitleCase($s))"
         $Results[$s] = "PASS  ${s}: $msg"
+        # A passing stage's jails (guest image copies) go; a failing one's stay to look at.
+        $dir = Join-Path $WorkDir $s
+        if (Test-Path $dir) { Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue }
     } catch {
         $Results[$s] = "FAIL  ${s}: $($_.Exception.Message)"
         Stop-Jailed
