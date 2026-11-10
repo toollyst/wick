@@ -34,6 +34,7 @@ mod irqchip;
 mod regs;
 mod vcpu;
 mod vm;
+mod whv;
 
 use wick_os::fd::{AsRawFd, RawFd};
 use windows_sys::Win32::System::Threading::CreateEventW;

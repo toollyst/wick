@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 
 use vmm_sys_util::errno::Error;
 use windows_sys::Win32::Foundation::{HANDLE, S_OK};
-use windows_sys::Win32::System::Hypervisor::{
+use super::whv::{
     self as whv, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
     WHV_RUN_VP_EXIT_CONTEXT,
 };

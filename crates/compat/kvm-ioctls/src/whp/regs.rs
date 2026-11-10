@@ -14,8 +14,8 @@ use kvm_bindings::{
     CpuId, Msrs, MsrList,
 };
 // kvm_bindings is imported as `kb` only where constants are needed.
-use windows_sys::Win32::System::Hypervisor as whv;
-use windows_sys::Win32::System::Hypervisor::{WHV_PARTITION_HANDLE, WHV_REGISTER_NAME};
+use super::whv;
+use super::whv::{WHV_PARTITION_HANDLE, WHV_REGISTER_NAME};
 
 use super::ffi::{self, as_u64, reg64};
 use super::{err, Result};

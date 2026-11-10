@@ -31,8 +31,8 @@ use kvm_bindings::{
     kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave, CpuId, Msrs, Xsave,
 };
 use vmm_sys_util::errno::Error;
-use windows_sys::Win32::System::Hypervisor as whv;
-use windows_sys::Win32::System::Hypervisor::WHV_PARTITION_HANDLE;
+use super::whv;
+use super::whv::WHV_PARTITION_HANDLE;
 
 use super::vm::VmInner;
 use super::{emulate, err, regs, Handle, IoEventAddress, Result, VcpuExit};

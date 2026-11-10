@@ -30,7 +30,7 @@ use kvm_bindings::{
     kvm_pit_state2, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
     KVM_IRQ_ROUTING_MSI,
 };
-use windows_sys::Win32::System::Hypervisor as whv;
+use super::whv;
 
 use super::vm::VmInner;
 

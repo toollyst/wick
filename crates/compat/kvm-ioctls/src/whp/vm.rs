@@ -22,8 +22,8 @@ use kvm_bindings::{
 };
 use vmm_sys_util::errno::Error;
 use vmm_sys_util::eventfd::EventFd;
-use windows_sys::Win32::System::Hypervisor as whv;
-use windows_sys::Win32::System::Hypervisor::WHV_PARTITION_HANDLE;
+use super::whv;
+use super::whv::WHV_PARTITION_HANDLE;
 
 use super::ffi;
 use super::irqchip::Irqchip;

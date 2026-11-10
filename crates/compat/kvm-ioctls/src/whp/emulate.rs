@@ -25,7 +25,7 @@
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{E_FAIL, S_OK};
-use windows_sys::Win32::System::Hypervisor::{
+use super::whv::{
     self as whv, WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO,
     WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME,
     WHV_REGISTER_VALUE, WHV_TRANSLATE_GVA_RESULT, WHV_VP_EXIT_CONTEXT,
