@@ -114,7 +114,7 @@ firecracker binary, vmm   (upstream source + patches/)
 | Hypervisor | KVM | Hypervisor.framework (macOS 15+) | Windows Hypervisor Platform |
 | Guest | x86_64, aarch64 | aarch64 | x86_64 |
 | Interrupt controller | KVM vGIC / LAPIC | `hv_gic_*` GICv3 (GICv2m MSI frame instead of an ITS) | WHP LAPIC + user-space IOAPIC, 8259 PIC, 8254 PIT |
-| Process hardening | seccomp-BPF, jailer | Seatbelt | process mitigation policies (AppContainer and Job Objects: roadmap) |
+| Process hardening | seccomp-BPF, jailer | Seatbelt, upstream's jailer on macOS backends (`overlay/jailer/platform`) | process mitigation policies (AppContainer and Job Objects: roadmap) |
 
 ## The POSIX layer on Windows
 

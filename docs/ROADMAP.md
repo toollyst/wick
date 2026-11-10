@@ -32,7 +32,7 @@ rootfs; on Windows, by [`tools/windows/boot-test.ps1`](../tools/windows/boot-tes
 | userfaultfd (`Uffd` memory backend) | upstream | works | planned |
 | hugepages | upstream | planned (uffd granularity) | planned (large pages) |
 | seccomp | upstream | Seatbelt | process mitigation policies |
-| jailer | upstream | planned | planned |
+| jailer | upstream | in place: upstream's jailer; chroot, uid/gid, memory cgroup, resource limits, daemonize (CPU cgroups planned) | planned |
 
 ## M1. Foundation
 
@@ -122,17 +122,19 @@ upstream `jailer` CLI, and each one has been measured on that host.
 Firecracker's isolation on Linux is hardware virtualisation, a minimal device model, per-thread seccomp filters and
 the jailer (chroot, uid/gid, namespaces, cgroups, resource limits). The plan keeps the upstream `jailer` CLI and
 gives each control a native backend. Each row names the mechanism; "verified" marks what has been measured on that
-host with a probe. None of it is wired into the jailer yet, and the jailer is not available on macOS or Windows
-today.
+host with a probe, "in place" what the jailer does today. On macOS upstream's jailer runs, with its Linux-only
+primitives behind backends in `overlay/jailer/platform` (patch 0016) and the jail handed over to Firecracker,
+since no program can start inside a chroot there (dyld maps the system libraries from outside it);
+`tools/macos/jailer-test.sh` checks it as root, on CI without a VM. On Windows the jailer is not available yet.
 
 | Control | macOS | Windows |
 | --- | --- | --- |
 | System call filter | Seatbelt `syscall-unix` allow-lists (kernel-enforced, process-wide; verified) | win32k lockdown, ACG, strict handle checks, extension-point and image-load policies (verified with Firecracker's run-time needs) |
-| chroot | Seatbelt path rules limited to the jail directory | AppContainer + jail directory ACL (user files denied, verified) |
-| network namespace | Seatbelt denies IP networking | AppContainer without capabilities (internet and loopback blocked, `AF_UNIX` API socket works; verified) |
-| uid/gid | setuid from a root jailer | per-VM AppContainer SID |
-| cgroups memory | jetsam limit via `posix_spawnattr_setjetsam_ext` (kills at the limit without root; verified) | Job Object commit limit (kills at the limit; verified). Shared sections are not charged to the job: memfd-backed memory goes through a jailer broker |
-| cgroups CPU | vCPU time quota in the VMM run loop | Job Object hard cap (verified) |
+| chroot | in place: `chroot(2)` by the jailer, and by Firecracker first thing after the exec; Seatbelt file rule limited to the jail | AppContainer + jail directory ACL (user files denied, verified) |
+| network namespace | in place: Seatbelt denies IP networking; `--netns` is refused | AppContainer without capabilities (internet and loopback blocked, `AF_UNIX` API socket works; verified) |
+| uid/gid | in place: dropped by Firecracker right after its chroot, exec'd from a root-owned copy the jailed user never could write | per-VM AppContainer SID |
+| cgroups memory | in place: `memory.max` / `memory.limit_in_bytes` → jetsam limit at the exec, the jailer's priority kept (a guest past the limit kills the VMM; measured) | Job Object commit limit (kills at the limit; verified). Shared sections are not charged to the job: memfd-backed memory goes through a jailer broker |
+| cgroups CPU | planned: vCPU time quota in the VMM run loop; `cpu.*` is refused until then | Job Object hard cap (verified) |
 | hugepages | 2 MiB fault/copy granularity in the uffd kernel side (no host superpages on Apple silicon) | `MEM_LARGE_PAGES` / `SEC_LARGE_PAGES` (verified); the privilege is stripped inside an AppContainer, so the jailer creates the section |
 
 Neither macOS nor Windows filters system calls per thread. Threads of one process share an address space, so on
