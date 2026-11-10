@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 12:34:22 +0900
+Subject: [PATCH] block: async engine on platform::async_io
+
+Why: the Async block engine is io_uring, which only Linux has.
+
+What: the block device's async engine submits through `platform::async_io`
+(io_uring on Linux, worker threads with F_FULLFSYNC or FlushFileBuffers
+elsewhere, same submission/completion model and queue limits). The
+io_uring kernel tests run only on Linux; the block device reads file
+identity and type through each host's metadata.
+
+Test: block device and io tests on each host; a guest reads and writes a
+drive with `io_engine: Async`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/devices/virtio/block/virtio/device.rs | 14 +++++++++++
+ .../virtio/block/virtio/io/async_io.rs        | 25 ++++++++-----------
+ .../devices/virtio/block/virtio/io/sync_io.rs |  4 +++
+ src/vmm/src/io_uring/mod.rs                   |  3 +++
+ src/vmm/src/io_uring/operation/mod.rs         |  3 ++-
+ 5 files changed, 34 insertions(+), 15 deletions(-)
+
+diff --git a/src/vmm/src/devices/virtio/block/virtio/device.rs b/src/vmm/src/devices/virtio/block/virtio/device.rs
+index dc2d018ac4959296daa50eded487136e71fc50f5..a484659b30f3abfc12f3e5891b86c42365854bf7 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/device.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/device.rs
+@@ -11,7 +11,12 @@ use std::fs::{File, OpenOptions};
+ use std::io::{Seek, SeekFrom};
+ use std::ops::Deref;
+ use std::os::fd::AsRawFd;
++#[cfg(target_os = "linux")]
+ use std::os::linux::fs::MetadataExt;
++// wick: same `st_*` accessors on macOS.
++#[cfg(target_os = "macos")]
++use std::os::macos::fs::MetadataExt;
++#[cfg(not(windows))]
+ use std::os::unix::fs::FileTypeExt;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+@@ -19,6 +24,10 @@ use std::sync::Arc;
+ use block_io::FileEngine;
+ use serde::{Deserialize, Serialize};
+ use vm_memory::ByteValued;
++
++// wick: Windows file types and identifiers (see `platform::fs`).
++#[cfg(windows)]
++use crate::platform::fs::FileTypeExt;
+ use vmm_sys_util::eventfd::EventFd;
+ 
+ use super::io::async_io;
+@@ -134,9 +143,14 @@ impl DiskProperties {
+     }
+ 
+     fn build_device_id(disk_file: &File) -> Result<String, VirtioBlockError> {
++        #[cfg(not(windows))]
+         let blk_metadata = disk_file
+             .metadata()
+             .map_err(VirtioBlockError::GetFileMetadata)?;
++        // wick: Windows metadata has no identifiers; they come from the handle.
++        #[cfg(windows)]
++        let blk_metadata = crate::platform::fs::StatIds::of(disk_file)
++            .map_err(VirtioBlockError::GetFileMetadata)?;
+         // This is how kvmtool does it.
+         let device_id = format!(
+             "{}{}{}",
+diff --git a/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs b/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs
+index 26a1f9aa96f852bac51328ff416d871068fb251c..1d871dde26914cd29654ead7a0c0d2504181b405 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs
+@@ -3,18 +3,17 @@
+ 
+ use std::fmt::Debug;
+ use std::fs::File;
+-use std::os::fd::RawFd;
+-use std::os::unix::io::AsRawFd;
+ 
+ use vm_memory::{GuestMemoryBackend, GuestMemoryError};
+ use vmm_sys_util::eventfd::EventFd;
+ 
+ use crate::devices::virtio::block::virtio::io::RequestError;
+ use crate::devices::virtio::block::virtio::{IO_URING_NUM_ENTRIES, PendingRequest};
+-use crate::io_uring::operation::{Cqe, OpCode, Operation};
+-use crate::io_uring::restriction::Restriction;
+-use crate::io_uring::{IoUring, IoUringError};
+ use crate::logger::log_dev_preview_warning;
++// wick: the host's async I/O backend (io_uring on Linux) behind the platform interface.
++use crate::platform::async_io::{
++    AsyncIo, Cqe, IoUringError, OpCode, Operation, Queue, Restriction,
++};
+ use crate::vstate::memory::{GuestAddress, GuestMemoryExtension, GuestMemoryMmap};
+ 
+ #[derive(Debug, thiserror::Error, displaydoc::Display)]
+@@ -38,7 +37,7 @@ pub enum AsyncIoError {
+ #[derive(Debug)]
+ pub struct AsyncFileEngine {
+     file: File,
+-    ring: IoUring<WrappedRequest>,
++    ring: Queue<WrappedRequest>,
+     completion_evt: EventFd,
+ }
+ 
+@@ -72,9 +71,9 @@ impl WrappedRequest {
+ impl AsyncFileEngine {
+     fn new_ring(
+         file: &File,
+-        completion_fd: RawFd,
+-    ) -> Result<IoUring<WrappedRequest>, IoUringError> {
+-        IoUring::new(
++        completion_evt: &EventFd,
++    ) -> Result<Queue<WrappedRequest>, IoUringError> {
++        AsyncIo::new(
+             u32::from(IO_URING_NUM_ENTRIES),
+             vec![file],
+             vec![
+@@ -85,7 +84,7 @@ impl AsyncFileEngine {
+                 Restriction::AllowOpCode(OpCode::Write),
+                 Restriction::AllowOpCode(OpCode::Fsync),
+             ],
+-            Some(completion_fd),
++            Some(completion_evt),
+         )
+     }
+ 
+@@ -93,8 +92,7 @@ impl AsyncFileEngine {
+         log_dev_preview_warning("Async file IO", Option::None);
+ 
+         let completion_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(AsyncIoError::EventFd)?;
+-        let ring =
+-            Self::new_ring(&file, completion_evt.as_raw_fd()).map_err(AsyncIoError::IoUring)?;
++        let ring = Self::new_ring(&file, &completion_evt).map_err(AsyncIoError::IoUring)?;
+ 
+         Ok(AsyncFileEngine {
+             file,
+@@ -104,8 +102,7 @@ impl AsyncFileEngine {
+     }
+ 
+     pub fn update_file(&mut self, file: File) -> Result<(), AsyncIoError> {
+-        let ring = Self::new_ring(&file, self.completion_evt.as_raw_fd())
+-            .map_err(AsyncIoError::IoUring)?;
++        let ring = Self::new_ring(&file, &self.completion_evt).map_err(AsyncIoError::IoUring)?;
+ 
+         self.file = file;
+         self.ring = ring;
+diff --git a/src/vmm/src/devices/virtio/block/virtio/io/sync_io.rs b/src/vmm/src/devices/virtio/block/virtio/io/sync_io.rs
+index 8ef5225f1b3b28a7353541f580271065ffccbd2b..7b8ed30463eb5185763387d150361081c34deb31 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/io/sync_io.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/io/sync_io.rs
+@@ -4,10 +4,14 @@
+ use std::fs::File;
+ use std::io::{Seek, SeekFrom, Write};
+ use std::os::fd::AsRawFd;
++#[cfg(not(windows))]
+ use std::os::unix::fs::FileTypeExt;
+ 
+ use vm_memory::{GuestMemoryBackend, GuestMemoryError, ReadVolatile, WriteVolatile};
+ 
++// wick: Windows file types (see `platform::fs`).
++#[cfg(windows)]
++use crate::platform::fs::FileTypeExt;
+ use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+ 
+ #[derive(Debug, thiserror::Error, displaydoc::Display)]
+diff --git a/src/vmm/src/io_uring/mod.rs b/src/vmm/src/io_uring/mod.rs
+index 3d8ec4410288f138d0e4fe3f366bfa8d0a0d3fd3..253e74d351d01a7adbd905d25daf791674fcf5a7 100644
+--- a/src/vmm/src/io_uring/mod.rs
++++ b/src/vmm/src/io_uring/mod.rs
+@@ -378,6 +378,9 @@ impl<T: Debug> IoUring<T> {
+     }
+ }
+ 
++// wick: these tests exercise the Linux kernel's io_uring; the platform
++// interface tests (`platform::async_io`) cover every host.
++#[cfg(target_os = "linux")]
+ #[cfg(test)]
+ mod tests {
+     #![allow(clippy::undocumented_unsafe_blocks)]
+diff --git a/src/vmm/src/io_uring/operation/mod.rs b/src/vmm/src/io_uring/operation/mod.rs
+index ead96df5ba5d5e8e6734a7207511020549eed14e..e19bb6cc18191eb8a7430e59a96c824bf27ceb3c 100644
+--- a/src/vmm/src/io_uring/operation/mod.rs
++++ b/src/vmm/src/io_uring/operation/mod.rs
+@@ -118,7 +118,8 @@ impl<T: Debug> Operation<T> {
+     }
+ 
+     // Needed for proptesting.
+-    #[cfg(test)]
++    // wick: only the Linux io_uring tests use it.
++    #[cfg(all(test, target_os = "linux"))]
+     pub(crate) fn set_linked(&mut self) {
+         self.flags |= 1 << io_uring_sqe_flags_bit::IOSQE_IO_LINK_BIT;
+     }

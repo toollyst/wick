@@ -6,3 +6,4 @@
 0004-seccomp-install-the-host-sandbox-where-seccomp-BPF-d.patch
 0005-utils-vmm-host-APIs-that-differ-outside-glibc-Linux.patch
 0006-vmm-platform-module-overlay-vmm-platform.patch
+0007-block-async-engine-on-platform-async_io.patch
