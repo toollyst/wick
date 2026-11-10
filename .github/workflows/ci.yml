@@ -113,13 +113,19 @@ jobs:
       - name: Compatibility crate tests
         working-directory: lib/firecracker
         run: |
-          for c in os std libc vmm-sys-util memfd event-manager micro-http; do
+          for c in os std libc vmm-sys-util memfd event-manager micro-http kvm-ioctls; do
             cargo test --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
           cargo test --manifest-path ../../crates/compat/vm-memory/Cargo.toml \
             --features backend-mmap,backend-bitmap,backend-atomic
           cargo test --manifest-path ../../crates/compat/vhost/Cargo.toml \
             --features vhost-user-frontend,vhost-user-backend
+      # The boot test's own helpers (serial-console protocol, vsock, network
+      # switch) against stand-ins, in Windows PowerShell 5.1 as users run it;
+      # hosted runners have no WHP to boot a guest.
+      - name: Boot test harness self-test
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -SelfTest
       # aws-lc-sys assembles its x86_64 code with NASM in release builds
       # (built from source rather than with its prebuilt objects).
       - name: Install NASM
@@ -150,5 +156,6 @@ jobs:
             lib/firecracker/build/cargo_target/release/firecracker.exe
             winprobe.exe
             tools/windows/boot-test.ps1
+            tools/windows/README.md
           if-no-files-found: error
           retention-days: 14
