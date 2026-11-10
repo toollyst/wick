@@ -63,7 +63,7 @@ after a Uffd restore); both are fixed.
 | Holes in snapshot files | `platform::fs` | record `SEEK_HOLE`, restore with `F_PUNCHHOLE` after flush (APFS fills holes on flush) | done (diff snapshot → `snapshot-editor rebase` → restore) |
 | Hypervisor (KVM) | `kvm-ioctls` API | HVF, including GIC register state | done (snapshot restore) |
 | Network (TAP) | `platform::net` | vmnet (`vmnet-shared`, `vmnet-host`, `vmnet-br-<if>`) or a Unix datagram endpoint; TUN header handling in `platform::vnet` (checksum, TSO, UFO) | done (guest NAT, TCP) |
-| userfaultfd | `userfaultfd` API | kernel side in `libc::wick_uffd` (`PROT_NONE` + signal, HVF stage-2, filled through an alias, fault-in before system calls, `MADV_DONTNEED` → remove events), socket protocol | done (snapshot restore with `uffd_on_demand_handler`) |
+| userfaultfd | `userfaultfd` API | kernel side in `libc::wick_uffd` (`PROT_NONE` + signal, HVF stage-2, filled through an alias, fault-in before system calls, `MADV_DONTNEED` → remove events), socket protocol (a handler's channel end stays open until the serving thread answers, since macOS can drop a descriptor only a message in flight refers to) | done (snapshot restore with `uffd_on_demand_handler`) |
 | snapshot-editor, examples | `platform::fs`, `vmm_sys_util::seek_hole` | `pread` + `write`, APFS `SEEK_HOLE` | done |
 | PCI / MSI-X | `kvm-ioctls` API (`GRP_ADDR` MSI frame) | HVF GIC MSI frame (GICv2m), FDT `arm,gic-v2m-frame`, MSI SPI state saved | done (virtio-pci blk and net, snapshot restore) |
 | vhost-user | `vmm-sys-util` eventfd, `libc` `SO_DOMAIN` | single-fd eventfd (FIFO, Linux counter semantics), memfd shared memory | done (vhost-user-blk backend in another process) |
