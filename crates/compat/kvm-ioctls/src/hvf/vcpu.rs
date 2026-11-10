@@ -216,7 +216,8 @@ impl VcpuShared {
 
     pub(crate) fn poke_if_vtimer_masked(&self) {
         if self.vtimer_masked.load(Ordering::Acquire) && self.in_run.load(Ordering::Acquire) {
-            self.cancel_run();
+            // Not in a signal handler (the vtimer thread), so it may wait.
+            super::interrupting(|| self.cancel_run());
         }
     }
 
@@ -330,7 +331,7 @@ impl VcpuFd {
         let mut hv: hv_vcpu_t = 0;
         let mut exit: *const hv_vcpu_exit_t = std::ptr::null();
         // SAFETY: valid output pointers; a NULL config selects the defaults.
-        check(unsafe { hv_vcpu_create(&mut hv, &mut exit, std::ptr::null_mut()) })?;
+        check(super::creating(|| unsafe { hv_vcpu_create(&mut hv, &mut exit, std::ptr::null_mut()) }))?;
         self.exit = ExitPtr(exit);
         self.created_here = true;
         // SAFETY: `hv` was just created on this thread.
@@ -423,7 +424,7 @@ fn probe_reset_regs() -> std::result::Result<HashMap<u64, Vec<u8>>, i32> {
         let mut hv: hv_vcpu_t = 0;
         let mut exit: *const hv_vcpu_exit_t = std::ptr::null();
         // SAFETY: valid output pointers; a NULL config selects the defaults.
-        let ret = unsafe { hv_vcpu_create(&mut hv, &mut exit, std::ptr::null_mut()) };
+        let ret = super::creating(|| unsafe { hv_vcpu_create(&mut hv, &mut exit, std::ptr::null_mut()) });
         if let Err(e) = check(ret) {
             return Err(e.errno());
         }
@@ -678,11 +679,23 @@ impl VcpuFd {
 
     /// Sets `immediate_exit`. Setting it to 1 also forces a running vCPU out
     /// of the guest, so the next (or current) `run()` returns `EINTR`.
+    ///
+    /// Clearing it on the owning thread is the vCPU taking the exit, which
+    /// Firecracker also does without calling `run()` when it finds the flag
+    /// already set (a kick that arrived between two runs): the vCPU then stops
+    /// for its owner as when `run()` returns `EINTR`, so other threads may read
+    /// its GIC registers (a snapshot right after a pause).
     pub fn set_kvm_immediate_exit(&mut self, val: u8) {
         self.shared.immediate_exit().store(val, Ordering::Release);
         if val != 0 {
             self.shared.cancel_run();
             self.shared.wake();
+        } else if let Ok(Some(hv)) = self.live()
+            && self.vm().is_ok_and(|vm| vm.gic.lock().unwrap().created)
+        {
+            // A failure leaves the registers unreadable from other threads,
+            // which then get EBUSY: reported there, never stale values.
+            let _ = self.shared.gic.lock().unwrap().stop(hv);
         }
     }
 
@@ -961,13 +974,13 @@ impl VcpuFd {
                 HV_EXIT_REASON_CANCELED => continue,
                 HV_EXIT_REASON_VTIMER_ACTIVATED => {
                     // SAFETY: `hv` belongs to this thread; ISPENDR0 is write-1-to-set.
-                    check(unsafe {
+                    check(super::interrupting(|| unsafe {
                         hv_gic_set_redistributor_reg(
                             hv,
                             HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0,
                             1 << HV_GIC_INT_EL1_VIRTUAL_TIMER,
                         )
-                    })?;
+                    }))?;
                     self.shared.vtimer_masked.store(true, Ordering::Release);
                     continue;
                 }

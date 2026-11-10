@@ -312,15 +312,15 @@ impl VmInner {
                 // A pulse, like KVM's irqfd: an edge for edge-triggered SPIs, and a
                 // level that is dropped again for level-triggered ones.
                 // SAFETY: plain calls; invalid ids are reported as errors.
-                unsafe {
+                super::interrupting(|| unsafe {
                     hv_gic_set_spi(intid, true);
                     hv_gic_set_spi(intid, false);
-                }
+                });
                 HV_SUCCESS
             }),
             Some(Route::Msi { address, data }) => self.raise_spi(data, || {
                 // SAFETY: plain call; a bad address or SPI is reported as an error.
-                unsafe { hv_gic_send_msi(address, data) }
+                super::interrupting(|| unsafe { hv_gic_send_msi(address, data) })
             }),
             None => HV_SUCCESS,
         };
@@ -386,9 +386,9 @@ impl VmInner {
                 return true;
             }
             // SAFETY: plain call; GICD_ISPENDR<n> is write-1-to-set.
-            unsafe {
+            super::interrupting(|| unsafe {
                 hv_gic_set_distributor_reg(0x200 + 4 * (intid / 32), 1 << (intid % 32))
-            };
+            });
             false
         });
         drop(deferred);
@@ -826,7 +826,7 @@ impl VmFd {
             return err(libc::EINVAL);
         }
         // SAFETY: plain call.
-        check(unsafe { hv_gic_set_spi(irq & 0xffff, active) })
+        check(super::interrupting(|| unsafe { hv_gic_set_spi(irq & 0xffff, active) }))
     }
 
     /// Sends an MSI through the MSI frame (`data` is the SPI). Returns 1, as
@@ -835,7 +835,9 @@ impl VmFd {
         self.fd.check()?;
         let address = u64::from(msi.address_hi) << 32 | u64::from(msi.address_lo);
         // SAFETY: plain call; a bad address or SPI is reported as an error.
-        check(self.inner.raise_spi(msi.data, || unsafe { hv_gic_send_msi(address, msi.data) }))?;
+        check(self.inner.raise_spi(msi.data, || {
+            super::interrupting(|| unsafe { hv_gic_send_msi(address, msi.data) })
+        }))?;
         Ok(1)
     }
 

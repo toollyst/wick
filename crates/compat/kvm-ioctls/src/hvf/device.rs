@@ -316,8 +316,8 @@ fn dist_write(vm: &VmInner, offset: u64, value: u32) -> Result<()> {
         let reg = u32::try_from(offset).unwrap();
         for bit in set_bits() {
             // SAFETY: plain call; GICD_ISPENDR<n> is write-1-to-set.
-            check(vm.raise_spi(first + bit, || unsafe {
-                hv_gic_set_distributor_reg(reg, 1 << bit)
+            check(vm.raise_spi(first + bit, || {
+                super::interrupting(|| unsafe { hv_gic_set_distributor_reg(reg, 1 << bit) })
             }))?;
         }
         return Ok(());

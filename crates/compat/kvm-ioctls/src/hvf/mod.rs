@@ -30,6 +30,32 @@ mod regs;
 mod vcpu;
 mod vm;
 
+/// Serialises vCPU creation with the calls that make interrupts pending.
+///
+/// Hypervisor.framework deadlocks when one thread creates a vCPU
+/// (`hv_vcpu_create`) while another makes a GIC interrupt pending, which
+/// interrupts the vCPUs (`Hv::Vm::interrupt_cpus`): the two take two internal
+/// locks in opposite orders. vCPUs are created on their own threads, so on a
+/// restore one vCPU making its deferred SPIs pending raced the next vCPU's
+/// creation and hung the VM (about one restore in fifteen). Creating a vCPU
+/// holds this exclusively ([`creating`]); every GIC write and vCPU poke made
+/// outside a signal handler holds it shared ([`interrupting`]), so they still
+/// run concurrently with each other. Process-wide, as the VM is.
+static CREATE_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Runs `f`, a `hv_vcpu_create`, with no interrupt being made pending.
+pub(crate) fn creating<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = CREATE_LOCK.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    f()
+}
+
+/// Runs `f`, one Hypervisor.framework call that can interrupt vCPUs, with no
+/// vCPU being created. `f` must not call [`interrupting`] or [`creating`].
+pub(crate) fn interrupting<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = CREATE_LOCK.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    f()
+}
+
 use std::fs::File;
 use std::os::raw::c_ulong;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
