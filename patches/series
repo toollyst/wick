@@ -10,3 +10,4 @@
 0008-snapshot-memory-files-keep-holes-on-every-host.patch
 0009-net-the-network-device-s-host-side-is-platform-net.patch
 0010-aarch64-GICv3-without-an-ITS-uses-a-GICv2m-MSI-frame.patch
+0011-vmm-memory-in-whole-host-pages-16-KiB-on-Apple-silic.patch
