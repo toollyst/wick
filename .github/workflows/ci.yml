@@ -46,6 +46,26 @@ jobs:
           tools/gen-kvm-bindings-windows.sh --check
           tools/gen-windows-sources.sh --check
 
+  # Dependency policy (CONTRIBUTING.md, "Dependencies"): RustSec advisories,
+  # licenses, banned and duplicate crates and sources for lib/firecracker's
+  # Cargo.lock and tools/vhost-user-blk's, with cargo-deny at upstream's
+  # version. The weekly run catches advisories published against an unchanged
+  # lockfile.
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - run: tools/setup.sh
+      - name: Install cargo-deny
+        run: |
+          source tools/common.sh
+          cargo install --locked cargo-deny --version "$(cargo_deny_version)"
+      - name: Dependency checks
+        run: tools/check-dependencies.sh
+
   linux:
     strategy:
       fail-fast: false
@@ -101,10 +121,6 @@ jobs:
         run: |
           tools/linux/compare-unit-tests.py "$RUNNER_TEMP/unit/upstream" "$RUNNER_TEMP/unit/wick" \
             --summary "$GITHUB_STEP_SUMMARY"
-      # On Linux the compatibility crates re-export the original crates from
-      # their release tags: those must be the crates.io releases upstream uses.
-      - name: Dependency sources are upstream's crates.io releases
-        run: tools/linux/check-dependency-sources.py lib/firecracker/build/devctr-cache/git/checkouts
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v7
