@@ -230,8 +230,18 @@ function Check([string]$name, $value, [scriptblock]$ok) {
 function Start-Shell($vm) {
     $c = @()
     $up = $vm.WaitFor('Run /bin/sh as init process', $TimeoutSec * 1000)
-    $c += Check 'kernel reaches init' $(if ($up) { 'yes' } else { 'no' }) { param($v) $v -eq 'yes' }
-    if (-not $up) { return ,$c }
+    if (-not $up) {
+        $last = ($vm.Output -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 3) -join ' | '
+        $why = if ($vm.Exited) { "firecracker exited ($($vm.ExitCode)): $last" } else { "no init after $TimeoutSec s: $last" }
+        if ($vm.Output -match 'Kvm\(Kvm\(Error\(55\)\)\)|Error creating KVM object') {
+            $why = "Windows Hypervisor Platform is not available: turn on the feature " +
+                "(optionalfeatures.exe, or Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform) " +
+                "and reboot. $why"
+        }
+        $c += @{ name = 'kernel reaches init'; ok = $false; detail = $why }
+        return ,$c
+    }
+    $c += @{ name = 'kernel reaches init'; ok = $true; detail = 'yes' }
     Start-Sleep -Milliseconds 1500
     $vm.Send('mount -t proc proc /proc; mount -t sysfs sys /sys')
     # The echo of the command line holds "6*7", not "42": only the shell's
