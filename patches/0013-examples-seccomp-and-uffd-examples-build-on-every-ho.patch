@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 12:34:31 +0900
+Subject: [PATCH] examples: seccomp and uffd examples build on every host
+
+Why: the examples used Linux-only syscall wrappers.
+
+What: the seccomp examples call write(2) directly; the uffd handlers use
+the portable peer-pid, POLLHUP and nfds_t forms.
+
+Test: `cargo build -p firecracker --examples`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/examples/seccomp/harmless.rs  |  4 +-
+ src/firecracker/examples/seccomp/malicious.rs |  4 +-
+ src/firecracker/examples/uffd/uffd_utils.rs   | 39 ++++++++++++++++---
+ 3 files changed, 39 insertions(+), 8 deletions(-)
+
+diff --git a/src/firecracker/examples/seccomp/harmless.rs b/src/firecracker/examples/seccomp/harmless.rs
+index 5ca08d489fa0eb96b4e213b731e558e296c56cec..336a0109482086ceca2cfa3ee7bcf7331a3c91ff 100644
+--- a/src/firecracker/examples/seccomp/harmless.rs
++++ b/src/firecracker/examples/seccomp/harmless.rs
+@@ -5,6 +5,8 @@ fn main() {
+     // The syscall is safe because we're only writing a static string to a file descriptor.
+     unsafe {
+         // Harmless print to standard output.
+-        libc::syscall(libc::SYS_write, libc::STDOUT_FILENO, "Hello, world!\n", 14);
++        // wick: write(2) itself (the same system call) instead of syscall(SYS_write),
++        // which only Linux numbers.
++        libc::write(libc::STDOUT_FILENO, "Hello, world!\n".as_ptr().cast(), 14);
+     }
+ }
+diff --git a/src/firecracker/examples/seccomp/malicious.rs b/src/firecracker/examples/seccomp/malicious.rs
+index b6ef27416072a5aa209e11957ea93d557ae8fc49..fb9487bc6f0a321ec02879ff9db7c86c2f5fe085 100644
+--- a/src/firecracker/examples/seccomp/malicious.rs
++++ b/src/firecracker/examples/seccomp/malicious.rs
+@@ -5,6 +5,8 @@ fn main() {
+     // The syscall is safe because we're only writing a static string to a file descriptor.
+     unsafe {
+         // In this example, the malicious component is outputting to standard input.
+-        libc::syscall(libc::SYS_write, libc::STDIN_FILENO, "Hello, world!\n", 14);
++        // wick: write(2) itself (the same system call) instead of syscall(SYS_write),
++        // which only Linux numbers.
++        libc::write(libc::STDIN_FILENO, "Hello, world!\n".as_ptr().cast(), 14);
+     }
+ }
+diff --git a/src/firecracker/examples/uffd/uffd_utils.rs b/src/firecracker/examples/uffd/uffd_utils.rs
+index ab28f6f4d2e9e68c81aebdf0a00916a06c4e875f..b95a6f4e262451522f1da15d3cc8a68684326bff 100644
+--- a/src/firecracker/examples/uffd/uffd_utils.rs
++++ b/src/firecracker/examples/uffd/uffd_utils.rs
+@@ -232,7 +232,9 @@ impl Runtime {
+         }
+     }
+ 
+-    fn peer_process_credentials(&self) -> libc::ucred {
++    // wick: the peer's pid: SO_PEERCRED on Linux, LOCAL_PEERPID on macOS.
++    #[cfg(target_os = "linux")]
++    fn peer_pid(&self) -> libc::pid_t {
+         let mut creds: libc::ucred = libc::ucred {
+             pid: 0,
+             gid: 0,
+@@ -251,15 +253,34 @@ impl Runtime {
+         if ret != 0 {
+             panic!("Failed to get peer process credentials");
+         }
+-        creds
++        creds.pid
++    }
++
++    #[cfg(target_os = "macos")]
++    fn peer_pid(&self) -> libc::pid_t {
++        let mut pid: libc::pid_t = 0;
++        let mut size = size_of::<libc::pid_t>() as u32;
++        let ret = unsafe {
++            libc::getsockopt(
++                self.stream.as_raw_fd(),
++                libc::SOL_LOCAL,
++                libc::LOCAL_PEERPID,
++                (&raw mut pid).cast::<c_void>(),
++                &raw mut size,
++            )
++        };
++        if ret != 0 {
++            panic!("Failed to get peer process credentials");
++        }
++        pid
+     }
+ 
+     pub fn install_panic_hook(&self) {
+-        let peer_creds = self.peer_process_credentials();
++        let peer_pid = self.peer_pid();
+ 
+         let default_panic_hook = std::panic::take_hook();
+         std::panic::set_hook(Box::new(move |panic_info| {
+-            let r = unsafe { libc::kill(peer_creds.pid, libc::SIGKILL) };
++            let r = unsafe { libc::kill(peer_pid, libc::SIGKILL) };
+ 
+             if r != 0 {
+                 eprintln!("Failed to kill Firecracker process from panic hook");
+@@ -286,7 +307,8 @@ impl Runtime {
+ 
+         loop {
+             let pollfd_ptr = pollfds.as_mut_ptr();
+-            let pollfd_size = pollfds.len() as u64;
++            // wick: nfds_t is 64 bits on Linux, 32 on macOS.
++            let pollfd_size = pollfds.len() as libc::nfds_t;
+ 
+             // # Safety:
+             // Pollfds vector is valid
+@@ -322,7 +344,12 @@ impl Runtime {
+                 }
+             }
+             // If connection is closed, we can skip the socket from being polled.
+-            pollfds.retain(|pollfd| pollfd.revents & (libc::POLLRDHUP | libc::POLLHUP) == 0);
++            // wick: POLLRDHUP is Linux only; macOS reports a closed peer as POLLHUP.
++            #[cfg(target_os = "linux")]
++            let closed = libc::POLLRDHUP | libc::POLLHUP;
++            #[cfg(not(target_os = "linux"))]
++            let closed = libc::POLLHUP;
++            pollfds.retain(|pollfd| pollfd.revents & closed == 0);
+         }
+     }
+ }

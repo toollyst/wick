@@ -12,3 +12,4 @@
 0010-aarch64-GICv3-without-an-ITS-uses-a-GICv2m-MSI-frame.patch
 0011-vmm-memory-in-whole-host-pages-16-KiB-on-Apple-silic.patch
 0012-tests-upstream-unit-tests-on-non-Linux-hosts.patch
+0013-examples-seccomp-and-uffd-examples-build-on-every-ho.patch
