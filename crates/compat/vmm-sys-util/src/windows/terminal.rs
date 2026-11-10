@@ -103,7 +103,8 @@ unsafe impl Terminal for StdinLock<'_> {
 
 #[cfg(test)]
 mod tests {
-    use wick_os::fd::RawHandle;
+    use std::os::windows::io::RawHandle;
+
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Pipes::CreatePipe;
 
@@ -136,7 +137,7 @@ mod tests {
 
         // A regular file.
         let file = crate::tempfile::TempFile::new().unwrap();
-        let file = Fd(wick_os::fd::AsRawFd::as_raw_fd(file.as_file()));
+        let file = Fd(from_handle(std::os::windows::io::AsRawHandle::as_raw_handle(file.as_file())));
         file.set_raw_mode().unwrap();
         file.set_canon_mode().unwrap();
     }
