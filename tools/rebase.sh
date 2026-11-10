@@ -9,8 +9,8 @@
 #   tools/rebase.sh --finish <new-tag>   after resolving conflicts and
 #                                        `git rebase --continue` there
 #
-# On success patches/, patches/base, patches/version (wick's number, reset to
-# 1) and the lib/firecracker pointer are updated in the index; build, test and
+# On success patches/, patches/base, patches/version (wick's fix number, reset to
+# 0) and the lib/firecracker pointer are updated in the index; build, test and
 # commit them. The previous series stays in lib/firecracker as branch
 # wick-<old-tag>.
 #
@@ -29,8 +29,8 @@ finish() {
         || die "branch $WICK_BRANCH is not based on $new"
 
     printf '%s\n' "$new" >"$PATCHES_DIR/base"
-    # wick's release number counts from 1 again on each upstream release.
-    printf '1\n' >"$PATCHES_DIR/version"
+    # A new upstream base starts with its own release (no wick fix number).
+    printf '0\n' >"$PATCHES_DIR/version"
     "$WICK_ROOT/tools/patches.sh" export
     git -C "$WICK_ROOT" update-index --cacheinfo "160000,$new_commit,lib/firecracker"
     git -C "$WICK_ROOT" add patches

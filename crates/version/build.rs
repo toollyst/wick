@@ -3,7 +3,9 @@
 
 //! Reads the release version from the wick repository: the upstream release in
 //! `patches/base` (`v1.18.0`) and wick's number in `patches/version` (`1`)
-//! make `1.18.0-wick.1`. Writes it to `$OUT_DIR/version.rs` for `src/lib.rs`.
+//! make the version: `1.18.0` for 0 (the release of the upstream base),
+//! `1.18.0+wick.N` for wick's fix releases on it. Writes it to
+//! `$OUT_DIR/version.rs` for `src/lib.rs`.
 //! A missing or malformed file fails the build; there is no fallback.
 
 use std::path::{Path, PathBuf};
@@ -40,20 +42,27 @@ fn main() {
 
     let number = read(&number_file);
     assert!(
-        is_numeric(&number) && number != "0",
-        "wick-version: {} must hold wick's release number (1, 2, ...), not '{number}'",
+        is_numeric(&number),
+        "wick-version: {} must hold wick's release number (0, 1, 2, ...), not '{number}'",
         number_file.display()
     );
 
-    let version = format!("{upstream}-wick.{number}");
+    // 0: the release of the upstream base, under upstream's version. A fix
+    // release N carries `+wick.N` (semver build metadata), so it never sorts
+    // below the upstream release it fixes, as a pre-release would.
+    let version = if number == "0" {
+        upstream.to_string()
+    } else {
+        format!("{upstream}+wick.{number}")
+    };
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("version.rs");
     let code = format!(
-        "/// The full version, `<upstream>-wick.<N>`, as a string literal.\n\
+        "/// The full version, `<upstream>` or `<upstream>+wick.<N>`, as a string literal.\n\
          #[macro_export]\n\
          macro_rules! version {{\n    () => {{\n        {version:?}\n    }};\n}}\n\
          /// The upstream Firecracker release wick is built on.\n\
          pub const UPSTREAM: &str = {upstream:?};\n\
-         /// wick's release number on top of [`UPSTREAM`].\n\
+         /// wick's fix release number on top of [`UPSTREAM`] (0: none).\n\
          pub const NUMBER: u32 = {number};\n"
     );
     std::fs::write(&out, code)

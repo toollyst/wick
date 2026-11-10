@@ -92,19 +92,23 @@ version move with it.
 
 ## Releases
 
-wick's version is upstream's plus wick's number: `<upstream>-wick.<N>` (for
-example `1.18.0-wick.1`, a valid semver string). The upstream part is
-`patches/base`; N is the only thing in `patches/version`. The binaries report
-it (`firecracker --version`, `GET /version`, and the jailer, snapshot-editor,
+A release on an upstream base carries upstream's version: `v1.18.0` is wick
+built on Firecracker v1.18.0. wick's own fix releases on the same base, if
+there are any, are `v1.18.0+wick.1`, `v1.18.0+wick.2`, ...: semver build
+metadata, so a fix release never sorts below the upstream release it fixes
+(a pre-release such as `1.18.0-wick.1` would). The upstream part is
+`patches/base`; the fix number is the only thing in `patches/version` (0 for
+the release of the base). The binaries report the same string
+(`firecracker --version`, `GET /version`, and the jailer, snapshot-editor,
 rebase-snap and seccompiler-bin), through `crates/version`, which reads both
 files at build time. Format and compatibility versions stay upstream's: the
 snapshot format (`--snapshot-version`), the API specification, and
 cpu-template-helper, whose version is recorded in CPU fingerprints.
 
-N starts at 1 for each upstream tag (`tools/rebase.sh` resets it). For the
-next release on the same upstream, raise N in `patches/version` in a commit
-of its own on `main` (`release: 1.18.0-wick.2`) and tag that commit with the
-same version, `v1.18.0-wick.2`. Pushing a tag runs the release workflow,
+The number is 0 after each new upstream base (`tools/rebase.sh` resets it).
+For a fix release on the same upstream, raise it in `patches/version` in a
+commit of its own on `main` (`release: 1.18.0+wick.1`) and tag that commit
+with the same version, `v1.18.0+wick.1`. Pushing a tag runs the release workflow,
 which refuses a tag that is not exactly `v` + the version from those two
 files, then builds and packages the macOS binary
 (`tools/package-release.sh`) and checks that it reports the tag. Hosted

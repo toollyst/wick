@@ -1,7 +1,8 @@
 # Copyright 2026 toollyst contributors.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Release (CONTRIBUTING.md, "Releases"): pushing a tag vX.Y.Z-wick.N builds the
+# Release (CONTRIBUTING.md, "Releases"): pushing a tag vX.Y.Z (the release of an
+# upstream base) or vX.Y.Z+wick.N (a wick fix release on it) builds the
 # macOS (Apple silicon) binary, signs it with the Hypervisor.framework
 # entitlement and publishes it as a GitHub Release in the upstream Firecracker
 # release layout (tools/package-release.sh). Hosted runners cannot run HVF
@@ -10,11 +11,11 @@ name: release
 
 on:
   push:
-    tags: ["v*-wick.*"]
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)build and upload, e.g. v1.18.0-wick.1"
+        description: "Existing tag to (re)build and upload, e.g. v1.18.0 or v1.18.0+wick.1"
         required: true
 
 permissions:

@@ -15,7 +15,8 @@ If you are not sure which, report it here and we will coordinate.
 
 ## Supported versions
 
-Security fixes go into the latest `v<upstream>-wick.<N>` release.
+Security fixes go into the latest release: `v<upstream>`, or a fix release
+`v<upstream>+wick.<N>` on it.
 
 ## Security model
 

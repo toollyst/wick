@@ -25,8 +25,8 @@ ROOT="$WICK_ROOT"
 tag="${1:-}"
 out="${2:-dist}"
 [[ -n "$tag" ]] || die "usage: $0 <tag> [out-dir]"
-[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-wick\.[0-9]+$ ]] \
-    || die "tag must look like v1.18.0-wick.1 (got '$tag')"
+[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\+wick\.[1-9][0-9]*)?$ ]] \
+    || die "tag must look like v1.18.0 or v1.18.0+wick.1 (got '$tag')"
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] \
     || die "needs macOS on Apple silicon"
 

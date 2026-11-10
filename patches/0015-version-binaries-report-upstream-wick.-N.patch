@@ -1,38 +1,41 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
 Date: Tue, 10 Nov 2026 15:08:10 +0900
-Subject: [PATCH] version: binaries report <upstream>-wick.<N>
+Subject: [PATCH] version: binaries report <upstream>[+wick.<N>]
 
-Why: wick's releases are upstream's version plus wick's own number
-(v1.18.0-wick.1), but the binaries print CARGO_PKG_VERSION, so a wick
-build says `Firecracker v1.18.0` and `GET /version` cannot tell it from
-upstream or from another wick release on the same base.
+Why: wick releases carry upstream's version (v1.18.0), and wick's own fix
+releases on that base are v1.18.0+wick.1, ...; but the binaries print
+CARGO_PKG_VERSION, so a fix release cannot be told from the upstream
+release it fixes, by `--version` or by `GET /version`.
 
 What: the release label comes from wick-version (crates/version), which
 reads patches/base and patches/version at build time and expands
-`wick_version::version!()` to the literal `1.18.0-wick.1`, a valid semver
-string with a pre-release part. It replaces env!("CARGO_PKG_VERSION") in
-firecracker (`--version`, `--help`, the start-up log line, `GET /version`
-and `vmm_version` in `GET /`), the jailer, snapshot-editor, rebase-snap and
-seccompiler-bin. Format and compatibility versions stay upstream's: the
-snapshot format and `--snapshot-version`, the API specification's version,
-and cpu-template-helper, whose version is written into CPU fingerprints
-that `fingerprint compare` checks. The workspace lists crates/version as a
-member. test_api_version compares Cargo.toml's version with the upstream
-part of the API's.
+`wick_version::version!()` to the literal `1.18.0` (fix number 0) or
+`1.18.0+wick.N`: semver build metadata, so a fix release never sorts below
+the upstream release, as a pre-release would. It replaces
+env!("CARGO_PKG_VERSION") in firecracker (`--version`, `--help`, the
+start-up log line, `GET /version` and `vmm_version` in `GET /`), the
+jailer, snapshot-editor, rebase-snap and seccompiler-bin. Format and
+compatibility versions stay upstream's: the snapshot format and
+`--snapshot-version`, the API specification's version, and
+cpu-template-helper, whose version is written into CPU fingerprints that
+`fingerprint compare` checks. The workspace lists crates/version as a
+member. test_api_version compares Cargo.toml's version with the API's
+without its build metadata.
 
 Test: `cargo test -p wick-version` and
-`cargo test -p firecracker --bin firecracker wick_version`;
-`firecracker --version` prints `Firecracker v1.18.0-wick.1` and
-`GET /version` returns `{"firecracker_version":"1.18.0-wick.1"}`, while
+`cargo test -p firecracker --bin firecracker wick_version`; with
+patches/version 1, `firecracker --version` prints
+`Firecracker v1.18.0+wick.1` and `GET /version` returns
+`{"firecracker_version":"1.18.0+wick.1"}`, while
 `firecracker --snapshot-version` still prints `v12.0.0`.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- Cargo.lock                                    | 12 +++++++
+ Cargo.lock                                    | 12 ++++++++
  Cargo.toml                                    |  6 ++--
  src/firecracker/Cargo.toml                    |  2 ++
- src/firecracker/src/main.rs                   | 33 +++++++++++++++++--
+ src/firecracker/src/main.rs                   | 28 +++++++++++++++++--
  src/jailer/Cargo.toml                         |  2 ++
  src/jailer/src/main.rs                        |  3 +-
  src/rebase-snap/Cargo.toml                    |  2 ++
@@ -41,8 +44,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/seccompiler/src/bin.rs                    |  3 +-
  src/snapshot-editor/Cargo.toml                |  2 ++
  src/snapshot-editor/src/main.rs               |  3 +-
- .../integration_tests/functional/test_api.py  |  4 +++
- 13 files changed, 71 insertions(+), 9 deletions(-)
+ .../integration_tests/functional/test_api.py  |  5 ++++
+ 13 files changed, 67 insertions(+), 9 deletions(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
 index f112d0451d2999877473e53e81a4f2b0d2083a31..a6dc5a393c079170d316ca70ad2ba3c0d3d63c5b 100644
@@ -118,27 +121,27 @@ index 69b2156b99babd1668345113cf0b11a79cda813c..f93bf271eb68582bb59fc633656a6255
  # for the gnu target, and the jailer needs a statically compiled binary to work correctly.
  # See https://github.com/firecracker-microvm/firecracker/commit/3bf285c8f8a815149923c562dd7edaffcaf10c4e
 diff --git a/src/firecracker/Cargo.toml b/src/firecracker/Cargo.toml
-index 37c2a2a3a62a03a8d755047702451e9f1bbb50cb..fbd7ee8d9ddf16d3e6e8541cdfa65e80a96c0df6 100644
+index 37c2a2a3a62a03a8d755047702451e9f1bbb50cb..38728c506c0dc24f1293a4fbe4b2a2771020a1ff 100644
 --- a/src/firecracker/Cargo.toml
 +++ b/src/firecracker/Cargo.toml
 @@ -25,6 +25,8 @@ displaydoc = "0.2.6"
  event-manager = "0.4.2"
  # wick: features of wick.
  wick-ext = { path = "../../../../crates/ext" }
-+# wick: wick's release version, <upstream>-wick.<N> (crates/version).
++# wick: wick's release version, <upstream>[+wick.<N>] (crates/version).
 +wick-version = { path = "../../../../crates/version" }
  libc = "0.2.186"
  log-instrument = { path = "../log-instrument", optional = true }
  # wick: by path, built over wick's POSIX layer on Windows (a [patch] of the
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
-index a92dbf32c7e0591a9d34513950da87d589c7bd52..b01b6506b1df2dc8700fad8fa75990782188550f 100644
+index a92dbf32c7e0591a9d34513950da87d589c7bd52..e0db3b38293d78a325337c72f88e91ac757f72a1 100644
 --- a/src/firecracker/src/main.rs
 +++ b/src/firecracker/src/main.rs
 @@ -53,10 +53,12 @@ use crate::seccomp::SeccompConfig;
  // runtime file.
  // see https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch03s15.html for more information.
  const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
-+// wick: the release label is wick's version, <upstream>-wick.<N> (crates/version);
++// wick: the release label is wick's version, <upstream>[+wick.<N>] (crates/version);
 +// `--snapshot-version` and the snapshot format stay upstream's.
  const FIRECRACKER_VERSION: &str = if cfg!(feature = "fuzzing") {
 -    concat!(env!("CARGO_PKG_VERSION"), "+fuzzing")
@@ -149,7 +152,7 @@ index a92dbf32c7e0591a9d34513950da87d589c7bd52..b01b6506b1df2dc8700fad8fa7599078
  };
  const MMDS_CONTENT_ARG: &str = "metadata";
  
-@@ -699,3 +701,30 @@ fn run_without_api(
+@@ -699,3 +701,25 @@ fn run_without_api(
      }
      Ok(())
  }
@@ -164,37 +167,32 @@ index a92dbf32c7e0591a9d34513950da87d589c7bd52..b01b6506b1df2dc8700fad8fa7599078
 +    fn test_firecracker_version_is_upstream_plus_wick_number() {
 +        // patches/base names the upstream release this Cargo.toml comes from.
 +        assert_eq!(wick_version::UPSTREAM, env!("CARGO_PKG_VERSION"));
-+        assert_eq!(
-+            FIRECRACKER_VERSION,
-+            format!(
-+                "{}-wick.{}",
-+                env!("CARGO_PKG_VERSION"),
-+                wick_version::NUMBER
-+            )
-+        );
++        let expected = match wick_version::NUMBER {
++            0 => env!("CARGO_PKG_VERSION").to_string(),
++            n => format!("{}+wick.{n}", env!("CARGO_PKG_VERSION")),
++        };
++        assert_eq!(FIRECRACKER_VERSION, expected);
++        // A wick fix release never sorts below the upstream release.
 +        let version = semver::Version::parse(FIRECRACKER_VERSION).unwrap();
-+        assert_eq!(
-+            version.pre.as_str(),
-+            format!("wick.{}", wick_version::NUMBER)
-+        );
-+        assert!(version.build.is_empty());
++        assert!(version.pre.is_empty());
++        assert!(version >= semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap());
 +    }
 +}
 diff --git a/src/jailer/Cargo.toml b/src/jailer/Cargo.toml
-index f98987a4af9ab0393aa423ea68bf7acd6f60e4dd..4da4996b2fc47eb76ea42ebdc4bde75e740e7355 100644
+index f98987a4af9ab0393aa423ea68bf7acd6f60e4dd..1950cefd06451e668ef1db85ffce9182f2b10242 100644
 --- a/src/jailer/Cargo.toml
 +++ b/src/jailer/Cargo.toml
 @@ -22,6 +22,8 @@ thiserror = "2.0.18"
  vmm-sys-util = "0.15.0"
  
  utils = { path = "../utils" }
-+# wick: wick's release version, <upstream>-wick.<N> (crates/version).
++# wick: wick's release version, <upstream>[+wick.<N>] (crates/version).
 +wick-version = { path = "../../../../crates/version" }
  
  [lints]
  workspace = true
 diff --git a/src/jailer/src/main.rs b/src/jailer/src/main.rs
-index 0daed7db7c8008f16abab186bb7eaa7e37ba855c..0e17c265f42231f6c056565ba15cbd8b34272e05 100644
+index 0daed7db7c8008f16abab186bb7eaa7e37ba855c..30b3c91b53306f9f284c0e01c4e4c5db0ee11b69 100644
 --- a/src/jailer/src/main.rs
 +++ b/src/jailer/src/main.rs
 @@ -19,7 +19,8 @@ mod chroot;
@@ -202,26 +200,26 @@ index 0daed7db7c8008f16abab186bb7eaa7e37ba855c..0e17c265f42231f6c056565ba15cbd8b
  mod resource_limits;
  
 -const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
-+// wick: wick's version, <upstream>-wick.<N> (crates/version); was CARGO_PKG_VERSION.
++// wick: wick's version, <upstream>[+wick.<N>] (crates/version); was CARGO_PKG_VERSION.
 +const JAILER_VERSION: &str = wick_version::version!();
  
  #[derive(Debug, thiserror::Error)]
  pub enum JailerError {
 diff --git a/src/rebase-snap/Cargo.toml b/src/rebase-snap/Cargo.toml
-index 6026ee7a2825644beaf28eb6bd5c7dee4653fd37..b10be6bc51f6db2aa9afe76055c9578538e0cd9a 100644
+index 6026ee7a2825644beaf28eb6bd5c7dee4653fd37..599038f983a235b622c8c6a2b2c9d783fde554cc 100644
 --- a/src/rebase-snap/Cargo.toml
 +++ b/src/rebase-snap/Cargo.toml
 @@ -20,6 +20,8 @@ thiserror = "2.0.18"
  vmm-sys-util = "0.15.0"
  
  utils = { path = "../utils" }
-+# wick: wick's release version, <upstream>-wick.<N> (crates/version).
++# wick: wick's release version, <upstream>[+wick.<N>] (crates/version).
 +wick-version = { path = "../../../../crates/version" }
  
  [lints]
  workspace = true
 diff --git a/src/rebase-snap/src/main.rs b/src/rebase-snap/src/main.rs
-index 783e20861976b422a277333df99e209e697ce6f5..1fd3fb1ac844257f2028fc79a65eb18c7bf84ff0 100644
+index 783e20861976b422a277333df99e209e697ce6f5..a069fd1fe54687d72a9fdd81a0b5b36721c3c790 100644
 --- a/src/rebase-snap/src/main.rs
 +++ b/src/rebase-snap/src/main.rs
 @@ -1,6 +1,9 @@
@@ -239,26 +237,26 @@ index 783e20861976b422a277333df99e209e697ce6f5..1fd3fb1ac844257f2028fc79a65eb18c
  use vmm_sys_util::seek_hole::SeekHole;
  
 -const REBASE_SNAP_VERSION: &str = env!("CARGO_PKG_VERSION");
-+// wick: wick's version, <upstream>-wick.<N> (crates/version); was CARGO_PKG_VERSION.
++// wick: wick's version, <upstream>[+wick.<N>] (crates/version); was CARGO_PKG_VERSION.
 +const REBASE_SNAP_VERSION: &str = wick_version::version!();
  const BASE_FILE: &str = "base-file";
  const DIFF_FILE: &str = "diff-file";
  const DEPRECATION_MSG: &str = "This tool is deprecated and will be removed in the future. Please \
 diff --git a/src/seccompiler/Cargo.toml b/src/seccompiler/Cargo.toml
-index ec5efc38590da97abeaacb78b68f915a73a9e458..bebc3d4a39182190808a46f78b59ba019f3d1988 100644
+index ec5efc38590da97abeaacb78b68f915a73a9e458..cdcfbc6636802a053ef7fa41de5f255aba5ffc18 100644
 --- a/src/seccompiler/Cargo.toml
 +++ b/src/seccompiler/Cargo.toml
 @@ -24,6 +24,8 @@ serde = { version = "1.0.228", features = ["derive"] }
  serde_json = "1.0.150"
  thiserror = "2.0.18"
  zerocopy = { version = "0.8.50" }
-+# wick: wick's release version, <upstream>-wick.<N> (crates/version).
++# wick: wick's release version, <upstream>[+wick.<N>] (crates/version).
 +wick-version = { path = "../../../../crates/version" }
  
  # wick: std::os::{unix, fd} on Windows (`extern crate wick_std as std` at the root).
  [target.'cfg(windows)'.dependencies]
 diff --git a/src/seccompiler/src/bin.rs b/src/seccompiler/src/bin.rs
-index 533e7c95870e850675f018b5b929525d1bc26198..0b9821680da45e756c2bbb4db3982f17bf24fe0c 100644
+index 533e7c95870e850675f018b5b929525d1bc26198..02909fd6f5638486de1a281e5ab1dbf549d096fa 100644
 --- a/src/seccompiler/src/bin.rs
 +++ b/src/seccompiler/src/bin.rs
 @@ -7,7 +7,8 @@ use seccompiler::{CompilationError, compile_bpf};
@@ -266,26 +264,26 @@ index 533e7c95870e850675f018b5b929525d1bc26198..0b9821680da45e756c2bbb4db3982f17
  
  #[derive(Debug, Parser)]
 -#[command(version = format!("v{}", env!("CARGO_PKG_VERSION")))]
-+// wick: wick's version, <upstream>-wick.<N> (crates/version); was CARGO_PKG_VERSION.
++// wick: wick's version, <upstream>[+wick.<N>] (crates/version); was CARGO_PKG_VERSION.
 +#[command(version = format!("v{}", wick_version::version!()))]
  struct Cli {
      #[arg(
          short,
 diff --git a/src/snapshot-editor/Cargo.toml b/src/snapshot-editor/Cargo.toml
-index 5a7e6955a71eb0d121e0a101f5935c41d9104c5c..8aff0cb1341c5945c330b1ceb7915041fa5367c8 100644
+index 5a7e6955a71eb0d121e0a101f5935c41d9104c5c..657d579e1f41fd10c6249e1c4ab04eb3bd3e42fe 100644
 --- a/src/snapshot-editor/Cargo.toml
 +++ b/src/snapshot-editor/Cargo.toml
 @@ -23,6 +23,8 @@ semver = "1.0.28"
  thiserror = "2.0.18"
  vmm = { path = "../vmm" }
  vmm-sys-util = "0.15.0"
-+# wick: wick's release version, <upstream>-wick.<N> (crates/version).
++# wick: wick's release version, <upstream>[+wick.<N>] (crates/version).
 +wick-version = { path = "../../../../crates/version" }
  
  [target.'cfg(target_arch = "aarch64")'.dependencies]
  clap-num = "1.2.0"
 diff --git a/src/snapshot-editor/src/main.rs b/src/snapshot-editor/src/main.rs
-index fbc4a2ab88399f7601364d7963a678d691f13b47..144a6f76b71ccd49189a0835e4f935dc94ea1f54 100644
+index fbc4a2ab88399f7601364d7963a678d691f13b47..f2dc39bf3ab8b3bbdd29515f8f51d038ebc40ead 100644
 --- a/src/snapshot-editor/src/main.rs
 +++ b/src/snapshot-editor/src/main.rs
 @@ -26,7 +26,8 @@ enum SnapEditorError {
@@ -293,23 +291,24 @@ index fbc4a2ab88399f7601364d7963a678d691f13b47..144a6f76b71ccd49189a0835e4f935dc
  
  #[derive(Debug, Parser)]
 -#[command(version = format!("v{}", env!("CARGO_PKG_VERSION")))]
-+// wick: wick's version, <upstream>-wick.<N> (crates/version); was CARGO_PKG_VERSION.
++// wick: wick's version, <upstream>[+wick.<N>] (crates/version); was CARGO_PKG_VERSION.
 +#[command(version = format!("v{}", wick_version::version!()))]
  struct Cli {
      #[command(subcommand)]
      command: Command,
 diff --git a/tests/integration_tests/functional/test_api.py b/tests/integration_tests/functional/test_api.py
-index 44645bc21894c4ab8178ef657002015685e852f5..024b6b6415e1c6c4a74eda7dd508b6c1e9bfee86 100644
+index 44645bc21894c4ab8178ef657002015685e852f5..2651ca6a01ec6db3b5ad4cf7ef2aa1481f009360 100644
 --- a/tests/integration_tests/functional/test_api.py
 +++ b/tests/integration_tests/functional/test_api.py
-@@ -1083,6 +1083,10 @@ def test_api_version(uvm):
+@@ -1083,6 +1083,11 @@ def test_api_version(uvm):
  
      cargo_version = get_firecracker_version_from_toml()
      api_version = semver.Version.parse(preboot_response.json()["firecracker_version"])
-+    # wick: the API reports <upstream>-wick.<N> (crates/version in the wick
++    # wick: the API reports <upstream>[+wick.<N>] (crates/version in the wick
 +    # repository); Cargo.toml holds the upstream part.
-+    assert re.fullmatch(r"wick\.[1-9][0-9]*", api_version.prerelease or "")
-+    cargo_version = cargo_version.replace(prerelease=api_version.prerelease)
++    assert api_version.prerelease is None
++    assert api_version.build is None or re.fullmatch(r"wick\.[1-9][0-9]*", api_version.build)
++    api_version = api_version.replace(build=None)
  
      # Cargo version should match FC API version
      assert cargo_version == api_version
