@@ -575,9 +575,132 @@ name_call!(
     getpeername
 );
 
+// ---- memfd ----
+
+/// `memfd_create` flag: close on exec (not inherited by children).
+pub const MFD_CLOEXEC: core::ffi::c_uint = 1;
+/// `memfd_create` flag: allow seals.
+pub const MFD_ALLOW_SEALING: core::ffi::c_uint = 2;
+
+/// `memfd_create`: a temporary file with no name that goes away with its
+/// last handle, as the `memfd` crate's Windows backend creates (created
+/// with `FILE_FLAG_DELETE_ON_CLOSE`, no sharing, marked temporary, and
+/// unlinked at once with POSIX delete semantics), so the descriptor
+/// supports `read`, `write`, `ftruncate` and `mmap` like a memfd.
+///
+/// `flags` may hold `MFD_CLOEXEC` and `MFD_ALLOW_SEALING`; seals are added
+/// through the `memfd` crate (`fcntl(F_ADD_SEALS)` does not exist here and
+/// fails). Other flags (`MFD_HUGETLB` and its sizes, `MFD_NOEXEC_SEAL`, ...)
+/// ask for what this cannot give and fail with `EINVAL`. On other failures
+/// the Windows error is the thread's last error.
+///
+/// # Safety
+/// `name` must be a valid C string (it is not used).
+pub unsafe fn memfd_create(_name: *const c_char, flags: core::ffi::c_uint) -> c_int {
+    use std::os::windows::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_EXISTS, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_TEMPORARY, FILE_DISPOSITION_FLAG_DELETE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FLAG_DELETE_ON_CLOSE,
+        FileDispositionInfoEx,
+    };
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
+        set_errno(crate::EINVAL);
+        return -1;
+    }
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(core::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap(),
+        lpSecurityDescriptor: core::ptr::null_mut(),
+        bInheritHandle: i32::from(flags & MFD_CLOEXEC == 0),
+    };
+    let h = loop {
+        let path = std::env::temp_dir().join(std::format!(
+            "wick-memfd-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let wide: std::vec::Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: a valid path and attributes; the result is checked.
+        let h = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | DELETE,
+                0,
+                &sa,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                core::ptr::null_mut(),
+            )
+        };
+        if h != INVALID_HANDLE_VALUE {
+            break h;
+        }
+        // SAFETY: plain call.
+        if unsafe { GetLastError() } != ERROR_FILE_EXISTS {
+            return -1;
+        }
+    };
+    // Unlink the name now. File systems without POSIX delete (FAT) keep it
+    // until the last handle goes, which deletes it.
+    let info = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: valid information of the right class and size.
+    unsafe {
+        SetFileInformationByHandle(
+            h,
+            FileDispositionInfoEx,
+            (&raw const info).cast(),
+            u32::try_from(core::mem::size_of_val(&info)).unwrap(),
+        )
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let fd = h as isize as c_int;
+    fd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_memfd_create() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::windows::io::FromRawHandle;
+
+        // SAFETY: a valid C string.
+        let fd = unsafe { memfd_create(c"t".as_ptr(), MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: a fresh handle we own.
+        let mut f = unsafe { std::fs::File::from_raw_handle(handle(fd)) };
+        f.write_all(b"wick").unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut s = std::string::String::new();
+        f.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "wick");
+        // No name left in the temporary directory once created.
+        let pid = std::format!("wick-memfd-{}-", std::process::id());
+        let left = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&pid))
+            .count();
+        assert_eq!(left, 0);
+        // MFD_HUGETLB: not available.
+        // SAFETY: as above.
+        assert_eq!(unsafe { memfd_create(c"t".as_ptr(), 4) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(crate::EINVAL)
+        );
+    }
 
     #[test]
     fn test_syscall_prctl_ioctl() {

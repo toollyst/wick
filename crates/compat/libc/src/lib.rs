@@ -87,11 +87,12 @@ mod windows_linux;
 #[rustfmt::skip]
 pub use windows_linux::{
     accept, bind, c_long, c_ulong, connect, fallocate, getpeername, getsockname, ioctl, listen,
-    prctl, sa_family_t, sockaddr_ll, sockaddr_storage, sockaddr_un, socket, syscall, Ioctl,
-    AF_PACKET, BLKIOMIN, BLKIOOPT, BLKPBSZGET, BLKSSZGET, EFD_CLOEXEC, EFD_NONBLOCK, EFD_SEMAPHORE,
-    FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, PR_GET_SECCOMP,
-    PR_SET_NO_NEW_PRIVS, SECCOMP_SET_MODE_FILTER, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_RAW,
-    SYS_arch_prctl, SYS_io_uring_enter, SYS_io_uring_register, SYS_io_uring_setup, SYS_seccomp,
+    memfd_create, prctl, sa_family_t, sockaddr_ll, sockaddr_storage, sockaddr_un, socket, syscall,
+    Ioctl, AF_PACKET, BLKIOMIN, BLKIOOPT, BLKPBSZGET, BLKSSZGET, EFD_CLOEXEC, EFD_NONBLOCK,
+    EFD_SEMAPHORE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
+    MFD_ALLOW_SEALING, MFD_CLOEXEC, PR_GET_SECCOMP, PR_SET_NO_NEW_PRIVS, SECCOMP_SET_MODE_FILTER,
+    SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_RAW, SYS_arch_prctl, SYS_io_uring_enter,
+    SYS_io_uring_register, SYS_io_uring_setup, SYS_seccomp,
 };
 #[cfg(windows)]
 mod windows_socket;

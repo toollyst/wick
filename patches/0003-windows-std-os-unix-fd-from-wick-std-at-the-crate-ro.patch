@@ -6,23 +6,28 @@ Subject: [PATCH] windows: std::os::{unix, fd} from wick-std at the crate roots
 Why: upstream code uses std::os::unix and std::os::fd (RawFd, AsRawFd,
 UnixStream, ...), which do not exist on Windows.
 
-What: utils, vmm and firecracker depend on wick-std on Windows and declare
-`extern crate wick_std as std;` at their roots, so `std::os::{unix, fd}`
-resolve to wick-os (the same traits over Windows handles) and everything
-else to the real std. Other targets are unaffected.
+What: utils, vmm, firecracker and seccompiler depend on wick-std on Windows
+and declare `extern crate wick_std as std;` at their roots, so
+`std::os::{unix, fd}` resolve to wick-os (the same traits over Windows
+handles) and everything else to the real std. seccompiler is built on the
+build host by Firecracker's build script, so a native Windows build needs
+it too. Other targets are unaffected.
 
-Test: `cargo build -p firecracker --target x86_64-pc-windows-gnu`.
+Test: `cargo build -p firecracker --target x86_64-pc-windows-gnu`, and
+`cargo build -p firecracker --release` on Windows.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/firecracker/Cargo.toml  | 4 ++++
  src/firecracker/src/lib.rs  | 4 ++++
  src/firecracker/src/main.rs | 4 ++++
+ src/seccompiler/Cargo.toml  | 4 ++++
+ src/seccompiler/src/lib.rs  | 5 +++++
  src/utils/Cargo.toml        | 4 ++++
  src/utils/src/lib.rs        | 4 ++++
  src/vmm/Cargo.toml          | 4 ++++
  src/vmm/src/lib.rs          | 4 ++++
- 7 files changed, 28 insertions(+)
+ 9 files changed, 37 insertions(+)
 
 diff --git a/src/firecracker/Cargo.toml b/src/firecracker/Cargo.toml
 index 8d2806f99b0ed1fc04d5cd15a1377d4dbf1c5be5..37c2a2a3a62a03a8d755047702451e9f1bbb50cb 100644
@@ -67,6 +72,36 @@ index ecb68b30b8753345a34dcf1d810d42b947d09f26..a92dbf32c7e0591a9d34513950da87d5
  mod api_server;
  mod api_server_adapter;
  mod generated;
+diff --git a/src/seccompiler/Cargo.toml b/src/seccompiler/Cargo.toml
+index 0fb22470515016f3e47b118a6ddd6a3a08d2c42b..ec5efc38590da97abeaacb78b68f915a73a9e458 100644
+--- a/src/seccompiler/Cargo.toml
++++ b/src/seccompiler/Cargo.toml
+@@ -25,5 +25,9 @@ serde_json = "1.0.150"
+ thiserror = "2.0.18"
+ zerocopy = { version = "0.8.50" }
+ 
++# wick: std::os::{unix, fd} on Windows (`extern crate wick_std as std` at the root).
++[target.'cfg(windows)'.dependencies]
++wick-std = { path = "../../../../crates/compat/std" }
++
+ [lints]
+ workspace = true
+diff --git a/src/seccompiler/src/lib.rs b/src/seccompiler/src/lib.rs
+index be003df7fe6911ea9a175fb46dd5f7e78bc01188..6593acbe19aa437885fc8868fd423dd2e708cf71 100644
+--- a/src/seccompiler/src/lib.rs
++++ b/src/seccompiler/src/lib.rs
+@@ -1,6 +1,11 @@
+ // Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++// wick: std::os::{unix, fd} on Windows from wick's POSIX layer (Firecracker's
++// build script builds this crate on the build host).
++#[cfg(windows)]
++extern crate wick_std as std;
++
+ use std::collections::BTreeMap;
+ use std::fs::File;
+ use std::io::{Read, Seek};
 diff --git a/src/utils/Cargo.toml b/src/utils/Cargo.toml
 index 6a8713c09549e667f53d30e0cb5e20901bf440c1..ab16020423d4c0e857ffab51888568bfa9f951a7 100644
 --- a/src/utils/Cargo.toml
