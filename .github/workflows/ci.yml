@@ -81,9 +81,13 @@ jobs:
       - name: Compatibility crate tests
         working-directory: lib/firecracker
         run: |
-          for c in libc vmm-sys-util memfd userfaultfd kvm-ioctls; do
+          for c in libc vmm-sys-util memfd userfaultfd; do
             cargo test --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
+          # The tests that create a VM need Hypervisor.framework, which GitHub's
+          # macOS runners (virtual machines) do not have; tools/macos/test.sh
+          # runs them, and tools/macos/boot-test.sh the scenarios.
+          cargo test --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- --skip hvf::vm::tests::
       - name: Host sandbox test
         working-directory: lib/firecracker
         run: cargo test -p vmm --lib ext::sandbox

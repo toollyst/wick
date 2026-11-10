@@ -951,6 +951,8 @@ fn io_err(e: std::io::Error) -> super::Error {
     super::Error::new(e.raw_os_error().unwrap_or(libc::EIO))
 }
 
+// These tests create a VM: they need Hypervisor.framework and the hypervisor
+// entitlement (tools/macos/test.sh); CI's macOS runners have neither.
 #[cfg(test)]
 mod tests {
     use kvm_bindings::{
