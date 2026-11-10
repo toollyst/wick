@@ -12,7 +12,7 @@
 #   tools/macos/boot-test.sh [--release] [stage...]
 #
 # Stages (default: all, in this order): boot smp block vsock net vmnet
-# snapshot diff uffd pci vhost-user devices. vmnet uses vmnet-shared (NAT); older
+# snapshot diff uffd pci vhost-user devices restores. vmnet uses vmnet-shared (NAT); older
 # macOS releases need root for vmnet.framework.
 # The guest images are cached in ~/Library/Caches/wick/boot-test; results and
 # logs go to build/boot-test/<time>. Run tools/setup.sh first.

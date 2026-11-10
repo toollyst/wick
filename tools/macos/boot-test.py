@@ -825,6 +825,45 @@ def stage_devices(ctx):
     return "virtio-rng, rate-limited block, MMDS V2 over the net endpoint, balloon inflate + statistics, logger and metrics files"
 
 
+def stage_restores(ctx, rounds=20):
+    """One snapshot restored many times, each restore paused and snapshotted again.
+
+    Catches races between vCPU threads at restore (Hypervisor.framework
+    deadlocked when one vCPU was created while another made an interrupt
+    pending, about one restore in fifteen) and at the pause before a snapshot
+    (a vCPU kicked between two runs paused without its GIC state readable)."""
+    uds = os.path.join(ctx.sock, "rs.v")
+    cfg = config(ctx, vcpus=2, vsock={"guest_cid": 3, "uds_path": uds})
+    vm = ctx.vm("rs0", [], cfg)
+    vm.shell()
+    guest_vsock_services(vm, uds)
+    vm.sh("A=before-$((6*7))")
+    state, mem = os.path.join(ctx.out, "rs.state"), os.path.join(ctx.out, "rs.mem")
+    again_state, again_mem = os.path.join(ctx.out, "rs2.state"), os.path.join(ctx.out, "rs2.mem")
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    vm.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": state, "mem_file_path": mem})
+    vm.kill()
+    for i in range(rounds):
+        if os.path.exists(uds):
+            os.unlink(uds)
+        vm = ctx.vm(f"rs{i + 1}", [])
+        vm.api("PUT", "/snapshot/load", {"snapshot_path": state,
+                                         "mem_backend": {"backend_type": "File", "backend_path": mem},
+                                         "resume_vm": True})
+        try:
+            _, out = vm.sh("echo restored $A", timeout=20)
+        except Failure as e:
+            raise Failure(f"restore {i + 1} of {rounds}: {e}") from None
+        check(out == "restored before-42", f"restore {i + 1}: {out!r}")
+        vm.api("PATCH", "/vm", {"state": "Paused"})
+        vm.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": again_state,
+                                           "mem_file_path": again_mem})
+        vm.kill()
+    for f in (mem, again_mem):
+        os.unlink(f)
+    return f"{rounds} restores of one snapshot, each paused and snapshotted again"
+
+
 STAGES = {
     "boot": stage_boot,
     "smp": stage_smp,
@@ -838,6 +877,7 @@ STAGES = {
     "pci": stage_pci,
     "vhost-user": stage_vhost_user,
     "devices": stage_devices,
+    "restores": stage_restores,
 }
 
 
