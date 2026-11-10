@@ -79,7 +79,7 @@ $BootArgs = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i804
 # (docs/ROADMAP.md, "Platform status"); listed in the summary, not run.
 # (The leading comma keeps a one-entry list a list of pairs.)
 $NotImplemented = @(
-    , @('jailer', 'the jailer (restricted token, Job Objects)')
+    , @('jailer', 'checked by tools\windows\jailer-test.ps1')
 )
 
 # --- helpers (C# 5: what Windows PowerShell 5.1 compiles) ---------------------
