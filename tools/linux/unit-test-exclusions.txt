@@ -1,0 +1,186 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Upstream unit tests that tools/linux/unit-tests.sh skips, in the upstream
+# baseline and in wick alike. Only tests that fail on plain upstream
+# (patches/base, no patches) on the same CI runner belong here: a test that
+# passes on upstream and fails on wick is a wick bug to fix, never an entry.
+# tools/linux/compare-unit-tests.py fails when an entry names no test.
+#
+# Format: <arch> <full test name>, arch is x86_64, aarch64 or all; each entry
+# below a comment that says why upstream fails it there.
+
+# --- aarch64 (ubuntu-24.04-arm) ----------------------------------------------
+#
+# The arm runner has no /dev/kvm. These tests open it, directly or by
+# creating a VM (Kvm::new, Vm::new, builder::build_microvm, ...), and fail on
+# plain upstream with ENOENT: "Cannot create Kvm: Kvm(Error(2))", or the same
+# error unwrapped through their callers' error types. Those that are not
+# aarch64-specific run, and pass, on the x86_64 runner, which has KVM.
+#
+# cpu-template-helper/bin:cpu-template-helper:
+aarch64 template::dump::tests::test_dump
+aarch64 tests::test_fingerprint_dump_command
+aarch64 tests::test_template_dump_command
+aarch64 tests::test_template_verify_command
+aarch64 utils::tests::test_build_microvm
+#
+# jailer/bin:jailer:
+aarch64 env::tests::test_dup2
+#
+# vmm/lib:vmm:
+aarch64 arch::aarch64::fdt::tests::test_create_fdt
+aarch64 arch::aarch64::gic::gicv2::regs::dist_regs::tests::test_access_dist_regs
+aarch64 arch::aarch64::gic::gicv2::regs::icc_regs::tests::test_access_icc_regs
+aarch64 arch::aarch64::gic::gicv2::regs::tests::test_vm_save_restore_state
+aarch64 arch::aarch64::gic::gicv3::regs::dist_regs::tests::test_access_dist_regs
+aarch64 arch::aarch64::gic::gicv3::regs::icc_regs::tests::test_access_icc_regs
+aarch64 arch::aarch64::gic::gicv3::regs::redist_regs::tests::test_access_redist_regs
+aarch64 arch::aarch64::gic::gicv3::regs::tests::test_vm_save_restore_state
+aarch64 arch::aarch64::gic::gicv3::tests::test_save_pending_tables
+aarch64 arch::aarch64::gic::tests::test_create_gic
+aarch64 arch::aarch64::vcpu::tests::test_configure_vcpu
+aarch64 arch::aarch64::vcpu::tests::test_create_vcpu
+aarch64 arch::aarch64::vcpu::tests::test_dump_cpu_config_after_init
+aarch64 arch::aarch64::vcpu::tests::test_dump_cpu_config_before_init
+aarch64 arch::aarch64::vcpu::tests::test_get_invalid_regs
+aarch64 arch::aarch64::vcpu::tests::test_get_set_regs
+aarch64 arch::aarch64::vcpu::tests::test_get_valid_regs
+aarch64 arch::aarch64::vcpu::tests::test_init_vcpu
+aarch64 arch::aarch64::vcpu::tests::test_mpstate
+aarch64 arch::aarch64::vcpu::tests::test_pmu_v3_feature_invalid
+aarch64 arch::aarch64::vcpu::tests::test_read_mpidr
+aarch64 arch::aarch64::vcpu::tests::test_setup_non_boot_vcpu
+aarch64 arch::aarch64::vcpu::tests::test_setup_regs
+aarch64 arch::aarch64::vcpu::tests::test_vcpu_save_restore_state
+aarch64 arch::aarch64::vcpu::tests::test_writable_imp_id_regs
+aarch64 builder::tests::test_attach_balloon_device
+aarch64 builder::tests::test_attach_block_devices
+aarch64 builder::tests::test_attach_boot_timer_device
+aarch64 builder::tests::test_attach_entropy_device
+aarch64 builder::tests::test_attach_net_devices
+aarch64 builder::tests::test_attach_pmem_devices
+aarch64 builder::tests::test_attach_virtio_mem_device
+aarch64 builder::tests::test_attach_vsock_device
+aarch64 device_manager::mmio::tests::test_device_info
+aarch64 device_manager::mmio::tests::test_register_too_many_devices
+aarch64 device_manager::mmio::tests::test_register_virtio_device
+aarch64 device_manager::pci_mngr::tests::test_device_manager_persistence
+aarch64 device_manager::persist::tests::test_device_manager_persistence
+aarch64 device_manager::tests::test_attach_legacy_serial
+aarch64 device_manager::tests::test_hotplug_block
+aarch64 device_manager::tests::test_hotplug_net
+aarch64 device_manager::tests::test_hotplug_pci_not_enabled
+aarch64 device_manager::tests::test_hotplug_pmem
+aarch64 device_manager::tests::test_hotunplug_pci_not_enabled
+aarch64 device_manager::tests::test_pci_bar_is_freed_on_unplug
+aarch64 device_manager::tests::test_unplug_root_block
+aarch64 device_manager::tests::test_unplug_root_pmem
+aarch64 devices::pci::pci_segment::tests::test_mmio_bus
+aarch64 devices::pci::pci_segment::tests::test_next_device_bdf
+aarch64 devices::pci::pci_segment::tests::test_pci_segment_build
+aarch64 devices::virtio::mem::device::tests::test_config_as_bytes
+aarch64 devices::virtio::mem::device::tests::test_event_fail_descriptor_chain_too_short
+aarch64 devices::virtio::mem::device::tests::test_event_fail_descriptor_length_too_small
+aarch64 devices::virtio::mem::device::tests::test_event_fail_response_descriptor_length_too_small
+aarch64 devices::virtio::mem::device::tests::test_event_fail_unexpected_readonly_descriptor
+aarch64 devices::virtio::mem::device::tests::test_event_fail_unexpected_writeonly_descriptor
+aarch64 devices::virtio::mem::device::tests::test_from_state
+aarch64 devices::virtio::mem::device::tests::test_invalid_range_out_of_bounds
+aarch64 devices::virtio::mem::device::tests::test_invalid_range_unaligned
+aarch64 devices::virtio::mem::device::tests::test_invalid_range_zero_blocks
+aarch64 devices::virtio::mem::device::tests::test_new
+aarch64 devices::virtio::mem::device::tests::test_plug_partial_kvm_failure_keeps_state_consistent
+aarch64 devices::virtio::mem::device::tests::test_plug_request_already_plugged
+aarch64 devices::virtio::mem::device::tests::test_plug_request_success
+aarch64 devices::virtio::mem::device::tests::test_plug_request_too_big
+aarch64 devices::virtio::mem::device::tests::test_repeated_unplug_all_is_noop
+aarch64 devices::virtio::mem::device::tests::test_set_features
+aarch64 devices::virtio::mem::device::tests::test_state_request_mixed
+aarch64 devices::virtio::mem::device::tests::test_state_request_plugged
+aarch64 devices::virtio::mem::device::tests::test_state_request_unplugged
+aarch64 devices::virtio::mem::device::tests::test_status
+aarch64 devices::virtio::mem::device::tests::test_unplug_all_request
+aarch64 devices::virtio::mem::device::tests::test_unplug_request_not_plugged
+aarch64 devices::virtio::mem::device::tests::test_unplug_request_success
+aarch64 devices::virtio::mem::device::tests::test_unsupported_request
+aarch64 devices::virtio::mem::device::tests::test_update_requested_size_device_not_active
+aarch64 devices::virtio::mem::device::tests::test_update_requested_size_invalid_size
+aarch64 devices::virtio::mem::device::tests::test_update_requested_size_success
+aarch64 devices::virtio::mem::device::tests::test_write_config
+aarch64 devices::virtio::mem::event_handler::tests::test_event_handler_activation
+aarch64 devices::virtio::mem::event_handler::tests::test_process_mem_queue_event
+aarch64 devices::virtio::mem::event_handler::tests::test_spurious_event_before_activation
+aarch64 devices::virtio::mem::persist::tests::test_save_restore_state
+aarch64 devices::virtio::mem::persist::tests::test_save_state
+aarch64 devices::virtio::pmem::device::tests::test_from_config
+aarch64 devices::virtio::pmem::device::tests::test_process_chain
+aarch64 devices::virtio::pmem::persist::tests::test_persistence
+aarch64 devices::virtio::pmem::persist::tests::test_restore_rejects_mismatched_config_space_size
+aarch64 devices::virtio::transport::pci::device::tests::test_activate_failure_sets_needs_reset
+aarch64 devices::virtio::transport::pci::device::tests::test_bar_relocation
+aarch64 devices::virtio::transport::pci::device::tests::test_bar_relocation_on_memory_space_enable_only
+aarch64 devices::virtio::transport::pci::device::tests::test_bar_relocation_refused
+aarch64 devices::virtio::transport::pci::device::tests::test_capabilities
+aarch64 devices::virtio::transport::pci::device::tests::test_device_initialization
+aarch64 devices::virtio::transport::pci::device::tests::test_isr_capability
+aarch64 devices::virtio::transport::pci::device::tests::test_notification_capability
+aarch64 devices::virtio::transport::pci::device::tests::test_pci_configuration_cap
+aarch64 devices::virtio::transport::pci::device::tests::test_pci_device_config
+aarch64 devices::virtio::transport::pci::device::tests::test_reading_bars
+aarch64 devices::virtio::transport::pci::device::tests::test_reset_and_reinitialization
+aarch64 pci::msix::tests::test_access_table
+aarch64 pci::msix::tests::test_enable_msix_vectors
+aarch64 pci::msix::tests::test_from_state_rejects_size_mismatches
+aarch64 pci::msix::tests::test_msix_from_state
+aarch64 pci::msix::tests::test_new_msix_config
+aarch64 pci::msix::tests::test_pba_bit_invalid_vector
+aarch64 pci::msix::tests::test_pba_invalid_offset
+aarch64 pci::msix::tests::test_pba_read
+aarch64 pci::msix::tests::test_pba_read_too_big
+aarch64 pci::msix::tests::test_pending_interrupt
+aarch64 pci::msix::tests::test_read_table_bad_length
+aarch64 pci::msix::tests::test_read_table_past_end
+aarch64 persist::tests::test_microvm_state_snapshot
+aarch64 rpc_interface::tests::test_runtime_disallowed
+aarch64 rpc_interface::tests::test_runtime_get_enclave_config_on_kvm_vm
+aarch64 rpc_interface::tests::test_runtime_get_mmds
+aarch64 rpc_interface::tests::test_runtime_get_vm_config
+aarch64 vstate::vcpu::tests::test_handle_kvm_exit
+aarch64 vstate::vcpu::tests::test_immediate_exit_shortcircuits_execution
+aarch64 vstate::vcpu::tests::test_set_mmio_bus
+aarch64 vstate::vcpu::tests::test_vcpu_dump_cpu_config
+aarch64 vstate::vcpu::tests::test_vcpu_kick
+aarch64 vstate::vcpu::tests::test_vcpu_pause_resume
+aarch64 vstate::vcpu::tests::test_vcpu_save_state_events
+aarch64 vstate::vm::tests::test_create_vcpus
+aarch64 vstate::vm::tests::test_msi_vector_group_disable
+aarch64 vstate::vm::tests::test_msi_vector_group_drop_frees_gsis
+aarch64 vstate::vm::tests::test_msi_vector_group_new
+aarch64 vstate::vm::tests::test_msi_vector_group_notifier
+aarch64 vstate::vm::tests::test_msi_vector_group_persistence
+aarch64 vstate::vm::tests::test_msi_vector_group_restore_rejects_out_of_range_gsi
+aarch64 vstate::vm::tests::test_msi_vector_group_trigger
+aarch64 vstate::vm::tests::test_msi_vector_group_update
+aarch64 vstate::vm::tests::test_msi_vector_group_update_invalid_vector
+aarch64 vstate::vm::tests::test_new
+aarch64 vstate::vm::tests::test_register_memory_regions
+aarch64 vstate::vm::tests::test_too_many_regions
+#
+# vmm/test:integration_tests:
+aarch64 test_build_and_boot_microvm
+aarch64 test_build_microvm
+aarch64 test_create_and_load_snapshot
+aarch64 test_disallow_dump_cpu_config_without_pausing
+aarch64 test_disallow_snapshots_without_pausing
+aarch64 test_load_snapshot_huge_pages_override
+aarch64 test_load_snapshot_rejects_hugetlbfs_with_file_backend
+aarch64 test_pause_resume_microvm
+aarch64 test_preboot_load_snap_disallowed_after_boot_resources
+aarch64 test_snapshot_load_sanity_checks
+#
+# jailer: counts the files copy_cache_info() copies from the host's
+# /sys/devices/system/cpu/cpu0/cache/index0 and expects all six it looks for
+# (size, level, type, shared_cpu_map, coherency_line_size, number_of_sets).
+# The runner's VM exposes five of them, so upstream fails it there too.
+aarch64 env::tests::test_copy_cache_info
