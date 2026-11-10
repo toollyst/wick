@@ -6,12 +6,13 @@
 # rootfs: boot, SMP, block (Sync/Async, read and write), vsock in both
 # directions, networking over a Unix datagram endpoint and vmnet, full and diff
 # snapshots restored in a new process, snapshot-editor rebase, the Uffd memory
-# backend, PCI with snapshot restore and a vhost-user-blk backend.
+# backend, PCI with snapshot restore, a vhost-user-blk backend, and the
+# logger, metrics, MMDS, balloon, entropy device and a rate limiter.
 #
 #   tools/macos/boot-test.sh [--release] [stage...]
 #
 # Stages (default: all, in this order): boot smp block vsock net vmnet
-# snapshot diff uffd pci vhost-user. vmnet uses vmnet-shared (NAT); older
+# snapshot diff uffd pci vhost-user devices. vmnet uses vmnet-shared (NAT); older
 # macOS releases need root for vmnet.framework.
 # The guest images are cached in ~/Library/Caches/wick/boot-test; results and
 # logs go to build/boot-test/<time>. Run tools/setup.sh first.

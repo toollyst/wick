@@ -70,7 +70,7 @@ The same as upstream Firecracker's
 | --- | --- | --- | --- |
 | Hardware virtualization, one kernel per VM | KVM | Hypervisor.framework | Windows Hypervisor Platform |
 | Minimal device model | upstream | upstream's device code; host-side backends are wick's | upstream's device code; host-side backends are wick's |
-| System call filter | per-thread seccomp-BPF (upstream) | **in place:** a Seatbelt profile, process-wide: no program execution, no fork, no IP networking, no Mach service lookups, no IOKit, no sysctl writes | **in place:** a process mitigation policy that blocks child-process creation; the full mitigation profile is planned |
+| System call filter | per-thread seccomp-BPF (upstream) | **in place:** a Seatbelt profile, process-wide: an allow-list of 118 system calls (any other one raises SIGSYS and Firecracker exits with upstream's bad-syscall code, as on a seccomp trap), no program execution, no fork, no IP networking, no Mach service lookups, no IOKit, no sysctl writes | **in place:** a process mitigation policy that blocks child-process creation; the full mitigation profile is planned |
 | Jailer: chroot | upstream | **in place:** upstream's jailer; `chroot(2)`, entered by Firecracker right after the exec, and a Seatbelt file rule limited to the jail | planned: AppContainer + jail directory ACL |
 | Jailer: network namespace | upstream | Seatbelt denies IP networking; `--netns` is refused | planned: AppContainer without capabilities |
 | Jailer: uid/gid | upstream | **in place:** dropped right after the chroot, checked that root cannot be regained | planned: per-VM AppContainer SID |
@@ -105,7 +105,10 @@ upstream Firecracker and its jailer.
   API server, whose separate filter is a real boundary, into a process of its own.
 - **wick's host-side code is young.** The compatibility crates and the macOS and Windows backends (the
   Hypervisor.framework and WHP run loops, the userfaultfd kernel side, the network backends) have not had the years
-  of review and fuzzing upstream's code has had, and have not had a third-party audit.
+  of review and fuzzing upstream's code has had, and have not had a third-party audit. Fuzzing has started: the
+  virtio-net offload handling every non-Linux network backend uses (`vnet`) and the requests a userfaultfd handler
+  process sends on macOS have fuzz targets, which CI runs for a minute each
+  ([CONTRIBUTING.md](CONTRIBUTING.md#fuzzing)). The Hypervisor.framework and WHP run loops have none yet.
 - **Side channels** between VMs on the same host follow upstream's
   [production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md)
   guidance on Linux; the equivalent guidance for macOS and Windows hosts is not written yet.

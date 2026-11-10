@@ -355,9 +355,13 @@ impl VmInner {
     /// not have counts as routed, so that raising it reports the error.
     fn spi_target_exists(&self, intid: u32) -> bool {
         const IRM: u64 = 1 << 31;
+        // `intid` can be any value a guest wrote as MSI data.
+        let Some(reg) = intid.checked_mul(8).and_then(|o| o.checked_add(0x6000)) else {
+            return true;
+        };
         let mut route = 0;
         // SAFETY: plain call with a valid output.
-        if unsafe { hv_gic_get_distributor_reg(0x6000 + 8 * intid, &mut route) } != HV_SUCCESS {
+        if unsafe { hv_gic_get_distributor_reg(reg, &mut route) } != HV_SUCCESS {
             return true;
         }
         let affinity = super::gic::packed_affinity(route);
@@ -979,10 +983,8 @@ mod tests {
         v & (1 << (intid % 32)) != 0
     }
 
-    #[test]
-    fn test_spi_raised_before_its_vcpu_exists() {
-        // Interrupts raised and pending state restored before the vCPU first
-        // runs (a snapshot restore kicks the devices then) are not lost.
+    /// A VM with a GIC and one vCPU that has not run yet.
+    fn vm_with_gic() -> (VmFd, DeviceFd, VcpuFd) {
         let vm = Kvm::new().unwrap().create_vm().unwrap();
         let mut dev = kvm_create_device {
             type_: kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
@@ -996,10 +998,34 @@ mod tests {
         set_attr(&gic, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_VGIC_V3_ADDR_TYPE_REDIST.into(), redist)
             .unwrap();
         set_attr(&gic, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_CTRL_INIT.into(), 0).unwrap();
-        let mut vcpu = vm.create_vcpu(0).unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
         let mut kvi = kvm_vcpu_init::default();
         vm.get_preferred_target(&mut kvi).unwrap();
         vcpu.vcpu_init(&kvi).unwrap();
+        (vm, gic, vcpu)
+    }
+
+    #[test]
+    fn test_msi_data_names_no_spi() {
+        // MSI data is the SPI, and the guest writes it: a value that names no
+        // SPI fails as Hypervisor.framework fails it, also while a vCPU has
+        // not run yet, when its route is looked up first.
+        let (vm, _gic, _vcpu) = vm_with_gic();
+        for data in [0x2000_0000, 0xffff_f000, u32::MAX] {
+            let msi = kvm_msi {
+                address_lo: 0x1000,
+                data,
+                ..Default::default()
+            };
+            vm.signal_msi(msi).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn test_spi_raised_before_its_vcpu_exists() {
+        // Interrupts raised and pending state restored before the vCPU first
+        // runs (a snapshot restore kicks the devices then) are not lost.
+        let (vm, gic, mut vcpu) = vm_with_gic();
 
         // Raised: waits for vCPU 0, which SPI 40 is routed to.
         let raised = vm.inner.raise_spi(40, || panic!("raised before its vCPU exists"));

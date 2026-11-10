@@ -762,6 +762,69 @@ def stage_vhost_user(ctx):
     return "vhost-user-blk backend in another process: read md5, write reaches the image"
 
 
+def stage_devices(ctx):
+    """Logger, metrics, MMDS, balloon, entropy and a rate limiter: what upstream
+    configures beside the devices above (and the system calls they make)."""
+    log = os.path.join(ctx.out, "devices.fc.log")
+    metrics = os.path.join(ctx.out, "devices.metrics")
+    for path in (log, metrics):
+        open(path, "w").close()
+    data = os.path.join(ctx.out, "devices.img")
+    random_file(data, 4 << 20)
+    endpoint = os.path.join(ctx.sock, "d.ep")
+    drives = [{"drive_id": "data", "path_on_host": data, "is_root_device": False, "is_read_only": True,
+               "rate_limiter": {"bandwidth": {"size": 1 << 20, "refill_time": 100}}}]
+    cfg = config(ctx, vcpus=2, mem=512, drives=drives,
+                 network_interfaces=[{"iface_id": "eth0", "host_dev_name": endpoint, "guest_mac": GUEST_MAC}],
+                 mmds_config={"version": "V2", "network_interfaces": ["eth0"]},
+                 balloon={"amount_mib": 0, "deflate_on_oom": True, "stats_polling_interval_s": 1},
+                 entropy={}, logger={"log_path": log, "level": "Info"}, metrics={"metrics_path": metrics})
+    vm = ctx.vm("devices", [], cfg)
+    switch = Switch(endpoint, os.path.join(ctx.sock, "d.sw"))
+    try:
+        vm.shell()
+        # Entropy device.
+        _, out = vm.sh("head -c 64 /dev/hwrng | od -An -tx1 | wc -w")
+        check(out == "64", f"64 bytes from virtio-rng: {out!r}")
+        # Rate limiter: 4 MiB at 1 MiB per 100 ms takes at least ~300 ms.
+        _, out = vm.sh("S=$(date +%s%N); dd if=/dev/vdb of=/dev/null bs=1M iflag=direct 2>/dev/null;"
+                       " echo $(( ($(date +%s%N) - S) / 1000000 ))")
+        check(int(out) >= 250, f"4 MiB read past a 10 MiB/s limiter in {out} ms")
+        # MMDS (V2: a token, then the data).
+        vm.api("PUT", "/mmds", {"wick": {"answer": "v42"}})
+        guest_net_up(vm, GUEST_IP)
+        vm.sh("ip route add 169.254.169.254 dev eth0")
+        _, token = vm.sh("printf 'PUT /latest/api/token HTTP/1.1\\r\\nX-metadata-token-ttl-seconds: 60\\r\\n\\r\\n'"
+                         " | socat -t 5 - TCP:169.254.169.254:80 | tail -1")
+        check(len(token) > 20, f"MMDS token {token!r}")
+        _, out = vm.sh(f"printf 'GET /wick/answer HTTP/1.1\\r\\nX-metadata-token: {token}\\r\\n\\r\\n'"
+                       " | socat -t 5 - TCP:169.254.169.254:80 | tail -1")
+        check(out == "v42", f"MMDS answer {out!r}")
+        # Balloon: inflate by 64 MiB, statistics.
+        vm.api("PATCH", "/balloon", {"amount_mib": 64})
+        deadline = time.time() + 30
+        while True:
+            stats = vm.api("GET", "/balloon/statistics")
+            if stats.get("actual_mib", 0) >= 64:
+                break
+            check(time.time() < deadline, f"balloon statistics {stats}")
+            time.sleep(0.5)
+        check(stats.get("actual_mib") == 64 and "free_memory" in stats, f"balloon statistics {stats}")
+        vm.api("PATCH", "/balloon", {"amount_mib": 0})
+        # Metrics, flushed on demand.
+        vm.api("PUT", "/actions", {"action_type": "FlushMetrics"})
+        with open(metrics) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
+        check(lines and "utc_timestamp_ms" in lines[-1] and lines[-1]["block"]["read_bytes"] >= 4 << 20,
+              f"metrics: {len(lines)} lines")
+        vm.reboot()
+    finally:
+        switch.close()
+    with open(log) as f:
+        check("API server started" in f.read(), "the logger writes to its file")
+    return "virtio-rng, rate-limited block, MMDS V2 over the net endpoint, balloon inflate + statistics, logger and metrics files"
+
+
 STAGES = {
     "boot": stage_boot,
     "smp": stage_smp,
@@ -774,6 +837,7 @@ STAGES = {
     "uffd": stage_uffd,
     "pci": stage_pci,
     "vhost-user": stage_vhost_user,
+    "devices": stage_devices,
 }
 
 

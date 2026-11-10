@@ -208,9 +208,10 @@ struct L3 {
     len: usize,
     /// The transport protocol.
     proto: u8,
-    /// IPv6: length of the part that is not fragmented (the base header and
-    /// the hop-by-hop and routing headers), and the offset of the next-header
-    /// byte that names the first fragmentable header.
+    /// IPv6: length of the part that is not fragmented (the base header, the
+    /// hop-by-hop and routing headers, and destination options not after a
+    /// routing header, as `ip6_find_1stfragopt`), and the offset of the
+    /// next-header byte that names the first fragmentable header.
     unfrag: usize,
     nexthdr_at: usize,
 }
@@ -242,6 +243,7 @@ fn parse_l3(frame: &[u8]) -> Option<L3> {
             let mut len = 40;
             let mut nexthdr_at = off + 6;
             let mut unfrag = None;
+            let mut routing = false;
             loop {
                 let ext_len = match proto {
                     IPV6_HOPOPTS | IPV6_ROUTING | IPV6_DSTOPTS => {
@@ -251,8 +253,13 @@ fn parse_l3(frame: &[u8]) -> Option<L3> {
                     IPV6_FRAGMENT => 8,
                     _ => break,
                 };
-                if unfrag.is_none() && !matches!(proto, IPV6_HOPOPTS | IPV6_ROUTING) {
-                    unfrag = Some((len, nexthdr_at));
+                if unfrag.is_none() {
+                    match proto {
+                        IPV6_HOPOPTS => {}
+                        IPV6_ROUTING => routing = true,
+                        IPV6_DSTOPTS if !routing => {}
+                        _ => unfrag = Some((len, nexthdr_at)),
+                    }
                 }
                 let at = off + len;
                 frame.get(at..at + ext_len)?;
@@ -749,6 +756,37 @@ mod tests {
         let whole = ipv6(IPPROTO_UDP, &hop, &joined);
         assert!(l4_valid(&whole));
         assert_eq!(&joined[8..], data.as_slice());
+    }
+
+    #[test]
+    fn test_ufo_ipv6_fragment_header_place() {
+        // Where ip6_find_1stfragopt puts the fragment header: after
+        // destination options, unless they follow a routing header.
+        let data = payload(2000);
+        for (chain, unfrag) in [
+            (vec![IPV6_HOPOPTS, IPV6_DSTOPTS], 2),
+            (vec![IPV6_DSTOPTS], 1),
+            (vec![IPV6_DSTOPTS, IPV6_ROUTING, IPV6_DSTOPTS], 2),
+        ] {
+            let mut ext = Vec::new();
+            for i in 0..chain.len() {
+                let next = chain.get(i + 1).copied().unwrap_or(IPPROTO_UDP);
+                ext.extend_from_slice(&[next, 0, 1, 4, 0, 0, 0, 0]);
+            }
+            let mut frame = ipv6(IPPROTO_UDP, &ext, &udp(&data));
+            frame[14 + 6] = chain[0];
+            let mut hdr = partial(&mut frame, 6);
+            hdr.gso_type = GSO_UDP;
+            hdr.gso_size = 1400;
+            let frags = run(&hdr, &mut frame).unwrap();
+            assert_eq!(frags.len(), 2, "{chain:?}");
+            let fh = 14 + 40 + 8 * unfrag;
+            let first = chain.get(unfrag).copied().unwrap_or(IPPROTO_UDP);
+            for f in &frags {
+                assert_eq!(f[fh - 8], IPV6_FRAGMENT, "{chain:?}");
+                assert_eq!(f[fh], first, "{chain:?}");
+            }
+        }
     }
 
     #[test]

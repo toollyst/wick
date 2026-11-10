@@ -33,6 +33,7 @@ tools/                    everything you run by hand or in CI (below)
   macos/                  run, test and boot-test on Apple silicon
   windows/                boot test and host capability probe for a Windows PC
   vhost-user-blk/         a vhost-user-blk backend used by the macOS boot test
+fuzz/                     fuzz targets for wick's own code (a crate of its own, CONTRIBUTING.md "Fuzzing")
 docs/                     these pages
 .github/workflows/        ci.yml (every push and pull request), release.yml (tags v*)
 ```
@@ -81,7 +82,7 @@ tools/patches.sh check                  # what CI checks about patches/
 | [`tools/rebase.sh`](../tools/rebase.sh) | Moves the series to a new upstream tag (`--finish` after resolving conflicts) |
 | [`tools/macos/run.sh`](../tools/macos/run.sh) | Builds, signs with the Hypervisor.framework entitlement and runs `firecracker` |
 | [`tools/macos/test.sh`](../tools/macos/test.sh) | Runs unit tests with the entitlement (through [`sign-and-run.sh`](../tools/macos/sign-and-run.sh) as the cargo runner) |
-| [`tools/macos/boot-test.sh`](../tools/macos/boot-test.sh) | Scenario tests against upstream's aarch64 CI guest: boot, SMP, block, vsock, net, vmnet, snapshots, diff, uffd, PCI, vhost-user |
+| [`tools/macos/boot-test.sh`](../tools/macos/boot-test.sh) | Scenario tests against upstream's aarch64 CI guest: boot, SMP, block, vsock, net, vmnet, snapshots, diff, uffd, PCI, vhost-user, devices (logger, metrics, MMDS, balloon, entropy, rate limiter) |
 | [`tools/macos/jailer-test.sh`](../tools/macos/jailer-test.sh) | The jailer's scenario tests, as root: refused options, uid/gid and chroot, files outside the jail, daemonize, jetsam limit, a jailed guest booted, snapshot, restored and killed past its memory limit |
 | [`tools/windows/boot-test.ps1`](../tools/windows/boot-test.ps1) | Scenario tests against upstream's x86_64 CI guest on WHP: boot, SMP, block, vsock, net ([steps](../tools/windows/README.md)) |
 | [`tools/windows/winprobe.c`](../tools/windows/winprobe.c) | Measures the Windows mechanisms the sandbox and jailer backends use |
@@ -89,6 +90,7 @@ tools/patches.sh check                  # what CI checks about patches/
 | [`tools/gen-kvm-bindings-windows.sh`](../tools/gen-kvm-bindings-windows.sh) | Generates `kvm-bindings` with the Linux x86_64 layout for Windows (`--check` in CI) |
 | [`tools/package-release.sh`](../tools/package-release.sh) | Packages a macOS release in upstream's release layout, with its SBOM ([`tools/sbom.py`](../tools/sbom.py) checks it against `Cargo.lock`) |
 | [`tools/check-dependencies.sh`](../tools/check-dependencies.sh) | Dependency checks: advisories, licenses, banned and duplicate crates, sources ([CONTRIBUTING.md](../CONTRIBUTING.md#dependencies)) |
+| [`tools/fuzz.sh`](../tools/fuzz.sh) | Runs the fuzz targets in `fuzz/` for a given time each (`-t SECONDS`, `-j JOBS`) |
 
 ## Where the rules live
 

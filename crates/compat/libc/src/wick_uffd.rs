@@ -501,7 +501,9 @@ fn alloc_bitmap(pages: u64, on: bool) -> *mut AtomicU64 {
 }
 
 /// Registers `[start, start + len)` (page aligned) with userfaultfd `ctx`.
-/// Pages that are not resident are missing from now on.
+/// Pages that are not resident are missing from now on. The range must be
+/// mapped (`ENOMEM`) and readable and writable (`EPERM`; Linux also takes
+/// anonymous memory with other protections, which fills here would change).
 pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     let ps = page_size();
     if len == 0 || !start.is_multiple_of(ps) || !len.is_multiple_of(ps) || start == 0 {
@@ -521,15 +523,12 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         return Err(errno_err(libc::ENOMEM));
     };
     let pages = len / ps;
-    // Residency decides what is missing.
-    let mut resident = std::vec![0u8; pages as usize];
-    // SAFETY: `resident` has one byte per page of the range.
-    if unsafe { libc::mincore(start as *mut _, len as usize, resident.as_mut_ptr().cast()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
     let mut alias = 0u64;
     let (mut cur, mut max) = (0, 0);
-    // SAFETY: maps the same memory a second time, shared, anywhere.
+    // SAFETY: maps the same memory a second time, shared, anywhere. It fails
+    // unless all of the range is mapped, so it comes before anything sized
+    // by `len`, which a handler process sends (macOS' mincore accepts
+    // unmapped pages).
     let kr = unsafe {
         mach_vm_remap(
             mach_task_self_,
@@ -547,6 +546,25 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     };
     if kr != 0 {
         return Err(errno_err(libc::ENOMEM));
+    }
+    // The alias has the protection of the memory (the most restrictive of
+    // the range), and pages are filled through it and then made readable and
+    // writable: memory that is not would fault on a fill, or change its
+    // protection. Guest memory always is.
+    let rw = libc::PROT_READ | libc::PROT_WRITE;
+    if cur & rw != rw {
+        // SAFETY: unmaps the alias made above.
+        unsafe { libc::munmap(alias as *mut _, len as usize) };
+        return Err(errno_err(libc::EPERM));
+    }
+    // Residency decides what is missing.
+    let mut resident = std::vec![0u8; pages as usize];
+    // SAFETY: `resident` has one byte per page of the range.
+    if unsafe { libc::mincore(start as *mut _, len as usize, resident.as_mut_ptr().cast()) } != 0 {
+        let err = io::Error::last_os_error();
+        // SAFETY: unmaps the alias made above.
+        unsafe { libc::munmap(alias as *mut _, len as usize) };
+        return Err(err);
     }
     let missing = alloc_bitmap(pages, false);
     let tracked = alloc_bitmap(pages, true);
@@ -574,14 +592,15 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
 }
 
 /// The registered range holding all of `[start, start + len)`, which must be
-/// page aligned.
+/// page aligned and must not wrap (`EINVAL`, as Linux's `validate_range`).
 fn range_of(ctx: usize, start: u64, len: u64) -> Result<&'static Range, c_int> {
     let ps = page_size();
     if ps == 0 || !start.is_multiple_of(ps) || !len.is_multiple_of(ps) || len == 0 {
         return Err(libc::EINVAL);
     }
+    let end = start.checked_add(len).ok_or(libc::EINVAL)?;
     let (range, _) = find(start).ok_or(libc::ENOENT)?;
-    if range.ctx.load(Ordering::Acquire) != ctx || start + len > range.end.load(Ordering::Acquire) {
+    if range.ctx.load(Ordering::Acquire) != ctx || end > range.end.load(Ordering::Acquire) {
         return Err(libc::ENOENT);
     }
     Ok(range)
@@ -820,37 +839,107 @@ fn words(buf: &[u8; proto::RECORD]) -> [u64; 4] {
     w
 }
 
-/// Receives a `HELLO` and its descriptor on the kernel end.
+/// Receives a record on the kernel end: `None` when every user descriptor
+/// is closed, else the descriptor of a `HELLO`. A record that is not a
+/// `HELLO`, or comes without a descriptor, is ignored; descriptors not kept
+/// are closed. A signal or a record sent in pieces does not end the
+/// userfaultfd.
 fn recv_hello(fd: c_int) -> Option<Option<c_int>> {
     let mut buf = [0u8; proto::RECORD];
-    let mut cmsg = [0u64; 8];
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: buf.len(),
-    };
-    // SAFETY: a zeroed msghdr is valid; the buffers outlive the call.
-    let n = unsafe {
-        let mut msg: libc::msghdr = core::mem::zeroed();
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cmsg.as_mut_ptr().cast();
-        msg.msg_controllen = core::mem::size_of_val(&cmsg) as _;
-        let n = libc::recvmsg(fd, &mut msg, libc::MSG_WAITALL);
-        if n == proto::RECORD as isize {
-            let c = libc::CMSG_FIRSTHDR(&msg);
-            if !c.is_null() && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let peer = *(libc::CMSG_DATA(c).cast::<c_int>());
-                return Some((words(&buf)[0] == proto::HELLO).then_some(peer));
+    let mut fds: Vec<c_int> = Vec::new();
+    let mut done = 0;
+    while done < buf.len() {
+        let mut cmsg = [0u64; 64];
+        let mut iov = libc::iovec {
+            iov_base: buf[done..].as_mut_ptr().cast(),
+            iov_len: buf.len() - done,
+        };
+        // SAFETY: a zeroed msghdr is valid; the buffers outlive the call, and
+        // the control messages read are those the kernel wrote.
+        let n = unsafe {
+            let mut msg: libc::msghdr = core::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg.as_mut_ptr().cast();
+            msg.msg_controllen = core::mem::size_of_val(&cmsg) as _;
+            let n = libc::recvmsg(fd, &mut msg, libc::MSG_WAITALL);
+            let mut c = if n > 0 {
+                libc::CMSG_FIRSTHDR(&msg)
+            } else {
+                ptr::null_mut()
+            };
+            while !c.is_null() {
+                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                    let data = libc::CMSG_DATA(c);
+                    let len = ((*c).cmsg_len as usize).saturating_sub(data as usize - c as usize);
+                    for i in 0..len / core::mem::size_of::<c_int>() {
+                        fds.push(ptr::read_unaligned(data.cast::<c_int>().add(i)));
+                    }
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
             }
+            n
+        };
+        if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
         }
-        n
-    };
-    if n <= 0 {
-        None
-    } else {
-        // A record without a descriptor: ignored.
-        Some(None)
+        if n <= 0 {
+            for fd in fds {
+                // SAFETY: descriptors received here and not kept.
+                unsafe { libc::close(fd) };
+            }
+            return None;
+        }
+        done += n as usize;
     }
+    let mut fds = fds.into_iter();
+    let peer = if words(&buf)[0] == proto::HELLO {
+        fds.next()
+    } else {
+        None
+    };
+    for fd in fds {
+        // SAFETY: descriptors received here and not kept.
+        unsafe { libc::close(fd) };
+    }
+    Some(peer)
+}
+
+/// Serves `[OP_COPY, dst, len, _]`, whose `len` bytes of data follow on
+/// `fd`; `None` when the channel closed. The request is checked before the
+/// data is read, and the data is read and copied a piece at a time, so a
+/// length that names no registered memory costs no memory to refuse. As
+/// Linux's `UFFDIO_COPY`, it stops at the first page that is not missing:
+/// `EEXIST` if that is the first, else `EAGAIN` with the count copied.
+fn serve_copy(
+    ctx: usize,
+    fd: c_int,
+    dst: u64,
+    len: u64,
+    wake_up: bool,
+) -> Option<Result<u64, (c_int, u64)>> {
+    const PIECE: u64 = 1 << 20;
+    let mut result = range_of(ctx, dst, len).map(|_| 0).map_err(|e| (e, 0));
+    let mut buf = Vec::new();
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(PIECE);
+        buf.resize(n as usize, 0);
+        if !read_full(fd, &mut buf) {
+            return None;
+        }
+        // Once stopped, the rest of the data is read and dropped.
+        if let Ok(copied) = result {
+            // SAFETY: `buf` holds `n` bytes.
+            result = match unsafe { copy(ctx, buf.as_ptr(), dst + done, n, wake_up) } {
+                Ok(m) => Ok(copied + m),
+                Err((_, m)) if copied + m > 0 => Err((libc::EAGAIN, copied + m)),
+                Err(e) => Err(e),
+            };
+        }
+        done += n;
+    }
+    Some(result)
 }
 
 /// Serves one request from a client channel; false when the channel closed.
@@ -866,17 +955,10 @@ fn serve_request(ctx: usize, fd: c_int) -> bool {
         Err((e, n)) => [(-(e as i64)) as u64, n],
     };
     let reply = match op {
-        proto::OP_COPY => {
-            let Ok(len) = usize::try_from(b) else {
-                return false;
-            };
-            let mut data = std::vec![0u8; len];
-            if !read_full(fd, &mut data) {
-                return false;
-            }
-            // SAFETY: `data` holds `len` bytes.
-            to_reply(unsafe { copy(ctx, data.as_ptr(), a, b, wake_up) })
-        }
+        proto::OP_COPY => match serve_copy(ctx, fd, a, b, wake_up) {
+            Some(r) => to_reply(r),
+            None => return false,
+        },
         proto::OP_ZEROPAGE => to_reply(zeropage(ctx, a, b, wake_up)),
         proto::OP_WAKE => to_reply(wake_range(ctx, a, b).map(|()| 0).map_err(|e| (e, 0))),
         proto::OP_REGISTER => to_reply(
@@ -1188,5 +1270,328 @@ pub mod syscalls {
             || iov_pages(iov, n, false),
             || unsafe { libc::sendmsg(fd, msg, flags) },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn map(pages: u64) -> u64 {
+        init().unwrap();
+        // SAFETY: a fresh anonymous mapping.
+        let p = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                (pages * page_size()) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        p as u64
+    }
+
+    fn socketpair() -> [c_int; 2] {
+        let mut fds = [0; 2];
+        // SAFETY: creates two descriptors.
+        let r = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(r, 0);
+        fds
+    }
+
+    /// Sends the first `len` bytes of a record with descriptors attached.
+    fn send_record(fd: c_int, words: [u64; 4], len: usize, fds: &[c_int]) {
+        let mut bytes = [0u8; proto::RECORD];
+        for (i, w) in words.iter().enumerate() {
+            bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut control = [0u64; 8];
+        // SAFETY: a msghdr with one buffer and the descriptors.
+        let n = unsafe {
+            let mut iov = libc::iovec {
+                iov_base: bytes.as_mut_ptr().cast(),
+                iov_len: len,
+            };
+            let mut msg: libc::msghdr = core::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            if !fds.is_empty() {
+                let size = core::mem::size_of_val(fds) as u32;
+                msg.msg_control = control.as_mut_ptr().cast();
+                msg.msg_controllen = libc::CMSG_SPACE(size) as _;
+                let c = libc::CMSG_FIRSTHDR(&msg);
+                (*c).cmsg_level = libc::SOL_SOCKET;
+                (*c).cmsg_type = libc::SCM_RIGHTS;
+                (*c).cmsg_len = libc::CMSG_LEN(size) as _;
+                ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c).cast(), fds.len());
+            }
+            libc::sendmsg(fd, &msg, 0)
+        };
+        assert_eq!(n, len as isize);
+    }
+
+    /// Waits up to five seconds for `fd` to be readable.
+    fn readable(fd: c_int) -> bool {
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd.
+        unsafe { libc::poll(&mut p, 1, 5000) == 1 }
+    }
+
+    fn record(head: [u64; 4]) -> Vec<u8> {
+        head.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// Sends a request and its data; returns the reply.
+    fn request(chan: c_int, head: [u64; 4], data: &[u8]) -> (i64, u64) {
+        let mut msg = record(head);
+        msg.extend_from_slice(data);
+        assert!(write_full(chan, &msg));
+        assert!(readable(chan), "no reply to {head:x?}");
+        let mut reply = [0u8; proto::RECORD];
+        assert!(read_full(chan, &mut reply));
+        let w = words(&reply);
+        (w[0] as i64, w[1])
+    }
+
+    /// Whether the serving thread answers requests on `chan`.
+    fn served(chan: c_int) -> bool {
+        request(chan, [proto::OP_WAKE, 0, 0, 0], &[]).0 == err(libc::EINVAL)
+    }
+
+    /// A request channel to the serving thread of the userfaultfd `user`.
+    fn channel(user: c_int) -> c_int {
+        let [mine, theirs] = socketpair();
+        send_record(user, [proto::HELLO, 0, 0, 0], proto::RECORD, &[theirs]);
+        // The serving thread holds the descriptor once it answered.
+        assert!(served(mine));
+        // SAFETY: our copy of the end sent.
+        unsafe { libc::close(theirs) };
+        mine
+    }
+
+    fn err(e: c_int) -> i64 {
+        -(e as i64)
+    }
+
+    fn close(fds: &[c_int]) {
+        for &fd in fds {
+            // SAFETY: descriptors of the test.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    #[test]
+    fn test_ranges_that_wrap() {
+        // A range whose end wraps around is EINVAL, as Linux's validate_range.
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(2);
+        register(ctx, mem, 2 * ps).unwrap();
+        let wrap = 0u64.wrapping_sub(ps);
+        assert_eq!(zeropage(ctx, mem, wrap, true), Err((libc::EINVAL, 0)));
+        assert_eq!(wake_range(ctx, mem, wrap), Err(libc::EINVAL));
+        assert_eq!(unregister(ctx, mem + ps, wrap), Err(libc::EINVAL));
+        // SAFETY: refused before `src` is read.
+        let r = unsafe { copy(ctx, ptr::null(), mem + ps, wrap, true) };
+        assert_eq!(r, Err((libc::EINVAL, 0)));
+        let chan = channel(user);
+        let head = [proto::OP_ZEROPAGE, mem, wrap, 0];
+        assert_eq!(request(chan, head, &[]), (err(libc::EINVAL), 0));
+        // Still registered and missing.
+        assert!(is_missing(mem) && is_missing(mem + ps));
+        assert_eq!(zeropage(ctx, mem, 2 * ps, true), Ok(2 * ps));
+        close(&[chan, user]);
+    }
+
+    #[test]
+    fn test_register_names_mapped_memory() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(4);
+        // Lengths no mapping has fail, without memory sized by them.
+        for len in [1 << 62, 1 << 40, (u64::MAX - mem) & !(ps - 1)] {
+            assert!(register(ctx, mem, len).is_err(), "{len:#x}");
+        }
+        // Part of the range unmapped: refused, and nothing is registered.
+        // SAFETY: the last two pages of the mapping above.
+        let r = unsafe { libc::munmap((mem + 2 * ps) as *mut _, (2 * ps) as usize) };
+        assert_eq!(r, 0);
+        assert!(register(ctx, mem, 4 * ps).is_err());
+        assert!(!is_missing(mem));
+        register(ctx, mem, 2 * ps).unwrap();
+        assert!(is_missing(mem));
+        // Through a handler's channel too.
+        let chan = channel(user);
+        let other = map(1);
+        let (r, _) = request(chan, [proto::OP_REGISTER, other, 1 << 62, 0], &[]);
+        assert!(r < 0);
+        let (r, _) = request(chan, [proto::OP_REGISTER, other, ps, 0], &[]);
+        assert_eq!(r, 0);
+        assert!(is_missing(other));
+        close(&[chan, user]);
+    }
+
+    #[test]
+    fn test_register_needs_read_write_memory() {
+        // Fills write through the alias, which has the memory's protection.
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(3);
+        for (page, prot) in [(1, libc::PROT_NONE), (2, libc::PROT_READ)] {
+            // SAFETY: a page of the mapping above.
+            let r = unsafe { libc::mprotect((mem + page * ps) as *mut _, ps as usize, prot) };
+            assert_eq!(r, 0);
+            let e = register(ctx, mem, (page + 1) * ps).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::EPERM), "{prot}");
+            let e = register(ctx, mem + page * ps, ps).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::EPERM), "{prot}");
+        }
+        register(ctx, mem, ps).unwrap();
+        assert_eq!(zeropage(ctx, mem, ps, true), Ok(ps));
+        close(&[user]);
+    }
+
+    #[test]
+    fn test_copy_from_a_handler() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = page_size();
+        // More than two pieces of copied data.
+        let pages = (2 << 20) / ps + 3;
+        let mem = map(pages);
+        register(ctx, mem, pages * ps).unwrap();
+        let chan = channel(user);
+        // Data for memory that is not registered is read and refused: the
+        // next request is understood.
+        let elsewhere = map(3);
+        let data = std::vec![7u8; (3 * ps) as usize];
+        let head = [proto::OP_COPY, elsewhere, 3 * ps, 0];
+        assert_eq!(request(chan, head, &data), (err(libc::ENOENT), 0));
+        // A page in the last piece is present: the copy stops there.
+        let present = pages - 2;
+        assert_eq!(zeropage(ctx, mem + present * ps, ps, true), Ok(ps));
+        let data: Vec<u8> = (0..pages * ps).map(|i| (i / ps) as u8).collect();
+        let head = [proto::OP_COPY, mem, pages * ps, 0];
+        let partial = (err(libc::EAGAIN), present * ps);
+        assert_eq!(request(chan, head, &data), partial);
+        for p in 0..pages {
+            let expect = match p {
+                p if p < present => p as u8,
+                p if p == present => 0,
+                _ => {
+                    assert!(is_missing(mem + p * ps), "page {p}");
+                    continue;
+                }
+            };
+            // SAFETY: a filled page.
+            let got = unsafe { ptr::read_volatile((mem + p * ps + 5) as *const u8) };
+            assert_eq!(got, expect, "page {p}");
+        }
+        // Present from the first page on: EEXIST.
+        let page = &data[..ps as usize];
+        let exists = (err(libc::EEXIST), 0);
+        assert_eq!(request(chan, [proto::OP_COPY, mem, ps, 0], page), exists);
+        let last = mem + (pages - 1) * ps;
+        let whole = (ps as i64, ps);
+        assert_eq!(request(chan, [proto::OP_COPY, last, ps, 0], page), whole);
+        // A length no data follows: the channel closes, the userfaultfd stays.
+        assert!(write_full(chan, &record([proto::OP_COPY, mem, 1 << 62, 0])));
+        close(&[chan]);
+        let chan = channel(user);
+        assert_eq!(request(chan, [proto::OP_WAKE, mem, ps, 0], &[]), (0, 0));
+        close(&[chan, user]);
+    }
+
+    /// Whether the peer of `fd` closed it, within five seconds.
+    fn peer_closed(fd: c_int) -> bool {
+        if !readable(fd) {
+            return false;
+        }
+        let mut b = 0u8;
+        // SAFETY: reads one byte.
+        unsafe { libc::read(fd, (&mut b as *mut u8).cast(), 1) == 0 }
+    }
+
+    #[test]
+    fn test_records_close_descriptors_not_kept() {
+        let (_, user) = create(0, false, true).unwrap();
+        // A record that is not a HELLO: its descriptor is closed.
+        let [a, b] = socketpair();
+        send_record(user, [0x99, 0, 0, 0], proto::RECORD, &[b]);
+        // A HELLO with two: the first is the channel, the second is closed.
+        let [c, d] = socketpair();
+        let [e, f] = socketpair();
+        send_record(user, [proto::HELLO, 0, 0, 0], proto::RECORD, &[d, f]);
+        assert!(served(c));
+        close(&[b, d, f]);
+        assert!(peer_closed(a), "descriptor of a record not a HELLO kept");
+        assert!(peer_closed(e), "second descriptor of a HELLO kept");
+        assert!(served(c));
+        close(&[a, c, e, user]);
+    }
+
+    unsafe extern "C" {
+        fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> c_int;
+    }
+
+    /// Sends `sig` to every userfaultfd serving thread.
+    fn signal_serving_threads(sig: c_int) {
+        let mut list: libc::thread_act_array_t = ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: lists this task's threads; the list and its ports are
+        // released below.
+        unsafe {
+            let task = mach_task_self_;
+            assert_eq!(libc::task_threads(task, &mut list, &mut count), 0);
+            for i in 0..count as usize {
+                let port = *list.add(i);
+                let t = libc::pthread_from_mach_thread_np(port);
+                let mut name = [0 as libc::c_char; 64];
+                if t != 0 && libc::pthread_getname_np(t, name.as_mut_ptr(), name.len()) == 0 {
+                    let name = core::ffi::CStr::from_ptr(name.as_ptr());
+                    if name.to_bytes() == b"userfaultfd" {
+                        libc::pthread_kill(t, sig);
+                    }
+                }
+                mach_port_deallocate(task, port);
+            }
+            let size = count as usize * core::mem::size_of::<libc::thread_act_t>();
+            libc::vm_deallocate(task, list as libc::vm_address_t, size as libc::vm_size_t);
+        }
+    }
+
+    extern "C" fn ignore(_: c_int) {}
+
+    #[test]
+    fn test_signals_and_split_records() {
+        // A handler that interrupts the serving threads' system calls.
+        // SAFETY: installs a handler that does nothing, without SA_RESTART.
+        unsafe {
+            let mut act: libc::sigaction = core::mem::zeroed();
+            act.sa_sigaction = ignore as *const () as usize;
+            libc::sigemptyset(&mut act.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGUSR2, &act, ptr::null_mut()), 0);
+        }
+        let (_, user) = create(0, false, true).unwrap();
+        let [mine, theirs] = socketpair();
+        // Half a HELLO, and signals while the serving thread waits for the rest.
+        send_record(user, [proto::HELLO, 0, 0, 0], 16, &[theirs]);
+        let until = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < until {
+            signal_serving_threads(libc::SIGUSR2);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(write_full(user, &[0; 16]));
+        // The HELLO arrived whole: the channel is served.
+        assert!(served(mine));
+        close(&[theirs, mine, user]);
     }
 }

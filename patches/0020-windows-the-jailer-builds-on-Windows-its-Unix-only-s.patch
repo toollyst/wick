@@ -16,8 +16,8 @@ resource limit tests that set and read limits are Linux's and macOS's.
  src/jailer/Cargo.toml             | 15 ++++++++++++++
  src/jailer/src/env.rs             | 34 +++++++++++++++++++++++++++++++
  src/jailer/src/main.rs            |  6 ++++++
- src/jailer/src/resource_limits.rs | 14 ++++++++++++-
- 5 files changed, 70 insertions(+), 1 deletion(-)
+ src/jailer/src/resource_limits.rs | 14 +++++++++++++
+ 5 files changed, 71 insertions(+)
 
 diff --git a/Cargo.lock b/Cargo.lock
 index fcbd9288282b5ffd059ea3639cca5ab87994906f..05c13b70f24dce00b5fbd4332736a6e51c0494e3 100644
@@ -171,7 +171,7 @@ index 95339d2b39c94a8dfd0cb4c74f7c9cb8018925a5..5166fc5dbc0169bd3fbae2c8a28cc590
  mod env;
  #[cfg(not(target_os = "linux"))]
 diff --git a/src/jailer/src/resource_limits.rs b/src/jailer/src/resource_limits.rs
-index 0ca4c3460dbbd70d4a90c113e1feedf52fbb968c..34be00a2613d9cc5d7bb2f9ab6eac57f65d15879 100644
+index 0ca4c3460dbbd70d4a90c113e1feedf52fbb968c..66ef3259c43a6fc36fc19ad166da9113d0b05b48 100644
 --- a/src/jailer/src/resource_limits.rs
 +++ b/src/jailer/src/resource_limits.rs
 @@ -4,6 +4,7 @@
@@ -213,13 +213,13 @@ index 0ca4c3460dbbd70d4a90c113e1feedf52fbb968c..34be00a2613d9cc5d7bb2f9ab6eac57f
      fn set_limit(resource: Resource, target: libc::rlim_t) -> Result<(), JailerError> {
          let rlim: libc::rlimit = libc::rlimit {
              rlim_cur: target,
-@@ -123,7 +134,8 @@ impl ResourceLimits {
-     }
+@@ -124,6 +135,9 @@ impl ResourceLimits {
  }
  
--#[cfg(test)]
-+// wick: the limits these tests set and read back are not Windows' (platform).
-+#[cfg(all(test, not(windows)))]
+ #[cfg(test)]
++// wick: the limits these tests set and read back are not Windows' (platform);
++// a separate attribute, so clippy still sees a test module.
++#[cfg(not(windows))]
  mod tests {
      #![allow(clippy::undocumented_unsafe_blocks)]
      use super::*;

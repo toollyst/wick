@@ -13,9 +13,12 @@ BPF filters as upstream does. The firecracker binary maps `--no-seccomp`
 and `--seccomp-filter` onto it and refuses a custom BPF file off Linux.
 seccompiler links libseccomp only on Linux and fails loudly instead of
 linking it elsewhere.
+A system call the host sandbox denies raises SIGSYS without seccomp's
+code; upstream's SIGSYS handler then logs it and exits with the
+bad-syscall code, as for a seccomp violation.
 
 Test: `cargo test -p vmm --lib ext::sandbox` (a sandboxed child cannot run
-a program); on Linux the seccomp integration tests are unchanged.
+a program, an unlisted system call exits with the bad-syscall code); on Linux the seccomp integration tests are unchanged.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -24,7 +27,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/seccompiler/build.rs        |  5 ++-
  src/seccompiler/src/bindings.rs | 57 +++++++++++++++++++++++++++++++++
  src/vmm/src/seccomp.rs          |  9 ++++++
- 5 files changed, 96 insertions(+), 1 deletion(-)
+ src/vmm/src/signal_handler.rs   |  8 +++++
+ 6 files changed, 104 insertions(+), 1 deletion(-)
 
 diff --git a/src/firecracker/build.rs b/src/firecracker/build.rs
 index fa868234e91bb5ab02d55fecc38c245b1c4704b0..926b917e67b60be8ce97b414fd33a459a8edb9ec 100644
@@ -194,3 +198,22 @@ index 82e30fa9289ae0d78a340d36f0b136e1073ff18d..644db182f76a3504022a0f525b78d146
      // If the program is empty, don't install the filter.
      if bpf_filter.is_empty() {
          return Ok(());
+diff --git a/src/vmm/src/signal_handler.rs b/src/vmm/src/signal_handler.rs
+index b593e6564a6bad8bf940d072f1627a51cd753ca5..5100dd301d9fda408988edc7613810fd5ce1957d 100644
+--- a/src/vmm/src/signal_handler.rs
++++ b/src/vmm/src/signal_handler.rs
+@@ -59,6 +59,14 @@ macro_rules! generate_handler {
+ }
+ 
+ fn log_sigsys_err(si_code: c_int, info: *mut siginfo_t) {
++    // wick: outside Linux the host sandbox, not seccomp, denies a system call
++    // and raises SIGSYS for it, without seccomp's code or the call's number.
++    #[cfg(not(target_os = "linux"))]
++    // SAFETY: the siginfo this handler was given.
++    if unsafe { crate::ext::sandbox::denied_syscall(si_code, info) } {
++        error_unrestricted!("Shutting down VM after the host sandbox denied a system call.");
++        return;
++    }
+     if si_code != SYS_SECCOMP_CODE {
+         // We received a SIGSYS for a reason other than `bad syscall`.
+         exit_with_code(FcExitCode::UnexpectedError);

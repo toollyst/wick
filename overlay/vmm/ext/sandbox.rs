@@ -49,7 +49,19 @@ pub enum SandboxError {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{FILES_ANYWHERE, PROFILE, apply, files_in_jail, profile, select};
+pub use macos::{
+    FILES_ANYWHERE, PROFILE, SYSCALLS, apply, denied_syscall, files_in_jail, profile, select,
+};
+
+/// Whether a SIGSYS is the host sandbox denying a system call (upstream's
+/// handler then exits as for a seccomp violation). Async-signal-safe.
+///
+/// # Safety
+/// `info` is the siginfo the kernel passed to a SIGSYS handler.
+#[cfg(not(target_os = "macos"))]
+pub unsafe fn denied_syscall(_si_code: libc::c_int, _info: *mut libc::siginfo_t) -> bool {
+    false
+}
 
 #[cfg(target_os = "windows")]
 pub use windows::{apply, select};
@@ -69,6 +81,7 @@ mod macos {
     use std::ffi::{CStr, c_char};
     use std::path::Path;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{Policy, SandboxError};
 
@@ -90,7 +103,43 @@ mod macos {
 (allow signal (target self))
 (allow process-info* (target self))
 (allow sysctl-read)
+; System calls: only those in SYSCALLS. Any other one fails and raises SIGSYS,
+; on which Firecracker exits as for a seccomp violation (upstream's filters
+; trap, and its SIGSYS handler exits with the bad-syscall code).
+(deny syscall-unix (with send-signal SIGSYS))
 "#;
+
+    /// The system calls the sandbox allows (`SYS_<name>`, <sys/syscall.h>):
+    /// the ones a Firecracker process makes once its first thread is
+    /// sandboxed, as upstream's seccomp filters allow only what each thread
+    /// needs. Measured over `tools/macos/boot-test.sh` (every device,
+    /// snapshots, userfaultfd, PCI, vhost-user, vmnet) with every
+    /// libsystem_kernel entry point recorded, plus each call's
+    /// cancellation-point twin (`_nocancel`) and what a panic or a thread's
+    /// exit takes (signal masks, `__pthread_kill`, `abort_with_payload`).
+    pub const SYSCALLS: &[&str] = &[
+        "exit", "read", "write", "open", "close", "unlink", "getpid", "getuid", "geteuid",
+        "recvmsg", "sendmsg", "recvfrom", "accept", "access", "dup", "pipe", "getegid",
+        "sigaction", "sigprocmask", "sigaltstack", "ioctl", "munmap", "mprotect", "madvise",
+        "mincore", "dup2", "fcntl", "fsync", "socket", "connect", "bind", "setsockopt",
+        "listen", "gettimeofday", "getrusage", "getsockopt", "readv", "writev", "mkfifo",
+        "sendto", "socketpair", "pread", "pwrite", "csops", "csops_audittoken",
+        "kdebug_typefilter", "kdebug_trace_string", "kdebug_trace64", "sigreturn", "fdatasync",
+        "getrlimit", "mmap", "lseek", "ftruncate", "sysctl", "getattrlist", "poll", "shm_open",
+        "shm_unlink", "gettid", "psynch_mutexwait", "psynch_mutexdrop", "psynch_cvbroad",
+        "psynch_cvsignal", "psynch_cvwait", "psynch_cvclrprepost", "issetugid",
+        "__pthread_kill", "__pthread_sigmask", "__disable_threadsignal", "__semwait_signal",
+        "proc_info", "stat64", "fstat64", "lstat64", "getdirentries64", "fstatfs64",
+        "bsdthread_create", "bsdthread_terminate", "kqueue", "kevent", "workq_open",
+        "workq_kernreturn", "thread_selfid", "kevent_qos", "kevent_id", "read_nocancel",
+        "write_nocancel", "open_nocancel", "close_nocancel", "recvmsg_nocancel",
+        "sendmsg_nocancel", "recvfrom_nocancel", "accept_nocancel", "fcntl_nocancel",
+        "fsync_nocancel", "connect_nocancel", "sigsuspend_nocancel", "readv_nocancel",
+        "writev_nocancel", "sendto_nocancel", "pread_nocancel", "pwrite_nocancel",
+        "poll_nocancel", "__semwait_signal_nocancel", "fileport_makefd", "openat",
+        "openat_nocancel", "fstatat64", "bsdthread_ctl", "recvmsg_x", "sendmsg_x", "getentropy",
+        "ulock_wait", "ulock_wake", "abort_with_payload", "os_fault_with_payload", "ulock_wait2",
+    ];
 
     /// File rule without the jailer: guest kernels, disks, snapshots, logs,
     /// metrics and the API socket are chosen by the operator, also after
@@ -116,7 +165,35 @@ mod macos {
             Some(root) => files_in_jail(root)?,
             None => FILES_ANYWHERE.to_owned(),
         };
-        Ok(format!("{PROFILE}{files}"))
+        Ok(format!("{PROFILE}{}{files}", syscall_rule()))
+    }
+
+    fn syscall_rule() -> String {
+        let mut rule = String::from("(allow syscall-unix (syscall-number");
+        for name in SYSCALLS {
+            rule.push_str(" SYS_");
+            rule.push_str(name);
+        }
+        rule.push_str("))\n");
+        rule
+    }
+
+    /// Set once the sandbox is installed, for [`denied_syscall`].
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// Whether a SIGSYS is the sandbox denying a system call: the sandbox
+    /// signals the process itself, with no code (and does not say which
+    /// call). Async-signal-safe.
+    ///
+    /// # Safety
+    /// `info` is the siginfo the kernel passed to a SIGSYS handler.
+    pub unsafe fn denied_syscall(si_code: libc::c_int, info: *mut libc::siginfo_t) -> bool {
+        if !INSTALLED.load(Ordering::Relaxed) || si_code != 0 || info.is_null() {
+            return false;
+        }
+        // SAFETY: the caller passes the handler's siginfo; getpid has no
+        // arguments.
+        unsafe { (*info).si_pid == libc::getpid() }
     }
 
     unsafe extern "C" {
@@ -149,6 +226,7 @@ mod macos {
         }
         install(&profile()?)?;
         state.installed = true;
+        INSTALLED.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -185,9 +263,9 @@ mod macos {
 
         // The sandbox is permanent, so it is tested in a child process
         // (the test binary itself, filtered to the child test below).
-        fn run_child(name: &str, env: &[(&str, &str)]) {
+        fn child(name: &str, env: &[(&str, &str)]) -> std::process::Output {
             let exe = std::env::current_exe().unwrap();
-            let out = Command::new(exe)
+            Command::new(exe)
                 .args([
                     "--exact",
                     &format!("ext::sandbox::macos::tests::{name}"),
@@ -196,7 +274,11 @@ mod macos {
                 ])
                 .envs(env.iter().copied())
                 .output()
-                .unwrap();
+                .unwrap()
+        }
+
+        fn run_child(name: &str, env: &[(&str, &str)]) {
+            let out = child(name, env);
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(
                 out.status.success(),
@@ -209,6 +291,89 @@ mod macos {
         #[test]
         fn test_sandbox_restricts_child() {
             run_child("sandboxed_child", &[]);
+        }
+
+        // A system call outside SYSCALLS raises SIGSYS, as a seccomp filter's
+        // trap does (the test binary has no handler, so it dies of it).
+        #[test]
+        fn test_unlisted_syscalls_raise_sigsys() {
+            use std::os::unix::process::ExitStatusExt;
+            for name in ["exec_child", "unlisted_child"] {
+                let out = child(name, &[]);
+                assert_eq!(
+                    out.status.signal(),
+                    Some(libc::SIGSYS),
+                    "{name}: {:?}\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout)
+                );
+                assert!(!String::from_utf8_lossy(&out.stdout).contains("CHILD-SURVIVED"));
+            }
+        }
+
+        // With upstream's signal handlers, a denied call ends Firecracker as a
+        // seccomp violation does: the bad-syscall exit code.
+        #[test]
+        fn test_denied_syscall_exits_as_seccomp() {
+            let out = child("handled_child", &[]);
+            assert_eq!(
+                out.status.code(),
+                Some(crate::FcExitCode::BadSyscall as i32),
+                "{:?}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+
+        #[test]
+        #[ignore = "run by test_denied_syscall_exits_as_seccomp in a separate process"]
+        fn handled_child() {
+            crate::signal_handler::register_signal_handlers().unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            // SAFETY: no arguments.
+            unsafe { libc::getppid() };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        #[test]
+        fn test_syscall_names_are_known() {
+            // The profile compiles only if Seatbelt knows every name; an
+            // unknown one fails `sandbox_init`, which test_sandbox_restricts_child
+            // would show. Here: no duplicates, and the calls Firecracker cannot
+            // run without are in.
+            let mut names = SYSCALLS.to_vec();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), SYSCALLS.len());
+            for needed in ["read", "write", "mmap", "kevent", "bsdthread_create", "exit"] {
+                assert!(SYSCALLS.contains(&needed), "{needed}");
+            }
+            for denied in ["fork", "vfork", "execve", "posix_spawn", "ptrace", "setuid", "chroot", "mount", "kill"] {
+                assert!(!SYSCALLS.contains(&denied), "{denied}");
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        fn exec_child() {
+            select(Policy::Default);
+            apply().unwrap();
+            let _ = std::process::Command::new("/bin/echo").output();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        #[test]
+        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        fn unlisted_child() {
+            select(Policy::Default);
+            apply().unwrap();
+            // SAFETY: no arguments.
+            unsafe { libc::getppid() };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
         }
 
         #[test]
@@ -239,7 +404,7 @@ mod macos {
             let base = jail.parent().unwrap().to_owned();
             // A descriptor opened before the sandbox stays usable.
             let early = std::fs::File::open(base.join("outside")).unwrap();
-            install(&format!("{PROFILE}{}", files_in_jail(&jail).unwrap())).unwrap();
+            install(&format!("{PROFILE}{}{}", syscall_rule(), files_in_jail(&jail).unwrap())).unwrap();
             let denied = |e: std::io::Error| e.raw_os_error() == Some(libc::EPERM);
             // Inside the jail: read, write, create, remove, Unix sockets.
             assert_eq!(std::fs::read(jail.join("inside")).unwrap(), b"guest");
@@ -271,10 +436,8 @@ mod macos {
             std::fs::write(&path, b"x").unwrap();
             std::fs::remove_file(&path).unwrap();
             let (_a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
-            // Program execution and IP networking are denied.
-            std::process::Command::new("/bin/echo")
-                .output()
-                .unwrap_err();
+            // IP networking is denied (program execution raises SIGSYS:
+            // test_unlisted_syscalls_raise_sigsys).
             let denied = |e: std::io::Error| e.raw_os_error() == Some(libc::EPERM);
             assert!(denied(
                 std::net::TcpStream::connect("127.0.0.1:9").unwrap_err()
