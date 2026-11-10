@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 12:34:20 +0900
+Subject: [PATCH] vmm: platform module (overlay/vmm/platform)
+
+Why: host facilities that upstream takes straight from Linux (io_uring,
+TUN/TAP, hole-keeping file systems) need one interface with a backend per
+OS, with Linux's semantics.
+
+What: vmm declares `platform` from overlay/vmm/platform. Its Linux backend
+is upstream's own code (io_uring, TAP, ext4/tmpfs holes); the macOS and
+Windows backends implement the same semantics natively. vmm depends on
+windows-sys for the Windows backends and the host sandbox.
+
+Test: `cargo test -p vmm platform::` runs the interface tests against the
+host's backend.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vmm/Cargo.toml | 7 +++++++
+ src/vmm/src/lib.rs | 4 ++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index 33b58da06b30c2e452bc4bf149a24d4381ac39ef..7d6d670e06fa44f3f3eff418ff448fce689c55a4 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -65,6 +65,13 @@ zerocopy = { version = "0.8.50" }
+ # wick: std::os::{unix, fd} on Windows (`extern crate wick_std as std` at the root).
+ [target.'cfg(windows)'.dependencies]
+ wick-std = { path = "../../../../crates/compat/std" }
++# wick: the Windows platform backends (overlay/vmm/platform/windows) and the host
++# sandbox (overlay/vmm/ext/sandbox.rs: process mitigation policy).
++windows-sys = { version = "0.61.2", features = [
++    "Win32_System_IO",
++    "Win32_System_Ioctl",
++    "Win32_System_Threading",
++] }
+ 
+ [target.'cfg(target_arch = "aarch64")'.dependencies]
+ vm-fdt = "0.3.0"
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 52394b6e08637d8fd59e51d7a349d711fba9fbf0..2ae177efa06110148fef559e424a011aac6bad45 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -101,6 +101,10 @@ pub mod mmds;
+ pub mod pci;
+ /// Save/restore utilities.
+ pub mod persist;
++/// Platform interfaces and their per-OS backends.
++// wick: host facilities behind interfaces with Linux, macOS and Windows backends.
++#[path = "../../../../../overlay/vmm/platform/mod.rs"]
++pub mod platform;
+ /// Resource store for configured microVM resources.
+ pub mod resources;
+ /// microVM RPC API adapters.
