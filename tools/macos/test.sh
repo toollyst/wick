@@ -34,7 +34,7 @@ cd "$ROOT/lib/firecracker"
 bins=()
 while IFS= read -r bin; do
     bins+=("$bin")
-done < <(cargo test --no-run --message-format=json "${cargo_args[@]}" 2>/dev/null |
+done < <(cargo test --locked --no-run --message-format=json "${cargo_args[@]}" 2>/dev/null |
     python3 -I -c '
 import json, sys
 for line in sys.stdin:

@@ -42,7 +42,7 @@ jobs:
         run: tools/patches.sh check
       - name: Check generated Windows sources
         run: |
-          (cd lib/firecracker && cargo fetch -q)
+          (cd lib/firecracker && cargo fetch --locked -q)
           tools/gen-kvm-bindings-windows.sh --check
           tools/gen-windows-sources.sh --check
 
@@ -84,7 +84,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libseccomp-dev
       - name: Build firecracker
         working-directory: lib/firecracker
-        run: cargo build -p firecracker
+        run: cargo build --locked -p firecracker
 
   # Upstream's unit tests as upstream's CI runs them (its development
   # container, as root, musl, one test thread: tools/linux/unit-tests.sh),
@@ -155,6 +155,9 @@ jobs:
           ls -l /dev/kvm
       - name: Release build (upstream's tools/release.sh, musl)
         run: tools/linux/devctr.sh --chown lib/firecracker/build -- ./tools/release.sh --libc musl --profile release
+      # Upstream's release.sh builds without --locked.
+      - name: The build kept Cargo.lock
+        run: git -C lib/firecracker diff --exit-code -- Cargo.lock
       - name: Boot test
         run: tools/linux/boot-test.sh --workdir "$RUNNER_TEMP/boot-test"
       - name: Upload logs
@@ -214,6 +217,10 @@ jobs:
         run: |
           tools/linux/compare-integration-tests.py "$RUNNER_TEMP/it/upstream" "$RUNNER_TEMP/it/wick" \
             --summary "$GITHUB_STEP_SUMMARY"
+      # Upstream's release.sh, which the tests build with, has no --locked.
+      - name: The build kept Cargo.lock
+        if: always()
+        run: git -C lib/firecracker diff --exit-code -- Cargo.lock
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v7
@@ -245,29 +252,29 @@ jobs:
         run: rustup component add clippy
       - name: Build firecracker
         working-directory: lib/firecracker
-        run: cargo build -p firecracker --bin firecracker
+        run: cargo build --locked -p firecracker --bin firecracker
       - name: Clippy
         working-directory: lib/firecracker
-        run: cargo clippy -p vmm -p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings
+        run: cargo clippy --locked -p vmm -p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings
       - name: Compatibility crate tests
         working-directory: lib/firecracker
         run: |
           for c in libc vmm-sys-util memfd userfaultfd; do
-            cargo test --manifest-path "../../crates/compat/$c/Cargo.toml"
+            cargo test --locked --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
           # The tests that create a VM need Hypervisor.framework, which GitHub's
           # macOS runners (virtual machines) do not have; tools/macos/test.sh
           # runs them, and tools/macos/boot-test.sh the scenarios.
-          cargo test --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- --skip hvf::vm::tests::
+          cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- --skip hvf::vm::tests::
       - name: Host sandbox and jail hand-over tests
         working-directory: lib/firecracker
-        run: cargo test -p vmm --lib "ext::"
+        run: cargo test --locked -p vmm --lib "ext::"
       # The jailer's tests run as root, as upstream's do (they set resource
       # limits and change owners); the runners have passwordless sudo.
       - name: Jailer unit tests
         working-directory: lib/firecracker
         run: |
-          bin=$(cargo test -p jailer --no-run --message-format=json |
+          bin=$(cargo test --locked -p jailer --no-run --message-format=json |
             jq -r 'select(.profile.test == true and .target.name == "jailer") | .executable')
           sudo env RUST_TEST_THREADS=1 "$bin"
       - name: Jailer scenario tests (without a VM)

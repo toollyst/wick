@@ -28,7 +28,7 @@ export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/lib/firecracker/build/cargo_target}"
 "$ROOT/tools/macos/run.sh" --build-only ${cargo_profile[@]+"${cargo_profile[@]}"}
 (cd "$ROOT/lib/firecracker" &&
-    CARGO_TARGET_DIR="$TARGET_DIR" cargo build ${cargo_profile[@]+"${cargo_profile[@]}"} -p jailer)
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked ${cargo_profile[@]+"${cargo_profile[@]}"} -p jailer)
 
 OUT="$ROOT/build/jailer-test/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
