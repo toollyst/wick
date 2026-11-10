@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 12:34:18 +0900
+Subject: [PATCH] seccomp: install the host sandbox where seccomp-BPF does not
+ exist
+
+Why: on macOS and Windows there is no seccomp. Silently running without a
+filter would be a bypass, so the host's own sandbox takes its place.
+
+What: vmm installs `ext::sandbox` (Seatbelt on macOS, process mitigation
+policies on Windows) where Linux installs BPF filters, then validates the
+BPF filters as upstream does. The firecracker binary maps `--no-seccomp`
+and `--seccomp-filter` onto it and refuses a custom BPF file off Linux.
+seccompiler links libseccomp only on Linux and fails loudly instead of
+linking it elsewhere.
+
+Test: `cargo test -p vmm --lib ext::sandbox` (a sandboxed child cannot run
+a program); on Linux the seccomp integration tests are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/build.rs        |  6 ++++
+ src/firecracker/src/seccomp.rs  | 20 ++++++++++++
+ src/seccompiler/build.rs        |  5 ++-
+ src/seccompiler/src/bindings.rs | 57 +++++++++++++++++++++++++++++++++
+ src/vmm/src/seccomp.rs          |  9 ++++++
+ 5 files changed, 96 insertions(+), 1 deletion(-)
+
+diff --git a/src/firecracker/build.rs b/src/firecracker/build.rs
+index fa868234e91bb5ab02d55fecc38c245b1c4704b0..926b917e67b60be8ce97b414fd33a459a8edb9ec 100644
+--- a/src/firecracker/build.rs
++++ b/src/firecracker/build.rs
+@@ -51,6 +51,12 @@ fn main() {
+     println!("cargo:rerun-if-changed={}", SECCOMPILER_SRC_DIR);
+ 
+     let out_path = format!("{}/{}", out_dir, ADVANCED_BINARY_FILTER_FILE_NAME);
++    // wick: seccomp-BPF exists only on Linux. Other hosts use their own sandbox
++    // (overlay/vmm/ext/sandbox.rs) and never read this file, which stays empty.
++    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
++        std::fs::write(&out_path, []).expect("Cannot write seccomp filter placeholder");
++        return;
++    }
+     seccompiler::compile_bpf(&seccomp_json_path, &target_arch, &out_path, false, false)
+         .expect("Cannot compile seccomp filters");
+ }
+diff --git a/src/firecracker/src/seccomp.rs b/src/firecracker/src/seccomp.rs
+index 421220a7b5faf156d54d5575b9230ac0ee0940ef..f073641bb1dcfa68213585e241b917be9b9f351d 100644
+--- a/src/firecracker/src/seccomp.rs
++++ b/src/firecracker/src/seccomp.rs
+@@ -20,6 +20,8 @@ pub enum FilterError {
+     MissingThreadCategory(String),
+     /// Filter file open error: {0}
+     FileOpen(std::io::Error),
++    /// {0}
++    Sandbox(vmm::ext::sandbox::SandboxError), // wick: host sandbox where seccomp-BPF is unavailable
+ }
+ 
+ /// Seccomp filter configuration.
+@@ -54,6 +56,24 @@ impl SeccompConfig {
+ 
+ /// Retrieve the appropriate filters, based on the SeccompConfig.
+ pub fn get_filters(config: SeccompConfig) -> Result<BpfThreadMap, FilterError> {
++    // wick: without seccomp-BPF the host sandbox stands in for the filters
++    // (vmm::ext::sandbox); the BPF maps stay empty.
++    if cfg!(not(target_os = "linux")) {
++        use vmm::ext::sandbox::{Policy, SandboxError, select};
++        return match config {
++            SeccompConfig::None => {
++                select(Policy::None);
++                Ok(get_empty_filters())
++            }
++            SeccompConfig::Advanced => {
++                select(Policy::Default);
++                Ok(get_empty_filters())
++            }
++            SeccompConfig::Custom(_) => {
++                Err(FilterError::Sandbox(SandboxError::CustomFilterUnsupported))
++            }
++        };
++    }
+     match config {
+         SeccompConfig::None => Ok(get_empty_filters()),
+         SeccompConfig::Advanced => get_default_filters(),
+diff --git a/src/seccompiler/build.rs b/src/seccompiler/build.rs
+index d0d2a30e39eba56a6c76f8186433e261e15efc5e..1bade811e0609eae47460c9a68fedb51a97d8180 100644
+--- a/src/seccompiler/build.rs
++++ b/src/seccompiler/build.rs
+@@ -3,5 +3,8 @@
+ 
+ fn main() {
+     println!("cargo::rustc-link-search=/usr/local/lib");
+-    println!("cargo::rustc-link-lib=seccomp");
++    // wick: libseccomp exists only on Linux (see src/bindings.rs).
++    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
++        println!("cargo::rustc-link-lib=seccomp");
++    }
+ }
+diff --git a/src/seccompiler/src/bindings.rs b/src/seccompiler/src/bindings.rs
+index 969ea91cd1c3561a7a9a6779421557f2b396635a..6f42c84af367d073270f737214df1e90e73cdbda 100644
+--- a/src/seccompiler/src/bindings.rs
++++ b/src/seccompiler/src/bindings.rs
+@@ -80,6 +80,8 @@ pub const SCMP_ACT_LOG: u32 = 0x7ffc0000;
+ /// Allow the syscall to be executed
+ pub const SCMP_ACT_ALLOW: u32 = 0x7fff0000;
+ 
++// wick: libseccomp exists only on Linux; elsewhere `no_libseccomp` below stands in.
++#[cfg(target_os = "linux")]
+ #[link(name = "seccomp")]
+ unsafe extern "C" {
+     /// Initialize the filter state
+@@ -169,3 +171,58 @@ unsafe extern "C" {
+ 
+ /// Negative pseudo syscall number returned by some functions in case of an error
+ pub const __NR_SCMP_ERROR: c_int = -1;
++
++// wick: libseccomp is Linux-only. On other hosts these stand-ins fail, so
++// compiling filters reports an error instead of producing empty programs.
++// (Firecracker itself uses the host sandbox there: overlay/vmm/ext/sandbox.rs.)
++#[cfg(not(target_os = "linux"))]
++pub use no_libseccomp::*;
++
++#[cfg(not(target_os = "linux"))]
++#[allow(clippy::missing_safety_doc)]
++mod no_libseccomp {
++    use super::*;
++
++    const MINUS_EOPNOTSUPP: c_int = -libc::EOPNOTSUPP;
++
++    /// Fails: no libseccomp on this host.
++    pub fn seccomp_init(_def_action: u32) -> scmp_filter_ctx {
++        std::ptr::null_mut()
++    }
++
++    /// Fails: no libseccomp on this host.
++    pub unsafe fn seccomp_arch_add(_ctx: scmp_filter_ctx, _arch_token: u32) -> c_int {
++        MINUS_EOPNOTSUPP
++    }
++
++    /// Fails: no libseccomp on this host.
++    pub unsafe fn seccomp_syscall_resolve_name(_name: *const c_char) -> c_int {
++        __NR_SCMP_ERROR
++    }
++
++    /// Fails: no libseccomp on this host.
++    pub unsafe fn seccomp_rule_add(
++        _ctx: scmp_filter_ctx,
++        _action: u32,
++        _syscall: c_int,
++        _arg_cnt: c_uint,
++    ) -> c_int {
++        MINUS_EOPNOTSUPP
++    }
++
++    /// Fails: no libseccomp on this host.
++    pub unsafe fn seccomp_rule_add_array(
++        _ctx: scmp_filter_ctx,
++        _action: u32,
++        _syscall: c_int,
++        _arg_cnt: c_uint,
++        _arg_array: *const scmp_arg_cmp,
++    ) -> c_int {
++        MINUS_EOPNOTSUPP
++    }
++
++    /// Fails: no libseccomp on this host.
++    pub unsafe fn seccomp_export_bpf(_ctx: const_scmp_filter_ctx, _fd: c_int) -> c_int {
++        MINUS_EOPNOTSUPP
++    }
++}
+diff --git a/src/vmm/src/seccomp.rs b/src/vmm/src/seccomp.rs
+index 82e30fa9289ae0d78a340d36f0b136e1073ff18d..644db182f76a3504022a0f525b78d1468bea334c 100644
+--- a/src/vmm/src/seccomp.rs
++++ b/src/vmm/src/seccomp.rs
+@@ -76,6 +76,8 @@ pub enum InstallationError {
+     FilterTooLarge,
+     /// prctl` syscall failed with error code: {0}
+     Prctl(std::io::Error),
++    /// {0}
++    Sandbox(crate::ext::sandbox::SandboxError), // wick: host sandbox where seccomp-BPF is unavailable
+ }
+ 
+ /// The maximum seccomp-BPF program length allowed by the linux kernel.
+@@ -92,6 +94,13 @@ struct SockFprog {
+ 
+ /// Apply bpf filter.
+ pub fn apply_filter(bpf_filter: BpfProgramRef) -> Result<(), InstallationError> {
++    // wick: hosts without seccomp-BPF install their own sandbox (process-wide, once;
++    // selected from the seccomp configuration, see vmm::ext::sandbox). Their filters are
++    // empty; a non-empty BPF program fails below as on a kernel without seccomp filters.
++    if cfg!(not(target_os = "linux")) {
++        crate::ext::sandbox::apply().map_err(InstallationError::Sandbox)?;
++    }
++
+     // If the program is empty, don't install the filter.
+     if bpf_filter.is_empty() {
+         return Ok(());
