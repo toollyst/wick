@@ -92,9 +92,13 @@ Platform, and the Windows column of [At a glance](#at-a-glance) says "works" for
   raw handle values (both fixed); a standard input that is a pipe is now pollable, so the serial console reads it as
   on Linux.
 - Next, on real hardware:
-  1. A first guest boot with upstream's x86_64 CI kernel and rootfs (`tools/windows/boot-test.ps1`): LAPIC state
-     layout (`get/set_lapic` over the interrupt controller state), CPUID hypervisor leaves and kvm-clock, the vCPU
-     kick at run time.
+  1. A first guest boot with upstream's x86_64 CI kernel and rootfs (`tools/windows/boot-test.ps1`: boot, SMP,
+     block, vsock, virtio-net over the Unix stream endpoint; the steps are in
+     [tools/windows/README.md](../tools/windows/README.md)): the LAPIC register page (`get/set_lapic`), AP start-up
+     through WHP's INIT/SIPI handling, CPUID hypervisor leaves and the guest clock, the vCPU kick at run time.
+     Reading the backend against upstream's boot path before that found the vCPU kick handle
+     (`create_vcpu_from_rawfd`) missing, which no boot gets past, a kick lost when it lands just before a run, APs
+     not held for their SIPI, a 1 KiB LAPIC exchange and a fatal HLT exit (all fixed).
   2. WHP inside an AppContainer and under the full mitigation profile.
   3. The fd-passing changes for jailed processes ([M5](#m5-security-parity-the-jailer-on-every-host)).
 - After that: PCI / MSI-X, snapshots and userfaultfd on Windows (planned in [At a glance](#at-a-glance)).

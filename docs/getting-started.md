@@ -163,7 +163,8 @@ wick on Windows uses the Windows Hypervisor Platform and x86_64 guests. Turn the
 `optionalfeatures.exe`, or as administrator: `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`).
 
 The fastest way to try it is the boot test, which downloads upstream's x86_64 CI guest and checks boot, serial I/O,
-SMP, the Async block engine and vsock stage by stage:
+SMP, Sync and Async block devices, vsock and virtio-net stage by stage
+([tools/windows/README.md](../tools/windows/README.md) has the steps):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1

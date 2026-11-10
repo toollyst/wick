@@ -81,7 +81,7 @@ tools/patches.sh check                  # what CI checks about patches/
 | [`tools/macos/run.sh`](../tools/macos/run.sh) | Builds, signs with the Hypervisor.framework entitlement and runs `firecracker` |
 | [`tools/macos/test.sh`](../tools/macos/test.sh) | Runs unit tests with the entitlement (through [`sign-and-run.sh`](../tools/macos/sign-and-run.sh) as the cargo runner) |
 | [`tools/macos/boot-test.sh`](../tools/macos/boot-test.sh) | Scenario tests against upstream's aarch64 CI guest: boot, SMP, block, vsock, net, vmnet, snapshots, diff, uffd, PCI, vhost-user |
-| [`tools/windows/boot-test.ps1`](../tools/windows/boot-test.ps1) | Boots upstream's x86_64 CI guest on WHP: boot, serial, SMP, Async block, vsock |
+| [`tools/windows/boot-test.ps1`](../tools/windows/boot-test.ps1) | Scenario tests against upstream's x86_64 CI guest on WHP: boot, SMP, block, vsock, net ([steps](../tools/windows/README.md)) |
 | [`tools/windows/winprobe.c`](../tools/windows/winprobe.c) | Measures the Windows mechanisms the sandbox and jailer backends use |
 | [`tools/gen-windows-sources.sh`](../tools/gen-windows-sources.sh) | Generates the Windows builds of the rust-vmm crates (`--check` in CI) |
 | [`tools/gen-kvm-bindings-windows.sh`](../tools/gen-kvm-bindings-windows.sh) | Generates `kvm-bindings` with the Linux x86_64 layout for Windows (`--check` in CI) |

@@ -34,11 +34,13 @@ networking, snapshots, userfaultfd, PCI, vhost-user); run it before sending a
 change to the macOS backends. Windows builds cross-compile from macOS or
 Linux with mingw-w64:
 `AWS_LC_SYS_NO_ASM=1 cargo build -p firecracker --target x86_64-pc-windows-gnu`.
-Natively on Windows (MSVC), `cargo build -p firecracker` works as is; release
-builds need [NASM](https://www.nasm.us/) on `PATH` for aws-lc-sys.
+Natively on Windows (MSVC), `cargo build -p firecracker` runs in a Visual
+Studio developer shell (`vcvars64.bat`) with [NASM](https://www.nasm.us/) on
+`PATH` for aws-lc-sys (debug builds can set `AWS_LC_SYS_NO_ASM=1` instead).
 On a Windows machine with the Windows Hypervisor Platform feature,
 `tools/windows/boot-test.ps1` boots upstream's x86_64 CI guest and checks boot,
-serial I/O, SMP, the Async block engine and vsock; `tools/windows/winprobe.c`
+serial I/O, SMP, Sync and Async block devices, vsock and virtio-net
+(`tools/windows/README.md` has the steps); `tools/windows/winprobe.c`
 measures the host mechanisms the sandbox and jailer backends use.
 
 Editors: `.vscode/settings.json` points rust-analyzer at
