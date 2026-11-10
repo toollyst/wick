@@ -18,10 +18,7 @@ param(
     [string[]]$Stage = @('refuse', 'isolation', 'boot', 'limits', 'cpu'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
-    [string]$Probe = '',
-    # The cpu stage measures the CPU rate cap (accepted with
-    # wick.cpu_cap=unsafe) instead of checking that cpu.max is refused.
-    [switch]$CpuCap
+    [string]$Probe = ''
 )
 $ErrorActionPreference = 'Stop'
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -242,37 +239,38 @@ function Stage-Limits {
     "memory.max below the guest's memory: Firecracker cannot map it and exits"
 }
 
-# cpu.max is the job's CPU rate hard cap, which the jailer refuses for now:
-# under it a jailed guest can stop taking interrupts for good (WHP, measured:
-# about 1 run in 3 at a quarter of a CPU, never without the cap, never with
-# the same cap on a Firecracker started outside the jailer; the vCPU thread
-# spins inside the hypervisor and a keystroke gets no echo). docs/ROADMAP.md,
-# M5. -CpuCap measures it, through the jailer's opt-in.
-function Stage-Cpu {
+# cpu.max is the job's CPU rate hard cap, from Firecracker's third CPU-second
+# on: a guest that boots under the cap calibrates its LAPIC timer while
+# throttled and can stop taking interrupts for good (about 1 boot in 3 at a
+# quarter of a CPU when the cap was there from the start). Each run boots a
+# guest under the limit, spins past the grace, then measures a 5 s spin.
+function Stage-Cpu([int]$Boots = 3) {
     $base = New-Base 'cpu'
-    if (-not $CpuCap) {
-        $r = Invoke-Jailer @('--id', 'c', '--exec-file', $Fc, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--cgroup-version', '2', '--cgroup', 'cpu.max=25000 100000')
-        Check ($r[0] -ne 0 -and $r[1] -match 'refused on Windows for now') "cpu.max: exit $($r[0]), $($r[1])"
-        Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue)) 'cpu.max started Firecracker'
-        return 'cpu.max is refused, naming the stall under the CPU rate cap (-CpuCap measures it)'
+    $used = @()
+    for ($b = 1; $b -le $Boots; $b++) {
+        $vm = Start-JailedVm $base "cpu$b" @('--cgroup-version', '2', '--cgroup', 'cpu.max=25000 100000')
+        try {
+            Wait-Shell $vm
+            $vm.Send('timeout 3 sh -c "while :; do :; done"; echo WARM')
+            Check ($vm.WaitFor('(?m)^WARM', 30)) "boot ${b}: the warm-up spin did not finish"
+            $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$base*" } | Select-Object -First 1
+            $t0 = $fcp.TotalProcessorTime; $w0 = [DateTime]::Now
+            $vm.Send('timeout 5 sh -c "while :; do :; done"; echo SPUN')
+            if (-not $vm.WaitFor('(?m)^SPUN', 30)) {
+                $vm.Send('')
+                $echo = $vm.WaitFor('(?m)^SPUN', 10)
+                throw [Failure]::new("boot ${b}: a guest spinning 5 s under cpu.max=25000 100000 did not finish in 30 s (a keystroke after: $(if ($echo) { 'finished' } else { 'no echo' }); $(if ($vm.Text() -match 'APIC frequency too slow') { 'the guest disabled its APIC timer' } else { 'APIC timer kept' }))")
+            }
+            $fcp.Refresh()
+            $u = ($fcp.TotalProcessorTime - $t0).TotalSeconds / ([DateTime]::Now - $w0).TotalSeconds
+            Check ($u -le 0.4) "boot ${b}: cpu.max of a quarter CPU: Firecracker used $([math]::Round($u * 100))% of one CPU"
+            Check (-not ($vm.Text() -match 'APIC frequency too slow')) "boot ${b}: the guest disabled its APIC timer"
+            $used += [math]::Round($u * 100)
+            $vm.Send('reboot -ff')
+            [void]$vm.P.WaitForExit(15000)
+        } finally { Stop-Jailed }
     }
-    $vm = Start-JailedVm $base 'cpu' @('--cgroup-version', '2', '--cgroup', 'wick.cpu_cap=unsafe', '--cgroup', 'cpu.max=25000 100000')
-    try {
-        Wait-Shell $vm
-        $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$base*" } | Select-Object -First 1
-        $t0 = $fcp.TotalProcessorTime; $w0 = [DateTime]::Now
-        $vm.Send('timeout 5 sh -c "while :; do :; done"; echo SPUN')
-        if (-not $vm.WaitFor('(?m)^SPUN', 30)) {
-            $vm.Send('')
-            $echo = $vm.WaitFor('(?m)^SPUN', 10)
-            throw [Failure]::new("a guest spinning 5 s under cpu.max=25000 100000 did not finish in 30 s (a keystroke after: $(if ($echo) { 'finished' } else { 'no echo' }))")
-        }
-        $fcp.Refresh()
-        $used = ($fcp.TotalProcessorTime - $t0).TotalSeconds / ([DateTime]::Now - $w0).TotalSeconds
-        Check ($used -le 0.4) "cpu.max of a quarter CPU: Firecracker used $([math]::Round($used * 100))% of one CPU"
-        $vm.Send('reboot -ff')
-        "cpu.max=25000 100000 (unsafe opt-in) held a spinning guest to $([math]::Round($used * 100))% of a CPU"
-    } finally { Stop-Jailed }
+    "cpu.max=25000 100000: $Boots boots, each held to $($used -join '%, ')% of a CPU in a spin, APIC timer kept"
 }
 
 # --- run ----------------------------------------------------------------------

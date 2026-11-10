@@ -11,16 +11,13 @@
 //! | cgroup v2 | cgroup v1 | Job Object |
 //! |---|---|---|
 //! | `memory.max` | `memory.limit_in_bytes` | job memory limit (commit; the job's processes fail to allocate past it) |
-//! | `cpu.max` (`<quota> [<period>]`) | `cpu.cfs_quota_us`, `cpu.cfs_period_us` | CPU rate hard cap, `quota / period` CPUs of all the host's; refused for now (below) |
+//! | `cpu.max` (`<quota> [<period>]`) | `cpu.cfs_quota_us`, `cpu.cfs_period_us` | CPU rate hard cap, `quota / period` CPUs of all the host's, from Firecracker's third CPU-second on (below) |
 //! | `pids.max` | `pids.max` | active process limit |
 //!
-//! A CPU limit is refused for now: a guest that boots under the job's CPU
-//! rate hard cap can stop taking interrupts for good (about 1 run in 3 at a
-//! quarter of a CPU). Linux calibrates its LAPIC timer against the PIT at
-//! boot (a WHP partition has no TSC deadline timer, which lets a KVM guest
-//! skip that); throttled, it finds the timer far too slow and disables it
-//! ("APIC frequency too slow"). The same cap applied 2 s after Firecracker started
-//! never stalled. `--cgroup wick.cpu_cap=unsafe` accepts it, to measure it.
+//! The CPU rate cap starts once Firecracker has used two seconds of CPU
+//! time (`platform::CPU_CAP_GRACE_100NS`): a guest that boots under the cap
+//! calibrates its LAPIC timer while throttled, finds it far too slow and can
+//! stop taking interrupts for good.
 //!
 //! Every other controller and property is refused, never accepted without
 //! effect. Windows has no cgroup hierarchy, so the v2 hierarchy is a path that
@@ -44,9 +41,6 @@ pub struct CgroupConfigurationBuilder {
     /// cgroup v1's quota and period, combined at `build`.
     v1_quota_us: Option<Option<u64>>,
     v1_period_us: Option<u64>,
-    /// The CPU limit asked for, refused unless `wick.cpu_cap=unsafe`.
-    cpu_asked: Option<String>,
-    cpu_unsafe: bool,
 }
 
 impl CgroupConfigurationBuilder {
@@ -58,8 +52,6 @@ impl CgroupConfigurationBuilder {
                 limits: Limits::default(),
                 v1_quota_us: None,
                 v1_period_us: None,
-                cpu_asked: None,
-                cpu_unsafe: false,
             }),
             _ => Err(JailerError::CgroupInvalidVersion(ver.to_string())),
         }
@@ -73,12 +65,7 @@ impl CgroupConfigurationBuilder {
         _parent_cg: &Path,
     ) -> Result<(), JailerError> {
         let cg = || format!("{file}={value}");
-        if file.starts_with("cpu.") {
-            self.cpu_asked.get_or_insert_with(cg);
-        }
         match (self.version, file.as_str()) {
-            // The opt-in to the CPU rate cap (`tools/windows/jailer-test.ps1 -CpuCap`).
-            (_, "wick.cpu_cap") if value == "unsafe" => self.cpu_unsafe = true,
             (2, "memory.max") | (1, "memory.limit_in_bytes") => {
                 let unlimited = if self.version == 2 { value == "max" } else { value == "-1" };
                 self.limits.memory_bytes = if unlimited {
@@ -153,11 +140,7 @@ impl CgroupConfigurationBuilder {
     }
 
     pub fn build(self) -> CgroupConfiguration {
-        let refused = match (&self.cpu_asked, self.cpu_unsafe) {
-            (Some(cg), false) if self.limits.cpu_rate.is_some() => Some(cg.clone()),
-            _ => None,
-        };
-        CgroupConfiguration { limits: self.limits, refused }
+        CgroupConfiguration { limits: self.limits }
     }
 
     pub fn get_v2_hierarchy_path(&self) -> Result<&PathBuf, JailerError> {
@@ -171,15 +154,10 @@ impl CgroupConfigurationBuilder {
 #[derive(Debug)]
 pub struct CgroupConfiguration {
     limits: Limits,
-    /// A CPU limit refused at `setup` (see `HostError::CpuCapStalls`).
-    refused: Option<String>,
 }
 
 impl CgroupConfiguration {
     pub fn setup(&self) -> Result<(), JailerError> {
-        if let Some(cg) = &self.refused {
-            return Err(HostError::CpuCapStalls(cg.clone()).into());
-        }
         platform::set_limits(self.limits);
         Ok(())
     }
@@ -254,24 +232,6 @@ mod tests {
                 "{p}"
             );
         }
-    }
-
-    #[test]
-    fn test_cpu_limit_is_refused_unless_unsafe() {
-        let conf = |props: &[&str]| {
-            let mut b = CgroupConfigurationBuilder::new(2, "").unwrap();
-            for p in props {
-                let (f, v) = p.split_once('=').unwrap();
-                b.add_cgroup_property(f.into(), v.into(), "id", Path::new("fc")).unwrap();
-            }
-            b.build()
-        };
-        let refused = conf(&["cpu.max=25000 100000"]);
-        assert_eq!(refused.refused.as_deref(), Some("cpu.max=25000 100000"));
-        assert!(matches!(refused.setup().unwrap_err(), JailerError::Host(HostError::CpuCapStalls(_))));
-        assert!(conf(&["cpu.max=max"]).refused.is_none(), "no limit, nothing refused");
-        assert!(conf(&["wick.cpu_cap=unsafe", "cpu.max=25000 100000"]).refused.is_none());
-        assert!(conf(&["cpu.max=25000 100000", "wick.cpu_cap=unsafe"]).refused.is_none());
     }
 
     #[test]

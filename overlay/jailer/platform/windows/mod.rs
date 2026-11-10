@@ -33,7 +33,8 @@
 //!   grants full access, inherited, to the jail's SID, the user, SYSTEM and
 //!   the administrators; it has a low mandatory label.
 //! - **cgroups are a Job Object** ([`cgroup`](super::cgroup)): job memory
-//!   limit, CPU rate hard cap (refused for now, see `cgroup`), active process limit; the job kills
+//!   limit, CPU rate hard cap (from Firecracker's third CPU-second on, see
+//!   `CPU_CAP_GRACE_100NS`), active process limit; the job kills
 //!   Firecracker when the jailer goes and limits its UI access.
 //! - **No exec**: the jailer starts Firecracker suspended in the job with the
 //!   tokens, waits for it, removes the jail's drive and exits with its status.
@@ -53,7 +54,7 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, STILL_ACTIVE,
+    INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0,
     LocalFree, SetHandleInformation,
 };
 use windows_sys::Win32::Security::Authorization::{
@@ -188,13 +189,6 @@ pub enum HostError {
     UnsupportedCgroup(String),
     #[error("--cgroup {0}: {1}")]
     CgroupValue(String, &'static str),
-    #[error(
-        "--cgroup {0} is refused on Windows for now: under the Job Object CPU rate hard cap that \
-         would enforce it, a jailed guest can stop taking interrupts for good (measured on WHP: \
-         about 1 run in 3 at a quarter of a CPU; docs/ROADMAP.md, M5). The jailer never accepts \
-         a limit that breaks the microVM. To measure it, add --cgroup wick.cpu_cap=unsafe."
-    )]
-    CpuCapStalls(String),
     #[error(
         "--resource-limit {0} is not supported on Windows: {1}. The jailer never accepts a limit \
          it cannot enforce."
@@ -833,19 +827,61 @@ fn job(limits: Limits) -> Result<OwnedHandle, HostError> {
         std::mem::size_of_val(&ui),
         "the job's UI restrictions",
     )?;
-    if let Some(rate) = limits.cpu_rate {
-        // SAFETY: plain data.
-        let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
-        cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-        cpu.Anonymous.CpuRate = rate;
-        set(
+    // The CPU rate comes later (`cap_cpu_after_grace`).
+    Ok(job)
+}
+
+/// Firecracker's CPU time before the jailer caps it: a Linux guest
+/// calibrates its LAPIC timer against the PIT early in its boot (a WHP
+/// partition has no TSC deadline timer, which lets a KVM guest skip that),
+/// and throttled it finds the timer far too slow, disables it ("APIC frequency
+/// too slow") and can stop taking interrupts for good (measured: about 1 boot
+/// in 3 under a quarter of a CPU; with the cap applied after the boot, none).
+/// The calibration is over a fraction of a second into the boot. A grace in
+/// CPU time rather than in wall time is not Firecracker's to stretch: a
+/// microVM configured through the API long after the start uses next to no
+/// CPU until then, and whatever runs in the process is capped after this
+/// much, the guest's work included.
+const CPU_CAP_GRACE_100NS: u64 = 2 * 10_000_000;
+
+/// The CPU time `process` has used, in 100 ns units.
+fn cpu_time(process: HANDLE) -> u64 {
+    let mut times = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let [created, exited, kernel, user] = &mut times;
+    // SAFETY: four out-parameters.
+    if unsafe { GetProcessTimes(process, created, exited, kernel, user) } == 0 {
+        return u64::MAX;
+    }
+    let t = |f: &FILETIME| u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime);
+    t(kernel).saturating_add(t(user))
+}
+
+/// Waits for `process` to use its grace of CPU time, then applies the job's
+/// CPU rate hard cap. `Ok(false)` if the process ended first.
+fn cap_cpu_after_grace(job: &OwnedHandle, process: HANDLE, rate: u32) -> Result<bool, HostError> {
+    while cpu_time(process) < CPU_CAP_GRACE_100NS {
+        // SAFETY: our child; a bounded wait.
+        if unsafe { WaitForSingleObject(process, 20) } == WAIT_OBJECT_0 {
+            return Ok(false);
+        }
+    }
+    // SAFETY: plain data.
+    let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+    cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+    cpu.Anonymous.CpuRate = rate;
+    // SAFETY: a structure of the size passed, for this class.
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
             JobObjectCpuRateControlInformation,
             (&raw const cpu).cast(),
-            std::mem::size_of_val(&cpu),
-            "the job's CPU rate",
-        )?;
+            u32::try_from(std::mem::size_of_val(&cpu)).unwrap(),
+        )
+    } == 0
+    {
+        return Err(HostError::Spawn("the job's CPU rate", last_error()));
     }
-    Ok(job)
+    Ok(true)
 }
 
 /// A command line from arguments, quoted as the MSVC runtime parses them.
@@ -1061,6 +1097,12 @@ fn exec(
         return Err(kill("ResumeThread", last_error()));
     }
     drop(thread);
+    if let Some(rate) = LIMITS.lock().unwrap().cpu_rate {
+        if let Err(e) = cap_cpu_after_grace(&job, process.as_raw_handle(), rate) {
+            // A limit that could not be applied: Firecracker does not run without it.
+            return Err(kill("the job's CPU rate", io::Error::other(e.to_string())));
+        }
+    }
     // SAFETY: our child.
     unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
     let mut code = 1u32;

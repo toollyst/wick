@@ -74,7 +74,7 @@ The same as upstream Firecracker's
 | Jailer: chroot | upstream | **in place:** upstream's jailer; `chroot(2)`, entered by Firecracker right after the exec, and a Seatbelt file rule limited to the jail | **in place:** upstream's jailer; the jail as a drive letter of its own with the current directory its root, a protected directory ACL open to the jail's SID |
 | Jailer: network namespace | upstream | Seatbelt denies IP networking; `--netns` is refused | planned: Windows Filtering Platform (WHP refuses an AppContainer); `--netns` is refused |
 | Jailer: uid/gid | upstream | **in place:** dropped right after the chroot, checked that root cannot be regained | **in place:** a restricted, low-integrity token without the user's SID and with a random SID per jail: no access to the user's files, another jail, or other processes (measured) |
-| Jailer: cgroups (memory, CPU) | upstream | memory **in place** (jetsam limit, killed at the limit as by the OOM killer); CPU **in place** (`cpu.max` / `cpu.cfs_quota_us` → a kernel CPU limit on the whole VMM, throttled once it used its share of each second); other controllers refused | memory **in place** through a Job Object memory limit; CPU refused for now (the CPU rate hard cap can stall a jailed guest: see below); other controllers refused |
+| Jailer: cgroups (memory, CPU) | upstream | memory **in place** (jetsam limit, killed at the limit as by the OOM killer); CPU **in place** (`cpu.max` / `cpu.cfs_quota_us` → a kernel CPU limit on the whole VMM, throttled once it used its share of each second); other controllers refused | memory and CPU **in place** through a Job Object (memory limit; CPU rate hard cap from Firecracker's third CPU-second on, so a booting guest can calibrate its timer); other controllers refused |
 
 The sandbox is installed where upstream installs its seccomp filters and keeps upstream's flags: on by default, off
 with `--no-seccomp`. On macOS a process may lift its own CPU limit and the allow-list is what denies that, so a
@@ -97,11 +97,10 @@ upstream Firecracker and its jailer.
   has no network or PID namespaces: IP networking is denied by the sandbox, and a jailed VMM uses Unix socket
   endpoints in the jail (vmnet needs root). Firecracker starts as root and enters the jail before anything else
   runs (dyld cannot start a program inside a chroot), from a root-owned copy of the binary outside the jail.
-- **Windows jailer: no network confinement or CPU limits yet.** IP networking is not
+- **Windows jailer: no network confinement yet.** IP networking is not
   blocked (`--netns` is refused; the Windows Filtering Platform backend is planned). A plain low-integrity process
-  of the same user can still reach a jail, as only the user's SID tells it from the operator. CPU limits are refused:
-  under the Job Object CPU rate cap that would enforce them a jailed guest can stop taking interrupts (about 1 run
-  in 3 at a quarter of a CPU; roadmap M5). Without the jailer,
+  of the same user can still reach a jail, as only the user's SID tells it from the operator. A CPU limit starts after
+  Firecracker's first 2 seconds of CPU time (a guest booting under it disabled its timer; roadmap M5). Without the jailer,
   Windows confinement is a mitigation policy that blocks child processes only.
 - **No per-thread filters outside Linux.** Neither macOS nor Windows filters system calls per thread. Threads of a
   process share its address space, so the plan applies the union of upstream's filters process-wide and moves the
