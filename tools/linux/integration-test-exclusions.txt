@@ -1,0 +1,28 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Upstream integration tests that fail on plain upstream (patches/base, no
+# patches) on the CI runner. They still run, in the upstream baseline and in
+# wick alike; tools/linux/compare-integration-tests.py lists their results,
+# does not count an upstream failure of theirs against wick, and still fails
+# if one passes on upstream and not on wick. A test that passes on upstream
+# and fails on wick is a wick bug to fix, never an entry. The comparison
+# fails when an entry names no test of a file that ran.
+#
+# Format: <arch> <pytest node id, relative to tests/, or a test function for
+# all its parameters>, arch is x86_64, aarch64 or all; each entry below a
+# comment that says why upstream fails it there.
+
+# --- x86_64 (ubuntu-latest) ----------------------------------------------------
+#
+# The host's own CPU vulnerability state. GitHub's runners are Azure VMs:
+# their sysfs reports the host vulnerable (spec_store_bypass, retbleed,
+# tsx_async_abort "Clear CPU buffers attempted, no microcode; SMT Host state
+# unknown") and spectre-meltdown-checker flags the same in the guest (VARIANT
+# 4 "Your CPU doesn't support SSBD", RETBLEED AMD), so these fail on plain
+# upstream there (6 of 6, measured with the 6.1 guest on an AMD EPYC 7763
+# runner). Upstream runs them on AWS bare metal with current microcode.
+x86_64 integration_tests/security/test_vulnerabilities.py::test_spectre_meltdown_checker_on_host
+x86_64 integration_tests/security/test_vulnerabilities.py::test_vulnerabilities_on_host
+x86_64 integration_tests/security/test_vulnerabilities.py::test_check_vulnerability_files_ab
+x86_64 integration_tests/security/test_vulnerabilities.py::test_spectre_meltdown_checker_on_guest
