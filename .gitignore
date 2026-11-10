@@ -3,3 +3,4 @@
 .DS_Store
 # tools/macos/boot-test.sh results.
 /build/
+__pycache__/

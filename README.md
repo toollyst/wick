@@ -54,7 +54,7 @@ wick removes that limit without forking Firecracker in the usual sense:
 
 | Host | Hypervisor | Guests | Status |
 | --- | --- | --- | --- |
-| Linux x86_64, aarch64 | KVM | x86_64, aarch64 | **Upstream Firecracker** from the same source: the compatibility crates re-export the original crates, and the Linux backends are upstream's code |
+| Linux x86_64, aarch64 | KVM | x86_64, aarch64 | **Upstream Firecracker** from the same source: the compatibility crates re-export the original crates, and the Linux backends are upstream's code. CI runs upstream's unit and integration tests on plain upstream and on wick, on the same machine, and requires the same result test by test |
 | macOS 15+ on Apple silicon | Hypervisor.framework | aarch64 | **Works.** Checked end to end against upstream's CI guest by [`tools/macos/boot-test.sh`](tools/macos/boot-test.sh) |
 | Windows 10 (1803+) and 11, x86_64 | Windows Hypervisor Platform | x86_64 | **Preview.** Builds and links, and its POSIX layer is tested natively in CI; first boot on real hardware pending |
 
@@ -120,7 +120,7 @@ overlay/vmm/       new vmm modules (vmm::platform, vmm::ext), compiled into upst
 crates/compat/     Linux-only dependencies on macOS and Windows (libc, kvm-ioctls, vmm-sys-util, ...)
 crates/ext/        wick's own features, behind vmm::ext
 crates/version/    the version the binaries report
-tools/             setup, patch export and check, rebase, generators, boot tests, release
+tools/             setup, patch export and check, rebase, generators, Linux tests against upstream, boot tests, release
 ```
 
 ```text
