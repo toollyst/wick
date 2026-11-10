@@ -1,0 +1,15 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# wick's additions to lib/firecracker/.cargo/config.toml (cargo merges the
+# configs of every parent directory of where it runs).
+
+# Windows (MSVC): link the C runtime statically, so firecracker.exe runs on a
+# Windows install without the Visual C++ redistributable, as upstream's
+# static musl binaries run on any Linux. Target rustflags replace
+# build.rustflags, so upstream's flags are repeated here.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ccodegen-units=1", "-Ctarget-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-Ccodegen-units=1", "-Ctarget-feature=+crt-static"]
