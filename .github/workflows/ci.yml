@@ -9,13 +9,23 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly, with all of upstream's functional and security integration tests.
+  schedule:
+    - cron: "23 3 * * 1"
   workflow_dispatch:
+    inputs:
+      integration:
+        description: "Linux integration tests: the subset every push runs, or upstream's functional and security suites"
+        type: choice
+        options: [subset, full]
+        default: subset
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # A push does not cancel the weekly or a full run on the same branch.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.integration }}
   cancel-in-progress: true
 
 jobs:
@@ -55,6 +65,151 @@ jobs:
       - name: Build firecracker
         working-directory: lib/firecracker
         run: cargo build -p firecracker
+
+  # Upstream's unit tests as upstream's CI runs them (its development
+  # container, as root, musl, one test thread: tools/linux/unit-tests.sh),
+  # first for plain upstream at patches/base and then for wick, on the same
+  # machine. wick must match upstream test by test; tests that fail on plain
+  # upstream there are listed with the reason in
+  # tools/linux/unit-test-exclusions.txt. The x86_64 runner has KVM, the arm
+  # one does not.
+  linux-unit-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - run: tools/setup.sh
+      - name: Host
+        run: |
+          uname -a
+          df -h /
+          grep -m1 '^model name' /proc/cpuinfo || true
+          nproc
+          free -g
+          ls -l /dev/kvm || echo "no /dev/kvm on ${{ matrix.runner }}"
+      - name: Unit tests, plain upstream
+        run: tools/linux/unit-tests.sh upstream "$RUNNER_TEMP/unit/upstream"
+      - name: Unit tests, wick
+        run: tools/linux/unit-tests.sh wick "$RUNNER_TEMP/unit/wick"
+      - name: Compare wick with upstream
+        run: |
+          tools/linux/compare-unit-tests.py "$RUNNER_TEMP/unit/upstream" "$RUNNER_TEMP/unit/wick" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      # On Linux the compatibility crates re-export the original crates from
+      # their release tags: those must be the crates.io releases upstream uses.
+      - name: Dependency sources are upstream's crates.io releases
+        run: tools/linux/check-dependency-sources.py lib/firecracker/build/devctr-cache/git/checkouts
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-unit-tests-${{ runner.arch }}
+          path: |
+            ${{ runner.temp }}/unit/*/*.log
+            ${{ runner.temp }}/unit/*/*.json
+            ${{ runner.temp }}/unit/*/*.status
+            ${{ runner.temp }}/unit/*/arch
+            ${{ runner.temp }}/unit/*/cpu
+          if-no-files-found: warn
+          retention-days: 14
+
+  # A guest on KVM with the binary upstream would ship: tools/release.sh's
+  # musl release build (seccomp filters installed), booted by
+  # tools/linux/boot-test.sh with upstream's CI kernel and rootfs.
+  linux-boot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - run: tools/setup.sh
+      - name: Give the runner user /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Release build (upstream's tools/release.sh, musl)
+        run: tools/linux/devctr.sh --chown lib/firecracker/build -- ./tools/release.sh --libc musl --profile release
+      - name: Boot test
+        run: tools/linux/boot-test.sh --workdir "$RUNNER_TEMP/boot-test"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-boot-test
+          path: ${{ runner.temp }}/boot-test/results-*
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Upstream's integration tests (pytest) as upstream's devtool runs them
+  # (tools/linux/integration-tests.sh): plain upstream, then wick, on the same
+  # machine, compared test by test. Every push runs a subset (API, boot and
+  # serial, block, vsock, net, balloon, entropy, pause/resume, snapshots,
+  # userfaultfd, jailer, seccomp); the weekly run and a dispatch with
+  # integration=full run upstream's functional and security suites, as its
+  # PR pipeline does. Guest kernel 6.1 only (CONTRIBUTING.md, "Tests").
+  linux-integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.integration == 'full') && 150 || 75 }}
+    env:
+      SUITE: ${{ (github.event_name == 'schedule' || inputs.integration == 'full') && 'full' || 'subset' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - run: tools/setup.sh
+      - name: Host
+        run: |
+          uname -a
+          grep -m1 '^model name' /proc/cpuinfo
+          nproc
+          free -g
+          df -h /
+      - name: Select the tests
+        run: |
+          if [[ "$SUITE" == full ]]; then
+            tests="integration_tests/functional integration_tests/security"
+          else
+            tests="$(printf 'integration_tests/%s ' \
+              functional/test_api.py functional/test_drive_virtio.py functional/test_vsock.py \
+              functional/test_snapshot_basic.py functional/test_serial_io.py functional/test_shut_down.py \
+              functional/test_cmd_line_start.py functional/test_pause_resume.py functional/test_net.py \
+              functional/test_balloon.py functional/test_rng.py functional/test_uffd.py \
+              security/test_jail.py security/test_seccomp.py)"
+          fi
+          echo "TESTS=-n 4 --dist worksteal $tests" >>"$GITHUB_ENV"
+          echo "$SUITE: $tests"
+      - name: Integration tests, plain upstream
+        run: tools/linux/integration-tests.sh upstream "$RUNNER_TEMP/it/upstream" $TESTS
+      - name: Integration tests, wick
+        if: always()
+        run: tools/linux/integration-tests.sh wick "$RUNNER_TEMP/it/wick" $TESTS
+      - name: Compare wick with upstream
+        if: always()
+        run: |
+          tools/linux/compare-integration-tests.py "$RUNNER_TEMP/it/upstream" "$RUNNER_TEMP/it/wick" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-integration-tests-${{ env.SUITE }}
+          path: |
+            ${{ runner.temp }}/it/*/pytest.log
+            ${{ runner.temp }}/it/*/test-report.json
+            ${{ runner.temp }}/it/*/status
+            ${{ runner.temp }}/it/*/arch
+          if-no-files-found: warn
+          retention-days: 14
 
   # macOS (Apple silicon): build, lint and the compatibility crates' tests.
   # Booting a guest needs Hypervisor.framework, which hosted runners do not
