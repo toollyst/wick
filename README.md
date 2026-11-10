@@ -67,10 +67,11 @@ AWS_LC_SYS_NO_ASM=1 cargo build -p firecracker --target x86_64-pc-windows-gnu
 
 ```text
 lib/firecracker/   upstream Firecracker at patches/base (v1.18.0)
-patches/           14 feature patches: about 1,000 changed lines in 53 upstream files, plus Cargo.lock
+patches/           15 feature patches: about 1,000 changed lines in 62 upstream files, plus Cargo.lock
 overlay/vmm/       new vmm modules (vmm::ext, vmm::platform), compiled into upstream's crate
 crates/compat/     Linux-only dependencies on macOS and Windows (libc, kvm-ioctls, vmm-sys-util, ...)
 crates/ext/        wick's own features, behind vmm::ext
+crates/version/    the version the binaries report, <upstream>-wick.<N> (patches/base + patches/version)
 tools/             setup, patch export/check, rebase, generators, macOS run/test, Windows boot test and probe, release
 ```
 

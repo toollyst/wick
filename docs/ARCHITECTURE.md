@@ -23,11 +23,13 @@ sandbox manager ──(OCI-like spec)──▶ adapter (separate repository) ─
 ```
 lib/firecracker/      upstream Firecracker, a submodule pinned at patches/base
 patches/              the patch series applied to it (series, base, *.patch)
+                      and wick's release number (version)
 overlay/vmm/          modules compiled into upstream's vmm crate
     ext/              extension point and host sandbox      (vmm::ext)
     platform/         host facility interfaces and backends (vmm::platform)
 crates/compat/        compatibility builds of Linux-only dependencies
 crates/ext/           wick-ext: wick's features behind vmm::ext
+crates/version/       wick-version: the version the binaries report
 tools/                setup, patch workflow, generators, macOS run/test, Windows boot test and probe, release
 docs/                 this document and the roadmap
 ```
@@ -35,14 +37,14 @@ docs/                 this document and the roadmap
 `tools/setup.sh` checks out lib/firecracker at the release in `patches/base`
 and applies the series as commits on a local branch `wick`. Cargo always runs
 in lib/firecracker: it is the workspace, and its manifest (patched) lists
-`crates/compat/*` and `crates/ext` as members, so there is one workspace, one
-`Cargo.lock` and one set of lints.
+`crates/compat/*`, `crates/ext` and `crates/version` as members, so there is
+one workspace, one `Cargo.lock` and one set of lints.
 
 Code that is new rather than a change to an upstream file lives outside the
 submodule. The overlay modules are declared from upstream's `vmm/src/lib.rs`
 with `#[path = "../../../../../overlay/vmm/..."]`, so they are part of the vmm
 crate (`crate::` paths work) while their files belong to wick. The patches
-therefore only change existing upstream files: 14 feature patches touching 53
+therefore only change existing upstream files: 15 feature patches touching 62
 files.
 
 ## Layers

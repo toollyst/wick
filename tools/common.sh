@@ -29,6 +29,23 @@ upstream_base() {
     tr -d '[:space:]' <"$PATCHES_DIR/base"
 }
 
+# wick's release number on top of the upstream base (patches/version).
+wick_number() {
+    local n
+    n="$(tr -d '[:space:]' <"$PATCHES_DIR/version")" || die "cannot read patches/version"
+    [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "patches/version must hold wick's release number (1, 2, ...), not '$n'"
+    echo "$n"
+}
+
+# wick's version, <upstream>-wick.<N> (for example 1.18.0-wick.1). The binaries
+# report the same string (crates/version reads the same two files at build time).
+wick_version() {
+    local base n
+    base="$(upstream_base)"
+    n="$(wick_number)" || exit 1
+    echo "${base#v}-wick.$n"
+}
+
 # The patch files, in order (patches/series).
 series() {
     grep -v '^\s*\(#\|$\)' "$PATCHES_DIR/series"

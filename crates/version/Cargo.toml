@@ -1,0 +1,19 @@
+[package]
+workspace = "../../lib/firecracker"
+name = "wick-version"
+version = "0.1.0"
+authors = ["toollyst contributors"]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "wick's release version: upstream Firecracker's version plus wick's number."
+build = "build.rs"
+
+[lib]
+bench = false
+
+[dev-dependencies]
+semver = "1.0.28"
+
+[lints]
+workspace = true

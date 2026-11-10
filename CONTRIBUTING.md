@@ -92,11 +92,24 @@ version move with it.
 
 ## Releases
 
-Tags are `<upstream tag>-wick.<N>` (for example `v1.18.0-wick.1`), counting
-from 1 for each upstream tag, on commits of `main`. Pushing a tag runs the
-release workflow, which builds and packages the macOS binary
-(`tools/package-release.sh`). Hosted runners cannot run Hypervisor.framework
-guests, so run the L3 scenarios on a Mac before tagging.
+wick's version is upstream's plus wick's number: `<upstream>-wick.<N>` (for
+example `1.18.0-wick.1`, a valid semver string). The upstream part is
+`patches/base`; N is the only thing in `patches/version`. The binaries report
+it (`firecracker --version`, `GET /version`, and the jailer, snapshot-editor,
+rebase-snap and seccompiler-bin), through `crates/version`, which reads both
+files at build time. Format and compatibility versions stay upstream's: the
+snapshot format (`--snapshot-version`), the API specification, and
+cpu-template-helper, whose version is recorded in CPU fingerprints.
+
+N starts at 1 for each upstream tag (`tools/rebase.sh` resets it). For the
+next release on the same upstream, raise N in `patches/version` in a commit
+of its own on `main` (`release: 1.18.0-wick.2`) and tag that commit with the
+same version, `v1.18.0-wick.2`. Pushing a tag runs the release workflow,
+which refuses a tag that is not exactly `v` + the version from those two
+files, then builds and packages the macOS binary
+(`tools/package-release.sh`) and checks that it reports the tag. Hosted
+runners cannot run Hypervisor.framework guests, so run the L3 scenarios on a
+Mac before tagging.
 
 ## Tests
 

@@ -43,6 +43,12 @@ jobs:
           git fetch -q origin main
           git merge-base --is-ancestor "$(git rev-parse HEAD)" origin/main \
             || { echo "::error::$TAG is not on main"; exit 1; }
+      - name: Tag must be the version in patches/base and patches/version
+        run: |
+          source tools/common.sh
+          version="$(wick_version)"
+          [[ "$TAG" == "v$version" ]] \
+            || { echo "::error::$TAG is not v$version (patches/base + patches/version)"; exit 1; }
       - name: Apply and check the patch series
         run: |
           tools/setup.sh
@@ -58,7 +64,11 @@ jobs:
           bin="release-$TAG-darwin-aarch64/firecracker-$TAG-darwin-aarch64"
           codesign --verify --strict "$bin"
           codesign -d --entitlements - "$bin" 2>/dev/null | grep -q com.apple.security.hypervisor
-          "$bin" --version
+          reported="$("$bin" --version)"
+          echo "$reported"
+          reported="${reported%%$'\n'*}"
+          [[ "$reported" == "Firecracker $TAG" ]] \
+            || { echo "::error::the binary reports '$reported', not 'Firecracker $TAG'"; exit 1; }
           rm -rf "release-$TAG-darwin-aarch64"
       - name: Publish the release
         run: |

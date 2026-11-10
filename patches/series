@@ -14,3 +14,4 @@
 0012-tests-upstream-unit-tests-on-non-Linux-hosts.patch
 0013-examples-seccomp-and-uffd-examples-build-on-every-ho.patch
 0014-build-Cargo.lock-for-wick-s-dependencies.patch
+0015-version-binaries-report-upstream-wick.-N.patch

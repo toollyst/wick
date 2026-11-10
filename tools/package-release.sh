@@ -30,10 +30,11 @@ out="${2:-dist}"
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] \
     || die "needs macOS on Apple silicon"
 
-# The tag's upstream version must be the one wick tracks.
-base="$(upstream_base)"
-[[ "${tag%%-wick.*}" == "$base" ]] \
-    || die "tag $tag does not match the tracked upstream $base (patches/base)"
+# The tag must be the version the binary reports: the upstream release wick
+# tracks (patches/base) and wick's number (patches/version).
+version="$(wick_version)"
+[[ "$tag" == "v$version" ]] \
+    || die "tag $tag is not v$version (patches/base $(upstream_base), patches/version $(wick_number))"
 
 name="wick-$tag-darwin-aarch64"
 bin_name="firecracker-$tag-darwin-aarch64"
@@ -46,6 +47,11 @@ CARGO_TARGET_DIR="$target_dir" "$ROOT/tools/macos/run.sh" --build-only --release
 bin="$target_dir/release/firecracker"
 codesign -d --entitlements - "$bin" 2>/dev/null | grep -q com.apple.security.hypervisor \
     || die "$bin is not signed with the hypervisor entitlement"
+# The first line of `--version` (not `| head`, which can cut the writer off).
+reported="$("$bin" --version)"
+reported="${reported%%$'\n'*}"
+[[ "$reported" == "Firecracker $tag" ]] \
+    || die "$bin reports '$reported', not 'Firecracker $tag'"
 
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
