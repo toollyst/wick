@@ -1,0 +1,46 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fuzz targets for wick's own host-side code (CONTRIBUTING.md, "Fuzzing"), run
+# with cargo-fuzz through tools/fuzz.sh. Not part of any release.
+[package]
+name = "wick-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4.10"
+arbitrary = { version = "1.4.1", features = ["derive"] }
+libc = "0.2.189"
+
+# The compatibility crates Firecracker builds with (docs/ARCHITECTURE.md).
+[patch.crates-io]
+libc = { path = "../crates/compat/libc" }
+
+[[bin]]
+name = "vnet_segment"
+path = "fuzz_targets/vnet_segment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vnet_offload"
+path = "fuzz_targets/vnet_offload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uffd_protocol"
+path = "fuzz_targets/uffd_protocol.rs"
+test = false
+doc = false
+bench = false

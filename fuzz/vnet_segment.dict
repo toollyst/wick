@@ -1,0 +1,27 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# libFuzzer dictionary of vnet_segment: virtio-net header values and the
+# Ethernet, IP, TCP and UDP fields vnet reads.
+needs_csum="\x01"
+gso_tcpv4="\x01\x01"
+gso_udp="\x01\x03"
+gso_tcpv6="\x01\x04"
+gso_ecn="\x81"
+ethertype_ipv4="\x08\x00"
+ethertype_ipv6="\x86\xdd"
+vlan_8021q="\x81\x00"
+vlan_8021ad="\x88\xa8"
+ipv4_ihl5="\x45"
+ipv4_ihl15="\x4f"
+ipv6="\x60"
+proto_tcp="\x06"
+proto_udp="\x11"
+ipv6_hopopts="\x00"
+ipv6_routing="\x2b"
+ipv6_fragment="\x2c"
+ipv6_ah="\x33"
+ipv6_dstopts="\x3c"
+tcp_doff5="\x50"
+tcp_doff15="\xf0"
+tcp_fin_psh_cwr="\x89"

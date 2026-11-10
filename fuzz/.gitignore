@@ -1,0 +1,5 @@
+# cargo-fuzz output (tools/fuzz.sh).
+/target/
+/corpus/
+/artifacts/
+/coverage/
