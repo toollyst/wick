@@ -17,10 +17,12 @@
 //! install its seccomp filter installs it for the whole process; later calls do
 //! nothing.
 //!
-//! The macOS sandbox restricts what the process can ask the kernel for, not
-//! which paths it touches (guest images, snapshots and sockets are chosen by the
-//! operator at run time): no program execution, no fork, no IP networking, no
-//! Mach service lookups, no IOKit, no sysctl writes.
+//! The macOS sandbox restricts what the process can ask the kernel for: no
+//! program execution, no fork, no IP networking, no Mach service lookups, no
+//! IOKit, no sysctl writes. Started by the jailer ([`super::jail`]), it also
+//! limits files to the jail directory; without the jailer, files are not
+//! limited, as on Linux without the jailer (guest images, snapshots and
+//! sockets are chosen by the operator at run time).
 //!
 //! The Windows sandbox blocks child-process creation (the `exec`/`fork` escape
 //! vector) with a process mitigation policy. Network and filesystem confinement
@@ -47,7 +49,7 @@ pub enum SandboxError {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{PROFILE, apply, select};
+pub use macos::{FILES_ANYWHERE, PROFILE, apply, files_in_jail, profile, select};
 
 #[cfg(target_os = "windows")]
 pub use windows::{apply, select};
@@ -65,16 +67,18 @@ pub fn apply() -> Result<(), SandboxError> {
 #[cfg(target_os = "macos")]
 mod macos {
     use std::ffi::{CStr, c_char};
+    use std::path::Path;
     use std::sync::Mutex;
 
     use super::{Policy, SandboxError};
 
-    /// Seatbelt profile installed by default on macOS.
+    /// Seatbelt profile installed by default on macOS, after the file rule
+    /// ([`FILES_ANYWHERE`], or [`files_in_jail`] when the jailer started
+    /// Firecracker).
     pub const PROFILE: &str = r#"(version 1)
 (deny default)
-; Files: guest kernels, disks, snapshots, logs, metrics and the API socket are
-; chosen by the operator, also after start-up (hot-plug, snapshots).
-(allow file-read* file-write* file-ioctl)
+; Descriptors the process already holds (the console, inherited sockets).
+(allow file-ioctl)
 ; Unix sockets only: API server, vsock backends, console.
 (allow system-socket)
 (allow network-bind (local unix-socket))
@@ -87,6 +91,33 @@ mod macos {
 (allow process-info* (target self))
 (allow sysctl-read)
 "#;
+
+    /// File rule without the jailer: guest kernels, disks, snapshots, logs,
+    /// metrics and the API socket are chosen by the operator, also after
+    /// start-up (hot-plug, snapshots), as on Linux without the jailer.
+    pub const FILES_ANYWHERE: &str = "(allow file-read* file-write*)\n";
+
+    /// File rule in a jail: only the jail directory, by its path outside the
+    /// chroot (Seatbelt matches the real path of a file, and the chroot
+    /// already hides everything else; this also covers descriptors opened
+    /// before the chroot).
+    pub fn files_in_jail(root: &Path) -> Result<String, SandboxError> {
+        let root = root
+            .to_str()
+            .filter(|r| r.starts_with('/') && !r.contains(['\0', '\n']))
+            .ok_or_else(|| SandboxError::Install(format!("jail path {root:?}")))?;
+        let quoted = root.replace('\\', "\\\\").replace('"', "\\\"");
+        Ok(format!("(allow file-read* file-write* (subpath \"{quoted}\"))\n"))
+    }
+
+    /// The profile for this process.
+    pub fn profile() -> Result<String, SandboxError> {
+        let files = match crate::ext::jail::root() {
+            Some(root) => files_in_jail(root)?,
+            None => FILES_ANYWHERE.to_owned(),
+        };
+        Ok(format!("{PROFILE}{files}"))
+    }
 
     unsafe extern "C" {
         // libsystem_sandbox (part of libSystem). Deprecated in the SDK headers but
@@ -116,7 +147,15 @@ mod macos {
         if state.policy == Policy::None || state.installed {
             return Ok(());
         }
-        let profile = std::ffi::CString::new(PROFILE).expect("profile has no NUL");
+        install(&profile()?)?;
+        state.installed = true;
+        Ok(())
+    }
+
+    /// Installs `profile` for the whole process, permanently.
+    fn install(profile: &str) -> Result<(), SandboxError> {
+        let profile = std::ffi::CString::new(profile)
+            .map_err(|_| SandboxError::Install("profile contains NUL".into()))?;
         let mut err: *mut c_char = std::ptr::null_mut();
         // SAFETY: valid NUL-terminated profile and output pointer; flags 0 means
         // "the string is an SBPL profile".
@@ -135,7 +174,6 @@ mod macos {
             };
             return Err(SandboxError::Install(msg));
         }
-        state.installed = true;
         Ok(())
     }
 
@@ -147,16 +185,16 @@ mod macos {
 
         // The sandbox is permanent, so it is tested in a child process
         // (the test binary itself, filtered to the child test below).
-        #[test]
-        fn test_sandbox_restricts_child() {
+        fn run_child(name: &str, env: &[(&str, &str)]) {
             let exe = std::env::current_exe().unwrap();
             let out = Command::new(exe)
                 .args([
                     "--exact",
-                    "ext::sandbox::macos::tests::sandboxed_child",
+                    &format!("ext::sandbox::macos::tests::{name}"),
                     "--ignored",
                     "--nocapture",
                 ])
+                .envs(env.iter().copied())
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -166,6 +204,58 @@ mod macos {
                 String::from_utf8_lossy(&out.stderr)
             );
             assert!(stdout.contains("CHILD-OK"), "{stdout}");
+        }
+
+        #[test]
+        fn test_sandbox_restricts_child() {
+            run_child("sandboxed_child", &[]);
+        }
+
+        #[test]
+        fn test_jail_profile_limits_files() {
+            let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("wick-jail-profile-{}", std::process::id()));
+            let jail = base.join("a \"quoted\" jail");
+            std::fs::create_dir_all(&jail).unwrap();
+            std::fs::write(base.join("outside"), b"secret").unwrap();
+            std::fs::write(jail.join("inside"), b"guest").unwrap();
+            run_child("jailed_child", &[("WICK_TEST_JAIL", jail.to_str().unwrap())]);
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        #[test]
+        fn test_files_in_jail_rejects_bad_paths() {
+            for bad in ["relative", "/a\nb"] {
+                files_in_jail(Path::new(bad)).unwrap_err();
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_jail_profile_limits_files in a separate process"]
+        fn jailed_child() {
+            let jail = std::path::PathBuf::from(std::env::var("WICK_TEST_JAIL").unwrap());
+            let base = jail.parent().unwrap().to_owned();
+            // A descriptor opened before the sandbox stays usable.
+            let early = std::fs::File::open(base.join("outside")).unwrap();
+            install(&format!("{PROFILE}{}", files_in_jail(&jail).unwrap())).unwrap();
+            let denied = |e: std::io::Error| e.raw_os_error() == Some(libc::EPERM);
+            // Inside the jail: read, write, create, remove, Unix sockets.
+            assert_eq!(std::fs::read(jail.join("inside")).unwrap(), b"guest");
+            std::fs::write(jail.join("new"), b"x").unwrap();
+            std::fs::remove_file(jail.join("new")).unwrap();
+            let sock = jail.join("s");
+            let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            std::os::unix::net::UnixStream::connect(&sock).unwrap();
+            // Outside it: nothing, not even next to the jail.
+            assert!(denied(std::fs::read(base.join("outside")).unwrap_err()));
+            assert!(denied(std::fs::write(base.join("new"), b"x").unwrap_err()));
+            assert!(denied(std::fs::read("/etc/hosts").unwrap_err()));
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut &early, &mut buf).unwrap();
+            assert_eq!(buf, "secret");
+            println!("CHILD-OK");
         }
 
         #[test]

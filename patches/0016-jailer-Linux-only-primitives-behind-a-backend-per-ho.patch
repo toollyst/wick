@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 23:24:22 +0900
+Subject: [PATCH] jailer: Linux-only primitives behind a backend per host
+
+Why: upstream's jailer uses Linux-only primitives (pivot_root in a mount
+namespace, cgroup files, setns, clone(CLONE_NEWPID), device nodes, the
+exec as uid:gid, close_range), so it did not build on macOS and a macOS
+Firecracker ran with no jail: no chroot, no uid/gid drop, no memory
+limit.
+
+What: upstream's jailer (command line, Env::new, Env::run) runs
+unchanged on every host. Outside Linux its chroot and cgroup modules,
+and the Env steps that need Linux, are backends in overlay/jailer/
+platform; on Linux they stay upstream's. The macOS backend chroots with
+chroot(2), turns the memory cgroup into a jetsam limit, refuses what
+macOS cannot enforce (network and PID namespaces, other cgroup
+controllers), needs no device nodes, and, since no program can start
+inside a chroot on macOS (dyld), leaves the chroot for the exec only and
+hands the jail over: Firecracker calls vmm::ext::jail::enter first,
+which chroots into the same jail and drops to uid:gid. Upstream's tests
+of the Linux backend stay Linux-only; the macOS backend has its own.
+
+Test: `cargo test -p jailer` as root (as upstream's), and
+tools/macos/jailer-test.sh (refusals, uid/gid, chroot, files outside
+the jail, daemonize, jetsam limit and priority, a guest booted, snapshot
+and restored in jails, a guest past the memory limit killed).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/src/main.rs |  7 ++++
+ src/jailer/src/env.rs       | 64 +++++++++++++++++++++++++++++++++++--
+ src/jailer/src/main.rs      | 17 ++++++++++
+ 3 files changed, 85 insertions(+), 3 deletions(-)
+
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index e0db3b38293d78a325337c72f88e91ac757f72a1..e6e9f0bdd8477030559cd09647b16c64af9d5a83 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -86,6 +86,8 @@ enum MainError {
+     RunWithApi(ApiServerError),
+     /// RunWithoutApiError error: {0}
+     RunWithoutApiError(RunWithoutApiError),
++    /// Failed to enter the jail: {0}
++    Jail(vmm::ext::jail::JailError), // wick: the jailer's hand-over (macOS)
+ }
+ 
+ #[derive(Debug, thiserror::Error, displaydoc::Display)]
+@@ -125,6 +127,11 @@ fn main() -> ExitCode {
+ }
+ 
+ fn main_exec() -> Result<(), MainError> {
++    // wick: where no program can start inside a chroot (macOS), the jailer
++    // hands its jail over and Firecracker enters it first, before any other
++    // thread; without the jailer, and on Linux, this does nothing.
++    vmm::ext::jail::enter().map_err(MainError::Jail)?;
++
+     // Initialize the logger.
+     LOGGER.init().map_err(MainError::SetLogger)?;
+ 
+diff --git a/src/jailer/src/env.rs b/src/jailer/src/env.rs
+index 7c595058313f9cfc57a9850d2c3fbbf05ba5acd5..e7ff99b60d0fc39ed039b891a4d919c01dd58b0b 100644
+--- a/src/jailer/src/env.rs
++++ b/src/jailer/src/env.rs
+@@ -7,9 +7,12 @@ use std::io;
+ use std::io::Write;
+ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
+ use std::os::unix::io::AsRawFd;
++#[cfg(target_os = "linux")] // wick: the exec as uid:gid is Linux's backend
+ use std::os::unix::process::CommandExt;
+ use std::path::{Component, Path, PathBuf};
+-use std::process::{Command, Stdio, exit, id};
++#[cfg(target_os = "linux")] // wick: as above
++use std::process::{Command, Stdio};
++use std::process::{exit, id};
+ 
+ use utils::arg_parser::UtilsArgParserError::MissingValue;
+ use utils::time::{ClockType, get_time_us};
+@@ -87,6 +90,7 @@ fn dup2(old_fd: libc::c_int, new_fd: libc::c_int) -> Result<(), JailerError> {
+ // not use the CLONE_VM flag, this will result with the original stack replicated, in a similar
+ // manner to the fork syscall. The libc wrapper prevents use of a NULL stack pointer, so we will
+ // call the syscall directly.
++#[cfg(target_os = "linux")] // wick: PID namespaces (exec_into_new_pid_ns)
+ fn clone(child_stack: *mut libc::c_void, flags: libc::c_int) -> Result<libc::c_int, JailerError> {
+     SyscallReturnCode(
+         // SAFETY: This is safe because we are using a library function with valid parameters.
+@@ -355,6 +359,13 @@ impl Env {
+         Ok(())
+     }
+ 
++    // wick: outside Linux, PID namespaces are platform::new_pid_ns (overlay/jailer/platform).
++    #[cfg(not(target_os = "linux"))]
++    fn exec_into_new_pid_ns(&mut self, _chroot_exec_file: PathBuf) -> Result<(), JailerError> {
++        crate::platform::new_pid_ns()
++    }
++
++    #[cfg(target_os = "linux")]
+     fn exec_into_new_pid_ns(&mut self, chroot_exec_file: PathBuf) -> Result<(), JailerError> {
+         // https://man7.org/linux/man-pages/man7/pid_namespaces.7.html
+         // > a process in an ancestor namespace can send signals to the "init" process of a child
+@@ -450,6 +461,13 @@ impl Env {
+         Err(MiscDevParseError::NotFound)
+     }
+ 
++    // wick: outside Linux, device nodes are platform::mknod_and_own_dev.
++    #[cfg(not(target_os = "linux"))]
++    fn mknod_and_own_dev(&self, dev_path: &CStr, _major: u32, _minor: u32) -> Result<(), JailerError> {
++        crate::platform::mknod_and_own_dev(dev_path)
++    }
++
++    #[cfg(target_os = "linux")]
+     fn mknod_and_own_dev(
+         &self,
+         dev_path: &CStr,
+@@ -548,6 +566,13 @@ impl Env {
+         Ok(exec_file_name.to_owned())
+     }
+ 
++    // wick: outside Linux, network namespaces are platform::join_netns.
++    #[cfg(not(target_os = "linux"))]
++    fn join_netns(path: &str) -> Result<(), JailerError> {
++        crate::platform::join_netns(path)
++    }
++
++    #[cfg(target_os = "linux")]
+     fn join_netns(path: &str) -> Result<(), JailerError> {
+         // The fd backing the file will be automatically dropped at the end of the scope
+         let netns =
+@@ -559,6 +584,31 @@ impl Env {
+             .map_err(JailerError::SetNetNs)
+     }
+ 
++    // wick: outside Linux, the exec as uid:gid is platform::exec_command, with
++    // the same arguments.
++    #[cfg(not(target_os = "linux"))]
++    fn exec_command(&self, _chroot_exec_file: PathBuf) -> io::Error {
++        let mut args = vec![
++            "--id".to_string(),
++            self.id.clone(),
++            "--start-time-us".to_string(),
++            self.start_time_us.to_string(),
++            "--start-time-cpu-us".to_string(),
++            get_time_us(ClockType::ProcessCpu).to_string(),
++            "--parent-cpu-time-us".to_string(),
++            self.jailer_cpu_time_us.to_string(),
++        ];
++        args.extend(self.extra_args.iter().cloned());
++        crate::platform::exec_command(
++            &self.exec_file_path,
++            &self.chroot_dir,
++            self.uid(),
++            self.gid(),
++            &args,
++        )
++    }
++
++    #[cfg(target_os = "linux")]
+     fn exec_command(&self, chroot_exec_file: PathBuf) -> io::Error {
+         Command::new(chroot_exec_file)
+             .args(["--id", &self.id])
+@@ -630,7 +680,13 @@ impl Env {
+         Ok(())
+     }
+ 
+-    #[cfg(target_arch = "aarch64")]
++    // wick: outside Linux, the MIDR_EL1 file is platform::copy_midr_el1_info.
++    #[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
++    fn copy_midr_el1_info(&self) -> Result<(), JailerError> {
++        crate::platform::copy_midr_el1_info()
++    }
++
++    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+     fn copy_midr_el1_info(&self) -> Result<(), JailerError> {
+         use crate::readln_special;
+ 
+@@ -792,7 +848,9 @@ impl Env {
+     }
+ }
+ 
+-#[cfg(test)]
++// wick: upstream's tests use Linux's cgroup files, device numbers and MetadataExt;
++// the other hosts' backends have their own (overlay/jailer/platform).
++#[cfg(all(test, target_os = "linux"))]
+ mod tests {
+     #![allow(clippy::undocumented_unsafe_blocks)]
+ 
+diff --git a/src/jailer/src/main.rs b/src/jailer/src/main.rs
+index 30b3c91b53306f9f284c0e01c4e4c5db0ee11b69..95339d2b39c94a8dfd0cb4c74f7c9cb8018925a5 100644
+--- a/src/jailer/src/main.rs
++++ b/src/jailer/src/main.rs
+@@ -10,13 +10,21 @@ use env::PROC_MOUNTS;
+ use utils::arg_parser::{ArgParser, Argument, UtilsArgParserError as ParsingError};
+ use utils::time::{ClockType, get_time_us};
+ use utils::validators;
++#[cfg(target_os = "linux")] // wick: close_range is Linux-only
+ use vmm_sys_util::syscall::SyscallReturnCode;
+ 
+ use crate::env::Env;
+ 
++// wick: the jailer's Linux-only primitives have a backend per host
++// (overlay/jailer/platform); on Linux they are upstream's.
++#[cfg_attr(target_os = "macos", path = "../../../../../overlay/jailer/platform/macos/cgroup.rs")]
+ mod cgroup;
++#[cfg_attr(target_os = "macos", path = "../../../../../overlay/jailer/platform/macos/chroot.rs")]
+ mod chroot;
+ mod env;
++#[cfg(not(target_os = "linux"))]
++#[path = "../../../../../overlay/jailer/platform/mod.rs"]
++mod platform;
+ mod resource_limits;
+ 
+ // wick: wick's version, <upstream>[+wick.<N>] (crates/version); was CARGO_PKG_VERSION.
+@@ -153,6 +161,10 @@ pub enum JailerError {
+     UTF8Parsing(std::str::Utf8Error),
+     #[error("{}", format!("Failed to write to {:?}: {}", .0, .1).replace('\"', ""))]
+     Write(PathBuf, io::Error),
++    // wick: an option a host's backend cannot enforce, or a step of it that failed.
++    #[cfg(not(target_os = "linux"))]
++    #[error("{0}")]
++    Host(platform::HostError),
+ }
+ 
+ /// Create an ArgParser object which contains info about the command line argument parser and
+@@ -255,6 +267,11 @@ pub fn readln_special<T: AsRef<Path> + Debug>(file_path: &T) -> Result<String, J
+     Ok(line)
+ }
+ 
++// wick: outside Linux, close_range is platform::close_fds_by_close_range.
++#[cfg(not(target_os = "linux"))]
++use platform::close_fds_by_close_range;
++
++#[cfg(target_os = "linux")]
+ fn close_fds_by_close_range() -> Result<(), JailerError> {
+     // First try using the close_range syscall to close all open FDs in the range of 3..UINT_MAX
+     // SAFETY: if the syscall is not available then ENOSYS will be returned

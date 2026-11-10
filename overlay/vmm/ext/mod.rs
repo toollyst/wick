@@ -13,6 +13,7 @@
 //!
 //! See `docs/ARCHITECTURE.md`.
 
+pub mod jail;
 pub mod sandbox;
 
 use std::collections::BTreeMap;
