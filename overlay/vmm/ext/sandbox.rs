@@ -46,6 +46,8 @@ pub enum SandboxError {
     Install(String),
     /// Custom seccomp-BPF filters can only be enforced on Linux
     CustomFilterUnsupported,
+    /// The jail's CPU limit of {0}% holds only with the sandbox: without it Firecracker could lift the limit itself (unlike a cgroup's). Drop --no-seccomp or the CPU cgroup
+    CpuLimitNeedsSandbox(u8),
 }
 
 #[cfg(target_os = "macos")]
@@ -221,8 +223,16 @@ mod macos {
     /// Installs the selected sandbox if it is not installed yet.
     pub fn apply() -> Result<(), SandboxError> {
         let mut state = STATE.lock().unwrap();
-        if state.policy == Policy::None || state.installed {
+        if state.installed {
             return Ok(());
+        }
+        if state.policy == Policy::None {
+            // A process may lift its own CPU limit; only the system call
+            // allow-list denies it that.
+            return match crate::ext::jail::cpu_limit() {
+                Some(percent) => Err(SandboxError::CpuLimitNeedsSandbox(percent)),
+                None => Ok(()),
+            };
         }
         install(&profile()?)?;
         state.installed = true;
@@ -350,7 +360,11 @@ mod macos {
             for needed in ["read", "write", "mmap", "kevent", "bsdthread_create", "exit"] {
                 assert!(SYSCALLS.contains(&needed), "{needed}");
             }
-            for denied in ["fork", "vfork", "execve", "posix_spawn", "ptrace", "setuid", "chroot", "mount", "kill"] {
+            for denied in [
+                "fork", "vfork", "execve", "posix_spawn", "ptrace", "setuid", "chroot", "mount", "kill",
+                // Would lift the jail's CPU limit (ext::jail).
+                "process_policy", "ledger",
+            ] {
                 assert!(!SYSCALLS.contains(&denied), "{denied}");
             }
         }
