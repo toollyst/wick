@@ -348,6 +348,13 @@ jobs:
       - name: Build snapshot-editor
         working-directory: lib/firecracker
         run: cargo build --locked -p snapshot-editor --release
+      # Upstream's jailer with the Windows backend (overlay/jailer/platform):
+      # its tests (tokens, job limits) and the binary.
+      - name: Jailer tests and build
+        working-directory: lib/firecracker
+        run: |
+          cargo test --locked -p jailer
+          cargo build --locked -p jailer --release
       # The boot test's uffd stage serves a snapshot's pages with it.
       - name: Build the uffd page fault handler example
         working-directory: lib/firecracker
@@ -374,6 +381,7 @@ jobs:
           path: |
             lib/firecracker/build/cargo_target/release/firecracker.exe
             lib/firecracker/build/cargo_target/release/snapshot-editor.exe
+            lib/firecracker/build/cargo_target/release/jailer.exe
             lib/firecracker/build/cargo_target/release/examples/uffd_on_demand_handler.exe
             lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe
             winprobe.exe

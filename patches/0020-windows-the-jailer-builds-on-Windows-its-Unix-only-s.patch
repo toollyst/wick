@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qmfflwj <qmfflwj@gmail.com>
+Date: Wed, 11 Nov 2026 00:51:21 +0900
+Subject: [PATCH] windows: the jailer builds on Windows, its Unix-only steps
+ through platform
+
+The jailer's root declares wick_std as std, and its Windows backend
+(overlay/jailer/platform/windows) is the cgroup and chroot module there, as
+on macOS. Upstream's steps Windows has no form of go through it: a jailed
+folder and the copy of the binary get the jail's access instead of a mode
+and an owner, resource limits Windows cannot enforce are refused, and
+--daemonize is refused (no fork; the jailer waits for Firecracker). The
+resource limit tests that set and read limits are Linux's and macOS's.
+---
+ Cargo.lock                        |  2 ++
+ src/jailer/Cargo.toml             | 15 ++++++++++++++
+ src/jailer/src/env.rs             | 34 +++++++++++++++++++++++++++++++
+ src/jailer/src/main.rs            |  6 ++++++
+ src/jailer/src/resource_limits.rs | 14 ++++++++++++-
+ 5 files changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index fcbd9288282b5ffd059ea3639cca5ab87994906f..05c13b70f24dce00b5fbd4332736a6e51c0494e3 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -869,7 +869,9 @@ dependencies = [
+  "thiserror 2.0.20",
+  "utils",
+  "vmm-sys-util 0.15.0",
++ "wick-std",
+  "wick-version",
++ "windows-sys",
+ ]
+ 
+ [[package]]
+diff --git a/src/jailer/Cargo.toml b/src/jailer/Cargo.toml
+index 1950cefd06451e668ef1db85ffce9182f2b10242..fd167cf60d357b13afb425e831e90abb55a5fe44 100644
+--- a/src/jailer/Cargo.toml
++++ b/src/jailer/Cargo.toml
+@@ -25,5 +25,20 @@ utils = { path = "../utils" }
+ # wick: wick's release version, <upstream>[+wick.<N>] (crates/version).
+ wick-version = { path = "../../../../crates/version" }
+ 
++# wick: std::os::{unix, fd} on Windows (`extern crate wick_std as std` at the
++# root), and the Windows backend of the jailer (overlay/jailer/platform/windows:
++# restricted tokens, the jail's ACL and drive, the Job Object).
++[target.'cfg(windows)'.dependencies]
++wick-std = { path = "../../../../crates/compat/std" }
++windows-sys = { version = "0.61.2", features = [
++    "Win32_Foundation",
++    "Win32_Security",
++    "Win32_Security_Authorization",
++    "Win32_Storage_FileSystem",
++    "Win32_System_Console",
++    "Win32_System_JobObjects",
++    "Win32_System_Threading",
++] }
++
+ [lints]
+ workspace = true
+diff --git a/src/jailer/src/env.rs b/src/jailer/src/env.rs
+index e7ff99b60d0fc39ed039b891a4d919c01dd58b0b..127df72acf5741f850081ac9de865f75b4a9d280 100644
+--- a/src/jailer/src/env.rs
++++ b/src/jailer/src/env.rs
+@@ -1,11 +1,17 @@
+ // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++// wick: on Windows the Unix-only steps go through platform, leaving their
++// imports and helpers unused.
++#![cfg_attr(windows, allow(unused_imports, dead_code))]
++
+ use std::ffi::{CStr, CString, OsString};
+ use std::fs::{self, File, OpenOptions, Permissions, canonicalize, read_to_string};
+ use std::io;
+ use std::io::Write;
++#[cfg(not(windows))] // wick: Windows has no file modes or owners (platform)
+ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
++#[cfg(not(windows))] // wick: as above
+ use std::os::unix::io::AsRawFd;
+ #[cfg(target_os = "linux")] // wick: the exec as uid:gid is Linux's backend
+ use std::os::unix::process::CommandExt;
+@@ -500,6 +506,14 @@ impl Env {
+             })
+     }
+ 
++    // wick: on Windows a jailed folder's access is the jail's, inherited
++    // (platform::setup_jailed_folder): no mode or owner to set.
++    #[cfg(windows)]
++    fn setup_jailed_folder(&self, folder: impl AsRef<Path>) -> Result<(), JailerError> {
++        crate::platform::setup_jailed_folder(folder.as_ref())
++    }
++
++    #[cfg(not(windows))]
+     fn setup_jailed_folder(&self, folder: impl AsRef<Path>) -> Result<(), JailerError> {
+         let folder_path = folder.as_ref();
+         fs::create_dir_all(folder_path)
+@@ -521,6 +535,16 @@ impl Env {
+             .ok_or_else(|| JailerError::ExtractFileName(self.exec_file_path.clone()))?;
+         let jailer_exec_file_path = self.chroot_dir.join(exec_file_name);
+ 
++        // wick: on Windows the copy has no mode or owner; its access is the
++        // jail's (platform::copy_exec).
++        #[cfg(windows)]
++        {
++            crate::platform::copy_exec(&self.exec_file_path, &jailer_exec_file_path)?;
++            Ok(exec_file_name.to_owned())
++        }
++        #[cfg(not(windows))]
++        {
++
+         // We do a copy instead of a hard-link for 2 reasons
+         // 1. hard-linking is not possible if the file is in another device
+         // 2. while hardlinking would save up disk space and also memory by sharing parts of the
+@@ -564,6 +588,7 @@ impl Env {
+         })?;
+ 
+         Ok(exec_file_name.to_owned())
++        }
+     }
+ 
+     // wick: outside Linux, network namespaces are platform::join_netns.
+@@ -725,7 +750,15 @@ impl Env {
+             conf.setup()?;
+         }
+ 
++        // wick: Windows has no fork; the jailer stays while Firecracker runs
++        // (platform::daemonize refuses).
++        #[cfg(windows)]
++        if self.daemonize {
++            crate::platform::daemonize()?;
++        }
++
+         // If daemonization was requested, open /dev/null before chrooting.
++        #[cfg(not(windows))]
+         let dev_null = if self.daemonize {
+             Some(
+                 File::open("/dev/null")
+@@ -786,6 +819,7 @@ impl Env {
+         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
+ 
+         // Daemonize before exec, if so required (when the dev_null variable != None).
++        #[cfg(not(windows))] // wick: refused on Windows above
+         if let Some(dev_null) = dev_null {
+             // We follow the double fork method to daemonize the jailer referring to
+             // https://0xjet.github.io/3OHA/2022/04/11/post.html
+diff --git a/src/jailer/src/main.rs b/src/jailer/src/main.rs
+index 95339d2b39c94a8dfd0cb4c74f7c9cb8018925a5..5166fc5dbc0169bd3fbae2c8a28cc59048e36f98 100644
+--- a/src/jailer/src/main.rs
++++ b/src/jailer/src/main.rs
+@@ -1,6 +1,10 @@
+ // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++// wick: std::os::{unix, fd} on Windows from wick's POSIX layer.
++#[cfg(windows)]
++extern crate wick_std as std;
++
+ use std::ffi::{CString, NulError, OsString};
+ use std::fmt::{Debug, Display};
+ use std::path::{Path, PathBuf};
+@@ -18,8 +22,10 @@ use crate::env::Env;
+ // wick: the jailer's Linux-only primitives have a backend per host
+ // (overlay/jailer/platform); on Linux they are upstream's.
+ #[cfg_attr(target_os = "macos", path = "../../../../../overlay/jailer/platform/macos/cgroup.rs")]
++#[cfg_attr(windows, path = "../../../../../overlay/jailer/platform/windows/cgroup.rs")]
+ mod cgroup;
+ #[cfg_attr(target_os = "macos", path = "../../../../../overlay/jailer/platform/macos/chroot.rs")]
++#[cfg_attr(windows, path = "../../../../../overlay/jailer/platform/windows/chroot.rs")]
+ mod chroot;
+ mod env;
+ #[cfg(not(target_os = "linux"))]
+diff --git a/src/jailer/src/resource_limits.rs b/src/jailer/src/resource_limits.rs
+index 0ca4c3460dbbd70d4a90c113e1feedf52fbb968c..34be00a2613d9cc5d7bb2f9ab6eac57f65d15879 100644
+--- a/src/jailer/src/resource_limits.rs
++++ b/src/jailer/src/resource_limits.rs
+@@ -4,6 +4,7 @@
+ use std::fmt;
+ use std::fmt::{Display, Formatter};
+ 
++#[cfg(not(windows))] // wick: setrlimit (set_limit)
+ use vmm_sys_util::syscall::SyscallReturnCode;
+ 
+ use super::JailerError;
+@@ -16,6 +17,7 @@ pub(crate) const FSIZE_ARG: &str = "fsize";
+ pub(crate) const NO_FILE_ARG: &str = "no-file";
+ 
+ #[derive(Debug, Clone, Copy)]
++#[cfg_attr(windows, allow(dead_code))] // wick: set on Linux and macOS only
+ pub enum Resource {
+     // Size of created files.
+     RlimitFsize,
+@@ -90,6 +92,14 @@ impl Default for ResourceLimits {
+ }
+ 
+ impl ResourceLimits {
++    // wick: Windows cannot enforce these limits; the backend refuses explicit
++    // ones (platform::install_resource_limits).
++    #[cfg(windows)]
++    pub fn install(self) -> Result<(), JailerError> {
++        crate::platform::install_resource_limits(self.file_size, self.no_file, NO_FILE)
++    }
++
++    #[cfg(not(windows))]
+     pub fn install(self) -> Result<(), JailerError> {
+         if let Some(file_size) = self.file_size {
+             // Set file size limit.
+@@ -101,6 +111,7 @@ impl ResourceLimits {
+         Ok(())
+     }
+ 
++    #[cfg(not(windows))] // wick: Windows has no setrlimit (install above)
+     fn set_limit(resource: Resource, target: libc::rlim_t) -> Result<(), JailerError> {
+         let rlim: libc::rlimit = libc::rlimit {
+             rlim_cur: target,
+@@ -123,7 +134,8 @@ impl ResourceLimits {
+     }
+ }
+ 
+-#[cfg(test)]
++// wick: the limits these tests set and read back are not Windows' (platform).
++#[cfg(all(test, not(windows)))]
+ mod tests {
+     #![allow(clippy::undocumented_unsafe_blocks)]
+     use super::*;
