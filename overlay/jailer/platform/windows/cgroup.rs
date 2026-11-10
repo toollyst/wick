@@ -11,8 +11,13 @@
 //! | cgroup v2 | cgroup v1 | Job Object |
 //! |---|---|---|
 //! | `memory.max` | `memory.limit_in_bytes` | job memory limit (commit; the job's processes fail to allocate past it) |
-//! | `cpu.max` (`<quota> [<period>]`) | `cpu.cfs_quota_us`, `cpu.cfs_period_us` | CPU rate hard cap, `quota / period` CPUs of all the host's |
+//! | `cpu.max` (`<quota> [<period>]`) | `cpu.cfs_quota_us`, `cpu.cfs_period_us` | CPU rate hard cap, `quota / period` CPUs of all the host's, from Firecracker's third CPU-second on (below) |
 //! | `pids.max` | `pids.max` | active process limit |
+//!
+//! The CPU rate cap starts once Firecracker has used two seconds of CPU
+//! time (`platform::CPU_CAP_GRACE_100NS`): a guest that boots under the cap
+//! calibrates its LAPIC timer while throttled, finds it far too slow and can
+//! stop taking interrupts for good.
 //!
 //! Every other controller and property is refused, never accepted without
 //! effect. Windows has no cgroup hierarchy, so the v2 hierarchy is a path that

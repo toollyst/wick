@@ -78,8 +78,10 @@ pub(crate) fn time_scale(scaled_hz: u64, base_hz: u64) -> (i8, u32) {
     (shift, mul)
 }
 
-/// Applies a `(shift, mul)` from [`time_scale`] to `delta`.
-pub(crate) fn scale(delta: u64, shift: i8, mul: u32) -> u64 {
+/// Applies a `(shift, mul)` from [`time_scale`] to `delta`: what the guest
+/// computes; the tests check [`time_scale`] with it.
+#[cfg(test)]
+fn scale(delta: u64, shift: i8, mul: u32) -> u64 {
     let d = if shift >= 0 { delta << shift } else { delta >> -shift };
     ((u128::from(d) * u128::from(mul)) >> 32) as u64
 }
