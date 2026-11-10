@@ -27,6 +27,13 @@ use crate::platform::fs::HoleKeeper;
 /// `FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE`.
 const PUNCH_HOLE: libc::c_int = 0x03;
 
+/// APFS blocks are 4 KiB; NTFS frees sparse files in 64 KiB units.
+#[cfg(not(windows))]
+pub const HOLE_UNIT: usize = 4096;
+/// APFS blocks are 4 KiB; NTFS frees sparse files in 64 KiB units.
+#[cfg(windows)]
+pub const HOLE_UNIT: usize = 64 * 1024;
+
 /// Makes `file` keep holes: APFS files always do; a Windows file is made
 /// sparse.
 pub fn keep_holes(file: &File) -> io::Result<()> {

@@ -107,6 +107,13 @@ pub fn keep_holes(file: &File) -> io::Result<()> {
     super::backend::fs::keep_holes(file)
 }
 
+/// The smallest region a hole of a file can be: a write into part of one
+/// allocates all of it. The page on Linux and macOS; 64 KiB on Windows,
+/// where NTFS allocates sparse files in compression units. A diff snapshot
+/// writes whole units (`dump_dirty`), so that the pages it leaves out stay
+/// holes.
+pub const HOLE_UNIT: usize = super::backend::fs::HOLE_UNIT;
+
 /// Keeps track of a file's holes while it is written.
 pub trait HoleKeeper: Sized {
     /// Records the holes `file` has now.
