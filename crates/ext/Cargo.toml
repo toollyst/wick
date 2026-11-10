@@ -1,0 +1,18 @@
+[package]
+workspace = "../../lib/firecracker"
+name = "wick-ext"
+version = "0.1.0"
+authors = ["toollyst contributors"]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Features of wick, attached through vmm::ext."
+
+[lib]
+bench = false
+
+[dependencies]
+vmm = { path = "../../lib/firecracker/src/vmm" }
+
+[lints]
+workspace = true
