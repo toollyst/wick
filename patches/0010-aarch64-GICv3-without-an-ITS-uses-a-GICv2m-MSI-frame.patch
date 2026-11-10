@@ -1,0 +1,404 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 12:34:26 +0900
+Subject: [PATCH] aarch64: GICv3 without an ITS uses a GICv2m MSI frame
+
+Why: Hypervisor.framework's GICv3 has no ITS, which upstream needs for
+PCI MSI-X.
+
+What: the GICv3 layout follows Hypervisor.framework's, the ITS is
+optional, and without it MSIs go to the GIC's MSI frame, described in the
+FDT as `arm,gic-v2m-frame`. GIC state save/restore includes the frame's
+SPIs. With an ITS nothing changes.
+
+Test: `--enable-pci` with virtio-pci block and net devices on macOS, and a
+snapshot restore with PCI.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vmm/src/arch/aarch64/fdt.rs               |  9 +-
+ src/vmm/src/arch/aarch64/gic/gicv3/mod.rs     | 48 +++++++++-
+ .../arch/aarch64/gic/gicv3/regs/dist_regs.rs  | 96 ++++++++++++++++++-
+ .../src/arch/aarch64/gic/gicv3/regs/mod.rs    | 63 +++++++++---
+ 4 files changed, 196 insertions(+), 20 deletions(-)
+
+diff --git a/src/vmm/src/arch/aarch64/fdt.rs b/src/vmm/src/arch/aarch64/fdt.rs
+index 74791d2b6894650b99c246110fe227a972c3de6d..2797b2187ddbea4d4e65e24fd77e825da0e8de3c 100644
+--- a/src/vmm/src/arch/aarch64/fdt.rs
++++ b/src/vmm/src/arch/aarch64/fdt.rs
+@@ -336,7 +336,14 @@ fn create_gic_node(fdt: &mut FdtWriter, gic_device: &GICDevice) -> Result<(), Fd
+ 
+     if let Some(msi_properties) = gic_device.msi_properties() {
+         let msic_node = fdt.begin_node("msic")?;
+-        fdt.property_string("compatible", "arm,gic-v3-its")?;
++        // wick: a GIC without an ITS has a GICv2m-style MSI frame
++        // (Hypervisor.framework); see `GICv3::create`.
++        let compatible = if gic_device.its_fd().is_some() {
++            "arm,gic-v3-its"
++        } else {
++            "arm,gic-v2m-frame"
++        };
++        fdt.property_string("compatible", compatible)?;
+         fdt.property_null("msi-controller")?;
+         fdt.property_u32("phandle", MSI_PHANDLE)?;
+         fdt.property_array_u64("reg", msi_properties)?;
+diff --git a/src/vmm/src/arch/aarch64/gic/gicv3/mod.rs b/src/vmm/src/arch/aarch64/gic/gicv3/mod.rs
+index 5d131cf7b76e07eabf6eff683a417e3e13dfbe16..b5d8481ca373a24ee4e568220397f6949480d1f9 100644
+--- a/src/vmm/src/arch/aarch64/gic/gicv3/mod.rs
++++ b/src/vmm/src/arch/aarch64/gic/gicv3/mod.rs
+@@ -31,6 +31,11 @@ impl GICv3 {
+     const KVM_VGIC_V3_DIST_SIZE: u64 = GICv3::SZ_64K;
+     const KVM_VGIC_V3_REDIST_SIZE: u64 = (2 * GICv3::SZ_64K);
+     const GIC_V3_ITS_SIZE: u64 = 0x2_0000;
++    // wick: a GIC without an ITS may have a GICv2m-style MSI frame instead
++    // (Hypervisor.framework). Its `KVM_DEV_ARM_VGIC_GRP_ADDR` type is defined by
++    // wick's kvm-ioctls for macOS; KVM does not know it and rejects it.
++    const ADDR_TYPE_MSI_FRAME: u64 = 0x1000;
++    const MSI_FRAME_SIZE: u64 = 0x1_0000;
+ 
+     // Device trees specific constants
+     const ARCH_GIC_V3_MAINT_IRQ: u32 = 9;
+@@ -47,6 +52,11 @@ impl GICv3 {
+ 
+     /// Get the address of the GIC redistributors.
+     fn get_redists_addr(vcpu_count: u64) -> u64 {
++        // wick: Hypervisor.framework (macOS) reserves a fixed 32 MiB
++        // redistributor region that must not overlap the distributor.
++        if cfg!(target_os = "macos") {
++            return GICv3::get_dist_addr() - 0x200_0000;
++        }
+         GICv3::get_dist_addr() - GICv3::get_redists_size(vcpu_count)
+     }
+ 
+@@ -102,12 +112,13 @@ impl GICv3 {
+         }))
+     }
+ 
++    // wick: the ITS is optional (see `create`); without one there is no ITS state.
+     pub fn save_device(&self, mpidrs: &[u64]) -> Result<GicState, GicError> {
+-        regs::save_state(&self.fd, self.its_device.as_ref().unwrap(), mpidrs)
++        regs::save_state(&self.fd, self.its_device.as_ref(), mpidrs)
+     }
+ 
+     pub fn restore_device(&self, mpidrs: &[u64], state: &GicState) -> Result<(), GicError> {
+-        regs::restore_state(&self.fd, self.its_device.as_ref().unwrap(), mpidrs, state)
++        regs::restore_state(&self.fd, self.its_device.as_ref(), mpidrs, state)
+     }
+ 
+     pub fn init_device_attributes(gic_device: &Self) -> Result<(), GicError> {
+@@ -167,12 +178,43 @@ impl GICv3 {
+         Ok(())
+     }
+ 
++    // wick: places the MSI frame where the ITS would be, if the GIC has one.
++    // Returns its `reg` (address and size), or `None` for a GIC without one.
++    fn init_msi_frame(gic_device: &Self) -> Result<Option<[u64; 2]>, GicError> {
++        let attr = kvm_bindings::kvm_device_attr {
++            group: kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ADDR,
++            attr: Self::ADDR_TYPE_MSI_FRAME,
++            addr: 0,
++            flags: 0,
++        };
++        if gic_device.device_fd().has_device_attr(&attr).is_err() {
++            return Ok(None);
++        }
++        let addr = Self::get_msi_address(gic_device.vcpu_count());
++        Self::set_device_attribute(
++            gic_device.device_fd(),
++            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ADDR,
++            Self::ADDR_TYPE_MSI_FRAME,
++            &addr as *const u64 as u64,
++            0,
++        )?;
++        Ok(Some([addr, Self::MSI_FRAME_SIZE]))
++    }
++
+     /// Method to initialize the GIC device
+     pub fn create(vm: &VmFd, vcpu_count: u64) -> Result<Self, GicError> {
+         let mut device = Self::create_device(vm, vcpu_count)?;
+ 
+         Self::init_device_attributes(&device)?;
+-        Self::init_its(vm, &mut device)?;
++        // wick: the ITS is optional. Hypervisor.framework (macOS) has none;
++        // MSIs then go through its MSI frame, and without either no MSI
++        // controller is advertised to the guest.
++        match Self::init_its(vm, &mut device) {
++            Err(GicError::CreateGIC(err)) if err.errno() == libc::ENODEV => {
++                device.msi_properties = Self::init_msi_frame(&device)?
++            }
++            other => other?,
++        }
+ 
+         Self::finalize_device(&device)?;
+ 
+diff --git a/src/vmm/src/arch/aarch64/gic/gicv3/regs/dist_regs.rs b/src/vmm/src/arch/aarch64/gic/gicv3/regs/dist_regs.rs
+index 5a6eafb70038ec62d6a07f9954399e8f522b5dc5..223843f021190d7f451243304d746f06744e5ce5 100644
+--- a/src/vmm/src/arch/aarch64/gic/gicv3/regs/dist_regs.rs
++++ b/src/vmm/src/arch/aarch64/gic/gicv3/regs/dist_regs.rs
+@@ -56,6 +56,9 @@ pub struct SharedIrqReg {
+     offset: u64,
+     /// Number of bits per interrupt.
+     bits_per_irq: u8,
++    // wick: the interrupts covered, `(first, count)`: the wired SPIs, or the
++    // ones above them (see `get_msi_spi_regs`).
++    irqs: (u32, u32),
+ }
+ 
+ impl MmioReg for SharedIrqReg {
+@@ -64,9 +67,12 @@ impl MmioReg for SharedIrqReg {
+         // read-as-zero/write-ignore (RAZ/WI) policy.
+         // The first part of a shared-irq register, the one corresponding to the
+         // SGI and PPI IRQs (0-32) is RAZ/WI, so we skip it.
+-        let start = self.offset + u64::from(SPI_START) * u64::from(self.bits_per_irq) / 8;
++        // wick: the interrupts are `irqs` (SPI_START and GSI_LEGACY_NUM for
++        // the static list).
++        let (first, count) = self.irqs;
++        let start = self.offset + u64::from(first) * u64::from(self.bits_per_irq) / 8;
+ 
+-        let size_in_bits = u64::from(self.bits_per_irq) * u64::from(GSI_LEGACY_NUM);
++        let size_in_bits = u64::from(self.bits_per_irq) * u64::from(count);
+         let mut size_in_bytes = size_in_bits / 8;
+         if size_in_bits % 8 > 0 {
+             size_in_bytes += 1;
+@@ -90,6 +96,7 @@ impl DistReg {
+         DistReg::SharedIrq(SharedIrqReg {
+             offset,
+             bits_per_irq,
++            irqs: (SPI_START, GSI_LEGACY_NUM),
+         })
+     }
+ }
+@@ -126,6 +133,73 @@ pub(crate) fn set_dist_regs(fd: &DeviceFd, state: &[GicRegState<u32>]) -> Result
+     DistRegEngine::set_regs_data(fd, Box::new(VGIC_DIST_REGS.iter()), state, 0)
+ }
+ 
++// wick: a GIC without an ITS signals MSIs as SPIs, through a GICv2m-style
++// MSI frame (Hypervisor.framework; see `GICv3::create`). They are the SPIs
++// above the wired ones, so their state is not in `VGIC_DIST_REGS`. These are
++// the same per-interrupt registers for them, up to the last SPI the
++// distributor implements (`GICD_TYPER.ITLinesNumber`, at most 1019).
++const GICD_TYPER: u64 = 0x0004;
++
++/// Number of entries `get_dist_regs` returns.
++pub(crate) fn dist_regs_len() -> usize {
++    VGIC_DIST_REGS.len()
++}
++
++/// Number of entries `get_msi_spi_regs` returns.
++#[cfg(test)]
++pub(crate) const MSI_SPI_REGS: usize = 10;
++
++fn msi_spi_regs(fd: &DeviceFd) -> Result<Vec<DistReg>, GicError> {
++    let mut typer = 0u32;
++    let mut attr = DistRegEngine::kvm_device_attr(GICD_TYPER, &mut typer, 0);
++    // SAFETY: `attr` points to `typer`, which outlives the call.
++    unsafe { fd.get_device_attr(&mut attr) }
++        .map_err(|err| GicError::DeviceAttribute(err, false, DistRegEngine::group()))?;
++    let end = (32 * ((typer & 0x1f) + 1)).min(1020);
++    let first = SPI_START + GSI_LEGACY_NUM;
++    let count = end.saturating_sub(first);
++    Ok(VGIC_DIST_REGS
++        .iter()
++        .filter_map(|reg| match reg {
++            DistReg::SharedIrq(reg) => Some(DistReg::SharedIrq(SharedIrqReg {
++                offset: reg.offset,
++                bits_per_irq: reg.bits_per_irq,
++                irqs: (first, count),
++            })),
++            DistReg::Simple(_) => None,
++        })
++        .collect())
++}
++
++// wick: see `msi_spi_regs`.
++pub(crate) fn get_msi_spi_regs(fd: &DeviceFd) -> Result<Vec<GicRegState<u32>>, GicError> {
++    msi_spi_regs(fd)?
++        .iter()
++        .map(|reg| DistRegEngine::get_reg_data(fd, reg, 0))
++        .collect()
++}
++
++// wick: see `msi_spi_regs`. The state must cover the same SPIs.
++pub(crate) fn set_msi_spi_regs(fd: &DeviceFd, state: &[GicRegState<u32>]) -> Result<(), GicError> {
++    let regs = msi_spi_regs(fd)?;
++    let fits = regs.len() == state.len()
++        && regs
++            .iter()
++            .zip(state)
++            .all(|(reg, s)| reg.iter::<u32>().count() == s.chunks.len());
++    if !fits {
++        return Err(GicError::DeviceAttribute(
++            kvm_ioctls::Error::new(libc::EINVAL),
++            true,
++            DistRegEngine::group(),
++        ));
++    }
++    for (reg, data) in regs.iter().zip(state) {
++        DistRegEngine::set_reg_data(fd, reg, data, 0)?;
++    }
++    Ok(())
++}
++
+ #[cfg(test)]
+ mod tests {
+     #![allow(clippy::undocumented_unsafe_blocks)]
+@@ -164,6 +238,24 @@ mod tests {
+         std::mem::forget(gic_fd);
+     }
+ 
++    // wick: the MSI SPI registers are the shared-irq ones above the wired SPIs.
++    #[test]
++    fn test_msi_spi_regs() {
++        let shared = VGIC_DIST_REGS
++            .iter()
++            .filter(|r| matches!(r, DistReg::SharedIrq(_)))
++            .count();
++        assert_eq!(shared, MSI_SPI_REGS);
++        let reg = DistReg::SharedIrq(SharedIrqReg {
++            offset: 0x0100,
++            bits_per_irq: 1,
++            irqs: (SPI_START + GSI_LEGACY_NUM, 892),
++        });
++        // ISENABLER for SPIs 128..1019: bytes 16..128, 28 words.
++        assert_eq!(reg.range(), 0x0110..0x0180);
++        assert_eq!(reg.iter::<u32>().count(), 28);
++    }
++
+     #[test]
+     fn test_dist_constructors() {
+         let simple_dist_reg = DistReg::simple(0, 4);
+diff --git a/src/vmm/src/arch/aarch64/gic/gicv3/regs/mod.rs b/src/vmm/src/arch/aarch64/gic/gicv3/regs/mod.rs
+index 83c2705002a1156d3cf92a87e9c38c4f25631f5c..aece30df4bdfdbfa7d98f89cd7f303eff888068b 100644
+--- a/src/vmm/src/arch/aarch64/gic/gicv3/regs/mod.rs
++++ b/src/vmm/src/arch/aarch64/gic/gicv3/regs/mod.rs
+@@ -13,15 +13,18 @@ use crate::arch::aarch64::gic::GicError;
+ use crate::arch::aarch64::gic::regs::{GicState, GicVcpuState};
+ 
+ /// Save the state of the GIC device.
++// wick: a GIC may have no ITS (Hypervisor.framework); it then has no ITS state.
+ pub fn save_state(
+     gic_device: &DeviceFd,
+-    its_device: &DeviceFd,
++    its_device: Option<&DeviceFd>,
+     mpidrs: &[u64],
+ ) -> Result<GicState, GicError> {
+     // Flush redistributors pending tables to guest RAM.
+     super::save_pending_tables(gic_device)?;
+     // Flush ITS tables into guest memory.
+-    its_save_tables(its_device)?;
++    if let Some(its_device) = its_device {
++        its_save_tables(its_device)?;
++    }
+ 
+     let mut vcpu_states = Vec::with_capacity(mpidrs.len());
+     for mpidr in mpidrs {
+@@ -31,23 +34,37 @@ pub fn save_state(
+         })
+     }
+ 
+-    let its_state = ItsRegisterState::save(its_device)?;
++    let its_state = its_device.map(ItsRegisterState::save).transpose()?;
++
++    // wick: without an ITS, MSIs are SPIs above the wired ones; their
++    // distributor state follows the other registers.
++    let mut dist = dist_regs::get_dist_regs(gic_device)?;
++    if its_device.is_none() {
++        dist.extend(dist_regs::get_msi_spi_regs(gic_device)?);
++    }
+ 
+     Ok(GicState {
+-        dist: dist_regs::get_dist_regs(gic_device)?,
++        dist,
+         gic_vcpu_states: vcpu_states,
+-        its_state: Some(its_state),
++        its_state,
+     })
+ }
+ 
+ /// Restore the state of the GIC device.
++// wick: the ITS is optional, as in `save_state`.
+ pub fn restore_state(
+     gic_device: &DeviceFd,
+-    its_device: &DeviceFd,
++    its_device: Option<&DeviceFd>,
+     mpidrs: &[u64],
+     state: &GicState,
+ ) -> Result<(), GicError> {
+     dist_regs::set_dist_regs(gic_device, &state.dist)?;
++    // wick: the MSI SPIs saved by `save_state` for a GIC without an ITS.
++    if let Some(msi_spis) = state.dist.get(dist_regs::dist_regs_len()..)
++        && !msi_spis.is_empty()
++    {
++        dist_regs::set_msi_spi_regs(gic_device, msi_spis)?;
++    }
+ 
+     if mpidrs.len() != state.gic_vcpu_states.len() {
+         return Err(GicError::InconsistentVcpuCount);
+@@ -57,11 +74,18 @@ pub fn restore_state(
+         icc_regs::set_icc_regs(gic_device, *mpidr, &vcpu_state.icc)?;
+     }
+ 
+-    state
+-        .its_state
+-        .as_ref()
+-        .ok_or(GicError::MissingItsState)?
+-        .restore(its_device)
++    match (its_device, state.its_state.as_ref()) {
++        (Some(its_device), its_state) => its_state
++            .ok_or(GicError::MissingItsState)?
++            .restore(its_device),
++        (None, None) => Ok(()),
++        // ITS state, but no ITS to restore it to.
++        (None, Some(_)) => Err(GicError::DeviceAttribute(
++            kvm_ioctls::Error::new(libc::ENODEV),
++            true,
++            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CTRL,
++        )),
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -79,7 +103,8 @@ mod tests {
+         let vm = kvm.create_vm().unwrap();
+         let gic = create_gic(&vm, 1, Some(GICVersion::GICV3)).expect("Cannot create gic");
+         let gic_fd = gic.device_fd();
+-        let its_fd = gic.its_fd().unwrap();
++        // wick: the ITS is optional (none with Hypervisor.framework).
++        let its_fd = gic.its_fd();
+ 
+         let mpidr = vec![1];
+         let res = save_state(gic_fd, its_fd, &mpidr);
+@@ -88,13 +113,17 @@ mod tests {
+             format!("{:?}", res.unwrap_err()),
+             "DeviceAttribute(Error(22), false, 5)"
+         );
++        // wick: Hypervisor.framework has one VM per process.
++        drop(gic);
++        drop(vm);
+ 
+         let kvm = Kvm::new().unwrap();
+         let vm = kvm.create_vm().unwrap();
+         let _vcpu = vm.create_vcpu(0).unwrap();
+         let gic = create_gic(&vm, 1, Some(GICVersion::GICV3)).expect("Cannot create gic");
+         let gic_fd = gic.device_fd();
+-        let its_fd = gic.its_fd().unwrap();
++        // wick: as above.
++        let its_fd = gic.its_fd();
+ 
+         let vm_state = save_state(gic_fd, its_fd, &mpidr).unwrap();
+         let val: u32 = 0;
+@@ -115,7 +144,13 @@ mod tests {
+         let gicd_statusr = &vm_state.dist[1];
+ 
+         assert_eq!(gicd_statusr.chunks[0], val);
+-        assert_eq!(vm_state.dist.len(), 12);
++        // wick: without an ITS the MSI SPIs follow (see `save_state`).
++        let msi_spi_regs = if its_fd.is_none() {
++            dist_regs::MSI_SPI_REGS
++        } else {
++            0
++        };
++        assert_eq!(vm_state.dist.len(), 12 + msi_spi_regs);
+         restore_state(gic_fd, its_fd, &mpidr, &vm_state).unwrap();
+         restore_state(gic_fd, its_fd, &[1, 2], &vm_state).unwrap_err();
+     }
