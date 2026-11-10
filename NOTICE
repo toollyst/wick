@@ -1,0 +1,29 @@
+wick
+Copyright 2026 toollyst contributors.
+SPDX-License-Identifier: Apache-2.0
+
+wick builds Firecracker (https://github.com/firecracker-microvm/firecracker),
+included as the lib/firecracker submodule and changed only by the patches in
+patches/. wick is not affiliated with Amazon Web Services or the Firecracker
+project.
+
+Firecracker's notice follows:
+
+  Firecracker
+  Copyright 2017-2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+  SPDX-License-Identifier: Apache-2.0
+
+  Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
+  Use of this source code is governed by a BSD-style license that can be
+  found in the THIRD-PARTY file (lib/firecracker/THIRD-PARTY).
+
+  The Firecracker release bundle includes libseccomp which is available
+  under the LGPLv2.1 license. This is used in the Firecracker build process
+  to produce cBPF bytecode that is shipped alongside Firecracker for use by
+  the Linux kernel.
+
+crates/compat/ contains builds of rust-vmm crates (vm-memory, event-manager,
+vhost, kvm-bindings, kvm-ioctls, vmm-sys-util), libc, memfd, userfaultfd and
+micro_http. Each keeps its upstream license, stated in its Cargo.toml; the
+sources under crates/compat/*/src/windows/ are generated from the upstream
+crate by the scripts in tools/.

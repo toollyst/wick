@@ -1,0 +1,3 @@
+# Build output (cargo builds in lib/firecracker/build/).
+/dist/
+.DS_Store
