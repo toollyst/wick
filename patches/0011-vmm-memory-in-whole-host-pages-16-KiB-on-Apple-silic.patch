@@ -8,21 +8,24 @@ few places.
 
 What: test memory is laid out in whole host pages, the balloon releases
 whole host pages, and the userfaultfd page size is the host page size.
-Guest-visible layout is unchanged.
+Guest-visible layout is unchanged. On 4 KiB hosts, the only host page size
+upstream supports, the balloon passes every range to discard_range()
+unchanged, as upstream does (empty and overflowing ones included).
 
-Test: vmm unit tests on a 16 KiB-page host; balloon inflate/deflate.
+Test: vmm unit tests on a 16 KiB-page host; balloon inflate/deflate;
+balloon::util::tests::test_whole_host_pages for both page sizes.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/vmm/src/device_manager/mmio.rs            | 18 ++--
  src/vmm/src/devices/virtio/balloon/device.rs  | 94 +++++++++++--------
- src/vmm/src/devices/virtio/balloon/util.rs    | 43 +++++++++
+ src/vmm/src/devices/virtio/balloon/util.rs    | 54 +++++++++++
  .../src/devices/virtio/block/virtio/io/mod.rs | 18 +++-
  src/vmm/src/test_utils/mod.rs                 | 14 ++-
  src/vmm/src/vmm_config/machine_config.rs      |  5 +-
  src/vmm/src/vstate/memory.rs                  | 70 ++++++++++++--
  src/vmm/src/vstate/vm.rs                      |  4 +-
- 8 files changed, 209 insertions(+), 57 deletions(-)
+ 8 files changed, 220 insertions(+), 57 deletions(-)
 
 diff --git a/src/vmm/src/device_manager/mmio.rs b/src/vmm/src/device_manager/mmio.rs
 index 4590bc3a7055bb3a70aa9b981d15994676a2ce08..bb929117ce6d1395fd945d14e38c26ff5b83adda 100644
@@ -243,21 +246,26 @@ index 4008b154b7c901dcf73258a66191f5e06d83d4fd..f72f634905824c1a807b26ab84a04c59
          }
      }
 diff --git a/src/vmm/src/devices/virtio/balloon/util.rs b/src/vmm/src/devices/virtio/balloon/util.rs
-index 242af17131bb9c989eaea61bdf438fc7a8fba8e3..53b14fefb4046d978fb661be480e71ec1fe23838 100644
+index 242af17131bb9c989eaea61bdf438fc7a8fba8e3..60d4d366a5932b02a24943ff1d9aca084ed9b16e 100644
 --- a/src/vmm/src/devices/virtio/balloon/util.rs
 +++ b/src/vmm/src/devices/virtio/balloon/util.rs
-@@ -4,6 +4,21 @@
+@@ -4,6 +4,26 @@
  use super::MAX_PAGE_COMPACT_BUFFER;
  use crate::logger::error;
  
 +/// wick: the part of the byte range `[addr, addr + len)` to release. Memory can only be
 +/// released in host pages (16 KiB on Apple silicon and some Arm servers, while balloon pages
 +/// are 4 KiB): a range of whole balloon pages is trimmed to the whole host pages in it (`None`
-+/// if there are none; the rest stays in place). Other ranges are returned unchanged, so that
-+/// releasing them fails as before.
++/// if there are none; the rest stays in place). Other ranges, and every range when host pages
++/// are balloon pages (4 KiB, the only host page size upstream supports), are returned
++/// unchanged, so that releasing them succeeds or fails exactly as upstream's code does
++/// (an empty or overflowing range included).
 +pub(crate) fn whole_host_pages(addr: u64, len: u64, host_page: u64) -> Option<(u64, u64)> {
 +    const BALLOON_PAGE: u64 = 1 << super::VIRTIO_BALLOON_PFN_SHIFT;
-+    if !addr.is_multiple_of(BALLOON_PAGE) || !len.is_multiple_of(BALLOON_PAGE) {
++    if host_page <= BALLOON_PAGE
++        || !addr.is_multiple_of(BALLOON_PAGE)
++        || !len.is_multiple_of(BALLOON_PAGE)
++    {
 +        return Some((addr, len));
 +    }
 +    let start = addr.checked_next_multiple_of(host_page)?;
@@ -268,16 +276,22 @@ index 242af17131bb9c989eaea61bdf438fc7a8fba8e3..53b14fefb4046d978fb661be480e71ec
  /// This takes a vector of page frame numbers, and compacts them
  /// into ranges of consecutive pages. The result is a vector
  /// of (start_page_frame_number, range_length) pairs.
-@@ -67,6 +82,34 @@ mod tests {
+@@ -67,6 +87,40 @@ mod tests {
  
      use super::*;
  
 +    #[test]
 +    fn test_whole_host_pages() {
-+        // 4 KiB host pages: ranges are kept as they are.
++        // 4 KiB host pages: ranges are kept as they are, empty and overflowing ones too,
++        // so that upstream's discard_range() sees exactly what the guest sent.
 +        assert_eq!(
 +            whole_host_pages(0x1000, 0x1000, 0x1000),
 +            Some((0x1000, 0x1000))
++        );
++        assert_eq!(whole_host_pages(0x1000, 0, 0x1000), Some((0x1000, 0)));
++        assert_eq!(
++            whole_host_pages(0xffff_ffff_ffff_f000, 0x2000, 0x1000),
++            Some((0xffff_ffff_ffff_f000, 0x2000))
 +        );
 +        // 16 KiB host pages: only whole host pages are released.
 +        assert_eq!(whole_host_pages(0x1000, 0x1000, 0x4000), None);
