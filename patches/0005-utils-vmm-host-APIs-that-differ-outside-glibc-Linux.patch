@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 12:34:19 +0900
+Subject: [PATCH] utils, vmm: host APIs that differ outside glibc/Linux
+
+Why: a few call sites assume glibc or Linux behaviour that has a direct
+equivalent elsewhere.
+
+What: `tm_zone` initialisation that does not assume glibc's layout; the
+timerfd is read through libc on Windows; SIGRTMIN/SIGRTMAX without glibc;
+`open_file_nonblock` on Windows; read-only pmem files are mapped privately
+on macOS (Hypervisor.framework cannot map shared memory of a file
+opened read-only; a read-only device is never written, so a private
+mapping holds the same bytes).
+
+Test: utils and vmm unit tests on each host.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/utils/src/time.rs                     | 20 ++++++++++++++++++--
+ src/vmm/src/devices/virtio/pmem/device.rs | 12 ++++++++++--
+ src/vmm/src/utils/mod.rs                  | 18 ++++++++++++++++++
+ src/vmm/src/utils/signal.rs               | 12 ++++++++++--
+ 4 files changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/src/utils/src/time.rs b/src/utils/src/time.rs
+index f6935eb48c6b82f5e2f3a7c4b340c81d51020143..fe21516de6cc405ea03e4f752ddff725c4960fec 100644
+--- a/src/utils/src/time.rs
++++ b/src/utils/src/time.rs
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use std::fs::File;
++// wick: `Read` is unused on Windows (see `TimerFd::read`).
++#[cfg_attr(windows, allow(unused_imports))]
+ use std::io::{ErrorKind, Read};
+ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+ use std::time::{Duration, Instant};
+@@ -73,7 +75,7 @@ impl LocalTime {
+             tm_yday: 0,
+             tm_isdst: 0,
+             tm_gmtoff: 0,
+-            tm_zone: std::ptr::null(),
++            tm_zone: std::ptr::null_mut(), // wick: `*mut` on macOS, coerces to `*const` on Linux.
+         };
+ 
+         // SAFETY: Safe because the parameters are valid.
+@@ -293,7 +295,21 @@ impl TimerFd {
+             TimerFd::Mock(mock) => return mock.read(),
+         };
+         let mut buf = [0u8; size_of::<u64>()];
+-        match file.read(buf.as_mut_slice()) {
++        // wick: on Windows a timerfd is read through libc (std would read
++        // the timer handle as a file).
++        #[cfg(windows)]
++        let read = {
++            // SAFETY: valid descriptor and buffer of the given length.
++            let n = unsafe { libc::read(file.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
++            if n < 0 {
++                Err(std::io::Error::last_os_error())
++            } else {
++                Ok(n.unsigned_abs())
++            }
++        };
++        #[cfg(not(windows))]
++        let read = file.read(buf.as_mut_slice());
++        match read {
+             Ok(_) => u64::from_ne_bytes(buf),
+             Err(inner) if inner.kind() == ErrorKind::WouldBlock => 0,
+             Err(err) => panic!("TimerFd read failed: {err:#}"),
+diff --git a/src/vmm/src/devices/virtio/pmem/device.rs b/src/vmm/src/devices/virtio/pmem/device.rs
+index 92c33243f2768be7ab539899a068a4f71ab3ea07..1197d4745b64d7e977808ba929d2f1599ccb1ad9 100644
+--- a/src/vmm/src/devices/virtio/pmem/device.rs
++++ b/src/vmm/src/devices/virtio/pmem/device.rs
+@@ -195,6 +195,14 @@ impl PmemMmap {
+         }
+ 
+         let mmap_len = align_up!(file_len, Self::ALIGNMENT);
++        // wick: Hypervisor.framework cannot map shared memory of a file opened read-only.
++        // A read-only device is never written (by the guest or by us), so a private mapping
++        // holds the same bytes.
++        let file_share = if cfg!(target_os = "macos") && read_only {
++            libc::MAP_PRIVATE
++        } else {
++            libc::MAP_SHARED
++        };
+         let mmap_ptr = if mmap_len == file_len {
+             // SAFETY: We are calling the system call with valid arguments and checking the returned
+             // value
+@@ -203,7 +211,7 @@ impl PmemMmap {
+                     std::ptr::null_mut(),
+                     u64_to_usize(file_len),
+                     prot,
+-                    libc::MAP_SHARED | libc::MAP_NORESERVE,
++                    file_share | libc::MAP_NORESERVE,
+                     file.as_raw_fd(),
+                     0,
+                 );
+@@ -237,7 +245,7 @@ impl PmemMmap {
+                     mmap_ptr,
+                     u64_to_usize(file_len),
+                     prot,
+-                    libc::MAP_SHARED | libc::MAP_NORESERVE | libc::MAP_FIXED,
++                    file_share | libc::MAP_NORESERVE | libc::MAP_FIXED,
+                     file.as_raw_fd(),
+                     0,
+                 );
+diff --git a/src/vmm/src/utils/mod.rs b/src/vmm/src/utils/mod.rs
+index 642c7d980c76e4850827966f02a25746282b705c..decf9d1823decbd65ee2b923955b1f6a7bfbbfd5 100644
+--- a/src/vmm/src/utils/mod.rs
++++ b/src/vmm/src/utils/mod.rs
+@@ -10,6 +10,7 @@ pub mod signal;
+ 
+ use std::fs::{File, OpenOptions};
+ use std::num::Wrapping;
++#[cfg(not(windows))]
+ use std::os::unix::fs::OpenOptionsExt;
+ use std::path::Path;
+ 
+@@ -101,6 +102,23 @@ macro_rules! align_down {
+ /// will fail with ENXIO if there is no readier already attached to it.
+ /// NOTE: writing to a pipe will start failing when reaching 64K of unconsumed content.
+ pub fn open_file_nonblock(path: &Path) -> Result<File, std::io::Error> {
++    // wick: Windows cannot open non-blocking; the file is made non-blocking
++    // once open (a pipe gets `PIPE_NOWAIT`; files never block).
++    #[cfg(windows)]
++    {
++        use std::os::fd::AsRawFd;
++        let file = OpenOptions::new()
++            .create(true)
++            .read(true)
++            .write(true)
++            .open(path)?;
++        // SAFETY: fcntl on a descriptor we own.
++        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, O_NONBLOCK) } < 0 {
++            return Err(std::io::Error::last_os_error());
++        }
++        return Ok(file);
++    }
++    #[cfg(not(windows))]
+     OpenOptions::new()
+         .custom_flags(O_NONBLOCK)
+         .create(true)
+diff --git a/src/vmm/src/utils/signal.rs b/src/vmm/src/utils/signal.rs
+index 5178c7ec3c1d4d6c9d24184eff33d83229fe8a2b..be98b9a8bbc112934d04a333f280ab628087c400 100644
+--- a/src/vmm/src/utils/signal.rs
++++ b/src/vmm/src/utils/signal.rs
+@@ -5,6 +5,7 @@ use libc::c_int;
+ pub use vmm_sys_util::signal::*;
+ 
+ // SAFETY: these are valid libc functions
++#[cfg(target_os = "linux")]
+ unsafe extern "C" {
+     // SAFETY: Function has no invariants that can be broken.
+     safe fn __libc_current_sigrtmin() -> c_int;
+@@ -15,10 +16,17 @@ unsafe extern "C" {
+ 
+ /// Sigrtmin
+ pub fn sigrtmin() -> c_int {
+-    __libc_current_sigrtmin()
++    #[cfg(target_os = "linux")]
++    return __libc_current_sigrtmin();
++    // wick: no real-time signals outside Linux; vmm-sys-util maps them to SIGUSR1/SIGUSR2.
++    #[cfg(not(target_os = "linux"))]
++    return SIGRTMIN();
+ }
+ 
+ /// Sigrtmax
+ pub fn sigrtmax() -> c_int {
+-    __libc_current_sigrtmax()
++    #[cfg(target_os = "linux")]
++    return __libc_current_sigrtmax();
++    #[cfg(not(target_os = "linux"))]
++    return SIGRTMAX();
+ }

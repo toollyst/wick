@@ -4,3 +4,4 @@
 0002-build-Linux-only-dependencies-from-wick-s-compatibil.patch
 0003-windows-std-os-unix-fd-from-wick-std-at-the-crate-ro.patch
 0004-seccomp-install-the-host-sandbox-where-seccomp-BPF-d.patch
+0005-utils-vmm-host-APIs-that-differ-outside-glibc-Linux.patch
