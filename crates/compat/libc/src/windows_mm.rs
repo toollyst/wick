@@ -36,17 +36,28 @@
 //! - `mincore`: working-set residency (`QueryWorkingSetEx`);
 //! - `msync`: `FlushViewOfFile`, and `FlushFileBuffers` for `MS_SYNC`.
 //!
-//! `MAP_HUGETLB` fails with `ENOMEM`, as Linux does without huge pages.
+//! `MAP_HUGETLB` on anonymous private memory maps large pages
+//! (`MEM_LARGE_PAGES`, which needs `SeLockMemoryPrivilege`); see
+//! `map_large`. They are changed in whole large pages: `munmap` of part of
+//! one mapping and `MAP_FIXED` over it fail with `EINVAL`, and
+//! `MADV_DONTNEED` zeroes them in place. Everything else with `MAP_HUGETLB`
+//! fails with `ENOMEM`, as Linux does without huge pages.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::vec::Vec;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NOT_ALL_ASSIGNED, GetLastError,
+    HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Security::{
+    AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
 use windows_sys::Win32::System::Memory::{
+    GetLargePageMinimum, MEM_LARGE_PAGES,
     CreateFileMappingW, FlushViewOfFile, MEM_COMMIT, MEM_DECOMMIT, MEM_PRESERVE_PLACEHOLDER,
     MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
     MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_EXECUTE_READ,
@@ -57,7 +68,7 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::ProcessStatus::{
     PSAPI_WORKING_SET_EX_INFORMATION, QueryWorkingSetEx,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::windows_fd::{wick_fd, handle, set_errno};
 use crate::{c_int, c_uchar, c_void, off_t, size_t};
@@ -219,6 +230,11 @@ enum Kind {
         _section: Arc<Owned>,
         file: Option<Arc<Owned>>,
     },
+    /// Anonymous private memory on large pages of `page` bytes
+    /// (`MAP_HUGETLB`): committed and locked when mapped, never a
+    /// placeholder, and changed only in whole large pages, as Linux changes
+    /// hugetlb mappings only in whole huge pages.
+    Large { page: usize },
 }
 
 /// Sorted, disjoint (offset, len) ranges.
@@ -434,6 +450,8 @@ fn to_placeholder(t: &mut Table, base: usize) -> bool {
     let ok = unsafe {
         match r.kind {
             Kind::Placeholder => return true,
+            // Large pages cannot become a placeholder (MAP_FIXED over them).
+            Kind::Large { .. } => return false,
             Kind::Private { .. } => VirtualFree(
                 base as *mut c_void,
                 r.len,
@@ -463,7 +481,7 @@ fn release(t: &mut Table, base: usize) -> bool {
     // SAFETY: frees our allocation, view or placeholder.
     let ok = unsafe {
         match r.kind {
-            Kind::Placeholder | Kind::Private { .. } => {
+            Kind::Placeholder | Kind::Private { .. } | Kind::Large { .. } => {
                 VirtualFree(base as *mut c_void, 0, MEM_RELEASE)
             }
             Kind::View { .. } => UnmapViewOfFile2(
@@ -745,6 +763,118 @@ fn fill(
     Ok(())
 }
 
+/// Enables `SeLockMemoryPrivilege` ("Lock pages in memory") in the process
+/// token, once; large pages need it. An administrator grants it, as on
+/// Linux an administrator reserves huge pages.
+fn lock_memory_privilege() -> bool {
+    static HELD: OnceLock<bool> = OnceLock::new();
+    *HELD.get_or_init(|| {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: opens our own token.
+        if unsafe {
+            OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token)
+        } == 0
+        {
+            return false;
+        }
+        // SAFETY: an all-zero TOKEN_PRIVILEGES is valid.
+        let mut tp: TOKEN_PRIVILEGES = unsafe { std::mem::zeroed() };
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        let name: Vec<u16> = "SeLockMemoryPrivilege\0".encode_utf16().collect();
+        // SAFETY: valid name, LUID and privilege structures; `token` is ours.
+        let ok = unsafe {
+            LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut tp.Privileges[0].Luid) != 0
+                && AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut())
+                    != 0
+                // Succeeds without the privilege, and says so.
+                && GetLastError() != ERROR_NOT_ALL_ASSIGNED
+        };
+        // SAFETY: closes the token we opened.
+        unsafe { CloseHandle(token) };
+        ok
+    })
+}
+
+/// The size of a large page if `flags` asks for that size (or for the
+/// default, `MAP_HUGE_*` bits 0), else `None`.
+fn large_page(flags: c_int) -> Option<usize> {
+    // SAFETY: plain query.
+    let page = unsafe { GetLargePageMinimum() };
+    let log2 = (flags >> MAP_HUGE_SHIFT) & 0x3f;
+    (page != 0 && (log2 == 0 || 1usize.checked_shl(log2.cast_unsigned()) == Some(page))).then_some(page)
+}
+
+/// `mmap` with `MAP_HUGETLB`: anonymous private memory on large pages,
+/// committed now (Windows has no lazily faulted large pages; Linux fails a
+/// hugetlb mapping it cannot back at fault time instead). Shared and
+/// file-backed huge pages (hugetlbfs, `MFD_HUGETLB` memfds), huge pages at a
+/// fixed address and sizes other than the host's large page fail with
+/// `ENOMEM`, as Linux does without huge pages of that kind; so does a
+/// process without `SeLockMemoryPrivilege`, or a host out of contiguous
+/// memory.
+fn map_large(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int) -> Result<*mut c_void, c_int> {
+    let _ = addr; // a hint only, as for any mapping without MAP_FIXED
+    let wprot = win_prot(prot).ok_or(crate::EINVAL)?;
+    if flags & MAP_ANONYMOUS == 0 || flags & MAP_SHARED != 0 || flags & MAP_FIXED != 0 {
+        return Err(crate::ENOMEM);
+    }
+    let page = large_page(flags).ok_or(crate::ENOMEM)?;
+    if !lock_memory_privilege() {
+        return Err(crate::ENOMEM);
+    }
+    let len = len.div_ceil(page) * page;
+    // SAFETY: a new allocation; large pages are committed read-write.
+    let p = unsafe {
+        VirtualAlloc2(
+            proc(),
+            std::ptr::null(),
+            len,
+            MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if p.is_null() {
+        return Err(crate::ENOMEM);
+    }
+    if wprot != PAGE_READWRITE && !protect(p as usize, len, wprot) {
+        // SAFETY: frees the allocation just made.
+        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+        return Err(crate::ENOMEM);
+    }
+    table().lock().unwrap().insert(p as usize, Region::new(len, Kind::Large { page }));
+    Ok(p)
+}
+
+/// Zeroes [base, base + len) of a large-page mapping (whole large pages),
+/// keeping each run's protection.
+fn zero_large(base: usize, len: usize) -> bool {
+    let end = base + len;
+    let mut at = base;
+    while at < end {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: queries our memory.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            return false;
+        }
+        let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(end) - at;
+        let writable = mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_EXECUTE_READWRITE;
+        if !writable && !protect(at, run, PAGE_READWRITE) {
+            return false;
+        }
+        // SAFETY: our committed memory, writable now.
+        unsafe { std::ptr::write_bytes(at as *mut u8, 0, run) };
+        if !writable && !protect(at, run, mbi.Protect) {
+            return false;
+        }
+        at += run;
+    }
+    true
+}
+
 /// `mmap`.
 ///
 /// # Safety
@@ -763,7 +893,10 @@ pub unsafe fn mmap(
         return fail(crate::EINVAL, MAP_FAILED);
     }
     if flags & MAP_HUGETLB != 0 {
-        return fail(crate::ENOMEM, MAP_FAILED);
+        return match map_large(addr, len, prot, flags) {
+            Ok(p) => p,
+            Err(e) => fail(e, MAP_FAILED),
+        };
     }
     let anon = flags & MAP_ANONYMOUS != 0;
     #[allow(clippy::cast_sign_loss)]
@@ -865,6 +998,13 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
     }
     let end = start + len.div_ceil(PAGE) * PAGE;
     let mut t = table().lock().unwrap();
+    // Large pages go back whole: refused before anything changes.
+    for b in overlapping(&t, start, end) {
+        let r = &t[&b];
+        if matches!(r.kind, Kind::Large { .. }) && (start > b || end < b + r.len) {
+            return fail(crate::EINVAL, -1);
+        }
+    }
     if !carve(&mut t, start, end) {
         return fail(crate::EINVAL, -1);
     }
@@ -876,7 +1016,7 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
             continue;
         }
         match r.kind {
-            Kind::Placeholder => unreachable!("carved"),
+            Kind::Placeholder | Kind::Large { .. } => unreachable!("carved or refused"),
             Kind::Private { .. } => {
                 // SAFETY: decommits part of our allocation.
                 unsafe { VirtualFree(s as *mut c_void, e - s, MEM_DECOMMIT) };
@@ -924,6 +1064,14 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
                         return fail(crate::ENOMEM, -1);
                     }
                     t.get_mut(&b).unwrap().kind = Kind::Private { file: None };
+                }
+            }
+            Kind::Large { page } => {
+                if !(s - b).is_multiple_of(page) || !(e - b).is_multiple_of(page) {
+                    return fail(crate::EINVAL, -1);
+                }
+                if !protect(s, e - s, wprot) {
+                    return fail(crate::EACCES, -1);
                 }
             }
             Kind::Private { .. } | Kind::View { .. } => {
@@ -994,6 +1142,17 @@ pub unsafe fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
     for b in overlapping(&t, start, end) {
         let r = &t[&b];
         let (s, e) = (start.max(b), end.min(b + r.len));
+        if let Kind::Large { page } = r.kind {
+            // Locked large pages cannot be dropped: they are zeroed in place,
+            // whole pages only, as Linux drops whole huge pages.
+            if !(s - b).is_multiple_of(page) || !(e - b).is_multiple_of(page) {
+                return fail(crate::EINVAL, -1);
+            }
+            if !zero_large(s, e - s) {
+                return fail(crate::EACCES, -1);
+            }
+            continue;
+        }
         let Kind::Private { file } = &r.kind else {
             continue;
         };
@@ -1378,24 +1537,50 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    fn hugetlb(len: usize, prot: c_int, flags: c_int) -> Result<usize, c_int> {
+        // SAFETY: a new mapping, or a failure.
+        let p = unsafe { mmap(std::ptr::null_mut(), len, prot, flags | MAP_HUGETLB, -1, 0) };
+        if p == MAP_FAILED {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+        } else {
+            Ok(p as usize)
+        }
+    }
+
     #[test]
     fn test_hugetlb_refused() {
         let _serial = serial();
-        // SAFETY: fails.
-        let p = unsafe {
-            mmap(
-                std::ptr::null_mut(),
-                2 << 20,
-                PROT_READ,
-                ANON | MAP_HUGETLB | MAP_HUGE_2MB,
-                -1,
-                0,
-            )
+        let shared = MAP_SHARED | MAP_ANONYMOUS;
+        assert_eq!(hugetlb(2 << 20, PROT_READ, shared | MAP_HUGE_2MB), Err(crate::ENOMEM));
+        assert_eq!(hugetlb(1 << 30, PROT_READ, ANON | MAP_HUGE_1GB), Err(crate::ENOMEM));
+        assert_eq!(hugetlb(2 << 20, 0x40, ANON), Err(crate::EINVAL));
+    }
+
+    #[test]
+    fn test_hugetlb() {
+        let _serial = serial();
+        let page = match hugetlb(3 << 20, PROT_READ | PROT_WRITE, ANON | MAP_HUGE_2MB) {
+            // Without "Lock pages in memory", as Linux without huge pages.
+            Err(e) => {
+                assert_eq!(e, crate::ENOMEM);
+                return;
+            }
+            Ok(p) => p,
         };
-        assert_eq!(p, MAP_FAILED);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(crate::ENOMEM)
-        );
+        let large = large_page(MAP_HUGE_2MB).unwrap();
+        assert!(page.is_multiple_of(large));
+        // SAFETY: our 4 MiB (two large pages) mapping.
+        unsafe {
+            *(page as *mut u8) = 7;
+            *((page + (4 << 20) - 1) as *mut u8) = 9;
+            assert_eq!(munmap(page as *mut c_void, large), -1, "part of a large-page mapping");
+            assert_eq!(madvise(page as *mut c_void, PAGE, MADV_DONTNEED), -1, "part of a large page");
+            assert_eq!(madvise(page as *mut c_void, large, MADV_DONTNEED), 0);
+            assert_eq!(*(page as *const u8), 0);
+            assert_eq!(*((page + (4 << 20) - 1) as *const u8), 9);
+            assert_eq!(mprotect(page as *mut c_void, large, PROT_READ), 0);
+            assert_eq!(mprotect(page as *mut c_void, PAGE, PROT_READ), -1);
+            assert_eq!(munmap(page as *mut c_void, 4 << 20), 0);
+        }
     }
 }
