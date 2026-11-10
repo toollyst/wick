@@ -1,0 +1,41 @@
+# Compatibility build of userfaultfd for wick (docs/ARCHITECTURE.md).
+# On Linux it re-exports the original crate unchanged. On macOS it implements the
+# API with the kernel side in wick's libc (wick_uffd).
+[package]
+workspace = "../../../lib/firecracker"
+name = "userfaultfd"
+version = "0.9.0"
+authors = ["toollyst contributors"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "userfaultfd 0.9.0: the original crate on Linux, an implementation on macOS."
+
+[lib]
+bench = false
+
+[features]
+default = []
+linux4_14 = ["upstream/linux4_14"]
+linux5_7 = ["upstream/linux5_7"]
+linux5_13 = ["upstream/linux5_13"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Same source as the crates.io 0.9.0 release (src/ is identical, checked 2026-11-09).
+upstream = { package = "userfaultfd", git = "https://github.com/bytecodealliance/userfaultfd-rs", tag = "v0.9.0" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+bitflags = "2.4.0"
+thiserror = "1.0.4"
+libc = { version = "0.2.186", features = ["extra_traits"] }
+nix = { version = "0.27", default-features = false }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "macos")))'.dependencies]
+bitflags = "2.4.0"
+thiserror = "1.0.4"
+# The original crate enables libc's `extra_traits` (through nix); keep the same
+# libc feature set on every host so code relying on it (e.g. `iovec: PartialEq`) builds.
+libc = { version = "0.2.186", features = ["extra_traits"] }
+
+[target.'cfg(windows)'.dependencies]
+wick-os = { path = "../os" }
