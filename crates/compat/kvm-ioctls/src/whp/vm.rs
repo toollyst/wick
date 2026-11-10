@@ -92,6 +92,11 @@ pub(crate) struct VmInner {
     ioevents: RwLock<Vec<IoEvent>>,
     irqfds: Mutex<Vec<IrqFd>>,
     pub(crate) irqchip: Mutex<Irqchip>,
+    /// kvm-clock: the VM-wide reference and the wall clock MSR.
+    pub(crate) pvclock: Mutex<super::pvclock::State>,
+    /// Whether the partition has a TSC-deadline local APIC timer
+    /// (`TscDeadlineTmrSupport`, processor features bank 1 bit 17).
+    pub(crate) tsc_deadline: bool,
     pub(crate) vcpus: Mutex<Vec<Weak<VcpuShared>>>,
     /// The irqfd watcher thread wakes on this to stop (with `stop` set) or
     /// to watch the irqfds registered since it last looked.
@@ -232,6 +237,68 @@ impl VmInner {
                 &count,
             )?;
         }
+        // The speculation controls (IA32_SPEC_CTRL, IA32_PRED_CMD: IBRS,
+        // STIBP, IBPB, SSBD), which a partition's default processor features
+        // lack (measured on WHP): KVM gives a guest the host's, and a Linux
+        // guest that CPUID tells about IBPB takes a #GP on its first IBPB
+        // without them. They make every VM exit costlier, which only matters
+        // to a guest that times itself against exits (TSC calibration against
+        // the PIT); a guest with kvm-clock (`pvclock`) does not.
+        const SPECULATION_CONTROLS: u64 = (1 << 44) | (1 << 45) | (1 << 46) | (1 << 48);
+        let mut written = 0u32;
+        let mut cap: whv::WHV_PROCESSOR_FEATURES_BANKS = whv::WHV_PROCESSOR_FEATURES_BANKS::default();
+        let mut banks: whv::WHV_PROCESSOR_FEATURES_BANKS = whv::WHV_PROCESSOR_FEATURES_BANKS::default();
+        let size = u32::try_from(core::mem::size_of_val(&banks)).unwrap();
+        // SAFETY: output buffers of the size passed.
+        let got = unsafe {
+            whv::WHvGetCapability(
+                whv::WHvCapabilityCodeProcessorFeaturesBanks,
+                (&raw mut cap).cast(),
+                size,
+                &mut written,
+            ) >= 0
+                && whv::WHvGetPartitionProperty(
+                    part,
+                    whv::WHvPartitionPropertyCodeProcessorFeaturesBanks,
+                    (&raw mut banks).cast(),
+                    size,
+                    &mut written,
+                ) >= 0
+        };
+        // SAFETY: plain data; bank 1 is the second word.
+        let tsc_deadline =
+            got && banks.BanksCount > 1 && unsafe { banks.Anonymous.AsUINT64[1] } & (1 << 17) != 0;
+        if got && banks.BanksCount > 0 {
+            // SAFETY: plain data; bank 0 is the first word of both.
+            unsafe {
+                banks.Anonymous.AsUINT64[0] |= cap.Anonymous.AsUINT64[0] & SPECULATION_CONTROLS;
+            }
+            // SAFETY: the structure read from the partition, with bits added.
+            unsafe {
+                ffi::set_partition_property(
+                    part,
+                    whv::WHvPartitionPropertyCodeProcessorFeaturesBanks,
+                    &banks,
+                )?;
+            }
+        }
+        // Likewise every XSAVE state component WHP supports.
+        let mut xsave: u64 = 0;
+        // SAFETY: an output buffer of the size passed.
+        let got = unsafe {
+            whv::WHvGetCapability(
+                whv::WHvCapabilityCodeProcessorXsaveFeatures,
+                (&raw mut xsave).cast(),
+                8,
+                &mut written,
+            )
+        };
+        if got >= 0 && xsave != 0 {
+            // SAFETY: a u64 property value for ProcessorXsaveFeatures.
+            unsafe {
+                ffi::set_partition_property(part, whv::WHvPartitionPropertyCodeProcessorXsaveFeatures, &xsave)?;
+            }
+        }
         // Emulate the local APIC in WHP (xAPIC).
         let apic_mode: i32 = whv::WHvX64LocalApicEmulationModeXApic;
         // SAFETY: an i32 property value for LocalApicEmulationMode.
@@ -243,8 +310,23 @@ impl VmInner {
             )?;
         }
         // Exit on CPUID and MSR accesses so the backend can answer them
-        // (X64CpuidExit | X64MsrExit).
-        let exits_bits: u64 = (1 << 0) | (1 << 1);
+        // (X64CpuidExit | X64MsrExit), and on hypercalls (HypercallExit), so
+        // a guest's VMCALL/VMMCALL gets KVM's answers instead of #UD.
+        let mut exits_bits: u64 = (1 << 0) | (1 << 1);
+        let mut supported: u64 = 0;
+        let mut n = 0u32;
+        // SAFETY: an output buffer of the size passed.
+        if unsafe {
+            whv::WHvGetCapability(
+                whv::WHvCapabilityCodeExtendedVmExits,
+                (&raw mut supported).cast(),
+                8,
+                &mut n,
+            )
+        } >= 0
+        {
+            exits_bits |= supported & (1 << 5);
+        }
         // SAFETY: a u64 value for ExtendedVmExits.
         unsafe {
             ffi::set_partition_property(
@@ -280,6 +362,8 @@ impl VmInner {
             ioevents: RwLock::new(Vec::new()),
             irqfds: Mutex::new(Vec::new()),
             irqchip: Mutex::new(Irqchip::new()),
+            pvclock: Mutex::new(super::pvclock::State::default()),
+            tsc_deadline,
             vcpus: Mutex::new(Vec::new()),
             stop_evt,
             stop: AtomicBool::new(false),
@@ -533,6 +617,7 @@ impl VmFd {
     /// Restores the guest clock.
     pub fn set_clock(&self, clock: &kvm_clock_data) -> Result<()> {
         self.inner.irqchip.lock().unwrap().set_clock(clock);
+        self.inner.pvclock.lock().unwrap().reset();
         Ok(())
     }
 
@@ -638,24 +723,30 @@ fn watch_irqfds(inner: &Arc<VmInner>) {
         for ev in &events[..n] {
             let fd = ev.data() as RawFd;
             if fd == stop_fd {
-                let _ = read_eventfd(fd);
+                let _ = inner.stop_evt.read();
                 // Stopping, or the irqfd set changed: the loop looks again.
                 continue;
             }
             // Drain the eventfd and raise its GSI (edge: raise then lower).
             if let Some(&(gsi, _)) = registered.get(&fd) {
-                // Read to clear the signal (the eventfd keeps a counter).
-                let _ = read_eventfd(fd);
-                inner.raise_gsi(gsi, true);
-                inner.raise_gsi(gsi, false);
+                // Clear the signal (the eventfd keeps a counter) through the
+                // eventfd itself: a Windows eventfd is a counter in a section
+                // and an event, which a plain `read` of the descriptor does not
+                // reach, and an uncleared eventfd stays readable, so the GSI
+                // would be raised again and again (an interrupt storm the
+                // guest reports as "nobody cared").
+                let cleared = {
+                    let irqfds = inner.irqfds.lock().unwrap();
+                    irqfds
+                        .iter()
+                        .find(|i| i.eventfd.as_raw_fd() == fd)
+                        .map(|i| i.eventfd.read().is_ok())
+                };
+                if cleared == Some(true) {
+                    inner.raise_gsi(gsi, true);
+                    inner.raise_gsi(gsi, false);
+                }
             }
         }
     }
-}
-
-/// Clears an eventfd's counter.
-fn read_eventfd(fd: RawFd) -> bool {
-    let mut buf = [0u8; 8];
-    // SAFETY: a valid buffer; the fd is an eventfd this VM owns.
-    unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) > 0 }
 }

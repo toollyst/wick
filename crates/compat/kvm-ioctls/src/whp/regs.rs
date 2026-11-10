@@ -634,16 +634,125 @@ pub(crate) fn set_vcpu_events(
 
 // ---- CPUID ----
 
-/// The host CPUID leaves the guest may use. WHP applies its own masking when
-/// the partition runs, so this returns the host leaves (as KVM's
-/// `GET_SUPPORTED_CPUID` returns the host-and-KVM-filtered set, which WHP
-/// then further constrains).
+/// The CPUID leaves the guest may use: the host's, without what a WHP guest
+/// does not get, as KVM's `GET_SUPPORTED_CPUID` is the host's without what
+/// KVM does not virtualize ([`mask_unsupported`]). Firecracker builds the
+/// guest's CPUID from this; WHP answers the guest's CPUID exits with it.
 pub(crate) fn supported_cpuid(num_entries: usize) -> Result<CpuId> {
-    let leaves = crate::whp::regs::host_cpuid_entries();
+    let mut leaves = crate::whp::regs::host_cpuid_entries();
+    for e in &mut leaves {
+        mask_unsupported(e);
+    }
+    leaves.extend(kvm_leaves());
     if leaves.len() > num_entries {
         return err(libc::E2BIG);
     }
     CpuId::from_entries(&leaves).map_err(|_| super::Error::new(libc::EINVAL))
+}
+
+/// The hypervisor leaves KVM's `GET_SUPPORTED_CPUID` has: the `KVMKVMKVM`
+/// signature at 0x40000000 and, at 0x40000001, the paravirtual features this
+/// backend implements: kvm-clock (`pvclock`), stable.
+fn kvm_leaves() -> [kvm_bindings::kvm_cpuid_entry2; 2] {
+    let sig = |s: &[u8; 4]| u32::from_le_bytes(*s);
+    let entry = |function, eax, ebx, ecx, edx| kvm_bindings::kvm_cpuid_entry2 {
+        function,
+        index: 0,
+        flags: 0,
+        eax,
+        ebx,
+        ecx,
+        edx,
+        padding: [0; 3],
+    };
+    [
+        entry(0x4000_0000, 0x4000_0001, sig(b"KVMK"), sig(b"VMKV"), sig(b"M\0\0\0")),
+        entry(
+            0x4000_0001,
+            super::pvclock::FEATURE_CLOCKSOURCE2 | super::pvclock::FEATURE_CLOCKSOURCE_STABLE,
+            0,
+            0,
+            0,
+        ),
+    ]
+}
+
+/// Clears what KVM's `kvm_set_cpu_caps` leaves out of `GET_SUPPORTED_CPUID`
+/// and WHP does not give a guest either: `MONITOR`/`MWAIT` and AMD's
+/// `MONITORX`/`MWAITX` (a WHP guest gets `#UD` for them: a Linux guest that
+/// sees them idles with `MWAIT` and dies at boot), nested virtualization
+/// (VMX, SMX, SVM, SKINIT), the processor's power and thermal management
+/// (EST, TM/TM2, leaves 5 and 6), debug stores and the performance
+/// monitoring unit (leaf 0xA, `PDCM`, AMD's core and northbridge counters,
+/// IBS), and `WAITPKG` (`UMWAIT`/`TPAUSE`).
+pub(crate) fn mask_unsupported(e: &mut kvm_bindings::kvm_cpuid_entry2) {
+    const fn bits(list: &[u32]) -> u32 {
+        let mut m = 0;
+        let mut i = 0;
+        while i < list.len() {
+            m |= 1 << list[i];
+            i += 1;
+        }
+        m
+    }
+    match (e.function, e.index) {
+        (0x1, _) => {
+            // ECX: DTES64, MONITOR, DS_CPL, VMX, SMX, EST, TM2, xTPR, PDCM,
+            // and TSC_DEADLINE: WHP's emulated local APIC has no TSC-deadline
+            // mode (a write of IA32_TSC_DEADLINE arms nothing), so a guest
+            // that used it would have no local timer; without it, Linux uses
+            // the APIC timer's one-shot mode.
+            e.ecx &= !bits(&[2, 3, 4, 5, 6, 7, 8, 14, 15, 24]);
+            // EDX: DS, ACPI (thermal), TM, PBE.
+            e.edx &= !bits(&[21, 22, 29, 31]);
+        }
+        (0x5 | 0x6 | 0xa, _) | (0x8000_000a, _) => {
+            e.eax = 0;
+            e.ebx = 0;
+            e.ecx = 0;
+            e.edx = 0;
+        }
+        (0x7, 0) => {
+            // ECX: WAITPKG.
+            e.ecx &= !bits(&[5]);
+        }
+        (0x8000_0001, _) => {
+            // ECX: SVM, IBS, SKINIT, WDT, PERFCTR_CORE, PERFCTR_NB, MWAITX.
+            e.ecx &= !bits(&[2, 10, 12, 13, 23, 24, 29]);
+        }
+        _ => {}
+    }
+}
+
+/// The size of an XSAVE area holding the state components of `mask`, as
+/// CPUID leaf 0xD reports it: the standard format (`compacted` false, leaf
+/// 0xD.0 EBX: the end of the last component at its fixed offset) or the
+/// compacted one of `XSAVEC`/`XSAVES` (leaf 0xD.1 EBX: the components in
+/// order, each aligned to 64 bytes if leaf 0xD.i ECX bit 1 says so). Both
+/// start after the 512-byte legacy area and the 64-byte header; the
+/// components' sizes and offsets are the processor's (leaf 0xD.i).
+pub(crate) fn xsave_size(mask: u64, compacted: bool) -> u32 {
+    use core::arch::x86_64::__cpuid_count;
+    const START: u32 = 512 + 64;
+    let mut size = START;
+    for i in 2..64u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let r = __cpuid_count(0xd, i);
+        if r.eax == 0 {
+            continue;
+        }
+        if compacted {
+            if r.ecx & 2 != 0 {
+                size = size.div_ceil(64) * 64;
+            }
+            size += r.eax;
+        } else {
+            size = size.max(r.ebx + r.eax);
+        }
+    }
+    size
 }
 
 /// Queries the host CPUID leaves Firecracker's templates expect, with their
@@ -789,6 +898,8 @@ pub(crate) fn msr_index_list() -> Result<MsrList> {
         0x1b, 0x10, 0x174, 0x175, 0x176, 0x277,
         0xc000_0080, 0xc000_0081, 0xc000_0082, 0xc000_0083, 0xc000_0084,
         0xc000_0100, 0xc000_0101, 0xc000_0102,
+        // kvm-clock (pvclock).
+        super::pvclock::MSR_WALL_CLOCK, super::pvclock::MSR_SYSTEM_TIME,
     ]
     .to_vec();
     MsrList::from_entries(&indices).map_err(|_| super::Error::new(libc::EINVAL))
@@ -866,6 +977,39 @@ mod tests {
             libc::EINVAL
         );
         assert_eq!(activity_from_mp_state(99).unwrap_err().errno(), libc::EINVAL);
+    }
+
+    #[test]
+    fn test_xsave_size() {
+        use core::arch::x86_64::{__cpuid_count, _xgetbv};
+        // x87 and SSE only: the legacy area and the header.
+        assert_eq!(xsave_size(0x3, false), 576);
+        assert_eq!(xsave_size(0x3, true), 576);
+        // The host's own XCR0: what the processor reports for it.
+        // SAFETY: XGETBV of XCR0 on a host that has XSAVE (every x86_64 Windows host).
+        let xcr0 = unsafe { _xgetbv(0) };
+        assert_eq!(xsave_size(xcr0, false), __cpuid_count(0xd, 0).ebx);
+    }
+
+    #[test]
+    fn test_supported_cpuid_has_no_mwait_or_nested_virt() {
+        let cpuid = supported_cpuid(256).unwrap();
+        for e in cpuid.as_slice() {
+            match (e.function, e.index) {
+                (0x1, _) => {
+                    assert_eq!(e.ecx & (1 << 3), 0, "MONITOR");
+                    assert_eq!(e.ecx & (1 << 5), 0, "VMX");
+                }
+                (0x5 | 0x6 | 0xa | 0x8000_000a, _) => {
+                    assert_eq!((e.eax, e.ebx, e.ecx, e.edx), (0, 0, 0, 0), "leaf {:#x}", e.function);
+                }
+                (0x8000_0001, _) => {
+                    assert_eq!(e.ecx & (1 << 29), 0, "MWAITX");
+                    assert_eq!(e.ecx & (1 << 2), 0, "SVM");
+                }
+                _ => {}
+            }
+        }
     }
 
     #[test]
