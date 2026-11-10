@@ -1,0 +1,7 @@
+{
+    // Cargo runs in lib/firecracker (the upstream workspace, with crates/ as
+    // members). Run tools/setup.sh first.
+    "rust-analyzer.linkedProjects": ["lib/firecracker/Cargo.toml"],
+    "rust-analyzer.cargo.extraEnv": { "MACOSX_DEPLOYMENT_TARGET": "15.0" },
+    "files.watcherExclude": { "**/lib/firecracker/build/**": true }
+}
