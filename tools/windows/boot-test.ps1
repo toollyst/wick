@@ -20,6 +20,8 @@
 #          a new process: shell state, clock, drives, vsock
 #   diff   diff snapshot with dirty page tracking (holes kept), merged by
 #          snapshot-editor and restored
+#   uffd   the snapshot stage's snapshot restored with the Uffd backend,
+#          served by upstream's uffd_on_demand_handler
 #   pci    the snapshot stage over virtio-pci with MSI-X (--enable-pci)
 #   vhost-user  a vhost-user-blk drive served by tools/vhost-user-blk in
 #          another process: read md5, a write reaches the image
@@ -76,7 +78,6 @@ $BootArgs = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i804
 # What upstream Firecracker does that wick does not do on Windows yet
 # (docs/ROADMAP.md, "Platform status"); listed in the summary, not run.
 $NotImplemented = @(
-    @('uffd', 'the Uffd memory backend'),
     @('jailer', 'the jailer (AppContainer, Job Objects)')
 )
 
@@ -1331,6 +1332,7 @@ function Find-Tool([string]$exe) {
         (Join-Path (Split-Path -Parent $Fc) $exe),
         (Join-Path $PSScriptRoot $exe),
         (Join-Path $root "lib\firecracker\build\cargo_target\release\$exe"),
+        (Join-Path $root "lib\firecracker\build\cargo_target\release\examples\$exe"),
         (Join-Path $root "lib\firecracker\build\vhost-user-blk\release\$exe")
     )
     foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
@@ -1389,7 +1391,9 @@ function Stage-Snapshot([switch]$Pci) {
     [Wick.Vsock]::Echo($uds, 52, 1MB)
     Save-Dmesg $vm "$tag-2"
     $vm.Reboot()
-    $script:SnapshotFiles = @{ State = $state; Mem = $mem; Data = $data; Uds = $uds; BashMd5 = $bashMd5 }
+    if (-not $Pci) {
+        $script:SnapshotFiles = @{ State = $state; Mem = $mem; Data = $data; Uds = $uds; BashMd5 = $bashMd5 }
+    }
     $over = if ($Pci) { ' over virtio-pci (MSI-X)' } else { '' }
     return "Full snapshot, restore in a new process: shell state, clock on both vCPUs, root and data drives, vsock$over"
 }
@@ -1435,6 +1439,41 @@ function Stage-Diff {
     Save-Dmesg $vm 'diff-2'
     $vm.Reboot()
     return "Diff snapshot ($([math]::Round($allocated / 1MB)) MiB allocated of 256), snapshot-editor rebase, restore"
+}
+
+# The snapshot stage's snapshot restored with the Uffd memory backend, its
+# pages served by upstream's uffd_on_demand_handler in another process.
+function Stage-Uffd {
+    $handlerExe = Find-Tool 'uffd_on_demand_handler.exe'
+    $f = $script:SnapshotFiles
+    Check ($null -ne $f) "needs the snapshot stage's files (-Stage snapshot,uffd)"
+    # The snapshot's vsock socket path is reused as it was.
+    if (Test-Path $f.Uds) { [IO.File]::Delete($f.Uds) }
+    $sock = Join-Path $SockDir 'uffd'
+    if (Test-Path $sock) { [IO.File]::Delete($sock) }
+    $log = Join-Path (Join-Path $Results 'uffd') 'handler.txt'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
+    $handler = New-Object Wick.Vm($handlerExe, "`"$sock`" `"$($f.Mem)`"", $log)
+    $script:Vms += $handler
+    $until = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not (Test-Path $sock)) {
+        if ($handler.Exited -or [DateTime]::UtcNow -gt $until) { Fail "uffd handler did not start ($($handler.ExitReason()))" }
+        Start-Sleep -Milliseconds 20
+    }
+    $vm = Start-Vm 'uffd' $null '' -Api
+    Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
+        snapshot_path = $f.State
+        mem_backend   = [ordered]@{ backend_type = 'Uffd'; backend_path = $sock }
+        resume_vm     = $true
+    }) | Out-Null
+    Test-Restored $vm $f.BashMd5 $f.Data
+    [Wick.Vsock]::Echo($f.Uds, 52, 1MB)
+    # Fresh pages after the restore.
+    $out = $vm.Sh('head -c 64m /dev/zero | md5sum', 120000, $true)
+    Check ((Get-Fields $out)[0] -eq '7f614da9329cd3aebf59b91aadc30bf0') "64 MiB of zeros: '$out'"
+    Save-Dmesg $vm 'uffd'
+    $vm.Reboot()
+    return 'restore with the Uffd backend served by uffd_on_demand_handler: shell state, clock, drives, vsock'
 }
 
 # A vhost-user-blk drive served by tools/vhost-user-blk in another process:
@@ -1507,6 +1546,7 @@ $Stages = [ordered]@{
     net      = { Stage-Net }
     snapshot = { Stage-Snapshot }
     diff     = { Stage-Diff }
+    uffd     = { Stage-Uffd }
     pci      = { Stage-Snapshot -Pci }
     'vhost-user' = { Stage-VhostUser }
     hugepages = { Stage-Hugepages }

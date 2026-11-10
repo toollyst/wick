@@ -268,7 +268,7 @@ jobs:
       - name: Compatibility crate tests
         working-directory: lib/firecracker
         run: |
-          for c in os std libc vmm-sys-util memfd event-manager micro-http kvm-ioctls; do
+          for c in os std libc vmm-sys-util memfd event-manager micro-http kvm-ioctls userfaultfd; do
             cargo test --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
           cargo test --manifest-path ../../crates/compat/vm-memory/Cargo.toml \
@@ -298,6 +298,10 @@ jobs:
       - name: Build snapshot-editor
         working-directory: lib/firecracker
         run: cargo build -p snapshot-editor --release
+      # The boot test's uffd stage serves a snapshot's pages with it.
+      - name: Build the uffd page fault handler example
+        working-directory: lib/firecracker
+        run: cargo build -p firecracker --example uffd_on_demand_handler --release
       # The boot test's vhost-user stage serves a drive with it.
       - name: Build the vhost-user-blk test backend
         working-directory: tools/vhost-user-blk
@@ -320,6 +324,7 @@ jobs:
           path: |
             lib/firecracker/build/cargo_target/release/firecracker.exe
             lib/firecracker/build/cargo_target/release/snapshot-editor.exe
+            lib/firecracker/build/cargo_target/release/examples/uffd_on_demand_handler.exe
             lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe
             winprobe.exe
             tools/windows/boot-test.ps1
