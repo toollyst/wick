@@ -179,8 +179,10 @@ sudo lib/firecracker/build/cargo_target/release/jailer --id vm1 \
 
 The API socket is then `$JAIL/run/firecracker.socket`. On macOS `--cgroup` takes the memory limit
 (`memory.limit_in_bytes`, or `memory.max` with `--cgroup-version 2`): the VMM is killed when it uses more, guest
-memory included. The jailer refuses what macOS cannot enforce: `--netns`, `--new-pid-ns` and other cgroup
-controllers. Networking inside a jail is a Unix datagram endpoint in the jail, since the sandbox denies IP
+memory included. It also takes the CPU limit (`cpu.cfs_quota_us` and `cpu.cfs_period_us`, or `cpu.max` with
+`--cgroup-version 2`): the VMM's threads are held to that share of a CPU, refilled each second. The jailer refuses
+what macOS cannot enforce: `--netns`, `--new-pid-ns`, other cgroup controllers and CPU limits below 1% or above
+255% of one CPU. Networking inside a jail is a Unix datagram endpoint in the jail, since the sandbox denies IP
 networking and vmnet needs root. [SECURITY.md](../SECURITY.md) has how each control is held.
 
 ## Windows (preview)
