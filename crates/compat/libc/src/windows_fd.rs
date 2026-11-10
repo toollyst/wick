@@ -348,9 +348,15 @@ pub mod wick_fd {
     /// on `EAGAIN`; a reader that buffers, such as a framed stream, calls it
     /// when it has nothing left).
     pub fn drained(fd: c_int) {
+        // Callers have just set errno (EAGAIN): keep it. Locking can reset the
+        // thread's last error (TLS access does on some builds).
+        // SAFETY: plain calls.
+        let e = unsafe { GetLastError() };
         if let Some(c) = drains().lock().unwrap().get(&fd) {
             c.fetch_add(1, Ordering::Release);
         }
+        // SAFETY: as above.
+        unsafe { SetLastError(e) };
     }
 
     /// Stops counting drains of `fd` (its edge-triggered registration ended).
