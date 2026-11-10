@@ -161,7 +161,7 @@ def stage_refuse(ctx):
     p = subprocess.run(["sudo", "-n", "-u", "nobody", "/usr/bin/env", f"WICK_JAIL={UID}:{GID}:/var/empty",
                         fc, "--no-api"], capture_output=True, text=True, timeout=20)
     out = (p.stdout + p.stderr).strip()
-    check(p.returncode != 0 and "needs root" in out, f"WICK_JAIL as nobody: exit {p.returncode}, {out!r}")
+    check(p.returncode != 0 and "NotRoot" in out, f"WICK_JAIL as nobody: exit {p.returncode}, {out!r}")
     return f"{len(cases)} options and a binary without the hand-over refused; hand-over needs root"
 
 
@@ -178,6 +178,9 @@ def stage_jail(ctx):
     check((uid, gid) == (UID, GID), f"uid/gid {uid}/{gid}")
     with open(jail.host("/firecracker.pid")) as f:
         check(int(f.read()) == pid, "pid file")
+    st = os.lstat(jail.host("/tmp"))
+    check(os.path.stat.S_ISDIR(st.st_mode) and (st.st_uid, st.st_mode & 0o777) == (UID, 0o700),
+          f"jail /tmp {st.st_uid} {oct(st.st_mode)}")
     roots = proc_root(pid)
     check(os.path.realpath(jail.root) in roots, f"lsof root/cwd {roots}")
     st = os.stat(jail.root)

@@ -17,6 +17,11 @@ use crate::JailerError;
 /// Environment variable through which Firecracker takes the jail over
 /// (`vmm::ext::jail::ENV`).
 const JAIL_ENV: &str = "WICK_JAIL";
+/// Firecracker's temporary directory in the jail. On macOS eventfds are
+/// unlinked FIFOs and memfds unlinked files (crates/compat), made in the
+/// temporary directory; on Linux both are kernel objects, so upstream's jail
+/// has none.
+const JAIL_TMP: &CStr = c"/tmp";
 /// Bytes every binary that takes the jail over carries
 /// (`vmm::ext::jail::HANDOVER_MARK`).
 const HANDOVER_MARK: &[u8] = b"wick-jail-handover:v1\0";
@@ -86,6 +91,8 @@ pub enum HostError {
     NoHandover(PathBuf),
     #[error("Failed to copy {0:?} to {1:?} for the exec: {2}")]
     CopyExec(PathBuf, PathBuf, io::Error),
+    #[error("Failed to make the jail's temporary directory: {0}")]
+    JailTmp(io::Error),
     #[error("Failed to read the jailer's memory priority: {0}")]
     JetsamPriority(io::Error),
     #[error("Failed to prepare the exec: {0}: {1}")]
@@ -177,6 +184,7 @@ fn exec(
     gid: u32,
     args: &[String],
 ) -> Result<io::Error, HostError> {
+    jail_tmp(uid, gid)?;
     leave_chroot()?;
     let exec_file = copy_for_exec(exec_file_path, chroot_dir)?;
 
@@ -189,7 +197,12 @@ fn exec(
     }
     let mut env_var = format!("{JAIL_ENV}={uid}:{gid}:").into_bytes();
     env_var.extend_from_slice(chroot_dir.as_os_str().as_bytes());
-    let env = [CString::new(env_var).map_err(|e| HostError::Spawn("WICK_JAIL", io::Error::other(e)))?];
+    let mut tmp_var = b"TMPDIR=".to_vec();
+    tmp_var.extend_from_slice(JAIL_TMP.to_bytes());
+    let env = [
+        CString::new(env_var).map_err(|e| HostError::Spawn("WICK_JAIL", io::Error::other(e)))?,
+        CString::new(tmp_var).expect("no NUL"),
+    ];
     let mut argv_ptrs: Vec<*mut libc::c_char> = argv.iter().map(|a| a.as_ptr().cast_mut()).collect();
     argv_ptrs.push(std::ptr::null_mut());
     let mut envp_ptrs: Vec<*mut libc::c_char> = env.iter().map(|a| a.as_ptr().cast_mut()).collect();
@@ -256,6 +269,33 @@ fn exec(
         )
     };
     Ok(io::Error::from_raw_os_error(ret))
+}
+
+/// Makes the jail's temporary directory (still inside the chroot), given to
+/// the jailed user as upstream's jail folders are. One the operator made is
+/// kept, if it is a directory and not a link.
+fn jail_tmp(uid: u32, gid: u32) -> Result<(), HostError> {
+    let err = |_| HostError::JailTmp(io::Error::last_os_error());
+    // SAFETY: NUL-terminated path.
+    let created = unsafe { libc::mkdir(JAIL_TMP.as_ptr(), 0o700) } == 0;
+    if !created && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
+        return Err(HostError::JailTmp(io::Error::last_os_error()));
+    }
+    // SAFETY: NUL-terminated path.
+    let fd = unsafe { libc::open(JAIL_TMP.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) };
+    if fd < 0 {
+        return Err(HostError::JailTmp(io::Error::last_os_error()));
+    }
+    // SAFETY: a descriptor we own.
+    let dir = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    if created {
+        // SAFETY: a directory descriptor.
+        let ok = unsafe { libc::fchown(dir.as_raw_fd(), uid, gid) == 0 && libc::fchmod(dir.as_raw_fd(), 0o700) == 0 };
+        if !ok {
+            return Err(err(()));
+        }
+    }
+    Ok(())
 }
 
 /// Back to the root directory the jailer had before its chroot.
