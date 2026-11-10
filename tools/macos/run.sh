@@ -31,7 +31,7 @@ done
 
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/lib/firecracker/build/cargo_target}"
-cargo_args=(build -p firecracker --bin firecracker)
+cargo_args=(build --locked -p firecracker --bin firecracker)
 [[ $PROFILE == release ]] && cargo_args+=(--release)
 (cd "$ROOT/lib/firecracker" && CARGO_TARGET_DIR="$TARGET_DIR" cargo "${cargo_args[@]}")
 

@@ -71,3 +71,18 @@ ensure_tag() {
 recorded_upstream() {
     git -C "$WICK_ROOT" ls-files -s lib/firecracker | awk '$1 == "160000" { print $2 }'
 }
+
+# The cargo-deny version upstream's development container installs
+# (lib/firecracker/tools/devctr/Dockerfile); wick's dependency checks use the
+# same (tools/check-dependencies.sh).
+cargo_deny_version() {
+    local v
+    v="$(sed -n 's/.*cargo install --locked cargo-deny --version \([0-9][0-9.]*\).*/\1/p' \
+        "$UPSTREAM_DIR/tools/devctr/Dockerfile")"
+    [[ -n "$v" ]] || die "cannot find the cargo-deny version in lib/firecracker/tools/devctr/Dockerfile"
+    echo "$v"
+}
+
+# The cargo-cyclonedx version that writes the release SBOM
+# (tools/package-release.sh).
+CARGO_CYCLONEDX_VERSION=0.5.9

@@ -20,6 +20,40 @@ not sure which, report it here and we will coordinate.
 
 Security fixes go into the latest release: `v<upstream>`, or a fix release `v<upstream>+wick.<N>` on it, and `main`.
 
+## Verifying a release
+
+Releases are built on GitHub-hosted runners by the release workflow
+([`.github/workflows/release.yml`](.github/workflows/release.yml)) from a tag on `main`, after the dependency checks
+([CONTRIBUTING.md](CONTRIBUTING.md#dependencies)) pass. Next to each archive, a release has:
+
+- `SHA256SUMS`: the SHA-256 of every file in the release.
+- `wick-<tag>-<os>-<arch>.cdx.json`: the SBOM (CycloneDX 1.5), every crate the binary is built from, with the version
+  and the checksum or git commit `Cargo.lock` pins.
+- Attestations, signed through Sigstore by the workflow run that built the release and recorded for this repository:
+  SLSA build provenance and the SBOM, both for the archive and for the `firecracker` binary in it.
+
+Check the files against `SHA256SUMS` (on Linux, `sha256sum -c SHA256SUMS`):
+
+```sh
+shasum -a 256 -c SHA256SUMS
+```
+
+Then check that this repository's release workflow built the archive, from the tag you expect, with the
+[GitHub CLI](https://cli.github.com/):
+
+```sh
+gh attestation verify wick-v1.18.0-darwin-aarch64.tgz --repo toollyst/wick \
+    --signer-workflow toollyst/wick/.github/workflows/release.yml \
+    --source-ref refs/tags/v1.18.0 --deny-self-hosted-runners
+```
+
+The same command works on the extracted binary (`release-v1.18.0-darwin-aarch64/firecracker-v1.18.0-darwin-aarch64`).
+`--predicate-type https://cyclonedx.org/bom` checks the SBOM attestation instead of the provenance, and
+`--format json` prints what was verified, including the commit the release was built from.
+
+The macOS binary carries only an ad-hoc code signature (it is not signed with an Apple Developer ID); the attestation
+is what ties it to this repository.
+
 ## Threat model
 
 The same as upstream Firecracker's

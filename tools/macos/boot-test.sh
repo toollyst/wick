@@ -31,8 +31,8 @@ export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/lib/firecracker/build/cargo_target}"
 "$ROOT/tools/macos/run.sh" --build-only ${cargo_profile[@]+"${cargo_profile[@]}"}
 (cd "$ROOT/lib/firecracker" &&
-    CARGO_TARGET_DIR="$TARGET_DIR" cargo build ${cargo_profile[@]+"${cargo_profile[@]}"} -p snapshot-editor &&
-    CARGO_TARGET_DIR="$TARGET_DIR" cargo build ${cargo_profile[@]+"${cargo_profile[@]}"} -p firecracker \
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked ${cargo_profile[@]+"${cargo_profile[@]}"} -p snapshot-editor &&
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked ${cargo_profile[@]+"${cargo_profile[@]}"} -p firecracker \
         --example uffd_on_demand_handler)
 (cd "$ROOT/tools/vhost-user-blk" && CARGO_TARGET_DIR="$ROOT/lib/firecracker/build/vhost-user-blk" \
     cargo build --release --locked)

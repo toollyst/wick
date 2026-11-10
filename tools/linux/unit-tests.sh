@@ -53,7 +53,7 @@ if [[ "${1:-}" == "--in-container" ]]; then
     echo "$arch" >"$out/arch"
     grep -m1 '^model name' /proc/cpuinfo >"$out/cpu" || true
     for run in lib examples; do
-        flags=(--target "$target" --all --no-fail-fast)
+        flags=(--target "$target" --all --no-fail-fast --locked)
         [[ "$run" == examples ]] && flags+=(--examples)
         log="$out/$run"
         # Build first: the JSON names the package of every test executable.

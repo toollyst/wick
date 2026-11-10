@@ -5,8 +5,15 @@
 # upstream base) or vX.Y.Z+wick.N (a wick fix release on it) builds the
 # macOS (Apple silicon) binary, signs it with the Hypervisor.framework
 # entitlement and publishes it as a GitHub Release in the upstream Firecracker
-# release layout (tools/package-release.sh). Hosted runners cannot run HVF
-# guests, so the guest smoke test runs on a Mac before the tag is pushed.
+# release layout (tools/package-release.sh), with an SBOM, a SHA256SUMS file
+# and signed build provenance (SECURITY.md, "Verifying a release"). Hosted
+# runners cannot run HVF guests, so the guest smoke test runs on a Mac before
+# the tag is pushed.
+#
+# Each job gets only the permissions it needs: the build, which runs the crates'
+# build scripts, can read the repository and nothing else; the attestation job
+# can sign but not write to the repository; only the last job, which runs no
+# code from the repository, can create the release.
 name: release
 
 on:
@@ -18,42 +25,58 @@ on:
         description: "Existing tag to (re)build and upload, e.g. v1.18.0 or v1.18.0+wick.1"
         required: true
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
 jobs:
   darwin-aarch64:
     # hv_gic_* needs the macOS 15 SDK.
     runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
-      TAG: ${{ inputs.tag || github.ref_name }}
-      GH_TOKEN: ${{ github.token }}
+    outputs:
+      base: ${{ steps.version.outputs.base }}
     steps:
-      - uses: actions/checkout@v4
+      # fetch-depth 0 fetches every branch, origin/main included.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
           submodules: true
+          persist-credentials: false
       - name: Tag must be on main
         run: |
-          git fetch -q origin main
           git merge-base --is-ancestor "$(git rev-parse HEAD)" origin/main \
             || { echo "::error::$TAG is not on main"; exit 1; }
       - name: Tag must be the version in patches/base and patches/version
+        id: version
         run: |
           source tools/common.sh
           version="$(wick_version)"
           [[ "$TAG" == "v$version" ]] \
             || { echo "::error::$TAG is not v$version (patches/base + patches/version)"; exit 1; }
+          echo "base=$(upstream_base)" >>"$GITHUB_OUTPUT"
       - name: Apply and check the patch series
         run: |
           tools/setup.sh
           tools/patches.sh check
+      # Built from crates.io with their own lockfiles, at the versions wick pins.
+      - name: Install cargo-deny and cargo-cyclonedx
+        run: |
+          source tools/common.sh
+          cargo install --locked cargo-deny --version "$(cargo_deny_version)"
+          cargo install --locked cargo-cyclonedx --version "$CARGO_CYCLONEDX_VERSION"
+      - name: Dependency checks (advisories, licenses, sources)
+        run: tools/check-dependencies.sh
       - name: Build, sign and package
         run: tools/package-release.sh "$TAG" dist
       - name: Verify the package
@@ -61,6 +84,7 @@ jobs:
           cd dist
           name="wick-$TAG-darwin-aarch64"
           shasum -a 256 -c "$name.tgz.sha256.txt"
+          python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$name.cdx.json"
           tar -xzf "$name.tgz"
           bin="release-$TAG-darwin-aarch64/firecracker-$TAG-darwin-aarch64"
           codesign --verify --strict "$bin"
@@ -71,17 +95,89 @@ jobs:
           [[ "$reported" == "Firecracker $TAG" ]] \
             || { echo "::error::the binary reports '$reported', not 'Firecracker $TAG'"; exit 1; }
           rm -rf "release-$TAG-darwin-aarch64"
+          ls -l
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-darwin-aarch64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Signed SLSA build provenance and the SBOM, bound to the archive and to the
+  # binary in it (`gh attestation verify`), recorded for this repository.
+  attest:
+    needs: darwin-aarch64
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-darwin-aarch64
+          path: dist
+      - name: Check the archive and take out the binary
+        run: |
+          cd dist
+          name="wick-$TAG-darwin-aarch64"
+          sha256sum -c "$name.tgz.sha256.txt"
+          mkdir ../bin
+          tar -xzf "$name.tgz" -C ../bin --strip-components 1 \
+            "release-$TAG-darwin-aarch64/firecracker-$TAG-darwin-aarch64"
+          ls -l ../bin
+      - name: Build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/wick-${{ env.TAG }}-darwin-aarch64.tgz
+            bin/firecracker-${{ env.TAG }}-darwin-aarch64
+      - name: SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/wick-${{ env.TAG }}-darwin-aarch64.tgz
+            bin/firecracker-${{ env.TAG }}-darwin-aarch64
+          sbom-path: dist/wick-${{ env.TAG }}-darwin-aarch64.cdx.json
+
+  publish:
+    needs: [darwin-aarch64, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BASE: ${{ needs.darwin-aarch64.outputs.base }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-darwin-aarch64
+          path: dist
+      - name: SHA256SUMS
+        run: |
+          cd dist
+          sha256sum -c ./*.sha256.txt
+          sha256sum -- *.tgz *.cdx.json >SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
       - name: Publish the release
         run: |
-          notes="wick $TAG, built from upstream Firecracker $(cat patches/base).
+          name="wick-$TAG-darwin-aarch64"
+          notes="wick $TAG, built from upstream Firecracker $BASE.
 
-          - wick-$TAG-darwin-aarch64.tgz: macOS 15+ on Apple silicon (Hypervisor.framework),
+          - $name.tgz: macOS 15+ on Apple silicon (Hypervisor.framework),
             ad-hoc signed with the com.apple.security.hypervisor entitlement. If a browser
             downloaded it, clear the quarantine attribute: xattr -d com.apple.quarantine <file>.
-          - Check: shasum -a 256 -c wick-$TAG-darwin-aarch64.tgz.sha256.txt"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.tgz dist/*.sha256.txt --clobber
+          - $name.cdx.json: the SBOM (CycloneDX 1.5), every crate the binary is built from.
+          - SHA256SUMS: SHA-256 of every file. Check: shasum -a 256 -c SHA256SUMS
+          - Build provenance and the SBOM are signed attestations of this repository's
+            release workflow. Check: gh attestation verify $name.tgz --repo $GITHUB_REPOSITORY
+            (SECURITY.md, \"Verifying a release\")."
+          files=(dist/*.tgz dist/*.sha256.txt dist/*.cdx.json dist/SHA256SUMS)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$TAG" dist/*.tgz dist/*.sha256.txt \
+            gh release create "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" \
               --title "$TAG" --notes "$notes" --verify-tag
           fi

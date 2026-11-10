@@ -33,18 +33,44 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
+          persist-credentials: false
       - name: Apply the patch series
         run: tools/setup.sh
       - name: Check the patch series
         run: tools/patches.sh check
       - name: Check generated Windows sources
         run: |
-          (cd lib/firecracker && cargo fetch -q)
+          (cd lib/firecracker && cargo fetch --locked -q)
           tools/gen-kvm-bindings-windows.sh --check
           tools/gen-windows-sources.sh --check
+      - name: Actions are pinned by commit
+        run: |
+          unpinned="$(grep -nE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s*[^@ ]+@[0-9a-f]{40}( |$)' || true)"
+          [[ -z "$unpinned" ]] || { echo "::error::actions not pinned by full commit SHA:"; echo "$unpinned"; exit 1; }
+
+  # Dependency policy (CONTRIBUTING.md, "Dependencies"): RustSec advisories,
+  # licenses, banned and duplicate crates and sources for lib/firecracker's
+  # Cargo.lock and tools/vhost-user-blk's, with cargo-deny at upstream's
+  # version. The weekly run catches advisories published against an unchanged
+  # lockfile.
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - run: tools/setup.sh
+      - name: Install cargo-deny
+        run: |
+          source tools/common.sh
+          cargo install --locked cargo-deny --version "$(cargo_deny_version)"
+      - name: Dependency checks
+        run: tools/check-dependencies.sh
 
   linux:
     strategy:
@@ -54,9 +80,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
+          persist-credentials: false
       - run: tools/setup.sh
       - name: Report KVM availability
         run: ls -l /dev/kvm || echo "no /dev/kvm on ${{ matrix.runner }}"
@@ -64,7 +91,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libseccomp-dev
       - name: Build firecracker
         working-directory: lib/firecracker
-        run: cargo build -p firecracker
+        run: cargo build --locked -p firecracker
 
   # Upstream's unit tests as upstream's CI runs them (its development
   # container, as root, musl, one test thread: tools/linux/unit-tests.sh),
@@ -81,9 +108,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
+          persist-credentials: false
       - run: tools/setup.sh
       - name: Host
         run: |
@@ -101,13 +129,9 @@ jobs:
         run: |
           tools/linux/compare-unit-tests.py "$RUNNER_TEMP/unit/upstream" "$RUNNER_TEMP/unit/wick" \
             --summary "$GITHUB_STEP_SUMMARY"
-      # On Linux the compatibility crates re-export the original crates from
-      # their release tags: those must be the crates.io releases upstream uses.
-      - name: Dependency sources are upstream's crates.io releases
-        run: tools/linux/check-dependency-sources.py lib/firecracker/build/devctr-cache/git/checkouts
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-unit-tests-${{ runner.arch }}
           path: |
@@ -126,9 +150,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
+          persist-credentials: false
       - run: tools/setup.sh
       - name: Give the runner user /dev/kvm
         run: |
@@ -139,11 +164,14 @@ jobs:
           ls -l /dev/kvm
       - name: Release build (upstream's tools/release.sh, musl)
         run: tools/linux/devctr.sh --chown lib/firecracker/build -- ./tools/release.sh --libc musl --profile release
+      # Upstream's release.sh builds without --locked.
+      - name: The build kept Cargo.lock
+        run: git -C lib/firecracker diff --exit-code -- Cargo.lock
       - name: Boot test
         run: tools/linux/boot-test.sh --workdir "$RUNNER_TEMP/boot-test"
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-boot-test
           path: ${{ runner.temp }}/boot-test/results-*
@@ -163,9 +191,10 @@ jobs:
     env:
       SUITE: ${{ (github.event_name == 'schedule' || inputs.integration == 'full') && 'full' || 'subset' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
+          persist-credentials: false
       - run: tools/setup.sh
       - name: Host
         run: |
@@ -188,19 +217,28 @@ jobs:
           fi
           echo "TESTS=-n 4 --dist worksteal $tests" >>"$GITHUB_ENV"
           echo "$SUITE: $tests"
+      # $TESTS is split into pytest's arguments on purpose.
       - name: Integration tests, plain upstream
-        run: tools/linux/integration-tests.sh upstream "$RUNNER_TEMP/it/upstream" $TESTS
+        run: |
+          # shellcheck disable=SC2086
+          tools/linux/integration-tests.sh upstream "$RUNNER_TEMP/it/upstream" $TESTS
       - name: Integration tests, wick
         if: always()
-        run: tools/linux/integration-tests.sh wick "$RUNNER_TEMP/it/wick" $TESTS
+        run: |
+          # shellcheck disable=SC2086
+          tools/linux/integration-tests.sh wick "$RUNNER_TEMP/it/wick" $TESTS
       - name: Compare wick with upstream
         if: always()
         run: |
           tools/linux/compare-integration-tests.py "$RUNNER_TEMP/it/upstream" "$RUNNER_TEMP/it/wick" \
             --summary "$GITHUB_STEP_SUMMARY"
+      # Upstream's release.sh, which the tests build with, has no --locked.
+      - name: The build kept Cargo.lock
+        if: always()
+        run: git -C lib/firecracker diff --exit-code -- Cargo.lock
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-integration-tests-${{ env.SUITE }}
           path: |
@@ -220,38 +258,39 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
+          persist-credentials: false
       - run: tools/setup.sh
       - name: Install clippy
         working-directory: lib/firecracker
         run: rustup component add clippy
       - name: Build firecracker
         working-directory: lib/firecracker
-        run: cargo build -p firecracker --bin firecracker
+        run: cargo build --locked -p firecracker --bin firecracker
       - name: Clippy
         working-directory: lib/firecracker
-        run: cargo clippy -p vmm -p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings
+        run: cargo clippy --locked -p vmm -p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings
       - name: Compatibility crate tests
         working-directory: lib/firecracker
         run: |
           for c in libc vmm-sys-util memfd userfaultfd; do
-            cargo test --manifest-path "../../crates/compat/$c/Cargo.toml"
+            cargo test --locked --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
           # The tests that create a VM need Hypervisor.framework, which GitHub's
           # macOS runners (virtual machines) do not have; tools/macos/test.sh
           # runs them, and tools/macos/boot-test.sh the scenarios.
-          cargo test --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- --skip hvf::vm::tests::
+          cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- --skip hvf::vm::tests::
       - name: Host sandbox and jail hand-over tests
         working-directory: lib/firecracker
-        run: cargo test -p vmm --lib "ext::"
+        run: cargo test --locked -p vmm --lib "ext::"
       # The jailer's tests run as root, as upstream's do (they set resource
       # limits and change owners); the runners have passwordless sudo.
       - name: Jailer unit tests
         working-directory: lib/firecracker
         run: |
-          bin=$(cargo test -p jailer --no-run --message-format=json |
+          bin=$(cargo test --locked -p jailer --no-run --message-format=json |
             jq -r 'select(.profile.test == true and .target.name == "jailer") | .executable')
           sudo env RUST_TEST_THREADS=1 "$bin"
       - name: Jailer scenario tests (without a VM)
@@ -266,9 +305,10 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
+          persist-credentials: false
       - run: tools/setup.sh
       # Upstream tests put sockets and files under /tmp, which Windows
       # resolves to \tmp on the current drive.
@@ -279,11 +319,11 @@ jobs:
         working-directory: lib/firecracker
         run: |
           for c in os std libc vmm-sys-util memfd event-manager micro-http kvm-ioctls userfaultfd; do
-            cargo test --manifest-path "../../crates/compat/$c/Cargo.toml"
+            cargo test --locked --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
-          cargo test --manifest-path ../../crates/compat/vm-memory/Cargo.toml \
+          cargo test --locked --manifest-path ../../crates/compat/vm-memory/Cargo.toml \
             --features backend-mmap,backend-bitmap,backend-atomic
-          cargo test --manifest-path ../../crates/compat/vhost/Cargo.toml \
+          cargo test --locked --manifest-path ../../crates/compat/vhost/Cargo.toml \
             --features vhost-user-frontend,vhost-user-backend
       # The boot test's own helpers (serial-console protocol, vsock, network
       # switch) against stand-ins, in Windows PowerShell 5.1 as users run it;
@@ -300,18 +340,18 @@ jobs:
           "$env:ProgramFiles\NASM" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Build firecracker (WHP backend)
         working-directory: lib/firecracker
-        run: cargo build -p firecracker --release
+        run: cargo build --locked -p firecracker --release
       - name: Smoke-test the binary
         working-directory: lib/firecracker
         run: build/cargo_target/release/firecracker.exe --version
       # The boot test's diff stage merges snapshots with it.
       - name: Build snapshot-editor
         working-directory: lib/firecracker
-        run: cargo build -p snapshot-editor --release
+        run: cargo build --locked -p snapshot-editor --release
       # The boot test's uffd stage serves a snapshot's pages with it.
       - name: Build the uffd page fault handler example
         working-directory: lib/firecracker
-        run: cargo build -p firecracker --example uffd_on_demand_handler --release
+        run: cargo build --locked -p firecracker --example uffd_on_demand_handler --release
       # The boot test's vhost-user stage serves a drive with it.
       - name: Build the vhost-user-blk test backend
         working-directory: tools/vhost-user-blk
@@ -328,7 +368,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       # For validation on Windows hardware with WHP (tools/windows/boot-test.ps1).
       - name: Upload Windows binaries
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wick-windows-x86_64-${{ github.sha }}
           path: |

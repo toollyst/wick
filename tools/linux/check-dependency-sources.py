@@ -4,7 +4,7 @@
 """Checks that the crates wick builds from git are the crates.io releases
 upstream's Cargo.lock uses.
 
-    tools/linux/check-dependency-sources.py CHECKOUTS_DIR
+    tools/linux/check-dependency-sources.py CHECKOUTS_DIR [LOCKFILE...]
 
 On Linux the compatibility crates (crates/compat) re-export the original
 crate, taken from the release's git tag rather than from crates.io. For every
@@ -13,7 +13,9 @@ lockfile (patches/base) takes from crates.io, this downloads the crates.io
 package and checks that it was published from the commit wick's lockfile
 pins (.cargo_vcs_info.json) and that every packaged file, Cargo.toml.orig
 included, is byte for byte the one in cargo's git checkout (CHECKOUTS_DIR,
-`$CARGO_HOME/git/checkouts`).
+`$CARGO_HOME/git/checkouts`). Every git dependency in the other LOCKFILEs
+(tools/vhost-user-blk/Cargo.lock) must be one of lib/firecracker's, so that
+the same check covers it. tools/check-dependencies.sh runs this script.
 """
 
 import io
@@ -110,6 +112,13 @@ def main():
 
     if not checked:
         problems.append("no git dependency of wick replaces a crates.io release; is the lockfile right?")
+    for other in sys.argv[2:]:
+        for (name, version), sources in sorted(packages(Path(other).read_text()).items()):
+            for source in sorted(s for s in sources if s.startswith("git+")):
+                if source not in wick.get((name, version), ()):
+                    problems.append(f"{other}: {name} {version} from {source} is not in lib/firecracker/Cargo.lock")
+                else:
+                    print(f"{other}: {name} {version} ({source.split('#')[0]}): as in lib/firecracker/Cargo.lock")
     for p in problems:
         print(f"PROBLEM: {p}")
     return 1 if problems else 0
