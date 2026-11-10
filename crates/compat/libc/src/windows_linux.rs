@@ -36,7 +36,7 @@ use windows_sys::Win32::System::Ioctl::{
 
 use crate::windows_fd::{wick_wsa_startup, handle, set_errno};
 use crate::windows_socket::{AF_INET, AF_INET6, AF_UNIX};
-use crate::{c_char, c_int, c_void, off_t};
+use crate::{c_char, c_int, c_void, off_t, size_t, ssize_t};
 
 /// `long` of the Linux LP64 ABI.
 #[allow(non_camel_case_types)]

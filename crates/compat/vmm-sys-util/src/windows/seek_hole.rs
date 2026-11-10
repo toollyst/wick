@@ -61,7 +61,7 @@ impl SeekHole for File {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{Seek, Write};
 
     use super::*;
     use crate::tempfile::TempFile;
