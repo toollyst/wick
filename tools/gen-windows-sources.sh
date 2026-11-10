@@ -33,6 +33,7 @@ CRATES=(
     "event-manager crates/compat/event-manager v0.4.2"
     "micro_http   crates/compat/micro-http     7975fe0e59000e8c41cb1d58fbd39ffa102e5b27"
     "vhost        crates/compat/vhost          vhost-v0.17.0"
+    "vhost-user-backend tools/vhost-user-blk/compat/vhost-user-backend vhost-v0.17.0"
 )
 
 # crate  file  test  reason
