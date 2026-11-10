@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE,
+    CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE,
     ERROR_HANDLE_EOF, ERROR_NO_DATA, FILETIME, GetHandleInformation, GetLastError, HANDLE,
     HANDLE_FLAG_INHERIT, SetHandleInformation, SetLastError,
 };
@@ -633,6 +633,39 @@ pub unsafe fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t {
     total
 }
 
+/// A handle of the file `h` opened for reading, closed when dropped.
+struct Readable(HANDLE);
+
+impl Drop for Readable {
+    fn drop(&mut self) {
+        // SAFETY: a handle opened by `readable`.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// Opens again the file `h` for reading only (`None`, with errno, if it
+/// cannot be).
+fn readable(h: HANDLE) -> Option<Readable> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        ReOpenFile, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    // SAFETY: reopens an open handle; the result is owned by `Readable`.
+    let r = unsafe {
+        ReOpenFile(
+            h,
+            FILE_READ_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if r == INVALID_HANDLE_VALUE || r.is_null() {
+        set_errno(crate::EACCES);
+        return None;
+    }
+    Some(Readable(r))
+}
+
 /// The allocated ranges of the file `h` in [from, to), in order.
 fn allocated_ranges(h: HANDLE, from: i64, to: i64) -> Option<std::vec::Vec<(i64, i64)>> {
     use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
@@ -665,6 +698,12 @@ fn allocated_ranges(h: HANDLE, from: i64, to: i64) -> Option<std::vec::Vec<(i64,
                 std::ptr::null_mut(),
             )
         };
+        if ok == 0 && last_error() == ERROR_ACCESS_DENIED.cast_signed() {
+            // The query needs read access, which `lseek` does not on Linux
+            // (a snapshot memory file is opened write-only): ask a handle of
+            // the same file opened for reading.
+            return readable(h).and_then(|r| allocated_ranges(r.0, from, to));
+        }
         if ok == 0 && last_error() != ERROR_MORE_DATA.cast_signed() {
             return None;
         }
@@ -1391,6 +1430,23 @@ mod tests {
             assert_eq!(st.st_mode & S_IFMT, S_IFREG);
             assert_eq!(st.st_size, 4);
             assert_eq!(lseek(fd, 0, SEEK_CUR), 5, "ftruncate keeps the position");
+        }
+        drop(f);
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn test_seek_hole_write_only() {
+        let (p, mut f) = temp("wo");
+        f.write_all(b"0123456789").unwrap();
+        drop(f);
+        // A snapshot memory file is opened like this.
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        let fd = fd_of(&f);
+        // SAFETY: a valid descriptor.
+        unsafe {
+            assert_eq!(lseek(fd, 1, SEEK_HOLE), 10);
+            assert_eq!(lseek(fd, 1, SEEK_DATA), 1);
         }
         drop(f);
         std::fs::remove_file(p).unwrap();
