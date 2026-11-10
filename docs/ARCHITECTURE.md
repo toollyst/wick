@@ -28,7 +28,7 @@ overlay/vmm/          modules compiled into upstream's vmm crate
     platform/         host facility interfaces and backends (vmm::platform)
 crates/compat/        compatibility builds of Linux-only dependencies
 crates/ext/           wick-ext: wick's features behind vmm::ext
-tools/                setup, patch workflow, generators, macOS run/test, release
+tools/                setup, patch workflow, generators, macOS run/test, Windows boot test and probe, release
 docs/                 this document and the roadmap
 ```
 

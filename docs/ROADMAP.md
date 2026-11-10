@@ -34,7 +34,8 @@ shutdown, API socket, Seatbelt sandbox, dirty page tracking.
 ## Windows (Windows Hypervisor Platform, x86_64 guests)
 
 **Code complete; not yet run on real hardware.** The vmm library and the
-firecracker binary build and link for `x86_64-pc-windows-gnu`.
+firecracker binary build and link for `x86_64-pc-windows-gnu` (cross) and
+`x86_64-pc-windows-msvc` (native, the binary CI publishes).
 
 - Done: the POSIX layer (`wick-os`, `wick-std`, `libc`, `vmm-sys-util`,
   `memfd`, generated `vm-memory`/`event-manager`/`micro_http`/`vhost`,
@@ -46,14 +47,18 @@ firecracker binary build and link for `x86_64-pc-windows-gnu`.
   LAPIC with a user-space IOAPIC, 8259 PIC and 8254 PIT, irqfd routing,
   CPUID and MSR filtering, register conversion), and a host sandbox that
   blocks child processes and fails loudly if it cannot.
+- Tested natively: CI runs every compatibility crate's tests on a Windows
+  runner. The first native run found synchronous sockets that blocked
+  descriptor passing behind a pending receive and standard descriptors passed
+  as raw handle values (both fixed); a standard input that is a pipe is now
+  pollable, so the serial console reads it as on Linux.
 - Next, on real hardware:
-  1. A first guest boot with upstream's x86_64 CI kernel and rootfs: LAPIC
-     state layout (`get/set_lapic` over the interrupt controller state),
-     CPUID hypervisor leaves and kvm-clock, the vCPU kick at run time.
+  1. A first guest boot with upstream's x86_64 CI kernel and rootfs
+     (`tools/windows/boot-test.ps1`): LAPIC state layout (`get/set_lapic`
+     over the interrupt controller state), CPUID hypervisor leaves and
+     kvm-clock, the vCPU kick at run time.
   2. WHP inside an AppContainer and under the full mitigation profile.
   3. The fd-passing changes for jailed processes (below).
-  4. The compatibility crate tests natively (the latest `ScmSocket` change
-     has only been cross-compiled).
 
 ## Security parity (in progress)
 

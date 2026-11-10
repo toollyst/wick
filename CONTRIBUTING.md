@@ -16,6 +16,12 @@ entitlement: use `tools/macos/run.sh` to run Firecracker and
 `tools/macos/test.sh` for tests. Windows builds cross-compile from macOS or
 Linux with mingw-w64:
 `AWS_LC_SYS_NO_ASM=1 cargo build -p firecracker --target x86_64-pc-windows-gnu`.
+Natively on Windows (MSVC), `cargo build -p firecracker` works as is; release
+builds need [NASM](https://www.nasm.us/) on `PATH` for aws-lc-sys.
+On a Windows machine with the Windows Hypervisor Platform feature,
+`tools/windows/boot-test.ps1` boots upstream's x86_64 CI guest and checks boot,
+serial I/O, SMP, the Async block engine and vsock; `tools/windows/winprobe.c`
+measures the host mechanisms the sandbox and jailer backends use.
 
 Editors: `.vscode/settings.json` points rust-analyzer at
 `lib/firecracker/Cargo.toml`; other editors need the same.
