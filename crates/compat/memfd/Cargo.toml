@@ -1,0 +1,33 @@
+# Compatibility build of memfd for wick (docs/ARCHITECTURE.md).
+# On Linux it re-exports the original crate unchanged. On macOS it provides the
+# same API on top of POSIX shared memory, on Windows on a nameless temporary
+# file and a section.
+[package]
+workspace = "../../../lib/firecracker"
+name = "memfd"
+version = "0.6.5"
+authors = ["toollyst contributors"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "memfd 0.6.5, with implementations for macOS and Windows."
+
+[lib]
+bench = false
+doctest = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Same source as the crates.io 0.6.5 release (src/ is identical, checked 2026-11-09).
+upstream = { package = "memfd", git = "https://github.com/lucab/memfd-rs", tag = "v0.6.5" }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+wick-os = { path = "../os" }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+] }
