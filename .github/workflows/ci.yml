@@ -21,8 +21,9 @@ concurrency:
 jobs:
   patches:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Apply the patch series
@@ -41,8 +42,9 @@ jobs:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - run: tools/setup.sh
@@ -59,10 +61,11 @@ jobs:
   # expose, so L3 runs on a Mac (tools/macos/run.sh).
   macos:
     runs-on: macos-latest
+    timeout-minutes: 20
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - run: tools/setup.sh
@@ -89,11 +92,12 @@ jobs:
   # and the firecracker binary on the WHP backend.
   windows:
     runs-on: windows-latest
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - run: tools/setup.sh
@@ -112,6 +116,35 @@ jobs:
             --features backend-mmap,backend-bitmap,backend-atomic
           cargo test --manifest-path ../../crates/compat/vhost/Cargo.toml \
             --features vhost-user-frontend,vhost-user-backend
+      # aws-lc-sys assembles its x86_64 code with NASM in release builds
+      # (built from source rather than with its prebuilt objects).
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "$env:ProgramFiles\NASM" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Build firecracker (WHP backend)
         working-directory: lib/firecracker
-        run: cargo build -p firecracker
+        run: cargo build -p firecracker --release
+      - name: Smoke-test the binary
+        working-directory: lib/firecracker
+        run: build/cargo_target/release/firecracker.exe --version
+      # The host capability probe (tools/windows/winprobe.c), built with the
+      # same MSVC toolchain the binary uses.
+      - name: Build winprobe
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && cl /nologo /W3 /O2 /D_CRT_SECURE_NO_WARNINGS tools\windows\winprobe.c advapi32.lib ws2_32.lib userenv.lib /Fe:winprobe.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # For validation on Windows hardware with WHP (tools/windows/boot-test.ps1).
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: wick-windows-x86_64-${{ github.sha }}
+          path: |
+            lib/firecracker/build/cargo_target/release/firecracker.exe
+            winprobe.exe
+            tools/windows/boot-test.ps1
+          if-no-files-found: error
+          retention-days: 14
