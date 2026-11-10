@@ -110,3 +110,55 @@ fn test_os_str_bytes() {
     assert_eq!(OsString::from_vec(b"xyz".to_vec()), OsString::from("xyz"));
     assert_eq!(OsString::from("é").into_vec(), "é".as_bytes());
 }
+
+#[test]
+fn test_standard_descriptors() {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    let std = unsafe {
+        [
+            GetStdHandle(STD_INPUT_HANDLE),
+            GetStdHandle(STD_OUTPUT_HANDLE),
+            GetStdHandle(STD_ERROR_HANDLE),
+        ]
+    };
+    for (fd, h) in (0..).zip(std) {
+        assert_eq!(super::fd::handle(fd), h);
+    }
+    // Other values are the handle itself.
+    let f = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+    assert_eq!(super::fd::handle(f.as_raw_fd()), f.as_raw_handle() as HANDLE);
+}
+
+#[test]
+fn test_socket_duplicated_while_a_receive_waits() {
+    // A blocking receive must not hold up a duplication of its socket (the
+    // vhost-user frontend sends its own channel while it waits for the ack).
+    let (a, b) = UnixStream::pair().unwrap();
+    let a2 = a.try_clone().unwrap();
+    let waiter = std::thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        (&a2).read_exact(&mut buf).unwrap();
+        buf[0]
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let fd = a.as_raw_fd();
+    std::thread::spawn(move || {
+        let d = dup(fd).map(|d| unsafe { OwnedFd::from_raw_fd(d) });
+        let _ = done_tx.send(d);
+    });
+    let Ok(dup) = done_rx.recv_timeout(std::time::Duration::from_secs(5)) else {
+        // Closing the sockets would wait behind the receive as well.
+        std::mem::forget((a, b));
+        panic!("dup blocked behind a pending receive");
+    };
+    drop(dup.unwrap());
+    (&b).write_all(&[7]).unwrap();
+    assert_eq!(waiter.join().unwrap(), 7);
+}

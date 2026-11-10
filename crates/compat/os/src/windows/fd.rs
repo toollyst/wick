@@ -18,8 +18,11 @@ use std::os::windows::io::{
 
 use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
-    FROM_PROTOCOL_INFO, INVALID_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSADuplicateSocketW,
-    WSAENOTSOCK, WSAGetLastError, WSAPROTOCOL_INFOW, WSASocketW, closesocket,
+    FROM_PROTOCOL_INFO, INVALID_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
+    WSADuplicateSocketW, WSAENOTSOCK, WSAGetLastError, WSAPROTOCOL_INFOW, WSASocketW, closesocket,
+};
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
 
@@ -30,10 +33,20 @@ pub type RawFd = i32;
 // back. They cannot lose bits: Windows keeps handle and socket values in 32
 // bits (sign-extended), so 64-bit values convert to `i32` and back exactly.
 
-/// The handle a descriptor names.
+/// The handle a descriptor names. `0`, `1` and `2` (`STDIN_FILENO`,
+/// `STDOUT_FILENO`, `STDERR_FILENO`) name this process's standard handles,
+/// as in the compatibility libc: no kernel handle has those values (handles
+/// are multiples of 4 and 0 is `NULL`), so the mapping is unambiguous.
 #[allow(clippy::as_conversions)]
 pub fn handle(fd: RawFd) -> HANDLE {
-    fd as isize as HANDLE
+    let std = match fd {
+        0 => STD_INPUT_HANDLE,
+        1 => STD_OUTPUT_HANDLE,
+        2 => STD_ERROR_HANDLE,
+        _ => return fd as isize as HANDLE,
+    };
+    // SAFETY: plain call.
+    unsafe { GetStdHandle(std) }
 }
 
 /// The descriptor of a handle.
@@ -91,7 +104,7 @@ pub fn dup(fd: RawFd) -> std::io::Result<RawFd> {
                 FROM_PROTOCOL_INFO,
                 &info,
                 0,
-                WSA_FLAG_NO_HANDLE_INHERIT,
+                WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
             )
         };
         if s == INVALID_SOCKET {
