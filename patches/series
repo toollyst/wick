@@ -8,3 +8,4 @@
 0006-vmm-platform-module-overlay-vmm-platform.patch
 0007-block-async-engine-on-platform-async_io.patch
 0008-snapshot-memory-files-keep-holes-on-every-host.patch
+0009-net-the-network-device-s-host-side-is-platform-net.patch

@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 10 Nov 2026 12:34:24 +0900
+Subject: [PATCH] net: the network device's host side is platform::net
+
+Why: TAP devices exist only on Linux.
+
+What: the virtio-net device talks to `platform::net` (TAP on Linux; vmnet
+or a Unix datagram endpoint on macOS; a Unix stream endpoint with QEMU
+stream framing on Windows). The TUN driver's virtio-net header handling
+(checksum, TSO, UFO) is done by `platform::vnet` where there is no TUN.
+TAP-only tests stay Linux-only.
+
+Test: net device tests on each host; a guest gets an address and opens a
+TCP connection.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vmm/src/devices/virtio/net/device.rs     |  3 ++-
+ src/vmm/src/devices/virtio/net/mod.rs        |  8 ++++++--
+ src/vmm/src/devices/virtio/net/tap.rs        |  9 +++++++++
+ src/vmm/src/devices/virtio/net/test_utils.rs | 18 ++++++++++++++++++
+ 4 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/src/vmm/src/devices/virtio/net/device.rs b/src/vmm/src/devices/virtio/net/device.rs
+index 2fcc411a2cead65c56ae7bd79df27622fbf29357..482b4802d6a9cea5cbd01c933fed62cfc8957d1d 100644
+--- a/src/vmm/src/devices/virtio/net/device.rs
++++ b/src/vmm/src/devices/virtio/net/device.rs
+@@ -29,7 +29,6 @@ use crate::devices::virtio::iovec::{
+     IoVecBuffer, IoVecBufferMut, IoVecError, ParsedDescriptorChain,
+ };
+ use crate::devices::virtio::net::metrics::{NetDeviceMetrics, NetMetricsPerDevice};
+-use crate::devices::virtio::net::tap::Tap;
+ use crate::devices::virtio::net::{
+     MAX_BUFFER_SIZE, NET_QUEUE_SIZES, NetError, NetQueue, RX_INDEX, TX_INDEX, generated,
+ };
+@@ -42,6 +41,8 @@ use crate::impl_device_type;
+ use crate::logger::{IncMetric, METRICS, error, warn};
+ use crate::mmds::data_store::Mmds;
+ use crate::mmds::ns::MmdsNetworkStack;
++// wick: the host's backend of `platform::net`.
++use crate::platform::net::Tap;
+ use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenType};
+ use crate::utils::net::mac::MacAddr;
+ use crate::vmm_config::enclave::DmbSizeMib;
+diff --git a/src/vmm/src/devices/virtio/net/mod.rs b/src/vmm/src/devices/virtio/net/mod.rs
+index 371ae4568514a88741902a7f3299cfb082a72a4f..512cb269f23426cd8cd8696541cf3422306aa862 100644
+--- a/src/vmm/src/devices/virtio/net/mod.rs
++++ b/src/vmm/src/devices/virtio/net/mod.rs
+@@ -21,12 +21,16 @@ pub mod device;
+ mod event_handler;
+ pub mod metrics;
+ pub mod persist;
+-mod tap;
++// wick: the TUN/TAP device is the Linux backend of `platform::net`.
++pub(crate) mod tap;
+ pub mod test_utils;
+ 
+ mod generated;
+ 
+-pub use tap::{Tap, TapError};
++// wick: the device uses the host's backend of `platform::net`.
++pub use tap::TapError;
++
++pub use crate::platform::net::Tap;
+ use vm_memory::VolatileMemoryError;
+ 
+ pub use self::device::Net;
+diff --git a/src/vmm/src/devices/virtio/net/tap.rs b/src/vmm/src/devices/virtio/net/tap.rs
+index 58bc82d62c8d49b479ce0279b81e4c21ae39dc4d..a784645ca91027879733b0ff1ed62dca625489df 100644
+--- a/src/vmm/src/devices/virtio/net/tap.rs
++++ b/src/vmm/src/devices/virtio/net/tap.rs
+@@ -5,6 +5,10 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the THIRD-PARTY file.
+ 
++// wick: the TUN/TAP device is the Linux backend of `platform::net`; other
++// hosts only use its errors.
++#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
++
+ use std::fmt::{self, Debug};
+ use std::fs::File;
+ use std::io::Error as IoError;
+@@ -35,6 +39,9 @@ pub enum TapError {
+     SetOffloadFlags(IoError),
+     /// Error while setting size of the vnet header: {0}
+     SetSizeOfVnetHdr(IoError),
++    // wick: errors of the host backends that are not TUN/TAP.
++    /// Couldn't open the network backend {1}: {0}
++    Backend(IoError, String),
+ }
+ 
+ const TUNTAP: ::std::os::raw::c_uint = 84;
+@@ -215,6 +222,8 @@ impl AsRawFd for Tap {
+     }
+ }
+ 
++// wick: these tests need TUN/TAP; `platform::net` has the interface tests.
++#[cfg(target_os = "linux")]
+ #[cfg(test)]
+ pub mod tests {
+     #![allow(clippy::undocumented_unsafe_blocks)]
+diff --git a/src/vmm/src/devices/virtio/net/test_utils.rs b/src/vmm/src/devices/virtio/net/test_utils.rs
+index c2fd5d73ddd5e46d29376f4765cbaf27077557cd..8f6b96d974aefb8c854c4b89f9eea4942e5daf30 100644
+--- a/src/vmm/src/devices/virtio/net/test_utils.rs
++++ b/src/vmm/src/devices/virtio/net/test_utils.rs
+@@ -3,10 +3,16 @@
+ 
+ #![doc(hidden)]
+ 
++// wick: the packet-socket host side of a TAP below is Linux-only.
++#[cfg(target_os = "linux")]
+ use std::fs::File;
++#[cfg(target_os = "linux")]
+ use std::mem;
++#[cfg(target_os = "linux")]
+ use std::os::raw::c_ulong;
++#[cfg(target_os = "linux")]
+ use std::os::unix::io::{AsRawFd, FromRawFd};
++#[cfg(target_os = "linux")]
+ use std::process::Command;
+ use std::str::FromStr;
+ use std::sync::atomic::{AtomicUsize, Ordering};
+@@ -15,7 +21,11 @@ use std::sync::{Arc, Mutex};
+ use crate::devices::virtio::net::Net;
+ #[cfg(test)]
+ use crate::devices::virtio::net::device::vnet_hdr_len;
++#[cfg(target_os = "linux")]
+ use crate::devices::virtio::net::generated::net_device_flags;
++// wick: the host side of a TAP is a packet socket on Linux; other hosts
++// have their backend's own (`platform::net::simulator`).
++#[cfg(target_os = "linux")]
+ use crate::devices::virtio::net::tap::{IfReqBuilder, Tap};
+ use crate::devices::virtio::queue::Queue;
+ use crate::devices::virtio::test_utils::VirtQueue;
+@@ -92,12 +102,17 @@ pub enum NetEvent {
+     TxRateLimiter,
+ }
+ 
++#[cfg(not(target_os = "linux"))]
++pub use crate::platform::net::simulator::{TapTrafficSimulator, enable, if_index};
++
++#[cfg(target_os = "linux")]
+ #[derive(Debug)]
+ pub struct TapTrafficSimulator {
+     socket: File,
+     send_addr: libc::sockaddr_ll,
+ }
+ 
++#[cfg(target_os = "linux")]
+ impl TapTrafficSimulator {
+     pub fn new(tap_index: i32) -> Self {
+         // Create sockaddr_ll struct.
+@@ -189,6 +204,7 @@ impl TapTrafficSimulator {
+     }
+ }
+ 
++#[cfg(target_os = "linux")]
+ pub fn create_socket() -> File {
+     // SAFETY: This is safe since we check the return value.
+     let socket = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, libc::ETH_P_ALL.to_be()) };
+@@ -209,6 +225,7 @@ pub fn virtqueues(mem: &GuestMemoryMmap) -> (VirtQueue<'_>, VirtQueue<'_>) {
+     (rxq, txq)
+ }
+ 
++#[cfg(target_os = "linux")]
+ pub fn if_index(tap: &Tap) -> i32 {
+     let sock = create_socket();
+     let ifreq = IfReqBuilder::new()
+@@ -224,6 +241,7 @@ pub fn if_index(tap: &Tap) -> i32 {
+ }
+ 
+ /// Enable the tap interface.
++#[cfg(target_os = "linux")]
+ pub fn enable(tap: &Tap) {
+     // Disable IPv6 router advertisement requests
+     Command::new("sh")
