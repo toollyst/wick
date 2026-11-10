@@ -30,7 +30,8 @@ overlay/vmm/          modules compiled into upstream's vmm crate
 crates/compat/        compatibility builds of Linux-only dependencies
 crates/ext/           wick-ext: wick's features behind vmm::ext
 crates/version/       wick-version: the version the binaries report
-tools/                setup, patch workflow, generators, Linux tests against upstream and boot test, macOS run/test/boot test, vhost-user-blk test backend, Windows boot test and probe, release
+tools/                setup, patch workflow, generators, Linux tests against upstream and boot test, macOS run/test/boot test, vhost-user-blk test backend, Windows boot test and probe, release, fuzzing
+fuzz/                 fuzz targets for wick's own code: a crate of its own, outside upstream's workspace
 docs/                 the documentation (docs/README.md is the index)
 ```
 

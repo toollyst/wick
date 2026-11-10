@@ -105,7 +105,10 @@ upstream Firecracker and its jailer.
   API server, whose separate filter is a real boundary, into a process of its own.
 - **wick's host-side code is young.** The compatibility crates and the macOS and Windows backends (the
   Hypervisor.framework and WHP run loops, the userfaultfd kernel side, the network backends) have not had the years
-  of review and fuzzing upstream's code has had, and have not had a third-party audit.
+  of review and fuzzing upstream's code has had, and have not had a third-party audit. Fuzzing has started: the
+  virtio-net offload handling every non-Linux network backend uses (`vnet`) and the requests a userfaultfd handler
+  process sends on macOS have fuzz targets, which CI runs for a minute each
+  ([CONTRIBUTING.md](CONTRIBUTING.md#fuzzing)). The Hypervisor.framework and WHP run loops have none yet.
 - **Side channels** between VMs on the same host follow upstream's
   [production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md)
   guidance on Linux; the equivalent guidance for macOS and Windows hosts is not written yet.

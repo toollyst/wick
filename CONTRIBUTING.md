@@ -222,6 +222,36 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   (baselines measured on AWS bare metal), and in CI the 5.10 and 6.18 guest
   kernel variants of the integration tests (6.1, upstream's default, runs).
 
+## Fuzzing
+
+wick's own code that takes input from a guest, or from another process,
+has fuzz targets in `fuzz/` (cargo-fuzz: libFuzzer with AddressSanitizer
+and overflow checks). The crate is standalone, with its own workspace, and
+compiles wick's sources directly, so upstream's workspace does not change.
+
+| Target | Code | Input | Checked against |
+|---|---|---|---|
+| `vnet_segment` | `overlay/vmm/platform/vnet.rs` | any virtio-net header and frame a guest can put on its TX queue | a reference written from Linux in `fuzz/src/frame.rs` (`skb_checksum_help`, `tcp_gso_segment`, UFO, `ip6_find_1stfragopt`) |
+| `vnet_offload` | the same | well-formed frames with checksum offload, TSO or UFO, as a guest's offloads make them | the same reference; every such frame is accepted, and the checksums of the segments and of the datagram the fragments reassemble to verify |
+| `uffd_protocol` (macOS) | `crates/compat/libc/src/wick_uffd.rs` | the requests and records a page fault handler process sends | the state Linux's `UFFDIO_*` leave memory in; no descriptor left open |
+
+```sh
+tools/fuzz.sh                          # every target this host runs, 60 s each
+tools/fuzz.sh -t 3600 -j 4 vnet_offload
+```
+
+`tools/fuzz.sh --toolchain` names the pinned nightly the targets build with;
+cargo-fuzz comes from `cargo install cargo-fuzz --locked`. CI runs every
+target for a minute on Linux and macOS. An input that fails is saved in
+`fuzz/artifacts/<target>/`, and
+`cargo +<toolchain> fuzz run --fuzz-dir fuzz <target> <file>` runs it again.
+
+- A bug a target finds is fixed with a unit test in the crate that fails
+  without the fix; the corpus is not a test.
+- New code that parses what a guest or another process sends gets a
+  target, through the code's public API, with a reference to check it
+  against where one exists.
+
 ## Pull requests
 
 - One change per pull request, with a test that fails without it: a unit test in the crate, an interface test in

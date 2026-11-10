@@ -33,6 +33,7 @@ tools/                    everything you run by hand or in CI (below)
   macos/                  run, test and boot-test on Apple silicon
   windows/                boot test and host capability probe for a Windows PC
   vhost-user-blk/         a vhost-user-blk backend used by the macOS boot test
+fuzz/                     fuzz targets for wick's own code (a crate of its own, CONTRIBUTING.md "Fuzzing")
 docs/                     these pages
 .github/workflows/        ci.yml (every push and pull request), release.yml (tags v*)
 ```
@@ -89,6 +90,7 @@ tools/patches.sh check                  # what CI checks about patches/
 | [`tools/gen-kvm-bindings-windows.sh`](../tools/gen-kvm-bindings-windows.sh) | Generates `kvm-bindings` with the Linux x86_64 layout for Windows (`--check` in CI) |
 | [`tools/package-release.sh`](../tools/package-release.sh) | Packages a macOS release in upstream's release layout, with its SBOM ([`tools/sbom.py`](../tools/sbom.py) checks it against `Cargo.lock`) |
 | [`tools/check-dependencies.sh`](../tools/check-dependencies.sh) | Dependency checks: advisories, licenses, banned and duplicate crates, sources ([CONTRIBUTING.md](../CONTRIBUTING.md#dependencies)) |
+| [`tools/fuzz.sh`](../tools/fuzz.sh) | Runs the fuzz targets in `fuzz/` for a given time each (`-t SECONDS`, `-j JOBS`) |
 
 ## Where the rules live
 
