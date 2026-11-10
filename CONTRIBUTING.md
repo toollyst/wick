@@ -110,6 +110,43 @@ Compatibility crates re-export the original crate from the same git tag; when
 upstream moves to a new version of a crate, the compatibility crate's tag and
 version move with it.
 
+## Dependencies
+
+CI checks the dependencies on every push and weekly, and the release workflow
+before it builds. Run the same checks locally (they need the network):
+
+```sh
+cargo install --locked cargo-deny --version 0.19.0   # upstream's version, see below
+tools/check-dependencies.sh
+```
+
+They cover `lib/firecracker/Cargo.lock` (with wick's patches) and
+`tools/vhost-user-blk/Cargo.lock`, for every target:
+
+- cargo-deny with upstream's own policy (`lib/firecracker/deny.toml`), as
+  upstream runs it, and with wick's (`tools/deny.toml`, and
+  `tools/vhost-user-blk/deny.toml` for the test backend), warnings as errors:
+  RustSec advisories (vulnerable, unmaintained, unsound, yanked crates);
+  licenses from upstream's list, all compatible with Apache-2.0 (MIT,
+  Apache-2.0, BSD-3-Clause, 0BSD, ISC, Unicode-3.0); upstream's banned
+  crates; no crate in two versions unless upstream's lockfile has both; and
+  sources: crates.io and the git repositories listed in `tools/deny.toml`
+  only.
+- `tools/linux/check-dependency-sources.py`: every crate taken from git is,
+  file by file, the crates.io release upstream's lockfile uses.
+
+The cargo-deny version is the one upstream's development container installs
+(`lib/firecracker/tools/devctr/Dockerfile`); the script refuses any other. It
+also refuses to run when `lib/firecracker/deny.toml` is not the file
+`tools/deny.toml` was made from (the hash in `tools/deny.toml`): after a
+rebase, carry upstream's changes over and update the hash.
+
+An advisory is fixed by moving to a fixed version of the crate (`cargo update
+-p <crate>` in lib/firecracker, then amend the lockfile patch), not by
+ignoring it. An `ignore` entry is accepted only for an advisory upstream
+ignores in its own `deny.toml`, with upstream's reason. A new git source or a
+second version of a crate needs an entry in `tools/deny.toml` that says why.
+
 ## Releases
 
 A release on an upstream base carries upstream's version: `v1.18.0` is wick
@@ -130,10 +167,27 @@ For a fix release on the same upstream, raise it in `patches/version` in a
 commit of its own on `main` (`release: 1.18.0+wick.1`) and tag that commit
 with the same version, `v1.18.0+wick.1`. Pushing a tag runs the release workflow,
 which refuses a tag that is not exactly `v` + the version from those two
-files, then builds and packages the macOS binary
+files, runs the dependency checks, then builds and packages the macOS binary
 (`tools/package-release.sh`) and checks that it reports the tag. Hosted
 runners cannot run Hypervisor.framework guests, so run the L3 scenarios on a
 Mac before tagging.
+
+A release has the archive, an SBOM, `SHA256SUMS` and signed build provenance
+([SECURITY.md](SECURITY.md#verifying-a-release)). Each job of the workflow has
+only the permissions it needs: the build can read the repository, a separate
+job signs the attestations, and the last one, which runs no code from the
+repository, publishes. Actions are pinned by full commit SHA (CI checks it);
+update the SHA and its version comment together.
+
+What a release is built with is pinned: the Rust toolchain is upstream's
+(`lib/firecracker/rust-toolchain.toml`, installed by rustup on first use),
+every build is `--locked` to `Cargo.lock` (upstream's `tools/release.sh`,
+which has no `--locked`, is checked to leave the lockfile unchanged in CI),
+and the release tools are installed with `cargo install --locked` at fixed
+versions (cargo-deny at upstream's, cargo-cyclonedx at the one in
+`tools/common.sh`). The SBOM is the same for the same commit on every
+machine. The binary is not yet checked to be bit-for-bit reproducible, and
+the runner image (`macos-15`) is GitHub's and changes over time.
 
 ## Tests
 
@@ -172,7 +226,8 @@ Mac before tagging.
   `platform::<iface>::tests` that runs against every backend, or a scenario in the boot tests.
 - Say which hosts you built and tested on. A change to a macOS backend needs a `tools/macos/boot-test.sh` run; a
   change to a Windows backend that you could not run on a WHP machine should say so, and someone with one will.
-- Run the checks CI runs: `tools/patches.sh check`, the build and clippy for your host, and the compatibility crates'
-  tests (`.github/workflows/ci.yml` has the exact commands).
+- Run the checks CI runs: `tools/patches.sh check`, the build and clippy for your host, the compatibility crates'
+  tests (`.github/workflows/ci.yml` has the exact commands), and `tools/check-dependencies.sh` if you changed a
+  `Cargo.toml` or `Cargo.lock`.
 
 By contributing, you agree that your work is licensed under the project's license (Apache-2.0).

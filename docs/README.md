@@ -85,7 +85,8 @@ tools/patches.sh check                  # what CI checks about patches/
 | [`tools/windows/winprobe.c`](../tools/windows/winprobe.c) | Measures the Windows mechanisms the sandbox and jailer backends use |
 | [`tools/gen-windows-sources.sh`](../tools/gen-windows-sources.sh) | Generates the Windows builds of the rust-vmm crates (`--check` in CI) |
 | [`tools/gen-kvm-bindings-windows.sh`](../tools/gen-kvm-bindings-windows.sh) | Generates `kvm-bindings` with the Linux x86_64 layout for Windows (`--check` in CI) |
-| [`tools/package-release.sh`](../tools/package-release.sh) | Packages a macOS release in upstream's release layout |
+| [`tools/package-release.sh`](../tools/package-release.sh) | Packages a macOS release in upstream's release layout, with its SBOM ([`tools/sbom.py`](../tools/sbom.py) checks it against `Cargo.lock`) |
+| [`tools/check-dependencies.sh`](../tools/check-dependencies.sh) | Dependency checks: advisories, licenses, banned and duplicate crates, sources ([CONTRIBUTING.md](../CONTRIBUTING.md#dependencies)) |
 
 ## Where the rules live
 
@@ -100,3 +101,5 @@ tools/patches.sh check                  # what CI checks about patches/
 | How a wick feature is reached (`PUT /extensions/{name}`, the config file's `extensions`) | [`overlay/vmm/ext/mod.rs`](../overlay/vmm/ext/mod.rs), [`crates/ext`](../crates/ext/src/lib.rs) |
 | How a Linux facility is rebuilt on Windows | the comments of each `crates/compat/*/src/windows*` module |
 | What CI runs on each OS | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) |
+| Which advisories, licenses, crates and sources the dependencies may have | [`tools/deny.toml`](../tools/deny.toml), from upstream's `lib/firecracker/deny.toml` |
+| What a release contains and how it is signed | [`.github/workflows/release.yml`](../.github/workflows/release.yml), [SECURITY.md](../SECURITY.md#verifying-a-release) |
