@@ -27,10 +27,11 @@ rootfs; on Windows, by [`tools/windows/boot-test.ps1`](../tools/windows/boot-tes
 | virtio-blk (Async) | upstream (io_uring) | works (worker threads) | built, validation pending |
 | vsock (UDS) | upstream | works (host→guest `CONNECT`, guest→host `<uds>_<port>`, MMIO and PCI) | built, validation pending |
 | virtio-net | upstream (TAP) | works (vmnet, Unix datagram endpoint) | built (Unix stream endpoint), validation pending |
-| PCI / MSI-X | upstream | works (`--enable-pci`, GICv2m MSI frame) | planned |
-| Snapshots | upstream | works (full and diff, restore in another process, `snapshot-editor rebase`, with PCI) | planned |
-| userfaultfd (`Uffd` memory backend) | upstream | works | planned |
-| hugepages | upstream | planned (uffd granularity) | planned (large pages) |
+| PCI / MSI-X | upstream | works (`--enable-pci`, GICv2m MSI frame) | built (MSI routes on the WHP LAPIC), validation pending |
+| Snapshots | upstream | works (full and diff, restore in another process, `snapshot-editor rebase`, with PCI) | built (vCPU events through WHP's pending-interruption registers, `snapshot-editor` on Windows), validation pending |
+| userfaultfd (`Uffd` memory backend) | upstream | works | built (vectored exception handler, WHP memory access exits, section alias), validation pending |
+| vhost-user | upstream | works (vhost-user-blk backend in another process) | built, validation pending |
+| hugepages | upstream | planned (uffd granularity) | built (`MEM_LARGE_PAGES`, needs "Lock pages in memory"), validation pending |
 | seccomp | upstream | Seatbelt | process mitigation policies |
 | jailer | upstream | in place: upstream's jailer; chroot, uid/gid, memory cgroup, resource limits, daemonize (CPU cgroups planned) | planned |
 
@@ -91,17 +92,20 @@ Platform, and the Windows column of [At a glance](#at-a-glance) says "works" for
   synchronous sockets that blocked descriptor passing behind a pending receive and standard descriptors passed as
   raw handle values (both fixed); a standard input that is a pipe is now pollable, so the serial console reads it as
   on Linux.
-- Next, on real hardware:
-  1. A first guest boot with upstream's x86_64 CI kernel and rootfs (`tools/windows/boot-test.ps1`: boot, SMP,
-     block, vsock, virtio-net over the Unix stream endpoint; the steps are in
-     [tools/windows/README.md](../tools/windows/README.md)): the LAPIC register page (`get/set_lapic`), AP start-up
-     through WHP's INIT/SIPI handling, CPUID hypervisor leaves and the guest clock, the vCPU kick at run time.
-     Reading the backend against upstream's boot path before that found the vCPU kick handle
-     (`create_vcpu_from_rawfd`) missing, which no boot gets past, a kick lost when it lands just before a run, APs
-     not held for their SIPI, a 1 KiB LAPIC exchange and a fatal HLT exit (all fixed).
-  2. WHP inside an AppContainer and under the full mitigation profile.
-  3. The fd-passing changes for jailed processes ([M5](#m5-security-parity-the-jailer-on-every-host)).
-- After that: PCI / MSI-X, snapshots and userfaultfd on Windows (planned in [At a glance](#at-a-glance)).
+- First run on real hardware (AMD Ryzen 9 7900, Windows 11 Pro build 26300, WHP): every stage failed before the
+  guest started, on the terminal mode of a standard input that is a pipe (the console API fails on a pipe; the
+  original leaves a descriptor that is not a TTY alone). Fixed; the stages run again with that fix.
+- Built since, with the boot test stages that check them (`snapshot`, `diff`, `uffd`, `pci`, `vhost-user`,
+  `hugepages`, the counterparts of the macOS ones): vCPU events for snapshots (WHP's pending-interruption and
+  interrupt-state registers), `snapshot-editor`, the Uffd backend (`libc::wick_uffd` on Windows: missing pages
+  `PAGE_NOACCESS`, a vectored exception handler for host threads, WHP memory access exits for guests, fills
+  through a second view of a pagefile section; upstream's `uffd_on_demand_handler` builds for Windows), the
+  vhost-user-blk test backend, and huge pages (`MEM_LARGE_PAGES`).
+- Measured on that machine: WHP honours the host protection of guest RAM (a guest access to a `PAGE_NOACCESS` page
+  exits at the instruction and re-runs once the page is accessible), which the Uffd backend relies on; WHP is
+  refused inside an AppContainer (`E_ACCESSDENIED`) but works for a process on a restricted, low integrity token
+  that has no access to the user's files ([M5](#m5-security-parity-the-jailer-on-every-host)).
+- Next: every boot test stage passing on that machine, then the jailer ([M5](#m5-security-parity-the-jailer-on-every-host)).
 
 ## M4. Linux: upstream parity
 
@@ -125,14 +129,15 @@ gives each control a native backend. Each row names the mechanism; "verified" ma
 host with a probe, "in place" what the jailer does today. On macOS upstream's jailer runs, with its Linux-only
 primitives behind backends in `overlay/jailer/platform` (patch 0016) and the jail handed over to Firecracker,
 since no program can start inside a chroot there (dyld maps the system libraries from outside it);
-`tools/macos/jailer-test.sh` checks it as root, on CI without a VM. On Windows the jailer is not available yet.
+`tools/macos/jailer-test.sh` checks it as root, on CI without a VM. On Windows the jailer is not available yet;
+the Windows column is what has been measured for it on a WHP machine.
 
 | Control | macOS | Windows |
 | --- | --- | --- |
 | System call filter | Seatbelt `syscall-unix` allow-lists (kernel-enforced, process-wide; verified) | win32k lockdown, ACG, strict handle checks, extension-point and image-load policies (verified with Firecracker's run-time needs) |
-| chroot | in place: `chroot(2)` by the jailer, and by Firecracker first thing after the exec; Seatbelt file rule limited to the jail | AppContainer + jail directory ACL (user files denied, verified) |
-| network namespace | in place: Seatbelt denies IP networking; `--netns` is refused | AppContainer without capabilities (internet and loopback blocked, `AF_UNIX` API socket works; verified) |
-| uid/gid | in place: dropped by Firecracker right after its chroot, exec'd from a root-owned copy the jailed user never could write | per-VM AppContainer SID |
+| chroot | in place: `chroot(2)` by the jailer, and by Firecracker first thing after the exec; Seatbelt file rule limited to the jail | the jail as a drive of its own (`DefineDosDevice`) and the current directory its root, so Firecracker's `/run/...` paths, files and `AF_UNIX` sockets alike, resolve inside it (verified); access outside it is the token's (below) |
+| network namespace | in place: Seatbelt denies IP networking; `--netns` is refused | planned: Windows Filtering Platform. An AppContainer would block IP networking (verified) but WHP refuses an AppContainer (`E_ACCESSDENIED`, verified), so the jailer cannot use one |
+| uid/gid | in place: dropped by Firecracker right after its chroot, exec'd from a root-owned copy the jailed user never could write | a restricted token without the user's SID, at low integrity, with an initial impersonation token for process start-up that Firecracker reverts first thing (the Chromium sandbox's pattern): WHP works, the user's files are denied (verified) |
 | cgroups memory | in place: `memory.max` / `memory.limit_in_bytes` → jetsam limit at the exec, the jailer's priority kept (a guest past the limit kills the VMM; measured) | Job Object commit limit (kills at the limit; verified). Shared sections are not charged to the job: memfd-backed memory goes through a jailer broker |
 | cgroups CPU | planned: vCPU time quota in the VMM run loop; `cpu.*` is refused until then | Job Object hard cap (verified) |
 | hugepages | 2 MiB fault/copy granularity in the uffd kernel side (no host superpages on Apple silicon) | `MEM_LARGE_PAGES` / `SEC_LARGE_PAGES` (verified); the privilege is stripped inside an AppContainer, so the jailer creates the section |
