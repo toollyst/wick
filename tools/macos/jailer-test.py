@@ -58,7 +58,8 @@ class Jail:
 class JailedVm(bt.Vm):
     """A Firecracker process started by the jailer, its console on a pipe."""
 
-    def __init__(self, ctx, name, jail, jailer_args=(), fc_args=(), config=None, wait_api=True):
+    def __init__(self, ctx, name, jail, jailer_args=(), fc_args=(), config=None, wait_api=True,
+                 pass_fds=()):
         self.ctx = ctx
         self.name = name
         self.jail = jail
@@ -76,7 +77,7 @@ class JailedVm(bt.Vm):
         self.cond = bt.threading.Condition()
         self.log = open(self.log_path, "w")
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT)
+                                     stderr=subprocess.STDOUT, pass_fds=pass_fds)
         self.pump = bt.threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
         ctx.vms.append(self)
@@ -211,7 +212,19 @@ def stage_jail(ctx):
     with open(secret, "w") as f:
         f.write("outside")
     os.symlink("/etc/hosts", jail.host("/hosts-link"))
-    vm = JailedVm(ctx, "jail", jail)
+    # Descriptors the jailer inherits: a file and a directory outside the
+    # jail (fchdir to one would leave the chroot). Upstream's
+    # close_fds_by_close_range closes them before the exec.
+    outside = os.path.join(ctx.base, "outside-dir")
+    os.mkdir(outside)
+    leaked = [os.open(secret, os.O_RDONLY), os.open(outside, os.O_RDONLY)]
+    for fd in leaked:
+        os.set_inheritable(fd, True)
+    try:
+        vm = JailedVm(ctx, "jail", jail, pass_fds=leaked)
+    finally:
+        for fd in leaked:
+            os.close(fd)
     pid = vm.proc.pid
     uid, gid, _ = proc_ids(pid)
     check((uid, gid) == (UID, GID), f"uid/gid {uid}/{gid}")
@@ -233,6 +246,11 @@ def stage_jail(ctx):
     txt = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "txt", "-Fn"], capture_output=True,
                          text=True).stdout
     check(f"n{exe}" in txt.splitlines(), f"executable of {pid} is not {exe}: {txt!r}")
+    names = subprocess.run(["lsof", "-a", "-p", str(pid), "-Fn"], capture_output=True,
+                           text=True).stdout.splitlines()
+    for path in (secret, outside):
+        check(f"n{os.path.realpath(path)}" not in names and f"n{path}" not in names,
+              f"Firecracker holds the jailer's descriptor for {path}")
     # Inside the jail: the kernel by its jailed path.
     vm.api("PUT", "/boot-source", {"kernel_image_path": "/" + bt.KERNEL, "boot_args": bt.BOOT_ARGS})
     # Outside it: by an absolute path, by `..`, by a link planted in the jail.
@@ -243,7 +261,8 @@ def stage_jail(ctx):
     # (vsock's guest-to-host connections, a network endpoint).
     vm.api("PUT", "/vsock", {"guest_cid": 3, "uds_path": "/v.sock"})
     vm.kill()
-    return "uid/gid, pid file, chroot, exec'd from a root-owned copy; outside files unreachable"
+    return ("uid/gid, pid file, chroot, exec'd from a root-owned copy, no inherited descriptors; "
+            "outside files unreachable")
 
 
 def stage_daemonize(ctx):
