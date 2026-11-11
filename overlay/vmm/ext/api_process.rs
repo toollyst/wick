@@ -390,7 +390,9 @@ mod macos {
     }
 
     /// The listening socket bound to `path` (the HTTP server's, which it
-    /// does not hand out).
+    /// does not hand out). macOS has no `SO_ACCEPTCONN` to read
+    /// (`ENOPROTOOPT`); a listener is the socket bound there with no peer,
+    /// as an accepted connection names the same path.
     fn listener_fd(path: &Path) -> Result<RawFd, ApiProcessError> {
         let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let want = canonical(path);
@@ -407,20 +409,16 @@ mod macos {
             {
                 continue;
             }
-            let mut listening: libc::c_int = 0;
-            let mut optlen =
-                libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).unwrap();
+            // SAFETY: an all-zero sockaddr_un is a valid output buffer.
+            let mut peer: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            let mut peer_len =
+                libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_un>()).unwrap();
             // SAFETY: a valid output buffer and its length.
-            let ret = unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_ACCEPTCONN,
-                    std::ptr::from_mut(&mut listening).cast(),
-                    &mut optlen,
-                )
-            };
-            if ret != 0 || listening == 0 {
+            let connected =
+                unsafe { libc::getpeername(fd, std::ptr::from_mut(&mut peer).cast(), &mut peer_len) };
+            if connected == 0
+                || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOTCONN)
+            {
                 continue;
             }
             // SAFETY: sun_path is NUL-terminated (zeroed above, and the
@@ -654,6 +652,35 @@ mod macos {
                     link.error(&format!("API Server encountered an error on response: {err}"))?;
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        use super::listener_fd;
+
+        #[test]
+        fn test_listener_is_found_among_connections_to_it() {
+            let dir = tempfile_dir();
+            let path = dir.join("api.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            // A connection each way names the same path.
+            let client = UnixStream::connect(&path).unwrap();
+            let (accepted, _) = listener.accept().unwrap();
+            assert_eq!(listener_fd(&path).unwrap(), listener.as_raw_fd());
+            drop((client, accepted));
+            listener_fd(&dir.join("other.sock")).unwrap_err();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A short directory: a Unix socket path is at most 104 bytes.
+        fn tempfile_dir() -> std::path::PathBuf {
+            let dir = std::path::PathBuf::from(format!("/tmp/wick-api-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
         }
     }
 }
