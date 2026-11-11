@@ -112,7 +112,8 @@ mod macos {
 ; for a seccomp violation, except what DENIED_WITH_ERROR lists (default_rule).
 (deny default)
 ; Unix sockets only: API server, vsock backends, console. Binding one is
-; setup's (SETUP_OPERATIONS), as on Linux the VMM thread's filter has no bind.
+; setup's (RUN_DENIED_OPERATIONS), as on Linux the VMM thread's filter has no
+; bind.
 (allow network-inbound (local unix-socket))
 (allow network-outbound (remote unix-socket))
 ; Guest memory backed by POSIX shared memory (memfd_create): only the
@@ -694,11 +695,18 @@ mod macos {
     /// changing a file's mode, owner, flags, times, extended attributes or
     /// ACL, and cloning one. They raise SIGSYS, as `chmod`, `fchmod`,
     /// `chown`, `utimensat`, `setxattr` and `copy_file_range` are in none
-    /// of upstream's filters. Seatbelt decides their system calls by these
-    /// operations, not by number ([`UNFILTERED_SYSCALLS`]).
+    /// of upstream's filters. And binding a Unix socket, which the
+    /// `network-inbound` rule allows until then (it decides a bind no
+    /// `network-bind` rule matches; this one, for the same operation and
+    /// with a filter, is the more specific, measured): as Linux's VMM filter
+    /// has no `bind`, every socket Firecracker binds (network endpoints, the
+    /// vsock device's) is bound while the microVM is built or restored.
+    /// Seatbelt decides their system calls by these operations, not by
+    /// number ([`UNFILTERED_SYSCALLS`]).
     pub const RUN_DENIED_OPERATIONS: &[&str] = &[
         "file-write-mode", "file-write-owner", "file-write-flags", "file-write-times",
         "file-write-xattr", "file-write-acl", "file-write-setugid", "file-clone",
+        "network-bind",
     ];
 
     /// The `fcntl` commands a running microVM may use (`F_<name>`,
@@ -802,10 +810,9 @@ mod macos {
     /// terminal. Binding a Unix socket is not here: Seatbelt decides it by
     /// the `network-inbound` rule (measured: with `(deny network-bind)` and
     /// that rule, a bind is allowed unless the deny is the more specific
-    /// rule), which a running microVM keeps for a network endpoint (Linux's
-    /// VMM filter opens the TAP device at net hotplug); a stream socket
-    /// cannot listen after [`narrow`] (`listen` is in [`SETUP_SYSCALLS`]), as
-    /// Linux's VMM filter has no `bind` or `listen`.
+    /// rule), so [`RUN_DENIED_OPERATIONS`] denies it after [`narrow`]; a
+    /// stream socket cannot listen then either (`listen` is in
+    /// [`SETUP_SYSCALLS`]), as Linux's VMM filter has no `bind` or `listen`.
     pub const SETUP_OPERATIONS: &[&str] = &[
         "file-ioctl",
         "sysctl-read",
@@ -2039,23 +2046,100 @@ mod macos {
         }
 
         // Listening on a Unix socket is setup's only: Linux's VMM filter has
-        // no bind or listen. A datagram endpoint is still bound after
-        // narrow() (network-inbound decides a Unix bind, measured), as Linux
-        // opens the TAP device of a hotplugged net device in the run phase.
+        // no bind or listen. A socket bound before narrow() (its name gone)
+        // cannot listen after it.
         #[test]
         #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
         fn listen_after_narrow_child() {
             let path = std::env::temp_dir().join(format!("wick-bind-{}", std::process::id()));
-            let endpoint = std::env::temp_dir().join(format!("wick-endpoint-{}", std::process::id()));
             select(Policy::Default);
             apply().unwrap();
-            let early = std::os::unix::net::UnixListener::bind(&path).unwrap();
-            drop(early);
-            let _ = std::fs::remove_file(&path);
+            // SAFETY: plain calls on a socket this child makes.
+            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            assert!(fd >= 0);
+            let (addr, len) = sockaddr_un(&path);
+            // SAFETY: a socket address of the given length.
+            assert_eq!(unsafe { libc::bind(fd, (&raw const addr).cast(), len) }, 0);
+            std::fs::remove_file(&path).unwrap();
+            println!("SETUP-BIND-OK");
             narrow().unwrap();
-            let _ep = std::os::unix::net::UnixDatagram::bind(&endpoint).unwrap();
-            std::fs::remove_file(&endpoint).unwrap();
-            let _ = std::os::unix::net::UnixListener::bind(&path);
+            // SAFETY: a bound socket.
+            unsafe { libc::listen(fd, 1) };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        /// A Unix socket address for `path`.
+        fn sockaddr_un(path: &std::path::Path) -> (libc::sockaddr_un, libc::socklen_t) {
+            use std::os::unix::ffi::OsStrExt;
+            // SAFETY: plain data.
+            let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            let bytes = path.as_os_str().as_bytes();
+            assert!(bytes.len() < addr.sun_path.len(), "{path:?}");
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
+                *to = *from as libc::c_char;
+            }
+            let len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_un>()).unwrap();
+            (addr, len)
+        }
+
+        // Binding a Unix socket is setup's only, as Linux's VMM filter has no
+        // bind: a datagram endpoint and a stream socket bind before narrow(),
+        // and after it binding either raises SIGSYS (RUN_DENIED_OPERATIONS),
+        // in a jail's network too.
+        #[test]
+        fn test_unix_bind_is_setups_only() {
+            use std::os::unix::process::ExitStatusExt;
+            let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("wick-bind-{}", std::process::id()));
+            let (jail, net) = (base.join("jail"), base.join("net"));
+            for case in ["datagram", "stream", "datagram-network"] {
+                std::fs::create_dir_all(&jail).unwrap();
+                std::fs::create_dir_all(&net).unwrap();
+                let out = child(
+                    "bind_after_narrow_child",
+                    &[("WICK_TEST_CASE", case), ("WICK_TEST_JAIL", jail.to_str().unwrap())],
+                );
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
+                assert!(stdout.contains("SETUP-BIND-OK") && !stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+                std::fs::remove_dir_all(&base).unwrap();
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_unix_bind_is_setups_only in a separate process"]
+        fn bind_after_narrow_child() {
+            let case = std::env::var("WICK_TEST_CASE").unwrap();
+            let jail = std::path::PathBuf::from(std::env::var("WICK_TEST_JAIL").unwrap());
+            let net = jail.parent().unwrap().join("net");
+            let (dir, network) = match case.as_str() {
+                "datagram-network" => (net.clone(), Some(net.as_path())),
+                _ => (jail.clone(), None),
+            };
+            let profile = profile_for(Some(&jail), network).unwrap();
+            COMPILED
+                .set((Compiled::here(&profile).unwrap(), Compiled::here(&api_profile()).unwrap()))
+                .unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            let bind = |name: &str| {
+                let kind = if case == "stream" { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
+                // SAFETY: plain calls on a socket made here.
+                let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+                assert!(fd >= 0);
+                let (addr, len) = sockaddr_un(&dir.join(name));
+                // SAFETY: a socket address of the given length.
+                unsafe { libc::bind(fd, (&raw const addr).cast(), len) }
+            };
+            assert_eq!(bind("early"), 0, "{}", std::io::Error::last_os_error());
+            println!("SETUP-BIND-OK");
+            narrow().unwrap();
+            println!("NARROWED");
+            bind("late");
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
         }
