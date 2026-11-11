@@ -79,7 +79,7 @@ export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/lib/firecracker/build/cargo_target}"
 (cd "$ROOT/lib/firecracker" && CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked --release \
     -p firecracker -p jailer -p snapshot-editor -p rebase-snap -p cpu-template-helper \
-    -p seccompiler --bins --examples)
+    -p seccompiler -p log-instrument --bins --examples)
 bin="$out/bin"
 mkdir -p "$bin/examples"
 for b in firecracker jailer snapshot-editor rebase-snap cpu-template-helper seccompiler-bin; do
@@ -142,6 +142,7 @@ env_args=(
     "PYTHONPATH=$ROOT/tools/macos/integration"
     "WICK_IT_MODE=$mode" "WICK_IT_ROOT=$session" "TMPDIR=$session/tmp"
     "WICK_IT_NETNS_HELPER=$bin/netns-slirp" "WICK_IT_VHOST_USER_BLK=$bin/vhost-user-blk"
+    "WICK_IT_BINARY_DIR=$bin"
     "PYTEST_ADDOPTS=${PYTEST_ADDOPTS:-}"
 )
 mkdir -p "$session/tmp"

@@ -72,6 +72,12 @@ def hvf_available():
 import framework.defs as _defs  # noqa: E402  pylint: disable=wrong-import-position
 
 _defs.DEFAULT_TEST_SESSION_ROOT_PATH = SESSION_ROOT
+# Where tests find the binaries they do not take from --binary-dir (upstream:
+# build/cargo_target/<arch>-unknown-linux-musl/release, the build devtool
+# makes): the same directory, the release build signed for macOS
+# (tools/macos/integration-tests.sh).
+if os.environ.get("WICK_IT_BINARY_DIR"):
+    _defs.DEFAULT_BINARY_DIR = pathlib.Path(os.environ["WICK_IT_BINARY_DIR"])
 
 import framework.utils as _utils  # noqa: E402  pylint: disable=wrong-import-position
 import framework.utils_cpuid as _cpuid  # noqa: E402  pylint: disable=wrong-import-position

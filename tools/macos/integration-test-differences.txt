@@ -66,6 +66,20 @@ all impossible integration_tests/functional/test_binary.py::test_release_debugin
 
 # Transparent huge pages (madvise MADV_HUGEPAGE): macOS has no huge pages for
 # a process's memory, and the call fails (EINVAL) rather than being ignored
-# (docs/PORTING.md row 10).
+# (docs/PORTING.md row 10). test_transparent_huge_pages_allocation counts
+# them in /proc/<pid>/smaps (AnonHugePages), which macOS does not have.
 all row-10 integration_tests/functional/test_shut_down.py::test_reboot[vmlinux-6.1.188-PCI_ON-kvm-Transparent]
 all row-10 integration_tests/functional/test_shut_down.py::test_reboot[vmlinux-6.1.188-PCI_OFF-kvm-Transparent]
+all row-10 integration_tests/functional/test_huge_pages.py::test_transparent_huge_pages_allocation
+
+# Firecracker without arguments binds upstream's default API socket,
+# /run/firecracker.socket. macOS's root is the sealed, read-only system
+# volume: it has no /run and none can be made while it runs (only
+# synthetic.conf, at boot), so Firecracker exits 1 (measured: `ls /run`, No
+# such file or directory; `mount`: / is "sealed, local, read-only").
+all impossible integration_tests/functional/test_cmd_line_parameters.py::test_cli_no_params
+
+# The test mounts a 512 MiB tmpfs at /mnt/<worker>: on macOS's sealed,
+# read-only system volume there is no /mnt and none can be made ("Read-only
+# file system: '/mnt'").
+all impossible integration_tests/functional/test_snapshot_not_losing_dirty_pages.py::test_diff_snapshot_works_after_error
