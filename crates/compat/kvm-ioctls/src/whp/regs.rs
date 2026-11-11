@@ -719,6 +719,16 @@ pub(crate) fn mask_unsupported(e: &mut kvm_bindings::kvm_cpuid_entry2) {
         }
         _ => {}
     }
+    // The APIC ID of the host processor the query ran on: no vCPU's, and not
+    // the same from one call to the next (measured: cpu-template-helper's
+    // fingerprints of one host differed in 0x80000026 EDX). Firecracker
+    // writes each vCPU's own into leaves 1, 0xB, 0x1F and 0x8000001E.
+    match e.function {
+        0x1 => e.ebx &= 0x00ff_ffff,
+        0xb | 0x1f | 0x8000_0026 => e.edx = 0,
+        0x8000_001e => e.eax = 0,
+        _ => {}
+    }
 }
 
 /// The size of an XSAVE area holding the state components of `mask`, as

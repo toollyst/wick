@@ -114,6 +114,35 @@ impossible integration_tests/functional/test_huge_pages.py::test_transparent_hug
 # system's DLLs (ntdll, kernel32, WinHvPlatform); there is no static form.
 impossible integration_tests/functional/test_binary.py::test_firecracker_binary_static_linking
 
+# The release's ELF sections and symbol table (readelf on firecracker and
+# firecracker.debug): a Windows release is a PE image with its debug
+# information in a PDB.
+impossible integration_tests/functional/test_binary.py::test_release_debuginfo
+impossible integration_tests/functional/test_binary.py::test_release_no_gdb
+
+# Firecracker started with no arguments listens on upstream's default API
+# socket, /run/firecracker.socket, in the /run every Linux host has. On
+# Windows that path is \run on the current drive, which no Windows host has;
+# Firecracker fails to bind it, as on a Linux host without /run.
+impossible integration_tests/functional/test_cmd_line_parameters.py::test_cli_no_params
+
+# A drive backed by a block device: a loop device (losetup) linked into the
+# jail with mknod. Windows has no device nodes to make in a directory, and no
+# loop devices.
+impossible integration_tests/functional/test_drive_virtio.py::test_rescan_dev
+
+# Characters pushed into Firecracker's terminal (TIOCSTI on
+# /proc/<pid>/fd/0): Windows has no tty ioctls; Firecracker's console is a
+# pipe from the jailer (overlay/jailer/platform/windows/console.rs).
+impossible integration_tests/functional/test_serial_io.py::test_serial_dos
+
+# Builds of Firecracker for Linux's musl target with the fuzzing and gdb
+# features, and of the instrumented binary: the tests build and run Linux
+# binaries. Their Windows builds are not made yet.
+bug integration_tests/functional/test_fuzzing.py::test_fuzzing_warning
+bug integration_tests/functional/test_gdb.py::test_gdb_connects
+bug integration_tests/functional/test_instrumented_firecracker.py::test_log_instrument_firecracker_basic_functionality
+
 # A host program run inside the network namespace (udp_offload.py), a TAP's
 # transmit queue length, a multi-queue TAP: a Windows network is a directory
 # of stream endpoints, which a host program cannot run in and which have no
@@ -121,6 +150,7 @@ impossible integration_tests/functional/test_binary.py::test_firecracker_binary_
 row-6 integration_tests/functional/test_net.py::test_tap_offload
 row-6 integration_tests/functional/test_net.py::test_high_ingress_traffic
 row-6 integration_tests/functional/test_net.py::test_multi_queue_unsupported
+row-6 integration_tests/functional/test_net_config_space.py::test_net_change_mac_address
 
 # Firecracker's memory beyond its guest's goes just above the tests' 5 MiB
 # (5.0 to 5.6 MiB), most with 16 vCPUs: each vCPU adds about 58 KiB of heap

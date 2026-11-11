@@ -83,10 +83,13 @@ try {
     # end of the session. The log in UTF-8 (Tee-Object writes UTF-16).
     $log = New-Object IO.StreamWriter((Join-Path $Out 'pytest.log'), $false, (New-Object Text.UTF8Encoding $false))
     try {
+        # pytest's standard error is output, not an error to stop on (Windows
+        # PowerShell makes each line of a native command's stderr one).
+        $ErrorActionPreference = 'Continue'
         & $py -m pytest -p wick_windows --continue-on-collection-errors --binary-dir $bin @PytestArgs 2>&1 |
             ForEach-Object { $line = "$_"; $log.WriteLine($line); $log.Flush(); $line }
         $status = $LASTEXITCODE
-    } finally { $log.Close() }
+    } finally { $log.Close(); $ErrorActionPreference = 'Stop' }
 } finally {
     Pop-Location
     # Everything the session started runs from its bin directory or its root.

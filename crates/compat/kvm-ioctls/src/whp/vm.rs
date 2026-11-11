@@ -345,21 +345,22 @@ impl VmInner {
                 &exits_bits,
             )?;
         }
-        // The CPUID leaves the backend intercepts (to apply Firecracker's
-        // configured CPUID); others use WHP's own virtualised values.
-        const CPUID_EXITS: &[u32] = &[
-            0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0xa, 0xb, 0xd, 0xf, 0x10, 0x14, 0x15, 0x16,
-            0x1f, 0x4000_0000, 0x4000_0001, 0x8000_0000, 0x8000_0001, 0x8000_0002, 0x8000_0003,
-            0x8000_0004, 0x8000_0005, 0x8000_0006, 0x8000_0007, 0x8000_0008, 0x8000_001d,
-            0x8000_001e,
-        ];
+        // The CPUID leaves the backend intercepts, to answer with Firecracker's
+        // configured CPUID as KVM does (a leaf not configured gets WHP's own
+        // value): every basic and extended leaf, and KVM's two. A leaf left
+        // to WHP showed the guest a value the configuration did not have
+        // (0x8000001a: cpu-template-helper's dump against the guest).
+        let cpuid_exits: Vec<u32> = (0x0..=0x24)
+            .chain([0x4000_0000, 0x4000_0001])
+            .chain(0x8000_0000..=0x8000_0028)
+            .collect();
         // SAFETY: an array of u32 CPUID function numbers.
         ffi::hr(unsafe {
             whv::WHvSetPartitionProperty(
                 part,
                 whv::WHvPartitionPropertyCodeCpuidExitList,
-                CPUID_EXITS.as_ptr().cast(),
-                u32::try_from(std::mem::size_of_val(CPUID_EXITS)).unwrap(),
+                cpuid_exits.as_ptr().cast(),
+                u32::try_from(std::mem::size_of_val(cpuid_exits.as_slice())).unwrap(),
             )
         })?;
         // SAFETY: completes partition setup.
