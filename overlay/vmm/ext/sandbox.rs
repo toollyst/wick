@@ -209,6 +209,9 @@ mod macos {
         "mkfifo", "unlink",
         // ftruncate, fallocate, fsync.
         "ftruncate", "fsync", "fsync_nocancel", "fdatasync",
+        // msync (MS_SYNC): the pmem device writes its guest's flush to the
+        // file (test_pmem.py: denied, the microVM stopped with SIGSYS).
+        "msync", "msync_nocancel",
         // getrandom, clock_gettime, gettid.
         "getentropy", "gettimeofday", "thread_selfid",
         // rt_sigaction, rt_sigprocmask, rt_sigreturn, sigaltstack, tkill.
