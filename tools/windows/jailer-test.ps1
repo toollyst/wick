@@ -6,11 +6,12 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,pidns,handoff,isolation,boot,limits,cpu,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,pidns,handoff,netns,isolation,boot,limits,cpu,uffd,vhost-user] [-Bin <dir>]
 #
-# `refuse`, `low`, `daemonize`, `handles`, `pidns` and `handoff` need no WHP;
-# the others boot a guest. `pidns` needs a console (it types into it and
-# reads it).
+# `refuse`, `low`, `daemonize`, `handles`, `pidns`, `handoff` and `netns` need
+# no WHP; the others boot a guest. `pidns` needs a console (it types into it
+# and reads it); `netns` needs an elevated PowerShell (the jailer adds
+# Windows Filtering Platform filters).
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build),
 # `examples\uffd_on_demand_handler.exe` for `uffd` and, for `vhost-user`,
@@ -21,7 +22,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'isolation', 'boot', 'limits', 'cpu', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'isolation', 'boot', 'limits', 'cpu', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -148,17 +149,19 @@ function Wait-Shell($vm) {
 function Stage-Refuse {
     $base = New-Base 'refuse'
     $common = @('--id', 'r', '--exec-file', $Fc, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base)
+    # --netns names a directory of endpoints that must exist, as the
+    # namespace file must on Linux.
     $cases = [ordered]@{
-        '--netns'                    = @('--netns', 'C:\x')
-        'fsize'                      = @('--resource-limit', 'fsize=1024')
-        'cpuset'                     = @('--cgroup', 'cpuset.cpus=0', '--cgroup-version', '2')
+        '--netns of a missing directory' = @('--netns', (Join-Path $WorkDir 'no-such-network'))
+        'fsize'                          = @('--resource-limit', 'fsize=1024')
+        'cpuset'                         = @('--cgroup', 'cpuset.cpus=0', '--cgroup-version', '2')
     }
     foreach ($k in $cases.Keys) {
         $r = Invoke-Jailer ($common + $cases[$k])
         Check ($r[0] -ne 0) "$k accepted (exit $($r[0])): $($r[1])"
         Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue)) "$k started Firecracker"
     }
-    "--netns, fsize= and an unsupported cgroup are refused before Firecracker starts"
+    "--netns of a missing directory, fsize= and an unsupported cgroup are refused before Firecracker starts"
 }
 
 # Row 15 of docs/PORTING.md: --daemonize, upstream's observable behaviour.
@@ -787,6 +790,82 @@ function Stage-Vhost-User {
     } finally {
         if ($b -and -not $b.HasExited) { $b.Kill() }
         Remove-Item $img -ErrorAction SilentlyContinue
+        Stop-Jailed
+    }
+}
+
+# Row 6 of docs/PORTING.md: --netns. On Linux the jailed Firecracker joins a
+# network namespace and the guest reaches only the network given there. On
+# Windows the network is a directory of endpoints: Firecracker makes its
+# network endpoints there (the jail's SID is granted on it), and the jail's
+# copy of Firecracker gets no IP networking at all (Windows Filtering
+# Platform, in a session that ends with the jailer). Two jails, each with a
+# network of its own: each one's endpoint is in its own directory, a jail
+# reaches its own network and not the other's, IP is denied to a jail with a
+# network and allowed to one without (the control), and a jailer that is not
+# elevated refuses the flag. Needs no guest; needs an elevated PowerShell.
+function Stage-Netns {
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Check $elevated 'needs an elevated PowerShell: the jailer adds Windows Filtering Platform filters for --netns'
+    $base = New-Base 'netns'
+    $probe = Get-Probe
+    $nets = @{}
+    foreach ($n in 'a', 'b') { $nets[$n] = Join-Path $base "net-$n"; New-Item -ItemType Directory -Force -Path $nets[$n] | Out-Null }
+    $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $port = $listener.LocalEndpoint.Port
+    try {
+        # Two jailed Firecrackers (no guest), each given a network of its
+        # own and a network interface through the API.
+        $jails = @{}
+        $macs = @{ a = '06:00:AC:10:00:0A'; b = '06:00:AC:10:00:0B' }
+        foreach ($n in 'a', 'b') {
+            $jails[$n] = Start-ApiJail $base $n @('--netns', $nets[$n])
+            Invoke-ApiOk $jails[$n].Sock 'PUT' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; host_dev_name = "tap$n"; guest_mac = $macs[$n] }) | Out-Null
+        }
+        foreach ($n in 'a', 'b') {
+            $other = if ($n -eq 'a') { 'b' } else { 'a' }
+            Check (Test-Path (Join-Path $nets[$n] "tap$n")) "jail $n's endpoint is not in its network directory"
+            Check (-not (Test-Path (Join-Path $nets[$n] "tap$other"))) "jail $other's endpoint is in jail $n's network directory"
+            Check (-not (Test-Path (Join-Path $jails[$n].Root "tmp\firecracker-net\tap$n"))) "jail $n's endpoint is in the jail's temporary directory, not its network's"
+        }
+        # A jailed process in network a reaches a's endpoint and not b's, and
+        # no IP at all (the operator's TCP port, a UDP datagram); a jailed
+        # process without a network reaches IP (the control).
+        $expect = [ordered]@{
+            "connect:$(Join-Path $nets['a'] 'tapa')" = $true
+            "connect:$(Join-Path $nets['b'] 'tapb')" = $false
+            "tcp:127.0.0.1:$port"                   = $false
+            'udp:127.0.0.1:9'                        = $false
+        }
+        $r = Invoke-Jailer (@('--id', 'probe', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--netns', $nets['a'], '--') + @($expect.Keys)) 30000
+        $lines = $r[1] -split "`r?`n"
+        $bad = @()
+        foreach ($k in $expect.Keys) {
+            $l = $lines | Where-Object { $_.StartsWith("$k ") } | Select-Object -First 1
+            if (-not $l) { $bad += "${k}: no answer"; continue }
+            if ($l.Substring($k.Length + 1).StartsWith('allowed') -ne $expect[$k]) { $bad += $l }
+        }
+        Check ($bad.Count -eq 0) "jailed in network a: $($bad -join '; ')"
+        $ctl = Invoke-Jailer @('--id', 'control', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', "tcp:127.0.0.1:$port", 'udp:127.0.0.1:9') 30000
+        $ctlBad = @(($ctl[1] -split "`r?`n") | Where-Object { $_ -match '^(tcp|udp):' -and $_ -notmatch ' allowed' })
+        Check ($ctlBad.Count -eq 0) "the control (a jail without a network) was denied IP, so the test proves nothing: $($ctlBad -join '; ')"
+        # The operator reaches both networks.
+        $op = Test-Probe @() ([ordered]@{ "connect:$(Join-Path $nets['a'] 'tapa')" = $true; "connect:$(Join-Path $nets['b'] 'tapb')" = $true })
+        Check ($op.Count -eq 0) "operator: $($op -join '; ')"
+        # Without elevation (a plain process of the user: jail-probe
+        # `medium`) the jailer refuses --netns, before Firecracker starts.
+        Assert-Medium
+        $m = Invoke-Medium @($Jailer, '--id', 'medium', '--exec-file', $Fc, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--netns', $nets['a'])
+        Check ($m[0] -ne 0 -and $m[1] -match 'elevated') "a jailer that is not elevated (exit $($m[0])): $($m[1])"
+        Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$base*medium*" })) 'a jailer that is not elevated started Firecracker'
+        # Ending the jailers ends their filter sessions: IP is back for the jail's binary.
+        Stop-Jailed
+        $after = Invoke-Jailer @('--id', 'after', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', "tcp:127.0.0.1:$port") 30000
+        Check ($after[1] -match 'tcp:.* allowed') "after the jailers ended, the jail's binary is still denied IP: $($after[1])"
+        "two jails, each with a network of its own: endpoints in their own directories, a jail reaches its network and not the other's, no IP (TCP, UDP) with a network and IP without (control); the filters end with the jailer; an unelevated jailer refuses --netns"
+    } finally {
+        $listener.Stop()
         Stop-Jailed
     }
 }

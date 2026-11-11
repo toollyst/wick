@@ -13,11 +13,11 @@ and an owner, resource limits Windows cannot enforce are refused, and
 resource limit tests that set and read limits are Linux's and macOS's.
 ---
  Cargo.lock                        |  2 ++
- src/jailer/Cargo.toml             | 15 ++++++++++++++
+ src/jailer/Cargo.toml             | 17 ++++++++++++++++
  src/jailer/src/env.rs             | 34 +++++++++++++++++++++++++++++++
  src/jailer/src/main.rs            |  6 ++++++
  src/jailer/src/resource_limits.rs | 14 +++++++++++++
- 5 files changed, 71 insertions(+)
+ 5 files changed, 73 insertions(+)
 
 diff --git a/Cargo.lock b/Cargo.lock
 index fcbd9288282b5ffd059ea3639cca5ab87994906f..05c13b70f24dce00b5fbd4332736a6e51c0494e3 100644
@@ -34,10 +34,10 @@ index fcbd9288282b5ffd059ea3639cca5ab87994906f..05c13b70f24dce00b5fbd4332736a6e5
  
  [[package]]
 diff --git a/src/jailer/Cargo.toml b/src/jailer/Cargo.toml
-index 1950cefd06451e668ef1db85ffce9182f2b10242..fd167cf60d357b13afb425e831e90abb55a5fe44 100644
+index 1950cefd06451e668ef1db85ffce9182f2b10242..b73afb36cbb2f3f8131291611e31ee3c8a3a58bc 100644
 --- a/src/jailer/Cargo.toml
 +++ b/src/jailer/Cargo.toml
-@@ -25,5 +25,20 @@ utils = { path = "../utils" }
+@@ -25,5 +25,22 @@ utils = { path = "../utils" }
  # wick: wick's release version, <upstream>[+wick.<N>] (crates/version).
  wick-version = { path = "../../../../crates/version" }
  
@@ -48,11 +48,13 @@ index 1950cefd06451e668ef1db85ffce9182f2b10242..fd167cf60d357b13afb425e831e90abb
 +wick-std = { path = "../../../../crates/compat/std" }
 +windows-sys = { version = "0.61.2", features = [
 +    "Win32_Foundation",
++    "Win32_NetworkManagement_WindowsFilteringPlatform",
 +    "Win32_Security",
 +    "Win32_Security_Authorization",
 +    "Win32_Storage_FileSystem",
 +    "Win32_System_Console",
 +    "Win32_System_JobObjects",
++    "Win32_System_Rpc",
 +    "Win32_System_Threading",
 +] }
 +

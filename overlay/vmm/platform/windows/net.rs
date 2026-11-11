@@ -51,8 +51,13 @@ pub const SEND_STALL: Duration = Duration::from_secs(1);
 /// How much is read from the connection at a time.
 const READ_CHUNK: usize = 64 << 10;
 
-/// The directory of endpoints named without a path separator.
+/// The directory of endpoints named without a path separator: the jail's
+/// network, if the jailer gave one (`--netns`, `ext::jail::netns`), else
+/// `%TEMP%\firecracker-net`.
 pub fn endpoint_dir() -> io::Result<PathBuf> {
+    if let Some(dir) = crate::ext::jail::netns() {
+        return Ok(dir.to_path_buf());
+    }
     let dir = std::env::temp_dir().join("firecracker-net");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)

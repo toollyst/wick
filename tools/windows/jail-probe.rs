@@ -16,7 +16,8 @@
 //!                               see:<pid> ctrl:<process group> procs:0
 //!                               wait:<seconds> console:0 tty:<file>
 //!                               attach:<pid> inject:0 echo:<file>
-//!                               hold:<path>:<seconds> pull:<pid>:<handle>
+//!                               hold:<path>:<seconds> tcp:<ip>:<port>
+//!                               udp:<ip>:<port> pull:<pid>:<handle>
 //!                               listen:<socket path> wsadup:<socket path>
 //!                               listenpull:<socket path> sockpull:<socket path>
 //!                               token:0
@@ -297,6 +298,7 @@ extern "system" {
     fn connect(s: usize, addr: *const u8, len: i32) -> i32;
     fn closesocket(s: usize) -> i32;
     fn WSAGetLastError() -> i32;
+    fn sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32) -> i32;
     fn bind(s: usize, addr: *const u8, len: i32) -> i32;
     fn listen(s: usize, backlog: i32) -> i32;
     fn accept(s: usize, addr: *mut u8, len: *mut i32) -> usize;
@@ -356,6 +358,50 @@ fn recv_all(s: usize, buf: &mut [u8]) -> bool {
         got += n as usize;
     }
     true
+}
+
+/// A `sockaddr_in` for `<ip>:<port>` (IPv4).
+fn sockaddr_in(arg: &str) -> Option<[u8; 16]> {
+    let (ip, port) = arg.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let octets: Vec<u8> = ip.split('.').map(|o| o.parse().ok()).collect::<Option<_>>()?;
+    if octets.len() != 4 {
+        return None;
+    }
+    let mut addr = [0u8; 16];
+    addr[0] = 2; // AF_INET
+    addr[2..4].copy_from_slice(&port.to_be_bytes());
+    addr[4..8].copy_from_slice(&octets);
+    Some(addr)
+}
+
+/// An IPv4 socket operation: `connect` (TCP) or `sendto` (UDP) to
+/// `<ip>:<port>`; what a network filter denies.
+fn ip_check(arg: &str, stream: bool) -> String {
+    let Some(addr) = sockaddr_in(arg) else {
+        return "bad address".into();
+    };
+    let mut data = [0u8; 512];
+    // SAFETY: room for WSADATA; then plain socket calls on a socket we own.
+    unsafe {
+        WSAStartup(0x0202, data.as_mut_ptr());
+        let s = socket(2, if stream { 1 } else { 2 }, 0); // AF_INET, SOCK_STREAM / SOCK_DGRAM
+        if s == usize::MAX {
+            return format!("denied socket {}", WSAGetLastError());
+        }
+        let rc = if stream {
+            connect(s, addr.as_ptr(), addr.len() as i32)
+        } else {
+            sendto(s, b"x".as_ptr(), 1, 0, addr.as_ptr(), addr.len() as i32)
+        };
+        let e = WSAGetLastError();
+        closesocket(s);
+        if rc >= 0 {
+            "allowed".into()
+        } else {
+            format!("denied {}", std::io::Error::from_raw_os_error(e))
+        }
+    }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -759,6 +805,8 @@ fn check(c: &str) -> String {
         }
         // A TCP connection or a UDP datagram to an IPv4 address: what a
         // jail's network filter denies.
+        "tcp" => ip_check(arg, true),
+        "udp" => ip_check(arg, false),
         // Opens the file `path` and keeps it open for `seconds`, printing
         // the handle's value: for another process to duplicate out of this
         // one (the receiver's side of descriptor passing from a jail).

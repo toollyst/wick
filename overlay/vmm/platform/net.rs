@@ -35,7 +35,8 @@
 //!   carrying plain Ethernet frames each preceded by its 32-bit big-endian
 //!   length (QEMU's `-netdev stream` framing, which gvisor-tap-vsock and
 //!   passt speak); one switch at a time. A name without `/` or `\` lives in
-//!   `%TEMP%\firecracker-net\`, a name with one is the path itself. The
+//!   `%TEMP%\firecracker-net\` (in a jail given a network with `--netns`,
+//!   that network's directory), a name with one is the path itself. The
 //!   virtio-net header is handled by [`super::vnet`].
 
 use std::fmt::Debug;

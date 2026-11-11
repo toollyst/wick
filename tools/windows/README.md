@@ -9,7 +9,10 @@
   enforce is refused), `isolation` (`jail-probe.rs`, run through the jailer
   as the jailed binary, may not read the user's files or SAM, write outside
   its jail, reach another jail's files, API socket or process, or open the
-  operator's; the operator reaches the API socket), `handoff` (a handle and a socket
+  operator's; the operator reaches the API socket), `netns` (two jails with
+  a network each: a jail reaches its own network's endpoint and not the
+  other's, is denied TCP and UDP, and an unelevated jailer is refused the
+  flag; needs an elevated PowerShell), `handoff` (a handle and a socket
   held by a jailed process are pulled out by the operator and by a
   medium-integrity process of the user), `boot` (a 2 vCPU guest
   in the jail), `limits` (`memory.max`), `cpu` (`cpu.max`: three boots under it), and a check

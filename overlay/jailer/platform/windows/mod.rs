@@ -61,11 +61,15 @@
 //!   (above); the jailer hands over to a relaunched keeper and returns 0 once
 //!   Firecracker runs, its pid in the pid file, as upstream's returns after
 //!   the clone.
+//! - **`--netns <dir>`** ([`netns`]): the jail's network is the directory
+//!   named, where Firecracker makes its network endpoints and which the
+//!   jail's SID is granted on, and the jail's copy of Firecracker gets no IP
+//!   networking at all (Windows Filtering Platform). Needs an elevated
+//!   jailer, as `setns` needs root.
 //!
-//! Refused, never accepted without effect: `--netns` (no network
-//! namespaces), `--resource-limit fsize=` and a `no-file=` other
-//! than the default (Windows cannot limit file sizes or the number of
-//! handles; the default is not enforced either).
+//! Refused, never accepted without effect: `--resource-limit fsize=` and a
+//! `no-file=` other than the default (Windows cannot limit file sizes or the
+//! number of handles; the default is not enforced either).
 
 use std::ffi::{CStr, OsStr};
 use std::io::{self, Read, Write};
@@ -123,6 +127,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 mod console;
+mod netns;
 
 /// `SE_GROUP_INTEGRITY` (winnt.h).
 const SE_GROUP_INTEGRITY: u32 = 0x20;
@@ -134,6 +139,9 @@ use crate::JailerError;
 /// Environment variable through which Firecracker takes the jail over
 /// (`vmm::ext::jail::ENV`).
 const JAIL_ENV: &str = "WICK_JAIL";
+/// Environment variable through which Firecracker takes the jail's network
+/// over (`vmm::ext::jail::NETNS_ENV`): the directory of its endpoints.
+const NETNS_ENV: &str = "WICK_NETNS";
 /// Bytes every binary that takes the jail over carries
 /// (`vmm::ext::jail::HANDOVER_MARK`): without it, a program would keep the
 /// initial impersonation token (the user's SID) on its main thread.
@@ -236,6 +244,8 @@ pub enum HostError {
     NoHandover(PathBuf),
     #[error("Failed to start the jailed process: {0}: {1}")]
     Spawn(&'static str, io::Error),
+    #[error("--netns {0:?}: {1}")]
+    Netns(PathBuf, String),
 }
 
 impl From<HostError> for JailerError {
@@ -289,14 +299,97 @@ pub(crate) fn set_limits(limits: Limits) {
     *LIMITS.lock().unwrap() = limits;
 }
 
-/// `--netns`: Windows has no network namespaces.
-pub fn join_netns(_path: &str) -> Result<(), JailerError> {
-    Err(HostError::Unsupported(
-        "netns",
-        "Windows has no network namespaces; give Firecracker a Unix stream network endpoint \
-         inside the jail",
-    )
-    .into())
+/// The jail's network (`--netns`): the directory of its endpoints, and the
+/// filter session that will deny the jail IP.
+static NETNS: Mutex<Option<(PathBuf, netns::NetFilter)>> = Mutex::new(None);
+
+/// `--netns <dir>`: the jail's network is the directory `dir`, which must
+/// exist, as the namespace file must on Linux (`netns` module documentation).
+/// Opens the filter session, which refuses a jailer that is not elevated,
+/// here, where `setns` fails on Linux; the directory is opened to the jail
+/// and the filters added when Firecracker starts ([`exec`]).
+pub fn join_netns(path: &str) -> Result<(), JailerError> {
+    let dir = std::fs::canonicalize(path)
+        .map(|p| plain(&p))
+        .map_err(|e| HostError::Netns(PathBuf::from(path), format!("cannot open the network directory: {e}")))?;
+    if !dir.is_dir() {
+        return Err(HostError::Netns(dir, "a network is a directory of endpoints".into()).into());
+    }
+    let filter = netns::NetFilter::open().map_err(|e| HostError::Netns(dir.clone(), e.to_string()))?;
+    *NETNS.lock().unwrap() = Some((dir, filter));
+    Ok(())
+}
+
+/// Grants the jail's SID full access to `dir` and what is made in it, keeping
+/// the other entries (another jail sharing the network keeps its own), and
+/// labels it with the jail's integrity level, so that the jailed process can
+/// make its endpoints there: an object without a label is medium, which a
+/// jailed process may not write to.
+fn grant_to_jail(dir: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SetEntriesInAclW,
+        TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    let sid = Sid::new(vm_sid()).map_err(|e| io::Error::other(e.to_string()))?;
+    let mut old: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated path; out-pointers for the DACL and its descriptor.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide(dir).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut old,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
+    }
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid.0.cast(),
+        },
+    };
+    let mut new: *mut ACL = std::ptr::null_mut();
+    // SAFETY: one entry; the old ACL lives in `sd`; an out-pointer.
+    let rc = unsafe { SetEntriesInAclW(1, &entry, old, &mut new) };
+    // SAFETY: allocated by GetNamedSecurityInfoW.
+    unsafe { LocalFree(sd) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
+    }
+    // SAFETY: a NUL-terminated path; the new ACL, freed below.
+    let rc = unsafe {
+        SetNamedSecurityInfoW(
+            wide(dir).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new,
+            std::ptr::null(),
+        )
+    };
+    // SAFETY: allocated by SetEntriesInAclW.
+    unsafe { LocalFree(new.cast()) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
+    }
+    set_security(dir, JAIL_LABEL, true)
 }
 
 /// The variable that tells a relaunched jailer it is the keeper of a
@@ -1252,6 +1345,22 @@ fn exec(
     let exe = jail.root.join(name);
     check_handover(&exe)?;
 
+    // --netns: the network directory opened to the jail, named to
+    // Firecracker, and no IP networking for the jail's binary, from before
+    // it starts until the jailer ends (the filter's session is the jailer's).
+    let netns = NETNS.lock().unwrap().take();
+    let mut vars = Vec::new();
+    let _net_filter = match netns {
+        Some((dir, mut filter)) => {
+            grant_to_jail(&dir)
+                .map_err(|e| HostError::Netns(dir.clone(), format!("cannot open the network to the jail: {e}")))?;
+            vars.push(format!("{NETNS_ENV}={}", dir.display()));
+            filter.block(&exe).map_err(|e| HostError::Netns(dir.clone(), e.to_string()))?;
+            Some(filter)
+        }
+        None => None,
+    };
+
     let drive_root = format!("{}\\", jail.drive);
     let mut argv = vec![format!("{drive_root}{}", name.to_string_lossy())];
     argv.extend(cpu_start_of_new_process(args));
@@ -1259,12 +1368,13 @@ fn exec(
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     let tmp = format!("{drive_root}{JAIL_TMP}");
     let mut env: Vec<u16> = Vec::new();
-    for var in [
+    vars.extend([
         format!("{JAIL_ENV}={uid}:{gid}:{}", chroot_dir.display()),
         format!("SystemRoot={system_root}"),
         format!("TEMP={tmp}"),
         format!("TMP={tmp}"),
-    ] {
+    ]);
+    for var in vars {
         env.extend(var.encode_utf16());
         env.push(0);
     }
@@ -1419,10 +1529,93 @@ fn exec(
 mod tests {
     use super::*;
 
+    // --netns names a directory of endpoints, which must exist, as the
+    // namespace file must on Linux.
     #[test]
-    fn test_unsupported_isolation_is_refused() {
-        let err = join_netns("x").unwrap_err();
-        assert!(matches!(err, JailerError::Host(HostError::Unsupported("netns", _))));
+    fn test_netns_needs_an_existing_directory() {
+        let dir = std::env::temp_dir().join(format!("wick-jailer-netns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(
+            join_netns(dir.to_str().unwrap()).unwrap_err(),
+            JailerError::Host(HostError::Netns(_, _))
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(matches!(
+            join_netns(file.to_str().unwrap()).unwrap_err(),
+            JailerError::Host(HostError::Netns(_, _))
+        ));
+        // An existing directory: the network is recorded, with a filter
+        // session whose filters are not added yet; or, in a test process
+        // that is not elevated, the refusal that names elevation.
+        match join_netns(dir.to_str().unwrap()) {
+            Ok(()) => {
+                let (recorded, filter) = NETNS.lock().unwrap().take().unwrap();
+                assert_eq!(recorded, plain(&std::fs::canonicalize(&dir).unwrap()));
+                assert!(!filter.is_blocking());
+            }
+            Err(JailerError::Host(HostError::Netns(_, msg))) => assert!(msg.contains("elevated"), "{msg}"),
+            Err(e) => panic!("{e}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The jail's SID is granted on a network directory without disturbing
+    // the entries there (another jail's), and the directory gets the jail's
+    // label.
+    #[test]
+    fn test_grant_to_jail_keeps_other_entries() {
+        let dir = std::env::temp_dir().join(format!("wick-jailer-grant-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sddl = |path: &Path, label: bool| -> String {
+            use windows_sys::Win32::Security::Authorization::{
+                ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            };
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let info = if label { LABEL_SECURITY_INFORMATION } else { DACL_SECURITY_INFORMATION };
+            // SAFETY: a NUL-terminated path and out-pointers.
+            let rc = unsafe {
+                GetNamedSecurityInfoW(
+                    wide(path).as_ptr(),
+                    SE_FILE_OBJECT,
+                    info,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut sd,
+                )
+            };
+            assert_eq!(rc, 0);
+            let mut text: *mut u16 = std::ptr::null_mut();
+            let mut len = 0u32;
+            // SAFETY: the descriptor from above; out-pointers.
+            let ok = unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, info, &mut text, &mut len)
+            };
+            assert_ne!(ok, 0);
+            // SAFETY: `len` characters allocated by the conversion.
+            let s = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(text, len as usize)) };
+            // SAFETY: allocated by the calls above.
+            unsafe {
+                LocalFree(text.cast());
+                LocalFree(sd);
+            }
+            s.trim_end_matches('\0').to_owned()
+        };
+        let before = sddl(&dir, false);
+        grant_to_jail(&dir).unwrap();
+        let after = sddl(&dir, false);
+        assert!(after.contains(vm_sid()), "{after}");
+        // Every entry there before is still there.
+        for ace in before.trim_start_matches("D:").split_inclusive(')').filter(|a| a.starts_with('(')) {
+            assert!(after.contains(ace), "{ace} lost: {after}");
+        }
+        assert!(sddl(&dir, true).contains(JAIL_INTEGRITY_SID));
+        // A second grant (another jail of the same jailer: the same SID) changes nothing more.
+        grant_to_jail(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // The keeper's variable is read before main, ahead of upstream's

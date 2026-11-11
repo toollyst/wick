@@ -54,6 +54,11 @@ pub const CPU_ENV: &str = "WICK_JAIL_CPU";
 /// over.
 pub const MEMORY_ENV: &str = "WICK_JAIL_MEMORY";
 
+/// Environment variable through which the Windows jailer hands the jail's
+/// network over (`--netns`): the directory the network endpoints
+/// (`platform::net`) are made in, in place of the temporary directory.
+pub const NETNS_ENV: &str = "WICK_NETNS";
+
 /// The API process's share of a jail's memory limit, in MiB: a process
 /// forked at start-up (a few MiB) and the requests it holds, at most the API
 /// payload limit each.
@@ -115,6 +120,13 @@ pub fn root() -> Option<&'static Path> {
 /// before any other thread starts.
 pub fn enter() -> Result<(), JailError> {
     imp::enter()
+}
+
+/// The jail's network ([`NETNS_ENV`]): the directory the network endpoints
+/// are made in, if the jailer gave one.
+#[cfg(windows)]
+pub fn netns() -> Option<&'static Path> {
+    imp::netns()
 }
 
 /// The CPU limit (percent of one CPU) [`enter`] applied, if any.
@@ -509,15 +521,21 @@ mod imp {
     }
 
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    static NETNS: OnceLock<PathBuf> = OnceLock::new();
 
     pub fn root() -> Option<&'static Path> {
         ROOT.get().map(PathBuf::as_path)
+    }
+
+    pub fn netns() -> Option<&'static Path> {
+        NETNS.get().map(PathBuf::as_path)
     }
 
     pub fn enter() -> Result<(), JailError> {
         let Some(value) = std::env::var_os(ENV) else {
             return Ok(());
         };
+        let netns = std::env::var_os(super::NETNS_ENV);
         // SAFETY: called first thing in main, before any other thread exists.
         unsafe { std::env::remove_var(ENV) };
         let value = value.to_string_lossy().into_owned();
@@ -545,6 +563,19 @@ mod imp {
             ));
         }
         ROOT.set(PathBuf::from(root)).expect("the jail is entered once");
+        if let Some(netns) = netns {
+            // SAFETY: as above, before any other thread.
+            unsafe { std::env::remove_var(super::NETNS_ENV) };
+            let dir = PathBuf::from(&netns);
+            if !dir.is_absolute() {
+                return Err(JailError::Format(format!(
+                    "{}: {}",
+                    super::NETNS_ENV,
+                    netns.to_string_lossy()
+                )));
+            }
+            NETNS.set(dir).expect("the jail is entered once");
+        }
         Ok(())
     }
 }
