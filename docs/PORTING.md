@@ -101,33 +101,30 @@ exemption.
 | `memory`: a guest past the memory limit kills the VMM | yes | **missing** |
 | `cpu`: a jailed guest's spinning vCPUs held to the limit | yes | yes |
 
-## Not done yet
+## Where behaviour is not the same yet
 
-On every host but Linux:
+The standard is Linux's behaviour, not a lighter version of it. Each row below is something Firecracker on Linux
+does that macOS or Windows does not do the same way yet. Every row is work to do, in the order given; none is
+optional and none is dropped for its cost. A row can end as "impossible" only when the host's OS or hardware
+physically cannot do it. Then the request is refused loudly, and the row says why.
 
-- **The API server in a process of its own.** Upstream gives the API thread a filter of its own, and that is a real
-  boundary. Threads share an address space, so the other threads' filters already amount to their union on Linux.
-  Today macOS and Windows apply that union to the whole process.
-- **Without the jailer, the VMM runs as the user who started it** (on Linux too, but there the jailer is the norm).
+| # | Linux does | macOS | Windows | Done when |
+| --- | --- | --- | --- | --- |
+| 1 | Allows each thread only the system calls upstream's filter lists for it | One allow-list for the whole process, 118 system calls + 25 Mach traps + 20 MIG routines, wider than Linux's union (about 60). To do: every entry justified by the Linux rule it stands for, the rest removed | `ProcessChildProcessPolicy` only. To do: the mitigation profile, each mitigation tied to the Linux rule it stands for | a unit test per removed or kept entry; every boot-test stage passes |
+| 2 | Checks the arguments of 14 calls (`ioctl` requests, `socket` domain, `mmap`/`mprotect` protections, `fcntl` commands, `futex` operations, ...) | Number-only. To do: each check expressed in Seatbelt (`file-ioctl` with `ioctl-command`, `network*`, `dynamic-code-generation`, `file-map-executable`), or written down as impossible | none. To do: the same list | a unit test per check that a call with a denied argument ends Firecracker as seccomp does |
+| 3 | A denied call raises SIGSYS, and Firecracker exits with upstream's bad-syscall code | the same for system calls, Mach traps and MIG routines; other denied operations (files, network) return `EPERM`. To do: `(with send-signal SIGSYS)` on each | a mitigation failure is a Windows error. To do: the same exit | a unit test per kind of denied operation |
+| 4 | The API thread has its own, narrower filter | the API thread shares the process's allow-list. To do: the API server in a process of its own with the API filter's equivalent | the same | the API filter's tests run against the API process |
+| 5 | vCPU threads have a filter different from the VMM thread's | Impossible: the hypervisor needs vCPUs in the VM's process, and macOS has no per-thread sandbox. The process gets the union, which is also the effective boundary on Linux, as threads share memory | Impossible, for the same reason (WHP partitions belong to a process; mitigations are per process) | written down in SECURITY.md |
+| 6 | `--netns`: Firecracker joins a network namespace, and the guest reaches only the network given there | refused. To do: the jailer gives each jail a network of its own, which the VMM reaches only through a socket in the jail | refused. To do: Windows Filtering Platform, and the same per-jail network | a jailer-test stage: two jails, each reaching only its own network |
+| 7 | `--new-pid-ns`: Firecracker sees and signals no other process | refused. To do: the sandbox limits process information and signals to Firecracker itself | refused. To do: the same | a jailer-test stage |
+| 8 | Every cgroup controller the operator names (`cpu.weight`, `pids.max`, `io.*`, `cpuset.*`, ...) | memory and CPU limits only, others refused. To do: each controller implemented, or refused as impossible with the reason (`cpuset`: Apple silicon has no CPU affinity) | the same | a jailer-test stage per controller |
+| 9 | The CPU quota refills every period (`cpu.max`'s second field) | refills every second. To do: the period honoured, or the difference written down as impossible | after 2 CPU-seconds of grace. To do: no grace | `jailer-test cpu` with a period other than 1 s |
+| 10 | Hugepages | missing. To do: 2 MiB granularity | built, not run | a `boot-test hugepages` stage on both |
+| 11 | x86_64 and aarch64 guests | aarch64 only: Apple silicon has no x86 virtualisation (impossible). x86_64 images through translation in the guest (M6) | x86_64 only. aarch64 images through translation in the guest (M6) | M6 |
+| 12 | Passes upstream's integration tests | not run on macOS. To do: upstream's pytest suites against the macOS build, compared test by test as on Linux | not run on Windows. To do: the same | a comparison as `compare-integration-tests.py` makes |
+| 13 | Upstream's code, reviewed and fuzzed for years | the Hypervisor.framework run loop has no fuzz target. To do: one | the WHP run loop has none. To do: one | a target in `fuzz/` run on CI |
+| 14 | A jailed VMM passes descriptors to a uffd handler or a vhost-user backend | the same | a jailed process cannot push handles. To do: the receiver duplicates them, or a broker does | `boot-test uffd` and `vhost-user` under the jailer |
+| 15 | Device stages | the same | missing: the `devices` boot-test stage, the `memory` jailer-test stage, `--daemonize`, the inherited-handle check | the stages pass |
+| 16 | Only the jail's user reaches a jail | the same | a low-integrity process of the same user reaches it | a jailer-test stage |
 
-macOS:
-
-- **Hugepages:** 2 MiB fault and copy granularity in the userfaultfd kernel side (Apple silicon has no host
-  superpages).
-
-Windows, in order:
-
-1. **Every Windows doc cell names its test.** After that, CI runs `tools/check-claims.py --strict-windows`.
-2. **The mitigation profile in `sandbox.rs`:** win32k lockdown, ACG, strict handle checks, extension-point and
-   image-load policies. Each one goes through an audit-mode run of every stage, and its own unit test checks it is
-   set (`GetProcessMitigationPolicy`).
-3. **Network confinement through the Windows Filtering Platform:** a jailed VMM cannot open an IP socket. A
-   jailer-test stage proves it.
-4. **Handle passing from a jailed VMM** (uffd handler, vhost-user backend): the receiver duplicates out of the
-   sender, or a jailer broker does it. `boot-test uffd` and `vhost-user` run under the jailer.
-5. **The missing stages above:** `devices`, `daemonize` (or `--daemonize` refused, with the reason in the tables),
-   and `memory`.
-6. **The CPU grace removed** by stating the LAPIC timer frequency to the guest.
-7. **Same-user low-integrity access:** a plain low-integrity process of the same user must not reach a jail.
-8. **A test that a jailed Firecracker holds no handle the jailer inherited**, the counterpart of `jailer-test jail`'s
-   descriptor check.
+Windows also has to name a test in each of its doc cells; after that, CI runs `tools/check-claims.py --strict-windows`.
