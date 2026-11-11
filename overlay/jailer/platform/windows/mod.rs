@@ -918,6 +918,24 @@ fn command_line(args: &[String]) -> String {
     line
 }
 
+/// Upstream's arguments with `--start-time-cpu-us` set to 0. Upstream passes
+/// the jailer's CPU time at the exec, which the exec'd Firecracker keeps
+/// counting from (the same process); Firecracker reports its start-up CPU
+/// time as its own CPU time minus that, plus `--parent-cpu-time-us`. Windows
+/// starts a new process, whose CPU time starts at 0: the jailer's value
+/// would make the difference negative (a panic in debug builds, a wrapped
+/// metric in release ones). The jailer's share stays in
+/// `--parent-cpu-time-us`.
+fn cpu_start_of_new_process(args: &[String]) -> Vec<String> {
+    let mut out = args.to_vec();
+    if let Some(i) = out.iter().position(|a| a == "--start-time-cpu-us") {
+        if let Some(value) = out.get_mut(i + 1) {
+            *value = "0".to_owned();
+        }
+    }
+    out
+}
+
 /// Checks that the binary in the jail takes the jail over.
 fn check_handover(exe: &Path) -> Result<(), HostError> {
     let mut bytes = Vec::new();
@@ -968,7 +986,7 @@ fn exec(
 
     let drive_root = format!("{}\\", jail.drive);
     let mut argv = vec![format!("{drive_root}{}", name.to_string_lossy())];
-    argv.extend(args.iter().cloned());
+    argv.extend(cpu_start_of_new_process(args));
     let mut cmd: Vec<u16> = wide(command_line(&argv));
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     let tmp = format!("{drive_root}{JAIL_TMP}");
@@ -1158,6 +1176,22 @@ mod tests {
         assert_eq!(command_line(&args(&["a", "b c", ""])), r#"a "b c" """#);
         assert_eq!(command_line(&args(&[r#"x"y"#, r"d\ e\"])), r#""x\"y" "d\ e\\""#);
         assert_eq!(command_line(&args(&[r"C:\p\f.exe", "--id", "x"])), r"C:\p\f.exe --id x");
+    }
+
+    #[test]
+    fn test_cpu_start_of_new_process() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            cpu_start_of_new_process(&args(&[
+                "--id", "a", "--start-time-cpu-us", "123456", "--parent-cpu-time-us", "99", "--",
+                "--start-time-cpu-us", "7",
+            ])),
+            args(&[
+                "--id", "a", "--start-time-cpu-us", "0", "--parent-cpu-time-us", "99", "--",
+                "--start-time-cpu-us", "7",
+            ])
+        );
+        assert_eq!(cpu_start_of_new_process(&args(&["--id"])), args(&["--id"]));
     }
 
     #[test]
