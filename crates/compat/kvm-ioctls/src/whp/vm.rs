@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use wick_os::fd::{AsRawFd, RawFd};
 use kvm_bindings::{
     kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2, kvm_userspace_memory_region,
-    KvmIrqRouting, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
+    KvmIrqRouting, KVM_CLOCK_HOST_TSC, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
 };
 use vmm_sys_util::errno::Error;
 use vmm_sys_util::eventfd::EventFd;
@@ -620,15 +620,34 @@ impl VmFd {
         Ok(())
     }
 
-    /// The guest clock (reference time).
+    /// The guest clock: once the guest has kvm-clock, the guest's kvm-clock
+    /// at the guest TSC returned with it (`host_tsc`, `pvclock`), as KVM
+    /// returns its kvm-clock; before, the VM clock.
     pub fn get_clock(&self) -> Result<kvm_clock_data> {
-        Ok(self.inner.irqchip.lock().unwrap().clock())
+        let mut clock = self.inner.irqchip.lock().unwrap().clock();
+        // vCPU 0's TSC, which every vCPU's follows (`pvclock`).
+        if let Ok(value) = ffi::get_register(self.inner.part, 0, whv::WHvX64RegisterTsc) {
+            let tsc = ffi::as_u64(&value);
+            if let Some(ns) = self.inner.pvclock.lock().unwrap().clock_at(tsc) {
+                clock.clock = ns;
+            }
+            clock.host_tsc = tsc;
+            clock.flags |= KVM_CLOCK_HOST_TSC;
+        }
+        Ok(clock)
     }
 
-    /// Restores the guest clock.
+    /// Restores the guest clock; with the guest TSC it was saved with
+    /// (`host_tsc`, [`Self::get_clock`]), the restored guest's kvm-clock goes
+    /// on from its TSC as before the snapshot. Upstream overwrites `flags`
+    /// before the call, so a non-zero `host_tsc` is what tells.
     pub fn set_clock(&self, clock: &kvm_clock_data) -> Result<()> {
         self.inner.irqchip.lock().unwrap().set_clock(clock);
-        self.inner.pvclock.lock().unwrap().reset();
+        let mut pvclock = self.inner.pvclock.lock().unwrap();
+        pvclock.reset();
+        if clock.host_tsc != 0 {
+            pvclock.pin(clock.host_tsc, clock.clock);
+        }
         Ok(())
     }
 
