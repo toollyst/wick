@@ -19,8 +19,9 @@
 # them. The guest artifacts are upstream's aarch64 CI set (the 6.1 kernel,
 # its debug build, Ubuntu 24.04 and Amazon Linux 2023), prepared by
 # tools/macos/integration/setup-artifacts.sh in
-# ~/Library/Caches/wick/integration. Needs squashfs, e2fsprogs and screen 5
-# from Homebrew (brew install squashfs e2fsprogs screen).
+# ~/Library/Caches/wick/integration. Needs squashfs, e2fsprogs, screen 5 and
+# zig (the guest's helper programs, wick_macos.gcc_compile) from Homebrew
+# (brew install squashfs e2fsprogs screen zig).
 #
 # OUT (default build/integration-tests/<time>) gets the pytest JSON report
 # (test-report.json), pytest's output (pytest.log), upstream's test_results
@@ -62,6 +63,8 @@ ARTIFACTS=(
 )
 SCREEN_DIR="$(env PATH="/opt/homebrew/bin:$PATH" brew --prefix screen 2>/dev/null)/bin"
 [[ -x "$SCREEN_DIR/screen" ]] || die "screen 5 missing: brew install screen (macOS's screen 4.0 has no -Logfile)"
+PATH="/opt/homebrew/bin:$PATH" command -v zig >/dev/null ||
+    die "zig missing: brew install zig (it builds the programs the tests run in the guest)"
 
 free_gib="${WICK_IT_FREE_GIB:-20}"
 [[ "$free_gib" =~ ^[0-9]+$ ]] || die "WICK_IT_FREE_GIB must be a number of GiB"

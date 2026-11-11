@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+"""binutils' `readelf -W --demangle -s`, the symbol table, for a Mach-O binary.
+
+Linux's binaries are ELF; macOS's are Mach-O, which readelf does not read.
+The symbol table is the same idea in both: this lists a Mach-O file's
+symbols (nm) in readelf's columns (Num, Value, Size, Type, Bind, Vis, Ndx,
+Name), Size and Ndx unknown. Anything else readelf does (ELF sections,
+-S) has no Mach-O counterpart here and is refused, naming the option.
+"""
+import re
+import subprocess
+import sys
+
+KINDS = {"t": ("FUNC", "LOCAL"), "T": ("FUNC", "GLOBAL"), "d": ("OBJECT", "LOCAL"),
+         "D": ("OBJECT", "GLOBAL"), "b": ("OBJECT", "LOCAL"), "B": ("OBJECT", "GLOBAL"),
+         "s": ("OBJECT", "LOCAL"), "S": ("OBJECT", "GLOBAL"), "U": ("NOTYPE", "GLOBAL")}
+
+
+def main():
+    args = sys.argv[1:]
+    files = [a for a in args if not a.startswith("-")]
+    opts = sorted(a for a in args if a.startswith("-"))
+    if opts not in (["--demangle", "-W", "-s"], ["--demangle", "-s"], ["-W", "-s"], ["-s"]) \
+            or len(files) != 1:
+        print(f"readelf (wick, macOS): `readelf {' '.join(args)}`: only the symbol table "
+              "(-s) of one Mach-O file is provided; Mach-O has no ELF sections", file=sys.stderr)
+        sys.exit(1)
+    nm = ["nm", "-P"] + (["--demangle"] if "--demangle" in opts else []) + files
+    out = subprocess.run(nm, check=True, capture_output=True, text=True).stdout
+    print(f"\nSymbol table '.symtab' contains {len(out.splitlines())} entries:")
+    print("   Num:    Value          Size Type    Bind   Vis      Ndx Name")
+    for n, line in enumerate(out.splitlines()):
+        # nm -P: "name type [value [size]]"; a demangled name has spaces.
+        m = re.match(r"^(.*) ([A-Za-z?-]) ?([0-9a-fA-F]*) ?([0-9a-fA-F]*)$", line)
+        if not m:
+            continue
+        name, kind, value = m.group(1), m.group(2), m.group(3)
+        typ, bind = KINDS.get(kind, ("NOTYPE", "GLOBAL" if kind.isupper() else "LOCAL"))
+        print(f"{n:6}: {int(value or '0', 16):016x}     0 {typ:7} {bind:6} DEFAULT    ? {name}")
+
+main()

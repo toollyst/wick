@@ -178,6 +178,82 @@ def get_threads(pid):
 
 _utils.get_threads = get_threads
 
+
+def _online_cpus():
+    """The CPUs the session may run on (Linux: its affinity mask and the
+    online CPUs). macOS has neither CPU sets nor CPU affinity: every thread
+    may run on every logical CPU."""
+    return list(range(int(_sysctl("hw.logicalcpu"))))
+
+
+_utils.CpuMap._cpus = classmethod(lambda cls: _online_cpus())
+
+
+def _no_affinity(pid, *args):
+    """`utils.get_cpu_affinity` and `set_cpu_affinity` (psutil's
+    cpu_affinity, Linux only): macOS cannot pin a thread to a CPU; its
+    affinity tags (thread_policy_set) are a scheduling hint, not a CPU set."""
+    raise OSError(errno.ENOSYS, f"CPU affinity of {pid}: macOS has no CPU affinity "
+                  "(thread_policy_set's affinity tag is a hint, not a CPU set)")
+
+
+_utils.get_cpu_affinity = _no_affinity
+_utils.set_cpu_affinity = _no_affinity
+
+# ------------------------------------------------------- programs it builds
+
+import host_tools.cargo_build as _cargo_build  # noqa: E402  pylint: disable=wrong-import-position
+from framework.with_filelock import with_filelock as _with_filelock  # noqa: E402  pylint: disable=wrong-import-position
+
+# Linux: `gcc -static`, as the host and the guest are the same Linux on the
+# same architecture. Here the programs a guest runs are built for it
+# (aarch64 Linux, static, with zig's C toolchain), and the one the host runs
+# for macOS. A source not listed fails, naming it.
+GUEST_PROGRAMS = {"host_tools/vsock_helper.c", "host_tools/sysgenid.c", "host_tools/vmclock.c",
+                  "host_tools/devmem.c", "host_tools/waitpkg.c", "data/msr/msr_reader.c"}
+HOST_PROGRAMS = {"host_tools/jailer_time.c"}
+@_with_filelock
+def gcc_compile(src_file, output_file, extra_flags="-static -O3"):
+    """`cargo_build.gcc_compile` for the machine that runs the program."""
+    out = pathlib.Path(output_file)
+    if out.exists():
+        return
+    if src_file in GUEST_PROGRAMS:
+        cmd = f"zig cc -target aarch64-linux-musl {src_file} -o {out} {extra_flags}"
+    elif src_file in HOST_PROGRAMS:
+        flags = " ".join(f for f in extra_flags.split() if f != "-static")
+        cmd = f"cc {src_file} -o {out} {flags}"
+    else:
+        raise NotImplementedError(f"{src_file}: not known to run in the guest or on the host")
+    _utils.check_output(cmd)
+
+
+_cargo_build.gcc_compile = gcc_compile
+
+# Linux: a build for the host's musl target. On macOS the host's target is
+# aarch64-apple-darwin, and Firecracker runs only signed with the
+# Hypervisor.framework entitlement (tools/macos/integration-tests.sh).
+HOST_TARGET = "aarch64-apple-darwin"
+ENTITLEMENTS = pathlib.Path(__file__).resolve().parent.parent / "hypervisor.entitlements"
+
+
+def _host_build(real):
+    def build(*args, **kwargs):
+        target = _cargo_build.DEFAULT_TARGET
+        _cargo_build.DEFAULT_TARGET = HOST_TARGET
+        try:
+            out = real(*args, **kwargs)
+        finally:
+            _cargo_build.DEFAULT_TARGET = target
+        _utils.check_output(f"codesign --force --sign - --entitlements {ENTITLEMENTS} "
+                            f"{pathlib.Path(out) / 'firecracker'}")
+        return out
+    return build
+
+
+_cargo_build.build_fuzzing = _host_build(_cargo_build.build_fuzzing)
+_cargo_build.build_gdb = _host_build(_cargo_build.build_gdb)
+
 # ------------------------------------------------------- process memory
 
 _libsystem._dyld_get_shared_cache_range.restype = ctypes.c_void_p

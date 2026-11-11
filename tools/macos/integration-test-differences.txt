@@ -46,3 +46,26 @@ all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
 # budget. Only a test whose every failing phase failed with this error is
 # excused.
 all bug failure:host_tools.memory.MemoryUsageExceededError
+
+# The test looks in Firecracker's log for the API socket by its path in the
+# jail, /run/firecracker.socket. Without the jailer's chroot (user mode)
+# Firecracker binds the socket below the jail's directory and its error
+# names that path.
+user root integration_tests/functional/test_api_server.py::test_api_socket_in_use
+
+# A static executable: macOS has none. Its system calls are libSystem's
+# interface, not the kernel's, and Apple supports no static linking of a
+# user program (`file`: "Mach-O 64-bit executable arm64").
+all impossible integration_tests/functional/test_binary.py::test_firecracker_binary_static_linking
+
+# The ELF debug file Linux's release splits off with objcopy, its sections
+# read with readelf -S. A Mach-O binary has no ELF sections; macOS keeps
+# DWARF in a dSYM bundle, Mach-O sections readelf does not read
+# (tools/macos/integration/bin/readelf lists symbols only).
+all impossible integration_tests/functional/test_binary.py::test_release_debuginfo
+
+# Transparent huge pages (madvise MADV_HUGEPAGE): macOS has no huge pages for
+# a process's memory, and the call fails (EINVAL) rather than being ignored
+# (docs/PORTING.md row 10).
+all row-10 integration_tests/functional/test_shut_down.py::test_reboot[vmlinux-6.1.188-PCI_ON-kvm-Transparent]
+all row-10 integration_tests/functional/test_shut_down.py::test_reboot[vmlinux-6.1.188-PCI_OFF-kvm-Transparent]
