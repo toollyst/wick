@@ -1257,15 +1257,24 @@ mod tests {
         assert_eq!(unsafe { madvise(shared, LEN, libc::MADV_DONTNEED) }, 0);
         assert_eq!(read(shared, 0), 0x5a);
 
-        // Unmapped pages: ENOMEM, and nothing changes.
         // SAFETY: unmapping our own mapping.
         unsafe { libc::munmap(shared, LEN) };
-        // SAFETY: a range that is partly unmapped.
-        assert_eq!(unsafe { madvise(shared, LEN, libc::MADV_DONTNEED) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ENOMEM)
-        );
+
+        // Unmapped pages: ENOMEM, and nothing changes. Not a range just
+        // unmapped, which another test's thread may map again: a range that
+        // starts mapped and runs past the end of the process's address space,
+        // where Linux also fails with ENOMEM.
+        let past_the_end = 0xffff_0000_0000_0000_usize as *mut c_void;
+        for (addr, len) in [(past_the_end, LEN), (anon, usize::MAX - anon as usize)] {
+            // SAFETY: a range that is not (all) mapped; nothing is changed.
+            assert_eq!(unsafe { madvise(addr, len, libc::MADV_DONTNEED) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOMEM)
+            );
+        }
+        // Nothing changed in the mapped part.
+        assert_eq!(read(anon, LEN / 2), 0x5a);
         // SAFETY: unmapping our own mapping.
         unsafe { libc::munmap(anon, LEN) };
     }
