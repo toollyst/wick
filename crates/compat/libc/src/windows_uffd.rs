@@ -897,6 +897,10 @@ fn serve(ctx: usize, kernel: c_int) {
 /// Linux kernel does when a system call copies to or from them (`write`: the
 /// call writes the memory). Returns whether any page was missing.
 pub fn prefault(addr: u64, len: u64, write: bool) -> bool {
+    // Lazy memory too: a system call fails on pages not committed (the
+    // kernel's copy takes no exception this process could resolve).
+    #[allow(clippy::cast_possible_truncation)]
+    crate::windows_mm::prefault_lazy(addr as usize, len as usize);
     if REGISTERED.load(Ordering::Acquire) == 0 || len == 0 {
         return false;
     }

@@ -637,7 +637,7 @@ impl VcpuFd {
                 } => {
                     // Firecracker wrote the input bytes into the scratch slice.
                     let value = read_scratch(scratch, len);
-                    let merged = merge_reg(rax, value, len);
+                    let merged = super::exit::in_result(rax, value, len);
                     regs::set_gpr_rax_rip(part, vp, merged, rip_after)?;
                 }
             }
@@ -647,7 +647,7 @@ impl VcpuFd {
             let Some(ctx) = self.enter()? else {
                 return err(libc::EINTR);
             };
-            let instr_len = u64::from(ctx.VpContext._bitfield & 0x0f);
+            let instr_len = super::exit::instruction_length(ctx.VpContext._bitfield);
             let rip = ctx.VpContext.Rip;
 
             match ctx.ExitReason {
@@ -679,10 +679,11 @@ impl VcpuFd {
                     let io = unsafe { ctx.Anonymous.IoPortAccess };
                     // SAFETY: the access-info bitfield overlaps the u32.
                     let info = unsafe { io.AccessInfo.AsUINT32 };
-                    let is_write = info & 1 != 0;
-                    let size = ((info >> 1) & 0x7) as usize;
-                    let string = (info >> 4) & 1 != 0;
-                    let rep = (info >> 5) & 1 != 0;
+                    // A size x86 port I/O does not have: never from WHP.
+                    let Some(access) = super::exit::port_access(info) else {
+                        return err(libc::EINVAL);
+                    };
+                    let super::exit::PortAccess { write: is_write, size, string, rep } = access;
                     let port = io.PortNumber;
 
                     if string || rep {
@@ -730,7 +731,7 @@ impl VcpuFd {
                             chip.pio_read(port, buf);
                             drop(chip);
                             let value = read_scratch(scratch, size);
-                            let merged = merge_reg(io.Rax, value, size);
+                            let merged = super::exit::in_result(io.Rax, value, size);
                             regs::set_gpr_rax_rip(part, vp, merged, rip + instr_len)?;
                             continue;
                         }
@@ -747,6 +748,20 @@ impl VcpuFd {
                 whv::WHvRunVpExitReasonMemoryAccess => {
                     // SAFETY: the union arm matches the exit reason.
                     let mem = unsafe { ctx.Anonymous.MemoryAccess };
+                    // Guest RAM not committed yet (anonymous `MAP_NORESERVE`
+                    // memory gets its pages at the first access, as on
+                    // Linux): WHP exits at the access to such a page, which
+                    // re-runs once it is committed (measured), as KVM resolves
+                    // the stage-2 fault through the host page.
+                    if let Some(host) = self.shared.inner.host_addr(mem.Gpa) {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let write = super::exit::memory_write(unsafe { mem.AccessInfo.AsUINT32 });
+                        match libc::wick_mm::commit_on_access(host as usize, write) {
+                            libc::wick_mm::Access::Committed => continue,
+                            libc::wick_mm::Access::Exhausted(err) => libc::wick_mm::out_of_memory(host as usize, err),
+                            libc::wick_mm::Access::NotLazy => {}
+                        }
+                    }
                     // Guest RAM that is a missing userfaultfd page: WHP
                     // honours its host PAGE_NOACCESS and exits at the
                     // access, which re-runs once the handler filled it, as
@@ -757,7 +772,7 @@ impl VcpuFd {
                     if libc::wick_uffd::active() {
                         if let Some(host) = self.shared.inner.host_addr(mem.Gpa) {
                             // SAFETY: the access-info bitfield overlaps the u32.
-                            let write = unsafe { mem.AccessInfo.AsUINT32 } & 0x3 == 1;
+                            let write = super::exit::memory_write(unsafe { mem.AccessInfo.AsUINT32 });
                             if libc::wick_uffd::fault(host, write) {
                                 ram_retries = 0;
                                 continue;
@@ -930,13 +945,9 @@ impl VcpuFd {
         // guest kernel find its XSAVE layout inconsistent and turn XSAVE off,
         // after which user space dies on XGETBV.
         match (function, index) {
-            (0x1, _) => {
+            (0x1, _) | (0x7, 0) => {
                 let cr4 = self.register(whv::WHvX64RegisterCr4)?;
-                ecx = (ecx & !(1 << 27)) | if cr4 & (1 << 18) != 0 { 1 << 27 } else { 0 };
-            }
-            (0x7, 0) => {
-                let cr4 = self.register(whv::WHvX64RegisterCr4)?;
-                ecx = (ecx & !(1 << 4)) | if cr4 & (1 << 22) != 0 { 1 << 4 } else { 0 };
+                ecx = super::exit::cpuid_ecx(function, index, ecx, cr4);
             }
             (0xd, 0) => {
                 let xcr0 = self.register(whv::WHvX64RegisterXCr0)?;
@@ -959,20 +970,14 @@ impl VcpuFd {
     /// the same moment, which ptp_kvm keeps the guest's time in step with);
     /// anything else is `-KVM_ENOSYS`, as KVM answers an unknown one.
     fn kvm_hypercall(&self, nr: u64, a0: u64, a1: u64) -> u64 {
-        const KVM_ENOSYS: i64 = 1000;
         const KVM_EOPNOTSUPP: i64 = 95;
         const KVM_EFAULT: i64 = 14;
-        const KVM_HC_VAPIC_POLL_IRQ: u64 = 1;
-        const KVM_HC_CLOCK_PAIRING: u64 = 9;
-        const KVM_CLOCK_PAIRING_WALLCLOCK: u64 = 0;
         let neg = |e: i64| (-e).cast_unsigned();
-        match nr {
-            KVM_HC_VAPIC_POLL_IRQ => 0,
-            KVM_HC_CLOCK_PAIRING => {
-                if a1 != KVM_CLOCK_PAIRING_WALLCLOCK {
-                    return neg(KVM_EOPNOTSUPP);
-                }
-                let Some(at) = self.shared.inner.host_addr(a0) else {
+        match super::exit::hypercall(nr, a0, a1) {
+            super::exit::Hypercall::PollIrq => 0,
+            super::exit::Hypercall::Error(rax) => rax,
+            super::exit::Hypercall::ClockPairing { gpa } => {
+                let Some(at) = self.shared.inner.host_addr(gpa) else {
                     return neg(KVM_EFAULT);
                 };
                 let Ok(tsc) = self.register(whv::WHvX64RegisterTsc) else {
@@ -990,7 +995,6 @@ impl VcpuFd {
                 unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), at as *mut u8, out.len()) };
                 0
             }
-            _ => neg(KVM_ENOSYS),
         }
     }
 
@@ -1008,10 +1012,9 @@ impl VcpuFd {
         rip_after: u64,
     ) -> Result<()> {
         // SAFETY: the access-info bitfield overlaps the u32.
-        let is_write = unsafe { m.AccessInfo.AsUINT32 } & 1 != 0;
+        let (is_write, value) = super::exit::msr_access(unsafe { m.AccessInfo.AsUINT32 }, m.Rax, m.Rdx);
         let index = m.MsrNumber;
         if is_write {
-            let value = (m.Rdx << 32) | (m.Rax & 0xffff_ffff);
             if index == MSR_TSC_DEADLINE {
                 self.write_tsc_deadline(value)?;
             } else {
@@ -1067,13 +1070,3 @@ fn write_scratch(scratch: *mut u8, value: u64, len: usize) {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch, n) };
 }
 
-/// Merges an `IN` result of `len` bytes into the old `RAX` (byte/word preserve
-/// the upper bits; a 4-byte read zero-extends, as x86 does).
-fn merge_reg(old: u64, value: u64, len: usize) -> u64 {
-    match len {
-        1 => (old & !0xff) | (value & 0xff),
-        2 => (old & !0xffff) | (value & 0xffff),
-        4 => value & 0xffff_ffff,
-        _ => value,
-    }
-}

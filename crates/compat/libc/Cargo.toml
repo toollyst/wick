@@ -47,3 +47,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The lazy-commit test runs a child under a job memory limit.
+windows-sys = { version = "0.61.2", features = ["Win32_System_JobObjects"] }

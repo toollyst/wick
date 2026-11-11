@@ -6,7 +6,7 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,daemonize,handles,pidns,handoff,netns,api,isolation,boot,limits,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
 #
 # `refuse`, `cpuset`, `weight`, `low`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
@@ -23,7 +23,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'api', 'isolation', 'boot', 'limits', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -170,7 +170,7 @@ function Stage-Refuse {
     $v2 = [ordered]@{
         'pids'          = 'pids.max=100'
         'io'            = 'io.weight=default 200'
-        'hugetlb'       = 'hugetlb.2MB.max=1073741824'
+        'hugetlb'       = 'hugetlb.1GB.max=1073741824'
         'rdma'          = 'rdma.max=mlx4_0'  # upstream's parser takes one '=' only
         'misc'          = 'misc.max=sev 1'
         'cgroup.freeze' = 'cgroup.freeze=1'
@@ -730,7 +730,8 @@ function Stage-Pidns {
         $sw.Stop()
         Check ($code -eq 0) "--new-pid-ns: the jailer exited $code (-1: did not return)"
         $root = Join-Path $base 'firecracker.exe\ns\root'
-        $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" } | Select-Object -First 1
+        # Firecracker, not its API process (which has the whole profile, ACG among it).
+        $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" -and (Get-Mitigations $_.Id).DynamicCode -eq 0 } | Select-Object -First 1
         Check ($null -ne $fcp) '--new-pid-ns: Firecracker is not running after the jailer returned'
         $written = [int](Get-Content (Join-Path $root 'firecracker.exe.pid'))
         Check ($written -eq $fcp.Id) "--new-pid-ns: the pid file holds $written, Firecracker is $($fcp.Id)"
@@ -1074,14 +1075,15 @@ function Stage-Boot {
     } finally { Stop-Jailed }
 }
 
-# docs/PORTING.md row 10: a jailed Firecracker maps no guest memory on large
-# pages, and says why: a token below medium integrity cannot have a privilege
-# enabled ("Lock pages in memory" among them), so the jail's token keeps no
-# privilege but traversal whether or not the operator's account holds it,
-# a jailed process cannot open its token to adjust it, large pages in the
-# jail are refused, and a jailed guest asking for 2 MiB pages fails to
-# start with the cause named (the broker that would bring them is row 10's
-# open work).
+# docs/PORTING.md row 10: a jailed guest's memory on large pages. A token
+# below medium integrity cannot have a privilege enabled ("Lock pages in
+# memory" among them), so the jail's token keeps no privilege but
+# traversal, a jailed process cannot open its token to adjust it, and it
+# cannot map large pages itself. The jailer, which holds the privilege,
+# makes the sections (its large-page broker): a jailed guest on 2 MiB pages
+# boots and uses them, and the jail's hugetlb.2MB.max bounds what the jailer
+# gives, as the hugetlb controller bounds huge pages on Linux. Without the
+# privilege, a jailed guest on 2 MiB pages is refused with the cause named.
 function Stage-Hugepages {
     $base = New-Base 'hugepages'
     $held = $null -ne (whoami /priv | Select-String 'SeLockMemoryPrivilege')
@@ -1091,34 +1093,146 @@ function Stage-Hugepages {
     $own = Invoke-JailedProbe $base 't' '2' @() 'tokenopen:0'
     Check ($own -match '^denied ') "a jailed process opened its own token to adjust it: $own"
     $large = Invoke-JailedProbe $base 'l' '2' @() 'largepage:64'
-    Check ($large -match '^denied ') "64 MiB of large pages in a jail: $large"
-    $vm = Start-JailedVm $base 'vm' @() 256 -hugePages '2M'
+    Check ($large -match '^denied ') "64 MiB of large pages by a jailed process itself: $large"
+    if (-not $held) {
+        $vm = Start-JailedVm $base 'vm' @() 256 -hugePages '2M'
+        try {
+            Check ($vm.P.WaitForExit(30000)) 'the jailer did not exit after Firecracker refused large pages'
+            Check ($vm.P.ExitCode -ne 0) "jailer exit $($vm.P.ExitCode) for a jailed guest on large pages"
+            $text = $vm.Text()
+            Check ($text -match 'below medium') "the refusal does not name the integrity level: $(($text -split "`n" | Select-Object -Last 5) -join ' | ')"
+        } finally { Stop-Jailed }
+        return "the jail keeps only traversal, cannot open its token or map large pages; this account lacks 'Lock pages in memory', so the jailer has none to give and a jailed guest on 2 MiB pages is refused naming the cause"
+    }
+    # No hugetlb.2MB.max, no broker (the limit stands for Linux's pool): a
+    # jailed guest on large pages is refused, naming the limit.
+    $vm = Start-JailedVm $base 'nolimit' @() 256 -hugePages '2M'
     try {
-        Check ($vm.P.WaitForExit(30000)) 'the jailer did not exit after Firecracker refused large pages'
-        Check ($vm.P.ExitCode -ne 0) "jailer exit $($vm.P.ExitCode) for a jailed guest on large pages"
+        Check ($vm.P.WaitForExit(30000)) 'the jailer did not exit for a jail on large pages without hugetlb.2MB.max'
+        Check ($vm.P.ExitCode -ne 0) "jailer exit $($vm.P.ExitCode) for a jail on large pages without hugetlb.2MB.max"
         $text = $vm.Text()
-        Check ($text -match 'below medium') "the refusal does not name the integrity level: $(($text -split "`n" | Select-Object -Last 5) -join ' | ')"
+        Check ($text -match 'hugetlb\.2MB\.max') "the refusal without a limit does not name hugetlb.2MB.max: $(($text -split "`n" | Select-Object -Last 4) -join ' | ')"
     } finally { Stop-Jailed }
-    $note = if ($held) { ' (the operator holds it)' } else { ' (the operator does not hold it either)' }
-    "the jail keeps only traversal, not 'Lock pages in memory'$note, cannot open its token, maps no large pages, and a jailed guest on 2 MiB pages is refused naming the integrity level"
+    # The jailer's sections: the guest boots on them and uses them.
+    $vm = Start-JailedVm $base 'vm' @('--cgroup-version', '2', '--cgroup', 'hugetlb.2MB.max=268435456') 256 -hugePages '2M'
+    try {
+        Check ($vm.WaitFor('Run /bin/sh', 30)) "a jailed guest on 2 MiB pages did not boot: $(($vm.Text() -split "`n" | Select-Object -Last 4) -join ' | ')"
+        Wait-Shell $vm
+        $mem = [int]$vm.Sh("awk '/MemTotal/ {print `$2}' /proc/meminfo", 10)
+        Check ($mem -gt 200000 -and $mem -le 262144) "MemTotal $mem kB for 256 MiB"
+        $out = $vm.Sh('mount -t tmpfs -o size=200m tmpfs /run && head -c 160m /dev/urandom > /run/f && md5sum /run/f > /run/a && md5sum /run/f | cmp - /run/a && echo same', 120)
+        Check ($out -eq 'same') "160 MiB in guest memory read back differently: '$out'"
+        $vm.Send('reboot -ff')
+        Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
+        Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
+    } finally { Stop-Jailed }
+    # hugetlb.2MB.max below the guest's memory: the jailer gives no more, and
+    # Firecracker fails to start naming the limit.
+    $vm = Start-JailedVm $base 'cap' @('--cgroup-version', '2', '--cgroup', 'hugetlb.2MB.max=134217728') 256 -hugePages '2M'
+    try {
+        Check ($vm.P.WaitForExit(30000)) 'the jailer did not exit when hugetlb.2MB.max was below the guest memory'
+        Check ($vm.P.ExitCode -ne 0) "jailer exit $($vm.P.ExitCode) for a guest past hugetlb.2MB.max"
+        $text = $vm.Text()
+        Check ($text -match 'hugetlb\.2MB\.max') "the refusal does not name hugetlb.2MB.max: $(($text -split "`n" | Select-Object -Last 4) -join ' | ')"
+    } finally { Stop-Jailed }
+    "the jail keeps only traversal and cannot map large pages itself; the jailer's sections give a jailed 256 MiB guest its 2 MiB pages (160 MiB written and read back), hugetlb.2MB.max of 128 MiB refuses it naming the limit, and without hugetlb.2MB.max the jailer gives none"
 }
 
+# A guest booted under the jailer with --netns: its network endpoint is made
+# in the network directory, and frames pass through it (boot-test.ps1's
+# switch, its C# taken from that script: ARP, ICMP echoes, a UDP echo).
+function Stage-Netguest {
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Check $elevated 'needs an elevated PowerShell: the jailer adds Windows Filtering Platform filters for --netns'
+    if (-not ('Wick.Switch' -as [type])) {
+        $source = [regex]::Match((Get-Content -Raw (Join-Path $Here 'boot-test.ps1')), "Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@", 'Singleline')
+        Check $source.Success "boot-test.ps1's switch was not found next to this script"
+        Add-Type -TypeDefinition $source.Groups[1].Value
+    }
+    $base = New-Base 'netguest'
+    $net = Join-Path $base 'net'
+    New-Item -ItemType Directory -Force -Path $net | Out-Null
+    $vm = Start-JailedVm $base 'g' @('--netns', $net) 256 -Api -NoConfig
+    try {
+        Invoke-ApiOk $vm.Sock 'PUT' '/boot-source' ([ordered]@{ kernel_image_path = '/vmlinux'; boot_args = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd root=/dev/vda ro rootfstype=squashfs init=/bin/sh' }) | Out-Null
+        Invoke-ApiOk $vm.Sock 'PUT' '/drives/rootfs' ([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs'; is_root_device = $true; is_read_only = $true }) | Out-Null
+        Invoke-ApiOk $vm.Sock 'PUT' '/machine-config' ([ordered]@{ vcpu_count = 2; mem_size_mib = 256 }) | Out-Null
+        Invoke-ApiOk $vm.Sock 'PUT' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; host_dev_name = 'tapg'; guest_mac = '06:00:0a:00:00:02' }) | Out-Null
+        $endpoint = Join-Path $net 'tapg'
+        Check (Test-Path $endpoint) "the guest's endpoint is not in its network directory ($endpoint)"
+        Check (-not (Test-Path (Join-Path $vm.Root 'tmp\firecracker-net\tapg'))) "the guest's endpoint is in the jail's temporary directory, not its network's"
+        $switch = New-Object Wick.Switch($endpoint, 10000)
+        try {
+            Invoke-ApiOk $vm.Sock 'PUT' '/actions' ([ordered]@{ action_type = 'InstanceStart' }) | Out-Null
+            Wait-Shell $vm
+            [void]$vm.Sh('ip addr add 10.0.0.2/24 dev eth0 && ip link set eth0 up && ip link set lo up', 20)
+            $out = $vm.Sh('ping -q -c 3 -i 0.3 -W 3 10.0.0.1 | grep transmitted', 30)
+            Check ($out -match ' 0% packet loss') "ping: $out"
+            $out = $vm.Sh('ping -q -c 50 -i 0.02 -s 1000 -W 3 10.0.0.1 | grep transmitted', 60)
+            Check ($out -match ' 0% packet loss') "ping -c 50 -s 1000: $out"
+            $out = $vm.Sh('echo udp-$((6*7)) | socat -t 3 - UDP:10.0.0.1:7', 30)
+            Check ($out -eq 'udp-42') "UDP echo '$out'"
+            $switch.Closing = $true
+        } finally { $switch.Close() }
+        Check ($null -eq $switch.ReadError) "switch: $($switch.ReadError) ($($switch.Counts))"
+        Check ($switch.Bad.Count -eq 0) "bad frames from the guest: $(($switch.Bad | Select-Object -First 3) -join '; ')"
+        Check ($switch.Arp -ge 1 -and $switch.Icmp -ge 53 -and $switch.Udp -ge 1) "switch saw $($switch.Counts)"
+    } finally { Stop-Jailed }
+    "a jailed guest with --netns: its endpoint in the network directory; ARP, ICMP (50 back to back), UDP echo through it, checksums valid ($($switch.Counts))"
+}
+# The guest using memory past the limit ends the VMM, as the cgroup OOM
+# killer does (tools/macos/jailer-test.py, stage_memory): a 1024 MiB guest
+# that writes 700 MiB, under a limit below that and under one above it. Guest
+# memory is committed as it is touched (libc windows_mm, lazy memory), so the
+# job is charged when Linux charges the cgroup.
+function Stage-Memory {
+    $base = New-Base 'memory'
+    $results = @()
+    foreach ($case in @(@{ Mib = 300; Ends = $true }, @{ Mib = 3000; Ends = $false })) {
+        $id = "mem$($case.Mib)"
+        $vm = Start-JailedVm $base $id @('--cgroup-version', '2', '--cgroup', "memory.max=$($case.Mib * 1MB)") 1024
+        try {
+            $how = ''
+            if ($vm.WaitFor('Run /bin/sh', 30)) {
+                Wait-Shell $vm
+                $vm.Send('mount -t tmpfs -o size=900m tmpfs /run && dd if=/dev/zero of=/run/x bs=1M count=700 2>/dev/null; echo WROTE-$?')
+                $wrote = $vm.WaitFor('WROTE-0', 120)
+                $how = if ($wrote) { 'the guest wrote 700 MiB' } else { 'the guest did not finish writing 700 MiB' }
+            } else {
+                $how = 'the guest did not boot'
+            }
+            $ended = $vm.P.WaitForExit($(if ($case.Ends) { 30000 } else { 2000 }))
+            $code = if ($ended) { $vm.P.ExitCode } else { 'running' }
+            Check ($ended -eq $case.Ends) "memory.max=$($case.Mib) MiB, a 1024 MiB guest writing 700 MiB: $how; the jailer: $code; $(($vm.Text() -split "`n" | Select-Object -Last 3) -join ' | ')"
+            if ($case.Ends) {
+                # As on Linux: the guest boots (its memory is charged as it is touched), and
+                # the VMM ends as the OOM killer ends it, with the cause named.
+                Check ($how -ne 'the guest did not boot') "memory.max=$($case.Mib) MiB: the guest did not boot (its memory charged before it ran)"
+                Check ($vm.P.ExitCode -eq 137) "the jailer returned $($vm.P.ExitCode) for a VMM ended by its memory limit, not 137 (128 + SIGKILL)"
+                Check ($vm.Text() -match 'the memory limit') "the VMM's end does not name the memory limit"
+            }
+            $results += "$($case.Mib) MiB: $(if ($ended) { "ended ($how, exit $code)" } else { 'survived' })"
+        } finally { Stop-Jailed }
+    }
+    "a 1024 MiB guest writes 700 MiB; memory.max " + ($results -join ', ')
+}
 function Stage-Limits {
-    # Job memory limit: below the guest's memory Firecracker cannot run it.
+    # Job memory limit below the guest's memory: as on Linux, the guest boots
+    # (its memory is charged as it is touched) and the VMM ends, with the OOM
+    # killer's exit code, once it touches more than the limit.
     $base = New-Base 'limits'
     $vm = Start-JailedVm $base 'small' @('--cgroup-version', '2', '--cgroup', 'memory.max=134217728') 256
     try {
-        $booted = $vm.WaitFor('Run /bin/sh', 30)
-        if ($booted) {
-            Wait-Shell $vm
-            # Touch all of guest memory: the job limit must stop it.
-            $vm.Send('mount -t tmpfs -o size=240m none /mnt && head -c 230m /dev/zero > /mnt/z; echo FILLED')
-            [void]$vm.WaitFor('FILLED', 60)
-        }
+        Check ($vm.WaitFor('Run /bin/sh', 30)) "a 256 MiB guest did not boot under memory.max=128 MiB: $(($vm.Text() -split "`n" | Select-Object -Last 3) -join ' | ')"
+        Wait-Shell $vm
+        # Touch most of guest memory: the job limit must stop it.
+        $vm.Send('mount -t tmpfs -o size=240m tmpfs /run && head -c 230m /dev/zero > /run/z; echo FILLED-$?')
+        $filled = $vm.WaitFor('FILLED-0', 60)
         $exited = $vm.P.WaitForExit(30000)
-        Check $exited "a 256 MiB guest ran under memory.max=128 MiB"
+        Check $exited "a 256 MiB guest wrote 230 MiB under memory.max=128 MiB and ran on (filled: $filled)"
+        Check ($vm.P.ExitCode -eq 137) "the jailer returned $($vm.P.ExitCode), not 137, for a VMM past its memory limit"
     } finally { Stop-Jailed }
-    "memory.max below the guest's memory: Firecracker cannot map it and exits"
+    "memory.max below the guest's memory: the guest boots, and the VMM ends with 137 once it touches more than the limit"
 }
 
 # cpu.max is the job's CPU rate hard cap, from Firecracker's start, with a

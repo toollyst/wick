@@ -47,6 +47,8 @@ target_args() {
     uffd_protocol) echo "-max_len=4096" ;;
     # Up to 256 guest accesses, line changes, routes and snapshots.
     whp_irqchip) echo "-max_len=8192" ;;
+    # A sequence of WHP exits' fields, about 20 bytes each.
+    whp_exit) echo "-max_len=4096" ;;
     *) die "unknown target '$1' (tools/fuzz.sh --list)" ;;
     esac
 }

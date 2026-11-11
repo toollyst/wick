@@ -58,3 +58,10 @@ path = "fuzz_targets/whp_irqchip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "whp_exit"
+path = "fuzz_targets/whp_exit.rs"
+test = false
+doc = false
+bench = false

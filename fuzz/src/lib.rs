@@ -35,3 +35,10 @@ extern crate self as kvm_bindings;
 /// uses nothing but `core`), so it is fuzzed on any host.
 #[path = "../../crates/compat/kvm-ioctls/src/hvf/exit.rs"]
 pub mod hvf_exit;
+
+/// What the WHP run loop decides from a vCPU exit's fields
+/// (`crates/compat/kvm-ioctls/src/whp/exit.rs`), compiled from its source (it
+/// uses nothing but `core`), so it is fuzzed on any host.
+#[allow(unreachable_pub, dead_code)]
+#[path = "../../crates/compat/kvm-ioctls/src/whp/exit.rs"]
+pub mod whp_exit;

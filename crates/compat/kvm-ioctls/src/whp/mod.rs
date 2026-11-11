@@ -30,6 +30,7 @@
 
 pub mod cap;
 mod emulate;
+mod exit;
 mod ffi;
 mod irqchip;
 mod pvclock;
