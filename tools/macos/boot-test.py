@@ -912,6 +912,114 @@ def stage_devices(ctx):
     return "virtio-rng, rate-limited block, MMDS V2 over the net endpoint, balloon inflate + statistics, logger and metrics files"
 
 
+def phys_footprint(pid):
+    """`pid`'s phys_footprint in bytes (proc_pid_rusage RUSAGE_INFO_V4): what
+    the jailer's memory limit is checked against."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    # rusage_info_v4: ri_uuid[16], then 64-bit counters; ri_phys_footprint is
+    # the eighth (sys/resource.h).
+    buf = (ctypes.c_uint8 * 512)()
+    r = libc.proc_pid_rusage(pid, 4, buf)
+    check(r == 0, f"proc_pid_rusage for {pid}: errno {ctypes.get_errno()}")
+    return struct.unpack_from("<Q", buf, 16 + 7 * 8)[0]
+
+
+def stage_balloon(ctx):
+    """A balloon cycle on a guest restored from a memory file, then on a
+    booted one: the guest and the host keep using the same pages, and the
+    pages the balloon took leave the VMM's footprint and come back when the
+    guest writes them again.
+
+    Hypervisor.framework maps the physical pages behind a host range, not the
+    host address, so a discard that replaced the pages (upstream's
+    `discard_range` maps anonymous memory `MAP_FIXED` over file-backed guest
+    memory; the libc's `MADV_DONTNEED` does the same for anonymous memory)
+    left the guest on the old pages while the drive's reads went to the new
+    ones: O_DIRECT reads of /dev/vda, whose buffers come from the pages the
+    balloon gave back, read stale data (measured: 2 wrong checksums in 6
+    reads). The backend now unmaps the range for the duration of the change
+    (`libc::wick_guest`). The booted guest's cycle also measured, before the
+    fix, a footprint that stayed at the guest's size: `MADV_FREE_REUSABLE`
+    released nothing of pages mapped in stage 2."""
+    disk = md5(ctx.rootfs, 64 << 20)
+    balloon = {"amount_mib": 0, "deflate_on_oom": True, "stats_polling_interval_s": 1}
+    cfg = config(ctx, vcpus=2, mem=512, balloon=balloon)
+
+    def direct_reads(vm, n=6):
+        """The O_DIRECT reads of the drive's first 64 MiB that read it wrong."""
+        bad = []
+        for i in range(n):
+            _, out = vm.sh("dd if=/dev/vda bs=1M count=64 iflag=direct 2>/dev/null | md5sum")
+            if out.split()[0] != disk:
+                bad.append(i)
+        return bad
+
+    def actual(vm, mib, timeout=60):
+        deadline = time.time() + timeout
+        while True:
+            stats = vm.api("GET", "/balloon/statistics")
+            if stats.get("actual_mib") == mib:
+                return
+            check(time.time() < deadline, f"balloon at {stats.get('actual_mib')} MiB, wanted {mib}: {stats}")
+            time.sleep(0.5)
+
+    def cycle(vm, mib):
+        vm.api("PATCH", "/balloon", {"amount_mib": mib})
+        actual(vm, mib)
+        vm.api("PATCH", "/balloon", {"amount_mib": 0})
+        actual(vm, 0)
+
+    # Pages the guest wrote and freed: what the balloon hands over is then
+    # resident on the host, and so is what O_DIRECT reads land in.
+    dirty = "mount -t tmpfs -o size=300m tmpfs /tmp 2>/dev/null; head -c 200m /dev/urandom > /tmp/f && rm /tmp/f"
+
+    # A guest restored from a memory file: its memory is the file, mapped
+    # private, and a discard replaces the range with anonymous memory.
+    vm = ctx.vm("balloon1", [], cfg)
+    vm.shell()
+    check(not direct_reads(vm, 2), "O_DIRECT reads of /dev/vda before any balloon")
+    vm.sh(dirty, 120)
+    state = os.path.join(ctx.out, "balloon.state")
+    mem = os.path.join(ctx.out, "balloon.mem")
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    vm.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": state, "mem_file_path": mem})
+    vm.kill()
+    vm = ctx.vm("balloon2", [])
+    vm.api("PUT", "/snapshot/load", {"snapshot_path": state,
+                                     "mem_backend": {"backend_type": "File", "backend_path": mem},
+                                     "resume_vm": True})
+    vm.shell()
+    cycle(vm, 150)
+    bad = direct_reads(vm)
+    check(not bad, f"after a restore from file and a 150 MiB balloon cycle, O_DIRECT reads {bad} of /dev/vda read it wrong")
+    vm.reboot()
+    os.unlink(mem)
+
+    # A booted guest: anonymous memory, and the footprint the jailer's limit
+    # is checked against goes down by what the balloon took and up again
+    # when the guest writes the pages again.
+    vm = ctx.vm("balloon3", [], cfg)
+    vm.shell()
+    vm.sh(dirty, 120)
+    before = phys_footprint(vm.proc.pid)
+    vm.api("PATCH", "/balloon", {"amount_mib": 150})
+    actual(vm, 150)
+    inflated = phys_footprint(vm.proc.pid)
+    check(before - inflated >= 100 << 20,
+          f"footprint {before >> 20} MiB before a 150 MiB balloon, {inflated >> 20} MiB after")
+    vm.api("PATCH", "/balloon", {"amount_mib": 0})
+    actual(vm, 0)
+    bad = direct_reads(vm)
+    check(not bad, f"after a 150 MiB balloon cycle, O_DIRECT reads {bad} of /dev/vda read it wrong")
+    vm.sh(dirty, 120)
+    again = phys_footprint(vm.proc.pid)
+    check(again - inflated >= 100 << 20,
+          f"footprint {inflated >> 20} MiB while inflated, {again >> 20} MiB after the guest wrote 200 MiB again")
+    vm.reboot()
+    return (f"150 MiB balloon cycles: after a restore from file, O_DIRECT reads of /dev/vda match 6 of 6;"
+            f" on a booted guest, footprint {before >> 20} -> {inflated >> 20} -> {again >> 20} MiB and reads match 6 of 6")
+
+
 def children(pid):
     out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout
     return [int(p) for p in out.split()]
@@ -1024,6 +1132,7 @@ STAGES = {
     "pci": stage_pci,
     "vhost-user": stage_vhost_user,
     "devices": stage_devices,
+    "balloon": stage_balloon,
     "restores": stage_restores,
     "api-process": stage_api_process,
 }

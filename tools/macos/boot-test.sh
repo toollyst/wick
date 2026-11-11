@@ -6,14 +6,17 @@
 # rootfs: boot, SMP, block (Sync/Async, read and write), vsock in both
 # directions, networking over a Unix datagram endpoint and vmnet, full and diff
 # snapshots restored in a new process, snapshot-editor rebase, the Uffd memory
-# backend, PCI with snapshot restore, a vhost-user-blk backend, and the
-# logger, metrics, MMDS, balloon, entropy device and a rate limiter.
+# backend, PCI with snapshot restore, a vhost-user-blk backend, the
+# logger, metrics, MMDS, balloon, entropy device and a rate limiter, and
+# balloon cycles after a restore from file and on a booted guest (the guest
+# keeps the host's pages; the footprint follows the balloon).
 #
 #   tools/macos/boot-test.sh [--release] [stage...]
 #
 # Stages (default: all, in this order): boot smp block vsock net vmnet
-# snapshot diff uffd hugepages pci vhost-user devices restores. vmnet uses vmnet-shared (NAT); older
-# macOS releases need root for vmnet.framework.
+# snapshot diff uffd hugepages pci vhost-user devices balloon restores
+# api-process. vmnet uses vmnet-shared (NAT); older macOS releases need root
+# for vmnet.framework.
 # The guest images are cached in ~/Library/Caches/wick/boot-test; results and
 # logs go to build/boot-test/<time>. Run tools/setup.sh first.
 set -euo pipefail

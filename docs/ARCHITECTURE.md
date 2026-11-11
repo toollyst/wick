@@ -96,7 +96,12 @@ firecracker binary, vmm   (upstream source + patches/)
    a signal on the host and stage-2 protection in the guest, sleeps until the
    handler fills them, and fills a page before a system call (`read`, `pread`,
    `recv`, ...) touches it, as Linux's `copy_to_user` would. The HVF backend
-   calls into it as KVM's `get_user_pages` would.
+   calls into it as KVM's `get_user_pages` would. And when the libc replaces
+   the pages of a range (`madvise(DONTNEED)` of private memory, a `MAP_FIXED`
+   mapping), the backend unmaps the range from stage 2 for the duration
+   (`libc::wick_guest`), as Linux's MMU notifier zaps KVM's stage-2 entries:
+   Hypervisor.framework maps physical pages, not host addresses, so the guest
+   would otherwise keep the old pages.
 5. **wick features go through the extension point.** Upstream calls `vmm::ext`
    from a few fixed places, and `wick-ext` implements the features
    (`PUT /extensions/{name}`, the config file's `extensions` section).
