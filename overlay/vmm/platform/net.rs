@@ -79,6 +79,11 @@ pub type Tap = super::backend::net::Tap;
 #[doc(hidden)]
 pub use super::backend::net::simulator;
 
+/// Where endpoints named without `/` are made outside a jail (the sandbox
+/// lets a running microVM remove their sockets).
+#[cfg(target_os = "macos")]
+pub use super::backend::net::user_endpoint_dir;
+
 #[cfg(test)]
 mod tests {
     // Interface tests: they run against the backend of the host they are

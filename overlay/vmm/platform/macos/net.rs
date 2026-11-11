@@ -79,6 +79,14 @@ pub fn endpoint_dir() -> io::Result<PathBuf> {
     if let Some((path, _)) = network() {
         return Ok(path.to_owned());
     }
+    let dir = user_endpoint_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// `firecracker-net` in the user's temporary directory (not made here):
+/// where endpoints named without `/` are made outside a jail.
+pub fn user_endpoint_dir() -> io::Result<PathBuf> {
     let mut buf = vec![0u8; usize::try_from(libc::PATH_MAX).unwrap()];
     // SAFETY: confstr into a buffer of the given size.
     let len = unsafe { libc::confstr(CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr().cast(), buf.len()) };
@@ -87,9 +95,7 @@ pub fn endpoint_dir() -> io::Result<PathBuf> {
     }
     let dir =
         CStr::from_bytes_until_nul(&buf).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-    let dir = Path::new(OsStr::from_bytes(dir.to_bytes())).join("firecracker-net");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    Ok(Path::new(OsStr::from_bytes(dir.to_bytes())).join("firecracker-net"))
 }
 
 fn sockaddr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {

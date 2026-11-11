@@ -88,12 +88,18 @@ fn poll_readable(fd: RawFd, timeout: i32) -> io::Result<bool> {
     }
 }
 
+/// How the name of an eventfd's FIFO starts, in the temporary directory
+/// (`std::env::temp_dir()`): then the process ID, `-` and a counter. The
+/// name is removed as soon as the FIFO is open; Firecracker's sandbox lets a
+/// running microVM remove only such names and its network endpoints.
+pub const FIFO_PREFIX: &str = ".eventfd-";
+
 /// A FIFO opened for reading and writing, with no name left behind.
 fn anonymous_fifo() -> io::Result<File> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     for _ in 0..16 {
         let path = std::env::temp_dir().join(format!(
-            ".eventfd-{}-{}",
+            "{FIFO_PREFIX}{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

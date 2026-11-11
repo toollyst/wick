@@ -260,7 +260,7 @@ mod macos {
         ("open", 5, Limit::Error("file-read* file-write*")),
         ("close", 6, Limit::Upstream("close")),
         ("link", 9, Limit::Default),
-        ("unlink", 10, Limit::Error("file-read* file-write*")),
+        ("unlink", 10, Limit::Signal("file-write-unlink")),
         ("mknod", 14, Limit::Number),
         ("chmod", 15, Limit::Signal("file-write-mode")),
         ("chown", 16, Limit::Signal("file-write-owner")),
@@ -349,7 +349,7 @@ mod macos {
         ("fchmodat", 467, Limit::Signal("file-write-mode")),
         ("fchownat", 468, Limit::Signal("file-write-owner")),
         ("linkat", 471, Limit::Default),
-        ("unlinkat", 472, Limit::Error("file-read* file-write*")),
+        ("unlinkat", 472, Limit::Signal("file-write-unlink")),
         ("fclonefileat", 517, Limit::Signal("file-clone")),
         ("fs_snapshot", 518, Limit::Signal("fs-snapshot*")),
         ("terminate_with_payload", 520, Limit::Signal("signal")),
@@ -606,11 +606,12 @@ mod macos {
         };
         let profile = PROFILE.replacen("(deny default)\n", &default_rule(), 1);
         Ok(format!(
-            "{profile}{}{}{}{files}{}",
+            "{profile}{}{}{}{files}{}{}",
             shm_rule(std::process::id()),
             syscall_rule(),
             operation_rule(),
-            run_rule()
+            run_rule(),
+            unlink_rule(root, netns, std::process::id())?
         ))
     }
 
@@ -626,6 +627,66 @@ mod macos {
              (ipc-posix-name-prefix \"{}{pid}.\"))\n",
             libc::HUGE_MEMFD_PREFIX
         )
+    }
+
+    /// The names a running microVM may remove (`unlink`, `unlinkat`; also
+    /// `rmdir` and the old name of `rename`, which Seatbelt decides by the
+    /// same operation, `file-write-unlink`), after [`narrow`]: an eventfd's
+    /// FIFO, which vmm-sys-util names `.eventfd-<pid>-<n>` in the temporary
+    /// directory and removes once open (an eventfd made when the guest
+    /// activates a device), and the sockets of the network endpoints
+    /// (`platform::net`, which removes its own when the device goes). Any
+    /// other name raises SIGSYS, as on Linux upstream's filters have no
+    /// `unlink`: Linux's eventfd and tap have no name. The file rule's other
+    /// operations are unchanged. Seatbelt matches the real path, so the
+    /// directories are given by theirs: in a jail (`root`), its `/tmp`
+    /// (the jailer's `TMPDIR`) and the jail and its network `netns`, by
+    /// their paths outside it; outside a jail, the temporary directory and
+    /// `firecracker-net` in the user's temporary directory.
+    ///
+    /// Memfds take no name a microVM removes: their shared memory objects
+    /// are `shm_rule`'s (`shm_unlink` is decided by `ipc-posix-shm*`), and
+    /// the compatibility libc's `memfd_create`, which makes a file, is not
+    /// called by Firecracker.
+    #[allow(unexpected_cfgs)]
+    fn unlink_rule(root: Option<&Path>, netns: Option<&Path>, pid: u32) -> Result<String, SandboxError> {
+        let tmp = std::env::temp_dir();
+        let fail = |what: &str, path: &Path, err: std::io::Error| {
+            SandboxError::Install(format!("{what} {path:?}: {err}"))
+        };
+        let (tmp, sockets) = match root {
+            Some(root) => {
+                let inside = tmp
+                    .strip_prefix("/")
+                    .map_err(|_| SandboxError::Install(format!("temporary directory {tmp:?}")))?;
+                (root.join(inside), [Some(root.to_owned()), netns.map(Path::to_owned)])
+            }
+            None => {
+                let dir = crate::platform::net::user_endpoint_dir()
+                    .map_err(|err| SandboxError::Install(format!("network endpoint directory: {err}")))?;
+                // The directory itself may not exist yet; its parent does.
+                let parent = dir.parent().unwrap_or(&dir);
+                let parent = parent.canonicalize().map_err(|err| fail("directory", parent, err))?;
+                let tmp = tmp.canonicalize().map_err(|err| fail("temporary directory", &tmp, err))?;
+                (tmp, [Some(parent.join("firecracker-net")), None])
+            }
+        };
+        let narrowed = format!("(extension \"{}\")", NARROWED.to_str().unwrap());
+        let fifo = quoted(&tmp.join(format!("{}{pid}-", vmm_sys_util::eventfd::FIFO_PREFIX)), "FIFO")?;
+        let mut rule = format!("(deny file-write-unlink {narrowed} (with send-signal SIGSYS))\n");
+        // Discovery build: allowed and reported instead.
+        #[cfg(wick_sandbox_discovery)]
+        rule.push_str(&format!("(allow file-write-unlink {narrowed} (with report))\n"));
+        rule.push_str(&format!(
+            "(allow file-write-unlink (require-all {narrowed} (vnode-type FIFO) (prefix \"{fifo}\")))\n"
+        ));
+        for dir in sockets.iter().flatten() {
+            rule.push_str(&format!(
+                "(allow file-write-unlink (require-all {narrowed} (vnode-type SOCKET) (subpath \"{}\")))\n",
+                quoted(dir, "network endpoint directory")?
+            ));
+        }
+        Ok(rule)
     }
 
     /// Operations a running microVM may not ask for, after the file rule
@@ -1842,15 +1903,18 @@ mod macos {
         // (ioctl FIOCLEX); after narrow() that holds as before it.
         #[test]
         fn test_accepted_sockets_are_close_on_exec() {
-            run_child("accept_child", &[]);
+            // Removed here: after narrow() the child may not remove it.
+            let path = std::env::temp_dir().join(format!("wick-accept-{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            run_child("accept_child", &[("WICK_TEST_PATH", path.to_str().unwrap())]);
+            std::fs::remove_file(&path).unwrap();
         }
 
         #[test]
         #[ignore = "run by test_accepted_sockets_are_close_on_exec in a separate process"]
         fn accept_child() {
             use std::os::fd::AsRawFd;
-            let path = std::env::temp_dir().join(format!("wick-accept-{}", std::process::id()));
-            let _ = std::fs::remove_file(&path);
+            let path = std::path::PathBuf::from(std::env::var("WICK_TEST_PATH").unwrap());
             let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
             select(Policy::Default);
             apply().unwrap();
@@ -1860,7 +1924,6 @@ mod macos {
             // SAFETY: a descriptor this process holds.
             let flags = unsafe { libc::fcntl(accepted.as_raw_fd(), libc::F_GETFD) };
             assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
-            std::fs::remove_file(&path).unwrap();
             println!("CHILD-OK");
         }
 
@@ -2389,7 +2452,9 @@ mod macos {
         // denies, after narrow() and in a jail: it raises SIGSYS, or fails
         // with EPERM, as its Limit says, and runs once the rule named is
         // lifted (an allow rule for its operation, or for its number). The
-        // ones nothing decides run.
+        // ones nothing decides run. The calls that remove a name also with
+        // the names a running microVM removes, which they remove unlifted
+        // (ALLOWED_NAMES), and others, which raise SIGSYS (DENIED_NAMES).
         #[test]
         fn test_unfiltered_syscalls_are_limited_by_their_rule() {
             use std::os::unix::process::ExitStatusExt;
@@ -2399,16 +2464,23 @@ mod macos {
                 .join(format!("wick-unfiltered-{}", std::process::id()));
             let jail = base.join("jail");
             std::fs::create_dir_all(jail.join("mnt")).unwrap();
+            std::fs::create_dir_all(jail.join("tmp")).unwrap();
+            std::fs::create_dir_all(base.join("net")).unwrap();
             let mut cases = Vec::new();
             for (name, _, limit) in UNFILTERED_SYSCALLS {
                 if matches!(limit, Limit::Upstream(_)) || ["exit"].contains(name) {
                     continue;
                 }
-                let lifts: &[&str] = match limit {
-                    Limit::Impossible(_) | Limit::Default => &["0"],
-                    _ => &["0", "1"],
+                let mut lifts: Vec<&str> = match limit {
+                    Limit::Impossible(_) | Limit::Default => vec!["0"],
+                    _ => vec!["0", "1"],
                 };
-                for lift in lifts {
+                for (call, names) in ALLOWED_NAMES.iter().chain(DENIED_NAMES) {
+                    if call.split(' ').any(|c| c == *name) {
+                        lifts.extend(*names);
+                    }
+                }
+                for lift in &lifts {
                     for file in ["inside", "second"] {
                         let _ = std::fs::remove_file(jail.join(format!("{file}-{name}-{lift}")));
                     }
@@ -2430,12 +2502,20 @@ mod macos {
                 .map(|(i, ((name, _, lift), other))| {
                     let other = other.id().to_string();
                     let ipc = ipc_name(i);
+                    // In a jail, the temporary directory is its /tmp (the
+                    // jailer's TMPDIR).
+                    let tmp = if lift.starts_with("free-") {
+                        std::env::temp_dir().to_str().unwrap().to_owned()
+                    } else {
+                        "/tmp".to_owned()
+                    };
                     [
                         ("WICK_TEST_CASE", *name),
                         ("WICK_TEST_LIFT", *lift),
                         ("WICK_TEST_JAIL", jail.to_str().unwrap()),
                         ("WICK_TEST_OTHER_PID", other.as_str()),
                         ("WICK_TEST_IPC_NAME", ipc.as_str()),
+                        ("TMPDIR", tmp.as_str()),
                     ]
                     .iter()
                     .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -2467,8 +2547,12 @@ mod macos {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let signal = out.status.signal();
                 let ret = stdout.lines().find_map(|l| l.strip_prefix("RET ")).unwrap_or("none");
+                let allowed = ALLOWED_NAMES.iter().any(|(_, names)| names.contains(lift));
+                let denied = DENIED_NAMES.iter().any(|(_, names)| names.contains(lift));
                 let ok = stdout.contains("NARROWED")
                     && match (limit, *lift) {
+                        _ if allowed => out.status.success() && ret == "ok 0" && stdout.contains("SURVIVED"),
+                        _ if denied => signal == Some(libc::SIGSYS),
                         (Limit::Signal(_) | Limit::Number | Limit::Default, "0") => {
                             signal == Some(libc::SIGSYS)
                         }
@@ -2505,6 +2589,25 @@ mod macos {
             assert!(failures.is_empty(), "{}", failures.join("\n"));
         }
 
+        /// The names a running microVM removes, by the calls that remove them
+        /// (cases of `unfiltered_child`): in a jail, an eventfd's FIFO in its
+        /// /tmp, a network endpoint's socket in its network, a memfd's
+        /// shared memory object and a huge page one's; outside a jail, a
+        /// FIFO in the temporary directory and an endpoint's socket in
+        /// `firecracker-net`.
+        const ALLOWED_NAMES: &[(&str, &[&str])] = &[
+            ("unlink unlinkat", &["fifo", "endpoint", "free-fifo", "free-endpoint"]),
+            ("shm_unlink", &["memfd", "huge"]),
+        ];
+
+        /// Names a running microVM does not remove: a file in the jail, a
+        /// file at an eventfd FIFO's name, a socket outside the network, a
+        /// FIFO with another process's eventfd name, and outside a jail a
+        /// file in the temporary directory. (A name outside the jail is the
+        /// unlifted case.)
+        const DENIED_NAMES: &[(&str, &[&str])] =
+            &[("unlink unlinkat", &["inside", "fifo-name", "socket", "fifo-other", "free-file"])];
+
         /// A POSIX IPC name of this test process's case `i` (31 bytes at most).
         fn ipc_name(i: usize) -> String {
             format!("/wick-u.{}.{i}", std::process::id())
@@ -2521,18 +2624,60 @@ mod macos {
             // SAFETY: no arguments.
             assert_ne!(unsafe { libc::geteuid() }, 0, "never as root: lifted calls run");
             let name = std::env::var("WICK_TEST_CASE").unwrap();
-            let lifted = std::env::var("WICK_TEST_LIFT").unwrap() == "1";
+            let lift = std::env::var("WICK_TEST_LIFT").unwrap();
+            let lifted = lift == "1";
             let jail = std::path::PathBuf::from(std::env::var("WICK_TEST_JAIL").unwrap());
             let base = jail.parent().unwrap().to_owned();
             let other = other_pid() as usize;
             let (n, limit) =
                 UNFILTERED_SYSCALLS.iter().find(|(x, ..)| *x == name).map(|(_, n, l)| (*n, *l)).unwrap();
             let c = |p: &std::path::Path| CString::new(p.as_os_str().as_bytes()).unwrap();
-            let tag = format!("{name}-{}", u8::from(lifted));
+            let tag = format!("{name}-{lift}");
             let inside = c(&jail.join(format!("inside-{tag}")));
             let second = c(&jail.join(format!("second-{tag}")));
             let outside = c(&base.join(format!("outside-{tag}")));
-            let other_name = CString::new(std::env::var("WICK_TEST_IPC_NAME").unwrap()).unwrap();
+            let pid = std::process::id();
+            let other_name = match lift.as_str() {
+                "memfd" => CString::new(format!("/fcm.{pid}.u")).unwrap(),
+                "huge" => CString::new(format!("{}{pid}.u", libc::HUGE_MEMFD_PREFIX)).unwrap(),
+                _ => CString::new(std::env::var("WICK_TEST_IPC_NAME").unwrap()).unwrap(),
+            };
+            // What unlink and unlinkat remove: a file outside the jail,
+            // unless a case of ALLOWED_NAMES or DENIED_NAMES. Each is made
+            // here, before the sandbox.
+            let fifo = |dir: &std::path::Path, pid: u32| {
+                let path = dir.join(format!("{}{pid}-0", vmm_sys_util::eventfd::FIFO_PREFIX));
+                // SAFETY: a NUL-terminated path.
+                assert_eq!(unsafe { libc::mkfifo(c(&path).as_ptr(), 0o600) }, 0, "{path:?}");
+                path
+            };
+            let socket = |path: std::path::PathBuf| {
+                std::mem::forget(std::os::unix::net::UnixDatagram::bind(&path).unwrap());
+                path
+            };
+            let file = |path: std::path::PathBuf| {
+                std::fs::write(&path, b"x").unwrap();
+                path
+            };
+            let free_tmp = std::env::temp_dir().canonicalize().unwrap();
+            let victim = match lift.as_str() {
+                "inside" => jail.join(format!("inside-{tag}")),
+                "fifo" => fifo(&jail.join("tmp"), pid),
+                "fifo-name" => {
+                    file(jail.join("tmp").join(format!("{}{pid}-1", vmm_sys_util::eventfd::FIFO_PREFIX)))
+                }
+                "fifo-other" => fifo(&jail.join("tmp"), pid + 1),
+                "endpoint" => socket(base.join("net").join(format!("e-{n}"))),
+                "socket" => socket(base.join(format!("s-{n}"))),
+                "free-fifo" => fifo(&free_tmp, pid),
+                "free-endpoint" => {
+                    let dir = crate::platform::net::user_endpoint_dir().unwrap();
+                    std::fs::create_dir_all(&dir).unwrap();
+                    socket(dir.join(format!("wick-u-{pid}-{n}")))
+                }
+                _ => base.join(format!("outside-{tag}")),
+            };
+            let victim = c(&victim);
             let mnt = c(&jail.join("mnt"));
             let jailc = c(&jail);
             let attr = c"user.wick";
@@ -2591,7 +2736,7 @@ mod macos {
                 // SAFETY: an 8-word buffer and its size in words.
                 assert_eq!(unsafe { task_info(mach_task_self_, 15, token.as_mut_ptr(), &mut count) }, 0);
             }
-            let lift = match (lifted, limit) {
+            let lift_rule = match (lifted, limit) {
                 (false, _) => String::new(),
                 (true, Limit::Number) => format!("(allow syscall-unix (syscall-number {n}))\n"),
                 // With a filter that holds: a rule with a filter takes
@@ -2602,7 +2747,12 @@ mod macos {
                     .collect(),
                 (true, _) => unreachable!(),
             };
-            let profile = format!("{}{lift}", profile_for(Some(&jail), None).unwrap());
+            let profile = match lift.as_str() {
+                "endpoint" => profile_for(Some(&jail), Some(&base.join("net"))),
+                l if l.starts_with("free-") => profile_for(None, None),
+                _ => profile_for(Some(&jail), None),
+            };
+            let profile = format!("{}{lift_rule}", profile.unwrap());
             COMPILED
                 .set((Compiled::here(&profile).unwrap(), Compiled::here(&api_profile()).unwrap()))
                 .unwrap();
@@ -2623,8 +2773,8 @@ mod macos {
                 "fork" => [0; 8],
                 "open" | "open_nocancel" => [p(&outside), 0, 0, 0, 0, 0, 0, 0],
                 "openat" | "openat_nocancel" => [cwd, p(&outside), 0, 0, 0, 0, 0, 0],
-                "unlink" => [p(&outside), 0, 0, 0, 0, 0, 0, 0],
-                "unlinkat" => [cwd, p(&outside), 0, 0, 0, 0, 0, 0],
+                "unlink" => [p(&victim), 0, 0, 0, 0, 0, 0, 0],
+                "unlinkat" => [cwd, p(&victim), 0, 0, 0, 0, 0, 0],
                 "link" => [p(&inside), p(&second), 0, 0, 0, 0, 0, 0],
                 "linkat" => [cwd, p(&inside), cwd, p(&second), 0, 0, 0, 0],
                 "mknod" => [p(&second), (libc::S_IFIFO | 0o600) as usize, 0, 0, 0, 0, 0, 0],
