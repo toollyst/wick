@@ -280,12 +280,41 @@ pub mod wick_fd {
         (ok != 0).then_some(out)
     }
 
+    std::thread_local! {
+        static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether this thread is asking about a descriptor that may have been
+    /// closed behind this table's back (by std, which closes handles
+    /// itself): the question is meant to fail for one, as on Linux a closed
+    /// descriptor answers `EBADF`. Under strict handle checks (a jailed
+    /// Firecracker's sandbox) the reference raises `STATUS_INVALID_HANDLE`,
+    /// which the sandbox lets the call return from (measured: continuable,
+    /// the call then fails with `ERROR_INVALID_HANDLE`).
+    pub fn probing() -> bool {
+        PROBING.with(std::cell::Cell::get)
+    }
+
+    /// Runs `f`, which asks about a handle that may be closed (see
+    /// [`probing`]).
+    pub fn probe<T>(f: impl FnOnce() -> T) -> T {
+        let was = PROBING.with(|p| p.replace(true));
+        let r = f();
+        PROBING.with(|p| p.set(was));
+        r
+    }
+
+    /// Whether descriptor `fd` still names `own`'s object.
+    fn same_object(fd: c_int, own: HANDLE) -> bool {
+        // SAFETY: compares two handle values; `fd`'s may be closed.
+        probe(|| unsafe { CompareObjectHandles(handle(fd), own) } != 0)
+    }
+
     fn live(map: &mut HashMap<c_int, Entry>, fd: c_int) -> bool {
         let Some(e) = map.get(&fd) else {
             return false;
         };
-        // SAFETY: compares two handle values.
-        if unsafe { CompareObjectHandles(handle(fd), e.own) } != 0 {
+        if same_object(fd, e.own) {
             true
         } else {
             map.remove(&fd);
@@ -301,8 +330,7 @@ pub mod wick_fd {
         static NEXT_SWEEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
         map.insert(fd, entry);
         if map.len() >= NEXT_SWEEP.load(Ordering::Relaxed) {
-            // SAFETY: compares two handle values.
-            map.retain(|&fd, e| unsafe { CompareObjectHandles(handle(fd), e.own) } != 0);
+            map.retain(|&fd, e| same_object(fd, e.own));
             NEXT_SWEEP.store((map.len() * 2).max(64), Ordering::Relaxed);
         }
     }

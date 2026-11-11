@@ -71,10 +71,14 @@ def thread_name(tid):
 
 
 def _cmdline(p):
+    """A process's command line on one line, as procps prints it (a Windows
+    command line may hold line breaks), or its name in brackets."""
     try:
-        return " ".join(p.cmdline()) or f"[{_name(p)}]"
+        cmd = " ".join(p.cmdline())
     except psutil.Error:
-        return f"[{_name(p)}]"
+        cmd = ""
+    cmd = " ".join(cmd.split())
+    return cmd or f"[{_name(p) or '?'}]"
 
 
 def ps(args):
