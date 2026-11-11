@@ -79,7 +79,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
-    DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED, FILETIME, GetLastError, HANDLE,
+    DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE,
     HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0,
     LocalFree, SetHandleInformation,
@@ -90,14 +90,15 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx,
+    CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx,
     LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, SE_PRIVILEGE_ENABLED, TOKEN_PRIVILEGES, TokenPrivileges,
     GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, GetTokenInformation,
-    LABEL_SECURITY_INFORMATION, LUA_TOKEN, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
     SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS,
-    TOKEN_DEFAULT_DACL, TOKEN_GROUPS, TOKEN_QUERY,
+    TOKEN_DEFAULT_DACL, TOKEN_GROUPS, TOKEN_OWNER, TOKEN_QUERY,
     TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenImpersonation,
-    TokenIntegrityLevel, TokenUser, PROTECTED_DACL_SECURITY_INFORMATION, ACL,
+    TokenIntegrityLevel, TokenOwner, TokenUser, PROTECTED_DACL_SECURITY_INFORMATION, ACL,
+    TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TokenElevationType, TokenElevationTypeFull, TokenLinkedToken,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION, DefineDosDeviceW, GetLogicalDrives,
@@ -350,44 +351,13 @@ pub fn join_netns(path: &str) -> Result<(), JailerError> {
     Ok(())
 }
 
-/// Grants the jail's SID full access to `dir` and what is made in it, and
-/// labels it with the jail's integrity level, so that the jailed process can
-/// make its endpoints there (an object without a label is medium, which a
-/// jailed process may not write to). The DACL is protected, as the jail
-/// directory's is ([`jail_dacl`]): an entry `dir` inherits (`C:\`'s
-/// Authenticated Users: Modify, which every jail's token holds) would let
-/// every jail into every network (measured: jailer-test netns, a jail of
-/// network a connected to network b's endpoint). The entries `dir` has of
-/// its own stay (another jail sharing the network keeps its SID); SYSTEM,
-/// the administrators and the user keep full access.
-fn grant_to_jail(dir: &Path) -> io::Result<()> {
-    let user = user_sid()?;
-    let current = dacl_sddl(dir)?;
-    let mut sddl = String::from("D:PAI");
-    // The entries of `dir`'s own: those not marked inherited (`ID`).
-    for ace in current.split_inclusive(')').filter_map(|a| a.find('(').map(|i| &a[i..])) {
-        let inherited = ace.trim_matches(|c| c == '(' || c == ')').split(';').nth(1).is_some_and(|f| f.contains("ID"));
-        if !inherited {
-            sddl.push_str(ace);
-        }
-    }
-    for trustee in ["SY", "BA", user.as_str(), vm_sid()] {
-        let ace = format!("(A;OICI;FA;;;{trustee})");
-        if !sddl.contains(&ace) {
-            sddl.push_str(&ace);
-        }
-    }
-    set_security(dir, &sddl, false)?;
-    set_security(dir, JAIL_LABEL, true)
-}
-
 /// The DACL of `path` as SDDL (`D:...`).
 fn dacl_sddl(path: &Path) -> io::Result<String> {
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1,
     };
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: a NUL-terminated path and out-pointers.
+    // SAFETY: a NUL-terminated path and an out-pointer.
     let rc = unsafe {
         GetNamedSecurityInfoW(
             wide(path).as_ptr(),
@@ -405,22 +375,55 @@ fn dacl_sddl(path: &Path) -> io::Result<String> {
     }
     let mut text: *mut u16 = std::ptr::null_mut();
     let mut len = 0u32;
-    // SAFETY: the descriptor from above; out-pointers.
+    // SAFETY: the descriptor read above; out-pointers.
     let ok = unsafe {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &mut text, &mut len)
     };
-    let result = if ok == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        // SAFETY: `len` characters allocated by the conversion.
-        let s = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(text, len as usize)) };
-        // SAFETY: allocated by the conversion.
-        unsafe { LocalFree(text.cast()) };
-        Ok(s.trim_end_matches('\0').to_owned())
-    };
+    let err = io::Error::last_os_error();
     // SAFETY: allocated by GetNamedSecurityInfoW.
     unsafe { LocalFree(sd) };
-    result
+    if ok == 0 {
+        return Err(err);
+    }
+    // SAFETY: `len` characters allocated by the conversion, freed here.
+    let sddl = unsafe {
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, len as usize));
+        LocalFree(text.cast());
+        s
+    };
+    Ok(sddl.trim_end_matches('\0').to_owned())
+}
+
+/// Protects the network directory `dir` as the jail directory is protected:
+/// its DACL no longer inherits from its parent (what `C:\` grants, Modify to
+/// Authenticated Users, which every jail's token holds, let a jail into
+/// another jail's network, measured by `jailer-test.ps1 netns` on a WHP
+/// machine) and holds SYSTEM, the administrators, the user and this jail's
+/// SID, inherited by the endpoints made in it, plus the jail SIDs granted
+/// before (another jail sharing the network keeps its own). The directory
+/// is labelled with the jail's integrity level, so that the jailed process
+/// can make its endpoints there: an object without a label is medium, which
+/// a jailed process may not write to.
+fn grant_to_jail(dir: &Path) -> io::Result<()> {
+    let user = user_sid()?;
+    let mine = vm_sid();
+    let mut dacl = format!(
+        "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{mine})"
+    );
+    for ace in dacl_sddl(dir)?.split('(').skip(1) {
+        let fields: Vec<&str> = ace.trim_end_matches(')').split(';').collect();
+        // An allow entry of this directory's own (not inherited), for a jail.
+        if let [kind, flags, _, _, _, sid] = fields[..]
+            && kind == "A"
+            && !flags.contains("ID")
+            && sid.starts_with("S-1-9-")
+            && sid != mine
+        {
+            dacl.push_str(&format!("(A;OICI;FA;;;{sid})"));
+        }
+    }
+    set_security(dir, &dacl, false)?;
+    set_security(dir, JAIL_LABEL, true)
 }
 
 /// The variable that tells a relaunched jailer it is the keeper of a
@@ -996,19 +999,25 @@ fn user_sid() -> io::Result<String> {
     // SAFETY: a token handle we own.
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
     let user = token_info(token.as_raw_handle(), TokenUser).map_err(io::Error::other)?;
+    // SAFETY: the buffer holds a TOKEN_USER.
+    sid_string(unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid })
+}
+
+/// `sid` as text (`S-1-...`).
+fn sid_string(sid: PSID) -> io::Result<String> {
     let mut text: *mut u16 = std::ptr::null_mut();
-    // SAFETY: the buffer holds a TOKEN_USER; an out-pointer.
-    if unsafe { ConvertSidToStringSidW((*user.as_ptr().cast::<TOKEN_USER>()).User.Sid, &mut text) } == 0 {
+    // SAFETY: a valid SID and an out-pointer.
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: a NUL-terminated string allocated by the conversion.
-    let sid = unsafe {
+    let s = unsafe {
         let len = (0..).take_while(|&i| *text.add(i) != 0).count();
         let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
         LocalFree(text.cast());
         s
     };
-    Ok(sid)
+    Ok(s)
 }
 
 /// A token information class, in a buffer of the size the token asks for.
@@ -1097,15 +1106,16 @@ fn tokens() -> Result<Tokens, HostError> {
     Ok(Tokens { primary, initial })
 }
 
-/// "Lock pages in memory": guest memory on large pages (`huge_pages`) needs
-/// it, as huge pages on Linux need a pool an administrator reserved.
-const LOCK_MEMORY: &str = "SeLockMemoryPrivilege";
-
 /// The privileges a jailed process keeps, when the operator's token holds
 /// them: `SeChangeNotifyPrivilege` (traversal, the one `DISABLE_MAX_PRIVILEGE`
-/// keeps) and [`LOCK_MEMORY`], which an administrator grants an account for
-/// large pages. Every other privilege is deleted from the jail's tokens.
-const KEPT_PRIVILEGES: [&str; 2] = ["SeChangeNotifyPrivilege", LOCK_MEMORY];
+/// keeps) and nothing else; every other privilege is deleted from the jail's
+/// tokens. "Lock pages in memory" (`SeLockMemoryPrivilege`, large pages) is
+/// not kept either: a token below medium integrity cannot have a privilege
+/// enabled (setting the level disables it, and enabling it again reports
+/// success and leaves it disabled; measured on Windows 11 26H2 at
+/// `S-1-16-6144` and `4096`, where `8192` and up keep it), so a jailed
+/// Firecracker maps no large pages (docs/PORTING.md row 10).
+const KEPT_PRIVILEGES: [&str; 1] = ["SeChangeNotifyPrivilege"];
 
 /// The privileges in `token`: (name, LUID and attributes).
 fn privileges(token: HANDLE) -> Result<Vec<(String, LUID_AND_ATTRIBUTES)>, HostError> {
@@ -1128,38 +1138,88 @@ fn privileges(token: HANDLE) -> Result<Vec<(String, LUID_AND_ATTRIBUTES)>, HostE
         .collect()
 }
 
-/// Enables the privilege `p` in `token`, which holds it.
-fn enable_privilege(token: HANDLE, p: LUID_AND_ATTRIBUTES) -> Result<(), HostError> {
-    let tp = TOKEN_PRIVILEGES {
-        PrivilegeCount: 1,
-        Privileges: [LUID_AND_ATTRIBUTES { Luid: p.Luid, Attributes: SE_PRIVILEGE_ENABLED }],
-    };
-    // SAFETY: a token we own and one privilege.
-    let ok = unsafe { AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
-    // It succeeds without the privilege, and says so.
-    // SAFETY: plain call.
-    if ok == 0 || unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
-        return Err(HostError::Spawn("enabling SeLockMemoryPrivilege in the jail's token", last_error()));
+/// `SE_GROUP_USE_FOR_DENY_ONLY` (winnt.h).
+const GROUP_DENY_ONLY: u32 = 0x10;
+
+/// The entries of a `TokenGroups` buffer.
+fn group_entries(buf: &[u64]) -> &[SID_AND_ATTRIBUTES] {
+    // SAFETY: the buffer holds a TOKEN_GROUPS with `GroupCount` entries.
+    unsafe {
+        let g = &*buf.as_ptr().cast::<TOKEN_GROUPS>();
+        std::slice::from_raw_parts(g.Groups.as_ptr(), g.GroupCount as usize)
     }
-    Ok(())
 }
 
-/// A restricted token: no privileges but [`KEPT_PRIVILEGES`] (with
-/// [`LOCK_MEMORY`] enabled, so a jailed Firecracker maps large pages without
-/// adjusting a token it may not open), `restricting` SIDs, the default DACL
-/// and the jail's integrity level.
+/// The groups of `from` (its `entries`) to mark deny-only in the jail's
+/// token: for an elevated token, exactly the groups its UAC-filtered twin
+/// (`TokenLinkedToken`) marks so; for a token UAC did not split, the groups
+/// UAC's filter marks, by name ([`is_admin_group`]).
+fn groups_to_deny(from: HANDLE, entries: &[SID_AND_ATTRIBUTES]) -> Result<Vec<SID_AND_ATTRIBUTES>, HostError> {
+    let elevation = token_info(from, TokenElevationType)?;
+    // SAFETY: the buffer holds a TOKEN_ELEVATION_TYPE.
+    let kind = unsafe { *elevation.as_ptr().cast::<TOKEN_ELEVATION_TYPE>() };
+    let names: Vec<String> = entries
+        .iter()
+        .map(|g| sid_string(g.Sid).map_err(|e| HostError::Spawn("a group's SID", e)))
+        .collect::<Result<_, _>>()?;
+    let denied: Vec<bool> = if kind == TokenElevationTypeFull {
+        let linked = token_info(from, TokenLinkedToken)?;
+        // SAFETY: the buffer holds a TOKEN_LINKED_TOKEN, whose handle is ours to close.
+        let linked = unsafe { OwnedHandle::from_raw_handle((*linked.as_ptr().cast::<TOKEN_LINKED_TOKEN>()).LinkedToken) };
+        let groups = token_info(linked.as_raw_handle(), TokenGroups)?;
+        let mut by_uac = Vec::new();
+        for g in group_entries(&groups) {
+            if g.Attributes & GROUP_DENY_ONLY != 0 {
+                by_uac.push(sid_string(g.Sid).map_err(|e| HostError::Spawn("a group's SID", e))?);
+            }
+        }
+        names.iter().map(|n| by_uac.contains(n)).collect()
+    } else {
+        names.iter().map(|n| is_admin_group(n)).collect()
+    };
+    Ok(entries
+        .iter()
+        .zip(denied)
+        .filter(|(g, d)| *d && g.Attributes & GROUP_DENY_ONLY == 0)
+        .map(|(g, _)| SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 })
+        .collect())
+}
+
+/// Whether `sid` is a group a UAC-filtered token marks deny-only (what
+/// `LUA_TOKEN` does): the administrators and the other operator groups,
+/// local and domain, and "local account and member of Administrators".
+fn is_admin_group(sid: &str) -> bool {
+    const BUILTIN: [&str; 11] = ["544", "547", "548", "549", "550", "551", "553", "554", "556", "569", "578"];
+    const DOMAIN: [&str; 8] = ["498", "512", "516", "517", "518", "519", "520", "521"];
+    if sid == "S-1-5-114" {
+        return true;
+    }
+    if let Some(rid) = sid.strip_prefix("S-1-5-32-") {
+        return BUILTIN.contains(&rid);
+    }
+    sid.starts_with("S-1-5-21-") && sid.rsplit('-').next().is_some_and(|rid| DOMAIN.contains(&rid))
+}
+
+/// A restricted token: the administrators' groups deny-only
+/// ([`groups_to_deny`]), the user its owner, no privileges but
+/// [`KEPT_PRIVILEGES`], `restricting` SIDs, the default DACL and the jail's
+/// integrity level. Not `LUA_TOKEN`, which does the first two but also
+/// strips every privilege but a standard user's from an elevated token,
+/// and whose list of groups is the system's to change.
 fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedHandle, HostError> {
     let held = privileges(from)?;
     let delete: Vec<LUID_AND_ATTRIBUTES> =
         held.iter().filter(|(n, _)| !KEPT_PRIVILEGES.contains(&n.as_str())).map(|(_, p)| *p).collect();
+    let groups = token_info(from, TokenGroups)?;
+    let disable = groups_to_deny(from, group_entries(&groups))?;
     let mut t: HANDLE = std::ptr::null_mut();
-    // SAFETY: a token we own, a valid privilege array and a valid SID array.
+    // SAFETY: a token we own, valid SID arrays and a valid privilege array.
     if unsafe {
         CreateRestrictedToken(
             from,
-            LUA_TOKEN,
             0,
-            std::ptr::null(),
+            u32::try_from(disable.len()).unwrap(),
+            disable.as_ptr(),
             u32::try_from(delete.len()).unwrap(),
             delete.as_ptr(),
             u32::try_from(restricting.len()).unwrap(),
@@ -1172,8 +1232,22 @@ fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedH
     }
     // SAFETY: a token handle we own.
     let t = unsafe { OwnedHandle::from_raw_handle(t) };
-    if let Some((_, lock)) = held.iter().find(|(n, _)| n == LOCK_MEMORY) {
-        enable_privilege(t.as_raw_handle(), *lock)?;
+    // The user owns what the jail makes (an elevated token's owner is the
+    // administrators' group, deny-only now).
+    let user = token_info(from, TokenUser)?;
+    // SAFETY: the buffer holds a TOKEN_USER.
+    let owner = TOKEN_OWNER { Owner: unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid } };
+    // SAFETY: a structure of the size passed; the SID lives in `user`.
+    if unsafe {
+        SetTokenInformation(
+            t.as_raw_handle(),
+            TokenOwner,
+            (&raw const owner).cast(),
+            u32::try_from(std::mem::size_of::<TOKEN_OWNER>()).unwrap(),
+        )
+    } == 0
+    {
+        return Err(HostError::Spawn("TokenOwner", last_error()));
     }
 
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -1746,15 +1820,27 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // The jail's SID is granted on a network directory whose DACL is then
-    // protected: what it inherited (%TEMP%'s entries here) is gone, its own
-    // entries (another jail's) stay, the administrators, SYSTEM and the user
-    // keep full access, and the directory gets the jail's label.
+    // A network directory granted to the jail is protected: what its parent
+    // grants (Authenticated Users, which every jail holds) is gone, the
+    // operator's entries and other jails' stay, and it gets the jail's label.
     #[test]
-    fn test_grant_to_jail_protects_the_network() {
+    fn test_grant_to_jail_protects_the_directory_and_keeps_other_jails() {
         let dir = std::env::temp_dir().join(format!("wick-jailer-grant-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let label = |path: &Path| -> String {
+        let other = "S-1-9-1-2-3-4";
+        let user = user_sid().unwrap();
+        // As a temporary directory comes, plus another jail's entry.
+        let inherited = dacl_sddl(&dir).unwrap();
+        assert!(inherited.contains(";ID;") || inherited.contains("ID;"), "no inherited entry to drop: {inherited}");
+        set_security(&dir, &format!("D:AI(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{other})"), false).unwrap();
+        grant_to_jail(&dir).unwrap();
+        let after = dacl_sddl(&dir).unwrap();
+        assert!(after.starts_with("D:P"), "not protected: {after}");
+        for sid in ["SY", "BA", user.as_str(), vm_sid(), other] {
+            assert!(after.contains(&format!("(A;OICI;FA;;;{sid})")), "{sid} missing: {after}");
+        }
+        assert!(!after.contains("ID;") && !after.contains(";AU)") && !after.contains(";BU)"), "inherited entries kept: {after}");
+        let label = {
             use windows_sys::Win32::Security::Authorization::{
                 ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
             };
@@ -1762,7 +1848,7 @@ mod tests {
             // SAFETY: a NUL-terminated path and out-pointers.
             let rc = unsafe {
                 GetNamedSecurityInfoW(
-                    wide(path).as_ptr(),
+                    wide(&dir).as_ptr(),
                     SE_FILE_OBJECT,
                     LABEL_SECURITY_INFORMATION,
                     std::ptr::null_mut(),
@@ -1775,9 +1861,9 @@ mod tests {
             assert_eq!(rc, 0);
             let mut text: *mut u16 = std::ptr::null_mut();
             let mut len = 0u32;
-            // SAFETY: the descriptor from above; out-pointers.
+            // SAFETY: the descriptor read above; out-pointers.
             let ok = unsafe {
-                ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, LABEL_SECURITY_INFORMATION, &mut text, &mut len)
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, LABEL_SECURITY_INFORMATION, &mut text, &mut len)
             };
             assert_ne!(ok, 0);
             // SAFETY: `len` characters allocated by the conversion.
@@ -1789,26 +1875,70 @@ mod tests {
             }
             s
         };
-        let before = dacl_sddl(&dir).unwrap();
-        assert!(before.contains("ID;"), "nothing inherited to test with: {before}");
-        // Guests (S-1-5-32-546, `BG` in SDDL) stands for another jail's SID:
-        // an entry of the directory's own (icacls grants only a SID Windows knows).
-        let st = std::process::Command::new("icacls").arg(&dir).arg("/grant").arg("*S-1-5-32-546:(OI)(CI)F").output().unwrap();
-        assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stdout));
-        grant_to_jail(&dir).unwrap();
-        let after = dacl_sddl(&dir).unwrap();
-        assert!(after.starts_with("D:P"), "not protected: {after}");
-        assert!(!after.contains("ID;"), "an inherited entry stayed: {after}");
-        let user = user_sid().unwrap();
-        for trustee in ["BG", "SY", "BA", user.as_str(), vm_sid()] {
-            assert!(after.contains(&format!(";;;{trustee})")), "{trustee} missing: {after}");
-        }
-        assert!(!after.contains(";;;AU)") && !after.contains(";;;BU)"), "{after}");
-        assert!(label(&dir).contains(JAIL_INTEGRITY_SID));
-        // A second grant (another jail of the same jailer: the same SID) changes nothing.
+        assert!(label.contains(JAIL_INTEGRITY_SID), "{label}");
+        // A second grant (another jail of the same jailer: the same SID) changes nothing more.
         grant_to_jail(&dir).unwrap();
         assert_eq!(dacl_sddl(&dir).unwrap(), after);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The jail's token marks the administrators' groups deny-only and makes
+    // the user its owner, as a UAC-filtered token does, without the LUA flag
+    // that would strip SeLockMemoryPrivilege with the rest.
+    #[test]
+    fn test_tokens_disable_the_administrators_and_are_owned_by_the_user() {
+        const DENY_ONLY: u32 = GROUP_DENY_ONLY;
+        assert!(is_admin_group("S-1-5-32-544") && is_admin_group("S-1-5-114") && is_admin_group("S-1-5-21-1-2-3-512"));
+        assert!(!is_admin_group("S-1-5-32-545") && !is_admin_group("S-1-5-21-1-2-3-1001") && !is_admin_group("S-1-1-0"));
+        // On an elevated token, UAC's own filter (the linked token) and the
+        // list agree on which of this token's groups to mark.
+        let mut own: HANDLE = std::ptr::null_mut();
+        // SAFETY: our own token.
+        assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut own) }, 0);
+        // SAFETY: a token handle we own.
+        let own = unsafe { OwnedHandle::from_raw_handle(own) };
+        let groups = token_info(own.as_raw_handle(), TokenGroups).unwrap();
+        let entries = group_entries(&groups);
+        let elevation = token_info(own.as_raw_handle(), TokenElevationType).unwrap();
+        // SAFETY: the buffer holds a TOKEN_ELEVATION_TYPE.
+        if unsafe { *elevation.as_ptr().cast::<TOKEN_ELEVATION_TYPE>() } == TokenElevationTypeFull {
+            let by_uac: Vec<String> =
+                groups_to_deny(own.as_raw_handle(), entries).unwrap().iter().map(|g| sid_string(g.Sid).unwrap()).collect();
+            let by_list: Vec<String> = entries
+                .iter()
+                .filter(|g| g.Attributes & DENY_ONLY == 0)
+                .map(|g| sid_string(g.Sid).unwrap())
+                .filter(|n| is_admin_group(n))
+                .collect();
+            assert_eq!(by_uac, by_list, "UAC's filter and the list disagree");
+        } else {
+            eprintln!("this token is not elevated: UAC's filter was not compared with the list");
+        }
+        let t = tokens().unwrap();
+        let user = user_sid().unwrap();
+        for token in [&t.primary, &t.initial] {
+            let groups = token_info(token.as_raw_handle(), TokenGroups).unwrap();
+            // SAFETY: the buffer holds a TOKEN_GROUPS with `GroupCount` entries.
+            let entries = unsafe {
+                let g = &*groups.as_ptr().cast::<TOKEN_GROUPS>();
+                std::slice::from_raw_parts(g.Groups.as_ptr(), g.GroupCount as usize)
+            };
+            let mut seen = 0;
+            for g in entries {
+                let sid = sid_string(g.Sid).unwrap();
+                if is_admin_group(&sid) {
+                    seen += 1;
+                    assert_ne!(g.Attributes & DENY_ONLY, 0, "{sid} is not deny-only");
+                }
+            }
+            if seen == 0 {
+                eprintln!("this account is in no administrators' group: only the owner was checked");
+            }
+            let owner = token_info(token.as_raw_handle(), TokenOwner).unwrap();
+            // SAFETY: the buffer holds a TOKEN_OWNER.
+            let owner = sid_string(unsafe { (*owner.as_ptr().cast::<TOKEN_OWNER>()).Owner }).unwrap();
+            assert_eq!(owner, user);
+        }
     }
 
     // The keeper's variable is read before main, ahead of upstream's
@@ -1908,11 +2038,11 @@ mod tests {
         job(&Limits { cpu_weight: Some(3), cpus: Some(vec![(0, 1)]), ..Limits::default() }).unwrap();
     }
 
-    /// The jail's tokens hold no privilege but traversal and, when the
-    /// operator's account holds it, "Lock pages in memory", enabled
-    /// (docs/PORTING.md, row 10); this process's token has others.
+    /// The jail's tokens hold no privilege but traversal, enabled
+    /// (docs/PORTING.md, row 10): not "Lock pages in memory" either, which
+    /// this process's token may hold; this process's token has others.
     #[test]
-    fn test_tokens_keep_only_traversal_and_lock_memory() {
+    fn test_tokens_keep_only_traversal() {
         let mut own: HANDLE = std::ptr::null_mut();
         // SAFETY: our own token.
         assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut own) }, 0);
@@ -1920,23 +2050,18 @@ mod tests {
         let own = unsafe { OwnedHandle::from_raw_handle(own) };
         let mine: Vec<String> = privileges(own.as_raw_handle()).unwrap().into_iter().map(|(n, _)| n).collect();
         assert!(mine.iter().any(|n| !KEPT_PRIVILEGES.contains(&n.as_str())), "{mine:?}");
-        let lock = mine.iter().any(|n| n == LOCK_MEMORY);
-        let mut want = vec![("SeChangeNotifyPrivilege".to_string(), true)];
-        if lock {
-            want.push((LOCK_MEMORY.to_string(), true));
-        }
+        let want = vec![("SeChangeNotifyPrivilege".to_string(), true)];
         let t = tokens().unwrap();
         for token in [&t.primary, &t.initial] {
-            let mut kept: Vec<(String, bool)> = privileges(token.as_raw_handle())
+            let kept: Vec<(String, bool)> = privileges(token.as_raw_handle())
                 .unwrap()
                 .into_iter()
                 .map(|(n, p)| (n, p.Attributes & SE_PRIVILEGE_ENABLED != 0))
                 .collect();
-            kept.sort();
             assert_eq!(kept, want, "the jail's token, from {mine:?}");
         }
-        if !lock {
-            eprintln!("this account lacks {LOCK_MEMORY}: only its absence from the jail was checked");
+        if !mine.iter().any(|n| n == "SeLockMemoryPrivilege") {
+            eprintln!("this account lacks SeLockMemoryPrivilege: its removal from the jail was not exercised");
         }
     }
 

@@ -496,6 +496,58 @@ namespace Wick {
         }
     }
 
+    // Large pages on this host: whether `bytes` of them can be had right
+    // now (VirtualAlloc with MEM_LARGE_PAGES, under SeLockMemoryPrivilege),
+    // so a guest that cannot get its memory is told apart from a Firecracker
+    // bug: the host's physical memory fragments with uptime, and the
+    // allocation then fails with ERROR_NO_SYSTEM_RESOURCES (1450) however
+    // much is free.
+    public static class LargePages {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr VirtualAlloc(IntPtr addr, UIntPtr size, uint type, uint protect);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool VirtualFree(IntPtr addr, UIntPtr size, uint type);
+        [DllImport("kernel32.dll")]
+        static extern UIntPtr GetLargePageMinimum();
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool LookupPrivilegeValueW(string system, string name, out long luid);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivileges p, uint len, IntPtr prev, IntPtr ret);
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll")]
+        static extern bool CloseHandle(IntPtr h);
+        [StructLayout(LayoutKind.Sequential)]
+        struct TokenPrivileges { public uint Count; public long Luid; public uint Attributes; }
+
+        public static long Minimum() { return (long)(ulong)GetLargePageMinimum(); }
+
+        // "" when `bytes` of large pages were allocated (and freed again),
+        // else what failed.
+        public static string Probe(long bytes) {
+            IntPtr token;
+            if (!OpenProcessToken(GetCurrentProcess(), 0x28, out token)) return "OpenProcessToken: error " + Marshal.GetLastWin32Error(); // ADJUST_PRIVILEGES | QUERY
+            try {
+                var p = new TokenPrivileges();
+                p.Count = 1;
+                p.Attributes = 2; // SE_PRIVILEGE_ENABLED
+                if (!LookupPrivilegeValueW(null, "SeLockMemoryPrivilege", out p.Luid)) return "LookupPrivilegeValue: error " + Marshal.GetLastWin32Error();
+                if (!AdjustTokenPrivileges(token, false, ref p, 16, IntPtr.Zero, IntPtr.Zero) || Marshal.GetLastWin32Error() != 0)
+                    return "enabling SeLockMemoryPrivilege: error " + Marshal.GetLastWin32Error();
+            } finally { CloseHandle(token); }
+            IntPtr mem = VirtualAlloc(IntPtr.Zero, (UIntPtr)(ulong)bytes, 0x3000 | 0x20000000, 0x04); // MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE
+            if (mem == IntPtr.Zero) {
+                int err = Marshal.GetLastWin32Error();
+                return "VirtualAlloc(MEM_LARGE_PAGES, " + (bytes >> 20) + " MiB) failed with error " + err +
+                    (err == 1450 ? " (ERROR_NO_SYSTEM_RESOURCES: the host has no " + (bytes >> 20) + " MiB of contiguous large pages free; its physical memory is fragmented, a reboot defragments it)" : "");
+            }
+            VirtualFree(mem, UIntPtr.Zero, 0x8000); // MEM_RELEASE
+            return "";
+        }
+    }
+
     public static class Util {
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         static extern uint GetCompressedFileSizeW(string path, out uint high);
@@ -1656,6 +1708,11 @@ function Stage-Hugepages {
     $priv = (whoami /priv | Select-String 'SeLockMemoryPrivilege') -ne $null
     Check $priv ("this account lacks 'Lock pages in memory' (SeLockMemoryPrivilege): an administrator grants it in " +
         "secpol.msc, Local Policies, User Rights Assignment, then sign out and in")
+    # The guest's memory in large pages, from this process, before Firecracker
+    # asks for it: a host that cannot give them fails here by name, not with
+    # Firecracker's bare OutOfMemory.
+    $probe = [Wick.LargePages]::Probe(256MB)
+    Check ($probe -eq '') "$probe (large page minimum $([Wick.LargePages]::Minimum()) bytes); the guest's 256 MiB are not to be had right now, which is the host's state, not Firecracker's"
     $cfg = Base-Config 2
     $cfg['machine-config']['huge_pages'] = '2M'
     $vm = Start-Vm 'hugepages' $cfg

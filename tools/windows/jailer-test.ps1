@@ -1074,44 +1074,33 @@ function Stage-Boot {
     } finally { Stop-Jailed }
 }
 
-# docs/PORTING.md row 10: a jailed Firecracker maps guest memory on large
-# pages, as on Linux it maps huge pages an administrator reserved. The jail's
-# token keeps no privilege but traversal and, when the operator's account
-# holds it, "Lock pages in memory" (enabled); the job's memory limit holds
-# large pages too; and a jailed 2 vCPU guest boots on 2 MiB pages and keeps
-# 160 MiB written to its memory.
+# docs/PORTING.md row 10: a jailed Firecracker maps no guest memory on large
+# pages, and says why: a token below medium integrity cannot have a privilege
+# enabled ("Lock pages in memory" among them), so the jail's token keeps no
+# privilege but traversal whether or not the operator's account holds it,
+# a jailed process cannot open its token to adjust it, large pages in the
+# jail are refused, and a jailed guest asking for 2 MiB pages fails to
+# start with the cause named (the broker that would bring them is row 10's
+# open work).
 function Stage-Hugepages {
     $base = New-Base 'hugepages'
     $held = $null -ne (whoami /priv | Select-String 'SeLockMemoryPrivilege')
     $privs = Invoke-JailedProbe $base 'p' '2' @() 'privileges:0'
-    $want = if ($held) { 'SeChangeNotifyPrivilege+,SeLockMemoryPrivilege+' } else { 'SeChangeNotifyPrivilege+' }
     $got = (($privs -replace '^allowed ', '') -split ',' | Sort-Object) -join ','
-    Check ($got -eq $want) "the jail's token holds '$privs', not '$want'"
-    # Firecracker in the jail cannot enable a privilege itself: the jailer does.
+    Check ($got -eq 'SeChangeNotifyPrivilege+') "the jail's token holds '$privs', not 'SeChangeNotifyPrivilege+'"
     $own = Invoke-JailedProbe $base 't' '2' @() 'tokenopen:0'
     Check ($own -match '^denied ') "a jailed process opened its own token to adjust it: $own"
     $large = Invoke-JailedProbe $base 'l' '2' @() 'largepage:64'
-    if (-not $held) {
-        Check ($large -match '^denied .*privilege') "large pages in a jail of an account without the privilege: $large"
-        Check $false ("this account lacks 'Lock pages in memory' (SeLockMemoryPrivilege), so large pages cannot be " +
-            "checked: an administrator grants it in secpol.msc, Local Policies, User Rights Assignment, then sign " +
-            "out and in (checked without it: the jail holds only traversal, cannot open its token to adjust it, and maps no large pages)")
-    }
-    Check ($large -match '^allowed ') "64 MiB of large pages in the jail: $large"
-    $limited = Invoke-JailedProbe $base 'm' '2' @('memory.max=33554432') 'largepage:64'
-    Check ($limited -match '^denied ') "64 MiB of large pages under memory.max=32 MiB: $limited"
+    Check ($large -match '^denied ') "64 MiB of large pages in a jail: $large"
     $vm = Start-JailedVm $base 'vm' @() 256 '2M'
     try {
-        Wait-Shell $vm
-        $mem = [int]$vm.Sh("awk '/MemTotal/ {print `$2}' /proc/meminfo", 10)
-        Check ($mem -gt 200000 -and $mem -le 262144) "MemTotal $mem kB for 256 MiB"
-        $out = $vm.Sh('mount -t tmpfs -o size=200m tmpfs /tmp && head -c 160m /dev/urandom > /tmp/f && md5sum /tmp/f > /tmp/a && md5sum /tmp/f | cmp - /tmp/a && echo same', 120)
-        Check ($out -eq 'same') "160 MiB in guest memory read back differently: '$out'"
-        $vm.Send('reboot -ff')
-        Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
-        Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
+        Check ($vm.P.WaitForExit(30000)) 'the jailer did not exit after Firecracker refused large pages'
+        Check ($vm.P.ExitCode -ne 0) "jailer exit $($vm.P.ExitCode) for a jailed guest on large pages"
+        $text = $vm.Text()
+        Check ($text -match 'below medium') "the refusal does not name the integrity level: $(($text -split "`n" | Select-Object -Last 5) -join ' | ')"
     } finally { Stop-Jailed }
-    "the jail keeps only traversal and 'Lock pages in memory', enabled (it cannot open its token to enable it); 64 MiB of large pages in the jail, refused under memory.max=32 MiB; a jailed 2 vCPU guest on 2 MiB pages boots and keeps 160 MiB written"
+    $note = if ($held) { ' (the operator holds it)' } else { ' (the operator does not hold it either)' }
+    "the jail keeps only traversal, not 'Lock pages in memory'$note, cannot open its token, maps no large pages, and a jailed guest on 2 MiB pages is refused naming the integrity level"
 }
 
 function Stage-Limits {
