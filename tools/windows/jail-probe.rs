@@ -869,6 +869,7 @@ fn check(c: &str) -> String {
                     if member != 0 { "yes" } else { "no" }
                 )
             }
+        }
         // The limits of the job this process is in, as Windows reports them:
         // `allowed affinity=<mask> cpu=<flags>:<rate or weight>`.
         "job" => {

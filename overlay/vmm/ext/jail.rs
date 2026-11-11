@@ -501,13 +501,14 @@ mod imp {
 /// ([`super::api_process`]). The jailer makes it as it makes Firecracker,
 /// from the same binary on the same token in the same Job Object, so the
 /// jail's limits cover both as one cgroup does, and hands each its end of
-/// the link: Firecracker's end comes as `WICK_API_WAITING`, the API
-/// process's as `WICK_API_LINK` with a handle to Firecracker as
-/// `WICK_API_FIRECRACKER`. The API process enters the jail as Firecracker
-/// does, then waits for its server and never returns from here. Without
-/// the jailer, Firecracker makes the API process itself (`api_process::
-/// split`) with the same two variables, and a process that finds them
-/// serves whether jailed or not.
+/// link: the API process listens, inside the jail, at the path it gets as
+/// `WICK_API_LINK`; Firecracker connects there (`WICK_API_WAITING`), as
+/// long as the API process runs (a handle to it, `WICK_API_PROCESS`). The
+/// API process enters the jail as Firecracker does, then waits for its
+/// server and never returns from here. Without the jailer, Firecracker
+/// makes the API process itself (`api_process::split`), with
+/// `WICK_API_LINK` and a handle to itself as `WICK_API_FIRECRACKER`, and a
+/// process that finds `WICK_API_LINK` serves whether jailed or not.
 #[cfg(windows)]
 mod imp {
     use std::io::Error;
@@ -559,7 +560,6 @@ mod imp {
             return Ok(());
         };
         let netns = std::env::var_os(super::NETNS_ENV);
-        let waiting = std::env::var_os(crate::ext::api_process::WAITING_ENV);
         // SAFETY: called first thing in main, before any other thread exists.
         unsafe { std::env::remove_var(ENV) };
         let value = value.to_string_lossy().into_owned();
@@ -600,13 +600,9 @@ mod imp {
             }
             NETNS.set(dir).expect("the jail is entered once");
         }
-        if let Some(waiting) = waiting {
-            // SAFETY: as above, before any other thread.
-            unsafe { std::env::remove_var(crate::ext::api_process::WAITING_ENV) };
-            let link = crate::ext::api_process::link_from_env(&waiting)
-                .map_err(|e| JailError::ApiProcess(Error::other(e.to_string())))?;
-            crate::ext::api_process::set_waiting(link);
-        }
+        // SAFETY: as above, before any other thread.
+        unsafe { crate::ext::api_process::take_waiting() }
+            .map_err(|e| JailError::ApiProcess(Error::other(e.to_string())))?;
         if api {
             // The jailer made this API process: in the jail now, it serves.
             serve_api()?;

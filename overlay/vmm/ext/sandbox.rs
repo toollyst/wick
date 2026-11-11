@@ -79,7 +79,9 @@ pub unsafe fn denied_syscall(_si_code: libc::c_int, _info: *mut libc::siginfo_t)
 }
 
 #[cfg(target_os = "windows")]
-pub use windows::{MITIGATIONS, Mitigation, Phase, apply, denied_syscall, narrow, select};
+pub use windows::{
+    MITIGATIONS, Mitigation, Phase, apply, apply_api, denied_syscall, narrow, select, selected,
+};
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 /// Selects the sandbox policy (no effect on Linux, where seccomp is used).
