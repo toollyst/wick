@@ -29,8 +29,19 @@ type HANDLE = *mut c_void;
 #[repr(C)]
 struct STARTUPINFOW {
     cb: u32,
-    rest: [usize; 12],
+    reserved: [*mut u16; 3],
+    geometry: [u32; 7],
+    flags: u32,
+    show_window: u16,
+    reserved2_len: u16,
+    reserved2: *mut u8,
+    stdin: HANDLE,
+    stdout: HANDLE,
+    stderr: HANDLE,
 }
+
+/// `STARTF_USESTDHANDLES`.
+const USE_STD_HANDLES: u32 = 0x100;
 
 #[repr(C)]
 struct PROCESS_INFORMATION {
@@ -75,6 +86,8 @@ extern "system" {
     fn CloseHandle(h: HANDLE) -> i32;
     fn GetCurrentProcess() -> HANDLE;
     fn GetLastError() -> u32;
+    fn GetStdHandle(which: u32) -> HANDLE;
+    fn SetHandleInformation(h: HANDLE, mask: u32, flags: u32) -> i32;
     fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32;
     fn GetExitCodeProcess(h: HANDLE, code: *mut u32) -> i32;
 }
@@ -175,7 +188,24 @@ fn low(checks: &[String]) -> std::io::Result<u32> {
             cmd.push_str(&format!(" \"{c}\""));
         }
         let mut cmd = wide(&cmd);
-        let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, rest: [0; 12] };
+        // The child answers on our standard handles, which a pipe may be.
+        let inherit = |which: u32| {
+            let h = GetStdHandle(which);
+            SetHandleInformation(h, 1, 1); // HANDLE_FLAG_INHERIT
+            h
+        };
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            reserved: [std::ptr::null_mut(); 3],
+            geometry: [0; 7],
+            flags: USE_STD_HANDLES,
+            show_window: 0,
+            reserved2_len: 0,
+            reserved2: std::ptr::null_mut(),
+            stdin: inherit(-10i32 as u32),
+            stdout: inherit(-11i32 as u32),
+            stderr: inherit(-12i32 as u32),
+        };
         let mut pi = PROCESS_INFORMATION { process: std::ptr::null_mut(), thread: std::ptr::null_mut(), pid: 0, tid: 0 };
         if CreateProcessAsUserW(
             dup,
@@ -183,7 +213,7 @@ fn low(checks: &[String]) -> std::io::Result<u32> {
             cmd.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            0,
+            1,
             0,
             std::ptr::null(),
             std::ptr::null(),

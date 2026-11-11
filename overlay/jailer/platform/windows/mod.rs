@@ -17,7 +17,8 @@
 //! - **The jailed identity is a restricted token** instead of `--uid`/`--gid`
 //!   (Windows has no numeric ids; they are recorded in `WICK_JAIL` only): the
 //!   user's privileges removed, the user's own SID left out of the
-//!   restricting SIDs, so the user's files are denied, and low integrity, so
+//!   restricting SIDs, so the user's files are denied, and the jail's
+//!   integrity level ([`JAIL_INTEGRITY_SID`], between low and medium), so
 //!   nothing at medium integrity can be written. WHP works for such a process
 //!   (it is refused inside an AppContainer). The process starts with an
 //!   initial impersonation token on its main thread, the same restricted
@@ -31,7 +32,11 @@
 //!   logon SID), so they open nothing a process of the session could not.
 //! - **The jail directory** is protected from what its parent grants and
 //!   grants full access, inherited, to the jail's SID, the user, SYSTEM and
-//!   the administrators; it has a low mandatory label.
+//!   the administrators. Its mandatory label is the jail's integrity level,
+//!   no read, write or execute up: a process of the user below it (a
+//!   low-integrity one, as a browser's sandbox runs) cannot open the jail's
+//!   files or API socket, nor the jailed process, although the user's SID
+//!   grants them; Firecracker, at that level, and the operator, above it, can.
 //! - **cgroups are a Job Object** ([`cgroup`](super::cgroup)): job memory
 //!   limit, CPU rate hard cap (from Firecracker's third CPU-second on, see
 //!   `CPU_CAP_GRACE_100NS`), active process limit; the job kills
@@ -169,9 +174,13 @@ fn jail_dacl(user: &str) -> String {
     )
 }
 /// Low mandatory label, inherited, no write up.
-const JAIL_LABEL: &str = "S:(ML;OICI;NW;;;LW)";
-/// Low integrity.
-const LOW_INTEGRITY_SID: &str = "S-1-16-4096";
+const JAIL_LABEL: &str = "S:(ML;OICI;NWNRNX;;;S-1-16-6144)";
+/// The jailed process's integrity level: above low (0x1000), so that a
+/// low-integrity process of the same user, which holds the user's SID the
+/// jail directory grants, is kept out by the jail's label, and below medium
+/// (0x2000), so that the jailed process writes nothing at medium integrity.
+/// Windows compares levels as numbers; 0x1800 has no name of its own.
+const JAIL_INTEGRITY_SID: &str = "S-1-16-6144";
 
 /// What the Windows backend refuses, or a Windows step that failed.
 #[derive(Debug, thiserror::Error)]
@@ -375,7 +384,7 @@ pub fn install_resource_limits(
 }
 
 /// Sets the jail directory's access (full access for the restricted token,
-/// inherited, a low mandatory label), maps a free drive letter to it and
+/// inherited, the jail's mandatory label), maps a free drive letter to it and
 /// makes its root the current directory. Upstream's absolute paths resolve
 /// inside the jail from here on.
 pub(crate) fn enter_jail(path: &Path) -> Result<(), JailerError> {
@@ -385,7 +394,7 @@ pub(crate) fn enter_jail(path: &Path) -> Result<(), JailerError> {
     let user = user_sid().map_err(|e| fail("the user's SID", e))?;
     set_security(&root, &jail_dacl(&user), false)
         .map_err(|e| fail("grant the jail's SID", e))?;
-    set_security(&root, JAIL_LABEL, true).map_err(|e| fail("set the low integrity label", e))?;
+    set_security(&root, JAIL_LABEL, true).map_err(|e| fail("set the jail's integrity label", e))?;
     std::fs::create_dir_all(root.join(JAIL_TMP)).map_err(|e| fail("create tmp", e))?;
     let drive = map_drive(&root).map_err(JailerError::from)?;
     // A step that fails from here on ends the jailer through `exit`, which
@@ -706,7 +715,7 @@ fn tokens() -> Result<Tokens, HostError> {
 }
 
 /// A restricted token: no privileges, `restricting` SIDs, the default DACL
-/// and low integrity.
+/// and the jail's integrity level.
 fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedHandle, HostError> {
     let mut t: HANDLE = std::ptr::null_mut();
     // SAFETY: a token we own and a valid SID array.
@@ -762,7 +771,7 @@ fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedH
         return Err(HostError::Spawn("TokenDefaultDacl", last_error()));
     }
 
-    let low = Sid::new(LOW_INTEGRITY_SID)?;
+    let low = Sid::new(JAIL_INTEGRITY_SID)?;
     let label = TOKEN_MANDATORY_LABEL {
         Label: SID_AND_ATTRIBUTES { Sid: low.0, Attributes: SE_GROUP_INTEGRITY },
     };

@@ -6,8 +6,8 @@
 //! Windows has no chroot. The jail's root becomes a drive of its own
 //! (`DefineDosDevice`) and the current directory its root, so the absolute
 //! paths upstream's jailer and Firecracker use from here on resolve inside the
-//! jail; the directory is opened to the jailed token and labelled low
-//! integrity (`platform::enter_jail`). Confinement itself is the jailed
+//! jail; the directory is opened to the jailed token and labelled with the
+//! jail's integrity level (`platform::enter_jail`). Confinement itself is the jailed
 //! process's restricted token (`platform::exec_command`).
 
 use std::path::Path;

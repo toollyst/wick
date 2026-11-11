@@ -6,7 +6,9 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,isolation,boot,limits,cpu] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,low,isolation,boot,limits,cpu] [-Bin <dir>]
+#
+# `refuse` and `low` need no WHP; the other stages boot a guest.
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build).
 # Needs the boot test's guest files in -Assets (vmlinux-6.1.188 and
@@ -15,7 +17,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'isolation', 'boot', 'limits', 'cpu'),
+    [string[]]$Stage = @('refuse', 'low', 'isolation', 'boot', 'limits', 'cpu'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -141,15 +143,53 @@ function Stage-Refuse {
     "--netns, --new-pid-ns, --daemonize, fsize= and an unsupported cgroup are refused before Firecracker starts"
 }
 
-function Stage-Isolation {
-    $probe = $Probe
-    if (-not $probe) {
-        $probe = Join-Path $WorkDir 'jail-probe.exe'
-        $rustc = Get-Command rustc -ErrorAction SilentlyContinue
-        Check ($null -ne $rustc) 'needs rustc (or -Probe) to build tools\windows\jail-probe.rs'
-        & $rustc.Source --edition 2021 -O -o $probe (Join-Path $Here 'jail-probe.rs') 2>&1 | Out-Host
-        Check (Test-Path $probe) 'jail-probe.rs did not build'
+# tools\windows\jail-probe.rs, built once (or -Probe).
+function Get-Probe {
+    if ($script:Probe) { return $script:Probe }
+    $p = Join-Path $WorkDir 'jail-probe.exe'
+    $rustc = Get-Command rustc -ErrorAction SilentlyContinue
+    Check ($null -ne $rustc) 'needs rustc (or -Probe) to build tools\windows\jail-probe.rs'
+    & $rustc.Source --edition 2021 -O -o $p (Join-Path $Here 'jail-probe.rs') 2>&1 | Out-Host
+    Check (Test-Path $p) 'jail-probe.rs did not build'
+    $script:Probe = $p
+    $p
+}
+
+# A jailed Firecracker with an API socket and no guest (no WHP needed).
+# Returns @{ Jailer; Fc (process); Root; Sock }.
+function Start-ApiJail([string]$base, [string]$id, [string[]]$jailerArgs = @()) {
+    $extra = ($jailerArgs | ForEach-Object { if ($_ -match ' ') { "`"$_`"" } else { $_ } }) -join ' '
+    $j = Start-Process $Jailer -ArgumentList "--id $id --exec-file `"$Fc`" --uid 0 --gid 0 --chroot-base-dir `"$base`" $extra" -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $base "$id-out.txt") -RedirectStandardError (Join-Path $base "$id-err.txt")
+    $root = Join-Path $base "firecracker.exe\$id\root"
+    $sock = Join-Path $root 'run\firecracker.socket'
+    $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t -and -not $j.HasExited) { Start-Sleep -Milliseconds 100 }
+    Check (Test-Path $sock) "the jailed API socket did not appear: $(Get-Content -Raw (Join-Path $base "$id-err.txt") -ErrorAction SilentlyContinue)"
+    $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" } | Select-Object -First 1
+    Check ($null -ne $fcp) "the jailed Firecracker $id is not running"
+    @{ Jailer = $j; Fc = $fcp; Root = $root; Sock = $sock }
+}
+
+# One API call to a socket; returns "<body> <status>".
+function Invoke-Api([string]$sock, [string]$method, [string]$path) {
+    & curl.exe -s -o - -w ' %{http_code}' --unix-socket $sock -X $method "http://localhost$path"
+}
+
+# Runs jail-probe with `checks` (check -> whether it must be allowed); returns
+# the lines that did not answer as expected.
+function Test-Probe([string[]]$prefix, $expect) {
+    $lines = @(& (Get-Probe) @($prefix + @($expect.Keys)) 2>&1 | ForEach-Object { "$_" })
+    $bad = @()
+    foreach ($k in $expect.Keys) {
+        $l = $lines | Where-Object { $_.StartsWith("$k ") } | Select-Object -First 1
+        if (-not $l) { $bad += "${k}: no answer ($($lines -join ' | '))"; continue }
+        $allowed = $l.Substring($k.Length + 1).StartsWith('allowed')
+        if ($allowed -ne $expect[$k]) { $bad += $l }
     }
+    $bad
+}
+
+function Stage-Isolation {
+    $probe = Get-Probe
     $base = New-Base 'isolation'
     $secret = Join-Path $env:USERPROFILE "wick-jailer-test-$PID.txt"
     Set-Content $secret 'secret'
@@ -201,6 +241,47 @@ function Stage-Isolation {
         "jailed: no user files, nothing outside its jail, no other jail, API socket or process (the operator's, another microVM's); the operator reaches the API socket ($($expect.Count) checks)"
     } finally {
         Remove-Item $secret, $outside, 'C:\Users\Public\wick-jailer-test.txt' -ErrorAction SilentlyContinue
+        Stop-Jailed
+    }
+}
+
+# Row 16 of docs/PORTING.md: only the jail's identity reaches a jail. A plain
+# low-integrity process of the same user (jail-probe `low`: the user's token
+# at low integrity, as a browser's sandbox runs) holds the user's SID, which
+# the jail directory grants; the jail's integrity label, above low, keeps it
+# out of the jail's files, its API socket and the jailed process. Needs no
+# guest.
+function Stage-Low {
+    $base = New-Base 'low'
+    try {
+        $jail = Start-ApiJail $base 'target'
+        Set-Content (Join-Path $jail.Root 'secret.txt') 'secret'
+        $localLow = Join-Path $env:USERPROFILE 'AppData\LocalLow'
+        $medium = Join-Path $env:USERPROFILE "wick-jailer-test-low-$PID.txt"
+        $lowFile = Join-Path $localLow "wick-jailer-test-low-$PID.txt"
+        $expect = [ordered]@{
+            "read:$($jail.Root)\secret.txt"     = $false  # the jail's files
+            "write:$($jail.Root)\intruder.txt"  = $false
+            "write:$($jail.Root)\run\x.txt"    = $false
+            "connect:$($jail.Sock)"             = $false  # its API socket
+            "open:$($jail.Fc.Id)"               = $false  # the jailed process
+            # The controls: it is a low-integrity process of the user.
+            'read:C:\Windows\win.ini'          = $true
+            "write:$lowFile"                    = $true
+            "write:$medium"                     = $false
+        }
+        $bad = Test-Probe @('low') $expect
+        Check ($bad.Count -eq 0) "low integrity: $($bad -join '; ')"
+        Check (-not (Test-Path (Join-Path $jail.Root 'intruder.txt'))) 'a file appeared in the jail'
+        # The operator still reaches the jailed Firecracker, which answers.
+        $op = Test-Probe @() ([ordered]@{ "connect:$($jail.Sock)" = $true; "read:$($jail.Root)\secret.txt" = $true })
+        Check ($op.Count -eq 0) "operator: $($op -join '; ')"
+        $answer = Invoke-Api $jail.Sock 'GET' '/'
+        Check ($answer -match '"state":"Not started".* 200$') "the jailed Firecracker's API: $answer"
+        Check (-not $jail.Fc.HasExited) 'the jailed Firecracker exited'
+        "a low-integrity process of the user reaches neither the jail's files, its API socket nor the jailed process ($($expect.Count - 3) checks, 3 controls); the operator does, and the jailed Firecracker answers"
+    } finally {
+        Remove-Item (Join-Path $env:USERPROFILE "wick-jailer-test-low-$PID.txt"), (Join-Path $env:USERPROFILE "AppData\LocalLow\wick-jailer-test-low-$PID.txt") -ErrorAction SilentlyContinue
         Stop-Jailed
     }
 }
@@ -298,9 +379,9 @@ $left = foreach ($c in [char[]](68..90)) {
     if ([WickJailerTest.Dos]::QueryDosDevice("$($c):", $sb, 1024) -gt 0 -and $sb.ToString().StartsWith("\??\$WorkDir", 'OrdinalIgnoreCase')) { "$($c): -> $($sb.ToString().Substring(4))" }
 }
 $Results['drives'] = if ($left) { "FAIL  drives: left mapped: $($left -join ', ')" } else { 'PASS  drives: every jail drive was removed' }
-''
-$Results.Values
 $failed = @($Results.Values | Where-Object { $_.StartsWith('FAIL') }).Count
+$summary = @($Results.Values) + @('', "$($Results.Count - $failed) passed, $failed failed")
+$summary | Set-Content -Encoding UTF8 (Join-Path $WorkDir 'summary.txt')
 ''
-"$($Results.Count - $failed) passed, $failed failed"
+$summary
 exit [int]($failed -ne 0)
