@@ -6,19 +6,22 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,pidns,isolation,boot,limits,cpu] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,pidns,handoff,isolation,boot,limits,cpu,uffd,vhost-user] [-Bin <dir>]
 #
-# `refuse`, `low`, `daemonize`, `handles` and `pidns` need no WHP; the others
-# boot a guest. `pidns` needs a console (it types into it and reads it).
+# `refuse`, `low`, `daemonize`, `handles`, `pidns` and `handoff` need no WHP;
+# the others boot a guest. `pidns` needs a console (it types into it and
+# reads it).
 #
-# -Bin holds jailer.exe and firecracker.exe (default: the release build).
+# -Bin holds jailer.exe and firecracker.exe (default: the release build),
+# `examples\uffd_on_demand_handler.exe` for `uffd` and, for `vhost-user`,
+# vhost-user-blk.exe next to them or in the build's vhost-user-blk\release.
 # Needs the boot test's guest files in -Assets (vmlinux-6.1.188 and
 # ubuntu-24.04.squashfs; tools/windows/boot-test.ps1 downloads them) and
 # rustc to build the probe (or -Probe with a built jail-probe.exe).
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'pidns', 'isolation', 'boot', 'limits', 'cpu'),
+    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'isolation', 'boot', 'limits', 'cpu', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -103,19 +106,32 @@ class JailedVm {
 }
 
 # A jail for `id` under `base` with the guest's files, and a VM in it.
-function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256) {
+# -Api keeps the API socket (/run/firecracker.socket in the jail) and sets
+# `Sock` and `Root` on the VM; -NoConfig starts Firecracker with nothing
+# configured (the API configures it); `drives` are added to the root drive.
+function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256, [switch]$Api, [switch]$NoConfig, [object[]]$drives = @()) {
     $root = Join-Path $base "firecracker.exe\$id\root"
     New-Item -ItemType Directory -Force -Path $root | Out-Null
     Copy-Item (Join-Path $Assets 'vmlinux-6.1.188') (Join-Path $root 'vmlinux')
     Copy-Item (Join-Path $Assets 'ubuntu-24.04.squashfs') (Join-Path $root 'rootfs')
     $cfg = [ordered]@{
         'boot-source'    = [ordered]@{ kernel_image_path = '/vmlinux'; boot_args = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd root=/dev/vda ro rootfstype=squashfs init=/bin/sh' }
-        'drives'         = @([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs'; is_root_device = $true; is_read_only = $true })
+        'drives'         = @([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs'; is_root_device = $true; is_read_only = $true }) + $drives
         'machine-config' = [ordered]@{ vcpu_count = 2; mem_size_mib = $memMib }
     }
     Set-Content -Encoding ASCII (Join-Path $root 'vm.json') ($cfg | ConvertTo-Json -Depth 5)
-    $line = (@('--id', $id, '--exec-file', "`"$Fc`"", '--uid', '0', '--gid', '0', '--chroot-base-dir', "`"$base`"") + ($jailerArgs | ForEach-Object { if ($_ -match ' ') { "`"$_`"" } else { $_ } }) + @('--', '--no-api', '--config-file', '/vm.json')) -join ' '
+    $fcArgs = @('--')
+    if (-not $Api) { $fcArgs += '--no-api' }
+    if (-not $NoConfig) { $fcArgs += @('--config-file', '/vm.json') }
+    $line = (@('--id', $id, '--exec-file', "`"$Fc`"", '--uid', '0', '--gid', '0', '--chroot-base-dir', "`"$base`"") + ($jailerArgs | ForEach-Object { if ($_ -match ' ') { "`"$_`"" } else { $_ } }) + $fcArgs) -join ' '
     $vm = [JailedVm]::new($Jailer, $line, (Join-Path $base "$id-console.txt"))
+    $vm | Add-Member -NotePropertyName Root -NotePropertyValue $root
+    $sock = Join-Path $root 'run\firecracker.socket'
+    $vm | Add-Member -NotePropertyName Sock -NotePropertyValue $sock
+    if ($Api) {
+        $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t -and -not $vm.P.HasExited) { Start-Sleep -Milliseconds 100 }
+        Check (Test-Path $sock) "the jailed API socket of $id did not appear: $(($vm.Text() -split "`n" | Select-Object -Last 3) -join ' | ')"
+    }
     $vm
 }
 
@@ -260,13 +276,47 @@ function Start-ApiJail([string]$base, [string]$id, [string[]]$jailerArgs = @()) 
     @{ Jailer = $j; Fc = $fcp; Root = $root; Sock = $sock }
 }
 
-# One API call to a socket; returns "<body> <status>".
-function Invoke-Api([string]$sock, [string]$method, [string]$path) {
-    & curl.exe -s -o - -w ' %{http_code}' --unix-socket $sock -X $method "http://localhost$path"
+# One API call to a socket; returns "<body> <status>". A body (an object) is
+# sent as JSON from a file: Windows PowerShell drops the quotes of a JSON
+# argument.
+function Invoke-Api([string]$sock, [string]$method, [string]$path, $body = $null) {
+    $a = @('-s', '-o', '-', '-w', ' %{http_code}', '--unix-socket', $sock, '-X', $method, "http://localhost$path")
+    if ($null -ne $body) {
+        $file = Join-Path $WorkDir "api-body-$PID.json"
+        [IO.File]::WriteAllText($file, ($body | ConvertTo-Json -Depth 8 -Compress))
+        $a += @('-H', 'Content-Type: application/json', '--data-binary', "@$file")
+    }
+    & curl.exe @a
+}
+
+# `Invoke-Api` that fails unless the status is 2xx; returns the body.
+function Invoke-ApiOk([string]$sock, [string]$method, [string]$path, $body = $null) {
+    $r = Invoke-Api $sock $method $path $body
+    Check ($r -match ' 2\d\d$') "$method $path -> $r"
+    $r -replace ' \d{3}$', ''
 }
 
 # Runs jail-probe with `checks` (check -> whether it must be allowed); returns
 # the lines that did not answer as expected.
+# Runs a program as a plain process of the user (jail-probe `medium`:
+# medium integrity, the administrators' group for deny only, no privilege
+# but SeChangeNotify, as UAC gives a user's programs); returns
+# (exit code, output).
+function Invoke-Medium([string[]]$argv, [int]$ms = 20000) {
+    $out = Join-Path $WorkDir 'medium-out.txt'
+    $line = 'medium ' + (($argv | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+    $p = Start-Process (Get-Probe) -ArgumentList $line -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+    $null = $p.Handle
+    if (-not $p.WaitForExit($ms)) { $p.Kill(); throw [Failure]::new("the medium process did not exit: $line") }
+    @($p.ExitCode, ((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join ''))
+}
+
+# Fails unless jail-probe `medium` makes a plain process of the user.
+function Assert-Medium {
+    $t = Invoke-Medium @((Get-Probe), 'token:0')
+    Check ($t[1] -match 'token:0 allowed integrity 8192 administrators no privileges 1') "jail-probe medium is not a plain process of the user: $($t[1])"
+}
+
 function Test-Probe([string[]]$prefix, $expect) {
     $lines = @(& (Get-Probe) @($prefix + @($expect.Keys)) 2>&1 | ForEach-Object { "$_" })
     $bad = @()
@@ -581,6 +631,162 @@ function Stage-Pidns {
     } finally {
         $victims | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
         [WickJailerTest.Term]::Flush()
+        Stop-Jailed
+    }
+}
+
+# Row 14 of docs/PORTING.md: a jailed VMM passes descriptors to a userfaultfd
+# handler or a vhost-user backend of the operator. The jail's token opens no
+# process outside the jail, so a jailed sender cannot duplicate handles into
+# the receiver, and neither can Winsock, which duplicates a socket into the
+# target process itself: the receiver pulls them out of the sender instead
+# (vmm-sys-util's sock_ctrl_msg, its FLAG_PULL frames). This stage checks that
+# with the jail's real tokens: a file handle and a socket a jailed process
+# holds are pulled out of it by a process of the operator (the test's, and a
+# plain medium-integrity one when the test is elevated), and the jailed
+# process cannot open the operator's. The protocol end to end, under a
+# guest, is `uffd` and `vhost-user`. Needs no guest.
+function Stage-Handoff {
+    $base = New-Base 'handoff'
+    $probe = Get-Probe
+    $root = Join-Path $base 'jail-probe.exe\h\root'
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    $secret = "HANDOFF-$([Guid]::NewGuid().ToString('N'))"
+    $file = Join-Path $WorkDir "handoff-secret-$PID.txt"
+    [IO.File]::WriteAllText($file, $secret)
+    # The socket's receiver listens in the jail: a socket outside it is out
+    # of the jail's reach, as a handler's socket is placed in the jail.
+    $sock = Join-Path $root 'handoff.sock'
+    $out = Join-Path $WorkDir 'handoff-out.txt'
+    $listenOut = Join-Path $WorkDir 'handoff-listen.txt'
+    $listener = $null
+    try {
+        $listener = Start-Process $probe -ArgumentList "listenpull:$sock" -PassThru -NoNewWindow -RedirectStandardOutput $listenOut
+        $t = [DateTime]::Now.AddSeconds(5); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
+        Check (Test-Path $sock) 'the receiver did not listen'
+        $j = Start-Process $Jailer -ArgumentList "--id h --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- sockpull:$sock hold:${file}:20 signal:$PID" -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+        $t = [DateTime]::Now.AddSeconds(15); $held = $null
+        while ([DateTime]::Now -lt $t -and -not $held -and -not $j.HasExited) {
+            Start-Sleep -Milliseconds 200
+            $held = Get-Content $out -ErrorAction SilentlyContinue | Where-Object { $_ -match '^hold:.* allowed (\d+)$' } | Select-Object -First 1
+        }
+        Check ($null -ne $held) "the jailed process did not hold the file: $(Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue)"
+        $value = [int64]($held -replace '.* allowed (\d+)$', '$1')
+        $jailed = Get-Process jail-probe | Where-Object { $_.Path -like "$root*" } | Select-Object -First 1
+        Check ($null -ne $jailed) 'the jailed process is not running'
+        # The socket the jailed process handed over works in the receiver.
+        [void]$listener.WaitForExit(10000)
+        $sent = Get-Content $out | Where-Object { $_.StartsWith('sockpull:') } | Select-Object -First 1
+        Check ($sent -match ' allowed') "the jailed sender: $sent"
+        $got = Get-Content $listenOut -Raw -ErrorAction SilentlyContinue
+        Check ($got -match 'listenpull:.* allowed') "the receiver: $got"
+        # The file handle is pulled out of the jailed process and read.
+        $pulled = & $probe "pull:$($jailed.Id):$value"
+        Check ($pulled -match "allowed $secret$") "the operator pulling the handle: $pulled"
+        $medium = ''
+        $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if ($elevated) {
+            # Also from a plain process of the user (medium integrity, no
+            # administrator's group or privileges), as a handler of the user
+            # runs: jail-probe `medium`, checked to be one first.
+            Assert-Medium
+            $m = Invoke-Medium @($probe, "pull:$($jailed.Id):$value")
+            Check ($m[1] -match "allowed $secret") "a medium-integrity process pulling the handle: $($m[1])"
+            $medium = ' and by a medium-integrity process of the user'
+        }
+        [void]$j.WaitForExit(30000)
+        $sig = Get-Content $out | Where-Object { $_.StartsWith("signal:$PID ") } | Select-Object -First 1
+        Check ($sig -and $sig -notmatch ' allowed') "the jailed process can open the operator: $sig"
+        "a socket and a file handle held by the jailed process were pulled out by the operator$medium; the jailed process cannot open the operator ($sig)"
+    } finally {
+        if ($listener -and -not $listener.HasExited) { $listener.Kill() }
+        Remove-Item $file -ErrorAction SilentlyContinue
+        Stop-Jailed
+    }
+}
+
+# A tool next to the binaries, or where the build puts it.
+function Find-Tool([string]$name) {
+    $dirs = @($Bin, (Join-Path $Bin 'examples'), (Join-Path $Bin '..\..\vhost-user-blk\release'))
+    foreach ($d in $dirs) { $p = Join-Path $d $name; if (Test-Path $p) { return (Resolve-Path $p).Path } }
+    throw [Failure]::new("$name not found in $($dirs -join ', ')")
+}
+
+# Row 14, end to end: a jailed guest snapshotted, then restored in another
+# jail with its memory served by upstream's uffd_on_demand_handler, a process
+# of the operator: the jailed Firecracker hands it the userfaultfd (a
+# socket) and the memory file, which the handler pulls out of the jail.
+function Stage-Uffd {
+    $handler = Find-Tool 'uffd_on_demand_handler.exe'
+    $base = New-Base 'uffd'
+    $h = $null
+    try {
+        $vm = Start-JailedVm $base 'snap' @() 256 -Api
+        Wait-Shell $vm
+        $vm.Send('echo snapshot-$((6*7)) > /tmp/mark')
+        Invoke-ApiOk $vm.Sock 'PATCH' '/vm' ([ordered]@{ state = 'Paused' }) | Out-Null
+        Invoke-ApiOk $vm.Sock 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = '/snap.state'; mem_file_path = '/snap.mem' }) | Out-Null
+        Stop-Jailed
+        # The restoring jail: the snapshot, the drives the snapshot names,
+        # and the handler's socket, in the jail.
+        $root = Join-Path $base 'firecracker.exe\restore\root'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        foreach ($f in 'snap.state', 'snap.mem') { Copy-Item (Join-Path $vm.Root $f) (Join-Path $root $f) }
+        $sock = Join-Path $root 'uffd.sock'
+        $h = Start-Process $handler -ArgumentList "`"$sock`" `"$(Join-Path $root 'snap.mem')`"" -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $base 'handler-out.txt') -RedirectStandardError (Join-Path $base 'handler-err.txt')
+        $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t -and -not $h.HasExited) { Start-Sleep -Milliseconds 100 }
+        Check (Test-Path $sock) "the uffd handler did not listen: $(Get-Content (Join-Path $base 'handler-err.txt') -Raw -ErrorAction SilentlyContinue)"
+        $vm2 = Start-JailedVm $base 'restore' @() 256 -Api -NoConfig
+        Invoke-ApiOk $vm2.Sock 'PUT' '/snapshot/load' ([ordered]@{ snapshot_path = '/snap.state'; mem_backend = [ordered]@{ backend_type = 'Uffd'; backend_path = '/uffd.sock' }; resume_vm = $true }) | Out-Null
+        $vm2.Send('PS1=')
+        $mark = $vm2.Sh('cat /tmp/mark', 30)
+        Check ($mark -eq 'snapshot-42') "the restored guest's state: '$mark'"
+        $md5 = $vm2.Sh('head -c 64m /dev/zero | md5sum', 120)
+        Check ($md5 -match '^7f614da9329cd3aebf59b91aadc30bf0') "64 MiB of fresh pages through the handler: '$md5'"
+        Check (-not $h.HasExited) "the handler exited: $(Get-Content (Join-Path $base 'handler-err.txt') -Raw -ErrorAction SilentlyContinue)"
+        $vm2.Send('reboot -ff')
+        Check ($vm2.P.WaitForExit(15000)) 'the jailer did not exit after the restored guest rebooted'
+        Check ($vm2.P.ExitCode -eq 0) "jailer exit $($vm2.P.ExitCode)"
+        'a jailed guest restored in another jail from a snapshot served by uffd_on_demand_handler outside it: state kept, fresh pages served'
+    } finally {
+        if ($h -and -not $h.HasExited) { $h.Kill() }
+        Stop-Jailed
+    }
+}
+
+# Row 14, end to end: a jailed guest with a vhost-user-blk drive served by
+# tools/vhost-user-blk, a process of the operator: the jailed Firecracker
+# hands it guest memory and eventfds, which the backend pulls out of the jail.
+function Stage-Vhost-User {
+    $vub = Find-Tool 'vhost-user-blk.exe'
+    $base = New-Base 'vhost-user'
+    $root = Join-Path $base 'firecracker.exe\vub\root'
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    $img = Join-Path $WorkDir 'vub.img'
+    $bytes = New-Object byte[] (8MB); (New-Object Random).NextBytes($bytes); [IO.File]::WriteAllBytes($img, $bytes)
+    $want = ([BitConverter]::ToString([Security.Cryptography.MD5]::Create().ComputeHash($bytes)) -replace '-', '').ToLower()
+    $sock = Join-Path $root 'vub.sock'
+    $b = $null
+    try {
+        $b = Start-Process $vub -ArgumentList "`"$sock`" `"$img`"" -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $base 'backend-out.txt') -RedirectStandardError (Join-Path $base 'backend-err.txt')
+        $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t -and -not $b.HasExited) { Start-Sleep -Milliseconds 100 }
+        Check (Test-Path $sock) "the vhost-user backend did not listen: $(Get-Content (Join-Path $base 'backend-err.txt') -Raw -ErrorAction SilentlyContinue)"
+        $vm = Start-JailedVm $base 'vub' @() 256 -drives @([ordered]@{ drive_id = 'vub'; socket = '/vub.sock'; is_root_device = $false })
+        Wait-Shell $vm
+        $got = $vm.Sh('md5sum /dev/vdb', 120)
+        Check ($got -match "^$want") "the guest's md5 over vhost-user '$got', the image's $want"
+        $vm.Sh('echo vhost-user-$((6*7)) | dd of=/dev/vdb bs=512 seek=8 conv=fsync,notrunc 2>/dev/null; echo WROTE', 30) | Out-Null
+        $vm.Send('reboot -ff')
+        Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
+        $b.Kill(); [void]$b.WaitForExit(5000)
+        $fs = [IO.File]::Open($img, 'Open', 'Read', 'ReadWrite')
+        try { $fs.Position = 4096; $w = New-Object byte[] 14; [void]$fs.Read($w, 0, 14) } finally { $fs.Dispose() }
+        $text = [Text.Encoding]::ASCII.GetString($w)
+        Check ($text -eq "vhost-user-42`n") "the guest's write is not in the backend's image: '$text'"
+        'a jailed guest reads and writes a vhost-user-blk drive served by a backend outside the jail'
+    } finally {
+        if ($b -and -not $b.HasExited) { $b.Kill() }
+        Remove-Item $img -ErrorAction SilentlyContinue
         Stop-Jailed
     }
 }

@@ -159,7 +159,9 @@ Linux the effective boundary of per-thread filters is already their union; the p
 and moves the API server, the thread whose separate filter is a real boundary, into a process of its own.
 
 On Windows a jailed process cannot open its peer to duplicate handles into it, so fd passing from a jailed VMM (to a
-uffd handler or a vhost-user backend) changes to the receiver duplicating out of the sender, or to a jailer broker.
+uffd handler or a vhost-user backend) is pulled: the sender keeps private copies and names them, and the receiver
+duplicates them out of the sender (`test_a_sender_that_cannot_open_the_receiver_is_pulled_from`, `jailer-test.ps1
+handoff`); the `uffd` and `vhost-user` jailer-test stages wait for a WHP machine.
 
 Every "in place", "verified" or "measured" in these tables names the test that checks it (`tools/check-claims.py`, on
 CI). Every Windows cell now names its test, so CI runs it with `--strict-windows`.

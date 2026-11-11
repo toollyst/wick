@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! header   magic "FCSM" u32 | descriptor count u32 | entries length u32 |
-//!          reserved u32 | data length u64                (little endian)
+//!          flags u32 | data length u64                   (little endian)
 //! entries  per descriptor: kind u32 | payload length u32 | payload
 //! data     the bytes of the call
 //! ```
@@ -24,6 +24,19 @@
 //! - a sealed memfd (a file with a `libc::wick_mm::Section`): the file, the
 //!   section, its size and whether it is sealed against growth; the
 //!   receiver attaches the section, so its mappings have the sealed size.
+//!
+//! A sender that may not open the peer for duplication (a jailed Firecracker
+//! sending to a userfaultfd handler or a vhost-user backend of the operator:
+//! the jail's token opens no process outside the jail) instead makes a
+//! private copy of each handle in itself and sends the copies' values with
+//! the [`FLAG_PULL`] flag; the receiver, which may open the sender, pulls
+//! each copy out of it (`DuplicateHandle` with `DUPLICATE_CLOSE_SOURCE`, so
+//! the copy is gone from the sender once taken). A socket is pulled the same
+//! way, as a handle: `WSADuplicateSocketW` itself duplicates into the target
+//! process, which such a sender cannot open, and a socket handle duplicated
+//! into the receiver is usable there (as an inherited one is). A receiver
+//! that cannot open the sender either fails the receive with the error,
+//! never silently without the descriptors.
 //!
 //! Receiving follows Linux stream semantics: the descriptors come with the
 //! first byte of their call's data; a receive returns data of consecutive
@@ -55,7 +68,7 @@ use wick_os::unix::net::UnixStream;
 use libc::{c_void, iovec};
 use windows_sys::Win32::Foundation::{
     CloseHandle, CompareObjectHandles, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS,
-    DuplicateHandle, ERROR_INVALID_DATA, HANDLE,
+    DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_DATA, HANDLE,
 };
 use windows_sys::Win32::Networking::WinSock::{
     FROM_PROTOCOL_INFO, INVALID_SOCKET, MSG_PEEK, SOCKET_ERROR, WSA_FLAG_NO_HANDLE_INHERIT,
@@ -68,10 +81,14 @@ use crate::errno::{Error, Result};
 
 const MAGIC: u32 = u32::from_le_bytes(*b"FCSM");
 const HEADER: usize = 24;
+/// Header flag: the handle values are the sender's, for the receiver to pull.
+const FLAG_PULL: u32 = 1;
 const KIND_HANDLE: u32 = 1;
 const KIND_EVENTFD: u32 = 2;
 const KIND_SOCKET: u32 = 3;
 const KIND_SECTION: u32 = 4;
+/// A socket, as a handle value of the sender's ([`FLAG_PULL`] frames only).
+const KIND_SOCKET_HANDLE: u32 = 5;
 /// Linux's limit of descriptors in one message.
 const SCM_MAX_FD: usize = 253;
 
@@ -105,12 +122,25 @@ impl Drop for Process {
     }
 }
 
-/// Handles duplicated into the peer, closed there again unless the frame
-/// was sent.
+/// Handles duplicated for a frame: into the peer, or, when the peer cannot
+/// be opened, as private copies in this process for the peer to pull. Closed
+/// again (there, or here) unless the frame was sent.
 struct InFlight<'a> {
-    peer: &'a Process,
+    /// The peer the handles are duplicated into; `None` for private copies.
+    peer: Option<&'a Process>,
     handles: Vec<u64>,
     sent: bool,
+}
+
+impl InFlight<'_> {
+    /// The process that holds the duplicates.
+    fn holder(&self) -> HANDLE {
+        match self.peer {
+            Some(peer) => peer.0,
+            // SAFETY: a pseudo handle of this process.
+            None => unsafe { GetCurrentProcess() },
+        }
+    }
 }
 
 impl Drop for InFlight<'_> {
@@ -119,10 +149,10 @@ impl Drop for InFlight<'_> {
             return;
         }
         for &h in &self.handles {
-            // SAFETY: closes, in the peer, a handle duplicated there above.
+            // SAFETY: closes, where it was made, a handle duplicated above.
             unsafe {
                 DuplicateHandle(
-                    self.peer.0,
+                    self.holder(),
                     h as usize as HANDLE,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
@@ -135,14 +165,17 @@ impl Drop for InFlight<'_> {
     }
 }
 
-fn dup_into(peer: &Process, h: HANDLE, flight: &mut InFlight<'_>) -> Result<u64> {
+/// Duplicates `h` for the frame: into the peer, or as a private copy here
+/// (not inheritable, so a child process cannot take it) for the peer to
+/// pull. Returns the duplicate's value where it was made.
+fn dup_for_peer(h: HANDLE, flight: &mut InFlight<'_>) -> Result<u64> {
     let mut out: HANDLE = std::ptr::null_mut();
-    // SAFETY: duplicates a handle of this process into the peer.
+    // SAFETY: duplicates a handle of this process into the holder.
     let ok = unsafe {
         DuplicateHandle(
             GetCurrentProcess(),
             h,
-            peer.0,
+            flight.holder(),
             &mut out,
             0,
             0,
@@ -190,16 +223,25 @@ fn raw_sendmsg<D: IntoIovec>(sock: RawFd, out_data: &[D], out_fds: &[RawFd]) -> 
     let mut entries = Vec::new();
     let peer;
     let mut flight = None;
+    let mut flags = 0u32;
     if !out_fds.is_empty() {
         let pid = wick_os::windows::peer_pid(sock).map_err(Error::from)?;
         // SAFETY: opens the peer for handle duplication; checked below.
         let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
-        if h.is_null() {
-            return Err(Error::last());
-        }
-        peer = Process(h);
+        peer = if h.is_null() {
+            let err = Error::last();
+            if err.errno() != ERROR_ACCESS_DENIED as i32 {
+                return Err(err);
+            }
+            // The peer is out of this process's reach (a jail): the peer
+            // pulls private copies out of this process instead.
+            flags |= FLAG_PULL;
+            None
+        } else {
+            Some(Process(h))
+        };
         let f = flight.insert(InFlight {
-            peer: &peer,
+            peer: peer.as_ref(),
             handles: Vec::new(),
             sent: false,
         });
@@ -207,17 +249,20 @@ fn raw_sendmsg<D: IntoIovec>(sock: RawFd, out_data: &[D], out_fds: &[RawFd]) -> 
             if let Some([section, space]) = super::eventfd::companions(fd) {
                 let mut payload = Vec::with_capacity(24);
                 for h in [fd, section, space] {
-                    payload.extend_from_slice(&dup_into(&peer, handle(h), f)?.to_le_bytes());
+                    payload.extend_from_slice(&dup_for_peer(handle(h), f)?.to_le_bytes());
                 }
                 put_entry(&mut entries, KIND_EVENTFD, &payload);
             } else if let Some(sec) = libc::wick_fd::attached::<libc::wick_mm::Section>(fd) {
                 let mut payload = Vec::with_capacity(32);
                 for h in [handle(fd), sec.handle as HANDLE] {
-                    payload.extend_from_slice(&dup_into(&peer, h, f)?.to_le_bytes());
+                    payload.extend_from_slice(&dup_for_peer(h, f)?.to_le_bytes());
                 }
                 payload.extend_from_slice(&sec.size.to_le_bytes());
                 payload.extend_from_slice(&u64::from(sec.grow_sealed()).to_le_bytes());
                 put_entry(&mut entries, KIND_SECTION, &payload);
+            } else if is_socket(fd) && f.peer.is_none() {
+                let v = dup_for_peer(handle(fd), f)?;
+                put_entry(&mut entries, KIND_SOCKET_HANDLE, &v.to_le_bytes());
             } else if is_socket(fd) {
                 // SAFETY: an all-zero WSAPROTOCOL_INFOW is valid.
                 let mut info: WSAPROTOCOL_INFOW = unsafe { std::mem::zeroed() };
@@ -234,7 +279,7 @@ fn raw_sendmsg<D: IntoIovec>(sock: RawFd, out_data: &[D], out_fds: &[RawFd]) -> 
                 };
                 put_entry(&mut entries, KIND_SOCKET, bytes);
             } else {
-                let v = dup_into(&peer, handle(fd), f)?;
+                let v = dup_for_peer(handle(fd), f)?;
                 put_entry(&mut entries, KIND_HANDLE, &v.to_le_bytes());
             }
         }
@@ -243,7 +288,7 @@ fn raw_sendmsg<D: IntoIovec>(sock: RawFd, out_data: &[D], out_fds: &[RawFd]) -> 
     frame.extend_from_slice(&MAGIC.to_le_bytes());
     frame.extend_from_slice(&u32::try_from(out_fds.len()).unwrap().to_le_bytes());
     frame.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_le_bytes());
-    frame.extend_from_slice(&0u32.to_le_bytes());
+    frame.extend_from_slice(&flags.to_le_bytes());
     frame.extend_from_slice(&(data_len as u64).to_le_bytes());
     frame.extend_from_slice(&entries);
     for d in out_data {
@@ -471,18 +516,71 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn value(v: u64) -> RawFd {
-    from_handle(v as usize as HANDLE)
+/// The sender of a frame with [`FLAG_PULL`], open for handle duplication.
+fn open_sender(sock: RawFd) -> Result<Process> {
+    let pid = wick_os::windows::peer_pid(sock).map_err(Error::from)?;
+    // SAFETY: opens the sender for handle duplication; checked below.
+    let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
+    if h.is_null() {
+        return Err(Error::last());
+    }
+    Ok(Process(h))
 }
 
-/// Decodes the entries of a frame into received descriptors.
-fn decode(entries: &[u8], count: usize) -> Result<Vec<(u32, RawFd)>> {
+/// A received handle value as a descriptor of this process: the value
+/// itself (duplicated into this process by the sender), or, from a sender
+/// whose handles are pulled, a duplicate taken out of it, which closes the
+/// sender's copy.
+#[allow(clippy::cast_possible_truncation)]
+fn take(sender: Option<&Process>, v: u64) -> Result<RawFd> {
+    let h = v as usize as HANDLE;
+    let Some(sender) = sender else {
+        return Ok(from_handle(h));
+    };
+    let mut out: HANDLE = std::ptr::null_mut();
+    // SAFETY: duplicates a handle of the sender into this process, closing
+    // the sender's; the result is checked.
+    let ok = unsafe {
+        DuplicateHandle(
+            sender.0,
+            h,
+            GetCurrentProcess(),
+            &mut out,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE,
+        )
+    };
+    if ok == 0 {
+        return Err(Error::last());
+    }
+    Ok(from_handle(out))
+}
+
+/// Decodes the entries of a frame into received descriptors; `sender` is
+/// the process to pull handle values from, for a frame with [`FLAG_PULL`].
+fn decode(entries: &[u8], count: usize, sender: Option<&Process>) -> Result<Vec<(u32, RawFd)>> {
     let mut out: Vec<(u32, RawFd)> = Vec::with_capacity(count);
     let mut at = 0;
     let bad = |out: &[(u32, RawFd)]| {
         close_received(out);
         win_error(ERROR_INVALID_DATA)
+    };
+    // Takes `n` handle values at the payload's start; closes what it took
+    // and everything received before on an error.
+    let taken = |p: &[u8], n: usize, out: &[(u32, RawFd)]| -> Result<Vec<RawFd>> {
+        let mut got = Vec::with_capacity(n);
+        for i in 0..n {
+            match take(sender, u64_at(p, i * 8)) {
+                Ok(fd) => got.push(fd),
+                Err(e) => {
+                    close_received(&got.iter().map(|&fd| (KIND_HANDLE, fd)).collect::<Vec<_>>());
+                    close_received(out);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(got)
     };
     while out.len() < count {
         if entries.len() < at + 8 {
@@ -497,10 +595,14 @@ fn decode(entries: &[u8], count: usize) -> Result<Vec<(u32, RawFd)>> {
         let p = &entries[at..at + len];
         at += len;
         match (kind, len) {
-            (KIND_HANDLE, 8) => out.push((kind, value(u64_at(p, 0)))),
+            (KIND_HANDLE, 8) => out.push((kind, taken(p, 1, &out)?[0])),
+            (KIND_SOCKET_HANDLE, 8) if sender.is_some() => {
+                out.push((KIND_SOCKET, taken(p, 1, &out)?[0]));
+            }
             (KIND_EVENTFD, 24) => {
-                let (fd, section, space) =
-                    (value(u64_at(p, 0)), value(u64_at(p, 8)), value(u64_at(p, 16)));
+                let [fd, section, space] = taken(p, 3, &out)?[..] else {
+                    unreachable!("three handles taken");
+                };
                 // SAFETY: the sender duplicated these three handles of one
                 // eventfd into this process for us.
                 if let Err(e) = unsafe { super::eventfd::adopt(fd, section, space) } {
@@ -511,7 +613,9 @@ fn decode(entries: &[u8], count: usize) -> Result<Vec<(u32, RawFd)>> {
                 out.push((kind, fd));
             }
             (KIND_SECTION, 32) => {
-                let (fd, section) = (value(u64_at(p, 0)), value(u64_at(p, 8)));
+                let [fd, section] = taken(p, 2, &out)?[..] else {
+                    unreachable!("two handles taken");
+                };
                 let sec = libc::wick_mm::Section {
                     handle: handle(section) as usize,
                     size: u64_at(p, 16),
@@ -562,7 +666,7 @@ fn is_frame_header(header: &[u8; HEADER]) -> bool {
     let entries_len = u32_at(header, 8) as usize;
     let largest = 8 + size_of::<WSAPROTOCOL_INFOW>();
     u32_at(header, 0) == MAGIC
-        && u32_at(header, 12) == 0
+        && u32_at(header, 12) <= FLAG_PULL
         && count <= SCM_MAX_FD
         && entries_len >= count * 8
         && entries_len <= count * largest
@@ -708,7 +812,19 @@ unsafe fn recvmsg_inner(sock: RawFd, iovecs: &mut [iovec], in_fds: &mut [RawFd])
         let data_len = u64_at(&header, 16);
         let mut entries = vec![0u8; entries_len];
         recv_exact(s, &mut entries)?;
-        let received = decode(&entries, count)?;
+        let sender = if count > 0 && u32_at(&header, 12) & FLAG_PULL != 0 {
+            match open_sender(sock) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    // The call's data is still the stream's next bytes.
+                    set_left(sock, data_len)?;
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        let received = decode(&entries, count, sender.as_ref())?;
         let fits = received.len() <= in_fds.len();
         if fits {
             for (slot, (_, fd)) in in_fds.iter_mut().zip(&received) {
@@ -899,27 +1015,9 @@ mod tests {
 
     #[test]
     fn test_send_recv_sealed_section() {
-        use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
         let (a, b) = UnixStream::pair().unwrap();
-        let file = crate::tempfile::TempFile::new().unwrap().into_file();
-        file.set_len(1 << 16).unwrap();
-        let section = unsafe {
-            CreateFileMappingW(
-                handle(file.as_raw_fd()),
-                std::ptr::null(),
-                PAGE_READWRITE,
-                0,
-                1 << 16,
-                std::ptr::null(),
-            )
-        };
-        assert!(!section.is_null());
-        let sec = libc::wick_mm::Section {
-            handle: section as usize,
-            size: 1 << 16,
-            grow_sealed: std::sync::atomic::AtomicBool::new(true),
-        };
-        libc::wick_fd::attach(file.as_raw_fd(), std::sync::Arc::new(sec)).unwrap();
+        let file = sealed_section(1 << 16);
+        let section = libc::wick_fd::attached::<libc::wick_mm::Section>(file.as_raw_fd()).unwrap().handle;
         a.send_with_fd([1u8].as_ref(), file.as_raw_fd()).unwrap();
         let mut buf = [0u8; 1];
         let (_, received) = b.recv_with_fd(&mut buf).unwrap();
@@ -927,7 +1025,7 @@ mod tests {
         let got = libc::wick_fd::attached::<libc::wick_mm::Section>(received.as_raw_fd()).unwrap();
         assert_eq!(got.size, 1 << 16);
         assert!(got.grow_sealed());
-        assert_ne!(got.handle, section as usize, "the receiver's own handle");
+        assert_ne!(got.handle, section, "the receiver's own handle");
         // The receiver's libc refuses to resize it.
         assert_eq!(unsafe { libc::ftruncate(received.as_raw_fd(), 1 << 17) }, -1);
     }
@@ -1017,5 +1115,181 @@ mod tests {
         let mut s = [0u8; 17];
         d.read_exact(&mut s).unwrap();
         assert_eq!(&s, b"via passed socket");
+    }
+
+    /// A sealed memfd stand-in: a file with a section attached, as the
+    /// compatibility libc makes for `memfd_create`.
+    fn sealed_section(size: u32) -> File {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
+        let file = crate::tempfile::TempFile::new().unwrap().into_file();
+        file.set_len(u64::from(size)).unwrap();
+        let section = unsafe {
+            CreateFileMappingW(
+                handle(file.as_raw_fd()),
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                size,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        let sec = libc::wick_mm::Section {
+            handle: section as usize,
+            size: u64::from(size),
+            grow_sealed: std::sync::atomic::AtomicBool::new(true),
+        };
+        libc::wick_fd::attach(file.as_raw_fd(), std::sync::Arc::new(sec)).unwrap();
+        file
+    }
+
+    // A sender that may not open the receiver (a jailed Firecracker sending
+    // to a handler process of the operator): the receiver pulls the handles
+    // out of the sender. The receiver is a child process whose process
+    // object admits nobody, so that this process, the sender, cannot open it
+    // for duplication (checked: otherwise the test would prove nothing).
+    #[test]
+    fn test_a_sender_that_cannot_open_the_receiver_is_pulled_from() {
+        use std::process::{Command, Stdio};
+
+        let path = std::env::temp_dir().join(format!("wick-scm-pull-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = wick_os::unix::net::UnixListener::bind(&path).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "windows::sock_ctrl_msg::tests::locked_receiver_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("WICK_TEST_SOCK", &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut s, _) = listener.accept().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut b = [0u8; 1];
+        s.read_exact(&mut b).unwrap();
+        assert_eq!(b, [b'L'], "the child did not lock its process object");
+        // An administrator's debug privilege, where it is enabled (as on
+        // some CI machines), opens any process: a jailed sender has no
+        // privilege, so this process drops it for the test.
+        disable_debug_privilege();
+        // SAFETY: plain call; the result is checked.
+        let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, child.id()) };
+        assert!(h.is_null(), "the receiver can be opened, so the test proves nothing");
+        assert_eq!(Error::last().errno(), ERROR_ACCESS_DENIED as i32);
+
+        let mut file = crate::tempfile::TempFile::new().unwrap().into_file();
+        file.write_all(b"handle pulled").unwrap();
+        let evt = EventFd::new(0).unwrap();
+        let section = sealed_section(1 << 16);
+        let (c, mut d) = UnixStream::pair().unwrap();
+        s.send_with_fds(
+            &[[b'D'].as_ref()],
+            &[file.as_raw_fd(), evt.as_raw_fd(), section.as_raw_fd(), c.as_raw_fd()],
+        )
+        .unwrap();
+        drop(c);
+        let mut answer = String::new();
+        s.read_to_string(&mut answer).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let text = format!(
+            "{}\n{}\n{}",
+            answer,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        for expected in ["file: handle pulled", "eventfd: 5", "section: 65536 sealed", "socket: sent"] {
+            assert!(answer.lines().any(|l| l == expected), "{expected}: {text}");
+        }
+        // The eventfd is shared, and the socket is the pair's other end.
+        assert_eq!(evt.read().unwrap(), 5);
+        let mut got = [0u8; 17];
+        d.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"via pulled socket");
+    }
+
+    /// Disables `SeDebugPrivilege` in this process's token, if it holds it.
+    fn disable_debug_privilege() {
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, TOKEN_ADJUST_PRIVILEGES,
+            TOKEN_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::OpenProcessToken;
+
+        let name: Vec<u16> = "SeDebugPrivilege".encode_utf16().chain(Some(0)).collect();
+        let mut token: HANDLE = std::ptr::null_mut();
+        let mut privileges: TOKEN_PRIVILEGES = unsafe { std::mem::zeroed() };
+        privileges.PrivilegeCount = 1;
+        unsafe {
+            assert_ne!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token),
+                0
+            );
+            assert_ne!(
+                LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut privileges.Privileges[0].Luid),
+                0
+            );
+            privileges.Privileges[0] = LUID_AND_ATTRIBUTES { Luid: privileges.Privileges[0].Luid, Attributes: 0 };
+            // Fails only for a malformed call; a privilege the token lacks
+            // is reported as not all assigned, which is fine.
+            assert_ne!(
+                AdjustTokenPrivileges(token, 0, &privileges, 0, std::ptr::null_mut(), std::ptr::null_mut()),
+                0
+            );
+            CloseHandle(token);
+        }
+    }
+
+    #[test]
+    #[ignore = "run by test_a_sender_that_cannot_open_the_receiver_is_pulled_from in a separate process"]
+    fn locked_receiver_child() {
+        use windows_sys::Win32::Security::{
+            ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl, InitializeSecurityDescriptor,
+            SECURITY_DESCRIPTOR, SetKernelObjectSecurity, SetSecurityDescriptorDacl,
+        };
+
+        let path = std::env::var("WICK_TEST_SOCK").unwrap();
+        let mut s = UnixStream::connect(&path).unwrap();
+        // An empty DACL: no process may open this one from here on.
+        let mut acl = [0u64; 1];
+        let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        let sd_ptr = (&raw mut sd).cast::<c_void>();
+        unsafe {
+            assert_ne!(InitializeAcl(acl.as_mut_ptr().cast::<ACL>(), 8, ACL_REVISION), 0);
+            assert_ne!(InitializeSecurityDescriptor(sd_ptr, 1), 0);
+            assert_ne!(SetSecurityDescriptorDacl(sd_ptr, 1, acl.as_ptr().cast::<ACL>(), 0), 0);
+            assert_ne!(
+                SetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, sd_ptr),
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+        }
+        s.write_all(b"L").unwrap();
+
+        let mut buf = [0u8; 1];
+        let mut fds = [0; 4];
+        let (n, nfds) = unsafe { s.recv_with_fds(&mut [iov(&mut buf)], &mut fds).unwrap() };
+        assert_eq!((n, nfds, buf[0]), (1, 4, b'D'));
+        let mut file = unsafe { File::from_raw_fd(fds[0]) };
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        let evt = unsafe { EventFd::from_raw_fd(fds[1]) };
+        evt.write(5).unwrap();
+        let section = unsafe { File::from_raw_fd(fds[2]) };
+        let sec = libc::wick_fd::attached::<libc::wick_mm::Section>(section.as_raw_fd()).unwrap();
+        let mut sock = unsafe { UnixStream::from_raw_fd(fds[3]) };
+        sock.write_all(b"via pulled socket").unwrap();
+        let answer = format!(
+            "file: {text}\neventfd: 5\nsection: {} {}\nsocket: sent\n",
+            sec.size,
+            if sec.grow_sealed() { "sealed" } else { "unsealed" }
+        );
+        s.write_all(answer.as_bytes()).unwrap();
     }
 }

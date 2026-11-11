@@ -9,7 +9,9 @@
   enforce is refused), `isolation` (`jail-probe.rs`, run through the jailer
   as the jailed binary, may not read the user's files or SAM, write outside
   its jail, reach another jail's files, API socket or process, or open the
-  operator's; the operator reaches the API socket), `boot` (a 2 vCPU guest
+  operator's; the operator reaches the API socket), `handoff` (a handle and a socket
+  held by a jailed process are pulled out by the operator and by a
+  medium-integrity process of the user), `boot` (a 2 vCPU guest
   in the jail), `limits` (`memory.max`), `cpu` (`cpu.max`: three boots under it), and a check
   that every jail's drive letter was removed. It needs the boot test's
   guest files (`-Assets`, default `C:\wbt`) and `rustc` for the probe:

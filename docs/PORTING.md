@@ -81,7 +81,7 @@ settings were tried first and were not applied to the process on Windows Server 
 | --- | --- | --- | --- | --- |
 | `kvm-ioctls` | the original | Hypervisor.framework: vCPUs, memory, GICv3 state, the GICv2m MSI frame, dirty tracking | crate tests, every `boot-test` stage | WHP: partition, LAPIC, user-space IOAPIC, PIC, PIT |
 | `libc` | the original | `fallocate`, `memfd_create`, the userfaultfd kernel side (`wick_uffd`) | crate tests, fuzz `uffd_protocol`, `boot-test uffd` | the POSIX layer on Win32 (`wick_fd`, mmap, sockets, signals), `windows_uffd` |
-| `vmm-sys-util` | the original | eventfd (pipes), epoll (kqueue), timerfd, signals | crate tests, `boot-test vhost-user` | IOCP, sections, waitable timers |
+| `vmm-sys-util` | the original | eventfd (pipes), epoll (kqueue), timerfd, signals | crate tests, `boot-test vhost-user` | IOCP, sections, waitable timers; `SCM_RIGHTS` as handles duplicated into the peer, or pulled out of a sender that cannot open its receiver, as a jailed one cannot (`test_a_sender_that_cannot_open_the_receiver_is_pulled_from`) |
 | `userfaultfd`, `memfd` | the original | on `wick_uffd`; an unlinked POSIX shared memory object | crate tests, `boot-test uffd` | on `windows_uffd`; an unnamed temporary file, size seals as sections |
 
 ## Scenario tests, stage by stage
@@ -105,6 +105,8 @@ exemption.
 | (a handle the jailer inherited is not open in the jail) | part of `jail` | `handles` |
 | (only the jail's identity reaches a jail) | part of `jail` | `low` (a low-integrity process of the user is kept out) |
 | (`--new-pid-ns`: no other process to see or signal) | refused (`refuse`) | `pidns` (no process, thread or console of anyone else; the jailer's return) |
+| (a jailed process hands a file and a socket to a helper outside) | part of `jail` (`SCM_RIGHTS` works from a chroot) | `handoff` (pulled out by the operator and by a medium-integrity process of the user; no guest) |
+| (a snapshot restored through a uffd handler, and a vhost-user block device, under the jailer) | `boot-test uffd`, `vhost-user` (no jailer) | `uffd`, `vhost-user` (written; wait for a WHP machine) |
 | `limits`: cgroups and resource limits applied | yes | yes |
 | `boot`: a jailed guest boots | yes | yes |
 | `memory`: a guest past the memory limit kills the VMM | yes | **missing** |
@@ -132,7 +134,7 @@ physically cannot do it. Then the request is refused loudly, and the row says wh
 | 11 | x86_64 and aarch64 guests | aarch64 only: Apple silicon has no x86 virtualisation (impossible). x86_64 images through translation in the guest (M6) | x86_64 only. aarch64 images through translation in the guest (M6) | M6 |
 | 12 | Passes upstream's integration tests | not run on macOS. To do: upstream's pytest suites against the macOS build, compared test by test as on Linux | not run on Windows. To do: the same | a comparison as `compare-integration-tests.py` makes |
 | 13 | Upstream's code, reviewed and fuzzed for years | the Hypervisor.framework run loop has no fuzz target. To do: one | the WHP run loop has none. To do: one | a target in `fuzz/` run on CI |
-| 14 | A jailed VMM passes descriptors to a uffd handler or a vhost-user backend | the same | a jailed process cannot push handles. To do: the receiver duplicates them, or a broker does | `boot-test uffd` and `vhost-user` under the jailer |
+| 14 | A jailed VMM passes descriptors to a uffd handler or a vhost-user backend | the same | In place without a guest: a jailed process cannot open its peer, so it cannot push handles into it (and `WSADuplicateSocket` fails from a jail: measured); the compatibility `SCM_RIGHTS` (`vmm-sys-util` `sock_ctrl_msg`) then sends in pull mode, keeping private copies of the handles and writing their values, flagged, and the receiver, which can open a jail's process (its DACL grants the owner), duplicates them out and closes the sender's copies, sockets as handles. The handler's or backend's socket must be inside the jail root, where a jailed Firecracker can connect (`test_a_sender_that_cannot_open_the_receiver_is_pulled_from`: a file, an eventfd, a sealed section and a socket pulled from a sender that cannot open the receiver; `jailer-test.ps1 handoff`: a jailed probe's file and socket pulled out by the operator and by a medium-integrity process of the user, the jailed process unable to open the operator). Left for a WHP machine: `jailer-test.ps1 uffd` (a snapshot restored through upstream's `uffd_on_demand_handler` in another process) and `vhost-user` (a vhost-user block device), both under the jailer, written and not yet run | `boot-test uffd` and `vhost-user` under the jailer |
 | 15 | Device stages | the same | `--daemonize` (`jailer-test.ps1 daemonize`) and the inherited-handle check (`jailer-test.ps1 handles`) are done. Left: the `devices` boot-test stage and the `memory` jailer-test stage (both need a WHP guest) | the stages pass |
 | 16 | Only the jail's user reaches a jail | the same | Done: the jail's integrity level is above low, so a plain low-integrity process of the same user is kept out of a jail's files, its API socket and its process (`jailer-test.ps1 low`) | a jailer-test stage |
 
