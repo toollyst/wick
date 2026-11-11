@@ -17,6 +17,7 @@ use kvm_bindings::{
     kvm_run, kvm_vcpu_init,
 };
 
+use super::exit::{self, DebugRegs, Exit, Mmio, Psci, SysregAccess, SysregResult};
 use super::ffi::*;
 use super::gic::{CpuReg, GicCpu};
 use super::regs::{self, Reg, reg_size};
@@ -32,23 +33,7 @@ const PSTATE_EL1H_DAIF: u64 = 0x3c5;
 /// other vCPUs (SGIs) are not seen by the waiting thread, so it polls.
 const WFI_MAX_WAIT: Duration = Duration::from_millis(1);
 
-// Exception classes (ESR_EL2.EC).
-const EC_WFX: u64 = 0x01;
-const EC_HVC64: u64 = 0x16;
-const EC_SMC64: u64 = 0x17;
-const EC_SYSREG: u64 = 0x18;
-const EC_DATA_ABORT_LOWER: u64 = 0x24;
-const EC_INST_ABORT_LOWER: u64 = 0x20;
-
-// PSCI 0.2 function ids (SMC32 and SMC64 variants) and return values.
-const PSCI_VERSION: u32 = 0x8400_0000;
-const PSCI_CPU_SUSPEND: [u32; 2] = [0x8400_0001, 0xc400_0001];
-const PSCI_CPU_OFF: u32 = 0x8400_0002;
-const PSCI_CPU_ON: [u32; 2] = [0x8400_0003, 0xc400_0003];
-const PSCI_AFFINITY_INFO: [u32; 2] = [0x8400_0004, 0xc400_0004];
-const PSCI_MIGRATE_INFO_TYPE: u32 = 0x8400_0006;
-const PSCI_SYSTEM_OFF: u32 = 0x8400_0008;
-const PSCI_SYSTEM_RESET: u32 = 0x8400_0009;
+// PSCI 0.2 return values (the calls are `exit::Psci`).
 const PSCI_RET_SUCCESS: i64 = 0;
 const PSCI_RET_NOT_SUPPORTED: i64 = -1;
 const PSCI_RET_INVALID_PARAMS: i64 = -2;
@@ -253,13 +238,6 @@ impl VcpuShared {
     }
 }
 
-struct PendingRead {
-    srt: u32,
-    len: usize,
-    sign_extend: bool,
-    sixty_four: bool,
-}
-
 /// Wrapper over a vCPU.
 pub struct VcpuFd {
     /// Like a KVM vCPU descriptor, the handle keeps its VM alive.
@@ -271,11 +249,10 @@ pub struct VcpuFd {
     created_here: bool,
     exit: ExitPtr,
     mmio: [u8; 8],
-    pending_read: Option<PendingRead>,
-    // Debug registers emulated in user space (see `sysreg_trap`).
-    os_lock: bool,
-    os_double_lock: bool,
-    dbg_power_request: bool,
+    /// The MMIO load Firecracker is completing (`complete_mmio_read`).
+    pending_read: Option<Mmio>,
+    /// Debug registers emulated in user space (see `sysreg_trap`).
+    debug: DebugRegs,
 }
 
 /// Pointer to the exit information Hypervisor.framework fills in for this vCPU.
@@ -304,10 +281,7 @@ impl VcpuFd {
             exit: ExitPtr(std::ptr::null()),
             mmio: [0; 8],
             pending_read: None,
-            // The OS lock is set at reset.
-            os_lock: true,
-            os_double_lock: false,
-            dbg_power_request: false,
+            debug: DebugRegs::default(),
         }
     }
 
@@ -728,16 +702,7 @@ impl VcpuFd {
         let Some(p) = self.pending_read.take() else {
             return Ok(());
         };
-        let mut buf = [0u8; 8];
-        buf[..p.len].copy_from_slice(&self.mmio[..p.len]);
-        let mut v = u64::from_le_bytes(buf);
-        if p.sign_extend && p.len < 8 {
-            let shift = 64 - 8 * p.len as u32;
-            v = (((v << shift) as i64) >> shift) as u64;
-        }
-        if !p.sixty_four {
-            v &= 0xffff_ffff;
-        }
+        let v = p.load_value(&self.mmio);
         if p.srt != 31 {
             self.set_reg(hv, HV_REG_X0 + p.srt, v)?;
         }
@@ -813,19 +778,19 @@ impl VcpuFd {
 
     /// Handles a PSCI call. Returns a system event to report, if any.
     fn psci(&self, hv: hv_vcpu_t) -> Result<Option<u32>> {
-        let func = self.reg(hv, HV_REG_X0)? as u32;
+        let call = Psci::decode(self.reg(hv, HV_REG_X0)?);
         let x1 = self.reg(hv, HV_REG_X0 + 1)?;
-        let ret: i64 = match func {
-            PSCI_VERSION => PSCI_VERSION_0_2,
-            f if PSCI_CPU_SUSPEND.contains(&f) => {
+        let ret: i64 = match call {
+            Psci::Version => PSCI_VERSION_0_2,
+            Psci::CpuSuspend => {
                 self.wait_for_interrupt(hv)?;
                 PSCI_RET_SUCCESS
             }
-            PSCI_CPU_OFF => {
+            Psci::CpuOff => {
                 self.shared.power.lock().unwrap().off = true;
                 return Ok(None);
             }
-            f if PSCI_CPU_ON.contains(&f) => {
+            Psci::CpuOn => {
                 let entry = self.reg(hv, HV_REG_X0 + 2)?;
                 let context = self.reg(hv, HV_REG_X0 + 3)?;
                 match self.find_vcpu(x1)? {
@@ -844,14 +809,14 @@ impl VcpuFd {
                     }
                 }
             }
-            f if PSCI_AFFINITY_INFO.contains(&f) => match self.find_vcpu(x1)? {
+            Psci::AffinityInfo => match self.find_vcpu(x1)? {
                 None => PSCI_RET_INVALID_PARAMS,
                 Some(target) => i64::from(target.powered_off()),
             },
-            PSCI_MIGRATE_INFO_TYPE => PSCI_TOS_NOT_PRESENT_MP,
-            PSCI_SYSTEM_OFF => return Ok(Some(KVM_SYSTEM_EVENT_SHUTDOWN)),
-            PSCI_SYSTEM_RESET => return Ok(Some(KVM_SYSTEM_EVENT_RESET)),
-            _ => PSCI_RET_NOT_SUPPORTED,
+            Psci::MigrateInfoType => PSCI_TOS_NOT_PRESENT_MP,
+            Psci::SystemOff => return Ok(Some(KVM_SYSTEM_EVENT_SHUTDOWN)),
+            Psci::SystemReset => return Ok(Some(KVM_SYSTEM_EVENT_RESET)),
+            Psci::NotSupported => PSCI_RET_NOT_SUPPORTED,
         };
         self.set_reg(hv, HV_REG_X0, ret as u64)?;
         Ok(None)
@@ -870,51 +835,16 @@ impl VcpuFd {
     /// registers Hypervisor.framework leaves to the VMM (the OS lock and
     /// debug power registers). Any other trapped register raises an
     /// undefined instruction exception in the guest, like KVM does.
-    fn sysreg_trap(&mut self, hv: hv_vcpu_t, iss: u64) -> Result<()> {
-        let is_read = iss & 1 != 0;
-        let rt = ((iss >> 5) & 0x1f) as u32;
-        let enc = (
-            (iss >> 20) & 3,   // op0
-            (iss >> 14) & 7,   // op1
-            (iss >> 10) & 0xf, // CRn
-            (iss >> 1) & 0xf,  // CRm
-            (iss >> 17) & 7,   // op2
-        );
-        let value = if is_read || rt == 31 {
+    fn sysreg_trap(&mut self, hv: hv_vcpu_t, access: SysregAccess) -> Result<()> {
+        let value = if access.read || access.rt == 31 {
             0
         } else {
-            self.reg(hv, HV_REG_X0 + rt)?
+            self.reg(hv, HV_REG_X0 + access.rt)?
         };
-        let read = match enc {
-            // OSLAR_EL1 (write only): sets the OS lock.
-            (2, 0, 1, 0, 4) if !is_read => {
-                self.os_lock = value & 1 != 0;
-                None
-            }
-            // OSLSR_EL1 (read only): OS lock implemented (OSLM = 0b10) and its state.
-            (2, 0, 1, 1, 4) if is_read => Some(0b1000 | u64::from(self.os_lock) << 1),
-            // OSDLR_EL1: double lock.
-            (2, 0, 1, 3, 4) => {
-                if is_read {
-                    Some(u64::from(self.os_double_lock))
-                } else {
-                    self.os_double_lock = value & 1 != 0;
-                    None
-                }
-            }
-            // DBGPRCR_EL1: core power-down request.
-            (2, 0, 1, 4, 4) => {
-                if is_read {
-                    Some(u64::from(self.dbg_power_request))
-                } else {
-                    self.dbg_power_request = value & 1 != 0;
-                    None
-                }
-            }
-            _ => return self.inject_undef(hv),
-        };
-        if let (Some(v), true) = (read, rt != 31) {
-            self.set_reg(hv, HV_REG_X0 + rt, v)?;
+        match self.debug.access(access, value) {
+            SysregResult::Undefined => return self.inject_undef(hv),
+            SysregResult::Read(v) if access.rt != 31 => self.set_reg(hv, HV_REG_X0 + access.rt, v)?,
+            SysregResult::Read(_) | SysregResult::Written => {}
         }
         self.advance_pc(hv)
     }
@@ -926,12 +856,7 @@ impl VcpuFd {
         let pc = self.reg(hv, HV_REG_PC)?;
         let cpsr = self.reg(hv, HV_REG_CPSR)?;
         let vbar = self.sys(hv, HV_SYS_REG_VBAR_EL1)?;
-        let from_el1 = (cpsr >> 2) & 3 == 1;
-        let offset = match (from_el1, cpsr & 1 != 0) {
-            (true, true) => 0x200,  // current EL with SP_ELx
-            (true, false) => 0x000, // current EL with SP_EL0
-            (false, _) => 0x400,    // lower EL, AArch64
-        };
+        let offset = exit::sync_vector_offset(cpsr);
         // SAFETY: `hv` belongs to this thread.
         unsafe {
             check(hv_vcpu_set_sys_reg(hv, HV_SYS_REG_ESR_EL1, ESR_IL))?;
@@ -989,12 +914,9 @@ impl VcpuFd {
             }
 
             let esr = exit.exception.syndrome;
-            let ec = (esr >> 26) & 0x3f;
-            let iss = esr & 0x1ff_ffff;
-            match ec {
-                EC_DATA_ABORT_LOWER | EC_INST_ABORT_LOWER => {
+            match exit::decode(esr) {
+                Exit::Abort { instruction, write } => {
                     let ipa = exit.exception.physical_address;
-                    let write = ec == EC_DATA_ABORT_LOWER && iss & (1 << 6) != 0;
                     // A page a userfaultfd has not filled: wait for it, as KVM
                     // does when it faults the host page in (get_user_pages).
                     if let Some(host) = vm.ram_host_addr(ipa)
@@ -1009,55 +931,46 @@ impl VcpuFd {
                     if vm.stale_fault(ipa, write) {
                         continue;
                     }
-                    if ec == EC_INST_ABORT_LOWER {
+                    if instruction {
                         return Ok(VcpuExit::Unsupported(esr as u32));
                     }
-                    let isv = iss & (1 << 24) != 0;
-                    let s1ptw = iss & (1 << 7) != 0;
-                    if !isv || s1ptw {
+                    let Some(access) = Mmio::decode(esr) else {
                         return Ok(VcpuExit::Unsupported(esr as u32));
-                    }
-                    let len = 1usize << ((iss >> 22) & 0b11);
-                    let srt = ((iss >> 16) & 0x1f) as u32;
-                    let addr = exit.exception.physical_address;
-                    if iss & (1 << 6) != 0 {
-                        let v = if srt == 31 {
+                    };
+                    let len = access.len;
+                    if access.write {
+                        let v = if access.srt == 31 {
                             0
                         } else {
-                            self.reg(hv, HV_REG_X0 + srt)?
+                            self.reg(hv, HV_REG_X0 + access.srt)?
                         };
                         self.advance_pc(hv)?;
-                        self.mmio[..len].copy_from_slice(&v.to_le_bytes()[..len]);
-                        if vm.ioevent(addr, &self.mmio[..len]) {
+                        self.mmio = access.store_bytes(v);
+                        if vm.ioevent(ipa, &self.mmio[..len]) {
                             continue;
                         }
-                        return Ok(VcpuExit::MmioWrite(addr, &self.mmio[..len]));
+                        return Ok(VcpuExit::MmioWrite(ipa, &self.mmio[..len]));
                     }
-                    self.pending_read = Some(PendingRead {
-                        srt,
-                        len,
-                        sign_extend: iss & (1 << 21) != 0,
-                        sixty_four: iss & (1 << 15) != 0,
-                    });
+                    self.pending_read = Some(access);
                     self.mmio = [0; 8];
-                    return Ok(VcpuExit::MmioRead(addr, &mut self.mmio[..len]));
+                    return Ok(VcpuExit::MmioRead(ipa, &mut self.mmio[..len]));
                 }
-                EC_HVC64 | EC_SMC64 => {
-                    if ec == EC_SMC64 {
+                call @ (Exit::Hvc | Exit::Smc) => {
+                    // HVC leaves the PC past the call, SMC at it.
+                    if call == Exit::Smc {
                         self.advance_pc(hv)?;
                     }
                     if let Some(event) = self.psci(hv)? {
                         return Ok(VcpuExit::SystemEvent(event, &[]));
                     }
                 }
-                EC_WFX => {
+                Exit::Wfi => {
                     self.advance_pc(hv)?;
-                    if iss & 1 == 0 {
-                        self.wait_for_interrupt(hv)?;
-                    }
+                    self.wait_for_interrupt(hv)?;
                 }
-                EC_SYSREG => self.sysreg_trap(hv, iss)?,
-                _ => return Ok(VcpuExit::Unsupported(esr as u32)),
+                Exit::Wfe => self.advance_pc(hv)?,
+                Exit::Sysreg(access) => self.sysreg_trap(hv, access)?,
+                Exit::Unsupported => return Ok(VcpuExit::Unsupported(esr as u32)),
             }
         }
     }

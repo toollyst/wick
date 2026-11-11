@@ -24,6 +24,7 @@
 
 pub mod cap;
 mod device;
+mod exit;
 mod ffi;
 mod gic;
 mod regs;
