@@ -765,6 +765,13 @@ mod macos {
         // fallocate FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE (the
         // compatibility libc's fallocate).
         "F_PUNCHHOLE",
+        // timerfd_create: a timer is a FIFO here (the compatibility libc),
+        // whose write end the timer thread sets to raise no SIGPIPE once
+        // the timer is closed; made after narrowing for a hot-plugged
+        // device's rate limiter (measured: the one call outside the lists
+        // when a drive, a net device or a pmem device is hot-plugged, with
+        // rate limiters, under the discovery build).
+        "F_SETNOSIGPIPE",
     ];
 
     /// The API process's `fcntl` commands: upstream's `api` filter allows
