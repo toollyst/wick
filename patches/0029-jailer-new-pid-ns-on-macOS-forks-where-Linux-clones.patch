@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Wed, 11 Nov 2026 19:59:03 +0900
+Subject: [PATCH] jailer: --new-pid-ns on macOS forks where Linux clones
+
+macOS has no PID namespaces. The jailer takes Linux's path with a fork
+in place of clone(CLONE_NEWPID): the pid file names the child, the
+child leaves the jailer's session if the jailer led one, and the jailer
+exits 0. What the namespace would hold is the jail's
+(overlay/jailer/platform/macos new_pid_ns, vmm::ext::jail).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/jailer/src/env.rs | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/src/jailer/src/env.rs b/src/jailer/src/env.rs
+index 026620e98fe13213383e2d8dff8849f3be86a27d..a2db0d2e2cdce87b9d586e8865950388bbf6e915 100644
+--- a/src/jailer/src/env.rs
++++ b/src/jailer/src/env.rs
+@@ -366,16 +366,16 @@ impl Env {
+     }
+ 
+     // wick: outside Linux, PID namespaces are platform::new_pid_ns (overlay/jailer/platform):
+-    // macOS refuses; on Windows the jailer has handed over to a keeper (env::run), which runs
+-    // Firecracker as without the flag.
+-    #[cfg(not(target_os = "linux"))]
++    // on Windows the jailer has handed over to a keeper (env::run), which runs Firecracker as
++    // without the flag; macOS takes Linux's path below, with a fork in place of the clone.
++    #[cfg(windows)]
+     fn exec_into_new_pid_ns(&mut self, chroot_exec_file: PathBuf) -> Result<(), JailerError> {
+         crate::platform::new_pid_ns()?;
+         self.save_exec_file_pid(id().try_into().unwrap(), chroot_exec_file.clone())?;
+         Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
+     }
+ 
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "macos"))] // wick: macOS: a fork (below)
+     fn exec_into_new_pid_ns(&mut self, chroot_exec_file: PathBuf) -> Result<(), JailerError> {
+         // https://man7.org/linux/man-pages/man7/pid_namespaces.7.html
+         // > a process in an ancestor namespace can send signals to the "init" process of a child
+@@ -412,7 +412,12 @@ impl Env {
+         // Duplicate the current process. The child process will belong to the previously created
+         // PID namespace. The current process will not be moved into the newly created namespace,
+         // but its first child will assume the role of init(1) in the new namespace.
++        #[cfg(target_os = "linux")] // wick: macOS has no PID namespaces
+         let pid = clone(std::ptr::null_mut(), libc::CLONE_NEWPID)?;
++        // wick: a child Firecracker becomes, whose jail holds what the namespace would
++        // (platform::new_pid_ns).
++        #[cfg(target_os = "macos")]
++        let pid = crate::platform::new_pid_ns()?;
+         match pid {
+             0 => {
+                 if is_session_leader {

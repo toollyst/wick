@@ -54,6 +54,38 @@ pub const CPU_ENV: &str = "WICK_JAIL_CPU";
 /// over.
 pub const MEMORY_ENV: &str = "WICK_JAIL_MEMORY";
 
+/// Environment variable through which the jailer says Firecracker runs in
+/// a PID namespace of its own (`--new-pid-ns`): `1`.
+pub const PID_NS_ENV: &str = "WICK_JAIL_PID_NS";
+
+/// The signals whose default action ends or stops a process and that
+/// upstream's Firecracker does not handle. In a PID namespace of its own on
+/// Linux, Firecracker is the namespace's init, and the kernel drops such a
+/// signal sent to it from outside (pid_namespaces(7)); with
+/// [`PID_NS_ENV`], [`enter`] ignores them, so the same signals stay
+/// without effect. Where upstream installs a handler later (SIGHUP here; and
+/// SIGPIPE, SIGSYS, SIGBUS, SIGSEGV, SIGILL, SIGXFSZ, SIGXCPU and the vCPU
+/// kick, not listed), the handler replaces the ignoring, as on Linux a
+/// handler lets the signal reach init. SIGKILL and SIGSTOP cannot be
+/// ignored, as the kernel delivers them to a namespace's init from outside.
+/// The faults a process raises itself (SIGABRT, SIGFPE, SIGTRAP) are left
+/// as they are: the kernel delivers those to init as well.
+#[cfg(any(target_os = "macos", test))]
+pub const DROPPED_IN_PID_NS: &[libc::c_int] = &[
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGALRM,
+    libc::SIGTERM,
+    libc::SIGTSTP,
+    libc::SIGTTIN,
+    libc::SIGTTOU,
+    libc::SIGVTALRM,
+    libc::SIGPROF,
+    libc::SIGHUP,
+];
+
 /// Environment variable through which the jailer hands the jail's network
 /// over (`--netns`): the absolute path of the directory the network
 /// endpoints (`platform::net`) are made in, in place of the temporary
@@ -115,6 +147,12 @@ pub enum JailError {
     /// {0}
     #[cfg(target_os = "macos")]
     Sandbox(crate::ext::sandbox::SandboxError),
+    /// Invalid WICK_JAIL_PID_NS (1 or unset): {0}
+    #[cfg(target_os = "macos")]
+    PidNsFormat(String),
+    /// Failed to ignore signal {0} in the PID namespace: {1}
+    #[cfg(target_os = "macos")]
+    PidNs(i32, std::io::Error),
 }
 
 /// The jail's root directory, as a path outside the jail, if Firecracker was
@@ -237,8 +275,8 @@ mod imp {
     use std::sync::OnceLock;
 
     use super::{
-        CPU_ENV, ENV, JailError, MEMORY_ENV, NETNS_ENV, Spec, parse, parse_cpu, parse_memory,
-        share,
+        CPU_ENV, ENV, JailError, MEMORY_ENV, NETNS_ENV, PID_NS_ENV, Spec, parse, parse_cpu,
+        parse_memory, share,
     };
 
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
@@ -471,13 +509,16 @@ mod imp {
     pub fn enter() -> Result<(), JailError> {
         let cpu = std::env::var_os(CPU_ENV).map(|v| v.to_string_lossy().into_owned());
         let memory = std::env::var_os(MEMORY_ENV).map(|v| v.to_string_lossy().into_owned());
+        let pid_ns = std::env::var_os(PID_NS_ENV).map(|v| v.to_string_lossy().into_owned());
         let netns = std::env::var_os(NETNS_ENV);
         let Some(value) = std::env::var_os(ENV) else {
-            // A limit alone would be the jail's, without the jail.
-            return match (cpu, memory) {
-                (Some(cpu), _) => Err(JailError::CpuFormat(cpu)),
-                (_, Some(memory)) => Err(JailError::MemoryFormat(memory)),
-                (None, None) => {
+            // A limit or PID namespace alone would be the jail's, without
+            // the jail.
+            return match (cpu, memory, pid_ns) {
+                (Some(cpu), _, _) => Err(JailError::CpuFormat(cpu)),
+                (_, Some(memory), _) => Err(JailError::MemoryFormat(memory)),
+                (_, _, Some(pid_ns)) => Err(JailError::PidNsFormat(pid_ns)),
+                (None, None, None) => {
                     // A network without a jail: Firecracker started in it, as
                     // `ip netns exec` starts it in a namespace on Linux.
                     if let Some(value) = netns {
@@ -495,12 +536,19 @@ mod imp {
             std::env::remove_var(ENV);
             std::env::remove_var(CPU_ENV);
             std::env::remove_var(MEMORY_ENV);
+            std::env::remove_var(PID_NS_ENV);
             std::env::remove_var(NETNS_ENV);
         }
         let value = value.to_string_lossy().into_owned();
         let Spec { uid, gid, root } = parse(&value)?;
         let cpu = cpu.as_deref().map(parse_cpu).transpose()?;
         let memory = memory.as_deref().map(parse_memory).transpose()?;
+        match pid_ns.as_deref() {
+            None => {}
+            // Before the API process is made: it is in the namespace too.
+            Some("1") => ignore_dropped_signals()?,
+            Some(other) => return Err(JailError::PidNsFormat(other.to_owned())),
+        }
         // SAFETY: no arguments.
         let euid = unsafe { libc::geteuid() };
         if euid != 0 {
@@ -555,6 +603,18 @@ mod imp {
         }
         ROOT.set(PathBuf::from(root))
             .expect("the jail is entered once");
+        Ok(())
+    }
+
+    /// `--new-pid-ns`: the signals a namespace's init does not get from
+    /// outside are ignored ([`super::DROPPED_IN_PID_NS`]).
+    pub(super) fn ignore_dropped_signals() -> Result<(), JailError> {
+        for &signal in super::DROPPED_IN_PID_NS {
+            // SAFETY: a valid signal number; SIG_IGN is no handler.
+            if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
+                return Err(JailError::PidNs(signal, Error::last_os_error()));
+            }
+        }
         Ok(())
     }
 
@@ -930,6 +990,21 @@ mod tests {
         stdout
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_pid_ns_needs_the_jail() {
+        let out = run_child("pid_ns_alone_child", &[(PID_NS_ENV, "1")]);
+        assert!(out.contains("PID-NS-ALONE-REFUSED"), "{out}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_pid_ns_needs_the_jail in a separate process"]
+    fn pid_ns_alone_child() {
+        assert!(matches!(enter(), Err(JailError::PidNsFormat(_))));
+        println!("PID-NS-ALONE-REFUSED");
+    }
+
     // A network without the jail: Firecracker started in it (as `ip netns
     // exec` does on Linux) makes its endpoints there; a relative path or a
     // missing directory fails at start.
@@ -973,4 +1048,36 @@ mod tests {
         println!("NETNS-BAD-REFUSED");
     }
 
+    // --new-pid-ns: what the kernel drops for a namespace's init, sent from
+    // outside, has no effect; a handler installed later (upstream's, for
+    // SIGHUP) gets its signal, as init's handler does on Linux.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_pid_ns_drops_unhandled_signals() {
+        let out = run_child("pid_ns_signals_child", &[]);
+        assert!(out.contains("PID-NS-SIGNALS-DROPPED"), "{out}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_pid_ns_drops_unhandled_signals in a separate process"]
+    fn pid_ns_signals_child() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static HUP: AtomicBool = AtomicBool::new(false);
+        extern "C" fn on_hup(_: libc::c_int) {
+            HUP.store(true, Ordering::SeqCst);
+        }
+        imp::ignore_dropped_signals().unwrap();
+        for &signal in DROPPED_IN_PID_NS {
+            // SAFETY: a signal to this process, which ignores it.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
+        }
+        // SAFETY: a handler that only stores to an atomic.
+        unsafe { libc::signal(libc::SIGHUP, on_hup as *const () as libc::sighandler_t) };
+        // SAFETY: as above, now handled.
+        unsafe { libc::kill(libc::getpid(), libc::SIGHUP) };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(HUP.load(Ordering::SeqCst));
+        println!("PID-NS-SIGNALS-DROPPED");
+    }
 }

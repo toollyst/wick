@@ -116,8 +116,15 @@ mod macos {
 (allow network-outbound (remote unix-socket))
 ; Guest memory backed by POSIX shared memory (memfd_create).
 (allow ipc-posix-shm*)
-; Own process only.
+; Own process only. Information about other processes is not covered by the
+; default rule (measured: under (deny default), proc_pidinfo, proc_pidpath and
+; proc_listallpids of another process succeed), so it is denied here: it
+; fails with an error, as /proc/<pid> of another process is not there in a
+; Linux jail (no /proc in the chroot, nor the pid in its PID namespace). A
+; signal to another process raises SIGSYS (the default rule), as kill is in
+; none of upstream's filters.
 (allow signal (target self))
+(deny process-info*)
 (allow process-info* (target self))
 ; No code mapped in: upstream's filters trap mmap and mprotect asking for
 ; PROT_EXEC. A file mapped executable and a MAP_JIT mapping raise SIGSYS here
@@ -331,6 +338,7 @@ mod macos {
     pub const API_PROFILE: &str = r#"(allow network-inbound (local unix-socket))
 (allow network-outbound (remote unix-socket))
 (allow signal (target self))
+(deny process-info*)
 (allow process-info* (target self))
 (deny file-map-executable (with send-signal SIGSYS))
 (deny dynamic-code-generation (with send-signal SIGSYS))
@@ -1500,6 +1508,72 @@ mod macos {
             let _ = std::fs::remove_file(&path);
             narrow().unwrap();
             let _ = std::os::unix::net::UnixListener::bind(&path);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        // --new-pid-ns: in a PID namespace of its own on Linux, Firecracker
+        // sees and signals no other process. Here its sandbox holds it:
+        // information about another process fails (EPERM; Seatbelt's default
+        // rule does not cover it, the profile's explicit rule does), and a
+        // signal to one raises SIGSYS (the test's own process stands for any
+        // other).
+        #[test]
+        fn test_no_other_process_in_reach() {
+            use std::os::unix::process::ExitStatusExt;
+            let me = std::process::id().to_string();
+            let out = child("other_pid_info_child", &[("WICK_TEST_OTHER_PID", &me)]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && stdout.contains("OTHER-DENIED"), "{:?}\n{stdout}", out.status);
+            let out = child("other_pid_signal_child", &[("WICK_TEST_OTHER_PID", &me)]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
+            assert!(!stdout.contains("CHILD-SURVIVED"));
+        }
+
+        fn other_pid() -> libc::pid_t {
+            std::env::var("WICK_TEST_OTHER_PID").unwrap().parse().unwrap()
+        }
+
+        #[test]
+        #[ignore = "run by test_no_other_process_in_reach in a separate process"]
+        fn other_pid_info_child() {
+            let pid = other_pid();
+            // Its own process information stays readable.
+            // SAFETY: plain data the call fills.
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            // SAFETY: a buffer of `size` bytes.
+            let own = unsafe {
+                libc::proc_pidinfo(std::process::id().cast_signed(), libc::PROC_PIDTBSDINFO, 0,
+                    (&raw mut info).cast(), size)
+            };
+            assert_eq!(own, size);
+            // SAFETY: as above.
+            let other = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+            let err = std::io::Error::last_os_error();
+            assert_eq!((other, err.raw_os_error()), (0, Some(libc::EPERM)), "{err}");
+            let mut path = [0u8; 1024];
+            // SAFETY: a buffer of its length.
+            let other = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), 1024) };
+            assert_eq!(other, 0);
+            let mut pids = [0i32; 4096];
+            // SAFETY: a buffer of its size in bytes.
+            let all = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), 4096 * 4) };
+            assert!(all <= 0, "{all} pids listed");
+            println!("OTHER-DENIED");
+        }
+
+        #[test]
+        #[ignore = "run by test_no_other_process_in_reach in a separate process"]
+        fn other_pid_signal_child() {
+            let pid = other_pid();
+            select(Policy::Default);
+            apply().unwrap();
+            // SAFETY: signal 0 only checks that the process can be signalled.
+            unsafe { libc::kill(pid, 0) };
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
         }

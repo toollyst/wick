@@ -8,7 +8,7 @@
 #
 #   tools/macos/jailer-test.sh [--release] [--no-vm] [stage...]
 #
-# Stages (default: all): refuse jail daemonize limits no-api boot netns memory cpu.
+# Stages (default: all): refuse jail daemonize pidns limits no-api boot netns memory cpu.
 # no-api, boot, netns, memory and cpu start a VM and need Hypervisor.framework; --no-vm skips them (GitHub's
 # macOS runners have no Hypervisor.framework). Results and logs go to
 # build/jailer-test/<time>. Run tools/setup.sh first.

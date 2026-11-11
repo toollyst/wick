@@ -24,6 +24,8 @@ const JAIL_CPU_ENV: &str = "WICK_JAIL_CPU";
 /// limit in MiB (`vmm::ext::jail::MEMORY_ENV`), to share it with its API
 /// process.
 const JAIL_MEMORY_ENV: &str = "WICK_JAIL_MEMORY";
+/// `vmm::ext::jail::PID_NS_ENV`.
+const JAIL_PID_NS_ENV: &str = "WICK_JAIL_PID_NS";
 /// Firecracker's temporary directory in the jail. On macOS eventfds are
 /// unlinked FIFOs and memfds unlinked files (crates/compat), made in the
 /// temporary directory; on Linux both are kernel objects, so upstream's jail
@@ -72,11 +74,6 @@ unsafe extern "C" {
 /// What the macOS backend refuses, or a macOS step that failed.
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
-    #[error(
-        "--{0} is not supported on macOS: {1}. The jailer never accepts an isolation option it \
-         cannot enforce."
-    )]
-    Unsupported(&'static str, &'static str),
     #[error(
         "--cgroup {0} is not supported on macOS (supported: memory.max and cpu.max with \
          --cgroup-version 2, memory.limit_in_bytes, cpu.cfs_quota_us and cpu.cfs_period_us with \
@@ -358,9 +355,29 @@ fn grant(path: &Path, uid: u32, perms: &[i32], flags: &[i32]) -> io::Result<()> 
     result
 }
 
-/// `--new-pid-ns`: macOS has no PID namespaces.
-pub fn new_pid_ns() -> Result<(), JailerError> {
-    Err(HostError::Unsupported("new-pid-ns", "macOS has no PID namespaces").into())
+/// Whether Firecracker runs in a PID namespace of its own (`--new-pid-ns`).
+static NEW_PID_NS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--new-pid-ns`, where upstream clones Firecracker into a new PID
+/// namespace: macOS has none, so Firecracker is a child, as the clone makes
+/// it, and its jail holds it as the namespace would. It sees and signals no
+/// process but itself: its sandbox allows process information and signals
+/// for itself only (`vmm::ext::sandbox::PROFILE`), so it cannot find another
+/// pid or reach one. Processes outside reach it only with the signals it
+/// handles, and SIGKILL and SIGSTOP: it ignores the others
+/// (`vmm::ext::jail::DROPPED_IN_PID_NS`), as the kernel drops them for a
+/// namespace's init. Its pid is the host's (upstream writes that pid, the
+/// one the jailer's namespace sees, to the pid file too): macOS has one pid
+/// space. The rest is upstream's: the jailer writes the child's pid to the
+/// pid file and exits 0. Returns the child's pid in the jailer, 0 in the
+/// child.
+pub fn new_pid_ns() -> Result<i32, JailerError> {
+    NEW_PID_NS.store(true, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: the jailer has one thread.
+    match unsafe { libc::fork() } {
+        -1 => Err(HostError::Spawn("new-pid-ns", io::Error::last_os_error()).into()),
+        pid => Ok(pid),
+    }
 }
 
 /// The device nodes upstream creates in the jail. None is needed on macOS;
@@ -437,6 +454,9 @@ fn exec(
     }
     if let Some(mib) = *MEMORY_LIMIT_MIB.lock().unwrap() {
         env.push(CString::new(format!("{JAIL_MEMORY_ENV}={mib}")).expect("no NUL"));
+    }
+    if NEW_PID_NS.load(std::sync::atomic::Ordering::Relaxed) {
+        env.push(CString::new(format!("{JAIL_PID_NS_ENV}=1")).expect("no NUL"));
     }
     if let Some(dir) = NETNS.lock().unwrap().as_ref() {
         grant_to_jail(dir, uid).map_err(|e| HostError::Netns(dir.clone(), e))?;
@@ -732,12 +752,20 @@ mod tests {
         drop((before, after));
     }
 
+    // --new-pid-ns: a child, as upstream's clone, and Firecracker is told
+    // it runs in a namespace of its own (its exec's environment).
     #[test]
-    fn test_unsupported_isolation_is_refused() {
-        assert!(matches!(
-            new_pid_ns().unwrap_err(),
-            JailerError::Host(HostError::Unsupported("new-pid-ns", _))
-        ));
+    fn test_new_pid_ns_forks() {
+        let pid = new_pid_ns().unwrap();
+        if pid == 0 {
+            // SAFETY: the child ends at once.
+            unsafe { libc::_exit(7) };
+        }
+        let mut status = 0;
+        // SAFETY: our child; an out-pointer.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 7, "{status:#x}");
+        assert!(NEW_PID_NS.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]

@@ -175,7 +175,6 @@ def stage_refuse(ctx):
     """Options the jailer cannot enforce on macOS, and binaries that cannot take a jail over."""
     cases = [
         (["--netns", "/var/run/netns/x"], "The jail's network \"/var/run/netns/x\" (--netns)"),
-        (["--new-pid-ns"], "--new-pid-ns is not supported on macOS"),
         (["--cgroup", "cpuset.cpus=0"], "--cgroup cpuset.cpus=0 is not supported on macOS"),
         (["--cgroup-version", "2", "--cgroup", "cpu.weight=100"], "is not supported on macOS"),
         (["--cgroup", "cpu.shares=512"], "is not supported on macOS"),
@@ -291,6 +290,87 @@ def stage_daemonize(ctx):
     finally:
         os.kill(pid, signal.SIGKILL)
     return "double fork, setsid, no terminal, pid file, API answers"
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def api_ok(sock):
+    conn = bt.UnixHTTPConnection(sock)
+    try:
+        conn.request("GET", "/")
+        return conn.getresponse().status == 200
+    finally:
+        conn.close()
+
+
+def stage_pidns(ctx):
+    """--new-pid-ns: upstream's process tree (the jailer exits 0, the pid file names its child), and
+    signals from outside: only the handled ones (and SIGKILL) reach Firecracker, as for a namespace's init."""
+    jail = Jail(ctx, "pidns")
+    # Firecracker runs on with the jailer's standard descriptors: a file,
+    # which the jailer's exit does not wait for.
+    log = os.path.join(ctx.out, "pidns.log")
+    with open(log, "w") as f:
+        p = subprocess.Popen([ctx.jailer] + jailer_base(ctx, "pidns") + [
+            "--new-pid-ns", "--", "--api-sock", "/run/firecracker.socket"],
+            stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
+        rc = p.wait(timeout=20)
+    with open(log) as f:
+        out = f.read()
+    check(rc == 0, f"jailer exit {rc}: {out!r}")
+    with open(jail.host("/firecracker.pid")) as f:
+        pid = int(f.read())
+    try:
+        check(pid != p.pid, f"pid file names the jailer ({pid})")
+        deadline = time.time() + 10
+        while not os.path.exists(jail.host("/run/firecracker.socket")) and time.time() < deadline:
+            time.sleep(0.05)
+        uid, gid, _ = proc_ids(pid)
+        check((uid, gid) == (UID, GID), f"uid/gid {uid}/{gid}")
+        check(api_ok(jail.host("/run/firecracker.socket")), "API of Firecracker in its namespace")
+        dropped = [signal.SIGTERM, signal.SIGINT, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2,
+                   signal.SIGALRM, signal.SIGTSTP, signal.SIGVTALRM, signal.SIGPROF]
+        for sig in dropped:
+            os.kill(pid, sig)
+        time.sleep(0.5)
+        check(alive(pid) and api_ok(jail.host("/run/firecracker.socket")),
+              "Firecracker ended by a signal it does not handle")
+        # A handled signal reaches it: upstream's SIGHUP handler ends it.
+        os.kill(pid, signal.SIGHUP)
+        deadline = time.time() + 5
+        while alive(pid) and time.time() < deadline:
+            time.sleep(0.05)
+        check(not alive(pid), "SIGHUP (handled) did not reach Firecracker")
+    finally:
+        if alive(pid):
+            os.kill(pid, signal.SIGKILL)
+    # Control: without --new-pid-ns, SIGTERM ends Firecracker.
+    jail = Jail(ctx, "pidns-control")
+    rc, out = run_jailer(ctx, jailer_base(ctx, "pidns-control") + ["--daemonize", "--", "--api-sock",
+                                                                    "/run/firecracker.socket"])
+    check(rc == 0, f"control jailer exit {rc}: {out!r}")
+    deadline = time.time() + 10
+    while not os.path.exists(jail.host("/run/firecracker.socket")) and time.time() < deadline:
+        time.sleep(0.05)
+    with open(jail.host("/firecracker.pid")) as f:
+        control = int(f.read())
+    try:
+        os.kill(control, signal.SIGTERM)
+        deadline = time.time() + 5
+        while alive(control) and time.time() < deadline:
+            time.sleep(0.05)
+        check(not alive(control), "control: SIGTERM did not end Firecracker outside a namespace")
+    finally:
+        if alive(control):
+            os.kill(control, signal.SIGKILL)
+    return (f"jailer exits 0, pid file names its child; {len(dropped)} unhandled signals dropped, "
+            "SIGHUP (handled) delivered; control without the flag ended by SIGTERM")
 
 
 # The API process's share of a jail's limits (vmm::ext::jail::API_MEMORY_MIB,
@@ -573,6 +653,7 @@ STAGES = {
     "refuse": stage_refuse,
     "jail": stage_jail,
     "daemonize": stage_daemonize,
+    "pidns": stage_pidns,
     "limits": stage_limits,
     "no-api": stage_no_api,
     "boot": stage_boot,
