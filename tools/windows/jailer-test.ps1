@@ -6,7 +6,7 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,daemonize,handles,pidns,handoff,netns,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
 #
 # `refuse`, `cpuset`, `weight`, `low`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
@@ -23,7 +23,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -1103,6 +1103,48 @@ function Stage-Hugepages {
     "the jail keeps only traversal, not 'Lock pages in memory'$note, cannot open its token, maps no large pages, and a jailed guest on 2 MiB pages is refused naming the integrity level"
 }
 
+# A guest booted under the jailer with --netns: its network endpoint is made
+# in the network directory, and frames pass through it (boot-test.ps1's
+# switch, its C# taken from that script: ARP, ICMP echoes, a UDP echo).
+function Stage-Netguest {
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Check $elevated 'needs an elevated PowerShell: the jailer adds Windows Filtering Platform filters for --netns'
+    if (-not ('Wick.Switch' -as [type])) {
+        $source = [regex]::Match((Get-Content -Raw (Join-Path $Here 'boot-test.ps1')), "Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@", 'Singleline')
+        Check $source.Success "boot-test.ps1's switch was not found next to this script"
+        Add-Type -TypeDefinition $source.Groups[1].Value
+    }
+    $base = New-Base 'netguest'
+    $net = Join-Path $base 'net'
+    New-Item -ItemType Directory -Force -Path $net | Out-Null
+    $vm = Start-JailedVm $base 'g' @('--netns', $net) 256 -Api -NoConfig
+    try {
+        Invoke-ApiOk $vm.Sock 'PUT' '/boot-source' ([ordered]@{ kernel_image_path = '/vmlinux'; boot_args = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd root=/dev/vda ro rootfstype=squashfs init=/bin/sh' }) | Out-Null
+        Invoke-ApiOk $vm.Sock 'PUT' '/drives/rootfs' ([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs'; is_root_device = $true; is_read_only = $true }) | Out-Null
+        Invoke-ApiOk $vm.Sock 'PUT' '/machine-config' ([ordered]@{ vcpu_count = 2; mem_size_mib = 256 }) | Out-Null
+        Invoke-ApiOk $vm.Sock 'PUT' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; host_dev_name = 'tapg'; guest_mac = '06:00:0a:00:00:02' }) | Out-Null
+        $endpoint = Join-Path $net 'tapg'
+        Check (Test-Path $endpoint) "the guest's endpoint is not in its network directory ($endpoint)"
+        Check (-not (Test-Path (Join-Path $vm.Root 'tmp\firecracker-net\tapg'))) "the guest's endpoint is in the jail's temporary directory, not its network's"
+        $switch = New-Object Wick.Switch($endpoint, 10000)
+        try {
+            Invoke-ApiOk $vm.Sock 'PUT' '/actions' ([ordered]@{ action_type = 'InstanceStart' }) | Out-Null
+            Wait-Shell $vm
+            [void]$vm.Sh('ip addr add 10.0.0.2/24 dev eth0 && ip link set eth0 up && ip link set lo up', 20)
+            $out = $vm.Sh('ping -q -c 3 -i 0.3 -W 3 10.0.0.1 | grep transmitted', 30)
+            Check ($out -match ' 0% packet loss') "ping: $out"
+            $out = $vm.Sh('ping -q -c 50 -i 0.02 -s 1000 -W 3 10.0.0.1 | grep transmitted', 60)
+            Check ($out -match ' 0% packet loss') "ping -c 50 -s 1000: $out"
+            $out = $vm.Sh('echo udp-$((6*7)) | socat -t 3 - UDP:10.0.0.1:7', 30)
+            Check ($out -eq 'udp-42') "UDP echo '$out'"
+            $switch.Closing = $true
+        } finally { $switch.Close() }
+        Check ($null -eq $switch.ReadError) "switch: $($switch.ReadError) ($($switch.Counts))"
+        Check ($switch.Bad.Count -eq 0) "bad frames from the guest: $(($switch.Bad | Select-Object -First 3) -join '; ')"
+        Check ($switch.Arp -ge 1 -and $switch.Icmp -ge 53 -and $switch.Udp -ge 1) "switch saw $($switch.Counts)"
+    } finally { Stop-Jailed }
+    "a jailed guest with --netns: its endpoint in the network directory; ARP, ICMP (50 back to back), UDP echo through it, checksums valid ($($switch.Counts))"
+}
 # The guest using memory past the limit ends the VMM, as the cgroup OOM
 # killer does (tools/macos/jailer-test.py, stage_memory): a 1024 MiB guest
 # that writes 700 MiB, under a limit below that and under one above it.
