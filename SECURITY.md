@@ -93,8 +93,7 @@ upstream Firecracker and its jailer.
 
 - **Without the jailer, the VMM runs as the user who started it** on macOS and Windows: an escape from the VM and
   then the VMM lands as that user (files are then not limited, as on Linux without the jailer).
-- **macOS jailer: no CPU limits yet, and no namespaces.** `cpu.*` cgroups are refused rather than ignored. macOS
-  has no network or PID namespaces: IP networking is denied by the sandbox, and a jailed VMM uses Unix socket
+- **macOS jailer: no namespaces.** macOS has no network or PID namespaces: IP networking is denied by the sandbox, and a jailed VMM uses Unix socket
   endpoints in the jail (vmnet needs root). Firecracker starts as root and enters the jail before anything else
   runs (dyld cannot start a program inside a chroot), from a root-owned copy of the binary outside the jail.
 - **Windows jailer: no network confinement yet.** IP networking is not

@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Every status claim in the docs' tables names the test that checks it.
 
-A table cell in README.md, SECURITY.md or docs/ROADMAP.md that says a control
+A table cell in README.md, SECURITY.md, docs/ROADMAP.md or docs/PORTING.md that says a control
 is "in place", "verified" or "measured" must also name, in backticks, the
 test that shows it: a boot-test or jailer-test stage (`boot-test snapshot`,
 `jailer-test.ps1 cpu`), a unit test (`test_cpu_limit_holds`, `ext::sandbox`),
@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-FILES = ["README.md", "SECURITY.md", "docs/ROADMAP.md"]
+FILES = ["README.md", "SECURITY.md", "docs/ROADMAP.md", "docs/PORTING.md"]
 CLAIM = re.compile(r"\bverified\b|\bmeasured\b|\bin place\b(?! of)", re.I)
 EVIDENCE = re.compile(
     r"`[^`]*(boot-test|jailer-test|test_[a-z0-9_]+|ext::[a-z_:]+|cargo test|integration-tests|"
