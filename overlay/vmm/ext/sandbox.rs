@@ -56,8 +56,9 @@ pub enum SandboxError {
 #[cfg(target_os = "macos")]
 pub use macos::{
     API_FCNTL_COMMANDS, API_MACH_TRAPS, API_MIG_ROUTINES, API_SYSCALLS, FCNTL_COMMANDS,
-    FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MIG_ROUTINES, PROFILE,
-    RUN_DENIED_OPERATIONS, SYSCALLS, UNFILTERED_SYSCALLS, api_profile, apply, apply_api,
+    FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MEASURED_MAJORS, MIG_ROUTINES,
+    PROFILE, RUN_DENIED_OPERATIONS, SYSCALLS, Skip, UNFILTERED_SYSCALLS, api_profile, apply,
+    apply_api,
     denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select, selected,
 };
 
@@ -172,8 +173,8 @@ mod macos {
     ///
     /// Seatbelt skips the rule on the number of the calls of
     /// [`UNFILTERED_SYSCALLS`] (`write`, `open`, `socket`, `ioctl`, ...) when
-    /// a rule allows the operation they make; for those, that table names the
-    /// rule that decides each one.
+    /// a rule allows the operation they make, on the macOS majors each says;
+    /// for those, that table names the rule that decides each one.
     pub const SYSCALLS: &[&str] = &[
         // mmap, munmap, mprotect, madvise, mincore.
         "mmap", "munmap", "mprotect", "madvise", "mincore",
@@ -246,119 +247,149 @@ mod macos {
         Impossible(&'static str),
     }
 
+    /// The macOS majors where [`UNFILTERED_SYSCALLS`] was measured
+    /// (`test_seatbelt_skips_the_number_of_these` on each, which the CI
+    /// macOS matrix runs: .github/workflows/ci.yml). On another major that
+    /// test and `test_unfiltered_syscalls_are_limited_by_their_rule` fail,
+    /// naming it, the first with what it measured there.
+    pub const MEASURED_MAJORS: &[u32] = &[26, 27];
+
+    /// On which of [`MEASURED_MAJORS`] Seatbelt skips the rule on a call's
+    /// number.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Skip {
+        /// On every measured major.
+        All,
+        /// On these majors only: on the other measured ones the rule on its
+        /// number decides, as for a call outside the table.
+        On(&'static [u32]),
+    }
+
+    impl Skip {
+        /// Whether Seatbelt skips the rule on the number on macOS `major`.
+        pub fn on(self, major: u32) -> bool {
+            match self {
+                Skip::All => true,
+                Skip::On(majors) => majors.contains(&major),
+            }
+        }
+    }
+
     /// The system calls whose number Seatbelt does not check when a rule
-    /// allows the operation they make (measured on macOS 27: under
-    /// `(allow default)` each one runs with a rule denying its number,
-    /// `test_seatbelt_skips_the_number_of_these`), with the rule of this
-    /// profile that decides each one after [`narrow`]
-    /// (`test_unfiltered_syscalls_are_limited_by_their_rule`). For the others
-    /// the rule on the number decides ([`SYSCALLS`]).
+    /// allows the operation they make (measured on each of
+    /// [`MEASURED_MAJORS`]: under `(allow default)` each one runs with a rule
+    /// denying its number, `test_seatbelt_skips_the_number_of_these`), on
+    /// which majors ([`Skip`]), with the rule of this profile that decides
+    /// each one after [`narrow`]
+    /// (`test_unfiltered_syscalls_are_limited_by_their_rule`). For the others,
+    /// and for these on a major where the number is checked, the rule on the
+    /// number decides ([`SYSCALLS`]).
     #[rustfmt::skip]
-    pub const UNFILTERED_SYSCALLS: &[(&str, u16, Limit)] = &[
-        ("exit", 1, Limit::Upstream("exit")),
-        ("fork", 2, Limit::Signal("process-fork")),
-        ("write", 4, Limit::Upstream("write")),
-        ("open", 5, Limit::Error("file-read* file-write*")),
-        ("close", 6, Limit::Upstream("close")),
-        ("link", 9, Limit::Default),
-        ("unlink", 10, Limit::Signal("file-write-unlink")),
-        ("mknod", 14, Limit::Number),
-        ("chmod", 15, Limit::Signal("file-write-mode")),
-        ("chown", 16, Limit::Signal("file-write-owner")),
-        ("getpid", 20, Limit::Impossible(NO_OPERATION)),
-        ("getuid", 24, Limit::Impossible(NO_OPERATION)),
-        ("ptrace", 26, Limit::Signal("system-debug")),
-        ("chflags", 34, Limit::Signal("file-write-flags")),
-        ("fchflags", 35, Limit::Signal("file-write-flags")),
-        ("kill", 37, Limit::Signal("signal")),
-        ("getgid", 47, Limit::Impossible(NO_OPERATION)),
-        ("acct", 51, Limit::Signal("system-acct")),
-        ("ioctl", 54, Limit::Signal("file-ioctl")),
-        ("reboot", 55, Limit::Signal("system-reboot")),
-        ("revoke", 56, Limit::Signal("file-revoke")),
-        ("umask", 60, Limit::Impossible(NO_OPERATION)),
-        ("chroot", 61, Limit::Signal("file-chroot")),
-        ("swapon", 85, Limit::Signal("system-swap")),
-        ("setpriority", 96, Limit::Signal("system-sched")),
-        ("socket", 97, Limit::Signal("system-socket")),
-        ("connect", 98, Limit::Signal("network-outbound")),
-        ("getpriority", 100, Limit::Signal("system-sched")),
-        ("bind", 104, Limit::Signal("network-bind")),
-        ("writev", 121, Limit::Upstream("writev")),
-        ("fchown", 123, Limit::Signal("file-write-owner")),
-        ("fchmod", 124, Limit::Signal("file-write-mode")),
-        ("utimes", 138, Limit::Signal("file-write-times")),
-        ("futimes", 139, Limit::Signal("file-write-times")),
-        ("pwrite", 154, Limit::Upstream("write")),
-        ("nfssvc", 155, Limit::Signal("system-nfssvc")),
-        ("unmount", 159, Limit::Signal("file-unmount")),
-        ("quotactl", 165, Limit::Impossible(QUOTAS)),
-        ("mount", 167, Limit::Signal("file-mount")),
-        ("csops", 169, Limit::Signal("process-codesigning*")),
-        ("csops_audittoken", 170, Limit::Signal("process-codesigning*")),
-        ("sysctl", 202, Limit::Signal("sysctl-read")),
-        ("undelete", 205, Limit::Impossible(WHITEOUTS)),
-        ("getumask", 215, Limit::Impossible(NO_OPERATION)),
-        ("searchfs", 225, Limit::Signal("file-search")),
-        ("setxattr", 236, Limit::Signal("file-write-xattr")),
-        ("fsetxattr", 237, Limit::Signal("file-write-xattr")),
-        ("removexattr", 238, Limit::Signal("file-write-xattr")),
-        ("fremovexattr", 239, Limit::Signal("file-write-xattr")),
-        ("fsctl", 242, Limit::Signal("system-fsctl file-fsctl")),
-        ("ffsctl", 245, Limit::Signal("system-fsctl file-fsctl")),
-        ("semctl", 254, Limit::Signal("ipc-sysv*")),
-        ("semget", 255, Limit::Signal("ipc-sysv*")),
-        ("semop", 256, Limit::Signal("ipc-sysv*")),
-        ("msgctl", 258, Limit::Signal("ipc-sysv*")),
-        ("msgget", 259, Limit::Signal("ipc-sysv*")),
-        ("msgsnd", 260, Limit::Signal("ipc-sysv*")),
-        ("msgrcv", 261, Limit::Signal("ipc-sysv*")),
-        ("shmat", 262, Limit::Signal("ipc-sysv*")),
-        ("shmctl", 263, Limit::Signal("ipc-sysv*")),
-        ("shmdt", 264, Limit::Signal("ipc-sysv*")),
-        ("shmget", 265, Limit::Signal("ipc-sysv*")),
-        ("shm_open", 266, Limit::Signal("ipc-posix-shm*")),
-        ("shm_unlink", 267, Limit::Signal("ipc-posix-shm*")),
-        ("sem_open", 268, Limit::Signal("ipc-posix-sem*")),
-        ("sem_close", 269, Limit::Number),
-        ("sem_unlink", 270, Limit::Signal("ipc-posix-sem*")),
-        ("sem_wait", 271, Limit::Number),
-        ("sem_trywait", 272, Limit::Number),
-        ("sem_post", 273, Limit::Number),
-        ("sysctlbyname", 274, Limit::Signal("sysctl-read")),
-        ("chmod_extended", 282, Limit::Signal("file-write-mode file-write-acl")),
-        ("fchmod_extended", 283, Limit::Signal("file-write-mode file-write-acl")),
-        ("issetugid", 327, Limit::Impossible(NO_OPERATION)),
-        ("__pthread_kill", 328, Limit::Upstream("tkill")),
-        ("proc_info", 336, Limit::Error("process-info*")),
-        ("lchown", 364, Limit::Signal("file-write-owner")),
-        ("write_nocancel", 397, Limit::Upstream("write")),
-        ("open_nocancel", 398, Limit::Error("file-read* file-write*")),
-        ("close_nocancel", 399, Limit::Upstream("close")),
-        ("connect_nocancel", 409, Limit::Signal("network-outbound")),
-        ("writev_nocancel", 412, Limit::Upstream("writev")),
-        ("pwrite_nocancel", 415, Limit::Upstream("write")),
-        ("msgsnd_nocancel", 418, Limit::Signal("ipc-sysv*")),
-        ("msgrcv_nocancel", 419, Limit::Signal("ipc-sysv*")),
-        ("sem_wait_nocancel", 420, Limit::Number),
-        ("pid_suspend", 433, Limit::Signal("system-suspend-resume")),
-        ("pid_resume", 434, Limit::Signal("system-suspend-resume")),
-        ("connectx", 447, Limit::Signal("network-outbound")),
-        ("clonefileat", 462, Limit::Signal("file-clone")),
-        ("openat", 463, Limit::Error("file-read* file-write*")),
-        ("openat_nocancel", 464, Limit::Error("file-read* file-write*")),
-        ("fchmodat", 467, Limit::Signal("file-write-mode")),
-        ("fchownat", 468, Limit::Signal("file-write-owner")),
-        ("linkat", 471, Limit::Default),
-        ("unlinkat", 472, Limit::Signal("file-write-unlink")),
-        ("fclonefileat", 517, Limit::Signal("file-clone")),
-        ("fs_snapshot", 518, Limit::Signal("fs-snapshot*")),
-        ("terminate_with_payload", 520, Limit::Signal("signal")),
-        ("abort_with_payload", 521, Limit::Upstream("exit_group")),
-        ("fmount", 526, Limit::Signal("file-mount")),
-        ("pwritev", 541, Limit::Upstream("writev")),
-        ("pwritev_nocancel", 543, Limit::Upstream("writev")),
-        ("proc_info_extended_id", 545, Limit::Error("process-info*")),
+    pub const UNFILTERED_SYSCALLS: &[(&str, u16, Limit, Skip)] = &[
+        ("exit", 1, Limit::Upstream("exit"), Skip::All),
+        ("fork", 2, Limit::Signal("process-fork"), Skip::All),
+        ("write", 4, Limit::Upstream("write"), Skip::All),
+        ("open", 5, Limit::Error("file-read* file-write*"), Skip::All),
+        ("close", 6, Limit::Upstream("close"), Skip::All),
+        ("link", 9, Limit::Default, Skip::All),
+        ("unlink", 10, Limit::Signal("file-write-unlink"), Skip::All),
+        ("mknod", 14, Limit::Number, Skip::All),
+        ("chmod", 15, Limit::Signal("file-write-mode"), Skip::All),
+        ("chown", 16, Limit::Signal("file-write-owner"), Skip::All),
+        ("getpid", 20, Limit::Impossible(NO_OPERATION), Skip::All),
+        ("getuid", 24, Limit::Impossible(NO_OPERATION), Skip::All),
+        ("ptrace", 26, Limit::Signal("system-debug"), Skip::All),
+        ("chflags", 34, Limit::Signal("file-write-flags"), Skip::All),
+        ("fchflags", 35, Limit::Signal("file-write-flags"), Skip::All),
+        ("kill", 37, Limit::Signal("signal"), Skip::All),
+        ("getgid", 47, Limit::Impossible(NO_OPERATION), Skip::All),
+        ("acct", 51, Limit::Signal("system-acct"), Skip::All),
+        ("ioctl", 54, Limit::Signal("file-ioctl"), Skip::All),
+        ("reboot", 55, Limit::Signal("system-reboot"), Skip::All),
+        ("revoke", 56, Limit::Signal("file-revoke"), Skip::All),
+        ("umask", 60, Limit::Impossible(NO_OPERATION), Skip::All),
+        ("chroot", 61, Limit::Signal("file-chroot"), Skip::All),
+        ("swapon", 85, Limit::Signal("system-swap"), Skip::All),
+        ("setpriority", 96, Limit::Signal("system-sched"), Skip::All),
+        ("socket", 97, Limit::Signal("system-socket"), Skip::All),
+        ("connect", 98, Limit::Signal("network-outbound"), Skip::All),
+        ("getpriority", 100, Limit::Signal("system-sched"), Skip::All),
+        ("bind", 104, Limit::Signal("network-bind"), Skip::All),
+        ("writev", 121, Limit::Upstream("writev"), Skip::All),
+        ("fchown", 123, Limit::Signal("file-write-owner"), Skip::All),
+        ("fchmod", 124, Limit::Signal("file-write-mode"), Skip::All),
+        ("utimes", 138, Limit::Signal("file-write-times"), Skip::All),
+        ("futimes", 139, Limit::Signal("file-write-times"), Skip::All),
+        ("pwrite", 154, Limit::Upstream("write"), Skip::All),
+        ("nfssvc", 155, Limit::Signal("system-nfssvc"), Skip::All),
+        ("unmount", 159, Limit::Signal("file-unmount"), Skip::All),
+        ("quotactl", 165, Limit::Impossible(QUOTAS), Skip::All),
+        ("mount", 167, Limit::Signal("file-mount"), Skip::All),
+        ("csops", 169, Limit::Signal("process-codesigning*"), Skip::All),
+        ("csops_audittoken", 170, Limit::Signal("process-codesigning*"), Skip::All),
+        ("sysctl", 202, Limit::Signal("sysctl-read"), Skip::All),
+        ("undelete", 205, Limit::Impossible(WHITEOUTS), Skip::All),
+        ("getumask", 215, Limit::Impossible(NO_OPERATION), Skip::On(&[27])),
+        ("searchfs", 225, Limit::Signal("file-search"), Skip::All),
+        ("setxattr", 236, Limit::Signal("file-write-xattr"), Skip::All),
+        ("fsetxattr", 237, Limit::Signal("file-write-xattr"), Skip::All),
+        ("removexattr", 238, Limit::Signal("file-write-xattr"), Skip::All),
+        ("fremovexattr", 239, Limit::Signal("file-write-xattr"), Skip::All),
+        ("fsctl", 242, Limit::Signal("system-fsctl file-fsctl"), Skip::All),
+        ("ffsctl", 245, Limit::Signal("system-fsctl file-fsctl"), Skip::All),
+        ("semctl", 254, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("semget", 255, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("semop", 256, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("msgctl", 258, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("msgget", 259, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("msgsnd", 260, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("msgrcv", 261, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("shmat", 262, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("shmctl", 263, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("shmdt", 264, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("shmget", 265, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("shm_open", 266, Limit::Signal("ipc-posix-shm*"), Skip::All),
+        ("shm_unlink", 267, Limit::Signal("ipc-posix-shm*"), Skip::All),
+        ("sem_open", 268, Limit::Signal("ipc-posix-sem*"), Skip::All),
+        ("sem_close", 269, Limit::Number, Skip::All),
+        ("sem_unlink", 270, Limit::Signal("ipc-posix-sem*"), Skip::All),
+        ("sem_wait", 271, Limit::Number, Skip::All),
+        ("sem_trywait", 272, Limit::Number, Skip::All),
+        ("sem_post", 273, Limit::Number, Skip::All),
+        ("sysctlbyname", 274, Limit::Signal("sysctl-read"), Skip::All),
+        ("chmod_extended", 282, Limit::Signal("file-write-mode file-write-acl"), Skip::All),
+        ("fchmod_extended", 283, Limit::Signal("file-write-mode file-write-acl"), Skip::All),
+        ("issetugid", 327, Limit::Impossible(NO_OPERATION), Skip::All),
+        ("__pthread_kill", 328, Limit::Upstream("tkill"), Skip::All),
+        ("proc_info", 336, Limit::Error("process-info*"), Skip::All),
+        ("lchown", 364, Limit::Signal("file-write-owner"), Skip::All),
+        ("write_nocancel", 397, Limit::Upstream("write"), Skip::All),
+        ("open_nocancel", 398, Limit::Error("file-read* file-write*"), Skip::All),
+        ("close_nocancel", 399, Limit::Upstream("close"), Skip::All),
+        ("connect_nocancel", 409, Limit::Signal("network-outbound"), Skip::All),
+        ("writev_nocancel", 412, Limit::Upstream("writev"), Skip::All),
+        ("pwrite_nocancel", 415, Limit::Upstream("write"), Skip::All),
+        ("msgsnd_nocancel", 418, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("msgrcv_nocancel", 419, Limit::Signal("ipc-sysv*"), Skip::All),
+        ("sem_wait_nocancel", 420, Limit::Number, Skip::All),
+        ("pid_suspend", 433, Limit::Signal("system-suspend-resume"), Skip::All),
+        ("pid_resume", 434, Limit::Signal("system-suspend-resume"), Skip::All),
+        ("connectx", 447, Limit::Signal("network-outbound"), Skip::All),
+        ("clonefileat", 462, Limit::Signal("file-clone"), Skip::All),
+        ("openat", 463, Limit::Error("file-read* file-write*"), Skip::All),
+        ("openat_nocancel", 464, Limit::Error("file-read* file-write*"), Skip::All),
+        ("fchmodat", 467, Limit::Signal("file-write-mode"), Skip::All),
+        ("fchownat", 468, Limit::Signal("file-write-owner"), Skip::All),
+        ("linkat", 471, Limit::Default, Skip::All),
+        ("unlinkat", 472, Limit::Signal("file-write-unlink"), Skip::All),
+        ("fclonefileat", 517, Limit::Signal("file-clone"), Skip::All),
+        ("fs_snapshot", 518, Limit::Signal("fs-snapshot*"), Skip::All),
+        ("terminate_with_payload", 520, Limit::Signal("signal"), Skip::All),
+        ("abort_with_payload", 521, Limit::Upstream("exit_group"), Skip::All),
+        ("fmount", 526, Limit::Signal("file-mount"), Skip::All),
+        ("pwritev", 541, Limit::Upstream("writev"), Skip::All),
+        ("pwritev_nocancel", 543, Limit::Upstream("writev"), Skip::All),
+        ("proc_info_extended_id", 545, Limit::Error("process-info*"), Skip::On(&[27])),
     ];
 
     /// Why a call of [`UNFILTERED_SYSCALLS`] has no limit: it asks only
@@ -2469,13 +2500,35 @@ mod macos {
         /// <sys/syscall.h> of the macOS 27 SDK).
         const SYS_MAXSYSCALL: u16 = 558;
 
+        /// The host's macOS major (`kern.osproductversion`).
+        fn macos_major() -> u32 {
+            let mut buf = [0u8; 32];
+            let mut len = buf.len();
+            // SAFETY: a NUL-terminated name, a buffer and its length.
+            let r = unsafe {
+                libc::sysctlbyname(
+                    c"kern.osproductversion".as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    &raw mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(r, 0, "kern.osproductversion: {}", std::io::Error::last_os_error());
+            let version = std::str::from_utf8(&buf[..len]).unwrap().trim_end_matches('\0');
+            version.split('.').next().unwrap().parse().unwrap_or_else(|e| panic!("macOS {version:?}: {e}"))
+        }
+
         // Seatbelt skips the rule on a call's number when a rule allows the
         // operation the call makes: under (allow default), with a rule
-        // denying one number, exactly the calls of UNFILTERED_SYSCALLS run
-        // (each other one raises SIGSYS). Measured here, every number in turn.
+        // denying one number, exactly the calls of UNFILTERED_SYSCALLS that
+        // Skip says it skips on this major run (each other one raises
+        // SIGSYS). Measured here, every number in turn; a major outside
+        // MEASURED_MAJORS fails with what was measured there.
         #[test]
         fn test_seatbelt_skips_the_number_of_these() {
             use std::os::unix::process::ExitStatusExt;
+            let major = macos_major();
             let envs = (0..SYS_MAXSYSCALL)
                 .map(|n| vec![("WICK_TEST_SYSCALL".to_owned(), n.to_string())])
                 .collect();
@@ -2488,8 +2541,14 @@ mod macos {
                     ran.push(u16::try_from(n).unwrap());
                 }
             }
-            let table: Vec<u16> = UNFILTERED_SYSCALLS.iter().map(|(_, n, _)| *n).collect();
-            assert_eq!(ran, table);
+            let table: Vec<u16> =
+                UNFILTERED_SYSCALLS.iter().filter(|(.., s)| s.on(major)).map(|(_, n, ..)| *n).collect();
+            assert!(
+                MEASURED_MAJORS.contains(&major),
+                "macOS {major} is not measured: Seatbelt skips the number of {ran:?} there (the table says \
+                 {table:?}); add it to MEASURED_MAJORS and to the Skip of each entry it differs on"
+            );
+            assert_eq!(ran, table, "macOS {major}");
         }
 
         #[test]
@@ -2524,10 +2583,17 @@ mod macos {
         // lifted (an allow rule for its operation, or for its number). The
         // ones nothing decides run. The calls that remove a name also with
         // the names a running microVM removes, which they remove unlifted
-        // (ALLOWED_NAMES), and others, which raise SIGSYS (DENIED_NAMES).
+        // (ALLOWED_NAMES), and others, which raise SIGSYS (DENIED_NAMES). A
+        // call whose number Seatbelt checks on this major (Skip) raises
+        // SIGSYS by its number whatever is lifted, unless SYSCALLS has it.
         #[test]
         fn test_unfiltered_syscalls_are_limited_by_their_rule() {
             use std::os::unix::process::ExitStatusExt;
+            let major = macos_major();
+            assert!(
+                MEASURED_MAJORS.contains(&major),
+                "macOS {major} is not measured (test_seatbelt_skips_the_number_of_these)"
+            );
             let base = std::env::temp_dir()
                 .canonicalize()
                 .unwrap()
@@ -2537,10 +2603,11 @@ mod macos {
             std::fs::create_dir_all(jail.join("tmp")).unwrap();
             std::fs::create_dir_all(base.join("net")).unwrap();
             let mut cases = Vec::new();
-            for (name, _, limit) in UNFILTERED_SYSCALLS {
+            for (name, _, limit, skip) in UNFILTERED_SYSCALLS {
                 if matches!(limit, Limit::Upstream(_)) || ["exit"].contains(name) {
                     continue;
                 }
+                let by_number = !skip.on(major) && !SYSCALLS.contains(name);
                 let mut lifts: Vec<&str> = match limit {
                     Limit::Impossible(_) | Limit::Default => vec!["0"],
                     _ => vec!["0", "1"],
@@ -2556,20 +2623,23 @@ mod macos {
                     }
                     std::fs::write(jail.join(format!("inside-{name}-{lift}")), b"x").unwrap();
                     std::fs::write(base.join(format!("outside-{name}-{lift}")), b"x").unwrap();
-                    cases.push((*name, *limit, *lift));
+                    cases.push((*name, *limit, *lift, by_number));
                 }
             }
             // Another process for each case, which a lifted call may signal,
-            // stop or end: never this one.
+            // stop or end: never this one. Killed below; long enough for the
+            // cases to run on a loaded host (a target gone before its case
+            // runs fails that case with ESRCH in place of the sandbox's
+            // answer).
             let mut others: Vec<std::process::Child> = cases
                 .iter()
-                .map(|_| Command::new("/bin/sleep").arg("60").spawn().unwrap())
+                .map(|_| Command::new("/bin/sleep").arg("3600").spawn().unwrap())
                 .collect();
             let envs = cases
                 .iter()
                 .zip(&others)
                 .enumerate()
-                .map(|(i, ((name, _, lift), other))| {
+                .map(|(i, ((name, _, lift, _), other))| {
                     let other = other.id().to_string();
                     let ipc = ipc_name(i);
                     // In a jail, the temporary directory is its /tmp (the
@@ -2613,7 +2683,7 @@ mod macos {
                 let _ = (name, unsafe { libc::unmount(mnt.as_ptr(), libc::MNT_FORCE) });
             }
             let mut failures = Vec::new();
-            for ((name, limit, lift), out) in cases.iter().zip(&outs) {
+            for ((name, limit, lift, by_number), out) in cases.iter().zip(&outs) {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let signal = out.status.signal();
                 let ret = stdout.lines().find_map(|l| l.strip_prefix("RET ")).unwrap_or("none");
@@ -2621,6 +2691,7 @@ mod macos {
                 let denied = DENIED_NAMES.iter().any(|(_, names)| names.contains(lift));
                 let ok = stdout.contains("NARROWED")
                     && match (limit, *lift) {
+                        _ if *by_number => signal == Some(libc::SIGSYS),
                         _ if allowed => out.status.success() && ret == "ok 0" && stdout.contains("SURVIVED"),
                         _ if denied => signal == Some(libc::SIGSYS),
                         (Limit::Signal(_) | Limit::Number | Limit::Default, "0") => {
@@ -2648,8 +2719,9 @@ mod macos {
                         _ => out.status.success() && stdout.contains("SURVIVED"),
                     };
                 if !ok {
+                    let rule = if *by_number { "the number rule, on this major" } else { "" };
                     failures.push(format!(
-                        "{name} (lifted {lift}, {limit:?}): {:?} RET {ret}\n{}",
+                        "{name} (lifted {lift}, {limit:?}{rule}; macOS {major}): {:?} RET {ret}\n{}",
                         out.status,
                         String::from_utf8_lossy(&out.stderr).lines().take(3).collect::<Vec<_>>().join("\n")
                     ));
@@ -2702,7 +2774,7 @@ mod macos {
             let base = jail.parent().unwrap().to_owned();
             let other = other_pid() as usize;
             let (n, limit) =
-                UNFILTERED_SYSCALLS.iter().find(|(x, ..)| *x == name).map(|(_, n, l)| (*n, *l)).unwrap();
+                UNFILTERED_SYSCALLS.iter().find(|(x, ..)| *x == name).map(|(_, n, l, _)| (*n, *l)).unwrap();
             let c = |p: &std::path::Path| CString::new(p.as_os_str().as_bytes()).unwrap();
             let tag = format!("{name}-{lift}");
             let inside = c(&jail.join(format!("inside-{tag}")));
