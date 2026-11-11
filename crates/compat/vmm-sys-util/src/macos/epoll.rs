@@ -28,8 +28,8 @@ pub use crate::epoll_types::{ControlOperation, EpollEvent, EventSet, epoll_event
 #[derive(Debug)]
 pub struct Epoll {
     kq: RawFd,
-    /// Registered descriptors and their user data.
-    interests: Mutex<HashMap<RawFd, u64>>,
+    /// Registered descriptors, their user data and events.
+    interests: Mutex<HashMap<RawFd, (u64, EventSet)>>,
 }
 
 fn kevent_for(fd: RawFd, filter: i16, flags: u16) -> libc::kevent {
@@ -134,14 +134,14 @@ impl Epoll {
                     return Err(io::Error::from_raw_os_error(libc::EEXIST));
                 }
                 self.apply(&Self::filter_changes(fd, event.event_set()))?;
-                interests.insert(fd, event.data());
+                interests.insert(fd, (event.data(), event.event_set()));
             }
             ControlOperation::Modify => {
                 if !interests.contains_key(&fd) {
                     return Err(io::Error::from_raw_os_error(libc::ENOENT));
                 }
                 self.apply(&Self::filter_changes(fd, event.event_set()))?;
-                interests.insert(fd, event.data());
+                interests.insert(fd, (event.data(), event.event_set()));
             }
             ControlOperation::Delete => {
                 if interests.remove(&fd).is_none() {
@@ -149,6 +149,38 @@ impl Epoll {
                 }
                 self.apply(&Self::filter_changes(fd, EventSet::empty()))?;
             }
+        }
+        Ok(())
+    }
+
+    /// In a forked child: a kqueue is not inherited across `fork` (an epoll
+    /// instance is, on Linux), so this makes the instance a new kqueue under
+    /// the same descriptor, with the same interests. A one-shot interest that
+    /// fired is armed again.
+    pub fn reopen_after_fork(&self) -> io::Result<()> {
+        let interests = self.interests.lock().unwrap();
+        // SAFETY: kqueue() takes no arguments; the result is checked.
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both descriptors are ours: `self.kq` is the inherited,
+        // dead one; dup2 replaces it and keeps its number.
+        let ret = unsafe { libc::dup2(kq, self.kq) };
+        let err = io::Error::last_os_error();
+        if kq != self.kq {
+            // SAFETY: the new descriptor, now duplicated.
+            unsafe { libc::close(kq) };
+        }
+        if ret < 0 {
+            return Err(err);
+        }
+        // SAFETY: `self.kq` is ours.
+        if unsafe { libc::fcntl(self.kq, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for (&fd, &(_, events)) in interests.iter() {
+            self.apply(&Self::filter_changes(fd, events))?;
         }
         Ok(())
     }
@@ -192,7 +224,7 @@ impl Epoll {
         for ev in fired.iter().take(usize::try_from(ret).unwrap_or(0)) {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let fd = ev.ident as RawFd;
-            let Some(&data) = interests.get(&fd) else {
+            let Some(&(data, _)) = interests.get(&fd) else {
                 continue;
             };
             let mut bits = EventSet::empty();
@@ -371,5 +403,37 @@ mod tests {
         assert_eq!(epoll.wait(100, &mut ready).unwrap(), 2);
         let mut big = [EpollEvent::default(); 8];
         assert_eq!(epoll.wait(100, &mut big).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_reopen_after_fork() {
+        // As an epoll instance on Linux, the instance works in a forked child
+        // (here once reopened): same descriptor, same interests and data.
+        let epoll = Epoll::new().unwrap();
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        epoll
+            .ctl(ControlOperation::Add, evt.as_raw_fd(), EpollEvent::new(EventSet::IN, 7))
+            .unwrap();
+        evt.write(1).unwrap();
+        // SAFETY: the child only makes plain calls and leaves with _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let mut ready = [EpollEvent::default(); 2];
+            // Without reopening, the inherited descriptor is no kqueue.
+            let before = epoll.wait(0, &mut ready).is_err();
+            let reopened = epoll.reopen_after_fork().is_ok();
+            let n = epoll.wait(100, &mut ready).unwrap_or(0);
+            let ok = before && reopened && n == 1 && ready[0].data() == 7;
+            // SAFETY: ends the child.
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child just made.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "{status:#x}");
+        // The parent's instance is untouched.
+        let mut ready = [EpollEvent::default(); 2];
+        assert_eq!(epoll.wait(100, &mut ready).unwrap(), 1);
     }
 }
