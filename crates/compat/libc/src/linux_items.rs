@@ -920,13 +920,47 @@ extern "C" fn wick_compat_syscall_enosys() -> c_int {
 
 // ---- functions with different signatures or missing on macOS ----
 
-/// `mincore` with the Linux signature (`*mut c_uchar`; macOS uses `*mut c_char`).
+/// `mincore` with the Linux signature (`*mut c_uchar`; macOS uses `*mut c_char`)
+/// and Linux's answer: one byte per page, its lowest bit set when the page
+/// holds data of the mapping.
+///
+/// macOS compresses (and swaps) a mapping's idle pages whenever memory is
+/// short, and cannot be told not to; its mincore then reports such a page
+/// paged out, not in core. Firecracker builds a diff snapshot without dirty
+/// tracking from mincore (`mincore_bitmap`), on Linux hosts without swap
+/// where a written page stays in core: a paged-out page left out of it is
+/// guest memory lost on restore (a restored guest's virtio ring read as
+/// garbage, measured under memory pressure in `test_vmclock.py`). A page
+/// macOS holds paged out has data, and reading it pages it in: it counts
+/// as resident here.
 ///
 /// # Safety
 /// Same contract as `mincore(2)`.
 pub unsafe fn mincore(addr: *mut c_void, len: size_t, vec: *mut c_uchar) -> c_int {
-    // SAFETY: forwarded unchanged; only the pointer type differs.
-    unsafe { libc::mincore(addr, len, vec.cast()) }
+    // SAFETY: forwarded; only the pointer type differs.
+    let r = unsafe { libc::mincore(addr, len, vec.cast()) };
+    if r == 0 {
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+        let n = len.div_ceil(page);
+        // SAFETY: mincore(2) filled one byte per page of the range in `vec`,
+        // which the caller sized for it.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(vec, n) };
+        for b in bytes {
+            *b = linux_residency(*b);
+        }
+    }
+    r
+}
+
+/// macOS's `MINCORE_PAGED_OUT` (<sys/mman.h>; not in the libc crate): the
+/// compressor or swap holds the page.
+const MINCORE_PAGED_OUT: c_uchar = 0x20;
+
+/// Linux's mincore byte for macOS's: resident (1) when the page is in core
+/// or paged out (compressed or swapped), absent (0) otherwise.
+fn linux_residency(macos: c_uchar) -> c_uchar {
+    c_uchar::from(macos & (libc::MINCORE_INCORE as c_uchar | MINCORE_PAGED_OUT) != 0)
 }
 
 /// `FALLOC_FL_KEEP_SIZE` (Linux value).
@@ -1753,6 +1787,22 @@ mod tests {
         let addr = (buf.as_mut_ptr() as usize & !(page - 1)) as *mut c_void;
         // SAFETY: the range is mapped (it is our heap buffer, page aligned down).
         assert_eq!(unsafe { mincore(addr, page, vec.as_mut_ptr()) }, 0);
+        // The buffer was written: in core, Linux's 1 and nothing else.
+        assert_eq!(vec[0], 1);
+    }
+
+    #[test]
+    fn test_mincore_paged_out_is_resident() {
+        // macOS's bytes for a page in core (referenced, modified, anonymous),
+        // one the compressor holds, and one never touched.
+        // <sys/mman.h>: MINCORE_ANONYMOUS.
+        let anonymous = 0x80;
+        let in_core = (libc::MINCORE_INCORE | libc::MINCORE_MODIFIED) as u8 | anonymous;
+        let paged_out = MINCORE_PAGED_OUT | anonymous;
+        assert_eq!(linux_residency(in_core), 1);
+        assert_eq!(linux_residency(paged_out), 1);
+        assert_eq!(linux_residency(0), 0);
+        assert_eq!(linux_residency(anonymous), 0);
     }
 
     #[test]

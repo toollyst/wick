@@ -658,10 +658,11 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         unsafe { libc::munmap(alias as *mut _, len as usize) };
         return Err(errno_err(libc::EPERM));
     }
-    // Residency decides what is missing.
+    // Residency decides what is missing: Linux's, where a page the
+    // compressor or swap holds has data and is not missing (crate::mincore).
     let mut resident = std::vec![0u8; (len / host) as usize];
     // SAFETY: `resident` has one byte per host page of the range.
-    if unsafe { libc::mincore(start as *mut _, len as usize, resident.as_mut_ptr().cast()) } != 0 {
+    if unsafe { crate::mincore(start as *mut _, len as usize, resident.as_mut_ptr()) } != 0 {
         let err = io::Error::last_os_error();
         // SAFETY: unmaps the alias made above.
         unsafe { libc::munmap(alias as *mut _, len as usize) };
