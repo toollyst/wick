@@ -96,6 +96,9 @@ pub(crate) struct VcpuShared {
     tsc_khz: AtomicU64,
     /// The last `MSR_KVM_SYSTEM_TIME_NEW` value.
     system_time_msr: AtomicU64,
+    /// The clock generation (`pvclock::State::generation`) this vCPU's time
+    /// info was last published under.
+    clock_gen: AtomicU64,
     /// Mirror of `kvm_run.immediate_exit`, written from any thread.
     immediate_exit: AtomicU8,
     /// Odd while the run loop is between its last `immediate_exit` check
@@ -206,6 +209,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         pending: Mutex::new(None),
         tsc_khz: AtomicU64::new(0),
         system_time_msr: AtomicU64::new(0),
+        clock_gen: AtomicU64::new(0),
         immediate_exit: AtomicU8::new(0),
         run_seq: AtomicU64::new(0),
         tsc_deadline: AtomicU64::new(0),
@@ -433,6 +437,8 @@ impl VcpuFd {
         match index {
             pvclock::MSR_SYSTEM_TIME => {
                 self.shared.system_time_msr.store(value, Ordering::Release);
+                let generation = inner.pvclock.lock().unwrap().generation;
+                self.shared.clock_gen.store(generation, Ordering::Release);
                 pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, |gpa| inner.host_addr(gpa), now);
                 true
             }
@@ -571,6 +577,7 @@ impl VcpuFd {
     fn enter(&self) -> Result<Option<whv::WHV_RUN_VP_EXIT_CONTEXT>> {
         let shared = &self.shared;
         shared.run_seq.fetch_add(1, Ordering::SeqCst);
+        self.update_clock();
         let result = self.raise_fired_deadline().and_then(|()| {
             if shared.immediate_exit.load(Ordering::SeqCst) != 0 {
                 Ok(None)
@@ -580,6 +587,20 @@ impl VcpuFd {
         });
         shared.run_seq.fetch_add(1, Ordering::SeqCst);
         result
+    }
+
+    /// Publishes this vCPU's kvm-clock time info again if the VM clock was
+    /// set since it was published (`pvclock`: a snapshot restore sets the
+    /// clock after the vCPUs' MSRs), as KVM does on `KVM_REQ_CLOCK_UPDATE`.
+    fn update_clock(&self) {
+        let inner = &self.shared.inner;
+        let generation = inner.pvclock.lock().unwrap().generation;
+        if self.shared.clock_gen.swap(generation, Ordering::AcqRel) == generation {
+            return;
+        }
+        let value = self.shared.system_time_msr.load(Ordering::Acquire);
+        let now = || inner.irqchip.lock().unwrap().clock().clock;
+        pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, |gpa| inner.host_addr(gpa), now);
     }
 
     /// Raises the interrupt of a TSC-deadline timer that fired since the
