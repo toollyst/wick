@@ -134,12 +134,13 @@ impl Drop for Process {
 }
 
 impl Process {
-    /// A handle of its own to the same process.
-    fn duplicate(&self) -> Result<Process> {
+    /// A handle of its own to the process `h` (a handle this process holds,
+    /// which stays the caller's) names.
+    fn duplicate(h: HANDLE) -> Result<Process> {
         let mut out: HANDLE = std::ptr::null_mut();
         // SAFETY: duplicates a handle we hold into this process.
         let ok = unsafe {
-            DuplicateHandle(GetCurrentProcess(), self.0, GetCurrentProcess(), &mut out, 0, 0, DUPLICATE_SAME_ACCESS)
+            DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &mut out, 0, 0, DUPLICATE_SAME_ACCESS)
         };
         if ok == 0 {
             return Err(Error::last());
@@ -160,10 +161,7 @@ static PEER_PROCESSES: Mutex<Option<HashMap<RawFd, Process>>> = Mutex::new(None)
 /// Firecracker the handle. Sockets are sent to such a peer as handles. The
 /// registry keeps a duplicate; the caller keeps `process`.
 pub fn set_peer_process(sock: RawFd, process: HANDLE) -> Result<()> {
-    let own = Process(process).duplicate();
-    // The caller's handle is not ours to close.
-    std::mem::forget(Process(process));
-    let own = own?;
+    let own = Process::duplicate(process)?;
     PEER_PROCESSES.lock().unwrap().get_or_insert_with(HashMap::new).insert(sock, own);
     Ok(())
 }
@@ -177,7 +175,7 @@ pub fn clear_peer_process(sock: RawFd) {
 
 /// A handle of this call's own to the peer process named for `sock`, if one is.
 fn named_peer(sock: RawFd) -> Result<Option<Process>> {
-    PEER_PROCESSES.lock().unwrap().as_ref().and_then(|m| m.get(&sock)).map(Process::duplicate).transpose()
+    PEER_PROCESSES.lock().unwrap().as_ref().and_then(|m| m.get(&sock)).map(|p| Process::duplicate(p.0)).transpose()
 }
 
 /// Handles duplicated for a frame: into the peer, or, when the peer cannot
@@ -1317,6 +1315,11 @@ mod tests {
         assert!(h.is_null(), "the receiver can be opened, so the test proves nothing");
         // The handle from making the process, as the jailer's.
         set_peer_process(s.as_raw_fd(), child.as_raw_handle()).unwrap();
+        // The caller's handle is still its own (a closed one is fatal under
+        // strict handle checks, and the child is waited on through it).
+        // SAFETY: plain call on the child's handle.
+        let alive = unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(child.as_raw_handle(), 0) };
+        assert_eq!(alive, windows_sys::Win32::Foundation::WAIT_TIMEOUT, "the child's handle was closed by set_peer_process");
 
         let mut file = crate::tempfile::TempFile::new().unwrap().into_file();
         file.write_all(b"handle pulled").unwrap();
