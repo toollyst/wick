@@ -186,21 +186,6 @@ def get_threads(pid):
 _utils.get_threads = get_threads
 
 
-def get_resident_memory(process):
-    """`utils.get_resident_memory`: Linux adds the process's hugetlbfs pages
-    (HugetlbPages in /proc/<pid>/status), which its RSS leaves out, to its
-    RSS. macOS has no /proc and no hugetlbfs: the resident pages of the
-    process's regions, as `memory_maps` reads them. Not psutil's RSS: that
-    counts the dyld shared cache's pages too (21.3 MiB of a booted 256 MiB
-    microVM's 147.8 MiB, measured), which every macOS process maps and
-    upstream's static Firecracker on Linux has none of; test_deflate_on_oom
-    sizes its balloon by this reading."""
-    return sum(m.rss for m in memory_maps(process, grouped=False)) // 1024
-
-
-_utils.get_resident_memory = get_resident_memory
-
-
 def _online_cpus():
     """The CPUs the session may run on (Linux: its affinity mask and the
     online CPUs). macOS has neither CPU sets nor CPU affinity: every thread
@@ -412,11 +397,48 @@ if not hasattr(resource, "prlimit"):
 
 
 def get_resident_memory(process):
-    """`framework.utils.get_resident_memory` (KiB) on macOS.
+    """`framework.utils.get_resident_memory` (KiB) on macOS: what the balloon
+    tests read through `get_stable_rss_mem` (test_balloon.py, the performance
+    balloon and memory hot-plug tests, test_snapshot_restore_cross_kernel).
 
-    Linux: the process's RSS plus its hugetlb pages (/proc/<pid>/status,
-    which hugetlb pages are not counted in). macOS has no hugetlb: a huge
-    page mapping is host pages (docs/PORTING.md row 10), all in the RSS."""
+    Linux (tests/framework/utils.py): `psutil.Process.memory_info().rss`,
+    which is VmRSS from /proc/<pid>/statm (RssAnon + RssFile + RssShmem:
+    every page present in the process's page tables, anonymous or file-backed
+    or shared, the static binary's own text among them, and the guest pages
+    KVM faulted in with get_user_pages; not pages swapped out, not the pages
+    of a mapped file the process has not touched), plus `HugetlbPages:` of
+    /proc/<pid>/status, which VmRSS leaves out.
+
+    macOS: the task's resident_size, which is what psutil's RSS reads: the
+    pages present in the process's page tables, the pages a vCPU wrote
+    through Hypervisor.framework among them (measured on a 256 MiB guest:
+    62,112 KiB idle, 217,664 after the guest wrote 150 MiB, as its regions'
+    resident pages went 36,880 to 192,272). Hugetlb: none on macOS, a huge
+    page mapping is host pages (docs/PORTING.md row 10), present like the
+    rest. Its one difference from Linux's is a fixed offset: the pages of
+    the dyld shared cache the process touched, 19 MiB here (RSS 62,112 KiB
+    against 43,136 of resident pages in the other regions), the system
+    libraries where upstream's static Firecracker on Linux carries 1.6 MiB of
+    its own text.
+
+    Not the resident pages of the regions `memory_maps` reads (c8d26ac):
+    pages_resident is the mapped object's residency, not the page tables',
+    so a mapped file counts whole once it is in the buffer cache: after a
+    restore from a snapshot file the 256 MiB guest reads 267,792 KiB whether
+    the guest has touched a page or not, and test_balloon_snapshot's reading
+    cannot rise when the guest dirties 60 MiB (measured: `assert 267792 >
+    267792`), where Linux's rises with every page faulted in. Not
+    phys_footprint (56,592 KiB idle): it leaves out the clean file-backed
+    pages VmRSS counts (4,400 KiB: the binary's text, the kernel image) and
+    counts what VmRSS does not (compressed pages, the kernel's page-table
+    and IOKit ledgers). Measured side by side, idle / after the guest wrote
+    150 MiB / after a full snapshot: RSS 62,112 / 217,664 / 461,936 KiB; the
+    regions' resident pages without the shared cache 43,136 / 198,528 /
+    268,688; phys_footprint 56,592 / 212,208 / 456,193. (After the full
+    snapshot every guest page is present: the snapshot read the pages the
+    guest never touched, and macOS gives real zero pages where Linux reads
+    its shared zero page uncharged, as docs/PORTING.md row 15 notes for
+    Windows.)"""
     return process.memory_info().rss // 1024
 
 
