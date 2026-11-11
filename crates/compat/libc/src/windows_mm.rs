@@ -285,7 +285,12 @@ enum Kind {
     /// Windows changes no large page's protection (`VirtualProtect` to any
     /// other fails with `ERROR_INVALID_ADDRESS`, from and to every
     /// protection; measured on Windows 11 26H2).
-    Large { page: usize, fresh: bool, wprot: u32 },
+    ///
+    /// `brokered`: the pages are a pagefile-backed large-page section the
+    /// jailer made ([`broker_section`]), mapped as a view (`section`), or,
+    /// `PROT_NONE`, an address range reserved for one (`section` none: a
+    /// large-page view takes no `PAGE_NOACCESS`).
+    Large { page: usize, fresh: bool, wprot: u32, brokered: bool, section: Option<Arc<Owned>> },
 }
 
 /// Sorted, disjoint (offset, len) ranges.
@@ -543,6 +548,13 @@ fn release(t: &mut Table, base: usize) -> bool {
     // SAFETY: frees our allocation, view or placeholder.
     let ok = unsafe {
         match r.kind {
+            Kind::Large { section: Some(_), .. } => UnmapViewOfFile2(
+                proc(),
+                MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: base as *mut c_void,
+                },
+                0,
+            ),
             Kind::Placeholder | Kind::Private { .. } | Kind::Large { .. } => {
                 VirtualFree(base as *mut c_void, 0, MEM_RELEASE)
             }
@@ -1181,7 +1193,11 @@ fn map_large(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int) -> Resul
     // it the allocation below fails.
     let _ = lock_memory_privilege();
     // With the protection asked for: it cannot be changed afterwards.
-    let p = alloc_large(std::ptr::null(), len, wprot);
+    let p = if force_broker() { std::ptr::null_mut() } else { alloc_large(std::ptr::null(), len, wprot) };
+    if p.is_null() && broker().is_some() {
+        // A jailed Firecracker: its large pages are the jailer's sections.
+        return map_large_brokered(len, prot, wprot, page);
+    }
     if p.is_null() {
         // SAFETY: plain call.
         let err = unsafe { GetLastError() };
@@ -1204,7 +1220,7 @@ fn map_large(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int) -> Resul
         return Err(crate::ENOMEM);
     }
     let fresh = prot & PROT_WRITE == 0;
-    table().lock().unwrap().insert(p as usize, Region::new(len, Kind::Large { page, fresh, wprot }));
+    table().lock().unwrap().insert(p as usize, Region::new(len, Kind::Large { page, fresh, wprot, brokered: false, section: None }));
     Ok(p)
 }
 
@@ -1240,7 +1256,7 @@ fn fixed_large(start: usize, len: usize, prot: c_int, page: usize) -> Result<*mu
     let mut t = table().lock().unwrap();
     let (b, fresh, old) = match overlapping(&t, start, end)[..] {
         [b] => match t[&b].kind {
-            Kind::Large { page: p, fresh, wprot: old } if p == page && b <= start && b + t[&b].len >= end => {
+            Kind::Large { page: p, fresh, wprot: old, .. } if p == page && b <= start && b + t[&b].len >= end => {
                 (b, fresh, old)
             }
             _ => return Err(crate::ENOMEM),
@@ -1257,14 +1273,174 @@ fn fixed_large(start: usize, len: usize, prot: c_int, page: usize) -> Result<*mu
     if !whole {
         return Err(crate::ENOMEM);
     }
-    // SAFETY: releases our allocation; the table entry goes with it.
-    unsafe { VirtualFree(b as *mut c_void, 0, MEM_RELEASE) };
-    t.remove(&b);
+    let brokered = matches!(t[&b].kind, Kind::Large { brokered: true, .. });
+    // Releases the mapping, a view or an allocation; the table entry goes
+    // with it (`release`).
+    release(&mut t, b);
+    if brokered {
+        // A new section (zero pages, as a new mapping is), or, PROT_NONE, a
+        // reservation for one.
+        let p = if wprot == PAGE_NOACCESS {
+            // SAFETY: reserves the range just released.
+            let p = unsafe { VirtualAlloc2(proc(), b as *const c_void, len, MEM_RESERVE, PAGE_NOACCESS, std::ptr::null_mut(), 0) };
+            if p as usize != b {
+                return Err(crate::ENOMEM);
+            }
+            t.insert(b, Region::new(len, Kind::Large { page, fresh: true, wprot, brokered: true, section: None }));
+            p
+        } else {
+            let s = broker_section(len).map_err(broker_refused)?;
+            let p = map_section_view(&s, b, len, wprot);
+            if p as usize != b {
+                return Err(crate::ENOMEM);
+            }
+            t.insert(
+                b,
+                Region::new(len, Kind::Large { page, fresh: prot & PROT_WRITE == 0, wprot, brokered: true, section: Some(Arc::new(s)) }),
+            );
+            p
+        };
+        return Ok(p);
+    }
     let p = alloc_large(b as *const c_void, len, wprot);
     if p.is_null() {
         return Err(crate::ENOMEM);
     }
-    t.insert(b, Region::new(len, Kind::Large { page, fresh: prot & PROT_WRITE == 0, wprot }));
+    t.insert(b, Region::new(len, Kind::Large { page, fresh: prot & PROT_WRITE == 0, wprot, brokered: false, section: None }));
+    Ok(p)
+}
+
+/// The jailer's large pages, for a jailed Firecracker, whose token cannot
+/// have "Lock pages in memory" enabled (below medium integrity no privilege
+/// can be; measured). The jailer, which holds the privilege, makes a
+/// pagefile-backed large-page section of the size asked for
+/// (`SEC_COMMIT | SEC_LARGE_PAGES`) and duplicates it into this process,
+/// which maps it with `MEM_LARGE_PAGES`: a process without the privilege,
+/// at the jail's integrity level, gets large pages so (measured). The
+/// channel is two pipes the jailer gives Firecracker (`WICK_LARGE_PAGES`,
+/// `<request handle>,<reply handle>`): a request is the size (u64), a reply
+/// the section's handle in this process (u64, 0 when refused) and the
+/// Windows error (u32). As on Linux, where huge pages come from a pool the
+/// administrator reserved and the hugetlb controller (not `memory.max`)
+/// limits them, the jailer refuses past the jail's `hugetlb.2MB.max`.
+struct Broker {
+    request: HANDLE,
+    reply: HANDLE,
+}
+
+// SAFETY: pipe handles may be used from any thread; behind a lock.
+unsafe impl Send for Broker {}
+
+fn broker() -> Option<&'static Mutex<Broker>> {
+    static BROKER: OnceLock<Option<Mutex<Broker>>> = OnceLock::new();
+    BROKER
+        .get_or_init(|| {
+            let v = std::env::var("WICK_LARGE_PAGES").ok()?;
+            let (a, b) = v.split_once(',')?;
+            Some(Mutex::new(Broker {
+                request: a.trim().parse::<usize>().ok()? as HANDLE,
+                reply: b.trim().parse::<usize>().ok()? as HANDLE,
+            }))
+        })
+        .as_ref()
+}
+
+/// Tests take the broker's path in a process that could map large pages
+/// itself.
+#[cfg(test)]
+static FORCE_BROKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn force_broker() -> bool {
+    #[cfg(test)]
+    return FORCE_BROKER.load(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    false
+}
+
+/// A large-page section of `len` bytes from the jailer, or the Windows
+/// error it refused with.
+fn broker_section(len: usize) -> Result<Owned, u32> {
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+    let Some(b) = broker() else {
+        return Err(0);
+    };
+    let b = b.lock().unwrap();
+    let request = (len as u64).to_le_bytes();
+    let mut done = 0u32;
+    // SAFETY: writes our buffer to the jailer's pipe.
+    if unsafe { WriteFile(b.request, request.as_ptr(), 8, &mut done, std::ptr::null_mut()) } == 0 || done != 8 {
+        // SAFETY: plain call.
+        return Err(unsafe { GetLastError() });
+    }
+    let mut reply = [0u8; 12];
+    let mut got = 0usize;
+    while got < reply.len() {
+        let mut n = 0u32;
+        // SAFETY: reads into the rest of our buffer.
+        let ok = unsafe {
+            ReadFile(b.reply, reply[got..].as_mut_ptr(), (reply.len() - got) as u32, &mut n, std::ptr::null_mut())
+        };
+        if ok == 0 || n == 0 {
+            // SAFETY: plain call.
+            return Err(unsafe { GetLastError() });
+        }
+        got += n as usize;
+    }
+    let handle = u64::from_le_bytes(reply[..8].try_into().unwrap());
+    let err = u32::from_le_bytes(reply[8..].try_into().unwrap());
+    if handle == 0 {
+        return Err(err);
+    }
+    Ok(Owned(handle as usize as HANDLE))
+}
+
+fn broker_refused(err: u32) -> c_int {
+    std::eprintln!(
+        "wick: large pages: the jailer refused a large-page section (error {err}): the jail's \
+         hugetlb.2MB.max is reached, or the host has no contiguous memory for it"
+    );
+    crate::ENOMEM
+}
+
+/// A view of a large-page section at `at` (0: anywhere), or null.
+fn map_section_view(section: &Owned, at: usize, len: usize, wprot: u32) -> *mut c_void {
+    // SAFETY: maps our section's view into free address space.
+    unsafe {
+        MapViewOfFile3(section.0, proc(), at as *const c_void, 0, len, MEM_LARGE_PAGES, wprot, std::ptr::null_mut(), 0)
+    }
+    .Value
+}
+
+/// `mmap` with `MAP_HUGETLB` from the jailer's sections ([`Broker`]).
+fn map_large_brokered(len: usize, prot: c_int, wprot: u32, page: usize) -> Result<*mut c_void, c_int> {
+    let (p, section) = if wprot == PAGE_NOACCESS {
+        // A large-page view takes no PAGE_NOACCESS: the range is reserved,
+        // aligned to the large page, for the view a MAP_FIXED maps over it.
+        // SAFETY: reserves free address space, released again below.
+        let over = unsafe { VirtualAlloc2(proc(), std::ptr::null(), len + page, MEM_RESERVE, PAGE_NOACCESS, std::ptr::null_mut(), 0) };
+        if over.is_null() {
+            return Err(crate::ENOMEM);
+        }
+        let at = (over as usize).div_ceil(page) * page;
+        // SAFETY: releases what was just reserved, then reserves its aligned part.
+        let p = unsafe {
+            VirtualFree(over, 0, MEM_RELEASE);
+            VirtualAlloc2(proc(), at as *const c_void, len, MEM_RESERVE, PAGE_NOACCESS, std::ptr::null_mut(), 0)
+        };
+        if p as usize != at {
+            return Err(crate::ENOMEM);
+        }
+        (p, None)
+    } else {
+        let s = broker_section(len).map_err(broker_refused)?;
+        let p = map_section_view(&s, 0, len, wprot);
+        if p.is_null() {
+            return Err(crate::ENOMEM);
+        }
+        (p, Some(Arc::new(s)))
+    };
+    let fresh = prot & PROT_WRITE == 0;
+    table().lock().unwrap().insert(p as usize, Region::new(len, Kind::Large { page, fresh, wprot, brokered: true, section }));
     Ok(p)
 }
 
@@ -1890,7 +2066,7 @@ mod tests {
             return;
         }
         let exe = std::env::current_exe().unwrap();
-        let mut child = std::process::Command::new(exe)
+        let child = std::process::Command::new(exe)
             .args(["--exact", "windows_mm::tests::lazy_child", "--ignored", "--nocapture"])
             .env("WICK_LAZY_CHILD", "1")
             .stdout(std::process::Stdio::piped())
@@ -1922,6 +2098,129 @@ mod tests {
         assert!(!text.contains("wrote 256 MiB"), "the job's limit did not hold: {text}");
         assert!(text.contains("the memory limit"), "{text}");
         assert_eq!(out.status.code(), Some(OOM_EXIT as i32), "{text}");
+    }
+
+    /// A process that maps large pages through the jailer's broker (a
+    /// jailed Firecracker, made to take that path here): this test is the
+    /// jailer, answering each request with a large-page section duplicated
+    /// into the child; the child maps guest memory as Firecracker does
+    /// (`PROT_NONE`, then `MAP_FIXED` read-write over it) and finds large
+    /// pages there. Needs "Lock pages in memory" (for the sections).
+    #[test]
+    fn test_hugetlb_through_the_broker() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+        use windows_sys::Win32::System::Pipes::CreatePipe;
+        if std::env::var_os("WICK_BROKER_CHILD").is_some() {
+            return;
+        }
+        if !lock_memory_privilege() || large_page(MAP_HUGE_2MB).is_none() {
+            std::eprintln!("test_hugetlb_through_the_broker: this account lacks SeLockMemoryPrivilege; not run");
+            return;
+        }
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        let pipe = || {
+            let (mut r, mut w): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+            // SAFETY: out-parameters.
+            assert_ne!(unsafe { CreatePipe(&mut r, &mut w, &sa, 0) }, 0);
+            (r, w)
+        };
+        let ((req_r, req_w), (rep_r, rep_w)) = (pipe(), pipe());
+        // Ours stay ours.
+        // SAFETY: our handles.
+        unsafe {
+            SetHandleInformation(req_r, HANDLE_FLAG_INHERIT, 0);
+            SetHandleInformation(rep_w, HANDLE_FLAG_INHERIT, 0);
+        }
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(exe)
+            .args(["--exact", "windows_mm::tests::broker_child", "--ignored", "--nocapture"])
+            .env("WICK_BROKER_CHILD", "1")
+            .env("WICK_LARGE_PAGES", std::format!("{},{}", req_w as usize, rep_r as usize))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // SAFETY: the child's ends, its own now.
+        unsafe {
+            CloseHandle(req_w);
+            CloseHandle(rep_r);
+        }
+        let child_h = child.as_raw_handle() as usize;
+        let (req_r, rep_w) = (req_r as usize, rep_w as usize);
+        let jailer = std::thread::spawn(move || {
+            let mut served = 0;
+            loop {
+                let mut len = [0u8; 8];
+                let mut n = 0u32;
+                // SAFETY: reads into our buffer.
+                if unsafe { ReadFile(req_r as HANDLE, len.as_mut_ptr(), 8, &mut n, std::ptr::null_mut()) } == 0 || n != 8 {
+                    break;
+                }
+                let len = u64::from_le_bytes(len);
+                // SAFETY: a pagefile-backed large-page section.
+                let s = unsafe {
+                    CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | 0x0800_0000 | 0x8000_0000, (len >> 32) as u32, len as u32, std::ptr::null())
+                };
+                let mut out: HANDLE = std::ptr::null_mut();
+                // SAFETY: duplicates our section into the child, closing ours.
+                let ok = !s.is_null()
+                    && unsafe { DuplicateHandle(GetCurrentProcess(), s, child_h as HANDLE, &mut out, 0, 0, DUPLICATE_SAME_ACCESS | 1) } != 0;
+                let mut reply = [0u8; 12];
+                if ok {
+                    reply[..8].copy_from_slice(&(out as usize as u64).to_le_bytes());
+                    served += 1;
+                } else {
+                    // SAFETY: plain call.
+                    reply[8..].copy_from_slice(&unsafe { GetLastError() }.to_le_bytes());
+                }
+                // SAFETY: writes our buffer.
+                unsafe { WriteFile(rep_w as HANDLE, reply.as_ptr(), 12, &mut n, std::ptr::null_mut()) };
+            }
+            served
+        });
+        let out = child.wait_with_output().unwrap();
+        let served = jailer.join().unwrap();
+        let text = std::format!("{}{}", std::string::String::from_utf8_lossy(&out.stdout), std::string::String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("brokered large pages: ok"), "{text}");
+        assert_eq!(served, 1, "sections served: one, for the read-write mapping: {text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_hugetlb_through_the_broker, with the broker's pipes"]
+    fn broker_child() {
+        FORCE_BROKER.store(true, std::sync::atomic::Ordering::SeqCst);
+        let huge = ANON | MAP_NORESERVE | MAP_HUGE_2MB | MAP_HUGETLB;
+        let len = 4 << 20;
+        // Firecracker's guest memory: a PROT_NONE reservation, then MAP_FIXED over it.
+        let base = map(0, len, PROT_NONE, huge, -1, 0);
+        assert!(base.is_multiple_of(2 << 20), "not aligned to the large page: {base:#x}");
+        let q = map(base, len, PROT_READ | PROT_WRITE, huge | MAP_FIXED, -1, 0);
+        assert_eq!(q, base);
+        // SAFETY: our mapping, read-write.
+        unsafe {
+            *(base as *mut u8) = 1;
+            *((base + len - 1) as *mut u8) = 2;
+            assert_eq!(*((base + len - 1) as *const u8), 2);
+        }
+        // SAFETY: an all-zero entry with an address is a valid query.
+        let mut e: PSAPI_WORKING_SET_EX_INFORMATION = unsafe { std::mem::zeroed() };
+        e.VirtualAddress = base as *mut c_void;
+        // SAFETY: one entry of the size passed.
+        assert_ne!(unsafe { QueryWorkingSetEx(proc(), (&raw mut e).cast(), std::mem::size_of_val(&e) as u32) }, 0);
+        // SAFETY: reads the flags of the union.
+        let flags = unsafe { e.VirtualAttributes.Flags };
+        assert_ne!(flags & (1 << 23), 0, "not a large page (flags {flags:#x})");
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { munmap(base as *mut c_void, len) }, 0);
+        std::println!("brokered large pages: ok");
     }
 
     #[test]

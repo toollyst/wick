@@ -15,6 +15,7 @@
 //! | `cpu.weight`, `cpu.weight.nice` | `cpu.shares` | weight-based CPU rate control: the Windows weight (1 to 9) whose share is nearest ([`cpu_weight`]) |
 //! | `cpuset.cpus` | `cpuset.cpus` | the job's processor affinity ([`cpu_groups`]) |
 //! | `cpuset.mems` | `cpuset.mems` | every memory node of the host: nothing to bind ([`check_mems`]) |
+//! | `hugetlb.2MB.max` | `hugetlb.2MB.limit_in_bytes` | the large-page sections the jailer gives Firecracker, in all (`platform::large_pages`) |
 //! | `pids.max`, `hugetlb.<size>.max` = `max` | `pids.max` = `max`, `hugetlb.<size>.limit_in_bytes` = `-1` | no limit, as on Linux |
 //!
 //! The CPU rate cap holds from Firecracker's start, as a cgroup's limit
@@ -156,6 +157,16 @@ impl CgroupConfigurationBuilder {
                 }
             }
             (_, "pids.max") if value == "max" => {}
+            // The host's large page is 2 MiB: its limit is the large-page
+            // broker's (`large_pages`); other sizes have no pages here.
+            (2, "hugetlb.2MB.max") | (1, "hugetlb.2MB.limit_in_bytes") => {
+                let unlimited = if self.version == 2 { value == "max" } else { value == "-1" };
+                self.limits.large_page_bytes = if unlimited {
+                    None
+                } else {
+                    Some(value.parse().map_err(|_| bad("not a number of bytes"))?)
+                };
+            }
             (2, f) if f.starts_with("hugetlb.") && f.ends_with(".max") && value == "max" => {}
             (1, f) if f.starts_with("hugetlb.") && f.ends_with(".limit_in_bytes") && value == "-1" => {}
             (version, f) => {
@@ -232,8 +243,8 @@ fn impossible(version: u8, file: &str) -> Option<&'static str> {
              priorities rather than weights or latency targets"
         }
         (_, "hugetlb") => {
-            "Windows charges large pages to the job's memory limit (memory.max) and has no limit \
-             of their own; only no limit (max, -1) is accepted"
+            "the host's large pages are 2 MiB: only hugetlb.2MB.max (v1: hugetlb.2MB.limit_in_bytes) \
+             limits them; pages of another size have no limit to set (only max, -1)"
         }
         (2, "rdma") => "Windows has no limit on a job's RDMA resources",
         (2, "misc") => "Windows has no counterpart for the misc controller's resources",
@@ -545,9 +556,10 @@ mod tests {
     }
 
     #[test]
-    fn test_hugetlb_has_no_limit_of_its_own() {
-        assert!(reason(2, "hugetlb.2MB.max=1073741824").contains("large pages"));
-        assert!(reason(1, "hugetlb.2MB.limit_in_bytes=1073741824").contains("large pages"));
+    fn test_hugetlb_2mb_limits_the_large_page_broker() {
+        assert_eq!(limits(2, &["hugetlb.2MB.max=1073741824"]).unwrap().large_page_bytes, Some(1 << 30));
+        assert_eq!(limits(1, &["hugetlb.2MB.limit_in_bytes=1073741824"]).unwrap().large_page_bytes, Some(1 << 30));
+        assert!(reason(2, "hugetlb.1GB.max=1073741824").contains("2 MiB"));
         assert_eq!(limits(2, &["hugetlb.2MB.max=max"]).unwrap(), Limits::default());
         assert_eq!(limits(1, &["hugetlb.2MB.limit_in_bytes=-1"]).unwrap(), Limits::default());
     }

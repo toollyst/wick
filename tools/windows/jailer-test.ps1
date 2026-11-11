@@ -170,7 +170,7 @@ function Stage-Refuse {
     $v2 = [ordered]@{
         'pids'          = 'pids.max=100'
         'io'            = 'io.weight=default 200'
-        'hugetlb'       = 'hugetlb.2MB.max=1073741824'
+        'hugetlb'       = 'hugetlb.1GB.max=1073741824'
         'rdma'          = 'rdma.max=mlx4_0'  # upstream's parser takes one '=' only
         'misc'          = 'misc.max=sev 1'
         'cgroup.freeze' = 'cgroup.freeze=1'
@@ -1075,14 +1075,15 @@ function Stage-Boot {
     } finally { Stop-Jailed }
 }
 
-# docs/PORTING.md row 10: a jailed Firecracker maps no guest memory on large
-# pages, and says why: a token below medium integrity cannot have a privilege
-# enabled ("Lock pages in memory" among them), so the jail's token keeps no
-# privilege but traversal whether or not the operator's account holds it,
-# a jailed process cannot open its token to adjust it, large pages in the
-# jail are refused, and a jailed guest asking for 2 MiB pages fails to
-# start with the cause named (the broker that would bring them is row 10's
-# open work).
+# docs/PORTING.md row 10: a jailed guest's memory on large pages. A token
+# below medium integrity cannot have a privilege enabled ("Lock pages in
+# memory" among them), so the jail's token keeps no privilege but
+# traversal, a jailed process cannot open its token to adjust it, and it
+# cannot map large pages itself. The jailer, which holds the privilege,
+# makes the sections (its large-page broker): a jailed guest on 2 MiB pages
+# boots and uses them, and the jail's hugetlb.2MB.max bounds what the jailer
+# gives, as the hugetlb controller bounds huge pages on Linux. Without the
+# privilege, a jailed guest on 2 MiB pages is refused with the cause named.
 function Stage-Hugepages {
     $base = New-Base 'hugepages'
     $held = $null -ne (whoami /priv | Select-String 'SeLockMemoryPrivilege')
@@ -1092,16 +1093,40 @@ function Stage-Hugepages {
     $own = Invoke-JailedProbe $base 't' '2' @() 'tokenopen:0'
     Check ($own -match '^denied ') "a jailed process opened its own token to adjust it: $own"
     $large = Invoke-JailedProbe $base 'l' '2' @() 'largepage:64'
-    Check ($large -match '^denied ') "64 MiB of large pages in a jail: $large"
+    Check ($large -match '^denied ') "64 MiB of large pages by a jailed process itself: $large"
+    if (-not $held) {
+        $vm = Start-JailedVm $base 'vm' @() 256 -hugePages '2M'
+        try {
+            Check ($vm.P.WaitForExit(30000)) 'the jailer did not exit after Firecracker refused large pages'
+            Check ($vm.P.ExitCode -ne 0) "jailer exit $($vm.P.ExitCode) for a jailed guest on large pages"
+            $text = $vm.Text()
+            Check ($text -match 'below medium') "the refusal does not name the integrity level: $(($text -split "`n" | Select-Object -Last 5) -join ' | ')"
+        } finally { Stop-Jailed }
+        return "the jail keeps only traversal, cannot open its token or map large pages; this account lacks 'Lock pages in memory', so the jailer has none to give and a jailed guest on 2 MiB pages is refused naming the cause"
+    }
+    # The jailer's sections: the guest boots on them and uses them.
     $vm = Start-JailedVm $base 'vm' @() 256 -hugePages '2M'
     try {
-        Check ($vm.P.WaitForExit(30000)) 'the jailer did not exit after Firecracker refused large pages'
-        Check ($vm.P.ExitCode -ne 0) "jailer exit $($vm.P.ExitCode) for a jailed guest on large pages"
-        $text = $vm.Text()
-        Check ($text -match 'below medium') "the refusal does not name the integrity level: $(($text -split "`n" | Select-Object -Last 5) -join ' | ')"
+        Check ($vm.WaitFor('Run /bin/sh', 30)) "a jailed guest on 2 MiB pages did not boot: $(($vm.Text() -split "`n" | Select-Object -Last 4) -join ' | ')"
+        Wait-Shell $vm
+        $mem = [int]$vm.Sh("awk '/MemTotal/ {print `$2}' /proc/meminfo", 10)
+        Check ($mem -gt 200000 -and $mem -le 262144) "MemTotal $mem kB for 256 MiB"
+        $out = $vm.Sh('mount -t tmpfs -o size=200m tmpfs /run && head -c 160m /dev/urandom > /run/f && md5sum /run/f > /run/a && md5sum /run/f | cmp - /run/a && echo same', 120)
+        Check ($out -eq 'same') "160 MiB in guest memory read back differently: '$out'"
+        $vm.Send('reboot -ff')
+        Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
+        Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
     } finally { Stop-Jailed }
-    $note = if ($held) { ' (the operator holds it)' } else { ' (the operator does not hold it either)' }
-    "the jail keeps only traversal, not 'Lock pages in memory'$note, cannot open its token, maps no large pages, and a jailed guest on 2 MiB pages is refused naming the integrity level"
+    # hugetlb.2MB.max below the guest's memory: the jailer gives no more, and
+    # Firecracker fails to start naming the limit.
+    $vm = Start-JailedVm $base 'cap' @('--cgroup-version', '2', '--cgroup', 'hugetlb.2MB.max=134217728') 256 -hugePages '2M'
+    try {
+        Check ($vm.P.WaitForExit(30000)) 'the jailer did not exit when hugetlb.2MB.max was below the guest memory'
+        Check ($vm.P.ExitCode -ne 0) "jailer exit $($vm.P.ExitCode) for a guest past hugetlb.2MB.max"
+        $text = $vm.Text()
+        Check ($text -match 'hugetlb\.2MB\.max') "the refusal does not name hugetlb.2MB.max: $(($text -split "`n" | Select-Object -Last 4) -join ' | ')"
+    } finally { Stop-Jailed }
+    "the jail keeps only traversal and cannot map large pages itself; the jailer's sections give a jailed 256 MiB guest its 2 MiB pages (160 MiB written and read back), and hugetlb.2MB.max of 128 MiB refuses it naming the limit"
 }
 
 # A guest booted under the jailer with --netns: its network endpoint is made

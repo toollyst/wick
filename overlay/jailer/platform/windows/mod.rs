@@ -131,6 +131,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 mod console;
+mod large_pages;
 mod netns;
 
 /// `SE_GROUP_INTEGRITY` (winnt.h).
@@ -317,6 +318,9 @@ pub(crate) struct Limits {
     pub cpu_weight: Option<u32>,
     /// The processors the job runs on: an affinity mask per processor group.
     pub cpus: Option<Vec<(u16, u64)>>,
+    /// Large pages the jailer gives Firecracker in all, in bytes
+    /// (`hugetlb.2MB.max`): the large-page broker refuses past it.
+    pub large_page_bytes: Option<u64>,
 }
 
 static LIMITS: Mutex<Limits> = Mutex::new(Limits {
@@ -324,6 +328,7 @@ static LIMITS: Mutex<Limits> = Mutex::new(Limits {
     cpu_rate: None,
     cpu_weight: None,
     cpus: None,
+    large_page_bytes: None,
 });
 
 pub(crate) fn set_limits(limits: Limits) {
@@ -1728,6 +1733,16 @@ fn exec(
     }
     // SAFETY: the handle just made, or null.
     let api_h = (!api_h.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(api_h) });
+    // Large pages for guest memory: a jailed process cannot have "Lock pages
+    // in memory" enabled, so the jailer, which holds it, makes the sections
+    // (`large_pages`); without the privilege nothing is offered and
+    // Firecracker refuses large pages naming the cause.
+    let broker = large_pages::Broker::new(limits.large_page_bytes)
+        .map_err(|e| HostError::Spawn("the large-page broker", e))?;
+    if let Some(b) = &broker {
+        fc_vars.push(format!("{}={}", large_pages::ENV, b.child_value()));
+        fc_handles.extend(b.child_handles());
+    }
     let fc = match spawn_jailed(&exe, &cmd, &fc_vars, std_handles, &fc_handles, &drive_root, &tokens, &job) {
         Ok(fc) => fc,
         Err(err) => {
@@ -1772,6 +1787,7 @@ fn exec(
     let process = fc.process;
     drop(fc.thread);
     drop(api_process);
+    let _broker = broker.map(|b| b.serve(process.as_raw_handle()));
     // --new-pid-ns: Firecracker runs and its pid is in the pid file; the
     // jailer that handed over to this keeper exits 0 (`new_pid_ns`).
     if let Some(event) = KEEPER_EVENT.lock().unwrap().take() {
