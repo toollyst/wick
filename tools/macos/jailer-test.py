@@ -333,7 +333,12 @@ def stage_limits(ctx):
     check(cpu_limit(vm.proc.pid) == (1, 250 - API_CPU, 1), f"v2 CPU limit {cpu_limit(vm.proc.pid)}")
     check(cpu_limit(api) == (1, API_CPU, 1), f"v2: the API process's CPU limit {cpu_limit(api)}")
     vm.kill()
-    # Without the API, Firecracker has the whole limit.
+    return (f"jetsam 300 MiB = {300 - API_MIB} + {API_MIB} (API process) (v1), 200 = {200 - API_MIB} + {API_MIB} "
+            f"(v2), priority {prio} kept; CPU 75% = {75 - API_CPU} + {API_CPU} (v1), 250% (v2)")
+
+
+def stage_no_api(ctx):
+    """VM: without the API there is no API process, and Firecracker has the jail's whole memory limit."""
     jail = Jail(ctx, "limits3", [ctx.kernel, ctx.rootfs])
     vm = JailedVm(ctx, "limits3", jail, ["--cgroup", "memory.limit_in_bytes=314572800"],
                   fc_args=["--no-api"], config=jail_config(), wait_api=False)
@@ -341,9 +346,7 @@ def stage_limits(ctx):
     check(bt.children(vm.proc.pid) == [], f"--no-api: child processes {bt.children(vm.proc.pid)}")
     check(jetsam(vm.proc.pid)[1] == 300, f"--no-api: jetsam limit {jetsam(vm.proc.pid)[1]} MiB")
     vm.kill()
-    return (f"jetsam 300 MiB = {300 - API_MIB} + {API_MIB} (API process) (v1), 200 = {200 - API_MIB} + {API_MIB} "
-            f"(v2), priority {prio} kept; CPU 75% = {75 - API_CPU} + {API_CPU} (v1), 250% (v2); "
-            f"--no-api: all 300 MiB, no API process")
+    return "--no-api: all 300 MiB, no API process"
 
 
 def stage_boot(ctx):
@@ -433,11 +436,12 @@ STAGES = {
     "jail": stage_jail,
     "daemonize": stage_daemonize,
     "limits": stage_limits,
+    "no-api": stage_no_api,
     "boot": stage_boot,
     "memory": stage_memory,
     "cpu": stage_cpu,
 }
-VM_STAGES = ("boot", "memory", "cpu")
+VM_STAGES = ("no-api", "boot", "memory", "cpu")
 
 
 class Context:
