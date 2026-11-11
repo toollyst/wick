@@ -199,6 +199,7 @@ pub(crate) fn supported(c: u64) -> i32 {
         | KVM_CAP_EXT_CPUID
         | KVM_CAP_TSC_CONTROL
         | KVM_CAP_GET_TSC_KHZ
+        | KVM_CAP_TSC_DEADLINE_TIMER
         | KVM_CAP_IMMEDIATE_EXIT => 1,
         KVM_CAP_NR_VCPUS | KVM_CAP_MAX_VCPUS | KVM_CAP_MAX_VCPU_ID => {
             i32::try_from(super::vm::MAX_VCPUS).unwrap_or(i32::MAX)

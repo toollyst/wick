@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Wed, 11 Nov 2026 15:42:47 +0900
+Subject: [PATCH] jailer: --new-pid-ns on Windows hands over to a keeper
+
+Upstream clones Firecracker into a new PID namespace, writes its pid to the pid file and exits 0. Windows has no fork: before the jail is built the jailer calls platform::new_pid_ns, which relaunches it as a keeper and returns as upstream's jailer does once Firecracker runs; where upstream clones, the keeper writes the pid file and runs Firecracker as without the flag. macOS still refuses the flag (platform::new_pid_ns fails first). The comment on --daemonize, which said platform::daemonize refuses, is corrected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/jailer/src/env.rs | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/src/jailer/src/env.rs b/src/jailer/src/env.rs
+index 127df72acf5741f850081ac9de865f75b4a9d280..026620e98fe13213383e2d8dff8849f3be86a27d 100644
+--- a/src/jailer/src/env.rs
++++ b/src/jailer/src/env.rs
+@@ -365,10 +365,14 @@ impl Env {
+         Ok(())
+     }
+ 
+-    // wick: outside Linux, PID namespaces are platform::new_pid_ns (overlay/jailer/platform).
++    // wick: outside Linux, PID namespaces are platform::new_pid_ns (overlay/jailer/platform):
++    // macOS refuses; on Windows the jailer has handed over to a keeper (env::run), which runs
++    // Firecracker as without the flag.
+     #[cfg(not(target_os = "linux"))]
+-    fn exec_into_new_pid_ns(&mut self, _chroot_exec_file: PathBuf) -> Result<(), JailerError> {
+-        crate::platform::new_pid_ns()
++    fn exec_into_new_pid_ns(&mut self, chroot_exec_file: PathBuf) -> Result<(), JailerError> {
++        crate::platform::new_pid_ns()?;
++        self.save_exec_file_pid(id().try_into().unwrap(), chroot_exec_file.clone())?;
++        Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
+     }
+ 
+     #[cfg(target_os = "linux")]
+@@ -750,12 +754,17 @@ impl Env {
+             conf.setup()?;
+         }
+ 
+-        // wick: Windows has no fork; the jailer stays while Firecracker runs
+-        // (platform::daemonize refuses).
++        // wick: Windows has no fork: for --daemonize, then for --new-pid-ns,
++        // the jailer relaunches itself and returns as upstream's does, and the
++        // relaunched jailer builds the jail and runs Firecracker (platform).
+         #[cfg(windows)]
+         if self.daemonize {
+             crate::platform::daemonize()?;
+         }
++        #[cfg(windows)]
++        if self.new_pid_ns {
++            crate::platform::new_pid_ns()?;
++        }
+ 
+         // If daemonization was requested, open /dev/null before chrooting.
+         #[cfg(not(windows))]

@@ -17,7 +17,7 @@ records the userfaultfd crate's windows-sys dependency.
  5 files changed, 16 insertions(+), 2 deletions(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 3a14850c5a6147d595359122c3554d1576201e39..fcbd9288282b5ffd059ea3639cca5ab87994906f 100644
+index d72659e18b0538ab747badb5d2d01b9d1e276602..c7884f8af20bce18ef4e08e7d00047a05aad0ae8 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -1789,6 +1789,7 @@ dependencies = [

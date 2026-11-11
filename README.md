@@ -15,8 +15,9 @@
 > [!IMPORTANT]
 > **macOS works end to end; Windows is a preview.** On Apple silicon, wick boots upstream's own CI guests and passes
 > scenario tests for SMP, block, vsock, networking, snapshots, userfaultfd, PCI and vhost-user. The Windows build is
-> complete but has not yet booted a guest on real hardware. On macOS, upstream's jailer runs with macOS backends
-> (chroot, uid/gid, the memory cgroup); on Windows it is not available yet. Read [SECURITY.md](SECURITY.md) before
+> complete but has not yet booted a guest on real hardware. Upstream's jailer runs on both with native backends
+> (on Windows: the jail as a drive and a restricted token, the Job Object, the mitigation profile); its parts that
+> need no guest are tested in CI, the rest on a WHP PC. Read [SECURITY.md](SECURITY.md) before
 > running untrusted multi-tenant workloads on either.
 
 ```sh
@@ -161,8 +162,9 @@ The short version; the [full roadmap](docs/ROADMAP.md) has the status of every r
 - [x] macOS: devices, snapshots, userfaultfd, PCI, vhost-user, Seatbelt sandbox, checked end to end
 - [x] Windows: WHP backend and the POSIX layer, native CI
 - [ ] Windows: first boot on real hardware, then snapshots and PCI
-- [ ] Security parity: the upstream `jailer` CLI with native backends (macOS: chroot, uid/gid, memory limit in
-  place; CPU limits and Windows next)
+- [ ] Security parity: the upstream `jailer` CLI with native backends (macOS: chroot, uid/gid, memory and CPU
+  limits; Windows: the jail drive and token, Job Object limits, the mitigation profile, `--daemonize`; network
+  confinement next)
 - [ ] Images everywhere: x86_64 images on Apple silicon (FEX-Emu with hardware TSO), arm64 images on Windows
 - [ ] Desktop devices: user-mode networking, virtio-fs
 - [ ] Distribution: release binaries, Homebrew, automatic rebase attempts on new upstream tags
@@ -194,10 +196,11 @@ Linux behaves differently on macOS, that is a bug; please report it.
 
 That is the goal, and it is not negotiable: every control Firecracker has on Linux gets a native equivalent.
 Hardware virtualization and the minimal device model are the same on every host, and the VMM process is already
-confined by Seatbelt on macOS and by process mitigation policies on Windows. On macOS, upstream's jailer runs with
-native backends for chroot, uid/gid and the memory cgroup; CPU limits there and the Windows jailer are in
-progress. [SECURITY.md](SECURITY.md) lists each control, per host, with what is
-done and what is not.
+confined by Seatbelt on macOS and by a process mitigation profile on Windows. Upstream's jailer runs on both with
+native backends — on Windows the jail as a drive and a restricted token, the Job Object for memory and CPU, the
+mitigation profile, `--daemonize` and `--netns` (a directory of endpoints as the jail's network, and no IP for the
+jail through the Windows Filtering Platform). [SECURITY.md](SECURITY.md) lists each control,
+per host, with what is done and what is not.
 
 </details>
 

@@ -13,6 +13,7 @@
 //!
 //! See `docs/ARCHITECTURE.md`.
 
+pub mod api_process;
 pub mod jail;
 pub mod sandbox;
 

@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Wed, 11 Nov 2026 13:13:24 +0900
+Subject: [PATCH] seccomp: narrow the host sandbox where the VMM thread gets
+ its filter
+
+Why: on Linux the VMM thread builds the microVM unfiltered and gets its
+narrow seccomp filter right before the event loop. A host sandbox that
+stays as wide as building the microVM needs would let a running microVM's
+VMM make calls Linux's filter denies.
+
+What: right after upstream installs the VMM thread's filter (with and
+without the API server), vmm::ext::sandbox::narrow() ends the host
+sandbox's setup phase for good. On Linux it does nothing; seccomp already
+did it.
+
+Test: `cargo test -p vmm --lib ext::sandbox` (test_narrow_ends_the_setup_phase,
+test_narrowing_is_one_way); every `tools/macos/boot-test.sh` stage, debug
+and release; tools/macos/sandbox-discovery.sh finds no call outside the
+run phase's lists.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/src/api_server_adapter.rs | 4 ++++
+ src/firecracker/src/main.rs               | 4 ++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/src/firecracker/src/api_server_adapter.rs b/src/firecracker/src/api_server_adapter.rs
+index 70abff48ce870067f0431108618be9914854fabf..02c59cbdec2c7f197f9d95ce19f49b97a621f4a5 100644
+--- a/src/firecracker/src/api_server_adapter.rs
++++ b/src/firecracker/src/api_server_adapter.rs
+@@ -256,6 +256,10 @@ pub(crate) fn run_with_api(
+                 .ok_or(ApiServerError::MissingSeccompFilter)?,
+         )
+         .map_err(ApiServerError::SeccompFilter)?;
++        // wick: where Linux installs the VMM thread's filter, the host sandbox
++        // narrows to what a running microVM needs (vmm::ext::sandbox::narrow).
++        vmm::ext::sandbox::narrow()
++            .map_err(|err| ApiServerError::SeccompFilter(vmm::seccomp::InstallationError::Sandbox(err)))?;
+ 
+         firecracker_metrics
+             .lock()
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index e6e9f0bdd8477030559cd09647b16c64af9d5a83..d94e0686fc674d9193b8ab4047c4be3db622964c 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -687,6 +687,10 @@ fn run_without_api(
+             .ok_or(RunWithoutApiError::MissingSeccompFilter)?,
+     )
+     .map_err(RunWithoutApiError::SeccompFilter)?;
++    // wick: where Linux installs the VMM thread's filter, the host sandbox
++    // narrows to what a running microVM needs (vmm::ext::sandbox::narrow).
++    vmm::ext::sandbox::narrow()
++        .map_err(|err| RunWithoutApiError::SeccompFilter(vmm::seccomp::InstallationError::Sandbox(err)))?;
+ 
+     // Start the metrics.
+     firecracker_metrics

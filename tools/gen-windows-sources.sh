@@ -99,6 +99,8 @@ gen() {
 
 check=0
 [[ "${1:-}" == "--check" ]] && check=1
+tmp=""
+trap '[[ -n "$tmp" ]] && rm -rf "$tmp"' EXIT
 for entry in "${CRATES[@]}"; do
     read -r name dir match <<<"$entry"
     src="$(upstream_src "$name" "$dir" "$match")"

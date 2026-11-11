@@ -154,6 +154,9 @@ pub(crate) struct VmInner {
     /// SPIs raised while the vCPU they are routed to did not exist: made
     /// pending when it does (see [`VmInner::raise_spi`]).
     deferred_spis: Mutex<Vec<u32>>,
+    /// SPIs restored active while the vCPU they are routed to did not exist:
+    /// made active when it does (see [`VmInner::activate_spi`]).
+    deferred_active: Mutex<Vec<u32>>,
     /// Register values of a freshly created Hypervisor.framework vCPU, read
     /// once from a scratch vCPU (see `VcpuFd::get_one_reg`).
     pub(crate) reset_regs: OnceLock<std::result::Result<HashMap<u64, Vec<u8>>, i32>>,
@@ -376,6 +379,51 @@ impl VmInner {
         self.deferred_spis.lock().unwrap().retain(|&i| i != intid);
     }
 
+    /// Makes SPI `intid` active with `activate` (`GICD_ISACTIVER`), as KVM
+    /// keeps it.
+    ///
+    /// Hypervisor.framework dereferences the vCPU an SPI's `GICD_IROUTER`
+    /// names when the SPI is made active, and crashes the process (a NULL
+    /// object) if that vCPU does not exist yet: a snapshot taken while the
+    /// guest handled an SPI restores it active before the vCPUs first run.
+    /// Such an SPI is recorded instead and made active when its vCPU is
+    /// created ([`Self::vcpu_created`]).
+    pub(crate) fn activate_spi(&self, intid: u32, activate: impl FnOnce() -> hv_return_t) -> hv_return_t {
+        if self.uncreated.load(Ordering::Acquire) == 0 {
+            return activate();
+        }
+        // Under the pending list's lock, as vcpu_created applies both.
+        let _deferred = self.deferred_spis.lock().unwrap();
+        if self.spi_target_exists(intid) {
+            return activate();
+        }
+        let mut active = self.deferred_active.lock().unwrap();
+        if !active.contains(&intid) {
+            active.push(intid);
+        }
+        HV_SUCCESS
+    }
+
+    /// Clears SPI `intid` if it waits for its vCPU to be made active
+    /// (`GICD_ICACTIVER`).
+    pub(crate) fn clear_deferred_active(&self, intid: u32) {
+        self.deferred_active.lock().unwrap().retain(|&i| i != intid);
+    }
+
+    /// The SPIs of the 32 starting at `first` that wait for their vCPU to be
+    /// made pending (`active` false) or active, as a register's bits: KVM
+    /// reports them in `GICD_ISPENDR` and `GICD_ISACTIVER`.
+    pub(crate) fn deferred_bits(&self, first: u32, active: bool) -> u32 {
+        let list = if active {
+            self.deferred_active.lock().unwrap()
+        } else {
+            self.deferred_spis.lock().unwrap()
+        };
+        list.iter()
+            .filter(|&&i| (first..first + 32).contains(&i))
+            .fold(0, |bits, &i| bits | 1 << (i - first))
+    }
+
     /// A vCPU's Hypervisor.framework vCPU now exists, with the SPI routes that
     /// name it written again: makes pending the SPIs that waited for it.
     pub(crate) fn vcpu_created(&self) {
@@ -388,6 +436,16 @@ impl VmInner {
             // SAFETY: plain call; GICD_ISPENDR<n> is write-1-to-set.
             super::interrupting(|| unsafe {
                 hv_gic_set_distributor_reg(0x200 + 4 * (intid / 32), 1 << (intid % 32))
+            });
+            false
+        });
+        self.deferred_active.lock().unwrap().retain(|&intid| {
+            if !self.spi_target_exists(intid) {
+                return true;
+            }
+            // SAFETY: plain call; GICD_ISACTIVER<n> is write-1-to-set.
+            super::interrupting(|| unsafe {
+                hv_gic_set_distributor_reg(0x300 + 4 * (intid / 32), 1 << (intid % 32))
             });
             false
         });
@@ -564,6 +622,7 @@ impl VmFd {
             vtimer_gen: AtomicU64::new(0),
             uncreated: AtomicUsize::new(0),
             deferred_spis: Mutex::new(Vec::new()),
+            deferred_active: Mutex::new(Vec::new()),
             reset_regs: OnceLock::new(),
             gic_cpu_reset: OnceLock::new(),
         });
@@ -985,6 +1044,13 @@ mod tests {
         v & (1 << (intid % 32)) != 0
     }
 
+    fn spi_active(intid: u32) -> bool {
+        let mut v = 0;
+        // SAFETY: plain call with a valid output.
+        check(unsafe { hv_gic_get_distributor_reg(0x300 + 4 * (intid / 32), &mut v) }).unwrap();
+        v & (1 << (intid % 32)) != 0
+    }
+
     /// A VM with a GIC and one vCPU that has not run yet.
     fn vm_with_gic() -> (VmFd, DeviceFd, VcpuFd) {
         let vm = Kvm::new().unwrap().create_vm().unwrap();
@@ -1066,6 +1132,130 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn test_spi_active_restored_before_its_vcpu_exists() {
+        // A snapshot taken while the guest handled an SPI restores it active
+        // before the vCPUs first run (the order of a real restore: the SPI's
+        // GICD_IROUTER, then GICD_ISACTIVER). Hypervisor.framework crashes
+        // the process if an SPI routed to a vCPU it has not created is made
+        // active: the state waits for the vCPU, and reads report it as KVM
+        // keeps it.
+        let (vm, gic, mut vcpu) = vm_with_gic();
+        let attr = |offset: u64, value: &u32| kvm_device_attr {
+            group: KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
+            attr: offset,
+            addr: std::ptr::from_ref(value) as u64,
+            flags: 0,
+        };
+        let write = |offset: u64, value: u32| gic.set_device_attr(&attr(offset, &value)).unwrap();
+        let read = |offset: u64| {
+            let mut value = 0u32;
+            let mut a = attr(offset, &value);
+            a.addr = std::ptr::from_mut(&mut value) as u64;
+            // SAFETY: `value` outlives the call and is the 4 bytes it fills.
+            unsafe { gic.get_device_attr(&mut a).unwrap() };
+            value
+        };
+        let (isactiver1, icactiver1) = (0x304u64, 0x384u64);
+        write(0x6104, 0); // GICD_IROUTER32, upper half: vCPU 0.
+        write(isactiver1, 1 << (32 - 32) | 1 << (33 - 32));
+        write(icactiver1, 1 << (33 - 32));
+        assert_eq!(*vm.inner.deferred_active.lock().unwrap(), [32]);
+        assert_eq!(read(isactiver1), 1);
+        assert_eq!(read(icactiver1), 1);
+        assert!(!spi_active(32));
+
+        // The vCPU's first run creates it: the SPI becomes active.
+        std::thread::spawn(move || {
+            vcpu.set_kvm_immediate_exit(1);
+            assert_eq!(vcpu.run().unwrap_err().errno(), libc::EINTR);
+            assert!(vm.inner.deferred_active.lock().unwrap().is_empty());
+            assert!(spi_active(32) && !spi_active(33));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn test_signals_interrupt_run_as_on_kvm() {
+        // A signal to a vCPU thread inside run() (Firecracker kicks vCPUs
+        // with one) makes KVM_RUN return EINTR if the kick set
+        // immediate_exit, and otherwise the vCPU just runs on: never an
+        // internal error. The guest spins (`b .`).
+        extern "C" fn nothing(_: libc::c_int) {}
+        // SAFETY: a handler that does nothing.
+        unsafe { libc::signal(libc::SIGUSR2, nothing as libc::sighandler_t) };
+        let vm = Kvm::new().unwrap().create_vm().unwrap();
+        let page = host_page_size() as usize;
+        // SAFETY: an anonymous mapping of one page, kept for the test.
+        let mem = unsafe {
+            libc::mmap(std::ptr::null_mut(), page, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+        };
+        assert_ne!(mem, libc::MAP_FAILED);
+        // SAFETY: the page just mapped; `b .` is 0x14000000.
+        unsafe { *mem.cast::<u32>() = 0x1400_0000 };
+        let region = kvm_userspace_memory_region {
+            slot: 0,
+            guest_phys_addr: 0x8000_0000,
+            memory_size: page as u64,
+            userspace_addr: mem as u64,
+            flags: 0,
+        };
+        // SAFETY: the page stays mapped for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        let mut kvi = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        vcpu.vcpu_init(&kvi).unwrap();
+        const PC: u64 = 0x6030_0000_0010_0040;
+        const PSTATE: u64 = 0x6030_0000_0010_0042;
+        vcpu.set_one_reg(PC, &0x8000_0000u64.to_le_bytes()).unwrap();
+        vcpu.set_one_reg(PSTATE, &0x3c5u64.to_le_bytes()).unwrap();
+        // The handle Firecracker kicks with (Vcpu::copy_kvm_vcpu_fd).
+        // SAFETY: dup of the vCPU's descriptor, owned by the new handle.
+        let mut kicker = unsafe {
+            vm.create_vcpu_from_rawfd(libc::dup(std::os::unix::io::AsRawFd::as_raw_fd(&vcpu))).unwrap()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let kicks = 300;
+        let runner = std::thread::spawn(move || {
+            // SAFETY: plain call.
+            tx.send(unsafe { libc::pthread_self() } as usize).unwrap();
+            let mut results = Vec::new();
+            for _ in 0..kicks {
+                match vcpu.run() {
+                    Err(e) if e.errno() == libc::EINTR => results.push("EINTR".to_owned()),
+                    Ok(exit) => results.push(format!("{exit:?}")),
+                    Err(e) => results.push(format!("error {e}")),
+                }
+                vcpu.set_kvm_immediate_exit(0);
+            }
+            results
+        });
+        let thread = rx.recv().unwrap() as libc::pthread_t;
+        // Half the kicks set immediate_exit (as Firecracker's do), the others
+        // are bare signals; both while the guest runs.
+        for i in 0..kicks * 4 {
+            std::thread::sleep(Duration::from_micros(500));
+            if i % 2 == 0 {
+                kicker.set_kvm_immediate_exit(1);
+            }
+            // SAFETY: a live thread of this process.
+            unsafe { libc::pthread_kill(thread, libc::SIGUSR2) };
+            if runner.is_finished() {
+                break;
+            }
+        }
+        while !runner.is_finished() {
+            kicker.set_kvm_immediate_exit(1);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let results = runner.join().unwrap();
+        let odd: Vec<_> = results.iter().filter(|r| *r != "EINTR").collect();
+        assert!(odd.is_empty(), "{} of {} runs: {:?}", odd.len(), results.len(), &odd[..odd.len().min(5)]);
     }
 
     #[test]

@@ -56,6 +56,7 @@ done
 case "$stage" in all|boot|smp|block|vsock) ;; *) echo "unknown stage: $stage" >&2; exit 2 ;; esac
 case "$seccomp" in yes|no|auto) ;; *) echo "--seccomp is yes, no or auto" >&2; exit 2 ;; esac
 
+source "$(dirname "${BASH_SOURCE[0]}")/../common.sh"
 step() { echo "  - $*"; }
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -82,6 +83,10 @@ done
 
 mkdir -p "$workdir"
 workdir="$(cd "$workdir" && pwd)"
+# Old runs and stray processes go first, and the run needs room for the guest
+# images and its own copies.
+export WICK_LINUX_BOOT_TEST_WORKDIR="$workdir"
+prepare_test_run "$workdir" 3
 results="$workdir/results-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$results"
 summary="$results/summary.txt"
@@ -174,10 +179,12 @@ wait_for() {
     done
 }
 
-FAILED=0
+FAILED=0 PASSED=0
 check() { # check NAME OK(0/1) DETAIL
     local mark=PASS
+    PASSED=$((PASSED + 1))
     if [[ "$2" != 1 ]]; then
+        PASSED=$((PASSED - 1))
         mark=FAIL
         FAILED=$((FAILED + 1))
     fi
@@ -382,6 +389,8 @@ EOF
 fi
 
 # --- report ------------------------------------------------------------------
+# The last line is what tools/clean.sh reads.
+echo "$PASSED passed, $FAILED failed" >>"$summary"
 echo "logs: $results"
 if ((FAILED > 0)); then
     echo "$FAILED check(s) failed"

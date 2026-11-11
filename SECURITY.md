@@ -70,11 +70,12 @@ The same as upstream Firecracker's
 | --- | --- | --- | --- |
 | Hardware virtualization, one kernel per VM | KVM | Hypervisor.framework | Windows Hypervisor Platform |
 | Minimal device model | upstream | upstream's device code; host-side backends are wick's | upstream's device code; host-side backends are wick's |
-| System call filter | per-thread seccomp-BPF (upstream) | **in place:** a Seatbelt profile, process-wide: an allow-list of 118 system calls, 25 Mach traps and 20 kernel MIG routines (any other one raises SIGSYS and Firecracker exits with upstream's bad-syscall code, as on a seccomp trap), no program execution, no fork, no IP networking, no Mach service lookups, no IOKit, no sysctl writes | **in place:** a process mitigation policy that blocks child-process creation; the full mitigation profile is planned |
-| Jailer: chroot | upstream | **in place:** upstream's jailer; `chroot(2)`, entered by Firecracker right after the exec, and a Seatbelt file rule limited to the jail | **in place:** upstream's jailer; the jail as a drive letter of its own with the current directory its root, a protected directory ACL open to the jail's SID |
-| Jailer: network namespace | upstream | Seatbelt denies IP networking; `--netns` is refused | planned: Windows Filtering Platform (WHP refuses an AppContainer); `--netns` is refused |
-| Jailer: uid/gid | upstream | **in place:** dropped right after the chroot, checked that root cannot be regained | **in place:** a restricted, low-integrity token without the user's SID and with a random SID per jail: no access to the user's files, another jail, or other processes (measured) |
-| Jailer: cgroups (memory, CPU) | upstream | memory **in place** (jetsam limit, killed at the limit as by the OOM killer); CPU **in place** (`cpu.max` / `cpu.cfs_quota_us` → a kernel CPU limit on the whole VMM, throttled once it used its share of each second); other controllers refused | memory and CPU **in place** through a Job Object (memory limit; CPU rate hard cap from Firecracker's third CPU-second on, so a booting guest can calibrate its timer); other controllers refused |
+| System call filter | per-thread seccomp-BPF (upstream) | **in place:** a Seatbelt profile, process-wide, in upstream's two phases: until the microVM is built (when Linux installs the VMM thread's filter) it allows what building takes; then it narrows for good, as no extension can be issued, taken or released any more, to 87 system calls, 15 Mach traps and 7 kernel MIG routines, each tied to the Linux rule it stands for (any other one raises SIGSYS and Firecracker exits with upstream's bad-syscall code, as on a seccomp trap). Always: no program execution, no fork, no IP networking, no Mach service lookups, no IOKit, no sysctl writes, no file mapped executable, no `MAP_JIT`; after narrowing also no socket binding, no sysctl reads, driver ioctls only for the terminal's settings and a block device's sizes, and no anonymous mapping asking for `PROT_EXEC` (checked in the compatibility libc: macOS has no kernel rule for it, so a raw system call is not checked; `test_executable_mappings_raise_sigsys`). A denied operation of any kind raises SIGSYS, except a file outside what is allowed, which fails with an error as outside a chroot; Seatbelt signals the process, so the denied call returns `EPERM` to its thread until the signal is taken, where Linux never returns from it. Seatbelt cannot deny 91 system calls by number (`write`, `open`, `socket`, `ioctl`, ...); its file, network and IPC rules limit those (`ext::sandbox` unit tests, `test_narrowing_is_one_way`, every `boot-test` stage, `tools/macos/sandbox-discovery.sh`) | **in place:** a process mitigation profile, each mitigation tied to the seccomp rule it stands for, in upstream's two phases: until the microVM is built (where Linux installs the VMM thread's filter) it sets what building takes — no child processes, no win32k, strict handle checks, extension points disabled, Microsoft-signed images only; then it narrows for good, adding no dynamic code and the image-load restrictions (no remote or low-label images, System32 first). A denied operation ends Firecracker with upstream's bad-syscall code where Windows reports it (an executable mapping, a handle the process does not hold), else fails closed (`ext::sandbox` unit tests: `test_win32k_policy`, `test_dynamic_code_policy`, `test_narrow_ends_the_setup_phase`, `test_denied_operation_exits_as_seccomp`, `test_denied_operations_fail_closed`; the run is found with `tools/windows/mitigation-audit.ps1`) |
+| Jailer: chroot | upstream | **in place:** upstream's jailer; `chroot(2)`, entered by Firecracker right after the exec, and a Seatbelt file rule limited to the jail (`jailer-test jail`) | **in place:** upstream's jailer; the jail as a drive letter of its own with the current directory its root, and a protected directory ACL open to the jail's SID (`jailer-test.ps1 isolation`, `drives`) |
+| Jailer: network namespace | upstream | Seatbelt denies IP networking; `--netns` is refused | **in place:** `--netns <dir>` names the jail's network, a directory of endpoints the operator made, where Firecracker makes its network endpoints (the jail's SID granted on it: jails given one directory share a network, a jail given its own reaches no other's), and the jail's copy of Firecracker gets no IP networking at all: Windows Filtering Platform block filters on its application id at every connect, bind, listen and accept layer, IPv4 and IPv6, in a session that ends with the jailer. Needs an elevated jailer (adding a filter is an administrator's right, as `setns` needs root); refused loudly without one. An AppContainer was not usable: WHP refuses to run inside one (`jailer-test.ps1 netns`, `refuse`) |
+| Jailer: uid/gid | upstream | **in place:** dropped right after the chroot, checked that root cannot be regained (`jailer-test jail`, `test_enter_needs_root`) | **in place:** a restricted token below medium integrity, without the user's SID and with a random SID per jail: no access to the user's files, another jail, or other processes, and, since the jail's integrity level is above low, no access from a plain low-integrity process of the same user either (`jailer-test.ps1 isolation`, `low`); no privilege but traversal and, when the operator's account holds it for huge pages, "Lock pages in memory", whose large pages the job's memory limit holds (`test_tokens_keep_only_traversal_and_lock_memory`, `jailer-test.ps1 hugepages`) |
+| Jailer: PID namespace | upstream | `--new-pid-ns` is refused | **in place** in every jail: no process or thread outside the jail opens to Firecracker, a process snapshot shows it none, and it is not on the jailer's console (no console control events or typed input; the jailer relays the console); `--new-pid-ns` returns as upstream's jailer does. Whether a pid is in use still shows (`jailer-test.ps1 pidns`) |
+| Jailer: cgroups (memory, CPU) | upstream | memory **in place** (jetsam limit, killed at the limit as by the OOM killer); CPU **in place** (`cpu.max` / `cpu.cfs_quota_us` → a kernel CPU limit on the whole VMM, throttled once it used its share of each second); other controllers refused (`jailer-test limits`, `jailer-test memory`, `jailer-test cpu`, `test_cpu_limit_holds`) | memory and CPU **in place** through a Job Object (memory limit; CPU rate hard cap from Firecracker's start or a CPU weight); `cpuset.cpus` as the job's affinity; other controllers refused with the reason (`jailer-test.ps1 limits`, `jailer-test.ps1 cpu`, `jailer-test.ps1 cpuset`, `jailer-test.ps1 weight`, `jailer-test.ps1 refuse`) |
 
 The sandbox is installed where upstream installs its seccomp filters and keeps upstream's flags: on by default, off
 with `--no-seccomp`. On macOS a process may lift its own CPU limit and the allow-list is what denies that, so a
@@ -93,24 +94,38 @@ upstream Firecracker and its jailer.
 
 - **Without the jailer, the VMM runs as the user who started it** on macOS and Windows: an escape from the VM and
   then the VMM lands as that user (files are then not limited, as on Linux without the jailer).
-- **macOS jailer: no CPU limits yet, and no namespaces.** `cpu.*` cgroups are refused rather than ignored. macOS
-  has no network or PID namespaces: IP networking is denied by the sandbox, and a jailed VMM uses Unix socket
+- **macOS jailer: no namespaces.** macOS has no network or PID namespaces: IP networking is denied by the sandbox, and a jailed VMM uses Unix socket
   endpoints in the jail (vmnet needs root). Firecracker starts as root and enters the jail before anything else
   runs (dyld cannot start a program inside a chroot), from a root-owned copy of the binary outside the jail.
-- **Windows jailer: no network confinement yet.** IP networking is not
-  blocked (`--netns` is refused; the Windows Filtering Platform backend is planned). A plain low-integrity process
-  of the same user can still reach a jail, as only the user's SID tells it from the operator. A CPU limit starts after
-  Firecracker's first 2 seconds of CPU time (a guest booting under it disabled its timer; roadmap M5). Without the jailer,
-  Windows confinement is a mitigation policy that blocks child processes only.
+- **Windows jailer: IP networking is denied with `--netns` only.** A jail given a network (`--netns <dir>`) gets
+  none of the host's IP networking: the Windows Filtering Platform blocks the jail's binary at every connect, bind,
+  listen and accept layer, in a session that ends with the jailer (`jailer-test.ps1 netns`). A jail without the
+  flag keeps the host's IP, as a Linux jail without it keeps the host's namespace; there seccomp's `socket` domain
+  rule still limits Firecracker to Unix sockets, and the mitigation profile has no counterpart of that rule yet
+  (docs/PORTING.md, row 2). `--netns` needs an elevated jailer, as `setns` needs root. Without the
+  jailer, Windows confinement is the mitigation profile only (no jail directory, token or Job Object).
 - **No per-thread filters outside Linux.** Neither macOS nor Windows filters system calls per thread. Threads of a
-  process share its address space, so the plan applies the union of upstream's filters process-wide and moves the
-  API server, whose separate filter is a real boundary, into a process of its own.
+  process share its address space, so the union of upstream's filters applies process-wide, and the API server,
+  whose separate filter is a real boundary, moves into a process of its own. On macOS that is in place: the API
+  socket's HTTP server and upstream's request parsing run in a process sandboxed as upstream's `api` filter (its
+  system calls only, no files, no shared memory, no executable mappings), and Firecracker's API thread handles the
+  requests it passes on with upstream's code; either process's end ends the other (`test_api_profile_*`,
+  `boot-test api-process`). In a jail the two share the jail's memory and CPU limits, so together they stay within
+  them (`test_limits_are_shared_with_the_api_process`; the jailer-test stage needs root). On Windows the same is
+  in place without a fork: the API process is a second process from Firecracker's binary, made by Firecracker
+  before its sandbox is set, or by the jailer in a jail on the jail's token and in its Job Object, with its end of
+  the link and a handle to Firecracker inherited; it has the whole mitigation profile from its start, before it
+  reads a byte from the socket (`test_api_profile_is_the_whole_profile_at_once`,
+  `test_the_api_process_serves_under_the_api_profile`, `jailer-test.ps1 api`; `boot-test api-process` waits for a
+  WHP machine).
 - **wick's host-side code is young.** The compatibility crates and the macOS and Windows backends (the
   Hypervisor.framework and WHP run loops, the userfaultfd kernel side, the network backends) have not had the years
   of review and fuzzing upstream's code has had, and have not had a third-party audit. Fuzzing has started: the
   virtio-net offload handling every non-Linux network backend uses (`vnet`) and the requests a userfaultfd handler
   process sends on macOS have fuzz targets, which CI runs for a minute each
-  ([CONTRIBUTING.md](CONTRIBUTING.md#fuzzing)). The Hypervisor.framework and WHP run loops have none yet.
+  ([CONTRIBUTING.md](CONTRIBUTING.md#fuzzing)), as does the interrupt controller the WHP run loop hands a
+  guest's port and MMIO accesses to (`whp_irqchip`). The Hypervisor.framework run loop has none yet, nor have the
+  WHP run loop's own steps, which call WHP.
 - **Side channels** between VMs on the same host follow upstream's
   [production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md)
   guidance on Linux; the equivalent guidance for macOS and Windows hosts is not written yet.

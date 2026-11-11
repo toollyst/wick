@@ -21,3 +21,9 @@
 0019-windows-the-serial-input-takes-an-empty-non-blocking.patch
 0020-windows-the-jailer-builds-on-Windows-its-Unix-only-s.patch
 0021-wick-a-diff-snapshot-writes-whole-hole-units.patch
+0022-seccomp-narrow-the-host-sandbox-where-the-VMM-thread.patch
+0023-tests-vmm-s-unit-tests-build-on-Windows.patch
+0024-block-a-Windows-drive-s-serial-is-distinct-per-file.patch
+0025-jailer-new-pid-ns-on-Windows-hands-over-to-a-keeper.patch
+0026-api-the-HTTP-server-in-a-process-of-its-own-where-th.patch
+0027-vmm-the-huge-page-guest-region-test-runs-on-Windows-.patch

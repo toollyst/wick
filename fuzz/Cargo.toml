@@ -44,3 +44,10 @@ path = "fuzz_targets/uffd_protocol.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "whp_irqchip"
+path = "fuzz_targets/whp_irqchip.rs"
+test = false
+doc = false
+bench = false

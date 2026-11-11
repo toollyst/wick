@@ -9,12 +9,14 @@ with the reason, and the exit status is non-zero if any stage failed.
 """
 
 import argparse
+import ctypes
 import hashlib
 import http.client
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -78,6 +80,10 @@ class Vm:
                 json.dump(config, f, indent=1)
             cmd += ["--config-file", path]
         cmd += args
+        # Diagnosis: extra Firecracker arguments for every VM of the run
+        # (WICK_BOOT_TEST_FC_ARGS="--no-seccomp" tells a sandbox problem from
+        # another one).
+        cmd += os.environ.get("WICK_BOOT_TEST_FC_ARGS", "").split()
         self.buf = ""
         self.cond = threading.Condition()
         self.log = open(self.log_path, "w")
@@ -86,6 +92,9 @@ class Vm:
         )
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+        # Registered at once, so a run stopped while it starts (a signal)
+        # still kills it.
+        ctx.vms.append(self)
         self.seq = 0
         if self.api_sock:
             deadline = time.time() + 10
@@ -825,6 +834,65 @@ def stage_devices(ctx):
     return "virtio-rng, rate-limited block, MMDS V2 over the net endpoint, balloon inflate + statistics, logger and metrics files"
 
 
+def children(pid):
+    out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout
+    return [int(p) for p in out.split()]
+
+
+def sandbox_denies(pid, operation):
+    """Whether the sandbox of `pid` denies `operation` (any path, any peer).
+
+    sandbox_check carries out the rule's action: an operation that raises
+    SIGSYS there (the default rule) ends the process checked. Only file
+    operations, denied with an error, are checked this way."""
+    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    lib.sandbox_check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    lib.sandbox_check.restype = ctypes.c_int
+    return lib.sandbox_check(pid, operation.encode(), 0) == 1
+
+
+def stage_api_process(ctx):
+    # On Linux the API thread has a filter of its own, narrower than the VMM
+    # thread's. The macOS sandbox is per process, so the API server's HTTP
+    # side is a process of its own (vmm::ext::api_process), sandboxed as that
+    # filter: no files (sandbox_check; what raises SIGSYS there:
+    # test_api_profile_* in ext::sandbox). Its end ends Firecracker as the API
+    # thread's does on Linux (a panic, panic = "abort"), and Firecracker's end
+    # ends it.
+    vm = ctx.vm("api-process", [], config(ctx))
+    vm.shell()
+    kids = children(vm.proc.pid)
+    check(len(kids) == 1, f"Firecracker's child processes: {kids}")
+    api = kids[0]
+    for op in ("file-read-data", "file-write-data"):
+        check(sandbox_denies(api, op), f"the API process is allowed {op}")
+        check(not sandbox_denies(vm.proc.pid, op), f"control: Firecracker is denied {op}")
+    info = vm.api("GET", "/")
+    check(info.get("state") == "Running", f"instance info through the API process: {info}")
+    vm.api("PUT", "/nothing-here", {}, expect=(400,))
+    os.kill(api, signal.SIGKILL)
+    code = vm.wait_exit(15)
+    check(code == -signal.SIGABRT, f"Firecracker after the API process was killed: exit {code}")
+    check("The API server process ended" in vm.buf, "no panic message for the API process's end")
+
+    vm = ctx.vm("api-process-2", [], config(ctx))
+    vm.shell()
+    kids = children(vm.proc.pid)
+    check(len(kids) == 1, f"Firecracker's child processes: {kids}")
+    vm.proc.kill()
+    vm.wait_exit(15)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            os.kill(kids[0], 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        raise Failure("the API process outlived Firecracker by 10s")
+    return "API process sandboxed (no files), serves the API; each one's end ends the other"
+
+
 def stage_restores(ctx, rounds=20):
     """One snapshot restored many times, each restore paused and snapshotted again.
 
@@ -878,6 +946,7 @@ STAGES = {
     "vhost-user": stage_vhost_user,
     "devices": stage_devices,
     "restores": stage_restores,
+    "api-process": stage_api_process,
 }
 
 
@@ -899,14 +968,38 @@ class Context:
         self.bash_md5 = None
 
     def vm(self, *a, **kw):
-        vm = Vm(self, *a, **kw)
-        self.vms.append(vm)
-        return vm
+        return Vm(self, *a, **kw)
 
     def cleanup(self):
         for vm in self.vms:
             vm.kill()
         self.vms = []
+
+
+def exit_on_signals():
+    """SIGTERM and SIGHUP end the run as an error does, so that its cleanup
+    (killing the VMs, removing temporary directories) still runs."""
+    import signal
+
+    def stop(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stop)
+
+
+def summarize(out, results):
+    """Prints the results and writes them to <out>/summary.txt, whose last
+    line, "N passed, M failed", tools/clean.sh reads. Returns the failures."""
+    lines = [f"{'PASS' if ok else 'FAIL'}  {name}: {detail.splitlines()[0]}" for name, ok, detail in results]
+    failed = sum(not ok for _, ok, _ in results)
+    lines.append(f"{len(results) - failed} passed, {failed} failed")
+    with open(os.path.join(out, "summary.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print()
+    print("\n".join(lines[:-1]))
+    print(f"\n{lines[-1]}; logs in {out}")
+    return failed
 
 
 def fetch(cache, name):
@@ -936,6 +1029,7 @@ def main():
         if s not in STAGES:
             p.error(f"unknown stage {s}")
     os.makedirs(args.out, exist_ok=True)
+    exit_on_signals()
     ctx = Context(args)
     results = []
     try:
@@ -956,17 +1050,13 @@ def main():
     finally:
         ctx.cleanup()
         shutil.rmtree(ctx.sock, ignore_errors=True)
-    print()
-    for name, ok, detail in results:
-        print(f"{'PASS' if ok else 'FAIL'}  {name}: {detail.splitlines()[0]}")
-    failed = sum(not ok for _, ok, _ in results)
+    failed = summarize(args.out, results)
     if not failed:
         # Snapshots and disk images take hundreds of MiB a run; kept only
         # when a stage failed, to look into.
         for name in os.listdir(args.out):
             if name.endswith((".mem", ".state", ".img")):
                 os.unlink(os.path.join(args.out, name))
-    print(f"\n{len(results) - failed} passed, {failed} failed; logs in {args.out}")
     sys.exit(1 if failed else 0)
 
 

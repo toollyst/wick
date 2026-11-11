@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Wed, 11 Nov 2026 16:28:33 +0900
+Subject: [PATCH] api: the HTTP server in a process of its own where the
+ sandbox is per process
+
+macOS sandboxes a process, not a thread, so the part of the API thread that
+faces the socket runs in a process of its own, sandboxed as upstream's api
+filter (vmm::ext::api_process). The API thread handles the requests it
+passes on with upstream's handle_request, so responses, logs and metrics are
+upstream's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/src/api_server/mod.rs     | 50 +++++++++++++++++++++++
+ src/firecracker/src/api_server_adapter.rs | 36 ++++++++++++++++
+ src/firecracker/src/main.rs               |  3 ++
+ 3 files changed, 89 insertions(+)
+
+diff --git a/src/firecracker/src/api_server/mod.rs b/src/firecracker/src/api_server/mod.rs
+index ecc11186dae76537b3b001d087d3a60c77bf5d45..54a52a7e587115a33b04c553dcdc5a8695a9ffb5 100644
+--- a/src/firecracker/src/api_server/mod.rs
++++ b/src/firecracker/src/api_server/mod.rs
+@@ -37,6 +37,12 @@ pub struct ApiServer {
+     to_vmm_fd: EventFd,
+ }
+ 
++/// wick: upstream's parsing of a request alone, which the API server's process runs on
++/// each request before it hands it to the API thread (vmm::ext::api_process).
++pub fn validate_request(request: &Request) {
++    let _ = ParsedRequest::try_from(request);
++}
++
+ impl ApiServer {
+     /// Constructor for `ApiServer`.
+     ///
+@@ -61,6 +67,8 @@ impl ApiServer {
+     /// * `start_time_us` - the timestamp for when the process was started in us.
+     /// * `start_time_cpu_us` - the timestamp for when the process was started in CPU us.
+     /// * `seccomp_filter` - the seccomp filter to apply.
++    // wick: not used where the HTTP server runs in a process of its own (`run_split`).
++    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+     pub fn run(
+         &mut self,
+         mut server: HttpServer,
+@@ -118,6 +126,48 @@ impl ApiServer {
+         }
+     }
+ 
++    /// wick: runs the API thread where the HTTP server is in a process of its own
++    /// (vmm::ext::api_process): as [`Self::run`], with each request read from and each
++    /// response written to that process.
++    #[cfg(any(target_os = "macos", windows))]
++    pub fn run_split(
++        &mut self,
++        mut link: vmm::ext::api_process::ApiLink<std::os::unix::net::UnixStream>,
++        process_time_reporter: ProcessTimeReporter,
++        seccomp_filter: BpfProgramRef,
++    ) {
++        use vmm::ext::api_process::FromApi;
++
++        if let Err(err) = vmm::seccomp::apply_filter(seccomp_filter) {
++            panic!(
++                "Failed to set the requested seccomp filters on the API thread: {}",
++                err
++            );
++        }
++        info_unrestricted!("API server started.");
++        process_time_reporter.report_start_time();
++        process_time_reporter.report_cpu_start_time();
++
++        loop {
++            match link.receive() {
++                Ok(FromApi::Request(request)) => {
++                    let request_processing_start_us = get_time_us(ClockType::Monotonic);
++                    let response = self.handle_request(&request, request_processing_start_us);
++                    link.respond(&response)
++                        .expect("Cannot send the response to the API server process");
++                    let delta_us = get_time_us(ClockType::Monotonic) - request_processing_start_us;
++                    debug!("Total previous API call duration: {} us.", delta_us);
++                }
++                Ok(FromApi::Error(message)) => error_unrestricted!("{}", message),
++                Ok(FromApi::Shutdown) => {
++                    debug!("shutdown request received, API server thread ending.");
++                    return;
++                }
++                Err(err) => panic!("{}", err),
++            }
++        }
++    }
++
+     /// Handles an API request received through the associated socket.
+     pub fn handle_request(
+         &mut self,
+diff --git a/src/firecracker/src/api_server_adapter.rs b/src/firecracker/src/api_server_adapter.rs
+index 02c59cbdec2c7f197f9d95ce19f49b97a621f4a5..034f00765565106b41e36760f40fe4f0cc26d847 100644
+--- a/src/firecracker/src/api_server_adapter.rs
++++ b/src/firecracker/src/api_server_adapter.rs
+@@ -19,6 +19,8 @@ use vmm::{EventManager, FcExitCode, Vmm};
+ use vmm_sys_util::epoll::EventSet;
+ use vmm_sys_util::eventfd::EventFd;
+ 
++// wick: on Windows the API process binds the socket (vmm::ext::api_process).
++#[cfg_attr(windows, allow(unused_imports))]
+ use super::api_server::{ApiServer, HttpServer, ServerError};
+ 
+ #[derive(Debug, thiserror::Error, displaydoc::Display)]
+@@ -37,6 +39,9 @@ pub enum ApiServerError {
+     MissingSeccompFilter,
+     /// Failed to install vmm seccomp filter: {0}
+     SeccompFilter(vmm::seccomp::InstallationError),
++    // wick: see vmm::ext::api_process.
++    /// Failed to start the API server process: {0}
++    ApiProcess(vmm::ext::api_process::ApiProcessError),
+ }
+ 
+ #[derive(Debug)]
+@@ -180,6 +185,10 @@ pub(crate) fn run_with_api(
+         .remove("api")
+         .expect("Missing seccomp filter for API thread.");
+ 
++    // wick: not changed where the HTTP server runs in a process of its own; on
++    // Windows that process binds the socket (vmm::ext::api_process::split).
++    #[cfg(not(windows))]
++    #[cfg_attr(target_os = "macos", allow(unused_mut))]
+     let mut server = match HttpServer::new(&bind_path) {
+         Ok(s) => s,
+         Err(ServerError::IOError(inner)) if inner.kind() == std::io::ErrorKind::AddrInUse => {
+@@ -196,20 +205,47 @@ pub(crate) fn run_with_api(
+         .try_clone()
+         .expect("Failed to clone API kill switch");
+ 
++    // wick: where the HTTP server runs in a process of its own, that process adds it.
++    #[cfg(not(any(target_os = "macos", windows)))]
+     server
+         .add_kill_switch(api_kill_switch_clone)
+         .expect("Cannot add HTTP server kill switch");
+ 
++    // wick: where the host sandbox is per process, the API thread's HTTP side runs in a
++    // process of its own, sandboxed as the API thread is filtered on Linux
++    // (vmm::ext::api_process); the API thread handles its requests.
++    #[cfg(target_os = "macos")]
++    let api_link = vmm::ext::api_process::split(
++        server,
++        api_kill_switch_clone,
++        &bind_path,
++        api_payload_limit,
++    )
++    .map_err(ApiServerError::ApiProcess)?;
++    // wick: the same on Windows, where the API process binds the socket.
++    #[cfg(windows)]
++    let api_link =
++        vmm::ext::api_process::split(api_kill_switch_clone, &bind_path, api_payload_limit)
++            .map_err(ApiServerError::ApiProcess)?;
++
+     // Start the separate API thread.
+     let api_thread = thread::Builder::new()
+         .name("fc_api".to_owned())
+         .spawn(move || {
++            #[cfg(not(any(target_os = "macos", windows)))]
+             ApiServer::new(to_vmm, from_vmm, to_vmm_event_fd).run(
+                 server,
+                 process_time_reporter,
+                 &api_seccomp_filter,
+                 api_payload_limit,
+             );
++            // wick: see above.
++            #[cfg(any(target_os = "macos", windows))]
++            ApiServer::new(to_vmm, from_vmm, to_vmm_event_fd).run_split(
++                api_link,
++                process_time_reporter,
++                &api_seccomp_filter,
++            );
+         })
+         .expect("API thread spawn failed.");
+ 
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index d94e0686fc674d9193b8ab4047c4be3db622964c..905abb41f4cdfc8851630d8dd33c8f75d75f75f2 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -130,6 +130,9 @@ fn main_exec() -> Result<(), MainError> {
+     // wick: where no program can start inside a chroot (macOS), the jailer
+     // hands its jail over and Firecracker enters it first, before any other
+     // thread; without the jailer, and on Linux, this does nothing.
++    // wick: the parsing the API server's process runs (vmm::ext::api_process),
++    // set first: the jail may make that process.
++    vmm::ext::api_process::set_validator(api_server::validate_request);
+     vmm::ext::jail::enter().map_err(MainError::Jail)?;
+ 
+     // Initialize the logger.

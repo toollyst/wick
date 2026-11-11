@@ -192,6 +192,18 @@ fn deliver(num: c_int) {
     }
 }
 
+/// Raises `num` on this thread as a synchronous signal, the way Linux forces
+/// a seccomp trap's `SIGSYS` on the thread that made the call: the handler
+/// runs now, on this thread, whether or not the signal is blocked, with
+/// `si_code` `code`. Returns `false` if no handler is registered (the
+/// caller then takes the default action).
+pub fn raise_synchronous(num: c_int, code: c_int) -> bool {
+    let Some(f) = handler(num) else { return false };
+    let mut info = siginfo_t::new(num, code, std::ptr::null_mut());
+    f(num, &mut info, std::ptr::null_mut());
+    true
+}
+
 /// Where faults come from: the unhandled-exception filter.
 static PREVIOUS_FILTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -572,6 +584,23 @@ mod tests {
         validate_signal_num(0).unwrap_err();
         validate_signal_num(65).unwrap_err();
         register_signal_handler(libc::SIGKILL, count).unwrap_err();
+    }
+
+    #[test]
+    fn test_raise_synchronous() {
+        static CODE: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn record(num: c_int, info: *mut siginfo_t, _: *mut c_void) {
+            assert_eq!(unsafe { (*info).si_signo }, num);
+            CODE.store(unsafe { (*info).si_code } as usize, Ordering::SeqCst);
+        }
+        let num = SIGRTMIN() + 7;
+        assert!(!raise_synchronous(num, 1));
+        register_signal_handler(num, record).unwrap();
+        // Blocked or not, the handler runs before the call returns.
+        block_signal(num).unwrap();
+        assert!(raise_synchronous(num, 7));
+        assert_eq!(CODE.load(Ordering::SeqCst), 7);
+        unblock_signal(num).unwrap();
     }
 
     #[test]

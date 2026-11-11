@@ -86,3 +86,17 @@ cargo_deny_version() {
 # The cargo-cyclonedx version that writes the release SBOM
 # (tools/package-release.sh).
 CARGO_CYCLONEDX_VERSION=0.5.9
+
+# Before a test run: removes what earlier runs left behind (tools/clean.sh:
+# old runs, stray test processes, temporary directories), then fails unless
+# the file system holding $1 has at least $2 GiB free. A full disk otherwise
+# shows up as unrelated failures (vmnet's VMNET_MEM_FAILURE once swap cannot
+# grow, short writes of snapshot files).
+prepare_test_run() {
+    local dir="$1" need_gib="$2" avail_gib mount
+    mkdir -p "$dir"
+    "$WICK_ROOT/tools/clean.sh" --quiet || echo "warning: tools/clean.sh could not remove everything (see above)" >&2
+    avail_gib="$(df -Pk "$dir" | awk 'NR == 2 { print int($4 / 1048576) }')"
+    mount="$(df -Pk "$dir" | awk 'NR == 2 { print $6 }')"
+    ((avail_gib >= need_gib)) || die "only $avail_gib GiB free on $mount; a test run needs $need_gib GiB (tools/clean.sh --all also removes the build output)"
+}

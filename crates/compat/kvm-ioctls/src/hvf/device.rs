@@ -223,7 +223,7 @@ impl DeviceFd {
                 return if write {
                     dist_write(vm, offset, get32())
                 } else {
-                    gic::dist_get(offset).map(put32)
+                    dist_read(vm, offset).map(put32)
                 };
             }
             let vcpu = vcpu_by_affinity(vm, attr.attr >> 32)?;
@@ -307,10 +307,50 @@ impl AsRawFd for DeviceFd {
 /// Writes distributor register `offset`. Pending SPIs restored while the
 /// vCPU they are routed to does not exist yet wait for it, as interrupts
 /// raised then do (see `VmInner::raise_spi`).
+const ISPENDR_SPIS: std::ops::Range<u64> = 0x204..0x280;
+const ICPENDR_SPIS: std::ops::Range<u64> = 0x284..0x300;
+const ISACTIVER_SPIS: std::ops::Range<u64> = 0x304..0x380;
+const ICACTIVER_SPIS: std::ops::Range<u64> = 0x384..0x400;
+
+/// Reads a distributor register, with the SPIs that wait for their vCPU
+/// reported pending or active, as KVM reports them.
+fn dist_read(vm: &VmInner, offset: u64) -> Result<u32> {
+    let v = gic::dist_get(offset)?;
+    let deferred = |base: u64, active: bool| {
+        vm.deferred_bits(u32::try_from(offset - base).unwrap() * 8, active)
+    };
+    Ok(if ISPENDR_SPIS.contains(&offset) {
+        v | deferred(0x200, false)
+    } else if ICPENDR_SPIS.contains(&offset) {
+        v | deferred(0x280, false)
+    } else if ISACTIVER_SPIS.contains(&offset) {
+        v | deferred(0x300, true)
+    } else if ICACTIVER_SPIS.contains(&offset) {
+        v | deferred(0x380, true)
+    } else {
+        v
+    })
+}
+
 fn dist_write(vm: &VmInner, offset: u64, value: u32) -> Result<()> {
-    const ISPENDR_SPIS: std::ops::Range<u64> = 0x204..0x280;
-    const ICPENDR_SPIS: std::ops::Range<u64> = 0x284..0x300;
     let set_bits = || (0..32u32).filter(move |b| value & (1 << b) != 0);
+    if ISACTIVER_SPIS.contains(&offset) {
+        let first = u32::try_from(offset - 0x300).unwrap() * 8;
+        let reg = u32::try_from(offset).unwrap();
+        for bit in set_bits() {
+            // SAFETY: plain call; GICD_ISACTIVER<n> is write-1-to-set.
+            check(vm.activate_spi(first + bit, || {
+                super::interrupting(|| unsafe { hv_gic_set_distributor_reg(reg, 1 << bit) })
+            }))?;
+        }
+        return Ok(());
+    }
+    if ICACTIVER_SPIS.contains(&offset) {
+        let first = u32::try_from(offset - 0x380).unwrap() * 8;
+        for bit in set_bits() {
+            vm.clear_deferred_active(first + bit);
+        }
+    }
     if ISPENDR_SPIS.contains(&offset) {
         let first = u32::try_from(offset - 0x200).unwrap() * 8;
         let reg = u32::try_from(offset).unwrap();

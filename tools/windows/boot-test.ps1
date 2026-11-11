@@ -174,6 +174,7 @@ namespace Wick {
         public bool Exited { get { return p.HasExited; } }
         public int ExitCode { get { return p.ExitCode; } }
 
+        public int Pid { get { return p.Id; } }
         public string ExitReason() {
             string state = p.HasExited ? "exit " + p.ExitCode : "running";
             var lines = Output.Trim().Split('\n');
@@ -459,6 +460,32 @@ namespace Wick {
                 int bodyAt = all.IndexOf("\r\n\r\n", StringComparison.Ordinal);
                 return bodyAt >= 0 ? all.Substring(bodyAt + 4) : "";
             }
+        }
+    }
+
+    // The process mitigation policies of a process (vmm::ext::sandbox's
+    // profile): the flags word of each.
+    public static class Mitigation {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetProcessMitigationPolicy(IntPtr process, int policy, out uint flags, IntPtr len);
+        [DllImport("kernel32.dll")]
+        static extern bool CloseHandle(IntPtr h);
+        public static readonly string[] Names = { "ExtensionPoint", "ImageLoad", "Signature", "StrictHandle", "Win32k", "DynamicCode", "ChildProcess" };
+        static readonly int[] Policies = { 6, 10, 8, 3, 4, 2, 13 };
+        public static Dictionary<string, uint> Of(int pid) {
+            IntPtr h = OpenProcess(0x400, false, pid); // PROCESS_QUERY_INFORMATION
+            if (h == IntPtr.Zero) throw new Failure("cannot open pid " + pid + ": error " + Marshal.GetLastWin32Error());
+            var m = new Dictionary<string, uint>();
+            try {
+                for (int i = 0; i < Names.Length; i++) {
+                    uint flags;
+                    if (!GetProcessMitigationPolicy(h, Policies[i], out flags, (IntPtr)4)) throw new Failure("mitigation " + Names[i] + " of pid " + pid + ": error " + Marshal.GetLastWin32Error());
+                    m[Names[i]] = flags;
+                }
+            } finally { CloseHandle(h); }
+            return m;
         }
     }
 
@@ -1197,6 +1224,10 @@ function Stage-Boot {
     Check ($mem -gt 200000 -and $mem -le 262144) "MemTotal $mem kB for 256 MiB"
     $hv = $vm.Sh('grep -c -w hypervisor /proc/cpuinfo')
     Check ($hv -eq '1') "CPUID hypervisor bit: '$hv'"
+    # The local timer in TSC-deadline mode, as on KVM: the guest does not
+    # calibrate its APIC timer at boot.
+    $deadline = $vm.Sh('grep -c "Clock Event Device: lapic-deadline" /proc/timer_list; true')
+    Check ($deadline -eq '1') "local timer in TSC-deadline mode (/proc/timer_list): '$deadline' of 1 vCPU"
     $clock = $vm.Sh('cat /sys/devices/system/clocksource/clocksource0/current_clocksource')
     $t0 = Get-Uptime $vm
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -1215,6 +1246,8 @@ function Stage-Smp {
     Wait-Shell $vm
     $online = $vm.Sh('cat /sys/devices/system/cpu/online')
     Check ($online -eq '0-1') "online CPUs '$online'"
+    $deadline = $vm.Sh('grep -c "Clock Event Device: lapic-deadline" /proc/timer_list; true')
+    Check ($deadline -eq '2') "local timers in TSC-deadline mode (/proc/timer_list): '$deadline' of 2 vCPUs"
     foreach ($cpu in 0, 1) {
         $out = $vm.Sh("taskset -c $cpu sh -c 'echo `$((cpu=$cpu+100))'")
         Check ($out -eq "$($cpu + 100)") "taskset $cpu`: '$out'"
@@ -1564,6 +1597,50 @@ function Stage-VhostUser {
 # Guest memory on 2 MiB large pages (machine-config huge_pages "2M"). Large
 # pages need the "Lock pages in memory" right (SeLockMemoryPrivilege), as
 # hugetlbfs on Linux needs huge pages reserved by an administrator.
+# Row 4 of docs/PORTING.md: the API thread's own, narrower filter. On
+# Windows the API server's HTTP side is a process of its own
+# (vmm::ext::api_process), made by Firecracker from its own binary before
+# its sandbox is set, with the whole mitigation profile from its start
+# (what raises SIGSYS there: test_api_profile_* in ext::sandbox); it serves
+# the API, its end ends Firecracker as the API thread's does on Linux (a
+# panic, panic = "abort"), and Firecracker's end ends it.
+function Stage-ApiProcess {
+    $all = @{ ExtensionPoint = 1; ImageLoad = 7; Signature = 1; StrictHandle = 3; Win32k = 1; DynamicCode = 1; ChildProcess = 1 }
+    $vm = Start-Vm 'api-process' (Base-Config 1) -Api
+    Wait-Shell $vm
+    $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($vm.Pid)" | Where-Object { $_.Name -eq 'firecracker.exe' })
+    Check ($kids.Count -eq 1) "Firecracker's child processes from its binary: $($kids.Count)"
+    $api = [int]$kids[0].ProcessId
+    $apiM = [Wick.Mitigation]::Of($api)
+    $meM = [Wick.Mitigation]::Of($PID)
+    $missing = @($all.Keys | Where-Object { ($apiM[$_] -band $all[$_]) -ne $all[$_] })
+    Check ($missing.Count -eq 0) "mitigations not in force in the API process: $($missing -join ', ')"
+    $here = @($all.Keys | Where-Object { ($meM[$_] -band $all[$_]) -ne 0 })
+    Check ($here.Count -eq 0) "mitigations in force in this shell (the control is lost): $($here -join ', ')"
+    $info = Invoke-Api $vm 'GET' '/'
+    Check ($info -match '"state":"Running"') "instance information through the API process: $info"
+    $status = 0
+    [void][Wick.Api]::Call($vm.ApiSock, 'PUT', '/nothing-here', '{}', 30000, [ref]$status)
+    Check ($status -eq 400) "an unknown path: $status"
+    Stop-Process -Id $api -Force
+    $until = [DateTime]::UtcNow.AddSeconds(15)
+    while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+    Check $vm.Exited 'Firecracker did not end within 15 s of the API process being killed'
+    Check ($vm.ExitCode -ne 0) "Firecracker exited 0 after the API process was killed"
+    Check ($vm.Output -match 'The API server process ended') "no panic message for the API process's end ($($vm.ExitReason()))"
+
+    $vm = Start-Vm 'api-process-2' (Base-Config 1) -Api
+    Wait-Shell $vm
+    $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($vm.Pid)" | Where-Object { $_.Name -eq 'firecracker.exe' })
+    Check ($kids.Count -eq 1) "Firecracker's child processes from its binary: $($kids.Count)"
+    $api = [int]$kids[0].ProcessId
+    $vm.Kill()
+    $until = [DateTime]::UtcNow.AddSeconds(10)
+    while ((Get-Process -Id $api -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+    Check ($null -eq (Get-Process -Id $api -ErrorAction SilentlyContinue)) 'the API process outlived Firecracker by 10 s'
+    return 'API process under the whole mitigation profile (this shell under none), serves the API; each one''s end ends the other'
+}
+
 function Stage-Hugepages {
     $priv = (whoami /priv | Select-String 'SeLockMemoryPrivilege') -ne $null
     Check $priv ("this account lacks 'Lock pages in memory' (SeLockMemoryPrivilege): an administrator grants it in " +
@@ -1595,6 +1672,7 @@ $Stages = [ordered]@{
     restores = { Stage-Restores }
     'vhost-user' = { Stage-VhostUser }
     hugepages = { Stage-Hugepages }
+    'api-process' = { Stage-ApiProcess }
 }
 
 # --- run ------------------------------------------------------------------------
