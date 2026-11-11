@@ -91,18 +91,22 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx,
-    LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, SE_PRIVILEGE_ENABLED, TOKEN_PRIVILEGES, TokenPrivileges,
+    LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, TOKEN_PRIVILEGES, TokenPrivileges,
     GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, GetTokenInformation,
     LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
     SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS,
     TOKEN_DEFAULT_DACL, TOKEN_GROUPS, TOKEN_OWNER, TOKEN_QUERY,
     TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenImpersonation,
-    TokenIntegrityLevel, TokenOwner, TokenUser, PROTECTED_DACL_SECURITY_INFORMATION, ACL,
+    TokenIntegrityLevel, TokenOwner, TokenUser, PROTECTED_DACL_SECURITY_INFORMATION, ACL, INHERITED_ACE,
     TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TokenElevationType, TokenElevationTypeFull, TokenLinkedToken,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION, DefineDosDeviceW, GetLogicalDrives,
 };
+#[cfg(test)]
+use windows_sys::Win32::Security::{CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE};
+#[cfg(test)]
+use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
@@ -356,7 +360,81 @@ pub fn join_netns(path: &str) -> Result<(), JailerError> {
     Ok(())
 }
 
-/// The DACL of `path` as SDDL (`D:...`).
+/// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE` (winnt.h; in
+/// windows-sys under `SystemServices`, a feature the jailer does not take).
+const ACCESS_ALLOWED_ACE_TYPE: u32 = 0;
+const ACCESS_DENIED_ACE_TYPE: u32 = 1;
+
+/// The entries of the DACL of `path`: ACE type, flags, access mask and the
+/// SID as text. The SID comes from `ConvertSidToStringSidW`, `S-1-...`
+/// always; SDDL writes a well-known account as its alias (CI's Windows
+/// runner is the built-in Administrator, which SDDL writes as `LA`, not
+/// `S-1-5-21-...-500`), so a text comparison on SDDL misses it.
+fn dacl_entries(path: &Path) -> io::Result<Vec<(u8, u8, u32, String)>> {
+    use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation, GetAce, GetAclInformation,
+    };
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut acl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated path and out-pointers.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut acl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
+    }
+    let entries = (|| {
+        if acl.is_null() {
+            // No DACL: everything is allowed; nothing to keep.
+            return Ok(Vec::new());
+        }
+        let mut info = ACL_SIZE_INFORMATION { AceCount: 0, AclBytesInUse: 0, AclBytesFree: 0 };
+        let size = u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>()).unwrap();
+        // SAFETY: the ACL lives in `sd`; a structure of the size passed.
+        if unsafe { GetAclInformation(acl, (&raw mut info).cast(), size, AclSizeInformation) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut entries = Vec::with_capacity(info.AceCount as usize);
+        for i in 0..info.AceCount {
+            let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: an index below the count read above; an out-pointer.
+            if unsafe { GetAce(acl, i, &mut ace) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: GetAce gave an ACE, whose header comes first.
+            let header = unsafe { *ace.cast::<ACE_HEADER>() };
+            let (mask, sid) = if u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE
+                || u32::from(header.AceType) == ACCESS_DENIED_ACE_TYPE
+            {
+                // SAFETY: an allow or deny ACE has the mask and the SID after
+                // the header (ACCESS_DENIED_ACE is laid out as ACCESS_ALLOWED_ACE).
+                let a = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+                (a.Mask, sid_string((&raw const a.SidStart).cast_mut().cast())?)
+            } else {
+                (0, String::new())
+            };
+            entries.push((header.AceType, header.AceFlags, mask, sid));
+        }
+        Ok(entries)
+    })();
+    // SAFETY: allocated by GetNamedSecurityInfoW.
+    unsafe { LocalFree(sd) };
+    entries
+}
+
+/// The DACL of `path` as SDDL (`D:...`), for the tests: see [`dacl_entries`]
+/// for why nothing is compared against it.
+#[cfg(test)]
 fn dacl_sddl(path: &Path) -> io::Result<String> {
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1,
@@ -405,22 +483,22 @@ fn dacl_sddl(path: &Path) -> io::Result<String> {
 /// another jail's network, measured by `jailer-test.ps1 netns` on a WHP
 /// machine) and holds SYSTEM, the administrators, the user and this jail's
 /// SID, inherited by the endpoints made in it, plus the jail SIDs granted
-/// before (another jail sharing the network keeps its own). The directory
-/// is labelled with the jail's integrity level, so that the jailed process
-/// can make its endpoints there: an object without a label is medium, which
-/// a jailed process may not write to.
+/// before (another jail sharing the network keeps its own: the entries are
+/// read as SIDs, not SDDL, so no alias SDDL writes for an account can hide
+/// one, [`dacl_entries`]). The directory is labelled with the jail's
+/// integrity level, so that the jailed process can make its endpoints
+/// there: an object without a label is medium, which a jailed process may
+/// not write to.
 fn grant_to_jail(dir: &Path) -> io::Result<()> {
     let user = user_sid()?;
     let mine = vm_sid();
     let mut dacl = format!(
         "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{mine})"
     );
-    for ace in dacl_sddl(dir)?.split('(').skip(1) {
-        let fields: Vec<&str> = ace.trim_end_matches(')').split(';').collect();
+    for (kind, flags, _, sid) in dacl_entries(dir)? {
         // An allow entry of this directory's own (not inherited), for a jail.
-        if let [kind, flags, _, _, _, sid] = fields[..]
-            && kind == "A"
-            && !flags.contains("ID")
+        if u32::from(kind) == ACCESS_ALLOWED_ACE_TYPE
+            && u32::from(flags) & INHERITED_ACE == 0
             && sid.starts_with("S-1-9-")
             && sid != mine
         {
@@ -1860,10 +1938,24 @@ mod tests {
         grant_to_jail(&dir).unwrap();
         let after = dacl_sddl(&dir).unwrap();
         assert!(after.starts_with("D:P"), "not protected: {after}");
-        for sid in ["SY", "BA", user.as_str(), vm_sid(), other] {
-            assert!(after.contains(&format!("(A;OICI;FA;;;{sid})")), "{sid} missing: {after}");
+        // As SIDs: SDDL writes the built-in Administrator (CI's runner) as
+        // "LA", so `user` is not found in the text.
+        let entries = dacl_entries(&dir).unwrap();
+        let full = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        for sid in ["S-1-5-18", "S-1-5-32-544", user.as_str(), vm_sid(), other] {
+            assert!(
+                entries.iter().any(|(k, f, m, s)| u32::from(*k) == ACCESS_ALLOWED_ACE_TYPE
+                    && u32::from(*f) == full
+                    && *m == FILE_ALL_ACCESS
+                    && s == sid),
+                "{sid} missing: {entries:?} ({after})"
+            );
         }
-        assert!(!after.contains("ID;") && !after.contains(";AU)") && !after.contains(";BU)"), "inherited entries kept: {after}");
+        assert_eq!(entries.len(), 5, "{entries:?} ({after})");
+        assert!(
+            entries.iter().all(|(_, f, _, s)| u32::from(*f) & INHERITED_ACE == 0 && s != "S-1-5-11" && s != "S-1-5-32-545"),
+            "inherited entries kept: {entries:?} ({after})"
+        );
         let label = {
             use windows_sys::Win32::Security::Authorization::{
                 ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
@@ -2080,7 +2172,7 @@ mod tests {
             let kept: Vec<(String, bool)> = privileges(token.as_raw_handle())
                 .unwrap()
                 .into_iter()
-                .map(|(n, p)| (n, p.Attributes & SE_PRIVILEGE_ENABLED != 0))
+                .map(|(n, p)| (n, p.Attributes & windows_sys::Win32::Security::SE_PRIVILEGE_ENABLED != 0))
                 .collect();
             assert_eq!(kept, want, "the jail's token, from {mine:?}");
         }
