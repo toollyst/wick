@@ -302,6 +302,19 @@ def _shims():
     with open(env, "w", newline="\n", encoding="utf-8") as f:
         # A UTF-8 locale, as a Linux host's shell has (grep -P wants one).
         f.write(f'PATH="{_msys(shims)}:$PATH"\nexport LC_ALL=C.UTF-8\n')
+        # /proc/<pid>/status of a Windows process (MSYS's /proc has its own
+        # processes only): hosttools.py's procstatus.
+        f.write(
+            "cat() {\n"
+            '  if [ "$#" -eq 1 ] && [ ! -e "$1" ]; then\n'
+            '    case "$1" in /proc/[0-9]*/status)\n'
+            '      local p="${1#/proc/}"; p="${p%/status}"\n'
+            f'      "{_msys(sys.executable)}" "{_msys(_HOSTTOOLS)}" procstatus "$p"; return $?;;\n'
+            "    esac\n"
+            "  fi\n"
+            '  command cat "$@"\n'
+            "}\n"
+        )
     os.environ["BASH_ENV"] = _msys(env)
 
 
