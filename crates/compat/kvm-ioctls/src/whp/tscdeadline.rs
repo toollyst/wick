@@ -26,14 +26,28 @@
 //! - when it fires, the vCPU is made to leave the guest
 //!   (`WHvCancelRunVirtualProcessor`) and, on its own thread, the deadline
 //!   is cleared and the LVT timer entry's vector requested for it, unless
-//!   the entry is masked, the APIC software-disabled or the timer no longer
-//!   in TSC-deadline mode ([`deadline_interrupt`]), as on the processor.
+//!   the APIC is software-disabled or the timer no longer in TSC-deadline
+//!   mode ([`deadline_interrupt`]).
 //!
-//! WHP's xAPIC keeps the LVT timer's mode field as written or drops the bit
-//! it does not know (a measurement on a WHP machine tells which); either way
-//! the timer is taken to be in TSC-deadline mode when the field says so, or
-//! says one-shot with no initial count (WHP's own timer not running), which
-//! is what a guest that selected TSC-deadline mode shows ([`deadline_mode`]).
+//! WHP's xAPIC refuses the guest's write of the LVT timer entry that
+//! selects TSC-deadline mode (measured on Windows 11 26H2, build
+//! 26300.9711, whose WHP has no `TscDeadlineTmrSupport` at all: the entry
+//! read `0x100ec`, Linux's earlier `lapic_timer_shutdown` write, masked
+//! with the vector, at every `IA32_TSC_DEADLINE` write of a boot, and the
+//! guest never got a local timer interrupt). So the entry's mode and mask
+//! fields are not the guest's: the mode shows one-shot with no initial
+//! count (WHP's own timer not running), and the mask is the last write WHP
+//! accepted, which Linux's is always masked (it unmasks only together with
+//! the mode bit). A guest in TSC-deadline mode is therefore taken at its
+//! `IA32_TSC_DEADLINE` writes, which the processor honours only with the
+//! timer unmasked in that mode and Linux makes only then: a non-zero write
+//! arms the timer whenever the entry is in TSC-deadline mode or in one-shot
+//! mode with no count ([`deadline_mode`]), and the interrupt is raised at
+//! the entry's vector regardless of its mask bit ([`deadline_interrupt`];
+//! `boot-test.ps1 smp`, where a guest's first sleep hung before). A guest
+//! that masks the entry and leaves a deadline armed gets an interrupt the
+//! processor would not raise; Linux disarms (`lapic_timer_shutdown`
+//! masks, and nothing is armed in the shutdown state).
 
 use std::collections::HashMap;
 use std::io;
@@ -61,6 +75,7 @@ const APIC_TMICT: usize = 0x380;
 /// `APIC_SPIV_APIC_ENABLED`.
 const SVR_ENABLED: u32 = 1 << 8;
 /// `APIC_LVT_MASKED`.
+#[cfg(test)]
 const LVT_MASKED: u32 = 1 << 16;
 
 fn reg(page: &[u8], offset: usize) -> u32 {
@@ -88,16 +103,19 @@ pub(crate) fn page_in_deadline_mode(page: &[u8]) -> bool {
 }
 
 /// The interrupt an expired deadline raises, from the APIC register page:
-/// `(APIC ID, vector)`, or `None` when the processor would raise none (the
-/// APIC software-disabled, the LVT timer entry masked, or the timer not in
-/// TSC-deadline mode).
+/// `(APIC ID, vector)`, or `None` when none is raised: the APIC
+/// software-disabled, the timer not in TSC-deadline mode, or the entry's
+/// vector not a valid one (below 16: the guest's write of the vector was
+/// lost too). The entry's mask bit is not the guest's (module
+/// documentation) and is not consulted.
 pub(crate) fn deadline_interrupt(page: &[u8]) -> Option<(u32, u8)> {
     let lvtt = reg(page, APIC_LVTT);
-    if reg(page, APIC_SVR) & SVR_ENABLED == 0 || lvtt & LVT_MASKED != 0 || !page_in_deadline_mode(page) {
+    #[allow(clippy::cast_possible_truncation)]
+    let vector = lvtt as u8;
+    if reg(page, APIC_SVR) & SVR_ENABLED == 0 || !page_in_deadline_mode(page) || vector < 16 {
         return None;
     }
-    #[allow(clippy::cast_possible_truncation)]
-    Some((reg(page, APIC_ID) >> 24, lvtt as u8))
+    Some((reg(page, APIC_ID) >> 24, vector))
 }
 
 /// How long until a guest TSC at `tsc` reaches `deadline`, at `hz`. Rounded
@@ -296,11 +314,17 @@ mod tests {
         // Linux's LOCAL_TIMER_VECTOR on APIC 1.
         assert_eq!(deadline_interrupt(&page(0x1ff, 0x4_00ec, 0, 1)), Some((1, 0xec)));
         assert_eq!(deadline_interrupt(&page(0x1ff, 0xec, 0, 3)), Some((3, 0xec)));
-        // Masked (lapic_timer_shutdown), software-disabled APIC, other modes.
-        assert_eq!(deadline_interrupt(&page(0x1ff, 0x5_00ec, 0, 0)), None);
+        // The entry as WHP shows it after refusing the guest's write that
+        // selected TSC-deadline mode: Linux's lapic_timer_shutdown write,
+        // masked, with the vector (0x100ec measured on Windows 11 26H2). The
+        // mask is not the guest's: the interrupt is raised.
+        assert_eq!(deadline_interrupt(&page(0x1ff, LVT_MASKED | 0xec, 0, 1)), Some((1, 0xec)));
+        assert_eq!(deadline_interrupt(&page(0x1ff, 0x5_00ec, 0, 0)), Some((0, 0xec)));
+        // Software-disabled APIC, other modes, no vector written.
         assert_eq!(deadline_interrupt(&page(0x0ff, 0x4_00ec, 0, 0)), None);
         assert_eq!(deadline_interrupt(&page(0x1ff, 0x2_00ec, 0, 0)), None);
         assert_eq!(deadline_interrupt(&page(0x1ff, 0xec, 5, 0)), None);
+        assert_eq!(deadline_interrupt(&page(0x1ff, LVT_MASKED, 0, 0)), None);
     }
 
     #[test]
