@@ -31,10 +31,13 @@
 //! handler runs when the signal is unblocked. Blocked faults take the default
 //! action, as Linux does.
 //!
+//! - A write to a Unix stream socket whose peer is gone (wick-os's
+//!   `UnixStream`) raises `SIGPIPE` on the writing thread, as Linux does for
+//!   a `write(2)` without `MSG_NOSIGNAL`; the write still fails.
+//!
 //! Real-time signals are numbered 34..=64 as with glibc. Windows raises no
-//! `SIGPIPE` (writes fail with the error instead), `SIGXCPU`, `SIGXFSZ` or
-//! `SIGSYS`; handlers for them can be registered and are called when the
-//! signal is sent to a thread.
+//! `SIGXCPU`, `SIGXFSZ` or `SIGSYS`; handlers for them can be registered and
+//! are called when the signal is sent to a thread.
 
 use std::fmt::{self, Display};
 use std::io;
@@ -316,6 +319,13 @@ pub fn register_signal_handler(num: c_int, handler: SignalHandler) -> errno::Res
             });
             result?;
         }
+        // A write to a stream whose peer is gone, which Linux answers with
+        // SIGPIPE to the writing thread (wick-os's UnixStream calls this).
+        // libc's write(2) on a pipe or socket, wick-os's UnixStream.
+        libc::SIGPIPE => {
+            libc::wick_signal::set_broken_pipe_hook(|| deliver(libc::SIGPIPE));
+            wick_os::windows::set_broken_pipe_hook(|| deliver(libc::SIGPIPE));
+        }
         _ => {}
     }
     Ok(())
@@ -584,6 +594,41 @@ mod tests {
         validate_signal_num(0).unwrap_err();
         validate_signal_num(65).unwrap_err();
         register_signal_handler(libc::SIGKILL, count).unwrap_err();
+    }
+
+    // A write to a stream whose peer closed fails and raises SIGPIPE on the
+    // writing thread, as on Linux.
+    #[test]
+    fn test_write_to_a_closed_peer_raises_sigpipe() {
+        use std::io::Write;
+        static PIPES: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn on_pipe(num: c_int, info: *mut siginfo_t, _: *mut c_void) {
+            assert_eq!(unsafe { (*info).si_signo }, num);
+            assert_eq!(num, libc::SIGPIPE);
+            PIPES.fetch_add(1, Ordering::SeqCst);
+        }
+        register_signal_handler(libc::SIGPIPE, on_pipe).unwrap();
+        let (mut a, b) = wick_os::unix::net::UnixStream::pair().unwrap();
+        drop(b);
+        let failed = (0..100).any(|_| {
+            let r = a.write(&[0u8; 4096]);
+            std::thread::sleep(Duration::from_millis(5));
+            r.is_err()
+        });
+        assert!(failed, "writes to a closed peer kept succeeding");
+        assert!(PIPES.load(Ordering::SeqCst) > 0, "no SIGPIPE");
+        // And through libc's write(2), as vm-memory writes a socket.
+        let before = PIPES.load(Ordering::SeqCst);
+        let (a, b) = wick_os::unix::net::UnixStream::pair().unwrap();
+        drop(b);
+        use wick_os::fd::AsRawFd;
+        let failed = (0..100).any(|_| {
+            let r = unsafe { libc::write(a.as_raw_fd(), [0u8; 4096].as_ptr().cast(), 4096) };
+            std::thread::sleep(Duration::from_millis(5));
+            r < 0
+        });
+        assert!(failed, "libc writes to a closed peer kept succeeding");
+        assert!(PIPES.load(Ordering::SeqCst) > before, "no SIGPIPE from libc's write");
     }
 
     #[test]

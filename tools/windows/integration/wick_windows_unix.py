@@ -134,6 +134,26 @@ class UnixSocket(_RealSocket):
         conn.setblocking(True)
         return conn, os.fsdecode(a.sun_path)
 
+    def _wait_readable(self):
+        """A blocking receive waits in slices: Python runs between them, so
+        an interrupt of the main thread (utils.Timeout's, which SIGALRM's
+        EINTR does on Linux) is raised there, where a thread blocked in
+        Winsock's recv would never see it."""
+        if self.family != AF_UNIX or self.gettimeout() is not None:
+            return
+        import select  # pylint: disable=import-outside-toplevel
+
+        while not select.select([self], [], [], 0.2)[0]:
+            pass
+
+    def recv(self, *args, **kwargs):
+        self._wait_readable()
+        return super().recv(*args, **kwargs)
+
+    def recv_into(self, *args, **kwargs):
+        self._wait_readable()
+        return super().recv_into(*args, **kwargs)
+
     def getsockname(self):
         if self.family != AF_UNIX:
             return super().getsockname()
