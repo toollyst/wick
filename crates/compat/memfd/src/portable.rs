@@ -112,16 +112,23 @@ impl MemfdOptions {
         self
     }
 
-    /// Creates the object. `name` is only used for debugging.
+    /// Creates the object. `name` is only used for debugging. Huge pages:
+    /// on macOS a 2 MiB huge page object (`macos`); on Windows refused
+    /// (docs/PORTING.md row 10).
     pub fn create<T: AsRef<str>>(&self, name: T) -> Result<Memfd, Error> {
-        if self.hugetlb.is_some() {
-            return Err(Error::Create(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "huge pages are not available for memfd on this OS",
-            )));
-        }
         let _ = name;
-        let file = os::create(self.cloexec).map_err(Error::Create)?;
+        #[cfg(target_os = "macos")]
+        let file = os::create(self.cloexec, self.hugetlb).map_err(Error::Create)?;
+        #[cfg(windows)]
+        let file = {
+            if self.hugetlb.is_some() {
+                return Err(Error::Create(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "huge pages are not available for memfd on this OS",
+                )));
+            }
+            os::create(self.cloexec).map_err(Error::Create)?
+        };
         Ok(Memfd {
             file,
             seals: Mutex::new(HashSet::new()),
@@ -289,11 +296,59 @@ mod tests {
         plain.add_seal(FileSeal::SealShrink).unwrap_err();
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_hugetlb_is_refused() {
         MemfdOptions::default()
             .hugetlb(Some(HugetlbSize::Huge2MB))
             .create("x")
+            .unwrap_err();
+    }
+
+    /// A 2 MiB huge page memfd maps in huge pages through the
+    /// compatibility libc (2 MiB aligned; a size that is not whole huge
+    /// pages refused at the mapping); other sizes have no pool.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_hugetlb_memfd_maps_huge() {
+        const HUGE: usize = 2 << 20;
+        let mfd = MemfdOptions::default()
+            .hugetlb(Some(HugetlbSize::Huge2MB))
+            .allow_sealing(true)
+            .create("huge")
+            .unwrap();
+        mfd.as_file().set_len(2 * HUGE as u64).unwrap();
+        let seals: SealsHashSet = [FileSeal::SealShrink, FileSeal::SealGrow].into_iter().collect();
+        mfd.add_seals(&seals).unwrap();
+        // SAFETY: a mapping of the object, unmapped below.
+        unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                HUGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_HUGETLB | libc::MAP_HUGE_2MB,
+                mfd.as_raw_fd(),
+                HUGE as libc::off_t,
+            );
+            assert_ne!(p, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+            assert_eq!(p as usize % HUGE, 0);
+            p.cast::<u8>().write_volatile(5);
+            assert_eq!(libc::munmap(p, HUGE), 0);
+        }
+        let odd = MemfdOptions::default()
+            .hugetlb(Some(HugetlbSize::Huge2MB))
+            .create("odd")
+            .unwrap();
+        odd.as_file().set_len(HUGE as u64 + 4096).unwrap();
+        // SAFETY: a mapping that is refused.
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), 4096, libc::PROT_READ, libc::MAP_SHARED, odd.as_raw_fd(), 0)
+        };
+        assert_eq!(p, libc::MAP_FAILED);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+        MemfdOptions::default()
+            .hugetlb(Some(HugetlbSize::Huge1GB))
+            .create("gib")
             .unwrap_err();
     }
 }

@@ -82,6 +82,10 @@ struct Range {
     start: AtomicU64,
     end: AtomicU64,
     ctx: AtomicUsize,
+    /// The page size of the range: the host's, or the huge page's for a
+    /// `MAP_HUGETLB` mapping ([`note_mapping`]), where a fault is reported
+    /// for and a fill covers a whole huge page, as Linux's hugetlb does.
+    page: AtomicU64,
     /// Second mapping of `[start, end)`, always readable and writable.
     alias: AtomicU64,
     /// One bit per page: the page is missing.
@@ -96,10 +100,16 @@ impl Range {
             start: AtomicU64::new(0),
             end: AtomicU64::new(0),
             ctx: AtomicUsize::new(0),
+            page: AtomicU64::new(0),
             alias: AtomicU64::new(0),
             missing: AtomicPtr::new(ptr::null_mut()),
             tracked: AtomicPtr::new(ptr::null_mut()),
         }
+    }
+
+    /// The range's page size.
+    fn page_size(&self) -> u64 {
+        self.page.load(Ordering::Acquire)
     }
 
     fn bit(map: &AtomicPtr<AtomicU64>, page: u64) -> &AtomicU64 {
@@ -151,6 +161,11 @@ static WAITERS: [Waiter; MAX_WAITERS] = [const {
     }
 }; MAX_WAITERS];
 static PAGE: AtomicU64 = AtomicU64::new(0);
+/// The `MAP_HUGETLB` mappings made through the compatibility `mmap`
+/// (`[start, end)`): a userfaultfd registered on one works in huge pages.
+/// A mapping made over one without the flag takes its place; an unmapped
+/// one is forgotten when something is mapped over it.
+static HUGE_MAPPINGS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 /// Number of registered ranges (the I/O wrappers skip all work at 0).
 static REGISTERED: AtomicUsize = AtomicUsize::new(0);
 /// Serializes changes to the ranges.
@@ -186,8 +201,53 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+/// The host's page size.
 fn page_size() -> u64 {
     PAGE.load(Ordering::Relaxed)
+}
+
+/// Records a mapping `[start, start + len)` the compatibility `mmap` made,
+/// with or without `MAP_HUGETLB`.
+pub fn note_mapping(start: u64, len: u64, huge: bool) {
+    let end = start.saturating_add(len);
+    let mut all = HUGE_MAPPINGS.lock().unwrap();
+    let mut kept = Vec::with_capacity(all.len() + 2);
+    for &(s, e) in all.iter() {
+        if e <= start || s >= end {
+            kept.push((s, e));
+            continue;
+        }
+        if s < start {
+            kept.push((s, start));
+        }
+        if e > end {
+            kept.push((end, e));
+        }
+    }
+    if huge {
+        kept.push((start, end));
+    }
+    *all = kept;
+}
+
+/// Whether any of `[start, end)` is a huge page mapping.
+pub fn touches_huge(start: u64, end: u64) -> bool {
+    let all = HUGE_MAPPINGS.lock().unwrap();
+    all.iter().any(|&(s, e)| s < end && start < e)
+}
+
+/// The page size of `[start, end)` if all of it is huge page mappings:
+/// [`crate::linux_items::HUGE_PAGE`]; `None` for ordinary memory, or for a
+/// range only part of which is huge (one range has one page size).
+pub fn huge_page_of(start: u64, end: u64) -> Option<u64> {
+    let all = HUGE_MAPPINGS.lock().unwrap();
+    let mut at = start;
+    while at < end {
+        // Adjacent huge mappings (one made fixed over part of another) are
+        // kept as separate entries.
+        at = all.iter().find(|&&(s, e)| s <= at && at < e)?.1;
+    }
+    Some(crate::linux_items::HUGE_PAGE)
 }
 
 fn errno_err(errno: c_int) -> io::Error {
@@ -238,7 +298,7 @@ fn find(addr: u64) -> Option<(&'static Range, u64)> {
     for r in RANGES.iter() {
         let start = r.start.load(Ordering::Acquire);
         if start != 0 && addr >= start && addr < r.end.load(Ordering::Acquire) {
-            return Some((r, (addr - start) / page_size()));
+            return Some((r, (addr - start) / r.page_size()));
         }
     }
     None
@@ -288,7 +348,7 @@ pub fn fault(addr: u64, write: bool) -> bool {
     if !Range::test(&range.tracked, page) || !Range::test(&range.missing, page) {
         return false;
     }
-    let page_addr = range.start.load(Ordering::Acquire) + page * page_size();
+    let page_addr = range.start.load(Ordering::Acquire) + page * range.page_size();
     // Claim a waiter slot.
     let slot = loop {
         if let Some(w) = WAITERS.iter().find(|w| {
@@ -397,7 +457,8 @@ fn stage2(start: u64, len: u64, present: bool) {
 }
 
 /// Calls `f(start, len)` for each run of missing registered pages in
-/// `[start, start + len)`.
+/// `[start, start + len)`, in the pages of each range (a huge page is
+/// whole; host pages outside the ranges).
 pub fn for_each_missing(start: u64, len: u64, mut f: impl FnMut(u64, u64)) {
     let ps = page_size();
     if ps == 0 {
@@ -407,19 +468,28 @@ pub fn for_each_missing(start: u64, len: u64, mut f: impl FnMut(u64, u64)) {
     let mut run: Option<u64> = None;
     let mut addr = start - start % ps;
     while addr < end {
-        let missing = is_missing(addr);
+        // The page holding `addr`, the one after it, and whether it is missing.
+        let (page_start, next, missing) = match find(addr) {
+            Some((r, page)) => {
+                let (base, rps) = (r.start.load(Ordering::Acquire), r.page_size());
+                let page_start = base + page * rps;
+                let missing = Range::test(&r.tracked, page) && Range::test(&r.missing, page);
+                (page_start, page_start + rps, missing)
+            }
+            None => (addr, addr + ps, false),
+        };
         match (missing, run) {
-            (true, None) => run = Some(addr),
+            (true, None) => run = Some(page_start),
             (false, Some(s)) => {
-                f(s, addr - s);
+                f(s, page_start - s);
                 run = None;
             }
             _ => {}
         }
-        addr += ps;
+        addr = next;
     }
     if let Some(s) = run {
-        f(s, end.min(addr) - s);
+        f(s, addr - s);
     }
 }
 
@@ -504,14 +574,22 @@ fn alloc_bitmap(pages: u64, on: bool) -> *mut AtomicU64 {
 /// Pages that are not resident are missing from now on. The range must be
 /// mapped (`ENOMEM`) and readable and writable (`EPERM`; Linux also takes
 /// anonymous memory with other protections, which fills here would change).
+/// A `MAP_HUGETLB` mapping ([`note_mapping`]) is registered in huge pages:
+/// the range must be aligned to them (`EINVAL`, as Linux's hugetlb
+/// registration), a huge page is missing when any host page of it is, and
+/// faults and fills work on whole huge pages.
 pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
-    let ps = page_size();
-    if len == 0 || !start.is_multiple_of(ps) || !len.is_multiple_of(ps) || start == 0 {
+    let host = page_size();
+    if len == 0 || start == 0 || !start.is_multiple_of(host) || !len.is_multiple_of(host) {
         return Err(errno_err(libc::EINVAL));
     }
     let end = start
         .checked_add(len)
         .ok_or_else(|| errno_err(libc::EINVAL))?;
+    let ps = huge_page_of(start, end).unwrap_or(host);
+    if !start.is_multiple_of(ps) || !len.is_multiple_of(ps) {
+        return Err(errno_err(libc::EINVAL));
+    }
     let _guard = LOCK.lock().unwrap();
     if RANGES.iter().any(|r| {
         let s = r.start.load(Ordering::Acquire);
@@ -558,8 +636,8 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         return Err(errno_err(libc::EPERM));
     }
     // Residency decides what is missing.
-    let mut resident = std::vec![0u8; pages as usize];
-    // SAFETY: `resident` has one byte per page of the range.
+    let mut resident = std::vec![0u8; (len / host) as usize];
+    // SAFETY: `resident` has one byte per host page of the range.
     if unsafe { libc::mincore(start as *mut _, len as usize, resident.as_mut_ptr().cast()) } != 0 {
         let err = io::Error::last_os_error();
         // SAFETY: unmaps the alias made above.
@@ -570,12 +648,15 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     let tracked = alloc_bitmap(pages, true);
     range.end.store(end, Ordering::Release);
     range.ctx.store(ctx, Ordering::Release);
+    range.page.store(ps, Ordering::Release);
     range.alias.store(alias, Ordering::Release);
     range.missing.store(missing, Ordering::Release);
     range.tracked.store(tracked, Ordering::Release);
     // Trailing bits of the last word stay set in `tracked`; they are past `end`.
+    let per_page = (ps / host) as usize;
     for page in 0..pages {
-        if resident[page as usize] & 1 == 0 {
+        let host_pages = &resident[page as usize * per_page..(page as usize + 1) * per_page];
+        if host_pages.iter().any(|r| r & 1 == 0) {
             Range::set(&range.missing, page, true);
         }
     }
@@ -592,16 +673,22 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
 }
 
 /// The registered range holding all of `[start, start + len)`, which must be
-/// page aligned and must not wrap (`EINVAL`, as Linux's `validate_range`).
+/// aligned to its pages (huge ones for a huge page range, as Linux's
+/// hugetlb `UFFDIO_COPY` requires) and must not wrap (`EINVAL`, as Linux's
+/// `validate_range`).
 fn range_of(ctx: usize, start: u64, len: u64) -> Result<&'static Range, c_int> {
-    let ps = page_size();
-    if ps == 0 || !start.is_multiple_of(ps) || !len.is_multiple_of(ps) || len == 0 {
+    let host = page_size();
+    if host == 0 || !start.is_multiple_of(host) || !len.is_multiple_of(host) || len == 0 {
         return Err(libc::EINVAL);
     }
     let end = start.checked_add(len).ok_or(libc::EINVAL)?;
     let (range, _) = find(start).ok_or(libc::ENOENT)?;
     if range.ctx.load(Ordering::Acquire) != ctx || end > range.end.load(Ordering::Acquire) {
         return Err(libc::ENOENT);
+    }
+    let ps = range.page_size();
+    if !start.is_multiple_of(ps) || !len.is_multiple_of(ps) {
+        return Err(libc::EINVAL);
     }
     Ok(range)
 }
@@ -612,7 +699,7 @@ pub fn unregister(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
     let _guard = LOCK.lock().unwrap();
     let range = range_of(ctx, start, len)?;
     let base = range.start.load(Ordering::Acquire);
-    let ps = page_size();
+    let ps = range.page_size();
     let mut runs = Vec::new();
     for_each_missing(start, len, |s, l| runs.push((s, l)));
     for page in (start - base) / ps..(start + len - base) / ps {
@@ -644,7 +731,7 @@ fn fill(
     let range = range_of(ctx, dst, len).map_err(|e| (e, 0))?;
     let base = range.start.load(Ordering::Acquire);
     let alias = range.alias.load(Ordering::Acquire);
-    let ps = page_size();
+    let ps = range.page_size();
     let first = (dst - base) / ps;
     let mut n = 0;
     while n < len / ps {
@@ -735,7 +822,11 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce() -> c_int) -> c_in
         if s == 0 || start >= e || s >= end {
             continue;
         }
-        let (from, to) = (start.max(s) - start.max(s) % ps, end.min(e));
+        // A discard of part of a huge page makes the whole page missing
+        // (Linux frees the whole huge page).
+        let ps = r.page_size();
+        let from = start.max(s) - (start.max(s) - s) % ps;
+        let to = end.min(e);
         let mut any = false;
         let mut addr = from;
         while addr < to {
@@ -749,6 +840,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce() -> c_int) -> c_in
         if !any {
             continue;
         }
+        let to = (s + (to - s).next_multiple_of(ps)).min(e);
         let mut runs = Vec::new();
         for_each_missing(from, to - from, |a, l| runs.push((a, l)));
         for (a, l) in runs {
@@ -775,7 +867,7 @@ fn destroy(ctx: usize) {
         let e = r.end.load(Ordering::Acquire);
         let mut runs = Vec::new();
         for_each_missing(s, e - s, |a, l| runs.push((a, l)));
-        let ps = page_size();
+        let ps = r.page_size();
         for (a, l) in runs {
             let _ = protect(a, l, libc::PROT_READ | libc::PROT_WRITE);
             stage2(a, l, true);
@@ -918,12 +1010,15 @@ fn serve_copy(
     len: u64,
     wake_up: bool,
 ) -> Option<Result<u64, (c_int, u64)>> {
-    const PIECE: u64 = 1 << 20;
-    let mut result = range_of(ctx, dst, len).map(|_| 0).map_err(|e| (e, 0));
+    // Pieces of a mebibyte, or of the range's page when it is larger (a
+    // huge page is filled whole).
+    let range = range_of(ctx, dst, len);
+    let piece = range.map_or(1 << 20, |r| r.page_size().max(1 << 20));
+    let mut result = range.map(|_| 0).map_err(|e| (e, 0));
     let mut buf = Vec::new();
     let mut done = 0;
     while done < len {
-        let n = (len - done).min(PIECE);
+        let n = (len - done).min(piece);
         buf.resize(n as usize, 0);
         if !read_full(fd, &mut buf) {
             return None;
@@ -1508,6 +1603,88 @@ mod tests {
         let chan = channel(user);
         assert_eq!(request(chan, [proto::OP_WAKE, mem, ps, 0], &[]), (0, 0));
         close(&[chan, user]);
+    }
+
+    /// A huge page mapping is registered in huge pages (docs/PORTING.md
+    /// row 10): a fault anywhere in one reports its address and waits for
+    /// the whole page; a copy must be aligned to huge pages and fills a
+    /// whole one; the other huge pages stay missing; a discard of part of
+    /// a filled page makes the whole page missing again.
+    #[test]
+    fn test_huge_page_ranges_fault_and_fill_whole_pages() {
+        use crate::linux_items::{HUGE_PAGE, MAP_HUGETLB, MAP_HUGE_2MB};
+        let (ctx, user) = create(0, false, true).unwrap();
+        let host = page_size();
+        let len = 3 * HUGE_PAGE;
+        // SAFETY: a huge page mapping of the compatibility mmap, unmapped at the end.
+        let mem = unsafe {
+            crate::linux_items::mmap(
+                ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | MAP_HUGETLB | MAP_HUGE_2MB,
+                -1,
+                0,
+            )
+        } as u64;
+        assert_ne!(mem, libc::MAP_FAILED as u64);
+        // Aligned to host pages, not to huge ones: refused.
+        let refused = register(ctx, mem + host, len - host).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EINVAL));
+        register(ctx, mem, len).unwrap();
+        for off in [0, host, HUGE_PAGE - host, HUGE_PAGE, 2 * HUGE_PAGE + 5 * host] {
+            assert!(is_missing(mem + off), "{off:#x}");
+        }
+        let mut runs = Vec::new();
+        for_each_missing(mem + host, len - 2 * host, |s, l| runs.push((s, l)));
+        assert_eq!(runs, std::vec![(mem, len)], "whole huge pages");
+        let chan = channel(user);
+        // A copy aligned to host pages only: EINVAL, as Linux's hugetlb.
+        let page = std::vec![3u8; HUGE_PAGE as usize];
+        let short = (err(libc::EINVAL), 0);
+        assert_eq!(request(chan, [proto::OP_COPY, mem + host, HUGE_PAGE, 0], &page), short);
+        assert_eq!(request(chan, [proto::OP_COPY, mem, host, 0], &page[..host as usize]), short);
+        // A read in the middle of the second huge page: the event names the
+        // address, and the reader waits until the whole page is filled.
+        let at = mem + HUGE_PAGE + 3 * host + 9;
+        let reader = std::thread::spawn(move || {
+            // SAFETY: registered memory; the fault is served below.
+            unsafe { ptr::read_volatile(at as *const u8) }
+        });
+        assert!(readable(user), "no page fault event");
+        let mut rec = [0u8; proto::RECORD];
+        assert!(read_full(user, &mut rec));
+        assert_eq!(words(&rec), [proto::EVENT_PAGEFAULT, at, 0, 0]);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!reader.is_finished(), "the reader went on before the fill");
+        let whole = (HUGE_PAGE as i64, HUGE_PAGE);
+        assert_eq!(request(chan, [proto::OP_COPY, mem + HUGE_PAGE, HUGE_PAGE, 0], &page), whole);
+        assert_eq!(reader.join().unwrap(), 3);
+        for off in [HUGE_PAGE, HUGE_PAGE + host, 2 * HUGE_PAGE - 1] {
+            assert!(!is_missing(mem + off), "{off:#x}");
+            // SAFETY: a filled page.
+            assert_eq!(unsafe { ptr::read_volatile((mem + off) as *const u8) }, 3);
+        }
+        for off in [0, HUGE_PAGE - 1, 2 * HUGE_PAGE, 3 * HUGE_PAGE - 1] {
+            assert!(is_missing(mem + off), "{off:#x}");
+        }
+        // Filled: EEXIST for the whole page.
+        let exists = (err(libc::EEXIST), 0);
+        assert_eq!(request(chan, [proto::OP_COPY, mem + HUGE_PAGE, HUGE_PAGE, 0], &page), exists);
+        // A discard of one host page of it: the whole huge page is missing.
+        // SAFETY: registered memory.
+        let rc = unsafe { crate::linux_items::madvise((mem + HUGE_PAGE + host) as *mut _, host as usize, libc::MADV_DONTNEED) };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        for off in [HUGE_PAGE, HUGE_PAGE + host, 2 * HUGE_PAGE - 1] {
+            assert!(is_missing(mem + off), "{off:#x}");
+        }
+        assert_eq!(request(chan, [proto::OP_ZEROPAGE, mem + HUGE_PAGE, HUGE_PAGE, 0], &[]), whole);
+        // SAFETY: a page zeroed again.
+        assert_eq!(unsafe { ptr::read_volatile((mem + HUGE_PAGE + host) as *const u8) }, 0);
+        unregister(ctx, mem, len).unwrap();
+        close(&[chan, user]);
+        // SAFETY: the mapping made above.
+        assert_eq!(unsafe { libc::munmap(mem as *mut _, len as usize) }, 0);
     }
 
     /// Whether the peer of `fd` closed it, within five seconds.

@@ -8,8 +8,12 @@
 //! (docs/ROADMAP.md lists the differences):
 //! - `eventfd` and `timerfd` flags and calls are implemented by the macOS
 //!   `vmm-sys-util` and in [`crate::timerfd`];
-//! - `mmap`: `MAP_POPULATE` prefaults; `MAP_HUGETLB` fails with `ENOTSUP`
-//!   (macOS has no huge page mappings for user space);
+//! - `mmap`: `MAP_POPULATE` prefaults; `MAP_HUGETLB`, and a huge page
+//!   memfd, map 2 MiB pages as Linux's hugetlb does for what Firecracker
+//!   sees (2 MiB alignment and size, a userfaultfd that faults and fills
+//!   2 MiB at a time), on host pages: macOS gives user space no superpage
+//!   on Apple silicon ([`mmap_huge`]); `munmap` keeps hugetlb's alignment
+//!   rule;
 //! - `prctl`: speculative store bypass control uses `PSTATE.SSBS`; options
 //!   macOS cannot honour fail with `EINVAL`, like an unknown option on Linux;
 //! - block device ioctls map to the `DKIOC*` equivalents;
@@ -48,6 +52,9 @@ pub const MAP_POPULATE: c_int = 0x0200_0000;
 pub const MADV_HUGEPAGE: c_int = 14;
 
 const HUGE_FLAGS: c_int = MAP_HUGETLB | (0x3f << MAP_HUGE_SHIFT);
+/// The huge page size: 2 MiB, Linux's default on x86_64 and on aarch64 with
+/// 4 KiB pages, and the one Firecracker's `huge_pages` asks for.
+pub(crate) const HUGE_PAGE: u64 = 2 << 20;
 
 /// The check upstream's seccomp filters make of `mmap` and `mprotect`, which
 /// trap when the protection includes `PROT_EXEC`, for the host sandbox
@@ -104,7 +111,10 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
 
 /// `mmap` with the Linux flags above.
 ///
-/// - `MAP_HUGETLB` (and huge page sizes): fails with `ENOTSUP`;
+/// - `MAP_HUGETLB` with `MAP_ANONYMOUS`, or a huge page memfd
+///   ([`hugetlb_file`]) with any flags: [`mmap_huge`]; `MAP_HUGETLB` with
+///   another file: `EINVAL`, as Linux (`ksys_mmap_pgoff`); the `MAP_HUGE_*`
+///   size bits alone mean nothing, as on Linux;
 /// - `MAP_POPULATE`: the range is prefaulted after mapping (`MADV_WILLNEED`
 ///   and a read of every page when it is readable);
 /// - `PROT_EXEC` once the host sandbox narrowed: see [`wick_mm`].
@@ -122,12 +132,23 @@ pub unsafe fn mmap(
     if wick_mm::exec_denied(prot) {
         return libc::MAP_FAILED;
     }
-    if flags & HUGE_FLAGS != 0 {
-        set_errno(libc::ENOTSUP);
+    if flags & libc::MAP_ANON != 0 {
+        if flags & MAP_HUGETLB != 0 {
+            // SAFETY: the caller's contract.
+            return unsafe { mmap_huge(addr, len, prot, flags, -1, 0) };
+        }
+    } else if hugetlb_file(fd) {
+        // SAFETY: the caller's contract.
+        return unsafe { mmap_huge(addr, len, prot, flags, fd, offset) };
+    } else if flags & MAP_HUGETLB != 0 {
+        set_errno(libc::EINVAL);
         return libc::MAP_FAILED;
     }
-    // SAFETY: forwarded with the Linux-only bit removed.
-    let ptr = unsafe { libc::mmap(addr, len, prot, flags & !MAP_POPULATE, fd, offset) };
+    // SAFETY: forwarded with the Linux-only bits removed.
+    let ptr = unsafe { libc::mmap(addr, len, prot, flags & !(MAP_POPULATE | HUGE_FLAGS), fd, offset) };
+    if ptr != libc::MAP_FAILED {
+        crate::wick_uffd::note_mapping(ptr as u64, len as u64, false);
+    }
     if ptr != libc::MAP_FAILED && flags & MAP_POPULATE != 0 {
         // SAFETY: the range was just mapped.
         unsafe { libc::madvise(ptr, len, libc::MADV_WILLNEED) };
@@ -143,6 +164,163 @@ pub unsafe fn mmap(
         }
     }
     ptr
+}
+
+/// `mmap` of a huge page mapping as Firecracker sees Linux's hugetlb ones:
+/// anonymous memory with `MAP_HUGETLB` (`fd` -1), or a huge page memfd
+/// ([`hugetlb_file`]; hugetlbfs files map huge with or without the flag).
+///
+/// macOS gives user space no superpage on Apple silicon: `mach_vm_allocate`
+/// and `mmap` with `VM_FLAGS_SUPERPAGE_SIZE_2MB` or `_ANY` fail with
+/// `KERN_INVALID_ARGUMENT` / `EINVAL` for 2 MiB to 64 MiB (measured on
+/// macOS 27.2, M1 Pro; `test_no_host_superpages`), and Hypervisor.framework
+/// takes no page size. So the memory is host pages, and what Linux's hugetlb
+/// mapping guarantees the program is kept: the address is a multiple of
+/// [`HUGE_PAGE`] (Firecracker relies on it: `allocate_protected` does not
+/// over-allocate for hugetlb), the size is rounded up to whole huge pages,
+/// a `MAP_FIXED` address or a file offset that is not a multiple fails with
+/// `EINVAL`, a file whose size is not whole huge pages fails with `EINVAL`
+/// (hugetlbfs refuses that size at `ftruncate`, which macOS's goes through
+/// unchecked), a size other than 2 MiB (`MAP_HUGE_1GB`, ...) fails with
+/// `ENOMEM` as Linux without a pool of that size does, a length too large
+/// to round with `ENOMEM`, and a userfaultfd registered on the mapping
+/// faults and fills it 2 MiB at a time ([`crate::wick_uffd`], which is
+/// told of the mapping here). The pages are not pinned and the TLB reach is
+/// the host's; docs/PORTING.md row 10.
+///
+/// # Safety
+/// Same contract as `mmap(2)`.
+unsafe fn mmap_huge(
+    addr: *mut c_void,
+    len: size_t,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    offset: off_t,
+) -> *mut c_void {
+    let size = (flags >> MAP_HUGE_SHIFT) & 0x3f;
+    if size != 0 && size != 21 {
+        set_errno(libc::ENOMEM);
+        return libc::MAP_FAILED;
+    }
+    let huge = HUGE_PAGE as usize;
+    let Some(len) = len.checked_next_multiple_of(huge).filter(|&l| l > 0) else {
+        set_errno(if len == 0 { libc::EINVAL } else { libc::ENOMEM });
+        return libc::MAP_FAILED;
+    };
+    if fd >= 0 {
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        // SAFETY: an out-parameter; the descriptor is the caller's.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return libc::MAP_FAILED;
+        }
+        if offset % HUGE_PAGE as off_t != 0 || st.st_size % HUGE_PAGE as off_t != 0 {
+            set_errno(libc::EINVAL);
+            return libc::MAP_FAILED;
+        }
+    }
+    let flags = flags & !(MAP_POPULATE | HUGE_FLAGS);
+    let ptr = if flags & libc::MAP_FIXED != 0 {
+        if !(addr as usize).is_multiple_of(huge) {
+            set_errno(libc::EINVAL);
+            return libc::MAP_FAILED;
+        }
+        // SAFETY: the caller's contract.
+        unsafe { libc::mmap(addr, len, prot, flags, fd, offset) }
+    } else {
+        // A reservation a huge page larger than needed, the mapping made
+        // fixed at its first huge page boundary, the rest released.
+        let Some(reserve) = len.checked_add(huge) else {
+            set_errno(libc::ENOMEM);
+            return libc::MAP_FAILED;
+        };
+        // SAFETY: a new anonymous reservation.
+        let raw = unsafe {
+            libc::mmap(addr, reserve, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+        };
+        if raw == libc::MAP_FAILED {
+            return raw;
+        }
+        let aligned = (raw as usize).next_multiple_of(huge);
+        let head = aligned - raw as usize;
+        // SAFETY: over the reservation made above.
+        let ptr = unsafe {
+            libc::mmap(aligned as *mut c_void, len, prot, flags | libc::MAP_FIXED, fd, offset)
+        };
+        let err = io_errno();
+        // SAFETY: the head and the tail of the reservation, or all of it.
+        unsafe {
+            if ptr == libc::MAP_FAILED {
+                libc::munmap(raw, reserve);
+                set_errno(err);
+                return libc::MAP_FAILED;
+            }
+            if head > 0 {
+                libc::munmap(raw, head);
+            }
+            if huge - head > 0 {
+                libc::munmap((aligned + len) as *mut c_void, huge - head);
+            }
+        }
+        ptr
+    };
+    if ptr != libc::MAP_FAILED {
+        crate::wick_uffd::note_mapping(ptr as u64, len as u64, true);
+    }
+    ptr
+}
+
+/// The last error's number.
+fn io_errno() -> c_int {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+}
+
+/// Whether `fd` is a huge page memfd: the compatibility `memfd` crate makes
+/// one as a POSIX shared memory object named `/fcmH.<pid>.<n>`, and the
+/// object keeps its name after `shm_unlink` and through `dup` (measured;
+/// `proc_pidfdinfo` with `PROC_PIDFDPSHMINFO`, which the narrowed sandbox
+/// allows as `proc_info`). An object's `fstat` tells nothing (device and
+/// inode 0, measured), so the name is the mark.
+pub(crate) fn hugetlb_file(fd: c_int) -> bool {
+    // struct pshm_fdinfo: 1192 bytes, pshminfo.pshm_name at 168 (measured).
+    const PROC_PIDFDPSHMINFO: c_int = 5;
+    const SIZE: usize = 1192;
+    const NAME_AT: usize = 168;
+    let mut info = [0u8; SIZE];
+    // SAFETY: a buffer of the size passed; our own pid.
+    let n = unsafe {
+        libc::proc_pidfdinfo(
+            std::process::id() as c_int,
+            fd,
+            PROC_PIDFDPSHMINFO,
+            info.as_mut_ptr().cast(),
+            SIZE as c_int,
+        )
+    };
+    n as usize == SIZE && info[NAME_AT..].starts_with(crate::HUGE_MEMFD_PREFIX.as_bytes())
+}
+
+/// `munmap`, with hugetlb's rule: a range that touches a huge page mapping
+/// must start and end on huge page boundaries (`EINVAL`, as Linux refuses
+/// to split a hugetlb mapping elsewhere). A mapping taken down is no longer
+/// huge for [`crate::wick_uffd`].
+///
+/// # Safety
+/// Same contract as `munmap(2)`.
+pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
+    let (start, end) = (addr as u64, (addr as u64).saturating_add(len as u64));
+    if crate::wick_uffd::touches_huge(start, end)
+        && (!start.is_multiple_of(HUGE_PAGE) || !end.is_multiple_of(HUGE_PAGE))
+    {
+        set_errno(libc::EINVAL);
+        return -1;
+    }
+    // SAFETY: the caller's contract.
+    let rc = unsafe { libc::munmap(addr, len) };
+    if rc == 0 {
+        crate::wick_uffd::note_mapping(start, len as u64, false);
+    }
+    rc
 }
 
 /// What one VM map entry holds, as far as `MADV_DONTNEED` cares.
@@ -1186,23 +1364,196 @@ mod tests {
         assert_eq!(unsafe { syscall(20) }, std::process::id() as c_int);
     }
 
+    /// The host has no superpages for user space (docs/PORTING.md row 10):
+    /// what [`mmap_huge`] is built on.
+    #[test]
+    fn test_no_host_superpages() {
+        unsafe extern "C" {
+            fn mach_vm_allocate(task: u32, addr: *mut u64, size: u64, flags: c_int) -> c_int;
+            fn mach_vm_deallocate(task: u32, addr: u64, size: u64) -> c_int;
+        }
+        const VM_FLAGS_ANYWHERE: c_int = 1;
+        // VM_FLAGS_SUPERPAGE_SHIFT 16: SUPERPAGE_SIZE_ANY 1, SUPERPAGE_SIZE_2MB 2.
+        const SUPERPAGE_ANY: c_int = 1 << 16;
+        const SUPERPAGE_2MB: c_int = 2 << 16;
+        const KERN_INVALID_ARGUMENT: c_int = 4;
+        for flag in [SUPERPAGE_ANY, SUPERPAGE_2MB] {
+            for size in [HUGE_PAGE, 32 * HUGE_PAGE] {
+                let mut addr = 0u64;
+                // SAFETY: an allocation of our own, released if it is made.
+                let kr = unsafe { mach_vm_allocate(mach_task_self_, &mut addr, size, VM_FLAGS_ANYWHERE | flag) };
+                if kr == 0 {
+                    // SAFETY: the allocation made above.
+                    unsafe { mach_vm_deallocate(mach_task_self_, addr, size) };
+                }
+                assert_eq!(kr, KERN_INVALID_ARGUMENT, "mach_vm_allocate {size:#x} with superpage flag {flag:#x}");
+                // SAFETY: an anonymous mapping, unmapped if it is made.
+                let p = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        size as usize,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANON,
+                        flag,
+                        0,
+                    )
+                };
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if p != libc::MAP_FAILED {
+                    // SAFETY: the mapping made above.
+                    unsafe { libc::munmap(p, size as usize) };
+                }
+                assert_eq!(p, libc::MAP_FAILED, "mmap {size:#x} with superpage flag {flag:#x}");
+                assert_eq!(errno, Some(libc::EINVAL));
+            }
+        }
+    }
+
+    /// A huge page memfd (the compatibility `memfd` crate's, named for it)
+    /// maps huge with or without MAP_HUGETLB, at huge page offsets only and
+    /// only when its size is whole huge pages; MAP_HUGETLB with another
+    /// file is EINVAL (docs/PORTING.md row 10).
+    #[test]
+    fn test_hugetlb_files() {
+        use std::os::fd::AsRawFd;
+        let shm = |name: &str, size: off_t| {
+            let cname = std::ffi::CString::new(name).unwrap();
+            // SAFETY: a NUL-terminated name; the object is unlinked at once.
+            let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::c_uint) };
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            // SAFETY: as above; sizes the object.
+            unsafe {
+                libc::shm_unlink(cname.as_ptr());
+                assert_eq!(libc::ftruncate(fd, size), 0, "{}", std::io::Error::last_os_error());
+            }
+            fd
+        };
+        let pid = std::process::id();
+        let huge_fd = shm(&format!("{}{pid}.t1", crate::HUGE_MEMFD_PREFIX), 2 * HUGE_PAGE as off_t);
+        let odd_fd = shm(&format!("{}{pid}.t2", crate::HUGE_MEMFD_PREFIX), HUGE_PAGE as off_t + 16384);
+        let plain_fd = shm(&format!("/fcm.{pid}.t3"), 2 * HUGE_PAGE as off_t);
+        assert!(hugetlb_file(huge_fd) && hugetlb_file(odd_fd) && !hugetlb_file(plain_fd));
+        let path = std::env::temp_dir().join(format!("wick-hugetlb-file-{pid}"));
+        let tmp = std::fs::File::create(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        tmp.set_len(2 * HUGE_PAGE).unwrap();
+        assert!(!hugetlb_file(tmp.as_raw_fd()));
+        // SAFETY: mappings of the objects above, unmapped below.
+        unsafe {
+            for flags in [libc::MAP_SHARED, libc::MAP_SHARED | MAP_HUGETLB | MAP_HUGE_2MB] {
+                let p = mmap(core::ptr::null_mut(), HUGE_PAGE as usize, libc::PROT_READ | libc::PROT_WRITE, flags, huge_fd, HUGE_PAGE as off_t);
+                assert_ne!(p, libc::MAP_FAILED, "{}", std::io::Error::last_os_error());
+                assert_eq!(p as u64 % HUGE_PAGE, 0);
+                assert_eq!(crate::wick_uffd::huge_page_of(p as u64, p as u64 + HUGE_PAGE), Some(HUGE_PAGE));
+                p.cast::<u8>().write_volatile(9);
+                assert_eq!(munmap(p, HUGE_PAGE as usize), 0);
+            }
+            let errs = |p: *mut c_void| {
+                assert_eq!(p, libc::MAP_FAILED);
+                std::io::Error::last_os_error().raw_os_error()
+            };
+            let off = mmap(core::ptr::null_mut(), 16384, libc::PROT_READ, libc::MAP_SHARED, huge_fd, 16384);
+            assert_eq!(errs(off), Some(libc::EINVAL), "an offset off a huge page");
+            let odd = mmap(core::ptr::null_mut(), 16384, libc::PROT_READ, libc::MAP_SHARED, odd_fd, 0);
+            assert_eq!(errs(odd), Some(libc::EINVAL), "a size that is not whole huge pages");
+            let flagged = mmap(core::ptr::null_mut(), HUGE_PAGE as usize, libc::PROT_READ, libc::MAP_SHARED | MAP_HUGETLB, plain_fd, 0);
+            assert_eq!(errs(flagged), Some(libc::EINVAL), "MAP_HUGETLB with another file");
+            let flagged = mmap(core::ptr::null_mut(), 16384, libc::PROT_READ, libc::MAP_SHARED | MAP_HUGETLB, tmp.as_raw_fd(), 0);
+            assert_eq!(errs(flagged), Some(libc::EINVAL), "MAP_HUGETLB with a plain file");
+            let ok = mmap(core::ptr::null_mut(), 16384, libc::PROT_READ, libc::MAP_SHARED, plain_fd, 0);
+            assert_ne!(ok, libc::MAP_FAILED);
+            assert_eq!(crate::wick_uffd::huge_page_of(ok as u64, ok as u64 + 16384), None);
+            assert_eq!(munmap(ok, 16384), 0);
+            for fd in [huge_fd, odd_fd, plain_fd] {
+                libc::close(fd);
+            }
+        }
+    }
+
     #[test]
     fn test_mmap_flags() {
         // SAFETY: anonymous mappings, unmapped below.
         unsafe {
+            // A huge page mapping: 2 MiB aligned, whole huge pages (the 1
+            // byte over rounds up to a second one), and usable.
             let huge = mmap(
                 core::ptr::null_mut(),
-                1 << 21,
-                libc::PROT_READ,
+                (1 << 21) + 1,
+                libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANON | MAP_HUGETLB | MAP_HUGE_2MB,
                 -1,
                 0,
             );
-            assert_eq!(huge, libc::MAP_FAILED);
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ENOTSUP)
+            assert_ne!(huge, libc::MAP_FAILED, "{}", std::io::Error::last_os_error());
+            assert_eq!(huge as u64 % HUGE_PAGE, 0, "{huge:p}");
+            let last = huge.cast::<u8>().add((2 << 21) - 1);
+            last.write_volatile(7);
+            assert_eq!(last.read_volatile(), 7);
+            assert_eq!(crate::wick_uffd::huge_page_of(huge as u64, huge as u64 + (2 << 21)), Some(HUGE_PAGE));
+            assert_eq!(crate::wick_uffd::huge_page_of(huge as u64, huge as u64 + (2 << 21) + 1), None);
+            // Over the second huge page, fixed, as Firecracker maps guest
+            // memory over its reservation: still a huge page there.
+            let second = huge.cast::<u8>().add(1 << 21).cast::<c_void>();
+            let fixed = mmap(
+                second,
+                1 << 21,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED | MAP_HUGETLB | MAP_HUGE_2MB,
+                -1,
+                0,
             );
+            assert_eq!(fixed, second);
+            assert_eq!(crate::wick_uffd::huge_page_of(huge as u64, huge as u64 + (2 << 21)), Some(HUGE_PAGE));
+            // A fixed address that is not a huge page boundary: EINVAL.
+            let off = huge.cast::<u8>().add(16384).cast::<c_void>();
+            let bad = mmap(
+                off,
+                1 << 21,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED | MAP_HUGETLB,
+                -1,
+                0,
+            );
+            assert_eq!(bad, libc::MAP_FAILED);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+            // A size the host has no pool for: ENOMEM, as Linux.
+            let gib = mmap(
+                core::ptr::null_mut(),
+                1 << 30,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANON | MAP_HUGETLB | MAP_HUGE_1GB,
+                -1,
+                0,
+            );
+            assert_eq!(gib, libc::MAP_FAILED);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOMEM));
+            // The size bits without MAP_HUGETLB mean nothing: an ordinary mapping.
+            let bits = mmap(core::ptr::null_mut(), 16384, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_ANON | MAP_HUGE_2MB, -1, 0);
+            assert_ne!(bits, libc::MAP_FAILED);
+            assert_eq!(crate::wick_uffd::huge_page_of(bits as u64, bits as u64 + 16384), None);
+            assert_eq!(munmap(bits, 16384), 0);
+            // A length that cannot be rounded up: ENOMEM.
+            let vast = mmap(core::ptr::null_mut(), usize::MAX - 5, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_ANON | MAP_HUGETLB, -1, 0);
+            assert_eq!(vast, libc::MAP_FAILED);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOMEM));
+            // Mapped over without the flag: no longer huge.
+            let plain = mmap(
+                huge,
+                1 << 21,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            );
+            assert_eq!(plain, huge);
+            assert_eq!(crate::wick_uffd::huge_page_of(huge as u64, huge as u64 + (1 << 21)), None);
+            assert_eq!(crate::wick_uffd::huge_page_of(second as u64, second as u64 + (1 << 21)), Some(HUGE_PAGE));
+            // munmap of a huge mapping off a huge page boundary: EINVAL; whole: taken down and forgotten.
+            assert_eq!(munmap(second.cast::<u8>().add(16384).cast(), 16384), -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+            assert_eq!(munmap(second, (1 << 21) - 16384), -1);
+            assert_eq!(munmap(huge, 2 << 21), 0);
+            assert_eq!(crate::wick_uffd::huge_page_of(second as u64, second as u64 + (1 << 21)), None);
             let p = mmap(
                 core::ptr::null_mut(),
                 1 << 20,

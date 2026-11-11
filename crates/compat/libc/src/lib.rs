@@ -24,7 +24,12 @@ pub use linux_items::*;
 // Items that exist on macOS with a different signature: the explicit re-export
 // takes precedence over the glob re-export of `upstream`.
 #[cfg(target_os = "macos")]
-pub use linux_items::{getsockopt, madvise, mincore, mmap, mprotect, syscall};
+pub use linux_items::{getsockopt, madvise, mincore, mmap, mprotect, munmap, syscall};
+/// The name prefix of a huge page memfd's shared memory object on macOS
+/// (`/fcmH.<pid>.<n>`, made by the compatibility `memfd` crate), by which
+/// `mmap` knows to map it in huge pages (docs/PORTING.md row 10).
+#[cfg(target_os = "macos")]
+pub const HUGE_MEMFD_PREFIX: &str = "/fcmH.";
 /// The kernel side of userfaultfd (a wick API, not part of `libc`).
 #[cfg(target_os = "macos")]
 pub mod wick_uffd;

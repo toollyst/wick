@@ -737,16 +737,87 @@ def stage_uffd(ctx):
     return "restore with the Uffd backend served by uffd_on_demand_handler"
 
 
+def stage_hugepages(ctx):
+    # docs/PORTING.md row 10. macOS gives user space no superpage on Apple
+    # silicon (measured: libc test_no_host_superpages), so `huge_pages: 2M`
+    # is what Firecracker sees of Linux's hugetlb: guest memory in whole,
+    # 2 MiB-aligned huge pages on host pages, and a snapshot restored through
+    # a userfaultfd handler that is faulted and filled 2 MiB at a time (the
+    # snapshot's mappings carry the 2 MiB page size; the compatibility uffd
+    # serves it: test_huge_page_ranges_fault_and_fill_whole_pages). With a
+    # vhost-user device the memory is a huge page memfd, shared with the
+    # backend (memfd test_hugetlb_memfd_maps_huge).
+    vm = ctx.vm("huge-odd", [], config(ctx, mem=255, machine={"huge_pages": "2M"}))
+    code = vm.wait_exit(15)
+    vm.pump.join(5)  # the last lines of the console, drained after the exit
+    check(code not in (None, 0), f"255 MiB on 2 MiB pages accepted: exit {code}")
+    check("not a multiple of the configured page size" in vm.buf, f"the refusal does not name the page size: {vm.exit_reason()}")
+    uds = os.path.join(ctx.sock, "huge.v")
+    cfg = config(ctx, vcpus=2, machine={"huge_pages": "2M"}, vsock={"guest_cid": 3, "uds_path": uds})
+    vm = ctx.vm("huge1", [], cfg)
+    vm.shell()
+    _, mem = vm.sh("awk '/MemTotal/ {print $2}' /proc/meminfo")
+    check(200_000 < int(mem) <= 262_144, f"MemTotal {mem} kB for 256 MiB")
+    vm.sh("mount -t tmpfs -o size=200m tmpfs /tmp && head -c 160m /dev/urandom > /tmp/f && md5sum /tmp/f > /tmp/a", 120)
+    _, out = vm.sh("md5sum /tmp/f | cmp - /tmp/a && echo same", 60)
+    check(out == "same", f"160 MiB in guest memory read back differently: {out!r}")
+    vm.sh("A=before-$((6*7))")
+    _, bash_md5 = vm.sh("md5sum /usr/bin/bash")
+    state = os.path.join(ctx.out, "huge.state")
+    mem_file = os.path.join(ctx.out, "huge.mem")
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    vm.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": state, "mem_file_path": mem_file})
+    vm.kill()
+    if os.path.exists(uds):
+        os.unlink(uds)
+    check(os.path.getsize(mem_file) == 256 << 20, f"memory file is {os.path.getsize(mem_file)} bytes")
+    sock = os.path.join(ctx.sock, "huge-uffd")
+    log = open(os.path.join(ctx.out, "huge-uffd-handler.log"), "w")
+    handler = subprocess.Popen([ctx.uffd_handler, sock, mem_file], stdout=log, stderr=subprocess.STDOUT)
+    try:
+        deadline = time.time() + 10
+        while not os.path.exists(sock):
+            check(handler.poll() is None and time.time() < deadline, f"uffd handler did not start ({handler.poll()})")
+            time.sleep(0.05)
+        vm = ctx.vm("huge2", [])
+        vm.api("PUT", "/snapshot/load", {"snapshot_path": state,
+                                         "mem_backend": {"backend_type": "Uffd", "backend_path": sock},
+                                         "resume_vm": True})
+        restored_checks(vm, bash_md5, None)
+        # The 160 MiB in the restored guest's memory came through the handler.
+        _, out = vm.sh("md5sum /tmp/f | cmp - /tmp/a && echo same", 120)
+        check(out == "same", f"160 MiB after the uffd restore: {out!r}")
+        _, out = vm.sh("head -c 64m /dev/zero | md5sum")
+        check(out.split()[0] == "7f614da9329cd3aebf59b91aadc30bf0", f"64 MiB of zeros: {out!r}")
+        vm.reboot()
+    finally:
+        if handler.poll() is None:
+            handler.terminate()
+        handler.wait(5)
+        log.close()
+    vhost_user_round(ctx, "huge-vub", {"huge_pages": "2M"})
+    return "a 2 vCPU guest on 2 MiB pages boots and keeps 160 MiB written; an odd size is refused; a snapshot of it restores through the Uffd backend 2 MiB at a time; a vhost-user drive on a huge page memfd"
+
+
 def stage_pci(ctx):
     return stage_snapshot(ctx, pci=True)
 
 
 def stage_vhost_user(ctx):
-    img = os.path.join(ctx.out, "vub.img")
+    vhost_user_round(ctx, "vhost-user", {})
+    return "vhost-user-blk backend in another process: read md5, write reaches the image"
+
+
+def vhost_user_round(ctx, name, machine):
+    """A guest (`machine` settings) with a vhost-user-blk drive served by the
+    test backend: the guest reads the image's md5 and its write reaches the
+    image. With a vhost-user device Firecracker backs guest memory with a
+    memfd (shared with the backend)."""
+    img = os.path.join(ctx.out, f"{name}.img")
     random_file(img, 8 << 20)
     want = md5(img)
-    sock = os.path.join(ctx.sock, "vub")
-    log = open(os.path.join(ctx.out, "vub.log"), "w")
+    sock = os.path.join(ctx.sock, f"{name}.vub")
+    log = open(os.path.join(ctx.out, f"{name}-backend.log"), "w")
     backend = subprocess.Popen([ctx.vub, sock, img], stdout=log, stderr=subprocess.STDOUT)
     try:
         deadline = time.time() + 10
@@ -754,7 +825,7 @@ def stage_vhost_user(ctx):
             check(backend.poll() is None and time.time() < deadline, f"vhost-user backend did not start ({backend.poll()})")
             time.sleep(0.05)
         drives = [{"drive_id": "vub", "socket": sock, "is_root_device": False}]
-        vm = ctx.vm("vhost-user", [], config(ctx, vcpus=2, drives=drives))
+        vm = ctx.vm(name, [], config(ctx, vcpus=2, drives=drives, machine=machine))
         vm.shell()
         _, out = vm.sh("md5sum /dev/vdb")
         check(out.split()[0] == want, f"guest md5 over vhost-user {out!r}")
@@ -768,7 +839,6 @@ def stage_vhost_user(ctx):
             backend.terminate()
         backend.wait(5)
         log.close()
-    return "vhost-user-blk backend in another process: read md5, write reaches the image"
 
 
 def stage_devices(ctx):
@@ -950,6 +1020,7 @@ STAGES = {
     "snapshot": stage_snapshot,
     "diff": stage_diff,
     "uffd": stage_uffd,
+    "hugepages": stage_hugepages,
     "pci": stage_pci,
     "vhost-user": stage_vhost_user,
     "devices": stage_devices,
