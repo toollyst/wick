@@ -293,27 +293,57 @@ def stage_daemonize(ctx):
     return "double fork, setsid, no terminal, pid file, API answers"
 
 
+# The API process's share of a jail's limits (vmm::ext::jail::API_MEMORY_MIB,
+# API_CPU_PERCENT): with the API on, Firecracker and its API process together
+# stay within the jail's limits, as one cgroup on Linux holds both.
+API_MIB, API_CPU = 32, 1
+
+
+def api_process(vm):
+    kids = bt.children(vm.proc.pid)
+    check(len(kids) == 1, f"Firecracker's child processes: {kids}")
+    return kids[0]
+
+
 def stage_limits(ctx):
-    """The memory cgroup becomes a jetsam limit (the jailer's jetsam priority kept), the CPU cgroup a CPU limit."""
+    """The memory cgroup becomes a jetsam limit (the jailer's jetsam priority kept), the CPU cgroup a CPU limit,
+    shared with the API process so that together they stay within the jail's."""
     jail = Jail(ctx, "limits")
     vm = JailedVm(ctx, "limits", jail, ["--cgroup", "memory.limit_in_bytes=314572800",
                                         "--cgroup", "cpu.cfs_quota_us=150000",
                                         "--cgroup", "cpu.cfs_period_us=200000",
                                         "--resource-limit", "no-file=512"])
+    api = api_process(vm)
     prio, limit = jetsam(vm.proc.pid)
     own_prio, _ = jetsam(os.getpid())
-    check(limit == 300, f"jetsam limit {limit} MiB")
+    check(limit == 300 - API_MIB, f"jetsam limit {limit} MiB")
+    check(jetsam(api)[1] == API_MIB, f"the API process's jetsam limit {jetsam(api)[1]} MiB")
     check(prio == own_prio, f"jetsam priority {prio}, the jailer's parent has {own_prio}")
-    # THROTTLE (1), 75% of one CPU, refilled every second.
-    check(cpu_limit(vm.proc.pid) == (1, 75, 1), f"v1 CPU limit {cpu_limit(vm.proc.pid)}")
+    # THROTTLE (1), 75% of one CPU in all, refilled every second.
+    check(cpu_limit(vm.proc.pid) == (1, 75 - API_CPU, 1), f"v1 CPU limit {cpu_limit(vm.proc.pid)}")
+    check(cpu_limit(api) == (1, API_CPU, 1), f"the API process's CPU limit {cpu_limit(api)}")
+    check(proc_ids(api)[:2] == (UID, GID), f"the API process runs as {proc_ids(api)[:2]}")
     vm.kill()
     jail = Jail(ctx, "limits2")
     vm = JailedVm(ctx, "limits2", jail, ["--cgroup-version", "2", "--cgroup", "memory.max=209715200",
                                          "--cgroup", "cpu.max=250000 100000"])
-    check(jetsam(vm.proc.pid)[1] == 200, f"v2 jetsam limit {jetsam(vm.proc.pid)[1]} MiB")
-    check(cpu_limit(vm.proc.pid) == (1, 250, 1), f"v2 CPU limit {cpu_limit(vm.proc.pid)}")
+    api = api_process(vm)
+    check(jetsam(vm.proc.pid)[1] == 200 - API_MIB, f"v2 jetsam limit {jetsam(vm.proc.pid)[1]} MiB")
+    check(jetsam(api)[1] == API_MIB, f"v2: the API process's jetsam limit {jetsam(api)[1]} MiB")
+    check(cpu_limit(vm.proc.pid) == (1, 250 - API_CPU, 1), f"v2 CPU limit {cpu_limit(vm.proc.pid)}")
+    check(cpu_limit(api) == (1, API_CPU, 1), f"v2: the API process's CPU limit {cpu_limit(api)}")
     vm.kill()
-    return f"jetsam limit 300 MiB (v1), 200 MiB (v2), priority {prio} kept; CPU 75% (v1), 250% (v2)"
+    # Without the API, Firecracker has the whole limit.
+    jail = Jail(ctx, "limits3", [ctx.kernel, ctx.rootfs])
+    vm = JailedVm(ctx, "limits3", jail, ["--cgroup", "memory.limit_in_bytes=314572800"],
+                  fc_args=["--no-api"], config=jail_config(), wait_api=False)
+    vm.wait_for(r"Run /bin/sh as init process", 60)
+    check(bt.children(vm.proc.pid) == [], f"--no-api: child processes {bt.children(vm.proc.pid)}")
+    check(jetsam(vm.proc.pid)[1] == 300, f"--no-api: jetsam limit {jetsam(vm.proc.pid)[1]} MiB")
+    vm.kill()
+    return (f"jetsam 300 MiB = {300 - API_MIB} + {API_MIB} (API process) (v1), 200 = {200 - API_MIB} + {API_MIB} "
+            f"(v2), priority {prio} kept; CPU 75% = {75 - API_CPU} + {API_CPU} (v1), 250% (v2); "
+            f"--no-api: all 300 MiB, no API process")
 
 
 def stage_boot(ctx):
@@ -385,9 +415,11 @@ def stage_cpu(ctx):
         vm.shell()
         vm.sh("for i in 1 2; do (while :; do :; done) & done; echo spinning")
         time.sleep(2)
-        t0, c0 = time.time(), cpu_seconds(vm.proc.pid)
+        # Firecracker and its API process, as one cgroup holds both on Linux.
+        procs = [vm.proc.pid] + bt.children(vm.proc.pid)
+        t0, c0 = time.time(), sum(cpu_seconds(p) for p in procs)
         time.sleep(8)
-        used[name] = 100 * (cpu_seconds(vm.proc.pid) - c0) / (time.time() - t0)
+        used[name] = 100 * (sum(cpu_seconds(p) for p in procs) - c0) / (time.time() - t0)
         vm.kill()
     free, limited = used["cpu-free"], used["cpu50"]
     # The unlimited VM shows the guest could use more than the limit.

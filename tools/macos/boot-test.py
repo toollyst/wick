@@ -9,12 +9,14 @@ with the reason, and the exit status is non-zero if any stage failed.
 """
 
 import argparse
+import ctypes
 import hashlib
 import http.client
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -832,6 +834,65 @@ def stage_devices(ctx):
     return "virtio-rng, rate-limited block, MMDS V2 over the net endpoint, balloon inflate + statistics, logger and metrics files"
 
 
+def children(pid):
+    out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout
+    return [int(p) for p in out.split()]
+
+
+def sandbox_denies(pid, operation):
+    """Whether the sandbox of `pid` denies `operation` (any path, any peer).
+
+    sandbox_check carries out the rule's action: an operation that raises
+    SIGSYS there (the default rule) ends the process checked. Only file
+    operations, denied with an error, are checked this way."""
+    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    lib.sandbox_check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    lib.sandbox_check.restype = ctypes.c_int
+    return lib.sandbox_check(pid, operation.encode(), 0) == 1
+
+
+def stage_api_process(ctx):
+    # On Linux the API thread has a filter of its own, narrower than the VMM
+    # thread's. The macOS sandbox is per process, so the API server's HTTP
+    # side is a process of its own (vmm::ext::api_process), sandboxed as that
+    # filter: no files (sandbox_check; what raises SIGSYS there:
+    # test_api_profile_* in ext::sandbox). Its end ends Firecracker as the API
+    # thread's does on Linux (a panic, panic = "abort"), and Firecracker's end
+    # ends it.
+    vm = ctx.vm("api-process", [], config(ctx))
+    vm.shell()
+    kids = children(vm.proc.pid)
+    check(len(kids) == 1, f"Firecracker's child processes: {kids}")
+    api = kids[0]
+    for op in ("file-read-data", "file-write-data"):
+        check(sandbox_denies(api, op), f"the API process is allowed {op}")
+        check(not sandbox_denies(vm.proc.pid, op), f"control: Firecracker is denied {op}")
+    info = vm.api("GET", "/")
+    check(info.get("state") == "Running", f"instance info through the API process: {info}")
+    vm.api("PUT", "/nothing-here", {}, expect=(400,))
+    os.kill(api, signal.SIGKILL)
+    code = vm.wait_exit(15)
+    check(code == -signal.SIGABRT, f"Firecracker after the API process was killed: exit {code}")
+    check("The API server process ended" in vm.buf, "no panic message for the API process's end")
+
+    vm = ctx.vm("api-process-2", [], config(ctx))
+    vm.shell()
+    kids = children(vm.proc.pid)
+    check(len(kids) == 1, f"Firecracker's child processes: {kids}")
+    vm.proc.kill()
+    vm.wait_exit(15)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            os.kill(kids[0], 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        raise Failure("the API process outlived Firecracker by 10s")
+    return "API process sandboxed (no files), serves the API; each one's end ends the other"
+
+
 def stage_restores(ctx, rounds=20):
     """One snapshot restored many times, each restore paused and snapshotted again.
 
@@ -885,6 +946,7 @@ STAGES = {
     "vhost-user": stage_vhost_user,
     "devices": stage_devices,
     "restores": stage_restores,
+    "api-process": stage_api_process,
 }
 
 

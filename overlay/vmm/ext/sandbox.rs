@@ -54,8 +54,9 @@ pub enum SandboxError {
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    FILES_ANYWHERE, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MIG_ROUTINES, PROFILE, SYSCALLS, apply,
-    denied_syscall, files_in_jail, narrow, profile, select,
+    API_MACH_TRAPS, API_MIG_ROUTINES, API_SYSCALLS, FILES_ANYWHERE, MACH_TRAPS,
+    MACH_TRAPS_IF_DEFINED, MIG_ROUTINES, PROFILE, SYSCALLS, api_profile, apply, apply_api,
+    denied_syscall, files_in_jail, narrow, profile, select, selected,
 };
 
 /// Narrows the sandbox to what a running microVM needs, for good. Called
@@ -209,6 +210,10 @@ mod macos {
         "getattrlist", "shm_open", "shm_unlink", "gettid", "issetugid", "proc_info",
         "getdirentries64", "bsdthread_create", "kqueue", "sigsuspend_nocancel", "fileport_makefd",
         "bsdthread_ctl",
+        // vmnet.framework's XPC connection reads the process's persona once
+        // the process forked (the API process, ext::api_process): measured,
+        // syscall-unix 494 in the sandbox's report.
+        "persona",
         // The Sandbox call narrow() takes the narrowed extension with
         // (PROFILE's system-mac-syscall rules).
         "__mac_syscall",
@@ -268,6 +273,107 @@ mod macos {
     /// (allowed where Seatbelt knows them). Measured: libmalloc's deferred
     /// reclamation.
     pub const MACH_TRAPS_IF_DEFINED: &[&str] = &["mach_vm_reclaim_update_kernel_accounting_trap"];
+
+    /// The API process's system calls (`ext::api_process`), each line the
+    /// rule of upstream's `api` filter it stands for: an HTTP server on a
+    /// socket it already listens on.
+    #[rustfmt::skip]
+    pub const API_SYSCALLS: &[&str] = &[
+        // accept4.
+        "accept", "accept_nocancel",
+        // read, recvfrom, recvmsg, sendto, write.
+        "read", "read_nocancel", "readv", "readv_nocancel", "write", "write_nocancel", "writev",
+        "writev_nocancel", "recvfrom", "recvfrom_nocancel", "recvmsg", "recvmsg_nocancel",
+        "sendto", "sendto_nocancel", "sendmsg", "sendmsg_nocancel",
+        // epoll_ctl, epoll_pwait.
+        "kevent", "kevent_qos", "kevent_id",
+        // openat (paths: none, the profile has no file rule), close, fcntl,
+        // ioctl (FIONBIO), fstat.
+        "open", "open_nocancel", "openat", "openat_nocancel", "close", "close_nocancel", "fcntl",
+        "fcntl_nocancel", "ioctl", "fstat64",
+        // mmap, munmap, madvise (brk, mremap: macOS's allocator maps).
+        "mmap", "munmap", "madvise",
+        // futex.
+        "psynch_mutexwait", "psynch_mutexdrop", "psynch_cvbroad", "psynch_cvsignal",
+        "psynch_cvwait", "psynch_cvclrprepost", "ulock_wait", "ulock_wake", "ulock_wait2",
+        // getrandom, clock_gettime, gettid.
+        "getentropy", "gettimeofday", "thread_selfid",
+        // rt_sigaction, rt_sigprocmask, rt_sigreturn, sigaltstack, tkill.
+        "sigaction", "sigprocmask", "__pthread_sigmask", "sigreturn", "sigaltstack",
+        "__pthread_kill",
+        // exit, exit_group: a thread's exit, a panic.
+        "exit", "bsdthread_terminate", "__disable_threadsignal", "abort_with_payload",
+        "os_fault_with_payload",
+    ];
+
+    /// The API process's Mach traps: memory (mmap, munmap), port rights of
+    /// its own task (close), futex, sched_yield.
+    #[rustfmt::skip]
+    pub const API_MACH_TRAPS: &[&str] = &[
+        "_kernelrpc_mach_vm_allocate_trap", "_kernelrpc_mach_vm_deallocate_trap",
+        "_kernelrpc_mach_vm_map_trap", "_kernelrpc_mach_port_deallocate_trap",
+        "_kernelrpc_mach_port_mod_refs_trap", "_kernelrpc_mach_port_construct_trap",
+        "_kernelrpc_mach_port_destruct_trap", "semaphore_signal_trap", "semaphore_wait_trap",
+        "swtch_pri", "syscall_thread_switch",
+    ];
+
+    /// The API process's kernel MIG routines.
+    pub const API_MIG_ROUTINES: &[&str] = &["mach_vm_map_external"];
+
+    /// The API process's rules, after [`default_rule`]: as [`PROFILE`]'s,
+    /// without shared memory and the setup phase.
+    pub const API_PROFILE: &str = r#"(allow network-inbound (local unix-socket))
+(allow network-outbound (remote unix-socket))
+(allow signal (target self))
+(allow process-info* (target self))
+(deny file-map-executable (with send-signal SIGSYS))
+(deny dynamic-code-generation (with send-signal SIGSYS))
+(deny syscall-unix (with send-signal SIGSYS))
+(deny syscall-mach (with send-signal SIGSYS))
+(deny syscall-mig (with send-signal SIGSYS))
+(deny generic-issue-extension)
+(deny system-mac-syscall (with send-signal SIGSYS))
+"#;
+
+    /// The API process's profile: only its lists, no files, Unix sockets only
+    /// (the API socket, the link to Firecracker), no setup phase (on Linux
+    /// the API thread's filter is installed before it serves).
+    pub fn api_profile() -> String {
+        let mut rule = format!("(version 1)\n{}{API_PROFILE}", default_rule());
+        rule.push_str(&api_discovery_rule());
+        rule.push_str(&allow("syscall-unix", "", "syscall-number", "SYS_", API_SYSCALLS));
+        rule.push_str(&allow("syscall-mach", "", "machtrap-number", "MSC_", API_MACH_TRAPS));
+        rule.push_str(&allow("syscall-mig", "", "kernel-mig-routine", "", API_MIG_ROUTINES));
+        rule
+    }
+
+    /// The discovery build's rule for the API process: every call outside
+    /// its lists is allowed and reported.
+    #[allow(unexpected_cfgs)]
+    fn api_discovery_rule() -> String {
+        #[cfg(wick_sandbox_discovery)]
+        return "(allow syscall-unix syscall-mach syscall-mig (with report))\n".to_owned();
+        #[allow(unreachable_code)]
+        String::new()
+    }
+
+    /// Installs the API process's sandbox ([`api_profile`]) and the check of
+    /// executable mappings, unless the sandbox is off (`--no-seccomp`).
+    #[allow(unexpected_cfgs)]
+    pub fn apply_api() -> Result<(), SandboxError> {
+        let mut state = STATE.lock().unwrap();
+        if state.policy == Policy::None || state.installed {
+            return Ok(());
+        }
+        install(&api_profile())?;
+        state.installed = true;
+        INSTALLED.store(true, Ordering::Relaxed);
+        state.narrowed_done = true;
+        if !cfg!(wick_sandbox_discovery) {
+            libc::wick_mm::deny_exec(exec_denied);
+        }
+        Ok(())
+    }
 
     /// File rule without the jailer: guest kernels, disks, snapshots, logs,
     /// metrics and the API socket are chosen by the operator, also after
@@ -536,6 +642,12 @@ mod macos {
         STATE.lock().unwrap().policy = policy;
     }
 
+    /// The selected policy (for the API process made before the selection,
+    /// `ext::api_process`).
+    pub fn selected() -> Policy {
+        STATE.lock().unwrap().policy
+    }
+
     /// Installs the selected sandbox if it is not installed yet.
     pub fn apply() -> Result<(), SandboxError> {
         let mut state = STATE.lock().unwrap();
@@ -744,6 +856,78 @@ mod macos {
             narrow().unwrap();
             // SAFETY: as above.
             unsafe { libc::dup(1) };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        // The API process's profile (ext::api_process) allows what an HTTP
+        // server on an open socket needs, as upstream's api filter: a call
+        // outside API_SYSCALLS, shared memory and an executable mapping raise
+        // SIGSYS; a file fails with an error, as outside the chroot.
+        #[test]
+        fn test_api_profile_raises_sigsys_outside_its_list() {
+            use std::os::unix::process::ExitStatusExt;
+            for case in ["dup", "shm", "exec", "socketpair"] {
+                let out = child("api_child", &[("WICK_TEST_CASE", case)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(stdout.contains("SETUP-OK"), "{case}: {stdout}");
+                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
+                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+            }
+            let out = child("api_child", &[("WICK_TEST_CASE", "allowed")]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && stdout.contains("CHILD-OK"), "{:?}\n{stdout}", out.status);
+        }
+
+        #[test]
+        #[ignore = "run by test_api_profile_raises_sigsys_outside_its_list in a separate process"]
+        fn api_child() {
+            use std::io::{Read, Write};
+            let case = std::env::var("WICK_TEST_CASE").unwrap();
+            let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+            select(Policy::Default);
+            apply_api().unwrap();
+            // What the API process does: Unix socket I/O, memory, time,
+            // randomness, threads' locks.
+            a.write_all(b"ping").unwrap();
+            let mut buf = [0u8; 4];
+            b.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"ping");
+            let v: Vec<u8> = vec![7; 1 << 20];
+            assert_eq!(v.iter().map(|&x| u64::from(x)).sum::<u64>(), 7 << 20);
+            let _ = std::time::SystemTime::now();
+            let mut entropy = [0u8; 16];
+            // SAFETY: a 16-byte output buffer.
+            assert_eq!(unsafe { libc::getentropy(entropy.as_mut_ptr().cast(), 16) }, 0);
+            // Files fail with an error.
+            std::fs::File::open("/etc/hosts").unwrap_err();
+            println!("SETUP-OK");
+            std::io::stdout().flush().unwrap();
+            match case.as_str() {
+                "allowed" => {
+                    println!("CHILD-OK");
+                    return;
+                }
+                // SAFETY: a plain call.
+                "dup" => unsafe {
+                    libc::dup(1);
+                },
+                // SAFETY: a NUL-terminated name.
+                "shm" => unsafe {
+                    libc::shm_open(c"/wick-api-test".as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
+                },
+                // SAFETY: a new anonymous mapping.
+                "exec" => unsafe {
+                    libc::mmap(std::ptr::null_mut(), 16384, libc::PROT_READ | libc::PROT_EXEC,
+                        libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+                },
+                _ => {
+                    let mut fds = [0; 2];
+                    // SAFETY: a two-element output buffer.
+                    unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+                }
+            }
+            // Seatbelt signals the process, not the thread.
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
         }

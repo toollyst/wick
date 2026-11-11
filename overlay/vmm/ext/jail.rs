@@ -29,6 +29,18 @@
 //! process can also lift its own limit; the sandbox's system call allow-list
 //! denies the call that would ([`super::sandbox`]), and the sandbox refuses to
 //! be turned off while a CPU limit is set ([`cpu_limit`]).
+//!
+//! A memory cgroup limit comes as [`MEMORY_ENV`], in MiB: the jailer set it
+//! as Firecracker's jetsam limit at the exec.
+//!
+//! On Linux one cgroup holds all of Firecracker, its API thread included. On
+//! macOS the API server's HTTP side is a process of its own
+//! ([`super::api_process`]), and both limits are per process: a fork does not
+//! inherit the CPU limit, and only root sets a jetsam limit. So when the jail
+//! has a limit and the API is on, [`enter`] makes the API process while
+//! Firecracker is still root, gives it a fixed share of each limit
+//! ([`API_MEMORY_MIB`], [`API_CPU_PERCENT`]) and keeps the rest: together
+//! they stay within the jail's limit, as one cgroup would.
 
 use std::path::Path;
 
@@ -37,6 +49,19 @@ pub const ENV: &str = "WICK_JAIL";
 
 /// Environment variable through which the jailer hands a CPU limit over.
 pub const CPU_ENV: &str = "WICK_JAIL_CPU";
+
+/// Environment variable through which the jailer hands the memory limit (MiB)
+/// over.
+pub const MEMORY_ENV: &str = "WICK_JAIL_MEMORY";
+
+/// The API process's share of a jail's memory limit, in MiB: a process
+/// forked at start-up (a few MiB) and the requests it holds, at most the API
+/// payload limit each.
+pub const API_MEMORY_MIB: u32 = 32;
+
+/// The API process's share of a jail's CPU limit, in percent of one CPU:
+/// parsing requests and passing them on.
+pub const API_CPU_PERCENT: u8 = 1;
 
 /// Marks a binary that takes the jail over from the jailer. The jailer refuses
 /// to exec a binary without it as root, since such a binary would run unjailed.
@@ -68,6 +93,16 @@ pub enum JailError {
     StillPrivileged(String),
     /// Failed to revert to the jail's token: {0}
     Revert(std::io::Error),
+    /// Invalid WICK_JAIL_MEMORY value {0:?}: expected a memory limit in MiB, with WICK_JAIL
+    MemoryFormat(String),
+    /// The jail's memory limit of {0} MiB leaves too little once the API process has its share of 32 MiB: give it more than 64 MiB, or run with --no-api
+    MemoryTooSmall(u32),
+    /// The jail's CPU limit of {0}% cannot be shared with the API process (1%): give it 2% or more, or run with --no-api
+    CpuTooSmall(u8),
+    /// Failed to set the jetsam memory limit of {0} MiB: {1}
+    MemoryLimit(u32, std::io::Error),
+    /// Failed to make the API process: {0}
+    ApiProcess(std::io::Error),
 }
 
 /// The jail's root directory, as a path outside the jail, if Firecracker was
@@ -86,6 +121,36 @@ pub fn enter() -> Result<(), JailError> {
 #[cfg(target_os = "macos")]
 pub fn cpu_limit() -> Option<u8> {
     imp::cpu_limit()
+}
+
+/// The [`MEMORY_ENV`] value: MiB, at least 1.
+#[cfg(any(target_os = "macos", test))]
+fn parse_memory(value: &str) -> Result<u32, JailError> {
+    match value.parse::<u32>() {
+        Ok(mib) if mib > 0 && value.bytes().all(|b| b.is_ascii_digit()) => Ok(mib),
+        _ => Err(JailError::MemoryFormat(value.to_owned())),
+    }
+}
+
+/// How a jail's limits are shared when the API server is a process of its
+/// own: `(Firecracker's, the API process's)` CPU and memory limits.
+#[cfg(any(target_os = "macos", test))]
+#[allow(clippy::type_complexity)]
+fn share(
+    cpu: Option<u8>,
+    memory: Option<u32>,
+) -> Result<((Option<u8>, Option<u8>), (Option<u32>, Option<u32>)), JailError> {
+    let cpu = match cpu {
+        Some(p) if p <= API_CPU_PERCENT => return Err(JailError::CpuTooSmall(p)),
+        Some(p) => (Some(p - API_CPU_PERCENT), Some(API_CPU_PERCENT)),
+        None => (None, None),
+    };
+    let memory = match memory {
+        Some(m) if m <= 2 * API_MEMORY_MIB => return Err(JailError::MemoryTooSmall(m)),
+        Some(m) => (Some(m - API_MEMORY_MIB), Some(API_MEMORY_MIB)),
+        None => (None, None),
+    };
+    Ok((cpu, memory))
 }
 
 /// The [`CPU_ENV`] value: a percentage of one CPU, 1 to 255.
@@ -132,7 +197,9 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
 
-    use super::{CPU_ENV, ENV, JailError, Spec, parse, parse_cpu};
+    use super::{
+        CPU_ENV, ENV, JailError, MEMORY_ENV, Spec, parse, parse_cpu, parse_memory, share,
+    };
 
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     static CPU_LIMIT: OnceLock<u8> = OnceLock::new();
@@ -218,23 +285,126 @@ mod imp {
         if ret == 0 { Ok(()) } else { Err(Error::last_os_error()) }
     }
 
+    /// `memorystatus_memlimit_properties_t` (sys/kern_memorystatus.h).
+    #[repr(C)]
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct MemlimitProperties {
+        active: i32,
+        active_attr: u32,
+        inactive: i32,
+        inactive_attr: u32,
+    }
+
+    // sys/kern_memorystatus.h.
+    const MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES: u32 = 7;
+    const MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES: u32 = 8;
+    const MEMORYSTATUS_MEMLIMIT_ATTR_FATAL: u32 = 1;
+
+    unsafe extern "C" {
+        fn memorystatus_control(
+            command: u32,
+            pid: i32,
+            flags: u32,
+            buffer: *mut libc::c_void,
+            size: libc::size_t,
+        ) -> libc::c_int;
+    }
+
+    /// Sets this process's jetsam limit to `mib` (killed when it goes over,
+    /// as the jailer's limit at the exec), and reads it back. Needs root.
+    fn limit_memory(mib: u32) -> Result<(), JailError> {
+        let fail = |e| JailError::MemoryLimit(mib, e);
+        let limit = i32::try_from(mib).map_err(|_| fail(Error::other("too large")))?;
+        let mut set = MemlimitProperties {
+            active: limit,
+            active_attr: MEMORYSTATUS_MEMLIMIT_ATTR_FATAL,
+            inactive: limit,
+            inactive_attr: MEMORYSTATUS_MEMLIMIT_ATTR_FATAL,
+        };
+        let size = std::mem::size_of::<MemlimitProperties>();
+        // SAFETY: a valid properties buffer of the size passed; this process.
+        check(unsafe {
+            memorystatus_control(
+                MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES,
+                libc::getpid(),
+                0,
+                std::ptr::from_mut(&mut set).cast(),
+                size,
+            )
+        })
+        .map_err(fail)?;
+        let mut got = MemlimitProperties::default();
+        // SAFETY: as above.
+        check(unsafe {
+            memorystatus_control(
+                MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES,
+                libc::getpid(),
+                0,
+                std::ptr::from_mut(&mut got).cast(),
+                size,
+            )
+        })
+        .map_err(fail)?;
+        if got.active != limit || got.inactive != limit || got.active_attr & 1 == 0 {
+            return Err(fail(Error::other(format!("the kernel reports {got:?}"))));
+        }
+        Ok(())
+    }
+
+    fn drop_privileges(uid: u32, gid: u32) -> Result<(), JailError> {
+        let groups = [gid];
+        // SAFETY: a one-element group list.
+        check(unsafe { libc::setgroups(1, groups.as_ptr()) })
+            .map_err(|e| JailError::SetGroups(gid, e))?;
+        // SAFETY: no pointers.
+        check(unsafe { libc::setgid(gid) }).map_err(|e| JailError::SetGid(gid, e))?;
+        // SAFETY: no pointers.
+        check(unsafe { libc::setuid(uid) }).map_err(|e| JailError::SetUid(uid, e))?;
+        verify_dropped(uid, gid)
+    }
+
+    /// The API process's side of [`enter`]: its share of the limits, the
+    /// same privileges as Firecracker, then it waits for the API server.
+    fn api_process(link: std::os::unix::net::UnixStream, uid: u32, gid: u32, cpu: Option<u8>, memory: Option<u32>) -> ! {
+        let result = (|| {
+            if let Some(mib) = memory {
+                limit_memory(mib)?;
+            }
+            drop_privileges(uid, gid)?;
+            if let Some(percent) = cpu {
+                limit_cpu(percent)?;
+            }
+            Ok::<(), JailError>(())
+        })();
+        if let Err(err) = result {
+            eprintln!("The API server process could not enter the jail: {err}");
+            // SAFETY: ends this process (Firecracker's exit code is the parent's).
+            unsafe { libc::_exit(1) };
+        }
+        crate::ext::api_process::wait_for_server(link)
+    }
+
     pub fn enter() -> Result<(), JailError> {
         let cpu = std::env::var_os(CPU_ENV).map(|v| v.to_string_lossy().into_owned());
+        let memory = std::env::var_os(MEMORY_ENV).map(|v| v.to_string_lossy().into_owned());
         let Some(value) = std::env::var_os(ENV) else {
-            // A CPU limit alone would be the jail's, without the jail.
-            return match cpu {
-                Some(cpu) => Err(JailError::CpuFormat(cpu)),
-                None => Ok(()),
+            // A limit alone would be the jail's, without the jail.
+            return match (cpu, memory) {
+                (Some(cpu), _) => Err(JailError::CpuFormat(cpu)),
+                (_, Some(memory)) => Err(JailError::MemoryFormat(memory)),
+                (None, None) => Ok(()),
             };
         };
         // SAFETY: called first thing in main, before any other thread exists.
         unsafe {
             std::env::remove_var(ENV);
             std::env::remove_var(CPU_ENV);
+            std::env::remove_var(MEMORY_ENV);
         }
         let value = value.to_string_lossy().into_owned();
         let Spec { uid, gid, root } = parse(&value)?;
         let cpu = cpu.as_deref().map(parse_cpu).transpose()?;
+        let memory = memory.as_deref().map(parse_memory).transpose()?;
         // SAFETY: no arguments.
         let euid = unsafe { libc::geteuid() };
         if euid != 0 {
@@ -246,17 +416,35 @@ mod imp {
             .map_err(|e| JailError::Chroot(root.clone(), e))?;
         // SAFETY: NUL-terminated path.
         check(unsafe { libc::chdir(c"/".as_ptr()) }).map_err(JailError::Chdir)?;
-        let groups = [gid];
-        // SAFETY: a one-element group list.
-        check(unsafe { libc::setgroups(1, groups.as_ptr()) })
-            .map_err(|e| JailError::SetGroups(gid, e))?;
-        // SAFETY: no pointers.
-        check(unsafe { libc::setgid(gid) }).map_err(|e| JailError::SetGid(gid, e))?;
-        // SAFETY: no pointers.
-        check(unsafe { libc::setuid(uid) }).map_err(|e| JailError::SetUid(uid, e))?;
-        verify_dropped(uid, gid)?;
-        if let Some(percent) = cpu {
+        // With a limit and the API on, the API process is made now, while
+        // Firecracker is root and has one thread, with its share of the
+        // limits (see the module's documentation).
+        let mut own_cpu = cpu;
+        let api = !std::env::args().any(|a| a == "--no-api");
+        if api && (cpu.is_some() || memory.is_some()) {
+            let ((vmm_cpu, api_cpu), (vmm_memory, api_memory)) = share(cpu, memory)?;
+            let (ours, theirs) =
+                std::os::unix::net::UnixStream::pair().map_err(JailError::ApiProcess)?;
+            // SAFETY: called first thing in main, with one thread.
+            match unsafe { libc::fork() } {
+                -1 => return Err(JailError::ApiProcess(Error::last_os_error())),
+                0 => {
+                    drop(ours);
+                    api_process(theirs, uid, gid, api_cpu, api_memory);
+                }
+                _ => drop(theirs),
+            }
+            if let Some(mib) = vmm_memory {
+                limit_memory(mib)?;
+            }
+            own_cpu = vmm_cpu;
+            crate::ext::api_process::set_waiting(ours);
+        }
+        drop_privileges(uid, gid)?;
+        if let Some(percent) = own_cpu {
             limit_cpu(percent)?;
+        }
+        if let Some(percent) = cpu {
             CPU_LIMIT.set(percent).expect("the jail is entered once");
         }
         ROOT.set(PathBuf::from(root))
@@ -443,6 +631,31 @@ mod tests {
         for bad in ["", "0", "256", "-1", "+5", " 5", "5%", "x"] {
             assert!(matches!(parse_cpu(bad), Err(JailError::CpuFormat(_))), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn test_parse_memory() {
+        assert_eq!(parse_memory("1").unwrap(), 1);
+        assert_eq!(parse_memory("4096").unwrap(), 4096);
+        for bad in ["", "0", "-1", "+5", " 5", "5M", "x", "99999999999"] {
+            assert!(matches!(parse_memory(bad), Err(JailError::MemoryFormat(_))), "{bad:?}");
+        }
+    }
+
+    // The jail's limits, shared with the API process, add up to what the
+    // jail allows, as one cgroup's would.
+    #[test]
+    fn test_limits_are_shared_with_the_api_process() {
+        let ((vmm_cpu, api_cpu), (vmm_mem, api_mem)) = share(Some(50), Some(512)).unwrap();
+        assert_eq!((vmm_cpu, api_cpu), (Some(49), Some(API_CPU_PERCENT)));
+        assert_eq!((vmm_mem, api_mem), (Some(512 - API_MEMORY_MIB), Some(API_MEMORY_MIB)));
+        assert_eq!(vmm_cpu.unwrap() + api_cpu.unwrap(), 50);
+        assert_eq!(vmm_mem.unwrap() + api_mem.unwrap(), 512);
+        assert_eq!(share(None, None).unwrap(), ((None, None), (None, None)));
+        assert_eq!(share(Some(2), None).unwrap(), ((Some(1), Some(1)), (None, None)));
+        assert!(matches!(share(Some(1), None), Err(JailError::CpuTooSmall(1))));
+        assert!(matches!(share(None, Some(64)), Err(JailError::MemoryTooSmall(64))));
+        assert_eq!(share(None, Some(65)).unwrap().1, (Some(33), Some(32)));
     }
 
     #[cfg(target_os = "macos")]

@@ -102,8 +102,13 @@ upstream Firecracker and its jailer.
   Firecracker's first 2 seconds of CPU time (a guest booting under it disabled its timer; roadmap M5). Without the
   jailer, Windows confinement is the mitigation profile only (no jail directory, token or Job Object).
 - **No per-thread filters outside Linux.** Neither macOS nor Windows filters system calls per thread. Threads of a
-  process share its address space, so the plan applies the union of upstream's filters process-wide and moves the
-  API server, whose separate filter is a real boundary, into a process of its own.
+  process share its address space, so the union of upstream's filters applies process-wide, and the API server,
+  whose separate filter is a real boundary, moves into a process of its own. On macOS that is in place: the API
+  socket's HTTP server and upstream's request parsing run in a process sandboxed as upstream's `api` filter (its
+  system calls only, no files, no shared memory, no executable mappings), and Firecracker's API thread handles the
+  requests it passes on with upstream's code; either process's end ends the other (`test_api_profile_*`,
+  `boot-test api-process`). In a jail the two share the jail's memory and CPU limits, so together they stay within
+  them (`test_limits_are_shared_with_the_api_process`; the jailer-test stage needs root). Windows: planned.
 - **wick's host-side code is young.** The compatibility crates and the macOS and Windows backends (the
   Hypervisor.framework and WHP run loops, the userfaultfd kernel side, the network backends) have not had the years
   of review and fuzzing upstream's code has had, and have not had a third-party audit. Fuzzing has started: the

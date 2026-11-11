@@ -25,3 +25,4 @@
 0023-tests-vmm-s-unit-tests-build-on-Windows.patch
 0024-block-a-Windows-drive-s-serial-is-distinct-per-file.patch
 0025-jailer-new-pid-ns-on-Windows-hands-over-to-a-keeper.patch
+0026-api-the-HTTP-server-in-a-process-of-its-own-where-th.patch

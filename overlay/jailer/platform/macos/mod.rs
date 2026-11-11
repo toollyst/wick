@@ -20,6 +20,10 @@ const JAIL_ENV: &str = "WICK_JAIL";
 /// Environment variable with the CPU limit for Firecracker to apply to itself
 /// (`vmm::ext::jail::CPU_ENV`).
 const JAIL_CPU_ENV: &str = "WICK_JAIL_CPU";
+/// Environment variable through which Firecracker learns the jail's memory
+/// limit in MiB (`vmm::ext::jail::MEMORY_ENV`), to share it with its API
+/// process.
+const JAIL_MEMORY_ENV: &str = "WICK_JAIL_MEMORY";
 /// Firecracker's temporary directory in the jail. On macOS eventfds are
 /// unlinked FIFOs and memfds unlinked files (crates/compat), made in the
 /// temporary directory; on Linux both are kernel objects, so upstream's jail
@@ -171,7 +175,7 @@ pub fn copy_midr_el1_info() -> Result<(), JailerError> {
 /// so the jailed user never had a chance to write the binary run as root),
 /// checks it takes the jail over, and replaces the jailer with it
 /// (`POSIX_SPAWN_SETEXEC`: same PID) with only the standard descriptors,
-/// `WICK_JAIL` (and `WICK_JAIL_CPU` for a CPU limit) as its whole environment
+/// `WICK_JAIL` (and `WICK_JAIL_CPU`, `WICK_JAIL_MEMORY` for the limits) as its whole environment
 /// and the jetsam memory limit. Returns only on failure.
 pub fn exec_command(
     exec_file_path: &Path,
@@ -214,6 +218,9 @@ fn exec(
     ];
     if let Some(percent) = *CPU_LIMIT_PERCENT.lock().unwrap() {
         env.push(CString::new(format!("{JAIL_CPU_ENV}={percent}")).expect("no NUL"));
+    }
+    if let Some(mib) = *MEMORY_LIMIT_MIB.lock().unwrap() {
+        env.push(CString::new(format!("{JAIL_MEMORY_ENV}={mib}")).expect("no NUL"));
     }
     let mut argv_ptrs: Vec<*mut libc::c_char> = argv.iter().map(|a| a.as_ptr().cast_mut()).collect();
     argv_ptrs.push(std::ptr::null_mut());
