@@ -3,9 +3,16 @@
 
 //! `timerfd_*` for macOS.
 //!
-//! A timer is a Unix socket pair. The caller gets the read end, which becomes
-//! readable when the timer expires and yields one native-endian `u64` per
-//! expiration, like a Linux timerfd. One background thread fires all timers.
+//! A timer is an unnamed FIFO (made, opened, its name removed), as an eventfd
+//! is here (vmm-sys-util's): Firecracker makes timers after its sandbox is
+//! narrowed (a hotplugged device's rate limiter), where upstream's filter
+//! allows `timerfd_create` and the narrowed sandbox allows a FIFO but no
+//! socket pair. The caller gets a descriptor open for reading (and writing,
+//! so that opening waits for no peer), which becomes readable when the timer
+//! expires and yields one native-endian `u64` per expiration, like a Linux
+//! timerfd. One background thread fires all timers through a write-only
+//! descriptor of its own, and learns that the caller closed the timer when
+//! the FIFO has no reader left (`EPIPE`).
 //!
 //! Differences from Linux:
 //! - each expiration is a separate 8-byte record instead of one accumulated
@@ -15,7 +22,10 @@
 //!   `EINVAL`), and every clock is treated as `CLOCK_MONOTONIC`.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -99,57 +109,80 @@ fn fcntl_or(fd: c_int, get: c_int, set: c_int, flag: c_int) -> bool {
     flags >= 0 && unsafe { libc::fcntl(fd, set, flags | flag) } >= 0
 }
 
+/// `F_SETNOSIGPIPE` (<sys/fcntl.h>; not in the libc crate): a write to a
+/// FIFO without a reader fails with `EPIPE` and raises no `SIGPIPE`.
+const F_SETNOSIGPIPE: c_int = 73;
+
+/// An unnamed FIFO: (the caller's descriptor, open for reading and writing;
+/// the timer thread's, open for writing, non-blocking, without `SIGPIPE`).
+fn unnamed_fifo() -> Option<(OwnedFd, OwnedFd)> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..16 {
+        let path = std::env::temp_dir().join(std::format!(
+            ".timerfd-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
+            set_errno(libc::EINVAL);
+            return None;
+        };
+        // SAFETY: mkfifo with a NUL-terminated path.
+        if unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) } != 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+                continue;
+            }
+            return None;
+        }
+        // Open for reading and writing, the reader's end waits for no peer;
+        // the writer's then finds a reader.
+        // SAFETY: open with a NUL-terminated path.
+        let read_fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        // SAFETY: as above.
+        let write_fd = (read_fd >= 0)
+            .then(|| unsafe { libc::open(cpath.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) });
+        let err = std::io::Error::last_os_error();
+        // SAFETY: as above; the descriptors keep the FIFO.
+        unsafe { libc::unlink(cpath.as_ptr()) };
+        // SAFETY: fresh descriptors we own, when open() returned them.
+        let read_end = (read_fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(read_fd) });
+        let write_end = write_fd
+            .filter(|fd| *fd >= 0)
+            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+        let (Some(read_end), Some(write_end)) = (read_end, write_end) else {
+            set_errno(err.raw_os_error().unwrap_or(libc::EIO));
+            return None;
+        };
+        // SAFETY: fcntl on a descriptor we own.
+        if unsafe { libc::fcntl(write_end.as_raw_fd(), F_SETNOSIGPIPE, 1) } != 0 {
+            return None;
+        }
+        return Some((read_end, write_end));
+    }
+    set_errno(libc::EEXIST);
+    None
+}
+
 /// Creates a timer and returns its descriptor, or `-1` with `errno` set.
 ///
 /// # Safety
 /// Same contract as Linux `timerfd_create`.
 pub unsafe fn timerfd_create(_clockid: clockid_t, flags: c_int) -> c_int {
-    let mut fds = [0 as c_int; 2];
-    // SAFETY: `fds` has room for two descriptors.
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } < 0 {
+    let Some((read_end, write_end)) = unnamed_fifo() else {
         return -1;
-    }
-    // SAFETY: socketpair() returned two fresh descriptors that we now own.
-    let (read_end, write_end) =
-        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    let one: c_int = 1;
-    // SAFETY: valid option pointer and length; failures are checked.
-    let nosigpipe = unsafe {
-        libc::setsockopt(
-            write_end.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_NOSIGPIPE,
-            (&one as *const c_int).cast(),
-            std::mem::size_of::<c_int>() as libc::socklen_t,
-        )
     };
-    let ok = nosigpipe == 0
-        && fcntl_or(
-            write_end.as_raw_fd(),
+    let ok = (flags & TFD_NONBLOCK == 0
+        || fcntl_or(
+            read_end.as_raw_fd(),
             libc::F_GETFL,
             libc::F_SETFL,
             libc::O_NONBLOCK,
-        )
-        && fcntl_or(
-            write_end.as_raw_fd(),
-            libc::F_GETFD,
-            libc::F_SETFD,
-            libc::FD_CLOEXEC,
-        )
-        && (flags & TFD_NONBLOCK == 0
-            || fcntl_or(
-                read_end.as_raw_fd(),
-                libc::F_GETFL,
-                libc::F_SETFL,
-                libc::O_NONBLOCK,
-            ))
-        && (flags & TFD_CLOEXEC == 0
-            || fcntl_or(
-                read_end.as_raw_fd(),
-                libc::F_GETFD,
-                libc::F_SETFD,
-                libc::FD_CLOEXEC,
-            ));
+        ))
+        && (flags & TFD_CLOEXEC != 0 || {
+            // The FIFO was opened close-on-exec; the caller did not ask for it.
+            // SAFETY: fcntl on a descriptor we own.
+            unsafe { libc::fcntl(read_end.as_raw_fd(), libc::F_SETFD, 0) >= 0 }
+        });
     if !ok {
         return -1;
     }
@@ -380,5 +413,34 @@ mod tests {
         );
         // SAFETY: closing our descriptor.
         unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn test_a_timer_is_a_fifo_and_its_close_is_seen() {
+        // SAFETY: plain call.
+        let fd = unsafe { timerfd_create(libc::CLOCK_MONOTONIC, TFD_NONBLOCK) };
+        assert!(fd >= 0);
+        // An unnamed FIFO, as an eventfd here: the narrowed sandbox allows
+        // making one, and no socket pair.
+        // SAFETY: fstat into a zeroed struct.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFIFO);
+        // SAFETY: fcntl on our descriptor; not asked for, not set.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+        // SAFETY: valid descriptor and spec.
+        assert_eq!(
+            unsafe { timerfd_settime(fd, 0, &spec(1, 0), std::ptr::null_mut()) },
+            0
+        );
+        // SAFETY: closing our descriptor before the timer fires: its
+        // expiration finds no reader (EPIPE, no SIGPIPE) and drops it.
+        unsafe { libc::close(fd) };
+        let gone = (0..200).any(|_| {
+            std::thread::sleep(Duration::from_millis(5));
+            !TIMERS.by_fd.lock().unwrap().contains_key(&fd)
+        });
+        assert!(gone);
     }
 }
