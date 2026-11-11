@@ -171,6 +171,21 @@ pub mod wick_mm {
     pub(super) static EXEC_DENIED: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
+    pub use super::Access;
+
+    /// The guest's access to `addr`, host memory of guest RAM, that the
+    /// hypervisor reported (WHP's memory access exit): commits the pages of
+    /// lazy memory there ([`super::LAZY`]). `write`: the access was a write.
+    pub fn commit_on_access(addr: usize, write: bool) -> Access {
+        super::commit_on_access(addr, write)
+    }
+
+    /// Ends the process for memory that could not be committed
+    /// ([`Access::Exhausted`]), as the cgroup OOM killer ends the VMM.
+    pub fn out_of_memory(addr: usize, err: u32) -> ! {
+        super::out_of_memory(addr, err)
+    }
+
     /// Calls the [`deny_exec`] hook if `prot` asks for execution.
     pub(super) fn check_exec(prot: c_int) {
         if prot & PROT_EXEC == 0 {
@@ -332,6 +347,9 @@ struct Region {
     /// charge (`MAP_NORESERVE`), and fault on access. Still mapped: an
     /// `mprotect` that allows access commits them again, zero-filled.
     noaccess: Ranges,
+    /// Anonymous private `MAP_NORESERVE` memory whose pages are committed at
+    /// their first access ([`LAZY`]).
+    lazy: bool,
 }
 
 impl Region {
@@ -341,6 +359,7 @@ impl Region {
             kind,
             holes: Vec::new(),
             noaccess: Vec::new(),
+            lazy: false,
         }
     }
 
@@ -505,6 +524,10 @@ fn to_placeholder(t: &mut Table, base: usize) -> bool {
     if ok == 0 {
         return false;
     }
+    if r.lazy {
+        lazy_remove(base, r.len);
+        r.lazy = false;
+    }
     r.kind = Kind::Placeholder;
     r.holes.clear();
     r.noaccess.clear();
@@ -514,6 +537,9 @@ fn to_placeholder(t: &mut Table, base: usize) -> bool {
 /// Releases the region at `base` and its address space.
 fn release(t: &mut Table, base: usize) -> bool {
     let r = t.remove(&base).unwrap();
+    if r.lazy {
+        lazy_remove(base, r.len);
+    }
     // SAFETY: frees our allocation, view or placeholder.
     let ok = unsafe {
         match r.kind {
@@ -592,6 +618,233 @@ fn make_placeholder(t: &mut Table, start: usize, end: usize) -> Result<(), c_int
         t.get_mut(&start).unwrap().len = end - start;
     }
     Ok(())
+}
+
+/// Anonymous private `MAP_NORESERVE` memory that is reserved, not committed:
+/// each range gets its pages committed, with its protection, at the first
+/// access to them, as Linux gives an anonymous mapping its pages (and
+/// charges a cgroup for them) when they are touched, not when they are
+/// mapped. Windows charges a job's memory limit for what is committed, so
+/// without this a guest is charged its whole memory at start-up: a jail's
+/// `memory.max` below the guest's size ended the VMM before the guest booted
+/// (measured: `jailer-test.ps1 memory`), where Linux kills it when the guest
+/// has used that much.
+///
+/// An access is caught where it happens: a host thread's (a device's, a
+/// snapshot's) by a vectored exception handler ([`lazy_on_exception`]), the
+/// guest's by the hypervisor's run loop, which WHP leaves with a memory
+/// access exit for a page that is not committed (measured: the exit, then
+/// the commit, then the access re-run). Sorted, disjoint `(start, len,
+/// protection)`. Locked briefly, never while memory is touched, so a fault
+/// inside a call that holds the region table cannot deadlock on it.
+static LAZY: Mutex<Vec<(usize, usize, PAGE_PROTECTION_FLAGS)>> = Mutex::new(Vec::new());
+
+/// How much is committed at a fault: a 64 KiB aligned block (clipped to its
+/// range), so a guest touching its memory in order takes one exit per block
+/// rather than per page.
+const LAZY_CHUNK: usize = 64 << 10;
+
+/// The exit code of a VMM that reached its memory limit: what a shell shows
+/// for a process the Linux OOM killer ended (`128 + SIGKILL`).
+pub(crate) const OOM_EXIT: u32 = 137;
+
+fn lazy_add(start: usize, len: usize, prot: PAGE_PROTECTION_FLAGS) {
+    lazy_remove(start, len);
+    let mut l = LAZY.lock().unwrap();
+    let at = l.partition_point(|&(s, _, _)| s < start);
+    l.insert(at, (start, len, prot));
+}
+
+fn lazy_remove(start: usize, len: usize) {
+    let end = start + len;
+    let mut l = LAZY.lock().unwrap();
+    let mut out = Vec::with_capacity(l.len() + 1);
+    for &(s, n, p) in l.iter() {
+        let e = s + n;
+        if e <= start || s >= end {
+            out.push((s, n, p));
+            continue;
+        }
+        if s < start {
+            out.push((s, start - s, p));
+        }
+        if e > end {
+            out.push((end, e - end, p));
+        }
+    }
+    *l = out;
+}
+
+/// The lazy ranges inside `[start, start + len)`.
+fn lazy_within(start: usize, len: usize) -> Vec<(usize, usize, PAGE_PROTECTION_FLAGS)> {
+    let end = start + len;
+    LAZY.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|&(s, n, p)| {
+            let (a, b) = (s.max(start), (s + n).min(end));
+            (a < b).then(|| (a, b - a, p))
+        })
+        .collect()
+}
+
+/// What an access to `addr` found ([`wick_mm::commit_on_access`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Not lazy memory, or lazy memory already committed: the access is not
+    /// this module's to resolve.
+    NotLazy,
+    /// The pages were committed now; the access can be run again.
+    Committed,
+    /// They could not be committed (the Windows error): the memory limit is
+    /// reached.
+    Exhausted(u32),
+}
+
+fn commit_on_access(addr: usize, write: bool) -> Access {
+    let found = {
+        let l = LAZY.lock().unwrap();
+        let i = l.partition_point(|&(s, _, _)| s <= addr);
+        i.checked_sub(1).map(|i| l[i]).filter(|&(s, n, _)| addr < s + n)
+    };
+    let Some((s, n, prot)) = found else {
+        return Access::NotLazy;
+    };
+    // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { VirtualQuery(addr as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+        return Access::NotLazy;
+    }
+    if mbi.State == MEM_COMMIT {
+        // Committed since the access: another thread or vCPU committed its
+        // block first (two vCPUs touching one block: measured, the second's
+        // exit was emulated as MMIO and the guest took a bogus fault). The
+        // access runs again; a write to memory mapped without write access
+        // is a protection fault, not ours.
+        let writable = matches!(prot, PAGE_READWRITE | PAGE_EXECUTE_READWRITE);
+        return if write && !writable { Access::NotLazy } else { Access::Committed };
+    }
+    let block = addr - addr % LAZY_CHUNK;
+    let (from, to) = (block.max(s), (block + LAZY_CHUNK).min(s + n));
+    if commit(from, to - from, prot, false) {
+        return Access::Committed;
+    }
+    // SAFETY: plain call.
+    let err = unsafe { GetLastError() };
+    // Another thread may have committed it meanwhile; only its page matters.
+    let page = addr - addr % PAGE;
+    if commit(page, PAGE, prot, false) {
+        Access::Committed
+    } else {
+        Access::Exhausted(err)
+    }
+}
+
+/// Commits the lazy pages of `[addr, addr + len)` that are not committed: a
+/// system call's buffer, which the kernel copies to or from without an
+/// exception this process could resolve (`ReadFile` into a page that is only
+/// reserved fails: measured, a guest kernel read into lazy memory). Linux
+/// faults the pages in as the call copies.
+pub(crate) fn prefault_lazy(addr: usize, len: usize) {
+    if len == 0 || LAZY.lock().unwrap().is_empty() {
+        return;
+    }
+    let start = addr - addr % PAGE;
+    for (s, n, prot) in lazy_within(start, (addr + len).div_ceil(PAGE) * PAGE - start) {
+        let end = s + n;
+        let mut at = s;
+        while at < end {
+            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+                break;
+            }
+            let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(end) - at;
+            if mbi.State != MEM_COMMIT && !commit(at, run, prot, false) {
+                // SAFETY: plain call.
+                out_of_memory(at, unsafe { GetLastError() });
+            }
+            at += run;
+        }
+    }
+}
+
+/// Commit charge set aside when the first lazy memory is mapped and given
+/// back when the limit is reached: then even a thread's stack cannot grow
+/// (measured: the process ended with `STATUS_STACK_OVERFLOW` writing the
+/// message below), and the message and the exit need some.
+static RESCUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const RESCUE_LEN: usize = 256 << 10;
+
+fn out_of_memory(addr: usize, err: u32) -> ! {
+    let rescue = RESCUE.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if rescue != 0 {
+        // SAFETY: frees the block set aside for this.
+        unsafe { VirtualFree(rescue as *mut c_void, 0, MEM_RELEASE) };
+    }
+    std::eprintln!(
+        "wick: guest memory: committing the pages at {addr:#x} failed with error {err}: the memory limit \
+         (the jail's memory.max, or the host's commit limit) is reached; the VMM ends, as the cgroup OOM \
+         killer ends it on Linux (exit {OOM_EXIT})"
+    );
+    // SAFETY: ends this process at once, as SIGKILL does.
+    unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), OOM_EXIT) };
+    unreachable!("the process ended");
+}
+
+/// A host thread's access to lazy memory: its pages are committed and the
+/// access runs again.
+unsafe extern "system" fn lazy_on_exception(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    const ACCESS_VIOLATION: i32 = 0xC000_0005_u32 as i32;
+    // SAFETY: the system passes valid exception pointers.
+    let rec = unsafe { &*(*info).ExceptionRecord };
+    if rec.ExceptionCode == ACCESS_VIOLATION && rec.NumberParameters >= 2 {
+        // [0]: 0 read, 1 write, 8 execute; [1]: the address.
+        match commit_on_access(rec.ExceptionInformation[1], rec.ExceptionInformation[0] == 1) {
+            Access::Committed => return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION,
+            Access::Exhausted(err) => out_of_memory(rec.ExceptionInformation[1], err),
+            Access::NotLazy => {}
+        }
+    }
+    windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Installs [`lazy_on_exception`] once; whether it is in place.
+fn lazy_handler() -> bool {
+    static INSTALLED: OnceLock<bool> = OnceLock::new();
+    *INSTALLED.get_or_init(|| {
+        // SAFETY: a new allocation, committed; given back by `out_of_memory`.
+        let rescue = unsafe {
+            VirtualAlloc2(proc(), std::ptr::null(), RESCUE_LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, std::ptr::null_mut(), 0)
+        };
+        RESCUE.store(rescue as usize, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: first in the chain; the handler stays for the process.
+        !unsafe { windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(lazy_on_exception)) }
+            .is_null()
+    })
+}
+
+/// Commits what is lazy in the region at `base` and makes it ordinary
+/// private memory (an `mprotect` over it, whose protections Windows cannot
+/// set on pages that are not committed).
+fn materialize(t: &mut Table, base: usize) -> bool {
+    let r = t.get_mut(&base).unwrap();
+    if !r.lazy {
+        return true;
+    }
+    for (s, n, p) in lazy_within(base, r.len) {
+        // Committed pages stay as they are; reserved ones get zero pages.
+        if !commit(s, n, p, false) {
+            return false;
+        }
+    }
+    lazy_remove(base, r.len);
+    r.lazy = false;
+    true
 }
 
 fn commit(base: usize, len: usize, prot: PAGE_PROTECTION_FLAGS, replace: bool) -> bool {
@@ -706,9 +959,30 @@ fn fill(
     let wprot = win_prot(prot).ok_or(crate::EINVAL)?;
     let anon = flags & MAP_ANONYMOUS != 0;
     let shared = flags & MAP_SHARED != 0;
+    let mut lazy = false;
     let kind = if anon && !shared {
         if prot == PROT_NONE {
             Kind::Placeholder
+        } else if flags & MAP_NORESERVE != 0 && flags & MAP_POPULATE == 0 && lazy_handler() {
+            // Reserved now, committed page block by page block at the first
+            // access ([`LAZY`]).
+            // SAFETY: reserves our placeholder.
+            let p = unsafe {
+                VirtualAlloc2(
+                    proc(),
+                    base as *const c_void,
+                    len,
+                    MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+                    wprot,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if p.is_null() {
+                return Err(crate::ENOMEM);
+            }
+            lazy = true;
+            Kind::Private { file: None }
         } else {
             if !commit(base, len, wprot, true) {
                 return Err(crate::ENOMEM);
@@ -788,6 +1062,10 @@ fn fill(
         }
     };
     t.get_mut(&base).unwrap().kind = kind;
+    if lazy {
+        t.get_mut(&base).unwrap().lazy = true;
+        lazy_add(base, len, wprot);
+    }
     if flags & MAP_POPULATE != 0 && prot != PROT_NONE {
         let range = WIN32_MEMORY_RANGE_ENTRY {
             VirtualAddress: base as *mut c_void,
@@ -1068,8 +1346,12 @@ pub unsafe fn mmap(
                 let r = t.get_mut(&b).unwrap();
                 if prot == PROT_NONE {
                     ranges_add(&mut r.noaccess, base - b, len);
+                    lazy_remove(base, len);
                 } else {
-                    if !commit(base, len, win_prot(prot).unwrap(), false) {
+                    // Lazy memory stays lazy: zero pages at the next access.
+                    if r.lazy && flags & MAP_NORESERVE != 0 {
+                        lazy_add(base, len, win_prot(prot).unwrap());
+                    } else if !commit(base, len, win_prot(prot).unwrap(), false) {
                         return fail(crate::ENOMEM, MAP_FAILED);
                     }
                     ranges_remove(&mut r.noaccess, base - b, len);
@@ -1143,6 +1425,7 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
             Kind::Private { .. } => {
                 // SAFETY: decommits part of our allocation.
                 unsafe { VirtualFree(s as *mut c_void, e - s, MEM_DECOMMIT) };
+                lazy_remove(s, e - s);
             }
             Kind::View { .. } => {
                 protect(s, e - s, PAGE_NOACCESS);
@@ -1204,6 +1487,12 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
                 if !r.mapped_in(s - b, e - s) {
                     return fail(crate::ENOMEM, -1);
                 }
+                // Windows sets no protection on pages not committed: lazy
+                // memory is committed first, and is ordinary memory from then on.
+                if r.lazy && !materialize(&mut t, b) {
+                    return fail(crate::ENOMEM, -1);
+                }
+                let r = &t[&b];
                 let decommitted = ranges_within(&r.noaccess, s - b, e - s);
                 if prot != PROT_NONE {
                     // Mapped `PROT_NONE` parts get their (zero) pages now.
@@ -1301,10 +1590,16 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<us
         unmap(alias);
         return Err(crate::ENOMEM);
     }
-    t.get_mut(&start).unwrap().kind = Kind::View {
+    let r = t.get_mut(&start).unwrap();
+    r.kind = Kind::View {
         _section: section,
         file: None,
     };
+    // A section is committed when it is touched, as the userfaultfd fills it.
+    if r.lazy {
+        lazy_remove(start, len);
+        r.lazy = false;
+    }
     Ok(alias)
 }
 
@@ -1403,6 +1698,11 @@ unsafe fn madvise_plain(addr: *mut c_void, len: size_t, advice: c_int) -> c_int 
             }
             // SAFETY: drops the pages of our private memory.
             unsafe { VirtualFree(at as *mut c_void, run, MEM_DECOMMIT) };
+            // Lazy memory gets zero pages again at its next access.
+            if !lazy_within(at, run).is_empty() {
+                at += run;
+                continue;
+            }
             if !commit(at, run, PAGE_READWRITE, false) {
                 return fail(crate::ENOMEM, -1);
             }
@@ -1516,6 +1816,132 @@ mod tests {
     }
 
     const ANON: c_int = MAP_PRIVATE | MAP_ANONYMOUS;
+
+    fn state(addr: usize) -> u32 {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(unsafe { VirtualQuery(addr as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) }, 0);
+        mbi.State
+    }
+
+    /// Anonymous private `MAP_NORESERVE` memory gets its pages at the first
+    /// access, a 64 KiB block at a time, as Linux gives them when touched:
+    /// mapped, nothing is committed; a write commits its block only; a
+    /// discarded block goes back to reserved and reads zero; the guest's
+    /// access (the hypervisor's report) commits as a host access does; an
+    /// `mprotect` makes the whole mapping ordinary memory.
+    #[test]
+    fn test_noreserve_memory_is_committed_at_first_access() {
+        let _serial = serial();
+        let len = 4 << 20;
+        let p = map(0, len, PROT_READ | PROT_WRITE, ANON | MAP_NORESERVE, -1, 0);
+        assert_eq!(state(p), MEM_RESERVE, "committed at the mmap");
+        assert_eq!(state(p + len - PAGE), MEM_RESERVE);
+        // A host write: the exception handler commits the block.
+        // SAFETY: our mapping.
+        unsafe { *((p + (1 << 20) + 5) as *mut u8) = 7 };
+        assert_eq!(state(p + (1 << 20)), MEM_COMMIT);
+        assert_eq!(state(p + (1 << 20) + LAZY_CHUNK - PAGE), MEM_COMMIT);
+        assert_eq!(state(p + (1 << 20) + LAZY_CHUNK), MEM_RESERVE, "more than the block was committed");
+        assert_eq!(state(p + (1 << 20) - PAGE), MEM_RESERVE, "more than the block was committed");
+        // SAFETY: as above.
+        assert_eq!(unsafe { *((p + (1 << 20) + 5) as *const u8) }, 7);
+        // The guest's access, as WHP reports it.
+        assert_eq!(wick_mm::commit_on_access(p + (2 << 20), true), Access::Committed);
+        assert_eq!(state(p + (2 << 20)), MEM_COMMIT);
+        // Committed meanwhile (another vCPU first): run again.
+        // Discarded: reserved again, zero at the next read.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { madvise((p + (1 << 20)) as *mut c_void, LAZY_CHUNK, MADV_DONTNEED) }, 0);
+        assert_eq!(state(p + (1 << 20)), MEM_RESERVE);
+        // SAFETY: as above.
+        assert_eq!(unsafe { *((p + (1 << 20) + 5) as *const u8) }, 0);
+        // mprotect: the whole mapping committed, and no longer lazy.
+        // SAFETY: as above.
+        assert_eq!(unsafe { mprotect(p as *mut c_void, len, PROT_READ) }, 0);
+        assert_eq!(state(p), MEM_COMMIT);
+        assert_eq!(state(p + len - PAGE), MEM_COMMIT);
+        assert_eq!(wick_mm::commit_on_access(p, false), Access::NotLazy);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { munmap(p as *mut c_void, len) }, 0);
+        assert!(lazy_within(p, len).is_empty(), "the unmapped range is still lazy");
+        // Without MAP_NORESERVE, and with MAP_POPULATE: committed at the mmap.
+        let q = map(0, 1 << 20, PROT_READ | PROT_WRITE, ANON, -1, 0);
+        assert_eq!(state(q), MEM_COMMIT);
+        let r = map(0, 1 << 20, PROT_READ | PROT_WRITE, ANON | MAP_NORESERVE | MAP_POPULATE, -1, 0);
+        assert_eq!(state(r), MEM_COMMIT);
+        // SAFETY: our mappings.
+        unsafe {
+            assert_eq!(munmap(q as *mut c_void, 1 << 20), 0);
+            assert_eq!(munmap(r as *mut c_void, 1 << 20), 0);
+        }
+    }
+
+    /// In a process whose job may commit 64 MiB, a 256 MiB lazy mapping is
+    /// made; 32 MiB of it are written; writing past the limit ends the
+    /// process with the OOM exit code, as the cgroup OOM killer ends the VMM.
+    #[test]
+    fn test_memory_past_the_job_limit_ends_the_process() {
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        if std::env::var_os("WICK_LAZY_CHILD").is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .args(["--exact", "windows_mm::tests::lazy_child", "--ignored", "--nocapture"])
+            .env("WICK_LAZY_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The job is set before the child maps anything (it sleeps 300 ms first).
+        // SAFETY: a new unnamed job.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!job.is_null());
+        // SAFETY: plain data.
+        let mut limit: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+        limit.JobMemoryLimit = 64 << 20;
+        // SAFETY: a structure of the size passed; the child's handle.
+        unsafe {
+            assert_ne!(
+                SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const limit).cast(), std::mem::size_of_val(&limit) as u32),
+                0
+            );
+            use std::os::windows::io::AsRawHandle;
+            assert_ne!(AssignProcessToJobObject(job, child.as_raw_handle()), 0, "{}", std::io::Error::last_os_error());
+        }
+        let out = child.wait_with_output().unwrap();
+        let text = std::format!("{}{}", std::string::String::from_utf8_lossy(&out.stdout), std::string::String::from_utf8_lossy(&out.stderr));
+        // SAFETY: our job handle.
+        unsafe { CloseHandle(job) };
+        assert!(text.contains("mapped 256 MiB") && text.contains("wrote 32 MiB"), "{text}");
+        assert!(!text.contains("wrote 256 MiB"), "the job's limit did not hold: {text}");
+        assert!(text.contains("the memory limit"), "{text}");
+        assert_eq!(out.status.code(), Some(OOM_EXIT as i32), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_memory_past_the_job_limit_ends_the_process in a job of its own"]
+    fn lazy_child() {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let len = 256 << 20;
+        let p = map(0, len, PROT_READ | PROT_WRITE, ANON | MAP_NORESERVE, -1, 0);
+        std::println!("mapped 256 MiB");
+        let write = |mib: usize| {
+            for at in (0..mib << 20).step_by(PAGE) {
+                // SAFETY: our mapping.
+                unsafe { *((p + at) as *mut u8) = 1 };
+            }
+        };
+        write(32);
+        std::println!("wrote 32 MiB");
+        write(256);
+        std::println!("wrote 256 MiB");
+    }
 
     #[test]
     fn test_firecracker_guest_memory_pattern() {

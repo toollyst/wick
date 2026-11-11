@@ -730,7 +730,8 @@ function Stage-Pidns {
         $sw.Stop()
         Check ($code -eq 0) "--new-pid-ns: the jailer exited $code (-1: did not return)"
         $root = Join-Path $base 'firecracker.exe\ns\root'
-        $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" } | Select-Object -First 1
+        # Firecracker, not its API process (which has the whole profile, ACG among it).
+        $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" -and (Get-Mitigations $_.Id).DynamicCode -eq 0 } | Select-Object -First 1
         Check ($null -ne $fcp) '--new-pid-ns: Firecracker is not running after the jailer returned'
         $written = [int](Get-Content (Join-Path $root 'firecracker.exe.pid'))
         Check ($written -eq $fcp.Id) "--new-pid-ns: the pid file holds $written, Firecracker is $($fcp.Id)"
@@ -1147,7 +1148,9 @@ function Stage-Netguest {
 }
 # The guest using memory past the limit ends the VMM, as the cgroup OOM
 # killer does (tools/macos/jailer-test.py, stage_memory): a 1024 MiB guest
-# that writes 700 MiB, under a limit below that and under one above it.
+# that writes 700 MiB, under a limit below that and under one above it. Guest
+# memory is committed as it is touched (libc windows_mm, lazy memory), so the
+# job is charged when Linux charges the cgroup.
 function Stage-Memory {
     $base = New-Base 'memory'
     $results = @()
@@ -1167,28 +1170,35 @@ function Stage-Memory {
             $ended = $vm.P.WaitForExit($(if ($case.Ends) { 30000 } else { 2000 }))
             $code = if ($ended) { $vm.P.ExitCode } else { 'running' }
             Check ($ended -eq $case.Ends) "memory.max=$($case.Mib) MiB, a 1024 MiB guest writing 700 MiB: $how; the jailer: $code; $(($vm.Text() -split "`n" | Select-Object -Last 3) -join ' | ')"
-            if ($case.Ends) { Check ($vm.P.ExitCode -ne 0) "the jailer returned 0 for a VMM ended by its memory limit" }
+            if ($case.Ends) {
+                # As on Linux: the guest boots (its memory is charged as it is touched), and
+                # the VMM ends as the OOM killer ends it, with the cause named.
+                Check ($how -ne 'the guest did not boot') "memory.max=$($case.Mib) MiB: the guest did not boot (its memory charged before it ran)"
+                Check ($vm.P.ExitCode -eq 137) "the jailer returned $($vm.P.ExitCode) for a VMM ended by its memory limit, not 137 (128 + SIGKILL)"
+                Check ($vm.Text() -match 'the memory limit') "the VMM's end does not name the memory limit"
+            }
             $results += "$($case.Mib) MiB: $(if ($ended) { "ended ($how, exit $code)" } else { 'survived' })"
         } finally { Stop-Jailed }
     }
     "a 1024 MiB guest writes 700 MiB; memory.max " + ($results -join ', ')
 }
 function Stage-Limits {
-    # Job memory limit: below the guest's memory Firecracker cannot run it.
+    # Job memory limit below the guest's memory: as on Linux, the guest boots
+    # (its memory is charged as it is touched) and the VMM ends, with the OOM
+    # killer's exit code, once it touches more than the limit.
     $base = New-Base 'limits'
     $vm = Start-JailedVm $base 'small' @('--cgroup-version', '2', '--cgroup', 'memory.max=134217728') 256
     try {
-        $booted = $vm.WaitFor('Run /bin/sh', 30)
-        if ($booted) {
-            Wait-Shell $vm
-            # Touch all of guest memory: the job limit must stop it.
-            $vm.Send('mount -t tmpfs -o size=240m none /mnt && head -c 230m /dev/zero > /mnt/z; echo FILLED')
-            [void]$vm.WaitFor('FILLED', 60)
-        }
+        Check ($vm.WaitFor('Run /bin/sh', 30)) "a 256 MiB guest did not boot under memory.max=128 MiB: $(($vm.Text() -split "`n" | Select-Object -Last 3) -join ' | ')"
+        Wait-Shell $vm
+        # Touch most of guest memory: the job limit must stop it.
+        $vm.Send('mount -t tmpfs -o size=240m tmpfs /run && head -c 230m /dev/zero > /run/z; echo FILLED-$?')
+        $filled = $vm.WaitFor('FILLED-0', 60)
         $exited = $vm.P.WaitForExit(30000)
-        Check $exited "a 256 MiB guest ran under memory.max=128 MiB"
+        Check $exited "a 256 MiB guest wrote 230 MiB under memory.max=128 MiB and ran on (filled: $filled)"
+        Check ($vm.P.ExitCode -eq 137) "the jailer returned $($vm.P.ExitCode), not 137, for a VMM past its memory limit"
     } finally { Stop-Jailed }
-    "memory.max below the guest's memory: Firecracker cannot map it and exits"
+    "memory.max below the guest's memory: the guest boots, and the VMM ends with 137 once it touches more than the limit"
 }
 
 # cpu.max is the job's CPU rate hard cap, from Firecracker's start, with a
