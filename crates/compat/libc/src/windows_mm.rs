@@ -824,6 +824,40 @@ fn lock_memory_privilege() -> bool {
     })
 }
 
+/// `GetCurrentProcessToken()` (processthreadsapi.h): a pseudo-handle that
+/// queries this process's token without opening it, which a jailed process
+/// may not do (`OpenProcessToken` is denied there: jail-probe `tokenopen`).
+const CURRENT_PROCESS_TOKEN: HANDLE = -4isize as HANDLE;
+
+/// This process's token's integrity level (the label's RID: medium is
+/// `0x2000`), read through the pseudo-handle, or the error reading it.
+fn integrity_level() -> Result<u32, u32> {
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
+        TokenIntegrityLevel,
+    };
+    let mut buf = [0u64; 64];
+    let mut len = 0u32;
+    // SAFETY: a buffer of the size passed; the pseudo-handle needs no open.
+    let ok = unsafe {
+        let p = buf.as_mut_ptr().cast();
+        GetTokenInformation(CURRENT_PROCESS_TOKEN, TokenIntegrityLevel, p, 512, &mut len) != 0
+    };
+    if !ok {
+        // SAFETY: plain call.
+        return Err(unsafe { GetLastError() });
+    }
+    // SAFETY: the buffer holds a TOKEN_MANDATORY_LABEL whose SID is valid.
+    unsafe {
+        let sid = (*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
+        let count = *GetSidSubAuthorityCount(sid);
+        if count == 0 {
+            return Err(0);
+        }
+        Ok(*GetSidSubAuthority(sid, u32::from(count) - 1))
+    }
+}
+
 /// The size of a large page if `flags` asks for that size (or for the
 /// default, `MAP_HUGE_*` bits 0), else `None`.
 fn large_page(flags: c_int) -> Option<usize> {
@@ -842,8 +876,10 @@ fn large_page(flags: c_int) -> Option<usize> {
 /// protection. Shared and file-backed huge pages (hugetlbfs, `MFD_HUGETLB`
 /// memfds), huge pages at a fixed address over other memory and sizes other
 /// than the host's large page fail with `ENOMEM`, as Linux does without huge
-/// pages of that kind; so does a process without `SeLockMemoryPrivilege`, or
-/// a host out of contiguous memory. A fixed address that is not a whole
+/// pages of that kind; so does a process without `SeLockMemoryPrivilege`
+/// (a jailed Firecracker, whose token is below medium integrity, where no
+/// privilege can be enabled: said on stderr), or a host out of contiguous
+/// memory. A fixed address that is not a whole
 /// number of large pages fails with `EINVAL`, as on Linux.
 fn map_large(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int) -> Result<*mut c_void, c_int> {
     let wprot = win_prot(prot).ok_or(crate::EINVAL)?;
@@ -855,9 +891,8 @@ fn map_large(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int) -> Resul
     if flags & MAP_FIXED != 0 {
         return fixed_large(addr as usize, len, prot, page);
     }
-    // Enables the privilege if this process may adjust its token; a jailed
-    // Firecracker's token has it enabled by the jailer. Without it the
-    // allocation below fails.
+    // Enables the privilege if this process may adjust its token. Without
+    // it the allocation below fails.
     let _ = lock_memory_privilege();
     // SAFETY: a new allocation; large pages are committed read-write.
     let p = unsafe {
@@ -872,6 +907,24 @@ fn map_large(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int) -> Resul
         )
     };
     if p.is_null() {
+        // SAFETY: plain call.
+        let err = unsafe { GetLastError() };
+        // A jailed Firecracker (docs/PORTING.md row 10): never silently.
+        match integrity_level() {
+            Ok(level) if level < 0x2000 => std::eprintln!(
+                "wick: large pages: VirtualAlloc2 failed with error {err}; this process's token is at \
+                 integrity level {level:#x}, below medium ({:#x}), where a privilege cannot be enabled \
+                 (SeLockMemoryPrivilege, which large pages need): a jailed Firecracker maps no large \
+                 pages; run it without the jailer",
+                0x2000
+            ),
+            Ok(_) => {}
+            Err(e) => std::eprintln!(
+                "wick: large pages: VirtualAlloc2 failed with error {err}; integrity level unknown \
+                 (GetTokenInformation error {e}): large pages need SeLockMemoryPrivilege enabled, \
+                 which a token below medium integrity cannot have; a jailed Firecracker maps none"
+            ),
+        }
         return Err(crate::ENOMEM);
     }
     if wprot != PAGE_READWRITE && !protect(p as usize, len, wprot) {
@@ -1743,6 +1796,49 @@ mod tests {
         }
         // SAFETY: our mapping.
         assert_eq!(unsafe { munmap(p, big) }, 0);
+    }
+
+    /// This process's token is at or above medium integrity, read through
+    /// the pseudo-handle without opening the token, as a jailed process
+    /// must (it cannot open its token; the jailer-test `hugepages` stage
+    /// reads the message `map_large` prints there): the level the
+    /// pseudo-handle gives is the opened token's.
+    #[test]
+    fn test_integrity_level_is_read() {
+        use windows_sys::Win32::Security::{GetTokenInformation, TokenIntegrityLevel};
+        let level = integrity_level().unwrap();
+        assert!(level >= 0x2000, "{level:#x}");
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: opens our own token (this test is not jailed).
+        assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }, 0);
+        let mut buf = [0u64; 64];
+        let mut len = 0u32;
+        // SAFETY: a buffer of the size passed; `token` is ours.
+        let ok = unsafe {
+            GetTokenInformation(token, TokenIntegrityLevel, buf.as_mut_ptr().cast(), 512, &mut len)
+        };
+        // SAFETY: closes the token we opened.
+        unsafe { CloseHandle(token) };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        let mut pseudo = [0u64; 64];
+        // SAFETY: as above, through the pseudo-handle.
+        let ok = unsafe {
+            let p = pseudo.as_mut_ptr().cast();
+            GetTokenInformation(CURRENT_PROCESS_TOKEN, TokenIntegrityLevel, p, 512, &mut len)
+        };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        // The label's SID follows the TOKEN_MANDATORY_LABEL header in the
+        // buffer (its pointer differs; the SID bytes do not).
+        assert_eq!(&buf[2..], &pseudo[2..]);
+        // SAFETY: the buffer holds a TOKEN_MANDATORY_LABEL whose SID is valid.
+        let opened = unsafe {
+            use windows_sys::Win32::Security::{
+                GetSidSubAuthority, GetSidSubAuthorityCount, TOKEN_MANDATORY_LABEL,
+            };
+            let sid = (*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
+            *GetSidSubAuthority(sid, u32::from(*GetSidSubAuthorityCount(sid)) - 1)
+        };
+        assert_eq!(level, opened);
     }
 
     /// Whether this process's token holds `SeLockMemoryPrivilege` ("Lock

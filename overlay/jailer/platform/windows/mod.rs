@@ -79,7 +79,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
-    DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED, FILETIME, GetLastError, HANDLE,
+    DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE,
     HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0,
     LocalFree, SetHandleInformation,
@@ -90,7 +90,7 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx,
+    CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx,
     LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, SE_PRIVILEGE_ENABLED, TOKEN_PRIVILEGES, TokenPrivileges,
     GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, GetTokenInformation,
     LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
@@ -1106,15 +1106,16 @@ fn tokens() -> Result<Tokens, HostError> {
     Ok(Tokens { primary, initial })
 }
 
-/// "Lock pages in memory": guest memory on large pages (`huge_pages`) needs
-/// it, as huge pages on Linux need a pool an administrator reserved.
-const LOCK_MEMORY: &str = "SeLockMemoryPrivilege";
-
 /// The privileges a jailed process keeps, when the operator's token holds
 /// them: `SeChangeNotifyPrivilege` (traversal, the one `DISABLE_MAX_PRIVILEGE`
-/// keeps) and [`LOCK_MEMORY`], which an administrator grants an account for
-/// large pages. Every other privilege is deleted from the jail's tokens.
-const KEPT_PRIVILEGES: [&str; 2] = ["SeChangeNotifyPrivilege", LOCK_MEMORY];
+/// keeps) and nothing else; every other privilege is deleted from the jail's
+/// tokens. "Lock pages in memory" (`SeLockMemoryPrivilege`, large pages) is
+/// not kept either: a token below medium integrity cannot have a privilege
+/// enabled (setting the level disables it, and enabling it again reports
+/// success and leaves it disabled; measured on Windows 11 26H2 at
+/// `S-1-16-6144` and `4096`, where `8192` and up keep it), so a jailed
+/// Firecracker maps no large pages (docs/PORTING.md row 10).
+const KEPT_PRIVILEGES: [&str; 1] = ["SeChangeNotifyPrivilege"];
 
 /// The privileges in `token`: (name, LUID and attributes).
 fn privileges(token: HANDLE) -> Result<Vec<(String, LUID_AND_ATTRIBUTES)>, HostError> {
@@ -1135,22 +1136,6 @@ fn privileges(token: HANDLE) -> Result<Vec<(String, LUID_AND_ATTRIBUTES)>, HostE
             Ok((String::from_utf16_lossy(&name[..len as usize]), *p))
         })
         .collect()
-}
-
-/// Enables the privilege `p` in `token`, which holds it.
-fn enable_privilege(token: HANDLE, p: LUID_AND_ATTRIBUTES) -> Result<(), HostError> {
-    let tp = TOKEN_PRIVILEGES {
-        PrivilegeCount: 1,
-        Privileges: [LUID_AND_ATTRIBUTES { Luid: p.Luid, Attributes: SE_PRIVILEGE_ENABLED }],
-    };
-    // SAFETY: a token we own and one privilege.
-    let ok = unsafe { AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
-    // It succeeds without the privilege, and says so.
-    // SAFETY: plain call.
-    if ok == 0 || unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
-        return Err(HostError::Spawn("enabling SeLockMemoryPrivilege in the jail's token", last_error()));
-    }
-    Ok(())
 }
 
 /// `SE_GROUP_USE_FOR_DENY_ONLY` (winnt.h).
@@ -1217,13 +1202,10 @@ fn is_admin_group(sid: &str) -> bool {
 
 /// A restricted token: the administrators' groups deny-only
 /// ([`groups_to_deny`]), the user its owner, no privileges but
-/// [`KEPT_PRIVILEGES`] (with [`LOCK_MEMORY`] enabled, so a jailed
-/// Firecracker maps large pages without adjusting a token it may not
-/// open), `restricting` SIDs, the default DACL and the jail's integrity
-/// level. Not `LUA_TOKEN`, which does the first two but also strips every
-/// privilege but a standard user's, `SeLockMemoryPrivilege` among them:
-/// an elevated jailer on an account holding it failed to enable it in the
-/// jail's token (ERROR_NOT_ALL_ASSIGNED, measured on a WHP machine).
+/// [`KEPT_PRIVILEGES`], `restricting` SIDs, the default DACL and the jail's
+/// integrity level. Not `LUA_TOKEN`, which does the first two but also
+/// strips every privilege but a standard user's from an elevated token,
+/// and whose list of groups is the system's to change.
 fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedHandle, HostError> {
     let held = privileges(from)?;
     let delete: Vec<LUID_AND_ATTRIBUTES> =
@@ -1266,9 +1248,6 @@ fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedH
     } == 0
     {
         return Err(HostError::Spawn("TokenOwner", last_error()));
-    }
-    if let Some((_, lock)) = held.iter().find(|(n, _)| n == LOCK_MEMORY) {
-        enable_privilege(t.as_raw_handle(), *lock)?;
     }
 
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -2059,11 +2038,11 @@ mod tests {
         job(&Limits { cpu_weight: Some(3), cpus: Some(vec![(0, 1)]), ..Limits::default() }).unwrap();
     }
 
-    /// The jail's tokens hold no privilege but traversal and, when the
-    /// operator's account holds it, "Lock pages in memory", enabled
-    /// (docs/PORTING.md, row 10); this process's token has others.
+    /// The jail's tokens hold no privilege but traversal, enabled
+    /// (docs/PORTING.md, row 10): not "Lock pages in memory" either, which
+    /// this process's token may hold; this process's token has others.
     #[test]
-    fn test_tokens_keep_only_traversal_and_lock_memory() {
+    fn test_tokens_keep_only_traversal() {
         let mut own: HANDLE = std::ptr::null_mut();
         // SAFETY: our own token.
         assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut own) }, 0);
@@ -2071,23 +2050,18 @@ mod tests {
         let own = unsafe { OwnedHandle::from_raw_handle(own) };
         let mine: Vec<String> = privileges(own.as_raw_handle()).unwrap().into_iter().map(|(n, _)| n).collect();
         assert!(mine.iter().any(|n| !KEPT_PRIVILEGES.contains(&n.as_str())), "{mine:?}");
-        let lock = mine.iter().any(|n| n == LOCK_MEMORY);
-        let mut want = vec![("SeChangeNotifyPrivilege".to_string(), true)];
-        if lock {
-            want.push((LOCK_MEMORY.to_string(), true));
-        }
+        let want = vec![("SeChangeNotifyPrivilege".to_string(), true)];
         let t = tokens().unwrap();
         for token in [&t.primary, &t.initial] {
-            let mut kept: Vec<(String, bool)> = privileges(token.as_raw_handle())
+            let kept: Vec<(String, bool)> = privileges(token.as_raw_handle())
                 .unwrap()
                 .into_iter()
                 .map(|(n, p)| (n, p.Attributes & SE_PRIVILEGE_ENABLED != 0))
                 .collect();
-            kept.sort();
             assert_eq!(kept, want, "the jail's token, from {mine:?}");
         }
-        if !lock {
-            eprintln!("this account lacks {LOCK_MEMORY}: only its absence from the jail was checked");
+        if !mine.iter().any(|n| n == "SeLockMemoryPrivilege") {
+            eprintln!("this account lacks SeLockMemoryPrivilege: its removal from the jail was not exercised");
         }
     }
 
