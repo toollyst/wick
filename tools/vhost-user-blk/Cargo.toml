@@ -16,6 +16,8 @@ virtio-bindings = "0.2.7"
 vm-memory = { version = "0.18.0", features = ["backend-mmap", "backend-atomic"] }
 vmm-sys-util = "0.15.0"
 libc = "0.2.186"
+# AF_UNIX sockets on Windows too (the control socket).
+wick-os = { path = "../../crates/compat/os" }
 
 # Upstream 0.23.0; on Windows its source over wick's POSIX layer.
 vhost-user-backend = { path = "compat/vhost-user-backend" }

@@ -570,14 +570,94 @@ fn release(t: &mut Table, base: usize) -> bool {
     ok != 0
 }
 
+/// Whether [start, end) is reserved address space with no page committed.
+fn reserved_only(start: usize, end: usize) -> bool {
+    let mut at = start;
+    while at < end {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0
+            || mbi.State != MEM_RESERVE
+        {
+            return false;
+        }
+        at = mbi.BaseAddress as usize + mbi.RegionSize;
+    }
+    true
+}
+
+/// The protection of the lazy private region at `base` if it can be split
+/// at `start` and `end` (see [`split_lazy`]).
+fn lazy_split_prot(t: &Table, base: usize, start: usize, end: usize) -> Option<PAGE_PROTECTION_FLAGS> {
+    let r = &t[&base];
+    if !r.lazy || !matches!(r.kind, Kind::Private { file: None }) || !r.holes.is_empty() || !r.noaccess.is_empty() {
+        return None;
+    }
+    let (s, e) = (start.max(base), end.min(base + r.len));
+    let lazies = lazy_within(base, r.len);
+    let prot = lazies.first()?.2;
+    let whole = lazies.iter().map(|l| l.1).sum::<usize>() == r.len;
+    (whole && lazies.iter().all(|l| l.2 == prot) && reserved_only(base, s) && reserved_only(e, base + r.len))
+        .then_some(prot)
+}
+
+/// Splits the lazy private region at `base` so that [start, end) is a
+/// placeholder of its own. Windows splits a placeholder, not an allocation
+/// (Linux splits any mapping): the allocation goes back to a placeholder
+/// whole, and the parts outside the range are reserved again, lazy with the
+/// region's protection. Only when no page outside the range was committed
+/// ([`lazy_split_prot`]): nothing outside is lost. Firecracker maps a
+/// virtio-pmem file so, over the start of anonymous memory rounded up to
+/// 2 MiB.
+fn split_lazy(t: &mut Table, base: usize, start: usize, end: usize, prot: PAGE_PROTECTION_FLAGS) -> bool {
+    let rend = base + t[&base].len;
+    let (s, e) = (start.max(base), end.min(rend));
+    if !to_placeholder(t, base) || !carve(t, s, e) {
+        return false;
+    }
+    for (a, b) in [(base, s), (e, rend)] {
+        if b <= a {
+            continue;
+        }
+        // SAFETY: reserves our placeholder again.
+        let p = unsafe {
+            VirtualAlloc2(
+                proc(),
+                a as *const c_void,
+                b - a,
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+                prot,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if p.is_null() {
+            return false;
+        }
+        let r = t.get_mut(&a).unwrap();
+        r.kind = Kind::Private { file: None };
+        r.lazy = true;
+        lazy_add(a, b - a, prot);
+    }
+    true
+}
+
 /// Makes [start, end) one placeholder, from what the table has there, or
 /// from free address space. `EINVAL` when it holds part of a private
-/// allocation or view, or memory this module did not map.
+/// allocation (but untouched lazy memory around it, [`split_lazy`]) or
+/// view, or memory this module did not map.
 fn make_placeholder(t: &mut Table, start: usize, end: usize) -> Result<(), c_int> {
     // Refused before anything changes: part of an allocation or view.
+    let mut splits = Vec::new();
     for b in overlapping(t, start, end) {
         let r = &t[&b];
         if !matches!(r.kind, Kind::Placeholder) && (b < start || b + r.len > end) {
+            splits.push((b, lazy_split_prot(t, b, start, end).ok_or(crate::EINVAL)?));
+        }
+    }
+    for (b, prot) in splits {
+        if !split_lazy(t, b, start, end, prot) {
             return Err(crate::EINVAL);
         }
     }
@@ -2357,6 +2437,53 @@ mod tests {
             );
             *((p + PAGE) as *mut u8) = 1;
             assert_eq!(munmap(p as *mut c_void, 1 << 20), 0);
+        }
+    }
+
+    #[test]
+    fn test_pmem_backing_file() {
+        // virtio-pmem: a file of whole 2 MiB maps as it is; another sits in
+        // a private anonymous mapping rounded up to 2 MiB (MAP_FIXED over it).
+        let _serial = serial();
+        use std::os::windows::io::AsRawHandle;
+        for (n, size) in [(0, 2usize << 20), (1, (2 << 20) + 3 * PAGE)] {
+            let path = std::env::temp_dir().join(std::format!("wick-pmem-{}-{n}", std::process::id()));
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.set_len(size as u64).unwrap();
+            let fd = crate::windows_fd::to_fd_pub(f.as_raw_handle());
+            let rw = PROT_READ | PROT_WRITE;
+            let p = if size == 2 << 20 {
+                map(0, size, rw, MAP_SHARED | MAP_NORESERVE, fd, 0)
+            } else {
+                let p = map(0, 4 << 20, rw, MAP_PRIVATE | MAP_NORESERVE | ANON, -1, 0);
+                assert_eq!(
+                    map(p, size, rw, MAP_SHARED | MAP_NORESERVE | MAP_FIXED, fd, 0),
+                    p,
+                    "file over the rounded-up mapping: {}",
+                    std::io::Error::last_os_error()
+                );
+                p
+            };
+            // SAFETY: our mapping.
+            unsafe {
+                *(p as *mut u8) = 0x5a;
+                // Past the file: the anonymous memory, committed at its first access.
+                let tail = (p + size.next_multiple_of(2 << 20) - PAGE) as *mut u8;
+                *tail = 0x77;
+                assert_eq!(*tail, 0x77);
+                assert_eq!(munmap(p as *mut c_void, size.next_multiple_of(2 << 20)), 0);
+            }
+            let mut b = [0u8; 1];
+            std::io::Read::read_exact(&mut std::fs::File::open(&path).unwrap(), &mut b).unwrap();
+            assert_eq!(b[0], 0x5a, "written to the file");
+            drop(f);
+            let _ = std::fs::remove_file(&path);
         }
     }
 

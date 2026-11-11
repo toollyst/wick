@@ -1,0 +1,207 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+"""Checks the Windows integration harness without a VM (CI's windows job).
+
+    python -I tools/windows/integration/selftest.py
+
+- AF_UNIX for Python (wick_windows_unix): bind, listen, connect, accept,
+  names, a round trip.
+- A network's host side (wick_windows_net): a stand-in for Firecracker's
+  endpoint (an AF_UNIX listener speaking its framing: each Ethernet frame
+  after its length, 32-bit big-endian) and a stand-in guest behind it. The
+  host side must answer the guest's ARP request and ICMP echo for the host's
+  address, and carry a TCP connection from a forward to the guest's port:
+  SYN out, bytes both ways, FIN.
+- procps and the memory monitor's mappings (hosttools, wick_windows_mem) on
+  this process; Windows paths as WSL names them.
+"""
+
+import ipaddress
+import os
+import socket
+import struct
+import sys
+import tempfile
+import threading
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import wick_windows_unix  # noqa: E402
+
+wick_windows_unix.install()
+
+import hosttools  # noqa: E402
+import wick_windows_mem  # noqa: E402
+import wick_windows_net as net  # noqa: E402
+
+FAILS = []
+
+
+def check(cond, what):
+    print(("ok   " if cond else "FAIL ") + what)
+    if not cond:
+        FAILS.append(what)
+
+
+def unix_roundtrip(tmp):
+    path = os.path.join(tmp, "s.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+    cli = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    cli.connect(path)
+    conn, _ = srv.accept()
+    cli.sendall(b"ping")
+    check(conn.recv(4) == b"ping", "AF_UNIX: connect, accept, a round trip")
+    check(srv.getsockname().endswith("s.sock"), "AF_UNIX: getsockname names the path")
+    try:
+        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).connect(os.path.join(tmp, "none.sock"))
+        check(False, "AF_UNIX: connecting to no socket fails")
+    except FileNotFoundError:
+        check(True, "AF_UNIX: connecting to no socket is ENOENT")
+    for s in (conn, cli, srv):
+        s.close()
+
+
+class Guest:
+    """The guest behind a stand-in endpoint: frames in, frames out."""
+
+    MAC = bytes.fromhex("060000000002")
+
+    def __init__(self, path):
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(path)
+        self.listener.listen(1)
+        self.conn = None
+        self.frames = []
+        self.cond = threading.Condition()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        self.conn, _ = self.listener.accept()
+        buf = b""
+        while True:
+            try:
+                data = self.conn.recv(65536)
+            except OSError:  # the host side closed the endpoint (cleanup)
+                return
+            if not data:
+                return
+            buf += data
+            while len(buf) >= 4 and len(buf) >= 4 + struct.unpack("!I", buf[:4])[0]:
+                n = struct.unpack("!I", buf[:4])[0]
+                with self.cond:
+                    self.frames.append(buf[4 : 4 + n])
+                    self.cond.notify_all()
+                buf = buf[4 + n :]
+
+    def send(self, frame):
+        self.conn.sendall(struct.pack("!I", len(frame)) + frame)
+
+    def wait(self, pred, timeout=5):
+        deadline = time.time() + timeout
+        with self.cond:
+            while True:
+                for f in self.frames:
+                    if pred(f):
+                        self.frames.remove(f)
+                        return f
+                left = deadline - time.time()
+                if left <= 0:
+                    return None
+                self.cond.wait(left)
+
+
+def ip_packet(src, dst, proto, payload):
+    hdr = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 1, 0, 64, proto, 0, src.packed, dst.packed)
+    hdr = hdr[:10] + struct.pack("!H", net._csum(hdr)) + hdr[12:]  # pylint: disable=protected-access
+    return hdr + payload
+
+
+def tcp_segment(src, dst, sport, dport, seq, ack, flags, payload=b""):
+    tcp = struct.pack("!HHIIBBHHH", sport, dport, seq, ack, 5 << 4, flags, 65535, 0, 0)
+    pseudo = struct.pack("!4s4sBBH", src.packed, dst.packed, 0, 6, len(tcp) + len(payload))
+    c = net._csum(pseudo + tcp + payload)  # pylint: disable=protected-access
+    return tcp[:16] + struct.pack("!H", c) + tcp[18:] + payload
+
+
+def network(tmp):
+    os.environ["WICK_IT_ROOT"] = tmp
+    host, guest = ipaddress.ip_address("192.168.0.1"), ipaddress.ip_address("192.168.0.2")
+    ns = net.NetNs("selftest")
+    ns.setup()
+    g = Guest(str(ns.path / "tap0"))
+    ns.add_tap("tap0", "192.168.0.1/30")
+    deadline = time.time() + 5
+    while g.conn is None and time.time() < deadline:
+        time.sleep(0.05)
+    check(g.conn is not None and ns.is_used(), "network: the host side connects to the endpoint")
+    host_mac = ns.taps["tap0"]._iface.host_mac  # pylint: disable=protected-access
+    # ARP for the host's address.
+    arp = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 1, Guest.MAC, guest.packed, b"\0" * 6, host.packed)
+    g.send(b"\xff" * 6 + Guest.MAC + b"\x08\x06" + arp)
+    reply = g.wait(lambda f: f[12:14] == b"\x08\x06" and f[20:22] == b"\x00\x02")
+    check(reply is not None and reply[22:28] == host_mac, "network: ARP reply with the host's address")
+    # ICMP echo.
+    echo = b"\x08\x00\x00\x00\x12\x34\x00\x01" + b"wick"
+    echo = echo[:2] + struct.pack("!H", net._csum(echo)) + echo[4:]  # pylint: disable=protected-access
+    g.send(host_mac + Guest.MAC + b"\x08\x00" + ip_packet(guest, host, 1, echo))
+    reply = g.wait(lambda f: f[12:14] == b"\x08\x00" and f[23] == 1)
+    check(reply is not None and reply[34] == 0 and reply[42:46] == b"wick", "network: ICMP echo reply")
+    # TCP through a forward to guest:22.
+    port = ns.forward(str(guest), 22)
+    client = socket.create_connection(("127.0.0.1", port), timeout=5)
+    syn = g.wait(lambda f: f[23] == 6 and f[47] & 0x02)
+    check(syn is not None, "network: a forward's connection sends a SYN to the guest")
+    if syn is None:
+        return
+    sport, = struct.unpack("!H", syn[34:36])
+    iss, = struct.unpack("!I", syn[38:42])
+    gseq = 1000
+    g.send(host_mac + Guest.MAC + b"\x08\x00" + ip_packet(guest, host, 6, tcp_segment(
+        guest, host, 22, sport, gseq, iss + 1, 0x12)))
+    g.wait(lambda f: f[23] == 6 and f[47] == 0x10)
+    g.send(host_mac + Guest.MAC + b"\x08\x00" + ip_packet(guest, host, 6, tcp_segment(
+        guest, host, 22, sport, gseq + 1, iss + 1, 0x18, b"SSH-2.0-selftest\r\n")))
+    check(client.recv(100) == b"SSH-2.0-selftest\r\n", "network: the guest's bytes reach the forward")
+    client.sendall(b"hello guest")
+    data = g.wait(lambda f: f[23] == 6 and len(f) > 54)
+    check(data is not None and data[54:65] == b"hello guest", "network: the forward's bytes reach the guest")
+    client.close()
+    fin = g.wait(lambda f: f[23] == 6 and f[47] & 0x01)
+    check(fin is not None, "network: closing the forward sends a FIN")
+    ns.cleanup()
+
+
+def host_tools():
+    ps = hosttools.thread_name  # importable, and names a thread without one as ""
+    check(isinstance(ps(0), str), "procps: a thread's name")
+    check(hosttools.wsl_path("C:\\a\\b c") == "/mnt/c/a/b c" and hosttools.wsl_path("-qF") == "-qF",
+          "e2fsprogs: Windows paths as WSL names them")
+    import psutil  # pylint: disable=import-outside-toplevel
+
+    wick_windows_mem.install()
+    block = bytearray(8 << 20)
+    maps = psutil.Process().memory_maps(grouped=False)
+    mine = [m for m in maps if m.size >= len(block) and m.rss >= len(block) // 2]
+    check(bool(mine), "memory_maps: an 8 MiB allocation, resident")
+    check(all(m.rss == 0 for m in maps if m.path.lower().startswith(wick_windows_mem._SYSTEM)),  # pylint: disable=protected-access
+          "memory_maps: the system's files count for nothing")
+    del block
+
+
+def main():
+    with tempfile.TemporaryDirectory(prefix="wick-st-") as tmp:
+        unix_roundtrip(tmp)
+        network(tmp)
+        host_tools()
+    if FAILS:
+        print(f"{len(FAILS)} failed")
+        return 1
+    print("all passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

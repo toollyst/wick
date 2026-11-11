@@ -5,8 +5,19 @@
 // vhost-user frontend in tools/macos/boot-test.sh and tools/windows/boot-test.ps1
 // (QEMU's macOS and Windows builds have no vhost-user-blk export).
 //   vhost-user-blk <socket> <image>
+//
+// Run as `crosvm` (the binary's name), it takes the command lines of crosvm's
+// that upstream's integration tests give their vhost-user-blk backend
+// (tests/framework/utils_drive.py), so that the tests run unchanged where
+// crosvm does not build (Windows):
+//   crosvm [--log-level L] devices [--disable-sandbox] [--control-socket CTR]
+//          --block vhost=<socket>,path=<image>[,ro]
+//   crosvm disk resize <index> <bytes> <CTR>
+// The control socket takes `resize <index> <bytes>`: the image is resized and
+// the device's capacity with it, which Firecracker reads again at a PATCH of
+// the drive. (The messages are this backend's, not crosvm's.)
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -24,6 +35,7 @@ use vmm_sys_util::epoll::EventSet;
 struct Blk {
     file: File,
     sectors: u64,
+    read_only: bool,
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     requests: u64,
 }
@@ -60,6 +72,7 @@ impl Blk {
                         written += d.len();
                     }
                 }
+                VIRTIO_BLK_T_OUT if self.read_only => st = VIRTIO_BLK_S_IOERR as u8,
                 VIRTIO_BLK_T_OUT => {
                     for d in data {
                         let mut buf = vec![0u8; d.len() as usize];
@@ -106,8 +119,10 @@ impl VhostUserBackendMut for Blk {
         256
     }
     fn features(&self) -> u64 {
+        let ro = if self.read_only { 1 << VIRTIO_BLK_F_RO } else { 0 };
         1 << VIRTIO_F_VERSION_1
             | 1 << VIRTIO_BLK_F_FLUSH
+            | ro
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
     }
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
@@ -141,11 +156,118 @@ impl VhostUserBackendMut for Blk {
     }
 }
 
+/// What to serve: the vhost-user socket, the image, read-only, the control
+/// socket.
+struct Serve {
+    socket: String,
+    image: String,
+    read_only: bool,
+    control: Option<String>,
+}
+
+/// crosvm's command lines (see the top of the file); `None` for this
+/// backend's own.
+fn crosvm(args: &[String]) -> Option<Serve> {
+    let mut it = args.iter().map(String::as_str).peekable();
+    if it.peek() == Some(&"--log-level") {
+        it.next();
+        it.next();
+    }
+    match it.next()? {
+        "disk" => {
+            let rest: Vec<&str> = it.collect();
+            let ["resize", index, bytes, ctr] = rest[..] else {
+                eprintln!("crosvm disk: only `resize <index> <bytes> <socket>`");
+                std::process::exit(2);
+            };
+            let mut s = wick_os::unix::net::UnixStream::connect(ctr).expect("control socket");
+            writeln!(s, "resize {index} {bytes}").unwrap();
+            let mut reply = String::new();
+            BufReader::new(s).read_line(&mut reply).unwrap();
+            if reply.trim() != "ok" {
+                eprintln!("crosvm disk resize: {}", reply.trim());
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        "devices" => {
+            let (mut block, mut control) = (None, None);
+            while let Some(a) = it.next() {
+                match a {
+                    "--disable-sandbox" => {}
+                    "--control-socket" => control = it.next().map(str::to_owned),
+                    "--block" => block = it.next().map(str::to_owned),
+                    other => {
+                        eprintln!("crosvm devices: {other} is not taken");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            let block = block.expect("--block vhost=<socket>,path=<image>[,ro]");
+            let (mut socket, mut image, mut read_only) = (None, None, false);
+            for part in block.split(',') {
+                match part.split_once('=') {
+                    Some(("vhost", v)) => socket = Some(v.to_owned()),
+                    Some(("path", v)) => image = Some(v.to_owned()),
+                    None if part == "ro" => read_only = true,
+                    _ => {
+                        eprintln!("crosvm --block: {part} is not taken");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Some(Serve { socket: socket.expect("vhost="), image: image.expect("path="), read_only, control })
+        }
+        _ => None,
+    }
+}
+
+/// The control socket: `resize <index> <bytes>` resizes the image and the
+/// device's capacity.
+fn control(path: String, blk: Arc<RwLock<Blk>>) {
+    let _ = std::fs::remove_file(&path);
+    let listener = wick_os::unix::net::UnixListener::bind(&path).expect("control socket");
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { continue };
+            let mut line = String::new();
+            let mut reader = BufReader::new(conn);
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            let reply = match line.split_whitespace().collect::<Vec<_>>()[..] {
+                ["resize", "0", bytes] => match bytes.parse::<u64>() {
+                    Ok(n) => {
+                        let mut b = blk.write().unwrap();
+                        match b.file.set_len(n) {
+                            Ok(()) => {
+                                b.sectors = n / 512;
+                                "ok".to_owned()
+                            }
+                            Err(e) => format!("resize: {e}"),
+                        }
+                    }
+                    Err(e) => format!("resize: {e}"),
+                },
+                _ => format!("not taken: {}", line.trim()),
+            };
+            let _ = writeln!(reader.get_mut(), "{reply}");
+        }
+    });
+}
+
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let socket = args.next().expect("socket");
-    let image = args.next().expect("image");
-    let mut file = OpenOptions::new().read(true).write(true).open(&image).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let name = std::path::Path::new(&args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let serve = if name == "crosvm" { crosvm(&args[1..]) } else { None };
+    let serve = serve.unwrap_or_else(|| Serve {
+        socket: args.get(1).expect("socket").clone(),
+        image: args.get(2).expect("image").clone(),
+        read_only: false,
+        control: None,
+    });
+    let (socket, image) = (serve.socket.clone(), serve.image.clone());
+    let mut file = OpenOptions::new().read(true).write(!serve.read_only).open(&image).unwrap();
     let len = file.seek(SeekFrom::End(0)).unwrap();
     let mut probe = [0u8; 1];
     file.seek(SeekFrom::Start(0)).unwrap();
@@ -153,9 +275,13 @@ fn main() {
     let blk = Arc::new(RwLock::new(Blk {
         file,
         sectors: len / 512,
+        read_only: serve.read_only,
         mem: None,
         requests: 0,
     }));
+    if let Some(path) = serve.control {
+        control(path, blk.clone());
+    }
     let mut daemon = VhostUserDaemon::new(
         "vhost-user-blk".into(),
         blk.clone(),
