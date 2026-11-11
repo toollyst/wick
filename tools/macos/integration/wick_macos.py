@@ -30,6 +30,7 @@ import pathlib
 import platform
 import re
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -418,6 +419,48 @@ import framework.http_api as _http_api  # noqa: E402  pylint: disable=wrong-impo
 import host_tools.network as _network  # noqa: E402  pylint: disable=wrong-import-position
 
 from wick_macos_net import NetNs, Tap  # noqa: E402  pylint: disable=wrong-import-position
+
+def _remove_tree(path):
+    """shutil.rmtree, also through what a test left without its owner's
+    permissions (test_negative_snapshot_permissions makes a jail read-only
+    and, when it fails, leaves it so)."""
+    def again(func, failed, _exc):
+        parent = os.path.dirname(failed)
+        for p in (parent, failed):
+            with contextlib.suppress(OSError):
+                os.chmod(p, 0o700, follow_symlinks=False)
+        func(failed)
+    shutil.rmtree(path, onexc=again)
+
+
+def remove_jails(factory):
+    """`MicroVMFactory.kill`, removing every microVM's jail even when killing
+    one fails. Upstream removes a jail after its microVM's kill returns; a
+    kill that raises (the memory monitor's MemoryUsageExceededError is raised
+    there) leaves that jail and every later one, with the microVMs' memory,
+    snapshots and disk copies, until the session ends: a session's runs
+    filled the disk that way. Each microVM is killed and its jail removed
+    as upstream does; the first error is raised after all of them."""
+    first = None
+    for vm in list(factory.vms):
+        try:
+            vm.kill()
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            first = first or err
+        for step in (vm.jailer.cleanup,
+                     lambda vm=vm: vm.jailer.jailer_id and vm.jailer.chroot_base_with_id().exists()
+                     and _remove_tree(vm.jailer.chroot_base_with_id()),
+                     vm.netns.cleanup):
+            try:
+                step()
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                first = first or err
+    factory.vms.clear()
+    if first is not None:
+        raise first
+
+
+_microvm.MicroVMFactory.kill = remove_jails
 
 # Linux: `ip netns`, a network namespace with TAP devices in it. macOS:
 # a network, a directory of endpoints (tools/macos/integration/wick_macos_net.py).

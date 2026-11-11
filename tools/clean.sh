@@ -59,7 +59,10 @@ allowed() {
     return 1
 }
 
-size_kb() { du -sk "$1" 2>/dev/null | awk '{ print $1 }'; }
+# du exits 1 when it cannot read part of the tree (a jail a test made
+# read-only) yet still prints what it could count; under pipefail that
+# status would end the script silently in the middle of remove().
+size_kb() { { du -sk "$1" 2>/dev/null || true; } | awk '{ print $1 }'; }
 
 remove() {
     local p="$1" why="$2" kb
@@ -72,7 +75,15 @@ remove() {
         freed_kb=$((freed_kb + kb))
         return 0
     fi
-    if rm -rf -- "$p" 2>/dev/null && [[ ! -e "$p" ]]; then
+    # A test may leave a directory without its owner's permissions (the
+    # integration tests' test_negative_snapshot_permissions makes a jail
+    # read-only): rm cannot enter it, and the owner gives them back first.
+    # chmod -R follows no symbolic link.
+    if ! rm -rf -- "$p" 2>/dev/null; then
+        chmod -R u+rwx -- "$p" 2>/dev/null || true
+        rm -rf -- "$p" 2>/dev/null || true
+    fi
+    if [[ ! -e "$p" ]]; then
         say "removed $p ($((kb / 1024)) MiB): $why"
         freed_kb=$((freed_kb + kb))
     else

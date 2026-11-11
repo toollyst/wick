@@ -69,7 +69,15 @@ PATH="/opt/homebrew/bin:$PATH" command -v zig >/dev/null ||
 
 free_gib="${WICK_IT_FREE_GIB:-20}"
 [[ "$free_gib" =~ ^[0-9]+$ ]] || die "WICK_IT_FREE_GIB must be a number of GiB"
+# No run with less than tools/macos/boot-test.sh's 5 GiB.
+((free_gib >= 5)) || die "WICK_IT_FREE_GIB must be at least 5"
 prepare_test_run "$ROOT/build/integration-tests" "$free_gib"
+# The session's jails are under /tmp, which may be on another volume than
+# the build output prepare_test_run checked: the same free space there.
+tmp_avail_gib="$(df -Pk /tmp | awk 'NR == 2 { print int($4 / 1048576) }')"
+tmp_mount="$(df -Pk /tmp | awk 'NR == 2 { print $6 }')"
+((tmp_avail_gib >= free_gib)) ||
+    die "only $tmp_avail_gib GiB free on $tmp_mount, which holds the session's jails (/tmp); a run needs $free_gib GiB there (tools/clean.sh)"
 out="${out:-$ROOT/build/integration-tests/$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
@@ -132,12 +140,28 @@ echo "$art" >"$ROOT/lib/firecracker/build/current_artifacts"
 # to 104 bytes, and ssh's control socket in a jail
 # (<root>/jailer/firecracker/<uuid>/root/ssh-0.sock plus ssh's 17-byte
 # suffix) is the longest: 102 bytes with this root.
+#
+# The session's jails hold each microVM's memory, snapshots and disk
+# copies (hundreds of MiB each). Each test's jails are removed when the test
+# ends, also when it fails (wick_macos.remove_jails), and the session
+# directory at exit, on failure or interruption too.
 session="$(mktemp -d /tmp/wit-XXXX)"
 cleanup() {
     # Everything the session started carries its root in its command line.
     pkill -KILL -f -- "$session" 2>/dev/null || true
     [[ -n "${sampler:-}" ]] && kill "$sampler" 2>/dev/null
-    rm -rf "$session"
+    # A test may leave a jail without its owner's permissions
+    # (test_negative_snapshot_permissions makes it read-only): they are given
+    # back first. As --jailer, the jailer made the jails as root, and only
+    # root removes them: sudo, without asking again (the run asked already).
+    if [[ $mode == jailer ]]; then
+        sudo -n chmod -R u+rwx "$session" 2>/dev/null || true
+        sudo -n rm -rf "$session" 2>/dev/null || true
+    else
+        chmod -R u+rwx "$session" 2>/dev/null || true
+        rm -rf "$session" || true
+    fi
+    [[ ! -e "$session" ]] || echo "cannot remove $session$([[ $mode == jailer ]] && echo ': root-owned, run sudo tools/clean.sh')" >&2
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
