@@ -6,9 +6,9 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,low,isolation,boot,limits,cpu] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,isolation,boot,limits,cpu] [-Bin <dir>]
 #
-# `refuse` and `low` need no WHP; the other stages boot a guest.
+# `refuse`, `low` and `daemonize` need no WHP; the other stages boot a guest.
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build).
 # Needs the boot test's guest files in -Assets (vmlinux-6.1.188 and
@@ -17,7 +17,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'low', 'isolation', 'boot', 'limits', 'cpu'),
+    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'isolation', 'boot', 'limits', 'cpu'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -131,7 +131,6 @@ function Stage-Refuse {
     $cases = [ordered]@{
         '--netns'                    = @('--netns', 'C:\x')
         '--new-pid-ns'               = @('--new-pid-ns')
-        '--daemonize'                = @('--daemonize')
         'fsize'                      = @('--resource-limit', 'fsize=1024')
         'cpuset'                     = @('--cgroup', 'cpuset.cpus=0', '--cgroup-version', '2')
     }
@@ -140,7 +139,45 @@ function Stage-Refuse {
         Check ($r[0] -ne 0) "$k accepted (exit $($r[0])): $($r[1])"
         Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue)) "$k started Firecracker"
     }
-    "--netns, --new-pid-ns, --daemonize, fsize= and an unsupported cgroup are refused before Firecracker starts"
+    "--netns, --new-pid-ns, fsize= and an unsupported cgroup are refused before Firecracker starts"
+}
+
+# Row 15 of docs/PORTING.md: --daemonize, upstream's observable behaviour.
+# The jailer returns 0 at once; Firecracker runs on, detached (no console),
+# and the pid file holds its pid. Needs no guest.
+function Stage-Daemonize {
+    $base = New-Base 'daemonize'
+    $root = Join-Path $base 'firecracker.exe\d\root'
+    try {
+        # The call operator blocks until the launcher returns; with --daemonize
+        # it returns at once, leaving a detached jailer and Firecracker behind.
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        & $Jailer --id d --exec-file $Fc --uid 0 --gid 0 --chroot-base-dir $base --daemonize 2>&1 | Out-Null
+        $code = $LASTEXITCODE
+        $sw.Stop()
+        Check ($code -eq 0) "the jailer did not return 0 with --daemonize (exit $code)"
+        Check ($sw.Elapsed.TotalSeconds -lt 10) "the jailer did not return promptly: $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
+        # The detached Firecracker keeps running after the launcher returned.
+        $sock = Join-Path $root 'run\firecracker.socket'
+        $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
+        Check (Test-Path $sock) 'the detached Firecracker did not open its API socket'
+        $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" } | Select-Object -First 1
+        Check ($null -ne $fcp) 'no detached Firecracker'
+        $pidFile = Join-Path $root 'firecracker.exe.pid'
+        Check (Test-Path $pidFile) 'no pid file'
+        $written = [int](Get-Content $pidFile)
+        Check ($written -eq $fcp.Id) "the pid file holds $written, Firecracker is $($fcp.Id)"
+        # It has no console window of its own.
+        Check ($fcp.MainWindowHandle -eq 0) 'the detached Firecracker has a window'
+        $answer = Invoke-Api $sock 'GET' '/'
+        Check ($answer -match ' 200$') "the detached Firecracker's API: $answer"
+        # Ending Firecracker lets its detached jailer exit cleanly and remove
+        # the jail's drive, as a guest shutdown does.
+        $fcp | Stop-Process -Force
+        $t = [DateTime]::Now.AddSeconds(5)
+        while ((Get-Process jailer -ErrorAction SilentlyContinue) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
+        "the launcher returned 0 in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s; a detached Firecracker (pid $written, in the pid file) ran with no console and answered its API"
+    } finally { Stop-Jailed }
 }
 
 # tools\windows\jail-probe.rs, built once (or -Probe).

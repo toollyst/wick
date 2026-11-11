@@ -43,10 +43,12 @@
 //!   Firecracker when the jailer goes and limits its UI access.
 //! - **No exec**: the jailer starts Firecracker suspended in the job with the
 //!   tokens, waits for it, removes the jail's drive and exits with its status.
+//! - **`--daemonize`** ([`daemonize`]): Windows has no fork, so the jailer
+//!   relaunches itself detached, without the flag, and returns 0; the
+//!   detached jailer builds the jail and runs Firecracker with no console.
 //!
 //! Refused, never accepted without effect: `--netns` and `--new-pid-ns`
-//! (no namespaces), `--daemonize` (the jailer owns the job and the drive
-//! while Firecracker runs), `--resource-limit fsize=` and a `no-file=` other
+//! (no namespaces), `--resource-limit fsize=` and a `no-file=` other
 //! than the default (Windows cannot limit file sizes or the number of
 //! handles; the default is not enforced either).
 
@@ -95,8 +97,9 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
     SetInformationJobObject,
 };
+use windows_sys::Win32::System::Console::GetConsoleWindow;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -288,15 +291,132 @@ pub fn new_pid_ns() -> Result<(), JailerError> {
     .into())
 }
 
-/// `--daemonize`: the jailer stays while Firecracker runs.
+/// `--daemonize`: upstream double-forks, so the jailer returns 0 at once and
+/// Firecracker keeps running with no controlling terminal, its stdio on
+/// `/dev/null`. Windows has no fork; the jailer relaunches itself, detached
+/// and without `--daemonize`, and exits 0. The relaunched jailer has no
+/// console (`DETACHED_PROCESS`) and `NUL` for its standard handles, which it
+/// passes on to Firecracker, so closing the terminal does not reach either;
+/// it then owns the Job Object and the jail's drive for Firecracker's life
+/// and waits for it, as a foreground jailer does. Called before any jail is
+/// set up (`env::run`), so the detached jailer builds the whole jail itself.
+///
+/// Returns only on failure; on success it never returns (it exits 0).
 pub fn daemonize() -> Result<(), JailerError> {
-    Err(HostError::Unsupported(
-        "daemonize",
-        "Windows has no exec, so the jailer stays while Firecracker runs: it owns the Job Object \
-         that limits it and removes the jail's drive when it exits; start the jailer detached \
-         instead",
-    )
-    .into())
+    match relaunch_detached() {
+        Ok(never) => match never {},
+        Err(err) => Err(HostError::Spawn("daemonize", err).into()),
+    }
+}
+
+/// The `NUL` device, opened for a detached process's standard handle.
+fn open_nul() -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap(),
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    // SAFETY: a NUL-terminated device name; the handle is owned below.
+    let h = unsafe {
+        CreateFileW(
+            wide("NUL").as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &sa,
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(last_error());
+    }
+    // SAFETY: a handle we own.
+    Ok(unsafe { OwnedHandle::from_raw_handle(h) })
+}
+
+/// Starts this jailer again with the same arguments but `--daemonize`,
+/// detached: no console, `NUL` for the standard handles, only those inherited.
+fn relaunch_detached() -> io::Result<std::convert::Infallible> {
+    use windows_sys::Win32::System::Threading::{CreateProcessW, DETACHED_PROCESS};
+
+    let exe = std::env::current_exe()?;
+    // The same command line without --daemonize: the relaunched jailer runs
+    // the foreground path.
+    let mut argv = vec![exe.to_string_lossy().into_owned()];
+    argv.extend(std::env::args().skip(1).filter(|a| a != "--daemonize"));
+    let mut cmd = wide(command_line(&argv));
+
+    let nul = open_nul()?;
+    // Only the standard handles are inheritable, and they are all NUL.
+    let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    si.StartupInfo.cb = u32::try_from(std::mem::size_of::<STARTUPINFOEXW>()).unwrap();
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = nul.as_raw_handle();
+    si.StartupInfo.hStdOutput = nul.as_raw_handle();
+    si.StartupInfo.hStdError = nul.as_raw_handle();
+    let handles = [nul.as_raw_handle()];
+    let mut size = 0usize;
+    // SAFETY: a size query.
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+    let mut attrs = vec![0u64; size.div_ceil(8)];
+    let list: LPPROC_THREAD_ATTRIBUTE_LIST = attrs.as_mut_ptr().cast();
+    // SAFETY: a buffer of the size asked for.
+    if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
+        return Err(last_error());
+    }
+    // SAFETY: the handle array outlives the process creation.
+    if unsafe {
+        UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            handles.as_ptr().cast(),
+            std::mem::size_of_val(&handles),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    } == 0
+    {
+        // SAFETY: initialised above.
+        unsafe { DeleteProcThreadAttributeList(list) };
+        return Err(last_error());
+    }
+    si.lpAttributeList = list;
+    // SAFETY: plain data.
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: NUL-terminated command line; the attribute list and NUL handle
+    // outlive the call.
+    let ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmd.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            DETACHED_PROCESS | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si.StartupInfo,
+            &mut pi,
+        )
+    };
+    // SAFETY: initialised above.
+    unsafe { DeleteProcThreadAttributeList(list) };
+    if ok == 0 {
+        return Err(last_error());
+    }
+    // SAFETY: handles CreateProcess gave us; we need neither.
+    unsafe {
+        windows_sys::Win32::Foundation::CloseHandle(pi.hProcess);
+        windows_sys::Win32::Foundation::CloseHandle(pi.hThread);
+    }
+    // The jailer has returned: the detached one runs on.
+    std::process::exit(0);
 }
 
 /// The device nodes upstream creates in the jail. None is needed on Windows;
@@ -1068,6 +1188,17 @@ fn exec(
     // SAFETY: plain data.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let no_sa: *const SECURITY_ATTRIBUTES = std::ptr::null();
+    // When the jailer has no console of its own (it was daemonized: started
+    // detached), Firecracker is given a new, hidden one, so its console setup
+    // does not fail; its standard handles are still the NUL ones above. A
+    // foreground jailer shares its console, which the interactive guest serial
+    // uses.
+    // SAFETY: plain call.
+    let no_console = unsafe { GetConsoleWindow() }.is_null();
+    let create_flags = CREATE_SUSPENDED
+        | CREATE_UNICODE_ENVIRONMENT
+        | EXTENDED_STARTUPINFO_PRESENT
+        | if no_console { CREATE_NO_WINDOW } else { 0 };
     // SAFETY: NUL-terminated application path, command line, environment and
     // directory; the attribute list and tokens outlive the call.
     let created = unsafe {
@@ -1078,7 +1209,7 @@ fn exec(
             no_sa,
             no_sa,
             i32::from(!handles.is_empty()),
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            create_flags,
             env.as_ptr().cast(),
             wide(&drive_root).as_ptr(),
             &si.StartupInfo,
@@ -1149,7 +1280,6 @@ mod tests {
         for (err, flag) in [
             (join_netns("x").unwrap_err(), "netns"),
             (new_pid_ns().unwrap_err(), "new-pid-ns"),
-            (daemonize().unwrap_err(), "daemonize"),
         ] {
             assert!(matches!(err, JailerError::Host(HostError::Unsupported(f, _)) if f == flag), "{flag}");
         }
