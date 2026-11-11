@@ -233,6 +233,29 @@ pub(crate) fn system_time(
     unsafe { publish(at as *mut VcpuTimeInfo, info) };
 }
 
+/// `PVCLOCK_GUEST_STOPPED`: the vCPU was stopped by the host.
+pub(crate) const PVCLOCK_GUEST_STOPPED: u8 = 1 << 1;
+
+/// `KVM_KVMCLOCK_CTRL` for the vCPU whose `MSR_KVM_SYSTEM_TIME_NEW` is
+/// `value`: sets `PVCLOCK_GUEST_STOPPED` in its time info, which the guest's
+/// lockup watchdogs read (and clear) after a pause, so that the time the VM
+/// was paused is not taken for a soft lockup. False when the vCPU has no
+/// kvm-clock, which KVM answers with `EINVAL`.
+pub(crate) fn set_guest_stopped(value: u64, host: impl Fn(u64) -> Option<u64>) -> bool {
+    if value & 1 == 0 {
+        return false;
+    }
+    let Some(at) = host(value & !0x1f) else { return false };
+    let at = at as *mut VcpuTimeInfo;
+    // SAFETY: guest RAM the guest gave for its time info (see system_time).
+    unsafe {
+        let mut info = core::ptr::read_volatile(at);
+        info.flags |= PVCLOCK_GUEST_STOPPED;
+        publish(at, info);
+    }
+    true
+}
+
 /// Handles a guest write of `MSR_KVM_WALL_CLOCK_NEW`: fills the
 /// `pvclock_wall_clock` at the guest physical address `value` with the wall
 /// time at which the VM clock was 0.
@@ -299,6 +322,18 @@ mod tests {
         assert!(at(&state, 9 * hz).abs_diff(4_000_000_000) < 10);
         state.reset();
         assert_eq!(state.clock_at(10 * hz), None);
+    }
+
+    #[test]
+    fn test_guest_stopped_is_published() {
+        let mut info = VcpuTimeInfo { version: 4, flags: PVCLOCK_TSC_STABLE, system_time: 7, ..Default::default() };
+        let at = &raw mut info as u64;
+        // The MSR's enable bit, the struct at "guest address" 0x1000.
+        assert!(!set_guest_stopped(0x1000, |_| Some(at)), "kvm-clock off");
+        assert!(set_guest_stopped(0x1001, |gpa| (gpa == 0x1000).then_some(at)));
+        assert_eq!(info.flags, PVCLOCK_TSC_STABLE | PVCLOCK_GUEST_STOPPED);
+        assert_eq!(info.system_time, 7, "the rest as it was");
+        assert_eq!(info.version, 6, "an update: even, advanced");
     }
 
     #[test]
