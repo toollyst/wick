@@ -21,3 +21,4 @@
 0019-windows-the-serial-input-takes-an-empty-non-blocking.patch
 0020-windows-the-jailer-builds-on-Windows-its-Unix-only-s.patch
 0021-wick-a-diff-snapshot-writes-whole-hole-units.patch
+0022-seccomp-narrow-the-host-sandbox-where-the-VMM-thread.patch

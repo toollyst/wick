@@ -57,17 +57,19 @@ go through a backend.
 
 | | Linux (upstream) | macOS | Test | Windows |
 | --- | --- | --- | --- | --- |
-| Default | per-thread seccomp-BPF | Seatbelt, process-wide: 118 system calls, 25 Mach traps (plus one where defined), 20 MIG routines; any other one raises SIGSYS and Firecracker exits with upstream's bad-syscall code | `test_unlisted_syscalls_raise_sigsys`, `test_denied_syscall_exits_as_seccomp`, every `boot-test` stage | `ProcessChildProcessPolicy` only |
+| Default | per-thread seccomp-BPF | Seatbelt, process-wide, in two phases: what building the microVM takes until `narrow()` (where Linux installs the VMM thread's filter), then 87 system calls, 15 Mach traps, 7 MIG routines, each tied to a Linux rule, for good; any other one raises SIGSYS and Firecracker exits with upstream's bad-syscall code | `test_unlisted_syscalls_raise_sigsys`, `test_denied_syscall_exits_as_seccomp`, `test_narrow_ends_the_setup_phase`, `test_narrowing_is_one_way`, every `boot-test` stage, `tools/macos/sandbox-discovery.sh` | `ProcessChildProcessPolicy` only |
 | No exec, fork, IP, Mach lookups, IOKit, sysctl writes | seccomp | the profile | `test_sandbox_restricts_child` | child processes only |
 | Files limited to the jail | chroot | a Seatbelt file rule on the jail | `test_jail_profile_limits_files`, `test_files_in_jail_rejects_bad_paths`, `jailer-test jail` | the jail's ACLs and token |
 | `--seccomp-filter FILE` | the given filters | refused | `ext::sandbox` | refused |
 | The allow-lists themselves | | no duplicates; the calls Firecracker needs are in, the ones that would lift a limit or reach another task are out; Seatbelt refuses to compile an unknown name | `test_syscall_names_are_known`, `test_mach_trap_names_are_known`, `test_mig_routine_names_are_known` | |
 
-How the macOS lists were found: `(allow syscall-mach (with report))` (and the same for `syscall-mig` and
-`syscall-unix`) logs each distinct call. Run every boot-test stage, debug and release, then
-`/usr/bin/log show --predicate 'sender == "Sandbox"'`. In zsh, a bare `log` is a builtin. The Windows counterpart
-is the same loop: turn a mitigation on in audit mode where Windows has one (the ETW mitigation events), run every
-stage, and only then turn it on for real.
+How the macOS lists are checked: `tools/macos/sandbox-discovery.sh` builds Firecracker with
+`--cfg wick_sandbox_discovery`, where a call outside the run phase's lists is allowed and reported, after `narrow()`,
+instead of raising SIGSYS. It runs every boot-test stage and fails if the kernel reported any call (debug and release
+both). To find calls the first time, `(allow syscall-unix (with report))` (and the same for `syscall-mach` and
+`syscall-mig`) logs each distinct call; `/usr/bin/log show --predicate 'sender == "Sandbox"'` reads them (in zsh, a
+bare `log` is a builtin). The Windows counterpart is the same loop: turn a mitigation on in audit mode where Windows
+has one (the ETW mitigation events), run every stage, and only then turn it on for real.
 
 ## The hypervisor and the compatibility crates (`crates/compat`)
 
@@ -110,7 +112,7 @@ physically cannot do it. Then the request is refused loudly, and the row says wh
 
 | # | Linux does | macOS | Windows | Done when |
 | --- | --- | --- | --- | --- |
-| 1 | Allows each thread only the system calls upstream's filter lists for it | One allow-list for the whole process, 118 system calls + 25 Mach traps + 20 MIG routines, wider than Linux's union (about 60). To do: every entry justified by the Linux rule it stands for, the rest removed | `ProcessChildProcessPolicy` only. To do: the mitigation profile, each mitigation tied to the Linux rule it stands for | a unit test per removed or kept entry; every boot-test stage passes |
+| 1 | Allows each thread only the system calls upstream's filter lists for it | Two phases as on Linux: wide until the microVM is built, then narrowed for good to 87 system calls, 15 Mach traps and 7 MIG routines, each tied to the Linux rule it stands for (`test_narrowing_is_one_way`, `tools/macos/sandbox-discovery.sh`). Left: Seatbelt cannot deny 91 system calls by number; each of those is to be tied to the operation rule that limits it, or written down as impossible | `ProcessChildProcessPolicy` only. To do: the mitigation profile, each mitigation tied to the Linux rule it stands for | a unit test per removed or kept entry; every boot-test stage passes |
 | 2 | Checks the arguments of 14 calls (`ioctl` requests, `socket` domain, `mmap`/`mprotect` protections, `fcntl` commands, `futex` operations, ...) | Number-only. To do: each check expressed in Seatbelt (`file-ioctl` with `ioctl-command`, `network*`, `dynamic-code-generation`, `file-map-executable`), or written down as impossible | none. To do: the same list | a unit test per check that a call with a denied argument ends Firecracker as seccomp does |
 | 3 | A denied call raises SIGSYS, and Firecracker exits with upstream's bad-syscall code | the same for system calls, Mach traps and MIG routines; other denied operations (files, network) return `EPERM`. To do: `(with send-signal SIGSYS)` on each | a mitigation failure is a Windows error. To do: the same exit | a unit test per kind of denied operation |
 | 4 | The API thread has its own, narrower filter | the API thread shares the process's allow-list. To do: the API server in a process of its own with the API filter's equivalent | the same | the API filter's tests run against the API process |

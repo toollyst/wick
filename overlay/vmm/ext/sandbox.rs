@@ -44,6 +44,8 @@ pub enum Policy {
 pub enum SandboxError {
     /// Failed to install the process sandbox: {0}
     Install(String),
+    /// Failed to narrow the process sandbox: {0}
+    Narrow(String),
     /// Custom seccomp-BPF filters can only be enforced on Linux
     CustomFilterUnsupported,
     /// The jail's CPU limit of {0}% holds only with the sandbox: without it Firecracker could lift the limit itself (unlike a cgroup's). Drop --no-seccomp or the CPU cgroup
@@ -53,8 +55,18 @@ pub enum SandboxError {
 #[cfg(target_os = "macos")]
 pub use macos::{
     FILES_ANYWHERE, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MIG_ROUTINES, PROFILE, SYSCALLS, apply,
-    denied_syscall, files_in_jail, profile, select,
+    denied_syscall, files_in_jail, narrow, profile, select,
 };
+
+/// Narrows the sandbox to what a running microVM needs, for good. Called
+/// where upstream installs the VMM thread's seccomp filter, after the microVM
+/// is built (on Linux that thread runs unfiltered until then). On Linux each
+/// thread's seccomp filter does this; on Windows nothing narrows yet, and the
+/// sandbox stays as [`apply`] installed it (docs/PORTING.md, row 1).
+#[cfg(not(target_os = "macos"))]
+pub fn narrow() -> Result<(), SandboxError> {
+    Ok(())
+}
 
 /// Whether a SIGSYS is the host sandbox denying a system call (upstream's
 /// handler then exits as for a seccomp violation). Async-signal-safe.
@@ -114,84 +126,133 @@ mod macos {
 (deny syscall-unix (with send-signal SIGSYS))
 (deny syscall-mach (with send-signal SIGSYS))
 (deny syscall-mig (with send-signal SIGSYS))
+; Two phases, as upstream's filters have: setup, until the microVM is built
+; (on Linux the VMM thread runs unfiltered until then), and run. What only
+; setup needs is allowed until the process holds the narrowed extension,
+; which narrow() takes. Then it cannot be undone: no extension can be issued,
+; and the Sandbox call that takes one (mac-syscall 6) and every other
+; mac-syscall raise SIGSYS; none releases one.
+(deny generic-issue-extension)
+(deny system-mac-syscall (with send-signal SIGSYS))
+(allow system-mac-syscall (require-all (mac-policy-name "Sandbox") (mac-syscall-number 6)
+    (require-not (extension "com.toollyst.wick.narrowed"))))
 "#;
 
-    /// The system calls the sandbox allows (`SYS_<name>`, <sys/syscall.h>):
-    /// the ones a Firecracker process makes once its first thread is
-    /// sandboxed, as upstream's seccomp filters allow only what each thread
-    /// needs. Measured over `tools/macos/boot-test.sh` (every device,
-    /// snapshots, userfaultfd, PCI, vhost-user, vmnet) with every
-    /// libsystem_kernel entry point recorded, plus each call's
+    /// The extension that ends the setup phase for good (see [`PROFILE`]).
+    const NARROWED: &CStr = c"com.toollyst.wick.narrowed";
+
+    /// The system calls a running microVM may make (`SYS_<name>`,
+    /// <sys/syscall.h>): after [`narrow`], where upstream's VMM thread gets
+    /// its filter. Each line stands for the rules of upstream's filters
+    /// (`resources/seccomp/aarch64-unknown-linux-musl.json`, the union of the
+    /// vmm, vcpu and api threads, as one process holds them all here) named in
+    /// its comment, and holds what a Firecracker process was measured to call
+    /// after narrowing, over every stage of `tools/macos/boot-test.sh`
+    /// (`tools/macos/sandbox-discovery.sh`), with each call's
     /// cancellation-point twin (`_nocancel`) and what a panic or a thread's
-    /// exit takes (signal masks, `__pthread_kill`, `abort_with_payload`).
+    /// exit takes.
+    ///
+    /// Seatbelt cannot deny some system calls by number (measured: `write`,
+    /// `open`, `close`, `socket`, `connect`, `bind`, `ioctl`, `sysctl`,
+    /// `shm_open`, `getpid`, ... 91 of them); those listed here only say that
+    /// a running microVM uses them, and the operation rules of [`PROFILE`]
+    /// (files, network, IPC, sysctl) are what limit them.
     pub const SYSCALLS: &[&str] = &[
-        "exit", "read", "write", "open", "close", "unlink", "getpid", "getuid", "geteuid",
-        "recvmsg", "sendmsg", "recvfrom", "accept", "access", "dup", "pipe", "getegid",
-        "sigaction", "sigprocmask", "sigaltstack", "ioctl", "munmap", "mprotect", "madvise",
-        "mincore", "dup2", "fcntl", "fsync", "socket", "connect", "bind", "setsockopt",
-        "listen", "gettimeofday", "getrusage", "getsockopt", "readv", "writev", "mkfifo",
-        "sendto", "socketpair", "pread", "pwrite", "csops", "csops_audittoken",
-        "kdebug_typefilter", "kdebug_trace_string", "kdebug_trace64", "sigreturn", "fdatasync",
-        "getrlimit", "mmap", "lseek", "ftruncate", "sysctl", "getattrlist", "poll", "shm_open",
-        "shm_unlink", "gettid", "psynch_mutexwait", "psynch_mutexdrop", "psynch_cvbroad",
-        "psynch_cvsignal", "psynch_cvwait", "psynch_cvclrprepost", "issetugid",
-        "__pthread_kill", "__pthread_sigmask", "__disable_threadsignal", "__semwait_signal",
-        "proc_info", "stat64", "fstat64", "lstat64", "getdirentries64", "fstatfs64",
-        "bsdthread_create", "bsdthread_terminate", "kqueue", "kevent", "workq_open",
-        "workq_kernreturn", "thread_selfid", "kevent_qos", "kevent_id", "read_nocancel",
-        "write_nocancel", "open_nocancel", "close_nocancel", "recvmsg_nocancel",
-        "sendmsg_nocancel", "recvfrom_nocancel", "accept_nocancel", "fcntl_nocancel",
-        "fsync_nocancel", "connect_nocancel", "sigsuspend_nocancel", "readv_nocancel",
-        "writev_nocancel", "sendto_nocancel", "pread_nocancel", "pwrite_nocancel",
-        "poll_nocancel", "__semwait_signal_nocancel", "fileport_makefd", "openat",
-        "openat_nocancel", "fstatat64", "bsdthread_ctl", "recvmsg_x", "sendmsg_x", "getentropy",
-        "ulock_wait", "ulock_wake", "abort_with_payload", "os_fault_with_payload", "ulock_wait2",
+        // mmap, munmap, mprotect, madvise, mincore.
+        "mmap", "munmap", "mprotect", "madvise", "mincore",
+        // futex.
+        "psynch_mutexwait", "psynch_mutexdrop", "psynch_cvbroad", "psynch_cvsignal",
+        "psynch_cvwait", "psynch_cvclrprepost", "ulock_wait", "ulock_wake", "ulock_wait2",
+        "__semwait_signal", "__semwait_signal_nocancel",
+        // epoll_ctl, epoll_pwait.
+        "kevent", "kevent_qos", "kevent_id", "poll", "poll_nocancel",
+        // read, readv, write, writev, recvfrom, recvmsg, sendmsg, sendto, lseek.
+        "read", "read_nocancel", "readv", "readv_nocancel", "write", "write_nocancel", "writev",
+        "writev_nocancel", "pread", "pread_nocancel", "pwrite", "pwrite_nocancel", "recvmsg",
+        "recvmsg_nocancel", "recvfrom", "recvfrom_nocancel", "sendmsg", "sendmsg_nocancel",
+        "sendto", "sendto_nocancel", "recvmsg_x", "sendmsg_x", "lseek",
+        // accept4, socket, connect (domains: the network rules); the socket
+        // options macOS sets where Linux has MSG_NOSIGNAL and accept4's flags.
+        "accept", "accept_nocancel", "socket", "connect", "connect_nocancel", "setsockopt",
+        "getsockopt",
+        // fstat, newfstatat.
+        "fstat64", "stat64", "lstat64", "fstatat64", "fstatfs64",
+        // openat, close, fcntl, ioctl (paths and drivers: the file rules).
+        "open", "open_nocancel", "openat", "openat_nocancel", "close", "close_nocancel", "fcntl",
+        "fcntl_nocancel", "ioctl",
+        // eventfd2: an eventfd is an unnamed FIFO here (vmm-sys-util's
+        // anonymous_fifo: made, opened, its name removed).
+        "mkfifo", "unlink",
+        // ftruncate, fallocate, fsync.
+        "ftruncate", "fsync", "fsync_nocancel", "fdatasync",
+        // getrandom, clock_gettime, gettid.
+        "getentropy", "gettimeofday", "thread_selfid",
+        // rt_sigaction, rt_sigprocmask, rt_sigreturn, sigaltstack, tkill.
+        "sigaction", "sigprocmask", "__pthread_sigmask", "sigreturn", "sigaltstack",
+        "__pthread_kill",
+        // exit, exit_group: a thread's exit, a worker thread parking, a panic.
+        "exit", "bsdthread_terminate", "__disable_threadsignal", "workq_open", "workq_kernreturn",
+        "abort_with_payload", "os_fault_with_payload",
     ];
 
-    /// The Mach traps the sandbox allows (`MSC_<name>`, XNU's
-    /// osfmk/kern/syscall_sw.c), the other way into the kernel on macOS. Those
-    /// a Firecracker process makes once sandboxed, measured over
-    /// `tools/macos/boot-test.sh` (the sandbox reporting each one): memory and
-    /// port rights of its own task, semaphores, `mach_msg2_trap` (Mach
-    /// messages, also to libdispatch and Hypervisor.framework) and the special
-    /// reply port; plus the ones of the same kind Apple's own hardened services
-    /// allow (allocating memory, port guards and types, the task, thread and
-    /// host self ports, the timebase, thread switching, vouchers), so that a
-    /// path the tests do not take is not killed for them. Not in it: anything
-    /// reaching another task (`task_for_pid`, `pid_for_task`,
-    /// `task_name_for_pid`), IOKit, swap control, debugging.
+    /// System calls allowed until [`narrow`] only, in addition to
+    /// [`SYSCALLS`]: what building the microVM takes (on Linux the VMM thread
+    /// runs unfiltered until then), measured as [`SYSCALLS`] are.
+    pub const SETUP_SYSCALLS: &[&str] = &[
+        "getpid", "getuid", "geteuid", "access", "dup", "pipe", "getegid", "dup2", "bind",
+        "listen", "getrusage", "socketpair", "csops", "csops_audittoken",
+        "kdebug_typefilter", "kdebug_trace_string", "kdebug_trace64", "getrlimit", "sysctl",
+        "getattrlist", "shm_open", "shm_unlink", "gettid", "issetugid", "proc_info",
+        "getdirentries64", "bsdthread_create", "kqueue", "sigsuspend_nocancel", "fileport_makefd",
+        "bsdthread_ctl",
+        // The Sandbox call narrow() takes the narrowed extension with
+        // (PROFILE's system-mac-syscall rules).
+        "__mac_syscall",
+    ];
+
+    /// The Mach traps a running microVM may make (`MSC_<name>`, XNU's
+    /// osfmk/kern/syscall_sw.c), the other way into the kernel on macOS, each
+    /// line for the Linux rules in its comment, measured as [`SYSCALLS`] are.
+    /// Not in it: anything reaching another task (`task_for_pid`,
+    /// `pid_for_task`, `task_name_for_pid`), IOKit, swap control, debugging.
     pub const MACH_TRAPS: &[&str] = &[
-        // Measured.
-        "_kernelrpc_mach_vm_deallocate_trap", "_kernelrpc_mach_vm_protect_trap",
-        "_kernelrpc_mach_vm_map_trap", "_kernelrpc_mach_port_deallocate_trap",
-        "_kernelrpc_mach_port_mod_refs_trap", "_kernelrpc_mach_port_construct_trap",
-        "_kernelrpc_mach_port_destruct_trap", "semaphore_signal_trap", "semaphore_wait_trap",
-        "semaphore_timedwait_trap", "mach_msg2_trap", "thread_get_special_reply_port",
-        // Of the same kind, allowed by Apple's hardened services.
-        "_kernelrpc_mach_vm_allocate_trap", "_kernelrpc_mach_port_guard_trap",
-        "_kernelrpc_mach_port_type_trap", "_kernelrpc_mach_port_insert_right_trap",
-        "_kernelrpc_mach_port_request_notification_trap", "host_self_trap",
-        "mach_timebase_info_trap", "syscall_thread_switch", "mach_generate_activity_id",
+        // mmap, munmap, mprotect.
+        "_kernelrpc_mach_vm_allocate_trap", "_kernelrpc_mach_vm_deallocate_trap",
+        "_kernelrpc_mach_vm_protect_trap", "_kernelrpc_mach_vm_map_trap",
+        // close: port rights of its own task (libdispatch, Hypervisor.framework).
+        "_kernelrpc_mach_port_deallocate_trap", "_kernelrpc_mach_port_mod_refs_trap",
+        "_kernelrpc_mach_port_construct_trap", "_kernelrpc_mach_port_destruct_trap",
+        // futex.
+        "semaphore_signal_trap", "semaphore_wait_trap", "semaphore_timedwait_trap",
+        // sendmsg, recvmsg: Mach messages, to libdispatch and Hypervisor.framework.
+        "mach_msg2_trap", "thread_get_special_reply_port",
+        // sched_yield (a contended lock yields).
+        "swtch_pri", "syscall_thread_switch",
+    ];
+
+    /// Mach traps allowed until [`narrow`] only, in addition to [`MACH_TRAPS`].
+    pub const SETUP_MACH_TRAPS: &[&str] = &[
+        "_kernelrpc_mach_port_guard_trap", "_kernelrpc_mach_port_type_trap",
+        "_kernelrpc_mach_port_insert_right_trap", "_kernelrpc_mach_port_request_notification_trap",
+        "host_self_trap", "mach_timebase_info_trap", "mach_generate_activity_id",
         "host_create_mach_voucher_trap", "mach_reply_port", "task_self_trap", "thread_self_trap",
     ];
 
-    /// The kernel's MIG routines the sandbox allows: the services of kernel
-    /// objects a Mach message (`mach_msg2_trap`) reaches, by the kernel's
-    /// names for them. Those a Firecracker process calls once sandboxed,
-    /// measured over `tools/macos/boot-test.sh` (the sandbox reporting each
-    /// one): the clock `nanosleep` waits on, semaphores, mapping and
-    /// inspecting its own memory, and its own task's special ports; plus the
-    /// ones of the same kind Apple's hardened services allow (the clock
-    /// service `nanosleep` looks up once, memory entries, copying and
-    /// reallocating its own memory, its own task's and port's information,
-    /// restartable ranges, vouchers), so that a path the tests do not take is
-    /// not killed for them. Not in it: setting special or exception ports,
-    /// other tasks' threads or state, host special ports, XPC connections.
+    /// The kernel's MIG routines a running microVM may call: the services of
+    /// kernel objects a Mach message (`mach_msg2_trap`) reaches, by the
+    /// kernel's names for them, measured as [`SYSCALLS`] are: the clock
+    /// `nanosleep` waits on (clock_nanosleep), semaphores (futex), mapping and
+    /// inspecting its own memory (mmap, mremap, mincore), and its own task's
+    /// special ports. Not in it: setting special or exception ports, other
+    /// tasks' threads or state, host special ports, XPC connections.
     pub const MIG_ROUTINES: &[&str] = &[
-        // Measured.
         "clock_get_time", "semaphore_create", "semaphore_destroy", "mach_vm_map_external",
         "mach_vm_remap_external", "mach_vm_region", "task_get_special_port_from_user",
-        // Of the same kind, allowed by Apple's hardened services.
+    ];
+
+    /// MIG routines allowed until [`narrow`] only, in addition to
+    /// [`MIG_ROUTINES`].
+    pub const SETUP_MIG_ROUTINES: &[&str] = &[
         "host_get_clock_service", "_mach_make_memory_entry", "mach_memory_entry_ownership",
         "mach_vm_copy", "mach_vm_reallocate", "vm_reallocate", "host_info", "task_info_from_user",
         "mach_port_set_attributes", "mach_port_request_notification",
@@ -231,13 +292,39 @@ mod macos {
         Ok(format!("{PROFILE}{}{files}", syscall_rule()))
     }
 
-    fn mach_trap_rule() -> String {
-        let mut rule = String::from("(allow syscall-mach (machtrap-number");
-        for name in MACH_TRAPS {
-            rule.push_str(" MSC_");
-            rule.push_str(name);
+    /// `(allow <op> (require-all <condition> (<filter> <prefix><name>...)))`,
+    /// or nothing for an empty list.
+    fn allow(op: &str, condition: &str, filter: &str, prefix: &str, names: &[&str]) -> String {
+        if names.is_empty() {
+            return String::new();
         }
-        rule.push_str("))\n");
+        let mut list = format!("({filter}");
+        for name in names {
+            list.push(' ');
+            list.push_str(prefix);
+            list.push_str(name);
+        }
+        list.push(')');
+        if condition.is_empty() {
+            format!("(allow {op} {list})\n")
+        } else {
+            format!("(allow {op} (require-all {condition} {list}))\n")
+        }
+    }
+
+    /// The allow rules for the system calls, Mach traps and MIG routines of
+    /// each phase.
+    fn syscall_rule() -> String {
+        let setup = format!("(require-not (extension \"{}\"))", NARROWED.to_str().unwrap());
+        // First, so that the allow rules below take precedence over it.
+        let mut rule = discovery_rule();
+        let run = (SYSCALLS, MACH_TRAPS, MIG_ROUTINES);
+        let setup_lists = (SETUP_SYSCALLS, SETUP_MACH_TRAPS, SETUP_MIG_ROUTINES);
+        for (cond, (syscalls, traps, migs)) in [("", run), (setup.as_str(), setup_lists)] {
+            rule.push_str(&allow("syscall-unix", cond, "syscall-number", "SYS_", syscalls));
+            rule.push_str(&allow("syscall-mach", cond, "machtrap-number", "MSC_", traps));
+            rule.push_str(&allow("syscall-mig", cond, "kernel-mig-routine", "", migs));
+        }
         for name in MACH_TRAPS_IF_DEFINED {
             rule.push_str(&format!(
                 "(when (defined? 'MSC_{name}) (allow syscall-mach (machtrap-number MSC_{name})))\n"
@@ -246,22 +333,19 @@ mod macos {
         rule
     }
 
-    /// The allow rules for [`SYSCALLS`], [`MACH_TRAPS`] and [`MIG_ROUTINES`].
-    fn syscall_rule() -> String {
-        let mut rule = String::from("(allow syscall-unix (syscall-number");
-        for name in SYSCALLS {
-            rule.push_str(" SYS_");
-            rule.push_str(name);
-        }
-        rule.push_str("))\n");
-        rule.push_str(&mach_trap_rule());
-        rule.push_str("(allow syscall-mig (kernel-mig-routine");
-        for name in MIG_ROUTINES {
-            rule.push(' ');
-            rule.push_str(name);
-        }
-        rule.push_str("))\n");
-        rule
+    /// The discovery build's rule (`tools/macos/sandbox-discovery.sh`, never
+    /// released): after narrow(), a call outside the run phase's lists is
+    /// allowed and reported instead of raising SIGSYS, so that one run of the
+    /// scenario tests lists every call they are missing.
+    #[allow(unexpected_cfgs)]
+    fn discovery_rule() -> String {
+        #[cfg(wick_sandbox_discovery)]
+        return format!(
+            "(allow syscall-unix syscall-mach syscall-mig (extension \"{}\") (with report))\n",
+            NARROWED.to_str().unwrap()
+        );
+        #[allow(unreachable_code)]
+        String::new()
     }
 
     /// Set once the sandbox is installed, for [`denied_syscall`].
@@ -287,16 +371,65 @@ mod macos {
         // still the documented way to apply an SBPL profile string.
         fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> i32;
         fn sandbox_free_error(errorbuf: *mut c_char);
+        fn sandbox_extension_issue_generic(class: *const c_char, flags: u32) -> *mut c_char;
+        fn sandbox_extension_consume(token: *const c_char) -> i64;
     }
 
     struct State {
         policy: Policy,
         installed: bool,
+        /// The narrowed extension's token, issued before the sandbox (a
+        /// sandboxed process cannot issue one), until narrow() consumes it.
+        narrowed: Option<Token>,
+        narrowed_done: bool,
+    }
+
+    /// An extension token from libsandbox, wiped and freed when dropped.
+    struct Token(*mut c_char);
+
+    // SAFETY: the token is a heap string owned by this value alone.
+    unsafe impl Send for Token {}
+
+    impl Token {
+        fn issue(class: &CStr) -> Result<Self, SandboxError> {
+            // SAFETY: a NUL-terminated class name; flags 0.
+            let token = unsafe { sandbox_extension_issue_generic(class.as_ptr(), 0) };
+            if token.is_null() {
+                return Err(SandboxError::Install(format!(
+                    "issuing the {class:?} extension: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(Token(token))
+        }
+
+        fn consume(&self) -> std::io::Result<i64> {
+            // SAFETY: a token sandbox_extension_issue_generic returned.
+            let handle = unsafe { sandbox_extension_consume(self.0) };
+            if handle < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(handle)
+        }
+    }
+
+    impl Drop for Token {
+        fn drop(&mut self) {
+            // SAFETY: a NUL-terminated string libsandbox allocated with malloc;
+            // wiped so that the process keeps no copy of it, then freed.
+            unsafe {
+                let len = libc::strlen(self.0);
+                std::ptr::write_bytes(self.0, 0, len);
+                libc::free(self.0.cast());
+            }
+        }
     }
 
     static STATE: Mutex<State> = Mutex::new(State {
         policy: Policy::None,
         installed: false,
+        narrowed: None,
+        narrowed_done: false,
     });
 
     /// Selects the sandbox to install. Called once at start-up from the seccomp configuration.
@@ -318,9 +451,30 @@ mod macos {
                 None => Ok(()),
             };
         }
+        // Issued before the sandbox, which denies issuing; an extension
+        // taken before the sandbox is installed would not attach to it.
+        let narrowed = Token::issue(NARROWED)?;
         install(&profile()?)?;
         state.installed = true;
         INSTALLED.store(true, Ordering::Relaxed);
+        state.narrowed = Some(narrowed);
+        Ok(())
+    }
+
+    /// Ends the setup phase for good: takes the narrowed extension, after
+    /// which the process can neither release it nor take or issue another
+    /// (see [`PROFILE`]). Without the sandbox (`--no-seccomp`), or a second
+    /// time, it does nothing.
+    pub fn narrow() -> Result<(), SandboxError> {
+        let mut state = STATE.lock().unwrap();
+        if !state.installed || state.narrowed_done {
+            return Ok(());
+        }
+        let fail = |what: &str, err: std::io::Error| SandboxError::Narrow(format!("{what}: {err}"));
+        let token = state.narrowed.take().expect("the narrowed token is kept until narrow()");
+        token.consume().map_err(|err| fail("taking the narrowed extension", err))?;
+        drop(token);
+        state.narrowed_done = true;
         Ok(())
     }
 
@@ -419,6 +573,79 @@ mod macos {
             );
         }
 
+        // Before narrow(), what building the microVM takes is allowed; after
+        // it, only the run phase's lists: a call of the setup phase raises
+        // SIGSYS, as one outside the VMM thread's filter does on Linux.
+        #[test]
+        fn test_narrow_ends_the_setup_phase() {
+            use std::os::unix::process::ExitStatusExt;
+            let out = child("narrowed_child", &[]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("SETUP-OK"), "{stdout}");
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
+            assert!(!stdout.contains("CHILD-SURVIVED"), "{stdout}");
+        }
+
+        // narrow() cannot be undone: after it, no extension can be issued or
+        // taken (each raises SIGSYS), and a thread cannot be created (Linux's
+        // VMM filter has no clone).
+        #[test]
+        fn test_narrowing_is_one_way() {
+            use std::os::unix::process::ExitStatusExt;
+            for case in ["issue", "consume", "thread"] {
+                let out = child("one_way_child", &[("WICK_TEST_CASE", case)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(stdout.contains("NARROWED"), "{case}: {stdout}");
+                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
+                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_narrow_ends_the_setup_phase in a separate process"]
+        fn narrowed_child() {
+            select(Policy::Default);
+            apply().unwrap();
+            // SAFETY: dup of the standard output, closed again.
+            let fd = unsafe { libc::dup(1) };
+            assert!(fd >= 0);
+            // SAFETY: the descriptor just created.
+            unsafe { libc::close(fd) };
+            println!("SETUP-OK");
+            narrow().unwrap();
+            // A second call does nothing.
+            narrow().unwrap();
+            // SAFETY: as above.
+            unsafe { libc::dup(1) };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        #[test]
+        #[ignore = "run by test_narrowing_is_one_way in a separate process"]
+        fn one_way_child() {
+            // Issued before the sandbox, as the narrowed token is.
+            let early = Token::issue(c"com.toollyst.wick.test").unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            println!("NARROWED");
+            match std::env::var("WICK_TEST_CASE").unwrap().as_str() {
+                "issue" => {
+                    let _ = Token::issue(NARROWED);
+                }
+                "consume" => {
+                    let _ = early.consume();
+                }
+                "thread" => {
+                    let _ = std::thread::spawn(|| ()).join();
+                }
+                other => panic!("{other}"),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
         #[test]
         #[ignore = "run by test_denied_syscall_exits_as_seccomp in a separate process"]
         fn handled_child() {
@@ -437,19 +664,24 @@ mod macos {
             // unknown one fails `sandbox_init`, which test_sandbox_restricts_child
             // would show. Here: no duplicates, and the calls Firecracker cannot
             // run without are in.
-            let mut names = SYSCALLS.to_vec();
+            let mut names = [SYSCALLS, SETUP_SYSCALLS].concat();
             names.sort_unstable();
             names.dedup();
-            assert_eq!(names.len(), SYSCALLS.len());
-            for needed in ["read", "write", "mmap", "kevent", "bsdthread_create", "exit"] {
+            assert_eq!(names.len(), SYSCALLS.len() + SETUP_SYSCALLS.len());
+            for needed in ["read", "write", "mmap", "kevent", "exit", "__pthread_kill"] {
                 assert!(SYSCALLS.contains(&needed), "{needed}");
+            }
+            // Building the microVM only: on Linux the VMM thread's filter
+            // allows none of them (no clone, bind, listen, socketpair).
+            for setup in ["bsdthread_create", "bind", "listen", "socketpair", "kqueue", "__mac_syscall"] {
+                assert!(SETUP_SYSCALLS.contains(&setup) && !SYSCALLS.contains(&setup), "{setup}");
             }
             for denied in [
                 "fork", "vfork", "execve", "posix_spawn", "ptrace", "setuid", "chroot", "mount", "kill",
                 // Would lift the jail's CPU limit (ext::jail).
                 "process_policy", "ledger",
             ] {
-                assert!(!SYSCALLS.contains(&denied), "{denied}");
+                assert!(!names.contains(&denied), "{denied}");
             }
         }
 
