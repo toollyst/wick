@@ -55,8 +55,9 @@ pub enum SandboxError {
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    API_MACH_TRAPS, API_MIG_ROUTINES, API_SYSCALLS, FILES_ANYWHERE, MACH_TRAPS,
-    MACH_TRAPS_IF_DEFINED, MIG_ROUTINES, PROFILE, SYSCALLS, api_profile, apply, apply_api,
+    API_FCNTL_COMMANDS, API_MACH_TRAPS, API_MIG_ROUTINES, API_SYSCALLS, FCNTL_COMMANDS,
+    FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MIG_ROUTINES, PROFILE,
+    RUN_DENIED_OPERATIONS, SYSCALLS, UNFILTERED_SYSCALLS, api_profile, apply, apply_api,
     denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select, selected,
 };
 
@@ -114,8 +115,9 @@ mod macos {
 ; setup's (SETUP_OPERATIONS), as on Linux the VMM thread's filter has no bind.
 (allow network-inbound (local unix-socket))
 (allow network-outbound (remote unix-socket))
-; Guest memory backed by POSIX shared memory (memfd_create).
-(allow ipc-posix-shm*)
+; Guest memory backed by POSIX shared memory (memfd_create): only the
+; objects this process names for its memfds (shm_rule), as on Linux a memfd
+; has no name another process could open.
 ; Own process only. Information about other processes is not covered by the
 ; default rule (measured: under (deny default), proc_pidinfo, proc_pidpath and
 ; proc_listallpids of another process succeed), so it is denied here: it
@@ -167,11 +169,10 @@ mod macos {
     /// cancellation-point twin (`_nocancel`) and what a panic or a thread's
     /// exit takes.
     ///
-    /// Seatbelt cannot deny some system calls by number (measured: `write`,
-    /// `open`, `close`, `socket`, `connect`, `bind`, `ioctl`, `sysctl`,
-    /// `shm_open`, `getpid`, ... 91 of them); those listed here only say that
-    /// a running microVM uses them, and the operation rules of [`PROFILE`]
-    /// (files, network, IPC, sysctl) are what limit them.
+    /// Seatbelt skips the rule on the number of the calls of
+    /// [`UNFILTERED_SYSCALLS`] (`write`, `open`, `socket`, `ioctl`, ...) when
+    /// a rule allows the operation they make; for those, that table names the
+    /// rule that decides each one.
     pub const SYSCALLS: &[&str] = &[
         // mmap, munmap, mprotect, madvise, mincore.
         "mmap", "munmap", "mprotect", "madvise", "mincore",
@@ -179,6 +180,9 @@ mod macos {
         "psynch_mutexwait", "psynch_mutexdrop", "psynch_cvbroad", "psynch_cvsignal",
         "psynch_cvwait", "psynch_cvclrprepost", "ulock_wait", "ulock_wake", "ulock_wait2",
         "__semwait_signal", "__semwait_signal_nocancel",
+        // futex: the priority a contended lock's owner is lent (libpthread's
+        // QoS override), measured after narrowing on a loaded host.
+        "bsdthread_ctl",
         // epoll_ctl, epoll_pwait.
         "kevent", "kevent_qos", "kevent_id", "poll", "poll_nocancel",
         // read, readv, write, writev, recvfrom, recvmsg, sendmsg, sendto, lseek.
@@ -213,6 +217,161 @@ mod macos {
         "abort_with_payload", "os_fault_with_payload",
     ];
 
+    /// What decides a system call of [`UNFILTERED_SYSCALLS`] in this
+    /// profile, after [`narrow`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Limit {
+        /// No rule allows the operation the call makes, so the rule on its
+        /// number decides: it is in none of the lists, and raises SIGSYS.
+        Number,
+        /// The rule of this operation (or these, space separated): a call
+        /// it denies raises SIGSYS.
+        Signal(&'static str),
+        /// The rule of this operation: a call it denies fails with `EPERM`,
+        /// as a path outside the chroot or another process's `/proc` entry
+        /// does on Linux.
+        Error(&'static str),
+        /// No rule allows what it asks for, and the default rule raises
+        /// SIGSYS; no single operation's rule lifts it (measured for `link`:
+        /// with files, and every other class of operation, allowed, it still
+        /// raises SIGSYS; only `(allow default)` lets it run).
+        Default,
+        /// Allowed after narrowing, as the rule of upstream's filters named
+        /// allows it, with no argument checked there (descriptors are opened
+        /// under the file rule).
+        Upstream(&'static str),
+        /// Nothing in Seatbelt decides it, for the reason given: the call
+        /// runs (or the kernel itself refuses it, as said).
+        Impossible(&'static str),
+    }
+
+    /// The system calls whose number Seatbelt does not check when a rule
+    /// allows the operation they make (measured on macOS 27: under
+    /// `(allow default)` each one runs with a rule denying its number,
+    /// `test_seatbelt_skips_the_number_of_these`), with the rule of this
+    /// profile that decides each one after [`narrow`]
+    /// (`test_unfiltered_syscalls_are_limited_by_their_rule`). For the others
+    /// the rule on the number decides ([`SYSCALLS`]).
+    #[rustfmt::skip]
+    pub const UNFILTERED_SYSCALLS: &[(&str, u16, Limit)] = &[
+        ("exit", 1, Limit::Upstream("exit")),
+        ("fork", 2, Limit::Signal("process-fork")),
+        ("write", 4, Limit::Upstream("write")),
+        ("open", 5, Limit::Error("file-read* file-write*")),
+        ("close", 6, Limit::Upstream("close")),
+        ("link", 9, Limit::Default),
+        ("unlink", 10, Limit::Error("file-read* file-write*")),
+        ("mknod", 14, Limit::Number),
+        ("chmod", 15, Limit::Signal("file-write-mode")),
+        ("chown", 16, Limit::Signal("file-write-owner")),
+        ("getpid", 20, Limit::Impossible(NO_OPERATION)),
+        ("getuid", 24, Limit::Impossible(NO_OPERATION)),
+        ("ptrace", 26, Limit::Signal("system-debug")),
+        ("chflags", 34, Limit::Signal("file-write-flags")),
+        ("fchflags", 35, Limit::Signal("file-write-flags")),
+        ("kill", 37, Limit::Signal("signal")),
+        ("getgid", 47, Limit::Impossible(NO_OPERATION)),
+        ("acct", 51, Limit::Signal("system-acct")),
+        ("ioctl", 54, Limit::Signal("file-ioctl")),
+        ("reboot", 55, Limit::Signal("system-reboot")),
+        ("revoke", 56, Limit::Signal("file-revoke")),
+        ("umask", 60, Limit::Impossible(NO_OPERATION)),
+        ("chroot", 61, Limit::Signal("file-chroot")),
+        ("swapon", 85, Limit::Signal("system-swap")),
+        ("setpriority", 96, Limit::Signal("system-sched")),
+        ("socket", 97, Limit::Signal("system-socket")),
+        ("connect", 98, Limit::Signal("network-outbound")),
+        ("getpriority", 100, Limit::Signal("system-sched")),
+        ("bind", 104, Limit::Signal("network-bind")),
+        ("writev", 121, Limit::Upstream("writev")),
+        ("fchown", 123, Limit::Signal("file-write-owner")),
+        ("fchmod", 124, Limit::Signal("file-write-mode")),
+        ("utimes", 138, Limit::Signal("file-write-times")),
+        ("futimes", 139, Limit::Signal("file-write-times")),
+        ("pwrite", 154, Limit::Upstream("write")),
+        ("nfssvc", 155, Limit::Signal("system-nfssvc")),
+        ("unmount", 159, Limit::Signal("file-unmount")),
+        ("quotactl", 165, Limit::Impossible(QUOTAS)),
+        ("mount", 167, Limit::Signal("file-mount")),
+        ("csops", 169, Limit::Signal("process-codesigning*")),
+        ("csops_audittoken", 170, Limit::Signal("process-codesigning*")),
+        ("sysctl", 202, Limit::Signal("sysctl-read")),
+        ("undelete", 205, Limit::Impossible(WHITEOUTS)),
+        ("getumask", 215, Limit::Impossible(NO_OPERATION)),
+        ("searchfs", 225, Limit::Signal("file-search")),
+        ("setxattr", 236, Limit::Signal("file-write-xattr")),
+        ("fsetxattr", 237, Limit::Signal("file-write-xattr")),
+        ("removexattr", 238, Limit::Signal("file-write-xattr")),
+        ("fremovexattr", 239, Limit::Signal("file-write-xattr")),
+        ("fsctl", 242, Limit::Signal("system-fsctl file-fsctl")),
+        ("ffsctl", 245, Limit::Signal("system-fsctl file-fsctl")),
+        ("semctl", 254, Limit::Signal("ipc-sysv*")),
+        ("semget", 255, Limit::Signal("ipc-sysv*")),
+        ("semop", 256, Limit::Signal("ipc-sysv*")),
+        ("msgctl", 258, Limit::Signal("ipc-sysv*")),
+        ("msgget", 259, Limit::Signal("ipc-sysv*")),
+        ("msgsnd", 260, Limit::Signal("ipc-sysv*")),
+        ("msgrcv", 261, Limit::Signal("ipc-sysv*")),
+        ("shmat", 262, Limit::Signal("ipc-sysv*")),
+        ("shmctl", 263, Limit::Signal("ipc-sysv*")),
+        ("shmdt", 264, Limit::Signal("ipc-sysv*")),
+        ("shmget", 265, Limit::Signal("ipc-sysv*")),
+        ("shm_open", 266, Limit::Signal("ipc-posix-shm*")),
+        ("shm_unlink", 267, Limit::Signal("ipc-posix-shm*")),
+        ("sem_open", 268, Limit::Signal("ipc-posix-sem*")),
+        ("sem_close", 269, Limit::Number),
+        ("sem_unlink", 270, Limit::Signal("ipc-posix-sem*")),
+        ("sem_wait", 271, Limit::Number),
+        ("sem_trywait", 272, Limit::Number),
+        ("sem_post", 273, Limit::Number),
+        ("sysctlbyname", 274, Limit::Signal("sysctl-read")),
+        ("chmod_extended", 282, Limit::Signal("file-write-mode file-write-acl")),
+        ("fchmod_extended", 283, Limit::Signal("file-write-mode file-write-acl")),
+        ("issetugid", 327, Limit::Impossible(NO_OPERATION)),
+        ("__pthread_kill", 328, Limit::Upstream("tkill")),
+        ("proc_info", 336, Limit::Error("process-info*")),
+        ("lchown", 364, Limit::Signal("file-write-owner")),
+        ("write_nocancel", 397, Limit::Upstream("write")),
+        ("open_nocancel", 398, Limit::Error("file-read* file-write*")),
+        ("close_nocancel", 399, Limit::Upstream("close")),
+        ("connect_nocancel", 409, Limit::Signal("network-outbound")),
+        ("writev_nocancel", 412, Limit::Upstream("writev")),
+        ("pwrite_nocancel", 415, Limit::Upstream("write")),
+        ("msgsnd_nocancel", 418, Limit::Signal("ipc-sysv*")),
+        ("msgrcv_nocancel", 419, Limit::Signal("ipc-sysv*")),
+        ("sem_wait_nocancel", 420, Limit::Number),
+        ("pid_suspend", 433, Limit::Signal("system-suspend-resume")),
+        ("pid_resume", 434, Limit::Signal("system-suspend-resume")),
+        ("connectx", 447, Limit::Signal("network-outbound")),
+        ("clonefileat", 462, Limit::Signal("file-clone")),
+        ("openat", 463, Limit::Error("file-read* file-write*")),
+        ("openat_nocancel", 464, Limit::Error("file-read* file-write*")),
+        ("fchmodat", 467, Limit::Signal("file-write-mode")),
+        ("fchownat", 468, Limit::Signal("file-write-owner")),
+        ("linkat", 471, Limit::Default),
+        ("unlinkat", 472, Limit::Error("file-read* file-write*")),
+        ("fclonefileat", 517, Limit::Signal("file-clone")),
+        ("fs_snapshot", 518, Limit::Signal("fs-snapshot*")),
+        ("terminate_with_payload", 520, Limit::Signal("signal")),
+        ("abort_with_payload", 521, Limit::Upstream("exit_group")),
+        ("fmount", 526, Limit::Signal("file-mount")),
+        ("pwritev", 541, Limit::Upstream("writev")),
+        ("pwritev_nocancel", 543, Limit::Upstream("writev")),
+        ("proc_info_extended_id", 545, Limit::Error("process-info*")),
+    ];
+
+    /// Why a call of [`UNFILTERED_SYSCALLS`] has no limit: it asks only
+    /// about the process itself, or sets its own file mode mask.
+    const NO_OPERATION: &str = "Seatbelt has no operation for it and skips its number: \
+        it asks about the process itself (or sets its own file mode mask)";
+    /// Why `quotactl` has none.
+    const QUOTAS: &str = "Seatbelt has no operation for it; it fails with ENOTSUP here \
+        (APFS keeps no quotas), with or without the sandbox";
+    /// Why `undelete` has none.
+    const WHITEOUTS: &str = "Seatbelt has no operation for it; it removes a whiteout, which \
+        only a union mount has, and fails with EPERM on any other file, with or without \
+        the sandbox";
+
     /// System calls allowed until [`narrow`] only, in addition to
     /// [`SYSCALLS`]: what building the microVM takes (on Linux the VMM thread
     /// runs unfiltered until then), measured as [`SYSCALLS`] are.
@@ -222,7 +381,6 @@ mod macos {
         "kdebug_typefilter", "kdebug_trace_string", "kdebug_trace64", "getrlimit", "sysctl",
         "getattrlist", "shm_open", "shm_unlink", "gettid", "issetugid", "proc_info",
         "getdirentries64", "bsdthread_create", "kqueue", "sigsuspend_nocancel", "fileport_makefd",
-        "bsdthread_ctl",
         // vmnet.framework's XPC connection reads the process's persona once
         // the process forked (the API process, ext::api_process): measured,
         // syscall-unix 494 in the sandbox's report.
@@ -352,12 +510,14 @@ mod macos {
     /// The API process's profile: only its lists, no files, Unix sockets only
     /// (the API socket, the link to Firecracker), no setup phase (on Linux
     /// the API thread's filter is installed before it serves).
+    #[allow(unexpected_cfgs)]
     pub fn api_profile() -> String {
         let mut rule = format!("(version 1)\n{}{API_PROFILE}", default_rule());
         rule.push_str(&api_discovery_rule());
         rule.push_str(&allow("syscall-unix", "", "syscall-number", "SYS_", API_SYSCALLS));
         rule.push_str(&allow("syscall-mach", "", "machtrap-number", "MSC_", API_MACH_TRAPS));
         rule.push_str(&allow("syscall-mig", "", "kernel-mig-routine", "", API_MIG_ROUTINES));
+        rule.push_str(&fcntl_rule("", API_FCNTL_COMMANDS));
         rule
     }
 
@@ -385,6 +545,8 @@ mod macos {
         state.narrowed_done = true;
         if !cfg!(wick_sandbox_discovery) {
             libc::wick_mm::deny_exec(exec_denied);
+            // Upstream's api filter: madvise with MADV_DONTNEED only.
+            libc::wick_mm::allow_only_advice(libc::MADV_DONTNEED, exec_denied);
         }
         Ok(())
     }
@@ -444,7 +606,98 @@ mod macos {
             None => FILES_ANYWHERE.to_owned(),
         };
         let profile = PROFILE.replacen("(deny default)\n", &default_rule(), 1);
-        Ok(format!("{profile}{}{}{files}", syscall_rule(), operation_rule()))
+        Ok(format!(
+            "{profile}{}{}{}{files}{}",
+            shm_rule(std::process::id()),
+            syscall_rule(),
+            operation_rule(),
+            run_rule()
+        ))
+    }
+
+    /// The POSIX shared memory objects of the process `pid`: the names the
+    /// compatibility memfd gives them (`/fcm.<pid>.<n>`, made and unlinked at
+    /// once). Another name fails and raises SIGSYS (the default rule): on
+    /// Linux a memfd has no name another process could open.
+    fn shm_rule(pid: u32) -> String {
+        format!("(allow ipc-posix-shm* (ipc-posix-name-prefix \"/fcm.{pid}.\"))\n")
+    }
+
+    /// Operations a running microVM may not ask for, after the file rule
+    /// (which allows them on the files it covers until [`narrow`]):
+    /// changing a file's mode, owner, flags, times, extended attributes or
+    /// ACL, and cloning one. They raise SIGSYS, as `chmod`, `fchmod`,
+    /// `chown`, `utimensat`, `setxattr` and `copy_file_range` are in none
+    /// of upstream's filters. Seatbelt decides their system calls by these
+    /// operations, not by number ([`UNFILTERED_SYSCALLS`]).
+    pub const RUN_DENIED_OPERATIONS: &[&str] = &[
+        "file-write-mode", "file-write-owner", "file-write-flags", "file-write-times",
+        "file-write-xattr", "file-write-acl", "file-write-setugid", "file-clone",
+    ];
+
+    /// The `fcntl` commands a running microVM may use (`F_<name>`,
+    /// <sys/fcntl.h>), each line for the rule of upstream's filters in its
+    /// comment, measured as [`SYSCALLS`] are. Any other command raises
+    /// SIGSYS after [`narrow`] (Seatbelt's `system-fcntl`, which checks
+    /// every command).
+    pub const FCNTL_COMMANDS: &[&str] = &[
+        // fcntl F_SETFD FD_CLOEXEC.
+        "F_GETFD", "F_SETFD",
+        // eventfd2 with EFD_NONBLOCK: an eventfd is a FIFO here, made
+        // non-blocking once open (vmm-sys-util).
+        "F_GETFL", "F_SETFL",
+        // fsync (macOS's full flush to the drive: the block device's flush).
+        "F_FULLFSYNC",
+        // io_uring_setup, io_uring_register: the asynchronous block engine's
+        // workers take their own descriptors of the drive and eventfd.
+        "F_DUPFD_CLOEXEC",
+        // fallocate FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE (the
+        // compatibility libc's fallocate).
+        "F_PUNCHHOLE",
+    ];
+
+    /// The API process's `fcntl` commands: upstream's `api` filter allows
+    /// `F_SETFD`.
+    pub const API_FCNTL_COMMANDS: &[&str] = &["F_GETFD", "F_SETFD"];
+
+    /// `(allow system-fcntl ...)` for `commands` after a deny with SIGSYS
+    /// under `condition` (none: always).
+    #[allow(unexpected_cfgs)]
+    fn fcntl_rule(condition: &str, commands: &[&str]) -> String {
+        let mut rule = if condition.is_empty() {
+            "(deny system-fcntl (with send-signal SIGSYS))\n".to_owned()
+        } else {
+            format!("(deny system-fcntl {condition} (with send-signal SIGSYS))\n")
+        };
+        rule.push_str(&allow("system-fcntl", "", "fcntl-command", "", commands));
+        // Discovery build: another command is allowed and reported.
+        #[cfg(wick_sandbox_discovery)]
+        rule.push_str(&format!(
+            "(allow system-fcntl (require-all {condition} (require-not (fcntl-command {}))) (with report))\n",
+            commands.join(" ")
+        ));
+        rule
+    }
+
+    /// The rules of the run phase that come after the file rule: the
+    /// operations of [`RUN_DENIED_OPERATIONS`] and the `fcntl` commands
+    /// outside [`FCNTL_COMMANDS`] raise SIGSYS once the process holds the
+    /// narrowed extension.
+    #[allow(unexpected_cfgs)]
+    fn run_rule() -> String {
+        let narrowed = format!("(extension \"{}\")", NARROWED.to_str().unwrap());
+        let mut rule = format!(
+            "(deny {} {narrowed} (with send-signal SIGSYS))\n",
+            RUN_DENIED_OPERATIONS.join(" ")
+        );
+        // Discovery build: allowed and reported instead.
+        #[cfg(wick_sandbox_discovery)]
+        rule.push_str(&format!(
+            "(allow {} {narrowed} (with report))\n",
+            RUN_DENIED_OPERATIONS.join(" ")
+        ));
+        rule.push_str(&fcntl_rule(&narrowed, FCNTL_COMMANDS));
+        rule
     }
 
     /// What a denied operation does: on Linux a system call outside a
@@ -478,14 +731,19 @@ mod macos {
     ];
 
     /// Operations of the setup phase only: building the microVM opens the
-    /// console's terminal, binds the API and vsock sockets, and reads system
-    /// information; on Linux the VMM thread's filter allows no bind, and
-    /// ioctl only for KVM, the TAP device and the terminal.
+    /// console's terminal and reads system information; on Linux the VMM
+    /// thread's filter allows ioctl only for KVM, the TAP device and the
+    /// terminal. Binding a Unix socket is not here: Seatbelt decides it by
+    /// the `network-inbound` rule (measured: with `(deny network-bind)` and
+    /// that rule, a bind is allowed unless the deny is the more specific
+    /// rule), which a running microVM keeps for a network endpoint (Linux's
+    /// VMM filter opens the TAP device at net hotplug); a stream socket
+    /// cannot listen after [`narrow`] (`listen` is in [`SETUP_SYSCALLS`]), as
+    /// Linux's VMM filter has no `bind` or `listen`.
     pub const SETUP_OPERATIONS: &[&str] = &[
         "file-ioctl",
         "sysctl-read",
         "system-socket",
-        "network-bind (local unix-socket)",
         // A vmnet interface (vmnet-shared, vmnet-host) is started while
         // the microVM is built, as Linux opens the TAP device then:
         // vmnet.framework connects to NetworkSharing for it (measured: the
@@ -532,13 +790,11 @@ mod macos {
                 rule.push_str(&format!("(allow {name} (require-all {filter} {setup}))\n"));
             }
         }
-        for op in RUN_OPERATIONS {
-            let (name, filter) = op.split_once(' ').unwrap_or((op, ""));
-            rule.push_str(&format!("(allow {name} {filter})\n"));
-        }
         // Discovery build: after narrow(), the setup operations' kinds are
-        // allowed and reported (last, so that this rule decides; a default
-        // rule's reports miss some of them, sysctl reads among them).
+        // allowed and reported (a rule with a filter, so that it takes
+        // precedence over the default rule, whose reports miss some of them,
+        // sysctl reads among them), but for what the run phase's rules below
+        // allow, which come later and so decide.
         #[cfg(wick_sandbox_discovery)]
         {
             let narrowed = format!("(extension \"{}\")", NARROWED.to_str().unwrap());
@@ -546,6 +802,10 @@ mod macos {
                 let name = op.split_once(' ').map_or(*op, |(name, _)| name);
                 rule.push_str(&format!("(allow {name} {narrowed} (with report))\n"));
             }
+        }
+        for op in RUN_OPERATIONS {
+            let (name, filter) = op.split_once(' ').unwrap_or((op, ""));
+            rule.push_str(&format!("(allow {name} {filter})\n"));
         }
         rule
     }
@@ -747,7 +1007,8 @@ mod macos {
     }
 
     /// Raises SIGSYS on this thread for an `mmap` or `mprotect` asking for
-    /// `PROT_EXEC` after [`narrow`], as a seccomp trap does: the signal is
+    /// `PROT_EXEC` after [`narrow`], or the API process's `madvise` with
+    /// advice other than `MADV_DONTNEED`, as a seccomp trap does: the signal is
     /// the one Seatbelt sends (no code, this process), so upstream's handler
     /// exits with the bad-syscall code ([`denied_syscall`]). If the signal is
     /// blocked or ignored, the default action, as the kernel forces a seccomp
@@ -1045,7 +1306,7 @@ mod macos {
             use std::os::unix::process::ExitStatusExt;
             for name in [
                 "exec_child", "unlisted_child", "unlisted_trap_child", "unlisted_mig_child", "tcp_child",
-                "udp_child", "bind_after_narrow_child",
+                "udp_child", "listen_after_narrow_child",
             ] {
                 let out = child(name, &[]);
                 assert_eq!(
@@ -1123,12 +1384,14 @@ mod macos {
 
         // The API process's profile (ext::api_process) allows what an HTTP
         // server on an open socket needs, as upstream's api filter: a call
-        // outside API_SYSCALLS, shared memory and an executable mapping raise
-        // SIGSYS; a file fails with an error, as outside the chroot.
+        // outside API_SYSCALLS, shared memory, an executable mapping, madvise
+        // with advice other than MADV_DONTNEED and an fcntl command other
+        // than F_GETFD and F_SETFD raise SIGSYS; a file fails with an error,
+        // as outside the chroot.
         #[test]
         fn test_api_profile_raises_sigsys_outside_its_list() {
             use std::os::unix::process::ExitStatusExt;
-            for case in ["dup", "shm", "exec", "socketpair"] {
+            for case in ["dup", "shm", "exec", "socketpair", "madvise", "dontneed", "fcntl"] {
                 let out = child("api_child", &[("WICK_TEST_CASE", case)]);
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 assert!(stdout.contains("SETUP-OK"), "{case}: {stdout}");
@@ -1162,6 +1425,18 @@ mod macos {
             assert_eq!(unsafe { libc::getentropy(entropy.as_mut_ptr().cast(), 16) }, 0);
             // Files fail with an error.
             std::fs::File::open("/etc/hosts").unwrap_err();
+            // Upstream's api filter: fcntl F_SETFD. (Its madvise with
+            // MADV_DONTNEED reads the region first with a Mach message here,
+            // which the API process's lists do not allow.)
+            const PAGE: usize = 16384;
+            // SAFETY: a new anonymous mapping.
+            let page = unsafe {
+                libc::mmap(std::ptr::null_mut(), PAGE, libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+            };
+            assert_ne!(page, libc::MAP_FAILED);
+            // SAFETY: a descriptor of this process.
+            assert_eq!(unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&a), libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
             println!("SETUP-OK");
             std::io::stdout().flush().unwrap();
             match case.as_str() {
@@ -1181,6 +1456,22 @@ mod macos {
                 "exec" => unsafe {
                     libc::mmap(std::ptr::null_mut(), 16384, libc::PROT_READ | libc::PROT_EXEC,
                         libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+                },
+                // Other advice (the compatibility libc's check).
+                // SAFETY: the mapping made above.
+                "madvise" => unsafe {
+                    libc::madvise(page, PAGE, libc::MADV_WILLNEED);
+                },
+                // MADV_DONTNEED: the compatibility libc reads the region
+                // first with a Mach message, outside the API process's lists.
+                // SAFETY: as above.
+                "dontneed" => unsafe {
+                    libc::madvise(page, PAGE, libc::MADV_DONTNEED);
+                },
+                // Another fcntl command (Seatbelt's system-fcntl).
+                // SAFETY: a descriptor of this process.
+                "fcntl" => unsafe {
+                    libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&a), libc::F_GETFL);
                 },
                 _ => {
                     let mut fds = [0; 2];
@@ -1349,6 +1640,43 @@ mod macos {
             println!("CHILD-SURVIVED");
         }
 
+        // An IP socket is made after narrow() (Seatbelt checks no family when
+        // a socket is made: socket is decided by system-socket, which covers
+        // other families), and connecting it raises SIGSYS.
+        #[test]
+        fn test_ip_sockets_are_made_but_not_used() {
+            use std::os::unix::process::ExitStatusExt;
+            let out = child("ip_socket_child", &[]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("MADE"), "{stdout}");
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
+            assert!(!stdout.contains("CHILD-SURVIVED"), "{stdout}");
+        }
+
+        #[test]
+        #[ignore = "run by test_ip_sockets_are_made_but_not_used in a separate process"]
+        fn ip_socket_child() {
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            // SAFETY: plain calls; the address is a valid sockaddr_in.
+            unsafe {
+                let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+                assert!(fd >= 0);
+                println!("MADE");
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                let mut sin: libc::sockaddr_in = std::mem::zeroed();
+                sin.sin_len = 16;
+                sin.sin_family = libc::AF_INET as u8;
+                sin.sin_port = 9u16.to_be();
+                sin.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+                libc::connect(fd, (&raw const sin).cast(), 16);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
         // IP networking: on Linux socket(AF_INET) is outside every filter.
         #[test]
         #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
@@ -1383,6 +1711,111 @@ mod macos {
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(stdout.contains("NARROWED"), "{stdout}");
             assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
+        }
+
+        // fcntl: after narrow(), the commands of FCNTL_COMMANDS run and any
+        // other one raises SIGSYS, as upstream's fcntl rules trap every
+        // command but F_SETFD and F_ADD_SEALS (Seatbelt's system-fcntl,
+        // which checks every command).
+        #[test]
+        fn test_fcntl_commands_outside_the_list_raise_sigsys() {
+            use std::os::unix::process::ExitStatusExt;
+            let out = child("fcntl_child", &[]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("LISTED-OK"), "{stdout}");
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
+            assert!(!stdout.contains("CHILD-SURVIVED"), "{stdout}");
+        }
+
+        #[test]
+        #[ignore = "run by test_fcntl_commands_outside_the_list_raise_sigsys in a separate process"]
+        fn fcntl_child() {
+            use std::os::fd::AsRawFd;
+            let file = std::fs::File::open("/dev/null").unwrap();
+            let fd = file.as_raw_fd();
+            select(Policy::Default);
+            apply().unwrap();
+            // Before narrow(): any command.
+            // SAFETY: a descriptor this process holds.
+            assert!(unsafe { libc::fcntl(fd, libc::F_GETFL) } >= 0);
+            narrow().unwrap();
+            // SAFETY: as above.
+            unsafe {
+                assert_eq!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+                assert_eq!(libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+            }
+            println!("LISTED-OK");
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
+            // SAFETY: a lock query on a descriptor this process holds.
+            let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+            unsafe { libc::fcntl(fd, libc::F_GETLK, &mut lock) };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        // futex: upstream's rules allow FUTEX_WAIT and FUTEX_WAKE (and their
+        // private and bitset forms) and trap the others, FUTEX_LOCK_PI and
+        // the requeues among them. macOS's locks are the ulock and psynch
+        // calls, whose operation Seatbelt does not check: after narrow(), an
+        // owner-tracking unfair-lock wake (UL_UNFAIR_LOCK, Linux's
+        // FUTEX_UNLOCK_PI) returns as any other operation does.
+        #[test]
+        fn test_futex_operations_are_not_checked() {
+            run_child("futex_child", &[]);
+        }
+
+        #[test]
+        #[ignore = "run by test_futex_operations_are_not_checked in a separate process"]
+        fn futex_child() {
+            unsafe extern "C" {
+                // <sys/ulock.h> (libsystem_kernel).
+                fn __ulock_wake(operation: u32, addr: *mut libc::c_void, wake_value: u64) -> libc::c_int;
+            }
+            const UL_COMPARE_AND_WAIT: u32 = 1;
+            const UL_UNFAIR_LOCK: u32 = 2;
+            const ULF_WAKE_ALL: u32 = 0x100;
+            let mut word = 0u32;
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            for op in [UL_COMPARE_AND_WAIT, UL_UNFAIR_LOCK | ULF_WAKE_ALL] {
+                // SAFETY: a word of this thread's; nothing waits on it.
+                let ret = unsafe { __ulock_wake(op, (&raw mut word).cast(), 0) };
+                let err = std::io::Error::last_os_error().raw_os_error();
+                assert_eq!((ret, err), (-1, Some(libc::ENOENT)), "operation {op:#x}");
+            }
+            // The signal Seatbelt would send arrives within this.
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            println!("CHILD-OK");
+        }
+
+        // accept4: upstream's rule allows the flags SOCK_CLOEXEC only. macOS
+        // has no accept4: accept takes no flags, and Rust's std, which makes
+        // the call, marks the accepted socket close-on-exec at once
+        // (ioctl FIOCLEX); after narrow() that holds as before it.
+        #[test]
+        fn test_accepted_sockets_are_close_on_exec() {
+            run_child("accept_child", &[]);
+        }
+
+        #[test]
+        #[ignore = "run by test_accepted_sockets_are_close_on_exec in a separate process"]
+        fn accept_child() {
+            use std::os::fd::AsRawFd;
+            let path = std::env::temp_dir().join(format!("wick-accept-{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            let (accepted, _) = listener.accept().unwrap();
+            // SAFETY: a descriptor this process holds.
+            let flags = unsafe { libc::fcntl(accepted.as_raw_fd(), libc::F_GETFD) };
+            assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+            std::fs::remove_file(&path).unwrap();
+            println!("CHILD-OK");
         }
 
         /// A pseudo-terminal's controller, opened before the sandbox.
@@ -1496,17 +1929,23 @@ mod macos {
             println!("CHILD-SURVIVED");
         }
 
-        // Binding a Unix socket is setup's only: Linux's VMM filter has no bind.
+        // Listening on a Unix socket is setup's only: Linux's VMM filter has
+        // no bind or listen. A datagram endpoint is still bound after
+        // narrow() (network-inbound decides a Unix bind, measured), as Linux
+        // opens the TAP device of a hotplugged net device in the run phase.
         #[test]
         #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
-        fn bind_after_narrow_child() {
+        fn listen_after_narrow_child() {
             let path = std::env::temp_dir().join(format!("wick-bind-{}", std::process::id()));
+            let endpoint = std::env::temp_dir().join(format!("wick-endpoint-{}", std::process::id()));
             select(Policy::Default);
             apply().unwrap();
             let early = std::os::unix::net::UnixListener::bind(&path).unwrap();
             drop(early);
             let _ = std::fs::remove_file(&path);
             narrow().unwrap();
+            let _ep = std::os::unix::net::UnixDatagram::bind(&endpoint).unwrap();
+            std::fs::remove_file(&endpoint).unwrap();
             let _ = std::os::unix::net::UnixListener::bind(&path);
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
@@ -1795,6 +2234,458 @@ mod macos {
             // path outside the chroot does on Linux (IP networking and program
             // execution raise SIGSYS: test_unlisted_syscalls_raise_sigsys).
             println!("CHILD-OK");
+        }
+
+        /// A raw system call (`svc #0x80`, the number in x16): x0, x1 and
+        /// whether it failed (carry set; x0 is then the errno).
+        ///
+        /// # Safety
+        /// The arguments are valid for the call.
+        unsafe fn svc(n: u16, a: [usize; 8]) -> (usize, usize, bool) {
+            let (r0, r1, carry): (usize, usize, usize);
+            // SAFETY: the caller's.
+            unsafe {
+                std::arch::asm!(
+                    "svc #0x80",
+                    "cset {c}, cs",
+                    c = lateout(reg) carry,
+                    inout("x16") usize::from(n) => _,
+                    inout("x0") a[0] => r0,
+                    inout("x1") a[1] => r1,
+                    inout("x2") a[2] => _,
+                    inout("x3") a[3] => _,
+                    inout("x4") a[4] => _,
+                    inout("x5") a[5] => _,
+                    inout("x6") a[6] => _,
+                    inout("x7") a[7] => _,
+                    out("x17") _,
+                    options(nostack),
+                )
+            };
+            (r0, r1, carry != 0)
+        }
+
+        /// Children `name` with each of `envs`, at most 16 at a time.
+        fn children(name: &str, envs: Vec<Vec<(String, String)>>) -> Vec<std::process::Output> {
+            let mut outs = Vec::new();
+            for chunk in envs.chunks(16) {
+                outs.extend(std::thread::scope(|s| {
+                    let handles: Vec<_> = chunk
+                        .iter()
+                        .map(|env| {
+                            s.spawn(move || {
+                                let env: Vec<(&str, &str)> =
+                                    env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                                child(name, &env)
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+                }));
+            }
+            outs
+        }
+
+        /// The highest BSD system call number (`SYS_MAXSYSCALL`,
+        /// <sys/syscall.h> of the macOS 27 SDK).
+        const SYS_MAXSYSCALL: u16 = 558;
+
+        // Seatbelt skips the rule on a call's number when a rule allows the
+        // operation the call makes: under (allow default), with a rule
+        // denying one number, exactly the calls of UNFILTERED_SYSCALLS run
+        // (each other one raises SIGSYS). Measured here, every number in turn.
+        #[test]
+        fn test_seatbelt_skips_the_number_of_these() {
+            use std::os::unix::process::ExitStatusExt;
+            let envs = (0..SYS_MAXSYSCALL)
+                .map(|n| vec![("WICK_TEST_SYSCALL".to_owned(), n.to_string())])
+                .collect();
+            let outs = children("number_child", envs);
+            let mut ran = Vec::new();
+            for (n, out) in outs.iter().enumerate() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(stdout.contains("APPLIED"), "{n}: {:?}\n{stdout}", out.status);
+                if out.status.signal() != Some(libc::SIGSYS) {
+                    ran.push(u16::try_from(n).unwrap());
+                }
+            }
+            let table: Vec<u16> = UNFILTERED_SYSCALLS.iter().map(|(_, n, _)| *n).collect();
+            assert_eq!(ran, table);
+        }
+
+        #[test]
+        #[ignore = "run by test_seatbelt_skips_the_number_of_these in a separate process"]
+        fn number_child() {
+            // SAFETY: no arguments.
+            assert_ne!(unsafe { libc::geteuid() }, 0, "never as root: the calls run");
+            let n: u16 = std::env::var("WICK_TEST_SYSCALL").unwrap().parse().unwrap();
+            install(&format!(
+                "(version 1)(allow default)(deny syscall-unix (syscall-number {n}) (with send-signal SIGSYS))"
+            ))
+            .unwrap();
+            println!("APPLIED");
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
+            // Arguments of 0: most calls fail at once (a null path, an
+            // empty buffer). msgget's: a key no queue has and no IPC_CREAT,
+            // so that a queue is not made.
+            let args = if n == 259 { [0x7769_636b, 0, 0, 0, 0, 0, 0, 0] } else { [0; 8] };
+            // SAFETY: see above; a fork's child (x1 = 1) leaves at once.
+            let (_, r1, _) = unsafe { svc(n, args) };
+            if n == 2 && r1 == 1 {
+                // SAFETY: the forked child ends.
+                unsafe { libc::_exit(0) };
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
+        // Each call of UNFILTERED_SYSCALLS, with an argument this profile
+        // denies, after narrow() and in a jail: it raises SIGSYS, or fails
+        // with EPERM, as its Limit says, and runs once the rule named is
+        // lifted (an allow rule for its operation, or for its number). The
+        // ones nothing decides run.
+        #[test]
+        fn test_unfiltered_syscalls_are_limited_by_their_rule() {
+            use std::os::unix::process::ExitStatusExt;
+            let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("wick-unfiltered-{}", std::process::id()));
+            let jail = base.join("jail");
+            std::fs::create_dir_all(jail.join("mnt")).unwrap();
+            let mut cases = Vec::new();
+            for (name, _, limit) in UNFILTERED_SYSCALLS {
+                if matches!(limit, Limit::Upstream(_)) || ["exit"].contains(name) {
+                    continue;
+                }
+                let lifts: &[&str] = match limit {
+                    Limit::Impossible(_) | Limit::Default => &["0"],
+                    _ => &["0", "1"],
+                };
+                for lift in lifts {
+                    for file in ["inside", "second"] {
+                        let _ = std::fs::remove_file(jail.join(format!("{file}-{name}-{lift}")));
+                    }
+                    std::fs::write(jail.join(format!("inside-{name}-{lift}")), b"x").unwrap();
+                    std::fs::write(base.join(format!("outside-{name}-{lift}")), b"x").unwrap();
+                    cases.push((*name, *limit, *lift));
+                }
+            }
+            // Another process for each case, which a lifted call may signal,
+            // stop or end: never this one.
+            let mut others: Vec<std::process::Child> = cases
+                .iter()
+                .map(|_| Command::new("/bin/sleep").arg("60").spawn().unwrap())
+                .collect();
+            let envs = cases
+                .iter()
+                .zip(&others)
+                .enumerate()
+                .map(|(i, ((name, _, lift), other))| {
+                    let other = other.id().to_string();
+                    let ipc = ipc_name(i);
+                    [
+                        ("WICK_TEST_CASE", *name),
+                        ("WICK_TEST_LIFT", *lift),
+                        ("WICK_TEST_JAIL", jail.to_str().unwrap()),
+                        ("WICK_TEST_OTHER_PID", other.as_str()),
+                        ("WICK_TEST_IPC_NAME", ipc.as_str()),
+                    ]
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect()
+                })
+                .collect();
+            let outs = children("unfiltered_child", envs);
+            for other in &mut others {
+                let _ = other.kill();
+                let _ = other.wait();
+            }
+            // The POSIX shared memory objects and semaphores a case left.
+            for i in 0..cases.len() {
+                let name = std::ffi::CString::new(ipc_name(i)).unwrap();
+                // SAFETY: a NUL-terminated name.
+                unsafe {
+                    libc::shm_unlink(name.as_ptr());
+                    libc::sem_unlink(name.as_ptr());
+                }
+            }
+            // A lifted mount mounted: undone here.
+            for name in ["mount", "fmount"] {
+                let mnt = std::ffi::CString::new(jail.join("mnt").as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: a NUL-terminated path.
+                let _ = (name, unsafe { libc::unmount(mnt.as_ptr(), libc::MNT_FORCE) });
+            }
+            let mut failures = Vec::new();
+            for ((name, limit, lift), out) in cases.iter().zip(&outs) {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let signal = out.status.signal();
+                let ret = stdout.lines().find_map(|l| l.strip_prefix("RET ")).unwrap_or("none");
+                let ok = stdout.contains("NARROWED")
+                    && match (limit, *lift) {
+                        (Limit::Signal(_) | Limit::Number | Limit::Default, "0") => {
+                            signal == Some(libc::SIGSYS)
+                        }
+                        (Limit::Error(_), "0") => {
+                            out.status.success() && ret == format!("err {}", libc::EPERM)
+                        }
+                        (Limit::Impossible(_), _) => out.status.success() && stdout.contains("SURVIVED"),
+                        // Lifted: the call runs, and fails, if it does, with
+                        // the kernel's error, not the sandbox's.
+                        (Limit::Error(_), _) => {
+                            out.status.success() && ret != format!("err {}", libc::EPERM)
+                        }
+                        _ => out.status.success() && stdout.contains("SURVIVED"),
+                    };
+                if !ok {
+                    failures.push(format!(
+                        "{name} (lifted {lift}, {limit:?}): {:?} RET {ret}\n{}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).lines().take(3).collect::<Vec<_>>().join("\n")
+                    ));
+                }
+            }
+            std::fs::remove_dir_all(&base).unwrap();
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        }
+
+        /// A POSIX IPC name of this test process's case `i` (31 bytes at most).
+        fn ipc_name(i: usize) -> String {
+            format!("/wick-u.{}.{i}", std::process::id())
+        }
+
+        #[test]
+        #[ignore = "run by test_unfiltered_syscalls_are_limited_by_their_rule in a separate process"]
+        fn unfiltered_child() {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            // SAFETY: no arguments.
+            assert_ne!(unsafe { libc::geteuid() }, 0, "never as root: lifted calls run");
+            let name = std::env::var("WICK_TEST_CASE").unwrap();
+            let lifted = std::env::var("WICK_TEST_LIFT").unwrap() == "1";
+            let jail = std::path::PathBuf::from(std::env::var("WICK_TEST_JAIL").unwrap());
+            let base = jail.parent().unwrap().to_owned();
+            let other = other_pid() as usize;
+            let (n, limit) =
+                UNFILTERED_SYSCALLS.iter().find(|(x, ..)| *x == name).map(|(_, n, l)| (*n, *l)).unwrap();
+            let c = |p: &std::path::Path| CString::new(p.as_os_str().as_bytes()).unwrap();
+            let tag = format!("{name}-{}", u8::from(lifted));
+            let inside = c(&jail.join(format!("inside-{tag}")));
+            let second = c(&jail.join(format!("second-{tag}")));
+            let outside = c(&base.join(format!("outside-{tag}")));
+            let other_name = CString::new(std::env::var("WICK_TEST_IPC_NAME").unwrap()).unwrap();
+            let mnt = c(&jail.join("mnt"));
+            let jailc = c(&jail);
+            let attr = c"user.wick";
+            // SAFETY: plain calls before the sandbox, on what this child made.
+            let (fd_in, inet, uid, gid) = unsafe {
+                libc::setxattr(inside.as_ptr(), attr.as_ptr(), c"x".as_ptr().cast(), 1, 0, 0);
+                // What shm_unlink and sem_unlink remove (a name that is not
+                // there fails before Seatbelt decides).
+                match name.as_str() {
+                    "shm_unlink" => {
+                        libc::close(libc::shm_open(other_name.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600));
+                    }
+                    "sem_unlink" => {
+                        libc::sem_close(libc::sem_open(other_name.as_ptr(), libc::O_CREAT, 0o600, 0));
+                    }
+                    _ => {}
+                }
+                (
+                    libc::open(inside.as_ptr(), libc::O_RDWR) as usize,
+                    libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) as usize,
+                    libc::getuid() as usize,
+                    libc::getgid() as usize,
+                )
+            };
+            let tty = pty() as usize;
+            // SAFETY: plain data.
+            let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            sin.sin_len = 16;
+            sin.sin_family = libc::AF_INET as u8;
+            sin.sin_port = 9u16.to_be();
+            sin.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+            // sa_endpoints_t: no source; the destination above.
+            #[repr(C)]
+            struct Endpoints {
+                srcif: u32,
+                srcaddr: *const libc::sockaddr_in,
+                srcaddrlen: u32,
+                dstaddr: *const libc::sockaddr_in,
+                dstaddrlen: u32,
+            }
+            let eps = Endpoints {
+                srcif: 0,
+                srcaddr: std::ptr::null(),
+                srcaddrlen: 0,
+                dstaddr: &raw const sin,
+                dstaddrlen: 16,
+            };
+            // This process's audit token (TASK_AUDIT_TOKEN), for csops_audittoken.
+            let mut token = [0u32; 8];
+            {
+                unsafe extern "C" {
+                    static mach_task_self_: libc::mach_port_t;
+                    fn task_info(t: libc::mach_port_t, f: u32, i: *mut u32, c: *mut u32) -> i32;
+                }
+                let mut count = 8u32;
+                // SAFETY: an 8-word buffer and its size in words.
+                assert_eq!(unsafe { task_info(mach_task_self_, 15, token.as_mut_ptr(), &mut count) }, 0);
+            }
+            let lift = match (lifted, limit) {
+                (false, _) => String::new(),
+                (true, Limit::Number) => format!("(allow syscall-unix (syscall-number {n}))\n"),
+                // With a filter that holds: a rule with a filter takes
+                // precedence over one without (measured), whatever their order.
+                (true, Limit::Signal(ops) | Limit::Error(ops)) => ops
+                    .split(' ')
+                    .map(|op| format!("(allow {op} (extension \"{}\"))\n", NARROWED.to_str().unwrap()))
+                    .collect(),
+                (true, _) => unreachable!(),
+            };
+            let profile = format!("{}{lift}", profile_for(Some(&jail), None).unwrap());
+            COMPILED
+                .set((Compiled::here(&profile).unwrap(), Compiled::here(&api_profile()).unwrap()))
+                .unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            println!("NARROWED");
+            let p = |s: &CString| s.as_ptr() as usize;
+            let mut buf = [0u8; 256];
+            let bp = buf.as_mut_ptr() as usize;
+            let mib = [libc::CTL_KERN, libc::KERN_OSTYPE];
+            let mut len: usize = 256;
+            let ostype = c"kern.ostype";
+            let cwd = libc::AT_FDCWD as usize;
+            const NONE: usize = 0xffff_ff9b; // KAUTH_UID_NONE, KAUTH_GID_NONE
+            const IPC_CREAT_600: usize = 0o1600;
+            let a: [usize; 8] = match name.as_str() {
+                "fork" => [0; 8],
+                "open" | "open_nocancel" => [p(&outside), 0, 0, 0, 0, 0, 0, 0],
+                "openat" | "openat_nocancel" => [cwd, p(&outside), 0, 0, 0, 0, 0, 0],
+                "unlink" => [p(&outside), 0, 0, 0, 0, 0, 0, 0],
+                "unlinkat" => [cwd, p(&outside), 0, 0, 0, 0, 0, 0],
+                "link" => [p(&inside), p(&second), 0, 0, 0, 0, 0, 0],
+                "linkat" => [cwd, p(&inside), cwd, p(&second), 0, 0, 0, 0],
+                "mknod" => [p(&second), (libc::S_IFIFO | 0o600) as usize, 0, 0, 0, 0, 0, 0],
+                "chmod" => [p(&inside), 0o600, 0, 0, 0, 0, 0, 0],
+                "fchmod" => [fd_in, 0o600, 0, 0, 0, 0, 0, 0],
+                "fchmodat" => [cwd, p(&inside), 0o600, 0, 0, 0, 0, 0],
+                "chmod_extended" => [p(&inside), NONE, NONE, 0o600, 0, 0, 0, 0],
+                "fchmod_extended" => [fd_in, NONE, NONE, 0o600, 0, 0, 0, 0],
+                "chown" | "lchown" => [p(&inside), uid, gid, 0, 0, 0, 0, 0],
+                "fchown" => [fd_in, uid, gid, 0, 0, 0, 0, 0],
+                "fchownat" => [cwd, p(&inside), uid, gid, 0, 0, 0, 0],
+                "chflags" => [p(&inside), 0, 0, 0, 0, 0, 0, 0],
+                "fchflags" => [fd_in, 0, 0, 0, 0, 0, 0, 0],
+                "utimes" => [p(&inside), 0, 0, 0, 0, 0, 0, 0],
+                "futimes" => [fd_in, 0, 0, 0, 0, 0, 0, 0],
+                "setxattr" => [p(&inside), attr.as_ptr() as usize, bp, 1, 0, 0, 0, 0],
+                "fsetxattr" => [fd_in, attr.as_ptr() as usize, bp, 1, 0, 0, 0, 0],
+                "removexattr" => [p(&inside), attr.as_ptr() as usize, 0, 0, 0, 0, 0, 0],
+                "fremovexattr" => [fd_in, attr.as_ptr() as usize, 0, 0, 0, 0, 0, 0],
+                "clonefileat" => [cwd, p(&inside), cwd, p(&second), 0, 0, 0, 0],
+                "fclonefileat" => [fd_in, cwd, p(&second), 0, 0, 0, 0, 0],
+                "revoke" => [p(&inside), 0, 0, 0, 0, 0, 0, 0],
+                "searchfs" => [p(&jailc), 0, 0, 0, 0, 0, 0, 0],
+                // FSIOC_SYNC_VOLUME (_IOW('A', 1, uint32_t)).
+                "fsctl" => [p(&inside), 0x8004_4101, bp, 0, 0, 0, 0, 0],
+                "ffsctl" => [fd_in, 0x8004_4101, bp, 0, 0, 0, 0, 0],
+                "undelete" => [p(&inside), 0, 0, 0, 0, 0, 0, 0],
+                "quotactl" => [p(&jailc), 0, 0, 0, 0, 0, 0, 0],
+                "mount" => [c"devfs".as_ptr() as usize, p(&mnt), 0, 0, 0, 0, 0, 0],
+                "fmount" => {
+                    // SAFETY: a NUL-terminated path.
+                    let dir = unsafe { libc::open(mnt.as_ptr(), libc::O_RDONLY) } as usize;
+                    [c"devfs".as_ptr() as usize, dir, 0, 0, 0, 0, 0, 0]
+                }
+                "unmount" => [p(&mnt), 0, 0, 0, 0, 0, 0, 0],
+                "chroot" => [p(&jailc), 0, 0, 0, 0, 0, 0, 0],
+                // RB_HALT: as an unprivileged user it fails, lifted or not.
+                "reboot" => [0x08, 0, 0, 0, 0, 0, 0, 0],
+                "acct" => [p(&inside), 0, 0, 0, 0, 0, 0, 0],
+                "swapon" => [p(&inside), 0, 0, 0, 0, 0, 0, 0],
+                "nfssvc" => [0, 0, 0, 0, 0, 0, 0, 0],
+                "fs_snapshot" => [1 /* SNAPSHOT_OP_CREATE */, fd_in, p(&second), 0, 0, 0, 0, 0],
+                "kill" => [other, 0, 0, 0, 0, 0, 0, 0],
+                "terminate_with_payload" => [other, 0, 0, 0, 0, 0, 0, 0],
+                "ptrace" => [libc::PT_ATTACHEXC as usize, other, 0, 0, 0, 0, 0, 0],
+                "pid_suspend" | "pid_resume" => [other, 0, 0, 0, 0, 0, 0, 0],
+                // PROC_INFO_CALL_PIDINFO, PROC_PIDTBSDINFO of another process.
+                "proc_info" => [2, other, libc::PROC_PIDTBSDINFO as usize, 0, bp, 136, 0, 0],
+                "proc_info_extended_id" => [2, other, libc::PROC_PIDTBSDINFO as usize, 0, 0, 0, bp, 136],
+                "setpriority" => [libc::PRIO_PROCESS as usize, 0, 5, 0, 0, 0, 0, 0],
+                "getpriority" => [libc::PRIO_PROCESS as usize, 0, 0, 0, 0, 0, 0, 0],
+                "csops" => [0, 0 /* CS_OPS_STATUS */, bp, 4, 0, 0, 0, 0],
+                "csops_audittoken" => [0, 0, bp, 4, token.as_ptr() as usize, 0, 0, 0],
+                "sysctl" => [mib.as_ptr() as usize, 2, bp, (&raw mut len) as usize, 0, 0, 0, 0],
+                "sysctlbyname" => {
+                    [ostype.as_ptr() as usize, 11, bp, (&raw mut len) as usize, 0, 0, 0, 0]
+                }
+                // TIOCSWINSZ: setting the terminal's size, a request outside
+                // RUN_OPERATIONS' (with a size read before, TIOCGWINSZ).
+                "ioctl" => {
+                    // SAFETY: a terminal descriptor and a winsize to fill.
+                    unsafe { libc::ioctl(tty as i32, libc::TIOCGWINSZ, bp) };
+                    [tty, libc::TIOCSWINSZ as usize, bp, 0, 0, 0, 0, 0]
+                }
+                // PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL: a kernel control socket.
+                "socket" => [32, 2, 2, 0, 0, 0, 0, 0],
+                "connect" | "connect_nocancel" => [inet, (&raw const sin) as usize, 16, 0, 0, 0, 0, 0],
+                "connectx" => [inet, (&raw const eps) as usize, 0, 0, 0, 0, 0, 0],
+                "bind" => [inet, (&raw const sin) as usize, 16, 0, 0, 0, 0, 0],
+                "semget" | "msgget" => [0 /* IPC_PRIVATE */, 1, IPC_CREAT_600, 0, 0, 0, 0, 0],
+                "shmget" => [0, 16384, IPC_CREAT_600, 0, 0, 0, 0, 0],
+                // IPC_STAT of no object: an error, once allowed.
+                "semctl" | "msgctl" | "shmctl" => [usize::MAX >> 1, 0, 2, bp, 0, 0, 0, 0],
+                "semop" | "shmat" => [usize::MAX >> 1, bp, 0, 0, 0, 0, 0, 0],
+                "msgsnd" | "msgsnd_nocancel" | "msgrcv" | "msgrcv_nocancel" => {
+                    [usize::MAX >> 1, bp, 8, 0, 0x800 /* IPC_NOWAIT */, 0, 0, 0]
+                }
+                "shmdt" => [bp, 0, 0, 0, 0, 0, 0, 0],
+                "shm_open" => {
+                    [other_name.as_ptr() as usize, (libc::O_RDWR | libc::O_CREAT) as usize, 0o600, 0, 0, 0, 0, 0]
+                }
+                "shm_unlink" | "sem_unlink" => [other_name.as_ptr() as usize, 0, 0, 0, 0, 0, 0, 0],
+                "sem_open" => [other_name.as_ptr() as usize, libc::O_CREAT as usize, 0o600, 0, 0, 0, 0, 0],
+                "sem_close" | "sem_wait" | "sem_wait_nocancel" | "sem_trywait" | "sem_post" => {
+                    [bp, 0, 0, 0, 0, 0, 0, 0]
+                }
+                "getpid" | "getuid" | "getgid" | "issetugid" | "getumask" => [0; 8],
+                "umask" => [0o022, 0, 0, 0, 0, 0, 0, 0],
+                other => panic!("no case for {other}"),
+            };
+            // SAFETY: arguments for this call, made above.
+            let (r0, r1, err) = unsafe { svc(n, a) };
+            if name == "fork" && r1 == 1 {
+                // SAFETY: the forked child ends.
+                unsafe { libc::_exit(0) };
+            }
+            if err {
+                println!("RET err {r0}");
+            } else {
+                println!("RET ok {r0}");
+            }
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
+            // What a lifted call made is undone (the lifted rule allows it).
+            if lifted && !err {
+                // SAFETY: plain calls on what the call above returned.
+                unsafe {
+                    match name.as_str() {
+                        "semget" => drop(libc::semctl(r0 as i32, 0, libc::IPC_RMID)),
+                        "msgget" => drop(svc(258, [r0, libc::IPC_RMID as usize, 0, 0, 0, 0, 0, 0])),
+                        "shmget" => drop(libc::shmctl(r0 as i32, libc::IPC_RMID, std::ptr::null_mut())),
+                        "shm_open" => drop(libc::shm_unlink(other_name.as_ptr())),
+                        "sem_open" => drop(libc::sem_unlink(other_name.as_ptr())),
+                        _ => {}
+                    }
+                }
+            }
+            // Seatbelt signals the process, not the thread.
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            println!("SURVIVED");
         }
     }
 }
