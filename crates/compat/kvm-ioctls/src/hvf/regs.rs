@@ -178,7 +178,9 @@ pub const PSCI_VERSION_0_2: u64 = 2;
 /// PSCI 1.0, the version a new VM's guest is given.
 pub const PSCI_VERSION_1_0: u64 = 0x1_0000;
 
-/// KVM register id of `KVM_REG_ARM_PSCI_VERSION`.
+/// KVM register id of `KVM_REG_ARM_PSCI_VERSION` (the tests'; `decode`
+/// matches its parts).
+#[cfg(test)]
 pub const PSCI_VERSION_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_FW;
 
 /// KVM register id of `SCTLR_EL1`.

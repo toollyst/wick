@@ -875,20 +875,22 @@ impl VcpuFd {
     }
 
     /// KVM_PTP (kvm_ptp_get_time): the wall clock and the guest's virtual
-    /// (`counter` 0) or physical (1) counter at the same moment; another
-    /// counter is NOT_SUPPORTED. The wall clock is read between two counter
-    /// reads, and the counter given is their midpoint.
+    /// counter (`counter` 0, `CNTVCT_EL0`: `mach_absolute_time` less the
+    /// vtimer offset, as Hypervisor.framework defines it) at the same
+    /// moment. The wall clock is read between two counter reads, and the
+    /// counter given is their midpoint. The physical counter (1) is
+    /// NOT_SUPPORTED, as any other: Hypervisor.framework traps a guest's
+    /// `CNTPCT_EL0` read (measured: `mrs x0, cntpct_el0` exits with
+    /// EC 0x18) and [`VcpuFd::sysreg_trap`] makes it undefined, so the
+    /// guest has no physical counter this could agree with; a Linux guest
+    /// at EL1 asks for the virtual one (`ptp_kvm_arm`).
     fn kvm_ptp(&self, hv: hv_vcpu_t, counter: u64) -> Result<[u64; 4]> {
-        let offset = match counter {
-            0 => {
-                let mut offset = 0;
-                // SAFETY: `hv` belongs to this thread.
-                check(unsafe { hv_vcpu_get_vtimer_offset(hv, &mut offset) })?;
-                offset
-            }
-            1 => 0,
-            _ => return Ok([PSCI_RET_NOT_SUPPORTED as u64, 0, 0, 0]),
-        };
+        if counter != 0 {
+            return Ok([PSCI_RET_NOT_SUPPORTED as u64, 0, 0, 0]);
+        }
+        let mut offset = 0;
+        // SAFETY: `hv` belongs to this thread.
+        check(unsafe { hv_vcpu_get_vtimer_offset(hv, &mut offset) })?;
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         // SAFETY: plain calls; `ts` is a valid timespec.
         let (before, after) = unsafe {
@@ -1079,6 +1081,38 @@ impl Drop for VcpuFd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // KVM_PTP answers the virtual counter with the wall clock (the words
+    // of kvm_ptp_get_time, KVM's own), and NOT_SUPPORTED for the physical
+    // counter, which the guest cannot read here, and for any other.
+    #[test]
+    fn test_kvm_ptp_counters() {
+        let vm = crate::Kvm::new().unwrap().create_vm().unwrap();
+        let mut kvi = kvm_bindings::kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        vcpu.vcpu_init(&kvi).unwrap();
+        let hv = vcpu.ensure_created().unwrap();
+        for counter in [1, 2, u64::MAX] {
+            assert_eq!(vcpu.kvm_ptp(hv, counter).unwrap(), [PSCI_RET_NOT_SUPPORTED as u64, 0, 0, 0]);
+        }
+        // SAFETY: plain calls.
+        let (t0, mut ts) = unsafe { (mach_absolute_time(), libc::timespec { tv_sec: 0, tv_nsec: 0 }) };
+        let words = vcpu.kvm_ptp(hv, 0).unwrap();
+        // SAFETY: plain calls; `ts` is a valid timespec.
+        let t1 = unsafe {
+            libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
+            mach_absolute_time()
+        };
+        let realtime = (words[0] << 32) | words[1];
+        let count = (words[2] << 32) | words[3];
+        let wall = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+        assert!(realtime <= wall && wall - realtime < 1_000_000_000, "{realtime} {wall}");
+        let mut offset = 0;
+        // SAFETY: `hv` belongs to this thread.
+        check(unsafe { hv_vcpu_get_vtimer_offset(hv, &mut offset) }).unwrap();
+        assert!(t0.wrapping_sub(offset) <= count && count <= t1.wrapping_sub(offset), "{t0} {count} {t1} {offset}");
+    }
 
     #[test]
     fn test_kvm_mpidr() {
