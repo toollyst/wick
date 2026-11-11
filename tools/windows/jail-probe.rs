@@ -1144,6 +1144,14 @@ fn main() {
             }
         }
     }
+    // The jailer makes a second process of its binary for Firecracker's API
+    // server (vmm::ext::api_process, WICK_API_LINK); this binary has nothing
+    // to serve, and a second copy running the checks would race the first
+    // (two senders on a `sockpull` listener; `pull:<pid>` of the wrong one).
+    if std::env::var_os("WICK_API_LINK").is_some() {
+        eprintln!("jail-probe: started as the jail's API process; nothing to serve");
+        return;
+    }
     // Firecracker's first step in a jail (vmm::ext::jail): drop the initial
     // impersonation token. Outside a jail it does nothing.
     // SAFETY: plain call.

@@ -410,7 +410,9 @@ function Invoke-Api([string]$sock, [string]$method, [string]$path, $body = $null
         [IO.File]::WriteAllText($file, ($body | ConvertTo-Json -Depth 8 -Compress))
         $a += @('-H', 'Content-Type: application/json', '--data-binary', "@$file")
     }
-    & curl.exe @a
+    # One string: a body with newlines would come back as an array, on which
+    # -match returns the matching lines rather than a boolean.
+    (& curl.exe @a) -join "`n"
 }
 
 # `Invoke-Api` that fails unless the status is 2xx; returns the body.
@@ -847,7 +849,9 @@ function Stage-Uffd {
     try {
         $vm = Start-JailedVm $base 'snap' @() 256 -Api
         Wait-Shell $vm
-        $vm.Send('echo snapshot-$((6*7)) > /tmp/mark')
+        # Done before the pause: serial input still in flight at the snapshot
+        # is not part of it (upstream saves no serial input buffer).
+        Check ($vm.Sh('echo snapshot-$((6*7)) > /tmp/mark; cat /tmp/mark', 30) -eq 'snapshot-42') 'the mark was not written'
         Invoke-ApiOk $vm.Sock 'PATCH' '/vm' ([ordered]@{ state = 'Paused' }) | Out-Null
         Invoke-ApiOk $vm.Sock 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = '/snap.state'; mem_file_path = '/snap.mem' }) | Out-Null
         Stop-Jailed
@@ -1030,7 +1034,8 @@ function Stage-Api {
         [void]$jail.Jailer.WaitForExit(15000)
         Check ($jail.Jailer.HasExited) 'the jailer (and Firecracker) did not end within 15 s of the API process being killed'
         Check ($jail.Jailer.ExitCode -ne 0) "the jailer returned 0 after the API process was killed"
-        $err = Get-Content -Raw (Join-Path $base 'api-err.txt') -ErrorAction SilentlyContinue
+        # The panic hook logs (the log is stdout here) besides stderr.
+        $err = (Get-Content -Raw (Join-Path $base 'api-out.txt'), (Join-Path $base 'api-err.txt') -ErrorAction SilentlyContinue) -join "`n"
         Check ($err -match 'The API server process ended') "no panic message for the API process's end: $err"
         Check ($null -eq (Get-Process -Id $jail.Fc.Id -ErrorAction SilentlyContinue)) 'Firecracker outlived the API process'
         # Firecracker's end ends the API process.

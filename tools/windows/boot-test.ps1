@@ -277,6 +277,13 @@ namespace Wick {
             if (p.ExitCode != 0) throw new Failure("exit status " + p.ExitCode + " after the guest reset (" + ExitReason() + ")");
         }
 
+        // After the exit: the last of the output, which the pumps may still
+        // be reading.
+        public void Drain(int ms) {
+            outPump.Join(ms);
+            errPump.Join(ms);
+        }
+
         public void Kill() {
             try { if (!p.HasExited) p.Kill(); } catch (InvalidOperationException) { } catch (System.ComponentModel.Win32Exception) { }
             p.WaitForExit(5000);
@@ -1627,6 +1634,7 @@ function Stage-ApiProcess {
     while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
     Check $vm.Exited 'Firecracker did not end within 15 s of the API process being killed'
     Check ($vm.ExitCode -ne 0) "Firecracker exited 0 after the API process was killed"
+    $vm.Drain(5000)
     Check ($vm.Output -match 'The API server process ended') "no panic message for the API process's end ($($vm.ExitReason()))"
 
     $vm = Start-Vm 'api-process-2' (Base-Config 1) -Api

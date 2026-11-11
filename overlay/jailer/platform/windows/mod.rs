@@ -201,7 +201,15 @@ fn vm_sid() -> &'static str {
 }
 
 /// The default DACL of both tokens: what the process creates (its own process
-/// and threads first) is open to SYSTEM, the jail's SID and the owner.
+/// and threads first) carries it: SYSTEM, the jail's SID and the owner (the
+/// process objects of a jail's Firecracker and API process read
+/// `D:(A;;0x1fffff;;;SY)(A;;0x1fffff;;;<jail SID>)(A;;0x1fffff;;;OW)`, label
+/// `S-1-16-6144` no-write-up/no-read-up, measured on Windows 11 26H2). The
+/// operator opens them with every right. A process of the jail opening its
+/// sibling for `PROCESS_DUP_HANDLE` is refused all the same (access denied,
+/// measured in `jailer-test.ps1 api`); why is not measured, and the
+/// Firecracker-to-API-process link does not depend on it
+/// (`vmm::ext::api_process`, `WICK_API_PROCESS`).
 fn default_dacl() -> String {
     format!("D:(A;;GA;;;SY)(A;;GA;;;{})(A;;GA;;;OW)", vm_sid())
 }
