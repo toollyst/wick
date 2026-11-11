@@ -8,7 +8,7 @@ use std::fs::File;
 use std::os::raw::{c_int, c_ulong};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -96,6 +96,36 @@ struct Slot {
 const RX: hv_memory_flags_t = HV_MEMORY_READ | HV_MEMORY_EXEC;
 const RWX: hv_memory_flags_t = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
 
+/// Part of a slot unmapped from stage 2 while the libc replaces the pages
+/// behind it (see [`guest_replace`]).
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    ipa: u64,
+    size: u64,
+    host: u64,
+}
+
+/// Guest memory: the slots, and the parts of them being replaced.
+#[derive(Debug, Default)]
+struct Memory {
+    slots: HashMap<u32, Slot>,
+    replacing: Vec<Window>,
+}
+
+impl Memory {
+    fn slot_at(&self, ipa: u64) -> Option<&Slot> {
+        self.slots
+            .values()
+            .find(|s| ipa >= s.ipa && ipa < s.ipa + s.size)
+    }
+
+    fn replacing(&self, ipa: u64) -> bool {
+        self.replacing
+            .iter()
+            .any(|w| ipa >= w.ipa && ipa < w.ipa + w.size)
+    }
+}
+
 fn host_page_size() -> u64 {
     // SAFETY: sysconf has no preconditions.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
@@ -129,7 +159,9 @@ pub(crate) struct GicConfig {
 
 #[derive(Debug)]
 pub(crate) struct VmInner {
-    memory: Mutex<HashMap<u32, Slot>>,
+    memory: Mutex<Memory>,
+    /// Signalled when a [`Window`] closes (its pages are mapped again).
+    remapped: Condvar,
     ioevents: RwLock<Vec<IoEvent>>,
     irq: Mutex<IrqState>,
     /// Shared with the irqfd thread, which waits on it without holding the VM.
@@ -188,21 +220,142 @@ fn uffd_stage2(host: u64, len: u64, present: bool) {
     };
     let memory = vm.memory.lock().unwrap();
     let page = host_page_size();
-    for slot in memory.values() {
+    for slot in memory.slots.values() {
         let start = host.max(slot.host);
         let end = (host + len).min(slot.host + slot.size);
         let mut addr = start - (start - slot.host) % page;
         while addr < end {
             let ipa = slot.ipa + (addr - slot.host);
-            let flags = if present { slot.flags(ipa) } else { 0 };
-            // SAFETY: changes the permissions of one page of a slot we mapped.
-            unsafe { hv_vm_protect(ipa, page as usize, flags) };
+            // A page being replaced is mapped again with its permissions
+            // when the replacement ends (`Slot::map`).
+            if !memory.replacing(ipa) {
+                let flags = if present { slot.flags(ipa) } else { 0 };
+                // SAFETY: changes the permissions of one page of a slot we mapped.
+                unsafe { hv_vm_protect(ipa, page as usize, flags) };
+            }
             addr += page;
         }
     }
 }
 
+/// `libc::wick_guest` replace hook: the pages behind the host range
+/// `[host, host + len)` are about to be replaced (`before`: a Linux
+/// `MADV_DONTNEED`, a `MAP_FIXED` mapping), or have been.
+///
+/// Hypervisor.framework maps the physical pages behind a host range when
+/// `hv_vm_map` is called, not the host address (measured: after a `MAP_FIXED`
+/// mapping over guest memory the guest kept the old pages, the host read 0
+/// where the guest had written; `test_madvise_dontneed_replaces_guest_pages`).
+/// So what the range holds of guest memory is unmapped before the change
+/// and mapped again after, with the permissions its pages had. A vCPU that
+/// faults on it in between waits for the new pages
+/// ([`VmInner::wait_mapped`]), as a KVM guest's access waits while the host
+/// zaps the page. Returns, before, whether any guest memory was unmapped,
+/// and after, whether all of it was mapped again.
+fn guest_replace(host: u64, len: u64, before: bool) -> bool {
+    let Some(vm) = CURRENT.lock().unwrap().upgrade() else {
+        return false;
+    };
+    let end = host + len;
+    let mut memory = vm.memory.lock().unwrap();
+    if before {
+        // A replacement of any of the same pages (another thread's
+        // discard) ends first.
+        while memory
+            .replacing
+            .iter()
+            .any(|w| w.host < end && host < w.host + w.size)
+        {
+            memory = vm.remapped.wait(memory).unwrap();
+        }
+        let windows: Vec<Window> = memory
+            .slots
+            .values()
+            .filter_map(|slot| {
+                let start = host.max(slot.host);
+                let stop = end.min(slot.host + slot.size);
+                (start < stop).then(|| Window {
+                    ipa: slot.ipa + (start - slot.host),
+                    size: stop - start,
+                    host: start,
+                })
+            })
+            .collect();
+        for w in &windows {
+            // SAFETY: unmapping part of a slot we mapped.
+            let ret = unsafe { hv_vm_unmap(w.ipa, w.size as usize) };
+            if ret != HV_SUCCESS {
+                // The guest would keep the old pages while the host uses
+                // the new ones: silent corruption.
+                eprintln!(
+                    "wick: guest memory at {:#x}+{:#x} cannot be unmapped while its pages are \
+                     replaced (hv_vm_unmap: {ret:#x})",
+                    w.ipa, w.size
+                );
+                std::process::abort();
+            }
+        }
+        let any = !windows.is_empty();
+        memory.replacing.extend(windows);
+        any
+    } else {
+        let (mine, rest): (Vec<Window>, Vec<Window>) = memory
+            .replacing
+            .drain(..)
+            .partition(|w| w.host >= host && w.host + w.size <= end);
+        memory.replacing = rest;
+        let mut ok = true;
+        for w in mine {
+            // The slot is still there: `set_user_memory_region` waits for
+            // open windows.
+            if let Some(slot) = memory.slot_at(w.ipa) {
+                // SAFETY: the slot's host range, valid while the slot exists.
+                ok &= unsafe { slot.map(w.host, w.ipa, w.size) }.is_ok();
+            }
+        }
+        vm.remapped.notify_all();
+        ok
+    }
+}
+
 impl Slot {
+    /// Maps `[host, host + size)`, part of the slot's memory, at `ipa` with
+    /// the permissions its pages have: the slot's, read-only until written
+    /// for a dirty-tracked page not written yet, none for a page a
+    /// userfaultfd has not filled.
+    ///
+    /// # Safety
+    /// The host range must stay mapped while the slot exists.
+    unsafe fn map(&self, host: u64, ipa: u64, size: u64) -> Result<()> {
+        let base = if self.readonly || self.dirty.is_some() { RX } else { RWX };
+        // SAFETY: the caller's contract.
+        check(unsafe { hv_vm_map(host as *mut _, ipa, size as usize, base) })?;
+        let page = host_page_size();
+        // Runs of pages whose permissions differ from the slot's.
+        let mut run: Option<(u64, hv_memory_flags_t)> = None;
+        let mut off = 0;
+        while off <= size {
+            let flags = if off == size {
+                base
+            } else if libc::wick_uffd::is_missing(host + off) {
+                0
+            } else {
+                self.flags(ipa + off)
+            };
+            if run.is_some_and(|(_, f)| f != flags) || (run.is_none() && flags != base) {
+                if let Some((start, f)) = run.take() {
+                    // SAFETY: changes the permissions of pages mapped above.
+                    check(unsafe { hv_vm_protect(ipa + start, (off - start) as usize, f) })?;
+                }
+                if flags != base {
+                    run = Some((off, flags));
+                }
+            }
+            off += page;
+        }
+        Ok(())
+    }
+
     /// The stage-2 permissions page `ipa` should have while present.
     fn flags(&self, ipa: u64) -> hv_memory_flags_t {
         if self.readonly {
@@ -227,10 +380,36 @@ impl VmInner {
     /// The host address of guest RAM at `ipa`.
     pub(crate) fn ram_host_addr(&self, ipa: u64) -> Option<u64> {
         let memory = self.memory.lock().unwrap();
+        memory.slot_at(ipa).map(|s| s.host + (ipa - s.ipa))
+    }
+
+    /// The memory, once the pages at `ipa` are not being replaced.
+    fn memory_mapped(&self, ipa: u64) -> MutexGuard<'_, Memory> {
+        let mut memory = self.memory.lock().unwrap();
+        while memory.replacing(ipa) {
+            memory = self.remapped.wait(memory).unwrap();
+        }
         memory
-            .values()
-            .find(|s| ipa >= s.ipa && ipa < s.ipa + s.size)
-            .map(|s| s.host + (ipa - s.ipa))
+    }
+
+    /// The memory, once no pages are being replaced.
+    fn memory_settled(&self) -> MutexGuard<'_, Memory> {
+        let mut memory = self.memory.lock().unwrap();
+        while !memory.replacing.is_empty() {
+            memory = self.remapped.wait(memory).unwrap();
+        }
+        memory
+    }
+
+    /// A guest fault on pages being replaced (`guest_replace`): waits until
+    /// the new pages are mapped. Returns whether it waited (the access is
+    /// then retried, and finds the new pages).
+    pub(crate) fn wait_mapped(&self, ipa: u64) -> bool {
+        if !self.memory.lock().unwrap().replacing(ipa) {
+            return false;
+        }
+        drop(self.memory_mapped(ipa));
+        true
     }
 
     /// A guest fault on RAM whose page allows the access (a permission change
@@ -238,11 +417,8 @@ impl VmInner {
     /// if `ipa` is not RAM or the access is not allowed (e.g. a write to a
     /// read-only slot, which is MMIO as on KVM).
     pub(crate) fn stale_fault(&self, ipa: u64, write: bool) -> bool {
-        let memory = self.memory.lock().unwrap();
-        let Some(slot) = memory
-            .values()
-            .find(|s| ipa >= s.ipa && ipa < s.ipa + s.size)
-        else {
+        let memory = self.memory_mapped(ipa);
+        let Some(slot) = memory.slot_at(ipa) else {
             return false;
         };
         let page = host_page_size();
@@ -261,9 +437,9 @@ impl VmInner {
     /// Handles a guest write fault on dirty-tracked memory: marks the page
     /// dirty and makes it writable. Returns false if `ipa` is not tracked memory.
     pub(crate) fn dirty_fault(&self, ipa: u64) -> bool {
-        let memory = self.memory.lock().unwrap();
+        let memory = self.memory_mapped(ipa);
         let page = host_page_size();
-        for slot in memory.values() {
+        for slot in memory.slots.values() {
             let Some(bitmap) = &slot.dirty else { continue };
             if ipa < slot.ipa || ipa >= slot.ipa + slot.size {
                 continue;
@@ -513,7 +689,7 @@ impl VmInner {
         }
         self.stop.store(true, Ordering::Release);
         let _ = self.stop_evt.write(1);
-        for (_, slot) in self.memory.lock().unwrap().drain() {
+        for (_, slot) in self.memory.lock().unwrap().slots.drain() {
             // SAFETY: unmapping a range we mapped.
             unsafe { hv_vm_unmap(slot.ipa, slot.size as usize) };
         }
@@ -611,7 +787,8 @@ impl VmFd {
             )
             .map_err(io_err)?;
         let inner = Arc::new(VmInner {
-            memory: Mutex::new(HashMap::new()),
+            memory: Mutex::new(Memory::default()),
+            remapped: Condvar::new(),
             ioevents: RwLock::new(Vec::new()),
             irq: Mutex::new(IrqState::default()),
             epoll: epoll.clone(),
@@ -631,7 +808,10 @@ impl VmFd {
             reset_regs: OnceLock::new(),
             gic_cpu_reset: OnceLock::new(),
         });
-        libc::wick_uffd::set_stage2_hook(uffd_stage2);
+        libc::wick_guest::set_hooks(libc::wick_guest::Hooks {
+            stage2: uffd_stage2,
+            replace: guest_replace,
+        });
         let mut vm = VmFd {
             inner,
             threads: Vec::new(),
@@ -664,8 +844,8 @@ impl VmFd {
         if region.flags & !(KVM_MEM_READONLY | KVM_MEM_LOG_DIRTY_PAGES) != 0 {
             return err(libc::EINVAL);
         }
-        let mut memory = self.inner.memory.lock().unwrap();
-        if let Some(slot) = memory.remove(&region.slot) {
+        let mut memory = self.inner.memory_settled();
+        if let Some(slot) = memory.slots.remove(&region.slot) {
             // SAFETY: unmapping a range we mapped.
             check(unsafe { hv_vm_unmap(slot.ipa, slot.size as usize) })?;
         }
@@ -676,38 +856,22 @@ impl VmFd {
         // Dirty tracking only concerns writable memory (writes to read-only
         // slots exit as MMIO, as on KVM).
         let track = region.flags & KVM_MEM_LOG_DIRTY_PAGES != 0 && !readonly;
-        let flags = if readonly || track { RX } else { RWX };
-        // SAFETY: the caller guarantees the host range is valid for the slot's lifetime.
-        check(unsafe {
-            hv_vm_map(
-                region.userspace_addr as *mut _,
-                region.guest_phys_addr,
-                region.memory_size as usize,
-                flags,
-            )
-        })?;
         let dirty = track.then(|| {
             let pages = region.memory_size.div_ceil(host_page_size());
             (0..pages.div_ceil(64))
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect()
         });
-        // Pages a userfaultfd has not filled yet fault in stage 2.
-        libc::wick_uffd::for_each_missing(region.userspace_addr, region.memory_size, |host, len| {
-            let ipa = region.guest_phys_addr + (host - region.userspace_addr);
-            // SAFETY: removes access to pages of the range mapped above.
-            unsafe { hv_vm_protect(ipa, len as usize, 0) };
-        });
-        memory.insert(
-            region.slot,
-            Slot {
-                ipa: region.guest_phys_addr,
-                size: region.memory_size,
-                host: region.userspace_addr,
-                readonly,
-                dirty,
-            },
-        );
+        let slot = Slot {
+            ipa: region.guest_phys_addr,
+            size: region.memory_size,
+            host: region.userspace_addr,
+            readonly,
+            dirty,
+        };
+        // SAFETY: the caller guarantees the host range is valid for the slot's lifetime.
+        unsafe { slot.map(region.userspace_addr, region.guest_phys_addr, region.memory_size) }?;
+        memory.slots.insert(region.slot, slot);
         Ok(())
     }
 
@@ -771,8 +935,9 @@ impl VmFd {
     /// again. Fails with `ENOENT` if the slot does not track dirty pages.
     pub fn get_dirty_log(&self, slot: u32, memory_size: usize) -> Result<Vec<u64>> {
         self.fd.check()?;
-        let memory = self.inner.memory.lock().unwrap();
-        let Some(s) = memory.get(&slot) else {
+        // Pages being replaced are protected again when mapped again.
+        let memory = self.inner.memory_settled();
+        let Some(s) = memory.slots.get(&slot) else {
             return err(libc::ENOENT);
         };
         let Some(bitmap) = &s.dirty else {
@@ -1191,7 +1356,7 @@ mod tests {
         // internal error. The guest spins (`b .`).
         extern "C" fn nothing(_: libc::c_int) {}
         // SAFETY: a handler that does nothing.
-        unsafe { libc::signal(libc::SIGUSR2, nothing as libc::sighandler_t) };
+        unsafe { libc::signal(libc::SIGUSR2, nothing as *const () as libc::sighandler_t) };
         let vm = Kvm::new().unwrap().create_vm().unwrap();
         let page = host_page_size() as usize;
         // SAFETY: an anonymous mapping of one page, kept for the test.
@@ -1261,6 +1426,278 @@ mod tests {
         let results = runner.join().unwrap();
         let odd: Vec<_> = results.iter().filter(|r| *r != "EINTR").collect();
         assert!(odd.is_empty(), "{} of {} runs: {:?}", odd.len(), results.len(), &odd[..odd.len().min(5)]);
+    }
+
+    /// KVM core register ids of `X<n>` (`KVM_REG_ARM_CORE`, two words each).
+    fn x_reg(n: u64) -> u64 {
+        0x6030_0000_0010_0000 + 2 * n
+    }
+    const PC: u64 = 0x6030_0000_0010_0040;
+    const PSTATE: u64 = 0x6030_0000_0010_0042;
+    const GUEST_BASE: u64 = 0x8000_0000;
+    /// An address no slot covers: a store to it exits as MMIO.
+    const MMIO: u64 = 0x1000_0000;
+
+    /// A VM with `mib` MiB of anonymous memory at [`GUEST_BASE`], the first
+    /// page holding `code`, and a vCPU initialised to run it. Returns the
+    /// memory's host address and size.
+    fn vm_with_memory(mib: usize, code: &[u32]) -> (VmFd, VcpuFd, *mut libc::c_void, usize) {
+        let vm = Kvm::new().unwrap().create_vm().unwrap();
+        let len = mib << 20;
+        // SAFETY: a fresh anonymous mapping, kept for the test.
+        let mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, libc::MAP_FAILED);
+        // SAFETY: the first page of the mapping.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), mem.cast::<u32>(), code.len()) };
+        let region = kvm_userspace_memory_region {
+            slot: 0,
+            guest_phys_addr: GUEST_BASE,
+            memory_size: len as u64,
+            userspace_addr: mem as u64,
+            flags: 0,
+        };
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let mut kvi = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        vcpu.vcpu_init(&kvi).unwrap();
+        (vm, vcpu, mem, len)
+    }
+
+    /// The process's phys_footprint, what the jailer's memory limit (a
+    /// jetsam limit) is checked against.
+    fn phys_footprint() -> u64 {
+        // SAFETY: plain data filled by the call.
+        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        // SAFETY: a V4 buffer for the V4 flavour.
+        let r = unsafe {
+            libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, std::ptr::from_mut(&mut info).cast())
+        };
+        assert_eq!(r, 0);
+        info.ri_phys_footprint
+    }
+
+    /// Guest program: writes X3 to every page from X1 to X2, then to X4
+    /// (MMIO: the exit).
+    const FILL: [u32; 6] = [0xf9000023, 0x91401021, 0xeb02003f, 0x54ffffa3, 0xf9000083, 0x14000000];
+
+    /// Runs [`FILL`] with `value` over all pages but the code's.
+    fn fill(vcpu: &mut VcpuFd, len: usize, value: u64) {
+        let page = host_page_size();
+        for (id, v) in [
+            (PC, GUEST_BASE),
+            (PSTATE, 0x3c5),
+            (x_reg(1), GUEST_BASE + page),
+            (x_reg(2), GUEST_BASE + len as u64),
+            (x_reg(3), value),
+            (x_reg(4), MMIO),
+        ] {
+            vcpu.set_one_reg(id, &v.to_le_bytes()).unwrap();
+        }
+        match vcpu.run().unwrap() {
+            crate::VcpuExit::MmioWrite(MMIO, data) => assert_eq!(data, &value.to_le_bytes()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The pages of guest memory are replaced under the guest by `replace`
+    /// (a Linux `MADV_DONTNEED`, a `MAP_FIXED` mapping): the guest and the
+    /// host then use the new pages, which are released from the footprint
+    /// and charged to it again when the guest writes them. Measured before
+    /// the fix with a standalone probe: Hypervisor.framework kept the old
+    /// pages (the host read 0 where the guest had written), and
+    /// `MADV_FREE_REUSABLE` released nothing of them.
+    fn replaced_pages(replace: impl Fn(*mut libc::c_void, usize)) {
+        const MIB: usize = 64;
+        let (_vm, mut vcpu, mem, len) = vm_with_memory(MIB, &FILL);
+        let page = host_page_size() as usize;
+        let at = |off: usize| -> u64 {
+            // SAFETY: inside the mapping.
+            unsafe { std::ptr::read_volatile(mem.cast::<u8>().add(off).cast::<u64>()) }
+        };
+        let idle = phys_footprint();
+        fill(&mut vcpu, len, 0x5a5a);
+        let written = phys_footprint();
+        assert!(written - idle >= 60 << 20, "footprint {idle} -> {written} for {MIB} MiB written");
+        assert_eq!(at(page), 0x5a5a);
+        assert_eq!(at(len - page), 0x5a5a);
+
+        // SAFETY: all pages of the mapping but the code's.
+        replace(unsafe { mem.add(page) }, len - page);
+        let discarded = phys_footprint();
+        assert!(written - discarded >= 60 << 20, "footprint {written} -> {discarded} after the discard");
+        assert_eq!(at(page), 0);
+        assert_eq!(at(len - page), 0);
+
+        // The guest writes the pages the host sees, and is charged for them.
+        fill(&mut vcpu, len, 0x1234);
+        assert_eq!(at(page), 0x1234, "the guest writes other pages than the host reads");
+        assert_eq!(at(len - page), 0x1234);
+        let again = phys_footprint();
+        assert!(again - discarded >= 60 << 20, "footprint {discarded} -> {again} after the guest wrote again");
+        println!(
+            "phys_footprint KiB: idle {}, guest wrote {MIB} MiB {}, discarded {}, guest wrote again {}",
+            idle >> 10,
+            written >> 10,
+            discarded >> 10,
+            again >> 10
+        );
+    }
+
+    #[test]
+    fn test_madvise_dontneed_replaces_guest_pages() {
+        replaced_pages(|ptr, len| {
+            // SAFETY: a mapped range of the test's.
+            assert_eq!(unsafe { libc::madvise(ptr, len, libc::MADV_DONTNEED) }, 0);
+        });
+    }
+
+    #[test]
+    fn test_map_fixed_replaces_guest_pages() {
+        // Upstream's `discard_range` on memory restored from a file.
+        replaced_pages(|ptr, len| {
+            // SAFETY: over a mapped range of the test's.
+            let p = unsafe {
+                libc::mmap(
+                    ptr,
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert_eq!(p, ptr);
+        });
+    }
+
+    /// Guest program: writes X3 to every page from X5 to X2, adds 1 to X3,
+    /// forever.
+    const COUNTER: [u32; 7] =
+        [0xaa0503e1, 0xf9000023, 0x91401021, 0xeb02003f, 0x54ffffa3, 0x91000463, 0x17fffffa];
+
+    /// A vCPU writing a range in a loop while another thread discards it:
+    /// a write that lands while the range is unmapped waits for the new
+    /// pages and lands on them; no exit is misread as MMIO, and once the
+    /// discards stop every page holds what the guest last wrote.
+    #[test]
+    fn test_guest_writes_during_a_discard_wait_for_the_new_pages() {
+        extern "C" fn nothing(_: libc::c_int) {}
+        // SAFETY: a handler that does nothing.
+        unsafe { libc::signal(libc::SIGUSR2, nothing as *const () as libc::sighandler_t) };
+        const MIB: usize = 16;
+        let (vm, mut vcpu, mem, len) = vm_with_memory(MIB, &COUNTER);
+        let page = host_page_size() as usize;
+        for (id, v) in [
+            (PC, GUEST_BASE),
+            (PSTATE, 0x3c5),
+            (x_reg(5), GUEST_BASE + page as u64),
+            (x_reg(2), GUEST_BASE + len as u64),
+            (x_reg(3), 1),
+        ] {
+            vcpu.set_one_reg(id, &v.to_le_bytes()).unwrap();
+        }
+        // SAFETY: dup of the vCPU's descriptor, owned by the new handle.
+        let mut kicker = unsafe {
+            vm.create_vcpu_from_rawfd(libc::dup(std::os::unix::io::AsRawFd::as_raw_fd(&vcpu))).unwrap()
+        };
+        // One thread runs the guest (Hypervisor.framework binds a vCPU's
+        // registers to it): a phase ends when the thread is kicked, and
+        // reports X3 (the round), X1 (the page being written) and whatever
+        // else run() returned.
+        let (to_main, from_runner) = std::sync::mpsc::channel::<(u64, u64, Vec<String>)>();
+        let (to_runner, from_main) = std::sync::mpsc::channel::<bool>();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            // SAFETY: plain call.
+            tid_tx.send(unsafe { libc::pthread_self() } as usize).unwrap();
+            let reg = |vcpu: &VcpuFd, id: u64| {
+                let mut v = [0u8; 8];
+                vcpu.get_one_reg(id, &mut v).unwrap();
+                u64::from_le_bytes(v)
+            };
+            loop {
+                vcpu.set_kvm_immediate_exit(0);
+                let mut odd = Vec::new();
+                loop {
+                    match vcpu.run() {
+                        Err(e) if e.errno() == libc::EINTR => break,
+                        Ok(exit) => odd.push(format!("{exit:?}")),
+                        Err(e) => odd.push(format!("error {e}")),
+                    }
+                    if odd.len() > 5 {
+                        break;
+                    }
+                }
+                to_main.send((reg(&vcpu, x_reg(3)), reg(&vcpu, x_reg(1)), odd)).unwrap();
+                if !from_main.recv().unwrap() {
+                    break;
+                }
+            }
+        });
+        let thread = tid_rx.recv().unwrap() as libc::pthread_t;
+        let mut kick = || loop {
+            kicker.set_kvm_immediate_exit(1);
+            // SAFETY: a live thread of this process.
+            unsafe { libc::pthread_kill(thread, libc::SIGUSR2) };
+            if let Ok(report) = from_runner.recv_timeout(Duration::from_millis(1)) {
+                return report;
+            }
+        };
+
+        // 200 discards of the whole range while the guest writes it.
+        for _ in 0..200 {
+            // SAFETY: all pages of the mapping but the code's.
+            assert_eq!(unsafe { libc::madvise(mem.add(page), len - page, libc::MADV_DONTNEED) }, 0);
+            std::thread::sleep(Duration::from_micros(500));
+        }
+        let (rounds, _, odd) = kick();
+        assert!(odd.is_empty(), "exits during the discards: {odd:?}");
+        assert!(rounds >= 1, "the guest did not run");
+
+        // Then the guest alone, for at least two whole rounds.
+        to_runner.send(true).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let (round, next, odd) = kick();
+        to_runner.send(false).unwrap();
+        runner.join().unwrap();
+        assert!(odd.is_empty(), "exits after the discards: {odd:?}");
+        assert!(round >= rounds + 2, "{rounds} rounds during the discards, {round} after");
+        // Pages before X1 hold the round being written, pages after it the
+        // one before; the page at X1 is either (the store may just have
+        // landed); a round just finished (X1 at the end) wrote the one before.
+        let mut wrong = Vec::new();
+        for off in (page..len).step_by(page) {
+            // SAFETY: inside the mapping.
+            let v = unsafe { std::ptr::read_volatile(mem.cast::<u8>().add(off).cast::<u64>()) };
+            let ipa = GUEST_BASE + off as u64;
+            let expected: &[u64] = if next >= GUEST_BASE + len as u64 || ipa > next {
+                &[round - 1]
+            } else if ipa < next {
+                &[round]
+            } else {
+                &[round, round - 1]
+            };
+            if !expected.contains(&v) {
+                wrong.push((ipa, v));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "round {round}, at {next:#x}: {} pages hold other values, e.g. {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(4)]
+        );
     }
 
     #[test]

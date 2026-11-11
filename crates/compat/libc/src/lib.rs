@@ -33,6 +33,9 @@ pub const HUGE_MEMFD_PREFIX: &str = "/fcmH.";
 /// The kernel side of userfaultfd (a wick API, not part of `libc`).
 #[cfg(target_os = "macos")]
 pub mod wick_uffd;
+/// The hypervisor backend's hooks on guest memory (a wick API, not part of `libc`).
+#[cfg(target_os = "macos")]
+pub mod wick_guest;
 #[cfg(target_os = "macos")]
 mod timerfd;
 // System calls on user memory wait for userfaultfd pages, as on Linux.

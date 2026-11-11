@@ -144,6 +144,9 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
 ///   size bits alone mean nothing, as on Linux;
 /// - `MAP_POPULATE`: the range is prefaulted after mapping (`MADV_WILLNEED`
 ///   and a read of every page when it is readable);
+/// - `MAP_FIXED`: what the range holds of guest memory is unmapped from the
+///   guest while the mapping replaces its pages, and mapped again after
+///   ([`crate::wick_guest`]);
 /// - `PROT_EXEC` once the host sandbox narrowed: see [`wick_mm`].
 ///
 /// # Safety
@@ -172,7 +175,7 @@ pub unsafe fn mmap(
         return libc::MAP_FAILED;
     }
     // SAFETY: forwarded with the Linux-only bits removed.
-    let ptr = unsafe { libc::mmap(addr, len, prot, flags & !(MAP_POPULATE | HUGE_FLAGS), fd, offset) };
+    let ptr = unsafe { mmap_replacing(addr, len, prot, flags & !(MAP_POPULATE | HUGE_FLAGS), fd, offset) };
     if ptr != libc::MAP_FAILED {
         crate::wick_uffd::note_mapping(ptr as u64, len as u64, false);
     }
@@ -253,7 +256,7 @@ unsafe fn mmap_huge(
             return libc::MAP_FAILED;
         }
         // SAFETY: the caller's contract.
-        unsafe { libc::mmap(addr, len, prot, flags, fd, offset) }
+        unsafe { mmap_replacing(addr, len, prot, flags, fd, offset) }
     } else {
         // A reservation a huge page larger than needed, the mapping made
         // fixed at its first huge page boundary, the rest released.
@@ -295,6 +298,29 @@ unsafe fn mmap_huge(
         crate::wick_uffd::note_mapping(ptr as u64, len as u64, true);
     }
     ptr
+}
+
+/// The host's `mmap`; with `MAP_FIXED`, the guest's view of `[addr, addr +
+/// len)` is replaced with it ([`crate::wick_guest::replacing`]).
+///
+/// # Safety
+/// Same contract as `mmap(2)`.
+unsafe fn mmap_replacing(
+    addr: *mut c_void,
+    len: size_t,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    offset: off_t,
+) -> *mut c_void {
+    if flags & libc::MAP_FIXED == 0 {
+        // SAFETY: the caller's contract.
+        return unsafe { libc::mmap(addr, len, prot, flags, fd, offset) };
+    }
+    crate::wick_guest::replacing(addr as u64, len as u64, || {
+        // SAFETY: the caller's contract.
+        unsafe { libc::mmap(addr, len, prot, flags, fd, offset) }
+    })
 }
 
 /// The last error's number.
@@ -376,8 +402,9 @@ unsafe extern "C" {
     static mach_task_self_: libc::mach_port_t;
 }
 
-/// Returns `(start, end, backing)` of the VM map entry at or after `addr`.
-fn vm_entry(addr: u64) -> Option<(u64, u64, Backing)> {
+/// Returns `(start, end, backing, protection)` of the VM map entry at or
+/// after `addr`.
+fn vm_entry(addr: u64) -> Option<(u64, u64, Backing, c_int)> {
     const VM_REGION_BASIC_INFO_64: c_int = 9;
     const VM_REGION_EXTENDED_INFO: c_int = 13;
     const VM_INHERIT_SHARE: u32 = 0;
@@ -402,6 +429,8 @@ fn vm_entry(addr: u64) -> Option<(u64, u64, Backing)> {
     let (start, size, basic) = region(VM_REGION_BASIC_INFO_64)?;
     let (_, _, ext) = region(VM_REGION_EXTENDED_INFO)?;
     // vm_region_basic_info_64: protection, max_protection, inheritance, ...
+    // (VM_PROT_* bits are PROT_* bits).
+    let protection = basic[0];
     let inheritance = basic[2] as u32;
     // vm_region_extended_info: ... ref_count (word 6), then shadow_depth (u16),
     // external_pager (u8), share_mode (u8) packed in word 7.
@@ -417,7 +446,7 @@ fn vm_entry(addr: u64) -> Option<(u64, u64, Backing)> {
     } else {
         Backing::Anonymous
     };
-    Some((start, start + size, backing))
+    Some((start, start + size, backing, protection))
 }
 
 /// Whether a file backs the entry at `addr` (somewhere in its shadow chain).
@@ -439,12 +468,18 @@ fn file_under(addr: u64) -> bool {
 /// anonymous memory reads as zeros and its pages are released, and shared
 /// memory keeps its contents (the pages are only dropped from this mapping).
 ///
-/// macOS's own `MADV_DONTNEED` is only a hint, so private anonymous ranges are
-/// zeroed with `MADV_ZERO` and released with `MADV_FREE_REUSABLE`. A private
-/// file mapping whose pages have been copied would have to fall back to the
-/// file's contents, which macOS offers no call for: a range holding one fails
-/// with `EINVAL` before anything changes (Firecracker remaps such memory
-/// instead, see `discard_range`).
+/// macOS's own `MADV_DONTNEED` is only a hint, so a private anonymous range
+/// gets fresh zero pages: an anonymous `MAP_FIXED` mapping with its
+/// protection replaces it, with the guest's view of it replaced too
+/// ([`crate::wick_guest`]). Not `MADV_ZERO` and `MADV_FREE_REUSABLE`: pages
+/// a guest has mapped are not released by them (measured: the footprint of
+/// 64 MiB of guest pages stayed at 65.8 MiB), and pages marked reusable that
+/// the guest writes again are not charged to the footprint again, which
+/// would let a guest past the jailer's memory limit. A private file mapping
+/// whose pages have been copied would have to fall back to the file's
+/// contents, which macOS offers no call for: a range holding one fails with
+/// `EINVAL` before anything changes (Firecracker remaps such memory instead,
+/// see `discard_range`).
 ///
 /// The range is taken as Linux takes it (`mm/madvise.c`): a start that is
 /// not page aligned, or a length that overflows when rounded up to pages,
@@ -491,7 +526,8 @@ unsafe fn dontneed(addr: *mut c_void, len: size_t, done: &mut std::vec::Vec<(u64
     let mut unmapped = false;
     let mut pos = start;
     while pos < end {
-        let Some((entry_start, entry_end, backing)) = vm_entry(pos).filter(|&(s, _, _)| s < end) else {
+        let Some((entry_start, entry_end, backing, prot)) = vm_entry(pos).filter(|&(s, _, _, _)| s < end)
+        else {
             unmapped = true;
             break;
         };
@@ -504,10 +540,15 @@ unsafe fn dontneed(addr: *mut c_void, len: size_t, done: &mut std::vec::Vec<(u64
             return -1;
         }
         let piece_end = entry_end.min(end);
-        entries.push((pos, piece_end, backing));
+        // Adjacent entries alike (a guest range split by earlier discards
+        // or protections) are discarded as one piece.
+        match entries.last_mut() {
+            Some((_, e, b, p)) if *e == pos && *b == backing && *p == prot => *e = piece_end,
+            _ => entries.push((pos, piece_end, backing, prot)),
+        }
         pos = piece_end;
     }
-    for (mut piece_start, piece_end, backing) in entries {
+    for (mut piece_start, piece_end, backing, prot) in entries {
         while piece_start < piece_end {
             let (seg_end, huge) = crate::wick_uffd::huge_segment(piece_start, piece_end);
             let (from, to) = if huge {
@@ -521,7 +562,7 @@ unsafe fn dontneed(addr: *mut c_void, len: size_t, done: &mut std::vec::Vec<(u64
             };
             if from < to {
                 // SAFETY: a mapped range of the caller's.
-                let ret = unsafe { discard_piece(from as *mut c_void, (to - from) as size_t, backing) };
+                let ret = unsafe { discard_piece(from as *mut c_void, (to - from) as size_t, backing, prot) };
                 if ret != 0 {
                     return ret;
                 }
@@ -537,36 +578,36 @@ unsafe fn dontneed(addr: *mut c_void, len: size_t, done: &mut std::vec::Vec<(u64
     0
 }
 
-/// Discards one mapped piece of one backing.
+/// Discards one mapped piece of one backing and protection.
 ///
 /// # Safety
 /// `[ptr, ptr + len)` must be mapped memory of the caller's.
-unsafe fn discard_piece(ptr: *mut c_void, len: size_t, backing: Backing) -> c_int {
+unsafe fn discard_piece(ptr: *mut c_void, len: size_t, backing: Backing, prot: c_int) -> c_int {
     match backing {
         // SAFETY: the caller's contract.
         Backing::Shared | Backing::File => unsafe { libc::madvise(ptr, len, libc::MADV_DONTNEED) },
         Backing::Anonymous => {
-            // SAFETY: the caller's contract.
-            let mut ret = unsafe { libc::madvise(ptr, len, MADV_ZERO) };
-            if ret != 0 && errno() == libc::EINVAL {
-                // Hosts without MADV_ZERO: zero by writing.
-                // SAFETY: a mapped, writable range (Linux would also
-                // fault on a read-only one).
-                unsafe { core::ptr::write_bytes(ptr.cast::<u8>(), 0, len) };
-                ret = 0;
-            }
-            if ret == 0 {
-                // SAFETY: as above.
-                ret = unsafe { libc::madvise(ptr, len, libc::MADV_FREE_REUSABLE) };
-            }
-            ret
+            // Fresh zero pages, released from the guest meanwhile. Kept
+            // `MAP_NORESERVE`, as Firecracker's guest memory is made
+            // (`discard_range` keeps it for the same reason).
+            // SAFETY: over a mapped range of the caller's, with its
+            // protection; the pages replaced are private, so nothing else
+            // held them.
+            let new = unsafe {
+                mmap_replacing(
+                    ptr,
+                    len,
+                    prot,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            if new == libc::MAP_FAILED { -1 } else { 0 }
         }
         Backing::FileCopied => unreachable!("refused before any piece is discarded"),
     }
 }
-
-/// `MADV_ZERO`: zero the pages of a range (macOS 14.4 and later).
-const MADV_ZERO: c_int = 11;
 
 // ---- socket options ----
 
@@ -1702,10 +1743,18 @@ mod tests {
             unsafe { *p.cast::<u8>().add(off) }
         };
 
-        // Private anonymous memory reads as zeros afterwards.
+        // Private anonymous memory reads as zeros afterwards, and its pages
+        // are released (not resident), the rest still there.
         let anon = map(libc::MAP_PRIVATE | libc::MAP_ANON, -1);
         // SAFETY: half of the mapping.
         assert_eq!(unsafe { madvise(anon, LEN / 2, libc::MADV_DONTNEED) }, 0);
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let mut resident = std::vec![0u8; LEN / page];
+        // SAFETY: one byte per page of the mapping.
+        assert_eq!(unsafe { mincore(anon, LEN, resident.as_mut_ptr()) }, 0);
+        assert!(resident[..LEN / 2 / page].iter().all(|r| r & 1 == 0), "discarded pages resident: {resident:?}");
+        assert!(resident[LEN / 2 / page..].iter().all(|r| r & 1 == 1), "kept pages not resident: {resident:?}");
         assert_eq!(read(anon, 0), 0);
         assert_eq!(read(anon, LEN / 2 - 1), 0);
         assert_eq!(read(anon, LEN / 2), 0x5a);
@@ -1769,6 +1818,66 @@ mod tests {
         assert_eq!(read(top, LEN - 1), 0);
         // SAFETY: unmapping our own mapping.
         unsafe { libc::munmap(top, LEN) };
+    }
+
+    /// A replacement of the pages of a range (a `MADV_DONTNEED` of private
+    /// anonymous memory, a `MAP_FIXED` mapping) is reported to the
+    /// hypervisor backend's hooks before and after, with the range; other
+    /// mappings are not.
+    #[test]
+    fn test_replaced_pages_are_reported_to_the_guest_hooks() {
+        use std::sync::Mutex;
+        static CALLS: Mutex<std::vec::Vec<(u64, u64, bool)>> = Mutex::new(std::vec::Vec::new());
+        fn stage2(_: u64, _: u64, _: bool) {}
+        fn replace(start: u64, len: u64, before: bool) -> bool {
+            CALLS.lock().unwrap().push((start, len, before));
+            true
+        }
+        crate::wick_guest::set_hooks(crate::wick_guest::Hooks { stage2, replace });
+        assert!(crate::wick_guest::hooked());
+        const LEN: usize = 1 << 20;
+        // SAFETY: a fresh mapping; not fixed, so not a replacement.
+        let p = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let (start, half) = (p as u64, (LEN / 2) as u64);
+        let calls = || -> std::vec::Vec<(u64, u64, bool)> {
+            CALLS.lock().unwrap().iter().copied().filter(|&(s, _, _)| s >= start && s < start + LEN as u64).collect()
+        };
+        assert!(calls().is_empty());
+        // SAFETY: inside the mapping.
+        unsafe { core::ptr::write_bytes(p.cast::<u8>(), 0x5a, LEN) };
+        // SAFETY: half of the mapping.
+        assert_eq!(unsafe { madvise(p, LEN / 2, libc::MADV_DONTNEED) }, 0);
+        assert_eq!(calls(), [(start, half, true), (start, half, false)]);
+        // SAFETY: over the other half.
+        let q = unsafe {
+            mmap(
+                p.cast::<u8>().add(LEN / 2).cast(),
+                LEN / 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(q as u64, start + half);
+        assert_eq!(
+            calls(),
+            [(start, half, true), (start, half, false), (start + half, half, true), (start + half, half, false)]
+        );
+        // SAFETY: the mapping, now all zeros.
+        assert_eq!(unsafe { *p.cast::<u8>().add(LEN - 1) }, 0);
+        // SAFETY: unmapping our own mapping.
+        unsafe { libc::munmap(p, LEN) };
     }
 
     fn memfd_file() -> std::os::fd::OwnedFd {

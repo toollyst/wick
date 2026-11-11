@@ -14,8 +14,9 @@
 //!   handler queues a page fault event and waits in a waiter slot; signals on
 //!   other addresses go to the previous handler.
 //! - Guests: Hypervisor.framework does not honour host protections, so the HVF
-//!   backend keeps missing pages inaccessible in stage 2 ([`set_stage2_hook`])
-//!   and resolves stage-2 faults with [`fault`].
+//!   backend keeps missing pages inaccessible in stage 2
+//!   ([`crate::wick_guest::Hooks::stage2`]) and resolves stage-2 faults with
+//!   [`fault`].
 //! - Pages are filled through a second mapping of the same memory
 //!   (`mach_vm_remap`) and only then made accessible, so no thread sees a page
 //!   half filled.
@@ -72,6 +73,9 @@ pub const FEATURE_EVENT_REMOVE: u64 = 1 << 3;
 const MAX_RANGES: usize = 64;
 /// `VM_FLAGS_ANYWHERE`.
 const VM_FLAGS_ANYWHERE: c_int = 1;
+/// `VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE`: at the address given, replacing
+/// what is mapped there.
+const VM_FLAGS_FIXED_OVERWRITE: c_int = 0x4000;
 const MAX_CTX: usize = 16;
 const MAX_WAITERS: usize = 256;
 
@@ -171,8 +175,6 @@ static REGISTERED: AtomicUsize = AtomicUsize::new(0);
 /// Serializes changes to the ranges.
 static LOCK: Mutex<()> = Mutex::new(());
 static INIT: Once = Once::new();
-/// `fn(host_addr, len, present)`, set by the HVF backend.
-static STAGE2: AtomicUsize = AtomicUsize::new(0);
 static OLD_SIGBUS: AtomicPtr<libc::sigaction> = AtomicPtr::new(ptr::null_mut());
 static OLD_SIGSEGV: AtomicPtr<libc::sigaction> = AtomicPtr::new(ptr::null_mut());
 
@@ -451,20 +453,11 @@ extern "C" fn on_signal(sig: c_int, info: *mut libc::siginfo_t, uctx: *mut libc:
     }
 }
 
-/// Sets the stage-2 hook of the HVF backend: called with
-/// `(host_addr, len, present)` when registered pages become present (they
-/// must be accessible to the guest) or missing (they must fault).
-pub fn set_stage2_hook(hook: fn(u64, u64, bool)) {
-    STAGE2.store(hook as usize, Ordering::Release);
-}
-
+/// Tells the HVF backend ([`crate::wick_guest::Hooks::stage2`]) that
+/// registered pages became present (they must be accessible to the guest)
+/// or missing (they must fault).
 fn stage2(start: u64, len: u64, present: bool) {
-    let hook = STAGE2.load(Ordering::Acquire);
-    if hook != 0 && len > 0 {
-        // SAFETY: set by `set_stage2_hook` from a `fn(u64, u64, bool)`.
-        let f: fn(u64, u64, bool) = unsafe { core::mem::transmute(hook) };
-        f(start, len, present);
-    }
+    crate::wick_guest::stage2(start, len, present);
 }
 
 /// Calls `f(start, len)` for each run of missing registered pages in
@@ -854,10 +847,44 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
         let ps = r.page_size();
         let ctx = r.ctx.load(Ordering::Acquire);
         let remove = CTXS[ctx].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0;
+        let alias = r.alias.load(Ordering::Acquire);
         for &(a, b) in &done {
             let (a, b) = (a.max(s), b.min(e));
             if a >= b {
                 continue;
+            }
+            // A discard of private anonymous memory replaces its pages
+            // (`linux_items::discard_piece`): the alias, through which
+            // pages are filled, must share the new ones, or a fill would go
+            // to the old pages, which the alias would also keep resident.
+            let mut at = alias + (a - s);
+            let (mut cur, mut max) = (0, 0);
+            // SAFETY: maps `[a, b)` of the range, which is mapped, over the
+            // same part of its alias, which is ours.
+            let kr = unsafe {
+                mach_vm_remap(
+                    mach_task_self_,
+                    &mut at,
+                    b - a,
+                    0,
+                    VM_FLAGS_FIXED_OVERWRITE,
+                    mach_task_self_,
+                    a,
+                    0,
+                    &mut cur,
+                    &mut max,
+                    1, // VM_INHERIT_NONE
+                )
+            };
+            if kr != 0 {
+                // The alias would fill the old pages: the next fill would
+                // corrupt the guest silently.
+                std::eprintln!(
+                    "wick: userfaultfd alias of {a:#x}+{:#x} cannot follow the discarded pages \
+                     (mach_vm_remap: {kr})",
+                    b - a
+                );
+                std::process::abort();
             }
             // The range's whole pages inside the piece.
             let (first, last) = ((a - s).div_ceil(ps), (b - s) / ps);
@@ -1632,6 +1659,36 @@ mod tests {
         let chan = channel(user);
         assert_eq!(request(chan, [proto::OP_WAKE, mem, ps, 0], &[]), (0, 0));
         close(&[chan, user]);
+    }
+
+    /// A discard of registered memory replaces its pages
+    /// (`linux_items::discard_piece`): the alias through which pages are
+    /// filled follows, so a copy after the discard lands in the pages the
+    /// memory now has, not in the old ones (which would also have kept the
+    /// old pages resident).
+    #[test]
+    fn test_discarded_pages_are_filled_through_the_new_alias() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(4);
+        register(ctx, mem, 4 * ps).unwrap();
+        let page = mem + ps;
+        let read = || {
+            // SAFETY: a filled page.
+            unsafe { ptr::read_volatile((page + 5) as *const u8) }
+        };
+        for (fill, expect) in [(0x11u8, 0x11u8), (0x22, 0x22)] {
+            let data = std::vec![fill; ps as usize];
+            // SAFETY: `data` holds a page; `page` is a missing page of the range.
+            assert_eq!(unsafe { copy(ctx, data.as_ptr(), page, ps, true) }, Ok(ps));
+            assert!(!is_missing(page));
+            assert_eq!(read(), expect, "copy of {fill:#x}");
+            // Missing again, with fresh pages; the copy above lands in them.
+            // SAFETY: one page of the mapping, through the compatibility madvise.
+            assert_eq!(unsafe { crate::linux_items::madvise(page as *mut _, ps as usize, libc::MADV_DONTNEED) }, 0);
+            assert!(is_missing(page));
+        }
+        close(&[user]);
     }
 
     /// A huge page mapping is registered in huge pages (docs/PORTING.md

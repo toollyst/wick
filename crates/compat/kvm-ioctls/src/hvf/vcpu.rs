@@ -1000,6 +1000,11 @@ impl VcpuFd {
             match exit::decode(esr) {
                 Exit::Abort { instruction, write } => {
                     let ipa = exit.exception.physical_address;
+                    // Pages being replaced under the guest (a discard; see
+                    // `vm::guest_replace`): wait for the new ones, then retry.
+                    if vm.wait_mapped(ipa) {
+                        continue;
+                    }
                     // A page a userfaultfd has not filled: wait for it, as KVM
                     // does when it faults the host page in (get_user_pages).
                     if let Some(host) = vm.ram_host_addr(ipa)
