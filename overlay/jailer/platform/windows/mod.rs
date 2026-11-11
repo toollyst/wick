@@ -350,31 +350,52 @@ pub fn join_netns(path: &str) -> Result<(), JailerError> {
     Ok(())
 }
 
-/// Grants the jail's SID full access to `dir` and what is made in it, keeping
-/// the other entries (another jail sharing the network keeps its own), and
+/// Grants the jail's SID full access to `dir` and what is made in it, and
 /// labels it with the jail's integrity level, so that the jailed process can
-/// make its endpoints there: an object without a label is medium, which a
-/// jailed process may not write to.
+/// make its endpoints there (an object without a label is medium, which a
+/// jailed process may not write to). The DACL is protected, as the jail
+/// directory's is ([`jail_dacl`]): an entry `dir` inherits (`C:\`'s
+/// Authenticated Users: Modify, which every jail's token holds) would let
+/// every jail into every network (measured: jailer-test netns, a jail of
+/// network a connected to network b's endpoint). The entries `dir` has of
+/// its own stay (another jail sharing the network keeps its SID); SYSTEM,
+/// the administrators and the user keep full access.
 fn grant_to_jail(dir: &Path) -> io::Result<()> {
-    use windows_sys::Win32::Security::Authorization::{
-        EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SetEntriesInAclW,
-        TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
-    };
-    use windows_sys::Win32::Security::SUB_CONTAINERS_AND_OBJECTS_INHERIT;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    let user = user_sid()?;
+    let current = dacl_sddl(dir)?;
+    let mut sddl = String::from("D:PAI");
+    // The entries of `dir`'s own: those not marked inherited (`ID`).
+    for ace in current.split_inclusive(')').filter_map(|a| a.find('(').map(|i| &a[i..])) {
+        let inherited = ace.trim_matches(|c| c == '(' || c == ')').split(';').nth(1).is_some_and(|f| f.contains("ID"));
+        if !inherited {
+            sddl.push_str(ace);
+        }
+    }
+    for trustee in ["SY", "BA", user.as_str(), vm_sid()] {
+        let ace = format!("(A;OICI;FA;;;{trustee})");
+        if !sddl.contains(&ace) {
+            sddl.push_str(&ace);
+        }
+    }
+    set_security(dir, &sddl, false)?;
+    set_security(dir, JAIL_LABEL, true)
+}
 
-    let sid = Sid::new(vm_sid()).map_err(|e| io::Error::other(e.to_string()))?;
-    let mut old: *mut ACL = std::ptr::null_mut();
+/// The DACL of `path` as SDDL (`D:...`).
+fn dacl_sddl(path: &Path) -> io::Result<String> {
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+    };
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: a NUL-terminated path; out-pointers for the DACL and its descriptor.
+    // SAFETY: a NUL-terminated path and out-pointers.
     let rc = unsafe {
         GetNamedSecurityInfoW(
-            wide(dir).as_ptr(),
+            wide(path).as_ptr(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut old,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             &mut sd,
         )
@@ -382,44 +403,24 @@ fn grant_to_jail(dir: &Path) -> io::Result<()> {
     if rc != 0 {
         return Err(io::Error::from_raw_os_error(rc.cast_signed()));
     }
-    let entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: FILE_ALL_ACCESS,
-        grfAccessMode: GRANT_ACCESS,
-        grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.0.cast(),
-        },
+    let mut text: *mut u16 = std::ptr::null_mut();
+    let mut len = 0u32;
+    // SAFETY: the descriptor from above; out-pointers.
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &mut text, &mut len)
     };
-    let mut new: *mut ACL = std::ptr::null_mut();
-    // SAFETY: one entry; the old ACL lives in `sd`; an out-pointer.
-    let rc = unsafe { SetEntriesInAclW(1, &entry, old, &mut new) };
+    let result = if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: `len` characters allocated by the conversion.
+        let s = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(text, len as usize)) };
+        // SAFETY: allocated by the conversion.
+        unsafe { LocalFree(text.cast()) };
+        Ok(s.trim_end_matches('\0').to_owned())
+    };
     // SAFETY: allocated by GetNamedSecurityInfoW.
     unsafe { LocalFree(sd) };
-    if rc != 0 {
-        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
-    }
-    // SAFETY: a NUL-terminated path; the new ACL, freed below.
-    let rc = unsafe {
-        SetNamedSecurityInfoW(
-            wide(dir).as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            new,
-            std::ptr::null(),
-        )
-    };
-    // SAFETY: allocated by SetEntriesInAclW.
-    unsafe { LocalFree(new.cast()) };
-    if rc != 0 {
-        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
-    }
-    set_security(dir, JAIL_LABEL, true)
+    result
 }
 
 /// The variable that tells a relaunched jailer it is the keeper of a
@@ -1745,25 +1746,25 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // The jail's SID is granted on a network directory without disturbing
-    // the entries there (another jail's), and the directory gets the jail's
-    // label.
+    // The jail's SID is granted on a network directory whose DACL is then
+    // protected: what it inherited (%TEMP%'s entries here) is gone, its own
+    // entries (another jail's) stay, the administrators, SYSTEM and the user
+    // keep full access, and the directory gets the jail's label.
     #[test]
-    fn test_grant_to_jail_keeps_other_entries() {
+    fn test_grant_to_jail_protects_the_network() {
         let dir = std::env::temp_dir().join(format!("wick-jailer-grant-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let sddl = |path: &Path, label: bool| -> String {
+        let label = |path: &Path| -> String {
             use windows_sys::Win32::Security::Authorization::{
                 ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
             };
             let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-            let info = if label { LABEL_SECURITY_INFORMATION } else { DACL_SECURITY_INFORMATION };
             // SAFETY: a NUL-terminated path and out-pointers.
             let rc = unsafe {
                 GetNamedSecurityInfoW(
                     wide(path).as_ptr(),
                     SE_FILE_OBJECT,
-                    info,
+                    LABEL_SECURITY_INFORMATION,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
@@ -1776,7 +1777,7 @@ mod tests {
             let mut len = 0u32;
             // SAFETY: the descriptor from above; out-pointers.
             let ok = unsafe {
-                ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, info, &mut text, &mut len)
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, LABEL_SECURITY_INFORMATION, &mut text, &mut len)
             };
             assert_ne!(ok, 0);
             // SAFETY: `len` characters allocated by the conversion.
@@ -1786,19 +1787,27 @@ mod tests {
                 LocalFree(text.cast());
                 LocalFree(sd);
             }
-            s.trim_end_matches('\0').to_owned()
+            s
         };
-        let before = sddl(&dir, false);
+        let before = dacl_sddl(&dir).unwrap();
+        assert!(before.contains("ID;"), "nothing inherited to test with: {before}");
+        // Guests (S-1-5-32-546, `BG` in SDDL) stands for another jail's SID:
+        // an entry of the directory's own (icacls grants only a SID Windows knows).
+        let st = std::process::Command::new("icacls").arg(&dir).arg("/grant").arg("*S-1-5-32-546:(OI)(CI)F").output().unwrap();
+        assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stdout));
         grant_to_jail(&dir).unwrap();
-        let after = sddl(&dir, false);
-        assert!(after.contains(vm_sid()), "{after}");
-        // Every entry there before is still there.
-        for ace in before.trim_start_matches("D:").split_inclusive(')').filter(|a| a.starts_with('(')) {
-            assert!(after.contains(ace), "{ace} lost: {after}");
+        let after = dacl_sddl(&dir).unwrap();
+        assert!(after.starts_with("D:P"), "not protected: {after}");
+        assert!(!after.contains("ID;"), "an inherited entry stayed: {after}");
+        let user = user_sid().unwrap();
+        for trustee in ["BG", "SY", "BA", user.as_str(), vm_sid()] {
+            assert!(after.contains(&format!(";;;{trustee})")), "{trustee} missing: {after}");
         }
-        assert!(sddl(&dir, true).contains(JAIL_INTEGRITY_SID));
-        // A second grant (another jail of the same jailer: the same SID) changes nothing more.
+        assert!(!after.contains(";;;AU)") && !after.contains(";;;BU)"), "{after}");
+        assert!(label(&dir).contains(JAIL_INTEGRITY_SID));
+        // A second grant (another jail of the same jailer: the same SID) changes nothing.
         grant_to_jail(&dir).unwrap();
+        assert_eq!(dacl_sddl(&dir).unwrap(), after);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
