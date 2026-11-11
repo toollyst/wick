@@ -112,14 +112,16 @@ _PROTECTED_DACL = 0x80000000
 
 
 class _SessionLock:
-    """A lock all the session's workers share (a named mutex): a DACL is read,
-    changed and written back, and six workers grant the same hard-linked
-    artifacts to their jails at once."""
+    """The jailers' DACL lock (a named mutex, ACL_LOCK in
+    overlay/jailer/platform/windows/mod.rs), which the session's workers
+    share with them: a DACL is read, changed and written back, and six
+    workers and their jailers grant the same hard-linked artifacts to their
+    jails at once."""
 
     def __enter__(self):
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateMutexW.restype = ctypes.c_void_p
-        name = "Local\\wick-it-dacl-" + os.path.basename(SESSION_ROOT)
+        name = "Local\\wick-jailer-acl"
         self._h = k32.CreateMutexW(None, False, name)
         if not self._h:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -231,9 +233,13 @@ def give_to_jail(path, root):
     def edit(aces):
         # A read-only artifact is linked into every jail of every session: an
         # ACE per jail outgrew the ACL (ERROR 1340, an ACL is at most 64
-        # KiB). The latest jails' grants stay; fewer than that run at once.
+        # KiB). A jailer takes its jail's entries off the files it shares
+        # when Firecracker ends (unshare, overlay/jailer/platform/windows);
+        # those of jailers that were killed are what this bounds. Far more
+        # than run at once: an entry is not dropped by its age, and one
+        # dropped was a running jail's (access denied at its next open).
         jails = [a for a in aces if a.startswith("(A;") and "S-1-9-" in a and a != grants[0]]
-        old = set(jails[:-31])
+        old = set(jails[:-256])
         return [a for a in aces if a not in old] + [g for g in grants if g not in aces]
 
     _set_dacl(path, edit)
