@@ -230,6 +230,17 @@ pub fn note_mapping(start: u64, len: u64, huge: bool) {
     *all = kept;
 }
 
+/// The first part of `[start, end)` that is all huge page mappings or all
+/// ordinary memory: its end, and whether it is huge.
+pub fn huge_segment(start: u64, end: u64) -> (u64, bool) {
+    let all = HUGE_MAPPINGS.lock().unwrap();
+    if let Some(&(_, e)) = all.iter().find(|&&(s, e)| s <= start && start < e) {
+        return (e.min(end), true);
+    }
+    let next = all.iter().map(|&(s, _)| s).filter(|&s| s > start).min().unwrap_or(end);
+    (next.min(end), false)
+}
+
 /// Whether any of `[start, end)` is a huge page mapping.
 pub fn touches_huge(start: u64, end: u64) -> bool {
     let all = HUGE_MAPPINGS.lock().unwrap();
@@ -476,7 +487,19 @@ pub fn for_each_missing(start: u64, len: u64, mut f: impl FnMut(u64, u64)) {
                 let missing = Range::test(&r.tracked, page) && Range::test(&r.missing, page);
                 (page_start, page_start + rps, missing)
             }
-            None => (addr, addr + ps, false),
+            // Unregistered memory holds no missing page: on to the next
+            // range (a walk by host pages over a span as large as a
+            // `MADV_DONTNEED` may name would not end).
+            None => {
+                let next = RANGES
+                    .iter()
+                    .map(|r| r.start.load(Ordering::Acquire))
+                    .filter(|&s| s > addr)
+                    .min()
+                    .unwrap_or(end)
+                    .min(end);
+                (addr, next.max(addr + ps), false)
+            }
         };
         match (missing, run) {
             (true, None) => run = Some(page_start),
@@ -795,18 +818,23 @@ pub fn wake_range(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
 }
 
 /// Wraps a `MADV_DONTNEED` of `[start, start + len)`: registered pages are
-/// made accessible for `discard` to zero and release them, then they are
-/// missing again and a remove event is queued (with `EVENT_REMOVE`).
-pub fn discarding(start: u64, len: u64, discard: impl FnOnce() -> c_int) -> c_int {
+/// made accessible for `discard` to zero and release them, and the pages of
+/// the pieces `discard` reports it discarded are missing again, with a
+/// remove event queued for each (with `EVENT_REMOVE`). Pieces in a huge page
+/// range are whole huge pages (Linux's hugetlb `MADV_DONTNEED` wants a huge
+/// page aligned start and rounds the end down); pages the discard did not
+/// reach keep their contents, as on Linux when it stops at an error.
+pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)>) -> c_int) -> c_int {
     let ps = page_size();
     let end = start.saturating_add(len);
+    let mut done = Vec::new();
     let touches = ps != 0
         && RANGES.iter().any(|r| {
             let s = r.start.load(Ordering::Acquire);
             s != 0 && start < r.end.load(Ordering::Acquire) && s < end
         });
     if !touches {
-        return discard();
+        return discard(&mut done);
     }
     let _guard = LOCK.lock().unwrap();
     let mut runs = Vec::new();
@@ -815,41 +843,41 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce() -> c_int) -> c_in
         // Missing pages hold zeros: let the discard reach them.
         let _ = protect(s, l, libc::PROT_READ | libc::PROT_WRITE);
     }
-    let ret = discard();
+    let ret = discard(&mut done);
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::Acquire);
         let e = r.end.load(Ordering::Acquire);
         if s == 0 || start >= e || s >= end {
             continue;
         }
-        // A discard of part of a huge page makes the whole page missing
-        // (Linux frees the whole huge page).
         let ps = r.page_size();
-        let from = start.max(s) - (start.max(s) - s) % ps;
-        let to = end.min(e);
-        let mut any = false;
-        let mut addr = from;
-        while addr < to {
-            let page = (addr - s) / ps;
-            if Range::test(&r.tracked, page) {
-                Range::set(&r.missing, page, true);
-                any = true;
+        let ctx = r.ctx.load(Ordering::Acquire);
+        let remove = CTXS[ctx].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0;
+        for &(a, b) in &done {
+            let (a, b) = (a.max(s), b.min(e));
+            if a >= b {
+                continue;
             }
-            addr += ps;
+            // The range's whole pages inside the piece.
+            let (first, last) = ((a - s).div_ceil(ps), (b - s) / ps);
+            for page in first..last {
+                if Range::test(&r.tracked, page) {
+                    Range::set(&r.missing, page, true);
+                }
+            }
+            if first < last && remove {
+                post(ctx, [proto::EVENT_REMOVE, s + first * ps, s + last * ps, 0]);
+            }
         }
-        if !any {
-            continue;
-        }
-        let to = (s + (to - s).next_multiple_of(ps)).min(e);
+        // Every missing page of the range in reach is inaccessible again:
+        // the ones just discarded and the ones made accessible above.
+        let from = start.max(s) - (start.max(s) - s) % ps;
+        let to = (s + (end.min(e) - s).next_multiple_of(ps)).min(e);
         let mut runs = Vec::new();
         for_each_missing(from, to - from, |a, l| runs.push((a, l)));
         for (a, l) in runs {
             let _ = protect(a, l, libc::PROT_NONE);
             stage2(a, l, false);
-        }
-        let ctx = r.ctx.load(Ordering::Acquire);
-        if CTXS[ctx].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0 {
-            post(ctx, [proto::EVENT_REMOVE, from, to, 0]);
         }
     }
     ret
@@ -1608,8 +1636,8 @@ mod tests {
     /// A huge page mapping is registered in huge pages (docs/PORTING.md
     /// row 10): a fault anywhere in one reports its address and waits for
     /// the whole page; a copy must be aligned to huge pages and fills a
-    /// whole one; the other huge pages stay missing; a discard of part of
-    /// a filled page makes the whole page missing again.
+    /// whole one; the other huge pages stay missing; a discard must start
+    /// on a huge page and its end is rounded down to one, as Linux's.
     #[test]
     fn test_huge_page_ranges_fault_and_fill_whole_pages() {
         use crate::linux_items::{HUGE_PAGE, MAP_HUGETLB, MAP_HUGE_2MB};
@@ -1671,10 +1699,23 @@ mod tests {
         // Filled: EEXIST for the whole page.
         let exists = (err(libc::EEXIST), 0);
         assert_eq!(request(chan, [proto::OP_COPY, mem + HUGE_PAGE, HUGE_PAGE, 0], &page), exists);
-        // A discard of one host page of it: the whole huge page is missing.
-        // SAFETY: registered memory.
-        let rc = unsafe { crate::linux_items::madvise((mem + HUGE_PAGE + host) as *mut _, host as usize, libc::MADV_DONTNEED) };
-        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        // Discards as Linux's hugetlb takes them (mm/madvise.c
+        // madvise_dontneed_free_valid_vma): a start off the huge page is
+        // EINVAL, an end inside it is rounded down (here to nothing), and
+        // the page keeps its contents; a whole huge page is missing again.
+        let dontneed = |at: u64, len: u64| {
+            // SAFETY: registered memory.
+            unsafe { crate::linux_items::madvise(at as *mut _, len as usize, libc::MADV_DONTNEED) }
+        };
+        assert_eq!(dontneed(mem + HUGE_PAGE + host, host), -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(dontneed(mem + HUGE_PAGE, HUGE_PAGE - host), 0);
+        for off in [HUGE_PAGE, HUGE_PAGE + host, 2 * HUGE_PAGE - 1] {
+            assert!(!is_missing(mem + off), "{off:#x}");
+            // SAFETY: a filled page.
+            assert_eq!(unsafe { ptr::read_volatile((mem + off) as *const u8) }, 3);
+        }
+        assert_eq!(dontneed(mem + HUGE_PAGE, HUGE_PAGE + host), 0, "{}", io::Error::last_os_error());
         for off in [HUGE_PAGE, HUGE_PAGE + host, 2 * HUGE_PAGE - 1] {
             assert!(is_missing(mem + off), "{off:#x}");
         }

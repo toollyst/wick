@@ -415,9 +415,17 @@ fn file_under(addr: u64) -> bool {
 /// macOS's own `MADV_DONTNEED` is only a hint, so private anonymous ranges are
 /// zeroed with `MADV_ZERO` and released with `MADV_FREE_REUSABLE`. A private
 /// file mapping whose pages have been copied would have to fall back to the
-/// file's contents, which macOS offers no call for: that range fails with
-/// `EINVAL` (Firecracker remaps such memory instead, see `discard_range`).
-/// Other advice is passed through.
+/// file's contents, which macOS offers no call for: a range holding one fails
+/// with `EINVAL` before anything changes (Firecracker remaps such memory
+/// instead, see `discard_range`).
+///
+/// The range is taken as Linux takes it (`mm/madvise.c`): a start that is
+/// not page aligned, or a length that overflows when rounded up to pages,
+/// is `EINVAL`; a length of 0 does nothing; the mapped parts are discarded
+/// and unmapped pages in the range then give `ENOMEM`. In a huge page
+/// mapping ([`mmap_huge`]) the start must be huge page aligned (`EINVAL`,
+/// with the parts before it discarded) and the end is rounded down to a huge
+/// page. Other advice is passed through.
 ///
 /// # Safety
 /// Same contract as `madvise(2)`.
@@ -426,27 +434,39 @@ pub unsafe fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
         // SAFETY: forwarded unchanged.
         return unsafe { libc::madvise(addr, len, advice) };
     }
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let rounded = len.checked_next_multiple_of(page);
+    let Some(len) = rounded.filter(|&l| (addr as usize).is_multiple_of(page) && (addr as usize).checked_add(l).is_some())
+    else {
+        set_errno(libc::EINVAL);
+        return -1;
+    };
+    if len == 0 {
+        return 0;
+    }
     // Pages registered with a userfaultfd become missing (and a remove event
     // is queued), as on Linux.
     // SAFETY: the caller's contract.
-    crate::wick_uffd::discarding(addr as u64, len as u64, || unsafe { dontneed(addr, len) })
+    crate::wick_uffd::discarding(addr as u64, len as u64, |done| unsafe { dontneed(addr, len, done) })
 }
 
-/// The `MADV_DONTNEED` of [`madvise`].
-unsafe fn dontneed(addr: *mut c_void, len: size_t) -> c_int {
-    let (start, end) = (addr as u64, (addr as u64).saturating_add(len as u64));
-    // Check the whole range first, so nothing changes if part of it fails.
+/// The `MADV_DONTNEED` of [`madvise`] over a page aligned range; the pieces
+/// discarded are added to `done`.
+unsafe fn dontneed(addr: *mut c_void, len: size_t, done: &mut std::vec::Vec<(u64, u64)>) -> c_int {
+    let (start, end) = (addr as u64, addr as u64 + len as u64);
+    // The mapped pieces, and whether there are unmapped pages between them.
     let mut entries = std::vec::Vec::new();
+    let mut unmapped = false;
     let mut pos = start;
     while pos < end {
-        let Some((entry_start, entry_end, backing)) = vm_entry(pos) else {
-            set_errno(libc::ENOMEM);
-            return -1;
+        let Some((entry_start, entry_end, backing)) = vm_entry(pos).filter(|&(s, _, _)| s < end) else {
+            unmapped = true;
+            break;
         };
         if entry_start > pos {
-            // Linux: ENOMEM for unmapped pages in the range.
-            set_errno(libc::ENOMEM);
-            return -1;
+            unmapped = true;
+            pos = entry_start;
         }
         if backing == Backing::FileCopied {
             set_errno(libc::EINVAL);
@@ -456,37 +476,62 @@ unsafe fn dontneed(addr: *mut c_void, len: size_t) -> c_int {
         entries.push((pos, piece_end, backing));
         pos = piece_end;
     }
-    for (piece_start, piece_end, backing) in entries {
-        let ptr = piece_start as *mut c_void;
-        let len = (piece_end - piece_start) as size_t;
-        let ret = match backing {
-            // SAFETY: a mapped range of the caller's.
-            Backing::Shared | Backing::File => unsafe {
-                libc::madvise(ptr, len, libc::MADV_DONTNEED)
-            },
-            Backing::Anonymous => {
+    for (mut piece_start, piece_end, backing) in entries {
+        while piece_start < piece_end {
+            let (seg_end, huge) = crate::wick_uffd::huge_segment(piece_start, piece_end);
+            let (from, to) = if huge {
+                if !piece_start.is_multiple_of(HUGE_PAGE) {
+                    set_errno(libc::EINVAL);
+                    return -1;
+                }
+                (piece_start, seg_end - seg_end % HUGE_PAGE)
+            } else {
+                (piece_start, seg_end)
+            };
+            if from < to {
                 // SAFETY: a mapped range of the caller's.
-                let mut ret = unsafe { libc::madvise(ptr, len, MADV_ZERO) };
-                if ret != 0 && errno() == libc::EINVAL {
-                    // Hosts without MADV_ZERO: zero by writing.
-                    // SAFETY: a mapped, writable range (Linux would also
-                    // fault on a read-only one).
-                    unsafe { core::ptr::write_bytes(ptr.cast::<u8>(), 0, len) };
-                    ret = 0;
+                let ret = unsafe { discard_piece(from as *mut c_void, (to - from) as size_t, backing) };
+                if ret != 0 {
+                    return ret;
                 }
-                if ret == 0 {
-                    // SAFETY: as above.
-                    ret = unsafe { libc::madvise(ptr, len, libc::MADV_FREE_REUSABLE) };
-                }
-                ret
+                done.push((from, to));
             }
-            Backing::FileCopied => unreachable!(),
-        };
-        if ret != 0 {
-            return ret;
+            piece_start = seg_end;
         }
     }
+    if unmapped {
+        set_errno(libc::ENOMEM);
+        return -1;
+    }
     0
+}
+
+/// Discards one mapped piece of one backing.
+///
+/// # Safety
+/// `[ptr, ptr + len)` must be mapped memory of the caller's.
+unsafe fn discard_piece(ptr: *mut c_void, len: size_t, backing: Backing) -> c_int {
+    match backing {
+        // SAFETY: the caller's contract.
+        Backing::Shared | Backing::File => unsafe { libc::madvise(ptr, len, libc::MADV_DONTNEED) },
+        Backing::Anonymous => {
+            // SAFETY: the caller's contract.
+            let mut ret = unsafe { libc::madvise(ptr, len, MADV_ZERO) };
+            if ret != 0 && errno() == libc::EINVAL {
+                // Hosts without MADV_ZERO: zero by writing.
+                // SAFETY: a mapped, writable range (Linux would also
+                // fault on a read-only one).
+                unsafe { core::ptr::write_bytes(ptr.cast::<u8>(), 0, len) };
+                ret = 0;
+            }
+            if ret == 0 {
+                // SAFETY: as above.
+                ret = unsafe { libc::madvise(ptr, len, libc::MADV_FREE_REUSABLE) };
+            }
+            ret
+        }
+        Backing::FileCopied => unreachable!("refused before any piece is discarded"),
+    }
 }
 
 /// `MADV_ZERO`: zero the pages of a range (macOS 14.4 and later).
@@ -1611,23 +1656,54 @@ mod tests {
         // SAFETY: unmapping our own mapping.
         unsafe { libc::munmap(shared, LEN) };
 
-        // Unmapped pages: ENOMEM, and nothing changes. Not a range just
-        // unmapped, which another test's thread may map again: a range that
-        // starts mapped and runs past the end of the process's address space,
-        // where Linux also fails with ENOMEM.
-        let past_the_end = 0xffff_0000_0000_0000_usize as *mut c_void;
-        for (addr, len) in [(past_the_end, LEN), (anon, usize::MAX - anon as usize)] {
-            // SAFETY: a range that is not (all) mapped; nothing is changed.
+        // The range as Linux takes it (mm/madvise.c check_input_range): a
+        // start off a page, or a length that wraps when rounded up to pages
+        // (from `anon` to the end of the address space), is EINVAL and
+        // nothing changes; a length of 0 does nothing.
+        let errno = || std::io::Error::last_os_error().raw_os_error();
+        let off_page = anon.cast::<u8>().wrapping_add(1).cast::<c_void>();
+        for (addr, len) in [(off_page, 1), (anon, usize::MAX - anon as usize)] {
+            // SAFETY: refused before anything is changed.
             assert_eq!(unsafe { madvise(addr, len, libc::MADV_DONTNEED) }, -1);
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ENOMEM)
-            );
+            assert_eq!(errno(), Some(libc::EINVAL));
         }
-        // Nothing changed in the mapped part.
+        // SAFETY: an empty range.
+        assert_eq!(unsafe { madvise(anon, 0, libc::MADV_DONTNEED) }, 0);
         assert_eq!(read(anon, LEN / 2), 0x5a);
         // SAFETY: unmapping our own mapping.
         unsafe { libc::munmap(anon, LEN) };
+
+        // Unmapped pages: ENOMEM. Not a range just unmapped, which another
+        // test's thread may map again, but ranges past the end of the
+        // address space, where nothing can be mapped: one wholly past it,
+        // and one from a mapping just below it, whose mapped part is
+        // discarded before ENOMEM is returned (madvise_walk_vmas).
+        const TOP: usize = 0x7fff_fe00_0000; // MACH_VM_MAX_ADDRESS (arm64)
+        let past_the_end = 0xffff_0000_0000_0000_usize as *mut c_void;
+        // SAFETY: nothing is mapped there.
+        assert_eq!(unsafe { madvise(past_the_end, LEN, libc::MADV_DONTNEED) }, -1);
+        assert_eq!(errno(), Some(libc::ENOMEM));
+        // SAFETY: a fresh mapping at the top of the address space if free.
+        let top = unsafe {
+            libc::mmap(
+                (TOP - LEN) as *mut c_void,
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(top as usize, TOP - LEN, "the top of the address space is taken");
+        // SAFETY: inside the mapping.
+        unsafe { core::ptr::write_bytes(top.cast::<u8>(), 0x5a, LEN) };
+        // SAFETY: our mapping, then unmappable addresses.
+        assert_eq!(unsafe { madvise(top, 2 * LEN, libc::MADV_DONTNEED) }, -1);
+        assert_eq!(errno(), Some(libc::ENOMEM));
+        assert_eq!(read(top, 0), 0);
+        assert_eq!(read(top, LEN - 1), 0);
+        // SAFETY: unmapping our own mapping.
+        unsafe { libc::munmap(top, LEN) };
     }
 
     fn memfd_file() -> std::os::fd::OwnedFd {
