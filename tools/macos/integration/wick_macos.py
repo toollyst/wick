@@ -410,6 +410,18 @@ import resource  # noqa: E402  pylint: disable=wrong-import-position
 if not hasattr(resource, "prlimit"):
     resource.prlimit = prlimit
 
+
+def get_resident_memory(process):
+    """`framework.utils.get_resident_memory` (KiB) on macOS.
+
+    Linux: the process's RSS plus its hugetlb pages (/proc/<pid>/status,
+    which hugetlb pages are not counted in). macOS has no hugetlb: a huge
+    page mapping is host pages (docs/PORTING.md row 10), all in the RSS."""
+    return process.memory_info().rss // 1024
+
+
+_utils.get_resident_memory = get_resident_memory
+
 import framework.kvm as _kvm  # noqa: E402  pylint: disable=wrong-import-position
 
 # The "kvm" backend of upstream's framework is Firecracker's KVM API, which
