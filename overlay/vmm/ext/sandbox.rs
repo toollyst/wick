@@ -641,9 +641,14 @@ mod macos {
     /// `unlink`: Linux's eventfd and tap have no name. The file rule's other
     /// operations are unchanged. Seatbelt matches the real path, so the
     /// directories are given by theirs: in a jail (`root`), its `/tmp`
-    /// (the jailer's `TMPDIR`) and the jail and its network `netns`, by
-    /// their paths outside it; outside a jail, the temporary directory and
-    /// `firecracker-net` in the user's temporary directory.
+    /// (the jailer's `TMPDIR`) for the FIFOs and the jail and its network
+    /// `netns`, by their paths outside it, for the sockets; outside a jail,
+    /// the temporary directory for the FIFOs, and a socket anywhere: an
+    /// endpoint is bound at the path the operator names (`host_dev_name`;
+    /// `boot-test net` names one in its own directory, measured: a
+    /// `firecracker-net`-only rule ended the microVM at its shutdown with
+    /// SIGSYS), and the name of a socket is all a running microVM may
+    /// remove there.
     ///
     /// Memfds take no name a microVM removes: their shared memory objects
     /// are `shm_rule`'s (`shm_unlink` is decided by `ipc-posix-shm*`), and
@@ -663,13 +668,8 @@ mod macos {
                 (root.join(inside), [Some(root.to_owned()), netns.map(Path::to_owned)])
             }
             None => {
-                let dir = crate::platform::net::user_endpoint_dir()
-                    .map_err(|err| SandboxError::Install(format!("network endpoint directory: {err}")))?;
-                // The directory itself may not exist yet; its parent does.
-                let parent = dir.parent().unwrap_or(&dir);
-                let parent = parent.canonicalize().map_err(|err| fail("directory", parent, err))?;
                 let tmp = tmp.canonicalize().map_err(|err| fail("temporary directory", &tmp, err))?;
-                (tmp, [Some(parent.join("firecracker-net")), None])
+                (tmp, [None, None])
             }
         };
         let narrowed = format!("(extension \"{}\")", NARROWED.to_str().unwrap());
@@ -681,6 +681,9 @@ mod macos {
         rule.push_str(&format!(
             "(allow file-write-unlink (require-all {narrowed} (vnode-type FIFO) (prefix \"{fifo}\")))\n"
         ));
+        if root.is_none() {
+            rule.push_str(&format!("(allow file-write-unlink (require-all {narrowed} (vnode-type SOCKET)))\n"));
+        }
         for dir in sockets.iter().flatten() {
             rule.push_str(&format!(
                 "(allow file-write-unlink (require-all {narrowed} (vnode-type SOCKET) (subpath \"{}\")))\n",
@@ -2754,11 +2757,8 @@ mod macos {
                 "endpoint" => socket(base.join("net").join(format!("e-{n}"))),
                 "socket" => socket(base.join(format!("s-{n}"))),
                 "free-fifo" => fifo(&free_tmp, pid),
-                "free-endpoint" => {
-                    let dir = crate::platform::net::user_endpoint_dir().unwrap();
-                    std::fs::create_dir_all(&dir).unwrap();
-                    socket(dir.join(format!("wick-u-{pid}-{n}")))
-                }
+                // At a path the operator names, as boot-test's net stage does.
+                "free-endpoint" => socket(free_tmp.join(format!("wick-ep-{pid}-{n}"))),
                 _ => base.join(format!("outside-{tag}")),
             };
             let victim = c(&victim);
