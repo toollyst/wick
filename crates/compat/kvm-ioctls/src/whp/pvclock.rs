@@ -15,8 +15,14 @@
 //! (`WHvCapabilityCodeProcessorClockFrequency`) and is the same on every
 //! vCPU, so one reference pair `(tsc, ns)` serves every vCPU and the clock is
 //! stable (`PVCLOCK_TSC_STABLE_BIT`), as KVM's master clock is. `ns` is the
-//! VM clock of `get_clock`/`set_clock`; a `set_clock` (snapshot restore)
-//! drops the reference, and the restored vCPUs' MSR writes take a new one.
+//! VM clock of `get_clock`/`set_clock`. A `set_clock` (snapshot restore)
+//! drops the reference and starts a new clock generation: upstream restores
+//! the vCPUs' MSRs, and so publishes their time info, before it sets the
+//! clock, so each vCPU publishes its time info again before it next enters
+//! the guest, under a reference taken then, as KVM does on a clock update
+//! request (`KVM_REQ_CLOCK_UPDATE`). Without it, a restored guest's kvm-clock
+//! restarts from the new VM's clock before `set_clock`, near 0, and goes
+//! backwards.
 
 use std::sync::Mutex;
 
@@ -93,12 +99,17 @@ pub(crate) struct State {
     reference: Option<(u64, u64)>,
     /// The last `MSR_KVM_WALL_CLOCK_NEW` value.
     pub(crate) wall_msr: u64,
+    /// Counts the times the VM clock was set: a vCPU whose time info was
+    /// published under an older one publishes it again.
+    pub(crate) generation: u64,
 }
 
 impl State {
-    /// Forgets the reference (the VM clock was set).
+    /// Forgets the reference and starts a new generation (the VM clock was
+    /// set).
     pub(crate) fn reset(&mut self) {
         self.reference = None;
+        self.generation += 1;
     }
 }
 
@@ -225,6 +236,18 @@ mod tests {
             let h = scale(hz * 3600, shift, mul);
             assert!(h.abs_diff(3_600_000_000_000) < 3_600_000, "{hz} Hz: {h} ns");
         }
+    }
+
+    // A snapshot restore publishes the vCPUs' time info (their MSRs) before
+    // it sets the clock: setting it must start a new generation, so each
+    // vCPU publishes again under a reference taken after it.
+    #[test]
+    fn test_set_clock_starts_a_new_generation() {
+        let mut state = State { reference: Some((1_000, 2_000)), ..State::default() };
+        let before = state.generation;
+        state.reset();
+        assert_eq!(state.reference, None);
+        assert_eq!(state.generation, before + 1);
     }
 
     #[test]
