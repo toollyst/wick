@@ -113,13 +113,19 @@ fn fcntl_or(fd: c_int, get: c_int, set: c_int, flag: c_int) -> bool {
 /// FIFO without a reader fails with `EPIPE` and raises no `SIGPIPE`.
 const F_SETNOSIGPIPE: c_int = 73;
 
+/// What a timer's FIFO is named in the temporary directory
+/// (`.timerfd-<pid>-<n>`): the host sandbox lets a narrowed process remove
+/// a FIFO so named of its own (`vmm::ext::sandbox`), as it lets it remove
+/// an eventfd's.
+pub const TIMERFD_FIFO_PREFIX: &str = ".timerfd-";
+
 /// An unnamed FIFO: (the caller's descriptor, open for reading and writing;
 /// the timer thread's, open for writing, non-blocking, without `SIGPIPE`).
 fn unnamed_fifo() -> Option<(OwnedFd, OwnedFd)> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     for _ in 0..16 {
         let path = std::env::temp_dir().join(std::format!(
-            ".timerfd-{}-{}",
+            "{TIMERFD_FIFO_PREFIX}{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

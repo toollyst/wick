@@ -83,6 +83,10 @@ pub use super::backend::net::simulator;
 /// lets a running microVM remove their sockets).
 #[cfg(target_os = "macos")]
 pub use super::backend::net::user_endpoint_dir;
+/// Binding an endpoint's socket (`ext::sandbox`'s tests: what a narrowed
+/// microVM may bind).
+#[cfg(all(target_os = "macos", test))]
+pub(crate) use super::backend::net::bind as bind_endpoint;
 
 #[cfg(test)]
 mod tests {

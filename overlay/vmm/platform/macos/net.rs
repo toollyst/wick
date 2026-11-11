@@ -153,6 +153,10 @@ pub(crate) fn dgram_socket() -> io::Result<OwnedFd> {
 
 /// Binds `sock` at `path`. A socket file nobody listens on any more is
 /// replaced; one in use fails with `EBUSY`, as a TAP opened twice does.
+/// Once the sandbox is narrowed (a device hot-plugged into a running
+/// microVM), a stale socket file is not replaced: removing it is setup's
+/// (`vmm::ext::sandbox`'s unlink rule), so the bind fails with
+/// `EADDRINUSE`, which the API reports, and the microVM runs on.
 pub(crate) fn bind(sock: &OwnedFd, path: &Path) -> io::Result<()> {
     let (addr, len) = sockaddr(path)?;
     let try_bind = || {
@@ -166,6 +170,9 @@ pub(crate) fn bind(sock: &OwnedFd, path: &Path) -> io::Result<()> {
     };
     match try_bind() {
         Err(err) if err.raw_os_error() == Some(libc::EADDRINUSE) => {
+            if crate::ext::sandbox::narrowed() {
+                return Err(err);
+            }
             let probe = dgram_socket()?;
             // SAFETY: connect with a valid address.
             let ret =
@@ -359,11 +366,11 @@ impl Endpoint {
 }
 
 // No `Drop`: the socket file stays when the device goes, as the API socket
-// does, and the next bind at the path replaces it (`bind`,
-// `test_stale_endpoint_replaced`). A running microVM may not remove a
-// socket: upstream's filters have no `unlink`, and the host sandbox lets
-// the run phase remove only this process's eventfd FIFOs
-// (`vmm::ext::sandbox`).
+// does, and the next bind at the path replaces it while the microVM is
+// built (`bind`, `test_stale_endpoint_replaced`). A running microVM may not
+// remove a socket: upstream's filters have no `unlink`, and the host sandbox
+// lets the run phase remove only this process's eventfd and timer FIFOs
+// (`vmm::ext::sandbox`); a device hot-plugged at a stale path is refused.
 
 #[derive(Debug)]
 enum Backend {

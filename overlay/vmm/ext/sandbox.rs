@@ -57,8 +57,8 @@ pub enum SandboxError {
 pub use macos::{
     API_FCNTL_COMMANDS, API_MACH_TRAPS, API_MIG_ROUTINES, API_SYSCALLS, FCNTL_COMMANDS,
     FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MEASURED_MAJORS, MIG_ROUTINES,
-    PROFILE, RUN_DENIED_OPERATIONS, SYSCALLS, Skip, UNFILTERED_SYSCALLS, api_profile, apply,
-    apply_api,
+    PROFILE, RUN_DENIED_OPERATIONS, SETUP_MIG_ROUTINES_IF_DEFINED, SYSCALLS, Skip,
+    UNFILTERED_SYSCALLS, api_profile, apply, apply_api, narrowed,
     denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select, selected,
 };
 
@@ -114,7 +114,7 @@ mod macos {
 (deny default)
 ; Unix sockets only: API server, vsock backends, console. Binding one is
 ; setup's (RUN_DENIED_OPERATIONS), as on Linux the VMM thread's filter has no
-; bind.
+; bind, but for a hot-plugged network device's endpoint (run_rule).
 (allow network-inbound (local unix-socket))
 (allow network-outbound (remote unix-socket))
 ; Guest memory backed by POSIX shared memory (memfd_create): only the
@@ -468,11 +468,19 @@ mod macos {
     /// [`MIG_ROUTINES`].
     pub const SETUP_MIG_ROUTINES: &[&str] = &[
         "host_get_clock_service", "_mach_make_memory_entry", "mach_memory_entry_ownership",
-        "mach_vm_copy", "mach_vm_reallocate", "vm_reallocate", "host_info", "task_info_from_user",
+        "mach_vm_copy", "host_info", "task_info_from_user",
         "mach_port_set_attributes", "mach_port_request_notification",
         "mach_port_get_context_from_user", "task_restartable_ranges_register",
         "mach_voucher_attr_command",
     ];
+
+    /// MIG routines of the setup phase that macOS 26 added (measured on
+    /// macOS 27: a guest's memory is reallocated by libmalloc through them;
+    /// on macOS 15 the names are unbound and a profile naming them does not
+    /// compile, measured by CI's macos-15 job), allowed where the kernel
+    /// defines them. An explicit list, so that a misspelt name in
+    /// [`SETUP_MIG_ROUTINES`] or [`MIG_ROUTINES`] still fails to compile.
+    pub const SETUP_MIG_ROUTINES_IF_DEFINED: &[&str] = &["mach_vm_reallocate", "vm_reallocate"];
 
     /// Mach traps of [`MACH_TRAPS`]' kind that only newer macOS releases have
     /// (allowed where Seatbelt knows them). Measured: libmalloc's deferred
@@ -645,7 +653,7 @@ mod macos {
             shm_rule(std::process::id()),
             syscall_rule(),
             operation_rule(),
-            run_rule(),
+            run_rule(root, netns)?,
             unlink_rule(root, std::process::id())?
         ))
     }
@@ -666,10 +674,13 @@ mod macos {
 
     /// The names a running microVM may remove (`unlink`, `unlinkat`; also
     /// `rmdir` and the old name of `rename`, which Seatbelt decides by the
-    /// same operation, `file-write-unlink`), after [`narrow`]: an eventfd's
-    /// FIFO only, which vmm-sys-util names `.eventfd-<pid>-<n>` in the
-    /// temporary directory and removes once open (an eventfd made when the
-    /// guest activates a device). Any other name raises SIGSYS, as upstream's
+    /// same operation, `file-write-unlink`), after [`narrow`]: its own
+    /// eventfds' and timers' FIFOs only, which vmm-sys-util names
+    /// `.eventfd-<pid>-<n>` and the compatibility libc `.timerfd-<pid>-<n>`
+    /// in the temporary directory and remove once open (an eventfd made when
+    /// the guest activates a device; a timer made for a hot-plugged device's
+    /// rate limiter, where Linux's filter allows `timerfd_create`). Any other
+    /// name raises SIGSYS, as upstream's
     /// filters have no `unlink` (Linux's eventfd and tap have no name): a
     /// network endpoint's socket is left behind when the device goes, as
     /// the API socket is, and the next bind at the path replaces a stale one
@@ -699,14 +710,16 @@ mod macos {
                 .map_err(|err| SandboxError::Install(format!("temporary directory {tmp:?}: {err}")))?,
         };
         let narrowed = format!("(extension \"{}\")", NARROWED.to_str().unwrap());
-        let fifo = quoted(&tmp.join(format!("{}{pid}-", vmm_sys_util::eventfd::FIFO_PREFIX)), "FIFO")?;
         let mut rule = format!("(deny file-write-unlink {narrowed} (with send-signal SIGSYS))\n");
         // Discovery build: allowed and reported instead.
         #[cfg(wick_sandbox_discovery)]
         rule.push_str(&format!("(allow file-write-unlink {narrowed} (with report))\n"));
-        rule.push_str(&format!(
-            "(allow file-write-unlink (require-all {narrowed} (vnode-type FIFO) (prefix \"{fifo}\")))\n"
-        ));
+        for prefix in [vmm_sys_util::eventfd::FIFO_PREFIX, libc::TIMERFD_FIFO_PREFIX] {
+            let fifo = quoted(&tmp.join(format!("{prefix}{pid}-")), "FIFO")?;
+            rule.push_str(&format!(
+                "(allow file-write-unlink (require-all {narrowed} (vnode-type FIFO) (prefix \"{fifo}\")))\n"
+            ));
+        }
         Ok(rule)
     }
 
@@ -715,14 +728,18 @@ mod macos {
     /// changing a file's mode, owner, flags, times, extended attributes or
     /// ACL, and cloning one. They raise SIGSYS, as `chmod`, `fchmod`,
     /// `chown`, `utimensat`, `setxattr` and `copy_file_range` are in none
-    /// of upstream's filters. And binding a Unix socket, which the
+    /// of upstream's filters. And binding a socket, which the
     /// `network-inbound` rule allows until then (it decides a bind no
     /// `network-bind` rule matches; this one, for the same operation and
     /// with a filter, is the more specific, measured): as Linux's VMM filter
-    /// has no `bind`, every socket Firecracker binds (network endpoints, the
-    /// vsock device's) is bound while the microVM is built or restored.
-    /// Seatbelt decides their system calls by these operations, not by
-    /// number ([`UNFILTERED_SYSCALLS`]).
+    /// has no `bind`, the sockets Firecracker binds while the microVM is
+    /// built or restored (network endpoints, the vsock device's) are bound
+    /// then; but for the endpoint of a network device hot-plugged into a
+    /// running microVM, which Linux's filter lets open its TAP (`openat`,
+    /// `ioctl`): a Unix socket in the jail's network, or outside a jail at
+    /// the operator's path, binds after [`narrow`] too (`run_rule`). Seatbelt
+    /// decides their system calls by these operations, not by number
+    /// ([`UNFILTERED_SYSCALLS`]).
     pub const RUN_DENIED_OPERATIONS: &[&str] = &[
         "file-write-mode", "file-write-owner", "file-write-flags", "file-write-times",
         "file-write-xattr", "file-write-acl", "file-write-setugid", "file-clone",
@@ -776,9 +793,14 @@ mod macos {
     /// The rules of the run phase that come after the file rule: the
     /// operations of [`RUN_DENIED_OPERATIONS`] and the `fcntl` commands
     /// outside [`FCNTL_COMMANDS`] raise SIGSYS once the process holds the
-    /// narrowed extension.
+    /// narrowed extension; but a Unix socket binds where setup could bind
+    /// one, for a hot-plugged network device's endpoint (a rule with a
+    /// filter: the more specific one decides): in the jail (`root`) and its
+    /// network (`netns`), or anywhere outside a jail (`root` is `None`). An
+    /// IP socket never binds after [`narrow`], and a stream socket bound
+    /// then cannot listen (`listen` is in [`SETUP_SYSCALLS`]).
     #[allow(unexpected_cfgs)]
-    fn run_rule() -> String {
+    fn run_rule(root: Option<&Path>, netns: Option<&Path>) -> Result<String, SandboxError> {
         let narrowed = format!("(extension \"{}\")", NARROWED.to_str().unwrap());
         let mut rule = format!(
             "(deny {} {narrowed} (with send-signal SIGSYS))\n",
@@ -790,8 +812,19 @@ mod macos {
             "(allow {} {narrowed} (with report))\n",
             RUN_DENIED_OPERATIONS.join(" ")
         ));
+        if root.is_none() {
+            rule.push_str(&format!("(allow network-bind (require-all {narrowed} (local unix-socket)))\n"));
+        }
+        for (dir, what) in [(root, "jail"), (netns, "network directory")] {
+            if let Some(dir) = dir {
+                let dir = quoted(dir, what)?;
+                rule.push_str(&format!(
+                    "(allow network-bind (require-all {narrowed} (local unix-socket) (subpath \"{dir}\")))\n"
+                ));
+            }
+        }
         rule.push_str(&fcntl_rule(&narrowed, FCNTL_COMMANDS));
-        rule
+        Ok(rule)
     }
 
     /// What a denied operation does: on Linux a system call outside a
@@ -941,6 +974,11 @@ mod macos {
                 "(when (defined? 'MSC_{name}) (allow syscall-mach (machtrap-number MSC_{name})))\n"
             ));
         }
+        for name in SETUP_MIG_ROUTINES_IF_DEFINED {
+            rule.push_str(&format!(
+                "(when (defined? '{name}) (allow syscall-mig (require-all (kernel-mig-routine {name}) {setup})))\n"
+            ));
+        }
         rule
     }
 
@@ -1074,6 +1112,13 @@ mod macos {
         INSTALLED.store(true, Ordering::Relaxed);
         state.narrowed = Some(narrowed);
         Ok(())
+    }
+
+    /// Whether [`narrow`] has run: what a running microVM may still do
+    /// differs from what building it may (`platform::net::bind` replaces a
+    /// stale socket only before).
+    pub fn narrowed() -> bool {
+        STATE.lock().unwrap().narrowed_done
     }
 
     /// Ends the setup phase for good: takes the narrowed extension, after
@@ -2108,19 +2153,34 @@ mod macos {
             (addr, len)
         }
 
-        // Binding a Unix socket is setup's only, as Linux's VMM filter has no
-        // bind: a datagram endpoint and a stream socket bind before narrow(),
-        // and after it binding either raises SIGSYS (RUN_DENIED_OPERATIONS),
-        // in a jail's network too.
+        // Binding a socket is setup's, as Linux's VMM filter has no bind,
+        // but for a hot-plugged network device's endpoint, which Linux's
+        // filter lets open its TAP: after narrow() a Unix socket binds
+        // where setup could bind one (the jail, its network, or outside a
+        // jail the operator's path: RUN_DENIED_OPERATIONS, run_rule), an IP
+        // socket raises SIGSYS, a stream socket bound then cannot listen,
+        // a path outside the jail fails with EPERM (the file rule's, as a
+        // file there), and at a stale socket's path platform::net::bind
+        // fails with EADDRINUSE (replacing it would remove a name) and the
+        // process runs on.
         #[test]
-        fn test_unix_bind_is_setups_only() {
+        fn test_unix_bind_after_narrow_is_where_setup_binds() {
             use std::os::unix::process::ExitStatusExt;
             let base = std::env::temp_dir()
                 .canonicalize()
                 .unwrap()
                 .join(format!("wick-bind-{}", std::process::id()));
             let (jail, net) = (base.join("jail"), base.join("net"));
-            for case in ["datagram", "stream", "datagram-network"] {
+            for case in [
+                "datagram",
+                "datagram-outside",
+                "stream",
+                "datagram-network",
+                "datagram-network-stale",
+                "free",
+                "free-stale",
+                "free-ip",
+            ] {
                 std::fs::create_dir_all(&jail).unwrap();
                 std::fs::create_dir_all(&net).unwrap();
                 let out = child(
@@ -2128,8 +2188,35 @@ mod macos {
                     &[("WICK_TEST_CASE", case), ("WICK_TEST_JAIL", jail.to_str().unwrap())],
                 );
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
-                assert!(stdout.contains("SETUP-BIND-OK") && !stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+                assert!(stdout.contains("SETUP-BIND-OK"), "{case}: {:?}\n{stdout}", out.status);
+                if case == "free-ip" {
+                    assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
+                    assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+                } else if case == "datagram-outside" {
+                    // The file rule decides a socket file outside the jail,
+                    // with EPERM, as a file there (measured; the bind rule
+                    // comes later).
+                    let err = format!("LATE-BIND-ERR {}", std::io::Error::from_raw_os_error(libc::EPERM));
+                    assert!(
+                        out.status.success() && stdout.contains(&err) && stdout.contains("CHILD-SURVIVED"),
+                        "{case}: {:?}\n{stdout}",
+                        out.status
+                    );
+                } else if case == "stream" {
+                    assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
+                    assert!(stdout.contains("LATE-BIND-OK") && !stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+                } else {
+                    let late = if case.ends_with("-stale") { "STALE-REFUSED" } else { "LATE-BIND-OK" };
+                    assert!(
+                        out.status.success() && stdout.contains(late) && stdout.contains("CHILD-SURVIVED"),
+                        "{case}: {:?}\n{stdout}",
+                        out.status
+                    );
+                    if case.ends_with("-stale") {
+                        let dir = if case.starts_with("free") { &base } else { &net };
+                        assert!(dir.join("late").exists(), "{case}: the stale socket was removed");
+                    }
+                }
                 std::fs::remove_dir_all(&base).unwrap();
             }
         }
@@ -2139,31 +2226,71 @@ mod macos {
         fn bind_after_narrow_child() {
             let case = std::env::var("WICK_TEST_CASE").unwrap();
             let jail = std::path::PathBuf::from(std::env::var("WICK_TEST_JAIL").unwrap());
-            let net = jail.parent().unwrap().join("net");
-            let (dir, network) = match case.as_str() {
-                "datagram-network" => (net.clone(), Some(net.as_path())),
-                _ => (jail.clone(), None),
+            let base = jail.parent().unwrap().to_owned();
+            let net = base.join("net");
+            let (dir, root, network) = match case.as_str() {
+                "datagram-network" | "datagram-network-stale" => (net.clone(), Some(jail.as_path()), Some(net.as_path())),
+                "free" | "free-stale" | "free-ip" => (base.clone(), None, None),
+                _ => (jail.clone(), Some(jail.as_path()), None),
             };
-            let profile = profile_for(Some(&jail), network).unwrap();
+            // The late bind's directory: outside the jail for that case.
+            let late_dir = if case == "datagram-outside" { base.clone() } else { dir.clone() };
+            let profile = profile_for(root, network).unwrap();
             COMPILED
                 .set((Compiled::here(&profile).unwrap(), Compiled::here(&api_profile()).unwrap()))
                 .unwrap();
             select(Policy::Default);
             apply().unwrap();
-            let bind = |name: &str| {
+            let bind = |dir: &std::path::Path, name: &str| {
                 let kind = if case == "stream" { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
                 // SAFETY: plain calls on a socket made here.
                 let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
                 assert!(fd >= 0);
                 let (addr, len) = sockaddr_un(&dir.join(name));
                 // SAFETY: a socket address of the given length.
-                unsafe { libc::bind(fd, (&raw const addr).cast(), len) }
+                (unsafe { libc::bind(fd, (&raw const addr).cast(), len) }, fd)
             };
-            assert_eq!(bind("early"), 0, "{}", std::io::Error::last_os_error());
+            assert_eq!(bind(&dir, "early").0, 0, "{}", std::io::Error::last_os_error());
             println!("SETUP-BIND-OK");
+            if case.ends_with("-stale") {
+                // A process that died left its socket file at the path.
+                assert_eq!(bind(&dir, "late").0, 0, "{}", std::io::Error::last_os_error());
+            }
             narrow().unwrap();
             println!("NARROWED");
-            bind("late");
+            if case == "free-ip" {
+                // SAFETY: plain calls on a socket made here.
+                let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+                assert!(fd >= 0);
+                // SAFETY: plain data.
+                let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                addr.sin_family = libc::sa_family_t::try_from(libc::AF_INET).unwrap();
+                addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+                let len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_in>()).unwrap();
+                // SAFETY: a socket address of the given length.
+                unsafe { libc::bind(fd, (&raw const addr).cast(), len) };
+            } else if case.ends_with("-stale") {
+                // SAFETY: plain calls on a socket made here.
+                let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+                assert!(fd >= 0);
+                // SAFETY: a descriptor made above, owned by nothing else.
+                let sock = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+                let err = crate::platform::net::bind_endpoint(&sock, &dir.join("late")).unwrap_err();
+                assert_eq!(err.raw_os_error(), Some(libc::EADDRINUSE), "{err}");
+                println!("STALE-REFUSED");
+            } else {
+                let (ret, fd) = bind(&late_dir, "late");
+                if ret == 0 {
+                    println!("LATE-BIND-OK");
+                } else {
+                    println!("LATE-BIND-ERR {}", std::io::Error::last_os_error());
+                }
+                if case == "stream" {
+                    // Bound, it cannot listen: listen is setup's.
+                    // SAFETY: a plain call on the socket bound above.
+                    unsafe { libc::listen(fd, 1) };
+                }
+            }
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
         }
@@ -2303,6 +2430,42 @@ mod macos {
             ] {
                 assert!(!MIG_ROUTINES.contains(&denied), "{denied}");
             }
+        }
+
+        #[test]
+        fn test_setup_mig_routines_are_distinct() {
+            let mut names = SETUP_MIG_ROUTINES.to_vec();
+            names.extend(SETUP_MIG_ROUTINES_IF_DEFINED);
+            names.extend(MIG_ROUTINES);
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(
+                names.len(),
+                SETUP_MIG_ROUTINES.len() + SETUP_MIG_ROUTINES_IF_DEFINED.len() + MIG_ROUTINES.len()
+            );
+            assert!(SETUP_MIG_ROUTINES_IF_DEFINED.contains(&"mach_vm_reallocate"));
+        }
+
+        // The profiles compile on this host, whatever its macOS major: a
+        // name the kernel does not define (a MIG routine of a later macOS,
+        // as mach_vm_reallocate on macOS 15) fails the compile, naming it.
+        #[test]
+        fn test_profiles_compile_on_this_major() {
+            let major = macos_major();
+            let base = std::env::temp_dir().join(format!("wick-compile-{}", std::process::id()));
+            let (jail, net) = (base.join("jail"), base.join("net"));
+            std::fs::create_dir_all(&jail).unwrap();
+            std::fs::create_dir_all(&net).unwrap();
+            for (name, profile) in [
+                ("no jail", profile_for(None, None)),
+                ("jail", profile_for(Some(&jail), None)),
+                ("jail with a network", profile_for(Some(&jail), Some(&net))),
+                ("API process", Ok(api_profile())),
+            ] {
+                let profile = profile.unwrap_or_else(|e| panic!("{name}: {e}"));
+                Compiled::here(&profile).unwrap_or_else(|e| panic!("{name} on macOS {major}: {e}"));
+            }
+            std::fs::remove_dir_all(&base).unwrap();
         }
 
         #[test]
@@ -2739,24 +2902,26 @@ mod macos {
         }
 
         /// The names a running microVM removes, by the calls that remove them
-        /// (cases of `unfiltered_child`): in a jail, an eventfd's FIFO in its
-        /// /tmp, a network endpoint's socket in its network, a memfd's
-        /// shared memory object and a huge page one's; outside a jail, a
-        /// FIFO in the temporary directory and an endpoint's socket in
-        /// `firecracker-net`.
+        /// (cases of `unfiltered_child`): in a jail, an eventfd's and a
+        /// timer's FIFO in its /tmp, a memfd's shared memory object and a
+        /// huge page one's; outside a jail, an eventfd's FIFO in the
+        /// temporary directory.
         const ALLOWED_NAMES: &[(&str, &[&str])] =
-            &[("unlink unlinkat", &["fifo", "free-fifo"]), ("shm_unlink", &["memfd", "huge"])];
+            &[("unlink unlinkat", &["fifo", "free-fifo", "timer"]), ("shm_unlink", &["memfd", "huge"])];
 
         /// Names a running microVM does not remove: a file in the jail, a
         /// file at an eventfd FIFO's name, a network endpoint's socket in
         /// the jail's network and a socket elsewhere in the jail, a FIFO
-        /// with another process's eventfd name, and outside a jail a file
-        /// in the temporary directory and an endpoint's socket at a path of
-        /// the operator's choosing. (A name outside the jail is the
+        /// with another process's eventfd or timer name, and outside a jail
+        /// a file in the temporary directory and an endpoint's socket at a
+        /// path of the operator's choosing. (A name outside the jail is the
         /// unlifted case.)
         const DENIED_NAMES: &[(&str, &[&str])] = &[(
             "unlink unlinkat",
-            &["inside", "fifo-name", "endpoint", "socket", "fifo-other", "free-file", "free-endpoint"],
+            &[
+                "inside", "fifo-name", "endpoint", "socket", "fifo-other", "timer-other", "free-file",
+                "free-endpoint",
+            ],
         )];
 
         /// A POSIX IPC name of this test process's case `i` (31 bytes at most).
@@ -2796,8 +2961,8 @@ mod macos {
             // What unlink and unlinkat remove: a file outside the jail,
             // unless a case of ALLOWED_NAMES or DENIED_NAMES. Each is made
             // here, before the sandbox.
-            let fifo = |dir: &std::path::Path, pid: u32| {
-                let path = dir.join(format!("{}{pid}-0", vmm_sys_util::eventfd::FIFO_PREFIX));
+            let fifo = |dir: &std::path::Path, prefix: &str, pid: u32| {
+                let path = dir.join(format!("{prefix}{pid}-0"));
                 // SAFETY: a NUL-terminated path.
                 assert_eq!(unsafe { libc::mkfifo(c(&path).as_ptr(), 0o600) }, 0, "{path:?}");
                 path
@@ -2813,14 +2978,16 @@ mod macos {
             let free_tmp = std::env::temp_dir().canonicalize().unwrap();
             let victim = match lift.as_str() {
                 "inside" => jail.join(format!("inside-{tag}")),
-                "fifo" => fifo(&jail.join("tmp"), pid),
+                "fifo" => fifo(&jail.join("tmp"), vmm_sys_util::eventfd::FIFO_PREFIX, pid),
+                "timer" => fifo(&jail.join("tmp"), libc::TIMERFD_FIFO_PREFIX, pid),
+                "timer-other" => fifo(&jail.join("tmp"), libc::TIMERFD_FIFO_PREFIX, pid + 1),
                 "fifo-name" => {
                     file(jail.join("tmp").join(format!("{}{pid}-1", vmm_sys_util::eventfd::FIFO_PREFIX)))
                 }
-                "fifo-other" => fifo(&jail.join("tmp"), pid + 1),
+                "fifo-other" => fifo(&jail.join("tmp"), vmm_sys_util::eventfd::FIFO_PREFIX, pid + 1),
                 "endpoint" => socket(base.join("net").join(format!("e-{n}"))),
                 "socket" => socket(base.join(format!("s-{n}"))),
-                "free-fifo" => fifo(&free_tmp, pid),
+                "free-fifo" => fifo(&free_tmp, vmm_sys_util::eventfd::FIFO_PREFIX, pid),
                 // At a path the operator names, as boot-test's net stage does.
                 "free-endpoint" => socket(free_tmp.join(format!("wick-ep-{pid}-{n}"))),
                 _ => base.join(format!("outside-{tag}")),
