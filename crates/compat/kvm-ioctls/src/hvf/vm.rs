@@ -148,6 +148,10 @@ pub(crate) struct VmInner {
     /// Incremented when `vtimer_offset` changes; vCPUs apply the new offset
     /// before they next run.
     pub(crate) vtimer_gen: AtomicU64,
+    /// The PSCI version the guest is given (`KVM_REG_ARM_PSCI_VERSION`):
+    /// [`regs::PSCI_VERSION_1_0`], or 0.2 once a snapshot of a VM given
+    /// 0.2 is restored. One for the VM, as KVM's.
+    pub(crate) psci_version: AtomicU64,
     /// vCPUs created with `create_vcpu` whose Hypervisor.framework vCPU does
     /// not exist yet (it is created on the first `run()`).
     uncreated: AtomicUsize,
@@ -620,6 +624,7 @@ impl VmFd {
             // SAFETY: plain call.
             vtimer_offset: AtomicU64::new(unsafe { mach_absolute_time() }),
             vtimer_gen: AtomicU64::new(0),
+            psci_version: AtomicU64::new(super::regs::PSCI_VERSION_1_0),
             uncreated: AtomicUsize::new(0),
             deferred_spis: Mutex::new(Vec::new()),
             deferred_active: Mutex::new(Vec::new()),
@@ -1298,5 +1303,41 @@ mod tests {
             assert!((0.1..2.0).contains(&elapsed(*c)), "{:.3}s", elapsed(*c));
         }
         assert!((elapsed(counts[1]) - elapsed(counts[0])).abs() < 0.05, "{counts:?}");
+    }
+
+    #[test]
+    fn test_psci_version_is_the_vms() {
+        // A new VM's guest is given PSCI 1.0 (SMCCC 1.1 and KVM's services
+        // behind it); a snapshot of a VM given 0.2 restores 0.2, for the VM,
+        // as on KVM; no other version is taken.
+        use super::super::regs::{PSCI_VERSION_0_2, PSCI_VERSION_1_0, PSCI_VERSION_ID};
+        let vm = Kvm::new().unwrap().create_vm().unwrap();
+        let mut kvi = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        let vcpus: Vec<_> = (0..2)
+            .map(|i| {
+                let v = vm.create_vcpu(i).unwrap();
+                v.vcpu_init(&kvi).unwrap();
+                v
+            })
+            .collect();
+        let read = |v: &VcpuFd| {
+            let mut buf = [0u8; 8];
+            v.get_one_reg(PSCI_VERSION_ID, &mut buf).unwrap();
+            u64::from_le_bytes(buf)
+        };
+        assert_eq!(read(&vcpus[0]), PSCI_VERSION_1_0);
+        let err = vcpus[0].set_one_reg(PSCI_VERSION_ID, &3u64.to_le_bytes()).unwrap_err();
+        assert_eq!(err.errno(), libc::EINVAL);
+        vcpus[0].set_one_reg(PSCI_VERSION_ID, &PSCI_VERSION_0_2.to_le_bytes()).unwrap();
+        let mut v1 = vcpus.into_iter().nth(1).unwrap();
+        let seen = std::thread::spawn(move || {
+            v1.set_kvm_immediate_exit(1);
+            v1.run().unwrap_err();
+            read(&v1)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seen, PSCI_VERSION_0_2);
     }
 }

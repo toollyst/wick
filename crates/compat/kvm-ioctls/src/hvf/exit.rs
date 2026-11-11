@@ -224,7 +224,11 @@ pub fn sync_vector_offset(cpsr: u64) -> u64 {
     }
 }
 
-/// A PSCI 0.2 call, from the function id in W0 (SMC32 and SMC64 ids).
+/// A call through the SMCCC conduit (HVC or SMC), from the function id in
+/// W0 (SMC32 and SMC64 ids): the PSCI 1.0 calls, SMCCC 1.1's own and KVM's
+/// vendor hypervisor services, what KVM answers for a guest on Linux
+/// (arch/arm64/kvm/psci.c, hypercalls.c). Without SMCCC 1.1 a Linux guest
+/// finds no hypervisor services: no `ptp_kvm` clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Psci {
     /// PSCI_VERSION.
@@ -243,9 +247,29 @@ pub enum Psci {
     SystemOff,
     /// SYSTEM_RESET.
     SystemReset,
+    /// PSCI_FEATURES (PSCI 1.0): X1 a function id.
+    Features,
+    /// SMCCC_VERSION.
+    SmcccVersion,
+    /// SMCCC_ARCH_FEATURES: X1 a function id.
+    SmcccArchFeatures,
+    /// The vendor hypervisor service's UID (KVM's).
+    VendorHypUid,
+    /// KVM's vendor hypervisor features: a bitmap.
+    KvmFeatures,
+    /// KVM_PTP: X1 the counter, virtual (0) or physical (1).
+    KvmPtp,
     /// Any other id: NOT_SUPPORTED.
     NotSupported,
 }
+
+/// SMCCC 1.1.
+pub const SMCCC_VERSION_1_1: u64 = 0x1_0001;
+/// ARM_SMCCC_VENDOR_HYP_UID_KVM_REG_0..3: KVM's vendor hypervisor UID.
+pub const KVM_UID: [u64; 4] = [0xb66f_b428, 0xe911_c52e, 0x564b_caa9, 0x743a_004d];
+/// KVM's features bitmap: ARM_SMCCC_KVM_FUNC_FEATURES (0) and
+/// ARM_SMCCC_KVM_FUNC_PTP (1).
+pub const KVM_FEATURES: u64 = 0b11;
 
 impl Psci {
     /// The call `x0` names; only its low 32 bits are the function id.
@@ -259,9 +283,40 @@ impl Psci {
             0x8400_0006 => Psci::MigrateInfoType,
             0x8400_0008 => Psci::SystemOff,
             0x8400_0009 => Psci::SystemReset,
+            0x8400_000a => Psci::Features,
+            0x8000_0000 => Psci::SmcccVersion,
+            0x8000_0001 => Psci::SmcccArchFeatures,
+            0x8600_ff01 => Psci::VendorHypUid,
+            0x8600_0000 => Psci::KvmFeatures,
+            0x8600_0001 => Psci::KvmPtp,
             _ => Psci::NotSupported,
         }
     }
+
+    /// PSCI_FEATURES for function id `id`: whether it is implemented (0,
+    /// and for CPU_SUSPEND: the original power_state format, no OS-initiated
+    /// mode), as KVM answers (kvm_psci_1_x_call).
+    pub fn implemented(id: u64) -> bool {
+        matches!(
+            Psci::decode(id),
+            Psci::Version
+                | Psci::CpuSuspend
+                | Psci::CpuOff
+                | Psci::CpuOn
+                | Psci::AffinityInfo
+                | Psci::MigrateInfoType
+                | Psci::SystemOff
+                | Psci::SystemReset
+                | Psci::Features
+                | Psci::SmcccVersion
+        ) && id >> 32 == 0
+    }
+}
+
+/// KVM_PTP's four result words (kvm_ptp_get_time): the wall clock in
+/// nanoseconds and the counter, each as its upper and lower 32 bits.
+pub fn ptp_words(realtime_ns: u64, counter: u64) -> [u64; 4] {
+    [realtime_ns >> 32, realtime_ns & 0xffff_ffff, counter >> 32, counter & 0xffff_ffff]
 }
 
 #[cfg(test)]
@@ -316,5 +371,28 @@ mod tests {
         assert_eq!(Psci::decode(0xffff_ffff_8400_0008), Psci::SystemOff);
         assert_eq!(Psci::decode(0xc400_0003), Psci::CpuOn);
         assert_eq!(Psci::decode(0x8400_0005), Psci::NotSupported);
+        assert_eq!(Psci::decode(0x8400_000a), Psci::Features);
+        assert_eq!(Psci::decode(0x8000_0000), Psci::SmcccVersion);
+        assert_eq!(Psci::decode(0x8600_ff01), Psci::VendorHypUid);
+        assert_eq!(Psci::decode(0x8600_0001), Psci::KvmPtp);
+    }
+
+    #[test]
+    fn test_psci_features_and_ptp() {
+        // PSCI_FEATURES: the PSCI 1.0 calls and SMCCC_VERSION, nothing else.
+        for id in [0x8400_0000, 0xc400_0003, 0x8400_0009, 0x8400_000a, 0x8000_0000] {
+            assert!(Psci::implemented(id), "{id:#x}");
+        }
+        // MIGRATE, SYSTEM_SUSPEND, SYSTEM_RESET2, the workarounds, KVM's
+        // services (they are not PSCI), garbage in the upper half.
+        for id in [0x8400_0005, 0xc400_000e, 0x8400_0012, 0x8000_8000, 0x8600_0001, 1 << 32 | 0x8400_0000] {
+            assert!(!Psci::implemented(id), "{id:#x}");
+        }
+        assert_eq!(ptp_words(0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321), [
+            0x1234_5678,
+            0x9abc_def0,
+            0x0fed_cba9,
+            0x8765_4321
+        ]);
     }
 }

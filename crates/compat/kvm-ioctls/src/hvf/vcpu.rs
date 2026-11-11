@@ -40,8 +40,6 @@ const PSCI_RET_INVALID_PARAMS: i64 = -2;
 const PSCI_RET_ALREADY_ON: i64 = -4;
 /// "Trusted OS not present": no migration needed.
 const PSCI_TOS_NOT_PRESENT_MP: i64 = 2;
-/// PSCI 0.2.
-const PSCI_VERSION_0_2: i64 = 2;
 
 const MPIDR_AFFINITY_MASK: u64 = 0xff_00ff_ffff;
 /// `kvm_run.system_event.data` of a PSCI SYSTEM_OFF or SYSTEM_RESET exit:
@@ -351,6 +349,12 @@ impl VcpuFd {
     }
 
     fn get_reg_now(&self, hv: hv_vcpu_t, id: u64, out: &mut [u8]) -> Result<()> {
+        if regs::decode(id) == Some(Reg::PsciVersion) {
+            let v = self.vm()?.psci_version.load(Ordering::Relaxed);
+            let n = out.len().min(8);
+            out[..n].copy_from_slice(&v.to_le_bytes()[..n]);
+            return Ok(());
+        }
         read_reg(hv, id, out)
     }
 
@@ -377,6 +381,7 @@ impl VcpuFd {
                 .wrapping_sub(vm.vtimer_offset.load(Ordering::Acquire)),
             // SAFETY: plain call.
             Some(Reg::PhysicalCount) => unsafe { mach_absolute_time() },
+            Some(Reg::PsciVersion) => vm.psci_version.load(Ordering::Relaxed),
             _ => {
                 let reset = vm
                     .reset_regs
@@ -450,7 +455,8 @@ fn read_reg(hv: hv_vcpu_t, id: u64, out: &mut [u8]) -> Result<()> {
                 }
                 Reg::PhysicalCount => v = mach_absolute_time(),
                 Reg::Aarch32Spsr => {}
-                Reg::PsciVersion => v = regs::PSCI_VERSION_0_2,
+                // A new VM's; the VM's own is read in get_reg_now.
+                Reg::PsciVersion => v = regs::PSCI_VERSION_1_0,
             }
         }
         let n = out.len().min(8);
@@ -482,10 +488,20 @@ impl VcpuFd {
                     self.apply_vtimer_offset(hv, &vm)
                 }
                 Reg::Aarch32Spsr if v == 0 => Ok(()),
-                Reg::PsciVersion if v == regs::PSCI_VERSION_0_2 => Ok(()),
-                Reg::PhysicalCount | Reg::Aarch32Spsr | Reg::PsciVersion => err(libc::EINVAL),
+                Reg::PsciVersion => self.set_psci_version(v),
+                Reg::PhysicalCount | Reg::Aarch32Spsr => err(libc::EINVAL),
             }
         }
+    }
+
+    /// Sets the VM's PSCI version: 1.0, or 0.2 (a snapshot taken when 0.2
+    /// was the one offered). KVM also takes 1.1, which is not offered here.
+    fn set_psci_version(&self, v: u64) -> Result<()> {
+        if v != regs::PSCI_VERSION_0_2 && v != regs::PSCI_VERSION_1_0 {
+            return err(libc::EINVAL);
+        }
+        self.vm()?.psci_version.store(v, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Gives the vCPU the VM's counter offset if it changed since.
@@ -526,6 +542,12 @@ impl VcpuFd {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&data[..8]);
                 self.vm()?.set_virtual_count(u64::from_le_bytes(buf));
+            }
+            // So is the PSCI version.
+            None if reg == Reg::PsciVersion => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[..8]);
+                self.set_psci_version(u64::from_le_bytes(buf))?;
             }
             None => {
                 let mut pending = self.shared.pending.lock().unwrap();
@@ -779,12 +801,34 @@ impl VcpuFd {
         Ok(())
     }
 
-    /// Handles a PSCI call. Returns a system event to report, if any.
+    /// Handles a call through the SMCCC conduit (PSCI, SMCCC, KVM's vendor
+    /// services). Returns a system event to report, if any.
     fn psci(&self, hv: hv_vcpu_t) -> Result<Option<u32>> {
         let call = Psci::decode(self.reg(hv, HV_REG_X0)?);
         let x1 = self.reg(hv, HV_REG_X0 + 1)?;
+        let psci_1_0 = self.vm()?.psci_version.load(Ordering::Relaxed) == regs::PSCI_VERSION_1_0;
+        let words = match call {
+            Psci::SmcccVersion => Some([exit::SMCCC_VERSION_1_1, 0, 0, 0]),
+            // No SMCCC_ARCH_WORKAROUND_* (nor TRNG, PV time) is implemented:
+            // the guest relies on what its CPU features say, as on a host
+            // whose firmware has none.
+            Psci::SmcccArchFeatures => Some([PSCI_RET_NOT_SUPPORTED as u64, 0, 0, 0]),
+            Psci::VendorHypUid => Some(exit::KVM_UID),
+            Psci::KvmFeatures => Some([exit::KVM_FEATURES, 0, 0, 0]),
+            Psci::KvmPtp => Some(self.kvm_ptp(hv, x1)?),
+            _ => None,
+        };
+        if let Some(words) = words {
+            for (i, w) in words.into_iter().enumerate() {
+                self.set_reg(hv, HV_REG_X0 + i as hv_reg_t, w)?;
+            }
+            return Ok(None);
+        }
         let ret: i64 = match call {
-            Psci::Version => PSCI_VERSION_0_2,
+            Psci::Version if psci_1_0 => regs::PSCI_VERSION_1_0 as i64,
+            Psci::Version => regs::PSCI_VERSION_0_2 as i64,
+            Psci::Features if psci_1_0 && Psci::implemented(x1) => PSCI_RET_SUCCESS,
+            Psci::Features => PSCI_RET_NOT_SUPPORTED,
             Psci::CpuSuspend => {
                 self.wait_for_interrupt(hv)?;
                 PSCI_RET_SUCCESS
@@ -820,9 +864,43 @@ impl VcpuFd {
             Psci::SystemOff => return Ok(Some(KVM_SYSTEM_EVENT_SHUTDOWN)),
             Psci::SystemReset => return Ok(Some(KVM_SYSTEM_EVENT_RESET)),
             Psci::NotSupported => PSCI_RET_NOT_SUPPORTED,
+            Psci::SmcccVersion
+            | Psci::SmcccArchFeatures
+            | Psci::VendorHypUid
+            | Psci::KvmFeatures
+            | Psci::KvmPtp => unreachable!("answered above"),
         };
         self.set_reg(hv, HV_REG_X0, ret as u64)?;
         Ok(None)
+    }
+
+    /// KVM_PTP (kvm_ptp_get_time): the wall clock and the guest's virtual
+    /// (`counter` 0) or physical (1) counter at the same moment; another
+    /// counter is NOT_SUPPORTED. The wall clock is read between two counter
+    /// reads, and the counter given is their midpoint.
+    fn kvm_ptp(&self, hv: hv_vcpu_t, counter: u64) -> Result<[u64; 4]> {
+        let offset = match counter {
+            0 => {
+                let mut offset = 0;
+                // SAFETY: `hv` belongs to this thread.
+                check(unsafe { hv_vcpu_get_vtimer_offset(hv, &mut offset) })?;
+                offset
+            }
+            1 => 0,
+            _ => return Ok([PSCI_RET_NOT_SUPPORTED as u64, 0, 0, 0]),
+        };
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: plain calls; `ts` is a valid timespec.
+        let (before, after) = unsafe {
+            let before = mach_absolute_time();
+            libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
+            (before, mach_absolute_time())
+        };
+        let realtime = (ts.tv_sec as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(ts.tv_nsec as u64);
+        let now = before + (after - before) / 2;
+        Ok(exit::ptp_words(realtime, now.wrapping_sub(offset)))
     }
 
     fn find_vcpu(&self, mpidr: u64) -> Result<Option<Arc<VcpuShared>>> {

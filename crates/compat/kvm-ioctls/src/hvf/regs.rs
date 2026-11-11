@@ -34,7 +34,9 @@ pub enum Reg {
     /// AArch32 banked SPSRs (abt, und, irq, fiq). AArch32 is not offered, so
     /// they read as 0 and only 0 can be written.
     Aarch32Spsr,
-    /// `KVM_REG_ARM_PSCI_VERSION`: the PSCI version (0.2). Only that value can be written.
+    /// `KVM_REG_ARM_PSCI_VERSION`: the PSCI version the guest is given, 1.0
+    /// or 0.2 (a snapshot taken before 1.0 was offered). As KVM's, one for
+    /// the VM.
     PsciVersion,
 }
 
@@ -173,6 +175,11 @@ pub fn reg_list() -> Vec<u64> {
 
 /// PSCI 0.2 as encoded in `KVM_REG_ARM_PSCI_VERSION` (`major << 16 | minor`).
 pub const PSCI_VERSION_0_2: u64 = 2;
+/// PSCI 1.0, the version a new VM's guest is given.
+pub const PSCI_VERSION_1_0: u64 = 0x1_0000;
+
+/// KVM register id of `KVM_REG_ARM_PSCI_VERSION`.
+pub const PSCI_VERSION_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_FW;
 
 /// KVM register id of `SCTLR_EL1`.
 pub const SCTLR_ID: u64 = SYSREG | KVM_REG_SIZE_U64 | 0xc080;
