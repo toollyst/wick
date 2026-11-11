@@ -54,9 +54,10 @@ pub const CPU_ENV: &str = "WICK_JAIL_CPU";
 /// over.
 pub const MEMORY_ENV: &str = "WICK_JAIL_MEMORY";
 
-/// Environment variable through which the Windows jailer hands the jail's
-/// network over (`--netns`): the directory the network endpoints
-/// (`platform::net`) are made in, in place of the temporary directory.
+/// Environment variable through which the jailer hands the jail's network
+/// over (`--netns`): the absolute path of the directory the network
+/// endpoints (`platform::net`) are made in, in place of the temporary
+/// directory.
 pub const NETNS_ENV: &str = "WICK_NETNS";
 
 /// The API process's share of a jail's memory limit, in MiB: a process
@@ -108,6 +109,12 @@ pub enum JailError {
     MemoryLimit(u32, std::io::Error),
     /// Failed to make the API process: {0}
     ApiProcess(std::io::Error),
+    /// The jail's network {0:?} (WICK_NETNS): {1}
+    #[cfg(target_os = "macos")]
+    Netns(std::ffi::OsString, std::io::Error),
+    /// {0}
+    #[cfg(target_os = "macos")]
+    Sandbox(crate::ext::sandbox::SandboxError),
 }
 
 /// The jail's root directory, as a path outside the jail, if Firecracker was
@@ -123,10 +130,29 @@ pub fn enter() -> Result<(), JailError> {
 }
 
 /// The jail's network ([`NETNS_ENV`]): the directory the network endpoints
-/// are made in, if the jailer gave one.
-#[cfg(windows)]
+/// are made in, if the jailer gave one, as a path outside the jail.
+#[cfg(any(target_os = "macos", windows))]
 pub fn netns() -> Option<&'static Path> {
     imp::netns()
+}
+
+/// The jail's network directory, opened before the chroot: a jailed
+/// Firecracker reaches it only through this descriptor
+/// (`platform::net` resolves endpoint names against it).
+#[cfg(target_os = "macos")]
+pub fn netns_dir() -> Option<std::os::fd::BorrowedFd<'static>> {
+    imp::netns_dir()
+}
+
+/// Closes the jail's network directory ([`netns_dir`]) in the API process,
+/// which reaches no network, as upstream's API thread opens no interface.
+///
+/// # Safety
+/// The child of a fork, which never uses [`netns_dir`] afterwards.
+#[cfg(target_os = "macos")]
+pub unsafe fn close_netns_in_child() {
+    // SAFETY: the caller's contract.
+    unsafe { imp::close_netns_in_child() }
 }
 
 /// The CPU limit (percent of one CPU) [`enter`] applied, if any.
@@ -206,18 +232,62 @@ fn parse(value: &str) -> Result<Spec, JailError> {
 mod imp {
     use std::ffi::CString;
     use std::io::Error;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
 
     use super::{
-        CPU_ENV, ENV, JailError, MEMORY_ENV, Spec, parse, parse_cpu, parse_memory, share,
+        CPU_ENV, ENV, JailError, MEMORY_ENV, NETNS_ENV, Spec, parse, parse_cpu, parse_memory,
+        share,
     };
 
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     static CPU_LIMIT: OnceLock<u8> = OnceLock::new();
+    /// The jail's network: its path outside the jail, and the directory
+    /// opened before the chroot.
+    static NETNS: OnceLock<(PathBuf, OwnedFd)> = OnceLock::new();
 
     pub fn root() -> Option<&'static Path> {
         ROOT.get().map(PathBuf::as_path)
+    }
+
+    pub fn netns() -> Option<&'static Path> {
+        NETNS.get().map(|(path, _)| path.as_path())
+    }
+
+    pub fn netns_dir() -> Option<BorrowedFd<'static>> {
+        NETNS.get().map(|(_, fd)| fd.as_fd())
+    }
+
+    /// See [`super::close_netns_in_child`].
+    pub unsafe fn close_netns_in_child() {
+        if let Some((_, dir)) = NETNS.get() {
+            // SAFETY: the caller's contract: NETNS is not used in this
+            // process again, so its descriptor may go.
+            unsafe { libc::close(dir.as_raw_fd()) };
+        }
+    }
+
+    /// Opens the jail's network directory ([`super::NETNS_ENV`]), which
+    /// must be absolute, before the chroot (outside the jail no path
+    /// reaches it).
+    fn open_netns(value: &std::ffi::OsStr) -> Result<(PathBuf, OwnedFd), JailError> {
+        use std::os::unix::ffi::OsStrExt;
+        let fail = |e| JailError::Netns(value.to_owned(), e);
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(fail(Error::other("not an absolute path")));
+        }
+        let c_path = CString::new(value.as_bytes()).map_err(|_| fail(Error::other("a NUL in the path")))?;
+        // SAFETY: a NUL-terminated path; the descriptor is owned below.
+        let fd = unsafe {
+            libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            return Err(fail(Error::last_os_error()));
+        }
+        // SAFETY: just opened, owned here.
+        Ok((path, unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
     pub fn cpu_limit() -> Option<u8> {
@@ -378,6 +448,8 @@ mod imp {
     /// The API process's side of [`enter`]: its share of the limits, the
     /// same privileges as Firecracker, then it waits for the API server.
     fn api_process(link: std::os::unix::net::UnixStream, uid: u32, gid: u32, cpu: Option<u8>, memory: Option<u32>) -> ! {
+        // SAFETY: the child of a fork made with one thread.
+        unsafe { close_netns_in_child() };
         let result = (|| {
             if let Some(mib) = memory {
                 limit_memory(mib)?;
@@ -399,12 +471,23 @@ mod imp {
     pub fn enter() -> Result<(), JailError> {
         let cpu = std::env::var_os(CPU_ENV).map(|v| v.to_string_lossy().into_owned());
         let memory = std::env::var_os(MEMORY_ENV).map(|v| v.to_string_lossy().into_owned());
+        let netns = std::env::var_os(NETNS_ENV);
         let Some(value) = std::env::var_os(ENV) else {
             // A limit alone would be the jail's, without the jail.
             return match (cpu, memory) {
                 (Some(cpu), _) => Err(JailError::CpuFormat(cpu)),
                 (_, Some(memory)) => Err(JailError::MemoryFormat(memory)),
-                (None, None) => Ok(()),
+                (None, None) => {
+                    // A network without a jail: Firecracker started in it, as
+                    // `ip netns exec` starts it in a namespace on Linux.
+                    if let Some(value) = netns {
+                        // SAFETY: called first thing in main, with one thread.
+                        unsafe { std::env::remove_var(NETNS_ENV) };
+                        NETNS.set(open_netns(&value)?).expect("the jail is entered once");
+                    }
+                    // SAFETY: called first thing in main, with one thread.
+                    unsafe { crate::ext::sandbox::prepare(None, None) }.map_err(JailError::Sandbox)
+                }
             };
         };
         // SAFETY: called first thing in main, before any other thread exists.
@@ -412,6 +495,7 @@ mod imp {
             std::env::remove_var(ENV);
             std::env::remove_var(CPU_ENV);
             std::env::remove_var(MEMORY_ENV);
+            std::env::remove_var(NETNS_ENV);
         }
         let value = value.to_string_lossy().into_owned();
         let Spec { uid, gid, root } = parse(&value)?;
@@ -422,6 +506,16 @@ mod imp {
         if euid != 0 {
             return Err(JailError::NotRoot(euid));
         }
+        // The jail's network, before the chroot hides it.
+        if let Some(value) = netns {
+            let opened = open_netns(&value)?;
+            NETNS.set(opened).expect("the jail is entered once");
+        }
+        // The sandbox's profiles, compiled while there is one thread
+        // (ext::sandbox::prepare says why).
+        // SAFETY: called first thing in main, with one thread.
+        unsafe { crate::ext::sandbox::prepare(Some(Path::new(&root)), self::netns()) }
+            .map_err(JailError::Sandbox)?;
         let c_root = CString::new(root.as_str()).map_err(|_| JailError::Format(value.clone()))?;
         // SAFETY: NUL-terminated path.
         check(unsafe { libc::chroot(c_root.as_ptr()) })
@@ -822,4 +916,61 @@ mod tests {
         assert!(matches!(enter(), Err(JailError::CpuFormat(_))));
         println!("CPU-ALONE-REFUSED");
     }
+
+    #[cfg(target_os = "macos")]
+    fn run_child(name: &str, env: &[(&str, &str)]) -> String {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("ext::jail::tests::{name}"), "--ignored", "--nocapture"])
+            .env_remove(ENV)
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{name}: {:?}\n{stdout}", out.status);
+        stdout
+    }
+
+    // A network without the jail: Firecracker started in it (as `ip netns
+    // exec` does on Linux) makes its endpoints there; a relative path or a
+    // missing directory fails at start.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_netns_without_the_jail() {
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let path = dir.as_path().canonicalize().unwrap();
+        let out = run_child("netns_alone_child", &[(NETNS_ENV, path.to_str().unwrap())]);
+        assert!(out.contains("NETNS-ALONE-OK"), "{out}");
+        for bad in ["relative", "/nonexistent/net"] {
+            let out = run_child("netns_bad_child", &[(NETNS_ENV, bad)]);
+            assert!(out.contains("NETNS-BAD-REFUSED"), "{bad}: {out}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_netns_without_the_jail in a separate process"]
+    fn netns_alone_child() {
+        let want = std::path::PathBuf::from(std::env::var_os(NETNS_ENV).unwrap());
+        enter().unwrap();
+        assert!(std::env::var_os(NETNS_ENV).is_none());
+        assert_eq!(netns(), Some(want.as_path()));
+        assert!(netns_dir().is_some());
+        // An interface named without a path is an endpoint there.
+        let tap = crate::platform::net::Tap::open_named("tap0").unwrap();
+        assert!(want.join("tap0").exists());
+        drop(tap);
+        assert!(!want.join("tap0").exists());
+        println!("NETNS-ALONE-OK");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_netns_without_the_jail in a separate process"]
+    fn netns_bad_child() {
+        let err = enter().unwrap_err();
+        assert!(matches!(err, JailError::Netns(..)), "{err}");
+        assert!(netns().is_none());
+        println!("NETNS-BAD-REFUSED");
+    }
+
 }
