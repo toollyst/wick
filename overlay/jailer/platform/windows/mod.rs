@@ -145,14 +145,14 @@ const JAIL_ENV: &str = "WICK_JAIL";
 /// Environment variable through which Firecracker takes the jail's network
 /// over (`vmm::ext::jail::NETNS_ENV`): the directory of its endpoints.
 const NETNS_ENV: &str = "WICK_NETNS";
-/// Firecracker's end of the link to the API process
-/// (`vmm::ext::api_process::WAITING_ENV`).
-const API_WAITING_ENV: &str = "WICK_API_WAITING";
-/// The API process's end of the link (`vmm::ext::api_process::LINK_ENV`).
+/// The path of the socket the API process listens on for Firecracker, to
+/// the API process (`vmm::ext::api_process::LINK_ENV`)...
 const API_LINK_ENV: &str = "WICK_API_LINK";
-/// The API process's handle to Firecracker
-/// (`vmm::ext::api_process::FIRECRACKER_ENV`).
-const API_FIRECRACKER_ENV: &str = "WICK_API_FIRECRACKER";
+/// ...and to Firecracker (`vmm::ext::api_process::WAITING_ENV`).
+const API_WAITING_ENV: &str = "WICK_API_WAITING";
+/// Firecracker's `SYNCHRONIZE` handle to the API process
+/// (`vmm::ext::api_process::API_PROCESS_ENV`).
+const API_PROCESS_ENV: &str = "WICK_API_PROCESS";
 /// `SYNCHRONIZE` (winnt.h).
 const SYNCHRONIZE: u32 = 0x0010_0000;
 /// Bytes every binary that takes the jail over carries
@@ -1524,17 +1524,6 @@ fn spawn_jailed(
     Ok(Spawned { process, thread, pid: pi.dwProcessId })
 }
 
-/// The handle of a socket, made inheritable.
-fn inheritable_socket(s: &std::os::unix::net::UnixStream) -> Result<HANDLE, HostError> {
-    use std::os::unix::io::AsRawFd;
-    let h = std::os::fd::socket(s.as_raw_fd()) as HANDLE;
-    // SAFETY: a socket handle we own.
-    if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
-        return Err(HostError::Spawn("the API link", last_error()));
-    }
-    Ok(h)
-}
-
 fn exec(
     exec_file_path: &Path,
     chroot_dir: &Path,
@@ -1599,67 +1588,64 @@ fn exec(
             }
         }
     }
-    // The link between Firecracker and its API process: a socket pair, an
-    // end inherited by each.
-    let link = if api {
-        let (fc_end, api_end) = std::os::unix::net::UnixStream::pair()
-            .map_err(|e| HostError::Spawn("the API link", e))?;
-        Some((fc_end, api_end))
-    } else {
-        None
-    };
-    let mut fc_vars = vars.clone();
-    let mut fc_handles = handles.clone();
-    if let Some((fc_end, _)) = &link {
-        let h = inheritable_socket(fc_end)?;
-        fc_vars.push(format!("{API_WAITING_ENV}={}", h as usize));
-        fc_handles.push(h);
-    }
-    let fc = spawn_jailed(&exe, &cmd, &fc_vars, std_handles, &fc_handles, &drive_root, &tokens, &job)?;
-    let fc_process = fc.process.as_raw_handle();
-    let kill = move |what, err| {
-        // SAFETY: our child, whose handle `fc.process` holds to the end.
-        unsafe { TerminateProcess(fc_process, 1) };
-        HostError::Spawn(what, err)
-    };
-    // The API process: the same binary, token, job and standard handles,
-    // with its end of the link and a handle to wait for Firecracker on.
-    let api_process = match link {
-        Some((fc_end, api_end)) => {
-            let mut fc_h: HANDLE = std::ptr::null_mut();
-            // SAFETY: duplicates a handle we own, for waiting only, inheritable.
-            if unsafe {
-                DuplicateHandle(
-                    GetCurrentProcess(),
-                    fc.process.as_raw_handle(),
-                    GetCurrentProcess(),
-                    &mut fc_h,
-                    SYNCHRONIZE,
-                    1,
-                    0,
-                )
-            } == 0
-            {
-                return Err(kill("a handle to Firecracker for the API process", last_error()));
-            }
-            // SAFETY: the handle just made.
-            let fc_h = unsafe { OwnedHandle::from_raw_handle(fc_h) };
-            let link_h = inheritable_socket(&api_end)
-                .map_err(|e| kill("the API link", io::Error::other(e.to_string())))?;
+    // The API server is a process of the jail too (`vmm::ext::api_process`):
+    // the same binary, token, job and standard handles, made first, listening
+    // for Firecracker on a socket inside the jail (a connection, so that each
+    // end's peer is the other process, which passing handles over it needs:
+    // the ends of a socket pair both name the process that made the pair).
+    // Firecracker gets the path, and a handle to the API process to bound its
+    // connecting with. The Job Object ends either when the jailer ends.
+    let link_path = api.then(|| format!("{tmp}\\api-link"));
+    let api_process = match &link_path {
+        Some(path) => {
             let mut api_vars = vars.clone();
-            api_vars.push(format!("{API_LINK_ENV}={}", link_h as usize));
-            api_vars.push(format!("{API_FIRECRACKER_ENV}={}", fc_h.as_raw_handle() as usize));
-            let mut api_handles = handles.clone();
-            api_handles.push(link_h);
-            api_handles.push(fc_h.as_raw_handle());
-            let spawned =
-                spawn_jailed(&exe, &cmd, &api_vars, std_handles, &api_handles, &drive_root, &tokens, &job)
-                    .map_err(|e| kill("the API server's process", io::Error::other(e.to_string())))?;
-            // Both have their own copies now.
-            drop((fc_end, api_end, fc_h));
-            Some(spawned)
+            api_vars.push(format!("{API_LINK_ENV}={path}"));
+            Some(spawn_jailed(&exe, &cmd, &api_vars, std_handles, &handles, &drive_root, &tokens, &job)?)
         }
         None => None,
+    };
+    let api_handle = api_process.as_ref().map(|p| p.process.as_raw_handle());
+    let mut fc_vars = vars.clone();
+    let mut fc_handles = handles.clone();
+    let mut api_h: HANDLE = std::ptr::null_mut();
+    if let (Some(path), Some(api)) = (&link_path, api_handle) {
+        // SAFETY: duplicates a handle we own, for waiting only, inheritable.
+        if unsafe { DuplicateHandle(GetCurrentProcess(), api, GetCurrentProcess(), &mut api_h, SYNCHRONIZE, 1, 0) }
+            == 0
+        {
+            let err = last_error();
+            // SAFETY: our child, suspended still.
+            unsafe { TerminateProcess(api, 1) };
+            return Err(HostError::Spawn("a handle to the API process for Firecracker", err));
+        }
+        fc_vars.push(format!("{API_WAITING_ENV}={path}"));
+        fc_vars.push(format!("{API_PROCESS_ENV}={}", api_h as usize));
+        fc_handles.push(api_h);
+    }
+    // SAFETY: the handle just made, or null.
+    let api_h = (!api_h.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(api_h) });
+    let fc = match spawn_jailed(&exe, &cmd, &fc_vars, std_handles, &fc_handles, &drive_root, &tokens, &job) {
+        Ok(fc) => fc,
+        Err(err) => {
+            if let Some(api) = api_handle {
+                // SAFETY: our child, suspended still.
+                unsafe { TerminateProcess(api, 1) };
+            }
+            return Err(err);
+        }
+    };
+    // Firecracker has its own copy now.
+    drop(api_h);
+    let fc_process = fc.process.as_raw_handle();
+    let kill = move |what, err| {
+        // SAFETY: our children, whose handles are held to the end.
+        unsafe {
+            TerminateProcess(fc_process, 1);
+            if let Some(api) = api_handle {
+                TerminateProcess(api, 1);
+            }
+        }
+        HostError::Spawn(what, err)
     };
     terminal.started();
     // Upstream's pid file holds the jailer's pid, which an exec keeps; here it
