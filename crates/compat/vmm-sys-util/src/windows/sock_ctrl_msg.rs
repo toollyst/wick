@@ -38,6 +38,13 @@
 //! that cannot open the sender either fails the receive with the error,
 //! never silently without the descriptors.
 //!
+//! Two processes that may open neither each other nor be pulled from (a
+//! jailed Firecracker and its API process, of one jail) need a third that
+//! may: the jailer, which made both, gives Firecracker a handle to the API
+//! process, and Firecracker names it for the link ([`set_peer_process`]);
+//! the descriptors are then duplicated into that handle's process, sockets
+//! as handles too (`WSADuplicateSocketW` opens its target by pid).
+//!
 //! Receiving follows Linux stream semantics: the descriptors come with the
 //! first byte of their call's data; a receive returns data of consecutive
 //! calls that are queued, and ends with the call it took descriptors from;
@@ -87,7 +94,8 @@ const KIND_HANDLE: u32 = 1;
 const KIND_EVENTFD: u32 = 2;
 const KIND_SOCKET: u32 = 3;
 const KIND_SECTION: u32 = 4;
-/// A socket, as a handle value of the sender's ([`FLAG_PULL`] frames only).
+/// A socket, as a handle value: the sender's ([`FLAG_PULL`] frames), or
+/// one duplicated into the receiver (a peer named by [`set_peer_process`]).
 const KIND_SOCKET_HANDLE: u32 = 5;
 /// Linux's limit of descriptors in one message.
 const SCM_MAX_FD: usize = 253;
@@ -115,11 +123,61 @@ fn backoff(round: &mut u32) {
 /// An open process handle, closed on drop.
 struct Process(HANDLE);
 
+// SAFETY: a kernel handle may be used and closed from any thread.
+unsafe impl Send for Process {}
+
 impl Drop for Process {
     fn drop(&mut self) {
         // SAFETY: closes the handle this object opened.
         unsafe { CloseHandle(self.0) };
     }
+}
+
+impl Process {
+    /// A handle of its own to the same process.
+    fn duplicate(&self) -> Result<Process> {
+        let mut out: HANDLE = std::ptr::null_mut();
+        // SAFETY: duplicates a handle we hold into this process.
+        let ok = unsafe {
+            DuplicateHandle(GetCurrentProcess(), self.0, GetCurrentProcess(), &mut out, 0, 0, DUPLICATE_SAME_ACCESS)
+        };
+        if ok == 0 {
+            return Err(Error::last());
+        }
+        Ok(Process(out))
+    }
+}
+
+/// The peer process of each socket named by [`set_peer_process`].
+static PEER_PROCESSES: Mutex<Option<HashMap<RawFd, Process>>> = Mutex::new(None);
+
+/// Names the process at the other end of `sock`: a handle to it with
+/// `PROCESS_DUP_HANDLE`, which the descriptors sent over `sock` are then
+/// duplicated into, instead of a handle opened by the peer's pid. For a
+/// peer the sender may not open: a jailed Firecracker and its API process,
+/// two processes of one jail, which may not open each other (measured by
+/// `jailer-test.ps1 api`), so the jailer, which made both, gives
+/// Firecracker the handle. Sockets are sent to such a peer as handles. The
+/// registry keeps a duplicate; the caller keeps `process`.
+pub fn set_peer_process(sock: RawFd, process: HANDLE) -> Result<()> {
+    let own = Process(process).duplicate();
+    // The caller's handle is not ours to close.
+    std::mem::forget(Process(process));
+    let own = own?;
+    PEER_PROCESSES.lock().unwrap().get_or_insert_with(HashMap::new).insert(sock, own);
+    Ok(())
+}
+
+/// Forgets the peer process of `sock` ([`set_peer_process`]).
+pub fn clear_peer_process(sock: RawFd) {
+    if let Some(map) = PEER_PROCESSES.lock().unwrap().as_mut() {
+        map.remove(&sock);
+    }
+}
+
+/// A handle of this call's own to the peer process named for `sock`, if one is.
+fn named_peer(sock: RawFd) -> Result<Option<Process>> {
+    PEER_PROCESSES.lock().unwrap().as_ref().and_then(|m| m.get(&sock)).map(Process::duplicate).transpose()
 }
 
 /// Handles duplicated for a frame: into the peer, or, when the peer cannot
@@ -224,21 +282,29 @@ fn raw_sendmsg<D: IntoIovec>(sock: RawFd, out_data: &[D], out_fds: &[RawFd]) -> 
     let peer;
     let mut flight = None;
     let mut flags = 0u32;
+    let mut named = false;
     if !out_fds.is_empty() {
         let pid = wick_os::windows::peer_pid(sock).map_err(Error::from)?;
-        // SAFETY: opens the peer for handle duplication; checked below.
-        let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
-        peer = if h.is_null() {
-            let err = Error::last();
-            if err.errno() != ERROR_ACCESS_DENIED as i32 {
-                return Err(err);
-            }
-            // The peer is out of this process's reach (a jail): the peer
-            // pulls private copies out of this process instead.
-            flags |= FLAG_PULL;
-            None
+        peer = if let Some(p) = named_peer(sock)? {
+            named = true;
+            #[cfg(test)]
+            tests::PUSHED_TO_NAMED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(p)
         } else {
-            Some(Process(h))
+            // SAFETY: opens the peer for handle duplication; checked below.
+            let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
+            if h.is_null() {
+                let err = Error::last();
+                if err.errno() != ERROR_ACCESS_DENIED as i32 {
+                    return Err(err);
+                }
+                // The peer is out of this process's reach (a jail): the peer
+                // pulls private copies out of this process instead.
+                flags |= FLAG_PULL;
+                None
+            } else {
+                Some(Process(h))
+            }
         };
         let f = flight.insert(InFlight {
             peer: peer.as_ref(),
@@ -260,7 +326,9 @@ fn raw_sendmsg<D: IntoIovec>(sock: RawFd, out_data: &[D], out_fds: &[RawFd]) -> 
                 payload.extend_from_slice(&sec.size.to_le_bytes());
                 payload.extend_from_slice(&u64::from(sec.grow_sealed()).to_le_bytes());
                 put_entry(&mut entries, KIND_SECTION, &payload);
-            } else if is_socket(fd) && f.peer.is_none() {
+            } else if is_socket(fd) && (f.peer.is_none() || named) {
+                // A private copy to pull, or, for a named peer, a handle in
+                // it: `WSADuplicateSocketW` would open the peer by its pid.
                 let v = dup_for_peer(handle(fd), f)?;
                 put_entry(&mut entries, KIND_SOCKET_HANDLE, &v.to_le_bytes());
             } else if is_socket(fd) {
@@ -596,7 +664,7 @@ fn decode(entries: &[u8], count: usize, sender: Option<&Process>) -> Result<Vec<
         at += len;
         match (kind, len) {
             (KIND_HANDLE, 8) => out.push((kind, taken(p, 1, &out)?[0])),
-            (KIND_SOCKET_HANDLE, 8) if sender.is_some() => {
+            (KIND_SOCKET_HANDLE, 8) => {
                 out.push((KIND_SOCKET, taken(p, 1, &out)?[0]));
             }
             (KIND_EVENTFD, 24) => {
@@ -1206,6 +1274,77 @@ mod tests {
             assert!(answer.lines().any(|l| l == expected), "{expected}: {text}");
         }
         // The eventfd is shared, and the socket is the pair's other end.
+        assert_eq!(evt.read().unwrap(), 5);
+        let mut got = [0u8; 17];
+        d.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"via pulled socket");
+    }
+
+    /// Frames sent to a peer named by [`set_peer_process`].
+    pub(super) static PUSHED_TO_NAMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    // A receiver that cannot be opened by its pid, as a jailed process
+    // cannot be by its jailed sibling, takes descriptors pushed into a
+    // handle its maker holds and named for the socket.
+    #[test]
+    fn test_a_named_peer_is_pushed_into_without_being_opened() {
+        use std::os::windows::io::AsRawHandle;
+        use std::process::{Command, Stdio};
+
+        let path = std::env::temp_dir().join(format!("wick-scm-named-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = wick_os::unix::net::UnixListener::bind(&path).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "windows::sock_ctrl_msg::tests::locked_receiver_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("WICK_TEST_SOCK", &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut s, _) = listener.accept().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut b = [0u8; 1];
+        s.read_exact(&mut b).unwrap();
+        assert_eq!(b, [b'L'], "the child did not lock its process object");
+        disable_debug_privilege();
+        // SAFETY: plain call; the result is checked.
+        let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, child.id()) };
+        assert!(h.is_null(), "the receiver can be opened, so the test proves nothing");
+        // The handle from making the process, as the jailer's.
+        set_peer_process(s.as_raw_fd(), child.as_raw_handle()).unwrap();
+
+        let mut file = crate::tempfile::TempFile::new().unwrap().into_file();
+        file.write_all(b"handle pulled").unwrap();
+        let evt = EventFd::new(0).unwrap();
+        let section = sealed_section(1 << 16);
+        let (c, mut d) = UnixStream::pair().unwrap();
+        let before = PUSHED_TO_NAMED.load(std::sync::atomic::Ordering::SeqCst);
+        s.send_with_fds(
+            &[[b'D'].as_ref()],
+            &[file.as_raw_fd(), evt.as_raw_fd(), section.as_raw_fd(), c.as_raw_fd()],
+        )
+        .unwrap();
+        assert_eq!(PUSHED_TO_NAMED.load(std::sync::atomic::Ordering::SeqCst), before + 1, "not pushed into the named peer");
+        drop(c);
+        clear_peer_process(s.as_raw_fd());
+        let mut answer = String::new();
+        s.read_to_string(&mut answer).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let text = format!(
+            "{}\n{}\n{}",
+            answer,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        for expected in ["file: handle pulled", "eventfd: 5", "section: 65536 sealed", "socket: sent"] {
+            assert!(answer.lines().any(|l| l == expected), "{expected}: {text}");
+        }
         assert_eq!(evt.read().unwrap(), 5);
         let mut got = [0u8; 17];
         d.read_exact(&mut got).unwrap();

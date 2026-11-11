@@ -287,8 +287,21 @@ impl<S: Read + Write> ApiLink<S> {
     /// If the API process ended without the server's shutdown, as the API
     /// thread's end ends Firecracker on Linux.
     pub fn receive(&mut self) -> Result<FromApi, ApiProcessError> {
-        let Some(msg) = read_message(&mut self.link).map_err(ApiProcessError::Link)? else {
-            panic!("The API server process ended");
+        let msg = match read_message(&mut self.link) {
+            Ok(Some(msg)) => msg,
+            Ok(None) => panic!("The API server process ended"),
+            // A Windows process that ends resets its connections rather
+            // than closing them (`boot-test.ps1 api-process`).
+            #[cfg(windows)]
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                panic!("The API server process ended")
+            }
+            Err(err) => return Err(ApiProcessError::Link(err)),
         };
         match msg.split_first() {
             Some((b'R', rest)) => decode_request(rest).map(FromApi::Request),
@@ -763,8 +776,10 @@ mod windows {
     /// In a jailed Firecracker: the path of the socket the API process the
     /// jailer made listens on.
     pub const WAITING_ENV: &str = "WICK_API_WAITING";
-    /// In a jailed Firecracker: the handle value of a `SYNCHRONIZE` handle
-    /// to that API process.
+    /// In a jailed Firecracker: the handle value of a handle to that API
+    /// process, `SYNCHRONIZE` (connecting waits on it) and
+    /// `PROCESS_DUP_HANDLE` (the server's descriptors are duplicated into
+    /// it: two processes of one jail may not open each other).
     pub const API_PROCESS_ENV: &str = "WICK_API_PROCESS";
 
     /// `SYNCHRONIZE` (winnt.h).
@@ -921,9 +936,10 @@ mod windows {
 
     /// Makes the API process: this binary again, with `args`, the path it
     /// is to listen on and a handle to this process inherited, and connects
-    /// to it. Returns Firecracker's end of the link. Before the sandbox: its
-    /// child process policy allows no process after it.
-    fn spawn(args: &[&str]) -> Result<UnixStream, ApiProcessError> {
+    /// to it. Returns Firecracker's end of the link and a handle to the
+    /// process. Before the sandbox: its child process policy allows no
+    /// process after it.
+    fn spawn(args: &[&str]) -> Result<(UnixStream, OwnedHandle), ApiProcessError> {
         let fail = ApiProcessError::Fork;
         let path = link_path();
         let fc = own_process(true).map_err(fail)?;
@@ -1011,8 +1027,9 @@ mod windows {
         // The API process has its own copy now.
         drop(fc);
         let link = connect(&path, &process)?;
-        *API_PROCESS.lock().unwrap() = Some(process);
-        Ok(link)
+        let kept = process.try_clone().map_err(fail)?;
+        *API_PROCESS.lock().unwrap() = Some(kept);
+        Ok((link, process))
     }
 
     /// Connects to the API process at `path`, where it listens once it has
@@ -1066,10 +1083,14 @@ mod windows {
         let listener = UnixListener::bind(socket_path)
             .map_err(|e| ApiProcessError::Bind(socket_path.to_path_buf(), e))?;
         let waiting = WAITING.lock().unwrap().take();
-        let link = match waiting {
-            Some((path, process)) => connect(&path, &process)?,
+        let (link, process) = match waiting {
+            Some((path, process)) => (connect(&path, &process)?, process),
             None => spawn(args)?,
         };
+        // The API process is the link's peer, by the handle: two processes
+        // of one jail may not open each other by pid.
+        vmm_sys_util::sock_ctrl_msg::set_peer_process(link.as_raw_fd(), process.as_raw_handle())
+            .map_err(|e| ApiProcessError::Link(io::Error::other(e.to_string())))?;
         let mut msg = u64::try_from(payload_limit).unwrap().to_le_bytes().to_vec();
         msg.push(u8::from(sandbox::selected() == Policy::Default));
         // A handle to this process, for the API process to end with.
@@ -1324,7 +1345,8 @@ mod windows {
             response.set_body(Body::new("{\"v\":1}"));
             link.respond(&response).unwrap();
             let got = client.join().unwrap();
-            assert!(got.starts_with("HTTP/1.1 200 OK"), "{got}");
+            // micro_http writes no reason phrase.
+            assert!(got.starts_with("HTTP/1.1 200 "), "{got}");
             // The profile, in force in the API process and not here.
             let api = API_PROCESS.lock().unwrap().as_ref().unwrap().as_raw_handle();
             for m in MITIGATIONS {

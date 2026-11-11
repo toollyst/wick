@@ -150,9 +150,11 @@ const NETNS_ENV: &str = "WICK_NETNS";
 const API_LINK_ENV: &str = "WICK_API_LINK";
 /// ...and to Firecracker (`vmm::ext::api_process::WAITING_ENV`).
 const API_WAITING_ENV: &str = "WICK_API_WAITING";
-/// Firecracker's `SYNCHRONIZE` handle to the API process
-/// (`vmm::ext::api_process::API_PROCESS_ENV`).
+/// Firecracker's handle to the API process, `SYNCHRONIZE` and
+/// `PROCESS_DUP_HANDLE` (`vmm::ext::api_process::API_PROCESS_ENV`).
 const API_PROCESS_ENV: &str = "WICK_API_PROCESS";
+/// `PROCESS_DUP_HANDLE` (winnt.h).
+const PROCESS_DUP_HANDLE: u32 = 0x0040;
 /// `SYNCHRONIZE` (winnt.h).
 const SYNCHRONIZE: u32 = 0x0010_0000;
 /// Bytes every binary that takes the jail over carries
@@ -1609,9 +1611,20 @@ fn exec(
     let mut fc_handles = handles.clone();
     let mut api_h: HANDLE = std::ptr::null_mut();
     if let (Some(path), Some(api)) = (&link_path, api_handle) {
-        // SAFETY: duplicates a handle we own, for waiting only, inheritable.
-        if unsafe { DuplicateHandle(GetCurrentProcess(), api, GetCurrentProcess(), &mut api_h, SYNCHRONIZE, 1, 0) }
-            == 0
+        // SAFETY: duplicates a handle we own, for waiting on and for
+        // duplicating handles into (the two may not open each other: both
+        // run the jail's restricted token), inheritable.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                api,
+                GetCurrentProcess(),
+                &mut api_h,
+                SYNCHRONIZE | PROCESS_DUP_HANDLE,
+                1,
+                0,
+            )
+        } == 0
         {
             let err = last_error();
             // SAFETY: our child, suspended still.
