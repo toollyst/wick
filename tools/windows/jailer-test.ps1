@@ -6,10 +6,11 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,daemonize,handles,pidns,isolation,boot,limits,cpu] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,daemonize,handles,pidns,isolation,boot,limits,cpu,hugepages] [-Bin <dir>]
 #
 # `refuse`, `cpuset`, `weight`, `low`, `daemonize`, `handles` and `pidns` need no WHP; the others
-# boot a guest. `pidns` needs a console (it types into it and reads it).
+# boot a guest. `pidns` needs a console (it types into it and reads it). `hugepages` needs
+# the account to hold "Lock pages in memory" (it fails, saying so, without it).
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build).
 # Needs the boot test's guest files in -Assets (vmlinux-6.1.188 and
@@ -18,7 +19,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'daemonize', 'handles', 'pidns', 'isolation', 'boot', 'limits', 'cpu'),
+    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'daemonize', 'handles', 'pidns', 'isolation', 'boot', 'limits', 'cpu', 'hugepages'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -103,7 +104,7 @@ class JailedVm {
 }
 
 # A jail for `id` under `base` with the guest's files, and a VM in it.
-function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256) {
+function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256, [string]$hugePages = '') {
     $root = Join-Path $base "firecracker.exe\$id\root"
     New-Item -ItemType Directory -Force -Path $root | Out-Null
     Copy-Item (Join-Path $Assets 'vmlinux-6.1.188') (Join-Path $root 'vmlinux')
@@ -113,6 +114,7 @@ function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(),
         'drives'         = @([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs'; is_root_device = $true; is_read_only = $true })
         'machine-config' = [ordered]@{ vcpu_count = 2; mem_size_mib = $memMib }
     }
+    if ($hugePages) { $cfg['machine-config']['huge_pages'] = $hugePages }
     Set-Content -Encoding ASCII (Join-Path $root 'vm.json') ($cfg | ConvertTo-Json -Depth 5)
     $line = (@('--id', $id, '--exec-file', "`"$Fc`"", '--uid', '0', '--gid', '0', '--chroot-base-dir', "`"$base`"") + ($jailerArgs | ForEach-Object { if ($_ -match ' ') { "`"$_`"" } else { $_ } }) + @('--', '--no-api', '--config-file', '/vm.json')) -join ' '
     $vm = [JailedVm]::new($Jailer, $line, (Join-Path $base "$id-console.txt"))
@@ -699,6 +701,46 @@ function Stage-Boot {
         Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
         "a 2 vCPU microVM boots in the jail (WHP under the restricted token) and the jailer exits 0 with it"
     } finally { Stop-Jailed }
+}
+
+# docs/PORTING.md row 10: a jailed Firecracker maps guest memory on large
+# pages, as on Linux it maps huge pages an administrator reserved. The jail's
+# token keeps no privilege but traversal and, when the operator's account
+# holds it, "Lock pages in memory" (enabled); the job's memory limit holds
+# large pages too; and a jailed 2 vCPU guest boots on 2 MiB pages and keeps
+# 160 MiB written to its memory.
+function Stage-Hugepages {
+    $base = New-Base 'hugepages'
+    $held = $null -ne (whoami /priv | Select-String 'SeLockMemoryPrivilege')
+    $privs = Invoke-JailedProbe $base 'p' '2' @() 'privileges:0'
+    $want = if ($held) { 'SeChangeNotifyPrivilege+,SeLockMemoryPrivilege+' } else { 'SeChangeNotifyPrivilege+' }
+    $got = (($privs -replace '^allowed ', '') -split ',' | Sort-Object) -join ','
+    Check ($got -eq $want) "the jail's token holds '$privs', not '$want'"
+    # Firecracker in the jail cannot enable a privilege itself: the jailer does.
+    $own = Invoke-JailedProbe $base 't' '2' @() 'token:0'
+    Check ($own -match '^denied ') "a jailed process opened its own token to adjust it: $own"
+    $large = Invoke-JailedProbe $base 'l' '2' @() 'largepage:64'
+    if (-not $held) {
+        Check ($large -match '^denied .*privilege') "large pages in a jail of an account without the privilege: $large"
+        Check $false ("this account lacks 'Lock pages in memory' (SeLockMemoryPrivilege), so large pages cannot be " +
+            "checked: an administrator grants it in secpol.msc, Local Policies, User Rights Assignment, then sign " +
+            "out and in (checked without it: the jail holds only traversal, cannot open its token to adjust it, and maps no large pages)")
+    }
+    Check ($large -match '^allowed ') "64 MiB of large pages in the jail: $large"
+    $limited = Invoke-JailedProbe $base 'm' '2' @('memory.max=33554432') 'largepage:64'
+    Check ($limited -match '^denied ') "64 MiB of large pages under memory.max=32 MiB: $limited"
+    $vm = Start-JailedVm $base 'vm' @() 256 '2M'
+    try {
+        Wait-Shell $vm
+        $mem = [int]$vm.Sh("awk '/MemTotal/ {print `$2}' /proc/meminfo", 10)
+        Check ($mem -gt 200000 -and $mem -le 262144) "MemTotal $mem kB for 256 MiB"
+        $out = $vm.Sh('mount -t tmpfs -o size=200m tmpfs /tmp && head -c 160m /dev/urandom > /tmp/f && md5sum /tmp/f > /tmp/a && md5sum /tmp/f | cmp - /tmp/a && echo same', 120)
+        Check ($out -eq 'same') "160 MiB in guest memory read back differently: '$out'"
+        $vm.Send('reboot -ff')
+        Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
+        Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
+    } finally { Stop-Jailed }
+    "the jail keeps only traversal and 'Lock pages in memory', enabled (it cannot open its token to enable it); 64 MiB of large pages in the jail, refused under memory.max=32 MiB; a jailed 2 vCPU guest on 2 MiB pages boots and keeps 160 MiB written"
 }
 
 function Stage-Limits {

@@ -13,7 +13,10 @@
   its jail, reach another jail's files, API socket or process, or open the
   operator's; the operator reaches the API socket), `boot` (a 2 vCPU guest
   in the jail), `limits` (`memory.max`), `cpu` (`cpu.max` from Firecracker's start: twelve boots under
-  it, each vCPU's local timer in TSC-deadline mode), and a check
+  it, each vCPU's local timer in TSC-deadline mode), `hugepages` (the jail
+  keeps "Lock pages in memory" and no other privilege but traversal, the
+  job's memory limit holds large pages, and a jailed guest boots on 2 MiB
+  pages; needs the privilege, as the boot test's stage does), and a check
   that every jail's drive letter was removed. It needs the boot test's
   guest files (`-Assets`, default `C:\wbt`) and `rustc` for the probe:
 

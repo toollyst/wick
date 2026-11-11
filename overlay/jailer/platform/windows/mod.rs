@@ -75,7 +75,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED, FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0,
     LocalFree, SetHandleInformation,
 };
@@ -85,7 +85,8 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, DuplicateTokenEx,
+    AdjustTokenPrivileges, CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx,
+    LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, SE_PRIVILEGE_ENABLED, TOKEN_PRIVILEGES, TokenPrivileges,
     GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, GetTokenInformation,
     LABEL_SECURITY_INFORMATION, LUA_TOKEN, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
     SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS,
@@ -981,19 +982,71 @@ fn tokens() -> Result<Tokens, HostError> {
     Ok(Tokens { primary, initial })
 }
 
-/// A restricted token: no privileges, `restricting` SIDs, the default DACL
+/// "Lock pages in memory": guest memory on large pages (`huge_pages`) needs
+/// it, as huge pages on Linux need a pool an administrator reserved.
+const LOCK_MEMORY: &str = "SeLockMemoryPrivilege";
+
+/// The privileges a jailed process keeps, when the operator's token holds
+/// them: `SeChangeNotifyPrivilege` (traversal, the one `DISABLE_MAX_PRIVILEGE`
+/// keeps) and [`LOCK_MEMORY`], which an administrator grants an account for
+/// large pages. Every other privilege is deleted from the jail's tokens.
+const KEPT_PRIVILEGES: [&str; 2] = ["SeChangeNotifyPrivilege", LOCK_MEMORY];
+
+/// The privileges in `token`: (name, LUID and attributes).
+fn privileges(token: HANDLE) -> Result<Vec<(String, LUID_AND_ATTRIBUTES)>, HostError> {
+    let buf = token_info(token, TokenPrivileges)?;
+    // SAFETY: the buffer holds a TOKEN_PRIVILEGES.
+    let tp = unsafe { &*buf.as_ptr().cast::<TOKEN_PRIVILEGES>() };
+    // SAFETY: `PrivilegeCount` entries follow.
+    let entries = unsafe { std::slice::from_raw_parts(tp.Privileges.as_ptr(), tp.PrivilegeCount as usize) };
+    entries
+        .iter()
+        .map(|p| {
+            let mut name = [0u16; 64];
+            let mut len = 64u32;
+            // SAFETY: a LUID and a buffer of `len` characters.
+            if unsafe { LookupPrivilegeNameW(std::ptr::null(), &p.Luid, name.as_mut_ptr(), &mut len) } == 0 {
+                return Err(HostError::Spawn("LookupPrivilegeNameW", last_error()));
+            }
+            Ok((String::from_utf16_lossy(&name[..len as usize]), *p))
+        })
+        .collect()
+}
+
+/// Enables the privilege `p` in `token`, which holds it.
+fn enable_privilege(token: HANDLE, p: LUID_AND_ATTRIBUTES) -> Result<(), HostError> {
+    let tp = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES { Luid: p.Luid, Attributes: SE_PRIVILEGE_ENABLED }],
+    };
+    // SAFETY: a token we own and one privilege.
+    let ok = unsafe { AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+    // It succeeds without the privilege, and says so.
+    // SAFETY: plain call.
+    if ok == 0 || unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+        return Err(HostError::Spawn("enabling SeLockMemoryPrivilege in the jail's token", last_error()));
+    }
+    Ok(())
+}
+
+/// A restricted token: no privileges but [`KEPT_PRIVILEGES`] (with
+/// [`LOCK_MEMORY`] enabled, so a jailed Firecracker maps large pages without
+/// adjusting a token it may not open), `restricting` SIDs, the default DACL
 /// and the jail's integrity level.
 fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedHandle, HostError> {
+    let held = privileges(from)?;
+    let delete: Vec<LUID_AND_ATTRIBUTES> =
+        held.iter().filter(|(n, _)| !KEPT_PRIVILEGES.contains(&n.as_str())).map(|(_, p)| *p).collect();
     let mut t: HANDLE = std::ptr::null_mut();
-    // SAFETY: a token we own and a valid SID array.
+    // SAFETY: a token we own, a valid privilege array and a valid SID array.
     if unsafe {
         CreateRestrictedToken(
             from,
-            DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+            LUA_TOKEN,
             0,
             std::ptr::null(),
-            0,
-            std::ptr::null(),
+            u32::try_from(delete.len()).unwrap(),
+            delete.as_ptr(),
             u32::try_from(restricting.len()).unwrap(),
             restricting.as_ptr(),
             &mut t,
@@ -1004,6 +1057,9 @@ fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedH
     }
     // SAFETY: a token handle we own.
     let t = unsafe { OwnedHandle::from_raw_handle(t) };
+    if let Some((_, lock)) = held.iter().find(|(n, _)| n == LOCK_MEMORY) {
+        enable_privilege(t.as_raw_handle(), *lock)?;
+    }
 
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: a NUL-terminated SDDL string and an out-pointer.
@@ -1517,6 +1573,38 @@ mod tests {
         tokens().unwrap();
         job(&Limits { memory_bytes: Some(256 << 20), cpu_rate: Some(5000), ..Limits::default() }).unwrap();
         job(&Limits { cpu_weight: Some(3), cpus: Some(vec![(0, 1)]), ..Limits::default() }).unwrap();
+    }
+
+    /// The jail's tokens hold no privilege but traversal and, when the
+    /// operator's account holds it, "Lock pages in memory", enabled
+    /// (docs/PORTING.md, row 10); this process's token has others.
+    #[test]
+    fn test_tokens_keep_only_traversal_and_lock_memory() {
+        let mut own: HANDLE = std::ptr::null_mut();
+        // SAFETY: our own token.
+        assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut own) }, 0);
+        // SAFETY: a token handle we own.
+        let own = unsafe { OwnedHandle::from_raw_handle(own) };
+        let mine: Vec<String> = privileges(own.as_raw_handle()).unwrap().into_iter().map(|(n, _)| n).collect();
+        assert!(mine.iter().any(|n| !KEPT_PRIVILEGES.contains(&n.as_str())), "{mine:?}");
+        let lock = mine.iter().any(|n| n == LOCK_MEMORY);
+        let mut want = vec![("SeChangeNotifyPrivilege".to_string(), true)];
+        if lock {
+            want.push((LOCK_MEMORY.to_string(), true));
+        }
+        let t = tokens().unwrap();
+        for token in [&t.primary, &t.initial] {
+            let mut kept: Vec<(String, bool)> = privileges(token.as_raw_handle())
+                .unwrap()
+                .into_iter()
+                .map(|(n, p)| (n, p.Attributes & SE_PRIVILEGE_ENABLED != 0))
+                .collect();
+            kept.sort();
+            assert_eq!(kept, want, "the jail's token, from {mine:?}");
+        }
+        if !lock {
+            eprintln!("this account lacks {LOCK_MEMORY}: only its absence from the jail was checked");
+        }
     }
 
     /// The job's CPU rate, read back.
