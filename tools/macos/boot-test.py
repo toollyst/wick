@@ -78,6 +78,10 @@ class Vm:
                 json.dump(config, f, indent=1)
             cmd += ["--config-file", path]
         cmd += args
+        # Diagnosis: extra Firecracker arguments for every VM of the run
+        # (WICK_BOOT_TEST_FC_ARGS="--no-seccomp" tells a sandbox problem from
+        # another one).
+        cmd += os.environ.get("WICK_BOOT_TEST_FC_ARGS", "").split()
         self.buf = ""
         self.cond = threading.Condition()
         self.log = open(self.log_path, "w")

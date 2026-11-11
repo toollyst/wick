@@ -104,20 +104,18 @@ mod macos {
     /// ([`FILES_ANYWHERE`], or [`files_in_jail`] when the jailer started
     /// Firecracker).
     pub const PROFILE: &str = r#"(version 1)
+; Whatever no rule below allows raises SIGSYS, on which Firecracker exits as
+; for a seccomp violation, except what DENIED_WITH_ERROR lists (default_rule).
 (deny default)
-; Descriptors the process already holds (the console, inherited sockets).
-(allow file-ioctl)
-; Unix sockets only: API server, vsock backends, console.
-(allow system-socket)
-(allow network-bind (local unix-socket))
+; Unix sockets only: API server, vsock backends, console. Binding one is
+; setup's (SETUP_OPERATIONS), as on Linux the VMM thread's filter has no bind.
 (allow network-inbound (local unix-socket))
 (allow network-outbound (remote unix-socket))
-; Guest memory backed by POSIX shared memory.
+; Guest memory backed by POSIX shared memory (memfd_create).
 (allow ipc-posix-shm*)
 ; Own process only.
 (allow signal (target self))
 (allow process-info* (target self))
-(allow sysctl-read)
 ; System calls: only those in SYSCALLS, Mach traps: only those in MACH_TRAPS,
 ; kernel MIG routines: only those in MIG_ROUTINES. Any other one fails and
 ; raises SIGSYS, on which Firecracker exits as for a seccomp violation
@@ -289,7 +287,102 @@ mod macos {
             Some(root) => files_in_jail(root)?,
             None => FILES_ANYWHERE.to_owned(),
         };
-        Ok(format!("{PROFILE}{}{files}", syscall_rule()))
+        let profile = PROFILE.replacen("(deny default)\n", &default_rule(), 1);
+        Ok(format!("{profile}{}{}{files}", syscall_rule(), operation_rule()))
+    }
+
+    /// What a denied operation does: on Linux a system call outside a
+    /// thread's filter traps, so here an operation no rule allows raises
+    /// SIGSYS. Except for files, which fail with an error, as on Linux a path
+    /// outside the chroot does, and what [`DENIED_WITH_ERROR`] lists.
+    #[allow(unexpected_cfgs)]
+    fn default_rule() -> String {
+        let mut rule = String::from("(deny default (with send-signal SIGSYS))\n(deny file-read* file-write*)\n");
+        for (op, why) in DENIED_WITH_ERROR {
+            rule.push_str(&format!("; {why}\n(deny {op})\n"));
+        }
+        // Discovery build: every operation no rule allows is allowed and
+        // reported instead.
+        #[cfg(wick_sandbox_discovery)]
+        rule.push_str("(allow default (with report))\n(deny file-read* file-write*)\n");
+        rule
+    }
+
+    /// Operations denied with an error rather than SIGSYS: ones the system
+    /// libraries make and handle failing, that Firecracker never asks for.
+    pub const DENIED_WITH_ERROR: &[(&str, &str)] = &[
+        (
+            "mach-priv-host-port",
+            "libsandbox asks for the host's privileged port right after sandbox_init.",
+        ),
+        (
+            "system-info (info-type \"vfs.disk-space\")",
+            "fstatfs (fallocate's hole punching, for the block size) then reports no exact free space.",
+        ),
+    ];
+
+    /// Operations of the setup phase only: building the microVM opens the
+    /// console's terminal, binds the API and vsock sockets, and reads system
+    /// information; on Linux the VMM thread's filter allows no bind, and
+    /// ioctl only for KVM, the TAP device and the terminal.
+    pub const SETUP_OPERATIONS: &[&str] = &[
+        "file-ioctl",
+        "sysctl-read",
+        "system-socket",
+        "network-bind (local unix-socket)",
+    ];
+
+    /// Operations of the run phase, for the ioctl requests upstream's VMM
+    /// filter allows a running microVM that have a macOS counterpart: the
+    /// terminal's settings restored on shutdown (TCGETS, TCSETS, TIOCGWINSZ)
+    /// and a block device's sizes when a drive is opened (BLKSSZGET,
+    /// BLKPBSZGET, BLKIOMIN, BLKIOOPT, mapped by the compatibility libc).
+    /// KVM, the TAP device and Nitro Enclaves have none: those requests are
+    /// never made here. Generic requests (FIONBIO, FIOCLEX) are not driver
+    /// requests and Seatbelt does not filter them. Of sysctls, a running
+    /// microVM reads only the one below.
+    pub const RUN_OPERATIONS: &[&str] = &[
+        concat!(
+            "file-ioctl (ioctl-command",
+            " #x40487413 #x80487414 #x80487415 #x80487416", // TIOCGETA, TIOCSETA, TIOCSETAW, TIOCSETAF
+            " #x40087468",                                    // TIOCGWINSZ
+            " #x40046418 #x4004644d",                         // DKIOCGETBLOCKSIZE, DKIOCGETPHYSICALBLOCKSIZE
+            ")"
+        ),
+        // Whether the host is itself a virtual machine: read by the system
+        // libraries (not wick's code) right after the microVM starts,
+        // measured on every boot; information only.
+        "sysctl-read (sysctl-name \"kern.hv_vmm_present\")",
+    ];
+
+    #[allow(unexpected_cfgs)]
+    fn operation_rule() -> String {
+        let setup = format!("(require-not (extension \"{}\"))", NARROWED.to_str().unwrap());
+        let mut rule = String::new();
+        for op in SETUP_OPERATIONS {
+            let (name, filter) = op.split_once(' ').unwrap_or((op, ""));
+            if filter.is_empty() {
+                rule.push_str(&format!("(allow {name} {setup})\n"));
+            } else {
+                rule.push_str(&format!("(allow {name} (require-all {filter} {setup}))\n"));
+            }
+        }
+        for op in RUN_OPERATIONS {
+            let (name, filter) = op.split_once(' ').unwrap_or((op, ""));
+            rule.push_str(&format!("(allow {name} {filter})\n"));
+        }
+        // Discovery build: after narrow(), the setup operations' kinds are
+        // allowed and reported (last, so that this rule decides; a default
+        // rule's reports miss some of them, sysctl reads among them).
+        #[cfg(wick_sandbox_discovery)]
+        {
+            let narrowed = format!("(extension \"{}\")", NARROWED.to_str().unwrap());
+            for op in SETUP_OPERATIONS {
+                let name = op.split_once(' ').map_or(*op, |(name, _)| name);
+                rule.push_str(&format!("(allow {name} {narrowed} (with report))\n"));
+            }
+        }
+        rule
     }
 
     /// `(allow <op> (require-all <condition> (<filter> <prefix><name>...)))`,
@@ -546,7 +639,10 @@ mod macos {
         #[test]
         fn test_unlisted_syscalls_raise_sigsys() {
             use std::os::unix::process::ExitStatusExt;
-            for name in ["exec_child", "unlisted_child", "unlisted_trap_child", "unlisted_mig_child"] {
+            for name in [
+                "exec_child", "unlisted_child", "unlisted_trap_child", "unlisted_mig_child", "tcp_child",
+                "udp_child", "bind_after_narrow_child",
+            ] {
                 let out = child(name, &[]);
                 assert_eq!(
                     out.status.signal(),
@@ -691,6 +787,122 @@ mod macos {
             select(Policy::Default);
             apply().unwrap();
             let _ = std::process::Command::new("/bin/echo").output();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        // IP networking: on Linux socket(AF_INET) is outside every filter.
+        #[test]
+        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        fn tcp_child() {
+            select(Policy::Default);
+            apply().unwrap();
+            let _ = std::net::TcpStream::connect("127.0.0.1:9");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        #[test]
+        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        fn udp_child() {
+            select(Policy::Default);
+            apply().unwrap();
+            let _ = std::net::UdpSocket::bind("127.0.0.1:0");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        // A running microVM's VMM may punch holes (discard, Linux's
+        // fallocate in the VMM filter) and restore the terminal on shutdown
+        // (TCSETS); another driver request, here simulating terminal input
+        // (TIOCSTI), raises SIGSYS, as an ioctl outside the filter's requests
+        // does on Linux.
+        #[test]
+        fn test_run_phase_ioctls_and_holes() {
+            run_child("run_phase_child", &[]);
+            use std::os::unix::process::ExitStatusExt;
+            let out = child("other_ioctl_child", &[]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("NARROWED"), "{stdout}");
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
+        }
+
+        /// A pseudo-terminal's controller, opened before the sandbox.
+        fn pty() -> libc::c_int {
+            // SAFETY: plain calls on a descriptor this function opens.
+            unsafe {
+                let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+                assert!(fd >= 0);
+                assert_eq!(libc::grantpt(fd), 0);
+                assert_eq!(libc::unlockpt(fd), 0);
+                let name = libc::ptsname(fd);
+                assert!(!name.is_null());
+                let sub = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+                assert!(sub >= 0);
+                sub
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_run_phase_ioctls_and_holes in a separate process"]
+        fn run_phase_child() {
+            use std::os::unix::io::AsRawFd;
+            let tty = pty();
+            let path = std::env::temp_dir().join(format!("wick-holes-{}", std::process::id()));
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_len(1 << 20).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            // SAFETY: termios is plain data the call fills.
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: a terminal descriptor and a termios to fill and set.
+            unsafe {
+                assert_eq!(libc::tcgetattr(tty, &mut t), 0);
+                assert_eq!(libc::tcsetattr(tty, libc::TCSANOW, &t), 0);
+            }
+            // SAFETY: a regular file; the compatibility libc's fallocate.
+            let ret = unsafe {
+                libc::fallocate(
+                    file.as_raw_fd(),
+                    // FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE (Linux values).
+                    0x02 | 0x01,
+                    4096,
+                    65536,
+                )
+            };
+            assert_eq!(ret, 0, "{}", std::io::Error::last_os_error());
+            println!("CHILD-OK");
+        }
+
+        #[test]
+        #[ignore = "run by test_run_phase_ioctls_and_holes in a separate process"]
+        fn other_ioctl_child() {
+            let tty = pty();
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            println!("NARROWED");
+            let c: libc::c_char = 0;
+            // SAFETY: TIOCSTI on a terminal descriptor with a one-byte argument.
+            unsafe { libc::ioctl(tty, libc::TIOCSTI, &c) };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        // Binding a Unix socket is setup's only: Linux's VMM filter has no bind.
+        #[test]
+        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        fn bind_after_narrow_child() {
+            let path = std::env::temp_dir().join(format!("wick-bind-{}", std::process::id()));
+            select(Policy::Default);
+            apply().unwrap();
+            let early = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            drop(early);
+            let _ = std::fs::remove_file(&path);
+            narrow().unwrap();
+            let _ = std::os::unix::net::UnixListener::bind(&path);
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
         }
@@ -845,15 +1057,9 @@ mod macos {
             std::fs::write(&path, b"x").unwrap();
             std::fs::remove_file(&path).unwrap();
             let (_a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
-            // IP networking is denied (program execution raises SIGSYS:
-            // test_unlisted_syscalls_raise_sigsys).
-            let denied = |e: std::io::Error| e.raw_os_error() == Some(libc::EPERM);
-            assert!(denied(
-                std::net::TcpStream::connect("127.0.0.1:9").unwrap_err()
-            ));
-            assert!(denied(
-                std::net::UdpSocket::bind("127.0.0.1:0").unwrap_err()
-            ));
+            // A file the profile does not allow fails with an error, as a
+            // path outside the chroot does on Linux (IP networking and program
+            // execution raise SIGSYS: test_unlisted_syscalls_raise_sigsys).
             println!("CHILD-OK");
         }
     }
