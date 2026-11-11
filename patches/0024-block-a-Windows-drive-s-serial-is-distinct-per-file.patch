@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Wed, 11 Nov 2026 14:53:45 +0900
+Subject: [PATCH] block: a Windows drive's serial is distinct per file
+
+kvmtool's decimal st_dev st_rdev st_ino of a Windows file (volume serial, 0, 64-bit file index) is up to 31 digits; the driver reads the first 20, so files of one volume shared a serial. On Windows the same identifiers are written in 20 base-32 digits (platform::fs::StatIds::device_id). Linux and macOS ids are unchanged. A test on every host checks that two files get distinct ids and a reopened file keeps its id.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/devices/virtio/block/virtio/device.rs | 34 +++++++++++++++----
+ 1 file changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/src/vmm/src/devices/virtio/block/virtio/device.rs b/src/vmm/src/devices/virtio/block/virtio/device.rs
+index e2fdcefa396d93a55e583451c24fcddc04c5aa76..e048151f472991f68edd7bd5ca5bde9188dd572b 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/device.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/device.rs
+@@ -152,12 +152,18 @@ impl DiskProperties {
+         let blk_metadata = crate::platform::fs::StatIds::of(disk_file)
+             .map_err(VirtioBlockError::GetFileMetadata)?;
+         // This is how kvmtool does it.
++        #[cfg(not(windows))]
+         let device_id = format!(
+             "{}{}{}",
+             blk_metadata.st_dev(),
+             blk_metadata.st_rdev(),
+             blk_metadata.st_ino()
+         );
++        // wick: in kvmtool's form, a Windows id is longer than the
++        // VIRTIO_BLK_ID_BYTES the driver reads, and files of a volume would
++        // share an id; this form of the same identifiers fits.
++        #[cfg(windows)]
++        let device_id = blk_metadata.device_id();
+         Ok(device_id)
+     }
+ 
+@@ -1866,19 +1872,16 @@ mod tests {
+                 assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+ 
+                 let blk_meta = blk_metadata.unwrap();
++                #[cfg(not(windows))]
+                 let expected_device_id = format!(
+                     "{}{}{}",
+                     blk_meta.st_dev(),
+                     blk_meta.st_rdev(),
+                     blk_meta.st_ino()
+                 );
+-                // wick: the driver gets the first VIRTIO_BLK_ID_BYTES of the id
+-                // (`build_disk_image_id`). A Windows id (volume serial number and 64-bit file
+-                // index) is longer than that; a Linux one is not.
++                // wick: as `build_device_id`.
+                 #[cfg(windows)]
+-                let expected_device_id = expected_device_id
+-                    [..expected_device_id.len().min(VIRTIO_BLK_ID_BYTES as usize)]
+-                    .to_string();
++                let expected_device_id = blk_meta.device_id();
+ 
+                 let mut buf = [0; VIRTIO_BLK_ID_BYTES as usize];
+                 mem.read_slice(&mut buf, data_addr).unwrap();
+@@ -2225,7 +2228,11 @@ mod tests {
+             #[cfg(windows)]
+             let mdata = crate::platform::fs::StatIds::of(f.as_file()).unwrap();
+             let mut id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
++            #[cfg(not(windows))]
+             let str_id = format!("{}{}{}", mdata.st_dev(), mdata.st_rdev(), mdata.st_ino());
++            // wick: as `build_device_id`.
++            #[cfg(windows)]
++            let str_id = mdata.device_id();
+             let part_id = str_id.as_bytes();
+             id[..cmp::min(part_id.len(), VIRTIO_BLK_ID_BYTES as usize)].clone_from_slice(
+                 &part_id[..cmp::min(part_id.len(), VIRTIO_BLK_ID_BYTES as usize)],
+@@ -2251,4 +2258,19 @@ mod tests {
+             assert_eq!(block.disk.image_id, id.as_slice());
+         }
+     }
++
++    // wick: what the guest reads as a drive's serial is distinct for each file
++    // and the same each time the file is opened (`update_disk_image`, restore).
++    #[test]
++    fn test_disk_image_id_is_per_file_and_stable() {
++        let first = TempFile::new().unwrap();
++        let second = TempFile::new().unwrap();
++        let first_id = DiskProperties::build_disk_image_id(first.as_file());
++        assert_ne!(
++            first_id,
++            DiskProperties::build_disk_image_id(second.as_file())
++        );
++        let reopened = File::open(first.as_path()).unwrap();
++        assert_eq!(DiskProperties::build_disk_image_id(&reopened), first_id);
++    }
+ }

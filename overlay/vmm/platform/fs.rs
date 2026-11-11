@@ -97,6 +97,34 @@ impl StatIds {
     pub fn st_ino(&self) -> u64 {
         self.0.st_ino
     }
+
+    /// The id a block device backed by this file reports to the guest
+    /// (`VIRTIO_BLK_T_GET_ID`), in place of kvmtool's decimal
+    /// `st_dev st_rdev st_ino`, which the driver reads only the first
+    /// `VIRTIO_BLK_ID_BYTES` (20) of. On Linux that form fits; a Windows one
+    /// (a 32-bit volume serial number, `0` and a 64-bit file index whose top
+    /// 16 bits are the NTFS sequence number) is up to 31 digits, so files of
+    /// one volume would share an id. Here the volume and the file index, 96
+    /// bits, are written as 20 base-32 digits, which keeps every bit: distinct
+    /// per file, and the same each time the file is opened, as on Linux.
+    pub fn device_id(&self) -> String {
+        device_id(self.0.st_dev, self.0.st_ino)
+    }
+}
+
+/// See [`StatIds::device_id`]: `volume` (a 32-bit serial number) and `index`
+/// as one 96-bit number in 20 lowercase base-32 digits (`0-9a-v`), most
+/// significant first.
+#[cfg(windows)]
+fn device_id(volume: u64, index: u64) -> String {
+    const DIGITS: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+    // `fstat` reports `dwVolumeSerialNumber`: 32 bits.
+    let volume = u32::try_from(volume).expect("a volume serial number is 32 bits");
+    let id = (u128::from(volume) << 64) | u128::from(index);
+    (0..20)
+        .rev()
+        .map(|digit| char::from(DIGITS[((id >> (5 * digit)) & 31) as usize]))
+        .collect()
 }
 
 /// The bytes the file system has allocated to `file`: `st_blocks` times 512,
@@ -193,6 +221,50 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
+    // Ids that kvmtool's decimal form, cut to 20 bytes, would make equal: a
+    // volume serial of 10 digits, `0`, and NTFS indices of consecutive files
+    // (sequence number 1) that differ past the 20th digit.
+    #[cfg(windows)]
+    #[test]
+    fn test_device_id_keeps_every_bit() {
+        let volume = 0xcafe_babe_u64;
+        let (first, second) = ((1u64 << 48) | 0x1234, (1u64 << 48) | 0x1235);
+        let cut = |index: u64| format!("{volume}0{index}")[..20].to_string();
+        assert_eq!(cut(first), cut(second), "the collision this replaces");
+
+        let ids = [device_id(volume, first), device_id(volume, second)];
+        assert_ne!(ids[0], ids[1]);
+        for id in &ids {
+            assert_eq!(id.len(), 20);
+            let digits = id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase());
+            assert!(digits, "{id}");
+        }
+        // The volume and the index do not run into each other.
+        assert_ne!(device_id(1, 0), device_id(0, 1 << 63));
+        assert_eq!(device_id(0, 0), "00000000000000000000");
+        assert_eq!(
+            device_id(u64::from(u32::MAX), u64::MAX),
+            "1vvvvvvvvvvvvvvvvvvv"
+        );
+    }
+
+    // Two files of one volume have distinct ids, and a file keeps its id when
+    // it is opened again (`build_disk_image_id` on a drive update or restore).
+    #[cfg(windows)]
+    #[test]
+    fn test_device_id_is_per_file_and_stable() {
+        let a = TempFile::new().unwrap();
+        let b = TempFile::new().unwrap();
+        let id = |f: &File| StatIds::of(f).unwrap().device_id();
+        let volume = |f: &File| StatIds::of(f).unwrap().st_dev();
+        assert_eq!(volume(a.as_file()), volume(b.as_file()));
+        assert_ne!(id(a.as_file()), id(b.as_file()));
+        let reopened = File::open(a.as_path()).unwrap();
+        assert_eq!(id(&reopened), id(a.as_file()));
+    }
+
     fn write_at(w: &mut SparseWriter, data: &mut [u8], at: u64) {
         w.seek(SeekFrom::Start(at)).unwrap();
         // SAFETY: `data` outlives the slice.
@@ -254,5 +326,4 @@ mod tests {
         assert!(back[at + diff.len()..].iter().all(|b| *b == 0x11));
         assert!(allocated(&file) >= 16 * MIB);
     }
-
 }
