@@ -98,6 +98,7 @@ use windows_sys::Win32::Security::{
     TOKEN_DEFAULT_DACL, TOKEN_GROUPS, TOKEN_OWNER, TOKEN_QUERY,
     TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenImpersonation,
     TokenIntegrityLevel, TokenOwner, TokenUser, PROTECTED_DACL_SECURITY_INFORMATION, ACL,
+    TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TokenElevationType, TokenElevationTypeFull, TokenLinkedToken,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION, DefineDosDeviceW, GetLogicalDrives,
@@ -1152,12 +1153,59 @@ fn enable_privilege(token: HANDLE, p: LUID_AND_ATTRIBUTES) -> Result<(), HostErr
     Ok(())
 }
 
+/// `SE_GROUP_USE_FOR_DENY_ONLY` (winnt.h).
+const GROUP_DENY_ONLY: u32 = 0x10;
+
+/// The entries of a `TokenGroups` buffer.
+fn group_entries(buf: &[u64]) -> &[SID_AND_ATTRIBUTES] {
+    // SAFETY: the buffer holds a TOKEN_GROUPS with `GroupCount` entries.
+    unsafe {
+        let g = &*buf.as_ptr().cast::<TOKEN_GROUPS>();
+        std::slice::from_raw_parts(g.Groups.as_ptr(), g.GroupCount as usize)
+    }
+}
+
+/// The groups of `from` (its `entries`) to mark deny-only in the jail's
+/// token: for an elevated token, exactly the groups its UAC-filtered twin
+/// (`TokenLinkedToken`) marks so; for a token UAC did not split, the groups
+/// UAC's filter marks, by name ([`is_admin_group`]).
+fn groups_to_deny(from: HANDLE, entries: &[SID_AND_ATTRIBUTES]) -> Result<Vec<SID_AND_ATTRIBUTES>, HostError> {
+    let elevation = token_info(from, TokenElevationType)?;
+    // SAFETY: the buffer holds a TOKEN_ELEVATION_TYPE.
+    let kind = unsafe { *elevation.as_ptr().cast::<TOKEN_ELEVATION_TYPE>() };
+    let names: Vec<String> = entries
+        .iter()
+        .map(|g| sid_string(g.Sid).map_err(|e| HostError::Spawn("a group's SID", e)))
+        .collect::<Result<_, _>>()?;
+    let denied: Vec<bool> = if kind == TokenElevationTypeFull {
+        let linked = token_info(from, TokenLinkedToken)?;
+        // SAFETY: the buffer holds a TOKEN_LINKED_TOKEN, whose handle is ours to close.
+        let linked = unsafe { OwnedHandle::from_raw_handle((*linked.as_ptr().cast::<TOKEN_LINKED_TOKEN>()).LinkedToken) };
+        let groups = token_info(linked.as_raw_handle(), TokenGroups)?;
+        let mut by_uac = Vec::new();
+        for g in group_entries(&groups) {
+            if g.Attributes & GROUP_DENY_ONLY != 0 {
+                by_uac.push(sid_string(g.Sid).map_err(|e| HostError::Spawn("a group's SID", e))?);
+            }
+        }
+        names.iter().map(|n| by_uac.contains(n)).collect()
+    } else {
+        names.iter().map(|n| is_admin_group(n)).collect()
+    };
+    Ok(entries
+        .iter()
+        .zip(denied)
+        .filter(|(g, d)| *d && g.Attributes & GROUP_DENY_ONLY == 0)
+        .map(|(g, _)| SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 })
+        .collect())
+}
+
 /// Whether `sid` is a group a UAC-filtered token marks deny-only (what
 /// `LUA_TOKEN` does): the administrators and the other operator groups,
 /// local and domain, and "local account and member of Administrators".
 fn is_admin_group(sid: &str) -> bool {
-    const BUILTIN: [&str; 10] = ["544", "547", "548", "549", "550", "551", "553", "554", "556", "578"];
-    const DOMAIN: [&str; 5] = ["512", "517", "518", "519", "520"];
+    const BUILTIN: [&str; 11] = ["544", "547", "548", "549", "550", "551", "553", "554", "556", "569", "578"];
+    const DOMAIN: [&str; 8] = ["498", "512", "516", "517", "518", "519", "520", "521"];
     if sid == "S-1-5-114" {
         return true;
     }
@@ -1168,7 +1216,7 @@ fn is_admin_group(sid: &str) -> bool {
 }
 
 /// A restricted token: the administrators' groups deny-only
-/// ([`is_admin_group`]), the user its owner, no privileges but
+/// ([`groups_to_deny`]), the user its owner, no privileges but
 /// [`KEPT_PRIVILEGES`] (with [`LOCK_MEMORY`] enabled, so a jailed
 /// Firecracker maps large pages without adjusting a token it may not
 /// open), `restricting` SIDs, the default DACL and the jail's integrity
@@ -1181,18 +1229,7 @@ fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedH
     let delete: Vec<LUID_AND_ATTRIBUTES> =
         held.iter().filter(|(n, _)| !KEPT_PRIVILEGES.contains(&n.as_str())).map(|(_, p)| *p).collect();
     let groups = token_info(from, TokenGroups)?;
-    // SAFETY: the buffer holds a TOKEN_GROUPS with `GroupCount` entries.
-    let entries = unsafe {
-        let g = &*groups.as_ptr().cast::<TOKEN_GROUPS>();
-        std::slice::from_raw_parts(g.Groups.as_ptr(), g.GroupCount as usize)
-    };
-    let mut disable = Vec::new();
-    for g in entries {
-        let text = sid_string(g.Sid).map_err(|e| HostError::Spawn("a group's SID", e))?;
-        if is_admin_group(&text) {
-            disable.push(SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 });
-        }
-    }
+    let disable = groups_to_deny(from, group_entries(&groups))?;
     let mut t: HANDLE = std::ptr::null_mut();
     // SAFETY: a token we own, valid SID arrays and a valid privilege array.
     if unsafe {
@@ -1871,10 +1908,33 @@ mod tests {
     // that would strip SeLockMemoryPrivilege with the rest.
     #[test]
     fn test_tokens_disable_the_administrators_and_are_owned_by_the_user() {
-        /// `SE_GROUP_USE_FOR_DENY_ONLY` (winnt.h).
-        const DENY_ONLY: u32 = 0x10;
+        const DENY_ONLY: u32 = GROUP_DENY_ONLY;
         assert!(is_admin_group("S-1-5-32-544") && is_admin_group("S-1-5-114") && is_admin_group("S-1-5-21-1-2-3-512"));
         assert!(!is_admin_group("S-1-5-32-545") && !is_admin_group("S-1-5-21-1-2-3-1001") && !is_admin_group("S-1-1-0"));
+        // On an elevated token, UAC's own filter (the linked token) and the
+        // list agree on which of this token's groups to mark.
+        let mut own: HANDLE = std::ptr::null_mut();
+        // SAFETY: our own token.
+        assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut own) }, 0);
+        // SAFETY: a token handle we own.
+        let own = unsafe { OwnedHandle::from_raw_handle(own) };
+        let groups = token_info(own.as_raw_handle(), TokenGroups).unwrap();
+        let entries = group_entries(&groups);
+        let elevation = token_info(own.as_raw_handle(), TokenElevationType).unwrap();
+        // SAFETY: the buffer holds a TOKEN_ELEVATION_TYPE.
+        if unsafe { *elevation.as_ptr().cast::<TOKEN_ELEVATION_TYPE>() } == TokenElevationTypeFull {
+            let by_uac: Vec<String> =
+                groups_to_deny(own.as_raw_handle(), entries).unwrap().iter().map(|g| sid_string(g.Sid).unwrap()).collect();
+            let by_list: Vec<String> = entries
+                .iter()
+                .filter(|g| g.Attributes & DENY_ONLY == 0)
+                .map(|g| sid_string(g.Sid).unwrap())
+                .filter(|n| is_admin_group(n))
+                .collect();
+            assert_eq!(by_uac, by_list, "UAC's filter and the list disagree");
+        } else {
+            eprintln!("this token is not elevated: UAC's filter was not compared with the list");
+        }
         let t = tokens().unwrap();
         let user = user_sid().unwrap();
         for token in [&t.primary, &t.initial] {
