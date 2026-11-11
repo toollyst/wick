@@ -4,12 +4,53 @@
 """procps' `ps` options upstream's framework uses, on macOS's ps.
 
 `--no-headers` becomes empty column titles (`-o pid=`), and the procps
-column `cmd` is BSD's `command`. Everything else goes to /bin/ps as given.
+column `cmd` is BSD's `command`. `-T -p <pid>` lists the process's threads
+as procps does (PID SPID TTY TIME CMD, CMD the thread's name), which macOS's
+ps cannot: names from proc_pidinfo, and a thread that has not named itself
+shows the process's name, as a Linux thread inherits its creator's. Everything
+else goes to /bin/ps as given.
 """
+import ctypes
 import os
 import sys
 
 args = sys.argv[1:]
+
+
+def threads(pid):
+    """The process's threads: (thread id, name)."""
+    libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    proc_pidlistthreadids, proc_pidthreadid64info = 28, 15
+    ids = (ctypes.c_uint64 * 4096)()
+    n = libsystem.proc_pidinfo(pid, proc_pidlistthreadids, ctypes.c_uint64(0), ids, ctypes.sizeof(ids))
+    if n <= 0:
+        return None
+    comm = ctypes.create_string_buffer(256)
+    libsystem.proc_name(pid, comm, 256)
+    out = []
+    info = ctypes.create_string_buffer(112)  # struct proc_threadinfo; pth_name at 48
+    for tid in ids[: n // 8]:
+        if libsystem.proc_pidinfo(pid, proc_pidthreadid64info, ctypes.c_uint64(tid), info, 112) <= 0:
+            continue
+        name = info.raw[48:112].split(b"\0", 1)[0].decode(errors="replace")
+        out.append((tid, name or comm.value.decode(errors="replace")))
+    return out
+
+
+if "-T" in args:
+    rest = [a for a in args if a not in ("-T", "--no-headers")]
+    if len(rest) != 2 or rest[0] != "-p" or not rest[1].isdigit():
+        print(f"ps (wick, macOS): -T only as `ps -T [--no-headers] -p <pid>`, not {args}", file=sys.stderr)
+        sys.exit(2)
+    listed = threads(int(rest[1]))
+    if listed is None:
+        sys.exit(1)
+    if "--no-headers" not in args:
+        print("    PID    SPID TTY          TIME CMD")
+    for tid, name in listed:
+        print(f"{rest[1]:>7} {tid:>7} ?        00:00:00 {name}")
+    sys.exit(0)
+
 no_headers = "--no-headers" in args
 args = [a for a in args if a != "--no-headers"]
 out = []

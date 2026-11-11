@@ -79,14 +79,18 @@ export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/lib/firecracker/build/cargo_target}"
 (cd "$ROOT/lib/firecracker" && CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked --release \
     -p firecracker -p jailer -p snapshot-editor -p rebase-snap -p cpu-template-helper \
-    -p seccompiler -p log-instrument --bins --examples)
+    -p seccompiler -p log-instrument -p clippy-tracing --bins --examples)
 bin="$out/bin"
 mkdir -p "$bin/examples"
-for b in firecracker jailer snapshot-editor rebase-snap cpu-template-helper seccompiler-bin; do
+for b in firecracker jailer snapshot-editor rebase-snap cpu-template-helper seccompiler-bin clippy-tracing; do
     cp "$TARGET_DIR/release/$b" "$bin/$b"
 done
 find "$TARGET_DIR/release/examples" -maxdepth 1 -type f -perm -u+x ! -name '*-*' -exec cp {} "$bin/examples/" \;
-codesign --force --sign - --entitlements "$ROOT/tools/macos/hypervisor.entitlements" "$bin/firecracker"
+# Both make a microVM (cpu-template-helper boots one to read its CPU's
+# configuration): Hypervisor.framework serves only a signed entitlement.
+for b in firecracker cpu-template-helper; do
+    codesign --force --sign - --entitlements "$ROOT/tools/macos/hypervisor.entitlements" "$bin/$b"
+done
 # Upstream's memory monitor counts the pages each mapping has resident. On
 # Linux that is the pages a process mapped; a macOS observer that is not the
 # process's debugger sees the pages of the mapped object, which for a file
@@ -143,6 +147,7 @@ env_args=(
     "WICK_IT_MODE=$mode" "WICK_IT_ROOT=$session" "TMPDIR=$session/tmp"
     "WICK_IT_NETNS_HELPER=$bin/netns-slirp" "WICK_IT_VHOST_USER_BLK=$bin/vhost-user-blk"
     "WICK_IT_BINARY_DIR=$bin"
+    "MKE2FS_CONFIG=$ROOT/tools/macos/integration/mke2fs.conf"
     "PYTEST_ADDOPTS=${PYTEST_ADDOPTS:-}"
 )
 mkdir -p "$session/tmp"

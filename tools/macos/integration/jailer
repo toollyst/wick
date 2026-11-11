@@ -72,7 +72,9 @@ def in_jail(root, path):
 
 
 def translate_config(root, path):
-    host = in_jail(root, path)
+    # Relative, the path is the jail's too: Firecracker runs in the jail's
+    # directory, as after the jailer's chroot.
+    host = in_jail(root, path) if path.startswith("/") else os.path.join(root, path)
     with open(host, encoding="utf-8") as f:
         cfg = json.load(f)
 

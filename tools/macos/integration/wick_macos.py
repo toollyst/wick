@@ -260,6 +260,36 @@ def _host_build(real):
 _cargo_build.build_fuzzing = _host_build(_cargo_build.build_fuzzing)
 _cargo_build.build_gdb = _host_build(_cargo_build.build_gdb)
 
+_real_cargo = _cargo_build.cargo
+LINUX_HOST_TARGET = re.compile(r"--target\s+(\S+)-unknown-linux-musl\b")
+
+
+def cargo(subcommand, cargo_args="", subcommand_args="", **kwargs):
+    """`cargo_build.cargo`; a build for the host's musl target (as
+    test_instrumented_firecracker.py asks for one) is a build for the host's
+    target here, signed as tools/macos/integration-tests.sh signs Firecracker,
+    and found where the test looks: `<target dir>/<arch>-unknown-linux-musl`
+    names the host target's directory."""
+    m = LINUX_HOST_TARGET.search(cargo_args)
+    if subcommand != "build" or not m:
+        return _real_cargo(subcommand, cargo_args, subcommand_args, **kwargs)
+    out = _real_cargo(subcommand, LINUX_HOST_TARGET.sub(f"--target {HOST_TARGET}", cargo_args),
+                      subcommand_args, **kwargs)
+    env = kwargs.get("env") or {}
+    target_dir = pathlib.Path(kwargs.get("cwd") or ".") / env.get(
+        "CARGO_TARGET_DIR", os.environ.get("CARGO_TARGET_DIR", "target"))
+    linux = target_dir / f"{m.group(1)}-unknown-linux-musl"
+    if not linux.exists():
+        linux.symlink_to(HOST_TARGET)
+    profile = "release" if "--release" in cargo_args else "debug"
+    fc = target_dir / HOST_TARGET / profile / "firecracker"
+    if fc.exists():
+        _utils.check_output(f"codesign --force --sign - --entitlements {ENTITLEMENTS} {fc}")
+    return out
+
+
+_cargo_build.cargo = cargo
+
 # ------------------------------------------------------- process memory
 
 _libsystem._dyld_get_shared_cache_range.restype = ctypes.c_void_p
@@ -501,6 +531,37 @@ if RUNS_AS_USER:
 
     _http_api.Resource.request = request
     _http_api.Resource.get = get
+
+    import framework.utils_uffd as _utils_uffd  # noqa: E402  pylint: disable=wrong-import-position
+
+    def uffd_spawn(self, uid, gid):
+        """`UffdHandler.spawn` without the chroot (root's): the handler runs
+        in the jail's directory, as the stand-in runs Firecracker, and the
+        paths it is given as the jail's (`/<name>`) are given relative to it
+        (JAIL_RELATIVE), where Firecracker's own `/firecracker-uffd.sock`
+        resolves. Upstream's chroot would leave the worker's root and working
+        directory changed when it is refused."""
+        del uid, gid  # the jail's user is the session's user
+        root = pathlib.Path(self._chroot)  # pylint: disable=protected-access
+        handler = root / self._handler_name  # pylint: disable=protected-access
+        handler.chmod(handler.stat().st_mode | 0o111)
+        log = root / self._log_file  # pylint: disable=protected-access
+        with open(log, "w", encoding="utf-8") as logfile:
+            # The handler's own path is the host's: the session's cleanup
+            # finds what it started by its root in the command line.
+            self._proc = subprocess.Popen(  # pylint: disable=protected-access,consider-using-with
+                [str(handler), JAIL_RELATIVE + self.socket_path.lstrip("/"), self.snapshot.mem.name],
+                stdout=logfile,
+                stderr=subprocess.STDOUT,
+                cwd=root,
+            )
+        # As upstream: time to start, or to fail.
+        time.sleep(1)
+        if not self.is_running():
+            print(log.read_text(encoding="utf-8"))
+            assert False, "Could not start PF handler!"
+
+    _utils_uffd.UffdHandler.spawn = uffd_spawn
 
 # ------------------------------------------------- files Firecracker maps
 
