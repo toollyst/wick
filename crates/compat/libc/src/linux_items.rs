@@ -95,6 +95,33 @@ pub mod wick_mm {
         super::set_errno(upstream::EPERM);
         true
     }
+
+    static ADVICE_DENIED: AtomicUsize = AtomicUsize::new(0);
+    static ADVICE_ALLOWED: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+    /// From now on, [`super::madvise`] calls `hook` for any advice but
+    /// `allowed` (the hook raises `SIGSYS`); if it returns, the call fails
+    /// with `EPERM`. The check of upstream's `api` filter, which allows
+    /// `madvise` with `MADV_DONTNEED` only, for the API process
+    /// (`vmm::ext::api_process`). Only calls through this crate are checked:
+    /// the system libraries' own (libmalloc's) and a raw system call are not.
+    pub fn allow_only_advice(allowed: c_int, hook: extern "C" fn(c_int)) {
+        ADVICE_ALLOWED.store(allowed, Ordering::Release);
+        ADVICE_DENIED.store(hook as usize, Ordering::Release);
+    }
+
+    /// Whether a call with `advice` is denied, after the hook ran.
+    pub(super) fn advice_denied(advice: c_int) -> bool {
+        let hook = ADVICE_DENIED.load(Ordering::Acquire);
+        if hook == 0 || advice == ADVICE_ALLOWED.load(Ordering::Acquire) {
+            return false;
+        }
+        // SAFETY: only `extern "C" fn(c_int)` values are stored.
+        let hook: extern "C" fn(c_int) = unsafe { core::mem::transmute(hook) };
+        hook(advice);
+        super::set_errno(upstream::EPERM);
+        true
+    }
 }
 
 /// `mprotect`, with the [`wick_mm`] check.
@@ -425,11 +452,15 @@ fn file_under(addr: u64) -> bool {
 /// and unmapped pages in the range then give `ENOMEM`. In a huge page
 /// mapping ([`mmap_huge`]) the start must be huge page aligned (`EINVAL`,
 /// with the parts before it discarded) and the end is rounded down to a huge
-/// page. Other advice is passed through.
+/// page. Other advice is passed through. Advice
+/// [`wick_mm::allow_only_advice`] denies raises `SIGSYS`.
 ///
 /// # Safety
 /// Same contract as `madvise(2)`.
 pub unsafe fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
+    if wick_mm::advice_denied(advice) {
+        return -1;
+    }
     if advice != libc::MADV_DONTNEED {
         // SAFETY: forwarded unchanged.
         return unsafe { libc::madvise(addr, len, advice) };
