@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Wed, 11 Nov 2026 18:52:26 +0900
+Subject: [PATCH] vmm: the huge page guest region test runs on Windows when a
+ large page maps
+
+Windows has no /proc/meminfo and no huge page pool: large pages come from
+free memory to an account that holds "Lock pages in memory". The test
+helper that counts free 2 MiB pages maps one there instead, so
+test_guest_region_alignment_and_size_huge runs Firecracker's allocate()
+(PROT_NONE reservation, then MAP_FIXED over it) on large pages.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vmm/src/vstate/memory.rs | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/vmm/src/vstate/memory.rs b/src/vmm/src/vstate/memory.rs
+index d9b9468b0406c1dfe452a5e057005c0f544faeba..c8734513bbb4e99e6c4897c0d32c5656b07eeca3 100644
+--- a/src/vmm/src/vstate/memory.rs
++++ b/src/vmm/src/vstate/memory.rs
+@@ -2482,6 +2482,33 @@ mod tests {
+     }
+ 
+     /// Returns the number of free 2 MiB hugepages on the system.
++    // wick: Windows has no /proc/meminfo and no huge page pool: large pages
++    // come from free memory to an account that holds "Lock pages in memory".
++    // One 2 MiB large page is free when mapping one succeeds.
++    #[cfg(windows)]
++    fn free_hugepages_2m() -> usize {
++        let len = mib_to_bytes(2);
++        // SAFETY: a new anonymous mapping, unmapped below.
++        let p = unsafe {
++            libc::mmap(
++                std::ptr::null_mut(),
++                len,
++                libc::PROT_READ,
++                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | libc::MAP_HUGE_2MB,
++                -1,
++                0,
++            )
++        };
++        if p == libc::MAP_FAILED {
++            return 0;
++        }
++        // SAFETY: the mapping made above.
++        assert_eq!(unsafe { libc::munmap(p, len) }, 0);
++        1
++    }
++
++    /// Returns the number of free 2 MiB hugepages on the system.
++    #[cfg(not(windows))]
+     fn free_hugepages_2m() -> usize {
+         let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+         meminfo

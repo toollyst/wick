@@ -697,12 +697,9 @@ pub(crate) fn mask_unsupported(e: &mut kvm_bindings::kvm_cpuid_entry2) {
     }
     match (e.function, e.index) {
         (0x1, _) => {
-            // ECX: DTES64, MONITOR, DS_CPL, VMX, SMX, EST, TM2, xTPR, PDCM,
-            // and TSC_DEADLINE: WHP's emulated local APIC has no TSC-deadline
-            // mode (a write of IA32_TSC_DEADLINE arms nothing), so a guest
-            // that used it would have no local timer; without it, Linux uses
-            // the APIC timer's one-shot mode.
-            e.ecx &= !bits(&[2, 3, 4, 5, 6, 7, 8, 14, 15, 24]);
+            // ECX: DTES64, MONITOR, DS_CPL, VMX, SMX, EST, TM2, xTPR, PDCM.
+            // TSC_DEADLINE stays, as KVM emulates the mode (`tscdeadline`).
+            e.ecx &= !bits(&[2, 3, 4, 5, 6, 7, 8, 14, 15]);
             // EDX: DS, ACPI (thermal), TM, PBE.
             e.edx &= !bits(&[21, 22, 29, 31]);
         }
@@ -900,6 +897,8 @@ pub(crate) fn msr_index_list() -> Result<MsrList> {
         0xc000_0100, 0xc000_0101, 0xc000_0102,
         // kvm-clock (pvclock).
         super::pvclock::MSR_WALL_CLOCK, super::pvclock::MSR_SYSTEM_TIME,
+        // IA32_TSC_DEADLINE (tscdeadline).
+        super::tscdeadline::MSR_TSC_DEADLINE,
     ]
     .to_vec();
     MsrList::from_entries(&indices).map_err(|_| super::Error::new(libc::EINVAL))

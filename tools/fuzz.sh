@@ -28,6 +28,7 @@ FUZZ_DIR="$WICK_ROOT/fuzz"
 host_targets() {
     echo vnet_segment
     echo vnet_offload
+    echo whp_irqchip
     if [[ "$(uname -s)" == Darwin ]]; then
         echo uffd_protocol
     fi
@@ -41,6 +42,8 @@ target_args() {
     vnet_offload) echo "-max_len=4096" ;;
     # Each run creates and releases a userfaultfd (a thread and a socket pair).
     uffd_protocol) echo "-max_len=4096" ;;
+    # Up to 256 guest accesses, line changes, routes and snapshots.
+    whp_irqchip) echo "-max_len=8192" ;;
     *) die "unknown target '$1' (tools/fuzz.sh --list)" ;;
     esac
 }

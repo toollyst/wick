@@ -49,9 +49,9 @@
 //!   files or API socket, nor the jailed process, although the user's SID
 //!   grants them; Firecracker, at that level, and the operator, above it, can.
 //! - **cgroups are a Job Object** ([`cgroup`](super::cgroup)): job memory
-//!   limit, CPU rate hard cap (from Firecracker's third CPU-second on, see
-//!   `CPU_CAP_GRACE_100NS`), active process limit; the job kills
-//!   Firecracker when the jailer goes and limits its UI access.
+//!   limit, CPU rate hard cap (from Firecracker's start, as a cgroup's
+//!   limit holds from the exec) or CPU weight, processor affinity; the job
+//!   kills Firecracker when the jailer goes and limits its UI access.
 //! - **No exec**: the jailer starts Firecracker suspended in the job with the
 //!   tokens, waits for it, removes the jail's drive and exits with its status.
 //! - **`--daemonize`** ([`daemonize`]): Windows has no fork, so the jailer
@@ -79,7 +79,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED, FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0,
     LocalFree, SetHandleInformation,
 };
@@ -89,7 +89,8 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, DuplicateTokenEx,
+    AdjustTokenPrivileges, CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx,
+    LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, SE_PRIVILEGE_ENABLED, TOKEN_PRIVILEGES, TokenPrivileges,
     GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, GetTokenInformation,
     LABEL_SECURITY_INFORMATION, LUA_TOKEN, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
     SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS,
@@ -105,7 +106,8 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
-    JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED,
+    JOB_OBJECT_LIMIT_AFFINITY, JobObjectGroupInformationEx,
     JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
     JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
@@ -219,11 +221,14 @@ pub enum HostError {
     )]
     Unsupported(&'static str, &'static str),
     #[error(
-        "--cgroup {0} is not supported on Windows (supported: memory.max, cpu.max and pids.max \
-         with --cgroup-version 2; memory.limit_in_bytes, cpu.cfs_quota_us, cpu.cfs_period_us and \
-         pids.max with --cgroup-version 1). The jailer never accepts a limit it cannot enforce."
+        "--cgroup {0} is not supported on Windows (supported: memory.max, cpu.max, cpu.weight, \
+         cpu.weight.nice, cpuset.cpus and cpuset.mems with --cgroup-version 2; \
+         memory.limit_in_bytes, cpu.cfs_quota_us, cpu.cfs_period_us, cpu.shares, cpuset.cpus and \
+         cpuset.mems with --cgroup-version 1). The jailer never accepts a limit it cannot enforce."
     )]
     UnsupportedCgroup(String),
+    #[error("--cgroup {0} is refused on Windows: {1}. The jailer never accepts a limit it cannot enforce.")]
+    ImpossibleCgroup(String, &'static str),
     #[error("--cgroup {0}: {1}")]
     CgroupValue(String, &'static str),
     #[error(
@@ -281,18 +286,22 @@ struct Jail {
 static JAIL: Mutex<Option<Jail>> = Mutex::new(None);
 
 /// The Job Object limits, from the cgroup configuration.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Limits {
     pub memory_bytes: Option<u64>,
     /// Hundredths of a percent of all processors (`CpuRate`).
     pub cpu_rate: Option<u32>,
-    pub processes: Option<u32>,
+    /// The job's CPU weight, 1 to 9 (`Weight`); never with `cpu_rate`.
+    pub cpu_weight: Option<u32>,
+    /// The processors the job runs on: an affinity mask per processor group.
+    pub cpus: Option<Vec<(u16, u64)>>,
 }
 
 static LIMITS: Mutex<Limits> = Mutex::new(Limits {
     memory_bytes: None,
     cpu_rate: None,
-    processes: None,
+    cpu_weight: None,
+    cpus: None,
 });
 
 pub(crate) fn set_limits(limits: Limits) {
@@ -1066,19 +1075,71 @@ fn tokens() -> Result<Tokens, HostError> {
     Ok(Tokens { primary, initial })
 }
 
-/// A restricted token: no privileges, `restricting` SIDs, the default DACL
+/// "Lock pages in memory": guest memory on large pages (`huge_pages`) needs
+/// it, as huge pages on Linux need a pool an administrator reserved.
+const LOCK_MEMORY: &str = "SeLockMemoryPrivilege";
+
+/// The privileges a jailed process keeps, when the operator's token holds
+/// them: `SeChangeNotifyPrivilege` (traversal, the one `DISABLE_MAX_PRIVILEGE`
+/// keeps) and [`LOCK_MEMORY`], which an administrator grants an account for
+/// large pages. Every other privilege is deleted from the jail's tokens.
+const KEPT_PRIVILEGES: [&str; 2] = ["SeChangeNotifyPrivilege", LOCK_MEMORY];
+
+/// The privileges in `token`: (name, LUID and attributes).
+fn privileges(token: HANDLE) -> Result<Vec<(String, LUID_AND_ATTRIBUTES)>, HostError> {
+    let buf = token_info(token, TokenPrivileges)?;
+    // SAFETY: the buffer holds a TOKEN_PRIVILEGES.
+    let tp = unsafe { &*buf.as_ptr().cast::<TOKEN_PRIVILEGES>() };
+    // SAFETY: `PrivilegeCount` entries follow.
+    let entries = unsafe { std::slice::from_raw_parts(tp.Privileges.as_ptr(), tp.PrivilegeCount as usize) };
+    entries
+        .iter()
+        .map(|p| {
+            let mut name = [0u16; 64];
+            let mut len = 64u32;
+            // SAFETY: a LUID and a buffer of `len` characters.
+            if unsafe { LookupPrivilegeNameW(std::ptr::null(), &p.Luid, name.as_mut_ptr(), &mut len) } == 0 {
+                return Err(HostError::Spawn("LookupPrivilegeNameW", last_error()));
+            }
+            Ok((String::from_utf16_lossy(&name[..len as usize]), *p))
+        })
+        .collect()
+}
+
+/// Enables the privilege `p` in `token`, which holds it.
+fn enable_privilege(token: HANDLE, p: LUID_AND_ATTRIBUTES) -> Result<(), HostError> {
+    let tp = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES { Luid: p.Luid, Attributes: SE_PRIVILEGE_ENABLED }],
+    };
+    // SAFETY: a token we own and one privilege.
+    let ok = unsafe { AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+    // It succeeds without the privilege, and says so.
+    // SAFETY: plain call.
+    if ok == 0 || unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+        return Err(HostError::Spawn("enabling SeLockMemoryPrivilege in the jail's token", last_error()));
+    }
+    Ok(())
+}
+
+/// A restricted token: no privileges but [`KEPT_PRIVILEGES`] (with
+/// [`LOCK_MEMORY`] enabled, so a jailed Firecracker maps large pages without
+/// adjusting a token it may not open), `restricting` SIDs, the default DACL
 /// and the jail's integrity level.
 fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedHandle, HostError> {
+    let held = privileges(from)?;
+    let delete: Vec<LUID_AND_ATTRIBUTES> =
+        held.iter().filter(|(n, _)| !KEPT_PRIVILEGES.contains(&n.as_str())).map(|(_, p)| *p).collect();
     let mut t: HANDLE = std::ptr::null_mut();
-    // SAFETY: a token we own and a valid SID array.
+    // SAFETY: a token we own, a valid privilege array and a valid SID array.
     if unsafe {
         CreateRestrictedToken(
             from,
-            DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+            LUA_TOKEN,
             0,
             std::ptr::null(),
-            0,
-            std::ptr::null(),
+            u32::try_from(delete.len()).unwrap(),
+            delete.as_ptr(),
             u32::try_from(restricting.len()).unwrap(),
             restricting.as_ptr(),
             &mut t,
@@ -1089,6 +1150,9 @@ fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedH
     }
     // SAFETY: a token handle we own.
     let t = unsafe { OwnedHandle::from_raw_handle(t) };
+    if let Some((_, lock)) = held.iter().find(|(n, _)| n == LOCK_MEMORY) {
+        enable_privilege(t.as_raw_handle(), *lock)?;
+    }
 
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: a NUL-terminated SDDL string and an out-pointer.
@@ -1136,9 +1200,18 @@ fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedH
     Ok(t)
 }
 
+/// `GROUP_AFFINITY` (winnt.h).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct GroupAffinity {
+    mask: usize,
+    group: u16,
+    reserved: [u16; 3],
+}
+
 /// A Job Object with the cgroup limits: Firecracker dies with the jailer
 /// (kill on close) and has no UI access.
-fn job(limits: Limits) -> Result<OwnedHandle, HostError> {
+fn job(limits: &Limits) -> Result<OwnedHandle, HostError> {
     // SAFETY: an unnamed job.
     let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if h.is_null() {
@@ -1154,9 +1227,28 @@ fn job(limits: Limits) -> Result<OwnedHandle, HostError> {
         basic.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
         info.JobMemoryLimit = usize::try_from(bytes).unwrap_or(usize::MAX);
     }
-    if let Some(n) = limits.processes {
-        info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        info.BasicLimitInformation.ActiveProcessLimit = n;
+    // cpuset.cpus: processors of the first group are the job's affinity;
+    // any other group needs the per-group form (`JobObjectGroupInformationEx`).
+    let groups: Vec<GroupAffinity> = limits
+        .cpus
+        .iter()
+        .flatten()
+        .map(|&(group, mask)| GroupAffinity { mask: usize::try_from(mask).unwrap_or(usize::MAX), group, reserved: [0; 3] })
+        .collect();
+    if let [only] = groups.as_slice() {
+        if only.group == 0 {
+            basic.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY;
+            basic.Affinity = only.mask;
+        }
+    }
+    // SAFETY: plain data.
+    let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+    if let Some(rate) = limits.cpu_rate {
+        cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+        cpu.Anonymous.CpuRate = rate;
+    } else if let Some(weight) = limits.cpu_weight {
+        cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
+        cpu.Anonymous.Weight = weight;
     }
     let set = |class, ptr: *const std::ffi::c_void, size: usize, what| {
         // SAFETY: a structure of the size passed, for this class.
@@ -1188,61 +1280,28 @@ fn job(limits: Limits) -> Result<OwnedHandle, HostError> {
         std::mem::size_of_val(&ui),
         "the job's UI restrictions",
     )?;
-    // The CPU rate comes later (`cap_cpu_after_grace`).
-    Ok(job)
-}
-
-/// Firecracker's CPU time before the jailer caps it: a Linux guest
-/// calibrates its LAPIC timer against the PIT early in its boot (a WHP
-/// partition has no TSC deadline timer, which lets a KVM guest skip that),
-/// and throttled it finds the timer far too slow, disables it ("APIC frequency
-/// too slow") and can stop taking interrupts for good (measured: about 1 boot
-/// in 3 under a quarter of a CPU; with the cap applied after the boot, none).
-/// The calibration is over a fraction of a second into the boot. A grace in
-/// CPU time rather than in wall time is not Firecracker's to stretch: a
-/// microVM configured through the API long after the start uses next to no
-/// CPU until then, and whatever runs in the process is capped after this
-/// much, the guest's work included.
-const CPU_CAP_GRACE_100NS: u64 = 2 * 10_000_000;
-
-/// The CPU time `process` has used, in 100 ns units.
-fn cpu_time(process: HANDLE) -> u64 {
-    let mut times = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
-    let [created, exited, kernel, user] = &mut times;
-    // SAFETY: four out-parameters.
-    if unsafe { GetProcessTimes(process, created, exited, kernel, user) } == 0 {
-        return u64::MAX;
+    if groups.len() > 1 || groups.first().is_some_and(|g| g.group != 0) {
+        set(
+            JobObjectGroupInformationEx,
+            groups.as_ptr().cast(),
+            std::mem::size_of_val(groups.as_slice()),
+            "the job's processors",
+        )?;
     }
-    let t = |f: &FILETIME| u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime);
-    t(kernel).saturating_add(t(user))
-}
-
-/// Waits for `process` to use its grace of CPU time, then applies the job's
-/// CPU rate hard cap. `Ok(false)` if the process ended first.
-fn cap_cpu_after_grace(job: &OwnedHandle, process: HANDLE, rate: u32) -> Result<bool, HostError> {
-    while cpu_time(process) < CPU_CAP_GRACE_100NS {
-        // SAFETY: our child; a bounded wait.
-        if unsafe { WaitForSingleObject(process, 20) } == WAIT_OBJECT_0 {
-            return Ok(false);
-        }
-    }
-    // SAFETY: plain data.
-    let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
-    cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-    cpu.Anonymous.CpuRate = rate;
-    // SAFETY: a structure of the size passed, for this class.
-    if unsafe {
-        SetInformationJobObject(
-            job.as_raw_handle(),
+    // The CPU rate hard cap or weight, before Firecracker runs: a cgroup's
+    // limit holds from the exec on. A booting guest no longer needs to run
+    // uncapped: it does not calibrate its local APIC timer, which WHP's
+    // TSC-deadline mode (crates/compat/kvm-ioctls, `tscdeadline`) spares it
+    // as KVM's does.
+    if limits.cpu_rate.is_some() || limits.cpu_weight.is_some() {
+        set(
             JobObjectCpuRateControlInformation,
             (&raw const cpu).cast(),
-            u32::try_from(std::mem::size_of_val(&cpu)).unwrap(),
-        )
-    } == 0
-    {
-        return Err(HostError::Spawn("the job's CPU rate", last_error()));
+            std::mem::size_of_val(&cpu),
+            "the job's CPU rate",
+        )?;
     }
-    Ok(true)
+    Ok(job)
 }
 
 /// A command line from arguments, quoted as the MSVC runtime parses them.
@@ -1381,7 +1440,7 @@ fn exec(
     env.push(0);
 
     let tokens = tokens()?;
-    let job = job(*LIMITS.lock().unwrap())?;
+    let job = job(&LIMITS.lock().unwrap())?;
 
     // The standard handles, inheritable, and only them; those that are the
     // jailer's console are pipes it relays (`console`).
@@ -1506,12 +1565,6 @@ fn exec(
         unsafe {
             SetEvent(event as HANDLE);
             windows_sys::Win32::Foundation::CloseHandle(event as HANDLE);
-        }
-    }
-    if let Some(rate) = LIMITS.lock().unwrap().cpu_rate {
-        if let Err(e) = cap_cpu_after_grace(&job, process.as_raw_handle(), rate) {
-            // A limit that could not be applied: Firecracker does not run without it.
-            return Err(kill("the job's CPU rate", io::Error::other(e.to_string())));
         }
     }
     // SAFETY: our child.
@@ -1711,7 +1764,106 @@ mod tests {
         // The lockdown and initial tokens can be made from a normal user's
         // token, and a job with every limit.
         tokens().unwrap();
-        job(Limits { memory_bytes: Some(256 << 20), cpu_rate: Some(5000), processes: Some(1) }).unwrap();
+        job(&Limits { memory_bytes: Some(256 << 20), cpu_rate: Some(5000), ..Limits::default() }).unwrap();
+        job(&Limits { cpu_weight: Some(3), cpus: Some(vec![(0, 1)]), ..Limits::default() }).unwrap();
+    }
+
+    /// The jail's tokens hold no privilege but traversal and, when the
+    /// operator's account holds it, "Lock pages in memory", enabled
+    /// (docs/PORTING.md, row 10); this process's token has others.
+    #[test]
+    fn test_tokens_keep_only_traversal_and_lock_memory() {
+        let mut own: HANDLE = std::ptr::null_mut();
+        // SAFETY: our own token.
+        assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut own) }, 0);
+        // SAFETY: a token handle we own.
+        let own = unsafe { OwnedHandle::from_raw_handle(own) };
+        let mine: Vec<String> = privileges(own.as_raw_handle()).unwrap().into_iter().map(|(n, _)| n).collect();
+        assert!(mine.iter().any(|n| !KEPT_PRIVILEGES.contains(&n.as_str())), "{mine:?}");
+        let lock = mine.iter().any(|n| n == LOCK_MEMORY);
+        let mut want = vec![("SeChangeNotifyPrivilege".to_string(), true)];
+        if lock {
+            want.push((LOCK_MEMORY.to_string(), true));
+        }
+        let t = tokens().unwrap();
+        for token in [&t.primary, &t.initial] {
+            let mut kept: Vec<(String, bool)> = privileges(token.as_raw_handle())
+                .unwrap()
+                .into_iter()
+                .map(|(n, p)| (n, p.Attributes & SE_PRIVILEGE_ENABLED != 0))
+                .collect();
+            kept.sort();
+            assert_eq!(kept, want, "the jail's token, from {mine:?}");
+        }
+        if !lock {
+            eprintln!("this account lacks {LOCK_MEMORY}: only its absence from the jail was checked");
+        }
+    }
+
+    /// The job's CPU rate, read back.
+    fn cpu_rate_of(job: &OwnedHandle) -> JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+        use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
+        // SAFETY: plain data.
+        let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a structure of the size passed, for this class.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectCpuRateControlInformation,
+                (&raw mut cpu).cast(),
+                u32::try_from(std::mem::size_of_val(&cpu)).unwrap(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+        cpu
+    }
+
+    /// The CPU rate hard cap is the job's before Firecracker is in it, as a
+    /// cgroup's limit holds from the exec: no grace (docs/PORTING.md, row 9).
+    #[test]
+    fn test_cpu_cap_holds_from_the_start() {
+        let j = job(&Limits { cpu_rate: Some(2500), ..Limits::default() }).unwrap();
+        let cpu = cpu_rate_of(&j);
+        let flags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+        assert_eq!(cpu.ControlFlags & flags, flags);
+        // SAFETY: the CpuRate arm, which the flags select.
+        assert_eq!(unsafe { cpu.Anonymous.CpuRate }, 2500);
+        // No limit asked for, none set.
+        let j = job(&Limits::default()).unwrap();
+        assert_eq!(cpu_rate_of(&j).ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, 0);
+    }
+
+    /// cpu.weight and cpuset.cpus are the job's weight and affinity, read
+    /// back (docs/PORTING.md, row 8).
+    #[test]
+    fn test_job_weight_and_affinity() {
+        use windows_sys::Win32::System::JobObjects::{JOBOBJECT_BASIC_LIMIT_INFORMATION, JobObjectBasicLimitInformation, QueryInformationJobObject};
+        let j = job(&Limits { cpu_weight: Some(2), cpus: Some(vec![(0, 0b1)]), ..Limits::default() }).unwrap();
+        let cpu = cpu_rate_of(&j);
+        let flags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
+        assert_eq!(cpu.ControlFlags & flags, flags);
+        // SAFETY: the Weight arm, which the flags select.
+        assert_eq!(unsafe { cpu.Anonymous.Weight }, 2);
+        // SAFETY: plain data.
+        let mut basic: JOBOBJECT_BASIC_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a structure of the size passed, for this class.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                j.as_raw_handle(),
+                JobObjectBasicLimitInformation,
+                (&raw mut basic).cast(),
+                u32::try_from(std::mem::size_of_val(&basic)).unwrap(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+        assert_ne!(basic.LimitFlags & JOB_OBJECT_LIMIT_AFFINITY, 0);
+        assert_eq!(basic.Affinity, 1);
+        // A processor the host does not have is refused by Windows too.
+        if std::thread::available_parallelism().unwrap().get() < 64 {
+            assert!(job(&Limits { cpus: Some(vec![(0, 1 << 63)]), ..Limits::default() }).is_err());
+        }
     }
 
     #[test]

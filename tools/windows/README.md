@@ -6,7 +6,9 @@
   mechanisms the sandbox and jailer backends use.
 - `jailer-test.ps1`: the jailer on WHP hardware, the counterpart of
   `tools/macos/jailer-test.py`. Stages: `refuse` (what Windows cannot
-  enforce is refused), `isolation` (`jail-probe.rs`, run through the jailer
+  enforce is refused, each cgroup controller with its reason), `cpuset`
+  (`cpuset.cpus` is the jailed process's affinity), `weight` (two jailed
+  processes at `cpu.weight` 50 and 100 sharing one processor), `isolation` (`jail-probe.rs`, run through the jailer
   as the jailed binary, may not read the user's files or SAM, write outside
   its jail, reach another jail's files, API socket or process, or open the
   operator's; the operator reaches the API socket), `netns` (two jails with
@@ -15,17 +17,17 @@
   flag; needs an elevated PowerShell), `handoff` (a handle and a socket
   held by a jailed process are pulled out by the operator and by a
   medium-integrity process of the user), `boot` (a 2 vCPU guest
-  in the jail), `limits` (`memory.max`), `cpu` (`cpu.max`: three boots under it), and a check
+  in the jail), `limits` (`memory.max`), `cpu` (`cpu.max` from Firecracker's start: twelve boots under
+  it, each vCPU's local timer in TSC-deadline mode), `hugepages` (the jail
+  keeps "Lock pages in memory" and no other privilege but traversal, the
+  job's memory limit holds large pages, and a jailed guest boots on 2 MiB
+  pages; needs the privilege, as the boot test's stage does), and a check
   that every jail's drive letter was removed. It needs the boot test's
   guest files (`-Assets`, default `C:\wbt`) and `rustc` for the probe:
 
   ```
   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir C:\wjt
   ```
-
-  The CPU cap starts after Firecracker's first 2 CPU-seconds: a guest
-  booting under it calibrated its LAPIC timer while throttled and could stop
-  taking interrupts (docs/ROADMAP.md, M5).
 
 CI builds both on every push and uploads them as the artifact
 `wick-windows-x86_64-<commit>`: `lib/firecracker/build/cargo_target/release/firecracker.exe`,
@@ -90,8 +92,8 @@ warnings, and the reset must end Firecracker with exit status 0.
 
 | Stage | Checks |
 |---|---|
-| `boot` | 1 vCPU: kernel reaches init, serial output and input (stdin is a pipe), `x86_64`, 1 CPU, memory size, CPUID hypervisor bit, the guest clock advances with the host's |
-| `smp` | 2 vCPUs: the AP starts (INIT/SIPI), work runs on each CPU, the clock agrees between them |
+| `boot` | 1 vCPU: kernel reaches init, serial output and input (stdin is a pipe), `x86_64`, 1 CPU, memory size, CPUID hypervisor bit, the local timer in TSC-deadline mode (`lapic-deadline`), the guest clock advances with the host's |
+| `smp` | 2 vCPUs: the AP starts (INIT/SIPI), both local timers in TSC-deadline mode, work runs on each CPU, the clock agrees between them |
 | `block` | an Async read-only drive (md5 of 8 MiB), a Sync and an Async writable drive (the host file holds what the guest wrote), a write to a read-only drive fails |
 | `vsock` | host to guest `CONNECT 52` with a 4 MiB echo read back by length; guest to host through `<uds>_53` |
 | `net` | virtio-net over the Windows endpoint (a Unix stream, each frame preceded by its 32-bit big-endian length): a switch in the script answers ARP, ICMP echo (1400 bytes, 200 back to back) and UDP echo, and checks the checksum of every frame the guest sends |

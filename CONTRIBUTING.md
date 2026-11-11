@@ -251,6 +251,7 @@ compiles wick's sources directly, so upstream's workspace does not change.
 | `vnet_segment` | `overlay/vmm/platform/vnet.rs` | any virtio-net header and frame a guest can put on its TX queue | a reference written from Linux in `fuzz/src/frame.rs` (`skb_checksum_help`, `tcp_gso_segment`, UFO, `ip6_find_1stfragopt`) |
 | `vnet_offload` | the same | well-formed frames with checksum offload, TSO or UFO, as a guest's offloads make them | the same reference; every such frame is accepted, and the checksums of the segments and of the datagram the fragments reassemble to verify |
 | `uffd_protocol` (macOS) | `crates/compat/libc/src/wick_uffd.rs` | the requests and records a page fault handler process sends | the state Linux's `UFFDIO_*` leave memory in; no descriptor left open |
+| `whp_irqchip` | `crates/compat/kvm-ioctls/src/whp/irqchip.rs` (built on any host) | any sequence of the port and MMIO accesses the WHP run loop hands it (PICs, ELCR, PIT, speaker port, I/O APIC), interrupt lines, MSI routes, PIT state from a snapshot file, and a snapshot at any point | a VM restored from the snapshot saves the same state and answers every later access as the original does (but for what follows the host clock); each MSI's interrupt request carries its vector and destination |
 
 ```sh
 tools/fuzz.sh                          # every target this host runs, 60 s each

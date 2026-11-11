@@ -11,3 +11,21 @@
 pub mod vnet;
 
 pub mod frame;
+
+pub mod whp;
+
+/// KVM's x86_64 structures (the snapshot state of the interrupt controller),
+/// on any host: the Windows build's bindings, which keep the Linux x86_64
+/// layout. `whp::irqchip` names them `kvm_bindings::...`.
+#[allow(
+    non_upper_case_globals,
+    non_camel_case_types,
+    non_snake_case,
+    dead_code,
+    unexpected_cfgs,
+    clippy::all
+)]
+#[path = "../../crates/compat/kvm-bindings/src/windows/x86_64/bindings.rs"]
+mod x86_bindings;
+pub use x86_bindings::*;
+extern crate self as kvm_bindings;

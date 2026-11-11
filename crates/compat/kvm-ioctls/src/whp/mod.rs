@@ -13,7 +13,8 @@
 //!   ([`emulate`]), and are handed to Firecracker as `VcpuExit::Mmio*` /
 //!   `VcpuExit::Io*`; `ioeventfd` writes are matched before the exit is
 //!   reported;
-//! - interrupts: the local APIC is WHP's (`WHvX64LocalApicEmulationModeXApic`);
+//! - interrupts: the local APIC is WHP's (`WHvX64LocalApicEmulationModeXApic`),
+//!   its TSC-deadline mode emulated here as KVM does ([`tscdeadline`]);
 //!   the I/O APIC, the 8259 PICs and the 8254 PIT are emulated here
 //!   ([`irqchip`]); `irqfd`s are served by a wait registered on the eventfd
 //!   that raises the routed GSI;
@@ -33,6 +34,7 @@ mod ffi;
 mod irqchip;
 mod pvclock;
 mod regs;
+mod tscdeadline;
 mod vcpu;
 mod vm;
 mod whv;

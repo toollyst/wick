@@ -20,7 +20,9 @@
 //!                               udp:<ip>:<port> pull:<pid>:<handle>
 //!                               listen:<socket path> wsadup:<socket path>
 //!                               listenpull:<socket path> sockpull:<socket path>
-//!                               token:0
+//!                               token:0 tokenopen:0
+//!                               job:0 affinity:0 spin:<seconds>
+//!                               privileges:0 largepage:<MiB>
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
@@ -139,6 +141,12 @@ extern "system" {
     fn GetNumberOfConsoleInputEvents(h: HANDLE, n: *mut u32) -> i32;
     fn WriteConsoleInputW(h: HANDLE, recs: *const KEY_RECORD, n: u32, written: *mut u32) -> i32;
     fn WriteFile(h: HANDLE, buf: *const u8, n: u32, written: *mut u32, ov: *mut c_void) -> i32;
+    fn QueryInformationJobObject(job: HANDLE, class: i32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+    fn GetProcessAffinityMask(p: HANDLE, mine: *mut usize, system: *mut usize) -> i32;
+    fn GetProcessTimes(p: HANDLE, c: *mut u64, e: *mut u64, k: *mut u64, u: *mut u64) -> i32;
+    fn GetLargePageMinimum() -> usize;
+    fn VirtualAlloc(addr: *mut c_void, size: usize, ty: u32, prot: u32) -> *mut c_void;
+    fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> i32;
 }
 
 #[repr(C)]
@@ -860,6 +868,117 @@ fn check(c: &str) -> String {
                     if member != 0 { "yes" } else { "no" }
                 )
             }
+        // The limits of the job this process is in, as Windows reports them:
+        // `allowed affinity=<mask> cpu=<flags>:<rate or weight>`.
+        "job" => {
+            let mut basic = [0u64; 8]; // JOBOBJECT_BASIC_LIMIT_INFORMATION (64 bytes)
+            let mut cpu = [0u32; 2]; // JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+            // SAFETY: buffers of the sizes passed; NULL is the caller's job.
+            unsafe {
+                if QueryInformationJobObject(std::ptr::null_mut(), 2, basic.as_mut_ptr().cast(), 64, std::ptr::null_mut()) == 0
+                    || QueryInformationJobObject(std::ptr::null_mut(), 15, cpu.as_mut_ptr().cast(), 8, std::ptr::null_mut()) == 0
+                {
+                    return format!("denied {}", std::io::Error::last_os_error());
+                }
+            }
+            // LimitFlags is at offset 16, Affinity at 48.
+            let flags = basic[2] as u32;
+            let affinity = if flags & 0x10 != 0 { format!("{:#x}", basic[6]) } else { "none".into() };
+            format!("allowed affinity={affinity} cpu={:#x}:{}", cpu[0], cpu[1])
+        }
+        // The processors this process may run on.
+        "affinity" => {
+            let (mut mine, mut system) = (0usize, 0usize);
+            // SAFETY: out-parameters.
+            if unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut mine, &mut system) } == 0 {
+                return format!("denied {}", std::io::Error::last_os_error());
+            }
+            format!("allowed {mine:#x} of {system:#x}")
+        }
+        // Spins for `arg` seconds of wall time: `allowed <CPU seconds used>`.
+        "spin" => {
+            let Ok(secs) = arg.parse() else {
+                return "bad seconds".into();
+            };
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            while std::time::Instant::now() < end {
+                std::hint::spin_loop();
+            }
+            let (mut c, mut e, mut k, mut u) = (0u64, 0u64, 0u64, 0u64);
+            // SAFETY: four out-parameters.
+            unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
+            format!("allowed {:.3}", (k + u) as f64 / 1e7)
+        }
+        // The privileges in this process's token, `+` after those enabled:
+        // `allowed SeChangeNotifyPrivilege+,...`.
+        "privileges" => {
+            // GetCurrentProcessToken(): a pseudo-handle that queries without
+            // opening the token, which a jailed process may not do.
+            let t = -4isize as HANDLE;
+            let mut buf = vec![0u64; 1024];
+            let mut len = 0u32;
+            // SAFETY: our own token and a buffer of the size passed.
+            if unsafe { GetTokenInformation(t, 3, buf.as_mut_ptr().cast(), 8192, &mut len) } == 0 {
+                return format!("denied {}", std::io::Error::last_os_error());
+            }
+            // TOKEN_PRIVILEGES: a u32 count, then (LUID u64, attributes u32)
+            // entries of 12 bytes from offset 4.
+            // SAFETY: the 8192-byte buffer above.
+            let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), 8192) };
+            let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let mut names = Vec::new();
+            for i in 0..word(0) as usize {
+                let at = 4 + 12 * i;
+                let luid = u64::from(word(at)) | (u64::from(word(at + 4)) << 32);
+                // Privilege LUIDs are fixed (winnt.h, SE_*_PRIVILEGE); a
+                // jailed process may not ask LSA for their names.
+                let name = match luid {
+                    4 => "SeLockMemoryPrivilege".to_string(),
+                    23 => "SeChangeNotifyPrivilege".to_string(),
+                    l => format!("privilege{l}"),
+                };
+                // SE_PRIVILEGE_ENABLED
+                let on = if word(at + 8) & 2 != 0 { "+" } else { "" };
+                names.push(format!("{name}{on}"));
+            }
+            format!("allowed {}", names.join(","))
+        }
+        // Opens this process's token to adjust its privileges, as the libc
+        // layer would to enable "Lock pages in memory".
+        "tokenopen" => {
+            let mut t = std::ptr::null_mut();
+            // TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY
+            // SAFETY: an out-pointer; our own process.
+            if unsafe { OpenProcessToken(GetCurrentProcess(), 0x28, &mut t) } == 0 {
+                return format!("denied {}", std::io::Error::last_os_error());
+            }
+            // SAFETY: the handle just opened.
+            unsafe { CloseHandle(t) };
+            "allowed".into()
+        }
+        // Commits `arg` MiB of large pages: `allowed <bytes>` or `denied <error>`.
+        "largepage" => {
+            let Ok(mib) = arg.parse::<usize>() else {
+                return "bad size".into();
+            };
+            // SAFETY: plain query.
+            let page = unsafe { GetLargePageMinimum() };
+            if page == 0 {
+                return "denied no large pages on this processor".into();
+            }
+            let size = (mib << 20).div_ceil(page) * page;
+            // MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE
+            // SAFETY: a new allocation, freed below.
+            let p = unsafe { VirtualAlloc(std::ptr::null_mut(), size, 0x2000_3000, 4) };
+            if p.is_null() {
+                return format!("denied {}", std::io::Error::last_os_error());
+            }
+            // SAFETY: our committed allocation; MEM_RELEASE.
+            unsafe {
+                p.cast::<u8>().write_volatile(1);
+                VirtualFree(p, 0, 0x8000);
+            }
+            format!("allowed {size}")
         }
         // Waits `arg` seconds: a process for the others to act on.
         "wait" => {
