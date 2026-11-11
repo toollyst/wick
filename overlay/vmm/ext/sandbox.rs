@@ -2076,9 +2076,9 @@ mod macos {
             let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
             let bytes = path.as_os_str().as_bytes();
             assert!(bytes.len() < addr.sun_path.len(), "{path:?}");
-            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            addr.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX).unwrap();
             for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
-                *to = *from as libc::c_char;
+                *to = (*from).cast_signed();
             }
             let len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_un>()).unwrap();
             (addr, len)
