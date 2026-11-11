@@ -23,3 +23,26 @@
 # limit stays unlimited, and a 1 GiB mapping succeeds). wick_macos's prlimit
 # raises ENOSYS rather than pretend.
 all impossible integration_tests/functional/test_api.py::test_api_machine_config
+
+# Ctrl+Alt+Del is the x86 i8042 keyboard controller's: upstream skips the
+# test off x86_64 ("not yet implemented on aarch64"), and the Linux results
+# are x86_64's.
+all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
+
+# Upstream's memory monitor (host_tools/memory.py) fails a test whose VMM
+# holds more than 5 MiB resident besides guest memory (7 MiB while a
+# snapshot is taken). On macOS the VMM's own memory is at that budget: the
+# process's regions as wick_macos.memory_maps reads them (proc_pidinfo)
+# peak at 4.7 to 4.9 MiB for a booted microVM of test_api.py and at 5.02
+# to 5.19 MiB where the monitor trips: Firecracker's text 2.3 to 2.5 MiB,
+# malloc 1.4 to 1.6 MiB, thread stacks 0.2 to 0.35 MiB; an idle Firecracker
+# holds 3.0 MiB. Apple silicon maps 16 KiB pages, where Linux's aarch64 and
+# x86_64 hosts map 4 KiB ones, so every page a thread, an allocation or a
+# code path touches costs four times as much. A pmem device whose file is
+# also a drive's counts the file's pages the drive read: macOS reports a
+# shared file mapping's resident pages per file, not per process (14 MiB of
+# pmem in test_get_full_config_after_restoring_snapshot, whose guest never
+# touches the pmem device). To do: bring the VMM's own memory under the
+# budget. Only a test whose every failing phase failed with this error is
+# excused.
+all bug failure:host_tools.memory.MemoryUsageExceededError

@@ -18,6 +18,12 @@ reason. It fails when:
 - a listed test passed (the entry is stale), or an entry names no test of a
   file the run collected;
 - there is no report, or pytest failed without a failing test.
+
+An entry names a test (a test function, a file) or a failure:
+`failure:<exception>` excuses a test that did not pass only because of that
+exception: every phase of it that failed (setup, call, teardown) failed with
+it. Such an entry cannot be stale for a test that passed; in a full run, a
+`bug` entry of either form that excused nothing is reported.
 """
 
 import argparse
@@ -63,6 +69,7 @@ def differences(mode):
                 reason.append(text)
             continue
         if not line:
+            reason = []  # a blank line ends a comment: the header is no reason
             continue
         m, kind, entry = line.split(None, 2)
         if m not in ("all", "user", "jailer"):
@@ -93,8 +100,15 @@ def main():
     problems = []
     report = args.out / "test-report.json"
     mac = {}
+    failures = {}  # node id: the crash message of each phase that failed
     if report.exists():
-        mac = {t["nodeid"]: t["outcome"] for t in json.loads(report.read_text())["tests"]}
+        for t in json.loads(report.read_text())["tests"]:
+            mac[t["nodeid"]] = t["outcome"]
+            failures[t["nodeid"]] = [
+                (t[phase].get("crash") or {}).get("message", "")
+                for phase in ("setup", "call", "teardown")
+                if t.get(phase, {}).get("outcome") == "failed"
+            ]
     else:
         problems.append("no test-report.json")
     linux = baseline()
@@ -103,8 +117,22 @@ def main():
 
     def entry_for(nodeid):
         for e in listed:
+            if e[0].startswith("failure:"):
+                continue
             if matches(nodeid, e[0]):
                 return e
+        return None
+
+    def failure_entry_for(nodeid):
+        """The failure entry that excuses a test that did not pass, if any."""
+        msgs = failures.get(nodeid)
+        if not msgs:
+            return None
+        for e in listed:
+            if e[0].startswith("failure:"):
+                exc = e[0][len("failure:"):]
+                if all(m.startswith(exc + ":") or m == exc for m in msgs):
+                    return e
         return None
 
     excused = defaultdict(list)
@@ -117,6 +145,8 @@ def main():
             continue
         mo = mac.get(nodeid, "not run")
         e = entry_for(nodeid)
+        if e is None and mo not in GOOD:
+            e = failure_entry_for(nodeid)
         if lo != "passed":
             if mo == "passed" or mo in GOOD:
                 agree += 1
@@ -140,6 +170,8 @@ def main():
         if nodeid in linux:
             continue
         e = entry_for(nodeid)
+        if e is None and mo not in GOOD:
+            e = failure_entry_for(nodeid)
         if mo in GOOD:
             agree += 1
             if e and mo == "passed" and e[1] != "arch":
@@ -152,6 +184,10 @@ def main():
     for entry, kind, _ in listed:
         module = entry.split("::", 1)[0]
         if not args.full:
+            continue
+        if entry.startswith("failure:"):
+            if kind == "bug" and entry not in used:
+                problems.append(f"entry '{entry}' (bug) matched nothing that failed")
             continue
         if module in files and not any(matches(n, entry) for n in list(mac) + list(linux)):
             problems.append(f"entry '{entry}' ({kind}) names no test")
