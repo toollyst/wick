@@ -6,12 +6,13 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,pidns,handoff,netns,api,isolation,boot,limits,cpu,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,daemonize,handles,pidns,handoff,netns,api,isolation,boot,limits,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
 #
-# `refuse`, `low`, `daemonize`, `handles`, `pidns`, `handoff`, `netns` and
-# `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
-# and reads it); `netns` needs an elevated PowerShell (the jailer adds
-# Windows Filtering Platform filters).
+# `refuse`, `cpuset`, `weight`, `low`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
+# and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
+# and reads it); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
+# Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
+# fails, saying so, without it).
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build),
 # `examples\uffd_on_demand_handler.exe` for `uffd` and, for `vhost-user`,
@@ -22,7 +23,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'api', 'isolation', 'boot', 'limits', 'cpu', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'api', 'isolation', 'boot', 'limits', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -110,7 +111,7 @@ class JailedVm {
 # -Api keeps the API socket (/run/firecracker.socket in the jail) and sets
 # `Sock` and `Root` on the VM; -NoConfig starts Firecracker with nothing
 # configured (the API configures it); `drives` are added to the root drive.
-function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256, [switch]$Api, [switch]$NoConfig, [object[]]$drives = @()) {
+function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256, [switch]$Api, [switch]$NoConfig, [object[]]$drives = @(), [string]$hugePages = '') {
     $root = Join-Path $base "firecracker.exe\$id\root"
     New-Item -ItemType Directory -Force -Path $root | Out-Null
     Copy-Item (Join-Path $Assets 'vmlinux-6.1.188') (Join-Path $root 'vmlinux')
@@ -120,6 +121,7 @@ function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(),
         'drives'         = @([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs'; is_root_device = $true; is_read_only = $true }) + $drives
         'machine-config' = [ordered]@{ vcpu_count = 2; mem_size_mib = $memMib }
     }
+    if ($hugePages) { $cfg['machine-config']['huge_pages'] = $hugePages }
     Set-Content -Encoding ASCII (Join-Path $root 'vm.json') ($cfg | ConvertTo-Json -Depth 5)
     $fcArgs = @('--')
     if (-not $Api) { $fcArgs += '--no-api' }
@@ -154,14 +156,114 @@ function Stage-Refuse {
     $cases = [ordered]@{
         '--netns of a missing directory' = @('--netns', (Join-Path $WorkDir 'no-such-network'))
         'fsize'                          = @('--resource-limit', 'fsize=1024')
-        'cpuset'                         = @('--cgroup', 'cpuset.cpus=0', '--cgroup-version', '2')
+        'memory.high'                    = @('--cgroup', 'memory.high=1048576', '--cgroup-version', '2')
     }
-    foreach ($k in $cases.Keys) {
-        $r = Invoke-Jailer ($common + $cases[$k])
+    # docs/PORTING.md row 8: each controller Windows has no counterpart for
+    # is refused with the reason (the message says "refused on Windows: why").
+    $v2 = [ordered]@{
+        'pids'          = 'pids.max=100'
+        'io'            = 'io.weight=default 200'
+        'hugetlb'       = 'hugetlb.2MB.max=1073741824'
+        'rdma'          = 'rdma.max=mlx4_0'  # upstream's parser takes one '=' only
+        'misc'          = 'misc.max=sev 1'
+        'cgroup.freeze' = 'cgroup.freeze=1'
+        'cpuset excl'   = 'cpuset.cpus.exclusive=0'
+    }
+    $v1 = [ordered]@{
+        'blkio'         = 'blkio.throttle.read_bps_device=8:0 1048576'
+        'freezer'       = 'freezer.state=FROZEN'
+        'devices'       = 'devices.deny=a'
+        'net_cls'       = 'net_cls.classid=1'
+        'net_prio'      = 'net_prio.ifpriomap=eth0 1'
+    }
+    $reasoned = [ordered]@{}
+    foreach ($k in $v2.Keys) { $reasoned["v2 $k"] = @('--cgroup', $v2[$k], '--cgroup-version', '2') }
+    foreach ($k in $v1.Keys) { $reasoned["v1 $k"] = @('--cgroup', $v1[$k], '--cgroup-version', '1') }
+    $reasoned['cpu.max with cpu.weight'] = @('--cgroup', 'cpu.max=50000 100000', '--cgroup', 'cpu.weight=50', '--cgroup-version', '2')
+    $nodes = 0; [void][WickJailerTest.Numa]::GetNumaHighestNodeNumber([ref]$nodes)
+    if ($nodes -gt 0) { $reasoned['cpuset.mems short of every node'] = @('--cgroup', 'cpuset.mems=0', '--cgroup-version', '2') }
+    foreach ($k in @($cases.Keys) + @($reasoned.Keys)) {
+        $argv = if ($cases.Contains($k)) { $cases[$k] } else { $reasoned[$k] }
+        $r = Invoke-Jailer ($common + $argv)
         Check ($r[0] -ne 0) "$k accepted (exit $($r[0])): $($r[1])"
         Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue)) "$k started Firecracker"
+        if ($reasoned.Contains($k)) { Check ($r[1] -match 'is refused on Windows: \S') "${k}: refused without its reason: $($r[1])" }
     }
-    "--netns of a missing directory, fsize= and an unsupported cgroup are refused before Firecracker starts"
+    "--netns of a missing directory, fsize=, an unsupported cgroup file and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
+}
+
+Add-Type -Namespace WickJailerTest -Name Numa -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool GetNumaHighestNodeNumber(ref uint n);'
+
+# Runs jail-probe through the jailer with `cgroups` (each a --cgroup value)
+# and returns its answer to `check`.
+function Invoke-JailedProbe([string]$base, [string]$id, [string]$version, [string[]]$cgroups, [string]$check) {
+    $argv = @('--id', $id, '--exec-file', (Get-Probe), '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--cgroup-version', $version)
+    foreach ($c in $cgroups) { $argv += @('--cgroup', $c) }
+    $r = Invoke-Jailer ($argv + @('--', $check)) 30000
+    Check ($r[0] -eq 0) "--cgroup $($cgroups -join ' --cgroup '): the jailer exited $($r[0]): $($r[1])"
+    $line = ($r[1] -split "`r?`n" | Where-Object { $_.StartsWith("$check ") } | Select-Object -First 1)
+    Check ($null -ne $line) "the jailed probe did not answer ${check}: $($r[1])"
+    $line.Substring($check.Length + 1)
+}
+
+# docs/PORTING.md row 8: cpuset.cpus is the job's processor affinity, which
+# the jailed process sees as its own; cpuset.mems naming every memory node of
+# the host binds nothing and is accepted. Needs no guest.
+function Stage-Cpuset {
+    $base = New-Base 'cpuset'
+    $cpus = [Environment]::ProcessorCount
+    Check ($cpus -ge 2) "needs 2 processors, the host has $cpus"
+    $last = $cpus - 1
+    $nodes = 0; [void][WickJailerTest.Numa]::GetNumaHighestNodeNumber([ref]$nodes)
+    $results = @()
+    foreach ($case in @(
+            @('2', "cpuset.cpus=1", 0x2),
+            @('1', "cpuset.cpus=0-1", 0x3),
+            @('2', "cpuset.cpus=0,$last", (1 + [math]::Pow(2, $last))))) {
+        $job = Invoke-JailedProbe $base "c$($results.Count)" $case[0] @($case[1], "cpuset.mems=0-$nodes") 'job:0'
+        $want = '0x{0:x}' -f [long]$case[2]
+        Check ($job -match "affinity=$want ") "v$($case[0]) $($case[1]): the job's affinity: $job"
+        $own = Invoke-JailedProbe $base "a$($results.Count)" $case[0] @($case[1]) 'affinity:0'
+        Check ($own -match "^allowed $want of ") "v$($case[0]) $($case[1]): the jailed process's affinity: $own"
+        $results += "$($case[1]) -> $want"
+    }
+    "the job's and the jailed process's affinity: $($results -join ', '); cpuset.mems=0-$nodes accepted"
+}
+
+# docs/PORTING.md row 8: cpu.weight is the job's CPU weight. Two jailed
+# processes spin on one processor (cpuset.cpus=0), one at cpu.weight=50 and
+# one at the default 100: Linux gives the first half the second's CPU time;
+# Windows weight 2 (the nearest, measured at 0.49 of the default) must give
+# it between 0.3 and 0.7 of it. Needs no guest.
+function Stage-Weight([int]$Seconds = 6) {
+    $base = New-Base 'weight'
+    $probe = Get-Probe
+    $runs = @()
+    foreach ($w in 50, 100) {
+        $out = Join-Path $base "w$w.txt"
+        $line = "--id w$w --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" --cgroup-version 2 --cgroup cpuset.cpus=0 --cgroup cpu.weight=$w -- job:0 spin:$Seconds"
+        $p = Start-Process $Jailer -ArgumentList $line -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+        $null = $p.Handle
+        $runs += @{ W = $w; P = $p; Out = $out }
+    }
+    try {
+        $cpu = @{}
+        foreach ($r in $runs) {
+            Check ($r.P.WaitForExit(($Seconds + 30) * 1000)) "the jailer at cpu.weight=$($r.W) did not exit"
+            $text = (Get-Content $r.Out, "$($r.Out).err" -Raw -ErrorAction SilentlyContinue) -join ''
+            Check ($r.P.ExitCode -eq 0) "cpu.weight=$($r.W): the jailer exited $($r.P.ExitCode): $text"
+            $want = if ($r.W -eq 50) { '0x3:2' } else { '0x3:5' }
+            Check ($text -match "job:0 allowed affinity=0x1 cpu=$want") "cpu.weight=$($r.W): the job's limits: $text"
+            Check ($text -match "spin:$Seconds allowed ([0-9.]+)") "cpu.weight=$($r.W): no spin result: $text"
+            $cpu[$r.W] = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+        }
+        $ratio = $cpu[50] / [math]::Max($cpu[100], 0.001)
+        Check ($ratio -ge 0.3 -and $ratio -le 0.7) ("cpu.weight 50 against 100 on one processor: {0:N2} s against {1:N2} s of CPU (ratio {2:N2}; Linux gives 0.5)" -f $cpu[50], $cpu[100], $ratio)
+        "cpu.weight=50 and 100 on one processor: Windows weights 2 and 5, {0:N2} s against {1:N2} s of CPU in {2} s (ratio {3:N2}; Linux gives 0.5)" -f $cpu[50], $cpu[100], $Seconds, $ratio
+    } finally {
+        foreach ($r in $runs) { if (-not $r.P.HasExited) { $r.P.Kill() } }
+        Get-Process jail-probe -ErrorAction SilentlyContinue | Stop-Process -Force
+    }
 }
 
 # Row 15 of docs/PORTING.md: --daemonize, upstream's observable behaviour.
@@ -952,6 +1054,46 @@ function Stage-Boot {
     } finally { Stop-Jailed }
 }
 
+# docs/PORTING.md row 10: a jailed Firecracker maps guest memory on large
+# pages, as on Linux it maps huge pages an administrator reserved. The jail's
+# token keeps no privilege but traversal and, when the operator's account
+# holds it, "Lock pages in memory" (enabled); the job's memory limit holds
+# large pages too; and a jailed 2 vCPU guest boots on 2 MiB pages and keeps
+# 160 MiB written to its memory.
+function Stage-Hugepages {
+    $base = New-Base 'hugepages'
+    $held = $null -ne (whoami /priv | Select-String 'SeLockMemoryPrivilege')
+    $privs = Invoke-JailedProbe $base 'p' '2' @() 'privileges:0'
+    $want = if ($held) { 'SeChangeNotifyPrivilege+,SeLockMemoryPrivilege+' } else { 'SeChangeNotifyPrivilege+' }
+    $got = (($privs -replace '^allowed ', '') -split ',' | Sort-Object) -join ','
+    Check ($got -eq $want) "the jail's token holds '$privs', not '$want'"
+    # Firecracker in the jail cannot enable a privilege itself: the jailer does.
+    $own = Invoke-JailedProbe $base 't' '2' @() 'tokenopen:0'
+    Check ($own -match '^denied ') "a jailed process opened its own token to adjust it: $own"
+    $large = Invoke-JailedProbe $base 'l' '2' @() 'largepage:64'
+    if (-not $held) {
+        Check ($large -match '^denied .*privilege') "large pages in a jail of an account without the privilege: $large"
+        Check $false ("this account lacks 'Lock pages in memory' (SeLockMemoryPrivilege), so large pages cannot be " +
+            "checked: an administrator grants it in secpol.msc, Local Policies, User Rights Assignment, then sign " +
+            "out and in (checked without it: the jail holds only traversal, cannot open its token to adjust it, and maps no large pages)")
+    }
+    Check ($large -match '^allowed ') "64 MiB of large pages in the jail: $large"
+    $limited = Invoke-JailedProbe $base 'm' '2' @('memory.max=33554432') 'largepage:64'
+    Check ($limited -match '^denied ') "64 MiB of large pages under memory.max=32 MiB: $limited"
+    $vm = Start-JailedVm $base 'vm' @() 256 '2M'
+    try {
+        Wait-Shell $vm
+        $mem = [int]$vm.Sh("awk '/MemTotal/ {print `$2}' /proc/meminfo", 10)
+        Check ($mem -gt 200000 -and $mem -le 262144) "MemTotal $mem kB for 256 MiB"
+        $out = $vm.Sh('mount -t tmpfs -o size=200m tmpfs /tmp && head -c 160m /dev/urandom > /tmp/f && md5sum /tmp/f > /tmp/a && md5sum /tmp/f | cmp - /tmp/a && echo same', 120)
+        Check ($out -eq 'same') "160 MiB in guest memory read back differently: '$out'"
+        $vm.Send('reboot -ff')
+        Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
+        Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
+    } finally { Stop-Jailed }
+    "the jail keeps only traversal and 'Lock pages in memory', enabled (it cannot open its token to enable it); 64 MiB of large pages in the jail, refused under memory.max=32 MiB; a jailed 2 vCPU guest on 2 MiB pages boots and keeps 160 MiB written"
+}
+
 function Stage-Limits {
     # Job memory limit: below the guest's memory Firecracker cannot run it.
     $base = New-Base 'limits'
@@ -970,21 +1112,30 @@ function Stage-Limits {
     "memory.max below the guest's memory: Firecracker cannot map it and exits"
 }
 
-# cpu.max is the job's CPU rate hard cap, from Firecracker's third CPU-second
-# on: a guest that boots under the cap calibrates its LAPIC timer while
-# throttled and can stop taking interrupts for good (about 1 boot in 3 at a
-# quarter of a CPU when the cap was there from the start). Each run boots a
-# guest under the limit, spins past the grace, then measures a 5 s spin.
-function Stage-Cpu([int]$Boots = 3) {
+# cpu.max is the job's CPU rate hard cap, from Firecracker's start, with a
+# 100 ms period. Each run boots a 2 vCPU guest under it: the boot itself is
+# held to the limit (no grace), each vCPU's local timer is in TSC-deadline
+# mode (lapic-deadline, as on KVM: the guest never calibrates its APIC timer,
+# which a throttled vCPU got wrong in about 1 boot in 3 at a quarter of a CPU
+# and then stopped taking interrupts), and a 5 s spin is held to the limit.
+# 12 boots: a failure rate of 1 in 3 passes them all with probability 0.8%.
+function Stage-Cpu([int]$Boots = 12) {
     $base = New-Base 'cpu'
     $used = @()
+    $booting = @()
     for ($b = 1; $b -le $Boots; $b++) {
         $vm = Start-JailedVm $base "cpu$b" @('--cgroup-version', '2', '--cgroup', 'cpu.max=25000 100000')
         try {
-            Wait-Shell $vm
-            $vm.Send('timeout 3 sh -c "while :; do :; done"; echo WARM')
-            Check ($vm.WaitFor('(?m)^WARM', 30)) "boot ${b}: the warm-up spin did not finish"
+            Check ($vm.WaitFor('Run /bin/sh', 120)) "boot ${b}: the guest did not reach init under cpu.max=25000 100000: $(($vm.Text() -split "`n" | Select-Object -Last 5) -join ' | ')"
             $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$base*" } | Select-Object -First 1
+            Check ($null -ne $fcp) "boot ${b}: no jailed Firecracker"
+            $bu = $fcp.TotalProcessorTime.TotalSeconds / ([DateTime]::Now - $fcp.StartTime).TotalSeconds
+            Check ($bu -le 0.4) "boot ${b}: cpu.max of a quarter CPU: Firecracker used $([math]::Round($bu * 100))% of one CPU from its start to init"
+            $booting += [math]::Round($bu * 100)
+            Wait-Shell $vm
+            $deadline = $vm.Sh('grep -c "Clock Event Device: lapic-deadline" /proc/timer_list', 10)
+            Check ($deadline -eq '2') "boot ${b}: $deadline of 2 vCPUs have their local timer in TSC-deadline mode (/proc/timer_list)"
+            $fcp.Refresh()
             $t0 = $fcp.TotalProcessorTime; $w0 = [DateTime]::Now
             $vm.Send('timeout 5 sh -c "while :; do :; done"; echo SPUN')
             if (-not $vm.WaitFor('(?m)^SPUN', 30)) {
@@ -1001,7 +1152,7 @@ function Stage-Cpu([int]$Boots = 3) {
             [void]$vm.P.WaitForExit(15000)
         } finally { Stop-Jailed }
     }
-    "cpu.max=25000 100000: $Boots boots, each held to $($used -join '%, ')% of a CPU in a spin, APIC timer kept"
+    "cpu.max=25000 100000 from the start: $Boots boots, held to $($booting -join '%, ')% of a CPU up to init and $($used -join '%, ')% in a spin, local timers in TSC-deadline mode"
 }
 
 # --- run ----------------------------------------------------------------------

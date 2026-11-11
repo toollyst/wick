@@ -15,8 +15,11 @@
 //!   the PICs, so these are modelled for the init-and-mask sequence and for
 //!   save/restore, not for delivery;
 //! - the **8254 PIT** at ports `0x40..=0x43` (and the speaker port `0x61`):
-//!   channel 0 drives IRQ 0 from a timer thread; channel 2 is readable so the
-//!   guest can calibrate against it.
+//!   channel 0 drives IRQ 0 from a timer thread, periodically in modes 2 and
+//!   3 and once per count loaded in modes 0, 1 and 4, as KVM's PIT does (a
+//!   Linux guest whose local APIC timer is not used ticks on the PIT in
+//!   one-shot mode, mode 4); every channel's count and output read back as
+//!   KVM computes them, channel 2's output through the speaker port.
 //!
 //! Firecracker's MPTable maps ISA IRQ *i* to I/O APIC pin *i* (identity), so a
 //! device that registers `irqfd` for GSI *g* is delivered through entry *g*,
@@ -45,6 +48,13 @@ const IOAPIC_VER: u32 = 0x0017_0011;
 
 /// PIT input frequency, in Hz.
 const PIT_FREQ: u64 = 1_193_182;
+
+/// Which byte of a count a channel reads or writes next, as KVM saves it
+/// (`kvm_pit_channel_state` `read_state`, `write_state`, `count_latched`).
+const RW_STATE_LSB: u8 = 1;
+const RW_STATE_MSB: u8 = 2;
+const RW_STATE_WORD0: u8 = 3;
+const RW_STATE_WORD1: u8 = 4;
 
 /// The I/O APIC.
 #[derive(Debug, Clone)]
@@ -128,8 +138,6 @@ impl IoApic {
 #[derive(Debug, Clone)]
 struct Pic {
     state: kvm_pic_state,
-    /// Position in the ICW init sequence (0 = not initialising).
-    init_step: u8,
 }
 
 impl Pic {
@@ -139,7 +147,6 @@ impl Pic {
         state.elcr_mask = elcr_mask;
         Pic {
             state,
-            init_step: 0,
         }
     }
 
@@ -154,7 +161,7 @@ impl Pic {
                 s.init4 = value & 1;
                 s
             };
-            self.init_step = 1;
+            self.state.init_state = 1;
         } else if value & 0x08 == 0 {
             // OCW2: EOI / rotate — clear the in-service bit.
             if value & 0x20 != 0 {
@@ -168,18 +175,18 @@ impl Pic {
 
     /// Data port (0x21 / 0xA1).
     fn write_data(&mut self, value: u8) {
-        match self.init_step {
+        match self.state.init_state {
             1 => {
                 self.state.irq_base = value & 0xf8;
-                self.init_step = 2;
+                self.state.init_state = 2;
             }
             2 => {
                 // ICW3 (cascade) — not modelled beyond sequencing.
-                self.init_step = if self.state.init4 != 0 { 3 } else { 0 };
+                self.state.init_state = if self.state.init4 != 0 { 3 } else { 0 };
             }
             3 => {
                 self.state.auto_eoi = u8::from(value & 0x02 != 0);
-                self.init_step = 0;
+                self.state.init_state = 0;
             }
             _ => self.state.imr = value, // OCW1: interrupt mask
         }
@@ -208,6 +215,8 @@ struct PitChannel {
     rw_mode: u8,
     /// For `rw_mode == 3`, whether the high byte is next.
     write_hi: bool,
+    /// For `rw_mode == 3`, the low byte written, loaded with the high one.
+    write_latch: u8,
     read_hi: bool,
     latched: Option<u16>,
     gate: bool,
@@ -221,6 +230,7 @@ impl PitChannel {
             mode: 0,
             rw_mode: 3,
             write_hi: false,
+            write_latch: 0,
             read_hi: false,
             latched: None,
             gate: true,
@@ -236,19 +246,62 @@ impl PitChannel {
         }
     }
 
-    /// The counter's current value, counting down from the reload value at
-    /// `PIT_FREQ`.
-    fn current_count(&self) -> u16 {
-        let reload = self.reload_value();
-        let elapsed_ns = self.load_time.elapsed().as_nanos() as u64;
-        let ticks = elapsed_ns.saturating_mul(PIT_FREQ) / 1_000_000_000;
-        let remaining = reload - (ticks % reload);
-        (remaining & 0xffff) as u16
+    /// The input clock ticks since the count was loaded.
+    fn elapsed_ticks(&self) -> u64 {
+        let elapsed_ns = u64::try_from(self.load_time.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        u64::try_from(u128::from(elapsed_ns) * u128::from(PIT_FREQ) / 1_000_000_000).unwrap_or(u64::MAX)
     }
 
-    /// The period of channel 0 in nanoseconds, or `None` if not periodic.
+    /// The counter's current value, `d` input clock ticks after the count was
+    /// loaded (KVM's `pit_get_count`).
+    fn count_after(&self, d: u64) -> u16 {
+        let count = self.reload_value();
+        #[allow(clippy::cast_possible_truncation)]
+        match self.mode {
+            0 | 1 | 4 | 5 => (count.wrapping_sub(d) & 0xffff) as u16,
+            3 => (count - (d.wrapping_mul(2) % count)) as u16,
+            _ => (count - d % count) as u16,
+        }
+    }
+
+    /// The counter's output, `d` input clock ticks after the count was loaded
+    /// (KVM's `pit_get_out`).
+    fn out_after(&self, d: u64) -> bool {
+        let count = self.reload_value();
+        match self.mode {
+            1 => d < count,
+            2 => d.is_multiple_of(count) && d != 0,
+            3 => d % count < count.div_ceil(2),
+            4 | 5 => d == count,
+            _ => d >= count,
+        }
+    }
+
+    /// The counter's current value.
+    fn current_count(&self) -> u16 {
+        self.count_after(self.elapsed_ticks())
+    }
+
+    /// The counter's current output.
+    fn out(&self) -> bool {
+        self.out_after(self.elapsed_ticks())
+    }
+
+    /// The time the loaded count takes to reach zero, in nanoseconds.
     fn period_ns(&self) -> u64 {
         self.reload_value().saturating_mul(1_000_000_000) / PIT_FREQ
+    }
+
+    /// What channel 0 does with IRQ 0 for its mode once a count is loaded
+    /// (KVM's `kvm_pit_load_count`): `Some(true)` raises it every period
+    /// (modes 2 and 3), `Some(false)` once when the count reaches zero
+    /// (modes 0, 1 and 4), `None` never (mode 5).
+    fn irq_timer(&self) -> Option<bool> {
+        match self.mode {
+            0 | 1 | 4 => Some(false),
+            2 | 3 => Some(true),
+            _ => None,
+        }
     }
 }
 
@@ -264,10 +317,16 @@ struct Pit {
 /// Command to the channel-0 timer thread.
 #[derive(Debug)]
 struct TimerCmd {
+    /// 0: disarmed.
     period_ns: u64,
+    /// Whether IRQ 0 repeats every period, or is raised once.
+    periodic: bool,
     generation: u64,
     stop: bool,
 }
+
+/// Raises IRQ 0 (on the timer thread); false once the VM is gone.
+type Irq0 = Box<dyn Fn() -> bool + Send>;
 
 #[derive(Debug)]
 struct PitTimer {
@@ -299,19 +358,35 @@ impl Pit {
         }
     }
 
-    /// Starts or reprograms the channel-0 timer thread for the current period.
+    /// Starts or reprograms the channel-0 timer thread for the count just
+    /// loaded and the channel's mode.
     fn program_timer(&mut self, inner: &Arc<VmInner>) {
+        let weak = Arc::downgrade(inner);
+        self.program_timer_with(move || {
+            Box::new(move || match weak.upgrade() {
+                Some(inner) => {
+                    inner.raise_gsi(0, true);
+                    inner.raise_gsi(0, false);
+                    true
+                }
+                None => false,
+            })
+        });
+    }
+
+    /// [`Self::program_timer`], with `irq0` making what raises IRQ 0 if the
+    /// timer thread is started.
+    fn program_timer_with(&mut self, irq0: impl FnOnce() -> Irq0) {
         let ch = &self.channels[0];
-        // Only periodic modes (2 and 3) drive a repeating IRQ 0.
-        let period_ns = if matches!(ch.mode, 2 | 3) {
-            ch.period_ns()
-        } else {
-            0
+        let (period_ns, periodic) = match ch.irq_timer() {
+            Some(periodic) => (ch.period_ns().max(1), periodic),
+            None => (0, false),
         };
         if let Some(timer) = &self.timer {
             let (lock, cv) = &*timer.shared;
             let mut cmd = lock.lock().unwrap();
             cmd.period_ns = period_ns;
+            cmd.periodic = periodic;
             cmd.generation += 1;
             cv.notify_all();
             return;
@@ -322,14 +397,15 @@ impl Pit {
         let shared = Arc::new((
             Mutex::new(TimerCmd {
                 period_ns,
+                periodic,
                 generation: 0,
                 stop: false,
             }),
             Condvar::new(),
         ));
         let thread_shared = shared.clone();
-        let weak = Arc::downgrade(inner);
-        let join = std::thread::spawn(move || timer_loop(&thread_shared, &weak));
+        let irq0 = irq0();
+        let join = std::thread::spawn(move || timer_loop(&thread_shared, &irq0));
         self.timer = Some(PitTimer {
             shared,
             join: Some(join),
@@ -337,12 +413,10 @@ impl Pit {
     }
 }
 
-/// The channel-0 timer: waits one period, raises IRQ 0, repeats. Reprogrammed
-/// by bumping the generation; stops when the VM is gone or `stop` is set.
-fn timer_loop(
-    shared: &Arc<(Mutex<TimerCmd>, Condvar)>,
-    weak: &std::sync::Weak<VmInner>,
-) {
+/// The channel-0 timer: waits one period, raises IRQ 0, and repeats in a
+/// periodic mode or disarms in a one-shot one. Reprogrammed by bumping the
+/// generation; stops when the VM is gone or `stop` is set.
+fn timer_loop(shared: &Arc<(Mutex<TimerCmd>, Condvar)>, irq0: &Irq0) {
     use std::time::Duration;
     let (lock, cv) = &**shared;
     loop {
@@ -374,13 +448,14 @@ fn timer_loop(
         if cmd.generation != generation {
             continue; // reprogrammed; restart with the new period
         }
+        let mut cmd = cmd;
+        if !cmd.periodic {
+            // One-shot: done until a count is loaded again.
+            cmd.period_ns = 0;
+        }
         drop(cmd);
-        match weak.upgrade() {
-            Some(inner) => {
-                inner.raise_gsi(0, true);
-                inner.raise_gsi(0, false);
-            }
-            None => return,
+        if !irq0() {
+            return;
         }
     }
 }
@@ -540,8 +615,14 @@ impl Irqchip {
             0xA1 => self.pics[1].write_data(value),
             0x4D0 => self.pics[0].state.elcr = value & self.pics[0].state.elcr_mask,
             0x4D1 => self.pics[1].state.elcr = value & self.pics[1].state.elcr_mask,
-            0x43 => self.pit_write_control(value, inner),
-            0x40..=0x42 => self.pit_write_counter((port - 0x40) as usize, value, inner),
+            0x43 => self.pit_write_control(value),
+            0x40..=0x42 => {
+                if self.pit_write_counter((port - 0x40) as usize, value)
+                    && let Some(pit) = &mut self.pit
+                {
+                    pit.program_timer(inner);
+                }
+            }
             0x61 => {
                 if let Some(pit) = &mut self.pit {
                     pit.speaker = value;
@@ -554,17 +635,20 @@ impl Irqchip {
 
     fn speaker_read(&self) -> u8 {
         let Some(pit) = &self.pit else { return 0 };
-        // Bit 5 reflects channel-2 output (toggles as the counter wraps), which
-        // the guest polls during TSC calibration.
-        let out2 = u8::from(pit.channels[2].current_count() < (pit.channels[2].reload_value() / 2) as u16);
-        (pit.speaker & 0x0f) | (out2 << 5)
+        // As KVM's speaker_ioport_read: bit 0 is channel 2's gate, bit 1
+        // the speaker data bit last written (which, as on KVM, a snapshot
+        // does not keep: kvm_pit_state2 has no field for it), bit 5
+        // channel 2's output, which a guest polls when it calibrates its
+        // TSC against the PIT. KVM's bit 4 (a refresh clock) is not modelled.
+        let out2 = u8::from(pit.channels[2].out());
+        u8::from(pit.channels[2].gate) | (pit.speaker & 0x2) | (out2 << 5)
     }
 
     fn pit_read_counter(&mut self, ch: usize) -> u8 {
         let Some(pit) = &mut self.pit else { return 0 };
         let channel = &mut pit.channels[ch];
         let count = channel.latched.unwrap_or_else(|| channel.current_count());
-        let byte = if channel.read_hi {
+        let byte = if channel.rw_mode == 2 || channel.read_hi {
             (count >> 8) as u8
         } else {
             count as u8
@@ -580,7 +664,7 @@ impl Irqchip {
         byte
     }
 
-    fn pit_write_control(&mut self, value: u8, inner: &Arc<VmInner>) {
+    fn pit_write_control(&mut self, value: u8) {
         let Some(pit) = &mut self.pit else { return };
         let ch = (value >> 6) & 0x3;
         if ch == 3 {
@@ -594,17 +678,21 @@ impl Irqchip {
             return;
         }
         channel.rw_mode = access;
-        channel.mode = (value >> 1) & 0x7;
+        // Modes 6 and 7 are 2 and 3.
+        channel.mode = match (value >> 1) & 0x7 {
+            m @ 6..=7 => m - 4,
+            m => m,
+        };
         channel.write_hi = false;
         channel.read_hi = false;
         channel.latched = None;
-        if ch == 0 {
-            pit.program_timer(inner);
-        }
+        // The timer changes when a count is loaded, as in KVM.
     }
 
-    fn pit_write_counter(&mut self, ch: usize, value: u8, inner: &Arc<VmInner>) {
-        let Some(pit) = &mut self.pit else { return };
+    /// Writes a byte of channel `ch`'s count; whether that loaded a count
+    /// into channel 0, whose timer then needs programming.
+    fn pit_write_counter(&mut self, ch: usize, value: u8) -> bool {
+        let Some(pit) = &mut self.pit else { return false };
         let channel = &mut pit.channels[ch];
         let loaded = match channel.rw_mode {
             1 => {
@@ -616,12 +704,13 @@ impl Irqchip {
                 true
             }
             _ => {
+                // The count changes once both bytes are in, as in KVM.
                 if channel.write_hi {
-                    channel.reload = (channel.reload & 0x00ff) | (u32::from(value) << 8);
+                    channel.reload = u32::from(channel.write_latch) | (u32::from(value) << 8);
                     channel.write_hi = false;
                     true
                 } else {
-                    channel.reload = u32::from(value);
+                    channel.write_latch = value;
                     channel.write_hi = true;
                     false
                 }
@@ -629,21 +718,40 @@ impl Irqchip {
         };
         if loaded {
             channel.load_time = Instant::now();
-            if ch == 0 {
-                pit.program_timer(inner);
-            }
         }
+        loaded && ch == 0
     }
 
     // ---- save / restore ----
 
+    /// The PIT's state as `KVM_GET_PIT2` gives it, with what a guest has
+    /// half done: a count of which only the low byte is written, and which
+    /// byte of a count (or of a latched count) it reads next.
     pub(crate) fn pit_state(&self) -> kvm_pit_state2 {
         let mut state: kvm_pit_state2 = unsafe { std::mem::zeroed() };
         if let Some(pit) = &self.pit {
             state.flags = pit.flags;
             for (i, ch) in pit.channels.iter().enumerate() {
+                let next = |hi: bool| match ch.rw_mode {
+                    1 => RW_STATE_LSB,
+                    2 => RW_STATE_MSB,
+                    _ if hi => RW_STATE_WORD1,
+                    _ => RW_STATE_WORD0,
+                };
+                // A latched count reads as KVM's `count_latched` gives it:
+                // the byte next, MSB for the second of a word.
+                let count_latched = match (ch.latched.is_some(), next(ch.read_hi)) {
+                    (false, _) => 0,
+                    (true, RW_STATE_WORD1) => RW_STATE_MSB,
+                    (true, n) => n,
+                };
                 state.channels[i] = kvm_pit_channel_state {
                     count: ch.reload,
+                    latched_count: ch.latched.unwrap_or(0),
+                    count_latched,
+                    read_state: next(ch.read_hi),
+                    write_state: next(ch.write_hi),
+                    write_latch: ch.write_latch,
                     mode: ch.mode,
                     rw_mode: ch.rw_mode,
                     gate: u8::from(ch.gate),
@@ -655,20 +763,35 @@ impl Irqchip {
     }
 
     pub(crate) fn set_pit_state(&mut self, state: &kvm_pit_state2, inner: &Arc<VmInner>) {
-        if self.pit.is_none() {
-            self.pit = Some(Pit::new(state.flags));
-        }
+        self.restore_pit(state);
         if let Some(pit) = &mut self.pit {
-            pit.flags = state.flags;
-            for (i, ch) in pit.channels.iter_mut().enumerate() {
-                let s = &state.channels[i];
-                ch.reload = s.count;
-                ch.mode = s.mode;
-                ch.rw_mode = if s.rw_mode == 0 { 3 } else { s.rw_mode };
-                ch.gate = s.gate != 0;
-                ch.load_time = Instant::now();
-            }
             pit.program_timer(inner);
+        }
+    }
+
+    /// [`Self::set_pit_state`] but for the timer.
+    fn restore_pit(&mut self, state: &kvm_pit_state2) {
+        let pit = self.pit.get_or_insert_with(|| Pit::new(state.flags));
+        pit.flags = state.flags;
+        for (i, ch) in pit.channels.iter_mut().enumerate() {
+            let s = &state.channels[i];
+            ch.reload = s.count;
+            ch.mode = s.mode;
+            ch.rw_mode = if s.rw_mode == 0 { 3 } else { s.rw_mode };
+            ch.gate = s.gate != 0;
+            ch.load_time = Instant::now();
+            // Any access mode but low or high only reads and writes a word,
+            // as `pit_read_counter` and `pit_write_counter` take it.
+            let word = !matches!(ch.rw_mode, 1 | 2);
+            ch.write_hi = word && s.write_state == RW_STATE_WORD1;
+            ch.write_latch = s.write_latch;
+            ch.latched = (s.count_latched != 0).then_some(s.latched_count);
+            ch.read_hi = word
+                && if s.count_latched != 0 {
+                    s.count_latched == RW_STATE_MSB
+                } else {
+                    s.read_state == RW_STATE_WORD1
+                };
         }
     }
 
@@ -767,4 +890,203 @@ fn write_le(data: &mut [u8], value: u64) {
     let bytes = value.to_le_bytes();
     let n = data.len().min(8);
     data[..n].copy_from_slice(&bytes[..n]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    fn channel(mode: u8, reload: u32) -> PitChannel {
+        PitChannel { mode, reload, ..PitChannel::new() }
+    }
+
+    /// Counts and outputs as KVM's `pit_get_count` and `pit_get_out` give
+    /// them.
+    #[test]
+    fn test_pit_count_and_out_by_mode() {
+        // Mode 0 (interrupt on terminal count): counts down once, then wraps
+        // through 0xffff; the output goes high at zero and stays.
+        let c = channel(0, 100);
+        assert_eq!(c.count_after(0), 100);
+        assert_eq!(c.count_after(40), 60);
+        assert_eq!(c.count_after(101), 0xffff);
+        assert!(!c.out_after(99));
+        assert!(c.out_after(100));
+        assert!(c.out_after(5000));
+        // Mode 4 (software strobe, Linux's one-shot): high for the zero tick only.
+        let c = channel(4, 100);
+        assert!(!c.out_after(99));
+        assert!(c.out_after(100));
+        assert!(!c.out_after(101));
+        // Mode 2 (rate generator): reloads; the output pulses at each reload.
+        let c = channel(2, 100);
+        assert_eq!(c.count_after(130), 70);
+        assert!(c.out_after(200));
+        assert!(!c.out_after(201));
+        assert!(!c.out_after(0));
+        // Mode 3 (square wave): counts down by two; high for the first half.
+        let c = channel(3, 100);
+        assert_eq!(c.count_after(10), 80);
+        assert!(c.out_after(49));
+        assert!(!c.out_after(50));
+        // A reload of 0 is 65536.
+        let c = channel(2, 0);
+        assert_eq!(c.count_after(1), 0xffff);
+    }
+
+    /// A snapshot keeps what the guest has half done with the PIT: a count
+    /// of which only the low byte is written, a latched count of which only
+    /// the low byte is read (found by fuzz/fuzz_targets/whp_irqchip.rs).
+    #[test]
+    fn test_pit_snapshot_keeps_half_written_and_half_read_counts() {
+        let restored = |chip: &Irqchip| {
+            let mut copy = Irqchip::new();
+            copy.restore_pit(&chip.pit_state());
+            copy
+        };
+        let mut chip = Irqchip::new();
+        chip.pit = Some(Pit::new(0));
+        // Channel 2, low then high byte, mode 0.
+        chip.pit_write_control(0xb0);
+        assert!(!chip.pit_write_counter(2, 0x34));
+        // Only the low byte: the count is not loaded yet (KVM's write_latch).
+        assert_eq!(chip.pit_state().channels[2].count, 0);
+        let mut copy = restored(&chip);
+        for c in [&mut chip, &mut copy] {
+            assert!(!c.pit_write_counter(2, 0x12));
+            assert_eq!(c.pit_state().channels[2].count, 0x1234);
+        }
+        // Channel 0's count loaded: its timer to program.
+        chip.pit_write_control(0x34);
+        assert!(!chip.pit_write_counter(0, 0));
+        assert!(chip.pit_write_counter(0, 0x10));
+        // A latched count read half-way.
+        chip.pit_write_control(0x80);
+        chip.pit_read_counter(2);
+        let mut copy = restored(&chip);
+        let hi = chip.pit_read_counter(2);
+        assert_eq!(copy.pit_read_counter(2), hi);
+        assert!((0x11..=0x12).contains(&hi), "{hi:#x}");
+        assert_eq!(copy.pit_state().channels[2].count_latched, 0);
+        // Then the counter itself, low byte first, in both.
+        assert_eq!(chip.pit_state().channels[2].read_state, RW_STATE_WORD0);
+        assert_eq!(copy.pit_state().channels[2].read_state, RW_STATE_WORD0);
+        // High byte only (rw_mode 2): reads give the high byte.
+        chip.pit_write_control(0xa0);
+        assert!(!chip.pit_write_counter(2, 0x56));
+        chip.pit_write_control(0x80);
+        let hi = chip.pit_read_counter(2);
+        assert!((0x55..=0x56).contains(&hi), "{hi:#x}");
+        // An access mode out of range in a snapshot file is taken as a
+        // word, there and again after a snapshot of it.
+        let mut state = chip.pit_state();
+        state.channels[1].rw_mode = 0xab;
+        chip.restore_pit(&state);
+        assert!(!chip.pit_write_counter(1, 0x01));
+        let copy = restored(&chip);
+        assert_eq!(copy.pit_state().channels[1].write_state, RW_STATE_WORD1);
+    }
+
+    /// A snapshot taken in a PIC's initialisation keeps its place in it
+    /// (`kvm_pic_state.init_state`, as KVM's): the next data byte is the
+    /// next ICW, not the mask (found by fuzz/fuzz_targets/whp_irqchip.rs).
+    #[test]
+    fn test_pic_snapshot_keeps_init_sequence() {
+        let mut chip = Irqchip::new();
+        chip.pics[0].write_cmd(0x11); // ICW1, ICW4 to come
+        let mut k: kvm_irqchip = unsafe { std::mem::zeroed() };
+        k.chip_id = KVM_IRQCHIP_PIC_MASTER;
+        chip.get_chip(&mut k);
+        let mut copy = Irqchip::new();
+        copy.set_chip(&k);
+        for c in [&mut chip, &mut copy] {
+            c.pics[0].write_data(0x30); // ICW2: vector base
+            c.pics[0].write_data(0x04); // ICW3
+            c.pics[0].write_data(0x01); // ICW4
+            c.pics[0].write_data(0xfb); // OCW1: the mask
+            assert_eq!((c.pics[0].state.irq_base, c.pics[0].state.imr), (0x30, 0xfb));
+        }
+    }
+
+    /// Port 0x61 reads as KVM's speaker port: gate 2, the speaker data bit
+    /// and channel 2's output; nothing else of what was written.
+    #[test]
+    fn test_speaker_port_reads_as_kvm() {
+        let mut chip = Irqchip::new();
+        chip.pit = Some(Pit::new(0));
+        let write = |chip: &mut Irqchip, v: u8| {
+            let pit = chip.pit.as_mut().unwrap();
+            pit.speaker = v;
+            pit.channels[2].gate = v & 1 != 0;
+        };
+        write(&mut chip, 0xff);
+        assert_eq!(chip.speaker_read() & !0x20, 0x03);
+        write(&mut chip, 0xfc);
+        assert_eq!(chip.speaker_read() & !0x20, 0);
+        // The data bit is not in a snapshot (kvm_pit_state2), the gate is.
+        write(&mut chip, 0x03);
+        let mut copy = Irqchip::new();
+        copy.restore_pit(&chip.pit_state());
+        assert_eq!(copy.speaker_read() & !0x20, 0x01);
+    }
+
+    #[test]
+    fn test_pit_irq_timer_by_mode() {
+        for (mode, expect) in [(0, Some(false)), (1, Some(false)), (4, Some(false)), (2, Some(true)), (3, Some(true)), (5, None)] {
+            assert_eq!(channel(mode, 1000).irq_timer(), expect, "mode {mode}");
+        }
+    }
+
+    /// Loads channel 0 of `pit` with `mode` and `reload`, as a guest's OUTs
+    /// would, and (re)programs the timer with a counting IRQ 0.
+    fn load(pit: &mut Pit, mode: u8, reload: u32, irqs: &Arc<AtomicU32>) {
+        pit.channels[0].mode = mode;
+        pit.channels[0].reload = reload;
+        pit.channels[0].load_time = Instant::now();
+        let irqs = irqs.clone();
+        pit.program_timer_with(move || {
+            Box::new(move || {
+                irqs.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+        });
+    }
+
+    /// Linux's one-shot PIT clockevent (`pit_set_oneshot`, then a count per
+    /// event) gets one IRQ 0 per count, as from KVM's PIT; before, only the
+    /// periodic modes raised it and a guest ticking on the PIT in one-shot
+    /// mode stopped taking timer interrupts.
+    #[test]
+    fn test_pit_one_shot_raises_irq0_once_per_count() {
+        let mut pit = Pit::new(0);
+        let irqs = Arc::new(AtomicU32::new(0));
+        // 1193 ticks: 1 ms.
+        load(&mut pit, 4, 1193, &irqs);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(irqs.load(Ordering::SeqCst), 1, "mode 4: one IRQ 0 per count");
+        load(&mut pit, 4, 1193, &irqs);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(irqs.load(Ordering::SeqCst), 2, "a second count, a second IRQ 0");
+        load(&mut pit, 0, 1193, &irqs);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(irqs.load(Ordering::SeqCst), 3, "mode 0 too");
+    }
+
+    #[test]
+    fn test_pit_periodic_repeats_and_mode_5_stops() {
+        let mut pit = Pit::new(0);
+        let irqs = Arc::new(AtomicU32::new(0));
+        // 11932 ticks: 10 ms.
+        load(&mut pit, 2, 11932, &irqs);
+        std::thread::sleep(Duration::from_millis(300));
+        let n = irqs.load(Ordering::SeqCst);
+        assert!(n >= 5, "mode 2 every 10 ms: {n} IRQs in 300 ms");
+        // Mode 5 (hardware-triggered strobe, no gate on channel 0): none.
+        load(&mut pit, 5, 11932, &irqs);
+        let n = irqs.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(irqs.load(Ordering::SeqCst) <= n + 1, "mode 5 kept raising IRQ 0");
+    }
 }
