@@ -79,7 +79,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
-    DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE,
+    DuplicateHandle, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE,
     HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0,
     LocalFree, SetHandleInformation,
@@ -91,7 +91,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx,
-    LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, SE_PRIVILEGE_ENABLED, TOKEN_PRIVILEGES, TokenPrivileges,
+    LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, TOKEN_PRIVILEGES, TokenPrivileges,
     GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, GetTokenInformation,
     LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
     SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS,
@@ -1025,8 +1025,16 @@ fn token_info(token: HANDLE, class: i32) -> Result<Vec<u64>, HostError> {
     let mut len = 0u32;
     // SAFETY: a size query.
     unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut len) };
+    // A class of a fixed size (TokenElevationType, TokenLinkedToken) answers
+    // a size query with ERROR_BAD_LENGTH (24), with the length it wants
+    // (measured on Windows 11 26H2: every jail failed with it), and takes
+    // no other length.
     // SAFETY: plain call.
-    if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+    let err = unsafe { GetLastError() };
+    if err != ERROR_INSUFFICIENT_BUFFER && err != ERROR_BAD_LENGTH {
+        return Err(HostError::Spawn("GetTokenInformation", last_error()));
+    }
+    if len == 0 {
         return Err(HostError::Spawn("GetTokenInformation", last_error()));
     }
     // u64 words: the structures hold pointers.
@@ -2056,7 +2064,7 @@ mod tests {
             let kept: Vec<(String, bool)> = privileges(token.as_raw_handle())
                 .unwrap()
                 .into_iter()
-                .map(|(n, p)| (n, p.Attributes & SE_PRIVILEGE_ENABLED != 0))
+                .map(|(n, p)| (n, p.Attributes & windows_sys::Win32::Security::SE_PRIVILEGE_ENABLED != 0))
                 .collect();
             assert_eq!(kept, want, "the jail's token, from {mine:?}");
         }

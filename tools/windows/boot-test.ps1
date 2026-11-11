@@ -519,7 +519,8 @@ namespace Wick {
         static extern IntPtr GetCurrentProcess();
         [DllImport("kernel32.dll")]
         static extern bool CloseHandle(IntPtr h);
-        [StructLayout(LayoutKind.Sequential)]
+        // Pack = 4, as winnt.h packs TOKEN_PRIVILEGES: the LUID is at offset 4 (at 8 the privilege named is not the one meant: error 1300).
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
         struct TokenPrivileges { public uint Count; public long Luid; public uint Attributes; }
 
         public static long Minimum() { return (long)(ulong)GetLargePageMinimum(); }
