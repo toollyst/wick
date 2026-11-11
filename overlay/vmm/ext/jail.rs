@@ -401,6 +401,22 @@ mod imp {
         Ok(())
     }
 
+    /// Applies a CPU limit of `percent` that refills every `interval`
+    /// seconds, and returns the interval the kernel reads back.
+    #[cfg(test)]
+    pub(super) fn cpu_refill_interval(percent: u8, interval: u64) -> u64 {
+        let mut attr = CpuUsageAttr {
+            action: PROC_POLICY_RSRCACT_THROTTLE,
+            percentage: percent.into(),
+            interval,
+            deadline: 0,
+        };
+        cpu_policy(PROC_POLICY_ACTION_APPLY, &mut attr).unwrap();
+        let mut got = CpuUsageAttr::default();
+        cpu_policy(PROC_POLICY_ACTION_GET, &mut got).unwrap();
+        got.interval
+    }
+
     fn check(ret: libc::c_int) -> Result<(), Error> {
         if ret == 0 { Ok(()) } else { Err(Error::last_os_error()) }
     }
@@ -885,6 +901,28 @@ mod tests {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "{stdout}");
         assert!(stdout.contains("CPU-LIMITED"), "{stdout}");
+    }
+
+    // The CPU limit's refill interval is a number of seconds (0 reads back
+    // as 1): a CFS period, 1 ms to 1 s, below a second cannot be asked for.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_cpu_limit_refills_in_whole_seconds() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "ext::jail::tests::cpu_refill_child", "--ignored", "--nocapture"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        assert!(stdout.contains("REFILL 0->1 1->1 2->2"), "{stdout}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_cpu_limit_refills_in_whole_seconds in a separate process"]
+    fn cpu_refill_child() {
+        let got: Vec<u64> = [0, 1, 2].iter().map(|&i| imp::cpu_refill_interval(50, i)).collect();
+        println!("REFILL 0->{} 1->{} 2->{}", got[0], got[1], got[2]);
     }
 
     #[cfg(target_os = "macos")]
