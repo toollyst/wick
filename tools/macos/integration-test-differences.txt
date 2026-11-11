@@ -187,6 +187,15 @@ all impossible integration_tests/functional/test_vsock.py::test_snapshot_restore
 # is a datagram endpoint (docs/PORTING.md row 6), one queue by design.
 all impossible integration_tests/functional/test_net.py::test_multi_queue_unsupported
 
+# The test hot-plugs a net device on a TAP nobody made and expects Firecracker
+# to refuse it ("Open tap device failed"): on Linux the jail's user cannot
+# create a TAP (TUNSETIFF needs CAP_NET_ADMIN), so only the operator's TAPs
+# open. On macOS Firecracker makes its endpoint itself (it binds the name, in
+# the jail's network or its temporary directory, docs/PORTING.md row 6), so
+# any free name opens: the device is attached to nothing, and the hot-plug
+# succeeds. To do: open only an endpoint the operator made.
+all row-6 integration_tests/functional/test_hotplug.py::test_hotplug_net[booted-kvm-NO_CPU_TMPL-True-vmlinux-6.1.188]
+
 # The test takes away the jail directory's write permission and expects
 # Firecracker, the jail's user, to fail writing the snapshot. As root (the
 # jailer, upstream's CI) the test still reaches the API socket in that
