@@ -1700,6 +1700,97 @@ mod tests {
         );
     }
 
+    /// The VM map entries inside `[start, start + len)`.
+    fn map_entries(start: u64, len: u64) -> usize {
+        unsafe extern "C" {
+            fn mach_vm_region(
+                task: u32,
+                address: *mut u64,
+                size: *mut u64,
+                flavor: c_int,
+                info: *mut c_int,
+                count: *mut u32,
+                object_name: *mut u32,
+            ) -> c_int;
+            static mach_task_self_: u32;
+        }
+        let (mut n, mut addr) = (0, start);
+        while addr < start + len {
+            let (mut at, mut size, mut object) = (addr, 0u64, 0u32);
+            let mut info = [0 as c_int; 16];
+            let mut count = 9u32;
+            // SAFETY: valid output buffers for VM_REGION_BASIC_INFO_64 (9).
+            let ret = unsafe {
+                mach_vm_region(mach_task_self_, &mut at, &mut size, 9, info.as_mut_ptr(), &mut count, &mut object)
+            };
+            if ret != 0 || at >= start + len {
+                break;
+            }
+            n += 1;
+            addr = at + size;
+        }
+        n
+    }
+
+    /// Free page reporting and a 4 KiB-page balloon release scattered host
+    /// pages, and each replaced piece is a VM map entry of its own (XNU
+    /// merges adjacent entries only when they share one object; a fresh
+    /// `MAP_FIXED` mapping has its own), so a large guest can come to tens
+    /// of thousands of entries and as many `hv_vm_map` ranges. On a 1 GiB
+    /// guest, three cycles of discarding every other host page (32768
+    /// discards) and the guest writing every page again: no discard, stage-2
+    /// mapping or guest access fails (a page left unmapped would exit as
+    /// MMIO), the entries are counted and the time per discard measured
+    /// (docs/PORTING.md, the `libc` row).
+    #[test]
+    fn test_scattered_discards_keep_the_guest_mapped() {
+        // WICK_STRESS_MIB raises the guest size for a longer run by hand.
+        let mib: usize = std::env::var("WICK_STRESS_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+        let (_vm, mut vcpu, mem, len) = vm_with_memory(mib, &FILL);
+        let page = host_page_size() as usize;
+        let at = |off: usize| -> u64 {
+            // SAFETY: inside the mapping.
+            unsafe { std::ptr::read_volatile(mem.cast::<u8>().add(off).cast::<u64>()) }
+        };
+        fill(&mut vcpu, len, 1);
+        let entries = map_entries(mem as u64, len as u64);
+        println!(
+            "guest wrote {mib} MiB: {entries} entries, footprint {} KiB",
+            phys_footprint() >> 10
+        );
+        // XNU maps anonymous memory in chunks of 128 MiB (ANON_CHUNK_SIZE).
+        assert!(entries <= mib.div_ceil(128), "{entries} entries before any discard");
+        for cycle in 1..=3u64 {
+            let start = std::time::Instant::now();
+            let (mut n, mut off) = (0u32, page);
+            while off < len {
+                // SAFETY: one page of the mapping.
+                if unsafe { libc::madvise(mem.add(off), page, libc::MADV_DONTNEED) } != 0 {
+                    panic!(
+                        "cycle {cycle}: discard {n} at {off:#x} failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                n += 1;
+                off += 2 * page;
+            }
+            let per = start.elapsed() / n;
+            let (discarded, footprint) = (map_entries(mem as u64, len as u64), phys_footprint());
+            assert_eq!(at(page), 0);
+            fill(&mut vcpu, len, cycle + 1);
+            for off in [page, 2 * page, len / 2, len - 2 * page, len - page] {
+                assert_eq!(at(off), cycle + 1, "page at {off:#x} after cycle {cycle}");
+            }
+            println!(
+                "cycle {cycle}: {n} discards of one page, {per:?} each; {discarded} entries after them, {} after \
+                 the guest wrote again; footprint {} KiB discarded, {} KiB written again",
+                map_entries(mem as u64, len as u64),
+                footprint >> 10,
+                phys_footprint() >> 10
+            );
+        }
+    }
+
     #[test]
     fn test_virtual_count_is_the_vms() {
         // As on KVM, writing one vCPU's TIMER_CNT sets the counter of every
