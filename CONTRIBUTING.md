@@ -90,6 +90,15 @@ discard local commits on `wick` unless given `--force`.
   requested. An error is acceptable only where the hardware or OS physically
   cannot do it, and the roadmap's status table says so.
 - Test-only shortcuts live in `cfg(test)` or in `tools/`.
+- A table cell in README.md, SECURITY.md or docs/ROADMAP.md that says a
+  control is "in place", "verified" or "measured" names, in backticks, the
+  test that checks it (`jailer-test cpu`, `test_sandbox_restricts_child`).
+  `tools/check-claims.py` enforces it on CI. A probe that once showed
+  something is not a test; the claim waits until the product does it and a
+  test in the repository shows it.
+- A number in a doc says how it was measured. On a loaded machine, measure
+  against a control run at the same time, or state only bounds the kernel
+  reports back (a limit read back, CPU time used), never wall-clock alone.
 - Find the cause before fixing a failure. Reproduce it, and fix what the
   reproduction shows, with a test that fails without the fix. A retry, a
   longer timeout or a skipped check added without a known cause hides the
