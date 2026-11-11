@@ -6,7 +6,9 @@
   mechanisms the sandbox and jailer backends use.
 - `jailer-test.ps1`: the jailer on WHP hardware, the counterpart of
   `tools/macos/jailer-test.py`. Stages: `refuse` (what Windows cannot
-  enforce is refused), `isolation` (`jail-probe.rs`, run through the jailer
+  enforce is refused, each cgroup controller with its reason), `cpuset`
+  (`cpuset.cpus` is the jailed process's affinity), `weight` (two jailed
+  processes at `cpu.weight` 50 and 100 sharing one processor), `isolation` (`jail-probe.rs`, run through the jailer
   as the jailed binary, may not read the user's files or SAM, write outside
   its jail, reach another jail's files, API socket or process, or open the
   operator's; the operator reaches the API socket), `boot` (a 2 vCPU guest

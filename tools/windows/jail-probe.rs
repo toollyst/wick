@@ -13,6 +13,7 @@
 //!                               see:<pid> ctrl:<process group> procs:0
 //!                               wait:<seconds> console:0 tty:<file>
 //!                               attach:<pid> inject:0 echo:<file>
+//!                               job:0 affinity:0 spin:<seconds>
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! ```
 //!
@@ -114,6 +115,9 @@ extern "system" {
     fn GetNumberOfConsoleInputEvents(h: HANDLE, n: *mut u32) -> i32;
     fn WriteConsoleInputW(h: HANDLE, recs: *const KEY_RECORD, n: u32, written: *mut u32) -> i32;
     fn WriteFile(h: HANDLE, buf: *const u8, n: u32, written: *mut u32, ov: *mut c_void) -> i32;
+    fn QueryInformationJobObject(job: HANDLE, class: i32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+    fn GetProcessAffinityMask(p: HANDLE, mine: *mut usize, system: *mut usize) -> i32;
+    fn GetProcessTimes(p: HANDLE, c: *mut u64, e: *mut u64, k: *mut u64, u: *mut u64) -> i32;
 }
 
 #[repr(C)]
@@ -526,6 +530,47 @@ fn check(c: &str) -> String {
                     format!("denied {}", std::io::Error::from_raw_os_error(GetLastError() as i32))
                 }
             }
+        }
+        // The limits of the job this process is in, as Windows reports them:
+        // `allowed affinity=<mask> cpu=<flags>:<rate or weight>`.
+        "job" => {
+            let mut basic = [0u64; 8]; // JOBOBJECT_BASIC_LIMIT_INFORMATION (64 bytes)
+            let mut cpu = [0u32; 2]; // JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+            // SAFETY: buffers of the sizes passed; NULL is the caller's job.
+            unsafe {
+                if QueryInformationJobObject(std::ptr::null_mut(), 2, basic.as_mut_ptr().cast(), 64, std::ptr::null_mut()) == 0
+                    || QueryInformationJobObject(std::ptr::null_mut(), 15, cpu.as_mut_ptr().cast(), 8, std::ptr::null_mut()) == 0
+                {
+                    return format!("denied {}", std::io::Error::last_os_error());
+                }
+            }
+            // LimitFlags is at offset 16, Affinity at 48.
+            let flags = basic[2] as u32;
+            let affinity = if flags & 0x10 != 0 { format!("{:#x}", basic[6]) } else { "none".into() };
+            format!("allowed affinity={affinity} cpu={:#x}:{}", cpu[0], cpu[1])
+        }
+        // The processors this process may run on.
+        "affinity" => {
+            let (mut mine, mut system) = (0usize, 0usize);
+            // SAFETY: out-parameters.
+            if unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut mine, &mut system) } == 0 {
+                return format!("denied {}", std::io::Error::last_os_error());
+            }
+            format!("allowed {mine:#x} of {system:#x}")
+        }
+        // Spins for `arg` seconds of wall time: `allowed <CPU seconds used>`.
+        "spin" => {
+            let Ok(secs) = arg.parse() else {
+                return "bad seconds".into();
+            };
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            while std::time::Instant::now() < end {
+                std::hint::spin_loop();
+            }
+            let (mut c, mut e, mut k, mut u) = (0u64, 0u64, 0u64, 0u64);
+            // SAFETY: four out-parameters.
+            unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
+            format!("allowed {:.3}", (k + u) as f64 / 1e7)
         }
         // Waits `arg` seconds: a process for the others to act on.
         "wait" => {

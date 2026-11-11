@@ -50,8 +50,8 @@
 //!   grants them; Firecracker, at that level, and the operator, above it, can.
 //! - **cgroups are a Job Object** ([`cgroup`](super::cgroup)): job memory
 //!   limit, CPU rate hard cap (from Firecracker's start, as a cgroup's
-//!   limit holds from the exec), active process limit; the job kills
-//!   Firecracker when the jailer goes and limits its UI access.
+//!   limit holds from the exec) or CPU weight, processor affinity; the job
+//!   kills Firecracker when the jailer goes and limits its UI access.
 //! - **No exec**: the jailer starts Firecracker suspended in the job with the
 //!   tokens, waits for it, removes the jail's drive and exits with its status.
 //! - **`--daemonize`** ([`daemonize`]): Windows has no fork, so the jailer
@@ -101,7 +101,8 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
-    JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED,
+    JOB_OBJECT_LIMIT_AFFINITY, JobObjectGroupInformationEx,
     JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
     JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
@@ -211,11 +212,14 @@ pub enum HostError {
     )]
     Unsupported(&'static str, &'static str),
     #[error(
-        "--cgroup {0} is not supported on Windows (supported: memory.max, cpu.max and pids.max \
-         with --cgroup-version 2; memory.limit_in_bytes, cpu.cfs_quota_us, cpu.cfs_period_us and \
-         pids.max with --cgroup-version 1). The jailer never accepts a limit it cannot enforce."
+        "--cgroup {0} is not supported on Windows (supported: memory.max, cpu.max, cpu.weight, \
+         cpu.weight.nice, cpuset.cpus and cpuset.mems with --cgroup-version 2; \
+         memory.limit_in_bytes, cpu.cfs_quota_us, cpu.cfs_period_us, cpu.shares, cpuset.cpus and \
+         cpuset.mems with --cgroup-version 1). The jailer never accepts a limit it cannot enforce."
     )]
     UnsupportedCgroup(String),
+    #[error("--cgroup {0} is refused on Windows: {1}. The jailer never accepts a limit it cannot enforce.")]
+    ImpossibleCgroup(String, &'static str),
     #[error("--cgroup {0}: {1}")]
     CgroupValue(String, &'static str),
     #[error(
@@ -271,18 +275,22 @@ struct Jail {
 static JAIL: Mutex<Option<Jail>> = Mutex::new(None);
 
 /// The Job Object limits, from the cgroup configuration.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Limits {
     pub memory_bytes: Option<u64>,
     /// Hundredths of a percent of all processors (`CpuRate`).
     pub cpu_rate: Option<u32>,
-    pub processes: Option<u32>,
+    /// The job's CPU weight, 1 to 9 (`Weight`); never with `cpu_rate`.
+    pub cpu_weight: Option<u32>,
+    /// The processors the job runs on: an affinity mask per processor group.
+    pub cpus: Option<Vec<(u16, u64)>>,
 }
 
 static LIMITS: Mutex<Limits> = Mutex::new(Limits {
     memory_bytes: None,
     cpu_rate: None,
-    processes: None,
+    cpu_weight: None,
+    cpus: None,
 });
 
 pub(crate) fn set_limits(limits: Limits) {
@@ -1043,9 +1051,18 @@ fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedH
     Ok(t)
 }
 
+/// `GROUP_AFFINITY` (winnt.h).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct GroupAffinity {
+    mask: usize,
+    group: u16,
+    reserved: [u16; 3],
+}
+
 /// A Job Object with the cgroup limits: Firecracker dies with the jailer
 /// (kill on close) and has no UI access.
-fn job(limits: Limits) -> Result<OwnedHandle, HostError> {
+fn job(limits: &Limits) -> Result<OwnedHandle, HostError> {
     // SAFETY: an unnamed job.
     let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if h.is_null() {
@@ -1061,15 +1078,28 @@ fn job(limits: Limits) -> Result<OwnedHandle, HostError> {
         basic.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
         info.JobMemoryLimit = usize::try_from(bytes).unwrap_or(usize::MAX);
     }
-    if let Some(n) = limits.processes {
-        info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        info.BasicLimitInformation.ActiveProcessLimit = n;
+    // cpuset.cpus: processors of the first group are the job's affinity;
+    // any other group needs the per-group form (`JobObjectGroupInformationEx`).
+    let groups: Vec<GroupAffinity> = limits
+        .cpus
+        .iter()
+        .flatten()
+        .map(|&(group, mask)| GroupAffinity { mask: usize::try_from(mask).unwrap_or(usize::MAX), group, reserved: [0; 3] })
+        .collect();
+    if let [only] = groups.as_slice() {
+        if only.group == 0 {
+            basic.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY;
+            basic.Affinity = only.mask;
+        }
     }
     // SAFETY: plain data.
     let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
     if let Some(rate) = limits.cpu_rate {
         cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
         cpu.Anonymous.CpuRate = rate;
+    } else if let Some(weight) = limits.cpu_weight {
+        cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
+        cpu.Anonymous.Weight = weight;
     }
     let set = |class, ptr: *const std::ffi::c_void, size: usize, what| {
         // SAFETY: a structure of the size passed, for this class.
@@ -1101,11 +1131,20 @@ fn job(limits: Limits) -> Result<OwnedHandle, HostError> {
         std::mem::size_of_val(&ui),
         "the job's UI restrictions",
     )?;
-    // The CPU rate hard cap, before Firecracker runs: a cgroup's limit holds
-    // from the exec on. A booting guest no longer needs to run uncapped: it
-    // does not calibrate its local APIC timer, which WHP's TSC-deadline mode
-    // (crates/compat/kvm-ioctls, `tscdeadline`) spares it as KVM's does.
-    if limits.cpu_rate.is_some() {
+    if groups.len() > 1 || groups.first().is_some_and(|g| g.group != 0) {
+        set(
+            JobObjectGroupInformationEx,
+            groups.as_ptr().cast(),
+            std::mem::size_of_val(groups.as_slice()),
+            "the job's processors",
+        )?;
+    }
+    // The CPU rate hard cap or weight, before Firecracker runs: a cgroup's
+    // limit holds from the exec on. A booting guest no longer needs to run
+    // uncapped: it does not calibrate its local APIC timer, which WHP's
+    // TSC-deadline mode (crates/compat/kvm-ioctls, `tscdeadline`) spares it
+    // as KVM's does.
+    if limits.cpu_rate.is_some() || limits.cpu_weight.is_some() {
         set(
             JobObjectCpuRateControlInformation,
             (&raw const cpu).cast(),
@@ -1235,7 +1274,7 @@ fn exec(
     env.push(0);
 
     let tokens = tokens()?;
-    let job = job(*LIMITS.lock().unwrap())?;
+    let job = job(&LIMITS.lock().unwrap())?;
 
     // The standard handles, inheritable, and only them; those that are the
     // jailer's console are pipes it relays (`console`).
@@ -1476,7 +1515,8 @@ mod tests {
         // The lockdown and initial tokens can be made from a normal user's
         // token, and a job with every limit.
         tokens().unwrap();
-        job(Limits { memory_bytes: Some(256 << 20), cpu_rate: Some(5000), processes: Some(1) }).unwrap();
+        job(&Limits { memory_bytes: Some(256 << 20), cpu_rate: Some(5000), ..Limits::default() }).unwrap();
+        job(&Limits { cpu_weight: Some(3), cpus: Some(vec![(0, 1)]), ..Limits::default() }).unwrap();
     }
 
     /// The job's CPU rate, read back.
@@ -1502,15 +1542,47 @@ mod tests {
     /// cgroup's limit holds from the exec: no grace (docs/PORTING.md, row 9).
     #[test]
     fn test_cpu_cap_holds_from_the_start() {
-        let j = job(Limits { cpu_rate: Some(2500), ..Limits::default() }).unwrap();
+        let j = job(&Limits { cpu_rate: Some(2500), ..Limits::default() }).unwrap();
         let cpu = cpu_rate_of(&j);
         let flags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
         assert_eq!(cpu.ControlFlags & flags, flags);
         // SAFETY: the CpuRate arm, which the flags select.
         assert_eq!(unsafe { cpu.Anonymous.CpuRate }, 2500);
         // No limit asked for, none set.
-        let j = job(Limits::default()).unwrap();
+        let j = job(&Limits::default()).unwrap();
         assert_eq!(cpu_rate_of(&j).ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, 0);
+    }
+
+    /// cpu.weight and cpuset.cpus are the job's weight and affinity, read
+    /// back (docs/PORTING.md, row 8).
+    #[test]
+    fn test_job_weight_and_affinity() {
+        use windows_sys::Win32::System::JobObjects::{JOBOBJECT_BASIC_LIMIT_INFORMATION, JobObjectBasicLimitInformation, QueryInformationJobObject};
+        let j = job(&Limits { cpu_weight: Some(2), cpus: Some(vec![(0, 0b1)]), ..Limits::default() }).unwrap();
+        let cpu = cpu_rate_of(&j);
+        let flags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
+        assert_eq!(cpu.ControlFlags & flags, flags);
+        // SAFETY: the Weight arm, which the flags select.
+        assert_eq!(unsafe { cpu.Anonymous.Weight }, 2);
+        // SAFETY: plain data.
+        let mut basic: JOBOBJECT_BASIC_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a structure of the size passed, for this class.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                j.as_raw_handle(),
+                JobObjectBasicLimitInformation,
+                (&raw mut basic).cast(),
+                u32::try_from(std::mem::size_of_val(&basic)).unwrap(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+        assert_ne!(basic.LimitFlags & JOB_OBJECT_LIMIT_AFFINITY, 0);
+        assert_eq!(basic.Affinity, 1);
+        // A processor the host does not have is refused by Windows too.
+        if std::thread::available_parallelism().unwrap().get() < 64 {
+            assert!(job(&Limits { cpus: Some(vec![(0, 1 << 63)]), ..Limits::default() }).is_err());
+        }
     }
 
     #[test]

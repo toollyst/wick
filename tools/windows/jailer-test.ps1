@@ -6,9 +6,9 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,pidns,isolation,boot,limits,cpu] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,daemonize,handles,pidns,isolation,boot,limits,cpu] [-Bin <dir>]
 #
-# `refuse`, `low`, `daemonize`, `handles` and `pidns` need no WHP; the others
+# `refuse`, `cpuset`, `weight`, `low`, `daemonize`, `handles` and `pidns` need no WHP; the others
 # boot a guest. `pidns` needs a console (it types into it and reads it).
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build).
@@ -18,7 +18,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'pidns', 'isolation', 'boot', 'limits', 'cpu'),
+    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'daemonize', 'handles', 'pidns', 'isolation', 'boot', 'limits', 'cpu'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -135,14 +135,114 @@ function Stage-Refuse {
     $cases = [ordered]@{
         '--netns'                    = @('--netns', 'C:\x')
         'fsize'                      = @('--resource-limit', 'fsize=1024')
-        'cpuset'                     = @('--cgroup', 'cpuset.cpus=0', '--cgroup-version', '2')
+        'memory.high'                = @('--cgroup', 'memory.high=1048576', '--cgroup-version', '2')
     }
-    foreach ($k in $cases.Keys) {
-        $r = Invoke-Jailer ($common + $cases[$k])
+    # docs/PORTING.md row 8: each controller Windows has no counterpart for
+    # is refused with the reason (the message says "refused on Windows: why").
+    $v2 = [ordered]@{
+        'pids'          = 'pids.max=100'
+        'io'            = 'io.weight=default 200'
+        'hugetlb'       = 'hugetlb.2MB.max=1073741824'
+        'rdma'          = 'rdma.max=mlx4_0'  # upstream's parser takes one '=' only
+        'misc'          = 'misc.max=sev 1'
+        'cgroup.freeze' = 'cgroup.freeze=1'
+        'cpuset excl'   = 'cpuset.cpus.exclusive=0'
+    }
+    $v1 = [ordered]@{
+        'blkio'         = 'blkio.throttle.read_bps_device=8:0 1048576'
+        'freezer'       = 'freezer.state=FROZEN'
+        'devices'       = 'devices.deny=a'
+        'net_cls'       = 'net_cls.classid=1'
+        'net_prio'      = 'net_prio.ifpriomap=eth0 1'
+    }
+    $reasoned = [ordered]@{}
+    foreach ($k in $v2.Keys) { $reasoned["v2 $k"] = @('--cgroup', $v2[$k], '--cgroup-version', '2') }
+    foreach ($k in $v1.Keys) { $reasoned["v1 $k"] = @('--cgroup', $v1[$k], '--cgroup-version', '1') }
+    $reasoned['cpu.max with cpu.weight'] = @('--cgroup', 'cpu.max=50000 100000', '--cgroup', 'cpu.weight=50', '--cgroup-version', '2')
+    $nodes = 0; [void][WickJailerTest.Numa]::GetNumaHighestNodeNumber([ref]$nodes)
+    if ($nodes -gt 0) { $reasoned['cpuset.mems short of every node'] = @('--cgroup', 'cpuset.mems=0', '--cgroup-version', '2') }
+    foreach ($k in @($cases.Keys) + @($reasoned.Keys)) {
+        $argv = if ($cases.Contains($k)) { $cases[$k] } else { $reasoned[$k] }
+        $r = Invoke-Jailer ($common + $argv)
         Check ($r[0] -ne 0) "$k accepted (exit $($r[0])): $($r[1])"
         Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue)) "$k started Firecracker"
+        if ($reasoned.Contains($k)) { Check ($r[1] -match 'is refused on Windows: \S') "${k}: refused without its reason: $($r[1])" }
     }
-    "--netns, fsize= and an unsupported cgroup are refused before Firecracker starts"
+    "--netns, fsize=, an unsupported cgroup file and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
+}
+
+Add-Type -Namespace WickJailerTest -Name Numa -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool GetNumaHighestNodeNumber(ref uint n);'
+
+# Runs jail-probe through the jailer with `cgroups` (each a --cgroup value)
+# and returns its answer to `check`.
+function Invoke-JailedProbe([string]$base, [string]$id, [string]$version, [string[]]$cgroups, [string]$check) {
+    $argv = @('--id', $id, '--exec-file', (Get-Probe), '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--cgroup-version', $version)
+    foreach ($c in $cgroups) { $argv += @('--cgroup', $c) }
+    $r = Invoke-Jailer ($argv + @('--', $check)) 30000
+    Check ($r[0] -eq 0) "--cgroup $($cgroups -join ' --cgroup '): the jailer exited $($r[0]): $($r[1])"
+    $line = ($r[1] -split "`r?`n" | Where-Object { $_.StartsWith("$check ") } | Select-Object -First 1)
+    Check ($null -ne $line) "the jailed probe did not answer ${check}: $($r[1])"
+    $line.Substring($check.Length + 1)
+}
+
+# docs/PORTING.md row 8: cpuset.cpus is the job's processor affinity, which
+# the jailed process sees as its own; cpuset.mems naming every memory node of
+# the host binds nothing and is accepted. Needs no guest.
+function Stage-Cpuset {
+    $base = New-Base 'cpuset'
+    $cpus = [Environment]::ProcessorCount
+    Check ($cpus -ge 2) "needs 2 processors, the host has $cpus"
+    $last = $cpus - 1
+    $nodes = 0; [void][WickJailerTest.Numa]::GetNumaHighestNodeNumber([ref]$nodes)
+    $results = @()
+    foreach ($case in @(
+            @('2', "cpuset.cpus=1", 0x2),
+            @('1', "cpuset.cpus=0-1", 0x3),
+            @('2', "cpuset.cpus=0,$last", (1 + [math]::Pow(2, $last))))) {
+        $job = Invoke-JailedProbe $base "c$($results.Count)" $case[0] @($case[1], "cpuset.mems=0-$nodes") 'job:0'
+        $want = '0x{0:x}' -f [long]$case[2]
+        Check ($job -match "affinity=$want ") "v$($case[0]) $($case[1]): the job's affinity: $job"
+        $own = Invoke-JailedProbe $base "a$($results.Count)" $case[0] @($case[1]) 'affinity:0'
+        Check ($own -match "^allowed $want of ") "v$($case[0]) $($case[1]): the jailed process's affinity: $own"
+        $results += "$($case[1]) -> $want"
+    }
+    "the job's and the jailed process's affinity: $($results -join ', '); cpuset.mems=0-$nodes accepted"
+}
+
+# docs/PORTING.md row 8: cpu.weight is the job's CPU weight. Two jailed
+# processes spin on one processor (cpuset.cpus=0), one at cpu.weight=50 and
+# one at the default 100: Linux gives the first half the second's CPU time;
+# Windows weight 2 (the nearest, measured at 0.49 of the default) must give
+# it between 0.3 and 0.7 of it. Needs no guest.
+function Stage-Weight([int]$Seconds = 6) {
+    $base = New-Base 'weight'
+    $probe = Get-Probe
+    $runs = @()
+    foreach ($w in 50, 100) {
+        $out = Join-Path $base "w$w.txt"
+        $line = "--id w$w --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" --cgroup-version 2 --cgroup cpuset.cpus=0 --cgroup cpu.weight=$w -- job:0 spin:$Seconds"
+        $p = Start-Process $Jailer -ArgumentList $line -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+        $null = $p.Handle
+        $runs += @{ W = $w; P = $p; Out = $out }
+    }
+    try {
+        $cpu = @{}
+        foreach ($r in $runs) {
+            Check ($r.P.WaitForExit(($Seconds + 30) * 1000)) "the jailer at cpu.weight=$($r.W) did not exit"
+            $text = (Get-Content $r.Out, "$($r.Out).err" -Raw -ErrorAction SilentlyContinue) -join ''
+            Check ($r.P.ExitCode -eq 0) "cpu.weight=$($r.W): the jailer exited $($r.P.ExitCode): $text"
+            $want = if ($r.W -eq 50) { '0x3:2' } else { '0x3:5' }
+            Check ($text -match "job:0 allowed affinity=0x1 cpu=$want") "cpu.weight=$($r.W): the job's limits: $text"
+            Check ($text -match "spin:$Seconds allowed ([0-9.]+)") "cpu.weight=$($r.W): no spin result: $text"
+            $cpu[$r.W] = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+        }
+        $ratio = $cpu[50] / [math]::Max($cpu[100], 0.001)
+        Check ($ratio -ge 0.3 -and $ratio -le 0.7) ("cpu.weight 50 against 100 on one processor: {0:N2} s against {1:N2} s of CPU (ratio {2:N2}; Linux gives 0.5)" -f $cpu[50], $cpu[100], $ratio)
+        "cpu.weight=50 and 100 on one processor: Windows weights 2 and 5, {0:N2} s against {1:N2} s of CPU in {2} s (ratio {3:N2}; Linux gives 0.5)" -f $cpu[50], $cpu[100], $Seconds, $ratio
+    } finally {
+        foreach ($r in $runs) { if (-not $r.P.HasExited) { $r.P.Kill() } }
+        Get-Process jail-probe -ErrorAction SilentlyContinue | Stop-Process -Force
+    }
 }
 
 # Row 15 of docs/PORTING.md: --daemonize, upstream's observable behaviour.
