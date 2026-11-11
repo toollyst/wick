@@ -181,7 +181,7 @@ def stage_refuse(ctx):
         (["--cgroup-version", "2", "--cgroup", "cpu.weight=100"], "no proportional share"),
         (["--cgroup", "cpu.shares=512"], "no proportional share"),
         (["--cgroup-version", "2", "--cgroup", "pids.max=10"], "no limit on a process's threads"),
-        (["--cgroup-version", "2", "--cgroup", "io.max=1:0 rbps=1048576"], "no per-process I/O"),
+        (["--cgroup-version", "2", "--cgroup", "io.weight=default 200"], "no per-process I/O"),
         (["--cgroup-version", "2", "--cgroup", "memory.high=268435456"], "hard limit only"),
         (["--cgroup-version", "2", "--cgroup", "hugetlb.2MB.max=0"], "no hugetlb page pool"),
         # CPU limits macOS cannot enforce as asked: never loosened.
