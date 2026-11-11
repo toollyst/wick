@@ -112,7 +112,13 @@ upstream Firecracker and its jailer.
   system calls only, no files, no shared memory, no executable mappings), and Firecracker's API thread handles the
   requests it passes on with upstream's code; either process's end ends the other (`test_api_profile_*`,
   `boot-test api-process`). In a jail the two share the jail's memory and CPU limits, so together they stay within
-  them (`test_limits_are_shared_with_the_api_process`; the jailer-test stage needs root). Windows: planned.
+  them (`test_limits_are_shared_with_the_api_process`; the jailer-test stage needs root). On Windows the same is
+  in place without a fork: the API process is a second process from Firecracker's binary, made by Firecracker
+  before its sandbox is set, or by the jailer in a jail on the jail's token and in its Job Object, with its end of
+  the link and a handle to Firecracker inherited; it has the whole mitigation profile from its start, before it
+  reads a byte from the socket (`test_api_profile_is_the_whole_profile_at_once`,
+  `test_the_api_process_serves_under_the_api_profile`, `jailer-test.ps1 api`; `boot-test api-process` waits for a
+  WHP machine).
 - **wick's host-side code is young.** The compatibility crates and the macOS and Windows backends (the
   Hypervisor.framework and WHP run loops, the userfaultfd kernel side, the network backends) have not had the years
   of review and fuzzing upstream's code has had, and have not had a third-party audit. Fuzzing has started: the

@@ -20,7 +20,7 @@
 //!                               udp:<ip>:<port> pull:<pid>:<handle>
 //!                               listen:<socket path> wsadup:<socket path>
 //!                               listenpull:<socket path> sockpull:<socket path>
-//!                               token:0
+//!                               token:0 mitigations:<pid>
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
@@ -115,6 +115,7 @@ extern "system" {
     fn DuplicateHandle(src: HANDLE, h: HANDLE, dst: HANDLE, out: *mut HANDLE, access: u32, inherit: i32, opts: u32) -> i32;
     fn CloseHandle(h: HANDLE) -> i32;
     fn GetCurrentProcess() -> HANDLE;
+    fn GetProcessMitigationPolicy(process: HANDLE, policy: i32, buf: *mut c_void, len: usize) -> i32;
     fn GetLastError() -> u32;
     fn GetStdHandle(which: u32) -> HANDLE;
     fn SetHandleInformation(h: HANDLE, mask: u32, flags: u32) -> i32;
@@ -860,6 +861,42 @@ fn check(c: &str) -> String {
                     if member != 0 { "yes" } else { "no" }
                 )
             }
+        }
+        // The process mitigation policies of a process (vmm::ext::sandbox's
+        // profile), as `name=flags`: the first word of each policy, which
+        // holds its flags.
+        "mitigations" => {
+            let Ok(pid) = arg.parse() else {
+                return "bad pid".into();
+            };
+            // SAFETY: plain call; PROCESS_QUERY_INFORMATION.
+            let h = unsafe { OpenProcess(0x400, 0, pid) };
+            if h.is_null() {
+                return format!("denied {}", std::io::Error::last_os_error());
+            }
+            let mut out = String::from("allowed");
+            for (name, policy) in [
+                ("ExtensionPoint", 6),
+                ("ImageLoad", 10),
+                ("Signature", 8),
+                ("StrictHandle", 3),
+                ("Win32k", 4),
+                ("DynamicCode", 2),
+                ("ChildProcess", 13),
+            ] {
+                let mut flags = 0u32;
+                // SAFETY: a 4-byte buffer of the size passed.
+                if unsafe { GetProcessMitigationPolicy(h, policy, (&raw mut flags).cast(), 4) } == 0 {
+                    let e = std::io::Error::last_os_error();
+                    // SAFETY: a handle we opened.
+                    unsafe { CloseHandle(h) };
+                    return format!("denied {name}: {e}");
+                }
+                out.push_str(&format!(" {name}={flags:x}"));
+            }
+            // SAFETY: a handle we opened.
+            unsafe { CloseHandle(h) };
+            out
         }
         // Waits `arg` seconds: a process for the others to act on.
         "wait" => {

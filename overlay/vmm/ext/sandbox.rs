@@ -1614,6 +1614,44 @@ mod windows {
         STATE.lock().unwrap().policy = policy;
     }
 
+    /// The selected sandbox.
+    pub fn selected() -> Policy {
+        STATE.lock().unwrap().policy
+    }
+
+    /// The API process's sandbox (`ext::api_process`), the counterpart of
+    /// upstream's `api` filter: the whole profile at once, the [`Phase::Setup`]
+    /// and [`Phase::Run`] mitigations and the trap on executable mappings,
+    /// before the process reads a byte from the API socket. The `api` filter
+    /// allows less than the VMM thread's; a mitigation profile has nothing
+    /// narrower than every mitigation, so the API process gets them all, from
+    /// the start. Applied once, before [`apply`]; nothing with `--no-seccomp`.
+    pub fn apply_api() -> Result<(), SandboxError> {
+        let mut state = STATE.lock().unwrap();
+        if state.policy == Policy::None {
+            return Ok(());
+        }
+        if state.installed {
+            return Err(SandboxError::Install(
+                "the API process's sandbox is applied before any other".into(),
+            ));
+        }
+        // SAFETY: registers a handler that only reads the exception record.
+        if unsafe { AddVectoredExceptionHandler(1, on_exception) }.is_null() {
+            return Err(SandboxError::Install(format!(
+                "the exception handler: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        set_phase(Phase::Setup).map_err(SandboxError::Install)?;
+        set_phase(Phase::Run).map_err(SandboxError::Install)?;
+        INSTALLED.store(true, Ordering::Release);
+        libc::wick_mm::deny_exec(exec_denied);
+        state.installed = true;
+        state.narrowed = true;
+        Ok(())
+    }
+
     /// The flags of `policy` in force for this process.
     pub fn read_back(policy: PROCESS_MITIGATION_POLICY) -> Result<u32, SandboxError> {
         let mut flags = 0u32;
@@ -1815,6 +1853,61 @@ mod windows {
         #[test]
         fn test_child_process_policy() {
             check_in_force("ProcessChildProcessPolicy");
+        }
+
+        // The API process's profile: every mitigation of both phases in force
+        // at once, and an executable mapping ends the process as a seccomp
+        // trap does (the `api` filter has no mmap/mprotect with PROT_EXEC).
+        #[test]
+        fn test_api_profile_is_the_whole_profile_at_once() {
+            let out = child("api_read_back_child", &[]);
+            assert!(out.status.success(), "{}", text(&out));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for m in MITIGATIONS {
+                let line = stdout
+                    .lines()
+                    .find(|l| l.starts_with(&format!("api {} ", m.name)))
+                    .unwrap_or_else(|| panic!("{} not read back: {stdout}", m.name));
+                let back = u32::from_str_radix(line.rsplit(' ').next().unwrap(), 16).unwrap();
+                assert_eq!(back & m.flags, m.flags, "{}", m.name);
+            }
+            assert!(stdout.contains("API-TWICE-REFUSED"), "{stdout}");
+        }
+
+        #[test]
+        #[ignore = "run by test_api_profile_is_the_whole_profile_at_once in a separate process"]
+        fn api_read_back_child() {
+            for m in MITIGATIONS {
+                assert_eq!(read_back(m.policy).unwrap() & m.flags, 0, "{}", m.name);
+            }
+            select(Policy::Default);
+            apply_api().unwrap();
+            for m in MITIGATIONS {
+                println!("api {} {:x}", m.name, read_back(m.policy).unwrap());
+            }
+            // Once; and the VMM's phases do nothing more after it.
+            if apply_api().is_err() {
+                println!("API-TWICE-REFUSED");
+            }
+            apply().unwrap();
+            narrow().unwrap();
+        }
+
+        #[test]
+        fn test_api_profile_denies_executable_mappings() {
+            let out = child("api_exec_child", &[("WICK_TEST_HANDLERS", "1")]);
+            assert_eq!(out.status.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", text(&out));
+            assert!(!text(&out).contains("CHILD-SURVIVED"), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_api_profile_denies_executable_mappings in a separate process"]
+        fn api_exec_child() {
+            crate::signal_handler::register_signal_handlers().unwrap();
+            select(Policy::Default);
+            apply_api().unwrap();
+            let p = anonymous(RWX);
+            println!("CHILD-SURVIVED {p:?}");
         }
 
         #[test]

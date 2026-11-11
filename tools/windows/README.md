@@ -14,7 +14,9 @@
   other's, is denied TCP and UDP, and an unelevated jailer is refused the
   flag; needs an elevated PowerShell), `handoff` (a handle and a socket
   held by a jailed process are pulled out by the operator and by a
-  medium-integrity process of the user), `boot` (a 2 vCPU guest
+  medium-integrity process of the user), `api` (the jail runs Firecracker
+  and its API server's process, the latter under the whole mitigation
+  profile; each one's end ends the other), `boot` (a 2 vCPU guest
   in the jail), `limits` (`memory.max`), `cpu` (`cpu.max`: three boots under it), and a check
   that every jail's drive letter was removed. It needs the boot test's
   guest files (`-Assets`, default `C:\wbt`) and `rustc` for the probe:
@@ -98,6 +100,7 @@ warnings, and the reset must end Firecracker with exit status 0.
 | `snapshot` | a full snapshot of a 2 vCPU guest with a data drive and vsock, restored in a new Firecracker process: shell state, the clock on both vCPUs, both drives, vsock |
 | `diff` | a diff snapshot with dirty page tracking (its file keeps its holes), merged into the full one by `snapshot-editor edit-memory rebase` and restored |
 | `uffd` | the `snapshot` stage's snapshot restored with the Uffd memory backend, its pages served by upstream's `uffd_on_demand_handler` in another process |
+| `api-process` | the API server's HTTP side runs in a process of its own with the whole mitigation profile (this shell under none), serves the API; killing it ends Firecracker, and Firecracker's end ends it |
 | `pci` | the `snapshot` stage over virtio-pci with MSI-X (`--enable-pci`) |
 | `vhost-user` | a vhost-user-blk drive served by `vhost-user-blk.exe` in another process: the guest reads its content, a guest write reaches the image |
 | `hugepages` | guest memory on 2 MiB large pages (`huge_pages: "2M"`): boots and keeps 160 MiB written to it. Needs "Lock pages in memory" for the account (`secpol.msc`, Local Policies, User Rights Assignment; sign out and in), as hugetlbfs on Linux needs huge pages reserved |

@@ -79,7 +79,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0,
     LocalFree, SetHandleInformation,
 };
@@ -142,6 +142,16 @@ const JAIL_ENV: &str = "WICK_JAIL";
 /// Environment variable through which Firecracker takes the jail's network
 /// over (`vmm::ext::jail::NETNS_ENV`): the directory of its endpoints.
 const NETNS_ENV: &str = "WICK_NETNS";
+/// Firecracker's end of the link to the API process
+/// (`vmm::ext::api_process::WAITING_ENV`).
+const API_WAITING_ENV: &str = "WICK_API_WAITING";
+/// The API process's end of the link (`vmm::ext::api_process::LINK_ENV`).
+const API_LINK_ENV: &str = "WICK_API_LINK";
+/// The API process's handle to Firecracker
+/// (`vmm::ext::api_process::FIRECRACKER_ENV`).
+const API_FIRECRACKER_ENV: &str = "WICK_API_FIRECRACKER";
+/// `SYNCHRONIZE` (winnt.h).
+const SYNCHRONIZE: u32 = 0x0010_0000;
 /// Bytes every binary that takes the jail over carries
 /// (`vmm::ext::jail::HANDOVER_MARK`): without it, a program would keep the
 /// initial impersonation token (the user's SID) on its main thread.
@@ -1315,8 +1325,13 @@ fn check_handover(exe: &Path) -> Result<(), HostError> {
 /// initial token on its main thread, in a Job Object with the cgroup limits,
 /// with the standard handles only, `WICK_JAIL`, the system root and the
 /// jail's temporary directory as its environment, and the jail's root as its
-/// current directory. Writes its pid to the pid file, waits for it, removes
-/// the jail's drive and exits with its status. Returns only on failure.
+/// current directory. Unless Firecracker runs with `--no-api`, starts the
+/// API server's process the same way (the same binary, token, job and
+/// standard handles: `vmm::ext::api_process`), with its end of a socket
+/// pair and a `SYNCHRONIZE` handle to Firecracker inherited, and
+/// Firecracker with the other end. Writes Firecracker's pid to the pid
+/// file, waits for it, removes the jail's drive and exits with its status.
+/// Returns only on failure.
 pub fn exec_command(
     exec_file_path: &Path,
     chroot_dir: &Path,
@@ -1330,72 +1345,36 @@ pub fn exec_command(
     }
 }
 
-fn exec(
-    exec_file_path: &Path,
-    chroot_dir: &Path,
-    uid: u32,
-    gid: u32,
-    args: &[String],
-) -> Result<std::convert::Infallible, HostError> {
-    let jail = JAIL.lock().unwrap();
-    let jail = jail
-        .as_ref()
-        .ok_or_else(|| HostError::Spawn("the jail", io::Error::other("the jailer did not enter one")))?;
-    let name = exec_file_path.file_name().unwrap_or_default();
-    let exe = jail.root.join(name);
-    check_handover(&exe)?;
+/// A process of the jail, started suspended ([`spawn_jailed`]).
+struct Spawned {
+    process: OwnedHandle,
+    thread: OwnedHandle,
+    pid: u32,
+}
 
-    // --netns: the network directory opened to the jail, named to
-    // Firecracker, and no IP networking for the jail's binary, from before
-    // it starts until the jailer ends (the filter's session is the jailer's).
-    let netns = NETNS.lock().unwrap().take();
-    let mut vars = Vec::new();
-    let _net_filter = match netns {
-        Some((dir, mut filter)) => {
-            grant_to_jail(&dir)
-                .map_err(|e| HostError::Netns(dir.clone(), format!("cannot open the network to the jail: {e}")))?;
-            vars.push(format!("{NETNS_ENV}={}", dir.display()));
-            filter.block(&exe).map_err(|e| HostError::Netns(dir.clone(), e.to_string()))?;
-            Some(filter)
-        }
-        None => None,
-    };
-
-    let drive_root = format!("{}\\", jail.drive);
-    let mut argv = vec![format!("{drive_root}{}", name.to_string_lossy())];
-    argv.extend(cpu_start_of_new_process(args));
-    let mut cmd: Vec<u16> = wide(command_line(&argv));
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let tmp = format!("{drive_root}{JAIL_TMP}");
+/// Starts `exe` suspended as a process of the jail: on the lockdown token,
+/// in `job`, with the initial token on its main thread, `vars` as its whole
+/// environment, `std_handles` as its standard handles and `inherit` (which
+/// holds them) as the only handles it inherits, and `cwd` as its current
+/// directory. A step that fails after the creation ends the process.
+#[allow(clippy::too_many_arguments)]
+fn spawn_jailed(
+    exe: &Path,
+    cmd: &str,
+    vars: &[String],
+    std_handles: [HANDLE; 3],
+    inherit: &[HANDLE],
+    cwd: &str,
+    tokens: &Tokens,
+    job: &OwnedHandle,
+) -> Result<Spawned, HostError> {
+    let mut cmd: Vec<u16> = wide(cmd);
     let mut env: Vec<u16> = Vec::new();
-    vars.extend([
-        format!("{JAIL_ENV}={uid}:{gid}:{}", chroot_dir.display()),
-        format!("SystemRoot={system_root}"),
-        format!("TEMP={tmp}"),
-        format!("TMP={tmp}"),
-    ]);
     for var in vars {
         env.extend(var.encode_utf16());
         env.push(0);
     }
     env.push(0);
-
-    let tokens = tokens()?;
-    let job = job(*LIMITS.lock().unwrap())?;
-
-    // The standard handles, inheritable, and only them; those that are the
-    // jailer's console are pipes it relays (`console`).
-    let mut terminal = console::Terminal::new().map_err(|e| HostError::Spawn("the terminal relay", e))?;
-    let std_handles = terminal.handles();
-    let mut handles: Vec<HANDLE> = Vec::new();
-    for h in std_handles {
-        if !h.is_null() && h != INVALID_HANDLE_VALUE && !handles.contains(&h) {
-            // SAFETY: one of our standard handles.
-            if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } != 0 {
-                handles.push(h);
-            }
-        }
-    }
     let mut size = 0usize;
     // SAFETY: a size query.
     unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
@@ -1405,15 +1384,15 @@ fn exec(
     if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
         return Err(HostError::Spawn("InitializeProcThreadAttributeList", last_error()));
     }
-    if !handles.is_empty() {
+    if !inherit.is_empty() {
         // SAFETY: the handle array outlives the process creation.
         if unsafe {
             UpdateProcThreadAttribute(
                 list,
                 0,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                handles.as_ptr().cast(),
-                std::mem::size_of_val(handles.as_slice()),
+                inherit.as_ptr().cast(),
+                std::mem::size_of_val(inherit),
                 std::ptr::null_mut(),
                 std::ptr::null(),
             )
@@ -1426,7 +1405,7 @@ fn exec(
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     si.StartupInfo.cb = u32::try_from(std::mem::size_of::<STARTUPINFOEXW>()).unwrap();
     si.lpAttributeList = list;
-    if !handles.is_empty() {
+    if !inherit.is_empty() {
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         si.StartupInfo.hStdInput = std_handles[0];
         si.StartupInfo.hStdOutput = std_handles[1];
@@ -1447,14 +1426,14 @@ fn exec(
     let created = unsafe {
         CreateProcessAsUserW(
             tokens.primary.as_raw_handle(),
-            wide(&exe).as_ptr(),
+            wide(exe).as_ptr(),
             cmd.as_mut_ptr(),
             no_sa,
             no_sa,
-            i32::from(!handles.is_empty()),
+            i32::from(!inherit.is_empty()),
             create_flags,
             env.as_ptr().cast(),
-            wide(&drive_root).as_ptr(),
+            wide(cwd).as_ptr(),
             &si.StartupInfo,
             &mut pi,
         )
@@ -1464,7 +1443,6 @@ fn exec(
     if created == 0 {
         return Err(HostError::Spawn("CreateProcessAsUser", last_error()));
     }
-    terminal.started();
     // SAFETY: handles CreateProcessAsUser gave us.
     let (process, thread) = unsafe {
         (OwnedHandle::from_raw_handle(pi.hProcess), OwnedHandle::from_raw_handle(pi.hThread))
@@ -1483,6 +1461,156 @@ fn exec(
     if unsafe { SetThreadToken(&mut thread_h, tokens.initial.as_raw_handle()) } == 0 {
         return Err(kill("SetThreadToken", last_error()));
     }
+    Ok(Spawned { process, thread, pid: pi.dwProcessId })
+}
+
+/// The handle of a socket, made inheritable.
+fn inheritable_socket(s: &std::os::unix::net::UnixStream) -> Result<HANDLE, HostError> {
+    use std::os::unix::io::AsRawFd;
+    let h = std::os::fd::socket(s.as_raw_fd()) as HANDLE;
+    // SAFETY: a socket handle we own.
+    if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+        return Err(HostError::Spawn("the API link", last_error()));
+    }
+    Ok(h)
+}
+
+fn exec(
+    exec_file_path: &Path,
+    chroot_dir: &Path,
+    uid: u32,
+    gid: u32,
+    args: &[String],
+) -> Result<std::convert::Infallible, HostError> {
+    let jail = JAIL.lock().unwrap();
+    let jail = jail
+        .as_ref()
+        .ok_or_else(|| HostError::Spawn("the jail", io::Error::other("the jailer did not enter one")))?;
+    let name = exec_file_path.file_name().unwrap_or_default();
+    let exe = jail.root.join(name);
+    check_handover(&exe)?;
+    // The API server is a process of its own (`vmm::ext::api_process`),
+    // which the jailer makes alongside Firecracker.
+    let api = !args.iter().any(|a| a == "--no-api");
+    let limits = *LIMITS.lock().unwrap();
+    if api && limits.processes == Some(1) {
+        return Err(HostError::Spawn(
+            "the API server's process",
+            io::Error::other(
+                "the jail allows one process (pids.max) and the API server is a process of its \
+                 own: allow 2, or run with --no-api",
+            ),
+        ));
+    }
+
+    // --netns: the network directory opened to the jail, named to
+    // Firecracker, and no IP networking for the jail's binary, from before
+    // it starts until the jailer ends (the filter's session is the jailer's).
+    let netns = NETNS.lock().unwrap().take();
+    let mut vars = Vec::new();
+    let _net_filter = match netns {
+        Some((dir, mut filter)) => {
+            grant_to_jail(&dir)
+                .map_err(|e| HostError::Netns(dir.clone(), format!("cannot open the network to the jail: {e}")))?;
+            vars.push(format!("{NETNS_ENV}={}", dir.display()));
+            filter.block(&exe).map_err(|e| HostError::Netns(dir.clone(), e.to_string()))?;
+            Some(filter)
+        }
+        None => None,
+    };
+
+    let drive_root = format!("{}\\", jail.drive);
+    let mut argv = vec![format!("{drive_root}{}", name.to_string_lossy())];
+    argv.extend(cpu_start_of_new_process(args));
+    let cmd = command_line(&argv);
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let tmp = format!("{drive_root}{JAIL_TMP}");
+    vars.extend([
+        format!("{JAIL_ENV}={uid}:{gid}:{}", chroot_dir.display()),
+        format!("SystemRoot={system_root}"),
+        format!("TEMP={tmp}"),
+        format!("TMP={tmp}"),
+    ]);
+
+    let tokens = tokens()?;
+    let job = job(limits)?;
+
+    // The standard handles, inheritable, and only them; those that are the
+    // jailer's console are pipes it relays (`console`).
+    let mut terminal = console::Terminal::new().map_err(|e| HostError::Spawn("the terminal relay", e))?;
+    let std_handles = terminal.handles();
+    let mut handles: Vec<HANDLE> = Vec::new();
+    for h in std_handles {
+        if !h.is_null() && h != INVALID_HANDLE_VALUE && !handles.contains(&h) {
+            // SAFETY: one of our standard handles.
+            if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } != 0 {
+                handles.push(h);
+            }
+        }
+    }
+    // The link between Firecracker and its API process: a socket pair, an
+    // end inherited by each.
+    let link = if api {
+        let (fc_end, api_end) = std::os::unix::net::UnixStream::pair()
+            .map_err(|e| HostError::Spawn("the API link", e))?;
+        Some((fc_end, api_end))
+    } else {
+        None
+    };
+    let mut fc_vars = vars.clone();
+    let mut fc_handles = handles.clone();
+    if let Some((fc_end, _)) = &link {
+        let h = inheritable_socket(fc_end)?;
+        fc_vars.push(format!("{API_WAITING_ENV}={}", h as usize));
+        fc_handles.push(h);
+    }
+    let fc = spawn_jailed(&exe, &cmd, &fc_vars, std_handles, &fc_handles, &drive_root, &tokens, &job)?;
+    let fc_process = fc.process.as_raw_handle();
+    let kill = move |what, err| {
+        // SAFETY: our child, whose handle `fc.process` holds to the end.
+        unsafe { TerminateProcess(fc_process, 1) };
+        HostError::Spawn(what, err)
+    };
+    // The API process: the same binary, token, job and standard handles,
+    // with its end of the link and a handle to wait for Firecracker on.
+    let api_process = match link {
+        Some((fc_end, api_end)) => {
+            let mut fc_h: HANDLE = std::ptr::null_mut();
+            // SAFETY: duplicates a handle we own, for waiting only, inheritable.
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    fc.process.as_raw_handle(),
+                    GetCurrentProcess(),
+                    &mut fc_h,
+                    SYNCHRONIZE,
+                    1,
+                    0,
+                )
+            } == 0
+            {
+                return Err(kill("a handle to Firecracker for the API process", last_error()));
+            }
+            // SAFETY: the handle just made.
+            let fc_h = unsafe { OwnedHandle::from_raw_handle(fc_h) };
+            let link_h = inheritable_socket(&api_end)
+                .map_err(|e| kill("the API link", io::Error::other(e.to_string())))?;
+            let mut api_vars = vars.clone();
+            api_vars.push(format!("{API_LINK_ENV}={}", link_h as usize));
+            api_vars.push(format!("{API_FIRECRACKER_ENV}={}", fc_h.as_raw_handle() as usize));
+            let mut api_handles = handles.clone();
+            api_handles.push(link_h);
+            api_handles.push(fc_h.as_raw_handle());
+            let spawned =
+                spawn_jailed(&exe, &cmd, &api_vars, std_handles, &api_handles, &drive_root, &tokens, &job)
+                    .map_err(|e| kill("the API server's process", io::Error::other(e.to_string())))?;
+            // Both have their own copies now.
+            drop((fc_end, api_end, fc_h));
+            Some(spawned)
+        }
+        None => None,
+    };
+    terminal.started();
     // Upstream's pid file holds the jailer's pid, which an exec keeps; here it
     // is Firecracker's.
     let pid_file = jail.root.join(format!("{}.pid", name.to_string_lossy()));
@@ -1490,15 +1618,19 @@ fn exec(
         .write(true)
         .truncate(true)
         .open(&pid_file)
-        .and_then(|mut f| write!(f, "{}", pi.dwProcessId))
+        .and_then(|mut f| write!(f, "{}", fc.pid))
     {
         return Err(kill("the pid file", e));
     }
-    // SAFETY: the suspended main thread.
-    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-        return Err(kill("ResumeThread", last_error()));
+    for p in std::iter::once(&fc).chain(api_process.as_ref()) {
+        // SAFETY: the suspended main thread.
+        if unsafe { ResumeThread(p.thread.as_raw_handle()) } == u32::MAX {
+            return Err(kill("ResumeThread", last_error()));
+        }
     }
-    drop(thread);
+    let process = fc.process;
+    drop(fc.thread);
+    drop(api_process);
     // --new-pid-ns: Firecracker runs and its pid is in the pid file; the
     // jailer that handed over to this keeper exits 0 (`new_pid_ns`).
     if let Some(event) = KEEPER_EVENT.lock().unwrap().take() {

@@ -6,10 +6,10 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,pidns,handoff,netns,isolation,boot,limits,cpu,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,pidns,handoff,netns,api,isolation,boot,limits,cpu,uffd,vhost-user] [-Bin <dir>]
 #
-# `refuse`, `low`, `daemonize`, `handles`, `pidns`, `handoff` and `netns` need
-# no WHP; the others boot a guest. `pidns` needs a console (it types into it
+# `refuse`, `low`, `daemonize`, `handles`, `pidns`, `handoff`, `netns` and
+# `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
 # and reads it); `netns` needs an elevated PowerShell (the jailer adds
 # Windows Filtering Platform filters).
 #
@@ -22,7 +22,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'isolation', 'boot', 'limits', 'cpu', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'api', 'isolation', 'boot', 'limits', 'cpu', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -274,9 +274,14 @@ function Start-ApiJail([string]$base, [string]$id, [string[]]$jailerArgs = @()) 
     $sock = Join-Path $root 'run\firecracker.socket'
     $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t -and -not $j.HasExited) { Start-Sleep -Milliseconds 100 }
     Check (Test-Path $sock) "the jailed API socket did not appear: $(Get-Content -Raw (Join-Path $base "$id-err.txt") -ErrorAction SilentlyContinue)"
-    $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" } | Select-Object -First 1
-    Check ($null -ne $fcp) "the jailed Firecracker $id is not running"
-    @{ Jailer = $j; Fc = $fcp; Root = $root; Sock = $sock }
+    # The jail runs two processes of the binary, Firecracker (the pid file)
+    # and its API server's process.
+    $pidFile = Join-Path $base "firecracker.exe\$id\root\firecracker.exe.pid"
+    $fcPid = [int](Get-Content $pidFile -Raw).Trim()
+    $fcp = Get-Process -Id $fcPid -ErrorAction SilentlyContinue
+    Check ($null -ne $fcp -and $fcp.Path -like "$root*") "the jailed Firecracker $id (pid $fcPid) is not running"
+    $api = Get-Process firecracker | Where-Object { $_.Path -like "$root*" -and $_.Id -ne $fcPid }
+    @{ Jailer = $j; Fc = $fcp; Api = $api; Root = $root; Sock = $sock }
 }
 
 # One API call to a socket; returns "<body> <status>". A body (an object) is
@@ -868,6 +873,67 @@ function Stage-Netns {
         $listener.Stop()
         Stop-Jailed
     }
+}
+
+# Row 4 of docs/PORTING.md: the API thread's own, narrower filter. The API
+# server's HTTP side is a process of its own (vmm::ext::api_process), which
+# the jailer makes alongside Firecracker from the same binary on the same
+# token, in the same job: it has the whole mitigation profile from the start
+# (Firecracker, still building, has the setup phase's only), answers the
+# API, and each one's end ends the other. Needs no guest.
+function Stage-Api {
+    $base = New-Base 'api'
+    $probe = Get-Probe
+    $all = [ordered]@{ ExtensionPoint = 1; ImageLoad = 7; Signature = 1; StrictHandle = 3; Win32k = 1; DynamicCode = 1; ChildProcess = 1 }
+    $run = @('ImageLoad', 'DynamicCode')
+    function Get-Mitigations([int]$id) {
+        $line = & $probe "mitigations:$id"
+        Check ($line -match '^mitigations:\d+ allowed') "reading pid $id's mitigations: $line"
+        $m = @{}
+        foreach ($kv in ($line -split ' ' | Where-Object { $_ -match '=' })) { $k, $v = $kv -split '='; $m[$k] = [Convert]::ToInt32($v, 16) }
+        $m
+    }
+    try {
+        $jail = Start-ApiJail $base 'api'
+        Check ($jail.Api.Count -eq 1) "processes of the jail's binary besides Firecracker: $($jail.Api.Count) (expected the API server's process)"
+        $apiPid = $jail.Api.Id
+        # The API answers, through the API process.
+        $info = Invoke-ApiOk $jail.Sock 'GET' '/'
+        Check ($info -match '"state":"Not started"') "instance information: $info"
+        $bad = Invoke-Api $jail.Sock 'PUT' '/nothing-here' ([ordered]@{ a = 1 })
+        Check ($bad -match ' 400$') "an unknown path: $bad"
+        # The profile: all of it in the API process; the setup phase's only in
+        # Firecracker, which has not built the microVM; none in this shell.
+        $apiM = Get-Mitigations $apiPid
+        $fcM = Get-Mitigations $jail.Fc.Id
+        $meM = Get-Mitigations $PID
+        $missing = @($all.Keys | Where-Object { ($apiM[$_] -band $all[$_]) -ne $all[$_] })
+        Check ($missing.Count -eq 0) "mitigations not in force in the API process: $($missing -join ', ') ($apiM)"
+        $fcSetup = @($all.Keys | Where-Object { $run -notcontains $_ -and ($fcM[$_] -band $all[$_]) -ne $all[$_] })
+        Check ($fcSetup.Count -eq 0) "setup-phase mitigations not in force in Firecracker: $($fcSetup -join ', ')"
+        $fcRun = @($run | Where-Object { ($fcM[$_] -band $all[$_]) -ne 0 })
+        Check ($fcRun.Count -eq 0) "run-phase mitigations already in force in Firecracker, before its microVM is built (the control is lost): $($fcRun -join ', ')"
+        $here = @($all.Keys | Where-Object { ($meM[$_] -band $all[$_]) -ne 0 })
+        Check ($here.Count -eq 0) "mitigations in force in this shell (the control is lost): $($here -join ', ')"
+        # The API process's end ends Firecracker (a panic, as the API thread's
+        # end does on Linux), and the jailer returns its status.
+        Stop-Process -Id $apiPid -Force
+        [void]$jail.Jailer.WaitForExit(15000)
+        Check ($jail.Jailer.HasExited) 'the jailer (and Firecracker) did not end within 15 s of the API process being killed'
+        Check ($jail.Jailer.ExitCode -ne 0) "the jailer returned 0 after the API process was killed"
+        $err = Get-Content -Raw (Join-Path $base 'api-err.txt') -ErrorAction SilentlyContinue
+        Check ($err -match 'The API server process ended') "no panic message for the API process's end: $err"
+        Check ($null -eq (Get-Process -Id $jail.Fc.Id -ErrorAction SilentlyContinue)) 'Firecracker outlived the API process'
+        # Firecracker's end ends the API process.
+        $jail2 = Start-ApiJail $base 'api2'
+        Check ($jail2.Api.Count -eq 1) "processes of the second jail's binary besides Firecracker: $($jail2.Api.Count)"
+        $apiPid2 = $jail2.Api.Id
+        Stop-Process -Id $jail2.Fc.Id -Force
+        $t = [DateTime]::Now.AddSeconds(10)
+        while ((Get-Process -Id $apiPid2 -ErrorAction SilentlyContinue) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
+        Check ($null -eq (Get-Process -Id $apiPid2 -ErrorAction SilentlyContinue)) 'the API process outlived Firecracker by 10 s'
+        "the jail runs Firecracker and its API process (the whole mitigation profile; Firecracker the setup phase's only; this shell none); the API answers through it; each one's end ends the other"
+    } finally { Stop-Jailed }
 }
 
 function Stage-Boot {

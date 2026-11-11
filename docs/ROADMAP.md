@@ -156,7 +156,10 @@ a WHP machine.
 
 Neither macOS nor Windows filters system calls per thread. Threads of one process share an address space, so on
 Linux the effective boundary of per-thread filters is already their union; the plan applies that union process-wide
-and moves the API server, the thread whose separate filter is a real boundary, into a process of its own.
+and moves the API server, the thread whose separate filter is a real boundary, into a process of its own. That is in
+place on both: on Windows the API process is a second process from Firecracker's binary with the whole mitigation
+profile from its start, made by Firecracker or, in a jail, by the jailer on the jail's token and in its Job Object
+(`test_the_api_process_serves_under_the_api_profile`, `jailer-test.ps1 api`).
 
 On Windows a jailed process cannot open its peer to duplicate handles into it, so fd passing from a jailed VMM (to a
 uffd handler or a vhost-user backend) is pulled: the sender keeps private copies and names them, and the receiver

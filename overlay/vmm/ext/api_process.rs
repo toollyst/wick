@@ -26,6 +26,13 @@
 //! the API thread's death ends Firecracker on Linux (upstream builds with
 //! `panic = "abort"`).
 //!
+//! On Windows there is no fork: the API process is a second process from
+//! Firecracker's binary (the `windows` module), made by Firecracker itself, or by the
+//! jailer in a jail, with its end of the link and a handle to Firecracker
+//! inherited; it finds them in its environment and serves before anything
+//! else of Firecracker's start-up runs. Its sandbox is the whole mitigation
+//! profile at once (`sandbox::apply_api`).
+//!
 //! Messages, each a 4-byte little-endian length and that many bytes:
 //!
 //! - API process to Firecracker: `R` + a request (`METHOD path HTTP/1.1`,
@@ -45,6 +52,8 @@ pub enum ApiProcessError {
     Threads(usize),
     /// Failed to make the API process: {0}
     Fork(io::Error),
+    /// Failed to bind the API socket at {0}: {1}
+    Bind(std::path::PathBuf, io::Error),
     /// The link to the API process failed: {0}
     Link(io::Error),
     /// A malformed message on the link to the API process: {0}
@@ -343,6 +352,12 @@ pub fn set_validator(validate: fn(&Request)) {
 
 #[cfg(target_os = "macos")]
 pub use macos::{set_waiting, split, wait_for_server};
+
+#[cfg(windows)]
+pub use windows::{
+    FIRECRACKER_ENV, LINK_ENV, WAITING_ENV, link_from_env, serve_if_api_process, set_waiting,
+    split, wait_for_server,
+};
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -681,6 +696,553 @@ mod macos {
             let dir = std::path::PathBuf::from(format!("/tmp/wick-api-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             dir
+        }
+    }
+}
+
+/// The API process on Windows: a second process from Firecracker's binary.
+///
+/// Without the jailer, [`split`] makes it ([`spawn`]): `CreateProcess` of
+/// the running binary, before the sandbox's child process policy is set,
+/// with the API process's end of the link and a `SYNCHRONIZE` handle to
+/// Firecracker inherited and their values in its environment ([`LINK_ENV`],
+/// [`FIRECRACKER_ENV`]); the new process finds them first thing
+/// (`ext::jail::enter`, [`serve_if_api_process`]) and serves. In a jail the
+/// jailer makes it the same way, as a process of the jail (the same token,
+/// Job Object and drive), and hands Firecracker its end of the link as
+/// [`WAITING_ENV`] ([`set_waiting`]). Either way the server's listening
+/// socket and kill switch are then sent over the link ([`split`]), as on
+/// macOS. The API process ends when Firecracker's process handle signals.
+#[cfg(windows)]
+mod windows {
+    use std::ffi::OsStr;
+    use std::io;
+    use std::os::fd::{from_socket, socket};
+    use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use micro_http::{HttpServer, ServerError};
+    use vmm_sys_util::eventfd::EventFd;
+    use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, INFINITE,
+        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    };
+
+    use super::{ApiLink, ApiProcessError, ServerLink, VALIDATE};
+    use crate::ext::sandbox::{self, Policy};
+
+    /// In the API process: the handle value of its end of the link.
+    pub const LINK_ENV: &str = "WICK_API_LINK";
+    /// In the API process: the handle value of a `SYNCHRONIZE` handle to
+    /// Firecracker's process.
+    pub const FIRECRACKER_ENV: &str = "WICK_API_FIRECRACKER";
+    /// In a jailed Firecracker: the handle value of its end of the link to
+    /// the API process the jailer made.
+    pub const WAITING_ENV: &str = "WICK_API_WAITING";
+
+    /// `SYNCHRONIZE` (winnt.h).
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    // windows-sys gates it behind Win32_System_Console, which the vmm crate
+    // does not otherwise need.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(id: u32) -> HANDLE;
+    }
+    /// `STD_INPUT_HANDLE`, `STD_OUTPUT_HANDLE`, `STD_ERROR_HANDLE`.
+    const STD_HANDLES: [u32; 3] = [-10i32 as u32, -11i32 as u32, -12i32 as u32];
+
+    /// The API process the jail made (`ext::jail::enter`), which waits for
+    /// its server.
+    static WAITING: Mutex<Option<UnixStream>> = Mutex::new(None);
+
+    /// The API process this process made ([`spawn`]).
+    static API_PROCESS: Mutex<Option<OwnedHandle>> = Mutex::new(None);
+
+    /// Keeps the link to the API process the jail made.
+    pub fn set_waiting(link: UnixStream) {
+        *WAITING.lock().unwrap() = Some(link);
+    }
+
+    fn bad_handle(what: &str, value: &OsStr) -> ApiProcessError {
+        ApiProcessError::Message(format!("{what}: not a handle value: {}", value.to_string_lossy()))
+    }
+
+    fn handle_value(value: &OsStr) -> Option<HANDLE> {
+        let v: usize = value.to_str()?.parse().ok()?;
+        (v != 0).then_some(v as HANDLE)
+    }
+
+    /// The link whose socket handle value a parent put in the environment.
+    pub fn link_from_env(value: &OsStr) -> Result<UnixStream, ApiProcessError> {
+        let h = handle_value(value).ok_or_else(|| bad_handle("the link", value))?;
+        // SAFETY: a socket handle this process inherited, for it to own.
+        Ok(unsafe { UnixStream::from_raw_fd(from_socket(h as usize)) })
+    }
+
+    /// Serves as the API process if this process was started as one
+    /// ([`LINK_ENV`] set): never returns then. Nothing otherwise.
+    pub fn serve_if_api_process() -> Result<(), ApiProcessError> {
+        let Some(link) = std::env::var_os(LINK_ENV) else {
+            return Ok(());
+        };
+        let firecracker = std::env::var_os(FIRECRACKER_ENV)
+            .ok_or_else(|| ApiProcessError::Message(format!("{FIRECRACKER_ENV} is not set")))?;
+        // SAFETY: called first thing in main, before any other thread exists.
+        unsafe {
+            std::env::remove_var(LINK_ENV);
+            std::env::remove_var(FIRECRACKER_ENV);
+        }
+        let link = link_from_env(&link)?;
+        let h = handle_value(&firecracker)
+            .ok_or_else(|| bad_handle("Firecracker's handle", &firecracker))?;
+        // SAFETY: a process handle this process inherited, for it to own.
+        let firecracker = unsafe { OwnedHandle::from_raw_handle(h) };
+        wait_for_server(link, firecracker)
+    }
+
+    fn inheritable(h: HANDLE) -> io::Result<()> {
+        // SAFETY: a handle this process holds.
+        if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
+        s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// `"<program>" "<arg>"...`, as the C runtime's parsing reads it back
+    /// (no argument here holds a quote or ends with a backslash).
+    fn command_line(program: &Path, args: &[&str]) -> String {
+        std::iter::once(program.to_string_lossy().into_owned())
+            .chain(args.iter().map(|a| (*a).to_owned()))
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// This process's environment plus `extra`, as a Unicode environment block.
+    fn environment(extra: &[(&str, String)]) -> Vec<u16> {
+        let mut block = Vec::new();
+        for (k, v) in std::env::vars_os() {
+            block.extend(k.encode_wide());
+            block.push(u16::from(b'='));
+            block.extend(v.encode_wide());
+            block.push(0);
+        }
+        for (k, v) in extra {
+            block.extend(format!("{k}={v}").encode_utf16());
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
+    /// Makes the API process: this binary again, with `args`, the API
+    /// process's end of a new link and a handle to this process inherited.
+    /// Returns Firecracker's end of the link. Before the sandbox: its child
+    /// process policy allows no process after it.
+    fn spawn(args: &[&str]) -> Result<UnixStream, ApiProcessError> {
+        let fail = ApiProcessError::Fork;
+        let (ours, theirs) = UnixStream::pair().map_err(ApiProcessError::Link)?;
+        let link_h = socket(theirs.as_raw_fd()) as HANDLE;
+        inheritable(link_h).map_err(fail)?;
+        let mut fc_h: HANDLE = std::ptr::null_mut();
+        // SAFETY: duplicates this process's pseudo handle for a child, for
+        // waiting only.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentProcess(),
+                GetCurrentProcess(),
+                &mut fc_h,
+                SYNCHRONIZE,
+                1,
+                0,
+            )
+        } == 0
+        {
+            return Err(fail(io::Error::last_os_error()));
+        }
+        // SAFETY: the handle just made.
+        let fc = unsafe { OwnedHandle::from_raw_handle(fc_h) };
+        let exe = std::env::current_exe().map_err(fail)?;
+        let mut cmd = wide(command_line(&exe, args));
+        let env = environment(&[
+            (LINK_ENV, (link_h as usize).to_string()),
+            (FIRECRACKER_ENV, (fc_h as usize).to_string()),
+        ]);
+        // The handles it inherits: the two above and the standard handles.
+        let mut handles = vec![link_h, fc_h];
+        // SAFETY: plain calls.
+        let std_handles = STD_HANDLES.map(|id| unsafe { GetStdHandle(id) });
+        for h in std_handles {
+            if !h.is_null() && h != -1isize as HANDLE && !handles.contains(&h) && inheritable(h).is_ok()
+            {
+                handles.push(h);
+            }
+        }
+        let mut size = 0usize;
+        // SAFETY: a size query.
+        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+        let mut attrs = vec![0u64; size.div_ceil(8)];
+        let list: LPPROC_THREAD_ATTRIBUTE_LIST = attrs.as_mut_ptr().cast();
+        // SAFETY: a buffer of the size asked for.
+        if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
+            return Err(fail(io::Error::last_os_error()));
+        }
+        // SAFETY: the handle array outlives the process creation.
+        if unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                std::mem::size_of_val(handles.as_slice()),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            let err = io::Error::last_os_error();
+            // SAFETY: initialised above.
+            unsafe { DeleteProcThreadAttributeList(list) };
+            return Err(fail(err));
+        }
+        // SAFETY: plain data.
+        let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        si.StartupInfo.cb = u32::try_from(std::mem::size_of::<STARTUPINFOEXW>()).unwrap();
+        si.lpAttributeList = list;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = std_handles[0];
+        si.StartupInfo.hStdOutput = std_handles[1];
+        si.StartupInfo.hStdError = std_handles[2];
+        // SAFETY: plain data.
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: NUL-terminated application path, command line and
+        // environment; the attribute list outlives the call.
+        let created = unsafe {
+            CreateProcessW(
+                wide(&exe).as_ptr(),
+                cmd.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                env.as_ptr().cast(),
+                std::ptr::null(),
+                &si.StartupInfo,
+                &mut pi,
+            )
+        };
+        let err = io::Error::last_os_error();
+        // SAFETY: initialised above.
+        unsafe { DeleteProcThreadAttributeList(list) };
+        if created == 0 {
+            return Err(fail(err));
+        }
+        // SAFETY: handles CreateProcess gave us.
+        unsafe {
+            CloseHandle(pi.hThread);
+            *API_PROCESS.lock().unwrap() = Some(OwnedHandle::from_raw_handle(pi.hProcess));
+        }
+        // The API process has its own copies now.
+        drop(theirs);
+        drop(fc);
+        Ok(ours)
+    }
+
+    /// Binds the API socket and moves the HTTP server into a process of its
+    /// own, sandboxed as upstream's API thread is filtered: the API process
+    /// the jail made, or else one made now. Returns Firecracker's end of the
+    /// link to it.
+    pub fn split(
+        kill_switch: EventFd,
+        socket_path: &Path,
+        payload_limit: usize,
+    ) -> Result<ApiLink<UnixStream>, ApiProcessError> {
+        split_with(&[], kill_switch, socket_path, payload_limit)
+    }
+
+    fn split_with(
+        args: &[&str],
+        kill_switch: EventFd,
+        socket_path: &Path,
+        payload_limit: usize,
+    ) -> Result<ApiLink<UnixStream>, ApiProcessError> {
+        let listener = UnixListener::bind(socket_path)
+            .map_err(|e| ApiProcessError::Bind(socket_path.to_path_buf(), e))?;
+        let waiting = WAITING.lock().unwrap().take();
+        let link = match waiting {
+            Some(link) => link,
+            None => spawn(args)?,
+        };
+        let mut msg = u64::try_from(payload_limit).unwrap().to_le_bytes().to_vec();
+        msg.push(u8::from(sandbox::selected() == Policy::Default));
+        link.send_with_fds(&[&msg[..]], &[listener.as_raw_fd(), kill_switch.as_raw_fd()])
+            .map_err(|e| ApiProcessError::Link(io::Error::other(e.to_string())))?;
+        // The API process has its own handles now.
+        drop(listener);
+        drop(kill_switch);
+        Ok(ApiLink::new(link))
+    }
+
+    /// The API process: waits for its server ([`split`]), or ends with
+    /// Firecracker if it never gets one (`--no-api`, an error).
+    pub fn wait_for_server(link: UnixStream, firecracker: OwnedHandle) -> ! {
+        let mut buf = [0u8; 16];
+        let mut fds = [-1 as RawFd; 2];
+        let mut iov = [libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() }];
+        // SAFETY: the iovec points at `buf`, which outlives the call.
+        let got = unsafe { link.recv_with_fds(&mut iov, &mut fds) };
+        let (len, nfds) = match got {
+            Ok((0, _)) => exit(Ok(())),
+            Ok(got) => got,
+            Err(err) => exit(Err(ApiProcessError::Link(io::Error::other(err.to_string())))),
+        };
+        if len != 9 || nfds != 2 {
+            exit(Err(ApiProcessError::Message(format!(
+                "start: {len} bytes, {nfds} descriptors"
+            ))));
+        }
+        let payload_limit =
+            usize::try_from(u64::from_le_bytes(buf[..8].try_into().unwrap())).unwrap();
+        sandbox::select(if buf[8] == 1 { Policy::Default } else { Policy::None });
+        // SAFETY: the API socket's listening descriptor, received for this
+        // server to own.
+        let mut server = match unsafe { HttpServer::new_from_fd(fds[0]) } {
+            Ok(server) => server,
+            Err(err) => exit(Err(ApiProcessError::Message(format!("{err:?}")))),
+        };
+        // SAFETY: the kill switch's descriptor, received for it to own.
+        let kill_switch = unsafe { EventFd::from_raw_fd(fds[1]) };
+        let result = server
+            .add_kill_switch(kill_switch)
+            .map_err(|e| ApiProcessError::Message(format!("{e:?}")))
+            .and_then(|()| serve(&mut server, link, payload_limit, firecracker));
+        exit(result)
+    }
+
+    /// Ends the API process (without Firecracker's exit code, which belongs
+    /// to Firecracker).
+    fn exit(result: Result<(), ApiProcessError>) -> ! {
+        let code = match result {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("The API server process failed: {err}");
+                1
+            }
+        };
+        std::process::exit(code)
+    }
+
+    /// Ends the API process when Firecracker ends, as the API thread ends
+    /// with it on Linux: a thread that waits on Firecracker's process handle.
+    fn end_with_firecracker(firecracker: OwnedHandle) -> Result<(), ApiProcessError> {
+        let fail = ApiProcessError::Fork;
+        // SAFETY: a handle we own.
+        match unsafe { WaitForSingleObject(firecracker.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => exit(Ok(())),
+            WAIT_TIMEOUT => {}
+            _ => return Err(fail(io::Error::last_os_error())),
+        }
+        std::thread::Builder::new()
+            .name("fc_api_watch".into())
+            .spawn(move || {
+                // SAFETY: a handle we own, waited on for good.
+                unsafe { WaitForSingleObject(firecracker.as_raw_handle(), INFINITE) };
+                exit(Ok(()))
+            })
+            .map_err(fail)?;
+        Ok(())
+    }
+
+    /// The API process's loop: the server's requests to Firecracker, its
+    /// responses back (as on macOS).
+    fn serve(
+        server: &mut HttpServer,
+        link: UnixStream,
+        payload_limit: usize,
+        firecracker: OwnedHandle,
+    ) -> Result<(), ApiProcessError> {
+        end_with_firecracker(firecracker)?;
+        // Firecracker's API thread logs; this process only parses.
+        log::set_max_level(log::LevelFilter::Off);
+        sandbox::apply_api().map_err(|e| ApiProcessError::Message(e.to_string()))?;
+        let validate = VALIDATE.get().copied();
+        let mut link = ServerLink::new(link);
+        server.set_payload_max_size(payload_limit);
+        server.start_server().map_err(|e| ApiProcessError::Message(format!("{e:?}")))?;
+        loop {
+            let requests = match server.requests() {
+                Ok(requests) => requests,
+                Err(ServerError::ShutdownEvent) => {
+                    server.flush_outgoing_writes();
+                    return link.shutdown();
+                }
+                Err(err) => {
+                    link.error(&format!("API Server error on retrieving incoming request: {err}"))?;
+                    continue;
+                }
+            };
+            for request in requests {
+                let mut ended = false;
+                let mut failed = None;
+                let response = request.process(|request| {
+                    if let Some(validate) = validate {
+                        validate(request);
+                    }
+                    let status = |code| micro_http::Response::new(micro_http::Version::Http11, code);
+                    match link.handle(request) {
+                        Ok(Some(response)) => response,
+                        Ok(None) => {
+                            ended = true;
+                            status(micro_http::StatusCode::ServiceUnavailable)
+                        }
+                        Err(err) => {
+                            failed = Some(err);
+                            status(micro_http::StatusCode::InternalServerError)
+                        }
+                    }
+                });
+                if ended {
+                    return Ok(());
+                }
+                if let Some(err) = failed {
+                    return Err(err);
+                }
+                if let Err(err) = server.respond(response) {
+                    link.error(&format!("API Server encountered an error on response: {err}"))?;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io::{Read, Write};
+
+        use micro_http::{Body, Response, StatusCode, Version};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, GetProcessMitigationPolicy, PROCESS_MITIGATION_POLICY,
+        };
+
+        use super::super::FromApi;
+        use super::*;
+        use crate::ext::sandbox::MITIGATIONS;
+
+        fn flags_of(process: HANDLE, policy: PROCESS_MITIGATION_POLICY) -> u32 {
+            let mut flags = 0u32;
+            // SAFETY: a 4-byte buffer of the size passed.
+            let ok = unsafe {
+                GetProcessMitigationPolicy(process, policy, std::ptr::from_mut(&mut flags).cast(), 4)
+            };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            flags
+        }
+
+        // The API process (this test binary, started by `split` as
+        // Firecracker starts it) has the whole mitigation profile where this
+        // process has none, serves a request through the link and ends with
+        // the server's shutdown.
+        #[test]
+        fn test_the_api_process_serves_under_the_api_profile() {
+            let dir = std::env::temp_dir().join(format!("wick-api-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("api.sock");
+            sandbox::select(Policy::Default);
+            let kill_switch = EventFd::new(0).unwrap();
+            let mut link = split_with(
+                &[
+                    "--exact",
+                    "ext::api_process::windows::tests::api_process_child",
+                    "--ignored",
+                    "--nocapture",
+                ],
+                kill_switch.try_clone().unwrap(),
+                &path,
+                1024,
+            )
+            .unwrap();
+            sandbox::select(Policy::None);
+            // A request, answered through the link.
+            let client_path = path.clone();
+            let client = std::thread::spawn(move || {
+                let mut c = UnixStream::connect(&client_path).unwrap();
+                c.write_all(b"GET /version HTTP/1.1\r\n\r\n").unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 1024];
+                loop {
+                    let n = c.read(&mut buf).unwrap();
+                    got.extend_from_slice(&buf[..n]);
+                    if n == 0 || got.ends_with(b"{\"v\":1}") {
+                        break;
+                    }
+                }
+                String::from_utf8(got).unwrap()
+            });
+            match link.receive().unwrap() {
+                FromApi::Request(r) => assert_eq!(r.uri().get_abs_path(), "/version"),
+                other => panic!("{other:?}"),
+            }
+            let mut response = Response::new(Version::Http11, StatusCode::OK);
+            response.set_body(Body::new("{\"v\":1}"));
+            link.respond(&response).unwrap();
+            let got = client.join().unwrap();
+            assert!(got.starts_with("HTTP/1.1 200 OK"), "{got}");
+            // The profile, in force in the API process and not here.
+            let api = API_PROCESS.lock().unwrap().as_ref().unwrap().as_raw_handle();
+            for m in MITIGATIONS {
+                assert_eq!(flags_of(api, m.policy) & m.flags, m.flags, "{} in the API process", m.name);
+                // SAFETY: plain call.
+                let here = flags_of(unsafe { GetCurrentProcess() }, m.policy);
+                assert_eq!(here & m.flags, 0, "{} here", m.name);
+            }
+            // The shutdown ends it, with success.
+            kill_switch.write(1).unwrap();
+            assert!(matches!(link.receive().unwrap(), FromApi::Shutdown));
+            // SAFETY: a handle we own.
+            let ended = unsafe { WaitForSingleObject(api, 10_000) };
+            assert_eq!(ended, WAIT_OBJECT_0, "the API process did not end");
+            let mut code = 1u32;
+            // SAFETY: a handle we own, the process ended.
+            unsafe { GetExitCodeProcess(api, &mut code) };
+            assert_eq!(code, 0);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        #[ignore = "run by test_the_api_process_serves_under_the_api_profile as the API process"]
+        fn api_process_child() {
+            serve_if_api_process().unwrap();
+            panic!("not started as the API process");
+        }
+
+        #[test]
+        fn test_command_line_quotes_each_argument() {
+            let line = command_line(Path::new(r"C:\a b\fc.exe"), &["--exact", "x y"]);
+            assert_eq!(line, r#""C:\a b\fc.exe" "--exact" "x y""#);
+        }
+
+        #[test]
+        fn test_handle_values() {
+            assert!(handle_value(OsStr::new("0")).is_none());
+            assert!(handle_value(OsStr::new("x")).is_none());
+            assert_eq!(handle_value(OsStr::new("1234")).unwrap() as usize, 1234);
         }
     }
 }

@@ -496,6 +496,18 @@ mod imp {
 /// that the thread impersonates no more and that the process token is the
 /// jailer's restricted one: a process [`ENV`] reaches otherwise fails instead
 /// of running with the user's identity.
+///
+/// The API server's HTTP side is a process of its own
+/// ([`super::api_process`]). The jailer makes it as it makes Firecracker,
+/// from the same binary on the same token in the same Job Object, so the
+/// jail's limits cover both as one cgroup does, and hands each its end of
+/// the link: Firecracker's end comes as `WICK_API_WAITING`, the API
+/// process's as `WICK_API_LINK` with a handle to Firecracker as
+/// `WICK_API_FIRECRACKER`. The API process enters the jail as Firecracker
+/// does, then waits for its server and never returns from here. Without
+/// the jailer, Firecracker makes the API process itself (`api_process::
+/// split`) with the same two variables, and a process that finds them
+/// serves whether jailed or not.
 #[cfg(windows)]
 mod imp {
     use std::io::Error;
@@ -531,11 +543,23 @@ mod imp {
         NETNS.get().map(PathBuf::as_path)
     }
 
+    /// The API process's side: it serves, and never returns.
+    fn serve_api() -> Result<(), JailError> {
+        crate::ext::api_process::serve_if_api_process()
+            .map_err(|e| JailError::ApiProcess(Error::other(e.to_string())))
+    }
+
     pub fn enter() -> Result<(), JailError> {
+        let api = std::env::var_os(crate::ext::api_process::LINK_ENV).is_some();
         let Some(value) = std::env::var_os(ENV) else {
+            // Without the jailer, Firecracker made this API process.
+            if api {
+                serve_api()?;
+            }
             return Ok(());
         };
         let netns = std::env::var_os(super::NETNS_ENV);
+        let waiting = std::env::var_os(crate::ext::api_process::WAITING_ENV);
         // SAFETY: called first thing in main, before any other thread exists.
         unsafe { std::env::remove_var(ENV) };
         let value = value.to_string_lossy().into_owned();
@@ -575,6 +599,17 @@ mod imp {
                 )));
             }
             NETNS.set(dir).expect("the jail is entered once");
+        }
+        if let Some(waiting) = waiting {
+            // SAFETY: as above, before any other thread.
+            unsafe { std::env::remove_var(crate::ext::api_process::WAITING_ENV) };
+            let link = crate::ext::api_process::link_from_env(&waiting)
+                .map_err(|e| JailError::ApiProcess(Error::other(e.to_string())))?;
+            crate::ext::api_process::set_waiting(link);
+        }
+        if api {
+            // The jailer made this API process: in the jail now, it serves.
+            serve_api()?;
         }
         Ok(())
     }

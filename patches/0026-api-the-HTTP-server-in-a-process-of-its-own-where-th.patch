@@ -13,12 +13,12 @@ upstream's.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/firecracker/src/api_server/mod.rs     | 50 +++++++++++++++++++++++
- src/firecracker/src/api_server_adapter.rs | 27 ++++++++++++
+ src/firecracker/src/api_server_adapter.rs | 36 ++++++++++++++++
  src/firecracker/src/main.rs               |  3 ++
- 3 files changed, 80 insertions(+)
+ 3 files changed, 89 insertions(+)
 
 diff --git a/src/firecracker/src/api_server/mod.rs b/src/firecracker/src/api_server/mod.rs
-index ecc11186dae76537b3b001d087d3a60c77bf5d45..56ea92aa366194a470961fba95b5c35c13594abc 100644
+index ecc11186dae76537b3b001d087d3a60c77bf5d45..54a52a7e587115a33b04c553dcdc5a8695a9ffb5 100644
 --- a/src/firecracker/src/api_server/mod.rs
 +++ b/src/firecracker/src/api_server/mod.rs
 @@ -37,6 +37,12 @@ pub struct ApiServer {
@@ -39,7 +39,7 @@ index ecc11186dae76537b3b001d087d3a60c77bf5d45..56ea92aa366194a470961fba95b5c35c
      /// * `start_time_cpu_us` - the timestamp for when the process was started in CPU us.
      /// * `seccomp_filter` - the seccomp filter to apply.
 +    // wick: not used where the HTTP server runs in a process of its own (`run_split`).
-+    #[cfg_attr(target_os = "macos", allow(dead_code))]
++    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
      pub fn run(
          &mut self,
          mut server: HttpServer,
@@ -50,7 +50,7 @@ index ecc11186dae76537b3b001d087d3a60c77bf5d45..56ea92aa366194a470961fba95b5c35c
 +    /// wick: runs the API thread where the HTTP server is in a process of its own
 +    /// (vmm::ext::api_process): as [`Self::run`], with each request read from and each
 +    /// response written to that process.
-+    #[cfg(target_os = "macos")]
++    #[cfg(any(target_os = "macos", windows))]
 +    pub fn run_split(
 +        &mut self,
 +        mut link: vmm::ext::api_process::ApiLink<std::os::unix::net::UnixStream>,
@@ -93,10 +93,19 @@ index ecc11186dae76537b3b001d087d3a60c77bf5d45..56ea92aa366194a470961fba95b5c35c
      pub fn handle_request(
          &mut self,
 diff --git a/src/firecracker/src/api_server_adapter.rs b/src/firecracker/src/api_server_adapter.rs
-index 02c59cbdec2c7f197f9d95ce19f49b97a621f4a5..52510a67fb334e011fc4fb2d6b2dda2a10c2d0c6 100644
+index 02c59cbdec2c7f197f9d95ce19f49b97a621f4a5..034f00765565106b41e36760f40fe4f0cc26d847 100644
 --- a/src/firecracker/src/api_server_adapter.rs
 +++ b/src/firecracker/src/api_server_adapter.rs
-@@ -37,6 +37,9 @@ pub enum ApiServerError {
+@@ -19,6 +19,8 @@ use vmm::{EventManager, FcExitCode, Vmm};
+ use vmm_sys_util::epoll::EventSet;
+ use vmm_sys_util::eventfd::EventFd;
+ 
++// wick: on Windows the API process binds the socket (vmm::ext::api_process).
++#[cfg_attr(windows, allow(unused_imports))]
+ use super::api_server::{ApiServer, HttpServer, ServerError};
+ 
+ #[derive(Debug, thiserror::Error, displaydoc::Display)]
+@@ -37,6 +39,9 @@ pub enum ApiServerError {
      MissingSeccompFilter,
      /// Failed to install vmm seccomp filter: {0}
      SeccompFilter(vmm::seccomp::InstallationError),
@@ -106,21 +115,23 @@ index 02c59cbdec2c7f197f9d95ce19f49b97a621f4a5..52510a67fb334e011fc4fb2d6b2dda2a
  }
  
  #[derive(Debug)]
-@@ -180,6 +183,8 @@ pub(crate) fn run_with_api(
+@@ -180,6 +185,10 @@ pub(crate) fn run_with_api(
          .remove("api")
          .expect("Missing seccomp filter for API thread.");
  
-+    // wick: not changed where the HTTP server runs in a process of its own.
++    // wick: not changed where the HTTP server runs in a process of its own; on
++    // Windows that process binds the socket (vmm::ext::api_process::split).
++    #[cfg(not(windows))]
 +    #[cfg_attr(target_os = "macos", allow(unused_mut))]
      let mut server = match HttpServer::new(&bind_path) {
          Ok(s) => s,
          Err(ServerError::IOError(inner)) if inner.kind() == std::io::ErrorKind::AddrInUse => {
-@@ -196,20 +201,42 @@ pub(crate) fn run_with_api(
+@@ -196,20 +205,47 @@ pub(crate) fn run_with_api(
          .try_clone()
          .expect("Failed to clone API kill switch");
  
 +    // wick: where the HTTP server runs in a process of its own, that process adds it.
-+    #[cfg(not(target_os = "macos"))]
++    #[cfg(not(any(target_os = "macos", windows)))]
      server
          .add_kill_switch(api_kill_switch_clone)
          .expect("Cannot add HTTP server kill switch");
@@ -136,12 +147,17 @@ index 02c59cbdec2c7f197f9d95ce19f49b97a621f4a5..52510a67fb334e011fc4fb2d6b2dda2a
 +        api_payload_limit,
 +    )
 +    .map_err(ApiServerError::ApiProcess)?;
++    // wick: the same on Windows, where the API process binds the socket.
++    #[cfg(windows)]
++    let api_link =
++        vmm::ext::api_process::split(api_kill_switch_clone, &bind_path, api_payload_limit)
++            .map_err(ApiServerError::ApiProcess)?;
 +
      // Start the separate API thread.
      let api_thread = thread::Builder::new()
          .name("fc_api".to_owned())
          .spawn(move || {
-+            #[cfg(not(target_os = "macos"))]
++            #[cfg(not(any(target_os = "macos", windows)))]
              ApiServer::new(to_vmm, from_vmm, to_vmm_event_fd).run(
                  server,
                  process_time_reporter,
@@ -149,7 +165,7 @@ index 02c59cbdec2c7f197f9d95ce19f49b97a621f4a5..52510a67fb334e011fc4fb2d6b2dda2a
                  api_payload_limit,
              );
 +            // wick: see above.
-+            #[cfg(target_os = "macos")]
++            #[cfg(any(target_os = "macos", windows))]
 +            ApiServer::new(to_vmm, from_vmm, to_vmm_event_fd).run_split(
 +                api_link,
 +                process_time_reporter,
