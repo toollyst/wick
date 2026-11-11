@@ -1153,6 +1153,7 @@ function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api) {
         }
     }
     $vm | Add-Member -NotePropertyName ApiSock -NotePropertyValue $sock
+    $vm | Add-Member -NotePropertyName LogPath -NotePropertyValue $logPath
     return $vm
 }
 
@@ -1635,7 +1636,9 @@ function Stage-ApiProcess {
     Check $vm.Exited 'Firecracker did not end within 15 s of the API process being killed'
     Check ($vm.ExitCode -ne 0) "Firecracker exited 0 after the API process was killed"
     $vm.Drain(5000)
-    Check ($vm.Output -match 'The API server process ended') "no panic message for the API process's end ($($vm.ExitReason()))"
+    # The panic hook logs through the logger, which --log-path sends to the log file.
+    $said = $vm.Output + "`n" + (Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue)
+    Check ($said -match 'The API server process ended') "no panic message for the API process's end ($($vm.ExitReason()))"
 
     $vm = Start-Vm 'api-process-2' (Base-Config 1) -Api
     Wait-Shell $vm

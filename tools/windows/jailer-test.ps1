@@ -76,7 +76,14 @@ class JailedVm {
         $this.Out = $out
         $psi = New-Object Diagnostics.ProcessStartInfo('cmd.exe', "/c `"`"$jailer`" $cmdline > `"$out`" 2>&1`"")
         $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
-        $this.P = [Diagnostics.Process]::Start($psi)
+        # Process.Start makes the stdin writer with the console's input
+        # encoding and flushes its preamble at once: with a UTF-8 code page
+        # the guest's serial input would start with a byte order mark, which
+        # a booting guest drops and a restored guest's shell reads as part of
+        # its first command (measured: `uffd`, EF BB BF before "PS1=").
+        $saved = $null
+        try { $saved = [Console]::InputEncoding; if ($saved.GetPreamble().Length -gt 0) { [Console]::InputEncoding = [Text.UTF8Encoding]::new($false) } } catch { $saved = $null }
+        try { $this.P = [Diagnostics.Process]::Start($psi) } finally { if ($saved -and $saved.GetPreamble().Length -gt 0) { try { [Console]::InputEncoding = $saved } catch {} } }
     }
     [string] Text() {
         try {
@@ -851,7 +858,8 @@ function Stage-Uffd {
         Wait-Shell $vm
         # Done before the pause: serial input still in flight at the snapshot
         # is not part of it (upstream saves no serial input buffer).
-        Check ($vm.Sh('echo snapshot-$((6*7)) > /tmp/mark; cat /tmp/mark', 30) -eq 'snapshot-42') 'the mark was not written'
+        # The root is read-only: a tmpfs for the mark.
+        Check ($vm.Sh('mount -t tmpfs tmpfs /tmp; echo snapshot-$((6*7)) > /tmp/mark; cat /tmp/mark', 30) -eq 'snapshot-42') 'the mark was not written'
         Invoke-ApiOk $vm.Sock 'PATCH' '/vm' ([ordered]@{ state = 'Paused' }) | Out-Null
         Invoke-ApiOk $vm.Sock 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = '/snap.state'; mem_file_path = '/snap.mem' }) | Out-Null
         Stop-Jailed
