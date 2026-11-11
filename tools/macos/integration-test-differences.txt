@@ -173,3 +173,57 @@ all bug integration_tests/functional/test_cpu_template_helper.py::test_consecuti
 # when the Mac is loaded. To do: inject an irqfd's interrupt from the thread
 # that signals it.
 all bug integration_tests/functional/test_rng.py::test_rng_bw_rate_limiter
+
+# The test pins Firecracker's threads to CPUs (sched_setaffinity). macOS
+# has no CPU affinity: thread_policy_set's affinity tag is a hint for
+# placing threads together, not a set of CPUs a thread may run on, and
+# wick_macos's set_cpu_affinity fails (ENOSYS) rather than pretend.
+all impossible integration_tests/functional/test_vsock.py::test_vsock_transport_reset_h2g
+all impossible integration_tests/functional/test_vsock.py::test_vsock_transport_reset_g2h
+all impossible integration_tests/functional/test_vsock.py::test_snapshot_restore_with_inflight_vsock_tx
+
+# The test makes a multi-queue TAP (`ip tuntap add ... multi_queue`) and
+# expects Firecracker to refuse it. macOS has no TAP devices: an interface
+# is a datagram endpoint (docs/PORTING.md row 6), one queue by design.
+all impossible integration_tests/functional/test_net.py::test_multi_queue_unsupported
+
+# The test takes away the jail directory's write permission and expects
+# Firecracker, the jail's user, to fail writing the snapshot. As root (the
+# jailer, upstream's CI) the test still reaches the API socket in that
+# directory; as the jail's user (the stand-in) it no longer can.
+user root integration_tests/functional/test_snapshot_basic.py::test_negative_snapshot_permissions
+
+# Transparent huge pages (row 10), as above.
+all row-10 integration_tests/functional/test_snapshot_basic.py::test_resume[PCI_ON-Transparent-True-vmlinux-6.1.188-kvm]
+all row-10 integration_tests/functional/test_snapshot_basic.py::test_resume[PCI_ON-Transparent-False-vmlinux-6.1.188-kvm]
+all row-10 integration_tests/functional/test_snapshot_basic.py::test_resume[PCI_OFF-Transparent-True-vmlinux-6.1.188-kvm]
+all row-10 integration_tests/functional/test_snapshot_basic.py::test_resume[PCI_OFF-Transparent-False-vmlinux-6.1.188-kvm]
+all row-10 integration_tests/functional/test_snapshot_basic.py::test_snapshot_huge_pages_override[PCI_ON-Transparent-None-vmlinux-6.1.188-kvm]
+all row-10 integration_tests/functional/test_snapshot_basic.py::test_snapshot_huge_pages_override[PCI_OFF-Transparent-None-vmlinux-6.1.188-kvm]
+all row-10 integration_tests/functional/test_snapshot_basic.py::test_snapshot_huge_pages_override[PCI_OFF-None-Transparent-vmlinux-6.1.188-kvm]
+
+# Skipped off x86_64 by upstream (x86 CPUID and MSRs; GDB needs a vmlinux,
+# and upstream's aarch64 kernel is an Image), and the Linux results are
+# x86_64's.
+all arch integration_tests/functional/test_cpu_features_x86_64.py
+all arch integration_tests/functional/test_gdb.py::test_gdb_connects
+
+# What the harness does not provide yet, each named by its failure:
+# socat (the vsock tests' host side; Homebrew), sfdisk (util-linux, for
+# PARTUUID disks), losetup (a loop device; macOS: hdiutil attach), a TAP's
+# transmit queue length (an endpoint's socket buffer here), and a host
+# program in a test's network (udp_offload.py; see test_net_change_mac_address).
+all bug integration_tests/functional/test_vsock.py::test_vsock
+all bug integration_tests/functional/test_vsock.py::test_vsock_bare_pause_resume
+all bug integration_tests/functional/test_vsock.py::test_vsock_after_override
+all bug integration_tests/functional/test_drive_virtio.py::test_partuuid_boot
+all bug integration_tests/functional/test_drive_vhost_user.py::test_partuuid_boot
+all bug integration_tests/functional/test_drive_virtio.py::test_rescan_dev
+all bug integration_tests/functional/test_net.py::test_high_ingress_traffic
+all bug integration_tests/functional/test_net.py::test_tap_offload
+
+# No SIGPIPE in 100 host connections closed with data in flight
+# (metrics: signals.sigpipe 0, which Linux counts at least once). To find:
+# whether the epoll layer reports the peer's close before Firecracker's next
+# write, where Linux lets the write come first.
+all bug integration_tests/functional/test_vsock.py::test_vsock_epipe
