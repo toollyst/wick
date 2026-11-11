@@ -366,11 +366,10 @@ mod macos {
         it asks about the process itself (or sets its own file mode mask)";
     /// Why `quotactl` has none.
     const QUOTAS: &str = "Seatbelt has no operation for it; it fails with ENOTSUP here \
-        (APFS keeps no quotas), with or without the sandbox";
+        (APFS keeps no quotas)";
     /// Why `undelete` has none.
     const WHITEOUTS: &str = "Seatbelt has no operation for it; it removes a whiteout, which \
-        only a union mount has, and fails with EPERM on any other file, with or without \
-        the sandbox";
+        only a union mount has, and fails with EPERM on any other file";
 
     /// System calls allowed until [`narrow`] only, in addition to
     /// [`SYSCALLS`]: what building the microVM takes (on Linux the VMM thread
@@ -1655,6 +1654,7 @@ mod macos {
 
         #[test]
         #[ignore = "run by test_ip_sockets_are_made_but_not_used in a separate process"]
+        #[allow(clippy::cast_possible_truncation)]
         fn ip_socket_child() {
             select(Policy::Default);
             apply().unwrap();
@@ -1747,8 +1747,9 @@ mod macos {
             println!("LISTED-OK");
             use std::io::Write;
             std::io::stdout().flush().unwrap();
-            // SAFETY: a lock query on a descriptor this process holds.
+            // SAFETY: plain data.
             let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+            // SAFETY: a lock query on a descriptor this process holds.
             unsafe { libc::fcntl(fd, libc::F_GETLK, &mut lock) };
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
@@ -2429,7 +2430,17 @@ mod macos {
                         (Limit::Error(_), "0") => {
                             out.status.success() && ret == format!("err {}", libc::EPERM)
                         }
-                        (Limit::Impossible(_), _) => out.status.success() && stdout.contains("SURVIVED"),
+                        // quotactl and undelete fail in the kernel.
+                        (Limit::Impossible(_), _) => {
+                            let expected = match *name {
+                                "quotactl" => Some(format!("err {}", libc::ENOTSUP)),
+                                "undelete" => Some(format!("err {}", libc::EPERM)),
+                                _ => None,
+                            };
+                            out.status.success()
+                                && stdout.contains("SURVIVED")
+                                && expected.is_none_or(|e| ret == e)
+                        }
                         // Lifted: the call runs, and fails, if it does, with
                         // the kernel's error, not the sandbox's.
                         (Limit::Error(_), _) => {
@@ -2456,6 +2467,9 @@ mod macos {
 
         #[test]
         #[ignore = "run by test_unfiltered_syscalls_are_limited_by_their_rule in a separate process"]
+        // A system call's arguments are machine words: descriptors, numbers
+        // and pointers are packed into them as they are.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
         fn unfiltered_child() {
             use std::ffi::CString;
             use std::os::unix::ffi::OsStrExt;
