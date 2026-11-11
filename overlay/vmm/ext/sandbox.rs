@@ -612,7 +612,7 @@ mod macos {
             syscall_rule(),
             operation_rule(),
             run_rule(),
-            unlink_rule(root, netns, std::process::id())?
+            unlink_rule(root, std::process::id())?
         ))
     }
 
@@ -633,44 +633,36 @@ mod macos {
     /// The names a running microVM may remove (`unlink`, `unlinkat`; also
     /// `rmdir` and the old name of `rename`, which Seatbelt decides by the
     /// same operation, `file-write-unlink`), after [`narrow`]: an eventfd's
-    /// FIFO, which vmm-sys-util names `.eventfd-<pid>-<n>` in the temporary
-    /// directory and removes once open (an eventfd made when the guest
-    /// activates a device), and the sockets of the network endpoints
-    /// (`platform::net`, which removes its own when the device goes). Any
-    /// other name raises SIGSYS, as on Linux upstream's filters have no
-    /// `unlink`: Linux's eventfd and tap have no name. The file rule's other
-    /// operations are unchanged. Seatbelt matches the real path, so the
-    /// directories are given by theirs: in a jail (`root`), its `/tmp`
-    /// (the jailer's `TMPDIR`) for the FIFOs and the jail and its network
-    /// `netns`, by their paths outside it, for the sockets; outside a jail,
-    /// the temporary directory for the FIFOs, and a socket anywhere: an
-    /// endpoint is bound at the path the operator names (`host_dev_name`;
-    /// `boot-test net` names one in its own directory, measured: a
-    /// `firecracker-net`-only rule ended the microVM at its shutdown with
-    /// SIGSYS), and the name of a socket is all a running microVM may
-    /// remove there.
+    /// FIFO only, which vmm-sys-util names `.eventfd-<pid>-<n>` in the
+    /// temporary directory and removes once open (an eventfd made when the
+    /// guest activates a device). Any other name raises SIGSYS, as upstream's
+    /// filters have no `unlink` (Linux's eventfd and tap have no name): a
+    /// network endpoint's socket is left behind when the device goes, as
+    /// the API socket is, and the next bind at the path replaces a stale one
+    /// (`platform::net::bind`); a running microVM may not remove it or any
+    /// other socket (a compromised unjailed VMM would reach the user's other
+    /// sockets). The file rule's other operations are unchanged. Seatbelt
+    /// matches the real path, so the directory is given by its: in a jail
+    /// (`root`), its `/tmp` (the jailer's `TMPDIR`) by its path outside;
+    /// outside a jail, the temporary directory.
     ///
     /// Memfds take no name a microVM removes: their shared memory objects
     /// are `shm_rule`'s (`shm_unlink` is decided by `ipc-posix-shm*`), and
     /// the compatibility libc's `memfd_create`, which makes a file, is not
     /// called by Firecracker.
     #[allow(unexpected_cfgs)]
-    fn unlink_rule(root: Option<&Path>, netns: Option<&Path>, pid: u32) -> Result<String, SandboxError> {
+    fn unlink_rule(root: Option<&Path>, pid: u32) -> Result<String, SandboxError> {
         let tmp = std::env::temp_dir();
-        let fail = |what: &str, path: &Path, err: std::io::Error| {
-            SandboxError::Install(format!("{what} {path:?}: {err}"))
-        };
-        let (tmp, sockets) = match root {
+        let tmp = match root {
             Some(root) => {
                 let inside = tmp
                     .strip_prefix("/")
                     .map_err(|_| SandboxError::Install(format!("temporary directory {tmp:?}")))?;
-                (root.join(inside), [Some(root.to_owned()), netns.map(Path::to_owned)])
+                root.join(inside)
             }
-            None => {
-                let tmp = tmp.canonicalize().map_err(|err| fail("temporary directory", &tmp, err))?;
-                (tmp, [None, None])
-            }
+            None => tmp
+                .canonicalize()
+                .map_err(|err| SandboxError::Install(format!("temporary directory {tmp:?}: {err}")))?,
         };
         let narrowed = format!("(extension \"{}\")", NARROWED.to_str().unwrap());
         let fifo = quoted(&tmp.join(format!("{}{pid}-", vmm_sys_util::eventfd::FIFO_PREFIX)), "FIFO")?;
@@ -681,15 +673,6 @@ mod macos {
         rule.push_str(&format!(
             "(allow file-write-unlink (require-all {narrowed} (vnode-type FIFO) (prefix \"{fifo}\")))\n"
         ));
-        if root.is_none() {
-            rule.push_str(&format!("(allow file-write-unlink (require-all {narrowed} (vnode-type SOCKET)))\n"));
-        }
-        for dir in sockets.iter().flatten() {
-            rule.push_str(&format!(
-                "(allow file-write-unlink (require-all {narrowed} (vnode-type SOCKET) (subpath \"{}\")))\n",
-                quoted(dir, "network endpoint directory")?
-            ));
-        }
         Ok(rule)
     }
 
@@ -2682,18 +2665,20 @@ mod macos {
         /// shared memory object and a huge page one's; outside a jail, a
         /// FIFO in the temporary directory and an endpoint's socket in
         /// `firecracker-net`.
-        const ALLOWED_NAMES: &[(&str, &[&str])] = &[
-            ("unlink unlinkat", &["fifo", "endpoint", "free-fifo", "free-endpoint"]),
-            ("shm_unlink", &["memfd", "huge"]),
-        ];
+        const ALLOWED_NAMES: &[(&str, &[&str])] =
+            &[("unlink unlinkat", &["fifo", "free-fifo"]), ("shm_unlink", &["memfd", "huge"])];
 
         /// Names a running microVM does not remove: a file in the jail, a
-        /// file at an eventfd FIFO's name, a socket outside the network, a
-        /// FIFO with another process's eventfd name, and outside a jail a
-        /// file in the temporary directory. (A name outside the jail is the
+        /// file at an eventfd FIFO's name, a network endpoint's socket in
+        /// the jail's network and a socket elsewhere in the jail, a FIFO
+        /// with another process's eventfd name, and outside a jail a file
+        /// in the temporary directory and an endpoint's socket at a path of
+        /// the operator's choosing. (A name outside the jail is the
         /// unlifted case.)
-        const DENIED_NAMES: &[(&str, &[&str])] =
-            &[("unlink unlinkat", &["inside", "fifo-name", "socket", "fifo-other", "free-file"])];
+        const DENIED_NAMES: &[(&str, &[&str])] = &[(
+            "unlink unlinkat",
+            &["inside", "fifo-name", "endpoint", "socket", "fifo-other", "free-file", "free-endpoint"],
+        )];
 
         /// A POSIX IPC name of this test process's case `i` (31 bytes at most).
         fn ipc_name(i: usize) -> String {

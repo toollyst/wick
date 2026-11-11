@@ -18,7 +18,6 @@ use std::io;
 use std::mem;
 use std::os::raw::{c_int, c_uint};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -209,8 +208,6 @@ struct Endpoint {
     /// The network's path outside the jail: a peer that names itself by it
     /// is reached relative to `dir`.
     dir_path: Option<PathBuf>,
-    /// Device and inode of the socket file, to unlink only our own.
-    id: (u64, u64),
     /// Where frames from the guest go: every host-side socket that sent a
     /// datagram here.
     peers: Vec<Peer>,
@@ -231,16 +228,12 @@ impl Endpoint {
     fn open(path: &Path, dir: Option<(&Path, BorrowedFd<'static>)>) -> io::Result<Self> {
         let sock = dgram_socket()?;
         let fd = dir.map(|(_, fd)| fd);
-        let meta = in_dir(fd, || {
-            bind(&sock, path)?;
-            std::fs::metadata(path)
-        })?;
+        in_dir(fd, || bind(&sock, path))?;
         Ok(Endpoint {
             sock,
             path: path.to_owned(),
             dir: fd,
             dir_path: dir.map(|(p, _)| p.to_owned()),
-            id: (meta.dev(), meta.ino()),
             peers: Vec::new(),
         })
     }
@@ -365,18 +358,12 @@ impl Endpoint {
     }
 }
 
-impl Drop for Endpoint {
-    fn drop(&mut self) {
-        let _ = in_dir(self.dir, || {
-            if let Ok(meta) = std::fs::symlink_metadata(&self.path)
-                && (meta.dev(), meta.ino()) == self.id
-            {
-                std::fs::remove_file(&self.path)?;
-            }
-            Ok(())
-        });
-    }
-}
+// No `Drop`: the socket file stays when the device goes, as the API socket
+// does, and the next bind at the path replaces it (`bind`,
+// `test_stale_endpoint_replaced`). A running microVM may not remove a
+// socket: upstream's filters have no `unlink`, and the host sandbox lets
+// the run phase remove only this process's eventfd FIFOs
+// (`vmm::ext::sandbox`).
 
 #[derive(Debug)]
 enum Backend {
@@ -817,8 +804,11 @@ mod tests {
         let name = dir.as_path().join("ep0");
         assert_eq!(tap.if_name_as_str(), name.to_str().unwrap());
         assert!(name.exists());
+        // The name stays when the endpoint goes (the run phase may not
+        // remove a socket); the next bind replaces it.
         drop(tap);
-        assert!(!name.exists());
+        assert!(name.exists());
+        drop(Tap::open_named(path.to_str().unwrap()).unwrap());
 
         let long = format!("/{}", "x".repeat(200));
         assert!(matches!(
@@ -837,8 +827,14 @@ mod tests {
         drop(sock);
         assert!(path.exists());
         let tap = Tap::open_named("fcstale").unwrap();
+        // A live one is busy, as a TAP opened twice.
+        let busy = Tap::open_named("fcstale").unwrap_err();
+        assert!(matches!(&busy, TapError::IfreqExecuteError(e, _) if e.raw_os_error() == Some(libc::EBUSY)), "{busy:?}");
+        // Left behind by an ended VM, replaced by the next.
         drop(tap);
-        assert!(!path.exists());
+        assert!(path.exists());
+        drop(Tap::open_named("fcstale").unwrap());
+        std::fs::remove_file(&path).unwrap();
     }
 
     // An endpoint in a jail's network: made, reached and removed in the
@@ -876,7 +872,7 @@ mod tests {
         let busy = Endpoint::open(Path::new("tap0"), Some((&net, dir.as_fd()))).unwrap_err();
         assert_eq!(busy.raw_os_error(), Some(libc::EBUSY));
         drop(ep);
-        assert!(!net.join("tap0").exists());
+        assert!(net.join("tap0").exists());
         std::fs::remove_dir_all(&net).unwrap();
     }
 
