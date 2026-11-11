@@ -6,9 +6,9 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,isolation,boot,limits,cpu] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,isolation,boot,limits,cpu] [-Bin <dir>]
 #
-# `refuse`, `low` and `daemonize` need no WHP; the other stages boot a guest.
+# `refuse`, `low`, `daemonize` and `handles` need no WHP; the others boot a guest.
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build).
 # Needs the boot test's guest files in -Assets (vmlinux-6.1.188 and
@@ -17,7 +17,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'isolation', 'boot', 'limits', 'cpu'),
+    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'isolation', 'boot', 'limits', 'cpu'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -190,6 +190,57 @@ function Get-Probe {
     Check (Test-Path $p) 'jail-probe.rs did not build'
     $script:Probe = $p
     $p
+}
+
+Add-Type -Namespace WickJailerTest -Name Handle -MemberDefinition '[DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetHandleInformation(System.IntPtr h, uint mask, uint flags);'
+
+# Runs a program that inherits the test's inheritable handles (ProcessStartInfo
+# with redirected output sets bInheritHandles = TRUE) and returns its stdout.
+function Invoke-Inheriting([string]$exe, [string]$argline) {
+    $psi = New-Object Diagnostics.ProcessStartInfo($exe, $argline)
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    $out = $p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd()
+    [void]$p.WaitForExit(20000)
+    $out
+}
+
+# Row 15 of docs/PORTING.md: a handle the jailer inherited is not open in the
+# jailed Firecracker (the counterpart of the macOS inherited-descriptor
+# check). The jailer passes only the standard handles
+# (PROC_THREAD_ATTRIBUTE_HANDLE_LIST), so an inheritable handle it holds does
+# not reach the jailed binary. Needs no guest.
+function Stage-Handles {
+    $base = New-Base 'handles'
+    $probe = Get-Probe
+    $secret = "LEAK-$([Guid]::NewGuid().ToString('N'))"
+    $file = Join-Path $WorkDir "handle-secret-$PID.txt"
+    [IO.File]::WriteAllText($file, $secret)
+    $fs = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite')
+    try {
+        $h = $fs.SafeFileHandle.DangerousGetHandle()
+        # HANDLE_FLAG_INHERIT: the handle inherits into a child when the launch
+        # inherits handles.
+        Check ([WickJailerTest.Handle]::SetHandleInformation($h, 1, 1)) 'could not make the handle inheritable'
+        $value = $h.ToInt64()
+        # The control: a child that inherits the handle reads the secret back
+        # through its value, so the value is live and inheritable.
+        $ctl = Invoke-Inheriting $probe "handle:$value"
+        Check ($ctl -match "handle:$value allowed $secret") "the inheritable handle did not reach a plain child (so the test proves nothing): $ctl"
+        # Through the jailer: the jailer inherits the handle (Invoke-Jailer's
+        # launch inherits handles) but passes only the standard handles on, so
+        # the jailed probe does not have it.
+        $r = Invoke-Jailer @('--id', 'h', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', "handle:$value") 20000
+        $line = ($r[1] -split "`r?`n" | Where-Object { $_.StartsWith("handle:$value ") } | Select-Object -First 1)
+        Check ($null -ne $line) "the jailed probe did not answer: $($r[1])"
+        Check (-not ($line -match "allowed $secret")) "a handle the jailer inherited reached the jailed Firecracker: $line"
+        Check ($line -match 'denied') "unexpected answer: $line"
+        "a handle the jailer inherited (which a plain child does read) is not open in the jailed binary: $line"
+    } finally {
+        $fs.Close()
+        Remove-Item $file -ErrorAction SilentlyContinue
+        Stop-Jailed
+    }
 }
 
 # A jailed Firecracker with an API socket and no guest (no WHP needed).

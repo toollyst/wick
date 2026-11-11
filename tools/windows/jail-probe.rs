@@ -90,6 +90,9 @@ extern "system" {
     fn SetHandleInformation(h: HANDLE, mask: u32, flags: u32) -> i32;
     fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32;
     fn GetExitCodeProcess(h: HANDLE, code: *mut u32) -> i32;
+    fn ReadFile(h: HANDLE, buf: *mut u8, n: u32, read: *mut u32, ov: *mut c_void) -> i32;
+    fn SetFilePointer(h: HANDLE, lo: i32, hi: *mut i32, from: u32) -> u32;
+    fn GetFileType(h: HANDLE) -> u32;
 }
 
 #[link(name = "ws2_32")]
@@ -157,6 +160,29 @@ fn check(c: &str) -> String {
                 } else {
                     format!("denied {}", std::io::Error::from_raw_os_error(e))
                 }
+            }
+        }
+        // A raw handle value the jailer held (inheritably): if it reached
+        // this process it names the same file and reads back its bytes.
+        "handle" => {
+            let Ok(value) = arg.parse::<isize>() else {
+                return "bad handle".into();
+            };
+            let h = value as HANDLE;
+            // FILE_BEGIN; -1 is INVALID_SET_FILE_POINTER.
+            // SAFETY: plain calls on a handle value; they fail safely if it is
+            // not a file handle of ours.
+            unsafe {
+                if GetFileType(h) == 0 {
+                    return format!("denied {}", std::io::Error::from_raw_os_error(GetLastError() as i32));
+                }
+                SetFilePointer(h, 0, std::ptr::null_mut(), 0);
+                let mut buf = [0u8; 64];
+                let mut read = 0u32;
+                if ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut read, std::ptr::null_mut()) == 0 {
+                    return format!("denied {}", std::io::Error::from_raw_os_error(GetLastError() as i32));
+                }
+                format!("allowed {}", String::from_utf8_lossy(&buf[..read as usize]))
             }
         }
         _ => "unknown check".into(),
