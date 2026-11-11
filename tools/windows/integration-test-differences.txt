@@ -32,6 +32,12 @@ error-text integration_tests/functional/test_uffd.py::test_bad_socket_path
 # nothing listens on: Windows's is WSAECONNREFUSED, 10061.
 error-text integration_tests/functional/test_uffd.py::test_unbinded_socket
 
+# "Device or resource busy (os error 16)" (EBUSY) for a hotplugged network
+# device on a TAP another device has open: Windows says "The requested
+# resource is in use. (os error 170)" (ERROR_BUSY). The device is refused,
+# as on Linux.
+error-text integration_tests/functional/test_hotplug.py::test_hotplug_net
+
 # "Permission denied" (EACCES, 13) for a snapshot written to a directory the
 # jail may not write and loaded from files it may not read (the test's chmod
 # is the jail's ACL here: tools/windows/integration/wick_windows.py): Windows
@@ -173,3 +179,4 @@ bug integration_tests/functional/test_cpu_features_x86_64.py::test_cpuid
 bug integration_tests/functional/test_topology.py::test_cache_topology
 bug integration_tests/functional/test_hotplug.py::test_hotplug_max_devices
 bug integration_tests/functional/test_metrics.py::test_net_metrics
+bug integration_tests/functional/test_api.py::test_get_full_config_after_restoring_snapshot
