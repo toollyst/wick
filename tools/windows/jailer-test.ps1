@@ -6,7 +6,7 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,daemonize,handles,pidns,handoff,netns,api,isolation,boot,limits,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,daemonize,handles,pidns,handoff,netns,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
 #
 # `refuse`, `cpuset`, `weight`, `low`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
@@ -23,7 +23,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'api', 'isolation', 'boot', 'limits', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -1103,6 +1103,34 @@ function Stage-Hugepages {
     "the jail keeps only traversal, not 'Lock pages in memory'$note, cannot open its token, maps no large pages, and a jailed guest on 2 MiB pages is refused naming the integrity level"
 }
 
+# The guest using memory past the limit ends the VMM, as the cgroup OOM
+# killer does (tools/macos/jailer-test.py, stage_memory): a 1024 MiB guest
+# that writes 700 MiB, under a limit below that and under one above it.
+function Stage-Memory {
+    $base = New-Base 'memory'
+    $results = @()
+    foreach ($case in @(@{ Mib = 300; Ends = $true }, @{ Mib = 3000; Ends = $false })) {
+        $id = "mem$($case.Mib)"
+        $vm = Start-JailedVm $base $id @('--cgroup-version', '2', '--cgroup', "memory.max=$($case.Mib * 1MB)") 1024
+        try {
+            $how = ''
+            if ($vm.WaitFor('Run /bin/sh', 30)) {
+                Wait-Shell $vm
+                $vm.Send('mount -t tmpfs -o size=900m tmpfs /run && dd if=/dev/zero of=/run/x bs=1M count=700 2>/dev/null; echo WROTE-$?')
+                $wrote = $vm.WaitFor('WROTE-0', 120)
+                $how = if ($wrote) { 'the guest wrote 700 MiB' } else { 'the guest did not finish writing 700 MiB' }
+            } else {
+                $how = 'the guest did not boot'
+            }
+            $ended = $vm.P.WaitForExit($(if ($case.Ends) { 30000 } else { 2000 }))
+            $code = if ($ended) { $vm.P.ExitCode } else { 'running' }
+            Check ($ended -eq $case.Ends) "memory.max=$($case.Mib) MiB, a 1024 MiB guest writing 700 MiB: $how; the jailer: $code; $(($vm.Text() -split "`n" | Select-Object -Last 3) -join ' | ')"
+            if ($case.Ends) { Check ($vm.P.ExitCode -ne 0) "the jailer returned 0 for a VMM ended by its memory limit" }
+            $results += "$($case.Mib) MiB: $(if ($ended) { "ended ($how, exit $code)" } else { 'survived' })"
+        } finally { Stop-Jailed }
+    }
+    "a 1024 MiB guest writes 700 MiB; memory.max " + ($results -join ', ')
+}
 function Stage-Limits {
     # Job memory limit: below the guest's memory Firecracker cannot run it.
     $base = New-Base 'limits'

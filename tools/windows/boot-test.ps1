@@ -29,6 +29,8 @@
 #          another process: read md5, a write reaches the image
 #   hugepages  guest memory on 2 MiB large pages (needs "Lock pages in
 #          memory" for this account)
+#   devices  virtio-rng, a rate-limited drive, MMDS V2, the balloon and its
+#          statistics, the logger's and the metrics' files
 #
 # Before each reset the guest kernel log must be free of stalls, BUGs, oopses
 # and warnings.
@@ -1705,6 +1707,82 @@ function Stage-ApiProcess {
     return 'API process under the whole mitigation profile (this shell under none), serves the API; each one''s end ends the other'
 }
 
+# Logger, metrics, MMDS, balloon, entropy and a rate limiter: what upstream
+# configures beside the devices above (tools/macos/boot-test.py, stage_devices).
+function Stage-Devices {
+    $dir = Join-Path $Results 'devices'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $metrics = Join-Path $dir 'metrics.json'
+    # Firecracker opens the metrics file, it does not create it.
+    New-Item -ItemType File -Force -Path $metrics | Out-Null
+    $data = Join-Path $dir 'data.img'
+    [Wick.Util]::WriteRandom($data, 4MB)
+    $endpoint = Join-Path $SockDir 'd.ep'
+    if (Test-Path $endpoint) { Remove-Item $endpoint -Force }
+    $cfg = Base-Config 2 512
+    $cfg['drives'] += [ordered]@{
+        drive_id = 'data'; path_on_host = $data; is_root_device = $false; is_read_only = $true
+        rate_limiter = [ordered]@{ bandwidth = [ordered]@{ size = 1MB; refill_time = 100 } }
+    }
+    $cfg['network-interfaces'] = @([ordered]@{ iface_id = 'eth0'; host_dev_name = $endpoint; guest_mac = $GuestMac })
+    $cfg['mmds-config'] = [ordered]@{ version = 'V2'; network_interfaces = @('eth0') }
+    $cfg['balloon'] = [ordered]@{ amount_mib = 0; deflate_on_oom = $true; stats_polling_interval_s = 1 }
+    $cfg['entropy'] = [ordered]@{}
+    $cfg['metrics'] = [ordered]@{ metrics_path = $metrics }
+    # The logger is the one every stage's VM has (--log-path, Start-Vm).
+    $vm = Start-Vm 'devices' $cfg -Api
+    try {
+        $switch = New-Object Wick.Switch($endpoint, 10000)
+    } catch {
+        if ($vm.Exited) { Wait-Shell $vm }
+        throw
+    }
+    try {
+        Wait-Shell $vm
+        # Entropy device.
+        $out = $vm.Sh('head -c 64 /dev/hwrng | od -An -tx1 | wc -w')
+        Check ($out -eq '64') "64 bytes from virtio-rng: '$out'"
+        # Rate limiter: 4 MiB at 1 MiB per 100 ms takes at least ~300 ms.
+        $out = $vm.Sh('S=$(date +%s%N); dd if=/dev/vdb of=/dev/null bs=1M iflag=direct 2>/dev/null; echo $(( ($(date +%s%N) - S) / 1000000 ))')
+        Check ([int]$out -ge 250) "4 MiB read past a 10 MiB/s limiter in $out ms"
+        # MMDS (V2: a token, then the data).
+        Invoke-Api $vm 'PUT' '/mmds' ([ordered]@{ wick = [ordered]@{ answer = 'v42' } }) | Out-Null
+        $vm.Sh('ip addr add 10.0.0.2/24 dev eth0 && ip link set eth0 up && ip link set lo up && ip route add 169.254.169.254 dev eth0') | Out-Null
+        $token = $vm.Sh('printf ''PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 60\r\n\r\n'' | socat -t 5 - TCP:169.254.169.254:80 | tail -1')
+        Check ($token.Length -gt 20) "MMDS token '$token'"
+        $out = $vm.Sh("printf 'GET /wick/answer HTTP/1.1\r\nX-metadata-token: $token\r\n\r\n' | socat -t 5 - TCP:169.254.169.254:80 | tail -1")
+        Check ($out -eq 'v42') "MMDS answer '$out'"
+        # Balloon: inflate by 64 MiB, statistics.
+        Invoke-Api $vm 'PATCH' '/balloon' ([ordered]@{ amount_mib = 64 }) | Out-Null
+        $until = [DateTime]::UtcNow.AddSeconds(30)
+        while ($true) {
+            $raw = Invoke-Api $vm 'GET' '/balloon/statistics'
+            $stats = $raw | ConvertFrom-Json
+            if ($stats.actual_mib -ge 64) { break }
+            Check ([DateTime]::UtcNow -lt $until) "balloon statistics $raw"
+            Start-Sleep -Milliseconds 500
+        }
+        Check ($stats.actual_mib -eq 64 -and $null -ne $stats.free_memory) "balloon statistics $raw"
+        Invoke-Api $vm 'PATCH' '/balloon' ([ordered]@{ amount_mib = 0 }) | Out-Null
+        # Metrics, flushed on demand.
+        Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
+        $fs = [IO.File]::Open($metrics, 'Open', 'Read', 'ReadWrite')
+        try { $text = (New-Object IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Close() }
+        $lines = @($text -split "`n" | Where-Object { $_.Trim() })
+        Check ($lines.Count -ge 1) 'no metrics line after FlushMetrics'
+        $last = $lines[-1] | ConvertFrom-Json
+        Check ($null -ne $last.utc_timestamp_ms -and $last.block.read_bytes -ge 4MB) "metrics: $($lines.Count) lines, block.read_bytes $($last.block.read_bytes)"
+        Save-Dmesg $vm 'devices'
+        $switch.Closing = $true
+        $vm.Reboot()
+    } finally {
+        $switch.Close()
+    }
+    # Lines of the VMM thread and of the API thread.
+    $log = Get-Content -Raw $vm.LogPath
+    Check ($log -match 'Successfully started microvm that was configured from one single json' -and $log -match 'The API server received a Put request on "/mmds"') 'the logger writes to its file'
+    return 'virtio-rng, rate-limited block, MMDS V2 over the net endpoint, balloon inflate + statistics, logger and metrics files'
+}
 function Stage-Hugepages {
     $priv = (whoami /priv | Select-String 'SeLockMemoryPrivilege') -ne $null
     Check $priv ("this account lacks 'Lock pages in memory' (SeLockMemoryPrivilege): an administrator grants it in " +
@@ -1742,6 +1820,7 @@ $Stages = [ordered]@{
     'vhost-user' = { Stage-VhostUser }
     hugepages = { Stage-Hugepages }
     'api-process' = { Stage-ApiProcess }
+    devices  = { Stage-Devices }
 }
 
 # --- run ------------------------------------------------------------------------
