@@ -7,8 +7,9 @@
 column `cmd` is BSD's `command`. `-T -p <pid>` lists the process's threads
 as procps does (PID SPID TTY TIME CMD, CMD the thread's name), which macOS's
 ps cannot: names from proc_pidinfo, and a thread that has not named itself
-shows the process's name, as a Linux thread inherits its creator's. Everything
-else goes to /bin/ps as given.
+shows the process's name, as a Linux thread inherits its creator's. So does
+the main thread Rust's runtime names "main" on macOS (and not on Linux, where
+naming it would rename the process). Everything else goes to /bin/ps as given.
 """
 import ctypes
 import os
@@ -29,11 +30,13 @@ def threads(pid):
     libsystem.proc_name(pid, comm, 256)
     out = []
     info = ctypes.create_string_buffer(112)  # struct proc_threadinfo; pth_name at 48
-    for tid in ids[: n // 8]:
+    for i, tid in enumerate(ids[: n // 8]):
         if libsystem.proc_pidinfo(pid, proc_pidthreadid64info, ctypes.c_uint64(tid), info, 112) <= 0:
             continue
         name = info.raw[48:112].split(b"\0", 1)[0].decode(errors="replace")
-        out.append((tid, name or comm.value.decode(errors="replace")))
+        if not name or (i == 0 and name == "main"):
+            name = comm.value.decode(errors="replace")
+        out.append((tid, name))
     return out
 
 

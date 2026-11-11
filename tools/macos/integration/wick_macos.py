@@ -185,6 +185,17 @@ def get_threads(pid):
 _utils.get_threads = get_threads
 
 
+def get_resident_memory(process):
+    """`utils.get_resident_memory`: Linux adds the process's hugetlbfs pages
+    (HugetlbPages in /proc/<pid>/status), which its RSS leaves out, to its
+    RSS. macOS has no /proc and no hugetlbfs: a process's resident memory is
+    its RSS (proc_pidinfo, through psutil), with every page it maps in it."""
+    return process.memory_info().rss // 1024
+
+
+_utils.get_resident_memory = get_resident_memory
+
+
 def _online_cpus():
     """The CPUs the session may run on (Linux: its affinity mask and the
     online CPUs). macOS has neither CPU sets nor CPU affinity: every thread

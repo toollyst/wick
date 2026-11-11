@@ -1,0 +1,11 @@
+#!/bin/sh
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+# GNU du (coreutils), which upstream's framework calls with its long options
+# (`du --apparent-size --block-size=1 <file>`); macOS's /usr/bin/du has
+# neither. Homebrew's coreutils installs it as gdu.
+for t in /opt/homebrew/opt/coreutils/libexec/gnubin/du /usr/local/opt/coreutils/libexec/gnubin/du; do
+    [ -x "$t" ] && exec "$t" "$@"
+done
+echo "du (wick, macOS): GNU du not found: brew install coreutils" >&2
+exit 127

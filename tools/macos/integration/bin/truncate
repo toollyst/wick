@@ -1,0 +1,11 @@
+#!/bin/sh
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+# GNU truncate (coreutils), which upstream's framework calls with its long
+# options (`truncate --size <n>M <file>`); macOS's /usr/bin/truncate takes
+# -s only. Homebrew's coreutils installs it as gtruncate.
+for t in /opt/homebrew/opt/coreutils/libexec/gnubin/truncate /usr/local/opt/coreutils/libexec/gnubin/truncate; do
+    [ -x "$t" ] && exec "$t" "$@"
+done
+echo "truncate (wick, macOS): GNU truncate not found: brew install coreutils" >&2
+exit 127

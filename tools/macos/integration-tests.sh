@@ -20,8 +20,9 @@
 # its debug build, Ubuntu 24.04 and Amazon Linux 2023), prepared by
 # tools/macos/integration/setup-artifacts.sh in
 # ~/Library/Caches/wick/integration. Needs squashfs, e2fsprogs, screen 5 and
-# zig (the guest's helper programs, wick_macos.gcc_compile) from Homebrew
-# (brew install squashfs e2fsprogs screen zig).
+# zig (the guest's helper programs, wick_macos.gcc_compile) and coreutils (GNU
+# truncate and du, tools/macos/integration/bin) from Homebrew
+# (brew install squashfs e2fsprogs screen zig coreutils).
 #
 # OUT (default build/integration-tests/<time>) gets the pytest JSON report
 # (test-report.json), pytest's output (pytest.log), upstream's test_results
