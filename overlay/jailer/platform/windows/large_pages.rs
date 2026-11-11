@@ -17,9 +17,13 @@
 //! As on Linux, where huge pages come from a pool an administrator reserved
 //! and the hugetlb controller limits them (not `memory.max`), the sections
 //! are not charged to the jail's job, and the jailer refuses past the jail's
-//! `hugetlb.2MB.max` (the sizes it gave, in all). Without the privilege the
-//! jailer offers nothing, and Firecracker refuses large pages naming the
-//! cause.
+//! `hugetlb.2MB.max` (the sizes it gave, in all). That limit is the pool:
+//! Windows has no pool an administrator reserved, so large pages are taken
+//! from the host's free physical memory, not pageable and outside the job's
+//! memory limit, and a jail without a `hugetlb.2MB.max` gets no broker (a
+//! VMM that an escape took over could otherwise take every large page the
+//! host has). Without the limit or the privilege the jailer offers nothing,
+//! and Firecracker refuses large pages naming the cause.
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -104,10 +108,11 @@ fn inheritable(h: &OwnedHandle) -> io::Result<()> {
 }
 
 impl Broker {
-    /// The broker, if this process can make large-page sections; `limit`:
-    /// the bytes it gives in all.
+    /// The broker, if the jail has a large-page limit (`limit`: the bytes it
+    /// gives in all, from `hugetlb.2MB.max`) and this process can make
+    /// large-page sections; none without the limit (module documentation).
     pub(super) fn new(limit: Option<u64>) -> io::Result<Option<Broker>> {
-        if !privilege() {
+        if limit.is_none_or(|l| l == 0) || !privilege() {
             return Ok(None);
         }
         let (request_read, request_write) = pipe()?;
@@ -206,6 +211,14 @@ fn section(len: u64, given: u64, limit: Option<u64>, process: HANDLE) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // No limit, no broker: without hugetlb.2MB.max a jail gets no large
+    // pages from the jailer.
+    #[test]
+    fn test_no_broker_without_a_limit() {
+        assert!(Broker::new(None).unwrap().is_none());
+        assert!(Broker::new(Some(0)).unwrap().is_none());
+    }
 
     // The limit is the bytes given in all: a request past it is refused
     // before a section is made.

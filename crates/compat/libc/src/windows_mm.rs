@@ -1206,8 +1206,9 @@ fn map_large(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int) -> Resul
             Ok(level) if level < 0x2000 => std::eprintln!(
                 "wick: large pages: VirtualAlloc2 failed with error {err}; this process's token is at \
                  integrity level {level:#x}, below medium ({:#x}), where a privilege cannot be enabled \
-                 (SeLockMemoryPrivilege, which large pages need): a jailed Firecracker maps no large \
-                 pages; run it without the jailer",
+                 (SeLockMemoryPrivilege, which large pages need): a jailed Firecracker gets its large \
+                 pages from the jailer, which gives them only to a jail with hugetlb.2MB.max set and \
+                 only with \"Lock pages in memory\" held by the operator's account",
                 0x2000
             ),
             Ok(_) => {}

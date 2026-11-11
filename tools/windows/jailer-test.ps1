@@ -1104,8 +1104,17 @@ function Stage-Hugepages {
         } finally { Stop-Jailed }
         return "the jail keeps only traversal, cannot open its token or map large pages; this account lacks 'Lock pages in memory', so the jailer has none to give and a jailed guest on 2 MiB pages is refused naming the cause"
     }
+    # No hugetlb.2MB.max, no broker (the limit stands for Linux's pool): a
+    # jailed guest on large pages is refused, naming the limit.
+    $vm = Start-JailedVm $base 'nolimit' @() 256 -hugePages '2M'
+    try {
+        Check ($vm.P.WaitForExit(30000)) 'the jailer did not exit for a jail on large pages without hugetlb.2MB.max'
+        Check ($vm.P.ExitCode -ne 0) "jailer exit $($vm.P.ExitCode) for a jail on large pages without hugetlb.2MB.max"
+        $text = $vm.Text()
+        Check ($text -match 'hugetlb\.2MB\.max') "the refusal without a limit does not name hugetlb.2MB.max: $(($text -split "`n" | Select-Object -Last 4) -join ' | ')"
+    } finally { Stop-Jailed }
     # The jailer's sections: the guest boots on them and uses them.
-    $vm = Start-JailedVm $base 'vm' @() 256 -hugePages '2M'
+    $vm = Start-JailedVm $base 'vm' @('--cgroup-version', '2', '--cgroup', 'hugetlb.2MB.max=268435456') 256 -hugePages '2M'
     try {
         Check ($vm.WaitFor('Run /bin/sh', 30)) "a jailed guest on 2 MiB pages did not boot: $(($vm.Text() -split "`n" | Select-Object -Last 4) -join ' | ')"
         Wait-Shell $vm
@@ -1126,7 +1135,7 @@ function Stage-Hugepages {
         $text = $vm.Text()
         Check ($text -match 'hugetlb\.2MB\.max') "the refusal does not name hugetlb.2MB.max: $(($text -split "`n" | Select-Object -Last 4) -join ' | ')"
     } finally { Stop-Jailed }
-    "the jail keeps only traversal and cannot map large pages itself; the jailer's sections give a jailed 256 MiB guest its 2 MiB pages (160 MiB written and read back), and hugetlb.2MB.max of 128 MiB refuses it naming the limit"
+    "the jail keeps only traversal and cannot map large pages itself; the jailer's sections give a jailed 256 MiB guest its 2 MiB pages (160 MiB written and read back), hugetlb.2MB.max of 128 MiB refuses it naming the limit, and without hugetlb.2MB.max the jailer gives none"
 }
 
 # A guest booted under the jailer with --netns: its network endpoint is made
