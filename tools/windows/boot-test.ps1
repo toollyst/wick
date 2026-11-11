@@ -1197,6 +1197,10 @@ function Stage-Boot {
     Check ($mem -gt 200000 -and $mem -le 262144) "MemTotal $mem kB for 256 MiB"
     $hv = $vm.Sh('grep -c -w hypervisor /proc/cpuinfo')
     Check ($hv -eq '1') "CPUID hypervisor bit: '$hv'"
+    # The local timer in TSC-deadline mode, as on KVM: the guest does not
+    # calibrate its APIC timer at boot.
+    $deadline = $vm.Sh('grep -c "Clock Event Device: lapic-deadline" /proc/timer_list; true')
+    Check ($deadline -eq '1') "local timer in TSC-deadline mode (/proc/timer_list): '$deadline' of 1 vCPU"
     $clock = $vm.Sh('cat /sys/devices/system/clocksource/clocksource0/current_clocksource')
     $t0 = Get-Uptime $vm
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -1215,6 +1219,8 @@ function Stage-Smp {
     Wait-Shell $vm
     $online = $vm.Sh('cat /sys/devices/system/cpu/online')
     Check ($online -eq '0-1') "online CPUs '$online'"
+    $deadline = $vm.Sh('grep -c "Clock Event Device: lapic-deadline" /proc/timer_list; true')
+    Check ($deadline -eq '2') "local timers in TSC-deadline mode (/proc/timer_list): '$deadline' of 2 vCPUs"
     foreach ($cpu in 0, 1) {
         $out = $vm.Sh("taskset -c $cpu sh -c 'echo `$((cpu=$cpu+100))'")
         Check ($out -eq "$($cpu + 100)") "taskset $cpu`: '$out'"

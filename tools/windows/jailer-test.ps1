@@ -619,21 +619,30 @@ function Stage-Limits {
     "memory.max below the guest's memory: Firecracker cannot map it and exits"
 }
 
-# cpu.max is the job's CPU rate hard cap, from Firecracker's third CPU-second
-# on: a guest that boots under the cap calibrates its LAPIC timer while
-# throttled and can stop taking interrupts for good (about 1 boot in 3 at a
-# quarter of a CPU when the cap was there from the start). Each run boots a
-# guest under the limit, spins past the grace, then measures a 5 s spin.
-function Stage-Cpu([int]$Boots = 3) {
+# cpu.max is the job's CPU rate hard cap, from Firecracker's start, with a
+# 100 ms period. Each run boots a 2 vCPU guest under it: the boot itself is
+# held to the limit (no grace), each vCPU's local timer is in TSC-deadline
+# mode (lapic-deadline, as on KVM: the guest never calibrates its APIC timer,
+# which a throttled vCPU got wrong in about 1 boot in 3 at a quarter of a CPU
+# and then stopped taking interrupts), and a 5 s spin is held to the limit.
+# 12 boots: a failure rate of 1 in 3 passes them all with probability 0.8%.
+function Stage-Cpu([int]$Boots = 12) {
     $base = New-Base 'cpu'
     $used = @()
+    $booting = @()
     for ($b = 1; $b -le $Boots; $b++) {
         $vm = Start-JailedVm $base "cpu$b" @('--cgroup-version', '2', '--cgroup', 'cpu.max=25000 100000')
         try {
-            Wait-Shell $vm
-            $vm.Send('timeout 3 sh -c "while :; do :; done"; echo WARM')
-            Check ($vm.WaitFor('(?m)^WARM', 30)) "boot ${b}: the warm-up spin did not finish"
+            Check ($vm.WaitFor('Run /bin/sh', 120)) "boot ${b}: the guest did not reach init under cpu.max=25000 100000: $(($vm.Text() -split "`n" | Select-Object -Last 5) -join ' | ')"
             $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$base*" } | Select-Object -First 1
+            Check ($null -ne $fcp) "boot ${b}: no jailed Firecracker"
+            $bu = $fcp.TotalProcessorTime.TotalSeconds / ([DateTime]::Now - $fcp.StartTime).TotalSeconds
+            Check ($bu -le 0.4) "boot ${b}: cpu.max of a quarter CPU: Firecracker used $([math]::Round($bu * 100))% of one CPU from its start to init"
+            $booting += [math]::Round($bu * 100)
+            Wait-Shell $vm
+            $deadline = $vm.Sh('grep -c "Clock Event Device: lapic-deadline" /proc/timer_list', 10)
+            Check ($deadline -eq '2') "boot ${b}: $deadline of 2 vCPUs have their local timer in TSC-deadline mode (/proc/timer_list)"
+            $fcp.Refresh()
             $t0 = $fcp.TotalProcessorTime; $w0 = [DateTime]::Now
             $vm.Send('timeout 5 sh -c "while :; do :; done"; echo SPUN')
             if (-not $vm.WaitFor('(?m)^SPUN', 30)) {
@@ -650,7 +659,7 @@ function Stage-Cpu([int]$Boots = 3) {
             [void]$vm.P.WaitForExit(15000)
         } finally { Stop-Jailed }
     }
-    "cpu.max=25000 100000: $Boots boots, each held to $($used -join '%, ')% of a CPU in a spin, APIC timer kept"
+    "cpu.max=25000 100000 from the start: $Boots boots, held to $($booting -join '%, ')% of a CPU up to init and $($used -join '%, ')% in a spin, local timers in TSC-deadline mode"
 }
 
 # --- run ----------------------------------------------------------------------

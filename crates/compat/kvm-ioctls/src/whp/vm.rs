@@ -94,9 +94,8 @@ pub(crate) struct VmInner {
     pub(crate) irqchip: Mutex<Irqchip>,
     /// kvm-clock: the VM-wide reference and the wall clock MSR.
     pub(crate) pvclock: Mutex<super::pvclock::State>,
-    /// Whether the partition has a TSC-deadline local APIC timer
-    /// (`TscDeadlineTmrSupport`, processor features bank 1 bit 17).
-    pub(crate) tsc_deadline: bool,
+    /// The vCPUs' TSC-deadline timers (`tscdeadline`).
+    pub(crate) deadlines: super::tscdeadline::Timers,
     pub(crate) vcpus: Mutex<Vec<Weak<VcpuShared>>>,
     /// The irqfd watcher thread wakes on this to stop (with `stop` set) or
     /// to watch the irqfds registered since it last looked.
@@ -265,13 +264,19 @@ impl VmInner {
                     &mut written,
                 ) >= 0
         };
-        // SAFETY: plain data; bank 1 is the second word.
-        let tsc_deadline =
-            got && banks.BanksCount > 1 && unsafe { banks.Anonymous.AsUINT64[1] } & (1 << 17) != 0;
+        // WHP's own TSC-deadline timer (`TscDeadlineTmrSupport`, bank 1 bit
+        // 17) is left out: `IA32_TSC_DEADLINE` is emulated here, as KVM
+        // emulates it (`tscdeadline`), which needs every access to exit, and
+        // its value to be saved with a snapshot, which WHP's would not be.
+        const TSC_DEADLINE_TMR: u64 = 1 << 17;
         if got && banks.BanksCount > 0 {
             // SAFETY: plain data; bank 0 is the first word of both.
             unsafe {
                 banks.Anonymous.AsUINT64[0] |= cap.Anonymous.AsUINT64[0] & SPECULATION_CONTROLS;
+            }
+            if banks.BanksCount > 1 {
+                // SAFETY: plain data; bank 1 is the second word.
+                unsafe { banks.Anonymous.AsUINT64[1] &= !TSC_DEADLINE_TMR };
             }
             // SAFETY: the structure read from the partition, with bits added.
             unsafe {
@@ -363,7 +368,7 @@ impl VmInner {
             irqfds: Mutex::new(Vec::new()),
             irqchip: Mutex::new(Irqchip::new()),
             pvclock: Mutex::new(super::pvclock::State::default()),
-            tsc_deadline,
+            deadlines: super::tscdeadline::Timers::new().map_err(io_err)?,
             vcpus: Mutex::new(Vec::new()),
             stop_evt,
             stop: AtomicBool::new(false),

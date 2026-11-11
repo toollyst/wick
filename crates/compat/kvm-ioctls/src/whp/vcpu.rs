@@ -17,6 +17,8 @@
 //! - **CPUID** and **MSR** intercepts are answered from the per-vCPU CPUID
 //!   table Firecracker installed and from the register mapping in
 //!   [`super::regs`];
+//! - **`IA32_TSC_DEADLINE`** is emulated here, as KVM does
+//!   ([`super::tscdeadline`]);
 //! - **HLT** becomes `VcpuExit::Hlt`; a cancelled run (the immediate-exit kick)
 //!   becomes `EINTR`; triple faults and unrecoverable exits become
 //!   `VcpuExit::Shutdown` / `VcpuExit::InternalError`.
@@ -35,6 +37,7 @@ use super::whv;
 use super::whv::WHV_PARTITION_HANDLE;
 
 use super::vm::VmInner;
+use super::tscdeadline::{self, MSR_TSC_DEADLINE};
 use super::{emulate, err, pvclock, regs, Handle, IoEventAddress, Result, VcpuExit};
 
 /// Size of the xAPIC state WHP exchanges (the APIC register page).
@@ -99,6 +102,14 @@ pub(crate) struct VcpuShared {
     /// and the return of `WHvRunVirtualProcessor`: a kick in that window
     /// cancels again until the run returns (see [`VcpuShared::kick`]).
     run_seq: AtomicU64,
+    /// `IA32_TSC_DEADLINE` ([`tscdeadline`]): 0 when disarmed or fired.
+    tsc_deadline: AtomicU64,
+    /// Bumped by every write of `IA32_TSC_DEADLINE`, so that a timer armed
+    /// by an earlier write cannot fire for a later one.
+    deadline_gen: AtomicU64,
+    /// The `deadline_gen` of a timer that fired and whose interrupt the run
+    /// loop is to raise before it next enters the guest (0: none).
+    deadline_fired: AtomicU64,
 }
 
 impl VcpuShared {
@@ -114,6 +125,14 @@ impl VcpuShared {
     /// returns. Both sides use sequentially consistent operations: either
     /// the run loop sees `immediate_exit`, or the kick sees the window open.
     fn kick(&self) {
+        self.leave_guest();
+    }
+
+    /// Makes a run in flight, or one about to start, return (see
+    /// [`Self::kick`]), and wakes a vCPU that WHP reported halted. The run
+    /// loop checks what the caller set (`immediate_exit`, `deadline_fired`)
+    /// before it enters the guest.
+    fn leave_guest(&self) {
         let _ = super::ffi::cancel_run(self.part, self.index);
         let seq = self.run_seq.load(Ordering::SeqCst);
         if seq % 2 == 1 {
@@ -129,6 +148,14 @@ impl VcpuShared {
             }
         }
         self.inner.wake_halted();
+    }
+
+    /// The TSC-deadline timer of generation `generation` fired (on the
+    /// timer thread): the run loop raises its interrupt before it next
+    /// enters the guest.
+    fn deadline_expired(&self, generation: u64) {
+        self.deadline_fired.store(generation, Ordering::SeqCst);
+        self.leave_guest();
     }
 }
 
@@ -181,6 +208,9 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         system_time_msr: AtomicU64::new(0),
         immediate_exit: AtomicU8::new(0),
         run_seq: AtomicU64::new(0),
+        tsc_deadline: AtomicU64::new(0),
+        deadline_gen: AtomicU64::new(0),
+        deadline_fired: AtomicU64::new(0),
     });
     {
         let mut vcpus = ALL_VCPUS.lock().unwrap();
@@ -301,11 +331,13 @@ impl VcpuFd {
 
     pub fn get_msrs(&self, msrs: &mut Msrs) -> Result<usize> {
         let n = regs::get_msrs(self.part(), self.vp(), msrs)?;
-        // The kvm-clock MSRs are this backend's (see `pvclock`).
+        // The kvm-clock MSRs and IA32_TSC_DEADLINE are this backend's (see
+        // `pvclock`, `tscdeadline`).
         for e in msrs.as_mut_slice() {
             match e.index {
                 pvclock::MSR_SYSTEM_TIME => e.data = self.shared.system_time_msr.load(Ordering::Acquire),
                 pvclock::MSR_WALL_CLOCK => e.data = self.shared.inner.pvclock.lock().unwrap().wall_msr,
+                MSR_TSC_DEADLINE => e.data = self.read_tsc_deadline()?,
                 _ => {}
             }
         }
@@ -314,9 +346,83 @@ impl VcpuFd {
     pub fn set_msrs(&self, msrs: &Msrs) -> Result<usize> {
         let n = regs::set_msrs(self.part(), self.vp(), msrs)?;
         for e in msrs.as_slice() {
-            self.write_kvm_msr(e.index, e.data);
+            if e.index == MSR_TSC_DEADLINE {
+                self.write_tsc_deadline(e.data)?;
+            } else {
+                self.write_kvm_msr(e.index, e.data);
+            }
         }
         Ok(n)
+    }
+
+    /// `IA32_TSC_DEADLINE` as the guest reads it: 0 outside TSC-deadline
+    /// mode, as on the processor and in KVM.
+    fn read_tsc_deadline(&self) -> Result<u64> {
+        let (page, _) = self.lapic_page()?;
+        Ok(if tscdeadline::page_in_deadline_mode(&page[..]) {
+            self.shared.tsc_deadline.load(Ordering::SeqCst)
+        } else {
+            0
+        })
+    }
+
+    /// A write of `IA32_TSC_DEADLINE`, by the guest or a restore (after
+    /// `IA32_TSC` and the local APIC, as upstream restores them): disarms
+    /// the timer, and for a non-zero deadline in TSC-deadline mode arms it
+    /// for when the guest TSC reaches it, or raises the interrupt at once
+    /// if it already has. Outside TSC-deadline mode the write is ignored,
+    /// as the processor ignores it.
+    fn write_tsc_deadline(&self, value: u64) -> Result<()> {
+        let shared = &self.shared;
+        let generation = shared.deadline_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        shared.deadline_fired.store(0, Ordering::SeqCst);
+        shared.inner.deadlines.disarm(self.vp());
+        shared.tsc_deadline.store(0, Ordering::SeqCst);
+        if value == 0 {
+            return Ok(());
+        }
+        let (page, _) = self.lapic_page()?;
+        if !tscdeadline::page_in_deadline_mode(&page[..]) {
+            return Ok(());
+        }
+        shared.tsc_deadline.store(value, Ordering::SeqCst);
+        let tsc = self.register(whv::WHvX64RegisterTsc)?;
+        if value <= tsc {
+            return self.raise_tsc_deadline();
+        }
+        // Without the guest TSC's frequency the deadline cannot be timed:
+        // the vCPU fails rather than never taking its timer interrupt.
+        let hz = pvclock::tsc_hz();
+        if hz == 0 {
+            return err(libc::ENOTSUP);
+        }
+        let due = std::time::Instant::now() + tscdeadline::time_to(value, tsc, hz);
+        let vcpu = Arc::downgrade(&self.shared);
+        shared.inner.deadlines.arm(
+            self.vp(),
+            due,
+            Arc::new(move || {
+                if let Some(v) = vcpu.upgrade() {
+                    v.deadline_expired(generation);
+                }
+            }),
+        );
+        Ok(())
+    }
+
+    /// The deadline was reached: clears `IA32_TSC_DEADLINE` and requests the
+    /// LVT timer entry's interrupt for this vCPU, unless the processor would
+    /// raise none ([`tscdeadline::deadline_interrupt`]). On the vCPU's
+    /// thread, while it is out of the guest.
+    fn raise_tsc_deadline(&self) -> Result<()> {
+        self.shared.tsc_deadline.store(0, Ordering::SeqCst);
+        let (page, _) = self.lapic_page()?;
+        if let Some((apic_id, vector)) = tscdeadline::deadline_interrupt(&page[..]) {
+            // Fixed delivery, edge, physical destination: an MSI to the APIC.
+            let address = 0xFEE0_0000 | (u64::from(apic_id & 0xff) << 12);
+            self.shared.inner.inject_msi(address, u32::from(vector));
+        }
+        Ok(())
     }
 
     /// A write of a kvm-clock MSR, by the guest or a restore; other MSRs are
@@ -465,13 +571,27 @@ impl VcpuFd {
     fn enter(&self) -> Result<Option<whv::WHV_RUN_VP_EXIT_CONTEXT>> {
         let shared = &self.shared;
         shared.run_seq.fetch_add(1, Ordering::SeqCst);
-        let result = if shared.immediate_exit.load(Ordering::SeqCst) != 0 {
-            Ok(None)
-        } else {
-            super::ffi::run_vp(self.part(), self.vp()).map(Some)
-        };
+        let result = self.raise_fired_deadline().and_then(|()| {
+            if shared.immediate_exit.load(Ordering::SeqCst) != 0 {
+                Ok(None)
+            } else {
+                super::ffi::run_vp(self.part(), self.vp()).map(Some)
+            }
+        });
         shared.run_seq.fetch_add(1, Ordering::SeqCst);
         result
+    }
+
+    /// Raises the interrupt of a TSC-deadline timer that fired since the
+    /// last entry into the guest, unless the deadline was written again
+    /// since.
+    fn raise_fired_deadline(&self) -> Result<()> {
+        let shared = &self.shared;
+        let fired = shared.deadline_fired.swap(0, Ordering::SeqCst);
+        if fired != 0 && fired == shared.deadline_gen.load(Ordering::SeqCst) {
+            self.raise_tsc_deadline()?;
+        }
+        Ok(())
     }
 
     /// Runs the vCPU until the next exit.
@@ -511,7 +631,15 @@ impl VcpuFd {
 
             match ctx.ExitReason {
                 whv::WHvRunVpExitReasonNone => continue,
-                whv::WHvRunVpExitReasonCanceled => return err(libc::EINTR),
+                // A kick (`immediate_exit`) is KVM's EINTR; a cancel from
+                // a TSC-deadline timer only made the vCPU leave the guest to
+                // take its interrupt (`enter`).
+                whv::WHvRunVpExitReasonCanceled => {
+                    if self.shared.immediate_exit.load(Ordering::SeqCst) != 0 {
+                        return err(libc::EINTR);
+                    }
+                    continue;
+                }
                 // KVM's local APIC is in the kernel, and x86 Firecracker
                 // treats an HLT exit as fatal: the vCPU waits here for an
                 // interrupt instead. With its local APIC emulated, WHP
@@ -784,16 +912,6 @@ impl VcpuFd {
             (0x1, _) => {
                 let cr4 = self.register(whv::WHvX64RegisterCr4)?;
                 ecx = (ecx & !(1 << 27)) | if cr4 & (1 << 18) != 0 { 1 << 27 } else { 0 };
-                // TSC_DEADLINE, whatever the configured CPUID says
-                // (Firecracker sets it, as KVM always emulates the mode): WHP's
-                // local APIC has no TSC-deadline mode where the partition
-                // lacks TscDeadlineTmrSupport, and a guest that used it would
-                // never get a local timer interrupt (measured: LOC stayed 0
-                // and sleep never returned). Linux then uses the one-shot
-                // mode, which WHP's local APIC emulates.
-                if !self.shared.inner.tsc_deadline {
-                    ecx &= !(1 << 24);
-                }
             }
             (0x7, 0) => {
                 let cr4 = self.register(whv::WHvX64RegisterCr4)?;
@@ -873,12 +991,17 @@ impl VcpuFd {
         let index = m.MsrNumber;
         if is_write {
             let value = (m.Rdx << 32) | (m.Rax & 0xffff_ffff);
-            self.write_kvm_msr(index, value);
+            if index == MSR_TSC_DEADLINE {
+                self.write_tsc_deadline(value)?;
+            } else {
+                self.write_kvm_msr(index, value);
+            }
             regs::set_rip(self.part(), self.vp(), rip_after)
         } else {
             let value = match index {
                 pvclock::MSR_SYSTEM_TIME => self.shared.system_time_msr.load(Ordering::Acquire),
                 pvclock::MSR_WALL_CLOCK => self.shared.inner.pvclock.lock().unwrap().wall_msr,
+                MSR_TSC_DEADLINE => self.read_tsc_deadline()?,
                 _ => 0,
             };
             regs::set_msr_result(self.part(), self.vp(), value, rip_after)
