@@ -303,6 +303,17 @@ jobs:
           sudo env RUST_TEST_THREADS=1 "$bin"
       - name: Jailer scenario tests (without a VM)
         run: tools/macos/jailer-test.sh --no-vm
+      # Upstream's integration tests need a VM (tools/macos/integration-tests.sh
+      # runs them on a Mac); their harness's network namespace and comparison
+      # run here.
+      - name: Integration test harness (without a VM)
+        run: |
+          brew install libslirp pkg-config
+          cc -O2 -Wall -Wextra -Werror -o "$RUNNER_TEMP/netns-slirp" tools/macos/integration/netns-slirp.c \
+            $(pkg-config --cflags --libs slirp)
+          python3 -I tools/macos/integration/netns-selftest.py "$RUNNER_TEMP/netns-slirp"
+          python3 -m py_compile tools/macos/integration/wick_macos.py tools/macos/integration/wick_macos_net.py \
+            tools/macos/integration/jailer tools/macos/integration/bin/ip tools/macos/compare-integration-tests.py
 
   # A minute of each fuzz target (fuzz/, CONTRIBUTING.md "Fuzzing"): they
   # build, their seeds pass, and a minute of new inputs finds nothing. Long

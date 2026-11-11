@@ -1,0 +1,25 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Upstream integration tests that pass on Linux
+# (tools/macos/integration-linux-baseline.txt) and do not pass on macOS, each
+# with the reason. tools/macos/compare-integration-tests.py fails on any other
+# difference, and on an entry whose tests pass.
+#
+# Format: <mode> <kind> <pytest node id, relative to tests/; a test function
+# for all its parameters>, below a comment that gives the reason.
+# mode: all, user (tools/macos/integration-tests.sh without --jailer) or
+# jailer. kind:
+#   row-N       a Linux feature macOS does not have yet: docs/PORTING.md row N
+#   root        needs the jailer as root: run with --jailer
+#   arch        tests of the x86_64 host (Apple silicon is aarch64; row 11)
+#   impossible  the host cannot do it; the comment says why
+#   bug         a wick bug, to fix
+
+# The test caps Firecracker's address space from outside with prlimit(2)
+# (RLIMIT_AS). macOS has no prlimit: a process reads and sets only its own
+# resource limits. Nor does it take an address-space limit at all (measured
+# with setrlimit on the process itself: a 64 MiB RLIMIT_AS is refused, the
+# limit stays unlimited, and a 1 GiB mapping succeeds). wick_macos's prlimit
+# raises ENOSYS rather than pretend.
+all impossible integration_tests/functional/test_api.py::test_api_machine_config

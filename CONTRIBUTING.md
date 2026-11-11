@@ -230,6 +230,19 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   exclude it. Tests that fail on plain upstream on the CI runner are listed,
   with the reason, in `tools/linux/unit-test-exclusions.txt` and
   `tools/linux/integration-test-exclusions.txt`.
+- On macOS, `tools/macos/integration-tests.sh` runs upstream's pytest suites
+  against the macOS release build and `tools/macos/compare-integration-tests.py`
+  compares them test by test with their results on Linux
+  (`tools/macos/integration-linux-baseline.txt`, from the Linux CI). Every
+  test that passes on Linux passes on macOS or is listed, with its root-caused
+  reason, in `tools/macos/integration-test-differences.txt`: a wick bug (fix
+  it), a Linux feature macOS does not have yet (its `docs/PORTING.md` row), an
+  x86_64-only test, or what the host cannot do (and why). Upstream's framework
+  is unchanged but for one patch to `tests/conftest.py`; the macOS host side
+  (process waiting, memory maps, networks and their host side, the jailer's stand-in for
+  runs without root) is `tools/macos/integration/`. Without arguments it runs
+  the functional and security suites as the user; `--jailer` runs them as root
+  with wick's jailer, as upstream's CI does on Linux.
 - `tools/linux/boot-test.sh` is `tools/windows/boot-test.ps1` for Linux: it
   boots upstream's CI guest with the musl release binary (seccomp filters on
   every thread) and checks serial I/O, SMP, the Async (io_uring) block engine

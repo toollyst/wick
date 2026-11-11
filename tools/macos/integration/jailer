@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+"""The jailer's stand-in for tools/macos/integration-tests.sh's user mode.
+
+Upstream's framework starts every microVM through the jailer, which needs
+root. In user mode this script takes the jailer's place: it starts
+Firecracker as the jailer's process tree does (`--daemonize`'s double fork
+and new session, `--new-pid-ns`'s child whose pid goes to `<exec>.pid` while
+the launcher exits 0, `--resource-limit`, `--netns`'s network), with the jail's directory as the
+root of every path Firecracker is given on its command line and in its
+configuration file, and as its working directory. What needs root (chroot,
+the jail's uid and gid, cgroups) is the jailer's own and is tested in the
+`jailer` mode; asking for a cgroup here fails, as a jailer that cannot set one
+does.
+"""
+
+import json
+import os
+import resource
+import sys
+import time
+
+# Firecracker options whose value is a path in the jail.
+PATH_OPTIONS = {"--api-sock", "--log-path", "--metrics-path", "--config-file", "--metadata",
+                "--seccomp-filter"}
+CONFIG_PATH_FIELDS = {"kernel_image_path", "initrd_path", "path_on_host", "socket", "uds_path",
+                      "log_path", "metrics_path", "serial_out_path"}
+
+
+def die(msg):
+    print(f"jailer (wick user-mode stand-in): {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse(argv):
+    opts = {"cgroup": [], "resource-limit": []}
+    flags = set()
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            rest = argv[i + 1 :]
+            break
+        if not a.startswith("--"):
+            die(f"unexpected argument {a}")
+        name = a[2:]
+        if name in ("daemonize", "new-pid-ns"):
+            flags.add(name)
+            i += 1
+            continue
+        if i + 1 >= len(argv):
+            die(f"{a} needs a value")
+        if name in opts and isinstance(opts[name], list):
+            opts[name].append(argv[i + 1])
+        else:
+            opts[name] = argv[i + 1]
+        i += 2
+    for req in ("id", "exec-file", "uid", "gid"):
+        if req not in opts:
+            die(f"missing --{req}")
+    return opts, flags, rest
+
+
+def in_jail(root, path):
+    return root + path if path.startswith("/") else path
+
+
+def translate_config(root, path):
+    host = in_jail(root, path)
+    with open(host, encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    def walk(v, key=None):
+        if isinstance(v, dict):
+            return {k: walk(x, k) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x, key) for x in v]
+        if key in CONFIG_PATH_FIELDS and isinstance(v, str):
+            return in_jail(root, v)
+        return v
+
+    out = os.path.join(os.path.dirname(host), ".wick-user-" + os.path.basename(host))
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(walk(cfg), f)
+    return out
+
+
+def join_netns(path):
+    """As the jailer's --netns: the network's directory, which must exist,
+    by its real path, given to Firecracker in WICK_NETNS
+    (vmm::ext::jail::netns; the jailer's join_netns)."""
+    real = os.path.realpath(path)
+    if not os.path.isdir(real):
+        die(f"The jail's network {real!r} (--netns): a network is a directory of endpoints")
+    os.environ["WICK_NETNS"] = real
+
+
+def main():
+    opts, flags, fc_args = parse(sys.argv[1:])
+    if opts["cgroup"] or "parent-cgroup" in opts or "cgroup-version" in opts:
+        die("cgroups need the jailer, as root (tools/macos/integration-tests.sh --jailer)")
+    exec_file = opts["exec-file"]
+    base = opts.get("chroot-base-dir", "/srv/jailer")
+    root = os.path.join(base, os.path.basename(exec_file), opts["id"], "root")
+    for d in ("", "/dev", "/dev/net", "/run"):
+        os.makedirs(root + d, exist_ok=True)
+
+    if "netns" in opts:
+        join_netns(opts["netns"])
+
+    for limit in opts["resource-limit"]:
+        name, _, value = limit.partition("=")
+        which = {"fsize": resource.RLIMIT_FSIZE, "no-file": resource.RLIMIT_NOFILE}.get(name)
+        if which is None or not value.isdigit():
+            die(f"invalid resource limit {limit}")
+        resource.setrlimit(which, (int(value), int(value)))
+
+    args = []
+    has_api = False
+    i = 0
+    while i < len(fc_args):
+        a = fc_args[i]
+        if a in PATH_OPTIONS and i + 1 < len(fc_args):
+            value = fc_args[i + 1]
+            if a == "--api-sock":
+                has_api = True
+            value = translate_config(root, value) if a == "--config-file" else in_jail(root, value)
+            args += [a, value]
+            i += 2
+            continue
+        if a == "--no-api":
+            has_api = True
+        args.append(a)
+        i += 1
+    if not has_api:
+        # Firecracker's default, /run/firecracker.socket, in the jail.
+        args = ["--api-sock", root + "/run/firecracker.socket"] + args
+
+    start_us = time.time_ns() // 1000
+    cpu_us = time.process_time_ns() // 1000
+    argv = [exec_file, "--id", opts["id"], "--start-time-us", str(start_us),
+            "--start-time-cpu-us", str(cpu_us), "--parent-cpu-time-us", "0"] + args
+    os.chdir(root)
+    pid_file = os.path.join(root, os.path.basename(exec_file) + ".pid")
+
+    if "daemonize" in flags:
+        null = os.open("/dev/null", os.O_RDWR)
+        if os.fork():
+            os._exit(0)
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+
+    if "new-pid-ns" in flags:
+        leader = "daemonize" not in flags and os.getsid(0) == os.getpid()
+        pid = os.fork()
+        if pid == 0:
+            if leader:
+                os.setsid()
+            os.execv(exec_file, argv)
+        with open(pid_file, "x", encoding="ascii") as f:
+            f.write(str(pid))
+        os._exit(0)
+    with open(pid_file, "x", encoding="ascii") as f:
+        f.write(str(os.getpid()))
+    os.execv(exec_file, argv)
+
+
+if __name__ == "__main__":
+    main()
