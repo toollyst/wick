@@ -91,6 +91,11 @@ pub(crate) struct VmInner {
     memory: Mutex<HashMap<u32, Slot>>,
     ioevents: RwLock<Vec<IoEvent>>,
     irqfds: Mutex<Vec<IrqFd>>,
+    /// Unregistered irqfds whose eventfd the watcher may still have in its
+    /// epoll: kept open until the watcher has taken them out of it, as
+    /// KVM's irqfd holds its eventfd until it is deassigned (see
+    /// [`retire_irqfd`]). Locked after `irqfds`.
+    retired_irqfds: Mutex<Vec<IrqFd>>,
     pub(crate) irqchip: Mutex<Irqchip>,
     /// kvm-clock: the VM-wide reference and the wall clock MSR.
     pub(crate) pvclock: Mutex<super::pvclock::State>,
@@ -366,6 +371,7 @@ impl VmInner {
             memory: Mutex::new(HashMap::new()),
             ioevents: RwLock::new(Vec::new()),
             irqfds: Mutex::new(Vec::new()),
+            retired_irqfds: Mutex::new(Vec::new()),
             irqchip: Mutex::new(Irqchip::new()),
             pvclock: Mutex::new(super::pvclock::State::default()),
             deadlines: super::tscdeadline::Timers::new().map_err(io_err)?,
@@ -527,11 +533,11 @@ impl VmFd {
     /// Stops routing `fd` to `gsi`.
     pub fn unregister_irqfd(&self, fd: &EventFd, gsi: u32) -> Result<()> {
         let mut irqfds = self.inner.irqfds.lock().unwrap();
-        let before = irqfds.len();
-        irqfds.retain(|i| !(i.gsi == gsi && i.fd == fd.as_raw_fd()));
-        if irqfds.len() == before {
+        let mut retired = self.inner.retired_irqfds.lock().unwrap();
+        if !retire_irqfd(&mut irqfds, &mut retired, fd.as_raw_fd(), gsi) {
             return err(libc::ENOENT);
         }
+        drop(retired);
         drop(irqfds);
         let _ = self.inner.stop_evt.write(1);
         Ok(())
@@ -681,6 +687,25 @@ impl AsRawFd for VmFd {
     }
 }
 
+/// Moves the irqfds of `fd` and `gsi` from `irqfds` to `retired`, where
+/// their eventfd stays open until the watcher has taken it out of its epoll
+/// and drops them: closing it at once would leave a closed handle in an
+/// epoll that waits on it, which strict handle checks (the sandbox) end the
+/// process for (`STATUS_INVALID_HANDLE`, measured: boot-test pci, an MSI-X
+/// irqfd unregistered at the guest's reset). Whether any was registered.
+fn retire_irqfd(irqfds: &mut Vec<IrqFd>, retired: &mut Vec<IrqFd>, fd: RawFd, gsi: u32) -> bool {
+    let before = retired.len();
+    let mut i = 0;
+    while i < irqfds.len() {
+        if irqfds[i].gsi == gsi && irqfds[i].fd == fd {
+            retired.push(irqfds.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    retired.len() > before
+}
+
 /// Waits on every registered irqfd; when one signals, raises its GSI. Woken
 /// by `stop_evt` to exit (`stop` set) or to pick up the irqfds registered or
 /// removed since.
@@ -709,6 +734,10 @@ fn watch_irqfds(inner: &Arc<VmInner>) {
                     registered.remove(&fd);
                 }
             }
+            // Every retired irqfd was unregistered before `current` was
+            // taken (both under the `irqfds` lock), so it is out of the
+            // epoll now, or never was in it: its eventfd may close.
+            inner.retired_irqfds.lock().unwrap().clear();
             for (&fd, &(gsi, _)) in &current {
                 if let std::collections::hash_map::Entry::Vacant(e) = registered.entry(fd) {
                     let _ = epoll.ctl(
@@ -753,5 +782,41 @@ fn watch_irqfds(inner: &Arc<VmInner>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::GetHandleInformation;
+
+    fn open(fd: RawFd) -> bool {
+        let mut flags = 0u32;
+        // SAFETY: queries a handle value; a closed one fails.
+        unsafe { GetHandleInformation(wick_os::fd::handle(fd), &mut flags) != 0 }
+    }
+
+    // An unregistered irqfd's eventfd stays open (the watcher may still
+    // wait on it) until the retired list is dropped, which the watcher does
+    // only after taking it out of its epoll.
+    #[test]
+    fn test_an_unregistered_irqfd_stays_open_until_retired() {
+        let device = EventFd::new(0).unwrap();
+        let other = EventFd::new(0).unwrap();
+        let mut irqfds = vec![
+            IrqFd { gsi: 5, fd: device.as_raw_fd(), eventfd: device.try_clone().unwrap() },
+            IrqFd { gsi: 6, fd: other.as_raw_fd(), eventfd: other.try_clone().unwrap() },
+        ];
+        let watched = irqfds[0].eventfd.as_raw_fd();
+        let mut retired = Vec::new();
+        assert!(!retire_irqfd(&mut irqfds, &mut retired, device.as_raw_fd(), 6), "a gsi it was not registered for");
+        assert!(retire_irqfd(&mut irqfds, &mut retired, device.as_raw_fd(), 5));
+        assert_eq!(irqfds.len(), 1);
+        assert_eq!(irqfds[0].gsi, 6);
+        assert!(open(watched), "the watcher's eventfd closed while it may still be in the epoll");
+        assert!(!retire_irqfd(&mut irqfds, &mut retired, device.as_raw_fd(), 5), "unregistered twice");
+        retired.clear();
+        assert!(!open(watched), "the retired eventfd was not closed");
+        assert!(open(device.as_raw_fd()), "the caller's eventfd is the caller's");
     }
 }
