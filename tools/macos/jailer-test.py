@@ -79,6 +79,7 @@ class JailedVm(bt.Vm):
                                      stderr=subprocess.STDOUT)
         self.pump = bt.threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+        ctx.vms.append(self)
         self.seq = 0
         if wait_api:
             deadline = time.time() + 10
@@ -423,6 +424,7 @@ def main():
         if s not in STAGES:
             p.error(f"unknown stage {s}")
     os.makedirs(args.out, exist_ok=True)
+    bt.exit_on_signals()
     ctx = Context(args)
     results = []
     try:
@@ -439,12 +441,13 @@ def main():
             print(f"   {'PASS' if ok else 'FAIL'} ({time.time() - t0:.1f}s): {detail}", flush=True)
     finally:
         subprocess.run(["pkill", "-9", "-f", ctx.base], check=False)
-        shutil.rmtree(ctx.base, ignore_errors=True)
-    print()
-    for name, ok, detail in results:
-        print(f"{'PASS' if ok else 'FAIL'}  {name}: {detail.splitlines()[0]}")
-    failed = sum(not ok for _, ok, _ in results)
-    print(f"\n{len(results) - failed} passed, {failed} failed; logs in {args.out}")
+        leftover = []
+        # onerror: sudo's python3 can be the system's 3.9, without onexc.
+        shutil.rmtree(ctx.base, onerror=lambda _f, path, _e: leftover.append(path))
+        if leftover:
+            # Reported, never left silently: tools/clean.sh removes them later.
+            print(f"cleanup: could not remove {len(leftover)} paths, e.g. {leftover[0]}", file=sys.stderr)
+    failed = bt.summarize(args.out, results)
     sys.exit(1 if failed else 0)
 
 

@@ -19,6 +19,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$ROOT/tools/common.sh"
 PROFILE=debug
 cargo_profile=()
 if [[ "${1:-}" == "--release" ]]; then
@@ -28,6 +29,7 @@ if [[ "${1:-}" == "--release" ]]; then
 fi
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || { echo "error: needs macOS on Apple silicon" >&2; exit 1; }
 
+prepare_test_run "$ROOT/build/boot-test" 5
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/lib/firecracker/build/cargo_target}"
 "$ROOT/tools/macos/run.sh" --build-only ${cargo_profile[@]+"${cargo_profile[@]}"}

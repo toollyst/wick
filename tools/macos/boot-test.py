@@ -86,6 +86,9 @@ class Vm:
         )
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+        # Registered at once, so a run stopped while it starts (a signal)
+        # still kills it.
+        ctx.vms.append(self)
         self.seq = 0
         if self.api_sock:
             deadline = time.time() + 10
@@ -899,14 +902,38 @@ class Context:
         self.bash_md5 = None
 
     def vm(self, *a, **kw):
-        vm = Vm(self, *a, **kw)
-        self.vms.append(vm)
-        return vm
+        return Vm(self, *a, **kw)
 
     def cleanup(self):
         for vm in self.vms:
             vm.kill()
         self.vms = []
+
+
+def exit_on_signals():
+    """SIGTERM and SIGHUP end the run as an error does, so that its cleanup
+    (killing the VMs, removing temporary directories) still runs."""
+    import signal
+
+    def stop(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stop)
+
+
+def summarize(out, results):
+    """Prints the results and writes them to <out>/summary.txt, whose last
+    line, "N passed, M failed", tools/clean.sh reads. Returns the failures."""
+    lines = [f"{'PASS' if ok else 'FAIL'}  {name}: {detail.splitlines()[0]}" for name, ok, detail in results]
+    failed = sum(not ok for _, ok, _ in results)
+    lines.append(f"{len(results) - failed} passed, {failed} failed")
+    with open(os.path.join(out, "summary.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print()
+    print("\n".join(lines[:-1]))
+    print(f"\n{lines[-1]}; logs in {out}")
+    return failed
 
 
 def fetch(cache, name):
@@ -936,6 +963,7 @@ def main():
         if s not in STAGES:
             p.error(f"unknown stage {s}")
     os.makedirs(args.out, exist_ok=True)
+    exit_on_signals()
     ctx = Context(args)
     results = []
     try:
@@ -956,17 +984,13 @@ def main():
     finally:
         ctx.cleanup()
         shutil.rmtree(ctx.sock, ignore_errors=True)
-    print()
-    for name, ok, detail in results:
-        print(f"{'PASS' if ok else 'FAIL'}  {name}: {detail.splitlines()[0]}")
-    failed = sum(not ok for _, ok, _ in results)
+    failed = summarize(args.out, results)
     if not failed:
         # Snapshots and disk images take hundreds of MiB a run; kept only
         # when a stage failed, to look into.
         for name in os.listdir(args.out):
             if name.endswith((".mem", ".state", ".img")):
                 os.unlink(os.path.join(args.out, name))
-    print(f"\n{len(results) - failed} passed, {failed} failed; logs in {args.out}")
     sys.exit(1 if failed else 0)
 
 

@@ -90,6 +90,10 @@ discard local commits on `wick` unless given `--force`.
   requested. An error is acceptable only where the hardware or OS physically
   cannot do it, and the roadmap's status table says so.
 - Test-only shortcuts live in `cfg(test)` or in `tools/`.
+- Find the cause before fixing a failure. Reproduce it, and fix what the
+  reproduction shows, with a test that fails without the fix. A retry, a
+  longer timeout or a skipped check added without a known cause hides the
+  bug and is not accepted.
 
 ## Commits
 
@@ -262,6 +266,15 @@ target for a minute on Linux and macOS. An input that fails is saved in
   `platform::<iface>::tests` that runs against every backend, or a scenario in the boot tests.
 - Say which hosts you built and tested on. A change to a macOS backend needs a `tools/macos/boot-test.sh` run; a
   change to a Windows backend that you could not run on a WHP machine should say so, and someone with one will.
+- Tests leave nothing behind. A test script registers every process it
+  starts as soon as it starts it, kills them on any exit (SIGTERM and SIGHUP
+  included), writes `summary.txt` ending `N passed, M failed`, and calls
+  `prepare_test_run` from `tools/common.sh`, which runs `tools/clean.sh`
+  and checks for free disk space first. `tools/clean.sh --dry-run` shows
+  what earlier runs left; `--all` also removes the build output.
+- Reviewing a pull request means reading the code behind each claim it
+  makes, for every host column it touches, not only that the other columns
+  did not change.
 - Run the checks CI runs: `tools/patches.sh check`, the build and clippy for your host, the compatibility crates'
   tests (`.github/workflows/ci.yml` has the exact commands), and `tools/check-dependencies.sh` if you changed a
   `Cargo.toml` or `Cargo.lock`.

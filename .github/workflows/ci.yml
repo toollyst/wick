@@ -50,6 +50,10 @@ jobs:
         run: |
           unpinned="$(grep -nE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s*[^@ ]+@[0-9a-f]{40}( |$)' || true)"
           [[ -z "$unpinned" ]] || { echo "::error::actions not pinned by full commit SHA:"; echo "$unpinned"; exit 1; }
+      - name: Cleanup script
+        run: |
+          bash -n tools/clean.sh
+          tools/clean.sh --dry-run
 
   # Dependency policy (CONTRIBUTING.md, "Dependencies"): RustSec advisories,
   # licenses, banned and duplicate crates and sources for lib/firecracker's
