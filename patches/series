@@ -27,3 +27,5 @@
 0025-jailer-new-pid-ns-on-Windows-hands-over-to-a-keeper.patch
 0026-api-the-HTTP-server-in-a-process-of-its-own-where-th.patch
 0027-vmm-the-huge-page-guest-region-test-runs-on-Windows-.patch
+0028-tests-on-macOS-the-session-s-host-side-is-wick-s-plu.patch
+0029-jailer-new-pid-ns-on-macOS-forks-where-Linux-clones.patch

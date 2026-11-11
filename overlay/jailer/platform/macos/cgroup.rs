@@ -14,8 +14,10 @@
 //! Firecracker applies to itself when it takes the jail over (an exec starts a
 //! new task, which drops the limit; see `vmm::ext::jail`). The kernel then
 //! blocks the process's threads once they used their share of each second,
-//! as CFS throttles a cgroup once it used its quota of each period. Every
-//! other controller and property is refused, never accepted without effect. macOS has no cgroup hierarchy, so
+//! as CFS throttles a cgroup once it used its quota of each period.
+//! `cpuset.cpus` and `cpuset.mems` naming every CPU and memory node are no
+//! restriction, on macOS as on Linux. Every other controller and property is
+//! refused with its reason ([`refusal`]), never accepted without effect. macOS has no cgroup hierarchy, so
 //! the v2 hierarchy is an empty directory: there is no parent cgroup to join.
 
 use std::path::{Path, PathBuf};
@@ -72,6 +74,8 @@ impl CgroupConfigurationBuilder {
             (2, "cpu.max") => self.cpu = cpu_max(&file, &value)?,
             (1, "cpu.cfs_quota_us") => self.cpu.quota_us = cfs_quota(&file, &value)?,
             (1, "cpu.cfs_period_us") => self.cpu.period_us = Some(period(&file, &value)?),
+            (_, "cpuset.cpus") => cpuset(&file, &value, host_cpus(), CPUS_ONLY_ALL)?,
+            (_, "cpuset.mems") => cpuset(&file, &value, MEMORY_NODES, MEMS_ONLY_ALL)?,
             _ => self.memory_limit_mib = memory_limit(self.version, &file, &value)?,
         }
         Ok(())
@@ -185,7 +189,7 @@ fn memory_limit(version: u8, file: &str, value: &str) -> Result<Option<i32>, Jai
     let unlimited = match (version, file) {
         (2, "memory.max") => value == "max",
         (1, "memory.limit_in_bytes") => value == "-1",
-        _ => return Err(HostError::UnsupportedCgroup(cg()).into()),
+        _ => return Err(HostError::UnsupportedCgroup(cg(), refusal(file)).into()),
     };
     if unlimited {
         return Ok(None);
@@ -202,6 +206,89 @@ fn memory_limit(version: u8, file: &str, value: &str) -> Result<Option<i32>, Jai
     let mib = i32::try_from(mib)
         .map_err(|_| HostError::CgroupValue(cg(), "above the largest jetsam limit"))?;
     Ok(Some(mib))
+}
+
+/// Memory nodes: Apple silicon's memory is one node (no NUMA).
+const MEMORY_NODES: u32 = 1;
+const CPUS_ONLY_ALL: &str = "Apple silicon has no CPU affinity: the kernel binds no thread to a CPU \
+    (thread_policy_set with THREAD_AFFINITY_POLICY returns KERN_NOT_SUPPORTED), so only every CPU can be named";
+const MEMS_ONLY_ALL: &str = "Apple silicon has one memory node, 0";
+
+/// The host's CPUs (`hw.logicalcpu_max`).
+fn host_cpus() -> u32 {
+    let mut n: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: a NUL-terminated name and an int-sized output buffer.
+    let ret = unsafe {
+        libc::sysctlbyname(
+            c"hw.logicalcpu_max".as_ptr(),
+            (&raw mut n).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    assert_eq!(ret, 0, "hw.logicalcpu_max: {}", std::io::Error::last_os_error());
+    u32::try_from(n).expect("a positive CPU count")
+}
+
+/// `cpuset.cpus` and `cpuset.mems`: a list (`0-3,5`) of the host's `count`
+/// CPUs or memory nodes. Naming every one is no restriction, which macOS
+/// holds as Linux does; naming one the host does not have fails, as writing
+/// the file does on Linux; a subset is refused with its reason (`only_all`).
+fn cpuset(file: &str, value: &str, count: u32, only_all: &'static str) -> Result<(), JailerError> {
+    let cg = || format!("{file}={value}");
+    let mut named = vec![false; count as usize];
+    for part in value.trim().split(',') {
+        let (lo, hi) = part.split_once('-').unwrap_or((part, part));
+        let (Ok(lo), Ok(hi)) = (lo.trim().parse::<u32>(), hi.trim().parse::<u32>()) else {
+            return Err(HostError::CgroupValue(cg(), "expected a list such as 0-3,5").into());
+        };
+        if lo > hi || hi >= count {
+            return Err(HostError::CgroupValue(cg(), "names one the host does not have").into());
+        }
+        for i in lo..=hi {
+            named[i as usize] = true;
+        }
+    }
+    if named.iter().all(|&n| n) {
+        Ok(())
+    } else {
+        Err(HostError::UnsupportedCgroup(cg(), only_all).into())
+    }
+}
+
+/// Why macOS cannot enforce the cgroup file `file`.
+fn refusal(file: &str) -> &'static str {
+    let controller = file.split_once('.').map_or(file, |(c, _)| c);
+    match (controller, file) {
+        (_, "memory.max" | "memory.limit_in_bytes") => {
+            "this cgroup version names the memory limit differently"
+        }
+        (_, "cpu.max" | "cpu.cfs_quota_us" | "cpu.cfs_period_us") => {
+            "this cgroup version names the CPU limit differently"
+        }
+        (_, "cpu.weight" | "cpu.weight.nice" | "cpu.shares" | "cpu.idle") => {
+            "macOS schedules threads by priority and has no proportional share of CPU time between \
+             groups of processes"
+        }
+        (_, "cpu.uclamp.min" | "cpu.uclamp.max") => "macOS has no utilisation clamping",
+        ("memory", _) => {
+            "jetsam, macOS's memory limit, is a hard limit only (memory.max): there is no reclaim \
+             threshold, protection or per-process swap limit"
+        }
+        ("pids", _) => {
+            "macOS has no limit on a process's threads (Firecracker can make no process: its sandbox \
+             denies fork and posix_spawn)"
+        }
+        ("io" | "blkio", _) => {
+            "macOS has no per-process I/O bandwidth, operation or weight limit, only I/O priority \
+             tiers (setiopolicy_np)"
+        }
+        ("hugetlb", _) => "macOS has no hugetlb page pool (docs/PORTING.md row 10)",
+        ("cpuset", _) => "only cpuset.cpus and cpuset.mems have a macOS counterpart",
+        _ => "no macOS counterpart",
+    }
 }
 
 #[cfg(test)]
@@ -276,28 +363,61 @@ mod tests {
         ));
     }
 
+    // Each controller macOS cannot enforce is refused with its reason.
     #[test]
     fn test_other_controllers_are_refused() {
-        for (v, p) in [
-            (1, "cpuset.cpus=0"),
-            (1, "cpu.shares=10"),
-            (2, "cpu.weight=10"),
-            (2, "cpuset.cpus=0"),
-            (1, "cpu.max=50000 100000"),
-            (2, "cpu.cfs_quota_us=50000"),
-            (2, "memory.limit_in_bytes=1048576"),
-            (1, "memory.max=1048576"),
-            (2, "pids.max=10"),
+        for (v, p, why) in [
+            (1, "cpuset.cpus=0", "no CPU affinity"),
+            (2, "cpuset.cpus=0", "no CPU affinity"),
+            (1, "cpu.shares=10", "no proportional share"),
+            (2, "cpu.weight=10", "no proportional share"),
+            (2, "cpu.weight.nice=5", "no proportional share"),
+            (2, "cpu.idle=1", "no proportional share"),
+            (2, "cpu.uclamp.max=50", "no utilisation clamping"),
+            (1, "cpu.max=50000 100000", "names the CPU limit differently"),
+            (2, "cpu.cfs_quota_us=50000", "names the CPU limit differently"),
+            (2, "memory.limit_in_bytes=1048576", "names the memory limit differently"),
+            (1, "memory.max=1048576", "names the memory limit differently"),
+            (2, "memory.high=1048576", "hard limit only"),
+            (2, "memory.low=1048576", "hard limit only"),
+            (2, "memory.swap.max=0", "hard limit only"),
+            (1, "memory.memsw.limit_in_bytes=1048576", "hard limit only"),
+            (2, "pids.max=10", "no limit on a process's threads"),
+            (2, "io.max=8:0 rbps=1048576", "no per-process I/O"),
+            (2, "io.weight=100", "no per-process I/O"),
+            (1, "blkio.weight=100", "no per-process I/O"),
+            (2, "hugetlb.2MB.max=0", "no hugetlb page pool"),
+            (2, "cpuset.cpus.exclusive=0", "only cpuset.cpus and cpuset.mems"),
+            (2, "rdma.max=x", "no macOS counterpart"),
         ] {
-            assert!(
-                matches!(limit(v, &[p]).unwrap_err(), JailerError::Host(HostError::UnsupportedCgroup(_))),
-                "{p}"
-            );
+            let err = limit(v, &[p]).unwrap_err();
+            assert!(matches!(err, JailerError::Host(HostError::UnsupportedCgroup(..))), "{p}: {err}");
+            assert!(err.to_string().contains(why), "{p}: {err}");
         }
         assert!(matches!(
             CgroupConfigurationBuilder::new(3, "").unwrap_err(),
             JailerError::CgroupInvalidVersion(_)
         ));
+    }
+
+    // cpuset: every CPU and memory node is no restriction, held as on Linux;
+    // one the host does not have fails as on Linux; a subset is refused (no
+    // CPU affinity, one memory node).
+    #[test]
+    fn test_cpuset() {
+        let n = host_cpus();
+        for v in [1, 2] {
+            let all = format!("cpuset.cpus=0-{}", n - 1);
+            assert_eq!(limit(v, &[&all, "cpuset.mems=0"]).unwrap(), None);
+            let listed: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+            limit(v, &[&format!("cpuset.cpus={}", listed.join(","))]).unwrap();
+            for bad in [format!("cpuset.cpus=0-{n}"), "cpuset.mems=1".into(), "cpuset.cpus=x".into()] {
+                let err = limit(v, &[&bad]).unwrap_err();
+                assert!(matches!(err, JailerError::Host(HostError::CgroupValue(..))), "{bad}: {err}");
+            }
+            let err = limit(v, &["cpuset.cpus=0-1"]).unwrap_err();
+            assert!(err.to_string().contains("KERN_NOT_SUPPORTED"), "{err}");
+        }
     }
 
     #[test]

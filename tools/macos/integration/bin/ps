@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+"""procps' `ps` options upstream's framework uses, on macOS's ps.
+
+`--no-headers` becomes empty column titles (`-o pid=`), and the procps
+column `cmd` is BSD's `command`. Everything else goes to /bin/ps as given.
+"""
+import os
+import sys
+
+args = sys.argv[1:]
+no_headers = "--no-headers" in args
+args = [a for a in args if a != "--no-headers"]
+out = []
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "-o" and i + 1 < len(args):
+        cols = ["command" if c == "cmd" else c for c in args[i + 1].split(",")]
+        if no_headers:
+            cols = [c if c.endswith("=") else c + "=" for c in cols]
+        out += ["-o", ",".join(cols)]
+        i += 2
+        continue
+    out.append(a)
+    i += 1
+os.execv("/bin/ps", ["ps"] + out)

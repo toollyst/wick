@@ -29,3 +29,9 @@ pub mod whp;
 mod x86_bindings;
 pub use x86_bindings::*;
 extern crate self as kvm_bindings;
+
+/// The exit decoding of the Hypervisor.framework backend
+/// (`crates/compat/kvm-ioctls/src/hvf/exit.rs`), compiled from its source (it
+/// uses nothing but `core`), so it is fuzzed on any host.
+#[path = "../../crates/compat/kvm-ioctls/src/hvf/exit.rs"]
+pub mod hvf_exit;

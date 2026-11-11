@@ -829,8 +829,16 @@ def stage_devices(ctx):
         vm.reboot()
     finally:
         switch.close()
+    # Lines of the VMM thread and of the API thread. Not the API thread's
+    # "API server started": upstream starts that thread before it applies
+    # the configuration file, which sets the logger up, so the line goes to
+    # the file or, when the thread is first, to Firecracker's output (seen
+    # once the sandbox's profile was compiled ahead: the thread got there
+    # 30 ms before the logger was set up).
     with open(log) as f:
-        check("API server started" in f.read(), "the logger writes to its file")
+        text = f.read()
+    check("Successfully started microvm that was configured from one single json" in text
+          and "The API server received a Put request on \"/mmds\"" in text, "the logger writes to its file")
     return "virtio-rng, rate-limited block, MMDS V2 over the net endpoint, balloon inflate + statistics, logger and metrics files"
 
 

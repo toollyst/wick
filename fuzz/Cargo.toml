@@ -39,6 +39,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "hvf_exit"
+path = "fuzz_targets/hvf_exit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "uffd_protocol"
 path = "fuzz_targets/uffd_protocol.rs"
 test = false
