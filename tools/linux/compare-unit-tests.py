@@ -19,7 +19,9 @@ their line numbers, which the patches move). It fails when:
 - a cargo test run failed without a failing test to show for it,
 - a crate upstream's build compiles is not compiled by wick's at the same
   version with the same features (the dependency graph moved under
-  upstream's code).
+  upstream's code), unless tools/linux/dependency-moves.txt moves that crate
+  to wick's version for a security advisory (an entry that matches no unit
+  fails too).
 
 Prints a table per package, the problems found, and writes the same as
 Markdown to --summary (e.g. $GITHUB_STEP_SUMMARY).
@@ -82,26 +84,53 @@ def compiled_units(build_json):
     return units
 
 
-def compare_builds(up_out, wk_out, problems):
+def dependency_moves():
+    """(crate, upstream version) -> (wick version, advisory), from
+    dependency-moves.txt."""
+    path = Path(__file__).with_name("dependency-moves.txt")
+    moves = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        crate, frm, to, advisory = line.split()
+        moves[(crate, frm)] = (to, advisory)
+    return moves
+
+
+def compare_builds(up_out, wk_out, problems, notes):
     """Every crate upstream compiles, wick compiles with the same features.
 
     The compatibility crates add a unit of the same name (the wrapper) next to
-    the original crate; a match with either is enough. Returns the number of
-    upstream units checked."""
+    the original crate; a match with either is enough. A crate moved for an
+    advisory (dependency-moves.txt) matches at wick's version. Returns the
+    number of upstream units checked."""
     checked = 0
+    moves = dependency_moves()
+    used = set()
     for run in RUNS:
         up = compiled_units(up_out / f"{run}.build.json")
         wk = compiled_units(wk_out / f"{run}.build.json")
         for key, feature_sets in sorted(up.items()):
             checked += 1
+            moved = moves.get((key[0], key[1]))
+            wkey = (key[0], moved[0], *key[2:]) if moved else key
             for features in feature_sets:
+                if moved and features in wk.get(wkey, set()):
+                    used.add((key[0], key[1]))
+                    continue
                 if features not in wk.get(key, set()):
-                    have = sorted(sorted(f) for f in wk.get(key, set()))
+                    have = sorted(sorted(f) for f in wk.get(wkey, set()) | wk.get(key, set()))
                     problems.append(
                         f"build ({run}): {key[0]} {key[1]} {key[2]}:{key[3]}"
                         f"{' (test)' if key[4] else ''} has features {sorted(features)} "
                         f"on upstream, {have or 'is not built'} on wick"
                     )
+    for (crate, frm), (to, advisory) in sorted(moves.items()):
+        if (crate, frm) in used:
+            notes.append(f"build: {crate} {frm} is {to} on wick ({advisory}, dependency-moves.txt)")
+        else:
+            problems.append(f"dependency-moves.txt: {crate} {frm} -> {to} ({advisory}) matches no unit")
     return checked
 
 
@@ -364,7 +393,7 @@ def main():
 
     explain(up_codes, up, "upstream")
     explain(wk_codes, wk, "wick")
-    units = compare_builds(args.upstream, args.wick, problems)
+    units = compare_builds(args.upstream, args.wick, problems, notes)
     if not up_names:
         problems.append("no upstream tests were found in the logs")
 

@@ -1,0 +1,13 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Crates wick's lockfile (patch 0014) moves to another version than
+# upstream's Cargo.lock has, each for a security advisory, as
+# CONTRIBUTING.md ("Dependencies") requires: an advisory is fixed by moving
+# to a fixed version, not by ignoring it. tools/linux/compare-unit-tests.py
+# then matches upstream's unit of <crate> <from> with wick's of <crate> <to>
+# (same target, same features), and fails when an entry matches no unit.
+#
+# Format: <crate> <upstream version> <wick version> <advisory>
+
+rustix 1.1.4 1.1.6 RUSTSEC-2026-0486
