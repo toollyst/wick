@@ -494,6 +494,10 @@ mod macos {
             -1 => Err(ApiProcessError::Fork(std::io::Error::last_os_error())),
             0 => {
                 drop(ours);
+                // As upstream's API thread, the API process opens no
+                // network interface: it keeps no way into the jail's network.
+                // SAFETY: the child of a fork made with one thread.
+                unsafe { crate::ext::jail::close_netns_in_child() };
                 // The server's epoll is a kqueue here, which a fork does not
                 // inherit.
                 let result = server

@@ -28,6 +28,7 @@ FUZZ_DIR="$WICK_ROOT/fuzz"
 host_targets() {
     echo vnet_segment
     echo vnet_offload
+    echo hvf_exit
     echo whp_irqchip
     if [[ "$(uname -s)" == Darwin ]]; then
         echo uffd_protocol
@@ -40,6 +41,8 @@ target_args() {
     # A virtio-net header and a frame of up to the device's 65550 bytes.
     vnet_segment) echo "-max_len=65560 -dict=$FUZZ_DIR/vnet_segment.dict" ;;
     vnet_offload) echo "-max_len=4096" ;;
+    # A sequence of vCPU exits, about 40 bytes each.
+    hvf_exit) echo "-max_len=4096" ;;
     # Each run creates and releases a userfaultfd (a thread and a socket pair).
     uffd_protocol) echo "-max_len=4096" ;;
     # Up to 256 guest accesses, line changes, routes and snapshots.

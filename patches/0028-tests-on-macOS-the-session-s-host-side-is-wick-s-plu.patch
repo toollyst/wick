@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Wed, 11 Nov 2026 18:20:38 +0900
+Subject: [PATCH] tests: on macOS the session's host side is wick's plugin
+
+Upstream's conftest checks that the session runs as root and makes itself a
+child subreaper through glibc's prctl. On macOS the session runs through
+tools/macos/integration-tests.sh, whose pytest plugin (wick_macos, loaded
+before conftest) decides whether the session must be root (its jailer mode)
+and waits for processes that are not its children with kqueue, as macOS has
+no subreaper. Without the plugin on macOS the session refuses to start.
+Linux is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/conftest.py | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 4bed2a7da81e0832a40445e900f647a076d62736..13ac5a569534f48fb5cbe57ad22353dbc65e79d3 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -53,8 +53,16 @@ if sys.version_info < (3, 10):
+     raise SystemError("This codebase requires Python 3.10 or above.")
+ 
+ 
++# wick: on macOS the session runs through tools/macos/integration-tests.sh,
++# whose plugin (tools/macos/integration/wick_macos.py, loaded before this
++# file) supplies the host side: it decides whether the session must be root
++# (with the jailer) and waits for processes that are not its children.
++_wick_host = sys.modules.get("wick_macos") if sys.platform == "darwin" else None
++if sys.platform == "darwin" and _wick_host is None:
++    raise SystemError("On macOS, run the tests with tools/macos/integration-tests.sh.")
++
+ # Some tests create system-level resources; ensure we run as root.
+-if os.geteuid() != 0:
++if os.geteuid() != 0 and not (_wick_host and _wick_host.RUNS_AS_USER):
+     raise PermissionError("Test session needs to be run as root.")
+ 
+ 
+@@ -63,8 +71,9 @@ if os.geteuid() != 0:
+ # waitpid() on the firecracker PID directly, avoiding the pidfd notification
+ # race for multi-threaded processes on kernels older than 6.15.
+ _PR_SET_CHILD_SUBREAPER = 36
+-_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+-if _libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
++# wick: macOS has no subreaper; the plugin waits for any pid with kqueue.
++_libc = ctypes.CDLL("libc.so.6", use_errno=True) if _wick_host is None else None
++if _libc and _libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+     raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER) failed")
+ 
+ 

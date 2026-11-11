@@ -27,7 +27,8 @@
 //!   other VMs; `vmnet-br-<if>`: bridged to host interface `<if>`), or a Unix
 //!   datagram endpoint that a host-side switch exchanges plain Ethernet
 //!   frames with (a name without `/` lives in the per-user directory
-//!   `$(getconf DARWIN_USER_TEMP_DIR)/firecracker-net/`, a name with `/` is
+//!   `$(getconf DARWIN_USER_TEMP_DIR)/firecracker-net/`, in a jail given a
+//!   network with `--netns` that network's directory; a name with `/` is
 //!   the path itself). The host side attaches by sending a datagram to the
 //!   endpoint (an empty one only attaches) and receives every frame the guest
 //!   sends. The virtio-net header is handled by [`super::vnet`].

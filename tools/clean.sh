@@ -14,7 +14,8 @@
 # - test processes left running by a killed test run (Firecracker, the jailer,
 #   the vhost-user and uffd test backends whose test runner is gone);
 # - temporary directories of test runs no process uses any more
-#   (/tmp/wick-bt-*, /private/tmp/wick-jt-*, the jails inside; root-owned ones
+#   (/tmp/wick-bt-*, /private/tmp/wick-jt-*, the integration tests' /tmp/wit-*,
+#   the jails inside; root-owned ones
 #   need root, and are reported otherwise).
 # --all also removes the build output: cargo's target directories, the
 #   development container's cache, dist/, and every test run.
@@ -52,6 +53,7 @@ allowed() {
         "$UPSTREAM_DIR"/build/cargo_target|"$UPSTREAM_DIR"/build/vhost-user-blk) return 0 ;;
         "$UPSTREAM_DIR"/build/devctr-cache) return 0 ;;
         /tmp/wick-bt-*|/private/tmp/wick-bt-*|/tmp/wick-jt-*|/private/tmp/wick-jt-*) return 0 ;;
+        /tmp/wit-*|/private/tmp/wit-*) return 0 ;;
         "$linux_workdir"/results-*) return 0 ;;
     esac
     return 1
@@ -111,7 +113,7 @@ clean_runs() {
 # Processes a test run started whose test runner is gone (parent pid 1).
 stray_processes() {
     ps -eo pid=,ppid=,args= | awk -v root="$WICK_ROOT" '
-        $2 == 1 && ($0 ~ /\/tmp\/wick-(bt|jt)-/ || index($0, root "/build/boot-test/") || index($0, root "/build/jailer-test/")) {
+        $2 == 1 && ($0 ~ /\/tmp\/wick-(bt|jt)-/ || $0 ~ /\/tmp\/wit-/ || index($0, root "/build/boot-test/") || index($0, root "/build/jailer-test/")) {
             print $1 " " substr($0, index($0, $3))
         }'
 }
@@ -134,7 +136,7 @@ clean_processes() {
 # Temporary directories of test runs no running process names.
 clean_temp() {
     local d
-    for d in /tmp/wick-bt-* /private/tmp/wick-bt-* /tmp/wick-jt-* /private/tmp/wick-jt-*; do
+    for d in /tmp/wick-bt-* /private/tmp/wick-bt-* /tmp/wick-jt-* /private/tmp/wick-jt-* /tmp/wit-* /private/tmp/wit-*; do
         [[ -d "$d" && ! -L "$d" ]] || continue
         # /tmp is /private/tmp on macOS: each directory once.
         [[ "$d" == /tmp/* && -d "/private$d" && "$(uname)" == Darwin ]] && continue

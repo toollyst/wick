@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+"""`ip netns exec <ns> ssh|scp ...` for upstream's framework on macOS.
+
+On Linux the framework reaches a guest from inside its network namespace.
+A macOS network (tools/macos/integration/wick_macos_net.py) is a directory
+of endpoints with a host side: ssh and scp reach the guest through the host
+side's forward to its port 22 (ProxyCommand). Anything else refuses loudly,
+as no host program can run inside such a network (docs/PORTING.md row 6).
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+# The session's root, as wick_macos reads it, without importing pytest's side.
+ROOT = os.environ.get("WICK_IT_ROOT")
+
+
+def fail(msg):
+    print(f"ip (wick, macOS): {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def destination(argv):
+    """The host of an ssh or scp command line, with its port (22 or -p/-P)."""
+    hosts, port = [], "22"
+    takes_value = set("BbcDEeFIiJLlmOoPpQRSWw")
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("-") and len(a) >= 2:
+            flag = a[1]
+            if flag in takes_value and len(a) == 2:
+                if flag in "pP":
+                    port = argv[i + 1]
+                i += 2
+                continue
+            if flag in "pP" and len(a) > 2:
+                port = a[2:]
+            i += 1
+            continue
+        hosts.append(a)
+        if argv[0] == "ssh":
+            break  # the rest is the remote command
+        i += 1
+    for h in hosts:
+        h = h.split("@", 1)[-1]
+        if argv[0] == "scp":
+            if ":" not in h:
+                continue
+            h = h.split(":", 1)[0]
+        return h, port
+    return None, port
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:2] != ["netns", "exec"] or len(args) < 4:
+        fail(f"`ip {' '.join(args)}`: macOS has no ip(8); only `ip netns exec <ns> ssh|scp ...` is provided")
+    ns, cmd = args[2], args[3:]
+    if not ROOT:
+        fail("WICK_IT_ROOT is not set: run tools/macos/integration-tests.sh")
+    control = os.path.join(ROOT, "netns", f"{ns}.ctl")
+    if os.path.basename(cmd[0]) not in ("ssh", "scp"):
+        fail(
+            f"{' '.join(cmd)!r} in network namespace {ns}: a macOS network is a directory of "
+            "endpoints, a host program cannot run inside it (docs/PORTING.md row 6)"
+        )
+    cmd[0] = os.path.basename(cmd[0])
+    host, port = destination(cmd)
+    if host is None:
+        # ssh -O check|stop: the control master, no new connection.
+        os.execvp(cmd[0], cmd)
+    from wick_macos_net import request  # pylint: disable=import-outside-toplevel
+
+    err, fwd = request(control, f"fwd {host} {port}")
+    if err:
+        fail(f"no route to {host}:{port} in network namespace {ns}: {os.strerror(err)}")
+    # nc's stderr is not ssh's: the framework waits for ssh's output to
+    # close, and the control master ssh leaves running keeps its proxy.
+    os.execvp(cmd[0], [cmd[0], "-o", f"ProxyCommand=/usr/bin/nc -U {fwd} 2>/dev/null", *cmd[1:]])
+
+
+main()

@@ -4,6 +4,13 @@
 //! [`TapDevice`] on macOS: a vmnet.framework interface or a Unix datagram
 //! endpoint (see [`crate::platform::net`] for the names), carrying plain
 //! Ethernet frames; the virtio-net header is handled by [`vnet`].
+//!
+//! In a jail given a network (`--netns`, [`crate::ext::jail::netns`]),
+//! endpoints named without `/` are made in the network's directory, which
+//! the chroot hides: the jail reaches it through the descriptor it opened
+//! before the chroot ([`crate::ext::jail::netns_dir`]), by making it the
+//! working directory of the calling thread alone for each call that names
+//! a path ([`in_dir`]). vmnet, the host's own network, is not the jail's.
 
 use std::ffi::{CStr, OsStr};
 use std::fmt;
@@ -12,6 +19,7 @@ use std::mem;
 use std::os::raw::{c_int, c_uint};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::fd::BorrowedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -32,8 +40,45 @@ const RCVBUF: c_int = 4 << 20;
 /// Most interfaces a `%d` name is tried with.
 const MAX_UNITS: u32 = 1 << 15;
 
-/// The directory of endpoints named without `/`.
+unsafe extern "C" {
+    /// Sets the calling thread's working directory to `fd`, or back to the
+    /// process's with -1 (libsystem_pthread; fts uses it).
+    fn pthread_fchdir_np(fd: c_int) -> c_int;
+}
+
+/// Runs `f`, which names paths, with relative paths resolved in `dir` (the
+/// jail's network) on this thread only; without `dir`, as the process
+/// resolves them.
+fn in_dir<T>(dir: Option<BorrowedFd<'_>>, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let Some(dir) = dir else {
+        return f();
+    };
+    // SAFETY: a directory descriptor; changes this thread's working directory.
+    if unsafe { pthread_fchdir_np(dir.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = f();
+    // SAFETY: -1 returns this thread to the process's working directory.
+    let back = unsafe { pthread_fchdir_np(-1) };
+    // Failing to would leave every relative path of this thread resolved in
+    // the network: not survivable.
+    assert_eq!(back, 0, "cannot leave the network directory: {}", io::Error::last_os_error());
+    result
+}
+
+/// Where endpoints named without `/` are made: the jail's network, as its
+/// path outside the jail and the descriptor that reaches it.
+fn network() -> Option<(&'static Path, BorrowedFd<'static>)> {
+    Some((crate::ext::jail::netns()?, crate::ext::jail::netns_dir()?))
+}
+
+/// The directory of endpoints named without `/`: the jail's network (by its
+/// path outside the jail), or `firecracker-net` in the user's temporary
+/// directory.
 pub fn endpoint_dir() -> io::Result<PathBuf> {
+    if let Some((path, _)) = network() {
+        return Ok(path.to_owned());
+    }
     let mut buf = vec![0u8; usize::try_from(libc::PATH_MAX).unwrap()];
     // SAFETY: confstr into a buffer of the given size.
     let len = unsafe { libc::confstr(CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr().cast(), buf.len()) };
@@ -151,7 +196,13 @@ impl Peer {
 /// A Unix datagram endpoint.
 struct Endpoint {
     sock: OwnedFd,
+    /// Its path: relative to `dir` when it is in the jail's network.
     path: PathBuf,
+    /// The jail's network, where relative paths resolve ([`in_dir`]).
+    dir: Option<BorrowedFd<'static>>,
+    /// The network's path outside the jail: a peer that names itself by it
+    /// is reached relative to `dir`.
+    dir_path: Option<PathBuf>,
     /// Device and inode of the socket file, to unlink only our own.
     id: (u64, u64),
     /// Where frames from the guest go: every host-side socket that sent a
@@ -169,20 +220,35 @@ impl fmt::Debug for Endpoint {
 }
 
 impl Endpoint {
-    fn open(path: &Path) -> io::Result<Self> {
+    /// Binds an endpoint at `path`, relative to the network `dir` (with its
+    /// path outside the jail) if given.
+    fn open(path: &Path, dir: Option<(&Path, BorrowedFd<'static>)>) -> io::Result<Self> {
         let sock = dgram_socket()?;
-        bind(&sock, path)?;
-        let meta = std::fs::metadata(path)?;
+        let fd = dir.map(|(_, fd)| fd);
+        let meta = in_dir(fd, || {
+            bind(&sock, path)?;
+            std::fs::metadata(path)
+        })?;
         Ok(Endpoint {
             sock,
             path: path.to_owned(),
+            dir: fd,
+            dir_path: dir.map(|(p, _)| p.to_owned()),
             id: (meta.dev(), meta.ino()),
             peers: Vec::new(),
         })
     }
 
     fn note_peer(&mut self, addr: libc::sockaddr_un, len: libc::socklen_t) {
-        let peer = Peer(addr, len);
+        let mut peer = Peer(addr, len);
+        // A peer in the network naming itself by its path outside the jail
+        // is reached by its name in the network's directory.
+        if let Some(dir) = &self.dir_path
+            && let Ok(rel) = Path::new(OsStr::from_bytes(peer.path())).strip_prefix(dir)
+            && let Ok((addr, len)) = sockaddr(rel)
+        {
+            peer = Peer(addr, len);
+        }
         if !peer.path().is_empty() && !self.peers.iter().any(|p| p.path() == peer.path()) {
             self.peers.push(peer);
         }
@@ -255,7 +321,16 @@ impl Endpoint {
         }
         let fd = self.sock.as_raw_fd();
         let mut result = Ok(());
-        self.peers.retain(|peer| {
+        let peers = &mut self.peers;
+        in_dir(self.dir, || {
+            Self::send_to_peers(fd, peers, frame, &mut result);
+            Ok(())
+        })?;
+        result
+    }
+
+    fn send_to_peers(fd: RawFd, peers: &mut Vec<Peer>, frame: &[u8], result: &mut io::Result<()>) {
+        peers.retain(|peer| {
             // SAFETY: sendto with a valid buffer and address.
             let ret = unsafe {
                 libc::sendto(
@@ -275,23 +350,25 @@ impl Endpoint {
                 Some(libc::ECONNREFUSED | libc::ENOENT) => false,
                 _ => {
                     if result.is_ok() {
-                        result = Err(err);
+                        *result = Err(err);
                     }
                     true
                 }
             }
         });
-        result
     }
 }
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        if let Ok(meta) = std::fs::symlink_metadata(&self.path)
-            && (meta.dev(), meta.ino()) == self.id
-        {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        let _ = in_dir(self.dir, || {
+            if let Ok(meta) = std::fs::symlink_metadata(&self.path)
+                && (meta.dev(), meta.ino()) == self.id
+            {
+                std::fs::remove_file(&self.path)?;
+            }
+            Ok(())
+        });
     }
 }
 
@@ -348,12 +425,25 @@ enum Target {
     /// An endpoint path; `%d` in its last component is a unit number.
     Endpoint {
         dir: Option<PathBuf>,
+        /// The jail's network, which `dir` is (reached by this descriptor).
+        network: Option<BorrowedFd<'static>>,
         name: String,
     },
 }
 
 fn parse_name(if_name: &str) -> Result<Target, TapError> {
     let invalid = || TapError::InvalidIfname;
+    if if_name.starts_with("vmnet-") && network().is_some() {
+        // vmnet is the host's network, as a host interface is outside a
+        // network namespace on Linux.
+        return Err(TapError::IfreqExecuteError(
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "vmnet is the host's network, not the jail's (--netns)",
+            ),
+            if_name.to_owned(),
+        ));
+    }
     match if_name {
         "vmnet-shared" => return Ok(Target::Vmnet(Mode::Shared)),
         "vmnet-host" => return Ok(Target::Vmnet(Mode::Host)),
@@ -372,6 +462,7 @@ fn parse_name(if_name: &str) -> Result<Target, TapError> {
     if if_name.contains('/') {
         return Ok(Target::Endpoint {
             dir: None,
+            network: None,
             name: if_name.to_owned(),
         });
     }
@@ -387,17 +478,22 @@ fn parse_name(if_name: &str) -> Result<Target, TapError> {
     let dir = endpoint_dir().map_err(TapError::OpenTun)?;
     Ok(Target::Endpoint {
         dir: Some(dir),
+        network: network().map(|(_, fd)| fd),
         name: name.to_owned(),
     })
 }
 
-fn open_endpoint(dir: Option<&Path>, name: &str) -> Result<(String, Endpoint), TapError> {
-    let open = |name: &str| {
-        let path = match dir {
-            Some(dir) => dir.join(name),
-            None => PathBuf::from(name),
-        };
-        Endpoint::open(&path)
+/// Opens the endpoint `name` in `dir` (`None`: `name` is the path), which
+/// is the network reached by `network` if given.
+fn open_endpoint(
+    dir: Option<&Path>,
+    network: Option<BorrowedFd<'static>>,
+    name: &str,
+) -> Result<(String, Endpoint), TapError> {
+    let open = |name: &str| match (dir, network) {
+        (Some(dir), Some(fd)) => Endpoint::open(Path::new(name), Some((dir, fd))),
+        (Some(dir), None) => Endpoint::open(&dir.join(name), None),
+        (None, _) => Endpoint::open(Path::new(name), None),
     };
     let failed = |err: io::Error, name: &str| match err.raw_os_error() {
         Some(libc::ENAMETOOLONG) => TapError::InvalidIfname,
@@ -434,14 +530,18 @@ impl Tap {
                     .map_err(|err| TapError::Backend(err, if_name.to_owned()))?;
                 (if_name.to_owned(), Backend::Vmnet(iface))
             }
-            Target::Endpoint { dir, name } => {
-                let (name, ep) = open_endpoint(dir.as_deref(), &name)?;
+            Target::Endpoint { dir, network, name } => {
+                let (name, ep) = open_endpoint(dir.as_deref(), network, &name)?;
                 (name, Backend::Endpoint(ep))
             }
         };
         let index = NEXT_INDEX.fetch_add(1, Ordering::Relaxed);
         if let Backend::Endpoint(ep) = &backend {
-            INDEXES.lock().unwrap().push((index, ep.path.clone()));
+            let path = match &ep.dir_path {
+                Some(dir) => dir.join(&ep.path),
+                None => ep.path.clone(),
+            };
+            INDEXES.lock().unwrap().push((index, path));
         }
         Ok(Tap {
             name,
@@ -733,6 +833,45 @@ mod tests {
         let tap = Tap::open_named("fcstale").unwrap();
         drop(tap);
         assert!(!path.exists());
+    }
+
+    // An endpoint in a jail's network: made, reached and removed in the
+    // network's directory through its descriptor, whatever the process's
+    // working directory (in the jail, the chroot hides the directory).
+    #[test]
+    fn test_endpoint_in_network_directory() {
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixDatagram;
+
+        let net = endpoint_dir().unwrap().join(format!("net-{}", std::process::id()));
+        std::fs::create_dir_all(&net).unwrap();
+        let dir: &'static OwnedFd = Box::leak(Box::new(OwnedFd::from(std::fs::File::open(&net).unwrap())));
+        let mut ep = Endpoint::open(Path::new("tap0"), Some((&net, dir.as_fd()))).unwrap();
+        assert!(net.join("tap0").exists());
+        // Relative to the network, not to the process's working directory.
+        assert!(!Path::new("tap0").exists());
+        // A peer naming itself by its path outside the jail, and one by its
+        // name in the network.
+        let outer = UnixDatagram::bind(net.join("outer")).unwrap();
+        outer.send_to(b"", net.join("tap0")).unwrap();
+        let inner_path = net.join("inner");
+        let inner = UnixDatagram::bind(&inner_path).unwrap();
+        inner.send_to(b"", net.join("tap0")).unwrap();
+        ep.learn_peers().unwrap();
+        let names: Vec<_> = ep.peers.iter().map(|p| p.path().to_vec()).collect();
+        assert_eq!(names, [b"outer".to_vec(), b"inner".to_vec()]);
+        ep.send(&frame(60)).unwrap();
+        let mut buf = [0u8; 100];
+        assert_eq!(outer.recv(&mut buf).unwrap(), 60);
+        assert_eq!(inner.recv(&mut buf).unwrap(), 60);
+        // This thread resolves relative paths as the process does again.
+        std::fs::metadata("tap0").unwrap_err();
+        // A second endpoint of the name is busy, as a TAP opened twice.
+        let busy = Endpoint::open(Path::new("tap0"), Some((&net, dir.as_fd()))).unwrap_err();
+        assert_eq!(busy.raw_os_error(), Some(libc::EBUSY));
+        drop(ep);
+        assert!(!net.join("tap0").exists());
+        std::fs::remove_dir_all(&net).unwrap();
     }
 
     #[test]

@@ -1,0 +1,449 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+"""The macOS host side of upstream's integration test framework.
+
+A pytest plugin, loaded by tools/macos/integration-tests.sh (`-p wick_macos`)
+before upstream's conftest.py. Upstream's framework drives Firecracker the
+same way on every host; what it does on the Linux host itself (KVM's device
+file, `/proc`, `/etc/os-release`, the child subreaper, the commands' GNU
+options) is supplied here for macOS, so that upstream's tests run unchanged.
+
+Two modes (WICK_IT_MODE):
+
+- `jailer`: as root, with wick's jailer, as upstream's CI runs the suite.
+- `user`: as the user who runs it, without the jailer (tools/macos/integration/
+  jailer, a stand-in that starts Firecracker as the jailer's process tree
+  does, with the jail's directory as its root for every path). It shows what
+  Firecracker does on macOS without root; what only the jailer does (chroot,
+  uid, cgroups, the jailer's own arguments) is checked by the `jailer` mode.
+
+Every substitution here says what it stands for on Linux.
+"""
+
+import contextlib
+import ctypes
+import errno
+import fcntl
+import json
+import os
+import pathlib
+import platform
+import re
+import select
+import subprocess
+import sys
+import time
+from collections import defaultdict
+
+MODE = os.environ.get("WICK_IT_MODE", "user")
+if MODE not in ("user", "jailer"):
+    raise SystemError(f"WICK_IT_MODE={MODE}: must be user or jailer")
+# Read by upstream's conftest.py (patched): the session does not need root.
+RUNS_AS_USER = MODE == "user"
+SESSION_ROOT = os.environ.get("WICK_IT_ROOT")
+if sys.platform != "darwin" or not SESSION_ROOT:
+    raise SystemError("wick_macos: run through tools/macos/integration-tests.sh on macOS")
+if MODE == "jailer" and os.geteuid() != 0:
+    raise PermissionError("WICK_IT_MODE=jailer runs as root, as upstream's suite does")
+
+# ------------------------------------------------------------------ the host
+
+# Linux calls this architecture aarch64, and upstream's framework names its
+# artifacts, parameters and checks after that name.
+_machine = platform.machine
+platform.machine = lambda: "aarch64" if _machine() == "arm64" else _machine()
+
+
+def _sysctl(name):
+    return subprocess.check_output(["/usr/sbin/sysctl", "-n", name], text=True).strip()
+
+
+def hvf_available():
+    """Whether this host runs Hypervisor.framework guests (Linux: /dev/kvm)."""
+    try:
+        return _sysctl("kern.hv_support") == "1"
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+# The test session root (upstream: /srv, a tmpfs devtool makes). Unix socket
+# paths are limited to 104 bytes on macOS, and the jail's API socket sits five
+# levels below this directory, so it is short (tools/macos/integration-tests.sh).
+import framework.defs as _defs  # noqa: E402  pylint: disable=wrong-import-position
+
+_defs.DEFAULT_TEST_SESSION_ROOT_PATH = SESSION_ROOT
+
+import framework.utils as _utils  # noqa: E402  pylint: disable=wrong-import-position
+import framework.utils_cpuid as _cpuid  # noqa: E402  pylint: disable=wrong-import-position
+
+
+def _cpu_model():
+    # Linux: the MIDR part number from /proc/cpuinfo, named by upstream's
+    # table of the Neoverse cores it knows. Apple's cores are not in it.
+    return "Unknown"
+
+
+_cpuid.get_cpu_vendor = lambda: _cpuid.CpuVendor.ARM
+_cpuid.get_cpu_model_name = _cpu_model
+_cpuid.get_cpu_codename = lambda default="Unknown": _cpu_model()
+
+
+@contextlib.contextmanager
+def _os_release():
+    """`/etc/os-release` as macOS's own, while framework.properties reads it."""
+    name = f'PRETTY_NAME="macOS {platform.mac_ver()[0]}"\n'
+    real = pathlib.Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        if str(self) == "/etc/os-release":
+            return name
+        return real(self, *args, **kwargs)
+
+    pathlib.Path.read_text = read_text
+    try:
+        yield
+    finally:
+        pathlib.Path.read_text = real
+
+
+with _os_release():
+    import framework.properties  # noqa: E402,F401  pylint: disable=wrong-import-position,unused-import
+
+
+def wait_process_termination(p_pid, timeout=10.0):
+    """`utils.wait_process_termination` without a subreaper.
+
+    Linux: the session is the subreaper of every process the jailer leaves
+    behind and waits for them with waitpid. On macOS they go to launchd, so
+    the wait is kqueue's NOTE_EXIT, which works for any process the session
+    may signal; a child of the session is reaped as well.
+    """
+    deadline = time.time() + timeout
+    kq = select.kqueue()
+    try:
+        ev = select.kevent(p_pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                           select.KQ_NOTE_EXIT)
+        try:
+            kq.control([ev], 0, 0)
+        except ProcessLookupError:
+            _reap(p_pid)
+            return
+        while True:
+            # A child that exited earlier is a zombie: no NOTE_EXIT any more.
+            if _reap(p_pid):
+                return
+            left = deadline - time.time()
+            if left <= 0:
+                raise TimeoutError(f"Process {p_pid} did not exit within {timeout}s")
+            if kq.control(None, 1, min(left, 0.2)):
+                _reap(p_pid)
+                return
+    finally:
+        kq.close()
+
+
+def _reap(pid):
+    """True if `pid` is a child of the session that has exited (and is reaped now)."""
+    try:
+        done, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return False
+    return done == pid
+
+
+_utils.wait_process_termination = wait_process_termination
+
+_libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+PROC_PIDLISTTHREADIDS = 28
+PROC_PIDTHREADID64INFO = 15
+
+
+def get_threads(pid):
+    """{thread name: [thread id]} of `pid` (upstream: psutil's threads, which
+    on macOS needs the process's task port, and each thread's name from
+    /proc). proc_pidinfo lists a process's threads and names to its user."""
+    ids = (ctypes.c_uint64 * 1024)()
+    n = _libsystem.proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, ctypes.c_uint64(0), ids, ctypes.sizeof(ids))
+    if n <= 0:
+        return {}
+    threads = defaultdict(list)
+    info = ctypes.create_string_buffer(112)  # struct proc_threadinfo
+    for tid in ids[: n // 8]:
+        if _libsystem.proc_pidinfo(pid, PROC_PIDTHREADID64INFO, ctypes.c_uint64(tid), info, 112) <= 0:
+            continue
+        name = info.raw[48:112].split(b"\0", 1)[0].decode(errors="replace")
+        threads[name].append(tid)
+    return dict(threads)
+
+
+_utils.get_threads = get_threads
+
+# ------------------------------------------------------- process memory
+
+_libsystem._dyld_get_shared_cache_range.restype = ctypes.c_void_p
+_libsystem._dyld_get_shared_cache_range.argtypes = [ctypes.POINTER(ctypes.c_size_t)]
+PROC_PIDREGIONPATHINFO = 8
+
+
+class _RegionInfo(ctypes.Structure):
+    """<sys/proc_info.h> struct proc_regioninfo."""
+
+    _fields_ = [
+        ("protection", ctypes.c_uint32), ("max_protection", ctypes.c_uint32),
+        ("inheritance", ctypes.c_uint32), ("flags", ctypes.c_uint32),
+        ("offset", ctypes.c_uint64), ("behavior", ctypes.c_uint32),
+        ("user_wired_count", ctypes.c_uint32), ("user_tag", ctypes.c_uint32),
+        ("pages_resident", ctypes.c_uint32), ("pages_shared_now_private", ctypes.c_uint32),
+        ("pages_swapped_out", ctypes.c_uint32), ("pages_dirtied", ctypes.c_uint32),
+        ("ref_count", ctypes.c_uint32), ("shadow_depth", ctypes.c_uint32),
+        ("share_mode", ctypes.c_uint32), ("private_pages_resident", ctypes.c_uint32),
+        ("shared_pages_resident", ctypes.c_uint32), ("obj_id", ctypes.c_uint32),
+        ("depth", ctypes.c_uint32), ("address", ctypes.c_uint64), ("size", ctypes.c_uint64),
+    ]
+
+
+class _RegionPathInfo(ctypes.Structure):
+    """<sys/proc_info.h> struct proc_regionwithpathinfo."""
+
+    _fields_ = [("info", _RegionInfo), ("vnode_info", ctypes.c_char * 152),
+                ("path", ctypes.c_char * 1024)]
+
+
+class _MemoryMap:
+    """What psutil's memory_maps(grouped=False) gives on Linux, for one mapping."""
+
+    def __init__(self, path, addr, size, rss):
+        self.path, self.addr, self.size, self.rss = path, addr, size, rss
+
+
+def _shared_cache():
+    length = ctypes.c_size_t()
+    base = _libsystem._dyld_get_shared_cache_range(ctypes.byref(length))
+    return (base or 0), (base or 0) + length.value
+
+
+def memory_maps(self, grouped=True):
+    """psutil's `Process.memory_maps` on macOS (psutil has it on Linux only).
+
+    Linux: /proc/<pid>/smaps, one entry per mapping with its resident size.
+    macOS: the process's regions from proc_pidinfo(PROC_PIDREGIONPATHINFO).
+    The dyld shared cache is left out: every process on macOS maps the
+    system libraries from it and shares their pages (upstream's Firecracker is
+    a static binary on Linux, so it has no such mapping). XNU splits a large
+    mapping of memory into regions of at most 128 MiB (ANON_CHUNK_SIZE);
+    adjacent regions alike in everything but their object are one mapping
+    here, as Linux merges such areas into one.
+    """
+    if grouped:
+        raise NotImplementedError("grouped memory maps")
+    page = os.sysconf("SC_PAGE_SIZE")
+    lo, hi = _shared_cache()
+    maps, addr, last = [], 0, None
+    while True:
+        info = _RegionPathInfo()
+        n = _libsystem.proc_pidinfo(self.pid, PROC_PIDREGIONPATHINFO, ctypes.c_uint64(addr),
+                                    ctypes.byref(info), ctypes.sizeof(info))
+        if n <= 0:
+            err = ctypes.get_errno()
+            if err == errno.ESRCH:
+                raise psutil.NoSuchProcess(self.pid)
+            break
+        r = info.info
+        addr = r.address + r.size
+        if lo <= r.address < hi:
+            continue
+        path = info.path.decode(errors="replace")
+        kind = (r.protection, r.max_protection, r.share_mode, r.user_tag, path)
+        if last and last[0] == kind and maps[-1].addr + maps[-1].size == r.address:
+            maps[-1].size += r.size
+            maps[-1].rss += r.pages_resident * page
+            continue
+        maps.append(_MemoryMap(path, r.address, r.size, r.pages_resident * page))
+        last = (kind,)
+    if not maps and not psutil.pid_exists(self.pid):
+        raise psutil.NoSuchProcess(self.pid)
+    return maps
+
+
+import psutil  # noqa: E402  pylint: disable=wrong-import-position
+
+psutil.Process.memory_maps = memory_maps
+
+
+def prlimit(pid, which, limits=None):
+    """`resource.prlimit` (Linux only): macOS has no interface to read or
+    set another process's resource limits; a process sets only its own."""
+    raise OSError(errno.ENOSYS, f"prlimit({pid}, {which}, {limits}): macOS has no prlimit; "
+                  "only a process itself reads or sets its resource limits")
+
+
+import resource  # noqa: E402  pylint: disable=wrong-import-position
+
+if not hasattr(resource, "prlimit"):
+    resource.prlimit = prlimit
+
+import framework.kvm as _kvm  # noqa: E402  pylint: disable=wrong-import-position
+
+# The "kvm" backend of upstream's framework is Firecracker's KVM API, which
+# wick provides on Hypervisor.framework (crates/compat/kvm-ioctls).
+_kvm.has_kvm = hvf_available
+_kvm.kvm_probe_details = lambda: {"hypervisor": "Hypervisor.framework", "kern.hv_support": hvf_available()}
+
+import framework.jailer as _jailer  # noqa: E402  pylint: disable=wrong-import-position
+import framework.microvm as _microvm  # noqa: E402  pylint: disable=wrong-import-position
+import framework.http_api as _http_api  # noqa: E402  pylint: disable=wrong-import-position
+import host_tools.network as _network  # noqa: E402  pylint: disable=wrong-import-position
+
+from wick_macos_net import NetNs, Tap  # noqa: E402  pylint: disable=wrong-import-position
+
+# Linux: `ip netns`, a network namespace with TAP devices in it. macOS:
+# a network, a directory of endpoints (tools/macos/integration/wick_macos_net.py).
+_network.NetNs = NetNs
+_network.Tap = Tap
+
+# ------------------------------------------------------------ user mode
+
+
+if RUNS_AS_USER:
+    _real_jailed_path = _jailer.JailerContext.jailed_path
+
+    def jailed_path(self, file_path, create=False, subdir="."):
+        """`JailerContext.jailed_path` without the chown to the jail's user.
+
+        The user who runs the session is the jail's user here; everything
+        else is upstream's.
+        """
+        real_chown = os.chown
+        os.chown = lambda path, uid, gid: None
+        try:
+            return _real_jailed_path(self, file_path, create, subdir)
+        finally:
+            os.chown = real_chown
+
+    _jailer.JailerContext.jailed_path = jailed_path
+
+    # Paths in API requests are the jail's: absolute ones start at the jail's
+    # root, as Firecracker sees them after chroot. Without a chroot they are
+    # put below the jail's directory on the way in, and taken off again in
+    # what Firecracker sends back (configurations, error messages).
+    PATH_FIELDS = {
+        "kernel_image_path", "initrd_path", "path_on_host", "socket", "uds_path",
+        "log_path", "metrics_path", "snapshot_path", "mem_file_path", "backend_path",
+        "serial_out_path",
+    }
+
+    def _chroot_of(api):
+        m = re.match(r"^(.*/jailer/[^/]+/[^/]+/root)/", api.socket)
+        if not m:
+            raise AssertionError(f"API socket {api.socket} is not in a jail directory")
+        return m.group(1)
+
+    def _to_host(value, root, key=None):
+        if isinstance(value, dict):
+            return {k: _to_host(v, root, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_to_host(v, root, key) for v in value]
+        if key in PATH_FIELDS and isinstance(value, str) and value.startswith("/"):
+            return root + value
+        return value
+
+    def _to_jail(value, root):
+        if isinstance(value, dict):
+            return {k: _to_jail(v, root) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_to_jail(v, root) for v in value]
+        if isinstance(value, str):
+            return value.replace(root + "/", "/").replace(root, "/")
+        return value
+
+    class _JailView:
+        """A response whose body shows the jail's paths."""
+
+        def __init__(self, res, root):
+            self._res = res
+            self._root = root
+
+        def __getattr__(self, name):
+            return getattr(self._res, name)
+
+        def json(self, **kwargs):
+            return _to_jail(self._res.json(**kwargs), self._root)
+
+        @property
+        def content(self):
+            return self._res.content.replace(self._root.encode() + b"/", b"/")
+
+        @property
+        def text(self):
+            return _to_jail(self._res.text, self._root)
+
+    _real_request = _http_api.Resource.request
+    _real_get = _http_api.Resource.get
+
+    def request(self, method, path, **kwargs):
+        root = _chroot_of(self._api)
+        try:
+            res = _real_request(self, method, path, **_to_host(kwargs, root))
+        except RuntimeError as err:
+            raise RuntimeError(*(_to_jail(a, root) if isinstance(a, str) else a for a in err.args)) from None
+        return _JailView(res, root)
+
+    def get(self):
+        return _JailView(_real_get(self), _chroot_of(self._api))
+
+    _http_api.Resource.request = request
+    _http_api.Resource.get = get
+
+# ------------------------------------------------- files Firecracker maps
+
+# Upstream's memory monitor counts the pages each mapping has resident: on
+# Linux, the pages Firecracker mapped. For a file, an observer on macOS sees
+# the file's pages in the buffer cache, all of them for a file the test has
+# just written. A pmem backing file, the one file Firecracker maps besides its
+# binary (tools/macos/integration-tests.sh), is rewritten in place without
+# caching before Firecracker is given it, so its resident pages are those its
+# guest touches. Its contents and inode stay the same.
+F_NOCACHE = 48
+
+
+def evict_cached_pages(path):
+    """Drops `path`'s pages from the buffer cache (an in-place rewrite
+    through F_NOCACHE)."""
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.fcntl(fd, F_NOCACHE, 1)
+        size, off = os.fstat(fd).st_size, 0
+        while off < size:
+            chunk = os.pread(fd, 1 << 20, off)
+            if not chunk:
+                break
+            os.pwrite(fd, chunk, off)
+            off += len(chunk)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+_request_mapping_files = _http_api.Resource.request
+
+
+def request_mapping_files(self, method, path, **kwargs):
+    """Resource.request, with a pmem backing file out of the buffer cache."""
+    backing = kwargs.get("path_on_host")
+    if self.resource == "/pmem" and method.upper() == "PUT" and isinstance(backing, str):
+        m = re.match(r"^(.*/jailer/[^/]+/[^/]+/root)/", self._api.socket)
+        host = m.group(1) + backing if m and backing.startswith("/") else backing
+        if os.path.isfile(host):
+            evict_cached_pages(host)
+    return _request_mapping_files(self, method, path, **kwargs)
+
+
+_http_api.Resource.request = request_mapping_files
+
+
+def pytest_report_header():
+    """What runs where."""
+    return [
+        f"wick macOS host: mode {MODE}, session root {SESSION_ROOT}, "
+        f"macOS {platform.mac_ver()[0]}, Hypervisor.framework {'yes' if hvf_available() else 'no'}"
+    ]

@@ -230,6 +230,19 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   exclude it. Tests that fail on plain upstream on the CI runner are listed,
   with the reason, in `tools/linux/unit-test-exclusions.txt` and
   `tools/linux/integration-test-exclusions.txt`.
+- On macOS, `tools/macos/integration-tests.sh` runs upstream's pytest suites
+  against the macOS release build and `tools/macos/compare-integration-tests.py`
+  compares them test by test with their results on Linux
+  (`tools/macos/integration-linux-baseline.txt`, from the Linux CI). Every
+  test that passes on Linux passes on macOS or is listed, with its root-caused
+  reason, in `tools/macos/integration-test-differences.txt`: a wick bug (fix
+  it), a Linux feature macOS does not have yet (its `docs/PORTING.md` row), an
+  x86_64-only test, or what the host cannot do (and why). Upstream's framework
+  is unchanged but for one patch to `tests/conftest.py`; the macOS host side
+  (process waiting, memory maps, networks and their host side, the jailer's stand-in for
+  runs without root) is `tools/macos/integration/`. Without arguments it runs
+  the functional and security suites as the user; `--jailer` runs them as root
+  with wick's jailer, as upstream's CI does on Linux.
 - `tools/linux/boot-test.sh` is `tools/windows/boot-test.ps1` for Linux: it
   boots upstream's CI guest with the musl release binary (seccomp filters on
   every thread) and checks serial I/O, SMP, the Async (io_uring) block engine
@@ -250,6 +263,7 @@ compiles wick's sources directly, so upstream's workspace does not change.
 |---|---|---|---|
 | `vnet_segment` | `overlay/vmm/platform/vnet.rs` | any virtio-net header and frame a guest can put on its TX queue | a reference written from Linux in `fuzz/src/frame.rs` (`skb_checksum_help`, `tcp_gso_segment`, UFO, `ip6_find_1stfragopt`) |
 | `vnet_offload` | the same | well-formed frames with checksum offload, TSO or UFO, as a guest's offloads make them | the same reference; every such frame is accepted, and the checksums of the segments and of the datagram the fragments reassemble to verify |
+| `hvf_exit` | `crates/compat/kvm-ioctls/src/hvf/exit.rs` | the exits a guest makes the Hypervisor.framework run loop decode: any exception syndrome, store register, device data, PSTATE and PSCI function id | a reference written from the Arm ARM (ESR_EL2, AArch64 loads and stores, the exception vectors) and PSCI 0.2: exit class, MMIO size, bytes stored and register loaded, the debug registers' state, undefined accesses |
 | `uffd_protocol` (macOS) | `crates/compat/libc/src/wick_uffd.rs` | the requests and records a page fault handler process sends | the state Linux's `UFFDIO_*` leave memory in; no descriptor left open |
 | `whp_irqchip` | `crates/compat/kvm-ioctls/src/whp/irqchip.rs` (built on any host) | any sequence of the port and MMIO accesses the WHP run loop hands it (PICs, ELCR, PIT, speaker port, I/O APIC), interrupt lines, MSI routes, PIT state from a snapshot file, and a snapshot at any point | a VM restored from the snapshot saves the same state and answers every later access as the original does (but for what follows the host clock); each MSI's interrupt request carries its vector and destination |
 

@@ -174,11 +174,16 @@ def jailer_base(ctx, vm_id, exec_file=None):
 def stage_refuse(ctx):
     """Options the jailer cannot enforce on macOS, and binaries that cannot take a jail over."""
     cases = [
-        (["--netns", "/var/run/netns/x"], "--netns is not supported on macOS"),
-        (["--new-pid-ns"], "--new-pid-ns is not supported on macOS"),
-        (["--cgroup", "cpuset.cpus=0"], "--cgroup cpuset.cpus=0 is not supported on macOS"),
-        (["--cgroup-version", "2", "--cgroup", "cpu.weight=100"], "is not supported on macOS"),
-        (["--cgroup", "cpu.shares=512"], "is not supported on macOS"),
+        (["--netns", "/var/run/netns/x"], "The jail's network \"/var/run/netns/x\" (--netns)"),
+        # One per controller macOS cannot enforce, each with its reason.
+        (["--cgroup", "cpuset.cpus=0"], "--cgroup cpuset.cpus=0 is not supported on macOS: Apple silicon has no CPU affinity"),
+        (["--cgroup", "cpuset.mems=1"], "names one the host does not have"),
+        (["--cgroup-version", "2", "--cgroup", "cpu.weight=100"], "no proportional share"),
+        (["--cgroup", "cpu.shares=512"], "no proportional share"),
+        (["--cgroup-version", "2", "--cgroup", "pids.max=10"], "no limit on a process's threads"),
+        (["--cgroup-version", "2", "--cgroup", "io.max=1:0 rbps=1048576"], "no per-process I/O"),
+        (["--cgroup-version", "2", "--cgroup", "memory.high=268435456"], "hard limit only"),
+        (["--cgroup-version", "2", "--cgroup", "hugetlb.2MB.max=0"], "no hugetlb page pool"),
         # CPU limits macOS cannot enforce as asked: never loosened.
         (["--cgroup-version", "2", "--cgroup", "cpu.max=1000 1000000"], "below 1% of one CPU"),
         (["--cgroup-version", "2", "--cgroup", "cpu.max=300000 100000"], "above 255% of one CPU"),
@@ -189,6 +194,12 @@ def stage_refuse(ctx):
     # A binary without the hand-over would run unjailed as root.
     rc, out = run_jailer(ctx, jailer_base(ctx, "refuse-exec", "/bin/sleep") + ["--", "60"])
     check(rc != 0 and "cannot take the jail over" in out, f"/bin/sleep: exit {rc}, {out!r}")
+    # Every CPU and memory node is no restriction: accepted (the jailer gets
+    # as far as the exec, which the binary without the hand-over fails).
+    ncpu = os.cpu_count()
+    rc, out = run_jailer(ctx, jailer_base(ctx, "cpuset-all", "/bin/sleep") + [
+        "--cgroup", f"cpuset.cpus=0-{ncpu - 1}", "--cgroup", "cpuset.mems=0", "--", "60"])
+    check(rc != 0 and "cannot take the jail over" in out, f"cpuset of every CPU: exit {rc}, {out!r}")
     # Without the sandbox Firecracker could lift its own CPU limit.
     rc, out = run_jailer(ctx, jailer_base(ctx, "refuse-cpu") + [
         "--cgroup", "cpu.cfs_quota_us=50000", "--", "--api-sock", "/run/firecracker.socket", "--no-seccomp"])
@@ -291,6 +302,87 @@ def stage_daemonize(ctx):
     finally:
         os.kill(pid, signal.SIGKILL)
     return "double fork, setsid, no terminal, pid file, API answers"
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def api_ok(sock):
+    conn = bt.UnixHTTPConnection(sock)
+    try:
+        conn.request("GET", "/")
+        return conn.getresponse().status == 200
+    finally:
+        conn.close()
+
+
+def stage_pidns(ctx):
+    """--new-pid-ns: upstream's process tree (the jailer exits 0, the pid file names its child), and
+    signals from outside: only the handled ones (and SIGKILL) reach Firecracker, as for a namespace's init."""
+    jail = Jail(ctx, "pidns")
+    # Firecracker runs on with the jailer's standard descriptors: a file,
+    # which the jailer's exit does not wait for.
+    log = os.path.join(ctx.out, "pidns.log")
+    with open(log, "w") as f:
+        p = subprocess.Popen([ctx.jailer] + jailer_base(ctx, "pidns") + [
+            "--new-pid-ns", "--", "--api-sock", "/run/firecracker.socket"],
+            stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
+        rc = p.wait(timeout=20)
+    with open(log) as f:
+        out = f.read()
+    check(rc == 0, f"jailer exit {rc}: {out!r}")
+    with open(jail.host("/firecracker.pid")) as f:
+        pid = int(f.read())
+    try:
+        check(pid != p.pid, f"pid file names the jailer ({pid})")
+        deadline = time.time() + 10
+        while not os.path.exists(jail.host("/run/firecracker.socket")) and time.time() < deadline:
+            time.sleep(0.05)
+        uid, gid, _ = proc_ids(pid)
+        check((uid, gid) == (UID, GID), f"uid/gid {uid}/{gid}")
+        check(api_ok(jail.host("/run/firecracker.socket")), "API of Firecracker in its namespace")
+        dropped = [signal.SIGTERM, signal.SIGINT, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2,
+                   signal.SIGALRM, signal.SIGTSTP, signal.SIGVTALRM, signal.SIGPROF]
+        for sig in dropped:
+            os.kill(pid, sig)
+        time.sleep(0.5)
+        check(alive(pid) and api_ok(jail.host("/run/firecracker.socket")),
+              "Firecracker ended by a signal it does not handle")
+        # A handled signal reaches it: upstream's SIGHUP handler ends it.
+        os.kill(pid, signal.SIGHUP)
+        deadline = time.time() + 5
+        while alive(pid) and time.time() < deadline:
+            time.sleep(0.05)
+        check(not alive(pid), "SIGHUP (handled) did not reach Firecracker")
+    finally:
+        if alive(pid):
+            os.kill(pid, signal.SIGKILL)
+    # Control: without --new-pid-ns, SIGTERM ends Firecracker.
+    jail = Jail(ctx, "pidns-control")
+    rc, out = run_jailer(ctx, jailer_base(ctx, "pidns-control") + ["--daemonize", "--", "--api-sock",
+                                                                    "/run/firecracker.socket"])
+    check(rc == 0, f"control jailer exit {rc}: {out!r}")
+    deadline = time.time() + 10
+    while not os.path.exists(jail.host("/run/firecracker.socket")) and time.time() < deadline:
+        time.sleep(0.05)
+    with open(jail.host("/firecracker.pid")) as f:
+        control = int(f.read())
+    try:
+        os.kill(control, signal.SIGTERM)
+        deadline = time.time() + 5
+        while alive(control) and time.time() < deadline:
+            time.sleep(0.05)
+        check(not alive(control), "control: SIGTERM did not end Firecracker outside a namespace")
+    finally:
+        if alive(control):
+            os.kill(control, signal.SIGKILL)
+    return (f"jailer exits 0, pid file names its child; {len(dropped)} unhandled signals dropped, "
+            "SIGHUP (handled) delivered; control without the flag ended by SIGTERM")
 
 
 # The API process's share of a jail's limits (vmm::ext::jail::API_MEMORY_MIB,
@@ -431,17 +523,157 @@ def stage_cpu(ctx):
     return f"2 vCPUs spinning: {free:.0f}% of one CPU unlimited, {limited:.0f}% with cpu.max 50%"
 
 
+class Network:
+    """A jail's network (--netns): a directory of endpoints. Behind each
+    interface name, a host socket in the directory that attaches to the
+    jail's endpoint of that name once it is there, answers ARP and ICMP echo
+    for its address and records every frame it gets."""
+
+    def __init__(self, path, host_ip, names=("tap0",)):
+        import socket as so
+        self.so = so
+        self.path = path
+        self.host_ip = so.inet_aton(host_ip)
+        os.makedirs(path)
+        self.frames = []
+        self.stop = False
+        self.hosts = {}
+        for name in names:
+            sock = so.socket(so.AF_UNIX, so.SOCK_DGRAM)
+            sock.bind(os.path.join(path, f"host-{name}"))
+            sock.settimeout(0.2)
+            self.hosts[name] = sock
+            bt.threading.Thread(target=self._host, args=(sock, os.path.join(path, name)), daemon=True).start()
+
+    def _host(self, sock, endpoint):
+        import struct
+        mac = bytes.fromhex("02000a0000fe")
+        attached = False
+        while not self.stop:
+            if not attached:
+                # An empty datagram attaches to the endpoint once it exists.
+                try:
+                    sock.sendto(b"", endpoint)
+                    attached = True
+                except OSError:
+                    time.sleep(0.1)
+                    continue
+            try:
+                frame, _ = sock.recvfrom(65536)
+            except self.so.timeout:
+                continue
+            except OSError:
+                return
+            if not frame:
+                continue
+            self.frames.append(frame)
+            src, ethertype = frame[6:12], struct.unpack("!H", frame[12:14])[0]
+            body = frame[14:]
+            reply = None
+            if ethertype == 0x0806 and body[24:28] == self.host_ip and body[6:8] == b"\0\1":
+                arp = body[:6] + b"\0\2" + mac + self.host_ip + body[8:18]
+                reply = src + mac + b"\x08\x06" + arp
+            elif ethertype == 0x0800 and body[16:20] == self.host_ip and body[9] == 1:
+                ihl = (body[0] & 0xF) * 4
+                total = struct.unpack("!H", body[2:4])[0]
+                icmp = body[ihl:total]
+                if icmp[0] != 8:
+                    continue
+                icmp = b"\0\0\0\0" + icmp[4:]
+                icmp = icmp[:2] + struct.pack("!H", bt.csum(icmp)) + icmp[4:]
+                hdr = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(icmp), 0, 0x4000, 64, 1, 0,
+                                  self.host_ip, body[12:16])
+                hdr = hdr[:10] + struct.pack("!H", bt.csum(hdr)) + hdr[12:]
+                reply = src + mac + b"\x08\x00" + hdr + icmp
+            if reply:
+                try:
+                    sock.sendto(reply, endpoint)
+                except OSError:
+                    attached = False
+
+    def frames_from(self, mac):
+        return [f for f in self.frames if f[6:12] == bytes.fromhex(mac.replace(":", ""))]
+
+    def close(self):
+        self.stop = True
+        for s in self.hosts.values():
+            s.close()
+
+
+def stage_netns(ctx):
+    """VM: two jails, each with a network of its own, reach only their own network; jails given one share it."""
+    nets = {"a": ("10.0.1", "06:00:0a:00:01:02"), "b": ("10.0.2", "06:00:0a:00:02:02")}
+    spaces = {n: Network(os.path.join(ctx.base, f"net-{n}"), f"{net}.1", ("tap0", "tap1"))
+              for n, (net, _) in nets.items()}
+    try:
+        vms = {}
+        for n, (net, mac) in nets.items():
+            jail = Jail(ctx, f"netns-{n}", [ctx.kernel, ctx.rootfs])
+            cfg = jail_config(network_interfaces=[{"iface_id": "eth0", "host_dev_name": "tap0",
+                                                   "guest_mac": mac}])
+            vms[n] = JailedVm(ctx, f"netns-{n}", jail, ["--netns", spaces[n].path], config=cfg)
+        for n, (net, _) in nets.items():
+            vm = vms[n]
+            vm.shell()
+            vm.sh(f"ip addr add {net}.2/24 dev eth0 && ip link set eth0 up")
+            _, out = vm.sh(f"ping -c 3 -i 0.3 -W 3 {net}.1")
+            check(" 0% packet loss" in out, f"jail {n}: ping its own host {net}.1: {out}")
+            check(os.path.exists(os.path.join(spaces[n].path, "tap0")), f"jail {n}: no endpoint in its network")
+        # Negative control: jail a, given an address on b's network, does
+        # not reach b's host, and b's network never sees a frame of a's.
+        a, b = vms["a"], spaces["b"]
+        a.sh("ip addr add 10.0.2.9/24 dev eth0")
+        _, out = a.sh("ping -c 3 -i 0.3 -W 2 10.0.2.1", ok=False)
+        check(" 100% packet loss" in out, f"jail a reached b's network: {out}")
+        check(not b.frames_from(nets["a"][1]), f"b's network got {len(b.frames_from(nets['a'][1]))} frames of a's")
+        check(spaces["a"].frames_from(nets["a"][1]), "a's network saw none of a's frames")
+        # A third jail given a's directory shares a's network, as a second
+        # Firecracker in one namespace does: its tap1 reaches a's host.
+        jail = Jail(ctx, "netns-c", [ctx.kernel, ctx.rootfs])
+        cfg = jail_config(network_interfaces=[{"iface_id": "eth0", "host_dev_name": "tap1",
+                                               "guest_mac": "06:00:0a:00:01:03"}])
+        c = JailedVm(ctx, "netns-c", jail, ["--netns", spaces["a"].path], config=cfg)
+        c.shell()
+        c.sh("ip addr add 10.0.1.3/24 dev eth0 && ip link set eth0 up")
+        _, out = c.sh("ping -c 3 -i 0.3 -W 3 10.0.1.1")
+        check(" 0% packet loss" in out, f"jail c in a's network: ping a's host: {out}")
+        c.reboot()
+        # In a network, vmnet (the host's own) is refused, and so is a name
+        # in use (jail a holds tap0), as a busy TAP.
+        jail = Jail(ctx, "netns-refuse")
+        vm = JailedVm(ctx, "netns-refuse", jail, ["--netns", spaces["a"].path])
+        for name, want in (("vmnet-shared", "not the jail's"), ("tap0", "os error 16")):
+            r = vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": name},
+                       expect=(400,))
+            check(want in json.dumps(r), f"{name}: {r}")
+        vm.kill()
+        for vm in vms.values():
+            vm.reboot()
+        # Not a directory: the jailer fails before anything runs.
+        bogus = os.path.join(ctx.base, "not-a-network")
+        open(bogus, "w").close()
+        rc, out = run_jailer(ctx, jailer_base(ctx, "netns-bogus") + ["--netns", bogus])
+        check(rc != 0 and "a network is a directory of endpoints" in out, f"--netns {bogus}: {rc} {out!r}")
+    finally:
+        for s in spaces.values():
+            s.close()
+    return ("two jails ping their own network's host; a on b's subnet: 100% loss, b saw no frame of a; "
+            "a third jail in a's directory reaches a's host; vmnet and a busy name refused; a file refused")
+
+
 STAGES = {
     "refuse": stage_refuse,
     "jail": stage_jail,
     "daemonize": stage_daemonize,
+    "pidns": stage_pidns,
     "limits": stage_limits,
     "no-api": stage_no_api,
     "boot": stage_boot,
+    "netns": stage_netns,
     "memory": stage_memory,
     "cpu": stage_cpu,
 }
-VM_STAGES = ("no-api", "boot", "memory", "cpu")
+VM_STAGES = ("no-api", "boot", "netns", "memory", "cpu")
 
 
 class Context:

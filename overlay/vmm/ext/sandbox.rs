@@ -18,7 +18,8 @@
 //! nothing.
 //!
 //! The macOS sandbox restricts what the process can ask the kernel for: no
-//! program execution, no fork, no IP networking, no Mach service lookups, no
+//! program execution, no fork, no IP networking, no Mach service lookups (but
+//! the one a vmnet interface's start makes while the microVM is built), no
 //! IOKit, no sysctl writes. Started by the jailer ([`super::jail`]), it also
 //! limits files to the jail directory; without the jailer, files are not
 //! limited, as on Linux without the jailer (guest images, snapshots and
@@ -56,7 +57,7 @@ pub enum SandboxError {
 pub use macos::{
     API_MACH_TRAPS, API_MIG_ROUTINES, API_SYSCALLS, FILES_ANYWHERE, MACH_TRAPS,
     MACH_TRAPS_IF_DEFINED, MIG_ROUTINES, PROFILE, SYSCALLS, api_profile, apply, apply_api,
-    denied_syscall, files_in_jail, narrow, profile, select, selected,
+    denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select, selected,
 };
 
 /// Narrows the sandbox to what a running microVM needs, for good. Called
@@ -115,8 +116,15 @@ mod macos {
 (allow network-outbound (remote unix-socket))
 ; Guest memory backed by POSIX shared memory (memfd_create).
 (allow ipc-posix-shm*)
-; Own process only.
+; Own process only. Information about other processes is not covered by the
+; default rule (measured: under (deny default), proc_pidinfo, proc_pidpath and
+; proc_listallpids of another process succeed), so it is denied here: it
+; fails with an error, as /proc/<pid> of another process is not there in a
+; Linux jail (no /proc in the chroot, nor the pid in its PID namespace). A
+; signal to another process raises SIGSYS (the default rule), as kill is in
+; none of upstream's filters.
 (allow signal (target self))
+(deny process-info*)
 (allow process-info* (target self))
 ; No code mapped in: upstream's filters trap mmap and mprotect asking for
 ; PROT_EXEC. A file mapped executable and a MAP_JIT mapping raise SIGSYS here
@@ -178,6 +186,9 @@ mod macos {
         "writev_nocancel", "pread", "pread_nocancel", "pwrite", "pwrite_nocancel", "recvmsg",
         "recvmsg_nocancel", "recvfrom", "recvfrom_nocancel", "sendmsg", "sendmsg_nocancel",
         "sendto", "sendto_nocancel", "recvmsg_x", "sendmsg_x", "lseek",
+        // sendto's address in the jail's network, a path resolved against its
+        // directory, which this thread enters for the call (platform::net).
+        "__pthread_fchdir",
         // accept4, socket, connect (domains: the network rules); the socket
         // options macOS sets where Linux has MSG_NOSIGNAL and accept4's flags.
         "accept", "accept_nocancel", "socket", "connect", "connect_nocancel", "setsockopt",
@@ -327,6 +338,7 @@ mod macos {
     pub const API_PROFILE: &str = r#"(allow network-inbound (local unix-socket))
 (allow network-outbound (remote unix-socket))
 (allow signal (target self))
+(deny process-info*)
 (allow process-info* (target self))
 (deny file-map-executable (with send-signal SIGSYS))
 (deny dynamic-code-generation (with send-signal SIGSYS))
@@ -367,7 +379,7 @@ mod macos {
         if state.policy == Policy::None || state.installed {
             return Ok(());
         }
-        install(&api_profile())?;
+        install_compiled(&compiled_api_profile()?)?;
         state.installed = true;
         INSTALLED.store(true, Ordering::Relaxed);
         state.narrowed_done = true;
@@ -382,23 +394,53 @@ mod macos {
     /// start-up (hot-plug, snapshots), as on Linux without the jailer.
     pub const FILES_ANYWHERE: &str = "(allow file-read* file-write*)\n";
 
+    /// A path for a profile: absolute, quoted.
+    fn quoted(path: &Path, what: &str) -> Result<String, SandboxError> {
+        let path = path
+            .to_str()
+            .filter(|r| r.starts_with('/') && !r.contains(['\0', '\n']))
+            .ok_or_else(|| SandboxError::Install(format!("{what} path {path:?}")))?;
+        Ok(path.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
     /// File rule in a jail: only the jail directory, by its path outside the
     /// chroot (Seatbelt matches the real path of a file, and the chroot
     /// already hides everything else; this also covers descriptors opened
     /// before the chroot).
-    pub fn files_in_jail(root: &Path) -> Result<String, SandboxError> {
-        let root = root
-            .to_str()
-            .filter(|r| r.starts_with('/') && !r.contains(['\0', '\n']))
-            .ok_or_else(|| SandboxError::Install(format!("jail path {root:?}")))?;
-        let quoted = root.replace('\\', "\\\\").replace('"', "\\\"");
-        Ok(format!("(allow file-read* file-write* (subpath \"{quoted}\"))\n"))
+    ///
+    /// With the jail's network (`netns`, `--netns`): also the Unix sockets
+    /// in that directory and nothing else there, as on Linux a network
+    /// namespace gives its interfaces and no file. The directory is reached
+    /// through a descriptor opened before the chroot, from which a relative
+    /// path could climb out (`..`), so Unix sockets are then connected to
+    /// only in the jail and in the network: file rules do not cover
+    /// `connect` or `sendto` (measured: both reach a socket elsewhere with
+    /// only the file rules), `network-outbound` does.
+    pub fn files_in_jail(root: &Path, netns: Option<&Path>) -> Result<String, SandboxError> {
+        let root = quoted(root, "jail")?;
+        let mut rule = format!("(allow file-read* file-write* (subpath \"{root}\"))\n");
+        if let Some(netns) = netns {
+            let netns = quoted(netns, "network")?;
+            rule.push_str(&format!(
+                "(allow file-read* file-write* (require-all (subpath \"{netns}\") (vnode-type SOCKET)))\n\
+                 (deny network-outbound (remote unix-socket))\n\
+                 (allow network-outbound (remote unix-socket (subpath \"{root}\")) \
+                 (remote unix-socket (subpath \"{netns}\")))\n"
+            ));
+        }
+        Ok(rule)
     }
 
     /// The profile for this process.
     pub fn profile() -> Result<String, SandboxError> {
-        let files = match crate::ext::jail::root() {
-            Some(root) => files_in_jail(root)?,
+        profile_for(crate::ext::jail::root(), crate::ext::jail::netns())
+    }
+
+    /// The profile for a process in the jail at `root` (`None`: no jail),
+    /// with the jail's network `netns` if it has one.
+    pub fn profile_for(root: Option<&Path>, netns: Option<&Path>) -> Result<String, SandboxError> {
+        let files = match root {
+            Some(root) => files_in_jail(root, netns)?,
             None => FILES_ANYWHERE.to_owned(),
         };
         let profile = PROFILE.replacen("(deny default)\n", &default_rule(), 1);
@@ -444,6 +486,15 @@ mod macos {
         "sysctl-read",
         "system-socket",
         "network-bind (local unix-socket)",
+        // A vmnet interface (vmnet-shared, vmnet-host) is started while
+        // the microVM is built, as Linux opens the TAP device then:
+        // vmnet.framework connects to NetworkSharing for it (measured: the
+        // only service a vmnet-shared start looks up). The sandbox is
+        // installed by whichever thread installs its filter first, the API
+        // thread's racing the build, so without this rule the lookup raised
+        // SIGSYS whenever the sandbox came first (seen in boot-test vmnet
+        // once the profile was compiled ahead).
+        "mach-lookup (global-name \"com.apple.NetworkSharing\")",
     ];
 
     /// Operations of the run phase, for the ioctl requests upstream's VMM
@@ -574,9 +625,7 @@ mod macos {
     }
 
     unsafe extern "C" {
-        // libsystem_sandbox (part of libSystem). Deprecated in the SDK headers but
-        // still the documented way to apply an SBPL profile string.
-        fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> i32;
+        // libsystem_sandbox (part of libSystem).
         fn sandbox_free_error(errorbuf: *mut c_char);
         fn sandbox_extension_issue_generic(class: *const c_char, flags: u32) -> *mut c_char;
         fn sandbox_extension_consume(token: *const c_char) -> i64;
@@ -667,7 +716,7 @@ mod macos {
         // Issued before the sandbox, which denies issuing; an extension
         // taken before the sandbox is installed would not attach to it.
         let narrowed = Token::issue(NARROWED)?;
-        install(&profile()?)?;
+        install_compiled(&compiled_profile()?)?;
         state.installed = true;
         INSTALLED.store(true, Ordering::Relaxed);
         state.narrowed = Some(narrowed);
@@ -717,28 +766,220 @@ mod macos {
     }
 
     /// Installs `profile` for the whole process, permanently.
+    #[cfg(test)]
     fn install(profile: &str) -> Result<(), SandboxError> {
-        let profile = std::ffi::CString::new(profile)
-            .map_err(|_| SandboxError::Install("profile contains NUL".into()))?;
-        let mut err: *mut c_char = std::ptr::null_mut();
-        // SAFETY: valid NUL-terminated profile and output pointer; flags 0 means
-        // "the string is an SBPL profile".
-        let ret = unsafe { sandbox_init(profile.as_ptr(), 0, &mut err) };
-        if ret != 0 {
-            let msg = if err.is_null() {
-                std::io::Error::last_os_error().to_string()
-            } else {
-                // SAFETY: sandbox_init returns a NUL-terminated message that we free.
-                let msg = unsafe { CStr::from_ptr(err) }
-                    .to_string_lossy()
-                    .into_owned();
-                // SAFETY: as above.
-                unsafe { sandbox_free_error(err) };
-                msg
-            };
-            return Err(SandboxError::Install(msg));
+        install_compiled(&Compiled::here(profile)?)
+    }
+
+    /// Installs a compiled profile for the whole process, permanently.
+    fn install_compiled(compiled: &Compiled) -> Result<(), SandboxError> {
+        // libsystem_trace sets itself up on the process's first os_log use,
+        // and asks the sandbox then (sandbox_check, the Sandbox mac-syscall
+        // 2), which the profile denies: Hypervisor.framework's first log,
+        // when the microVM is built, raised SIGSYS. sandbox_init logs before
+        // it applies a profile, so libsystem_trace was set up by then; a
+        // compiled profile is applied without it, so the log is set up
+        // here, as it was.
+        // SAFETY: NUL-terminated subsystem and category; the log object is
+        // kept for the process's life, as os_log's are.
+        unsafe { os_log_create(c"com.toollyst.wick".as_ptr(), c"sandbox".as_ptr()) };
+        let profile = SandboxProfile {
+            builtin: std::ptr::null(),
+            data: compiled.0.as_ptr(),
+            size: compiled.0.len(),
+        };
+        // SAFETY: a profile of libsandbox's bytecode, which it only reads.
+        if unsafe { sandbox_apply(&profile) } != 0 {
+            return Err(SandboxError::Install(format!(
+                "applying the profile: {}",
+                std::io::Error::last_os_error()
+            )));
         }
         Ok(())
+    }
+
+    /// A profile compiled to libsandbox's bytecode.
+    #[derive(Clone)]
+    pub struct Compiled(Vec<u8>);
+
+    impl std::fmt::Debug for Compiled {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Compiled({} bytes)", self.0.len())
+        }
+    }
+
+    impl Compiled {
+        /// Compiles `profile` in this process.
+        fn here(profile: &str) -> Result<Self, SandboxError> {
+            let profile = std::ffi::CString::new(profile)
+                .map_err(|_| SandboxError::Install("profile contains NUL".into()))?;
+            let mut err: *mut c_char = std::ptr::null_mut();
+            // SAFETY: a NUL-terminated profile, no parameters, an out-pointer.
+            let compiled =
+                unsafe { sandbox_compile_string(profile.as_ptr(), std::ptr::null_mut(), &mut err) };
+            if compiled.is_null() {
+                let msg = if err.is_null() {
+                    std::io::Error::last_os_error().to_string()
+                } else {
+                    // SAFETY: libsandbox's NUL-terminated message, freed below.
+                    let msg = unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned();
+                    // SAFETY: as above.
+                    unsafe { sandbox_free_error(err) };
+                    msg
+                };
+                return Err(SandboxError::Install(msg));
+            }
+            // SAFETY: libsandbox's profile: `size` bytes at `data`, freed
+            // once copied.
+            let bytes = unsafe {
+                let p = &*compiled;
+                let bytes = std::slice::from_raw_parts(p.data, p.size).to_vec();
+                sandbox_free_profile(compiled);
+                bytes
+            };
+            Ok(Compiled(bytes))
+        }
+
+        /// Compiles `profile` in a child process. libsandbox compiles a
+        /// profile in the memory of the process that asks (about 3 MiB for
+        /// Firecracker's, measured with phys_footprint), which malloc then
+        /// keeps resident: Firecracker, which upstream holds to 5 MiB of its
+        /// own memory (tests/host_tools/memory.py), would carry that for
+        /// good. The child's memory goes with the child.
+        ///
+        /// # Safety
+        /// The process has one thread (the child runs libsandbox's
+        /// compiler, which allocates).
+        unsafe fn in_child(profile: &str) -> Result<Self, SandboxError> {
+            use std::io::Read;
+            let fail = |what: &str| {
+                SandboxError::Install(format!(
+                    "compiling the profile in a child: {what}: {}",
+                    std::io::Error::last_os_error()
+                ))
+            };
+            let mut fds = [0; 2];
+            // SAFETY: an array of two descriptors.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return Err(fail("pipe"));
+            }
+            // SAFETY: the caller guarantees one thread.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                // The child: the bytecode, or an error message, then exit.
+                // SAFETY: our own descriptors; _exit ends the child without
+                // running the parent's exit handlers.
+                unsafe {
+                    libc::close(fds[0]);
+                    let (status, bytes) = match Compiled::here(profile) {
+                        Ok(c) => (0u8, c.0),
+                        Err(e) => (1u8, e.to_string().into_bytes()),
+                    };
+                    let mut out = vec![status];
+                    out.extend_from_slice(&bytes);
+                    let mut off = 0;
+                    while off < out.len() {
+                        let n = libc::write(fds[1], out[off..].as_ptr().cast(), out.len() - off);
+                        if n <= 0 {
+                            libc::_exit(2);
+                        }
+                        off += n.unsigned_abs();
+                    }
+                    libc::_exit(0);
+                }
+            }
+            // SAFETY: our own descriptor.
+            unsafe { libc::close(fds[1]) };
+            if pid < 0 {
+                // SAFETY: our own descriptor.
+                unsafe { libc::close(fds[0]) };
+                return Err(fail("fork"));
+            }
+            // SAFETY: the pipe's read end, owned here from now on.
+            let mut pipe = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]) };
+            let mut out = Vec::new();
+            let read = pipe.read_to_end(&mut out);
+            let mut status = 0;
+            // SAFETY: our child; an out-pointer.
+            while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    return Err(fail("waitpid"));
+                }
+            }
+            read.map_err(|e| SandboxError::Install(format!("compiling the profile in a child: {e}")))?;
+            match out.split_first() {
+                Some((0, bytes)) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 => {
+                    Ok(Compiled(bytes.to_vec()))
+                }
+                Some((1, msg)) => Err(SandboxError::Install(String::from_utf8_lossy(msg).into_owned())),
+                _ => Err(SandboxError::Install(format!(
+                    "compiling the profile in a child: it ended with status {status:#x}"
+                ))),
+            }
+        }
+    }
+
+    /// The profiles [`prepare`] compiled: Firecracker's and the API process's.
+    static COMPILED: std::sync::OnceLock<(Compiled, Compiled)> = std::sync::OnceLock::new();
+
+    /// Compiles this process's profiles ahead of [`apply`] and
+    /// [`apply_api`], in a child ([`Compiled::in_child`]), for the jail at
+    /// `root` (`None`: no jail) with the network `netns`.
+    ///
+    /// # Safety
+    /// The process has one thread: `ext::jail::enter` calls it first thing in
+    /// main.
+    pub unsafe fn prepare(root: Option<&Path>, netns: Option<&Path>) -> Result<(), SandboxError> {
+        // SAFETY: one thread, as the caller guarantees.
+        let vmm = unsafe { Compiled::in_child(&profile_for(root, netns)?)? };
+        // SAFETY: as above.
+        let api = unsafe { Compiled::in_child(&api_profile())? };
+        COMPILED
+            .set((vmm, api))
+            .map_err(|_| SandboxError::Install("the profiles are compiled once".into()))
+    }
+
+    /// Firecracker's profile, compiled ([`prepare`]) or compiled now.
+    fn compiled_profile() -> Result<Compiled, SandboxError> {
+        match COMPILED.get() {
+            Some((vmm, _)) => Ok(vmm.clone()),
+            None => Compiled::here(&profile()?),
+        }
+    }
+
+    /// The API process's profile, compiled ([`prepare`]) or compiled now.
+    fn compiled_api_profile() -> Result<Compiled, SandboxError> {
+        match COMPILED.get() {
+            Some((_, api)) => Ok(api.clone()),
+            None => Compiled::here(&api_profile()),
+        }
+    }
+
+    /// libsandbox's compiled profile (sandbox_compile_string).
+    #[repr(C)]
+    struct SandboxProfile {
+        builtin: *const c_char,
+        data: *const u8,
+        size: usize,
+    }
+
+    // libsandbox: compiling apart from applying, which sandbox_init does in
+    // one call. Not in the SDK's headers, exported by libsandbox (its .tbd
+    // lists them); Chromium's Seatbelt sandbox uses the same three calls.
+    unsafe extern "C" {
+        // <os/log.h> (libSystem).
+        fn os_log_create(subsystem: *const c_char, category: *const c_char) -> *mut libc::c_void;
+    }
+
+    #[link(name = "sandbox")]
+    unsafe extern "C" {
+        fn sandbox_compile_string(
+            profile: *const c_char,
+            params: *mut libc::c_void,
+            error: *mut *mut c_char,
+        ) -> *mut SandboxProfile;
+        fn sandbox_apply(profile: *const SandboxProfile) -> i32;
+        fn sandbox_free_profile(profile: *mut SandboxProfile);
     }
 
     #[cfg(test)]
@@ -777,6 +1018,24 @@ mod macos {
         #[test]
         fn test_sandbox_restricts_child() {
             run_child("sandboxed_child", &[]);
+        }
+
+        // prepare() compiles in a child: the same bytecode as compiling here,
+        // and the compiler's error when the profile does not compile. (The
+        // test binary has other threads; libmalloc's fork handlers keep
+        // malloc usable in the child, which is all the compiler needs.)
+        #[test]
+        fn test_profile_compiles_in_a_child() {
+            let profile = profile_for(None, None).unwrap();
+            // SAFETY: see above.
+            let child = unsafe { Compiled::in_child(&profile) }.unwrap();
+            assert_eq!(child.0, Compiled::here(&profile).unwrap().0);
+            assert!(!child.0.is_empty());
+            // SAFETY: as above.
+            let err = unsafe { Compiled::in_child("(version 1)\n(allow no-such-operation)\n") }
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no-such-operation"), "{err}");
         }
 
         // A system call outside SYSCALLS raises SIGSYS, as a seccomp filter's
@@ -1056,7 +1315,7 @@ mod macos {
         #[test]
         fn test_syscall_names_are_known() {
             // The profile compiles only if Seatbelt knows every name; an
-            // unknown one fails `sandbox_init`, which test_sandbox_restricts_child
+            // unknown one fails `sandbox_compile_string`, which test_sandbox_restricts_child
             // would show. Here: no duplicates, and the calls Firecracker cannot
             // run without are in.
             let mut names = [SYSCALLS, SETUP_SYSCALLS].concat();
@@ -1190,6 +1449,53 @@ mod macos {
             println!("CHILD-SURVIVED");
         }
 
+        // Starting a vmnet interface is part of building the microVM: its
+        // service lookup succeeds before narrow() and raises SIGSYS after
+        // it; no other service is looked up in either phase.
+        #[test]
+        fn test_vmnet_lookup_is_setups_only() {
+            use std::os::unix::process::ExitStatusExt;
+            for case in ["vmnet", "other"] {
+                let out = child("lookup_child", &[("WICK_TEST_CASE", case)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert_eq!(stdout.contains("SETUP-LOOKUP-OK"), case == "vmnet", "{case}: {stdout}");
+                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
+                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_vmnet_lookup_is_setups_only in a separate process"]
+        fn lookup_child() {
+            unsafe extern "C" {
+                // <servers/bootstrap.h> (libSystem).
+                static bootstrap_port: libc::mach_port_t;
+                fn bootstrap_look_up(
+                    bp: libc::mach_port_t,
+                    name: *const libc::c_char,
+                    sp: *mut libc::mach_port_t,
+                ) -> libc::c_int;
+            }
+            let look_up = |name: &CStr| {
+                let mut port: libc::mach_port_t = 0;
+                // SAFETY: the task's bootstrap port, a NUL-terminated name and
+                // an out-pointer.
+                unsafe { bootstrap_look_up(bootstrap_port, name.as_ptr(), &mut port) }
+            };
+            select(Policy::Default);
+            apply().unwrap();
+            if std::env::var("WICK_TEST_CASE").unwrap() == "other" {
+                look_up(c"com.apple.SystemConfiguration.configd");
+            } else {
+                assert_eq!(look_up(c"com.apple.NetworkSharing"), 0);
+                println!("SETUP-LOOKUP-OK");
+                narrow().unwrap();
+                look_up(c"com.apple.NetworkSharing");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
         // Binding a Unix socket is setup's only: Linux's VMM filter has no bind.
         #[test]
         #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
@@ -1202,6 +1508,72 @@ mod macos {
             let _ = std::fs::remove_file(&path);
             narrow().unwrap();
             let _ = std::os::unix::net::UnixListener::bind(&path);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        // --new-pid-ns: in a PID namespace of its own on Linux, Firecracker
+        // sees and signals no other process. Here its sandbox holds it:
+        // information about another process fails (EPERM; Seatbelt's default
+        // rule does not cover it, the profile's explicit rule does), and a
+        // signal to one raises SIGSYS (the test's own process stands for any
+        // other).
+        #[test]
+        fn test_no_other_process_in_reach() {
+            use std::os::unix::process::ExitStatusExt;
+            let me = std::process::id().to_string();
+            let out = child("other_pid_info_child", &[("WICK_TEST_OTHER_PID", &me)]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && stdout.contains("OTHER-DENIED"), "{:?}\n{stdout}", out.status);
+            let out = child("other_pid_signal_child", &[("WICK_TEST_OTHER_PID", &me)]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
+            assert!(!stdout.contains("CHILD-SURVIVED"));
+        }
+
+        fn other_pid() -> libc::pid_t {
+            std::env::var("WICK_TEST_OTHER_PID").unwrap().parse().unwrap()
+        }
+
+        #[test]
+        #[ignore = "run by test_no_other_process_in_reach in a separate process"]
+        fn other_pid_info_child() {
+            let pid = other_pid();
+            // Its own process information stays readable.
+            // SAFETY: plain data the call fills.
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            // SAFETY: a buffer of `size` bytes.
+            let own = unsafe {
+                libc::proc_pidinfo(std::process::id().cast_signed(), libc::PROC_PIDTBSDINFO, 0,
+                    (&raw mut info).cast(), size)
+            };
+            assert_eq!(own, size);
+            // SAFETY: as above.
+            let other = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+            let err = std::io::Error::last_os_error();
+            assert_eq!((other, err.raw_os_error()), (0, Some(libc::EPERM)), "{err}");
+            let mut path = [0u8; 1024];
+            // SAFETY: a buffer of its length.
+            let other = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), 1024) };
+            assert_eq!(other, 0);
+            let mut pids = [0i32; 4096];
+            // SAFETY: a buffer of its size in bytes.
+            let all = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), 4096 * 4) };
+            assert!(all <= 0, "{all} pids listed");
+            println!("OTHER-DENIED");
+        }
+
+        #[test]
+        #[ignore = "run by test_no_other_process_in_reach in a separate process"]
+        fn other_pid_signal_child() {
+            let pid = other_pid();
+            select(Policy::Default);
+            apply().unwrap();
+            // SAFETY: signal 0 only checks that the process can be signalled.
+            unsafe { libc::kill(pid, 0) };
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
         }
@@ -1311,9 +1683,72 @@ mod macos {
         }
 
         #[test]
+        fn test_jail_network_profile_limits_sockets() {
+            let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("wick-jail-net-{}", std::process::id()));
+            let (jail, net, other) = (base.join("jail"), base.join("net"), base.join("other"));
+            for dir in [&jail, &net, &other] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            // A peer in the jail's network, and one in another network.
+            let _peer = std::os::unix::net::UnixDatagram::bind(net.join("peer")).unwrap();
+            let _stranger = std::os::unix::net::UnixDatagram::bind(other.join("peer")).unwrap();
+            run_child(
+                "jailed_net_child",
+                &[("WICK_TEST_JAIL", jail.to_str().unwrap()), ("WICK_TEST_NET", net.to_str().unwrap())],
+            );
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        #[test]
+        #[ignore = "run by test_jail_network_profile_limits_sockets in a separate process"]
+        fn jailed_net_child() {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::net::UnixDatagram;
+            unsafe extern "C" {
+                fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+            }
+            let jail = std::path::PathBuf::from(std::env::var("WICK_TEST_JAIL").unwrap());
+            let net = std::path::PathBuf::from(std::env::var("WICK_TEST_NET").unwrap());
+            let base = jail.parent().unwrap().to_owned();
+            // The network directory, opened before the sandbox (and, in a
+            // jail, before the chroot).
+            let dir = std::fs::File::open(&net).unwrap();
+            install(&format!("{PROFILE}{}{}", syscall_rule(), files_in_jail(&jail, Some(&net)).unwrap()))
+                .unwrap();
+            let denied = |e: std::io::Error| e.raw_os_error() == Some(libc::EPERM);
+            // SAFETY: a directory descriptor; this thread's working directory.
+            assert_eq!(unsafe { pthread_fchdir_np(dir.as_raw_fd()) }, 0);
+            // In the network: an endpoint is bound, reaches a peer, is removed.
+            let ep = UnixDatagram::bind("tap0").unwrap();
+            ep.send_to(b"frame", "peer").unwrap();
+            std::fs::remove_file("tap0").unwrap();
+            // No other file there.
+            assert!(denied(std::fs::write("file", b"x").unwrap_err()));
+            // Climbing out of it reaches no other network, nor anything
+            // next to the jail.
+            assert!(denied(ep.send_to(b"frame", "../other/peer").unwrap_err()));
+            assert!(denied(UnixDatagram::unbound().unwrap().connect("../other/peer").unwrap_err()));
+            assert!(denied(UnixDatagram::bind("../other/tap0").unwrap_err()));
+            assert!(denied(UnixDatagram::bind("../tap0").unwrap_err()));
+            // SAFETY: back to the process's working directory.
+            assert_eq!(unsafe { pthread_fchdir_np(-1) }, 0);
+            // By absolute path: the same.
+            assert!(denied(ep.send_to(b"frame", base.join("other/peer")).unwrap_err()));
+            ep.send_to(b"frame", net.join("peer")).unwrap();
+            // The jail's own sockets still work.
+            let _l = std::os::unix::net::UnixListener::bind(jail.join("s")).unwrap();
+            std::os::unix::net::UnixStream::connect(jail.join("s")).unwrap();
+            println!("CHILD-OK");
+        }
+
+        #[test]
         fn test_files_in_jail_rejects_bad_paths() {
             for bad in ["relative", "/a\nb"] {
-                files_in_jail(Path::new(bad)).unwrap_err();
+                files_in_jail(Path::new(bad), None).unwrap_err();
+                files_in_jail(Path::new("/jail"), Some(Path::new(bad))).unwrap_err();
             }
         }
 
@@ -1324,7 +1759,7 @@ mod macos {
             let base = jail.parent().unwrap().to_owned();
             // A descriptor opened before the sandbox stays usable.
             let early = std::fs::File::open(base.join("outside")).unwrap();
-            install(&format!("{PROFILE}{}{}", syscall_rule(), files_in_jail(&jail).unwrap())).unwrap();
+            install(&format!("{PROFILE}{}{}", syscall_rule(), files_in_jail(&jail, None).unwrap())).unwrap();
             let denied = |e: std::io::Error| e.raw_os_error() == Some(libc::EPERM);
             // Inside the jail: read, write, create, remove, Unix sockets.
             assert_eq!(std::fs::read(jail.join("inside")).unwrap(), b"guest");
