@@ -24,3 +24,4 @@
 0022-seccomp-narrow-the-host-sandbox-where-the-VMM-thread.patch
 0023-tests-vmm-s-unit-tests-build-on-Windows.patch
 0024-block-a-Windows-drive-s-serial-is-distinct-per-file.patch
+0025-jailer-new-pid-ns-on-Windows-hands-over-to-a-keeper.patch

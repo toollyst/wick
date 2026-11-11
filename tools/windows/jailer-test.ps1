@@ -6,9 +6,10 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,isolation,boot,limits,cpu] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,pidns,isolation,boot,limits,cpu] [-Bin <dir>]
 #
-# `refuse`, `low`, `daemonize` and `handles` need no WHP; the others boot a guest.
+# `refuse`, `low`, `daemonize`, `handles` and `pidns` need no WHP; the others
+# boot a guest. `pidns` needs a console (it types into it and reads it).
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build).
 # Needs the boot test's guest files in -Assets (vmlinux-6.1.188 and
@@ -17,7 +18,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'isolation', 'boot', 'limits', 'cpu'),
+    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'pidns', 'isolation', 'boot', 'limits', 'cpu'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -55,6 +56,9 @@ function Invoke-Jailer([string[]]$argv, [int]$ms = 20000) {
     $out = Join-Path $WorkDir 'jailer-out.txt'
     $line = ($argv | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
     $p = Start-Process $Jailer -ArgumentList $line -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+    # Holding the process handle keeps its exit code (else ExitCode is empty
+    # once it has exited).
+    $null = $p.Handle
     if (-not $p.WaitForExit($ms)) { $p.Kill(); throw [Failure]::new("jailer did not exit: $line") }
     @($p.ExitCode, ((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join ''))
 }
@@ -130,7 +134,6 @@ function Stage-Refuse {
     $common = @('--id', 'r', '--exec-file', $Fc, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base)
     $cases = [ordered]@{
         '--netns'                    = @('--netns', 'C:\x')
-        '--new-pid-ns'               = @('--new-pid-ns')
         'fsize'                      = @('--resource-limit', 'fsize=1024')
         'cpuset'                     = @('--cgroup', 'cpuset.cpus=0', '--cgroup-version', '2')
     }
@@ -139,7 +142,7 @@ function Stage-Refuse {
         Check ($r[0] -ne 0) "$k accepted (exit $($r[0])): $($r[1])"
         Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue)) "$k started Firecracker"
     }
-    "--netns, --new-pid-ns, fsize= and an unsupported cgroup are refused before Firecracker starts"
+    "--netns, fsize= and an unsupported cgroup are refused before Firecracker starts"
 }
 
 # Row 15 of docs/PORTING.md: --daemonize, upstream's observable behaviour.
@@ -370,6 +373,214 @@ function Stage-Low {
         "a low-integrity process of the user reaches neither the jail's files, its API socket nor the jailed process ($($expect.Count - 3) checks, 3 controls); the operator does, and the jailed Firecracker answers"
     } finally {
         Remove-Item (Join-Path $env:USERPROFILE "wick-jailer-test-low-$PID.txt"), (Join-Path $env:USERPROFILE "AppData\LocalLow\wick-jailer-test-low-$PID.txt") -ErrorAction SilentlyContinue
+        Stop-Jailed
+    }
+}
+
+# The test's console, for the stages that give the jailer a terminal: its
+# input and output handles (inheritable), a process started on them, keys
+# typed into it and its screen read back.
+Add-Type -Namespace WickJailerTest -Name Term -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct SI { public int cb; public string r; public string d; public string t; public int x, y, w, h, cx, cy, fa, fl; public short sw, cb2; public System.IntPtr r2, i, o, e; }
+[StructLayout(LayoutKind.Sequential)]
+public struct PI { public System.IntPtr p, t; public int pid, tid; }
+[StructLayout(LayoutKind.Sequential)]
+public struct SA { public int n; public System.IntPtr sd; public bool inherit; }
+[StructLayout(LayoutKind.Explicit)]
+public struct KEY { [FieldOffset(0)] public ushort type; [FieldOffset(4)] public int down; [FieldOffset(8)] public ushort repeat; [FieldOffset(10)] public ushort vk; [FieldOffset(12)] public ushort scan; [FieldOffset(14)] public ushort ch; [FieldOffset(16)] public uint state; }
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+static extern bool CreateProcessW(string app, System.Text.StringBuilder cmd, System.IntPtr pa, System.IntPtr ta, bool inherit, uint flags, System.IntPtr env, string cwd, ref SI si, out PI pi);
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+static extern System.IntPtr CreateFileW(string name, uint access, uint share, ref SA sa, uint disp, uint flags, System.IntPtr t);
+[DllImport("kernel32.dll")] static extern uint WaitForSingleObject(System.IntPtr h, uint ms);
+[DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(System.IntPtr h, out uint code);
+[DllImport("kernel32.dll")] static extern bool CloseHandle(System.IntPtr h);
+[DllImport("kernel32.dll")] static extern bool GetConsoleMode(System.IntPtr h, out uint m);
+[DllImport("kernel32.dll")] static extern bool WriteConsoleInputW(System.IntPtr h, KEY[] r, uint n, out uint w);
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool ReadConsoleOutputCharacterW(System.IntPtr h, System.Text.StringBuilder s, uint n, uint xy, out uint read);
+[DllImport("kernel32.dll")] static extern bool FlushConsoleInputBuffer(System.IntPtr h);
+static System.IntPtr In = System.IntPtr.Zero, Out = System.IntPtr.Zero;
+static System.IntPtr File(string path, uint disp) {
+  var sa = new SA(); sa.n = Marshal.SizeOf(typeof(SA)); sa.inherit = true;
+  var h = CreateFileW(path, 0xC0000000, 3, ref sa, disp, 0, System.IntPtr.Zero);
+  if (h.ToInt64() == -1) throw new System.Exception(path + ": error " + Marshal.GetLastWin32Error());
+  return h;
+}
+public static void Open() { if (In == System.IntPtr.Zero) { In = File("CONIN$", 3); Out = File("CONOUT$", 3); } }
+// Starts `cmd` with the console as its input and, unless `output` names a
+// file (PowerShell passes $null as ""), as its output and error; `group`
+// gives it a process group of its own.
+public static PI Start(string cmd, string output, bool group) {
+  Open();
+  var si = new SI(); si.cb = Marshal.SizeOf(typeof(SI)); PI pi;
+  bool toFile = !string.IsNullOrEmpty(output);
+  var o = toFile ? File(output, 2) : Out;
+  si.fl = 0x100; si.i = In; si.o = o; si.e = o;
+  bool ok = CreateProcessW(null, new System.Text.StringBuilder(cmd), System.IntPtr.Zero, System.IntPtr.Zero, true, group ? 0x200u : 0u, System.IntPtr.Zero, null, ref si, out pi);
+  int err = Marshal.GetLastWin32Error();
+  if (toFile) CloseHandle(o);
+  if (!ok) throw new System.Exception("CreateProcess: error " + err);
+  CloseHandle(pi.t);
+  return pi;
+}
+// The exit code, or -1 if it did not exit in `ms`.
+public static long Wait(PI pi, uint ms) {
+  if (WaitForSingleObject(pi.p, ms) != 0) return -1;
+  uint c; GetExitCodeProcess(pi.p, out c); CloseHandle(pi.p); return c;
+}
+public static uint Mode() { Open(); uint m; GetConsoleMode(In, out m); return m; }
+public static void Flush() { Open(); FlushConsoleInputBuffer(In); }
+public static void Type(string s) {
+  Open();
+  var r = new KEY[s.Length];
+  for (int i = 0; i < s.Length; i++) { r[i].type = 1; r[i].down = 1; r[i].repeat = 1; r[i].ch = s[i]; }
+  uint w; WriteConsoleInputW(In, r, (uint)r.Length, out w);
+}
+public static string Screen() { Open(); var sb = new System.Text.StringBuilder(200 * 300); uint n; ReadConsoleOutputCharacterW(Out, sb, 200 * 300, 0, out n); return sb.ToString(); }
+'@
+
+# A process of the user on the test's console, in a process group of its own,
+# for the jailed process to act on (jail-probe `wait`).
+function Start-Victim { [WickJailerTest.Term]::Start("`"$(Get-Probe)`" wait:300", $null, $true).pid }
+function Test-Alive([int]$p) { [bool](Get-Process -Id $p -ErrorAction SilentlyContinue) }
+
+# Runs jail-probe `checks` on the test's console (input; output to a file),
+# plain or through the jailer; returns its answer lines.
+function Invoke-OnConsole([string]$cmd, [string]$out) {
+    $pi = [WickJailerTest.Term]::Start($cmd, $out, $false)
+    $code = [WickJailerTest.Term]::Wait($pi, 30000)
+    Check ($code -ne -1) "did not exit: $cmd"
+    @(Get-Content $out)
+}
+
+# Row 7 of docs/PORTING.md: --new-pid-ns. In its own PID namespace the
+# jailed Firecracker sees and signals no other process; on Windows every
+# jail holds that, flag or not: its token opens no other process or thread
+# (the user's, another jail's, the jailer, SYSTEM's), a process snapshot
+# shows it none, and it is not on the jailer's console, so console control
+# events and typed input reach no other process (the jailer relays the
+# console through pipes). The flag gives upstream's jailer behaviour: the
+# jailer returns 0 once Firecracker runs, its pid in the pid file, and
+# Firecracker runs on. Controls: the same checks from a plain process of the
+# user, on the same console, are allowed. Needs no guest.
+function Stage-Pidns {
+    $base = New-Base 'pidns'
+    $probe = Get-Probe
+    $out = Join-Path $WorkDir 'pidns-out.txt'
+    $victims = @()
+    try {
+        $other = Start-ApiJail $base 'other'
+        $victims = @((Start-Victim), (Start-Victim))
+        $services = (Get-Process services).Id
+        # A pid no process has (the highest of the system's plus a margin, a
+        # multiple of 4 as process ids are).
+        $unused = ((Get-Process | Measure-Object Id -Maximum).Maximum + 4000) -band -bnot 3
+
+        # The control: a plain process of the user on the console reaches
+        # all of it.
+        $ctl = Invoke-OnConsole "`"$probe`" procs:0 see:$($victims[0]) signal:$($victims[0]) thread:$($victims[0]) signal:$($other.Fc.Id) inject:0 ctrl:$($victims[0])" $out
+        [WickJailerTest.Term]::Flush()
+        $bad = @($ctl | Where-Object { $_ -notmatch ' allowed' })
+        Check ($ctl.Count -eq 7 -and $bad.Count -eq 0) "the control was not allowed everything (so the test proves nothing): $($ctl -join ' | ')"
+        Start-Sleep -Milliseconds 500
+        Check (-not (Test-Alive $victims[0])) "the control's console control event did not end the victim"
+
+        # Jailed, on the same console.
+        $v = $victims[1]
+        $checks = [ordered]@{
+            'procs:0'            = 'a process snapshot shows another process'
+            "see:$v"             = 'a process of the user is visible'
+            "see:$($other.Fc.Id)" = "another jail's Firecracker is visible"
+            'see:parent'         = 'the jailer is visible'
+            "signal:$v"          = 'a process of the user can be opened'
+            "signal:$PID"        = 'the operator can be opened'
+            "signal:$($other.Fc.Id)" = "another jail's Firecracker can be opened"
+            'signal:parent'      = 'the jailer can be opened'
+            "signal:$services"   = 'a SYSTEM process can be opened'
+            "thread:$v"          = "a thread of the user's process can be opened"
+            'inject:0'           = 'input can be typed into the console'
+            'attach:parent'      = "it can attach to the jailer's console"
+        }
+        $line = "`"$Jailer`" --id probe --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- $(@($checks.Keys) -join ' ') ctrl:$v signal:$unused"
+        $got = Invoke-OnConsole $line $out
+        $fails = @()
+        foreach ($k in $checks.Keys) {
+            $l = $got | Where-Object { $_.StartsWith("$k ") } | Select-Object -First 1
+            if (-not $l) { $fails += "${k}: no answer"; continue }
+            if ($l -match "^$([regex]::Escape($k)) allowed") { $fails += "$($checks[$k]): $l" }
+        }
+        Check ($fails.Count -eq 0) "jailed: $($fails -join '; ')"
+        Start-Sleep -Milliseconds 500
+        Check (Test-Alive $v) "the jailed process's console control event ended a process of the user"
+        # What Windows still tells it: whether a pid is in use (OpenProcess
+        # fails with access denied for one that is, invalid parameter for one
+        # that is not), as kill(pid, 0) tells a Linux process outside a PID
+        # namespace. Recorded, not hidden.
+        $oracle = $got | Where-Object { $_.StartsWith("signal:$unused ") } | Select-Object -First 1
+        Check ($oracle -match 'os error 87') "an unused pid: $oracle"
+
+        # The relay: keys typed on the console reach the jailed process as
+        # the bytes it would have read (Ctrl+C a byte), its output reaches the
+        # console, and the console's mode is restored after.
+        $mode = [WickJailerTest.Term]::Mode()
+        $pi = [WickJailerTest.Term]::Start("`"$Jailer`" --id echo --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- echo:echo.txt", $null, $false)
+        $t = [DateTime]::Now.AddSeconds(10)
+        while ([WickJailerTest.Term]::Mode() -eq $mode -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 50 }
+        $raw = [WickJailerTest.Term]::Mode()
+        Check ($raw -ne $mode) 'the jailer did not set the console to raw mode'
+        [WickJailerTest.Term]::Type("hi$([char]3)q")
+        $code = [WickJailerTest.Term]::Wait($pi, 20000)
+        Check ($code -eq 0) "the relayed jailer: exit $code"
+        $bytes = Get-Content (Join-Path $base 'jail-probe.exe\echo\root\echo.txt') -ErrorAction SilentlyContinue
+        Check ($bytes -eq '68 69 03 71') "typed 'hi', Ctrl+C, 'q'; the jailed process read: $bytes"
+        Check ([WickJailerTest.Term]::Screen() -match '\[jail-probe echo 4\]') "the jailed process's output did not reach the console"
+        Check ([WickJailerTest.Term]::Mode() -eq $mode) ("the console mode was 0x{0:x}, is 0x{1:x} after" -f $mode, [WickJailerTest.Term]::Mode())
+
+        # --new-pid-ns: the jailer returns 0 once Firecracker runs; the pid
+        # file holds Firecracker's pid; Firecracker runs on.
+        # (Output to a file: the keeper and Firecracker keep the jailer's
+        # standard handles, so a pipe would stay open while they run.)
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $pi = [WickJailerTest.Term]::Start("`"$Jailer`" --id ns --exec-file `"$Fc`" --uid 0 --gid 0 --chroot-base-dir `"$base`" --new-pid-ns", (Join-Path $WorkDir 'pidns-ns.txt'), $false)
+        $code = [WickJailerTest.Term]::Wait($pi, 20000)
+        $sw.Stop()
+        Check ($code -eq 0) "--new-pid-ns: the jailer exited $code (-1: did not return)"
+        $root = Join-Path $base 'firecracker.exe\ns\root'
+        $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" } | Select-Object -First 1
+        Check ($null -ne $fcp) '--new-pid-ns: Firecracker is not running after the jailer returned'
+        $written = [int](Get-Content (Join-Path $root 'firecracker.exe.pid'))
+        Check ($written -eq $fcp.Id) "--new-pid-ns: the pid file holds $written, Firecracker is $($fcp.Id)"
+        $sock = Join-Path $root 'run\firecracker.socket'
+        $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
+        $answer = Invoke-Api $sock 'GET' '/'
+        Check ($answer -match ' 200$') "--new-pid-ns: Firecracker's API: $answer"
+        # The same isolation with the flag.
+        $r = Invoke-Jailer @('--id', 'nsprobe', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--new-pid-ns', '--', 'procs:0', 'signal:parent', "signal:$PID", 'wait:2') 20000
+        Check ($r[0] -eq 0) "--new-pid-ns, the probe: the jailer exited $($r[0])"
+        $t = [DateTime]::Now.AddSeconds(15)
+        while ((Get-Process jail-probe -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$base*nsprobe*" }) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
+        $nsLines = @(Get-Content (Join-Path $WorkDir 'jailer-out.txt'))
+        foreach ($k in 'procs:0', 'signal:parent', "signal:$PID") {
+            $l = $nsLines | Where-Object { $_.StartsWith("$k ") } | Select-Object -First 1
+            Check ($l -and $l -notmatch ' allowed') "--new-pid-ns, jailed: $k -> $l"
+        }
+        # A jail that cannot be built: the jailer exits with the keeper's
+        # status, not 0 (upstream's jailer fails before it clones). A binary
+        # without the hand-over mark is refused once the jail is built.
+        $plain = Join-Path $WorkDir 'unmarked.exe'
+        Copy-Item (Join-Path $env:SystemRoot 'System32\whoami.exe') $plain -Force
+        $r = Invoke-Jailer @('--id', 'nsbad', '--exec-file', $plain, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--new-pid-ns') 20000
+        Check ($r[0] -ne 0) "--new-pid-ns with a jail that cannot be built: the jailer exited 0: $($r[1])"
+        Remove-Item $plain -ErrorAction SilentlyContinue
+        # Ending Firecracker ends its keeper, which removes the jail's drive.
+        $fcp | Stop-Process -Force
+        $t = [DateTime]::Now.AddSeconds(5)
+        while ((Get-Process jailer -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $other.Jailer.Id }) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
+        "the control reaches every process ($($ctl.Count) checks); jailed, nothing ($($checks.Count) checks and a console control event: the user's process survives); typed keys reach it through the relay as bytes and the console mode is restored; --new-pid-ns: the jailer returned 0 in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s with Firecracker running (pid file), refused a jail it could not build; a pid's existence still shows ($oracle)"
+    } finally {
+        $victims | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+        [WickJailerTest.Term]::Flush()
         Stop-Jailed
     }
 }

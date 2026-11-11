@@ -9,6 +9,11 @@
 //! ```text
 //! jail-probe [low] <check>...   check: read:<path> write:<path>
 //!                               open:<pid> connect:<socket path>
+//!                               handle:<value> signal:<pid> thread:<pid>
+//!                               see:<pid> ctrl:<process group> procs:0
+//!                               wait:<seconds> console:0 tty:<file>
+//!                               attach:<pid> inject:0 echo:<file>
+//! (<pid> may be `parent`: in a jail, the jailer.)
 //! ```
 //!
 //! Prints one line per check: `<check> allowed` or `<check> denied <error>`.
@@ -93,6 +98,172 @@ extern "system" {
     fn ReadFile(h: HANDLE, buf: *mut u8, n: u32, read: *mut u32, ov: *mut c_void) -> i32;
     fn SetFilePointer(h: HANDLE, lo: i32, hi: *mut i32, from: u32) -> u32;
     fn GetFileType(h: HANDLE) -> u32;
+    fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> HANDLE;
+    fn Process32FirstW(snap: HANDLE, entry: *mut PROCESSENTRY32W) -> i32;
+    fn Process32NextW(snap: HANDLE, entry: *mut PROCESSENTRY32W) -> i32;
+    fn Thread32First(snap: HANDLE, entry: *mut THREADENTRY32) -> i32;
+    fn Thread32Next(snap: HANDLE, entry: *mut THREADENTRY32) -> i32;
+    fn OpenThread(access: u32, inherit: i32, tid: u32) -> HANDLE;
+    fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+    fn K32EnumProcesses(pids: *mut u32, bytes: u32, needed: *mut u32) -> i32;
+    fn FreeConsole() -> i32;
+    fn AttachConsole(pid: u32) -> i32;
+    fn GetConsoleWindow() -> HANDLE;
+    fn GetConsoleMode(h: HANDLE, mode: *mut u32) -> i32;
+    fn SetConsoleMode(h: HANDLE, mode: u32) -> i32;
+    fn GetNumberOfConsoleInputEvents(h: HANDLE, n: *mut u32) -> i32;
+    fn WriteConsoleInputW(h: HANDLE, recs: *const KEY_RECORD, n: u32, written: *mut u32) -> i32;
+    fn WriteFile(h: HANDLE, buf: *const u8, n: u32, written: *mut u32, ov: *mut c_void) -> i32;
+}
+
+#[repr(C)]
+struct PROCESSENTRY32W {
+    size: u32,
+    usage: u32,
+    pid: u32,
+    heap: usize,
+    module: u32,
+    threads: u32,
+    parent: u32,
+    priority: i32,
+    flags: u32,
+    exe: [u16; 260],
+}
+
+/// An `INPUT_RECORD` holding a `KEY_EVENT_RECORD`.
+#[repr(C)]
+struct KEY_RECORD {
+    event_type: u16,
+    key_down: i32,
+    repeat: u16,
+    vkey: u16,
+    vscan: u16,
+    ch: u16,
+    state: u32,
+}
+
+#[repr(C)]
+struct THREADENTRY32 {
+    size: u32,
+    usage: u32,
+    tid: u32,
+    owner: u32,
+    base_priority: i32,
+    delta_priority: i32,
+    flags: u32,
+}
+
+/// The access rights through which one process acts on another, and their
+/// names: each is asked for alone, so the answer lists every one granted.
+const PROCESS_RIGHTS: [(u32, &str); 11] = [
+    (0x0001, "terminate"),
+    (0x0002, "create_thread"),
+    (0x0008, "vm_operation"),
+    (0x0010, "vm_read"),
+    (0x0020, "vm_write"),
+    (0x0040, "dup_handle"),
+    (0x0200, "set_information"),
+    (0x0400, "query_information"),
+    (0x0800, "suspend_resume"),
+    (0x1000, "query_limited_information"),
+    (0x0010_0000, "synchronize"),
+];
+const THREAD_RIGHTS: [(u32, &str); 6] = [
+    (0x0001, "terminate"),
+    (0x0002, "suspend_resume"),
+    (0x0008, "get_context"),
+    (0x0010, "set_context"),
+    (0x0800, "query_limited_information"),
+    (0x0010_0000, "synchronize"),
+];
+
+/// `allowed <rights>` for the rights `open` grants, `denied <first error>`
+/// if none.
+fn rights(open: impl Fn(u32) -> HANDLE, table: &[(u32, &str)]) -> String {
+    let mut granted = Vec::new();
+    let mut error = None;
+    for (right, name) in table {
+        let h = open(*right);
+        if h.is_null() {
+            // SAFETY: plain call.
+            error.get_or_insert(unsafe { GetLastError() });
+        } else {
+            granted.push(*name);
+            // SAFETY: the handle just opened.
+            unsafe { CloseHandle(h) };
+        }
+    }
+    match (granted.is_empty(), error) {
+        (false, _) => format!("allowed {}", granted.join(",")),
+        (true, Some(e)) => format!("denied {}", std::io::Error::from_raw_os_error(e as i32)),
+        (true, None) => "denied".into(),
+    }
+}
+
+/// The processes a snapshot shows: (pid, parent, image).
+fn processes() -> Result<Vec<(u32, u32, String)>, u32> {
+    // TH32CS_SNAPPROCESS
+    // SAFETY: plain calls on a snapshot we own; the entry has its size set.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(0x2, 0);
+        if snap as isize == -1 {
+            return Err(GetLastError());
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut out = Vec::new();
+        let mut ok = Process32FirstW(snap, &mut e);
+        while ok != 0 {
+            let n = e.exe.iter().position(|c| *c == 0).unwrap_or(e.exe.len());
+            out.push((e.pid, e.parent, String::from_utf16_lossy(&e.exe[..n])));
+            ok = Process32NextW(snap, &mut e);
+        }
+        CloseHandle(snap);
+        Ok(out)
+    }
+}
+
+/// A pid argument: a number, or `parent` (this process's parent, from a
+/// snapshot: in a jail, the jailer).
+fn pid_of(arg: &str) -> Option<u32> {
+    if arg == "parent" {
+        // PROCESS_BASIC_INFORMATION: InheritedFromUniqueProcessId is its 6th
+        // word. A jailed process cannot see itself in a snapshot.
+        let mut info = [0usize; 6];
+        // SAFETY: a buffer of the size passed, on our own process.
+        let st = unsafe { NtQueryInformationProcess(GetCurrentProcess(), 0, info.as_mut_ptr(), 48, std::ptr::null_mut()) };
+        return (st == 0).then(|| info[5] as u32);
+    }
+    arg.parse().ok()
+}
+
+/// The threads of `pid` a snapshot shows.
+fn threads(pid: u32) -> Result<Vec<u32>, u32> {
+    // TH32CS_SNAPTHREAD
+    // SAFETY: as in `processes`.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(0x4, 0);
+        if snap as isize == -1 {
+            return Err(GetLastError());
+        }
+        let mut e: THREADENTRY32 = std::mem::zeroed();
+        e.size = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut out = Vec::new();
+        let mut ok = Thread32First(snap, &mut e);
+        while ok != 0 {
+            if e.owner == pid {
+                out.push(e.tid);
+            }
+            ok = Thread32Next(snap, &mut e);
+        }
+        CloseHandle(snap);
+        Ok(out)
+    }
+}
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryInformationProcess(p: HANDLE, class: u32, info: *mut usize, len: u32, ret: *mut u32) -> i32;
 }
 
 #[link(name = "ws2_32")]
@@ -184,6 +355,185 @@ fn check(c: &str) -> String {
                 }
                 format!("allowed {}", String::from_utf8_lossy(&buf[..read as usize]))
             }
+        }
+        // What this process can do to process `pid`: every right granted.
+        "signal" => {
+            let Some(pid) = pid_of(arg) else {
+                return "bad pid".into();
+            };
+            // SAFETY: plain call.
+            rights(|r| unsafe { OpenProcess(r, 0, pid) }, &PROCESS_RIGHTS)
+        }
+        // The same for the threads of process `pid`.
+        "thread" => {
+            let Some(pid) = pid_of(arg) else {
+                return "bad pid".into();
+            };
+            let tids = match threads(pid) {
+                Ok(t) if t.is_empty() => return "denied no thread of it is visible".into(),
+                Ok(t) => t,
+                Err(e) => return format!("denied {}", std::io::Error::from_raw_os_error(e as i32)),
+            };
+            // SAFETY: plain call.
+            rights(|r| unsafe { OpenThread(r, 0, tids[0]) }, &THREAD_RIGHTS)
+        }
+        // Whether process `pid` shows in a process snapshot (Toolhelp) or in
+        // EnumProcesses: what this process can learn of it without a handle.
+        "see" => {
+            let Some(pid) = pid_of(arg) else {
+                return "bad pid".into();
+            };
+            let mut pids = vec![0u32; 4096];
+            let mut needed = 0u32;
+            // SAFETY: a buffer of the size passed.
+            let enumerated = unsafe { K32EnumProcesses(pids.as_mut_ptr(), (pids.len() * 4) as u32, &mut needed) } != 0;
+            let enumerated = enumerated && pids[..needed as usize / 4].contains(&pid);
+            match processes() {
+                Ok(list) => match list.iter().find(|p| p.0 == pid) {
+                    Some(p) => format!("allowed {} (parent {}), {} processes visible", p.2, p.1, list.len()),
+                    None if enumerated => "allowed by EnumProcesses only".into(),
+                    None => format!("denied not among the {} processes visible", list.len()),
+                },
+                Err(e) if enumerated => format!("allowed by EnumProcesses only (snapshot: {e})"),
+                Err(e) => format!("denied {}", std::io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+        // Every process this process can see: the count and the images.
+        "procs" => match processes() {
+            Ok(list) => {
+                // Pid 0 is the idle pseudo-process every snapshot shows.
+                let list: Vec<_> = list.into_iter().filter(|p| p.0 != 0 && p.0 != std::process::id()).collect();
+                let other = list.len();
+                let mut names: Vec<&str> = list.iter().map(|p| p.2.as_str()).collect();
+                names.sort_unstable();
+                names.dedup();
+                if other == 0 {
+                    "denied no other process is visible".into()
+                } else {
+                    format!("allowed {other} others: {}", names.join(","))
+                }
+            }
+            Err(e) => format!("denied {}", std::io::Error::from_raw_os_error(e as i32)),
+        },
+        // A console control event (CTRL_BREAK_EVENT) to process group `arg`
+        // of this process's console: the console delivers it to every process
+        // of that group, whoever sent it.
+        "ctrl" => {
+            let Ok(group) = arg.parse::<u32>() else {
+                return "bad group".into();
+            };
+            // SAFETY: plain call.
+            if unsafe { GenerateConsoleCtrlEvent(1, group) } != 0 {
+                "allowed".into()
+            } else {
+                // SAFETY: plain call.
+                format!("denied {}", std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32))
+            }
+        }
+        // This process's console: whether it has one with a window, and
+        // whether its standard output is a console it can write to.
+        "console" => {
+            // SAFETY: plain calls on our own standard output.
+            unsafe {
+                let out = GetStdHandle(-11i32 as u32);
+                let mut mode = 0;
+                let is_console = GetConsoleMode(out, &mut mode) != 0;
+                let mut n = 0;
+                let line = b"[jail-probe console write]\r\n";
+                let wrote = WriteFile(out, line.as_ptr(), line.len() as u32, &mut n, std::ptr::null_mut()) != 0;
+                format!(
+                    "{} window {}, stdout console {is_console}, written {wrote}",
+                    if wrote { "allowed" } else { "denied" },
+                    !GetConsoleWindow().is_null()
+                )
+            }
+        }
+        // What Firecracker does with a terminal on its standard handles (the
+        // interactive serial console): input mode raw, input events polled,
+        // output written. The answer goes to the file `arg`, as standard
+        // output is the terminal.
+        "tty" => {
+            // SAFETY: plain calls on our own standard handles.
+            let answer = unsafe {
+                let (inp, out) = (GetStdHandle(-10i32 as u32), GetStdHandle(-11i32 as u32));
+                let (mut mode, mut events, mut n) = (0u32, 0u32, 0u32);
+                let get = GetConsoleMode(inp, &mut mode) != 0;
+                let set = get && SetConsoleMode(inp, mode & !0x7) != 0 && SetConsoleMode(inp, mode) != 0;
+                let poll = GetNumberOfConsoleInputEvents(inp, &mut events) != 0;
+                let line = b"[jail-probe tty write]\r\n";
+                let wrote = WriteFile(out, line.as_ptr(), line.len() as u32, &mut n, std::ptr::null_mut()) != 0;
+                let ok = get && set && poll && wrote;
+                format!(
+                    "{} input mode {get}, raw {set}, poll {poll}, output {wrote}, own window {}",
+                    if ok { "allowed" } else { "denied" },
+                    !GetConsoleWindow().is_null()
+                )
+            };
+            match std::fs::write(arg, &answer) {
+                Ok(()) => answer,
+                Err(e) => format!("denied cannot record: {e}"),
+            }
+        }
+        // Types a key into the console of this process's standard input, as
+        // Linux's TIOCSTI does: what a shell reading it would run.
+        "inject" => {
+            let rec = KEY_RECORD { event_type: 1, key_down: 1, repeat: 1, vkey: 0, vscan: 0, ch: u16::from(b'x'), state: 0 };
+            let mut n = 0;
+            // SAFETY: one record, our own standard input.
+            if unsafe { WriteConsoleInputW(GetStdHandle(-10i32 as u32), &rec, 1, &mut n) } != 0 {
+                "allowed".into()
+            } else {
+                // SAFETY: plain call.
+                format!("denied {}", std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32))
+            }
+        }
+        // Reads standard input up to a `q`, writes a marker to standard
+        // output, and records the bytes read, in hex, in the file `arg`.
+        "echo" => {
+            let mut got = Vec::new();
+            let mut b = [0u8; 1];
+            while got.len() < 64 {
+                match std::io::stdin().read(&mut b) {
+                    Ok(1) => {
+                        got.push(b[0]);
+                        if b[0] == b'q' {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            println!("[jail-probe echo {}]", got.len());
+            let hex: Vec<String> = got.iter().map(|b| format!("{b:02x}")).collect();
+            match std::fs::write(arg, hex.join(" ")) {
+                Ok(()) => format!("allowed {}", hex.join(" ")),
+                Err(e) => format!("denied cannot record: {e}"),
+            }
+        }
+        // Leaves this process's console and attaches to that of process
+        // `pid`: then its console control events reach that console's
+        // processes.
+        "attach" => {
+            let Some(pid) = pid_of(arg) else {
+                return "bad pid".into();
+            };
+            // SAFETY: plain calls.
+            unsafe {
+                FreeConsole();
+                if AttachConsole(pid) != 0 {
+                    "allowed".into()
+                } else {
+                    format!("denied {}", std::io::Error::from_raw_os_error(GetLastError() as i32))
+                }
+            }
+        }
+        // Waits `arg` seconds: a process for the others to act on.
+        "wait" => {
+            let Ok(secs) = arg.parse() else {
+                return "bad seconds".into();
+            };
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            "allowed".into()
         }
         _ => "unknown check".into(),
     }
