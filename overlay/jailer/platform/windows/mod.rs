@@ -93,11 +93,11 @@ use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx,
     LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, SE_PRIVILEGE_ENABLED, TOKEN_PRIVILEGES, TokenPrivileges,
     GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, GetTokenInformation,
-    LABEL_SECURITY_INFORMATION, LUA_TOKEN, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
     SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS,
-    TOKEN_DEFAULT_DACL, TOKEN_GROUPS, TOKEN_QUERY,
+    TOKEN_DEFAULT_DACL, TOKEN_GROUPS, TOKEN_OWNER, TOKEN_QUERY,
     TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenImpersonation,
-    TokenIntegrityLevel, TokenUser, PROTECTED_DACL_SECURITY_INFORMATION, ACL,
+    TokenIntegrityLevel, TokenOwner, TokenUser, PROTECTED_DACL_SECURITY_INFORMATION, ACL,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION, DefineDosDeviceW, GetLogicalDrives,
@@ -350,31 +350,21 @@ pub fn join_netns(path: &str) -> Result<(), JailerError> {
     Ok(())
 }
 
-/// Grants the jail's SID full access to `dir` and what is made in it, keeping
-/// the other entries (another jail sharing the network keeps its own), and
-/// labels it with the jail's integrity level, so that the jailed process can
-/// make its endpoints there: an object without a label is medium, which a
-/// jailed process may not write to.
-fn grant_to_jail(dir: &Path) -> io::Result<()> {
+/// The DACL of `path` as SDDL (`D:...`).
+fn dacl_sddl(path: &Path) -> io::Result<String> {
     use windows_sys::Win32::Security::Authorization::{
-        EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SetEntriesInAclW,
-        TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1,
     };
-    use windows_sys::Win32::Security::SUB_CONTAINERS_AND_OBJECTS_INHERIT;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-
-    let sid = Sid::new(vm_sid()).map_err(|e| io::Error::other(e.to_string()))?;
-    let mut old: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: a NUL-terminated path; out-pointers for the DACL and its descriptor.
+    // SAFETY: a NUL-terminated path and an out-pointer.
     let rc = unsafe {
         GetNamedSecurityInfoW(
-            wide(dir).as_ptr(),
+            wide(path).as_ptr(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut old,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             &mut sd,
         )
@@ -382,43 +372,56 @@ fn grant_to_jail(dir: &Path) -> io::Result<()> {
     if rc != 0 {
         return Err(io::Error::from_raw_os_error(rc.cast_signed()));
     }
-    let entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: FILE_ALL_ACCESS,
-        grfAccessMode: GRANT_ACCESS,
-        grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.0.cast(),
-        },
+    let mut text: *mut u16 = std::ptr::null_mut();
+    let mut len = 0u32;
+    // SAFETY: the descriptor read above; out-pointers.
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &mut text, &mut len)
     };
-    let mut new: *mut ACL = std::ptr::null_mut();
-    // SAFETY: one entry; the old ACL lives in `sd`; an out-pointer.
-    let rc = unsafe { SetEntriesInAclW(1, &entry, old, &mut new) };
+    let err = io::Error::last_os_error();
     // SAFETY: allocated by GetNamedSecurityInfoW.
     unsafe { LocalFree(sd) };
-    if rc != 0 {
-        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
+    if ok == 0 {
+        return Err(err);
     }
-    // SAFETY: a NUL-terminated path; the new ACL, freed below.
-    let rc = unsafe {
-        SetNamedSecurityInfoW(
-            wide(dir).as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            new,
-            std::ptr::null(),
-        )
+    // SAFETY: `len` characters allocated by the conversion, freed here.
+    let sddl = unsafe {
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, len as usize));
+        LocalFree(text.cast());
+        s
     };
-    // SAFETY: allocated by SetEntriesInAclW.
-    unsafe { LocalFree(new.cast()) };
-    if rc != 0 {
-        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
+    Ok(sddl.trim_end_matches('\0').to_owned())
+}
+
+/// Protects the network directory `dir` as the jail directory is protected:
+/// its DACL no longer inherits from its parent (what `C:\` grants, Modify to
+/// Authenticated Users, which every jail's token holds, let a jail into
+/// another jail's network, measured by `jailer-test.ps1 netns` on a WHP
+/// machine) and holds SYSTEM, the administrators, the user and this jail's
+/// SID, inherited by the endpoints made in it, plus the jail SIDs granted
+/// before (another jail sharing the network keeps its own). The directory
+/// is labelled with the jail's integrity level, so that the jailed process
+/// can make its endpoints there: an object without a label is medium, which
+/// a jailed process may not write to.
+fn grant_to_jail(dir: &Path) -> io::Result<()> {
+    let user = user_sid()?;
+    let mine = vm_sid();
+    let mut dacl = format!(
+        "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{mine})"
+    );
+    for ace in dacl_sddl(dir)?.split('(').skip(1) {
+        let fields: Vec<&str> = ace.trim_end_matches(')').split(';').collect();
+        // An allow entry of this directory's own (not inherited), for a jail.
+        if let [kind, flags, _, _, _, sid] = fields[..]
+            && kind == "A"
+            && !flags.contains("ID")
+            && sid.starts_with("S-1-9-")
+            && sid != mine
+        {
+            dacl.push_str(&format!("(A;OICI;FA;;;{sid})"));
+        }
     }
+    set_security(dir, &dacl, false)?;
     set_security(dir, JAIL_LABEL, true)
 }
 
@@ -995,19 +998,25 @@ fn user_sid() -> io::Result<String> {
     // SAFETY: a token handle we own.
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
     let user = token_info(token.as_raw_handle(), TokenUser).map_err(io::Error::other)?;
+    // SAFETY: the buffer holds a TOKEN_USER.
+    sid_string(unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid })
+}
+
+/// `sid` as text (`S-1-...`).
+fn sid_string(sid: PSID) -> io::Result<String> {
     let mut text: *mut u16 = std::ptr::null_mut();
-    // SAFETY: the buffer holds a TOKEN_USER; an out-pointer.
-    if unsafe { ConvertSidToStringSidW((*user.as_ptr().cast::<TOKEN_USER>()).User.Sid, &mut text) } == 0 {
+    // SAFETY: a valid SID and an out-pointer.
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: a NUL-terminated string allocated by the conversion.
-    let sid = unsafe {
+    let s = unsafe {
         let len = (0..).take_while(|&i| *text.add(i) != 0).count();
         let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
         LocalFree(text.cast());
         s
     };
-    Ok(sid)
+    Ok(s)
 }
 
 /// A token information class, in a buffer of the size the token asks for.
@@ -1143,22 +1152,55 @@ fn enable_privilege(token: HANDLE, p: LUID_AND_ATTRIBUTES) -> Result<(), HostErr
     Ok(())
 }
 
-/// A restricted token: no privileges but [`KEPT_PRIVILEGES`] (with
-/// [`LOCK_MEMORY`] enabled, so a jailed Firecracker maps large pages without
-/// adjusting a token it may not open), `restricting` SIDs, the default DACL
-/// and the jail's integrity level.
+/// Whether `sid` is a group a UAC-filtered token marks deny-only (what
+/// `LUA_TOKEN` does): the administrators and the other operator groups,
+/// local and domain, and "local account and member of Administrators".
+fn is_admin_group(sid: &str) -> bool {
+    const BUILTIN: [&str; 10] = ["544", "547", "548", "549", "550", "551", "553", "554", "556", "578"];
+    const DOMAIN: [&str; 5] = ["512", "517", "518", "519", "520"];
+    if sid == "S-1-5-114" {
+        return true;
+    }
+    if let Some(rid) = sid.strip_prefix("S-1-5-32-") {
+        return BUILTIN.contains(&rid);
+    }
+    sid.starts_with("S-1-5-21-") && sid.rsplit('-').next().is_some_and(|rid| DOMAIN.contains(&rid))
+}
+
+/// A restricted token: the administrators' groups deny-only
+/// ([`is_admin_group`]), the user its owner, no privileges but
+/// [`KEPT_PRIVILEGES`] (with [`LOCK_MEMORY`] enabled, so a jailed
+/// Firecracker maps large pages without adjusting a token it may not
+/// open), `restricting` SIDs, the default DACL and the jail's integrity
+/// level. Not `LUA_TOKEN`, which does the first two but also strips every
+/// privilege but a standard user's, `SeLockMemoryPrivilege` among them:
+/// an elevated jailer on an account holding it failed to enable it in the
+/// jail's token (ERROR_NOT_ALL_ASSIGNED, measured on a WHP machine).
 fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedHandle, HostError> {
     let held = privileges(from)?;
     let delete: Vec<LUID_AND_ATTRIBUTES> =
         held.iter().filter(|(n, _)| !KEPT_PRIVILEGES.contains(&n.as_str())).map(|(_, p)| *p).collect();
+    let groups = token_info(from, TokenGroups)?;
+    // SAFETY: the buffer holds a TOKEN_GROUPS with `GroupCount` entries.
+    let entries = unsafe {
+        let g = &*groups.as_ptr().cast::<TOKEN_GROUPS>();
+        std::slice::from_raw_parts(g.Groups.as_ptr(), g.GroupCount as usize)
+    };
+    let mut disable = Vec::new();
+    for g in entries {
+        let text = sid_string(g.Sid).map_err(|e| HostError::Spawn("a group's SID", e))?;
+        if is_admin_group(&text) {
+            disable.push(SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 });
+        }
+    }
     let mut t: HANDLE = std::ptr::null_mut();
-    // SAFETY: a token we own, a valid privilege array and a valid SID array.
+    // SAFETY: a token we own, valid SID arrays and a valid privilege array.
     if unsafe {
         CreateRestrictedToken(
             from,
-            LUA_TOKEN,
             0,
-            std::ptr::null(),
+            u32::try_from(disable.len()).unwrap(),
+            disable.as_ptr(),
             u32::try_from(delete.len()).unwrap(),
             delete.as_ptr(),
             u32::try_from(restricting.len()).unwrap(),
@@ -1171,6 +1213,23 @@ fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedH
     }
     // SAFETY: a token handle we own.
     let t = unsafe { OwnedHandle::from_raw_handle(t) };
+    // The user owns what the jail makes (an elevated token's owner is the
+    // administrators' group, deny-only now).
+    let user = token_info(from, TokenUser)?;
+    // SAFETY: the buffer holds a TOKEN_USER.
+    let owner = TOKEN_OWNER { Owner: unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid } };
+    // SAFETY: a structure of the size passed; the SID lives in `user`.
+    if unsafe {
+        SetTokenInformation(
+            t.as_raw_handle(),
+            TokenOwner,
+            (&raw const owner).cast(),
+            u32::try_from(std::mem::size_of::<TOKEN_OWNER>()).unwrap(),
+        )
+    } == 0
+    {
+        return Err(HostError::Spawn("TokenOwner", last_error()));
+    }
     if let Some((_, lock)) = held.iter().find(|(n, _)| n == LOCK_MEMORY) {
         enable_privilege(t.as_raw_handle(), *lock)?;
     }
@@ -1745,25 +1804,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // The jail's SID is granted on a network directory without disturbing
-    // the entries there (another jail's), and the directory gets the jail's
-    // label.
+    // A network directory granted to the jail is protected: what its parent
+    // grants (Authenticated Users, which every jail holds) is gone, the
+    // operator's entries and other jails' stay, and it gets the jail's label.
     #[test]
-    fn test_grant_to_jail_keeps_other_entries() {
+    fn test_grant_to_jail_protects_the_directory_and_keeps_other_jails() {
         let dir = std::env::temp_dir().join(format!("wick-jailer-grant-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let sddl = |path: &Path, label: bool| -> String {
+        let other = "S-1-9-1-2-3-4";
+        let user = user_sid().unwrap();
+        // As a temporary directory comes, plus another jail's entry.
+        let inherited = dacl_sddl(&dir).unwrap();
+        assert!(inherited.contains(";ID;") || inherited.contains("ID;"), "no inherited entry to drop: {inherited}");
+        set_security(&dir, &format!("D:AI(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{other})"), false).unwrap();
+        grant_to_jail(&dir).unwrap();
+        let after = dacl_sddl(&dir).unwrap();
+        assert!(after.starts_with("D:P"), "not protected: {after}");
+        for sid in ["SY", "BA", user.as_str(), vm_sid(), other] {
+            assert!(after.contains(&format!("(A;OICI;FA;;;{sid})")), "{sid} missing: {after}");
+        }
+        assert!(!after.contains("ID;") && !after.contains(";AU)") && !after.contains(";BU)"), "inherited entries kept: {after}");
+        let label = {
             use windows_sys::Win32::Security::Authorization::{
                 ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
             };
             let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-            let info = if label { LABEL_SECURITY_INFORMATION } else { DACL_SECURITY_INFORMATION };
             // SAFETY: a NUL-terminated path and out-pointers.
             let rc = unsafe {
                 GetNamedSecurityInfoW(
-                    wide(path).as_ptr(),
+                    wide(&dir).as_ptr(),
                     SE_FILE_OBJECT,
-                    info,
+                    LABEL_SECURITY_INFORMATION,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
@@ -1774,9 +1845,9 @@ mod tests {
             assert_eq!(rc, 0);
             let mut text: *mut u16 = std::ptr::null_mut();
             let mut len = 0u32;
-            // SAFETY: the descriptor from above; out-pointers.
+            // SAFETY: the descriptor read above; out-pointers.
             let ok = unsafe {
-                ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, info, &mut text, &mut len)
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, LABEL_SECURITY_INFORMATION, &mut text, &mut len)
             };
             assert_ne!(ok, 0);
             // SAFETY: `len` characters allocated by the conversion.
@@ -1786,20 +1857,49 @@ mod tests {
                 LocalFree(text.cast());
                 LocalFree(sd);
             }
-            s.trim_end_matches('\0').to_owned()
+            s
         };
-        let before = sddl(&dir, false);
-        grant_to_jail(&dir).unwrap();
-        let after = sddl(&dir, false);
-        assert!(after.contains(vm_sid()), "{after}");
-        // Every entry there before is still there.
-        for ace in before.trim_start_matches("D:").split_inclusive(')').filter(|a| a.starts_with('(')) {
-            assert!(after.contains(ace), "{ace} lost: {after}");
-        }
-        assert!(sddl(&dir, true).contains(JAIL_INTEGRITY_SID));
+        assert!(label.contains(JAIL_INTEGRITY_SID), "{label}");
         // A second grant (another jail of the same jailer: the same SID) changes nothing more.
         grant_to_jail(&dir).unwrap();
+        assert_eq!(dacl_sddl(&dir).unwrap(), after);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The jail's token marks the administrators' groups deny-only and makes
+    // the user its owner, as a UAC-filtered token does, without the LUA flag
+    // that would strip SeLockMemoryPrivilege with the rest.
+    #[test]
+    fn test_tokens_disable_the_administrators_and_are_owned_by_the_user() {
+        /// `SE_GROUP_USE_FOR_DENY_ONLY` (winnt.h).
+        const DENY_ONLY: u32 = 0x10;
+        assert!(is_admin_group("S-1-5-32-544") && is_admin_group("S-1-5-114") && is_admin_group("S-1-5-21-1-2-3-512"));
+        assert!(!is_admin_group("S-1-5-32-545") && !is_admin_group("S-1-5-21-1-2-3-1001") && !is_admin_group("S-1-1-0"));
+        let t = tokens().unwrap();
+        let user = user_sid().unwrap();
+        for token in [&t.primary, &t.initial] {
+            let groups = token_info(token.as_raw_handle(), TokenGroups).unwrap();
+            // SAFETY: the buffer holds a TOKEN_GROUPS with `GroupCount` entries.
+            let entries = unsafe {
+                let g = &*groups.as_ptr().cast::<TOKEN_GROUPS>();
+                std::slice::from_raw_parts(g.Groups.as_ptr(), g.GroupCount as usize)
+            };
+            let mut seen = 0;
+            for g in entries {
+                let sid = sid_string(g.Sid).unwrap();
+                if is_admin_group(&sid) {
+                    seen += 1;
+                    assert_ne!(g.Attributes & DENY_ONLY, 0, "{sid} is not deny-only");
+                }
+            }
+            if seen == 0 {
+                eprintln!("this account is in no administrators' group: only the owner was checked");
+            }
+            let owner = token_info(token.as_raw_handle(), TokenOwner).unwrap();
+            // SAFETY: the buffer holds a TOKEN_OWNER.
+            let owner = sid_string(unsafe { (*owner.as_ptr().cast::<TOKEN_OWNER>()).Owner }).unwrap();
+            assert_eq!(owner, user);
+        }
     }
 
     // The keeper's variable is read before main, ahead of upstream's
