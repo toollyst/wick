@@ -75,11 +75,12 @@ unsafe extern "C" {
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
     #[error(
-        "--cgroup {0} is not supported on macOS (supported: memory.max and cpu.max with \
+        "--cgroup {0} is not supported on macOS: {1} (supported: memory.max and cpu.max with \
          --cgroup-version 2, memory.limit_in_bytes, cpu.cfs_quota_us and cpu.cfs_period_us with \
-         --cgroup-version 1). The jailer never accepts a limit it cannot enforce."
+         --cgroup-version 1, and cpuset.cpus and cpuset.mems naming every CPU and memory node). \
+         The jailer never accepts a limit it cannot enforce."
     )]
-    UnsupportedCgroup(String),
+    UnsupportedCgroup(String, &'static str),
     #[error("--cgroup {0}: {1}")]
     CgroupValue(String, &'static str),
     #[error("No macOS equivalent for the device {0:?} in the jail")]

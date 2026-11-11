@@ -175,9 +175,15 @@ def stage_refuse(ctx):
     """Options the jailer cannot enforce on macOS, and binaries that cannot take a jail over."""
     cases = [
         (["--netns", "/var/run/netns/x"], "The jail's network \"/var/run/netns/x\" (--netns)"),
-        (["--cgroup", "cpuset.cpus=0"], "--cgroup cpuset.cpus=0 is not supported on macOS"),
-        (["--cgroup-version", "2", "--cgroup", "cpu.weight=100"], "is not supported on macOS"),
-        (["--cgroup", "cpu.shares=512"], "is not supported on macOS"),
+        # One per controller macOS cannot enforce, each with its reason.
+        (["--cgroup", "cpuset.cpus=0"], "--cgroup cpuset.cpus=0 is not supported on macOS: Apple silicon has no CPU affinity"),
+        (["--cgroup", "cpuset.mems=1"], "names one the host does not have"),
+        (["--cgroup-version", "2", "--cgroup", "cpu.weight=100"], "no proportional share"),
+        (["--cgroup", "cpu.shares=512"], "no proportional share"),
+        (["--cgroup-version", "2", "--cgroup", "pids.max=10"], "no limit on a process's threads"),
+        (["--cgroup-version", "2", "--cgroup", "io.max=1:0 rbps=1048576"], "no per-process I/O"),
+        (["--cgroup-version", "2", "--cgroup", "memory.high=268435456"], "hard limit only"),
+        (["--cgroup-version", "2", "--cgroup", "hugetlb.2MB.max=0"], "no hugetlb page pool"),
         # CPU limits macOS cannot enforce as asked: never loosened.
         (["--cgroup-version", "2", "--cgroup", "cpu.max=1000 1000000"], "below 1% of one CPU"),
         (["--cgroup-version", "2", "--cgroup", "cpu.max=300000 100000"], "above 255% of one CPU"),
@@ -188,6 +194,12 @@ def stage_refuse(ctx):
     # A binary without the hand-over would run unjailed as root.
     rc, out = run_jailer(ctx, jailer_base(ctx, "refuse-exec", "/bin/sleep") + ["--", "60"])
     check(rc != 0 and "cannot take the jail over" in out, f"/bin/sleep: exit {rc}, {out!r}")
+    # Every CPU and memory node is no restriction: accepted (the jailer gets
+    # as far as the exec, which the binary without the hand-over fails).
+    ncpu = os.cpu_count()
+    rc, out = run_jailer(ctx, jailer_base(ctx, "cpuset-all", "/bin/sleep") + [
+        "--cgroup", f"cpuset.cpus=0-{ncpu - 1}", "--cgroup", "cpuset.mems=0", "--", "60"])
+    check(rc != 0 and "cannot take the jail over" in out, f"cpuset of every CPU: exit {rc}, {out!r}")
     # Without the sandbox Firecracker could lift its own CPU limit.
     rc, out = run_jailer(ctx, jailer_base(ctx, "refuse-cpu") + [
         "--cgroup", "cpu.cfs_quota_us=50000", "--", "--api-sock", "/run/firecracker.socket", "--no-seccomp"])
