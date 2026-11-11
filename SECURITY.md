@@ -113,7 +113,9 @@ upstream Firecracker and its jailer.
   of review and fuzzing upstream's code has had, and have not had a third-party audit. Fuzzing has started: the
   virtio-net offload handling every non-Linux network backend uses (`vnet`) and the requests a userfaultfd handler
   process sends on macOS have fuzz targets, which CI runs for a minute each
-  ([CONTRIBUTING.md](CONTRIBUTING.md#fuzzing)). The Hypervisor.framework and WHP run loops have none yet.
+  ([CONTRIBUTING.md](CONTRIBUTING.md#fuzzing)), as does the interrupt controller the WHP run loop hands a
+  guest's port and MMIO accesses to (`whp_irqchip`). The Hypervisor.framework run loop has none yet, nor have the
+  WHP run loop's own steps, which call WHP.
 - **Side channels** between VMs on the same host follow upstream's
   [production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md)
   guidance on Linux; the equivalent guidance for macOS and Windows hosts is not written yet.
