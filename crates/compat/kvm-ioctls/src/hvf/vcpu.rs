@@ -44,6 +44,9 @@ const PSCI_TOS_NOT_PRESENT_MP: i64 = 2;
 const PSCI_VERSION_0_2: i64 = 2;
 
 const MPIDR_AFFINITY_MASK: u64 = 0xff_00ff_ffff;
+/// `kvm_run.system_event.data` of a PSCI SYSTEM_OFF or SYSTEM_RESET exit:
+/// `ndata` 1, the flags 0 (KVM since Linux 5.18).
+static SYSTEM_EVENT_DATA: [u64; 1] = [0];
 
 /// KVM's MPIDR for vCPU `id` (`reset_mpidr` in Linux arch/arm64/kvm/sys_regs.c).
 fn kvm_mpidr(id: u64) -> u64 {
@@ -961,7 +964,10 @@ impl VcpuFd {
                         self.advance_pc(hv)?;
                     }
                     if let Some(event) = self.psci(hv)? {
-                        return Ok(VcpuExit::SystemEvent(event, &[]));
+                        // As KVM since Linux 5.18 (kvm_prepare_system_event):
+                        // one word of data, the event's flags, 0 for PSCI's
+                        // SYSTEM_OFF and SYSTEM_RESET.
+                        return Ok(VcpuExit::SystemEvent(event, &SYSTEM_EVENT_DATA));
                     }
                 }
                 Exit::Wfi => {
