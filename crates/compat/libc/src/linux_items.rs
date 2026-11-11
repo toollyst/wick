@@ -49,11 +49,65 @@ pub const MADV_HUGEPAGE: c_int = 14;
 
 const HUGE_FLAGS: c_int = MAP_HUGETLB | (0x3f << MAP_HUGE_SHIFT);
 
+/// The check upstream's seccomp filters make of `mmap` and `mprotect`, which
+/// trap when the protection includes `PROT_EXEC`, for the host sandbox
+/// (`vmm::ext::sandbox`) to turn on once it narrows.
+///
+/// macOS has no kernel rule for it: Seatbelt filters a system call by number
+/// only, and an anonymous mapping made executable runs, also under the
+/// hardened runtime (measured on macOS 27 with an ad-hoc signature).
+/// Seatbelt's own rules end the process for a file mapped executable
+/// (`file-map-executable`) and a `MAP_JIT` mapping
+/// (`dynamic-code-generation`).
+pub mod wick_mm {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::c_int;
+
+    static EXEC_DENIED: AtomicUsize = AtomicUsize::new(0);
+
+    /// From now on, [`super::mmap`] and [`super::mprotect`] call `hook` when
+    /// asked for `PROT_EXEC` (the hook raises `SIGSYS`); if it returns, the
+    /// call fails with `EPERM`. As the Windows compatibility libc's.
+    pub fn deny_exec(hook: extern "C" fn(c_int)) {
+        EXEC_DENIED.store(hook as usize, Ordering::Release);
+    }
+
+    /// Whether a call asking for `prot` is denied, after the hook ran.
+    pub(super) fn exec_denied(prot: c_int) -> bool {
+        if prot & upstream::PROT_EXEC == 0 {
+            return false;
+        }
+        let hook = EXEC_DENIED.load(Ordering::Acquire);
+        if hook == 0 {
+            return false;
+        }
+        // SAFETY: only `extern "C" fn(c_int)` values are stored.
+        let hook: extern "C" fn(c_int) = unsafe { core::mem::transmute(hook) };
+        hook(prot);
+        super::set_errno(upstream::EPERM);
+        true
+    }
+}
+
+/// `mprotect`, with the [`wick_mm`] check.
+///
+/// # Safety
+/// Same contract as `mprotect(2)`.
+pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
+    if wick_mm::exec_denied(prot) {
+        return -1;
+    }
+    // SAFETY: forwarded.
+    unsafe { libc::mprotect(addr, len, prot) }
+}
+
 /// `mmap` with the Linux flags above.
 ///
 /// - `MAP_HUGETLB` (and huge page sizes): fails with `ENOTSUP`;
 /// - `MAP_POPULATE`: the range is prefaulted after mapping (`MADV_WILLNEED`
-///   and a read of every page when it is readable).
+///   and a read of every page when it is readable);
+/// - `PROT_EXEC` once the host sandbox narrowed: see [`wick_mm`].
 ///
 /// # Safety
 /// Same contract as `mmap(2)`.
@@ -65,6 +119,9 @@ pub unsafe fn mmap(
     fd: c_int,
     offset: off_t,
 ) -> *mut c_void {
+    if wick_mm::exec_denied(prot) {
+        return libc::MAP_FAILED;
+    }
     if flags & HUGE_FLAGS != 0 {
         set_errno(libc::ENOTSUP);
         return libc::MAP_FAILED;

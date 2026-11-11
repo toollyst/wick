@@ -115,6 +115,13 @@ mod macos {
 ; Own process only.
 (allow signal (target self))
 (allow process-info* (target self))
+; No code mapped in: upstream's filters trap mmap and mprotect asking for
+; PROT_EXEC. A file mapped executable and a MAP_JIT mapping raise SIGSYS here
+; (without the explicit rule Seatbelt lets a file under /usr/lib be mapped
+; executable); an anonymous mapping is the compatibility libc's check
+; (libc::wick_mm), turned on by narrow().
+(deny file-map-executable (with send-signal SIGSYS))
+(deny dynamic-code-generation (with send-signal SIGSYS))
 ; System calls: only those in SYSCALLS, Mach traps: only those in MACH_TRAPS,
 ; kernel MIG routines: only those in MIG_ROUTINES. Any other one fails and
 ; raises SIGSYS, on which Firecracker exits as for a seccomp violation
@@ -557,6 +564,7 @@ mod macos {
     /// which the process can neither release it nor take or issue another
     /// (see [`PROFILE`]). Without the sandbox (`--no-seccomp`), or a second
     /// time, it does nothing.
+    #[allow(unexpected_cfgs)]
     pub fn narrow() -> Result<(), SandboxError> {
         let mut state = STATE.lock().unwrap();
         if !state.installed || state.narrowed_done {
@@ -566,8 +574,32 @@ mod macos {
         let token = state.narrowed.take().expect("the narrowed token is kept until narrow()");
         token.consume().map_err(|err| fail("taking the narrowed extension", err))?;
         drop(token);
+        // Upstream's filters trap mmap and mprotect asking for PROT_EXEC. A
+        // discovery build lets the call through.
+        if !cfg!(wick_sandbox_discovery) {
+            libc::wick_mm::deny_exec(exec_denied);
+        }
         state.narrowed_done = true;
         Ok(())
+    }
+
+    /// Raises SIGSYS on this thread for an `mmap` or `mprotect` asking for
+    /// `PROT_EXEC` after [`narrow`], as a seccomp trap does: the signal is
+    /// the one Seatbelt sends (no code, this process), so upstream's handler
+    /// exits with the bad-syscall code ([`denied_syscall`]). If the signal is
+    /// blocked or ignored, the default action, as the kernel forces a seccomp
+    /// trap's SIGSYS.
+    extern "C" fn exec_denied(_prot: libc::c_int) {
+        // SAFETY: plain calls on this thread, with a valid signal set.
+        unsafe {
+            libc::pthread_kill(libc::pthread_self(), libc::SIGSYS);
+            libc::signal(libc::SIGSYS, libc::SIG_DFL);
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGSYS);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            libc::pthread_kill(libc::pthread_self(), libc::SIGSYS);
+        }
     }
 
     /// Installs `profile` for the whole process, permanently.
@@ -714,6 +746,88 @@ mod macos {
             unsafe { libc::dup(1) };
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
+        }
+
+        // Executable mappings end the process as upstream's mmap and mprotect
+        // rules do (they trap on PROT_EXEC): a file mapped executable and a
+        // MAP_JIT mapping always (Seatbelt), an anonymous one after narrow()
+        // (the compatibility libc's check). Before narrow(), where Linux's
+        // VMM thread is unfiltered, an anonymous one is made.
+        #[test]
+        fn test_executable_mappings_raise_sigsys() {
+            use std::os::unix::process::ExitStatusExt;
+            for case in ["file", "jit", "mmap", "mprotect", "blocked"] {
+                let out = child("exec_map_child", &[("WICK_TEST_CASE", case)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(stdout.contains("SETUP-OK"), "{case}: {stdout}");
+                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
+                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_executable_mappings_raise_sigsys in a separate process"]
+        fn exec_map_child() {
+            const PAGE: usize = 16384;
+            let anon = |prot| {
+                // SAFETY: a new anonymous mapping.
+                unsafe {
+                    libc::mmap(std::ptr::null_mut(), PAGE, prot, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+                }
+            };
+            let case = std::env::var("WICK_TEST_CASE").unwrap();
+            let lib = std::fs::File::open("/usr/lib/dyld")
+                .or_else(|_| std::fs::File::open(std::env::current_exe().unwrap()))
+                .unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            let rw = anon(libc::PROT_READ | libc::PROT_WRITE);
+            assert_ne!(rw, libc::MAP_FAILED);
+            if case == "mmap" || case == "mprotect" || case == "blocked" {
+                assert_ne!(anon(libc::PROT_READ | libc::PROT_EXEC), libc::MAP_FAILED);
+                narrow().unwrap();
+                // Not executable: allowed.
+                assert_ne!(anon(libc::PROT_READ), libc::MAP_FAILED);
+                // SAFETY: the mapping made above.
+                assert_eq!(unsafe { libc::mprotect(rw, PAGE, libc::PROT_READ) }, 0);
+            }
+            if case == "blocked" {
+                // SAFETY: a valid signal set.
+                unsafe {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGSYS);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                }
+            }
+            println!("SETUP-OK");
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
+            let p = match case.as_str() {
+                // SAFETY: a mapping of an open file.
+                "file" => unsafe {
+                    libc::mmap(std::ptr::null_mut(), PAGE, libc::PROT_READ | libc::PROT_EXEC,
+                        libc::MAP_PRIVATE, std::os::unix::io::AsRawFd::as_raw_fd(&lib), 0)
+                },
+                "jit" => {
+                    // SAFETY: a new anonymous mapping.
+                    unsafe {
+                        libc::mmap(std::ptr::null_mut(), PAGE,
+                            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                            libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_JIT, -1, 0)
+                    }
+                }
+                "mmap" | "blocked" => anon(libc::PROT_READ | libc::PROT_EXEC),
+                // SAFETY: the mapping made above.
+                _ => match unsafe { libc::mprotect(rw, PAGE, libc::PROT_READ | libc::PROT_EXEC) } {
+                    0 => rw,
+                    _ => libc::MAP_FAILED,
+                },
+            };
+            // Seatbelt signals the process, not the thread: the denied call
+            // returns EPERM here until the signal lands on a thread.
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED {p:?}");
         }
 
         #[test]

@@ -24,7 +24,7 @@ pub use linux_items::*;
 // Items that exist on macOS with a different signature: the explicit re-export
 // takes precedence over the glob re-export of `upstream`.
 #[cfg(target_os = "macos")]
-pub use linux_items::{getsockopt, madvise, mincore, mmap, syscall};
+pub use linux_items::{getsockopt, madvise, mincore, mmap, mprotect, syscall};
 /// The kernel side of userfaultfd (a wick API, not part of `libc`).
 #[cfg(target_os = "macos")]
 pub mod wick_uffd;
