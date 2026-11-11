@@ -615,11 +615,17 @@ mod macos {
     }
 
     /// The POSIX shared memory objects of the process `pid`: the names the
-    /// compatibility memfd gives them (`/fcm.<pid>.<n>`, made and unlinked at
-    /// once). Another name fails and raises SIGSYS (the default rule): on
-    /// Linux a memfd has no name another process could open.
+    /// compatibility memfd gives them (`/fcm.<pid>.<n>`, and
+    /// `/fcmH.<pid>.<n>` for a huge page one, `libc::HUGE_MEMFD_PREFIX`;
+    /// made and unlinked at once). Another name fails and raises SIGSYS (the
+    /// default rule): on Linux a memfd has no name another process could
+    /// open.
     fn shm_rule(pid: u32) -> String {
-        format!("(allow ipc-posix-shm* (ipc-posix-name-prefix \"/fcm.{pid}.\"))\n")
+        format!(
+            "(allow ipc-posix-shm* (ipc-posix-name-prefix \"/fcm.{pid}.\") \
+             (ipc-posix-name-prefix \"{}{pid}.\"))\n",
+            libc::HUGE_MEMFD_PREFIX
+        )
     }
 
     /// Operations a running microVM may not ask for, after the file rule
@@ -1711,6 +1717,45 @@ mod macos {
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(stdout.contains("NARROWED"), "{stdout}");
             assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
+        }
+
+        // Shared memory after narrow(): the memfds this process makes, an
+        // ordinary one and a 2 MiB huge page one (guest memory for a
+        // vhost-user device on huge pages), are created; a name of another
+        // process raises SIGSYS.
+        #[test]
+        fn test_own_memfds_are_made_after_narrow() {
+            use std::os::unix::process::ExitStatusExt;
+            let out = child("memfd_child", &[]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("MEMFDS-OK"), "{stdout}");
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
+            assert!(!stdout.contains("CHILD-SURVIVED"), "{stdout}");
+        }
+
+        #[test]
+        #[ignore = "run by test_own_memfds_are_made_after_narrow in a separate process"]
+        fn memfd_child() {
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            for huge in [None, Some(memfd::HugetlbSize::Huge2MB)] {
+                let mfd = memfd::MemfdOptions::default()
+                    .hugetlb(huge)
+                    .allow_sealing(true)
+                    .create("guest_mem")
+                    .unwrap_or_else(|e| panic!("memfd {huge:?}: {e}"));
+                mfd.as_file().set_len(2 << 20).unwrap();
+            }
+            println!("MEMFDS-OK");
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
+            // Another process's memfd name: the default rule, SIGSYS.
+            let other = std::ffi::CString::new(format!("{}1.0", libc::HUGE_MEMFD_PREFIX)).unwrap();
+            // SAFETY: a plain call.
+            unsafe { libc::shm_open(other.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
         }
 
         // fcntl: after narrow(), the commands of FCNTL_COMMANDS run and any
