@@ -83,3 +83,93 @@ all impossible integration_tests/functional/test_cmd_line_parameters.py::test_cl
 # read-only system volume there is no /mnt and none can be made ("Read-only
 # file system: '/mnt'").
 all impossible integration_tests/functional/test_snapshot_not_losing_dirty_pages.py::test_diff_snapshot_works_after_error
+
+# Transparent huge pages, as above (row 10): the microVM does not start
+# ("Error calling madvise: Invalid argument") before the pmem device is used.
+all row-10 integration_tests/functional/test_pmem.py::test_pmem_add[vmlinux-6.1.188-PCI_ON-Transparent-kvm]
+all row-10 integration_tests/functional/test_pmem.py::test_pmem_add[vmlinux-6.1.188-PCI_OFF-Transparent-kvm]
+all row-10 integration_tests/functional/test_pmem.py::test_pmem_add_as_root_ro[vmlinux-6.1.188-PCI_ON-Transparent-kvm]
+all row-10 integration_tests/functional/test_pmem.py::test_pmem_add_as_root_ro[vmlinux-6.1.188-PCI_OFF-Transparent-kvm]
+all row-10 integration_tests/functional/test_pmem.py::test_pmem_add_as_root_rw[vmlinux-6.1.188-PCI_ON-rw-Transparent-kvm]
+all row-10 integration_tests/functional/test_pmem.py::test_pmem_add_as_root_rw[vmlinux-6.1.188-PCI_OFF-rw-Transparent-kvm]
+all row-10 integration_tests/functional/test_pmem.py::test_pmem_zero_size_backing_file[vmlinux-6.1.188-PCI_ON-Transparent-kvm]
+all row-10 integration_tests/functional/test_pmem.py::test_pmem_zero_size_backing_file[vmlinux-6.1.188-PCI_OFF-Transparent-kvm]
+all row-10 integration_tests/functional/test_pmem.py::test_pmem_dax_memory_saving[vmlinux-6.1.188-rw-Transparent-kvm]
+all row-10 integration_tests/functional/test_pmem.py::test_device_reset[vmlinux-6.1.188-PCI_ON-Transparent-kvm]
+all row-10 integration_tests/functional/test_pmem.py::test_device_reset[vmlinux-6.1.188-PCI_OFF-Transparent-kvm]
+
+# Signal 35 is musl's SIGRTMIN, the signal Firecracker on Linux kicks its
+# vCPU threads with and handles. macOS has no real-time signals (NSIG 32):
+# kill(2) with 35 fails with EINVAL, and Firecracker kicks a vCPU through
+# Hypervisor.framework (hv_vcpus_exit), not with a signal.
+all impossible integration_tests/functional/test_signals.py::test_handled_signals
+
+# The test sets Firecracker's RLIMIT_FSIZE from outside with prlimit(2):
+# macOS has no prlimit (see test_api_machine_config above). The limit itself
+# exists, and the jailer's --resource-limit fsize= sets it.
+all impossible integration_tests/functional/test_signals.py::test_sigxfsz_handler
+
+# The handler's "socket" is a regular file. connect(2) to it fails on Linux
+# with ECONNREFUSED, which the test expects by Linux's number ("Connection
+# refused (os error 111)"); macOS fails it with ENOTSOCK, and its
+# ECONNREFUSED is 61. Firecracker reports the host's error as it is.
+all impossible integration_tests/functional/test_uffd.py::test_unbinded_socket
+
+# The guest connects to a server the test runs in the microVM's network
+# namespace (`ip netns exec <ns> python3 ...`). The harness's networks
+# (tools/macos/integration/wick_macos_net.py) run no host program inside:
+# their host side forwards only to the guest. To do: a forward from the
+# network's host address to a program on the host (slirp's guestfwd).
+all bug integration_tests/functional/test_net_config_space.py::test_net_change_mac_address
+
+# The test writes to Firecracker's terminal through /proc/<pid>/fd/0 with
+# TIOCSTI and reads its size with pmap; test_pmem_dax_memory_saving reads
+# RssAnon in /proc/<pid>/status. macOS has no /proc and no pmap; TIOCSTI on a
+# terminal not the caller's controlling one needs root there. To do: the
+# harness opens the terminal by its device (proc_pidfdinfo) and reads the
+# sizes with proc_pidinfo, as wick_macos.memory_maps does.
+all bug integration_tests/functional/test_serial_io.py::test_serial_dos
+all bug integration_tests/functional/test_pmem.py::test_pmem_dax_memory_saving[vmlinux-6.1.188-rw-None-kvm]
+
+# The guest's cache hierarchy is the host's, which Firecracker on Linux
+# reads in /sys/devices/system/cpu/cpu0/cache and gives the guest in its
+# device tree (arch::aarch64::cache_info). macOS has no such directory:
+# Firecracker logs "No L1 caches found in sysfs" and the guest has no cache
+# entries (`grep: /sys/devices/system/cpu/cpu0/cache/index*/level: No such
+# file or directory`). To do: the host's caches from sysctl (hw.perflevel*),
+# and the test's host side read the same way.
+all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_ON-HTT_OFF-1-kvm]
+all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_ON-HTT_OFF-2-kvm]
+all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_ON-HTT_OFF-16-kvm]
+all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_OFF-HTT_OFF-1-kvm]
+all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_OFF-HTT_OFF-2-kvm]
+all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_OFF-HTT_OFF-16-kvm]
+
+# Skipped off x86_64 by upstream (SMT is configured only on x86; pvclock;
+# cpuid and rdmsr), and the Linux results are x86_64's.
+all arch integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_ON-HTT_ON-1-kvm]
+all arch integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_ON-HTT_ON-2-kvm]
+all arch integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_ON-HTT_ON-16-kvm]
+all arch integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_OFF-HTT_ON-1-kvm]
+all arch integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_OFF-HTT_ON-2-kvm]
+all arch integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_OFF-HTT_ON-16-kvm]
+all arch integration_tests/functional/test_pause_resume.py::test_kvmclock_ctrl
+all arch integration_tests/functional/test_cpu_template_helper.py::test_cpu_config_dump_vs_actual
+
+# cpu-template-helper's fingerprint reads the host CPU's identification
+# registers in /sys/devices/system/cpu/cpu0/regs/identification
+# ("Failed to read .../revidr_el1: No such file or directory"); macOS has
+# no such directory. To do: the fingerprint's host fields from macOS
+# (sysctl hw.*, the vCPU's own ID registers).
+all bug integration_tests/functional/test_cpu_template_helper.py::test_consecutive_fingerprint_consistency
+
+# The test reads 100 times the rate limiter's bucket from /dev/hwrng within
+# ssh's 100 s, and its 1000 KB/s case needs the device to give at least
+# 1 MB/s. Measured without a rate limiter (scratch probe, load ~80): 80 KB/s,
+# one 64-byte request per guest notification and interrupt, about 0.75 ms
+# each: the vCPU's notification, the event loop's wakeup and the interrupt's
+# injection are three thread hand-offs here (the irqfd thread among them)
+# where KVM handles two in the kernel. The 100 KB/s case fails the same way
+# when the Mac is loaded. To do: inject an irqfd's interrupt from the thread
+# that signals it.
+all bug integration_tests/functional/test_rng.py::test_rng_bw_rate_limiter
