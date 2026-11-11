@@ -6,7 +6,9 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,isolation,boot,limits,cpu] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,low,daemonize,handles,isolation,boot,limits,cpu] [-Bin <dir>]
+#
+# `refuse`, `low`, `daemonize` and `handles` need no WHP; the others boot a guest.
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build).
 # Needs the boot test's guest files in -Assets (vmlinux-6.1.188 and
@@ -15,7 +17,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'isolation', 'boot', 'limits', 'cpu'),
+    [string[]]$Stage = @('refuse', 'low', 'daemonize', 'handles', 'isolation', 'boot', 'limits', 'cpu'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -129,7 +131,6 @@ function Stage-Refuse {
     $cases = [ordered]@{
         '--netns'                    = @('--netns', 'C:\x')
         '--new-pid-ns'               = @('--new-pid-ns')
-        '--daemonize'                = @('--daemonize')
         'fsize'                      = @('--resource-limit', 'fsize=1024')
         'cpuset'                     = @('--cgroup', 'cpuset.cpus=0', '--cgroup-version', '2')
     }
@@ -138,18 +139,145 @@ function Stage-Refuse {
         Check ($r[0] -ne 0) "$k accepted (exit $($r[0])): $($r[1])"
         Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue)) "$k started Firecracker"
     }
-    "--netns, --new-pid-ns, --daemonize, fsize= and an unsupported cgroup are refused before Firecracker starts"
+    "--netns, --new-pid-ns, fsize= and an unsupported cgroup are refused before Firecracker starts"
+}
+
+# Row 15 of docs/PORTING.md: --daemonize, upstream's observable behaviour.
+# The jailer returns 0 at once; Firecracker runs on, detached (no console),
+# and the pid file holds its pid. Needs no guest.
+function Stage-Daemonize {
+    $base = New-Base 'daemonize'
+    $root = Join-Path $base 'firecracker.exe\d\root'
+    try {
+        # The call operator blocks until the launcher returns; with --daemonize
+        # it returns at once, leaving a detached jailer and Firecracker behind.
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        & $Jailer --id d --exec-file $Fc --uid 0 --gid 0 --chroot-base-dir $base --daemonize 2>&1 | Out-Null
+        $code = $LASTEXITCODE
+        $sw.Stop()
+        Check ($code -eq 0) "the jailer did not return 0 with --daemonize (exit $code)"
+        Check ($sw.Elapsed.TotalSeconds -lt 10) "the jailer did not return promptly: $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
+        # The detached Firecracker keeps running after the launcher returned.
+        $sock = Join-Path $root 'run\firecracker.socket'
+        $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
+        Check (Test-Path $sock) 'the detached Firecracker did not open its API socket'
+        $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" } | Select-Object -First 1
+        Check ($null -ne $fcp) 'no detached Firecracker'
+        $pidFile = Join-Path $root 'firecracker.exe.pid'
+        Check (Test-Path $pidFile) 'no pid file'
+        $written = [int](Get-Content $pidFile)
+        Check ($written -eq $fcp.Id) "the pid file holds $written, Firecracker is $($fcp.Id)"
+        # It has no console window of its own.
+        Check ($fcp.MainWindowHandle -eq 0) 'the detached Firecracker has a window'
+        $answer = Invoke-Api $sock 'GET' '/'
+        Check ($answer -match ' 200$') "the detached Firecracker's API: $answer"
+        # Ending Firecracker lets its detached jailer exit cleanly and remove
+        # the jail's drive, as a guest shutdown does.
+        $fcp | Stop-Process -Force
+        $t = [DateTime]::Now.AddSeconds(5)
+        while ((Get-Process jailer -ErrorAction SilentlyContinue) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
+        "the launcher returned 0 in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s; a detached Firecracker (pid $written, in the pid file) ran with no console and answered its API"
+    } finally { Stop-Jailed }
+}
+
+# tools\windows\jail-probe.rs, built once (or -Probe).
+function Get-Probe {
+    if ($script:Probe) { return $script:Probe }
+    $p = Join-Path $WorkDir 'jail-probe.exe'
+    $rustc = Get-Command rustc -ErrorAction SilentlyContinue
+    Check ($null -ne $rustc) 'needs rustc (or -Probe) to build tools\windows\jail-probe.rs'
+    & $rustc.Source --edition 2021 -O -o $p (Join-Path $Here 'jail-probe.rs') 2>&1 | Out-Host
+    Check (Test-Path $p) 'jail-probe.rs did not build'
+    $script:Probe = $p
+    $p
+}
+
+Add-Type -Namespace WickJailerTest -Name Handle -MemberDefinition '[DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetHandleInformation(System.IntPtr h, uint mask, uint flags);'
+
+# Runs a program that inherits the test's inheritable handles (ProcessStartInfo
+# with redirected output sets bInheritHandles = TRUE) and returns its stdout.
+function Invoke-Inheriting([string]$exe, [string]$argline) {
+    $psi = New-Object Diagnostics.ProcessStartInfo($exe, $argline)
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    $out = $p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd()
+    [void]$p.WaitForExit(20000)
+    $out
+}
+
+# Row 15 of docs/PORTING.md: a handle the jailer inherited is not open in the
+# jailed Firecracker (the counterpart of the macOS inherited-descriptor
+# check). The jailer passes only the standard handles
+# (PROC_THREAD_ATTRIBUTE_HANDLE_LIST), so an inheritable handle it holds does
+# not reach the jailed binary. Needs no guest.
+function Stage-Handles {
+    $base = New-Base 'handles'
+    $probe = Get-Probe
+    $secret = "LEAK-$([Guid]::NewGuid().ToString('N'))"
+    $file = Join-Path $WorkDir "handle-secret-$PID.txt"
+    [IO.File]::WriteAllText($file, $secret)
+    $fs = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite')
+    try {
+        $h = $fs.SafeFileHandle.DangerousGetHandle()
+        # HANDLE_FLAG_INHERIT: the handle inherits into a child when the launch
+        # inherits handles.
+        Check ([WickJailerTest.Handle]::SetHandleInformation($h, 1, 1)) 'could not make the handle inheritable'
+        $value = $h.ToInt64()
+        # The control: a child that inherits the handle reads the secret back
+        # through its value, so the value is live and inheritable.
+        $ctl = Invoke-Inheriting $probe "handle:$value"
+        Check ($ctl -match "handle:$value allowed $secret") "the inheritable handle did not reach a plain child (so the test proves nothing): $ctl"
+        # Through the jailer: the jailer inherits the handle (Invoke-Jailer's
+        # launch inherits handles) but passes only the standard handles on, so
+        # the jailed probe does not have it.
+        $r = Invoke-Jailer @('--id', 'h', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', "handle:$value") 20000
+        $line = ($r[1] -split "`r?`n" | Where-Object { $_.StartsWith("handle:$value ") } | Select-Object -First 1)
+        Check ($null -ne $line) "the jailed probe did not answer: $($r[1])"
+        Check (-not ($line -match "allowed $secret")) "a handle the jailer inherited reached the jailed Firecracker: $line"
+        Check ($line -match 'denied') "unexpected answer: $line"
+        "a handle the jailer inherited (which a plain child does read) is not open in the jailed binary: $line"
+    } finally {
+        $fs.Close()
+        Remove-Item $file -ErrorAction SilentlyContinue
+        Stop-Jailed
+    }
+}
+
+# A jailed Firecracker with an API socket and no guest (no WHP needed).
+# Returns @{ Jailer; Fc (process); Root; Sock }.
+function Start-ApiJail([string]$base, [string]$id, [string[]]$jailerArgs = @()) {
+    $extra = ($jailerArgs | ForEach-Object { if ($_ -match ' ') { "`"$_`"" } else { $_ } }) -join ' '
+    $j = Start-Process $Jailer -ArgumentList "--id $id --exec-file `"$Fc`" --uid 0 --gid 0 --chroot-base-dir `"$base`" $extra" -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $base "$id-out.txt") -RedirectStandardError (Join-Path $base "$id-err.txt")
+    $root = Join-Path $base "firecracker.exe\$id\root"
+    $sock = Join-Path $root 'run\firecracker.socket'
+    $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t -and -not $j.HasExited) { Start-Sleep -Milliseconds 100 }
+    Check (Test-Path $sock) "the jailed API socket did not appear: $(Get-Content -Raw (Join-Path $base "$id-err.txt") -ErrorAction SilentlyContinue)"
+    $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" } | Select-Object -First 1
+    Check ($null -ne $fcp) "the jailed Firecracker $id is not running"
+    @{ Jailer = $j; Fc = $fcp; Root = $root; Sock = $sock }
+}
+
+# One API call to a socket; returns "<body> <status>".
+function Invoke-Api([string]$sock, [string]$method, [string]$path) {
+    & curl.exe -s -o - -w ' %{http_code}' --unix-socket $sock -X $method "http://localhost$path"
+}
+
+# Runs jail-probe with `checks` (check -> whether it must be allowed); returns
+# the lines that did not answer as expected.
+function Test-Probe([string[]]$prefix, $expect) {
+    $lines = @(& (Get-Probe) @($prefix + @($expect.Keys)) 2>&1 | ForEach-Object { "$_" })
+    $bad = @()
+    foreach ($k in $expect.Keys) {
+        $l = $lines | Where-Object { $_.StartsWith("$k ") } | Select-Object -First 1
+        if (-not $l) { $bad += "${k}: no answer ($($lines -join ' | '))"; continue }
+        $allowed = $l.Substring($k.Length + 1).StartsWith('allowed')
+        if ($allowed -ne $expect[$k]) { $bad += $l }
+    }
+    $bad
 }
 
 function Stage-Isolation {
-    $probe = $Probe
-    if (-not $probe) {
-        $probe = Join-Path $WorkDir 'jail-probe.exe'
-        $rustc = Get-Command rustc -ErrorAction SilentlyContinue
-        Check ($null -ne $rustc) 'needs rustc (or -Probe) to build tools\windows\jail-probe.rs'
-        & $rustc.Source --edition 2021 -O -o $probe (Join-Path $Here 'jail-probe.rs') 2>&1 | Out-Host
-        Check (Test-Path $probe) 'jail-probe.rs did not build'
-    }
+    $probe = Get-Probe
     $base = New-Base 'isolation'
     $secret = Join-Path $env:USERPROFILE "wick-jailer-test-$PID.txt"
     Set-Content $secret 'secret'
@@ -201,6 +329,47 @@ function Stage-Isolation {
         "jailed: no user files, nothing outside its jail, no other jail, API socket or process (the operator's, another microVM's); the operator reaches the API socket ($($expect.Count) checks)"
     } finally {
         Remove-Item $secret, $outside, 'C:\Users\Public\wick-jailer-test.txt' -ErrorAction SilentlyContinue
+        Stop-Jailed
+    }
+}
+
+# Row 16 of docs/PORTING.md: only the jail's identity reaches a jail. A plain
+# low-integrity process of the same user (jail-probe `low`: the user's token
+# at low integrity, as a browser's sandbox runs) holds the user's SID, which
+# the jail directory grants; the jail's integrity label, above low, keeps it
+# out of the jail's files, its API socket and the jailed process. Needs no
+# guest.
+function Stage-Low {
+    $base = New-Base 'low'
+    try {
+        $jail = Start-ApiJail $base 'target'
+        Set-Content (Join-Path $jail.Root 'secret.txt') 'secret'
+        $localLow = Join-Path $env:USERPROFILE 'AppData\LocalLow'
+        $medium = Join-Path $env:USERPROFILE "wick-jailer-test-low-$PID.txt"
+        $lowFile = Join-Path $localLow "wick-jailer-test-low-$PID.txt"
+        $expect = [ordered]@{
+            "read:$($jail.Root)\secret.txt"     = $false  # the jail's files
+            "write:$($jail.Root)\intruder.txt"  = $false
+            "write:$($jail.Root)\run\x.txt"    = $false
+            "connect:$($jail.Sock)"             = $false  # its API socket
+            "open:$($jail.Fc.Id)"               = $false  # the jailed process
+            # The controls: it is a low-integrity process of the user.
+            'read:C:\Windows\win.ini'          = $true
+            "write:$lowFile"                    = $true
+            "write:$medium"                     = $false
+        }
+        $bad = Test-Probe @('low') $expect
+        Check ($bad.Count -eq 0) "low integrity: $($bad -join '; ')"
+        Check (-not (Test-Path (Join-Path $jail.Root 'intruder.txt'))) 'a file appeared in the jail'
+        # The operator still reaches the jailed Firecracker, which answers.
+        $op = Test-Probe @() ([ordered]@{ "connect:$($jail.Sock)" = $true; "read:$($jail.Root)\secret.txt" = $true })
+        Check ($op.Count -eq 0) "operator: $($op -join '; ')"
+        $answer = Invoke-Api $jail.Sock 'GET' '/'
+        Check ($answer -match '"state":"Not started".* 200$') "the jailed Firecracker's API: $answer"
+        Check (-not $jail.Fc.HasExited) 'the jailed Firecracker exited'
+        "a low-integrity process of the user reaches neither the jail's files, its API socket nor the jailed process ($($expect.Count - 3) checks, 3 controls); the operator does, and the jailed Firecracker answers"
+    } finally {
+        Remove-Item (Join-Path $env:USERPROFILE "wick-jailer-test-low-$PID.txt"), (Join-Path $env:USERPROFILE "AppData\LocalLow\wick-jailer-test-low-$PID.txt") -ErrorAction SilentlyContinue
         Stop-Jailed
     }
 }
@@ -298,9 +467,9 @@ $left = foreach ($c in [char[]](68..90)) {
     if ([WickJailerTest.Dos]::QueryDosDevice("$($c):", $sb, 1024) -gt 0 -and $sb.ToString().StartsWith("\??\$WorkDir", 'OrdinalIgnoreCase')) { "$($c): -> $($sb.ToString().Substring(4))" }
 }
 $Results['drives'] = if ($left) { "FAIL  drives: left mapped: $($left -join ', ')" } else { 'PASS  drives: every jail drive was removed' }
-''
-$Results.Values
 $failed = @($Results.Values | Where-Object { $_.StartsWith('FAIL') }).Count
+$summary = @($Results.Values) + @('', "$($Results.Count - $failed) passed, $failed failed")
+$summary | Set-Content -Encoding UTF8 (Join-Path $WorkDir 'summary.txt')
 ''
-"$($Results.Count - $failed) passed, $failed failed"
+$summary
 exit [int]($failed -ne 0)

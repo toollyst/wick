@@ -7,9 +7,11 @@
 
 use crate::{c_void, size_t};
 
-/// `struct iovec`: one buffer of a vectored I/O call.
+/// `struct iovec`: one buffer of a vectored I/O call. Compared and hashed by
+/// its fields with the `extra_traits` feature, as libc's own.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
 pub struct iovec {
     /// Start of the buffer.
     pub iov_base: *mut c_void,

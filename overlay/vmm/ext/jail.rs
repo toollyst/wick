@@ -289,7 +289,7 @@ mod imp {
 }
 
 /// Windows: the jailer (overlay/jailer/platform/windows) starts Firecracker
-/// on a restricted, low integrity token, with an initial impersonation token
+/// on a restricted token below medium integrity, with an initial impersonation token
 /// (the same with the user's SID) on the main thread so the loader can start
 /// the process, and the jail's root as the current directory (a drive of its
 /// own). Entering the jail is reverting to the process token, then checking

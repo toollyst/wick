@@ -153,6 +153,31 @@ const GRANULE: usize = 64 * 1024;
 pub mod wick_mm {
     use super::*;
 
+    /// What `mmap` and `mprotect` call when asked for `PROT_EXEC` once the
+    /// host sandbox prohibits dynamic code (`vmm::ext::sandbox`): the
+    /// counterpart of upstream's seccomp rules for both calls, which trap
+    /// when the protection includes `PROT_EXEC`. The hook raises `SIGSYS`;
+    /// if it returns, the call fails as Windows refuses the mapping.
+    pub fn deny_exec(hook: extern "C" fn(c_int)) {
+        EXEC_DENIED.store(hook as usize, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) static EXEC_DENIED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Calls the [`deny_exec`] hook if `prot` asks for execution.
+    pub(super) fn check_exec(prot: c_int) {
+        if prot & PROT_EXEC == 0 {
+            return;
+        }
+        let hook = EXEC_DENIED.load(std::sync::atomic::Ordering::Acquire);
+        if hook != 0 {
+            // SAFETY: only `extern "C" fn(c_int)` values are stored.
+            let hook: extern "C" fn(c_int) = unsafe { std::mem::transmute(hook) };
+            hook(prot);
+        }
+    }
+
     /// A section to map instead of the file a descriptor names: a memfd
     /// sealed against shrinking or growing attaches the section that fixes
     /// its size (see the `memfd` compatibility crate). While it exists,
@@ -887,6 +912,7 @@ pub unsafe fn mmap(
     fd: c_int,
     offset: off_t,
 ) -> *mut c_void {
+    wick_mm::check_exec(prot);
     let ty = flags & (MAP_SHARED | MAP_PRIVATE);
     if len == 0 || offset < 0 || (ty != MAP_SHARED && ty != MAP_PRIVATE) || win_prot(prot).is_none()
     {
@@ -1039,6 +1065,7 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
 /// # Safety
 /// Same contract as `mprotect(2)`.
 pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
+    wick_mm::check_exec(prot);
     let start = addr as usize;
     let Some(wprot) = win_prot(prot) else {
         return fail(crate::EINVAL, -1);

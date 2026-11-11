@@ -20,8 +20,8 @@ and the [roadmap](ROADMAP.md) say what is in place. This page says what each bac
    runs against every backend, a unit test next to the backend, or a boot-test or jailer-test stage. Each row below
    names its test. A probe that once showed something is not a test.
 4. **A doc claim names its test.** A table cell that says "in place", "verified" or "measured" names the test in
-   backticks (`tools/check-claims.py`, on CI). Windows cells are warnings until each one names its test; then CI
-   runs with `--strict-windows`.
+   backticks (`tools/check-claims.py`, on CI). Every Windows cell now names its test, so CI runs with
+   `--strict-windows`.
 5. **Tests leave nothing behind.** Every process a test starts is registered as soon as it is started and killed on
    any exit. Each run writes `summary.txt` ending `N passed, M failed`. Each launcher calls `prepare_test_run`
    (`tools/common.sh`), which runs `tools/clean.sh` and checks free disk space first.
@@ -42,34 +42,38 @@ go through a backend.
 
 | Primitive | Linux (upstream) | macOS | Test | Windows |
 | --- | --- | --- | --- | --- |
-| `chroot::chroot` | mount namespace + `pivot_root` | `chroot(2)`; left again for the exec only, and entered again by Firecracker first thing (`vmm::ext::jail::enter`) | `jailer-test jail` | the jail as a drive of its own, the current directory its root |
-| `Env::exec_command` | exec as `uid:gid` | exec of a root-owned copy outside the jail that carries `HANDOVER_MARK`, with `WICK_JAIL=<uid>:<gid>:<root>` | `test_copy_for_exec`, `test_enter_needs_root`, `jailer-test jail` | a restricted, low-integrity token with a random SID per jail; the jailer waits and exits with Firecracker's status |
-| `cgroup` memory | cgroup files | jetsam limit at the exec | `test_memory_limit`, `jailer-test limits`, `jailer-test memory` | Job Object memory limit |
-| `cgroup` CPU | cgroup files | `process_policy` CPU limit, applied by `jail::enter` and read back; `--no-seccomp` refused with it | `test_cpu_limit`, `test_cpu_limit_holds`, `test_cpu_limit_needs_the_jail`, `jailer-test cpu` | Job Object CPU rate hard cap, after 2 CPU-seconds of grace (to remove) |
-| `cgroup`, other controllers | cgroup files | refused | `test_other_controllers_are_refused`, `jailer-test refuse` | refused |
-| `join_netns` (`--netns`) | `setns` | refused; the Seatbelt profile denies IP networking | `test_unsupported_isolation_is_refused`, `test_sandbox_restricts_child`, `jailer-test refuse` | refused; Windows Filtering Platform confinement is planned |
-| `new_pid_ns` (`--new-pid-ns`) | `clone(CLONE_NEWPID)` | refused | `test_unsupported_isolation_is_refused` | refused |
-| `--daemonize` | `setsid`, `/dev/null` | upstream's | `jailer-test daemonize` | refused |
-| `mknod_and_own_dev` | device nodes in the jail | none needed | `test_devices` | none needed |
-| `close_fds_by_close_range` | `close_range` | `proc_pidinfo` + `close`; a file and a directory outside the jail, inherited by the jailer, are not open in Firecracker | `jailer-test jail` | nothing to close: only the standard handles are passed (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`); no test yet |
+| `chroot::chroot` | mount namespace + `pivot_root` | `chroot(2)`; left again for the exec only, and entered again by Firecracker first thing (`vmm::ext::jail::enter`) | `jailer-test jail` | the jail as a drive of its own, the current directory its root (`jailer-test.ps1 isolation`, `drives`) |
+| `Env::exec_command` | exec as `uid:gid` | exec of a root-owned copy outside the jail that carries `HANDOVER_MARK`, with `WICK_JAIL=<uid>:<gid>:<root>` | `test_copy_for_exec`, `test_enter_needs_root`, `jailer-test jail` | a restricted token below medium integrity with a random SID per jail; the jailer waits and exits with Firecracker's status (`jailer-test.ps1 isolation`, `low`) |
+| `cgroup` memory | cgroup files | jetsam limit at the exec | `test_memory_limit`, `jailer-test limits`, `jailer-test memory` | Job Object memory limit (`jailer-test.ps1 limits`) |
+| `cgroup` CPU | cgroup files | `process_policy` CPU limit, applied by `jail::enter` and read back; `--no-seccomp` refused with it | `test_cpu_limit`, `test_cpu_limit_holds`, `test_cpu_limit_needs_the_jail`, `jailer-test cpu` | Job Object CPU rate hard cap, after 2 CPU-seconds of grace (to remove) (`jailer-test.ps1 cpu`) |
+| `cgroup`, other controllers | cgroup files | refused | `test_other_controllers_are_refused`, `jailer-test refuse` | refused (`jailer-test.ps1 refuse`) |
+| `join_netns` (`--netns`) | `setns` | refused; the Seatbelt profile denies IP networking | `test_unsupported_isolation_is_refused`, `test_sandbox_restricts_child`, `jailer-test refuse` | refused; Windows Filtering Platform confinement is planned (`test_unsupported_isolation_is_refused`, `jailer-test.ps1 refuse`) |
+| `new_pid_ns` (`--new-pid-ns`) | `clone(CLONE_NEWPID)` | refused | `test_unsupported_isolation_is_refused` | refused (`test_unsupported_isolation_is_refused`, `jailer-test.ps1 refuse`) |
+| `--daemonize` | `setsid`, `/dev/null` | upstream's | `jailer-test daemonize` | the jailer relaunches itself detached, without the flag, and returns 0; the detached jailer runs Firecracker with no console (`jailer-test.ps1 daemonize`) |
+| `mknod_and_own_dev` | device nodes in the jail | none needed | `test_devices` | none needed (`test_devices`) |
+| `close_fds_by_close_range` | `close_range` | `proc_pidinfo` + `close`; a file and a directory outside the jail, inherited by the jailer, are not open in Firecracker | `jailer-test jail` | nothing to close: only the standard handles are passed (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), so a handle the jailer inherited is not open in Firecracker (`jailer-test.ps1 handles`) |
 
 ## The system call filter (`overlay/vmm/ext/sandbox.rs`)
 
 | | Linux (upstream) | macOS | Test | Windows |
 | --- | --- | --- | --- | --- |
-| Default | per-thread seccomp-BPF | Seatbelt, process-wide, in two phases: what building the microVM takes until `narrow()` (where Linux installs the VMM thread's filter), then 87 system calls, 15 Mach traps, 7 MIG routines, each tied to a Linux rule, for good; any other one raises SIGSYS and Firecracker exits with upstream's bad-syscall code | `test_unlisted_syscalls_raise_sigsys`, `test_denied_syscall_exits_as_seccomp`, `test_narrow_ends_the_setup_phase`, `test_narrowing_is_one_way`, every `boot-test` stage, `tools/macos/sandbox-discovery.sh` | `ProcessChildProcessPolicy` only |
-| No exec, fork, IP, Mach lookups, IOKit, sysctl writes | seccomp | the profile | `test_sandbox_restricts_child` | child processes only |
-| Files limited to the jail | chroot | a Seatbelt file rule on the jail | `test_jail_profile_limits_files`, `test_files_in_jail_rejects_bad_paths`, `jailer-test jail` | the jail's ACLs and token |
-| `--seccomp-filter FILE` | the given filters | refused | `ext::sandbox` | refused |
-| The allow-lists themselves | | no duplicates; the calls Firecracker needs are in, the ones that would lift a limit or reach another task are out; Seatbelt refuses to compile an unknown name | `test_syscall_names_are_known`, `test_mach_trap_names_are_known`, `test_mig_routine_names_are_known` | |
+| Default | per-thread seccomp-BPF | Seatbelt, process-wide, in two phases: what building the microVM takes until `narrow()` (where Linux installs the VMM thread's filter), then 87 system calls, 15 Mach traps, 7 MIG routines, each tied to a Linux rule, for good; any other one raises SIGSYS and Firecracker exits with upstream's bad-syscall code | `test_unlisted_syscalls_raise_sigsys`, `test_denied_syscall_exits_as_seccomp`, `test_narrow_ends_the_setup_phase`, `test_narrowing_is_one_way`, every `boot-test` stage, `tools/macos/sandbox-discovery.sh` | a process mitigation profile, process-wide, in the same two phases (`apply()` then `narrow()`), each mitigation tied to a Linux rule; a denied operation ends Firecracker with upstream's bad-syscall code where Windows reports it (an executable mapping, an invalid handle), else fails closed (`test_narrow_ends_the_setup_phase`, `test_narrowing_is_one_way`, `test_denied_operation_exits_as_seccomp`, `test_denied_operations_fail_closed`, `tools/windows/mitigation-audit.ps1`) |
+| No exec, fork, IP, Mach lookups, IOKit, sysctl writes | seccomp | the profile | `test_sandbox_restricts_child` | no child processes, no win32k, no dynamic code, no extension points, Microsoft-signed images only, none remote or low-label (`test_child_process_policy`, `test_win32k_policy`, `test_dynamic_code_policy`, `test_extension_point_policy`, `test_signature_policy`, `test_image_load_policy`) |
+| Files limited to the jail | chroot | a Seatbelt file rule on the jail | `test_jail_profile_limits_files`, `test_files_in_jail_rejects_bad_paths`, `jailer-test jail` | the jail's ACLs and token (`jailer-test.ps1 isolation`, `low`) |
+| `--seccomp-filter FILE` | the given filters | refused | `ext::sandbox` | refused (`ext::sandbox`) |
+| The allow-lists themselves | | no duplicates; the calls Firecracker needs are in, the ones that would lift a limit or reach another task are out; Seatbelt refuses to compile an unknown name | `test_syscall_names_are_known`, `test_mach_trap_names_are_known`, `test_mig_routine_names_are_known` | each mitigation names the Linux rule it stands for, read back after it is set (`test_every_mitigation_names_its_linux_rule`, `test_strict_handle_check_policy`) |
 
 How the macOS lists are checked: `tools/macos/sandbox-discovery.sh` builds Firecracker with
 `--cfg wick_sandbox_discovery`, where a call outside the run phase's lists is allowed and reported, after `narrow()`,
 instead of raising SIGSYS. It runs every boot-test stage and fails if the kernel reported any call (debug and release
 both). To find calls the first time, `(allow syscall-unix (with report))` (and the same for `syscall-mach` and
 `syscall-mig`) logs each distinct call; `/usr/bin/log show --predicate 'sender == "Sandbox"'` reads them (in zsh, a
-bare `log` is a builtin). The Windows counterpart is the same loop: turn a mitigation on in audit mode where Windows
-has one (the ETW mitigation events), run every stage, and only then turn it on for real.
+bare `log` is a builtin). The Windows counterpart is `tools/windows/mitigation-audit.ps1`: it builds Firecracker with
+`--cfg wick_sandbox_discovery`, which sets the audit variant of the mitigations Windows audits at run time (dynamic
+code, child processes, win32k) so an operation they would deny is allowed and reported in the Security-Mitigations
+event log instead, runs an API session (no WHP) or boot-test stages, and lists what the logs reported. A control that
+allocates executable memory must be reported, or a clean run would prove nothing. Image File Execution Options audit
+settings were tried first and were not applied to the process on Windows Server 2022.
 
 ## The hypervisor and the compatibility crates (`crates/compat`)
 
@@ -97,7 +101,9 @@ exemption.
 | --- | --- | --- |
 | `refuse`: unsupported isolation refused | yes | yes |
 | `jail`: chroot, user, descriptors, the hand-over | yes | `isolation`, `drives` |
-| `daemonize` | yes | **missing**: `--daemonize` is refused |
+| `daemonize` | yes | `daemonize` (the launcher returns 0; a detached Firecracker runs with no console) |
+| (a handle the jailer inherited is not open in the jail) | part of `jail` | `handles` |
+| (only the jail's identity reaches a jail) | part of `jail` | `low` (a low-integrity process of the user is kept out) |
 | `limits`: cgroups and resource limits applied | yes | yes |
 | `boot`: a jailed guest boots | yes | yes |
 | `memory`: a guest past the memory limit kills the VMM | yes | **missing** |
@@ -112,9 +118,9 @@ physically cannot do it. Then the request is refused loudly, and the row says wh
 
 | # | Linux does | macOS | Windows | Done when |
 | --- | --- | --- | --- | --- |
-| 1 | Allows each thread only the system calls upstream's filter lists for it | Two phases as on Linux: wide until the microVM is built, then narrowed for good to 87 system calls, 15 Mach traps and 7 MIG routines, each tied to the Linux rule it stands for (`test_narrowing_is_one_way`, `tools/macos/sandbox-discovery.sh`). Left: Seatbelt cannot deny 91 system calls by number; each of those is to be tied to the operation rule that limits it, or written down as impossible | `ProcessChildProcessPolicy` only. To do: the mitigation profile, each mitigation tied to the Linux rule it stands for | a unit test per removed or kept entry; every boot-test stage passes |
-| 2 | Checks the arguments of 14 calls (`ioctl` requests, `socket` domain, `mmap`/`mprotect` protections, `fcntl` commands, `futex` operations, ...) | Expressed in Seatbelt where it has a counterpart: after narrowing, driver ioctls only for the terminal's settings and a block device's sizes (Linux's TCGETS/TCSETS/TIOCGWINSZ and BLK* rules; KVM, TAP and Nitro Enclaves requests have none here), Unix sockets only and no bind (`socket`/`connect`/`bind` domains), no sysctl reads (`test_run_phase_ioctls_and_holes`, `test_unlisted_syscalls_raise_sigsys`). Left: `mmap`/`mprotect` protections, `fcntl` commands, `futex` operations, `madvise` advice, `accept4` flags, each expressed or written down as impossible | none. To do: the same list | a unit test per check that a call with a denied argument ends Firecracker as seccomp does |
-| 3 | A denied call raises SIGSYS, and Firecracker exits with upstream's bad-syscall code | A denied system call, Mach trap, MIG routine, network operation, ioctl, sysctl or any other operation raises SIGSYS and Firecracker exits with upstream's bad-syscall code; a file outside what is allowed fails with an error, as a path outside the chroot does on Linux; two operations the system libraries make and handle failing are denied with an error (`DENIED_WITH_ERROR`) (`test_unlisted_syscalls_raise_sigsys`, `test_denied_syscall_exits_as_seccomp`) | a mitigation failure is a Windows error. To do: the same exit | a unit test per kind of denied operation |
+| 1 | Allows each thread only the system calls upstream's filter lists for it | Two phases as on Linux: wide until the microVM is built, then narrowed for good to 87 system calls, 15 Mach traps and 7 MIG routines, each tied to the Linux rule it stands for (`test_narrowing_is_one_way`, `tools/macos/sandbox-discovery.sh`). Left: Seatbelt cannot deny 91 system calls by number; each of those is to be tied to the operation rule that limits it, or written down as impossible | Done: a process mitigation profile in the same two phases (`apply()`, then `narrow()` where Linux installs the VMM thread's filter), each mitigation tied to the Linux rule it stands for and read back (`test_every_mitigation_names_its_linux_rule`, `test_narrowing_is_one_way`, `tools/windows/mitigation-audit.ps1`). A mitigation is coarser than a seccomp rule (it bars a capability, not a numbered call); where Windows has no mitigation for a Linux rule, it is written down | a unit test per removed or kept entry (on Windows, per mitigation, read back with `GetProcessMitigationPolicy`); every boot-test stage passes; the discovery or audit run is clean |
+| 2 | Checks the arguments of 14 calls (`ioctl` requests, `socket` domain, `mmap`/`mprotect` protections, `fcntl` commands, `futex` operations, ...) | Expressed in Seatbelt where it has a counterpart: after narrowing, driver ioctls only for the terminal's settings and a block device's sizes (Linux's TCGETS/TCSETS/TIOCGWINSZ and BLK* rules; KVM, TAP and Nitro Enclaves requests have none here), Unix sockets only and no bind (`socket`/`connect`/`bind` domains), no sysctl reads (`test_run_phase_ioctls_and_holes`, `test_unlisted_syscalls_raise_sigsys`). Left: `mmap`/`mprotect` protections, `fcntl` commands, `futex` operations, `madvise` advice, `accept4` flags, each expressed or written down as impossible | Partly: the `mmap`/`mprotect` `PROT_EXEC` check is the dynamic code policy, and using a handle the process does not hold is the strict handle check (`test_dynamic_code_policy`, `test_strict_handle_check_policy`). Left: `ioctl`/`socket`/`fcntl`/`futex` arguments, which a mitigation cannot express, to be tied to a token or ACL limit or written down as impossible | a unit test per check that a call with a denied argument ends Firecracker as seccomp does |
+| 3 | A denied call raises SIGSYS, and Firecracker exits with upstream's bad-syscall code | A denied system call, Mach trap, MIG routine, network operation, ioctl, sysctl or any other operation raises SIGSYS and Firecracker exits with upstream's bad-syscall code; a file outside what is allowed fails with an error, as a path outside the chroot does on Linux; two operations the system libraries make and handle failing are denied with an error (`DENIED_WITH_ERROR`) (`test_unlisted_syscalls_raise_sigsys`, `test_denied_syscall_exits_as_seccomp`) | Done where Windows reports the denial (an executable mapping, an invalid handle): SIGSYS on the calling thread, so upstream's handler exits with the bad-syscall code (`test_denied_operation_exits_as_seccomp`, `test_denied_operation_raises_sigsys`). The denials Windows reports only as an error code (child process, win32k, unsigned/remote/low image) fail closed, with no notification to turn into SIGSYS (`test_denied_operations_fail_closed`) | a unit test per kind of denied operation |
 | 4 | The API thread has its own, narrower filter | the API thread shares the process's allow-list. To do: the API server in a process of its own with the API filter's equivalent | the same | the API filter's tests run against the API process |
 | 5 | vCPU threads have a filter different from the VMM thread's | Impossible: the hypervisor needs vCPUs in the VM's process, and macOS has no per-thread sandbox. The process gets the union, which is also the effective boundary on Linux, as threads share memory | Impossible, for the same reason (WHP partitions belong to a process; mitigations are per process) | written down in SECURITY.md |
 | 6 | `--netns`: Firecracker joins a network namespace, and the guest reaches only the network given there | refused. To do: the jailer gives each jail a network of its own, which the VMM reaches only through a socket in the jail | refused. To do: Windows Filtering Platform, and the same per-jail network | a jailer-test stage: two jails, each reaching only its own network |
@@ -126,7 +132,7 @@ physically cannot do it. Then the request is refused loudly, and the row says wh
 | 12 | Passes upstream's integration tests | not run on macOS. To do: upstream's pytest suites against the macOS build, compared test by test as on Linux | not run on Windows. To do: the same | a comparison as `compare-integration-tests.py` makes |
 | 13 | Upstream's code, reviewed and fuzzed for years | the Hypervisor.framework run loop has no fuzz target. To do: one | the WHP run loop has none. To do: one | a target in `fuzz/` run on CI |
 | 14 | A jailed VMM passes descriptors to a uffd handler or a vhost-user backend | the same | a jailed process cannot push handles. To do: the receiver duplicates them, or a broker does | `boot-test uffd` and `vhost-user` under the jailer |
-| 15 | Device stages | the same | missing: the `devices` boot-test stage, the `memory` jailer-test stage, `--daemonize`, the inherited-handle check | the stages pass |
-| 16 | Only the jail's user reaches a jail | the same | a low-integrity process of the same user reaches it | a jailer-test stage |
+| 15 | Device stages | the same | `--daemonize` (`jailer-test.ps1 daemonize`) and the inherited-handle check (`jailer-test.ps1 handles`) are done. Left: the `devices` boot-test stage and the `memory` jailer-test stage (both need a WHP guest) | the stages pass |
+| 16 | Only the jail's user reaches a jail | the same | Done: the jail's integrity level is above low, so a plain low-integrity process of the same user is kept out of a jail's files, its API socket and its process (`jailer-test.ps1 low`) | a jailer-test stage |
 
-Windows also has to name a test in each of its doc cells; after that, CI runs `tools/check-claims.py --strict-windows`.
+Each Windows doc cell names its test, so CI runs `tools/check-claims.py --strict-windows`.

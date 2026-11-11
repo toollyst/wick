@@ -9,7 +9,7 @@
 //!
 //! | Firecracker flag        | Linux                 | macOS                                   | Windows                                   |
 //! |-------------------------|-----------------------|-----------------------------------------|-------------------------------------------|
-//! | (default)               | built-in BPF filters  | built-in Seatbelt profile ([`PROFILE`]) | child-process-creation block ([`windows`])|
+//! | (default)               | built-in BPF filters  | built-in Seatbelt profile ([`PROFILE`]) | process mitigation profile ([`windows`])  |
 //! | `--no-seccomp`          | no filters            | no sandbox                              | no sandbox                                |
 //! | `--seccomp-filter FILE` | the given BPF filters | refused (BPF cannot be enforced)        | refused (BPF cannot be enforced)          |
 //!
@@ -24,11 +24,11 @@
 //! limited, as on Linux without the jailer (guest images, snapshots and
 //! sockets are chosen by the operator at run time).
 //!
-//! The Windows sandbox blocks child-process creation (the `exec`/`fork` escape
-//! vector) with a process mitigation policy. Network and filesystem confinement
-//! on Windows needs an AppContainer lowbox token, which is the next hardening
-//! step and is tracked in `docs/ROADMAP.md`; it is not silently assumed
-//! here — what is installed is exactly what is documented.
+//! The Windows sandbox is a process mitigation profile, each mitigation tied
+//! to the seccomp rule it stands for: no child processes, no win32k, no
+//! dynamic code, Microsoft-signed images only, none from the network or
+//! labelled low, no extension points, strict handle checks. Files are the
+//! jail's token's and ACLs' ([`super::jail`]).
 
 /// The sandbox the process should install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,9 +61,8 @@ pub use macos::{
 /// Narrows the sandbox to what a running microVM needs, for good. Called
 /// where upstream installs the VMM thread's seccomp filter, after the microVM
 /// is built (on Linux that thread runs unfiltered until then). On Linux each
-/// thread's seccomp filter does this; on Windows nothing narrows yet, and the
-/// sandbox stays as [`apply`] installed it (docs/PORTING.md, row 1).
-#[cfg(not(target_os = "macos"))]
+/// thread's seccomp filter does this.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn narrow() -> Result<(), SandboxError> {
     Ok(())
 }
@@ -73,13 +72,13 @@ pub fn narrow() -> Result<(), SandboxError> {
 ///
 /// # Safety
 /// `info` is the siginfo the kernel passed to a SIGSYS handler.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub unsafe fn denied_syscall(_si_code: libc::c_int, _info: *mut libc::siginfo_t) -> bool {
     false
 }
 
 #[cfg(target_os = "windows")]
-pub use windows::{apply, select};
+pub use windows::{MITIGATIONS, Mitigation, Phase, apply, denied_syscall, narrow, select};
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 /// Selects the sandbox policy (no effect on Linux, where seccomp is used).
@@ -1067,22 +1066,248 @@ mod macos {
 
 #[cfg(target_os = "windows")]
 mod windows {
+    //! The Windows sandbox: a process mitigation profile ([`MITIGATIONS`]),
+    //! each mitigation standing for a rule of upstream's seccomp filters
+    //! (resources/seccomp/x86_64-unknown-linux-musl.json). The mitigations
+    //! are permanent: once set, the process cannot lift them. Each is read
+    //! back after it is set, and start-up fails if one is missing.
+    //!
+    //! As on Linux, where the VMM thread builds the microVM unfiltered and
+    //! gets its narrow filter before the event loop, the profile comes in two
+    //! phases ([`Phase`]): [`apply`] sets what building the microVM can live
+    //! with, [`narrow`] the rest once it is built and every library it needs
+    //! is loaded (no dynamic code, the image load restrictions).
+    //!
+    //! A seccomp filter traps a denied call: SIGSYS, and upstream's handler
+    //! exits with the bad-syscall code. Two denials do the same here, by
+    //! raising SIGSYS synchronously on the thread that made the call:
+    //!
+    //! - `mmap` and `mprotect` with `PROT_EXEC` after [`narrow`] (the POSIX
+    //!   layer's own check, the same rule as upstream's filter), which the
+    //!   dynamic code policy denies;
+    //! - a handle the process does not hold: strict handle checks raise
+    //!   `STATUS_INVALID_HANDLE`, which a vectored exception handler turns
+    //!   into SIGSYS.
+    //!
+    //! Windows reports the other mitigations' denials as an error status of
+    //! the call, with no documented way to be told of them: creating a
+    //! process fails with `ERROR_CHILD_PROCESS_BLOCKED`, loading a win32k
+    //! library with `ERROR_DLL_INIT_FAILED`, an unsigned image with
+    //! `ERROR_INVALID_IMAGE_HASH`, a remote or low-label image with
+    //! `ERROR_ACCESS_DENIED`. Those fail closed, and Firecracker goes on.
+
+    use std::ffi::c_void;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use windows_sys::Win32::System::Threading::{
-        ProcessChildProcessPolicy, SetProcessMitigationPolicy,
+        GetCurrentProcess, GetProcessMitigationPolicy, PROCESS_MITIGATION_POLICY,
+        ProcessChildProcessPolicy, ProcessDynamicCodePolicy, ProcessExtensionPointDisablePolicy,
+        ProcessImageLoadPolicy, ProcessSignaturePolicy, ProcessStrictHandleCheckPolicy,
+        ProcessSystemCallDisablePolicy, SetProcessMitigationPolicy, TerminateProcess,
     };
 
     use super::{Policy, SandboxError};
 
+    /// When a mitigation is set.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Phase {
+        /// By [`apply`], where upstream installs the first seccomp filter.
+        Setup,
+        /// By [`narrow`], where upstream installs the VMM thread's filter.
+        Run,
+    }
+
+    /// One process mitigation policy and the flags the sandbox sets.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Mitigation {
+        /// The policy's name (`PROCESS_MITIGATION_POLICY`).
+        pub name: &'static str,
+        /// The policy.
+        pub policy: PROCESS_MITIGATION_POLICY,
+        /// Its flags word, as `SetProcessMitigationPolicy` takes it.
+        pub flags: u32,
+        /// The rule of upstream's seccomp filters it stands for.
+        pub linux: &'static str,
+        /// When it is set.
+        pub phase: Phase,
+        /// Its audit flags, set instead of `flags` by a discovery build
+        /// (`--cfg wick_sandbox_discovery`, tools/windows/mitigation-audit.ps1):
+        /// Windows then reports what the mitigation would deny in the
+        /// Security-Mitigations event log, and allows it. 0 where Windows
+        /// reports no audit at run time (measured on Windows Server 2022:
+        /// the signature and image load audits stay silent, their
+        /// enforcement is reported); the discovery build enforces those.
+        pub audit: u32,
+    }
+
+    /// The mitigation profile, in the order it is applied.
+    pub const MITIGATIONS: &[Mitigation] = &[
+        Mitigation {
+            name: "ProcessExtensionPointDisablePolicy",
+            policy: ProcessExtensionPointDisablePolicy,
+            // DisableExtensionPoints: no AppInit DLLs, window hooks, input
+            // method editors or other legacy ways into the process.
+            flags: 1,
+            linux: "mmap/mprotect: arg 2 & PROT_EXEC == 0 (no code mapped into a filtered thread)",
+            phase: Phase::Setup,
+            audit: 0,
+        },
+        Mitigation {
+            name: "ProcessImageLoadPolicy",
+            policy: ProcessImageLoadPolicy,
+            // NoRemoteImages | NoLowMandatoryLabelImages | PreferSystem32Images.
+            flags: 0b111,
+            linux: "mmap/mprotect: arg 2 & PROT_EXEC == 0 (no executable mapping of a file); here: \
+                    no image from the network or labelled low, system DLLs from System32",
+            phase: Phase::Run,
+            audit: 0,
+        },
+        Mitigation {
+            name: "ProcessSignaturePolicy",
+            policy: ProcessSignaturePolicy,
+            // MicrosoftSignedOnly: Firecracker is one executable and loads
+            // system DLLs only.
+            flags: 1,
+            linux: "mmap/mprotect: arg 2 & PROT_EXEC == 0 (no new code); here: no image Microsoft \
+                    did not sign",
+            phase: Phase::Setup,
+            audit: 0,
+        },
+        Mitigation {
+            name: "ProcessStrictHandleCheckPolicy",
+            policy: ProcessStrictHandleCheckPolicy,
+            // RaiseExceptionOnInvalidHandleReference |
+            // HandleExceptionsPermanentlyEnabled.
+            flags: 0b11,
+            linux: "default action trap: a call the filter does not allow ends the process; here: \
+                    a handle the process does not hold",
+            phase: Phase::Setup,
+            audit: 0,
+        },
+        Mitigation {
+            name: "ProcessSystemCallDisablePolicy",
+            policy: ProcessSystemCallDisablePolicy,
+            // DisallowWin32kSystemCalls.
+            flags: 1,
+            linux: "default action trap for every call not listed: no filter lists a call to a \
+                    display or input device (ioctl is limited to KVM, TUN, vsock, block and \
+                    terminal requests)",
+            phase: Phase::Setup,
+            audit: 0b10 /* AuditDisallowWin32kSystemCalls */,
+        },
+        Mitigation {
+            name: "ProcessDynamicCodePolicy",
+            policy: ProcessDynamicCodePolicy,
+            // ProhibitDynamicCode.
+            flags: 1,
+            linux: "mmap/mprotect: arg 2 & PROT_EXEC == 0",
+            phase: Phase::Run,
+            audit: 0b1000 /* AuditProhibitDynamicCode */,
+        },
+        Mitigation {
+            name: "ProcessChildProcessPolicy",
+            policy: ProcessChildProcessPolicy,
+            // NoChildProcessCreation.
+            flags: 1,
+            linux: "no clone without CLONE_THREAD, fork, vfork, execve or execveat in any filter",
+            phase: Phase::Setup,
+            audit: 0b10 /* AuditNoChildProcessCreation */,
+        },
+    ];
+
+    /// `si_code` of a SIGSYS from a seccomp filter (`SYS_SECCOMP`).
+    const SYS_SECCOMP: libc::c_int = 1;
+    /// `STATUS_INVALID_HANDLE`, raised by strict handle checks.
+    const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+    /// `STATUS_HANDLE_NOT_CLOSABLE`, raised by strict handle checks.
+    const STATUS_HANDLE_NOT_CLOSABLE: u32 = 0xC000_0235;
+    /// `STATUS_DYNAMIC_CODE_BLOCKED`, what the dynamic code policy answers.
+    const STATUS_DYNAMIC_CODE_BLOCKED: u32 = 0xC000_0604;
+
+    /// What the sandbox denied (an NTSTATUS), once it did: for
+    /// [`denied_syscall`].
+    static DENIED: AtomicU32 = AtomicU32::new(0);
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// Ends the process for a denied operation as a seccomp trap does:
+    /// SIGSYS on this thread, whose handler (upstream's) exits with the
+    /// bad-syscall code; without a handler, the default action, the end of
+    /// the process as by the signal (`128 + SIGSYS`, as `kill` reports it).
+    fn deny(status: u32) -> ! {
+        if DENIED.compare_exchange(0, status, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "The host sandbox denied an operation (NTSTATUS {status:#010x})"
+            );
+            vmm_sys_util::signal::raise_synchronous(libc::SIGSYS, SYS_SECCOMP);
+        }
+        // SAFETY: ends this process.
+        unsafe { TerminateProcess(GetCurrentProcess(), (128 + libc::SIGSYS).cast_unsigned()) };
+        unreachable!("the process ended");
+    }
+
+    extern "C" fn exec_denied(_prot: libc::c_int) {
+        deny(STATUS_DYNAMIC_CODE_BLOCKED);
+    }
+
+    #[repr(C)]
+    struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        record: *mut ExceptionRecord,
+        address: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct ExceptionPointers {
+        record: *mut ExceptionRecord,
+        context: *mut c_void,
+    }
+
+    /// `EXCEPTION_CONTINUE_SEARCH`.
+    const CONTINUE_SEARCH: i32 = 0;
+
+    unsafe extern "system" fn on_exception(info: *mut ExceptionPointers) -> i32 {
+        // SAFETY: Windows passes valid exception pointers.
+        let code = unsafe { (*(*info).record).code };
+        if INSTALLED.load(Ordering::Acquire)
+            && (code == STATUS_INVALID_HANDLE || code == STATUS_HANDLE_NOT_CLOSABLE)
+        {
+            deny(code);
+        }
+        CONTINUE_SEARCH
+    }
+
+    // windows-sys gates it behind Win32_System_Diagnostics_Debug, which the
+    // vmm crate does not otherwise need.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AddVectoredExceptionHandler(
+            first: u32,
+            handler: unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
+        ) -> *mut c_void;
+    }
+
+    /// Whether a SIGSYS is the sandbox denying an operation. Async-signal-safe.
+    ///
+    /// # Safety
+    /// `info` is the siginfo a SIGSYS handler was given.
+    pub unsafe fn denied_syscall(si_code: libc::c_int, _info: *mut libc::siginfo_t) -> bool {
+        si_code == SYS_SECCOMP && DENIED.load(Ordering::SeqCst) != 0
+    }
+
     struct State {
         policy: Policy,
         installed: bool,
+        narrowed: bool,
     }
 
     static STATE: Mutex<State> = Mutex::new(State {
         policy: Policy::None,
         installed: false,
+        narrowed: false,
     });
 
     /// Selects the sandbox to install. Called once at start-up from the seccomp
@@ -1091,34 +1316,420 @@ mod windows {
         STATE.lock().unwrap().policy = policy;
     }
 
-    /// Installs the selected sandbox if it is not installed yet.
-    ///
-    /// Blocks child-process creation for the whole process with
-    /// `ProcessChildProcessPolicy` (`NoChildProcessCreation`). The call is
-    /// checked: if the policy cannot be set the sandbox is not silently
-    /// skipped — an error is returned and start-up fails.
+    /// The flags of `policy` in force for this process.
+    pub fn read_back(policy: PROCESS_MITIGATION_POLICY) -> Result<u32, SandboxError> {
+        let mut flags = 0u32;
+        // SAFETY: a 4-byte buffer of the size passed.
+        let ok = unsafe {
+            GetProcessMitigationPolicy(
+                GetCurrentProcess(),
+                policy,
+                std::ptr::from_mut(&mut flags).cast(),
+                std::mem::size_of::<u32>(),
+            )
+        };
+        if ok == 0 {
+            return Err(SandboxError::Install(format!(
+                "reading back mitigation policy {policy}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(flags)
+    }
+
+    /// The flags the sandbox sets for `m`: its audit flags in a discovery
+    /// build, where it has them.
+    #[allow(unexpected_cfgs)]
+    fn flags_to_set(m: &Mitigation) -> u32 {
+        if cfg!(wick_sandbox_discovery) && m.audit != 0 { m.audit } else { m.flags }
+    }
+
+    /// Sets the mitigations of `phase`, each read back.
+    fn set_phase(phase: Phase) -> Result<(), String> {
+        for m in MITIGATIONS.iter().filter(|m| m.phase == phase) {
+            let flags = flags_to_set(m);
+            // SAFETY: a 4-byte policy value of the size passed.
+            let ok = unsafe {
+                SetProcessMitigationPolicy(
+                    m.policy,
+                    std::ptr::from_ref(&flags).cast(),
+                    std::mem::size_of::<u32>(),
+                )
+            };
+            if ok == 0 {
+                return Err(format!("{}: {}", m.name, std::io::Error::last_os_error()));
+            }
+            let back = read_back(m.policy).map_err(|e| e.to_string())?;
+            if back & flags != flags {
+                return Err(format!("{}: {back:#x} in force, {flags:#x} set", m.name));
+            }
+        }
+        Ok(())
+    }
+
+    /// Installs the selected sandbox if it is not installed yet: the trap on
+    /// invalid handles, then the [`Phase::Setup`] mitigations, checked by
+    /// reading them back. Any step that fails is an error, and start-up
+    /// fails with it.
     pub fn apply() -> Result<(), SandboxError> {
         let mut state = STATE.lock().unwrap();
         if state.policy == Policy::None || state.installed {
             return Ok(());
         }
-        // Bit 0 of the policy flags is `NoChildProcessCreation`.
-        let flags: u32 = 1;
-        // SAFETY: a 4-byte policy value of the size passed, for the current
-        // process's `ProcessChildProcessPolicy`.
-        let ok = unsafe {
-            SetProcessMitigationPolicy(
-                ProcessChildProcessPolicy,
-                std::ptr::from_ref(&flags).cast(),
-                std::mem::size_of::<u32>(),
-            )
-        };
-        if ok == 0 {
-            return Err(SandboxError::Install(
-                std::io::Error::last_os_error().to_string(),
-            ));
+        // SAFETY: registers a handler that only reads the exception record.
+        if unsafe { AddVectoredExceptionHandler(1, on_exception) }.is_null() {
+            return Err(SandboxError::Install(format!(
+                "the exception handler: {}",
+                std::io::Error::last_os_error()
+            )));
         }
+        set_phase(Phase::Setup).map_err(SandboxError::Install)?;
+        INSTALLED.store(true, Ordering::Release);
         state.installed = true;
         Ok(())
+    }
+
+    /// Ends the setup phase for good: the [`Phase::Run`] mitigations, read
+    /// back, and the trap on executable mappings. Nothing if the sandbox is
+    /// not installed (`--no-seccomp`) or already narrowed.
+    #[allow(unexpected_cfgs)]
+    pub fn narrow() -> Result<(), SandboxError> {
+        let mut state = STATE.lock().unwrap();
+        if !state.installed || state.narrowed {
+            return Ok(());
+        }
+        set_phase(Phase::Run).map_err(SandboxError::Narrow)?;
+        // A discovery build lets the mapping through, for the audit to report.
+        if !cfg!(wick_sandbox_discovery) {
+            libc::wick_mm::deny_exec(exec_denied);
+        }
+        state.narrowed = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::process::{Command, Output};
+        use std::sync::OnceLock;
+
+        use super::*;
+
+        // The sandbox is permanent, so it runs in a child process (the test
+        // binary itself, filtered to one of the ignored tests below).
+        fn child(name: &str, env: &[(&str, &str)]) -> Output {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("ext::sandbox::windows::tests::{name}"),
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .envs(env.iter().copied())
+                .output()
+                .unwrap()
+        }
+
+        fn text(out: &Output) -> String {
+            format!(
+                "{:?}\n{}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        }
+
+        /// What a sandboxed child reads back, once for all the tests.
+        fn read_back_in_child() -> &'static str {
+            static OUT: OnceLock<String> = OnceLock::new();
+            OUT.get_or_init(|| {
+                let out = child("read_back_child", &[]);
+                assert!(out.status.success(), "{}", text(&out));
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            })
+        }
+
+        fn check_in_force(name: &str) {
+            let m = MITIGATIONS.iter().find(|m| m.name == name).unwrap();
+            let out = read_back_in_child();
+            let back = |phase: &str| {
+                let line = out
+                    .lines()
+                    .find(|l| l.starts_with(&format!("{phase} {name} ")))
+                    .unwrap_or_else(|| panic!("{name} not read back: {out}"));
+                u32::from_str_radix(line.rsplit(' ').next().unwrap(), 16).unwrap() & m.flags
+            };
+            // In force from its phase on, not before.
+            assert_eq!(back("setup"), if m.phase == Phase::Setup { m.flags } else { 0 }, "{name}");
+            assert_eq!(back("run"), m.flags, "{name}");
+        }
+
+        #[test]
+        #[ignore = "run by the test_*_policy tests in a separate process"]
+        fn read_back_child() {
+            // Nothing is in force before the sandbox.
+            for m in MITIGATIONS {
+                assert_eq!(read_back(m.policy).unwrap() & m.flags, 0, "{}", m.name);
+            }
+            select(Policy::Default);
+            apply().unwrap();
+            // A second call does nothing.
+            apply().unwrap();
+            for m in MITIGATIONS {
+                println!("setup {} {:x}", m.name, read_back(m.policy).unwrap());
+            }
+            narrow().unwrap();
+            narrow().unwrap();
+            for m in MITIGATIONS {
+                println!("run {} {:x}", m.name, read_back(m.policy).unwrap());
+            }
+        }
+
+        #[test]
+        fn test_extension_point_policy() {
+            check_in_force("ProcessExtensionPointDisablePolicy");
+        }
+
+        #[test]
+        fn test_image_load_policy() {
+            check_in_force("ProcessImageLoadPolicy");
+        }
+
+        #[test]
+        fn test_signature_policy() {
+            check_in_force("ProcessSignaturePolicy");
+        }
+
+        #[test]
+        fn test_strict_handle_check_policy() {
+            check_in_force("ProcessStrictHandleCheckPolicy");
+        }
+
+        #[test]
+        fn test_win32k_policy() {
+            check_in_force("ProcessSystemCallDisablePolicy");
+        }
+
+        #[test]
+        fn test_dynamic_code_policy() {
+            check_in_force("ProcessDynamicCodePolicy");
+        }
+
+        #[test]
+        fn test_child_process_policy() {
+            check_in_force("ProcessChildProcessPolicy");
+        }
+
+        #[test]
+        fn test_every_mitigation_names_its_linux_rule() {
+            let mut names: Vec<_> = MITIGATIONS.iter().map(|m| m.name).collect();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), MITIGATIONS.len());
+            for m in MITIGATIONS {
+                assert!(m.linux.len() > 20, "{}", m.name);
+                assert_ne!(m.flags, 0, "{}", m.name);
+            }
+        }
+
+        /// The denials that end Firecracker as a seccomp trap does: with
+        /// upstream's handlers, the bad-syscall exit code.
+        const TRAPS: [&str; 3] = ["exec_mmap_child", "exec_mprotect_child", "bad_handle_child"];
+
+        #[test]
+        fn test_denied_operation_exits_as_seccomp() {
+            for name in TRAPS {
+                let out = child(name, &[("WICK_TEST_HANDLERS", "1")]);
+                assert_eq!(
+                    out.status.code(),
+                    Some(crate::FcExitCode::BadSyscall as i32),
+                    "{name}: {}",
+                    text(&out)
+                );
+                assert!(!text(&out).contains("CHILD-SURVIVED"), "{name}");
+            }
+        }
+
+        // Without a handler, the default action of SIGSYS.
+        #[test]
+        fn test_denied_operation_raises_sigsys() {
+            for name in TRAPS {
+                let out = child(name, &[]);
+                assert_eq!(out.status.code(), Some(128 + libc::SIGSYS), "{name}: {}", text(&out));
+                assert!(!text(&out).contains("CHILD-SURVIVED"), "{name}");
+            }
+        }
+
+        fn sandboxed() {
+            if std::env::var_os("WICK_TEST_HANDLERS").is_some() {
+                crate::signal_handler::register_signal_handlers().unwrap();
+            }
+            select(Policy::Default);
+            apply().unwrap();
+        }
+
+        fn anonymous(prot: libc::c_int) -> *mut c_void {
+            // SAFETY: an anonymous mapping.
+            unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    prot,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            }
+        }
+
+        const RWX: libc::c_int = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+
+        // What building the microVM may do, a running one may not: an
+        // executable mapping is allowed until narrow(), and ends the process
+        // as a seccomp trap after it.
+        #[test]
+        fn test_narrow_ends_the_setup_phase() {
+            let out = child("narrowed_child", &[("WICK_TEST_HANDLERS", "1")]);
+            assert_eq!(out.status.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", text(&out));
+            assert!(text(&out).contains("SETUP-OK"), "{}", text(&out));
+            assert!(!text(&out).contains("CHILD-SURVIVED"), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_narrow_ends_the_setup_phase in a separate process"]
+        fn narrowed_child() {
+            sandboxed();
+            assert_ne!(anonymous(RWX), libc::MAP_FAILED);
+            println!("SETUP-OK");
+            narrow().unwrap();
+            let p = anonymous(RWX);
+            println!("CHILD-SURVIVED {p:?}");
+        }
+
+        // The run phase cannot be undone: each mitigation stays in force after
+        // an attempt to clear it.
+        #[test]
+        fn test_narrowing_is_one_way() {
+            let out = child("one_way_child", &[]);
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(text(&out).contains("CHILD-OK"), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_narrowing_is_one_way in a separate process"]
+        fn one_way_child() {
+            sandboxed();
+            narrow().unwrap();
+            for m in MITIGATIONS {
+                let none = 0u32;
+                // SAFETY: a 4-byte policy value of the size passed.
+                unsafe { SetProcessMitigationPolicy(m.policy, std::ptr::from_ref(&none).cast(), 4) };
+                assert_eq!(read_back(m.policy).unwrap() & m.flags, m.flags, "{}", m.name);
+            }
+            println!("CHILD-OK");
+        }
+
+        #[test]
+        #[ignore = "run by test_denied_operation_* in a separate process"]
+        fn exec_mmap_child() {
+            sandboxed();
+            narrow().unwrap();
+            let p = anonymous(RWX);
+            println!("CHILD-SURVIVED {p:?}");
+        }
+
+        #[test]
+        #[ignore = "run by test_denied_operation_* in a separate process"]
+        fn exec_mprotect_child() {
+            sandboxed();
+            narrow().unwrap();
+            let p = anonymous(libc::PROT_READ | libc::PROT_WRITE);
+            assert_ne!(p, libc::MAP_FAILED);
+            // SAFETY: the mapping above.
+            let r = unsafe { libc::mprotect(p, 4096, libc::PROT_READ | libc::PROT_EXEC) };
+            println!("CHILD-SURVIVED {r}");
+        }
+
+        #[test]
+        #[ignore = "run by test_denied_operation_* in a separate process"]
+        fn bad_handle_child() {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn SetEvent(h: *mut c_void) -> i32;
+            }
+            sandboxed();
+            // SAFETY: a handle value the process does not hold; strict
+            // handle checks raise for it.
+            let r = unsafe { SetEvent(0x1234 as *mut c_void) };
+            println!("CHILD-SURVIVED {r}");
+        }
+
+        /// The denials Windows reports as an error: each fails, and the
+        /// process goes on (`ERROR_*` code of each, winerror.h).
+        #[test]
+        fn test_denied_operations_fail_closed() {
+            let dir = std::env::temp_dir().join(format!("wick-sandbox-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            // An image Microsoft did not sign: this test binary.
+            let unsigned = dir.join("unsigned.dll");
+            std::fs::copy(std::env::current_exe().unwrap(), &unsigned).unwrap();
+            // A Microsoft-signed image labelled low.
+            let low = dir.join("low");
+            std::fs::create_dir_all(&low).unwrap();
+            let system = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap())
+                .join(r"System32\version.dll");
+            let low_dll = low.join("version.dll");
+            std::fs::copy(&system, &low_dll).unwrap();
+            let st = Command::new("icacls")
+                .arg(&low_dll)
+                .args(["/setintegritylevel", "low"])
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "{}", text(&st));
+            let out = child(
+                "fail_closed_child",
+                &[
+                    ("WICK_TEST_UNSIGNED", unsigned.to_str().unwrap()),
+                    ("WICK_TEST_LOW", low_dll.to_str().unwrap()),
+                ],
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+            let all = text(&out);
+            assert!(out.status.success(), "{all}");
+            for expected in [
+                "child-process 367",   // ERROR_CHILD_PROCESS_BLOCKED
+                "win32k 1114",         // ERROR_DLL_INIT_FAILED
+                "unsigned-image 577",  // ERROR_INVALID_IMAGE_HASH
+                "low-label-image 5",   // ERROR_ACCESS_DENIED
+                "CHILD-OK",
+            ] {
+                assert!(all.lines().any(|l| l == expected), "{expected}: {all}");
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_denied_operations_fail_closed in a separate process"]
+        fn fail_closed_child() {
+            use std::os::windows::ffi::OsStrExt;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn LoadLibraryW(path: *const u16) -> *mut c_void;
+                fn GetLastError() -> u32;
+            }
+            let load = |path: &std::ffi::OsStr| {
+                let wide: Vec<u16> = path.encode_wide().chain(Some(0)).collect();
+                // SAFETY: a NUL-terminated path.
+                let h = unsafe { LoadLibraryW(wide.as_ptr()) };
+                // SAFETY: plain call.
+                if h.is_null() { unsafe { GetLastError() } } else { 0 }
+            };
+            sandboxed();
+            narrow().unwrap();
+            let e = Command::new("cmd.exe").args(["/c", "exit"]).status().unwrap_err();
+            println!("child-process {}", e.raw_os_error().unwrap_or(0));
+            println!("win32k {}", load("user32.dll".as_ref()));
+            println!("unsigned-image {}", load(&std::env::var_os("WICK_TEST_UNSIGNED").unwrap()));
+            println!("low-label-image {}", load(&std::env::var_os("WICK_TEST_LOW").unwrap()));
+            println!("CHILD-OK");
+        }
     }
 }

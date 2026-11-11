@@ -99,6 +99,20 @@ impl StatIds {
     }
 }
 
+/// The bytes the file system has allocated to `file`: `st_blocks` times 512,
+/// from `fstat` (on Windows the compatibility libc's, which reports the
+/// allocation size of the handle, so a sparse file's holes are not counted).
+#[cfg(test)]
+pub(crate) fn allocated(file: &File) -> u64 {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: an all-zero `stat` is a valid output buffer.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid descriptor and output buffer.
+    let ret = unsafe { libc::fstat(file.as_raw_fd(), &mut st) };
+    assert_eq!(ret, 0, "fstat: {}", io::Error::last_os_error());
+    u64::try_from(st.st_blocks).unwrap() * 512
+}
+
 /// Makes `file` keep holes where it is extended or not written, as Linux files
 /// do. Called before a file is extended to a size its writer will not fill
 /// (a snapshot memory file). On Linux and macOS files always do; on Windows
@@ -171,7 +185,6 @@ impl WriteVolatile for SparseWriter<'_> {
 mod tests {
     #![allow(clippy::cast_possible_truncation)]
     use std::io::Read;
-    use std::os::unix::fs::MetadataExt;
 
     use vm_memory::VolatileSlice;
     use vmm_sys_util::tempfile::TempFile;
@@ -179,10 +192,6 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1 << 20;
-
-    fn allocated(file: &File) -> u64 {
-        file.metadata().unwrap().blocks() * 512
-    }
 
     fn write_at(w: &mut SparseWriter, data: &mut [u8], at: u64) {
         w.seek(SeekFrom::Start(at)).unwrap();
@@ -194,6 +203,9 @@ mod tests {
     #[test]
     fn test_gaps_stay_holes() {
         let mut file = TempFile::new().unwrap().into_file();
+        // As `Vm::snapshot_memory_to_file` does: on Windows, a file keeps holes only if
+        // it is sparse.
+        keep_holes(&file).unwrap();
         file.set_len(64 * MIB).unwrap();
         let mut page = vec![0xabu8; 64 << 10];
         let mut w = SparseWriter::new(&mut file).unwrap();
@@ -221,6 +233,7 @@ mod tests {
     fn test_existing_data_is_kept() {
         // A diff snapshot is merged into an existing full snapshot.
         let mut file = TempFile::new().unwrap().into_file();
+        keep_holes(&file).unwrap();
         file.set_len(16 * MIB).unwrap();
         let mut base = vec![0x11u8; (16 * MIB) as usize];
         let mut w = SparseWriter::new(&mut file).unwrap();

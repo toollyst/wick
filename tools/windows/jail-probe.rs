@@ -29,8 +29,19 @@ type HANDLE = *mut c_void;
 #[repr(C)]
 struct STARTUPINFOW {
     cb: u32,
-    rest: [usize; 12],
+    reserved: [*mut u16; 3],
+    geometry: [u32; 7],
+    flags: u32,
+    show_window: u16,
+    reserved2_len: u16,
+    reserved2: *mut u8,
+    stdin: HANDLE,
+    stdout: HANDLE,
+    stderr: HANDLE,
 }
+
+/// `STARTF_USESTDHANDLES`.
+const USE_STD_HANDLES: u32 = 0x100;
 
 #[repr(C)]
 struct PROCESS_INFORMATION {
@@ -75,8 +86,13 @@ extern "system" {
     fn CloseHandle(h: HANDLE) -> i32;
     fn GetCurrentProcess() -> HANDLE;
     fn GetLastError() -> u32;
+    fn GetStdHandle(which: u32) -> HANDLE;
+    fn SetHandleInformation(h: HANDLE, mask: u32, flags: u32) -> i32;
     fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32;
     fn GetExitCodeProcess(h: HANDLE, code: *mut u32) -> i32;
+    fn ReadFile(h: HANDLE, buf: *mut u8, n: u32, read: *mut u32, ov: *mut c_void) -> i32;
+    fn SetFilePointer(h: HANDLE, lo: i32, hi: *mut i32, from: u32) -> u32;
+    fn GetFileType(h: HANDLE) -> u32;
 }
 
 #[link(name = "ws2_32")]
@@ -146,6 +162,29 @@ fn check(c: &str) -> String {
                 }
             }
         }
+        // A raw handle value the jailer held (inheritably): if it reached
+        // this process it names the same file and reads back its bytes.
+        "handle" => {
+            let Ok(value) = arg.parse::<isize>() else {
+                return "bad handle".into();
+            };
+            let h = value as HANDLE;
+            // FILE_BEGIN; -1 is INVALID_SET_FILE_POINTER.
+            // SAFETY: plain calls on a handle value; they fail safely if it is
+            // not a file handle of ours.
+            unsafe {
+                if GetFileType(h) == 0 {
+                    return format!("denied {}", std::io::Error::from_raw_os_error(GetLastError() as i32));
+                }
+                SetFilePointer(h, 0, std::ptr::null_mut(), 0);
+                let mut buf = [0u8; 64];
+                let mut read = 0u32;
+                if ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut read, std::ptr::null_mut()) == 0 {
+                    return format!("denied {}", std::io::Error::from_raw_os_error(GetLastError() as i32));
+                }
+                format!("allowed {}", String::from_utf8_lossy(&buf[..read as usize]))
+            }
+        }
         _ => "unknown check".into(),
     }
 }
@@ -175,7 +214,24 @@ fn low(checks: &[String]) -> std::io::Result<u32> {
             cmd.push_str(&format!(" \"{c}\""));
         }
         let mut cmd = wide(&cmd);
-        let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, rest: [0; 12] };
+        // The child answers on our standard handles, which a pipe may be.
+        let inherit = |which: u32| {
+            let h = GetStdHandle(which);
+            SetHandleInformation(h, 1, 1); // HANDLE_FLAG_INHERIT
+            h
+        };
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            reserved: [std::ptr::null_mut(); 3],
+            geometry: [0; 7],
+            flags: USE_STD_HANDLES,
+            show_window: 0,
+            reserved2_len: 0,
+            reserved2: std::ptr::null_mut(),
+            stdin: inherit(-10i32 as u32),
+            stdout: inherit(-11i32 as u32),
+            stderr: inherit(-12i32 as u32),
+        };
         let mut pi = PROCESS_INFORMATION { process: std::ptr::null_mut(), thread: std::ptr::null_mut(), pid: 0, tid: 0 };
         if CreateProcessAsUserW(
             dup,
@@ -183,7 +239,7 @@ fn low(checks: &[String]) -> std::io::Result<u32> {
             cmd.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            0,
+            1,
             0,
             std::ptr::null(),
             std::ptr::null(),

@@ -53,7 +53,7 @@ jobs:
       # Every "in place", "verified" or "measured" in the docs' tables names
       # the test that checks it (Windows cells: warnings for now, M5).
       - name: Doc claims name their tests
-        run: python3 tools/check-claims.py
+        run: python3 tools/check-claims.py --strict-windows
       - name: Cleanup script
         run: |
           bash -n tools/clean.sh

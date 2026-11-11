@@ -17,7 +17,8 @@
 //! - **The jailed identity is a restricted token** instead of `--uid`/`--gid`
 //!   (Windows has no numeric ids; they are recorded in `WICK_JAIL` only): the
 //!   user's privileges removed, the user's own SID left out of the
-//!   restricting SIDs, so the user's files are denied, and low integrity, so
+//!   restricting SIDs, so the user's files are denied, and the jail's
+//!   integrity level ([`JAIL_INTEGRITY_SID`], between low and medium), so
 //!   nothing at medium integrity can be written. WHP works for such a process
 //!   (it is refused inside an AppContainer). The process starts with an
 //!   initial impersonation token on its main thread, the same restricted
@@ -31,17 +32,23 @@
 //!   logon SID), so they open nothing a process of the session could not.
 //! - **The jail directory** is protected from what its parent grants and
 //!   grants full access, inherited, to the jail's SID, the user, SYSTEM and
-//!   the administrators; it has a low mandatory label.
+//!   the administrators. Its mandatory label is the jail's integrity level,
+//!   no read, write or execute up: a process of the user below it (a
+//!   low-integrity one, as a browser's sandbox runs) cannot open the jail's
+//!   files or API socket, nor the jailed process, although the user's SID
+//!   grants them; Firecracker, at that level, and the operator, above it, can.
 //! - **cgroups are a Job Object** ([`cgroup`](super::cgroup)): job memory
 //!   limit, CPU rate hard cap (from Firecracker's third CPU-second on, see
 //!   `CPU_CAP_GRACE_100NS`), active process limit; the job kills
 //!   Firecracker when the jailer goes and limits its UI access.
 //! - **No exec**: the jailer starts Firecracker suspended in the job with the
 //!   tokens, waits for it, removes the jail's drive and exits with its status.
+//! - **`--daemonize`** ([`daemonize`]): Windows has no fork, so the jailer
+//!   relaunches itself detached, without the flag, and returns 0; the
+//!   detached jailer builds the jail and runs Firecracker with no console.
 //!
 //! Refused, never accepted without effect: `--netns` and `--new-pid-ns`
-//! (no namespaces), `--daemonize` (the jailer owns the job and the drive
-//! while Firecracker runs), `--resource-limit fsize=` and a `no-file=` other
+//! (no namespaces), `--resource-limit fsize=` and a `no-file=` other
 //! than the default (Windows cannot limit file sizes or the number of
 //! handles; the default is not enforced either).
 
@@ -90,8 +97,9 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
     SetInformationJobObject,
 };
+use windows_sys::Win32::System::Console::GetConsoleWindow;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -169,9 +177,13 @@ fn jail_dacl(user: &str) -> String {
     )
 }
 /// Low mandatory label, inherited, no write up.
-const JAIL_LABEL: &str = "S:(ML;OICI;NW;;;LW)";
-/// Low integrity.
-const LOW_INTEGRITY_SID: &str = "S-1-16-4096";
+const JAIL_LABEL: &str = "S:(ML;OICI;NWNRNX;;;S-1-16-6144)";
+/// The jailed process's integrity level: above low (0x1000), so that a
+/// low-integrity process of the same user, which holds the user's SID the
+/// jail directory grants, is kept out by the jail's label, and below medium
+/// (0x2000), so that the jailed process writes nothing at medium integrity.
+/// Windows compares levels as numbers; 0x1800 has no name of its own.
+const JAIL_INTEGRITY_SID: &str = "S-1-16-6144";
 
 /// What the Windows backend refuses, or a Windows step that failed.
 #[derive(Debug, thiserror::Error)]
@@ -279,15 +291,132 @@ pub fn new_pid_ns() -> Result<(), JailerError> {
     .into())
 }
 
-/// `--daemonize`: the jailer stays while Firecracker runs.
+/// `--daemonize`: upstream double-forks, so the jailer returns 0 at once and
+/// Firecracker keeps running with no controlling terminal, its stdio on
+/// `/dev/null`. Windows has no fork; the jailer relaunches itself, detached
+/// and without `--daemonize`, and exits 0. The relaunched jailer has no
+/// console (`DETACHED_PROCESS`) and `NUL` for its standard handles, which it
+/// passes on to Firecracker, so closing the terminal does not reach either;
+/// it then owns the Job Object and the jail's drive for Firecracker's life
+/// and waits for it, as a foreground jailer does. Called before any jail is
+/// set up (`env::run`), so the detached jailer builds the whole jail itself.
+///
+/// Returns only on failure; on success it never returns (it exits 0).
 pub fn daemonize() -> Result<(), JailerError> {
-    Err(HostError::Unsupported(
-        "daemonize",
-        "Windows has no exec, so the jailer stays while Firecracker runs: it owns the Job Object \
-         that limits it and removes the jail's drive when it exits; start the jailer detached \
-         instead",
-    )
-    .into())
+    match relaunch_detached() {
+        Ok(never) => match never {},
+        Err(err) => Err(HostError::Spawn("daemonize", err).into()),
+    }
+}
+
+/// The `NUL` device, opened for a detached process's standard handle.
+fn open_nul() -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap(),
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    // SAFETY: a NUL-terminated device name; the handle is owned below.
+    let h = unsafe {
+        CreateFileW(
+            wide("NUL").as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &sa,
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(last_error());
+    }
+    // SAFETY: a handle we own.
+    Ok(unsafe { OwnedHandle::from_raw_handle(h) })
+}
+
+/// Starts this jailer again with the same arguments but `--daemonize`,
+/// detached: no console, `NUL` for the standard handles, only those inherited.
+fn relaunch_detached() -> io::Result<std::convert::Infallible> {
+    use windows_sys::Win32::System::Threading::{CreateProcessW, DETACHED_PROCESS};
+
+    let exe = std::env::current_exe()?;
+    // The same command line without --daemonize: the relaunched jailer runs
+    // the foreground path.
+    let mut argv = vec![exe.to_string_lossy().into_owned()];
+    argv.extend(std::env::args().skip(1).filter(|a| a != "--daemonize"));
+    let mut cmd = wide(command_line(&argv));
+
+    let nul = open_nul()?;
+    // Only the standard handles are inheritable, and they are all NUL.
+    let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    si.StartupInfo.cb = u32::try_from(std::mem::size_of::<STARTUPINFOEXW>()).unwrap();
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = nul.as_raw_handle();
+    si.StartupInfo.hStdOutput = nul.as_raw_handle();
+    si.StartupInfo.hStdError = nul.as_raw_handle();
+    let handles = [nul.as_raw_handle()];
+    let mut size = 0usize;
+    // SAFETY: a size query.
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+    let mut attrs = vec![0u64; size.div_ceil(8)];
+    let list: LPPROC_THREAD_ATTRIBUTE_LIST = attrs.as_mut_ptr().cast();
+    // SAFETY: a buffer of the size asked for.
+    if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
+        return Err(last_error());
+    }
+    // SAFETY: the handle array outlives the process creation.
+    if unsafe {
+        UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            handles.as_ptr().cast(),
+            std::mem::size_of_val(&handles),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    } == 0
+    {
+        // SAFETY: initialised above.
+        unsafe { DeleteProcThreadAttributeList(list) };
+        return Err(last_error());
+    }
+    si.lpAttributeList = list;
+    // SAFETY: plain data.
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: NUL-terminated command line; the attribute list and NUL handle
+    // outlive the call.
+    let ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmd.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            DETACHED_PROCESS | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si.StartupInfo,
+            &mut pi,
+        )
+    };
+    // SAFETY: initialised above.
+    unsafe { DeleteProcThreadAttributeList(list) };
+    if ok == 0 {
+        return Err(last_error());
+    }
+    // SAFETY: handles CreateProcess gave us; we need neither.
+    unsafe {
+        windows_sys::Win32::Foundation::CloseHandle(pi.hProcess);
+        windows_sys::Win32::Foundation::CloseHandle(pi.hThread);
+    }
+    // The jailer has returned: the detached one runs on.
+    std::process::exit(0);
 }
 
 /// The device nodes upstream creates in the jail. None is needed on Windows;
@@ -375,7 +504,7 @@ pub fn install_resource_limits(
 }
 
 /// Sets the jail directory's access (full access for the restricted token,
-/// inherited, a low mandatory label), maps a free drive letter to it and
+/// inherited, the jail's mandatory label), maps a free drive letter to it and
 /// makes its root the current directory. Upstream's absolute paths resolve
 /// inside the jail from here on.
 pub(crate) fn enter_jail(path: &Path) -> Result<(), JailerError> {
@@ -385,7 +514,7 @@ pub(crate) fn enter_jail(path: &Path) -> Result<(), JailerError> {
     let user = user_sid().map_err(|e| fail("the user's SID", e))?;
     set_security(&root, &jail_dacl(&user), false)
         .map_err(|e| fail("grant the jail's SID", e))?;
-    set_security(&root, JAIL_LABEL, true).map_err(|e| fail("set the low integrity label", e))?;
+    set_security(&root, JAIL_LABEL, true).map_err(|e| fail("set the jail's integrity label", e))?;
     std::fs::create_dir_all(root.join(JAIL_TMP)).map_err(|e| fail("create tmp", e))?;
     let drive = map_drive(&root).map_err(JailerError::from)?;
     // A step that fails from here on ends the jailer through `exit`, which
@@ -706,7 +835,7 @@ fn tokens() -> Result<Tokens, HostError> {
 }
 
 /// A restricted token: no privileges, `restricting` SIDs, the default DACL
-/// and low integrity.
+/// and the jail's integrity level.
 fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedHandle, HostError> {
     let mut t: HANDLE = std::ptr::null_mut();
     // SAFETY: a token we own and a valid SID array.
@@ -762,7 +891,7 @@ fn restricted(from: HANDLE, restricting: &[SID_AND_ATTRIBUTES]) -> Result<OwnedH
         return Err(HostError::Spawn("TokenDefaultDacl", last_error()));
     }
 
-    let low = Sid::new(LOW_INTEGRITY_SID)?;
+    let low = Sid::new(JAIL_INTEGRITY_SID)?;
     let label = TOKEN_MANDATORY_LABEL {
         Label: SID_AND_ATTRIBUTES { Sid: low.0, Attributes: SE_GROUP_INTEGRITY },
     };
@@ -918,6 +1047,24 @@ fn command_line(args: &[String]) -> String {
     line
 }
 
+/// Upstream's arguments with `--start-time-cpu-us` set to 0. Upstream passes
+/// the jailer's CPU time at the exec, which the exec'd Firecracker keeps
+/// counting from (the same process); Firecracker reports its start-up CPU
+/// time as its own CPU time minus that, plus `--parent-cpu-time-us`. Windows
+/// starts a new process, whose CPU time starts at 0: the jailer's value
+/// would make the difference negative (a panic in debug builds, a wrapped
+/// metric in release ones). The jailer's share stays in
+/// `--parent-cpu-time-us`.
+fn cpu_start_of_new_process(args: &[String]) -> Vec<String> {
+    let mut out = args.to_vec();
+    if let Some(i) = out.iter().position(|a| a == "--start-time-cpu-us") {
+        if let Some(value) = out.get_mut(i + 1) {
+            *value = "0".to_owned();
+        }
+    }
+    out
+}
+
 /// Checks that the binary in the jail takes the jail over.
 fn check_handover(exe: &Path) -> Result<(), HostError> {
     let mut bytes = Vec::new();
@@ -968,7 +1115,7 @@ fn exec(
 
     let drive_root = format!("{}\\", jail.drive);
     let mut argv = vec![format!("{drive_root}{}", name.to_string_lossy())];
-    argv.extend(args.iter().cloned());
+    argv.extend(cpu_start_of_new_process(args));
     let mut cmd: Vec<u16> = wide(command_line(&argv));
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     let tmp = format!("{drive_root}{JAIL_TMP}");
@@ -1041,6 +1188,17 @@ fn exec(
     // SAFETY: plain data.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let no_sa: *const SECURITY_ATTRIBUTES = std::ptr::null();
+    // When the jailer has no console of its own (it was daemonized: started
+    // detached), Firecracker is given a new, hidden one, so its console setup
+    // does not fail; its standard handles are still the NUL ones above. A
+    // foreground jailer shares its console, which the interactive guest serial
+    // uses.
+    // SAFETY: plain call.
+    let no_console = unsafe { GetConsoleWindow() }.is_null();
+    let create_flags = CREATE_SUSPENDED
+        | CREATE_UNICODE_ENVIRONMENT
+        | EXTENDED_STARTUPINFO_PRESENT
+        | if no_console { CREATE_NO_WINDOW } else { 0 };
     // SAFETY: NUL-terminated application path, command line, environment and
     // directory; the attribute list and tokens outlive the call.
     let created = unsafe {
@@ -1051,7 +1209,7 @@ fn exec(
             no_sa,
             no_sa,
             i32::from(!handles.is_empty()),
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            create_flags,
             env.as_ptr().cast(),
             wide(&drive_root).as_ptr(),
             &si.StartupInfo,
@@ -1122,7 +1280,6 @@ mod tests {
         for (err, flag) in [
             (join_netns("x").unwrap_err(), "netns"),
             (new_pid_ns().unwrap_err(), "new-pid-ns"),
-            (daemonize().unwrap_err(), "daemonize"),
         ] {
             assert!(matches!(err, JailerError::Host(HostError::Unsupported(f, _)) if f == flag), "{flag}");
         }
@@ -1158,6 +1315,22 @@ mod tests {
         assert_eq!(command_line(&args(&["a", "b c", ""])), r#"a "b c" """#);
         assert_eq!(command_line(&args(&[r#"x"y"#, r"d\ e\"])), r#""x\"y" "d\ e\\""#);
         assert_eq!(command_line(&args(&[r"C:\p\f.exe", "--id", "x"])), r"C:\p\f.exe --id x");
+    }
+
+    #[test]
+    fn test_cpu_start_of_new_process() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            cpu_start_of_new_process(&args(&[
+                "--id", "a", "--start-time-cpu-us", "123456", "--parent-cpu-time-us", "99", "--",
+                "--start-time-cpu-us", "7",
+            ])),
+            args(&[
+                "--id", "a", "--start-time-cpu-us", "0", "--parent-cpu-time-us", "99", "--",
+                "--start-time-cpu-us", "7",
+            ])
+        );
+        assert_eq!(cpu_start_of_new_process(&args(&["--id"])), args(&["--id"]));
     }
 
     #[test]
