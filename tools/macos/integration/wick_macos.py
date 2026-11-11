@@ -305,32 +305,56 @@ _network.Tap = Tap
 
 
 if RUNS_AS_USER:
-    _real_jailed_path = _jailer.JailerContext.jailed_path
+    import framework.utils_drive as _utils_drive  # noqa: E402  pylint: disable=wrong-import-position
 
-    def jailed_path(self, file_path, create=False, subdir="."):
-        """`JailerContext.jailed_path` without the chown to the jail's user.
-
-        The user who runs the session is the jail's user here; everything
-        else is upstream's.
-        """
+    @contextlib.contextmanager
+    def _jail_user_is_session_user():
+        """No chown to the jail's user: the user who runs the session is the
+        jail's user here."""
         real_chown = os.chown
         os.chown = lambda path, uid, gid: None
         try:
-            return _real_jailed_path(self, file_path, create, subdir)
+            yield
         finally:
             os.chown = real_chown
 
+    _real_jailed_path = _jailer.JailerContext.jailed_path
+
+    def jailed_path(self, file_path, create=False, subdir="."):
+        """`JailerContext.jailed_path` without the chown to the jail's user;
+        everything else is upstream's."""
+        with _jail_user_is_session_user():
+            return _real_jailed_path(self, file_path, create, subdir)
+
     _jailer.JailerContext.jailed_path = jailed_path
+
+    _real_backend_spawn = _utils_drive.VhostUserBlkBackend.spawn
+
+    def backend_spawn(self, uid, gid):
+        """`VhostUserBlkBackend.spawn` without the chown of its socket to the
+        jail's user; everything else is upstream's."""
+        with _jail_user_is_session_user():
+            return _real_backend_spawn(self, uid, gid)
+
+    _utils_drive.VhostUserBlkBackend.spawn = backend_spawn
 
     # Paths in API requests are the jail's: absolute ones start at the jail's
     # root, as Firecracker sees them after chroot. Without a chroot they are
-    # put below the jail's directory on the way in, and taken off again in
-    # what Firecracker sends back (configurations, error messages).
+    # given to Firecracker relative to its working directory, which the
+    # stand-in makes the jail's directory (JAIL_RELATIVE, `.//<path>`), and
+    # taken back to the jail's form in what Firecracker sends back
+    # (configurations, error messages). Relative, they resolve as the chroot
+    # resolves them: a snapshot keeps the paths of its devices, and a microVM
+    # restored in another jail opens them in its own jail, not in the jail the
+    # snapshot was taken in (which an absolute host path would name).
     PATH_FIELDS = {
         "kernel_image_path", "initrd_path", "path_on_host", "socket", "uds_path",
         "log_path", "metrics_path", "snapshot_path", "mem_file_path", "backend_path",
         "serial_out_path",
     }
+    JAIL_RELATIVE = ".//"
+    # A path given as JAIL_RELATIVE, where it starts in a text.
+    _JAIL_RELATIVE_IN_TEXT = re.compile(r"(?:^|(?<=[\s'\"(\[=:,]))\.//")
 
     def _chroot_of(api):
         m = re.match(r"^(.*/jailer/[^/]+/[^/]+/root)/", api.socket)
@@ -338,13 +362,13 @@ if RUNS_AS_USER:
             raise AssertionError(f"API socket {api.socket} is not in a jail directory")
         return m.group(1)
 
-    def _to_host(value, root, key=None):
+    def _to_host(value, key=None):
         if isinstance(value, dict):
-            return {k: _to_host(v, root, k) for k, v in value.items()}
+            return {k: _to_host(v, k) for k, v in value.items()}
         if isinstance(value, list):
-            return [_to_host(v, root, key) for v in value]
+            return [_to_host(v, key) for v in value]
         if key in PATH_FIELDS and isinstance(value, str) and value.startswith("/"):
-            return root + value
+            return JAIL_RELATIVE + value.lstrip("/")
         return value
 
     def _to_jail(value, root):
@@ -353,7 +377,8 @@ if RUNS_AS_USER:
         if isinstance(value, list):
             return [_to_jail(v, root) for v in value]
         if isinstance(value, str):
-            return value.replace(root + "/", "/").replace(root, "/")
+            value = value.replace(root + "/", "/").replace(root, "/")
+            return _JAIL_RELATIVE_IN_TEXT.sub("/", value)
         return value
 
     class _JailView:
@@ -371,7 +396,8 @@ if RUNS_AS_USER:
 
         @property
         def content(self):
-            return self._res.content.replace(self._root.encode() + b"/", b"/")
+            return _to_jail(self._res.content.decode(errors="surrogateescape"), self._root).encode(
+                errors="surrogateescape")
 
         @property
         def text(self):
@@ -383,7 +409,7 @@ if RUNS_AS_USER:
     def request(self, method, path, **kwargs):
         root = _chroot_of(self._api)
         try:
-            res = _real_request(self, method, path, **_to_host(kwargs, root))
+            res = _real_request(self, method, path, **_to_host(kwargs))
         except RuntimeError as err:
             raise RuntimeError(*(_to_jail(a, root) if isinstance(a, str) else a for a in err.args)) from None
         return _JailView(res, root)

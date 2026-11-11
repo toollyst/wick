@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+"""crosvm's vhost-user block device, as upstream's framework runs it, on macOS.
+
+Linux: upstream's development container has crosvm, which the framework
+runs as a vhost-user-blk backend (framework/utils_drive.py,
+CrosvmVhostUserBlkBackend):
+
+    crosvm [--log-level L] devices --disable-sandbox --control-socket CTRL \\
+        --block vhost=SOCKET,path=IMAGE[,ro]
+    crosvm disk resize 0 BYTES CTRL
+
+crosvm does not build for macOS. This runs wick's backend, tools/vhost-user-blk
+(WICK_IT_VHOST_USER_BLK, built by tools/macos/integration-tests.sh), with
+the same device: read-only with `ro`, resized through its control socket,
+one frontend, files left behind when it is killed. Any other crosvm command
+or option is refused, naming it.
+"""
+import os
+import socket
+import sys
+
+
+def fail(msg):
+    print(f"crosvm (wick, macOS): {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def devices(args):
+    control, block = None, None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--disable-sandbox":
+            i += 1
+        elif a in ("--control-socket", "--block") and i + 1 < len(args):
+            if a == "--control-socket":
+                control = args[i + 1]
+            elif block is not None:
+                fail("one --block device only")
+            else:
+                block = args[i + 1]
+            i += 2
+        else:
+            fail(f"devices: unsupported option {a}")
+    if block is None:
+        fail("devices: no --block")
+    opts = {}
+    for item in block.split(","):
+        key, _, value = item.partition("=")
+        opts[key] = value
+    if set(opts) - {"vhost", "path", "ro"} or "vhost" not in opts or "path" not in opts:
+        fail(f"--block {block}: only vhost=<socket>,path=<image>[,ro]")
+    backend = os.environ.get("WICK_IT_VHOST_USER_BLK")
+    if not backend:
+        fail("WICK_IT_VHOST_USER_BLK is not set: run tools/macos/integration-tests.sh")
+    argv = [backend, opts["vhost"], opts["path"]]
+    if "ro" in opts:
+        argv.append("--read-only")
+    if control:
+        argv += ["--control-socket", control]
+    # crosvm --log-level off prints nothing; the backend's one line goes too.
+    null = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(null, 1)
+    os.execv(backend, argv)
+
+
+def disk(args):
+    if len(args) != 4 or args[0] != "resize" or args[1] != "0" or not args[2].isdigit():
+        fail(f"disk {' '.join(args)}: only `disk resize 0 <bytes> <control socket>`")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(10)
+        s.connect(args[3])
+        s.sendall(f"resize {args[2]}\n".encode())
+        reply = s.makefile().readline().strip()
+    if reply != "ok":
+        fail(f"disk resize: {reply or 'no reply'}")
+
+
+def main():
+    args = sys.argv[1:]
+    while args and args[0] == "--log-level":
+        args = args[2:]
+    if not args:
+        fail("no command")
+    if args[0] == "devices":
+        devices(args[1:])
+    elif args[0] == "disk":
+        disk(args[1:])
+    else:
+        fail(f"`crosvm {args[0]}` is not provided on macOS; only `devices --block` and `disk resize`")
+
+
+main()

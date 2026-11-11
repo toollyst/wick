@@ -9,7 +9,11 @@ Firecracker as the jailer's process tree does (`--daemonize`'s double fork
 and new session, `--new-pid-ns`'s child whose pid goes to `<exec>.pid` while
 the launcher exits 0, `--resource-limit`, `--netns`'s network), with the jail's directory as the
 root of every path Firecracker is given on its command line and in its
-configuration file, and as its working directory. What needs root (chroot,
+configuration file, and as its working directory. The paths of the
+configuration file are given relative to that directory (`.//<path>`, as
+tools/macos/integration/wick_macos.py gives those of API requests): a
+snapshot keeps them, and a microVM restored in another jail resolves them
+in its own jail, as it does in a chroot. What needs root (chroot,
 the jail's uid and gid, cgroups) is the jailer's own and is tested in the
 `jailer` mode; asking for a cgroup here fails, as a jailer that cannot set one
 does.
@@ -77,8 +81,8 @@ def translate_config(root, path):
             return {k: walk(x, k) for k, x in v.items()}
         if isinstance(v, list):
             return [walk(x, key) for x in v]
-        if key in CONFIG_PATH_FIELDS and isinstance(v, str):
-            return in_jail(root, v)
+        if key in CONFIG_PATH_FIELDS and isinstance(v, str) and v.startswith("/"):
+            return ".//" + v.lstrip("/")
         return v
 
     out = os.path.join(os.path.dirname(host), ".wick-user-" + os.path.basename(host))

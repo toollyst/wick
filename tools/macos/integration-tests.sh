@@ -25,7 +25,11 @@
 # OUT (default build/integration-tests/<time>) gets the pytest JSON report
 # (test-report.json), pytest's output (pytest.log), upstream's test_results
 # directory and the comparison (comparison.md); summary.txt ends
-# "N passed, M failed".
+# "N passed, M failed", and session-peak-kib the most the session's
+# directory held (sampled every 10 s), what the free-space check is sized by.
+#
+# A run needs WICK_IT_FREE_GIB (default 20) GiB free; a selection of tests
+# that session-peak-kib shows to need less may ask for less.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -59,7 +63,9 @@ ARTIFACTS=(
 SCREEN_DIR="$(env PATH="/opt/homebrew/bin:$PATH" brew --prefix screen 2>/dev/null)/bin"
 [[ -x "$SCREEN_DIR/screen" ]] || die "screen 5 missing: brew install screen (macOS's screen 4.0 has no -Logfile)"
 
-prepare_test_run "$ROOT/build/integration-tests" 20
+free_gib="${WICK_IT_FREE_GIB:-20}"
+[[ "$free_gib" =~ ^[0-9]+$ ]] || die "WICK_IT_FREE_GIB must be a number of GiB"
+prepare_test_run "$ROOT/build/integration-tests" "$free_gib"
 out="${out:-$ROOT/build/integration-tests/$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
@@ -92,6 +98,10 @@ slirp_cflags="$(env PATH="/opt/homebrew/bin:$PATH" pkg-config --cflags --libs sl
     die "libslirp missing: brew install libslirp pkg-config"
 # shellcheck disable=SC2086
 cc -O2 -Wall -Wextra -Werror -o "$bin/netns-slirp" "$ROOT/tools/macos/integration/netns-slirp.c" $slirp_cflags
+# crosvm's vhost-user block device (tools/macos/integration/bin/crosvm).
+(cd "$ROOT/tools/vhost-user-blk" && CARGO_TARGET_DIR="$ROOT/lib/firecracker/build/vhost-user-blk" \
+    cargo build --release --locked)
+cp "$ROOT/lib/firecracker/build/vhost-user-blk/release/vhost-user-blk" "$bin/vhost-user-blk"
 if [[ $mode == user ]]; then
     cp "$ROOT/tools/macos/integration/jailer" "$bin/jailer"
 fi
@@ -118,6 +128,7 @@ session="$(mktemp -d /tmp/wit-XXXX)"
 cleanup() {
     # Everything the session started carries its root in its command line.
     pkill -KILL -f -- "$session" 2>/dev/null || true
+    [[ -n "${sampler:-}" ]] && kill "$sampler" 2>/dev/null
     rm -rf "$session"
 }
 trap cleanup EXIT
@@ -127,10 +138,25 @@ env_args=(
     "PATH=$ROOT/tools/macos/integration/bin:$SCREEN_DIR:/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
     "PYTHONPATH=$ROOT/tools/macos/integration"
     "WICK_IT_MODE=$mode" "WICK_IT_ROOT=$session" "TMPDIR=$session/tmp"
-    "WICK_IT_NETNS_HELPER=$bin/netns-slirp"
+    "WICK_IT_NETNS_HELPER=$bin/netns-slirp" "WICK_IT_VHOST_USER_BLK=$bin/vhost-user-blk"
     "PYTEST_ADDOPTS=${PYTEST_ADDOPTS:-}"
 )
 mkdir -p "$session/tmp"
+# The session directory's peak size, sampled: the blocks of its files that
+# have one link (the guest artifacts are hard links to the cache).
+(
+    peak=0
+    while [[ -d "$session" ]]; do
+        kib="$(find "$session" -type f -links 1 -exec stat -f %b {} + 2>/dev/null |
+            awk '{ s += $1 } END { print int(s / 2) }')"
+        if ((kib > peak)); then
+            peak=$kib
+            echo "$peak" >"$out/session-peak-kib"
+        fi
+        sleep 10
+    done
+) &
+sampler=$!
 rm -rf "$ROOT/lib/firecracker/test_results"
 pytest=("$ROOT/build/integration/venv/bin/python" -m pytest -p wick_macos --binary-dir "$bin" "$@")
 [[ -x "$ROOT/build/integration/venv/bin/python" ]] || die "no Python environment: tools/macos/integration/venv.sh"
