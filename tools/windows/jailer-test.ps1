@@ -1092,7 +1092,7 @@ function Stage-Hugepages {
     Check ($own -match '^denied ') "a jailed process opened its own token to adjust it: $own"
     $large = Invoke-JailedProbe $base 'l' '2' @() 'largepage:64'
     Check ($large -match '^denied ') "64 MiB of large pages in a jail: $large"
-    $vm = Start-JailedVm $base 'vm' @() 256 '2M'
+    $vm = Start-JailedVm $base 'vm' @() 256 -hugePages '2M'
     try {
         Check ($vm.P.WaitForExit(30000)) 'the jailer did not exit after Firecracker refused large pages'
         Check ($vm.P.ExitCode -ne 0) "jailer exit $($vm.P.ExitCode) for a jailed guest on large pages"

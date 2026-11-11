@@ -70,7 +70,8 @@ pub const PID_NS_ENV: &str = "WICK_JAIL_PID_NS";
 /// ignored, as the kernel delivers them to a namespace's init from outside.
 /// The faults a process raises itself (SIGABRT, SIGFPE, SIGTRAP) are left
 /// as they are: the kernel delivers those to init as well.
-#[cfg(any(target_os = "macos", test))]
+// Not in a Windows test build: Windows has no SIGTSTP, SIGTTIN, SIGTTOU, SIGVTALRM or SIGPROF.
+#[cfg(any(target_os = "macos", all(test, not(windows))))]
 pub const DROPPED_IN_PID_NS: &[libc::c_int] = &[
     libc::SIGINT,
     libc::SIGQUIT,

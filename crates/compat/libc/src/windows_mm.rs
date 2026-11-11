@@ -41,7 +41,11 @@
 //! `map_large`. They are changed in whole large pages: `munmap` of part of
 //! one mapping and a mapping without `MAP_HUGETLB` at a fixed address over
 //! it fail with `EINVAL`; a `MAP_HUGETLB` mapping at a fixed address over
-//! whole pages of it, and `MADV_DONTNEED`, zero them in place. Everything
+//! whole pages of it, and `MADV_DONTNEED`, zero them in place. Windows
+//! changes no large page's protection, so a mapping keeps the one it was
+//! made with: `mprotect` grants only that one (`EACCES` otherwise), and a
+//! fixed `MAP_HUGETLB` mapping with another protection is made only over a
+//! whole mapping, which is allocated again (`fixed_large`). Everything
 //! else with `MAP_HUGETLB` fails with `ENOMEM`, as Linux does without huge
 //! pages.
 
@@ -261,8 +265,12 @@ enum Kind {
     /// (`MAP_HUGETLB`): committed and locked when mapped, never a
     /// placeholder, and changed only in whole large pages, as Linux changes
     /// hugetlb mappings only in whole huge pages. `fresh`: never writable
-    /// since mapped, so still the zeros Windows gave it.
-    Large { page: usize, fresh: bool },
+    /// since mapped, so still the zeros Windows gave it. `wprot`: the
+    /// protection it was allocated with, which is its protection for good:
+    /// Windows changes no large page's protection (`VirtualProtect` to any
+    /// other fails with `ERROR_INVALID_ADDRESS`, from and to every
+    /// protection; measured on Windows 11 26H2).
+    Large { page: usize, fresh: bool, wprot: u32 },
 }
 
 /// Sorted, disjoint (offset, len) ranges.
@@ -894,18 +902,8 @@ fn map_large(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int) -> Resul
     // Enables the privilege if this process may adjust its token. Without
     // it the allocation below fails.
     let _ = lock_memory_privilege();
-    // SAFETY: a new allocation; large pages are committed read-write.
-    let p = unsafe {
-        VirtualAlloc2(
-            proc(),
-            std::ptr::null(),
-            len,
-            MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
-            PAGE_READWRITE,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
+    // With the protection asked for: it cannot be changed afterwards.
+    let p = alloc_large(std::ptr::null(), len, wprot);
     if p.is_null() {
         // SAFETY: plain call.
         let err = unsafe { GetLastError() };
@@ -927,20 +925,34 @@ fn map_large(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int) -> Resul
         }
         return Err(crate::ENOMEM);
     }
-    if wprot != PAGE_READWRITE && !protect(p as usize, len, wprot) {
-        // SAFETY: frees the allocation just made.
-        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
-        return Err(crate::ENOMEM);
-    }
     let fresh = prot & PROT_WRITE == 0;
-    table().lock().unwrap().insert(p as usize, Region::new(len, Kind::Large { page, fresh }));
+    table().lock().unwrap().insert(p as usize, Region::new(len, Kind::Large { page, fresh, wprot }));
     Ok(p)
 }
 
-/// `MAP_FIXED` hugetlb mapping of [start, start + len) (whole large pages):
-/// over whole pages of one large-page mapping of size `page`, its pages,
-/// zero-filled (unless they still hold the zeros they were mapped with),
-/// with protection `prot`.
+/// `len` bytes of large pages, committed and locked, with protection `wprot`
+/// (theirs for good), at `at` or anywhere (null); null on failure.
+fn alloc_large(at: *const c_void, len: usize, wprot: u32) -> *mut c_void {
+    // SAFETY: a new allocation, or a failure.
+    unsafe {
+        VirtualAlloc2(proc(), at, len, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, wprot, std::ptr::null_mut(), 0)
+    }
+}
+
+/// `MAP_FIXED` hugetlb mapping of [start, start + len) (whole large pages)
+/// over whole pages of one large-page mapping of size `page`: zero-filled
+/// pages with protection `prot`. Windows changes no large page's protection
+/// ([`Kind::Large`]), so:
+/// - over the whole mapping with another protection (Firecracker's guest
+///   memory: read-write over its `PROT_NONE` reservation), the mapping is
+///   released and allocated again at its address with the new protection.
+///   If that fails the range is left unmapped and the call fails with
+///   `ENOMEM`, as Linux leaves it when a `MAP_FIXED` mapping fails after
+///   the old one is gone;
+/// - with the mapping's own protection, the pages are zeroed in place;
+/// - over part of the mapping with another protection, `ENOMEM`: one
+///   allocation has one protection, and two allocations in its place could
+///   not be unmapped as one mapping.
 fn fixed_large(start: usize, len: usize, prot: c_int, page: usize) -> Result<*mut c_void, c_int> {
     if !start.is_multiple_of(page) {
         return Err(crate::EINVAL);
@@ -948,50 +960,41 @@ fn fixed_large(start: usize, len: usize, prot: c_int, page: usize) -> Result<*mu
     let wprot = win_prot(prot).ok_or(crate::EINVAL)?;
     let end = start + len;
     let mut t = table().lock().unwrap();
-    let (b, fresh) = match overlapping(&t, start, end)[..] {
+    let (b, fresh, old) = match overlapping(&t, start, end)[..] {
         [b] => match t[&b].kind {
-            Kind::Large { page: p, fresh } if p == page && b <= start && b + t[&b].len >= end => (b, fresh),
+            Kind::Large { page: p, fresh, wprot: old } if p == page && b <= start && b + t[&b].len >= end => {
+                (b, fresh, old)
+            }
             _ => return Err(crate::ENOMEM),
         },
         _ => return Err(crate::ENOMEM),
     };
-    if !fresh && !zero_large(start, len) {
+    let whole = b == start && t[&b].len == len;
+    if old == wprot {
+        if !fresh {
+            zero_large(start, len);
+        }
+        return Ok(start as *mut c_void);
+    }
+    if !whole {
         return Err(crate::ENOMEM);
     }
-    if !protect(start, len, wprot) {
+    // SAFETY: releases our allocation; the table entry goes with it.
+    unsafe { VirtualFree(b as *mut c_void, 0, MEM_RELEASE) };
+    t.remove(&b);
+    let p = alloc_large(b as *const c_void, len, wprot);
+    if p.is_null() {
         return Err(crate::ENOMEM);
     }
-    if prot & PROT_WRITE != 0 {
-        t.get_mut(&b).unwrap().kind = Kind::Large { page, fresh: false };
-    }
-    Ok(start as *mut c_void)
+    t.insert(b, Region::new(len, Kind::Large { page, fresh: prot & PROT_WRITE == 0, wprot }));
+    Ok(p)
 }
 
-/// Zeroes [base, base + len) of a large-page mapping (whole large pages),
-/// keeping each run's protection.
-fn zero_large(base: usize, len: usize) -> bool {
-    let end = base + len;
-    let mut at = base;
-    while at < end {
-        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid.
-        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: queries our memory.
-        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
-            return false;
-        }
-        let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(end) - at;
-        let writable = mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_EXECUTE_READWRITE;
-        if !writable && !protect(at, run, PAGE_READWRITE) {
-            return false;
-        }
-        // SAFETY: our committed memory, writable now.
-        unsafe { std::ptr::write_bytes(at as *mut u8, 0, run) };
-        if !writable && !protect(at, run, mbi.Protect) {
-            return false;
-        }
-        at += run;
-    }
-    true
+/// Zeroes [base, base + len) of a writable large-page mapping (a mapping
+/// that is not `fresh` is writable: its protection never changed).
+fn zero_large(base: usize, len: usize) {
+    // SAFETY: our committed, locked, writable memory.
+    unsafe { std::ptr::write_bytes(base as *mut u8, 0, len) };
 }
 
 /// `mmap`.
@@ -1187,15 +1190,14 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
                     t.get_mut(&b).unwrap().kind = Kind::Private { file: None };
                 }
             }
-            Kind::Large { page, .. } => {
+            Kind::Large { page, wprot: old, .. } => {
                 if !(s - b).is_multiple_of(page) || !(e - b).is_multiple_of(page) {
                     return fail(crate::EINVAL, -1);
                 }
-                if !protect(s, e - s, wprot) {
+                // Windows changes no large page's protection (`Kind::Large`):
+                // only the protection it has is granted.
+                if old != wprot {
                     return fail(crate::EACCES, -1);
-                }
-                if prot & PROT_WRITE != 0 {
-                    t.get_mut(&b).unwrap().kind = Kind::Large { page, fresh: false };
                 }
             }
             Kind::Private { .. } | Kind::View { .. } => {
@@ -1364,14 +1366,15 @@ unsafe fn madvise_plain(addr: *mut c_void, len: size_t, advice: c_int) -> c_int 
     for b in overlapping(&t, start, end) {
         let r = &t[&b];
         let (s, e) = (start.max(b), end.min(b + r.len));
-        if let Kind::Large { page, .. } = r.kind {
+        if let Kind::Large { page, fresh, .. } = r.kind {
             // Locked large pages cannot be dropped: they are zeroed in place,
-            // whole pages only, as Linux drops whole huge pages.
+            // whole pages only, as Linux drops whole huge pages (pages never
+            // writable are zeros still).
             if !(s - b).is_multiple_of(page) || !(e - b).is_multiple_of(page) {
                 return fail(crate::EINVAL, -1);
             }
-            if !zero_large(s, e - s) {
-                return fail(crate::EACCES, -1);
+            if !fresh {
+                zero_large(s, e - s);
             }
             continue;
         }
@@ -1909,8 +1912,13 @@ mod tests {
             assert_eq!(madvise(page as *mut c_void, large, MADV_DONTNEED), 0);
             assert_eq!(*(page as *const u8), 0);
             assert_eq!(*((page + (4 << 20) - 1) as *const u8), 9);
-            assert_eq!(mprotect(page as *mut c_void, large, PROT_READ), 0);
-            assert_eq!(mprotect(page as *mut c_void, PAGE, PROT_READ), -1);
+            // The protection it has, and no other (Windows changes no large
+            // page's protection); whole large pages only.
+            assert_eq!(mprotect(page as *mut c_void, large, PROT_READ | PROT_WRITE), 0);
+            assert_eq!(mprotect(page as *mut c_void, large, PROT_READ), -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EACCES));
+            assert_eq!(mprotect(page as *mut c_void, PAGE, PROT_READ | PROT_WRITE), -1);
+            assert_eq!(*((page + (4 << 20) - 1) as *const u8), 9);
             assert_eq!(munmap(page as *mut c_void, 4 << 20), 0);
         }
 
@@ -1919,24 +1927,38 @@ mod tests {
         // over it.
         let huge = ANON | MAP_NORESERVE | MAP_HUGE_2MB;
         let base = hugetlb(4 << 20, PROT_NONE, huge).unwrap();
+        let protection = |at: usize| {
+            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            assert_ne!(unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) }, 0);
+            mbi.Protect
+        };
+        // The reservation is inaccessible, as PROT_NONE is.
+        assert_eq!(protection(base), PAGE_NOACCESS);
         let fixed = |at: usize, len: usize, prot: c_int| {
             // SAFETY: MAP_FIXED over our own mapping, or a failure.
             let q = unsafe { mmap(at as *mut c_void, len, prot, huge | MAP_FIXED | MAP_HUGETLB, -1, 0) };
             if q == MAP_FAILED { Err(std::io::Error::last_os_error().raw_os_error().unwrap()) } else { Ok(q as usize) }
         };
+        // Part of it with another protection: one allocation, one protection.
+        assert_eq!(fixed(base + large, large, PROT_READ | PROT_WRITE), Err(crate::ENOMEM));
+        // The whole of it, read-write: allocated again at its address.
         assert_eq!(fixed(base, 4 << 20, PROT_READ | PROT_WRITE), Ok(base));
+        assert_eq!(protection(base), PAGE_READWRITE);
         // SAFETY: our 4 MiB mapping, read-write now.
         unsafe {
             *(base as *mut u8) = 3;
             *((base + large) as *mut u8) = 4;
         }
-        // Over its second page, read-only: zeros, the first page kept.
-        assert_eq!(fixed(base + large, large, PROT_READ), Ok(base + large));
+        // Over its second page, with its protection: zeros, the first page kept.
+        assert_eq!(fixed(base + large, large, PROT_READ | PROT_WRITE), Ok(base + large));
         // SAFETY: as above.
         unsafe {
             assert_eq!(*(base as *const u8), 3);
             assert_eq!(*((base + large) as *const u8), 0);
         }
+        // Over its second page, read-only: another protection for a part.
+        assert_eq!(fixed(base + large, large, PROT_READ), Err(crate::ENOMEM));
         // Not a large page boundary; beyond the mapping.
         assert_eq!(fixed(base + PAGE, large, PROT_READ), Err(crate::EINVAL));
         assert_eq!(fixed(base + large, 2 * large, PROT_READ), Err(crate::ENOMEM));
