@@ -285,8 +285,13 @@ function Stage-Daemonize {
         $sock = Join-Path $root 'run\firecracker.socket'
         $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
         Check (Test-Path $sock) 'the detached Firecracker did not open its API socket'
-        $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" } | Select-Object -First 1
-        Check ($null -ne $fcp) 'no detached Firecracker'
+        # Two processes of the binary run the jail, Firecracker and its API
+        # process (`api`); Firecracker is the one without the API process's
+        # whole mitigation profile (no dynamic code policy before a guest).
+        $procs = @(Get-Process firecracker | Where-Object { $_.Path -like "$root*" })
+        Check ($procs.Count -eq 2) "processes of the jail's binary: $($procs.Count) (expected Firecracker and its API process)"
+        $fcp = $procs | Where-Object { (Get-Mitigations $_.Id).DynamicCode -eq 0 } | Select-Object -First 1
+        Check ($null -ne $fcp) 'no detached Firecracker (both processes of the binary carry the API profile)'
         $pidFile = Join-Path $root 'firecracker.exe.pid'
         Check (Test-Path $pidFile) 'no pid file'
         $written = [int](Get-Content $pidFile)
@@ -305,6 +310,15 @@ function Stage-Daemonize {
 }
 
 # tools\windows\jail-probe.rs, built once (or -Probe).
+# The process mitigations of pid $id, by name, through jail-probe.
+function Get-Mitigations([int]$id) {
+    $line = & (Get-Probe) "mitigations:$id"
+    Check ($line -match '^mitigations:\d+ allowed') "reading pid $id's mitigations: $line"
+    $m = @{}
+    foreach ($kv in ($line -split ' ' | Where-Object { $_ -match '=' })) { $k, $v = $kv -split '='; $m[$k] = [Convert]::ToInt32($v, 16) }
+    $m
+}
+
 function Get-Probe {
     if ($script:Probe) { return $script:Probe }
     $p = Join-Path $WorkDir 'jail-probe.exe'
@@ -988,13 +1002,6 @@ function Stage-Api {
     $probe = Get-Probe
     $all = [ordered]@{ ExtensionPoint = 1; ImageLoad = 7; Signature = 1; StrictHandle = 3; Win32k = 1; DynamicCode = 1; ChildProcess = 1 }
     $run = @('ImageLoad', 'DynamicCode')
-    function Get-Mitigations([int]$id) {
-        $line = & $probe "mitigations:$id"
-        Check ($line -match '^mitigations:\d+ allowed') "reading pid $id's mitigations: $line"
-        $m = @{}
-        foreach ($kv in ($line -split ' ' | Where-Object { $_ -match '=' })) { $k, $v = $kv -split '='; $m[$k] = [Convert]::ToInt32($v, 16) }
-        $m
-    }
     try {
         $jail = Start-ApiJail $base 'api'
         Check ($jail.Api.Count -eq 1) "processes of the jail's binary besides Firecracker: $($jail.Api.Count) (expected the API server's process)"
