@@ -23,6 +23,16 @@
 //! request (`KVM_REQ_CLOCK_UPDATE`). Without it, a restored guest's kvm-clock
 //! restarts from the new VM's clock before `set_clock`, near 0, and goes
 //! backwards.
+//!
+//! Upstream saves the vCPUs, their TSCs among them, before it reads the
+//! clock, and restores them before it sets it; on KVM the moments between
+//! are microseconds, on WHP milliseconds, enough for a restored Linux guest's
+//! clocksource watchdog to find kvm-clock and the TSC apart (measured: 5 ms
+//! over 480 ms) and mark the TSC unstable. So `get_clock` also returns the
+//! guest TSC at the moment of the clock it returns (`host_tsc`, the field
+//! KVM fills with the host's), the clock being the guest's kvm-clock at that
+//! TSC, and `set_clock` makes that pair the reference: the restored guest's
+//! kvm-clock goes on from its TSC exactly as it did before the snapshot.
 
 use std::sync::Mutex;
 
@@ -85,8 +95,7 @@ pub(crate) fn time_scale(scaled_hz: u64, base_hz: u64) -> (i8, u32) {
 }
 
 /// Applies a `(shift, mul)` from [`time_scale`] to `delta`: what the guest
-/// computes; the tests check [`time_scale`] with it.
-#[cfg(test)]
+/// computes.
 fn scale(delta: u64, shift: i8, mul: u32) -> u64 {
     let d = if shift >= 0 { delta << shift } else { delta >> -shift };
     ((u128::from(d) * u128::from(mul)) >> 32) as u64
@@ -110,6 +119,29 @@ impl State {
     pub(crate) fn reset(&mut self) {
         self.reference = None;
         self.generation += 1;
+    }
+
+    /// Makes `(tsc, ns)` the reference: the guest's kvm-clock reads `ns`
+    /// when its TSC reads `tsc` (a restored clock, with the guest TSC it was
+    /// saved with).
+    pub(crate) fn pin(&mut self, tsc: u64, ns: u64) {
+        self.reference = Some((tsc, ns));
+    }
+
+    /// The guest's kvm-clock when its TSC reads `tsc`, as the guest computes
+    /// it from the time info published under the reference, if there is one.
+    pub(crate) fn clock_at(&self, tsc: u64) -> Option<u64> {
+        let (ref_tsc, ref_ns) = self.reference?;
+        let hz = tsc_hz();
+        if hz == 0 {
+            return None;
+        }
+        let (shift, mul) = time_scale(1_000_000_000, hz);
+        Some(if tsc >= ref_tsc {
+            ref_ns.saturating_add(scale(tsc - ref_tsc, shift, mul))
+        } else {
+            ref_ns.saturating_sub(scale(ref_tsc - tsc, shift, mul))
+        })
     }
 }
 
@@ -248,6 +280,25 @@ mod tests {
         state.reset();
         assert_eq!(state.reference, None);
         assert_eq!(state.generation, before + 1);
+    }
+
+    // The pair a snapshot saved is the restored reference, and the clock is
+    // read from the guest TSC through it, both ways from the reference.
+    #[test]
+    fn test_pinned_reference_reads_the_clock_from_the_tsc() {
+        let mut state = State::default();
+        assert_eq!(state.clock_at(1), None);
+        let hz = tsc_hz();
+        if hz == 0 {
+            return; // no WHP: no TSC frequency to scale by
+        }
+        state.pin(10 * hz, 5_000_000_000);
+        let at = |s: &State, tsc| s.clock_at(tsc).unwrap();
+        assert_eq!(at(&state, 10 * hz), 5_000_000_000);
+        assert!(at(&state, 11 * hz).abs_diff(6_000_000_000) < 10);
+        assert!(at(&state, 9 * hz).abs_diff(4_000_000_000) < 10);
+        state.reset();
+        assert_eq!(state.clock_at(10 * hz), None);
     }
 
     #[test]
