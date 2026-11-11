@@ -21,7 +21,9 @@
 # directory and the comparison with Linux's results (comparison.md); the
 # script fails on a difference not in tools\windows\integration-test-differences.txt.
 # (The pytest arguments are one string: PowerShell would take "-x" or "-k" for its own.)
-param([string]$Out = '', [string]$Pytest = '')
+# -Keep leaves the session root (jails, screen logs: the jailer's output) in
+# place for a look after the run.
+param([string]$Out = '', [string]$Pytest = '', [switch]$Keep)
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $Fc = Join-Path $Root 'lib\firecracker'
@@ -95,7 +97,8 @@ try {
     # Everything the session started runs from its bin directory or its root.
     Get-Process | Where-Object { $_.Path -and ($_.Path.StartsWith($bin) -or $_.Path.StartsWith($session)) } |
         Stop-Process -Force -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $session -ErrorAction SilentlyContinue
+    if ($Keep) { Write-Host "session root kept: $session" }
+    else { Remove-Item -Recurse -Force $session -ErrorAction SilentlyContinue }
     $touched = @(git -C $Fc diff --name-only | Where-Object { $sourcesBefore -notcontains $_ })
     if ($touched.Count) {
         Write-Warning "the tests changed $($touched.Count) upstream source files; put back: $($touched -join ', ')"

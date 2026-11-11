@@ -931,8 +931,43 @@ fn set_security(path: &Path, sddl: &str, label: bool) -> io::Result<()> {
     result
 }
 
+/// Holds the session's drive-letter mutex while alive.
+struct DriveLock(windows_sys::Win32::Foundation::HANDLE);
+
+impl DriveLock {
+    /// Jailers that start together each found the same letter free and
+    /// defined it: `DefineDosDevice` stacks a second definition rather than
+    /// refusing it, so one jail's drive named the other's directory and its
+    /// Firecracker never appeared where it was expected (measured: three of
+    /// six jails started at once). Choosing and defining a letter is done
+    /// under one mutex in the logon session's namespace, the mappings' own.
+    fn take() -> Option<DriveLock> {
+        use windows_sys::Win32::System::Threading::{CreateMutexW, INFINITE, WaitForSingleObject};
+        // SAFETY: a NUL-terminated name; the handle is closed by Drop.
+        let h = unsafe { CreateMutexW(std::ptr::null(), 0, wide("Local\\wick-jailer-drives").as_ptr()) };
+        if h.is_null() {
+            return None;
+        }
+        // SAFETY: our mutex handle. WAIT_ABANDONED (a jailer that died
+        // holding it) also gives us the mutex.
+        unsafe { WaitForSingleObject(h, INFINITE) };
+        Some(DriveLock(h))
+    }
+}
+
+impl Drop for DriveLock {
+    fn drop(&mut self) {
+        // SAFETY: the mutex this jailer holds, and its handle.
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 /// Maps the highest free drive letter to `root`.
 fn map_drive(root: &Path) -> Result<String, HostError> {
+    let _one_at_a_time = DriveLock::take();
     sweep_drives(root);
     // SAFETY: plain call.
     let used = unsafe { GetLogicalDrives() };
