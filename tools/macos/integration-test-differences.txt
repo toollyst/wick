@@ -187,6 +187,26 @@ all impossible integration_tests/functional/test_vsock.py::test_snapshot_restore
 # is a datagram endpoint (docs/PORTING.md row 6), one queue by design.
 all impossible integration_tests/functional/test_net.py::test_multi_queue_unsupported
 
+# A balloon (or free page report) on macOS returns no memory, and after a
+# restore from a snapshot file it corrupts guest memory. Firecracker
+# discards a released range with madvise(MADV_DONTNEED) (wick: MADV_ZERO
+# and MADV_FREE_REUSABLE) or, for memory mapped privately from a snapshot
+# file, by mapping anonymous memory over it (MAP_FIXED). Measured on
+# Hypervisor.framework (an hv_vm_map'd 64 MiB a vCPU wrote): MADV_FREE_REUSABLE
+# marks 1 page of 4093 reusable and the footprint stays at 65.8 MiB, so
+# test_rss_memory_lower (30.6 MiB of the 32 MiB dirtied stay), test_balloon_snapshot
+# and test_hinting_reporting_snapshot see no reduction; and after MAP_FIXED
+# the guest keeps writing the old pages while Firecracker's devices use the
+# new ones. A restored microVM whose balloon went to 150 MiB and back read
+# its disk with O_DIRECT to two different wrong checksums in 6 reads (none
+# before the balloon). hv_vm_unmap of the range, MAP_FIXED, and hv_vm_map
+# again frees the memory (footprint 65.8 to 1.8 MiB), keeps the guest's and
+# Firecracker's view one, and charges pages the guest touches again. To do:
+# discard guest memory that way.
+all bug integration_tests/functional/test_balloon.py::test_rss_memory_lower
+all bug integration_tests/functional/test_balloon.py::test_balloon_snapshot
+all bug integration_tests/functional/test_balloon.py::test_hinting_reporting_snapshot
+
 # The test hot-plugs a net device on a TAP nobody made and expects Firecracker
 # to refuse it ("Open tap device failed"): on Linux the jail's user cannot
 # create a TAP (TUNSETIFF needs CAP_NET_ADMIN), so only the operator's TAPs

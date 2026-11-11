@@ -189,9 +189,13 @@ _utils.get_threads = get_threads
 def get_resident_memory(process):
     """`utils.get_resident_memory`: Linux adds the process's hugetlbfs pages
     (HugetlbPages in /proc/<pid>/status), which its RSS leaves out, to its
-    RSS. macOS has no /proc and no hugetlbfs: a process's resident memory is
-    its RSS (proc_pidinfo, through psutil), with every page it maps in it."""
-    return process.memory_info().rss // 1024
+    RSS. macOS has no /proc and no hugetlbfs: the resident pages of the
+    process's regions, as `memory_maps` reads them. Not psutil's RSS: that
+    counts the dyld shared cache's pages too (21.3 MiB of a booted 256 MiB
+    microVM's 147.8 MiB, measured), which every macOS process maps and
+    upstream's static Firecracker on Linux has none of; test_deflate_on_oom
+    sizes its balloon by this reading."""
+    return sum(m.rss for m in memory_maps(process, grouped=False)) // 1024
 
 
 _utils.get_resident_memory = get_resident_memory
