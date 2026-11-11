@@ -14,9 +14,12 @@ thread's name is the description Rust's std gives it, SetThreadDescription):
 
 `dmesg`: Windows's System log (below).
 
-e2fsprogs (`mkfs.ext4`, `resize2fs`, `e2fsck`, `fsck.ext4`, `debugfs`) and
-util-linux's `sfdisk`: Windows has no tool that writes ext4 or a Linux
-partition table on an image file; these are the Linux tools, run in
+e2fsprogs (`mkfs.ext4`, `resize2fs`, `e2fsck`, `fsck.ext4`, `debugfs`),
+util-linux's `sfdisk` and `blkid`, and `gcc` (upstream builds small static
+Linux programs on the host and copies them into the guest: vsock_helper.c,
+vmclock.c, ...): Windows has no tool that writes ext4 or a Linux partition
+table on an image file, or that builds a Linux binary; these are the Linux
+tools, run in
 the WSL distribution the artifacts were prepared with (WICK_IT_WSL,
 tools/windows/integration/setup-artifacts.ps1), on the same file
 (C:\\x -> /mnt/c/x).
@@ -134,7 +137,61 @@ def dmesg(_args):
     return out.returncode
 
 
-E2FSPROGS = ("mkfs.ext4", "resize2fs", "e2fsck", "fsck.ext4", "debugfs", "sfdisk")
+E2FSPROGS = ("mkfs.ext4", "resize2fs", "e2fsck", "fsck.ext4", "debugfs", "sfdisk", "blkid", "gcc", "lscpu")
+
+
+def socat(args):
+    """`socat [-d...] UNIX-LISTEN:<path>[,fork][,backlog=N] exec:'/bin/cat'|STDOUT`,
+    the host side of upstream's vsock tests: a listener on an AF_UNIX path
+    (Windows's; WSL's socat cannot reach those sockets) that echoes what each
+    connection sends, or writes it to standard output. With `fork`, every
+    connection; without, the first one."""
+    import socket  # pylint: disable=import-outside-toplevel
+    import threading  # pylint: disable=import-outside-toplevel
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import wick_windows_unix  # pylint: disable=import-outside-toplevel
+
+    wick_windows_unix.install()
+    args = [a for a in args if not re.fullmatch(r"-d+", a)]
+    if len(args) != 2 or not args[0].upper().startswith("UNIX-LISTEN:"):
+        print(f"socat {' '.join(args)}: only UNIX-LISTEN:<path>[,opts] with exec:'/bin/cat' or STDOUT "
+              "(tools/windows/integration/hosttools.py)", file=sys.stderr)
+        return 2
+    path, *opts = args[0].split(":", 1)[1].split(",")
+    fork = "fork" in opts
+    backlog = next((int(o.split("=")[1]) for o in opts if o.startswith("backlog=")), 5)
+    target = args[1].strip("'\"").lower()
+    echo = target.startswith("exec:") and target.split(":", 1)[1].strip("'\"") == "/bin/cat"
+    if not echo and target != "stdout":
+        print(f"socat: target {args[1]} is not taken", file=sys.stderr)
+        return 2
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(path)
+    listener.listen(backlog)
+    out = sys.stdout.buffer
+
+    def serve(conn):
+        with conn:
+            while True:
+                try:
+                    data = conn.recv(65536)
+                except OSError:
+                    return
+                if not data:
+                    return
+                if echo:
+                    conn.sendall(data)
+                else:
+                    out.write(data)
+                    out.flush()
+
+    while True:
+        conn, _ = listener.accept()
+        if not fork:
+            serve(conn)
+            return 0
+        threading.Thread(target=serve, args=(conn,), daemon=True).start()
 _DRIVE_PATH = re.compile(r"^([A-Za-z]):[\\/](.*)$")
 
 
@@ -154,7 +211,7 @@ def e2fsprogs(tool, args):
     return out.returncode
 
 
-TOOLS = ("ps", "pgrep", "pidof", "dmesg", *E2FSPROGS)
+TOOLS = ("ps", "pgrep", "pidof", "dmesg", "socat", *E2FSPROGS)
 
 
 def main():
@@ -163,7 +220,7 @@ def main():
     sys.stderr.reconfigure(newline="\n", encoding="utf-8")
     if tool in E2FSPROGS:
         return e2fsprogs(tool, args)
-    return {"ps": ps, "pgrep": pgrep, "pidof": pidof, "dmesg": dmesg}[tool](args)
+    return {"ps": ps, "pgrep": pgrep, "pidof": pidof, "dmesg": dmesg, "socat": socat}[tool](args)
 
 
 if __name__ == "__main__":

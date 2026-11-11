@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qmfflwj <qmfflwj@gmail.com>
+Date: Thu, 12 Nov 2026 04:19:16 +0900
+Subject: [PATCH] windows: cpu-template-helper's fingerprint names the host
+ from the registry
+
+A fingerprint names the host's microcode revision and its BIOS's version and
+release, which Linux reads from /proc/cpuinfo and the DMI files in sysfs.
+Windows keeps the same facts in the registry: the revision the processor
+reported at boot (CentralProcessor\0, "Update Revision": Intel's in the
+high half, AMD's the whole value) and the SMBIOS BIOS values
+(System\BIOS). They are read there, in Linux's format (0xa60120c, FB5,
+5.35 on the WHP PC); a sysfs path the helper does not map is not found, as
+on Linux.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                                    |  1 +
+ src/cpu-template-helper/Cargo.toml            |  4 +
+ .../src/fingerprint/dump.rs                   | 91 ++++++++++++++++++-
+ 3 files changed, 95 insertions(+), 1 deletion(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index e2987d317f825629781d914a98f0e71aabc5c7ee..6556a8f2808529cc0f02fea6b451e8fbad96a5cc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -425,6 +425,7 @@ dependencies = [
+  "thiserror 2.0.20",
+  "vmm",
+  "vmm-sys-util 0.15.0",
++ "windows-sys",
+ ]
+ 
+ [[package]]
+diff --git a/src/cpu-template-helper/Cargo.toml b/src/cpu-template-helper/Cargo.toml
+index cf4435685716255f8e9e47ef5edff34e5ed36647..90e2581ccefcfce8a62a50c0cf47fb215fb7ddaa 100644
+--- a/src/cpu-template-helper/Cargo.toml
++++ b/src/cpu-template-helper/Cargo.toml
+@@ -24,5 +24,9 @@ thiserror = "2.0.18"
+ vmm = { path = "../vmm" }
+ vmm-sys-util = "0.15.0"
+ 
++# wick: the host facts a fingerprint names, from the registry on Windows.
++[target.'cfg(windows)'.dependencies]
++windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Registry"] }
++
+ [lints]
+ workspace = true
+diff --git a/src/cpu-template-helper/src/fingerprint/dump.rs b/src/cpu-template-helper/src/fingerprint/dump.rs
+index 53e03a6d1b573075a4fd532c03e49e817240d707..3beaa8ae77a9f55ac12a80ba96a9daecbe4e07a2 100644
+--- a/src/cpu-template-helper/src/fingerprint/dump.rs
++++ b/src/cpu-template-helper/src/fingerprint/dump.rs
+@@ -1,6 +1,8 @@
+ // Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++// wick: Linux's files are not read on Windows (read_sysfs_file).
++#[cfg(not(windows))]
+ use std::fs::read_to_string;
+ use std::sync::{Arc, Mutex};
+ 
+@@ -59,13 +61,100 @@ fn get_kernel_version() -> Result<String, FingerprintDumpError> {
+     Ok(version.to_string())
+ }
+ 
++#[cfg(not(windows))]
+ fn read_sysfs_file(path: &str) -> Result<String, FingerprintDumpError> {
+     let s = read_to_string(path)
+         .map_err(|err| FingerprintDumpError::ReadSysfsFile(path.to_string(), err))?;
+     Ok(s.trim_end_matches('\n').to_string())
+ }
+ 
+-#[cfg(target_arch = "x86_64")]
++// wick: Windows has no sysfs; the DMI files the fingerprint reads are the
++// SMBIOS values Windows keeps in the registry (HARDWARE\DESCRIPTION\System\BIOS),
++// in Linux's format. Any other path is not found, as on Linux.
++#[cfg(windows)]
++fn read_sysfs_file(path: &str) -> Result<String, FingerprintDumpError> {
++    const BIOS: &str = r"HARDWARE\DESCRIPTION\System\BIOS";
++    let value = match path {
++        "/sys/devices/virtual/dmi/id/bios_version" => {
++            registry::string(BIOS, "BIOSVersion")
++        }
++        "/sys/devices/virtual/dmi/id/bios_release" => registry::dword(BIOS, "BiosMajorRelease")
++            .and_then(|major| {
++                registry::dword(BIOS, "BiosMinorRelease").map(|minor| format!("{major}.{minor}"))
++            }),
++        _ => Err(std::io::ErrorKind::NotFound.into()),
++    };
++    value.map_err(|err| FingerprintDumpError::ReadSysfsFile(path.to_string(), err))
++}
++
++#[cfg(all(target_arch = "x86_64", windows))]
++fn get_microcode_version() -> Result<String, FingerprintDumpError> {
++    // wick: the revision Windows read from the processor at boot, as Linux's
++    // /proc/cpuinfo shows it: Intel's in the high half of the 8-byte value,
++    // AMD's the whole 4-byte one.
++    let bytes = registry::binary(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0", "Update Revision")
++        .map_err(FingerprintDumpError::ReadProcCpuinfo)?;
++    let revision = match bytes.len() {
++        8 => u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
++        4 => u32::from_le_bytes(bytes[..4].try_into().unwrap()),
++        _ => return Err(FingerprintDumpError::MicrocodeVersionNotFound),
++    };
++    Ok(format!("{revision:#x}"))
++}
++
++// wick: values under HKEY_LOCAL_MACHINE.
++#[cfg(windows)]
++mod registry {
++    use std::io;
++
++    use windows_sys::Win32::System::Registry::{
++        HKEY_LOCAL_MACHINE, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
++    };
++
++    fn wide(s: &str) -> Vec<u16> {
++        s.encode_utf16().chain(std::iter::once(0)).collect()
++    }
++
++    fn get(key: &str, value: &str, kind: u32) -> io::Result<Vec<u8>> {
++        let (key, value) = (wide(key), wide(value));
++        let mut buf = vec![0u8; 512];
++        let mut len = u32::try_from(buf.len()).unwrap();
++        // SAFETY: NUL-terminated names; a buffer of the length passed.
++        let rc = unsafe {
++            RegGetValueW(
++                HKEY_LOCAL_MACHINE,
++                key.as_ptr(),
++                value.as_ptr(),
++                kind,
++                std::ptr::null_mut(),
++                buf.as_mut_ptr().cast(),
++                &mut len,
++            )
++        };
++        if rc != 0 {
++            return Err(io::Error::from_raw_os_error(i32::try_from(rc).unwrap()));
++        }
++        buf.truncate(len as usize);
++        Ok(buf)
++    }
++
++    pub fn string(key: &str, value: &str) -> io::Result<String> {
++        let b = get(key, value, RRF_RT_REG_SZ)?;
++        let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
++        Ok(String::from_utf16_lossy(&units).trim_end_matches('\0').trim().to_string())
++    }
++
++    pub fn dword(key: &str, value: &str) -> io::Result<u32> {
++        let b = get(key, value, RRF_RT_REG_DWORD)?;
++        Ok(u32::from_le_bytes(b[..4].try_into().unwrap()))
++    }
++
++    pub fn binary(key: &str, value: &str) -> io::Result<Vec<u8>> {
++        get(key, value, RRF_RT_REG_BINARY)
++    }
++}
++
++#[cfg(all(target_arch = "x86_64", not(windows)))]
+ fn get_microcode_version() -> Result<String, FingerprintDumpError> {
+     let cpuinfo = read_to_string("/proc/cpuinfo").map_err(FingerprintDumpError::ReadProcCpuinfo)?;
+     for line in cpuinfo.lines() {

@@ -29,3 +29,9 @@
 0027-vmm-the-huge-page-guest-region-test-runs-on-Windows-.patch
 0028-tests-on-macOS-the-session-s-host-side-is-wick-s-plu.patch
 0029-jailer-new-pid-ns-on-macOS-forks-where-Linux-clones.patch
+0030-windows-rebase-snap-and-cpu-template-helper-build-on.patch
+0031-windows-an-API-socket-in-use-is-reported-as-upstream.patch
+0032-windows-a-log-line-s-origin-names-its-source-file-wi.patch
+0033-cpu-template-helper-the-mock-config-s-paths-are-JSON.patch
+0034-windows-cpu-template-helper-s-fingerprint-names-the-.patch
+0035-windows-no-fdtable-resize-which-Windows-has-no-table.patch

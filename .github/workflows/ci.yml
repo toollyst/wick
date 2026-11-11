@@ -405,6 +405,11 @@ jobs:
       - name: Build snapshot-editor
         working-directory: lib/firecracker
         run: cargo build --locked -p snapshot-editor --release
+      # Upstream's other tools, which its integration tests run
+      # (tools/windows/integration-tests.ps1).
+      - name: Build rebase-snap, cpu-template-helper, seccompiler
+        working-directory: lib/firecracker
+        run: cargo build --locked -p rebase-snap -p cpu-template-helper -p seccompiler --release
       # Upstream's jailer with the Windows backend (overlay/jailer/platform):
       # its tests (tokens, job limits) and the binary.
       - name: Jailer tests and build

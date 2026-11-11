@@ -50,6 +50,20 @@ fn test_listener() {
 }
 
 #[test]
+fn test_connect_errors_are_linux_kinds() {
+    // No socket file: ENOENT on Linux, NotFound here.
+    let missing = temp_path("missing.sock");
+    let e = UnixStream::connect(&missing).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+    // A socket file nothing listens on any more: ECONNREFUSED on both.
+    let path = temp_path("closed.sock");
+    drop(UnixListener::bind(&path).unwrap());
+    let e = UnixStream::connect(&path).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused, "{e}");
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
 fn test_nonblocking() {
     let (a, _b) = UnixStream::pair().unwrap();
     a.set_nonblocking(true).unwrap();

@@ -147,6 +147,28 @@ def memory_maps(self, grouped=True):
     return _Maps(handle, out)
 
 
+def resident_kib(pid):
+    """What upstream's `utils.get_resident_memory` reads on Linux: the
+    process's resident memory (VmRSS) plus its hugetlbfs pages
+    (HugetlbPages, which Linux counts apart), in KiB. Here every page of the
+    process in its working set, large pages included (QueryWorkingSetEx
+    reports each 4 KiB of one as valid), the system's files too, as VmRSS
+    counts every mapping."""
+    total = 0
+    maps = memory_maps(psutil.Process(pid), grouped=False)
+    for m in maps:
+        system, m.path = m.path, ""  # count the system's files too
+        total += m.rss
+        m.path = system
+    return total // 1024
+
+
 def install():
-    """Makes psutil.Process.memory_maps this one."""
+    """Makes psutil.Process.memory_maps this one, and upstream's resident
+    memory reading (framework.utils.get_resident_memory) read it."""
     psutil.Process.memory_maps = memory_maps
+    try:
+        import framework.utils as utils  # pylint: disable=import-outside-toplevel
+    except ImportError:  # outside upstream's tests (selftest.py)
+        return
+    utils.get_resident_memory = lambda process: resident_kib(process.pid)
