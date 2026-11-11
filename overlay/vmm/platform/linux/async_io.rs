@@ -15,6 +15,11 @@ use crate::platform::async_io::{AsyncIo, Cqe, IoUringError, Operation, Restricti
 /// The Linux queue is the io_uring instance itself.
 pub type Queue<T> = IoUring<T>;
 
+/// An io_uring needs no thread of the process: nothing to start.
+pub fn seal_workers() -> std::io::Result<()> {
+    Ok(())
+}
+
 impl<T: Debug> AsyncIo<T> for IoUring<T> {
     fn new(
         num_entries: u32,

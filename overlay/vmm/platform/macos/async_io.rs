@@ -9,10 +9,18 @@
 //! uses the same queue; see `platform::windows`):
 //! - `push` places the operation on the submission queue (a `Vec`), and the
 //!   user data in a slab, exactly like [`crate::io_uring::IoUring`];
-//! - `submit` moves the queued operations to a shared job list served by
-//!   worker threads;
+//! - `submit` moves the queued operations to the job list of the process's
+//!   worker threads, which every queue shares;
 //! - a worker runs one `pread`, `pwrite` or `F_FULLFSYNC`, appends the result
-//!   to the completion list and writes the completion [`EventFd`].
+//!   to its queue's completion list and writes the completion [`EventFd`].
+//!
+//! The workers are the process's, not a queue's: a queue made after the
+//! sandbox has narrowed (the block device's new ring when a drive's file is
+//! replaced, a drive added to a running microVM) needs no new thread, as an
+//! io_uring needs none on Linux, where the narrowed filter allows
+//! `io_uring_setup` but no `clone`. Until [`seal_workers`] the pool grows to
+//! `WORKERS` threads for each live queue; from then on it keeps the threads
+//! it has (at least one), and later queues share them.
 //!
 //! `F_FULLFSYNC` is used for fsync because on macOS plain `fsync` does not
 //! flush the drive's cache, which Linux's `fsync` does. On Windows `fsync`
@@ -27,7 +35,6 @@ use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::JoinHandle;
 
 use vmm_sys_util::eventfd::EventFd;
 
@@ -36,10 +43,56 @@ use crate::platform::async_io::{
     AsyncIo, Cqe, IoUringError, MAX_ENTRIES, MAX_FILES, OpCode, Operation, Restriction,
 };
 
-/// Worker threads per queue. The block device keeps at most
-/// `IO_URING_NUM_ENTRIES` operations in flight; four threads keep a fast SSD
-/// busy without one thread per operation.
+/// Worker threads per live queue, until [`seal_workers`]. The block device
+/// keeps at most `IO_URING_NUM_ENTRIES` operations in flight; four threads
+/// keep a fast SSD busy without one thread per operation.
 const WORKERS: u32 = 4;
+
+/// The process's worker threads and the jobs they serve, from every queue.
+#[derive(Debug, Default)]
+struct Pool {
+    jobs: VecDeque<(Arc<Shared>, Job)>,
+    threads: u32,
+    /// Queues that exist.
+    live: u32,
+    /// No thread is made any more ([`seal_workers`]).
+    sealed: bool,
+}
+
+static POOL: Mutex<Pool> = Mutex::new(Pool {
+    jobs: VecDeque::new(),
+    threads: 0,
+    live: 0,
+    sealed: false,
+});
+/// Signalled when jobs arrive.
+static WORK: Condvar = Condvar::new();
+
+fn pool() -> MutexGuard<'static, Pool> {
+    // A worker never panics while holding the lock, so it is never poisoned.
+    POOL.lock().unwrap()
+}
+
+/// Makes worker threads until the pool has `want`, unless it is sealed.
+fn grow(pool: &mut Pool, want: u32) -> io::Result<()> {
+    while !pool.sealed && pool.threads < want {
+        std::thread::Builder::new()
+            .name("wick_async_io".into())
+            .spawn(worker)?;
+        pool.threads += 1;
+    }
+    Ok(())
+}
+
+/// Starts the worker threads that queues made from now on share, at least
+/// one, and makes no more: called before the sandbox stops the process from
+/// creating threads (`ext::sandbox::narrow`).
+pub fn seal_workers() -> io::Result<()> {
+    let mut pool = pool();
+    grow(&mut pool, 1)?;
+    pool.sealed = true;
+    Ok(())
+}
 
 /// An operation on its way to a worker.
 #[derive(Debug)]
@@ -55,18 +108,15 @@ struct Job {
 
 #[derive(Debug, Default)]
 struct State {
-    jobs: VecDeque<Job>,
     completions: VecDeque<(i32, usize)>,
     /// Submitted operations whose completion is not on `completions` yet.
     running: u32,
-    shutdown: bool,
 }
 
+/// A queue's side the workers see.
 #[derive(Debug)]
 struct Shared {
     state: Mutex<State>,
-    /// Signalled when jobs arrive or on shutdown.
-    work: Condvar,
     /// Signalled when an operation completes.
     done: Condvar,
     files: Vec<File>,
@@ -96,7 +146,6 @@ impl Shared {
 /// The macOS queue.
 pub struct Queue<T> {
     shared: Arc<Shared>,
-    workers: Vec<JoinHandle<()>>,
     submission: Vec<Job>,
     sq_entries: u32,
     cq_entries: u32,
@@ -171,18 +220,15 @@ fn execute(files: &[File], job: &Job) -> i32 {
     }
 }
 
-fn worker(shared: Arc<Shared>) {
+fn worker() {
     loop {
-        let job = {
-            let mut state = shared.lock();
+        let (shared, job) = {
+            let mut pool = pool();
             loop {
-                if state.shutdown {
-                    return;
+                if let Some(next) = pool.jobs.pop_front() {
+                    break next;
                 }
-                if let Some(job) = state.jobs.pop_front() {
-                    break job;
-                }
-                state = shared.work.wait(state).unwrap();
+                pool = WORK.wait(pool).unwrap();
             }
         };
         let res = execute(&shared.files, &job);
@@ -234,32 +280,27 @@ impl<T: Debug> AsyncIo<T> for Queue<T> {
                 .collect()
         });
 
+        {
+            let mut pool = pool();
+            let want = WORKERS.saturating_mul(pool.live + 1);
+            grow(&mut pool, want).map_err(IoUringError::Setup)?;
+            pool.live += 1;
+        }
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
-            work: Condvar::new(),
             done: Condvar::new(),
             files,
             eventfd,
         });
-        let mut queue = Queue {
+        Ok(Queue {
             shared,
-            workers: Vec::new(),
             submission: Vec::with_capacity(sq_entries as usize),
             sq_entries,
             cq_entries,
             num_ops: 0,
             slab: slab::Slab::with_capacity((sq_entries + cq_entries) as usize),
             allowed,
-        };
-        for _ in 0..WORKERS.min(sq_entries) {
-            let shared = queue.shared.clone();
-            let handle = std::thread::Builder::new()
-                .name("wick_async_io".into())
-                .spawn(move || worker(shared))
-                .map_err(IoUringError::Setup)?;
-            queue.workers.push(handle);
-        }
-        Ok(queue)
+        })
     }
 
     fn push(&mut self, op: Operation<T>) -> Result<(), (IoUringError, T)> {
@@ -314,21 +355,28 @@ impl<T: Debug> AsyncIo<T> for Queue<T> {
             return Ok(0);
         }
         let mut denied = None;
+        let mut jobs = Vec::with_capacity(end);
+        for job in self.submission.drain(..end) {
+            if job.denied {
+                denied = Some(job.key);
+            } else {
+                jobs.push(job);
+            }
+        }
         {
             let mut state = self.shared.lock();
-            for job in self.submission.drain(..end) {
-                if job.denied {
-                    denied = Some(job.key);
-                } else {
-                    state.running += 1;
-                    state.jobs.push_back(job);
-                }
-            }
+            state.running += u32::try_from(jobs.len()).unwrap();
             if let Some(key) = denied {
                 state.completions.push_back((-libc::EACCES, key));
             }
         }
-        self.shared.work.notify_all();
+        if !jobs.is_empty() {
+            let mut pool = pool();
+            pool.jobs
+                .extend(jobs.into_iter().map(|job| (self.shared.clone(), job)));
+            drop(pool);
+            WORK.notify_all();
+        }
         if denied.is_some() {
             self.shared.notify_completion();
         }
@@ -360,15 +408,20 @@ impl<T: Debug> AsyncIo<T> for Queue<T> {
 
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
-        {
-            let mut state = self.shared.lock();
-            state.shutdown = true;
-            state.jobs.clear();
-        }
-        self.shared.work.notify_all();
-        for handle in self.workers.drain(..) {
-            // A worker only returns; a panic in it has already been reported.
-            let _ = handle.join();
+        // Operations that have not started are discarded; running ones are
+        // waited for, so no worker touches their buffers afterwards.
+        let discarded = {
+            let mut pool = pool();
+            let before = pool.jobs.len();
+            pool.jobs.retain(|(shared, _)| !Arc::ptr_eq(shared, &self.shared));
+            let discarded = before - pool.jobs.len();
+            pool.live -= 1;
+            discarded
+        };
+        let mut state = self.shared.lock();
+        state.running -= u32::try_from(discarded).unwrap();
+        while state.running > 0 {
+            state = self.shared.done.wait(state).unwrap();
         }
     }
 }
@@ -393,6 +446,29 @@ mod tests {
         drop(q);
         // Every worker has exited, so the buffer is no longer in use.
         buf[0] = 1;
+    }
+
+    #[test]
+    fn test_queue_after_seal_makes_no_thread() {
+        // The narrowed sandbox kills a process that creates a thread: a queue
+        // made after seal_workers (a drive's new file, a hotplugged drive)
+        // works on the threads already there.
+        seal_workers().unwrap();
+        let threads = pool().threads;
+        assert!(threads >= 1);
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(4096).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let mut q: Queue<u32> = AsyncIo::new(4, vec![&file], vec![], None).unwrap();
+        let q2: Queue<u32> = AsyncIo::new(4, vec![&file], vec![], None).unwrap();
+        q.push(Operation::read(0, buf.as_mut_ptr() as usize, 4096, 0, 7))
+            .unwrap();
+        assert_eq!(q.submit_and_wait_all().unwrap(), 1);
+        let cqe = q.pop().unwrap().unwrap();
+        assert_eq!(cqe.result().unwrap(), 4096);
+        assert_eq!(cqe.user_data(), 7);
+        drop(q2);
+        assert_eq!(pool().threads, threads);
     }
 
     #[test]

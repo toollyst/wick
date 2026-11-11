@@ -74,6 +74,14 @@ pub trait AsyncIo<T>: Sized + Debug {
 /// This host's [`AsyncIo`] backend.
 pub type Queue<T> = super::backend::async_io::Queue<T>;
 
+/// Readies the host for queues made once the process may no longer create
+/// threads (`ext::sandbox::narrow`): on Linux nothing, an io_uring needs no
+/// thread; on macOS the worker threads every later queue shares are started
+/// here, and no more are made.
+pub fn seal_workers() -> std::io::Result<()> {
+    super::backend::async_io::seal_workers()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::cast_possible_truncation)]

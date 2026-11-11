@@ -1084,6 +1084,10 @@ mod macos {
             return Ok(());
         }
         let fail = |what: &str, err: std::io::Error| SandboxError::Narrow(format!("{what}: {err}"));
+        // The narrowed profile allows no new thread (SETUP_SYSCALLS'
+        // bsdthread_create): the Async block engine's workers start now.
+        crate::platform::async_io::seal_workers()
+            .map_err(|err| fail("starting the async I/O workers", err))?;
         let token = state.narrowed.take().expect("the narrowed token is kept until narrow()");
         token.consume().map_err(|err| fail("taking the narrowed extension", err))?;
         drop(token);
