@@ -213,7 +213,8 @@ impl NetFilter {
         Ok(())
     }
 
-    /// Whether [`NetFilter::block`] was done.
+    /// Whether [`NetFilter::block`] was done (for the tests).
+    #[cfg(test)]
     pub fn is_blocking(&self) -> bool {
         self.blocking
     }
