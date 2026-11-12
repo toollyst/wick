@@ -206,8 +206,9 @@ vhost-user, the devices, the command line and more)
 powershell -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1
 ```
 
-It uses `firecracker.exe` next to the script, or the one under `lib\firecracker\build\cargo_target`. CI uploads a
-natively built `firecracker.exe` with the script as a workflow artifact on every run. Network interfaces on Windows
+It uses `firecracker.exe` next to the script, or the one under `lib\firecracker\build\cargo_target`. CI uploads the
+Windows kit (natively built binaries, this script, the jailer test and its probe; listed in
+[`tools/windows/README.md`](../tools/windows/README.md)) as a workflow artifact on every run. Network interfaces on Windows
 are Unix stream endpoints that a host switch such as gvisor-tap-vsock or passt connects to.
 
 The Windows build has booted guests on one Windows 11 PC so far ([PORTING.md](PORTING.md) lists the stages that

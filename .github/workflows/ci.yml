@@ -528,7 +528,15 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && cl /nologo /W3 /O2 /D_CRT_SECURE_NO_WARNINGS tools\windows\winprobe.c advapi32.lib ws2_32.lib userenv.lib /Fe:winprobe.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      # For validation on Windows hardware with WHP (tools/windows/boot-test.ps1).
+      # The jailer test's probe and the memory-partition probe, so the kit
+      # runs on a PC without Rust (tools/windows/jailer-test.ps1 uses the
+      # built jail-probe.exe next to it).
+      - name: Build the probes
+        run: |
+          rustc --edition 2021 -O -o tools/windows/jail-probe.exe tools/windows/jail-probe.rs
+          rustc --edition 2021 -O -o tools/windows/memory-partition-probe.exe tools/windows/memory-partition-probe.rs
+      # For validation on Windows hardware with WHP (tools/windows/boot-test.ps1,
+      # jailer-test.ps1): everything the stages need, at the paths they look in.
       - name: Upload Windows binaries
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -537,10 +545,16 @@ jobs:
             lib/firecracker/build/cargo_target/release/firecracker.exe
             lib/firecracker/build/cargo_target/release/snapshot-editor.exe
             lib/firecracker/build/cargo_target/release/jailer.exe
+            lib/firecracker/build/cargo_target/release/rebase-snap.exe
             lib/firecracker/build/cargo_target/release/examples/uffd_on_demand_handler.exe
+            lib/firecracker/build/cargo_target/debug/firecracker.exe
             lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe
             winprobe.exe
             tools/windows/boot-test.ps1
+            tools/windows/jailer-test.ps1
+            tools/windows/jail-probe.exe
+            tools/windows/job-freeze-probe.ps1
+            tools/windows/memory-partition-probe.exe
             tools/windows/README.md
           if-no-files-found: error
           retention-days: 14

@@ -19,7 +19,8 @@
 # vhost-user-blk.exe next to them or in the build's vhost-user-blk\release.
 # Needs the boot test's guest files in -Assets (vmlinux-6.1.188 and
 # ubuntu-24.04.squashfs; tools/windows/boot-test.ps1 downloads them) and
-# rustc to build the probe (or -Probe with a built jail-probe.exe).
+# the probe: -Probe, else jail-probe.exe next to this script (CI's kit has
+# it), else rustc to build it from jail-probe.rs.
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
@@ -55,6 +56,9 @@ function New-Base([string]$name) {
     New-Item -ItemType Directory -Force -Path $b | Out-Null
     $b
 }
+
+# What the jailer says when no --resource-limit no-file= is given.
+$NoFileWarning = "jailer: warning: Windows cannot limit the number of handles a process opens: upstream's default --resource-limit no-file=2048 is not enforced, and nothing bounds the jailed Firecracker's handles"
 
 # Runs the jailer to completion; returns @(exit code, output).
 function Invoke-Jailer([string[]]$argv, [int]$ms = 20000) {
@@ -286,11 +290,18 @@ function Stage-Daemonize {
     try {
         # The call operator blocks until the launcher returns; with --daemonize
         # it returns at once, leaving a detached jailer and Firecracker behind.
+        # Its stderr is read as text: under 'Stop' a native command's stderr
+        # line is an error, and the launcher prints upstream's no-file
+        # warning (Stage-Nofile), which is all it may print.
         $sw = [Diagnostics.Stopwatch]::StartNew()
-        & $Jailer --id d --exec-file $Fc --uid 0 --gid 0 --chroot-base-dir $base --daemonize 2>&1 | Out-Null
+        $ErrorActionPreference = 'Continue'
+        $said = @(& $Jailer --id d --exec-file $Fc --uid 0 --gid 0 --chroot-base-dir $base --daemonize 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
         $code = $LASTEXITCODE
+        $ErrorActionPreference = 'Stop'
         $sw.Stop()
-        Check ($code -eq 0) "the jailer did not return 0 with --daemonize (exit $code)"
+        Check ($code -eq 0) "the jailer did not return 0 with --daemonize (exit $code): $($said -join ' | ')"
+        $other = @($said | Where-Object { $_ -ne $NoFileWarning })
+        Check ($other.Count -eq 0) "the launcher printed more than the no-file warning: $($other -join ' | ')"
         Check ($sw.Elapsed.TotalSeconds -lt 10) "the jailer did not return promptly: $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
         # The detached Firecracker keeps running after the launcher returned.
         $sock = Join-Path $root 'run\firecracker.socket'
@@ -332,6 +343,12 @@ function Get-Mitigations([int]$id) {
 
 function Get-Probe {
     if ($script:Probe) { return $script:Probe }
+    # CI's kit has it built next to this script.
+    $kit = Join-Path $Here 'jail-probe.exe'
+    if (Test-Path $kit) {
+        $script:Probe = $kit
+        return $kit
+    }
     $p = Join-Path $WorkDir 'jail-probe.exe'
     $rustc = Get-Command rustc -ErrorAction SilentlyContinue
     Check ($null -ne $rustc) 'needs rustc (or -Probe) to build tools\windows\jail-probe.rs'
@@ -715,7 +732,7 @@ function Stage-Links {
 function Stage-Nofile {
     $probe = Get-Probe
     $base = New-Base 'nofile'
-    $warning = "jailer: warning: Windows cannot limit the number of handles a process opens: upstream's default --resource-limit no-file=2048 is not enforced, and nothing bounds the jailed Firecracker's handles"
+    $warning = $NoFileWarning
     $common = @('--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base)
     $r = Invoke-Jailer (@('--id', 'default') + $common + @('--', 'files:5000')) 60000
     Check ($r[0] -eq 0 -and $r[1].Contains($warning)) "without no-file=, the jailer's warning: exit $($r[0]): $($r[1])"

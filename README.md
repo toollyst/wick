@@ -108,9 +108,10 @@ cd lib/firecracker
 AWS_LC_SYS_NO_ASM=1 cargo build -p firecracker --target x86_64-pc-windows-gnu
 ```
 
-Every CI run on `main` uploads a natively built `firecracker.exe` as a workflow artifact, together with
-[`tools/windows/boot-test.ps1`](tools/windows/boot-test.ps1), which boots upstream's x86_64 CI guest on a PC with
-the *Windows Hypervisor Platform* feature turned on. If you have one, a run of it is the most useful contribution
+Every CI run on `main` uploads the Windows kit as a workflow artifact: natively built `firecracker.exe`, the
+jailer and the snapshot tools, with [`tools/windows/boot-test.ps1`](tools/windows/boot-test.ps1), which boots
+upstream's x86_64 CI guest on a PC with the *Windows Hypervisor Platform* feature turned on, and the jailer test
+with its probe ([`tools/windows/README.md`](tools/windows/README.md) lists the files; the kit needs no Rust). If you have one, a run of it is the most useful contribution
 right now.
 
 Then follow [docs/getting-started.md](docs/getting-started.md) to boot your first microVM: a guest kernel and rootfs

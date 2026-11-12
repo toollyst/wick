@@ -37,7 +37,8 @@
   stage does), `uffd` and `vhost-user` (a jailed guest's memory handed to a
   handler or a backend of the operator); and a check that every jail's drive
   letter was removed. It needs the boot test's guest files (`-Assets`,
-  default `C:\wbt`) and `rustc` for the probe:
+  default `C:\wbt`) and the probe (`jail-probe.exe` from the kit, or
+  `rustc` to build it):
 
   ```
   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir C:\wjt
@@ -45,10 +46,15 @@
 
 CI builds the binaries on every push and uploads them as the artifact
 `wick-windows-x86_64-<commit>`: `lib/firecracker/build/cargo_target/release/firecracker.exe`,
-`snapshot-editor.exe`, `jailer.exe` and `examples/uffd_on_demand_handler.exe` next to it,
+`snapshot-editor.exe`, `jailer.exe`, `rebase-snap.exe` and
+`examples/uffd_on_demand_handler.exe` next to it,
+`lib/firecracker/build/cargo_target/debug/firecracker.exe` (built with the gdb
+feature, for the `gdb` stage),
 `lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe` (the
-vhost-user test backend), `winprobe.exe`, `tools/windows/boot-test.ps1` and
-this file, at those paths.
+vhost-user test backend), `winprobe.exe`, and in `tools/windows/`
+`boot-test.ps1`, `jailer-test.ps1` with `jail-probe.exe` built,
+`job-freeze-probe.ps1`, `memory-partition-probe.exe` and this file, at those
+paths. The kit needs no Rust.
 
 ## Running it on a Windows PC
 

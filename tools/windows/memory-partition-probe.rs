@@ -8,7 +8,9 @@
 //!
 //! Needs an elevated prompt and an account holding "Lock pages in memory"
 //! (SeLockMemoryPrivilege; the hugepages stage needs it too). It says so and
-//! stops if the privilege is missing. No dependencies:
+//! stops if the privilege is missing. CI's kit has it built
+//! (`tools\windows\memory-partition-probe.exe`); otherwise, with no
+//! dependencies:
 //!
 //! ```text
 //! rustc -O memory-partition-probe.rs
