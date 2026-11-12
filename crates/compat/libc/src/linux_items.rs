@@ -48,8 +48,12 @@ pub const MAP_HUGE_2MB: c_int = 21 << MAP_HUGE_SHIFT;
 pub const MAP_HUGE_1GB: c_int = 30 << MAP_HUGE_SHIFT;
 /// Prefault the mapping. A bit macOS `mmap` does not use: [`mmap`] handles it.
 pub const MAP_POPULATE: c_int = 0x0200_0000;
-/// Transparent huge page advice. macOS has no such advice: `madvise` fails with `EINVAL`.
+/// Transparent huge page advice (Linux value): [`madvise`] takes it as Linux
+/// takes it on a host whose transparent huge pages are `never`.
 pub const MADV_HUGEPAGE: c_int = 14;
+/// No transparent huge pages for the range (Linux value): as
+/// [`MADV_HUGEPAGE`].
+pub const MADV_NOHUGEPAGE: c_int = 15;
 
 const HUGE_FLAGS: c_int = MAP_HUGETLB | (0x3f << MAP_HUGE_SHIFT);
 /// The huge page size: 2 MiB, Linux's default on x86_64 and on aarch64 with
@@ -487,8 +491,19 @@ fn file_under(addr: u64) -> bool {
 /// and unmapped pages in the range then give `ENOMEM`. In a huge page
 /// mapping ([`mmap_huge`]) the start must be huge page aligned (`EINVAL`,
 /// with the parts before it discarded) and the end is rounded down to a huge
-/// page. Other advice is passed through. Advice
-/// [`wick_mm::allow_only_advice`] denies raises `SIGSYS`.
+/// page.
+///
+/// `MADV_HUGEPAGE` and `MADV_NOHUGEPAGE` (Firecracker's `huge_pages:
+/// Transparent`) are advice on Linux too: with transparent huge pages set to
+/// `never` the call succeeds and the range stays on small pages. macOS gives
+/// user space no superpage (`test_no_host_superpages`), so that is what this
+/// host is: the range is checked as Linux checks it (`EINVAL` for a start off
+/// a page or a wrapping length, `ENOMEM` for unmapped pages) and the call
+/// succeeds; the memory stays on host pages (docs/PORTING.md row 10).
+/// macOS has no advice of these numbers, so they must not be passed on.
+///
+/// Other advice is passed through. Advice [`wick_mm::allow_only_advice`]
+/// denies raises `SIGSYS`.
 ///
 /// # Safety
 /// Same contract as `madvise(2)`.
@@ -496,7 +511,8 @@ pub unsafe fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
     if wick_mm::advice_denied(advice) {
         return -1;
     }
-    if advice != libc::MADV_DONTNEED {
+    let thp = advice == MADV_HUGEPAGE || advice == MADV_NOHUGEPAGE;
+    if advice != libc::MADV_DONTNEED && !thp {
         // SAFETY: forwarded unchanged.
         return unsafe { libc::madvise(addr, len, advice) };
     }
@@ -511,10 +527,30 @@ pub unsafe fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
     if len == 0 {
         return 0;
     }
+    if thp {
+        return thp_advice(addr as u64, addr as u64 + len as u64);
+    }
     // Pages registered with a userfaultfd become missing (and a remove event
     // is queued), as on Linux.
     // SAFETY: the caller's contract.
     crate::wick_uffd::discarding(addr as u64, len as u64, |done| unsafe { dontneed(addr, len, done) })
+}
+
+/// `MADV_HUGEPAGE` or `MADV_NOHUGEPAGE` over the page aligned `[start, end)`:
+/// nothing to change on this host (see [`madvise`]); unmapped pages in the
+/// range give `ENOMEM`, as Linux's madvise_walk_vmas does.
+fn thp_advice(start: u64, end: u64) -> c_int {
+    let mut pos = start;
+    while pos < end {
+        match vm_entry(pos) {
+            Some((entry_start, entry_end, _, _)) if entry_start <= pos => pos = entry_end,
+            _ => {
+                set_errno(libc::ENOMEM);
+                return -1;
+            }
+        }
+    }
+    0
 }
 
 /// The `MADV_DONTNEED` of [`madvise`] over a page aligned range; the pieces
@@ -1716,6 +1752,35 @@ mod tests {
             assert_ne!(p, libc::MAP_FAILED);
             libc::munmap(p, 1 << 20);
         }
+    }
+
+    #[test]
+    fn test_transparent_huge_page_advice() {
+        // As on a Linux host whose transparent huge pages are `never`: the
+        // advice is taken and the memory stays on small pages; the range is
+        // checked as Linux checks it.
+        const LEN: usize = 1 << 20;
+        // SAFETY: a fresh mapping, unmapped below.
+        let p = unsafe {
+            libc::mmap(core::ptr::null_mut(), LEN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let errno = || std::io::Error::last_os_error().raw_os_error();
+        for advice in [MADV_HUGEPAGE, MADV_NOHUGEPAGE] {
+            // SAFETY: our mapping.
+            assert_eq!(unsafe { madvise(p, LEN, advice) }, 0, "{advice}: {:?}", errno());
+            // SAFETY: a start off a page: refused before anything.
+            assert_eq!(unsafe { madvise(p.cast::<u8>().wrapping_add(1).cast(), 1, advice) }, -1);
+            assert_eq!(errno(), Some(libc::EINVAL));
+            // SAFETY: nothing is mapped there.
+            assert_eq!(unsafe { madvise(0xffff_0000_0000_0000_usize as *mut c_void, LEN, advice) }, -1);
+            assert_eq!(errno(), Some(libc::ENOMEM));
+        }
+        // The memory is still ordinary, writable memory.
+        // SAFETY: inside the mapping.
+        unsafe { p.cast::<u8>().write_volatile(7) };
+        // SAFETY: unmapping our own mapping.
+        unsafe { libc::munmap(p, LEN) };
     }
 
     #[test]
