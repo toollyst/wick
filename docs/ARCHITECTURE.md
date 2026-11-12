@@ -261,7 +261,11 @@ semantics on Win32. The details are in the comments of each
   and fails otherwise (it never leaves zeros where Linux leaves a hole).
 - **`net`**: a Unix stream endpoint that a host switch connects to. Ethernet
   frames are prefixed with a 32-bit big-endian length, QEMU's
-  `-netdev stream` framing (compatible with gvisor-tap-vsock and passt); one
+  `-netdev stream` framing, which passt and gvisor-tap-vsock (`-listen-qemu`)
+  use too. Those tools listen and wait for QEMU to connect, as the endpoint
+  listens, so neither connects to it without an adapter (a process that
+  connects to both); what has run against it is the test scripts' own switch
+  (`boot-test.ps1 net`, `jailer-test.ps1 netguest`). One
   switch at a time: one that connects while another is there waits its turn,
   and what it sent reaches the guest once the other leaves. `platform::vnet`
   handles the virtio-net header.

@@ -34,8 +34,10 @@
 //!   sends. The virtio-net header is handled by [`super::vnet`].
 //! - Windows: a Unix stream endpoint that a host-side switch connects to,
 //!   carrying plain Ethernet frames each preceded by its 32-bit big-endian
-//!   length (QEMU's `-netdev stream` framing, which gvisor-tap-vsock and
-//!   passt speak); one switch at a time, a later one waiting its turn. A
+//!   length (QEMU's `-netdev stream` framing, which passt and
+//!   gvisor-tap-vsock's `-listen-qemu` use too; they listen, as the endpoint
+//!   does, so they need an adapter to reach it); one switch at a time, a
+//!   later one waiting its turn. A
 //!   name without `/` or `\` lives in
 //!   `%TEMP%\firecracker-net\` (in a jail given a network with `--netns`,
 //!   that network's directory), a name with one is the path itself. The

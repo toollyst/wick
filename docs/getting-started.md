@@ -214,7 +214,10 @@ powershell -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1
 It uses `firecracker.exe` next to the script, or the one under `lib\firecracker\build\cargo_target`. CI uploads the
 Windows kit (natively built binaries, this script, the jailer test and its probe; listed in
 [`tools/windows/README.md`](../tools/windows/README.md)) as a workflow artifact on every run. Network interfaces on Windows
-are Unix stream endpoints that a host switch such as gvisor-tap-vsock or passt connects to.
+are Unix stream endpoints that listen for a host switch to connect, each frame preceded by its 32-bit big-endian length
+(QEMU's `-netdev stream` framing). passt and gvisor-tap-vsock (`-listen-qemu`) use that framing but listen
+themselves, waiting for QEMU to connect, so they need an adapter that connects to both; the switch that has run
+against the endpoint is the boot test's own.
 
 The Windows build has booted guests on one Windows 11 PC so far ([PORTING.md](PORTING.md) lists the stages that
 have run there), so the results of a run on other hardware are genuinely useful: please [open an issue](https://github.com/toollyst/wick/issues/new/choose)

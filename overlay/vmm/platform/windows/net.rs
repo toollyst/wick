@@ -5,7 +5,11 @@
 //! [`crate::platform::net`] for the names) that a host-side switch connects
 //! to. Frames go both ways as plain Ethernet frames, each preceded by its
 //! length as a 32-bit big-endian number: the framing of QEMU's
-//! `-netdev stream`, which gvisor-tap-vsock and passt also speak. The
+//! `-netdev stream`, which passt and gvisor-tap-vsock (`-listen-qemu`) use
+//! too. Those tools listen and wait for QEMU to connect, as this endpoint
+//! listens, so neither connects to it without an adapter (a process that
+//! connects to both); what has run against it is the test scripts' own
+//! switch (`boot-test.ps1 net`, `jailer-test.ps1 netguest`). The
 //! virtio-net header is handled by [`vnet`].
 //!
 //! - One switch is connected at a time. One that connects while another is
@@ -46,7 +50,7 @@ const IFACE_NAME_MAX_LEN: usize = 16;
 /// Most interfaces a `%d` name is tried with.
 const MAX_UNITS: u32 = 1 << 15;
 /// The largest frame a switch may send: a 64 KiB packet and its Ethernet
-/// header (gvisor-tap-vsock and passt send at most the MTU).
+/// header.
 const MAX_FRAME: usize = 65536 + 14 + 4 + 4;
 /// How long the rest of a frame the connection took part of may wait.
 pub const SEND_STALL: Duration = Duration::from_secs(1);
