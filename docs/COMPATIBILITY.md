@@ -193,7 +193,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 
 | Feature | macOS | Windows |
 | --- | --- | --- |
-| `vcpu_count` | 🟢 `boot-test smp`, `test_all_vcpus_online` | 🟡 `boot-test.ps1 smp`. With 16 vCPUs the VMM's own memory is over the tests' 5 MiB budget (`test_all_vcpus_online` [bug]) |
+| `vcpu_count` | 🟢 `boot-test smp` (2 vCPUs, work on each; cpu1 offline and online 3 times, and after a restore in `boot-test snapshot`), `test_all_vcpus_online` | 🟡 `boot-test.ps1 smp`. With 16 vCPUs the VMM's own memory is over the tests' 5 MiB budget (`test_all_vcpus_online` [bug]) |
 | `smt` | ⚪ aarch64 has no SMT, and upstream refuses it there | ❔ every test with SMT on is listed for the VMM memory budget (`test_cache_topology` [bug]) |
 | Static CPU templates (x86: C3, T2, T2S, T2CL, T2A) | ⚪ x86 only | ❔ the template tests are skipped on Linux CI (`test_cpu_template`) |
 | Static CPU template V1N1 (aarch64) | ❔ no test, and no Linux aarch64 result | ⚪ aarch64 only |
@@ -202,7 +202,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | Guest CPUID (x86) | ⚪ | 🟡 KVM's supported set, less what WHP lacks: MWAIT and nested virtualisation (roadmap M3). `test_brand_string`, `test_extended_cache_features`, `test_host_vs_guest_cpu_features`, `test_waitpkg_inaccessibility`; `test_cpuid` [bug: VMM memory] |
 | kvm-clock and `KVMCLOCK_CTRL` (x86) | ⚪ x86 only (`test_kvmclock_ctrl` [arch]) | 🟢 `test_kvmclock_ctrl`, `boot-test.ps1 boot` |
 | TSC-deadline timer (x86) | ⚪ | 🟡 emulated as KVM does; fires about 0.75 ms after the deadline, where KVM's fires within microseconds (row 9, `test_timers_are_high_resolution`) |
-| PSCI 1.0, SMCCC 1.1 (aarch64) | 🟡 as KVM, but `SMCCC_ARCH_FEATURES` answers NOT_SUPPORTED for `WORKAROUND_1`, `_2` and `_3` (`test_psci_version_is_the_vms`) | ⚪ |
+| PSCI 1.0, SMCCC 1.1 (aarch64) | 🟡 as KVM, but `SMCCC_ARCH_FEATURES` answers NOT_SUPPORTED for `WORKAROUND_1`, `_2` and `_3` (`test_psci_version_is_the_vms`). `CPU_ON` resets the vCPU as KVM's `kvm_reset_vcpu` does (`boot-test smp`, `test_a_new_vcpu_has_kvms_reset_values`) | ⚪ |
 | KVM PTP clock | 🟡 `test_kvm_ptp`; no physical counter: Hypervisor.framework does not let the guest read it (`test_kvm_ptp_counters`) | 🟢 `test_kvm_ptp` |
 | PV time, steal time (aarch64) | 🔴 not done yet: the backend offers no PV time device, so the guest reports no PV steal time and upstream's `test_guest_has_pvtime_enabled` fails (run on macOS 27.2; no Linux aarch64 run exists to compare) | ⚪ |
 | Cache topology in the guest | 🟡 the guest has no cache entries: Firecracker reads them from sysfs, which macOS lacks (`test_cache_topology` [bug]) | ❔ listed for the VMM memory budget only (`test_cache_topology` [bug]) |
@@ -225,7 +225,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 
 | Feature | macOS | Windows |
 | --- | --- | --- |
-| Full snapshot, restore in another process | 🟢 `boot-test snapshot`, `boot-test restores` (20 rounds) | 🟢 `boot-test.ps1 snapshot`, `boot-test.ps1 restores` |
+| Full snapshot, restore in another process | 🟢 `boot-test snapshot` (with cpu1 offline and online after the restore), `boot-test restores` (20 rounds) | 🟢 `boot-test.ps1 snapshot`, `boot-test.ps1 restores` |
 | Diff snapshot, `snapshot-editor edit-memory rebase` | 🟢 `boot-test diff`, `test_diff_snapshot_overlay`, `test_cmp_full_and_first_diff_mem` | 🟡 dirty memory is written in 64 KiB units, NTFS's sparse granularity (`boot-test.ps1 diff`, `test_diff_snapshot_overlay`) |
 | `mem_backend: Uffd` | 🟡 the kernel side of userfaultfd is rebuilt in user space (`boot-test uffd`, `jailer-test uffd`, `test_valid_handler`, `test_malicious_handler`). A handler path that is not a socket fails with `ENOTSOCK` (`test_unbinded_socket` [impossible]) | 🟡 the same, on Windows (`boot-test.ps1 uffd`, `jailer-test.ps1 uffd`, `test_valid_handler`); errors in Windows' text (`test_bad_socket_path`, `test_unbinded_socket` [error-text]) |
 | Snapshot with PCI devices | 🟢 `boot-test pci`, `test_bar_relocation_snapshot` | 🟢 `boot-test.ps1 pci`, `test_bar_relocation_snapshot` |

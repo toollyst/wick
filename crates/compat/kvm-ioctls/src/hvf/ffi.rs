@@ -48,7 +48,9 @@ pub const HV_REG_FPCR: hv_reg_t = 32;
 pub const HV_REG_FPSR: hv_reg_t = 33;
 pub const HV_REG_CPSR: hv_reg_t = 34;
 
+pub const HV_SYS_REG_MIDR_EL1: hv_sys_reg_t = 0xc000;
 pub const HV_SYS_REG_MPIDR_EL1: hv_sys_reg_t = 0xc005;
+pub const HV_SYS_REG_ID_AA64DFR0_EL1: hv_sys_reg_t = 0xc028;
 pub const HV_SYS_REG_SPSR_EL1: hv_sys_reg_t = 0xc200;
 pub const HV_SYS_REG_ELR_EL1: hv_sys_reg_t = 0xc201;
 pub const HV_SYS_REG_SP_EL0: hv_sys_reg_t = 0xc208;

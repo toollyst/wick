@@ -1792,6 +1792,60 @@ mod tests {
     }
 
     #[test]
+    fn test_vcpu_init_reads_what_the_run_phase_needs() {
+        // A new vCPU's register values come from a scratch vCPU on a thread
+        // of its own (`probe_reset_regs`). The run phase may make no thread
+        // (Firecracker's host sandbox, as Linux's vCPU filter has no clone),
+        // and it needs them: a vCPU that PSCI CPU_ON starts again is reset
+        // to them. So the first vcpu_init, in the setup phase, reads them.
+        let vm = Kvm::new().unwrap().create_vm().unwrap();
+        assert!(vm.inner.reset_regs.get().is_none());
+        let vcpu = vm.create_vcpu(0).unwrap();
+        assert!(vm.inner.reset_regs.get().is_none());
+        let mut kvi = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        vcpu.vcpu_init(&kvi).unwrap();
+        assert!(matches!(vm.inner.reset_regs.get(), Some(Ok(_))));
+    }
+
+    #[test]
+    fn test_a_new_vcpu_has_kvms_reset_values() {
+        // A vCPU that PSCI CPU_ON starts again is reset to a new vCPU's
+        // values (`reset_for_cpu_on`). Where KVM's reset gives a register a
+        // value, a new Hypervisor.framework vCPU has the same one: 0 for
+        // x0-x30, SP_EL0, PC, the FP/SIMD registers, FPSR and FPCR
+        // (arch/arm64/include/asm/kvm_emulate.h `kvm_reset_vcpu_core`), and
+        // for MDSCR_EL1, CPACR_EL1, TCR_EL1, VBAR_EL1, CONTEXTIDR_EL1,
+        // CNTKCTL_EL1, CNTV_CTL_EL0 and CNTV_CVAL_EL0 (their `reset_val`
+        // in arch/arm64/kvm/sys_regs.c). SCTLR_EL1 and PSTATE differ, and
+        // are written.
+        use super::super::regs::{self, Reg};
+        let vm = Kvm::new().unwrap().create_vm().unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let mut kvi = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        vcpu.vcpu_init(&kvi).unwrap();
+        let reset = vm.inner.reset_regs.get().unwrap().as_ref().unwrap();
+        let zero_sys = [0x8012, 0xc082, 0xc102, 0xc600, 0xc681, 0xc708, 0xdf19, 0xdf02];
+        let mut checked = 0;
+        for id in regs::reg_list() {
+            let kvm_zero = zero_sys.iter().any(|e| id == regs::sys_id(*e))
+                || match regs::decode(id) {
+                    Some(Reg::Gp(r)) => r <= HV_REG_PC,
+                    Some(Reg::Simd(_) | Reg::Fp(_)) => true,
+                    Some(Reg::Sys(r)) => r == HV_SYS_REG_SP_EL0,
+                    _ => false,
+                };
+            if kvm_zero {
+                assert!(reset[&id].iter().all(|b| *b == 0), "{id:#x}: {:?}", reset[&id]);
+                checked += 1;
+            }
+        }
+        // 31 + PC + SP_EL0, 32 V registers, FPSR, FPCR, 8 system registers.
+        assert_eq!(checked, 33 + 32 + 2 + zero_sys.len());
+    }
+
+    #[test]
     fn test_virtual_count_is_the_vms() {
         // As on KVM, writing one vCPU's TIMER_CNT sets the counter of every
         // vCPU, from the time of the write (not the time a vCPU first runs).

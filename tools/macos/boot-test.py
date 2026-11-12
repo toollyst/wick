@@ -290,8 +290,24 @@ def stage_smp(ctx):
         check(out == str(cpu + 100), f"taskset {cpu}: {out!r}")
     _, out = vm.sh("for c in 0 1; do taskset -c $c sh -c 'i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done' & done; wait; echo spun")
     check(out.endswith("spun"), f"parallel work: {out!r}")
+    cpu_offline_online(vm, "smp")
     vm.reboot()
-    return "2 vCPUs online, work runs on each"
+    return "2 vCPUs online, work runs on each; cpu1 offline and online 3 times (PSCI CPU_OFF, CPU_ON)"
+
+
+# A CPU taken offline and back online (PSCI CPU_OFF, then CPU_ON, which KVM
+# answers with a reset of the vCPU: arch/arm64/kvm/psci.c kvm_psci_vcpu_on,
+# reset.c kvm_reset_vcpu), three times; work then runs on it. The guest
+# command, for boot-test.ps1 to do the same:
+CPU_OFFLINE_ONLINE = ("for i in 1 2 3; do echo 0 > /sys/devices/system/cpu/cpu1/online || echo off-failed; "
+                      "echo 1 > /sys/devices/system/cpu/cpu1/online || echo on-failed; done; "
+                      "taskset -c 1 sh -c 'i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo cpu1-ran'; "
+                      "cat /sys/devices/system/cpu/online")
+
+
+def cpu_offline_online(vm, what):
+    _, out = vm.sh(CPU_OFFLINE_ONLINE, timeout=60)
+    check(out.splitlines()[-2:] == ["cpu1-ran", "0-1"], f"{what}: cpu1 offline/online: {out!r}")
 
 
 def stage_block(ctx):
@@ -754,8 +770,12 @@ def stage_snapshot(ctx, pci=False):
                                      "resume_vm": True})
     restored_checks(vm, bash_md5, data)
     vsock_host_to_guest(uds, 1 << 20)
+    # A restored vCPU taken offline and online (the case that found CPU_ON
+    # not resetting the vCPU).
+    cpu_offline_online(vm, "restored")
     vm.reboot()
-    return "Full snapshot, restore in a new process: shell state, block, vsock" + (" over PCI" if pci else "")
+    return ("Full snapshot, restore in a new process: shell state, block, vsock, cpu1 offline/online"
+            + (" over PCI" if pci else ""))
 
 
 def restored_checks(vm, bash_md5, data):

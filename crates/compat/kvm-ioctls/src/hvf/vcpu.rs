@@ -601,6 +601,13 @@ impl VcpuFd {
         if kvi.features[0] & !allowed != 0 || kvi.features[1..].iter().any(|f| *f != 0) {
             return err(libc::EINVAL);
         }
+        // A new vCPU's register values come from a scratch vCPU on a thread
+        // of its own: read now, while the host sandbox still lets a thread
+        // be made (Firecracker inits its vCPUs before it narrows it), not
+        // when a vCPU the guest starts again (PSCI CPU_ON) is reset in the
+        // run phase, which makes no thread (SYS_bsdthread_create denied, as
+        // Linux's vCPU filter has no clone).
+        let _ = self.vm()?.reset_regs.get_or_init(probe_reset_regs);
         // KVM resets the vCPU: PSTATE and SCTLR_EL1 get their reset values
         // (other registers start as Hypervisor.framework creates them).
         let reset = [
@@ -744,15 +751,13 @@ impl VcpuFd {
         err(libc::EINTR)
     }
 
-    fn wait_powered_on(&self, hv: hv_vcpu_t) -> Result<bool> {
+    fn wait_powered_on(&mut self, hv: hv_vcpu_t) -> Result<bool> {
         let mut power = self.shared.power.lock().unwrap();
         loop {
             if !power.off {
                 if let Some((entry, context)) = power.boot.take() {
                     drop(power);
-                    self.set_reg(hv, HV_REG_PC, entry)?;
-                    self.set_reg(hv, HV_REG_X0, context)?;
-                    self.set_reg(hv, HV_REG_CPSR, PSTATE_EL1H_DAIF)?;
+                    self.reset_for_cpu_on(hv, entry, context)?;
                 }
                 return Ok(true);
             }
@@ -761,6 +766,78 @@ impl VcpuFd {
             }
             power = self.shared.cv.wait(power).unwrap();
         }
+    }
+
+    /// Resets the vCPU that PSCI `CPU_ON` starts, as KVM does
+    /// (arch/arm64/kvm/psci.c `kvm_psci_vcpu_on` asks for it, reset.c
+    /// `kvm_reset_vcpu` does it), then starts it at `entry` with `context`
+    /// in x0 (`kvm_reset_vcpu_psci`):
+    /// - the core registers (kvm_emulate.h `kvm_reset_vcpu_core`): x0-x30,
+    ///   SP_EL0, PC and the FP/SIMD registers, FPSR and FPCR to 0 (a new
+    ///   Hypervisor.framework vCPU's values, `test_a_new_vcpu_has_kvms_reset_values`),
+    ///   PSTATE EL1h with D, A, I and F masked;
+    /// - the system registers (sys_regs.c `kvm_reset_sys_regs`), each the
+    ///   vCPU keeps (`regs::reg_list`) to the value a new
+    ///   Hypervisor.framework vCPU has: those KVM resets to a value
+    ///   (`reset_val`) have it there, SCTLR_EL1 is written; those KVM
+    ///   leaves UNKNOWN (`reset_unknown`) have the new vCPU's. SP_EL1,
+    ///   ELR_EL1 and SPSR_EL1 keep theirs: KVM's have no reset;
+    /// - the breakpoint and watchpoint registers to 0 (`reset_dbg_wb_reg`),
+    ///   and the emulated debug registers as a new vCPU's;
+    /// - the virtual timer (arch_timer.c `kvm_timer_vcpu_reset`, and
+    ///   `TIMER_REG`'s `reset_val` 0): CNTV_CTL_EL0 and CNTV_CVAL_EL0 0,
+    ///   unmasked; its offset is the VM's;
+    /// - no MMIO load left to complete (`kvm_reset_vcpu_psci` clears what
+    ///   was pending).
+    ///
+    /// They stay, as on KVM: MPIDR_EL1 and MIDR_EL1 (set at init), the
+    /// counter (the VM's), the GIC redistributor (the vGIC is not reset).
+    fn reset_for_cpu_on(&mut self, hv: hv_vcpu_t, entry: u64, context: u64) -> Result<()> {
+        let vm = self.vm()?;
+        let reset = vm.reset_regs.get_or_init(probe_reset_regs).as_ref().map_err(|e| Error::new(*e))?;
+        for id in regs::reg_list() {
+            match regs::decode(id) {
+                Some(Reg::Sys(
+                    HV_SYS_REG_MPIDR_EL1
+                    | HV_SYS_REG_MIDR_EL1
+                    | HV_SYS_REG_SP_EL1
+                    | HV_SYS_REG_ELR_EL1
+                    | HV_SYS_REG_SPSR_EL1,
+                )) => continue,
+                Some(Reg::VirtualCount | Reg::PhysicalCount | Reg::PsciVersion) => continue,
+                _ => {}
+            }
+            let v = reset.get(&id).ok_or_else(|| Error::new(libc::ENOENT))?;
+            self.set_reg_now(hv, id, v)?;
+        }
+        self.set_reg_now(hv, regs::SCTLR_ID, &regs::SCTLR_RESET.to_le_bytes())?;
+        // Breakpoints (DBGBVRn, DBGBCRn) and watchpoints (DBGWVRn,
+        // DBGWCRn), as many as ID_AA64DFR0_EL1 says the vCPU has.
+        let dfr0 = self.sys(hv, HV_SYS_REG_ID_AA64DFR0_EL1)?;
+        let breakpoints = ((dfr0 >> 12) & 0xf) + 1;
+        let watchpoints = ((dfr0 >> 20) & 0xf) + 1;
+        for n in 0..16u16 {
+            // DBGBVRn, DBGBCRn (op2 4, 5); DBGWVRn, DBGWCRn (op2 6, 7).
+            let mut op2s = Vec::new();
+            if u64::from(n) < breakpoints {
+                op2s.extend([4, 5]);
+            }
+            if u64::from(n) < watchpoints {
+                op2s.extend([6, 7]);
+            }
+            for op2 in op2s {
+                // SAFETY: `hv` belongs to this thread.
+                check(unsafe { hv_vcpu_set_sys_reg(hv, 0x8000 | n << 3 | op2, 0) })?;
+            }
+        }
+        self.debug = DebugRegs::default();
+        // SAFETY: `hv` belongs to this thread.
+        check(unsafe { hv_vcpu_set_vtimer_mask(hv, false) })?;
+        self.shared.vtimer_masked.store(false, Ordering::Release);
+        self.pending_read = None;
+        self.set_reg(hv, HV_REG_PC, entry)?;
+        self.set_reg(hv, HV_REG_X0, context)?;
+        self.set_reg(hv, HV_REG_CPSR, PSTATE_EL1H_DAIF)
     }
 
     /// Unmasks the virtual timer once the guest no longer has it firing.
