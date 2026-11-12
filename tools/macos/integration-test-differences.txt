@@ -64,13 +64,15 @@ all impossible integration_tests/functional/test_binary.py::test_firecracker_bin
 # (tools/macos/integration/bin/readelf lists symbols only).
 all impossible integration_tests/functional/test_binary.py::test_release_debuginfo
 
-# Transparent huge pages (madvise MADV_HUGEPAGE): macOS has no huge pages for
-# a process's memory, and the call fails (EINVAL) rather than being ignored
-# (docs/PORTING.md row 10). test_transparent_huge_pages_allocation counts
-# them in /proc/<pid>/smaps (AnonHugePages), which macOS does not have.
-all row-10 integration_tests/functional/test_shut_down.py::test_reboot[vmlinux-6.1.188-PCI_ON-kvm-Transparent]
-all row-10 integration_tests/functional/test_shut_down.py::test_reboot[vmlinux-6.1.188-PCI_OFF-kvm-Transparent]
-all row-10 integration_tests/functional/test_huge_pages.py::test_transparent_huge_pages_allocation
+# Transparent huge pages: macOS has none for a process's memory, so wick
+# takes huge_pages: Transparent as Linux does on a host whose transparent
+# huge pages are `never` (docs/PORTING.md row 10). The test needs a host
+# with them: it raises "THP cannot be tested in this host" when
+# /sys/kernel/mm/transparent_hugepage/enabled is not madvise or always, as
+# on such a Linux host, and it counts AnonHugePages in /proc/<pid>/smaps,
+# which macOS does not have (measured: both, with huge_pages Transparent and
+# None).
+all impossible integration_tests/functional/test_huge_pages.py::test_transparent_huge_pages_allocation
 
 # Firecracker without arguments binds upstream's default API socket,
 # /run/firecracker.socket. macOS's root is the sealed, read-only system
@@ -83,20 +85,6 @@ all impossible integration_tests/functional/test_cmd_line_parameters.py::test_cl
 # read-only system volume there is no /mnt and none can be made ("Read-only
 # file system: '/mnt'").
 all impossible integration_tests/functional/test_snapshot_not_losing_dirty_pages.py::test_diff_snapshot_works_after_error
-
-# Transparent huge pages, as above (row 10): the microVM does not start
-# ("Error calling madvise: Invalid argument") before the pmem device is used.
-all row-10 integration_tests/functional/test_pmem.py::test_pmem_add[vmlinux-6.1.188-PCI_ON-Transparent-kvm]
-all row-10 integration_tests/functional/test_pmem.py::test_pmem_add[vmlinux-6.1.188-PCI_OFF-Transparent-kvm]
-all row-10 integration_tests/functional/test_pmem.py::test_pmem_add_as_root_ro[vmlinux-6.1.188-PCI_ON-Transparent-kvm]
-all row-10 integration_tests/functional/test_pmem.py::test_pmem_add_as_root_ro[vmlinux-6.1.188-PCI_OFF-Transparent-kvm]
-all row-10 integration_tests/functional/test_pmem.py::test_pmem_add_as_root_rw[vmlinux-6.1.188-PCI_ON-rw-Transparent-kvm]
-all row-10 integration_tests/functional/test_pmem.py::test_pmem_add_as_root_rw[vmlinux-6.1.188-PCI_OFF-rw-Transparent-kvm]
-all row-10 integration_tests/functional/test_pmem.py::test_pmem_zero_size_backing_file[vmlinux-6.1.188-PCI_ON-Transparent-kvm]
-all row-10 integration_tests/functional/test_pmem.py::test_pmem_zero_size_backing_file[vmlinux-6.1.188-PCI_OFF-Transparent-kvm]
-all row-10 integration_tests/functional/test_pmem.py::test_pmem_dax_memory_saving[vmlinux-6.1.188-rw-Transparent-kvm]
-all row-10 integration_tests/functional/test_pmem.py::test_device_reset[vmlinux-6.1.188-PCI_ON-Transparent-kvm]
-all row-10 integration_tests/functional/test_pmem.py::test_device_reset[vmlinux-6.1.188-PCI_OFF-Transparent-kvm]
 
 # Signal 35 is musl's SIGRTMIN, the signal Firecracker on Linux kicks its
 # vCPU threads with and handles. macOS has no real-time signals (NSIG 32):
@@ -130,6 +118,7 @@ all bug integration_tests/functional/test_net_config_space.py::test_net_change_m
 # sizes with proc_pidinfo, as wick_macos.memory_maps does.
 all bug integration_tests/functional/test_serial_io.py::test_serial_dos
 all bug integration_tests/functional/test_pmem.py::test_pmem_dax_memory_saving[vmlinux-6.1.188-rw-None-kvm]
+all bug integration_tests/functional/test_pmem.py::test_pmem_dax_memory_saving[vmlinux-6.1.188-rw-Transparent-kvm]
 
 # The guest's cache hierarchy is the host's, which Firecracker on Linux
 # reads in /sys/devices/system/cpu/cpu0/cache and gives the guest in its
@@ -201,15 +190,6 @@ all row-6 integration_tests/functional/test_hotplug.py::test_hotplug_net[booted-
 # jailer, upstream's CI) the test still reaches the API socket in that
 # directory; as the jail's user (the stand-in) it no longer can.
 user root integration_tests/functional/test_snapshot_basic.py::test_negative_snapshot_permissions
-
-# Transparent huge pages (row 10), as above.
-all row-10 integration_tests/functional/test_snapshot_basic.py::test_resume[PCI_ON-Transparent-True-vmlinux-6.1.188-kvm]
-all row-10 integration_tests/functional/test_snapshot_basic.py::test_resume[PCI_ON-Transparent-False-vmlinux-6.1.188-kvm]
-all row-10 integration_tests/functional/test_snapshot_basic.py::test_resume[PCI_OFF-Transparent-True-vmlinux-6.1.188-kvm]
-all row-10 integration_tests/functional/test_snapshot_basic.py::test_resume[PCI_OFF-Transparent-False-vmlinux-6.1.188-kvm]
-all row-10 integration_tests/functional/test_snapshot_basic.py::test_snapshot_huge_pages_override[PCI_ON-Transparent-None-vmlinux-6.1.188-kvm]
-all row-10 integration_tests/functional/test_snapshot_basic.py::test_snapshot_huge_pages_override[PCI_OFF-Transparent-None-vmlinux-6.1.188-kvm]
-all row-10 integration_tests/functional/test_snapshot_basic.py::test_snapshot_huge_pages_override[PCI_OFF-None-Transparent-vmlinux-6.1.188-kvm]
 
 # Skipped off x86_64 by upstream (x86 CPUID and MSRs; GDB needs a vmlinux,
 # and upstream's aarch64 kernel is an Image), and the Linux results are
