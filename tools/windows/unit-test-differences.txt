@@ -91,8 +91,9 @@ error-text vmm vmm_config::net::tests::test_insert_error_cases
 bug vmm devices::virtio::rng::device::tests::test_bandwidth_rate_limiter
 #   (entropy_bytes 0, not 1000, 350 ms after the limiter blocked: the replenish
 #   timer's event did not arrive in the 100 ms emulated. vmm-sys-util's epoll
-#   test_a_timer_that_expired_unwatched_is_reported checks the timer and epoll
-#   alone: if it passes, the cause is above them)
+#   test_a_timer_that_expired_unwatched_is_reported, the timer and epoll
+#   alone, passes (CI run 43298293407): the cause is above them, in the rate
+#   limiter or the rng device's use of its timer)
 
 # Other packages.
 linux-path firecracker seccomp::tests::test_seccomp_config
@@ -147,14 +148,14 @@ bug vmm devices::virtio::block::vhost_user::device::tests::test_activate
 bug vmm devices::virtio::block::vhost_user::device::tests::test_new_all_features
 bug vmm devices::virtio::block::vhost_user::device::tests::test_new_no_features
 bug vmm devices::virtio::vhost_user::tests::test_new
-#   (test_utils::create_tmp_socket panics "Cannot bind socket" (mod.rs:173),
-#   which carries no errno. Its path is TempDir::new's, canonicalized: on
-#   Windows the verbatim form `\\?\C:\...`, with "/tmp_socket" appended, and
-#   a `\\?\` path keeps its '/' (Naming Files, Paths, and Namespaces). libc's
-#   test_unix_bind_of_each_path_form_on_record, in CI's WHP step, prints the
-#   bind of each form with its errno. c7c8837's exact AF_UNIX length did not
-#   change it. Listed again after c7c8837 dropped these entries before they
-#   had run)
+#   (test_utils::create_tmp_socket panics "Cannot bind socket" (mod.rs:173).
+#   Its path is TempDir::new's, canonicalized: on Windows the verbatim form
+#   `\\?\C:\...`, with "/tmp_socket" appended, and a `\\?\` path keeps its
+#   '/' (Naming Files, Paths, and Namespaces). Measured by libc's
+#   test_unix_bind_of_each_path_form_on_record in CI run 43298293407's WHP
+#   step: the verbatim form with '/' fails with ERROR_INVALID_PARAMETER (87);
+#   with '\', and the plain form with either, binds. c7c8837's exact AF_UNIX
+#   length did not change it)
 
 # vmm: WHP maps guest memory for one partition of a process at a time
 # (kvm-ioctls' test_one_partition_of_a_process_maps_memory; MAPTEST in CI's

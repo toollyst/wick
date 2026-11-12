@@ -425,6 +425,14 @@ unsafe fn winsock_addr(addr: *const c_void, len: u32) -> Option<(sockaddr_storag
         // unix_mkname_bsd: the path is terminated at the length given and
         // its strlen taken), so `sizeof(struct sockaddr_un)` names the
         // same socket as the exact length; Winsock is given the exact one.
+        // Measured (CI run 43298293407): a bind and connect with the
+        // whole size, so passed, work (test_unix_bind_with_the_whole_
+        // structure_size). What Winsock does given the whole size itself
+        // is the "winsock" BINDTEST line of
+        // test_unix_bind_of_each_path_form_on_record. The vhost-user
+        // tests' "Cannot bind socket" was not the length: their path had a
+        // '/' after a `\\?\` prefix, which the verbatim BINDTEST lines show
+        // refused (ERROR_INVALID_PARAMETER).
         // An abstract address (`sun_path[0]` NUL) is passed as it is.
         // SAFETY: `s` is `sockaddr_storage`, `n` within it.
         let bytes = unsafe { std::slice::from_raw_parts((&raw const s).cast::<u8>(), n) };
@@ -1110,6 +1118,29 @@ mod tests {
                 std::println!("BINDTEST {form} {sep:?} {path:?}: {outcome}");
                 let _ = std::fs::remove_file(&path);
             }
+        }
+        // Winsock itself given the structure's whole size (bind above gives
+        // it the exact length), for winsock_addr's comment.
+        {
+            let path = std::format!("{}\\tmp_socket_whole", plain.to_str().unwrap());
+            let size = c_int::try_from(std::mem::size_of::<sockaddr_un>()).unwrap();
+            // SAFETY: socket calls on our descriptor and buffers.
+            let outcome = unsafe {
+                let fd = socket(AF_UNIX, crate::SOCK_STREAM, 0);
+                assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+                let mut a: sockaddr_un = std::mem::zeroed();
+                a.sun_family = u16::try_from(AF_UNIX).unwrap();
+                std::ptr::copy(path.as_ptr().cast(), a.sun_path.as_mut_ptr(), path.len());
+                let outcome = if ws::bind(sock(fd), (&raw const a).cast(), size) == 0 {
+                    std::string::String::from("ok")
+                } else {
+                    std::format!("failed, WSA error {}", WSAGetLastError())
+                };
+                assert_eq!(crate::close(fd), 0);
+                outcome
+            };
+            std::println!("BINDTEST winsock whole size ({size} bytes) {path:?}: {outcome}");
+            let _ = std::fs::remove_file(&path);
         }
         std::fs::remove_dir_all(&plain).unwrap();
     }
