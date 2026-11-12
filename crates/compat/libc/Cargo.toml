@@ -29,6 +29,7 @@ upstream = { package = "libc", git = "https://github.com/rust-lang/libc", tag = 
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_Foundation",
     "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Networking_WinSock",

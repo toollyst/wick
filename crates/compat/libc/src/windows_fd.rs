@@ -862,13 +862,46 @@ pub unsafe fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t {
     pos
 }
 
-/// `fsync`.
+/// Whether the handle `h` was opened to write: its granted access
+/// (`NtQueryObject`, `ObjectBasicInformation`) has `FILE_WRITE_DATA` or
+/// `FILE_APPEND_DATA`. `None` if it cannot be queried.
+fn may_write(h: HANDLE) -> Option<bool> {
+    use windows_sys::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_APPEND_DATA, FILE_WRITE_DATA};
+    use windows_sys::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
+    let mut info = PUBLIC_OBJECT_BASIC_INFORMATION::default();
+    // SAFETY: an output buffer of the size passed.
+    let status = unsafe {
+        NtQueryObject(
+            h,
+            ObjectBasicInformation,
+            (&raw mut info).cast(),
+            u32::try_from(std::mem::size_of::<PUBLIC_OBJECT_BASIC_INFORMATION>()).unwrap(),
+            std::ptr::null_mut(),
+        )
+    };
+    (status >= 0).then_some(info.GrantedAccess & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0)
+}
+
+/// `fsync`. Linux asks no write access of the descriptor (fs/sync.c:
+/// `do_fsync`, `vfs_fsync_range`), so a file opened read-only (a read-only
+/// drive) syncs; `FlushFileBuffers` fails on a handle without
+/// `GENERIC_WRITE` (Microsoft's documentation of it) with
+/// `ERROR_ACCESS_DENIED`. Through a handle of a file that cannot write
+/// nothing was written, so it succeeds here without a flush. (Linux would
+/// also write back what other descriptors of the file wrote; Windows lets
+/// no handle without write access flush.)
 ///
 /// # Safety
 /// No requirements; `unsafe` like the libc function.
 pub unsafe fn fsync(fd: c_int) -> c_int {
+    let h = handle(fd);
     // SAFETY: plain call.
-    if unsafe { FlushFileBuffers(handle(fd)) } == 0 {
+    if unsafe { GetFileType(h) } == FILE_TYPE_DISK && may_write(h) == Some(false) {
+        return 0;
+    }
+    // SAFETY: plain call.
+    if unsafe { FlushFileBuffers(h) } == 0 {
         return -1;
     }
     0
@@ -1497,6 +1530,34 @@ mod tests {
             assert_eq!(lseek(fd, 0, SEEK_CUR), 5, "ftruncate keeps the position");
         }
         drop(f);
+        std::fs::remove_file(p).unwrap();
+    }
+
+    // A drive opened read-only syncs, as fsync(2) on an O_RDONLY descriptor
+    // does on Linux; FlushFileBuffers itself refuses that handle (the
+    // reason for the check); a writable file still flushes.
+    #[test]
+    fn test_fsync_of_a_read_only_file() {
+        let (p, mut f) = temp("fsync");
+        f.write_all(b"0123456789").unwrap();
+        let fd = fd_of(&f);
+        // SAFETY: a valid descriptor.
+        unsafe {
+            assert_eq!(fsync(fd), 0);
+            assert_eq!(fdatasync(fd), 0);
+        }
+        drop(f);
+        let r = std::fs::File::open(&p).unwrap();
+        let fd = fd_of(&r);
+        // SAFETY: a valid descriptor.
+        unsafe {
+            assert_eq!(FlushFileBuffers(handle(fd)), 0, "FlushFileBuffers on a read-only handle");
+            assert_eq!(GetLastError(), ERROR_ACCESS_DENIED);
+            assert_eq!(fsync(fd), 0, "fsync of a read-only file: {}", std::io::Error::last_os_error());
+            assert_eq!(fdatasync(fd), 0);
+        }
+        assert_eq!(may_write(handle(fd)), Some(false));
+        drop(r);
         std::fs::remove_file(p).unwrap();
     }
 

@@ -247,7 +247,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | virtio-blk, `io_engine: Sync` | 🟢 `boot-test block` | 🟢 `boot-test.ps1 block` |
 | `io_engine: Async` | 🟢 io_uring's model on worker threads (`boot-test block`, `test_drive_io_engine`) | 🟢 the same code (`boot-test.ps1 block`, `test_drive_io_engine`) |
 | `is_read_only`, root device | 🟢 `boot-test block` checks that a write fails | 🟢 `boot-test.ps1 block` |
-| Flush, `cache_type` | 🟢 a flush is `F_FULLFSYNC` (`test_flush`, `test_no_flush`) | 🟢 `test_flush`, `test_no_flush` |
+| Flush, `cache_type` | 🟢 a flush is `F_FULLFSYNC` (`test_flush`, `test_no_flush`) | 🟢 `test_flush`, `test_no_flush`. A read-only drive's flush succeeds, as `fsync` of an `O_RDONLY` descriptor on Linux, where `FlushFileBuffers` refuses a handle that cannot write (`test_fsync_of_a_read_only_file`, `test_sync_all_of_a_read_only_file`; patches/0041): until then every snapshot logged "Failed to drain ops and flush block data" with `ERROR_ACCESS_DENIED` for a read-only root drive (`boot-test.ps1 tools`, `diff` on a WHP PC) |
 | Discard, block size, topology | 🟢 `test_discard`, `test_blk_size`, `test_topology_advertised` | 🟢 `test_discard`, `test_blk_size`, `test_topology_advertised` |
 | Rate limiter | 🟢 `boot-test devices`, `test_rate_limiters_api_config` | 🟢 `boot-test.ps1 devices`, `test_rate_limiters_api_config` |
 | Boot by `partuuid` | 🟢 `test_partuuid_boot` (a drive and a vhost-user drive; the harness's `sfdisk` and `blkid` write and read the DOS label as util-linux does), `test_partuuid_update` | 🟢 `test_partuuid_boot` |

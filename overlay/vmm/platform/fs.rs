@@ -38,6 +38,26 @@ pub fn size(file: &mut File) -> io::Result<u64> {
     file.seek(SeekFrom::End(0))
 }
 
+/// `File::sync_all` as Linux's `fsync(2)` answers it, for a drive's file:
+/// Linux asks no write access of the descriptor (fs/sync.c), so a read-only
+/// drive's file syncs. On Windows `File::sync_all` is `FlushFileBuffers`,
+/// which needs a handle that may write (`ERROR_ACCESS_DENIED` otherwise):
+/// there it is the compatibility libc's `fsync`, which answers a handle that
+/// cannot write as Linux does (nothing was written through it).
+pub fn sync_all(file: &File) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a descriptor the file owns.
+        if unsafe { libc::fsync(file.as_raw_fd()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    file.sync_all()
+}
+
 /// `std::os::unix::fs::FileTypeExt`. On Windows, the queries a
 /// `std::fs::FileType` answers there: it describes files, directories and
 /// symbolic links only (std cannot read the metadata of a device), so it is
@@ -233,6 +253,18 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1 << 20;
+
+    // A drive opened read-only syncs, as on Linux: the snapshot's
+    // drain_and_flush and the guest's flush request on a read-only drive.
+    #[test]
+    fn test_sync_all_of_a_read_only_file() {
+        let tmp = TempFile::new().unwrap();
+        std::fs::write(tmp.as_path(), b"data").unwrap();
+        let rw = std::fs::OpenOptions::new().read(true).write(true).open(tmp.as_path()).unwrap();
+        sync_all(&rw).unwrap();
+        let ro = File::open(tmp.as_path()).unwrap();
+        sync_all(&ro).unwrap();
+    }
 
     // A drive on a block device has the device's size, as on Linux, where
     // lseek to the end gives it. A real one: a raw image attached without a

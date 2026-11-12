@@ -41,3 +41,4 @@
 0039-windows-the-gdb-feature-builds-the-WHP-backend-s-gue.patch
 0040-macos-a-drive-on-a-block-device-has-the-device-s-siz.patch
 0041-macos-SIGSYS-s-handler-runs-on-a-thread-of-its-own.patch
+0042-windows-a-read-only-drive-syncs-as-fsync-on-Linux.patch

@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 23:15:08 +0900
+Subject: [PATCH] windows: a read-only drive syncs, as fsync on Linux
+
+The block engines' flush (a snapshot's drain_and_flush, the guest's flush
+request) calls File::sync_all, which on Windows is FlushFileBuffers: it
+needs a handle that may write and fails with ERROR_ACCESS_DENIED for a
+read-only drive, where Linux's fsync of an O_RDONLY descriptor succeeds.
+Both go through wick's platform::fs::sync_all, File::sync_all on Linux
+and macOS.
+---
+ src/vmm/src/devices/virtio/block/virtio/io/async_io.rs | 3 ++-
+ src/vmm/src/devices/virtio/block/virtio/io/sync_io.rs  | 3 ++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs b/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs
+index 1d871dde26914cd29654ead7a0c0d2504181b405..9ee3fe7931db2be53e4f20f2ef7a8b04a21a7a91 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs
+@@ -227,7 +227,8 @@ impl AsyncFileEngine {
+         // Sync data out to physical media on host.
+         // We don't need to call flush first since all the ops are performed through io_uring
+         // and Rust shouldn't manage any data in its internal buffers.
+-        self.file.sync_all().map_err(AsyncIoError::SyncAll)?;
++        // wick: Linux's answer for a drive opened read-only (`platform::fs::sync_all`).
++        crate::platform::fs::sync_all(&self.file).map_err(AsyncIoError::SyncAll)?;
+ 
+         Ok(())
+     }
+diff --git a/src/vmm/src/devices/virtio/block/virtio/io/sync_io.rs b/src/vmm/src/devices/virtio/block/virtio/io/sync_io.rs
+index 7b8ed30463eb5185763387d150361081c34deb31..884995d95c6aca2a98131076f60a30a4f3238dd2 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/io/sync_io.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/io/sync_io.rs
+@@ -132,7 +132,8 @@ impl SyncFileEngine {
+         // flush() first to force any cached data out of rust buffers.
+         self.file.flush().map_err(SyncIoError::Flush)?;
+         // Sync data out to physical media on host.
+-        self.file.sync_all().map_err(SyncIoError::SyncAll)
++        // wick: Linux's answer for a drive opened read-only (`platform::fs::sync_all`).
++        crate::platform::fs::sync_all(&self.file).map_err(SyncIoError::SyncAll)
+     }
+ 
+     pub fn discard(&mut self, range: (u64, u32)) -> Result<u32, SyncIoError> {
