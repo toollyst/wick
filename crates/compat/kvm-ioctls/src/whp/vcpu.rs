@@ -294,23 +294,27 @@ impl VcpuFd {
     }
 
     /// `KVM_TRANSLATE`: the guest physical address `gva` maps to in the
-    /// vCPU's current paging mode, from `WHvTranslateGva` without access
-    /// checks (a page walk, as KVM's); `writeable` from a second walk that
-    /// checks for a write ([`super::debug::translation`]).
+    /// vCPU's current paging mode, as KVM answers it
+    /// ([`super::debug::translation`]): the address itself while paging is
+    /// off, else `WHvTranslateGva`'s walk without access checks. A failed
+    /// walk is an invalid translation, not a failed call; only a refused
+    /// `WHvGetVirtualProcessorRegisters` or `WHvTranslateGva` call fails it.
     pub fn translate_gva(&self, gva: u64) -> Result<kvm_bindings::kvm_translation> {
-        let walk = |flags| -> Result<(i32, u64)> {
-            // SAFETY: plain data; zero is a valid value.
-            let mut result: whv::WHV_TRANSLATE_GVA_RESULT = unsafe { std::mem::zeroed() };
-            let mut gpa = 0u64;
-            // SAFETY: out-pointers valid for the call.
-            super::ffi::hr(unsafe {
-                whv::WHvTranslateGva(self.part(), self.vp(), gva, flags, &mut result, &mut gpa)
-            })?;
-            Ok((result.ResultCode, gpa))
-        };
-        let (code, gpa) = walk(whv::WHvTranslateGvaFlagNone)?;
-        let (wcode, _) = walk(whv::WHvTranslateGvaFlagValidateWrite | whv::WHvTranslateGvaFlagPrivilegeExempt)?;
-        Ok(super::debug::translation(gva, code, gpa, wcode == whv::WHvTranslateGvaResultSuccess))
+        if self.register(whv::WHvX64RegisterCr0)? & super::debug::CR0_PG == 0 {
+            return Ok(super::debug::translation(gva, None));
+        }
+        let (code, gpa) = self.translate_walk(gva, whv::WHvTranslateGvaFlagNone)?;
+        Ok(super::debug::translation(gva, Some((code, gpa))))
+    }
+
+    /// One `WHvTranslateGva` walk with `flags`: its result code and address.
+    pub(crate) fn translate_walk(&self, gva: u64, flags: whv::WHV_TRANSLATE_GVA_FLAGS) -> Result<(i32, u64)> {
+        // SAFETY: plain data; zero is a valid value.
+        let mut result: whv::WHV_TRANSLATE_GVA_RESULT = unsafe { std::mem::zeroed() };
+        let mut gpa = 0u64;
+        // SAFETY: out-pointers valid for the call.
+        super::ffi::hr(unsafe { whv::WHvTranslateGva(self.part(), self.vp(), gva, flags, &mut result, &mut gpa) })?;
+        Ok((result.ResultCode, gpa))
     }
 
     /// `KVM_SET_GUEST_DEBUG` ([`super::debug`]): the partition's exception

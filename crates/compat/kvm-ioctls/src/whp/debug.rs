@@ -173,18 +173,36 @@ pub(crate) fn pending_bp() -> u64 {
     1 | (3 << 1) | (u64::from(BP_VECTOR) << 16)
 }
 
-/// `KVM_TRANSLATE`'s answer from `WHvTranslateGva` with no access checks
-/// (a page walk, as KVM's): valid only for `WHvTranslateGvaResultSuccess`
-/// (0); every other result (page not present, privilege violation, invalid
-/// page table flags, a GPA that is not mapped or not readable, an overlay,
-/// an intercept) is "no translation", as KVM's walk that fails.
-pub(crate) fn translation(gva: u64, result_code: i32, gpa: u64, writeable: bool) -> kvm_translation {
-    let valid = result_code == 0;
+/// KVM's `INVALID_GPA` (`~0ull`, include/linux/kvm_types.h): the
+/// physical address of a translation that failed.
+pub(crate) const INVALID_GPA: u64 = u64::MAX;
+
+/// `CR0.PG`.
+pub(crate) const CR0_PG: u64 = 1 << 31;
+
+/// `KVM_TRANSLATE`'s answer, as KVM's `kvm_arch_vcpu_ioctl_translate`
+/// (arch/x86/kvm/x86.c, Linux 6.12), which never fails: `walk` is `None`
+/// when the vCPU's paging is off, where KVM's `nonpaging_gva_to_gpa`
+/// (arch/x86/kvm/mmu/mmu.c) gives the address itself, valid (at the PVH
+/// entry, before the guest turns paging on); otherwise it is
+/// `WHvTranslateGva`'s result code and address for a walk without access
+/// checks, as KVM's (`kvm_mmu_gva_to_gpa_system`, access 0). Valid only for
+/// `WHvTranslateGvaResultSuccess` (0); every other result (page not present,
+/// privilege violation, invalid page table flags, a GPA that is not mapped
+/// or not readable, an overlay, an intercept) is no translation, with
+/// `INVALID_GPA`, as KVM's walk that fails. `writeable` is 1 and `usermode`
+/// 0 whatever the walk found, as KVM sets them.
+pub(crate) fn translation(gva: u64, walk: Option<(i32, u64)>) -> kvm_translation {
+    let gpa = match walk {
+        None => Some(gva),
+        Some((0, gpa)) => Some(gpa),
+        Some(_) => None,
+    };
     kvm_translation {
         linear_address: gva,
-        physical_address: if valid { gpa } else { 0 },
-        valid: u8::from(valid),
-        writeable: u8::from(valid && writeable),
+        physical_address: gpa.unwrap_or(INVALID_GPA),
+        valid: u8::from(gpa.is_some()),
+        writeable: 1,
         usermode: 0,
         pad: [0; 5],
     }
@@ -289,13 +307,27 @@ mod tests {
 
     #[test]
     fn test_translation_result_codes() {
-        let t = translation(0xffff_ffff_8100_0123, 0, 0x100_0123, true);
-        assert_eq!((t.linear_address, t.physical_address, t.valid, t.writeable), (0xffff_ffff_8100_0123, 0x100_0123, 1, 1));
-        assert_eq!(translation(0x10, 0, 0x10, false).writeable, 0);
-        // PageNotPresent .. Intercept: no translation.
+        let t = translation(0xffff_ffff_8100_0123, Some((0, 0x100_0123)));
+        assert_eq!(
+            (t.linear_address, t.physical_address, t.valid, t.writeable, t.usermode),
+            (0xffff_ffff_8100_0123, 0x100_0123, 1, 1, 0)
+        );
+        // PageNotPresent .. Intercept: no translation, KVM's INVALID_GPA;
+        // the call itself succeeds and writeable is still 1, as KVM's.
         for code in 1..=8 {
-            let t = translation(0x10, code, 0x99, true);
-            assert_eq!((t.valid, t.physical_address, t.writeable), (0, 0, 0), "result code {code}");
+            let t = translation(0x10, Some((code, 0x99)));
+            assert_eq!((t.valid, t.physical_address, t.writeable), (0, INVALID_GPA, 1), "result code {code}");
+        }
+    }
+
+    // Paging off (the PVH entry): KVM's nonpaging walk gives the address
+    // itself, valid, also one no guest memory backs (gdb reads a kernel
+    // symbol there; the read of guest memory then fails, not the translation).
+    #[test]
+    fn test_translation_without_paging_is_the_address() {
+        for gva in [0x100_0000u64, 0xffff_ffff_82ed_2098] {
+            let t = translation(gva, None);
+            assert_eq!((t.physical_address, t.valid, t.writeable, t.usermode), (gva, 1, 1, 0));
         }
     }
 }

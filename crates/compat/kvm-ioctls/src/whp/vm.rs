@@ -967,6 +967,107 @@ mod tests {
         }
     }
 
+    // KVM_TRANSLATE on WHP (the PC; `cargo test -- --ignored`), with a vCPU
+    // as gdb meets it: at the PVH entry (protected mode, paging off) and at
+    // `start_kernel` (long mode, 4-level paging, the kernel's half, a 2 MiB
+    // supervisor page). Paging off is KVM's identity, valid even where no
+    // memory is; paging on is one walk without checks. Prints what each
+    // WHvTranslateGva flag set returns in both modes, the measurement that
+    // chooses the walk's flags (`translate_gva`).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored"]
+    fn test_translate_as_kvm_at_the_entry_and_in_long_mode() {
+        use super::super::debug::INVALID_GPA;
+        let _one = GUEST_MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let vm = VmFd::create().unwrap();
+        let len = 4usize << 20;
+        // SAFETY: anonymous memory for the test, unmapped below.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let mem = p.cast::<u64>();
+        // PML4 at 0x1000, PDPT at 0x2000, PD at 0x3000: 0xffffffff80000000
+        // (PML4 511, PDPT 510, PD 0) is the 2 MiB page at 0x200000.
+        // SAFETY: within the mapping, 8-byte aligned.
+        unsafe {
+            *mem.add(0x1000 / 8 + 511) = 0x2000 | 3;
+            *mem.add(0x2000 / 8 + 510) = 0x3000 | 3;
+            *mem.add(0x3000 / 8) = 0x20_0000 | 0x83;
+        }
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: len as u64,
+            userspace_addr: p as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let (mapped, unmapped) = (0xffff_ffff_8000_1234_u64, 0xffff_ffff_82ed_2098_u64);
+        let flag_sets: [(&str, whv::WHV_TRANSLATE_GVA_FLAGS); 8] = [
+            ("none", whv::WHvTranslateGvaFlagNone),
+            ("read", whv::WHvTranslateGvaFlagValidateRead),
+            ("write", whv::WHvTranslateGvaFlagValidateWrite),
+            ("execute", whv::WHvTranslateGvaFlagValidateExecute),
+            ("exempt", whv::WHvTranslateGvaFlagPrivilegeExempt),
+            ("read+exempt", whv::WHvTranslateGvaFlagValidateRead | whv::WHvTranslateGvaFlagPrivilegeExempt),
+            ("write+exempt", whv::WHvTranslateGvaFlagValidateWrite | whv::WHvTranslateGvaFlagPrivilegeExempt),
+            ("read+write", whv::WHvTranslateGvaFlagValidateRead | whv::WHvTranslateGvaFlagValidateWrite),
+        ];
+        let report = |mode: &str| {
+            for gva in [0x10_0000, mapped, unmapped] {
+                for (name, flags) in flag_sets {
+                    match vcpu.translate_walk(gva, flags) {
+                        Ok((code, gpa)) => eprintln!("{mode} {gva:#x} {name}: S_OK, result {code}, gpa {gpa:#x}"),
+                        Err(e) => eprintln!("{mode} {gva:#x} {name}: failed, errno {}", e.errno()),
+                    }
+                }
+            }
+        };
+
+        // The PVH entry: protected mode, paging off.
+        let mut s = vcpu.get_sregs().unwrap();
+        s.cr0 = 0x11; // PE, ET
+        s.cr4 = 0;
+        s.efer = 0;
+        s.cs.l = 0;
+        s.cs.db = 1;
+        vcpu.set_sregs(&s).unwrap();
+        report("entry");
+        for gva in [0x10_0000, unmapped] {
+            let t = vcpu.translate_gva(gva).unwrap();
+            assert_eq!((t.physical_address, t.valid, t.writeable), (gva, 1, 1), "paging off: {gva:#x}");
+        }
+
+        // start_kernel: long mode, 4-level paging.
+        s.cr0 = 0x8000_0011; // PG, ET, PE
+        s.cr3 = 0x1000;
+        s.cr4 = 0x20; // PAE
+        s.efer = 0x500; // LME, LMA
+        s.cs.l = 1;
+        s.cs.db = 0;
+        vcpu.set_sregs(&s).unwrap();
+        report("long");
+        let t = vcpu.translate_gva(mapped).unwrap();
+        assert_eq!((t.physical_address, t.valid, t.writeable), (0x20_1234, 1, 1), "the kernel's page");
+        let t = vcpu.translate_gva(unmapped).unwrap();
+        assert_eq!((t.physical_address, t.valid, t.writeable), (INVALID_GPA, 0, 1), "no page: invalid, as KVM");
+
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { libc::munmap(p, len) }, 0);
+    }
+
     #[test]
     fn test_clock_realtime_advances_by_the_wall_time_since() {
         // SAFETY: an all-zero kvm_clock_data is valid.
