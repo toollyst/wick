@@ -594,11 +594,27 @@ fn alloc_bitmap(pages: u64, on: bool) -> *mut AtomicU64 {
     Box::into_raw(v.into_boxed_slice()).cast()
 }
 
+/// Whether any of `[start, end)` is the alias of a registered range. A fill
+/// writes through the alias holding [`LOCK`]: were the alias registered
+/// itself, the fill would fault on its missing pages and wait for a fill
+/// of them, which needs [`LOCK`], forever. Linux fills page tables and has
+/// no alias; this is memory a userfaultfd cannot take, refused with
+/// `EINVAL` as Linux refuses such a vma (`vma_can_userfault`), not `EBUSY`,
+/// which says another userfaultfd has the memory until it unregisters it.
+fn overlaps_an_alias(start: u64, end: u64) -> bool {
+    RANGES.iter().any(|r| {
+        let s = r.start.load(Ordering::Acquire);
+        let alias = r.alias.load(Ordering::Acquire);
+        s != 0 && alias != 0 && start < alias + (r.end.load(Ordering::Acquire) - s) && alias < end
+    })
+}
+
 /// Registers `[start, start + len)` (page aligned) with userfaultfd `ctx`.
 /// Pages that are not resident are missing from now on. The range must be
 /// mapped (`ENOMEM`) and readable and writable (`EPERM`; Linux also takes
-/// anonymous memory with other protections, which fills here would change).
-/// A `MAP_HUGETLB` mapping ([`note_mapping`]) is registered in huge pages:
+/// anonymous memory with other protections, which fills here would change),
+/// and no part of it the alias of a registered range (`EINVAL`,
+/// [`overlaps_an_alias`]). A `MAP_HUGETLB` mapping ([`note_mapping`]) is registered in huge pages:
 /// the range must be aligned to them (`EINVAL`, as Linux's hugetlb
 /// registration), a huge page is missing when any host page of it is, and
 /// faults and fills work on whole huge pages.
@@ -615,6 +631,9 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         return Err(errno_err(libc::EINVAL));
     }
     let _guard = LOCK.lock().unwrap();
+    if overlaps_an_alias(start, end) {
+        return Err(errno_err(libc::EINVAL));
+    }
     if RANGES.iter().any(|r| {
         let s = r.start.load(Ordering::Acquire);
         s != 0 && start < r.end.load(Ordering::Acquire) && s < end
@@ -1599,6 +1618,29 @@ mod tests {
         -(e as i64)
     }
 
+    /// Runs test `name` again in a process of its own (this binary, that
+    /// test only) and checks that it passed there; true in that process,
+    /// which goes on with the test.
+    fn in_own_process(name: &str) -> bool {
+        const CHILD: &str = "WICK_UFFD_TEST_ALONE";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let text = std::format!(
+            "{:?}\n{}{}",
+            out.status,
+            std::string::String::from_utf8_lossy(&out.stdout),
+            std::string::String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+        false
+    }
+
     fn close(fds: &[c_int]) {
         for &fd in fds {
             // SAFETY: descriptors of the test.
@@ -1661,20 +1703,7 @@ mod tests {
     /// so the hole is made only once that thread has answered a request.
     #[test]
     fn test_register_refuses_a_range_with_a_hole() {
-        const NAME: &str = "wick_uffd::tests::test_register_refuses_a_range_with_a_hole";
-        const CHILD: &str = "WICK_UFFD_TEST_ALONE";
-        if std::env::var_os(CHILD).is_none() {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            let text = std::format!(
-                "{}{}",
-                std::string::String::from_utf8_lossy(&out.stdout),
-                std::string::String::from_utf8_lossy(&out.stderr)
-            );
-            assert!(out.status.success() && text.contains("1 passed"), "{text}");
+        if !in_own_process("wick_uffd::tests::test_register_refuses_a_range_with_a_hole") {
             return;
         }
         let (ctx, user) = create(0, false, true).unwrap();
@@ -1710,6 +1739,44 @@ mod tests {
         register(ctx, mem, ps).unwrap();
         assert_eq!(zeropage(ctx, mem, ps, true), Ok(ps));
         close(&[user]);
+    }
+
+    /// A range over the alias of a registered range is refused (`EINVAL`):
+    /// its missing pages would be the alias's, and a fill of the first
+    /// range, which writes through the alias holding [`LOCK`], would fault
+    /// on them and wait for a fill of the second, which needs [`LOCK`]:
+    /// forever. In a process of its own, under an alarm, so that the hang
+    /// ends the process and fails the test: a fill of two pages takes
+    /// microseconds, and 10 s is far beyond any wait for the CPU.
+    #[test]
+    fn test_register_refuses_another_ranges_alias() {
+        if !in_own_process("wick_uffd::tests::test_register_refuses_another_ranges_alias") {
+            return;
+        }
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(2);
+        let chan = channel(user);
+        register(ctx, mem, 2 * ps).unwrap();
+        let alias = find(mem).unwrap().0.alias.load(Ordering::Acquire);
+        let whole = register(ctx, alias, 2 * ps);
+        let part = register(ctx, alias + ps, ps);
+        // Through a handler's channel too, over the alias and memory before it.
+        let other = map(1);
+        let (around, _) = request(chan, [proto::OP_REGISTER, alias - ps, 2 * ps, 0], &[]);
+        // SAFETY: plain alarm; its default action ends the process.
+        unsafe { libc::alarm(10) };
+        assert_eq!(zeropage(ctx, mem, 2 * ps, true), Ok(2 * ps));
+        // SAFETY: as above.
+        unsafe { libc::alarm(0) };
+        assert_eq!(whole.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(part.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(around, err(libc::EINVAL));
+        assert!(!is_missing(alias) && !is_missing(alias - ps));
+        // Other memory is taken.
+        let (r, _) = request(chan, [proto::OP_REGISTER, other, ps, 0], &[]);
+        assert_eq!(r, 0);
+        close(&[chan, user]);
     }
 
     #[test]
