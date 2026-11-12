@@ -248,10 +248,18 @@ pub fn sync_vector_offset(cpsr: u64) -> u64 {
     }
 }
 
+/// `ARM_SMCCC_HV_PV_TIME_FEATURES` (Arm DEN0057A; Linux's
+/// include/linux/arm-smccc.h): fast call, SMC64, standard hypervisor
+/// services, function 0x20.
+pub const PV_TIME_FEATURES: u32 = 0xc500_0020;
+/// `ARM_SMCCC_HV_PV_TIME_ST`: function 0x21.
+pub const PV_TIME_ST: u32 = 0xc500_0021;
+
 /// A call through the SMCCC conduit (HVC or SMC), from the function id in
 /// W0 (SMC32 and SMC64 ids): the PSCI 1.0 calls, SMCCC 1.1's own and KVM's
 /// vendor hypervisor services, what KVM answers for a guest on Linux
-/// (arch/arm64/kvm/psci.c, hypercalls.c). Without SMCCC 1.1 a Linux guest
+/// (arch/arm64/kvm/psci.c, hypercalls.c), and PV time's (`super::pvtime`).
+/// Without SMCCC 1.1 a Linux guest
 /// finds no hypervisor services: no `ptp_kvm` clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Psci {
@@ -283,6 +291,10 @@ pub enum Psci {
     KvmFeatures,
     /// KVM_PTP: X1 the counter, virtual (0) or physical (1).
     KvmPtp,
+    /// PV_TIME_FEATURES (Arm DEN0057A, SMC64 only): X1 a PV time call.
+    PvTimeFeatures,
+    /// PV_TIME_ST: the IPA of the vCPU's stolen-time structure.
+    PvTimeSt,
     /// Any other id: NOT_SUPPORTED.
     NotSupported,
 }
@@ -313,6 +325,8 @@ impl Psci {
             0x8600_ff01 => Psci::VendorHypUid,
             0x8600_0000 => Psci::KvmFeatures,
             0x8600_0001 => Psci::KvmPtp,
+            PV_TIME_FEATURES => Psci::PvTimeFeatures,
+            PV_TIME_ST => Psci::PvTimeSt,
             _ => Psci::NotSupported,
         }
     }
@@ -421,6 +435,10 @@ mod tests {
         assert_eq!(Psci::decode(0x8000_0000), Psci::SmcccVersion);
         assert_eq!(Psci::decode(0x8600_ff01), Psci::VendorHypUid);
         assert_eq!(Psci::decode(0x8600_0001), Psci::KvmPtp);
+        assert_eq!(Psci::decode(0xc500_0020), Psci::PvTimeFeatures);
+        assert_eq!(Psci::decode(0xc500_0021), Psci::PvTimeSt);
+        // PV time has no SMC32 calls.
+        assert_eq!(Psci::decode(0x8500_0021), Psci::NotSupported);
     }
 
     #[test]
@@ -431,7 +449,7 @@ mod tests {
         }
         // MIGRATE, SYSTEM_SUSPEND, SYSTEM_RESET2, the workarounds, KVM's
         // services (they are not PSCI), garbage in the upper half.
-        for id in [0x8400_0005, 0xc400_000e, 0x8400_0012, 0x8000_8000, 0x8600_0001, 1 << 32 | 0x8400_0000] {
+        for id in [0x8400_0005, 0xc400_000e, 0x8400_0012, 0x8000_8000, 0x8600_0001, 0xc500_0020, 1 << 32 | 0x8400_0000] {
             assert!(!Psci::implemented(id), "{id:#x}");
         }
         assert_eq!(ptp_words(0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321), [

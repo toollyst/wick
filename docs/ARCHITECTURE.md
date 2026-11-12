@@ -129,6 +129,14 @@ firecracker binary, vmm   (upstream source + patches/)
 | Interrupt controller | KVM vGIC / LAPIC | `hv_gic_*` GICv3 (GICv2m MSI frame instead of an ITS) | WHP LAPIC + user-space IOAPIC, 8259 PIC, 8254 PIT |
 | Process hardening | seccomp-BPF, jailer | Seatbelt, upstream's jailer on macOS backends (`overlay/jailer/platform`) | a process mitigation profile, upstream's jailer on Windows backends: a jail drive, a restricted token, a Job Object |
 
+PV steal time on macOS 27 (`crates/compat/kvm-ioctls/src/hvf/pvtime.rs`): KVM adds a vCPU thread's run delay to the
+guest's stolen-time structure at the next entry after the scheduler runs the thread again. Hypervisor.framework
+does not leave `hv_vcpu_run` when the host deschedules the thread, so the backend counts a vCPU's steal as the
+time inside `run()` the thread was neither on a CPU nor waiting for an interrupt, and writes it at each entry; a
+thread of each microVM reads its running vCPU threads' state every 2 ms (`thread_info`) and makes one kept off
+its CPU for 1 ms leave the guest (`hv_vcpus_exit`), which the run loop enters again with the steal written. It
+sleeps while no vCPU is in the guest and ends with the microVM. Cost and lateness: docs/COMPATIBILITY.md, PV time.
+
 ## The POSIX layer on Windows
 
 Upstream and the external crates (`vmm-sys-util`, `event-manager`,

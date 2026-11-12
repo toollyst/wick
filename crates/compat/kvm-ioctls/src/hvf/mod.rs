@@ -30,6 +30,14 @@ mod ffi;
 mod gic;
 mod idregs;
 pub mod latency;
+mod pvtime;
+
+/// wick: whether PV steal time is offered on this macOS (macOS 27:
+/// `hv_vcpu_get_wait_for_interrupt_time`): the host sandbox then lets a
+/// running microVM read its own threads' CPU time (vmm::ext::sandbox).
+pub fn pv_time_offered() -> bool {
+    pvtime::supported()
+}
 mod regs;
 mod vcpu;
 mod vm;

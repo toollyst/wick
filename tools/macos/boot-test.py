@@ -14,6 +14,7 @@ import hashlib
 import http.client
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -1775,6 +1776,143 @@ def stage_tools(ctx):
             "load; rebase-snap equals snapshot-editor rebase and restores")
 
 
+# PV steal time (Arm DEN0057A), offered where Hypervisor.framework gives a
+# vCPU's WFI time apart (hv_vcpu_get_wait_for_interrupt_time, macOS 27), as
+# KVM offers it where it can account steal (pvtime.c
+# kvm_arm_pvtime_supported). The guest's steal (/proc/stat, USER_HZ ticks)
+# on its 2 vCPUs, each case PVTIME_CASE_S long: idle, then spinning, on the
+# host as it is; spinning, then idle, while the host runs 2 spinning
+# processes per CPU. Beside each: what the host's own scheduler took from a
+# spinning process of its own over the same time (the control: what a
+# vCPU thread loses to the host's other work, KVM's run delay), and the PV
+# time kicker's exits and CPU time (its debug line, every 10 s). Then, the
+# guest spinning under the host's spinners: a pause and resume loop, and a
+# restore in a new process (upstream's performance test_pvtime_snapshot).
+PVTIME_CASE_S = 12
+
+
+def _off_cpu_ms(seconds):
+    """A spinning process's wall time less its CPU time, in ms: what the
+    host's scheduler kept from it (the control)."""
+    code = ("import time\n"
+            "w, c = time.monotonic(), time.thread_time()\n"
+            f"while time.monotonic() - w < {seconds}: pass\n"
+            "print(int(((time.monotonic() - w) - (time.thread_time() - c)) * 1000))\n")
+    return subprocess.Popen([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, text=True)
+
+
+def stage_pvtime(ctx):
+    major = int(platform.mac_ver()[0].split(".")[0])
+    vm = ctx.vm("pvtime", ["--level", "Debug"], config(ctx, vcpus=2))
+    vm.shell()
+    _, found = vm.sh("dmesg | grep -c 'stolen time PV' || true")
+    if major < 27:
+        check(found == "0", f"macOS {major}: the guest found PV time: {found!r}")
+        vm.reboot()
+        return f"macOS {major}: PV time not offered (no WFI figure before macOS 27), the guest uses none"
+    check(found == "1", f"dmesg 'stolen time PV': {found!r}")
+    _, hz = vm.sh("getconf CLK_TCK")
+
+    def steal_ms():
+        _, out = vm.sh("awk '/^cpu /{print $9}' /proc/stat")
+        return int(out.strip().splitlines()[-1]) * 1000 // int(hz)
+
+    kick_rx = re.compile(r"pvtime: (\d+) vCPU exits for steal time in ([\d.]+) s; "
+                         r"the kicker's own CPU time ([\d.]+) ms")
+
+    def case():
+        start = len(vm.buf)
+        control = _off_cpu_ms(PVTIME_CASE_S)
+        s0 = steal_ms()
+        time.sleep(PVTIME_CASE_S)
+        stolen = steal_ms() - s0
+        off = int(control.communicate()[0])
+        lines = kick_rx.findall(vm.buf[start:])
+        secs = sum(float(s) for _, s, _ in lines) or 1.0
+        kicks = sum(int(k) for k, _, _ in lines) / secs
+        cpu = sum(float(c) for _, _, c in lines) / secs
+        return stolen, off, kicks, cpu
+
+    def spin_guest():
+        # Both vCPUs spinning; their pids kept in the shell, which keeps no
+        # jobs from one command line to the next (and the root is read-only).
+        vm.sh("SPIN=; for c in 0 1; do taskset -c $c sh -c 'while :; do :; done' & SPIN=\"$SPIN $!\"; done")
+
+    results = {}
+    results["idle guest"] = case()
+    spin_guest()
+    results["busy guest"] = case()
+    hogs = [subprocess.Popen(["/usr/bin/yes"], stdout=subprocess.DEVNULL) for _ in range(2 * os.cpu_count())]
+    try:
+        results["busy guest, host spinners"] = case()
+        vm.sh("kill $SPIN")
+        results["idle guest, host spinners"] = case()
+        spin_guest()
+        # A pause and resume loop: no vCPU is in run() while paused, and
+        # the steal goes on after it.
+        s0 = steal_ms()
+        for _ in range(20):
+            vm.api("PATCH", "/vm", {"state": "Paused"})
+            time.sleep(0.05)
+            vm.api("PATCH", "/vm", {"state": "Resumed"})
+            time.sleep(0.05)
+        time.sleep(2)
+        paused = steal_ms() - s0
+        # Upstream's performance/test_pvtime_snapshot, with the host's
+        # spinners for its two vCPUs pinned to one CPU (no CPU affinity on
+        # macOS: row 8): the steal is kept by a restore in a new process
+        # and goes on after it. The second between the reading and the pause
+        # stands for upstream's ssh round trips there: steal is in USER_HZ
+        # ticks (10 ms), and a pause right after the reading may come
+        # before the next one.
+        before = steal_ms()
+        time.sleep(1)
+        state, mem = (os.path.join(ctx.out, f"pvtime.{n}") for n in ("state", "mem"))
+        vm.api("PATCH", "/vm", {"state": "Paused"})
+        vm.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": state, "mem_file_path": mem})
+        vm.kill()
+        vm = ctx.vm("pvtime2", ["--level", "Debug"])
+        vm.api("PUT", "/snapshot/load", {"snapshot_path": state,
+                                         "mem_backend": {"backend_type": "File", "backend_path": mem},
+                                         "resume_vm": True})
+        after_snap = steal_ms()
+        time.sleep(2)
+        after_resume = steal_ms()
+        os.unlink(state)
+        os.unlink(mem)
+    finally:
+        for h in hogs:
+            h.kill()
+            h.wait()
+    detail = "; ".join(
+        f"{name}: steal {stolen} ms over {2 * PVTIME_CASE_S} s of vCPU time (control: a host spinner lost "
+        f"{off} ms of {PVTIME_CASE_S} s), {kicks:.1f} kicks/s, kicker {cpu:.2f} ms CPU/s"
+        for name, (stolen, off, kicks, cpu) in results.items()) + (
+        f"; busy guest, host spinners: steal {paused} ms over 20 pauses and 2 s; "
+        f"restore in a new process: {before} -> {after_snap} ms, {after_resume} ms 2 s later")
+    check(paused > 0, f"no steal over 20 pauses and 2 s after: {detail}")
+    check(before < after_snap < before + 10000, f"steal across the restore: {detail}")
+    check(after_resume > after_snap, f"no steal after the restore: {detail}")
+    busy, busy_hogs, idle_hogs = (results[k][0] for k in
+                                  ("busy guest", "busy guest, host spinners", "idle guest, host spinners"))
+    check(busy_hogs > 2000 * PVTIME_CASE_S // 5, f"too little steal under contention: {detail}")
+    # The guest's steal on the host as it is follows what the host took from
+    # its own spinner (both vCPUs: up to twice the control), plus 1 ms per
+    # second per vCPU of granularity.
+    control = results["busy guest"][1]
+    check(busy <= 2 * control + 2 * PVTIME_CASE_S + 200, f"steal beyond the host's own load: {detail}")
+    # An idle guest waits in WFI, where the kicker leaves it
+    # (test_the_kicker_leaves_a_waiting_vcpu_alone). It wakes for its timer
+    # ticks, and a wake-up the host's spinners hold off its CPU for 1 ms is
+    # kicked (measured: about 100 kicks/s), but Hypervisor.framework counts
+    # that time as the wait's, so the guest is given no steal for it, where
+    # KVM counts the woken thread's run delay (docs/COMPATIBILITY.md, PV time).
+    check(idle_hogs < 200, f"steal counted while the guest idled: {detail}")
+    check(results["idle guest"][2] < 5, f"kicks while the guest idled: {detail}")
+    vm.reboot()
+    return detail
+
+
 STAGES = {
     "boot": stage_boot,
     "smp": stage_smp,
@@ -1797,6 +1935,7 @@ STAGES = {
     "no-seccomp": stage_no_seccomp,
     "memory-hotplug": stage_memory_hotplug,
     "cpu-templates": stage_cpu_templates,
+    "pvtime": stage_pvtime,
 }
 
 

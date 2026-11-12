@@ -175,6 +175,9 @@ fn step(s: &Step, debug: &mut DebugRegs, reference: &mut Reference) {
                 0x8600_ff01 => Psci::VendorHypUid,
                 0x8600_0000 => Psci::KvmFeatures,
                 0x8600_0001 => Psci::KvmPtp,
+                // PV time (Arm DEN0057A): SMC64 only.
+                0xc500_0020 => Psci::PvTimeFeatures,
+                0xc500_0021 => Psci::PvTimeSt,
                 _ => Psci::NotSupported,
             };
             assert_eq!(Psci::decode(s.x0), want, "x0 {:#x}", s.x0);

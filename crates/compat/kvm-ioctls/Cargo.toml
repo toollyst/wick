@@ -29,6 +29,8 @@ upstream = { package = "kvm-ioctls", git = "https://github.com/rust-vmm/kvm", ta
 [target.'cfg(target_os = "macos")'.dependencies]
 kvm-bindings = { version = "0.14.0", features = ["fam-wrappers"] }
 libc = "0.2.186"
+# The PV time kicker's debug line (src/hvf/pvtime.rs).
+log = "0.4.33"
 vmm-sys-util = "0.15.0"
 
 [target.'cfg(windows)'.dependencies]

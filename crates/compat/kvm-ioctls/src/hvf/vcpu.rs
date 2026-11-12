@@ -23,6 +23,7 @@ use super::exit::{self, DebugRegs, Exit, Mmio, Psci, SysregAccess, SysregResult}
 use super::ffi::*;
 use super::gic::{CpuReg, GicCpu};
 use super::idregs;
+use super::pvtime;
 use super::regs::{self, Reg, reg_size};
 use super::vm::VmInner;
 use super::wait::{Ended, Waiter};
@@ -66,6 +67,23 @@ fn timebase() -> mach_timebase_info_data_t {
         }
         tb
     })
+}
+
+fn ticks_to_ns(ticks: u64) -> u64 {
+    let tb = timebase();
+    (u128::from(ticks) * u128::from(tb.numer) / u128::from(tb.denom)).min(u64::MAX as u128) as u64
+}
+
+/// `ticks_to_ns`, for the PV time tests.
+#[cfg(test)]
+pub(crate) fn tests_ticks_to_ns(ticks: u64) -> u64 {
+    ticks_to_ns(ticks)
+}
+
+/// `mach_absolute_time` in nanoseconds.
+pub(crate) fn wall_ns() -> u64 {
+    // SAFETY: plain call.
+    ticks_to_ns(unsafe { mach_absolute_time() })
 }
 
 fn ticks_to_duration(ticks: u64) -> Duration {
@@ -174,6 +192,16 @@ pub(crate) struct VcpuShared {
     /// The registers of the vCPU while it is stopped, for its other handles
     /// (`debug::Stopped`).
     stopped: Mutex<Option<Stopped>>,
+    // PV time (`super::pvtime`).
+    /// The IPA of the vCPU's stolen-time structure (`KVM_ARM_VCPU_PVTIME_IPA`,
+    /// set once, from any handle; `pvtime::NO_IPA`: none) and the owner's
+    /// steal accounting. Only creating the vCPU clears the IPA, not
+    /// `KVM_ARM_VCPU_INIT`, as KVM (arm.c kvm_arch_vcpu_create ->
+    /// kvm_arm_pvtime_vcpu_init).
+    pvtime: Arc<Mutex<pvtime::Steal>>,
+    /// Whether the IPA is set: `run()` reads it alone, so a vCPU without PV
+    /// time takes no lock and reads no clock for it.
+    pvtime_on: AtomicBool,
 }
 
 impl VcpuShared {
@@ -199,6 +227,8 @@ impl VcpuShared {
             gic: Mutex::new(GicCpu::default()),
             debug: Mutex::new(GuestDebug::default()),
             stopped: Mutex::new(None),
+            pvtime: Arc::new(Mutex::new(pvtime::Steal::default())),
+            pvtime_on: AtomicBool::new(false),
         });
         ALL_VCPUS.lock().unwrap().push(Arc::downgrade(&shared));
         Ok((file, shared))
@@ -1054,16 +1084,32 @@ impl VcpuFd {
         Ok(())
     }
 
-    /// vCPU device attributes (PMU, timers, PV time) are not supported (`ENXIO`).
-    pub fn has_device_attr(&self, _device_attr: &kvm_device_attr) -> Result<()> {
+    /// vCPU device attributes: PV time's IPA (`super::pvtime`); the PMU's and
+    /// the timers' are not supported (`ENXIO`).
+    pub fn has_device_attr(&self, device_attr: &kvm_device_attr) -> Result<()> {
         self.fd.check()?;
-        err(libc::ENXIO)
+        pvtime::has_attr(device_attr)
     }
 
-    /// vCPU device attributes (PMU, timers, PV time) are not supported (`ENXIO`).
-    pub fn set_device_attr(&self, _device_attr: &kvm_device_attr) -> Result<()> {
+    /// Sets PV time's IPA, once (kvm_arm_pvtime_set_attr): a 64-byte aligned
+    /// address in guest RAM. Other attributes are not supported (`ENXIO`).
+    pub fn set_device_attr(&self, device_attr: &kvm_device_attr) -> Result<()> {
         self.fd.check()?;
-        err(libc::ENXIO)
+        let ipa = pvtime::requested_ipa(device_attr)?;
+        let mut steal = self.shared.pvtime.lock().unwrap();
+        if steal.ipa != pvtime::NO_IPA {
+            return err(libc::EEXIST);
+        }
+        if self.vm.ram_host_addr(ipa).is_none() {
+            return err(libc::EINVAL);
+        }
+        steal.ipa = ipa;
+        drop(steal);
+        if let Some(kicker) = self.vm.pvtime_kicker.get() {
+            kicker.register(&self.shared.pvtime);
+        }
+        self.shared.pvtime_on.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Returns the `kvm_run` structure. Only `immediate_exit` is meaningful.
@@ -1156,7 +1202,12 @@ impl VcpuFd {
             if self.shared.immediate_exit().load(Ordering::Acquire) != 0 {
                 return Ok(false);
             }
+            let since = wall_ns();
             power = self.shared.cv.wait(power).unwrap();
+            // Powered off: the guest's own wait (PSCI CPU_OFF), not steal.
+            if self.shared.pvtime_on.load(Ordering::Acquire) {
+                self.shared.pvtime.lock().unwrap().waited(wall_ns() - since);
+            }
         }
     }
 
@@ -1278,9 +1329,14 @@ impl VcpuFd {
     }
 
     /// Called with how long `WFI` (or PSCI `CPU_SUSPEND`) waited of the
-    /// guest's own accord, which steal time leaves out. Nothing uses it yet,
-    /// and with the framework's GIC it is not called ([`Self::wait_for_interrupt`]).
-    fn waited_for_interrupt(&self, _waited: Duration) {}
+    /// guest's own accord, which steal time leaves out (`pvtime::Steal`).
+    /// With the framework's GIC it is not called ([`Self::wait_for_interrupt`]):
+    /// the framework's own WFI time is read instead.
+    fn waited_for_interrupt(&self, waited: Duration) {
+        if self.shared.pvtime_on.load(Ordering::Acquire) {
+            self.shared.pvtime.lock().unwrap().waited(waited.as_nanos() as u64);
+        }
+    }
 
     /// Handles a call through the SMCCC conduit (PSCI, SMCCC, KVM's vendor
     /// services). Returns a system event to report, if any.
@@ -1290,13 +1346,24 @@ impl VcpuFd {
         let psci_1_0 = self.vm()?.psci_version.load(Ordering::Relaxed) == regs::PSCI_VERSION_1_0;
         let words = match call {
             Psci::SmcccVersion => Some([exit::SMCCC_VERSION_1_1, 0, 0, 0]),
-            // No SMCCC_ARCH_WORKAROUND_* (nor TRNG, PV time) is implemented:
-            // the guest relies on what its CPU features say, as on a host
-            // whose firmware has none.
-            Psci::SmcccArchFeatures => Some([PSCI_RET_NOT_SUPPORTED as u64, 0, 0, 0]),
+            // PV time's calls; no SMCCC_ARCH_WORKAROUND_* (nor TRNG) is
+            // implemented: the guest relies on what its CPU features say, as
+            // on a host whose firmware has none.
+            Psci::SmcccArchFeatures => Some([
+                pvtime::arch_feature(x1 as u32).unwrap_or(PSCI_RET_NOT_SUPPORTED as u64),
+                0,
+                0,
+                0,
+            ]),
             Psci::VendorHypUid => Some(exit::KVM_UID),
             Psci::KvmFeatures => Some([exit::KVM_FEATURES, 0, 0, 0]),
             Psci::KvmPtp => Some(self.kvm_ptp(hv, x1)?),
+            Psci::PvTimeFeatures => {
+                let ipa = self.shared.pvtime.lock().unwrap().ipa;
+                let ret = if pvtime::features(x1 as u32, ipa) { PSCI_RET_SUCCESS } else { PSCI_RET_NOT_SUPPORTED };
+                Some([ret as u64, 0, 0, 0])
+            }
+            Psci::PvTimeSt => Some([self.pv_time_st(hv), 0, 0, 0]),
             _ => None,
         };
         if let Some(words) = words {
@@ -1348,10 +1415,59 @@ impl VcpuFd {
             | Psci::SmcccArchFeatures
             | Psci::VendorHypUid
             | Psci::KvmFeatures
-            | Psci::KvmPtp => unreachable!("answered above"),
+            | Psci::KvmPtp
+            | Psci::PvTimeFeatures
+            | Psci::PvTimeSt => unreachable!("answered above"),
         };
         self.set_reg(hv, HV_REG_X0, ret as u64)?;
         Ok(None)
+    }
+
+    /// PV_TIME_ST (kvm_init_stolen_time): the IPA of the vCPU's stolen-time
+    /// structure, zeroed (revision 0, attributes 0, no time stolen yet), or
+    /// NOT_SUPPORTED when the vCPU has none. KVM's X0 is the IPA even if
+    /// the write fails (a read-only slot): the guest then reads what is there.
+    /// Steal is counted from this call on, as KVM counts it from the
+    /// thread's run_delay at the call.
+    fn pv_time_st(&self, hv: hv_vcpu_t) -> u64 {
+        let mut steal = self.shared.pvtime.lock().unwrap();
+        let ipa = steal.ipa;
+        if ipa == pvtime::NO_IPA {
+            return PSCI_RET_NOT_SUPPORTED as u64;
+        }
+        steal.start(wall_ns(), ticks_to_ns(pvtime::wfi_ticks(hv)));
+        drop(steal);
+        // SAFETY: STRUCT_SIZE bytes at the host address write_guest gives.
+        self.vm.write_guest(ipa, pvtime::STRUCT_SIZE, |p| unsafe { std::ptr::write_bytes(p, 0, pvtime::STRUCT_SIZE) });
+        ipa
+    }
+
+    /// Brings the guest's stolen time up to date, at most every
+    /// millisecond (`pvtime::Steal`). Called by the owner, outside
+    /// `hv_vcpu_run`, where the framework's WFI time can be read.
+    fn pvtime_update(&self, hv: hv_vcpu_t) {
+        if !self.shared.pvtime_on.load(Ordering::Acquire) {
+            return;
+        }
+        let now = wall_ns();
+        let mut steal = self.shared.pvtime.lock().unwrap();
+        if !steal.due(now) {
+            return;
+        }
+        let add = steal.update(now, ticks_to_ns(pvtime::wfi_ticks(hv)));
+        let ipa = steal.ipa;
+        drop(steal);
+        if add > 0 {
+            // `stolen_time`, le64 at offset 8 (8-byte aligned: the IPA is
+            // 64-byte aligned, and so is its host address), read and written
+            // with one access each, as kvm_get_guest/kvm_put_guest.
+            self.vm.write_guest(ipa + 8, 8, |p| {
+                // SAFETY: an aligned u64 in guest RAM, mapped while this runs.
+                let word = unsafe { AtomicU64::from_ptr(p.cast::<u64>()) };
+                let v = u64::from_le(word.load(Ordering::Relaxed)).wrapping_add(add);
+                word.store(v.to_le(), Ordering::Relaxed);
+            });
+        }
     }
 
     /// KVM_PTP (kvm_ptp_get_time): the wall clock and the guest's virtual
@@ -1452,6 +1568,33 @@ impl VcpuFd {
 
     /// Runs the vCPU until an exit Firecracker must handle (`KVM_RUN`).
     pub fn run(&mut self) -> Result<VcpuExit<'_>> {
+        // PV time accounts the thread while it is in here (`pvtime::Steal`).
+        if !self.shared.pvtime_on.load(Ordering::Acquire) {
+            return self.run_loop();
+        }
+        self.fd.check()?;
+        let hv = self.ensure_created()?;
+        let shared = Arc::clone(&self.shared);
+        let kicker = self.vm.pvtime_kicker.get().cloned();
+        shared.pvtime.lock().unwrap().enter(wall_ns(), hv);
+        if let Some(kicker) = &kicker {
+            kicker.entered();
+        }
+        let exit = self.run_loop();
+        shared.pvtime.lock().unwrap().leave(wall_ns());
+        if let Some(kicker) = &kicker {
+            kicker.left();
+        }
+        exit
+    }
+
+    /// The framework's vCPU, for tests that read its counters on the owner thread.
+    #[cfg(test)]
+    pub(crate) fn hv_for_test(&self) -> Option<hv_vcpu_t> {
+        self.shared.hv()
+    }
+
+    fn run_loop(&mut self) -> Result<VcpuExit<'_>> {
         self.fd.check()?;
         let hv = self.ensure_created()?;
         // What other handles wrote while it was stopped, then the debug
@@ -1478,6 +1621,7 @@ impl VcpuFd {
             }
             self.update_vtimer(hv)?;
             self.apply_vtimer_offset(hv, &vm)?;
+            self.pvtime_update(hv);
 
             let saved = self.debug.enter(hv, self.shared.os_lock.load(Ordering::Relaxed))?;
             self.shared.in_run.store(true, Ordering::Release);

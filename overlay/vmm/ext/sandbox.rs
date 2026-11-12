@@ -490,6 +490,31 @@ mod macos {
         "mach_vm_remap_external", "mach_vm_region", "task_get_special_port_from_user",
     ];
 
+    /// System calls a running microVM makes only where PV steal time is
+    /// offered (macOS 27, `kvm_ioctls::pv_time_offered`; nowhere else is
+    /// either list in the profile): a vCPU thread reads its own CPU time,
+    /// clock_gettime(CLOCK_THREAD_CPUTIME_ID), which libc makes
+    /// thread_selfusage (XNU bsd/kern/kern_resource.c: the calling
+    /// thread's runtime, `thread_get_runtime_self`, nothing else; measured:
+    /// without it the microVM stopped with SIGSYS at its first run).
+    /// Linux's VMM filter has clock_gettime.
+    pub const PVTIME_SYSCALLS: &[&str] = &["thread_selfusage"];
+
+    /// MIG routines a running microVM calls only where PV steal time is
+    /// offered: the PV time kicker (kvm-ioctls hvf::pvtime::Kicker) reads a
+    /// vCPU thread's run state and CPU time with `thread_info`. XNU's
+    /// routine takes a thread inspect port (osfmk/mach/thread_act.defs
+    /// `thread_info`) and only reads (osfmk/kern/thread.c
+    /// `thread_info_internal`: basic, identifier, scheduling and extended
+    /// information; the debug flavor only on DEVELOPMENT kernels). The
+    /// ports it can name are this process's own threads': no rule lets it
+    /// reach another task's (task_for_pid, task_threads and the task name
+    /// traps stay denied). On Linux KVM reads the vCPU thread's run delay in
+    /// the kernel, with no call of the VMM's: this stands for no rule of
+    /// upstream's filter, and gives a compromised VMM only its own threads'
+    /// state, which it can already observe.
+    pub const PVTIME_MIG_ROUTINES: &[&str] = &["thread_info"];
+
     /// MIG routines allowed until [`narrow`] only, in addition to
     /// [`MIG_ROUTINES`].
     pub const SETUP_MIG_ROUTINES: &[&str] = &[
@@ -1061,6 +1086,10 @@ mod macos {
             rule.push_str(&allow("syscall-unix", cond, "syscall-number", "SYS_", syscalls));
             rule.push_str(&allow("syscall-mach", cond, "machtrap-number", "MSC_", traps));
             rule.push_str(&allow("syscall-mig", cond, "kernel-mig-routine", "", migs));
+        }
+        if kvm_ioctls::pv_time_offered() {
+            rule.push_str(&allow("syscall-unix", "", "syscall-number", "SYS_", PVTIME_SYSCALLS));
+            rule.push_str(&allow("syscall-mig", "", "kernel-mig-routine", "", PVTIME_MIG_ROUTINES));
         }
         for name in MACH_TRAPS_IF_DEFINED {
             rule.push_str(&format!(
@@ -2922,10 +2951,10 @@ mod macos {
             // unknown one fails `sandbox_compile_string`, which test_sandbox_restricts_child
             // would show. Here: no duplicates, and the calls Firecracker cannot
             // run without are in.
-            let mut names = [SYSCALLS, SETUP_SYSCALLS].concat();
+            let mut names = [SYSCALLS, SETUP_SYSCALLS, PVTIME_SYSCALLS].concat();
             names.sort_unstable();
             names.dedup();
-            assert_eq!(names.len(), SYSCALLS.len() + SETUP_SYSCALLS.len());
+            assert_eq!(names.len(), SYSCALLS.len() + SETUP_SYSCALLS.len() + PVTIME_SYSCALLS.len());
             // A call the table numbers is written by number, since an older
             // libsandbox may not know its name (macOS 15 and 26: SYS_getumask).
             let rules = [syscall_rule(), api_profile()].concat();
@@ -3639,10 +3668,10 @@ mod macos {
 
         #[test]
         fn test_mig_routine_names_are_known() {
-            let mut names = MIG_ROUTINES.to_vec();
+            let mut names = [MIG_ROUTINES, PVTIME_MIG_ROUTINES].concat();
             names.sort_unstable();
             names.dedup();
-            assert_eq!(names.len(), MIG_ROUTINES.len());
+            assert_eq!(names.len(), MIG_ROUTINES.len() + PVTIME_MIG_ROUTINES.len());
             for needed in ["clock_get_time", "mach_vm_map_external", "semaphore_create"] {
                 assert!(MIG_ROUTINES.contains(&needed), "{needed}");
             }
@@ -3653,6 +3682,82 @@ mod macos {
             ] {
                 assert!(!MIG_ROUTINES.contains(&denied), "{denied}");
             }
+        }
+
+        // Where PV steal time is offered (macOS 27), a running microVM reads
+        // its threads' CPU time and state: its own (thread_selfusage) and a
+        // vCPU thread's (thread_info, the PV time kicker). The routines next
+        // to thread_info on a thread port, which change a thread, are denied
+        // after narrowing (thread_policy_set is SETUP_MIG_ROUTINES' only, for
+        // the vCPU threads' latency tier) (task_threads, which would give the ports of the task's
+        // threads, is unlisted_mig_child's). Where PV time is not offered,
+        // neither read is in the profile.
+        #[test]
+        fn test_thread_reads_are_pv_times_only() {
+            use std::os::unix::process::ExitStatusExt;
+            let offered = kvm_ioctls::pv_time_offered();
+            for case in ["reads", "thread_set_state", "thread_policy_set", "thread_suspend"] {
+                let out = child("thread_read_child", &[("WICK_TEST_CASE", case)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(stdout.contains("NARROWED"), "{case}: {}", text(&out));
+                if case == "reads" && offered {
+                    assert!(out.status.success(), "{case}: {}", text(&out));
+                    assert!(stdout.contains("READS-OK"), "{case}: {}", text(&out));
+                } else {
+                    assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case} (PV time offered: {offered}): {}", text(&out));
+                    assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
+                }
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_thread_reads_are_pv_times_only in a separate process"]
+        fn thread_read_child() {
+            unsafe extern "C" {
+                // <mach/thread_act.h>, MIG routines on a thread port.
+                fn thread_set_state(thread: libc::mach_port_t, flavor: i32, state: *const u32, count: u32) -> i32;
+                fn thread_policy_set(thread: libc::mach_port_t, flavor: u32, policy: *const i32, count: u32) -> i32;
+                fn thread_suspend(thread: libc::mach_port_t) -> i32;
+            }
+            // A thread of this process, as a vCPU thread is the kicker's.
+            let sibling = std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_secs(30)));
+            // SAFETY: a live thread of this process.
+            let port = unsafe { libc::pthread_mach_thread_np(std::os::unix::thread::JoinHandleExt::as_pthread_t(&sibling)) };
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            println!("NARROWED");
+            match std::env::var("WICK_TEST_CASE").unwrap().as_str() {
+                "reads" => {
+                    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                    // SAFETY: a valid timespec.
+                    assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) }, 0);
+                    // SAFETY: a zeroed plain-data structure.
+                    let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
+                    let mut count = libc::THREAD_BASIC_INFO_COUNT;
+                    // SAFETY: a thread port of this process and a buffer of `count` words.
+                    let ret = unsafe {
+                        libc::thread_info(
+                            port,
+                            libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+                            std::ptr::from_mut(&mut info).cast(),
+                            &mut count,
+                        )
+                    };
+                    assert_eq!(ret, libc::KERN_SUCCESS);
+                    println!("READS-OK");
+                }
+                // Flavor 0 and no state: refused by the kernel if it ever ran.
+                // SAFETY: as above, with an empty state.
+                "thread_set_state" => drop(unsafe { thread_set_state(port, 0, std::ptr::null(), 0) }),
+                // SAFETY: as above, with an empty policy.
+                "thread_policy_set" => drop(unsafe { thread_policy_set(port, 0, std::ptr::null(), 0) }),
+                // SAFETY: suspends the sleeping sibling, if it ever ran.
+                "thread_suspend" => drop(unsafe { thread_suspend(port) }),
+                other => panic!("{other}"),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            println!("CHILD-SURVIVED");
         }
 
         #[test]

@@ -214,6 +214,8 @@ pub(crate) struct VmInner {
     pub(crate) ptrauth: Mutex<Option<bool>>,
     /// GIC registers of a freshly created vCPU, read from the first one.
     pub(crate) gic_cpu_reset: OnceLock<HashMap<super::gic::CpuReg, u64>>,
+    /// The PV time kicker, where PV time is offered (`super::pvtime::Kicker`).
+    pub(crate) pvtime_kicker: OnceLock<Arc<super::pvtime::Kicker>>,
 }
 
 /// Identity of an eventfd that survives `dup` (the inode of its pipe).
@@ -473,6 +475,34 @@ impl VmInner {
         false
     }
 
+    /// Writes guest RAM at `ipa` from the hypervisor's side, as KVM's
+    /// kvm_write_guest/kvm_put_guest: `f` gets the host address of `len`
+    /// bytes (within one page) while the memory lock keeps them mapped. A
+    /// page a userfaultfd has not filled is waited for (KVM's copy_to_user
+    /// faults it in), and a dirty-tracked page is marked dirty
+    /// (mark_page_dirty). `None` if `ipa` is not writable RAM (a read-only
+    /// slot: KVM_HVA_ERR_RO_BAD).
+    pub(crate) fn write_guest<R>(&self, ipa: u64, len: usize, f: impl FnOnce(*mut u8) -> R) -> Option<R> {
+        let page = host_page_size();
+        debug_assert!(ipa % page + len as u64 <= page);
+        loop {
+            let memory = self.memory_mapped(ipa);
+            let slot = memory.slot_at(ipa).filter(|s| !s.readonly)?;
+            let host = slot.host + (ipa - slot.ipa);
+            if libc::wick_uffd::is_missing(host) {
+                drop(memory);
+                libc::wick_uffd::fault(host, true);
+                continue;
+            }
+            let r = f(host as *mut u8);
+            if let Some(bitmap) = &slot.dirty {
+                let index = (ipa - slot.ipa) / page;
+                bitmap[(index / 64) as usize].fetch_or(1 << (index % 64), Ordering::AcqRel);
+            }
+            return Some(r);
+        }
+    }
+
     /// Signals the eventfd registered for an MMIO write, if any. Returns true if one matched.
     pub(crate) fn ioevent(&self, addr: u64, data: &[u8]) -> bool {
         let events = self.ioevents.read().unwrap();
@@ -706,6 +736,9 @@ impl VmInner {
         self.stop.store(true, Ordering::Release);
         let _ = self.stop_evt.write(1);
         self.vtimer_waiter.wake();
+        if let Some(kicker) = self.pvtime_kicker.get() {
+            kicker.stop();
+        }
         for (_, slot) in self.memory.lock().unwrap().slots.drain() {
             // SAFETY: unmapping a range we mapped.
             unsafe { hv_vm_unmap(slot.ipa, slot.size as usize) };
@@ -753,6 +786,9 @@ impl Drop for VmFd {
             self.inner.stop.store(true, Ordering::Release);
             let _ = self.inner.stop_evt.write(1);
             self.inner.vtimer_waiter.wake();
+            if let Some(kicker) = self.inner.pvtime_kicker.get() {
+                kicker.stop();
+            }
             for handle in self.threads.drain(..) {
                 let _ = handle.join();
             }
@@ -831,6 +867,7 @@ impl VmFd {
             id_locked: AtomicBool::new(false),
             ptrauth: Mutex::new(None),
             gic_cpu_reset: OnceLock::new(),
+            pvtime_kicker: OnceLock::new(),
         });
         libc::wick_guest::set_hooks(libc::wick_guest::Hooks {
             stage2: uffd_stage2,
@@ -856,6 +893,10 @@ impl VmFd {
                 .spawn(move || vtimer_thread(&waiter, weak))
                 .map_err(io_err)?,
         );
+        if let Some((kicker, handle)) = super::pvtime::Kicker::start().map_err(io_err)? {
+            let _ = vm.inner.pvtime_kicker.set(kicker);
+            vm.threads.push(handle);
+        }
         *current = Arc::downgrade(&vm.inner);
         Ok(vm)
     }
