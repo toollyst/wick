@@ -27,6 +27,7 @@ import sys
 import tempfile
 import time
 import traceback
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location("boot_test", os.path.join(HERE, "boot-test.py"))
@@ -1044,8 +1045,21 @@ def stage_hugepages(ctx):
             "a uffd handler outside it; a vhost-user drive on a huge page memfd, its backend outside the jail")
 
 
+def _cgroup_test():
+    """tools/macos/jailer-cgroup-test.py: the cgroup stages measured against Linux."""
+    spec = importlib.util.spec_from_file_location("jailer_cgroup_test", os.path.join(HERE, "jailer-cgroup-test.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def stage_cgroup_devices(ctx):
+    return _cgroup_test().stage_cgroup_devices(ctx, types.SimpleNamespace(**globals()))
+
+
 STAGES = {
     "refuse": stage_refuse,
+    "cgroup-devices": stage_cgroup_devices,
     "jail": stage_jail,
     "daemonize": stage_daemonize,
     "pidns": stage_pidns,

@@ -113,6 +113,15 @@ def refused(ctx, vm_id, args, want):
     rc, out = run.finish()
     check(rc != 0 and want in out, f"{args}: refused with {want!r}")
     check(not run.started(), f"{args}: the payload never ran")
+    return run
+
+
+def left(run):
+    """What the failed jailer left in its jail directory (None: no directory)."""
+    if not os.path.isdir(run.jail):
+        return None
+    return sorted(os.path.relpath(os.path.join(d, f), run.jail)
+                  for d, dirs, files in os.walk(run.jail) for f in dirs + files)
 
 
 def case_devices(ctx):
@@ -122,10 +131,22 @@ def case_devices(ctx):
         parent = os.path.join(ctx.devices, "firecracker", prop)
         # The jailer first reads the parent's file (inherit_from_parent): a
         # write-only file, whose read fails with EINVAL.
-        refused(ctx, f"devices{i}", ["--cgroup-version", "1", "--cgroup", value],
-                f"Failed to read file {parent} into a string: Invalid argument")
-    refused(ctx, "devices-list", ["--cgroup-version", "1", "--cgroup", "devices.list=a *:* rwm"],
-            "Invalid argument")
+        run = refused(ctx, f"devices{i}", ["--cgroup-version", "1", "--cgroup", value],
+                      f"Failed to read file {parent} into a string: Invalid argument")
+        # Refused at the cgroup step: the jail's root is made and the binary
+        # copied into it (both before the step), and the cgroup made.
+        print(f"   left in the jail: {left(run)}", flush=True)
+        check(left(run) == ["root", "root/firecracker"], f"{value}: the jail holds the copied binary only")
+        check(os.path.isdir(os.path.join(ctx.devices, "firecracker", run.id)), f"{value}: the cgroup is made")
+    run = refused(ctx, "devices-list", ["--cgroup-version", "1", "--cgroup", "devices.list=a *:* rwm"],
+                  "Invalid argument")
+    print(f"   left in the jail: {left(run)}", flush=True)
+    print("== v2 devices", flush=True)
+    for i, value in enumerate(["devices.deny=a", "devices.allow=c 1:3 rwm"]):
+        run = refused(ctx, f"devices-v2-{i}", ["--cgroup-version", "2", "--cgroup", value],
+                      "Controller devices is unavailable")
+        # Refused while the options are parsed: no jail directory.
+        check(left(run) is None, f"v2 {value}: no jail directory made")
 
 
 def case_freezer_values(ctx):
@@ -176,7 +197,8 @@ def frozen_at_start(ctx, vm_id, daemonize):
 def case_v2(ctx):
     print("== v2 cgroup.freeze", flush=True)
     for i, value in enumerate(["cgroup.freeze=1", "cgroup.freeze=0", "cgroup.procs=1"]):
-        refused(ctx, f"v2-{i}", ["--cgroup-version", "2", "--cgroup", value], "Controller cgroup is unavailable")
+        run = refused(ctx, f"v2-{i}", ["--cgroup-version", "2", "--cgroup", value], "Controller cgroup is unavailable")
+        check(left(run) is None, f"v2 {value}: no jail directory made")
 
 
 class Ctx:

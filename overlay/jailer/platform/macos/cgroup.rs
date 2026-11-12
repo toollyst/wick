@@ -71,6 +71,10 @@ impl CgroupConfigurationBuilder {
         _parent_cg: &Path,
     ) -> Result<(), JailerError> {
         match (self.version, file.as_str()) {
+            // v2 has no devices controller: upstream's error.
+            (2, f) if f.starts_with("devices.") => {
+                return Err(JailerError::CgroupControllerUnavailable("devices".to_owned()));
+            }
             (2, "cpu.max") => self.cpu = cpu_max(&file, &value)?,
             (1, "cpu.cfs_quota_us") => self.cpu.quota_us = cfs_quota(&file, &value)?,
             (1, "cpu.cfs_period_us") => self.cpu.period_us = Some(period(&file, &value)?),
@@ -287,6 +291,10 @@ fn refusal(file: &str) -> &'static str {
         }
         ("hugetlb", _) => "macOS has no hugetlb page pool (docs/PORTING.md row 10)",
         ("cpuset", _) => "only cpuset.cpus and cpuset.mems have a macOS counterpart",
+        ("devices", _) => {
+            "upstream's jailer cannot set it on Linux either: it first reads the parent cgroup's file, and \
+             devices.allow and devices.deny are write-only (EINVAL), devices.list read-only"
+        }
         _ => "no macOS counterpart",
     }
 }
@@ -389,10 +397,17 @@ mod tests {
             (2, "hugetlb.2MB.max=0", "no hugetlb page pool"),
             (2, "cpuset.cpus.exclusive=0", "only cpuset.cpus and cpuset.mems"),
             (2, "rdma.max=x", "no macOS counterpart"),
+            (1, "devices.deny=a", "cannot set it on Linux either"),
+            (1, "devices.allow=c 1:3 rwm", "devices.allow and devices.deny are write-only"),
+            (1, "devices.list=a *:* rwm", "devices.list read-only"),
         ] {
             let err = limit(v, &[p]).unwrap_err();
             assert!(matches!(err, JailerError::Host(HostError::UnsupportedCgroup(..))), "{p}: {err}");
             assert!(err.to_string().contains(why), "{p}: {err}");
+        }
+        // v2: no devices controller, upstream's own error.
+        for p in ["devices.deny=a", "devices.allow=c 1:3 rwm"] {
+            assert_eq!(limit(2, &[p]).unwrap_err().to_string(), "Controller devices is unavailable", "{p}");
         }
         assert!(matches!(
             CgroupConfigurationBuilder::new(3, "").unwrap_err(),

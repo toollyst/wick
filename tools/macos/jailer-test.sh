@@ -8,7 +8,7 @@
 #
 #   tools/macos/jailer-test.sh [--release] [--no-vm] [stage...]
 #
-# Stages (default: all): refuse jail daemonize pidns limits fsize no-api boot netns memory
+# Stages (default: all): refuse cgroup-devices jail daemonize pidns limits fsize no-api boot netns memory
 # cpu hugepages uffd vhost-user. fsize, no-api, boot, netns, memory, cpu, hugepages, uffd
 # and vhost-user start a VM and need Hypervisor.framework; --no-vm skips them (GitHub's
 # macOS runners have no Hypervisor.framework). Results and logs go to
