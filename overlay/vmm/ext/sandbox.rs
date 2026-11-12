@@ -3938,6 +3938,26 @@ mod macos {
                     }
                 }
                 for lift in &lifts {
+                    // pid_suspend and pid_resume, lifted, as root only. XNU's
+                    // pid_suspend (bsd/kern/kern_proc.c) asks the sandbox
+                    // first (mac_proc_check_suspend_resume) and then, for a
+                    // caller that is not root and another process, taskgated
+                    // (__KERNEL_WAITING_ON_TASKGATED_CHECK_ACCESS_UPCALL__),
+                    // and waits for its answer: once taskgated asked authd
+                    // for system.privilege.taskport.debug, a password dialog
+                    // nobody answered held the call, and every task-port
+                    // request of the host, for ever (macOS 27.2). Unlifted,
+                    // the sandbox refuses first, so no case and no microVM
+                    // reaches taskgated: the profile never allows the
+                    // operation, and the jailer's freezer, which does, is root.
+                    // SAFETY: no arguments.
+                    if ["pid_suspend", "pid_resume"].contains(name) && *lift == "1" && unsafe { libc::geteuid() } != 0 {
+                        eprintln!(
+                            "{name} lifted: NOT RUN: as a plain user it waits on taskgated, which can put up a \
+                             password dialog and block every debugger of the host; run the test as root"
+                        );
+                        continue;
+                    }
                     for file in ["inside", "second"] {
                         let _ = std::fs::remove_file(jail.join(format!("{file}-{name}-{lift}")));
                     }
