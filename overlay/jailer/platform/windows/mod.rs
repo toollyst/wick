@@ -533,9 +533,15 @@ fn dacl_sddl(path: &Path) -> io::Result<String> {
 /// another jail's network, measured by `jailer-test.ps1 netns` on a WHP
 /// machine) and holds SYSTEM, the administrators, the user and this jail's
 /// SID, inherited by the endpoints made in it, plus the jail SIDs granted
-/// before (another jail sharing the network keeps its own: the entries are
-/// read as SIDs, not SDDL, so no alias SDDL writes for an account can hide
-/// one, [`dacl_entries`]). The directory is labelled with the jail's
+/// before (another jail given the same directory keeps its entry: the
+/// entries are read as SIDs, not SDDL, so no alias SDDL writes for an
+/// account can hide one, [`dacl_entries`]). Those jails are not separated
+/// from each other's endpoints: each one's entry is inherited by every
+/// endpoint in the directory, so one may connect to another's endpoint as
+/// its switch, delete it, or take its name first, where two Firecrackers in
+/// one Linux namespace cannot reach each other's TAP. Not done yet; until
+/// then each jail needs a network directory of its own (SECURITY.md, "Not at
+/// parity yet"). The directory is labelled with the jail's
 /// integrity level, so that the jailed process can make its endpoints
 /// there: an object without a label is medium, which a jailed process may
 /// not write to.
