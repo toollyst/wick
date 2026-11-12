@@ -30,7 +30,7 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 
 use super::fd::{
-    AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd, from_socket, socket,
+    AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd, socket, socket_fd,
 };
 
 /// Starts Winsock once per process.
@@ -79,7 +79,7 @@ fn new_socket() -> io::Result<OwnedFd> {
         return Err(last_error());
     }
     // SAFETY: a new socket owned here.
-    Ok(unsafe { OwnedFd::from_raw_fd(from_socket(s)) })
+    Ok(unsafe { OwnedFd::from_raw_fd(socket_fd(s)?) })
 }
 
 /// The address of an `AF_UNIX` socket.
@@ -476,7 +476,7 @@ impl UnixListener {
             return Err(last_error());
         }
         // SAFETY: a new socket owned here.
-        let fd = unsafe { OwnedFd::from_raw_fd(from_socket(s)) };
+        let fd = unsafe { OwnedFd::from_raw_fd(socket_fd(s)?) };
         Ok((UnixStream(fd), SocketAddr { addr, len }))
     }
 

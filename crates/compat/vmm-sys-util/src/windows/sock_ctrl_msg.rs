@@ -70,7 +70,7 @@ use std::fs::File;
 use std::mem::size_of;
 use std::sync::{Mutex, OnceLock};
 
-use wick_os::fd::{AsRawFd, FromRawFd, RawFd, from_handle, from_socket, handle, socket};
+use wick_os::fd::{AsRawFd, FromRawFd, RawFd, from_handle, handle, socket, socket_fd};
 use wick_os::unix::net::UnixStream;
 use libc::{c_void, iovec};
 use windows_sys::Win32::Foundation::{
@@ -718,7 +718,15 @@ fn decode(entries: &[u8], count: usize, sender: Option<&Process>) -> Result<Vec<
                     close_received(&out);
                     return Err(err);
                 }
-                out.push((kind, from_socket(s)));
+                match socket_fd(s) {
+                    Ok(fd) => out.push((kind, fd)),
+                    Err(err) => {
+                        // Said on stderr: the errno alone cannot carry why.
+                        eprintln!("recvmsg: a received {err}");
+                        close_received(&out);
+                        return Err(Error::new(libc::EINVAL));
+                    }
+                }
             }
             _ => return Err(bad(&out)),
         }

@@ -6,8 +6,9 @@
 //! 64-bit Windows keeps handle values in 32 bits and conversions back
 //! sign-extend (Microsoft, "Interprocess communication"), so `-1` is
 //! `INVALID_HANDLE_VALUE` and `INVALID_SOCKET`. Winsock does not promise it
-//! for a `SOCKET` (any value below `INVALID_SOCKET`); the system's providers
-//! return kernel handles.
+//! for a `SOCKET` (any value below `INVALID_SOCKET`): the system's providers
+//! return kernel handles, and a socket whose value is no descriptor is
+//! refused where it is made or accepted ([`socket_fd`]), never truncated.
 
 use std::fmt;
 use std::fs::File;
@@ -35,7 +36,7 @@ pub type RawFd = i32;
 // The conversions below are where handle values become descriptors and
 // back. They cannot lose bits for a kernel handle: Windows keeps those in 32
 // bits (sign-extended), so 64-bit values convert to `i32` and back exactly.
-// A socket is one when it comes from the system's providers.
+// A socket that is not one is refused ([`socket_fits`]).
 
 /// The handle a descriptor names. `0`, `1` and `2` (`STDIN_FILENO`,
 /// `STDOUT_FILENO`, `STDERR_FILENO`) name this process's standard handles,
@@ -66,14 +67,49 @@ pub fn socket(fd: RawFd) -> usize {
     fd as isize as usize
 }
 
-/// The descriptor of a socket.
+/// The descriptor a socket value is, if it is one: a value that converts to
+/// `i32` and back exactly and is not 0, 1 or 2 (the standard handles).
+/// Winsock allows a `SOCKET` "any value in the range 0 to
+/// INVALID_SOCKET-1" (Socket Data Type); the system's providers return
+/// kernel handles, which always fit, but a layered provider need not.
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap
 )]
+pub fn socket_fits(s: usize) -> Option<RawFd> {
+    let fd = s as isize as RawFd;
+    (socket(fd) == s && !(0..=2).contains(&fd)).then_some(fd)
+}
+
+/// The descriptor of a socket. Panics, rather than truncate it, on a value
+/// that is no descriptor ([`socket_fits`]): sockets this crate makes or
+/// accepts are checked where they are made ([`socket_fd`]), so only a socket
+/// std made can get here with one.
 pub fn from_socket(s: usize) -> RawFd {
-    s as isize as RawFd
+    socket_fits(s).unwrap_or_else(|| panic!("{}", not_a_descriptor(s)))
+}
+
+fn not_a_descriptor(s: usize) -> String {
+    format!(
+        "socket value {s:#x} is no descriptor: it does not fit in 32 bits, or is 0, 1 or 2 \
+         (the standard handles); refused, not truncated"
+    )
+}
+
+/// The descriptor of a socket this process just made or accepted: refused
+/// with `EINVAL` (`ERROR_INVALID_PARAMETER`) and closed when its value is no
+/// descriptor ([`socket_fits`]), never truncated.
+pub fn socket_fd(s: usize) -> std::io::Result<RawFd> {
+    adopt_socket(s, socket_fits)
+}
+
+pub(crate) fn adopt_socket(s: usize, fits: fn(usize) -> Option<RawFd>) -> std::io::Result<RawFd> {
+    fits(s).ok_or_else(|| {
+        // SAFETY: closes the caller's new socket, which nothing else owns.
+        unsafe { closesocket(s) };
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, not_a_descriptor(s))
+    })
 }
 
 /// Closes a descriptor: a socket with `closesocket`, any other handle with
@@ -116,7 +152,7 @@ pub fn dup(fd: RawFd) -> std::io::Result<RawFd> {
             // SAFETY: reads the thread's last Winsock error.
             return Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
         }
-        return Ok(from_socket(s));
+        return socket_fd(s);
     }
     // SAFETY: reads the thread's last Winsock error.
     if unsafe { WSAGetLastError() } != WSAENOTSOCK {

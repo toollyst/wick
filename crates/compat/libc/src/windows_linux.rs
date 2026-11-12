@@ -439,6 +439,36 @@ fn wsa_fail() -> c_int {
     -1
 }
 
+/// The descriptor a socket value is, if it is one: a value that converts to
+/// `c_int` and back exactly and is not 0, 1 or 2 (the standard handles).
+/// Winsock allows a `SOCKET` "any value in the range 0 to
+/// INVALID_SOCKET-1" (Socket Data Type); the system's providers return
+/// kernel handles, which always fit, but a layered provider need not. The
+/// same rule as `wick_os::fd::socket_fits`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+pub(crate) fn socket_fits(s: ws::SOCKET) -> Option<c_int> {
+    let fd = s as isize as c_int;
+    (sock(fd) == s && !(0..=2).contains(&fd)).then_some(fd)
+}
+
+/// The descriptor of a socket this process just made or accepted. One that
+/// is no descriptor ([`socket_fits`]) is closed, never truncated, and
+/// refused with `EINVAL`, the reason on stderr (the errno alone cannot
+/// carry it).
+pub(crate) fn socket_fd(s: ws::SOCKET, fits: fn(ws::SOCKET) -> Option<c_int>) -> Option<c_int> {
+    let fd = fits(s);
+    if fd.is_none() {
+        // SAFETY: closes the caller's new socket, which nothing else owns.
+        unsafe { ws::closesocket(s) };
+        std::eprintln!(
+            "socket value {s:#x} is no descriptor: it does not fit in 32 bits, or is 0, 1 or 2 \
+             (the standard handles); refused (EINVAL), not truncated"
+        );
+        set_errno(crate::EINVAL);
+    }
+    fd
+}
+
 /// `socket`, with Linux families and the `SOCK_NONBLOCK`/`SOCK_CLOEXEC`
 /// flags. Returns a descriptor.
 ///
@@ -460,8 +490,9 @@ pub unsafe fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int {
     if s == INVALID_SOCKET {
         return wsa_fail();
     }
-    #[allow(clippy::cast_possible_truncation)]
-    let fd = s as c_int;
+    let Some(fd) = socket_fd(s, socket_fits) else {
+        return -1;
+    };
     // SAFETY: our new descriptor.
     if ty & SOCK_NONBLOCK != 0
         && unsafe { crate::windows_fd::fcntl(fd, crate::F_SETFL, crate::O_NONBLOCK) } != 0
@@ -536,12 +567,13 @@ pub unsafe fn accept(fd: c_int, addr: *mut crate::sockaddr, len: *mut u32) -> c_
     if a == INVALID_SOCKET {
         return wsa_fail();
     }
+    let Some(fd) = socket_fd(a, socket_fits) else {
+        return -1;
+    };
     if !addr.is_null() && !len.is_null() {
         // SAFETY: the caller's contract.
         unsafe { linux_addr(&mut s, n, addr.cast(), len) };
     }
-    #[allow(clippy::cast_possible_truncation)]
-    let fd = a as c_int;
     fd
 }
 
@@ -762,6 +794,36 @@ pub unsafe fn sendfile64(out_fd: c_int, in_fd: c_int, offset: *mut off64_t, coun
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_socket_values_that_are_no_descriptor() {
+        assert_eq!(socket_fits(0x1234), Some(0x1234));
+        for s in [0usize, 1, 2, 0x1_0000_0004, 0x8000_0000, 0xffff_ffff] {
+            assert_eq!(socket_fits(s), None, "{s:#x}");
+        }
+    }
+
+    #[test]
+    fn test_a_socket_that_is_no_descriptor_is_refused_and_closed() {
+        wick_wsa_startup();
+        // SAFETY: a new socket owned here.
+        let s = unsafe { ws::WSASocketW(i32::from(ws::AF_INET), ws::SOCK_STREAM, 0, std::ptr::null(), 0, 0) };
+        assert_ne!(s, INVALID_SOCKET);
+        // A real socket, judged as a layered provider's value would be.
+        assert_eq!(socket_fd(s, |_| None), None);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EINVAL));
+        // It was closed: closing it again finds no socket.
+        // SAFETY: a value that names no socket now.
+        assert_eq!(unsafe { ws::closesocket(s) }, SOCKET_ERROR);
+        // SAFETY: reads the thread's last Winsock error.
+        assert_eq!(unsafe { WSAGetLastError() }, ws::WSAENOTSOCK);
+        // A socket that fits is its descriptor.
+        // SAFETY: as above.
+        let s = unsafe { ws::WSASocketW(i32::from(ws::AF_INET), ws::SOCK_STREAM, 0, std::ptr::null(), 0, 0) };
+        let fd = socket_fd(s, socket_fits).unwrap();
+        // SAFETY: our socket.
+        assert_eq!(unsafe { ws::closesocket(sock(fd)) }, 0);
+    }
 
     #[test]
     fn test_sendfile64() {

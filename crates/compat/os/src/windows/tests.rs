@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::Shutdown;
 
-use super::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, dup};
+use super::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, adopt_socket, dup, socket_fits};
 use super::unix::ffi::{OsStrExt, OsStringExt};
 use super::unix::fs::{FileExt, MetadataExt};
 use super::unix::net::{UnixListener, UnixStream};
@@ -70,6 +70,46 @@ fn test_nonblocking() {
     let mut buf = [0u8; 1];
     let err = (&a).read(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn test_socket_values_that_are_no_descriptor() {
+    // Kernel handles (multiples of 4 in 32 bits) are descriptors, as is
+    // `INVALID_SOCKET`'s -1 for the callers that check it first.
+    assert_eq!(socket_fits(0x1234), Some(0x1234));
+    assert_eq!(socket_fits(usize::MAX), Some(-1));
+    assert_eq!(socket_fits(0x7fff_fffc), Some(0x7fff_fffc));
+    // A value past 32 bits, or 0, 1 or 2 (the standard handles), is not.
+    for s in [0usize, 1, 2, 0x1_0000_0004, 0x8000_0000, 0xffff_ffff, usize::MAX - 0x1_0000_0000] {
+        assert_eq!(socket_fits(s), None, "{s:#x}");
+    }
+    let err = std::panic::catch_unwind(|| super::fd::from_socket(0x1_0000_0004)).unwrap_err();
+    assert!(err.downcast_ref::<String>().unwrap().contains("refused, not truncated"));
+}
+
+#[test]
+fn test_a_socket_that_is_no_descriptor_is_refused_and_closed() {
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, SOCK_STREAM, SOCKET_ERROR, WSAENOTSOCK, WSAGetLastError, WSASocketW, closesocket,
+    };
+    super::net::startup();
+    // SAFETY: a new socket owned here.
+    let s = unsafe { WSASocketW(i32::from(AF_INET), SOCK_STREAM, 0, std::ptr::null(), 0, 0) };
+    assert_ne!(s, usize::MAX);
+    // A real socket, judged as a layered provider's value would be.
+    let err = adopt_socket(s, |_| None).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains(&format!("{s:#x}")), "{err}");
+    // It was closed: closing it again finds no socket.
+    // SAFETY: a value that names no socket now.
+    assert_eq!(unsafe { closesocket(s) }, SOCKET_ERROR);
+    // SAFETY: reads the thread's last Winsock error.
+    assert_eq!(unsafe { WSAGetLastError() }, WSAENOTSOCK);
+    // One that fits is the descriptor.
+    // SAFETY: a new socket owned here.
+    let s = unsafe { WSASocketW(i32::from(AF_INET), SOCK_STREAM, 0, std::ptr::null(), 0, 0) };
+    let fd = super::fd::socket_fd(s).unwrap();
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
 }
 
 #[test]

@@ -240,6 +240,13 @@ fn to_fd(s: SOCKET) -> c_int {
     s as u32 as c_int
 }
 
+/// The descriptor of a socket made or accepted here: `None` (the socket
+/// closed, `EINVAL` set, the reason on stderr) when its value is no
+/// descriptor, never truncated. [`to_fd`] is for sockets adopted so.
+fn adopt(s: SOCKET) -> Option<c_int> {
+    crate::windows_linux::socket_fd(s, crate::windows_linux::socket_fits)
+}
+
 fn send_all(fd: c_int, buf: &[u8]) -> bool {
     let mut done = 0;
     while done < buf.len() {
@@ -467,7 +474,16 @@ fn socket_pair() -> io::Result<(c_int, c_int)> {
             close(a);
             return Err(e);
         }
-        Ok((to_fd(b), to_fd(a)))
+        // Both made, or neither: a refused one is closed already.
+        match (adopt(b), adopt(a)) {
+            (Some(b), Some(a)) => Ok((b, a)),
+            (b, a) => {
+                for fd in [b, a].into_iter().flatten() {
+                    close(sock(fd));
+                }
+                Err(errno_err(crate::EINVAL))
+            }
+        }
     });
     close(listener);
     let _ = std::fs::remove_file(&path);
@@ -827,7 +843,7 @@ fn recv_hello(fd: c_int) -> Option<Option<c_int>> {
             WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
         )
     };
-    Some((s != INVALID_SOCKET).then(|| to_fd(s)))
+    Some((s != INVALID_SOCKET).then(|| adopt(s)).flatten())
 }
 
 /// Serves one request from a client channel; false when the channel closed.

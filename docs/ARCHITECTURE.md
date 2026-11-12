@@ -140,7 +140,11 @@ semantics on Win32. The details are in the comments of each
   sign-extended) is the `HANDLE` or `SOCKET` value itself, and 0, 1, 2 are the
   standard handles. Winsock promises neither for a `SOCKET` ("any value in the
   range 0 to INVALID_SOCKET-1", Socket Data Type): the system's providers
-  return kernel handles (AFD), and the mapping relies on it.
+  return kernel handles (AFD), and a socket whose value does not fit in 32
+  bits, or is 0, 1 or 2, is closed and refused with `EINVAL` where it is made
+  or accepted, never truncated (`wick-os` and the compatibility libc,
+  `test_a_socket_that_is_no_descriptor_is_refused_and_closed`; one std made
+  panics when it becomes a descriptor, `test_socket_values_that_are_no_descriptor`).
   `wick-os` re-exports `std::os::{unix, fd}` on Unix and defines the same
   traits and types on handles on Windows (`AsRawFd`, `AsFd`, `OwnedFd`, ...;
   `unix::net`'s `UnixStream` and `UnixListener` are Winsock `AF_UNIX`).
