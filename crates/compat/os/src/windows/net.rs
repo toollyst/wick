@@ -234,7 +234,10 @@ fn take_error(fd: SOCKET) -> io::Result<Option<io::Error>> {
 /// What a write to a stream whose peer is gone does besides failing. Linux
 /// sends the writing thread `SIGPIPE` (a `write(2)` without `MSG_NOSIGNAL`,
 /// as std's `UnixStream` writes), which Firecracker counts; Windows raises no
-/// signal. wick's signal emulation sets the hook when a `SIGPIPE` handler is
+/// signal. A write to a pipe without a reader does the same on Linux (fs/pipe.c
+/// `anon_pipe_write`: `send_sig(SIGPIPE, current, 0)` when `!pipe->readers`),
+/// which here is [`crate::stdio::Stdout`]'s write to a standard output pipe.
+/// wick's signal emulation sets the hook when a `SIGPIPE` handler is
 /// registered (vmm-sys-util's `register_signal_handler`).
 static BROKEN_PIPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -243,7 +246,7 @@ pub fn set_broken_pipe_hook(hook: fn()) {
     BROKEN_PIPE.store(hook as usize, Ordering::Release);
 }
 
-fn broken_pipe() {
+pub(crate) fn broken_pipe() {
     let f = BROKEN_PIPE.load(Ordering::Acquire);
     if f != 0 {
         // SAFETY: only `fn()` values are stored, as `usize`.

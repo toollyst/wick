@@ -22,6 +22,8 @@ pub mod vcpu_thread;
 mod snapshot_vcpu_tests;
 #[cfg(all(test, unix))]
 mod nonblocking_pipe_tests;
+#[cfg(test)]
+mod serial_stdout_tests;
 #[cfg(all(test, unix))]
 mod sigpipe_tests;
 #[cfg(all(test, unix))]

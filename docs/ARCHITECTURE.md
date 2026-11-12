@@ -176,7 +176,17 @@ semantics on Win32. The details are in the comments of each
   (`test_a_pipe_reads_as_on_linux`,
   `test_a_console_without_characters_reads_as_eagain`,
   `test_serial_input_reads_an_emptied_pipe_as_eagain`). `lock()` is std's
-  lock, for the terminal modes.
+  lock, for the terminal modes. `std::io::stdout` and `Stdout` are
+  `wick_os::stdio`'s too: a full non-blocking pipe takes 0 bytes of a write
+  and std passes the 0 on (`WriteZero` from `write_all` and the buffer's
+  flush); this one fails with `EWOULDBLOCK` as Linux does, keeps std's
+  1024-byte line buffer so a failed write leaves the same bytes buffered,
+  reports a pipe with no reader as `BrokenPipe` with the `SIGPIPE` hook, and
+  writes a console with std's writer (`test_a_full_pipe_writes_as_on_linux`,
+  `test_the_serial_on_a_full_non_blocking_stdout`, which also runs on Linux
+  and macOS). `print!`/`println!` keep std's own buffer, so they interleave
+  with it by line; its buffer is not flushed at exit, where std's is. Libtest
+  writes through std's, so the unit-test checker still gives tests a file.
 - **errno = Win32/WSA codes**, chosen so that the `io::ErrorKind` mapping
   matches Linux (`EPERM`=`WSAEACCES`, `EAGAIN`=`EWOULDBLOCK`,
   `ENOTTY`=`ERROR_INVALID_FUNCTION`, ...). A code Windows gives beside one of

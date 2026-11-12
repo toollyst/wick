@@ -13,10 +13,13 @@
 //! resolves every `std::` path in the crate through this crate: everything
 //! is the real standard library (re-exported), except that `std::os` also
 //! has `unix` and `fd` from `wick_os`, wick's implementation of them on
-//! Windows, and that on Windows `std::io::stdin` and `std::io::Stdin` are
-//! `wick_os::stdio`'s: an empty non-blocking pipe reads as `EWOULDBLOCK`, as
-//! on Linux, not as the end (Firecracker's serial input). Macros
-//! (`println!`, `vec!`, ...) still come from the real `std`.
+//! Windows, and that on Windows `std::io::stdin`, `std::io::Stdin`,
+//! `std::io::stdout` and `std::io::Stdout` are `wick_os::stdio`'s: an empty
+//! non-blocking pipe reads as `EWOULDBLOCK`, as on Linux, not as the end
+//! (Firecracker's serial input), and a write to a full non-blocking pipe fails
+//! with `EWOULDBLOCK`, as on Linux, not with 0 bytes written (its serial
+//! output and its logger). Macros (`println!`, `vec!`, ...) still come from
+//! the real `std`, so `print!`/`println!` write through std's own buffer.
 //!
 //! On Windows `std::os::raw::c_long` and `c_ulong` are also 64 bits wide: the
 //! upstream crates use them in bindings of Linux kernel ABIs (`ifreq`,
@@ -28,13 +31,13 @@
 
 pub use std::*;
 
-/// `std::io`, with `stdin` and `Stdin` from `wick_os::stdio` on Windows (the
-/// names shadow the glob's).
+/// `std::io`, with `stdin`, `Stdin`, `stdout` and `Stdout` from
+/// `wick_os::stdio` on Windows (the names shadow the glob's).
 #[cfg(windows)]
 pub mod io {
     pub use std::io::*;
 
-    pub use wick_os::stdio::{Stdin, stdin};
+    pub use wick_os::stdio::{Stdin, Stdout, stdin, stdout};
 }
 
 /// `std::os`, plus `unix` and `fd` on Windows.
@@ -68,9 +71,11 @@ mod tests {
         let _: Option<super::os::unix::net::UnixStream> = None;
         #[cfg(windows)]
         assert_eq!(super::mem::size_of::<super::os::raw::c_ulong>(), 8);
-        // The standard input is wick-os's, the rest of io std's.
+        // The standard input and output are wick-os's, the rest of io std's.
         #[cfg(windows)]
         let _: wick_os::stdio::Stdin = super::io::stdin();
+        #[cfg(windows)]
+        let _: wick_os::stdio::Stdout = super::io::stdout();
         let _: super::io::ErrorKind = std::io::ErrorKind::WouldBlock;
         assert_eq!(super::mem::size_of::<super::os::raw::c_int>(), 4);
     }

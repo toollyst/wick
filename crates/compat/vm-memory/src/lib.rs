@@ -18,3 +18,34 @@ pub use upstream::*;
 mod windows;
 #[cfg(windows)]
 pub use windows::*;
+
+/// `WriteVolatile` for wick's `std::io::Stdout` (`wick_os::stdio::Stdout`,
+/// which wick-std puts in its place on Windows), as upstream has it for std's
+/// (io.rs: a `write(2)` on its descriptor, past std's buffer). Firecracker's
+/// Nitro Enclaves console writes guest output to it.
+#[cfg(all(windows, feature = "rawfd"))]
+mod wick_stdout {
+    use wick_os::fd::AsFd;
+    use wick_os::stdio::Stdout;
+
+    use crate::bitmap::BitmapSlice;
+    use crate::{VolatileMemoryError, VolatileSlice, WriteVolatile};
+
+    impl WriteVolatile for Stdout {
+        fn write_volatile<B: BitmapSlice>(
+            &mut self,
+            buf: &VolatileSlice<B>,
+        ) -> Result<usize, VolatileMemoryError> {
+            self.as_fd().write_volatile(buf)
+        }
+    }
+
+    impl WriteVolatile for &Stdout {
+        fn write_volatile<B: BitmapSlice>(
+            &mut self,
+            buf: &VolatileSlice<B>,
+        ) -> Result<usize, VolatileMemoryError> {
+            self.as_fd().write_volatile(buf)
+        }
+    }
+}

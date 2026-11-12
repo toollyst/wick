@@ -1,8 +1,9 @@
 // Copyright 2026 toollyst contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `std::io::stdin` with Linux's non-blocking reads; wick-std puts it in
-//! place of std's on Windows.
+//! `std::io::stdin` with Linux's non-blocking reads and `std::io::stdout`
+//! with Linux's non-blocking writes ([`Stdout`]); wick-std puts them in place
+//! of std's on Windows.
 //!
 //! Firecracker makes its standard input non-blocking (`O_NONBLOCK`, which
 //! the compatibility `fcntl` makes `PIPE_NOWAIT` on a pipe), and its serial
@@ -35,18 +36,18 @@
 //! buffer, not this one; upstream reads through [`Stdin`].
 
 use std::fmt;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, LineWriter, Read, Write};
 use std::os::windows::io::{AsRawHandle, RawHandle};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use windows_sys::Win32::Foundation::{
     ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_INVALID_HANDLE, ERROR_NO_DATA, GetLastError,
     HANDLE, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::Storage::FileSystem::ReadFile;
+use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType, ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
     GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT, PeekConsoleInputW, ReadConsoleInputW,
-    STD_INPUT_HANDLE,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 
 use super::fd::{AsFd, AsRawFd, BorrowedFd, RawFd, from_handle};
@@ -211,14 +212,188 @@ impl AsFd for Stdin {
     }
 }
 
+/// std's standard output buffer: `LineWriter::new`, 1024 bytes
+/// (library/std/src/io/stdio.rs `stdout`; library/std/src/io/buffered/
+/// linewriter.rs `LineWriter::new`).
+const OUT_BUF_SIZE: usize = 1024;
+
+/// Writes to `h`, a pipe or a file, with Linux's results (see [`Stdout`]).
+pub(crate) fn write_handle(h: HANDLE, buf: &[u8]) -> io::Result<usize> {
+    let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    let mut n = 0u32;
+    // SAFETY: the buffer is valid for `len` bytes; a synchronous write.
+    if unsafe { WriteFile(h, buf.as_ptr(), len, &mut n, std::ptr::null_mut()) } == 0 {
+        // SAFETY: plain call.
+        return match unsafe { GetLastError() } {
+            // std's handle_ebadf: no standard output takes everything.
+            ERROR_INVALID_HANDLE => Ok(buf.len()),
+            e @ (ERROR_BROKEN_PIPE | ERROR_NO_DATA) => {
+                super::net::broken_pipe();
+                Err(io::Error::from_raw_os_error(e.cast_signed()))
+            }
+            e => Err(io::Error::from_raw_os_error(e.cast_signed())),
+        };
+    }
+    // SAFETY: plain call.
+    if n == 0 && !buf.is_empty() && unsafe { GetFileType(h) } == FILE_TYPE_PIPE {
+        return Err(would_block());
+    }
+    Ok(usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// The standard output handle, read on each call as std does; `None` when the
+/// process has none.
+fn std_output() -> Option<HANDLE> {
+    // SAFETY: plain call.
+    let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    (!h.is_null() && h != INVALID_HANDLE_VALUE).then_some(h)
+}
+
+/// The unbuffered writer under [`Stdout`]'s buffer.
+struct RawOut;
+
+impl Write for RawOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let Some(h) = std_output() else {
+            return Ok(buf.len());
+        };
+        let mut mode = 0;
+        // SAFETY: queries a handle; fails on anything but a console.
+        if unsafe { GetConsoleMode(h, &mut mode) } == 0 {
+            return write_handle(h, buf);
+        }
+        // A console: std's writer (UTF-8 to UTF-16), flushed at once, as
+        // this writer is unbuffered under [`Stdout`]'s buffer.
+        let mut out = std::io::stdout().lock();
+        let n = out.write(buf)?;
+        out.flush()?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A handle to the process's standard output, as `std::io::Stdout`, whose
+/// writes give Linux's results where std's differ on Windows.
+///
+/// Firecracker makes its standard output non-blocking when the serial writes
+/// there (`set_stdout_nonblocking`; the compatibility `fcntl` makes a pipe
+/// `PIPE_NOWAIT`). A full non-blocking pipe takes nothing: on Linux the write
+/// fails with `EAGAIN` (fs/pipe.c `anon_pipe_write`, `if (!ret) ret =
+/// -EAGAIN`), `ErrorKind::WouldBlock`; on Windows `WriteFile` returns success
+/// with 0 bytes written ("Named Pipe Type, Read, and Wait Modes"), and std's
+/// writer passes the 0 on, which `write_all` and the buffer's flush report as
+/// `ErrorKind::WriteZero`. This one writes:
+/// - a pipe or a file with `WriteFile`: 0 bytes of a non-empty write to a
+///   pipe is [`WOULD_BLOCK`] (a pipe in blocking mode completes a write only
+///   once all of it is written, `SetNamedPipeHandleState`, so it is a full
+///   non-blocking pipe, whichever handle made it non-blocking);
+///   `ERROR_BROKEN_PIPE`/`ERROR_NO_DATA` (no reader) fails with
+///   `ErrorKind::BrokenPipe` and calls the `SIGPIPE` hook
+///   ([`super::set_broken_pipe_hook`]), as Linux sends `SIGPIPE` there;
+/// - a console with std's own console writer;
+/// - no standard output as std does: everything is taken (`handle_ebadf`).
+///
+/// It is buffered as std's is, a `LineWriter` of 1024 bytes, so that a failed
+/// write leaves the same bytes buffered as on Linux, where std's buffer sits
+/// on `write(2)`. Differences, both from the separate buffer:
+/// `print!`/`println!` write through std's buffer, so the two interleave by
+/// line, not by byte; and std flushes its buffer at exit
+/// (`std::process::exit` and the return from `main` call `rt::cleanup`, which
+/// replaces the buffer), this one is not, so bytes left in it by a write that
+/// failed are not written at exit. A non-blocking pipe also takes part of a
+/// write that does not fit, where Linux writes up to `PIPE_BUF` bytes all or
+/// nothing (the compatibility libc's module documentation says why).
+pub struct Stdout {
+    inner: &'static Mutex<LineWriter<RawOut>>,
+}
+
+/// The process's standard output, as `std::io::stdout`.
+pub fn stdout() -> Stdout {
+    static INNER: OnceLock<Mutex<LineWriter<RawOut>>> = OnceLock::new();
+    Stdout {
+        inner: INNER.get_or_init(|| Mutex::new(LineWriter::with_capacity(OUT_BUF_SIZE, RawOut))),
+    }
+}
+
+impl Stdout {
+    fn locked(&self) -> MutexGuard<'static, LineWriter<RawOut>> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+// As std's `Stdout`, each call holds the lock throughout, so `write_all`
+// and `write_fmt` are the buffer's own (a `LineWriter` writes whole lines).
+impl Write for Stdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self).write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        (&*self).write_all(buf)
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
+        (&*self).write_fmt(args)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
+    }
+}
+
+impl Write for &Stdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.locked().write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.locked().write_all(buf)
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
+        self.locked().write_fmt(args)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.locked().flush()
+    }
+}
+
+impl fmt::Debug for Stdout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Stdout").finish_non_exhaustive()
+    }
+}
+
+impl AsRawHandle for Stdout {
+    fn as_raw_handle(&self) -> RawHandle {
+        std::io::stdout().as_raw_handle()
+    }
+}
+
+impl AsRawFd for Stdout {
+    fn as_raw_fd(&self) -> RawFd {
+        from_handle(self.as_raw_handle())
+    }
+}
+
+impl AsFd for Stdout {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the standard output handle lives as long as the process.
+        unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
     use std::os::windows::io::FromRawHandle;
 
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Console::{
         ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, FOCUS_EVENT,
@@ -542,5 +717,76 @@ mod tests {
         assert!(format!("{s:?}").starts_with("Stdin"));
         fn send_sync<T: Send + Sync + 'static>(_: &T) {}
         send_sync(&s);
+    }
+
+    // A full non-blocking pipe: a write fails with WSAEWOULDBLOCK (EAGAIN on
+    // Linux, fs/pipe.c anon_pipe_write), where std's writer returns Ok(0) and
+    // write_all WriteZero; after a read there is room again; with the reader
+    // gone, BrokenPipe (EPIPE on Linux).
+    #[test]
+    fn test_a_full_pipe_writes_as_on_linux() {
+        let (r, w) = pipe();
+        let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+        // SAFETY: our pipe's write end.
+        assert_ne!(
+            unsafe { SetNamedPipeHandleState(w, &mode, std::ptr::null(), std::ptr::null()) },
+            0
+        );
+        let chunk = [7u8; 1000];
+        let mut total = 0usize;
+        let err = loop {
+            match write_handle(w, &chunk) {
+                Ok(n) => {
+                    assert!(n > 0, "a write that takes nothing fails");
+                    total += n;
+                    assert!(total < 64 << 20, "the pipe never filled");
+                }
+                Err(e) => break e,
+            }
+        };
+        assert!(total > 0);
+        assert_eq!(err.raw_os_error(), Some(WOULD_BLOCK));
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        // std's writer on the same handle: 0 bytes, which write_all reports
+        // as WriteZero; what this module is for.
+        let file = std::mem::ManuallyDrop::new(
+            // SAFETY: borrowed; ManuallyDrop keeps it from closing the handle.
+            unsafe { std::fs::File::from_raw_handle(w) },
+        );
+        assert_eq!((&*file).write(&chunk).unwrap(), 0, "std's write to a full pipe");
+        let err = (&*file).write_all(&chunk).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero, "{err:?}");
+        let mut buf = [0u8; 4096];
+        assert!(read_handle(r, &mut buf).unwrap() > 0);
+        assert_eq!(write_handle(w, &chunk[..1]).unwrap(), 1);
+        // SAFETY: the reader, ours.
+        unsafe { CloseHandle(r) };
+        let err = write_handle(w, &chunk[..1]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err:?}");
+        // SAFETY: the writer, ours.
+        unsafe { CloseHandle(w) };
+    }
+
+    // No standard output (a NULL handle: ERROR_INVALID_HANDLE) takes the
+    // whole write, as std's handle_ebadf makes it.
+    #[test]
+    fn test_no_output_takes_everything() {
+        assert_eq!(write_handle(std::ptr::null_mut(), b"abc").unwrap(), 3);
+    }
+
+    #[test]
+    fn test_stdout_is_the_standard_output() {
+        let s = stdout();
+        // SAFETY: plain call.
+        let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        assert_eq!(s.as_raw_handle() as HANDLE, h);
+        assert_eq!(s.as_raw_fd(), from_handle(h as RawHandle));
+        assert_eq!(s.as_fd().as_raw_fd(), s.as_raw_fd());
+        assert!(format!("{s:?}").starts_with("Stdout"));
+        fn send_sync<T: Send + Sync + 'static>(_: &T) {}
+        send_sync(&s);
+        // An empty write, and a flush with nothing buffered, write nothing.
+        assert_eq!((&s).write(b"").unwrap(), 0);
+        (&s).flush().unwrap();
     }
 }
