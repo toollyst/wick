@@ -90,6 +90,27 @@ mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 echo aarch64 >"$out/arch"
 
+# What the run builds from: wick's and lib/firecracker's commits, and the
+# Rust sources that differ from them (another session's work in progress
+# in a shared checkout ends up in the binaries). Written to provenance.txt,
+# at the head of pytest.log and at the end of summary.txt; a dirty tree is
+# a loud warning, and a run's results speak for the commits only when it
+# is clean.
+{
+    echo "wick HEAD: $(git -C "$ROOT" rev-parse HEAD)"
+    echo "lib/firecracker HEAD: $(git -C "$ROOT/lib/firecracker" rev-parse HEAD)"
+    dirty="$(git -C "$ROOT" status --short -- crates overlay lib/firecracker tools/vhost-user-blk;
+        git -C "$ROOT/lib/firecracker" status --short -- src resources Cargo.toml Cargo.lock .cargo |
+            sed 's|^\(...\)|\1lib/firecracker/|')"
+    if [[ -n "$dirty" ]]; then
+        echo "WARNING: built from a dirty Rust tree; these paths differ from the commits above:"
+        echo "$dirty" | sed 's/^/    /'
+    else
+        echo "Rust tree: clean (crates, overlay, lib/firecracker, tools/vhost-user-blk)"
+    fi
+} >"$out/provenance.txt"
+cat "$out/provenance.txt"
+
 # The release build, as upstream's tests use it.
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/lib/firecracker/build/cargo_target}"
@@ -221,14 +242,15 @@ sampler=$!
 # would share.
 rm -rf "$out/test_results"
 mkdir -p "$out/test_results"
+cp "$out/provenance.txt" "$out/pytest.log"
 pytest=("$ROOT/build/integration/venv/bin/python" -m pytest -p wick_macos --binary-dir "$bin"
     "--json-report-file=$out/test_results/test-report.json" "$@")
 [[ -x "$ROOT/build/integration/venv/bin/python" ]] || die "no Python environment: tools/macos/integration/venv.sh"
 set +e
 if [[ $mode == jailer ]]; then
-    (cd "$ROOT/lib/firecracker/tests" && sudo env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee "$out/pytest.log"
+    (cd "$ROOT/lib/firecracker/tests" && sudo env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
 else
-    (cd "$ROOT/lib/firecracker/tests" && env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee "$out/pytest.log"
+    (cd "$ROOT/lib/firecracker/tests" && env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
 fi
 status=${PIPESTATUS[0]}
 set -e
@@ -238,5 +260,13 @@ echo "$status" >"$out/status"
 echo "$mode" >"$out/mode"
 cp "$out/test_results/test-report.json" "$out/test-report.json" 2>/dev/null || true
 echo "pytest exited with $status"
+set +e
 python3 -I "$ROOT/tools/macos/compare-integration-tests.py" "$out" ${compare[@]+"${compare[@]}"} --summary "$out/comparison.md" \
     --summary-txt "$out/summary.txt"
+compared=$?
+set -e
+cat "$out/provenance.txt" >>"$out/summary.txt"
+if grep -q '^WARNING' "$out/provenance.txt"; then
+    echo "WARNING: built from a dirty Rust tree (provenance.txt): the results are not the commits'" >&2
+fi
+exit "$compared"
