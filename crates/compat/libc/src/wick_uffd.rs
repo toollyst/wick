@@ -1786,6 +1786,72 @@ mod tests {
         assert_eq!(unsafe { libc::munmap(mem as *mut _, len as usize) }, 0);
     }
 
+    /// A system call that copies to or from missing registered pages waits
+    /// for the handler to fill them and then completes, as Linux's
+    /// `copy_to_user` and `copy_from_user` do for a userfaultfd made with
+    /// `user_mode_only(false)` (upstream's `persist.rs`): their fault goes
+    /// through mm/memory.c `do_anonymous_page` to `handle_userfault`.
+    /// macOS's own `read` into such a page fails with `EFAULT` instead.
+    #[test]
+    fn test_system_calls_wait_for_missing_pages() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(2);
+        register(ctx, mem, 2 * ps).unwrap();
+        let chan = channel(user);
+        let [r, w] = {
+            let mut fds = [0; 2];
+            // SAFETY: creates two descriptors.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            fds
+        };
+        let data = [0x22u8; 16];
+        // SAFETY: 16 bytes into the pipe; then the plain call into a missing page.
+        unsafe {
+            assert_eq!(libc::write(w, data.as_ptr().cast(), 16), 16);
+            assert_eq!(libc::read(r, (mem + 8) as *mut core::ffi::c_void, 16), -1);
+        }
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EFAULT));
+        // A read into the first page (the call writes the memory, a write
+        // fault as on Linux), then a write from the second (a read fault):
+        // each call waits for its page.
+        let page = std::vec![0x11u8; ps as usize];
+        let (into, from) = (mem + 8, mem + ps + 8);
+        type Call = Box<dyn FnOnce() -> isize + Send>;
+        let calls: [(u64, u64, Call); 2] = [
+            (into, proto::FLAG_WRITE, Box::new(move || {
+                // SAFETY: registered memory; the fault is served below.
+                unsafe { syscalls::read(r, into as *mut core::ffi::c_void, 16) }
+            })),
+            (from, 0, Box::new(move || {
+                // SAFETY: as above.
+                unsafe { syscalls::write(w, from as *const core::ffi::c_void, 16) }
+            })),
+        ];
+        for (at, flags, call) in calls {
+            let call = std::thread::spawn(call);
+            assert!(readable(user), "no page fault event for {at:#x}");
+            let mut rec = [0u8; proto::RECORD];
+            assert!(read_full(user, &mut rec));
+            assert_eq!(words(&rec), [proto::EVENT_PAGEFAULT, at, flags, 0]);
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!call.is_finished(), "the call went on before the fill");
+            let base = at - at % ps;
+            assert_eq!(request(chan, [proto::OP_COPY, base, ps, 0], &page), (ps as i64, ps));
+            assert_eq!(call.join().unwrap(), 16);
+        }
+        // SAFETY: filled pages; the pipe holds what the write took.
+        unsafe {
+            assert_eq!(ptr::read_volatile(mem as *const u8), 0x11);
+            assert_eq!(ptr::read_volatile(into as *const u8), 0x22);
+            let mut back = [0u8; 16];
+            assert_eq!(libc::read(r, back.as_mut_ptr().cast(), 16), 16);
+            assert_eq!(back, [0x11u8; 16]);
+        }
+        unregister(ctx, mem, 2 * ps).unwrap();
+        close(&[r, w, chan, user]);
+    }
+
     /// Whether the peer of `fd` closed it, within five seconds.
     fn peer_closed(fd: c_int) -> bool {
         if !readable(fd) {

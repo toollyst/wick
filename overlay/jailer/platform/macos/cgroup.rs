@@ -467,6 +467,39 @@ mod tests {
         }
     }
 
+    /// The reason `CPUS_ONLY_ALL` gives, measured: XNU's arm
+    /// `ml_get_max_affinity_sets` returns 0 (osfmk/arm/cpu_affinity.h), so
+    /// `thread_policy_set` and `thread_policy_get` answer `THREAD_AFFINITY_POLICY`
+    /// with `KERN_NOT_SUPPORTED` (osfmk/kern/thread_policy.c).
+    #[test]
+    fn test_no_cpu_affinity() {
+        let mut policy = libc::thread_affinity_policy_data_t { affinity_tag: 1 };
+        // SAFETY: the calling thread's own port, which needs no release.
+        let thread = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
+        // SAFETY: a policy of THREAD_AFFINITY_POLICY_COUNT integers.
+        let set = unsafe {
+            libc::thread_policy_set(
+                thread,
+                libc::THREAD_AFFINITY_POLICY as libc::thread_policy_flavor_t,
+                (&raw mut policy).cast(),
+                libc::THREAD_AFFINITY_POLICY_COUNT,
+            )
+        };
+        let mut count = libc::THREAD_AFFINITY_POLICY_COUNT;
+        let mut get_default: libc::boolean_t = 0;
+        // SAFETY: as above, with the count and flag the call writes.
+        let get = unsafe {
+            libc::thread_policy_get(
+                thread,
+                libc::THREAD_AFFINITY_POLICY as libc::thread_policy_flavor_t,
+                (&raw mut policy).cast(),
+                &mut count,
+                &mut get_default,
+            )
+        };
+        assert_eq!((set, get), (libc::KERN_NOT_SUPPORTED, libc::KERN_NOT_SUPPORTED));
+    }
+
     fn builder(version: u8, props: &[&str]) -> Result<CgroupConfigurationBuilder, JailerError> {
         let mut b = CgroupConfigurationBuilder::new(version, "/proc/mounts")?;
         for p in props {

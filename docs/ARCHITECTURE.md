@@ -95,11 +95,16 @@ firecracker binary, vmm   (upstream source + patches/)
    userfaultfd (`libc::wick_uffd`) catches missing pages with `PROT_NONE` and
    a signal on the host and stage-2 protection in the guest, sleeps until the
    handler fills them, and fills a page before a system call (`read`, `pread`,
-   `recv`, ...) touches it, as Linux's `copy_to_user` would. The HVF backend
+   `recv`, `write`, ...) touches it, as Linux's `copy_to_user` and `copy_from_user`
+   would (their fault reaches `handle_userfault` through mm/memory.c
+   `do_anonymous_page`, for a userfaultfd made with `user_mode_only(false)`,
+   as upstream makes it; `test_system_calls_wait_for_missing_pages`). The HVF backend
    calls into it as KVM's `get_user_pages` would. And when the libc replaces
    the pages of a range (`madvise(DONTNEED)` of private memory, a `MAP_FIXED`
    mapping), the backend unmaps the range from stage 2 for the duration
-   (`libc::wick_guest`), as Linux's MMU notifier zaps KVM's stage-2 entries:
+   (`libc::wick_guest`), as Linux's MMU notifier zaps KVM's stage-2 entries
+   (virt/kvm/kvm_main.c `kvm_mmu_notifier_invalidate_range_start`, arch/arm64/kvm/mmu.c
+   `kvm_unmap_gfn_range`; `test_replaced_pages_are_reported_to_the_guest_hooks`):
    Hypervisor.framework maps physical pages, not host addresses, so the guest
    would otherwise keep the old pages.
 5. **wick features go through the extension point.** Upstream calls `vmm::ext`

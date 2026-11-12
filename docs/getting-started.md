@@ -186,8 +186,10 @@ are upstream's, in `/private/var/wick/firecracker/vm1/` next to `root/` (`freeze
 jailer leaves for each jail until it ends. The jailer refuses
 what macOS cannot enforce, each with its reason: other cgroup controllers (`cpuset.cpus` and `cpuset.mems` only
 when they name every CPU and memory node) and CPU limits below 1% or above
-255% of one CPU. Networking inside a jail is a Unix datagram endpoint, since the sandbox denies IP networking and
-vmnet needs root: in the jail, or in the jail's network, as on Windows: `--netns DIR` names a directory of
+255% of one CPU. Networking inside a jail is a Unix datagram endpoint, since the sandbox denies IP networking, and the
+jailed Firecracker is not root, which vmnet's bridged mode (and every mode before macOS 26) needs; vmnet-shared
+and vmnet-host on macOS 26 need no root but have not yet been run in a jail. The endpoint is in the jail, or in
+the jail's network, as on Windows: `--netns DIR` names a directory of
 endpoints you made, where a `host_dev_name` without `/` is then made, and your host-side switch binds its own
 socket there too (by the directory's real path or a name relative to it). Two jails given one directory share a
 network; a jail given its own reaches no other's. [SECURITY.md](../SECURITY.md) has how each control is held.

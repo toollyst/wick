@@ -238,9 +238,13 @@ struct Channel {
     /// Our end.
     fd: RawFd,
     /// The end sent to the serving thread with `HELLO`, until it has answered
-    /// a request. macOS can discard a descriptor that is only referenced by a
-    /// message in flight (the receiver then gets a socket whose peer is gone),
-    /// so the sender keeps it open until the receiver certainly holds it.
+    /// a request. While only the message in flight refers to a socket, and the
+    /// message waits on a socket that was never in flight itself, XNU's
+    /// collector (`unp_gc`, bsd/kern/uipc_usrreq.c) does not reach it and
+    /// flushes it (`sorflush`: its data discarded, its receive side shut), so
+    /// the serving thread would get a socket that reads end of file; Linux
+    /// keeps it (net/unix/garbage.c `unix_vertex_dead`). The sender keeps it
+    /// open until the receiver certainly holds it (`test_inflight_socket_is_flushed`).
     sent: Option<RawFd>,
 }
 
@@ -824,5 +828,111 @@ mod tests {
         // Registered twice.
         let e = uffd.register(mem.cast(), ps);
         assert!(matches!(e, Err(Error::SystemError(Errno::EBUSY))), "{e:?}");
+    }
+
+    fn socket_pair() -> [RawFd; 2] {
+        let mut fds = [0; 2];
+        // SAFETY: creates two descriptors.
+        let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "{}", Errno::last());
+        fds
+    }
+
+    /// Sends one byte over `fd` with `right` as SCM_RIGHTS, as `channel`
+    /// sends `HELLO`; with no `right`, receives one and returns its descriptor.
+    fn byte_with_right(fd: RawFd, right: Option<RawFd>) -> Option<RawFd> {
+        let mut byte = *b"h";
+        // SAFETY: arithmetic on a size.
+        let space = unsafe { libc::CMSG_SPACE(mem::size_of::<RawFd>() as u32) } as usize;
+        let mut control = vec![0u8; space];
+        // SAFETY: a msghdr over local buffers, with room for one descriptor.
+        unsafe {
+            let mut iov = libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut msg: libc::msghdr = mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = space as _;
+            if let Some(right) = right {
+                let h = libc::CMSG_FIRSTHDR(&msg);
+                (*h).cmsg_level = libc::SOL_SOCKET;
+                (*h).cmsg_type = libc::SCM_RIGHTS;
+                (*h).cmsg_len = libc::CMSG_LEN(mem::size_of::<RawFd>() as u32) as _;
+                *(libc::CMSG_DATA(h).cast::<RawFd>()) = right;
+                assert_eq!(libc::sendmsg(fd, &msg, 0), 1, "{}", Errno::last());
+                return None;
+            }
+            assert_eq!(libc::recvmsg(fd, &mut msg, 0), 1, "{}", Errno::last());
+            let h = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!h.is_null(), "no descriptor received");
+            Some(*(libc::CMSG_DATA(h).cast::<RawFd>()))
+        }
+    }
+
+    /// Reads one byte from a received socket and closes it: whether it was
+    /// the byte its peer wrote (a flushed socket reads end of file).
+    fn kept_its_byte(fd: RawFd) -> bool {
+        let mut got = [0u8];
+        // SAFETY: a one-byte buffer; a descriptor this test owns.
+        let n = unsafe { libc::read(fd, got.as_mut_ptr().cast(), 1) };
+        // SAFETY: as above.
+        unsafe { libc::close(fd) };
+        n == 1 && got == *b"x"
+    }
+
+    /// One round: sockets `kept` and `closed` are sent over `a` to `b`, which
+    /// is in this process's table and never in flight; `closed` is closed
+    /// after sending, as `channel` closed its end before `sent` stayed open,
+    /// and `kept` stays open. A byte is written into each one's queue, a Unix
+    /// socket is freed (`unp_unlock` then queues `unp_gc`), and both are
+    /// received and read. Returns whether each kept its byte.
+    fn inflight_round() -> (bool, bool) {
+        let [a, b] = socket_pair();
+        let [kept_peer, kept] = socket_pair();
+        let [closed_peer, closed] = socket_pair();
+        byte_with_right(a, Some(kept));
+        byte_with_right(a, Some(closed));
+        // SAFETY: descriptors this test owns; one-byte writes.
+        unsafe {
+            libc::close(closed);
+            assert_eq!(libc::write(kept_peer, b"x".as_ptr().cast(), 1), 1);
+            assert_eq!(libc::write(closed_peer, b"x".as_ptr().cast(), 1), 1);
+            let [x, y] = socket_pair();
+            libc::close(x);
+            libc::close(y);
+        }
+        // unp_gc runs as a thread call, which nothing here can wait for; with
+        // 20 ms it had run in 100 of 100 rounds of the probe this test comes
+        // from (macOS 27.2), and the test needs it in one round of ROUNDS.
+        thread::sleep(std::time::Duration::from_millis(20));
+        let kept_got = kept_its_byte(byte_with_right(b, None).unwrap());
+        let closed_got = kept_its_byte(byte_with_right(b, None).unwrap());
+        // SAFETY: descriptors this test owns.
+        unsafe {
+            for fd in [a, b, kept_peer, closed_peer, kept] {
+                libc::close(fd);
+            }
+        }
+        (kept_got, closed_got)
+    }
+
+    /// Why `Channel::sent` stays open: XNU's collector flushes a socket that
+    /// only a message waiting on a never-in-flight socket refers to (Linux
+    /// keeps it), and keeps one this process still has open. A round where
+    /// the closed socket was flushed is one where the collector ran after
+    /// both were in flight, so the kept one was judged in that same pass.
+    #[test]
+    fn test_inflight_socket_is_flushed() {
+        const ROUNDS: usize = 10;
+        let rounds: Vec<(bool, bool)> = (0..ROUNDS).map(|_| inflight_round()).collect();
+        let flushed = rounds.iter().filter(|(_, closed)| !closed).count();
+        assert!(flushed > 0, "XNU's unp_gc flushed no in-flight socket in {ROUNDS} rounds");
+        assert!(
+            rounds.iter().all(|(kept, _)| *kept),
+            "a socket kept open was flushed: {rounds:?}"
+        );
     }
 }
