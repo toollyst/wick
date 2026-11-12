@@ -121,6 +121,8 @@ slirp_cflags="$(env PATH="/opt/homebrew/bin:$PATH" pkg-config --cflags --libs sl
     die "libslirp missing: brew install libslirp pkg-config"
 # shellcheck disable=SC2086
 cc -O2 -Wall -Wextra -Werror -o "$bin/netns-slirp" "$ROOT/tools/macos/integration/netns-slirp.c" $slirp_cflags
+# A host program in a test's network (tools/macos/integration/bin/ip).
+cc -O2 -Wall -Wextra -Werror -dynamiclib -o "$bin/netns-preload.dylib" "$ROOT/tools/macos/integration/netns-preload.c"
 # crosvm's vhost-user block device (tools/macos/integration/bin/crosvm).
 (cd "$ROOT/tools/vhost-user-blk" && CARGO_TARGET_DIR="$ROOT/lib/firecracker/build/vhost-user-blk" \
     cargo build --release --locked)
@@ -191,7 +193,8 @@ env_args=(
     "PATH=$ROOT/tools/macos/integration/bin:$SCREEN_DIR:/opt/homebrew/opt/e2fsprogs/sbin:$PATH:/opt/homebrew/bin"
     "PYTHONPATH=$ROOT/tools/macos/integration"
     "WICK_IT_MODE=$mode" "WICK_IT_ROOT=$session" "TMPDIR=$session/tmp"
-    "WICK_IT_NETNS_HELPER=$bin/netns-slirp" "WICK_IT_VHOST_USER_BLK=$bin/vhost-user-blk"
+    "WICK_IT_NETNS_HELPER=$bin/netns-slirp" "WICK_IT_NETNS_PRELOAD=$bin/netns-preload.dylib"
+    "WICK_IT_VHOST_USER_BLK=$bin/vhost-user-blk"
     "WICK_IT_BINARY_DIR=$bin"
     "MKE2FS_CONFIG=$ROOT/tools/macos/integration/mke2fs.conf"
     "PYTEST_ADDOPTS=${PYTEST_ADDOPTS:-}"

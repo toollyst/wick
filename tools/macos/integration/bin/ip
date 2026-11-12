@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 # Copyright 2026 toollyst contributors.
 # SPDX-License-Identifier: Apache-2.0
-"""`ip netns exec <ns> ssh|scp ...` for upstream's framework on macOS.
+"""`ip netns exec <ns> <program> ...` for upstream's framework on macOS.
 
-On Linux the framework reaches a guest from inside its network namespace.
+On Linux the framework reaches a guest from inside its network namespace,
+and runs host programs there (a server the guest connects to, iperf3).
 A macOS network (tools/macos/integration/wick_macos_net.py) is a directory
-of endpoints with a host side: ssh and scp reach the guest through the host
-side's forward to its port 22 (ProxyCommand). Anything else refuses loudly,
-as no host program can run inside such a network (docs/PORTING.md row 6).
+of endpoints with a host side, netns-slirp: ssh and scp reach the guest
+through the host side's forward to its port 22 (ProxyCommand); any other
+program runs with tools/macos/integration/netns-preload.c inserted, which
+puts its IPv4 sockets into the network (its header says how). A program
+macOS's System Integrity Protection guards (in /usr/bin, /bin, /sbin,
+/usr/sbin, /usr/libexec, /System) does not get an inserted library: it is
+refused rather than run outside the network.
 """
 
 import os
+import shutil
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -56,6 +62,26 @@ def destination(argv):
     return None, port
 
 
+PROTECTED = ("/usr/bin/", "/bin/", "/sbin/", "/usr/sbin/", "/usr/libexec/", "/System/")
+
+
+def program_in_network(ns, control, cmd):
+    """Runs `cmd` with its IPv4 sockets in the network (netns-preload)."""
+    preload = os.environ.get("WICK_IT_NETNS_PRELOAD")
+    if not preload or not os.path.exists(preload):
+        fail("WICK_IT_NETNS_PRELOAD is not set or missing: run tools/macos/integration-tests.sh")
+    path = shutil.which(cmd[0])
+    if path is None:
+        fail(f"{cmd[0]}: not found")
+    real = os.path.realpath(path)
+    if real.startswith(PROTECTED):
+        fail(f"{cmd[0]} is {real}, which System Integrity Protection runs without inserted "
+             f"libraries: it cannot run inside network namespace {ns}")
+    env = dict(os.environ, DYLD_INSERT_LIBRARIES=preload, WICK_NETNS_CTL=control,
+               WICK_NETNS_FWD=os.path.join(ROOT, "netns", f"{ns}.fwd"))
+    os.execve(path, cmd, env)
+
+
 def main():
     args = sys.argv[1:]
     if args[:2] != ["netns", "exec"] or len(args) < 4:
@@ -65,10 +91,7 @@ def main():
         fail("WICK_IT_ROOT is not set: run tools/macos/integration-tests.sh")
     control = os.path.join(ROOT, "netns", f"{ns}.ctl")
     if os.path.basename(cmd[0]) not in ("ssh", "scp"):
-        fail(
-            f"{' '.join(cmd)!r} in network namespace {ns}: a macOS network is a directory of "
-            "endpoints, a host program cannot run inside it (docs/PORTING.md row 6)"
-        )
+        program_in_network(ns, control, cmd)
     cmd[0] = os.path.basename(cmd[0])
     host, port = destination(cmd)
     if host is None:
