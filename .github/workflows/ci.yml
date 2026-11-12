@@ -297,24 +297,14 @@ jobs:
       # runs the same script there).
       - name: Nitro Enclave refused without the device
         run: python3 -I tools/macos/enclave-refusal-test.py lib/firecracker/build/cargo_target/debug/firecracker
-      - name: Compatibility crate tests
-        working-directory: lib/firecracker
-        run: |
-          for c in libc vmm-sys-util memfd userfaultfd; do
-            cargo test --locked --manifest-path "../../crates/compat/$c/Cargo.toml"
-          done
-          # The tests that create a VM need Hypervisor.framework, which GitHub's
-          # macOS runners (virtual machines) do not have; tools/macos/test.sh
-          # runs them, and tools/macos/boot-test.sh the scenarios.
-          cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- --skip hvf::vm::tests:: \
-            --skip hvf::vcpu::tests::test_kvm_ptp_counters
-      - name: Host sandbox and jail hand-over tests
-        working-directory: lib/firecracker
-        # ext::snapshot_vcpu_tests restore a vCPU, which needs
-        # Hypervisor.framework (GitHub's macOS runners have none: hv_vm_create
-        # gives ENOTSUP); tools/macos/test.sh -- ext:: runs them on a Mac.
-        run: |
-          cargo test --locked -p vmm --lib "ext::" -- --skip ext::snapshot_vcpu_tests::
+      # Every test of every crate but the jailer runs; the ones that cannot
+      # pass on a runner (they create a VM, and GitHub's macOS runners have no
+      # Hypervisor.framework) are listed by name and reason, and the check
+      # fails on an unlisted failure, a listed test that passes, or a listed
+      # name that is no test. tools/macos/test.sh runs the listed ones on a
+      # Mac, and tools/macos/boot-test.sh the scenarios.
+      - name: Unit tests of every crate but the jailer (tools/macos/unit-test-differences.txt)
+        run: python3 -I tools/macos/check-unit-tests.py
       # The jailer's tests run as root, as upstream's do (they set resource
       # limits and change owners); the runners have passwordless sudo.
       - name: Jailer unit tests
@@ -322,7 +312,10 @@ jobs:
         run: |
           bin=$(cargo test --locked -p jailer --no-run --message-format=json |
             jq -r 'select(.profile.test == true and .target.name == "jailer") | .executable')
-          sudo env RUST_TEST_THREADS=1 "$bin"
+          sudo env RUST_TEST_THREADS=1 "$bin" --skip platform::macos::freezer::tests::test_self_check_under_load
+          # Its count of the reads the old self-check would have failed on
+          # (libtest shows a passing test's output only with --nocapture).
+          sudo env RUST_TEST_THREADS=1 "$bin" platform::macos::freezer::tests::test_self_check_under_load --exact --nocapture
       - name: Jailer scenario tests (without a VM)
         run: tools/macos/jailer-test.sh --no-vm
       # Upstream's integration tests need a VM (tools/macos/integration-tests.sh
