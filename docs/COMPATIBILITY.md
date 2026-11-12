@@ -148,7 +148,7 @@ The rough status of each area. The sections below give each feature's status and
 | [cgroup controllers](#cgroup-controllers) | 🟢 | 🟡 memory, CPU; most others refused | 🟡 memory, CPU, cpuset, weight; the rest refused |
 | [Security and sandbox](#security-and-sandbox) | 🟢 | 🟡 Seatbelt, process-wide | 🟡 process mitigations, process-wide |
 | [Signals and exit codes](#signals-and-exit-codes) | 🟢 | 🟡 no real-time signals | 🔴 no signals from outside the process |
-| [Tools](#tools) | 🟢 | 🟡 no `seccompiler-bin`; `cpu-template-helper`'s fingerprint reads sysfs | 🟡 no `seccompiler-bin`; no fuzzing, gdb or instrumented builds yet |
+| [Tools](#tools) | 🟢 | 🟡 no `seccompiler-bin`; `cpu-template-helper`'s fingerprint reads sysfs | 🟡 no `seccompiler-bin`; no gdb build; the fuzzing and instrumented builds' tests not yet run |
 | [Upstream integration tests](#upstream-integration-tests) | 🟢 the baseline | 🟡 functional suites, as the user | 🟡 functional and security suites, under the jailer |
 
 Linux is the baseline. CI runs upstream's unit and integration tests on plain upstream and on wick, on the same
@@ -223,7 +223,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | PV time, steal time (aarch64) | ❔ untested; the backend reports no PV time device, and `test_guest_has_pvtime_enabled` has no Linux result | ⚪ |
 | Cache topology in the guest | 🟡 the guest has no cache entries: Firecracker reads them from sysfs, which macOS lacks (`test_cache_topology` [bug]) | ❔ listed for the VMM memory budget only (`test_cache_topology` [bug]) |
 | Guest-visible aarch64 features | ❔ `test_guest_cpu_features` is skipped on Linux x86_64 | ⚪ |
-| GDB stub | ❔ upstream's test needs an x86 vmlinux (`test_gdb_connects` [arch]) | 🔴 not done yet: no Windows build with the gdb feature (`test_gdb_connects` [bug]) |
+| GDB stub | ❔ upstream's test needs an x86 vmlinux (`test_gdb_connects` [arch]) | 🔴 not done yet: the build with the gdb feature fails: the WHP vCPU has no `translate_gva` or `set_guest_debug`, and wick's Unix socket is not one of gdbstub's connections (measured on Windows Server 2022; `test_gdb_connects` [bug]) |
 
 ## Memory and huge pages
 
@@ -328,7 +328,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | Logger to a file: level, origin, module | 🟢 `test_log_config`, `test_api_requests_logs`, `boot-test devices` | 🟡 `test_log_config`, `boot-test.ps1 devices`; errors in Windows' text (`test_api_requests_logs` [error-text]) |
 | Metrics to a file | 🟢 `test_metrics_default_shape`, `test_block_metrics`, `test_net_metrics`, `boot-test devices` | 🟢 `test_metrics_default_shape`, `test_block_metrics`, `boot-test.ps1 devices`; the net test fails only on the VMM memory budget (`test_net_metrics` [bug]) |
 | Logger or metrics to a FIFO | 🟢 metrics on a FIFO from `--metrics-path` and the log on one from `PUT /logger`, read from after Firecracker started, as upstream's `docs/logger.md` does (`boot-test cli`) | 🟡 a named pipe (`\\.\pipe\<name>`) is the counterpart: log lines arrive through one given as `--log-path` or with `PUT /logger`, and a reader that never reads (Debug lines from 300 requests into a 4 KiB pipe) or that goes away does not stop Firecracker (measured on a machine without WHP). Two differences: the reader makes the pipe before Firecracker opens it, as a FIFO must exist before, but there is no reader-less pipe to open (Linux opens a FIFO `O_RDWR` with no reader); and nothing is created at a `\\.\pipe\` path, so a pipe nobody made fails at the start with exit 1, where Linux creates a regular file. Metrics through a pipe, and `missed_log_count`: written, not yet run on a WHP machine (`boot-test.ps1 cli`) |
-| Log instrumentation | 🟢 `test_instrumentation_example_output`, `test_log_instrument_firecracker_basic_functionality` | 🟡 `test_instrumentation_example_output`; no Windows instrumented build yet (`test_log_instrument_firecracker_basic_functionality` [bug]) |
+| Log instrumentation | 🟢 `test_instrumentation_example_output`, `test_log_instrument_firecracker_basic_functionality` | 🟡 `test_instrumentation_example_output`; the instrumented build builds and, at Trace, logs entry and exit markers of the API's request handling (measured by hand on Windows Server 2022); its test not yet run (`test_log_instrument_firecracker_basic_functionality` [bug]) |
 
 ## `firecracker` command line
 
@@ -437,7 +437,7 @@ Linux. The macOS and Windows counterparts are not written yet (SECURITY.md, "Not
 | `cpu-template-helper` | 🟡 the fingerprint reads sysfs, which macOS lacks (`test_consecutive_fingerprint_consistency` [bug]); the dump test is x86 (`test_cpu_config_dump_vs_actual` [arch]) | 🟢 `test_cpu_config_dump_vs_actual`, `test_consecutive_fingerprint_consistency` |
 | `seccompiler-bin` | 🔴 impossible: no libseccomp, so it fails with an error (`ext::sandbox`) | 🔴 impossible, the same (`test_validate_filter` [impossible]) |
 | uffd example handlers | 🟢 `test_valid_handler`, `test_malicious_handler`, `boot-test uffd` | 🟢 `test_valid_handler`, `test_malicious_handler`, `boot-test.ps1 uffd` |
-| Fuzzing build, gdb build, instrumented build | 🟢 `test_fuzzing_warning`, `test_log_instrument_firecracker_basic_functionality`; gdb as under [CPU](#cpu) | 🔴 not done yet: no Windows builds (`test_fuzzing_warning`, `test_gdb_connects` [bug]) |
+| Fuzzing build, gdb build, instrumented build | 🟢 `test_fuzzing_warning`, `test_log_instrument_firecracker_basic_functionality`; gdb as under [CPU](#cpu) | 🔴 not done yet: the fuzzing and instrumented builds build (the fuzzing binary logs its warning and `+fuzzing`; measured by hand on Windows Server 2022), their tests not yet run (`test_fuzzing_warning`, `test_log_instrument_firecracker_basic_functionality` [bug]); the gdb build fails, as under [CPU](#cpu) (`test_gdb_connects` [bug]) |
 | Static binary, ELF debug info | 🔴 impossible: Mach-O, dynamically linked (`test_firecracker_binary_static_linking`, `test_release_debuginfo` [impossible]) | 🔴 impossible: PE image, PDB (`test_firecracker_binary_static_linking`, `test_release_no_gdb` [impossible]) |
 | Binary size | 🟢 `test_firecracker_binary_size`, `test_jailer_binary_size` | 🟢 `test_firecracker_binary_size`, `test_jailer_binary_size` |
 | `devtool` (upstream's Docker dev container) | ⚪ Linux and Docker only; `tools/macos/*.sh` replace it | ⚪ Linux only; `tools/windows/*.ps1` replace it |
