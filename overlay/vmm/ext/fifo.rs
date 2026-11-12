@@ -23,7 +23,8 @@
 //! anything is in the overflow every write goes behind it, so the order is
 //! kept; a thread made at the first FIFO's open (before the host sandbox
 //! narrows) moves the overflow into the FIFO as the reader makes room; it
-//! stops for the API process's fork ([`before_fork`], [`after_fork`]). A
+//! stops for the API process's fork, gone from the kernel's count of threads
+//! when [`before_fork`] returns, and runs again after it ([`after_fork`]). A
 //! write of up to 4096 bytes (Linux's `PIPE_BUF`) is taken whole or not at
 //! all. Only the overflow can be lost at an abrupt end (`SIGKILL`, and
 //! `SIGTERM`, `SIGINT`, `SIGQUIT`, which Firecracker leaves at their default
@@ -52,7 +53,9 @@ pub fn drain() {}
 /// Called before a `fork`: no thread of this module's to stop where the
 /// file is the FIFO itself.
 #[cfg(not(target_os = "macos"))]
-pub fn before_fork() {}
+pub fn before_fork() -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Called after a `fork`, on both sides: nothing to do where the file is
 /// the FIFO itself.
@@ -554,9 +557,12 @@ mod macos {
     /// Stops the relay thread before a `fork` (`ext::api_process::split`,
     /// which forks only from one thread): it holds the overflows' locks
     /// while it runs, and a fork copies only the calling thread. Waits for
-    /// a relay pass in progress to end. [`after_fork`] starts it again.
-    pub fn before_fork() {
-        relay::stop();
+    /// a relay pass in progress to end, and then until the kernel counts
+    /// the relay's thread no more (`relay::stop`); a thread the kernel
+    /// still lists 10 s after its join is an error, and the split fails
+    /// by it. [`after_fork`] starts the relay again.
+    pub fn before_fork() -> io::Result<()> {
+        relay::stop()
     }
 
     /// After a `fork` that [`before_fork`] preceded, or after the `fork`
@@ -575,6 +581,13 @@ mod macos {
         } else {
             relay::restart()
         }
+    }
+
+    /// [`before_fork`]'s wait for a joined relay, on thread `tid` (the test
+    /// of its error: a thread that has not ended).
+    #[cfg(test)]
+    pub(crate) fn reaped(tid: u64, wait: Duration) -> io::Result<()> {
+        relay::reaped(tid, wait)
     }
 
     /// The bytes all overflows hold now (the split test: Firecracker's relay
@@ -604,7 +617,18 @@ mod macos {
             wake_w: AtomicI32,
             /// The relay thread, while it runs.
             thread: Mutex<Option<JoinHandle<()>>>,
+            /// The kernel's id of the relay thread (`thread_id`, unique
+            /// while the host is up), which the thread writes as it
+            /// starts; 0 before that.
+            tid: AtomicU64,
         }
+
+        /// How long [`stop`] waits for the kernel to take the relay's
+        /// thread, joined, off the process's list of threads.
+        const REAP: Duration = Duration::from_secs(10);
+        /// proc_info(2)'s flavor that lists a process's thread ids (xnu
+        /// bsd/sys/proc_info.h).
+        const PROC_PIDLISTTHREADIDS: libc::c_int = 28;
 
         static RELAY: OnceLock<Relay> = OnceLock::new();
         /// The relay ends at its next pass ([`stop`]).
@@ -647,6 +671,7 @@ mod macos {
                     wake_r: AtomicI32::new(r.into_raw_fd()),
                     wake_w: AtomicI32::new(w.into_raw_fd()),
                     thread: Mutex::new(None),
+                    tid: AtomicU64::new(0),
                 }
             });
             if fresh {
@@ -663,6 +688,7 @@ mod macos {
             let mut thread = relay.thread.lock().unwrap();
             if thread.is_none() {
                 STOP.store(false, Ordering::Release);
+                relay.tid.store(0, Ordering::Release);
                 *thread = Some(std::thread::Builder::new().name("fc_fifo".into()).spawn(move || run(relay))?);
             }
             Ok(())
@@ -676,16 +702,89 @@ mod macos {
             Ok(())
         }
 
-        /// Ends the relay thread, if it runs, and waits for it.
-        pub(super) fn stop() {
-            let Some(relay) = RELAY.get() else { return };
+        /// Ends the relay thread, if it runs, and waits for it: for its
+        /// join, and then until the kernel lists its thread no more.
+        ///
+        /// The join alone is not the thread's end to the kernel. An exiting
+        /// thread wakes its joiner before it asks the kernel to end it
+        /// (libpthread src/pthread.c `_pthread_terminate`:
+        /// `_pthread_joiner_wake`, then `__bsdthread_terminate`), and the
+        /// kernel takes an ended thread off its task's list, and out of
+        /// `thread_count`, later still, on its reaper thread (xnu
+        /// osfmk/kern/thread.c `thread_terminate_queue_invoke`). Until
+        /// then proc_info(2)'s `pti_threadnum` (`thread_count`,
+        /// osfmk/kern/bsd_kern.c `fill_taskprocinfo`) counts it, and
+        /// `ext::api_process::fork`, which reads that, refuses the fork
+        /// ("Firecracker has 2 threads").
+        pub(super) fn stop() -> io::Result<()> {
+            let Some(relay) = RELAY.get() else { return Ok(()) };
             let thread = relay.thread.lock().unwrap().take();
-            if let Some(thread) = thread {
-                STOP.store(true, Ordering::Release);
-                wake();
-                // A relay that panicked has ended too (and the panic aborts
-                // Firecracker: panic = "abort").
-                let _ = thread.join();
+            let Some(thread) = thread else { return Ok(()) };
+            STOP.store(true, Ordering::Release);
+            wake();
+            // A relay that panicked has ended too (and the panic aborts
+            // Firecracker: panic = "abort").
+            let _ = thread.join();
+            // Written by the thread before anything else, so before its end.
+            match relay.tid.load(Ordering::Acquire) {
+                0 => Err(io::Error::other("the FIFO relay's thread ended without its kernel thread id")),
+                tid => reaped(tid, REAP),
+            }
+        }
+
+        /// Waits until the kernel lists thread `tid`, which has been
+        /// joined, among this process's threads no more.
+        ///
+        /// It reads the list `thread_count` counts (`task->threads`; the
+        /// reaper takes a thread off the one and out of the other under one
+        /// hold of the task's lock, and both readings take that lock), by
+        /// the thread's id, which names no later thread. It ends: a joined
+        /// thread runs none of Firecracker's code and waits for nothing of
+        /// Firecracker's any more, only the rest of `_pthread_terminate`
+        /// into `__bsdthread_terminate`, and the kernel reaps it whatever
+        /// this thread does; this thread yields the processor between two
+        /// readings. A thread still listed after `wait` ([`REAP`]) is an
+        /// error, not waited for longer.
+        pub(super) fn reaped(tid: u64, wait: Duration) -> io::Result<()> {
+            let deadline = Instant::now() + wait;
+            while thread_ids()?.contains(&tid) {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::other(format!(
+                        "the FIFO relay's thread (id {tid}) was joined, and the kernel still lists it among this \
+                         process's threads {} ms later",
+                        wait.as_millis()
+                    )));
+                }
+                std::thread::yield_now();
+            }
+            Ok(())
+        }
+
+        /// The kernel's ids of this process's threads (proc_info(2)
+        /// `PROC_PIDLISTTHREADIDS`: xnu bsd/kern/proc_info.c
+        /// `proc_pidlistthreads`, osfmk/kern/bsd_kern.c
+        /// `fill_taskthreadlist`, which walks `task->threads` under the
+        /// task's lock). The same system call, on this process, as
+        /// `ext::api_process`'s count, which both sandbox profiles allow
+        /// (`process-info*` with `(target self)`).
+        fn thread_ids() -> io::Result<Vec<u64>> {
+            let mut ids = vec![0u64; 64];
+            loop {
+                let size = libc::c_int::try_from(std::mem::size_of_val(ids.as_slice())).map_err(io::Error::other)?;
+                // SAFETY: a valid output buffer of the size passed.
+                let got = unsafe {
+                    libc::proc_pidinfo(libc::getpid(), PROC_PIDLISTTHREADIDS, 0, ids.as_mut_ptr().cast(), size)
+                };
+                if got <= 0 {
+                    // A process has a thread: 0 bytes is the call's failure.
+                    return Err(io::Error::last_os_error());
+                }
+                if got < size {
+                    ids.truncate(usize::try_from(got).map_err(io::Error::other)? / std::mem::size_of::<u64>());
+                    return Ok(ids);
+                }
+                // A full buffer may be a list cut short.
+                ids.resize(ids.len() * 2, 0);
             }
         }
 
@@ -766,6 +865,12 @@ mod macos {
         }
 
         fn run(relay: &'static Relay) {
+            let mut tid = 0u64;
+            // SAFETY: 0 names the calling thread; `tid` is written.
+            if unsafe { libc::pthread_threadid_np(0, &mut tid) } != 0 {
+                tid = 0;
+            }
+            relay.tid.store(tid, Ordering::Release);
             set_mask();
             let mut buf = [0u8; 64];
             loop {
@@ -1024,6 +1129,94 @@ pub(crate) mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    // A relay thread the kernel still lists when the wait is over is an
+    // error that says so (here a thread that has not ended: this one), and
+    // a thread id the kernel does not list is no wait.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_a_relay_thread_the_kernel_still_lists_is_an_error() {
+        let mut tid = 0u64;
+        // SAFETY: 0 names the calling thread; `tid` is written.
+        assert_eq!(unsafe { libc::pthread_threadid_np(0, &mut tid) }, 0);
+        let start = Instant::now();
+        let err = super::macos::reaped(tid, Duration::from_millis(50)).unwrap_err();
+        assert!(start.elapsed() >= Duration::from_millis(50), "{:?}", start.elapsed());
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the FIFO relay's thread (id {tid}) was joined, and the kernel still lists it among this process's \
+                 threads 50 ms later"
+            )
+        );
+        // Thread ids start above 0 and u64::MAX is none.
+        super::macos::reaped(u64::MAX, Duration::ZERO).unwrap();
+    }
+
+    /// How often [`relay_stop_child`] stops the relay.
+    #[cfg(target_os = "macos")]
+    const RELAY_STOPS: usize = 1000;
+
+    // When `before_fork` returns, the kernel counts the relay's thread no
+    // more: `ext::api_process::split` forks only from a process of one
+    // thread, by the kernel's count, and `pthread_join` returns before the
+    // joined thread's kernel thread has gone (libpthread pthread.c
+    // `_pthread_terminate`: `_pthread_joiner_wake` before
+    // `__bsdthread_terminate`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_the_relay_stopped_for_a_fork_is_gone_from_the_kernels_count() {
+        use std::io::Read;
+        let (_dir, path) = fifo("log");
+        let mut c = child("relay_stop_child", &path);
+        let status = wait_child(&mut c);
+        let mut out = String::new();
+        c.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+        assert!(
+            status.success() && out.contains(&format!("RELAY-STOP more-than-one-thread 0 of {RELAY_STOPS}\n")),
+            "{status:?}\n{out}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_the_relay_stopped_for_a_fork_is_gone_from_the_kernels_count"]
+    fn relay_stop_child() {
+        use crate::ext::api_process::threads;
+        // In a fork, whose only thread is this one, as Firecracker's main
+        // thread at the split.
+        // SAFETY: the fork runs the test and ends; this process waits for
+        // it and ends as it ended.
+        match unsafe { libc::fork() } {
+            0 => {}
+            // SAFETY: the fork's pid; ends this process as it ended.
+            pid => unsafe {
+                let mut status = 0;
+                libc::waitpid(pid, &mut status, 0);
+                if libc::WIFEXITED(status) {
+                    libc::_exit(libc::WEXITSTATUS(status));
+                }
+                libc::_exit(128 + libc::WTERMSIG(status));
+            },
+        }
+        assert_eq!(threads().unwrap(), 1, "the fork has one thread");
+        // The first FIFO's open starts the relay.
+        let _out = open_file_nonblock(&child_path()).unwrap();
+        let mut more = 0;
+        for round in 0..RELAY_STOPS {
+            assert_eq!(threads().unwrap(), 2, "round {round}: the relay runs");
+            super::before_fork().unwrap();
+            // What `ext::api_process::fork` reads, and refuses the fork by.
+            if threads().unwrap() != 1 {
+                more += 1;
+            }
+            super::after_fork(false).unwrap();
+        }
+        println!("RELAY-STOP more-than-one-thread {more} of {RELAY_STOPS}");
+        std::io::stdout().flush().unwrap();
+        // SAFETY: ends the fork.
+        unsafe { libc::_exit(0) }
     }
 
     // A line written while the FIFO has room is in it when the write

@@ -413,6 +413,8 @@ pub fn set_validator(validate: fn(&Request)) {
 
 #[cfg(target_os = "macos")]
 pub use macos::{set_waiting, split, wait_for_server, watch_child};
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use macos::threads;
 
 #[cfg(windows)]
 pub use windows::{
@@ -524,8 +526,9 @@ mod macos {
         *WAITING.lock().unwrap() = Some(link);
     }
 
-    /// Threads of this process.
-    fn threads() -> Result<usize, ApiProcessError> {
+    /// Threads of this process, as the kernel counts them (xnu
+    /// osfmk/kern/bsd_kern.c `fill_taskprocinfo`: `task->thread_count`).
+    pub(crate) fn threads() -> Result<usize, ApiProcessError> {
         // SAFETY: an all-zero proc_taskinfo is a valid output buffer.
         let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
         let size = i32::try_from(std::mem::size_of::<libc::proc_taskinfo>()).unwrap();
@@ -619,11 +622,14 @@ mod macos {
         }
         // The thread that moves the FIFOs' overflows (`ext::fifo`), made at
         // the first FIFO's open (`--metrics-path`, `--log-path`), stops for
-        // the fork, and runs again after it, whether or not it was made.
-        crate::ext::fifo::before_fork();
-        let forked = fork(server, kill_switch, payload_limit);
-        let relay = crate::ext::fifo::after_fork(false)
-            .map_err(|e| ApiProcessError::Fork(std::io::Error::other(format!("the FIFO relay: {e}"))));
+        // the fork (when `before_fork` returns, the kernel counts it no
+        // more), and runs again after it, whether or not it was made.
+        let relay_error =
+            |e| ApiProcessError::Fork(std::io::Error::other(format!("the FIFO relay: {e}")));
+        let forked = crate::ext::fifo::before_fork()
+            .map_err(relay_error)
+            .and_then(|()| fork(server, kill_switch, payload_limit));
+        let relay = crate::ext::fifo::after_fork(false).map_err(relay_error);
         let link = forked?;
         relay?;
         Ok(link)
