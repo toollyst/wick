@@ -243,8 +243,11 @@ sampler=$!
 rm -rf "$out/test_results"
 mkdir -p "$out/test_results"
 cp "$out/provenance.txt" "$out/pytest.log"
+# A file that does not import (test_seccomp_validate.py needs Linux's
+# libseccomp) would end the whole session: the run goes on without it, and
+# the comparison counts it as a difference unless it is listed.
 pytest=("$ROOT/build/integration/venv/bin/python" -m pytest -p wick_macos --binary-dir "$bin"
-    "--json-report-file=$out/test_results/test-report.json" "$@")
+    "--json-report-file=$out/test_results/test-report.json" --continue-on-collection-errors "$@")
 [[ -x "$ROOT/build/integration/venv/bin/python" ]] || die "no Python environment: tools/macos/integration/venv.sh"
 set +e
 if [[ $mode == jailer ]]; then

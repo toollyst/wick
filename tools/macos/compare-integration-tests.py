@@ -17,6 +17,9 @@ reason. It fails when:
 - a test that exists only on macOS fails, unlisted;
 - a listed test passed (the entry is stale), or an entry names no test of a
   file the run collected;
+- a file failed to collect (pytest's --continue-on-collection-errors goes
+  on without it) and is not listed: its Linux-passing tests count as not
+  run, and the file itself is a difference;
 - there is no report, or pytest failed without a failing test.
 
 An entry names a test (a test function, a file) or a failure:
@@ -101,8 +104,14 @@ def main():
     report = args.out / "test-report.json"
     mac = {}
     failures = {}  # node id: the crash message of each phase that failed
+    uncollected = {}  # a file that failed to collect: the last line of its error
     if report.exists():
-        for t in json.loads(report.read_text())["tests"]:
+        data = json.loads(report.read_text())
+        for c in data.get("collectors", []):
+            if c.get("outcome") == "failed" and c.get("nodeid", "").endswith(".py"):
+                lines = [ln for ln in str(c.get("longrepr", "")).splitlines() if ln.strip()]
+                uncollected[c["nodeid"]] = lines[-1].strip().removeprefix("E").strip() if lines else "no error text"
+        for t in data["tests"]:
             mac[t["nodeid"]] = t["outcome"]
             failures[t["nodeid"]] = [
                 (t[phase].get("crash") or {}).get("message", "")
@@ -113,7 +122,7 @@ def main():
         problems.append("no test-report.json")
     linux = baseline()
     listed = differences(mode)
-    files = {n.split("::", 1)[0] for n in mac}
+    files = {n.split("::", 1)[0] for n in mac} | set(uncollected)
 
     def entry_for(nodeid):
         for e in listed:
@@ -141,7 +150,7 @@ def main():
     for nodeid, lo in sorted(linux.items()):
         if nodeid.split("::", 1)[0] not in files:
             continue
-        if nodeid not in mac and not args.full:
+        if nodeid not in mac and not args.full and nodeid.split("::", 1)[0] not in uncollected:
             continue
         mo = mac.get(nodeid, "not run")
         e = entry_for(nodeid)
@@ -194,6 +203,13 @@ def main():
         elif module in files and entry not in used and kind == "bug":
             problems.append(f"entry '{entry}' (bug) matched nothing that failed")
 
+    for path, why in sorted(uncollected.items()):
+        e = entry_for(path)
+        if e:
+            used.add(e[0])
+        else:
+            problems.append(f"{path}: failed to collect ({why}), unlisted")
+
     status = (args.out / "status").read_text().strip() if (args.out / "status").exists() else "?"
     if status not in ("0", "1") and not problems:
         problems.append(f"pytest exited with {status}")
@@ -206,6 +222,12 @@ def main():
     lc = Counter(o for n, o in linux.items() if n.split("::", 1)[0] in files)
     lines.append("| Linux, same files | " + " | ".join(str(lc[k]) for k in ("passed", "failed", "error", "skipped")) + " |")
     lines.append("")
+    if uncollected:
+        lines.append(f"### Files that failed to collect ({len(uncollected)})")
+        for path, why in sorted(uncollected.items()):
+            e = entry_for(path)
+            lines.append(f"- `{path}`: {why}" + (f" (listed: {e[1]})" if e else " (unlisted)"))
+        lines.append("")
     by_kind = defaultdict(list)
     for e, items in excused.items():
         by_kind[e[1]].append((e, items))

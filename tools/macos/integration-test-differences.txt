@@ -24,6 +24,14 @@
 # raises ENOSYS rather than pretend.
 all impossible integration_tests/functional/test_api.py::test_api_machine_config
 
+# The test compiles each filter with libseccomp too (`import seccomp`, its
+# Python binding) and compares the BPF with seccompiler's. libseccomp exists
+# for Linux only (seccomp is a Linux kernel interface); macOS's filters are
+# Seatbelt profiles. The file does not import (measured: ModuleNotFoundError:
+# No module named 'seccomp'), and the run goes on without it
+# (--continue-on-collection-errors).
+all impossible integration_tests/security/test_seccomp_validate.py
+
 # Ctrl+Alt+Del is the x86 i8042 keyboard controller's: upstream skips the
 # test off x86_64 ("not yet implemented on aarch64"), and the Linux results
 # are x86_64's.
