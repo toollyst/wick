@@ -1,0 +1,36 @@
+#!/bin/sh
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+# util-linux's losetup, as upstream's tests call it (test_drive_virtio.py's
+# test_rescan_dev): `losetup --find --show FILE` makes a block device of a
+# file and prints its node, `losetup --detach DEV` removes it.
+#
+# macOS: a disk image attached without mounting it (hdiutil attach -nomount,
+# as a raw image, CRawDiskImage: the file's bytes are the disk's, as a loop
+# device's are). Its /dev/diskN is the user's who attached it (measured:
+# brw-r----- <user> staff), so the user opens it read-write, where Linux's
+# loop devices need root. Its size is the file's.
+set -eu
+die() { echo "losetup (wick, macOS): $*" >&2; exit 1; }
+case "${1:-}" in
+--find)
+    [ "$#" -eq 3 ] && [ "$2" = --show ] || die "only --find --show FILE and --detach DEV are supported"
+    [ -f "$3" ] || die "$3: not a file"
+    out="$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$3" 2>/dev/null)" ||
+        die "hdiutil attach $3 failed"
+    dev="$(printf '%s\n' "$out" | awk 'NR == 1 { print $1 }')"
+    case "$dev" in /dev/disk*) ;; *) die "hdiutil attach $3: no device in '$out'" ;; esac
+    # Recorded for the session's end (integration-tests.sh), which detaches
+    # what a failed test left attached.
+    [ -n "${WICK_IT_ROOT:-}" ] && mkdir -p "$WICK_IT_ROOT/.attached" && : >"$WICK_IT_ROOT/.attached/${dev#/dev/}"
+    echo "$dev"
+    ;;
+--detach | -d)
+    [ "$#" -eq 2 ] || die "--detach DEV"
+    hdiutil detach "$2" >/dev/null 2>&1 || hdiutil detach -force "$2" >/dev/null 2>&1 ||
+        die "hdiutil detach $2 failed"
+    [ -n "${WICK_IT_ROOT:-}" ] && rm -f "$WICK_IT_ROOT/.attached/${2#/dev/}"
+    true
+    ;;
+*) die "only --find --show FILE and --detach DEV are supported, not '$*'" ;;
+esac

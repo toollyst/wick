@@ -577,7 +577,18 @@ if RUNS_AS_USER:
 
     def jailed_path(self, file_path, create=False, subdir="."):
         """`JailerContext.jailed_path` without the chown to the jail's user;
-        everything else is upstream's."""
+        everything else is upstream's, but for a block device: upstream
+        makes a node of the same device in the jail (mknod), which macOS
+        allows only root (measured as the user: EPERM). The user-mode jail
+        is no chroot, and a symbolic link in it to the device's node names
+        the same device for Firecracker, which opens it through the link."""
+        src = pathlib.Path(file_path)
+        if create and src.is_block_device():
+            dst = pathlib.Path(self.chroot_path()) / subdir / src.name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.unlink(missing_ok=True)
+            dst.symlink_to(src)
+            return str(pathlib.Path("/") / subdir / src.name)
         with _jail_user_is_session_user():
             return _real_jailed_path(self, file_path, create, subdir)
 
