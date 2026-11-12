@@ -47,6 +47,19 @@ struct IoEvent {
     eventfd: EventFd,
 }
 
+/// Whether an ioeventfd at `addr` of `len` bytes (0: any) with `datamatch`
+/// (None: any value) collides with `ev`, by KVM's rule (virt/kvm/eventfd.c,
+/// ioeventfd_check_collision, which kvm_assign_ioeventfd_idx answers with
+/// -EEXIST): the same bus and address, and either length 0, or the same
+/// length and either without a datamatch or the same datamatch.
+fn collides(ev: &IoEvent, addr: &IoEventAddress, len: u32, datamatch: Option<u64>) -> bool {
+    ev.addr == *addr
+        && (ev.len == 0
+            || len == 0
+            || (ev.len == len
+                && (ev.datamatch.is_none() || datamatch.is_none() || ev.datamatch == datamatch)))
+}
+
 impl IoEvent {
     fn matches(&self, addr: &IoEventAddress, data: &[u8]) -> bool {
         if self.addr != *addr {
@@ -661,19 +674,28 @@ impl VmFd {
     }
 
     /// Registers an eventfd that is signalled on a matching guest I/O write.
+    ///
+    /// As KVM_IOEVENTFD: the length is the datamatch's size (kvm-ioctls'
+    /// register_ioevent: `size_of::<T>()`, 0 for NoDatamatch, which
+    /// matches a write of any length), and one that collides with a
+    /// registered one is refused with EEXIST ([`collides`]).
     pub fn register_ioevent<T: Into<u64>>(
         &self,
         fd: &EventFd,
         addr: &IoEventAddress,
         datamatch: T,
     ) -> Result<()> {
-        let datamatch_val = datamatch.into();
-        let has_datamatch = std::mem::size_of::<T>() > 0;
+        let len = u32::try_from(std::mem::size_of::<T>()).unwrap();
+        let datamatch = (len > 0).then(|| datamatch.into());
+        let mut ioevents = self.inner.ioevents.write().unwrap();
+        if ioevents.iter().any(|ev| collides(ev, addr, len, datamatch)) {
+            return err(libc::EEXIST);
+        }
         let eventfd = fd.try_clone().map_err(io_err)?;
-        self.inner.ioevents.write().unwrap().push(IoEvent {
+        ioevents.push(IoEvent {
             addr: *addr,
-            len: 0,
-            datamatch: has_datamatch.then_some(datamatch_val),
+            len,
+            datamatch,
             fd: fd.as_raw_fd(),
             eventfd,
         });
@@ -687,13 +709,13 @@ impl VmFd {
         addr: &IoEventAddress,
         datamatch: T,
     ) -> Result<()> {
-        let datamatch_val = datamatch.into();
-        let has_datamatch = std::mem::size_of::<T>() > 0;
-        let want = has_datamatch.then_some(datamatch_val);
+        let len = u32::try_from(std::mem::size_of::<T>()).unwrap();
+        let want = (len > 0).then(|| datamatch.into());
         let mut ioevents = self.inner.ioevents.write().unwrap();
         let before = ioevents.len();
-        ioevents
-            .retain(|ev| !(ev.addr == *addr && ev.datamatch == want && ev.fd == fd.as_raw_fd()));
+        ioevents.retain(|ev| {
+            !(ev.addr == *addr && ev.len == len && ev.datamatch == want && ev.fd == fd.as_raw_fd())
+        });
         if ioevents.len() == before {
             return err(libc::ENOENT);
         }
@@ -1503,5 +1525,29 @@ mod tests {
         retired.clear();
         assert!(!open(watched), "the retired eventfd was not closed");
         assert!(open(device.as_raw_fd()), "the caller's eventfd is the caller's");
+    }
+
+    // KVM's collision rule for ioeventfds, which register_ioevent refuses
+    // with EEXIST: vmm's test_bar_relocation and _refused register a probe
+    // where a device's notification ioeventfd is, and expect the refusal.
+    #[test]
+    fn test_an_ioeventfd_that_collides_is_refused() {
+        let ev = |addr, len, datamatch| {
+            let e = EventFd::new(0).unwrap();
+            IoEvent { addr, len, datamatch, fd: e.as_raw_fd(), eventfd: e }
+        };
+        let m = IoEventAddress::Mmio(0x1000);
+        let queue1 = ev(m, 4, Some(1));
+        // The same registration again.
+        assert!(collides(&queue1, &m, 4, Some(1)));
+        // Without a datamatch, or of any length: it covers the other.
+        assert!(collides(&queue1, &m, 0, None));
+        assert!(collides(&ev(m, 0, None), &m, 8, Some(5)));
+        // Virtio-MMIO's queues share the notify address, one value each.
+        assert!(!collides(&queue1, &m, 4, Some(2)));
+        // Another length, address or bus.
+        assert!(!collides(&queue1, &m, 2, Some(1)));
+        assert!(!collides(&queue1, &IoEventAddress::Mmio(0x1004), 4, Some(1)));
+        assert!(!collides(&queue1, &IoEventAddress::Pio(0x1000), 4, Some(1)));
     }
 }

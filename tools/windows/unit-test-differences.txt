@@ -128,12 +128,11 @@ error-text vmm vstate::vm::tests::test_register_memory_regions
 
 # vmm: WHP and KVM differ, measured on CI (run 43292883636), once the maps
 # after the first microVM worked (the header). To root-cause:
-bug vmm devices::virtio::transport::pci::device::tests::test_bar_relocation
-bug vmm devices::virtio::transport::pci::device::tests::test_bar_relocation_refused
-#   (a second ioeventfd at an address one is registered at is accepted
-#   (device.rs:1514 and :1572, unwrap_err of Ok); KVM refuses one that
-#   collides, same address and length and datamatch, with EEXIST
-#   (virt/kvm/eventfd.c, kvm_assign_ioeventfd_idx: ioeventfd_check_collision))
+# (pci::device's test_bar_relocation and _refused were listed until
+# kvm-ioctls' WHP register_ioevent refused a colliding ioeventfd with EEXIST,
+# by KVM's rule (virt/kvm/eventfd.c, ioeventfd_check_collision; whp/vm.rs
+# collides): a second ioeventfd at an address one was registered at had been
+# accepted (device.rs:1514 and :1572, unwrap_err of Ok), run 43292883636.)
 bug vmm vstate::vcpu::tests::test_vcpu_dump_cpu_config
 #   (its last send_event(Finish) fails: VcpuSendEventError(Error(31)), the
 #   last error of the vCPU thread's kick (vmm-sys-util windows/signal.rs
