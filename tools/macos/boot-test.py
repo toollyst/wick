@@ -1142,6 +1142,35 @@ def sandbox_denies(pid, operation):
     return lib.sandbox_check(pid, operation.encode(), 0) == 1
 
 
+def sandboxed(pid):
+    """Whether `pid` runs in a sandbox at all (sandbox_check, no operation)."""
+    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    lib.sandbox_check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    lib.sandbox_check.restype = ctypes.c_int
+    return lib.sandbox_check(pid, None, 0) == 1
+
+
+def stage_no_seccomp(ctx):
+    """Without --no-seccomp, Firecracker and its API process run in the
+    Seatbelt profile (upstream's seccomp filters: vmm::ext::sandbox); with
+    it, neither does, and the guest runs either way. The check is one the
+    profile denies with an error, not SIGSYS (issuing a sandbox extension),
+    so asking does not end the process."""
+    results = []
+    for flag in ([], ["--no-seccomp"]):
+        vm = ctx.vm("no-seccomp" if flag else "seccomp", flag, config(ctx))
+        vm.shell()
+        _, out = vm.sh("echo guest-$((6*7))")
+        check(out == "guest-42", f"guest {flag}: {out!r}")
+        procs = [vm.proc.pid] + children(vm.proc.pid)
+        state = [(sandboxed(p), sandbox_denies(p, "generic-issue-extension")) for p in procs]
+        want = (not flag, not flag)
+        check(all(st == want for st in state), f"{' '.join(flag) or 'default'}: (sandboxed, denies) of {procs}: {state}")
+        vm.reboot()
+        results.append(f"{len(procs)} processes {'not ' if flag else ''}sandboxed")
+    return f"default: {results[0]}; --no-seccomp: {results[1]}; the guest runs in both"
+
+
 def stage_api_process(ctx):
     # On Linux the API thread has a filter of its own, narrower than the VMM
     # thread's. The macOS sandbox is per process, so the API server's HTTP
@@ -1367,7 +1396,19 @@ def stage_cli(ctx):
         wall = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000 - t0
         metrics = read_metrics(mfifo.text(wait_for="utc_timestamp_ms"))
         log = lfifo.text(wait_for='Get request on "/machine-config"')
-        vm.kill()
+        # The readers go away mid-run: Firecracker holds both FIFOs open
+        # read-write and non-blocking (utils::open_file_nonblock, as on
+        # Linux), so a write past a full pipe fails with EAGAIN rather than
+        # raising SIGPIPE or blocking, and the microVM and the API go on.
+        mfifo.close()
+        lfifo.close()
+        for _ in range(500):
+            vm.api("GET", "/machine-config")
+        vm.api("PUT", "/actions", {"action_type": "FlushMetrics"})
+        vm.shell()
+        _, out = vm.sh("echo after-$((6*7))")
+        check(out == "after-42", f"guest after the FIFO readers went: {out!r}")
+        vm.reboot()
     finally:
         mfifo.close()
         lfifo.close()
@@ -1377,7 +1418,26 @@ def stage_cli(ctx):
     start, cpu = api["process_startup_time_us"], api["process_startup_time_cpu_us"]
     check(0 < start <= wall, f"process_startup_time_us {start}, {wall} us since --start-time-us")
     check(parent < cpu < parent + wall * os.cpu_count(), f"process_startup_time_cpu_us {cpu} (parent {parent}, wall {wall})")
-    done.append(f"start time metrics {start} us, {cpu} CPU us (of {wall} us); logger and metrics on FIFOs")
+    done.append(f"start time metrics {start} us, {cpu} CPU us (of {wall} us); logger and metrics on FIFOs, "
+                "and the microVM goes on once their readers went")
+
+    # A log FIFO nobody ever reads: Firecracker opens it without a reader
+    # (O_RDWR), and once the pipe is full each line is lost and counted in
+    # logger.missed_log_count (logging.rs), as on Linux.
+    unread = os.path.join(ctx.sock, "unread.fifo")
+    os.mkfifo(unread)
+    metrics = os.path.join(ctx.out, "cli-unread.metrics")
+    vm = ctx.vm("cli-unread", ["--log-path", unread, "--level", "Debug", "--metrics-path", metrics], config(ctx))
+    vm.shell()
+    for _ in range(2000):
+        vm.api("GET", "/machine-config")
+    vm.api("PUT", "/actions", {"action_type": "FlushMetrics"})
+    missed = read_metrics(metrics)[-1]["logger"]["missed_log_count"]
+    check(missed > 0, f"logger.missed_log_count {missed} after 2000 requests logged to a FIFO nobody reads")
+    _, out = vm.sh("echo unread-$((6*7))")
+    check(out == "unread-42", f"guest with an unread log FIFO: {out!r}")
+    vm.reboot()
+    done.append(f"a log FIFO nobody reads: {missed} lines missed and counted, the microVM goes on")
 
     # --boot-timer: the guest's /usr/local/bin/init (upstream's rootfs
     # overlay) writes 123 to the boot timer device at the start of the MMIO
@@ -1431,6 +1491,13 @@ def stage_tools(ctx):
     vm.api("PATCH", "/vm", {"state": "Paused"})
     vm.api("PUT", "/snapshot/create", {"snapshot_type": "Diff", "snapshot_path": state, "mem_file_path": diff})
     vm.kill()
+    # The diff's memory file has holes where no page was dirtied (what
+    # rebase-snap copies around, by SEEK_DATA and SEEK_HOLE).
+    st = os.stat(diff)
+    with open(diff, "rb") as f:
+        hole = os.lseek(f.fileno(), 0, os.SEEK_HOLE)
+    check(st.st_size == 256 << 20 and st.st_blocks * 512 < st.st_size and hole < st.st_size,
+          f"diff memory file: {st.st_size} bytes, {st.st_blocks * 512} allocated, first hole at {hole}")
 
     # snapshot-editor info-vmstate: the version, the vCPU states and the
     # whole state (info.rs).
@@ -1456,6 +1523,34 @@ def stage_tools(ctx):
     r = editor("version", "--vmstate-path", ctx.kernel)
     check(r.returncode != 0, f"info-vmstate version of a kernel image: {r.returncode} {r.stdout!r}")
 
+    # A state file with another architecture's magic, then with a newer
+    # version, is refused at the load with upstream's error (snapshot/mod.rs,
+    # checked before the CRC), by snapshot-editor and by Firecracker, which
+    # then ends as after any failed load. bitcode writes the header first: a
+    # byte, the magic (8 bytes, little-endian), the version's length and text.
+    with open(full_state, "rb") as f:
+        raw = bytearray(f.read())
+    check(raw[1:9] == struct.pack("<Q", 0x0710_1984_AAAA_0000) and raw[10:16] == b"12.0.0",
+          f"state file header {raw[:16].hex()}")
+    x86 = raw[:1] + struct.pack("<Q", 0x0710_1984_8664_0000) + raw[9:]
+    newer = raw[:10] + b"99" + raw[12:]
+    patched = os.path.join(ctx.out, "tools-patched.state")
+    for what, data, error in (("x86_64 magic", x86, "Magic value does not match arch"),
+                              ("version 99.0.0", newer, "Invalid data version")):
+        with open(patched, "wb") as f:
+            f.write(data)
+        r = editor("version", "--vmstate-path", patched)
+        check(r.returncode != 0 and error in r.stdout + r.stderr,
+              f"info-vmstate of a state file with {what}: {r.returncode} {(r.stdout + r.stderr).strip()!r}")
+        vm = ctx.vm(f"tools-{what.split()[0]}", [])
+        reply = vm.api("PUT", "/snapshot/load", {"snapshot_path": patched,
+                                                 "mem_backend": {"backend_type": "File", "backend_path": base}},
+                       expect=(400,))
+        check(error in reply.get("fault_message", ""), f"load of a state file with {what}: {reply}")
+        code = vm.wait_exit(10)
+        check(code != 0, f"Firecracker after a failed load ({what}): exit {code}")
+    os.unlink(patched)
+
     # rebase-snap (deprecated for snapshot-editor edit-memory rebase): the
     # diff's data regions written over the base; both tools give the same file.
     other = os.path.join(ctx.out, "tools-base2.mem")
@@ -1475,8 +1570,9 @@ def stage_tools(ctx):
     _, out = vm.sh("echo $A $B")
     check(out == "before-42 second-49", f"after a rebase-snap restore: {out!r}")
     vm.reboot()
-    return ("info-vmstate version v12.0.0, vcpu-states (2 vCPUs, mpidr, PC), vm-state; a non-snapshot refused; "
-            "rebase-snap equals snapshot-editor rebase and restores")
+    return ("diff memory file has holes; info-vmstate version v12.0.0, vcpu-states (2 vCPUs, mpidr, PC), vm-state; "
+            "a non-snapshot refused; another arch's magic or a newer version refused by snapshot-editor and the "
+            "load; rebase-snap equals snapshot-editor rebase and restores")
 
 
 STAGES = {
@@ -1498,6 +1594,7 @@ STAGES = {
     "api-process": stage_api_process,
     "cli": stage_cli,
     "tools": stage_tools,
+    "no-seccomp": stage_no_seccomp,
 }
 
 
