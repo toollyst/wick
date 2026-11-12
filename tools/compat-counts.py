@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Copyright 2026 toollyst contributors.
 # SPDX-License-Identifier: Apache-2.0
-"""Per upstream test file: Linux's results and the differences each host lists.
+"""The generated parts of docs/COMPATIBILITY.md: progress per host, and per
+upstream test file Linux's results and the differences each host lists.
 
     python3 -I tools/compat-counts.py                       # print the table
     python3 -I tools/compat-counts.py --check docs/COMPATIBILITY.md
@@ -20,12 +21,20 @@ count of listed differences, not a measured pass rate: no run report is
 committed. A `failure:<exception>` entry names no test (it excuses whatever
 fails only with that exception), so it is a footnote, never a count.
 
---check FILE fails when the table between FILE's
-<!-- compat-counts:begin --> and <!-- compat-counts:end --> markers is not
-what this prints; --write FILE replaces it.
+The progress block counts the status icons of every feature table in the
+document (a table with macOS and Windows columns): each cell must start with
+one of 🟢 🟡 🔴 ⚪ ❔, and a 🔴 cell must say whether the host cannot do it
+("impossible") or it is "not done yet". A host's progress is the rows that
+work (🟢 or 🟡) out of the rows it can do: all rows but the ⚪ and the
+impossible ones. Untested (❔) and not done yet rows count against it.
+
+--check FILE fails when a block between FILE's markers
+(<!-- compat-progress:begin --> ... end, <!-- compat-counts:begin --> ...
+end) is not what this makes of FILE; --write FILE replaces them.
 """
 
 import argparse
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -36,6 +45,12 @@ MACOS = ROOT / "tools/macos/integration-test-differences.txt"
 WINDOWS = ROOT / "tools/windows/integration-test-differences.txt"
 BEGIN = "<!-- compat-counts:begin -->"
 END = "<!-- compat-counts:end -->"
+PROGRESS_BEGIN = "<!-- compat-progress:begin -->"
+PROGRESS_END = "<!-- compat-progress:end -->"
+HOSTS = ("macOS", "Windows")
+STATUSES = {"🟢": "same", "🟡": "differs", "🔴": "red", "⚪": "na", "❔": "untested"}
+# Sections whose tables are not feature tables.
+NOT_FEATURES = {"Summary", "Progress", "Upstream integration tests"}
 PREFIX = "integration_tests/"
 
 # The mode of macOS's differences file the counts are for: the functional
@@ -153,6 +168,116 @@ def tally(host, entries, linux):
     return per_file, notes
 
 
+def feature_rows(text):
+    """(area, feature, {host: status}) of each row of the document's feature tables."""
+    rows = []
+    area, header = None, None
+    for n, line in enumerate(text.splitlines(), 1):
+        if line.startswith("## "):
+            area, header = line[3:].strip(), None
+            continue
+        if line.startswith("#") or not line.startswith("|"):
+            header = None
+            continue
+        cells = [c.strip() for c in line.replace("\\|", "\0").strip().strip("|").split("|")]
+        if header is None:
+            header = cells
+            continue
+        if all(set(c) <= set("-: ") for c in cells) or area in NOT_FEATURES:
+            continue
+        if not all(h in header for h in HOSTS):
+            continue
+        status = {}
+        for host in HOSTS:
+            cell = cells[header.index(host)]
+            icon = cell[:1]
+            if icon not in STATUSES:
+                raise SystemExit(f"docs line {n}: the {host} cell starts with no status icon: {cell[:60]!r}")
+            kind = STATUSES[icon]
+            if kind == "red":
+                if re.match(r"🔴\s*impossible", cell):
+                    kind = "impossible"
+                elif re.match(r"🔴\s*not done yet", cell):
+                    kind = "not yet"
+                else:
+                    raise SystemExit(f"docs line {n}: a {host} 🔴 cell says neither impossible nor not done yet: "
+                                     f"{cell[:60]!r}")
+            status[host] = kind
+        rows.append((area, cells[0], status))
+    return rows
+
+
+def bar(done, of):
+    pct = 100 * done / of if of else 0
+    full = round(pct / 10)
+    return f"`{'█' * full}{'░' * (10 - full)}` {pct:.0f}%"
+
+
+def progress_cell(counts):
+    of = sum(counts.values()) - counts["na"] - counts["impossible"]
+    done = counts["same"] + counts["differs"]
+    return bar(done, of) + f" ({done} of {of})"
+
+
+def integration(linux, files, host):
+    """Linux-passing tests in the suites `host` has run: all, listed, and listed as impossible or arch."""
+    passed = [n for n, o in linux.items() if o == "passed" and not any(n.startswith(p) for p in NOT_RUN[host])]
+    listed = Counter()
+    for name, kinds in files.items():
+        if not any(name.startswith(p) for p in NOT_RUN[host]):
+            listed.update(kinds)
+    return len(passed), sum(listed.values()), listed["impossible"] + listed["arch"]
+
+
+def progress(text):
+    rows = feature_rows(text)
+    linux = baseline()
+    mac_files, _ = tally("macOS", [e for e in macos_entries() if e[2] in ("all", MACOS_MODE)], linux)
+    win_files, _ = tally("Windows", windows_entries(), linux)
+    files = {"macOS": mac_files, "Windows": win_files}
+    per_host = {h: Counter(r[2][h] for r in rows) for h in HOSTS}
+    areas = []
+    for area, _, _ in rows:
+        if area not in areas:
+            areas.append(area)
+
+    out = [f"Generated by `tools/compat-counts.py` from the {len(rows)} feature rows below and the differences "
+           "files; CI fails when it is stale.", ""]
+    out += ["| | macOS | Windows |", "| --- | --- | --- |"]
+    out.append("| **Works (🟢 or 🟡), of what the host can do** | "
+               + " | ".join(f"**{progress_cell(per_host[h])}**" for h in HOSTS) + " |")
+    for label, key in (("🟢 Same as Linux", "same"), ("🟡 Works, with differences", "differs"),
+                       ("🔴 Not done yet", "not yet"), ("❔ Not tested", "untested"),
+                       ("🔴 Impossible on the host (refused)", "impossible"), ("⚪ Not applicable", "na")):
+        out.append(f"| {label} | " + " | ".join(str(per_host[h][key]) for h in HOSTS) + " |")
+    cells = []
+    for h in HOSTS:
+        total, listed, impossible = integration(linux, files[h], h)
+        suites = "functional" if NOT_RUN[h] else "functional and security"
+        cells.append(f"{bar(total - listed, total - impossible)} ({total - listed} of {total - impossible}; "
+                     f"{suites})")
+    out.append("| **Upstream integration tests that agree with Linux**, of those the host can run | "
+               + " | ".join(cells) + " |")
+    out += ["", "| Area | macOS | Windows |", "| --- | --- | --- |"]
+    for area in areas:
+        anchor = re.sub(r"[^a-z0-9 -]", "", area.lower()).replace(" ", "-")
+        counts = {h: Counter(r[2][h] for r in rows if r[0] == area) for h in HOSTS}
+        out.append(f"| [{area}](#{anchor}) | " + " | ".join(progress_cell(counts[h]) for h in HOSTS) + " |")
+    out += ["", "Integration tests: Linux's passing tests in the suites the host has run, less the ones its "
+            "differences file lists; tests listed as impossible or x86_64-only are left out of the total. "
+            "macOS runs them as the user, without its security suite, and its memory-budget entry can excuse "
+            "more (see [Upstream integration tests](#upstream-integration-tests))."]
+    for h in HOSTS:
+        left = [(a, f, s[h]) for a, f, s in rows if s[h] in ("not yet", "untested")]
+        out += ["", f"<details><summary>{h}: {len(left)} rows left (🔴 not done yet or ❔ not tested)</summary>", ""]
+        for kind, icon in (("not yet", "🔴"), ("untested", "❔")):
+            for a, f, k in left:
+                if k == kind:
+                    out.append(f"- {icon} {a}: {f}")
+        out += ["", "</details>"]
+    return "\n".join(out) + "\n"
+
+
 def table():
     linux = baseline()
     mac = [e for e in macos_entries() if e[2] in ("all", MACOS_MODE)]
@@ -213,14 +338,18 @@ def table():
     return "\n".join(lines) + "\n"
 
 
-def embedded(path):
-    text = path.read_text(encoding="utf-8")
+def embedded(text, begin, end, path):
     try:
-        head, rest = text.split(BEGIN, 1)
-        body, tail = rest.split(END, 1)
+        head, rest = text.split(begin, 1)
+        body, tail = rest.split(end, 1)
     except ValueError:
-        raise SystemExit(f"{path}: no {BEGIN} ... {END} markers")
+        raise SystemExit(f"{path}: no {begin} ... {end} markers")
     return head, body, tail
+
+
+def blocks(text):
+    """Each generated block: (begin, end, what it should hold)."""
+    return [(PROGRESS_BEGIN, PROGRESS_END, progress(text)), (BEGIN, END, table())]
 
 
 def main():
@@ -229,20 +358,24 @@ def main():
     group.add_argument("--check", type=Path, metavar="FILE", help="fail if FILE's embedded table is stale")
     group.add_argument("--write", type=Path, metavar="FILE", help="replace FILE's embedded table")
     args = ap.parse_args()
-    out = table()
     if args.check:
-        _, body, _ = embedded(args.check)
-        if body.strip() != out.strip():
-            print(f"{args.check}: the integration test counts are stale; run "
-                  f"python3 -I tools/compat-counts.py --write {args.check}", file=sys.stderr)
-            return 1
-        print(f"{args.check}: integration test counts are current")
+        text = args.check.read_text(encoding="utf-8")
+        for begin, end, out in blocks(text):
+            _, body, _ = embedded(text, begin, end, args.check)
+            if body.strip() != out.strip():
+                print(f"{args.check}: the block {begin} is stale; run "
+                      f"python3 -I tools/compat-counts.py --write {args.check}", file=sys.stderr)
+                return 1
+        print(f"{args.check}: progress and integration test counts are current")
         return 0
     if args.write:
-        head, _, tail = embedded(args.write)
-        args.write.write_text(f"{head}{BEGIN}\n{out}{END}{tail}", encoding="utf-8")
+        text = args.write.read_text(encoding="utf-8")
+        for begin, end, out in blocks(text):
+            head, _, tail = embedded(text, begin, end, args.write)
+            text = f"{head}{begin}\n{out}{end}{tail}"
+        args.write.write_text(text, encoding="utf-8")
         return 0
-    sys.stdout.write(out)
+    sys.stdout.write(table())
     return 0
 
 

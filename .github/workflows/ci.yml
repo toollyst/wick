@@ -54,7 +54,7 @@ jobs:
       # the test that checks it, Windows cells included.
       - name: Doc claims name their tests
         run: python3 tools/check-claims.py --strict-windows
-      - name: Compatibility matrix counts are current
+      - name: Compatibility matrix progress and counts are current
         run: python3 -I tools/compat-counts.py --check docs/COMPATIBILITY.md
       - name: Cleanup script
         run: |
