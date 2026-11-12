@@ -471,6 +471,22 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+      # The machine on record before anything can fail: windows-latest is not
+      # one machine (run 43292883636's was an AMD EPYC 9V45; the runs before
+      # it printed none), and what the unit tests and the WHP step measure
+      # depends on its processor and on WHP being there.
+      - name: Host
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor | Format-List Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors
+          Get-CimInstance Win32_OperatingSystem | Format-List Caption,Version,BuildNumber
+          Get-CimInstance Win32_ComputerSystem | Format-List HypervisorPresent
+          try {
+            Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -ErrorAction Stop | Format-List FeatureName,State
+          } catch {
+            "HypervisorPlatform: not read ($($_.Exception.Message))"
+          }
+          if (Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll") { "WinHvPlatform.dll: present" } else { "WinHvPlatform.dll: absent" }
       - run: tools/setup.sh
       # Upstream tests put sockets and files under /tmp, which Windows
       # resolves to \tmp on the current drive.
@@ -640,23 +656,25 @@ jobs:
             tools/windows/README.md
           if-no-files-found: error
           retention-days: 14
-      # CI's runner has WHP (run 43277608081), so it is a WHP machine too:
-      # the host on record (processor, Windows build, WHP's capabilities),
-      # then kvm-ioctls' tests that need WHP, which the crate step leaves
-      # out (#[ignore]d, or skipped there). Each runs alone, in a process
-      # of its own (a test that leaves the process unable to map guest
-      # memory would spoil the next), with --nocapture so the WHPCAP,
-      # BPTEST and MAPTEST lines it prints are in the log, and must pass;
-      # what each expects is in its comment. The bp tests are measured on
-      # an AMD PC (70dfabf); on an Intel runner this is their first Intel
-      # measurement, test_bp_ways_on_record printing how each way to hand a
-      # #BP back fares there. Last, after the kit's upload, so a WHP result
-      # never costs the PC its kit; it runs whatever the steps before gave.
+      # CI's runner has WHP (run 43277608081), so it is a WHP machine too
+      # (the Host step records which): WHP's capabilities, then kvm-ioctls'
+      # tests that need WHP, which the crate step leaves out (#[ignore]d, or
+      # skipped there). Each runs alone, in a process of its own (a test
+      # that leaves the process unable to map guest memory would spoil the
+      # next), with --nocapture so the WHPCAP, BPTEST and MAPTEST lines it
+      # prints are in the log, and must pass; what each expects is in its
+      # comment. The bp tests were first measured on an AMD PC (70dfabf);
+      # run 43292883636's runner was AMD too, so an Intel runner, when one
+      # comes, gives their first Intel measurement (test_bp_ways_on_record
+      # prints how each way to hand a #BP back fares). Then libc's record of
+      # an AF_UNIX bind of each path form (BINDTEST lines; vmm's vhost-user
+      # tests fail in create_tmp_socket's bind). Last, after the kit's
+      # upload, so a WHP result never costs the PC its kit; it runs whatever
+      # the steps before gave.
       - name: WHP tests on the runner
         if: success() || failure()
         working-directory: lib/firecracker
         run: |
-          powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors; Get-CimInstance Win32_OperatingSystem | Format-List Caption,Version,BuildNumber"
           k=../../crates/compat/kvm-ioctls/Cargo.toml
           failed=0
           alone() {
@@ -686,4 +704,6 @@ jobs:
               test_bp_ways_on_record; do
             alone "whp::vcpu::bp_tests::$t" --features gdb
           done
+          k=../../crates/compat/libc/Cargo.toml
+          alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
           exit $failed

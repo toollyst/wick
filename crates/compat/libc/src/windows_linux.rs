@@ -1042,9 +1042,9 @@ mod tests {
     // connects to that path.
     #[test]
     fn test_unix_bind_with_the_whole_structure_size() {
-        let dir = std::env::temp_dir().join(format!("wick-bind-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(std::format!("wick-bind-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = format!("{}/tmp_socket", dir.to_str().unwrap());
+        let path = std::format!("{}/tmp_socket", dir.to_str().unwrap());
         // SAFETY: socket calls on our descriptors and buffers.
         unsafe {
             let fd = socket(AF_UNIX, crate::SOCK_STREAM, 0);
@@ -1062,5 +1062,55 @@ mod tests {
             assert_eq!(crate::close(fd), 0);
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The path vmm's create_tmp_socket binds on Windows. vmm-sys-util's
+    // TempDir::new canonicalizes the temporary directory, as upstream's
+    // does, and on Windows canonicalize gives the verbatim form `\\?\C:\...`
+    // (vmm's test_device_manager_persistence prints one, CI run
+    // 43292883636); create_tmp_socket then appends "/tmp_socket". The Win32
+    // file functions turn '/' into '\' except in a `\\?\` path, which goes
+    // to the file system as it is (Naming Files, Paths, and Namespaces,
+    // learn.microsoft.com/windows/win32/fileio/naming-a-file). vmm's
+    // vhost-user tests fail there with "Cannot bind socket", which carries
+    // no errno: this binds each form, plain and verbatim, with '/' and with
+    // '\' before the name, and prints each outcome with its errno (BINDTEST
+    // lines, CI's last step). It records; vmm's vhost-user tests are the
+    // assertion (tools/windows/unit-test-differences.txt).
+    #[test]
+    #[ignore = "records; CI's last step runs it with --nocapture"]
+    fn test_unix_bind_of_each_path_form_on_record() {
+        let plain = std::env::temp_dir().join(std::format!("wick-vbind-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
+        let verbatim = std::fs::canonicalize(&plain).unwrap();
+        for (form, dir) in [("plain", &plain), ("verbatim", &verbatim)] {
+            for sep in ['/', '\\'] {
+                let path = std::format!("{}{sep}tmp_socket", dir.to_str().unwrap());
+                // SAFETY: socket calls on our descriptor and buffers.
+                let outcome = unsafe {
+                    let fd = socket(AF_UNIX, crate::SOCK_STREAM, 0);
+                    assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+                    let mut a: sockaddr_un = std::mem::zeroed();
+                    a.sun_family = u16::try_from(AF_UNIX).unwrap();
+                    let outcome = if path.len() < a.sun_path.len() {
+                        std::ptr::copy(path.as_ptr().cast(), a.sun_path.as_mut_ptr(), path.len());
+                        let size = u32::try_from(std::mem::size_of::<sockaddr_un>()).unwrap();
+                        if bind(fd, (&raw const a).cast(), size) == 0 {
+                            std::string::String::from("ok")
+                        } else {
+                            let e = std::io::Error::last_os_error();
+                            std::format!("failed, errno {:?} ({e})", e.raw_os_error())
+                        }
+                    } else {
+                        std::format!("not tried: {} bytes, sun_path holds {}", path.len(), a.sun_path.len() - 1)
+                    };
+                    assert_eq!(crate::close(fd), 0);
+                    outcome
+                };
+                std::println!("BINDTEST {form} {sep:?} {path:?}: {outcome}");
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        std::fs::remove_dir_all(&plain).unwrap();
     }
 }

@@ -1206,18 +1206,18 @@ mod tests {
         assert_eq!(present, 1, "WHvCapabilityCodeHypervisorPresent");
     }
 
-    // CI run 43277608081: after vmm's test_vcpu_cpuid_restore, which keeps a
-    // VM with guest memory while a second VM maps (refused: one partition of
-    // a process maps memory at a time), every later map of the process failed
+    // CI run 43277608081: from a point on, every map of vmm's process failed
     // with ERROR_INVALID_PARAMETER (87). Two causes give that: WHP keeping
-    // something of the refused map, or of the first VM, after both are gone;
-    // or the first VM kept alive by a reference. These two tests tell them
-    // apart, each in a process of its own (CI's WHP step runs them so), as a
-    // process left unable to map would spoil the tests after it.
+    // something of a refused map, or of a VM, after it is gone; or a VM kept
+    // alive by a reference. These two tests tell them apart, each in a
+    // process of its own (CI's WHP step runs them so), as a process left
+    // unable to map would spoil the tests after it. Run 43292883636: both
+    // pass, so it was a VM kept alive: the irqfd watcher's (fixed in 28e7fb8;
+    // test_a_vm_with_an_irqfd_is_dropped_with_its_last_reference), and the
+    // map failures of vmm's tests that were left are each a test keeping a
+    // VM (tools/windows/unit-test-differences.txt).
     //
-    // Firecracker's need, asserted: once both are gone, a third VM maps. If
-    // this fails with 87, the cause is WHP's (the first), and the vmm entries
-    // listed after test_vcpu_cpuid_restore are a WHP limit.
+    // Firecracker's need, asserted: once both are gone, a third VM maps.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture, alone"]
     fn test_maps_after_a_refused_map_once_both_vms_are_gone() {

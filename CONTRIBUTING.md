@@ -250,12 +250,15 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   tests the same way (one at a time, `--no-fail-fast`; on CI's `windows`
   job) and fails on any failure not listed, with its reason, in
   `tools/windows/unit-test-differences.txt`, on a listed test that passes and
-  on an entry that names no test. CI's runner has WHP; the tests that make
-  a VM and fail there are listed as `whp-pc` with their measured cause, and
-  with `--whp`, on the WHP PC, they must pass. The job's last step, "WHP
-  tests on the runner", prints the runner's processor and WHP capabilities
-  and runs kvm-ioctls' tests that need WHP (`#[ignore]`d in `cargo test`),
-  each alone in a process of its own; on a WHP machine run one as
+  on an entry that names no test. CI's runner has WHP; a test that makes a
+  VM and fails there but must pass on the WHP PC is listed as `whp-pc` with
+  its measured cause, and with `--whp`, on the PC, it must pass (none is
+  listed at present: each failure there has a cause of another kind). The
+  job's first step, "Host", prints the runner's processor, Windows build
+  and whether WHP is there; its last step, "WHP tests on the runner",
+  prints WHP's capabilities and runs kvm-ioctls' tests that need WHP
+  (`#[ignore]`d in `cargo test`), and libc's record of an AF_UNIX bind of
+  each path form, each alone in a process of its own; on a WHP machine run one as
   `cargo test --manifest-path crates/compat/kvm-ioctls/Cargo.toml
   [--features gdb] -- --include-ignored --exact --nocapture <test>`.
 - On macOS, `tools/macos/integration-tests.sh` runs upstream's pytest suites

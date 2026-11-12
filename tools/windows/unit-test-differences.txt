@@ -36,6 +36,23 @@
 # they left the list. What still fails there is listed by its measured
 # cause below.
 #
+# Run 43277608081 also failed every guest-memory map of vmm's process after
+# builder's test_attach_balloon_device, and of cpu-template-helper's after
+# template::dump's test_dump, with ERROR_INVALID_PARAMETER (87): about 100
+# entries, then listed whp-pc. The cause was kvm-ioctls' irqfd watcher,
+# which held its VM by a strong reference until the VM was dropped, so a VM
+# that registered an irqfd was never dropped. Those two are the first tests
+# of their processes, in name order, to make a microVM, whose devices
+# register irqfds (device_manager/legacy.rs:68), and both pass; WHP maps
+# guest memory for one partition of a process at a time, and the kept VM's
+# memory refused every later map. 28e7fb8 holds the VM weakly, and in run
+# 43292883636 (same runner image, 20261103.298.1) the about 100 pass;
+# kvm-ioctls' test_a_vm_with_an_irqfd_is_dropped_with_its_last_reference
+# passes in its WHP step, and MAPTEST there shows a refused map leaves no
+# state behind and a kept VM refuses every later map. The whp-pc entries
+# that still failed there were each given their measured cause below; none
+# is whp-pc now.
+#
 # The checker reports every disagreement of a run (it does not stop at the
 # first), so one run is enough to bring the list in step.
 
@@ -47,6 +64,12 @@ linux-path vmm resources::tests::test_cpu_config_from_valid_json
 linux-path vmm resources::tests::test_cpu_config_inline
 #   (the JSON is built with format! from a temp file path; a Windows path's
 #   backslashes are invalid JSON escapes: "invalid escape, line 9, column 50")
+linux-path vmm device_manager::pci_mngr::tests::test_device_manager_persistence
+linux-path vmm device_manager::persist::tests::test_device_manager_persistence
+#   (the expected JSON is built with format! from TempFile's path, which on
+#   Windows is verbatim and has backslashes: the serialized "\\?\C:\..." is
+#   not the format!'s text (persist.rs:814 and 915, pci_mngr.rs:954), run
+#   43292883636)
 linux-path vmm nitro_enclave::ne_ioctl::tests::test_update_device_config_issues_ioctl
 linux-path vmm nitro_enclave::ne_ioctl::tests::test_update_device_config_rejects_bad_arguments
 linux-path vmm device_manager::nitro_enclave::tests::test_update_device_config_unknown_device
@@ -72,14 +95,6 @@ bug vmm devices::virtio::rng::device::tests::test_bandwidth_rate_limiter
 #   alone: if it passes, the cause is above them)
 
 # Other packages.
-whp-pc cpu-template-helper utils::tests::test_build_microvm
-whp-pc cpu-template-helper tests::test_template_dump_command
-whp-pc cpu-template-helper tests::test_fingerprint_dump_command
-whp-pc cpu-template-helper tests::test_template_verify_command
-#   (each builds a microVM. On CI, run 43277608081, they fail but their messages
-#   are lost: the test binary's own output stopped, libtest ending with "io
-#   error when listing tests: WriteZero, failed to write whole buffer". To
-#   root-cause; template::dump test_dump, which builds one too, passes)
 linux-path firecracker seccomp::tests::test_seccomp_config
 #   (SeccompConfig::from_args(false, Some("/dev/null")))
 bug clippy-tracing exclude
@@ -104,138 +119,64 @@ bug vmm arch::x86_64::vcpu::tests::test_get_msrs_with_invalid_msr_index
 #   (get_msrs of MSRs 2..=4, which KVM does not support, succeeds (vcpu.rs:1214))
 bug vmm arch::x86_64::vm::tests::test_vm_save_restore_state
 #   (save_state of a VM without irqchip, clock or PIT succeeds (vm.rs:284))
-whp-limit vmm arch::x86_64::vcpu::tests::test_vcpu_cpuid_restore
-#   (it keeps its first VM, with its guest memory, while it makes a second: WHP
-#   maps guest memory for one partition of a process at a time, and the second
-#   VM's map fails with ERROR_INVALID_PARAMETER, 87; kvm-ioctls'
-#   test_one_partition_of_a_process_maps_memory measures the limit)
 error-text vmm vstate::vm::tests::test_register_memory_regions
 #   (expects Linux's text for a region of 16 bytes, "Invalid argument (os error
 #   22)"; WHP refuses it with ERROR_INVALID_PARAMETER: "The parameter is
-#   incorrect. (os error 87)". Its later map, of a page, is one of the group
-#   below on CI)
+#   incorrect. (os error 87)". Its later map, of a page, would fail too: it
+#   runs after test_msi_vector_group_persistence, below)
 
-# vmm: tests that map guest memory after test_vcpu_cpuid_restore. On CI (run
-# 43277608081, one test at a time in name order) every guest-memory map of the
-# process after that test fails with ERROR_INVALID_PARAMETER (87):
-# SetUserMemoryRegion(Error(87)) from test_utils' setup_vm_with_memory, or
-# test_too_many_regions' first region. The maps of the tests before it (one
-# VM at a time, each dropped with its memory mapped) succeeded. Not yet
-# root-caused: WHP's state after a map refused beside another partition's
-# memory, or a reference that keeps that test's first VM after its panic.
-# kvm-ioctls' test_maps_after_a_refused_map_once_both_vms_are_gone and
-# test_a_vm_kept_alive_keeps_later_maps_refused tell them apart (CI's WHP
-# step and the PC). On the PC (--whp) they must pass.
-whp-pc vmm arch::x86_64::vm::tests::test_vm_save_restore_state_bad_irqchip
-whp-pc vmm arch::x86_64::vm::tests::test_vm_save_restore_state_kvm_clock_realtime
-whp-pc vmm builder::tests::test_attach_block_devices
-whp-pc vmm builder::tests::test_attach_boot_timer_device
-whp-pc vmm builder::tests::test_attach_entropy_device
-whp-pc vmm builder::tests::test_attach_net_devices
-whp-pc vmm builder::tests::test_attach_pmem_devices
-whp-pc vmm builder::tests::test_attach_virtio_mem_device
-whp-pc vmm builder::tests::test_attach_vsock_device
-whp-pc vmm device_manager::legacy::tests::test_register_legacy_devices
-whp-pc vmm device_manager::mmio::tests::test_device_info
-whp-pc vmm device_manager::mmio::tests::test_register_too_many_devices
-whp-pc vmm device_manager::mmio::tests::test_register_virtio_device
-whp-pc vmm device_manager::pci_mngr::tests::test_device_manager_persistence
-whp-pc vmm device_manager::persist::tests::test_device_manager_persistence
-whp-pc vmm device_manager::tests::test_hotplug_block
-whp-pc vmm device_manager::tests::test_hotplug_net
-whp-pc vmm device_manager::tests::test_hotplug_pci_not_enabled
-whp-pc vmm device_manager::tests::test_hotplug_pmem
-whp-pc vmm device_manager::tests::test_hotunplug_pci_not_enabled
-whp-pc vmm device_manager::tests::test_pci_bar_is_freed_on_unplug
-whp-pc vmm device_manager::tests::test_unplug_root_block
-whp-pc vmm device_manager::tests::test_unplug_root_pmem
-whp-pc vmm devices::pci::pci_segment::tests::test_io_bus
-whp-pc vmm devices::pci::pci_segment::tests::test_next_device_bdf
-whp-pc vmm devices::pci::pci_segment::tests::test_pci_segment_build
-whp-pc vmm devices::pci::pci_segment::tests::test_mmio_bus
-whp-pc vmm devices::virtio::mem::device::tests::test_config_as_bytes
-whp-pc vmm devices::virtio::mem::device::tests::test_event_fail_descriptor_chain_too_short
-whp-pc vmm devices::virtio::mem::device::tests::test_event_fail_descriptor_length_too_small
-whp-pc vmm devices::virtio::mem::device::tests::test_event_fail_response_descriptor_length_too_small
-whp-pc vmm devices::virtio::mem::device::tests::test_event_fail_unexpected_readonly_descriptor
-whp-pc vmm devices::virtio::mem::device::tests::test_event_fail_unexpected_writeonly_descriptor
-whp-pc vmm devices::virtio::mem::device::tests::test_from_state
-whp-pc vmm devices::virtio::mem::device::tests::test_invalid_range_out_of_bounds
-whp-pc vmm devices::virtio::mem::device::tests::test_invalid_range_unaligned
-whp-pc vmm devices::virtio::mem::device::tests::test_invalid_range_zero_blocks
-whp-pc vmm devices::virtio::mem::device::tests::test_new
-whp-pc vmm devices::virtio::mem::device::tests::test_plug_partial_kvm_failure_keeps_state_consistent
-whp-pc vmm devices::virtio::mem::device::tests::test_plug_request_already_plugged
-whp-pc vmm devices::virtio::mem::device::tests::test_plug_request_success
-whp-pc vmm devices::virtio::mem::device::tests::test_plug_request_too_big
-whp-pc vmm devices::virtio::mem::device::tests::test_repeated_unplug_all_is_noop
-whp-pc vmm devices::virtio::mem::device::tests::test_set_features
-whp-pc vmm devices::virtio::mem::device::tests::test_state_request_mixed
-whp-pc vmm devices::virtio::mem::device::tests::test_state_request_plugged
-whp-pc vmm devices::virtio::mem::device::tests::test_state_request_unplugged
-whp-pc vmm devices::virtio::mem::device::tests::test_status
-whp-pc vmm devices::virtio::mem::device::tests::test_unplug_all_request
-whp-pc vmm devices::virtio::mem::device::tests::test_unplug_request_not_plugged
-whp-pc vmm devices::virtio::mem::device::tests::test_unplug_request_success
-whp-pc vmm devices::virtio::mem::device::tests::test_unsupported_request
-whp-pc vmm devices::virtio::mem::device::tests::test_update_requested_size_device_not_active
-whp-pc vmm devices::virtio::mem::device::tests::test_update_requested_size_invalid_size
-whp-pc vmm devices::virtio::mem::device::tests::test_update_requested_size_success
-whp-pc vmm devices::virtio::mem::device::tests::test_write_config
-whp-pc vmm devices::virtio::mem::event_handler::tests::test_event_handler_activation
-whp-pc vmm devices::virtio::mem::event_handler::tests::test_process_mem_queue_event
-whp-pc vmm devices::virtio::mem::event_handler::tests::test_spurious_event_before_activation
-whp-pc vmm devices::virtio::mem::persist::tests::test_save_restore_state
-whp-pc vmm devices::virtio::mem::persist::tests::test_save_state
-whp-pc vmm devices::virtio::pmem::device::tests::test_from_config
-whp-pc vmm devices::virtio::pmem::device::tests::test_process_chain
-whp-pc vmm devices::virtio::pmem::persist::tests::test_persistence
-whp-pc vmm devices::virtio::pmem::persist::tests::test_restore_rejects_mismatched_config_space_size
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_activate_failure_sets_needs_reset
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_bar_relocation
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_bar_relocation_on_memory_space_enable_only
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_bar_relocation_refused
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_capabilities
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_device_initialization
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_isr_capability
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_notification_capability
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_pci_configuration_cap
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_pci_device_config
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_reading_bars
-whp-pc vmm devices::virtio::transport::pci::device::tests::test_reset_and_reinitialization
-whp-pc vmm pci::msix::tests::test_access_table
-whp-pc vmm pci::msix::tests::test_enable_msix_vectors
-whp-pc vmm pci::msix::tests::test_from_state_rejects_size_mismatches
-whp-pc vmm pci::msix::tests::test_msix_from_state
-whp-pc vmm pci::msix::tests::test_new_msix_config
-whp-pc vmm pci::msix::tests::test_pba_bit_invalid_vector
-whp-pc vmm pci::msix::tests::test_pba_invalid_offset
-whp-pc vmm pci::msix::tests::test_pba_read
-whp-pc vmm pci::msix::tests::test_pba_read_too_big
-whp-pc vmm pci::msix::tests::test_pending_interrupt
-whp-pc vmm pci::msix::tests::test_read_table_bad_length
-whp-pc vmm pci::msix::tests::test_read_table_past_end
-whp-pc vmm persist::tests::test_microvm_state_snapshot
-whp-pc vmm rpc_interface::tests::test_runtime_disallowed
-whp-pc vmm rpc_interface::tests::test_runtime_get_enclave_config_on_kvm_vm
-whp-pc vmm rpc_interface::tests::test_runtime_get_mmds
-whp-pc vmm rpc_interface::tests::test_runtime_get_vm_config
-whp-pc vmm vstate::vcpu::tests::test_handle_kvm_exit
-whp-pc vmm vstate::vcpu::tests::test_immediate_exit_shortcircuits_execution
-whp-pc vmm vstate::vcpu::tests::test_set_mmio_bus
-whp-pc vmm vstate::vcpu::tests::test_vcpu_dump_cpu_config
-whp-pc vmm vstate::vcpu::tests::test_vcpu_kick
-whp-pc vmm vstate::vcpu::tests::test_vcpu_pause_resume
-whp-pc vmm vstate::vcpu::tests::test_vcpu_save_state_events
-whp-pc vmm vstate::vm::tests::test_create_vcpus
-whp-pc vmm vstate::vm::tests::test_msi_vector_group_disable
-whp-pc vmm vstate::vm::tests::test_msi_vector_group_drop_frees_gsis
-whp-pc vmm vstate::vm::tests::test_msi_vector_group_new
-whp-pc vmm vstate::vm::tests::test_msi_vector_group_notifier
-whp-pc vmm vstate::vm::tests::test_msi_vector_group_persistence
-whp-pc vmm vstate::vm::tests::test_msi_vector_group_restore_rejects_out_of_range_gsi
-whp-pc vmm vstate::vm::tests::test_msi_vector_group_trigger
-whp-pc vmm vstate::vm::tests::test_msi_vector_group_update
-whp-pc vmm vstate::vm::tests::test_msi_vector_group_update_invalid_vector
-whp-pc vmm vstate::vm::tests::test_restore_state_resource_allocator
-whp-pc vmm vstate::vm::tests::test_too_many_regions
+# vmm: WHP and KVM differ, measured on CI (run 43292883636), once the maps
+# after the first microVM worked (the header). To root-cause:
+bug vmm devices::virtio::transport::pci::device::tests::test_bar_relocation
+bug vmm devices::virtio::transport::pci::device::tests::test_bar_relocation_refused
+#   (a second ioeventfd at an address one is registered at is accepted
+#   (device.rs:1514 and :1572, unwrap_err of Ok); KVM refuses one that
+#   collides, same address and length and datamatch, with EEXIST
+#   (virt/kvm/eventfd.c, kvm_assign_ioeventfd_idx: ioeventfd_check_collision))
+bug vmm vstate::vcpu::tests::test_vcpu_dump_cpu_config
+#   (its last send_event(Finish) fails: VcpuSendEventError(Error(31)), the
+#   last error of the vCPU thread's kick (vmm-sys-util windows/signal.rs
+#   send, QueueUserAPC2); Linux's pthread_kill of a thread that has exited
+#   returns 0 (musl: tid 0; glibc 2.34+: pd->exiting). To measure whether the
+#   thread had exited)
+error-text vmm vstate::vcpu::tests::test_handle_kvm_exit
+#   (expects Linux's text for libc::EINVAL, "Invalid argument (os error 22)";
+#   on Windows libc::EINVAL is ERROR_INVALID_PARAMETER: "The parameter is
+#   incorrect. (os error 87)")
+bug vmm devices::virtio::block::vhost_user::device::tests::test_activate
+bug vmm devices::virtio::block::vhost_user::device::tests::test_new_all_features
+bug vmm devices::virtio::block::vhost_user::device::tests::test_new_no_features
+bug vmm devices::virtio::vhost_user::tests::test_new
+#   (test_utils::create_tmp_socket panics "Cannot bind socket" (mod.rs:173),
+#   which carries no errno. Its path is TempDir::new's, canonicalized: on
+#   Windows the verbatim form `\\?\C:\...`, with "/tmp_socket" appended, and
+#   a `\\?\` path keeps its '/' (Naming Files, Paths, and Namespaces). libc's
+#   test_unix_bind_of_each_path_form_on_record, in CI's WHP step, prints the
+#   bind of each form with its errno. c7c8837's exact AF_UNIX length did not
+#   change it. Listed again after c7c8837 dropped these entries before they
+#   had run)
+
+# vmm: WHP maps guest memory for one partition of a process at a time
+# (kvm-ioctls' test_one_partition_of_a_process_maps_memory; MAPTEST in CI's
+# WHP step, run 43292883636: a VM kept alive keeps every later map refused
+# with ERROR_INVALID_PARAMETER, 87, and once it is gone maps work again).
+# These keep a VM with its guest memory while they make another: the second
+# VM's map fails with 87, as it would on every WHP host.
+whp-limit vmm arch::x86_64::vcpu::tests::test_vcpu_cpuid_restore
+whp-limit vmm arch::x86_64::vm::tests::test_vm_save_restore_state_bad_irqchip
+whp-limit vmm arch::x86_64::vm::tests::test_vm_save_restore_state_kvm_clock_realtime
+#   (the first VM is kept in a binding the second shadows: vcpu.rs:1008 and
+#   1026; vm.rs:307 and 322, 353 and 357)
+# test_msi_vector_group_persistence (which passes) ends with
+# std::mem::forget(restored_group): the group holds an Arc of its Vm, so the
+# VM and its mapped memory are never dropped, and every guest-memory map of
+# the process after it fails with 87. These are the tests after it in name
+# order that map guest memory (test_new, which maps none, passes):
+whp-limit vmm vstate::vm::tests::test_msi_vector_group_restore_rejects_out_of_range_gsi
+whp-limit vmm vstate::vm::tests::test_msi_vector_group_trigger
+whp-limit vmm vstate::vm::tests::test_msi_vector_group_update
+whp-limit vmm vstate::vm::tests::test_msi_vector_group_update_invalid_vector
+whp-limit vmm vstate::vm::tests::test_restore_state_resource_allocator
+whp-limit vmm vstate::vm::tests::test_too_many_regions
+#   (SetUserMemoryRegion(Error(87)) from test_utils' setup_vm_with_memory;
+#   test_too_many_regions: its first region, "iteration 0")
