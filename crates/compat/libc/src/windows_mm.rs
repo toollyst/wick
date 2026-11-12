@@ -28,7 +28,8 @@
 //!   recommits it zero-filled in place; over part of a view it fails with
 //!   `EINVAL`, as Windows cannot replace part of a view;
 //! - `mprotect`: `VirtualProtect`; making a placeholder accessible commits
-//!   zero-filled memory, as Linux faults in zero pages;
+//!   zero-filled memory, as Linux faults in zero pages; lazy memory's
+//!   untouched pages stay uncommitted under any protection (`LAZY`);
 //! - `madvise(MADV_DONTNEED)`: private memory is decommitted and recommitted,
 //!   so it reads as zeros, or as the file again for a private file mapping;
 //!   shared mappings keep their data, as on Linux. Advice without an effect
@@ -729,6 +730,10 @@ fn make_placeholder(t: &mut Table, start: usize, end: usize) -> Result<(), c_int
 /// the commit, then the access re-run). Sorted, disjoint `(start, len,
 /// protection)`. Locked briefly, never while memory is touched, so a fault
 /// inside a call that holds the region table cannot deadlock on it.
+///
+/// An `mprotect` keeps memory lazy ([`protect_lazy`]): the protection of a
+/// range is the one its pages get when committed, and a `PAGE_NOACCESS`
+/// range (`PROT_NONE`) is committed by no access, which faults, as on Linux.
 static LAZY: Mutex<Vec<(usize, usize, PAGE_PROTECTION_FLAGS)>> = Mutex::new(Vec::new());
 
 /// How much is committed at a fault: a 64 KiB aligned block (clipped to its
@@ -802,6 +807,11 @@ fn commit_on_access(addr: usize, write: bool) -> Access {
     let Some((s, n, prot)) = found else {
         return Access::NotLazy;
     };
+    // `PROT_NONE`: the access is a fault, as Linux's to a `PROT_NONE`
+    // mapping; nothing is committed.
+    if prot == PAGE_NOACCESS {
+        return Access::NotLazy;
+    }
     // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: as above.
@@ -844,6 +854,11 @@ pub(crate) fn prefault_lazy(addr: usize, len: usize) {
     }
     let start = addr - addr % PAGE;
     for (s, n, prot) in lazy_within(start, (addr + len).div_ceil(PAGE) * PAGE - start) {
+        // `PROT_NONE`: the call faults on it, as Linux's copy does
+        // (`EFAULT`); nothing to commit.
+        if prot == PAGE_NOACCESS {
+            continue;
+        }
         let end = s + n;
         let mut at = s;
         while at < end {
@@ -920,22 +935,37 @@ fn lazy_handler() -> bool {
     })
 }
 
-/// Commits what is lazy in the region at `base` and makes it ordinary
-/// private memory (an `mprotect` over it, whose protections Windows cannot
-/// set on pages that are not committed).
-fn materialize(t: &mut Table, base: usize) -> bool {
-    let r = t.get_mut(&base).unwrap();
-    if !r.lazy {
-        return true;
-    }
-    for (s, n, p) in lazy_within(base, r.len) {
-        // Committed pages stay as they are; reserved ones get zero pages.
-        if !commit(s, n, p, false) {
+/// `mprotect` of `[s, e)`, in the lazy region at `b`: committed pages get
+/// the protection now, and the rest (Windows sets no protection on pages
+/// not committed) stays reserved, getting it when its first access commits
+/// it ([`LAZY`]); `PROT_NONE` ones are committed by no access. As Linux,
+/// whose `mprotect` changes the entries of the pages present and brings in
+/// none (mm/mprotect.c, `change_protection`), so that an anonymous mapping
+/// is charged for what was touched, whatever its protection: Firecracker
+/// makes each unplugged virtio-mem slot `PROT_NONE` at start-up, and
+/// committing them then charged the whole hotplug region (measured on WHP:
+/// a commit charge of 1182 MiB for a 512 MiB guest with 1024 MiB of
+/// hotplug memory, unchanged by an unplug). Mapped `PROT_NONE` parts
+/// left decommitted by a fixed mapping ([`Region::noaccess`]) become lazy
+/// with the rest.
+fn protect_lazy(t: &mut Table, b: usize, s: usize, e: usize, wprot: PAGE_PROTECTION_FLAGS) -> bool {
+    let r = t.get_mut(&b).unwrap();
+    ranges_remove(&mut r.noaccess, s - b, e - s);
+    lazy_add(s, e - s, wprot);
+    let mut at = s;
+    while at < e {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
             return false;
         }
+        let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(e) - at;
+        if mbi.State == MEM_COMMIT && !protect(at, run, wprot) {
+            return false;
+        }
+        at += run;
     }
-    lazy_remove(base, r.len);
-    r.lazy = false;
     true
 }
 
@@ -1586,7 +1616,8 @@ pub unsafe fn mmap(
         // Firecracker does to plug and unplug memory slots: the old pages are
         // dropped in place. Accessible memory is recommitted zero-filled;
         // `PROT_NONE` stays decommitted (no memory, no commit charge) and is
-        // committed again by an `mprotect` that allows access.
+        // committed again by an `mprotect` that allows access (lazy
+        // memory: at its first access after that, [`protect_lazy`]).
         if anon && ty == MAP_PRIVATE {
             let inside = t
                 .range(..=base)
@@ -1744,10 +1775,13 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
                 if !r.mapped_in(s - b, e - s) {
                     return fail(crate::ENOMEM, -1);
                 }
-                // Windows sets no protection on pages not committed: lazy
-                // memory is committed first, and is ordinary memory from then on.
-                if r.lazy && !materialize(&mut t, b) {
-                    return fail(crate::ENOMEM, -1);
+                // Lazy memory stays lazy: its pages not committed get the
+                // protection when they are.
+                if r.lazy {
+                    if !protect_lazy(&mut t, b, s, e, wprot) {
+                        return fail(crate::EACCES, -1);
+                    }
+                    continue;
                 }
                 let r = &t[&b];
                 let decommitted = ranges_within(&r.noaccess, s - b, e - s);
@@ -2202,12 +2236,88 @@ mod tests {
         mbi.State
     }
 
+    /// Committed bytes of `[p, p + len)`, as the kernel reports them.
+    fn committed(p: usize, len: usize) -> usize {
+        let mut at = p;
+        let mut n = 0;
+        while at < p + len {
+            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            assert_ne!(unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) }, 0);
+            let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(p + len) - at;
+            if mbi.State == MEM_COMMIT {
+                n += run;
+            }
+            at += run;
+        }
+        n
+    }
+
+    /// What Firecracker does with a virtio-mem slot, on lazy memory, as
+    /// Linux does it (mm/mprotect.c `change_protection` changes the pages
+    /// present only; mm/madvise.c `MADV_DONTNEED` zaps them):
+    /// - start-up makes the unplugged slot `PROT_NONE`: nothing committed;
+    /// - a plug makes it accessible: nothing committed until touched;
+    /// - an unplug makes it `PROT_NONE`, the data kept, then discards it:
+    ///   its commit is given back, and an access is a fault, not a commit;
+    /// - plugged again: zeros, committed at the access.
+    #[test]
+    fn test_mprotect_keeps_noreserve_memory_lazy() {
+        let _serial = serial();
+        let len = 8 << 20;
+        let p = map(0, len, PROT_READ | PROT_WRITE, ANON | MAP_NORESERVE, -1, 0);
+        // Start-up: the slot (the upper half) is PROT_NONE.
+        let (slot, n) = (p + len / 2, len / 2);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { mprotect(slot as *mut c_void, n, PROT_NONE) }, 0);
+        assert_eq!(committed(p, len), 0, "mprotect(PROT_NONE) committed memory");
+        assert_eq!(wick_mm::commit_on_access(slot, false), Access::NotLazy, "a PROT_NONE access committed");
+        assert_eq!(committed(p, len), 0);
+        // The lower half is still lazy and writable.
+        // SAFETY: our mapping.
+        unsafe { *(p as *mut u8) = 1 };
+        assert_eq!(committed(p, len), LAZY_CHUNK);
+        // Plugged: accessible, nothing committed until touched.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { mprotect(slot as *mut c_void, n, PROT_READ | PROT_WRITE) }, 0);
+        assert_eq!(committed(slot, n), 0, "mprotect(RW) committed memory");
+        for off in (0..2 << 20).step_by(PAGE) {
+            // SAFETY: our mapping.
+            unsafe { *((slot + off) as *mut u8) = 0xa5 };
+        }
+        assert_eq!(committed(slot, n), 2 << 20);
+        // Unplugged: PROT_NONE keeps the data and its commit ...
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { mprotect(slot as *mut c_void, n, PROT_NONE) }, 0);
+        assert_eq!(committed(slot, n), 2 << 20, "mprotect(PROT_NONE) dropped data");
+        assert_eq!(wick_mm::commit_on_access(slot, false), Access::NotLazy, "a PROT_NONE access ran");
+        // ... and the discard gives the commit back.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { madvise(slot as *mut c_void, n, MADV_DONTNEED) }, 0);
+        assert_eq!(committed(slot, n), 0, "MADV_DONTNEED kept the commit");
+        assert_eq!(wick_mm::commit_on_access(slot, false), Access::NotLazy);
+        assert_eq!(committed(slot, n), 0);
+        // Plugged again: zeros, committed at the access.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { mprotect(slot as *mut c_void, n, PROT_READ | PROT_WRITE) }, 0);
+        assert_eq!(committed(slot, n), 0);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { *((slot + PAGE) as *const u8) }, 0, "the discarded slot kept its data");
+        assert_eq!(committed(slot, n), LAZY_CHUNK);
+        // The lower half kept its byte throughout.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { *(p as *const u8) }, 1);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { munmap(p as *mut c_void, len) }, 0);
+        assert!(lazy_within(p, len).is_empty());
+    }
+
     /// Anonymous private `MAP_NORESERVE` memory gets its pages at the first
     /// access, a 64 KiB block at a time, as Linux gives them when touched:
     /// mapped, nothing is committed; a write commits its block only; a
     /// discarded block goes back to reserved and reads zero; the guest's
     /// access (the hypervisor's report) commits as a host access does; an
-    /// `mprotect` makes the whole mapping ordinary memory.
+    /// `mprotect` commits nothing (test_mprotect_keeps_noreserve_memory_lazy).
     #[test]
     fn test_noreserve_memory_is_committed_at_first_access() {
         let _serial = serial();
@@ -2234,12 +2344,14 @@ mod tests {
         assert_eq!(state(p + (1 << 20)), MEM_RESERVE);
         // SAFETY: as above.
         assert_eq!(unsafe { *((p + (1 << 20) + 5) as *const u8) }, 0);
-        // mprotect: the whole mapping committed, and no longer lazy.
+        // mprotect: nothing more committed; a read commits read-only.
         // SAFETY: as above.
         assert_eq!(unsafe { mprotect(p as *mut c_void, len, PROT_READ) }, 0);
+        assert_eq!(state(p), MEM_RESERVE);
+        assert_eq!(state(p + len - PAGE), MEM_RESERVE);
+        assert_eq!(wick_mm::commit_on_access(p, false), Access::Committed);
         assert_eq!(state(p), MEM_COMMIT);
-        assert_eq!(state(p + len - PAGE), MEM_COMMIT);
-        assert_eq!(wick_mm::commit_on_access(p, false), Access::NotLazy);
+        assert_eq!(wick_mm::commit_on_access(p + 5, true), Access::NotLazy, "a write to read-only memory");
         // SAFETY: our mapping.
         assert_eq!(unsafe { munmap(p as *mut c_void, len) }, 0);
         assert!(lazy_within(p, len).is_empty(), "the unmapped range is still lazy");

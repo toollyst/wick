@@ -81,8 +81,9 @@ Platform, and the Windows column of [At a glance](#at-a-glance) says "works" for
 **Every boot test stage that has run on real hardware passes** (AMD Ryzen 9 7900, Windows 11 Pro build
 26300): boot, smp, block, vsock, net, snapshot, diff, uffd, pci, restores (20 restores, each paused and snapshotted
 again), vhost-user, hugepages, api-process and devices (docs/PORTING.md rows 4, 10 and 15). `balloon`,
-`memory-hotplug`, `gdb`, the guest parts of `cli`, `tools` and `no-seccomp`, and the drive serials and rate
-limiters of `block` and `net` are written and wait for that machine. The vmm library and the firecracker binary build and link for
+`smp` with CPU 1 taken offline and online, `tools`, `no-seccomp`, `foreign-snapshot`, and the drive serials and rate
+limiters of `block` and `net` passed there too (kit 8d577b7, Windows 11 10.0.26300.9711). `memory-hotplug` failed there, with a cause found and fixed
+(docs/PORTING.md row 15), and waits for a re-run, as do `balloon`, `gdb` and the guest parts of `cli`. The vmm library and the firecracker binary build and link for
 `x86_64-pc-windows-gnu` (cross) and `x86_64-pc-windows-msvc` (native, the binary CI publishes).
 
 - Done: the POSIX layer (`wick-os`, `wick-std`, `libc`, `vmm-sys-util`, `memfd`, generated

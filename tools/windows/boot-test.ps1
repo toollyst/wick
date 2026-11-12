@@ -50,8 +50,10 @@
 #          and with a guest running
 #   foreign-snapshot  a state file made on another host (-ForeignState) is
 #          refused at the load (no guest)
-#   memory-hotplug  virtio-mem: 512 MiB plugged, seen in MemTotal and used,
-#          then unplugged (the commit charge goes down) and plugged again
+#   memory-hotplug  virtio-mem: the unplugged region not charged at the
+#          boot, 512 MiB plugged, seen in MemTotal and used, then unplugged
+#          (the commit charge and private working set go down) and plugged
+#          again
 #   gdb    (not in `all`: needs a Firecracker built with the gdb feature and
 #          a gdb) upstream's debug kernel under gdb: a hardware breakpoint at
 #          start_kernel, the kernel's bytes read through the stub's address
@@ -2973,6 +2975,23 @@ function Stage-MemoryHotplug {
     $cfg['memory-hotplug'] = [ordered]@{ total_size_mib = 1024; slot_size_mib = 128; block_size_mib = 2 }
     $vm = Start-Vm 'memory-hotplug' $cfg -Api
     Wait-Shell $vm
+    # Firecracker's commit charge (private bytes: what a job's memory limit
+    # counts, as a cgroup's memory.current counts a Linux VMM's touched
+    # anonymous pages) and private working set (resident and not shared,
+    # Linux's RSS of anonymous memory). On Linux the guest's memory is
+    # MAP_NORESERVE, so never in Committed_AS (mm/mmap.c do_mmap), and an
+    # mprotect brings in no pages (mm/mprotect.c change_protection): only
+    # touched pages are resident or charged, and MADV_DONTNEED gives them
+    # back.
+    $commit = { (Get-Process -Id $vm.Pid).PrivateMemorySize64 }
+    $privateWs = {
+        $p = Get-CimInstance Win32_PerfRawData_PerfProc_Process -Filter "IDProcess = $($vm.Pid)"
+        return [long]$p.WorkingSetPrivate
+    }
+    # The 1024 MiB of hotplug memory, all unplugged (PROT_NONE): not charged.
+    $booted = & $commit
+    $bootedWs = & $privateWs
+    Check ($booted -lt 1024MB) ("commit charge {0} MiB at the boot of a 512 MiB guest with 1024 MiB of unplugged hotplug memory" -f ($booted -shr 20))
     $memTotal = { [math]::Floor([long]$vm.Sh("awk '/MemTotal/ {print `$2}' /proc/meminfo") / 1024) }
     $base = & $memTotal
     $plug = {
@@ -3004,17 +3023,22 @@ function Stage-MemoryHotplug {
     $out = $vm.Sh('mount -t tmpfs -o size=900m tmpfs /tmp && head -c 600m /dev/urandom > /tmp/f && md5sum /tmp/f > /tmp/a && md5sum /tmp/f | cmp - /tmp/a && echo same', 180000, $true)
     Check ($out -eq 'same') "600 MiB in a guest of $base + 512 MiB read back differently: '$out'"
     $vm.Sh('rm /tmp/f /tmp/a && umount /tmp') | Out-Null
-    # The unplugged memory leaves Firecracker's commit charge (the
-    # counterpart of the macOS stage's resident size).
-    $commit = { (Get-Process -Id $vm.Pid).PrivateMemorySize64 }
+    # The unplugged memory leaves Firecracker's commit charge and its
+    # private working set (the counterpart of the macOS stage's resident
+    # size, and of Linux's RSS).
     $plugged = & $commit
+    $pluggedWs = & $privateWs
     & $plug 0
     $unplugged = & $commit
-    Check ($unplugged -lt $plugged) ("commit charge {0} -> {1} MiB after the unplug" -f ($plugged -shr 20), ($unplugged -shr 20))
+    $unpluggedWs = & $privateWs
+    $numbers = "commit charge {0} MiB at the boot, {1} plugged, {2} unplugged; private working set {3}, {4}, {5} MiB" -f ($booted -shr 20), ($plugged -shr 20), ($unplugged -shr 20), ($bootedWs -shr 20), ($pluggedWs -shr 20), ($unpluggedWs -shr 20)
+    Write-Host "  $numbers"
+    Check ($unplugged -lt $plugged) "the commit charge did not fall at the unplug: $numbers"
+    Check ($unpluggedWs -lt $pluggedWs) "the private working set did not fall at the unplug: $numbers"
     & $plug 512  # again, as upstream's test does
     Save-Dmesg $vm 'memory-hotplug'
     $vm.Reboot()
-    return ("virtio-mem: MemTotal $base -> $($base + 512) MiB and back and again, 600 MiB written and read back while plugged, commit charge {0} -> {1} MiB at the unplug" -f ($plugged -shr 20), ($unplugged -shr 20))
+    return ("virtio-mem: MemTotal $base -> $($base + 512) MiB and back and again, 600 MiB written and read back while plugged, $numbers")
 }
 
 $Stages = [ordered]@{
