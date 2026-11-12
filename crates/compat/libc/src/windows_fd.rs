@@ -11,6 +11,18 @@
 //!   `recv`/`send`, on other handles `ReadFile`/`WriteFile`; a pipe whose
 //!   writer is gone reads as end of file, a pipe whose reader is gone fails
 //!   with `EPIPE`; `pread`/`pwrite` leave the file position alone;
+//! - `write`/`writev` to a full non-blocking pipe fail with `EAGAIN`, as on
+//!   Linux. One difference: Linux writes at most `PIPE_BUF` (4096) bytes
+//!   all or nothing (pipe(7)), and here a write that does not fit is
+//!   written in part, whatever its size (a non-blocking byte pipe takes "as
+//!   many bytes as the buffer holds", Named Pipe Type, Read, and Wait
+//!   Modes). The room left cannot be told beforehand: the write end's
+//!   `WriteQuotaAvailable` (FILE_PIPE_LOCAL_INFORMATION) reads 0 while the
+//!   reader waits in a read, though a write then completes at once
+//!   (vmm-sys-util's `test_pipe_write_room_reads_0_while_a_read_waits`), so
+//!   refusing on it would refuse every write while a reader waits; and
+//!   `PeekNamedPipe` takes only a read end ("a handle to the read end of an
+//!   anonymous pipe");
 //! - `read` on a timerfd returns its expiration count;
 //! - `close`, `dup` and `dup2` keep the [`wick_fd`] attachments of a
 //!   descriptor (an eventfd's counter, a timer's schedule) with every handle
@@ -521,8 +533,17 @@ fn write_handle(h: HANDLE, buf: *const c_void, count: usize, at: Option<i64>) ->
         }
         return raw_failed();
     }
-    // A non-blocking pipe that is full takes nothing.
-    if n == 0 && count > 0 && wick_fd::flags(to_fd(h)).load(Ordering::Relaxed) & O_NONBLOCK != 0 {
+    // A full non-blocking pipe takes nothing and returns success with 0
+    // written (WriteFile, "Pipes"): EAGAIN, as Linux's pipe write gives
+    // with O_NONBLOCK and the pipe full (fs/pipe.c anon_pipe_write: `if
+    // (!ret) ret = -EAGAIN; break;`), never 0. A pipe in blocking mode does
+    // not complete a write before all is written (SetNamedPipeHandleState,
+    // PIPE_WAIT), so 0 of a non-zero count is PIPE_NOWAIT, whoever set it:
+    // this descriptor, a duplicate or another process, as the mode is the
+    // pipe end's (test_pipe_wait_mode_is_shared_with_a_child_process), not
+    // only what this process's flags table knows.
+    // SAFETY: plain call.
+    if n == 0 && count > 0 && at.is_none() && unsafe { GetFileType(h) } == FILE_TYPE_PIPE {
         set_errno(crate::EAGAIN);
         return -1;
     }
@@ -1716,6 +1737,64 @@ mod tests {
             ));
             let err = std::io::Write::write_all(&mut &*writer, b"more").unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::WriteZero, "{err:?}");
+            assert_eq!(close(fds[1]), 0);
+            assert_eq!(close(fds[0]), 0);
+        }
+    }
+
+    // A pipe made non-blocking through another handle of its write end (a
+    // duplicate here; in CI's case another process's inherited copy), which
+    // this descriptor's flags do not show: once full, `write` and `writev`
+    // still fail with EAGAIN as on Linux, never return 0. A write that does
+    // not fit is written in part, whatever its size (the module docs say
+    // why Linux's all-or-nothing for PIPE_BUF bytes is not kept).
+    #[test]
+    fn test_a_pipe_made_non_blocking_elsewhere_is_eagain_when_full() {
+        let mut fds = [0; 2];
+        // SAFETY: valid buffers, descriptors and handles.
+        unsafe {
+            assert_eq!(pipe(fds.as_mut_ptr()), 0);
+            let mut other: HANDLE = std::ptr::null_mut();
+            assert_ne!(
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    handle(fds[1]),
+                    GetCurrentProcess(),
+                    &mut other,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                ),
+                0
+            );
+            set_nowait(other);
+            assert_eq!(fcntl(fds[1], F_GETFL) & O_NONBLOCK, 0, "this descriptor's flags do not know");
+            let chunk = [7u8; 1000];
+            let mut total = 0usize;
+            let mut last = 0usize;
+            loop {
+                let n = write(fds[1], chunk.as_ptr().cast(), chunk.len());
+                if n < 0 {
+                    break;
+                }
+                assert!(n > 0, "a write that takes nothing fails");
+                last = n.unsigned_abs();
+                total += last;
+                assert!(total < 64 << 20, "the pipe never filled");
+            }
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EAGAIN));
+            std::println!("filled with {total} bytes; the last write took {last} of 1000");
+            let iov = [iovec {
+                iov_base: chunk.as_ptr().cast_mut().cast(),
+                iov_len: 16,
+            }];
+            assert_eq!(writev(fds[1], iov.as_ptr(), 1), -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EAGAIN));
+            // Room again after a read, and the write goes through.
+            let mut b = [0u8; 4096];
+            assert!(read(fds[0], b.as_mut_ptr().cast(), b.len()) > 0);
+            assert!(write(fds[1], chunk.as_ptr().cast(), 16) > 0);
+            CloseHandle(other);
             assert_eq!(close(fds[1]), 0);
             assert_eq!(close(fds[0]), 0);
         }
