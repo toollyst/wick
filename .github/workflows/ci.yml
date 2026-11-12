@@ -253,6 +253,20 @@ jobs:
         run: |
           tools/linux/compare-integration-tests.py "$RUNNER_TEMP/it/upstream" "$RUNNER_TEMP/it/wick" \
             --summary "$GITHUB_STEP_SUMMARY"
+      # Informational, never fails the job: the VMM's own memory at its peak,
+      # by kind of mapping, for the tests whose memory macOS compares with
+      # Linux's (tools/linux/integration/wick_memdiag.py, loaded in this step
+      # only: the steps above keep upstream's monitor as it is).
+      - name: VMM memory by kind of mapping (informational)
+        if: success() || failure()
+        continue-on-error: true
+        run: |
+          WICK_IT_MEMDIAG=1 tools/linux/integration-tests.sh wick "$RUNNER_TEMP/it/memdiag" -n 1 \
+            integration_tests/functional/test_vsock.py::test_vsock_epipe \
+            integration_tests/functional/test_vsock.py::test_vsock_transport_reset_h2g \
+            integration_tests/functional/test_balloon.py::test_deflate_on_oom || true
+          python3 -I tools/linux/integration/wick_memdiag.py summary \
+            "$RUNNER_TEMP/it/memdiag/memory-peaks.jsonl" | tee -a "$GITHUB_STEP_SUMMARY" || true
       # Upstream's release.sh, which the tests build with, has no --locked.
       - name: The build kept Cargo.lock
         if: always()
@@ -263,6 +277,7 @@ jobs:
         with:
           name: linux-integration-tests-${{ env.SUITE }}
           path: |
+            ${{ runner.temp }}/it/*/memory-peaks.jsonl
             ${{ runner.temp }}/it/*/pytest.log
             ${{ runner.temp }}/it/*/test-report.json
             ${{ runner.temp }}/it/*/status

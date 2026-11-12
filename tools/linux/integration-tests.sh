@@ -16,7 +16,8 @@
 # tools/setup-ci-artifacts.sh; kernel-parametrized tests run for that kernel
 # only. /srv is upstream's tmpfs, as devtool makes it. OUT gets the pytest
 # JSON report (test-report.json), pytest's output (pytest.log) and
-# upstream's test_results directory.
+# upstream's test_results directory, and with WICK_IT_MEMDIAG=1
+# memory-peaks.jsonl (below).
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../common.sh"
 
@@ -90,8 +91,17 @@ rm -rf "$tree/test_results"
 # Every selected test runs, those in tools/linux/integration-test-exclusions.txt
 # too: the comparison expects them to fail on upstream here, and still
 # requires wick to pass where upstream passes.
+# WICK_IT_MEMDIAG=1: an informational run, never a counted one, that also
+# loads tools/linux/integration/wick_memdiag.py (the VMM's own memory at its
+# peak, by kind of mapping, in OUT/memory-peaks.jsonl).
+runner=(./tools/test.sh)
+if [[ "${WICK_IT_MEMDIAG:-}" == 1 ]]; then
+    runner=(env "PYTHONPATH=$WICK_ROOT/tools/linux/integration"
+        "WICK_MEMDIAG_OUT=$out/memory-peaks.jsonl" ./tools/test.sh -p wick_memdiag)
+    rm -f "$out/memory-peaks.jsonl"
+fi
 set +e
-devctr -- ./tools/test.sh "$@" 2>&1 | tee "$out/pytest.log"
+devctr -- "${runner[@]}" "$@" 2>&1 | tee "$out/pytest.log"
 status=${PIPESTATUS[0]}
 set -e
 echo "$status" >"$out/status"
