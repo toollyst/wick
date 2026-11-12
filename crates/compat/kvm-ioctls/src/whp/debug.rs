@@ -155,10 +155,23 @@ pub(crate) const WINDOW_DR7: u64 = (1 << 10) | 1;
 pub(crate) const DR7_NONE: u64 = 1 << 10;
 
 /// How long the other vCPUs may be held: a window ends at the handler or at
-/// a delivery fault, within microseconds. This bound is the last resort for
-/// one whose end never comes (no handler could be read and no fault came,
-/// as with a stale TLB entry for the IDT); it is cancelled and closed, and
-/// says so.
+/// a delivery fault. This bound is the last resort for one whose end never
+/// comes (no handler could be read and no fault came, as with a stale TLB
+/// entry for the IDT); it is cancelled and closed, and says so.
+///
+/// Why 20 ms. A delivery touches the IDT, the GDT (the handler's code
+/// segment), the TSS (a stack switch), the stack (one or two pages) and,
+/// for the DR to fire, the handler's address: each can be guest RAM not yet
+/// committed (a memory-access exit and a commit, tens of microseconds) or a
+/// userfaultfd page (served by the handler process, a round trip through
+/// another process, milliseconds under load). Without such faults a window
+/// takes microseconds; 2 ms would close one that waits on two or three uffd
+/// pages of a busy handler. A window closed early is safe, only slower: the
+/// INT3 not yet delivered exits to gdb's stub again, which hands it back
+/// again (from the code; not measured). 200 ms would hold every other vCPU,
+/// with its timers and interrupts, for a fifth of a second. 20 ms leaves
+/// room for several uffd round trips and stays under a guest-visible stall
+/// (Linux's soft-lockup and RCU-stall detectors are seconds).
 pub(crate) const WINDOW_BOUND: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// How many windows were closed at [`WINDOW_BOUND`]: the tests' check that
