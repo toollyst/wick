@@ -43,3 +43,4 @@
 0041-macos-SIGSYS-s-handler-runs-on-a-thread-of-its-own.patch
 0042-windows-a-read-only-drive-syncs-as-fsync-on-Linux.patch
 0043-windows-the-dirty-dump-tests-write-in-hole-units-as-.patch
+0044-macos-the-sockets-Firecracker-makes-raise-SIGPIPE-as.patch

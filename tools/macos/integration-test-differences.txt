@@ -231,12 +231,6 @@ all arch integration_tests/functional/test_gdb.py::test_gdb_connects
 # in the harness's network that sends one.
 all bug integration_tests/functional/test_net.py::test_tap_offload
 
-# No SIGPIPE in 100 host connections closed with data in flight
-# (metrics: signals.sigpipe 0, which Linux counts at least once). To find:
-# whether the epoll layer reports the peer's close before Firecracker's next
-# write, where Linux lets the write come first.
-all bug integration_tests/functional/test_vsock.py::test_vsock_epipe
-
 # The test sizes a balloon from the RSS it measures (test_balloon.py:
 # 256 MiB minus get_resident_memory minus 50 MiB), so that the guest runs out
 # of memory when it dirties 128 MiB, and with deflate_on_oom the balloon
