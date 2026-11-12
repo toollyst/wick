@@ -321,9 +321,11 @@ jobs:
           brew install libslirp pkg-config
           cc -O2 -Wall -Wextra -Werror -o "$RUNNER_TEMP/netns-slirp" tools/macos/integration/netns-slirp.c \
             $(pkg-config --cflags --libs slirp)
-          python3 -I tools/macos/integration/netns-selftest.py "$RUNNER_TEMP/netns-slirp"
+          cc -O2 -Wall -Wextra -Werror -dynamiclib -o "$RUNNER_TEMP/netns-preload.dylib" tools/macos/integration/netns-preload.c
+          python3 -I tools/macos/integration/netns-selftest.py "$RUNNER_TEMP/netns-slirp" "$RUNNER_TEMP/netns-preload.dylib"
           python3 -m py_compile tools/macos/integration/wick_macos.py tools/macos/integration/wick_macos_net.py \
-            tools/macos/integration/jailer tools/macos/integration/bin/ip tools/macos/compare-integration-tests.py
+            tools/macos/integration/jailer tools/macos/integration/bin/ip tools/macos/integration/bin/fallocate \
+            tools/macos/compare-integration-tests.py
 
   # Seatbelt differs between macOS majors (which system calls' numbers it
   # skips when a rule allows their operation: UNFILTERED_SYSCALLS and
