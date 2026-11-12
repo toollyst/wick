@@ -301,6 +301,11 @@ jobs:
   # Booting a guest needs Hypervisor.framework, which hosted runners do not
   # expose, so L3 runs on a Mac (tools/macos/run.sh).
   macos:
+    # After linux-boot, for the state file it makes (the foreign snapshot
+    # step); it runs when linux-boot has failed too, and that step alone
+    # fails then.
+    needs: linux-boot
+    if: ${{ !cancelled() }}
     runs-on: macos-latest
     timeout-minutes: 30
     env:
@@ -324,6 +329,21 @@ jobs:
       # runs the same script there).
       - name: Nitro Enclave refused without the device
         run: python3 -I tools/macos/enclave-refusal-test.py lib/firecracker/build/cargo_target/debug/firecracker
+      # A state file made on Linux x86_64 by this run's linux-boot job is
+      # refused here with upstream's error, before a VM is made (so it needs
+      # no Hypervisor.framework).
+      - name: Download the state file made on Linux
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-vmstate
+          path: ${{ runner.temp }}/linux-vmstate
+      - name: A snapshot made on Linux x86_64 is refused
+        working-directory: lib/firecracker
+        run: |
+          cargo build --locked -p snapshot-editor
+          cat "$RUNNER_TEMP/linux-vmstate/linux-x86_64.txt"
+          python3 -I ../../tools/macos/foreign-snapshot-test.py build/cargo_target/debug/firecracker \
+            build/cargo_target/debug/snapshot-editor "$RUNNER_TEMP/linux-vmstate/linux-x86_64.vmstate"
       # The jailer's tests run as root, as upstream's do (they set resource
       # limits and change owners); the runners have passwordless sudo.
       - name: Jailer unit tests
