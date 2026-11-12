@@ -88,7 +88,7 @@ pub use windows_fd::{
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, O_CLOEXEC,
     O_NOFOLLOW, O_NONBLOCK, RLIM_INFINITY, RLIMIT_FSIZE, RLIMIT_NOFILE, S_IFIFO, S_IFSOCK, SEEK_CUR, SEEK_DATA, SEEK_END, SEEK_HOLE,
     SEEK_SET, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, _SC_CLK_TCK, _SC_NPROCESSORS_CONF, _SC_NPROCESSORS_ONLN, _SC_OPEN_MAX,
-    _SC_PAGE_SIZE, _SC_PAGESIZE, _SC_PHYS_PAGES, wick_fd, fdatasync, fsync, ftruncate, getrlimit,
+    _SC_PAGE_SIZE, _SC_PAGESIZE, _SC_PHYS_PAGES, wick_fd, wick_signal, fdatasync, fsync, ftruncate, getrlimit,
     pread, pwrite, readv, rlim_t, rlimit, sysconf, uname, utsname, writev,
 };
 #[cfg(windows)]

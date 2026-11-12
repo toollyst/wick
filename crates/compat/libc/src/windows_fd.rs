@@ -201,6 +201,39 @@ fn wsa_errno() {
     set_errno(unsafe { WSAGetLastError() });
 }
 
+/// Signals Windows does not raise, raised by this layer.
+pub mod wick_signal {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static BROKEN_PIPE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Sets what a write to a pipe or stream socket whose other end is gone
+    /// calls besides failing: Linux sends the writing thread `SIGPIPE`
+    /// (`write(2)`, `send(2)` without `MSG_NOSIGNAL`). wick's signal emulation
+    /// (vmm-sys-util) sets it when a `SIGPIPE` handler is registered.
+    pub fn set_broken_pipe_hook(hook: fn()) {
+        BROKEN_PIPE.store(hook as usize, Ordering::Release);
+    }
+
+    /// Calls the hook, keeping the thread's error for the failed write.
+    pub(crate) fn broken_pipe() {
+        let f = BROKEN_PIPE.load(Ordering::Acquire);
+        if f != 0 {
+            let err = super::last_error();
+            // SAFETY: only `fn()` values are stored, as `usize`.
+            let f: fn() = unsafe { std::mem::transmute::<usize, fn()>(f) };
+            f();
+            super::set_errno(err);
+        }
+    }
+}
+
+/// A Winsock error of a write whose peer is gone (WSAESHUTDOWN,
+/// WSAECONNRESET, WSAECONNABORTED).
+fn peer_gone(err: c_int) -> bool {
+    matches!(err, 10058 | 10054 | 10053)
+}
+
 /// Descriptor attachments: state that belongs to the object a descriptor
 /// names (an eventfd's counter, a timer's schedule, status flags) and goes
 /// with every descriptor of it.
@@ -432,6 +465,7 @@ fn write_handle(h: HANDLE, buf: *const c_void, count: usize, at: Option<i64>) ->
         // SAFETY: plain call.
         if matches!(unsafe { GetLastError() }, ERROR_BROKEN_PIPE | ERROR_NO_DATA) {
             set_errno(crate::EPIPE);
+            wick_signal::broken_pipe();
         }
         return -1;
     }
@@ -498,6 +532,9 @@ pub unsafe fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
         let n = unsafe { send(socket(fd), buf.cast(), len, 0) };
         if n == SOCKET_ERROR {
             wsa_errno();
+            if peer_gone(last_error()) {
+                wick_signal::broken_pipe();
+            }
             return -1;
         }
         return n as ssize_t;

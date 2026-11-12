@@ -7,7 +7,7 @@ pub mod fd;
 mod fs;
 mod net;
 
-pub use net::{peer_pid, startup};
+pub use net::{peer_pid, set_broken_pipe_hook, startup};
 
 /// `std::os::unix`.
 pub mod unix {

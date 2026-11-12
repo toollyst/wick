@@ -226,6 +226,27 @@ fn take_error(fd: SOCKET) -> io::Result<Option<io::Error>> {
     Ok((err != 0).then(|| io::Error::from_raw_os_error(err)))
 }
 
+/// What a write to a stream whose peer is gone does besides failing. Linux
+/// sends the writing thread `SIGPIPE` (a `write(2)` without `MSG_NOSIGNAL`,
+/// as std's `UnixStream` writes), which Firecracker counts; Windows raises no
+/// signal. wick's signal emulation sets the hook when a `SIGPIPE` handler is
+/// registered (vmm-sys-util's `register_signal_handler`).
+static BROKEN_PIPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Sets what a write to a stream whose peer is gone calls (see above).
+pub fn set_broken_pipe_hook(hook: fn()) {
+    BROKEN_PIPE.store(hook as usize, Ordering::Release);
+}
+
+fn broken_pipe() {
+    let f = BROKEN_PIPE.load(Ordering::Acquire);
+    if f != 0 {
+        // SAFETY: only `fn()` values are stored, as `usize`.
+        let f: fn() = unsafe { std::mem::transmute::<usize, fn()>(f) };
+        f();
+    }
+}
+
 /// A Unix domain stream socket.
 pub struct UnixStream(OwnedFd);
 
@@ -351,7 +372,12 @@ impl UnixStream {
     fn send(&self, buf: &[u8]) -> io::Result<usize> {
         let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
         // SAFETY: the buffer is valid for `len` bytes.
-        let n = cvt(unsafe { send(self.sock(), buf.as_ptr(), len, 0) })?;
+        let n = cvt(unsafe { send(self.sock(), buf.as_ptr(), len, 0) }).inspect_err(|e| {
+            // WSAESHUTDOWN, WSAECONNRESET, WSAECONNABORTED: the peer is gone.
+            if matches!(e.raw_os_error(), Some(10058 | 10054 | 10053)) {
+                broken_pipe();
+            }
+        })?;
         Ok(usize::try_from(n).unwrap())
     }
 }
