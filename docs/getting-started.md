@@ -180,7 +180,10 @@ sudo lib/firecracker/build/cargo_target/release/jailer --id vm1 \
 The API socket is then `$JAIL/run/firecracker.socket`. On macOS `--cgroup` takes the memory limit
 (`memory.limit_in_bytes`, or `memory.max` with `--cgroup-version 2`): the VMM is killed when it uses more, guest
 memory included. It also takes the CPU limit (`cpu.cfs_quota_us` and `cpu.cfs_period_us`, or `cpu.max` with
-`--cgroup-version 2`): the VMM's threads are held to that share of a CPU, refilled each second. The jailer refuses
+`--cgroup-version 2`): the VMM's threads are held to that share of a CPU, refilled each second. The freezer's files
+are upstream's, in `/private/var/wick/firecracker/vm1/` next to `root/` (`freezer.state`, or `cgroup.freeze` with
+`--cgroup-version 2`): writing `FROZEN` (or `1`) as root suspends the jail, kept by a root supervisor process the
+jailer leaves for each jail until it ends. The jailer refuses
 what macOS cannot enforce, each with its reason: other cgroup controllers (`cpuset.cpus` and `cpuset.mems` only
 when they name every CPU and memory node) and CPU limits below 1% or above
 255% of one CPU. Networking inside a jail is a Unix datagram endpoint, since the sandbox denies IP networking and
