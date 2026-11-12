@@ -196,15 +196,13 @@ all arch integration_tests/functional/test_cpu_features_x86_64.py
 all arch integration_tests/functional/test_gdb.py::test_gdb_connects
 
 # What the harness does not provide yet, each named by its failure:
-# socat (the vsock tests' host side; Homebrew), sfdisk (util-linux, for
-# PARTUUID disks), losetup (a loop device; macOS: hdiutil attach), a TAP's
+# socat (the vsock tests' host side; Homebrew), losetup (a loop device;
+# macOS: hdiutil attach), a TAP's
 # transmit queue length (an endpoint's socket buffer here), and a host
 # program in a test's network (udp_offload.py; see test_net_change_mac_address).
 all bug integration_tests/functional/test_vsock.py::test_vsock
 all bug integration_tests/functional/test_vsock.py::test_vsock_bare_pause_resume
 all bug integration_tests/functional/test_vsock.py::test_vsock_after_override
-all bug integration_tests/functional/test_drive_virtio.py::test_partuuid_boot
-all bug integration_tests/functional/test_drive_vhost_user.py::test_partuuid_boot
 all bug integration_tests/functional/test_drive_virtio.py::test_rescan_dev
 all bug integration_tests/functional/test_net.py::test_high_ingress_traffic
 all bug integration_tests/functional/test_net.py::test_tap_offload

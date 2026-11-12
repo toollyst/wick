@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+"""util-linux's `sfdisk` as upstream's framework uses it, which macOS lacks.
+
+framework/utils_drive.py's partuuid_and_disk_path runs
+`echo type=83 | sfdisk --no-tell-kernel <file>` on a file with no partition
+table: sfdisk then writes a DOS (MBR) label with a random disk identifier and
+one partition of that type from sector 2048 (1 MiB, its default alignment)
+to the end of the file. This writes the same: the identifier at byte 440,
+the entry at 446 (CHS from sfdisk's 255 heads and 63 sectors, the maximum
+past cylinder 1023), the 0x55AA signature. Any other use is refused.
+"""
+import os
+import struct
+import sys
+
+SECTOR = 512
+START = 2048
+
+
+def chs(lba):
+    heads, sectors = 255, 63
+    c, rest = divmod(lba, heads * sectors)
+    h, s = divmod(rest, sectors)
+    if c > 1023:
+        c, h, s = 1023, 254, 63
+    else:
+        s += 1
+    return bytes([h, (s & 0x3F) | ((c >> 2) & 0xC0), c & 0xFF])
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) != 2 or args[0] != "--no-tell-kernel":
+        sys.exit(f"sfdisk (wick macOS shim): only `sfdisk --no-tell-kernel <file>` is supported, not {args}")
+    path = args[1]
+    script = [line.strip() for line in sys.stdin.read().splitlines() if line.strip()]
+    if len(script) != 1 or not script[0].startswith("type="):
+        sys.exit(f"sfdisk (wick macOS shim): only one `type=<hex>` partition is supported, not {script}")
+    ptype = int(script[0][len("type="):], 16)
+    size = os.path.getsize(path)
+    sectors = size // SECTOR
+    if sectors <= START:
+        sys.exit(f"sfdisk (wick macOS shim): {path} is too small for a partition at sector {START}")
+    with open(path, "r+b") as f:
+        mbr = bytearray(f.read(SECTOR).ljust(SECTOR, b"\0"))
+        if mbr[510:512] == b"\x55\xaa":
+            sys.exit(f"sfdisk (wick macOS shim): {path} already has a partition table")
+        ident = struct.unpack("<I", os.urandom(4))[0] or 1
+        last = sectors - 1
+        entry = (b"\x00" + chs(START) + bytes([ptype]) + chs(last)
+                 + struct.pack("<II", START, sectors - START))
+        mbr[440:444] = struct.pack("<I", ident)
+        mbr[444:446] = b"\0\0"
+        mbr[446:510] = entry + b"\0" * 48
+        mbr[510:512] = b"\x55\xaa"
+        f.seek(0)
+        f.write(mbr)
+    print(f"Created a new DOS disklabel with disk identifier 0x{ident:08x}.")
+    print(f"{path}1 : start= {START}, size= {sectors - START}, type={ptype:x}")
+
+
+main()
