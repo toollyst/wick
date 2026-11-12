@@ -89,10 +89,14 @@ all impossible integration_tests/functional/test_huge_pages.py::test_transparent
 # such file or directory; `mount`: / is "sealed, local, read-only").
 all impossible integration_tests/functional/test_cmd_line_parameters.py::test_cli_no_params
 
-# The test mounts a 512 MiB tmpfs at /mnt/<worker>: on macOS's sealed,
-# read-only system volume there is no /mnt and none can be made ("Read-only
-# file system: '/mnt'").
-all impossible integration_tests/functional/test_snapshot_not_losing_dirty_pages.py::test_diff_snapshot_works_after_error
+# The test mounts a 512 MiB tmpfs at /mnt/<worker>, which macOS's sealed,
+# read-only system volume cannot have; the harness gives it a RAM disk with
+# an APFS volume instead (wick_macos.small_tmpfs, on the session's
+# t<worker>), and the test then fails the framework's check that the API
+# socket is in a jail directory (measured, clean tree: "API socket
+# /tmp/wit-*/t0/firecracker/<id>/root/run/firecracker.socket is not in a
+# jail directory"). To find: where that check looks for the jail.
+all bug integration_tests/functional/test_snapshot_not_losing_dirty_pages.py::test_diff_snapshot_works_after_error
 
 # Signal 35 is musl's SIGRTMIN, the signal Firecracker on Linux kicks its
 # vCPU threads with and handles. macOS has no real-time signals (NSIG 32):
@@ -110,13 +114,6 @@ all impossible integration_tests/functional/test_signals.py::test_sigxfsz_handle
 # refused (os error 111)"); macOS fails it with ENOTSOCK, and its
 # ECONNREFUSED is 61. Firecracker reports the host's error as it is.
 all impossible integration_tests/functional/test_uffd.py::test_unbinded_socket
-
-# The guest connects to a server the test runs in the microVM's network
-# namespace (`ip netns exec <ns> python3 ...`). The harness's networks
-# (tools/macos/integration/wick_macos_net.py) run no host program inside:
-# their host side forwards only to the guest. To do: a forward from the
-# network's host address to a program on the host (slirp's guestfwd).
-all bug integration_tests/functional/test_net_config_space.py::test_net_change_mac_address
 
 # The test writes to Firecracker's terminal through /proc/<pid>/fd/0 with
 # TIOCSTI and reads its size with pmap. macOS has no /proc and no pmap;
@@ -169,14 +166,6 @@ all bug integration_tests/functional/test_cpu_template_helper.py::test_consecuti
 # that signals it.
 all bug integration_tests/functional/test_rng.py::test_rng_bw_rate_limiter
 
-# The test pins Firecracker's threads to CPUs (sched_setaffinity). macOS
-# has no CPU affinity: thread_policy_set's affinity tag is a hint for
-# placing threads together, not a set of CPUs a thread may run on, and
-# wick_macos's set_cpu_affinity fails (ENOSYS) rather than pretend.
-all impossible integration_tests/functional/test_vsock.py::test_vsock_transport_reset_h2g
-all impossible integration_tests/functional/test_vsock.py::test_vsock_transport_reset_g2h
-all impossible integration_tests/functional/test_vsock.py::test_snapshot_restore_with_inflight_vsock_tx
-
 # The test makes a multi-queue TAP (`ip tuntap add ... multi_queue`) and
 # expects Firecracker to refuse it. macOS has no TAP devices: an interface
 # is a datagram endpoint (docs/PORTING.md row 6), one queue by design.
@@ -203,17 +192,24 @@ user root integration_tests/functional/test_snapshot_basic.py::test_negative_sna
 all arch integration_tests/functional/test_cpu_features_x86_64.py
 all arch integration_tests/functional/test_gdb.py::test_gdb_connects
 
-# What the harness does not provide yet, each named by its failure:
-# socat (the vsock tests' host side; Homebrew), losetup (a loop device;
-# macOS: hdiutil attach), a TAP's
-# transmit queue length (an endpoint's socket buffer here), and a host
-# program in a test's network (udp_offload.py; see test_net_change_mac_address).
+# Listed when the harness lacked socat, a TAP's transmit queue length and a
+# host program in a test's network, which it has now (socat from Homebrew;
+# netns-slirp's txqueuelen; ip netns exec through netns-preload.dylib). Not
+# yet run on a clean tree since: their reason is to measure.
 all bug integration_tests/functional/test_vsock.py::test_vsock
 all bug integration_tests/functional/test_vsock.py::test_vsock_bare_pause_resume
 all bug integration_tests/functional/test_vsock.py::test_vsock_after_override
-all bug integration_tests/functional/test_drive_virtio.py::test_rescan_dev
-all bug integration_tests/functional/test_net.py::test_high_ingress_traffic
 all bug integration_tests/functional/test_net.py::test_tap_offload
+
+# The test's body passes (the drive moved to a block device, the guest
+# reads its new size), and its last step fails: `losetup --detach` of the
+# device Firecracker still has open. bin/losetup detaches with hdiutil,
+# which refuses a disk in use even with -force (measured, also outside a
+# VM with a process holding the disk open: "couldn't eject", exit 16,
+# EBUSY). Linux detaches a loop device in use on its last close instead
+# (losetup(8), util-linux: "lazy device destruction" since Linux 3.7, the
+# autoclear flag). To do: detach on the disk's last close.
+all bug integration_tests/functional/test_drive_virtio.py::test_rescan_dev
 
 # No SIGPIPE in 100 host connections closed with data in flight
 # (metrics: signals.sigpipe 0, which Linux counts at least once). To find:
