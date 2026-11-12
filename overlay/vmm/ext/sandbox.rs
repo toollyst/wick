@@ -2093,8 +2093,29 @@ mod macos {
         #[test]
         #[ignore = "run by test_a_handled_signal_interrupts_a_blocking_call in a separate process"]
         fn interrupted_child() {
+            // In a fork of this thread, so that the process holds only the
+            // threads the work makes: libtest's main thread, waiting for the
+            // test's end on its parker, makes its kernel semaphore at its
+            // first wait (libdispatch `_dispatch_sema4_create_slow`:
+            // semaphore_create, over mach_msg2_trap), which the API
+            // profile denies if that wait comes after it (as api_child).
+            in_fork(|| {
+                let ok = std::panic::catch_unwind(interrupted_body).is_ok();
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                if !ok {
+                    // SAFETY: ends the fork, as a panic ends a test.
+                    unsafe { libc::_exit(101) };
+                }
+            })
+        }
+
+        /// [`interrupted_child`]'s work, in its fork. No thread of it parks
+        /// (a channel, a join): a parker's first wait after the profile
+        /// would be denied as libtest's is. The blocked thread's results
+        /// come back in atomics.
+        fn interrupted_body() {
             use std::os::unix::thread::JoinHandleExt;
-            use std::sync::atomic::AtomicU8;
+            use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU8};
             use std::time::{Duration, Instant};
 
             use crate::utils::signal::{register_signal_handler, sigrtmin};
@@ -2104,28 +2125,41 @@ mod macos {
             // SAFETY: an array of two descriptors to fill.
             assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
             // How far the blocked thread is: 1 its read returned, 2 its
-            // sleep did.
+            // sleep did; and what each returned, with its errno.
+            static STARTED: AtomicBool = AtomicBool::new(false);
             static STAGE: AtomicU8 = AtomicU8::new(0);
+            static READ: AtomicIsize = AtomicIsize::new(0);
+            static READ_ERR: AtomicI32 = AtomicI32::new(0);
+            static SLEEP: AtomicI32 = AtomicI32::new(0);
+            static SLEEP_ERR: AtomicI32 = AtomicI32::new(0);
             let reader = fds[0];
             let case = std::env::var("WICK_TEST_CASE").unwrap();
             let sleeps = case != "api";
-            // Made before the sandbox, as the vCPU and API threads are.
+            // Made, and running, before the sandbox, as the vCPU and API
+            // threads are.
             let blocked = std::thread::spawn(move || {
+                STARTED.store(true, Ordering::Release);
                 let mut byte = 0u8;
                 // SAFETY: one byte into a local, from the pipe's read end.
                 let read = unsafe { libc::read(reader, (&raw mut byte).cast(), 1) };
-                let read_err = std::io::Error::last_os_error().raw_os_error();
+                READ_ERR.store(std::io::Error::last_os_error().raw_os_error().unwrap_or(0), Ordering::Relaxed);
+                READ.store(read, Ordering::Relaxed);
                 STAGE.store(1, Ordering::Release);
-                let (mut sleep, mut sleep_err) = (-1, Some(libc::EINTR));
+                let (mut sleep, mut sleep_err) = (-1, libc::EINTR);
                 if sleeps {
                     let long = libc::timespec { tv_sec: 30, tv_nsec: 0 };
                     // SAFETY: a time to sleep and no remainder asked for.
                     sleep = unsafe { libc::nanosleep(&long, std::ptr::null_mut()) };
-                    sleep_err = std::io::Error::last_os_error().raw_os_error();
+                    sleep_err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 }
+                SLEEP.store(sleep, Ordering::Relaxed);
+                SLEEP_ERR.store(sleep_err, Ordering::Relaxed);
                 STAGE.store(2, Ordering::Release);
-                (read, read_err, sleep, sleep_err)
             });
+            while !STARTED.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            assert_eq!(process_threads(), 2, "the profile is applied with this thread and the blocked one only");
             match case.as_str() {
                 "setup" => {
                     select(Policy::Default);
@@ -2156,9 +2190,10 @@ mod macos {
                     std::hint::spin_loop();
                 }
             }
-            let (read, read_err, sleep, sleep_err) = blocked.join().unwrap();
-            assert_eq!((read, read_err), (-1, Some(libc::EINTR)));
-            assert_eq!((sleep, sleep_err), (-1, Some(libc::EINTR)));
+            let read = (READ.load(Ordering::Relaxed), READ_ERR.load(Ordering::Relaxed));
+            let sleep = (SLEEP.load(Ordering::Relaxed), SLEEP_ERR.load(Ordering::Relaxed));
+            assert_eq!(read, (-1, libc::EINTR));
+            assert_eq!(sleep, (-1, libc::EINTR));
             println!("CHILD-OK");
         }
 
