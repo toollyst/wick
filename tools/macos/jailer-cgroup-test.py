@@ -165,11 +165,33 @@ class Freeze:
     def kids(self, pid):
         return self.jt.bt.children(pid)
 
+    # When the stage last wrote a control file (time.monotonic()).
+    written_at = None
+
     def cpu(self, pids, seconds=1.5):
-        """CPU seconds each of `pids` used over `seconds` (ps: 10 ms steps)."""
+        """CPU seconds each of `pids` used over `seconds` (ps: 10 ms steps).
+        Also keeps, in self.trace, the CPU each used in every 100 ms of the
+        window, with the time since the stage's last write: a jail thawed
+        late shows no CPU and then full CPU, one starved by other processes
+        a low rate throughout."""
+        start = time.monotonic()
         before = [self.jt.cpu_seconds(p) for p in pids]
-        time.sleep(seconds)
-        return [round(self.jt.cpu_seconds(p) - b, 2) for p, b in zip(pids, before)]
+        last, self.trace = before, []
+        while time.monotonic() - start < seconds:
+            time.sleep(max(0.0, min(0.1, seconds - (time.monotonic() - start))))
+            now = [self.jt.cpu_seconds(p) for p in pids]
+            since = time.monotonic() - (self.written_at or start)
+            self.trace.append((round(since * 1000), [round((n - l) * 1000) for n, l in zip(now, last)]))
+            last = now
+        return [round(n - b, 2) for n, b in zip(last, before)]
+
+    def explain_cpu(self, what):
+        """The window's trace, the load and the top CPU users, for a check
+        on the CPU a jail got."""
+        print(f"   {what}: CPU ms per 100 ms, as (ms since the last write, [per pid]): {self.trace}", flush=True)
+        print(f"   {what}: load average {os.getloadavg()}", flush=True)
+        top = subprocess.run(["ps", "-A", "-r", "-o", "pid=,pcpu=,comm="], capture_output=True, text=True).stdout
+        print(f"   {what}: top CPU users: {top.splitlines()[:8]}", flush=True)
 
     def frozen(self, pids, what):
         used = self.cpu(pids)
@@ -179,6 +201,8 @@ class Freeze:
     def running(self, pids, what):
         used = self.cpu(pids)
         print(f"   {what}: CPU seconds over 1.5 s {used}", flush=True)
+        if not all(u > 0.3 for u in used):
+            self.explain_cpu(what)
         self.check(all(u > 0.3 for u in used), f"{what}: too little CPU time while thawed {used}")
 
     def supervisor(self, vm_id):
@@ -216,6 +240,7 @@ class Freeze:
     def write(jd, name, value):
         with open(os.path.join(jd, name), "w") as f:
             f.write(value)
+        Freeze.written_at = time.monotonic()
 
     def as_jail_uid(self, jd, name, pid):
         p = subprocess.run([sys.executable, "-I", "-c", AS_JAIL_UID_PY, str(self.jt.UID), str(self.jt.GID),
