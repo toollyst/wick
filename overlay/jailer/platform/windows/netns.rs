@@ -9,12 +9,15 @@
 //! What a jail gets instead is the same reach:
 //!
 //! - **Its network is a directory of endpoints.** `--netns <dir>` names a
-//!   directory the operator made; every network endpoint Firecracker opens
-//!   (`platform::net`, a Unix stream socket a host-side switch connects to)
-//!   is made there, and the jail's SID is granted on it, as a TAP device in
-//!   the namespace is reachable from inside it. Two jails given the same
-//!   directory share a network, as two Firecrackers in one namespace do; a
-//!   jail given its own reaches no other jail's (`jailer-test.ps1 netns`).
+//!   directory the operator made, which grants no jail anything; every
+//!   network endpoint Firecracker opens (`platform::net`, a Unix stream
+//!   socket a host-side switch connects to) is made in the jail's own
+//!   directory in it, `<dir>\<id>`, which only that jail and the operator
+//!   reach (`jail_network` in the module above). Jails given one directory
+//!   are in one network, as Firecrackers in one namespace are, and each
+//!   endpoint is its jail's alone, as a TAP is its owner's (drivers/net/
+//!   tun.c: `tun_not_capable`, `tun_attach`): no other jail can connect to
+//!   it, delete it or take its name (`jailer-test.ps1 netns`).
 //! - **No IP networking at all**, through the Windows Filtering Platform
 //!   ([`NetFilter`]): every IPv4 and IPv6 connect, bind, listen and accept of
 //!   the processes running the jail's copy of Firecracker is blocked, in a

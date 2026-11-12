@@ -40,7 +40,8 @@
 //!   later one waiting its turn. A
 //!   name without `/` or `\` lives in
 //!   `%TEMP%\firecracker-net\` (in a jail given a network with `--netns`,
-//!   that network's directory), a name with one is the path itself. The
+//!   the jail's own directory in it, `<network>\<id>`), a name with one is
+//!   the path itself. The
 //!   virtio-net header is handled by [`super::vnet`].
 
 use std::fmt::Debug;

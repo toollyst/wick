@@ -65,10 +65,11 @@
 //!   Firecracker runs, its pid in the pid file, as upstream's returns after
 //!   the clone.
 //! - **`--netns <dir>`** ([`netns`]): the jail's network is the directory
-//!   named, where Firecracker makes its network endpoints and which the
-//!   jail's SID is granted on, and the jail's copy of Firecracker gets no IP
-//!   networking at all (Windows Filtering Platform). Needs an elevated
-//!   jailer, as `setns` needs root.
+//!   named, which grants no jail anything; Firecracker makes its network
+//!   endpoints in the jail's own directory in it, `<dir>\<id>`, which only
+//!   the jail and the operator reach ([`jail_network`]); and the jail's copy
+//!   of Firecracker gets no IP networking at all (Windows Filtering
+//!   Platform). Needs an elevated jailer, as `setns` needs root.
 //!
 //! Refused, never accepted without effect: `--resource-limit fsize=` and a
 //! `no-file=` other than the default (Windows cannot limit file sizes or the
@@ -100,14 +101,14 @@ use windows_sys::Win32::Security::{
     SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS,
     TOKEN_DEFAULT_DACL, TOKEN_GROUPS, TOKEN_OWNER, TOKEN_QUERY,
     TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenImpersonation,
-    TokenIntegrityLevel, TokenOwner, TokenUser, PROTECTED_DACL_SECURITY_INFORMATION, ACL, INHERITED_ACE,
+    TokenIntegrityLevel, TokenOwner, TokenUser, PROTECTED_DACL_SECURITY_INFORMATION, ACL,
     TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TokenElevationType, TokenElevationTypeFull, TokenLinkedToken,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION, DefineDosDeviceW, GetLogicalDrives,
 };
 #[cfg(test)]
-use windows_sys::Win32::Security::{CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE};
+use windows_sys::Win32::Security::{CONTAINER_INHERIT_ACE, INHERITED_ACE, OBJECT_INHERIT_ACE};
 #[cfg(test)]
 use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::Console::{
@@ -412,7 +413,9 @@ pub fn join_netns(path: &str) -> Result<(), JailerError> {
 
 /// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE` (winnt.h; in
 /// windows-sys under `SystemServices`, a feature the jailer does not take).
+#[cfg(test)]
 const ACCESS_ALLOWED_ACE_TYPE: u32 = 0;
+#[cfg(test)]
 const ACCESS_DENIED_ACE_TYPE: u32 = 1;
 
 /// The entries of the DACL of `path`: ACE type, flags, access mask and the
@@ -420,6 +423,7 @@ const ACCESS_DENIED_ACE_TYPE: u32 = 1;
 /// always; SDDL writes a well-known account as its alias (CI's Windows
 /// runner is the built-in Administrator, which SDDL writes as `LA`, not
 /// `S-1-5-21-...-500`), so a text comparison on SDDL misses it.
+#[cfg(test)]
 fn dacl_entries(path: &Path) -> io::Result<Vec<(u8, u8, u32, String)>> {
     use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
     use windows_sys::Win32::Security::{
@@ -527,60 +531,177 @@ fn dacl_sddl(path: &Path) -> io::Result<String> {
     Ok(sddl.trim_end_matches('\0').to_owned())
 }
 
-/// Protects the network directory `dir` as the jail directory is protected:
-/// its DACL no longer inherits from its parent (what `C:\` grants, Modify to
-/// Authenticated Users, which every jail's token holds, let a jail into
-/// another jail's network, measured by `jailer-test.ps1 netns` on a WHP
-/// machine) and holds SYSTEM, the administrators, the user and this jail's
-/// SID, inherited by the endpoints made in it, plus the jail SIDs granted
-/// before (another jail given the same directory keeps its entry: the
-/// entries are read as SIDs, not SDDL, so no alias SDDL writes for an
-/// account can hide one, [`dacl_entries`]). Those jails are not separated
-/// from each other's endpoints: each one's entry is inherited by every
-/// endpoint in the directory, so one may connect to another's endpoint as
-/// its switch, delete it, or take its name first, where two Firecrackers in
-/// one Linux namespace cannot reach each other's TAP. Not done yet; until
-/// then each jail needs a network directory of its own (SECURITY.md, "Not at
-/// parity yet"). The directory is labelled with the jail's
-/// integrity level, so that the jailed process can make its endpoints
-/// there: an object without a label is medium, which a jailed process may
-/// not write to.
-fn grant_to_jail(dir: &Path) -> io::Result<()> {
-    let user = user_sid()?;
-    let mine = vm_sid();
-    let mut dacl = format!(
-        "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{mine})"
-    );
-    for (kind, flags, _, sid) in dacl_entries(dir)? {
-        // An allow entry of this directory's own (not inherited), for a jail.
-        if u32::from(kind) == ACCESS_ALLOWED_ACE_TYPE
-            && u32::from(flags) & INHERITED_ACE == 0
-            && sid.starts_with("S-1-9-")
-            && sid != mine
-        {
-            dacl.push_str(&format!("(A;OICI;FA;;;{sid})"));
-        }
+/// The longest endpoint name Firecracker makes in a network directory
+/// (`platform::net`: names shorter than `IFNAMSIZ`, 16).
+const ENDPOINT_NAME_MAX: usize = 15;
+/// `sockaddr_un`'s path with its NUL (afunix.h, `UNIX_PATH_MAX`): an endpoint's
+/// path must be shorter (`platform::net` refuses a longer one).
+const UNIX_PATH_MAX: usize = 108;
+
+/// The owner of `path`, as text.
+fn owner_sid(path: &Path) -> io::Result<String> {
+    use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut owner: PSID = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated path and out-pointers.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
     }
-    set_security(dir, &dacl, false)?;
-    set_security(dir, JAIL_LABEL, true)
+    let sid = sid_string(owner);
+    // SAFETY: allocated by GetNamedSecurityInfoW; `owner` points into it.
+    unsafe { LocalFree(sd) };
+    sid
 }
 
 /// What a jail holds of its network (`--netns`) while Firecracker runs: the
-/// directory its endpoints are made in, named to Firecracker
-/// (`vmm::ext::jail::NETNS_ENV`).
+/// directory of its own its endpoints are made in, named to Firecracker
+/// (`vmm::ext::jail::NETNS_ENV`), open without `FILE_SHARE_DELETE` so that a
+/// second jail of the same id is refused while this one lives. The jailer
+/// keeps it until it ends, with Firecracker.
 #[derive(Debug)]
 struct JailNetwork {
     dir: PathBuf,
-    _lock: Option<OwnedHandle>,
+    _lock: std::fs::File,
 }
 
-/// Opens the network directory `network` to the jail `id`. Today the jail's
-/// SID is granted on the network directory itself ([`grant_to_jail`]), and
-/// the jail makes its endpoints there.
-fn jail_network(network: &Path, _id: &OsStr) -> Result<JailNetwork, HostError> {
-    grant_to_jail(network)
-        .map_err(|e| HostError::Netns(network.to_owned(), format!("cannot open the network to the jail: {e}")))?;
-    Ok(JailNetwork { dir: network.to_owned(), _lock: None })
+/// Gives the jail `id` its own directory in the network directory
+/// `network`: `<network>\<id>`, where Firecracker makes its endpoints
+/// (`platform::net`), as a TAP is its owner's on Linux (drivers/net/tun.c:
+/// `tun_not_capable` refuses another user's attach, `tun_attach` a second
+/// one with EBUSY).
+///
+/// - The network directory grants no jail anything: SYSTEM, the
+///   administrators, the user and the directory's owner (the operator, whose
+///   switch reaches the endpoints), protected from what its parent grants
+///   (`C:\` gives Authenticated Users, which every jail's token holds, Modify).
+///   An entry an earlier jailer gave a jail there goes. A jail reaches its
+///   own directory through it by its traversal privilege
+///   (`SeChangeNotifyPrivilege`, the one the jail keeps), and can neither
+///   list it nor make a name in it, so it cannot take a later jail's name or
+///   directory first.
+/// - The jail's directory holds those and the jail's SID, protected and
+///   labelled with the jail's integrity level, so that the jail can make its
+///   endpoints there (an object without a label is medium, which a jail may
+///   not write to). No other jail reaches it: none can connect to an
+///   endpoint there (AF_UNIX `connect` needs write access to the socket's
+///   file), delete one or take its name.
+/// - It is opened without `FILE_SHARE_DELETE` first: while a jail of the id
+///   runs, a second one is refused as busy (EBUSY on Linux) and the first
+///   keeps its endpoints. A link or a file in its place is refused. Both
+///   DACLs are written through handles ([`set_security_of`]), so a jail
+///   starting does not open the directories of the jails running. What a
+///   jail of the id that ended left (its endpoints) is removed; the
+///   directory itself is kept when the jail ends, as upstream keeps the
+///   jail's root.
+/// - A network path whose endpoints could not be named within
+///   `sockaddr_un`'s 108 bytes is refused before anything is made (Linux
+///   names a TAP, not a path).
+fn jail_network(network: &Path, id: &OsStr) -> Result<JailNetwork, HostError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    };
+    /// `ERROR_SHARING_VIOLATION` (winerror.h).
+    const SHARING_VIOLATION: i32 = 32;
+    let refuse = |why: String| HostError::Netns(network.to_owned(), why);
+    let fail = |what: String, e: io::Error| HostError::Netns(network.to_owned(), format!("{what}: {e}"));
+    let dir = network.join(id);
+    if dir.as_os_str().len() + 1 + ENDPOINT_NAME_MAX >= UNIX_PATH_MAX {
+        return Err(refuse(format!(
+            "the jail's network directory {} is too long a path: an endpoint's path, the directory and a \
+             name of up to {ENDPOINT_NAME_MAX} characters, must be shorter than sockaddr_un's {UNIX_PATH_MAX} bytes",
+            dir.display()
+        )));
+    }
+    let user = user_sid().map_err(|e| fail("the user's SID".into(), e))?;
+    let owner = owner_sid(network).map_err(|e| fail("the network directory's owner".into(), e))?;
+    let mut operators = vec!["S-1-5-18".to_owned(), "S-1-5-32-544".to_owned(), user];
+    if !operators.contains(&owner) {
+        operators.push(owner);
+    }
+    let dacl = |jail: Option<&str>| {
+        let mut dacl = "D:PAI".to_owned();
+        for sid in operators.iter().map(String::as_str).chain(jail) {
+            dacl.push_str(&format!("(A;OICI;FA;;;{sid})"));
+        }
+        dacl
+    };
+    // Written whole, the same by every jailer of the user: no other jailer's
+    // change is lost, and the running jails' directories in it, each with a
+    // protected DACL of its own, are not touched.
+    let whole = std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(network)
+        .map_err(|e| fail("open the network directory".into(), e))?;
+    set_security_of(whole.as_raw_handle(), &dacl(None), false)
+        .map_err(|e| fail("close the network directory to every jail".into(), e))?;
+    drop(whole);
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(fail(format!("make {}", dir.display()), e)),
+    }
+    let lock = std::fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&dir)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(SHARING_VIOLATION) {
+                refuse(format!(
+                    "{} is busy: a jail of id {} is running and holds it ({e})",
+                    dir.display(),
+                    id.to_string_lossy()
+                ))
+            } else {
+                fail(format!("open {}", dir.display()), e)
+            }
+        })?;
+    // SAFETY: zeroed is a valid value of the plain structure.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: an open handle and a structure to fill.
+    if unsafe { GetFileInformationByHandle(lock.as_raw_handle(), &mut info) } == 0 {
+        return Err(fail(format!("read {}", dir.display()), last_error()));
+    }
+    // Held, it can be neither renamed nor removed: the checks hold for the
+    // path from here on.
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(refuse(format!("{} is not a directory of its own (a link or a file)", dir.display())));
+    }
+    // Through the handle held: the object checked above. What is in it now
+    // goes next; what Firecracker makes there inherits this.
+    set_security_of(lock.as_raw_handle(), &dacl(Some(vm_sid())), false)
+        .map_err(|e| fail(format!("give {} to the jail", dir.display()), e))?;
+    set_security_of(lock.as_raw_handle(), JAIL_LABEL, true).map_err(|e| fail(format!("label {}", dir.display()), e))?;
+    let left = std::fs::read_dir(&dir).map_err(|e| fail(format!("read {}", dir.display()), e))?;
+    for entry in left {
+        let entry = entry.map_err(|e| fail(format!("read {}", dir.display()), e))?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| fail(format!("read {}", path.display()), e))?;
+        if kind.is_dir() {
+            return Err(refuse(format!("{} holds a directory, which no jail makes there", dir.display())));
+        }
+        std::fs::remove_file(&path)
+            .map_err(|e| fail(format!("remove {}, which a jail of id {} left", path.display(), id.to_string_lossy()), e))?;
+    }
+    Ok(JailNetwork { dir, _lock: lock })
 }
 
 /// The variable that tells a relaunched jailer it is the keeper of a
@@ -1075,6 +1196,38 @@ fn set_security(path: &Path, sddl: &str, label: bool) -> io::Result<()> {
         };
         if rc == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(rc as i32)) }
     };
+    // SAFETY: allocated by the conversion.
+    unsafe { LocalFree(sd) };
+    result
+}
+
+/// As [`set_security`], through an open handle of the object (`WRITE_DAC`
+/// for a DACL, `WRITE_OWNER` for a label), to that object alone
+/// (`SetKernelObjectSecurity`). By name, Windows also rewrites the inherited
+/// entries of everything a directory holds, opening each directory under it
+/// to list it; a running jail's network directory is held open without
+/// `FILE_SHARE_DELETE` ([`jail_network`]), which an open to list must share
+/// (the sharing rule, `IoCheckShareAccess`), and whether that walk shares it
+/// is not documented.
+fn set_security_of(handle: HANDLE, sddl: &str, label: bool) -> io::Result<()> {
+    use windows_sys::Win32::Security::SetKernelObjectSecurity;
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated SDDL string and an out-pointer.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide(sddl).as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    let info = if label { LABEL_SECURITY_INFORMATION } else { DACL_SECURITY_INFORMATION };
+    // SAFETY: an open handle and the descriptor converted above, which
+    // carries the DACL's control bits (`P`, protected) with it.
+    let result = if unsafe { SetKernelObjectSecurity(handle, info, sd) } == 0 { Err(last_error()) } else { Ok(()) };
     // SAFETY: allocated by the conversion.
     unsafe { LocalFree(sd) };
     result
@@ -2061,7 +2214,7 @@ fn exec(
     let api = !args.iter().any(|a| a == "--no-api");
     let limits = LIMITS.lock().unwrap().clone();
 
-    // --netns: the network directory opened to the jail, named to
+    // --netns: the jail's own directory of the network, named to
     // Firecracker, and no IP networking for the jail's binary, from before
     // it starts until the jailer ends (the filter's session is the jailer's).
     let netns = NETNS.lock().unwrap().take();
@@ -2314,110 +2467,6 @@ mod tests {
             Err(e) => panic!("{e}"),
         }
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    // A network directory granted to the jail is protected: what its parent
-    // grants (Authenticated Users, which every jail holds) is gone, the
-    // operator's entries and other jails' stay, and it gets the jail's label.
-    #[test]
-    fn test_grant_to_jail_protects_the_directory_and_keeps_other_jails() {
-        let dir = std::env::temp_dir().join(format!("wick-jailer-grant-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let other = "S-1-9-1-2-3-4";
-        let user = user_sid().unwrap();
-        // As a temporary directory comes, plus another jail's entry.
-        let inherited = dacl_sddl(&dir).unwrap();
-        assert!(inherited.contains(";ID;") || inherited.contains("ID;"), "no inherited entry to drop: {inherited}");
-        set_security(&dir, &format!("D:AI(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{other})"), false).unwrap();
-        grant_to_jail(&dir).unwrap();
-        let after = dacl_sddl(&dir).unwrap();
-        assert!(after.starts_with("D:P"), "not protected: {after}");
-        // As SIDs: SDDL writes the built-in Administrator (CI's runner) as
-        // "LA", so `user` is not found in the text.
-        let entries = dacl_entries(&dir).unwrap();
-        let full = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
-        for sid in ["S-1-5-18", "S-1-5-32-544", user.as_str(), vm_sid(), other] {
-            assert!(
-                entries.iter().any(|(k, f, m, s)| u32::from(*k) == ACCESS_ALLOWED_ACE_TYPE
-                    && u32::from(*f) == full
-                    && *m == FILE_ALL_ACCESS
-                    && s == sid),
-                "{sid} missing: {entries:?} ({after})"
-            );
-        }
-        assert_eq!(entries.len(), 5, "{entries:?} ({after})");
-        assert!(
-            entries.iter().all(|(_, f, _, s)| u32::from(*f) & INHERITED_ACE == 0 && s != "S-1-5-11" && s != "S-1-5-32-545"),
-            "inherited entries kept: {entries:?} ({after})"
-        );
-        let label = {
-            use windows_sys::Win32::Security::Authorization::{
-                ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
-            };
-            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-            // SAFETY: a NUL-terminated path and out-pointers.
-            let rc = unsafe {
-                GetNamedSecurityInfoW(
-                    wide(&dir).as_ptr(),
-                    SE_FILE_OBJECT,
-                    LABEL_SECURITY_INFORMATION,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &mut sd,
-                )
-            };
-            assert_eq!(rc, 0);
-            let mut text: *mut u16 = std::ptr::null_mut();
-            let mut len = 0u32;
-            // SAFETY: the descriptor read above; out-pointers.
-            let ok = unsafe {
-                ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, LABEL_SECURITY_INFORMATION, &mut text, &mut len)
-            };
-            assert_ne!(ok, 0);
-            // SAFETY: `len` characters allocated by the conversion.
-            let s = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(text, len as usize)) };
-            // SAFETY: allocated by the calls above.
-            unsafe {
-                LocalFree(text.cast());
-                LocalFree(sd);
-            }
-            s
-        };
-        assert!(label.contains(JAIL_INTEGRITY_SID), "{label}");
-        // A second grant (another jail of the same jailer: the same SID) changes nothing more.
-        grant_to_jail(&dir).unwrap();
-        assert_eq!(dacl_sddl(&dir).unwrap(), after);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The owner of `path`, as text.
-    fn owner_sid(path: &Path) -> io::Result<String> {
-        use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
-        use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
-        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        let mut owner: PSID = std::ptr::null_mut();
-        // SAFETY: a NUL-terminated path and out-pointers.
-        let rc = unsafe {
-            GetNamedSecurityInfoW(
-                wide(path).as_ptr(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                &mut owner,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut sd,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc.cast_signed()));
-        }
-        let sid = sid_string(owner);
-        // SAFETY: allocated by GetNamedSecurityInfoW; `owner` points into it.
-        unsafe { LocalFree(sd) };
-        sid
     }
 
     /// The mandatory label of `path` as SDDL (`S:...`).

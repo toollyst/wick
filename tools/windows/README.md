@@ -24,12 +24,14 @@
   open in the jail), `pidns` (no process, thread or console of anyone else;
   needs a console), `handoff` (a handle and a socket held by a jailed process
   are pulled out by the operator and by a medium-integrity process of the
-  user), `netns` (two jails with a network each: a jail reaches its own
-  network's endpoint and not the other's, is denied TCP and UDP, and an
-  unelevated jailer is refused the flag; needs an elevated PowerShell) and
+  user), `netns` (two jails with a network each, and a jail and a probe
+  given the first's: each endpoint in its jail's own directory of the
+  network, which no other jail reaches; a second jail of a running id
+  refused; TCP and UDP denied; an unelevated jailer refused the flag; needs
+  an elevated PowerShell) and
   `api` (the jail runs Firecracker and its API server's process, the latter
   under the whole mitigation profile; each one's end ends the other). With a
-  guest: `netguest` (frames through the network directory's endpoint),
+  guest: `netguest` (frames through the endpoint in the jail's own directory of the network),
   `isolation` (`jail-probe.rs`, run through the jailer as the jailed binary,
   may not read the user's files or SAM, write outside its jail, reach another
   jail's files, API socket or process, or open the operator's; the operator

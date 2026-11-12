@@ -58,8 +58,8 @@ pub const SEND_STALL: Duration = Duration::from_secs(1);
 const READ_CHUNK: usize = 64 << 10;
 
 /// The directory of endpoints named without a path separator: the jail's
-/// network, if the jailer gave one (`--netns`, `ext::jail::netns`), else
-/// `%TEMP%\firecracker-net`.
+/// own directory of its network, if the jailer gave one (`--netns`,
+/// `ext::jail::netns`: `<network>\<id>`), else `%TEMP%\firecracker-net`.
 pub fn endpoint_dir() -> io::Result<PathBuf> {
     if let Some(dir) = crate::ext::jail::netns() {
         return Ok(dir.to_path_buf());

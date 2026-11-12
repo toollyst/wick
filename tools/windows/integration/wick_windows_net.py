@@ -220,9 +220,15 @@ class _Iface:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    @property
-    def path(self):
-        return self.netns.path / self.name
+    def paths(self):
+        """Where the endpoint may be: in a jail's own directory of the
+        network, <network>\\<id>\\<name> (the jailer gives each jail one),
+        or in the network directory itself for a VMM not jailed. A jail that
+        ended leaves its directory, and may leave its endpoint, which refuses
+        a connection: the switch connects to the one that accepts."""
+        found = sorted(p for p in self.netns.path.glob(f"*/{self.name}"))
+        bare = self.netns.path / self.name
+        return found + [bare] if bare.exists() else found
 
     def used(self):
         return self.conn is not None
@@ -231,14 +237,16 @@ class _Iface:
 
     def _run(self):
         while not self.stop:
-            if not self.path.exists():
-                time.sleep(0.05)
-                continue
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                s.connect(str(self.path))
-            except OSError:
-                s.close()
+            s = None
+            for path in self.paths():
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    s.connect(str(path))
+                    break
+                except OSError:
+                    s.close()
+                    s = None
+            if s is None:
                 time.sleep(0.05)
                 continue
             self.conn = s
