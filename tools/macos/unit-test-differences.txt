@@ -1,0 +1,211 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The workspace's unit tests that do not pass on macOS CI's runners, each with
+# the reason. tools/macos/check-unit-tests.py runs every test of every crate
+# it names (the jailer's run as root in their own step) and fails on:
+#   - a failure not listed here;
+#   - an entry whose test passes, is ignored or does not run;
+#   - an entry naming a test that does not exist.
+# So nothing goes unrun silently, and the list cannot rot.
+#
+# Format: <kind> <crate> <test path>, below a comment that gives the reason.
+# <crate> is a name of check-unit-tests.py's: the package, or compat-<name> for
+# crates/compat/<name>. kind:
+#   no-hvf      creates a VM: hv_vm_create fails (CreateVm(Error(1)) or Error(1))
+#               where Hypervisor.framework is missing, as on GitHub's macOS
+#               runners (virtual machines), or without the hypervisor
+#               entitlement. Each passes on an M1 Pro (macOS 27.2) signed with
+#               it, alone in its process (tools/macos/test.sh, one VM per
+#               process); that run is where these are tested.
+#   linux-path  the test reads a Linux path itself
+#   error-text  the test builds Linux's error text from a Linux errno number
+#   bug         a wick bug or difference to fix (root cause first)
+#
+# Measured on an M1 Pro, macOS 27.2, 2026-11-13, unsigned (as CI), one test
+# thread, then each failure alone unsigned and signed:
+#   vmm --lib: 1003 tests; 825 pass, 138 fail, 40 ignored (the ext:: helpers
+#   their parent tests run in a child process). All 138 fail unsigned alone
+#   with CreateVm(Error(1)) and pass signed alone.
+#   cpu-template-helper: 29 tests; 23 pass, 6 fail (4 no-hvf, 2 below).
+#   compat-kvm-ioctls: 30 tests; 13 pass, 17 fail, all no-hvf.
+#   Pass (names, a name in two of a crate's binaries counted once):
+#   acpi-tables 22, clippy-tracing 17, firecracker 89, rebase-snap 3,
+#   snapshot-editor 6, utils 16, wick-ext 1, wick-version 2, compat-libc 30,
+#   compat-memfd 3, compat-std 1, compat-userfaultfd 5, compat-vmm-sys-util 26.
+#   No tests: log-instrument, log-instrument-macros, seccompiler,
+#   compat-event-manager, compat-kvm-bindings, compat-micro-http, compat-os,
+#   compat-vhost, compat-vm-memory.
+
+# cpu-template-helper: the fingerprint is read from Linux sysfs, which macOS
+# has not (docs/COMPATIBILITY.md, the cpu-template-helper row: 🟡). Windows
+# reads the same values from the registry (fingerprint/dump.rs
+# read_sysfs_file); macOS has no equivalent yet. test_fingerprint_dump_command
+# also creates a VM: without Hypervisor.framework it fails at that first.
+bug cpu-template-helper fingerprint::dump::tests::test_read_valid_sysfs_file
+bug cpu-template-helper tests::test_fingerprint_dump_command
+
+# cpu-template-helper: builds a microVM.
+no-hvf cpu-template-helper template::dump::tests::test_dump
+no-hvf cpu-template-helper tests::test_template_dump_command
+no-hvf cpu-template-helper tests::test_template_verify_command
+no-hvf cpu-template-helper utils::tests::test_build_microvm
+
+# compat-kvm-ioctls: the Hypervisor.framework backend's own tests.
+no-hvf compat-kvm-ioctls hvf::vcpu::tests::test_kvm_ptp_counters
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_new_vcpu_has_kvms_reset_values
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_guest_writes_during_a_discard_wait_for_the_new_pages
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_id_register_writes_reach_the_guest
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_madvise_dontneed_replaces_guest_pages
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_map_fixed_replaces_guest_pages
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_msi_data_names_no_spi
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_os_lock_is_a_register_as_on_kvm
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_psci_version_is_the_vms
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_ptrauth_is_a_vcpu_feature
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_ptrauth_keys_are_hidden_without_ptrauth
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_scattered_discards_keep_the_guest_mapped
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_signals_interrupt_run_as_on_kvm
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_spi_active_restored_before_its_vcpu_exists
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_spi_raised_before_its_vcpu_exists
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_vcpu_init_reads_what_the_run_phase_needs
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_virtual_count_is_the_vms
+
+# vmm: every test that builds a Vm (vstate::vm::Vm::new and its callers).
+no-hvf vmm arch::aarch64::fdt::tests::test_create_fdt
+no-hvf vmm arch::aarch64::gic::gicv2::regs::dist_regs::tests::test_access_dist_regs
+no-hvf vmm arch::aarch64::gic::gicv2::regs::icc_regs::tests::test_access_icc_regs
+no-hvf vmm arch::aarch64::gic::gicv2::regs::tests::test_vm_save_restore_state
+no-hvf vmm arch::aarch64::gic::gicv3::regs::dist_regs::tests::test_access_dist_regs
+no-hvf vmm arch::aarch64::gic::gicv3::regs::icc_regs::tests::test_access_icc_regs
+no-hvf vmm arch::aarch64::gic::gicv3::regs::redist_regs::tests::test_access_redist_regs
+no-hvf vmm arch::aarch64::gic::gicv3::regs::tests::test_vm_save_restore_state
+no-hvf vmm arch::aarch64::gic::gicv3::tests::test_save_pending_tables
+no-hvf vmm arch::aarch64::gic::tests::test_create_gic
+no-hvf vmm arch::aarch64::vcpu::tests::test_configure_vcpu
+no-hvf vmm arch::aarch64::vcpu::tests::test_create_vcpu
+no-hvf vmm arch::aarch64::vcpu::tests::test_dump_cpu_config_after_init
+no-hvf vmm arch::aarch64::vcpu::tests::test_dump_cpu_config_before_init
+no-hvf vmm arch::aarch64::vcpu::tests::test_get_invalid_regs
+no-hvf vmm arch::aarch64::vcpu::tests::test_get_set_regs
+no-hvf vmm arch::aarch64::vcpu::tests::test_get_valid_regs
+no-hvf vmm arch::aarch64::vcpu::tests::test_init_vcpu
+no-hvf vmm arch::aarch64::vcpu::tests::test_mpstate
+no-hvf vmm arch::aarch64::vcpu::tests::test_pmu_v3_feature_invalid
+no-hvf vmm arch::aarch64::vcpu::tests::test_read_mpidr
+no-hvf vmm arch::aarch64::vcpu::tests::test_setup_non_boot_vcpu
+no-hvf vmm arch::aarch64::vcpu::tests::test_setup_regs
+no-hvf vmm arch::aarch64::vcpu::tests::test_vcpu_save_restore_state
+no-hvf vmm arch::aarch64::vcpu::tests::test_writable_imp_id_regs
+no-hvf vmm builder::tests::test_attach_balloon_device
+no-hvf vmm builder::tests::test_attach_block_devices
+no-hvf vmm builder::tests::test_attach_boot_timer_device
+no-hvf vmm builder::tests::test_attach_entropy_device
+no-hvf vmm builder::tests::test_attach_net_devices
+no-hvf vmm builder::tests::test_attach_pmem_devices
+no-hvf vmm builder::tests::test_attach_virtio_mem_device
+no-hvf vmm builder::tests::test_attach_vsock_device
+no-hvf vmm device_manager::mmio::tests::test_device_info
+no-hvf vmm device_manager::mmio::tests::test_register_too_many_devices
+no-hvf vmm device_manager::mmio::tests::test_register_virtio_device
+no-hvf vmm device_manager::pci_mngr::tests::test_device_manager_persistence
+no-hvf vmm device_manager::persist::tests::test_device_manager_persistence
+no-hvf vmm device_manager::tests::test_attach_legacy_serial
+no-hvf vmm device_manager::tests::test_hotplug_block
+no-hvf vmm device_manager::tests::test_hotplug_net
+no-hvf vmm device_manager::tests::test_hotplug_pci_not_enabled
+no-hvf vmm device_manager::tests::test_hotplug_pmem
+no-hvf vmm device_manager::tests::test_hotunplug_pci_not_enabled
+no-hvf vmm device_manager::tests::test_pci_bar_is_freed_on_unplug
+no-hvf vmm device_manager::tests::test_unplug_root_block
+no-hvf vmm device_manager::tests::test_unplug_root_pmem
+no-hvf vmm devices::pci::pci_segment::tests::test_mmio_bus
+no-hvf vmm devices::pci::pci_segment::tests::test_next_device_bdf
+no-hvf vmm devices::pci::pci_segment::tests::test_pci_segment_build
+no-hvf vmm devices::virtio::mem::device::tests::test_config_as_bytes
+no-hvf vmm devices::virtio::mem::device::tests::test_event_fail_descriptor_chain_too_short
+no-hvf vmm devices::virtio::mem::device::tests::test_event_fail_descriptor_length_too_small
+no-hvf vmm devices::virtio::mem::device::tests::test_event_fail_response_descriptor_length_too_small
+no-hvf vmm devices::virtio::mem::device::tests::test_event_fail_unexpected_readonly_descriptor
+no-hvf vmm devices::virtio::mem::device::tests::test_event_fail_unexpected_writeonly_descriptor
+no-hvf vmm devices::virtio::mem::device::tests::test_from_state
+no-hvf vmm devices::virtio::mem::device::tests::test_invalid_range_out_of_bounds
+no-hvf vmm devices::virtio::mem::device::tests::test_invalid_range_unaligned
+no-hvf vmm devices::virtio::mem::device::tests::test_invalid_range_zero_blocks
+no-hvf vmm devices::virtio::mem::device::tests::test_new
+no-hvf vmm devices::virtio::mem::device::tests::test_plug_partial_kvm_failure_keeps_state_consistent
+no-hvf vmm devices::virtio::mem::device::tests::test_plug_request_already_plugged
+no-hvf vmm devices::virtio::mem::device::tests::test_plug_request_success
+no-hvf vmm devices::virtio::mem::device::tests::test_plug_request_too_big
+no-hvf vmm devices::virtio::mem::device::tests::test_repeated_unplug_all_is_noop
+no-hvf vmm devices::virtio::mem::device::tests::test_set_features
+no-hvf vmm devices::virtio::mem::device::tests::test_state_request_mixed
+no-hvf vmm devices::virtio::mem::device::tests::test_state_request_plugged
+no-hvf vmm devices::virtio::mem::device::tests::test_state_request_unplugged
+no-hvf vmm devices::virtio::mem::device::tests::test_status
+no-hvf vmm devices::virtio::mem::device::tests::test_unplug_all_request
+no-hvf vmm devices::virtio::mem::device::tests::test_unplug_request_not_plugged
+no-hvf vmm devices::virtio::mem::device::tests::test_unplug_request_success
+no-hvf vmm devices::virtio::mem::device::tests::test_unsupported_request
+no-hvf vmm devices::virtio::mem::device::tests::test_update_requested_size_device_not_active
+no-hvf vmm devices::virtio::mem::device::tests::test_update_requested_size_invalid_size
+no-hvf vmm devices::virtio::mem::device::tests::test_update_requested_size_success
+no-hvf vmm devices::virtio::mem::device::tests::test_write_config
+no-hvf vmm devices::virtio::mem::event_handler::tests::test_event_handler_activation
+no-hvf vmm devices::virtio::mem::event_handler::tests::test_process_mem_queue_event
+no-hvf vmm devices::virtio::mem::event_handler::tests::test_spurious_event_before_activation
+no-hvf vmm devices::virtio::mem::persist::tests::test_save_restore_state
+no-hvf vmm devices::virtio::mem::persist::tests::test_save_state
+no-hvf vmm devices::virtio::pmem::device::tests::test_from_config
+no-hvf vmm devices::virtio::pmem::device::tests::test_process_chain
+no-hvf vmm devices::virtio::pmem::persist::tests::test_persistence
+no-hvf vmm devices::virtio::pmem::persist::tests::test_restore_rejects_mismatched_config_space_size
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_activate_failure_sets_needs_reset
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_bar_relocation
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_bar_relocation_on_memory_space_enable_only
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_bar_relocation_refused
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_capabilities
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_device_initialization
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_isr_capability
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_notification_capability
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_pci_configuration_cap
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_pci_device_config
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_reading_bars
+no-hvf vmm devices::virtio::transport::pci::device::tests::test_reset_and_reinitialization
+no-hvf vmm ext::snapshot_vcpu_tests::test_a_state_with_ptrauth_keys_needs_ptrauth
+no-hvf vmm pci::msix::tests::test_access_table
+no-hvf vmm pci::msix::tests::test_enable_msix_vectors
+no-hvf vmm pci::msix::tests::test_from_state_rejects_size_mismatches
+no-hvf vmm pci::msix::tests::test_msix_from_state
+no-hvf vmm pci::msix::tests::test_new_msix_config
+no-hvf vmm pci::msix::tests::test_pba_bit_invalid_vector
+no-hvf vmm pci::msix::tests::test_pba_invalid_offset
+no-hvf vmm pci::msix::tests::test_pba_read
+no-hvf vmm pci::msix::tests::test_pba_read_too_big
+no-hvf vmm pci::msix::tests::test_pending_interrupt
+no-hvf vmm pci::msix::tests::test_read_table_bad_length
+no-hvf vmm pci::msix::tests::test_read_table_past_end
+no-hvf vmm persist::tests::test_microvm_state_snapshot
+no-hvf vmm rpc_interface::tests::test_runtime_disallowed
+no-hvf vmm rpc_interface::tests::test_runtime_get_enclave_config_on_kvm_vm
+no-hvf vmm rpc_interface::tests::test_runtime_get_mmds
+no-hvf vmm rpc_interface::tests::test_runtime_get_vm_config
+no-hvf vmm vstate::vcpu::tests::test_handle_kvm_exit
+no-hvf vmm vstate::vcpu::tests::test_immediate_exit_shortcircuits_execution
+no-hvf vmm vstate::vcpu::tests::test_set_mmio_bus
+no-hvf vmm vstate::vcpu::tests::test_vcpu_dump_cpu_config
+no-hvf vmm vstate::vcpu::tests::test_vcpu_kick
+no-hvf vmm vstate::vcpu::tests::test_vcpu_pause_resume
+no-hvf vmm vstate::vcpu::tests::test_vcpu_save_state_events
+no-hvf vmm vstate::vm::tests::test_create_vcpus
+no-hvf vmm vstate::vm::tests::test_msi_vector_group_disable
+no-hvf vmm vstate::vm::tests::test_msi_vector_group_drop_frees_gsis
+no-hvf vmm vstate::vm::tests::test_msi_vector_group_new
+no-hvf vmm vstate::vm::tests::test_msi_vector_group_notifier
+no-hvf vmm vstate::vm::tests::test_msi_vector_group_persistence
+no-hvf vmm vstate::vm::tests::test_msi_vector_group_restore_rejects_out_of_range_gsi
+no-hvf vmm vstate::vm::tests::test_msi_vector_group_trigger
+no-hvf vmm vstate::vm::tests::test_msi_vector_group_update
+no-hvf vmm vstate::vm::tests::test_msi_vector_group_update_invalid_vector
+no-hvf vmm vstate::vm::tests::test_new
+no-hvf vmm vstate::vm::tests::test_register_memory_regions
+no-hvf vmm vstate::vm::tests::test_too_many_regions

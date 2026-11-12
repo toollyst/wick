@@ -235,6 +235,13 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   exclude it. Tests that fail on plain upstream on the CI runner are listed,
   with the reason, in `tools/linux/unit-test-exclusions.txt` and
   `tools/linux/integration-test-exclusions.txt`.
+- On macOS, `tools/macos/check-unit-tests.py` runs every crate's unit tests
+  but the jailer's (which need root) as CI's runners do, without
+  Hypervisor.framework, and fails on any failure
+  `tools/macos/unit-test-differences.txt` does not list with its reason, on a
+  listed test that passes, and on a listed name that is not a test. A test
+  that creates a VM is listed `no-hvf`; `tools/macos/test.sh` runs it on a
+  Mac, signed, in a process of its own.
 - On macOS, `tools/macos/integration-tests.sh` runs upstream's pytest suites
   against the macOS release build and `tools/macos/compare-integration-tests.py`
   compares them test by test with their results on Linux
