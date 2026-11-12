@@ -207,10 +207,15 @@ all arch integration_tests/functional/test_gdb.py::test_gdb_connects
 # is left to the device, which only a TAP Firecracker set TUN_F_CSUM on
 # takes. macOS's UDP has no such option (netinet/udp.h: UDP_NOCKSUM only)
 # and the call fails (measured, clean tree: "[Errno 42] Protocol not
-# available"), before anything reaches Firecracker. To do: the harness's
-# network takes UDP_SEGMENT (netns-preload) and hands the endpoint the
-# datagram as Linux's stack hands the TAP, its checksum left to the device
-# (the TUN header wick's vnet layer reads).
+# available"), before anything reaches Firecracker. Nor does Firecracker's
+# endpoint take an offloaded frame from the host: it carries plain
+# Ethernet frames, read as complete with a zeroed virtio-net header
+# (overlay/vmm/platform/macos/net.rs set_offload, read_iovec: "The host
+# never hands the guest offloaded frames"). macOS has such frames in
+# vmnet (vmnet.h: vmnet_enable_virtio_header_key, vmnet_enable_tso_key,
+# vmnet_enable_checksum_offload_key), which wick does not ask for. To do:
+# an endpoint that takes the host's offloaded frames, and a host program
+# in the harness's network that sends one.
 all bug integration_tests/functional/test_net.py::test_tap_offload
 
 # The test passes (measured, clean tree: all four, the drive moved to a
