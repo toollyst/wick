@@ -254,13 +254,22 @@ all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinu
 # it fell, 49632 to 48416; test_hinting_reporting_snapshot (:660) wants it
 # to fall when the guest frees the memory its helper held (with hinting
 # started, or with free page reporting), and it rose, 50960 to 53184
-# (hinting) and 49520 to 51056 (reporting). The cause is not yet known. To
-# separate: the host reclaiming the restored region's clean file-backed
-# pages (a reading's fall) against a discard over that MAP_PRIVATE file
-# mapping that does not reach the page tables (discard_range,
-# vstate/memory.rs; a reading's missing fall), by logging each reading's
-# parts, the guest region's present pages and the host's paging next to
-# the guest's /proc/meminfo.
+# (hinting) and 49520 to 51056 (reporting).
+# The cause, measured for test_balloon_snapshot in the diagnostic run
+# m2-diag at dd657f4 (WICK_IT_DIAG_MEMORY), where it failed again (53344 to
+# 46704) and the other five passed: the host compressed the pages the guest
+# had just written. Between the two readings the task's resident size fell
+# 6.5 MiB while its phys_footprint, which counts compressed pages, rose
+# 62.9 MiB, the 60 MiB the guest dirtied; the host's memory pressure went
+# from normal to warn and its compressor took 4.2 GiB more. The resident
+# size leaves compressed pages out (XNU's phys_mem ledger), as Linux's VmRSS
+# leaves swapped pages out, but macOS compresses whenever the host is short
+# of memory, where upstream's Linux hosts keep a VMM's pages resident. The
+# hinting failures' third readings (about 50 MiB, against 183 to 185 MiB in
+# m2-diag with the helper's 130 MiB held) fit the same, not measured then.
+# The fix is the reading's: count the task's compressed pages too
+# (TASK_VM_INFO's compressed, the internal_compressed ledger, which
+# task_name_for_pid lets the user read); it waits for a run that measures it.
 all bug integration_tests/functional/test_balloon.py::test_balloon_snapshot[vmlinux-6.1.188-PCI_ON-kvm]
 all bug integration_tests/functional/test_balloon.py::test_hinting_reporting_snapshot[vmlinux-6.1.188-PCI_ON-hinting-kvm]
 all bug integration_tests/functional/test_balloon.py::test_hinting_reporting_snapshot[vmlinux-6.1.188-PCI_OFF-reporting-kvm]
