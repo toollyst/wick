@@ -554,51 +554,55 @@ def _waitpid(pid, options):
 
 
 def wait_process_termination(p_pid, timeout=10.0):
-    """`utils.wait_process_termination` through the process handle."""
+    """`utils.wait_process_termination` through the process handle, then for
+    what of a jail ends after `p_pid` (wick_windows_proc.jail_after), taken
+    when the process was killed or else now: once it returns for
+    Firecracker, no process of its jail holds a file there, as on Linux,
+    where Firecracker's process is all there is of a jail."""
+    after = _AFTER.pop(p_pid, None)
+    if after is None:
+        after = _proc.jail_after(p_pid)
     try:
-        psutil.Process(p_pid).wait(timeout)
-    except psutil.NoSuchProcess:
-        return
-    except psutil.TimeoutExpired:
-        raise TimeoutError(f"Process {p_pid} did not exit within {timeout}s") from None
+        try:
+            psutil.Process(p_pid).wait(timeout)
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.TimeoutExpired:
+            raise TimeoutError(f"Process {p_pid} did not exit within {timeout}s") from None
+        _proc.wait_all(after, timeout, f"process {p_pid}")
+    finally:
+        _proc.close_all(after)
 
 
 import psutil  # noqa: E402  pylint: disable=wrong-import-position
 
 import wick_windows_mem  # noqa: E402  pylint: disable=wrong-import-position
+import wick_windows_proc as _proc  # noqa: E402  pylint: disable=wrong-import-position
 
 # os.kill: Linux raises ProcessLookupError (ESRCH) for a pid no process has.
 # Windows's os.kill fails with ERROR_INVALID_PARAMETER for one, and with
 # access denied for a process that has ended while a handle keeps its pid.
 _real_kill = os.kill
-_SYNCHRONIZE = 0x00100000
 
-
-def _ended(pid):
-    """Whether no running process has `pid`."""
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.OpenProcess.restype = ctypes.c_void_p
-    h = k32.OpenProcess(_SYNCHRONIZE | 0x1000, False, pid)  # | PROCESS_QUERY_LIMITED_INFORMATION
-    if not h:
-        return ctypes.get_last_error() == 87
-    try:
-        return k32.WaitForSingleObject(ctypes.c_void_p(h), 0) == 0
-    finally:
-        k32.CloseHandle(ctypes.c_void_p(h))
+# What ends after a process this session killed, as handles, until
+# wait_process_termination waits for it.
+_AFTER = {}
+# The screen stand-ins (start_screen_process), and those of them stopped.
+_STAND_INS = set()
+_STOPPED = set()
+# How long a stand-in's kill waits for what it started (the jailer, which
+# bounds each of its own waits at 30 s).
+_STAND_IN_LIMIT = 60.0
 
 
 def _kill(pid, sig):
     if sig in (signal.CTRL_C_EVENT, signal.CTRL_BREAK_EVENT):
         return _real_kill(pid, sig)
-    # CPython's os.kill opens the process for every access right, more than a
-    # jailed process's DACL may give its user (which grants terminating it):
-    # PROCESS_TERMINATE alone, then TerminateProcess with the signal's
-    # number, as CPython's.
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.OpenProcess.restype = ctypes.c_void_p
     if sig in (signal.SIGSTOP, signal.SIGCONT):
         # Stopping and continuing a process: suspending and resuming all its
         # threads (NtSuspendProcess, NtResumeProcess).
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
         h = k32.OpenProcess(0x0800, False, pid)  # PROCESS_SUSPEND_RESUME
         if not h:
             raise ProcessLookupError(3, f"kill({pid}): no such process")
@@ -608,24 +612,29 @@ def _kill(pid, sig):
             status = call(ctypes.c_void_p(h))
             if status:
                 raise OSError(errno.EPERM, f"kill({pid}, {sig}): NTSTATUS {status & 0xFFFFFFFF:#x}")
+            (_STOPPED.add if sig == signal.SIGSTOP else _STOPPED.discard)(pid)
         finally:
             k32.CloseHandle(ctypes.c_void_p(h))
         return None
-    h = k32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
-    if not h:
-        err = ctypes.get_last_error()
-        if err == 87 or _ended(pid):
-            raise ProcessLookupError(3, f"kill({pid}): no such process")
-        raise ctypes.WinError(err)
+    # Ending a process: TerminateProcess with the signal's number, as
+    # CPython's os.kill.
+    if pid in _STAND_INS:
+        resume = (lambda: _kill(pid, signal.SIGCONT)) if pid in _STOPPED else None
+        try:
+            return _proc.end_stand_in(pid, sig, _STAND_IN_LIMIT, resume)
+        finally:
+            _STAND_INS.discard(pid)
+            _STOPPED.discard(pid)
+    after = _proc.jail_after(pid)
     try:
-        if not k32.TerminateProcess(ctypes.c_void_p(h), sig):
-            err = ctypes.get_last_error()
-            if _ended(pid):
-                raise ProcessLookupError(3, f"kill({pid}): no such process")
-            raise ctypes.WinError(err)
-        return None
-    finally:
-        k32.CloseHandle(ctypes.c_void_p(h))
+        _proc.terminate(pid, sig)
+    except BaseException:
+        _proc.close_all(after)
+        raise
+    _proc.close_all(_AFTER.pop(pid, []))
+    if after:
+        _AFTER[pid] = after
+    return None
 
 
 os.kill = _kill
@@ -708,28 +717,6 @@ def set_cpu_affinity(pid, cpulist):
 _utils.get_threads = get_threads
 _utils.get_cpu_affinity = get_cpu_affinity
 _utils.set_cpu_affinity = set_cpu_affinity
-
-# Removing a jail: a process of it that has just ended may still hold a file
-# there for a moment (the jailer's keeper, which waits for Firecracker); Linux
-# unlinks open files. Retried for a few seconds.
-import shutil  # noqa: E402  pylint: disable=wrong-import-position
-
-_real_rmtree = shutil.rmtree
-
-
-def rmtree(path, *args, **kwargs):
-    """`shutil.rmtree`, retried while a file is in use (WinError 32)."""
-    deadline = time.time() + 10
-    while True:
-        try:
-            return _real_rmtree(path, *args, **kwargs)
-        except PermissionError as err:
-            if getattr(err, "winerror", None) != 32 or time.time() > deadline:
-                raise
-            time.sleep(0.2)
-
-
-shutil.rmtree = rmtree
 
 # Upstream's memory monitor reads Linux's smaps through psutil
 # (tools/windows/integration/wick_windows_mem.py).
@@ -931,7 +918,9 @@ def start_screen_process(screen_log, session_name, binary_path, binary_params):
     )
     _SESSIONS[session_name] = (proc, None)
     _utils.wait_process_running(psutil.Process(proc.pid))
-    return _interpreter(proc.pid)
+    pid = _interpreter(proc.pid)
+    _STAND_INS.add(pid)
+    return pid
 
 
 def _interpreter(pid):

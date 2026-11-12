@@ -14,6 +14,8 @@
   SYN out, bytes both ways, FIN.
 - procps and the memory monitor's mappings (hosttools, wick_windows_mem) on
   this process; Windows paths as WSL names them.
+- What a kill and a wait for an end wait for (wick_windows_proc): the jailer
+  after Firecracker, the screen stand-in's child before the stand-in.
 """
 
 import ipaddress
@@ -205,11 +207,118 @@ def host_tools():
     del block
 
 
+def _cmd(script):
+    """cmd.exe running `script`, its pid's process and its Popen."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    return subprocess.Popen(f'"{comspec}" /d /s /c "{script}"')  # pylint: disable=consider-using-with
+
+
+def _first_child(pid, name, timeout=10):
+    import psutil  # pylint: disable=import-outside-toplevel
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        found = [c for c in psutil.Process(pid).children() if c.name().lower() == name]
+        if found:
+            return found[0]
+        time.sleep(0.02)
+    raise RuntimeError(f"process {pid} started no {name}")
+
+
+def _suspend(pid, resume=False):
+    import ctypes  # pylint: disable=import-outside-toplevel
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(0x0800, False, pid)  # PROCESS_SUSPEND_RESUME
+    ntdll = ctypes.WinDLL("ntdll")
+    try:
+        status = (ntdll.NtResumeProcess if resume else ntdll.NtSuspendProcess)(ctypes.c_void_p(h))
+        assert status == 0, f"NTSTATUS {status & 0xFFFFFFFF:#x}"
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def _end_stand_in(proc, pid, limit, resume=None):
+    """end_stand_in, whose stand-in ends by itself once its child has, as
+    screen does on Linux, so that the kill finds it ended."""
+    try:
+        proc.end_stand_in(pid, 9, limit, resume)
+    except ProcessLookupError:
+        pass
+
+
+def process_ends(tmp):
+    """What wick_windows.py's os.kill and wait_process_termination wait for
+    (wick_windows_proc), with cmd.exe as the jailer, Firecracker and the
+    jailer's screen: a wait for the jail's Firecracker returns once its
+    jailer, which runs on a moment after it, has ended; a screen stand-in
+    ends only after what it started has."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    import wick_windows_proc as proc  # pylint: disable=import-outside-toplevel
+
+    # The "jailer" runs on for about 2 s after its "Firecracker" ends.
+    jailer = _cmd(f'"{os.environ.get("COMSPEC", "cmd.exe")}" /d /c ping -n 60 127.0.0.1 >nul & ping -n 3 127.0.0.1 >nul')
+    fc = _first_child(jailer.pid, "cmd.exe")
+    ping = _first_child(fc.pid, "ping.exe")
+    after = proc.jail_after(fc.pid, firecracker="cmd.exe", jailer="cmd.exe")
+    check([w for w, _ in after] == ["its jailer"], f"jail: the jailer is what ends after Firecracker ({[w for w, _ in after]})")
+    proc.terminate(fc.pid, 9)
+    fc.wait(10)
+    check(jailer.poll() is None, "jail: the jailer runs on after Firecracker's end (what the wait is for)")
+    try:
+        proc.wait_all(after, 10, "Firecracker")
+    finally:
+        proc.close_all(after)
+    check(jailer.poll() is not None, "jail: a wait for Firecracker returns once its jailer has ended")
+    try:
+        proc.terminate(fc.pid, 9)
+        check(False, "jail: ending an ended process is ProcessLookupError")
+    except ProcessLookupError:
+        check(True, "jail: ending an ended process is ProcessLookupError")
+    ping.kill()
+
+    # A screen stand-in whose child runs about 2 s: its kill waits for it.
+    log = os.path.join(tmp, "screen.log")
+    stand_in = subprocess.Popen(  # pylint: disable=consider-using-with
+        [sys.executable, hosttools.__file__, "screen", log,
+         os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "ping -n 3 127.0.0.1 >nul & echo child done"],
+        stdin=subprocess.PIPE)
+    child = _first_child(stand_in.pid, "cmd.exe")
+    start = time.monotonic()
+    _end_stand_in(proc, stand_in.pid, 20)
+    took = time.monotonic() - start
+    check(not child.is_running(), f"screen: the stand-in's kill returns once its child has ended ({took:.1f} s)")
+    check(stand_in.wait(10) == 0, "screen: the stand-in ended by itself once its child had")
+    with open(log, "rb") as f:
+        check(b"child done" in f.read(), "screen: the child's last output is in the log")
+
+    # A stopped stand-in, whose child writes past the pipe's buffer: resumed,
+    # it copies the rest and the child ends.
+    log = os.path.join(tmp, "screen-stopped.log")
+    stand_in = subprocess.Popen(  # pylint: disable=consider-using-with
+        [sys.executable, hosttools.__file__, "screen", log, os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c",
+         "ping -n 2 127.0.0.1 >nul & for /l %i in (1,1,4000) do @echo 0123456789012345678901234567890123456789"],
+        stdin=subprocess.PIPE)
+    child = _first_child(stand_in.pid, "cmd.exe")
+    _suspend(stand_in.pid)
+    _end_stand_in(proc, stand_in.pid, 30, resume=lambda: _suspend(stand_in.pid, resume=True))
+    check(not child.is_running(), "screen: a stopped stand-in's kill resumes it and returns once its child has ended")
+    stand_in.wait(10)
+    with open(log, "rb") as f:
+        lines = f.read().count(b"0123456789")
+    check(lines == 4000, f"screen: a stopped stand-in copied all of its child's output ({lines} of 4000 lines)")
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="wick-st-") as tmp:
         unix_roundtrip(tmp)
         network(tmp)
         host_tools()
+        process_ends(tmp)
     if FAILS:
         print(f"{len(FAILS)} failed")
         return 1
