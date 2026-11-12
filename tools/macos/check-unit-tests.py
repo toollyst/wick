@@ -148,6 +148,18 @@ def run(exe, cwd, env):
     return failed, out
 
 
+def failure_output(out, test):
+    """What libtest printed for the failed `test`: its section between
+    `---- <test> stdout ----` and the next section."""
+    head = f"---- {test} stdout ----\n"
+    at = out.find(head)
+    if at < 0:
+        return ""
+    body = out[at + len(head):]
+    end = min(i for i in (body.find("\n---- "), body.find("\nfailures:\n"), len(body)) if i >= 0)
+    return body[:end].rstrip()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--crate", action="append", help="only these crates (names as in the list)")
@@ -169,7 +181,7 @@ def main():
         if exes is None:
             errors.append(f"{crate}: the tests do not build:\n    " + "\n    ".join(err))
             continue
-        names, failed, ignored = set(), set(), set()
+        names, failed, ignored, outputs = set(), set(), set(), {}
         for exe, cwd in exes:
             exe_env = package_env(env, cwd)
             names |= listed(exe, cwd, exe_env)
@@ -179,11 +191,15 @@ def main():
                 errors.append(f"{crate}: {os.path.basename(exe)} {out}")
                 continue
             failed |= f
+            for test in f:
+                outputs[test] = failure_output(out, test)
         want = {test for (c, test) in entries if c == crate}
         for test in sorted(want - names):
             errors.append(f"{crate}: listed {test} is not a test of the crate")
         for test in sorted(failed - want):
-            errors.append(f"{crate}: {test} fails and is not listed")
+            # What it printed: a runner's failure is read from the log alone.
+            said = "\n    ".join(outputs.get(test, "").splitlines()[-30:])
+            errors.append(f"{crate}: {test} fails and is not listed" + (f":\n    {said}" if said else ""))
         for test in sorted((want & names) - failed):
             why = "is ignored" if test in ignored else "passes"
             errors.append(f"{crate}: listed {test} ({entries[(crate, test)]}) {why}")
