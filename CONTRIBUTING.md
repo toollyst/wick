@@ -247,7 +247,14 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   (process waiting, memory maps, networks and their host side, the jailer's stand-in for
   runs without root) is `tools/macos/integration/`. Without arguments it runs
   the functional and security suites as the user; `--jailer` runs them as root
-  with wick's jailer, as upstream's CI does on Linux.
+  with wick's jailer, as upstream's CI does on Linux. `WICK_IT_DIAG_MEMORY=1`
+  (each memory reading `get_stable_rss_mem` takes logged with its parts, the
+  host's paging and the guest's `/proc/meminfo`, in `OUT/memory-diag.jsonl`)
+  and `WICK_IT_DEFER_MEMORY_ERROR=1` (the memory monitor's error at a kill
+  inside a test held to the test's end, so the steps after the kill run; the
+  test still fails) make a diagnostic run: `provenance.txt` says so, the
+  comparison counts it as a problem, and no count or "passes" in the docs
+  comes from it.
 - `tools/linux/boot-test.sh` runs the first stages of
   `tools/windows/boot-test.ps1` on Linux: it boots upstream's CI guest with the musl release binary (seccomp filters on
   every thread) and checks serial I/O, SMP, the Async (io_uring) block engine
