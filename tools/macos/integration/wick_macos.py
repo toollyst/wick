@@ -537,10 +537,27 @@ import host_tools.memory as _memory  # noqa: E402  pylint: disable=wrong-import-
 # - the platform's: the system libraries' pages it mapped from the dyld
 #   shared cache, which a macOS process cannot do without (QA1118) and a
 #   static Linux binary carries inside its own text. This part is held to
-#   SHARED_CACHE_CEILING, measured, so that it is bounded and a rise shows,
-#   and reported beside the other (memory-parts.jsonl in the run's
-#   directory, one line per microVM).
-SHARED_CACHE_CEILING = int(os.environ.get("WICK_IT_SHARED_CACHE_CEILING_MIB", "0")) << 20 or None
+#   SHARED_CACHE_CEILING, so that it is bounded and a rise shows, and
+#   reported beside the other (memory-parts.jsonl in the run's directory,
+#   one line per microVM).
+# The ceiling: measured on macOS 27.2 (m2-parts, 77 microVMs of the
+# balloon, vsock, snapshot and CPU tests), the part is 4.64 MiB in every
+# microVM with a guest (4.48 idle, without one); the ceiling is that
+# maximum plus 0.36 MiB, 5 MiB. The part is flat to the KiB, so more
+# system-library code or data mapped (a framework newly linked, a library
+# path newly run) shows past 0.36 MiB. Another macOS major lays out its
+# shared cache differently, so the ceiling is per major, and a major not
+# measured fails every monitored test, saying so, rather than take another
+# major's number (WICK_IT_SHARED_CACHE_CEILING_MIB sets one for a measuring
+# run; memory-parts.jsonl has the parts).
+SHARED_CACHE_CEILING_MIB = {27: 5.0}  # macOS major: MiB (27: measured on 27.2, m2-parts)
+MACOS_MAJOR = int(platform.mac_ver()[0].split(".")[0])
+if "WICK_IT_SHARED_CACHE_CEILING_MIB" in os.environ:
+    SHARED_CACHE_CEILING = float(os.environ["WICK_IT_SHARED_CACHE_CEILING_MIB"]) * (1 << 20)
+elif MACOS_MAJOR in SHARED_CACHE_CEILING_MIB:
+    SHARED_CACHE_CEILING = SHARED_CACHE_CEILING_MIB[MACOS_MAJOR] * (1 << 20)
+else:
+    SHARED_CACHE_CEILING = None  # not measured on this macOS: check_samples fails
 _MEMORY_PARTS = pathlib.Path(os.environ.get("WICK_IT_BINARY_DIR", SESSION_ROOT)).parent / "memory-parts.jsonl"
 
 
@@ -575,7 +592,7 @@ def monitor_run(self):
         self.wick_shared_cache_rss = cache
         self.wick_peak = {"own": max(own, self.wick_peak["own"]),
                           "shared_cache": max(cache, self.wick_peak["shared_cache"])}
-        if own > self.threshold or (SHARED_CACHE_CEILING and cache > SHARED_CACHE_CEILING):
+        if own > self.threshold or (SHARED_CACHE_CEILING is not None and cache > SHARED_CACHE_CEILING):
             self._exceeded = ps
             with contextlib.suppress(psutil.NoSuchProcess, ProcessLookupError):
                 self.wick_breakdown = region_breakdown(
@@ -590,6 +607,11 @@ def check_samples(self):
     # pylint: disable=protected-access
     import json as _json  # pylint: disable=import-outside-toplevel
     import logging  # pylint: disable=import-outside-toplevel
+    if SHARED_CACHE_CEILING is None:
+        raise RuntimeError(
+            f"memory monitor: the shared cache's ceiling is not measured on this macOS ({MACOS_MAJOR}); "
+            f"measured on {sorted(SHARED_CACHE_CEILING_MIB)}. Measure it (memory-parts.jsonl, "
+            "WICK_IT_SHARED_CACHE_CEILING_MIB) and add it to wick_macos.SHARED_CACHE_CEILING_MIB")
     peak = getattr(self, "wick_peak", None)
     if peak is not None:
         with contextlib.suppress(OSError), open(_MEMORY_PARTS, "a", encoding="utf-8") as f:
@@ -600,9 +622,10 @@ def check_samples(self):
     if self._exceeded is not None:
         log = logging.getLogger("wick_macos")
         cache = getattr(self, "wick_shared_cache_rss", 0)
-        if SHARED_CACHE_CEILING and cache > SHARED_CACHE_CEILING:
-            log.warning("memory monitor: the shared cache's part %.2f MiB is over its ceiling %.2f MiB",
-                        cache / 2**20, SHARED_CACHE_CEILING / 2**20)
+        if cache > SHARED_CACHE_CEILING:
+            log.warning("memory monitor: the shared cache's part %.2f MiB is over its ceiling %.2f MiB "
+                        "for macOS %d (memory-parts.jsonl has the parts of every microVM)",
+                        cache / 2**20, SHARED_CACHE_CEILING / 2**20, MACOS_MAJOR)
         rows = getattr(self, "wick_breakdown", None)
         if rows is None:
             log.warning("memory monitor tripped at %.2f MiB; the process was gone before its regions were read",

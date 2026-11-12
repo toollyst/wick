@@ -39,44 +39,39 @@ all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
 
 # Upstream's memory monitor (host_tools/memory.py) fails a test whose VMM
 # holds more than 5 MiB resident besides guest memory (7 MiB while a
-# snapshot is taken). On macOS the VMM's own memory is at that budget: the
-# process's regions as wick_macos.memory_maps reads them (proc_pidinfo)
-# peak at 4.7 to 4.9 MiB for a booted microVM of test_api.py and at 5.02
-# to 5.19 MiB where the monitor trips: Firecracker's text 2.3 to 2.5 MiB,
-# malloc 1.4 to 1.6 MiB, thread stacks 0.2 to 0.35 MiB; an idle Firecracker
-# holds 3.0 MiB. Apple silicon maps 16 KiB pages, where Linux's aarch64 and
-# x86_64 hosts map 4 KiB ones, so every page a thread, an allocation or a
-# code path touches costs four times as much. A pmem device whose file is
-# also a drive's counts the file's pages the drive read: macOS reports a
-# shared file mapping's resident pages per file, not per process (14 MiB of
-# pmem in test_get_full_config_after_restoring_snapshot, whose guest never
-# touches the pmem device; in the footprint mode below, 0 KiB in the page
-# tables of 15,360 resident, m2-mem). The same holds for Firecracker's binary, and
-# its text was the largest part: Linux counts a file mapping's pages the
-# process mapped (smaps Rss, present page-table entries: fs/proc/task_mmu.c
-# smaps_pte_entry), macOS the file's pages in the buffer cache (XNU
-# osfmk/vm/bsd_vm.c fill_procregioninfo -> vm_map_region_look_for_page,
-# vm_page_lookup in the file's object). The user mode's stand-in ran every
-# Firecracker of the session from one binary, so each counted the code all
-# of them ran (measured, idle Firecracker without a guest: 5.22 MiB from a
-# binary all in the cache, its binary's mappings 3.84 MiB; 2.84 MiB from
-# the stand-in's copy in the jail, now a clone with no page cached, as
-# upstream's jailer copies the binary into each jail). wick_macos.memory_maps
-# now reads the regions in the footprint mode (vm.self_region_footprint, which
-# a process sets for itself: XNU vm_map_region_walk then asks the target's
-# pmap per page), so a page counts when Firecracker has it mapped, as on
-# Linux (measured: the idle Firecracker's binary 0.92 MiB, 2.25 MiB in all,
-# from a binary all in the cache). Run with both (clean tree, m2-queue):
-# the monitor still trips, at 5.03 to 5.44 MiB in most tests and at 6.48
-# to 6.91 MiB in test_vsock_epipe and test_vsock_bare_pause_resume, so what
-# is left is not the binary's cached pages. The regions at the trip
-# (wick_macos logs them; m2-mem, clean tree): the binary's text the VM ran,
-# mapped, 1.9 to 2.2 MiB; libmalloc's small zone (VM_MEMORY_MALLOC_SMALL)
-# 1.7 to 2.0 MiB, about 3 MiB in test_vsock_epipe and
-# test_vsock_bare_pause_resume; malloc's other zones 0.65 to 0.7 MiB;
-# thread stacks 0.4 MiB. To find: what Firecracker holds in the small zone.
-# Only a test whose every failing phase failed with this error is excused.
-# excused: at least 22 (run m2-queue at 27c2d4e): pass their own assertions and fail only the teardown's memory budget
+# snapshot is taken), counted as Linux counts it: the pages of every
+# mapping present in the process's page tables (smaps Rss, fs/proc/
+# task_mmu.c smaps_pte_entry). wick_macos.memory_maps counts the same,
+# by the page tables (vm.self_region_footprint, which a process sets for
+# itself: XNU vm_map_region_walk then asks the target's pmap per page),
+# and the monitor keeps the VMM's resident memory in two parts.
+#
+# The platform's part, not a failure: the system libraries' pages the
+# process mapped from the dyld shared cache. A macOS process cannot do
+# without them (Apple QA1118: no statically linked binaries); upstream's
+# static Firecracker carries its libc in its own text. The count is the
+# process's own: 4.48 MiB on an idle Firecracker without a guest,
+# unchanged while other programs ran library code Firecracker never runs,
+# and the phys_mem ledger (task RSS) is the sum of both parts. It is
+# 4.64 MiB in every one of 77 microVMs with a guest (m2-parts, wick
+# 8d577b7, macOS 27.2), and the monitor holds it to a ceiling of 5 MiB
+# for macOS 27 (wick_macos.SHARED_CACHE_CEILING_MIB; a macOS major not
+# measured fails every monitored test, saying so).
+#
+# The VMM's own part, the bug: every mapping outside the shared cache,
+# held to upstream's 5 and 7 MiB. In m2-parts it is 4.16 to 7.92 MiB
+# (median 5.00): the binary's text the VM ran, 1.9 to 2.2 MiB; libmalloc's
+# small zone (VM_MEMORY_MALLOC_SMALL) 1.7 to 2.0 MiB, about 3 MiB in
+# test_vsock_epipe and test_vsock_bare_pause_resume (6.2 to 7.9 MiB in
+# all); malloc's other zones 0.65 to 0.7 MiB; thread stacks 0.4 MiB
+# (m2-mem's region dumps). Apple silicon maps 16 KiB pages, where Linux's
+# hosts map 4 KiB ones, so every page a thread, an allocation or a code
+# path touches costs four times as much. Earlier measurements that counted
+# cached file pages (a pmem file's, the binary's own) are superseded: in
+# the page tables they count only as mapped. To find: what Firecracker
+# holds in the small zone. Only a test whose every failing phase failed
+# with this error is excused.
+# excused: at least 19 (run m2-parts at 8d577b7): pass their own assertions and fail only the memory budget of the VMM's own part
 all bug failure:host_tools.memory.MemoryUsageExceededError
 
 # The test looks in Firecracker's log for the API socket by its path in the
@@ -235,18 +230,16 @@ all bug integration_tests/functional/test_net.py::test_tap_offload
 # write, where Linux lets the write come first.
 all bug integration_tests/functional/test_vsock.py::test_vsock_epipe
 
-# The test sizes a balloon from the VMM's resident memory (256 MiB minus
-# get_resident_memory minus 50 MiB) so that the guest runs out of memory and
-# the balloon deflates. macOS's reading is Linux's semantics (the pages
-# present in the process's page tables, wick_macos.get_resident_memory) and
-# includes the 19 MiB of the dyld shared cache the process touched, the
-# system libraries where upstream's static Firecracker on Linux has 1.6 MiB
-# of its own text; so the balloon is about 17 MiB smaller than on Linux, the
-# guest does not run out of memory, and the balloon does not deflate
-# (measured: "Balloon did not deflate" with deflate_on_oom; the other
-# variant then fails only on the memory monitor's 5 MiB budget, which
-# Firecracker's own memory exceeds by 0.05 to 0.3 MiB on macOS, every
-# suite). To resolve: a reading of the shared cache's present pages to
-# leave out (no interface for another process: region residency is the
-# object's, not the page tables'), or the test's margin.
-all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom
+# The test sizes a balloon from the RSS it measures (test_balloon.py:
+# 256 MiB minus get_resident_memory minus 50 MiB), so that the guest runs out
+# of memory when it dirties 128 MiB, and with deflate_on_oom the balloon
+# deflates. On macOS the guest does not run out of memory ("Balloon did not
+# deflate"; m2-parts, wick 8d577b7). The variant without deflate_on_oom
+# passes. The shared cache's part of the RSS (4.64 MiB, the memory entry
+# above) makes the balloon 4.6 MiB smaller than on Linux, too little to
+# leave the guest the 128 MiB, so it is not the cause; an earlier reading
+# of 19 MiB there counted object residency, not the page tables. To find:
+# the RSS's parts against the guest's own use (its /proc/meminfo); one
+# guess, to measure, is a 16 KiB host page holding the guest's 4 KiB pages.
+all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_ON-True-kvm]
+all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_OFF-True-kvm]
