@@ -655,12 +655,14 @@ jobs:
           rustc --edition 2021 -O -o tools/windows/jail-probe.exe tools/windows/jail-probe.rs
           rustc --edition 2021 -O -o tools/windows/memory-partition-probe.exe tools/windows/memory-partition-probe.rs
       # Firecracker's gdb stub (upstream's test_gdb builds it), for
-      # boot-test.ps1 gdb on a WHP machine. Built last: the debug profile's
-      # firecracker.exe is the one path, and any earlier step that builds the
-      # workspace's debug binaries (the unit tests do) replaces a gdb build
-      # with a plain one, as run 43282663307's kit showed (no
-      # gdb_socket_path in its debug firecracker.exe). The check fails the
-      # job if the uploaded binary is not the gdb build.
+      # boot-test.ps1 gdb on a WHP machine. Built right before the kit's
+      # upload, after every step before it that builds the workspace's
+      # debug binaries: the debug profile's firecracker.exe is the one path,
+      # and such a build replaces a gdb build with a plain one, as run
+      # 43282663307's kit showed (no gdb_socket_path in its debug
+      # firecracker.exe). The unit-test step, which builds them, runs after
+      # the upload, so it replaces only the copy on the runner. The check
+      # fails the job if the uploaded binary is not the gdb build.
       - name: Build firecracker with the gdb feature
         working-directory: lib/firecracker
         run: |
