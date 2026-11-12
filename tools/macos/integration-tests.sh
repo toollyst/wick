@@ -162,6 +162,14 @@ echo "$$ $(echo $(ps -o lstart= -p $$))" >"$session/.owner-pid"
 cleanup() {
     # Everything the session started carries its root in its command line.
     pkill -KILL -f -- "$session" 2>/dev/null || true
+    # Disk images the session attached and a failed test left attached
+    # (bin/losetup's, wick_macos.small_tmpfs's RAM disks); as --jailer, root
+    # attached them.
+    if [[ $mode == jailer ]]; then
+        sudo -n "$ROOT/tools/macos/integration/detach-session-disks.sh" "$session" || true
+    else
+        "$ROOT/tools/macos/integration/detach-session-disks.sh" "$session" || true
+    fi
     [[ -n "${sampler:-}" ]] && kill "$sampler" 2>/dev/null
     # A test may leave a jail without its owner's permissions
     # (test_negative_snapshot_permissions makes it read-only): they are given
