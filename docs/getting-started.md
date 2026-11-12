@@ -93,6 +93,10 @@ guest; Firecracker exits with status 0 (the shell needs `/proc` before `reboot` 
 
 Drop `init=/bin/sh` from `boot_args` to boot Ubuntu's own init instead.
 
+Start Firecracker from a process that is not a background one, as from a terminal here: under `taskpolicy -b` or a
+background QoS clamp macOS coalesces its guest's timers, and the guest's 1 ms sleeps take a median 60 ms longer,
+its 20 ms sleeps 170 ms ([COMPATIBILITY.md](COMPATIBILITY.md), Guest timers).
+
 ## 4. Drive it through the API
 
 The REST API over a Unix socket is the way most tools drive Firecracker, and it is unchanged. Start Firecracker with
@@ -188,8 +192,9 @@ are upstream's, in `/private/var/wick/firecracker/vm1/` next to `root/` (`freeze
 jailer leaves for each jail until it ends. A write that fails with "Operation not permitted" met the supervisor
 writing the file back (after a value without its newline, or an invalid one): write it again. The jailer refuses
 what macOS cannot enforce, each with its reason: other cgroup controllers (`cpuset.cpus` and `cpuset.mems` only
-when they name every CPU and memory node) and CPU limits below 1% or above
-255% of one CPU. Networking inside a jail is a Unix datagram endpoint, since the sandbox denies IP networking, and the
+when they name every CPU and memory node), CPU limits below 1% or above
+255% of one CPU, and a `--parent-cgroup` that would bound a group of jails (macOS has no limit on a group of
+processes; each jail's own `--cgroup` limits apply). Networking inside a jail is a Unix datagram endpoint, since the sandbox denies IP networking, and the
 jailed Firecracker is not root, which vmnet's bridged mode (and every mode before macOS 26) needs; vmnet-shared
 and vmnet-host on macOS 26 need no root but have not yet been run in a jail. The endpoint is in the jail, or in
 the jail's network: `--netns DIR` names a directory you made, the network. Each jail given it has a directory of its
