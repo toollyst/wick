@@ -174,6 +174,8 @@ def main():
         check(request(ctl, "add bare")[0] == 0, "a TAP without an address")
         check(request(ctl, "used tap0") == (0, "0"), "tap0 unused")
         check(request(ctl, "used tap9")[0] == 19, "a missing interface is ENODEV")
+        check(request(ctl, "txqueuelen tap0 5") == (0, ""), "txqueuelen recorded")
+        check(request(ctl, "stats tap0") == (0, "txqueuelen 5 dropped 0"), "stats: the length, no drops")
         dev, host = endpoint(net, "tap0")
         check(request(ctl, "used tap0") == (0, "1"), "tap0 used")
         arp = (b"\xff" * 6 + GUEST_MAC + b"\x08\x06" + struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) + GUEST_MAC

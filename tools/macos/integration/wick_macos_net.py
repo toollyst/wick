@@ -16,6 +16,7 @@ program cannot run inside a network that is a directory, so `check_output`
 and the `ip` shim refuse it, naming the reason.
 """
 
+import logging
 import os
 import shutil
 import socket
@@ -25,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 HELPER = os.environ.get("WICK_IT_NETNS_HELPER", "")
+LOG = logging.getLogger("wick_macos_net")
 
 
 def request(path, line):
@@ -79,11 +81,18 @@ class Tap:
         return self._netns
 
     def set_tx_queue_len(self, tx_queue_len):
-        """Linux: `ip link set <tap> txqueuelen N`."""
-        raise NotImplementedError(
-            f"{self.name}: txqueuelen {tx_queue_len}: an interface of a macOS network is a "
-            "datagram endpoint, it has no transmit queue to size (docs/PORTING.md row 6)"
-        )
+        """Linux: `ip link set <tap> txqueuelen N`, the frames the host holds
+        for the VMM before it drops more (test_high_ingress_traffic sets 5,
+        so that a flood fills it). Here those frames wait in the VMM's
+        endpoint, whose receive buffer the VMM sizes (vmm::platform::net,
+        4 MiB): past it the host side drops them, as the TAP does past its
+        queue. The length is recorded with the host side, which counts the
+        frames it drops; the network's end logs both (`stats`), so a test's
+        log shows whether its flood overflowed the queue."""
+        check(self.netns.control, f"txqueuelen {self.name} {tx_queue_len}")
+        self._tx_queue_len = tx_queue_len
+        LOG.warning("%s: txqueuelen %s recorded: the queue is the VMM endpoint's receive buffer "
+                    "(4 MiB), which the host side counts drops past", self.name, tx_queue_len)
 
     def __repr__(self):
         return f"<Tap name={self.name} netns={self.netns.id}>"
@@ -146,6 +155,9 @@ class NetNs:
 
     def cleanup(self):
         """Removes the network."""
+        for tap in self.taps.values():
+            if getattr(tap, "_tx_queue_len", None) is not None and self._proc is not None:
+                LOG.warning("%s: %s", tap.name, check(self.control, f"stats {tap.name}"))
         if self._proc is not None:
             self._proc.stdin.close()
             try:

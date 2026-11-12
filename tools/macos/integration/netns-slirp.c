@@ -21,6 +21,17 @@
 //   add <name> [<address>/<prefix>] an interface, with the host's address
 //   fwd <guest ip> <port>           a forward; the reply is its socket path
 //   used <name>                     "1" while a VMM has the interface bound
+//   txqueuelen <name> <n>           Linux's `ip link set <tap> txqueuelen n`:
+//                                   recorded (see below)
+//   stats <name>                    "txqueuelen <n> dropped <frames>"
+//
+// A TAP's transmit queue (txqueuelen) is the frames the host has for the
+// VMM that it has not read yet; past it the host drops them. Here those
+// frames wait in the VMM's endpoint, a datagram socket whose receive buffer
+// the VMM sizes (vmm::platform::net, 4 MiB); past it a send fails with
+// ENOBUFS and this process drops the frame, as the TAP does. The length a
+// test asks for is recorded, not applied (the buffer is the VMM's socket's),
+// and the frames dropped are counted.
 // It prints "ready" once CONTROL listens, and ends when its stdin closes
 // (the harness's end of a pipe: the network lives as long as its owner).
 //
@@ -112,6 +123,8 @@ struct iface {
     int fd;                  // the host's socket, bound at .host-<name>
     struct sockaddr_un vmm;  // the VMM's endpoint, <name>
     ino_t attached;          // the endpoint attached to (its inode), 0: none
+    int txqueuelen;          // what a test asked for (0: not asked)
+    uint64_t dropped;        // frames for the VMM dropped: its endpoint was full
 };
 
 #define MAX_UFWDS 64
@@ -149,8 +162,10 @@ static slirp_ssize_t send_packet(const void *buf, size_t len, void *opaque) {
     if (!i->attached)
         return (slirp_ssize_t)len; // no VMM: dropped, as on a TAP no one reads
     ssize_t n = sendto(i->fd, buf, len, 0, (struct sockaddr *)&i->vmm, sizeof i->vmm);
-    if (n < 0 && (errno == EAGAIN || errno == ENOBUFS))
+    if (n < 0 && (errno == EAGAIN || errno == ENOBUFS)) {
+        i->dropped++;
         return (slirp_ssize_t)len; // TCP retransmits
+    }
     if (n < 0 && (errno == ECONNREFUSED || errno == ENOENT)) {
         i->attached = 0; // the VMM went away: dropped
         return (slirp_ssize_t)len;
@@ -331,9 +346,10 @@ static void udp_to_guest(struct ufwd *u, const uint8_t *data, size_t len) {
         uint16_t hc = csum16(ip, 20, 0);
         ip[10] = (uint8_t)(hc >> 8), ip[11] = (uint8_t)hc;
         memcpy(ip + 20, udp + off, chunk);
-        if (sendto(i->fd, f, 14 + tot, 0, (struct sockaddr *)&i->vmm, sizeof i->vmm) < 0 &&
-            (errno == ECONNREFUSED || errno == ENOENT))
-            i->attached = 0;
+        if (sendto(i->fd, f, 14 + tot, 0, (struct sockaddr *)&i->vmm, sizeof i->vmm) < 0) {
+            if (errno == ECONNREFUSED || errno == ENOENT) i->attached = 0;
+            if (errno == EAGAIN || errno == ENOBUFS) i->dropped++;
+        }
         off += chunk;
     }
 }
@@ -644,6 +660,20 @@ static void request(int conn, char *line) {
         char text[32];
         snprintf(text, sizeof text, "127.0.0.1:%d", ntohs(h.sin_port));
         reply(conn, 0, text);
+    } else if (n == 3 && strcmp(verb, "txqueuelen") == 0) {
+        struct iface *i = find(a);
+        int len = atoi(b);
+        if (!i || len < 0) {
+            reply(conn, i ? EINVAL : ENODEV, NULL);
+            return;
+        }
+        i->txqueuelen = len;
+        reply(conn, 0, NULL);
+    } else if (n == 2 && strcmp(verb, "stats") == 0) {
+        struct iface *i = find(a);
+        char text[64];
+        if (i) snprintf(text, sizeof text, "txqueuelen %d dropped %llu", i->txqueuelen, (unsigned long long)i->dropped);
+        reply(conn, i ? 0 : ENODEV, i ? text : NULL);
     } else if (n == 2 && strcmp(verb, "used") == 0) {
         struct iface *i = find(a);
         reply(conn, i ? 0 : ENODEV, i && bound(i) ? "1" : "0");
