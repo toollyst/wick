@@ -83,7 +83,7 @@ Platform, and the Windows column of [At a glance](#at-a-glance) says "works" for
 again), vhost-user, hugepages, api-process and devices (docs/PORTING.md rows 4, 10 and 15). `smp` with CPU 1
 taken offline and online, `tools`, `no-seccomp`, `foreign-snapshot`, and the drive serials and rate limiters of
 `block` and `net` passed there too (kit 8d577b7, Windows 11 10.0.26300.9711), and `memory-hotplug` after a fix; on kit
-dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `gdb` failed there (kit dd657f4: the address translation failed where KVM's never fails; fixed, to re-run); `balloon` and the guest parts of `cli` wait for that
+dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `gdb` passed 3 of 3 on kit 7952d31, after its address translation (kit dd657f4) and the guest's own `INT3` (kit 684042f) were fixed; `balloon` and the guest parts of `cli` wait for that
 machine. The vmm library and the firecracker binary build and link for
 `x86_64-pc-windows-gnu` (cross) and `x86_64-pc-windows-msvc` (native, the binary CI publishes).
 
