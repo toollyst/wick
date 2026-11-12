@@ -245,7 +245,9 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   `tools/macos/unit-test-differences.txt` does not list with its reason, on a
   listed test that passes, and on a listed name that is not a test. A test
   that creates a VM is listed `no-hvf`; `tools/macos/test.sh` runs it on a
-  Mac, signed, in a process of its own.
+  Mac, signed, in a process of its own. With `--out DIR` it keeps each
+  crate's output and every test's result by name (`tests.tsv`); CI's `macos`
+  job uploads them as the `macos-unit-tests` artifact.
 - On Windows, `tools/windows/check-unit-tests.py` runs every package's unit
   tests the same way (one at a time, `--no-fail-fast`; on CI's `windows`
   job) and fails on any failure not listed, with its reason, in

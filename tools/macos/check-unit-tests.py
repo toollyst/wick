@@ -12,7 +12,13 @@ limit), and the check fails on:
   - a test binary that does not finish in time, or does not build.
 So nothing goes unrun silently, and the list cannot rot.
 
-    python3 -I tools/macos/check-unit-tests.py [--crate NAME ...]
+    python3 -I tools/macos/check-unit-tests.py [--crate NAME ...] [--out DIR] [--summary FILE]
+
+With --out, DIR keeps each crate's output (<crate>.log, every test binary's
+in turn) and every test's result (tests.tsv: crate, test, result, and whether
+libtest printed the test's `test <name> ...` line); --summary appends the
+counts and the errors to FILE in Markdown (CI's step summary). Neither
+changes what the check asserts.
 
 The binaries run unsigned, as on CI's runners, which have no
 Hypervisor.framework: a test that creates a VM fails (`no-hvf`). On a Mac,
@@ -24,6 +30,7 @@ in their own CI step.
 import argparse
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -164,7 +171,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--crate", action="append", help="only these crates (names as in the list)")
     ap.add_argument("--differences", default=DIFFERENCES)
+    ap.add_argument("--out", type=pathlib.Path, help="where each crate's output and every test's result are kept")
+    ap.add_argument("--summary", type=pathlib.Path, help="append a Markdown summary here")
     a = ap.parse_args()
+    if a.out:
+        a.out.mkdir(parents=True, exist_ok=True)
+    rows = []
+    counts = []
     entries, errors = read_differences(a.differences)
     all_crates = crates()
     for crate, test in entries:
@@ -182,17 +195,36 @@ def main():
             errors.append(f"{crate}: the tests do not build:\n    " + "\n    ".join(err))
             continue
         names, failed, ignored, outputs = set(), set(), set(), {}
+        log = []
         for exe, cwd in exes:
             exe_env = package_env(env, cwd)
             names |= listed(exe, cwd, exe_env)
             ignored |= listed(exe, cwd, exe_env, ignored=True)
             f, out = run(exe, cwd, exe_env)
+            log.append(f"==== {os.path.basename(exe)} (in {cwd})\n{out}\n")
             if f is None:
                 errors.append(f"{crate}: {os.path.basename(exe)} {out}")
                 continue
             failed |= f
             for test in f:
                 outputs[test] = failure_output(out, test)
+        if a.out:
+            text = "".join(log)
+            (a.out / f"{crate}.log").write_text(text)
+            want_here = {test for (c, test) in entries if c == crate}
+            for test in sorted(names):
+                if test in ignored:
+                    result = "ignored"
+                elif test in failed:
+                    result = "fail-listed" if test in want_here else "fail-unlisted"
+                else:
+                    result = "pass"
+                # libtest's line, which a test's own output may follow on
+                # the same line (one thread): "test <name> ... ", or
+                # "test <name> - should panic ... ".
+                said = (f"test {test} ... ", f"test {test} - should panic ... ")
+                started = "yes" if any(s in text for s in said) else "no"
+                rows.append(f"{crate}\t{test}\t{result}\t{started}")
         want = {test for (c, test) in entries if c == crate}
         for test in sorted(want - names):
             errors.append(f"{crate}: listed {test} is not a test of the crate")
@@ -207,11 +239,21 @@ def main():
         totals["pass"] += len(ran - failed)
         totals["listed"] += len(failed & want)
         totals["ignored"] += len(ignored)
-        print(f"{crate}: {len(ran - failed)} pass, {len(failed & want)} fail as listed, "
-              f"{len(failed - want)} fail unlisted, {len(ignored)} ignored", flush=True)
-    print(f"all: {totals['pass']} pass, {totals['listed']} fail as listed, {totals['ignored']} ignored")
+        line = (f"{crate}: {len(ran - failed)} pass, {len(failed & want)} fail as listed, "
+                f"{len(failed - want)} fail unlisted, {len(ignored)} ignored")
+        counts.append(line)
+        print(line, flush=True)
+    total = f"all: {totals['pass']} pass, {totals['listed']} fail as listed, {totals['ignored']} ignored"
+    print(total)
     for e in errors:
         print(f"error: {e}")
+    if a.out:
+        (a.out / "tests.tsv").write_text("crate\ttest\tresult\tstarted\n" + "".join(r + "\n" for r in rows))
+    if a.summary:
+        md = ["## macOS unit tests", ""] + [f"- {c}" for c in counts] + ["", total, ""]
+        md += [f"{len(errors)} error(s)."] + [f"- {e.splitlines()[0]}" for e in errors]
+        with open(a.summary, "a") as f:
+            f.write("\n".join(md) + "\n")
     sys.exit(1 if errors else 0)
 
 

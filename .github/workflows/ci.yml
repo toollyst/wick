@@ -382,7 +382,18 @@ jobs:
       - name: Unit tests of every crate but the jailer (tools/macos/unit-test-differences.txt)
         # Runs after an earlier step's failure too: each step answers its own question.
         if: success() || failure()
-        run: python3 -I tools/macos/check-unit-tests.py
+        run: python3 -I tools/macos/check-unit-tests.py --out "$RUNNER_TEMP/unit" --summary "$GITHUB_STEP_SUMMARY"
+      # Every test's result by name (tests.tsv) and each crate's output.
+      - name: Upload the unit tests' output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-unit-tests
+          path: |
+            ${{ runner.temp }}/unit/*.log
+            ${{ runner.temp }}/unit/tests.tsv
+          if-no-files-found: warn
+          retention-days: 14
 
   # Seatbelt differs between macOS majors (which system calls' numbers it
   # skips when a rule allows their operation: UNFILTERED_SYSCALLS and
