@@ -24,6 +24,7 @@
 //!                               job:0 affinity:0 spin:<seconds>
 //!                               privileges:0 largepage:<MiB>
 //!                               link:<new name>|<existing file> files:<n>
+//!                               private:<MiB> sections:<MiB> filesections:<MiB>
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
@@ -149,6 +150,9 @@ extern "system" {
     fn GetLargePageMinimum() -> usize;
     fn VirtualAlloc(addr: *mut c_void, size: usize, ty: u32, prot: u32) -> *mut c_void;
     fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> i32;
+    fn CreateFileMappingW(file: HANDLE, sa: *const c_void, prot: u32, hi: u32, lo: u32, name: *const u16) -> HANDLE;
+    fn MapViewOfFile(section: HANDLE, access: u32, hi: u32, lo: u32, size: usize) -> *mut c_void;
+    fn CreateFileW(name: *const u16, access: u32, share: u32, sa: *const c_void, disposition: u32, flags: u32, template: HANDLE) -> HANDLE;
 }
 
 #[repr(C)]
@@ -416,6 +420,49 @@ fn ip_check(arg: &str, stream: bool) -> String {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
+}
+
+/// The `n`th MiB of a `private`, `sections` or `filesections` check: taken,
+/// every page written, and never freed.
+fn take_mib(kind: &str, n: usize) -> Result<(), String> {
+    const MIB: usize = 1 << 20;
+    let invalid = usize::MAX as HANDLE;
+    let last = || std::io::Error::last_os_error().to_string();
+    // SAFETY: new allocations and mappings of our own, written within their size.
+    unsafe {
+        let p = match kind {
+            // MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE
+            "private" => VirtualAlloc(std::ptr::null_mut(), MIB, 0x3000, 4),
+            _ => {
+                let file = if kind == "filesections" {
+                    let path = std::env::temp_dir().join(format!("jail-probe-{}-{n}", std::process::id()));
+                    // GENERIC_READ | GENERIC_WRITE, CREATE_NEW,
+                    // FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE
+                    let f = CreateFileW(wide(&path.to_string_lossy()).as_ptr(), 0xC000_0000, 0, std::ptr::null(), 1, 0x0400_0100, std::ptr::null_mut());
+                    if f == invalid {
+                        return Err(format!("CreateFileW {}: {}", path.display(), last()));
+                    }
+                    f
+                } else {
+                    invalid
+                };
+                // PAGE_READWRITE
+                let s = CreateFileMappingW(file, std::ptr::null(), 4, 0, MIB as u32, std::ptr::null());
+                if s.is_null() {
+                    return Err(format!("CreateFileMappingW: {}", last()));
+                }
+                // FILE_MAP_ALL_ACCESS
+                MapViewOfFile(s, 0xF001F, 0, 0, MIB)
+            }
+        };
+        if p.is_null() {
+            return Err(last());
+        }
+        for page in (0..MIB).step_by(4096) {
+            p.cast::<u8>().add(page).write_volatile(1);
+        }
+    }
+    Ok(())
 }
 
 fn check(c: &str) -> String {
@@ -977,6 +1024,22 @@ fn check(c: &str) -> String {
             // SAFETY: the handle just opened.
             unsafe { CloseHandle(t) };
             "allowed".into()
+        }
+        // Takes `arg` MiB of memory 1 MiB at a time and writes every page, kept
+        // until the process ends: private memory (`private`), pagefile-backed
+        // sections (`sections`), or sections of delete-on-close temporary files
+        // as wick's memfd makes them (`filesections`). `allowed <MiB>` or
+        // `denied after <MiB>: <error>`.
+        "private" | "sections" | "filesections" => {
+            let Ok(mib) = arg.parse::<usize>() else {
+                return "bad size".into();
+            };
+            for i in 0..mib {
+                if let Err(e) = take_mib(kind, i) {
+                    return format!("denied after {i}: {e}");
+                }
+            }
+            format!("allowed {mib}")
         }
         // Commits `arg` MiB of large pages: `allowed <bytes>` or `denied <error>`.
         "largepage" => {

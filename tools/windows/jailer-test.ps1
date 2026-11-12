@@ -6,9 +6,9 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,links,nofile,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
 #
-# `refuse`, `cpuset`, `weight`, `low`, `links`, `nofile`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
+# `refuse`, `cpuset`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
 # and reads it); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
 # Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
@@ -23,7 +23,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'links', 'nofile', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -723,6 +723,28 @@ function Stage-Nofile {
     $r = Invoke-Jailer (@('--id', 'memory', '--cgroup-version', '2', '--cgroup', 'memory.max=33554432') + $common + @('--', 'files:100000')) 120000
     Check ($r[0] -eq 0 -and $r[1].Contains($warning) -and $r[1] -match 'files:100000 allowed 100000') "under memory.max=32 MiB: exit $($r[0]): $($r[1])"
     "without --resource-limit no-file= the jailer warns that upstream's default is not enforced; the jailed process opens 5000 files, and 100000 under memory.max=32 MiB"
+}
+
+# memory.max bounds all of the jailed process's memory, as a cgroup does: under
+# 32 MiB, private memory (the control), pagefile-backed sections and sections of
+# temporary files (wick's memfd) are each refused well before 256 MiB.
+# FAILS today: a Job Object charges private commit only (docs/COMPATIBILITY.md,
+# memory.max), and this stage says how much the sections took.
+function Stage-Sections {
+    $probe = Get-Probe
+    $base = New-Base 'sections'
+    $common = @('--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--cgroup-version', '2', '--cgroup', 'memory.max=33554432')
+    $r = Invoke-Jailer (@('--id', 'private') + $common + @('--', 'private:256')) 120000
+    Check ($r[1] -match 'private:256 denied after (\d+)' -and [int]$Matches[1] -le 32) "the control, private memory under memory.max=32 MiB: exit $($r[0]): $($r[1])"
+    $control = [int]$Matches[1]
+    $escaped = @()
+    foreach ($kind in 'sections', 'filesections') {
+        $r = Invoke-Jailer (@('--id', $kind) + $common + @('--', "${kind}:256")) 120000
+        if ($r[1] -match "${kind}:256 denied after (\d+)" -and [int]$Matches[1] -le 32) { continue }
+        $escaped += "${kind}: $(($r[1] -split "`n" | Where-Object { $_ -match "^${kind}:" }) -join ' ') (exit $($r[0]))"
+    }
+    Check ($escaped.Count -eq 0) "memory.max=32 MiB holds private memory (denied after $control MiB) but not: $($escaped -join '; ')"
+    "under memory.max=32 MiB private memory stops after $control MiB, and so do pagefile-backed and temporary-file sections"
 }
 
 function Stage-Pidns {
