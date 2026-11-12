@@ -1129,6 +1129,11 @@ fn fcntl_impl(fd: c_int, cmd: c_int, arg: usize) -> c_int {
             } else {
                 // SAFETY: plain call.
                 if unsafe { GetFileType(handle(fd)) } == FILE_TYPE_PIPE {
+                    // The wait mode belongs to the pipe end, so duplicates
+                    // and inherited copies of the handle share it, as
+                    // Linux's O_NONBLOCK is the open file description's
+                    // (test_pipe_wait_mode_is_shared_by_duplicated_handles,
+                    // test_pipe_wait_mode_is_shared_with_a_child_process).
                     let mode = PIPE_READMODE_BYTE | if nonblock { PIPE_NOWAIT } else { PIPE_WAIT };
                     // SAFETY: changes the mode of the caller's pipe handle.
                     if unsafe {
@@ -1502,6 +1507,8 @@ mod tests {
     use std::io::Write;
     use std::os::windows::io::AsRawHandle;
 
+    use windows_sys::Win32::System::Pipes::GetNamedPipeInfo;
+
     use super::*;
 
     fn fd_of(f: &std::fs::File) -> c_int {
@@ -1796,5 +1803,183 @@ mod tests {
                 b"Windows"
             );
         }
+    }
+
+    // --- Measurements of the pipe modes F_SETFL sets (PIPE_NOWAIT), which
+    // the docs cite. The numbers are printed (--nocapture shows them); the
+    // asserts are what the docs say of them.
+
+    /// An anonymous pipe: (read end, write end), not inheritable.
+    fn raw_pipe(size: u32) -> (HANDLE, HANDLE) {
+        let (mut r, mut w): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: two out-pointers to handles.
+        assert_ne!(unsafe { CreatePipe(&mut r, &mut w, std::ptr::null(), size) }, 0);
+        (r, w)
+    }
+
+    /// `FILE_PIPE_INFORMATION` of a pipe handle (ntifs.h; class 23 of
+    /// `NtQueryInformationFile`): `(ReadMode, CompletionMode)`. A
+    /// completion mode of 1 (FILE_PIPE_COMPLETE_OPERATION) is PIPE_NOWAIT.
+    fn pipe_modes(h: HANDLE) -> (u32, u32) {
+        #[link(name = "ntdll", kind = "raw-dylib")]
+        extern "system" {
+            fn NtQueryInformationFile(
+                h: HANDLE,
+                io: *mut [usize; 2],
+                info: *mut [u32; 2],
+                len: u32,
+                class: u32,
+            ) -> i32;
+        }
+        let (mut io, mut info) = ([0usize; 2], [0u32; 2]);
+        // SAFETY: a pipe handle and out-buffers of the sizes given.
+        let status = unsafe { NtQueryInformationFile(h, &mut io, &mut info, 8, 23) };
+        assert_eq!(status, 0, "NtQueryInformationFile(FilePipeInformation): {status:#x}");
+        (info[0], info[1])
+    }
+
+    fn set_nowait(h: HANDLE) {
+        let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+        // SAFETY: a pipe handle of this process.
+        let ok = unsafe { SetNamedPipeHandleState(h, &mode, std::ptr::null(), std::ptr::null()) };
+        assert_ne!(ok, 0, "SetNamedPipeHandleState: {}", std::io::Error::last_os_error());
+    }
+
+    // Is the wait mode a handle's, or the pipe end's? PIPE_NOWAIT set on a
+    // write end shows on a duplicate of that handle (the same file object),
+    // and not on the read end.
+    #[test]
+    fn test_pipe_wait_mode_is_shared_by_duplicated_handles() {
+        let (r, w) = raw_pipe(0);
+        let mut w2: HANDLE = std::ptr::null_mut();
+        // SAFETY: duplicates our handle.
+        assert_ne!(
+            unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    w,
+                    GetCurrentProcess(),
+                    &mut w2,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            },
+            0
+        );
+        let before = (pipe_modes(w), pipe_modes(w2), pipe_modes(r));
+        set_nowait(w);
+        let after = (pipe_modes(w), pipe_modes(w2), pipe_modes(r));
+        std::println!(
+            "(read mode, completion mode) of the write end, its duplicate, the read end: \
+             {before:?}, then after PIPE_NOWAIT on the write end {after:?}"
+        );
+        assert_eq!(before, ((0, 0), (0, 0), (0, 0)));
+        assert_eq!(after.0 .1, 1);
+        assert_eq!(after.1 .1, 1, "the duplicate has the write end's PIPE_NOWAIT");
+        assert_eq!(after.2 .1, 0, "the read end keeps its own wait mode");
+        // SAFETY: our handles.
+        unsafe {
+            CloseHandle(w2);
+            CloseHandle(w);
+            CloseHandle(r);
+        }
+    }
+
+    /// Tells `pipe_mode_child` the inherited handle to set PIPE_NOWAIT on.
+    const MODE_CHILD_ENV: &str = "WICK_TEST_PIPE_MODE_CHILD";
+
+    /// Sets PIPE_NOWAIT on a pipe handle it inherited, as a test binary
+    /// does on the standard output cargo gave it. Run by
+    /// `test_pipe_wait_mode_is_shared_with_a_child_process`.
+    #[test]
+    #[ignore = "the child of test_pipe_wait_mode_is_shared_with_a_child_process"]
+    fn pipe_mode_child() {
+        let Ok(h) = std::env::var(MODE_CHILD_ENV) else {
+            return;
+        };
+        set_nowait(h.parse::<usize>().unwrap() as HANDLE);
+        std::println!("PIPE-MODE-CHILD-OK");
+    }
+
+    // Across CreateProcess inheritance: a child sets PIPE_NOWAIT on its copy
+    // of the write end, and the parent's handle has it after the child is
+    // gone.
+    #[test]
+    fn test_pipe_wait_mode_is_shared_with_a_child_process() {
+        if std::env::var_os(MODE_CHILD_ENV).is_some() {
+            return;
+        }
+        let (r, w) = raw_pipe(0);
+        // SAFETY: our handle, inherited by the child.
+        assert_ne!(unsafe { SetHandleInformation(w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }, 0);
+        let before = pipe_modes(w);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "windows_fd::tests::pipe_mode_child", "--ignored", "--nocapture"])
+            .env(MODE_CHILD_ENV, std::format!("{}", w as usize))
+            .output()
+            .unwrap();
+        let text = std::string::String::from_utf8_lossy(&out.stdout).into_owned()
+            + &std::string::String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && text.contains("PIPE-MODE-CHILD-OK"), "{text}");
+        let after = pipe_modes(w);
+        std::println!(
+            "(read mode, completion mode) of the parent's write end: {before:?}, then after the \
+             child's PIPE_NOWAIT on its inherited copy {after:?}"
+        );
+        assert_eq!(before.1, 0);
+        assert_eq!(after.1, 1, "the child's PIPE_NOWAIT is the parent's too");
+        // SAFETY: our handles.
+        unsafe {
+            CloseHandle(w);
+            CloseHandle(r);
+        }
+    }
+
+    // CreatePipe's buffer: GetNamedPipeInfo's sizes of each end, and what
+    // one non-blocking write of 1 MiB puts into the empty pipe ("as many
+    // bytes as the buffer holds", Named Pipe Type, Read, and Wait Modes).
+    // nSize 0 is the system's default, and what Python's subprocess asks
+    // for (Lib/subprocess.py, `_winapi.CreatePipe(None, 0)`), the pipe of
+    // tools/windows/check-unit-tests.py before it gave the tests a file.
+    // Linux's pipe holds 64 KiB (16 pages, PIPE_DEF_BUFFERS).
+    #[test]
+    fn test_create_pipe_sizes() {
+        let measure = |size: u32| {
+            let (r, w) = raw_pipe(size);
+            let info = |h: HANDLE| {
+                let (mut flags, mut out, mut inb, mut max) = (0u32, 0u32, 0u32, 0u32);
+                // SAFETY: out-pointers to u32s.
+                let ok = unsafe { GetNamedPipeInfo(h, &mut flags, &mut out, &mut inb, &mut max) };
+                if ok == 0 {
+                    std::format!("GetNamedPipeInfo failed: {}", std::io::Error::last_os_error())
+                } else {
+                    std::format!("OutBufferSize {out}, InBufferSize {inb}")
+                }
+            };
+            let (read_info, write_info) = (info(r), info(w));
+            set_nowait(w);
+            let big = std::vec![7u8; 1 << 20];
+            let mut taken = 0u32;
+            // SAFETY: a valid buffer.
+            let ok = unsafe {
+                WriteFile(w, big.as_ptr(), 1 << 20, &mut taken, std::ptr::null_mut())
+            };
+            assert_ne!(ok, 0, "WriteFile: {}", std::io::Error::last_os_error());
+            std::println!(
+                "CreatePipe nSize {size}: read end {read_info}; write end {write_info}; \
+                 a non-blocking 1 MiB write into the empty pipe takes {taken} bytes"
+            );
+            // SAFETY: our handles.
+            unsafe {
+                CloseHandle(w);
+                CloseHandle(r);
+            }
+            taken
+        };
+        let default = measure(0);
+        let asked_64k = measure(65536);
+        assert!(default > 0 && default < 64 * 1024, "nSize 0 holds {default} bytes");
+        assert!(asked_64k > 0, "nSize 65536 holds {asked_64k} bytes");
     }
 }
