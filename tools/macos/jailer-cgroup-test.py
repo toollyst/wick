@@ -105,14 +105,36 @@ try:
 except OSError as e:
     res.append(f"sigcont {e.errno}")
 res.append("pid_resume " + subprocess.run([resumer, str(pid)], capture_output=True, text=True).stdout.strip())
-# The flag the supervisor closes the file with while it writes it back
-# (UF_IMMUTABLE): only the file's owner or root sets or lifts it.
-for what, flags in (("uchg", os.stat(path).st_flags | 2), ("nouchg", os.stat(path).st_flags & ~2)):
+print("; ".join(res))
+"""
+
+# The flag the supervisor closes the control file with while it writes it
+# back (UF_IMMUTABLE, `chflags uchg`), as the jail's uid, which does not own
+# the file (root does): setting it, and lifting it. Run as root; drops to
+# the uid first. Each call that would change the flags fails with EACCES;
+# the one that would leave them as they are succeeds and changes nothing.
+# xnu bsd/vfs/vfs_subr.c vnode_authattr: only "if (fdelta != 0)", the flags
+# that would change, is KAUTH_VNODE_WRITE_SECURITY required, which a file's
+# owner has and another uid has only from an ACL (vnode_authorize_simple);
+# with no change nothing is asked (chflags0 authorizes only "if (action
+# ...)"). The denial is EACCES, not EPERM: vnode_authorize turns kauth's
+# EPERM into EACCES ("traditional behaviour"); vnode_authattr's own EPERM
+# is for a flag outside UF_SETTABLE, which UF_IMMUTABLE is not. Measured
+# the same as a plain user on a root-owned file on macOS 27.2, and by this
+# stage on CI's macOS 26.
+CHFLAGS_AS_JAIL_UID_PY = r"""
+import os, sys
+uid, gid, path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+os.setgroups([gid]); os.setgid(gid); os.setuid(uid)
+res = []
+flags = os.stat(path).st_flags
+for what, new in (("uchg", flags | 2), ("nouchg", flags & ~2)):
     try:
-        os.chflags(path, flags)
+        os.chflags(path, new)
         res.append(f"chflags {what} ok")
     except OSError as e:
         res.append(f"chflags {what} {e.errno}")
+res.append(f"flag {'set' if os.stat(path).st_flags & 2 else 'unset'}")
 print("; ".join(res))
 """
 
@@ -269,6 +291,11 @@ class Freeze:
                             os.path.join(jd, name), str(pid), self.resumer], capture_output=True, text=True)
         return (p.stdout + p.stderr).strip()
 
+    def chflags_as_jail_uid(self, jd, name):
+        p = subprocess.run([sys.executable, "-I", "-c", CHFLAGS_AS_JAIL_UID_PY, str(self.jt.UID), str(self.jt.GID),
+                            os.path.join(jd, name)], capture_output=True, text=True)
+        return (p.stdout + p.stderr).strip()
+
     def gone(self, pid):
         return not self.jt.alive(pid)
 
@@ -371,10 +398,33 @@ def stage_freeze(ctx, jt):
         # The jail's uid cannot thaw it.
         got = fz.as_jail_uid(jd, "freezer.state", pid)
         print(f"   as the jail's uid: {got}", flush=True)
-        check(f"write {errno.EACCES}" in got and "sigcont ok" in got and f"pid_resume -1 {errno.EPERM}" in got
-              and f"chflags uchg {errno.EPERM}" in got and f"chflags nouchg {errno.EPERM}" in got,
+        # (SIGCONT is delivered, one uid to its own process, and resumes
+        # nothing: the jail stays frozen, checked below.)
+        check(f"write {errno.EACCES}" in got and "sigcont ok" in got and f"pid_resume -1 {errno.EPERM}" in got,
               f"as the jail's uid: {got}")
-        check(os.stat(os.path.join(jd, "freezer.state")).st_flags & 2 == 0, "freezer.state is not immutable")
+        # Nor can it set or lift the flag the supervisor closes the file
+        # with while it writes it back (CHFLAGS_AS_JAIL_UID_PY has the
+        # rule). With the flag unset: setting it is refused; "lifting" it
+        # changes nothing, so nothing is asked and nothing happens.
+        state = os.path.join(jd, "freezer.state")
+        got = fz.chflags_as_jail_uid(jd, "freezer.state")
+        print(f"   as the jail's uid, the flag unset: {got}", flush=True)
+        check(got == f"chflags uchg {errno.EACCES}; chflags nouchg ok; flag unset",
+              f"as the jail's uid, the flag unset: {got}")
+        # With the flag set, as the supervisor holds it during a write-back
+        # (set here by root, the file's owner, on the jail's own control
+        # file, which nothing writes meanwhile): lifting it is refused and
+        # the flag stays; "setting" it changes nothing.
+        flags = os.stat(state).st_flags
+        os.chflags(state, flags | 2)
+        try:
+            got = fz.chflags_as_jail_uid(jd, "freezer.state")
+        finally:
+            os.chflags(state, flags)
+        print(f"   as the jail's uid, the flag set: {got}", flush=True)
+        check(got == f"chflags uchg ok; chflags nouchg {errno.EACCES}; flag set",
+              f"as the jail's uid, the flag set (it must not lift it): {got}")
+        check(os.stat(state).st_flags & 2 == 0, "freezer.state is not immutable")
         fz.frozen([pid, kid], "after the jail's uid tried")
         # An invalid value: ignored, the file restored to the state.
         fz.write(jd, "freezer.state", "FREEZING\n")
