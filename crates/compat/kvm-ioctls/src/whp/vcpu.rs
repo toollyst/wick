@@ -107,6 +107,10 @@ pub(crate) struct VcpuShared {
     run_seq: AtomicU64,
     /// `IA32_TSC_DEADLINE` ([`tscdeadline`]): 0 when disarmed or fired.
     tsc_deadline: AtomicU64,
+    /// `IA32_TSC_ADJUST` and `IA32_MISC_ENABLE` where the partition does not
+    /// keep them ([`regs::software_msr`]), as KVM keeps them.
+    tsc_adjust: AtomicU64,
+    misc_enable: AtomicU64,
     /// Bumped by every write of `IA32_TSC_DEADLINE`, so that a timer armed
     /// by an earlier write cannot fire for a later one.
     deadline_gen: AtomicU64,
@@ -216,6 +220,8 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         immediate_exit: AtomicU8::new(0),
         run_seq: AtomicU64::new(0),
         tsc_deadline: AtomicU64::new(0),
+        tsc_adjust: AtomicU64::new(0),
+        misc_enable: AtomicU64::new(0),
         deadline_gen: AtomicU64::new(0),
         deadline_fired: AtomicU64::new(0),
         debug: Mutex::new(super::debug::State::default()),
@@ -296,15 +302,16 @@ impl VcpuFd {
     /// `KVM_TRANSLATE`: the guest physical address `gva` maps to in the
     /// vCPU's current paging mode, as KVM answers it
     /// ([`super::debug::translation`]): the address itself while paging is
-    /// off, else `WHvTranslateGva`'s walk without access checks. A failed
-    /// walk is an invalid translation, not a failed call; only a refused
-    /// `WHvGetVirtualProcessorRegisters` or `WHvTranslateGva` call fails it.
+    /// off, else `WHvTranslateGva`'s walk as KVM's
+    /// ([`super::debug::TRANSLATE_FLAGS`]). A failed or refused walk is an
+    /// invalid translation, not a failed call, as KVM's never fails; only
+    /// reading CR0 can fail it.
     pub fn translate_gva(&self, gva: u64) -> Result<kvm_bindings::kvm_translation> {
         if self.register(whv::WHvX64RegisterCr0)? & super::debug::CR0_PG == 0 {
             return Ok(super::debug::translation(gva, None));
         }
-        let (code, gpa) = self.translate_walk(gva, whv::WHvTranslateGvaFlagNone)?;
-        Ok(super::debug::translation(gva, Some((code, gpa))))
+        let walk = self.translate_walk(gva, super::debug::TRANSLATE_FLAGS).ok();
+        Ok(super::debug::translation(gva, Some(walk)))
     }
 
     /// One `WHvTranslateGva` walk with `flags`: its result code and address.
@@ -454,6 +461,7 @@ impl VcpuFd {
                 pvclock::MSR_SYSTEM_TIME => e.data = self.shared.system_time_msr.load(Ordering::Acquire),
                 pvclock::MSR_WALL_CLOCK => e.data = self.shared.inner.pvclock.lock().unwrap().wall_msr,
                 MSR_TSC_DEADLINE => e.data = self.read_tsc_deadline()?,
+                i if regs::software_msr(i) => e.data = self.software_msr(i).load(Ordering::Acquire),
                 _ => {}
             }
         }
@@ -464,11 +472,62 @@ impl VcpuFd {
         for e in msrs.as_slice() {
             if e.index == MSR_TSC_DEADLINE {
                 self.write_tsc_deadline(e.data)?;
+            } else if regs::software_msr(e.index) {
+                self.write_software_msr(e.index, e.data, true)?;
             } else {
                 self.write_kvm_msr(e.index, e.data);
             }
         }
         Ok(n)
+    }
+
+    /// The vCPU's copy of a [`regs::software_msr`].
+    fn software_msr(&self, index: u32) -> &AtomicU64 {
+        if index == regs::MSR_IA32_TSC_ADJUST { &self.shared.tsc_adjust } else { &self.shared.misc_enable }
+    }
+
+    /// Writes a [`regs::software_msr`] as KVM's `kvm_set_msr_common` does
+    /// (Linux 6.12): `IA32_TSC_ADJUST` is kept only when the guest's CPUID
+    /// has TSC_ADJUST, and a guest's write moves its TSC by the change and
+    /// publishes its kvm-clock again (`adjust_tsc_offset_guest`,
+    /// `KVM_REQ_CLOCK_UPDATE`); a guest's write of `IA32_MISC_ENABLE` that
+    /// changes a read-only PMU bit is refused with #GP and leaves EMON as it
+    /// was (the MWAIT quirk is KVM's default, so MWAIT is a plain bit).
+    /// Returns whether the write was taken.
+    fn write_software_msr(&self, index: u32, data: u64, host: bool) -> Result<bool> {
+        const EMON: u64 = 1 << 7;
+        const PMU_RO_MASK: u64 = (1 << 11) | (1 << 12);
+        let cell = self.software_msr(index);
+        if index == regs::MSR_IA32_TSC_ADJUST {
+            if !self.guest_has_tsc_adjust() {
+                return Ok(true);
+            }
+            if !host {
+                let adj = data.wrapping_sub(cell.load(Ordering::Acquire));
+                let tsc = self.register(whv::WHvX64RegisterTsc)?;
+                super::ffi::set_register(self.part(), self.vp(), whv::WHvX64RegisterTsc, super::ffi::reg64(tsc.wrapping_add(adj)))?;
+                // Published again at the next entry (`update_clock`).
+                self.shared.clock_gen.store(u64::MAX, Ordering::Release);
+            }
+            cell.store(data, Ordering::Release);
+            return Ok(true);
+        }
+        let old = cell.load(Ordering::Acquire);
+        let data = if host {
+            data
+        } else {
+            if (old ^ data) & PMU_RO_MASK != 0 {
+                return Ok(false);
+            }
+            (data & !EMON) | (old & EMON)
+        };
+        cell.store(data, Ordering::Release);
+        Ok(true)
+    }
+
+    /// CPUID.(EAX=7,ECX=0):EBX bit 1, TSC_ADJUST, in the guest's CPUID.
+    fn guest_has_tsc_adjust(&self) -> bool {
+        self.shared.cpuid.lock().unwrap().iter().any(|e| e.function == 7 && e.index == 0 && e.ebx & (1 << 1) != 0)
     }
 
     /// `IA32_TSC_DEADLINE` as the guest reads it: 0 outside TSC-deadline
@@ -1160,6 +1219,16 @@ impl VcpuFd {
         if is_write {
             if index == MSR_TSC_DEADLINE {
                 self.write_tsc_deadline(value)?;
+            } else if regs::software_msr(index) {
+                if !self.write_software_msr(index, value, false)? {
+                    // #GP(0), RIP left at the WRMSR, as KVM's refused write.
+                    return super::ffi::set_register(
+                        self.part(),
+                        self.vp(),
+                        whv::WHvRegisterPendingInterruption,
+                        super::ffi::reg64(super::debug::pending_gp()),
+                    );
+                }
             } else {
                 self.write_kvm_msr(index, value);
             }
@@ -1169,6 +1238,7 @@ impl VcpuFd {
                 pvclock::MSR_SYSTEM_TIME => self.shared.system_time_msr.load(Ordering::Acquire),
                 pvclock::MSR_WALL_CLOCK => self.shared.inner.pvclock.lock().unwrap().wall_msr,
                 MSR_TSC_DEADLINE => self.read_tsc_deadline()?,
+                i if regs::software_msr(i) => self.software_msr(i).load(Ordering::Acquire),
                 _ => 0,
             };
             regs::set_msr_result(self.part(), self.vp(), value, rip_after)

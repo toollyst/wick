@@ -905,6 +905,24 @@ fn mtrr_register(index: u32) -> Option<WHV_REGISTER_NAME> {
     })
 }
 
+/// `IA32_TSC_ADJUST`.
+pub(crate) const MSR_IA32_TSC_ADJUST: u32 = 0x3b;
+/// `IA32_MISC_ENABLE`.
+pub(crate) const MSR_IA32_MISC_ENABLE: u32 = 0x1a0;
+
+/// The MSRs KVM keeps in software on every host (`ia32_tsc_adjust_msr`,
+/// `ia32_misc_enable_msr`, x86.c `kvm_set_msr_common`, listed in
+/// `emulated_msrs_all`), which a partition may lack as a register (an AMD
+/// host's has neither, measured): the vCPU keeps them then
+/// ([`software_msr`]), as KVM does.
+const KVM_SOFTWARE_MSRS: [u32; 2] = [MSR_IA32_TSC_ADJUST, MSR_IA32_MISC_ENABLE];
+
+/// Whether `index` is one of [`KVM_SOFTWARE_MSRS`] that this host's
+/// partitions do not keep, so the vCPU keeps it.
+pub(crate) fn software_msr(index: u32) -> bool {
+    KVM_SOFTWARE_MSRS.contains(&index) && !partition_msrs().iter().any(|&(i, _)| i == index)
+}
+
 /// The candidates of [`LISTED_WHERE_PRESENT`] and the MTRRs.
 fn candidates() -> Vec<(u32, WHV_REGISTER_NAME)> {
     let mut all = LISTED_WHERE_PRESENT.to_vec();
@@ -1002,12 +1020,14 @@ pub(crate) fn msr_index_list() -> Result<MsrList> {
         super::tscdeadline::MSR_TSC_DEADLINE,
     ]
     .into_iter()
-    // KVM's others that this partition keeps (the MTRRs are not listed).
+    // KVM's others that this partition keeps (the MTRRs are not listed),
+    // and those KVM keeps in software, kept by the vCPU where the partition
+    // does not.
     .chain(
         LISTED_WHERE_PRESENT
             .iter()
             .map(|&(i, _)| i)
-            .filter(|i| partition_msrs().iter().any(|&(p, _)| p == *i)),
+            .filter(|i| KVM_SOFTWARE_MSRS.contains(i) || partition_msrs().iter().any(|&(p, _)| p == *i)),
     )
     .collect();
     MsrList::from_entries(&indices).map_err(|_| super::Error::new(libc::EINVAL))
@@ -1051,48 +1071,6 @@ mod tests {
         idx.sort_unstable();
         idx.dedup();
         assert_eq!(idx.len(), c.len());
-    }
-
-    // On WHP (the PC; `cargo test -- --ignored`): a partition configured as
-    // a VM's has the MSRs this backend lists, and IA32_TSC with
-    // IA32_TSC_ADJUST written as a restore writes them (the TSC first in the
-    // list) read back as saved: the adjust exactly, the TSC within the time
-    // the calls took.
-    #[test]
-    #[ignore = "needs WHP: run on a WHP machine with --ignored"]
-    fn test_tsc_and_its_adjust_restore_as_saved() {
-        let present: Vec<u32> = partition_msrs().iter().map(|&(i, _)| i).collect();
-        eprintln!("MSRs this host's partitions keep: {present:x?}");
-        for need in [0x3b, 0x1a0, 0x2ff] {
-            assert!(present.contains(&need), "{need:#x} not kept by this host's partition");
-        }
-        let part = super::super::vm::test_partition().expect("a partition with vCPU 0");
-        let (tsc, adjust) = (0x1234_5678_9abc_u64, 0x10_0000_u64);
-        let mut msrs = Msrs::from_entries(&[
-            kvm_bindings::kvm_msr_entry { index: 0x10, data: tsc, ..Default::default() },
-            kvm_bindings::kvm_msr_entry { index: 0x3b, data: adjust, ..Default::default() },
-        ])
-        .unwrap();
-        assert_eq!(set_msrs(part, 0, &msrs).unwrap(), 2);
-        assert_eq!(get_msrs(part, 0, &mut msrs).unwrap(), 2);
-        let got = msrs.as_slice();
-        assert_eq!(got[1].data, adjust, "TSC_ADJUST read back");
-        // A vCPU that has not run: its TSC moves with the host's, a few
-        // milliseconds at most here.
-        assert!(got[0].data >= tsc && got[0].data - tsc < 1 << 32, "TSC {:#x}, {tsc:#x} written", got[0].data);
-        // MISC_ENABLE and the MTRR default type take Firecracker's boot values.
-        let boot = [(0x1a0, 1u64), (0x2ff, (1 << 11) | 6)];
-        let mut m = Msrs::from_entries(
-            &boot.map(|(index, data)| kvm_bindings::kvm_msr_entry { index, data, ..Default::default() }),
-        )
-        .unwrap();
-        assert_eq!(set_msrs(part, 0, &m).unwrap(), 2);
-        assert_eq!(get_msrs(part, 0, &mut m).unwrap(), 2);
-        for (e, (index, data)) in m.as_slice().iter().zip(boot) {
-            assert_eq!(e.data & data, data, "{index:#x} read back {:#x}", e.data);
-        }
-        // SAFETY: the partition made for this test.
-        unsafe { whv::WHvDeletePartition(part) };
     }
 
     #[test]

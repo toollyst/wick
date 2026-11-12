@@ -251,17 +251,6 @@ pub(crate) fn probe_registers(names: &[WHV_REGISTER_NAME]) -> Vec<bool> {
     ok
 }
 
-/// A partition configured as a VM's, with vCPU 0 and no memory, for tests
-/// that need WHP.
-#[cfg(test)]
-pub(crate) fn test_partition() -> Result<WHV_PARTITION_HANDLE> {
-    let part = ffi::create_partition()?;
-    configure(part)?;
-    // SAFETY: vCPU 0 of the partition just configured.
-    ffi::hr(unsafe { whv::WHvCreateVirtualProcessor(part, 0, 0) })?;
-    Ok(part)
-}
-
 /// Sets a new partition's properties and sets it up, as every VM's.
 fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
         // Processor count must be set before the partition is set up.
@@ -970,10 +959,14 @@ mod tests {
     // KVM_TRANSLATE on WHP (the PC; `cargo test -- --ignored`), with a vCPU
     // as gdb meets it: at the PVH entry (protected mode, paging off) and at
     // `start_kernel` (long mode, 4-level paging, the kernel's half, a 2 MiB
-    // supervisor page). Paging off is KVM's identity, valid even where no
-    // memory is; paging on is one walk without checks. Prints what each
-    // WHvTranslateGva flag set returns in both modes, the measurement that
-    // chooses the walk's flags (`translate_gva`).
+    // supervisor page). Paging off is KVM's identity (nonpaging_gva_to_gpa:
+    // the whole 64-bit address, where WHP's walk truncates it to 32 bits),
+    // valid even where no memory is; paging on is KVM's supervisor read
+    // (debug::TRANSLATE_FLAGS). Prints what each WHvTranslateGva flag set
+    // returns in both modes. Measured on a WHP machine (Ryzen 9 7900): every
+    // set without a validate flag is refused (E_INVALIDARG); with read, write
+    // or execute, the entry gives the address truncated to 32 bits and long
+    // mode the page's address or PageNotPresent.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored"]
     fn test_translate_as_kvm_at_the_entry_and_in_long_mode() {
@@ -995,12 +988,15 @@ mod tests {
         assert_ne!(p, libc::MAP_FAILED);
         let mem = p.cast::<u64>();
         // PML4 at 0x1000, PDPT at 0x2000, PD at 0x3000: 0xffffffff80000000
-        // (PML4 511, PDPT 510, PD 0) is the 2 MiB page at 0x200000.
+        // (PML4 511, PDPT 510, PD 0) is the 2 MiB supervisor page at
+        // 0x200000, and 0xffffffff80200000 (PD 1) the same page as a user
+        // page.
         // SAFETY: within the mapping, 8-byte aligned.
         unsafe {
-            *mem.add(0x1000 / 8 + 511) = 0x2000 | 3;
-            *mem.add(0x2000 / 8 + 510) = 0x3000 | 3;
+            *mem.add(0x1000 / 8 + 511) = 0x2000 | 7;
+            *mem.add(0x2000 / 8 + 510) = 0x3000 | 7;
             *mem.add(0x3000 / 8) = 0x20_0000 | 0x83;
+            *mem.add(0x3000 / 8 + 1) = 0x20_0000 | 0x87;
         }
         let region = kvm_bindings::kvm_userspace_memory_region {
             slot: 0,
@@ -1012,7 +1008,7 @@ mod tests {
         // SAFETY: the memory stays mapped while the VM has it.
         unsafe { vm.set_user_memory_region(region) }.unwrap();
         let vcpu = vm.create_vcpu(0).unwrap();
-        let (mapped, unmapped) = (0xffff_ffff_8000_1234_u64, 0xffff_ffff_82ed_2098_u64);
+        let (mapped, user, unmapped) = (0xffff_ffff_8000_1234_u64, 0xffff_ffff_8020_1234_u64, 0xffff_ffff_82ed_2098_u64);
         let flag_sets: [(&str, whv::WHV_TRANSLATE_GVA_FLAGS); 8] = [
             ("none", whv::WHvTranslateGvaFlagNone),
             ("read", whv::WHvTranslateGvaFlagValidateRead),
@@ -1024,7 +1020,7 @@ mod tests {
             ("read+write", whv::WHvTranslateGvaFlagValidateRead | whv::WHvTranslateGvaFlagValidateWrite),
         ];
         let report = |mode: &str| {
-            for gva in [0x10_0000, mapped, unmapped] {
+            for gva in [0x10_0000, mapped, user, unmapped] {
                 for (name, flags) in flag_sets {
                     match vcpu.translate_walk(gva, flags) {
                         Ok((code, gpa)) => eprintln!("{mode} {gva:#x} {name}: S_OK, result {code}, gpa {gpa:#x}"),
@@ -1061,11 +1057,63 @@ mod tests {
         assert_eq!((t.physical_address, t.valid, t.writeable), (0x20_1234, 1, 1), "the kernel's page");
         let t = vcpu.translate_gva(unmapped).unwrap();
         assert_eq!((t.physical_address, t.valid, t.writeable), (INVALID_GPA, 0, 1), "no page: invalid, as KVM");
+        // A user page: KVM's supervisor read finds it too (no SMAP here).
+        let t = vcpu.translate_gva(user).unwrap();
+        assert_eq!((t.physical_address, t.valid, t.writeable), (0x20_1234, 1, 1), "a user page");
 
         drop(vcpu);
         drop(vm);
         // SAFETY: our mapping.
         assert_eq!(unsafe { libc::munmap(p, len) }, 0);
+    }
+
+    // On WHP (the PC; `cargo test -- --ignored`): the MSRs a snapshot
+    // carries round-trip through a vCPU on any host. KVM keeps
+    // IA32_TSC_ADJUST and IA32_MISC_ENABLE in software on Intel and AMD
+    // alike; where the partition has no register for one (an AMD host's has
+    // neither, measured on a Ryzen 9 7900) the vCPU keeps it, so both are
+    // listed and restored as saved everywhere. TSC_ADJUST is kept only for a
+    // guest whose CPUID has TSC_ADJUST, as KVM; IA32_TSC moves with the host
+    // while the vCPU has not run, by the few milliseconds the calls took;
+    // MISC_ENABLE and the MTRR default type take Firecracker's boot values.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored"]
+    fn test_tsc_and_its_adjust_restore_as_saved() {
+        use kvm_bindings::{CpuId, Msrs, kvm_cpuid_entry2, kvm_msr_entry};
+        let present = super::super::regs::msr_index_list().unwrap();
+        let listed: Vec<u32> = present.as_slice().to_vec();
+        eprintln!("MSRs listed: {listed:x?}");
+        for need in [0x3b, 0x1a0] {
+            assert!(listed.contains(&need), "{need:#x} not listed, which KVM lists on every host");
+        }
+        let vm = VmFd::create().unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let tsc_adjust_cpuid = kvm_cpuid_entry2 { function: 7, index: 0, ebx: 1 << 1, ..Default::default() };
+        vcpu.set_cpuid2(&CpuId::from_entries(&[tsc_adjust_cpuid]).unwrap()).unwrap();
+        let (tsc, adjust) = (0x1234_5678_9abc_u64, 0x10_0000_u64);
+        let entry = |index, data| kvm_msr_entry { index, data, ..Default::default() };
+        let mut msrs = Msrs::from_entries(&[entry(0x10, tsc), entry(0x3b, adjust)]).unwrap();
+        assert_eq!(vcpu.set_msrs(&msrs).unwrap(), 2);
+        assert_eq!(vcpu.get_msrs(&mut msrs).unwrap(), 2);
+        let got = msrs.as_slice();
+        assert_eq!(got[1].data, adjust, "TSC_ADJUST read back");
+        assert!(got[0].data >= tsc && got[0].data - tsc < 1 << 32, "TSC {:#x}, {tsc:#x} written", got[0].data);
+        let boot = [(0x1a0, 1u64), (0x2ff, (1 << 11) | 6)];
+        let mut m = Msrs::from_entries(&boot.map(|(index, data)| entry(index, data))).unwrap();
+        assert_eq!(vcpu.set_msrs(&m).unwrap(), 2);
+        assert_eq!(vcpu.get_msrs(&mut m).unwrap(), 2);
+        for (e, (index, data)) in m.as_slice().iter().zip(boot) {
+            assert_eq!(e.data & data, data, "{index:#x} read back {:#x}", e.data);
+        }
+        // Without TSC_ADJUST in the guest's CPUID a host's write is not
+        // kept, as KVM's (x86.c, kvm_set_msr_common).
+        let vcpu1 = vm.create_vcpu(1).unwrap();
+        let mut a = Msrs::from_entries(&[entry(0x3b, adjust)]).unwrap();
+        assert_eq!(vcpu1.set_msrs(&a).unwrap(), 1);
+        assert_eq!(vcpu1.get_msrs(&mut a).unwrap(), 1);
+        if super::super::regs::software_msr(0x3b) {
+            assert_eq!(a.as_slice()[0].data, 0, "TSC_ADJUST kept for a guest without it");
+        }
     }
 
     #[test]

@@ -166,6 +166,12 @@ pub(crate) fn debug_exit(vector: u8, rip: u64, param: u64, dr7: u64) -> Option<k
     Some(kvm_debug_exit_arch { exception: u32::from(vector), pad: 0, pc: rip, dr6, dr7 })
 }
 
+/// WHP's `WHV_X64_PENDING_INTERRUPTION_REGISTER` for a #GP(0): a hardware
+/// exception (type 3), vector 13, with its error code (bit 4), 0.
+pub(crate) fn pending_gp() -> u64 {
+    1 | (3 << 1) | (1 << 4) | (13 << 16)
+}
+
 /// WHP's `WHV_X64_PENDING_INTERRUPTION_REGISTER` for a #BP (a hardware
 /// exception, type 3, vector 3): delivered with `RIP` past the `INT3`, as
 /// the guest's own breakpoint would have been.
@@ -180,22 +186,34 @@ pub(crate) const INVALID_GPA: u64 = u64::MAX;
 /// `CR0.PG`.
 pub(crate) const CR0_PG: u64 = 1 << 31;
 
+/// The `WHvTranslateGva` flags of KVM's `KVM_TRANSLATE` walk
+/// (`kvm_mmu_gva_to_gpa_system`: access 0, "without checking CPL",
+/// arch/x86/kvm/x86.c), a supervisor read: `ValidateRead` with
+/// `PrivilegeExempt`. WHP refuses a walk with no validate flag (E_INVALIDARG
+/// for "none" and "exempt" alone, at the PVH entry and in long mode,
+/// measured on a WHP machine, `test_translate_as_kvm_at_the_entry_and_in_long_mode`).
+pub(crate) const TRANSLATE_FLAGS: super::whv::WHV_TRANSLATE_GVA_FLAGS =
+    super::whv::WHvTranslateGvaFlagValidateRead | super::whv::WHvTranslateGvaFlagPrivilegeExempt;
+
 /// `KVM_TRANSLATE`'s answer, as KVM's `kvm_arch_vcpu_ioctl_translate`
 /// (arch/x86/kvm/x86.c, Linux 6.12), which never fails: `walk` is `None`
 /// when the vCPU's paging is off, where KVM's `nonpaging_gva_to_gpa`
 /// (arch/x86/kvm/mmu/mmu.c) gives the address itself, valid (at the PVH
-/// entry, before the guest turns paging on); otherwise it is
-/// `WHvTranslateGva`'s result code and address for a walk without access
-/// checks, as KVM's (`kvm_mmu_gva_to_gpa_system`, access 0). Valid only for
-/// `WHvTranslateGvaResultSuccess` (0); every other result (page not present,
-/// privilege violation, invalid page table flags, a GPA that is not mapped
-/// or not readable, an overlay, an intercept) is no translation, with
-/// `INVALID_GPA`, as KVM's walk that fails. `writeable` is 1 and `usermode`
-/// 0 whatever the walk found, as KVM sets them.
-pub(crate) fn translation(gva: u64, walk: Option<(i32, u64)>) -> kvm_translation {
+/// entry, before the guest turns paging on: the whole 64-bit address, where
+/// WHP's own walk truncates it to 32 bits in protected mode, measured);
+/// otherwise it is `WHvTranslateGva`'s answer for KVM's walk
+/// (`kvm_mmu_gva_to_gpa_system`, access 0: a supervisor read, whatever the
+/// CPL; [`TRANSLATE_FLAGS`]), `None` when WHP refused the call. Valid only
+/// for `WHvTranslateGvaResultSuccess` (0); every other result (page not
+/// present, privilege violation, invalid page table flags, a GPA that is not
+/// mapped or not readable, an overlay, an intercept) and a refused call are
+/// no translation, with `INVALID_GPA`, as KVM's walk that fails: the ioctl
+/// never fails. `writeable` is 1 and `usermode` 0 whatever the walk found,
+/// as KVM sets them.
+pub(crate) fn translation(gva: u64, walk: Option<Option<(i32, u64)>>) -> kvm_translation {
     let gpa = match walk {
         None => Some(gva),
-        Some((0, gpa)) => Some(gpa),
+        Some(Some((0, gpa))) => Some(gpa),
         Some(_) => None,
     };
     kvm_translation {
@@ -297,6 +315,16 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_gp_is_a_hardware_exception_13_with_error_code_0() {
+        let p = pending_gp();
+        assert_eq!(p & 1, 1);
+        assert_eq!((p >> 1) & 0x7, 3);
+        assert_eq!((p >> 4) & 1, 1, "#GP has an error code");
+        assert_eq!((p >> 16) & 0xffff, 13);
+        assert_eq!(p >> 32, 0, "error code 0");
+    }
+
+    #[test]
     fn test_pending_bp_is_a_hardware_exception_3() {
         let p = pending_bp();
         assert_eq!(p & 1, 1);
@@ -307,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_translation_result_codes() {
-        let t = translation(0xffff_ffff_8100_0123, Some((0, 0x100_0123)));
+        let t = translation(0xffff_ffff_8100_0123, Some(Some((0, 0x100_0123))));
         assert_eq!(
             (t.linear_address, t.physical_address, t.valid, t.writeable, t.usermode),
             (0xffff_ffff_8100_0123, 0x100_0123, 1, 1, 0)
@@ -315,9 +343,14 @@ mod tests {
         // PageNotPresent .. Intercept: no translation, KVM's INVALID_GPA;
         // the call itself succeeds and writeable is still 1, as KVM's.
         for code in 1..=8 {
-            let t = translation(0x10, Some((code, 0x99)));
+            let t = translation(0x10, Some(Some((code, 0x99))));
             assert_eq!((t.valid, t.physical_address, t.writeable), (0, INVALID_GPA, 1), "result code {code}");
         }
+        // A walk WHP refused: no translation, the call still succeeds.
+        let t = translation(0x10, Some(None));
+        assert_eq!((t.valid, t.physical_address, t.writeable), (0, INVALID_GPA, 1));
+        // ValidateRead | PrivilegeExempt (winhvplatformdefs.h).
+        assert_eq!(TRANSLATE_FLAGS, 0x1 | 0x8);
     }
 
     // Paging off (the PVH entry): KVM's nonpaging walk gives the address
