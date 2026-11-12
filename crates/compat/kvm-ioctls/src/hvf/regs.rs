@@ -38,6 +38,9 @@ pub enum Reg {
     /// or 0.2 (a snapshot taken before 1.0 was offered). As KVM's, one for
     /// the VM.
     PsciVersion,
+    /// `OSLSR_EL1`: the OS lock, which the VMM emulates (Hypervisor.framework
+    /// has no such register); listed and restored as KVM's.
+    OsLock,
 }
 
 const CORE: u64 = KVM_REG_ARM64 | KVM_REG_ARM_CORE as u64;
@@ -94,6 +97,7 @@ pub fn decode(id: u64) -> Option<Reg> {
             KVM_TIMER_CVAL => Some(Reg::Sys(HV_SYS_REG_CNTV_CVAL_EL0)),
             KVM_TIMER_CTL => Some(Reg::Sys(HV_SYS_REG_CNTV_CTL_EL0)),
             KVM_PTIMER_CNT => Some(Reg::PhysicalCount),
+            OSLSR_EL1 => Some(Reg::OsLock),
             r => Some(Reg::Sys(r)),
         },
         KVM_REG_ARM_FW if low == 0 => Some(Reg::PsciVersion),
@@ -104,6 +108,9 @@ pub fn decode(id: u64) -> Option<Reg> {
 fn core_id(size: u64, off: u64) -> u64 {
     CORE | size | off
 }
+
+/// `OSLSR_EL1` (op0 2, op1 0, CRn 1, CRm 1, op2 4).
+const OSLSR_EL1: u16 = 0x808c;
 
 pub(crate) fn sys_id(enc: u16) -> u64 {
     SYSREG | KVM_REG_SIZE_U64 | u64::from(enc)
@@ -170,6 +177,9 @@ pub fn reg_list() -> Vec<u64> {
     ids.push(core_id(KVM_REG_SIZE_U32, OFF_FPSR));
     ids.push(core_id(KVM_REG_SIZE_U32, OFF_FPCR));
     ids.extend(STATE_SYSREGS.iter().map(|r| sys_id(*r)));
+    // KVM lists OSLSR_EL1 (its descriptor has set_user), so a snapshot keeps
+    // the OS lock.
+    ids.push(sys_id(OSLSR_EL1));
     ids
 }
 

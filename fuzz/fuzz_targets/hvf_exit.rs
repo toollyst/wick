@@ -48,14 +48,13 @@ enum Class {
     DataAbort,
 }
 
-/// The debug registers as the Arm ARM describes them: each is readable,
-/// writable or both, and holds one bit the run loop emulates.
+/// The debug registers as KVM emulates them (arch/arm64/kvm/sys_regs.c):
+/// OSLAR_EL1 write only and OSLSR_EL1 read only, the OS lock clear at reset
+/// (OSLSR_EL1's reset_val, OSLSR_EL1_OSLM_IMPLEMENTED); OSDLR_EL1 and
+/// DBGPRCR_EL1 read as 0 and ignore writes (trap_raz_wi).
 #[derive(Default)]
 struct Reference {
-    /// OSLK is set by a cold reset.
-    os_unlocked: bool,
-    double_lock: bool,
-    power_request: bool,
+    os_lock: bool,
 }
 
 impl Reference {
@@ -66,12 +65,10 @@ impl Reference {
         }
         let bit = value & 1 == 1;
         match (crm, read) {
-            (0, false) => self.os_unlocked = !bit, // OSLAR_EL1, WO
-            (1, true) => return Some(if self.os_unlocked { 0b1000 } else { 0b1010 }), // OSLSR_EL1, RO
-            (3, true) => return Some(self.double_lock as u64),
-            (3, false) => self.double_lock = bit,
-            (4, true) => return Some(self.power_request as u64),
-            (4, false) => self.power_request = bit,
+            (0, false) => self.os_lock = bit, // OSLAR_EL1, WO
+            (1, true) => return Some(if self.os_lock { 0b1010 } else { 0b1000 }), // OSLSR_EL1, RO
+            (3 | 4, true) => return Some(0),  // OSDLR_EL1, DBGPRCR_EL1: RAZ
+            (3 | 4, false) => {}              // WI
             _ => return None,
         }
         Some(0)
@@ -195,10 +192,7 @@ fn step(s: &Step, debug: &mut DebugRegs, reference: &mut Reference) {
                 Some(v) if access.read => assert_eq!(got, SysregResult::Read(v), "{access:?}"),
                 Some(_) => assert_eq!(got, SysregResult::Written, "{access:?}"),
             }
-            assert_eq!(
-                (debug.os_lock, debug.os_double_lock, debug.power_request),
-                (!reference.os_unlocked, reference.double_lock, reference.power_request)
-            );
+            assert_eq!(debug.os_lock, reference.os_lock);
         }
         _ => {}
     }

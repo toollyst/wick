@@ -1984,6 +1984,53 @@ mod tests {
     }
 
     #[test]
+    fn test_os_lock_is_a_register_as_on_kvm() {
+        // OSLSR_EL1 as KVM has it (arch/arm64/kvm/sys_regs.c): listed by
+        // KVM_GET_REG_LIST (it has set_user), so a snapshot keeps the OS
+        // lock; reset to OSLSR_EL1_OSLM_IMPLEMENTED, the lock clear; only
+        // OSLK may differ from that in a write (set_oslsr_el1, EINVAL). The
+        // guest reads what was written and changes it with OSLAR_EL1, and
+        // its change is what KVM_GET_ONE_REG reads after.
+        use super::super::regs::sys_id;
+        let oslsr = sys_id(0x808c);
+        // mrs x0, OSLSR_EL1; str x0, [x4]; msr OSLAR_EL1, x1;
+        // mrs x0, OSLSR_EL1; str x0, [x4]; b .
+        const CODE: [u32; 6] = [0xd5301180, 0xf9000080, 0xd5101081, 0xd5301180, 0xf9000080, 0x14000000];
+        let (_vm, mut vcpu, _mem, _len) = vm_with_memory(1, &CODE);
+        let mut list = kvm_bindings::RegList::new(500).unwrap();
+        vcpu.get_reg_list(&mut list).unwrap();
+        assert!(list.as_slice().contains(&oslsr));
+        let read = move |v: &VcpuFd| {
+            let mut buf = [0u8; 8];
+            v.get_one_reg(oslsr, &mut buf).unwrap();
+            u64::from_le_bytes(buf)
+        };
+        assert_eq!(read(&vcpu), 0b1000);
+        for bad in [0u64, 0b1001, 0b1100, 0b1_1010] {
+            let e = vcpu.set_one_reg(oslsr, &bad.to_le_bytes()).unwrap_err().errno();
+            assert_eq!(e, libc::EINVAL, "{bad:#b}");
+        }
+        vcpu.set_one_reg(oslsr, &0b1010u64.to_le_bytes()).unwrap();
+        assert_eq!(read(&vcpu), 0b1010);
+        let (seen, after) = std::thread::spawn(move || {
+            for (id, v) in [(PC, GUEST_BASE), (PSTATE, 0x3c5), (x_reg(4), MMIO), (x_reg(1), 0)] {
+                vcpu.set_one_reg(id, &v.to_le_bytes()).unwrap();
+            }
+            let mut seen = [0u64; 2];
+            for g in &mut seen {
+                match vcpu.run().unwrap() {
+                    crate::VcpuExit::MmioWrite(MMIO, data) => *g = u64::from_le_bytes(data.try_into().unwrap()),
+                    other => panic!("{other:?}"),
+                }
+            }
+            (seen, read(&vcpu))
+        })
+        .join()
+        .unwrap();
+        assert_eq!((seen, after), ([0b1010, 0b1000], 0b1000));
+    }
+
+    #[test]
     fn test_ptrauth_keys_are_hidden_without_ptrauth() {
         // As on KVM, the pointer authentication key registers (APIA, APIB,
         // APDA, APDB, APGA, LO and HI) belong to a vCPU given

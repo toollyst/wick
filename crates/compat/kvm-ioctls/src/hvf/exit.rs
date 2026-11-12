@@ -154,21 +154,37 @@ impl SysregAccess {
     }
 }
 
-/// The debug registers a trapped access reaches (KVM emulates the same
-/// ones): the OS lock, the OS double lock and the core power-down request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The debug registers a trapped access reaches, as KVM emulates them
+/// (arch/arm64/kvm/sys_regs.c): the OS lock (OSLAR_EL1, OSLSR_EL1), and
+/// OSDLR_EL1 and DBGPRCR_EL1, which read as 0 and ignore writes
+/// (`trap_raz_wi`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DebugRegs {
-    /// OSLSR_EL1.OSLK, set at reset.
+    /// OSLSR_EL1.OSLK: clear at reset, as KVM resets OSLSR_EL1 to
+    /// `OSLSR_EL1_OSLM_IMPLEMENTED`.
     pub os_lock: bool,
-    /// OSDLR_EL1.DLK.
-    pub os_double_lock: bool,
-    /// DBGPRCR_EL1.CORENPDRQ.
-    pub power_request: bool,
 }
 
-impl Default for DebugRegs {
-    fn default() -> Self {
-        DebugRegs { os_lock: true, os_double_lock: false, power_request: false }
+/// OSLSR_EL1 with the OS lock clear: OSLM = 0b10, the OS lock implemented
+/// (`OSLSR_EL1_OSLM_IMPLEMENTED`, its reset value on KVM).
+pub const OSLSR_RESET: u64 = 0b1000;
+/// OSLSR_EL1.OSLK.
+pub const OSLSR_OSLK: u64 = 0b10;
+
+impl DebugRegs {
+    /// OSLSR_EL1 as the guest reads it.
+    pub fn oslsr(self) -> u64 {
+        OSLSR_RESET | if self.os_lock { OSLSR_OSLK } else { 0 }
+    }
+
+    /// Takes an OSLSR_EL1 value written by user space: as KVM's
+    /// `set_oslsr_el1`, only OSLK may differ from the reset value.
+    pub fn set_oslsr(&mut self, v: u64) -> bool {
+        if (v ^ OSLSR_RESET) & !OSLSR_OSLK != 0 {
+            return false;
+        }
+        self.os_lock = v & OSLSR_OSLK != 0;
+        true
     }
 }
 
@@ -195,19 +211,10 @@ impl DebugRegs {
                 SysregResult::Written
             }
             // OSLSR_EL1 (read only): OS lock implemented (OSLM = 0b10) and its state.
-            ((2, 0, 1, 1, 4), true) => SysregResult::Read(0b1000 | u64::from(self.os_lock) << 1),
-            // OSDLR_EL1: double lock.
-            ((2, 0, 1, 3, 4), true) => SysregResult::Read(u64::from(self.os_double_lock)),
-            ((2, 0, 1, 3, 4), false) => {
-                self.os_double_lock = bit;
-                SysregResult::Written
-            }
-            // DBGPRCR_EL1: core power-down request.
-            ((2, 0, 1, 4, 4), true) => SysregResult::Read(u64::from(self.power_request)),
-            ((2, 0, 1, 4, 4), false) => {
-                self.power_request = bit;
-                SysregResult::Written
-            }
+            ((2, 0, 1, 1, 4), true) => SysregResult::Read(self.oslsr()),
+            // OSDLR_EL1 and DBGPRCR_EL1: read as 0, writes ignored.
+            ((2, 0, 1, 3 | 4, 4), true) => SysregResult::Read(0),
+            ((2, 0, 1, 3 | 4, 4), false) => SysregResult::Written,
             _ => SysregResult::Undefined,
         }
     }
@@ -355,15 +362,24 @@ mod tests {
     fn test_debug_registers() {
         let mut d = DebugRegs::default();
         let acc = |read, encoding| SysregAccess { read, rt: 0, encoding };
-        // The OS lock is set at reset, and OSLAR clears it.
+        // As KVM resets it, the OS lock is clear (OSLSR_EL1 is
+        // OSLSR_EL1_OSLM_IMPLEMENTED: arch/arm64/kvm/sys_regs.c, its
+        // descriptor's reset_val); OSLAR sets and clears it.
+        assert_eq!(d.access(acc(true, (2, 0, 1, 1, 4)), 0), SysregResult::Read(0b1000));
+        assert_eq!(d.access(acc(false, (2, 0, 1, 0, 4)), 1), SysregResult::Written);
         assert_eq!(d.access(acc(true, (2, 0, 1, 1, 4)), 0), SysregResult::Read(0b1010));
         assert_eq!(d.access(acc(false, (2, 0, 1, 0, 4)), 0), SysregResult::Written);
         assert_eq!(d.access(acc(true, (2, 0, 1, 1, 4)), 0), SysregResult::Read(0b1000));
-        // OSLAR is write only, OSLSR read only.
+        // OSLAR is write only, OSLSR read only (read_from_write_only,
+        // write_to_read_only: an undefined instruction).
         assert_eq!(d.access(acc(true, (2, 0, 1, 0, 4)), 0), SysregResult::Undefined);
         assert_eq!(d.access(acc(false, (2, 0, 1, 1, 4)), 1), SysregResult::Undefined);
-        assert_eq!(d.access(acc(false, (2, 0, 1, 4, 4)), 3), SysregResult::Written);
-        assert_eq!(d.access(acc(true, (2, 0, 1, 4, 4)), 0), SysregResult::Read(1));
+        // OSDLR_EL1 and DBGPRCR_EL1 read as 0 and ignore writes, as KVM's
+        // (trap_raz_wi).
+        for enc in [(2, 0, 1, 3, 4), (2, 0, 1, 4, 4)] {
+            assert_eq!(d.access(acc(false, enc), 3), SysregResult::Written);
+            assert_eq!(d.access(acc(true, enc), 0), SysregResult::Read(0));
+        }
         assert_eq!(d.access(acc(true, (3, 0, 1, 0, 0)), 0), SysregResult::Undefined);
         assert_eq!(sync_vector_offset(0x3c5), 0x200);
         assert_eq!(sync_vector_offset(0x3c4), 0x000);

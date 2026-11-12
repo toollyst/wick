@@ -134,6 +134,9 @@ pub(crate) struct VcpuShared {
     /// mapped page; `run()` reads `immediate_exit` from it.
     pub(crate) run: KvmRunPage,
     vtimer_masked: AtomicBool,
+    /// OSLSR_EL1.OSLK, which the VMM emulates (see `sysreg_trap`); here, not
+    /// in the owner handle, as `KVM_SET_ONE_REG` takes any handle.
+    os_lock: AtomicBool,
     /// The `VmInner::vtimer_gen` whose offset the vCPU has (`u64::MAX`: none yet).
     vtimer_gen: AtomicU64,
     in_run: AtomicBool,
@@ -157,6 +160,7 @@ impl VcpuShared {
             hv: AtomicU64::new(NOT_CREATED),
             run: KvmRunPage::new(),
             vtimer_masked: AtomicBool::new(false),
+            os_lock: AtomicBool::new(false),
             vtimer_gen: AtomicU64::new(u64::MAX),
             in_run: AtomicBool::new(false),
             power: Mutex::new(Power::default()),
@@ -253,8 +257,6 @@ pub struct VcpuFd {
     mmio: [u8; 8],
     /// The MMIO load Firecracker is completing (`complete_mmio_read`).
     pending_read: Option<Mmio>,
-    /// Debug registers emulated in user space (see `sysreg_trap`).
-    debug: DebugRegs,
 }
 
 /// Pointer to the exit information Hypervisor.framework fills in for this vCPU.
@@ -283,7 +285,6 @@ impl VcpuFd {
             exit: ExitPtr(std::ptr::null()),
             mmio: [0; 8],
             pending_read: None,
-            debug: DebugRegs::default(),
         }
     }
 
@@ -484,6 +485,8 @@ fn read_reg(hv: hv_vcpu_t, id: u64, out: &mut [u8]) -> Result<()> {
                 Reg::Aarch32Spsr => {}
                 // A new VM's; the VM's own is read in get_reg_now.
                 Reg::PsciVersion => v = regs::PSCI_VERSION_1_0,
+                // A new vCPU's: the lock clear, as KVM resets it.
+                Reg::OsLock => v = exit::OSLSR_RESET,
             }
         }
         let n = out.len().min(8);
@@ -516,9 +519,21 @@ impl VcpuFd {
                 }
                 Reg::Aarch32Spsr if v == 0 => Ok(()),
                 Reg::PsciVersion => self.set_psci_version(v),
+                Reg::OsLock => self.set_os_lock(v),
                 Reg::PhysicalCount | Reg::Aarch32Spsr => err(libc::EINVAL),
             }
         }
+    }
+
+    /// Sets OSLSR_EL1 as KVM's `set_oslsr_el1` does: only OSLK may differ
+    /// from the reset value (`EINVAL`).
+    fn set_os_lock(&self, v: u64) -> Result<()> {
+        let mut debug = DebugRegs::default();
+        if !debug.set_oslsr(v) {
+            return err(libc::EINVAL);
+        }
+        self.shared.os_lock.store(debug.os_lock, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Sets the VM's PSCI version: 1.0, or 0.2 (a snapshot taken when 0.2
@@ -571,6 +586,13 @@ impl VcpuFd {
             self.set_id_reg(r, u64::from_le_bytes(buf))?;
             return Ok(size);
         }
+        // The OS lock is the VMM's, with or without the vCPU.
+        if reg == Reg::OsLock {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&data[..8]);
+            self.set_os_lock(u64::from_le_bytes(buf))?;
+            return Ok(size);
+        }
         match self.live()? {
             Some(hv) => self.set_reg_now(hv, reg_id, &data[..size])?,
             // The counter is the VM's, and counts from the time of the write.
@@ -610,6 +632,11 @@ impl VcpuFd {
         {
             let v = self.id_reg(r)?;
             data[..8].copy_from_slice(&v.to_le_bytes());
+            return Ok(size);
+        }
+        if reg == Reg::OsLock {
+            let debug = DebugRegs { os_lock: self.shared.os_lock.load(Ordering::Relaxed) };
+            data[..8].copy_from_slice(&debug.oslsr().to_le_bytes());
             return Ok(size);
         }
         match self.live()? {
@@ -982,7 +1009,6 @@ impl VcpuFd {
                 check(unsafe { hv_vcpu_set_sys_reg(hv, 0x8000 | n << 3 | op2, 0) })?;
             }
         }
-        self.debug = DebugRegs::default();
         // SAFETY: `hv` belongs to this thread.
         check(unsafe { hv_vcpu_set_vtimer_mask(hv, false) })?;
         self.shared.vtimer_masked.store(false, Ordering::Release);
@@ -1153,7 +1179,10 @@ impl VcpuFd {
         } else {
             self.reg(hv, HV_REG_X0 + access.rt)?
         };
-        match self.debug.access(access, value) {
+        let mut debug = DebugRegs { os_lock: self.shared.os_lock.load(Ordering::Relaxed) };
+        let result = debug.access(access, value);
+        self.shared.os_lock.store(debug.os_lock, Ordering::Relaxed);
+        match result {
             SysregResult::Undefined => return self.inject_undef(hv),
             SysregResult::Read(v) if access.rt != 31 => self.set_reg(hv, HV_REG_X0 + access.rt, v)?,
             SysregResult::Read(_) | SysregResult::Written => {}
