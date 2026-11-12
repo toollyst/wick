@@ -468,9 +468,12 @@ jobs:
           for c in os std libc vmm-sys-util memfd event-manager micro-http userfaultfd; do
             cargo test --locked --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
-          # The tests that create a partition need WHP, which hosted runners
-          # do not have (WHvCreatePartition: ERROR_MOD_NOT_FOUND); they run on
-          # a WHP machine, as the boot test does.
+          # Hosted runners have WHP (run 43277608081: vmm's unit tests make
+          # partitions, map guest memory and run vCPUs). These two make
+          # several partitions with guest memory in one process, and on the
+          # runner every map after one refused beside another partition's
+          # memory failed (tools/windows/unit-test-differences.txt, whp-pc);
+          # until that is root-caused they run on the WHP PC.
           cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- \
             --skip whp::vm::tests::test_vms_one_after_another_map_their_memory \
             --skip whp::vm::tests::test_one_partition_of_a_process_maps_memory
@@ -485,8 +488,8 @@ jobs:
           cargo test --locked --manifest-path ../../crates/compat/vhost/Cargo.toml \
             --features vhost-user-frontend,vhost-user-backend
       # The boot test's own helpers (serial-console protocol, vsock, network
-      # switch) against stand-ins, in Windows PowerShell 5.1 as users run it;
-      # hosted runners have no WHP to boot a guest.
+      # switch) against stand-ins, in Windows PowerShell 5.1 as users run it.
+      # Its boot stages run on the WHP PC, with its guest image.
       - name: Boot test harness self-test
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -SelfTest

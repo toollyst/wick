@@ -4753,18 +4753,25 @@ mod windows {
         use super::*;
 
         // The sandbox is permanent, so it runs in a child process (the test
-        // binary itself, filtered to one of the ignored tests below).
+        // binary itself, filtered to one of the ignored tests below). When
+        // tests run one at a time (RUST_TEST_THREADS=1, as upstream's CI and
+        // tools/windows/check-unit-tests.py run tests), libtest writes
+        // "test <name> ... " before a test runs (library/test/src/formatters/
+        // pretty.rs, write_test_start), so the child's first line would
+        // follow it (measured: CI run 43277608081); it gets a line of its own.
         fn child(name: &str, env: &[(&str, &str)]) -> Output {
-            Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    &format!("ext::sandbox::windows::tests::{name}"),
-                    "--ignored",
-                    "--nocapture",
-                ])
+            let test = format!("ext::sandbox::windows::tests::{name}");
+            let mut out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--ignored", "--nocapture"])
                 .envs(env.iter().copied())
                 .output()
-                .unwrap()
+                .unwrap();
+            let start = format!("test {test} ... ");
+            let at = out.stdout.windows(start.len()).position(|w| w == start.as_bytes());
+            if let Some(at) = at {
+                out.stdout.insert(at + start.len(), b'\n');
+            }
+            out
         }
 
         fn text(out: &Output) -> String {

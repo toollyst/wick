@@ -168,9 +168,12 @@ semantics on Win32. The details are in the comments of each
   and every error the compat libc sets or leaves go through it. A code whose
   meaning depends on the call is mapped where it is made: `ERROR_NO_DATA`
   is `EPIPE` from a write and `EAGAIN` from a non-blocking read (std's own
-  read of an empty pipe keeps 232, which Firecracker's serial input takes
-  for `EWOULDBLOCK`, patch 0019); `WSAESHUTDOWN` is `EPIPE` from a send and
-  the end (0) from a recv; `ERROR_INVALID_FUNCTION` from
+  read of an empty non-blocking pipe returns `Ok(0)`, the end, as for a
+  closed writer: std takes 232 as `BrokenPipe` and a read's `BrokenPipe` as
+  the end, measured by the libc's `test_pipe`); `WSAESHUTDOWN` is `EPIPE`
+  from a send and the end (0) from a recv, and `WSAECONNABORTED` (the peer
+  gone) `EPIPE` from a send and `ECONNRESET` from a recv
+  (`vmm-sys-util`'s `sock_ctrl_msg`); `ERROR_INVALID_FUNCTION` from
   `FSCTL_SET_ZERO_DATA` is `fallocate`'s `EOPNOTSUPP`.
 - **Per-object state (`libc::wick_fd`).** State that belongs to the object a
   handle points to (eventfd counter, timer schedule, status flags such as

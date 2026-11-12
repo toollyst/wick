@@ -11,8 +11,8 @@ RUST_BACKTRACE=1, --no-fail-fast; tools/linux/unit-tests.sh does the same),
 and compares every test's result with tools/windows/unit-test-differences.txt.
 It fails on a failure the file does not list, on an entry whose test passes
 (an entry is a test that fails, so a fixed test leaves the list), and on an
-entry that names no test of the run. Without --whp, a no-whp entry must
-fail (the host has no WHP); with --whp (a WHP machine), it must pass.
+entry that names no test of the run. A whp-pc entry fails on CI's runner
+for its listed reason; with --whp (the WHP PC) it must pass.
 
 Each package's output is kept in DIR (default: a temporary directory) as
 <package>.log.
@@ -28,7 +28,7 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIST = ROOT / "tools" / "windows" / "unit-test-differences.txt"
-KINDS = {"no-whp", "error-text", "linux-path", "bug"}
+KINDS = {"whp-pc", "whp-limit", "error-text", "linux-path", "bug"}
 
 # Each package and its cargo test arguments. firecracker: its example
 # seccomp_jailer uses std::os::unix and does not build on Windows, so its
@@ -100,7 +100,7 @@ def run(package, args, out_dir):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--whp", action="store_true", help="a WHP machine: no-whp entries must pass")
+    ap.add_argument("--whp", action="store_true", help="the WHP PC: whp-pc entries must pass")
     ap.add_argument("--out", type=pathlib.Path, help="where each package's output is kept")
     ap.add_argument("--summary", type=pathlib.Path, help="append a Markdown summary here")
     opts = ap.parse_args()
@@ -122,9 +122,9 @@ def main():
             kind = listed.get(test)
             if result == "FAILED" and kind is None:
                 problems.append(f"{package} {test}: fails, and is not listed")
-            elif result == "FAILED" and kind == "no-whp" and opts.whp:
-                problems.append(f"{package} {test}: no-whp, and fails on this WHP machine")
-            elif result == "ok" and kind is not None and not (kind == "no-whp" and opts.whp):
+            elif result == "FAILED" and kind == "whp-pc" and opts.whp:
+                problems.append(f"{package} {test}: whp-pc, and fails on this WHP machine")
+            elif result == "ok" and kind is not None and not (kind == "whp-pc" and opts.whp):
                 problems.append(f"{package} {test}: listed as {kind}, and passes: remove its entry")
         for test, kind in sorted(listed.items()):
             if test not in results:

@@ -1651,15 +1651,19 @@ mod tests {
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(crate::EAGAIN)
             );
-            // std reads the same empty non-blocking pipe as ERROR_NO_DATA
-            // (232), what Firecracker's serial input (std's Stdin) is given
-            // and patch 0019 takes for EWOULDBLOCK: ReadFile's 232 is an
-            // empty pipe, not the EPIPE of a write's.
+            // std reads the same empty non-blocking pipe as its end, Ok(0)
+            // (measured: CI run 43277608081): ReadFile's ERROR_NO_DATA (232)
+            // is ErrorKind::BrokenPipe (std sys/io/error/windows.rs,
+            // decode_error_kind), which Handle::read returns as Ok(0)
+            // (sys/pal/windows/handle.rs), as it does a closed writer's
+            // ERROR_BROKEN_PIPE. A reader through std (Firecracker's serial
+            // input is std's Stdin) cannot tell an empty pipe from a closed
+            // one.
             let reader = std::mem::ManuallyDrop::new(<std::fs::File as std::os::windows::io::FromRawHandle>::from_raw_handle(
                 handle(fds[0]),
             ));
-            let got = std::io::Read::read(&mut &*reader, &mut b).unwrap_err().raw_os_error();
-            assert_eq!(got, Some(232), "std's read of an empty non-blocking pipe");
+            let got = std::io::Read::read(&mut &*reader, &mut b).unwrap();
+            assert_eq!(got, 0, "std's read of an empty non-blocking pipe");
             // End of file once the writer is gone.
             assert_eq!(close(fds[1]), 0);
             assert_eq!(fcntl(fds[0], F_SETFL, 0), 0);

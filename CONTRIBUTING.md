@@ -246,8 +246,9 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   tests the same way (one at a time, `--no-fail-fast`; on CI's `windows`
   job) and fails on any failure not listed, with its reason, in
   `tools/windows/unit-test-differences.txt`, on a listed test that passes and
-  on an entry that names no test. The tests that create a VM are listed as
-  `no-whp` for CI's runner; with `--whp`, on a WHP machine, they must pass.
+  on an entry that names no test. CI's runner has WHP; the tests that make
+  a VM and fail there are listed as `whp-pc` with their measured cause, and
+  with `--whp`, on the WHP PC, they must pass.
 - On macOS, `tools/macos/integration-tests.sh` runs upstream's pytest suites
   against the macOS release build and `tools/macos/compare-integration-tests.py`
   compares them test by test with their results on Linux

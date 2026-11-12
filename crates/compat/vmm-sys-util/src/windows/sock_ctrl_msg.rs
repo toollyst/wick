@@ -107,8 +107,35 @@ fn win_error(code: u32) -> Error {
 
 /// `WSAESHUTDOWN`.
 const WSAESHUTDOWN: i32 = 10058;
-/// `ERROR_BROKEN_PIPE`.
+/// `WSAECONNABORTED`.
+const WSAECONNABORTED: i32 = 10053;
+/// `WSAECONNRESET`, the compat libc's ECONNRESET.
+const WSAECONNRESET: i32 = 10054;
+/// `ERROR_BROKEN_PIPE`, the compat libc's EPIPE.
 const ERROR_BROKEN_PIPE: i32 = 109;
+
+/// A send's Winsock error as Linux's AF_UNIX send gives it: after a
+/// shutdown, or on a connection Winsock aborted (the peer gone), EPIPE, as
+/// a send to a peer that closed. vhost-user (and any caller) then sees the
+/// errno it classifies as a broken socket, as on Linux.
+fn send_error(err: Error) -> Error {
+    match err.errno() {
+        WSAESHUTDOWN | WSAECONNABORTED => Error::new(ERROR_BROKEN_PIPE),
+        _ => err,
+    }
+}
+
+/// A recv's Winsock error as Linux's AF_UNIX recv gives it: after a
+/// shutdown of this side's reading, the end (`None`: 0 bytes); on a
+/// connection Winsock aborted, ECONNRESET, Linux's when the peer went away
+/// with data unread (`unix_release_sock`, net/unix/af_unix.c).
+fn recv_error(err: Error) -> Option<Error> {
+    match err.errno() {
+        WSAESHUTDOWN => None,
+        WSAECONNABORTED => Some(Error::new(WSAECONNRESET)),
+        _ => Some(err),
+    }
+}
 
 fn wsa_error() -> Error {
     // SAFETY: reads the thread's last Winsock error.
@@ -264,12 +291,7 @@ fn send_all(sock: usize, mut buf: &[u8], started: &mut bool) -> Result<()> {
         // SAFETY: the buffer is valid for `len` bytes.
         let n = unsafe { send(sock, buf.as_ptr(), len, 0) };
         if n == SOCKET_ERROR {
-            let err = wsa_error();
-            // A send after a shutdown is Linux's EPIPE (`ERROR_BROKEN_PIPE`,
-            // the compat libc's EPIPE).
-            if err.errno() == WSAESHUTDOWN {
-                return Err(Error::new(ERROR_BROKEN_PIPE));
-            }
+            let err = send_error(wsa_error());
             // A frame that started goes out whole, or the peer would lose
             // its place in the stream.
             if err.errno() == WSAEWOULDBLOCK && *started {
@@ -445,11 +467,9 @@ fn recv_bytes(sock: usize, buf: &mut [u8], peek: bool, progress: bool) -> Result
         if n != SOCKET_ERROR {
             return Ok(usize::try_from(n).unwrap());
         }
-        let err = wsa_error();
-        // After a shutdown of this side's reading Linux's recv reads the end.
-        if err.errno() == WSAESHUTDOWN {
+        let Some(err) = recv_error(wsa_error()) else {
             return Ok(0);
-        }
+        };
         if err.errno() == WSAEWOULDBLOCK && progress {
             backoff(&mut round);
             continue;
@@ -1033,6 +1053,22 @@ mod tests {
             iov_base: buf.as_mut_ptr().cast(),
             iov_len: buf.len(),
         }
+    }
+
+    // A peer gone reads as on Linux, whatever Winsock calls it: a send's
+    // EPIPE, a recv's end or ECONNRESET; vhost-user's classifier then calls
+    // the socket broken, as it does on Linux.
+    #[test]
+    fn test_a_gone_peer_reads_as_linux() {
+        for code in [WSAESHUTDOWN, WSAECONNABORTED] {
+            assert_eq!(send_error(Error::new(code)).errno(), ERROR_BROKEN_PIPE, "{code}");
+        }
+        assert_eq!(send_error(Error::new(WSAEWOULDBLOCK)).errno(), WSAEWOULDBLOCK);
+        assert!(recv_error(Error::new(WSAESHUTDOWN)).is_none());
+        assert_eq!(recv_error(Error::new(WSAECONNABORTED)).unwrap().errno(), WSAECONNRESET);
+        assert_eq!(recv_error(Error::new(WSAEWOULDBLOCK)).unwrap().errno(), WSAEWOULDBLOCK);
+        assert_eq!(libc::EPIPE, ERROR_BROKEN_PIPE);
+        assert_eq!(libc::ECONNRESET, WSAECONNRESET);
     }
 
     #[test]
