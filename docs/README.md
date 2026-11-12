@@ -34,7 +34,7 @@ tools/                    everything you run by hand or in CI (below)
   macos/                  run, test, boot-test, jailer-test and the integration harness on Apple silicon
   windows/                boot test, jailer test, integration harness and host probes for a Windows PC
   linux/                  upstream's unit and integration tests on Linux, compared with plain upstream
-  vhost-user-blk/         a vhost-user-blk backend used by the macOS boot test
+  vhost-user-blk/         a vhost-user-blk backend for the boot, jailer and integration tests
 fuzz/                     fuzz targets for wick's own code (a crate of its own, CONTRIBUTING.md "Fuzzing")
 docs/                     these pages
 .github/workflows/        ci.yml (every push and pull request), release.yml (tags v*)
