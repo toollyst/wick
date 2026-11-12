@@ -119,8 +119,12 @@ impossible integration_tests/security/test_jail.py::test_new_pid_namespace
 # The test writes host paths into regular expressions unescaped, and a
 # jail under /srv: a Windows path's \ is an escape there.
 impossible integration_tests/security/test_jail.py::test_exec_file_not_exist
-impossible integration_tests/security/test_jail.py::test_exec_destination_path_is_symlink
-impossible integration_tests/security/test_jail.py::test_exec_destination_path_is_hardlink
+
+# The same, and the jailer differs: it refuses a symbolic link planted where
+# it copies Firecracker as a hard link, and does not see a hard link there,
+# writing Firecracker into the linked file (platform/windows copy_exec).
+bug integration_tests/security/test_jail.py::test_exec_destination_path_is_symlink
+bug integration_tests/security/test_jail.py::test_exec_destination_path_is_hardlink
 
 # Transparent huge pages (/sys/kernel/mm/transparent_hugepage, AnonHugePages
 # in smaps): Windows has no transparent huge pages; its large pages are
@@ -164,14 +168,22 @@ bug integration_tests/functional/test_fuzzing.py::test_fuzzing_warning
 bug integration_tests/functional/test_gdb.py::test_gdb_connects
 bug integration_tests/functional/test_instrumented_firecracker.py::test_log_instrument_firecracker_basic_functionality
 
-# A host program run inside the network namespace (udp_offload.py), a TAP's
-# transmit queue length, a multi-queue TAP: a Windows network is a directory
-# of stream endpoints, which a host program cannot run in and which have no
-# TAP queues (docs/PORTING.md row 6).
-row-6 integration_tests/functional/test_net.py::test_tap_offload
-row-6 integration_tests/functional/test_net.py::test_high_ingress_traffic
-row-6 integration_tests/functional/test_net.py::test_multi_queue_unsupported
-row-6 integration_tests/functional/test_net_config_space.py::test_net_change_mac_address
+# A host program in the test's network: udp_offload.py sending UDP (with
+# UDP_SEGMENT) to the guest, iperf3 sending UDP to it, a TCP server the guest
+# connects to. A Windows network is a directory of endpoints (docs/PORTING.md
+# row 6); the harness's host side (wick_windows_net.py) answers ARP and ICMP
+# and carries TCP connections the host opens to the guest, and nothing else
+# yet. To do: UDP from a host program to the guest, a forward from the
+# network's host address to a program on the host, and a TAP's transmit
+# queue length as the endpoint's socket buffer.
+bug integration_tests/functional/test_net.py::test_tap_offload
+bug integration_tests/functional/test_net.py::test_high_ingress_traffic
+bug integration_tests/functional/test_net_config_space.py::test_net_change_mac_address
+
+# The test makes a multi-queue TAP (`ip tuntap add ... multi_queue`) and
+# expects Firecracker to refuse it. Windows has no TAP devices: an interface
+# is a stream endpoint (docs/PORTING.md row 6), one queue by design.
+impossible integration_tests/functional/test_net.py::test_multi_queue_unsupported
 
 # Firecracker's memory beyond its guest's goes just above the tests' 5 MiB
 # (5.0 to 5.6 MiB), most with 16 vCPUs: each vCPU adds about 58 KiB of heap
