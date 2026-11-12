@@ -277,12 +277,32 @@ pub fn decode_response(bytes: &[u8]) -> Result<Response, ApiProcessError> {
 #[derive(Debug)]
 pub struct ApiLink<S: Read + Write> {
     link: S,
+    /// What Firecracker keeps of the server it handed the API process until
+    /// that process's first message, which it sends once it has them
+    /// (macOS: [`macos::split`]).
+    kept: Option<Kept>,
+}
+
+/// Descriptors kept only to be closed later (made on macOS only).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct Kept(#[allow(dead_code)] Box<dyn std::any::Any + Send>);
+
+impl std::fmt::Debug for Kept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Kept")
+    }
 }
 
 impl<S: Read + Write> ApiLink<S> {
     /// A link over `link`.
     pub fn new(link: S) -> Self {
-        Self { link }
+        Self { link, kept: None }
+    }
+
+    /// A link over `link` that keeps `kept` until the first message.
+    #[cfg(target_os = "macos")]
+    fn keeping(link: S, kept: Box<dyn std::any::Any + Send>) -> Self {
+        Self { link, kept: Some(Kept(kept)) }
     }
 
     /// What the API process sent next.
@@ -292,7 +312,11 @@ impl<S: Read + Write> ApiLink<S> {
     /// thread's end ends Firecracker on Linux.
     pub fn receive(&mut self) -> Result<FromApi, ApiProcessError> {
         let msg = match read_message(&mut self.link) {
-            Ok(Some(msg)) => msg,
+            Ok(Some(msg)) => {
+                // The API process has what it was sent.
+                self.kept = None;
+                msg
+            }
             Ok(None) => {
                 // A denied call ended it, but its report did not come.
                 #[cfg(target_os = "macos")]
@@ -583,10 +607,15 @@ mod macos {
             msg.push(u8::from(sandbox::selected() == Policy::Default));
             link.send_with_fds(&[&msg[..]], &[listener, kill_switch.as_raw_fd()])
                 .map_err(|e| ApiProcessError::Link(std::io::Error::other(e.to_string())))?;
-            // The API process has its own descriptors now.
-            drop(server);
-            drop(kill_switch);
-            return Ok(ApiLink::new(link));
+            // Kept until the API process has them: until then they are in
+            // flight on a link made before the jail's fork, whose end there
+            // was never in flight itself, and XNU's collector, which marks
+            // only from sockets in flight (bsd/kern/uipc_usrreq.c `unp_gc`),
+            // flushes a socket a message waiting there alone holds, after
+            // which the listener's accept fails (`ECONNABORTED`). Linux keeps
+            // it (net/unix/garbage.c `unix_vertex_dead`). The API process's
+            // first message comes after it received them.
+            return Ok(ApiLink::keeping(link, Box::new((server, kill_switch))));
         }
         let n = threads()?;
         if n != 1 {
@@ -799,7 +828,7 @@ mod macos {
 
     #[cfg(test)]
     mod tests {
-        use std::os::unix::io::AsRawFd;
+        use std::os::unix::io::{AsRawFd, RawFd};
         use std::os::unix::net::{UnixListener, UnixStream};
 
         use super::listener_fd;
@@ -815,6 +844,119 @@ mod macos {
             assert_eq!(listener_fd(&path).unwrap(), listener.as_raw_fd());
             drop((client, accepted));
             listener_fd(&dir.join("other.sock")).unwrap_err();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        extern "C" fn interrupted(_: libc::c_int) {}
+
+        /// What an accept on the idle listener `fd` ends with: `EINTR` from
+        /// a signal 20 ms later when the listener is whole, `ECONNABORTED`
+        /// at once when the collector flushed it. The 20 ms decides nothing:
+        /// a flushed listener fails without waiting.
+        fn idle_accept(fd: RawFd) -> Option<i32> {
+            // SAFETY: a handler that does nothing, without SA_RESTART.
+            unsafe {
+                let mut act: libc::sigaction = std::mem::zeroed();
+                act.sa_sigaction = interrupted as *const () as usize;
+                assert_eq!(libc::sigaction(libc::SIGUSR2, &act, std::ptr::null_mut()), 0);
+            }
+            // SAFETY: plain call.
+            let me = unsafe { libc::pthread_self() } as usize;
+            let waker = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                // SAFETY: this test's thread, which waits for the waker.
+                unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGUSR2) };
+            });
+            // SAFETY: a listener of the caller's.
+            let r = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            let err = std::io::Error::last_os_error().raw_os_error();
+            waker.join().unwrap();
+            assert_eq!(r, -1, "a connection on an idle listener");
+            err
+        }
+
+        /// The listener and kill switch [`super::split`] sends the API
+        /// process the jail made stay whole until the API process has them.
+        /// They are in flight to it on a link made before the jail's fork,
+        /// whose end there was never in flight itself, and XNU's collector,
+        /// which marks only from sockets in flight (bsd/kern/uipc_usrreq.c
+        /// `unp_gc`), flushes a socket that a message waiting there alone
+        /// holds (`sorflush`: `socantrcvmore`), after which an accept on the
+        /// idle listener fails with `ECONNABORTED` at once, where Linux's
+        /// blocks (net/unix/garbage.c `unix_vertex_dead` keeps a socket a
+        /// socket not in flight is to receive). Firecracker keeps its copies
+        /// until the API process's first message. The collector runs some
+        /// time after any Unix socket is freed, and nothing tells when: a
+        /// canary listener sent the same way after them, which nothing else
+        /// holds, is taken back until one comes back flushed, which shows
+        /// that a pass ran while the API's were in flight. In a process of
+        /// its own, where the signal that ends an idle accept reaches only
+        /// this test's thread.
+        #[test]
+        fn test_the_api_listener_outlives_its_flight() {
+            const NAME: &str = "ext::api_process::macos::tests::test_the_api_listener_outlives_its_flight";
+            if std::env::var_os("WICK_API_TEST_ALONE").is_none() {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
+                    .env("WICK_API_TEST_ALONE", "1")
+                    .output()
+                    .unwrap();
+                assert!(out.status.success() && text(&out).contains("1 passed"), "{}", text(&out));
+                return;
+            }
+            use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+
+            let dir = tempfile_dir();
+            let path = dir.join("api.sock");
+            let server = micro_http::HttpServer::new(&path).unwrap();
+            let kill_switch = vmm_sys_util::eventfd::EventFd::new(libc::O_NONBLOCK).unwrap();
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            super::set_waiting(ours);
+            let mut link = super::split(server, kill_switch, &path, 51200).unwrap();
+
+            let (to, from) = UnixStream::pair().unwrap();
+            // A guard against a hang only: the collector ran within 20 ms in
+            // 50 of 50 runs of agent-state/mac3/probes/inflight-listener.c.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            for round in 0.. {
+                assert!(std::time::Instant::now() < deadline, "the collector did not run in 30 s");
+                let canary_path = dir.join(format!("canary-{round}.sock"));
+                let canary = UnixListener::bind(&canary_path).unwrap();
+                to.send_with_fd(&[0u8][..], canary.as_raw_fd()).unwrap();
+                drop(canary);
+                // Freeing a pair of sockets queues the collector.
+                drop(UnixStream::pair().unwrap());
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let mut byte = [0u8; 1];
+                let (n, fd): (usize, Option<std::fs::File>) = from.recv_with_fd(&mut byte[..]).unwrap();
+                let fd = fd.unwrap();
+                assert_eq!(n, 1);
+                let flushed = idle_accept(fd.as_raw_fd()) == Some(libc::ECONNABORTED);
+                drop(fd);
+                std::fs::remove_file(&canary_path).unwrap();
+                if flushed {
+                    break;
+                }
+            }
+
+            let mut buf = [0u8; 16];
+            let mut fds = [-1; 2];
+            let mut iov = [libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() }];
+            // SAFETY: the iovec points at `buf`, which outlives the call.
+            let (len, nfds) = unsafe { theirs.recv_with_fds(&mut iov, &mut fds) }.unwrap();
+            assert_eq!((len, nfds), (9, 2));
+            assert_eq!(idle_accept(fds[0]), Some(libc::EINTR), "the API listener was flushed");
+
+            // Firecracker lets go of its copies at the first message.
+            assert!(link.kept.is_some());
+            super::super::write_message(&mut &theirs, &[b"E", b"first"]).unwrap();
+            assert!(matches!(link.receive(), Ok(super::super::FromApi::Error(m)) if m == "first"));
+            assert!(link.kept.is_none());
+            // SAFETY: the descriptors received above.
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
             std::fs::remove_dir_all(&dir).unwrap();
         }
 
