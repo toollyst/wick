@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Fri, 13 Nov 2026 04:38:26 +0900
+Subject: [PATCH] vmm: a vCPU thread is the host's to prepare when it is made
+
+start_threaded calls vmm::ext::vcpu_thread::spawned with the new thread's
+handle, on the thread that makes it, while the microVM is still being
+built. Nothing on Linux. On macOS the vCPU thread is given the latency
+tier a guest's timer waits need; the call it takes is denied once the
+sandbox has narrowed, so it cannot be made later from the thread itself.
+A refusal fails the start as a failed spawn does.
+---
+ src/vmm/src/vstate/vcpu.rs | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/vmm/src/vstate/vcpu.rs b/src/vmm/src/vstate/vcpu.rs
+index 5af0b76dc6b0891b6a6ea4de282f32eb97094d65..e967026be3c95678f2c4fbca5b0714867cf825ba 100644
+--- a/src/vmm/src/vstate/vcpu.rs
++++ b/src/vmm/src/vstate/vcpu.rs
+@@ -200,6 +200,9 @@ impl Vcpu {
+                 self.run(filter);
+             })
+             .map_err(StartThreadedError::Spawn)?;
++        // wick: what the host does to a vCPU thread when it is made
++        // (vmm::ext::vcpu_thread).
++        crate::ext::vcpu_thread::spawned(&vcpu_thread).map_err(StartThreadedError::Spawn)?;
+ 
+         Ok(VcpuHandle::new(
+             event_sender,

@@ -38,8 +38,12 @@
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
 #   cpu-template-helper: 29 tests; 23 pass, 6 fail (4 no-hvf, 2 below).
-#   compat-kvm-ioctls: 54 tests; 22 pass, 32 fail, all no-hvf (Error(1) at
-#   hv_vm_create; counted again with the guest-debug tests).
+#   compat-kvm-ioctls: 56 tests; 23 pass, 33 fail, all no-hvf (Error(1) at
+#   hv_vm_create; counted again with the guest-debug tests, and with the
+#   vCPU thread's latency tier: test_a_wfi_ends_when_its_timer_is_due
+#   fails on a runner before it makes its VM, at its own requirement of a
+#   foreground process, since the runners' processes are coalesced as
+#   background ones: timer-coalescing.py's output in the same job).
 #   Pass (names, a name in two of a crate's binaries counted once):
 #   acpi-tables 22, clippy-tracing 17, firecracker 89, rebase-snap 3,
 #   snapshot-editor 6, utils 16, wick-ext 1, wick-version 2, compat-libc 30,
@@ -79,6 +83,7 @@ no-hvf compat-kvm-ioctls hvf::debug::tests::test_the_guests_os_lock_blocks_its_o
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_watchpoint_exit_gives_the_address
 no-hvf compat-kvm-ioctls hvf::vcpu::tests::test_kvm_ptp_counters
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_new_vcpu_has_kvms_reset_values
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_wfi_ends_when_its_timer_is_due
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_guest_writes_during_a_discard_wait_for_the_new_pages
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_id_register_writes_reach_the_guest
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_madvise_dontneed_replaces_guest_pages

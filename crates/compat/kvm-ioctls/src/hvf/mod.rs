@@ -29,6 +29,7 @@ mod exit;
 mod ffi;
 mod gic;
 mod idregs;
+pub mod latency;
 mod regs;
 mod vcpu;
 mod vm;

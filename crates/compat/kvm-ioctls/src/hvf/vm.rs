@@ -2200,6 +2200,141 @@ mod tests {
         assert_eq!(r, 0);
     }
 
+    /// Guest program: arms its virtual timer X0 ticks ahead, unmasked (PSTATE
+    /// masks the interrupt), waits in `WFI` until the timer's condition is
+    /// met (`CNTV_CTL_EL0.ISTATUS`), then writes to X4 (MMIO: the exit).
+    const WFI_UNTIL_DUE: [u32; 9] = [
+        0xd51be300, // msr cntv_tval_el0, x0
+        0xd2800021, // mov x1, #1
+        0xd51be321, // msr cntv_ctl_el0, x1
+        0xd5033fdf, // isb
+        0xd503207f, // 1: wfi
+        0xd53be321, // mrs x1, cntv_ctl_el0
+        0x3617ffc1, // tbz w1, #2, 1b
+        0xf9000081, // str x1, [x4]
+        0x14000000, // b .
+    ];
+
+    /// A VM with a GIC (a firing virtual timer is made pending in it), a page
+    /// of memory at [`GUEST_BASE`] holding `code`, and a vCPU set to run it
+    /// with interrupts masked.
+    fn vm_with_gic_and_code(code: &[u32]) -> (VmFd, DeviceFd, VcpuFd) {
+        let (vm, gic, vcpu) = vm_with_gic();
+        let page = host_page_size() as usize;
+        // SAFETY: an anonymous mapping of one page, kept for the test.
+        let mem = unsafe {
+            libc::mmap(std::ptr::null_mut(), page, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+        };
+        assert_ne!(mem, libc::MAP_FAILED);
+        // SAFETY: the page just mapped.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), mem.cast::<u32>(), code.len()) };
+        let region = kvm_userspace_memory_region {
+            slot: 0,
+            guest_phys_addr: GUEST_BASE,
+            memory_size: page as u64,
+            userspace_addr: mem as u64,
+            flags: 0,
+        };
+        // SAFETY: the page stays mapped for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+        vcpu.set_one_reg(PC, &GUEST_BASE.to_le_bytes()).unwrap();
+        vcpu.set_one_reg(PSTATE, &0x3c5u64.to_le_bytes()).unwrap();
+        (vm, gic, vcpu)
+    }
+
+    #[test]
+    fn test_a_wfi_ends_when_its_timer_is_due() {
+        // A guest waiting in WFI for its virtual timer, 20 ms ahead, runs
+        // again when the timer is due, as on KVM, whose wait is an hrtimer
+        // with no slack (arch/arm64/kvm/arch_timer.c): on macOS as near to
+        // it as the vCPU thread's latency tier lets it (`latency`). The
+        // guest's lateness is compared with a NOTE_CRITICAL kqueue timer's,
+        // taken right after it in each round (the load of the machine at
+        // that time), first on the thread as it is, then with the tier the
+        // product gives a vCPU thread (`latency::vcpu_thread`), which is
+        // what is asserted: a median under 3 ms.
+        //
+        // Why 3 ms. With tier 0 the kernel's leeway for this wait is
+        // MIN(20 ms / 8, 1 ms), and up to as much again while the user is
+        // idle: 2 ms at most (osfmk/kern/timer_call.c timer_call_slop,
+        // osfmk/arm/arm_timer.c latency_qos_ns_max). Measured (M1 Pro, macOS
+        // 27.2, load average 4, the user idle; three runs of this test):
+        // medians 1.28, 1.35 and 1.66 ms. Without the tier (tier 1: 5 ms,
+        // 10 ms idle), the same runs: medians 4.7, 6.1 and 9.5 ms. 3 ms is
+        // 1 ms above the most the kernel adds with the tier and 1.7 ms under
+        // the least measured without it. A median: with the tier one or two
+        // rounds of 21 were up to 6.0 ms late.
+        //
+        // The tier in effect is the more coalesced of the thread's and the
+        // task's (osfmk/kern/thread_policy.c), so this holds only in a
+        // process that is not a background one: required first, by this
+        // thread's own 20 ms sleeps (a foreground process's end at most
+        // 10 ms late, a background one's 100 ms and more).
+        const DUE: Duration = Duration::from_millis(20);
+        const ROUNDS: usize = 21;
+        let mut sleeps: Vec<Duration> = (0..5)
+            .map(|_| {
+                let start = Instant::now();
+                thread::sleep(DUE);
+                start.elapsed() - DUE
+            })
+            .collect();
+        sleeps.sort_unstable();
+        // <sys/resource.h>.
+        const PRIO_DARWIN_PROCESS: libc::c_int = 4;
+        // SAFETY: reads this process's Darwin background state.
+        let darwin_bg = unsafe { libc::getpriority(PRIO_DARWIN_PROCESS, 0) };
+        assert!(
+            darwin_bg == 0 && sleeps[2] < Duration::from_millis(15),
+            "this test needs a foreground launcher (a signed run from a terminal, tools/macos/test.sh): this \
+             process is a background one, whose timers macOS coalesces whatever its threads ask for \
+             (PRIO_DARWIN_PROCESS {darwin_bg}; 20 ms sleeps end {sleeps:?} late)"
+        );
+        let (_vm, _gic, mut vcpu) = vm_with_gic_and_code(&WFI_UNTIL_DUE);
+        let mut freq = 0u64;
+        // SAFETY: reads CNTFRQ_EL0, readable at EL0.
+        unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
+        let ticks = freq * DUE.as_micros() as u64 / 1_000_000;
+        let control = Waiter::new().unwrap();
+        // The guest's lateness less the control's, in microseconds, sorted.
+        let rounds = |vcpu: &mut VcpuFd| {
+            let mut later = Vec::new();
+            for _ in 0..ROUNDS {
+                for (id, v) in [(PC, GUEST_BASE), (x_reg(0), ticks), (x_reg(4), MMIO)] {
+                    vcpu.set_one_reg(id, &v.to_le_bytes()).unwrap();
+                }
+                let start = Instant::now();
+                match vcpu.run().unwrap() {
+                    crate::VcpuExit::MmioWrite(MMIO, _) => {}
+                    other => panic!("{other:?}"),
+                }
+                let guest = start.elapsed();
+                let start = Instant::now();
+                assert_eq!(control.wait(Some(DUE)), Ended::Due);
+                let controlled = start.elapsed();
+                assert!(guest >= DUE, "the guest ran again early, after {guest:?}");
+                later.push(guest.as_micros() as i128 - controlled.as_micros() as i128);
+            }
+            later.sort_unstable();
+            later
+        };
+        let without = rounds(&mut vcpu);
+        // SAFETY: no arguments.
+        super::super::latency::vcpu_thread(unsafe { libc::pthread_self() }).unwrap();
+        let with = rounds(&mut vcpu);
+        println!(
+            "a guest's {DUE:?} WFI, later than a NOTE_CRITICAL timer by (us, sorted): on the thread as it is, median {} \
+             {without:?}; as a vCPU thread, median {} {with:?}",
+            without[ROUNDS / 2],
+            with[ROUNDS / 2]
+        );
+        assert!(
+            with[ROUNDS / 2] < 3000,
+            "as a vCPU thread the guest ran again a median {} us after the control: {with:?} (without the tier: {without:?})",
+            with[ROUNDS / 2]
+        );
+    }
+
     #[test]
     fn test_the_vtimer_thread_runs_only_while_a_timer_is_masked() {
         // The thread that pokes vCPUs whose virtual timer is masked (the

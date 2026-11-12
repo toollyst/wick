@@ -498,6 +498,11 @@ mod macos {
         "mach_port_set_attributes", "mach_port_request_notification",
         "mach_port_get_context_from_user", "task_restartable_ranges_register",
         "mach_voucher_attr_command",
+        // A vCPU thread's latency tier, set by the thread that makes it
+        // while the microVM is built (ext::vcpu_thread; Linux's vCPU threads
+        // need no counterpart). Setup's only: the routine sets any policy of
+        // any thread of the task.
+        "thread_policy_set",
     ];
 
     /// MIG routines of the setup phase that macOS 26 added (measured on
@@ -1995,7 +2000,7 @@ mod macos {
         #[test]
         fn test_narrowing_is_one_way() {
             use std::os::unix::process::ExitStatusExt;
-            for case in ["issue", "consume", "thread"] {
+            for case in ["issue", "consume", "thread", "thread-policy"] {
                 let out = child("one_way_child", &[("WICK_TEST_CASE", case)]);
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 assert!(stdout.contains("NARROWED"), "{case}: {}", text(&out));
@@ -2015,6 +2020,15 @@ mod macos {
             assert!(fd >= 0);
             // SAFETY: the descriptor just created.
             unsafe { libc::close(fd) };
+            // A vCPU thread's latency tier is set in the setup phase
+            // (ext::vcpu_thread).
+            let (end, wait) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                let _ = wait.recv();
+            });
+            crate::ext::vcpu_thread::spawned(&thread).unwrap();
+            drop(end);
+            thread.join().unwrap();
             println!("SETUP-OK");
             narrow().unwrap();
             // A second call does nothing.
@@ -2310,6 +2324,12 @@ mod macos {
                 }
                 "thread" => {
                     let _ = std::thread::spawn(|| ()).join();
+                }
+                // A thread's policy is setup's to set (a vCPU thread's
+                // latency tier, ext::vcpu_thread).
+                "thread-policy" => {
+                    // SAFETY: no arguments.
+                    let _ = kvm_ioctls::latency::vcpu_thread(unsafe { libc::pthread_self() });
                 }
                 other => panic!("{other}"),
             }
