@@ -121,7 +121,8 @@ upstream Firecracker and its jailer.
   freezes or thaws the jail's Job Object. The class that does it, `JobObjectFreezeInformation` (18), is not in
   Microsoft's documentation (the SDK lists it as reserved); its layout is System Informer's (phnt `ntpsapi.h`). It
   was measured on Windows Server 2022 build 20348 and Windows 11 build 26300, elevated and not
-  (`tools/windows/job-freeze-probe.ps1`). Because Windows does not promise it, every jail's start first freezes a
+  (`tools/windows/job-freeze-probe.ps1`), and the freezer stage passed on both (elevated on build 20348, unelevated
+  and elevated on build 26300 with kit 8d577b7: `jailer-test.ps1 freeze`). Because Windows does not promise it, every jail's start first freezes a
   throwaway process in a job of its own and checks that its CPU time stands still; where that fails, on a build that
   changed it, no jail starts, and the error names the NTSTATUS and the build (`test_self_check`). A freeze or thaw the
   file asks for that fails kills the jail rather than leave it against the request (`test_a_failed_freeze_fails`).
