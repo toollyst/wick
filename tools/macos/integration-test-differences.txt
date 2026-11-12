@@ -50,7 +50,8 @@ all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
 # also a drive's counts the file's pages the drive read: macOS reports a
 # shared file mapping's resident pages per file, not per process (14 MiB of
 # pmem in test_get_full_config_after_restoring_snapshot, whose guest never
-# touches the pmem device). The same holds for Firecracker's binary, and
+# touches the pmem device; in the footprint mode below, 0 KiB in the page
+# tables of 15,360 resident, m2-mem). The same holds for Firecracker's binary, and
 # its text was the largest part: Linux counts a file mapping's pages the
 # process mapped (smaps Rss, present page-table entries: fs/proc/task_mmu.c
 # smaps_pte_entry), macOS the file's pages in the buffer cache (XNU
@@ -68,9 +69,13 @@ all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
 # from a binary all in the cache). Run with both (clean tree, m2-queue):
 # the monitor still trips, at 5.03 to 5.44 MiB in most tests and at 6.48
 # to 6.91 MiB in test_vsock_epipe and test_vsock_bare_pause_resume, so what
-# is left is not the binary's cached pages. To find: which regions hold it
-# (the regions at the trip, in both modes). Only a test whose every failing
-# phase failed with this error is excused.
+# is left is not the binary's cached pages. The regions at the trip
+# (wick_macos logs them; m2-mem, clean tree): the binary's text the VM ran,
+# mapped, 1.9 to 2.2 MiB; libmalloc's small zone (VM_MEMORY_MALLOC_SMALL)
+# 1.7 to 2.0 MiB, about 3 MiB in test_vsock_epipe and
+# test_vsock_bare_pause_resume; malloc's other zones 0.65 to 0.7 MiB;
+# thread stacks 0.4 MiB. To find: what Firecracker holds in the small zone.
+# Only a test whose every failing phase failed with this error is excused.
 all bug failure:host_tools.memory.MemoryUsageExceededError
 
 # The test looks in Firecracker's log for the API socket by its path in the
@@ -217,18 +222,6 @@ all arch integration_tests/functional/test_gdb.py::test_gdb_connects
 # an endpoint that takes the host's offloaded frames, and a host program
 # in the harness's network that sends one.
 all bug integration_tests/functional/test_net.py::test_tap_offload
-
-# The test passes (measured, clean tree: all four, the drive moved to a
-# host block device and the guest reading its new size), and on PCI_ON the
-# framework then failed it: once it killed Firecracker it looks for any
-# command line naming the jail's id (microvm.py kill), and found
-# bin/losetup's waiter, which detaches the disk on Firecracker's last close
-# as Linux's lazy detach does (losetup(8), --detach; drivers/block/loop.c
-# loop_clr_fd, LO_FLAGS_AUTOCLEAR) and had the image's path, in the jail,
-# in its command line. The path is in its environment now
-# (disks-selftest.sh). Not yet re-run.
-all bug integration_tests/functional/test_drive_virtio.py::test_rescan_dev[kvm-vmlinux-6.1.188-PCI_ON-Sync]
-all bug integration_tests/functional/test_drive_virtio.py::test_rescan_dev[kvm-vmlinux-6.1.188-PCI_ON-Async]
 
 # No SIGPIPE in 100 host connections closed with data in flight
 # (metrics: signals.sigpipe 0, which Linux counts at least once). To find:
