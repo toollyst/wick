@@ -87,7 +87,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetFileType, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE,
 };
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, PeekConsoleInputW, ReadConsoleInputW, INPUT_RECORD, KEY_EVENT,
+    GetConsoleMode, GetNumberOfConsoleInputEvents, PeekConsoleInputW, ReadConsoleInputW,
+    ENABLE_LINE_INPUT, INPUT_RECORD, KEY_EVENT,
 };
 
 use super::errors::einval;
@@ -467,9 +468,61 @@ fn kind_of(fd: RawFd) -> io::Result<Kind> {
     }
 }
 
-/// Whether console input has a record that reads as bytes; drops the
-/// records in front of it that do not.
+/// In line input mode: whether the Enter that ends a line is among the
+/// records waiting. Nothing is removed.
+///
+/// Linux's terminal in canonical mode has input only once a line is
+/// complete (drivers/tty/n_tty.c `input_available_p`: `canon_head !=
+/// read_tail`); until then a non-blocking read fails with `EAGAIN`
+/// (`n_tty_read`: `tty_io_nonblock`) and poll does not report it readable
+/// (`n_tty_poll`). A console read in line input mode returns "only when a
+/// carriage return is read" (ENABLE_LINE_INPUT,
+/// learn.microsoft.com/windows/console/setconsolemode) and has no
+/// non-blocking form, so a read begun with part of a line typed would hold
+/// its thread until Enter. A console that cannot be asked counts as ready,
+/// so that the reader sees the error. The reader's rule is the same
+/// (`wick_os::stdio`).
+fn line_ready(h: HANDLE) -> bool {
+    let mut count = 0u32;
+    // SAFETY: an out-pointer to a u32.
+    if unsafe { GetNumberOfConsoleInputEvents(h, &mut count) } == 0 {
+        return true;
+    }
+    if count == 0 {
+        return false;
+    }
+    // SAFETY: an all-zero INPUT_RECORD is valid.
+    let mut recs: Vec<INPUT_RECORD> = vec![unsafe { std::mem::zeroed() }; count as usize];
+    let mut n = 0u32;
+    // SAFETY: room for `count` records.
+    if unsafe { PeekConsoleInputW(h, recs.as_mut_ptr(), count, &mut n) } == 0 {
+        return true;
+    }
+    recs.iter().take(n as usize).any(|rec| {
+        if u32::from(rec.EventType) != KEY_EVENT {
+            return false;
+        }
+        // SAFETY: the record is a key event.
+        let key = unsafe { rec.Event.KeyEvent };
+        // SAFETY: a union of u16 and i8; both read as the code unit.
+        key.bKeyDown != 0 && unsafe { key.uChar.UnicodeChar } == 0x0d
+    })
+}
+
+/// Whether a read of console input would return at once. In line input
+/// mode: a whole line waits ([`line_ready`]), as Linux's poll reports a
+/// canonical terminal; the records of an unfinished line keep the
+/// console's handle signalled, so a wait comes back here to look until
+/// Enter or raw mode (Firecracker is in line input mode only from the
+/// serial's registration to the vCPUs' start, and from its stop to its
+/// exit). Otherwise: a record that reads as bytes waits; the records in
+/// front of it that do not are dropped.
 fn console_ready(h: HANDLE) -> bool {
+    let mut mode = 0u32;
+    // SAFETY: an out-pointer to a u32; fails on anything but a console.
+    if unsafe { GetConsoleMode(h, &mut mode) } != 0 && mode & ENABLE_LINE_INPUT != 0 {
+        return line_ready(h);
+    }
     loop {
         // SAFETY: an all-zero INPUT_RECORD is valid.
         let mut rec: INPUT_RECORD = unsafe { std::mem::zeroed() };

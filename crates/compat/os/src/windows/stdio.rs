@@ -25,8 +25,11 @@
 //!   Records that read as nothing (key releases, mouse, focus and window
 //!   events) are dropped first, as `vmm_sys_util`'s epoll drops them before
 //!   it reports a console readable. In line input mode (canonical, before
-//!   Firecracker sets raw mode) the read still waits for the end of the line,
-//!   as a blocking read of a canonical terminal does on Linux;
+//!   Firecracker sets raw mode and after it sets canonical mode back) a
+//!   read with no whole line typed is [`WOULD_BLOCK`] too, and takes
+//!   nothing, as Linux's canonical terminal gives `EAGAIN` until the line is
+//!   complete (`line_ready`); once Enter is among the records the line
+//!   reads;
 //! - no standard input (`NULL`, or a handle that is not valid) as the end,
 //!   as std does (its `handle_ebadf`).
 //!
@@ -46,8 +49,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType, ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT, PeekConsoleInputW, ReadConsoleInputW,
-    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    ENABLE_LINE_INPUT, GetConsoleMode, GetNumberOfConsoleInputEvents, GetStdHandle, INPUT_RECORD,
+    KEY_EVENT, PeekConsoleInputW, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 
 use super::fd::{AsFd, AsRawFd, BorrowedFd, RawFd, from_handle};
@@ -85,10 +88,57 @@ pub(crate) fn read_handle(h: HANDLE, buf: &mut [u8]) -> io::Result<usize> {
     Ok(usize::try_from(n).unwrap_or(usize::MAX))
 }
 
-/// Whether console input `h` has a record that reads as a character; drops
-/// the records in front of it that do not. A console that cannot be asked
-/// counts as ready, so that the read reports its error.
+/// In line input mode: whether the Enter that ends a line is among the
+/// records waiting. Nothing is removed.
+///
+/// Linux's terminal in canonical mode has input only once a line is
+/// complete (drivers/tty/n_tty.c `input_available_p`: `canon_head !=
+/// read_tail`); until then a non-blocking read fails with `EAGAIN`
+/// (`n_tty_read`: `tty_io_nonblock`) and poll does not report it readable
+/// (`n_tty_poll`). A console read in line input mode returns "only when a
+/// carriage return is read" (ENABLE_LINE_INPUT,
+/// learn.microsoft.com/windows/console/setconsolemode) and has no
+/// non-blocking form, so a read begun with part of a line typed would hold
+/// its thread until Enter. A console that cannot be asked counts as ready,
+/// so that the read reports its error.
+fn line_ready(h: HANDLE) -> bool {
+    let mut count = 0u32;
+    // SAFETY: an out-pointer to a u32.
+    if unsafe { GetNumberOfConsoleInputEvents(h, &mut count) } == 0 {
+        return true;
+    }
+    if count == 0 {
+        return false;
+    }
+    // SAFETY: an all-zero INPUT_RECORD is valid.
+    let mut recs: Vec<INPUT_RECORD> = vec![unsafe { std::mem::zeroed() }; count as usize];
+    let mut n = 0u32;
+    // SAFETY: room for `count` records.
+    if unsafe { PeekConsoleInputW(h, recs.as_mut_ptr(), count, &mut n) } == 0 {
+        return true;
+    }
+    recs.iter().take(n as usize).any(|rec| {
+        if u32::from(rec.EventType) != KEY_EVENT {
+            return false;
+        }
+        // SAFETY: the record is a key event.
+        let key = unsafe { rec.Event.KeyEvent };
+        // SAFETY: a union of u16 and i8; both read as the code unit.
+        key.bKeyDown != 0 && unsafe { key.uChar.UnicodeChar } == 0x0d
+    })
+}
+
+/// Whether a read of console input `h` would return at once. In line input
+/// mode: a whole line waits ([`line_ready`]). Otherwise: a record that
+/// reads as a character waits; the records in front of it that do not are
+/// dropped. A console that cannot be asked counts as ready, so that the
+/// read reports its error.
 pub(crate) fn console_ready(h: HANDLE) -> bool {
+    let mut mode = 0u32;
+    // SAFETY: an out-pointer to a u32; fails on anything but a console.
+    if unsafe { GetConsoleMode(h, &mut mode) } != 0 && mode & ENABLE_LINE_INPUT != 0 {
+        return line_ready(h);
+    }
     loop {
         // SAFETY: an all-zero INPUT_RECORD is valid.
         let mut rec: INPUT_RECORD = unsafe { std::mem::zeroed() };
@@ -494,13 +544,17 @@ mod tests {
     const CONSOLE_CHILD_ENV: &str = "WICK_TEST_STDIO_CONSOLE_CHILD";
 
     fn key(down: bool, c: u8) -> INPUT_RECORD {
+        key_vk(down, c, 0)
+    }
+
+    fn key_vk(down: bool, c: u8, vk: u16) -> INPUT_RECORD {
         INPUT_RECORD {
             EventType: 1, // KEY_EVENT
             Event: INPUT_RECORD_0 {
                 KeyEvent: KEY_EVENT_RECORD {
                     bKeyDown: i32::from(down),
                     wRepeatCount: 1,
-                    wVirtualKeyCode: 0,
+                    wVirtualKeyCode: vk,
                     wVirtualScanCode: 0,
                     uChar: KEY_EVENT_RECORD_0 {
                         UnicodeChar: u16::from(c),
@@ -600,6 +654,32 @@ mod tests {
         assert_eq!(got, b"hi");
         // And then nothing again.
         assert_eq!(input.read(&mut buf).unwrap_err().raw_os_error(), Some(WOULD_BLOCK));
+
+        // Line input mode, as before Firecracker sets raw mode: part of a
+        // line typed is EAGAIN, as on a canonical terminal on Linux
+        // (n_tty_read), and nothing of it is taken.
+        // SAFETY: our console input handle.
+        unsafe {
+            let raw = mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+            assert_ne!(SetConsoleMode(conin, raw | ENABLE_LINE_INPUT), 0);
+        }
+        write(&[key(true, b'o'), key(false, b'o'), key(true, b'k')]);
+        let err = input.read(&mut buf).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(WOULD_BLOCK), "part of a line");
+        assert_eq!(pending(), 3, "the records of the unfinished line stay");
+        // Enter (VK_RETURN) ends the line, and it reads, with its end.
+        write(&[key_vk(true, b'\r', 0x0d)]);
+        let mut got = Vec::new();
+        while !got.ends_with(b"\n") {
+            match input.read(&mut buf) {
+                Ok(n) => {
+                    assert!(n > 0, "the end of a console");
+                    got.extend_from_slice(&buf[..n]);
+                }
+                Err(e) => panic!("after {got:?}: {e}"),
+            }
+        }
+        assert_eq!(got, b"ok\r\n");
     }
 
     /// Runs `console_child` with a console of its own, hidden:

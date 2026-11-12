@@ -16,7 +16,9 @@
 //!   all or nothing (pipe(7)), and here a write that does not fit is
 //!   written in part, whatever its size (a non-blocking byte pipe takes "as
 //!   many bytes as the buffer holds", Named Pipe Type, Read, and Wait
-//!   Modes). The room left cannot be told beforehand: the write end's
+//!   Modes; `test_a_small_write_that_does_not_fit_is_written_in_part`), and
+//!   what was written cannot be taken back. The room left cannot be told
+//!   beforehand: the write end's
 //!   `WriteQuotaAvailable` (FILE_PIPE_LOCAL_INFORMATION) reads 0 while the
 //!   reader waits in a read, though a write then completes at once
 //!   (vmm-sys-util's `test_pipe_write_room_reads_0_while_a_read_waits`), so
@@ -2060,5 +2062,55 @@ mod tests {
         let asked_64k = measure(65536);
         assert!(default > 0 && default < 64 * 1024, "nSize 0 holds {default} bytes");
         assert!(asked_64k > 0, "nSize 65536 holds {asked_64k} bytes");
+    }
+
+    // The difference from Linux the module docs state, as what `write`
+    // does: a non-blocking write of at most PIPE_BUF (4096) bytes into a
+    // pipe with less room is taken in part. Linux takes such a write whole
+    // or fails it with EAGAIN (pipe(7), "O_NONBLOCK enabled, n <=
+    // PIPE_BUF"; fs/pipe.c pipe_write, anon_pipe_write since v6.15: a
+    // write of at most a page merges whole into the last buffer or takes a
+    // buffer of its own, and with none free returns EAGAIN with nothing
+    // written). Windows: "When writing to a non-blocking, byte-mode pipe
+    // handle with insufficient buffer space, WriteFile returns TRUE with
+    // *lpNumberOfBytesWritten < nNumberOfBytesToWrite" (WriteFile,
+    // learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-writefile).
+    // Two pipes, filled in writes of 3000 and of 2999 bytes after one
+    // byte: whatever a pipe holds, the last write that takes anything
+    // cannot be whole in both.
+    #[test]
+    fn test_a_small_write_that_does_not_fit_is_written_in_part() {
+        let fill = |len: usize| {
+            let mut fds = [0; 2];
+            let chunk = std::vec![7u8; len];
+            let mut total = 0usize;
+            let mut last = 0usize;
+            // SAFETY: valid buffers and descriptors.
+            unsafe {
+                assert_eq!(pipe(fds.as_mut_ptr()), 0);
+                assert_eq!(fcntl(fds[1], F_SETFL, O_NONBLOCK), 0);
+                assert_eq!(write(fds[1], chunk.as_ptr().cast(), 1), 1);
+                loop {
+                    let n = write(fds[1], chunk.as_ptr().cast(), len);
+                    if n < 0 {
+                        break;
+                    }
+                    last = n.unsigned_abs();
+                    assert!(last > 0 && last <= len);
+                    total += last;
+                    assert!(total < 64 << 20, "the pipe never filled");
+                }
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(crate::EAGAIN)
+                );
+                assert_eq!(close(fds[1]), 0);
+                assert_eq!(close(fds[0]), 0);
+            }
+            std::println!("writes of {len}: the pipe took 1 + {total} bytes, the last write {last}");
+            last < len
+        };
+        let (a, b) = (fill(3000), fill(2999));
+        assert!(a || b, "a write of at most PIPE_BUF bytes was taken in part");
     }
 }
