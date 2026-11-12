@@ -23,8 +23,8 @@ fails only with that exception), so its reason must say how many tests it
 excused in which run, in a comment line of its own, which the comparators
 ignore:
 
-    # excused: 22 (run m2-queue at 27c2d4e): pass their own assertions and fail only the teardown's memory budget
-    # excused: at least 22 (run m2-queue at 27c2d4e): ...
+    # excused: 19 (run m2-parts at 8d577b7): pass their own assertions and fail only the memory budget of the VMM's own part
+    # excused: at least 19 (run m2-parts at 8d577b7): ...
 
 the number from that run's comparison.md, "at least" when the run was not
 the full suites. The progress block takes them out of the tests that agree
