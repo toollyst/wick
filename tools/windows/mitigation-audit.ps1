@@ -75,6 +75,9 @@ if ([W.M]::VirtualAlloc([IntPtr]::Zero, 4096, 0x3000, 0x40) -eq [IntPtr]::Zero) 
     $controlFile = Join-Path $WorkDir 'control.ps1'
     Set-Content -Encoding ASCII $controlFile $script
     $control = Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$controlFile`"" -PassThru -WindowStyle Hidden
+    # Windows PowerShell 5.1 keeps no exit code for a Start-Process process
+    # unless its handle was taken while it ran.
+    $null = $control.Handle
     $script:Started += $control
     [void]$control.WaitForExit(60000)
     if (-not $control.HasExited -or $control.ExitCode -ne 0) { throw "the control did not run (exit $($control.ExitCode))" }
@@ -89,6 +92,7 @@ if ([W.M]::VirtualAlloc([IntPtr]::Zero, 4096, 0x3000, 0x40) -eq [IntPtr]::Zero) 
         Set-Content -Encoding ASCII $kernel 'not a kernel'
         $p = Start-Process $Fc -ArgumentList "--api-sock `"$sock`"" -PassThru -NoNewWindow `
             -RedirectStandardOutput (Join-Path $WorkDir 'stdout.txt') -RedirectStandardError (Join-Path $WorkDir 'stderr.txt')
+        $null = $p.Handle
         $script:Started += $p
         $t = [DateTime]::Now.AddSeconds(10)
         while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t -and -not $p.HasExited) { Start-Sleep -Milliseconds 50 }

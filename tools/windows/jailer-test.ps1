@@ -30,6 +30,12 @@ param(
     [string]$Probe = ''
 )
 $ErrorActionPreference = 'Stop'
+# Firecracker, the jailer and the probes write UTF-8 (Rust's strings,
+# Windows' error texts in them included, which are in the system's language);
+# Windows PowerShell reads a file in the ANSI code page and a redirected
+# stream in the console's unless told: on a Korean or Japanese Windows their
+# text came out garbled.
+$PSDefaultParameterValues['Get-Content:Encoding'] = 'UTF8'
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $Bin) { $Bin = Join-Path (Split-Path -Parent (Split-Path -Parent $Here)) 'lib\firecracker\build\cargo_target\release' }
 $Jailer = Join-Path $Bin 'jailer.exe'
@@ -414,6 +420,9 @@ function Stage-Handles {
 function Start-ApiJail([string]$base, [string]$id, [string[]]$jailerArgs = @()) {
     $extra = ($jailerArgs | ForEach-Object { if ($_ -match ' ') { "`"$_`"" } else { $_ } }) -join ' '
     $j = Start-Process $Jailer -ArgumentList "--id $id --exec-file `"$Fc`" --uid 0 --gid 0 --chroot-base-dir `"$base`" $extra" -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $base "$id-out.txt") -RedirectStandardError (Join-Path $base "$id-err.txt")
+    # Windows PowerShell 5.1 keeps no exit code for a Start-Process process
+    # unless its handle was taken while it ran (the api stage checks it).
+    $null = $j.Handle
     $root = Join-Path $base "firecracker.exe\$id\root"
     $sock = Join-Path $root 'run\firecracker.socket'
     $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t -and -not $j.HasExited) { Start-Sleep -Milliseconds 100 }
@@ -465,10 +474,15 @@ function Invoke-Medium([string[]]$argv, [int]$ms = 20000) {
     @($p.ExitCode, ((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join ''))
 }
 
-# Fails unless jail-probe `medium` makes a plain process of the user.
+# Fails unless jail-probe `medium` makes a plain process of the user, in
+# which a program that loads user32 runs (PowerShell: it died at start with
+# 0xC0000142 while the token kept an elevated default DACL).
 function Assert-Medium {
     $t = Invoke-Medium @((Get-Probe), 'token:0')
     Check ($t[1] -match 'token:0 allowed integrity 8192 administrators no privileges 1') "jail-probe medium is not a plain process of the user: $($t[1])"
+    $ps = Join-Path $PSHOME 'powershell.exe'
+    $t = Invoke-Medium @($ps, '-NoProfile', '-NonInteractive', '-Command', 'exit 7') 60000
+    Check ($t[0] -eq 7) ("PowerShell as a plain process of the user: exit 0x{0:x8} {1}" -f $t[0], $t[1])
 }
 
 function Test-Probe([string[]]$prefix, $expect) {
@@ -828,7 +842,15 @@ function Stage-Pidns {
         $t = [DateTime]::Now.AddSeconds(10)
         while ([WickJailerTest.Term]::Mode() -eq $mode -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 50 }
         $raw = [WickJailerTest.Term]::Mode()
-        Check ($raw -ne $mode) 'the jailer did not set the console to raw mode'
+        if ($raw -eq $mode) {
+            # Why: the jailer fails at the start if SetConsoleMode refuses
+            # the raw mode (console.rs, Terminal::new), and says so.
+            $code = [WickJailerTest.Term]::Wait($pi, 0)
+            $state = if ($code -eq -1) { 'still runs' } else { "exited with $code" }
+            $screen = ([WickJailerTest.Term]::Screen() -replace '\s+', ' ').Trim()
+            if ($screen.Length -gt 400) { $screen = $screen.Substring($screen.Length - 400) }
+            Check $false ("the jailer did not set the console to raw mode: the input mode stayed 0x{0:x}; the jailer {1}; the screen ends: {2}" -f $mode, $state, $screen)
+        }
         [WickJailerTest.Term]::Type("hi$([char]3)q")
         $code = [WickJailerTest.Term]::Wait($pi, 20000)
         Check ($code -eq 0) "the relayed jailer: exit $code"
@@ -1159,7 +1181,7 @@ function Stage-Api {
         Stop-Process -Id $apiPid -Force
         [void]$jail.Jailer.WaitForExit(15000)
         Check ($jail.Jailer.HasExited) 'the jailer (and Firecracker) did not end within 15 s of the API process being killed'
-        Check ($jail.Jailer.ExitCode -ne 0) "the jailer returned 0 after the API process was killed"
+        Check ($null -ne $jail.Jailer.ExitCode -and $jail.Jailer.ExitCode -ne 0) "the jailer returned $($jail.Jailer.ExitCode) after the API process was killed"
         # The panic hook logs (the log is stdout here) besides stderr.
         $err = (Get-Content -Raw (Join-Path $base 'api-out.txt'), (Join-Path $base 'api-err.txt') -ErrorAction SilentlyContinue) -join "`n"
         Check ($err -match 'The API server process ended') "no panic message for the API process's end: $err"

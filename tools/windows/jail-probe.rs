@@ -87,6 +87,8 @@ extern "system" {
     fn GetSidSubAuthorityCount(sid: *mut c_void) -> *mut u8;
     fn GetSidSubAuthority(sid: *mut c_void, index: u32) -> *mut u32;
     fn SetTokenInformation(t: HANDLE, class: i32, info: *const c_void, len: u32) -> i32;
+    fn InitializeAcl(acl: *mut c_void, len: u32, revision: u32) -> i32;
+    fn AddAccessAllowedAce(acl: *mut c_void, revision: u32, mask: u32, sid: *mut c_void) -> i32;
     fn CreateRestrictedToken(
         t: HANDLE,
         flags: u32,
@@ -1169,6 +1171,40 @@ fn run_as(level: &str, lua: bool, argv: &[String]) -> std::io::Result<u32> {
         let label = SID_AND_ATTRIBUTES { sid, attributes: 0x20 }; // SE_GROUP_INTEGRITY
         let len = std::mem::size_of::<SID_AND_ATTRIBUTES>() as u32 + GetLengthSid(sid);
         if SetTokenInformation(dup, 25, (&raw const label).cast(), len) == 0 {
+            return fail();
+        }
+        // The user owns what the child makes, and its default DACL grants
+        // SYSTEM and the user, as a user's own token does: an elevated
+        // token's default DACL grants Administrators and SYSTEM only, which
+        // the LUA token has for deny only, so its child's own process and
+        // thread objects granted it nothing and a child that makes a console
+        // or loads user32 (PowerShell) died at start with 0xC0000142
+        // (STATUS_DLL_INIT_FAILED; measured by Windows 2, finding-0xC0000142).
+        let mut user = [0u8; 256];
+        let mut needed = 0;
+        if GetTokenInformation(t, 1, user.as_mut_ptr().cast(), user.len() as u32, &mut needed) == 0 {
+            return fail(); // TokenUser
+        }
+        let user_sid = *user.as_ptr().cast::<*mut c_void>();
+        let mut system = std::ptr::null_mut();
+        if ConvertStringSidToSidW(wide("S-1-5-18").as_ptr(), &mut system) == 0 {
+            return fail();
+        }
+        let mut acl = [0u64; 64];
+        let acl = acl.as_mut_ptr().cast::<c_void>();
+        const ACL_REVISION: u32 = 2;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        if InitializeAcl(acl, 512, ACL_REVISION) == 0
+            || AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, system) == 0
+            || AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, user_sid) == 0
+        {
+            return fail();
+        }
+        // TokenOwner (4) is a TOKEN_OWNER, TokenDefaultDacl (6) a
+        // TOKEN_DEFAULT_DACL: one pointer each.
+        if SetTokenInformation(dup, 4, (&raw const user_sid).cast(), std::mem::size_of::<*mut c_void>() as u32) == 0
+            || SetTokenInformation(dup, 6, (&raw const acl).cast(), std::mem::size_of::<*mut c_void>() as u32) == 0
+        {
             return fail();
         }
         let cmd = argv.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(" ");
