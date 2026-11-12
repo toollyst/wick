@@ -310,7 +310,11 @@ jobs:
             --skip hvf::vcpu::tests::test_kvm_ptp_counters
       - name: Host sandbox and jail hand-over tests
         working-directory: lib/firecracker
-        run: cargo test --locked -p vmm --lib "ext::"
+        # ext::snapshot_vcpu_tests restore a vCPU, which needs
+        # Hypervisor.framework (GitHub's macOS runners have none: hv_vm_create
+        # gives ENOTSUP); tools/macos/test.sh -- ext:: runs them on a Mac.
+        run: |
+          cargo test --locked -p vmm --lib "ext::" -- --skip ext::snapshot_vcpu_tests::
       # The jailer's tests run as root, as upstream's do (they set resource
       # limits and change owners); the runners have passwordless sudo.
       - name: Jailer unit tests
