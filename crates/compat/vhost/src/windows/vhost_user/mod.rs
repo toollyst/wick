@@ -206,6 +206,12 @@ impl std::convert::From<vmm_sys_util::errno::Error> for Error {
             libc::ENOMEM => Error::SocketRetry(IOError::from_raw_os_error(libc::ENOMEM)),
             // Connection reset by peer.
             libc::ECONNRESET => Error::SocketBroken(IOError::from_raw_os_error(libc::ECONNRESET)),
+            // wick: Winsock's peer that went away (WSAECONNABORTED), which
+            // Linux's AF_UNIX reports as ECONNRESET or EPIPE.
+            libc::ECONNABORTED => Error::SocketBroken(IOError::from_raw_os_error(libc::ECONNABORTED)),
+            // wick: Winsock's send after a shutdown (WSAESHUTDOWN), Linux's
+            // EPIPE.
+            10058 => Error::SocketBroken(IOError::from_raw_os_error(libc::EPIPE)),
             // The local end has been shut down on a connection oriented socket. In this  case the
             // process will also receive a SIGPIPE unless MSG_NOSIGNAL is set.
             libc::EPIPE => Error::SocketBroken(IOError::from_raw_os_error(libc::EPIPE)),
@@ -593,6 +599,16 @@ mod tests {
         assert!(!Error::IncorrectFds.should_reconnect());
         assert!(!Error::OversizedMsg.should_reconnect());
         assert!(!Error::FeatureMismatch.should_reconnect());
+    }
+
+    // A peer gone is SocketBroken however Winsock words it: reset,
+    // aborted, shut down, or EPIPE.
+    #[test]
+    fn test_a_gone_peer_is_broken() {
+        for e in [libc::ECONNRESET, libc::ECONNABORTED, 10058, libc::EPIPE] {
+            let got: Error = vmm_sys_util::errno::Error::new(e).into();
+            assert!(matches!(got, Error::SocketBroken(_)), "{e}: {got:?}");
+        }
     }
 
     #[test]

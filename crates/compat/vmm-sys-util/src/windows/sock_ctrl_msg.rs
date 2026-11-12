@@ -105,6 +105,11 @@ fn win_error(code: u32) -> Error {
     Error::new(code as i32)
 }
 
+/// `WSAESHUTDOWN`.
+const WSAESHUTDOWN: i32 = 10058;
+/// `ERROR_BROKEN_PIPE`.
+const ERROR_BROKEN_PIPE: i32 = 109;
+
 fn wsa_error() -> Error {
     // SAFETY: reads the thread's last Winsock error.
     Error::new(unsafe { WSAGetLastError() })
@@ -260,6 +265,11 @@ fn send_all(sock: usize, mut buf: &[u8], started: &mut bool) -> Result<()> {
         let n = unsafe { send(sock, buf.as_ptr(), len, 0) };
         if n == SOCKET_ERROR {
             let err = wsa_error();
+            // A send after a shutdown is Linux's EPIPE (`ERROR_BROKEN_PIPE`,
+            // the compat libc's EPIPE).
+            if err.errno() == WSAESHUTDOWN {
+                return Err(Error::new(ERROR_BROKEN_PIPE));
+            }
             // A frame that started goes out whole, or the peer would lose
             // its place in the stream.
             if err.errno() == WSAEWOULDBLOCK && *started {
@@ -436,6 +446,10 @@ fn recv_bytes(sock: usize, buf: &mut [u8], peek: bool, progress: bool) -> Result
             return Ok(usize::try_from(n).unwrap());
         }
         let err = wsa_error();
+        // After a shutdown of this side's reading Linux's recv reads the end.
+        if err.errno() == WSAESHUTDOWN {
+            return Ok(0);
+        }
         if err.errno() == WSAEWOULDBLOCK && progress {
             backoff(&mut round);
             continue;

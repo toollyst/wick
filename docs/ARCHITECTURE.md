@@ -163,7 +163,13 @@ semantics on Win32. The details are in the comments of each
   them with the same meaning is mapped to it (`libc::wick_errno_from_win32`:
   `ERROR_PATH_NOT_FOUND` is `ENOENT`, `ERROR_OUTOFMEMORY` `ENOMEM`, ...), so
   upstream's comparisons with `libc::E*` match; the WHP backend's `HRESULT`s
-  go through it.
+  and every error the compat libc sets or leaves go through it. A code whose
+  meaning depends on the call is mapped where it is made: `ERROR_NO_DATA`
+  is `EPIPE` from a write and `EAGAIN` from a non-blocking read (std's own
+  read of an empty pipe keeps 232, which Firecracker's serial input takes
+  for `EWOULDBLOCK`, patch 0019); `WSAESHUTDOWN` is `EPIPE` from a send and
+  the end (0) from a recv; `ERROR_INVALID_FUNCTION` from
+  `FSCTL_SET_ZERO_DATA` is `fallocate`'s `EOPNOTSUPP`.
 - **Per-object state (`libc::wick_fd`).** State that belongs to the object a
   handle points to (eventfd counter, timer schedule, status flags such as
   `O_NONBLOCK`, memfd seal sections) is keyed by the fd value. A duplicate of

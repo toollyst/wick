@@ -262,6 +262,19 @@ fn write_zeros(fd: c_int, zeros: &[u8], mut from: i64, to: i64) -> bool {
     true
 }
 
+/// `fallocate`'s failure of `FSCTL_SET_ZERO_DATA`: `ERROR_INVALID_FUNCTION`
+/// (a file system without it), which this layer's `ENOTTY` is, is Linux's
+/// `EOPNOTSUPP` for a mode the file system does not support
+/// (`fallocate(2)`); any other error as its constant.
+fn zero_failed() -> c_int {
+    // SAFETY: reads the thread's last error.
+    if unsafe { GetLastError() } == windows_sys::Win32::Foundation::ERROR_INVALID_FUNCTION {
+        set_errno(crate::EOPNOTSUPP);
+        return -1;
+    }
+    crate::windows_fd::raw_failed()
+}
+
 /// `fallocate`:
 /// - `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`: the file is made sparse
 ///   and the range deallocated; file systems without sparse files fail with
@@ -299,23 +312,23 @@ pub unsafe fn fallocate(fd: c_int, mode: c_int, offset: off_t, len: off_t) -> c_
                 return fail(crate::EOPNOTSUPP);
             }
             if !zero_data(h, offset, end.min(size)) {
-                return -1;
+                return zero_failed();
             }
         }
         FALLOC_FL_ZERO_RANGE => {
             if !zero_data(h, offset, end.min(size)) {
-                return -1;
+                return zero_failed();
             }
             if !keep && end > size && !set_size(h, end) {
-                return -1;
+                return crate::windows_fd::raw_failed();
             }
         }
         0 => {
             if !keep && end > size && !set_size(h, end) {
-                return -1;
+                return crate::windows_fd::raw_failed();
             }
             if !fill_holes(fd, h, offset, if keep { end.min(size) } else { end }) {
-                return -1;
+                return crate::windows_fd::raw_failed();
             }
         }
         _ => return fail(crate::EOPNOTSUPP),

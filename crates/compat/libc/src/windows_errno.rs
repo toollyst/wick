@@ -155,11 +155,17 @@ pub fn wick_errno_from_win32(code: c_int) -> c_int {
         3 | 15 | 53 | 67 | 161 | 126 | 1168 => ENOENT,
         // ERROR_FILE_EXISTS (CreateFile's CREATE_NEW).
         80 => EEXIST,
-        // ERROR_OUTOFMEMORY, ERROR_COMMITMENT_LIMIT.
-        14 | 1455 => ENOMEM,
+        // ERROR_OUTOFMEMORY, ERROR_COMMITMENT_LIMIT, ERROR_NO_SYSTEM_RESOURCES
+        // (a handle, section or thread the system cannot make),
+        // ERROR_WORKING_SET_QUOTA, ERROR_NOT_ENOUGH_QUOTA (a job's or the
+        // process's quota): Linux's ENOMEM for memory it cannot give.
+        14 | 1455 | 1450 | 1453 | 1816 => ENOMEM,
         // ERROR_HANDLE_DISK_FULL.
         39 => ENOSPC,
-        // ERROR_NO_DATA: a pipe being closed at the other end.
+        // ERROR_NO_DATA from a write: "The pipe is being closed". From a
+        // non-blocking ReadFile it is an empty pipe, EAGAIN: that call site
+        // maps it itself (read_handle), as std's callers must
+        // (Firecracker's serial input, patch 0019).
         232 => EPIPE,
         // ERROR_SEM_TIMEOUT, WAIT_TIMEOUT, ERROR_TIMEOUT.
         121 | 258 | 1460 => ETIMEDOUT,
@@ -176,6 +182,8 @@ pub fn wick_errno_from_win32(code: c_int) -> c_int {
         10022 => EINVAL,
         10063 => ENAMETOOLONG,
         10066 => ENOTEMPTY,
+        // WSAEOPNOTSUPP: an operation the socket does not support.
+        10045 => EOPNOTSUPP,
         _ => code,
     }
 }
@@ -190,12 +198,22 @@ mod tests {
     // its meaning; an unknown code is kept.
     #[test]
     fn test_synonyms_give_the_constant() {
-        for e in [ENOENT, EEXIST, ENOMEM, EINVAL, EBADF, EFAULT, EPIPE, ETIMEDOUT, EPERM, EACCES, EBUSY, EAGAIN, EINTR] {
-            assert_eq!(wick_errno_from_win32(e), e);
+        // Every constant is its own value, so normalising errno twice is
+        // normalising it once.
+        for e in [
+            EPERM, ENOENT, ESRCH, EINTR, EIO, ENXIO, E2BIG, ENOEXEC, EBADF, ECHILD, EAGAIN, ENOMEM, EACCES,
+            EFAULT, EBUSY, EEXIST, EXDEV, ENODEV, ENOTDIR, EISDIR, EINVAL, ENFILE, EMFILE, ENOTTY, EFBIG,
+            ENOSPC, ESPIPE, EROFS, EMLINK, EPIPE, ERANGE, EDEADLK, ENAMETOOLONG, ENOSYS, ENOTEMPTY,
+            EOVERFLOW, ECANCELED, EOPNOTSUPP, EPROTO, ETIMEDOUT, EADDRINUSE, EADDRNOTAVAIL, ECONNREFUSED,
+            ECONNRESET, ECONNABORTED, ENOTCONN, EISCONN, ENOBUFS, EMSGSIZE, EINPROGRESS, EALREADY, ENOTSOCK,
+            EAFNOSUPPORT, ENETUNREACH, EHOSTUNREACH, EPROTONOSUPPORT, ENOPROTOOPT,
+        ] {
+            assert_eq!(wick_errno_from_win32(e), e, "{e}");
         }
         for (code, e) in [
             (3, ENOENT), (15, ENOENT), (53, ENOENT), (67, ENOENT), (161, ENOENT), (126, ENOENT), (1168, ENOENT),
-            (80, EEXIST), (14, ENOMEM), (1455, ENOMEM), (39, ENOSPC), (232, EPIPE),
+            (80, EEXIST), (14, ENOMEM), (1455, ENOMEM), (1450, ENOMEM), (1453, ENOMEM), (1816, ENOMEM),
+            (39, ENOSPC), (232, EPIPE), (10045, EOPNOTSUPP),
             (121, ETIMEDOUT), (258, ETIMEDOUT), (1460, ETIMEDOUT), (1314, EPERM), (1004, EINVAL), (1784, EFAULT),
             (10009, EBADF), (10014, EFAULT), (10022, EINVAL), (10063, ENAMETOOLONG), (10066, ENOTEMPTY),
         ] {

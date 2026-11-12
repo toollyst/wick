@@ -127,11 +127,16 @@ pub const SEEK_DATA: c_int = 3;
 /// `lseek`: the next hole at or after the offset (the end of the file is one).
 pub const SEEK_HOLE: c_int = 4;
 
+/// Sets errno to `e`, or to the `E*` constant of its meaning where `e` is
+/// a Win32 or Winsock code Windows uses beside it
+/// ([`crate::wick_errno_from_win32`]: `WSAEINVAL` is `EINVAL`,
+/// `ERROR_HANDLE_DISK_FULL` `ENOSPC`), so that what upstream compares with
+/// `libc::EX` matches whichever code the Windows call gave.
 pub(crate) fn set_errno(e: c_int) {
     #[allow(clippy::cast_sign_loss)]
     // SAFETY: sets the thread's last error.
     unsafe {
-        SetLastError(e as u32)
+        SetLastError(crate::wick_errno_from_win32(e) as u32)
     };
 }
 
@@ -140,6 +145,13 @@ fn last_error() -> c_int {
     #[allow(clippy::cast_possible_wrap)]
     let e = unsafe { GetLastError() } as c_int;
     e
+}
+
+/// `-1`, with errno the error the last Windows call left as the `E*`
+/// constant of its meaning ([`set_errno`]).
+pub(crate) fn raw_failed<T: From<i8>>() -> T {
+    set_errno(last_error());
+    T::from(-1)
 }
 
 /// The handle `fd` names.
@@ -228,10 +240,13 @@ pub mod wick_signal {
     }
 }
 
+/// `WSAESHUTDOWN`.
+const WSAESHUTDOWN: c_int = 10058;
+
 /// A Winsock error of a write whose peer is gone (WSAESHUTDOWN,
 /// WSAECONNRESET, WSAECONNABORTED).
 fn peer_gone(err: c_int) -> bool {
-    matches!(err, 10058 | 10054 | 10053)
+    matches!(err, WSAESHUTDOWN | crate::ECONNRESET | crate::ECONNABORTED)
 }
 
 /// Descriptor attachments: state that belongs to the object a descriptor
@@ -475,7 +490,7 @@ fn read_handle(h: HANDLE, buf: *mut c_void, count: usize, at: Option<i64>) -> ss
                 set_errno(crate::EAGAIN);
                 return -1;
             }
-            _ => return -1,
+            _ => return raw_failed(),
         }
     }
     n as ssize_t
@@ -504,7 +519,7 @@ fn write_handle(h: HANDLE, buf: *const c_void, count: usize, at: Option<i64>) ->
             set_errno(crate::EPIPE);
             wick_signal::broken_pipe();
         }
-        return -1;
+        return raw_failed();
     }
     // A non-blocking pipe that is full takes nothing.
     if n == 0 && count > 0 && wick_fd::flags(to_fd(h)).load(Ordering::Relaxed) & O_NONBLOCK != 0 {
@@ -531,6 +546,12 @@ pub unsafe fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
         // SAFETY: the caller's contract.
         let n = unsafe { recv(socket(fd), buf.cast(), len, 0) };
         if n == SOCKET_ERROR {
+            // WSAESHUTDOWN: this end's receiving was shut down, which
+            // Linux's recv reads as the end (0).
+            // SAFETY: reads the thread's last Winsock error.
+            if unsafe { WSAGetLastError() } == WSAESHUTDOWN {
+                return 0;
+            }
             wsa_errno();
             if errno() == crate::EWOULDBLOCK {
                 wick_fd::drained(fd);
@@ -556,7 +577,7 @@ pub unsafe fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
         let mut pos = 0i64;
         // SAFETY: queries the position.
         if unsafe { SetFilePointerEx(handle(fd), 0, &mut pos, FILE_CURRENT) } == 0 {
-            return -1;
+            return raw_failed();
         }
         let Some(count) = within(limit, pos, count) else {
             return -1;
@@ -570,6 +591,10 @@ pub unsafe fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
         if n == SOCKET_ERROR {
             wsa_errno();
             if peer_gone(last_error()) {
+                // WSAESHUTDOWN: Linux's send after a shutdown is EPIPE.
+                if last_error() == WSAESHUTDOWN {
+                    set_errno(crate::EPIPE);
+                }
                 wick_signal::broken_pipe();
             }
             return -1;
@@ -585,7 +610,7 @@ fn keeping_position(h: HANDLE, f: impl FnOnce() -> ssize_t) -> ssize_t {
     let mut pos = 0i64;
     // SAFETY: queries the position.
     if unsafe { SetFilePointerEx(h, 0, &mut pos, FILE_CURRENT) } == 0 {
-        return -1;
+        return raw_failed();
     }
     let r = f();
     let err = last_error();
@@ -839,11 +864,11 @@ pub unsafe fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t {
     if whence == SEEK_DATA || whence == SEEK_HOLE {
         let h = handle(fd);
         let Some(to) = seek_data_hole(h, offset, whence == SEEK_DATA) else {
-            return -1;
+            return raw_failed();
         };
         // SAFETY: plain call.
         if unsafe { SetFilePointerEx(h, to, std::ptr::null_mut(), FILE_BEGIN) } == 0 {
-            return -1;
+            return raw_failed();
         }
         return to;
     }
@@ -866,7 +891,7 @@ pub unsafe fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t {
     let mut pos = 0i64;
     // SAFETY: plain call.
     if unsafe { SetFilePointerEx(h, offset, &mut pos, method) } == 0 {
-        return -1;
+        return raw_failed();
     }
     pos
 }
@@ -911,7 +936,7 @@ pub unsafe fn fsync(fd: c_int) -> c_int {
     }
     // SAFETY: plain call.
     if unsafe { FlushFileBuffers(h) } == 0 {
-        return -1;
+        return raw_failed();
     }
     0
 }
@@ -940,7 +965,7 @@ pub unsafe fn ftruncate(fd: c_int, length: off_t) -> c_int {
         let mut size = 0i64;
         // SAFETY: valid out-parameter.
         if unsafe { GetFileSizeEx(handle(fd), &mut size) } == 0 {
-            return -1;
+            return raw_failed();
         }
         if length < size || (length > size && s.grow_sealed()) {
             set_errno(crate::EPERM);
@@ -954,7 +979,7 @@ pub unsafe fn ftruncate(fd: c_int, length: off_t) -> c_int {
             if SetFilePointerEx(h, length, std::ptr::null_mut(), FILE_BEGIN) == 0
                 || SetEndOfFile(h) == 0
             {
-                -1
+                raw_failed()
             } else {
                 0
             }
@@ -1037,11 +1062,11 @@ pub unsafe fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
     };
     let new = dup_inherit(oldfd, true);
     if new < 0 {
-        return -1;
+        return raw_failed();
     }
     // SAFETY: plain call; the duplicate becomes the standard handle.
     if unsafe { SetStdHandle(std, handle(new)) } == 0 {
-        return -1;
+        return raw_failed();
     }
     newfd
 }
@@ -1115,7 +1140,7 @@ fn fcntl_impl(fd: c_int, cmd: c_int, arg: usize) -> c_int {
                         )
                     } == 0
                     {
-                        return -1;
+                        return raw_failed();
                     }
                 }
             }
@@ -1234,7 +1259,7 @@ pub unsafe fn fstat(fd: c_int, buf: *mut stat) -> c_int {
                 let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
                 // SAFETY: plain call.
                 if unsafe { GetFileInformationByHandle(h, &mut info) } == 0 {
-                    return -1;
+                    return raw_failed();
                 }
                 // SAFETY: an all-zero info is a valid out-parameter.
                 let mut std_info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
@@ -1248,7 +1273,7 @@ pub unsafe fn fstat(fd: c_int, buf: *mut stat) -> c_int {
                     )
                 } == 0
                 {
-                    return -1;
+                    return raw_failed();
                 }
                 let dir = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
                 st.st_mode = if dir {
@@ -1291,7 +1316,7 @@ pub unsafe fn pipe(fds: *mut c_int) -> c_int {
     let mut w: HANDLE = std::ptr::null_mut();
     // SAFETY: plain call with out-parameters.
     if unsafe { CreatePipe(&mut r, &mut w, std::ptr::null(), 0) } == 0 {
-        return -1;
+        return raw_failed();
     }
     for h in [r, w] {
         // SAFETY: our new handles.
@@ -1350,7 +1375,7 @@ pub unsafe fn sysconf(name: c_int) -> crate::c_long {
             ms.dwLength = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).unwrap();
             // SAFETY: plain call.
             if unsafe { GlobalMemoryStatusEx(&mut ms) } == 0 {
-                return -1;
+                return raw_failed();
             }
             (ms.ullTotalPhys / u64::from(si.dwPageSize)) as crate::c_long
         }
@@ -1587,6 +1612,24 @@ mod tests {
         std::fs::remove_file(p).unwrap();
     }
 
+    // errno is the constant of what the Windows call meant: a synonym set
+    // (WSAEINVAL) or left by a call (ERROR_HANDLE_DISK_FULL) is the constant.
+    #[test]
+    fn test_errno_is_the_constant_of_its_meaning() {
+        set_errno(10022);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EINVAL));
+        // SAFETY: sets the thread's last error.
+        unsafe { SetLastError(39) };
+        assert_eq!(raw_failed::<ssize_t>(), -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::ENOSPC));
+        // SAFETY: as above.
+        unsafe { SetLastError(1816) };
+        assert_eq!(raw_failed::<c_int>(), -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::ENOMEM));
+        set_errno(crate::EPIPE);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EPIPE));
+    }
+
     #[test]
     fn test_pipe() {
         let mut fds = [0; 2];
@@ -1608,6 +1651,15 @@ mod tests {
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(crate::EAGAIN)
             );
+            // std reads the same empty non-blocking pipe as ERROR_NO_DATA
+            // (232), what Firecracker's serial input (std's Stdin) is given
+            // and patch 0019 takes for EWOULDBLOCK: ReadFile's 232 is an
+            // empty pipe, not the EPIPE of a write's.
+            let reader = std::mem::ManuallyDrop::new(<std::fs::File as std::os::windows::io::FromRawHandle>::from_raw_handle(
+                handle(fds[0]),
+            ));
+            let got = std::io::Read::read(&mut &*reader, &mut b).unwrap_err().raw_os_error();
+            assert_eq!(got, Some(232), "std's read of an empty non-blocking pipe");
             // End of file once the writer is gone.
             assert_eq!(close(fds[1]), 0);
             assert_eq!(fcntl(fds[0], F_SETFL, 0), 0);

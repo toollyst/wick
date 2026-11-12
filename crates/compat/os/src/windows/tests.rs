@@ -32,6 +32,20 @@ fn test_pair() {
     assert_eq!(b.read(&mut buf).unwrap(), 0);
 }
 
+// After shutdown, as on Linux: a write is EPIPE (BrokenPipe), a read of
+// the side shut for reading is the end (0), where Winsock fails both with
+// WSAESHUTDOWN.
+#[test]
+fn test_writes_and_reads_after_shutdown() {
+    let (mut a, mut b) = UnixStream::pair().unwrap();
+    a.shutdown(Shutdown::Write).unwrap();
+    let err = a.write(b"x").unwrap_err();
+    assert_eq!((err.raw_os_error(), err.kind()), (Some(109), std::io::ErrorKind::BrokenPipe));
+    b.shutdown(Shutdown::Read).unwrap();
+    let mut buf = [0u8; 4];
+    assert_eq!(b.read(&mut buf).unwrap(), 0);
+}
+
 #[test]
 fn test_listener() {
     let path = temp_path("listener.sock");

@@ -50,6 +50,11 @@ fn last_error() -> io::Error {
     io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
 }
 
+/// `WSAESHUTDOWN`: the socket's direction was shut down.
+const WSAESHUTDOWN: i32 = 10058;
+/// `ERROR_BROKEN_PIPE`, the compat libc's `EPIPE`.
+const EPIPE: i32 = 109;
+
 fn cvt(r: i32) -> io::Result<i32> {
     if r == SOCKET_ERROR {
         Err(last_error())
@@ -375,19 +380,27 @@ impl UnixStream {
     fn recv_with(&self, buf: &mut [u8], flags: i32) -> io::Result<usize> {
         let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
         // SAFETY: the buffer is valid for `len` bytes.
-        let n = cvt(unsafe { recv(self.sock(), buf.as_mut_ptr(), len, flags) })?;
-        Ok(usize::try_from(n).unwrap())
+        match cvt(unsafe { recv(self.sock(), buf.as_mut_ptr(), len, flags) }) {
+            Ok(n) => Ok(usize::try_from(n).unwrap()),
+            // After `shutdown(Read)` Linux's recv reads the end; Winsock's
+            // fails with WSAESHUTDOWN.
+            Err(e) if e.raw_os_error() == Some(WSAESHUTDOWN) => Ok(0),
+            Err(e) => Err(e),
+        }
     }
 
     fn send(&self, buf: &[u8]) -> io::Result<usize> {
         let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
         // SAFETY: the buffer is valid for `len` bytes.
-        let n = cvt(unsafe { send(self.sock(), buf.as_ptr(), len, 0) }).inspect_err(|e| {
-            // WSAESHUTDOWN, WSAECONNRESET, WSAECONNABORTED: the peer is gone.
-            if matches!(e.raw_os_error(), Some(10058 | 10054 | 10053)) {
-                broken_pipe();
-            }
-        })?;
+        let n = cvt(unsafe { send(self.sock(), buf.as_ptr(), len, 0) })
+            .inspect_err(|e| {
+                // WSAESHUTDOWN, WSAECONNRESET, WSAECONNABORTED: the peer is gone.
+                if matches!(e.raw_os_error(), Some(WSAESHUTDOWN | 10054 | 10053)) {
+                    broken_pipe();
+                }
+            })
+            // A send after `shutdown(Write)` is Linux's EPIPE.
+            .map_err(|e| if e.raw_os_error() == Some(WSAESHUTDOWN) { io::Error::from_raw_os_error(EPIPE) } else { e })?;
         Ok(usize::try_from(n).unwrap())
     }
 }

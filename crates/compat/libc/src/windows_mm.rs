@@ -2119,7 +2119,7 @@ pub unsafe fn mincore(addr: *mut c_void, len: size_t, vec: *mut c_uchar) -> c_in
             u32::try_from(n * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()).unwrap();
         // SAFETY: the buffer holds `n` entries.
         if unsafe { QueryWorkingSetEx(proc(), info.as_mut_ptr().cast(), bytes) } == 0 {
-            return -1;
+            return crate::windows_fd::raw_failed();
         }
         for (k, e) in info.iter().enumerate() {
             // SAFETY: reads the flags of the union.
@@ -2152,7 +2152,7 @@ pub unsafe fn msync(addr: *mut c_void, len: size_t, flags: c_int) -> c_int {
         if let Kind::View { file, .. } = &r.kind {
             // SAFETY: flushes our view.
             if unsafe { FlushViewOfFile(s as *const c_void, e - s) } == 0 {
-                return -1;
+                return crate::windows_fd::raw_failed();
             }
             if let (true, Some(f)) = (flags & MS_SYNC != 0, file) {
                 // SAFETY: flushes the file of our view.
