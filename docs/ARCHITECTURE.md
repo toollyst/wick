@@ -30,7 +30,7 @@ overlay/vmm/          modules compiled into upstream's vmm crate
 crates/compat/        compatibility builds of Linux-only dependencies
 crates/ext/           wick-ext: wick's features behind vmm::ext
 crates/version/       wick-version: the version the binaries report
-tools/                setup, patch workflow, generators, Linux tests against upstream and boot test, macOS run/test/boot test, vhost-user-blk test backend, Windows boot test and probe, release, fuzzing
+tools/                setup, patch workflow, generators, Linux tests against upstream and boot test, macOS run/test/boot and jailer tests, vhost-user-blk test backend, Windows boot and jailer tests and probes, upstream's integration tests on macOS and Windows, release, fuzzing
 fuzz/                 fuzz targets for wick's own code: a crate of its own, outside upstream's workspace
 docs/                 the documentation (docs/README.md is the index)
 ```
@@ -120,7 +120,7 @@ firecracker binary, vmm   (upstream source + patches/)
 | Hypervisor | KVM | Hypervisor.framework (macOS 15+) | Windows Hypervisor Platform |
 | Guest | x86_64, aarch64 | aarch64 | x86_64 |
 | Interrupt controller | KVM vGIC / LAPIC | `hv_gic_*` GICv3 (GICv2m MSI frame instead of an ITS) | WHP LAPIC + user-space IOAPIC, 8259 PIC, 8254 PIT |
-| Process hardening | seccomp-BPF, jailer | Seatbelt, upstream's jailer on macOS backends (`overlay/jailer/platform`) | process mitigation policies (AppContainer and Job Objects: roadmap) |
+| Process hardening | seccomp-BPF, jailer | Seatbelt, upstream's jailer on macOS backends (`overlay/jailer/platform`) | a process mitigation profile, upstream's jailer on Windows backends: a jail drive, a restricted token, a Job Object |
 
 ## The POSIX layer on Windows
 

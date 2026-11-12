@@ -31,8 +31,9 @@ crates/
   ext/                    wick-ext: wick's features behind vmm::ext
   version/                wick-version: the version string every binary reports
 tools/                    everything you run by hand or in CI (below)
-  macos/                  run, test and boot-test on Apple silicon
-  windows/                boot test and host capability probe for a Windows PC
+  macos/                  run, test, boot-test, jailer-test and the integration harness on Apple silicon
+  windows/                boot test, jailer test, integration harness and host probes for a Windows PC
+  linux/                  upstream's unit and integration tests on Linux, compared with plain upstream
   vhost-user-blk/         a vhost-user-blk backend used by the macOS boot test
 fuzz/                     fuzz targets for wick's own code (a crate of its own, CONTRIBUTING.md "Fuzzing")
 docs/                     these pages
@@ -55,7 +56,7 @@ semantics, on that host's facilities.
 | `kvm-bindings` | KVM structures | the original | generated with the Linux x86_64 layout |
 | `libc` | Linux-only libc | `fallocate`, `memfd_create`, the userfaultfd kernel side (`wick_uffd`), ... | the POSIX layer over Win32: fds as handles, mmap, sockets, signals (`wick_fd`) |
 | `vmm-sys-util` | eventfd, epoll, timerfd, signals | pipes, kqueue, timer threads | IOCP, sections, waitable timers |
-| `userfaultfd` | the userfaultfd API | on the userfaultfd kernel side in the compatibility `libc` | the API builds; creating a userfaultfd fails until it is implemented (roadmap) |
+| `userfaultfd` | the userfaultfd API | on the userfaultfd kernel side in the compatibility `libc` | the same, on its Windows kernel side (`libc::wick_uffd`, `windows_uffd.rs`) |
 | `memfd` | memfd and seals | an unlinked POSIX shared memory object | an unnamed temporary file; size seals are sections |
 | `os`, `std` | `std::os::{unix, fd}` | re-exported | the same traits and types on handles |
 | `vm-memory`, `event-manager`, `micro-http`, `vhost` | rust-vmm crates | the original | upstream's source with mechanical rewrites, generated |
@@ -79,13 +80,14 @@ tools/patches.sh check                  # what CI checks about patches/
 | Tool | What it does |
 | --- | --- |
 | [`tools/setup.sh`](../tools/setup.sh) | Checks out upstream at `patches/base` and applies the series as commits on branch `wick` (`--force` discards local commits) |
-| [`tools/patches.sh`](../tools/patches.sh) | `export` writes `patches/` from branch `wick`; `check` verifies it matches, that every changed upstream file carries a `wick:` comment and that the submodule is at `patches/base` |
+| [`tools/patches.sh`](../tools/patches.sh) | `export` writes `patches/` from branch `wick`; `check` verifies it matches, that every changed upstream file carries a `wick:` comment, that the submodule is at `patches/base`, and that README.md and docs/ARCHITECTURE.md count the series and its files right |
 | [`tools/rebase.sh`](../tools/rebase.sh) | Moves the series to a new upstream tag (`--finish` after resolving conflicts) |
 | [`tools/macos/run.sh`](../tools/macos/run.sh) | Builds, signs with the Hypervisor.framework entitlement and runs `firecracker` |
 | [`tools/macos/test.sh`](../tools/macos/test.sh) | Runs unit tests with the entitlement (through [`sign-and-run.sh`](../tools/macos/sign-and-run.sh) as the cargo runner) |
-| [`tools/macos/boot-test.sh`](../tools/macos/boot-test.sh) | Scenario tests against upstream's aarch64 CI guest: boot, SMP, block, vsock, net, vmnet, snapshots, diff, uffd, PCI, vhost-user, devices (logger, metrics, MMDS, balloon, entropy, rate limiter), balloon (cycles after a restore from file and on a booted guest: the guest keeps the host's pages, the footprint follows the balloon), restores (one snapshot restored and snapshotted again 20 times, for races between vCPU threads) |
-| [`tools/macos/jailer-test.sh`](../tools/macos/jailer-test.sh) | The jailer's scenario tests, as root: refused options, uid/gid and chroot, files outside the jail, daemonize, jetsam and CPU limits, a jailed guest booted, snapshot, restored, killed past its memory limit and held to its CPU limit |
-| [`tools/windows/boot-test.ps1`](../tools/windows/boot-test.ps1) | Scenario tests against upstream's x86_64 CI guest on WHP: boot, SMP, block, vsock, net ([steps](../tools/windows/README.md)) |
+| [`tools/macos/boot-test.sh`](../tools/macos/boot-test.sh) | Scenario tests against upstream's aarch64 CI guest: boot, SMP, block, vsock, net, vmnet, snapshots, diff, uffd, PCI, vhost-user, devices (logger, metrics, MMDS, balloon, entropy, rate limiter), balloon (cycles after a restore from file and on a booted guest: the guest keeps the host's pages, the footprint follows the balloon), restores (one snapshot restored and snapshotted again 20 times, for races between vCPU threads), hugepages, api-process, cli (exit codes, start time flags, logger and metrics on FIFOs), tools (`rebase-snap`, `snapshot-editor`), no-seccomp, memory-hotplug (virtio-mem) |
+| [`tools/macos/jailer-test.sh`](../tools/macos/jailer-test.sh) | The jailer's scenario tests, as root: refused options, uid/gid and chroot, files outside the jail, daemonize, `--new-pid-ns`, jetsam, CPU and resource limits read back, `fsize`, a jailed guest booted without and with the API, on its own network (`--netns`), killed past its memory limit, held to its CPU limit, on huge pages, restored through a uffd handler and with a vhost-user drive |
+| [`tools/windows/boot-test.ps1`](../tools/windows/boot-test.ps1) | Scenario tests against upstream's x86_64 CI guest on WHP: the macOS stages but `vmnet`, and `foreign-snapshot` and `gdb` ([steps](../tools/windows/README.md)) |
+| [`tools/windows/jailer-test.ps1`](../tools/windows/jailer-test.ps1) | The jailer's scenario tests on WHP: refused options, the jail's isolation, links, handles, daemonize, pidns, netns, the API process, Job Object limits, hugepages, uffd and vhost-user under the jailer ([stages](../tools/windows/README.md)) |
 | [`tools/windows/winprobe.c`](../tools/windows/winprobe.c) | Measures the Windows mechanisms the sandbox and jailer backends use |
 | [`tools/gen-windows-sources.sh`](../tools/gen-windows-sources.sh) | Generates the Windows builds of the rust-vmm crates (`--check` in CI) |
 | [`tools/gen-kvm-bindings-windows.sh`](../tools/gen-kvm-bindings-windows.sh) | Generates `kvm-bindings` with the Linux x86_64 layout for Windows (`--check` in CI) |

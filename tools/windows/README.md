@@ -5,35 +5,47 @@
 - `winprobe.c` (`winprobe.exe` in CI's artifact): measures the host
   mechanisms the sandbox and jailer backends use.
 - `jailer-test.ps1`: the jailer on WHP hardware, the counterpart of
-  `tools/macos/jailer-test.py`. Stages: `refuse` (what Windows cannot
-  enforce is refused, each cgroup controller with its reason), `cpuset`
-  (`cpuset.cpus` is the jailed process's affinity), `weight` (two jailed
-  processes at `cpu.weight` 50 and 100 sharing one processor), `isolation` (`jail-probe.rs`, run through the jailer
-  as the jailed binary, may not read the user's files or SAM, write outside
-  its jail, reach another jail's files, API socket or process, or open the
-  operator's; the operator reaches the API socket), `netns` (two jails with
-  a network each: a jail reaches its own network's endpoint and not the
-  other's, is denied TCP and UDP, and an unelevated jailer is refused the
-  flag; needs an elevated PowerShell), `handoff` (a handle and a socket
-  held by a jailed process are pulled out by the operator and by a
-  medium-integrity process of the user), `api` (the jail runs Firecracker
-  and its API server's process, the latter under the whole mitigation
-  profile; each one's end ends the other), `boot` (a 2 vCPU guest
-  in the jail), `limits` (`memory.max`), `cpu` (`cpu.max` from Firecracker's start: twelve boots under
-  it, each vCPU's local timer in TSC-deadline mode), `hugepages` (the jail
-  keeps "Lock pages in memory" and no other privilege but traversal, the
-  job's memory limit holds large pages, and a jailed guest boots on 2 MiB
-  pages; needs the privilege, as the boot test's stage does), and a check
-  that every jail's drive letter was removed. It needs the boot test's
-  guest files (`-Assets`, default `C:\wbt`) and `rustc` for the probe:
+  `tools/macos/jailer-test.py`. Stages without a guest: `refuse` (what
+  Windows cannot enforce is refused, each cgroup controller and resource
+  limit with its reason), `cpuset` (`cpuset.cpus` is the jailed process's
+  affinity), `weight` (two jailed processes at `cpu.weight` 50 and 100
+  sharing one processor), `low` (a low-integrity process of the user is kept
+  out of a jail), `links` (a jail makes no hard link to a file outside it and
+  no entry above its root), `nofile` (no handle limit: records the missing
+  guarantee and fails once something bounds the handles), `sections`
+  (`memory.max` against sections: fails today, as a Job Object does not
+  charge them), `daemonize`, `handles` (a handle the jailer inherited is not
+  open in the jail), `pidns` (no process, thread or console of anyone else;
+  needs a console), `handoff` (a handle and a socket held by a jailed process
+  are pulled out by the operator and by a medium-integrity process of the
+  user), `netns` (two jails with a network each: a jail reaches its own
+  network's endpoint and not the other's, is denied TCP and UDP, and an
+  unelevated jailer is refused the flag; needs an elevated PowerShell) and
+  `api` (the jail runs Firecracker and its API server's process, the latter
+  under the whole mitigation profile; each one's end ends the other). With a
+  guest: `netguest` (frames through the network directory's endpoint),
+  `isolation` (`jail-probe.rs`, run through the jailer as the jailed binary,
+  may not read the user's files or SAM, write outside its jail, reach another
+  jail's files, API socket or process, or open the operator's; the operator
+  reaches the API socket), `boot` (a 2 vCPU guest in the jail), `limits`
+  (`memory.max` below the guest's memory: the VMM ends with 137), `memory`
+  (a guest past the limit ends the VMM, and runs on under a larger one),
+  `cpu` (`cpu.max` from Firecracker's start: twelve boots under it, each
+  vCPU's local timer in TSC-deadline mode), `hugepages` (the jail keeps no
+  privilege but traversal and gets its 2 MiB pages from the jailer, bounded
+  by `hugetlb.2MB.max`; needs "Lock pages in memory", as the boot test's
+  stage does), `uffd` and `vhost-user` (a jailed guest's memory handed to a
+  handler or a backend of the operator); and a check that every jail's drive
+  letter was removed. It needs the boot test's guest files (`-Assets`,
+  default `C:\wbt`) and `rustc` for the probe:
 
   ```
   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir C:\wjt
   ```
 
-CI builds both on every push and uploads them as the artifact
+CI builds the binaries on every push and uploads them as the artifact
 `wick-windows-x86_64-<commit>`: `lib/firecracker/build/cargo_target/release/firecracker.exe`,
-`snapshot-editor.exe` and `examples/uffd_on_demand_handler.exe` next to it,
+`snapshot-editor.exe`, `jailer.exe` and `examples/uffd_on_demand_handler.exe` next to it,
 `lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe` (the
 vhost-user test backend), `winprobe.exe`, `tools/windows/boot-test.ps1` and
 this file, at those paths.
@@ -88,7 +100,7 @@ the firmware, and nothing else installed: the script is Windows PowerShell 5.1.
 
 ## What the boot test checks
 
-Every stage boots its own VM; before each guest reset the guest kernel log
+Every stage that needs a guest boots its own VM; before each guest reset the guest kernel log
 must be free of RCU stalls, soft lockups, hung tasks, BUGs, oopses and
 warnings, and the reset must end Firecracker with exit status 0.
 
@@ -104,12 +116,14 @@ warnings, and the reset must end Firecracker with exit status 0.
 | `uffd` | the `snapshot` stage's snapshot restored with the Uffd memory backend, its pages served by upstream's `uffd_on_demand_handler` in another process |
 | `api-process` | the API server's HTTP side runs in a process of its own with the whole mitigation profile (this shell under none), serves the API; killing it ends Firecracker, and Firecracker's end ends it |
 | `pci` | the `snapshot` stage over virtio-pci with MSI-X (`--enable-pci`) |
+| `restores` | one snapshot restored 20 times, each paused and snapshotted again (vCPU races at the restore and at the pause) |
 | `vhost-user` | a vhost-user-blk drive served by `vhost-user-blk.exe` in another process: the guest reads its content, a guest write reaches the image |
 | `hugepages` | guest memory on 2 MiB large pages (`huge_pages: "2M"`): boots and keeps 160 MiB written to it. Needs "Lock pages in memory" for the account (`secpol.msc`, Local Policies, User Rights Assignment; sign out and in), as hugetlbfs on Linux needs huge pages reserved |
-
+| `devices` | virtio-rng, a rate-limited drive, MMDS V2 over the net endpoint, the balloon and its statistics, the logger's and the metrics' files |
+| `balloon` | 150 MiB balloon cycles on a guest restored from a memory file and on a booted one: O_DIRECT reads of the drive read the file, and the commit charge goes down and up again with the balloon |
 | `cli` | exit codes 153 (bad arguments), 152 (bad `--level`), 1 (bad configuration file), without a guest; `--module`; the start time metrics of `--start-time-us`, `--start-time-cpu-us`, `--parent-cpu-time-us`; the log and the metrics on named pipes (the counterpart of a FIFO), with a pipe nobody reads and one whose reader leaves; `--boot-timer` with upstream's `/usr/local/bin/init` |
 | `tools` | `rebase-snap` and `snapshot-editor edit-memory rebase` on a sparse and a dense synthetic diff file (the dense one refused, the base untouched), without a guest; then a diff snapshot (written as a sparse file) rebased by both alike and restored; `snapshot-editor info-vmstate` `version`, `vcpu-states`, `vm-state`; the state file with the aarch64 magic or a newer version refused at the load |
-| `no-seccomp` | without `--no-seccomp` the setup-phase mitigations are in force in Firecracker and the whole profile in its API process; with it none in either. No guest |
+| `no-seccomp` | without `--no-seccomp` the setup-phase mitigations are in force in Firecracker and the whole profile in its API process; with it none in either. Before a boot (no guest), then with a guest running |
 | `foreign-snapshot` | a state file made on another host, given as `-ForeignState <file>` (the macOS boot test's snapshot stage makes an aarch64 one), is refused at the load and Firecracker ends. No guest |
 | `memory-hotplug` | virtio-mem: 512 MiB plugged into a 512 MiB guest, seen in `MemTotal`, 600 MiB written and read back, then unplugged |
 | `gdb` | not in `all`: Firecracker built with the gdb feature (`-GdbFirecracker`) and gdb (`-Gdb`, or MSYS2's `gdb-multiarch`) on upstream's debug kernel: a hardware breakpoint at `start_kernel`, the kernel's bytes read through the stub as in the vmlinux, a software breakpoint at `rest_init`, the guest boots on. gdb reaches the gdb socket by its path, or through a TCP relay of the stage's own |
@@ -119,9 +133,6 @@ warnings, and the reset must end Firecracker with exit status 0.
 The results folder holds, per stage, the VM config, the serial console, the
 Firecracker log at debug level and the guest kernel log, plus `host.txt`
 (Windows build, CPU, WHP state) and `summary.txt`.
-
-Not implemented on Windows yet, listed as `N/A` in the summary and not run:
-the jailer (docs/ROADMAP.md).
 
 If WHP is not usable, every stage fails with the reason the script found
 before starting, for example "the Windows hypervisor is not running".
