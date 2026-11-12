@@ -19,6 +19,13 @@ set -euo pipefail
 
 dir="$1"
 E2=/opt/homebrew/opt/e2fsprogs/sbin
+# Upstream's devctr (Ubuntu 24.04) makes the 500 MiB image with 4 KiB blocks,
+# the guest's page size, which an ext4 mounted with DAX needs (test_pmem.py's
+# rootflags=dax); Homebrew's e2fsprogs gives an image under 512 MiB 1 KiB
+# blocks ("EXT4-fs (pmem0): unsupported blocksize for DAX"). The test
+# session's configuration (tools/macos/integration-tests.sh) is used here too.
+export MKE2FS_CONFIG
+MKE2FS_CONFIG="$(cd "$(dirname "$0")" && pwd)/mke2fs.conf"
 for t in unsquashfs mksquashfs; do
     command -v "$t" >/dev/null || { echo "error: $t missing: brew install squashfs" >&2; exit 1; }
 done
@@ -101,7 +108,11 @@ PY
 
 for squashfs in *.squashfs; do
     name="${squashfs%.squashfs}"
-    [[ -s "$squashfs.orig" && -s "$name.ext4" ]] && continue
+    # An image made before it had 4 KiB blocks is made again.
+    if [[ -s "$squashfs.orig" && -s "$name.ext4" ]] &&
+        [[ "$("$E2/dumpe2fs" -h "$name.ext4" 2>/dev/null | awk '/^Block size:/ { print $3 }')" == 4096 ]]; then
+        continue
+    fi
     echo "setting up $name"
     src="$squashfs"
     [[ -s "$squashfs.orig" ]] && src="$squashfs.orig"
@@ -119,6 +130,7 @@ for squashfs in *.squashfs; do
     chmod -R u+rwX "$tree"
     mkdir -p "$tree/root/.ssh"
     cp id_rsa.pub "$tree/root/.ssh/authorized_keys"
+    rm -f "$name.id_rsa"  # found read-only (0400) when made again
     cp id_rsa "$name.id_rsa"
     [[ -s "$squashfs.orig" ]] || mv "$squashfs" "$squashfs.orig"
     mksquashfs "$tree" "$squashfs" -all-root -root-mode "$(cat owners.root)" -pf owners.pseudo \

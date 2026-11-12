@@ -702,6 +702,32 @@ def request_mapping_files(self, method, path, **kwargs):
 _http_api.Resource.request = request_mapping_files
 
 
+def rss_anon_kib(pid):
+    """`RssAnon:` of /proc/<pid>/status (KiB) on macOS: what test_pmem's
+    `outside_rssanon` reads with `cat /proc/<pid>/status`.
+
+    Linux: the resident pages of the process's anonymous mappings (private
+    or shared anonymous memory; guest memory not backed by a file is one).
+    macOS: the resident pages of the regions that map no file (no vnode
+    path in proc_pidinfo(PROC_PIDREGIONPATHINFO)), without the dyld shared
+    cache, as `memory_maps` reads them. For an anonymous region the object's
+    resident pages are the process's (a mapped file's are the buffer
+    cache's, which is why `get_resident_memory` does not use this)."""
+    return sum(m.rss for m in memory_maps(psutil.Process(pid), grouped=False) if not m.path) // 1024
+
+
+def _outside_rssanon(vm):
+    return rss_anon_kib(vm.firecracker_pid)
+
+
+def pytest_runtest_setup(item):
+    """test_pmem reads RssAnon from /proc, which macOS does not have: its
+    helper reads it as `rss_anon_kib` does."""
+    module = getattr(item, "module", None)
+    if module is not None and module.__name__.endswith("test_pmem") and hasattr(module, "outside_rssanon"):
+        module.outside_rssanon = _outside_rssanon
+
+
 def pytest_report_header():
     """What runs where."""
     return [

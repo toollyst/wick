@@ -111,14 +111,12 @@ all impossible integration_tests/functional/test_uffd.py::test_unbinded_socket
 all bug integration_tests/functional/test_net_config_space.py::test_net_change_mac_address
 
 # The test writes to Firecracker's terminal through /proc/<pid>/fd/0 with
-# TIOCSTI and reads its size with pmap; test_pmem_dax_memory_saving reads
-# RssAnon in /proc/<pid>/status. macOS has no /proc and no pmap; TIOCSTI on a
-# terminal not the caller's controlling one needs root there. To do: the
-# harness opens the terminal by its device (proc_pidfdinfo) and reads the
-# sizes with proc_pidinfo, as wick_macos.memory_maps does.
+# TIOCSTI and reads its size with pmap. macOS has no /proc and no pmap;
+# TIOCSTI on a terminal not the caller's controlling one needs root there.
+# To do: the harness opens the terminal by its device (proc_pidfdinfo) and
+# reads the sizes with proc_pidinfo, as wick_macos.memory_maps does (as
+# wick_macos.rss_anon_kib does for test_pmem_dax_memory_saving's RssAnon).
 all bug integration_tests/functional/test_serial_io.py::test_serial_dos
-all bug integration_tests/functional/test_pmem.py::test_pmem_dax_memory_saving[vmlinux-6.1.188-rw-None-kvm]
-all bug integration_tests/functional/test_pmem.py::test_pmem_dax_memory_saving[vmlinux-6.1.188-rw-Transparent-kvm]
 
 # The guest's cache hierarchy is the host's, which Firecracker on Linux
 # reads in /sys/devices/system/cpu/cpu0/cache and gives the guest in its
