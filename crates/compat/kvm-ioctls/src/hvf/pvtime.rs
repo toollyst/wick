@@ -814,11 +814,15 @@ mod tests {
                 unsafe { vm.create_vcpu_from_rawfd(libc::dup(std::os::unix::io::AsRawFd::as_raw_fd(&vcpu))).unwrap() };
             let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let d = done.clone();
+            // The pauses start once the guest has made its first exit: an
+            // immediate exit before it would end that first run() instead.
+            let (started_tx, started) = std::sync::mpsc::channel();
             let runner = std::thread::spawn(move || {
                 vcpu.set_one_reg(PC, &RAM.to_le_bytes()).unwrap();
                 vcpu.set_one_reg(PSTATE, &0x3c5u64.to_le_bytes()).unwrap();
                 vcpu.set_one_reg(X9, &0x1000u64.to_le_bytes()).unwrap();
                 assert!(matches!(vcpu.run().unwrap(), VcpuExit::MmioWrite(..)));
+                started_tx.send(()).unwrap();
                 let mut pauses = 0;
                 while !d.load(std::sync::atomic::Ordering::Acquire) {
                     let e = vcpu.run().map(|_| ()).unwrap_err();
@@ -828,6 +832,7 @@ mod tests {
                 }
                 pauses
             });
+            started.recv().unwrap();
             for _ in 0..50 {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 other.set_kvm_immediate_exit(1);
