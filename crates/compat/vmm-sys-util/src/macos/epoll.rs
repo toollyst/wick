@@ -11,8 +11,16 @@
 //! Mapping:
 //! - level-triggered by default, like epoll; [`EventSet::EDGE_TRIGGERED`] maps
 //!   to `EV_CLEAR` and [`EventSet::ONE_SHOT`] to `EV_DISPATCH`;
-//! - `EV_EOF` is reported as [`EventSet::HANG_UP`] and
-//!   [`EventSet::READ_HANG_UP`], `EV_ERROR` as [`EventSet::ERROR`];
+//! - the end of a stream is reported as Linux's poll functions report it,
+//!   by the descriptor's kind (see [`Kind`]): a socket whose receiving side
+//!   is shut (`EV_EOF` on `EVFILT_READ`) is readable with
+//!   [`EventSet::READ_HANG_UP`], and [`EventSet::HANG_UP`] only once both
+//!   sides are shut; a pipe's read end is readable only with data and hangs
+//!   up once no writer is left, its write end gets [`EventSet::ERROR`] once
+//!   no reader is left; a socket error (`EV_EOF`'s `fflags`) is
+//!   [`EventSet::ERROR`];
+//! - as epoll, [`EventSet::READ_HANG_UP`] only when asked for,
+//!   [`EventSet::HANG_UP`] and [`EventSet::ERROR`] always;
 //! - [`EventSet::PRIORITY`], [`EventSet::WAKE_UP`] and
 //!   [`EventSet::EXCLUSIVE`] are accepted and ignored.
 
@@ -28,8 +36,98 @@ pub use crate::epoll_types::{ControlOperation, EpollEvent, EventSet, epoll_event
 #[derive(Debug)]
 pub struct Epoll {
     kq: RawFd,
-    /// Registered descriptors, their user data and events.
-    interests: Mutex<HashMap<RawFd, (u64, EventSet)>>,
+    /// Registered descriptors, their user data, events and kind.
+    interests: Mutex<HashMap<RawFd, (u64, EventSet, Kind)>>,
+}
+
+/// What a descriptor is, for how the end of its stream is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// net/unix/af_unix.c `unix_poll`, net/ipv4/tcp.c `tcp_poll`.
+    Socket,
+    /// fs/pipe.c `pipe_poll`.
+    Pipe,
+    Other,
+}
+
+impl Kind {
+    fn of(fd: RawFd) -> Kind {
+        // SAFETY: an all-zero stat is a valid output buffer.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is a valid output buffer; a bad `fd` fails.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return Kind::Other;
+        }
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFSOCK => Kind::Socket,
+            libc::S_IFIFO => Kind::Pipe,
+            _ => Kind::Other,
+        }
+    }
+}
+
+/// Which sides of socket `fd` are shut (receiving, sending), as kqueue's
+/// `EV_EOF` on its read and write filters tells it, asked of a kqueue of its
+/// own so that a side the caller has no filter for is known too.
+fn shut_sides(fd: RawFd) -> (bool, bool) {
+    // SAFETY: kqueue() takes no arguments; the result is checked.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return (false, false);
+    }
+    let changes = [
+        kevent_for(fd, libc::EVFILT_READ, libc::EV_ADD),
+        kevent_for(fd, libc::EVFILT_WRITE, libc::EV_ADD),
+    ];
+    let mut out = [kevent_for(0, 0, 0); 2];
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: both buffers hold two kevents; `kq` is ours.
+    let n = unsafe { libc::kevent(kq, changes.as_ptr(), 2, out.as_mut_ptr(), 2, &zero) };
+    // SAFETY: closing the kqueue made above.
+    unsafe { libc::close(kq) };
+    let eof = |filter| {
+        out.iter()
+            .take(usize::try_from(n).unwrap_or(0))
+            .any(|e| e.filter == filter && e.flags & libc::EV_EOF != 0 && e.flags & libc::EV_ERROR == 0)
+    };
+    (eof(libc::EVFILT_READ), eof(libc::EVFILT_WRITE))
+}
+
+/// The events a fired filter stands for on a descriptor of `kind`, as
+/// Linux's poll function for it reports them.
+fn events_for(fd: RawFd, kind: Kind, ev: &libc::kevent) -> EventSet {
+    let read = ev.filter == libc::EVFILT_READ;
+    let eof = ev.flags & libc::EV_EOF != 0;
+    let mut bits = if read { EventSet::IN } else { EventSet::OUT };
+    if !eof {
+        return bits;
+    }
+    match kind {
+        Kind::Socket => {
+            // A socket error comes with the end of the stream (so_error).
+            if ev.fflags != 0 {
+                bits |= EventSet::ERROR;
+            }
+            let (rcv, snd) = shut_sides(fd);
+            if rcv {
+                bits |= EventSet::IN | EventSet::READ_HANG_UP;
+            }
+            if rcv && snd {
+                bits |= EventSet::HANG_UP;
+            }
+        }
+        Kind::Pipe if read => {
+            // Readable only while there is data; no writer left: hang-up.
+            if ev.data == 0 {
+                bits.remove(EventSet::IN);
+            }
+            bits |= EventSet::HANG_UP;
+        }
+        // No reader left on a pipe's write end: an error.
+        Kind::Pipe => bits |= EventSet::ERROR,
+        Kind::Other => bits |= EventSet::HANG_UP,
+    }
+    bits
 }
 
 fn kevent_for(fd: RawFd, filter: i16, flags: u16) -> libc::kevent {
@@ -134,14 +232,14 @@ impl Epoll {
                     return Err(io::Error::from_raw_os_error(libc::EEXIST));
                 }
                 self.apply(&Self::filter_changes(fd, event.event_set()))?;
-                interests.insert(fd, (event.data(), event.event_set()));
+                interests.insert(fd, (event.data(), event.event_set(), Kind::of(fd)));
             }
             ControlOperation::Modify => {
                 if !interests.contains_key(&fd) {
                     return Err(io::Error::from_raw_os_error(libc::ENOENT));
                 }
                 self.apply(&Self::filter_changes(fd, event.event_set()))?;
-                interests.insert(fd, (event.data(), event.event_set()));
+                interests.insert(fd, (event.data(), event.event_set(), Kind::of(fd)));
             }
             ControlOperation::Delete => {
                 if interests.remove(&fd).is_none() {
@@ -179,7 +277,7 @@ impl Epoll {
         if unsafe { libc::fcntl(self.kq, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        for (&fd, &(_, events)) in interests.iter() {
+        for (&fd, &(_, events, _)) in interests.iter() {
             self.apply(&Self::filter_changes(fd, events))?;
         }
         Ok(())
@@ -224,20 +322,21 @@ impl Epoll {
         for ev in fired.iter().take(usize::try_from(ret).unwrap_or(0)) {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let fd = ev.ident as RawFd;
-            let Some(&(data, _)) = interests.get(&fd) else {
+            let Some(&(data, interest, kind)) = interests.get(&fd) else {
                 continue;
             };
-            let mut bits = EventSet::empty();
-            if ev.filter == libc::EVFILT_READ {
-                bits |= EventSet::IN;
-            } else if ev.filter == libc::EVFILT_WRITE {
-                bits |= EventSet::OUT;
-            }
-            if ev.flags & libc::EV_EOF != 0 {
-                bits |= EventSet::HANG_UP | EventSet::READ_HANG_UP;
-            }
+            let mut bits = if ev.filter == libc::EVFILT_READ || ev.filter == libc::EVFILT_WRITE {
+                events_for(fd, kind, ev)
+            } else {
+                EventSet::empty()
+            };
             if ev.flags & libc::EV_ERROR != 0 {
                 bits |= EventSet::ERROR;
+            }
+            // As epoll: what was asked for, and always hang-up and error.
+            bits &= interest | EventSet::HANG_UP | EventSet::ERROR;
+            if bits.is_empty() {
+                continue;
             }
             let slot = match slot_of.get(&fd) {
                 Some(slot) => *slot,
@@ -381,6 +480,84 @@ mod tests {
         assert!(ready[0].event_set().contains(EventSet::HANG_UP));
         // SAFETY: closing our read end.
         unsafe { libc::close(fds[0]) };
+    }
+
+    /// The events one `wait` reports for `fd` registered with `interest`.
+    fn events_of(fd: RawFd, interest: EventSet) -> EventSet {
+        let epoll = Epoll::new().unwrap();
+        epoll
+            .ctl(ControlOperation::Add, fd, EpollEvent::new(interest, 9))
+            .unwrap();
+        let mut ready = [EpollEvent::default(); 2];
+        assert_eq!(epoll.wait(100, &mut ready).unwrap(), 1, "{interest:?}");
+        ready[0].event_set()
+    }
+
+    fn socketpair() -> [RawFd; 2] {
+        let mut s = [0; 2];
+        // SAFETY: room for two descriptors.
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, s.as_mut_ptr()) }, 0);
+        s
+    }
+
+    fn close(fd: RawFd) {
+        // SAFETY: a descriptor the test owns.
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn test_stream_socket_peer_closed_or_half_closed_as_linux() {
+        // Linux, net/unix/af_unix.c unix_poll: RCV_SHUTDOWN gives EPOLLIN and
+        // EPOLLRDHUP; EPOLLHUP only when both directions are shut
+        // (sk_shutdown == SHUTDOWN_MASK, which the peer's close sets:
+        // unix_release_sock); a socket whose peer closed stays writable
+        // (unix_writable). epoll reports EPOLLRDHUP only when asked for it,
+        // EPOLLHUP and EPOLLERR always (fs/eventpoll.c: do_epoll_ctl adds
+        // them, ep_item_poll masks with the interest).
+        let all = EventSet::IN | EventSet::OUT | EventSet::READ_HANG_UP;
+        let s = socketpair();
+        close(s[1]);
+        assert_eq!(events_of(s[0], all), all | EventSet::HANG_UP);
+        assert_eq!(events_of(s[0], EventSet::IN), EventSet::IN | EventSet::HANG_UP);
+        assert_eq!(events_of(s[0], EventSet::OUT), EventSet::OUT | EventSet::HANG_UP);
+        close(s[0]);
+        // The peer shuts down its sending side only: readable to EOF, no HUP.
+        let s = socketpair();
+        // SAFETY: our descriptor.
+        assert_eq!(unsafe { libc::shutdown(s[1], libc::SHUT_WR) }, 0);
+        assert_eq!(
+            events_of(s[0], EventSet::IN | EventSet::READ_HANG_UP),
+            EventSet::IN | EventSet::READ_HANG_UP
+        );
+        assert_eq!(events_of(s[0], EventSet::IN), EventSet::IN);
+        close(s[0]);
+        close(s[1]);
+    }
+
+    #[test]
+    fn test_pipe_ends_as_linux() {
+        // Linux, fs/pipe.c pipe_poll: the read end is readable only with data,
+        // and EPOLLHUP once no writer is left; the write end gets EPOLLERR once
+        // no reader is left. No EPOLLRDHUP on a pipe.
+        let mut p = [0; 2];
+        // SAFETY: room for two descriptors.
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        close(p[1]);
+        let rd = EventSet::IN | EventSet::READ_HANG_UP;
+        assert_eq!(events_of(p[0], rd), EventSet::HANG_UP);
+        close(p[0]);
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        // SAFETY: one byte from a local.
+        assert_eq!(unsafe { libc::write(p[1], [7u8].as_ptr().cast(), 1) }, 1);
+        close(p[1]);
+        assert_eq!(events_of(p[0], rd), EventSet::IN | EventSet::HANG_UP);
+        close(p[0]);
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        close(p[0]);
+        assert_eq!(events_of(p[1], EventSet::OUT), EventSet::OUT | EventSet::ERROR);
+        close(p[1]);
     }
 
     #[test]
