@@ -344,6 +344,29 @@ jobs:
         run: |
           sw_vers
           cargo test --locked -p vmm --lib "ext::sandbox"
+      # The API process's profile test once failed on macos-15 with its child
+      # dead before its first marker (c7d32e2); run alone, repeatedly, it
+      # shows whether that is intermittent and how often.
+      - name: API process profile test, 20 runs
+        if: success() || failure()
+        working-directory: lib/firecracker
+        run: |
+          failed=0
+          for i in $(seq 20); do
+            cargo test --locked -q -p vmm --lib \
+              ext::sandbox::macos::tests::test_api_profile_raises_sigsys_outside_its_list -- --exact \
+              > "$RUNNER_TEMP/api-profile-$i.log" 2>&1 || { failed=$((failed + 1)); cat "$RUNNER_TEMP/api-profile-$i.log"; }
+          done
+          echo "$failed of 20 runs failed"
+          [[ $failed -eq 0 ]]
+      # What the sandbox denied the test processes (vmm-<hash>), for a
+      # failure above: the kernel reports a denied call by its number
+      # ("deny(1) syscall-unix 117"), SIGSYS or not.
+      - name: Sandbox reports
+        if: failure()
+        run: |
+          /usr/bin/log show --last 20m --style compact --predicate 'sender == "Sandbox"' |
+            grep -E 'Sandbox: vmm-[0-9a-f]+\(' | grep -v ' allow ' | tail -300 || true
 
   # A minute of each fuzz target (fuzz/, CONTRIBUTING.md "Fuzzing"): they
   # build, their seeds pass, and a minute of new inputs finds nothing. Long

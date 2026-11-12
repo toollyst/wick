@@ -1463,15 +1463,22 @@ mod macos {
                 .unwrap()
         }
 
+        /// A child's exit status, output and error output, for an assertion's
+        /// message: a child that died before its marker says how.
+        fn text(out: &std::process::Output) -> String {
+            format!(
+                "{:?}\n--- stdout\n{}\n--- stderr\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        }
+
         fn run_child(name: &str, env: &[(&str, &str)]) {
             let out = child(name, env);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                out.status.success(),
-                "{stdout}\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert!(stdout.contains("CHILD-OK"), "{stdout}");
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(stdout.contains("CHILD-OK"), "{}", text(&out));
         }
 
         #[test]
@@ -1510,11 +1517,10 @@ mod macos {
                 assert_eq!(
                     out.status.signal(),
                     Some(libc::SIGSYS),
-                    "{name}: {:?}\n{}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stdout)
+                    "{name}: {}",
+                    text(&out)
                 );
-                assert!(!String::from_utf8_lossy(&out.stdout).contains("CHILD-SURVIVED"));
+                assert!(!String::from_utf8_lossy(&out.stdout).contains("CHILD-SURVIVED"), "{name}: {}", text(&out));
             }
         }
 
@@ -1526,9 +1532,8 @@ mod macos {
             assert_eq!(
                 out.status.code(),
                 Some(crate::FcExitCode::BadSyscall as i32),
-                "{:?}\n{}",
-                out.status,
-                String::from_utf8_lossy(&out.stdout)
+                "{}",
+                text(&out)
             );
         }
 
@@ -1540,9 +1545,9 @@ mod macos {
             use std::os::unix::process::ExitStatusExt;
             let out = child("narrowed_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(stdout.contains("SETUP-OK"), "{stdout}");
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
-            assert!(!stdout.contains("CHILD-SURVIVED"), "{stdout}");
+            assert!(stdout.contains("SETUP-OK"), "{}", text(&out));
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
+            assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
 
         // narrow() cannot be undone: after it, no extension can be issued or
@@ -1554,9 +1559,9 @@ mod macos {
             for case in ["issue", "consume", "thread"] {
                 let out = child("one_way_child", &[("WICK_TEST_CASE", case)]);
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                assert!(stdout.contains("NARROWED"), "{case}: {stdout}");
-                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
-                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+                assert!(stdout.contains("NARROWED"), "{case}: {}", text(&out));
+                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
             }
         }
 
@@ -1592,13 +1597,13 @@ mod macos {
             for case in ["dup", "shm", "exec", "socketpair", "madvise", "dontneed", "fcntl"] {
                 let out = child("api_child", &[("WICK_TEST_CASE", case)]);
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                assert!(stdout.contains("SETUP-OK"), "{case}: {stdout}");
-                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
-                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+                assert!(stdout.contains("SETUP-OK"), "{case}: {}", text(&out));
+                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
             }
             let out = child("api_child", &[("WICK_TEST_CASE", "allowed")]);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(out.status.success() && stdout.contains("CHILD-OK"), "{:?}\n{stdout}", out.status);
+            assert!(out.status.success() && stdout.contains("CHILD-OK"), "{}", text(&out));
         }
 
         #[test]
@@ -1693,9 +1698,9 @@ mod macos {
             for case in ["file", "jit", "mmap", "mprotect", "blocked"] {
                 let out = child("exec_map_child", &[("WICK_TEST_CASE", case)]);
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                assert!(stdout.contains("SETUP-OK"), "{case}: {stdout}");
-                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
-                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+                assert!(stdout.contains("SETUP-OK"), "{case}: {}", text(&out));
+                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
             }
         }
 
@@ -1857,9 +1862,9 @@ mod macos {
             use std::os::unix::process::ExitStatusExt;
             let out = child("ip_socket_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(stdout.contains("MADE"), "{stdout}");
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
-            assert!(!stdout.contains("CHILD-SURVIVED"), "{stdout}");
+            assert!(stdout.contains("MADE"), "{}", text(&out));
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
+            assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
 
         #[test]
@@ -1919,8 +1924,8 @@ mod macos {
             use std::os::unix::process::ExitStatusExt;
             let out = child("other_ioctl_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(stdout.contains("NARROWED"), "{stdout}");
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
+            assert!(stdout.contains("NARROWED"), "{}", text(&out));
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
         }
 
         // Shared memory after narrow(): the memfds this process makes, an
@@ -1932,9 +1937,9 @@ mod macos {
             use std::os::unix::process::ExitStatusExt;
             let out = child("memfd_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(stdout.contains("MEMFDS-OK"), "{stdout}");
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
-            assert!(!stdout.contains("CHILD-SURVIVED"), "{stdout}");
+            assert!(stdout.contains("MEMFDS-OK"), "{}", text(&out));
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
+            assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
 
         #[test]
@@ -1971,9 +1976,9 @@ mod macos {
             use std::os::unix::process::ExitStatusExt;
             let out = child("fcntl_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(stdout.contains("LISTED-OK"), "{stdout}");
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
-            assert!(!stdout.contains("CHILD-SURVIVED"), "{stdout}");
+            assert!(stdout.contains("LISTED-OK"), "{}", text(&out));
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
+            assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
 
         #[test]
@@ -2143,9 +2148,9 @@ mod macos {
             for case in ["vmnet", "other"] {
                 let out = child("lookup_child", &[("WICK_TEST_CASE", case)]);
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                assert_eq!(stdout.contains("SETUP-LOOKUP-OK"), case == "vmnet", "{case}: {stdout}");
-                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
-                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+                assert_eq!(stdout.contains("SETUP-LOOKUP-OK"), case == "vmnet", "{case}: {}", text(&out));
+                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
             }
         }
 
@@ -2255,10 +2260,10 @@ mod macos {
                     &[("WICK_TEST_CASE", case), ("WICK_TEST_JAIL", jail.to_str().unwrap())],
                 );
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                assert!(stdout.contains("SETUP-BIND-OK"), "{case}: {:?}\n{stdout}", out.status);
+                assert!(stdout.contains("SETUP-BIND-OK"), "{case}: {}", text(&out));
                 if case == "free-ip" {
-                    assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
-                    assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+                    assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                    assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
                 } else if case == "datagram-outside" {
                     // The file rule decides a socket file outside the jail,
                     // with EPERM, as a file there (measured; the bind rule
@@ -2270,8 +2275,8 @@ mod macos {
                         out.status
                     );
                 } else if case == "stream" {
-                    assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {:?}\n{stdout}", out.status);
-                    assert!(stdout.contains("LATE-BIND-OK") && !stdout.contains("CHILD-SURVIVED"), "{case}: {stdout}");
+                    assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                    assert!(stdout.contains("LATE-BIND-OK") && !stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
                 } else {
                     let late = if case.ends_with("-stale") { "STALE-REFUSED" } else { "LATE-BIND-OK" };
                     assert!(
@@ -2374,11 +2379,11 @@ mod macos {
             let me = std::process::id().to_string();
             let out = child("other_pid_info_child", &[("WICK_TEST_OTHER_PID", &me)]);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(out.status.success() && stdout.contains("OTHER-DENIED"), "{:?}\n{stdout}", out.status);
+            assert!(out.status.success() && stdout.contains("OTHER-DENIED"), "{}", text(&out));
             let out = child("other_pid_signal_child", &[("WICK_TEST_OTHER_PID", &me)]);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{:?}\n{stdout}", out.status);
-            assert!(!stdout.contains("CHILD-SURVIVED"));
+            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
+            assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
 
         fn other_pid() -> libc::pid_t {
