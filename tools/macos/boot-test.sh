@@ -18,7 +18,7 @@
 #
 # Stages (default: all, in this order): boot smp block vsock net vmnet
 # snapshot diff uffd hugepages pci vhost-user devices balloon restores
-# api-process cli tools no-seccomp. vmnet uses vmnet-shared (NAT); older macOS
+# api-process cli tools no-seccomp memory-hotplug. vmnet uses vmnet-shared (NAT); older macOS
 # releases need root for vmnet.framework.
 # The guest images are cached in ~/Library/Caches/wick/boot-test; results and
 # logs go to build/boot-test/<time>. Run tools/setup.sh first.

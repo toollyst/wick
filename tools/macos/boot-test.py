@@ -1171,6 +1171,72 @@ def stage_no_seccomp(ctx):
     return f"default: {results[0]}; --no-seccomp: {results[1]}; the guest runs in both"
 
 
+def resident(pid):
+    """`pid`'s resident size in bytes (proc_pidinfo PROC_PIDTASKINFO,
+    pti_resident_size): what psutil's RSS reads on macOS."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    buf = (ctypes.c_uint8 * 96)()  # struct proc_taskinfo
+    n = libc.proc_pidinfo(pid, 4, ctypes.c_uint64(0), buf, 96)
+    check(n == 96, f"proc_pidinfo PROC_PIDTASKINFO for {pid}: {n}, errno {ctypes.get_errno()}")
+    return struct.unpack_from("<Q", buf, 8)[0]
+
+
+def stage_memory_hotplug(ctx):
+    """virtio-mem, as upstream's test_virtio_mem_hotplug_hotunplug
+    (performance/test_hotplug_memory.py) checks it: the guest's driver gets
+    the requested size (dmesg) and carries it out (MemTotal = base +
+    plugged), the memory is usable, and an unplug back to 0 gives MemTotal
+    back and leaves Firecracker with less resident. 512 MiB plugged into a
+    512 MiB guest (a 1 GiB area, 128 MiB slots, 2 MiB blocks)."""
+    cfg = config(ctx, vcpus=2, mem=512,
+                 memory_hotplug={"total_size_mib": 1024, "slot_size_mib": 128, "block_size_mib": 2})
+    cfg["boot-source"]["boot_args"] = BOOT_ARGS + " memhp_default_state=online_movable"
+    vm = ctx.vm("memory-hotplug", [], cfg)
+    vm.shell()
+    _, out = vm.sh("dmesg | grep virtio_mem | head -3; true")
+    check("virtio_mem" in out, f"the guest found no virtio-mem device: {out!r}")
+
+    def mem_total():
+        return int(vm.sh("awk '/MemTotal/ {print $2}' /proc/meminfo")[1]) // 1024
+
+    base = mem_total()
+
+    def plug(mib):
+        vm.api("PATCH", "/hotplug/memory", {"requested_size_mib": mib})
+        deadline = time.time() + 60
+        while True:
+            hp = vm.api("GET", "/hotplug/memory")
+            if hp.get("plugged_size_mib") == mib:
+                break
+            check(time.time() < deadline, f"plugged_size_mib {hp} 60 s after asking for {mib} MiB")
+            time.sleep(0.1)
+        _, req = vm.sh("dmesg | grep virtio_mem | grep 'requested size' | tail -1")
+        check(req and int(req.split(":")[-1].strip(), 0) == mib << 20, f"virtio_mem's requested size {req!r} for {mib} MiB")
+        deadline = time.time() + 5
+        while True:
+            now = mem_total()
+            if now == base + mib:
+                return
+            check(time.time() < deadline, f"MemTotal {now} MiB, {base} + {mib} expected")
+            time.sleep(0.5)
+
+    plug(512)
+    # Memory past what the guest booted with, written and read back.
+    # (The root file system is read-only: the tmpfs goes on /tmp.)
+    _, out = vm.sh("mount -t tmpfs -o size=900m tmpfs /tmp && head -c 600m /dev/urandom > /tmp/f && "
+                   "md5sum /tmp/f > /tmp/a && md5sum /tmp/f | cmp - /tmp/a && echo same", timeout=180)
+    check(out == "same", f"600 MiB in a guest of {base} + 512 MiB read back differently: {out!r}")
+    vm.sh("rm /tmp/f /tmp/a && umount /tmp")
+    rss_plugged = resident(vm.proc.pid)
+    plug(0)
+    rss_unplugged = resident(vm.proc.pid)
+    check(rss_unplugged < rss_plugged, f"resident {rss_plugged >> 20} -> {rss_unplugged >> 20} MiB after the unplug")
+    plug(512)  # again, as upstream's test does
+    vm.reboot()
+    return (f"virtio-mem: MemTotal {base} -> {base + 512} MiB and back and again, 600 MiB written and read back "
+            f"while plugged, resident {rss_plugged >> 20} -> {rss_unplugged >> 20} MiB at the unplug")
+
+
 def stage_api_process(ctx):
     # On Linux the API thread has a filter of its own, narrower than the VMM
     # thread's. The macOS sandbox is per process, so the API server's HTTP
@@ -1595,6 +1661,7 @@ STAGES = {
     "cli": stage_cli,
     "tools": stage_tools,
     "no-seccomp": stage_no_seccomp,
+    "memory-hotplug": stage_memory_hotplug,
 }
 
 
