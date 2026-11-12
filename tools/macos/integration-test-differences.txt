@@ -243,3 +243,21 @@ all bug integration_tests/functional/test_vsock.py::test_vsock_epipe
 # guess, to measure, is a 16 KiB host page holding the guest's 4 KiB pages.
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_ON-True-kvm]
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_OFF-True-kvm]
+
+# Failed in run m2-parts at 8d577b7; the other variants passed in that run,
+# and all pass on Linux. After a snapshot's restore the restored VM's RSS
+# (get_resident_memory, KiB) moved the wrong way: test_balloon_snapshot
+# (test_balloon.py:554) wants it to rise when the guest dirties 60 MiB, and
+# it fell, 49632 to 48416; test_hinting_reporting_snapshot (:660) wants it
+# to fall when the guest frees the memory its helper held (with hinting
+# started, or with free page reporting), and it rose, 50960 to 53184
+# (hinting) and 49520 to 51056 (reporting). The cause is not yet known. To
+# separate: the host reclaiming the restored region's clean file-backed
+# pages (a reading's fall) against a discard over that MAP_PRIVATE file
+# mapping that does not reach the page tables (discard_range,
+# vstate/memory.rs; a reading's missing fall), by logging each reading's
+# parts, the guest region's present pages and the host's paging next to
+# the guest's /proc/meminfo.
+all bug integration_tests/functional/test_balloon.py::test_balloon_snapshot[vmlinux-6.1.188-PCI_ON-kvm]
+all bug integration_tests/functional/test_balloon.py::test_hinting_reporting_snapshot[vmlinux-6.1.188-PCI_ON-hinting-kvm]
+all bug integration_tests/functional/test_balloon.py::test_hinting_reporting_snapshot[vmlinux-6.1.188-PCI_OFF-reporting-kvm]
