@@ -744,6 +744,18 @@ def jailed_path(self, file_path, create=False, subdir="."):
 
 _jailer.JailerContext.jailed_path = jailed_path
 
+# WICK_IT_NO_DAEMONIZE=1 (a debugging aid): jailers run in the foreground, so
+# what Firecracker writes to its standard error (the host sandbox's NTSTATUS
+# when it denies an operation) is in the screen log, as without --daemonize.
+if os.environ.get("WICK_IT_NO_DAEMONIZE") == "1":
+    _real_jailer_init = _jailer.JailerContext.__init__
+
+    def _jailer_init(self, *args, **kwargs):
+        _real_jailer_init(self, *args, **kwargs)
+        self.daemonize = False
+
+    _jailer.JailerContext.__init__ = _jailer_init
+
 import framework.microvm as _microvm  # noqa: E402  pylint: disable=wrong-import-position
 
 _real_copy_to_chroot = _microvm.Snapshot.copy_to_chroot

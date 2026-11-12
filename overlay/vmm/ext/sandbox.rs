@@ -3418,6 +3418,30 @@ mod windows {
                 std::io::stderr(),
                 "The host sandbox denied an operation (NTSTATUS {status:#010x})"
             );
+            // Where: the return addresses in Firecracker's image, as offsets
+            // from its base, which the release's PDB resolves (a jail has no
+            // PDB beside its copy of the binary). The process ends here.
+            let base = unsafe {
+                windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null())
+            } as usize;
+            let mut frames = [std::ptr::null_mut::<c_void>(); 48];
+            // SAFETY: a buffer of 48 frames.
+            let n = unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(
+                    0,
+                    48,
+                    frames.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            let mut line = String::from("  at firecracker.exe+");
+            for f in &frames[..usize::from(n)] {
+                let ip = *f as usize;
+                if ip >= base && ip - base < 64 << 20 {
+                    line.push_str(&format!("{:#x} ", ip - base));
+                }
+            }
+            let _ = writeln!(std::io::stderr(), "{line}");
             vmm_sys_util::signal::raise_synchronous(libc::SIGSYS, SYS_SECCOMP);
         }
         // SAFETY: ends this process.
@@ -3445,6 +3469,8 @@ mod windows {
 
     /// `EXCEPTION_CONTINUE_SEARCH`.
     const CONTINUE_SEARCH: i32 = 0;
+    /// `EXCEPTION_CONTINUE_EXECUTION`.
+    const CONTINUE_EXECUTION: i32 = -1;
 
     unsafe extern "system" fn on_exception(info: *mut ExceptionPointers) -> i32 {
         // SAFETY: Windows passes valid exception pointers.
@@ -3452,6 +3478,15 @@ mod windows {
         if INSTALLED.load(Ordering::Acquire)
             && (code == STATUS_INVALID_HANDLE || code == STATUS_HANDLE_NOT_CLOSABLE)
         {
+            // The POSIX layer asking whether a descriptor is still open
+            // (libc's descriptor table, about descriptors std closed
+            // itself): meant to fail for one that is not, as EBADF on Linux.
+            // The call returns its error (measured continuable). Found as
+            // SIGSYS on the 19th network interface of test_max_devices,
+            // when the table's sweep met a closed descriptor.
+            if code == STATUS_INVALID_HANDLE && libc::wick_fd::probing() {
+                return CONTINUE_EXECUTION;
+            }
             deny(code);
         }
         CONTINUE_SEARCH
@@ -3931,6 +3966,36 @@ mod windows {
             // handle checks raise for it.
             let r = unsafe { SetEvent(0x1234 as *mut c_void) };
             println!("CHILD-SURVIVED {r}");
+        }
+
+        // A descriptor closed behind the POSIX layer's back (std closes its
+        // handles itself) that the layer then asks about: the question fails,
+        // as EBADF on Linux, and the process goes on under strict handle
+        // checks. (Firecracker died of SIGSYS on the 19th network interface
+        // of test_max_devices, when libc's descriptor table swept such a
+        // descriptor.)
+        #[test]
+        fn test_probing_a_closed_descriptor_is_not_a_denial() {
+            let out = child("closed_descriptor_child", &[("WICK_TEST_HANDLERS", "1")]);
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(text(&out).contains("CHILD-SURVIVED none"), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_probing_a_closed_descriptor_is_not_a_denial in a separate process"]
+        fn closed_descriptor_child() {
+            use std::os::windows::io::{FromRawHandle, OwnedHandle};
+            sandboxed();
+            // A descriptor with state in libc's table (a timerfd's schedule).
+            // SAFETY: plain call.
+            let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
+            assert!(fd >= 0);
+            // Closed as std closes a handle, past libc's close (a descriptor
+            // is its handle's value).
+            // SAFETY: the timerfd's handle, owned from here and closed.
+            drop(unsafe { OwnedHandle::from_raw_handle(fd as isize as *mut c_void) });
+            let state = libc::wick_fd::attached::<u64>(fd);
+            println!("CHILD-SURVIVED {}", if state.is_none() { "none" } else { "some" });
         }
 
         /// The denials Windows reports as an error: each fails, and the
