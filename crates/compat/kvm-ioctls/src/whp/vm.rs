@@ -26,22 +26,13 @@ use super::whv;
 use super::whv::WHV_PARTITION_HANDLE;
 
 use super::ffi;
+use super::guest_mem::{self, Slot};
 use super::irqchip::Irqchip;
 use super::vcpu::{VcpuFd, VcpuShared};
 use super::{err, Cap, DeviceFd, Handle, IoEventAddress, Result};
 
 /// Largest number of vCPUs a partition is set up for.
 pub(crate) const MAX_VCPUS: usize = 32;
-
-/// One mapped guest-memory slot.
-#[derive(Debug)]
-struct Slot {
-    guest_phys: u64,
-    size: u64,
-    /// The host address mapped at `guest_phys`.
-    host: u64,
-    log_dirty: bool,
-}
 
 /// A registered ioeventfd.
 #[derive(Debug)]
@@ -143,6 +134,14 @@ impl VmInner {
             .values()
             .find(|s| gpa >= s.guest_phys && gpa < s.guest_phys + s.size)
             .map(|s| s.host + (gpa - s.guest_phys))
+    }
+
+    /// Writes `data` into guest RAM at `gpa` as KVM's `kvm_write_guest`
+    /// does ([`guest_mem::write`]): false (`-EFAULT`) at a page no slot maps
+    /// or a read-only one. The slot table stays locked for the copy, so a
+    /// slot is not unmapped under it.
+    pub(crate) fn write_guest(&self, gpa: u64, data: &[u8]) -> bool {
+        guest_mem::write(&mut self.memory.lock().unwrap(), gpa, data)
     }
 
     /// If a guest access at `addr` of `data` matches an ioeventfd, signals it
@@ -451,21 +450,17 @@ impl VmFd {
         map()?;
         memory.insert(
             region.slot,
-            Slot {
-                guest_phys: region.guest_phys_addr,
-                size: region.memory_size,
-                host: region.userspace_addr,
-                log_dirty,
-            },
+            Slot::new(region.guest_phys_addr, region.memory_size, region.userspace_addr, readonly, log_dirty),
         );
         Ok(())
     }
 
     /// The dirty-page bitmap of a slot (one bit per guest page), cleared by
-    /// the query.
+    /// the query: the pages the guest wrote (WHP's) and those the backend
+    /// wrote for it (`write_guest`), as KVM's log has both.
     pub fn get_dirty_log(&self, slot: u32, memory_size: usize) -> Result<Vec<u64>> {
-        let memory = self.inner.memory.lock().unwrap();
-        let s = memory.get(&slot).ok_or_else(|| Error::new(libc::ENOENT))?;
+        let mut memory = self.inner.memory.lock().unwrap();
+        let s = memory.get_mut(&slot).ok_or_else(|| Error::new(libc::ENOENT))?;
         if !s.log_dirty {
             return err(libc::EINVAL);
         }
@@ -483,6 +478,7 @@ impl VmFd {
                 u32::try_from(words * 8).unwrap(),
             )
         })?;
+        s.take_host_dirty(&mut bitmap);
         Ok(bitmap)
     }
 

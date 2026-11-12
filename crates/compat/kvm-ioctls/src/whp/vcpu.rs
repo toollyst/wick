@@ -927,8 +927,11 @@ impl VcpuFd {
                 whv::WHvRunVpExitReasonHypercall => {
                     // SAFETY: the union arm matches the exit reason.
                     let h = unsafe { ctx.Anonymous.Hypercall };
-                    let result = self.kvm_hypercall(h.Rax, h.Rbx, h.Rcx);
-                    regs::set_gpr_rax_rip(part, vp, result, rip + instr_len)?;
+                    // SAFETY: plain 16-bit views of the exit context's bit fields.
+                    let (state, cs) = unsafe { (ctx.VpContext.ExecutionState.AsUINT16, ctx.VpContext.Cs.Anonymous.Attributes) };
+                    let wide = super::exit::long_mode_code(state, cs);
+                    let result = self.kvm_hypercall(h.Rax, h.Rbx, h.Rcx, wide, super::exit::cpl(state));
+                    regs::set_gpr_rax_rip(part, vp, super::exit::hypercall_rax(result, wide), rip + instr_len)?;
                     continue;
                 }
 
@@ -1105,18 +1108,17 @@ impl VcpuFd {
     /// makes: `KVM_HC_VAPIC_POLL_IRQ` (nothing to do) and
     /// `KVM_HC_CLOCK_PAIRING` (the host's wall clock with the guest TSC of
     /// the same moment, which ptp_kvm keeps the guest's time in step with);
-    /// anything else is `-KVM_ENOSYS`, as KVM answers an unknown one.
-    fn kvm_hypercall(&self, nr: u64, a0: u64, a1: u64) -> u64 {
+    /// anything else is `-KVM_ENOSYS`, as KVM answers an unknown one. From a
+    /// privilege level but 0, every one is `-KVM_EPERM`
+    /// ([`super::exit::hypercall`]).
+    fn kvm_hypercall(&self, nr: u64, a0: u64, a1: u64, op_64_bit: bool, cpl: u8) -> u64 {
         const KVM_EOPNOTSUPP: i64 = 95;
         const KVM_EFAULT: i64 = 14;
         let neg = |e: i64| (-e).cast_unsigned();
-        match super::exit::hypercall(nr, a0, a1) {
+        match super::exit::hypercall(nr, a0, a1, op_64_bit, cpl) {
             super::exit::Hypercall::PollIrq => 0,
             super::exit::Hypercall::Error(rax) => rax,
             super::exit::Hypercall::ClockPairing { gpa } => {
-                let Some(at) = self.shared.inner.host_addr(gpa) else {
-                    return neg(KVM_EFAULT);
-                };
                 let Ok(tsc) = self.register(whv::WHvX64RegisterTsc) else {
                     return neg(KVM_EOPNOTSUPP);
                 };
@@ -1128,9 +1130,9 @@ impl VcpuFd {
                 out[0..8].copy_from_slice(&now.as_secs().to_le_bytes());
                 out[8..16].copy_from_slice(&u64::from(now.subsec_nanos()).to_le_bytes());
                 out[16..24].copy_from_slice(&tsc.to_le_bytes());
-                // SAFETY: guest RAM the guest named for the result.
-                unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), at as *mut u8, out.len()) };
-                0
+                // KVM's kvm_pv_clock_pairing: kvm_write_guest, -KVM_EFAULT if
+                // any of the 64 bytes is not writable guest RAM.
+                if self.shared.inner.write_guest(gpa, &out) { 0 } else { neg(KVM_EFAULT) }
             }
         }
     }

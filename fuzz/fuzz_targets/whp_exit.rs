@@ -5,7 +5,8 @@
 //! controls (`crates/compat/kvm-ioctls/src/whp/exit.rs`): the instruction
 //! length, a port access's direction, size and kind, a memory access's
 //! direction, an MSR access and the value it writes, the `RAX` an `IN`
-//! leaves, the CPUID bits that follow CR4, and the hypercall answered.
+//! leaves, the CPUID bits that follow CR4, and the hypercall answered (at
+//! the privilege level and operand size the exit context gives).
 //! Checked against a reference written here from the x86 architecture (the
 //! Intel SDM: port I/O sizes, 32-bit register writes zero-extending,
 //! `WRMSR` taking `EDX:EAX`, CPUID's OSXSAVE and OSPKE) and KVM's hypercall
@@ -15,7 +16,10 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use wick_fuzz::whp_exit::{Hypercall, PortAccess, cpuid_ecx, hypercall, in_result, instruction_length, memory_write, msr_access, port_access};
+use wick_fuzz::whp_exit::{
+    Hypercall, PortAccess, cpl, cpuid_ecx, hypercall, hypercall_rax, in_result, instruction_length, long_mode_code, memory_write, msr_access,
+    port_access,
+};
 
 #[derive(Arbitrary, Debug)]
 enum Exit {
@@ -23,7 +27,7 @@ enum Exit {
     Memory { info: u32 },
     Msr { info: u32, rax: u64, rdx: u64 },
     Cpuid { function: u8, index: u8, ecx: u32, cr4: u64 },
-    Hypercall { nr: u8, a0: u64, a1: u8 },
+    Hypercall { nr: u64, a0: u64, a1: u64, state: u16, cs: u16 },
 }
 
 #[derive(Arbitrary, Debug)]
@@ -79,15 +83,27 @@ fn check(e: &Exit) {
             assert_eq!(got & !(1 << bit), ecx & !(1 << bit), "only the OS bit changes");
             assert_eq!(got >> bit & 1, (cr4 >> cr4_bit & 1) as u32);
         }
-        Exit::Hypercall { nr, a0, a1 } => {
-            let (nr, a1) = (u64::from(nr % 12), u64::from(a1 % 3));
-            let want = match (nr, a1) {
-                (1, _) => Hypercall::PollIrq,
-                (9, 0) => Hypercall::ClockPairing { gpa: a0 },
-                (9, _) => Hypercall::Error((-95i64) as u64),
+        Exit::Hypercall { nr, a0, a1, state, cs } => {
+            // Mostly the hypercalls KVM knows, in their high bits anything.
+            let nr = (nr & !0xff) | (nr & 0xff) % 12;
+            let a1 = (a1 & !0xff) | (a1 & 0xff) % 3;
+            let (level, wide) = (cpl(state), long_mode_code(state, cs));
+            assert_eq!(u16::from(level), state & 3);
+            assert_eq!(wide, state & 0x10 != 0 && cs & 0x2000 != 0);
+            // KVM's __kvm_emulate_hypercall: low halves outside 64-bit
+            // code, -KVM_EPERM from any level but 0.
+            let low = |v: u64| if wide { v } else { v & 0xffff_ffff };
+            let want = match (level, low(nr), low(a1)) {
+                (1..=3, _, _) => Hypercall::Error((-1i64) as u64),
+                (_, 1, _) => Hypercall::PollIrq,
+                (_, 9, 0) => Hypercall::ClockPairing { gpa: low(a0) },
+                (_, 9, _) => Hypercall::Error((-95i64) as u64),
                 _ => Hypercall::Error((-1000i64) as u64),
             };
-            assert_eq!(hypercall(nr, a0, a1), want);
+            assert_eq!(hypercall(nr, a0, a1, wide, level), want);
+            if let Hypercall::Error(rax) = want {
+                assert_eq!(hypercall_rax(rax, wide), low(rax));
+            }
         }
     }
 }

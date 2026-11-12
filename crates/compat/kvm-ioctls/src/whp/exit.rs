@@ -80,6 +80,19 @@ pub fn cpuid_ecx(function: u32, index: u32, ecx: u32, cr4: u64) -> u32 {
     }
 }
 
+/// The vCPU's current privilege level, from the exit context's
+/// `ExecutionState` (`WHV_X64_VP_EXECUTION_STATE`: `Cpl` is bits 0-1).
+pub fn cpl(execution_state: u16) -> u8 {
+    (execution_state & 3) as u8
+}
+
+/// Whether the vCPU runs 64-bit code, as KVM's `is_64_bit_hypercall`
+/// (`is_64_bit_mode`) decides: long mode (`ExecutionState.EferLma`, bit 4) and
+/// a 64-bit code segment (the exit context's `Cs` attributes, `Long`, bit 13).
+pub fn long_mode_code(execution_state: u16, cs_attributes: u16) -> bool {
+    execution_state >> 4 & 1 == 1 && cs_attributes >> 13 & 1 == 1
+}
+
 /// What a KVM hypercall (`kvm_emulate_hypercall`: `nr` in RAX, its first
 /// two arguments in RBX and RCX) is answered with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,19 +107,35 @@ pub enum Hypercall {
     Error(u64),
 }
 
-/// Decodes a KVM hypercall.
-pub fn hypercall(nr: u64, a0: u64, a1: u64) -> Hypercall {
+/// Decodes a KVM hypercall made at privilege level `cpl`, in 64-bit code or
+/// not (`op_64_bit`), as KVM's `__kvm_emulate_hypercall` (arch/x86/kvm/x86.c)
+/// does: outside 64-bit code the number and the arguments are their low 32
+/// bits, and a hypercall from any privilege level but 0 is `-KVM_EPERM`
+/// whatever its number (so guest user space cannot have the host write
+/// guest memory for it).
+pub fn hypercall(nr: u64, a0: u64, a1: u64, op_64_bit: bool, cpl: u8) -> Hypercall {
     const KVM_ENOSYS: i64 = 1000;
+    const KVM_EPERM: i64 = 1;
     const KVM_EOPNOTSUPP: i64 = 95;
     const KVM_HC_VAPIC_POLL_IRQ: u64 = 1;
     const KVM_HC_CLOCK_PAIRING: u64 = 9;
     const KVM_CLOCK_PAIRING_WALLCLOCK: u64 = 0;
+    let (nr, a0, a1) = if op_64_bit { (nr, a0, a1) } else { (nr & 0xffff_ffff, a0 & 0xffff_ffff, a1 & 0xffff_ffff) };
+    if cpl != 0 {
+        return Hypercall::Error((-KVM_EPERM).cast_unsigned());
+    }
     match nr {
         KVM_HC_VAPIC_POLL_IRQ => Hypercall::PollIrq,
         KVM_HC_CLOCK_PAIRING if a1 == KVM_CLOCK_PAIRING_WALLCLOCK => Hypercall::ClockPairing { gpa: a0 },
         KVM_HC_CLOCK_PAIRING => Hypercall::Error((-KVM_EOPNOTSUPP).cast_unsigned()),
         _ => Hypercall::Error((-KVM_ENOSYS).cast_unsigned()),
     }
+}
+
+/// The `RAX` a hypercall's result leaves: outside 64-bit code its low 32
+/// bits, as KVM's `kvm_emulate_hypercall` writes it.
+pub fn hypercall_rax(result: u64, op_64_bit: bool) -> u64 {
+    if op_64_bit { result } else { result & 0xffff_ffff }
 }
 
 #[cfg(test)]
@@ -138,8 +167,30 @@ mod tests {
         assert_eq!(cpuid_ecx(1, 0, 0, 1 << 18), 1 << 27);
         assert_eq!(cpuid_ecx(1, 0, 1 << 27, 0), 0);
         assert_eq!(cpuid_ecx(7, 1, 1 << 4, 0), 1 << 4, "only subleaf 0 follows CR4.PKE");
-        assert_eq!(hypercall(9, 0x1000, 0), Hypercall::ClockPairing { gpa: 0x1000 });
-        assert_eq!(hypercall(9, 0x1000, 1), Hypercall::Error((-95i64).cast_unsigned()));
-        assert_eq!(hypercall(42, 0, 0), Hypercall::Error((-1000i64).cast_unsigned()));
+        assert_eq!(hypercall(9, 0x1000, 0, true, 0), Hypercall::ClockPairing { gpa: 0x1000 });
+        assert_eq!(hypercall(9, 0x1000, 1, true, 0), Hypercall::Error((-95i64).cast_unsigned()));
+        assert_eq!(hypercall(42, 0, 0, true, 0), Hypercall::Error((-1000i64).cast_unsigned()));
+    }
+
+    // KVM's __kvm_emulate_hypercall: a hypercall from guest user space (or
+    // CPL 1, 2) is -KVM_EPERM before its number is looked at, so the clock
+    // pairing hypercall never writes for it; outside 64-bit code the number
+    // and the arguments are their low halves and so is the result in RAX.
+    #[test]
+    fn test_hypercall_privilege_and_operand_size() {
+        let eperm = Hypercall::Error((-1i64).cast_unsigned());
+        for cpl in 1..=3 {
+            assert_eq!(hypercall(9, 0x1000, 0, true, cpl), eperm, "cpl {cpl}");
+            assert_eq!(hypercall(1, 0, 0, true, cpl), eperm, "cpl {cpl}");
+        }
+        assert_eq!(hypercall(0x1_0000_0009, 0xdead_0000_1000, 0x7_0000_0000, false, 0), Hypercall::ClockPairing { gpa: 0x1000 });
+        assert_eq!(hypercall(0x1_0000_0009, 0x1000, 0, true, 0), Hypercall::Error((-1000i64).cast_unsigned()));
+        assert_eq!(hypercall_rax((-1000i64).cast_unsigned(), false), 0xffff_fc18);
+        assert_eq!(hypercall_rax((-1000i64).cast_unsigned(), true), (-1000i64).cast_unsigned());
+        // WHV_X64_VP_EXECUTION_STATE and the CS attributes' Long bit.
+        assert_eq!(cpl(0b11 | 1 << 4), 3);
+        assert!(long_mode_code(1 << 4, 1 << 13));
+        assert!(!long_mode_code(1 << 4, 0), "compatibility mode");
+        assert!(!long_mode_code(0, 1 << 13), "no long mode");
     }
 }

@@ -33,6 +33,7 @@ mod debug;
 mod emulate;
 mod exit;
 mod ffi;
+mod guest_mem;
 mod irqchip;
 mod pvclock;
 mod regs;
