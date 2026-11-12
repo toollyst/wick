@@ -27,6 +27,11 @@ the host's own), and the checks also run while the pages are compressed: the
 mapping's compressed pages and the ledger's agree, get_resident_memory still
 counts the 64 MiB, and the replacement takes them out of the ledger too. A
 host that compresses nothing in the time fails that check, saying so.
+
+wick_macos imports upstream's framework, whose framework/defs.py reads the
+guest artifacts' directory from lib/firecracker/build/current_artifacts,
+which integration-tests.sh writes; nothing here reads an artifact, so on a
+host without them (CI) the file may name an empty directory.
 """
 
 import argparse

@@ -327,6 +327,12 @@ jobs:
           # on a helper process, in upstream's test environment (venv.sh).
           brew install uv
           tools/macos/integration/venv.sh
+          # wick_macos imports upstream's framework, whose framework/defs.py
+          # reads the guest artifacts' directory from
+          # lib/firecracker/build/current_artifacts (integration-tests.sh
+          # writes it); the runner has no guest artifacts: an empty directory.
+          mkdir -p "$RUNNER_TEMP/no-guest-artifacts" lib/firecracker/build
+          echo "$RUNNER_TEMP/no-guest-artifacts" >lib/firecracker/build/current_artifacts
           build/integration/venv/bin/python tools/macos/integration/memory-selftest.py
       # Every test of every crate but the jailer runs; the ones that cannot
       # pass on a runner (they create a VM, and GitHub's macOS runners have no
