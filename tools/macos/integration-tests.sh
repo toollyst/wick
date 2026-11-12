@@ -146,6 +146,12 @@ echo "$art" >"$ROOT/lib/firecracker/build/current_artifacts"
 # ends, also when it fails (wick_macos.remove_jails), and the session
 # directory at exit, on failure or interruption too.
 session="$(mktemp -d /tmp/wit-XXXX)"
+# The session's owner: while this script runs, tools/clean.sh (which every
+# test script's start runs) leaves the session and the processes naming it
+# (its screen sessions have parent pid 1) alone. Its pid and start time:
+# a pid used again later is not this run.
+# shellcheck disable=SC2046,SC2005
+echo "$$ $(echo $(ps -o lstart= -p $$))" >"$session/.owner-pid"
 cleanup() {
     # Everything the session started carries its root in its command line.
     pkill -KILL -f -- "$session" 2>/dev/null || true
@@ -191,8 +197,14 @@ mkdir -p "$session/tmp"
     done
 ) &
 sampler=$!
-rm -rf "$ROOT/lib/firecracker/test_results"
-pytest=("$ROOT/build/integration/venv/bin/python" -m pytest -p wick_macos --binary-dir "$bin" "$@")
+# The JSON report, and upstream's per-test results directories next to it
+# (conftest.py's results_dir), in this run's own directory: upstream's
+# pytest.ini puts them in lib/firecracker/test_results, which another run
+# would share.
+rm -rf "$out/test_results"
+mkdir -p "$out/test_results"
+pytest=("$ROOT/build/integration/venv/bin/python" -m pytest -p wick_macos --binary-dir "$bin"
+    "--json-report-file=$out/test_results/test-report.json" "$@")
 [[ -x "$ROOT/build/integration/venv/bin/python" ]] || die "no Python environment: tools/macos/integration/venv.sh"
 set +e
 if [[ $mode == jailer ]]; then
@@ -202,10 +214,11 @@ else
 fi
 status=${PIPESTATUS[0]}
 set -e
+# As --jailer, pytest wrote the results as root.
+[[ $mode == jailer ]] && sudo -n chown -R "$(id -u):$(id -g)" "$out/test_results" 2>/dev/null || true
 echo "$status" >"$out/status"
 echo "$mode" >"$out/mode"
-[[ -d "$ROOT/lib/firecracker/test_results" ]] && cp -r "$ROOT/lib/firecracker/test_results" "$out/test_results"
-cp "$ROOT/lib/firecracker/test_results/test-report.json" "$out/test-report.json" 2>/dev/null || true
+cp "$out/test_results/test-report.json" "$out/test-report.json" 2>/dev/null || true
 echo "pytest exited with $status"
 python3 -I "$ROOT/tools/macos/compare-integration-tests.py" "$out" ${compare[@]+"${compare[@]}"} --summary "$out/comparison.md" \
     --summary-txt "$out/summary.txt"

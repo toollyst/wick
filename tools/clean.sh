@@ -16,7 +16,9 @@
 # - temporary directories of test runs no process uses any more
 #   (/tmp/wick-bt-*, /private/tmp/wick-jt-*, the integration tests' /tmp/wit-*,
 #   the jails inside; root-owned ones
-#   need root, and are reported otherwise).
+#   need root, and are reported otherwise). An integration test session
+#   that is still running (its .owner-pid names a live process) is left
+#   alone, with the processes that name it.
 # --all also removes the build output: cargo's target directories, the
 #   development container's cache, dist/, and every test run.
 # --dry-run lists what would go, and how much space it holds.
@@ -34,7 +36,7 @@ while (($#)); do
         --keep) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--keep needs a number"; keep="$2"; shift 2 ;;
         --all) all=1; shift ;;
         --quiet) quiet=1; shift ;;
-        -h|--help) sed -n '4,25p' "$0"; exit 0 ;;
+        -h|--help) sed -n '4,28p' "$0"; exit 0 ;;
         *) die "unknown option $1 (see --help)" ;;
     esac
 done
@@ -121,7 +123,22 @@ clean_runs() {
     done < <(runs "$dir" "$pattern")
 }
 
+# Whether the integration test session directory $1 (/tmp/wit-*) belongs to
+# a run still going: tools/macos/integration-tests.sh writes its pid and its
+# start time (ps -o lstart) to .owner-pid when it makes the session. A missing
+# or garbled file, a dead owner or a reused pid (another start time) is a
+# finished session.
+live_session() {
+    local pid start
+    { read -r pid start <"$1/.owner-pid"; } 2>/dev/null || return 1
+    [[ "$pid" =~ ^[0-9]+$ && -n "$start" ]] || return 1
+    # shellcheck disable=SC2046,SC2005
+    [[ "$(echo $(ps -o lstart= -p "$pid" 2>/dev/null))" == "$start" ]]
+}
+
 # Processes a test run started whose test runner is gone (parent pid 1).
+# A running integration session's screen sessions have parent pid 1 too
+# (screen -dm): those of a live session are not strays.
 stray_processes() {
     ps -eo pid=,ppid=,args= | awk -v root="$WICK_ROOT" '
         $2 == 1 && ($0 ~ /\/tmp\/wick-(bt|jt)-/ || $0 ~ /\/tmp\/wit-/ || index($0, root "/build/boot-test/") || index($0, root "/build/jailer-test/")) {
@@ -141,7 +158,10 @@ clean_processes() {
             echo "cannot kill $pid ($cmd)$( ((EUID)) && echo ': run as root (sudo tools/clean.sh)')" >&2
             failed=1
         fi
-    done < <(stray_processes)
+    done < <(stray_processes | while read -r pid cmd; do
+        [[ "$cmd" =~ /tmp/(wit-[A-Za-z0-9]+) ]] && live_session "/tmp/${BASH_REMATCH[1]}" && continue
+        echo "$pid $cmd"
+    done)
 }
 
 # Temporary directories of test runs no running process names.
@@ -151,6 +171,10 @@ clean_temp() {
         [[ -d "$d" && ! -L "$d" ]] || continue
         # /tmp is /private/tmp on macOS: each directory once.
         [[ "$d" == /tmp/* && -d "/private$d" && "$(uname)" == Darwin ]] && continue
+        if [[ "$(basename "$d")" == wit-* ]] && live_session "$d"; then
+            say "keeping $d: its integration test run is still going"
+            continue
+        fi
         if ps -eo args= | grep -F -- "$(basename "$d")" | grep -vq -e grep -e clean.sh; then
             say "keeping $d: a running test uses it"
             continue
