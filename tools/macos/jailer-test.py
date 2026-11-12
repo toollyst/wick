@@ -914,6 +914,72 @@ def stage_netns(ctx):
             "a third jail in a's directory reaches a's host; vmnet and a busy name refused; a file refused")
 
 
+def macos_major():
+    return int(subprocess.run(["sw_vers", "-productVersion"], capture_output=True, text=True,
+                              check=True).stdout.split(".")[0])
+
+
+def put_vmnet(vm, name, expect):
+    """PUT a network interface on `name`: Firecracker starts the vmnet
+    interface then, before any VM (net.rs `Tap::open_named`)."""
+    return vm.api("PUT", "/network-interfaces/eth0",
+                  {"iface_id": "eth0", "host_dev_name": name, "guest_mac": bt.GUEST_MAC}, expect=expect)
+
+
+def stage_vmnet(ctx):
+    """vmnet started by a jailed Firecracker, which is not root (no VM): shared and host mode on
+    macOS 26 need no root (vmnet.rs), earlier majors do; with --netns vmnet is refused."""
+    major = macos_major()
+    done = []
+    for mode in ("vmnet-shared", "vmnet-host"):
+        # Control: Firecracker as root, not jailed. If it cannot start the
+        # interface, the host has no vmnet and the jailed result says nothing.
+        ctl = bt.Vm(ctx, f"{mode}-control", [])
+        r = put_vmnet(ctl, mode, (204, 400))
+        ctl.kill()
+        check(r is None, f"{mode}: root, not jailed, starts no interface, so a jail cannot be judged: {r}")
+        jail = Jail(ctx, mode)
+        vm = JailedVm(ctx, mode, jail)
+        check(proc_ids(vm.proc.pid)[:2] == (UID, GID), f"{mode}: the jailed Firecracker is not {UID}:{GID}")
+        if major >= 26:
+            put_vmnet(vm, mode, (204,))
+            m = vm.wait_for(r"vmnet: network (\d+\.\d+\.\d+\.\d+/\d+)", 10)
+            done.append(f"{mode} started in the jail ({m.group(1)})")
+        else:
+            r = put_vmnet(vm, mode, (400,))
+            check("vmnet_start_interface" in json.dumps(r), f"{mode} in the jail: {r}")
+            done.append(f"{mode} refused in the jail (vmnet_start_interface needs root before macOS 26)")
+        vm.kill()
+    # In the jail's network (--netns), vmnet, the host's network, is refused.
+    net = os.path.join(ctx.base, "vmnet-netns")
+    os.makedirs(net)
+    jail = Jail(ctx, "vmnet-netns")
+    vm = JailedVm(ctx, "vmnet-netns", jail, ["--netns", net])
+    r = put_vmnet(vm, "vmnet-shared", (400,))
+    check("not the jail's" in json.dumps(r), f"vmnet-shared with --netns: {r}")
+    vm.kill()
+    done.append("refused with --netns")
+    return f"macOS {major}: " + "; ".join(done)
+
+
+def stage_vmnet_guest(ctx):
+    """VM: a guest on vmnet-shared in a jail pings the vmnet gateway (macOS 26 and later)."""
+    major = macos_major()
+    check(major >= 26, f"macOS {major}: a jailed Firecracker cannot start vmnet before macOS 26 (stage vmnet)")
+    jail = Jail(ctx, "vmnet-guest", [ctx.kernel, ctx.rootfs])
+    cfg = jail_config(vcpus=2, network_interfaces=[
+        {"iface_id": "eth0", "host_dev_name": "vmnet-shared", "guest_mac": bt.GUEST_MAC}])
+    vm = JailedVm(ctx, "vmnet-guest", jail, config=cfg)
+    m = vm.wait_for(r"vmnet: network (\d+\.\d+\.\d+)\.(\d+)/24", 20)
+    net, gw = m.group(1), f"{m.group(1)}.{m.group(2)}"
+    vm.shell()
+    bt.guest_net_up(vm, f"{net}.77")
+    _, out = vm.sh(f"ping -c 3 -W 3 {gw}")
+    check(" 0% packet loss" in out, f"ping the vmnet gateway {gw} from the jailed guest: {out}")
+    vm.reboot()
+    return f"macOS {major}: a jailed guest on vmnet-shared pings {gw}"
+
+
 ZEROS_64M_MD5 = "7f614da9329cd3aebf59b91aadc30bf0"
 
 
@@ -1073,13 +1139,15 @@ STAGES = {
     "no-api": stage_no_api,
     "boot": stage_boot,
     "netns": stage_netns,
+    "vmnet": stage_vmnet,
+    "vmnet-guest": stage_vmnet_guest,
     "memory": stage_memory,
     "cpu": stage_cpu,
     "hugepages": stage_hugepages,
     "uffd": stage_uffd,
     "vhost-user": stage_vhost_user,
 }
-VM_STAGES = ("no-api", "fsize", "boot", "netns", "memory", "cpu", "hugepages", "uffd", "vhost-user")
+VM_STAGES = ("no-api", "fsize", "boot", "netns", "vmnet-guest", "memory", "cpu", "hugepages", "uffd", "vhost-user")
 
 
 class Context:
