@@ -9,7 +9,13 @@ A helper process maps 64 MiB of private memory and writes every page; the
 harness (wick_macos) reads it as upstream's tests would read a Firecracker:
 
 - get_resident_memory is the task's resident size plus its compressed pages
-  (TASK_VM_INFO), and the resident size is psutil's RSS;
+  (TASK_VM_INFO) less the platform part (the dyld shared cache's pages,
+  shared_cache_part, which the memory monitor counts apart), and the resident
+  size is psutil's RSS;
+- the platform part is held to its ceiling: over it, or with no ceiling
+  measured for the macOS, get_resident_memory raises (the helper is Python,
+  not Firecracker, so the ceiling is set from its own part for the other
+  checks);
 - each of memory_maps' mappings counts its present and its compressed pages
   (`rss` = `present` + `swapped`), and the helper's 64 MiB are in one;
 - after the helper replaces the 64 MiB with fresh pages (mmap MAP_FIXED, as
@@ -89,13 +95,33 @@ def main():
         addr = int(helper.stdout.readline(), 16)
         proc = psutil.Process(helper.pid)
 
+        cache = w.shared_cache_part(w.memory_maps(proc, grouped=False))
+        check("the helper maps the dyld shared cache", cache > 0, f"{cache >> 10} KiB")
+        for ceiling, error, what in ((None, RuntimeError, "no ceiling measured"),
+                                     (cache - (64 << 10), w._memory.MemoryUsageExceededError, "over the ceiling")):  # pylint: disable=protected-access
+            w.SHARED_CACHE_CEILING = ceiling
+            try:
+                w.get_resident_memory(proc)
+                raised = None
+            except Exception as err:  # pylint: disable=broad-except
+                raised = err
+            check(f"{what}: get_resident_memory raises", isinstance(raised, error), repr(raised)[:160])
+        w.SHARED_CACHE_CEILING = cache + MIB
+
         def readings(label):
-            info = w._task_vm_info(helper.pid)  # pylint: disable=protected-access
-            rss = w.get_resident_memory(proc)
-            maps = w.memory_maps(proc, grouped=False)
+            for _ in range(5):
+                maps = w.memory_maps(proc, grouped=False)
+                info = w._task_vm_info(helper.pid)  # pylint: disable=protected-access
+                rss = w.get_resident_memory(proc)
+                again = w.memory_maps(proc, grouped=False)
+                if w.shared_cache_part(again) == w.shared_cache_part(maps):
+                    break
+            part = w.shared_cache_part(maps)
             region = next((m for m in maps if m.addr <= addr < m.addr + m.size), None)
-            check(f"{label}: get_resident_memory is resident + compressed", rss == (info["resident"] + info["compressed"]) // 1024,
-                  f"{rss} KiB; resident {info['resident'] >> 10}, compressed {info['compressed'] >> 10} KiB")
+            check(f"{label}: get_resident_memory is resident + compressed - the shared cache's part",
+                  rss == (info["resident"] + info["compressed"] - part) // 1024,
+                  f"{rss} KiB; resident {info['resident'] >> 10}, compressed {info['compressed'] >> 10}, "
+                  f"shared cache {part >> 10} KiB")
             check(f"{label}: every mapping's rss is present + swapped", all(m.rss == m.present + m.swapped for m in maps),
                   f"{len(maps)} mappings")
             return info, rss, region

@@ -59,9 +59,9 @@
 #
 # A diagnostic run: one with WICK_IT_DIAG_MEMORY=1 (each memory reading of
 # get_stable_rss_mem logged with its parts, the host's paging and the guest's
-# /proc/meminfo, in OUT/memory-diag.jsonl), WICK_IT_DIAG_RSS_LESS=shared-cache
-# or =vmm (that reading without the VMM's shared cache part, or without both
-# its parts) or WICK_IT_DEFER_MEMORY_ERROR=1
+# /proc/meminfo, in OUT/memory-diag.jsonl), WICK_IT_DIAG_RSS_LESS=vmm (that
+# reading without the VMM's own part too; it always leaves out the VMM's
+# shared cache part) or WICK_IT_DEFER_MEMORY_ERROR=1
 # (the memory monitor's error at a kill inside a test held to the test's
 # end, so that the steps after the kill run; the test still fails), as
 # tools/macos/integration/wick_macos.py (DIAGNOSTIC_SWITCHES) describes.

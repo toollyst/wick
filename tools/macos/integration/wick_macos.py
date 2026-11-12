@@ -435,6 +435,14 @@ _set_self_region_footprint()
 _FOOTPRINT_LOCK = threading.Lock()
 
 
+def shared_cache_part(maps):
+    """Bytes: the VMM's platform part in `maps` (memory_maps), the pages of
+    its dyld shared cache mappings, present or compressed. The one
+    definition the memory monitor (vmm_parts) and the reading
+    (get_resident_memory) both use."""
+    return sum(m.rss for m in maps if m.shared_cache)
+
+
 def memory_maps(self, grouped=True):
     """psutil's `Process.memory_maps` on macOS (psutil has it on Linux only).
 
@@ -505,7 +513,7 @@ def _memory_maps(self):
         last = (kind,)
     if not maps and not psutil.pid_exists(self.pid):
         raise psutil.NoSuchProcess(self.pid)
-    _LAST_SHARED_CACHE_RSS[0] = sum(m.rss for m in maps if m.shared_cache)
+    _LAST_SHARED_CACHE_RSS[0] = shared_cache_part(maps)
     return maps
 
 
@@ -589,6 +597,28 @@ elif MACOS_MAJOR in SHARED_CACHE_CEILING_MIB:
     SHARED_CACHE_CEILING = SHARED_CACHE_CEILING_MIB[MACOS_MAJOR] * (1 << 20)
 else:
     SHARED_CACHE_CEILING = None  # not measured on this macOS: check_samples fails
+
+
+def hold_shared_cache_part(cache):
+    """The shared cache's part (bytes) held to SHARED_CACHE_CEILING, as the
+    memory monitor holds it and get_resident_memory, which leaves it out of
+    its reading, holds it: RuntimeError when the ceiling is not measured on
+    this macOS, MemoryUsageExceededError over it."""
+    if SHARED_CACHE_CEILING is None:
+        raise _unmeasured_ceiling()
+    if cache > SHARED_CACHE_CEILING:
+        raise _memory.MemoryUsageExceededError(
+            cache, SHARED_CACHE_CEILING,
+            f"the dyld shared cache's part, over its ceiling for macOS {MACOS_MAJOR}")
+
+
+def _unmeasured_ceiling():
+    return RuntimeError(
+        f"memory monitor: the shared cache's ceiling is not measured on this macOS ({MACOS_MAJOR}); "
+        f"measured on {sorted(SHARED_CACHE_CEILING_MIB)}. Measure it (memory-parts.jsonl, "
+        "WICK_IT_SHARED_CACHE_CEILING_MIB) and add it to wick_macos.SHARED_CACHE_CEILING_MIB")
+
+
 _MEMORY_PARTS = pathlib.Path(os.environ.get("WICK_IT_BINARY_DIR", SESSION_ROOT)).parent / "memory-parts.jsonl"
 
 # A diagnostic run: one with any of these switches on, which
@@ -599,13 +629,14 @@ _MEMORY_PARTS = pathlib.Path(os.environ.get("WICK_IT_BINARY_DIR", SESSION_ROOT))
 # - WICK_IT_DIAG_MEMORY: each reading get_stable_rss_mem takes logs its parts
 #   to memory-diag.jsonl (diag_get_resident_memory), and each stable reading
 #   the guest's view (diag_get_stable_rss_mem).
-# - WICK_IT_DIAG_RSS_LESS=shared-cache or =vmm: get_resident_memory, as
-#   get_stable_rss_mem reads it, leaves out the VMM's platform part (the
-#   dyld shared cache's pages) or the VMM's both parts (the shared cache's
-#   and its own, leaving the guest's memory): what the tests that size
-#   something from the reading (test_deflate_on_oom's balloon) do with a
-#   VMM of less memory, Linux's static binary has no platform part. Its
-#   readings are logged as WICK_IT_DIAG_MEMORY logs them (on with it).
+# - WICK_IT_DIAG_RSS_LESS=vmm: get_resident_memory, as get_stable_rss_mem
+#   reads it, leaves out the VMM's own part too (it always leaves out the
+#   platform part, the dyld shared cache's pages), leaving the guest's
+#   memory: what the tests that size something from the reading
+#   (test_deflate_on_oom's balloon) do with a VMM that holds nothing besides
+#   the guest. Its readings are logged as WICK_IT_DIAG_MEMORY logs them (on
+#   with it). (=shared-cache, the platform part alone, is the reading itself
+#   since run m2-less-cache.)
 # - WICK_IT_DEFER_MEMORY_ERROR: the memory monitor's error at a kill inside a
 #   test (upstream raises it there, microvm.py kill -> check_samples, and the
 #   test's later steps do not run) is held to the test's end and raised
@@ -614,8 +645,9 @@ _MEMORY_PARTS = pathlib.Path(os.environ.get("WICK_IT_BINARY_DIR", SESSION_ROOT))
 DIAGNOSTIC_SWITCHES = ("WICK_IT_DIAG_MEMORY", "WICK_IT_DIAG_RSS_LESS", "WICK_IT_DEFER_MEMORY_ERROR")
 DIAGNOSTIC = [s for s in DIAGNOSTIC_SWITCHES if os.environ.get(s, "") not in ("", "0")]
 RSS_LESS = os.environ.get("WICK_IT_DIAG_RSS_LESS", "") if "WICK_IT_DIAG_RSS_LESS" in DIAGNOSTIC else ""
-if RSS_LESS not in ("", "shared-cache", "vmm"):
-    raise ValueError(f"WICK_IT_DIAG_RSS_LESS={RSS_LESS!r}: shared-cache or vmm")
+if RSS_LESS not in ("", "vmm"):
+    raise ValueError(f"WICK_IT_DIAG_RSS_LESS={RSS_LESS!r}: vmm (the reading leaves out the shared cache's "
+                     "part without a switch)")
 _MEMORY_DIAG = _MEMORY_PARTS.with_name("memory-diag.jsonl")
 # While a test's call runs with WICK_IT_DEFER_MEMORY_ERROR: the errors held.
 _DEFERRED = {"active": False, "errors": []}
@@ -632,15 +664,11 @@ def vmm_parts(maps, guest_bytes):
     monitor counts them: the dyld shared cache's mappings, and every other
     mapping but guest memory, which upstream's monitor knows by its size
     (MemoryMonitor.is_guest_mem), and a Nitro Enclaves device's."""
-    own = cache = 0
-    for m in maps:
-        # Upstream skips a mapping by its size as guest memory; the
-        # shared cache's are never guest memory, and some are larger.
-        if m.shared_cache:
-            cache += m.rss
-        elif "nitro_enclaves" not in m.path and not _GUEST_RULE.is_guest_mem(m.size, guest_bytes):
-            own += m.rss
-    return own, cache
+    # Upstream skips a mapping by its size as guest memory; the shared
+    # cache's are never guest memory, and some are larger.
+    own = sum(m.rss for m in maps if not m.shared_cache and "nitro_enclaves" not in m.path
+              and not _GUEST_RULE.is_guest_mem(m.size, guest_bytes))
+    return own, shared_cache_part(maps)
 
 
 def monitor_run(self):
@@ -683,11 +711,8 @@ def check_samples(self):
     import json as _json  # pylint: disable=import-outside-toplevel
     import logging  # pylint: disable=import-outside-toplevel
     if SHARED_CACHE_CEILING is None:
-        raise RuntimeError(
-            f"memory monitor: the shared cache's ceiling is not measured on this macOS ({MACOS_MAJOR}); "
-            f"measured on {sorted(SHARED_CACHE_CEILING_MIB)}. Measure it (memory-parts.jsonl, "
-            "WICK_IT_SHARED_CACHE_CEILING_MIB) and add it to wick_macos.SHARED_CACHE_CEILING_MIB")
-    peak = getattr(self, "wick_peak", None)
+        raise _unmeasured_ceiling()
+    peak =getattr(self, "wick_peak", None)
     if peak is not None:
         with contextlib.suppress(OSError), open(_MEMORY_PARTS, "a", encoding="utf-8") as f:
             f.write(_json.dumps({"test": os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0],
@@ -798,7 +823,10 @@ def get_resident_memory(process):
 
     macOS: the task's resident size and its compressed pages (_task_vm_info:
     TASK_VM_INFO resident_size + compressed), the counterpart of VmRSS +
-    VmSwap. macOS compresses a process's pages whenever the host is short of
+    VmSwap, less the VMM's platform part (shared_cache_part: the system
+    libraries' pages from the dyld shared cache, below), which is held to
+    its ceiling instead, as the memory monitor holds it
+    (hold_shared_cache_part). macOS compresses a process's pages whenever the host is short of
     memory, without swap: measured in m2-diag (dd657f4), a restored VM's
     resident size fell 6.5 MiB while the guest wrote 60 MiB, its
     phys_footprint rose 62.9 MiB, the host's memory pressure went to warn
@@ -821,11 +849,27 @@ def get_resident_memory(process):
     through Hypervisor.framework among them (measured on a 256 MiB guest:
     62,112 KiB idle, 217,664 after the guest wrote 150 MiB). Hugetlb: none
     on macOS, a huge page mapping is host pages (docs/PORTING.md row 10),
-    counted like the rest. Its one difference from Linux's is an offset:
-    the system libraries' pages the process mapped from the dyld shared
-    cache, where upstream's static Firecracker carries 1.6 MiB of its own
-    text: 4.64 MiB in the page tables in every microVM of run m2-parts (the
-    memory monitor's platform part). (A reading of 19 MiB here set the RSS
+    counted like the rest.
+
+    The platform part is left out: the system libraries' pages the process
+    mapped from the dyld shared cache, which a macOS process cannot do
+    without (QA1118) and upstream's static Firecracker carries inside its
+    own text: 4.64 MiB in every microVM of run m2-parts, 4.64 (4,752 KiB)
+    in each of the 16 of m2-less-cache and m2-less-vmm. The VMM's own part
+    stays in, as Linux's VmRSS counts Firecracker's own pages (its binary's
+    text, its heap, its stacks): 4.3 to 4.8 MiB there. The reading matters
+    beyond its changes where a test sizes something from it:
+    test_deflate_on_oom inflates its balloon to `256 - (reading + 50)` MiB,
+    and the guest then has the reading's MiB beyond its own memory free. In
+    the diagnostic runs at c0cf9ee, with deflate_on_oom (the guest's
+    MemAvailable after the inflation in brackets): m2-less-cache, the
+    reading without the platform part, a balloon of 63 MiB (126) did not
+    deflate and one of 65 (121) did; m2-less-vmm, without the own part too,
+    67 (123) and 70 (122) both did; the full reading of m2-kpf, 58 to 60,
+    neither. So the test passes when the VMM's own part is about 2 MiB or
+    less (memory-diag.jsonl's sweep), and it fails on that part, not on
+    the reading (tools/macos/integration-test-differences.txt).
+    (A reading of 19 MiB here set the RSS
     against the other regions' residency in their objects, not their pages
     in the page tables.)
 
@@ -847,8 +891,18 @@ def get_resident_memory(process):
     every guest page is present: the snapshot read the pages the guest never
     touched, and macOS gives real zero pages where Linux reads its shared
     zero page uncharged, as docs/PORTING.md row 15 notes for Windows.)"""
+    held, maps = _reading_parts(process)
+    cache = shared_cache_part(maps)
+    hold_shared_cache_part(cache)
+    return (held - cache) // 1024
+
+
+def _reading_parts(process):
+    """Bytes the task holds (resident + compressed, _task_vm_info), and its
+    mappings (memory_maps), read one after the other."""
+    maps = memory_maps(process, grouped=False)
     info = _task_vm_info(process.pid)
-    return (info["resident"] + info["compressed"]) // 1024
+    return info["resident"] + info["compressed"], maps
 
 
 _utils.get_resident_memory = get_resident_memory
@@ -881,7 +935,8 @@ def _task_memory(pid):
     """KiB: the task's resident size and phys_footprint (proc_pid_rusage,
     RUSAGE_INFO_V0: ri_resident_size, ri_phys_footprint, the 9th and 10th
     64-bit words), and apart its internal, external and compressed pages
-    (_task_vm_info); get_resident_memory is resident + compressed."""
+    (_task_vm_info); get_resident_memory is resident + compressed, less
+    the shared cache's part."""
     buf = (ctypes.c_uint64 * 12)()
     if _libsystem.proc_pid_rusage(pid, 0, ctypes.byref(buf)):
         return {"error": os.strerror(ctypes.get_errno())}
@@ -1033,8 +1088,10 @@ def diag_get_resident_memory(process):
     regions (_region_groups) and the host's paging (_host_memory), and the
     VMM's two parts as the memory monitor counts them (vmm_parts), with the
     balloon test_deflate_on_oom would size from the reading with or without
-    them. With WICK_IT_DIAG_RSS_LESS the reading returned leaves out the
-    shared cache's part (shared-cache) or both parts (vmm).
+    them. With WICK_IT_DIAG_RSS_LESS=vmm the reading returned leaves out the
+    own part too. "rss_kib" is get_resident_memory's reading (less the
+    shared cache's part since m2-less-cache; the full reading before),
+    "full_kib" the task's resident + compressed.
 
     The sweep "own_mib": the reading less the shared cache's part, with the
     VMM's own part replaced by 0 to 5 MiB: what a VMM that holds that much
@@ -1042,27 +1099,27 @@ def diag_get_resident_memory(process):
     (upstream's SPECIFICATION.md: a memory overhead <= 5 MiB, the memory
     monitor's budget); how much less is not measured here (the Linux CI
     keeps pass and fail only), so every value is logged, not one guessed."""
-    rss = get_resident_memory(process)
+    held, maps = _reading_parts(process)
+    cache = shared_cache_part(maps)
+    hold_shared_cache_part(cache)
+    rss = (held - cache) >> 10
     if _DIAG_CALL[1] is not None:
         record = {"kind": "reading", "call": _DIAG_CALL[1], "pid": process.pid, "rss_kib": rss}
         try:
             record.update(task=_task_memory(process.pid), regions=_region_groups(process.pid))
             if _DIAG_GUEST[0]:
-                with _FOOTPRINT_LOCK:
-                    own, cache = vmm_parts(_memory_maps(process), _DIAG_GUEST[0])
-                guest = rss * 1024 - own - cache
+                own, _ = vmm_parts(maps, _DIAG_GUEST[0])
+                guest = held - cache - own
                 record["parts"] = {
-                    "full_kib": rss, "shared_cache_kib": cache >> 10, "own_kib": own >> 10,
+                    "full_kib": held >> 10, "shared_cache_kib": cache >> 10, "own_kib": own >> 10,
                     "balloon_mib": {
-                        "full": _deflate_balloon_mib(rss),
-                        "less shared cache": _deflate_balloon_mib((rss * 1024 - cache) >> 10),
+                        "full": _deflate_balloon_mib(held >> 10),
+                        "less shared cache": _deflate_balloon_mib(rss),
                         "guest only": _deflate_balloon_mib(guest >> 10),
                         "own_mib": {x: _deflate_balloon_mib((guest + (x << 20)) >> 10) for x in range(6)},
                     },
                 }
-                if RSS_LESS == "shared-cache":
-                    rss = (rss * 1024 - cache) >> 10
-                elif RSS_LESS == "vmm":
+                if RSS_LESS == "vmm":
                     rss = guest >> 10
                 record["rss_less"], record["returned_kib"] = RSS_LESS, rss
         except psutil.NoSuchProcess:

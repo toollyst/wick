@@ -59,7 +59,9 @@ all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
 # 4.64 MiB in every one of 77 microVMs with a guest (m2-parts, wick
 # 8d577b7, and m2-parts2, d706d9a; macOS 27.2), and the monitor holds it to a ceiling of 5 MiB
 # for macOS 27 (wick_macos.SHARED_CACHE_CEILING_MIB; a macOS major not
-# measured fails every monitored test, saying so).
+# measured fails every monitored test, saying so). get_resident_memory, the
+# RSS the balloon tests read, leaves the part out and holds it to the same
+# ceiling (wick_macos.shared_cache_part: one definition for both).
 #
 # The VMM's own part, the bug: every mapping outside the shared cache,
 # held to upstream's 5 and 7 MiB. In m2-parts2 (d706d9a, with the pages
@@ -234,21 +236,29 @@ all bug integration_tests/functional/test_net.py::test_tap_offload
 # The test sizes a balloon from the RSS it measures (test_balloon.py:
 # 256 MiB minus get_resident_memory minus 50 MiB), so that the guest runs out
 # of memory when it dirties 128 MiB, and with deflate_on_oom the balloon
-# deflates. On macOS the guest does not run out of memory ("Balloon did not
-# deflate"; both variants in m2-parts2, d706d9a). The variant without
-# deflate_on_oom passes. Measured in the diagnostic run m2-kpf (33b9eec,
-# WICK_IT_DIAG_MEMORY, the guest's /proc/kpageflags): after boot the reading
-# is 147 MiB, the guest has 31,532 of its 65,024 RAM pages in use (123 MiB,
-# its reserved memory among them) and they fill 7,939 16 KiB frames
-# (124 MiB): the host's 16 KiB pages add 0.7%, so they are not the cause
-# (upstream's aarch64 CI hosts run 4 KiB pages: CONFIG_ARM64_4K_PAGES=y in
-# the Amazon Linux 2 5.10 and 2023 6.1 and 6.18 aarch64 kernels' configs).
-# The balloon is then 59 MiB and leaves the guest 77 MiB free and about
-# 58 MiB of page cache, about the 128 MiB the test writes: the margin is a
-# few MiB, and the reading carries the dyld shared cache's 4.64 MiB (the
-# memory entry above), which upstream's static Linux binary does not. To
-# find: whether that offset is what keeps the guest out of the OOM (a run
-# with the reading less the shared cache's part).
+# deflates. Every MiB the reading holds beyond the guest's memory is a MiB
+# more the guest has free (upstream tuned this sizing three times for guests
+# a few MiB smaller: 214314d30, 80abdb211, 4f3d8cd27). On macOS the guest
+# does not run out of memory ("Balloon did not deflate"; both variants in
+# m2-parts2, d706d9a). The variant without deflate_on_oom passes. Measured
+# in the diagnostic run m2-kpf (33b9eec, the guest's /proc/kpageflags): the
+# guest has 31,532 of its 65,024 RAM pages in use (123 MiB, its reserved
+# memory among them) and they fill 7,939 16 KiB frames (124 MiB): the
+# host's 16 KiB pages add 0.7%, so they are not the cause (upstream's
+# aarch64 CI hosts run 4 KiB pages: CONFIG_ARM64_4K_PAGES=y in the Amazon
+# Linux 2 5.10 and 2023 6.1 and 6.18 aarch64 kernels' configs). The reading
+# has left out the dyld shared cache's part since (get_resident_memory, as
+# the memory monitor counts it apart: the memory entry above); it keeps the
+# VMM's own part, as Linux's VmRSS keeps Firecracker's own pages. In the
+# diagnostic runs at c0cf9ee, with deflate_on_oom (balloon MiB, the guest's
+# MemAvailable after the inflation in brackets): m2-less-cache, the reading
+# without the shared cache's part, PCI_ON 63 (126) did not deflate, PCI_OFF
+# 65 (121) did; m2-less-vmm, without the own part too, PCI_ON 67 (123) and
+# PCI_OFF 70 (122) both did; m2-kpf, the full reading, 58 to 60, neither. So
+# it passes when the VMM's own part is about 2 MiB or less; it is 4.3 to
+# 4.8 MiB (the memory entry above has what holds it). A run where it passes
+# before that part comes down passes at the margin, by luck: the entry stays
+# until then.
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_ON-True-kvm]
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_OFF-True-kvm]
 
