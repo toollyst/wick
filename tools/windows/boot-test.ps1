@@ -31,6 +31,9 @@
 #          memory" for this account)
 #   devices  virtio-rng, a rate-limited drive, MMDS V2, the balloon and its
 #          statistics, the logger's and the metrics' files
+#   balloon  150 MiB balloon cycles on a guest restored from a memory file
+#          and on a booted one: O_DIRECT reads of the drive read the file,
+#          and the commit charge goes down and up again with the balloon
 #
 # Before each reset the guest kernel log must be free of stalls, BUGs, oopses
 # and warnings.
@@ -1783,6 +1786,93 @@ function Stage-Devices {
     Check ($log -match 'Successfully started microvm that was configured from one single json' -and $log -match 'The API server received a Put request on "/mmds"') 'the logger writes to its file'
     return 'virtio-rng, rate-limited block, MMDS V2 over the net endpoint, balloon inflate + statistics, logger and metrics files'
 }
+# A balloon cycle on a guest restored from a memory file, then on a booted
+# one, the counterpart of the macOS stage: the guest and the host keep using
+# the same pages (O_DIRECT reads of the drive, whose buffers come from pages
+# the balloon gave back, read what the file holds), and the pages the balloon
+# took leave Firecracker's commit charge, which the jail's memory.max limits
+# (row 15), and come back when the guest writes them again.
+function Stage-Balloon {
+    $disk = [Wick.Util]::Md5File($Rootfs, 64MB)
+    $dir = Join-Path $Scratch 'balloon'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $cfg = Base-Config 2 512
+    $cfg['balloon'] = [ordered]@{ amount_mib = 0; deflate_on_oom = $true; stats_polling_interval_s = 1 }
+    # The O_DIRECT reads of the drive's first 64 MiB that read it wrong.
+    $directReads = {
+        param($vm, [int]$n)
+        $bad = @()
+        for ($i = 0; $i -lt $n; $i++) {
+            $out = $vm.Sh('dd if=/dev/vda bs=1M count=64 iflag=direct 2>/dev/null | md5sum', 120000, $true)
+            if ((Get-Fields $out)[0] -ne $disk) { $bad += $i }
+        }
+        return , $bad
+    }
+    $actual = {
+        param($vm, [int]$mib)
+        $until = [DateTime]::UtcNow.AddSeconds(60)
+        while ($true) {
+            $raw = Invoke-Api $vm 'GET' '/balloon/statistics'
+            if (($raw | ConvertFrom-Json).actual_mib -eq $mib) { return }
+            Check ([DateTime]::UtcNow -lt $until) "balloon statistics $raw, wanted $mib MiB"
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    # Private bytes: the commit charge (Process.PagefileUsage is 32-bit).
+    $commit = { param($vm) return (Get-Process -Id $vm.Pid).PrivateMemorySize64 }
+    # Pages the guest wrote and freed: what the balloon hands over is then
+    # backed on the host, and so is what O_DIRECT reads land in.
+    $dirty = 'mount -t tmpfs -o size=300m tmpfs /tmp 2>/dev/null; head -c 200m /dev/urandom > /tmp/f && rm /tmp/f'
+
+    # A guest restored from a memory file.
+    $vm = Start-Vm 'balloon-1' $cfg -Api
+    Wait-Shell $vm
+    $bad = & $directReads $vm 2
+    Check ($bad.Count -eq 0) "O_DIRECT reads $($bad -join ', ') of /dev/vda read it wrong before any balloon"
+    $vm.Sh($dirty, 120000, $true) | Out-Null
+    $state = Join-Path $dir 'balloon.state'
+    $mem = Join-Path $dir 'balloon.mem'
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+    Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $state; mem_file_path = $mem }) | Out-Null
+    $vm.Kill()
+    $vm = Start-Vm 'balloon-2' $null -Api
+    Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
+        snapshot_path = $state
+        mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = $mem }
+        resume_vm     = $true
+    }) | Out-Null
+    Invoke-Api $vm 'PATCH' '/balloon' ([ordered]@{ amount_mib = 150 }) | Out-Null
+    & $actual $vm 150
+    Invoke-Api $vm 'PATCH' '/balloon' ([ordered]@{ amount_mib = 0 }) | Out-Null
+    & $actual $vm 0
+    $bad = & $directReads $vm 6
+    Check ($bad.Count -eq 0) "after a restore from file and a 150 MiB balloon cycle, O_DIRECT reads $($bad -join ', ') of /dev/vda read it wrong"
+    $vm.Reboot()
+    Remove-Item -Force $mem, $state
+
+    # A booted guest: the commit charge goes down by what the balloon took
+    # and up again when the guest writes the pages again.
+    $vm = Start-Vm 'balloon-3' $cfg -Api
+    Wait-Shell $vm
+    $vm.Sh($dirty, 120000, $true) | Out-Null
+    $before = & $commit $vm
+    Invoke-Api $vm 'PATCH' '/balloon' ([ordered]@{ amount_mib = 150 }) | Out-Null
+    & $actual $vm 150
+    $inflated = & $commit $vm
+    Check (($before - $inflated) -ge 100MB) ("commit charge {0} MiB before a 150 MiB balloon, {1} MiB after" -f ($before -shr 20), ($inflated -shr 20))
+    Invoke-Api $vm 'PATCH' '/balloon' ([ordered]@{ amount_mib = 0 }) | Out-Null
+    & $actual $vm 0
+    $bad = & $directReads $vm 6
+    Check ($bad.Count -eq 0) "after a 150 MiB balloon cycle, O_DIRECT reads $($bad -join ', ') of /dev/vda read it wrong"
+    $vm.Sh($dirty, 120000, $true) | Out-Null
+    $again = & $commit $vm
+    Check (($again - $inflated) -ge 100MB) ("commit charge {0} MiB while inflated, {1} MiB after the guest wrote 200 MiB again" -f ($inflated -shr 20), ($again -shr 20))
+    Save-Dmesg $vm 'balloon'
+    $vm.Reboot()
+    $summary = "on a booted guest, commit charge {0} -> {1} -> {2} MiB and reads match 6 of 6" -f ($before -shr 20), ($inflated -shr 20), ($again -shr 20)
+    return "150 MiB balloon cycles: after a restore from file, O_DIRECT reads of /dev/vda match 6 of 6; $summary"
+}
+
 function Stage-Hugepages {
     $priv = (whoami /priv | Select-String 'SeLockMemoryPrivilege') -ne $null
     Check $priv ("this account lacks 'Lock pages in memory' (SeLockMemoryPrivilege): an administrator grants it in " +
@@ -1821,6 +1911,7 @@ $Stages = [ordered]@{
     hugepages = { Stage-Hugepages }
     'api-process' = { Stage-ApiProcess }
     devices  = { Stage-Devices }
+    balloon  = { Stage-Balloon }
 }
 
 # --- run ------------------------------------------------------------------------
