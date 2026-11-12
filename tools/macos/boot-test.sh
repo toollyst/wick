@@ -17,7 +17,7 @@
 #   tools/macos/boot-test.sh [--release] [stage...]
 #
 # Stages (default: all, in this order): boot smp block vsock net vmnet
-# snapshot diff uffd hugepages pci vhost-user devices balloon restores
+# snapshot snapshot-permissions diff uffd hugepages pci vhost-user devices balloon restores
 # api-process cli tools no-seccomp memory-hotplug cpu-templates pvtime (PV steal
 # time: on macOS 27 its figures, elsewhere that it is not offered). vmnet uses
 # vmnet-shared (NAT); older macOS

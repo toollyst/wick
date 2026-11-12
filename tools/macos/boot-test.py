@@ -779,6 +779,79 @@ def stage_snapshot(ctx, pci=False):
             + (" over PCI" if pci else ""))
 
 
+def stage_snapshot_permissions(ctx):
+    """Upstream's test_negative_snapshot_permissions, without the jailer: a
+    snapshot into a directory Firecracker cannot write is refused with the
+    host's "Permission denied" and the microVM lives on; a restore from a
+    memory file, a state file or a drive it cannot read is refused with
+    upstream's error for each, and Firecracker ends, as after any failed
+    load. Upstream's test takes the permissions from the jail's directory
+    and so needs the jailer (root: tools/macos/integration-tests.sh
+    --jailer); here Firecracker runs as the user, against a directory and
+    files of the user's own with their permissions taken away."""
+    tag = "sperm"
+    data = os.path.join(ctx.out, f"{tag}.img")
+    random_file(data, 1 << 20)
+    drives = [{"drive_id": "data", "path_on_host": data, "is_root_device": False, "is_read_only": True}]
+    vm = ctx.vm(f"{tag}1", [], config(ctx, drives=drives))
+    vm.shell()
+    vm.sh("A=before-$((6*7))")
+    target = os.path.join(ctx.out, f"{tag}-dir")
+    os.mkdir(target)
+    state, mem = os.path.join(target, "state"), os.path.join(target, "mem")
+    create = {"snapshot_type": "Full", "snapshot_path": state, "mem_file_path": mem}
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    os.chmod(target, 0o500)
+    try:
+        r = vm.api("PUT", "/snapshot/create", create, expect=(400,))
+    finally:
+        os.chmod(target, 0o700)
+    refused = r["fault_message"]
+    check("Permission denied (os error 13)" in refused, f"a snapshot into a read-only directory: {refused}")
+    check(not os.listdir(target), f"the refused snapshot left {os.listdir(target)}")
+    # The microVM lives on: resumed, its shell answers; then the snapshot
+    # is made once the directory can be written.
+    vm.api("PATCH", "/vm", {"state": "Resumed"})
+    _, out = vm.sh("echo alive $A")
+    check(out == "alive before-42", f"after the refused snapshot: {out!r}")
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    vm.api("PUT", "/snapshot/create", create)
+    vm.kill()
+
+    load = {"snapshot_path": state, "mem_backend": {"backend_type": "File", "backend_path": mem}, "resume_vm": True}
+    # Upstream's three messages, word for word.
+    cases = (
+        ("memory file", mem,
+         "Load snapshot error: Failed to restore from snapshot: Failed to load guest memory: Error creating guest "
+         "memory from file: Failed to load guest memory: Permission denied (os error 13)"),
+        ("state file", state,
+         "Load snapshot error: Failed to restore from snapshot: Failed to get snapshot state from file: Failed to "
+         "open snapshot file: Permission denied (os error 13)"),
+        ("drive", data,
+         "Virtio backend error: Error manipulating the backing file: Permission denied (os error 13)"),
+    )
+    for n, (what, path, want) in enumerate(cases):
+        mode = os.stat(path).st_mode & 0o777
+        os.chmod(path, 0)
+        try:
+            vm = ctx.vm(f"{tag}-load{n}", [])
+            r = vm.api("PUT", "/snapshot/load", load, expect=(400,))
+            check(want in r["fault_message"], f"a restore with an unreadable {what}: {r['fault_message']}")
+            code = vm.wait_exit(10)
+            check(code != 0, f"Firecracker after a restore refused for its {what}: exit status {code}")
+        finally:
+            os.chmod(path, mode)
+    # With the permissions back, the same snapshot restores.
+    vm = ctx.vm(f"{tag}2", [])
+    vm.api("PUT", "/snapshot/load", load)
+    _, out = vm.sh("echo restored $A")
+    check(out == "restored before-42", f"after the restore: {out!r}")
+    vm.reboot()
+    return ("a snapshot into a directory without write permission: 400 Permission denied, nothing left there, the "
+            "microVM runs on; a restore with an unreadable memory file, state file or drive: upstream's error for "
+            "each and Firecracker exits; the snapshot restores once readable")
+
+
 def restored_checks(vm, bash_md5, data):
     _, out = vm.sh("echo restored $A")
     check(out == "restored before-42", f"after restore: {out!r}")
@@ -1921,6 +1994,7 @@ STAGES = {
     "net": stage_net,
     "vmnet": stage_vmnet,
     "snapshot": stage_snapshot,
+    "snapshot-permissions": stage_snapshot_permissions,
     "diff": stage_diff,
     "uffd": stage_uffd,
     "hugepages": stage_hugepages,

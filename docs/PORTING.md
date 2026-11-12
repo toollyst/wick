@@ -94,6 +94,7 @@ exemption.
 | `boot`, `smp`, `block`, `vsock`, `net` | yes | yes |
 | `vmnet` | yes (root before macOS 26) | no counterpart (vmnet is macOS's) |
 | `snapshot`, `diff`, `uffd`, `pci`, `restores`, `vhost-user` | yes | yes |
+| `snapshot-permissions`: a snapshot into a directory without write permission, and a restore from files without read permission, are refused with upstream's errors | yes | no stage: upstream's `test_negative_snapshot_permissions` runs there |
 | `devices`: logger, metrics, MMDS, balloon, entropy, a rate limiter | yes | yes (`boot-test.ps1 devices`, row 15) |
 | `balloon`: a 150 MiB balloon cycle on a guest restored from a memory file, then on a booted guest | yes: the guest keeps the pages the host and the devices use (O_DIRECT reads of the drive match the file 6 of 6 times after each cycle; before the fix 6 of 6 read stale data, as Hypervisor.framework had kept the pages a `MAP_FIXED` discard replaced), and the pages the balloon took leave the VMM's footprint (the jailer's limit is on it) and are charged again when the guest writes them (measured 263 → 114 → 270 MiB; `test_madvise_dontneed_replaces_guest_pages`: 66 → 2 → 66 MiB for 64 MiB of guest pages) | written, not yet run on a WHP machine: the same cycles, with the commit charge (what the jail's `memory.max` limits, row 15) for the footprint (`boot-test.ps1 balloon`) |
 | `hugepages` | yes (2 MiB pages on host pages: row 10) | yes; unjailed it needs "Lock pages in memory", jailed the large pages come from the jailer (row 10, `jailer-test.ps1 hugepages`) |
