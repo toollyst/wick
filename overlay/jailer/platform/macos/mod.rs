@@ -84,6 +84,11 @@ pub enum HostError {
          The jailer never accepts a limit it cannot enforce."
     )]
     UnsupportedCgroup(String, &'static str),
+    #[error(
+        "--{0} is not supported on macOS: {1}. The jailer never accepts an isolation option it \
+         cannot enforce."
+    )]
+    Unsupported(&'static str, &'static str),
     #[error("--cgroup {0}: {1}")]
     CgroupValue(String, &'static str),
     #[error("No macOS equivalent for the device {0:?} in the jail")]

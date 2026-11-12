@@ -23,12 +23,58 @@
 //! refused as upstream refuses it, `cgroup` being no controller. Every other
 //! controller and property is refused with its reason ([`refusal`]), never
 //! accepted without effect. macOS has no cgroup hierarchy, so the v2
-//! hierarchy is an empty directory: there is no parent cgroup to join.
+//! hierarchy is an empty directory: there is no parent cgroup to join. A
+//! `--parent-cgroup` the operator names is refused ([`refuse_named_parent`]):
+//! on Linux it bounds a group of jails together, and macOS has no limit on
+//! several processes together that the jailer could make
+//! ([`PARENT_IMPOSSIBLE`]). Upstream's default parent, the exec file's name,
+//! is accepted and places nothing, as on Linux when no such parent was made
+//! beforehand.
 
 use std::path::{Path, PathBuf};
 
 use crate::JailerError;
 use crate::platform::{self, FreezerState, FreezerVersion, HostError, freezer_values};
+
+/// Why a `--parent-cgroup` on the command line is refused. It opens and
+/// ends as Windows's text does, so the two hosts refuse alike; the middle is
+/// macOS's. XNU (apple-oss-distributions/xnu): the one kernel object that
+/// groups processes for resource accounting is a coalition. Its ledger has
+/// one entry, logical writes (osfmk/kern/coalition.c
+/// `init_coalition_ledgers`), whose I/O monitor is its only limit
+/// (bsd/kern/sys_coalition.c `coalition_ledger`); memory and CPU time are
+/// summed for reports only (`coalition_resource_usage`). And only a process
+/// of a privileged coalition, launchd's, makes one or spawns into one, root
+/// or not (`coalition()`: `task_is_in_privileged_coalition`, else `EPERM`;
+/// bsd/kern/kern_exec.c, the spawn attribute's coalition). A jetsam limit
+/// and a CPU limit are one process's (the limits this file sets).
+pub(crate) const PARENT_IMPOSSIBLE: &str = "impossible: a parent cgroup that bounds a group of \
+    jails would be a kernel limit on several processes together, which macOS does not have: a \
+    coalition, its one grouping of processes, limits neither memory nor CPU and is made by launchd \
+    alone, and a jetsam or CPU limit is one process's; leave --parent-cgroup out, and each jail's \
+    own --cgroup limits still apply";
+
+/// Refuses a `--parent-cgroup` named on the jailer's command line (`args`,
+/// the program first; Firecracker's arguments, after `--`, are not the
+/// jailer's). Upstream reads the parent only where the builder is made: with
+/// `--cgroup`, or with `--cgroup-version 2` and no `--cgroup` (env.rs), so
+/// this runs there; with v1 and no `--cgroup` upstream ignores the parent,
+/// and so does macOS. The flag cannot be refused by its value: upstream
+/// defaults it to the exec file's name, so every start has one, and the
+/// default is accepted. No value can be `--parent-cgroup`: upstream's parser
+/// takes no value that starts with `--`.
+fn refuse_named_parent<S: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = S>) -> Result<(), JailerError> {
+    let named = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .skip(1)
+        .take_while(|a| a != "--")
+        .any(|a| a == "--parent-cgroup");
+    if named {
+        return Err(HostError::Unsupported("parent-cgroup", PARENT_IMPOSSIBLE).into());
+    }
+    Ok(())
+}
 
 /// The (empty) cgroup v2 hierarchy on macOS.
 const NO_HIERARCHY: &str = "/var/empty";
@@ -58,6 +104,7 @@ struct CpuBandwidth {
 
 impl CgroupConfigurationBuilder {
     pub fn new(ver: u8, _proc_mounts_path: &str) -> Result<Self, JailerError> {
+        refuse_named_parent(std::env::args_os())?;
         match ver {
             1 | 2 => {
                 platform::set_cgroup_version(if ver == 1 { FreezerVersion::V1 } else { FreezerVersion::V2 });
@@ -535,6 +582,28 @@ mod tests {
             let err = builder(v, &[p]).unwrap_err();
             assert_eq!(err.to_string(), format!("Controller {controller} is unavailable"), "v{v} {p}");
         }
+    }
+
+    // A parent the operator names is refused, with the reason; the default
+    // parent (none named) is accepted; a `--parent-cgroup` among
+    // Firecracker's arguments, after `--`, is not the jailer's.
+    #[test]
+    fn test_parent_cgroup_is_refused() {
+        let jailer = ["jailer", "--id", "a", "--exec-file", "firecracker", "--cgroup-version", "2"];
+        let with = |extra: &[&'static str]| refuse_named_parent(jailer.iter().chain(extra));
+        match with(&["--parent-cgroup", "tenants"]) {
+            Err(JailerError::Host(HostError::Unsupported("parent-cgroup", why))) => assert_eq!(why, PARENT_IMPOSSIBLE),
+            other => panic!("{other:?}"),
+        }
+        let text = with(&["--cgroup", "memory.max=1G", "--parent-cgroup", "firecracker"]).unwrap_err().to_string();
+        assert!(text.starts_with("--parent-cgroup is not supported on macOS: impossible: a parent cgroup that bounds"), "{text}");
+        assert!(text.contains("leave --parent-cgroup out, and each jail's own --cgroup limits still apply"), "{text}");
+        with(&[]).unwrap();
+        with(&["--cgroup", "memory.max=1G"]).unwrap();
+        with(&["--", "--parent-cgroup", "x"]).unwrap();
+        // The builder is where it is refused (this process's own arguments
+        // name no parent).
+        CgroupConfigurationBuilder::new(2, "").unwrap();
     }
 
     #[test]

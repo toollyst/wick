@@ -24,6 +24,18 @@
 # raises ENOSYS rather than pretend.
 all impossible integration_tests/functional/test_api.py::test_api_machine_config
 
+# --parent-cgroup: on Linux a parent cgroup bounds a group of jails
+# together, and the tests read its files under /sys/fs/cgroup. macOS has no
+# kernel limit on several processes together that the jailer could make (a
+# coalition limits neither memory nor CPU and is launchd's to make: XNU
+# osfmk/kern/coalition.c, bsd/kern/sys_coalition.c), nor those files. The
+# jailer refuses a parent the test names, with that reason, before either
+# (test_parent_cgroup_is_refused; docs/COMPATIBILITY.md). test_jail.py has
+# not been run under the jailer on macOS yet (root): these two are listed
+# from the code, to be confirmed by that run.
+jailer impossible integration_tests/security/test_jail.py::test_cgroups_custom_parent
+jailer impossible integration_tests/security/test_jail.py::test_cgroups_parent_cgroup_but_no_cgroup
+
 # The test compiles each filter with libseccomp too (`import seccomp`, its
 # Python binding) and compares the BPF with seccompiler's. libseccomp exists
 # for Linux only (seccomp is a Linux kernel interface); macOS's filters are
