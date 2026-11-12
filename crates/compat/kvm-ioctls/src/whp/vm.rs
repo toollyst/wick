@@ -23,7 +23,7 @@ use kvm_bindings::{
 use vmm_sys_util::errno::Error;
 use vmm_sys_util::eventfd::EventFd;
 use super::whv;
-use super::whv::WHV_PARTITION_HANDLE;
+use super::whv::{WHV_PARTITION_HANDLE, WHV_REGISTER_NAME};
 
 use super::ffi;
 use super::guest_mem::{self, Slot};
@@ -234,8 +234,36 @@ impl VmFd {
     }
 }
 
-impl VmInner {
-    fn setup(part: WHV_PARTITION_HANDLE) -> Result<VmInner> {
+/// Which of `names` a partition configured as a VM's ([`configure`]) lets
+/// vCPU 0 read and write back: a throwaway partition with no memory, made
+/// and deleted here. All false if WHP cannot make one.
+pub(crate) fn probe_registers(names: &[WHV_REGISTER_NAME]) -> Vec<bool> {
+    let mut ok = vec![false; names.len()];
+    let Ok(part) = ffi::create_partition() else { return ok };
+    // SAFETY: vCPU 0 of the partition just configured.
+    if configure(part).is_ok() && ffi::hr(unsafe { whv::WHvCreateVirtualProcessor(part, 0, 0) }).is_ok() {
+        for (i, &name) in names.iter().enumerate() {
+            ok[i] = ffi::get_register(part, 0, name).is_ok_and(|v| ffi::set_register(part, 0, name, v).is_ok());
+        }
+    }
+    // SAFETY: the partition made above, deleted with its vCPU.
+    unsafe { whv::WHvDeletePartition(part) };
+    ok
+}
+
+/// A partition configured as a VM's, with vCPU 0 and no memory, for tests
+/// that need WHP.
+#[cfg(test)]
+pub(crate) fn test_partition() -> Result<WHV_PARTITION_HANDLE> {
+    let part = ffi::create_partition()?;
+    configure(part)?;
+    // SAFETY: vCPU 0 of the partition just configured.
+    ffi::hr(unsafe { whv::WHvCreateVirtualProcessor(part, 0, 0) })?;
+    Ok(part)
+}
+
+/// Sets a new partition's properties and sets it up, as every VM's.
+fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
         // Processor count must be set before the partition is set up.
         let count = u32::try_from(MAX_VCPUS).unwrap();
         // SAFETY: a u32 property value for ProcessorCount.
@@ -371,7 +399,12 @@ impl VmInner {
             )
         })?;
         // SAFETY: completes partition setup.
-        ffi::hr(unsafe { whv::WHvSetupPartition(part) })?;
+        ffi::hr(unsafe { whv::WHvSetupPartition(part) })
+}
+
+impl VmInner {
+    fn setup(part: WHV_PARTITION_HANDLE) -> Result<VmInner> {
+        configure(part)?;
 
         let stop_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(io_err)?;
         Ok(VmInner {

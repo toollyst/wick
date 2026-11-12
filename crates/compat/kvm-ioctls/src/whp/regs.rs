@@ -858,7 +858,72 @@ fn msr_register(index: u32) -> Option<WHV_REGISTER_NAME> {
         0xc000_0102 => whv::WHvX64RegisterKernelGsBase,
         0x277 => whv::WHvX64RegisterPat,              // IA32_PAT
         0x10 => whv::WHvX64RegisterTsc,               // IA32_TSC
+        _ => return partition_msrs().iter().find(|&&(i, _)| i == index).map(|&(_, n)| n),
+    })
+}
+
+/// `WHvX64RegisterMsrIa32MiscEnable` (winhvplatformdefs.h, 0x20A0), which
+/// windows-sys 0.61 does not name.
+const MISC_ENABLE_REGISTER: WHV_REGISTER_NAME = 0x0000_20A0;
+
+/// MSRs KVM lists for saving (KVM_GET_MSR_INDEX_LIST: x86.c's
+/// msrs_to_save_base, kept where the host has them, kvm_probe_msr_to_save,
+/// and emulated_msrs_all) that WHP keeps in a register, which a partition
+/// has or not by the host's processor and the Windows build: listed and
+/// mapped where it has them ([`partition_msrs`]). IA32_XSS, which KVM 6.12
+/// does not list but upstream saves when listed (msr.rs: without it a
+/// restored guest's XRSTORS of supervisor state takes #GP), is among them.
+const LISTED_WHERE_PRESENT: &[(u32, WHV_REGISTER_NAME)] = &[
+    (0x3b, whv::WHvX64RegisterTscAdjust),       // IA32_TSC_ADJUST
+    (0x48, whv::WHvX64RegisterSpecCtrl),        // IA32_SPEC_CTRL
+    (0x122, whv::WHvX64RegisterTsxCtrl),        // IA32_TSX_CTRL
+    (0x1a0, MISC_ENABLE_REGISTER),              // IA32_MISC_ENABLE
+    (0xe1, whv::WHvX64RegisterUmwaitControl),   // IA32_UMWAIT_CONTROL
+    (0x1c4, whv::WHvX64RegisterXfd),            // IA32_XFD
+    (0x1c5, whv::WHvX64RegisterXfdErr),         // IA32_XFD_ERR
+    (0xda0, whv::WHvX64RegisterXss),            // IA32_XSS
+    (0xc000_0103, whv::WHvX64RegisterTscAux),   // IA32_TSC_AUX
+];
+
+/// The MTRRs, which KVM gets and sets (kvm_mtrr_get_msr, kvm_mtrr_set_msr)
+/// without listing them, and Firecracker's boot sets IA32_MTRR_DEF_TYPE of
+/// (create_boot_msr_entries: enabled, write-back): the WHP register of
+/// each, where WHP has one (16 variable pairs, the fixed ranges).
+fn mtrr_register(index: u32) -> Option<WHV_REGISTER_NAME> {
+    #[allow(clippy::cast_possible_wrap)]
+    let n = |base: WHV_REGISTER_NAME, k: u32| base + k as WHV_REGISTER_NAME;
+    Some(match index {
+        0x2ff => whv::WHvX64RegisterMsrMtrrDefType,
+        // IA32_MTRR_PHYSBASEn at 0x200 + 2n, IA32_MTRR_PHYSMASKn after it.
+        0x200..=0x21f if index.is_multiple_of(2) => n(whv::WHvX64RegisterMsrMtrrPhysBase0, (index - 0x200) / 2),
+        0x200..=0x21f => n(whv::WHvX64RegisterMsrMtrrPhysMask0, (index - 0x201) / 2),
+        0x250 => whv::WHvX64RegisterMsrMtrrFix64k00000,
+        0x258 => whv::WHvX64RegisterMsrMtrrFix16k80000,
+        0x259 => whv::WHvX64RegisterMsrMtrrFix16kA0000,
+        0x268..=0x26f => n(whv::WHvX64RegisterMsrMtrrFix4kC0000, index - 0x268),
         _ => return None,
+    })
+}
+
+/// The candidates of [`LISTED_WHERE_PRESENT`] and the MTRRs.
+fn candidates() -> Vec<(u32, WHV_REGISTER_NAME)> {
+    let mut all = LISTED_WHERE_PRESENT.to_vec();
+    for index in (0x200..=0x21f).chain([0x250, 0x258, 0x259, 0x2ff]).chain(0x268..=0x26f) {
+        all.push((index, mtrr_register(index).unwrap()));
+    }
+    all
+}
+
+/// Those of [`candidates`] that a VM's partition lets a vCPU read and
+/// write ([`super::vm::probe_registers`], once per process). With no WHP,
+/// none: the MSRs are then dropped and read as 0, as before.
+fn partition_msrs() -> &'static [(u32, WHV_REGISTER_NAME)] {
+    static PRESENT: std::sync::OnceLock<Vec<(u32, WHV_REGISTER_NAME)>> = std::sync::OnceLock::new();
+    PRESENT.get_or_init(|| {
+        let all = candidates();
+        let names: Vec<WHV_REGISTER_NAME> = all.iter().map(|&(_, n)| n).collect();
+        let ok = super::vm::probe_registers(&names);
+        all.into_iter().zip(ok).filter_map(|(c, ok)| ok.then_some(c)).collect()
     })
 }
 
@@ -895,10 +960,20 @@ pub(crate) fn get_msrs(part: WHV_PARTITION_HANDLE, vp: u32, msrs: &mut Msrs) -> 
 /// Writes MSRs to the WHP registers they map to; unmapped MSRs are ignored
 /// (WHP models the architectural MSRs itself), as KVM ignores writes to MSRs
 /// it has no state for when they match the reset value.
+///
+/// IA32_TSC goes last. KVM takes the host's writes of IA32_TSC and
+/// IA32_TSC_ADJUST as independent (x86.c, kvm_set_msr_common: only a
+/// guest's write of either moves the other), and a restore writes both in
+/// the list's order, the TSC first. Whether WHP moves the TSC at a write of
+/// its TscAdjust register is not documented, so the TSC is written after
+/// it, and the guest gets the saved TSC either way
+/// (`test_tsc_and_its_adjust_restore_as_saved`, on WHP).
 pub(crate) fn set_msrs(part: WHV_PARTITION_HANDLE, vp: u32, msrs: &Msrs) -> Result<usize> {
+    const IA32_TSC: u32 = 0x10;
     let entries = msrs.as_slice();
+    let ordered = entries.iter().filter(|e| e.index != IA32_TSC).chain(entries.iter().filter(|e| e.index == IA32_TSC));
     let mut count = 0;
-    for e in entries {
+    for e in ordered {
         if let Some(name) = msr_register(e.index) {
             ffi::set_register(part, vp, name, reg64(e.data))?;
         } else if let Some(seg) = msr_segment_base(e.index) {
@@ -926,7 +1001,15 @@ pub(crate) fn msr_index_list() -> Result<MsrList> {
         // IA32_TSC_DEADLINE (tscdeadline).
         super::tscdeadline::MSR_TSC_DEADLINE,
     ]
-    .to_vec();
+    .into_iter()
+    // KVM's others that this partition keeps (the MTRRs are not listed).
+    .chain(
+        LISTED_WHERE_PRESENT
+            .iter()
+            .map(|&(i, _)| i)
+            .filter(|i| partition_msrs().iter().any(|&(p, _)| p == *i)),
+    )
+    .collect();
     MsrList::from_entries(&indices).map_err(|_| super::Error::new(libc::EINVAL))
 }
 
@@ -944,6 +1027,73 @@ pub(crate) fn get_host_msrs(_msrs: &mut Msrs) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Each candidate MSR names the WHP register the header gives it
+    // (winhvplatformdefs.h): the variable MTRRs in pairs, base then mask,
+    // the fixed ones in order; nothing else maps.
+    #[test]
+    fn test_mtrr_registers() {
+        assert_eq!(mtrr_register(0x200), Some(whv::WHvX64RegisterMsrMtrrPhysBase0));
+        assert_eq!(mtrr_register(0x201), Some(whv::WHvX64RegisterMsrMtrrPhysMask0));
+        assert_eq!(mtrr_register(0x21e), Some(whv::WHvX64RegisterMsrMtrrPhysBaseF));
+        assert_eq!(mtrr_register(0x21f), Some(whv::WHvX64RegisterMsrMtrrPhysMaskF));
+        assert_eq!(mtrr_register(0x20b), Some(whv::WHvX64RegisterMsrMtrrPhysMask5));
+        assert_eq!(mtrr_register(0x268), Some(whv::WHvX64RegisterMsrMtrrFix4kC0000));
+        assert_eq!(mtrr_register(0x26f), Some(whv::WHvX64RegisterMsrMtrrFix4kF8000));
+        assert_eq!(mtrr_register(0x2ff), Some(whv::WHvX64RegisterMsrMtrrDefType));
+        for none in [0x1ff, 0x220, 0x251, 0x25a, 0x267, 0x270, 0xfe] {
+            assert_eq!(mtrr_register(none), None, "{none:#x}");
+        }
+        assert_eq!(MISC_ENABLE_REGISTER, 0x20A0);
+        // No index twice among the candidates.
+        let c = candidates();
+        let mut idx: Vec<u32> = c.iter().map(|&(i, _)| i).collect();
+        idx.sort_unstable();
+        idx.dedup();
+        assert_eq!(idx.len(), c.len());
+    }
+
+    // On WHP (the PC; `cargo test -- --ignored`): a partition configured as
+    // a VM's has the MSRs this backend lists, and IA32_TSC with
+    // IA32_TSC_ADJUST written as a restore writes them (the TSC first in the
+    // list) read back as saved: the adjust exactly, the TSC within the time
+    // the calls took.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored"]
+    fn test_tsc_and_its_adjust_restore_as_saved() {
+        let present: Vec<u32> = partition_msrs().iter().map(|&(i, _)| i).collect();
+        eprintln!("MSRs this host's partitions keep: {present:x?}");
+        for need in [0x3b, 0x1a0, 0x2ff] {
+            assert!(present.contains(&need), "{need:#x} not kept by this host's partition");
+        }
+        let part = super::super::vm::test_partition().expect("a partition with vCPU 0");
+        let (tsc, adjust) = (0x1234_5678_9abc_u64, 0x10_0000_u64);
+        let mut msrs = Msrs::from_entries(&[
+            kvm_bindings::kvm_msr_entry { index: 0x10, data: tsc, ..Default::default() },
+            kvm_bindings::kvm_msr_entry { index: 0x3b, data: adjust, ..Default::default() },
+        ])
+        .unwrap();
+        assert_eq!(set_msrs(part, 0, &msrs).unwrap(), 2);
+        assert_eq!(get_msrs(part, 0, &mut msrs).unwrap(), 2);
+        let got = msrs.as_slice();
+        assert_eq!(got[1].data, adjust, "TSC_ADJUST read back");
+        // A vCPU that has not run: its TSC moves with the host's, a few
+        // milliseconds at most here.
+        assert!(got[0].data >= tsc && got[0].data - tsc < 1 << 32, "TSC {:#x}, {tsc:#x} written", got[0].data);
+        // MISC_ENABLE and the MTRR default type take Firecracker's boot values.
+        let boot = [(0x1a0, 1u64), (0x2ff, (1 << 11) | 6)];
+        let mut m = Msrs::from_entries(
+            &boot.map(|(index, data)| kvm_bindings::kvm_msr_entry { index, data, ..Default::default() }),
+        )
+        .unwrap();
+        assert_eq!(set_msrs(part, 0, &m).unwrap(), 2);
+        assert_eq!(get_msrs(part, 0, &mut m).unwrap(), 2);
+        for (e, (index, data)) in m.as_slice().iter().zip(boot) {
+            assert_eq!(e.data & data, data, "{index:#x} read back {:#x}", e.data);
+        }
+        // SAFETY: the partition made for this test.
+        unsafe { whv::WHvDeletePartition(part) };
+    }
 
     #[test]
     fn test_segment_roundtrip() {
