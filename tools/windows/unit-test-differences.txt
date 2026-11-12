@@ -129,9 +129,10 @@ error-text vmm vstate::vm::tests::test_register_memory_regions
 # test_too_many_regions' first region. The maps of the tests before it (one
 # VM at a time, each dropped with its memory mapped) succeeded. Not yet
 # root-caused: WHP's state after a map refused beside another partition's
-# memory, or a reference that keeps that test's first VM after its panic; a
-# kvm-ioctls test on the PC is to tell them apart. On the PC (--whp) they
-# must pass.
+# memory, or a reference that keeps that test's first VM after its panic.
+# kvm-ioctls' test_maps_after_a_refused_map_once_both_vms_are_gone and
+# test_a_vm_kept_alive_keeps_later_maps_refused tell them apart (CI's WHP
+# step and the PC). On the PC (--whp) they must pass.
 whp-pc vmm arch::x86_64::vm::tests::test_vm_save_restore_state_bad_irqchip
 whp-pc vmm arch::x86_64::vm::tests::test_vm_save_restore_state_kvm_clock_realtime
 whp-pc vmm builder::tests::test_attach_block_devices

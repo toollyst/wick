@@ -2049,4 +2049,102 @@ mod bp_tests {
         drop(vm);
         unmap(m);
     }
+
+    /// `WHvRegisterPendingEvent` (WinHvPlatformDefs.h).
+    const PENDING_EVENT: whv::WHV_REGISTER_NAME = 0x8000_0002u32 as i32;
+
+    /// `WHV_X64_PENDING_INTERRUPTION_REGISTER` for #BP: pending, `kind` (3
+    /// exception; 6 Hyper-V's software exception, which WHP's header does not
+    /// list), instruction length `len`, vector 3.
+    fn pending_interruption(kind: u64, len: u64) -> u64 {
+        1 | (kind << 1) | (len << 5) | (3 << 16)
+    }
+
+    /// The ways to hand a #BP back to the guest that 32fd94c tried, on
+    /// record for each processor vendor (it prints, and asserts only its
+    /// scaffold): from the exit at the guest's INT3, each way in a VM of its
+    /// own, what its calls returned, the exit that followed, whether the
+    /// guest's handler ran and the RIP it was given (the INT3 is at 0x6000;
+    /// Linux's handler expects 0x6001). (i) is the backend's #BP window
+    /// (`KVM_GUESTDBG_INJECT_BP`); before it, (i) was a pending exception
+    /// #BP, which WHP refused with 0xc0350005 on an AMD host (578b04f).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_bp_ways_on_record() {
+        eprintln!("BPTEST exception exit bitmap capability: {}", capability(CAP_EXCEPTION_EXIT_BITMAP));
+        eprintln!("BPTEST processor vendor (0 AMD, 1 Intel, 2 Hygon): {}", capability(CAP_PROCESSOR_VENDOR));
+        type Way = fn(&VcpuFd) -> Vec<String>;
+        let ways: [(&str, Way); 5] = [
+            ("i: the #BP window (INJECT_BP)", |v| {
+                let control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP | KVM_GUESTDBG_INJECT_BP;
+                let r = v.set_guest_debug(&kvm_guest_debug { control, ..Default::default() });
+                vec![format!("set_guest_debug(INJECT_BP): {:?}", r.map_err(|e| e.errno()))]
+            }),
+            ("ii-a: RIP at the INT3, PendingInterruption exception #BP, length 1", |v| {
+                let r = super::super::ffi::set_register(
+                    v.part(),
+                    v.vp(),
+                    whv::WHvRegisterPendingInterruption,
+                    super::super::ffi::reg64(pending_interruption(3, 1)),
+                );
+                vec![format!("set PendingInterruption {:#x}: {:?}", pending_interruption(3, 1), r.map_err(|e| e.errno()))]
+            }),
+            ("ii-b: RIP at the INT3, PendingInterruption type 6 (software exception) #BP, length 1", |v| {
+                let r = super::super::ffi::set_register(
+                    v.part(),
+                    v.vp(),
+                    whv::WHvRegisterPendingInterruption,
+                    super::super::ffi::reg64(pending_interruption(6, 1)),
+                );
+                vec![format!("set PendingInterruption {:#x}: {:?}", pending_interruption(6, 1), r.map_err(|e| e.errno()))]
+            }),
+            ("iii: RIP+1, PendingEvent exception event #BP", |v| {
+                let rip = super::super::ffi::set_register(
+                    v.part(),
+                    v.vp(),
+                    whv::WHvX64RegisterRip,
+                    super::super::ffi::reg64(CODE + 1),
+                );
+                let event = 1 | (3 << 16);
+                let r = super::super::ffi::set_register(v.part(), v.vp(), PENDING_EVENT, super::super::ffi::reg64(event));
+                vec![
+                    format!("set RIP {:#x}: {:?}", CODE + 1, rip.map_err(|e| e.errno())),
+                    format!("set PendingEvent {event:#x}: {:?}", r.map_err(|e| e.errno())),
+                ]
+            }),
+            ("iv: #BP out of the exit bitmap, RIP at the INT3, the guest runs it", |v| {
+                let r = v.set_guest_debug(&kvm_guest_debug { control: KVM_GUESTDBG_ENABLE, ..Default::default() });
+                vec![format!("set_guest_debug(ENABLE only: bitmap 0): {:?}", r.map_err(|e| e.errno()))]
+            }),
+        ];
+        let mut scaffold = Vec::new();
+        for (name, way) in ways {
+            let (vm, m) = vm_with(true);
+            let mut vcpu = vm.create_vcpu(0).unwrap();
+            start(&vcpu, CODE, STACK);
+            let first = run_once(&mut vcpu);
+            eprintln!("BPTEST {name}: first {first}");
+            if first == format!("exit Debug vector 3 pc {CODE:#x}") {
+                for line in way(&vcpu) {
+                    eprintln!("BPTEST {name}: {line}");
+                }
+                let then = run_once(&mut vcpu);
+                let rip = vcpu.get_regs().map(|r| r.rip);
+                eprintln!(
+                    "BPTEST {name}: then {then}; handler ran {} time(s); pushed RIP {:#x}; RIP after {:?}",
+                    peek(m, COUNT),
+                    peek(m, PUSHED),
+                    rip.map(|r| format!("{r:#x}"))
+                );
+            }
+            scaffold.push((name, first));
+            drop(vcpu);
+            drop(vm);
+            unmap(m);
+        }
+        // The scaffold itself: each VM stops at the guest's INT3 first.
+        for (name, first) in scaffold {
+            assert_eq!(first, format!("exit Debug vector 3 pc {CODE:#x}"), "{name}");
+        }
+    }
 }

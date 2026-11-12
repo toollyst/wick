@@ -147,7 +147,12 @@ impl Drop for VmInner {
         self.stop.store(true, Ordering::Release);
         let _ = self.stop_evt.write(1);
         if let Some(h) = self.watcher.lock().unwrap().take() {
-            let _ = h.join();
+            // The irqfd watcher holds the VM only while it handles a wake, so
+            // the last reference can be its own: it then returns after this
+            // drop, without another wait, and must not be waited for here.
+            if h.thread().id() != std::thread::current().id() {
+                let _ = h.join();
+            }
         }
         // SAFETY: deletes the partition this VM owns, after its vCPUs are gone.
         unsafe { whv::WHvDeletePartition(self.part) };
@@ -884,8 +889,11 @@ impl VmFd {
         if watcher.is_some() {
             return;
         }
-        let inner = self.inner.clone();
-        *watcher = Some(std::thread::spawn(move || watch_irqfds(&inner)));
+        // Weak: the watcher does not keep the VM alive (its partition, and
+        // the guest memory WHP maps for it) once nothing else does.
+        let vm = Arc::downgrade(&self.inner);
+        let stop_fd = self.inner.stop_evt.as_raw_fd();
+        *watcher = Some(std::thread::spawn(move || watch_irqfds(&vm, stop_fd)));
     }
 }
 
@@ -915,20 +923,63 @@ fn retire_irqfd(irqfds: &mut Vec<IrqFd>, retired: &mut Vec<IrqFd>, fd: RawFd, gs
 }
 
 /// Waits on every registered irqfd; when one signals, raises its GSI. Woken
-/// by `stop_evt` to exit (`stop` set) or to pick up the irqfds registered or
-/// removed since.
-fn watch_irqfds(inner: &Arc<VmInner>) {
+/// by `stop_evt` (`stop_fd`) to exit (`stop` set) or to pick up the irqfds
+/// registered or removed since.
+///
+/// It holds the VM only while it handles a wake: a strong reference across
+/// the wait, which only the VM's drop ended, kept a VM that had registered an
+/// irqfd (its partition, and the guest memory WHP maps for it) to the
+/// process's end, and the next VM of the process could not map its memory
+/// (`test_a_vm_with_an_irqfd_is_dropped_with_its_last_reference`).
+fn watch_irqfds(vm: &Weak<VmInner>, stop_fd: RawFd) {
     use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
     // Without it no device interrupt would ever be delivered.
     let epoll = Epoll::new().expect("wick: the irqfd watcher cannot create its epoll");
     let mut registered: HashMap<RawFd, (u32, u64)> = HashMap::new();
-    let stop_fd = inner.stop_evt.as_raw_fd();
     let _ = epoll.ctl(
         ControlOperation::Add,
         stop_fd,
         EpollEvent::new(EventSet::IN, stop_fd as u64),
     );
-    while !inner.stop.load(Ordering::Acquire) {
+    let mut events = [EpollEvent::default(); 16];
+    let mut n = 0;
+    loop {
+        // Gone (its drop has begun): its drop does not wait for this thread
+        // if it runs here, and has the eventfds open until it returns if it
+        // runs elsewhere.
+        let Some(inner) = vm.upgrade() else { return };
+        if inner.stop.load(Ordering::Acquire) {
+            return;
+        }
+        // What the last wait returned, against the set it waited on.
+        for ev in &events[..n] {
+            let fd = ev.data() as RawFd;
+            if fd == stop_fd {
+                let _ = inner.stop_evt.read();
+                // Stopping, or the irqfd set changed: looked at below.
+                continue;
+            }
+            // Drain the eventfd and raise its GSI (edge: raise then lower).
+            if let Some(&(gsi, _)) = registered.get(&fd) {
+                // Clear the signal (the eventfd keeps a counter) through the
+                // eventfd itself: a Windows eventfd is a counter in a section
+                // and an event, which a plain `read` of the descriptor does not
+                // reach, and an uncleared eventfd stays readable, so the GSI
+                // would be raised again and again (an interrupt storm the
+                // guest reports as "nobody cared").
+                let cleared = {
+                    let irqfds = inner.irqfds.lock().unwrap();
+                    irqfds
+                        .iter()
+                        .find(|i| i.eventfd.as_raw_fd() == fd)
+                        .map(|i| i.eventfd.read().is_ok())
+                };
+                if cleared == Some(true) {
+                    inner.raise_gsi(gsi, true);
+                    inner.raise_gsi(gsi, false);
+                }
+            }
+        }
         // Reconcile the registered set with the current irqfds.
         {
             let irqfds = inner.irqfds.lock().unwrap();
@@ -957,39 +1008,13 @@ fn watch_irqfds(inner: &Arc<VmInner>) {
                 }
             }
         }
-        let mut events = [EpollEvent::default(); 16];
-        let n = match epoll.wait(1000, &mut events) {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        for ev in &events[..n] {
-            let fd = ev.data() as RawFd;
-            if fd == stop_fd {
-                let _ = inner.stop_evt.read();
-                // Stopping, or the irqfd set changed: the loop looks again.
-                continue;
-            }
-            // Drain the eventfd and raise its GSI (edge: raise then lower).
-            if let Some(&(gsi, _)) = registered.get(&fd) {
-                // Clear the signal (the eventfd keeps a counter) through the
-                // eventfd itself: a Windows eventfd is a counter in a section
-                // and an event, which a plain `read` of the descriptor does not
-                // reach, and an uncleared eventfd stays readable, so the GSI
-                // would be raised again and again (an interrupt storm the
-                // guest reports as "nobody cared").
-                let cleared = {
-                    let irqfds = inner.irqfds.lock().unwrap();
-                    irqfds
-                        .iter()
-                        .find(|i| i.eventfd.as_raw_fd() == fd)
-                        .map(|i| i.eventfd.read().is_ok())
-                };
-                if cleared == Some(true) {
-                    inner.raise_gsi(gsi, true);
-                    inner.raise_gsi(gsi, false);
-                }
-            }
+        drop(inner);
+        // That was the last reference: the VM was dropped here, its eventfds
+        // closed; no wait on them.
+        if vm.strong_count() == 0 {
+            return;
         }
+        n = epoll.wait(1000, &mut events).unwrap_or(0);
     }
 }
 
@@ -1100,6 +1125,182 @@ mod tests {
             a.set_user_memory_region(region(0, ma, 0)).unwrap();
             b.set_user_memory_region(region(1 << 32, mb, len as u64)).unwrap();
         }
+    }
+
+    /// Anonymous memory of `len` bytes for a test's VM, left to the test to
+    /// unmap.
+    fn anon(len: usize) -> u64 {
+        // SAFETY: anonymous memory for the test.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        p as u64
+    }
+
+    /// Maps `len` bytes at `host` as slot 0 at guest address 0.
+    fn map0(vm: &VmFd, host: u64, len: usize) -> Result<()> {
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: len as u64,
+            userspace_addr: host,
+        };
+        // SAFETY: the tests keep the memory mapped while a VM has it.
+        unsafe { vm.set_user_memory_region(region) }
+    }
+
+    fn unanon(host: u64, len: usize) {
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(host as *mut core::ffi::c_void, len) }, 0);
+    }
+
+    // What the runner (CI's WHP step) and the PC report about WHP, for the
+    // record of both processor vendors: each capability's HRESULT and value
+    // (WHV_CAPABILITY_CODE, WinHvPlatformDefs.h).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_print_whp_capabilities() {
+        let codes: [(&str, whv::WHV_CAPABILITY_CODE); 14] = [
+            ("HypervisorPresent", 0),
+            ("Features", 1),
+            ("ExtendedVmExits", 2),
+            ("ExceptionExitBitmap", 3),
+            ("X64MsrExitBitmap", 4),
+            ("GpaRangePopulateFlags", 5),
+            ("SchedulerFeatures", 6),
+            ("ProcessorVendor (0 AMD, 1 Intel, 2 Hygon)", 0x1000),
+            ("ProcessorFeatures", 0x1001),
+            ("ProcessorClFlushSize", 0x1002),
+            ("ProcessorXsaveFeatures", 0x1003),
+            ("ProcessorClockFrequency", 0x1004),
+            ("InterruptClockFrequency", 0x1005),
+            ("ProcessorFeaturesBanks", 0x1006),
+        ];
+        let mut present = 0;
+        for (name, code) in codes {
+            let mut buf = [0u64; 4];
+            let mut written = 0u32;
+            // SAFETY: a buffer of the size passed.
+            let hres = unsafe { whv::WHvGetCapability(code, buf.as_mut_ptr().cast(), 32, &mut written) };
+            eprintln!(
+                "WHPCAP {name} ({code:#x}): HRESULT {:#010x}, {written} bytes, {:#x} {:#x} {:#x} {:#x}",
+                hres.cast_unsigned(),
+                buf[0],
+                buf[1],
+                buf[2],
+                buf[3]
+            );
+            if code == 0 {
+                present = buf[0] & 0xFFFF_FFFF;
+            }
+        }
+        assert_eq!(present, 1, "WHvCapabilityCodeHypervisorPresent");
+    }
+
+    // CI run 43277608081: after vmm's test_vcpu_cpuid_restore, which keeps a
+    // VM with guest memory while a second VM maps (refused: one partition of
+    // a process maps memory at a time), every later map of the process failed
+    // with ERROR_INVALID_PARAMETER (87). Two causes give that: WHP keeping
+    // something of the refused map, or of the first VM, after both are gone;
+    // or the first VM kept alive by a reference. These two tests tell them
+    // apart, each in a process of its own (CI's WHP step runs them so), as a
+    // process left unable to map would spoil the tests after it.
+    //
+    // Firecracker's need, asserted: once both are gone, a third VM maps. If
+    // this fails with 87, the cause is WHP's (the first), and the vmm entries
+    // listed after test_vcpu_cpuid_restore are a WHP limit.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture, alone"]
+    fn test_maps_after_a_refused_map_once_both_vms_are_gone() {
+        let _one = GUEST_MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = 16usize << 20;
+        let (ha, hb, hc) = (anon(len), anon(len), anon(len));
+        let a = VmFd::create().unwrap();
+        map0(&a, ha, len).unwrap();
+        let b = VmFd::create().unwrap();
+        let refused = map0(&b, hb, len).map_err(|e| e.errno());
+        eprintln!("MAPTEST B's map beside A's memory: {refused:?}");
+        assert_eq!(refused, Err(87), "WHP's one-partition limit is gone");
+        drop(b);
+        drop(a);
+        let c = VmFd::create().unwrap();
+        let r = map0(&c, hc, len).map_err(|e| e.errno());
+        eprintln!("MAPTEST C's map after A and B were dropped: {r:?}");
+        assert_eq!(r, Ok(()), "a VM after a refused map, once both VMs are gone");
+        drop(c);
+        for h in [ha, hb, hc] {
+            unanon(h, len);
+        }
+    }
+
+    // The second cause, made on purpose: the first VM kept alive by a
+    // reference (as a vCPU or a thread of the backend holds one) keeps its
+    // memory mapped, so a third VM's map is refused while it lives and
+    // succeeds once it is gone.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture, alone"]
+    fn test_a_vm_kept_alive_keeps_later_maps_refused() {
+        let _one = GUEST_MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = 16usize << 20;
+        let (ha, hb, hc) = (anon(len), anon(len), anon(len));
+        let a = VmFd::create().unwrap();
+        map0(&a, ha, len).unwrap();
+        let b = VmFd::create().unwrap();
+        assert_eq!(map0(&b, hb, len).map_err(|e| e.errno()), Err(87));
+        drop(b);
+        let kept = Arc::clone(&a.inner);
+        drop(a);
+        let c = VmFd::create().unwrap();
+        let r = map0(&c, hc, len).map_err(|e| e.errno());
+        eprintln!("MAPTEST C's map while A's partition is kept: {r:?}");
+        assert_eq!(r, Err(87), "A, kept, still has its memory mapped");
+        drop(kept);
+        let r = map0(&c, hc, len).map_err(|e| e.errno());
+        eprintln!("MAPTEST C's map once A is gone: {r:?}");
+        assert_eq!(r, Ok(()));
+        drop(c);
+        for h in [ha, hb, hc] {
+            unanon(h, len);
+        }
+    }
+
+    // A VM that registered an irqfd is dropped with its last reference, and
+    // the next VM of the process maps its memory: the irqfd watcher holds the
+    // VM only while it handles a wake (a strong reference across its waits,
+    // ended only by the VM's drop, kept such a VM to the process's end).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture, alone"]
+    fn test_a_vm_with_an_irqfd_is_dropped_with_its_last_reference() {
+        let _one = GUEST_MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = 16usize << 20;
+        let (ha, hc) = (anon(len), anon(len));
+        let a = VmFd::create().unwrap();
+        map0(&a, ha, len).unwrap();
+        let irq = EventFd::new(0).unwrap();
+        a.register_irqfd(&irq, 5).unwrap();
+        let weak = Arc::downgrade(&a.inner);
+        drop(a);
+        // The watcher may be handling the wake register_irqfd gave it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while weak.strong_count() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(weak.strong_count(), 0, "the VM outlived its last reference");
+        let c = VmFd::create().unwrap();
+        assert_eq!(map0(&c, hc, len).map_err(|e| e.errno()), Ok(()), "the next VM maps its memory");
+        drop(c);
+        drop(irq);
+        unanon(ha, len);
+        unanon(hc, len);
     }
 
     // KVM_TRANSLATE on WHP (the PC; `cargo test -- --ignored`), with a vCPU

@@ -468,12 +468,10 @@ jobs:
           for c in os std libc vmm-sys-util memfd event-manager micro-http userfaultfd; do
             cargo test --locked --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
-          # Hosted runners have WHP (run 43277608081: vmm's unit tests make
-          # partitions, map guest memory and run vCPUs). These two make
-          # several partitions with guest memory in one process, and on the
-          # runner every map after one refused beside another partition's
-          # memory failed (tools/windows/unit-test-differences.txt, whp-pc);
-          # until that is root-caused they run on the WHP PC.
+          # These two make several partitions with guest memory in one
+          # process; they run in the WHP step, each in a process of its own
+          # (on the runner every map after one refused beside another
+          # partition's memory failed, run 43277608081).
           cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- \
             --skip whp::vm::tests::test_vms_one_after_another_map_their_memory \
             --skip whp::vm::tests::test_one_partition_of_a_process_maps_memory
@@ -627,3 +625,50 @@ jobs:
             tools/windows/README.md
           if-no-files-found: error
           retention-days: 14
+      # CI's runner has WHP (run 43277608081), so it is a WHP machine too:
+      # the host on record (processor, Windows build, WHP's capabilities),
+      # then kvm-ioctls' tests that need WHP, which the crate step leaves
+      # out (#[ignore]d, or skipped there). Each runs alone, in a process
+      # of its own (a test that leaves the process unable to map guest
+      # memory would spoil the next), with --nocapture so the WHPCAP,
+      # BPTEST and MAPTEST lines it prints are in the log, and must pass;
+      # what each expects is in its comment. The bp tests are measured on
+      # an AMD PC (70dfabf); on an Intel runner this is their first Intel
+      # measurement, test_bp_ways_on_record printing how each way to hand a
+      # #BP back fares there. Last, after the kit's upload, so a WHP result
+      # never costs the PC its kit; it runs whatever the steps before gave.
+      - name: WHP tests on the runner
+        if: success() || failure()
+        working-directory: lib/firecracker
+        run: |
+          powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors; Get-CimInstance Win32_OperatingSystem | Format-List Caption,Version,BuildNumber"
+          k=../../crates/compat/kvm-ioctls/Cargo.toml
+          failed=0
+          alone() {
+            local out
+            out=$(cargo test --locked --manifest-path "$k" "${@:2}" -- \
+              --include-ignored --exact --nocapture --test-threads=1 "$1" 2>&1) || true
+            printf '%s\n' "$out"
+            if ! grep -q "test result: ok. 1 passed" <<<"$out"; then
+              echo "::error::$1 did not pass alone"
+              failed=1
+            fi
+          }
+          for t in test_print_whp_capabilities \
+              test_vms_one_after_another_map_their_memory \
+              test_one_partition_of_a_process_maps_memory \
+              test_translate_as_kvm_at_the_entry_and_in_long_mode \
+              test_tsc_and_its_adjust_restore_as_saved \
+              test_maps_after_a_refused_map_once_both_vms_are_gone \
+              test_a_vm_kept_alive_keeps_later_maps_refused \
+              test_a_vm_with_an_irqfd_is_dropped_with_its_last_reference; do
+            alone "whp::vm::tests::$t"
+          done
+          for t in test_bp_handed_back_to_the_guest \
+              test_bp_window_holds_the_other_vcpus \
+              test_bp_delivery_fault_is_the_guests \
+              test_gdb_breakpoints_after_a_handed_back_bp \
+              test_bp_ways_on_record; do
+            alone "whp::vcpu::bp_tests::$t" --features gdb
+          done
+          exit $failed
