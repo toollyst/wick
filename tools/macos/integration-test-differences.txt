@@ -67,15 +67,34 @@ all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
 # held to upstream's 5 and 7 MiB. In m2-parts2 (d706d9a, with the pages
 # the host compressed) it is 4.28 to 6.36 MiB (median 5.05; m2-parts,
 # present pages only, 4.16 to 7.92): the binary's text the VM ran, 1.9 to
-# 2.2 MiB; libmalloc's small zone (VM_MEMORY_MALLOC_SMALL) 1.7 to 2.0 MiB,
-# about 3 MiB in test_vsock_epipe and test_vsock_bare_pause_resume (5.95 to
-# 6.36 MiB in all in m2-parts2); malloc's other zones 0.65 to 0.7 MiB; thread stacks 0.4 MiB
-# (m2-mem's region dumps). Apple silicon maps 16 KiB pages, where Linux's
+# 2.2 MiB; libmalloc's small zone (VM_MEMORY_MALLOC_SMALL) 1.7 to 2.0 MiB;
+# malloc's other zones 0.65 to 0.7 MiB; thread stacks 0.4 MiB (m2-mem's
+# region dumps). In the vsock tests the small zone held vsock's 64 KiB
+# per-connection TX buffers, which Firecracker fills when a write to the
+# host's socket would block, with xnu's 8 KiB AF_UNIX send buffer where
+# Linux's is 208 KiB. Since 49998df every AF_UNIX stream starts with
+# Linux's: test_vsock_epipe's peak 4.73 to 5.05 MiB (median 4.91, no TX
+# buffer, 3 of 10 over 5 MiB by at most 48 KiB), was 5.2 to 9.4 (median 8.3,
+# 50 TX buffers) (A/B at c9b2c5c, 10 microVMs each, sampling past 5 MiB).
+# In run mac1-vsock-balloon-ff84c70 (test_vsock.py and test_balloon.py at
+# ff84c70) test_vsock.py's tests over the budget went from 17 (m2-parts2,
+# d706d9a) to 10, and the kills inside a test from 5 to 1
+# (test_vsock_transport_reset_g2h[PCI_ON-2vcpu], after 2 of its 5
+# restores); those 10 trip at 5.02 to 5.55 MiB. What remains is under study,
+# not explained. The 7 under the budget in that run (test_vsock, both
+# variants; the PCI_OFF variants of test_vsock_epipe,
+# test_vsock_bare_pause_resume, test_snapshot_restore_with_inflight_vsock_tx
+# and test_device_reset; test_vsock_transport_reset_h2g[PCI_OFF-1vcpu]) are
+# at the margin: under budget in 1 of 1 runs at ff84c70, so the count below
+# stays m2-parts2's. Upstream's message names the threshold in force when
+# check_samples raises (host_tools/memory.py:179), 7 MiB once the test took
+# a snapshot after the trip, not the 5 MiB the sample crossed (:116): "5.09
+# MiB exceeded maximum threshold (7.0 MiB)" is a 5 MiB trip.
+# Apple silicon maps 16 KiB pages, where Linux's
 # hosts map 4 KiB ones, so every page a thread, an allocation or a code
 # path touches costs four times as much. Earlier measurements that counted
 # cached file pages (a pmem file's, the binary's own) are superseded: in
-# the page tables they count only as mapped. To find: what Firecracker
-# holds in the small zone. Only a test whose every failing phase failed
+# the page tables they count only as mapped. Only a test whose every failing phase failed
 # with this error is excused. Upstream raises it when a microVM is killed
 # (microvm.py kill, check_samples): a test that kills one inside its body
 # stops there, and its steps after that kill did not run, untested rather
@@ -258,7 +277,9 @@ all bug integration_tests/functional/test_net.py::test_tap_offload
 # it passes when the VMM's own part is about 2 MiB or less; it is 4.3 to
 # 4.8 MiB (the memory entry above has what holds it). A run where it passes
 # before that part comes down passes at the margin, by luck: the entry stays
-# until then.
+# until then. At the margin: both passed in mac1-vsock-balloon-ff84c70
+# (ff84c70) with the VMM's own part unchanged, 4.62 and 4.36 MiB (balloon 62
+# and 65 MiB).
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_ON-True-kvm]
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_OFF-True-kvm]
 
