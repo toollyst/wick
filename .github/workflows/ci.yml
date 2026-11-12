@@ -446,6 +446,20 @@ jobs:
       - name: Build rebase-snap, cpu-template-helper, seccompiler
         working-directory: lib/firecracker
         run: cargo build --locked -p rebase-snap -p cpu-template-helper -p seccompiler --release
+      # The two rebase tools' tests. The five skipped write their diff file
+      # without marking it sparse (holes by set_len or seeks, which NTFS
+      # allocates as zeros); both tools refuse such a file on Windows rather
+      # than copy its zeros over the base (patches/0037), so these fail
+      # with that refusal.
+      - name: rebase-snap and snapshot-editor tests
+        working-directory: lib/firecracker
+        run: |
+          cargo test --locked -p rebase-snap -p snapshot-editor -- --exact \
+            --skip tests::test_rebase \
+            --skip tests::test_rebase_corner_cases \
+            --skip edit_memory::tests::test_rebase \
+            --skip edit_memory::tests::test_rebase_empty_diff \
+            --skip edit_memory::tests::test_rebase_full_diff
       # Upstream's jailer with the Windows backend (overlay/jailer/platform):
       # its tests (tokens, job limits) and the binary.
       - name: Jailer tests and build
