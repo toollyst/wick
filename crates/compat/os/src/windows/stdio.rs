@@ -222,7 +222,7 @@ mod tests {
     };
     use windows_sys::Win32::System::Console::{
         ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, FOCUS_EVENT,
-        FOCUS_EVENT_RECORD, GetConsoleWindow, GetNumberOfConsoleInputEvents, INPUT_RECORD_0,
+        FOCUS_EVENT_RECORD, GetConsoleProcessList, GetNumberOfConsoleInputEvents, INPUT_RECORD_0,
         KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, STD_INPUT_HANDLE, SetConsoleMode, SetStdHandle,
         WriteConsoleInputW,
     };
@@ -345,10 +345,10 @@ mod tests {
         }
     }
 
-    /// A process with a console of its own and no window (its parent made it
-    /// with CREATE_NO_WINDOW): [`stdin`] on that console, in raw mode as
+    /// [`stdin`] on a console of this process's own, in raw mode as
     /// Firecracker sets it when the vCPUs start. Run by
-    /// `test_a_console_without_characters_reads_as_eagain`.
+    /// `test_a_console_without_characters_reads_as_eagain`, which gives it
+    /// that console.
     #[test]
     #[ignore = "the child of test_a_console_without_characters_reads_as_eagain"]
     fn console_child() {
@@ -357,9 +357,12 @@ mod tests {
         }
         assert_eq!(u32::from(key(true, b'a').EventType), KEY_EVENT);
         assert_eq!(u32::from(focus().EventType), FOCUS_EVENT);
-        // Records are written below: never into a console someone sees.
-        // SAFETY: plain call.
-        assert!(unsafe { GetConsoleWindow() }.is_null(), "a console with a window");
+        // Records are written below: only into a console no other process
+        // is attached to.
+        let mut ids = [0u32; 4];
+        // SAFETY: room for 4 process ids.
+        let attached = unsafe { GetConsoleProcessList(ids.as_mut_ptr(), 4) };
+        assert_eq!(attached, 1, "a console shared with other processes: {ids:?}");
         let name: Vec<u16> = "CONIN$".encode_utf16().chain([0]).collect();
         // SAFETY: a NUL-terminated name; no security attributes or template.
         let conin = unsafe {
@@ -424,29 +427,108 @@ mod tests {
         assert_eq!(input.read(&mut buf).unwrap_err().raw_os_error(), Some(WOULD_BLOCK));
     }
 
+    /// Runs `console_child` with a console of its own, hidden:
+    /// CREATE_NEW_CONSOLE ("The new process has a new console, instead of
+    /// inheriting its parent's console", Microsoft's Process Creation Flags,
+    /// learn.microsoft.com/windows/win32/procthread/process-creation-flags)
+    /// with STARTF_USESHOWWINDOW and SW_HIDE (the STARTUPINFO given to
+    /// CreateProcess "affects a console created if the CREATE_NEW_CONSOLE
+    /// flag is specified", Creation of a Console,
+    /// learn.microsoft.com/windows/console/creation-of-a-console). Not
+    /// CREATE_NO_WINDOW: "run without a console window. Therefore, the
+    /// console handle for the application is not set" (Process Creation
+    /// Flags) does not say a console is made. The child's output comes back
+    /// through a pipe (STARTF_USESTDHANDLES). Ignored in `cargo test`: the
+    /// windows job of ci.yml runs it alone, in a step after the binaries'
+    /// upload, so that a runner without a console cannot cost the kit.
     #[test]
+    #[ignore = "needs a console: CI's post-upload step runs it"]
     fn test_a_console_without_characters_reads_as_eagain() {
-        use std::os::windows::process::CommandExt;
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::io::OwnedHandle;
+
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        use windows_sys::Win32::System::Threading::{
+            CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess,
+            PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW,
+            WaitForSingleObject,
+        };
+
         if std::env::var_os(CONSOLE_CHILD_ENV).is_some() {
             return;
         }
-        /// A console of its own without a window (CreateProcess flags).
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "windows::stdio::tests::console_child",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env(CONSOLE_CHILD_ENV, "1")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(std::process::Stdio::null())
-            .output()
+        let (r, w) = pipe();
+        // SAFETY: our handle; the child's end only is inherited.
+        assert_ne!(unsafe { SetHandleInformation(w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }, 0);
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd: Vec<u16> = vec![u16::from(b'"')];
+        cmd.extend(exe.as_os_str().encode_wide());
+        cmd.extend(
+            "\" --exact windows::stdio::tests::console_child --ignored --nocapture".encode_utf16(),
+        );
+        cmd.push(0);
+        // This process's environment and the child's marker, sorted by name
+        // as CreateProcess expects, two NULs at the end.
+        let mut vars: Vec<(OsString, OsString)> = std::env::vars_os()
+            .filter(|(k, _)| k.to_str() != Some(CONSOLE_CHILD_ENV))
+            .collect();
+        vars.push((CONSOLE_CHILD_ENV.into(), "1".into()));
+        vars.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
+        let mut env: Vec<u16> = Vec::new();
+        for (k, v) in &vars {
+            env.extend(k.encode_wide());
+            env.push(u16::from(b'='));
+            env.extend(v.encode_wide());
+            env.push(0);
+        }
+        env.push(0);
+        let si = STARTUPINFOW {
+            cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap(),
+            dwFlags: STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES,
+            wShowWindow: 0, // SW_HIDE
+            hStdInput: std::ptr::null_mut(),
+            hStdOutput: w,
+            hStdError: w,
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
+        // SAFETY: a writable NUL-terminated command line, a Unicode
+        // environment block ending in two NULs, valid structures.
+        let ok = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                cmd.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
+                env.as_ptr().cast(),
+                std::ptr::null(),
+                &si,
+                &mut pi,
+            )
+        };
+        assert_ne!(ok, 0, "CreateProcessW: {}", io::Error::last_os_error());
+        // SAFETY: our copies; the child has its own.
+        unsafe {
+            CloseHandle(w);
+            CloseHandle(pi.hThread);
+        }
+        let mut out = Vec::new();
+        // SAFETY: the read end, owned from here; it ends when the child does.
+        std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(r) })
+            .read_to_end(&mut out)
             .unwrap();
-        let text = String::from_utf8_lossy(&out.stdout).into_owned()
-            + &String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+        let mut code = 0u32;
+        // SAFETY: the child's process handle, ours to wait on and close.
+        unsafe {
+            WaitForSingleObject(pi.hProcess, u32::MAX);
+            assert_ne!(GetExitCodeProcess(pi.hProcess, &mut code), 0);
+            CloseHandle(pi.hProcess);
+        }
+        let text = String::from_utf8_lossy(&out);
+        assert!(code == 0 && text.contains("1 passed"), "exit {code}: {text}");
     }
 
     #[test]

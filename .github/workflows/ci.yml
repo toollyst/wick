@@ -773,3 +773,17 @@ jobs:
             failed=1
           fi
           exit $failed
+      # wick-os's standard input on a console (a hidden console of its own,
+      # made for a child process): ignored in the crate step above so that a
+      # runner without a console cannot cost the kit; run alone here, after
+      # the upload, and must pass.
+      - name: Standard input on a console
+        if: success() || failure()
+        working-directory: lib/firecracker
+        run: |
+          cargo test --locked --manifest-path ../../crates/compat/os/Cargo.toml -- \
+            --include-ignored --exact --nocapture \
+            windows::stdio::tests::test_a_console_without_characters_reads_as_eagain \
+            2>&1 | tee "$RUNNER_TEMP/stdio-console.log"
+          test "${PIPESTATUS[0]}" -eq 0
+          grep -q "1 passed" "$RUNNER_TEMP/stdio-console.log"
