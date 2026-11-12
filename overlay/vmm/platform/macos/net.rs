@@ -1077,7 +1077,7 @@ mod tests {
         // Each stranger attaches and sends a frame; then the switch does.
         for (n, stranger) in strangers.iter().enumerate() {
             stranger.send_to(b"", &tap0).unwrap();
-            stranger.send_to(&vec![u8::try_from(n).unwrap() + 1; 60], &tap0).unwrap();
+            stranger.send_to(&[u8::try_from(n).unwrap() + 1; 60], &tap0).unwrap();
         }
         switch.send_to(&[0xee; 64], &tap0).unwrap();
         // The guest gets the switch's frame, and that one only.
