@@ -133,6 +133,19 @@ s.close()
     check(request(ctl, f"gfwd {HOST_IP} 4444 {fwd}/x")[0] == 0, "the port of a listener gone is taken over")
     check(request(ctl, f"ungfwd {HOST_IP} 4444")[0] == 0, "ungfwd")
 
+    cli = program(preload, ctl, fwd, f"""
+import socket
+c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+c.settimeout(10)
+c.connect(({GUEST_IP!r}, 22))
+print("peer", c.getpeername(), flush=True)
+c.close()
+""")
+    r = frame_of(dev, b"\x08\x00", lambda f: f[23] == 6 and f[36:38] == struct.pack("!H", 22) and f[47] & 0x02)
+    check(socket.inet_ntoa(r[30:34]) == GUEST_IP, "a program's TCP connect reaches the guest's port 22 (SYN)")
+    out, err = cli.communicate(timeout=10)
+    check(f"peer ('{GUEST_IP}', 22)" in out, f"getpeername shows the guest: {out!r} {err!r}")
+
     udp = program(preload, ctl, fwd, f"""
 import socket
 u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
