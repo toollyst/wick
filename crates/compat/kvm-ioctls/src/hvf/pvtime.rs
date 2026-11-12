@@ -947,8 +947,9 @@ mod tests {
         // kvm_update_stolen_time): here the time in run() the thread was
         // neither on a CPU nor waiting in the guest's WFI (`Steal`). A
         // spinning guest on a host with 20 threads spinning on its CPUs
-        // loses a large part of its time, which the guest reads; on an idle
-        // host little; a guest that only waits in WFI loses nothing, hogs
+        // loses a large part of its time, which the guest reads; on the host
+        // as it is about what a spinning thread beside it loses (the
+        // control: the host may be loaded by anything else); a guest that only waits in WFI loses nothing, hogs
         // or not (its time is idle, not stolen). Each figure stays within
         // the framework's own accounting: wall in run() less exec time less
         // WFI time, which also counts the framework's work as lost, so the
@@ -961,21 +962,42 @@ mod tests {
         let run = std::time::Duration::from_millis(1000);
         let ncpu = std::thread::available_parallelism().unwrap().get();
         for (entry, hogs) in [(0u64, 0usize), (0, 2 * ncpu), (0x28, 0), (0x28, 2 * ncpu)] {
+            // The control: a thread spinning beside the vCPU over the same
+            // time, and the share of it the host's scheduler kept from it.
+            let control = std::thread::spawn(move || {
+                let (t0, c0) = (std::time::Instant::now(), thread_cpu());
+                while t0.elapsed() < run + std::time::Duration::from_millis(300) {
+                    std::hint::spin_loop();
+                }
+                let wall = t0.elapsed().as_nanos() as u64;
+                (wall.saturating_sub(thread_cpu() - c0), wall)
+            });
             let (wall, cpu, exec, wfi, stolen) = measure(entry, hogs, run);
+            let (lost, of) = control.join().unwrap();
+            let control = (u128::from(lost) * u128::from(wall) / u128::from(of)) as u64;
+            println!("control: a spinning thread lost {:.1} ms of {:.1}", lost as f64 / 1e6, of as f64 / 1e6);
             let framework = wall.saturating_sub(exec + wfi);
             let lost_outside_guest = cpu.saturating_sub(exec);
             // The test's own wall time includes its calls around run(),
             // outside what is accounted, where a contended thread is kept
             // off a CPU as often as anywhere: 1% of the wall time (measured
-            // up to 3.3 ms of 1020, 0.3%, under 20 hogs), plus 2 ms.
-            let slack = 2_000_000 + wall / 100;
+            // up to 3.3 ms of 1020, 0.3%, under 20 hogs on a quiet host),
+            // plus 2 ms, plus a twentieth of what the host kept from the
+            // control (measured: 21 ms short with the control losing 676 ms
+            // under 20 hogs at load 60; the calls around run() are a few
+            // percent of the time and lose their share of it).
+            let slack = 2_000_000 + wall / 100 + control / 20;
             assert!(stolen <= framework + slack, "stolen {stolen} over the framework's {framework}");
             assert!(
                 stolen + lost_outside_guest + slack >= framework,
                 "stolen {stolen} under the framework's {framework} less the thread's own work {lost_outside_guest}"
             );
             match (entry, hogs) {
-                (0, 0) => assert!(stolen < wall / 10, "idle host: {stolen} of {wall}"),
+                // The host as it is: what its scheduler kept from the
+                // control, twice over for the spread between two spinning
+                // threads, plus the 5% the framework's own work in run()
+                // counts as lost (above).
+                (0, 0) => assert!(stolen < 2 * control + wall / 20, "host as it is: {stolen} of {wall}, control {control}"),
                 (0, _) => assert!(stolen > wall / 5, "contended host: {stolen} of {wall}"),
                 _ => assert!(stolen < wall / 50, "a guest in WFI: {stolen} of {wall}"),
             }
