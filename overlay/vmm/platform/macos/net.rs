@@ -292,7 +292,15 @@ struct Endpoint {
     peers: Vec<Peer>,
     /// Datagrams dropped because their sender may not be a peer.
     refused: u64,
+    /// The senders whose refusal was logged (each once), by the address
+    /// they gave; at most [`REFUSED_LOGGED`], so that a sender that keeps
+    /// changing its name fills neither the log nor memory.
+    refused_senders: Vec<Vec<u8>>,
 }
+
+/// How many refused senders are logged by name; one more line says that
+/// further ones are not.
+const REFUSED_LOGGED: usize = 8;
 
 impl fmt::Debug for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -323,6 +331,7 @@ impl Endpoint {
             switch,
             peers: Vec::new(),
             refused: 0,
+            refused_senders: Vec::new(),
         })
     }
 
@@ -339,16 +348,34 @@ impl Endpoint {
                 self.peers.iter().any(|p| p.path() == address.path()) || switch.owns(dir, address)
             });
             let Some(address) = admitted else {
-                if self.refused == 0 {
-                    crate::logger::warn!(
-                        "net: {:?} takes frames only from sockets directly in {:?} that its owner or root owns: \
-                         dropped a datagram from {:?} (logged once)",
-                        self.path,
-                        switch.network,
-                        OsStr::from_bytes(peer.path())
-                    );
-                }
+                // Said once for each sender, so that an operator whose
+                // switch is bound by another name than its real path in
+                // the network directory sees why nothing flows.
                 self.refused += 1;
+                let sender = peer.path();
+                if self.refused_senders.len() <= REFUSED_LOGGED
+                    && !self.refused_senders.iter().any(|s| s == sender)
+                {
+                    if self.refused_senders.len() < REFUSED_LOGGED {
+                        crate::logger::warn!(
+                            "net: {:?} dropped a datagram from {:?}: its peers are the sockets directly in {:?}, \
+                             bound by that path, that the directory's owner or root owns ({} dropped so far; \
+                             said once for this sender)",
+                            self.path,
+                            OsStr::from_bytes(sender),
+                            switch.network,
+                            self.refused
+                        );
+                    } else {
+                        crate::logger::warn!(
+                            "net: {:?} dropped a datagram from one more sender that is no peer; further senders \
+                             are not logged ({} dropped so far)",
+                            self.path,
+                            self.refused
+                        );
+                    }
+                    self.refused_senders.push(sender.to_vec());
+                }
                 return false;
             };
             if !self.peers.iter().any(|p| p.path() == address.path()) {
@@ -1060,6 +1087,11 @@ mod tests {
         assert_eq!(buf[..64], [0xee; 64]);
         assert_eq!(ep.recv(&mut iov).unwrap(), None);
         assert_eq!(ep.refused, 10, "two datagrams from each of five strangers");
+        // Each stranger is said once, by the address it gave (none, for the
+        // socket without a name).
+        let said: Vec<_> = ep.refused_senders.iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect();
+        let want = [a.join("inside"), b.join("tap0"), PathBuf::from("switch"), b.join("../b/switch2"), PathBuf::new()];
+        assert_eq!(said, want.map(|p| p.to_str().unwrap().to_owned()));
         // The guest's frames go to the switch, and to it only.
         let names: Vec<_> = ep.peers.iter().map(|p| p.path().to_vec()).collect();
         assert_eq!(names, [b"../switch".to_vec()]);

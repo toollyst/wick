@@ -155,7 +155,9 @@ upstream Firecracker and its jailer.
   datagram's sender address is the path the sender wrote, which a process can forge from its own root, and macOS
   gives datagram sockets no peer credentials (xnu bsd/kern/uipc_usrreq.c, `LOCAL_PEERCRED` is a stream's). The
   network directory's owner is trusted for that network, as whoever holds CAP_NET_ADMIN in a namespace is on Linux.
-  Use one uid per jail, as upstream advises.
+  Use one uid per jail, as upstream advises. So that a switch started or restarted after a jail is reachable,
+  the jails' uids are granted write, and nothing else, on every file made directly in the network directory, not on
+  sockets alone: keep nothing there but the switch's sockets (`test_each_jail_has_a_network_directory_of_its_own`).
 - **Windows jailer: jails given one network directory are not separated from each other's endpoints.** On Linux
   two Firecrackers in one network namespace cannot reach each other's TAP: a TAP is its owner's, and a second
   attach is refused (drivers/net/tun.c, `tun_not_capable`, `tun_attach`). On Windows the network directory grants
