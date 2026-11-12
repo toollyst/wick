@@ -77,6 +77,17 @@ def program_in_network(ns, control, cmd):
     if real.startswith(PROTECTED):
         fail(f"{cmd[0]} is {real}, which System Integrity Protection runs without inserted "
              f"libraries: it cannot run inside network namespace {ns}")
+    # A script runs in its interpreter: a protected one (/bin/sh, /usr/bin/env)
+    # drops the inserted library for everything it starts.
+    with open(real, "rb") as f:
+        head = f.read(256)
+    if head.startswith(b"#!"):
+        interp = head[2:].split(b"\n", 1)[0].split()
+        interp = os.path.realpath(interp[0].decode()) if interp else ""
+        if interp.startswith(PROTECTED):
+            fail(f"{cmd[0]} is a script for {interp}, which System Integrity Protection runs "
+                 f"without inserted libraries: it cannot run inside network namespace {ns} "
+                 "(give the program itself)")
     env = dict(os.environ, DYLD_INSERT_LIBRARIES=preload, WICK_NETNS_CTL=control,
                WICK_NETNS_FWD=os.path.join(ROOT, "netns", f"{ns}.fwd"))
     os.execve(path, cmd, env)
