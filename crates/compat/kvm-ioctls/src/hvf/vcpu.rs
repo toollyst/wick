@@ -1404,13 +1404,11 @@ impl VcpuFd {
         } else {
             self.reg(hv, HV_REG_X0 + access.rt)?
         };
-        // While user space debugs with USE_HW the guest's debug register
-        // accesses trap, as KVM's (MDCR_EL2.TDA); between runs the hardware
-        // holds the guest's own values (`debug`), which they reach. One the
-        // host does not have is undefined.
-        if self.debug.hw()
-            && let Some(r) = debug::trapped_register(access.encoding)
-        {
+        // While user space debugs with USE_HW, or the guest's OS lock is set,
+        // the guest's debug register accesses trap, as KVM's (MDCR_EL2.TDA);
+        // between runs the hardware holds the guest's own values (`debug`),
+        // which they reach. One the host does not have is undefined.
+        if let Some(r) = debug::trapped_register(access.encoding) {
             let done = if access.read {
                 match self.sys(hv, r) {
                     Ok(v) if access.rt != 31 => self.set_reg(hv, HV_REG_X0 + access.rt, v).is_ok(),

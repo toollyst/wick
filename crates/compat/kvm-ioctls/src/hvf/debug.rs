@@ -162,8 +162,11 @@ pub struct Owner {
     pub debug: GuestDebug,
     /// `DBG_SS_ACTIVE_PENDING`.
     pub ss_active_pending: bool,
-    /// The traps are on; the debug register trap's value before them.
-    traps: Option<bool>,
+    /// The traps set (debug exceptions, debug register accesses); `None`
+    /// while never changed.
+    traps: Option<(bool, bool)>,
+    /// The debug register trap as the vCPU had it before.
+    regs_before: Option<bool>,
 }
 
 /// The guest's state kept over one run.
@@ -220,42 +223,45 @@ impl Owner {
         self.on() && self.debug.control & KVM_GUESTDBG_USE_HW != 0
     }
 
-    /// Sets the traps for the request in force (`kvm_arm_setup_mdcr_el2`):
-    /// debug exceptions while on; debug register accesses while `USE_HW`,
-    /// else as they were before debugging.
-    fn traps(&mut self, hv: hv_vcpu_t) -> Result<()> {
-        match (self.on(), self.traps) {
-            (false, None) => return Ok(()),
-            (false, Some(before)) => {
-                // SAFETY: `hv` belongs to the calling thread.
-                unsafe {
-                    check(hv_vcpu_set_trap_debug_exceptions(hv, false))?;
-                    check(hv_vcpu_set_trap_debug_reg_accesses(hv, before))?;
-                }
-                self.traps = None;
-                return Ok(());
-            }
-            (true, None) => {
-                let mut before = false;
-                // SAFETY: as above; `before` is written.
-                unsafe {
-                    check(hv_vcpu_get_trap_debug_reg_accesses(hv, &mut before))?;
-                    check(hv_vcpu_set_trap_debug_exceptions(hv, true))?;
-                }
-                self.traps = Some(before);
-            }
-            (true, Some(_)) => {}
+    /// Sets the traps (`kvm_arm_setup_mdcr_el2`): debug exceptions while
+    /// user space debugs (TDE); debug register accesses while it uses the
+    /// hardware (`USE_HW`) or the guest's OS lock is set (TDA), else as the
+    /// vCPU had them.
+    fn traps(&mut self, hv: hv_vcpu_t, os_lock: bool) -> Result<()> {
+        let exceptions = self.on();
+        let regs = self.hw() || os_lock;
+        if self.traps.is_none() && !exceptions && !regs {
+            return Ok(());
         }
-        let regs = self.hw() || self.traps == Some(true);
-        // SAFETY: as above.
-        check(unsafe { hv_vcpu_set_trap_debug_reg_accesses(hv, regs) })
+        let before = match self.regs_before {
+            Some(b) => b,
+            None => {
+                let mut b = false;
+                // SAFETY: `hv` belongs to the calling thread; `b` is written.
+                check(unsafe { hv_vcpu_get_trap_debug_reg_accesses(hv, &mut b) })?;
+                self.regs_before = Some(b);
+                b
+            }
+        };
+        let want = (exceptions, regs || before);
+        if self.traps != Some(want) {
+            // SAFETY: as above.
+            unsafe {
+                check(hv_vcpu_set_trap_debug_exceptions(hv, want.0))?;
+                check(hv_vcpu_set_trap_debug_reg_accesses(hv, want.1))?;
+            }
+            self.traps = Some(want);
+        }
+        Ok(())
     }
 
-    /// Before a run (`kvm_arm_setup_debug`). `os_lock`: the guest's OS lock,
-    /// which clears MDSCR_EL1.MDE in the hardware unless user space uses it.
+    /// Before a run (`kvm_arm_setup_debug`), while user space debugs or the
+    /// guest's OS lock (`os_lock`) is set: the OS lock blocks the guest's
+    /// own debug exceptions, so MDSCR_EL1.MDE is cleared in the hardware
+    /// unless user space uses it (and MDSCR_EL1.SS unless it steps).
     pub fn enter(&mut self, hv: hv_vcpu_t, os_lock: bool) -> Result<Option<Saved>> {
-        self.traps(hv)?;
-        if !self.on() {
+        self.traps(hv, os_lock)?;
+        if !self.on() && !os_lock {
             return Ok(None);
         }
         let mdscr = sys(hv, MDSCR_EL1)?;
@@ -409,6 +415,16 @@ mod tests {
     const MRS_X0_DBGBVR0: u32 = 0xd530_0080;
     /// mrs x0, MDSCR_EL1 (2, 0, 0, 2, 2).
     const MRS_X0_MDSCR: u32 = 0xd530_0240;
+
+    /// msr DBGBCR0_EL1, x2 (2, 0, 0, 0, 5).
+    const MSR_DBGBCR0_X2: u32 = 0xd510_00a2;
+    /// msr MDSCR_EL1, x3.
+    const MSR_MDSCR_X3: u32 = 0xd510_0243;
+    /// msr OSLAR_EL1, x5 (2, 0, 1, 0, 4).
+    const MSR_OSLAR_X5: u32 = 0xd510_1085;
+    /// msr DAIFClr, #8: debug exceptions unmasked.
+    const MSR_DAIFCLR_D: u32 = 0xd503_48ff;
+    const ISB: u32 = 0xd503_3fdf;
 
     /// DBGBCR as Firecracker's gdb stub writes it (gdb/arch/aarch64.rs
     /// `set_kvm_debug`): enabled, EL1 and EL0, all four bytes.
@@ -694,6 +710,34 @@ mod tests {
         debug(&vcpu, KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP, Default::default());
         assert_eq!(debug_exit(&mut vcpu).0, EC_SOFTWARE_STEP_LOWER);
         assert_eq!(get(&vcpu, PC), GUEST_BASE + 4);
+    }
+
+    #[test]
+    fn test_the_guests_os_lock_blocks_its_own_breakpoints() {
+        // KVM clears MDSCR_EL1.MDE in the hardware while the guest's OS lock
+        // is set, with or without user space debugging (debug.c
+        // kvm_arm_setup_debug: "The OS Lock blocks debug exceptions in all
+        // ELs when it is enabled"), and traps its debug register accesses
+        // then (kvm_arm_setup_mdcr_el2), so it reads back its own MDSCR_EL1.
+        // The guest sets its own EL1 breakpoint on the NOP (MDE and KDE, D
+        // unmasked), then the OS lock: nothing fires, and it reports its
+        // MDSCR_EL1 with MDE. Again with the lock released: its breakpoint
+        // fires into its own vector (ESR_EL1 EC 0x31).
+        const MDE_KDE: u64 = MDSCR_MDE | (1 << 13);
+        const NOP_AT: u64 = GUEST_BASE + 6 * 4;
+        let (_vm, mut vcpu) = guest(
+            &[MSR_DBGBVR0_X1, MSR_DBGBCR0_X2, MSR_MDSCR_X3, MSR_OSLAR_X5, MSR_DAIFCLR_D, ISB, NOP, MRS_X0_MDSCR,
+                STR_X0_X4, B_SELF],
+            &reporting_vectors(),
+        );
+        for (id, v) in [(x_reg(1), NOP_AT), (x_reg(2), BCR), (x_reg(3), MDE_KDE), (x_reg(5), 1)] {
+            set(&vcpu, id, v);
+        }
+        assert_eq!(reported(&mut vcpu), MDE_KDE);
+        for (id, v) in [(PC, GUEST_BASE), (PSTATE, 0x3c5), (x_reg(5), 0)] {
+            set(&vcpu, id, v);
+        }
+        assert_eq!(reported(&mut vcpu) >> 26, 0x31);
     }
 
     #[test]
