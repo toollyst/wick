@@ -406,6 +406,15 @@ jobs:
       - name: Boot test harness self-test
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -SelfTest
+      # Upstream's integration tests need WHP (tools/windows/integration-tests.ps1
+      # runs them on Windows hardware); their harness's AF_UNIX sockets,
+      # network host side and host tools run here.
+      - name: Integration test harness (without a VM)
+        run: |
+          # upstream's pin (tools/devctr/poetry.lock)
+          python -m pip install --quiet psutil==6.1.1
+          python -I tools/windows/integration/selftest.py
+          python -m py_compile tools/windows/integration/*.py
       # aws-lc-sys assembles its x86_64 code with NASM in release builds
       # (built from source rather than with its prebuilt objects).
       - name: Install NASM

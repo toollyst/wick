@@ -3,18 +3,27 @@
 //
 // A minimal vhost-user-blk backend on the rust-vmm crates, to test Firecracker's
 // vhost-user frontend in tools/macos/boot-test.sh and tools/windows/boot-test.ps1
-// (QEMU's macOS and Windows builds have no vhost-user-blk export), and as
-// the backend of tools/macos/integration/bin/crosvm, crosvm's `devices
-// --block vhost=...` for upstream's integration tests.
+// (QEMU's macOS and Windows builds have no vhost-user-blk export).
 //   vhost-user-blk <socket> <image> [--read-only] [--control-socket <path>]
 // --read-only: the device is read-only (VIRTIO_BLK_F_RO), writes fail.
-// --control-socket (Unix): takes `resize <bytes>` requests, one line per
-//   connection, answered `ok` or `error: <why>`: the image is resized and
-//   the device's capacity with it (crosvm's `disk resize`); the frontend
-//   reads it again with GET_CONFIG.
+// --control-socket: takes the resize requests described below.
 // It serves one frontend and exits when it disconnects, as crosvm does.
+//
+// Run as `crosvm` (the binary's name), it takes the command lines of crosvm's
+// that upstream's integration tests give their vhost-user-blk backend
+// (tests/framework/utils_drive.py), so that the tests run unchanged where
+// crosvm does not build (macOS's tools/macos/integration/bin/crosvm runs it
+// with its own command line; Windows names it crosvm):
+//   crosvm [--log-level L] devices [--disable-sandbox] [--control-socket CTR]
+//          --block vhost=<socket>,path=<image>[,ro]
+//   crosvm disk resize <index> <bytes> <CTR>
+// The control socket takes `resize <index> <bytes>` (crosvm's) or
+// `resize <bytes>`, one line per connection, answered `ok` or an error: the
+// image is resized and the device's capacity with it, which Firecracker reads
+// again at a PATCH of the drive; a read-only device is not resized. (The
+// messages are this backend's, not crosvm's.)
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -31,8 +40,8 @@ use vmm_sys_util::epoll::EventSet;
 
 struct Blk {
     file: File,
-    read_only: bool,
     sectors: u64,
+    read_only: bool,
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     requests: u64,
 }
@@ -153,36 +162,146 @@ impl VhostUserBackendMut for Blk {
     }
 }
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let socket = args.next().expect("socket");
-    let image = args.next().expect("image");
-    let mut read_only = false;
-    let mut control = None;
-    while let Some(a) = args.next() {
+/// What to serve: the vhost-user socket, the image, read-only, the control
+/// socket.
+struct Serve {
+    socket: String,
+    image: String,
+    read_only: bool,
+    control: Option<String>,
+}
+
+/// crosvm's command lines (see the top of the file); `None` for this
+/// backend's own.
+fn crosvm(args: &[String]) -> Option<Serve> {
+    let mut it = args.iter().map(String::as_str).peekable();
+    if it.peek() == Some(&"--log-level") {
+        it.next();
+        it.next();
+    }
+    match it.next()? {
+        "disk" => {
+            let rest: Vec<&str> = it.collect();
+            let ["resize", index, bytes, ctr] = rest[..] else {
+                eprintln!("crosvm disk: only `resize <index> <bytes> <socket>`");
+                std::process::exit(2);
+            };
+            let mut s = wick_os::unix::net::UnixStream::connect(ctr).expect("control socket");
+            writeln!(s, "resize {index} {bytes}").unwrap();
+            let mut reply = String::new();
+            BufReader::new(s).read_line(&mut reply).unwrap();
+            if reply.trim() != "ok" {
+                eprintln!("crosvm disk resize: {}", reply.trim());
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        "devices" => {
+            let (mut block, mut control) = (None, None);
+            while let Some(a) = it.next() {
+                match a {
+                    "--disable-sandbox" => {}
+                    "--control-socket" => control = it.next().map(str::to_owned),
+                    "--block" => block = it.next().map(str::to_owned),
+                    other => {
+                        eprintln!("crosvm devices: {other} is not taken");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            let block = block.expect("--block vhost=<socket>,path=<image>[,ro]");
+            let (mut socket, mut image, mut read_only) = (None, None, false);
+            for part in block.split(',') {
+                match part.split_once('=') {
+                    Some(("vhost", v)) => socket = Some(v.to_owned()),
+                    Some(("path", v)) => image = Some(v.to_owned()),
+                    None if part == "ro" => read_only = true,
+                    _ => {
+                        eprintln!("crosvm --block: {part} is not taken");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Some(Serve { socket: socket.expect("vhost="), image: image.expect("path="), read_only, control })
+        }
+        _ => None,
+    }
+}
+
+/// The control socket: `resize <index> <bytes>` resizes the image and the
+/// device's capacity.
+fn control(path: String, blk: Arc<RwLock<Blk>>) {
+    let _ = std::fs::remove_file(&path);
+    let listener = wick_os::unix::net::UnixListener::bind(&path).expect("control socket");
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { continue };
+            let mut line = String::new();
+            let mut reader = BufReader::new(conn);
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            let reply = match line.split_whitespace().collect::<Vec<_>>()[..] {
+                ["resize", "0", bytes] | ["resize", bytes] => match bytes.parse::<u64>() {
+                    Ok(_) if blk.read().unwrap().read_only => "error: the device is read-only".to_owned(),
+                    Ok(n) => {
+                        let mut b = blk.write().unwrap();
+                        match b.file.set_len(n) {
+                            Ok(()) => {
+                                b.sectors = n / 512;
+                                "ok".to_owned()
+                            }
+                            Err(e) => format!("resize: {e}"),
+                        }
+                    }
+                    Err(e) => format!("resize: {e}"),
+                },
+                _ => format!("not taken: {}", line.trim()),
+            };
+            let _ = writeln!(reader.get_mut(), "{reply}");
+        }
+    });
+}
+
+/// This backend's own command line (see the top of the file).
+fn own(args: &[String]) -> Serve {
+    let mut it = args.iter();
+    let socket = it.next().expect("socket").clone();
+    let image = it.next().expect("image").clone();
+    let (mut read_only, mut control) = (false, None);
+    while let Some(a) = it.next() {
         match a.as_str() {
             "--read-only" => read_only = true,
-            "--control-socket" => control = Some(args.next().expect("--control-socket needs a path")),
+            "--control-socket" => control = Some(it.next().expect("--control-socket needs a path").clone()),
             _ => {
                 eprintln!("vhost-user-blk: unknown argument {a}");
                 std::process::exit(2);
             }
         }
     }
-    let mut file = OpenOptions::new().read(true).write(!read_only).open(&image).unwrap();
+    Serve { socket, image, read_only, control }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let name = std::path::Path::new(&args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let serve = if name == "crosvm" { crosvm(&args[1..]) } else { None };
+    let serve = serve.unwrap_or_else(|| own(&args[1..]));
+    let (socket, image) = (serve.socket.clone(), serve.image.clone());
+    let mut file = OpenOptions::new().read(true).write(!serve.read_only).open(&image).unwrap();
     let len = file.seek(SeekFrom::End(0)).unwrap();
     let mut probe = [0u8; 1];
     file.seek(SeekFrom::Start(0)).unwrap();
     let _ = file.read(&mut probe);
     let blk = Arc::new(RwLock::new(Blk {
         file,
-        read_only,
         sectors: len / 512,
+        read_only: serve.read_only,
         mem: None,
         requests: 0,
     }));
-    if let Some(path) = control {
-        serve_control(&path, blk.clone());
+    if let Some(path) = serve.control {
+        control(path, blk.clone());
     }
     let mut daemon = VhostUserDaemon::new(
         "vhost-user-blk".into(),
@@ -194,49 +313,6 @@ fn main() {
     std::io::stdout().flush().unwrap();
     let r = daemon.serve(&socket);
     println!("vhost-user-blk: done ({} requests): {r:?}", blk.read().unwrap().requests);
-}
-
-/// The control socket: `resize <bytes>` sets the image's length and the
-/// device's capacity (whole sectors).
-#[cfg(unix)]
-fn serve_control(path: &str, blk: Arc<RwLock<Blk>>) {
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixListener;
-    let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path).unwrap_or_else(|e| panic!("control socket {path}: {e}"));
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(mut conn) = conn else { continue };
-            let mut line = String::new();
-            if BufReader::new(&conn).read_line(&mut line).is_err() {
-                continue;
-            }
-            let reply = match line.trim().strip_prefix("resize ").map(str::parse::<u64>) {
-                Some(Ok(bytes)) => {
-                    let mut b = blk.write().unwrap();
-                    if b.read_only {
-                        "error: the device is read-only".to_string()
-                    } else {
-                        match b.file.set_len(bytes) {
-                            Ok(()) => {
-                                b.sectors = bytes / 512;
-                                "ok".to_string()
-                            }
-                            Err(e) => format!("error: {e}"),
-                        }
-                    }
-                }
-                _ => format!("error: unknown request {:?}", line.trim()),
-            };
-            let _ = writeln!(conn, "{reply}");
-        }
-    });
-}
-
-#[cfg(windows)]
-fn serve_control(path: &str, _blk: Arc<RwLock<Blk>>) {
-    eprintln!("vhost-user-blk: --control-socket {path}: Unix sockets only");
-    std::process::exit(2);
 }
 
 #[cfg(unix)]
