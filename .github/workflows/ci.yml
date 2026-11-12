@@ -487,6 +487,11 @@ jobs:
       - name: Smoke-test the binary
         working-directory: lib/firecracker
         run: build/cargo_target/release/firecracker.exe --version
+      # The Linux and macOS jobs' check, through the harness's AF_UNIX
+      # sockets: Windows has no /dev/nitro_enclaves either, and the start is
+      # refused with Windows' error for the missing path (os error 3).
+      - name: Nitro Enclave refused without the device
+        run: python -I tools/windows/enclave-refusal-test.py lib/firecracker/build/cargo_target/release/firecracker.exe
       # Firecracker's gdb stub (upstream's test_gdb builds it), built only:
       # running it needs WHP (boot-test.ps1 gdb on a WHP machine).
       - name: Build firecracker with the gdb feature

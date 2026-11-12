@@ -754,9 +754,7 @@ def get_binary(name, *, binary_dir=_cargo_build.DEFAULT_BINARY_DIR, example=None
     bin directory (WICK_IT_BIN, tools/windows/integration-tests.ps1)."""
     if pathlib.Path(binary_dir) == pathlib.Path(_cargo_build.DEFAULT_BINARY_DIR) and os.environ.get("WICK_IT_BIN"):
         binary_dir = pathlib.Path(os.environ["WICK_IT_BIN"])
-    path = _real_get_binary(name, binary_dir=binary_dir, example=example)
-    exe = path.with_name(path.name + ".exe")
-    return exe if not path.exists() and exe.exists() else path
+    return hosttools.windows_binary(_real_get_binary(name, binary_dir=binary_dir, example=example))
 
 
 _cargo_build.get_binary = get_binary
@@ -835,6 +833,18 @@ def copy_to_chroot(self, chroot):
 
 
 _microvm.Snapshot.copy_to_chroot = copy_to_chroot
+
+# The factory names its binaries as on Linux too (`binary_path / "firecracker"`),
+# and asserts they exist: in a directory a test built itself (test_fuzzing,
+# test_gdb) there is only the `.exe`.
+_microvm.MicroVMFactory.fc_binary_path = property(
+    lambda self: hosttools.windows_binary(self.binary_path / "firecracker"),
+    doc=_microvm.MicroVMFactory.fc_binary_path.__doc__,
+)
+_microvm.MicroVMFactory.jailer_binary_path = property(
+    lambda self: hosttools.windows_binary(self.binary_path / "jailer"),
+    doc=_microvm.MicroVMFactory.jailer_binary_path.__doc__,
+)
 
 # The uffd page fault handler. Linux: started chrooted in the jail, so its
 # socket (/firecracker-uffd.sock) is where the jailed Firecracker connects,

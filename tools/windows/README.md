@@ -158,3 +158,47 @@ Firecracker log at debug level and the guest kernel log, plus `host.txt`
 
 If WHP is not usable, every stage fails with the reason the script found
 before starting, for example "the Windows hypervisor is not running".
+
+## Upstream's integration tests
+
+`integration-tests.ps1` runs upstream's pytest suites (functional and
+security by default) against the Windows build, unchanged, with the host side
+in `integration/` (the pytest plugin `wick_windows.py`), and compares each
+test with Linux's results (`compare-integration-tests.py`,
+`integration-test-differences.txt`). Unlike the boot test it needs a source
+checkout with the release build, not the kit, and:
+
+- WHP, as for the boot test;
+- a Python 3 for `integration\venv.ps1`, which makes the test environment at
+  upstream's pinned versions, and the guest artifacts from
+  `integration\setup-artifacts.ps1` (needs WSL with squashfs-tools and
+  e2fsprogs);
+- Git for Windows's bash (or its path in `WICK_IT_BASH`);
+- rustup's Rust, its `cargo` first on `PATH` (a cargo from elsewhere, such as
+  Chocolatey's, fails with "can't find crate for core"), and Visual Studio's
+  C++ build tools: `test_fuzzing.py`, `test_gdb.py` and
+  `test_instrumented_firecracker.py` build Firecracker themselves, with
+  cargo run in Git's bash, where `link` is coreutils' and `vcvars64` needs
+  `vswhere`.
+
+The script checks the last two before anything runs and stops with the
+reason: `cargo` in PowerShell and in Git's bash is rustup's
+(`%CARGO_HOME%\bin`), `vswhere.exe` exists (its directory is put on `PATH`),
+and `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` names MSVC's `link.exe`
+(set from the newest MSVC tools `vswhere` finds when not set).
+
+Run it from an elevated PowerShell. Upstream's suite runs as root on Linux
+(`tools/devtool test` runs it in a `--privileged` container), which the
+jailer's chroot, cgroups and network namespaces need; here every jailed
+microVM's `--netns` adds Windows Filtering Platform filters, which need an
+elevated jailer. Not elevated, the script warns and those tests fail.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\windows\integration\venv.ps1
+powershell -ExecutionPolicy Bypass -File tools\windows\integration\setup-artifacts.ps1
+powershell -ExecutionPolicy Bypass -File tools\windows\integration-tests.ps1
+powershell -ExecutionPolicy Bypass -File tools\windows\integration-tests.ps1 -Pytest "integration_tests/functional/test_fuzzing.py"
+```
+
+The results (pytest's report and log, upstream's `test_results`, the
+comparison with Linux) go to `build\integration-tests\<time>`, or `-Out`.

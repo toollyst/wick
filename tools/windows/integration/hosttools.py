@@ -29,6 +29,7 @@ tools/windows/integration/setup-artifacts.ps1), on the same file
 
 import ctypes
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -253,6 +254,15 @@ TOOLS = ("ps", "pgrep", "pidof", "dmesg", "socat", *E2FSPROGS)
 # target's directory name (wick_windows.py links the two).
 WINDOWS_TARGET = "x86_64-pc-windows-msvc"
 _MUSL_TARGET = re.compile(r"--target\s+(\S+-unknown-linux-musl)\b")
+
+
+def windows_binary(path):
+    """The file Windows has for the binary upstream names `path` (Linux's
+    name, without an extension): `path` if it exists, else `path.exe` if that
+    exists, else `path`, so a check that it exists fails as upstream's does."""
+    path = pathlib.Path(path)
+    exe = path.with_name(path.name + ".exe")
+    return exe if not path.exists() and exe.exists() else path
 
 
 def windows_cargo_args(cargo_args):

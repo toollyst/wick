@@ -18,6 +18,7 @@
 
 import ipaddress
 import os
+import pathlib
 import socket
 import struct
 import sys
@@ -179,6 +180,15 @@ def host_tools():
     check(isinstance(ps(0), str), "procps: a thread's name")
     check(hosttools.wsl_path("C:\\a\\b c") == "/mnt/c/a/b c" and hosttools.wsl_path("-qF") == "-qF",
           "e2fsprogs: Windows paths as WSL names them")
+    with tempfile.TemporaryDirectory(prefix="wick-st-bin-") as d:
+        d = pathlib.Path(d)
+        (d / "firecracker.exe").write_bytes(b"")
+        check(hosttools.windows_binary(d / "firecracker") == d / "firecracker.exe"
+              and hosttools.windows_binary(d / "jailer") == d / "jailer",
+              "binaries: Linux's name finds the .exe of a directory with only that (a test's own build)")
+        (d / "firecracker").write_bytes(b"")
+        check(hosttools.windows_binary(d / "firecracker") == d / "firecracker",
+              "binaries: Linux's name where the file has it")
     check(hosttools.windows_cargo_args("--features gdb --target x86_64-unknown-linux-musl --all")
           == ("--features gdb --target x86_64-pc-windows-msvc --all", "x86_64-unknown-linux-musl")
           and hosttools.windows_cargo_args("--release -p firecracker") == ("--release -p firecracker", None),

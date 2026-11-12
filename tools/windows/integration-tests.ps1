@@ -12,9 +12,11 @@
 # Without test arguments, upstream's functional and security suites. Needs the
 # release build (lib\firecracker\build\cargo_target\release), the Python
 # environment (tools\windows\integration\venv.ps1), the guest artifacts
-# (tools\windows\integration\setup-artifacts.ps1) and Git for Windows's bash.
-# Runs as the user; --netns tests need an elevated shell (the jailer's
-# Windows Filtering Platform filters).
+# (tools\windows\integration\setup-artifacts.ps1), Git for Windows's bash,
+# rustup's Rust and Visual Studio's C++ build tools (for the tests that build
+# Firecracker themselves; checked at the start). Run it elevated: upstream's
+# suite runs as root on Linux, and every jailed microVM's --netns needs an
+# elevated jailer (its Windows Filtering Platform filters).
 #
 # OUT (default build\integration-tests\<time>) gets the pytest JSON report
 # (test-report.json), pytest's output (pytest.log), upstream's test_results
@@ -35,6 +37,46 @@ $Out = (Resolve-Path $Out).Path
 $py = Join-Path $Root 'build\integration\venv-windows\Scripts\python.exe'
 if (-not (Test-Path $py)) { throw "no Python environment: tools\windows\integration\venv.ps1" }
 if (-not (Test-Path (Join-Path $Fc 'build\current_artifacts'))) { throw "no guest artifacts: tools\windows\integration\setup-artifacts.ps1" }
+
+# What the tests that build Firecracker themselves (test_fuzzing_warning,
+# test_gdb_connects, test_instrumented_firecracker) need, checked here rather
+# than deep in a test. Their cargo runs through Git's bash (wick_windows.py),
+# whose PATH puts its own /usr/bin first. A WHP PC run (2026-11-13) needed:
+# - rustup's cargo before any other: a Chocolatey cargo 1.92 failed with
+#   "can't find crate for core";
+# - MSVC's link.exe named for cargo: in Git's bash `link` is coreutils';
+# - vswhere's directory on PATH, for vcvars64 (aws-lc-sys's build).
+$bash = if ($env:WICK_IT_BASH) { $env:WICK_IT_BASH } else { 'C:\Program Files\Git\bin\bash.exe' }
+if (-not (Test-Path $bash)) { throw "no Git for Windows bash at $bash (or set WICK_IT_BASH)" }
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+$rustupCargo = Join-Path $cargoHome 'bin\cargo.exe'
+if (-not (Test-Path $rustupCargo)) { throw "no rustup cargo at ${rustupCargo}: install Rust with rustup (https://rustup.rs)" }
+$psCargo = (Get-Command cargo -ErrorAction SilentlyContinue).Source
+if ($psCargo -ine $rustupCargo) { throw "the first cargo on PATH is '$psCargo', not rustup's ${rustupCargo}: put $(Split-Path $rustupCargo) first in PATH" }
+# (No double quote in the command: Windows PowerShell 5.1 passes them to a
+# native program unescaped.)
+$bashCargo = (& $bash -c 'command -v cargo | cygpath -w -f -' 2>$null | Select-Object -First 1)
+if ($bashCargo -ine $rustupCargo) { throw "in Git's bash the first cargo is '$bashCargo', not rustup's ${rustupCargo}: put $(Split-Path $rustupCargo) first in PATH" }
+$vsInstaller = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+$vswhere = Join-Path $vsInstaller 'vswhere.exe'
+if (-not (Test-Path $vswhere)) { throw "no ${vswhere}: install Visual Studio Build Tools with the C++ workload" }
+$env:PATH = "$vsInstaller;$env:PATH"
+if (-not $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER) {
+    $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if (-not $vs) { throw "vswhere finds no Visual Studio with the C++ x64 tools (Microsoft.VisualStudio.Component.VC.Tools.x86.x64)" }
+    $msvc = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory | Sort-Object { [version]$_.Name } | Select-Object -Last 1
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = Join-Path $msvc.FullName 'bin\Hostx64\x64\link.exe'
+}
+$link = $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
+if (-not (Test-Path $link) -or (Split-Path -Leaf $link) -ine 'link.exe' -or $link -match '\\Git\\usr\\bin\\') {
+    throw "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER is '$link', not MSVC's link.exe"
+}
+# Upstream's suite runs as root (tools/devtool test: a --privileged container),
+# which the jailer's chroot, cgroups and network namespaces need. Here the
+# same: a jailed microVM's --netns adds Windows Filtering Platform filters,
+# which need an elevated jailer.
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin) { Write-Warning "not elevated: every jailed microVM's --netns is refused (upstream's suite runs as root on Linux)" }
 
 # The binaries, as upstream's tests name them.
 $release = Join-Path $Fc 'build\cargo_target\release'
