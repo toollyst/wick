@@ -56,6 +56,15 @@
 #
 # A run needs WICK_IT_FREE_GIB (default 20) GiB free; a selection of tests
 # that session-peak-kib shows to need less may ask for less.
+#
+# A diagnostic run: one with WICK_IT_DIAG_MEMORY=1 (each memory reading of
+# get_stable_rss_mem logged with its parts, the host's paging and the guest's
+# /proc/meminfo, in OUT/memory-diag.jsonl) or WICK_IT_DEFER_MEMORY_ERROR=1
+# (the memory monitor's error at a kill inside a test held to the test's
+# end, so that the steps after the kill run; the test still fails), as
+# tools/macos/integration/wick_macos.py (DIAGNOSTIC_SWITCHES) describes.
+# provenance.txt says DIAGNOSTIC RUN, and the comparison counts that as a
+# problem: what such a run shows is to read, not a result.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -111,6 +120,15 @@ mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 echo aarch64 >"$out/arch"
 
+# The diagnostic switches that are on (wick_macos.DIAGNOSTIC_SWITCHES).
+diagnostic=()
+for switch in WICK_IT_DIAG_MEMORY WICK_IT_DEFER_MEMORY_ERROR; do
+    value="${!switch:-}"
+    if [[ -n "$value" && "$value" != 0 ]]; then
+        diagnostic+=("$switch=$value")
+    fi
+done
+
 # What the run builds from: wick's and lib/firecracker's commits, and the
 # Rust sources that differ from them (another session's work in progress
 # in a shared checkout ends up in the binaries). Written to provenance.txt,
@@ -128,6 +146,9 @@ echo aarch64 >"$out/arch"
         echo "$dirty" | sed 's/^/    /'
     else
         echo "Rust tree: clean (crates, overlay, lib/firecracker, tools/vhost-user-blk)"
+    fi
+    if ((${#diagnostic[@]})); then
+        echo "DIAGNOSTIC RUN (${diagnostic[*]}): what it shows is to read, not a result"
     fi
 } >"$out/provenance.txt"
 cat "$out/provenance.txt"
@@ -240,6 +261,7 @@ env_args=(
     "WICK_IT_BINARY_DIR=$bin"
     "MKE2FS_CONFIG=$ROOT/tools/macos/integration/mke2fs.conf"
     "PYTEST_ADDOPTS=${PYTEST_ADDOPTS:-}"
+    ${diagnostic[@]+"${diagnostic[@]}"}
 )
 mkdir -p "$session/tmp"
 # The session directory's peak size, sampled: the blocks of its files that

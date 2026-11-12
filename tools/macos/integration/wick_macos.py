@@ -380,6 +380,10 @@ class _MemoryMap:
     def __init__(self, path, addr, size, rss):
         self.path, self.addr, self.size, self.rss = path, addr, size, rss
         self.tag, self.shared_cache, self.writable = 0, False, False
+        # Bytes of the region's pages compressed or swapped out, and its
+        # share mode (<mach/vm_region.h> SM_*): what a diagnostic run logs
+        # (WICK_IT_DIAG_MEMORY).
+        self.swapped, self.share_mode = 0, 0
 
 
 def _shared_cache():
@@ -476,9 +480,11 @@ def _memory_maps(self):
         if last and last[0] == kind and maps[-1].addr + maps[-1].size == r.address:
             maps[-1].size += r.size
             maps[-1].rss += r.pages_resident * page
+            maps[-1].swapped += r.pages_swapped_out * page
             continue
         maps.append(_MemoryMap(path, r.address, r.size, r.pages_resident * page))
         maps[-1].tag, maps[-1].shared_cache = r.user_tag, in_cache
+        maps[-1].swapped, maps[-1].share_mode = r.pages_swapped_out * page, r.share_mode
         maps[-1].writable = bool(r.protection & 2)  # VM_PROT_WRITE
         last = (kind,)
     if not maps and not psutil.pid_exists(self.pid):
@@ -560,6 +566,25 @@ else:
     SHARED_CACHE_CEILING = None  # not measured on this macOS: check_samples fails
 _MEMORY_PARTS = pathlib.Path(os.environ.get("WICK_IT_BINARY_DIR", SESSION_ROOT)).parent / "memory-parts.jsonl"
 
+# A diagnostic run: one with any of these switches on, which
+# integration-tests.sh passes on and names in provenance.txt
+# ("DIAGNOSTIC RUN"), and which compare-integration-tests.py then reports as
+# no result. What a switch adds is to read, never to count: its runs feed
+# no excused count and no "passes" in the docs.
+# - WICK_IT_DIAG_MEMORY: each reading get_stable_rss_mem takes logs its parts
+#   to memory-diag.jsonl (diag_get_resident_memory), and each stable reading
+#   the guest's view (diag_get_stable_rss_mem).
+# - WICK_IT_DEFER_MEMORY_ERROR: the memory monitor's error at a kill inside a
+#   test (upstream raises it there, microvm.py kill -> check_samples, and the
+#   test's later steps do not run) is held to the test's end and raised
+#   then, the same error, so the test still fails; the steps after the kill
+#   run, and memory-diag.jsonl records how they ended.
+DIAGNOSTIC_SWITCHES = ("WICK_IT_DIAG_MEMORY", "WICK_IT_DEFER_MEMORY_ERROR")
+DIAGNOSTIC = [s for s in DIAGNOSTIC_SWITCHES if os.environ.get(s, "") not in ("", "0")]
+_MEMORY_DIAG = _MEMORY_PARTS.with_name("memory-diag.jsonl")
+# While a test's call runs with WICK_IT_DEFER_MEMORY_ERROR: the errors held.
+_DEFERRED = {"active": False, "errors": []}
+
 
 def monitor_run(self):
     """MemoryMonitor.run (host_tools/memory.py) with the VMM's memory in its
@@ -618,7 +643,8 @@ def check_samples(self):
             f.write(_json.dumps({"test": os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0],
                                  "pid": self._vm.firecracker_pid, "own_mib": round(peak["own"] / 2**20, 2),
                                  "shared_cache_mib": round(peak["shared_cache"] / 2**20, 2),
-                                 "exceeded": self._exceeded is not None}) + "\n")
+                                 "exceeded": self._exceeded is not None,
+                                 **({"diagnostic": DIAGNOSTIC} if DIAGNOSTIC else {})}) + "\n")
     if self._exceeded is not None:
         log = logging.getLogger("wick_macos")
         cache = getattr(self, "wick_shared_cache_rss", 0)
@@ -635,7 +661,15 @@ def check_samples(self):
                         "(KiB: mapped, in the page tables, resident in the object): %s",
                         self._current_rss / (1 << 20), cache / (1 << 20),
                         "; ".join(f"{n} {s}/{f}/{c}" for n, s, f, c in rows if f or c))
-    _real_check_samples(self)
+    try:
+        _real_check_samples(self)
+    except _memory.MemoryUsageExceededError as err:
+        if not _DEFERRED["active"]:
+            raise
+        _DEFERRED["errors"].append(err)
+        logging.getLogger("wick_macos").warning(
+            "diagnostic (WICK_IT_DEFER_MEMORY_ERROR): %s at a kill inside the test; held to the test's end, "
+            "and the test goes on", err)
 
 
 _real_check_samples = _memory.MemoryMonitor.check_samples
@@ -675,11 +709,13 @@ def get_resident_memory(process):
     62,112 KiB idle, 217,664 after the guest wrote 150 MiB, as its regions'
     resident pages went 36,880 to 192,272). Hugetlb: none on macOS, a huge
     page mapping is host pages (docs/PORTING.md row 10), present like the
-    rest. Its one difference from Linux's is a fixed offset: the pages of
-    the dyld shared cache the process touched, 19 MiB here (RSS 62,112 KiB
-    against 43,136 of resident pages in the other regions), the system
-    libraries where upstream's static Firecracker on Linux carries 1.6 MiB of
-    its own text.
+    rest. Its one difference from Linux's is an offset: the system
+    libraries' pages the process mapped from the dyld shared cache, where
+    upstream's static Firecracker carries 1.6 MiB of its own text: 4.64 MiB
+    in the page tables in every microVM of run m2-parts (the memory
+    monitor's platform part). (A reading of 19 MiB here set the RSS against
+    the other regions' residency in their objects, not their pages in the
+    page tables.)
 
     Not the regions' resident pages as proc_pidinfo gives them by default
     (c8d26ac; `memory_maps` reads them in the footprint mode since):
@@ -704,6 +740,151 @@ def get_resident_memory(process):
 
 
 _utils.get_resident_memory = get_resident_memory
+
+# --------------------------------------- diagnostic runs: memory readings
+
+# <mach/vm_region.h> share modes.
+_SHARE_MODES = {1: "cow", 2: "private", 3: "empty", 4: "shared", 5: "trueshared",
+                6: "private aliased", 7: "shared aliased", 8: "large page"}
+# The vm_stat lines a reading keeps, in pages of vm_stat's page size.
+_VM_STAT_KEYS = ("Pages free", "Pages active", "Pages inactive", "Pages speculative", "Pages wired down",
+                 "File-backed pages", "Anonymous pages", "Pages stored in compressor",
+                 "Pages occupied by compressor", "Decompressions", "Compressions", "Pageins", "Pageouts",
+                 "Swapins", "Swapouts")
+# The guest's /proc/meminfo lines a stable reading keeps (kB).
+_MEMINFO_KEYS = ("MemTotal", "MemFree", "MemAvailable", "Buffers", "Cached", "AnonPages", "Mapped",
+                 "Shmem", "Slab", "KernelStack", "PageTables")
+# The get_stable_rss_mem call a reading belongs to (diag_get_stable_rss_mem).
+_DIAG_CALL = [0, None]
+
+
+def _diag_write(record):
+    record = {"test": os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0], "time": round(time.time(), 3),
+              "diagnostic": DIAGNOSTIC, **record}
+    with open(_MEMORY_DIAG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _task_memory(pid):
+    """KiB: the task's resident size and phys_footprint (proc_pid_rusage,
+    RUSAGE_INFO_V0: ri_resident_size, ri_phys_footprint, the 9th and 10th
+    64-bit words). phys_footprint counts the task's compressed pages, which
+    the resident size does not."""
+    buf = (ctypes.c_uint64 * 12)()
+    if _libsystem.proc_pid_rusage(pid, 0, ctypes.byref(buf)):
+        return {"error": os.strerror(ctypes.get_errno())}
+    return {"resident_kib": buf[8] >> 10, "phys_footprint_kib": buf[9] >> 10}
+
+
+def _region_groups(pid):
+    """The process's regions in the footprint mode, as the memory monitor
+    reads them, grouped: the shared cache; every mapping of at least 16 MiB
+    (guest memory and its pieces after discards) by its file or VM tag and
+    share mode; and the rest. KiB mapped, present in the page tables, and
+    compressed or swapped out, and the number of mappings."""
+    with _FOOTPRINT_LOCK:
+        maps = _memory_maps(psutil.Process(pid))
+    groups = defaultdict(lambda: [0, 0, 0, 0])
+    for m in maps:
+        if m.shared_cache:
+            key = "shared cache"
+        elif m.size >= 16 << 20:
+            name = os.path.basename(m.path) if m.path else f"tag {m.tag}"
+            key = f"{name} ({_SHARE_MODES.get(m.share_mode, m.share_mode)})"
+        else:
+            key = "other mappings"
+        g = groups[key]
+        g[0], g[1], g[2], g[3] = g[0] + (m.size >> 10), g[1] + (m.rss >> 10), g[2] + (m.swapped >> 10), g[3] + 1
+    return {k: {"mapped_kib": v[0], "present_kib": v[1], "swapped_kib": v[2], "mappings": v[3]}
+            for k, v in groups.items()}
+
+
+def _host_memory():
+    """The host's paging: vm_stat's counters (in its pages) and the memory
+    pressure level (kern.memorystatus_vm_pressure_level: 1 normal, 2 warn,
+    4 critical)."""
+    out = {}
+    try:
+        text = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, text=True, timeout=10, check=True).stdout
+    except (OSError, subprocess.SubprocessError) as err:
+        return {"error": str(err)}
+    m = re.search(r"page size of (\d+) bytes", text)
+    out["page_size"] = int(m[1]) if m else None
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        key = key.strip().strip('"')
+        if key in _VM_STAT_KEYS:
+            out[key] = int(value.strip().rstrip("."))
+    level, size = ctypes.c_int(-1), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+    if not _libsystem.sysctlbyname(b"kern.memorystatus_vm_pressure_level", ctypes.byref(level),
+                                   ctypes.byref(size), None, 0):
+        out["pressure_level"] = level.value
+    return out
+
+
+def _guest_memory(uvm):
+    """The guest's /proc/meminfo (kB) and the balloon's statistics, read
+    after a stable reading (over ssh and the API: they touch the guest, so
+    a reading is never taken between them)."""
+    out = {}
+    try:
+        rc, text, err = uvm.ssh.run("cat /proc/meminfo", timeout=20)
+        if rc == 0:
+            for line in text.splitlines():
+                key, _, value = line.partition(":")
+                if key in _MEMINFO_KEYS:
+                    out[key] = int(value.split()[0])
+        else:
+            out["meminfo_error"] = f"rc {rc}: {err.strip()[:200]}"
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        out["meminfo_error"] = repr(exc)[:200]
+    try:
+        stats = uvm.api.balloon_stats.get().json()
+        out["balloon"] = {k: stats.get(k) for k in ("target_mib", "actual_mib", "free_memory",
+                                                   "available_memory", "total_memory")}
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        out["balloon_error"] = repr(exc)[:200]
+    return out
+
+
+def diag_get_resident_memory(process):
+    """get_resident_memory, and in a get_stable_rss_mem call of a diagnostic
+    run (WICK_IT_DIAG_MEMORY) the reading's parts, logged to
+    memory-diag.jsonl: the task's resident size and phys_footprint, its
+    regions (_region_groups) and the host's paging (_host_memory)."""
+    rss = get_resident_memory(process)
+    if _DIAG_CALL[1] is not None:
+        record = {"kind": "reading", "call": _DIAG_CALL[1], "pid": process.pid, "rss_kib": rss}
+        try:
+            record.update(task=_task_memory(process.pid), regions=_region_groups(process.pid))
+        except psutil.NoSuchProcess:
+            record["error"] = "process gone"
+        record["host"] = _host_memory()
+        _diag_write(record)
+    return rss
+
+
+_real_get_stable_rss_mem = _utils.get_stable_rss_mem
+
+
+def diag_get_stable_rss_mem(uvm, percentage_delta=1):
+    """get_stable_rss_mem in a diagnostic run (WICK_IT_DIAG_MEMORY): its
+    readings logged (diag_get_resident_memory), then the stable reading with
+    the guest's view (_guest_memory)."""
+    _DIAG_CALL[0] += 1
+    _DIAG_CALL[1] = _DIAG_CALL[0]
+    try:
+        rss = _real_get_stable_rss_mem(uvm, percentage_delta)
+    finally:
+        _DIAG_CALL[1] = None
+    _diag_write({"kind": "stable", "call": _DIAG_CALL[0], "rss_kib": rss, "guest": _guest_memory(uvm)})
+    return rss
+
+
+if "WICK_IT_DIAG_MEMORY" in DIAGNOSTIC:
+    _libsystem.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    _utils.get_resident_memory = diag_get_resident_memory
+    _utils.get_stable_rss_mem = diag_get_stable_rss_mem
 
 import framework.kvm as _kvm  # noqa: E402  pylint: disable=wrong-import-position
 
@@ -1138,6 +1319,11 @@ def pytest_runtest_setup(item):
         module.outside_rssanon = _outside_rssanon
     if module is not None and module.__name__.endswith("test_serial_io") and getattr(module, "os", None) is os:
         module.os = _ProcFdOs()
+    # A diagnostic run's readings (WICK_IT_DIAG_MEMORY): the test modules
+    # that import get_stable_rss_mem by name.
+    if module is not None and "WICK_IT_DIAG_MEMORY" in DIAGNOSTIC \
+            and getattr(module, "get_stable_rss_mem", None) is _real_get_stable_rss_mem:
+        module.get_stable_rss_mem = diag_get_stable_rss_mem
 
 
 import pytest as _pytest  # noqa: E402  pylint: disable=wrong-import-position
@@ -1149,7 +1335,13 @@ def pytest_runtest_call(item):
     guest (overhead_rss), which on macOS includes the system libraries'
     pages from the dyld shared cache (`memory_maps`): beside it the test also
     publishes the two parts, overhead_rss_shared_cache and overhead_rss_own,
-    so that a change in the VMM's own memory shows on its own."""
+    so that a change in the VMM's own memory shows on its own.
+
+    In a diagnostic run with WICK_IT_DEFER_MEMORY_ERROR, the memory
+    monitor's errors at a kill inside the test are held (check_samples):
+    when the test's call ends, how the steps after the kill ended goes to
+    memory-diag.jsonl, and a call that passed fails with the first held
+    error; a call that failed keeps its own failure."""
     metrics = item.funcargs.get("metrics") if item.name.startswith("test_memory_overhead") else None
     if metrics is not None:
         put = metrics.put_metric
@@ -1162,7 +1354,17 @@ def pytest_runtest_call(item):
                 put("overhead_rss_own", value - cache, unit)
 
         metrics.put_metric = put_metric
-    yield
+    defer = "WICK_IT_DEFER_MEMORY_ERROR" in DIAGNOSTIC
+    _DEFERRED.update(active=defer, errors=[])
+    outcome = yield
+    _DEFERRED["active"] = False
+    if defer and _DEFERRED["errors"]:
+        # The steps after the kill ran: how they ended, then the held error.
+        excinfo = outcome.excinfo
+        _diag_write({"kind": "deferred", "errors": [str(e) for e in _DEFERRED["errors"]],
+                     "after": "passed" if excinfo is None else f"{excinfo[0].__name__}: {str(excinfo[1])[:500]}"})
+        if excinfo is None:
+            outcome.force_exception(_DEFERRED["errors"][0])
 
 
 def pytest_report_header():

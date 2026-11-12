@@ -20,7 +20,10 @@ reason. It fails when:
 - a file failed to collect (pytest's --continue-on-collection-errors goes
   on without it) and is not listed: its Linux-passing tests count as not
   run, and the file itself is a difference;
-- there is no report, or pytest failed without a failing test.
+- there is no report, or pytest failed without a failing test;
+- the run was a diagnostic run (provenance.txt says DIAGNOSTIC RUN:
+  integration-tests.sh, WICK_IT_DIAG_MEMORY or WICK_IT_DEFER_MEMORY_ERROR):
+  what it shows is to read, not a result.
 
 An entry names a test (a test function, a file) or a failure:
 `failure:<exception>` excuses a test that did not pass only because of that
@@ -101,6 +104,13 @@ def main():
     mode = (args.out / "mode").read_text().strip() if (args.out / "mode").exists() else "user"
 
     problems = []
+    provenance = args.out / "provenance.txt"
+    if provenance.exists():
+        problems += [
+            f"{line.strip()} (provenance.txt)"
+            for line in provenance.read_text(encoding="utf-8").splitlines()
+            if line.startswith("DIAGNOSTIC RUN")
+        ]
     report = args.out / "test-report.json"
     mac = {}
     failures = {}  # node id: the crash message of each phase that failed
