@@ -368,12 +368,18 @@ user root integration_tests/security/test_jail.py::test_exec_destination_path_is
 # "Too many open files" for the same errno.
 all impossible integration_tests/security/test_jail.py::test_negative_no_file_limit
 
-# --new-pid-ns without --daemonize: the launcher exits once Firecracker is
-# its child, and screen 5.0.2 ends the session when the process it started
-# exits (measured: a launcher that forks and exits after 0.3 s leaves no
-# session 0.5 s later), before the test's `screen -X colon "logfile flush
-# 0"` ("No screen session found"). Linux's jailer exits the same way there
-# (env.rs exec_into_new_pid_ns) and the test passes on Linux: why is not
-# known yet.
+# --new-pid-ns without --daemonize: the launcher forks Firecracker and exits,
+# as Linux's jailer does in that mode (env.rs exec_into_new_pid_ns: clone,
+# write the pid file, exit(0)), and screen ends the session when the process
+# it started exits (upstream says so: microvm.py spawn, "the screen process
+# will exit"). The test's start_screen_process sends `screen -X colon
+# "logfile flush 0"` after `screen -ls` finds the session: a race with the
+# launcher's exit on every host. Measured here with the stand-in launching a
+# script (no guest): `screen -dmS` returned after 117 ms, `screen -ls` found
+# the session at 235 ms, the flush at 328 ms got "No screen session found",
+# and the session was gone at 416 ms; without --new-pid-ns the same flush
+# succeeds. Each screen 5.0.2 command takes about 100 ms here; that Linux
+# passes says its screen commands finish before its jailer exits there
+# (inferred: no Linux host to time it on).
 all bug integration_tests/security/test_jail.py::test_firecracker_kill_by_pid[kvm-PCI_OFF-True-False-vmlinux-6.1.188]
 all bug integration_tests/security/test_jail.py::test_firecracker_kill_by_pid[kvm-PCI_ON-True-False-vmlinux-6.1.188]
