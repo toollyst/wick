@@ -64,6 +64,11 @@ extern crate std;
 #[cfg(windows)]
 #[path = "windows_uffd.rs"]
 pub mod wick_uffd;
+/// The jailer's `--resource-limit no-file=`: descriptors past it fail with
+/// `EMFILE` (a wick API, not part of `libc`).
+#[cfg(windows)]
+#[path = "windows_nofile.rs"]
+pub mod wick_nofile;
 #[cfg(windows)]
 mod windows_errno;
 // Explicit, so they take precedence over the CRT values of `upstream`.

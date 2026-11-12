@@ -79,4 +79,51 @@ mod tests {
         let _: super::io::ErrorKind = std::io::ErrorKind::WouldBlock;
         assert_eq!(super::mem::size_of::<super::os::raw::c_int>(), 4);
     }
+
+    /// `std::fs`'s calls that make a descriptor on Linux fail with EMFILE
+    /// (`WSAEMFILE`, the compat libc's) under a `--resource-limit no-file=`
+    /// below the process's handles (`WICK_NO_FILE`, which the Windows jailer
+    /// sets), as an `open` past `RLIMIT_NOFILE` does. Run in a process of
+    /// its own: the limit is the process's.
+    #[cfg(windows)]
+    #[test]
+    fn test_fs_opens_fail_with_emfile_past_the_limit() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::nofile_child", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("WICK_NO_FILE", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let text = std::format!(
+            "{}{}",
+            std::string::String::from_utf8_lossy(&out.stdout),
+            std::string::String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success() && text.contains("nofile child: ok"), "exit {:?}: {text}", out.status.code());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "run by test_fs_opens_fail_with_emfile_past_the_limit, in a process of its own"]
+    fn nofile_child() {
+        if std::env::var_os("WICK_NO_FILE").is_none() {
+            return;
+        }
+        const EMFILE: i32 = 10024;
+        let exe = std::env::current_exe().unwrap();
+        let copy = std::env::temp_dir().join(std::format!("wick-std-nofile-{}", std::process::id()));
+        let check = |what: &str, r: std::io::Result<()>| {
+            let err = r.expect_err(what);
+            assert_eq!(err.raw_os_error(), Some(EMFILE), "{what}: {err}");
+        };
+        check("OpenOptions::open", super::fs::OpenOptions::new().read(true).open(&exe).map(drop));
+        check("fs::read", super::fs::read(&exe).map(drop));
+        check("fs::read_to_string", super::fs::read_to_string(&exe).map(drop));
+        check("fs::write", super::fs::write(&copy, b"x"));
+        check("fs::copy", super::fs::copy(&exe, &copy).map(drop));
+        check("fs::read_dir", super::fs::read_dir(std::env::temp_dir()).map(drop));
+        assert!(!copy.exists(), "a refused call made {copy:?}");
+        std::println!("nofile child: ok");
+    }
 }

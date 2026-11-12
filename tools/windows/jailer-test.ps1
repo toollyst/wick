@@ -64,9 +64,6 @@ function New-Base([string]$name) {
     $b
 }
 
-# What the jailer says when no --resource-limit no-file= is given.
-$NoFileWarning = "jailer: warning: Windows cannot limit the number of handles a process opens: upstream's default --resource-limit no-file=2048 is not enforced, and nothing bounds the jailed Firecracker's handles"
-
 # Runs the jailer to completion; returns @(exit code, output).
 function Invoke-Jailer([string[]]$argv, [int]$ms = 20000) {
     $out = Join-Path $WorkDir 'jailer-out.txt'
@@ -174,8 +171,6 @@ function Stage-Refuse {
     $cases = [ordered]@{
         '--netns of a missing directory' = @('--netns', (Join-Path $WorkDir 'no-such-network'))
         'fsize'                          = @('--resource-limit', 'fsize=1024')
-        'no-file=512'                    = @('--resource-limit', 'no-file=512')
-        'no-file=2048'                   = @('--resource-limit', 'no-file=2048')  # upstream's default, given
         'memory.high'                    = @('--cgroup', 'memory.high=1048576', '--cgroup-version', '2')
     }
     # docs/PORTING.md row 8: each controller Windows has no counterpart for
@@ -206,10 +201,9 @@ function Stage-Refuse {
         Check ($r[0] -ne 0) "$k accepted (exit $($r[0])): $($r[1])"
         Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue)) "$k started Firecracker"
         if ($reasoned.Contains($k)) { Check ($r[1] -match 'is refused on Windows: \S') "${k}: refused without its reason: $($r[1])" }
-        if ($k -like 'no-file=*') { Check ($r[1].Contains('--resource-limit no-file is not supported on Windows: Windows cannot limit the number of handles a process opens')) "${k}: refused without its reason: $($r[1])" }
         if ($k -eq 'fsize') { Check ($r[1].Contains('--resource-limit fsize is not supported on Windows: Windows cannot limit the size of the files a process writes')) "${k}: refused without its reason: $($r[1])" }
     }
-    "--netns of a missing directory, fsize=, no-file= (512, and upstream's default 2048 given), an unsupported cgroup file and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
+    "--netns of a missing directory, fsize=, an unsupported cgroup file and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
 }
 
 Add-Type -Namespace WickJailerTest -Name Numa -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool GetNumaHighestNodeNumber(ref uint n);'
@@ -296,8 +290,7 @@ function Stage-Daemonize {
         # The call operator blocks until the launcher returns; with --daemonize
         # it returns at once, leaving a detached jailer and Firecracker behind.
         # Its stderr is read as text: under 'Stop' a native command's stderr
-        # line is an error, and the launcher prints upstream's no-file
-        # warning (Stage-Nofile), which is all it may print.
+        # line is an error. The launcher prints nothing.
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $ErrorActionPreference = 'Continue'
         $said = @(& $Jailer --id d --exec-file $Fc --uid 0 --gid 0 --chroot-base-dir $base --daemonize 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
@@ -305,8 +298,7 @@ function Stage-Daemonize {
         $ErrorActionPreference = 'Stop'
         $sw.Stop()
         Check ($code -eq 0) "the jailer did not return 0 with --daemonize (exit $code): $($said -join ' | ')"
-        $other = @($said | Where-Object { $_ -ne $NoFileWarning })
-        Check ($other.Count -eq 0) "the launcher printed more than the no-file warning: $($other -join ' | ')"
+        Check ($said.Count -eq 0) "the launcher printed: $($said -join ' | ')"
         Check ($sw.Elapsed.TotalSeconds -lt 10) "the jailer did not return promptly: $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
         # The detached Firecracker keeps running after the launcher returned.
         $sock = Join-Path $root 'run\firecracker.socket'
@@ -740,24 +732,55 @@ function Stage-Links {
     }
 }
 
-# Upstream's default limit of 2048 descriptors (no --resource-limit no-file=
-# given), which Windows cannot enforce: the jailer says so at its start, on
-# stderr, and the jailed process opens more (jail-probe as the jailed
-# binary), under the jail's memory limit too (a Job Object's memory limit
-# does not count handles). An explicit no-file= is refused (`refuse`). This
-# records the missing guarantee: it fails once something bounds the handles.
+# --resource-limit no-file= (upstream's 2048 when not given) is each jailed
+# process's limit on its handles, where Linux counts descriptors
+# (docs/COMPATIBILITY.md): a call of wick's POSIX layer (the compat libc,
+# wick-os, the std::fs shadow, vmm-sys-util, memfd) that would make a
+# descriptor past it fails with EMFILE (WSAEMFILE, os error 10024, through
+# the errno table) and the process goes on; the calls' own tests are
+# `wick_nofile::tests` (libc), `windows::tests` (wick-os) and wick-std's.
+# Here, through the jailer:
+# - no-file=3, below the handles any process starts with, stops the jailed
+#   Firecracker at once with EMFILE, as upstream's test_negative_no_file_limit
+#   asserts (Windows' number and text);
+# - the default, 2048 given and 512 are accepted without a warning, the API
+#   answers, and each process of the jail holds fewer handles than the limit;
+# - handles made outside that layer are not refused: the jailed probe opens
+#   5000 files with Windows' own calls under no-file=512, and 100000 under
+#   memory.max of 32 MiB too. This records what is left to the jailer's
+#   supervision (not written yet) and fails once it bounds them.
 # Needs no guest.
 function Stage-Nofile {
     $probe = Get-Probe
     $base = New-Base 'nofile'
-    $warning = $NoFileWarning
-    $common = @('--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base)
-    $r = Invoke-Jailer (@('--id', 'default') + $common + @('--', 'files:5000')) 60000
-    Check ($r[0] -eq 0 -and $r[1].Contains($warning)) "without no-file=, the jailer's warning: exit $($r[0]): $($r[1])"
-    Check ($r[1] -match 'files:5000 allowed 5000') "without no-file=, the jailed process: $($r[1])"
-    $r = Invoke-Jailer (@('--id', 'memory', '--cgroup-version', '2', '--cgroup', 'memory.max=33554432') + $common + @('--', 'files:100000')) 120000
-    Check ($r[0] -eq 0 -and $r[1].Contains($warning) -and $r[1] -match 'files:100000 allowed 100000') "under memory.max=32 MiB: exit $($r[0]): $($r[1])"
-    "without --resource-limit no-file= the jailer warns that upstream's default is not enforced; the jailed process opens 5000 files, and 100000 under memory.max=32 MiB"
+    try {
+        $r = Invoke-Jailer @('--id', 'three', '--exec-file', $Fc, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--resource-limit', 'no-file=3') 30000
+        Check ($r[0] -ne 0) "no-file=3: the jailed Firecracker ran and exited 0: $($r[1])"
+        Check ($r[1] -match 'os error 10024') "no-file=3: the jailed Firecracker did not stop with EMFILE: exit $($r[0]): $($r[1])"
+        $left = @(Get-Process firecracker -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$base*" })
+        Check ($left.Count -eq 0) "no-file=3: $($left.Count) processes of the jail are left"
+        $counts = @()
+        foreach ($case in @(@('default', @(), 2048), @('given', @('--resource-limit', 'no-file=2048'), 2048), @('set', @('--resource-limit', 'no-file=512'), 512))) {
+            $id = $case[0]
+            $jail = Start-ApiJail $base $id $case[1]
+            $null = Invoke-ApiOk $jail.Sock 'GET' '/'
+            $said = (Get-Content -Raw (Join-Path $base "$id-err.txt") -ErrorAction SilentlyContinue)
+            Check (-not ($said -match 'jailer: warning')) "${id}: the jailer warned: $said"
+            foreach ($p in @($jail.Fc) + @($jail.Api)) {
+                $p.Refresh()
+                Check ($p.HandleCount -le $case[2]) "${id}: process $($p.Id) of the jail holds $($p.HandleCount) handles, past no-file=$($case[2])"
+                $counts += "$id $($p.Id): $($p.HandleCount)"
+            }
+            Stop-Process -Id $jail.Fc.Id -Force
+            [void]$jail.Jailer.WaitForExit(10000)
+        }
+        $common = @('--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--resource-limit', 'no-file=512')
+        $r = Invoke-Jailer (@('--id', 'raw') + $common + @('--', 'files:5000')) 60000
+        Check ($r[0] -eq 0 -and $r[1] -match 'files:5000 allowed 5000') "no-file=512, the probe's own opens: exit $($r[0]): $($r[1])"
+        $r = Invoke-Jailer (@('--id', 'memory', '--cgroup-version', '2', '--cgroup', 'memory.max=33554432') + $common + @('--', 'files:100000')) 120000
+        Check ($r[0] -eq 0 -and $r[1] -match 'files:100000 allowed 100000') "no-file=512 and memory.max=32 MiB, the probe's own opens: exit $($r[0]): $($r[1])"
+        "no-file=3 stops the jailed Firecracker with EMFILE (os error 10024); the default, 2048 and 512 are accepted without a warning and the API answers (handles: $($counts -join ', ')); opens outside wick's POSIX layer are not refused: the jailed probe opens 5000 files under no-file=512, and 100000 under memory.max=32 MiB too"
+    } finally { Stop-Jailed }
 }
 
 # memory.max bounds all of the jailed process's memory, as a cgroup does: under

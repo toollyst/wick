@@ -233,3 +233,111 @@ fn test_socket_duplicated_while_a_receive_waits() {
     (&b).write_all(&[7]).unwrap();
     assert_eq!(waiter.join().unwrap(), 7);
 }
+
+// `--resource-limit no-file=` (the Windows jailer gives it in `WICK_NO_FILE`;
+// crates/compat/libc, `wick_nofile`): every call here that makes a
+// descriptor fails with EMFILE once the process's handles leave no room for
+// it, as past RLIMIT_NOFILE on Linux, and makes nothing. The API server
+// (micro-http) and the vsock muxer accept through `UnixListener::accept`:
+// refused before it takes a connection, which stays queued, as Linux takes
+// the descriptor number before it accepts (linux v6.12 net/socket.c,
+// `__sys_accept4_file`). A pair needs room for two. Run in a process of its
+// own ([`nofile_child`]): the count and the limit are the process's.
+#[test]
+fn test_emfile_at_the_limit() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "windows::tests::nofile_child", "--ignored", "--nocapture", "--test-threads=1"])
+        .env(NOFILE_CHILD, "1")
+        .env_remove(NOFILE_VAR)
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("nofile child: ok"), "exit {:?}: {text}", out.status.code());
+}
+
+/// The variable the jailer gives the limit in.
+const NOFILE_VAR: &str = "WICK_NO_FILE";
+const NOFILE_CHILD: &str = "WICK_NOFILE_CHILD";
+/// `WSAEMFILE`, the compat libc's `EMFILE`.
+const EMFILE: i32 = 10024;
+
+fn handles() -> u64 {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+    let mut n = 0u32;
+    assert_ne!(unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) }, 0);
+    u64::from(n)
+}
+
+/// `r` failed with EMFILE and made no handle (`before`: the count before it).
+#[track_caller]
+fn refused<T: std::fmt::Debug>(what: &str, before: u64, r: std::io::Result<T>) {
+    let err = r.expect_err(what);
+    assert_eq!(err.raw_os_error(), Some(EMFILE), "{what}: {err}");
+    assert_eq!(handles(), before, "{what}: the refused call made a handle");
+}
+
+#[test]
+#[ignore = "run by test_emfile_at_the_limit, in a process of its own"]
+fn nofile_child() {
+    use windows_sys::Win32::Networking::WinSock::{AF_UNIX, SOCK_STREAM, WSASocketW, closesocket};
+    if std::env::var_os(NOFILE_CHILD).is_none() {
+        return;
+    }
+    // Winsock's first AF_UNIX socket loads what it needs once: warmed up
+    // with Winsock itself, which no limit sees.
+    super::net::startup();
+    let s = unsafe { WSASocketW(i32::from(AF_UNIX), SOCK_STREAM, 0, std::ptr::null(), 0, 0) };
+    assert_eq!(unsafe { closesocket(s) }, 0);
+    let path = temp_path("nofile.sock");
+    let other = temp_path("nofile-other.sock");
+    let limit = handles() + 24;
+    unsafe { std::env::set_var(NOFILE_VAR, limit.to_string()) };
+
+    let listener = UnixListener::bind(&path).unwrap();
+    let mut client = UnixStream::connect(&path).unwrap();
+    // Fill: each clone is made while one more handle fits; the first that
+    // does not fit is refused.
+    let mut fillers = Vec::new();
+    loop {
+        assert!(fillers.len() < 100, "no clone refused under a limit of {limit}");
+        let before = handles();
+        let r = listener.try_clone();
+        if before < limit {
+            fillers.push(r.unwrap_or_else(|e| panic!("try_clone refused at {before} handles of {limit}: {e}")));
+        } else {
+            refused("try_clone at the limit", before, r);
+            break;
+        }
+    }
+    // Every call that makes a descriptor is refused.
+    refused("accept", handles(), listener.accept());
+    refused("connect", handles(), UnixStream::connect(&path));
+    refused("bind", handles(), UnixListener::bind(&other));
+    refused("pair", handles(), UnixStream::pair());
+    refused("dup", handles(), dup(listener.as_raw_fd()));
+    // After a close the next call succeeds: the refused accept left the
+    // connection queued, and it is the client's.
+    while handles() >= limit {
+        drop(fillers.pop().expect("closing every clone left no room"));
+    }
+    let (mut server, _) = listener.accept().unwrap();
+    client.write_all(b"q").unwrap();
+    let mut byte = [0u8; 1];
+    server.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"q");
+    // A pair needs room for two descriptors (three handles a moment: it
+    // listens, connects and accepts).
+    while handles() >= limit {
+        drop(fillers.pop().expect("closing every clone left no room"));
+    }
+    if handles() + 1 == limit {
+        refused("pair with room for one", handles(), UnixStream::pair());
+    }
+    while handles() + 2 > limit {
+        drop(fillers.pop().expect("closing every clone left no room"));
+    }
+    let (_a, _b) = UnixStream::pair().unwrap();
+    drop((fillers, listener));
+    let _ = std::fs::remove_file(&path);
+    println!("nofile child: ok");
+}

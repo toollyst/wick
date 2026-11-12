@@ -17,8 +17,11 @@
   affinity), `weight` (two jailed processes at `cpu.weight` 50 and 100
   sharing one processor), `low` (a low-integrity process of the user is kept
   out of a jail), `links` (a jail makes no hard link to a file outside it and
-  no entry above its root), `nofile` (no handle limit: records the missing
-  guarantee and fails once something bounds the handles), `sections`
+  no entry above its root), `nofile` (`--resource-limit no-file=`, upstream's
+  2048 by default: `no-file=3` stops Firecracker with EMFILE, the limits
+  given are accepted and held; the jailed probe's own opens are not refused,
+  which records what is left to the jailer's supervision and fails once it
+  bounds them), `sections`
   (`memory.max` against sections: fails today, as a Job Object does not
   charge them), `daemonize`, `handles` (a handle the jailer inherited is not
   open in the jail), `pidns` (no process, thread or console of anyone else;

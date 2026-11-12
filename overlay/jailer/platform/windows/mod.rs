@@ -2716,30 +2716,23 @@ mod tests {
 
     #[test]
     fn test_resource_limits() {
-        // Without a limit: accepted (with NO_FILE_WARNING).
-        install_resource_limits(None, None).unwrap();
         assert!(matches!(
             install_resource_limits(Some(1 << 20), None).unwrap_err(),
             JailerError::Host(HostError::UnsupportedLimit("fsize", _))
         ));
-        // Any no-file=, upstream's default value too.
-        for n in [512, 2048] {
-            let err = install_resource_limits(None, Some(n)).unwrap_err();
-            assert!(matches!(err, JailerError::Host(HostError::UnsupportedLimit("no-file", _))));
-            assert_eq!(
-                err.to_string(),
-                "--resource-limit no-file is not supported on Windows: Windows cannot limit the number of \
-                 handles a process opens. The jailer never accepts a limit it cannot enforce."
-            );
+        // no-file=: any value, below the handles a process starts with too
+        // (upstream's test_negative_no_file_limit gives 3), as Linux's
+        // setrlimit takes it.
+        for n in [3, 512, 2048] {
+            install_resource_limits(None, Some(n)).unwrap();
         }
+        // Without it: upstream's default.
+        install_resource_limits(None, None).unwrap();
         // Through upstream's argument parsing: given or not.
         let mut limits = crate::resource_limits::ResourceLimits::default();
         limits.install().unwrap();
-        limits.set_no_file(2048);
-        assert!(matches!(
-            limits.install().unwrap_err(),
-            JailerError::Host(HostError::UnsupportedLimit("no-file", _))
-        ));
+        limits.set_no_file(512);
+        limits.install().unwrap();
     }
 
     #[test]
