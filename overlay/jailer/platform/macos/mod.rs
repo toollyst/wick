@@ -663,6 +663,40 @@ fn exec(
         env.push(CString::new(var).map_err(|e| HostError::Spawn("WICK_NETNS", io::Error::other(e)))?);
         network_lock = Some(lock);
     }
+    let memory = match *MEMORY_LIMIT_MIB.lock().unwrap() {
+        Some(limit) => Some((jetsam_priority()?, limit)),
+        None => None,
+    };
+    // Last before the exec: the jail's supervisor, which may hold the exec
+    // back while the jail is frozen.
+    replace_process(&argv, &env, network_lock.as_ref(), memory, || {
+        freezer::start_supervisor(freezer).map_err(HostError::Freezer)
+    })
+}
+
+/// Replaces this process with `argv[0]` (`posix_spawn` with
+/// `POSIX_SPAWN_SETEXEC`), given `argv`, `env` as its whole environment, the
+/// standard descriptors and `network_lock` and no other descriptor, and
+/// `memory`'s jetsam priority and limit (MiB). `last` runs when all else
+/// is ready, just before. Returns only on failure.
+///
+/// `network_lock` is close-on-exec until here (a descriptor of the
+/// jailer's that must reach nothing but Firecracker), and an inherit action
+/// alone does not carry such a descriptor over when the spawn replaces the
+/// caller: the kernel makes the new process's descriptor table first,
+/// without the close-on-exec ones (xnu bsd/kern/kern_exec.c posix_spawn:
+/// cloneproc(CLONEPROC_EXEC); kern_descrip.c fdt_fork with in_exec), and
+/// runs the file actions on that table after, where the inherit action
+/// finds no such descriptor: EBADF (exec_handle_file_actions,
+/// PSFA_INHERIT). So the flag is cleared here, last, and the inherit
+/// action keeps the descriptor through POSIX_SPAWN_CLOEXEC_DEFAULT.
+fn replace_process(
+    argv: &[CString],
+    env: &[CString],
+    network_lock: Option<&OwnedFd>,
+    memory: Option<(i32, i32)>,
+    last: impl FnOnce() -> Result<(), HostError>,
+) -> Result<io::Error, HostError> {
     let mut argv_ptrs: Vec<*mut libc::c_char> = argv.iter().map(|a| a.as_ptr().cast_mut()).collect();
     argv_ptrs.push(std::ptr::null_mut());
     let mut envp_ptrs: Vec<*mut libc::c_char> = env.iter().map(|a| a.as_ptr().cast_mut()).collect();
@@ -695,7 +729,7 @@ fn exec(
     }
     let inherited = [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
         .into_iter()
-        .chain(network_lock.as_ref().map(AsRawFd::as_raw_fd));
+        .chain(network_lock.map(AsRawFd::as_raw_fd));
     for fd in inherited {
         // SAFETY: initialised above.
         let ret = unsafe { posix_spawn_file_actions_addinherit_np(actions.as_mut_ptr(), fd) };
@@ -703,8 +737,7 @@ fn exec(
             return Err(fail("posix_spawn_file_actions_addinherit_np", ret));
         }
     }
-    if let Some(limit) = *MEMORY_LIMIT_MIB.lock().unwrap() {
-        let priority = jetsam_priority()?;
+    if let Some((priority, limit)) = memory {
         // SAFETY: initialised above.
         let ret = unsafe {
             posix_spawnattr_setjetsam_ext(
@@ -719,9 +752,14 @@ fn exec(
             return Err(fail("posix_spawnattr_setjetsam_ext", ret));
         }
     }
-    // Last before the exec: the jail's supervisor, which may hold the exec
-    // back while the jail is frozen.
-    freezer::start_supervisor(freezer).map_err(HostError::Freezer)?;
+    last()?;
+    if let Some(lock) = network_lock {
+        // SAFETY: a descriptor we own; the jailer has one thread and
+        // nothing is started between this and the exec.
+        if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, 0) } != 0 {
+            return Err(HostError::Spawn("fcntl(F_SETFD) on the network's lock", io::Error::last_os_error()));
+        }
+    }
     // SAFETY: NUL-terminated path, argument and environment vectors that
     // outlive the call; attributes initialised above.
     let ret = unsafe {
@@ -926,6 +964,72 @@ mod tests {
     /// `ls`'s name for a uid nobody has.
     fn who(uid: u32) -> String {
         format!("{uid:X}")
+    }
+
+    // The exec itself, with a stand-in for Firecracker: the lock reaches the
+    // new program (and nothing else of the jailer's does), and is held for
+    // as long as that program lives. The stand-in is a shell that fails
+    // unless the lock's descriptor is open and another of the jailer's,
+    // not close-on-exec, is not; it says so and waits for its stdin to end.
+    #[test]
+    fn test_the_network_lock_is_held_by_the_program_the_jailer_becomes() {
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let net = dir.as_path().canonicalize().unwrap();
+        let (_sub, lock) = network_for_jail(&net, "a", 54321).unwrap();
+        let other = File::open(&net).unwrap();
+        let script = format!(
+            ": <&{} || exit 9; if (: <&{}) 2>/dev/null; then exit 8; fi; echo ok; read line; exit 0",
+            lock.as_raw_fd(),
+            other.as_raw_fd()
+        );
+        let argv = ["/bin/sh", "-c", &script].map(|a| CString::new(a).unwrap());
+        let (mut pipe, mut out) = ([-1; 2], [-1; 2]);
+        // SAFETY: arrays of two descriptors.
+        assert_eq!(unsafe { (libc::pipe(pipe.as_mut_ptr()), libc::pipe(out.as_mut_ptr())) }, (0, 0));
+        // SAFETY: the child only calls replace_process and _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // SAFETY: descriptors of ours; ends the child.
+            unsafe {
+                libc::dup2(pipe[0], 0);
+                libc::dup2(out[1], 1);
+                libc::fcntl(other.as_raw_fd(), libc::F_SETFD, 0);
+                let code = match replace_process(&argv, &[], Some(&lock), None, || Ok(())) {
+                    Ok(err) => 100 + err.raw_os_error().unwrap_or(0),
+                    Err(_) => 99,
+                };
+                libc::_exit(code)
+            }
+        }
+        // SAFETY: the child's ends; the other is ours from here.
+        let mut said = unsafe {
+            libc::close(pipe[0]);
+            libc::close(out[1]);
+            <File as std::os::fd::FromRawFd>::from_raw_fd(out[0])
+        };
+        // The jailer's own descriptor is gone with the jailer.
+        drop(lock);
+        let wait = |flags| {
+            let mut status = 0;
+            // SAFETY: our child; an out-pointer.
+            let got = unsafe { libc::waitpid(pid, &mut status, flags) };
+            (got, status)
+        };
+        let mut word = [0u8; 3];
+        if said.read_exact(&mut word).is_err() {
+            let (_, status) = wait(0);
+            panic!("the stand-in did not start with the lock: exit {}", libc::WEXITSTATUS(status));
+        }
+        assert_eq!(&word, b"ok\n");
+        let err = network_for_jail(&net, "a", 54321).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBUSY), "{err}");
+        // SAFETY: ends the stand-in's stdin.
+        unsafe { libc::close(pipe[1]) };
+        let (got, status) = wait(0);
+        assert_eq!(got, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "status {status:#x}");
+        network_for_jail(&net, "a", 54321).unwrap();
     }
 
     // Linux: a TAP that has a queue attached refuses a second attach with
