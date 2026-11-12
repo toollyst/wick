@@ -144,18 +144,17 @@ error-text vmm vstate::vcpu::tests::test_handle_kvm_exit
 #   (expects Linux's text for libc::EINVAL, "Invalid argument (os error 22)";
 #   on Windows libc::EINVAL is ERROR_INVALID_PARAMETER: "The parameter is
 #   incorrect. (os error 87)")
-bug vmm devices::virtio::block::vhost_user::device::tests::test_activate
-bug vmm devices::virtio::block::vhost_user::device::tests::test_new_all_features
-bug vmm devices::virtio::block::vhost_user::device::tests::test_new_no_features
-bug vmm devices::virtio::vhost_user::tests::test_new
-#   (test_utils::create_tmp_socket panics "Cannot bind socket" (mod.rs:173).
-#   Its path is TempDir::new's, canonicalized: on Windows the verbatim form
-#   `\\?\C:\...`, with "/tmp_socket" appended, and a `\\?\` path keeps its
-#   '/' (Naming Files, Paths, and Namespaces). Measured by libc's
-#   test_unix_bind_of_each_path_form_on_record in CI run 43298293407's WHP
-#   step: the verbatim form with '/' fails with ERROR_INVALID_PARAMETER (87);
-#   with '\', and the plain form with either, binds. c7c8837's exact AF_UNIX
-#   length did not change it)
+# (vhost-user's test_new and block vhost-user's test_activate,
+# test_new_all_features and test_new_no_features were listed until
+# vmm-sys-util's TempDir gave the plain path where it names the same
+# directory (windows/tempdir.rs, plain). They failed in
+# test_utils::create_tmp_socket, "Cannot bind socket" (mod.rs:173): its path
+# was TempDir::new's canonical, verbatim one (`\\?\C:\...`) with
+# "/tmp_socket" appended, and a `\\?\` path keeps its '/' (Naming Files,
+# Paths, and Namespaces). Measured by libc's
+# test_unix_bind_of_each_path_form_on_record in CI run 43298293407's WHP
+# step: the verbatim form with '/' fails with ERROR_INVALID_PARAMETER (87);
+# with '\', and the plain form with either, binds.)
 
 # vmm: WHP maps guest memory for one partition of a process at a time
 # (kvm-ioctls' test_one_partition_of_a_process_maps_memory; MAPTEST in CI's
