@@ -11,6 +11,7 @@ says what it stands for on Linux.
 """
 
 import ctypes
+import errno
 import os
 import platform
 import re
@@ -581,12 +582,44 @@ def _ended(pid):
 
 
 def _kill(pid, sig):
+    if sig in (signal.CTRL_C_EVENT, signal.CTRL_BREAK_EVENT):
+        return _real_kill(pid, sig)
+    # CPython's os.kill opens the process for every access right, more than a
+    # jailed process's DACL may give its user (which grants terminating it):
+    # PROCESS_TERMINATE alone, then TerminateProcess with the signal's
+    # number, as CPython's.
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    if sig in (signal.SIGSTOP, signal.SIGCONT):
+        # Stopping and continuing a process: suspending and resuming all its
+        # threads (NtSuspendProcess, NtResumeProcess).
+        h = k32.OpenProcess(0x0800, False, pid)  # PROCESS_SUSPEND_RESUME
+        if not h:
+            raise ProcessLookupError(3, f"kill({pid}): no such process")
+        try:
+            ntdll = ctypes.WinDLL("ntdll")
+            call = ntdll.NtSuspendProcess if sig == signal.SIGSTOP else ntdll.NtResumeProcess
+            status = call(ctypes.c_void_p(h))
+            if status:
+                raise OSError(errno.EPERM, f"kill({pid}, {sig}): NTSTATUS {status & 0xFFFFFFFF:#x}")
+        finally:
+            k32.CloseHandle(ctypes.c_void_p(h))
+        return None
+    h = k32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+    if not h:
+        err = ctypes.get_last_error()
+        if err == 87 or _ended(pid):
+            raise ProcessLookupError(3, f"kill({pid}): no such process")
+        raise ctypes.WinError(err)
     try:
-        _real_kill(pid, sig)
-    except OSError as err:
-        if isinstance(err, ProcessLookupError) or _ended(pid):
-            raise ProcessLookupError(3, f"kill({pid}): no such process") from None
-        raise
+        if not k32.TerminateProcess(ctypes.c_void_p(h), sig):
+            err = ctypes.get_last_error()
+            if _ended(pid):
+                raise ProcessLookupError(3, f"kill({pid}): no such process")
+            raise ctypes.WinError(err)
+        return None
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
 
 
 os.kill = _kill
@@ -848,17 +881,39 @@ _SESSIONS = {}
 
 
 def start_screen_process(screen_log, session_name, binary_path, binary_params):
-    """`utils.start_screen_process`: the binary with its input a pipe and its
-    output in `screen_log`; returns its pid (the "screen" pid, which the
-    framework kills with Firecracker's)."""
-    log = open(screen_log, "ab", buffering=0)  # pylint: disable=consider-using-with
+    """`utils.start_screen_process`: the binary under a stand-in for screen
+    (hosttools.py's `screen`), its input a pipe from this session and its
+    output copied to `screen_log`; returns the stand-in's pid (the "screen"
+    pid, which tests stop and the framework kills with Firecracker's)."""
     proc = subprocess.Popen(  # pylint: disable=consider-using-with
-        [str(binary_path), *[str(p) for p in binary_params]],
-        stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+        [sys.executable, _HOSTTOOLS, "screen", str(screen_log), str(binary_path),
+         *[str(p) for p in binary_params]],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    _SESSIONS[session_name] = (proc, log)
+    _SESSIONS[session_name] = (proc, None)
     _utils.wait_process_running(psutil.Process(proc.pid))
-    return proc.pid
+    return _interpreter(proc.pid)
+
+
+def _interpreter(pid):
+    """The pid of the interpreter a Python process started as `pid` runs in.
+    A virtual environment's python.exe is a launcher that runs the base
+    interpreter as its child and waits for it: stopping the launcher
+    (SIGSTOP, NtSuspendProcess) would leave the interpreter copying."""
+    if os.path.normcase(sys.executable) == os.path.normcase(getattr(sys, "_base_executable", sys.executable)):
+        return pid
+    import time  # pylint: disable=import-outside-toplevel
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            children = psutil.Process(pid).children()
+        except psutil.Error:
+            return pid
+        if children:
+            return children[0].pid
+        time.sleep(0.02)
+    raise RuntimeError(f"{sys.executable} (pid {pid}) started no interpreter")
 
 
 _utils.start_screen_process = start_screen_process
@@ -1025,7 +1080,20 @@ def _ssh_exec(self, cmd, timeout=100, check=False):
         return _utils.CommandReturn(0, "", "Stop listening request sent.\n")
     establish = any(o.startswith("ControlMaster=") for o in opts)
     if establish:
-        self._wick_options = [o for o in _without_control(opts) if o != "-vvv"]
+        # The connection's options for every later command, but its
+        # ConnectTimeout: on Linux that bounds the one connection the master
+        # makes, and later commands ride it; here each makes its own, whose
+        # key exchange takes longer than 2 s on a loaded host (measured:
+        # "Connection timed out during banner exchange" at six VMs at once).
+        kept = [o for o in _without_control(opts) if o != "-vvv"]
+        self._wick_options = []
+        i = 0
+        while i < len(kept):
+            if kept[i] == "-o" and kept[i + 1].startswith("ConnectTimeout="):
+                i += 2
+                continue
+            self._wick_options.append(kept[i])
+            i += 1
     base = getattr(self, "_wick_options", [])
     opts = _without_control(opts)
     # The connection's options (key, algorithms) first; ssh takes the first

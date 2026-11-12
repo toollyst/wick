@@ -228,6 +228,23 @@ def procstatus(args):
     return 0
 
 
+def screen(args):
+    """`screen` as upstream runs Firecracker in it: `screen LOG CMD...` runs
+    CMD with this process's standard input (the session's serial input) and
+    its output on a pipe that this process copies to LOG. Stopping this
+    process (SIGSTOP: suspended) stops the copying, and CMD's writes then
+    find the pipe full, as a screen that is stopped leaves its terminal."""
+    log, cmd = args[0], args[1:]
+    child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)  # pylint: disable=consider-using-with
+    with open(log, "ab", buffering=0) as out:
+        while True:
+            data = child.stdout.read1(4096)
+            if not data:
+                break
+            out.write(data)
+    return child.wait()
+
+
 TOOLS = ("ps", "pgrep", "pidof", "dmesg", "socat", *E2FSPROGS)
 
 
@@ -238,7 +255,7 @@ def main():
     if tool in E2FSPROGS:
         return e2fsprogs(tool, args)
     return {"ps": ps, "pgrep": pgrep, "pidof": pidof, "dmesg": dmesg, "socat": socat,
-            "procstatus": procstatus}[tool](args)
+            "procstatus": procstatus, "screen": screen}[tool](args)
 
 
 if __name__ == "__main__":
