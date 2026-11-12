@@ -21,6 +21,8 @@ pub mod vcpu_thread;
 #[cfg(all(test, target_os = "macos"))]
 mod snapshot_vcpu_tests;
 #[cfg(all(test, unix))]
+mod nonblocking_pipe_tests;
+#[cfg(all(test, unix))]
 mod sigpipe_tests;
 #[cfg(all(test, unix))]
 mod unix_stream_tests;
