@@ -1,32 +1,39 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
 Date: Thu, 12 Nov 2026 16:00:44 +0900
-Subject: [PATCH] windows: the jailer refuses every no-file limit
+Subject: [PATCH] windows: the jailer tells its backend whether no-file was
+ given
 
-Windows cannot limit the number of handles a process opens (a process's
-pool quota is accepted and ignored; a Job Object has no handle limit and
-its memory limit does not count handles). The Windows jailer refused a
-no-file= value other than upstream's default, but accepted
---resource-limit no-file=2048 without effect. ResourceLimits records on
-Windows whether no-file= was given, and the backend refuses it whatever
-the value; without it the backend warns that the default is not enforced.
+Windows has no setrlimit. ResourceLimits records on Windows whether
+no-file= was given, and install hands the backend the value, or None
+(platform::install_resource_limits).
+
+The backend at first refused every no-file=, the default's value too, as
+Windows has no limit on the handles of a process. It now gives the limit,
+upstream's 2048 when none was given, to each process of the jail, which
+counts it in its own handles and fails a call that would make a descriptor
+past it with EMFILE (wick's POSIX layer: crates/compat/libc, wick_nofile).
+fsize= is still refused: Windows cannot limit the size of the files a
+process writes.
+
 Nothing changes on Linux or macOS.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 ---
- src/jailer/src/resource_limits.rs | 18 ++++++++++++++++--
- 1 file changed, 16 insertions(+), 2 deletions(-)
+ src/jailer/src/resource_limits.rs | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
 
 diff --git a/src/jailer/src/resource_limits.rs b/src/jailer/src/resource_limits.rs
-index 66ef3259c43a6fc36fc19ad166da9113d0b05b48..77648a218b866d48caaa975788e4538c7ca21ec3 100644
+index 66ef3259c43a6fc36fc19ad166da9113d0b05b48..ce51b290f7c61558536b9547b9c46c776165c79c 100644
 --- a/src/jailer/src/resource_limits.rs
 +++ b/src/jailer/src/resource_limits.rs
 @@ -80,6 +80,10 @@ impl Display for Resource {
  pub struct ResourceLimits {
      file_size: Option<u64>,
      no_file: u64,
-+    // wick: whether `no-file=` was given; Windows refuses it, the default's
-+    // value included (platform::install_resource_limits).
++    // wick: whether `no-file=` was given; the Windows backend is told, and
++    // takes the default itself when not (platform::install_resource_limits).
 +    #[cfg(windows)]
 +    no_file_given: bool,
  }
@@ -43,10 +50,11 @@ index 66ef3259c43a6fc36fc19ad166da9113d0b05b48..77648a218b866d48caaa975788e4538c
  }
  
  impl ResourceLimits {
-     // wick: Windows cannot enforce these limits; the backend refuses explicit
+-    // wick: Windows cannot enforce these limits; the backend refuses explicit
 -    // ones (platform::install_resource_limits).
-+    // ones and warns that the default is not enforced
-+    // (platform::install_resource_limits).
++    // wick: Windows has no setrlimit. The backend refuses `fsize=`, which
++    // it cannot enforce, and gives `no-file` to each process of the jail,
++    // which counts it in its own handles (platform::install_resource_limits).
      #[cfg(windows)]
      pub fn install(self) -> Result<(), JailerError> {
 -        crate::platform::install_resource_limits(self.file_size, self.no_file, NO_FILE)

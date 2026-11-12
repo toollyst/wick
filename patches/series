@@ -36,7 +36,7 @@
 0034-windows-cpu-template-helper-s-fingerprint-names-the-.patch
 0035-windows-no-fdtable-resize-which-Windows-has-no-table.patch
 0036-windows-rebase-refuses-a-diff-file-that-is-not-spars.patch
-0037-windows-the-jailer-refuses-every-no-file-limit.patch
+0037-windows-the-jailer-tells-its-backend-whether-no-file.patch
 0038-windows-the-gdb-feature-builds-the-WHP-backend-s-gue.patch
 0039-macos-a-drive-on-a-block-device-has-the-device-s-siz.patch
 0040-macos-SIGSYS-s-handler-runs-on-a-thread-of-its-own.patch
