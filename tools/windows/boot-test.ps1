@@ -2904,6 +2904,31 @@ if ($SelfTest) {
         vsock  = { [Wick.SelfTest]::VsockTest($dir) }
         api    = { [Wick.SelfTest]::ApiTest($dir) }
         pipe   = { [Wick.PipeSelfTest]::Run() }
+        relay  = {
+            # The gdb stage's TCP relay, against a stand-in for the gdb stub.
+            $path = Join-Path $dir 'gdb.sock'
+            $stub = [Wick.USock]::Listen($path)
+            $relay = New-Object Wick.Relay($path)
+            $tcp = New-Object Net.Sockets.TcpClient('127.0.0.1', $relay.Port)
+            try {
+                $c = $stub.Accept(5000)
+                $st = $tcp.GetStream()
+                $ask = [Text.Encoding]::ASCII.GetBytes('$qSupported#37')
+                $st.Write($ask, 0, $ask.Length)
+                $got = New-Object byte[] $ask.Length
+                $c.RecvExact($got, 0, $got.Length, 5000)
+                Check ([Text.Encoding]::ASCII.GetString($got) -eq '$qSupported#37') 'the stub did not get the client''s bytes'
+                $c.SendAll([Text.Encoding]::ASCII.GetBytes('+$OK#9a'))
+                $back = New-Object byte[] 7
+                $n = 0
+                $st.ReadTimeout = 5000
+                while ($n -lt 7) { $r = $st.Read($back, $n, 7 - $n); if ($r -le 0) { break }; $n += $r }
+                Check ([Text.Encoding]::ASCII.GetString($back, 0, $n) -eq '+$OK#9a') 'the client did not get the stub''s bytes'
+                Check (-not $relay.Error) "relay: $($relay.Error)"
+                $c.Dispose()
+            } finally { $tcp.Close(); $relay.Stop(); $stub.Dispose() }
+            return 'Relay: TCP to a Unix socket and back'
+        }
         sparse = {
             # The synthetic diff files of the tools stage.
             $data = [Wick.Util]::Random(64KB)
