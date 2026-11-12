@@ -1235,6 +1235,59 @@ pub mod syscalls {
         }
     }
 
+    /// SIGPIPE as Linux raises it, after a write to `fd` that returned
+    /// `ret`; returns `ret`, with errno as the call left it.
+    ///
+    /// Linux raises SIGPIPE on the calling thread when a write to a stream
+    /// socket (a Unix one or TCP) fails with `EPIPE` having sent nothing, unless the call
+    /// passed `MSG_NOSIGNAL` (net/unix/af_unix.c `unix_stream_sendmsg`,
+    /// `pipe_err`: `send_sig(SIGPIPE, current, 0)`, which `send_sig_info`
+    /// sends to the thread, `PIDTYPE_PID`); `write(2)` and `writev(2)` pass
+    /// no flags. xnu raises it for the process (bsd/kern/sys_socket.c
+    /// `soo_write`, bsd/kern/uipc_syscalls.c `sendit`), and not at all on a
+    /// socket with `SO_NOSIGPIPE`, which Rust's std sets on every socket it
+    /// makes on Apple systems (its own writes stand for Linux's, which pass
+    /// `MSG_NOSIGNAL`; they do not come here). So only where xnu kept quiet
+    /// for that flag alone, this raises it, once: a socket without the flag
+    /// has had its signal from xnu, and a pipe (`ENOTSOCK`) too. As on
+    /// Linux, a blocked SIGPIPE stays pending for the thread and an ignored
+    /// one is dropped (`pthread_kill`).
+    fn linux_sigpipe(fd: c_int, flags: c_int, ret: ssize_t) -> ssize_t {
+        if ret >= 0 || errno() != libc::EPIPE || flags & libc::MSG_NOSIGNAL != 0 {
+            return ret;
+        }
+        let mut on: c_int = 0;
+        let mut len = core::mem::size_of::<c_int>() as socklen_t;
+        // SAFETY: an int and its length, as SO_NOSIGPIPE takes.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&raw mut on).cast(),
+                &mut len,
+            )
+        };
+        // Only a stream socket's write raises it on Linux (a datagram or
+        // seqpacket socket's, unix_dgram_sendmsg, does not).
+        let mut kind: c_int = 0;
+        let mut kind_len = core::mem::size_of::<c_int>() as socklen_t;
+        // SAFETY: as above, for SO_TYPE.
+        let stream = got == 0
+            && on != 0
+            && unsafe {
+                libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, (&raw mut kind).cast(), &mut kind_len)
+            } == 0
+            && kind == libc::SOCK_STREAM;
+        if stream {
+            // SAFETY: a signal to the calling thread.
+            unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGPIPE) };
+        }
+        // SAFETY: this thread's errno, as the call left it.
+        unsafe { *libc::__error() = libc::EPIPE };
+        ret
+    }
+
     fn iov_pages(iov: *const iovec, count: c_int, write: bool) -> bool {
         let mut any = false;
         for i in 0..count.max(0) as usize {
@@ -1263,10 +1316,11 @@ pub mod syscalls {
     /// As `write(2)`.
     pub unsafe fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
         // SAFETY: the caller's contract.
-        with_pages(
+        let ret = with_pages(
             || prefault(buf as u64, count as u64, false),
             || unsafe { libc::write(fd, buf, count) },
-        )
+        );
+        linux_sigpipe(fd, 0, ret)
     }
 
     /// `pread(2)`.
@@ -1311,10 +1365,11 @@ pub mod syscalls {
     /// As `writev(2)`.
     pub unsafe fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t {
         // SAFETY: the caller's contract.
-        with_pages(
+        let ret = with_pages(
             || iov_pages(iov, iovcnt, false),
             || unsafe { libc::writev(fd, iov, iovcnt) },
-        )
+        );
+        linux_sigpipe(fd, 0, ret)
     }
 
     /// `preadv(2)`.
@@ -1359,10 +1414,11 @@ pub mod syscalls {
     /// As `send(2)`.
     pub unsafe fn send(socket: c_int, buf: *const c_void, len: size_t, flags: c_int) -> ssize_t {
         // SAFETY: the caller's contract.
-        with_pages(
+        let ret = with_pages(
             || prefault(buf as u64, len as u64, false),
             || unsafe { libc::send(socket, buf, len, flags) },
-        )
+        );
+        linux_sigpipe(socket, flags, ret)
     }
 
     /// `recvfrom(2)`.
@@ -1397,10 +1453,11 @@ pub mod syscalls {
         addrlen: socklen_t,
     ) -> ssize_t {
         // SAFETY: the caller's contract.
-        with_pages(
+        let ret = with_pages(
             || prefault(buf as u64, len as u64, false),
             || unsafe { libc::sendto(socket, buf, len, flags, addr, addrlen) },
-        )
+        );
+        linux_sigpipe(socket, flags, ret)
     }
 
     /// `recvmsg(2)`.
@@ -1425,10 +1482,11 @@ pub mod syscalls {
         // SAFETY: the caller's msghdr.
         let (iov, n) = unsafe { ((*msg).msg_iov, (*msg).msg_iovlen) };
         // SAFETY: the caller's contract.
-        with_pages(
+        let ret = with_pages(
             || iov_pages(iov, n, false),
             || unsafe { libc::sendmsg(fd, msg, flags) },
-        )
+        );
+        linux_sigpipe(fd, flags, ret)
     }
 }
 

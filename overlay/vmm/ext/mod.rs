@@ -18,6 +18,8 @@ pub mod jail;
 pub mod sandbox;
 #[cfg(all(test, target_os = "macos"))]
 mod snapshot_vcpu_tests;
+#[cfg(all(test, unix))]
+mod sigpipe_tests;
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;

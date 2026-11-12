@@ -12,13 +12,11 @@
 //! |---|---|---|---|
 //! | [`async_io`] | io_uring | worker threads, `pread`/`pwrite`/`F_FULLFSYNC` | the macOS worker threads, `FlushFileBuffers` |
 //! | [`fs`] | (holes kept by the file system) | holes restored with `F_PUNCHHOLE` | sparse files, holes restored and checked |
-//! | [`socket`] | (SIGPIPE on a closed peer) | `SO_NOSIGPIPE` cleared where std set it | (wick's sockets raise it) |
 //! | [`net`] | TUN/TAP | vmnet.framework, or a Unix datagram endpoint; [`vnet`] header handling | a Unix stream endpoint (QEMU framing); [`vnet`] header handling |
 
 pub mod async_io;
 pub mod fs;
 pub mod net;
-pub mod socket;
 pub mod vnet;
 
 #[cfg(target_os = "linux")]

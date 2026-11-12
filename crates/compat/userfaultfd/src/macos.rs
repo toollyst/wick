@@ -322,8 +322,11 @@ fn words(b: &[u8; proto::RECORD]) -> [u64; 4] {
 
 fn write_all(fd: RawFd, mut buf: &[u8]) -> nix::Result<()> {
     while !buf.is_empty() {
-        // SAFETY: writes from a valid buffer.
-        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        // SAFETY: writes from a valid buffer, to the channel's socket.
+        // MSG_NOSIGNAL: a userfaultfd is no socket on Linux, and a write to
+        // it raises no SIGPIPE (the compatibility libc's send raises it as
+        // Linux does for a socket's, without the flag).
+        let n = unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL) };
         if n < 0 {
             let e = Errno::last();
             if e == Errno::EINTR {
@@ -400,7 +403,7 @@ impl Uffd {
             (*c).cmsg_type = libc::SCM_RIGHTS;
             (*c).cmsg_len = libc::CMSG_LEN(mem::size_of::<RawFd>() as u32) as _;
             *(libc::CMSG_DATA(c).cast::<RawFd>()) = theirs;
-            libc::sendmsg(self.fd, &msg, 0)
+            libc::sendmsg(self.fd, &msg, libc::MSG_NOSIGNAL)
         };
         let mut channel = Channel {
             fd: mine,

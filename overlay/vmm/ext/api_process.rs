@@ -426,8 +426,13 @@ mod macos {
         let fd = LINK.load(std::sync::atomic::Ordering::Acquire);
         let mut done = 0;
         while done < msg.len() {
-            // SAFETY: the rest of `msg` to the link.
-            let n = unsafe { libc::write(fd, msg[done..].as_ptr().cast(), msg.len() - done) };
+            // SAFETY: the rest of `msg` to the link. MSG_NOSIGNAL: Firecracker
+            // gone, the waiter exits 148 all the same (and a write's SIGPIPE
+            // would have the compatibility libc ask the socket's options,
+            // outside the API process's sandbox).
+            let n = unsafe {
+                libc::send(fd, msg[done..].as_ptr().cast(), msg.len() - done, libc::MSG_NOSIGNAL)
+            };
             if n > 0 {
                 done += n.unsigned_abs();
             } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
@@ -516,17 +521,6 @@ mod macos {
         Ok(usize::try_from(info.pti_threadnum).unwrap())
     }
 
-    /// Lets the API socket's connections raise SIGPIPE on a write after the
-    /// client has gone, as on Linux, where upstream's handler counts it
-    /// (`platform::socket`): cleared on the HTTP server's listener, made by
-    /// std, before the API process has it, so every connection it accepts
-    /// has it clear (xnu's `sonewconn` copies the flag).
-    fn listener_raises_sigpipe(path: &Path) -> Result<(), ApiProcessError> {
-        crate::platform::socket::sigpipe_as_linux(listener_fd(path)?)
-            .map(drop)
-            .map_err(|e| ApiProcessError::Bind(path.to_owned(), e))
-    }
-
     /// The listening socket bound to `path` (the HTTP server's, which it
     /// does not hand out). macOS has no `SO_ACCEPTCONN` to read
     /// (`ENOPROTOOPT`); a listener is the socket bound there with no peer,
@@ -583,7 +577,6 @@ mod macos {
         socket_path: &Path,
         payload_limit: usize,
     ) -> Result<ApiLink<UnixStream>, ApiProcessError> {
-        listener_raises_sigpipe(socket_path)?;
         if let Some(link) = WAITING.lock().unwrap().take() {
             let listener = listener_fd(socket_path)?;
             let mut msg = u64::try_from(payload_limit).unwrap().to_le_bytes().to_vec();
@@ -822,38 +815,6 @@ mod macos {
             assert_eq!(listener_fd(&path).unwrap(), listener.as_raw_fd());
             drop((client, accepted));
             listener_fd(&dir.join("other.sock")).unwrap_err();
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-
-        // A write to a connection of the API socket after the client has
-        // closed raises SIGPIPE, counted as on Linux (upstream's API thread
-        // writes a response to a client that has gone).
-        #[test]
-        fn test_the_api_socket_raises_sigpipe() {
-            crate::platform::socket::test_util::run_sigpipe_child(
-                "ext::api_process::macos::tests::api_socket_sigpipe_child",
-            );
-        }
-
-        #[test]
-        #[ignore = "run by test_the_api_socket_raises_sigpipe in a separate process"]
-        fn api_socket_sigpipe_child() {
-            let dir = tempfile_dir();
-            let path = dir.join("sigpipe.sock");
-            let _server = micro_http::HttpServer::new(&path).unwrap();
-            super::listener_raises_sigpipe(&path).unwrap();
-            crate::platform::socket::test_util::sigpipe_child(|| {
-                let client = UnixStream::connect(&path).unwrap();
-                let listener = listener_fd(&path).unwrap();
-                // SAFETY: a listening socket; no address asked for.
-                let accepted = unsafe { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) };
-                assert!(accepted >= 0);
-                drop(client);
-                // SAFETY: one byte from a valid buffer, to the accepted socket.
-                let n = unsafe { libc::write(accepted, b"x".as_ptr().cast(), 1) };
-                assert_eq!(n, -1);
-                assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EPIPE));
-            });
             std::fs::remove_dir_all(&dir).unwrap();
         }
 
