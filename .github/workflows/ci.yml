@@ -102,6 +102,13 @@ jobs:
       - name: Build firecracker
         working-directory: lib/firecracker
         run: cargo build --locked -p firecracker
+      # What upstream's jailer does with the freezer and devices cgroups (the
+      # reference for the macOS and Windows jailers), measured as root.
+      - name: Build the jailer
+        working-directory: lib/firecracker
+        run: cargo build --locked -p jailer
+      - name: Upstream jailer's freezer and devices cgroups
+        run: sudo python3 -I tools/linux/jailer-cgroup-check.py --jailer lib/firecracker/build/cargo_target/debug/jailer
 
   # Upstream's unit tests as upstream's CI runs them (its development
   # container, as root, musl, one test thread: tools/linux/unit-tests.sh),

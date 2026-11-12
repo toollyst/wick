@@ -248,6 +248,11 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   boots upstream's CI guest with the musl release binary (seccomp filters on
   every thread) and checks serial I/O, SMP, the Async (io_uring) block engine
   and vsock.
+- `tools/linux/jailer-cgroup-check.py` measures, as root in the Linux CI, what
+  upstream's jailer does with the freezer and devices cgroup options (v1
+  `freezer.state` and `devices.*` on mounted v1 hierarchies, v2
+  `cgroup.freeze`), the reference the other hosts' jailers follow: it asserts
+  each exit code and error text and prints them.
 - Upstream tests left out on purpose: `test_licenses.py::test_for_valid_licenses`
   (wick's copyright headers), `tests/integration_tests/performance/`
   (baselines measured on AWS bare metal), and in CI the 5.10 and 6.18 guest
