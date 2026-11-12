@@ -2649,20 +2649,56 @@ mod macos {
             assert!(!run.stdout.contains("CHILD-SURVIVED"), "{}", run.text());
         }
 
-        // The same with the logger's lock held (as upstream's update() does
-        // while configuring the logger): the log line comes once it is
-        // released, then exit 148.
+        /// The `STAGES-NS` line `in_fork` printed for a case, by name:
+        /// nanoseconds from just before the denied call (0: not reached).
+        fn stages(run: &SigsysRun) -> std::collections::HashMap<String, u64> {
+            let line = run
+                .stdout
+                .split("STAGES-NS ")
+                .nth(1)
+                .and_then(|r| r.lines().next())
+                .unwrap_or_else(|| panic!("no stages: {}", run.text()));
+            let words: Vec<&str> = line.split_whitespace().collect();
+            words.chunks(2).map(|w| (w[0].to_owned(), w[1].parse().unwrap())).collect()
+        }
+
+        // The SIGSYS handler takes the logger's lock (upstream's handler
+        // logs), and a thread of the process may hold it (as upstream's
+        // update() does while configuring the logger). Held for good, the
+        // handler never logs, and SIGSYS_DEADLINE ends the process with
+        // exit 148 all the same: the wait on the lock is bounded by the
+        // deadline, which starts when the waiter wakes and cannot end
+        // before. No bound on how late: that is the host's scheduling.
         #[test]
-        fn test_sigsys_does_not_wait_on_the_logger_lock() {
+        fn test_sigsys_deadline_bounds_a_wait_on_the_logger_lock() {
+            use std::time::Duration;
+            let run = sigsys_run("logger-held", Some(Duration::ZERO), SIGSYS_DEADLINE + Duration::from_secs(20));
+            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
+            assert!(!run.stdout.contains("Shutting down VM"), "the handler logged: {}", run.text());
+            let at = stages(&run);
+            assert!(at["woken"] > 0 && at["released"] == 0, "{at:?}: {}", run.text());
+            let waited = Duration::from_nanos(at["exited"] - at["woken"]);
+            assert!(waited >= SIGSYS_DEADLINE, "exit {waited:?} after the waiter woke: {at:?}");
+        }
+
+        // Released once the waiter has woken (the deadline then has all of
+        // its time left), the lock lets the handler's work through: its log
+        // line, the fault counted, exit 148. A run without them prints when
+        // each stage came, so a host that kept the process off its CPUs
+        // for the deadline says so.
+        #[test]
+        fn test_sigsys_handler_logs_once_the_logger_lock_is_released() {
             use std::time::Duration;
             let run = sigsys_run("logger", Some(Duration::ZERO), Duration::from_secs(20));
-            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
+            let at = stages(&run);
+            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{at:?}: {}", run.text());
+            assert!(at["released"] >= at["woken"] && at["woken"] > 0, "{at:?}: {}", run.text());
             assert!(
                 run.stdout.contains("Shutting down VM after the host sandbox denied a system call."),
-                "{}",
+                "{at:?}: {}",
                 run.text()
             );
-            assert!(run.stdout.contains(FAULT_METRIC), "{}", run.text());
+            assert!(run.stdout.contains(FAULT_METRIC), "{at:?}: {}", run.text());
         }
 
         // A thread's panic (upstream's hook writes metrics, then aborts)
@@ -2757,7 +2793,7 @@ mod macos {
                     .unwrap_or_else(|| panic!("{}", run.text()))
                     .to_owned();
                 let ns: Vec<u64> = line.split_whitespace().skip(1).step_by(2).map(|n| n.parse().unwrap()).collect();
-                let [returned, forwarded, woken, exited, last_run] = ns[..] else { panic!("{line}") };
+                let [returned, forwarded, woken, exited, last_run, _released] = ns[..] else { panic!("{line}") };
                 eprintln!("sigsys stages: {line}");
                 assert!(
                     returned > 0 && forwarded > 0 && woken >= forwarded && exited >= woken,
@@ -2864,12 +2900,13 @@ mod macos {
                             // call returns.
                             let since = |slot: usize| at(slot).saturating_sub(at(STAGE_CALLED));
                             println!(
-                                "STAGES-NS returned {} forwarded {} woken {} exited {} last-run {}",
+                                "STAGES-NS returned {} forwarded {} woken {} exited {} last-run {} released {}",
                                 since(0),
                                 since(SigsysStage::Forwarded as usize),
                                 since(SigsysStage::Woken as usize),
                                 since(STAGE_EXITED),
-                                since(1)
+                                since(1),
+                                since(STAGE_RELEASED)
                             );
                         }
                         if libc::WIFEXITED(status) {
@@ -2910,7 +2947,8 @@ mod macos {
         /// returned (slot 0), the last time the denying thread ran after it
         /// (1), the SIGSYS path's stages (`SigsysStage`, 2 and 3), when
         /// this process saw the fork's exit ([`STAGE_EXITED`]) and the time
-        /// just before the call ([`STAGE_CALLED`])
+        /// just before the call ([`STAGE_CALLED`]), and when a case released
+        /// the lock it held ([`STAGE_RELEASED`])
         /// (nanoseconds of CLOCK_MONOTONIC_RAW).
         static RUN_ON: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicU64> =
             std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
@@ -2919,6 +2957,8 @@ mod macos {
         const STAGE_EXITED: usize = 4;
         /// The slot of the time just before the denied call.
         const STAGE_CALLED: usize = 5;
+        /// The slot of the time a case released the lock it held.
+        const STAGE_RELEASED: usize = 6;
 
         fn now_ns() -> u64 {
             let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -3003,19 +3043,26 @@ mod macos {
             }
             let panics = case == "panic";
             let free = case == "free";
+            // The stages are printed for these cases too (in_fork).
+            let stamped = free || case.starts_with("logger");
             // The offender blocks SIGSYS for itself: the sandbox's signal
             // then goes to the first thread, which holds the lock.
             let offender = std::thread::spawn(move || {
                 block_sigsys();
                 std::thread::sleep(Duration::from_millis(200));
                 eprintln!("DENYING");
-                if free {
+                if stamped {
                     let page = RUN_ON.load(Ordering::Acquire);
                     // SAFETY: the shared page sigsys_lock_child mapped.
                     unsafe { (*page.add(STAGE_CALLED)).store(now_ns(), Ordering::Release) };
                 }
                 // SAFETY: no arguments; denied, which raises SIGSYS.
                 unsafe { libc::getppid() };
+                if !free && stamped {
+                    let page = RUN_ON.load(Ordering::Acquire);
+                    // SAFETY: the shared page sigsys_lock_child mapped.
+                    unsafe { (*page).store(now_ns(), Ordering::Release) };
+                }
                 if free {
                     // How long this thread runs on, until the exit.
                     let page = RUN_ON.load(Ordering::Acquire);
@@ -3040,9 +3087,23 @@ mod macos {
                     fill_stdout();
                     let _ = METRICS.write();
                 }
-                "logger" => {
+                "logger" | "logger-held" => {
                     let guard = LOGGER.0.write().unwrap();
-                    std::thread::sleep(Duration::from_secs(1));
+                    if case == "logger-held" {
+                        // Held until the deadline ends the process.
+                        loop {
+                            std::thread::sleep(Duration::from_secs(60));
+                        }
+                    }
+                    // Until the waiter has woken: the deadline has started.
+                    let page = SIGSYS_STAGES.load(Ordering::Acquire);
+                    // SAFETY: the shared page sigsys_lock_child mapped.
+                    while unsafe { (*page.add(SigsysStage::Woken as usize)).load(Ordering::Acquire) } == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let run_on = RUN_ON.load(Ordering::Acquire);
+                    // SAFETY: as above.
+                    unsafe { (*run_on.add(STAGE_RELEASED)).store(now_ns(), Ordering::Release) };
                     drop(guard);
                 }
                 other => panic!("{other}"),
