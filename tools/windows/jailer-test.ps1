@@ -646,6 +646,11 @@ public static long Wait(PI pi, uint ms) {
   uint c; GetExitCodeProcess(pi.p, out c); CloseHandle(pi.p); return c;
 }
 public static uint Mode() { Open(); uint m; GetConsoleMode(In, out m); return m; }
+// Raw as vmm_sys_util::terminal sets it: no line input, echo or Ctrl+C
+// processing (ENABLE_LINE_INPUT 2, ENABLE_ECHO_INPUT 4, ENABLE_PROCESSED_INPUT
+// 1), virtual terminal input (0x200); canonical: all of those but the last.
+public static bool IsRaw(uint m) { return (m & 7) == 0 && (m & 0x200) != 0; }
+public static bool IsCanonical(uint m) { return (m & 7) == 7 && (m & 0x200) == 0; }
 public static void Flush() { Open(); FlushConsoleInputBuffer(In); }
 public static void Type(string s) {
   Open();
@@ -781,8 +786,23 @@ function Stage-Pidns {
     $probe = Get-Probe
     $out = Join-Path $WorkDir 'pidns-out.txt'
     $victims = @()
+    # The console's input mode at each step, timed, for the messages.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $timeline = New-Object System.Collections.Generic.List[string]
+    $note = {
+        param([string]$what)
+        $m = [WickJailerTest.Term]::Mode()
+        $timeline.Add(('{0} ms {1}: 0x{2:x}' -f $clock.ElapsedMilliseconds, $what, $m))
+        $m
+    }
     try {
+        $start = & $note 'the stage starts'
+        Check ([WickJailerTest.Term]::IsCanonical($start)) ("the console is not in canonical mode at the start (0x{0:x}), so its mode proves nothing" -f $start)
         $other = Start-ApiJail $base 'other'
+        # Started from this shell: on the operator's console when the shell's
+        # input is one (an interactive console; not under ssh).
+        $m = & $note 'an API-only jail started from the shell'
+        Check ($m -eq $start) "an API-only jail changed the console's mode (upstream Firecracker sets raw mode only when it starts the microVM's vCPUs): $($timeline -join '; ')"
         $victims = @((Start-Victim), (Start-Victim))
         $services = (Get-Process services).Id
         # A pid no process has (the highest of the system's plus a margin, a
@@ -832,30 +852,52 @@ function Stage-Pidns {
         $oracle = $got | Where-Object { $_.StartsWith("signal:$unused ") } | Select-Object -First 1
         Check ($oracle -match 'os error 87') "an unused pid: $oracle"
 
-        # The relay: keys typed on the console reach the jailed process as
-        # the bytes it would have read (Ctrl+C a byte), its output reaches the
-        # console, and the console's mode is restored after.
-        $mode = [WickJailerTest.Term]::Mode()
+        # The console's mode, as a Linux terminal's under a jailed
+        # Firecracker: as the operator left it while Firecracker runs no
+        # microVM (upstream sets raw mode in Vm::start_vcpus and canonical
+        # mode in Vmm::stop), and nothing reads it then. An API-only jailed
+        # Firecracker with the console as its input (given here, so that
+        # this holds under ssh too) leaves the mode, and takes none of the
+        # keys typed below for another jail.
+        $idle = [WickJailerTest.Term]::Start("`"$Jailer`" --id idle --exec-file `"$Fc`" --uid 0 --gid 0 --chroot-base-dir `"$base`"", (Join-Path $WorkDir 'pidns-idle.txt'), $false)
+        $idleSock = Join-Path $base 'firecracker.exe\idle\root\run\firecracker.socket'
+        $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $idleSock) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
+        Check (Test-Path $idleSock) "the API-only jail on the console: no API socket: $(Get-Content -Raw (Join-Path $WorkDir 'pidns-idle.txt') -ErrorAction SilentlyContinue)"
+        $m = & $note 'an API-only jail with the console as its input'
+        Check ($m -eq $start) "an API-only jail on the console changed its mode: $($timeline -join '; ')"
+
+        # The relay: the jailed process asks for raw mode as Firecracker does
+        # at a microVM's start (jail-probe echo: the jailer's mode pipe),
+        # keys typed on the console then reach it as the bytes it would have
+        # read (Ctrl+C a byte), its output reaches the console, and after it
+        # asked for canonical mode and ended the console has its mode back.
         $pi = [WickJailerTest.Term]::Start("`"$Jailer`" --id echo --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- echo:echo.txt", $null, $false)
         $t = [DateTime]::Now.AddSeconds(10)
-        while ([WickJailerTest.Term]::Mode() -eq $mode -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 50 }
-        $raw = [WickJailerTest.Term]::Mode()
-        if ($raw -eq $mode) {
-            # Why: the jailer fails at the start if SetConsoleMode refuses
-            # the raw mode (console.rs, Terminal::new), and says so.
+        while (-not [WickJailerTest.Term]::IsRaw([WickJailerTest.Term]::Mode()) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 20 }
+        $m = & $note 'the jailed process asked for raw mode'
+        if (-not [WickJailerTest.Term]::IsRaw($m)) {
             $code = [WickJailerTest.Term]::Wait($pi, 0)
             $state = if ($code -eq -1) { 'still runs' } else { "exited with $code" }
             $screen = ([WickJailerTest.Term]::Screen() -replace '\s+', ' ').Trim()
             if ($screen.Length -gt 400) { $screen = $screen.Substring($screen.Length - 400) }
-            Check $false ("the jailer did not set the console to raw mode: the input mode stayed 0x{0:x}; the jailer {1}; the screen ends: {2}" -f $mode, $state, $screen)
+            Check $false ("the jailer did not set the console to raw mode in 10 s: {0}; the jailer {1}; the screen ends: {2}" -f ($timeline -join '; '), $state, $screen)
         }
         [WickJailerTest.Term]::Type("hi$([char]3)q")
         $code = [WickJailerTest.Term]::Wait($pi, 20000)
+        $m = & $note 'the relayed jailer ended'
         Check ($code -eq 0) "the relayed jailer: exit $code"
         $bytes = Get-Content (Join-Path $base 'jail-probe.exe\echo\root\echo.txt') -ErrorAction SilentlyContinue
-        Check ($bytes -eq '68 69 03 71') "typed 'hi', Ctrl+C, 'q'; the jailed process read: $bytes"
+        Check ($bytes -eq '68 69 03 71') "typed 'hi', Ctrl+C, 'q'; the jailed process read: $bytes (the API-only jail on the console must take none)"
         Check ([WickJailerTest.Term]::Screen() -match '\[jail-probe echo 4\]') "the jailed process's output did not reach the console"
-        Check ([WickJailerTest.Term]::Mode() -eq $mode) ("the console mode was 0x{0:x}, is 0x{1:x} after" -f $mode, [WickJailerTest.Term]::Mode())
+        Check ($m -eq $start) "the console's mode after the relayed jailer: $($timeline -join '; ')"
+
+        # The API-only jail ends: its Firecracker never asked, and the mode
+        # stays.
+        Get-Process firecracker -ErrorAction SilentlyContinue | Where-Object { $_.Path -like (Join-Path $base 'firecracker.exe\idle\*') } | Stop-Process -Force
+        $code = [WickJailerTest.Term]::Wait($idle, 10000)
+        $m = & $note 'the API-only jail on the console ended'
+        Check ($code -ne -1) 'the API-only jail on the console did not end with its Firecracker'
+        Check ($m -eq $start) "the console's mode after the API-only jail ended: $($timeline -join '; ')"
 
         # --new-pid-ns: the jailer returns 0 once Firecracker runs; the pid
         # file holds Firecracker's pid; Firecracker runs on.
@@ -898,7 +940,7 @@ function Stage-Pidns {
         $fcp | Stop-Process -Force
         $t = [DateTime]::Now.AddSeconds(5)
         while ((Get-Process jailer -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $other.Jailer.Id }) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
-        "the control reaches every process ($($ctl.Count) checks); jailed, nothing ($($checks.Count) checks and a console control event: the user's process survives); typed keys reach it through the relay as bytes and the console mode is restored; --new-pid-ns: the jailer returned 0 in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s with Firecracker running (pid file), refused a jail it could not build; a pid's existence still shows ($oracle)"
+        "the control reaches every process ($($ctl.Count) checks); jailed, nothing ($($checks.Count) checks and a console control event: the user's process survives); the console's mode stays with API-only jails and is raw only once the jailed process asks, typed keys reach it through the relay as bytes, none reach an API-only jail, and the mode is back after ($($timeline -join '; ')); --new-pid-ns: the jailer returned 0 in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s with Firecracker running (pid file), refused a jail it could not build; a pid's existence still shows ($oracle)"
     } finally {
         $victims | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
         [WickJailerTest.Term]::Flush()

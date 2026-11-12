@@ -2108,6 +2108,12 @@ fn exec(
     let api_handle = api_process.as_ref().map(|p| p.process.as_raw_handle());
     let mut fc_vars = vars.clone();
     let mut fc_handles = handles.clone();
+    // The console's mode follows Firecracker's requests (`console`): its
+    // end of the mode pipe, to Firecracker only.
+    if let Some(h) = terminal.mode_pipe() {
+        fc_vars.push(format!("{}={}", console::MODE_ENV, h as usize));
+        fc_handles.push(h);
+    }
     let mut api_h: HANDLE = std::ptr::null_mut();
     if let (Some(path), Some(api)) = (&link_path, api_handle) {
         // SAFETY: duplicates a handle we own, for waiting on and for

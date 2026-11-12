@@ -19,20 +19,33 @@
 //! would have read and written on the console itself (`ReadFile` and
 //! `WriteFile` on it, as the compatibility libc does).
 //!
-//! Firecracker puts its standard input in raw mode for the guest's serial
-//! console; on a pipe that changes nothing, so the jailer sets the console
-//! to that mode (`vmm_sys_util::terminal`'s raw mode: no line input, echo or
-//! Ctrl+C processing, virtual terminal input) while it relays, and restores
-//! it when Firecracker ends. Ctrl+C is then a byte for the guest, as it is
-//! once Firecracker has set raw mode on Linux; there the terminal is raw
-//! from the microVM's start rather than Firecracker's.
+//! Firecracker puts its standard input in raw mode when it starts the
+//! microVM's vCPUs (upstream `Vm::start_vcpus`) and back in canonical mode
+//! when it stops (`Vmm::stop`, and its panic hook); on Linux that is the
+//! jailer's terminal. Here its standard input is a pipe, so it tells the
+//! jailer instead, through a second pipe (`vmm_sys_util::terminal`'s
+//! `MODE_ENV`: a byte per request), and the jailer sets its console to that
+//! mode (no line input, echo or Ctrl+C processing, virtual terminal input;
+//! or those back). Until then the console is as the operator left it, and
+//! nothing reads it: console input is relayed from the first raw request
+//! on, as on Linux Firecracker reads its terminal only once the microVM
+//! runs (what was typed before stays in the console's input buffer, as in
+//! a terminal's). Ctrl+C is then a byte for the guest, as it is on Linux.
+//! When Firecracker ends, the console gets back the mode it had before the
+//! first request; Linux leaves a terminal as Firecracker left it, which
+//! after a `SIGKILL` is raw.
 //!
 //! Standard handles that are not consoles (pipes, files, `NUL`) are passed
 //! on as they are.
 
 use std::io::{self, Read, Write};
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+
+pub(super) use vmm_sys_util::terminal::MODE_ENV;
+use vmm_sys_util::terminal::{CANON_REQUEST, RAW_REQUEST};
 
 use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
@@ -46,6 +59,41 @@ use windows_sys::Win32::System::Console::{
 fn raw(mode: CONSOLE_MODE) -> CONSOLE_MODE {
     (mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
         | ENABLE_VIRTUAL_TERMINAL_INPUT
+}
+
+/// `vmm_sys_util::terminal::Terminal::set_canon_mode` on Windows.
+fn canon(mode: CONSOLE_MODE) -> CONSOLE_MODE {
+    (mode | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)
+        & !ENABLE_VIRTUAL_TERMINAL_INPUT
+}
+
+/// What Firecracker asked of its standard input's mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Request {
+    Raw,
+    Canon,
+}
+
+/// Reads Firecracker's mode requests from `from` until it has no writer
+/// left (Firecracker exited), calling `apply` for each in order. A byte that
+/// is no request is ignored: Firecracker can ask for these two modes of the
+/// console and nothing else, as on Linux it can set its terminal's.
+fn read_requests(from: OwnedHandle, mut apply: impl FnMut(Request)) {
+    let mut from = std::fs::File::from(from);
+    let mut buf = [0u8; 64];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        for &b in &buf[..n] {
+            match b {
+                RAW_REQUEST => apply(Request::Raw),
+                CANON_REQUEST => apply(Request::Canon),
+                _ => {}
+            }
+        }
+    }
 }
 
 fn is_console(h: HANDLE) -> bool {
@@ -124,31 +172,83 @@ pub(super) struct Terminal {
     child_ends: Vec<OwnedHandle>,
     /// The output relay, which ends when Firecracker's output pipe does.
     output: Option<JoinHandle<()>>,
-    /// The console input and its mode before the relay set raw mode.
-    restore: Option<(Std, CONSOLE_MODE)>,
+    /// Firecracker's end of the mode pipe ([`MODE_ENV`]), when its standard
+    /// input is relayed from the console.
+    mode_pipe: Option<HANDLE>,
+    /// The mode relay, which ends when Firecracker's end of the mode pipe
+    /// does.
+    modes: Option<JoinHandle<()>>,
+    /// The console input, its mode before Firecracker's first request, and
+    /// whether a request changed it.
+    restore: Option<(Std, CONSOLE_MODE, Arc<AtomicBool>)>,
 }
 
 impl Terminal {
     /// Firecracker's standard handles: the jailer's, each that is a console
-    /// replaced by a relayed pipe. Sets the console's input to raw mode.
+    /// replaced by a relayed pipe. The console's mode is left as it is
+    /// until Firecracker asks ([`Terminal::mode_pipe`]).
     pub(super) fn new() -> io::Result<Self> {
         // SAFETY: plain calls.
         let own = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|w| unsafe { GetStdHandle(w) });
-        let mut t = Terminal { handles: own, child_ends: Vec::new(), output: None, restore: None };
+        let mut t = Terminal {
+            handles: own,
+            child_ends: Vec::new(),
+            output: None,
+            mode_pipe: None,
+            modes: None,
+            restore: None,
+        };
         if is_console(own[0]) {
+            let console = Std(own[0]);
             let mut mode = 0;
             // SAFETY: a console handle (checked above).
-            unsafe { GetConsoleMode(own[0], &mut mode) };
+            unsafe { GetConsoleMode(console.0, &mut mode) };
+            // That the console takes raw mode (virtual terminal input needs
+            // a console that has it), found now rather than when the microVM
+            // starts, where the jailer could only say so: set, then put back.
             // SAFETY: as above.
-            if unsafe { SetConsoleMode(own[0], raw(mode)) } == 0 {
+            if unsafe { SetConsoleMode(console.0, raw(mode)) } == 0 {
                 return Err(io::Error::last_os_error());
             }
-            t.restore = Some((Std(own[0]), mode));
-            let (mine, child) = pipe(true)?;
+            // SAFETY: as above.
+            unsafe { SetConsoleMode(console.0, mode) };
+            let changed = Arc::new(AtomicBool::new(false));
+            t.restore = Some((console, mode, changed.clone()));
+            let (input, child) = pipe(true)?;
             t.handles[0] = child.as_raw_handle();
             t.child_ends.push(child);
-            let console = Std(own[0]);
-            std::thread::spawn(move || relay_input(console, mine));
+            let (requests, child) = pipe(false)?;
+            t.mode_pipe = Some(child.as_raw_handle());
+            t.child_ends.push(child);
+            let mut input = Some(input);
+            t.modes = Some(std::thread::spawn(move || {
+                read_requests(requests, |request| {
+                    let mut now = 0;
+                    // SAFETY: the console input handle, open for the
+                    // jailer's life.
+                    unsafe { GetConsoleMode(console.0, &mut now) };
+                    let new = match request {
+                        Request::Raw => raw(now),
+                        Request::Canon => canon(now),
+                    };
+                    // SAFETY: as above.
+                    if unsafe { SetConsoleMode(console.0, new) } == 0 {
+                        // Firecracker cannot be told (a pipe has no answer):
+                        // the operator is.
+                        eprintln!(
+                            "jailer: the console did not take the mode Firecracker asked for ({request:?}): {}",
+                            io::Error::last_os_error()
+                        );
+                    } else {
+                        changed.store(true, Ordering::SeqCst);
+                    }
+                    if request == Request::Raw
+                        && let Some(to) = input.take()
+                    {
+                        std::thread::spawn(move || relay_input(console, to));
+                    }
+                });
+            }));
         }
         let (out, err) = (is_console(own[1]), is_console(own[2]));
         if out || err {
@@ -172,25 +272,39 @@ impl Terminal {
         self.handles
     }
 
+    /// Firecracker's end of the mode pipe, inheritable, for [`MODE_ENV`]:
+    /// there when its standard input is relayed from the console.
+    pub(super) fn mode_pipe(&self) -> Option<HANDLE> {
+        self.mode_pipe
+    }
+
     /// Closes the jailer's copies of Firecracker's pipe ends, once it has
     /// its own: its output then ends when it exits.
     pub(super) fn started(&mut self) {
         self.child_ends.clear();
+        self.mode_pipe = None;
     }
 
     /// After Firecracker exited: copies the rest of its output to the
     /// console and restores the console's input mode.
     pub(super) fn finish(mut self) {
         self.child_ends.clear();
+        self.mode_pipe = None;
         if let Some(output) = self.output.take() {
             let _ = output.join();
+        }
+        // No request after the console's mode is put back.
+        if let Some(modes) = self.modes.take() {
+            let _ = modes.join();
         }
     }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if let Some((console, mode)) = self.restore.take() {
+        if let Some((console, mode, changed)) = self.restore.take()
+            && changed.load(Ordering::SeqCst)
+        {
             // SAFETY: the console input handle, open for the jailer's life.
             unsafe { SetConsoleMode(console.0, mode) };
         }
@@ -203,8 +317,22 @@ mod tests {
 
     #[test]
     fn test_raw_mode_is_firecrackers() {
-        let canon = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | 0x80;
-        assert_eq!(raw(canon), 0x80 | ENABLE_VIRTUAL_TERMINAL_INPUT);
+        let cooked = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | 0x80;
+        assert_eq!(raw(cooked), 0x80 | ENABLE_VIRTUAL_TERMINAL_INPUT);
+        assert_eq!(canon(raw(cooked)), cooked);
+    }
+
+    #[test]
+    fn test_mode_requests_are_read_in_order_and_nothing_else() {
+        let (mine, child) = pipe(false).unwrap();
+        let mut w = std::fs::File::from(child);
+        // As Firecracker writes them (`vmm_sys_util::terminal`), with bytes
+        // that are no request among them.
+        w.write_all(&[RAW_REQUEST, b'x', 0, CANON_REQUEST, RAW_REQUEST]).unwrap();
+        drop(w);
+        let mut got = Vec::new();
+        read_requests(mine, |r| got.push(r));
+        assert_eq!(got, [Request::Raw, Request::Canon, Request::Raw]);
     }
 
     #[test]

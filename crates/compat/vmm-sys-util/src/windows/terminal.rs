@@ -9,15 +9,25 @@
 //!   bytes a Unix terminal would send (arrow keys as escape sequences).
 //!
 //! A handle that is not a console is left alone and the mode calls succeed,
-//! as the original does for a descriptor that is not a TTY.
+//! as the original does for a descriptor that is not a TTY. One exception: a
+//! jailed Firecracker's standard input is a pipe the jailer relays the
+//! console through (the jailer's `console` module), and the jailer gives it
+//! the write end of a second pipe in [`MODE_ENV`]. Changing the standard
+//! input's mode writes the request there (`r` for raw, `c` for canonical),
+//! and the jailer sets its console to that mode. So the console turns raw
+//! when Firecracker starts the microVM's vCPUs and canonical when it stops,
+//! as a Linux terminal does under a jailed Firecracker.
 //!
 //! `set_non_block` sets `O_NONBLOCK` with the compatibility `fcntl`, as the
 //! original does: pipes become non-blocking; consoles have no non-blocking
 //! mode, and their readiness comes from [`crate::epoll`].
 
 use std::io::StdinLock;
+use std::sync::OnceLock;
 
 use wick_os::fd::{RawFd, from_handle, handle};
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Storage::FileSystem::WriteFile;
 use windows_sys::Win32::System::Console::{
     CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
     ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
@@ -25,13 +35,47 @@ use windows_sys::Win32::System::Console::{
 
 use crate::errno::{Error, Result};
 
-fn modify_mode<F: FnOnce(CONSOLE_MODE) -> CONSOLE_MODE>(fd: RawFd, f: F) -> Result<()> {
+/// The variable that names, as a handle value, the pipe to the jailer that
+/// relays this process's standard input from its console (set by the
+/// jailer for a jailed Firecracker only).
+pub const MODE_ENV: &str = "WICK_CONSOLE_MODE";
+
+/// The request byte for raw mode on [`MODE_ENV`]'s pipe.
+pub const RAW_REQUEST: u8 = b'r';
+/// The request byte for canonical mode.
+pub const CANON_REQUEST: u8 = b'c';
+
+/// [`MODE_ENV`]'s pipe, read once.
+fn jailer_pipe() -> Option<HANDLE> {
+    static PIPE: OnceLock<Option<usize>> = OnceLock::new();
+    PIPE.get_or_init(|| std::env::var(MODE_ENV).ok()?.parse().ok())
+        .map(|h| h as HANDLE)
+}
+
+/// Writes `request` to the jailer's pipe; an error if the jailer cannot be
+/// told (it ended), as a refused `tcsetattr` is one.
+fn tell_jailer(pipe: HANDLE, request: u8) -> Result<()> {
+    let mut n = 0u32;
+    // SAFETY: one byte from a valid buffer to the handle the jailer gave.
+    if unsafe { WriteFile(pipe, &request, 1, &mut n, std::ptr::null_mut()) } == 0 || n != 1 {
+        return Err(Error::last());
+    }
+    Ok(())
+}
+
+fn modify_mode<F: FnOnce(CONSOLE_MODE) -> CONSOLE_MODE>(fd: RawFd, request: u8, f: F) -> Result<()> {
     let mut mode: CONSOLE_MODE = 0;
     // SAFETY: queries a console handle; fails on anything else.
     if unsafe { GetConsoleMode(handle(fd), &mut mode) } == 0 {
         // Not a console (a pipe, a file, NUL): nothing to change, as the
-        // original returns `Ok` when `isatty` is false.
-        return Ok(());
+        // original returns `Ok` when `isatty` is false; unless it is the
+        // standard input a jailer relays from its console.
+        // SAFETY: plain call.
+        let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        return match jailer_pipe() {
+            Some(pipe) if handle(fd) == stdin => tell_jailer(pipe, request),
+            _ => Ok(()),
+        };
     }
     let new = f(mode);
     // SAFETY: as above.
@@ -53,7 +97,7 @@ pub unsafe trait Terminal {
 
     /// Sets the console to canonical mode.
     fn set_canon_mode(&self) -> Result<()> {
-        modify_mode(self.tty_fd(), |m| {
+        modify_mode(self.tty_fd(), CANON_REQUEST, |m| {
             (m | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)
                 & !ENABLE_VIRTUAL_TERMINAL_INPUT
         })
@@ -61,7 +105,7 @@ pub unsafe trait Terminal {
 
     /// Sets the console to raw mode.
     fn set_raw_mode(&self) -> Result<()> {
-        modify_mode(self.tty_fd(), |m| {
+        modify_mode(self.tty_fd(), RAW_REQUEST, |m| {
             (m & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
                 | ENABLE_VIRTUAL_TERMINAL_INPUT
         })
@@ -165,5 +209,66 @@ mod tests {
         let file = Fd(from_handle(std::os::windows::io::AsRawHandle::as_raw_handle(file.as_file())));
         file.set_raw_mode().unwrap();
         file.set_canon_mode().unwrap();
+    }
+
+    /// A jailed Firecracker, as `start_vcpus` and `Vmm::stop` change its
+    /// standard input's mode (run by `test_a_jailed_stdin_tells_the_jailer`).
+    #[test]
+    #[ignore = "the child of test_a_jailed_stdin_tells_the_jailer"]
+    fn jailed_child() {
+        if std::env::var_os(MODE_ENV).is_none() {
+            return;
+        }
+        let stdin = std::io::stdin().lock();
+        stdin.set_raw_mode().unwrap();
+        stdin.set_canon_mode().unwrap();
+        // Another handle that is not a console tells the jailer nothing.
+        let (mut r, mut w): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: two out-pointers to handles.
+        assert_ne!(unsafe { CreatePipe(&mut r, &mut w, std::ptr::null(), 0) }, 0);
+        Fd(from_handle(r as RawHandle)).set_raw_mode().unwrap();
+        // SAFETY: the handles made above.
+        unsafe {
+            CloseHandle(r);
+            CloseHandle(w);
+        }
+    }
+
+    /// A process whose standard input is a pipe and that has the jailer's
+    /// mode pipe (this test is the jailer): its standard input's raw and
+    /// canonical modes reach the jailer, in order, and nothing else does.
+    #[test]
+    fn test_a_jailed_stdin_tells_the_jailer() {
+        use std::io::Read;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        if std::env::var_os(MODE_ENV).is_some() {
+            return;
+        }
+        let (mut r, mut w): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: two out-pointers to handles.
+        assert_ne!(unsafe { CreatePipe(&mut r, &mut w, std::ptr::null(), 0) }, 0);
+        // SAFETY: our handle; the child's end only is inherited.
+        assert_ne!(unsafe { SetHandleInformation(w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }, 0);
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(exe)
+            .args(["--exact", "windows::terminal::tests::jailed_child", "--ignored", "--nocapture"])
+            .env(MODE_ENV, (w as usize).to_string())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // SAFETY: the child has its copy; ours is closed, so the read ends
+        // when the child does.
+        unsafe { CloseHandle(w) };
+        // SAFETY: our read end, owned from here.
+        let mut requests = std::fs::File::from(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(r as RawHandle) });
+        let mut got = Vec::new();
+        requests.read_to_end(&mut got).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+        assert_eq!(got, [RAW_REQUEST, CANON_REQUEST]);
     }
 }

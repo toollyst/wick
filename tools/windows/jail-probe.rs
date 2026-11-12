@@ -843,7 +843,19 @@ fn check(c: &str) -> String {
         }
         // Reads standard input up to a `q`, writes a marker to standard
         // output, and records the bytes read, in hex, in the file `arg`.
+        // As Firecracker around a microVM's run, it first asks for raw mode
+        // and at the end for canonical mode: through the jailer's mode pipe
+        // when it is jailed on a console (vmm_sys_util::terminal, MODE_ENV).
         "echo" => {
+            let mode_pipe: Option<usize> = std::env::var("WICK_CONSOLE_MODE").ok().and_then(|v| v.parse().ok());
+            let ask = |request: u8| {
+                if let Some(h) = mode_pipe {
+                    let mut n = 0u32;
+                    // SAFETY: one byte to the handle the jailer gave.
+                    unsafe { WriteFile(h as HANDLE, &request, 1, &mut n, std::ptr::null_mut()) };
+                }
+            };
+            ask(b'r');
             let mut got = Vec::new();
             let mut b = [0u8; 1];
             while got.len() < 64 {
@@ -857,6 +869,7 @@ fn check(c: &str) -> String {
                     _ => break,
                 }
             }
+            ask(b'c');
             println!("[jail-probe echo {}]", got.len());
             let hex: Vec<String> = got.iter().map(|b| format!("{b:02x}")).collect();
             match std::fs::write(arg, hex.join(" ")) {
