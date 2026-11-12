@@ -9,7 +9,8 @@
 #   boot   1 vCPU: init, serial out and in (stdin is a pipe), CPU, memory,
 #          guest clock, CPUID hypervisor bit, reset exits Firecracker with 0
 #   smp    2 vCPUs: AP start-up, work on each CPU, the clock agrees between
-#          them
+#          them; CPU 1 offline and online (INIT/SIPI) three times, then
+#          working, after boot and after a snapshot restore
 #   block  Async read-only drive (md5), Sync and Async writable drives (the
 #          host sees the guest's writes), read-only enforced, each drive's
 #          serial from its file
@@ -1632,8 +1633,24 @@ function Stage-Boot {
     return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), reset exits 0" -f $dt, $host_dt)
 }
 
+# CPU 1 taken offline and back online three times, then work on it: on x86
+# the guest parks the CPU (play_dead) and starts it again with INIT and
+# SIPI, which WHP's local APIC handles in the hypervisor (KVM resets the
+# vCPU at the INIT, kvm_vcpu_reset with init_event). An AP that does not
+# come back as reset oopses here, as one did on Hypervisor.framework
+# (PSCI CPU_ON). Any failed write, a stall, BUG, oops or warning fails.
+function Test-CpuOfflineOnline($vm, [string]$when) {
+    $out = $vm.Sh("for i in 1 2 3; do echo 0 > /sys/devices/system/cpu/cpu1/online || echo off-failed; echo 1 > /sys/devices/system/cpu/cpu1/online || echo on-failed; done; taskset -c 1 sh -c 'i=0; while [ `$i -lt 20000 ]; do i=`$((i+1)); done; echo cpu1-ran'; cat /sys/devices/system/cpu/online", 120000, $true)
+    $lines = @($out -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    Check ($lines.Count -eq 2 -and $lines[0] -eq 'cpu1-ran' -and $lines[1] -eq '0-1') "CPU 1 offline and online three times $when, then work on it: '$($lines -join ' | ')'"
+    $vm.Healthy()
+    # Recorded: a local timer interrupt for a CPU whose timer is not set up
+    # (an interrupt KVM would not raise after the INIT, kvm_lapic_reset).
+    $vm.Sh("dmesg | grep -c 'Spurious LAPIC timer interrupt'; true")
+}
+
 function Stage-Smp {
-    $vm = Start-Vm 'smp' (Base-Config 2)
+    $vm = Start-Vm 'smp' (Base-Config 2) -Api
     Wait-Shell $vm
     $online = $vm.Sh('cat /sys/devices/system/cpu/online')
     Check ($online -eq '0-1') "online CPUs '$online'"
@@ -1654,9 +1671,29 @@ function Stage-Smp {
     $a = [double]::Parse(($lines[0] -split '\s+')[0], [Globalization.CultureInfo]::InvariantCulture)
     $b = [double]::Parse(($lines[1] -split '\s+')[0], [Globalization.CultureInfo]::InvariantCulture)
     Check (($b - $a) -gt 0.9 -and ($b - $a) -le $host_dt + 0.1) ("guest clock advanced {0:N2} s across vCPUs in {1:N2} s" -f ($b - $a), $host_dt)
+    $spurious = Test-CpuOfflineOnline $vm 'after boot'
+    # The same in a microVM restored from a snapshot, in a new process.
+    $dir = Join-Path $Scratch 'smp'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $state = Join-Path $dir 'vm.state'
+    $mem = Join-Path $dir 'vm.mem'
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+    Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $state; mem_file_path = $mem }) | Out-Null
     Save-Dmesg $vm 'smp'
+    $vm.Kill()
+    $vm = Start-Vm 'smp-restored' $null -Api
+    Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
+        snapshot_path = $state
+        mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = $mem }
+        resume_vm     = $true
+    }) | Out-Null
+    $online = $vm.Sh('cat /sys/devices/system/cpu/online')
+    Check ($online -eq '0-1') "online CPUs after restore '$online'"
+    $spuriousRestored = Test-CpuOfflineOnline $vm 'after a snapshot restore'
+    Save-Dmesg $vm 'smp-restored'
     $vm.Reboot()
-    return '2 vCPUs online, work runs on each, clock agrees across vCPUs, reset exits 0'
+    Remove-Item $state, $mem -ErrorAction SilentlyContinue
+    return "2 vCPUs online, work runs on each, clock agrees across vCPUs, CPU 1 offline and online 3 times then working, after boot and after a snapshot restore (spurious LAPIC timer interrupts: $spurious, $spuriousRestored), reset exits 0"
 }
 
 function Stage-Block {
