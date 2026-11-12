@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Fri, 13 Nov 2026 00:57:10 +0900
+Subject: [PATCH] windows: the dirty-dump tests write in hole units, as a diff
+ snapshot does
+
+On Windows a diff snapshot writes 64 KiB units whole (`platform::fs::HOLE_UNIT`),
+because NTFS allocates a sparse file in those units. A clean page in a dirty unit
+is written with the data it has, which is the base's. The two upstream tests of
+dump_dirty failed on Windows for two reasons.
+
+test_dump_dirty counts in pages. With 4 KiB pages, its two-page regions are in
+one unit, and the unit's clean page is written.
+
+dump_dirty_correctness writes in a different order from a snapshot. It set the
+file's length before the file was made sparse, which allocates the whole file on
+NTFS: "8 blocks allocated, 0 expected". Vm::snapshot_memory_to_file calls
+keep_holes before set_len. Its oracle also wrote single pages, and its slots were
+any number of pages, where a VM's are MiB multiples.
+
+Both tests now count in hole units. That is the host page on Linux and macOS, so
+there they are upstream's tests unchanged except for the writer. Each file is
+made sparse before its length is set, and is written through SparseWriter, as the
+snapshot is. The property test's slots are whole units, and its oracle writes a
+unit whole when one of its pages is dirty. A bitmap bit is still a page, and one
+bit dirties its unit.
+
+Measured on Windows Server 2022: vstate::memory and platform::fs pass, 28 of 28
+(the two failed before with and without the lazy-mprotect change).
+---
+ src/vmm/src/vstate/memory.rs | 103 ++++++++++++++++++++++++-----------
+ 1 file changed, 71 insertions(+), 32 deletions(-)
+
+diff --git a/src/vmm/src/vstate/memory.rs b/src/vmm/src/vstate/memory.rs
+index 851f73e7223ff636d8c0babc54b8c7fc4f78fb48..54dfbd7fb41d64638d78c4b3aca136972c53f879 100644
+--- a/src/vmm/src/vstate/memory.rs
++++ b/src/vmm/src/vstate/memory.rs
+@@ -1600,11 +1600,15 @@ mod tests {
+     #[test]
+     fn test_dump_dirty() {
+         let page_size = host_page_size();
+-
++        // wick: the test's "pages" are hole units (`platform::fs::HOLE_UNIT`), what a diff
++        // snapshot writes or leaves out whole: the host page on Linux and macOS, 64 KiB
++        // (`ppu` pages) on Windows. A bitmap bit is still a page: one bit dirties its unit.
++        let unit = crate::platform::fs::HOLE_UNIT.max(page_size);
++        let ppu = unit / page_size;
+         // Two regions of two pages each, with a one page gap between them.
+         let region_1_address = GuestAddress(0);
+-        let region_2_address = GuestAddress(page_size as u64 * 3);
+-        let region_size = page_size * 2;
++        let region_2_address = GuestAddress(unit as u64 * 3);
++        let region_size = unit * 2;
+         let mem_regions = [
+             (region_1_address, region_size),
+             (region_2_address, region_size),
+@@ -1612,6 +1616,14 @@ mod tests {
+         let guest_memory = into_region_ext(
+             anonymous(mem_regions.into_iter(), true, HugePageConfig::None).unwrap(),
+         );
++        // wick: written as `Vm::snapshot_memory_to_file` writes: a file keeps holes only if
++        // it is sparse on Windows, made so before its length is set.
++        let dump = |file: &mut std::fs::File, bitmap: &DirtyBitmap| {
++            crate::platform::fs::keep_holes(file).unwrap();
++            let mut writer = crate::platform::fs::SparseWriter::new(file).unwrap();
++            guest_memory.dump_dirty(&mut writer, bitmap).unwrap();
++            writer.finish().unwrap();
++        };
+         // Check that Firecracker bitmap is clean.
+         guest_memory.iter().for_each(|r| {
+             assert!(!r.bitmap().dirty_at(0));
+@@ -1637,8 +1649,9 @@ mod tests {
+         // First region pages: [dirty, clean]
+         // Second region pages: [clean, dirty]
+         let mut kvm_dirty_bitmap: DirtyBitmap = HashMap::new();
++        // wick: the first page of each unit (0b01, 0b10 where a unit is a page).
+         kvm_dirty_bitmap.insert(0, vec![0b01]);
+-        kvm_dirty_bitmap.insert(1, vec![0b10]);
++        kvm_dirty_bitmap.insert(1, vec![1 << ppu]);
+ 
+         let mut file = TempFile::new().unwrap().into_file();
+         guest_memory
+@@ -1665,25 +1678,25 @@ mod tests {
+         // Dirty the memory and dump again
+         let file = TempFile::new().unwrap();
+         let mut reader = file.into_file();
+-        let zeros = vec![0u8; page_size];
+-        let ones = vec![1u8; page_size];
+-        let twos = vec![2u8; page_size];
++        // wick: units (see above).
++        let zeros = vec![0u8; unit];
++        let ones = vec![1u8; unit];
++        let twos = vec![2u8; unit];
+ 
+         // Firecracker Dirty Bitmap:
+         // First region pages: [clean, dirty]
+         // Second region pages: [clean, clean]
+         guest_memory
+-            .write(&twos, GuestAddress(page_size as u64))
++            .write(&twos, GuestAddress(unit as u64))
+             .unwrap();
+         // KVM dirty bitmap:
+         // First region pages: [dirty, clean]
+         // Second region pages: [clean, dirty]
+         kvm_dirty_bitmap.insert(0, vec![0b01]);
+-        kvm_dirty_bitmap.insert(1, vec![0b10]);
++        kvm_dirty_bitmap.insert(1, vec![1 << ppu]);
+ 
+-        guest_memory
+-            .dump_dirty(&mut reader, &kvm_dirty_bitmap)
+-            .unwrap();
++        // wick: as a snapshot writes (see above).
++        dump(&mut reader, &kvm_dirty_bitmap);
+ 
+         // Check that only the dirty regions are dumped.
+         let mut diff_file_content = Vec::new();
+@@ -1712,13 +1725,13 @@ mod tests {
+         kvm_dirty_bitmap.insert(1, vec![0b00]);
+ 
+         let file = TempFile::new().unwrap();
+-        let logical_size = page_size as u64 * 4;
++        // wick: units (see above); sparse before the length is set, as a snapshot does.
++        let logical_size = unit as u64 * 4;
++        crate::platform::fs::keep_holes(file.as_file()).unwrap();
+         file.as_file().set_len(logical_size).unwrap();
+ 
+         let mut reader = file.into_file();
+-        guest_memory
+-            .dump_dirty(&mut reader, &kvm_dirty_bitmap)
+-            .unwrap();
++        dump(&mut reader, &kvm_dirty_bitmap);
+ 
+         // Check that only the dirty regions are dumped.
+         let mut diff_file_content = Vec::new();
+@@ -1744,7 +1757,8 @@ mod tests {
+         // wick: Windows metadata has no block count; the allocation comes from the handle.
+         #[cfg(windows)]
+         let physical_size = crate::platform::fs::allocated(&reader);
+-        assert_eq!(physical_size, 2 * page_size as u64);
++        // wick: units (see above).
++        assert_eq!(physical_size, 2 * unit as u64);
+         assert_ne!(physical_size, logical_size);
+ 
+         // Test with bitmaps that are too large or too small
+@@ -1755,13 +1769,16 @@ mod tests {
+             Err(MemoryError::DirtyBitmapTooLarge)
+         ));
+         kvm_dirty_bitmap.insert(0, vec![0b01]);
+-        kvm_dirty_bitmap.insert(1, vec![0b110]);
++        // wick: the second unit's first page and the page past the region (0b110 where a
++        // unit is a page).
++        kvm_dirty_bitmap.insert(1, vec![(1 << ppu) | (1 << (2 * ppu))]);
+         assert!(matches!(
+             guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+             Err(MemoryError::DirtyBitmapTooLarge)
+         ));
+         kvm_dirty_bitmap.insert(0, vec![]);
+-        kvm_dirty_bitmap.insert(1, vec![0b10]);
++        // wick: units (0b10 where a unit is a page).
++        kvm_dirty_bitmap.insert(1, vec![1 << ppu]);
+         assert!(matches!(
+             guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+             Err(MemoryError::DirtyBitmapTooSmall)
+@@ -1998,6 +2015,9 @@ mod tests {
+             dirty_bitmap: &DirtyBitmap,
+         ) -> usize {
+             let page_size = host_page_size();
++            // wick: a unit of `ppu` pages is written whole if one of its pages is dirty
++            // (`platform::fs::HOLE_UNIT`; one page on Linux and macOS).
++            let ppu = pages_per_unit();
+             let mut dirty_count = 0;
+             for (slot, plugged) in mem.iter().flat_map(|r| r.slots()) {
+                 if !plugged {
+@@ -2011,24 +2031,34 @@ mod tests {
+                 let fc_bitmap = slot.slice.bitmap();
+                 let num_pages = slot.slice.len() / page_size;
+ 
+-                for page_index in 0..num_pages {
+-                    let page_offset = page_index * page_size;
+-                    let is_kvm_dirty =
+-                        ((kvm_bitmap[page_index / 64] >> (page_index % 64)) & 1) != 0;
+-                    let is_fc_dirty = fc_bitmap.dirty_at(page_offset);
+-
+-                    if is_kvm_dirty || is_fc_dirty {
+-                        let slice = &slot.slice.subslice(page_offset, page_size).unwrap();
++                // wick: in units (see above); slots are whole units.
++                assert_eq!(num_pages % ppu, 0);
++                for unit_start in (0..num_pages).step_by(ppu) {
++                    let page_offset = unit_start * page_size;
++                    let dirty = (unit_start..unit_start + ppu).any(|page_index| {
++                        let is_kvm_dirty =
++                            ((kvm_bitmap[page_index / 64] >> (page_index % 64)) & 1) != 0;
++                        is_kvm_dirty || fc_bitmap.dirty_at(page_index * page_size)
++                    });
++
++                    if dirty {
++                        let slice = &slot.slice.subslice(page_offset, ppu * page_size).unwrap();
+                         writer.write_all_volatile(slice).unwrap();
+-                        dirty_count += 1;
++                        dirty_count += ppu;
+                     } else {
+-                        writer.seek(SeekFrom::Current(page_size as i64)).unwrap();
++                        writer.seek(SeekFrom::Current((ppu * page_size) as i64)).unwrap();
+                     }
+                 }
+             }
+             dirty_count
+         }
+ 
++        // wick: pages in a hole unit (`platform::fs::HOLE_UNIT`): 1 on Linux and macOS, 16
++        // on Windows, where a diff snapshot writes 64 KiB units whole.
++        fn pages_per_unit() -> usize {
++            (crate::platform::fs::HOLE_UNIT / host_page_size()).max(1)
++        }
++
+         /// Generate a KVM dirty bitmap for a slot of `num_pages` pages.
+         fn kvm_bitmap_for(num_pages: usize) -> impl Strategy<Value = Vec<u64>> {
+             let num_u64s = num_pages.div_ceil(64);
+@@ -2067,7 +2097,10 @@ mod tests {
+         fn region_spec() -> impl Strategy<Value = RegionSpec> {
+             prop_oneof![
+                 // Dram: 1 slot, always plugged
+-                (0usize..=8, 1usize..=128).prop_flat_map(|(gap_pages, pages_per_slot)| {
++                // wick: slots of whole units (1 to 128 pages where a unit is a page), as a
++                // VM's slots are (MiB multiples).
++                (0usize..=8, 1usize..=128 / pages_per_unit()).prop_flat_map(|(gap_pages, units)| {
++                    let pages_per_slot = units * pages_per_unit();
+                     (
+                         kvm_bitmap_for(pages_per_slot),
+                         proptest::collection::vec(any::<bool>(), pages_per_slot),
+@@ -2082,8 +2115,10 @@ mod tests {
+                         })
+                 }),
+                 // Hotpluggable: 1-4 slots, each plugged or not
+-                (0usize..=8, 1usize..=128, 1usize..=4).prop_flat_map(
+-                    |(gap_pages, pages_per_slot, num_slots)| {
++                // wick: slots of whole units, as above.
++                (0usize..=8, 1usize..=128 / pages_per_unit(), 1usize..=4).prop_flat_map(
++                    |(gap_pages, units, num_slots)| {
++                        let pages_per_slot = units * pages_per_unit();
+                         (
+                             proptest::collection::vec(any::<bool>(), num_slots),
+                             proptest::collection::vec(kvm_bitmap_for(pages_per_slot), num_slots),
+@@ -2200,6 +2235,8 @@ mod tests {
+                 // success, which would clear the firecracker bitmap before
+                 // the oracle implementation gets to read it.
+                 let mut oracle_file = TempFile::new().unwrap().into_file();
++                // wick: sparse before the length is set, as a snapshot's file.
++                crate::platform::fs::keep_holes(&oracle_file).unwrap();
+                 oracle_file.set_len(total_size as u64).unwrap();
+                 // wick: write as `Vm::snapshot_memory_to_file` does, keeping holes.
+                 let mut writer = SparseWriter::new(&mut oracle_file).unwrap();
+@@ -2221,6 +2258,8 @@ mod tests {
+ 
+                 // Run the optimized implementation.
+                 let mut opt_file = TempFile::new().unwrap().into_file();
++                // wick: as above.
++                crate::platform::fs::keep_holes(&opt_file).unwrap();
+                 opt_file.set_len(total_size as u64).unwrap();
+                 // wick: write as `Vm::snapshot_memory_to_file` does, keeping holes.
+                 let mut writer = SparseWriter::new(&mut opt_file).unwrap();
