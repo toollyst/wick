@@ -565,6 +565,24 @@ fn grant_to_jail(dir: &Path) -> io::Result<()> {
     set_security(dir, JAIL_LABEL, true)
 }
 
+/// What a jail holds of its network (`--netns`) while Firecracker runs: the
+/// directory its endpoints are made in, named to Firecracker
+/// (`vmm::ext::jail::NETNS_ENV`).
+#[derive(Debug)]
+struct JailNetwork {
+    dir: PathBuf,
+    _lock: Option<OwnedHandle>,
+}
+
+/// Opens the network directory `network` to the jail `id`. Today the jail's
+/// SID is granted on the network directory itself ([`grant_to_jail`]), and
+/// the jail makes its endpoints there.
+fn jail_network(network: &Path, _id: &OsStr) -> Result<JailNetwork, HostError> {
+    grant_to_jail(network)
+        .map_err(|e| HostError::Netns(network.to_owned(), format!("cannot open the network to the jail: {e}")))?;
+    Ok(JailNetwork { dir: network.to_owned(), _lock: None })
+}
+
 /// The variable that tells a relaunched jailer it is the keeper of a
 /// `--new-pid-ns` jail, holding the value of the event it sets once
 /// Firecracker runs ([`new_pid_ns`]).
@@ -2048,15 +2066,21 @@ fn exec(
     // it starts until the jailer ends (the filter's session is the jailer's).
     let netns = NETNS.lock().unwrap().take();
     let mut vars = Vec::new();
-    let _net_filter = match netns {
+    // Both live until the jailer ends (it ends with `exit`, which drops
+    // nothing): the filter session, and the jail's hold on its network.
+    let (_net_filter, _jail_network) = match netns {
         Some((dir, mut filter)) => {
-            grant_to_jail(&dir)
-                .map_err(|e| HostError::Netns(dir.clone(), format!("cannot open the network to the jail: {e}")))?;
-            vars.push(format!("{NETNS_ENV}={}", dir.display()));
+            let id = jail
+                .root
+                .parent()
+                .and_then(Path::file_name)
+                .ok_or_else(|| HostError::Netns(dir.clone(), format!("no jail id in {}", jail.root.display())))?;
+            let network = jail_network(&dir, id)?;
+            vars.push(format!("{NETNS_ENV}={}", network.dir.display()));
             filter.block(&exe).map_err(|e| HostError::Netns(dir.clone(), e.to_string()))?;
-            Some(filter)
+            (Some(filter), Some(network))
         }
-        None => None,
+        None => (None, None),
     };
 
     let drive_root = format!("{}\\", jail.drive);
@@ -2366,6 +2390,191 @@ mod tests {
         grant_to_jail(&dir).unwrap();
         assert_eq!(dacl_sddl(&dir).unwrap(), after);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The owner of `path`, as text.
+    fn owner_sid(path: &Path) -> io::Result<String> {
+        use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+        use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let mut owner: PSID = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated path and out-pointers.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wide(path).as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc.cast_signed()));
+        }
+        let sid = sid_string(owner);
+        // SAFETY: allocated by GetNamedSecurityInfoW; `owner` points into it.
+        unsafe { LocalFree(sd) };
+        sid
+    }
+
+    /// The mandatory label of `path` as SDDL (`S:...`).
+    fn label_sddl(path: &Path) -> String {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+        };
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated path and out-pointers.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wide(path).as_ptr(),
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(rc, 0, "{path:?}");
+        let mut text: *mut u16 = std::ptr::null_mut();
+        let mut len = 0u32;
+        // SAFETY: the descriptor read above; out-pointers.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, LABEL_SECURITY_INFORMATION, &mut text, &mut len)
+        };
+        assert_ne!(ok, 0, "{path:?}");
+        // SAFETY: `len` characters allocated by the conversion.
+        let s = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(text, len as usize)) };
+        // SAFETY: allocated by the calls above.
+        unsafe {
+            LocalFree(text.cast());
+            LocalFree(sd);
+        }
+        s
+    }
+
+    /// Who reaches a network directory and every jail's directory in it
+    /// besides that jail: SYSTEM, the administrators, the user and the
+    /// network directory's owner `owner`, sorted.
+    fn operators(owner: &str) -> Vec<String> {
+        let mut sids = vec!["S-1-5-18".to_owned(), "S-1-5-32-544".to_owned(), user_sid().unwrap()];
+        if !sids.iter().any(|s| s == owner) {
+            sids.push(owner.to_owned());
+        }
+        sids.sort();
+        sids
+    }
+
+    /// The SIDs of `path`'s DACL, sorted, which must all be its own (not
+    /// inherited) full-access allow entries for files and directories.
+    fn full_access_sids(path: &Path) -> Vec<String> {
+        let full = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        let entries = dacl_entries(path).unwrap();
+        let mut sids = Vec::new();
+        for (k, f, m, s) in &entries {
+            assert!(
+                u32::from(*k) == ACCESS_ALLOWED_ACE_TYPE && u32::from(*f) == full && *m == FILE_ALL_ACCESS,
+                "{path:?}: an entry other than its own full access: {entries:?}"
+            );
+            sids.push(s.clone());
+        }
+        sids.sort();
+        sids
+    }
+
+    /// A fresh directory under the temporary directory.
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wick-jailer-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // A network directory grants no jail anything: each jail's endpoints are
+    // in a directory of its own in it (test_each_jail_has_a_network_
+    // directory_of_its_own), as a TAP is its owner's on Linux
+    // (drivers/net/tun.c, tun_not_capable). The entry an earlier jailer gave
+    // a jail on the directory itself goes, and so does what its parent
+    // grants (Authenticated Users, which every jail's token holds).
+    #[test]
+    fn test_the_network_directory_grants_no_jail() {
+        let net = fresh_dir("net");
+        let user = user_sid().unwrap();
+        let earlier = "S-1-9-1-2-3-4";
+        set_security(&net, &format!("D:AI(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{earlier})"), false).unwrap();
+        let owner = owner_sid(&net).unwrap();
+        let network = jail_network(&net, OsStr::new("a")).unwrap();
+        let sddl = dacl_sddl(&net).unwrap();
+        assert!(sddl.starts_with("D:P"), "not protected: {sddl}");
+        assert_eq!(full_access_sids(&net), operators(&owner), "{sddl}");
+        drop(network);
+        std::fs::remove_dir_all(&net).unwrap();
+    }
+
+    // Each jail's endpoints are made in `<network>\<id>`, which only the jail
+    // and the network's operators (SYSTEM, the administrators, the user, the
+    // network directory's owner) reach, labelled with the jail's integrity
+    // level so that the jail can make them. What a jail of the same id that
+    // ended left there goes (its dead endpoints); the directory stays when
+    // the jail ends, as upstream leaves the jail's root. A network path
+    // whose endpoints could not be named within `sockaddr_un`'s 108 bytes is
+    // refused before anything is made.
+    #[test]
+    fn test_each_jail_has_a_network_directory_of_its_own() {
+        let net = fresh_dir("netdir");
+        let own = net.join("a");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("tap0"), b"").unwrap();
+        let owner = owner_sid(&net).unwrap();
+        let network = jail_network(&net, OsStr::new("a")).unwrap();
+        assert_eq!(network.dir, own);
+        let sddl = dacl_sddl(&own).unwrap();
+        assert!(sddl.starts_with("D:P"), "not protected: {sddl}");
+        let mut want = operators(&owner);
+        want.push(vm_sid().to_owned());
+        want.sort();
+        assert_eq!(full_access_sids(&own), want, "{sddl}");
+        let label = label_sddl(&own);
+        assert!(label.contains(JAIL_INTEGRITY_SID), "{label}");
+        assert!(!own.join("tap0").exists(), "the endpoint a dead jail of the id left is still there");
+        drop(network);
+        assert!(own.is_dir(), "the jail's network directory went with the jail");
+        let long = "i".repeat(100);
+        match jail_network(&net, OsStr::new(&long)) {
+            Err(HostError::Netns(_, msg)) => assert!(msg.contains("too long"), "{msg}"),
+            other => panic!("a network path too long for an endpoint: {other:?}"),
+        }
+        assert!(!net.join(&long).exists(), "a directory was made for a refused jail");
+        std::fs::remove_dir_all(&net).unwrap();
+    }
+
+    // As a TAP a Firecracker has attached refuses a second attach (Linux:
+    // tun_attach, EBUSY), a jail's network directory refuses a second jail of
+    // the same id while the first holds it, and the first keeps its
+    // endpoint; once it has ended, the id starts again.
+    #[test]
+    fn test_a_second_jail_of_one_id_is_refused_and_the_first_keeps_its_endpoint() {
+        let net = fresh_dir("netbusy");
+        let first = jail_network(&net, OsStr::new("a")).unwrap();
+        // The first jail's endpoint (a file standing for its socket).
+        let endpoint = first.dir.join("tap0");
+        std::fs::write(&endpoint, b"").unwrap();
+        match jail_network(&net, OsStr::new("a")) {
+            Err(HostError::Netns(_, msg)) => assert!(msg.contains("busy"), "{msg}"),
+            other => panic!("a second jail of one id: {other:?}"),
+        }
+        assert!(endpoint.exists(), "the second jail of the id took the first one's endpoint");
+        let other = jail_network(&net, OsStr::new("b")).unwrap();
+        assert_ne!(other.dir, first.dir, "two jails share a network directory");
+        drop(first);
+        let again = jail_network(&net, OsStr::new("a")).unwrap();
+        assert!(!endpoint.exists(), "the endpoint of the jail that ended is still there");
+        drop((again, other));
+        std::fs::remove_dir_all(&net).unwrap();
     }
 
     // The jail's token marks the administrators' groups deny-only and makes

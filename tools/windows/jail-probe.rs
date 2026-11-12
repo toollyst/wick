@@ -20,6 +20,7 @@
 //!                               udp:<ip>:<port> pull:<pid>:<handle>
 //!                               listen:<socket path> wsadup:<socket path>
 //!                               listenpull:<socket path> sockpull:<socket path>
+//!                               bind:<socket path> delete:<path>
 //!                               token:0 tokenopen:0 mitigations:<pid>
 //!                               job:0 affinity:0 spin:<seconds>
 //!                               privileges:0 largepage:<MiB>
@@ -496,6 +497,33 @@ fn check(c: &str) -> String {
                 }
             }
             format!("allowed {}", kept.len())
+        }
+        // Removes the file `arg` (a network endpoint, say).
+        "delete" => io(std::fs::remove_file(arg)),
+        // Binds and listens at `arg`, as a network endpoint is made: whether
+        // this process may make that name. A name it made is removed again.
+        "bind" => {
+            let mut data = [0u8; 512];
+            let addr = sockaddr_un(arg);
+            // SAFETY: room for WSADATA; then plain socket calls on a socket we own.
+            unsafe {
+                WSAStartup(0x0202, data.as_mut_ptr());
+                let l = socket(1, 1, 0);
+                if l == usize::MAX {
+                    return format!("denied socket {}", std::io::Error::from_raw_os_error(WSAGetLastError()));
+                }
+                let made = bind(l, addr.as_ptr(), addr.len() as i32) == 0;
+                let answer = if made && listen(l, 1) == 0 {
+                    "allowed".to_string()
+                } else {
+                    format!("denied {}", std::io::Error::from_raw_os_error(WSAGetLastError()))
+                };
+                closesocket(l);
+                if made {
+                    let _ = std::fs::remove_file(arg);
+                }
+                answer
+            }
         }
         "link" => match arg.split_once('|') {
             Some((new, existing)) => io(std::fs::hard_link(existing, new)),

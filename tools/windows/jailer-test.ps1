@@ -1109,15 +1109,23 @@ function Stage-Vhost-User {
 }
 
 # Row 6 of docs/PORTING.md: --netns. On Linux the jailed Firecracker joins a
-# network namespace and the guest reaches only the network given there. On
-# Windows the network is a directory of endpoints: Firecracker makes its
-# network endpoints there (the jail's SID is granted on it), and the jail's
-# copy of Firecracker gets no IP networking at all (Windows Filtering
-# Platform, in a session that ends with the jailer). Two jails, each with a
-# network of its own: each one's endpoint is in its own directory, a jail
-# reaches its own network and not the other's, IP is denied to a jail with a
-# network and allowed to one without (the control), and a jailer that is not
-# elevated refuses the flag. Needs no guest; needs an elevated PowerShell.
+# network namespace and the guest reaches only the network given there; a TAP
+# in it is its owner's (drivers/net/tun.c: tun_not_capable, and tun_attach
+# refuses a second attach with EBUSY). On Windows the network is a directory
+# of endpoints, which grants no jail anything: each jail makes its endpoints
+# in a directory of its own in it, <network>\<id>, which only that jail and
+# the operator reach; and the jail's copy of Firecracker gets no IP
+# networking at all (Windows Filtering Platform, in a session that ends with
+# the jailer). Two jails, each with a network of its own, and a third jail
+# and a jailed probe given the first's: every endpoint is in its jail's own
+# directory; the probe, a jail of that network too, cannot connect to,
+# delete or take the name of another jail's endpoint, or make a name in the
+# network directory itself, and makes one in its own (the control); a second
+# jail of a running jail's id is refused and the first keeps its endpoint;
+# the operator reaches every endpoint (the control); IP is denied to a jail
+# with a network and allowed to one without (the control), and a jailer that
+# is not elevated refuses the flag. Needs no guest; needs an elevated
+# PowerShell.
 function Stage-Netns {
     $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     Check $elevated 'needs an elevated PowerShell: the jailer adds Windows Filtering Platform filters for --netns'
@@ -1137,20 +1145,31 @@ function Stage-Netns {
             $jails[$n] = Start-ApiJail $base $n @('--netns', $nets[$n])
             Invoke-ApiOk $jails[$n].Sock 'PUT' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; host_dev_name = "tap$n"; guest_mac = $macs[$n] }) | Out-Null
         }
+        $ep = @{ a = (Join-Path $nets['a'] 'a\tapa'); b = (Join-Path $nets['b'] 'b\tapb') }
         foreach ($n in 'a', 'b') {
             $other = if ($n -eq 'a') { 'b' } else { 'a' }
-            Check (Test-Path (Join-Path $nets[$n] "tap$n")) "jail $n's endpoint is not in its network directory"
-            Check (-not (Test-Path (Join-Path $nets[$n] "tap$other"))) "jail $other's endpoint is in jail $n's network directory"
+            Check (Test-Path $ep[$n]) "jail $n's endpoint is not in its own directory of its network ($($ep[$n]))"
+            Check (-not (Test-Path (Join-Path $nets[$n] "tap$n"))) "jail $n's endpoint is in the network directory itself, which every jail given it reached"
+            Check (-not (Test-Path (Join-Path $nets[$n] "$other\tap$other"))) "jail $other's endpoint is in jail $n's network"
             Check (-not (Test-Path (Join-Path $jails[$n].Root "tmp\firecracker-net\tap$n"))) "jail $n's endpoint is in the jail's temporary directory, not its network's"
         }
-        # A jailed process in network a reaches a's endpoint and not b's, and
-        # no IP at all (the operator's TCP port, a UDP datagram); a jailed
-        # process without a network reaches IP (the control).
+        # A jailed process given network a, as jail a is: it reaches no other
+        # jail's endpoint there (it would be that jail's switch: every frame of
+        # its guest, and frames into it), cannot delete one, and cannot make a
+        # name in the network directory itself, where it could take a later
+        # jail's name or directory first; it makes one in its own directory
+        # (the control). No IP at all (the operator's TCP port, a UDP
+        # datagram); a jailed process without a network reaches IP (the
+        # control).
         $expect = [ordered]@{
-            "connect:$(Join-Path $nets['a'] 'tapa')" = $true
-            "connect:$(Join-Path $nets['b'] 'tapb')" = $false
-            "tcp:127.0.0.1:$port"                   = $false
-            'udp:127.0.0.1:9'                        = $false
+            "connect:$($ep['a'])"                              = $false
+            "delete:$($ep['a'])"                               = $false
+            "bind:$(Join-Path $nets['a'] 'tapc')"              = $false
+            "write:$(Join-Path $nets['a'] 'c')"                = $false
+            "bind:$(Join-Path $nets['a'] 'probe\own')"         = $true
+            "connect:$($ep['b'])"                              = $false
+            "tcp:127.0.0.1:$port"                             = $false
+            'udp:127.0.0.1:9'                                  = $false
         }
         $r = Invoke-Jailer (@('--id', 'probe', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--netns', $nets['a'], '--') + @($expect.Keys)) 30000
         $lines = $r[1] -split "`r?`n"
@@ -1164,8 +1183,22 @@ function Stage-Netns {
         $ctl = Invoke-Jailer @('--id', 'control', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', "tcp:127.0.0.1:$port", 'udp:127.0.0.1:9') 30000
         $ctlBad = @(($ctl[1] -split "`r?`n") | Where-Object { $_ -match '^(tcp|udp):' -and $_ -notmatch ' allowed' })
         Check ($ctlBad.Count -eq 0) "the control (a jail without a network) was denied IP, so the test proves nothing: $($ctlBad -join '; ')"
-        # The operator reaches both networks.
-        $op = Test-Probe @() ([ordered]@{ "connect:$(Join-Path $nets['a'] 'tapa')" = $true; "connect:$(Join-Path $nets['b'] 'tapb')" = $true })
+        Check (Test-Path $ep['a']) "jail a's endpoint went while a jailed process of its network tried it"
+        # Jail c, given network a after the probe tried c's names there: its
+        # endpoint is made, in its own directory.
+        $jails['c'] = Start-ApiJail $base 'c' @('--netns', $nets['a'])
+        Invoke-ApiOk $jails['c'].Sock 'PUT' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; host_dev_name = 'tapc'; guest_mac = '06:00:AC:10:00:0C' }) | Out-Null
+        $ep['c'] = Join-Path $nets['a'] 'c\tapc'
+        Check (Test-Path $ep['c']) "jail c's endpoint is not in its own directory of the network ($($ep['c']))"
+        # A second jail of id a while a runs is refused (Linux: a second
+        # attach of a TAP, EBUSY), and a keeps its endpoint.
+        $second = Invoke-Jailer @('--id', 'a', '--exec-file', $Fc, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--netns', $nets['a']) 30000
+        Check ($second[0] -ne 0) "a second jail of id a started while a ran: $($second[1])"
+        Check ($null -ne (Get-Process -Id $jails['a'].Fc.Id -ErrorAction SilentlyContinue)) "jail a ended when a second jail of its id was started: $($second[1])"
+        Check (Test-Path $ep['a']) "jail a's endpoint went when a second jail of its id was started: $($second[1])"
+        # The operator reaches every jail's endpoint (the control for the
+        # denials above).
+        $op = Test-Probe @() ([ordered]@{ "connect:$($ep['a'])" = $true; "connect:$($ep['b'])" = $true; "connect:$($ep['c'])" = $true })
         Check ($op.Count -eq 0) "operator: $($op -join '; ')"
         # Without elevation (a plain process of the user: jail-probe
         # `medium`) the jailer refuses --netns, before Firecracker starts.
@@ -1177,7 +1210,7 @@ function Stage-Netns {
         Stop-Jailed
         $after = Invoke-Jailer @('--id', 'after', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', "tcp:127.0.0.1:$port") 30000
         Check ($after[1] -match 'tcp:.* allowed') "after the jailers ended, the jail's binary is still denied IP: $($after[1])"
-        "two jails, each with a network of its own: endpoints in their own directories, a jail reaches its network and not the other's, no IP (TCP, UDP) with a network and IP without (control); the filters end with the jailer; an unelevated jailer refuses --netns"
+        "two jails, each with a network of its own, and a jail and a probe given the first's: each endpoint in its jail's own directory of the network; the probe could not connect to, delete or take the name of another jail's endpoint, nor make a name in the network directory, and made one in its own (control); a second jail of a running id refused, the first keeping its endpoint; the operator reaches every endpoint (control); no IP (TCP, UDP) with a network and IP without (control); the filters end with the jailer; an unelevated jailer refuses --netns"
     } finally {
         $listener.Stop()
         Stop-Jailed
@@ -1415,8 +1448,9 @@ function Stage-Netguest {
         Invoke-ApiOk $vm.Sock 'PUT' '/drives/rootfs' ([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs'; is_root_device = $true; is_read_only = $true }) | Out-Null
         Invoke-ApiOk $vm.Sock 'PUT' '/machine-config' ([ordered]@{ vcpu_count = 2; mem_size_mib = 256 }) | Out-Null
         Invoke-ApiOk $vm.Sock 'PUT' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; host_dev_name = 'tapg'; guest_mac = '06:00:0a:00:00:02' }) | Out-Null
-        $endpoint = Join-Path $net 'tapg'
-        Check (Test-Path $endpoint) "the guest's endpoint is not in its network directory ($endpoint)"
+        # The jail's endpoints are in its own directory of the network, <network>\<id>.
+        $endpoint = Join-Path $net 'g\tapg'
+        Check (Test-Path $endpoint) "the guest's endpoint is not in the jail's own directory of its network ($endpoint)"
         Check (-not (Test-Path (Join-Path $vm.Root 'tmp\firecracker-net\tapg'))) "the guest's endpoint is in the jail's temporary directory, not its network's"
         $switch = New-Object Wick.Switch($endpoint, 10000)
         try {
