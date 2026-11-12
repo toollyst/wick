@@ -1588,7 +1588,17 @@ function Stage-Freeze {
         $p.Refresh()
         [math]::Round($p.TotalProcessorTime.TotalMilliseconds - $a)
     }
-    $read = { param($id, $f) $p = Join-Path (& $dirOf $id) $f; if (Test-Path $p) { [IO.File]::ReadAllText($p) } else { '<none>' } }
+    # Read as type and Get-Content open a file, sharing reading and writing: such a reader is never
+    # refused. File.ReadAllText shares reading alone, which Windows refuses for the microseconds any
+    # handle can write the file, the jailer's write-back's or the operator's own (freezer.rs; refused
+    # so once on Windows 11 26300).
+    $read = {
+        param($id, $f)
+        $p = Join-Path (& $dirOf $id) $f
+        if (-not (Test-Path $p)) { return '<none>' }
+        $s = [IO.File]::Open($p, 'Open', 'Read', 'ReadWrite')
+        try { (New-Object IO.StreamReader($s)).ReadToEnd() } finally { $s.Dispose() }
+    }
     $write = { param($id, $f, $v) [IO.File]::WriteAllText((Join-Path (& $dirOf $id) $f), $v) }
     $until = {
         param([scriptblock]$cond, [int]$ms = 5000)

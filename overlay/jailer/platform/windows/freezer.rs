@@ -67,7 +67,7 @@
 //! waits only if they say `FROZEN` again.
 
 use std::ffi::c_void;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
@@ -83,12 +83,12 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, DeleteFileW, FILE_ATTRIBUTE_DIRECTORY,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, CreateHardLinkW, DeleteFileW, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
     FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FindCloseChangeNotification, FindFirstChangeNotificationW,
-    FindNextChangeNotification, GetFileInformationByHandle, MOVEFILE_REPLACE_EXISTING, MoveFileExW,
+    FindNextChangeNotification, GetFileInformationByHandle,
     RemoveDirectoryW,
 };
 use windows_sys::Win32::System::JobObjects::{
@@ -374,9 +374,21 @@ enum Opened {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Written {
     Done,
-    /// Another process holds the file without sharing it: written once the
-    /// settle timer fires again.
+    /// Another process holds the file without sharing writing: written
+    /// once the settle timer fires again.
     Busy,
+}
+
+/// What writing the control file back came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Restored {
+    Done,
+    /// Another process holds the file without sharing writing: written
+    /// once the settle timer fires again.
+    Busy,
+    /// A writer wrote the file after the jailer read it: what it holds,
+    /// left as it is, to be handled as written.
+    Changed(Vec<u8>),
 }
 
 fn is_busy(e: &io::Error) -> bool {
@@ -387,6 +399,49 @@ fn not_found(e: &io::Error) -> bool {
     matches!(e.raw_os_error().map(i32::cast_unsigned), Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND))
 }
 
+/// Deletes `path` (a NUL-terminated wide path) if it is there.
+fn delete(path: &[u16]) -> io::Result<()> {
+    // SAFETY: a NUL-terminated path.
+    if unsafe { DeleteFileW(path.as_ptr()) } == 0 {
+        let e = last_error();
+        if !not_found(&e) {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+// The files are read and written as near as Windows lets a file be to a
+// cgroup's on Linux, where any process opens them at any time, is never
+// refused and reads a whole value. On Windows a handle that can write a
+// file, or delete it (as replacing it by a rename does), refuses every
+// opener that does not share that with it, and every way to change a
+// file's content takes such a handle. Measured on Windows Server 2022 build
+// 20348, four readers in tight loops, 2000 changes (agent-state/win2/
+// results-fzs.txt, results-fzs2.txt, results-fzt.txt):
+//
+// - written in place: a reader that shares reading and writing (`type`,
+//   Get-Content, C's fopen) is never refused; one that shares reading alone
+//   (.NET's File.ReadAllText) is, about ten times a change; a value changed
+//   in several bytes can be read half written ("THAWEN\n", twice);
+// - replaced by a rename (MoveFileExW, or a POSIX-semantics rename) of a
+//   file written aside: every reader that does not share deleting, both of
+//   those, is refused about twice a change, whoever scans the files (the
+//   same with the files written 10 s before); a reader holding the file
+//   refuses the rename itself;
+// - a hard link made and removed: no reader refused.
+//
+// So the jailer makes a file by writing it aside and linking the name to
+// it, where nothing is (a reader finds no file, then the whole file), and
+// writes one in place, never cutting it first: what it writes into a file
+// differs from what the file holds in one byte (cgroup.events, cgroup.freeze)
+// or only in its end (a value of freezer.state written back canonical keeps
+// its word), so it is never read half written, but for an invalid value
+// written over. A reader that shares writing is never refused
+// (`test_readers_are_never_refused_v1`, `_v2`); one that shares reading
+// alone can be, while the jailer writes (on Linux, never): a Windows file
+// cannot keep it from that (CreateFileW: a share mode that conflicts with
+// the access of an open handle fails with ERROR_SHARING_VIOLATION).
 impl Files {
     fn new(dir: &Path, version: Version) -> io::Result<Files> {
         let user = super::user_sid()?;
@@ -402,9 +457,9 @@ impl Files {
     /// already: the jailer never takes over files it did not make.
     pub(crate) fn create(dir: &Path, version: Version, state: State) -> io::Result<Files> {
         let files = Files::new(dir, version)?;
-        files.create_file(version.control(), version.canonical(state))?;
+        files.make(version.control(), version.canonical(state))?;
         if version == Version::V2 {
-            files.create_file(fv::EVENTS, &fv::events(true, state == State::Frozen))?;
+            files.make(fv::EVENTS, &fv::events(true, state == State::Frozen))?;
         }
         Ok(files)
     }
@@ -425,10 +480,15 @@ impl Files {
         self.dir.join(name)
     }
 
-    /// Makes `name` (never one that is there) with the files' DACL.
-    fn create_file(&self, name: &str, content: &[u8]) -> io::Result<()> {
+    /// `name`, made with `content` and the files' DACL (never one that is
+    /// there): written as `.<name>.tmp`, which no one but the jailer opens,
+    /// then given the name, so it is whole from the moment it is there.
+    fn make(&self, name: &str, content: &[u8]) -> io::Result<()> {
         let path = self.path(name);
+        let tmp_path = self.path(&format!(".{name}.tmp"));
         let fail = |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", path.display()));
+        let tmp = wide(&tmp_path);
+        delete(&tmp).map_err(fail)?;
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: a NUL-terminated SDDL string and an out-pointer.
         if unsafe {
@@ -449,15 +509,7 @@ impl Files {
         };
         // SAFETY: a NUL-terminated path; the descriptor outlives the call.
         let h = unsafe {
-            CreateFileW(
-                wide(&path).as_ptr(),
-                GENERIC_WRITE,
-                FILE_SHARE_READ,
-                &sa,
-                CREATE_NEW,
-                FILE_FLAG_OPEN_REPARSE_POINT,
-                std::ptr::null_mut(),
-            )
+            CreateFileW(tmp.as_ptr(), GENERIC_WRITE, 0, &sa, CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut())
         };
         let err = last_error();
         // SAFETY: allocated by the conversion.
@@ -467,22 +519,41 @@ impl Files {
         }
         // SAFETY: a handle we own.
         let mut file = unsafe { std::fs::File::from_raw_handle(h) };
-        file.write_all(content).map_err(fail)
+        let written = file.write_all(content);
+        drop(file);
+        // SAFETY: NUL-terminated paths. The name is linked to the file, not
+        // moved: a move holds the file with delete access while it is
+        // named, which refused a reader sharing reading and writing that
+        // opened it then (`test_readers_are_never_refused_v1`, 4 times in
+        // a run); a link made and the other name removed refuse no reader
+        // (agent-state/win2/results-fzs.txt). Fails if the name is there.
+        let linked = written.and_then(|()| {
+            if unsafe { CreateHardLinkW(wide(&path).as_ptr(), tmp.as_ptr(), std::ptr::null()) } == 0 {
+                Err(last_error())
+            } else {
+                Ok(())
+            }
+        });
+        let removed = delete(&tmp);
+        linked.and(removed).map_err(fail)
     }
 
     /// `name`, open (for writing when `write`), if it is a file the jailer
     /// trusts: a regular file, not a reparse point, with one name, owned by
-    /// SYSTEM, the administrators or the operator. Shared with every other
-    /// opener, so that an operator's writer and the jailer never lock each
-    /// other out; one that shares it with no one makes it [`Opened::Busy`].
+    /// SYSTEM, the administrators or the operator. To read, shared with
+    /// every other opener; to write, with every opener but a writer, so
+    /// that the jailer's write is never made over another's
+    /// ([`restore`](Self::restore)). An opener that does not share what this
+    /// asks makes it [`Opened::Busy`].
     fn open_trusted(&self, name: &str, write: bool) -> io::Result<Opened> {
         use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
         let access = if write { GENERIC_WRITE | GENERIC_READ } else { GENERIC_READ } | READ_CONTROL | FILE_READ_ATTRIBUTES;
+        let share = if write { FILE_SHARE_READ | FILE_SHARE_DELETE } else { FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE };
         let file = match std::fs::OpenOptions::new()
             .read(true)
             .write(write)
             .access_mode(access)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .share_mode(share)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(self.path(name))
         {
@@ -533,33 +604,69 @@ impl Files {
         Ok(if self.owners.contains(&owner?) { Opened::File(file) } else { Opened::Untrusted })
     }
 
-    /// Reads the control file: the request, and whether the file holds the
-    /// request's canonical form; `None` while another process holds it
-    /// unshared.
-    pub(crate) fn read(&self) -> io::Result<Option<(fv::Request, bool)>> {
+    /// Reads the control file: the request, whether the file holds the
+    /// request's canonical form, and what it holds (what
+    /// [`restore`](Self::restore) is given); `None` while another process
+    /// holds it unshared.
+    pub(crate) fn read(&self) -> io::Result<Option<(fv::Request, bool, Vec<u8>)>> {
         let file = match self.open_trusted(self.version.control(), false)? {
             Opened::File(file) => file,
-            Opened::Untrusted => return Ok(Some((fv::Request::Invalid, false))),
+            Opened::Untrusted => return Ok(Some((fv::Request::Invalid, false, Vec::new()))),
             Opened::Busy => return Ok(None),
         };
         let mut buf = Vec::with_capacity(fv::MAX_FILE + 1);
         file.take(u64::try_from(fv::MAX_FILE + 1).unwrap()).read_to_end(&mut buf)?;
         let request = fv::parse(self.version, &buf);
         let canonical = matches!(request, fv::Request::Set(s) if buf == self.version.canonical(s));
-        Ok(Some((request, canonical)))
+        Ok(Some((request, canonical, buf)))
     }
 
-    /// Writes the control file back to `state`, in place: a writer that has
-    /// it open writes to the same file. One that is not a trusted file is
-    /// removed (a link, not what it names) and made again.
-    pub(crate) fn restore(&self, state: State) -> io::Result<Written> {
-        let name = self.version.control();
+    /// Writes the control file back to `state`, in place (a writer that has
+    /// it open writes to the same file), unless a writer wrote it after the
+    /// jailer read `seen` from it: then [`Restored::Changed`] with what it
+    /// holds, which is left as it is. What it holds is read through the
+    /// handle that writes it, which shares no writing, so no write lands
+    /// between that read and the jailer's write: none is lost (on Linux a
+    /// write is never undone either). A writer opening it meanwhile is
+    /// refused; one that has it open makes it [`Restored::Busy`]. One that
+    /// is not a trusted file is removed (a link, not what it names) and
+    /// made again.
+    pub(crate) fn restore(&self, state: State, seen: &[u8]) -> io::Result<Restored> {
+        self.write_over(self.version.control(), self.version.canonical(state), Some(seen))
+    }
+
+    /// v2: `cgroup.events`, written in place: from one state to another one
+    /// byte changes, so a reader never sees half of it. A reader that holds
+    /// it without sharing writing makes it [`Written::Busy`].
+    pub(crate) fn write_events(&self, populated: bool, frozen: bool) -> io::Result<Written> {
+        if self.version != Version::V2 {
+            return Ok(Written::Done);
+        }
+        // Not compared with what it held: Changed is never returned so.
+        Ok(match self.write_over(fv::EVENTS, &fv::events(populated, frozen), None)? {
+            Restored::Busy => Written::Busy,
+            Restored::Done | Restored::Changed(_) => Written::Done,
+        })
+    }
+
+    /// Writes `content` into `name` in place, from its start, then cuts it
+    /// after it (never cut first: a reader would find it empty); if `seen`,
+    /// only while it holds that.
+    fn write_over(&self, name: &str, content: &[u8], seen: Option<&[u8]>) -> io::Result<Restored> {
         match self.open_trusted(name, true)? {
-            Opened::Busy => Ok(Written::Busy),
+            Opened::Busy => Ok(Restored::Busy),
             Opened::File(mut file) => {
-                file.set_len(0)?;
-                file.write_all(self.version.canonical(state))?;
-                Ok(Written::Done)
+                if let Some(seen) = seen {
+                    let mut was = Vec::with_capacity(fv::MAX_FILE + 1);
+                    (&file).take(u64::try_from(fv::MAX_FILE + 1).unwrap()).read_to_end(&mut was)?;
+                    if was != seen {
+                        return Ok(Restored::Changed(was));
+                    }
+                    file.rewind()?;
+                }
+                file.write_all(content)?;
+                file.set_len(u64::try_from(content.len()).unwrap())?;
+                Ok(Restored::Done)
             }
             Opened::Untrusted => {
                 let path = wide(self.path(name));
@@ -569,43 +676,16 @@ impl Files {
                     let e = last_error();
                     // SAFETY: as above.
                     if !not_found(&e) && unsafe { RemoveDirectoryW(path.as_ptr()) } == 0 {
-                        return if is_busy(&e) { Ok(Written::Busy) } else { Err(e) };
+                        return if is_busy(&e) { Ok(Restored::Busy) } else { Err(e) };
                     }
                 }
-                match self.create_file(name, self.version.canonical(state)) {
-                    Ok(()) => Ok(Written::Done),
-                    Err(e) if is_busy(&e) => Ok(Written::Busy),
+                match self.make(name, content) {
+                    Ok(()) => Ok(Restored::Done),
+                    Err(e) if is_busy(&e) => Ok(Restored::Busy),
                     Err(e) => Err(e),
                 }
             }
         }
-    }
-
-    /// v2: `cgroup.events`, rewritten whole (a reader never sees half of
-    /// it): written aside, then moved over it. A reader that holds it
-    /// without letting it be replaced makes it [`Written::Busy`].
-    pub(crate) fn write_events(&self, populated: bool, frozen: bool) -> io::Result<Written> {
-        if self.version != Version::V2 {
-            return Ok(Written::Done);
-        }
-        let tmp = format!(".{}.tmp", fv::EVENTS);
-        let tmp_path = wide(self.path(&tmp));
-        // SAFETY: a NUL-terminated path.
-        if unsafe { DeleteFileW(tmp_path.as_ptr()) } == 0 {
-            let e = last_error();
-            if !not_found(&e) {
-                return Err(e);
-            }
-        }
-        self.create_file(&tmp, &fv::events(populated, frozen))?;
-        // SAFETY: NUL-terminated paths.
-        if unsafe { MoveFileExW(tmp_path.as_ptr(), wide(self.path(fv::EVENTS)).as_ptr(), MOVEFILE_REPLACE_EXISTING) } == 0 {
-            let e = last_error();
-            // SAFETY: as above.
-            unsafe { DeleteFileW(tmp_path.as_ptr()) };
-            return if is_busy(&e) { Ok(Written::Busy) } else { Err(e) };
-        }
-        Ok(Written::Done)
     }
 }
 
@@ -739,7 +819,7 @@ impl Control {
         } else {
             watch.settling = false;
         }
-        let Some((request, canonical)) = files.read()? else {
+        let Some((request, canonical, seen)) = files.read()? else {
             // Held unshared by its writer: looked at again after the settle.
             if !watch.settling {
                 watch.settle_later()?;
@@ -752,25 +832,19 @@ impl Control {
                     watch.settle_cancel();
                 }
                 self.restore_pending = false;
-                if !canonical && files.restore(state)? == Written::Busy {
-                    // As Linux reads the file back, once the writer lets go.
-                    self.restore_pending = true;
-                    watch.settle_later()?;
-                }
                 self.state = state;
+                // As Linux reads the file back; nothing written when it
+                // holds that already.
+                if !canonical {
+                    self.write_back(files, watch, &seen)?;
+                }
                 Ok(Some(state))
             }
             fv::Request::Empty | fv::Request::Invalid if event == Event::Settled || self.restore_pending => {
                 if !self.restore_pending {
                     log(&fv::ignored(files.version, request));
                 }
-                match files.restore(self.state)? {
-                    Written::Done => self.restore_pending = false,
-                    Written::Busy => {
-                        self.restore_pending = true;
-                        watch.settle_later()?;
-                    }
-                }
+                self.write_back(files, watch, &seen)?;
                 Ok(None)
             }
             fv::Request::Empty | fv::Request::Invalid => {
@@ -780,6 +854,23 @@ impl Control {
                 Ok(None)
             }
         }
+    }
+
+    /// Writes the control file back to the state, `seen` being what the
+    /// jailer read from it. Held by a writer: pending, written after the
+    /// settle, the file meanwhile holding what the writer wrote. Written
+    /// after the jailer read it: left as the writer left it, and handled as
+    /// any write, which the change notification reports (the watch was
+    /// armed before the read), so no write is undone.
+    fn write_back(&mut self, files: &Files, watch: &mut Watch, seen: &[u8]) -> io::Result<()> {
+        match files.restore(self.state, seen)? {
+            Restored::Done | Restored::Changed(_) => self.restore_pending = false,
+            Restored::Busy => {
+                self.restore_pending = true;
+                watch.settle_later()?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -840,6 +931,11 @@ impl Freezer {
             }
             None => Files::create(&jail_dir, version(), State::Thawed).map_err(|e| e.to_string())?,
         };
+        Freezer::of(files)
+    }
+
+    /// The freezer of `files`.
+    fn of(files: Files) -> Result<Freezer, String> {
         let watch = Watch::new(&files).map_err(|e| format!("watching {}: {e}", files.dir.display()))?;
         Ok(Freezer {
             files,
@@ -1078,9 +1174,35 @@ mod tests {
         std::fs::read_to_string(path).unwrap()
     }
 
-    // The files: made exclusive, with their DACL; read back; restored in
-    // place; a hard link or a directory in the control file's place is not
-    // trusted, and is replaced.
+    /// The request and whether it is canonical.
+    fn request(files: &Files) -> (fv::Request, bool) {
+        let (request, canonical, _) = files.read().unwrap().unwrap();
+        (request, canonical)
+    }
+
+    /// Reads `path` as `type` and Get-Content open it, sharing reading and
+    /// writing.
+    fn read_sharing(path: &Path) -> String {
+        let mut s = String::new();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
+        s
+    }
+
+    /// Restores the control file after reading it.
+    fn restore(files: &Files, state: State) -> Restored {
+        let (_, _, seen) = files.read().unwrap().unwrap();
+        files.restore(state, &seen).unwrap()
+    }
+
+    // The files: made exclusive, with their DACL; read back; restored; a
+    // write that came after the read is not lost; a hard link or a
+    // directory in the control file's place is not trusted, and is replaced.
     #[test]
     fn test_files() {
         let dir = temp_dir("files");
@@ -1088,39 +1210,80 @@ mod tests {
         assert_eq!(content(&dir.join("cgroup.freeze")), "0\n");
         assert_eq!(content(&dir.join("cgroup.events")), "populated 1\nfrozen 0\n");
         assert!(Files::create(&dir, Version::V2, State::Thawed).is_err(), "made over existing files");
-        assert_eq!(files.read().unwrap().unwrap(), (fv::Request::Set(State::Thawed), true));
+        assert_eq!(request(&files), (fv::Request::Set(State::Thawed), true));
         std::fs::write(dir.join("cgroup.freeze"), "1").unwrap();
-        assert_eq!(files.read().unwrap().unwrap(), (fv::Request::Set(State::Frozen), false));
-        assert_eq!(files.restore(State::Frozen).unwrap(), Written::Done);
+        assert_eq!(request(&files), (fv::Request::Set(State::Frozen), false));
+        assert_eq!(restore(&files, State::Frozen), Restored::Done);
         assert_eq!(content(&dir.join("cgroup.freeze")), "1\n");
+        // Written after the read: left as written, and what it holds comes
+        // back.
+        std::fs::write(dir.join("cgroup.freeze"), "1").unwrap();
+        let (_, _, seen) = files.read().unwrap().unwrap();
+        std::fs::write(dir.join("cgroup.freeze"), "0").unwrap();
+        assert_eq!(files.restore(State::Frozen, &seen).unwrap(), Restored::Changed(b"0".to_vec()));
+        assert_eq!(content(&dir.join("cgroup.freeze")), "0");
+        assert!(!dir.join(".cgroup.freeze.tmp").exists() && !dir.join(".cgroup.events.tmp").exists());
         assert_eq!(files.write_events(true, true).unwrap(), Written::Done);
         assert_eq!(content(&dir.join("cgroup.events")), "populated 1\nfrozen 1\n");
         // A hard link in its place.
         std::fs::remove_file(dir.join("cgroup.freeze")).unwrap();
         std::fs::write(dir.join("other"), "0\n").unwrap();
         std::fs::hard_link(dir.join("other"), dir.join("cgroup.freeze")).unwrap();
-        assert_eq!(files.read().unwrap().unwrap(), (fv::Request::Invalid, false));
-        assert_eq!(files.restore(State::Frozen).unwrap(), Written::Done);
+        assert_eq!(request(&files), (fv::Request::Invalid, false));
+        assert_eq!(restore(&files, State::Frozen), Restored::Done);
         assert_eq!(content(&dir.join("cgroup.freeze")), "1\n");
         assert_eq!(content(&dir.join("other")), "0\n", "the link's other name was written");
         // A directory in its place.
         std::fs::remove_file(dir.join("cgroup.freeze")).unwrap();
         std::fs::create_dir(dir.join("cgroup.freeze")).unwrap();
-        assert_eq!(files.read().unwrap().unwrap(), (fv::Request::Invalid, false));
-        assert_eq!(files.restore(State::Thawed).unwrap(), Written::Done);
+        assert_eq!(request(&files), (fv::Request::Invalid, false));
+        assert_eq!(restore(&files, State::Thawed), Restored::Done);
         assert_eq!(content(&dir.join("cgroup.freeze")), "0\n");
-        // A reader that does not let cgroup.events be replaced: busy, then done.
+        // A reader that holds cgroup.events sharing reading alone: busy,
+        // a reader that shares writing reads the state before (the old
+        // truth, never a third thing) meanwhile; then done.
         let reader = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(dir.join("cgroup.events")).unwrap();
         assert_eq!(files.write_events(true, false).unwrap(), Written::Busy);
+        assert_eq!(read_sharing(&dir.join("cgroup.events")), "populated 1\nfrozen 1\n");
         drop(reader);
         assert_eq!(files.write_events(true, false).unwrap(), Written::Done);
         assert_eq!(content(&dir.join("cgroup.events")), "populated 1\nfrozen 0\n");
+        // One that holds it sharing writing: written under it, and it reads
+        // the new state from the start again, as a reader polling it on
+        // Linux does.
+        let mut holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(dir.join("cgroup.events"))
+            .unwrap();
+        assert_eq!(files.write_events(true, true).unwrap(), Written::Done);
+        let mut s = String::new();
+        holder.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "populated 1\nfrozen 1\n");
+        drop(holder);
+        // The control file held so: what the writer wrote (the truth, in
+        // its form) until written back.
+        std::fs::write(dir.join("cgroup.freeze"), "1").unwrap();
+        let reader = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(dir.join("cgroup.freeze")).unwrap();
+        assert_eq!(restore(&files, State::Frozen), Restored::Busy);
+        assert_eq!(read_sharing(&dir.join("cgroup.freeze")), "1");
+        drop(reader);
+        assert_eq!(restore(&files, State::Frozen), Restored::Done);
+        assert_eq!(content(&dir.join("cgroup.freeze")), "1\n");
+        std::fs::write(dir.join("cgroup.freeze"), "0\n").unwrap();
         // A writer that shares the control file with no one: busy, then read.
         let writer = std::fs::OpenOptions::new().write(true).share_mode(0).open(dir.join("cgroup.freeze")).unwrap();
         assert_eq!(files.read().unwrap(), None);
-        assert_eq!(files.restore(State::Frozen).unwrap(), Written::Busy);
+        assert_eq!(files.restore(State::Frozen, b"0\n").unwrap(), Restored::Busy);
         drop(writer);
-        assert_eq!(files.read().unwrap().unwrap(), (fv::Request::Set(State::Thawed), true));
+        assert_eq!(request(&files), (fv::Request::Set(State::Thawed), true));
+        // A writer that holds it open, sharing everything: not replaced
+        // under it, so its next write is the file's.
+        let mut writer = std::fs::OpenOptions::new().write(true).open(dir.join("cgroup.freeze")).unwrap();
+        assert_eq!(files.restore(State::Frozen, b"0\n").unwrap(), Restored::Busy);
+        writer.write_all(b"1").unwrap();
+        drop(writer);
+        assert_eq!(request(&files), (fv::Request::Set(State::Frozen), true));
         // v1: one file.
         let d1 = temp_dir("files-v1");
         Files::create(&d1, Version::V1, State::Frozen).unwrap();
@@ -1197,6 +1360,250 @@ mod tests {
         assert_eq!(content(&dir.join("cgroup.events")), "populated 0\nfrozen 0\n");
         drop(freezer);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The job, shared with the thread that writes the control file.
+    struct SharedJob(std::sync::Arc<Mutex<FakeJob>>);
+
+    impl JobFreeze for SharedJob {
+        fn set(&mut self, frozen: bool) -> Result<(), i32> {
+            self.0.lock().unwrap().set(frozen)
+        }
+    }
+
+    /// What a reader of a file saw: the reads, the reads refused, and what
+    /// it read that is not one of the file's whole values.
+    #[derive(Default, Debug)]
+    struct Seen {
+        share: u32,
+        reads: u64,
+        refused: u64,
+        first_refusals: Vec<String>,
+        torn: Vec<String>,
+    }
+
+    /// Reads `path`, opened sharing `share`, until `stop`, as fast as it
+    /// can, each open and read under `gate`'s read side. Not there yet is no
+    /// refusal; gone once it was there is.
+    fn hammer(
+        path: PathBuf,
+        share: u32,
+        whole: &'static [&'static str],
+        gate: std::sync::Arc<std::sync::RwLock<()>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Seen {
+        let mut seen = Seen { share, ..Seen::default() };
+        let mut was_there = false;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let _gate = gate.read().unwrap();
+            match std::fs::OpenOptions::new().read(true).share_mode(share).open(&path) {
+                Ok(mut f) => {
+                    was_there = true;
+                    let mut s = String::new();
+                    f.read_to_string(&mut s).unwrap();
+                    seen.reads += 1;
+                    if !whole.contains(&s.as_str()) && seen.torn.len() < 10 {
+                        seen.torn.push(s);
+                    }
+                }
+                Err(e) if not_found(&e) && !was_there => {}
+                Err(e) => {
+                    seen.refused += 1;
+                    if seen.first_refusals.len() < 3 {
+                        seen.first_refusals.push(format!("{}{e}", if was_there { "" } else { "before the first read: " }));
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    /// Writes `value` into the control file in place as a writer that
+    /// keeps the file (`echo 1 >`) does, without cutting it first, under
+    /// `gate`'s write side; opened again while the jailer's write-back
+    /// holds it (which shares no writing): the number of times.
+    fn write_over(path: &Path, value: &str, gate: &std::sync::RwLock<()>) -> u64 {
+        let mut refused = 0;
+        loop {
+            let _gate = gate.write().unwrap();
+            match std::fs::OpenOptions::new().write(true).open(path) {
+                Ok(mut f) => {
+                    f.write_all(value.as_bytes()).unwrap();
+                    f.set_len(u64::try_from(value.len()).unwrap()).unwrap();
+                    return refused;
+                }
+                Err(e) if e.raw_os_error().map(i32::cast_unsigned) == Some(ERROR_SHARING_VIOLATION) => refused += 1,
+                Err(e) => panic!("writing {}: {e}", path.display()),
+            }
+        }
+    }
+
+    // As a cgroup's files on Linux, which a reader opens and reads whatever
+    // the kernel does meanwhile. Readers of both files in tight loops from
+    // before the jailer makes them, while the state flips 1000 times,
+    // written in a form the jailer writes back canonical each time:
+    //
+    // - those that open as `type`, Get-Content, Python's open and C's fopen
+    //   do (sharing reading and writing) are never refused and never read
+    //   anything but a whole value (neither half of one nor an empty file);
+    // - those that open as .NET's File.ReadAllText and File.OpenRead do
+    //   (sharing reading alone) are counted, not held to zero: Windows
+    //   refuses them while any handle can write the file (CreateFileW: "You
+    //   cannot request a sharing mode that conflicts with the access mode
+    //   that is specified in an existing request that has an open handle"),
+    //   and every way to change a file's content takes one (measured,
+    //   agent-state/win2/results-fzs.txt, results-fzs2.txt,
+    //   results-fzt.txt; the freeze stage's ReadAllText was refused so on
+    //   Windows 11 26300); what they do read is whole;
+    // - every flip reaches the job, in order; once the readers stop, both
+    //   files read the last state within the settle.
+    //
+    // The test's own writer, the operator, takes `gate`'s write side, the
+    // readers its read side: a write of the operator's own refuses such a
+    // reader, or is read half made, as any writer's on Windows, and is not
+    // the jailer's to answer for. The jailer takes no part in the gate.
+    fn readers_never_refused(version: Version) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, RwLock};
+        const FLIPS: usize = 1000;
+        const SHARING_WRITE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+        let dir = temp_dir(&format!("readers-{version:?}"));
+        let control = dir.join(version.control());
+        let (control_whole, events_whole): (&'static [&'static str], &'static [&'static str]) = match version {
+            Version::V1 => (&["THAWED\n", "FROZEN\n", "THAWED", "FROZEN"], &[]),
+            Version::V2 => (&["0\n", "1\n", "0", "1"], &["populated 1\nfrozen 0\n", "populated 1\nfrozen 1\n"]),
+        };
+        let gate = Arc::new(RwLock::new(()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for (i, share) in [SHARING_WRITE, FILE_SHARE_READ, SHARING_WRITE, FILE_SHARE_READ].into_iter().enumerate() {
+            let (path, whole) =
+                if version == Version::V2 && i >= 2 { (dir.join(fv::EVENTS), events_whole) } else { (control.clone(), control_whole) };
+            let (gate, stop) = (gate.clone(), stop.clone());
+            readers.push(std::thread::spawn(move || (path.clone(), hammer(path, share, whole, gate, stop))));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let job = Arc::new(Mutex::new(FakeJob::default()));
+        let mut shared = SharedJob(job.clone());
+        let mut freezer = Freezer::of(Files::create(&dir, version, State::Thawed).unwrap()).unwrap();
+        freezer.before_resume(&mut shared).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (job, done, control, gate) = (job.clone(), done.clone(), control.clone(), gate.clone());
+            std::thread::spawn(move || {
+                let mut refused_by_the_jailer = 0;
+                let mut lost = None;
+                'flips: for i in 0..FLIPS {
+                    let value = match (version, i % 2 == 0) {
+                        (Version::V1, true) => "FROZEN",
+                        (Version::V1, false) => "THAWED",
+                        (Version::V2, true) => "1",
+                        (Version::V2, false) => "0",
+                    };
+                    refused_by_the_jailer += write_over(&control, value, &gate);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while job.lock().unwrap().0.len() <= i {
+                        if std::time::Instant::now() > deadline {
+                            lost = Some(i);
+                            break 'flips;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+                done.store(true, Ordering::Relaxed);
+                (refused_by_the_jailer, lost)
+            })
+        };
+        while !done.load(Ordering::Relaxed) {
+            if let Some(ev) = freezer.watch.wait(Some(50)).unwrap() {
+                freezer.woken(&mut shared, usize::from(ev == Event::Settled)).unwrap();
+            }
+        }
+        let (refused_by_the_jailer, lost) = writer.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let seen: Vec<(PathBuf, Seen)> = readers.into_iter().map(|r| r.join().unwrap()).collect();
+        // The readers gone, what is still to be written back is, by the settle.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(u64::from(fv::SETTLE_MS) * 3);
+        while let Some(ev) = freezer.watch.wait(Some(fv::SETTLE_MS * 2)).unwrap() {
+            freezer.woken(&mut shared, usize::from(ev == Event::Settled)).unwrap();
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+        }
+        let flips = job.lock().unwrap().0.clone();
+        for (path, s) in &seen {
+            eprintln!(
+                "{version:?}: {} sharing {}: {} reads, {} refused {:?}, not whole {:?}",
+                path.file_name().unwrap().to_string_lossy(),
+                if s.share == SHARING_WRITE { "read|write" } else { "read alone" },
+                s.reads,
+                s.refused,
+                s.first_refusals,
+                s.torn
+            );
+        }
+        eprintln!("{version:?}: {} flips; the operator's write refused by the jailer's write-back {refused_by_the_jailer} times", flips.len());
+        for (path, s) in &seen {
+            assert!(s.reads > 0, "{version:?}: {} never read", path.display());
+            assert!(s.torn.is_empty(), "{version:?}: {} read not whole: {:?}", path.display(), s.torn);
+            if s.share == SHARING_WRITE {
+                assert_eq!(s.refused, 0, "{version:?}: {} refused a reader sharing writing: {:?}", path.display(), s.first_refusals);
+            }
+        }
+        assert_eq!(lost, None, "{version:?}: a flip did not reach the job in 10 s");
+        assert!(flips.len() == FLIPS && flips.iter().enumerate().all(|(i, f)| *f == (i % 2 == 0)), "{version:?}: flips {flips:?}");
+        let last = if FLIPS % 2 == 1 { State::Frozen } else { State::Thawed };
+        assert_eq!(content(&control).as_bytes(), version.canonical(last), "{version:?}: the control file not written back");
+        if version == Version::V2 {
+            assert_eq!(content(&dir.join(fv::EVENTS)).into_bytes(), fv::events(true, last == State::Frozen), "cgroup.events not written");
+        }
+        drop(freezer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // An operator's write that lands between the jailer's read of the
+    // control file and its write-back is applied, never written over (the
+    // write-back undid it before: `test_readers_are_never_refused_v2` lost
+    // a flip so, agent-state/win2/results-fz-readers-before.txt). The
+    // jailer's steps of a read are run by hand here, the write put between.
+    #[test]
+    fn test_a_write_after_the_read_is_applied() {
+        let dir = temp_dir("raced");
+        let mut freezer = Freezer::of(Files::create(&dir, Version::V2, State::Thawed).unwrap()).unwrap();
+        let mut job = FakeJob::default();
+        freezer.before_resume(&mut job).unwrap();
+        write(&dir, "cgroup.freeze", "1");
+        drain(&mut freezer, &mut job);
+        assert_eq!((job.0.clone(), content(&dir.join("cgroup.freeze"))), (vec![true], "1\n".to_owned()));
+        // The operator thaws, in a form to be written back; the jailer reads it.
+        write(&dir, "cgroup.freeze", "0");
+        let (request, canonical, seen) = freezer.files.read().unwrap().unwrap();
+        assert_eq!((request, canonical), (fv::Request::Set(State::Thawed), false));
+        freezer.control.state = State::Thawed;
+        freezer.apply(&mut job, State::Thawed).unwrap();
+        // The operator freezes again before the write-back.
+        write(&dir, "cgroup.freeze", "1");
+        let Freezer { files, watch, control, .. } = &mut freezer;
+        control.write_back(files, watch, &seen).unwrap();
+        assert_eq!(content(&dir.join("cgroup.freeze")), "1", "the write-back wrote over the operator's write");
+        assert!(!control.restore_pending);
+        // The change notification brings the write; it is applied.
+        drain(&mut freezer, &mut job);
+        assert_eq!(job.0, [true, false, true], "the operator's write was lost");
+        assert_eq!(content(&dir.join("cgroup.freeze")), "1\n");
+        assert_eq!(content(&dir.join("cgroup.events")), "populated 1\nfrozen 1\n");
+        drop(freezer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_readers_are_never_refused_v1() {
+        readers_never_refused(Version::V1);
+    }
+
+    #[test]
+    fn test_readers_are_never_refused_v2() {
+        readers_never_refused(Version::V2);
     }
 
     // A failed freeze is the jail's end, never a jail left running against
