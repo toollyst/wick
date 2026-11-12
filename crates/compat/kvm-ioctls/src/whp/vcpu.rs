@@ -675,7 +675,7 @@ impl VcpuFd {
         let mut page = Box::new([0u8; LAPIC_PAGE]);
         let mut written = 0u32;
         // SAFETY: valid output buffer of the given size.
-        super::ffi::hr(unsafe {
+        let hres = unsafe {
             whv::WHvGetVirtualProcessorInterruptControllerState(
                 self.part(),
                 self.vp(),
@@ -683,7 +683,8 @@ impl VcpuFd {
                 LAPIC_PAGE as u32,
                 &mut written,
             )
-        })?;
+        };
+        super::ffi::hr_of("WHvGetVirtualProcessorInterruptControllerState", hres, || format!("vp {}", self.vp()))?;
         // Anything shorter is not the register page this conversion assumes.
         if (written as usize) < LAPIC_REGS {
             return err(libc::EIO);
@@ -711,14 +712,10 @@ impl VcpuFd {
             *dst = *src as u8;
         }
         // SAFETY: the register page is valid for `size` bytes.
-        super::ffi::hr(unsafe {
-            whv::WHvSetVirtualProcessorInterruptControllerState(
-                self.part(),
-                self.vp(),
-                page.as_ptr().cast(),
-                size,
-            )
-        })
+        let hres = unsafe {
+            whv::WHvSetVirtualProcessorInterruptControllerState(self.part(), self.vp(), page.as_ptr().cast(), size)
+        };
+        super::ffi::hr_of("WHvSetVirtualProcessorInterruptControllerState", hres, || format!("vp {}", self.vp()))
     }
 
     // ---- vCPU events ----

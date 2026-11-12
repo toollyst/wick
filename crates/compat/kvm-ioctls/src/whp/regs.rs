@@ -331,7 +331,7 @@ pub(crate) fn get_xsave(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<kvm_xsave
     let mut out = kvm_xsave { region: [0; 1024], extra: Default::default() };
     let mut written = 0u32;
     // SAFETY: valid output buffer of the given size.
-    ffi::hr(unsafe {
+    let hres = unsafe {
         whv::WHvGetVirtualProcessorXsaveState(
             part,
             vp,
@@ -339,20 +339,22 @@ pub(crate) fn get_xsave(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<kvm_xsave
             u32::try_from(XSAVE_AREA_LEN).unwrap(),
             &mut written,
         )
-    })?;
+    };
+    ffi::hr_of("WHvGetVirtualProcessorXsaveState", hres, || format!("vp {vp}"))?;
     Ok(out)
 }
 
 pub(crate) fn set_xsave(part: WHV_PARTITION_HANDLE, vp: u32, x: &kvm_xsave) -> Result<()> {
     // SAFETY: the region is valid for its size.
-    ffi::hr(unsafe {
+    let hres = unsafe {
         whv::WHvSetVirtualProcessorXsaveState(
             part,
             vp,
             x.region.as_ptr().cast(),
             u32::try_from(XSAVE_AREA_LEN).unwrap(),
         )
-    })
+    };
+    ffi::hr_of("WHvSetVirtualProcessorXsaveState", hres, || format!("vp {vp}"))
 }
 
 /// `kvm_fpu` is the legacy FXSAVE region at the start of the XSAVE area.

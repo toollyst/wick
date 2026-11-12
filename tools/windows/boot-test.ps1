@@ -2949,7 +2949,12 @@ continue
         $text = Get-GdbText $out
         [IO.File]::WriteAllText((Join-Path $dir 'gdb-session.txt'), $text)
         if ($relay -and $relay.Error) { Fail "relay: $($relay.Error)" }
-        Check ($text -match 'hit (Hardware assisted )?[Bb]reakpoint 1, (0x[0-9a-f]+ in )?start_kernel') "the hardware breakpoint at start_kernel was not hit: $text"
+        # Firecracker's end first: what gdb did not reach after it is its
+        # consequence, not the failure.
+        Check (-not $vm.Exited) "Firecracker ended during the gdb session ($($vm.ExitReason())); gdb's session: $text"
+        # gdb words the stop "Thread N hit Hardware assisted breakpoint 1, ..."
+        # with threads and "Hardware assisted breakpoint 1, ..." without.
+        Check ($text -match '(hit )?(Hardware assisted )?[Bb]reakpoint 1, (0x[0-9a-f]+ in )?start_kernel') "the hardware breakpoint at start_kernel was not hit: $text"
         Check ($text -match 'WICK-RIP ([0-9a-f]+) ([0-9a-f]+)' -and $Matches[1] -eq $Matches[2]) "RIP at the breakpoint is not start_kernel: $text"
         $seenStart = Get-GdbBytes $text 'WICK-X1'
         Check ($seenStart -eq $fileStart) "start_kernel through the stub: '$seenStart', in the kernel file: '$fileStart'"

@@ -10,6 +10,7 @@
 
 #![allow(non_upper_case_globals)]
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 
 use vmm_sys_util::errno::Error;
@@ -28,6 +29,44 @@ pub(crate) fn hr(hres: i32) -> Result<()> {
     } else {
         Err(from_hresult(hres))
     }
+}
+
+thread_local! {
+    /// Set while a probe runs, whose failed calls are its answers.
+    static QUIET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f` without reporting the WHP calls that fail in it ([`hr_of`]): a
+/// probe's failures are its answers, not errors.
+pub(crate) fn quietly<T>(f: impl FnOnce() -> T) -> T {
+    let was = QUIET.replace(true);
+    let out = f();
+    QUIET.set(was);
+    out
+}
+
+/// [`hr`] for the WHP call `call`, which on a failure also writes to
+/// standard error the call, what it was given (`detail`: the vCPU, the
+/// registers and values) and its `HRESULT`. The errno a failure becomes
+/// names neither the call nor the register (an `os error 87` is any
+/// `E_INVALIDARG` and every `WHV_E_*`), and Firecracker logs only that.
+pub(crate) fn hr_of(call: &str, hres: i32, detail: impl FnOnce() -> String) -> Result<()> {
+    if hres != S_OK && !QUIET.get() {
+        eprintln!("whp: {call}({}) failed: HRESULT {:#010x}", detail(), hres.cast_unsigned());
+    }
+    hr(hres)
+}
+
+/// The registers of a call, `name` or `name=value` (the low 64 bits).
+fn registers(names: &[WHV_REGISTER_NAME], values: Option<&[WHV_REGISTER_VALUE]>) -> String {
+    let mut out = Vec::with_capacity(names.len());
+    for (i, n) in names.iter().enumerate() {
+        out.push(match values {
+            Some(v) => format!("{n:#x}={:#x}", as_u64(&v[i])),
+            None => format!("{n:#x}"),
+        });
+    }
+    out.join(", ")
 }
 
 /// `WHV_E_VP_ALREADY_EXISTS` (winhvplatformdefs.h).
@@ -93,14 +132,15 @@ pub(crate) unsafe fn set_partition_property<T>(
     value: &T,
 ) -> Result<()> {
     // SAFETY: the caller's contract; `value` is valid for its size.
-    hr(unsafe {
+    let hres = unsafe {
         whv::WHvSetPartitionProperty(
             part,
             code,
             (std::ptr::from_ref::<T>(value)).cast(),
             u32::try_from(std::mem::size_of::<T>()).unwrap(),
         )
-    })
+    };
+    hr_of("WHvSetPartitionProperty", hres, || format!("{code:#x}"))
 }
 
 /// A register value aligned on 16 bytes. The header declares
@@ -148,7 +188,7 @@ pub(crate) fn get_registers(
     let aligned = room.slice();
     // SAFETY: both arrays have `names.len()` elements; `Aligned` is a
     // `WHV_REGISTER_VALUE` aligned as WHP requires.
-    hr(unsafe {
+    let hres = unsafe {
         whv::WHvGetVirtualProcessorRegisters(
             part,
             vp,
@@ -156,7 +196,8 @@ pub(crate) fn get_registers(
             u32::try_from(names.len()).unwrap(),
             aligned.as_mut_ptr().cast(),
         )
-    })?;
+    };
+    hr_of("WHvGetVirtualProcessorRegisters", hres, || format!("vp {vp}: {}", registers(names, None)))?;
     for (v, a) in values.iter_mut().zip(aligned.iter()) {
         *v = a.0;
     }
@@ -177,7 +218,7 @@ pub(crate) fn set_registers(
         *a = Aligned(*v);
     }
     // SAFETY: both arrays have `names.len()` elements, aligned (`Aligned`).
-    hr(unsafe {
+    let hres = unsafe {
         whv::WHvSetVirtualProcessorRegisters(
             part,
             vp,
@@ -185,7 +226,8 @@ pub(crate) fn set_registers(
             u32::try_from(names.len()).unwrap(),
             aligned.as_ptr().cast(),
         )
-    })
+    };
+    hr_of("WHvSetVirtualProcessorRegisters", hres, || format!("vp {vp}: {}", registers(names, Some(values))))
 }
 
 /// Reads one register of a vCPU.
@@ -230,21 +272,24 @@ pub(crate) fn run_vp(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<WHV_RUN_VP_E
     // SAFETY: all-zero is a valid exit context.
     let mut ctx = Exit(unsafe { std::mem::zeroed() });
     // SAFETY: valid output buffer of the given size.
-    hr(unsafe {
+    let hres = unsafe {
         whv::WHvRunVirtualProcessor(
             part,
             vp,
             (&raw mut ctx.0).cast(),
             u32::try_from(std::mem::size_of_val(&ctx.0)).unwrap(),
         )
-    })?;
+    };
+    hr_of("WHvRunVirtualProcessor", hres, || format!("vp {vp}"))?;
     Ok(ctx.0)
 }
 
 /// Asks a running vCPU to exit `WHvRunVirtualProcessor` as soon as possible.
 pub(crate) fn cancel_run(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<()> {
     // SAFETY: plain call; harmless if the vCPU is not running.
-    hr(unsafe { whv::WHvCancelRunVirtualProcessor(part, vp, 0) })
+    hr_of("WHvCancelRunVirtualProcessor", unsafe { whv::WHvCancelRunVirtualProcessor(part, vp, 0) }, || {
+        format!("vp {vp}")
+    })
 }
 
 /// A Windows handle wrapper that closes on drop.
@@ -290,5 +335,15 @@ mod tests {
             assert_eq!(errno(h), libc::EINVAL, "{h:#x}");
         }
         assert!(hr(S_OK).is_ok());
+    }
+
+    // A failed call's report names each register, with the value written.
+    #[test]
+    fn test_a_failure_names_its_registers() {
+        let names = [whv::WHvRegisterPendingInterruption, whv::WHvX64RegisterRip];
+        assert_eq!(registers(&names, None), "0x80000000, 0x10");
+        assert_eq!(registers(&names, Some(&[reg64(0x3_0007), reg64(0x1000)])), "0x80000000=0x30007, 0x10=0x1000");
+        assert_eq!(hr_of("WHvRunVirtualProcessor", 0x8007_0057u32 as i32, || "vp 0".into()).unwrap_err().errno(), libc::EINVAL);
+        assert!(quietly(|| hr_of("WHvRunVirtualProcessor", 0x8037_0305u32 as i32, || unreachable!())).is_err());
     }
 }

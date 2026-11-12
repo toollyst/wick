@@ -243,7 +243,9 @@ pub(crate) fn probe_registers(names: &[WHV_REGISTER_NAME]) -> Vec<bool> {
     // SAFETY: vCPU 0 of the partition just configured.
     if configure(part).is_ok() && ffi::hr(unsafe { whv::WHvCreateVirtualProcessor(part, 0, 0) }).is_ok() {
         for (i, &name) in names.iter().enumerate() {
-            ok[i] = ffi::get_register(part, 0, name).is_ok_and(|v| ffi::set_register(part, 0, name, v).is_ok());
+            ok[i] = ffi::quietly(|| {
+                ffi::get_register(part, 0, name).is_ok_and(|v| ffi::set_register(part, 0, name, v).is_ok())
+            });
         }
     }
     // SAFETY: the partition made above, deleted with its vCPU.
@@ -664,8 +666,9 @@ impl VmFd {
         let mut clock = self.inner.irqchip.lock().unwrap().clock();
         clock.realtime = realtime_ns();
         clock.flags |= KVM_CLOCK_REALTIME;
-        // vCPU 0's TSC, which every vCPU's follows (`pvclock`).
-        if let Ok(value) = ffi::get_register(self.inner.part, 0, whv::WHvX64RegisterTsc) {
+        // vCPU 0's TSC, which every vCPU's follows (`pvclock`); none before
+        // vCPU 0 is made, an answer, not an error.
+        if let Ok(value) = ffi::quietly(|| ffi::get_register(self.inner.part, 0, whv::WHvX64RegisterTsc)) {
             let tsc = ffi::as_u64(&value);
             if let Some(ns) = self.inner.pvclock.lock().unwrap().clock_at(tsc) {
                 clock.clock = ns;
