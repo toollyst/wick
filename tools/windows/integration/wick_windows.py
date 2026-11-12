@@ -110,11 +110,36 @@ def _sddl(path, info):
 _PROTECTED_DACL = 0x80000000
 
 
+class _SessionLock:
+    """A lock all the session's workers share (a named mutex): a DACL is read,
+    changed and written back, and six workers grant the same hard-linked
+    artifacts to their jails at once."""
+
+    def __enter__(self):
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        name = "Local\\wick-it-dacl-" + os.path.basename(SESSION_ROOT)
+        self._h = k32.CreateMutexW(None, False, name)
+        if not self._h:
+            raise ctypes.WinError(ctypes.get_last_error())
+        k32.WaitForSingleObject(ctypes.c_void_p(self._h), 0xFFFFFFFF)
+        self._k32 = k32
+
+    def __exit__(self, *_):
+        self._k32.ReleaseMutex(ctypes.c_void_p(self._h))
+        self._k32.CloseHandle(ctypes.c_void_p(self._h))
+
+
 def _set_dacl(path, edit):
     """Sets `path`'s DACL to `edit(aces)`, the DACL's ACEs as SDDL strings
     in order (icacls cannot name a SID no account has, as a jail's: 1332).
     Explicit denies come first, then explicit allows, as Windows orders an
-    ACL; inherited ACEs are recomputed from the parent."""
+    ACL; inherited ACEs are recomputed from the parent. One worker at a time."""
+    with _SessionLock():
+        _set_dacl_locked(path, edit)
+
+
+def _set_dacl_locked(path, edit):
     dacl = _sddl(path, _DACL_INFO)
     m = re.match(r"D:([A-Z]*)(.*)$", dacl)
     flags, aces = m.group(1), re.findall(r"\([^)]*\)", m.group(2))
@@ -170,6 +195,17 @@ def _chmod(path, mode, *args, **kwargs):
 os.chmod = _chmod
 
 
+_USER_SID = []
+
+
+def _user_sid():
+    """The session user's SID (S-1-5-21-...)."""
+    if not _USER_SID:
+        out = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, check=True)
+        _USER_SID.append(out.stdout.strip().split(",")[-1].strip('"'))
+    return _USER_SID[0]
+
+
 def give_to_jail(path, root):
     """`chown(path, uid, gid)` for a jail: `path` is granted to the jail's
     SID, the one the jail directory `root` grants (S-1-9-..., the jailer's
@@ -184,8 +220,22 @@ def give_to_jail(path, root):
     sid = re.search(r"S-1-9-[0-9-]+", dacl)
     if not dacl.startswith("D:P") or sid is None:
         return
-    grant = f"(A;;FA;;;{sid.group(0)})"
-    _set_dacl(path, lambda aces: aces if grant in aces else aces + [grant])
+    # A jailed process's access is checked twice (a restricted token): for
+    # its restricting SIDs, the jail's, and for its normal ones, the user's.
+    # A file that grants the user only as OWNER RIGHTS (Python makes 0o700
+    # directories so: pytest's tmp_path) passes the second check for nothing
+    # (measured: access denied, then opened once the user's SID was added).
+    grants = [f"(A;;FA;;;{sid.group(0)})", f"(A;;FA;;;{_user_sid()})"]
+
+    def edit(aces):
+        # A read-only artifact is linked into every jail of every session: an
+        # ACE per jail outgrew the ACL (ERROR 1340, an ACL is at most 64
+        # KiB). The latest jails' grants stay; fewer than that run at once.
+        jails = [a for a in aces if a.startswith("(A;") and "S-1-9-" in a and a != grants[0]]
+        old = set(jails[:-31])
+        return [a for a in aces if a not in old] + [g for g in grants if g not in aces]
+
+    _set_dacl(path, edit)
     label = _sddl(root, _LABEL_INFO)
     if "ML;" not in label:
         return
@@ -250,7 +300,8 @@ def _shims():
             f.write(f'#!/bin/sh\nexec "{_msys(sys.executable)}" "{_msys(_HOSTTOOLS)}" {tool} "$@"\n')
     env = os.path.join(shims, "bash_env")
     with open(env, "w", newline="\n", encoding="utf-8") as f:
-        f.write(f'PATH="{_msys(shims)}:$PATH"\n')
+        # A UTF-8 locale, as a Linux host's shell has (grep -P wants one).
+        f.write(f'PATH="{_msys(shims)}:$PATH"\nexport LC_ALL=C.UTF-8\n')
     os.environ["BASH_ENV"] = _msys(env)
 
 
@@ -399,6 +450,17 @@ def _path_stat(self, *, follow_symlinks=True):
 
 
 pathlib.Path.stat = _path_stat
+
+_real_os_stat = os.stat
+
+
+def _os_stat(path, *args, **kwargs):
+    """`os.stat` with st_blocks (`_Stat`) for a path; a descriptor's as it is."""
+    st = _real_os_stat(path, *args, **kwargs)
+    return _Stat(path, st) if isinstance(path, (str, os.PathLike)) else st
+
+
+os.stat = _os_stat
 
 import framework.properties  # noqa: E402,F401  pylint: disable=wrong-import-position,unused-import
 
