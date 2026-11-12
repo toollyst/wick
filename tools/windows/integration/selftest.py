@@ -299,9 +299,10 @@ def process_ends(tmp):
     # A stopped stand-in, whose child writes past the pipe's buffer: resumed,
     # it copies the rest and the child ends.
     log = os.path.join(tmp, "screen-stopped.log")
+    line = b"0123456789012345678901234567890123456789"
     stand_in = subprocess.Popen(  # pylint: disable=consider-using-with
         [sys.executable, hosttools.__file__, "screen", log, os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c",
-         "ping -n 2 127.0.0.1 >nul & for /l %i in (1,1,4000) do @echo 0123456789012345678901234567890123456789"],
+         f"ping -n 2 127.0.0.1 >nul & for /l %i in (1,1,4000) do @echo {line.decode()}"],
         stdin=subprocess.PIPE)
     child = _first_child(stand_in.pid, "cmd.exe")
     _suspend(stand_in.pid)
@@ -309,7 +310,8 @@ def process_ends(tmp):
     check(not child.is_running(), "screen: a stopped stand-in's kill resumes it and returns once its child has ended")
     stand_in.wait(10)
     with open(log, "rb") as f:
-        lines = f.read().count(b"0123456789")
+        # Whole lines: each line holds its first ten digits four times.
+        lines = f.read().splitlines().count(line)
     check(lines == 4000, f"screen: a stopped stand-in copied all of its child's output ({lines} of 4000 lines)")
 
 
