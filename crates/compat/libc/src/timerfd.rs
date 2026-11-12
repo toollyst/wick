@@ -177,6 +177,19 @@ const F_SETNOSIGPIPE: c_int = 73;
 /// an eventfd's.
 pub const TIMERFD_FIFO_PREFIX: &str = ".timerfd-";
 
+/// Held by the crate's tests that start a process, while they start it,
+/// and by those that need no other process to hold their descriptors: XNU's
+/// `posix_spawn` copies every descriptor into the child, close-on-exec ones
+/// too (bsd/kern/kern_exec.c, `fork1` with `PROC_CREATE_SPAWN`), and closes
+/// those only when the new image is activated (`fdt_exec`), so meanwhile
+/// the child holds the read end of a timer its parent closed, and the timer
+/// is not seen closed (measured: 2 of 200 runs of the timer tests).
+#[cfg(test)]
+pub(crate) fn spawning() -> std::sync::MutexGuard<'static, ()> {
+    static SPAWNING: Mutex<()> = Mutex::new(());
+    SPAWNING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// An unnamed FIFO: (the caller's descriptor, open for reading and writing;
 /// the timer thread's, open for writing, non-blocking, without `SIGPIPE`).
 fn unnamed_fifo() -> Option<(OwnedFd, OwnedFd)> {
@@ -477,11 +490,17 @@ mod tests {
         const NAME: &str = "timerfd::tests::test_timers_are_not_coalesced";
         const CHILD: &str = "WICK_TIMERFD_TEST_ALONE";
         if std::env::var_os(CHILD).is_none() {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
+            let child = {
+                let _spawning = spawning();
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
+                    .env(CHILD, "1")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            };
+            let out = child.wait_with_output().unwrap();
             let text = std::format!(
                 "{:?}\n{}{}",
                 out.status,
@@ -610,6 +629,7 @@ mod tests {
 
     #[test]
     fn test_a_timer_closed_disarmed_is_released() {
+        let _alone = spawning();
         // SAFETY: plain call.
         let fd = unsafe { timerfd_create(libc::CLOCK_MONOTONIC, TFD_CLOEXEC) };
         assert!(fd >= 0);
@@ -659,9 +679,10 @@ mod tests {
         // SAFETY: closing our descriptor.
         unsafe { libc::close(fd) };
 
-        // The close of a timer: with TFD_CLOEXEC, so that no child another
-        // test spawns meanwhile holds the FIFO's read end (its expiration
-        // would then find a reader).
+        // The close of a timer: with TFD_CLOEXEC, and while no other test
+        // starts a process ([`spawning`]), so that no child holds the FIFO's
+        // read end (its expiration would then find a reader).
+        let _alone = spawning();
         // SAFETY: plain call.
         let fd = unsafe { timerfd_create(libc::CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC) };
         assert!(fd >= 0);

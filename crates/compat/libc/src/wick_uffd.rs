@@ -1859,11 +1859,17 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             return true;
         }
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([name, "--exact", "--test-threads=1", "--nocapture"])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
+        let child = {
+            let _spawning = crate::timerfd::spawning();
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([name, "--exact", "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let out = child.wait_with_output().unwrap();
         let text = std::format!(
             "{:?}\n{}{}",
             out.status,
