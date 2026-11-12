@@ -73,20 +73,27 @@ def run(package, args, out_dir):
     env = dict(os.environ, RUST_TEST_THREADS="1", RUST_BACKTRACE="1")
     cmd = ["cargo", "test", "--locked", "--no-fail-fast", "-p", package, *args]
     print("+ " + " ".join(cmd), flush=True)
-    proc = subprocess.run(
-        cmd,
-        cwd=ROOT / "lib" / "firecracker",
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    (out_dir / f"{package}.log").write_text(proc.stdout, encoding="utf-8")
+    # The test binaries write to the log file itself, not to a pipe: a test
+    # that builds a microVM with the serial on standard output makes that
+    # output non-blocking (upstream's set_stdout_nonblocking), on Windows
+    # PIPE_NOWAIT on standard output's pipe handle (the compatibility
+    # fcntl). A full non-blocking pipe then takes part of a write and
+    # libtest's next write_all fails with WriteZero, losing the failures'
+    # messages (run 43277608081, cpu-template-helper). O_NONBLOCK on a file
+    # changes nothing, on Windows as on Linux.
+    log = out_dir / f"{package}.log"
+    with open(log, "wb") as f:
+        proc = subprocess.run(
+            cmd,
+            cwd=ROOT / "lib" / "firecracker",
+            env=env,
+            stdout=f,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    output = log.read_bytes().decode("utf-8", errors="replace")
     results = {}
-    for line in proc.stdout.splitlines():
+    for line in output.splitlines():
         m = RESULT.match(line)
         if m:
             name = m.group(1).removesuffix(" - should panic")
@@ -94,8 +101,11 @@ def run(package, args, out_dir):
             # in either is the test's result.
             if results.get(name) != "FAILED":
                 results[name] = m.group(2)
-    built = "error: could not compile" not in proc.stdout and "error[E" not in proc.stdout
-    return results, built, proc.returncode
+    built = "error: could not compile" not in output and "error[E" not in output
+    # libtest could not write its report (it says "listing" for any run):
+    # results it did not print are lost, so the run cannot be compared.
+    cut = "error: io error when listing tests" in output
+    return results, built, proc.returncode, cut
 
 
 def main():
@@ -111,10 +121,12 @@ def main():
     problems = []
     counts = []
     for package, args in RUNS:
-        results, built, code = run(package, args, out_dir)
+        results, built, code, cut = run(package, args, out_dir)
         if not built:
             problems.append(f"{package}: did not build (see {out_dir / (package + '.log')})")
             continue
+        if cut:
+            problems.append(f"{package}: libtest's output was cut short, results lost (see {out_dir / (package + '.log')})")
         listed = {t: k for (k, p, t) in entries if p == package}
         n = {"ok": 0, "FAILED": 0, "ignored": 0}
         for test, result in sorted(results.items()):

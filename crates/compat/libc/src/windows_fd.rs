@@ -1672,6 +1672,48 @@ mod tests {
         }
     }
 
+    // A full non-blocking pipe, as Firecracker leaves its standard output
+    // when the serial writes there (upstream's set_stdout_nonblocking):
+    // `write` here fails with EAGAIN, as on Linux. std on the same handle
+    // gets a write of 0 bytes, which write_all reports as WriteZero, "failed
+    // to write whole buffer": a full non-blocking byte pipe takes what fits
+    // and returns success (WriteFile, "Pipes": "WriteFile returns TRUE with
+    // *lpNumberOfBytesWritten < nNumberOfBytesToWrite"), and std's
+    // Handle::write passes that on. How libtest lost its report in CI run
+    // 43277608081 (cpu-template-helper; tools/windows/check-unit-tests.py).
+    #[test]
+    fn test_a_full_non_blocking_pipe() {
+        let mut fds = [0; 2];
+        // SAFETY: valid buffers and descriptors.
+        unsafe {
+            assert_eq!(pipe(fds.as_mut_ptr()), 0);
+            assert_eq!(fcntl(fds[1], F_SETFL, O_NONBLOCK), 0);
+            let chunk = [7u8; 4096];
+            let mut total = 0usize;
+            loop {
+                let n = write(fds[1], chunk.as_ptr().cast(), chunk.len());
+                if n < 0 {
+                    break;
+                }
+                assert!(n > 0, "a write that takes nothing fails");
+                total += n.unsigned_abs();
+                assert!(total < 64 << 20, "the pipe never filled");
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(crate::EAGAIN)
+            );
+            assert!(total > 0);
+            let writer = std::mem::ManuallyDrop::new(<std::fs::File as std::os::windows::io::FromRawHandle>::from_raw_handle(
+                handle(fds[1]),
+            ));
+            let err = std::io::Write::write_all(&mut &*writer, b"more").unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::WriteZero, "{err:?}");
+            assert_eq!(close(fds[1]), 0);
+            assert_eq!(close(fds[0]), 0);
+        }
+    }
+
     #[test]
     fn test_cloexec_and_dup() {
         let (p, f) = temp("dup");
