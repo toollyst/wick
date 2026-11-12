@@ -70,19 +70,10 @@ MACOS_MODE = "user"
 # Suites a host has not run in full (docs/PORTING.md row 12, "To do"). Their
 # cells say so, rather than a 0 that would read as "no difference".
 NOT_RUN = {
-    # test_fips.py and test_nv.py have run as the user (5 passed,
-    # build/integration-tests/fips-nv, 2026-11-12).
-    "macOS": tuple(
-        f"integration_tests/security/{name}.py"
-        for name in (
-            "test_custom_seccomp",
-            "test_jail",
-            "test_sec_audit",
-            "test_seccomp",
-            "test_seccomp_validate",
-            "test_vulnerabilities",
-        )
-    ),
+    # The security suite has run as the user (build/integration-tests/
+    # mac2-security-20261113-060224, 604dce4: 15 passed; test_fips.py and
+    # test_nv.py before it, build/integration-tests/fips-nv, 2026-11-12).
+    "macOS": (),
     "Windows": (),
 }
 
@@ -327,8 +318,8 @@ def progress(text):
     out += ["", "Integration tests: Linux's passing tests in the suites the host has run, less the ones its "
             "differences file lists by name and the ones a `failure:` entry excused in its last run; tests "
             "listed as impossible or x86_64-only are left out of the total. \"At most\" when an excused count "
-            "is a lower bound (a run of part of the suites). macOS runs them as the user, without its security "
-            "suite (see [Upstream integration tests](#upstream-integration-tests))." + "".join(" " + e for e in excused)]
+            "is a lower bound (a run of part of the suites). macOS runs them as the user (its tests that need "
+            "the jailer as root are listed `root`; see [Upstream integration tests](#upstream-integration-tests))." + "".join(" " + e for e in excused)]
     for h in HOSTS:
         left = [(a, f, s[h]) for a, f, s in rows if s[h] in ("not yet", "untested")]
         out += ["", f"<details><summary>{h}: {len(left)} rows left (🔴 not done yet or ❔ not tested)</summary>", ""]

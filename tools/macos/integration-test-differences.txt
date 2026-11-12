@@ -296,3 +296,84 @@ all bug integration_tests/functional/test_net.py::test_tap_offload
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_ON-True-kvm]
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_OFF-True-kvm]
 
+# Upstream's security suite, first run on macOS: mac2-security-20261113-060224 (604dce4, user mode). Each block
+# below gives what that run measured.
+
+# seccomp-BPF. seccompiler-bin, which every test of these files but
+# test_invalid_bpf, test_no_seccomp and test_default_seccomp_level runs
+# first, ends with "Error: LibSeccompContext": it compiles through
+# libseccomp, which exists for Linux only. Firecracker refuses
+# --seccomp-filter before reading the file ("Seccomp error: Custom
+# seccomp-BPF filters can only be enforced on Linux",
+# src/firecracker/src/seccomp.rs), so test_invalid_bpf's "Filter
+# deserialization failed" cannot appear; test_no_seccomp and
+# test_default_seccomp_level read `Seccomp:` from /proc/<tid>/status, which
+# macOS has not ("No such file or directory"). macOS's filter is a Seatbelt
+# profile, tested by the sandbox's own tests (test_narrowing_is_one_way,
+# test_unlisted_syscalls_raise_sigsys). The seccomp demos'
+# test_seccomp_rust_panic failed at seccompiler-bin too: its demo never ran.
+all impossible integration_tests/security/test_custom_seccomp.py
+all impossible integration_tests/security/test_seccomp.py
+
+# The test reads Firecracker's limits from outside with prlimit(2); macOS
+# has none (wick_macos.prlimit: "macOS has no prlimit; only a process itself
+# reads or sets its resource limits", ENOSYS).
+all impossible integration_tests/security/test_jail.py::test_args_default_resource_limits
+all impossible integration_tests/security/test_jail.py::test_args_resource_limits
+all impossible integration_tests/security/test_jail.py::test_new_pid_ns_resource_limits
+
+# PID namespaces: the test runs `pidof` (not on macOS: exit 127) and reads
+# NStgid from /proc/<pid>/status. macOS has no PID namespaces; the jailer's
+# --new-pid-ns runs Firecracker as a child it does not wait for
+# (overlay/jailer/platform).
+all impossible integration_tests/security/test_jail.py::test_new_pid_namespace
+
+# `mount --bind` into the jail (macOS's mount(8) has no --bind: exit 64);
+# macOS has no bind mounts.
+all impossible integration_tests/security/test_jail.py::test_jailer_bind_mount_propagation
+
+# The tests assert /sys/devices/system/node/node0 (Linux's NUMA sysfs) before
+# Firecracker starts, and read the cgroup files under /sys/fs/cgroup; macOS
+# has neither. test_cgroups_without_numa failed in user mode on the
+# stand-in's refusal of --cgroup; under the jailer it reaches the same
+# /sys/fs/cgroup reads (check_cgroups_v1): listed from the code, to be
+# confirmed by the root run. With no /sys/fs/cgroup/cgroup.controllers the
+# file's fixture takes the host for cgroup v1, so the v2-only tests skip.
+all impossible integration_tests/security/test_jail.py::test_cgroups
+all impossible integration_tests/security/test_jail.py::test_node_cgroups
+all impossible integration_tests/security/test_jail.py::test_cgroups_without_numa
+all impossible integration_tests/security/test_jail.py::test_cgroupsv2_written_only_once
+user impossible integration_tests/security/test_jail.py::test_cgroups_custom_parent
+user impossible integration_tests/security/test_jail.py::test_cgroups_parent_cgroup_but_no_cgroup
+
+# The jail's ownership (uid and gid 1234: the stand-in, as the user, leaves
+# its files the user's, gid 0) and the jailer's own refusals (an empty --id;
+# a missing or non-file --exec-file; a symlink or hard link where the binary
+# goes), which the stand-in does not make. The exec-file and link tests
+# also write under /srv, which the read-only system volume does not have
+# (measured: "Read-only file system: '/srv'"); the root run needs it made
+# first (a synthetic.conf entry: the user's call). test_empty_jailer_id's
+# teardown also counts every Firecracker process as one with the empty id.
+user root integration_tests/security/test_jail.py::test_default_chroot_hierarchy
+user root integration_tests/security/test_jail.py::test_arbitrary_usocket_location
+user root integration_tests/security/test_jail.py::test_empty_jailer_id
+user root integration_tests/security/test_jail.py::test_exec_file_not_exist
+user root integration_tests/security/test_jail.py::test_exec_destination_path_is_symlink
+user root integration_tests/security/test_jail.py::test_exec_destination_path_is_hardlink
+
+# With --resource-limit no-file=3 the jailer cannot open what it needs before
+# Firecracker runs (the stand-in: /dev/null, EMFILE; Linux's jailer the
+# same), as the test expects; it then asserts the text musl's strerror gives
+# EMFILE, "No file descriptors available (os error 24)". macOS's libc says
+# "Too many open files" for the same errno.
+all impossible integration_tests/security/test_jail.py::test_negative_no_file_limit
+
+# --new-pid-ns without --daemonize: the launcher exits once Firecracker is
+# its child, and screen 5.0.2 ends the session when the process it started
+# exits (measured: a launcher that forks and exits after 0.3 s leaves no
+# session 0.5 s later), before the test's `screen -X colon "logfile flush
+# 0"` ("No screen session found"). Linux's jailer exits the same way there
+# (env.rs exec_into_new_pid_ns) and the test passes on Linux: why is not
+# known yet.
+all bug integration_tests/security/test_jail.py::test_firecracker_kill_by_pid[kvm-PCI_OFF-True-False-vmlinux-6.1.188]
+all bug integration_tests/security/test_jail.py::test_firecracker_kill_by_pid[kvm-PCI_ON-True-False-vmlinux-6.1.188]
