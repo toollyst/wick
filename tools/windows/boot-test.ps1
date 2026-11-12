@@ -34,6 +34,17 @@
 #   balloon  150 MiB balloon cycles on a guest restored from a memory file
 #          and on a booted one: O_DIRECT reads of the drive read the file,
 #          and the commit charge goes down and up again with the balloon
+#   cli    Firecracker's command line: exit codes 152 and 153 (no guest),
+#          --module, the start time flags, the logger and metrics on named
+#          pipes (a stalled and a vanished reader included), --boot-timer
+#   tools  rebase-snap and snapshot-editor rebase on sparse and dense
+#          synthetic diff files (no guest), then on a diff snapshot;
+#          info-vmstate; state files with another arch's magic or a newer
+#          version refused at the load
+#   no-seccomp  the mitigation profile on without --no-seccomp and off with
+#          it, in Firecracker and its API process (no guest)
+#   foreign-snapshot  a state file made on another host (-ForeignState) is
+#          refused at the load (no guest)
 #
 # Before each reset the guest kernel log must be free of stalls, BUGs, oopses
 # and warnings.
@@ -63,6 +74,9 @@ param(
     # Stage names, comma-separated or as a list; `all` runs every stage.
     [string[]]$Stage = @('all'),
     [int]$TimeoutSec = 120,
+    # For the foreign-snapshot stage: a snapshot state file made on another
+    # host (the macOS boot test's snapshot stage makes an aarch64 one).
+    [string]$ForeignState,
     # Checks the harness itself against stand-ins for Firecracker's sockets
     # (no WHP, no downloads) and exits.
     [switch]$SelfTest
@@ -1130,6 +1144,117 @@ namespace Wick {
 }
 '@
 
+# Named pipes and sparse files (System.Core: System.IO.Pipes).
+Add-Type -ReferencedAssemblies System.Core -TypeDefinition @'
+using System;
+using System.IO;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+namespace Wick {
+    // The reading end of a named pipe Firecracker writes its log or metrics
+    // to (\\.\pipe\<name>): the Windows counterpart of a FIFO. The pipe
+    // exists from here on; Firecracker connects to it as a client. With
+    // `read` false nobody reads it (a reader that stalls).
+    public class PipeReader {
+        NamedPipeServerStream s;
+        StringBuilder text = new StringBuilder();
+        Thread t;
+        public readonly string Path;
+        public PipeReader(string name, bool read, int buffer) {
+            Path = @"\\.\pipe\" + name;
+            s = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.None, buffer, buffer);
+            t = new Thread(() => {
+                try {
+                    s.WaitForConnection();
+                    if (!read) return;
+                    var buf = new byte[65536];
+                    int n;
+                    while ((n = s.Read(buf, 0, buf.Length)) > 0) {
+                        lock (text) text.Append(Encoding.UTF8.GetString(buf, 0, n));
+                    }
+                } catch (Exception) { }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+        public bool Connected { get { return s.IsConnected; } }
+        public string Text { get { lock (text) return text.ToString(); } }
+        // Waits until `pattern` is in what was read; false at the deadline.
+        public bool WaitFor(string pattern, int ms) {
+            var until = DateTime.UtcNow.AddMilliseconds(ms);
+            while (DateTime.UtcNow < until) {
+                if (System.Text.RegularExpressions.Regex.IsMatch(Text, pattern)) return true;
+                Thread.Sleep(50);
+            }
+            return false;
+        }
+        public bool WaitConnected(int ms) {
+            var until = DateTime.UtcNow.AddMilliseconds(ms);
+            while (!s.IsConnected && DateTime.UtcNow < until) Thread.Sleep(20);
+            return s.IsConnected;
+        }
+        // The reader goes away while Firecracker still writes.
+        public void Close() {
+            try { if (s.IsConnected) s.Disconnect(); } catch (Exception) { }
+            try { s.Dispose(); } catch (Exception) { }
+        }
+    }
+
+    public static class Sparse {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool DeviceIoControl(IntPtr h, uint code, IntPtr inb, int inl, IntPtr outb, int outl, out int ret, IntPtr ov);
+        const uint FSCTL_SET_SPARSE = 0x900C4;
+
+        public static bool Is(string path) {
+            return (File.GetAttributes(path) & FileAttributes.SparseFile) != 0;
+        }
+        // A file of `size` bytes with `data` at `at`: sparse (the rest is a
+        // hole), or not (the rest is allocated zeros, as NTFS extends a file
+        // not marked sparse).
+        public static void Write(string path, long size, byte[] data, long at, bool sparse) {
+            using (var f = new FileStream(path, FileMode.Create, FileAccess.ReadWrite)) {
+                if (sparse) {
+                    int r;
+                    if (!DeviceIoControl(f.SafeFileHandle.DangerousGetHandle(), FSCTL_SET_SPARSE, IntPtr.Zero, 0, IntPtr.Zero, 0, out r, IntPtr.Zero))
+                        throw new InvalidOperationException("FSCTL_SET_SPARSE " + path + ": error " + Marshal.GetLastWin32Error());
+                }
+                f.SetLength(size);
+                f.Position = at;
+                f.Write(data, 0, data.Length);
+            }
+        }
+        // Bytes that differ between two files of the same length (-1: lengths differ).
+        public static long Differ(string a, string b) {
+            byte[] x = File.ReadAllBytes(a), y = File.ReadAllBytes(b);
+            if (x.Length != y.Length) return -1;
+            long n = 0;
+            for (int i = 0; i < x.Length; i++) if (x[i] != y[i]) n++;
+            return n;
+        }
+    }
+
+    public static class PipeSelfTest {
+        // A client writes to the reader's pipe, as Firecracker's logger does.
+        public static string Run() {
+            var r = new PipeReader("wick-bt-self-" + System.Diagnostics.Process.GetCurrentProcess().Id, true, 4096);
+            try {
+                using (var c = new NamedPipeClientStream(".", r.Path.Substring(9), PipeDirection.InOut)) {
+                    c.Connect(5000);
+                    var b = Encoding.UTF8.GetBytes("line one\nline two\n");
+                    c.Write(b, 0, b.Length);
+                    c.Flush();
+                    if (!r.WaitFor("line two", 5000)) throw new InvalidOperationException("pipe reader got '" + r.Text + "'");
+                }
+                return "PipeReader: a client's writes are read";
+            } finally { r.Close(); }
+        }
+    }
+}
+'@
+
 function Write-Step([string]$msg) { Write-Host "  - $msg" }
 
 function Get-Asset([string]$name) {
@@ -1896,6 +2021,394 @@ function Stage-Hugepages {
     return '2 vCPUs on 2 MiB large pages: boots, 160 MiB written and read back'
 }
 
+# Runs Firecracker (or `exe`) to its end; returns its exit code and its
+# output (stdout and stderr).
+function Invoke-Exe([string]$exe, [string[]]$argv, [int]$ms = 30000) {
+    $psi = New-Object Diagnostics.ProcessStartInfo($exe)
+    $psi.Arguments = ($argv | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    $out = $p.StandardOutput.ReadToEndAsync()
+    $err = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit($ms)) {
+        try { $p.Kill() } catch { }
+        Fail "$(Split-Path -Leaf $exe) $($psi.Arguments): still running after $($ms / 1000) s"
+    }
+    $p.WaitForExit()
+    return @($p.ExitCode, ($out.Result + $err.Result))
+}
+
+# Microseconds on CLOCK_MONOTONIC as Firecracker reads it on Windows (the
+# performance counter, the clock of Stopwatch).
+function Get-MonotonicUs {
+    return [long]([double][Diagnostics.Stopwatch]::GetTimestamp() * 1000000 / [Diagnostics.Stopwatch]::Frequency)
+}
+
+# The metrics lines (JSON) in `text`, parsed.
+function Get-MetricsLines([string]$text) {
+    return @($text -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | ForEach-Object { $_ | ConvertFrom-Json })
+}
+
+# The origins (source files) of the log lines in `text`: what
+# --show-log-origin writes after the level.
+function Get-LogOrigins([string]$text) {
+    return @([regex]::Matches($text, '\[[^\]\r\n]*?:(?:ERROR|WARN|INFO|DEBUG|TRACE):([^:\]\r\n]+\.rs):\d+\]') | ForEach-Object { $_.Groups[1].Value })
+}
+
+# Firecracker's own command line, the counterpart of the macOS stage:
+# (a) exit codes, (b) --module, (c) --start-time-us, --start-time-cpu-us,
+# --parent-cpu-time-us, (d) the logger and metrics on named pipes, the
+# Windows counterpart of a FIFO, (e) --boot-timer. (a) needs no guest.
+function Stage-Cli {
+    $done = @()
+    $dir = Join-Path $Results 'cli'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    # (a) Upstream maps an argument parsing error to 153 (ArgParsing) and an
+    # invalid --level to 152 (BadConfiguration); a configuration file that
+    # does not parse is a generic error, 1 (main.rs, FcExitCode).
+    $good = Join-Path $dir 'good.json'
+    (Base-Config 1) | ConvertTo-Json -Depth 8 | Set-Content -Encoding ASCII $good
+    $bad = Join-Path $dir 'bad.json'
+    [IO.File]::WriteAllText($bad, '{"boot-source": {"kernel_image_path": ')
+    $cases = @(
+        @(@('--no-such-flag'), 153, 'ParseArguments'),
+        @(@('--api-sock'), 153, 'ParseArguments'),
+        @(@('--no-api', '--config-file', $good, '--level', 'Bogus'), 152, 'InvalidLogLevel'),
+        @(@('--no-api', '--config-file', $bad), 1, 'ParseFromJson')
+    )
+    foreach ($c in $cases) {
+        $r = Invoke-Exe $Fc $c[0]
+        $tail = $r[1].Trim(); if ($tail.Length -gt 300) { $tail = $tail.Substring($tail.Length - 300) }
+        Check ($r[0] -eq $c[1] -and $r[1].Contains($c[2]) -and $r[1].Contains("exit_code=$($c[1])")) "firecracker $($c[0] -join ' '): exit $($r[0]), wanted $($c[1]); $tail"
+    }
+    $done += 'exit 153 for bad arguments, 152 for a bad --level, 1 for a bad configuration file'
+    Write-Step $done[-1]
+
+    # (b) --module: only lines from modules under the filter are written;
+    # file!() of a line names its crate's directory. Without a guest the
+    # vmm crate logs nothing, so each filter boots one.
+    $crates = [ordered]@{ vmm = 'src/vmm/'; firecracker = 'src/firecracker/' }
+    $seen = @()
+    foreach ($module in @('vmm', 'firecracker', '')) {
+        $name = if ($module) { "cli-module-$module" } else { 'cli-module-all' }
+        $metrics = Join-Path $dir "$name.metrics"
+        New-Item -ItemType File -Force -Path $metrics | Out-Null
+        $extra = "--metrics-path `"$metrics`""
+        if ($module) { $extra += " --module $module" }
+        $vm = Start-Vm $name (Base-Config 1) $extra -Api
+        Wait-Shell $vm
+        Invoke-Api $vm 'GET' '/machine-config' | Out-Null
+        Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
+        $vm.Reboot()
+        $origins = Get-LogOrigins (Get-Content -Raw $vm.LogPath)
+        Check ($origins.Count -gt 0) "--module ${module}: no log lines with an origin in $($vm.LogPath)"
+        if ($module) {
+            $stray = @($origins | Where-Object { -not $_.StartsWith($crates[$module]) } | Sort-Object -Unique)
+            Check ($stray.Count -eq 0) "--module ${module}: lines from $(($stray | Select-Object -First 5) -join ', ')"
+        } else {
+            foreach ($k in $crates.Keys) {
+                Check (@($origins | Where-Object { $_.StartsWith($crates[$k]) }).Count -gt 0) "no filter: no line from $k"
+            }
+            # Without the start time flags both metrics stay 0.
+            $api = (Get-MetricsLines (Get-Content -Raw $metrics))[-1].api_server
+            Check ($api.process_startup_time_us -eq 0 -and $api.process_startup_time_cpu_us -eq 0) "start time metrics without the flags: $($api | ConvertTo-Json -Compress)"
+        }
+        $seen += "$(if ($module) { $module } else { 'all' })=$($origins.Count)"
+    }
+    $done += "--module keeps its crate's lines ($($seen -join ', '))"
+    Write-Step $done[-1]
+
+    # (c, d) --start-time-us is CLOCK_MONOTONIC in us (what the jailer
+    # passes), --start-time-cpu-us the CPU time the process had at the exec,
+    # --parent-cpu-time-us the jailer's: once the API server is up the
+    # metrics hold the time since the start and the CPU time since then plus
+    # the parent's (ProcessTimeReporter). The metrics go to a named pipe
+    # given on the command line, the log to one given through the API.
+    # Unlike a FIFO, a pipe exists only while its reader holds it, so the
+    # readers are made first; Firecracker connects to them.
+    $tag = "wick-bt-$PID"
+    $mpipe = New-Object Wick.PipeReader("$tag-metrics", $true, 65536)
+    $lpipe = New-Object Wick.PipeReader("$tag-log", $true, 65536)
+    $stall = New-Object Wick.PipeReader("$tag-stall", $false, 4096)
+    try {
+        $parent = 1000
+        $t0 = Get-MonotonicUs
+        $vm = Start-Vm 'cli-time' (Base-Config 1) "--start-time-us $t0 --start-time-cpu-us 0 --parent-cpu-time-us $parent --metrics-path $($mpipe.Path)" -Api
+        Check ($mpipe.WaitConnected(10000)) "Firecracker did not open the metrics pipe $($mpipe.Path)"
+        Wait-Shell $vm
+        Invoke-Api $vm 'PUT' '/logger' ([ordered]@{ log_path = $lpipe.Path; level = 'Info' }) | Out-Null
+        Check ($lpipe.WaitConnected(10000)) "Firecracker did not open the log pipe $($lpipe.Path)"
+        Invoke-Api $vm 'GET' '/machine-config' | Out-Null
+        Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
+        $wall = (Get-MonotonicUs) - $t0
+        Check ($mpipe.WaitFor('utc_timestamp_ms', 10000)) "no metrics through the pipe: '$($mpipe.Text)'"
+        Check ($lpipe.WaitFor('Get request on "/machine-config"', 10000)) "no log lines through the pipe: '$($lpipe.Text)'"
+        $api = (Get-MetricsLines $mpipe.Text)[-1].api_server
+        $start = [long]$api.process_startup_time_us
+        $cpu = [long]$api.process_startup_time_cpu_us
+        $ncpu = [Environment]::ProcessorCount
+        Check ($start -gt 0 -and $start -le $wall) "process_startup_time_us $start, $wall us since --start-time-us"
+        Check ($cpu -gt $parent -and $cpu -lt $parent + $wall * $ncpu) "process_startup_time_cpu_us $cpu (parent $parent, wall $wall us, $ncpu CPUs)"
+        $done += "start time metrics $start us, $cpu CPU us (of $wall us); logger and metrics on named pipes"
+        Write-Step $done[-1]
+        # A reader that stops reading, then one that goes away: on Linux a
+        # FIFO opened O_RDWR never blocks the writer nor fails it with EPIPE.
+        # Firecracker must go on serving either way.
+        Invoke-Api $vm 'PUT' '/logger' ([ordered]@{ log_path = $stall.Path; level = 'Debug' }) | Out-Null
+        Check ($stall.WaitConnected(10000)) "Firecracker did not open the stalled pipe"
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        for ($i = 0; $i -lt 200; $i++) { Invoke-Api $vm 'GET' '/' | Out-Null }
+        $out = $vm.Sh('echo still-$((6*7))')
+        Check ($out -eq 'still-42') "the guest after 200 requests logged to a pipe nobody reads: '$out'"
+        $stalled = [int]$sw.Elapsed.TotalMilliseconds
+        $stall.Close()
+        for ($i = 0; $i -lt 50; $i++) { Invoke-Api $vm 'GET' '/' | Out-Null }
+        $out = $vm.Sh('echo after-$((6*7))')
+        Check ($out -eq 'after-42' -and -not $vm.Exited) "after the log pipe's reader went away: '$out' ($($vm.ExitReason()))"
+        Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
+        Check ($mpipe.WaitFor('"missed_log_count":[1-9]', 10000)) "logger.missed_log_count stayed 0 while nobody read the log pipe"
+        $done += "a log pipe nobody reads (200 requests in $stalled ms, lines missed and counted) or whose reader left does not stop Firecracker"
+        Write-Step $done[-1]
+        $vm.Kill()
+    } finally {
+        $mpipe.Close(); $lpipe.Close(); $stall.Close()
+    }
+
+    # (e) --boot-timer: the guest's /usr/local/bin/init (upstream's rootfs
+    # overlay) writes 123 to the boot timer device through /dev/mem, then
+    # runs /sbin/init; upstream's test_boottime boots it so. Without the
+    # flag there is no device.
+    $timer = 'Guest-boot-time =\s+(\d+) us\s+(\d+) ms,\s+(\d+) CPU us\s+(\d+) CPU ms'
+    $bootArgs = $BootArgs -replace 'init=/bin/sh', 'init=/usr/local/bin/init'
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $vm = Start-Vm 'cli-boot-timer' (Base-Config 1 256 $bootArgs) '--boot-timer'
+    $until = [DateTime]::UtcNow.AddSeconds(60)
+    $m = $null
+    while ([DateTime]::UtcNow -lt $until) {
+        $m = [regex]::Match((Get-Content -Raw $vm.LogPath) + $vm.Output, $timer)
+        if ($m.Success -or $vm.Exited) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    $wall = $sw.Elapsed.TotalMilliseconds * 1000
+    Check ($m -and $m.Success) "no Guest-boot-time line within 60 s ($($vm.ExitReason()))"
+    $us = [long]$m.Groups[1].Value; $cpuUs = [long]$m.Groups[3].Value
+    $ncpu = [Environment]::ProcessorCount
+    # Both are differences of two clock reads (boot_timer.rs, unsigned): a
+    # read that failed would leave 0 and the difference wrap to near 2^64.
+    Check ($us -gt 0 -and $us -lt $wall -and $cpuUs -gt 0 -and $cpuUs -lt $wall * $ncpu -and [long]$m.Groups[2].Value -eq [math]::Floor($us / 1000) -and [long]$m.Groups[4].Value -eq [math]::Floor($cpuUs / 1000)) "Guest-boot-time '$($m.Value)'; $([long]$wall) us since the start, $ncpu host CPUs"
+    # The guest goes on to /sbin/init.
+    $vm.WaitFor('systemd\[1\]|Welcome to', 60000, 0) | Out-Null
+    Check (-not $vm.Exited) "Firecracker after the boot timer write: $($vm.ExitReason())"
+    $vm.Kill()
+    $vm = Start-Vm 'cli-no-boot-timer' (Base-Config 1 256 $bootArgs)
+    $vm.WaitFor('Run /usr/local/bin/init as init process', 60000, 0) | Out-Null
+    $vm.WaitFor('systemd\[1\]|Welcome to', 60000, 0) | Out-Null
+    Check (-not [regex]::IsMatch((Get-Content -Raw $vm.LogPath) + $vm.Output, $timer)) 'Guest-boot-time without --boot-timer'
+    $vm.Kill()
+    $done += "--boot-timer: Guest-boot-time $us us ($cpuUs CPU us), none without it"
+    return ($done -join '; ')
+}
+
+# Copies `base` to `out`, rebases it with `diff` through `tool`
+# (rebase-snap or snapshot-editor); returns its exit code and output.
+function Invoke-Rebase([string]$tool, [string]$base, [string]$diff) {
+    if ($tool -eq 'rebase-snap') {
+        return Invoke-Exe (Find-Tool 'rebase-snap.exe') @('--base-file', $base, '--diff-file', $diff)
+    }
+    return Invoke-Exe (Find-Tool 'snapshot-editor.exe') @('edit-memory', 'rebase', '--memory-path', $base, '--diff-path', $diff)
+}
+
+# rebase-snap and snapshot-editor, the counterpart of the macOS stage: on a
+# diff file NTFS keeps holes in (sparse) and one it does not (refused, the
+# base untouched: patches/0037), both without a guest; then on a diff
+# snapshot of a 2 vCPU guest, with snapshot-editor's info-vmstate commands
+# and Firecracker's refusal of a state file of another architecture or
+# snapshot version.
+function Stage-Tools {
+    $done = @()
+    $dir = Join-Path $Scratch 'tools'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $size = 16MB
+    $base = Join-Path $dir 'synthetic-base.bin'
+    $want = Join-Path $dir 'synthetic-want.bin'
+    [Wick.Util]::WriteRandom($base, $size)
+    $data = [Wick.Util]::Random(64KB)
+    Copy-Item $base $want
+    $fs = [IO.File]::OpenWrite($want); $fs.Position = 4MB; $fs.Write($data, 0, $data.Length); $fs.Close()
+    $sparse = Join-Path $dir 'synthetic-sparse.diff'
+    $dense = Join-Path $dir 'synthetic-dense.diff'
+    [Wick.Sparse]::Write($sparse, $size, $data, 4MB, $true)
+    [Wick.Sparse]::Write($dense, $size, $data, 4MB, $false)
+    Check ([Wick.Sparse]::Is($sparse) -and -not [Wick.Sparse]::Is($dense)) 'the synthetic diff files'
+    foreach ($tool in @('rebase-snap', 'snapshot-editor')) {
+        $b = Join-Path $dir "synthetic-$tool.bin"
+        Copy-Item $base $b -Force
+        $r = Invoke-Rebase $tool $b $dense
+        Check ($r[0] -ne 0 -and $r[1] -match 'not a sparse file') "${tool}: a diff file that is not sparse: exit $($r[0]) $($r[1].Trim())"
+        $changed = [Wick.Sparse]::Differ($b, $base)
+        Check ($changed -eq 0) "${tool}: refused, yet $changed bytes of the base changed"
+        $r = Invoke-Rebase $tool $b $sparse
+        Check ($r[0] -eq 0) "${tool}: a sparse diff file: exit $($r[0]) $($r[1].Trim())"
+        $wrong = [Wick.Sparse]::Differ($b, $want)
+        Check ($wrong -eq 0) "${tool}: $wrong bytes wrong after rebasing a sparse diff"
+    }
+    $done += 'a sparse diff rebased right and one that is not refused, the base untouched, by both tools'
+    Write-Step $done[-1]
+
+    $editor = Find-Tool 'snapshot-editor.exe'
+    $cfg = Base-Config 2
+    $cfg['machine-config']['track_dirty_pages'] = $true
+    $vm = Start-Vm 'tools-1' $cfg -Api
+    Wait-Shell $vm
+    $vm.Sh('A=before-$((6*7))') | Out-Null
+    $bashMd5 = $vm.Sh('md5sum /usr/bin/bash')
+    $mem = Join-Path $dir 'base.mem'
+    $diff = Join-Path $dir 'diff.mem'
+    $state = Join-Path $dir 'diff.state'
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+    Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = (Join-Path $dir 'full.state'); mem_file_path = $mem }) | Out-Null
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Resumed' } | Out-Null
+    $vm.Sh('B=second-$((7*7)); cat /usr/bin/* > /dev/null 2>&1; true', 120000, $true) | Out-Null
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+    Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Diff'; snapshot_path = $state; mem_file_path = $diff }) | Out-Null
+    $vm.Kill()
+    # Firecracker writes a diff snapshot as a sparse file (keep_holes).
+    Check ([Wick.Sparse]::Is($diff)) "the diff snapshot Firecracker wrote is not a sparse file ($((Get-Item $diff).Attributes))"
+
+    # snapshot-editor info-vmstate: the version, the vCPU states and the
+    # whole state (info.rs).
+    $r = Invoke-Exe $editor @('info-vmstate', 'version', '--vmstate-path', $state)
+    Check ($r[0] -eq 0 -and $r[1].Trim() -eq 'v12.0.0') "info-vmstate version: $($r[0]) '$($r[1].Trim())'"
+    $r = Invoke-Exe $editor @('info-vmstate', 'vcpu-states', '--vmstate-path', $state)
+    Check ($r[0] -eq 0) "info-vmstate vcpu-states: $($r[0]) $($r[1])"
+    $parts = [regex]::Split($r[1], '(?m)^vcpu (\d+):\r?$')
+    $ids = @(); for ($i = 1; $i -lt $parts.Count; $i += 2) { $ids += $parts[$i] }
+    Check (($ids -join ',') -eq '0,1') "vcpu-states lists vCPUs $($ids -join ',')"
+    for ($i = 0; $i -lt 2; $i++) {
+        $body = $parts[2 * $i + 2]
+        # x86_64: kvm_mp_state, and the instruction pointer in kernel space.
+        $rip = [regex]::Match($body, '(?m)^\s*rip: (\d+),')
+        $ripOk = $rip.Success -and ([UInt64]::Parse($rip.Groups[1].Value) -ge [UInt64]'18446603336221196288')
+        Check ($body -match 'mp_state: 0,' -and $ripOk) "vcpu ${i}: $($body.Trim().Substring(0, [math]::Min(200, $body.Trim().Length)))"
+    }
+    $r = Invoke-Exe $editor @('info-vmstate', 'vm-state', '--vmstate-path', $state)
+    Check ($r[0] -eq 0 -and $r[1] -match 'mem_size_mib: 256' -and ([regex]::Matches($r[1], 'kvm_mp_state \{')).Count -eq 2 -and $r[1] -match 'device_states:') "info-vmstate vm-state: $($r[0]) $($r[1].Substring(0, [math]::Min(300, $r[1].Length)))"
+    $r = Invoke-Exe $editor @('info-vmstate', 'version', '--vmstate-path', $Kernel)
+    Check ($r[0] -ne 0) "info-vmstate version of a kernel image: $($r[0]) $($r[1])"
+    $done += 'info-vmstate version v12.0.0, vcpu-states (2 vCPUs, mp_state, RIP), vm-state; a non-snapshot refused'
+    Write-Step $done[-1]
+
+    # rebase-snap (deprecated for snapshot-editor edit-memory rebase): the
+    # diff's data written over the base; both tools give the same file.
+    $other = Join-Path $dir 'base2.mem'
+    Copy-Item $mem $other
+    $r = Invoke-Rebase 'rebase-snap' $mem $diff
+    Check ($r[0] -eq 0) "rebase-snap: $($r[0]) $($r[1].Trim())"
+    $r = Invoke-Rebase 'snapshot-editor' $other $diff
+    Check ($r[0] -eq 0) "snapshot-editor rebase: $($r[0]) $($r[1].Trim())"
+    Check ([Wick.Util]::Md5File($mem, -1) -eq [Wick.Util]::Md5File($other, -1)) 'rebase-snap and snapshot-editor rebase give different memory files'
+    Remove-Item $other
+    $vm = Start-Vm 'tools-2' $null -Api
+    Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
+        snapshot_path = $state
+        mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = $mem }
+        resume_vm     = $true
+    }) | Out-Null
+    Test-Restored $vm $bashMd5 $null
+    $out = $vm.Sh('echo $A $B')
+    Check ($out -eq 'before-42 second-49') "after a rebase-snap restore: '$out'"
+    Save-Dmesg $vm 'tools-2'
+    $vm.Reboot()
+    $done += 'rebase-snap equals snapshot-editor rebase and restores'
+    Write-Step $done[-1]
+
+    # The state file with another architecture's magic, then with a newer
+    # snapshot version: refused at the load (snapshot/mod.rs), and
+    # Firecracker ends, as after any failed load. The header is the first
+    # thing bitcode writes: a byte, the magic (8 bytes, little-endian), then
+    # the version as a length and its text.
+    $bytes = [IO.File]::ReadAllBytes($state)
+    $x86 = [BitConverter]::GetBytes([UInt64]'0x0710198486640000')
+    for ($i = 0; $i -lt 8; $i++) { Check ($bytes[1 + $i] -eq $x86[$i]) "the x86_64 magic is not at offset 1 of $state" }
+    Check ([Text.Encoding]::ASCII.GetString($bytes, 10, 6) -eq '12.0.0') "the version is not at offset 10 of $state"
+    $arm = [byte[]]$bytes.Clone()
+    [Array]::Copy([BitConverter]::GetBytes([UInt64]'0x07101984AAAA0000'), 0, $arm, 1, 8)
+    $newer = [byte[]]$bytes.Clone()
+    $newer[10] = [byte][char]'9'; $newer[11] = [byte][char]'9'
+    foreach ($case in @(@('aarch64 magic', $arm, 'Magic value does not match arch'), @('version 99.0.0', $newer, 'Invalid data version'))) {
+        $f = Join-Path $dir 'patched.state'
+        [IO.File]::WriteAllBytes($f, $case[1])
+        $vm = Start-Vm "tools-$($case[0] -replace '\W', '')" $null -Api
+        $status = 0
+        $body = [ordered]@{ snapshot_path = $f; mem_backend = [ordered]@{ backend_type = 'File'; backend_path = $mem } } | ConvertTo-Json -Compress
+        $out = [Wick.Api]::Call($vm.ApiSock, 'PUT', '/snapshot/load', $body, 30000, [ref]$status)
+        Check ($status -eq 400 -and $out.Contains($case[2])) "a state file with $($case[0]): $status $out"
+        $until = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+        Check $vm.Exited "Firecracker went on after a failed load ($($case[0]))"
+    }
+    $done += 'a state file with the aarch64 magic or a newer version refused at the load'
+    return ($done -join '; ')
+}
+
+# A snapshot state file made on another host (-ForeignState; the macOS
+# boot test's snapshot stage makes an aarch64 one): refused at the load
+# with upstream's error, and Firecracker ends, as after any failed load.
+# The same upstream decoding as on Linux; needs no guest.
+function Stage-ForeignSnapshot {
+    Check ($ForeignState -and (Test-Path $ForeignState)) 'pass -ForeignState <a snapshot state file made on another host, e.g. by tools/macos/boot-test.py snapshot>'
+    $vm = Start-Vm 'foreign-snapshot' $null -Api
+    $status = 0
+    $body = [ordered]@{ snapshot_path = (Resolve-Path $ForeignState).Path; mem_backend = [ordered]@{ backend_type = 'File'; backend_path = (Join-Path $Scratch 'none.mem') } } | ConvertTo-Json -Compress
+    $out = [Wick.Api]::Call($vm.ApiSock, 'PUT', '/snapshot/load', $body, 30000, [ref]$status)
+    Check ($status -eq 400 -and $out -match 'Failed to load snapshot state from file') "PUT /snapshot/load of $ForeignState`: $status $out"
+    $until = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+    Check $vm.Exited 'Firecracker went on after a failed load'
+    $why = ([regex]::Match($out, 'Failed to load snapshot state from file: ([^"]*)')).Groups[1].Value
+    $r = Invoke-Exe (Find-Tool 'snapshot-editor.exe') @('info-vmstate', 'version', '--vmstate-path', $ForeignState)
+    Check ($r[0] -ne 0) "snapshot-editor info-vmstate version of it: $($r[0]) $($r[1])"
+    return "refused at the load ($why), Firecracker exits; snapshot-editor refuses it too"
+}
+
+# --no-seccomp turns the mitigation profile off, in Firecracker and in its
+# API process, and without it the profile is on (vmm::ext::sandbox).
+# Needs no guest: an API session reaches the sandbox's setup phase (the
+# run phase begins at InstanceStart).
+function Stage-NoSeccomp {
+    $setup = @{ ExtensionPoint = 1; Signature = 1; StrictHandle = 3; Win32k = 1; ChildProcess = 1 }
+    $all = @{ ExtensionPoint = 1; ImageLoad = 7; Signature = 1; StrictHandle = 3; Win32k = 1; DynamicCode = 1; ChildProcess = 1 }
+    $seen = @()
+    foreach ($off in @($false, $true)) {
+        $name = if ($off) { 'no-seccomp-off' } else { 'no-seccomp-on' }
+        $vm = Start-Vm $name $null $(if ($off) { '--no-seccomp' } else { '' }) -Api
+        # An answer from Firecracker's API thread: its sandbox is installed by then.
+        Invoke-Api $vm 'PUT' '/machine-config' ([ordered]@{ vcpu_count = 1; mem_size_mib = 128 }) | Out-Null
+        $fcM = [Wick.Mitigation]::Of($vm.Pid)
+        $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($vm.Pid)" | Where-Object { $_.Name -eq 'firecracker.exe' })
+        Check ($kids.Count -eq 1) "${name}: Firecracker's child processes from its binary: $($kids.Count)"
+        $apiM = [Wick.Mitigation]::Of([int]$kids[0].ProcessId)
+        if ($off) {
+            $on = @($all.Keys | Where-Object { ($fcM[$_] -band $all[$_]) -ne 0 })
+            Check ($on.Count -eq 0) "--no-seccomp: in force in Firecracker: $($on -join ', ')"
+            $on = @($all.Keys | Where-Object { ($apiM[$_] -band $all[$_]) -ne 0 })
+            Check ($on.Count -eq 0) "--no-seccomp: in force in the API process: $($on -join ', ')"
+        } else {
+            $missing = @($setup.Keys | Where-Object { ($fcM[$_] -band $setup[$_]) -ne $setup[$_] })
+            Check ($missing.Count -eq 0) "without --no-seccomp: not in force in Firecracker: $($missing -join ', ')"
+            $missing = @($all.Keys | Where-Object { ($apiM[$_] -band $all[$_]) -ne $all[$_] })
+            Check ($missing.Count -eq 0) "without --no-seccomp: not in force in the API process: $($missing -join ', ')"
+        }
+        $info = Invoke-Api $vm 'GET' '/'
+        Check ($info -match '"state":"Not started"') "${name}: instance information: $info"
+        $vm.Kill()
+    }
+    return 'without --no-seccomp the setup-phase mitigations in Firecracker and the whole profile in its API process; with it none in either'
+}
+
 $Stages = [ordered]@{
     boot     = { Stage-Boot }
     smp      = { Stage-Smp }
@@ -1912,6 +2425,10 @@ $Stages = [ordered]@{
     'api-process' = { Stage-ApiProcess }
     devices  = { Stage-Devices }
     balloon  = { Stage-Balloon }
+    cli      = { Stage-Cli }
+    tools    = { Stage-Tools }
+    'no-seccomp' = { Stage-NoSeccomp }
+    'foreign-snapshot' = { Stage-ForeignSnapshot }
 }
 
 # --- run ------------------------------------------------------------------------
@@ -1923,6 +2440,18 @@ if ($SelfTest) {
         switch = { [Wick.SelfTest]::SwitchTest($dir) }
         vsock  = { [Wick.SelfTest]::VsockTest($dir) }
         api    = { [Wick.SelfTest]::ApiTest($dir) }
+        pipe   = { [Wick.PipeSelfTest]::Run() }
+        sparse = {
+            # The synthetic diff files of the tools stage.
+            $data = [Wick.Util]::Random(64KB)
+            $s = Join-Path $dir 'sparse.bin'; $d = Join-Path $dir 'dense.bin'
+            [Wick.Sparse]::Write($s, 16MB, $data, 4MB, $true)
+            [Wick.Sparse]::Write($d, 16MB, $data, 4MB, $false)
+            Check ([Wick.Sparse]::Is($s) -and -not [Wick.Sparse]::Is($d)) 'sparse attribute'
+            Check ([Wick.Util]::Allocated($s) -lt 1MB -and [Wick.Util]::Allocated($d) -ge 16MB) "allocated: $([Wick.Util]::Allocated($s)), $([Wick.Util]::Allocated($d))"
+            Check ([Wick.Sparse]::Differ($s, $d) -eq 0) 'the two read differently'
+            return 'Sparse: a sparse and a dense file with the same content'
+        }
         shell  = {
             # The serial-console protocol, against a POSIX shell on a pipe.
             $sh = @("$env:ProgramFiles\Git\bin\sh.exe", "$env:ProgramFiles\Git\usr\bin\sh.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
