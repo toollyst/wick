@@ -136,6 +136,12 @@ impl VmInner {
             .map(|s| s.host + (gpa - s.guest_phys))
     }
 
+    /// The slot table, for what the backend writes into guest RAM as KVM
+    /// does (`pvclock`, `guest_mem`).
+    pub(crate) fn ram(&self) -> &super::pvclock::Ram {
+        &self.memory
+    }
+
     /// Writes `data` into guest RAM at `gpa` as KVM's `kvm_write_guest`
     /// does ([`guest_mem::write`]): false (`-EFAULT`) at a page no slot maps
     /// or a read-only one. The slot table stays locked for the copy, so a

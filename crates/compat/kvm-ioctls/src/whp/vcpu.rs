@@ -547,11 +547,11 @@ impl VcpuFd {
                 self.shared.system_time_msr.store(value, Ordering::Release);
                 let generation = inner.pvclock.lock().unwrap().generation;
                 self.shared.clock_gen.store(generation, Ordering::Release);
-                pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, |gpa| inner.host_addr(gpa), now);
+                pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, inner.ram(), now);
                 true
             }
             pvclock::MSR_WALL_CLOCK => {
-                pvclock::wall_clock(&inner.pvclock, value, |gpa| inner.host_addr(gpa), now());
+                pvclock::wall_clock(&inner.pvclock, value, inner.ram(), now());
                 true
             }
             _ => false,
@@ -596,7 +596,7 @@ impl VcpuFd {
     pub fn kvmclock_ctrl(&self) -> Result<()> {
         let value = self.shared.system_time_msr.load(Ordering::Acquire);
         let inner = &self.shared.inner;
-        if pvclock::set_guest_stopped(value, |gpa| inner.host_addr(gpa)) {
+        if pvclock::set_guest_stopped(value, inner.ram()) {
             Ok(())
         } else {
             err(libc::EINVAL)
@@ -716,7 +716,7 @@ impl VcpuFd {
         }
         let value = self.shared.system_time_msr.load(Ordering::Acquire);
         let now = || inner.irqchip.lock().unwrap().clock().clock;
-        pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, |gpa| inner.host_addr(gpa), now);
+        pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, inner.ram(), now);
     }
 
     /// Raises the interrupt of a TSC-deadline timer that fired since the

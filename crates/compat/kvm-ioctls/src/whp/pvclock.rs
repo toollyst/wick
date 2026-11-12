@@ -33,10 +33,23 @@
 //! KVM fills with the host's), the clock being the guest's kvm-clock at that
 //! TSC, and `set_clock` makes that pair the reference: the restored guest's
 //! kvm-clock goes on from its TSC exactly as it did before the snapshot.
+//!
+//! The guest names where both structures go, so they are written as KVM
+//! writes them (arch/x86/kvm/x86.c): the wall clock through
+//! `kvm_read_guest`/`kvm_write_guest` ([`guest_mem`]: page by page, a page
+//! no slot maps or a read-only one stops it, written pages dirty), the time
+//! info in place through a `gfn_to_pfn_cache`, which takes it only within
+//! one page of a writable slot ([`guest_mem::with_page`]). Neither address
+//! is aligned by KVM, so neither is assumed aligned here.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
+use super::guest_mem::{self, Slot};
 use super::{ffi, whv};
+
+/// The VM's guest RAM slots, which the structures are written into.
+pub(crate) type Ram = Mutex<HashMap<u32, Slot>>;
 
 /// `MSR_KVM_WALL_CLOCK_NEW`.
 pub(crate) const MSR_WALL_CLOCK: u32 = 0x4b56_4d00;
@@ -145,48 +158,82 @@ impl State {
     }
 }
 
-/// `struct pvclock_vcpu_time_info`.
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+/// `struct pvclock_vcpu_time_info` (32 bytes, little-endian, packed as the
+/// guest lays it out).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct VcpuTimeInfo {
     version: u32,
-    pad0: u32,
     tsc_timestamp: u64,
     system_time: u64,
     tsc_to_system_mul: u32,
     tsc_shift: i8,
     flags: u8,
-    pad: [u8; 2],
 }
 
-/// `struct pvclock_wall_clock`.
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
-struct WallClock {
-    version: u32,
-    sec: u32,
-    nsec: u32,
-}
+/// The size of `struct pvclock_vcpu_time_info`.
+const TIME_INFO_LEN: usize = 32;
 
-/// Writes `value` at host address `at` the way KVM updates a pvclock
-/// structure: the version odd while the fields change, then even.
-///
-/// # Safety
-/// `at` must be valid for writes of a `T` whose first field is the version.
-unsafe fn publish<T: Copy>(at: *mut T, value: T) {
-    let version = at.cast::<u32>();
-    // SAFETY: the caller's contract.
-    unsafe {
-        let v = core::ptr::read_volatile(version);
-        core::ptr::write_volatile(version, v.wrapping_add(1) | 1);
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        let mut copy = value;
-        // Keep the odd version while the rest is written.
-        *(&raw mut copy).cast::<u32>() = v.wrapping_add(1) | 1;
-        core::ptr::write_volatile(at, copy);
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        core::ptr::write_volatile(version, (v.wrapping_add(1) | 1).wrapping_add(1));
+impl VcpuTimeInfo {
+    fn to_bytes(self) -> [u8; TIME_INFO_LEN] {
+        let mut b = [0u8; TIME_INFO_LEN];
+        b[0..4].copy_from_slice(&self.version.to_le_bytes());
+        b[8..16].copy_from_slice(&self.tsc_timestamp.to_le_bytes());
+        b[16..24].copy_from_slice(&self.system_time.to_le_bytes());
+        b[24..28].copy_from_slice(&self.tsc_to_system_mul.to_le_bytes());
+        b[28] = self.tsc_shift.to_le_bytes()[0];
+        b[29] = self.flags;
+        b
     }
+
+    fn from_bytes(b: &[u8; TIME_INFO_LEN]) -> Self {
+        let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        VcpuTimeInfo {
+            version: u32_at(0),
+            tsc_timestamp: u64_at(8),
+            system_time: u64_at(16),
+            tsc_to_system_mul: u32_at(24),
+            tsc_shift: i8::from_le_bytes([b[28]]),
+            flags: b[29],
+        }
+    }
+}
+
+/// The time info at `gpa` updated in place as KVM's
+/// `kvm_setup_guest_pvclock` does: its version made odd (`(version + 1) |
+/// 1`), the fields `update` gives from what the guest holds, then the
+/// version made even; KVM keeps a `PVCLOCK_GUEST_STOPPED` the guest has not
+/// cleared yet, and so does this. Nothing is written, and false returned,
+/// where KVM's cache takes no time info ([`guest_mem::with_page`]: across a
+/// page, a read-only slot, no slot). Bytes, volatile: the guest's address
+/// need not be aligned, and the guest reads it while it changes.
+fn update_time_info(ram: &Ram, gpa: u64, update: impl FnOnce(VcpuTimeInfo) -> VcpuTimeInfo) -> bool {
+    use core::sync::atomic::{Ordering, fence};
+    guest_mem::with_page(&mut ram.lock().unwrap(), gpa, TIME_INFO_LEN, |at| {
+        // SAFETY: `with_page` gives the host address of 32 bytes of guest
+        // RAM within one page of a slot that stays mapped while the slot
+        // table is locked (it is, for this call); arrays of bytes have no
+        // alignment.
+        unsafe {
+            let old = VcpuTimeInfo::from_bytes(&core::ptr::read_volatile(at.cast::<[u8; TIME_INFO_LEN]>()));
+            let odd = old.version.wrapping_add(1) | 1;
+            core::ptr::write_volatile(at.cast::<[u8; 4]>(), odd.to_le_bytes());
+            fence(Ordering::SeqCst);
+            let mut new = update(old);
+            new.flags |= old.flags & PVCLOCK_GUEST_STOPPED;
+            new.version = odd;
+            core::ptr::write_volatile(at.cast::<[u8; TIME_INFO_LEN]>(), new.to_bytes());
+            fence(Ordering::SeqCst);
+            core::ptr::write_volatile(at.cast::<[u8; 4]>(), odd.wrapping_add(1).to_le_bytes());
+        }
+    })
+}
+
+/// The time info address in a `MSR_KVM_SYSTEM_TIME_NEW` value: KVM's
+/// `system_time & ~1ULL` (kvm_write_system_time), the enable bit off and
+/// nothing aligned.
+fn time_info_gpa(value: u64) -> u64 {
+    value & !1
 }
 
 /// Handles a guest write of `MSR_KVM_SYSTEM_TIME_NEW` on vCPU `vp`: fills the
@@ -198,14 +245,12 @@ pub(crate) fn system_time(
     part: whv::WHV_PARTITION_HANDLE,
     vp: u32,
     value: u64,
-    host: impl Fn(u64) -> Option<u64>,
+    ram: &Ram,
     now_ns: impl Fn() -> u64,
 ) {
     if value & 1 == 0 {
         return;
     }
-    let gpa = value & !0x1f;
-    let Some(at) = host(gpa) else { return };
     let hz = tsc_hz();
     if hz == 0 {
         return;
@@ -228,9 +273,8 @@ pub(crate) fn system_time(
         flags: PVCLOCK_TSC_STABLE,
         ..VcpuTimeInfo::default()
     };
-    // SAFETY: guest RAM the guest gave for its time info (32 bytes, 32-byte
-    // aligned, so within one page).
-    unsafe { publish(at as *mut VcpuTimeInfo, info) };
+    // Where KVM's cache takes no time info, the guest gets none, as on KVM.
+    update_time_info(ram, time_info_gpa(value), |_| info);
 }
 
 /// `PVCLOCK_GUEST_STOPPED`: the vCPU was stopped by the host.
@@ -240,40 +284,65 @@ pub(crate) const PVCLOCK_GUEST_STOPPED: u8 = 1 << 1;
 /// `value`: sets `PVCLOCK_GUEST_STOPPED` in its time info, which the guest's
 /// lockup watchdogs read (and clear) after a pause, so that the time the VM
 /// was paused is not taken for a soft lockup. False when the vCPU has no
-/// kvm-clock, which KVM answers with `EINVAL`.
-pub(crate) fn set_guest_stopped(value: u64, host: impl Fn(u64) -> Option<u64>) -> bool {
+/// kvm-clock (the MSR's enable bit off), which KVM answers with `EINVAL`;
+/// with it on, KVM takes the request (`pvclock_set_guest_stopped_request`)
+/// whether or not its cache could take the time info, which then gets
+/// nothing, and so does this.
+pub(crate) fn set_guest_stopped(value: u64, ram: &Ram) -> bool {
     if value & 1 == 0 {
         return false;
     }
-    let Some(at) = host(value & !0x1f) else { return false };
-    let at = at as *mut VcpuTimeInfo;
-    // SAFETY: guest RAM the guest gave for its time info (see system_time).
-    unsafe {
-        let mut info = core::ptr::read_volatile(at);
+    update_time_info(ram, time_info_gpa(value), |mut info| {
         info.flags |= PVCLOCK_GUEST_STOPPED;
-        publish(at, info);
-    }
+        info
+    });
     true
 }
 
-/// Handles a guest write of `MSR_KVM_WALL_CLOCK_NEW`: fills the
-/// `pvclock_wall_clock` at the guest physical address `value` with the wall
-/// time at which the VM clock was 0.
-pub(crate) fn wall_clock(state: &Mutex<State>, value: u64, host: impl Fn(u64) -> Option<u64>, now_ns: u64) {
+/// Handles a write of `MSR_KVM_WALL_CLOCK_NEW` (by the guest or a restore):
+/// fills the `pvclock_wall_clock` at the guest physical address `value` with
+/// the wall time at which the VM clock was 0.
+pub(crate) fn wall_clock(state: &Mutex<State>, value: u64, ram: &Ram, now_ns: u64) {
     state.lock().unwrap().wall_msr = value;
-    let Some(at) = host(value) else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let boot = now.saturating_sub(std::time::Duration::from_nanos(now_ns));
+    write_wall_clock(ram, value, boot);
+}
+
+/// KVM's `kvm_write_wall_clock`, step by step: nothing for address 0; the
+/// version read (if that fails, nothing is written); an odd one is the
+/// guest's junk and made even; the version advanced and written (if that
+/// fails, nothing more), then version, seconds and nanoseconds, then the
+/// version advanced again. Each through `kvm_read_guest`/`kvm_write_guest`
+/// ([`guest_mem`]), the slot table locked throughout.
+fn write_wall_clock(ram: &Ram, gpa: u64, epoch: std::time::Duration) {
+    if gpa == 0 {
+        return;
+    }
+    let mut slots = ram.lock().unwrap();
+    let mut v = [0u8; 4];
+    if !guest_mem::read(&mut slots, gpa, &mut v) {
+        return;
+    }
+    let mut version = u32::from_le_bytes(v);
+    if version & 1 != 0 {
+        version = version.wrapping_add(1);
+    }
+    version = version.wrapping_add(1);
+    if !guest_mem::write(&mut slots, gpa, &version.to_le_bytes()) {
+        return;
+    }
+    let mut wc = [0u8; 12];
+    wc[0..4].copy_from_slice(&version.to_le_bytes());
+    // KVM's `(u32)wall_nsec`: the seconds wrap in 2106.
     #[allow(clippy::cast_possible_truncation)]
-    let wc = WallClock {
-        version: 0,
-        sec: boot.as_secs() as u32,
-        nsec: boot.subsec_nanos(),
-    };
-    // SAFETY: guest RAM the guest gave for its wall clock (12 bytes).
-    unsafe { publish(at as *mut WallClock, wc) };
+    wc[4..8].copy_from_slice(&(epoch.as_secs() as u32).to_le_bytes());
+    wc[8..12].copy_from_slice(&epoch.subsec_nanos().to_le_bytes());
+    guest_mem::write(&mut slots, gpa, &wc);
+    version = version.wrapping_add(1);
+    guest_mem::write(&mut slots, gpa, &version.to_le_bytes());
 }
 
 #[cfg(test)]
@@ -324,27 +393,129 @@ mod tests {
         assert_eq!(state.clock_at(10 * hz), None);
     }
 
-    #[test]
-    fn test_guest_stopped_is_published() {
-        let mut info = VcpuTimeInfo { version: 4, flags: PVCLOCK_TSC_STABLE, system_time: 7, ..Default::default() };
-        let at = &raw mut info as u64;
-        // The MSR's enable bit, the struct at "guest address" 0x1000.
-        assert!(!set_guest_stopped(0x1000, |_| Some(at)), "kvm-clock off");
-        assert!(set_guest_stopped(0x1001, |gpa| (gpa == 0x1000).then_some(at)));
-        assert_eq!(info.flags, PVCLOCK_TSC_STABLE | PVCLOCK_GUEST_STOPPED);
-        assert_eq!(info.system_time, 7, "the rest as it was");
-        assert_eq!(info.version, 6, "an update: even, advanced");
+    const PAGE: u64 = guest_mem::PAGE;
+
+    /// Guest RAM of two one-page slots over `mem`: 0x10000 (writable) and
+    /// 0x11000 (read-only if `readonly1`), with dirty logging.
+    fn ram(mem: &mut [u8], readonly1: bool) -> Ram {
+        let host = mem.as_mut_ptr() as u64;
+        let mut t = HashMap::new();
+        t.insert(0, Slot::new(0x10000, PAGE, host, false, true));
+        t.insert(1, Slot::new(0x10000 + PAGE, PAGE, host + PAGE, readonly1, true));
+        Mutex::new(t)
+    }
+
+    fn info_at(mem: &[u8], off: usize) -> VcpuTimeInfo {
+        VcpuTimeInfo::from_bytes(mem[off..off + TIME_INFO_LEN].try_into().unwrap())
     }
 
     #[test]
-    fn test_publish_versions() {
-        let mut info = VcpuTimeInfo::default();
-        // SAFETY: a local structure.
-        unsafe { publish(&raw mut info, VcpuTimeInfo { system_time: 5, ..VcpuTimeInfo::default() }) };
-        assert_eq!(info.version, 2);
-        assert_eq!(info.system_time, 5);
-        // SAFETY: as above.
-        unsafe { publish(&raw mut info, VcpuTimeInfo { system_time: 6, ..VcpuTimeInfo::default() }) };
-        assert_eq!(info.version, 4);
+    fn test_time_info_layout() {
+        let info = VcpuTimeInfo {
+            version: 3,
+            tsc_timestamp: 0x1122_3344_5566_7788,
+            system_time: 9,
+            tsc_to_system_mul: 0xdead_beef,
+            tsc_shift: -2,
+            flags: 5,
+        };
+        let b = info.to_bytes();
+        // struct pvclock_vcpu_time_info: version, pad0, tsc_timestamp,
+        // system_time, tsc_to_system_mul, tsc_shift, flags, pad[2].
+        assert_eq!(&b[0..4], &[3, 0, 0, 0]);
+        assert_eq!(&b[8..16], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!((b[28], b[29]), (0xfe, 5));
+        assert_eq!(VcpuTimeInfo::from_bytes(&b), info);
+    }
+
+    // The time info at the address the guest gives, aligned or not (KVM:
+    // `& ~1`), updated with the version odd then even, a GUEST_STOPPED the
+    // guest has not cleared kept, the page dirty.
+    #[test]
+    fn test_time_info_is_updated_in_place_at_any_address() {
+        let mut mem = vec![0u8; 2 * PAGE as usize];
+        let r = ram(&mut mem, false);
+        let value = 0x10000 + 0x46 + 1; // not 32-byte aligned; the enable bit
+        assert_eq!(time_info_gpa(value), 0x10046);
+        let fresh = VcpuTimeInfo { system_time: 5, flags: PVCLOCK_TSC_STABLE, ..Default::default() };
+        assert!(update_time_info(&r, time_info_gpa(value), |_| fresh));
+        let got = info_at(&mem, 0x46);
+        assert_eq!((got.version, got.system_time, got.flags), (2, 5, PVCLOCK_TSC_STABLE));
+        assert!(mem[..0x46].iter().all(|&b| b == 0) && mem[0x46 + 32..].iter().all(|&b| b == 0));
+        // KVM_KVMCLOCK_CTRL: the flag set, the rest as it was.
+        assert!(set_guest_stopped(value, &r));
+        let got = info_at(&mem, 0x46);
+        assert_eq!((got.version, got.system_time, got.flags), (4, 5, PVCLOCK_TSC_STABLE | PVCLOCK_GUEST_STOPPED));
+        // The next update keeps the flag the guest has not cleared.
+        assert!(update_time_info(&r, 0x10046, |_| fresh));
+        assert_eq!(info_at(&mem, 0x46).flags, PVCLOCK_TSC_STABLE | PVCLOCK_GUEST_STOPPED);
+        assert_eq!(info_at(&mem, 0x46).version, 6);
+        let mut log = [0u64; 1];
+        r.lock().unwrap().get_mut(&0).unwrap().take_host_dirty(&mut log);
+        assert_eq!(log[0], 1);
+        // With the enable bit off, KVM_KVMCLOCK_CTRL is EINVAL.
+        assert!(!set_guest_stopped(value & !1, &r));
+    }
+
+    // Where KVM's cache takes no time info, nothing is written: across a
+    // page (here into the next, writable, slot), in a read-only slot, where
+    // no slot is. KVM_KVMCLOCK_CTRL still succeeds with the enable bit on.
+    #[test]
+    fn test_time_info_is_not_written_where_kvm_takes_none() {
+        let mut mem = vec![0u8; 2 * PAGE as usize];
+        let r = ram(&mut mem, false);
+        let info = VcpuTimeInfo { system_time: 5, ..Default::default() };
+        assert!(!update_time_info(&r, 0x10000 + PAGE - 16, |_| info));
+        let mut mem2 = vec![0u8; 2 * PAGE as usize];
+        let r2 = ram(&mut mem2, true);
+        assert!(!update_time_info(&r2, 0x10000 + PAGE + 64, |_| info));
+        assert!(!update_time_info(&r2, 0x10000 + 2 * PAGE, |_| info));
+        assert!(set_guest_stopped(0x10000 + 2 * PAGE + 1, &r2));
+        assert!(mem.iter().all(|&b| b == 0) && mem2.iter().all(|&b| b == 0));
+    }
+
+    // kvm_write_wall_clock's steps: an even version advanced to odd, the
+    // fields, then even; an odd (junk) one made even first; at an address
+    // across two slots, written page by page.
+    #[test]
+    fn test_wall_clock_as_kvm_writes_it() {
+        let mut mem = vec![0u8; 2 * PAGE as usize];
+        let r = ram(&mut mem, false);
+        let epoch = std::time::Duration::new(1_700_000_000, 123);
+        let wc = |mem: &[u8], off: usize| {
+            let u = |i: usize| u32::from_le_bytes(mem[off + i..off + i + 4].try_into().unwrap());
+            (u(0), u(4), u(8))
+        };
+        mem[0x102..0x106].copy_from_slice(&4u32.to_le_bytes());
+        write_wall_clock(&r, 0x10102, epoch);
+        assert_eq!(wc(&mem, 0x102), (6, 1_700_000_000, 123));
+        mem[0x102..0x106].copy_from_slice(&7u32.to_le_bytes());
+        write_wall_clock(&r, 0x10102, epoch);
+        assert_eq!(wc(&mem, 0x102), (10, 1_700_000_000, 123));
+        // Across the two slots' boundary.
+        let off = PAGE as usize - 6;
+        write_wall_clock(&r, 0x10000 + off as u64, epoch);
+        assert_eq!(wc(&mem, off), (2, 1_700_000_000, 123));
+        let mut log = [0u64; 1];
+        r.lock().unwrap().get_mut(&1).unwrap().take_host_dirty(&mut log);
+        assert_eq!(log[0], 1);
+    }
+
+    // Where kvm_write_wall_clock stops: no address; a version it cannot
+    // read (no slot); a version it cannot write (a read-only slot): nothing
+    // written. Into a read-only slot from a writable one before it: the
+    // version's first bytes (in the writable page) only, as KVM's
+    // kvm_write_guest writes the pages before the one it refuses.
+    #[test]
+    fn test_wall_clock_where_kvm_writes_nothing() {
+        let mut mem = vec![0u8; 2 * PAGE as usize];
+        let r = ram(&mut mem, true);
+        let epoch = std::time::Duration::new(1_700_000_000, 123);
+        write_wall_clock(&r, 0, epoch);
+        write_wall_clock(&r, 0x10000 + 2 * PAGE, epoch);
+        write_wall_clock(&r, 0x10000 + PAGE + 8, epoch);
+        assert!(mem.iter().all(|&b| b == 0));
+        write_wall_clock(&r, 0x10000 + PAGE - 2, epoch);
+        assert_eq!(&mem[PAGE as usize - 2..PAGE as usize + 10], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
 }

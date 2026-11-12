@@ -48,6 +48,15 @@ impl Slot {
         gpa >= self.guest_phys && gpa - self.guest_phys < self.size
     }
 
+    /// Marks the page at `off` in the slot as written by the backend, for
+    /// the next dirty log (`mark_page_dirty_in_slot`), when it is logged.
+    fn mark_dirty(&mut self, off: u64) {
+        if self.log_dirty {
+            let page = usize::try_from(off / PAGE).unwrap();
+            self.host_dirty[page / 64] |= 1 << (page % 64);
+        }
+    }
+
     /// Takes the pages the backend wrote into `bitmap` (the dirty log of
     /// this slot, one bit per page) and clears them.
     pub(crate) fn take_host_dirty(&mut self, bitmap: &mut [u64]) {
@@ -96,16 +105,31 @@ pub(crate) fn write(slots: &mut HashMap<u32, Slot>, gpa: u64, data: &[u8]) -> bo
         // host memory the slot's owner keeps mapped while it is registered;
         // the slot table is locked by the caller for the copy.
         unsafe { std::ptr::copy_nonoverlapping(data[from..].as_ptr(), (slot.host + off) as *mut u8, seg) };
-        if slot.log_dirty {
-            let page = usize::try_from(off / PAGE).unwrap();
-            slot.host_dirty[page / 64] |= 1 << (page % 64);
-        }
+        slot.mark_dirty(off);
     })
 }
 
-// Read by the tests only until kvm-clock's wall clock reads its version
-// through it.
-#[allow(dead_code)]
+/// KVM's `gfn_to_pfn_cache`, through which it updates kvm-clock's time info
+/// in place (virt/kvm/pfncache.c): the `len` bytes at `gpa` must lie in one
+/// page (`kvm_gpc_check`: `offset + len <= PAGE_SIZE`) of a slot that may be
+/// written (`gfn_to_hva_many` refuses a read-only one). `f` gets their host
+/// address, with the slot table locked by the caller, and the page is then
+/// marked dirty (`kvm_gpc_mark_dirty_in_slot`). False, and `f` not called,
+/// otherwise: KVM then publishes nothing.
+pub(crate) fn with_page(slots: &mut HashMap<u32, Slot>, gpa: u64, len: usize, f: impl FnOnce(*mut u8)) -> bool {
+    if len == 0 || gpa % PAGE + len as u64 > PAGE {
+        return false;
+    }
+    let mut f = Some(f);
+    segments(slots, gpa, len, true, |slot, at, _, _| {
+        let off = at - slot.guest_phys;
+        if let Some(f) = f.take() {
+            f((slot.host + off) as *mut u8);
+        }
+        slot.mark_dirty(off);
+    })
+}
+
 /// KVM's `kvm_read_guest`: reads `buf.len()` bytes at `gpa`; false (KVM's
 /// `-EFAULT`) at the first page that no slot maps.
 pub(crate) fn read(slots: &mut HashMap<u32, Slot>, gpa: u64, buf: &mut [u8]) -> bool {
@@ -219,5 +243,31 @@ mod tests {
         let mut t = table(&mut mem, 1, 0, false, false);
         assert!(write(&mut t, 0x10000, &[1; 8]));
         assert!(t[&0].host_dirty.is_empty());
+    }
+
+    // The in-place access kvm-clock's time info takes: within one page of a
+    // writable slot, at any address (KVM aligns nothing), the page then
+    // dirty; across a page, in a read-only slot or where no slot is: refused
+    // with nothing called.
+    #[test]
+    fn test_in_place_access_is_one_writable_page() {
+        let mut mem = vec![0u8; 2 * PAGE as usize];
+        let mut t = table(&mut mem, 1, 0, true, true);
+        let host = mem.as_ptr() as u64;
+        let mut got = None;
+        assert!(with_page(&mut t, 0x10000 + 3, 32, |p| got = Some(p as u64)));
+        assert_eq!(got, Some(host + 3));
+        let mut log = [0u64; 1];
+        t.get_mut(&0).unwrap().take_host_dirty(&mut log);
+        assert_eq!(log[0], 1);
+        // The last 32 bytes of a page, and one byte more.
+        assert!(with_page(&mut t, 0x10000 + PAGE - 32, 32, |_| {}));
+        let mut called = false;
+        assert!(!with_page(&mut t, 0x10000 + PAGE - 31, 32, |_| called = true));
+        // The read-only slot, no slot, nothing.
+        assert!(!with_page(&mut t, 0x10000 + PAGE, 32, |_| called = true));
+        assert!(!with_page(&mut t, 0x10000 + 2 * PAGE, 32, |_| called = true));
+        assert!(!with_page(&mut t, 0x10000, 0, |_| called = true));
+        assert!(!called);
     }
 }
