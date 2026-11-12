@@ -375,15 +375,21 @@ class _RegionPathInfo(ctypes.Structure):
 
 
 class _MemoryMap:
-    """What psutil's memory_maps(grouped=False) gives on Linux, for one mapping."""
+    """What psutil's memory_maps(grouped=False) gives on Linux, for one
+    mapping. `rss` is `present` + `swapped` (memory_maps says why); the two
+    parts are kept apart for the logs."""
 
-    def __init__(self, path, addr, size, rss):
-        self.path, self.addr, self.size, self.rss = path, addr, size, rss
+    def __init__(self, path, addr, size, present):
+        self.path, self.addr, self.size, self.present = path, addr, size, present
         self.tag, self.shared_cache, self.writable = 0, False, False
         # Bytes of the region's pages compressed or swapped out, and its
-        # share mode (<mach/vm_region.h> SM_*): what a diagnostic run logs
-        # (WICK_IT_DIAG_MEMORY).
+        # share mode (<mach/vm_region.h> SM_*).
         self.swapped, self.share_mode = 0, 0
+
+    @property
+    def rss(self):
+        """The pages the process holds: present, or compressed."""
+        return self.present + self.swapped
 
 
 def _shared_cache():
@@ -438,6 +444,16 @@ def memory_maps(self, grouped=True):
     in the footprint mode (VM_SELF_REGION_FOOTPRINT above): the pages the
     process has mapped. The footprint mode's region of owned memory is left
     out (_FOOTPRINT_REGION_TAG).
+    A mapping's `rss` is its present pages and its compressed or swapped out
+    ones (pages_swapped_out: in the footprint mode, the pages the pmap
+    reports compressed, XNU vm_map_region_walk), the counterpart of smaps'
+    Rss + Swap: upstream reads Rss on hosts that do not swap the VMM out,
+    where Swap is 0, and macOS compresses a process's pages whenever the
+    host is short of memory (measured in m2-diag: a restored VM's resident
+    size fell 6.5 MiB while the guest wrote 60 MiB, which its phys_footprint
+    counted compressed). So a page compressed by the host's pressure still
+    counts, as it would on upstream's hosts, and the memory monitor's budget
+    cannot be met by the host compressing the VMM's memory.
     The dyld shared cache's entries are in, marked `shared_cache`: the
     system libraries every macOS process runs (no static binaries: Apple
     QA1118), whose pages count as those of any other mapping, by this
@@ -479,7 +495,7 @@ def _memory_maps(self):
         kind = (r.protection, r.max_protection, r.share_mode, r.user_tag, path, in_cache)
         if last and last[0] == kind and maps[-1].addr + maps[-1].size == r.address:
             maps[-1].size += r.size
-            maps[-1].rss += r.pages_resident * page
+            maps[-1].present += r.pages_resident * page
             maps[-1].swapped += r.pages_swapped_out * page
             continue
         maps.append(_MemoryMap(path, r.address, r.size, r.pages_resident * page))
@@ -505,9 +521,10 @@ psutil.Process.memory_maps = memory_maps
 
 def region_breakdown(pid, skip=lambda m: False):
     """[(name, KiB mapped, KiB present in the page tables, KiB resident in
-    the object)] of `pid`'s regions but those `skip` names, largest first:
-    what the memory monitor counted, and what proc_pidinfo's default mode
-    would have, to name what holds the memory when the monitor trips. A
+    the object, KiB compressed)] of `pid`'s regions but those `skip` names,
+    largest first: what the memory monitor counted (present + compressed),
+    and what proc_pidinfo's default mode would have, to name what holds the
+    memory when the monitor trips. A
     region is named by its file, or by its VM tag (<mach/vm_statistics.h>
     VM_MEMORY_*: 1 malloc, 2 malloc small, 3 malloc large, 7 malloc tiny,
     11 malloc nano, 30 stack)."""
@@ -518,7 +535,7 @@ def region_breakdown(pid, skip=lambda m: False):
             cached = _memory_maps(psutil.Process(pid))
         finally:
             _set_self_region_footprint(1)
-    rows = defaultdict(lambda: [0, 0, 0])
+    rows = defaultdict(lambda: [0, 0, 0, 0])
     for maps, col in ((mapped, 1), (cached, 2)):
         for m in maps:
             if skip(m):
@@ -528,9 +545,10 @@ def region_breakdown(pid, skip=lambda m: False):
                 name = "shared cache " + name
             if col == 1:
                 rows[name][0] += m.size
-            rows[name][col] += m.rss
-    return sorted(((k, v[0] >> 10, v[1] >> 10, v[2] >> 10) for k, v in rows.items()),
-                  key=lambda r: -r[2])
+                rows[name][3] += m.swapped
+            rows[name][col] += m.present
+    return sorted(((k, v[0] >> 10, v[1] >> 10, v[2] >> 10, v[3] >> 10) for k, v in rows.items()),
+                  key=lambda r: -(r[2] + r[4]))
 
 
 import host_tools.memory as _memory  # noqa: E402  pylint: disable=wrong-import-position
@@ -546,6 +564,13 @@ import host_tools.memory as _memory  # noqa: E402  pylint: disable=wrong-import-
 #   SHARED_CACHE_CEILING, so that it is bounded and a rise shows, and
 #   reported beside the other (memory-parts.jsonl in the run's directory,
 #   one line per microVM).
+# Each part counts a mapping's present pages and its compressed ones
+# (memory_maps: `rss`). Upstream's monitor sums smaps' Rss, which leaves
+# swapped pages out, on hosts that do not swap the VMM out; a part counted by
+# present pages alone would let the host's compressor, which takes an idle
+# process's pages whenever the host is short of memory, bring the VMM's own
+# memory under the budget. Counted with them, the budget holds what the VMM
+# holds, whatever the host's pressure.
 # The ceiling: measured on macOS 27.2 (m2-parts, 77 microVMs of the
 # balloon, vsock, snapshot and CPU tests), the part is 4.64 MiB in every
 # microVM with a guest (4.48 idle, without one); the ceiling is that
@@ -658,9 +683,9 @@ def check_samples(self):
                         self._current_rss / (1 << 20))
         else:
             log.warning("memory monitor tripped at %.2f MiB of the VMM's own, %.2f MiB of the shared cache "
-                        "(KiB: mapped, in the page tables, resident in the object): %s",
+                        "(KiB: mapped, in the page tables, resident in the object, compressed): %s",
                         self._current_rss / (1 << 20), cache / (1 << 20),
-                        "; ".join(f"{n} {s}/{f}/{c}" for n, s, f, c in rows if f or c))
+                        "; ".join(f"{n} {s}/{f}/{c}/{z}" for n, s, f, c, z in rows if f or c or z))
     try:
         _real_check_samples(self)
     except _memory.MemoryUsageExceededError as err:
@@ -690,32 +715,94 @@ if not hasattr(resource, "prlimit"):
     resource.prlimit = prlimit
 
 
+# struct task_vm_info (<mach/task_info.h>) as 64-bit words: [2]
+# resident_size, [6] internal, [8] external, [15] compressed.
+TASK_VM_INFO = 22
+_libsystem.task_name_for_pid.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_uint)]
+_libsystem.task_info.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+_libsystem.mach_port_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint]
+_MACH_TASK_SELF = ctypes.c_uint.in_dll(_libsystem, "mach_task_self_")
+
+
+def _task_vm_info(pid):
+    """Bytes: the task's resident size, internal, external and compressed
+    pages, from task_info(TASK_VM_INFO) on its name port. task_name_for_pid
+    gives a name port for a process of the caller's user, and root for any
+    (measured as the user on another process of the user). `compressed` is
+    the task's internal_compressed ledger, its private pages held in the
+    compressor (XNU osfmk/kern/task.c task_info, TASK_VM_INFO:
+    vm_info->compressed); resident_size is the phys_mem ledger, the pages
+    present in its page tables, what psutil's RSS reads. Raises OSError when
+    either call fails (a process gone among them)."""
+    port = ctypes.c_uint(0)
+    kr = _libsystem.task_name_for_pid(_MACH_TASK_SELF, pid, ctypes.byref(port))
+    if kr:
+        if not psutil.pid_exists(pid):
+            raise psutil.NoSuchProcess(pid)
+        raise OSError(errno.EPERM, f"task_name_for_pid({pid}): kern_return {kr}")
+    try:
+        info, count = (ctypes.c_uint64 * 100)(), ctypes.c_uint32(200)
+        kr = _libsystem.task_info(port, TASK_VM_INFO, ctypes.byref(info), ctypes.byref(count))
+    finally:
+        _libsystem.mach_port_deallocate(_MACH_TASK_SELF, port.value)
+    if kr:
+        if not psutil.pid_exists(pid):
+            raise psutil.NoSuchProcess(pid)
+        raise OSError(errno.EIO, f"task_info({pid}, TASK_VM_INFO): kern_return {kr}")
+    return {"resident": info[2], "internal": info[6], "external": info[8], "compressed": info[15]}
+
+
 def get_resident_memory(process):
     """`framework.utils.get_resident_memory` (KiB) on macOS: what the balloon
     tests read through `get_stable_rss_mem` (test_balloon.py, the performance
     balloon and memory hot-plug tests, test_snapshot_restore_cross_kernel).
 
     Linux (tests/framework/utils.py): `psutil.Process.memory_info().rss`,
-    which is VmRSS from /proc/<pid>/statm (RssAnon + RssFile + RssShmem:
-    every page present in the process's page tables, anonymous or file-backed
-    or shared, the static binary's own text among them, and the guest pages
-    KVM faulted in with get_user_pages; not pages swapped out, not the pages
-    of a mapped file the process has not touched), plus `HugetlbPages:` of
-    /proc/<pid>/status, which VmRSS leaves out.
+    which is VmRSS from /proc/<pid>/statm (fs/proc/task_mmu.c task_mem:
+    MM_ANONPAGES + MM_FILEPAGES + MM_SHMEMPAGES, every page present in the
+    process's page tables, anonymous or file-backed or shared, the static
+    binary's own text among them, and the guest pages KVM faulted in with
+    get_user_pages; not the pages of a mapped file the process has not
+    touched), plus `HugetlbPages:` of /proc/<pid>/status, which VmRSS leaves
+    out. VmRSS leaves out the pages swapped out, which task_mem counts apart
+    as VmSwap (MM_SWAPENTS); upstream's hosts do not swap the VMM out, so
+    there VmRSS is VmRSS + VmSwap, what the process holds. A page discarded
+    while swapped out leaves VmSwap (mm/memory.c zap_pte_range: a swap entry
+    zapped by MADV_DONTNEED or munmap decrements MM_SWAPENTS and frees the
+    slot), so a balloon's inflation shows as a fall either way.
 
-    macOS: the task's resident_size, which is what psutil's RSS reads: the
-    pages present in the process's page tables, the pages a vCPU wrote
+    macOS: the task's resident size and its compressed pages (_task_vm_info:
+    TASK_VM_INFO resident_size + compressed), the counterpart of VmRSS +
+    VmSwap. macOS compresses a process's pages whenever the host is short of
+    memory, without swap: measured in m2-diag (dd657f4), a restored VM's
+    resident size fell 6.5 MiB while the guest wrote 60 MiB, its
+    phys_footprint rose 62.9 MiB, the host's memory pressure went to warn
+    and its compressor took 4.2 GiB more, and test_balloon_snapshot failed
+    on the fall. A discard still shows as a fall: private pages replaced
+    while compressed leave the ledger with them (measured: 262,880 KiB
+    compressed, 704 KiB after mmap MAP_FIXED over them, as wick's
+    MADV_DONTNEED of private guest memory does; memory-selftest.py
+    --wait-compressed checks it), as a discarded swapped page leaves VmSwap. Guest
+    memory is private but with a vhost-user device, when Firecracker backs
+    it with a memfd (resources.rs allocate_memory_regions): Linux's VmSwap
+    leaves a shared mapping's swapped pages out, and macOS's ledger counts
+    them and keeps them through MADV_DONTNEED (measured with shared
+    anonymous memory and a POSIX shared memory object: 262,848 and 262,832
+    KiB still compressed after it), so there the reading counts compressed pages
+    Linux's would not; of the tests that read it, only the performance
+    suite's test_hotplug_memory runs with vhost-user. The resident size
+    alone counts the pages present in the
+    process's page tables (the phys_mem ledger), the pages a vCPU wrote
     through Hypervisor.framework among them (measured on a 256 MiB guest:
-    62,112 KiB idle, 217,664 after the guest wrote 150 MiB, as its regions'
-    resident pages went 36,880 to 192,272). Hugetlb: none on macOS, a huge
-    page mapping is host pages (docs/PORTING.md row 10), present like the
-    rest. Its one difference from Linux's is an offset: the system
-    libraries' pages the process mapped from the dyld shared cache, where
-    upstream's static Firecracker carries 1.6 MiB of its own text: 4.64 MiB
-    in the page tables in every microVM of run m2-parts (the memory
-    monitor's platform part). (A reading of 19 MiB here set the RSS against
-    the other regions' residency in their objects, not their pages in the
-    page tables.)
+    62,112 KiB idle, 217,664 after the guest wrote 150 MiB). Hugetlb: none
+    on macOS, a huge page mapping is host pages (docs/PORTING.md row 10),
+    counted like the rest. Its one difference from Linux's is an offset:
+    the system libraries' pages the process mapped from the dyld shared
+    cache, where upstream's static Firecracker carries 1.6 MiB of its own
+    text: 4.64 MiB in the page tables in every microVM of run m2-parts (the
+    memory monitor's platform part). (A reading of 19 MiB here set the RSS
+    against the other regions' residency in their objects, not their pages
+    in the page tables.)
 
     Not the regions' resident pages as proc_pidinfo gives them by default
     (c8d26ac; `memory_maps` reads them in the footprint mode since):
@@ -727,16 +814,16 @@ def get_resident_memory(process):
     267792`), where Linux's rises with every page faulted in. Not
     phys_footprint (56,592 KiB idle): it leaves out the clean file-backed
     pages VmRSS counts (4,400 KiB: the binary's text, the kernel image) and
-    counts what VmRSS does not (compressed pages, the kernel's page-table
-    and IOKit ledgers). Measured side by side, idle / after the guest wrote
-    150 MiB / after a full snapshot: RSS 62,112 / 217,664 / 461,936 KiB; the
-    regions' resident pages without the shared cache 43,136 / 198,528 /
-    268,688; phys_footprint 56,592 / 212,208 / 456,193. (After the full
-    snapshot every guest page is present: the snapshot read the pages the
-    guest never touched, and macOS gives real zero pages where Linux reads
-    its shared zero page uncharged, as docs/PORTING.md row 15 notes for
-    Windows.)"""
-    return process.memory_info().rss // 1024
+    counts what VmRSS does not (the kernel's page-table and IOKit ledgers).
+    Measured side by side, idle / after the guest wrote 150 MiB / after a
+    full snapshot: RSS 62,112 / 217,664 / 461,936 KiB; the regions' resident
+    pages without the shared cache 43,136 / 198,528 / 268,688;
+    phys_footprint 56,592 / 212,208 / 456,193. (After the full snapshot
+    every guest page is present: the snapshot read the pages the guest never
+    touched, and macOS gives real zero pages where Linux reads its shared
+    zero page uncharged, as docs/PORTING.md row 15 notes for Windows.)"""
+    info = _task_vm_info(process.pid)
+    return (info["resident"] + info["compressed"]) // 1024
 
 
 _utils.get_resident_memory = get_resident_memory
@@ -768,30 +855,19 @@ def _diag_write(record):
 def _task_memory(pid):
     """KiB: the task's resident size and phys_footprint (proc_pid_rusage,
     RUSAGE_INFO_V0: ri_resident_size, ri_phys_footprint, the 9th and 10th
-    64-bit words). phys_footprint counts the task's compressed pages, which
-    the resident size does not. And its compressed, internal and external
-    pages: task_info(TASK_VM_INFO) on the task's name port, which
-    task_name_for_pid gives the user for a process of the same user
-    (measured); `compressed` is the internal_compressed ledger (XNU
-    osfmk/kern/task.c task_info, TASK_VM_INFO)."""
+    64-bit words), and apart its internal, external and compressed pages
+    (_task_vm_info); get_resident_memory is resident + compressed."""
     buf = (ctypes.c_uint64 * 12)()
     if _libsystem.proc_pid_rusage(pid, 0, ctypes.byref(buf)):
         return {"error": os.strerror(ctypes.get_errno())}
     out = {"resident_kib": buf[8] >> 10, "phys_footprint_kib": buf[9] >> 10}
-    port = ctypes.c_uint(0)
-    kr = _libsystem.task_name_for_pid(ctypes.c_uint.in_dll(_libsystem, "mach_task_self_"), pid, ctypes.byref(port))
-    if kr:
-        out["vm_info_error"] = f"task_name_for_pid: {kr}"
+    try:
+        info = _task_vm_info(pid)
+    except OSError as err:
+        out["vm_info_error"] = str(err)
         return out
-    # struct task_vm_info as 64-bit words: [2] resident_size, [6] internal,
-    # [8] external, [15] compressed, [18] phys_footprint.
-    info, count = (ctypes.c_uint64 * 100)(), ctypes.c_uint32(200)
-    kr = _libsystem.task_info(port, 22, ctypes.byref(info), ctypes.byref(count))  # TASK_VM_INFO
-    _libsystem.mach_port_deallocate(ctypes.c_uint.in_dll(_libsystem, "mach_task_self_"), port)
-    if kr:
-        out["vm_info_error"] = f"task_info: {kr}"
-        return out
-    out.update(internal_kib=info[6] >> 10, external_kib=info[8] >> 10, compressed_kib=info[15] >> 10)
+    out.update(internal_kib=info["internal"] >> 10, external_kib=info["external"] >> 10,
+               compressed_kib=info["compressed"] >> 10)
     return out
 
 
@@ -813,7 +889,7 @@ def _region_groups(pid):
         else:
             key = "other mappings"
         g = groups[key]
-        g[0], g[1], g[2], g[3] = g[0] + (m.size >> 10), g[1] + (m.rss >> 10), g[2] + (m.swapped >> 10), g[3] + 1
+        g[0], g[1], g[2], g[3] = g[0] + (m.size >> 10), g[1] + (m.present >> 10), g[2] + (m.swapped >> 10), g[3] + 1
     return {k: {"mapped_kib": v[0], "present_kib": v[1], "swapped_kib": v[2], "mappings": v[3]}
             for k, v in groups.items()}
 
@@ -1210,7 +1286,10 @@ def rss_anon_kib(pid):
     is RssFile there): the pages the process has mapped
     (the footprint mode), as Linux's RssAnon counts its anonymous pages
     (fs/proc/task_mmu.c task_mem: get_mm_counter(mm, MM_ANONPAGES), the
-    anonymous pages mapped in its page tables)."""
+    anonymous pages mapped in its page tables), and their compressed ones,
+    as `memory_maps` counts them: RssAnon leaves swapped pages out (VmSwap),
+    on hosts that do not swap the VMM out, where macOS compresses whenever
+    the host is short of memory."""
     return sum(m.rss for m in memory_maps(psutil.Process(pid), grouped=False)
                if not m.path and (m.writable or not m.shared_cache)) // 1024
 
