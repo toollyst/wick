@@ -16,6 +16,7 @@ macOS runners, which have no Hypervisor.framework).
 
 import argparse
 import ctypes
+import errno as errno_mod
 import importlib.util
 import json
 import os
@@ -201,6 +202,129 @@ def run_jailer(ctx, args, timeout=20):
 def jailer_base(ctx, vm_id, exec_file=None):
     return ["--id", vm_id, "--exec-file", exec_file or ctx.firecracker, "--uid", str(UID),
             "--gid", str(GID), "--chroot-base-dir", ctx.base]
+
+
+# ---------------------------------------------------------------- resource limits
+
+# A program the jailer runs in Firecracker's place (it carries the hand-over
+# mark, vmm::ext::jail::HANDOVER_MARK, so the jailer takes it): the process the
+# jailer execs (POSIX_SPAWN_SETEXEC, same PID) reports its RLIMIT_NOFILE and
+# RLIMIT_FSIZE, then opens descriptors until one fails, and with SIGXFSZ
+# ignored writes past the file size limit, as upstream's test_jail.py reads
+# Firecracker's limits with prlimit, which macOS lacks (a process reads only
+# its own). Its last argument is the file to write.
+RLIMIT_PROBE_C = r"""
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <unistd.h>
+__attribute__((used)) static const char mark[] = "wick-jail-handover:v1";
+static long long lim(rlim_t v) { return v == RLIM_INFINITY ? -1 : (long long)v; }
+int main(int argc, char **argv) {
+    struct rlimit nofile, fsize;
+    getrlimit(RLIMIT_NOFILE, &nofile);
+    getrlimit(RLIMIT_FSIZE, &fsize);
+    int open_before = 0;
+    for (int fd = 0; fd < 65536; fd++) if (fcntl(fd, F_GETFD) != -1) open_before++;
+    int opened = 0, err = 0;
+    for (;;) { if (open("/dev/null", O_RDONLY) < 0) { err = errno; break; } opened++; }
+    long long written = -1; int werr = 0;
+    if (fsize.rlim_cur != RLIM_INFINITY && argc > 1) {
+        signal(SIGXFSZ, SIG_IGN);
+        close(3);  /* a descriptor for the file */
+        int f = open(argv[argc - 1], O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        char buf[4096]; memset(buf, 7, sizeof buf); written = 0;
+        for (;;) { ssize_t n = write(f, buf, sizeof buf); if (n < 0) { werr = errno; break; } written += n; }
+    }
+    printf("RLIMITS nofile %lld %lld fsize %lld %lld open_before %d opened %d errno %d written %lld werrno %d mark %c\n",
+           lim(nofile.rlim_cur), lim(nofile.rlim_max), lim(fsize.rlim_cur), lim(fsize.rlim_max),
+           open_before, opened, err, written, werr, mark[0]);
+    return 0;
+}
+"""
+
+
+def build_rlimit_probe(directory):
+    """Compiles the probe into `directory`; returns its path."""
+    src = os.path.join(directory, "rlimit-probe.c")
+    exe = os.path.join(directory, "rlimit-probe")
+    with open(src, "w") as f:
+        f.write(RLIMIT_PROBE_C)
+    subprocess.run(["/usr/bin/cc", "-O2", "-o", exe, src], check=True)
+    with open(exe, "rb") as f:
+        check(b"wick-jail-handover:v1\0" in f.read(), "the probe does not carry the hand-over mark")
+    return exe
+
+
+def parse_probe(out):
+    """The probe's report: {name: int}."""
+    line = next((l for l in out.splitlines() if l.startswith("RLIMITS ")), None)
+    check(line is not None, f"no report from the probe: {out!r}")
+    words = line.split()[1:]
+    vals = {}
+    i = 0
+    while i < len(words):
+        name = words[i]
+        if name in ("nofile", "fsize"):
+            vals[name] = (int(words[i + 1]), int(words[i + 2]))
+            i += 3
+        elif name == "mark":
+            i += 2
+        else:
+            vals[name] = int(words[i + 1])
+            i += 2
+    return vals
+
+
+def check_probe(vals, nofile, fsize, what):
+    """Linux's rules (upstream's test_jail.py check_limits and
+    test_args_default_resource_limits): soft and hard both the limit; the
+    descriptor past it fails with EMFILE; a write past the file size limit
+    fails with EFBIG (SIGXFSZ ignored) at the limit."""
+    check(vals["nofile"] == (nofile, nofile), f"{what}: RLIMIT_NOFILE {vals['nofile']}, wanted {nofile}")
+    check(vals["fsize"] == (fsize, fsize), f"{what}: RLIMIT_FSIZE {vals['fsize']}, wanted {fsize}")
+    check(vals["open_before"] + vals["opened"] == nofile and vals["errno"] == errno_mod.EMFILE,
+          f"{what}: {vals['open_before']} open + {vals['opened']} opened before errno {vals['errno']}, "
+          f"wanted EMFILE at descriptor {nofile + 1}")
+    if fsize != -1:
+        check(vals["written"] == fsize and vals["werrno"] == errno_mod.EFBIG,
+              f"{what}: {vals['written']} bytes written before errno {vals['werrno']}, wanted EFBIG at {fsize}")
+
+
+def self_check_probe():
+    """What runs without root: the probe builds, carries the mark, and
+    measures limits set on it (here by this process, not by a jailer)."""
+    import resource
+    d = tempfile.mkdtemp(prefix="wick-jt-probe-")
+    try:
+        exe = build_rlimit_probe(d)
+
+        def limits():
+            resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (1 << 20, 1 << 20))
+
+        out = subprocess.run([exe, os.path.join(d, "big")], preexec_fn=limits, capture_output=True,
+                             text=True, check=True, close_fds=True).stdout
+        check_probe(parse_probe(out), 64, 1 << 20, "self-check")
+        print(f"probe self-check passed: {out.strip()}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def jailed_probe(ctx, name, limits_args):
+    """Runs the probe through the jailer with `limits_args`; returns its report."""
+    if ctx.rlimit_probe is None:
+        ctx.rlimit_probe = build_rlimit_probe(ctx.base)
+    Jail(ctx, name)
+    big = os.path.join(ctx.base, f"{name}.big")
+    rc, out = run_jailer(ctx, jailer_base(ctx, name, ctx.rlimit_probe) + list(limits_args) + ["--", big])
+    check(rc == 0, f"{name}: the jailed probe exited {rc}: {out!r}")
+    if os.path.exists(big):
+        os.unlink(big)
+    return parse_probe(out)
 
 
 # ---------------------------------------------------------------- stages
@@ -460,8 +584,25 @@ def stage_limits(ctx):
     check(cpu_limit(vm.proc.pid) == (1, 250 - API_CPU, 1), f"v2 CPU limit {cpu_limit(vm.proc.pid)}")
     check(cpu_limit(api) == (1, API_CPU, 1), f"v2: the API process's CPU limit {cpu_limit(api)}")
     vm.kill()
+    # --resource-limit, read back from the process the jailer execs, as
+    # upstream's test_jail.py reads Firecracker's: by default no-file is 2048
+    # and fsize unlimited; set, both are what was asked.
+    check_probe(jailed_probe(ctx, "rlimit-default", []), 2048, -1, "default")
+    check_probe(jailed_probe(ctx, "rlimit-set", ["--resource-limit", "no-file=512",
+                                                 "--resource-limit", f"fsize={1 << 20}"]),
+                512, 1 << 20, "no-file=512, fsize=1 MiB")
+    # Firecracker itself with too few descriptors does not start
+    # (upstream's test_negative_no_file_limit).
+    Jail(ctx, "nofile3")
+    rc, out = run_jailer(ctx, jailer_base(ctx, "nofile3") + ["--resource-limit", "no-file=3", "--",
+                                                             "--api-sock", "/run/firecracker.socket"])
+    # EMFILE is errno 24 on both; upstream's musl build words it "No file
+    # descriptors available", macOS's libc "Too many open files".
+    check(rc != 0 and "Too many open files (os error 24)" in out, f"no-file=3: exit {rc}, {out!r}")
     return (f"jetsam 300 MiB = {300 - API_MIB} + {API_MIB} (API process) (v1), 200 = {200 - API_MIB} + {API_MIB} "
-            f"(v2), priority {prio} kept; CPU 75% = {75 - API_CPU} + {API_CPU} (v1), 250% (v2)")
+            f"(v2), priority {prio} kept; CPU 75% = {75 - API_CPU} + {API_CPU} (v1), 250% (v2); "
+            "no-file 2048 by default and 512 set (EMFILE past it), fsize unlimited by default and 1 MiB set "
+            "(EFBIG at it); no-file=3 stops Firecracker with EMFILE")
 
 
 def stage_no_api(ctx):
@@ -533,6 +674,31 @@ def stage_memory(ctx):
         results.append(f"{limit_mib} MiB: {'killed' if killed else 'survived'}")
         vm.kill()
     return "guest writes 700 MiB; " + ", ".join(results)
+
+
+def stage_fsize(ctx):
+    """VM: a snapshot past the jail's file size limit raises SIGXFSZ, on which
+    Firecracker stops as upstream's test_negative_file_size_limit asserts
+    ("intercepting signal 25"); under the limit the microVM starts
+    (test_positive_file_size_limit)."""
+    jail = Jail(ctx, "fsize-ok", [ctx.kernel, ctx.rootfs])
+    vm = JailedVm(ctx, "fsize-ok", jail, ["--resource-limit", f"fsize={(128 + 1) << 20}"],
+                  config=jail_config(mem=128))
+    vm.shell()
+    vm.kill()
+    jail = Jail(ctx, "fsize", [ctx.kernel, ctx.rootfs])
+    vm = JailedVm(ctx, "fsize", jail, ["--resource-limit", f"fsize={1 << 20}"], config=jail_config())
+    vm.shell()
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    try:
+        vm.api("PUT", "/snapshot/create", {"mem_file_path": "/vm.mem", "snapshot_path": "/vm.vmstate"})
+        raise Failure("a 256 MiB snapshot under a 1 MiB fsize limit was written")
+    except (OSError, bt.http.client.HTTPException):
+        pass
+    vm.wait_exit(10)
+    vm.pump.join(5)
+    check("Shutting down VM after intercepting signal 25, code 0" in vm.buf, f"fsize: {vm.exit_reason()}")
+    return "a 128 MiB guest starts under a 129 MiB fsize limit; a snapshot past 1 MiB: SIGXFSZ, Firecracker stops"
 
 
 def stage_cpu(ctx):
@@ -833,6 +999,7 @@ STAGES = {
     "daemonize": stage_daemonize,
     "pidns": stage_pidns,
     "limits": stage_limits,
+    "fsize": stage_fsize,
     "no-api": stage_no_api,
     "boot": stage_boot,
     "netns": stage_netns,
@@ -842,7 +1009,7 @@ STAGES = {
     "uffd": stage_uffd,
     "vhost-user": stage_vhost_user,
 }
-VM_STAGES = ("no-api", "boot", "netns", "memory", "cpu", "hugepages", "uffd", "vhost-user")
+VM_STAGES = ("no-api", "fsize", "boot", "netns", "memory", "cpu", "hugepages", "uffd", "vhost-user")
 
 
 class Context:
@@ -852,6 +1019,7 @@ class Context:
         self.uffd_handler = args.uffd_handler
         self.vub = args.vhost_user_blk
         self.out = args.out
+        self.rlimit_probe = None
         # Unix socket paths must be shorter than 104 bytes: a short base.
         self.base = tempfile.mkdtemp(prefix="wick-jt-", dir="/private/tmp")
         os.chmod(self.base, 0o755)
@@ -875,7 +1043,12 @@ def main():
     p.add_argument("--cache", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--no-vm", action="store_true", help="skip the stages that boot a VM")
+    p.add_argument("--probe-self-check", action="store_true",
+                   help="build the resource limit probe and check it without root, then exit")
     p.add_argument("stages", nargs="*", help=f"stages (default: all): {', '.join(STAGES)}")
+    if "--probe-self-check" in sys.argv[1:]:
+        self_check_probe()
+        return
     args = p.parse_args()
     if os.geteuid() != 0:
         p.error("needs root (the jailer chroots and changes user)")

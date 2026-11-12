@@ -115,7 +115,8 @@ exemption.
 | (a snapshot restored through a uffd handler, and a vhost-user block device, under the jailer) | `uffd`, `vhost-user` (the uffd handler and the vhost-user backend outside the jail) | `uffd`, `vhost-user` (row 14, on a WHP machine) |
 | (the API server's process is a process of the jail) | `limits` (the API process's jetsam and CPU limits within the jail's, and its uid; root) | `api` (the whole mitigation profile; each one's end ends the other; no guest) |
 | (`--netns`: a jail reaches only its own network) | `netns` (two jails, a network each, a third sharing one; no frame across) | `netns` (two jails, a network each; no IP for a jail with a network; an unelevated jailer refused) |
-| `limits`: cgroups and resource limits applied | yes | yes |
+| `limits`: cgroups and resource limits applied (and read back: `no-file` 2048 by default and 512 set, `EMFILE` past it; `fsize` unlimited by default and 1 MiB set, `EFBIG` at it, through a probe the jailer runs in Firecracker's place; `no-file=3` stops Firecracker) | yes (the read-back written, not yet run) | yes |
+| `fsize`: a snapshot past the jail's `fsize` limit stops Firecracker with SIGXFSZ, a guest under it starts | yes (written, not yet run) | no counterpart (Windows cannot limit file sizes: refused) |
 | `boot`: a jailed guest boots | yes | yes |
 | `memory`: a guest past the memory limit kills the VMM | yes | `memory` (row 15) |
 | `hugepages`: a jailed guest on 2 MiB pages, restored through a uffd handler and with a vhost-user drive outside the jail | yes (the memory limit counts huge pages: row 10) | `hugepages` (row 10) |

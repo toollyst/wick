@@ -8,9 +8,9 @@
 #
 #   tools/macos/jailer-test.sh [--release] [--no-vm] [stage...]
 #
-# Stages (default: all): refuse jail daemonize pidns limits no-api boot netns memory cpu
-# hugepages uffd vhost-user. no-api, boot, netns, memory, cpu, hugepages, uffd and
-# vhost-user start a VM and need Hypervisor.framework; --no-vm skips them (GitHub's
+# Stages (default: all): refuse jail daemonize pidns limits fsize no-api boot netns memory
+# cpu hugepages uffd vhost-user. fsize, no-api, boot, netns, memory, cpu, hugepages, uffd
+# and vhost-user start a VM and need Hypervisor.framework; --no-vm skips them (GitHub's
 # macOS runners have no Hypervisor.framework). Results and logs go to
 # build/jailer-test/<time>. Run tools/setup.sh first.
 set -euo pipefail
