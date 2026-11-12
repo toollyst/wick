@@ -20,6 +20,8 @@ pub mod sandbox;
 mod snapshot_vcpu_tests;
 #[cfg(all(test, unix))]
 mod sigpipe_tests;
+#[cfg(all(test, unix))]
+mod unix_stream_tests;
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;

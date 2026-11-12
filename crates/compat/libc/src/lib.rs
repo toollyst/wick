@@ -38,6 +38,11 @@ pub mod wick_uffd;
 pub mod wick_guest;
 #[cfg(target_os = "macos")]
 mod timerfd;
+// AF_UNIX streams start with Linux's send buffer (`socket`, `socketpair`).
+#[cfg(target_os = "macos")]
+mod unix_stream_buffer;
+#[cfg(target_os = "macos")]
+pub use unix_stream_buffer::LINUX_WMEM_DEFAULT;
 // System calls on user memory wait for userfaultfd pages, as on Linux.
 #[cfg(target_os = "macos")]
 pub use wick_uffd::syscalls::{

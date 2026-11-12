@@ -90,7 +90,9 @@ firecracker binary, vmm   (upstream source + patches/)
    did in the kernel (irqfd, MMIO decode, PSCI, GIC, timers, dirty tracking,
    handle lifetime and `EBADF`, error meanings such as `ENOEXEC`). Linux-only
    libc functions are implemented with the same names and semantics
-   (`fallocate`, `madvise(DONTNEED)`). What the kernel did stays where the
+   (`fallocate`, `madvise(DONTNEED)`), and so are kernel defaults a program
+   relies on without asking: an AF_UNIX stream starts with Linux's send
+   buffer (the compatibility `libc` defines `socket` and `socketpair`). What the kernel did stays where the
    kernel was (the compatibility `libc`). For example, the kernel side of
    userfaultfd (`libc::wick_uffd`) catches missing pages with `PROT_NONE` and
    a signal on the host and stage-2 protection in the guest, sleeps until the
