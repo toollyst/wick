@@ -370,7 +370,13 @@ jobs:
         working-directory: lib/firecracker
         run: |
           sw_vers
-          cargo test --locked -p vmm --lib "ext::sandbox"
+          cargo test --locked -p vmm --lib "ext::sandbox" -- \
+            --skip ext::sandbox::macos::tests::test_sigsys_handler_work_ends_the_process_within_its_deadline
+          # Alone and with --nocapture, so its stages and their distribution
+          # (SIGSYS_DEADLINE's measurement) are in the log, passing or not.
+          cargo test --locked -p vmm --lib \
+            ext::sandbox::macos::tests::test_sigsys_handler_work_ends_the_process_within_its_deadline \
+            -- --exact --nocapture
       # The API process's profile test once failed on macos-15 with its child
       # dead before its first marker (c7d32e2); run alone, repeatedly, it
       # shows whether that is intermittent and how often.
