@@ -1563,12 +1563,12 @@ mod tests {
     /// result in EWOULDBLOCK"). So the input event's read can find the pipe
     /// empty, its writer open. Linux's pipe_read gives EAGAIN there
     /// (fs/pipe.c), and the serial waits for input again
-    /// (handle_ewouldblock). The serial reads with `std::io::stdin()` (vmm's
-    /// `std` is wick-std, which re-exports std's `io` unchanged), and std reads
-    /// an empty non-blocking pipe as `Ok(0)` (ReadFile's ERROR_NO_DATA is
-    /// ErrorKind::BrokenPipe in std's decode_error_kind, which Handle::read
-    /// returns as the end): the serial's end of input, so it detaches the input
-    /// for good.
+    /// (handle_ewouldblock). The serial reads with `std::io::stdin()`, which
+    /// in vmm is wick-std's, `wick_os::stdio::stdin()`, read here. std's own
+    /// reads an empty non-blocking pipe as `Ok(0)` (ReadFile's ERROR_NO_DATA
+    /// is ErrorKind::BrokenPipe in std's decode_error_kind, which
+    /// Handle::read returns as the end): the serial's end of input, after
+    /// which it never reads its input again.
     #[test]
     #[ignore = "the child of test_serial_input_reads_an_emptied_pipe_as_eagain"]
     fn serial_input_child() {
@@ -1596,7 +1596,7 @@ mod tests {
         let mut events = [EpollEvent::default(); 4];
         assert_eq!(epoll.wait(10_000, &mut events).unwrap(), 1);
         assert_eq!((events[0].data(), events[0].event_set()), (9, EventSet::IN));
-        let mut input = std::io::stdin();
+        let mut input = wick_os::stdio::stdin();
         let mut buf = [0u8; 64];
         // The buffer-ready event's read, handled first, takes the byte.
         assert_eq!(input.read(&mut buf).unwrap(), 1);

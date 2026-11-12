@@ -1656,9 +1656,9 @@ mod tests {
             // is ErrorKind::BrokenPipe (std sys/io/error/windows.rs,
             // decode_error_kind), which Handle::read returns as Ok(0)
             // (sys/pal/windows/handle.rs), as it does a closed writer's
-            // ERROR_BROKEN_PIPE. A reader through std (Firecracker's serial
-            // input is std's Stdin) cannot tell an empty pipe from a closed
-            // one.
+            // ERROR_BROKEN_PIPE. A reader through std cannot tell an empty
+            // pipe from a closed one; Firecracker's serial input reads
+            // wick-std's Stdin (wick_os::stdio), which can.
             let reader = std::mem::ManuallyDrop::new(<std::fs::File as std::os::windows::io::FromRawHandle>::from_raw_handle(
                 handle(fds[0]),
             ));

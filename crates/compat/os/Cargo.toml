@@ -26,9 +26,13 @@ gdbstub = { version = "0.7.10", optional = true }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
+    # CreatePipe and CreateFileW (stdio's tests).
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_IO",
+    # SetNamedPipeHandleState (stdio's tests).
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 

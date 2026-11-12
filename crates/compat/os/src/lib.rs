@@ -16,4 +16,4 @@ pub use std::os::{fd, unix};
 #[cfg(windows)]
 pub mod windows;
 #[cfg(windows)]
-pub use windows::{fd, unix};
+pub use windows::{fd, stdio, unix};

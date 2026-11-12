@@ -168,7 +168,15 @@ semantics on Win32. The details are in the comments of each
   Upstream crate roots get `#[cfg(windows)] extern crate wick_std as std;` (a
   one-line patch), so `std::os::{unix, fd}` resolve to `wick-os`. `c_long` and
   `c_ulong` in `std::os::raw` are 64-bit on Windows too, to keep the layout of
-  Linux kernel ABI bindings (`ifreq`, io_uring, ...).
+  Linux kernel ABI bindings (`ifreq`, io_uring, ...). `std::io::stdin` and
+  `Stdin` are `wick_os::stdio`'s on Windows: std's reads an empty
+  non-blocking pipe as the end (`Ok(0)`), which the serial takes as its
+  input closed; this one gives `EWOULDBLOCK` as Linux does, for a console
+  with nothing typed too, and reads console input with std's console reader
+  (`test_a_pipe_reads_as_on_linux`,
+  `test_a_console_without_characters_reads_as_eagain`,
+  `test_serial_input_reads_an_emptied_pipe_as_eagain`). `lock()` is std's
+  lock, for the terminal modes.
 - **errno = Win32/WSA codes**, chosen so that the `io::ErrorKind` mapping
   matches Linux (`EPERM`=`WSAEACCES`, `EAGAIN`=`EWOULDBLOCK`,
   `ENOTTY`=`ERROR_INVALID_FUNCTION`, ...). A code Windows gives beside one of
