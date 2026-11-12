@@ -179,6 +179,10 @@ def host_tools():
     check(isinstance(ps(0), str), "procps: a thread's name")
     check(hosttools.wsl_path("C:\\a\\b c") == "/mnt/c/a/b c" and hosttools.wsl_path("-qF") == "-qF",
           "e2fsprogs: Windows paths as WSL names them")
+    check(hosttools.windows_cargo_args("--features gdb --target x86_64-unknown-linux-musl --all")
+          == ("--features gdb --target x86_64-pc-windows-msvc --all", "x86_64-unknown-linux-musl")
+          and hosttools.windows_cargo_args("--release -p firecracker") == ("--release -p firecracker", None),
+          "cargo: a musl --target is the Windows target")
     import psutil  # pylint: disable=import-outside-toplevel
 
     wick_windows_mem.install()

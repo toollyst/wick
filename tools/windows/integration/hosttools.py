@@ -247,6 +247,22 @@ def screen(args):
 
 TOOLS = ("ps", "pgrep", "pidof", "dmesg", "socat", *E2FSPROGS)
 
+# Cargo: upstream's tests that build Firecracker themselves (test_fuzzing,
+# test_gdb, test_instrumented_firecracker) build for Linux's musl target.
+# Here they build for the Windows one, and find its output under the musl
+# target's directory name (wick_windows.py links the two).
+WINDOWS_TARGET = "x86_64-pc-windows-msvc"
+_MUSL_TARGET = re.compile(r"--target\s+(\S+-unknown-linux-musl)\b")
+
+
+def windows_cargo_args(cargo_args):
+    """`cargo_args` with a Linux musl `--target` replaced by the Windows
+    target, and the musl target's name (None if it had none)."""
+    m = _MUSL_TARGET.search(cargo_args)
+    if not m:
+        return cargo_args, None
+    return cargo_args[: m.start()] + f"--target {WINDOWS_TARGET}" + cargo_args[m.end():], m.group(1)
+
 
 def main():
     tool, args = sys.argv[1], sys.argv[2:]

@@ -761,6 +761,29 @@ def get_binary(name, *, binary_dir=_cargo_build.DEFAULT_BINARY_DIR, example=None
 
 _cargo_build.get_binary = get_binary
 
+_real_cargo = _cargo_build.cargo
+
+
+def cargo(subcommand, cargo_args="", subcommand_args="", *, env=None, cwd=None, nightly=False, timeout=None):
+    """`cargo`, building for the Windows target where a test asks for
+    Linux's musl one (test_fuzzing, test_gdb, test_instrumented_firecracker
+    build Firecracker themselves), with the output also under the musl
+    target's directory name (a junction), where the test looks for it."""
+    cargo_args, musl = hosttools.windows_cargo_args(cargo_args)
+    out = _real_cargo(subcommand, cargo_args, subcommand_args, env=env, cwd=cwd, nightly=nightly, timeout=timeout)
+    if musl and subcommand == "build":
+        target_dir = pathlib.Path((env or {}).get("CARGO_TARGET_DIR") or "build/cargo_target")
+        if not target_dir.is_absolute():
+            target_dir = pathlib.Path(cwd or os.getcwd()) / target_dir
+        linked = target_dir / musl
+        if not linked.exists():
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(linked), str(target_dir / hosttools.WINDOWS_TARGET)],
+                           check=True, capture_output=True)
+    return out
+
+
+_cargo_build.cargo = cargo
+
 # --------------------------------------------------------------- the jail
 
 import framework.jailer as _jailer  # noqa: E402  pylint: disable=wrong-import-position
