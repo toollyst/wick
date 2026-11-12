@@ -24,6 +24,45 @@ use std::os::unix::io::AsRawFd;
 
 use crate::platform::fs::HoleKeeper;
 
+/// `DKIOCGETBLOCKSIZE` (`_IOR('d', 24, uint32_t)`): a block device's
+/// logical block size.
+pub const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x4004_6418;
+/// `DKIOCGETBLOCKCOUNT` (`_IOR('d', 25, uint64_t)`): its number of blocks.
+pub const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x4008_6419;
+
+/// A block device's capacity in bytes (`None` for any other file). On
+/// Linux `lseek(fd, 0, SEEK_END)` gives it; on macOS that gives 0 for a
+/// block device (measured on a `/dev/diskN` of `hdiutil attach -nomount`),
+/// so the device's block count times its block size is read instead.
+#[cfg(not(windows))]
+pub fn block_device_size(file: &File) -> io::Result<Option<u64>> {
+    let fd = file.as_raw_fd();
+    // SAFETY: plain data, filled by fstat.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a descriptor of `file` and a valid output.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFBLK {
+        return Ok(None);
+    }
+    let mut block: u32 = 0;
+    let mut count: u64 = 0;
+    // SAFETY: read-only queries of a block device into outputs of their sizes.
+    unsafe {
+        if libc::ioctl(fd, DKIOCGETBLOCKSIZE, &mut block) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::ioctl(fd, DKIOCGETBLOCKCOUNT, &mut count) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    count
+        .checked_mul(u64::from(block))
+        .map(Some)
+        .ok_or_else(|| io::Error::other("block device size overflows"))
+}
+
 /// `FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE`.
 const PUNCH_HOLE: libc::c_int = 0x03;
 

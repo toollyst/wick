@@ -25,6 +25,19 @@ use std::io::{self, Seek, SeekFrom};
 use vm_memory::bitmap::BitmapSlice;
 use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
 
+/// The size of a drive's backing file, as Linux's `lseek(fd, 0, SEEK_END)`
+/// gives it: a regular file's length, a block device's capacity. macOS
+/// gives 0 for a block device: its capacity is read with the disk ioctls
+/// (`backend::fs::block_device_size`). Leaves the file's offset at its end
+/// for a regular file, as the seek does.
+pub fn size(file: &mut File) -> io::Result<u64> {
+    #[cfg(target_os = "macos")]
+    if let Some(size) = super::backend::fs::block_device_size(file)? {
+        return Ok(size);
+    }
+    file.seek(SeekFrom::End(0))
+}
+
 /// `std::os::unix::fs::FileTypeExt`. On Windows, the queries a
 /// `std::fs::FileType` answers there: it describes files, directories and
 /// symbolic links only (std cannot read the metadata of a device), so it is
@@ -220,6 +233,42 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1 << 20;
+
+    // A drive on a block device has the device's size, as on Linux, where
+    // lseek to the end gives it. A real one: a raw image attached without a
+    // file system (hdiutil, as the user; detached at the end).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_block_device_size() {
+        struct Attached(String);
+        impl Drop for Attached {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("/usr/bin/hdiutil")
+                    .args(["detach", "-force", &self.0])
+                    .output();
+            }
+        }
+        let image = TempFile::new().unwrap();
+        image.as_file().set_len(768 * 1024).unwrap();
+        let out = std::process::Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-nomount", "-imagekey", "diskimage-class=CRawDiskImage"])
+            .arg(image.as_path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let dev = String::from_utf8(out.stdout).unwrap().split_whitespace().next().unwrap().to_owned();
+        let _attached = Attached(dev.clone());
+        assert!(dev.starts_with("/dev/disk"), "{dev}");
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&dev).unwrap();
+        assert!(file.metadata().unwrap().file_type().is_block_device());
+        // What upstream reads, and why this exists.
+        assert_eq!(file.seek(SeekFrom::End(0)).unwrap(), 0);
+        assert_eq!(size(&mut file).unwrap(), 768 * 1024);
+        // A regular file: its length, as before.
+        let mut plain = TempFile::new().unwrap().into_file();
+        plain.set_len(12345).unwrap();
+        assert_eq!(size(&mut plain).unwrap(), 12345);
+    }
 
     // Ids that kvmtool's decimal form, cut to 20 bytes, would make equal: a
     // volume serial of 10 digits, `0`, and NTFS indices of consecutive files

@@ -936,6 +936,10 @@ mod macos {
             " #x40487413 #x80487414 #x80487415 #x80487416", // TIOCGETA, TIOCSETA, TIOCSETAW, TIOCSETAF
             " #x40087468",                                    // TIOCGWINSZ
             " #x40046418 #x4004644d",                         // DKIOCGETBLOCKSIZE, DKIOCGETPHYSICALBLOCKSIZE
+            // DKIOCGETBLOCKCOUNT: a drive's size when it is opened again
+            // (PATCH /drives), the macOS counterpart of Linux's lseek to the
+            // end; a read-only query of a descriptor the process holds.
+            " #x40086419",
             ")"
         ),
         // Whether the host is itself a virtual machine: read by the system

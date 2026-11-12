@@ -282,6 +282,29 @@ fn own(args: &[String]) -> Serve {
     Serve { socket, image, read_only, control }
 }
 
+/// The image's size: a file's length, or a block device's capacity, which
+/// macOS's lseek to the end reports as 0 (Linux's gives it), read with the
+/// disk ioctls as Firecracker's drives read it (vmm platform::fs::size).
+fn image_size(file: &mut File) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::io::AsRawFd;
+        if file.metadata().unwrap().file_type().is_block_device() {
+            const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x4004_6418;
+            const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x4008_6419;
+            let (mut block, mut count) = (0u32, 0u64);
+            // SAFETY: read-only queries of a block device into outputs of their sizes.
+            unsafe {
+                assert_eq!(libc::ioctl(file.as_raw_fd(), DKIOCGETBLOCKSIZE, &mut block), 0);
+                assert_eq!(libc::ioctl(file.as_raw_fd(), DKIOCGETBLOCKCOUNT, &mut count), 0);
+            }
+            return count.checked_mul(u64::from(block)).unwrap();
+        }
+    }
+    file.seek(SeekFrom::End(0)).unwrap()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let name = std::path::Path::new(&args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -289,7 +312,7 @@ fn main() {
     let serve = serve.unwrap_or_else(|| own(&args[1..]));
     let (socket, image) = (serve.socket.clone(), serve.image.clone());
     let mut file = OpenOptions::new().read(true).write(!serve.read_only).open(&image).unwrap();
-    let len = file.seek(SeekFrom::End(0)).unwrap();
+    let len = image_size(&mut file);
     let mut probe = [0u8; 1];
     file.seek(SeekFrom::Start(0)).unwrap();
     let _ = file.read(&mut probe);

@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 17:46:10 +0900
+Subject: [PATCH] macos: a drive on a block device has the device's size
+
+A drive's size is read with lseek(fd, 0, SEEK_END), which on Linux gives
+a block device's capacity and on macOS gives 0 for one (measured on a
+/dev/diskN of hdiutil attach -nomount): a drive on a block device was a
+0-byte disk. DiskProperties::file_size reads the size with
+platform::fs::size, which on macOS reads a block device's block count
+times its block size (DKIOCGETBLOCKCOUNT, DKIOCGETBLOCKSIZE) and seeks
+otherwise. The same function serves a drive's rescan (PATCH /drives).
+Nothing changes on Linux or Windows.
+
+Test: cargo test -p vmm --lib platform::fs::tests::test_block_device_size
+(a raw image attached as /dev/diskN, as the user).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vmm/src/devices/virtio/block/virtio/device.rs | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/vmm/src/devices/virtio/block/virtio/device.rs b/src/vmm/src/devices/virtio/block/virtio/device.rs
+index e048151f472991f68edd7bd5ca5bde9188dd572b..56262a2d7997ed0801795aca362e6ab141c1f21e 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/device.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/device.rs
+@@ -8,6 +8,8 @@
+ use std::cmp;
+ use std::convert::From;
+ use std::fs::{File, OpenOptions};
++// wick: the size is read by `platform::fs::size`; the tests still seek.
++#[cfg(test)]
+ use std::io::{Seek, SeekFrom};
+ use std::ops::Deref;
+ use std::os::fd::AsRawFd;
+@@ -87,8 +89,8 @@ impl DiskProperties {
+ 
+     // Helper function that gets the size of the file
+     fn file_size(disk_image_path: &str, disk_image: &mut File) -> Result<u64, VirtioBlockError> {
+-        let disk_size = disk_image
+-            .seek(SeekFrom::End(0))
++        // wick: a block device's size, which macOS's lseek to the end reports as 0.
++        let disk_size = crate::platform::fs::size(disk_image)
+             .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.to_string()))?;
+ 
+         // We only support disk size, which uses the first two words of the configuration space.
