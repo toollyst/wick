@@ -965,6 +965,12 @@ mod macos {
 
     /// `(allow <op> (require-all <condition> (<filter> <prefix><name>...)))`,
     /// or nothing for an empty list.
+    ///
+    /// A system call whose number `UNFILTERED_SYSCALLS` records is written as
+    /// that number, not as its `SYS_` name: libsandbox's names are those of
+    /// the major it ships with, and an unknown one fails the whole profile
+    /// (macOS 15 and 26 have no `SYS_getumask`), while a system call's number
+    /// does not change between majors.
     fn allow(op: &str, condition: &str, filter: &str, prefix: &str, names: &[&str]) -> String {
         if names.is_empty() {
             return String::new();
@@ -972,8 +978,13 @@ mod macos {
         let mut list = format!("({filter}");
         for name in names {
             list.push(' ');
-            list.push_str(prefix);
-            list.push_str(name);
+            match UNFILTERED_SYSCALLS.iter().find(|(n, ..)| n == name) {
+                Some((_, number, ..)) if prefix == "SYS_" => list.push_str(&number.to_string()),
+                _ => {
+                    list.push_str(prefix);
+                    list.push_str(name);
+                }
+            }
         }
         list.push(')');
         if condition.is_empty() {
@@ -1782,6 +1793,17 @@ mod macos {
             names.sort_unstable();
             names.dedup();
             assert_eq!(names.len(), SYSCALLS.len() + SETUP_SYSCALLS.len());
+            // A call the table numbers is written by number, since an older
+            // libsandbox may not know its name (macOS 15 and 26: SYS_getumask).
+            let rules = [syscall_rule(), api_profile()].concat();
+            for (name, number, ..) in UNFILTERED_SYSCALLS {
+                for end in [" ", ")"] {
+                    assert!(!rules.contains(&format!("SYS_{name}{end}")), "{name} by name");
+                }
+                if names.contains(name) {
+                    assert!(rules.contains(&format!(" {number} ")) || rules.contains(&format!(" {number})")), "{name}");
+                }
+            }
             for needed in ["read", "write", "mmap", "kevent", "exit", "__pthread_kill"] {
                 assert!(SYSCALLS.contains(&needed), "{needed}");
             }
