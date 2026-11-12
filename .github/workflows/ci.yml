@@ -723,8 +723,10 @@ jobs:
       # runner, when one comes, gives their first Intel measurement
       # (test_bp_ways_on_record prints how each way to hand a #BP back
       # fares). Then libc's record of an AF_UNIX bind of each path form
-      # (BINDTEST lines). Records only print; a crash in one fails this
-      # step, never the kit. Last, after the kit's
+      # (BINDTEST lines), and the vmm's record of what the network
+      # endpoint's descriptor check costs a frame (the TAPCHECK line: the
+      # unit tests' step built that test binary). Records only print; a
+      # crash in one fails this step, never the kit. Last, after the kit's
       # upload, so a WHP result never costs the PC its kit; it runs whatever
       # the steps before gave.
       - name: WHP tests on the runner
@@ -762,4 +764,12 @@ jobs:
           done
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
+          t=platform::windows::net::tests::test_descriptor_check_cost_on_record
+          out=$(cargo test --locked -p vmm --lib -- \
+            --include-ignored --exact --nocapture --test-threads=1 "$t" 2>&1) || true
+          printf '%s\n' "$out"
+          if ! grep -q "test result: ok. 1 passed" <<<"$out"; then
+            echo "::error::$t did not pass alone"
+            failed=1
+          fi
           exit $failed

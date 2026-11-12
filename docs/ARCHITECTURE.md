@@ -277,5 +277,9 @@ semantics on Win32. The details are in the comments of each
   connects to both); what has run against it is the test scripts' own switch
   (`boot-test.ps1 net`, `jailer-test.ps1 netguest`). One
   switch at a time: one that connects while another is there waits its turn,
-  and what it sent reaches the guest once the other leaves. `platform::vnet`
-  handles the virtio-net header.
+  and what it sent reaches the guest once the other leaves. A frame the guest
+  sends while no switch is connected is dropped and its write succeeds, as a
+  write to a TAP that is up when nothing on the host takes the frame
+  (drivers/net/tun.c, `tun_get_user`). The descriptor Firecracker holds is
+  the listening socket: once it is closed, tx and rx fail with `EBADF` and
+  the switch is disconnected. `platform::vnet` handles the virtio-net header.

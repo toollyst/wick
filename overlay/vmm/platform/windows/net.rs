@@ -17,8 +17,23 @@
 //!   leaves; what it sent meanwhile reaches the guest then. So no frame a
 //!   switch sent is lost to the order in which switches came and went, as
 //!   on a TAP, where every host-side writer's frames reach the guest.
-//! - Frames the guest sends while no switch is connected are dropped, as on
-//!   a link without a peer.
+//! - Frames the guest sends while no switch is connected are dropped, and
+//!   the write succeeds: what Linux does with a frame written to a TAP that
+//!   is up when nothing on the host takes it (drivers/net/tun.c,
+//!   `tun_get_user`: the frame goes to the host's stack and the write
+//!   returns its length). An endpoint is never down, so the `EIO` a write to
+//!   a TAP that is down gets (the same function, `!(dev->flags & IFF_UP)`)
+//!   has no counterpart here.
+//! - The endpoint drops no frame of a switch for want of room: while
+//!   Firecracker does not read, the frames wait in the connection, and a
+//!   full connection holds the switch's writes back. A TAP drops instead:
+//!   `tun_net_xmit` drops the host's frame when the TAP's queue
+//!   (`TUN_READQ_SIZE`, 500 frames) is full (`ptr_ring_produce` fails) or
+//!   no process holds the TAP (`!tfile`). With no Firecracker there is no
+//!   endpoint, and a switch cannot connect.
+//! - The descriptor is the interface: once it is closed, reads and writes
+//!   fail with `EBADF` and the connected switch is disconnected, whoever
+//!   closed it (`Endpoint::check_open`).
 //! - The guest's frames are never sent in part: a frame the connection
 //!   cannot take at all is dropped, as when a TAP queue is full, and a frame
 //!   it took part of is completed, waiting up to [`SEND_STALL`] for the
@@ -126,12 +141,9 @@ impl Endpoint {
     /// that sends and closes, then the next that connects and sends, before
     /// a read: two frames, and the second was lost).
     ///
-    /// No switch waiting is no error. A listener that fails otherwise (its
-    /// descriptor closed, the tap's own descriptor as Firecracker sees it)
-    /// fails the I/O that asked, as I/O on a closed tap descriptor fails on
-    /// Linux (EBADF): upstream's test_tx_tap_failure and
-    /// test_read_tap_fail_event_handler close it to count tap_write_fails
-    /// and tap_read_fails, which a dropped frame left at 0.
+    /// No switch waiting is no error. A listener that fails otherwise fails
+    /// the I/O that asked. (A closed listener does not get here:
+    /// [`Endpoint::check_open`] has refused the I/O.)
     fn accept(&mut self) -> io::Result<()> {
         while self.conn.is_none() {
             let conn = match self.listener.accept() {
@@ -158,6 +170,46 @@ impl Endpoint {
             }
         }
         Ok(())
+    }
+
+    /// `EBADF` unless the tap's descriptor still names the listening socket.
+    ///
+    /// The descriptor Firecracker holds for the interface
+    /// ([`Tap::as_raw_fd`]) is the listener's, while frames flow on the
+    /// connection it accepted. On Linux `readv` and `writev` look the
+    /// descriptor up first and fail with `EBADF` when it is closed
+    /// (fs/read_write.c, `do_readv` and `do_writev`: `fdget_pos`), so a
+    /// closed tap descriptor passes no frame, whatever is at the other
+    /// side. Here the connection would carry on without this check, as it
+    /// did: upstream's test_tx_tap_failure and
+    /// test_read_tap_fail_event_handler close the descriptor to count
+    /// tap_write_fails and tap_read_fails, and passed only because they
+    /// connect no switch (the listener's `accept` failed).
+    ///
+    /// The switch is disconnected, as the TAP's queue goes with its
+    /// descriptor, and what it had sent is discarded.
+    ///
+    /// "Still names" is the descriptor table's answer
+    /// (`libc::wick_fd::attached`): the [`Redirect`] attached at
+    /// [`Endpoint::open`] is found only while the value names the object it
+    /// was attached to (`CompareObjectHandles` with the table's own handle
+    /// of it), so a value closed by any call, or one that names another
+    /// object since, is not the listener. Under a jail's strict handle
+    /// checks the table asks as a probe (`libc::wick_fd::probe`), which
+    /// the sandbox lets fail.
+    ///
+    /// Cost, once per [`Tap::write_iovec`] and [`Tap::read_iovec`] (not
+    /// per segment of an offloaded frame): the table's lock, a hash lookup
+    /// and one system call (`CompareObjectHandles`). Its time is on record
+    /// from test_descriptor_check_cost_on_record (the TAPCHECK line).
+    fn check_open(&mut self) -> io::Result<()> {
+        let fd = self.listener.as_raw_fd();
+        let attached = libc::wick_fd::attached::<Redirect>(fd);
+        if attached.is_some_and(|r| Arc::ptr_eq(&r, &self.redirect)) {
+            return Ok(());
+        }
+        self.disconnect();
+        Err(io::Error::from_raw_os_error(libc::EBADF))
     }
 
     fn disconnect(&mut self) {
@@ -392,6 +444,7 @@ impl Tap {
 
     /// See [`TapDevice::write_iovec`].
     pub fn write_iovec(&mut self, buffer: &IoVecBuffer) -> io::Result<usize> {
+        self.endpoint.check_open()?;
         let total = buffer.len() as usize;
         let hdr_len = self.hdr_len.load(Ordering::Relaxed);
         self.tx.clear();
@@ -412,6 +465,7 @@ impl Tap {
     /// See [`TapDevice::read_iovec`]. The header is zeroed: a complete
     /// frame, no offloads.
     pub fn read_iovec(&mut self, buffer: &mut [libc::iovec]) -> io::Result<usize> {
+        self.endpoint.check_open()?;
         let hdr_len = self.hdr_len.load(Ordering::Relaxed);
         let mut skip = hdr_len;
         let mut first = 0;
@@ -688,6 +742,80 @@ mod tests {
         let path = tap.endpoint.path.clone();
         std::mem::forget(tap);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_a_frame_with_no_switch_is_dropped_and_the_write_succeeds() {
+        // As a write to a TAP that is up when nothing on the host takes
+        // the frame (drivers/net/tun.c, tun_get_user): the whole length is
+        // returned, and the frame is gone, not kept for a later switch.
+        let mut tap = Tap::open_named("fcnosw%d").unwrap();
+        tap.set_vnet_hdr_size(12).unwrap();
+        let mut lost = vec![0u8; 12];
+        lost.extend_from_slice(&frame(100));
+        let n = tap.write_iovec(&IoVecBuffer::from(lost.as_slice())).unwrap();
+        assert_eq!(n, lost.len());
+
+        let mut switch = UnixStream::connect(&tap.endpoint.path).unwrap();
+        switch.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut out = vec![0u8; 12];
+        out.extend_from_slice(&frame(60));
+        tap.write_iovec(&IoVecBuffer::from(out.as_slice())).unwrap();
+        // The first thing the switch reads is the second frame.
+        let mut got = [0u8; 4 + 60];
+        switch.read_exact(&mut got).unwrap();
+        assert_eq!(&got[..4], &60u32.to_be_bytes()[..]);
+        assert_eq!(&got[4..], &frame(60)[..]);
+    }
+
+    /// What [`Endpoint::check_open`] costs, on record: the time of a check
+    /// alone, and of a whole `write_iovec` of a 1514-byte frame (which
+    /// holds one check) to a switch that reads. Times are the test
+    /// profile's (unoptimised) on whatever machine runs it; nothing is
+    /// asserted of them. The guest-visible effect is `boot-test.ps1 net`'s
+    /// throughput on the PC, kit against kit.
+    #[test]
+    #[ignore = "a record: prints the TAPCHECK line, asserts no time"]
+    fn test_descriptor_check_cost_on_record() {
+        const N: u32 = 20_000;
+        let mut tap = Tap::open_named("fccost%d").unwrap();
+        tap.set_vnet_hdr_size(12).unwrap();
+        let mut switch = UnixStream::connect(&tap.endpoint.path).unwrap();
+        switch.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // The switch reads until the tap is gone, so the connection is
+        // not full for long; a frame it cannot take at all is dropped, as
+        // in the product, and is not in `delivered`.
+        let reader = std::thread::spawn(move || {
+            let mut chunk = vec![0u8; 64 << 10];
+            let mut bytes = 0usize;
+            loop {
+                match switch.read(&mut chunk) {
+                    Ok(0) | Err(_) => return bytes,
+                    Ok(n) => bytes += n,
+                }
+            }
+        });
+        let mut out = vec![0u8; 12];
+        out.extend_from_slice(&frame(1514));
+        let buffer = IoVecBuffer::from(out.as_slice());
+
+        let start = std::time::Instant::now();
+        for _ in 0..N {
+            tap.write_iovec(&buffer).unwrap();
+        }
+        let write = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..N {
+            tap.endpoint.check_open().unwrap();
+        }
+        let check = start.elapsed();
+        drop(tap);
+        let delivered = reader.join().unwrap() / (4 + 1514);
+        println!(
+            "TAPCHECK frames={N} delivered={delivered} write_iovec_ns={} check_ns={} (per call, test profile)",
+            write.as_nanos() / u128::from(N),
+            check.as_nanos() / u128::from(N),
+        );
     }
 
     #[test]
