@@ -23,6 +23,7 @@
 //!                               token:0 tokenopen:0 mitigations:<pid>
 //!                               job:0 affinity:0 spin:<seconds>
 //!                               privileges:0 largepage:<MiB>
+//!                               link:<new name>|<existing file>
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
@@ -432,6 +433,12 @@ fn check(c: &str) -> String {
             .append(true)
             .open(arg)
             .and_then(|mut f| f.write_all(b"x"))),
+        // A hard link (CreateHardLinkW), which needs write access to the
+        // existing file's attributes.
+        "link" => match arg.split_once('|') {
+            Some((new, existing)) => io(std::fs::hard_link(existing, new)),
+            None => "unknown check".into(),
+        },
         "open" => {
             let Ok(pid) = arg.parse() else {
                 return "bad pid".into();

@@ -6,9 +6,9 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,links,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
 #
-# `refuse`, `cpuset`, `weight`, `low`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
+# `refuse`, `cpuset`, `weight`, `low`, `links`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
 # and reads it); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
 # Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
@@ -23,7 +23,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'links', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -647,6 +647,60 @@ function Invoke-OnConsole([string]$cmd, [string]$out) {
 # jailer returns 0 once Firecracker runs, its pid in the pid file, and
 # Firecracker runs on. Controls: the same checks from a plain process of the
 # user, on the same console, are allowed. Needs no guest.
+# What a jail could plant for the jailer that next starts a jail of its id
+# to act on. That jailer grants the jail full access to each file in its root
+# with other names (the operator's files linked into several jails), and
+# writes Firecracker's copy and the pid file there, refusing a link in their
+# place (unit test test_copy_exec_refuses_a_planted_link). From the jail
+# (jail-probe as the jailed binary): no hard link to a file outside it, the
+# operator's that it can read, a system file, another jail's (a hard link
+# needs write access to the file's attributes), while it can link its own
+# files (the control); no entry in the directories above its root, so no
+# junction in place of the root or above. Needs no guest.
+function Stage-Links {
+    $probe = Get-Probe
+    $base = New-Base 'links'
+    $readable = Join-Path $WorkDir "links-readable-$PID.txt"
+    try {
+        $other = Start-ApiJail $base 'other'
+        $otherFile = Join-Path $other.Root 'kernel.bin'
+        Set-Content $otherFile "another jail's file"
+        Set-Content $readable "the operator's file"
+        # Readable as C:\Windows\win.ini is: Users, Everyone, application packages.
+        icacls $readable /grant '*S-1-5-32-545:R' '*S-1-1-0:R' '*S-1-15-2-1:R' | Out-Null
+        $root = Join-Path $base 'jail-probe.exe\probe\root'
+        $parent = Split-Path -Parent $root
+        $expect = [ordered]@{
+            "read:$readable"                                 = $true    # the controls: it reads that file,
+            'write:own.txt'                                  = $true    # writes in its jail
+            "link:$root\link-own.txt|$root\own.txt"          = $true    # and links its own file
+            "link:$root\link-operator.txt|$readable"         = $false
+            "link:$root\link-system.txt|C:\Windows\win.ini"  = $false
+            "link:$root\link-other.txt|$otherFile"           = $false
+            "write:$parent\entry.txt"                        = $false   # the directory of its root
+            "write:$(Split-Path -Parent $parent)\entry.txt"  = $false
+            "write:$base\entry.txt"                          = $false   # the chroot base
+        }
+        $r = Invoke-Jailer (@('--id', 'probe', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--') + @($expect.Keys)) 30000
+        $lines = $r[1] -split "`r?`n"
+        $bad = @()
+        $denied = @()
+        foreach ($k in $expect.Keys) {
+            $l = $lines | Where-Object { $_.StartsWith("$k ") } | Select-Object -First 1
+            if (-not $l) { $bad += "${k}: no answer ($($r[1].Trim()))"; continue }
+            $allowed = $l.Substring($k.Length + 1).StartsWith('allowed')
+            if ($allowed -ne $expect[$k]) { $bad += $l }
+            if ($k.StartsWith('link:') -and -not $allowed) { $denied += ($l.Substring($k.Length + 1) -replace '^denied ', '') }
+        }
+        Check ($bad.Count -eq 0) "jailed: $($bad -join '; ')"
+        Check ((Get-Content -Raw $readable).Trim() -eq "the operator's file" -and (Get-Content -Raw $otherFile).Trim() -eq "another jail's file") 'a linked file changed'
+        "jailed: no hard link to the operator's file it reads, a system file or another jail's ($($denied -join '; ')), while it links its own; no entry above its root"
+    } finally {
+        Remove-Item $readable -ErrorAction SilentlyContinue
+        Stop-Jailed
+    }
+}
+
 function Stage-Pidns {
     $base = New-Base 'pidns'
     $probe = Get-Probe

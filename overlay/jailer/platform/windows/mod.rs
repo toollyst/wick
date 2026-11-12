@@ -805,24 +805,78 @@ pub fn setup_jailed_folder(folder: &Path) -> Result<(), JailerError> {
     std::fs::create_dir_all(folder).map_err(|err| JailerError::CreateDir(folder.to_owned(), err))
 }
 
-/// Copies the operator's binary into the jail, as upstream does: a copy, so
-/// two Firecracker processes never share its memory. Never through a link
-/// planted at the destination.
-pub fn copy_exec(src: &Path, dst: &Path) -> Result<(), JailerError> {
-    if let Ok(meta) = std::fs::symlink_metadata(dst) {
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            return Err(JailerError::HardLink(dst.to_owned()));
+/// Why [`open_own`] refused a file.
+#[derive(Debug)]
+enum NotOwn {
+    /// The open failed, or found a reparse point or a directory, where
+    /// upstream's open (O_NOFOLLOW) fails: ELOOP, EISDIR.
+    Open(io::Error),
+    /// The file's information could not be read.
+    Metadata(io::Error),
+    /// The file has other names (a hard link).
+    HardLink,
+}
+
+impl From<NotOwn> for io::Error {
+    fn from(e: NotOwn) -> Self {
+        match e {
+            NotOwn::Open(e) | NotOwn::Metadata(e) => e,
+            NotOwn::HardLink => io::Error::other("the file has other names (a hard link)"),
         }
     }
-    let copy_err = |err| JailerError::Copy(src.to_owned(), dst.to_owned(), err);
-    let mut from = std::fs::File::open(src).map_err(|err| JailerError::Open(src.to_owned(), err))?;
-    let mut to = std::fs::OpenOptions::new()
+}
+
+/// Opens `path` in the jail for writing, never through a link planted there,
+/// as upstream opens what it writes in the jail: without following a symbolic
+/// link (O_NOFOLLOW; here any reparse point, a junction too), refusing a file
+/// with other names (a hard link). The checks are made on the handle returned,
+/// so nothing can be swapped in between, and it is shared with no one. The
+/// open creates the file or opens the one there in one step (OPEN_ALWAYS);
+/// an existing file is emptied only after the checks.
+fn open_own(path: &Path) -> Result<std::fs::File, NotOwn> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::{ERROR_STOPPED_ON_SYMLINK, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, GetFileInformationByHandle,
+    };
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
-        .open(dst)
-        .map_err(|err| JailerError::Open(dst.to_owned(), err))?;
-    io::copy(&mut from, &mut to).map_err(copy_err)?;
+        .access_mode(GENERIC_WRITE | FILE_READ_ATTRIBUTES)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(NotOwn::Open)?;
+    // SAFETY: zeroed is a valid value of the plain structure.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: an open handle and a structure to fill.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(NotOwn::Metadata(last_error()));
+    }
+    if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return Err(NotOwn::Open(io::Error::from_raw_os_error(ERROR_STOPPED_ON_SYMLINK as i32)));
+    }
+    if info.nNumberOfLinks > 1 {
+        return Err(NotOwn::HardLink);
+    }
+    file.set_len(0).map_err(NotOwn::Open)?;
+    Ok(file)
+}
+
+/// Copies the operator's binary into the jail, as upstream does: a copy, so
+/// two Firecracker processes never share its memory; never through a link
+/// planted there ([`open_own`]). Upstream copies over an existing file of the
+/// name without emptying it (no O_TRUNC), leaving the end of a longer one;
+/// here it is emptied first.
+pub fn copy_exec(src: &Path, dst: &Path) -> Result<(), JailerError> {
+    let mut from = std::fs::File::open(src).map_err(|err| JailerError::Open(src.to_owned(), err))?;
+    let mut to = open_own(dst).map_err(|e| match e {
+        NotOwn::Open(err) => JailerError::Open(dst.to_owned(), err),
+        NotOwn::Metadata(err) => JailerError::Metadata(dst.to_owned(), err),
+        NotOwn::HardLink => JailerError::HardLink(dst.to_owned()),
+    })?;
+    io::copy(&mut from, &mut to).map_err(|err| JailerError::Copy(src.to_owned(), dst.to_owned(), err))?;
     Ok(())
 }
 
@@ -2051,12 +2105,7 @@ fn exec(
     // Upstream's pid file holds the jailer's pid, which an exec keeps; here it
     // is Firecracker's.
     let pid_file = jail.root.join(format!("{}.pid", name.to_string_lossy()));
-    if let Err(e) = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&pid_file)
-        .and_then(|mut f| write!(f, "{}", fc.pid))
-    {
+    if let Err(e) = open_own(&pid_file).map_err(io::Error::from).and_then(|mut f| write!(f, "{}", fc.pid)) {
         return Err(kill("the pid file", e));
     }
     for p in std::iter::once(&fc).chain(api_process.as_ref()) {
@@ -2459,10 +2508,69 @@ mod tests {
         let dst = dir.join("dst.exe");
         copy_exec(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"binary");
-        // Not over a directory.
+        // Not over a directory: the open fails, as upstream's (EISDIR).
         let d = dir.join("d");
         std::fs::create_dir(&d).unwrap();
-        assert!(matches!(copy_exec(&src, &d).unwrap_err(), JailerError::HardLink(_)));
+        assert!(matches!(copy_exec(&src, &d).unwrap_err(), JailerError::Open(p, _) if p == d));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // A link planted where the jailer copies Firecracker (upstream's
+    // test_exec_destination_path_is_hardlink and _is_symlink): refused, as
+    // upstream refuses it (the hard link after its open, the symbolic link
+    // at its open, O_NOFOLLOW), and the linked file is left as it was.
+    #[test]
+    fn test_copy_exec_refuses_a_planted_link() {
+        let dir = std::env::temp_dir().join(format!("wick-jailer-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.exe");
+        std::fs::write(&src, b"binary").unwrap();
+        let target = dir.join("target.txt");
+        let content = b"the operator's file".as_slice();
+        std::fs::write(&target, content).unwrap();
+
+        let hard = dir.join("hard.exe");
+        std::fs::hard_link(&target, &hard).unwrap();
+        let r = copy_exec(&src, &hard).map_err(|e| e.to_string());
+        let after = std::fs::read(&target).unwrap();
+        assert!(
+            r.as_ref().is_err_and(|e| e.starts_with("Detected hard link at: ")) && after == content,
+            "a hard link: {r:?}; the linked file now holds {:?}",
+            String::from_utf8_lossy(&after)
+        );
+
+        let sym = dir.join("sym.exe");
+        std::os::windows::fs::symlink_file(&target, &sym)
+            .expect("a symbolic link (the test needs SeCreateSymbolicLinkPrivilege: run it elevated)");
+        let r = copy_exec(&src, &sym);
+        assert!(matches!(&r, Err(JailerError::Open(p, _)) if *p == sym), "a symbolic link: {r:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), content);
+
+        // One that leads nowhere: nothing is made where it points.
+        let dangling = dir.join("dangling.exe");
+        std::os::windows::fs::symlink_file(dir.join("nowhere.exe"), &dangling).unwrap();
+        let r = copy_exec(&src, &dangling);
+        assert!(matches!(&r, Err(JailerError::Open(p, _)) if *p == dangling), "a dangling symbolic link: {r:?}");
+        assert!(!dir.join("nowhere.exe").exists());
+
+        // A directory junction (made without a privilege, unlike a symbolic link).
+        let junction = dir.join("junction.exe");
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "mklink /J: {out:?}");
+        let r = copy_exec(&src, &junction);
+        assert!(matches!(&r, Err(JailerError::Open(p, _)) if *p == junction), "a junction: {r:?}");
+
+        // A file of its own of that name (a jail started again): copied over, whole.
+        let old = dir.join("old.exe");
+        std::fs::write(&old, b"a longer binary of a previous run").unwrap();
+        copy_exec(&src, &old).unwrap();
+        assert_eq!(std::fs::read(&old).unwrap(), b"binary");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
