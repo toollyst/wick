@@ -239,6 +239,17 @@ mod macos {
         // exit, exit_group: a thread's exit, a worker thread parking, a panic.
         "exit", "bsdthread_terminate", "__disable_threadsignal", "workq_open", "workq_kernreturn",
         "abort_with_payload", "os_fault_with_payload",
+        // A cancellation point's EINTR (read, nanosleep, ... interrupted by a
+        // handled signal, the vCPU kick's included): libsystem's stub asks
+        // whether the calling thread was cancelled before it returns the
+        // error (Libsyscall custom/errno.c `cerror`, libpthread
+        // `_pthread_exit_if_canceled`). The call reads or sets the calling
+        // thread's own cancellation state only (XNU bsd/kern/kern_sig.c
+        // `__pthread_canceled`); no thread is ever marked cancelled here
+        // (__pthread_markcancel is in no list), so the answer is always no.
+        // Never seen in discovery: only a signal landing inside a blocking
+        // call takes that path (test_a_handled_signal_interrupts_a_blocking_call).
+        "__pthread_canceled",
     ];
 
     /// What decides a system call of [`UNFILTERED_SYSCALLS`] in this
@@ -573,6 +584,8 @@ mod macos {
         // exit, exit_group: a thread's exit, a panic.
         "exit", "bsdthread_terminate", "__disable_threadsignal", "abort_with_payload",
         "os_fault_with_payload",
+        // As in SYSCALLS: a cancellation point's EINTR.
+        "__pthread_canceled",
         // As in SYSCALLS: what macOS 27 lets through by an operation's rule
         // where an older major checks the number, so that every major
         // behaves as 27 (the API process's profile has no file rule, so
@@ -2053,6 +2066,100 @@ mod macos {
             assert!(stdout.contains("EPOLL-OK"), "{}", text(&out));
             assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
             assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
+        }
+
+        // A handled signal that lands while a thread is blocked in a
+        // cancellation point (the vCPU kick, SIGRTMIN here as upstream sends
+        // it, with upstream's flags: no SA_RESTART) makes the call fail with
+        // EINTR, and the thread goes on, in every phase and profile, as on
+        // Linux. libsystem's stub of such a call asks the kernel whether the
+        // thread was cancelled (__pthread_canceled(0)) before it returns
+        // EINTR (Libsyscall custom/errno.c `cerror`, libpthread
+        // pthread_cancelable.c `_pthread_exit_if_canceled`); unlisted, that
+        // query raised SIGSYS and stopped the microVM. Two cancellation
+        // points: read on a pipe, and nanosleep (__semwait_signal) where the
+        // profile lets a thread sleep (not the API process's: it has no
+        // clock or __semwait_signal).
+        #[test]
+        fn test_a_handled_signal_interrupts_a_blocking_call() {
+            for case in ["setup", "run", "api"] {
+                let out = child("interrupted_child", &[("WICK_TEST_CASE", case)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(stdout.contains("SANDBOXED"), "{case}: {}", text(&out));
+                assert!(out.status.success() && stdout.contains("CHILD-OK"), "{case}: {}", text(&out));
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_a_handled_signal_interrupts_a_blocking_call in a separate process"]
+        fn interrupted_child() {
+            use std::os::unix::thread::JoinHandleExt;
+            use std::sync::atomic::AtomicU8;
+            use std::time::{Duration, Instant};
+
+            use crate::utils::signal::{register_signal_handler, sigrtmin};
+            extern "C" fn kicked(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
+            register_signal_handler(sigrtmin(), kicked).unwrap();
+            let mut fds = [0; 2];
+            // SAFETY: an array of two descriptors to fill.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // How far the blocked thread is: 1 its read returned, 2 its
+            // sleep did.
+            static STAGE: AtomicU8 = AtomicU8::new(0);
+            let reader = fds[0];
+            let case = std::env::var("WICK_TEST_CASE").unwrap();
+            let sleeps = case != "api";
+            // Made before the sandbox, as the vCPU and API threads are.
+            let blocked = std::thread::spawn(move || {
+                let mut byte = 0u8;
+                // SAFETY: one byte into a local, from the pipe's read end.
+                let read = unsafe { libc::read(reader, (&raw mut byte).cast(), 1) };
+                let read_err = std::io::Error::last_os_error().raw_os_error();
+                STAGE.store(1, Ordering::Release);
+                let (mut sleep, mut sleep_err) = (-1, Some(libc::EINTR));
+                if sleeps {
+                    let long = libc::timespec { tv_sec: 30, tv_nsec: 0 };
+                    // SAFETY: a time to sleep and no remainder asked for.
+                    sleep = unsafe { libc::nanosleep(&long, std::ptr::null_mut()) };
+                    sleep_err = std::io::Error::last_os_error().raw_os_error();
+                }
+                STAGE.store(2, Ordering::Release);
+                (read, read_err, sleep, sleep_err)
+            });
+            match case.as_str() {
+                "setup" => {
+                    select(Policy::Default);
+                    apply().unwrap();
+                }
+                "run" => {
+                    select(Policy::Default);
+                    apply().unwrap();
+                    narrow().unwrap();
+                }
+                "api" => {
+                    select(Policy::Default);
+                    apply_api().unwrap();
+                }
+                other => panic!("no case {other}"),
+            }
+            println!("SANDBOXED");
+            // A signal may come before the thread blocks: it is sent again
+            // until both calls have returned.
+            let start = Instant::now();
+            while STAGE.load(Ordering::Acquire) < 2 {
+                assert!(start.elapsed() < Duration::from_secs(10), "stage {}", STAGE.load(Ordering::Acquire));
+                // SAFETY: a live thread of this process.
+                assert_eq!(unsafe { libc::pthread_kill(blocked.as_pthread_t(), sigrtmin()) }, 0);
+                // Spun, not slept: the API process's profile has no sleep.
+                let sent = Instant::now();
+                while sent.elapsed() < Duration::from_millis(20) {
+                    std::hint::spin_loop();
+                }
+            }
+            let (read, read_err, sleep, sleep_err) = blocked.join().unwrap();
+            assert_eq!((read, read_err), (-1, Some(libc::EINTR)));
+            assert_eq!((sleep, sleep_err), (-1, Some(libc::EINTR)));
+            println!("CHILD-OK");
         }
 
         // narrow() cannot be undone: after it, no extension can be issued or
