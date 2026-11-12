@@ -599,16 +599,48 @@ _MEMORY_PARTS = pathlib.Path(os.environ.get("WICK_IT_BINARY_DIR", SESSION_ROOT))
 # - WICK_IT_DIAG_MEMORY: each reading get_stable_rss_mem takes logs its parts
 #   to memory-diag.jsonl (diag_get_resident_memory), and each stable reading
 #   the guest's view (diag_get_stable_rss_mem).
+# - WICK_IT_DIAG_RSS_LESS=shared-cache or =vmm: get_resident_memory, as
+#   get_stable_rss_mem reads it, leaves out the VMM's platform part (the
+#   dyld shared cache's pages) or the VMM's both parts (the shared cache's
+#   and its own, leaving the guest's memory): what the tests that size
+#   something from the reading (test_deflate_on_oom's balloon) do with a
+#   VMM of less memory, Linux's static binary has no platform part. Its
+#   readings are logged as WICK_IT_DIAG_MEMORY logs them (on with it).
 # - WICK_IT_DEFER_MEMORY_ERROR: the memory monitor's error at a kill inside a
 #   test (upstream raises it there, microvm.py kill -> check_samples, and the
 #   test's later steps do not run) is held to the test's end and raised
 #   then, the same error, so the test still fails; the steps after the kill
 #   run, and memory-diag.jsonl records how they ended.
-DIAGNOSTIC_SWITCHES = ("WICK_IT_DIAG_MEMORY", "WICK_IT_DEFER_MEMORY_ERROR")
+DIAGNOSTIC_SWITCHES = ("WICK_IT_DIAG_MEMORY", "WICK_IT_DIAG_RSS_LESS", "WICK_IT_DEFER_MEMORY_ERROR")
 DIAGNOSTIC = [s for s in DIAGNOSTIC_SWITCHES if os.environ.get(s, "") not in ("", "0")]
+RSS_LESS = os.environ.get("WICK_IT_DIAG_RSS_LESS", "") if "WICK_IT_DIAG_RSS_LESS" in DIAGNOSTIC else ""
+if RSS_LESS not in ("", "shared-cache", "vmm"):
+    raise ValueError(f"WICK_IT_DIAG_RSS_LESS={RSS_LESS!r}: shared-cache or vmm")
 _MEMORY_DIAG = _MEMORY_PARTS.with_name("memory-diag.jsonl")
 # While a test's call runs with WICK_IT_DEFER_MEMORY_ERROR: the errors held.
 _DEFERRED = {"active": False, "errors": []}
+
+
+# Upstream's rule for guest memory (MemoryMonitor.is_guest_mem, by a
+# mapping's size and the architecture's memory layout), on an instance that
+# is never started: the rule reads only the class's layout constants.
+_GUEST_RULE = _memory.MemoryMonitor.__new__(_memory.MemoryMonitor)
+
+
+def vmm_parts(maps, guest_bytes):
+    """Bytes: the VMM's two parts in `maps` (memory_maps), as the memory
+    monitor counts them: the dyld shared cache's mappings, and every other
+    mapping but guest memory, which upstream's monitor knows by its size
+    (MemoryMonitor.is_guest_mem), and a Nitro Enclaves device's."""
+    own = cache = 0
+    for m in maps:
+        # Upstream skips a mapping by its size as guest memory; the
+        # shared cache's are never guest memory, and some are larger.
+        if m.shared_cache:
+            cache += m.rss
+        elif "nitro_enclaves" not in m.path and not _GUEST_RULE.is_guest_mem(m.size, guest_bytes):
+            own += m.rss
+    return own, cache
 
 
 def monitor_run(self):
@@ -630,14 +662,7 @@ def monitor_run(self):
             mmaps = ps.memory_maps(grouped=False)
         except psutil.NoSuchProcess:
             return
-        own = cache = 0
-        for m in mmaps:
-            # Upstream skips a mapping by its size as guest memory; the
-            # shared cache's are never guest memory, and some are larger.
-            if m.shared_cache:
-                cache += m.rss
-            elif "nitro_enclaves" not in m.path and not self.is_guest_mem(m.size, guest):
-                own += m.rss
+        own, cache = vmm_parts(mmaps, guest)
         self._current_rss = own
         self.wick_shared_cache_rss = cache
         self.wick_peak = {"own": max(own, self.wick_peak["own"]),
@@ -991,16 +1016,55 @@ def _guest_memory(uvm):
     return out
 
 
+# The guest's memory size in bytes, while diag_get_stable_rss_mem runs.
+_DIAG_GUEST = [None]
+
+
+def _deflate_balloon_mib(reading_kib):
+    """The balloon test_deflate_on_oom inflates from a reading (KiB):
+    `256 - (int(initial_rss / 1024) + 50)` (test_balloon.py)."""
+    return 256 - (int(reading_kib / 1024) + 50)
+
+
 def diag_get_resident_memory(process):
     """get_resident_memory, and in a get_stable_rss_mem call of a diagnostic
     run (WICK_IT_DIAG_MEMORY) the reading's parts, logged to
     memory-diag.jsonl: the task's resident size and phys_footprint, its
-    regions (_region_groups) and the host's paging (_host_memory)."""
+    regions (_region_groups) and the host's paging (_host_memory), and the
+    VMM's two parts as the memory monitor counts them (vmm_parts), with the
+    balloon test_deflate_on_oom would size from the reading with or without
+    them. With WICK_IT_DIAG_RSS_LESS the reading returned leaves out the
+    shared cache's part (shared-cache) or both parts (vmm).
+
+    The sweep "own_mib": the reading less the shared cache's part, with the
+    VMM's own part replaced by 0 to 5 MiB: what a VMM that holds that much
+    besides the guest would read. Linux's Firecracker holds at most 5 MiB
+    (upstream's SPECIFICATION.md: a memory overhead <= 5 MiB, the memory
+    monitor's budget); how much less is not measured here (the Linux CI
+    keeps pass and fail only), so every value is logged, not one guessed."""
     rss = get_resident_memory(process)
     if _DIAG_CALL[1] is not None:
         record = {"kind": "reading", "call": _DIAG_CALL[1], "pid": process.pid, "rss_kib": rss}
         try:
             record.update(task=_task_memory(process.pid), regions=_region_groups(process.pid))
+            if _DIAG_GUEST[0]:
+                with _FOOTPRINT_LOCK:
+                    own, cache = vmm_parts(_memory_maps(process), _DIAG_GUEST[0])
+                guest = rss * 1024 - own - cache
+                record["parts"] = {
+                    "full_kib": rss, "shared_cache_kib": cache >> 10, "own_kib": own >> 10,
+                    "balloon_mib": {
+                        "full": _deflate_balloon_mib(rss),
+                        "less shared cache": _deflate_balloon_mib((rss * 1024 - cache) >> 10),
+                        "guest only": _deflate_balloon_mib(guest >> 10),
+                        "own_mib": {x: _deflate_balloon_mib((guest + (x << 20)) >> 10) for x in range(6)},
+                    },
+                }
+                if RSS_LESS == "shared-cache":
+                    rss = (rss * 1024 - cache) >> 10
+                elif RSS_LESS == "vmm":
+                    rss = guest >> 10
+                record["rss_less"], record["returned_kib"] = RSS_LESS, rss
         except psutil.NoSuchProcess:
             record["error"] = "process gone"
         record["host"] = _host_memory()
@@ -1017,15 +1081,16 @@ def diag_get_stable_rss_mem(uvm, percentage_delta=1):
     the guest's view (_guest_memory)."""
     _DIAG_CALL[0] += 1
     _DIAG_CALL[1] = _DIAG_CALL[0]
+    _DIAG_GUEST[0] = getattr(uvm, "mem_size_bytes", None)
     try:
         rss = _real_get_stable_rss_mem(uvm, percentage_delta)
     finally:
-        _DIAG_CALL[1] = None
+        _DIAG_CALL[1] = _DIAG_GUEST[0] = None
     _diag_write({"kind": "stable", "call": _DIAG_CALL[0], "rss_kib": rss, "guest": _guest_memory(uvm)})
     return rss
 
 
-if "WICK_IT_DIAG_MEMORY" in DIAGNOSTIC:
+if "WICK_IT_DIAG_MEMORY" in DIAGNOSTIC or RSS_LESS:
     _libsystem.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
     _utils.get_resident_memory = diag_get_resident_memory
     _utils.get_stable_rss_mem = diag_get_stable_rss_mem
@@ -1468,7 +1533,7 @@ def pytest_runtest_setup(item):
         module.os = _ProcFdOs()
     # A diagnostic run's readings (WICK_IT_DIAG_MEMORY): the test modules
     # that import get_stable_rss_mem by name.
-    if module is not None and "WICK_IT_DIAG_MEMORY" in DIAGNOSTIC \
+    if module is not None and ("WICK_IT_DIAG_MEMORY" in DIAGNOSTIC or RSS_LESS) \
             and getattr(module, "get_stable_rss_mem", None) is _real_get_stable_rss_mem:
         module.get_stable_rss_mem = diag_get_stable_rss_mem
 

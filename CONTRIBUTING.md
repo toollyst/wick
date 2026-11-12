@@ -256,7 +256,9 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   the functional and security suites as the user; `--jailer` runs them as root
   with wick's jailer, as upstream's CI does on Linux. `WICK_IT_DIAG_MEMORY=1`
   (each memory reading `get_stable_rss_mem` takes logged with its parts, the
-  host's paging and the guest's `/proc/meminfo`, in `OUT/memory-diag.jsonl`)
+  host's paging and the guest's `/proc/meminfo`, in `OUT/memory-diag.jsonl`),
+  `WICK_IT_DIAG_RSS_LESS=shared-cache` or `=vmm` (that reading without the
+  VMM's dyld shared cache part, or without both its parts)
   and `WICK_IT_DEFER_MEMORY_ERROR=1` (the memory monitor's error at a kill
   inside a test held to the test's end, so the steps after the kill run; the
   test still fails) make a diagnostic run: `provenance.txt` says so, the
