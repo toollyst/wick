@@ -159,7 +159,11 @@ semantics on Win32. The details are in the comments of each
   Linux kernel ABI bindings (`ifreq`, io_uring, ...).
 - **errno = Win32/WSA codes**, chosen so that the `io::ErrorKind` mapping
   matches Linux (`EPERM`=`WSAEACCES`, `EAGAIN`=`EWOULDBLOCK`,
-  `ENOTTY`=`ERROR_INVALID_FUNCTION`, ...).
+  `ENOTTY`=`ERROR_INVALID_FUNCTION`, ...). A code Windows gives beside one of
+  them with the same meaning is mapped to it (`libc::wick_errno_from_win32`:
+  `ERROR_PATH_NOT_FOUND` is `ENOENT`, `ERROR_OUTOFMEMORY` `ENOMEM`, ...), so
+  upstream's comparisons with `libc::E*` match; the WHP backend's `HRESULT`s
+  go through it.
 - **Per-object state (`libc::wick_fd`).** State that belongs to the object a
   handle points to (eventfd counter, timer schedule, status flags such as
   `O_NONBLOCK`, memfd seal sections) is keyed by the fd value. A duplicate of

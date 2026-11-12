@@ -141,11 +141,68 @@ errnos! {
     ENOPROTOOPT = 10042;
 }
 
+/// The `E*` constant of a Win32 or Winsock error code: the code itself when
+/// it is one, else the constant of the same meaning for a code Windows uses
+/// beside it (a synonym), so that what upstream code compares with
+/// `libc::EX` matches whichever of them a Windows call gave. A code with no
+/// Linux counterpart is kept as it is: it matches no `E*`, as an errno
+/// Firecracker does not expect matches none of its arms.
+pub fn wick_errno_from_win32(code: c_int) -> c_int {
+    match code {
+        // ERROR_PATH_NOT_FOUND, ERROR_INVALID_DRIVE, ERROR_BAD_NETPATH,
+        // ERROR_BAD_NET_NAME, ERROR_BAD_PATHNAME, ERROR_MOD_NOT_FOUND,
+        // ERROR_NOT_FOUND: no such file, directory or object.
+        3 | 15 | 53 | 67 | 161 | 126 | 1168 => ENOENT,
+        // ERROR_FILE_EXISTS (CreateFile's CREATE_NEW).
+        80 => EEXIST,
+        // ERROR_OUTOFMEMORY, ERROR_COMMITMENT_LIMIT.
+        14 | 1455 => ENOMEM,
+        // ERROR_HANDLE_DISK_FULL.
+        39 => ENOSPC,
+        // ERROR_NO_DATA: a pipe being closed at the other end.
+        232 => EPIPE,
+        // ERROR_SEM_TIMEOUT, WAIT_TIMEOUT, ERROR_TIMEOUT.
+        121 | 258 | 1460 => ETIMEDOUT,
+        // ERROR_PRIVILEGE_NOT_HELD: Linux's EPERM for a missing capability.
+        1314 => EPERM,
+        // ERROR_INVALID_FLAGS.
+        1004 => EINVAL,
+        // ERROR_INVALID_USER_BUFFER.
+        1784 => EFAULT,
+        // Winsock's codes for what Win32 codes name elsewhere: WSAEBADF,
+        // WSAEFAULT, WSAEINVAL, WSAENAMETOOLONG, WSAENOTEMPTY.
+        10009 => EBADF,
+        10014 => EFAULT,
+        10022 => EINVAL,
+        10063 => ENAMETOOLONG,
+        10066 => ENOTEMPTY,
+        _ => code,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Error, ErrorKind};
 
     use super::*;
+
+    // Every E* constant is its own value; each synonym gives the constant of
+    // its meaning; an unknown code is kept.
+    #[test]
+    fn test_synonyms_give_the_constant() {
+        for e in [ENOENT, EEXIST, ENOMEM, EINVAL, EBADF, EFAULT, EPIPE, ETIMEDOUT, EPERM, EACCES, EBUSY, EAGAIN, EINTR] {
+            assert_eq!(wick_errno_from_win32(e), e);
+        }
+        for (code, e) in [
+            (3, ENOENT), (15, ENOENT), (53, ENOENT), (67, ENOENT), (161, ENOENT), (126, ENOENT), (1168, ENOENT),
+            (80, EEXIST), (14, ENOMEM), (1455, ENOMEM), (39, ENOSPC), (232, EPIPE),
+            (121, ETIMEDOUT), (258, ETIMEDOUT), (1460, ETIMEDOUT), (1314, EPERM), (1004, EINVAL), (1784, EFAULT),
+            (10009, EBADF), (10014, EFAULT), (10022, EINVAL), (10063, ENAMETOOLONG), (10066, ENOTEMPTY),
+        ] {
+            assert_eq!(wick_errno_from_win32(code), e, "code {code}");
+        }
+        assert_eq!(wick_errno_from_win32(0x1234), 0x1234);
+    }
 
     #[test]
     fn test_kinds_match_linux() {

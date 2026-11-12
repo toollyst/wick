@@ -30,28 +30,29 @@ pub(crate) fn hr(hres: i32) -> Result<()> {
     }
 }
 
-/// Maps the WHP/Win32 `HRESULT` to the closest Linux errno, so callers see
-/// the error values KVM would give. The raw `HRESULT` is kept as the error's
-/// OS code for anything that wants the exact facility/code.
+/// `WHV_E_VP_ALREADY_EXISTS` (winhvplatformdefs.h).
+const WHV_E_VP_ALREADY_EXISTS: i32 = 0x8037_0306u32 as i32;
+
+/// Maps a WHP `HRESULT` to the errno KVM gives for the same failure, in
+/// the compat libc's errno values (each `libc::E*` is a Win32 code,
+/// `windows_errno.rs`). A Win32 error (`FACILITY_WIN32`, `0x8007xxxx`:
+/// `E_INVALIDARG`, `E_ACCESSDENIED`, `E_OUTOFMEMORY` among them) is its
+/// code through [`libc::wick_errno_from_win32`], so a synonym of a
+/// constant gives that constant; `E_NOTIMPL` is `ENOSYS`; a vCPU that
+/// exists already is `EEXIST`, as `KVM_CREATE_VCPU` answers; every other
+/// `HRESULT` (WHP's own `WHV_E_*`, the generic ones) is `EINVAL`, what KVM
+/// returns for an argument it rejects.
 fn from_hresult(hres: i32) -> Error {
-    use windows_sys::Win32::Foundation::{
-        E_ACCESSDENIED, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY,
-    };
-    // WHP uses HRESULTs from FACILITY_WIN32 (0x8007xxxx) for Win32 errors, and
-    // a few generic ones. Translate the ones that matter; keep the rest as a
-    // generic EINVAL (what KVM returns for a rejected ioctl argument).
+    use windows_sys::Win32::Foundation::E_NOTIMPL;
     const WIN32_FACILITY: i32 = 0x8007_0000u32 as i32;
     if (hres & 0xFFFF_0000u32 as i32) == WIN32_FACILITY {
-        return Error::new(hres & 0xFFFF);
+        return Error::new(libc::wick_errno_from_win32(hres & 0xFFFF));
     }
-    let errno = match hres {
-        E_INVALIDARG => libc::EINVAL,
-        E_ACCESSDENIED => libc::EACCES,
-        E_OUTOFMEMORY => libc::ENOMEM,
+    Error::new(match hres {
         E_NOTIMPL => libc::ENOSYS,
+        WHV_E_VP_ALREADY_EXISTS => libc::EEXIST,
         _ => libc::EINVAL,
-    };
-    Error::new(errno)
+    })
 }
 
 /// Whether WHP is present on this host (the hypervisor platform feature is
@@ -261,5 +262,33 @@ impl Drop for OwnedHandle {
             // SAFETY: closes the handle this wrapper owns.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The HRESULTs WHP calls return, each as the errno KVM gives for that
+    // failure (in the compat libc's values): the Win32 ones through the one
+    // table, so E_INVALIDARG is EINVAL and E_OUTOFMEMORY (ERROR_OUTOFMEMORY,
+    // 14) ENOMEM, not its raw code.
+    #[test]
+    fn test_hresults_are_kvms_errnos() {
+        let errno = |h: u32| from_hresult(h as i32).errno();
+        assert_eq!(errno(0x8007_0057), libc::EINVAL, "E_INVALIDARG");
+        assert_eq!(errno(0x8007_0005), libc::EACCES, "E_ACCESSDENIED");
+        assert_eq!(errno(0x8007_000E), libc::ENOMEM, "E_OUTOFMEMORY");
+        assert_eq!(errno(0x8007_0008), libc::ENOMEM, "ERROR_NOT_ENOUGH_MEMORY");
+        assert_eq!(errno(0x8007_05AF), libc::ENOMEM, "ERROR_COMMITMENT_LIMIT");
+        assert_eq!(errno(0x8007_007E), libc::ENOENT, "ERROR_MOD_NOT_FOUND (no WHP)");
+        assert_eq!(errno(0x8007_00AA), libc::EBUSY, "ERROR_BUSY");
+        assert_eq!(errno(0x8000_4001), libc::ENOSYS, "E_NOTIMPL");
+        assert_eq!(errno(0x8037_0306), libc::EEXIST, "WHV_E_VP_ALREADY_EXISTS");
+        // WHP's other own codes and the generic ones: EINVAL.
+        for h in [0x8037_0300u32, 0x8037_0302, 0x8037_0305, 0x8037_0307, 0x8037_0308, 0x8037_0309, 0x8000_4005] {
+            assert_eq!(errno(h), libc::EINVAL, "{h:#x}");
+        }
+        assert!(hr(S_OK).is_ok());
     }
 }
