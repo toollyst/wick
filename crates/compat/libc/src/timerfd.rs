@@ -12,7 +12,12 @@
 //! expires and yields one native-endian `u64` per expiration, like a Linux
 //! timerfd. One background thread fires all timers through a write-only
 //! descriptor of its own, and learns that the caller closed the timer when
-//! the FIFO has no reader left (`EPIPE`).
+//! the FIFO has no reader left (`EPIPE`). It waits for the next expiration
+//! on a kqueue timer marked `NOTE_CRITICAL`, which macOS fires when due:
+//! any other wait of its (a condition variable's, `nanosleep`, a `kevent`
+//! timeout) it may delay to coalesce timers, by up to 100 ms in a
+//! background process (`kern.timer_coalesce_bg_ns_max`), where Linux fires
+//! a timerfd's hrtimer with no slack.
 //!
 //! Differences from Linux:
 //! - each expiration is a separate 8-byte record instead of one accumulated
@@ -26,7 +31,7 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use std::boxed::Box;
@@ -74,14 +79,44 @@ impl Timer {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Timers {
     by_fd: Mutex<HashMap<c_int, Timer>>,
-    changed: Condvar,
+    /// The kqueue the timer thread waits on: a user event, [`CHANGED`], and
+    /// a timer, [`DUE`], for the next expiration.
+    kq: c_int,
+}
+
+/// The kqueue user event that tells the timer thread a timer changed.
+const CHANGED: usize = 0;
+/// The kqueue timer of the next expiration.
+const DUE: usize = 1;
+
+fn kevent_change(kq: c_int, ident: usize, filter: i16, flags: u16, fflags: u32, data: isize) -> c_int {
+    let change = libc::kevent {
+        ident,
+        filter,
+        flags,
+        fflags,
+        data,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: one change, no events out.
+    unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) }
 }
 
 static TIMERS: LazyLock<&'static Timers> = LazyLock::new(|| {
-    let timers: &'static Timers = Box::leak(Box::default());
+    // SAFETY: plain call; the kqueue lives as long as the process.
+    let kq = unsafe { libc::kqueue() };
+    assert!(
+        kq >= 0 && kevent_change(kq, CHANGED, libc::EVFILT_USER, libc::EV_ADD | libc::EV_CLEAR, 0, 0) == 0,
+        "cannot make the timerfd thread's kqueue: {}",
+        std::io::Error::last_os_error()
+    );
+    let timers: &'static Timers = Box::leak(Box::new(Timers {
+        by_fd: Mutex::default(),
+        kq,
+    }));
     std::thread::Builder::new()
         .name("wick-timerfd".to_string())
         .spawn(move || run(timers))
@@ -270,7 +305,7 @@ pub unsafe fn timerfd_settime(
     }
     timer.deadline = (!value.is_zero()).then(|| now + value);
     timer.interval = interval;
-    timers.changed.notify_all();
+    kevent_change(timers.kq, CHANGED, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0);
     0
 }
 
@@ -291,8 +326,8 @@ pub unsafe fn timerfd_gettime(fd: c_int, curr_value: *mut itimerspec) -> c_int {
 }
 
 fn run(timers: &'static Timers) {
-    let mut by_fd = timers.by_fd.lock().unwrap();
     loop {
+        let mut by_fd = timers.by_fd.lock().unwrap();
         by_fd.retain(|_, timer| !timer.closed());
         let now = Instant::now();
         let mut closed = Vec::new();
@@ -340,10 +375,18 @@ fn run(timers: &'static Timers) {
             .filter_map(|t| t.deadline)
             .min()
             .map(|d| d.saturating_duration_since(Instant::now()));
-        by_fd = match wait {
-            Some(wait) => timers.changed.wait_timeout(by_fd, wait).unwrap().0,
-            None => timers.changed.wait(by_fd).unwrap(),
-        };
+        drop(by_fd);
+        // Until the next expiration, or a change made since the lock was
+        // released (the user event stays triggered until it is taken).
+        if let Some(wait) = wait {
+            let ns = isize::try_from(wait.as_nanos()).unwrap_or(isize::MAX);
+            let flags = libc::NOTE_CRITICAL | libc::NOTE_NSECONDS;
+            kevent_change(timers.kq, DUE, libc::EVFILT_TIMER, libc::EV_ADD | libc::EV_ONESHOT, flags, ns);
+        }
+        let mut got = std::mem::MaybeUninit::<libc::kevent>::uninit();
+        // SAFETY: room for one event, no timeout; an interrupted wait only
+        // goes round again.
+        unsafe { libc::kevent(timers.kq, std::ptr::null(), 0, got.as_mut_ptr(), 1, std::ptr::null()) };
     }
 }
 
@@ -416,6 +459,101 @@ mod tests {
         // Disarmed after firing.
         let cur = gettime(fd);
         assert_eq!((cur.it_value.tv_sec, cur.it_value.tv_nsec), (0, 0));
+    }
+
+    /// A timer fires when it is due, as Linux's (an hrtimer, which takes no
+    /// slack), however much macOS may delay the process's timers to
+    /// coalesce them: by up to 100 ms for a background process
+    /// (`kern.timer_coalesce_bg_ns_max`; a 50 ms wait measured 160 to 230 ms
+    /// late under `taskpolicy -b`), where upstream's timer tests give 25 and
+    /// 50 ms of margin. In a process of its own made background, each
+    /// expiration is measured against a control armed with it: a kqueue
+    /// timer marked `NOTE_CRITICAL`, which macOS does not coalesce, so the
+    /// host's scheduling delays, unbounded on a loaded host, fall on both.
+    /// Their median difference must stay under 20 ms, a fifth of the most
+    /// the host may coalesce.
+    #[test]
+    fn test_timers_are_not_coalesced() {
+        const NAME: &str = "timerfd::tests::test_timers_are_not_coalesced";
+        const CHILD: &str = "WICK_TIMERFD_TEST_ALONE";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let text = std::format!(
+                "{:?}\n{}{}",
+                out.status,
+                std::string::String::from_utf8_lossy(&out.stdout),
+                std::string::String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success() && text.contains("1 passed"), "{text}");
+            return;
+        }
+        // SAFETY: plain call, on this process.
+        let r = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG) };
+        assert_eq!(r, 0);
+        // SAFETY: plain calls; we own the descriptors.
+        let (kq, fd) = unsafe {
+            (libc::kqueue(), timerfd_create(libc::CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC))
+        };
+        assert!(kq >= 0 && fd >= 0);
+        // SAFETY: we own `fd`.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let event = |ident: usize, filter: i16, flags: u16, fflags: u32, data: isize| libc::kevent {
+            ident,
+            filter,
+            flags,
+            fflags,
+            data,
+            udata: std::ptr::null_mut(),
+        };
+        let read = event(fd as usize, libc::EVFILT_READ, libc::EV_ADD, 0, 0);
+        // SAFETY: one change, no events.
+        let r = unsafe { libc::kevent(kq, &read, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        assert_eq!(r, 0);
+        let mut later = Vec::new();
+        for _ in 0..15 {
+            // Before the timer is armed: a background thread can wait a
+            // millisecond for the CPU between the two.
+            let armed = Instant::now();
+            // SAFETY: valid descriptor and spec.
+            assert_eq!(unsafe { timerfd_settime(fd, 0, &spec(50, 0), std::ptr::null_mut()) }, 0);
+            let control = event(
+                1,
+                libc::EVFILT_TIMER,
+                libc::EV_ADD | libc::EV_ONESHOT,
+                libc::NOTE_CRITICAL | libc::NOTE_USECONDS,
+                50_000,
+            );
+            // SAFETY: one change, no events.
+            let r = unsafe { libc::kevent(kq, &control, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+            assert_eq!(r, 0);
+            let (mut timer, mut controlled) = (None, None);
+            while timer.is_none() || controlled.is_none() {
+                let mut got = event(0, 0, 0, 0, 0);
+                // SAFETY: one event out, no timeout.
+                let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut got, 1, std::ptr::null()) };
+                assert_eq!(n, 1);
+                let at = armed.elapsed();
+                if got.filter == libc::EVFILT_READ {
+
+                    timer.get_or_insert(at);
+                    while read_u64(&mut file).is_some() {}
+                } else {
+                    controlled.get_or_insert(at);
+                }
+            }
+            let (timer, controlled) = (timer.unwrap(), controlled.unwrap());
+            assert!(timer >= Duration::from_millis(50), "fired early, after {timer:?}");
+            later.push(timer.as_micros() as i128 - controlled.as_micros() as i128);
+        }
+        later.sort_unstable();
+        let median = later[later.len() / 2];
+        assert!(median < 20_000, "the timer fired a median {median} us after the control: {later:?}");
+        // SAFETY: our descriptor.
+        unsafe { libc::close(kq) };
     }
 
     #[test]
