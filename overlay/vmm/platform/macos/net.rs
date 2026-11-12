@@ -525,6 +525,22 @@ impl Tap {
     /// See [`TapDevice::open_named`].
     pub fn open_named(if_name: &str) -> Result<Tap, TapError> {
         let (name, backend) = match parse_name(if_name)? {
+            Target::Vmnet(_) if crate::ext::sandbox::narrowed() => {
+                // A vmnet start makes setup's calls (a pipe, the lookup of
+                // NetworkSharing, the root daemon behind vmnet, over XPC),
+                // which the narrowed sandbox raises SIGSYS for: refused before
+                // any of them, so the API reports it and the microVM runs on
+                // (sandbox::tests::test_vmnet_hotplug_after_narrow_is_refused).
+                return Err(TapError::Backend(
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "a vmnet interface is started while the microVM is built; the sandbox \
+                         refuses one hot-plugged into a running microVM (a Unix endpoint can be \
+                         hot-plugged)",
+                    ),
+                    if_name.to_owned(),
+                ));
+            }
             Target::Vmnet(mode) => {
                 let iface = vmnet::Interface::start(&mode)
                     .map_err(|err| TapError::Backend(err, if_name.to_owned()))?;

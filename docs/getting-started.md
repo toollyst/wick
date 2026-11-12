@@ -156,6 +156,8 @@ example. In the guest, give `eth0` another address on that network:
 ```
 
 Bridged mode, and every mode before macOS 26, needs root for vmnet.framework; a Unix datagram endpoint never does.
+A vmnet interface is configured before the microVM starts: one hot-plugged into a running microVM is refused (the
+sandbox does not let a running VMM start one); a Unix datagram endpoint can be hot-plugged.
 
 ## 6. Run it jailed (macOS)
 

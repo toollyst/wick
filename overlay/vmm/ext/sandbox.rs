@@ -3193,6 +3193,47 @@ mod macos {
             println!("CHILD-SURVIVED");
         }
 
+        // A vmnet interface hot-plugged into a running microVM is refused
+        // with an error the API reports, before any of vmnet's calls (its
+        // start makes setup's calls: a pipe, the NetworkSharing lookup), and
+        // the microVM runs on. The device is made as the hot-plug makes it
+        // (Net::new, rpc_interface's hotplug_device).
+        #[test]
+        fn test_vmnet_hotplug_after_narrow_is_refused() {
+            for name in ["vmnet-shared", "vmnet-host", "vmnet-br-en0"] {
+                let out = child("vmnet_hotplug_child", &[("WICK_TEST_CASE", name)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(out.status.success(), "{name}: {}", text(&out));
+                assert!(stdout.contains("REFUSED"), "{name}: {}", text(&out));
+                assert!(stdout.contains("a Unix endpoint can be hot-plugged"), "{name}: {}", text(&out));
+                assert!(stdout.contains("CHILD-SURVIVED"), "{name}: {}", text(&out));
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_vmnet_hotplug_after_narrow_is_refused in a separate process"]
+        fn vmnet_hotplug_child() {
+            let name = std::env::var("WICK_TEST_CASE").unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            let net = crate::devices::virtio::net::Net::new(
+                "hotplugged".into(),
+                &name,
+                None,
+                Default::default(),
+                Default::default(),
+                None,
+            );
+            match net {
+                Ok(_) => println!("STARTED"),
+                Err(err) => println!("REFUSED {err}"),
+            }
+            // SIGSYS's handler runs on a thread of its own: time for it.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            println!("CHILD-SURVIVED");
+        }
+
         // Listening on a Unix socket is setup's only: Linux's VMM filter has
         // no bind or listen. A socket bound before narrow() (its name gone)
         // cannot listen after it.
