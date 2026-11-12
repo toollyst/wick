@@ -12,12 +12,14 @@
 # Format: <kind> <crate> <test path>, below a comment that gives the reason.
 # <crate> is a name of check-unit-tests.py's: the package, or compat-<name> for
 # crates/compat/<name>. kind:
-#   no-hvf      creates a VM: hv_vm_create fails (CreateVm(Error(1)) or Error(1))
-#               where Hypervisor.framework is missing, as on GitHub's macOS
-#               runners (virtual machines), or without the hypervisor
-#               entitlement. Each passes on an M1 Pro (macOS 27.2) signed with
-#               it, alone in its process (tools/macos/test.sh, one VM per
-#               process); that run is where these are tested.
+#   no-hvf      creates a VM: hv_vm_create fails where Hypervisor.framework
+#               is missing, as on GitHub's macOS runners (virtual machines):
+#               HV_UNSUPPORTED, CreateVm(Error(45)) or Error(45) (ENOTSUP);
+#               and without the hypervisor entitlement: HV_DENIED,
+#               CreateVm(Error(1)) or Error(1) (EPERM). Each passes on an
+#               M1 Pro (macOS 27.2) signed with it, alone in its process
+#               (tools/macos/test.sh, one VM per process); that run is where
+#               these are tested.
 #   linux-path  the test reads a Linux path itself
 #   error-text  the test builds Linux's error text from a Linux errno number
 #   bug         a wick bug or difference to fix (root cause first)
@@ -28,7 +30,8 @@
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
 #   cpu-template-helper: 29 tests; 23 pass, 6 fail (4 no-hvf, 2 below).
-#   compat-kvm-ioctls: 30 tests; 13 pass, 17 fail, all no-hvf.
+#   compat-kvm-ioctls: 54 tests; 22 pass, 32 fail, all no-hvf (Error(1) at
+#   hv_vm_create; counted again with the guest-debug tests).
 #   Pass (names, a name in two of a crate's binaries counted once):
 #   acpi-tables 22, clippy-tracing 17, firecracker 89, rebase-snap 3,
 #   snapshot-editor 6, utils 16, wick-ext 1, wick-version 2, compat-libc 30,
@@ -52,6 +55,20 @@ no-hvf cpu-template-helper tests::test_template_verify_command
 no-hvf cpu-template-helper utils::tests::test_build_microvm
 
 # compat-kvm-ioctls: the Hypervisor.framework backend's own tests.
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_a_running_vcpu_is_busy_for_a_dup_handle
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_a_stopped_vcpu_reads_and_writes_from_a_dup_handle
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_brk_exits_as_kvm_debug_with_guest_debugging
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_brk_is_the_guests_without_guest_debugging
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_debug_capabilities_are_a_vcpus_counts
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_debug_registers_are_listed_and_restored_as_kvms
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_guest_debug_before_the_vcpu_exists
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_guest_debug_registers_stay_the_guests
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_hw_breakpoint_exits_at_its_address
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_set_guest_debug_from_a_dup_handle_applies_at_the_next_run
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_set_guest_debug_rejects_unknown_flags
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_single_step_exits_after_one_instruction
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_the_guests_os_lock_blocks_its_own_breakpoints
+no-hvf compat-kvm-ioctls hvf::debug::tests::test_watchpoint_exit_gives_the_address
 no-hvf compat-kvm-ioctls hvf::vcpu::tests::test_kvm_ptp_counters
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_new_vcpu_has_kvms_reset_values
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_guest_writes_during_a_discard_wait_for_the_new_pages
@@ -67,6 +84,7 @@ no-hvf compat-kvm-ioctls hvf::vm::tests::test_scattered_discards_keep_the_guest_
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_signals_interrupt_run_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_spi_active_restored_before_its_vcpu_exists
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_spi_raised_before_its_vcpu_exists
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_the_vtimer_thread_runs_only_while_a_timer_is_masked
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_vcpu_init_reads_what_the_run_phase_needs
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_virtual_count_is_the_vms
 

@@ -790,13 +790,40 @@ mod tests {
     #[test]
     fn test_debug_capabilities_answer_as_kvms() {
         use crate::Cap;
+        // Without a VM, as KVM answers them from the host.
         let kvm = Kvm::new().unwrap();
         assert_eq!(kvm.check_extension_int(Cap::SetGuestDebug), 1);
-        // The host's counts, as a vCPU's ID_AA64DFR0_EL1 gives them.
+        let (brps, wrps) = host_counts().map_or((0, 0), |(b, w)| (b as i32, w as i32));
+        assert_eq!(kvm.check_extension_int(Cap::DebugHwBps), brps);
+        assert_eq!(kvm.check_extension_int(Cap::DebugHwWps), wrps);
+        // Where Hypervisor.framework runs (kern.hv_support), it gives the
+        // counts: Arm requires at least 2 of each (ID_AA64DFR0_EL1.BRPs,
+        // WRPs). Where it does not, as on GitHub's runners, there is no VM
+        // to debug, as Linux without KVM.
+        if hv_support() {
+            assert!(brps >= 2 && wrps >= 2, "{brps} {wrps}");
+        }
+    }
+
+    /// `kern.hv_support`: whether this host runs Hypervisor.framework VMs.
+    fn hv_support() -> bool {
+        let mut v: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        // SAFETY: a NUL-terminated name and an int-sized output.
+        let r = unsafe {
+            libc::sysctlbyname(c"kern.hv_support".as_ptr(), (&raw mut v).cast(), &mut len, std::ptr::null_mut(), 0)
+        };
+        r == 0 && v == 1
+    }
+
+    #[test]
+    fn test_debug_capabilities_are_a_vcpus_counts() {
+        use crate::Cap;
+        let kvm = Kvm::new().unwrap();
+        // The counts a vCPU's ID_AA64DFR0_EL1 gives.
         let (_vm, vcpu) = guest(&[B_SELF], &[]);
         let (brps, wrps) = counts(get(&vcpu, sys_id(HV_SYS_REG_ID_AA64DFR0_EL1)));
         assert_eq!(kvm.check_extension_int(Cap::DebugHwBps), brps as i32);
         assert_eq!(kvm.check_extension_int(Cap::DebugHwWps), wrps as i32);
-        assert!(brps >= 2 && wrps >= 2, "{brps} {wrps}");
     }
 }
