@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+"""util-linux's `fallocate -l LENGTH FILE` (test_snapshot_not_losing_dirty_pages
+fills a small file system with it): the file gets LENGTH bytes of allocated
+blocks, without writing them. macOS: fcntl(F_PREALLOCATE) allocates them
+past the file's end, and ftruncate makes them the file's length. As fallocate(1),
+a file system that cannot allocate them is an error, never a sparse file."""
+
+import errno
+import fcntl
+import os
+import re
+import struct
+import sys
+
+F_PREALLOCATE = 42
+F_PEOFPOSMODE = 3
+UNITS = {"": 1, "B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40,
+         "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3, "TB": 1000 ** 4}
+
+
+def die(msg):
+    print(f"fallocate (wick, macOS): {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main(argv):
+    if len(argv) != 3 or argv[0] not in ("-l", "--length"):
+        die(f"only `fallocate -l LENGTH FILE` is supported, not {' '.join(argv)!r}")
+    m = re.fullmatch(r"(\d+)([KMGT]?(?:i?B)?)", argv[1])
+    if not m:
+        die(f"invalid length {argv[1]!r}")
+    length = int(m.group(1)) * UNITS[m.group(2).replace("iB", "")]
+    fd = os.open(argv[2], os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        have = os.fstat(fd).st_size
+        # APFS gives at most about half its free space to one request
+        # (measured on a 512 MiB volume: 229, 114 and 114 MiB for 459 MiB
+        # asked, where one F_ALLOCATEALL of 459 MiB fails with ENOSPC):
+        # the rest is asked for again until all of it is allocated, and a
+        # request that gets nothing is ENOSPC.
+        need = length - have
+        while need > 0:
+            store = struct.pack("IiqqQ", 0, F_PEOFPOSMODE, 0, need, 0)
+            try:
+                got = struct.unpack("IiqqQ", fcntl.fcntl(fd, F_PREALLOCATE, store))[4]
+            except OSError as err:
+                die(f"fallocate failed: {os.strerror(err.errno)}")
+            if got <= 0:
+                die(f"fallocate failed: {os.strerror(errno.ENOSPC)}")
+            need -= got
+        if length > have:
+            os.ftruncate(fd, length)
+    finally:
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

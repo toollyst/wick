@@ -771,6 +771,82 @@ def _outside_rssanon(vm):
     return rss_anon_kib(vm.firecracker_pid)
 
 
+# ------------------------------------------------------ a small tmpfs
+
+RAM_DISK_MIB = 512
+
+
+def _run(*cmd):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120).stdout
+
+
+@contextlib.contextmanager
+def small_tmpfs(worker_id, mib=RAM_DISK_MIB):
+    """`mount -o size=512M -t tmpfs none /mnt/<worker>`, as
+    test_snapshot_not_losing_dirty_pages.py's mount_tmpfs_small makes it.
+
+    macOS has no tmpfs, and its root is the sealed, read-only system volume
+    (no /mnt). Its counterpart, without root: a RAM disk (`hdiutil attach
+    -nomount ram://<sectors>`: memory, given back when it is detached, as a
+    tmpfs's), erased as an APFS volume (`diskutil erasevolume`: sparse files,
+    as tmpfs has, where HFS+ allocates every block up to a write's offset)
+    and mounted on a directory of the session (`diskutil mount -mountPoint`).
+    All three work as the user (measured: the disk's device nodes are the
+    user's, the volume is "mounted by" the user). A user's APFS volume
+    ignores ownership (noowners); as root (the jailer's mode, which chowns
+    the jail to its user) ownership is enabled, as on tmpfs. Its free space
+    is APFS's: some of the 512 MiB holds the container's own metadata."""
+    num = re.sub(r"\D", "", str(worker_id)) or "0"
+    mnt = pathlib.Path(SESSION_ROOT) / f"t{num}"
+    # Unique among the session's and any other session's volumes.
+    name = f"{pathlib.Path(SESSION_ROOT).name}-t{num}"
+    mnt.mkdir(parents=True)
+    disk = _run("hdiutil", "attach", "-nomount", f"ram://{mib * 2048}").split()[0]
+    # Recorded for the session's end (tools/macos/integration-tests.sh),
+    # which detaches what a killed test left attached.
+    record = pathlib.Path(SESSION_ROOT) / ".attached" / disk.removeprefix("/dev/")
+    record.parent.mkdir(exist_ok=True)
+    record.touch()
+    try:
+        _run("diskutil", "erasevolume", "APFS", name, disk)
+        info = _run("diskutil", "info", f"/Volumes/{name}")
+        volume = re.search(r"Device Node:\s*(\S+)", info).group(1)
+        _run("diskutil", "unmount", volume)
+        _run("diskutil", "mount", "-mountPoint", str(mnt), volume)
+        if os.geteuid() == 0:
+            _run("diskutil", "enableOwnership", str(mnt))
+        yield mnt
+    finally:
+        # Detached whatever happened above; a disk that will not detach
+        # stays recorded, for the session's end, and fails the test here.
+        detach = subprocess.run(["hdiutil", "detach", "-force", disk], check=False,
+                                capture_output=True, text=True, timeout=120)
+        with contextlib.suppress(OSError):
+            mnt.rmdir()
+        if detach.returncode != 0:
+            raise OSError(errno.EBUSY, f"RAM disk {disk} did not detach: {detach.stderr.strip()}")
+        record.unlink()
+
+
+def _mount_tmpfs_small(worker_id):
+    """mount_tmpfs_small (test_snapshot_not_losing_dirty_pages.py) on macOS."""
+    with small_tmpfs(worker_id) as mnt:
+        yield mnt
+
+
+def pytest_pycollect_makemodule(module_path, parent):  # pylint: disable=unused-argument
+    """test_snapshot_not_losing_dirty_pages.py's mount_tmpfs_small fixture
+    mounts a tmpfs at /mnt/<worker>: here it is `small_tmpfs`. The module's
+    fixture is replaced before pytest reads the module's fixtures."""
+    if module_path.name != "test_snapshot_not_losing_dirty_pages.py":
+        return None
+    import pytest  # pylint: disable=import-outside-toplevel
+    mod = pytest.Module.from_parent(parent, path=module_path)
+    assert hasattr(mod.obj, "mount_tmpfs_small"), "upstream's mount_tmpfs_small is gone"
+    mod.obj.mount_tmpfs_small = pytest.fixture(name="mount_tmpfs_small")(_mount_tmpfs_small)
+    return mod
+
+
 def pytest_runtest_setup(item):
     """test_pmem reads RssAnon from /proc, which macOS does not have: its
     helper reads it as `rss_anon_kib` does. A test of NOISE_ONLY_PINNING
