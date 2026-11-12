@@ -170,6 +170,14 @@ static PAGE: AtomicU64 = AtomicU64::new(0);
 /// A mapping made over one without the flag takes its place; an unmapped
 /// one is forgotten when something is mapped over it.
 static HUGE_MAPPINGS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+/// Held by every test that makes huge page mappings: what [`huge_page_of`]
+/// answers for an address next to a test's mapping is then that test's own,
+/// not a huge mapping another test made there in the meantime.
+#[cfg(test)]
+pub(crate) fn huge_mapping_test() -> std::sync::MutexGuard<'static, ()> {
+    static TESTS: Mutex<()> = Mutex::new(());
+    TESTS.lock().unwrap_or_else(|e| e.into_inner())
+}
 /// Number of registered ranges (the I/O wrappers skip all work at 0).
 static REGISTERED: AtomicUsize = AtomicUsize::new(0);
 /// Serializes changes to the ranges.
@@ -1572,12 +1580,6 @@ mod tests {
         for len in [1 << 62, 1 << 40, (u64::MAX - mem) & !(ps - 1)] {
             assert!(register(ctx, mem, len).is_err(), "{len:#x}");
         }
-        // Part of the range unmapped: refused, and nothing is registered.
-        // SAFETY: the last two pages of the mapping above.
-        let r = unsafe { libc::munmap((mem + 2 * ps) as *mut _, (2 * ps) as usize) };
-        assert_eq!(r, 0);
-        assert!(register(ctx, mem, 4 * ps).is_err());
-        assert!(!is_missing(mem));
         register(ctx, mem, 2 * ps).unwrap();
         assert!(is_missing(mem));
         // Through a handler's channel too.
@@ -1588,6 +1590,47 @@ mod tests {
         let (r, _) = request(chan, [proto::OP_REGISTER, other, ps, 0], &[]);
         assert_eq!(r, 0);
         assert!(is_missing(other));
+        close(&[chan, user]);
+    }
+
+    /// A range with an unmapped part is refused, and nothing is registered.
+    /// Nothing but this test may map memory while the hole is open, or a
+    /// mapping can take it. Among other tests' threads, one did (their
+    /// mappings, the aliases `register` makes), and the range was registered
+    /// whole over another test's memory or alias, so it runs in a process of
+    /// its own: this binary again, this test only. There the serving thread
+    /// did (Rust's start of a thread maps its signal stack and guard page),
+    /// so the hole is made only once that thread has answered a request.
+    #[test]
+    fn test_register_refuses_a_range_with_a_hole() {
+        const NAME: &str = "wick_uffd::tests::test_register_refuses_a_range_with_a_hole";
+        const CHILD: &str = "WICK_UFFD_TEST_ALONE";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let text = std::format!(
+                "{}{}",
+                std::string::String::from_utf8_lossy(&out.stdout),
+                std::string::String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success() && text.contains("1 passed"), "{text}");
+            return;
+        }
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(4);
+        let chan = channel(user);
+        // SAFETY: the last two pages of the mapping above.
+        let r = unsafe { libc::munmap((mem + 2 * ps) as *mut _, (2 * ps) as usize) };
+        assert_eq!(r, 0);
+        let e = register(ctx, mem, 4 * ps).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ENOMEM));
+        assert!(!is_missing(mem));
+        register(ctx, mem, 2 * ps).unwrap();
+        assert!(is_missing(mem));
         close(&[chan, user]);
     }
 
@@ -1699,6 +1742,7 @@ mod tests {
     #[test]
     fn test_huge_page_ranges_fault_and_fill_whole_pages() {
         use crate::linux_items::{HUGE_PAGE, MAP_HUGETLB, MAP_HUGE_2MB};
+        let _alone = huge_mapping_test();
         let (ctx, user) = create(0, false, true).unwrap();
         let host = page_size();
         let len = 3 * HUGE_PAGE;
@@ -1782,8 +1826,11 @@ mod tests {
         assert_eq!(unsafe { ptr::read_volatile((mem + HUGE_PAGE + host) as *const u8) }, 0);
         unregister(ctx, mem, len).unwrap();
         close(&[chan, user]);
-        // SAFETY: the mapping made above.
-        assert_eq!(unsafe { libc::munmap(mem as *mut _, len as usize) }, 0);
+        // SAFETY: the mapping made above, through the compatibility munmap,
+        // which forgets the huge mapping (the system's would leave it in
+        // HUGE_MAPPINGS, where another test's mapping at that address then
+        // reads as huge).
+        assert_eq!(unsafe { crate::linux_items::munmap(mem as *mut _, len as usize) }, 0);
     }
 
     /// A system call that copies to or from missing registered pages waits

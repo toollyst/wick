@@ -1602,6 +1602,7 @@ mod tests {
     /// file is EINVAL (docs/PORTING.md row 10).
     #[test]
     fn test_hugetlb_files() {
+        let _alone = crate::wick_uffd::huge_mapping_test();
         use std::os::fd::AsRawFd;
         let shm = |name: &str, size: off_t| {
             let cname = std::ffi::CString::new(name).unwrap();
@@ -1659,6 +1660,7 @@ mod tests {
 
     #[test]
     fn test_mmap_flags() {
+        let _alone = crate::wick_uffd::huge_mapping_test();
         // SAFETY: anonymous mappings, unmapped below.
         unsafe {
             // A huge page mapping: 2 MiB aligned, whole huge pages (the 1
@@ -1892,10 +1894,14 @@ mod tests {
     #[test]
     fn test_replaced_pages_are_reported_to_the_guest_hooks() {
         use std::sync::Mutex;
-        static CALLS: Mutex<std::vec::Vec<(u64, u64, bool)>> = Mutex::new(std::vec::Vec::new());
+        use std::thread::ThreadId;
+        // The hooks are the process's: other tests' replacements come here
+        // too, some of them earlier at the addresses this mapping now has, so
+        // each call is kept with the thread that made it.
+        static CALLS: Mutex<std::vec::Vec<(ThreadId, u64, u64, bool)>> = Mutex::new(std::vec::Vec::new());
         fn stage2(_: u64, _: u64, _: bool) {}
         fn replace(start: u64, len: u64, before: bool) -> bool {
-            CALLS.lock().unwrap().push((start, len, before));
+            CALLS.lock().unwrap().push((std::thread::current().id(), start, len, before));
             true
         }
         crate::wick_guest::set_hooks(crate::wick_guest::Hooks { stage2, replace });
@@ -1914,8 +1920,15 @@ mod tests {
         };
         assert_ne!(p, libc::MAP_FAILED);
         let (start, half) = (p as u64, (LEN / 2) as u64);
+        let me = std::thread::current().id();
         let calls = || -> std::vec::Vec<(u64, u64, bool)> {
-            CALLS.lock().unwrap().iter().copied().filter(|&(s, _, _)| s >= start && s < start + LEN as u64).collect()
+            CALLS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|&&(t, s, _, _)| t == me && s >= start && s < start + LEN as u64)
+                .map(|&(_, s, l, b)| (s, l, b))
+                .collect()
         };
         assert!(calls().is_empty());
         // SAFETY: inside the mapping.
