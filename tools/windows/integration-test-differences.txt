@@ -158,11 +158,9 @@ impossible integration_tests/functional/test_serial_io.py::test_serial_dos
 
 # Builds of Firecracker with the fuzzing and gdb features, and of the
 # instrumented binary, which the tests make for Linux's musl target and
-# wick_windows.py makes for the Windows one. The fuzzing and instrumented
-# builds build (measured on a Windows Server 2022 host without WHP), their
-# tests are not run yet; the gdb build does not: the WHP vCPU has no
-# translate_gva or set_guest_debug, and wick's UnixStream is not one of
-# gdbstub's connections (src/vmm/src/gdb).
+# wick_windows.py makes for the Windows one. The three build (measured on a
+# Windows Server 2022 host without WHP; gdb: patches/0039); their tests are
+# not run yet, as they need WHP.
 bug integration_tests/functional/test_fuzzing.py::test_fuzzing_warning
 bug integration_tests/functional/test_gdb.py::test_gdb_connects
 bug integration_tests/functional/test_instrumented_firecracker.py::test_log_instrument_firecracker_basic_functionality
