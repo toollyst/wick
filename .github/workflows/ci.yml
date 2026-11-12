@@ -297,14 +297,6 @@ jobs:
       # runs the same script there).
       - name: Nitro Enclave refused without the device
         run: python3 -I tools/macos/enclave-refusal-test.py lib/firecracker/build/cargo_target/debug/firecracker
-      # Every test of every crate but the jailer runs; the ones that cannot
-      # pass on a runner (they create a VM, and GitHub's macOS runners have no
-      # Hypervisor.framework) are listed by name and reason, and the check
-      # fails on an unlisted failure, a listed test that passes, or a listed
-      # name that is no test. tools/macos/test.sh runs the listed ones on a
-      # Mac, and tools/macos/boot-test.sh the scenarios.
-      - name: Unit tests of every crate but the jailer (tools/macos/unit-test-differences.txt)
-        run: python3 -I tools/macos/check-unit-tests.py
       # The jailer's tests run as root, as upstream's do (they set resource
       # limits and change owners); the runners have passwordless sudo.
       - name: Jailer unit tests
@@ -336,6 +328,16 @@ jobs:
           brew install uv
           tools/macos/integration/venv.sh
           build/integration/venv/bin/python tools/macos/integration/memory-selftest.py
+      # Every test of every crate but the jailer runs; the ones that cannot
+      # pass on a runner (they create a VM, and GitHub's macOS runners have no
+      # Hypervisor.framework) are listed by name and reason, and the check
+      # fails on an unlisted failure, a listed test that passes, or a listed
+      # name that is no test. tools/macos/test.sh runs the listed ones on a
+      # Mac, and tools/macos/boot-test.sh the scenarios.
+      # Last in the job, so a unit test's failure does not keep the jailer and
+      # harness steps above from running.
+      - name: Unit tests of every crate but the jailer (tools/macos/unit-test-differences.txt)
+        run: python3 -I tools/macos/check-unit-tests.py
 
   # Seatbelt differs between macOS majors (which system calls' numbers it
   # skips when a rule allows their operation: UNFILTERED_SYSCALLS and
