@@ -89,22 +89,25 @@ fn test_socket_values_that_are_no_descriptor() {
 
 #[test]
 fn test_a_socket_that_is_no_descriptor_is_refused_and_closed() {
-    use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, SOCK_STREAM, SOCKET_ERROR, WSAENOTSOCK, WSAGetLastError, WSASocketW, closesocket,
-    };
+    use std::os::windows::io::IntoRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCK_STREAM, WSASocketW};
     super::net::startup();
-    // SAFETY: a new socket owned here.
-    let s = unsafe { WSASocketW(i32::from(AF_INET), SOCK_STREAM, 0, std::ptr::null(), 0, 0) };
-    assert_ne!(s, usize::MAX);
+    // A connected socket, whose peer sees its close: the end of the stream.
+    // The refused value is not used again to prove it (closing it a second
+    // time would close whatever socket another test thread got that value
+    // for since: CI's run did, and that thread's test failed).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let s = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap().into_raw_socket() as usize;
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
     // A real socket, judged as a layered provider's value would be.
     let err = adopt_socket(s, |_| None).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     assert!(err.to_string().contains(&format!("{s:#x}")), "{err}");
-    // It was closed: closing it again finds no socket.
-    // SAFETY: a value that names no socket now.
-    assert_eq!(unsafe { closesocket(s) }, SOCKET_ERROR);
-    // SAFETY: reads the thread's last Winsock error.
-    assert_eq!(unsafe { WSAGetLastError() }, WSAENOTSOCK);
+    // It was closed: its peer reads the end of the stream, where an open
+    // socket would leave the read waiting until the timeout.
+    let mut byte = [0u8; 1];
+    assert_eq!(peer.read(&mut byte).unwrap(), 0, "the refused socket was not closed");
     // One that fits is the descriptor.
     // SAFETY: a new socket owned here.
     let s = unsafe { WSASocketW(i32::from(AF_INET), SOCK_STREAM, 0, std::ptr::null(), 0, 0) };

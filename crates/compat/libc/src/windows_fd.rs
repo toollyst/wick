@@ -322,12 +322,21 @@ pub mod wick_fd {
         }
     }
 
+    /// The table's size at which [`insert`] next sweeps it.
+    static NEXT_SWEEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
+
+    /// The table's size at which it is next swept, for the tests: the
+    /// table is the process's, which tests running at once share.
+    #[cfg(test)]
+    pub(crate) fn next_sweep() -> usize {
+        NEXT_SWEEP.load(Ordering::Relaxed)
+    }
+
     /// Inserts an entry. Entries of descriptors closed without `close` here
     /// (by std, say) are swept whenever the table has doubled since the
     /// last sweep, so the table stays proportional to the live descriptors
     /// and closed objects are released.
     fn insert(map: &mut HashMap<c_int, Entry>, fd: c_int, entry: Entry) {
-        static NEXT_SWEEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
         map.insert(fd, entry);
         if map.len() >= NEXT_SWEEP.load(Ordering::Relaxed) {
             map.retain(|&fd, e| same_object(fd, e.own));

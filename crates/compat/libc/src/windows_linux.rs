@@ -805,18 +805,24 @@ mod tests {
 
     #[test]
     fn test_a_socket_that_is_no_descriptor_is_refused_and_closed() {
+        use std::io::Read;
+        use std::os::windows::io::IntoRawSocket;
         wick_wsa_startup();
-        // SAFETY: a new socket owned here.
-        let s = unsafe { ws::WSASocketW(i32::from(ws::AF_INET), ws::SOCK_STREAM, 0, std::ptr::null(), 0, 0) };
-        assert_ne!(s, INVALID_SOCKET);
+        // A connected socket, whose peer sees its close: the end of the
+        // stream. The refused value is not used again to prove it (closing
+        // it a second time would close whatever socket another test thread
+        // got that value for since).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let s = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap().into_raw_socket() as usize;
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
         // A real socket, judged as a layered provider's value would be.
         assert_eq!(socket_fd(s, |_| None), None);
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EINVAL));
-        // It was closed: closing it again finds no socket.
-        // SAFETY: a value that names no socket now.
-        assert_eq!(unsafe { ws::closesocket(s) }, SOCKET_ERROR);
-        // SAFETY: reads the thread's last Winsock error.
-        assert_eq!(unsafe { WSAGetLastError() }, ws::WSAENOTSOCK);
+        // It was closed: its peer reads the end of the stream, where an
+        // open socket would leave the read waiting until the timeout.
+        let mut byte = [0u8; 1];
+        assert_eq!(peer.read(&mut byte).unwrap(), 0, "the refused socket was not closed");
         // A socket that fits is its descriptor.
         // SAFETY: as above.
         let s = unsafe { ws::WSASocketW(i32::from(ws::AF_INET), ws::SOCK_STREAM, 0, std::ptr::null(), 0, 0) };

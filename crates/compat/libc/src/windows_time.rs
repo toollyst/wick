@@ -629,10 +629,13 @@ mod tests {
         // SAFETY: what `File`'s drop does with the descriptor's handle.
         assert_ne!(unsafe { CloseHandle(handle(fd)) }, 0);
         // Other descriptors made meanwhile, held open so that the table
-        // grows to its sweep: the closed timer must be gone by then.
+        // grows to its sweep: the closed timer must be gone by then. The
+        // table is the process's, which other tests fill and sweep at the
+        // same time, so the sweep's size is read as it is now, not assumed:
+        // once this test alone holds more entries than that, a sweep has run.
         let mut held = std::vec::Vec::new();
         let mut released = false;
-        for _ in 0..200 {
+        while held.len() <= crate::windows_fd::wick_fd::next_sweep() {
             // SAFETY: plain call.
             let other = unsafe { timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC) };
             assert!(other != -1);
