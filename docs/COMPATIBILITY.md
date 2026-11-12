@@ -278,7 +278,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | Feature | macOS | Windows |
 | --- | --- | --- |
 | Balloon inflate and deflate | 🟡 gives back only whole 16 KiB host pages (`boot-test balloon`, `test_inflate_reduces_free`, `test_rss_memory_lower`) | 🟢 `test_inflate_reduces_free`, `test_rss_memory_lower`, `boot-test.ps1 devices`. The `boot-test.ps1 balloon` stage is written but not yet run |
-| `deflate_on_oom` | 🟡 without deflate_on_oom passes; with it the guest does not run out of memory, cause to find (`test_deflate_on_oom[...True]` [bug]) | 🟢 `test_deflate_on_oom` |
+| `deflate_on_oom` | 🟡 without deflate_on_oom passes; with it the guest does not run out of memory: the test passes when the VMM's own memory is about 2 MiB or less, and it is 4.3 to 4.8 MiB (VMM memory; not the 16 KiB host pages, 0.7% measured in the guest; diagnostic runs m2-less-cache and m2-less-vmm at c0cf9ee) (`test_deflate_on_oom[...True]` [bug]) | 🟢 `test_deflate_on_oom` |
 | Statistics, free page hinting and reporting, snapshot | 🟢 `test_stats`, `test_stats_update`, `test_hinting_reporting_snapshot` and `test_balloon_snapshot` pass, all variants (m2-parts2 at d706d9a, with get_resident_memory counting the pages the host compressed) | 🟢 `test_stats`, `test_hinting_reporting_snapshot`, `test_balloon_snapshot` |
 | virtio-rng | 🟢 `test_rng_present`, `boot-test devices` | 🟢 `test_rng_present`, `boot-test.ps1 devices` |
 | Entropy throughput | 🟡 about 80 KB/s, where a test needs 1 MB/s (`test_rng_bw_rate_limiter` [bug]) | 🟢 `test_rng_bw_rate_limiter` |
