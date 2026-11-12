@@ -427,9 +427,10 @@ unsafe fn winsock_addr(addr: *const c_void, len: u32) -> Option<(sockaddr_storag
         // same socket as the exact length; Winsock is given the exact one.
         // Measured (CI run 43298293407): a bind and connect with the
         // whole size, so passed, work (test_unix_bind_with_the_whole_
-        // structure_size). What Winsock does given the whole size itself
-        // is the "winsock" BINDTEST line of
-        // test_unix_bind_of_each_path_form_on_record. The vhost-user
+        // structure_size), and Winsock itself, given the whole size (110
+        // bytes), binds the path too (the "winsock whole size" BINDTEST line
+        // of test_unix_bind_of_each_path_form_on_record, run 43306073982):
+        // the exact length is Linux's rule kept, not a Winsock need. The vhost-user
         // tests' "Cannot bind socket" was not the length: their path had a
         // '/' after a `\\?\` prefix, which the verbatim BINDTEST lines show
         // refused (ERROR_INVALID_PARAMETER).
