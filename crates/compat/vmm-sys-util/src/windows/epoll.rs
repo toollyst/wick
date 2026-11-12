@@ -1041,6 +1041,39 @@ mod tests {
             .collect()
     }
 
+    // A rate limiter's timer (vmm's rng test_bandwidth_rate_limiter: the
+    // refill timer's event did not arrive in the 100 ms it waits): a
+    // non-blocking one-shot timerfd, registered before it is armed and
+    // expired while nobody waited, is reported by the next wait, and its
+    // read gives one expiration.
+    #[test]
+    fn test_a_timer_that_expired_unwatched_is_reported() {
+        // SAFETY: plain calls on our descriptor and buffers.
+        unsafe {
+            let fd = libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC);
+            assert!(fd >= 0, "{}", io::Error::last_os_error());
+            let epoll = Epoll::new().unwrap();
+            epoll
+                .ctl(ControlOperation::Add, fd, EpollEvent::new(EventSet::IN, 9))
+                .unwrap();
+            assert!(wait_now(&epoll).is_empty(), "disarmed");
+            let spec = libc::itimerspec {
+                it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+                it_value: libc::timespec { tv_sec: 0, tv_nsec: 100_000_000 },
+            };
+            assert_eq!(libc::timerfd_settime(fd, 0, &spec, std::ptr::null_mut()), 0);
+            std::thread::sleep(std::time::Duration::from_millis(350));
+            let mut events = [EpollEvent::default(); 4];
+            assert_eq!(epoll.wait(100, &mut events).unwrap(), 1, "the expired timer");
+            assert_eq!(events[0].data(), 9);
+            let mut buf = [0u8; 8];
+            assert_eq!(libc::read(fd, buf.as_mut_ptr().cast(), 8), 8, "{}", io::Error::last_os_error());
+            assert_eq!(u64::from_ne_bytes(buf), 1);
+            assert!(wait_now(&epoll).is_empty(), "read");
+            assert_eq!(libc::close(fd), 0);
+        }
+    }
+
     #[test]
     fn test_eventfd_level_triggered() {
         let epoll = Epoll::new().unwrap();

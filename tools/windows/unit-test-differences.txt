@@ -65,18 +65,11 @@ error-text vmm vmm_config::net::tests::test_insert_error_cases
 # test_one_switch_at_a_time, were listed until the net endpoint's fix,
 # b113a1e: a switch that connects while another is there waits its turn.
 # Measured fixed by this check in CI run 43277608081, where all three pass.)
-bug vmm devices::virtio::net::device::tests::test_tx_tap_failure
-bug vmm devices::virtio::net::device::tests::test_read_tap_fail_event_handler
-#   (the test closes the tap's fd to make its next write/read fail; tap_write_fails /
-#   tap_read_fails stay 0)
 bug vmm devices::virtio::rng::device::tests::test_bandwidth_rate_limiter
 #   (entropy_bytes 0, not 1000, 350 ms after the limiter blocked: the replenish
-#   timer's event did not arrive in the 100 ms emulated)
-bug vmm devices::virtio::block::vhost_user::device::tests::test_activate
-bug vmm devices::virtio::block::vhost_user::device::tests::test_new_all_features
-bug vmm devices::virtio::block::vhost_user::device::tests::test_new_no_features
-bug vmm devices::virtio::vhost_user::tests::test_new
-#   (test_utils::create_tmp_socket: libc::bind of an AF_UNIX path in a TempDir fails)
+#   timer's event did not arrive in the 100 ms emulated. vmm-sys-util's epoll
+#   test_a_timer_that_expired_unwatched_is_reported checks the timer and epoll
+#   alone: if it passes, the cause is above them)
 
 # Other packages.
 whp-pc cpu-template-helper utils::tests::test_build_microvm

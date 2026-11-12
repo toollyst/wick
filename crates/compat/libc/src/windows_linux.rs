@@ -418,6 +418,22 @@ unsafe fn winsock_addr(addr: *const c_void, len: u32) -> Option<(sockaddr_storag
     unsafe { std::ptr::copy_nonoverlapping(addr.cast::<u8>(), (&raw mut s).cast::<u8>(), n) };
     let family = to_winsock_family(c_int::from(s.ss_family))?;
     s.ss_family = u16::try_from(family).ok()?;
+    let mut n = n;
+    if family == AF_UNIX && n > 2 {
+        // A path address is its path up to the first NUL, whatever length
+        // was passed, as Linux reads it (net/unix/af_unix.c,
+        // unix_mkname_bsd: the path is terminated at the length given and
+        // its strlen taken), so `sizeof(struct sockaddr_un)` names the
+        // same socket as the exact length; Winsock is given the exact one.
+        // An abstract address (`sun_path[0]` NUL) is passed as it is.
+        // SAFETY: `s` is `sockaddr_storage`, `n` within it.
+        let bytes = unsafe { std::slice::from_raw_parts((&raw const s).cast::<u8>(), n) };
+        if bytes[2] != 0 {
+            if let Some(end) = bytes[2..].iter().position(|&b| b == 0) {
+                n = 2 + end + 1;
+            }
+        }
+    }
     Some((s, c_int::try_from(n).ok()?))
 }
 
@@ -1017,5 +1033,34 @@ mod tests {
             assert_eq!(socket(AF_PACKET, SOCK_RAW, 0), -1);
             assert_eq!(crate::close(fd), 0);
         }
+    }
+
+    // vmm's test_utils::create_tmp_socket, as it is: a zeroed sockaddr_un
+    // with the path, bound with the structure's whole size, then listened
+    // on (vmm's vhost-user tests failed in it with "Cannot bind socket").
+    // Linux binds the path up to its NUL; so does this, and a client
+    // connects to that path.
+    #[test]
+    fn test_unix_bind_with_the_whole_structure_size() {
+        let dir = std::env::temp_dir().join(format!("wick-bind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = format!("{}/tmp_socket", dir.to_str().unwrap());
+        // SAFETY: socket calls on our descriptors and buffers.
+        unsafe {
+            let fd = socket(AF_UNIX, crate::SOCK_STREAM, 0);
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            let mut a: sockaddr_un = std::mem::zeroed();
+            a.sun_family = u16::try_from(AF_UNIX).unwrap();
+            std::ptr::copy(path.as_ptr().cast(), a.sun_path.as_mut_ptr(), path.len());
+            let size = u32::try_from(std::mem::size_of::<sockaddr_un>()).unwrap();
+            let r = bind(fd, (&raw const a).cast(), size);
+            assert_eq!(r, 0, "bind {path:?}: {}", std::io::Error::last_os_error());
+            assert_eq!(listen(fd, 1), 0, "{}", std::io::Error::last_os_error());
+            let c = socket(AF_UNIX, crate::SOCK_STREAM, 0);
+            assert_eq!(connect(c, (&raw const a).cast(), size), 0, "{}", std::io::Error::last_os_error());
+            assert_eq!(crate::close(c), 0);
+            assert_eq!(crate::close(fd), 0);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

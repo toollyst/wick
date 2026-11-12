@@ -121,10 +121,30 @@ impl Endpoint {
     /// one before it may have left already, its end not read yet (a switch
     /// that sends and closes, then the next that connects and sends, before
     /// a read: two frames, and the second was lost).
-    fn accept(&mut self) {
+    ///
+    /// No switch waiting is no error. A listener that fails otherwise (its
+    /// descriptor closed, the tap's own descriptor as Firecracker sees it)
+    /// fails the I/O that asked, as I/O on a closed tap descriptor fails on
+    /// Linux (EBADF): upstream's test_tx_tap_failure and
+    /// test_read_tap_fail_event_handler close it to count tap_write_fails
+    /// and tap_read_fails, which a dropped frame left at 0.
+    fn accept(&mut self) -> io::Result<()> {
         while self.conn.is_none() {
-            let Ok((conn, _)) = self.listener.accept() else {
-                return;
+            let conn = match self.listener.accept() {
+                Ok((conn, _)) => conn,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                // A switch that went away before it was taken: the next.
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err),
             };
             // A connection that cannot be made non-blocking is dropped; the
             // next waiting one is tried.
@@ -133,6 +153,7 @@ impl Endpoint {
                 self.conn = Some(conn);
             }
         }
+        Ok(())
     }
 
     fn disconnect(&mut self) {
@@ -173,7 +194,7 @@ impl Endpoint {
                 return Ok(Some(copied));
             }
             if self.conn.is_none() {
-                self.accept();
+                self.accept()?;
             }
             let Some(conn) = self.conn.as_mut() else {
                 libc::wick_fd::drained(self.listener.as_raw_fd());
@@ -209,7 +230,7 @@ impl Endpoint {
     /// Sends one frame to the switch, or drops it (see the module docs).
     fn send(&mut self, frame: &[u8]) -> io::Result<()> {
         if self.conn.is_none() {
-            self.accept();
+            self.accept()?;
         }
         let Some(conn) = self.conn.as_mut() else {
             return Ok(());
