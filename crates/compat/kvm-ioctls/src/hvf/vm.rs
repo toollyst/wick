@@ -2283,6 +2283,105 @@ mod tests {
         (vm, gic, vcpu)
     }
 
+    /// Guest program: writes X3 to X4 (MMIO: an exit) for ever.
+    const MMIO_FOR_EVER: [u32; 2] = [
+        0xf9000083, // 1: str x3, [x4]
+        0x17ffffff, // b 1b
+    ];
+
+    // The host's clocks, read on a vCPU's thread between its exits, never
+    // read lower than the read before: Linux's CLOCK_MONOTONIC never goes
+    // back (kernel/time/timekeeping.c), and Firecracker subtracts two of
+    // its readings around each MMIO exit (logger/metrics.rs
+    // LatencyMetricsRecorder). Each clock is read three times after every
+    // exit; a lower reading is reported with the clock, which of the three
+    // reads it was, and by how much.
+    #[test]
+    fn test_clocks_do_not_go_back_on_a_vcpu_thread() {
+        unsafe extern "C" {
+            fn mach_absolute_time() -> u64;
+            fn mach_continuous_time() -> u64;
+        }
+        const NAMES: [&str; 7] = [
+            "CLOCK_MONOTONIC",
+            "CLOCK_REALTIME",
+            "CLOCK_UPTIME_RAW",
+            "CLOCK_MONOTONIC_RAW",
+            "mach_absolute_time",
+            "mach_continuous_time",
+            "CNTVCT_EL0",
+        ];
+        fn clock(id: libc::clockid_t) -> u64 {
+            let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: a timespec to fill.
+            assert_eq!(unsafe { libc::clock_gettime(id, &mut t) }, 0);
+            t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+        }
+        fn read() -> [u64; 7] {
+            let mut cntvct = 0u64;
+            // SAFETY: reads the virtual counter, readable at EL0.
+            unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) cntvct) };
+            [
+                clock(libc::CLOCK_MONOTONIC),
+                clock(libc::CLOCK_REALTIME),
+                clock(libc::CLOCK_UPTIME_RAW),
+                clock(libc::CLOCK_MONOTONIC_RAW),
+                // SAFETY: no arguments.
+                unsafe { mach_absolute_time() },
+                // SAFETY: no arguments.
+                unsafe { mach_continuous_time() },
+                cntvct,
+            ]
+        }
+        let exits: usize = std::env::var("WICK_CLOCK_EXITS").ok().and_then(|v| v.parse().ok()).unwrap_or(300_000);
+        let (_vm, _gic, mut vcpu) = vm_with_gic_and_code(&MMIO_FOR_EVER);
+        for (id, v) in [(x_reg(3), 7u64), (x_reg(4), MMIO)] {
+            vcpu.set_one_reg(id, &v.to_le_bytes()).unwrap();
+        }
+        // [clock][which read after the exit]: how often lower, the most by.
+        let mut back = [[(0u64, 0u64); 3]; 7];
+        let mut first: Vec<String> = Vec::new();
+        let mut last = read();
+        let started = Instant::now();
+        for exit in 0..exits {
+            match vcpu.run().unwrap() {
+                crate::VcpuExit::MmioWrite(MMIO, _) => {}
+                other => panic!("{other:?}"),
+            }
+            for nth in 0..3 {
+                let now = read();
+                for c in 0..7 {
+                    if now[c] < last[c] {
+                        let by = last[c] - now[c];
+                        back[c][nth].0 += 1;
+                        back[c][nth].1 = back[c][nth].1.max(by);
+                        if first.len() < 12 {
+                            first.push(format!(
+                                "exit {exit}, read {nth}: {} lower by {by} (before {:?}, now {:?})",
+                                NAMES[c], last, now
+                            ));
+                        }
+                    }
+                }
+                last = now;
+            }
+        }
+        let mut report = format!("{exits} MMIO exits in {:?}, each clock read 3 times after each:\n", started.elapsed());
+        for c in 0..7 {
+            report.push_str(&format!(
+                "  {:22} lower than the read before: {:?} times (1st, 2nd, 3rd read after an exit), the most by {:?}\n",
+                NAMES[c],
+                back[c].map(|b| b.0),
+                back[c].map(|b| b.1)
+            ));
+        }
+        for line in &first {
+            report.push_str(&format!("  {line}\n"));
+        }
+        println!("{report}");
+        assert!(back.iter().flatten().all(|b| b.0 == 0), "a clock went back on a vCPU's thread:\n{report}");
+    }
+
     #[test]
     fn test_a_wfi_ends_when_its_timer_is_due() {
         // A guest waiting in WFI for its virtual timer, 20 ms ahead, runs

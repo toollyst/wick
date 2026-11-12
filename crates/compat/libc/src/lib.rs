@@ -36,6 +36,12 @@ pub mod wick_uffd;
 /// The hypervisor backend's hooks on guest memory (a wick API, not part of `libc`).
 #[cfg(target_os = "macos")]
 pub mod wick_guest;
+// CLOCK_MONOTONIC as Linux has it: the explicit re-export takes precedence
+// over the glob re-export of `upstream`.
+#[cfg(target_os = "macos")]
+mod macos_time;
+#[cfg(target_os = "macos")]
+pub use macos_time::clock_gettime;
 #[cfg(target_os = "macos")]
 mod timerfd;
 // AF_UNIX streams start with Linux's send buffer (`socket`, `socketpair`).

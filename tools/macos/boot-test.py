@@ -1716,7 +1716,10 @@ def stage_cli(ctx):
         seen[module or "all"] = len(origins)
     done.append(f"--module keeps its crate's lines ({seen})")
 
-    # --start-time-us is CLOCK_MONOTONIC in us (what the jailer passes),
+    # --start-time-us is CLOCK_MONOTONIC in us (what the jailer passes):
+    # Linux's, which on macOS is CLOCK_UPTIME_RAW's reading, the hardware
+    # counter, and not macOS's clock of that name (the compat libc's
+    # macos_time.rs);
     # --start-time-cpu-us the CPU time the process had at the exec,
     # --parent-cpu-time-us the jailer's: once the API server is up the
     # metrics hold the time since the start and the CPU time since then plus
@@ -1726,7 +1729,7 @@ def stage_cli(ctx):
     lfifo = FifoReader(os.path.join(ctx.sock, "l.fifo"))
     try:
         parent = 1000
-        t0 = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000
+        t0 = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) // 1000
         vm = ctx.vm("cli-time", ["--start-time-us", str(t0), "--start-time-cpu-us", "0",
                                  "--parent-cpu-time-us", str(parent), "--metrics-path", mfifo.path])
         vm.api("PUT", "/logger", {"log_path": lfifo.path, "level": "Info"})
@@ -1738,7 +1741,7 @@ def stage_cli(ctx):
         vm.api("PUT", "/machine-config", cfg["machine-config"])
         vm.api("PUT", "/actions", {"action_type": "InstanceStart"})
         vm.api("PUT", "/actions", {"action_type": "FlushMetrics"})
-        wall = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000 - t0
+        wall = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) // 1000 - t0
         metrics = read_metrics(mfifo.text(wait_for="utc_timestamp_ms"))
         log = lfifo.text(wait_for='Get request on "/machine-config"')
         # The readers go away mid-run: Firecracker holds both FIFOs open
@@ -1765,6 +1768,31 @@ def stage_cli(ctx):
     check(parent < cpu < parent + wall * os.cpu_count(), f"process_startup_time_cpu_us {cpu} (parent {parent}, wall {wall})")
     done.append(f"start time metrics {start} us, {cpu} CPU us (of {wall} us); logger and metrics on FIFOs, "
                 "and the microVM goes on once their readers went")
+
+    # A caller that passes macOS's own CLOCK_MONOTONIC (the wall clock since
+    # the boot) instead: the metric is off by what the two clocks differ by,
+    # as it is on Linux for a start time that is not the clock's. Behind the
+    # counter it adds that much; ahead of it (a Mac that has slept: macOS's
+    # clock counts the sleep) the start time is in the future and upstream's
+    # subtraction overflows, which is not run here.
+    own = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000
+    raw = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) // 1000
+    behind = raw - own
+    if behind > 0:
+        wrong = os.path.join(ctx.out, "cli-wrong-clock.metrics")
+        vm = ctx.vm("cli-wrong-clock", ["--start-time-us", str(own), "--metrics-path", wrong], config(ctx))
+        vm.shell()
+        vm.api("PUT", "/actions", {"action_type": "FlushMetrics"})
+        took = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) // 1000 - raw
+        got = read_metrics(wrong)[-1]["api_server"]["process_startup_time_us"]
+        vm.reboot()
+        check(behind < got <= behind + took,
+              f"process_startup_time_us {got} with macOS's CLOCK_MONOTONIC as --start-time-us: the clocks differ by {behind} us, "
+              f"{took} us passed")
+        done.append(f"macOS's own CLOCK_MONOTONIC as --start-time-us is off by the clocks' difference ({behind} us: metric {got})")
+    else:
+        done.append(f"macOS's own CLOCK_MONOTONIC as --start-time-us: NOT RUN, it is {-behind} us ahead of the counter on this host "
+                    "(a start time in the future)")
 
     # A log FIFO nobody ever reads: Firecracker opens it without a reader
     # (O_RDWR), and once the pipe is full each line is lost and counted in
