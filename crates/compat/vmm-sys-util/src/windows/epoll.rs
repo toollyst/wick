@@ -1545,6 +1545,107 @@ mod tests {
         close_handle(r);
         close_handle(w);
     }
+
+    /// Tells the child of `test_serial_input_reads_an_emptied_pipe_as_eagain`
+    /// that it is the child.
+    const SERIAL_CHILD_ENV: &str = "WICK_TEST_SERIAL_INPUT_CHILD";
+
+    /// Firecracker's serial input on a standard input that is a pipe, run by
+    /// `test_serial_input_reads_an_emptied_pipe_as_eagain`.
+    ///
+    /// A wait reports the pipe readable only while it has data (`collect`
+    /// asks `pipe_state` then), and an emptied pipe is not reported again.
+    /// But the serial reads its input on two events, the input's and the
+    /// buffer-ready eventfd's, and one wait can report both (upstream's
+    /// vmm/tests/devices.rs, test_issue_serial_hangup_anon_pipe_while_registered_stdin:
+    /// "Either one of the events might be handled first. The handling of the
+    /// second event will find the stdin without any pending bytes and will
+    /// result in EWOULDBLOCK"). So the input event's read can find the pipe
+    /// empty, its writer open. Linux's pipe_read gives EAGAIN there
+    /// (fs/pipe.c), and the serial waits for input again
+    /// (handle_ewouldblock). The serial reads with `std::io::stdin()` (vmm's
+    /// `std` is wick-std, which re-exports std's `io` unchanged), and std reads
+    /// an empty non-blocking pipe as `Ok(0)` (ReadFile's ERROR_NO_DATA is
+    /// ErrorKind::BrokenPipe in std's decode_error_kind, which Handle::read
+    /// returns as the end): the serial's end of input, so it detaches the input
+    /// for good.
+    #[test]
+    #[ignore = "the child of test_serial_input_reads_an_emptied_pipe_as_eagain"]
+    fn serial_input_child() {
+        if std::env::var_os(SERIAL_CHILD_ENV).is_none() {
+            return;
+        }
+        // Non-blocking, as Firecracker makes its standard input before the
+        // vCPUs start (start_vcpus, Terminal::set_non_block).
+        // SAFETY: plain calls on the standard input.
+        unsafe {
+            let flags = libc::fcntl(0, libc::F_GETFL);
+            assert!(flags >= 0, "F_GETFL: {}", io::Error::last_os_error());
+            assert_eq!(
+                libc::fcntl(0, libc::F_SETFL, flags | libc::O_NONBLOCK),
+                0,
+                "F_SETFL: {}",
+                io::Error::last_os_error()
+            );
+        }
+        let epoll = Epoll::new().unwrap();
+        epoll
+            .ctl(ControlOperation::Add, 0, EpollEvent::new(EventSet::IN, 9))
+            .unwrap();
+        // The parent wrote one byte and keeps its end open.
+        let mut events = [EpollEvent::default(); 4];
+        assert_eq!(epoll.wait(10_000, &mut events).unwrap(), 1);
+        assert_eq!((events[0].data(), events[0].event_set()), (9, EventSet::IN));
+        let mut input = std::io::stdin();
+        let mut buf = [0u8; 64];
+        // The buffer-ready event's read, handled first, takes the byte.
+        assert_eq!(input.read(&mut buf).unwrap(), 1);
+        // Empty, its writer open: not reported any more.
+        assert!(wait_now(&epoll).is_empty());
+        // The read of the input event reported above.
+        let got = input.read(&mut buf).map_err(|e| e.raw_os_error());
+        assert_eq!(
+            got,
+            Err(Some(libc::EWOULDBLOCK)),
+            "an empty pipe whose writer is open must read as EWOULDBLOCK; Ok(0) is the end of the input, and the serial detaches it"
+        );
+        epoll
+            .ctl(ControlOperation::Delete, 0, EpollEvent::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_serial_input_reads_an_emptied_pipe_as_eagain() {
+        if std::env::var_os(SERIAL_CHILD_ENV).is_some() {
+            return;
+        }
+        // An anonymous pipe as the jailer gives Firecracker its console
+        // (CreatePipe, through std::io::pipe; jailer platform/windows/console.rs).
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "windows::epoll::tests::serial_input_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(SERIAL_CHILD_ENV, "1")
+            .stdin(reader)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer.write_all(b"x").unwrap();
+        // The writer stays open until the child is done: its reads must see
+        // an empty pipe, not the end of one.
+        let out = child.wait_with_output().unwrap();
+        drop(writer);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    }
+
     #[test]
     fn test_nested_epoll() {
         let outer = Epoll::new().unwrap();

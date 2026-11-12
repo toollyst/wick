@@ -164,8 +164,10 @@ pub fn wick_errno_from_win32(code: c_int) -> c_int {
         39 => ENOSPC,
         // ERROR_NO_DATA from a write: "The pipe is being closed". From a
         // non-blocking ReadFile it is an empty pipe, EAGAIN: that call site
-        // maps it itself (read_handle), as std's callers must
-        // (Firecracker's serial input, patch 0019).
+        // maps it itself (read_handle). std never shows its callers the
+        // code: its Handle::read returns it as Ok(0), the end of the pipe
+        // (Firecracker's serial input reads std's Stdin;
+        // vmm-sys-util test_serial_input_reads_an_emptied_pipe_as_eagain).
         232 => EPIPE,
         // ERROR_SEM_TIMEOUT, WAIT_TIMEOUT, ERROR_TIMEOUT.
         121 | 258 | 1460 => ETIMEDOUT,

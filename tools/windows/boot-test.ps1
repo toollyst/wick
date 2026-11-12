@@ -7,7 +7,9 @@
 # guest and the host see:
 #
 #   boot   1 vCPU: init, serial out and in (stdin is a pipe), CPU, memory,
-#          guest clock, CPUID hypervisor bit, reset exits Firecracker with 0
+#          guest clock, CPUID hypervisor bit; serial input still read after
+#          30 s of silence and after a full receive FIFO; reset exits
+#          Firecracker with 0
 #   smp    2 vCPUs: AP start-up, work on each CPU, the clock agrees between
 #          them; CPU 1 offline and online (INIT/SIPI) three times, then
 #          working, after boot and after a snapshot restore
@@ -1603,10 +1605,47 @@ function Get-Uptime($vm, [string]$cmd = 'cat /proc/uptime') {
     return [double]::Parse(($out -split '\s+')[0], [Globalization.CultureInfo]::InvariantCulture)
 }
 
+# Runs a guest command whose output must be `$want`; `$what` names the case
+# in the failure, also when the command never comes back (input not read).
+function Test-SerialCommand($vm, [string]$cmd, [string]$want, [string]$what) {
+    try {
+        $out = $vm.Sh($cmd, 10000, $true)
+    } catch {
+        $f = Get-Failure $_
+        if (-not $f) { throw }
+        Fail "serial input $what`: $($f.Message)"
+    }
+    Check ($out -eq $want) "serial input $what`: '$out', want '$want'"
+}
+
+# The serial keeps reading its input (a pipe, non-blocking) in the cases
+# where it reads the pipe empty while the writer is open. Linux's read gives
+# EAGAIN there and the serial waits for input again (handle_ewouldblock); a
+# read of 0 bytes is the end of the input, after which nothing typed
+# reaches the guest.
+#  - After 30 s with nothing typed: a command must still reach the shell.
+#  - After a full receive FIFO (64 bytes, vm-superio): with the vCPU paused, a
+#    line longer than the FIFO fills it and a second line arrives while it is
+#    full, so the serial stops watching its input (ENOBUFS). Resumed, the
+#    guest drains the FIFO; each drain reads more input, and the read that
+#    finds it empty watches the input again (EAGAIN on Linux). A command
+#    typed after that must reach the shell, and see both lines.
+function Test-SerialInput($vm) {
+    Start-Sleep -Seconds 30
+    Test-SerialCommand $vm 'echo QUIET-$((6*7))' 'QUIET-42' 'after 30 s of silence'
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+    $vm.Send('A=' + ('L' * 100))
+    Start-Sleep -Milliseconds 500
+    $vm.Send('B=second')
+    Start-Sleep -Milliseconds 500
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Resumed' } | Out-Null
+    Test-SerialCommand $vm 'echo ${#A}:$B' '100:second' 'after a full receive FIFO'
+}
+
 # --- stages ---------------------------------------------------------------------
 
 function Stage-Boot {
-    $vm = Start-Vm 'boot' (Base-Config 1)
+    $vm = Start-Vm 'boot' (Base-Config 1) -Api
     Wait-Shell $vm
     $out = $vm.Sh('echo WICK-$((6*7))')
     Check ($out -eq 'WICK-42') "serial echo: '$out'"
@@ -1630,9 +1669,10 @@ function Stage-Boot {
     $host_dt = $sw.Elapsed.TotalSeconds
     $dt = $t1 - $t0
     Check ($dt -gt 1.5 -and $dt -le $host_dt + 0.5) ("guest clock advanced {0:N2} s in {1:N2} s (clocksource {2})" -f $dt, $host_dt, $clock)
+    Test-SerialInput $vm
     Save-Dmesg $vm 'boot'
     $vm.Reboot()
-    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), reset exits 0" -f $dt, $host_dt)
+    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0" -f $dt, $host_dt)
 }
 
 # CPU 1 taken offline and back online three times, then work on it: on x86
