@@ -23,6 +23,7 @@
 #![allow(missing_docs)]
 
 pub mod cap;
+mod debug;
 mod device;
 mod exit;
 mod ffi;

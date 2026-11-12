@@ -105,6 +105,9 @@ fn step(s: &Step, debug: &mut DebugRegs, reference: &mut Reference) {
         }),
         0x20 => Exit::Abort { instruction: true, write: false },
         0x24 => Exit::Abort { instruction: false, write: bit(6) },
+        // KVM's kvm_handle_guest_debug classes: breakpoint, software step and
+        // watchpoint from a lower EL, BKPT, BRK.
+        0x30 | 0x32 | 0x34 | 0x38 | 0x3c => Exit::Debug,
         _ => Exit::Unsupported,
     };
     assert_eq!(exit, expected, "esr {esr:#x}");

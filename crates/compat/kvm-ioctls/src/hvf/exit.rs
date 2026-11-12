@@ -24,6 +24,16 @@ pub const EC_SYSREG: u64 = 0x18;
 pub const EC_INST_ABORT_LOWER: u64 = 0x20;
 /// A data abort from a lower exception level.
 pub const EC_DATA_ABORT_LOWER: u64 = 0x24;
+/// A breakpoint from a lower exception level.
+pub const EC_BREAKPOINT_LOWER: u64 = 0x30;
+/// A software step from a lower exception level.
+pub const EC_SOFTWARE_STEP_LOWER: u64 = 0x32;
+/// A watchpoint from a lower exception level.
+pub const EC_WATCHPOINT_LOWER: u64 = 0x34;
+/// BKPT (AArch32).
+pub const EC_BKPT32: u64 = 0x38;
+/// BRK (AArch64).
+pub const EC_BRK64: u64 = 0x3c;
 
 /// What an exception exit is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +55,10 @@ pub enum Exit {
     Wfe,
     /// A system register access.
     Sysreg(SysregAccess),
+    /// A debug exception (a breakpoint, a software step, a watchpoint, BKPT
+    /// or BRK from the guest), which reaches the host only while user space
+    /// debugs the guest (`super::debug`).
+    Debug,
     /// Any other exception class.
     Unsupported,
 }
@@ -63,6 +77,9 @@ pub fn decode(esr: u64) -> Exit {
         EC_WFX if iss & 1 == 0 => Exit::Wfi,
         EC_WFX => Exit::Wfe,
         EC_SYSREG => Exit::Sysreg(SysregAccess::decode(iss)),
+        // KVM's `kvm_handle_guest_debug` classes (handle_exit.c
+        // `arm_exit_handlers`): the lower-EL ones and the two instructions.
+        EC_BREAKPOINT_LOWER | EC_SOFTWARE_STEP_LOWER | EC_WATCHPOINT_LOWER | EC_BKPT32 | EC_BRK64 => Exit::Debug,
         _ => Exit::Unsupported,
     }
 }
@@ -356,6 +373,19 @@ mod tests {
             Exit::Sysreg(SysregAccess { read: true, rt: 3, encoding: (2, 0, 1, 1, 4) })
         );
         assert_eq!(decode(0), Exit::Unsupported);
+    }
+
+    #[test]
+    fn test_decode_debug_classes() {
+        // Breakpoint, software step, watchpoint (lower EL), BKPT, BRK.
+        for ec in [0x30u64, 0x32, 0x34, 0x38, 0x3c] {
+            assert_eq!(decode(ec << 26 | 0x22), Exit::Debug, "{ec:#x}");
+        }
+        // The current-EL classes cannot come from a guest (its EL1 is the
+        // host's lower level); vector catch (0x3a) is AArch32 only.
+        for ec in [0x31u64, 0x33, 0x35, 0x3a, 0x3d] {
+            assert_eq!(decode(ec << 26), Exit::Unsupported, "{ec:#x}");
+        }
     }
 
     #[test]

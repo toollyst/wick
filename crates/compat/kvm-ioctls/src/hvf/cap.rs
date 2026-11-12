@@ -198,7 +198,13 @@ pub(crate) fn supported(c: std::os::raw::c_ulong) -> i32 {
         // Pointer authentication: Apple silicon has it, and the guest is
         // given it only with the vCPU features (`idregs`).
         | KVM_CAP_ARM_PTRAUTH_ADDRESS
-        | KVM_CAP_ARM_PTRAUTH_GENERIC => 1,
+        | KVM_CAP_ARM_PTRAUTH_GENERIC
+        // Guest debugging for user space (`super::debug`), as arm64 KVM.
+        | KVM_CAP_SET_GUEST_DEBUG => 1,
+        // The host's breakpoints and watchpoints (KVM's `get_num_brps`,
+        // `get_num_wrps`).
+        KVM_CAP_GUEST_DEBUG_HW_BPS => super::debug::host_counts().map_or(0, |c| c.0 as i32),
+        KVM_CAP_GUEST_DEBUG_HW_WPS => super::debug::host_counts().map_or(0, |c| c.1 as i32),
         KVM_CAP_NR_VCPUS | KVM_CAP_MAX_VCPUS | KVM_CAP_MAX_VCPU_ID => super::vm::max_vcpus() as i32,
         KVM_CAP_NR_MEMSLOTS => super::NR_MEMSLOTS as i32,
         KVM_CAP_ARM_VM_IPA_SIZE => super::vm::max_ipa_bits() as i32,

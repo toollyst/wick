@@ -13,9 +13,11 @@ use std::time::Duration;
 
 use kvm_bindings::{
     KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, KVM_ARM_VCPU_PTRAUTH_ADDRESS, KVM_ARM_VCPU_PTRAUTH_GENERIC, KVM_MP_STATE_RUNNABLE, KVM_MP_STATE_STOPPED,
-    KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, RegList, kvm_device_attr, kvm_mp_state,
-    kvm_run, kvm_vcpu_init,
+    KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, RegList, kvm_device_attr, kvm_guest_debug,
+    kvm_mp_state, kvm_run, kvm_vcpu_init,
 };
+
+use super::debug::{self, GuestDebug, Stopped};
 
 use super::exit::{self, DebugRegs, Exit, Mmio, Psci, SysregAccess, SysregResult};
 use super::ffi::*;
@@ -148,6 +150,12 @@ pub(crate) struct VcpuShared {
     initialized: AtomicBool,
     /// GIC redistributor and CPU interface registers for other threads.
     gic: Mutex<GicCpu>,
+    /// What user space asked for with `set_guest_debug`, from any handle;
+    /// the owner applies it when it runs (`debug`).
+    debug: Mutex<GuestDebug>,
+    /// The registers of the vCPU while it is stopped, for its other handles
+    /// (`debug::Stopped`).
+    stopped: Mutex<Option<Stopped>>,
 }
 
 impl VcpuShared {
@@ -168,6 +176,8 @@ impl VcpuShared {
             pending: Mutex::new(Vec::new()),
             initialized: AtomicBool::new(false),
             gic: Mutex::new(GicCpu::default()),
+            debug: Mutex::new(GuestDebug::default()),
+            stopped: Mutex::new(None),
         });
         ALL_VCPUS.lock().unwrap().push(Arc::downgrade(&shared));
         Ok((file, shared))
@@ -257,6 +267,8 @@ pub struct VcpuFd {
     mmio: [u8; 8],
     /// The MMIO load Firecracker is completing (`complete_mmio_read`).
     pending_read: Option<Mmio>,
+    /// Guest debugging as the owner applies it.
+    debug: debug::Owner,
 }
 
 /// Pointer to the exit information Hypervisor.framework fills in for this vCPU.
@@ -285,6 +297,7 @@ impl VcpuFd {
             exit: ExitPtr(std::ptr::null()),
             mmio: [0; 8],
             pending_read: None,
+            debug: debug::Owner::default(),
         }
     }
 
@@ -593,8 +606,24 @@ impl VcpuFd {
             self.set_os_lock(u64::from_le_bytes(buf))?;
             return Ok(size);
         }
-        match self.live()? {
-            Some(hv) => self.set_reg_now(hv, reg_id, &data[..size])?,
+        let live = match self.live() {
+            Ok(live) => live,
+            // Another handle (a debugger's): only while the vCPU is stopped.
+            Err(_) => {
+                self.stopped_write(reg_id, reg, &data[..size])?;
+                return Ok(size);
+            }
+        };
+        match live {
+            Some(hv) => {
+                self.apply_remote_writes(hv)?;
+                self.set_reg_now(hv, reg_id, &data[..size])?;
+                if let Some(s) = self.shared.stopped.lock().unwrap().as_mut()
+                    && let Some(v) = s.regs.get_mut(&reg_id)
+                {
+                    *v = data[..size].to_vec();
+                }
+            }
             // The counter is the VM's, and counts from the time of the write.
             None if reg == Reg::VirtualCount => {
                 let mut buf = [0u8; 8];
@@ -639,11 +668,111 @@ impl VcpuFd {
             data[..8].copy_from_slice(&debug.oslsr().to_le_bytes());
             return Ok(size);
         }
-        match self.live()? {
-            Some(hv) => self.get_reg_now(hv, reg_id, &mut data[..size])?,
-            None => self.get_reg_early(reg_id, &mut data[..size])?,
+        match self.live() {
+            Ok(Some(hv)) => {
+                self.apply_remote_writes(hv)?;
+                self.get_reg_now(hv, reg_id, &mut data[..size])?;
+            }
+            Ok(None) => self.get_reg_early(reg_id, &mut data[..size])?,
+            // Another handle (a debugger's): only while the vCPU is stopped.
+            Err(_) => self.stopped_read(reg_id, reg, &mut data[..size])?,
         }
         Ok(size)
+    }
+
+    /// Sets up guest debugging by user space (`KVM_SET_GUEST_DEBUG`), from
+    /// any handle: stored, and applied by the vCPU when it next runs, as
+    /// KVM applies it at the next `KVM_RUN` (`super::debug`).
+    pub fn set_guest_debug(&self, debug_struct: &kvm_guest_debug) -> Result<()> {
+        self.fd.check()?;
+        self.shared.debug.lock().unwrap().set(debug_struct.control, &debug_struct.arch)
+    }
+
+    /// Publishes the registers of the stopped vCPU for its other handles
+    /// (`debug::Stopped`); once per stop.
+    fn publish(&self, hv: hv_vcpu_t) -> Result<()> {
+        let mut stopped = self.shared.stopped.lock().unwrap();
+        if stopped.is_some() {
+            return Ok(());
+        }
+        let mut values = HashMap::new();
+        for id in regs::reg_list() {
+            // Read live from the VM by other handles.
+            if matches!(
+                regs::decode(id),
+                Some(Reg::VirtualCount | Reg::PhysicalCount | Reg::PsciVersion | Reg::OsLock)
+            ) {
+                continue;
+            }
+            let mut buf = vec![0u8; reg_size(id)];
+            self.get_reg_now(hv, id, &mut buf)?;
+            values.insert(id, buf);
+        }
+        *stopped = Some(Stopped { regs: values, writes: Vec::new() });
+        Ok(())
+    }
+
+    /// Applies, on the owner, the writes other handles made while the vCPU
+    /// was stopped, in their order.
+    fn apply_remote_writes(&self, hv: hv_vcpu_t) -> Result<()> {
+        let writes = match self.shared.stopped.lock().unwrap().as_mut() {
+            Some(s) => std::mem::take(&mut s.writes),
+            None => return Ok(()),
+        };
+        for (id, data) in writes {
+            self.set_reg_now(hv, id, &data)?;
+        }
+        Ok(())
+    }
+
+    /// A register of the stopped vCPU, for a handle that is not its owner;
+    /// `EBUSY` while it runs, as before.
+    fn stopped_read(&self, reg_id: u64, reg: Reg, out: &mut [u8]) -> Result<()> {
+        let stopped = self.shared.stopped.lock().unwrap();
+        let Some(s) = stopped.as_ref() else {
+            return err(libc::EBUSY);
+        };
+        if matches!(reg, Reg::VirtualCount | Reg::PhysicalCount | Reg::PsciVersion) {
+            drop(stopped);
+            return self.get_reg_early(reg_id, out);
+        }
+        let v = s.regs.get(&reg_id).ok_or_else(|| Error::new(libc::EBUSY))?;
+        out.copy_from_slice(&v[..out.len()]);
+        Ok(())
+    }
+
+    /// Writes a register of the stopped vCPU from a handle that is not its
+    /// owner: read back at once, applied by the owner before it next uses
+    /// the vCPU. `EBUSY` while it runs, as before.
+    fn stopped_write(&self, reg_id: u64, reg: Reg, data: &[u8]) -> Result<()> {
+        let mut stopped = self.shared.stopped.lock().unwrap();
+        let Some(s) = stopped.as_mut() else {
+            return err(libc::EBUSY);
+        };
+        let mut buf = [0u8; 8];
+        let n = data.len().min(8);
+        buf[..n].copy_from_slice(&data[..n]);
+        let v = u64::from_le_bytes(buf);
+        match reg {
+            Reg::VirtualCount => {
+                drop(stopped);
+                self.vm()?.set_virtual_count(v);
+                Ok(())
+            }
+            Reg::PsciVersion => {
+                drop(stopped);
+                self.set_psci_version(v)
+            }
+            Reg::Aarch32Spsr if v == 0 => Ok(()),
+            Reg::PhysicalCount | Reg::Aarch32Spsr => err(libc::EINVAL),
+            _ => {
+                if let Some(slot) = s.regs.get_mut(&reg_id) {
+                    *slot = data.to_vec();
+                }
+                s.writes.push((reg_id, data.to_vec()));
+                Ok(())
+            }
+        }
     }
 
     /// Lists the registers that can be saved (`KVM_GET_REG_LIST`).
@@ -870,12 +999,13 @@ impl VcpuFd {
         if val != 0 {
             self.shared.cancel_run();
             self.shared.wake();
-        } else if let Ok(Some(hv)) = self.live()
-            && self.vm().is_ok_and(|vm| vm.gic.lock().unwrap().created)
-        {
+        } else if let Ok(Some(hv)) = self.live() {
             // A failure leaves the registers unreadable from other threads,
             // which then get EBUSY: reported there, never stale values.
-            let _ = self.shared.gic.lock().unwrap().stop(hv);
+            let _ = self.publish(hv);
+            if self.vm().is_ok_and(|vm| vm.gic.lock().unwrap().created) {
+                let _ = self.shared.gic.lock().unwrap().stop(hv);
+            }
         }
     }
 
@@ -922,6 +1052,7 @@ impl VcpuFd {
         if gic {
             self.shared.gic.lock().unwrap().stop(hv)?;
         }
+        self.publish(hv)?;
         err(libc::EINTR)
     }
 
@@ -1179,6 +1310,25 @@ impl VcpuFd {
         } else {
             self.reg(hv, HV_REG_X0 + access.rt)?
         };
+        // While user space debugs with USE_HW the guest's debug register
+        // accesses trap, as KVM's (MDCR_EL2.TDA); between runs the hardware
+        // holds the guest's own values (`debug`), which they reach. One the
+        // host does not have is undefined.
+        if self.debug.hw()
+            && let Some(r) = debug::trapped_register(access.encoding)
+        {
+            let done = if access.read {
+                match self.sys(hv, r) {
+                    Ok(v) if access.rt != 31 => self.set_reg(hv, HV_REG_X0 + access.rt, v).is_ok(),
+                    Ok(_) => true,
+                    Err(_) => false,
+                }
+            } else {
+                // SAFETY: `hv` belongs to this thread.
+                check(unsafe { hv_vcpu_set_sys_reg(hv, r, value) }).is_ok()
+            };
+            return if done { self.advance_pc(hv) } else { self.inject_undef(hv) };
+        }
         let mut debug = DebugRegs { os_lock: self.shared.os_lock.load(Ordering::Relaxed) };
         let result = debug.access(access, value);
         self.shared.os_lock.store(debug.os_lock, Ordering::Relaxed);
@@ -1212,6 +1362,15 @@ impl VcpuFd {
     pub fn run(&mut self) -> Result<VcpuExit<'_>> {
         self.fd.check()?;
         let hv = self.ensure_created()?;
+        // What other handles wrote while it was stopped, then the debug
+        // request in force, before anything else touches the vCPU.
+        let stopped = self.shared.stopped.lock().unwrap().take();
+        if let Some(stopped) = stopped {
+            for (id, data) in stopped.writes {
+                self.set_reg_now(hv, id, &data)?;
+            }
+        }
+        self.debug.take(&mut self.shared.debug.lock().unwrap());
         self.complete_mmio_read(hv)?;
         let vm = self.vm()?;
         let gic = vm.gic.lock().unwrap().created;
@@ -1228,10 +1387,14 @@ impl VcpuFd {
             self.update_vtimer(hv)?;
             self.apply_vtimer_offset(hv, &vm)?;
 
+            let saved = self.debug.enter(hv, self.shared.os_lock.load(Ordering::Relaxed))?;
             self.shared.in_run.store(true, Ordering::Release);
             // SAFETY: `hv` belongs to this thread.
             let ret = unsafe { hv_vcpu_run(hv) };
             self.shared.in_run.store(false, Ordering::Release);
+            if let Some(saved) = saved {
+                self.debug.leave(hv, saved)?;
+            }
             check(ret)?;
             // SAFETY: Hypervisor.framework keeps the exit record valid for the vCPU's lifetime.
             let exit = unsafe { *self.exit.0 };
@@ -1319,7 +1482,17 @@ impl VcpuFd {
                 }
                 Exit::Wfe => self.advance_pc(hv)?,
                 Exit::Sysreg(access) => self.sysreg_trap(hv, access)?,
-                Exit::Unsupported => return Ok(VcpuExit::Unsupported(esr as u32)),
+                // As KVM's kvm_handle_guest_debug: the PC stays at the
+                // instruction; a step taken ends the active-pending state.
+                Exit::Debug if self.debug.on() => {
+                    if (esr >> 26) & 0x3f == exit::EC_SOFTWARE_STEP_LOWER {
+                        self.debug.ss_active_pending = false;
+                    }
+                    let arch = debug::exit_arch(esr, exit.exception.virtual_address);
+                    self.publish(hv)?;
+                    return Ok(VcpuExit::Debug(arch));
+                }
+                Exit::Debug | Exit::Unsupported => return Ok(VcpuExit::Unsupported(esr as u32)),
             }
         }
     }
