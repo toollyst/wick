@@ -50,6 +50,10 @@
 #          refused at the load (no guest)
 #   memory-hotplug  virtio-mem: 512 MiB plugged, seen in MemTotal and used,
 #          then unplugged
+#   gdb    (not in `all`: needs a Firecracker built with the gdb feature and
+#          a gdb) upstream's debug kernel under gdb: a hardware breakpoint at
+#          start_kernel, the kernel's bytes read through the stub's address
+#          translation, a software breakpoint at rest_init, the guest boots
 #
 # Before each reset the guest kernel log must be free of stalls, BUGs, oopses
 # and warnings.
@@ -82,6 +86,12 @@ param(
     # For the foreign-snapshot stage: a snapshot state file made on another
     # host (the macOS boot test's snapshot stage makes an aarch64 one).
     [string]$ForeignState,
+    # For the gdb stage (not part of `all`): a Firecracker built with the
+    # gdb feature (default: lib\firecracker\build\cargo_target\debug), and
+    # a gdb that reads x86-64 Linux kernels (default: gdb-multiarch or gdb on
+    # PATH, then MSYS2's in C:\msys64\{ucrt64,mingw64}\bin).
+    [string]$GdbFirecracker,
+    [string]$Gdb,
     # Checks the harness itself against stand-ins for Firecracker's sockets
     # (no WHP, no downloads) and exits.
     [switch]$SelfTest
@@ -452,6 +462,59 @@ namespace Wick {
 
         public void Dispose() {
             if (s != Invalid) { closesocket(s); s = Invalid; }
+        }
+    }
+
+    // A TCP listener on 127.0.0.1 whose one connection is relayed to a Unix
+    // socket: for a gdb that cannot connect to a Unix socket path itself.
+    public class Relay {
+        System.Net.Sockets.TcpListener listener;
+        volatile bool stopped;
+        public int Port;
+        public volatile string Error;
+        public volatile bool Connected;
+
+        public Relay(string uds) {
+            listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+            listener.Start();
+            Port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+            var t = new Thread(() => Run(uds));
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        void Run(string uds) {
+            try {
+                var client = listener.AcceptTcpClient();
+                listener.Stop();
+                var u = USock.Connect(uds);
+                Connected = true;
+                var stream = client.GetStream();
+                var up = new Thread(() => {
+                    var b = new byte[4096];
+                    try {
+                        int n;
+                        while ((n = stream.Read(b, 0, b.Length)) > 0) u.SendAll(b, 0, n);
+                    } catch (Exception) { }
+                });
+                up.IsBackground = true;
+                up.Start();
+                var buf = new byte[4096];
+                while (!stopped) {
+                    int n = u.Recv(buf, 0, buf.Length, 200);
+                    if (n == 0) break;
+                    if (n > 0) stream.Write(buf, 0, n);
+                }
+                client.Close();
+                u.Dispose();
+            } catch (Exception e) {
+                if (!stopped) Error = e.Message;
+            }
+        }
+
+        public void Stop() {
+            stopped = true;
+            try { listener.Stop(); } catch (Exception) { }
         }
     }
 
@@ -2607,6 +2670,164 @@ function Stage-NoSeccomp {
 # virtio-mem, as upstream's test_virtio_mem_hotplug_hotunplug does it: 512 MiB
 # plugged into a guest of 512 MiB (a 1 GiB hotplug area, 128 MiB slots, 2 MiB
 # blocks) and seen in its MemTotal, used, then unplugged again.
+# The gdb client: -Gdb, else gdb-multiarch or gdb on PATH, else MSYS2's
+# (pacman -S mingw-w64-ucrt-x86_64-gdb-multiarch). It must read x86-64 Linux
+# ELF files: a gdb built for Windows targets only cannot.
+function Find-Gdb {
+    if ($Gdb) { return (Resolve-Path $Gdb).Path }
+    foreach ($n in @('gdb-multiarch', 'gdb')) {
+        $c = Get-Command $n -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($c) { return $c.Source }
+    }
+    foreach ($c in @('C:\msys64\ucrt64\bin\gdb-multiarch.exe', 'C:\msys64\mingw64\bin\gdb-multiarch.exe', 'C:\msys64\ucrt64\bin\gdb.exe', 'C:\msys64\mingw64\bin\gdb.exe')) {
+        if (Test-Path $c) { return $c }
+    }
+    Fail 'no gdb: install MSYS2 and `pacman -S mingw-w64-ucrt-x86_64-gdb-multiarch`, or pass -Gdb <gdb.exe>'
+}
+
+# Runs gdb in batch mode on `$symbols` with `$script`; returns its process,
+# its output going to `$out`.
+function Start-Gdb([string]$gdb, [string]$symbols, [string]$script, [string]$out) {
+    $scriptPath = "$out.gdb"
+    [IO.File]::WriteAllText($scriptPath, $script)
+    return Start-Process -FilePath $gdb -ArgumentList @('-nx', '-batch', '-x', "`"$scriptPath`"", "`"$symbols`"") -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+}
+
+function Get-GdbText([string]$out) {
+    return ((Get-Content -Raw $out, "$out.err" -ErrorAction SilentlyContinue) -join "`n")
+}
+
+# The bytes gdb's `x/16xb` printed after the line `$marker`.
+function Get-GdbBytes([string]$text, [string]$marker) {
+    $i = $text.IndexOf("$marker`n")
+    if ($i -lt 0) { $i = $text.IndexOf("$marker`r`n") }
+    if ($i -lt 0) { return '' }
+    $lines = @($text.Substring($i) -split "`r?`n" | Select-Object -Skip 1 -First 2)
+    return (($lines | ForEach-Object { [regex]::Matches(($_ -split ':', 2)[-1], '0x[0-9a-f]{2}\b') | ForEach-Object { $_.Value } }) -join ' ')
+}
+
+# Firecracker's gdb stub (the gdb feature), as upstream's test_gdb_connects:
+# gdb connects to the stub's socket and a hardware breakpoint at start_kernel
+# is hit; then what the stub's address translation (WHvTranslateGva) reads
+# must be the vmlinux's bytes: at start_kernel (a page offset kept, the
+# kernel text's large page) and, at a software breakpoint at rest_init, at
+# the kernel's start through the direct map (2 MiB or 1 GiB pages); the guest
+# then boots on under gdb. Whether this gdb reaches the socket by its path
+# (`target remote <path>`) is tried first and reported; otherwise it goes
+# through a TCP relay (Wick.Relay).
+function Stage-Gdb {
+    $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $fc = if ($GdbFirecracker) { (Resolve-Path $GdbFirecracker).Path } else { Join-Path $root 'lib\firecracker\build\cargo_target\debug\firecracker.exe' }
+    Check (Test-Path $fc) "no Firecracker built with the gdb feature at $fc (cargo build -p firecracker --features gdb, or pass -GdbFirecracker)"
+    $gdb = Find-Gdb
+    Write-Step "gdb: $gdb ($((& $gdb --version 2>&1 | Select-Object -First 1)))"
+    New-Item -ItemType Directory -Force -Path (Join-Path $WorkDir 'debug') | Out-Null
+    $kernel = Get-Asset "debug/$KernelName"
+    $symbols = Join-Path $WorkDir "debug\$KernelName.debug"
+    if (-not (Test-Path $symbols)) {
+        $gz = Get-Asset "debug/$KernelName.debug.gz"
+        $in = [IO.File]::OpenRead($gz)
+        try {
+            $z = New-Object IO.Compression.GZipStream($in, [IO.Compression.CompressionMode]::Decompress)
+            $o = [IO.File]::Create("$symbols.part")
+            try { $z.CopyTo($o) } finally { $o.Close(); $z.Close() }
+        } finally { $in.Close() }
+        Move-Item -Force "$symbols.part" $symbols
+    }
+    # What the kernel file holds, read by gdb without a target.
+    $dir = Join-Path $Results 'gdb'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $offline = Join-Path $dir 'offline.txt'
+    $p = Start-Gdb $gdb $symbols "printf `"WICK-X1\n`"`nx/16xb start_kernel`nprintf `"WICK-X3\n`"`nx/16xb _text`n" $offline
+    Check ($p.WaitForExit(120000) -and $p.ExitCode -eq 0) "gdb cannot read $symbols ($gdb must read x86-64 Linux kernels): $(Get-GdbText $offline)"
+    $offlineText = Get-GdbText $offline
+    $fileStart = Get-GdbBytes $offlineText 'WICK-X1'
+    $fileText = Get-GdbBytes $offlineText 'WICK-X3'
+    Check ($fileStart -match '^(0x[0-9a-f]{2} ){15}0x[0-9a-f]{2}$' -and $fileText -match '^(0x[0-9a-f]{2} ){15}') "gdb's reading of start_kernel and _text in $symbols`: $offlineText"
+
+    $sock = Join-Path $SockDir 'gdb.sock'
+    if (Test-Path $sock) { [IO.File]::Delete($sock) }
+    $config = Base-Config 1
+    $config.'boot-source'.kernel_image_path = $kernel
+    $config.'machine-config'.gdb_socket_path = $sock
+    $saved = $script:Fc
+    $script:Fc = $fc
+    try { $vm = Start-Vm 'gdb' $config } finally { $script:Fc = $saved }
+    # Firecracker waits for gdb before it runs the guest.
+    $until = [DateTime]::UtcNow.AddSeconds(30)
+    while (-not (Test-Path $sock)) {
+        Check (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) "no gdb socket at $sock ($($vm.ExitReason()))"
+        Start-Sleep -Milliseconds 50
+    }
+    $session = @'
+set pagination off
+set confirm off
+target remote TARGET
+hbreak start_kernel
+continue
+printf "WICK-RIP %lx %lx\n", $rip, &start_kernel
+printf "WICK-X1\n"
+x/16xb start_kernel
+break rest_init
+continue
+printf "WICK-REST %lx %lx\n", $rip, &rest_init
+printf "WICK-X2\n"
+x/16xb (char *)0xffff888001000000
+continue
+'@
+    # By the socket's path first, then through the relay.
+    $out = Join-Path $dir 'gdb-direct.txt'
+    $g = Start-Gdb $gdb $symbols ($session -replace 'TARGET', $sock) $out
+    $direct = $false
+    $t = [DateTime]::UtcNow.AddSeconds(20)
+    while ([DateTime]::UtcNow -lt $t -and -not $g.HasExited) {
+        if ((Get-GdbText $out) -match 'WICK-RIP|Remote debugging using') { $direct = $true; break }
+        Start-Sleep -Milliseconds 200
+    }
+    $relay = $null
+    if (-not $direct) {
+        $directText = (Get-GdbText $out).Trim()
+        try { $g.Kill() } catch { }
+        Write-Step "gdb does not reach the Unix socket by its path ($(($directText -split "`n" | Select-Object -Last 2) -join ' | ')); through a TCP relay"
+        Check (Test-Path $sock) 'the gdb socket went away after the direct attempt'
+        $relay = New-Object Wick.Relay($sock)
+        $out = Join-Path $dir 'gdb-relay.txt'
+        $g = Start-Gdb $gdb $symbols ($session -replace 'TARGET', "127.0.0.1:$($relay.Port)") $out
+    } else {
+        Write-Step 'gdb reaches the Unix socket by its path'
+    }
+    try {
+        $text = ''
+        $t = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+        while ([DateTime]::UtcNow -lt $t -and -not $g.HasExited) {
+            $text = Get-GdbText $out
+            if ($text -match 'WICK-REST [0-9a-f]+ [0-9a-f]+\s+WICK-X2\s+\S+:(\s+0x[0-9a-f]{2}){8}\s+\S+:(\s+0x[0-9a-f]{2}){8}') { break }
+            Start-Sleep -Milliseconds 200
+        }
+        $text = Get-GdbText $out
+        [IO.File]::WriteAllText((Join-Path $dir 'gdb-session.txt'), $text)
+        if ($relay -and $relay.Error) { Fail "relay: $($relay.Error)" }
+        Check ($text -match 'hit (Hardware assisted )?[Bb]reakpoint 1, (0x[0-9a-f]+ in )?start_kernel') "the hardware breakpoint at start_kernel was not hit: $text"
+        Check ($text -match 'WICK-RIP ([0-9a-f]+) ([0-9a-f]+)' -and $Matches[1] -eq $Matches[2]) "RIP at the breakpoint is not start_kernel: $text"
+        $seenStart = Get-GdbBytes $text 'WICK-X1'
+        Check ($seenStart -eq $fileStart) "start_kernel through the stub: '$seenStart', in the kernel file: '$fileStart'"
+        Check ($text -match 'Breakpoint 2, (0x[0-9a-f]+ in )?rest_init') "the software breakpoint at rest_init was not hit: $text"
+        Check ($text -match 'WICK-REST ([0-9a-f]+) ([0-9a-f]+)' -and $Matches[1] -eq $Matches[2]) "RIP at the software breakpoint is not rest_init: $text"
+        $seenDirect = Get-GdbBytes $text 'WICK-X2'
+        Check ($seenDirect -eq $fileText) "the kernel's start through the direct map: '$seenDirect', _text in the kernel file: '$fileText'"
+        # gdb's last `continue`: the guest boots on under it.
+        Wait-Shell $vm
+        $o = $vm.Sh('echo gdb-$((6*7))')
+        Check ($o -eq 'gdb-42') "the guest under gdb: '$o'"
+    } finally {
+        try { $g.Kill() } catch { }
+        if ($relay) { $relay.Stop() }
+    }
+    $vm.Kill()
+    $how = if ($direct) { 'by the socket path' } else { 'through a TCP relay (this gdb does not reach a Unix socket by its path)' }
+    return "gdb $how`: hardware breakpoint at start_kernel, its bytes and the kernel's start through the direct map as in the vmlinux, software breakpoint at rest_init, the guest boots on"
+}
+
 function Stage-MemoryHotplug {
     $cfg = Base-Config 2 512 ($BootArgs + ' memhp_default_state=online_movable')
     $cfg['memory-hotplug'] = [ordered]@{ total_size_mib = 1024; slot_size_mib = 128; block_size_mib = 2 }
@@ -2668,7 +2889,10 @@ $Stages = [ordered]@{
     'no-seccomp' = { Stage-NoSeccomp }
     'foreign-snapshot' = { Stage-ForeignSnapshot }
     'memory-hotplug' = { Stage-MemoryHotplug }
+    gdb      = { Stage-Gdb }
 }
+# Stages `all` leaves out: they need what a plain kit does not have.
+$NotInAll = @('gdb')
 
 # --- run ------------------------------------------------------------------------
 
@@ -2731,7 +2955,7 @@ if ($SelfTest) {
 
 # `-Stage boot,smp` reaches a -File script as one string.
 $selected = @($Stage | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-if ($selected -contains 'all') { $selected = @($Stages.Keys) }
+if ($selected -contains 'all') { $selected = @($Stages.Keys | Where-Object { $NotInAll -notcontains $_ }) }
 foreach ($s in $selected) {
     if (-not $Stages.Contains($s)) { throw "unknown stage '$s'; stages: all, $(@($Stages.Keys) -join ', ')" }
 }
