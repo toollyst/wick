@@ -8,8 +8,9 @@
 #
 #   tools/macos/jailer-test.sh [--release] [--no-vm] [stage...]
 #
-# Stages (default: all): refuse jail daemonize pidns limits no-api boot netns memory cpu.
-# no-api, boot, netns, memory and cpu start a VM and need Hypervisor.framework; --no-vm skips them (GitHub's
+# Stages (default: all): refuse jail daemonize pidns limits no-api boot netns memory cpu
+# hugepages uffd vhost-user. no-api, boot, netns, memory, cpu, hugepages, uffd and
+# vhost-user start a VM and need Hypervisor.framework; --no-vm skips them (GitHub's
 # macOS runners have no Hypervisor.framework). Results and logs go to
 # build/jailer-test/<time>. Run tools/setup.sh first.
 set -euo pipefail
@@ -30,7 +31,12 @@ export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/lib/firecracker/build/cargo_target}"
 "$ROOT/tools/macos/run.sh" --build-only ${cargo_profile[@]+"${cargo_profile[@]}"}
 (cd "$ROOT/lib/firecracker" &&
-    CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked ${cargo_profile[@]+"${cargo_profile[@]}"} -p jailer)
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked ${cargo_profile[@]+"${cargo_profile[@]}"} -p jailer &&
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked ${cargo_profile[@]+"${cargo_profile[@]}"} -p firecracker \
+        --example uffd_on_demand_handler)
+# The operator's processes outside the jail: a uffd handler, a vhost-user backend.
+(cd "$ROOT/tools/vhost-user-blk" && CARGO_TARGET_DIR="$ROOT/lib/firecracker/build/vhost-user-blk" \
+    cargo build --release --locked)
 
 OUT="$ROOT/build/jailer-test/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
@@ -45,5 +51,7 @@ PY
 exec sudo python3 -I "$ROOT/tools/macos/jailer-test.py" \
     --jailer "$TARGET_DIR/$PROFILE/jailer" \
     --firecracker "$TARGET_DIR/$PROFILE/firecracker" \
+    --uffd-handler "$TARGET_DIR/$PROFILE/examples/uffd_on_demand_handler" \
+    --vhost-user-blk "$ROOT/lib/firecracker/build/vhost-user-blk/release/vhost-user-blk" \
     --cache "$CACHE" \
     --out "$OUT" "$@"

@@ -90,15 +90,50 @@ class JailedVm(bt.Vm):
                 time.sleep(0.02)
 
 
-def jail_config(vcpus=1, mem=256, **extra):
+def jail_config(vcpus=1, mem=256, machine=None, drives=(), **extra):
     cfg = {
         "boot-source": {"kernel_image_path": "/" + bt.KERNEL, "boot_args": bt.BOOT_ARGS},
         "drives": [{"drive_id": "rootfs", "path_on_host": "/" + bt.ROOTFS,
-                    "is_root_device": True, "is_read_only": True}],
-        "machine-config": {"vcpu_count": vcpus, "mem_size_mib": mem},
+                    "is_root_device": True, "is_read_only": True}] + list(drives),
+        "machine-config": {"vcpu_count": vcpus, "mem_size_mib": mem, **(machine or {})},
     }
     cfg.update({k.replace("_", "-"): v for k, v in extra.items()})
     return cfg
+
+
+class OperatorServer:
+    """A process of the operator outside the jail (a uffd handler, a vhost-user
+    backend) listening on a Unix socket placed in the jail, as on Linux, where
+    the jailed Firecracker reaches only sockets in its chroot. The socket is
+    made connectable by the jail's user (umask 0), as an operator does."""
+
+    def __init__(self, ctx, name, cmd, sock):
+        self.name = name
+        self.log_path = os.path.join(ctx.out, f"{name}.log")
+        self.log = open(self.log_path, "w")
+        old = os.umask(0)
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT)
+        finally:
+            os.umask(old)
+        deadline = time.time() + 10
+        while not os.path.exists(sock):
+            check(self.proc.poll() is None and time.time() < deadline,
+                  f"{name} did not listen ({self.proc.poll()}; log {self.log_path})")
+            time.sleep(0.05)
+
+    def alive(self):
+        check(self.proc.poll() is None, f"{self.name} exited {self.proc.poll()}; log {self.log_path}")
+
+    def stop(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+        try:
+            self.proc.wait(5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        self.log.close()
 
 
 def proc_ids(pid):
@@ -661,6 +696,137 @@ def stage_netns(ctx):
             "a third jail in a's directory reaches a's host; vmnet and a busy name refused; a file refused")
 
 
+ZEROS_64M_MD5 = "7f614da9329cd3aebf59b91aadc30bf0"
+
+
+def uffd_round(ctx, name, machine):
+    """A jailed guest (`machine` settings) snapshotted, then restored in another
+    jail with its memory served by upstream's uffd_on_demand_handler, a process
+    of the operator outside the jail: the jailed Firecracker hands it the
+    userfaultfd over the handler's socket in the jail (SCM_RIGHTS), and the
+    handler fills the guest's pages from the memory file."""
+    jail = Jail(ctx, f"{name}-snap", [ctx.kernel, ctx.rootfs])
+    vm = JailedVm(ctx, f"{name}-snap", jail, config=jail_config(vcpus=2, machine=machine))
+    vm.shell()
+    _, bash_md5 = vm.sh("md5sum /usr/bin/bash")
+    # 160 MiB in guest memory: what the handler must give back after restore.
+    vm.sh("mount -t tmpfs -o size=200m tmpfs /tmp && head -c 160m /dev/urandom > /tmp/f && md5sum /tmp/f > /tmp/a", 120)
+    vm.sh("A=before-$((6*7))")
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    vm.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": "/vm.state",
+                                       "mem_file_path": "/vm.mem"})
+    vm.kill()
+    check(os.path.getsize(jail.host("vm.mem")) == 256 << 20,
+          f"memory file is {os.path.getsize(jail.host('vm.mem'))} bytes")
+    jail2 = Jail(ctx, f"{name}-restore", [ctx.kernel, ctx.rootfs, jail.host("vm.state"), jail.host("vm.mem")])
+    sock = jail2.host("/uffd.sock")
+    handler = OperatorServer(ctx, f"{name}-handler", [ctx.uffd_handler, sock, jail2.host("vm.mem")], sock)
+    try:
+        vm = JailedVm(ctx, f"{name}-restore", jail2)
+        vm.api("PUT", "/snapshot/load", {"snapshot_path": "/vm.state",
+                                         "mem_backend": {"backend_type": "Uffd", "backend_path": "/uffd.sock"},
+                                         "resume_vm": True})
+        bt.restored_checks(vm, bash_md5, None)
+        _, out = vm.sh("md5sum /tmp/f | cmp - /tmp/a && echo same", 120)
+        check(out == "same", f"160 MiB after the uffd restore: {out!r}")
+        _, out = vm.sh("head -c 64m /dev/zero | md5sum", 120)  # fresh pages after restore
+        check(out.split()[0] == ZEROS_64M_MD5, f"64 MiB of zeros: {out!r}")
+        handler.alive()
+        vm.reboot()
+    finally:
+        handler.stop()
+
+
+def vhost_user_round(ctx, name, machine):
+    """A jailed guest (`machine` settings) with a vhost-user-blk drive served by
+    tools/vhost-user-blk, a process of the operator outside the jail: the jailed
+    Firecracker hands it guest memory (a memfd, a huge page one on huge pages)
+    and eventfds over the backend's socket in the jail. The guest reads the
+    image's md5 and its write reaches the image."""
+    img = os.path.join(ctx.out, f"{name}.img")
+    bt.random_file(img, 8 << 20)
+    want = bt.md5(img)
+    jail = Jail(ctx, name, [ctx.kernel, ctx.rootfs])
+    sock = jail.host("/vub.sock")
+    backend = OperatorServer(ctx, f"{name}-backend", [ctx.vub, sock, img], sock)
+    try:
+        drives = [{"drive_id": "vub", "socket": "/vub.sock", "is_root_device": False}]
+        vm = JailedVm(ctx, name, jail, config=jail_config(vcpus=2, machine=machine, drives=drives))
+        vm.shell()
+        _, out = vm.sh("md5sum /dev/vdb", 120)
+        check(out.split()[0] == want, f"guest md5 over vhost-user {out!r}, the image's {want}")
+        vm.sh("echo vhost-user-$((6*7)) | dd of=/dev/vdb bs=512 seek=8 conv=fsync,notrunc 2>/dev/null")
+        backend.alive()
+        vm.reboot()
+        with open(img, "rb") as f:
+            f.seek(4096)
+            check(f.read(14) == b"vhost-user-42\n", "guest write not in the backend's image")
+    finally:
+        backend.stop()
+
+
+def stage_uffd(ctx):
+    """VM: a jailed guest restored in another jail from a snapshot served by a uffd handler outside it."""
+    uffd_round(ctx, "uffd", {})
+    return ("a jailed guest snapshotted, restored in another jail through uffd_on_demand_handler outside it: "
+            "shell state, 160 MiB of memory, fresh pages")
+
+
+def stage_vhost_user(ctx):
+    """VM: a jailed guest on a vhost-user-blk drive whose backend runs outside the jail."""
+    vhost_user_round(ctx, "vhost-user", {})
+    return "a jailed guest reads and writes a vhost-user-blk drive served by a backend outside the jail"
+
+
+def stage_hugepages(ctx):
+    """VM: a jailed guest on 2 MiB pages: boots, limited by the memory cgroup, restores through uffd, vhost-user.
+
+    docs/PORTING.md row 10: macOS gives user space no superpage, so huge
+    pages are host pages in Linux's hugetlb layout. There is no hugetlb pool
+    either (`hugetlb.2MB.max` is refused: `refuse`), so the jail's memory
+    limit is what limits a guest on huge pages: checked here, since on Linux
+    the memory cgroup does not count hugetlb pages."""
+    huge = {"huge_pages": "2M"}
+    # A size that is not whole huge pages is refused, as on Linux.
+    jail = Jail(ctx, "huge-odd", [ctx.kernel, ctx.rootfs])
+    vm = JailedVm(ctx, "huge-odd", jail, config=jail_config(mem=255, machine=huge), wait_api=False)
+    code = vm.wait_exit(15)
+    vm.pump.join(5)
+    check(code not in (None, 0), f"255 MiB on 2 MiB pages accepted: exit {code}")
+    check("not a multiple of the configured page size" in vm.buf,
+          f"the refusal does not name the page size: {vm.exit_reason()}")
+    jail = Jail(ctx, "huge", [ctx.kernel, ctx.rootfs])
+    vm = JailedVm(ctx, "huge", jail, config=jail_config(vcpus=2, machine=huge))
+    vm.shell()
+    _, mem = vm.sh("awk '/MemTotal/ {print $2}' /proc/meminfo")
+    check(200_000 < int(mem) <= 262_144, f"MemTotal {mem} kB for 256 MiB")
+    _, out = vm.sh("mount -t tmpfs -o size=200m tmpfs /tmp && head -c 160m /dev/urandom > /tmp/f && "
+                   "md5sum /tmp/f > /tmp/a && md5sum /tmp/f | cmp - /tmp/a && echo same", 120)
+    check(out == "same", f"160 MiB in guest memory read back differently: {out!r}")
+    vm.reboot()
+    killed = {}
+    for limit_mib, expect_kill in ((300, True), (3000, False)):
+        name = f"huge-mem{limit_mib}"
+        jail = Jail(ctx, name, [ctx.kernel, ctx.rootfs])
+        vm = JailedVm(ctx, name, jail, ["--cgroup", f"memory.limit_in_bytes={limit_mib << 20}"],
+                      config=jail_config(mem=1024, machine=huge))
+        vm.shell()
+        vm.sh("mount -t tmpfs -o size=900m tmpfs /run")
+        try:
+            vm.sh("dd if=/dev/zero of=/run/x bs=1M count=700 2>/dev/null; echo done", timeout=120)
+            killed[limit_mib] = False
+        except Failure:
+            killed[limit_mib] = vm.proc.wait(10) == -signal.SIGKILL
+        check(killed[limit_mib] == expect_kill, f"limit {limit_mib} MiB, guest on 2 MiB pages wrote 700 MiB: "
+                                                f"killed={killed[limit_mib]} ({vm.exit_reason()})")
+        vm.kill()
+    uffd_round(ctx, "huge-uffd", huge)
+    vhost_user_round(ctx, "huge-vub", huge)
+    return ("a jailed 2 vCPU guest on 2 MiB pages boots and keeps 160 MiB written; an odd size is refused; "
+            "700 MiB written: killed at a 300 MiB memory limit, not at 3000; restored in another jail through "
+            "a uffd handler outside it; a vhost-user drive on a huge page memfd, its backend outside the jail")
+
+
 STAGES = {
     "refuse": stage_refuse,
     "jail": stage_jail,
@@ -672,14 +838,19 @@ STAGES = {
     "netns": stage_netns,
     "memory": stage_memory,
     "cpu": stage_cpu,
+    "hugepages": stage_hugepages,
+    "uffd": stage_uffd,
+    "vhost-user": stage_vhost_user,
 }
-VM_STAGES = ("no-api", "boot", "netns", "memory", "cpu")
+VM_STAGES = ("no-api", "boot", "netns", "memory", "cpu", "hugepages", "uffd", "vhost-user")
 
 
 class Context:
     def __init__(self, args):
         self.jailer = args.jailer
         self.firecracker = args.firecracker
+        self.uffd_handler = args.uffd_handler
+        self.vub = args.vhost_user_blk
         self.out = args.out
         # Unix socket paths must be shorter than 104 bytes: a short base.
         self.base = tempfile.mkdtemp(prefix="wick-jt-", dir="/private/tmp")
@@ -699,6 +870,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--jailer", required=True)
     p.add_argument("--firecracker", required=True)
+    p.add_argument("--uffd-handler", required=True)
+    p.add_argument("--vhost-user-blk", required=True)
     p.add_argument("--cache", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--no-vm", action="store_true", help="skip the stages that boot a VM")
