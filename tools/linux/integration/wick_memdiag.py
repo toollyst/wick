@@ -14,8 +14,9 @@ sample over the threshold is kept, the same figure reported); it goes on
 sampling after that, and keeps, for each microVM, the highest sum and what
 it was made of:
 
-- binary text / binary data: the Firecracker executable's mappings, by
-  permission (the release build is static, so there are no shared libraries)
+- binary text / binary data: the Firecracker executable's mappings, read-only
+  (its code and constants) or writable (the release build is static, so
+  there are no shared libraries); macOS splits its __TEXT and __DATA alike
 - heap: [heap] (musl's brk)
 - main stack: [stack]
 - thread stacks: an anonymous mapping right above a no-access guard mapping
@@ -75,7 +76,7 @@ def classify(maps, exe):
         kib = m.rss // 1024
         path = m.path
         if exe and path == exe:
-            kind = "binary text" if "x" in m.perms else "binary data"
+            kind = "binary data" if "w" in m.perms else "binary text"
         elif path == "[heap]":
             kind = "heap"
         elif path == "[stack]":

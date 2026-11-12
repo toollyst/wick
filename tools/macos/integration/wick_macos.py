@@ -642,7 +642,13 @@ _MEMORY_PARTS = pathlib.Path(os.environ.get("WICK_IT_BINARY_DIR", SESSION_ROOT))
 #   test's later steps do not run) is held to the test's end and raised
 #   then, the same error, so the test still fails; the steps after the kill
 #   run, and memory-diag.jsonl records how they ended.
-DIAGNOSTIC_SWITCHES = ("WICK_IT_DIAG_MEMORY", "WICK_IT_DIAG_RSS_LESS", "WICK_IT_DEFER_MEMORY_ERROR")
+# - WICK_IT_DIAG_MEMORY_KINDS: the memory monitor samples on past its first
+#   sample over the budget (which it keeps, and reports, as without it) to
+#   each microVM's peak of the VMM's own part, and memory-peaks.jsonl gets
+#   the peak by kind of mapping (memory_kinds), the kinds
+#   tools/linux/integration/wick_memdiag.py reports on Linux's CI.
+DIAGNOSTIC_SWITCHES = ("WICK_IT_DIAG_MEMORY", "WICK_IT_DIAG_RSS_LESS", "WICK_IT_DEFER_MEMORY_ERROR",
+                       "WICK_IT_DIAG_MEMORY_KINDS")
 DIAGNOSTIC = [s for s in DIAGNOSTIC_SWITCHES if os.environ.get(s, "") not in ("", "0")]
 RSS_LESS = os.environ.get("WICK_IT_DIAG_RSS_LESS", "") if "WICK_IT_DIAG_RSS_LESS" in DIAGNOSTIC else ""
 if RSS_LESS not in ("", "vmm"):
@@ -671,6 +677,43 @@ def vmm_parts(maps, guest_bytes):
     return own, shared_cache_part(maps)
 
 
+# The kinds of mapping tools/linux/integration/wick_memdiag.py reports on
+# Linux, in its order, so that the two tables line up
+# (WICK_IT_DIAG_MEMORY_KINDS). macOS has no [heap] or [stack]: malloc's
+# zones are the heap, by their VM tags (<mach/vm_statistics.h>
+# VM_MEMORY_MALLOC*), and every thread's stack, the main thread's too, is
+# tag 30 (VM_MEMORY_STACK), under "thread stacks". The binary's mappings are
+# split by write permission (__TEXT, its constants among them, and __DATA);
+# Linux's step splits them the same way. Hypervisor.framework's vCPU state
+# and the commpage have no kind of their own here: "anon other" and the
+# shared cache. The shared cache's part is apart, as the monitor counts it.
+MEMORY_KINDS = ("binary text", "binary data", "heap", "main stack", "thread stacks", "kvm vcpu",
+                "anon other", "file other", "vdso")
+_MALLOC_TAGS = {1, 2, 3, 4, 6, 7, 8, 9, 11, 12}
+_STACK_TAG = 30
+_MEMORY_PEAKS = _MEMORY_PARTS.with_name("memory-peaks.jsonl")
+
+
+def memory_kinds(maps, exe):
+    """KiB per kind (MEMORY_KINDS) of the VMM's own mappings `maps` (the
+    shared cache's and guest memory already left out); `exe` is the
+    binary's real path."""
+    kinds = dict.fromkeys(MEMORY_KINDS, 0)
+    for m in maps:
+        if m.path and exe and os.path.realpath(m.path) == exe:
+            kind = "binary data" if m.writable else "binary text"
+        elif m.path:
+            kind = "file other"
+        elif m.tag in _MALLOC_TAGS:
+            kind = "heap"
+        elif m.tag == _STACK_TAG:
+            kind = "thread stacks"
+        else:
+            kind = "anon other"
+        kinds[kind] += m.rss >> 10
+    return kinds
+
+
 def monitor_run(self):
     """MemoryMonitor.run (host_tools/memory.py) with the VMM's memory in its
     two parts: upstream's loop, whose sum is the part outside the shared
@@ -684,6 +727,9 @@ def monitor_run(self):
     try:
         ps = psutil.Process(self._vm.firecracker_pid)
     except (psutil.NoSuchProcess, FileNotFoundError):
+        return
+    if "WICK_IT_DIAG_MEMORY_KINDS" in DIAGNOSTIC:
+        _monitor_run_to_peak(self, ps, guest)
         return
     while not self._should_stop:
         try:
@@ -702,6 +748,53 @@ def monitor_run(self):
                     ps.pid, skip=lambda m: not m.shared_cache and self.is_guest_mem(m.size, guest))
             return
         time.sleep(self._period_s)
+
+
+def _monitor_run_to_peak(self, ps, guest):
+    """monitor_run's loop in a WICK_IT_DIAG_MEMORY_KINDS run: the same
+    figures until the first sample over a limit, which is kept and reported
+    as monitor_run keeps it; then on to the end of the microVM, the peak of
+    the VMM's own part by kind appended to memory-peaks.jsonl."""
+    # pylint: disable=protected-access
+    try:
+        exe = os.path.realpath(ps.exe())
+    except (psutil.Error, OSError):
+        exe = None
+    test = os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0]
+    peak, peak_kinds, peak_cache, first_over, samples = 0, None, 0, None, 0
+    try:
+        while not self._should_stop:
+            try:
+                mmaps = ps.memory_maps(grouped=False)
+            except psutil.NoSuchProcess:
+                return
+            own, cache = vmm_parts(mmaps, guest)
+            samples += 1
+            self.wick_peak = {"own": max(own, self.wick_peak["own"]),
+                              "shared_cache": max(cache, self.wick_peak["shared_cache"])}
+            if self._exceeded is None:
+                self._current_rss = own
+                self.wick_shared_cache_rss = cache
+                if own > self.threshold or (SHARED_CACHE_CEILING is not None and cache > SHARED_CACHE_CEILING):
+                    self._exceeded = ps
+                    first_over = own
+                    with contextlib.suppress(psutil.NoSuchProcess, ProcessLookupError):
+                        self.wick_breakdown = region_breakdown(
+                            ps.pid, skip=lambda m: not m.shared_cache and self.is_guest_mem(m.size, guest))
+            if own > peak:
+                peak, peak_cache = own, cache
+                peak_kinds = memory_kinds(
+                    [m for m in mmaps if not m.shared_cache and "nitro_enclaves" not in m.path
+                     and not _GUEST_RULE.is_guest_mem(m.size, guest)], exe)
+            time.sleep(self._period_s)
+    finally:
+        with contextlib.suppress(OSError), open(_MEMORY_PEAKS, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"test": test, "pid": ps.pid, "peak_kib": peak >> 10, "kinds_kib": peak_kinds,
+                                "first_over_kib": None if first_over is None else first_over >> 10,
+                                "threshold_mib": self.threshold / (1 << 20),
+                                "shared_cache_kib": peak_cache >> 10, "samples": samples,
+                                "arch": platform.machine(), "page_size": os.sysconf("SC_PAGE_SIZE"),
+                                "diagnostic": DIAGNOSTIC}) + "\n")
 
 
 def check_samples(self):
