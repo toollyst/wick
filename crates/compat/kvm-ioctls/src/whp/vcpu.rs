@@ -120,6 +120,11 @@ pub(crate) struct VcpuShared {
     /// Guest debugging for the gdb stub ([`super::debug`]); untouched
     /// without the `gdb` feature.
     debug: Mutex<super::debug::State>,
+    /// Bumped when a #BP window of this vCPU opens and when it closes: a
+    /// window's generation is odd while it is open.
+    window_gen: AtomicU64,
+    /// The generation of a window that outlived [`super::debug::WINDOW_BOUND`].
+    window_expired: AtomicU64,
 }
 
 impl VcpuShared {
@@ -158,6 +163,32 @@ impl VcpuShared {
             }
         }
         self.inner.wake_halted();
+        // A vCPU held out of the guest by another's #BP window sees the kick.
+        self.inner.notify_bp_window();
+    }
+
+    /// Whether this vCPU has a #BP window open.
+    fn in_bp_window(&self) -> bool {
+        self.inner.bp_owner.load(Ordering::SeqCst) == i64::from(self.index)
+    }
+
+    /// Closes this vCPU's #BP window `w`: its DR0-DR3, DR6, DR7 and NMI mask
+    /// as before it, gdb's exception exits back, the held vCPUs let go. The
+    /// window is closed even if a register cannot be written, whose error is
+    /// returned.
+    #[cfg_attr(not(feature = "gdb"), allow(dead_code))]
+    fn close_window(&self, w: &super::debug::Window) -> Result<()> {
+        let s = w.saved;
+        let d = kvm_debugregs { db: [s[0], s[1], s[2], s[3]], dr6: s[4], dr7: s[5], ..Default::default() };
+        let dregs = regs::set_debugregs(self.part, self.index, &d);
+        let nmi = super::ffi::get_register(self.part, self.index, whv::WHvRegisterInterruptState).and_then(|v| {
+            let state = super::ffi::as_u64(&v);
+            let state = if w.nmi_masked { state | INTERRUPT_STATE_NMI_MASKED } else { state & !INTERRUPT_STATE_NMI_MASKED };
+            super::ffi::set_register(self.part, self.index, whv::WHvRegisterInterruptState, super::ffi::reg64(state))
+        });
+        self.window_gen.fetch_add(1, Ordering::SeqCst);
+        let bitmap = self.inner.close_bp_window();
+        dregs.and(nmi).and(bitmap)
     }
 
     /// The TSC-deadline timer of generation `generation` fired (on the
@@ -225,6 +256,8 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         deadline_gen: AtomicU64::new(0),
         deadline_fired: AtomicU64::new(0),
         debug: Mutex::new(super::debug::State::default()),
+        window_gen: AtomicU64::new(0),
+        window_expired: AtomicU64::new(0),
     });
     {
         let mut vcpus = ALL_VCPUS.lock().unwrap();
@@ -335,23 +368,36 @@ impl VcpuFd {
         let vp = self.vp();
         let mut state = self.shared.debug.lock().unwrap();
         if dbg.control & kvm_bindings::KVM_GUESTDBG_ENABLE != 0 || state.saved.is_some() || state.tf_owned {
-            // SAFETY: a u64 value for ExceptionExitBitmap.
-            unsafe {
-                super::ffi::set_partition_property(part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &plan.bitmap)?;
-            }
+            // Written at once, or when an open #BP window closes.
+            self.shared.inner.set_debug_bitmap(plan.bitmap)?;
         }
+        // While this vCPU's #BP window is open its DRs are the window's, and
+        // what it found there (`saved`) is what comes back at its end: gdb's
+        // and the guest's values go there, and the next entry writes gdb's.
         if plan.hw {
             if state.saved.is_none() {
-                let d = regs::get_debugregs(part, vp)?;
-                state.saved = Some([d.db[0], d.db[1], d.db[2], d.db[3], d.dr6, d.dr7]);
+                let saved = match &state.window {
+                    Some(w) => w.saved,
+                    None => {
+                        let d = regs::get_debugregs(part, vp)?;
+                        [d.db[0], d.db[1], d.db[2], d.db[3], d.dr6, d.dr7]
+                    }
+                };
+                state.saved = Some(saved);
             }
             let r = &dbg.arch.debugreg;
             let hw = ([r[0], r[1], r[2], r[3]], r[7]);
-            write_hw_breakpoints(part, vp, hw)?;
+            if state.window.is_none() {
+                write_hw_breakpoints(part, vp, hw)?;
+            }
             state.hw = Some(hw);
         } else if let Some(s) = state.saved.take() {
-            let d = kvm_debugregs { db: [s[0], s[1], s[2], s[3]], dr6: s[4], dr7: s[5], ..Default::default() };
-            regs::set_debugregs(part, vp, &d)?;
+            if let Some(w) = state.window.as_mut() {
+                w.saved = s;
+            } else {
+                let d = kvm_debugregs { db: [s[0], s[1], s[2], s[3]], dr6: s[4], dr7: s[5], ..Default::default() };
+                regs::set_debugregs(part, vp, &d)?;
+            }
             state.hw = None;
         }
         if plan.step || state.tf_owned {
@@ -367,32 +413,227 @@ impl VcpuFd {
 
     /// What gdb's debugging needs before an entry into the guest: its
     /// hardware breakpoints again (the guest may have written DR7), `RF` to
-    /// leave the instruction breakpoint the vCPU stopped on, a #BP for the
-    /// guest's own `INT3`.
+    /// leave the instruction breakpoint the vCPU stopped on, and for the
+    /// guest's own `INT3` a #BP window ([`super::debug`]). While a window is
+    /// open, its DRs stay.
     #[cfg(feature = "gdb")]
     fn prepare_debug_entry(&self) -> Result<()> {
         let part = self.part();
         let vp = self.vp();
         let mut state = self.shared.debug.lock().unwrap();
-        if let Some(hw) = state.hw {
+        if let (Some(hw), None) = (state.hw, &state.window) {
             write_hw_breakpoints(part, vp, hw)?;
         }
         if std::mem::take(&mut state.resume_rf) {
             let rflags = super::ffi::as_u64(&super::ffi::get_register(part, vp, whv::WHvX64RegisterRflags)?);
             super::ffi::set_register(part, vp, whv::WHvX64RegisterRflags, super::ffi::reg64(rflags | super::debug::RFLAGS_RF))?;
         }
-        if std::mem::take(&mut state.inject_bp) {
-            // The exit left RIP at the INT3: the guest's #BP returns past it.
-            let rip = super::ffi::as_u64(&super::ffi::get_register(part, vp, whv::WHvX64RegisterRip)?);
-            super::ffi::set_register(part, vp, whv::WHvX64RegisterRip, super::ffi::reg64(rip + state.last_len))?;
-            super::ffi::set_register(
-                part,
-                vp,
-                whv::WHvRegisterPendingInterruption,
-                super::ffi::reg64(super::debug::pending_bp()),
-            )?;
+        if state.inject_bp && state.window.is_none() {
+            if let Some(w) = self.open_window()? {
+                state.window = Some(w);
+                state.inject_bp = false;
+            }
         }
         Ok(())
+    }
+
+    /// Opens a #BP window for the guest's INT3 at RIP: the other vCPUs held
+    /// out of the guest, DR0 on the #BP handler, NMIs masked, and the
+    /// partition's exception exits without #BP. `None` if a kick came
+    /// first: nothing opened, the #BP still to come, and the entry returns
+    /// `EINTR`.
+    #[cfg(feature = "gdb")]
+    fn open_window(&self) -> Result<Option<super::debug::Window>> {
+        use super::debug::{self, Window};
+        let inner = &self.shared.inner;
+        let (part, vp) = (self.part(), self.vp());
+        if !inner.open_bp_window(vp, &self.shared.immediate_exit) {
+            return Ok(None);
+        }
+        // First the others out of the guest, then the exits changed: never
+        // a moment where another vCPU runs without #BP exits.
+        self.hold_others();
+        let found = (|| {
+            let d = regs::get_debugregs(part, vp)?;
+            let nmi = super::ffi::as_u64(&super::ffi::get_register(part, vp, whv::WHvRegisterInterruptState)?);
+            Ok((d, nmi))
+        })();
+        let (d, nmi) = match found {
+            Ok(found) => found,
+            Err(e) => {
+                let _ = inner.close_bp_window();
+                return Err(e);
+            }
+        };
+        let w = Window {
+            saved: [d.db[0], d.db[1], d.db[2], d.db[3], d.dr6, d.dr7],
+            nmi_masked: nmi & INTERRUPT_STATE_NMI_MASKED != 0,
+            vector: debug::BP_VECTOR,
+            handler: self.handler_of(debug::BP_VECTOR),
+            faults: debug::DELIVERY_FAULTS,
+            opened: std::time::Instant::now(),
+        };
+        self.shared.window_gen.fetch_add(1, Ordering::SeqCst);
+        let armed = (|| {
+            arm_window(part, vp, w.handler)?;
+            super::ffi::set_register(part, vp, whv::WHvRegisterInterruptState, super::ffi::reg64(nmi | INTERRUPT_STATE_NMI_MASKED))?;
+            inner.set_window_bitmap(debug::window_bitmap(w.faults))
+        })();
+        if let Err(e) = armed {
+            let _ = self.shared.close_window(&w);
+            return Err(e);
+        }
+        self.watch_window();
+        Ok(Some(w))
+    }
+
+    /// Makes every other vCPU of the partition leave the guest: its run is
+    /// cancelled until its run sequence is even. It cannot enter again
+    /// while the window is open: `enter` makes the sequence odd before it
+    /// reads the window's owner, which was stored before this reads the
+    /// sequence (both sequentially consistent), as the kick does.
+    #[cfg(feature = "gdb")]
+    fn hold_others(&self) {
+        let others: Vec<Arc<VcpuShared>> = self
+            .shared
+            .inner
+            .vcpus
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|s| s.index != self.shared.index)
+            .collect();
+        for other in &others {
+            let mut spins = 0u32;
+            while other.run_seq.load(Ordering::SeqCst) % 2 == 1 {
+                let _ = super::ffi::cancel_run(other.part, other.index);
+                spins += 1;
+                if spins < 64 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            }
+        }
+    }
+
+    /// The last resort for a window whose end never comes (see
+    /// [`super::debug::WINDOW_BOUND`]): after the bound, if the same window
+    /// is still open, it is marked expired and the vCPU's run cancelled;
+    /// the run loop then closes it and says so.
+    #[cfg(feature = "gdb")]
+    fn watch_window(&self) {
+        // Weak: a vCPU (and its partition) dropped meanwhile is not kept.
+        let shared = Arc::downgrade(&self.shared);
+        let generation = self.shared.window_gen.load(Ordering::SeqCst);
+        std::thread::spawn(move || {
+            std::thread::sleep(super::debug::WINDOW_BOUND);
+            let Some(shared) = shared.upgrade() else { return };
+            if shared.window_gen.load(Ordering::SeqCst) == generation {
+                shared.window_expired.store(generation, Ordering::SeqCst);
+                shared.leave_guest();
+            }
+        });
+    }
+
+    /// Whether this vCPU's open window outlived its bound.
+    fn window_expired(&self) -> bool {
+        let generation = self.shared.window_gen.load(Ordering::SeqCst);
+        generation % 2 == 1 && self.shared.window_expired.load(Ordering::SeqCst) == generation
+    }
+
+    /// Closes the window if it outlived its bound, with a warning.
+    #[cfg(feature = "gdb")]
+    fn end_expired_window(&self) -> Result<()> {
+        if !self.window_expired() {
+            return Ok(());
+        }
+        let mut state = self.shared.debug.lock().unwrap();
+        let Some(w) = state.window.take() else { return Ok(()) };
+        let reason = match w.handler {
+            None => "no handler could be read from its gate, and no fault came",
+            Some(_) => "the delivery did not reach the handler",
+        };
+        eprintln!(
+            "whp: warning: vCPU {}'s #BP window (vector {}, handler {:?}) closed after {:?}, its bound: {reason}; \
+             the other vCPUs were held until then",
+            self.vp(),
+            w.vector,
+            w.handler.map(|h| format!("{h:#x}")),
+            w.opened.elapsed()
+        );
+        super::debug::WINDOWS_EXPIRED.fetch_add(1, Ordering::SeqCst);
+        self.shared.close_window(&w)
+    }
+
+    /// A round of the window for the fault `vector` its delivery raised:
+    /// out of the intercepted faults, DR0 on its handler. The INT3 runs
+    /// again and faults natively.
+    #[cfg(feature = "gdb")]
+    fn window_round(&self, w: &mut super::debug::Window, vector: u8) -> Result<()> {
+        w.faults &= !(1u64 << vector);
+        w.vector = vector;
+        w.handler = self.handler_of(vector);
+        arm_window(self.part(), self.vp(), w.handler)?;
+        self.shared.inner.set_window_bitmap(super::debug::window_bitmap(w.faults))
+    }
+
+    /// The handler `vector`'s gate sends the CPU to, from the guest's IDT
+    /// as the vCPU's registers name it; `None` if the gate sends nowhere or
+    /// cannot be read (delivery through it faults).
+    #[cfg(feature = "gdb")]
+    fn handler_of(&self, vector: u8) -> Option<u64> {
+        use super::debug::{self, Target};
+        let s = self.get_sregs().ok()?;
+        let mode = debug::table_mode(s.cr0, s.efer);
+        let (at, size) = debug::gate_at(mode, s.idt.base, s.idt.limit, vector)?;
+        let mut gate = [0u8; 16];
+        self.read_linear(s.cr0, at, &mut gate[..size])?;
+        match debug::gate_target(mode, &gate[..size])? {
+            Target::Linear(handler) => Some(handler),
+            Target::Segment { selector, offset } => {
+                let (base, limit) = if selector & 4 != 0 {
+                    (s.ldt.base, u64::from(s.ldt.limit))
+                } else {
+                    (s.gdt.base, u64::from(s.gdt.limit))
+                };
+                let at = u64::from(selector & !7);
+                if at + 7 > limit {
+                    return None;
+                }
+                let mut d = [0u8; 8];
+                self.read_linear(s.cr0, base.wrapping_add(at), &mut d)?;
+                Some(debug::descriptor_base(&d).wrapping_add(offset) & 0xFFFF_FFFF)
+            }
+        }
+    }
+
+    /// Reads guest memory at linear address `at` as the vCPU sees it (its
+    /// page tables when paging is on, walked as `KVM_TRANSLATE` walks them),
+    /// from guest RAM only.
+    #[cfg(feature = "gdb")]
+    fn read_linear(&self, cr0: u64, at: u64, buf: &mut [u8]) -> Option<()> {
+        let mut done = 0;
+        while done < buf.len() {
+            let addr = at.wrapping_add(done as u64);
+            let n = usize::try_from(0x1000 - (addr & 0xFFF)).unwrap().min(buf.len() - done);
+            let gpa = if cr0 & super::debug::CR0_PG != 0 {
+                match self.translate_walk(addr, super::debug::TRANSLATE_FLAGS) {
+                    Ok((0, gpa)) => gpa,
+                    _ => return None,
+                }
+            } else {
+                addr
+            };
+            let host = self.shared.inner.host_addr(gpa)?;
+            // The rest of the page is in the same slot: slots are whole
+            // pages. SAFETY: guest RAM, mapped in this process while its
+            // slot is.
+            unsafe { std::ptr::copy_nonoverlapping(host as *const u8, buf[done..].as_mut_ptr(), n) };
+            done += n;
+        }
+        Some(())
     }
     pub fn get_sregs(&self) -> Result<kvm_sregs> {
         regs::get_sregs(self.part(), self.vp())
@@ -749,16 +990,33 @@ impl VcpuFd {
         }
     }
 
-    /// One `WHvRunVirtualProcessor`, unless a kick came first (`None`).
-    fn enter(&self) -> Result<Option<whv::WHV_RUN_VP_EXIT_CONTEXT>> {
+    /// One `WHvRunVirtualProcessor`, unless a kick came first. While
+    /// another vCPU's #BP window is open this one waits out of the guest
+    /// (and a kick still returns); while its own is, a kick waits for the
+    /// window's end (one delivery), and a window that outlived its bound
+    /// comes back for the run loop to close.
+    fn enter(&self) -> Result<Entry> {
         let shared = &self.shared;
-        shared.run_seq.fetch_add(1, Ordering::SeqCst);
+        let vp = self.vp();
+        let own_window = loop {
+            shared.run_seq.fetch_add(1, Ordering::SeqCst);
+            let owner = shared.inner.bp_owner.load(Ordering::SeqCst);
+            if owner < 0 || owner == i64::from(vp) {
+                break owner >= 0;
+            }
+            shared.run_seq.fetch_add(1, Ordering::SeqCst);
+            if !shared.inner.wait_bp_window(vp, &shared.immediate_exit) {
+                return Ok(Entry::Kicked);
+            }
+        };
         self.update_clock();
         let result = self.raise_fired_deadline().and_then(|()| {
-            if shared.immediate_exit.load(Ordering::SeqCst) != 0 {
-                Ok(None)
+            if own_window && self.window_expired() {
+                Ok(Entry::WindowExpired)
+            } else if !own_window && shared.immediate_exit.load(Ordering::SeqCst) != 0 {
+                Ok(Entry::Kicked)
             } else {
-                super::ffi::run_vp(self.part(), self.vp()).map(Some)
+                super::ffi::run_vp(self.part(), vp).map(Entry::Ran)
             }
         });
         shared.run_seq.fetch_add(1, Ordering::SeqCst);
@@ -793,6 +1051,26 @@ impl VcpuFd {
 
     /// Runs the vCPU until the next exit.
     pub fn run(&mut self) -> Result<VcpuExit<'_>> {
+        #[cfg(feature = "gdb")]
+        let shared = Arc::clone(&self.shared);
+        let exit = self.run_loop();
+        // A return with a #BP window open, at none of its ends: it closes
+        // first, so that no other vCPU stays held.
+        #[cfg(feature = "gdb")]
+        {
+            let open = shared.debug.lock().unwrap().window.take();
+            if let Some(w) = open {
+                if let Err(e) = shared.close_window(&w) {
+                    if exit.is_ok() {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        exit
+    }
+
+    fn run_loop(&mut self) -> Result<VcpuExit<'_>> {
         let part = self.part();
         let vp = self.vp();
         let run_ptr = self.shared.run.ptr();
@@ -822,8 +1100,14 @@ impl VcpuFd {
         loop {
             #[cfg(feature = "gdb")]
             self.prepare_debug_entry()?;
-            let Some(ctx) = self.enter()? else {
-                return err(libc::EINTR);
+            let ctx = match self.enter()? {
+                Entry::Ran(ctx) => ctx,
+                Entry::Kicked => return err(libc::EINTR),
+                Entry::WindowExpired => {
+                    #[cfg(feature = "gdb")]
+                    self.end_expired_window()?;
+                    continue;
+                }
             };
             let instr_len = super::exit::instruction_length(ctx.VpContext._bitfield);
             let rip = ctx.VpContext.Rip;
@@ -834,7 +1118,9 @@ impl VcpuFd {
                 // a TSC-deadline timer only made the vCPU leave the guest to
                 // take its interrupt (`enter`).
                 whv::WHvRunVpExitReasonCanceled => {
-                    if self.shared.immediate_exit.load(Ordering::SeqCst) != 0 {
+                    // In this vCPU's own #BP window a kick waits for the
+                    // window's end (`enter`).
+                    if self.shared.immediate_exit.load(Ordering::SeqCst) != 0 && !self.shared.in_bp_window() {
                         return err(libc::EINTR);
                     }
                     continue;
@@ -1007,12 +1293,41 @@ impl VcpuFd {
                     // SAFETY: the union arm matches the exit reason.
                     let ex = unsafe { ctx.Anonymous.VpException };
                     let mut state = self.shared.debug.lock().unwrap();
+                    if let Some(mut w) = state.window.take() {
+                        let vector = ex.ExceptionType;
+                        // The linear address DR0 compares: RIP in 64-bit
+                        // code (every IA-32e handler), CS's base plus RIP
+                        // otherwise.
+                        // SAFETY: plain 16-bit views of the exit context's bit fields.
+                        let (mode, cs) = unsafe { (ctx.VpContext.ExecutionState.AsUINT16, ctx.VpContext.Cs.Anonymous.Attributes) };
+                        let at = if super::exit::long_mode_code(mode, cs) {
+                            rip
+                        } else {
+                            ctx.VpContext.Cs.Base.wrapping_add(rip) & 0xFFFF_FFFF
+                        };
+                        if vector == super::debug::DB_VECTOR && w.handler == Some(at) {
+                            // The delivery reached its handler: the window's
+                            // end. The guest goes on into the handler.
+                            self.shared.close_window(&w)?;
+                            continue;
+                        }
+                        if vector < 64 && w.faults & (1u64 << vector) != 0 {
+                            // The delivery faulted: a round for that fault.
+                            let round = self.window_round(&mut w, vector);
+                            state.window = Some(w);
+                            round?;
+                            continue;
+                        }
+                        // Anything else (a #DB elsewhere: the guest's own
+                        // TF or breakpoint): the window ends, and the exit
+                        // is gdb's as any other.
+                        self.shared.close_window(&w)?;
+                    }
                     let dr7 = state.hw.map_or(0, |(_, dr7)| dr7);
                     let Some(arch) = super::debug::debug_exit(ex.ExceptionType, rip, ex.ExceptionParameter, dr7)
                     else {
                         return Ok(VcpuExit::InternalError);
                     };
-                    state.last_len = instr_len.max(1);
                     if ex.ExceptionType == super::debug::DB_VECTOR && super::debug::at_hw_breakpoint(rip, &state) {
                         state.resume_rf = true;
                     }
@@ -1243,6 +1558,29 @@ impl VcpuFd {
     }
 }
 
+/// What an entry into the guest came to ([`VcpuFd::enter`]).
+enum Entry {
+    Ran(whv::WHV_RUN_VP_EXIT_CONTEXT),
+    /// `immediate_exit`: the run returns `EINTR`.
+    Kicked,
+    /// This vCPU's #BP window outlived its bound.
+    WindowExpired,
+}
+
+/// `WHV_X64_INTERRUPT_STATE_REGISTER`'s NMI mask (bit 1).
+const INTERRUPT_STATE_NMI_MASKED: u64 = 1 << 1;
+
+/// A #BP window's DR0 and DR7: an instruction breakpoint on `handler`, or
+/// none.
+#[cfg(feature = "gdb")]
+fn arm_window(part: WHV_PARTITION_HANDLE, vp: u32, handler: Option<u64>) -> Result<()> {
+    let hw = match handler {
+        Some(h) => ([h, 0, 0, 0], super::debug::WINDOW_DR7),
+        None => ([0; 4], super::debug::DR7_NONE),
+    };
+    write_hw_breakpoints(part, vp, hw)
+}
+
 /// gdb's hardware breakpoints into the vCPU's DR0-DR3 and DR7.
 fn write_hw_breakpoints(part: WHV_PARTITION_HANDLE, vp: u32, (addrs, dr7): ([u64; 4], u64)) -> Result<()> {
     const NAMES: [whv::WHV_REGISTER_NAME; 5] = [
@@ -1293,58 +1631,82 @@ fn write_scratch(scratch: *mut u8, value: u64, len: usize) {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch, n) };
 }
 
-// How WHP hands a #BP the partition exited on back to the guest, which
-// upstream's gdb stub asks for (`KVM_GUESTDBG_INJECT_BP`) when the INT3 is
-// the guest's own: the kernel's `int3_selftest` (Linux v6.12,
-// arch/x86/kernel/alternative.c:1608-1668, from arch_cpu_finalize_init)
-// executes one during boot, and the gdb stage's vCPU run failed with
-// `os error 87` there (kit fb9d77b). KVM queues the #BP (x86.c,
-// kvm_arch_vcpu_ioctl_set_guest_debug) and delivers it as a software
-// exception from RIP at the INT3 (SVM: RIP put back and NextRIP past it,
-// svm.c svm_update_soft_interrupt_rip; VMX: the exit's instruction
-// length). QEMU's WHPX never intercepts INT3 (whpx-all.c: "the WHPX API
-// does not offer an easy way to pass the intercepted exception back to the
-// guest"; WHvRegisterPendingEvent "seems to only work for interrupts and
-// not software exceptions"); its own breakpoints are INT1. Not tried here,
-// as a fifth way: no #BP intercept at all, the guest handling every INT3,
-// and gdb's breakpoints then needing another mechanism than INT3.
+// The #BP window ([`super::debug`]) on a WHP machine, with small long-mode
+// guests: the guest's own INT3 handed back as upstream's gdb stub asks
+// (`KVM_GUESTDBG_INJECT_BP`, as for the kernel's `int3_selftest`, Linux
+// v6.12 arch/x86/kernel/alternative.c, which the gdb stage's boot runs into).
+// What led here, measured on an AMD host (bf52d6f): a pending #BP through
+// `WHvRegisterPendingInterruption` (hardware exception or software
+// exception, length 0 or 1) is refused with STATUS_HV_INVALID_PARAMETER,
+// through `WHvRegisterPendingEvent` it gives an InternalError exit, and only
+// the guest's INT3 run again with #BP out of the exception exits delivers it
+// (the guest's handler ran, pushed RIP past the INT3). QEMU's WHPX never
+// intercepts INT3 (whpx-all.c: "the WHPX API does not offer an easy way to
+// pass the intercepted exception back to the guest").
 #[cfg(all(test, feature = "gdb"))]
 mod bp_tests {
     use super::*;
     use kvm_bindings::{
-        kvm_guest_debug, kvm_segment, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_INJECT_BP,
-        KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP,
+        kvm_guest_debug, kvm_mp_state, kvm_segment, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_INJECT_BP,
+        KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP, KVM_MP_STATE_RUNNABLE,
     };
     use std::sync::atomic::AtomicBool;
 
     const MEM: usize = 4 << 20;
-    /// The INT3, followed by `out 0x80, al` and `jmp $`.
+    /// vCPU 0: the guest's own INT3, `out 0x80, al`, a `nop` (where gdb
+    /// puts a hardware breakpoint), gdb's INT3, `jmp $`.
     const CODE: u64 = 0x6000;
-    /// The #BP handler: records the RIP the CPU pushed and a mark, `iretq`.
+    /// vCPU 1: gdb's INT3, `jmp` back to it.
+    const CODE1: u64 = 0x6100;
+    /// vCPU 0 in the two-vCPU test: the guest's INT3, `out 0x80, al`, `jmp`
+    /// back to the INT3.
+    const LOOP0: u64 = 0x6200;
+    /// The #BP handler: stores the RIP pushed, DR7 and DR0 as it reads them,
+    /// counts itself, `iretq`.
     const HANDLER: u64 = 0x7000;
+    /// The #NP handler: stores its error code and the RIP pushed, then
+    /// `out 0x82, al` and `jmp $`.
+    const NP_HANDLER: u64 = 0x7100;
     const PUSHED: u64 = 0x8000;
-    const MARK: u64 = 0x8008;
+    const COUNT: u64 = 0x8008;
+    const DR7_SEEN: u64 = 0x8010;
+    const DR0_SEEN: u64 = 0x8018;
+    const NP_ERR: u64 = 0x8020;
+    const NP_RIP: u64 = 0x8028;
     const STACK: u64 = 0x9000;
+    const STACK1: u64 = 0xA000;
     const GDT: u64 = 0x4000;
     const IDT: u64 = 0x5000;
     const PORT: u16 = 0x80;
-    /// `WHvRegisterPendingEvent` (WinHvPlatformDefs.h).
-    const PENDING_EVENT: whv::WHV_REGISTER_NAME = 0x8000_0002u32 as i32;
+    const NP_PORT: u16 = 0x82;
+    /// The guest's own DR0 and DR7 (no breakpoint enabled: LE, GE, bit 10).
+    const GUEST_DR0: u64 = 0x1234_5000;
+    const GUEST_DR7: u64 = 0x700;
     /// `WHvCapabilityCodeExceptionExitBitmap`, `WHvCapabilityCodeProcessorVendor`.
     const CAP_EXCEPTION_EXIT_BITMAP: whv::WHV_CAPABILITY_CODE = 3;
     const CAP_PROCESSOR_VENDOR: whv::WHV_CAPABILITY_CODE = 0x1000;
 
-    /// `WHV_X64_PENDING_INTERRUPTION_REGISTER` for #BP: pending, `kind`
-    /// (3 exception; 6 Hyper-V's software exception, which WHP's header does
-    /// not list), instruction length `len`, vector 3.
-    fn pending_interruption(kind: u64, len: u64) -> u64 {
-        1 | (kind << 1) | (len << 5) | (3 << 16)
+    /// An interrupt gate (0x8E) to `handler` through selector 8.
+    fn gate(m: *mut u8, vector: u64, handler: u64) {
+        let low = (handler & 0xFFFF) | (8 << 16) | (0x8E << 40) | (((handler >> 16) & 0xFFFF) << 48);
+        put(m, IDT + vector * 16, &low.to_le_bytes());
+        put(m, IDT + vector * 16 + 8, &(handler >> 32).to_le_bytes());
+    }
+
+    fn put(m: *mut u8, at: u64, bytes: &[u8]) {
+        // SAFETY: within the test's mapping.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), m.add(at as usize), bytes.len()) };
+    }
+
+    fn peek(m: *mut u8, at: u64) -> u64 {
+        // SAFETY: within the test's mapping, 8-byte aligned.
+        unsafe { std::ptr::read_volatile(m.add(at as usize).cast::<u64>()) }
     }
 
     /// Guest memory with long mode's tables (the first 2 MiB identity
-    /// mapped), a GDT (64-bit code at 8, data at 0x10), an IDT whose vector 3
-    /// is the handler, the code and the handler.
-    fn guest() -> *mut u8 {
+    /// mapped), a GDT (64-bit code at 8, data at 0x10), an IDT with the #NP
+    /// gate and, if `bp_gate`, the #BP gate, the code and the handlers.
+    fn guest(bp_gate: bool) -> *mut u8 {
         // SAFETY: anonymous memory for the test, unmapped by the caller.
         let p = unsafe {
             libc::mmap(
@@ -1358,27 +1720,43 @@ mod bp_tests {
         };
         assert_ne!(p, libc::MAP_FAILED);
         let m = p.cast::<u8>();
-        let put = |at: u64, bytes: &[u8]| {
-            // SAFETY: within the mapping.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), m.add(at as usize), bytes.len()) };
-        };
-        let q = |at: u64, v: u64| put(at, &v.to_le_bytes());
+        let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
         q(0x1000, 0x2000 | 3);
         q(0x2000, 0x3000 | 3);
         q(0x3000, 0x83);
         q(GDT + 8, 0x00AF_9A00_0000_FFFF);
         q(GDT + 16, 0x00CF_9200_0000_FFFF);
-        // An interrupt gate (0x8E) to the handler through selector 8.
-        q(IDT + 3 * 16, (HANDLER & 0xFFFF) | (8 << 16) | (0x8E << 40) | (((HANDLER >> 16) & 0xFFFF) << 48));
-        q(IDT + 3 * 16 + 8, HANDLER >> 32);
-        put(CODE, &[0xCC, 0xE6, PORT as u8, 0xEB, 0xFE]);
+        if bp_gate {
+            gate(m, 3, HANDLER);
+        }
+        gate(m, 11, NP_HANDLER);
+        put(m, CODE, &[0xCC, 0xE6, PORT as u8, 0x90, 0xCC, 0xEB, 0xFE]);
+        put(m, CODE1, &[0xCC, 0xEB, 0xFD]);
+        put(m, LOOP0, &[0xCC, 0xE6, PORT as u8, 0xEB, 0xFB]);
         put(
+            m,
             HANDLER,
             &[
                 0x48, 0x8B, 0x04, 0x24, // mov rax, [rsp]
-                0x48, 0x89, 0x04, 0x25, 0x00, 0x80, 0x00, 0x00, // mov [0x8000], rax
-                0xC6, 0x04, 0x25, 0x08, 0x80, 0x00, 0x00, 0x01, // mov byte [0x8008], 1
+                0x48, 0x89, 0x04, 0x25, 0x00, 0x80, 0x00, 0x00, // mov [PUSHED], rax
+                0x0F, 0x21, 0xF8, // mov rax, dr7
+                0x48, 0x89, 0x04, 0x25, 0x10, 0x80, 0x00, 0x00, // mov [DR7_SEEN], rax
+                0x0F, 0x21, 0xC0, // mov rax, dr0
+                0x48, 0x89, 0x04, 0x25, 0x18, 0x80, 0x00, 0x00, // mov [DR0_SEEN], rax
+                0xF0, 0x48, 0xFF, 0x04, 0x25, 0x08, 0x80, 0x00, 0x00, // lock inc qword [COUNT]
                 0x48, 0xCF, // iretq
+            ],
+        );
+        put(
+            m,
+            NP_HANDLER,
+            &[
+                0x48, 0x8B, 0x04, 0x24, // mov rax, [rsp]: the error code
+                0x48, 0x89, 0x04, 0x25, 0x20, 0x80, 0x00, 0x00, // mov [NP_ERR], rax
+                0x48, 0x8B, 0x44, 0x24, 0x08, // mov rax, [rsp + 8]: the RIP
+                0x48, 0x89, 0x04, 0x25, 0x28, 0x80, 0x00, 0x00, // mov [NP_RIP], rax
+                0xE6, NP_PORT as u8, // out 0x82, al
+                0xEB, 0xFE, // jmp $
             ],
         );
         m
@@ -1400,9 +1778,30 @@ mod bp_tests {
         }
     }
 
-    /// The vCPU in long mode at the INT3, #BP intercepted as gdb's
-    /// software breakpoints are.
-    fn start(vcpu: &VcpuFd) {
+    /// A VM whose RAM is `guest(bp_gate)`.
+    fn vm_with(bp_gate: bool) -> (super::super::VmFd, *mut u8) {
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest(bp_gate);
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        (vm, m)
+    }
+
+    fn unmap(m: *mut u8) {
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
+    /// The vCPU in long mode at `rip`, #BP intercepted as gdb's software
+    /// breakpoints are.
+    fn start(vcpu: &VcpuFd, rip: u64, rsp: u64) {
         let mut s = vcpu.get_sregs().unwrap();
         s.cr0 = 0x8000_0031; // PG, NE, ET, PE
         s.cr3 = 0x1000;
@@ -1417,9 +1816,27 @@ mod bp_tests {
         (s.gdt.base, s.gdt.limit) = (GDT, 23);
         (s.idt.base, s.idt.limit) = (IDT, 4095);
         vcpu.set_sregs(&s).unwrap();
-        vcpu.set_regs(&kvm_regs { rip: CODE, rsp: STACK, rflags: 2, ..Default::default() }).unwrap();
+        vcpu.set_regs(&kvm_regs { rip, rsp, rflags: 2, ..Default::default() }).unwrap();
         let control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP;
         vcpu.set_guest_debug(&kvm_guest_debug { control, ..Default::default() }).unwrap();
+    }
+
+    /// What upstream's `inject_bp_to_guest` does: `vcpu_inject_bp`.
+    fn hand_back(vcpu: &VcpuFd, mut dbg: kvm_guest_debug) {
+        dbg.control |= KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP | KVM_GUESTDBG_INJECT_BP;
+        vcpu.set_guest_debug(&dbg).unwrap();
+    }
+
+    fn describe(exit: Result<VcpuExit<'_>>) -> String {
+        match exit {
+            Ok(VcpuExit::IoOut(port, _)) => format!("exit IoOut port {port:#x}"),
+            Ok(VcpuExit::Debug(arch)) => format!("exit Debug vector {} pc {:#x}", arch.exception, arch.pc),
+            Ok(VcpuExit::Shutdown) => "exit Shutdown".to_string(),
+            Ok(VcpuExit::InternalError) => "exit InternalError".to_string(),
+            Ok(_) => "exit (another)".to_string(),
+            Err(e) if e.errno() == libc::EINTR => "kicked".to_string(),
+            Err(e) => format!("run failed, errno {}", e.errno()),
+        }
     }
 
     /// One `run`, kicked after 5 s if it has not returned, as a line.
@@ -1436,18 +1853,10 @@ mod bp_tests {
             }
             kicker.set_kvm_immediate_exit(1);
         });
-        let line = match vcpu.run() {
-            Ok(VcpuExit::IoOut(port, _)) => format!("exit IoOut port {port:#x}"),
-            Ok(VcpuExit::Debug(arch)) => format!("exit Debug vector {} pc {:#x}", arch.exception, arch.pc),
-            Ok(VcpuExit::Shutdown) => "exit Shutdown".to_string(),
-            Ok(VcpuExit::InternalError) => "exit InternalError".to_string(),
-            Ok(_) => "exit (another)".to_string(),
-            Err(e) if e.errno() == libc::EINTR => "no exit within 5 s (kicked)".to_string(),
-            Err(e) => format!("run failed, errno {}", e.errno()),
-        };
+        let line = describe(vcpu.run());
         done.store(true, Ordering::SeqCst);
         watchdog.join().unwrap();
-        line
+        if line == "kicked" { "no exit within 5 s (kicked)".to_string() } else { line }
     }
 
     fn capability(code: whv::WHV_CAPABILITY_CODE) -> String {
@@ -1458,95 +1867,142 @@ mod bp_tests {
         format!("HRESULT {:#010x}, {written} bytes, {:#x}", hres.cast_unsigned(), buf[0])
     }
 
-    /// Each way to hand the #BP back, in a VM of its own, from the exit of
-    /// the guest's INT3: what each call returned, the exit that followed,
-    /// whether the guest's handler ran, the RIP it was given (the INT3 is at
-    /// 0x6000; Linux's handler expects 0x6001) and RIP after.
+    fn expired() -> u64 {
+        super::super::debug::WINDOWS_EXPIRED.load(Ordering::SeqCst)
+    }
+
+    /// The guest's own INT3, handed back: its handler runs with the RIP
+    /// past the INT3 pushed and reads the guest's own DR7 and DR0 (the
+    /// window's are gone before its first instruction), and #BP is gdb's
+    /// again after it: gdb's INT3 that follows stops the vCPU.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_bp_handed_back_to_the_guest() {
         eprintln!("BPTEST exception exit bitmap capability: {}", capability(CAP_EXCEPTION_EXIT_BITMAP));
         eprintln!("BPTEST processor vendor (0 AMD, 1 Intel, 2 Hygon): {}", capability(CAP_PROCESSOR_VENDOR));
-        type Way = fn(&VcpuFd) -> Vec<String>;
-        let ways: [(&str, Way); 5] = [
-            ("i: today's INJECT_BP (RIP+1, PendingInterruption exception #BP, length 0)", |v| {
-                let control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_USE_SW_BP | KVM_GUESTDBG_INJECT_BP;
-                let r = v.set_guest_debug(&kvm_guest_debug { control, ..Default::default() });
-                vec![format!("set_guest_debug(INJECT_BP): {:?}", r.map_err(|e| e.errno()))]
-            }),
-            ("ii-a: RIP at the INT3, PendingInterruption exception #BP, length 1", |v| {
-                let r = super::super::ffi::set_register(
-                    v.part(),
-                    v.vp(),
-                    whv::WHvRegisterPendingInterruption,
-                    super::super::ffi::reg64(pending_interruption(3, 1)),
-                );
-                vec![format!("set PendingInterruption {:#x}: {:?}", pending_interruption(3, 1), r.map_err(|e| e.errno()))]
-            }),
-            ("ii-b: RIP at the INT3, PendingInterruption type 6 (software exception) #BP, length 1", |v| {
-                let r = super::super::ffi::set_register(
-                    v.part(),
-                    v.vp(),
-                    whv::WHvRegisterPendingInterruption,
-                    super::super::ffi::reg64(pending_interruption(6, 1)),
-                );
-                vec![format!("set PendingInterruption {:#x}: {:?}", pending_interruption(6, 1), r.map_err(|e| e.errno()))]
-            }),
-            ("iii: RIP+1, PendingEvent exception event #BP", |v| {
-                let rip = super::super::ffi::set_register(v.part(), v.vp(), whv::WHvX64RegisterRip, super::super::ffi::reg64(CODE + 1));
-                let event = 1 | (3 << 16);
-                let r = super::super::ffi::set_register(v.part(), v.vp(), PENDING_EVENT, super::super::ffi::reg64(event));
-                vec![
-                    format!("set RIP {:#x}: {:?}", CODE + 1, rip.map_err(|e| e.errno())),
-                    format!("set PendingEvent {event:#x}: {:?}", r.map_err(|e| e.errno())),
-                ]
-            }),
-            ("iv: #BP out of the exit bitmap, RIP at the INT3, the guest runs it", |v| {
-                let control = KVM_GUESTDBG_ENABLE;
-                let r = v.set_guest_debug(&kvm_guest_debug { control, ..Default::default() });
-                vec![format!("set_guest_debug(ENABLE only: bitmap 0): {:?}", r.map_err(|e| e.errno()))]
-            }),
-        ];
-        let mut scaffold = Vec::new();
-        for (name, way) in ways {
-            let vm = super::super::VmFd::create().unwrap();
-            let m = guest();
-            let region = kvm_bindings::kvm_userspace_memory_region {
-                slot: 0,
-                flags: 0,
-                guest_phys_addr: 0,
-                memory_size: MEM as u64,
-                userspace_addr: m as u64,
-            };
-            // SAFETY: the memory stays mapped while the VM has it.
-            unsafe { vm.set_user_memory_region(region) }.unwrap();
-            let mut vcpu = vm.create_vcpu(0).unwrap();
-            start(&vcpu);
-            let first = run_once(&mut vcpu);
-            eprintln!("BPTEST {name}: first {first}");
-            scaffold.push((name, first.clone()));
-            if first == format!("exit Debug vector 3 pc {CODE:#x}") {
-                for line in way(&vcpu) {
-                    eprintln!("BPTEST {name}: {line}");
+        let before = expired();
+        let (vm, m) = vm_with(true);
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu, CODE, STACK);
+        vcpu.set_debug_regs(&kvm_debugregs { db: [GUEST_DR0, 0, 0, 0], dr7: GUEST_DR7, ..Default::default() })
+            .unwrap();
+        assert_eq!(run_once(&mut vcpu), format!("exit Debug vector 3 pc {CODE:#x}"));
+        hand_back(&vcpu, kvm_guest_debug::default());
+        assert_eq!(run_once(&mut vcpu), format!("exit IoOut port {PORT:#x}"), "the handler ran and returned");
+        assert_eq!(peek(m, COUNT), 1);
+        assert_eq!(peek(m, PUSHED), CODE + 1, "the RIP pushed is past the INT3, as on hardware");
+        assert_eq!(peek(m, DR7_SEEN), GUEST_DR7, "the handler reads the guest's DR7, not the window's");
+        assert_eq!(peek(m, DR0_SEEN), GUEST_DR0, "the handler reads the guest's DR0, not the window's");
+        assert_eq!(run_once(&mut vcpu), format!("exit Debug vector 3 pc {:#x}", CODE + 4), "#BP is gdb's again");
+        assert_eq!(peek(m, COUNT), 1);
+        let d = vcpu.get_debug_regs().unwrap();
+        assert_eq!((d.db[0], d.dr7), (GUEST_DR0, GUEST_DR7));
+        assert_eq!(expired(), before, "no window needed its bound");
+        drop(vcpu);
+        drop(vm);
+        unmap(m);
+    }
+
+    /// vCPU 1 runs into gdb's INT3 again and again while vCPU 0's own INT3s
+    /// are handed back: whether vCPU 1 was held during a window or ran
+    /// between them, its INT3 always stops it and never reaches the guest's
+    /// handler.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_bp_window_holds_the_other_vcpus() {
+        const ROUNDS: u64 = 200;
+        let before = expired();
+        let (vm, m) = vm_with(true);
+        let mut vcpu0 = vm.create_vcpu(0).unwrap();
+        let mut vcpu1 = vm.create_vcpu(1).unwrap();
+        start(&vcpu0, LOOP0, STACK);
+        start(&vcpu1, CODE1, STACK1);
+        // An application processor waits for a SIPI; this one runs at once.
+        vcpu1.set_mp_state(kvm_mp_state { mp_state: KVM_MP_STATE_RUNNABLE }).unwrap();
+        let mut kick1 = VcpuFd { shared: Arc::clone(&vcpu1.shared), own: None };
+        let other = std::thread::spawn(move || {
+            let mut stops = 0u64;
+            loop {
+                let line = describe(vcpu1.run());
+                if line == format!("exit Debug vector 3 pc {CODE1:#x}") {
+                    stops += 1;
+                } else if line == "kicked" {
+                    return Ok(stops);
+                } else {
+                    return Err(line);
                 }
-                let then = run_once(&mut vcpu);
-                // SAFETY: within the mapping, 8-byte aligned.
-                let (pushed, mark) = unsafe { (*m.add(PUSHED as usize).cast::<u64>(), *m.add(MARK as usize)) };
-                let rip = vcpu.get_regs().map(|r| r.rip);
-                eprintln!(
-                    "BPTEST {name}: then {then}; handler ran {}; pushed RIP {pushed:#x}; RIP after {:?}",
-                    mark == 1,
-                    rip.map(|r| format!("{r:#x}"))
-                );
             }
-            drop(vcpu);
-            drop(vm);
-            // SAFETY: our mapping.
-            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        });
+        for round in 0..ROUNDS {
+            assert_eq!(run_once(&mut vcpu0), format!("exit Debug vector 3 pc {LOOP0:#x}"), "round {round}");
+            hand_back(&vcpu0, kvm_guest_debug::default());
+            assert_eq!(run_once(&mut vcpu0), format!("exit IoOut port {PORT:#x}"), "round {round}");
         }
-        // The scaffold itself: each VM stops at the guest's INT3 first.
-        for (name, first) in scaffold {
-            assert_eq!(first, format!("exit Debug vector 3 pc {CODE:#x}"), "{name}");
-        }
+        kick1.set_kvm_immediate_exit(1);
+        let stops = other.join().unwrap().expect("vCPU 1 stops only at gdb's INT3");
+        eprintln!("BPTEST vCPU 1 stopped at gdb's INT3 {stops} times during vCPU 0's {ROUNDS} windows");
+        assert_eq!(peek(m, COUNT), ROUNDS, "only vCPU 0's own INT3s reached the guest's handler");
+        assert!(stops > 0, "vCPU 1 ran meanwhile");
+        assert_eq!(expired(), before, "no window needed its bound");
+        drop(vcpu0);
+        drop(kick1);
+        drop(vm);
+        unmap(m);
+    }
+
+    /// A #BP whose gate is absent: its delivery faults with #NP natively, as
+    /// on hardware: the guest's #NP handler runs, with the error code that
+    /// names IDT entry 3 (index 3, IDT bit; EXT clear for INT3) and the RIP
+    /// of the INT3 (a fault).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_bp_delivery_fault_is_the_guests() {
+        let before = expired();
+        let (vm, m) = vm_with(false);
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu, CODE, STACK);
+        assert_eq!(run_once(&mut vcpu), format!("exit Debug vector 3 pc {CODE:#x}"));
+        hand_back(&vcpu, kvm_guest_debug::default());
+        assert_eq!(run_once(&mut vcpu), format!("exit IoOut port {NP_PORT:#x}"), "the #NP handler ran");
+        assert_eq!(peek(m, NP_ERR), (3 << 3) | 2);
+        assert_eq!(peek(m, NP_RIP), CODE);
+        assert_eq!(peek(m, COUNT), 0);
+        assert_eq!(expired(), before, "no window needed its bound");
+        drop(vcpu);
+        drop(vm);
+        unmap(m);
+    }
+
+    /// gdb's own breakpoints after a guest's INT3 was handed back: its
+    /// hardware breakpoint (DR0, which the window borrowed) fires, then its
+    /// INT3 stops the vCPU.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_gdb_breakpoints_after_a_handed_back_bp() {
+        let before = expired();
+        let (vm, m) = vm_with(true);
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu, CODE, STACK);
+        // As upstream's vcpu_set_debug: DR0 on the `nop`, DR7's G0, GE and
+        // bit 10.
+        let mut dbg = kvm_guest_debug {
+            control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP | KVM_GUESTDBG_USE_HW_BP,
+            ..Default::default()
+        };
+        dbg.arch.debugreg[0] = CODE + 3;
+        dbg.arch.debugreg[7] = (1 << 10) | (1 << 9) | 0b10;
+        vcpu.set_guest_debug(&dbg).unwrap();
+        assert_eq!(run_once(&mut vcpu), format!("exit Debug vector 3 pc {CODE:#x}"));
+        hand_back(&vcpu, dbg);
+        assert_eq!(run_once(&mut vcpu), format!("exit IoOut port {PORT:#x}"), "the handler ran and returned");
+        assert_eq!((peek(m, COUNT), peek(m, PUSHED)), (1, CODE + 1));
+        assert_eq!(run_once(&mut vcpu), format!("exit Debug vector 1 pc {:#x}", CODE + 3), "gdb's hardware breakpoint");
+        vcpu.set_guest_debug(&dbg).unwrap();
+        assert_eq!(run_once(&mut vcpu), format!("exit Debug vector 3 pc {:#x}", CODE + 4), "gdb's INT3");
+        assert_eq!(peek(m, COUNT), 1);
+        assert_eq!(expired(), before, "no window needed its bound");
+        drop(vcpu);
+        drop(vm);
+        unmap(m);
     }
 }

@@ -117,10 +117,155 @@ pub(crate) struct State {
     /// `RFLAGS.RF` at the next entry: the vCPU stopped on one of gdb's
     /// instruction breakpoints, which would hit again at once.
     pub(crate) resume_rf: bool,
-    /// A #BP for the guest at the next entry.
+    /// A #BP for the guest at the next entry: its own `INT3`, run again in
+    /// a [`Window`].
     pub(crate) inject_bp: bool,
-    /// The length of the instruction of the last debug exit (`INT3`: 1).
-    pub(crate) last_len: u64,
+    /// The #BP window open on this vCPU.
+    pub(crate) window: Option<Window>,
+}
+
+// Handing a #BP back to the guest (`KVM_GUESTDBG_INJECT_BP`). WHP refuses a
+// #BP as a pending event: `WHvRegisterPendingInterruption` with a #BP,
+// hardware or software exception, length 0 or 1, fails with
+// STATUS_HV_INVALID_PARAMETER (0xc0350005), and `WHvRegisterPendingEvent`
+// gives an InternalError exit (measured on an AMD host,
+// `test_bp_handed_back_to_the_guest` at bf52d6f). So the guest runs its
+// INT3 again with #BP out of the partition's exception exits, which only
+// natively delivers it. The bitmap is the partition's, so for that window
+// the other vCPUs are held out of the guest (`vcpu.rs`, `enter`), and the
+// window ends deterministically: DR0 is an instruction breakpoint on the
+// handler the gate names (with #DB intercepted), a fault taken before the
+// handler's first instruction (SDM vol. 3, 17.2.4; delivery clears RF,
+// 6.12.1.2): the #BP delivered and its RIP pushed, nothing else run. A
+// delivery that faults (absent gate, task gate, beyond the IDT's limit, DPL
+// below CPL, a bad stack) faults the same way natively; the window
+// intercepts those faults ([`DELIVERY_FAULTS`]) and starts a round for the
+// fault's vector: out of the bitmap, DR0 on its handler, the INT3 run again.
+// Each round takes a vector out, so there are at most six; a triple fault
+// is a shutdown, as on hardware.
+
+/// The faults an exception's delivery can itself raise: #DF, #TS, #NP,
+/// #SS, #GP, #PF.
+pub(crate) const DELIVERY_FAULTS: u64 = (1 << 8) | (1 << 10) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14);
+
+/// DR7 in a window: DR0 an instruction breakpoint (`L0`; R/W0 and LEN0 00),
+/// bit 10 (reads as 1).
+pub(crate) const WINDOW_DR7: u64 = (1 << 10) | 1;
+/// DR7 with no breakpoint.
+pub(crate) const DR7_NONE: u64 = 1 << 10;
+
+/// How long the other vCPUs may be held: a window ends at the handler or at
+/// a delivery fault, within microseconds. This bound is the last resort for
+/// one whose end never comes (no handler could be read and no fault came,
+/// as with a stale TLB entry for the IDT); it is cancelled and closed, and
+/// says so.
+pub(crate) const WINDOW_BOUND: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How many windows were closed at [`WINDOW_BOUND`]: the tests' check that
+/// none needed it.
+pub(crate) static WINDOWS_EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The partition's exception exits during a window: #DB for its end, and
+/// the delivery faults `faults` still intercepted. Never #BP.
+pub(crate) fn window_bitmap(faults: u64) -> u64 {
+    (1 << DB_VECTOR) | (faults & DELIVERY_FAULTS)
+}
+
+/// An open window.
+#[derive(Debug, Clone)]
+pub(crate) struct Window {
+    /// DR0-DR3, DR6, DR7 from before the window, put back at its end.
+    pub(crate) saved: [u64; 6],
+    /// `WHvRegisterInterruptState`'s NMI mask from before (the window masks
+    /// NMIs: one that comes is taken just after it).
+    pub(crate) nmi_masked: bool,
+    /// The vector being delivered: #BP, or the fault its delivery raised.
+    pub(crate) vector: u8,
+    /// Its handler, armed in DR0; `None` if its gate gives none.
+    pub(crate) handler: Option<u64>,
+    /// The delivery faults still intercepted.
+    pub(crate) faults: u64,
+    /// When it opened, for [`WINDOW_BOUND`].
+    pub(crate) opened: std::time::Instant,
+}
+
+/// `CR0.PE`, `EFER.LMA`.
+const CR0_PE: u64 = 1;
+const EFER_LMA: u64 = 1 << 10;
+
+/// The format of the vCPU's interrupt table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TableMode {
+    /// The real-mode IVT: 4-byte entries, offset and segment.
+    Real,
+    /// 8-byte gates.
+    Protected,
+    /// 16-byte gates.
+    Long,
+}
+
+pub(crate) fn table_mode(cr0: u64, efer: u64) -> TableMode {
+    if cr0 & CR0_PE == 0 {
+        TableMode::Real
+    } else if efer & EFER_LMA != 0 {
+        TableMode::Long
+    } else {
+        TableMode::Protected
+    }
+}
+
+/// The linear address and size of `vector`'s entry, `None` beyond the
+/// table's limit.
+pub(crate) fn gate_at(mode: TableMode, base: u64, limit: u16, vector: u8) -> Option<(u64, usize)> {
+    let size: u64 = match mode {
+        TableMode::Real => 4,
+        TableMode::Protected => 8,
+        TableMode::Long => 16,
+    };
+    let at = u64::from(vector) * size;
+    (at + size - 1 <= u64::from(limit)).then_some((base.wrapping_add(at), size as usize))
+}
+
+/// Where an entry sends the CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Target {
+    Linear(u64),
+    /// Protected mode: the offset in the code segment `selector` names.
+    Segment { selector: u16, offset: u64 },
+}
+
+/// The target of an entry of `mode` (`gate` of its size); `None` for one
+/// that sends nowhere: not present, a task gate or another type. Delivery
+/// through such a gate faults, which the window intercepts.
+pub(crate) fn gate_target(mode: TableMode, gate: &[u8]) -> Option<Target> {
+    let word = |i: usize| u64::from(u16::from_le_bytes([gate[i], gate[i + 1]]));
+    match mode {
+        TableMode::Real => Some(Target::Linear((word(2) << 4) + word(0))),
+        TableMode::Protected | TableMode::Long => {
+            let kind = gate[5];
+            // Present, a system descriptor (S clear), an interrupt or trap
+            // gate (32-bit 0xE/0xF; 16-bit 6/7 outside long mode).
+            if kind & 0x80 == 0 || kind & 0x10 != 0 {
+                return None;
+            }
+            match (mode, kind & 0xF) {
+                (TableMode::Long, 0xE | 0xF) => {
+                    let high = u64::from(u32::from_le_bytes(gate[8..12].try_into().unwrap()));
+                    Some(Target::Linear(word(0) | (word(6) << 16) | (high << 32)))
+                }
+                (TableMode::Protected, 0xE | 0xF) => {
+                    Some(Target::Segment { selector: word(2) as u16, offset: word(0) | (word(6) << 16) })
+                }
+                (TableMode::Protected, 0x6 | 0x7) => Some(Target::Segment { selector: word(2) as u16, offset: word(0) }),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// The base of a segment descriptor.
+pub(crate) fn descriptor_base(d: &[u8; 8]) -> u64 {
+    u64::from(d[2]) | (u64::from(d[3]) << 8) | (u64::from(d[4]) << 16) | (u64::from(d[7]) << 24)
 }
 
 /// `RFLAGS` as the guest has it: without the `TF` gdb set.
@@ -170,13 +315,6 @@ pub(crate) fn debug_exit(vector: u8, rip: u64, param: u64, dr7: u64) -> Option<k
 /// exception (type 3), vector 13, with its error code (bit 4), 0.
 pub(crate) fn pending_gp() -> u64 {
     1 | (3 << 1) | (1 << 4) | (13 << 16)
-}
-
-/// WHP's `WHV_X64_PENDING_INTERRUPTION_REGISTER` for a #BP (a hardware
-/// exception, type 3, vector 3): delivered with `RIP` past the `INT3`, as
-/// the guest's own breakpoint would have been.
-pub(crate) fn pending_bp() -> u64 {
-    1 | (3 << 1) | (u64::from(BP_VECTOR) << 16)
 }
 
 /// KVM's `INVALID_GPA` (`~0ull`, include/linux/kvm_types.h): the
@@ -325,12 +463,67 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_bp_is_a_hardware_exception_3() {
-        let p = pending_bp();
-        assert_eq!(p & 1, 1);
-        assert_eq!((p >> 1) & 0x7, 3);
-        assert_eq!((p >> 4) & 1, 0, "#BP has no error code");
-        assert_eq!((p >> 16) & 0xffff, 3);
+    fn test_window_never_intercepts_bp() {
+        assert_eq!(window_bitmap(DELIVERY_FAULTS), (1 << 1) | (1 << 8) | (0b1_1111 << 10));
+        assert_eq!(window_bitmap(u64::MAX) & (1 << BP_VECTOR), 0);
+        // A round takes its fault out; #DB stays for the end.
+        assert_eq!(window_bitmap(DELIVERY_FAULTS & !(1 << 11)) & (1 << 11), 0);
+        assert_eq!(window_bitmap(0), 1 << 1);
+        assert_eq!(WINDOW_DR7 & 0b11, 1, "L0 only");
+        assert_eq!((WINDOW_DR7 >> 16) & 0xF, 0, "an instruction breakpoint, length 1");
+    }
+
+    #[test]
+    fn test_table_modes_and_entries() {
+        assert_eq!(table_mode(0x10, 0), TableMode::Real);
+        assert_eq!(table_mode(0x11, 0), TableMode::Protected);
+        assert_eq!(table_mode(0x8000_0011, 0x500), TableMode::Long);
+        // Within the limit: the entry's last byte at most the limit.
+        assert_eq!(gate_at(TableMode::Long, 0x5000, 4095, 3), Some((0x5030, 16)));
+        assert_eq!(gate_at(TableMode::Long, 0x5000, 0x3F, 3), Some((0x5030, 16)));
+        assert_eq!(gate_at(TableMode::Long, 0x5000, 0x3E, 3), None);
+        assert_eq!(gate_at(TableMode::Protected, 0x100, 0x1F, 3), Some((0x118, 8)));
+        assert_eq!(gate_at(TableMode::Real, 0, 0x3FF, 3), Some((12, 4)));
+    }
+
+    #[test]
+    fn test_gate_targets() {
+        // Long mode: an interrupt gate (0x8E) and a trap gate (0x8F) to
+        // 0xffff_ffff_8100_1234; Linux's int3 gate has DPL 3 (0xEE).
+        let long = |kind: u8| {
+            let mut g = [0u8; 16];
+            g[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
+            g[2..4].copy_from_slice(&0x10u16.to_le_bytes());
+            g[5] = kind;
+            g[6..8].copy_from_slice(&0x8100u16.to_le_bytes());
+            g[8..12].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+            g
+        };
+        for kind in [0x8E, 0x8F, 0xEE] {
+            assert_eq!(gate_target(TableMode::Long, &long(kind)), Some(Target::Linear(0xffff_ffff_8100_1234)));
+        }
+        // Not present, a task gate (in long mode: #GP), a 16-bit gate, a
+        // code descriptor: nowhere.
+        for kind in [0x0E, 0x85, 0x86, 0x9A] {
+            assert_eq!(gate_target(TableMode::Long, &long(kind)), None, "{kind:#x}");
+        }
+        // Protected mode: 32-bit and 16-bit gates go through the selector;
+        // a task gate goes nowhere.
+        let mut g = [0u8; 8];
+        g[0..2].copy_from_slice(&0x5678u16.to_le_bytes());
+        g[2..4].copy_from_slice(&0x08u16.to_le_bytes());
+        g[6..8].copy_from_slice(&0x0010u16.to_le_bytes());
+        g[5] = 0x8E;
+        assert_eq!(gate_target(TableMode::Protected, &g), Some(Target::Segment { selector: 8, offset: 0x10_5678 }));
+        g[5] = 0x86;
+        assert_eq!(gate_target(TableMode::Protected, &g), Some(Target::Segment { selector: 8, offset: 0x5678 }));
+        g[5] = 0x85;
+        assert_eq!(gate_target(TableMode::Protected, &g), None);
+        // Real mode: segment * 16 + offset.
+        assert_eq!(gate_target(TableMode::Real, &[0x34, 0x12, 0x00, 0xF0]), Some(Target::Linear(0xF1234)));
+        // A flat code segment's base, and one at 0x1234_5600.
+        assert_eq!(descriptor_base(&0x00CF_9A00_0000_FFFFu64.to_le_bytes()), 0);
+        assert_eq!(descriptor_base(&0x12CF_9A34_5600_FFFFu64.to_le_bytes()), 0x1234_5600);
     }
 
     #[test]

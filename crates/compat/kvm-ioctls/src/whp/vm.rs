@@ -12,7 +12,7 @@
 //! local APIC with `WHvRequestInterrupt`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 
 use wick_os::fd::{AsRawFd, RawFd};
@@ -106,6 +106,13 @@ pub(crate) struct VmInner {
     /// The last `WHvRequestInterrupt` failure reported, so each kind is
     /// reported once.
     request_failure: AtomicI32,
+    /// The #BP window (`debug`'s module notes): gdb's exception-exit
+    /// bitmap, which a window replaces while it is open, and the condvar
+    /// the held vCPUs wait on. A leaf lock: nothing else is locked while it
+    /// is held, so it is in no lock-order cycle.
+    bp_window: (Mutex<u64>, Condvar),
+    /// The vCPU whose window is open, -1 for none (read by every entry).
+    pub(crate) bp_owner: AtomicI64,
 }
 
 // SAFETY: the partition handle is an opaque value WHP accepts from any thread;
@@ -204,6 +211,87 @@ impl VmInner {
         let (lock, cv) = &self.halt_wake;
         *lock.lock().unwrap() += 1;
         cv.notify_all();
+    }
+
+    /// Sets the partition's exception exits to gdb's `bitmap`: now, or when
+    /// the open #BP window closes (a window's bitmap never has #BP).
+    pub(crate) fn set_debug_bitmap(&self, bitmap: u64) -> Result<()> {
+        let mut gdb = self.bp_window.0.lock().unwrap();
+        *gdb = bitmap;
+        if self.bp_owner.load(Ordering::SeqCst) < 0 {
+            // SAFETY: a u64 value for ExceptionExitBitmap.
+            unsafe { ffi::set_partition_property(self.part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &bitmap) }?;
+        }
+        Ok(())
+    }
+
+    /// Makes vCPU `vp` the owner of the #BP window, once no other window is
+    /// open: from then on no other vCPU enters the guest. The exception
+    /// exits are its to change ([`Self::set_window_bitmap`]) once the others
+    /// are out. `false`, with nothing taken, if `immediate_exit` is set
+    /// meanwhile.
+    #[cfg_attr(not(feature = "gdb"), allow(dead_code))]
+    pub(crate) fn open_bp_window(&self, vp: u32, immediate_exit: &AtomicU8) -> bool {
+        let (lock, cv) = &self.bp_window;
+        let mut gdb = lock.lock().unwrap();
+        loop {
+            if immediate_exit.load(Ordering::SeqCst) != 0 {
+                return false;
+            }
+            if self.bp_owner.load(Ordering::SeqCst) < 0 {
+                break;
+            }
+            gdb = cv.wait(gdb).unwrap();
+        }
+        self.bp_owner.store(i64::from(vp), Ordering::SeqCst);
+        true
+    }
+
+    /// Sets the window's exception exits to `bitmap` (a new round).
+    #[cfg_attr(not(feature = "gdb"), allow(dead_code))]
+    pub(crate) fn set_window_bitmap(&self, bitmap: u64) -> Result<()> {
+        let _gdb = self.bp_window.0.lock().unwrap();
+        // SAFETY: a u64 value for ExceptionExitBitmap.
+        unsafe { ffi::set_partition_property(self.part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &bitmap) }
+    }
+
+    /// Closes the open #BP window: gdb's exception exits back, the held
+    /// vCPUs let go. The owner is released even if the bitmap cannot be
+    /// written, whose error is returned.
+    #[cfg_attr(not(feature = "gdb"), allow(dead_code))]
+    pub(crate) fn close_bp_window(&self) -> Result<()> {
+        let (lock, cv) = &self.bp_window;
+        let gdb = lock.lock().unwrap();
+        // SAFETY: a u64 value for ExceptionExitBitmap.
+        let result = unsafe { ffi::set_partition_property(self.part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &*gdb) };
+        self.bp_owner.store(-1, Ordering::SeqCst);
+        drop(gdb);
+        cv.notify_all();
+        result
+    }
+
+    /// Waits while another vCPU than `vp` has a #BP window open. `false` if
+    /// `immediate_exit` is set (the kick: the run returns).
+    pub(crate) fn wait_bp_window(&self, vp: u32, immediate_exit: &AtomicU8) -> bool {
+        let (lock, cv) = &self.bp_window;
+        let mut gdb = lock.lock().unwrap();
+        loop {
+            if immediate_exit.load(Ordering::SeqCst) != 0 {
+                return false;
+            }
+            let owner = self.bp_owner.load(Ordering::SeqCst);
+            if owner < 0 || owner == i64::from(vp) {
+                return true;
+            }
+            gdb = cv.wait(gdb).unwrap();
+        }
+    }
+
+    /// Wakes the vCPUs waiting on the window, to see a kick: taken after
+    /// the kick's flag is set, so a waiter checks it or is woken.
+    pub(crate) fn notify_bp_window(&self) {
+        drop(self.bp_window.0.lock().unwrap());
+        self.bp_window.1.notify_all();
     }
 
     /// Waits for the next [`Self::wake_halted`], at most `timeout`.
@@ -414,6 +502,8 @@ impl VmInner {
             has_irqchip: AtomicBool::new(false),
             halt_wake: (Mutex::new(0), Condvar::new()),
             request_failure: AtomicI32::new(0),
+            bp_window: (Mutex::new(0), Condvar::new()),
+            bp_owner: AtomicI64::new(-1),
         })
     }
 }
