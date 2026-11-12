@@ -241,19 +241,20 @@ all bug integration_tests/functional/test_vsock.py::test_vsock_epipe
 # 256 MiB minus get_resident_memory minus 50 MiB), so that the guest runs out
 # of memory when it dirties 128 MiB, and with deflate_on_oom the balloon
 # deflates. On macOS the guest does not run out of memory ("Balloon did not
-# deflate"; m2-parts, wick 8d577b7). The variant without deflate_on_oom
-# passes. The shared cache's part of the RSS (4.64 MiB, the memory entry
-# above) makes the balloon 4.6 MiB smaller than on Linux, too little to
-# leave the guest the 128 MiB, so it is not the cause; an earlier reading
-# of 19 MiB there counted object residency, not the page tables. In the
-# diagnostic run m2-diag (dd657f4) PCI_ON failed again: the reading after
-# boot was 148 MiB where the guest's /proc/meminfo had 96 MiB in use (55 of
-# them its page cache), so the balloon was 58 MiB and the guest kept 198;
-# PCI_OFF passed there only because the host had compressed 35 MiB of the
-# VM (resident 106 MiB, phys_footprint 140), which the reading now counts
-# (get_resident_memory: resident and compressed). To find: what the guest
-# region holds beyond the guest's use; one guess, to measure in the guest
-# (/proc/kpageflags), is a 16 KiB host page holding the guest's 4 KiB pages.
+# deflate"; both variants in m2-parts2, d706d9a). The variant without
+# deflate_on_oom passes. Measured in the diagnostic run m2-kpf (33b9eec,
+# WICK_IT_DIAG_MEMORY, the guest's /proc/kpageflags): after boot the reading
+# is 147 MiB, the guest has 31,532 of its 65,024 RAM pages in use (123 MiB,
+# its reserved memory among them) and they fill 7,939 16 KiB frames
+# (124 MiB): the host's 16 KiB pages add 0.7%, so they are not the cause
+# (upstream's aarch64 CI hosts run 4 KiB pages: CONFIG_ARM64_4K_PAGES=y in
+# the Amazon Linux 2 5.10 and 2023 6.1 and 6.18 aarch64 kernels' configs).
+# The balloon is then 59 MiB and leaves the guest 77 MiB free and about
+# 58 MiB of page cache, about the 128 MiB the test writes: the margin is a
+# few MiB, and the reading carries the dyld shared cache's 4.64 MiB (the
+# memory entry above), which upstream's static Linux binary does not. To
+# find: whether that offset is what keeps the guest out of the OOM (a run
+# with the reading less the shared cache's part).
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_ON-True-kvm]
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_OFF-True-kvm]
 
