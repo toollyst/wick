@@ -1084,7 +1084,7 @@ mod macos {
                 let _ = LOGGER.init();
                 // SAFETY: a new descriptor of standard output, owned here.
                 let out = unsafe { std::fs::File::from_raw_fd(libc::dup(1)) };
-                METRICS.init(std::io::LineWriter::new(out)).unwrap();
+                METRICS.init(std::io::LineWriter::new(crate::ext::fifo::plain(out))).unwrap();
                 sandbox::select(Policy::Default);
                 let dir = std::path::PathBuf::from(format!("/tmp/wick-apiv-{}", std::process::id()));
                 std::fs::create_dir_all(&dir).unwrap();

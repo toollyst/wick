@@ -14,6 +14,7 @@
 //! See `docs/ARCHITECTURE.md`.
 
 pub mod api_process;
+pub mod fifo;
 pub mod jail;
 pub mod sandbox;
 #[cfg(all(test, target_os = "macos"))]

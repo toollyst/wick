@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Fri, 13 Nov 2026 04:08:30 +0900
+Subject: [PATCH] macos: a FIFO for the log, metrics or serial output holds 64
+ KiB, as on Linux
+
+Firecracker opens the log, metrics and serial output paths with
+utils::open_file_nonblock, O_RDWR so that a FIFO never lacks a reader.
+On Linux the FIFO then holds pipe(7)'s 65536 unread bytes. On macOS a
+FIFO is a pair of local stream sockets with 8 KiB of buffer
+(net.local.stream.sendspace), which no call on its descriptor raises.
+
+open_file_nonblock now returns wick's OutFile (overlay/vmm/ext/fifo.rs).
+On Linux it is the File itself, and on Windows still the File (Windows
+2's half to come). On macOS a FIFO gets an overflow of 65536 less the
+FIFO's own buffer, moved into the FIFO as the reader makes room; anything
+else is written directly.
+
+The logger's target, FcLineWriter, both SerialOutInner::File and the
+tests that build them from a File (through ext::fifo::plain) take an
+OutFile. An orderly end drains the overflow first:
+- upstream's panic hook, after its metrics;
+- exit_with_code, before its _exit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/src/main.rs                 |  2 ++
+ src/vmm/src/devices/legacy/serial.rs        | 10 ++++++----
+ src/vmm/src/logger/logging.rs               |  6 ++++--
+ src/vmm/src/logger/metrics.rs               |  6 ++++--
+ src/vmm/src/logger/mod.rs                   |  3 ++-
+ src/vmm/src/nitro_enclave/serial_console.rs |  3 ++-
+ src/vmm/src/signal_handler.rs               |  2 ++
+ src/vmm/src/utils/mod.rs                    | 14 ++++++++++----
+ 8 files changed, 32 insertions(+), 14 deletions(-)
+
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index 794dacdcdd61f2907d8e9f65b9cf4966fb91a76c..b8b01d400f3535e471dad4aba63bbadfa2afcb30 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -169,6 +169,8 @@ fn main_exec() -> Result<(), MainError> {
+         if let Err(err) = METRICS.write() {
+             error_unrestricted!("Failed to write metrics while panicking: {}", err);
+         }
++        // wick: what waits for a FIFO's reader goes into the FIFO (`ext::fifo`).
++        vmm::ext::fifo::drain();
+     }));
+ 
+     let http_max_payload_size_str = HTTP_MAX_PAYLOAD_SIZE.to_string();
+diff --git a/src/vmm/src/devices/legacy/serial.rs b/src/vmm/src/devices/legacy/serial.rs
+index 6e7f596788c89af0c7dc6479c352e88ddf8295a6..47b5cff5e5a571e739b9c5962bae5ed7c4a410ce 100644
+--- a/src/vmm/src/devices/legacy/serial.rs
++++ b/src/vmm/src/devices/legacy/serial.rs
+@@ -7,7 +7,6 @@
+ 
+ //! Implements a wrapper over an UART serial device.
+ use std::fmt::Debug;
+-use std::fs::File;
+ use std::io::{self, Read, Stdin, Write};
+ use std::os::unix::io::{AsRawFd, RawFd};
+ use std::sync::{Arc, Barrier};
+@@ -130,7 +129,8 @@ impl SerialEvents for SerialEventsWrapper {
+ pub enum SerialOutInner {
+     Sink,
+     Stdout(std::io::Stdout),
+-    File(File),
++    // wick: an `OutFile` (`ext::fifo`).
++    File(crate::ext::fifo::OutFile),
+ }
+ 
+ /// Output sink for the serial device, with optional rate limiting.
+@@ -544,7 +544,8 @@ mod tests {
+         let tmp = vmm_sys_util::tempfile::TempFile::new().unwrap();
+         let file = tmp.into_file();
+         let mut serial_out = SerialOut::new(
+-            SerialOutInner::File(file.try_clone().unwrap()),
++            // wick: an `OutFile` (`ext::fifo`).
++            SerialOutInner::File(crate::ext::fifo::plain(file.try_clone().unwrap())),
+             Some(TokenBucket::new(1024, 0, 1000).unwrap()),
+         );
+ 
+@@ -565,7 +566,8 @@ mod tests {
+         let tmp = vmm_sys_util::tempfile::TempFile::new().unwrap();
+         let file = tmp.into_file();
+         let mut serial_out = SerialOut::new(
+-            SerialOutInner::File(file.try_clone().unwrap()),
++            // wick: an `OutFile` (`ext::fifo`).
++            SerialOutInner::File(crate::ext::fifo::plain(file.try_clone().unwrap())),
+             Some(TokenBucket::new(4, 0, 1000).unwrap()),
+         );
+ 
+diff --git a/src/vmm/src/logger/logging.rs b/src/vmm/src/logger/logging.rs
+index 0b3cf94faaf2d17f0ebc9b5a011c4a864965f580..3009ddaa37fe318af169189e27d1895072235b15 100644
+--- a/src/vmm/src/logger/logging.rs
++++ b/src/vmm/src/logger/logging.rs
+@@ -101,7 +101,8 @@ pub struct LogFormat {
+ }
+ #[derive(Debug)]
+ pub struct LoggerConfiguration {
+-    pub target: Option<std::fs::File>,
++    // wick: an `OutFile` (`ext::fifo`).
++    pub target: Option<crate::ext::fifo::OutFile>,
+     pub filter: LogFilter,
+     pub format: LogFormat,
+ }
+@@ -374,7 +375,8 @@ mod tests {
+ 
+         // Create logger.
+         let logger = Logger(RwLock::new(LoggerConfiguration {
+-            target: Some(target),
++            // wick: an `OutFile` (`ext::fifo`).
++            target: Some(crate::ext::fifo::plain(target)),
+             filter: LogFilter {
+                 module: Some(String::from("module")),
+             },
+diff --git a/src/vmm/src/logger/metrics.rs b/src/vmm/src/logger/metrics.rs
+index 72a27eee705cb412543434ad42ff74f93fe6e7c5..aba032d789cb990d068dd58354e26b3f91188f1c 100644
+--- a/src/vmm/src/logger/metrics.rs
++++ b/src/vmm/src/logger/metrics.rs
+@@ -1116,13 +1116,15 @@ mod tests {
+         assert!(res.is_ok() && !res.unwrap());
+ 
+         let f = TempFile::new().expect("Failed to create temporary metrics file");
+-        m.init(LineWriter::new(f.into_file())).unwrap();
++        // wick: an `OutFile` (`ext::fifo`).
++        m.init(LineWriter::new(crate::ext::fifo::plain(f.into_file()))).unwrap();
+ 
+         m.write().unwrap();
+ 
+         let f = TempFile::new().expect("Failed to create temporary metrics file");
+ 
+-        m.init(LineWriter::new(f.into_file())).unwrap_err();
++        // wick: an `OutFile` (`ext::fifo`).
++        m.init(LineWriter::new(crate::ext::fifo::plain(f.into_file()))).unwrap_err();
+     }
+ 
+     #[test]
+diff --git a/src/vmm/src/logger/mod.rs b/src/vmm/src/logger/mod.rs
+index df71f408db809edae5ee1d58c822386d2e37fb5c..6ea1139480e41b4fcebe6153b69f9e17a504d069 100644
+--- a/src/vmm/src/logger/mod.rs
++++ b/src/vmm/src/logger/mod.rs
+@@ -29,7 +29,8 @@ pub use metrics::{
+ use utils::time::{ClockType, get_time_us};
+ 
+ /// Alias for `std::io::LineWriter<std::fs::File>`.
+-pub type FcLineWriter = std::io::LineWriter<std::fs::File>;
++// wick: an `OutFile` (`ext::fifo`).
++pub type FcLineWriter = std::io::LineWriter<crate::ext::fifo::OutFile>;
+ 
+ /// Prefix to be used in log lines for functions/modules in Firecracker
+ /// that are not generally available.
+diff --git a/src/vmm/src/nitro_enclave/serial_console.rs b/src/vmm/src/nitro_enclave/serial_console.rs
+index 1db4f31ff0acbbb65306184e94bb98774e1e4242..5d27c6e8798149124151b4646a11bedefa0a2afd 100644
+--- a/src/vmm/src/nitro_enclave/serial_console.rs
++++ b/src/vmm/src/nitro_enclave/serial_console.rs
+@@ -30,7 +30,8 @@ const SERIAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+ 
+ /// Sink for serial data.
+ enum SerialOutInner {
+-    File(std::fs::File),
++    // wick: an `OutFile` (`ext::fifo`).
++    File(crate::ext::fifo::OutFile),
+     Stdout(io::Stdout),
+     #[cfg(test)]
+     Test(PartialSink),
+diff --git a/src/vmm/src/signal_handler.rs b/src/vmm/src/signal_handler.rs
+index b123031161ac5137b9bbeb6408d18df78cd9e9c2..54dbc9d8d87d228befc9f67c6ecc336f57d02b4e 100644
+--- a/src/vmm/src/signal_handler.rs
++++ b/src/vmm/src/signal_handler.rs
+@@ -24,6 +24,8 @@ fn exit_with_code(exit_code: FcExitCode) {
+     if let Err(err) = METRICS.write() {
+         error_unrestricted!("Failed to write metrics while stopping: {}", err);
+     }
++    // wick: what waits for a FIFO's reader goes into the FIFO (`ext::fifo`).
++    crate::ext::fifo::drain();
+     // SAFETY: Safe because we're terminating the process anyway.
+     unsafe { libc::_exit(exit_code as i32) };
+ }
+diff --git a/src/vmm/src/utils/mod.rs b/src/vmm/src/utils/mod.rs
+index decf9d1823decbd65ee2b923955b1f6a7bfbbfd5..392caeb773b2d48c8a5b2cfd84fc11d580a51e1e 100644
+--- a/src/vmm/src/utils/mod.rs
++++ b/src/vmm/src/utils/mod.rs
+@@ -8,7 +8,7 @@ pub mod net;
+ /// Module with external libc functions
+ pub mod signal;
+ 
+-use std::fs::{File, OpenOptions};
++use std::fs::OpenOptions;
+ use std::num::Wrapping;
+ #[cfg(not(windows))]
+ use std::os::unix::fs::OpenOptionsExt;
+@@ -101,7 +101,8 @@ macro_rules! align_down {
+ /// if nobody is consuming the message. Otherwise opening the FIFO with only WRITE and O_NONBLOCK
+ /// will fail with ENXIO if there is no readier already attached to it.
+ /// NOTE: writing to a pipe will start failing when reaching 64K of unconsumed content.
+-pub fn open_file_nonblock(path: &Path) -> Result<File, std::io::Error> {
++// wick: an `OutFile`, so that a FIFO holds 64K on every host (`ext::fifo`).
++pub fn open_file_nonblock(path: &Path) -> Result<crate::ext::fifo::OutFile, std::io::Error> {
+     // wick: Windows cannot open non-blocking; the file is made non-blocking
+     // once open (a pipe gets `PIPE_NOWAIT`; files never block).
+     #[cfg(windows)]
+@@ -119,12 +120,17 @@ pub fn open_file_nonblock(path: &Path) -> Result<File, std::io::Error> {
+         return Ok(file);
+     }
+     #[cfg(not(windows))]
+-    OpenOptions::new()
++    let file = OpenOptions::new()
+         .custom_flags(O_NONBLOCK)
+         .create(true)
+         .read(true)
+         .write(true)
+-        .open(path)
++        .open(path)?;
++    // wick: macOS's FIFO buffer is 8K: what does not fit waits in the process.
++    #[cfg(target_os = "macos")]
++    return crate::ext::fifo::OutFile::opened(file, path);
++    #[cfg(not(any(windows, target_os = "macos")))]
++    Ok(file)
+ }
+ 
+ /// Simple compact version type encoded as `major << 24 | minor << 16 | patch`

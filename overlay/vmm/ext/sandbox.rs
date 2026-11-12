@@ -1219,7 +1219,9 @@ mod macos {
                 return;
             }
             // The waiter cannot be woken: exit as upstream's handler would,
-            // without its log line and metrics.
+            // without its log line and metrics, but with what waits for a
+            // FIFO's reader in the FIFO.
+            crate::ext::fifo::drain();
             // SAFETY: ends the process.
             unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) };
         }
@@ -1227,6 +1229,7 @@ mod macos {
         // handler here, as without the waiter.
         match SIGSYS_HANDLER.load(Ordering::Acquire) {
             0 => {
+                crate::ext::fifo::drain();
                 // SAFETY: ends the process.
                 unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) }
             }
@@ -2508,6 +2511,32 @@ mod macos {
             assert!(!run.stdout.contains(FAULT_METRIC), "{}", run.text());
         }
 
+        // That exit (forward_sigsys's _exit, the waiter not woken) drains
+        // a FIFO's overflow first: a reader of the log or metrics FIFO gets
+        // all Firecracker wrote, as Linux's FIFO holds it (ext::fifo).
+        #[test]
+        fn test_a_sigsys_exit_drains_a_fifos_overflow() {
+            use std::time::{Duration, Instant};
+
+            use crate::ext::fifo::tests::{fifo, lines, read_exactly, reader};
+            let (_dir, path) = fifo("sigsys");
+            let r = reader(&path);
+            let written = path.with_extension("written");
+            let reading = std::thread::spawn(move || {
+                // Not before the child filled the FIFO and its overflow: a
+                // reader from the start would let every write into the FIFO.
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !written.exists() {
+                    assert!(Instant::now() < deadline, "the child did not fill the FIFO");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                read_exactly(&r, 30000)
+            });
+            let run = sigsys_run(&format!("brokenpipe-fifo={}", path.display()), Some(Duration::ZERO), Duration::from_secs(20));
+            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
+            assert!(reading.join().unwrap() == lines(0..300), "the lines came back otherwise: {}", run.text());
+        }
+
         // If the waiter cannot be woken (its pipe broken), the signal's
         // handler exits 148 at once, without upstream's handler work.
         #[test]
@@ -2741,7 +2770,26 @@ mod macos {
             // Logs (with no target) and metrics go to standard output.
             // SAFETY: a new descriptor of standard output, owned here.
             let out = unsafe { std::fs::File::from_raw_fd(libc::dup(1)) };
-            METRICS.init(std::io::LineWriter::new(out)).unwrap();
+            METRICS.init(std::io::LineWriter::new(crate::ext::fifo::plain(out))).unwrap();
+            // "<case>-fifo=<path>": 300 lines into that FIFO first, the
+            // overflow beyond its own buffer held with the relay stopped (only
+            // the exit's drain moves it), then <path>.written made; after the
+            // sandbox, the reader's first bytes awaited.
+            let (case, fifo) = match case.split_once("-fifo=") {
+                Some((case, path)) => {
+                    use std::io::Write;
+                    let path = std::path::Path::new(path);
+                    let out = crate::utils::open_file_nonblock(path).unwrap();
+                    let mut w = &out;
+                    for i in 0..300 {
+                        w.write_all(&crate::ext::fifo::tests::line(i)).unwrap();
+                    }
+                    assert!(out.pause_relay() > 0, "nothing in the overflow");
+                    std::fs::write(path.with_extension("written"), b"").unwrap();
+                    (case, Some(out))
+                }
+                None => (case, None),
+            };
             if case == "panic" {
                 // Upstream's hook (firecracker/src/main.rs), with the abort
                 // of its panic = "abort".
@@ -2761,6 +2809,9 @@ mod macos {
                 // SAFETY: the read end, made just above.
                 unsafe { libc::close(r) };
                 WAITER_PIPE.store(w, Ordering::Release);
+            }
+            if let Some(out) = &fifo {
+                out.wait_reader();
             }
             let panics = case == "panic";
             let free = case == "free";

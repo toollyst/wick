@@ -44,3 +44,4 @@
 0042-windows-a-read-only-drive-syncs-as-fsync-on-Linux.patch
 0043-windows-the-dirty-dump-tests-write-in-hole-units-as-.patch
 0044-windows-the-compatibility-kvm-ioctls-logs-through-Fi.patch
+0045-macos-a-FIFO-for-the-log-metrics-or-serial-output-ho.patch
