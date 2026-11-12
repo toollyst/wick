@@ -69,9 +69,10 @@ _SYSTEM = _system_dir_device()
 class MemoryMap:
     """What psutil's memory_maps(grouped=False) gives on Linux, for one mapping."""
 
-    def __init__(self, handle, path, addr, size, committed, image):
+    def __init__(self, handle, path, addr, size, committed, image, kind=0):
         self.path, self.addr, self.size = path, addr, size
         self._handle, self._committed, self._image = handle, committed, image
+        self.kind = kind  # MEM_PRIVATE, MEM_MAPPED or MEM_IMAGE
         self._rss = None
 
     @property
@@ -143,7 +144,7 @@ def memory_maps(self, grouped=True):
         path = ""
         if _psapi.GetMappedFileNameW(handle, ctypes.c_void_p(alloc), name, 1024):
             path = name.value
-        out.append(MemoryMap(handle, path, alloc, end - alloc, committed, kind == MEM_IMAGE))
+        out.append(MemoryMap(handle, path, alloc, end - alloc, committed, kind == MEM_IMAGE, kind))
     return _Maps(handle, out)
 
 
@@ -161,6 +162,40 @@ def resident_kib(pid):
         total += m.rss
         m.path = system
     return total // 1024
+
+
+MEM_PRIVATE, MEM_MAPPED = 0x20000, 0x40000
+
+
+def proc_status(pid):
+    """Linux's /proc/<pid>/status, the fields upstream's tests read, from the
+    process's mappings: RssAnon is resident private memory, RssShmem shared
+    memory no file backs (a memfd), RssFile what images and files back. A
+    Windows process has no seccomp mode or PID namespace to show."""
+    p = psutil.Process(pid)
+    anon = shmem = files = 0
+    for m in memory_maps(p, grouped=False):
+        system, m.path = m.path, ""  # count the system's files too, as Linux does
+        rss = m.rss
+        m.path = system
+        if m.kind == MEM_PRIVATE:
+            anon += rss
+        elif m.kind == MEM_MAPPED and not system:
+            shmem += rss
+        else:
+            files += rss
+    name = p.name().removesuffix(".exe")
+    kib = lambda n: f"{n // 1024} kB"  # noqa: E731
+    return "".join([
+        f"Name:\t{name}\n",
+        f"Pid:\t{pid}\n",
+        f"PPid:\t{p.ppid()}\n",
+        f"VmRSS:\t{kib(anon + shmem + files)}\n",
+        f"RssAnon:\t{kib(anon)}\n",
+        f"RssFile:\t{kib(files)}\n",
+        f"RssShmem:\t{kib(shmem)}\n",
+        f"Threads:\t{p.num_threads()}\n",
+    ])
 
 
 def install():

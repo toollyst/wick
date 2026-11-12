@@ -82,6 +82,17 @@ impossible integration_tests/security/test_jail.py::test_cgroups_custom_parent
 impossible integration_tests/security/test_jail.py::test_node_cgroups
 impossible integration_tests/security/test_jail.py::test_cgroups_without_numa
 impossible integration_tests/security/test_jail.py::test_v1_default_cgroups
+impossible integration_tests/security/test_jail.py::test_cgroups_parent_cgroup_but_no_cgroup
+impossible integration_tests/security/test_jail.py::test_cgroupsv2_written_only_once
+
+# Bind mounts into the jail (mount --bind of the kernel and rootfs) and
+# their propagation: Windows has no bind mounts; a jail's files are linked
+# into its directory.
+impossible integration_tests/security/test_jail.py::test_jailer_bind_mount_propagation
+
+# A 512 MiB tmpfs mounted for the snapshot, to make it run out of space:
+# Windows mounts no tmpfs of a size.
+impossible integration_tests/functional/test_snapshot_not_losing_dirty_pages.py::test_diff_snapshot_works_after_error
 
 # --resource-limit fsize= and no-file=, and reading them back with prlimit:
 # Windows cannot limit the size of the files a process writes or the number

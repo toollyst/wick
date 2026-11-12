@@ -211,6 +211,19 @@ def e2fsprogs(tool, args):
     return out.returncode
 
 
+def procstatus(args):
+    """`cat /proc/<pid>/status` for a Windows process (wick_windows_mem)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import wick_windows_mem  # pylint: disable=import-outside-toplevel
+
+    try:
+        sys.stdout.write(wick_windows_mem.proc_status(int(args[0])))
+    except psutil.Error:
+        print(f"cat: /proc/{args[0]}/status: No such file or directory", file=sys.stderr)
+        return 1
+    return 0
+
+
 TOOLS = ("ps", "pgrep", "pidof", "dmesg", "socat", *E2FSPROGS)
 
 
@@ -220,7 +233,8 @@ def main():
     sys.stderr.reconfigure(newline="\n", encoding="utf-8")
     if tool in E2FSPROGS:
         return e2fsprogs(tool, args)
-    return {"ps": ps, "pgrep": pgrep, "pidof": pidof, "dmesg": dmesg, "socat": socat}[tool](args)
+    return {"ps": ps, "pgrep": pgrep, "pidof": pidof, "dmesg": dmesg, "socat": socat,
+            "procstatus": procstatus}[tool](args)
 
 
 if __name__ == "__main__":

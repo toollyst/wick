@@ -786,16 +786,11 @@ fn host_cpuid_entries() -> Vec<kvm_bindings::kvm_cpuid_entry2> {
     const SIGNIFICANT_INDEX: u32 = kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
     for function in 0..=max_std {
         match function {
-            // Leaves with meaningful sub-leaves.
-            0x4 => {
-                for index in 0..8 {
-                    let r = __cpuid_count(function, index);
-                    if r.eax & 0x1f == 0 {
-                        break;
-                    }
-                    push(function, index, SIGNIFICANT_INDEX);
-                }
-            }
+            // Leaves with meaningful sub-leaves. The caches, as KVM lists
+            // them (kvm/cpuid.c): sub-leaf 0 always, then each next one while
+            // the one before described a cache, the terminating null one
+            // included (an AMD host's leaf 4 is that one alone).
+            0x4 => cache_subleaves(&mut push, function),
             0x7 => {
                 let max_sub = __cpuid_count(0x7, 0).eax;
                 for index in 0..=max_sub {
@@ -824,9 +819,26 @@ fn host_cpuid_entries() -> Vec<kvm_bindings::kvm_cpuid_entry2> {
         }
     }
     for function in 0x8000_0000..=max_ext {
-        push(function, 0, 0);
+        if function == 0x8000_001d {
+            // AMD's caches, listed as leaf 4.
+            cache_subleaves(&mut push, function);
+        } else {
+            push(function, 0, 0);
+        }
     }
     out
+}
+
+/// KVM's cache leaves (4, 0x8000001D): sub-leaf 0, then the next while the
+/// one before has a cache type (EAX[4:0]).
+fn cache_subleaves(push: &mut impl FnMut(u32, u32, u32), function: u32) {
+    use core::arch::x86_64::__cpuid_count;
+    for index in 0..64 {
+        push(function, index, kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX);
+        if __cpuid_count(function, index).eax & 0x1f == 0 {
+            break;
+        }
+    }
 }
 
 // ---- MSRs ----
@@ -901,10 +913,14 @@ pub(crate) fn set_msrs(part: WHV_PARTITION_HANDLE, vp: u32, msrs: &Msrs) -> Resu
 
 /// The MSR indices this backend can get and set.
 pub(crate) fn msr_index_list() -> Result<MsrList> {
+    // As KVM's KVM_GET_MSR_INDEX_LIST, without EFER, FS_BASE and GS_BASE,
+    // which are kvm_sregs' (a snapshot saves them there); listed, they were
+    // dumped by cpu-template-helper as MSRs of the template, at their value
+    // before the guest ran.
     let indices: Vec<u32> = [
         0x1b, 0x10, 0x174, 0x175, 0x176, 0x277,
-        0xc000_0080, 0xc000_0081, 0xc000_0082, 0xc000_0083, 0xc000_0084,
-        0xc000_0100, 0xc000_0101, 0xc000_0102,
+        0xc000_0081, 0xc000_0082, 0xc000_0083, 0xc000_0084,
+        0xc000_0102,
         // kvm-clock (pvclock).
         super::pvclock::MSR_WALL_CLOCK, super::pvclock::MSR_SYSTEM_TIME,
         // IA32_TSC_DEADLINE (tscdeadline).
