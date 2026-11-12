@@ -158,7 +158,7 @@ multi-tenant workloads on macOS or Windows.
 | Host OS | upstream's kernel support | 🟡 macOS 15 or later is the stated minimum. The only recorded guest runs are on macOS 27.2 (row 10). macOS 15 and 26 run only the sandbox unit tests, on CI (`test_seatbelt_skips_the_number_of_these`, job `macos-seatbelt`) | 🟡 Windows 10 1803+ and 11 are the stated range. Guests booted on Windows 11 26H2, build 26300, only (rows 4, 9). Windows 10 is not tested |
 | Hypervisor | KVM, `/dev/kvm` | 🟡 Hypervisor.framework. The binary needs the hypervisor entitlement, an ad-hoc signature, which `tools/macos/run.sh` adds (`boot-test boot`) | 🟡 Windows Hypervisor Platform, turned on once by an administrator (`boot-test.ps1 boot`) |
 | Guest architecture | x86_64, aarch64 | 🟡 aarch64 only. x86_64 is impossible: Apple silicon has no x86 virtualisation (row 11) | 🟡 x86_64 only. aarch64 is not done yet (row 11, roadmap M6) |
-| Privileges | root for the jailer | 🟡 root for the jailer (`jailer-test jail`) and for vmnet (`boot-test vmnet`) | 🟡 the jailer runs unelevated (`jailer-test.ps1 isolation`). `--netns` needs elevation (row 6). Huge pages without the jailer need "Lock pages in memory" (row 10) |
+| Privileges | root for the jailer | 🟡 root for the jailer (`jailer-test jail`) and for vmnet in bridged mode or before macOS 26 (`boot-test vmnet`) | 🟡 the jailer runs unelevated (`jailer-test.ps1 isolation`). `--netns` needs elevation (row 6). Huge pages without the jailer need "Lock pages in memory" (row 10) |
 
 ## API endpoints
 
@@ -240,7 +240,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | Clock source, VMGenID, vmclock across a restore | 🟢 `test_clocksource_snapshot_restore`, `test_vmgenid`, `test_snapshot_update` | 🟢 `test_clocksource_snapshot_restore`, `test_vmgenid`, `test_snapshot_update` |
 | `sync_snapshot_files`, dirty pages in a full snapshot | 🟢 `test_sync_snapshot_files`, `test_dirty_pages_after_full_snapshot` | 🟢 `test_sync_snapshot_files`, `test_dirty_pages_after_full_snapshot` |
 | Snapshot to a directory the jail cannot write | ❔ the test needs root, and the run was as the user (`test_negative_snapshot_permissions` [root]) | 🟡 refused, with Windows' error text (`test_negative_snapshot_permissions` [error-text]) |
-| Diff snapshot after an out-of-space error | ❔ the test mounts a tmpfs, which macOS cannot (`test_diff_snapshot_works_after_error` [impossible]) | ❔ the same (`test_diff_snapshot_works_after_error` [impossible]) |
+| Diff snapshot after an out-of-space error | ❔ the test mounts a small tmpfs, which macOS does not have; the harness now gives an APFS RAM disk in its place, not yet run with the test (`test_diff_snapshot_works_after_error` [impossible]) | ❔ the test mounts a tmpfs, which Windows does not have (`test_diff_snapshot_works_after_error` [impossible]) |
 | aarch64 physical counter reset; `snapshot-editor edit-vmstate remove-regs` | 🟡 `remove-regs` takes `MIDR_EL1` out of a snapshot, which then restores (`test_remove_regs`). The guest has no physical counter to reset: Hypervisor.framework traps a read of `CNTPCT_EL0` and the backend makes it undefined, so no host count reaches the guest (`hvf/vcpu.rs`). But the backend offers no `KVM_CAP_COUNTER_OFFSET` and no `CNTPCT_EL0` register, so the snapshot has none, and `test_physical_counter_reset_aarch64` fails: "Did not find CNTPCT_EL0 register in snapshot". Run on macOS 27.2; no Linux aarch64 run exists to compare | ⚪ aarch64 only |
 | A snapshot restored on another host OS | ❔ untested | ❔ a state file made by wick on macOS (aarch64, by a build a few commits before this row) is refused at the load with upstream's error, "An error occurred during bitcode serialization", and Firecracker then exits as after any failed load (`boot-test.ps1 foreign-snapshot`, no guest); the same upstream decoding as on Linux, the error text measured on Windows only. The state file with the aarch64 magic or a newer version: written, not yet run on a WHP machine (`boot-test.ps1 tools`). A Linux x86_64 snapshot restored here: untested |
 
@@ -258,7 +258,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | Rate limiter | 🟢 `boot-test devices`, `test_rate_limiters_api_config` | 🟢 `boot-test.ps1 devices`, `test_rate_limiters_api_config` |
 | Boot by `partuuid` | 🟢 `test_partuuid_boot` (a drive and a vhost-user drive; the harness's `sfdisk` and `blkid` write and read the DOS label as util-linux does), `test_partuuid_update` | 🟢 `test_partuuid_boot` |
 | A file-backed drive changed and rescanned | 🟢 `test_rescan_file` | 🟢 `test_rescan_file` |
-| A drive on a host block device | ❔ the test harness lacks `losetup` (`test_rescan_dev` [bug]) | 🔴 impossible: no device nodes or loop devices (`test_rescan_dev` [impossible]) |
+| A drive on a host block device | ❔ a drive on a block device has the device's size (patches/0040, `test_block_device_size`), and the harness now gives `losetup` (a raw disk image attached with hdiutil); `test_rescan_dev` [bug] has not run since | 🔴 impossible: no device nodes or loop devices (`test_rescan_dev` [impossible]) |
 | The drive's serial (`VIRTIO_BLK_GET_ID`) | 🟢 upstream's rule: the guest's `/sys/block/vdX/serial` is the file's `st_dev`, `st_rdev` and `st_ino` in decimal, cut to 20 bytes, distinct per drive (`boot-test block`) | 🟡 20 base-32 digits of the file's volume serial number and file index, distinct per file (`test_disk_image_id_is_per_file_and_stable`); the guest's `/sys/block/vdX/serial`: written, not yet run on a WHP machine (`boot-test.ps1 block`) |
 | Drive hotplug | 🟢 `test_hotplug_block` | 🟡 errors in Windows' text (`test_hotplug_block` [error-text]) |
 | vhost-user-blk | 🟢 `boot-test vhost-user`, `jailer-test vhost-user`, `test_vhost_user_block_read_write`; on huge page memory too (`boot-test hugepages`, `jailer-test hugepages`) | 🟡 `boot-test.ps1 vhost-user`, `jailer-test.ps1 vhost-user`, `test_vhost_user_block_read_write`. Not with huge pages: `MFD_HUGETLB` memfds fail with `EINVAL` (row 10, not done yet) |
@@ -271,7 +271,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | MTU advertised to the guest | 🟢 `test_tap_mtu_advertised_to_guest` | 🟢 `test_tap_mtu_advertised_to_guest` |
 | Checksum, TSO, UFO offloads | 🟡 done in user space, as TUN's header (fuzz `vnet_offload`); the upstream test needs a host program the harness cannot run (`test_tap_offload` [bug]) | 🟡 the same code; untested end to end: the test needs a host program the harness cannot run yet (`test_tap_offload` [bug]) |
 | Guest changes its MAC | ❔ the test needs a host program in the network (`test_net_change_mac_address` [bug]) | ❔ the same (`test_net_change_mac_address` [bug]) |
-| High ingress traffic, transmit queue length | ❔ the harness lacks a TAP's queue length (`test_high_ingress_traffic` [bug]) | ❔ the harness lacks a host program sending UDP to the guest and a TAP's queue length (`test_high_ingress_traffic` [bug]) |
+| High ingress traffic, transmit queue length | ❔ the harness now gives a TAP's queue length (the VMM endpoint's buffer, the frames dropped past it counted), iperf3 and host programs in a test's network; not yet run with the test (`test_high_ingress_traffic` [bug]) | ❔ the harness lacks a host program sending UDP to the guest and a TAP's queue length (`test_high_ingress_traffic` [bug]) |
 | Multi-queue TAP refused | ⚪ no TAP devices (`test_multi_queue_unsupported` [impossible]) | ⚪ no TAP devices (`test_multi_queue_unsupported` [impossible]) |
 | rx/tx rate limiters | 🟢 the API takes them (`test_rate_limiters_api_config`); set with `PATCH` on a running device at 1 MiB/s, each direction runs at 0.5 to 1.25 times the limit (measured 0.99 and 1.02 MiB/s), and at three times it or more without one (`boot-test net`) | ❔ the API takes them (`test_rate_limiters_api_config`); throttling: written, not yet run on a WHP machine, as on macOS (`boot-test.ps1 net`) |
 | Net hotplug | 🟡 any free endpoint name opens, so plugging a device nobody prepared succeeds, where Linux refuses it (`test_hotplug_net` [row-6]) | 🟡 refused, as on Linux, with Windows' error (`ERROR_BUSY`, 170) (`test_hotplug_net` [error-text]) |
@@ -281,7 +281,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 
 | Feature | macOS | Windows |
 | --- | --- | --- |
-| Host to guest `CONNECT`, guest to host `<uds>_<port>`, over MMIO and PCI | 🟢 `boot-test vsock`, `boot-test pci`. Most upstream tests need `socat`, which the harness lacks (`test_vsock` [bug]) | 🟢 `boot-test.ps1 vsock`, `test_vsock` |
+| Host to guest `CONNECT`, guest to host `<uds>_<port>`, over MMIO and PCI | 🟢 `boot-test vsock`, `boot-test pci`. Most upstream tests need `socat`, which the harness now takes from Homebrew; not yet run with them (`test_vsock` [bug]) | 🟢 `boot-test.ps1 vsock`, `test_vsock` |
 | Transport reset on snapshot, in-flight data | ❔ the tests pin threads to CPUs, and macOS has no CPU affinity (`test_vsock_transport_reset_h2g` [impossible]) | 🟢 `test_vsock_transport_reset_h2g`, `test_snapshot_restore_with_inflight_vsock_tx` |
 | A peer that closes with data in flight | 🟡 no SIGPIPE is counted where Linux counts one (`test_vsock_epipe` [bug]) | 🟢 `test_vsock_epipe` |
 
@@ -345,7 +345,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 ## Jailer flags
 
 On Linux the jailer uses namespaces, a chroot and cgroups. On macOS and Windows, upstream's jailer runs with each
-Linux primitive behind a host backend. On macOS the jailer needs root, as on Linux; on Windows it runs unelevated.
+Linux primitive behind a host backend. On macOS the jailer needs root, as on Linux; on Windows it runs unelevated, but for `--netns` (row 6).
 
 | Flag | macOS | Windows |
 | --- | --- | --- |
