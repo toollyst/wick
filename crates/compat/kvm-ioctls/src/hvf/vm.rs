@@ -10,7 +10,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kvm_bindings::{
     KVM_ARM_TARGET_GENERIC_V8, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI,
@@ -24,6 +24,7 @@ use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 use super::device::{DeviceFd, DeviceKind};
 use super::ffi::*;
 use super::vcpu::{VcpuFd, VcpuShared};
+use super::wait::{Ended, Waiter};
 use super::{Cap, Handle, IoEventAddress, Result, cap, err};
 
 /// First SPI interrupt id; KVM maps legacy GSI `n` to `n + 32`.
@@ -174,6 +175,11 @@ pub(crate) struct VmInner {
     torn_down: AtomicBool,
     pub(crate) vcpus: Mutex<Vec<Arc<VcpuShared>>>,
     pub(crate) gic: Mutex<GicConfig>,
+    /// What the virtual timer thread waits on ([`vtimer_thread`]).
+    vtimer_waiter: Arc<Waiter>,
+    /// Tests: the rounds the virtual timer thread made.
+    #[cfg(test)]
+    vtimer_rounds: AtomicU64,
     /// Value of `mach_absolute_time()` at which the guest counter reads 0.
     /// One for the VM, as KVM's: writing a vCPU's `TIMER_CNT` sets it for all.
     pub(crate) vtimer_offset: AtomicU64,
@@ -699,6 +705,7 @@ impl VmInner {
         }
         self.stop.store(true, Ordering::Release);
         let _ = self.stop_evt.write(1);
+        self.vtimer_waiter.wake();
         for (_, slot) in self.memory.lock().unwrap().slots.drain() {
             // SAFETY: unmapping a range we mapped.
             unsafe { hv_vm_unmap(slot.ipa, slot.size as usize) };
@@ -745,6 +752,7 @@ impl Drop for VmFd {
         if Arc::strong_count(&self.inner) == 1 {
             self.inner.stop.store(true, Ordering::Release);
             let _ = self.inner.stop_evt.write(1);
+            self.inner.vtimer_waiter.wake();
             for handle in self.threads.drain(..) {
                 let _ = handle.join();
             }
@@ -808,6 +816,9 @@ impl VmFd {
             torn_down: AtomicBool::new(false),
             vcpus: Mutex::new(Vec::new()),
             gic: Mutex::new(GicConfig::default()),
+            vtimer_waiter: Arc::new(Waiter::new().map_err(io_err)?),
+            #[cfg(test)]
+            vtimer_rounds: AtomicU64::new(0),
             // SAFETY: plain call.
             vtimer_offset: AtomicU64::new(unsafe { mach_absolute_time() }),
             vtimer_gen: AtomicU64::new(0),
@@ -838,10 +849,11 @@ impl VmFd {
                 .map_err(io_err)?,
         );
         let weak = Arc::downgrade(&vm.inner);
+        let waiter = vm.inner.vtimer_waiter.clone();
         vm.threads.push(
             thread::Builder::new()
                 .name("wick_hvf_vtimer".into())
-                .spawn(move || vtimer_thread(weak))
+                .spawn(move || vtimer_thread(&waiter, weak))
                 .map_err(io_err)?,
         );
         *current = Arc::downgrade(&vm.inner);
@@ -1180,18 +1192,48 @@ impl AsRawFd for VmFd {
     }
 }
 
+impl VmInner {
+    /// A vCPU masked its virtual timer: the virtual timer thread starts its
+    /// rounds.
+    pub(crate) fn vtimer_masked(&self) {
+        self.vtimer_waiter.wake();
+    }
+}
+
+/// How often the virtual timer thread pokes vCPUs whose timer is masked.
+const VTIMER_ROUND: Duration = Duration::from_millis(1);
+
 /// Forces an exit from vCPUs whose virtual timer is masked, so that the mask is
-/// re-evaluated (the guest's EOI of the timer interrupt is not trapped).
-fn vtimer_thread(vm: Weak<VmInner>) {
+/// re-evaluated (the guest's EOI of the timer interrupt is not trapped): a
+/// round every [`VTIMER_ROUND`] while a vCPU's timer is masked, on a timer
+/// macOS does not coalesce ([`Waiter`]). While none is, it waits untimed for
+/// a vCPU to mask one ([`VmInner::vtimer_masked`]) and makes no wakeup.
+/// With Hypervisor.framework's GIC, which Firecracker always makes, the
+/// framework delivers the timer itself and no `VTIMER_ACTIVATED` exit comes
+/// (measured: none from a guest whose timer fired for 100 ms), so no timer is
+/// masked and the thread makes no round.
+fn vtimer_thread(waiter: &Waiter, vm: Weak<VmInner>) {
+    // The next round's time; `None` while no vCPU's timer is masked.
+    let mut next: Option<Instant> = None;
     loop {
-        thread::sleep(Duration::from_millis(1));
+        let ended = waiter.wait(next.map(|n| n.saturating_duration_since(Instant::now())));
         let Some(vm) = vm.upgrade() else { return };
         if vm.stop.load(Ordering::Acquire) {
             return;
         }
-        for vcpu in vm.vcpus.lock().unwrap().iter() {
-            vcpu.poke_if_vtimer_masked();
+        if ended != Ended::Due {
+            // A vCPU masked its timer (or a signal came): a round within
+            // VTIMER_ROUND, not sooner than one already due.
+            next.get_or_insert_with(|| Instant::now() + VTIMER_ROUND);
+            continue;
         }
+        #[cfg(test)]
+        vm.vtimer_rounds.fetch_add(1, Ordering::Relaxed);
+        let mut masked = false;
+        for vcpu in vm.vcpus.lock().unwrap().iter() {
+            masked |= vcpu.poke_if_vtimer_masked();
+        }
+        next = masked.then(|| Instant::now() + VTIMER_ROUND);
     }
 }
 
@@ -2133,5 +2175,74 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(seen, PSCI_VERSION_0_2);
+    }
+
+    /// Sets this process's latency QoS to `LATENCY_QOS_TIER_3`
+    /// (`TASK_BASE_LATENCY_QOS_POLICY`), with which macOS coalesces its
+    /// timers by far more than the 1 ms of a foreground process (XNU
+    /// osfmk/kern/timer_call.c `tcoal_qos_adjust`; measured: a 20 ms sleep
+    /// ends a median 130 ms late, a `NOTE_CRITICAL` timer 30 us). Unlike a
+    /// background policy it leaves CPU scheduling as it is, so a test sees
+    /// timer coalescing alone. A VM test runs in a process of its own
+    /// (tools/macos/test.sh; Hypervisor.framework has one VM per process).
+    fn coalescing_tier() {
+        unsafe extern "C" {
+            fn task_policy_set(task: libc::mach_port_t, flavor: u32, info: *const i32, count: u32) -> i32;
+        }
+        const TASK_BASE_LATENCY_QOS_POLICY: u32 = 10;
+        const LATENCY_QOS_TIER_3: i32 = (0xff << 16) | 4;
+        // struct task_qos_policy: the latency tier, the throughput tier
+        // (THROUGHPUT_QOS_TIER_UNSPECIFIED).
+        let policy = [LATENCY_QOS_TIER_3, 0];
+        #[allow(deprecated)]
+        // SAFETY: this task's port and a task_qos_policy of two integers.
+        let r = unsafe { task_policy_set(libc::mach_task_self(), TASK_BASE_LATENCY_QOS_POLICY, policy.as_ptr(), 2) };
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_the_vtimer_thread_runs_only_while_a_timer_is_masked() {
+        // The thread that pokes vCPUs whose virtual timer is masked (the
+        // guest's EOI is not trapped) makes no round while none is: an idle
+        // VM costs no wakeup there (KVM has no such thread). While one is
+        // masked, in a process whose timers macOS coalesces
+        // ([`coalescing_tier`]), its rounds come every 1 ms, not when macOS
+        // coalesces them: at least half the rounds of a 1 ms NOTE_CRITICAL
+        // kqueue timer counted over the same 200 ms (the load of the machine
+        // then); a coalesced 1 ms wait would make a few. Then none again
+        // once the timer is unmasked. With Hypervisor.framework's GIC, as
+        // Firecracker makes it, a vCPU's timer is never masked (no
+        // VTIMER_ACTIVATED exit comes; measured), so the vCPU is marked
+        // masked as such an exit marks it.
+        const WINDOW: Duration = Duration::from_millis(200);
+        coalescing_tier();
+        let vm = Kvm::new().unwrap().create_vm().unwrap();
+        let _vcpu = vm.create_vcpu(0).unwrap();
+        let shared = vm.inner.vcpus.lock().unwrap()[0].clone();
+        let rounds = || vm.inner.vtimer_rounds.load(Ordering::Relaxed);
+        let idle = |what: &str| {
+            std::thread::sleep(Duration::from_millis(50));
+            let before = rounds();
+            std::thread::sleep(WINDOW);
+            let n = rounds() - before;
+            assert_eq!(n, 0, "the thread made {n} rounds in {WINDOW:?} with no timer masked ({what})");
+        };
+        idle("before");
+
+        shared.set_vtimer_masked(&vm.inner, true);
+        let control = super::super::wait::Waiter::new().unwrap();
+        let before = rounds();
+        let start = std::time::Instant::now();
+        let mut controlled = 0;
+        while start.elapsed() < WINDOW {
+            assert_eq!(control.wait(Some(Duration::from_millis(1))), super::super::wait::Ended::Due);
+            controlled += 1;
+        }
+        let masked = rounds() - before;
+        println!("rounds in {WINDOW:?} while masked: {masked}, the control's {controlled}");
+        assert!(2 * masked >= controlled, "{masked} rounds while masked, the control {controlled}");
+
+        shared.set_vtimer_masked(&vm.inner, false);
+        idle("after");
     }
 }

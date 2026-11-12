@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::os::raw::c_int;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use kvm_bindings::{
     KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, KVM_ARM_VCPU_PTRAUTH_ADDRESS, KVM_ARM_VCPU_PTRAUTH_GENERIC, KVM_MP_STATE_RUNNABLE, KVM_MP_STATE_STOPPED,
@@ -25,6 +25,7 @@ use super::gic::{CpuReg, GicCpu};
 use super::idregs;
 use super::regs::{self, Reg, reg_size};
 use super::vm::VmInner;
+use super::wait::{Ended, Waiter};
 use super::{Error, Handle, Result, VcpuExit, err};
 
 const NOT_CREATED: u64 = u64::MAX;
@@ -82,6 +83,16 @@ struct Power {
     boot: Option<(u64, u64)>,
     /// Set by interrupt injection and kicks; consumed by `WFI`.
     wake: bool,
+    /// Set while `WFI` waits on the vCPU's [`Waiter`]: a change of the power
+    /// state then wakes it too ([`VcpuShared::notify`]).
+    waiting: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: run by [`VcpuShared::wait_for_wake`] on its thread once it has
+    /// decided to wait, before it waits.
+    static BEFORE_WAIT: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A `kvm_run` structure at a fixed address.
@@ -143,7 +154,14 @@ pub(crate) struct VcpuShared {
     vtimer_gen: AtomicU64,
     in_run: AtomicBool,
     power: Mutex<Power>,
+    /// What a powered-off vCPU waits on ([`VcpuFd::wait_powered_on`]).
     cv: Condvar,
+    /// What `WFI` waits on: a timer macOS does not coalesce
+    /// ([`VcpuShared::wait_for_wake`]).
+    waiter: Waiter,
+    /// Tests: the times a power change woke the [`Waiter`].
+    #[cfg(test)]
+    triggers: AtomicU64,
     /// Register writes made before the Hypervisor.framework vCPU exists.
     pending: Mutex<Vec<(u64, Vec<u8>)>>,
     /// Set by `KVM_ARM_VCPU_INIT`; registers cannot be used before it.
@@ -173,6 +191,9 @@ impl VcpuShared {
             in_run: AtomicBool::new(false),
             power: Mutex::new(Power::default()),
             cv: Condvar::new(),
+            waiter: Waiter::new().map_err(|e| Error::new(e.raw_os_error().unwrap_or(libc::EIO)))?,
+            #[cfg(test)]
+            triggers: AtomicU64::new(0),
             pending: Mutex::new(Vec::new()),
             initialized: AtomicBool::new(false),
             gic: Mutex::new(GicCpu::default()),
@@ -204,8 +225,59 @@ impl VcpuShared {
 
     /// Wakes the vCPU if it waits in `WFI` or powered off.
     pub(crate) fn wake(&self) {
-        self.power.lock().unwrap().wake = true;
+        let mut power = self.power.lock().unwrap();
+        power.wake = true;
+        self.notify(power);
+    }
+
+    /// Tells the vCPU of a change made to `power`: a powered-off vCPU waits
+    /// on the condition variable, `WFI` on the [`Waiter`], which costs a
+    /// system call and is woken only while `WFI` waits on it.
+    fn notify(&self, power: MutexGuard<'_, Power>) {
+        let waiting = power.waiting;
+        drop(power);
         self.cv.notify_all();
+        if waiting {
+            #[cfg(test)]
+            self.triggers.fetch_add(1, Ordering::Relaxed);
+            self.waiter.wake();
+        }
+    }
+
+    /// `WFI`'s wait: until a wake ([`VcpuShared::wake`]: an interrupt
+    /// injected, a kick) or until `timeout` passed. Returns how long it
+    /// waited and how the wait ended, or `None` if a wake or a kick was
+    /// already there.
+    ///
+    /// No wake is lost: `waiting` is set under the power lock that a wake
+    /// takes, so a wake made after the decision to wait triggers the
+    /// [`Waiter`], whose trigger stays pending until the wait returns it,
+    /// even if it came before the wait began. A wake that comes after the
+    /// wait ended and before `waiting` is cleared leaves a trigger that ends
+    /// the next wait at once: a WFI that ends with no interrupt, which the
+    /// guest must expect, as Linux's idle loop does (it rechecks and waits
+    /// again).
+    fn wait_for_wake(&self, timeout: Duration) -> Option<(Duration, Ended)> {
+        let mut power = self.power.lock().unwrap();
+        if power.wake || self.immediate_exit().load(Ordering::Acquire) != 0 {
+            power.wake = false;
+            return None;
+        }
+        power.waiting = true;
+        drop(power);
+        #[cfg(test)]
+        BEFORE_WAIT.with(|f| {
+            if let Some(f) = f.borrow().as_ref() {
+                f();
+            }
+        });
+        let start = Instant::now();
+        let ended = self.waiter.wait(Some(timeout));
+        let waited = start.elapsed();
+        let mut power = self.power.lock().unwrap();
+        power.waiting = false;
+        power.wake = false;
+        Some((waited, ended))
     }
 
     fn cancel_run(&self) {
@@ -215,11 +287,25 @@ impl VcpuShared {
         }
     }
 
-    pub(crate) fn poke_if_vtimer_masked(&self) {
-        if self.vtimer_masked.load(Ordering::Acquire) && self.in_run.load(Ordering::Acquire) {
+    /// Tests: masks or unmasks the virtual timer as a `VTIMER_ACTIVATED`
+    /// exit and [`VcpuFd::update_vtimer`] do.
+    #[cfg(test)]
+    pub(crate) fn set_vtimer_masked(&self, vm: &VmInner, masked: bool) {
+        self.vtimer_masked.store(masked, Ordering::Release);
+        if masked {
+            vm.vtimer_masked();
+        }
+    }
+
+    /// Makes the vCPU exit if it runs with its virtual timer masked (the
+    /// exit re-evaluates the mask). Returns whether the timer is masked.
+    pub(crate) fn poke_if_vtimer_masked(&self) -> bool {
+        let masked = self.vtimer_masked.load(Ordering::Acquire);
+        if masked && self.in_run.load(Ordering::Acquire) {
             // Not in a signal handler (the vtimer thread), so it may wait.
             super::interrupting(|| self.cancel_run());
         }
+        masked
     }
 
     fn powered_off(&self) -> bool {
@@ -962,8 +1048,9 @@ impl VcpuFd {
             KVM_MP_STATE_STOPPED => true,
             _ => return err(libc::EINVAL),
         };
-        self.shared.power.lock().unwrap().off = off;
-        self.shared.cv.notify_all();
+        let mut power = self.shared.power.lock().unwrap();
+        power.off = off;
+        self.shared.notify(power);
         Ok(())
     }
 
@@ -1164,6 +1251,11 @@ impl VcpuFd {
         Ok(())
     }
 
+    /// A `WFI` exit's wait. With Hypervisor.framework's GIC, which
+    /// Firecracker always makes (upstream's `setup_irqchip`, here
+    /// `hv_gic_create`), a guest's WFI makes no exit: the framework waits in
+    /// `hv_vcpu_run` (measured: no WFI exit in 15 guest waits of 20 ms). This
+    /// is the wait of a VM without that GIC.
     fn wait_for_interrupt(&self, hv: hv_vcpu_t) -> Result<()> {
         let mut timeout = WFI_MAX_WAIT;
         let ctl = self.sys(hv, HV_SYS_REG_CNTV_CTL_EL0)?;
@@ -1179,13 +1271,16 @@ impl VcpuFd {
             }
             timeout = timeout.min(ticks_to_duration(cval - now));
         }
-        let mut power = self.shared.power.lock().unwrap();
-        if !power.wake && self.shared.immediate_exit().load(Ordering::Acquire) == 0 {
-            power = self.shared.cv.wait_timeout(power, timeout).unwrap().0;
+        if let Some((waited, _)) = self.shared.wait_for_wake(timeout) {
+            self.waited_for_interrupt(waited);
         }
-        power.wake = false;
         Ok(())
     }
+
+    /// Called with how long `WFI` (or PSCI `CPU_SUSPEND`) waited of the
+    /// guest's own accord, which steal time leaves out. Nothing uses it yet,
+    /// and with the framework's GIC it is not called ([`Self::wait_for_interrupt`]).
+    fn waited_for_interrupt(&self, _waited: Duration) {}
 
     /// Handles a call through the SMCCC conduit (PSCI, SMCCC, KVM's vendor
     /// services). Returns a system event to report, if any.
@@ -1235,8 +1330,7 @@ impl VcpuFd {
                         } else {
                             power.off = false;
                             power.boot = Some((entry, context));
-                            drop(power);
-                            target.cv.notify_all();
+                            target.notify(power);
                             PSCI_RET_SUCCESS
                         }
                     }
@@ -1411,6 +1505,7 @@ impl VcpuFd {
                         )
                     }))?;
                     self.shared.vtimer_masked.store(true, Ordering::Release);
+                    vm.vtimer_masked();
                     continue;
                 }
                 HV_EXIT_REASON_EXCEPTION => {}
@@ -1548,6 +1643,46 @@ mod tests {
         // SAFETY: `hv` belongs to this thread.
         check(unsafe { hv_vcpu_get_vtimer_offset(hv, &mut offset) }).unwrap();
         assert!(t0.wrapping_sub(offset) <= count && count <= t1.wrapping_sub(offset), "{t0} {count} {t1} {offset}");
+    }
+
+    // A wake made after WFI decided to wait and before it waits (here from
+    // the waiting thread itself, at that point) ends the wait at once.
+    #[test]
+    fn test_a_wake_between_the_decision_and_the_wait_ends_it() {
+        let (_handle, shared) = VcpuShared::new(0).unwrap();
+        let other = shared.clone();
+        BEFORE_WAIT.with(|f| *f.borrow_mut() = Some(Box::new(move || other.wake())));
+        let ended = shared.wait_for_wake(Duration::from_secs(10));
+        BEFORE_WAIT.with(|f| *f.borrow_mut() = None);
+        assert_eq!(ended.map(|(_, e)| e), Some(Ended::Woken));
+        assert_eq!(shared.triggers.load(Ordering::Relaxed), 1);
+    }
+
+    // A wake while WFI does not wait (interrupt injection's, for every vCPU)
+    // costs no system call: WFI then sees it before it waits. A wake while
+    // WFI waits ends the wait.
+    #[test]
+    fn test_a_wake_triggers_the_waiter_only_while_wfi_waits() {
+        let (_handle, shared) = VcpuShared::new(0).unwrap();
+        shared.wake();
+        shared.wake();
+        assert_eq!(shared.triggers.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.wait_for_wake(Duration::from_secs(10)), None);
+        let start = Instant::now();
+        let (_, ended) = shared.wait_for_wake(Duration::from_millis(20)).unwrap();
+        assert_eq!(ended, Ended::Due);
+        assert!(start.elapsed() >= Duration::from_millis(20));
+        let other = shared.clone();
+        let waker = std::thread::spawn(move || {
+            while !other.power.lock().unwrap().waiting {
+                std::thread::yield_now();
+            }
+            other.wake();
+        });
+        let (_, ended) = shared.wait_for_wake(Duration::from_secs(10)).unwrap();
+        waker.join().unwrap();
+        assert_eq!(ended, Ended::Woken);
+        assert_eq!(shared.triggers.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -32,6 +32,7 @@ mod idregs;
 mod regs;
 mod vcpu;
 mod vm;
+mod wait;
 
 /// Serialises vCPU creation with the calls that make interrupts pending.
 ///
