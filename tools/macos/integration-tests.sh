@@ -28,10 +28,31 @@
 # socat iperf3). A missing one stops the run before any test.
 #
 # OUT (default build/integration-tests/<time>) gets the pytest JSON report
-# (test-report.json), pytest's output (pytest.log), upstream's test_results
-# directory and the comparison (comparison.md); summary.txt ends
-# "N passed, M failed", and session-peak-kib the most the session's
-# directory held (sampled every 10 s), what the free-space check is sized by.
+# (test-report.json; upstream's per-test test_results directory beside it, in
+# OUT/test_results), pytest's output (pytest.log), the comparison
+# (comparison.md), provenance.txt (wick's and lib/firecracker's commits and
+# the Rust paths that differ from them: a run built from a dirty tree says
+# WARNING, at the start, at the head of pytest.log and summary.txt, and at
+# the end), summary.txt, which ends "N passed, M failed", and
+# session-peak-kib the most the session's directory held (sampled every
+# 10 s), what the free-space check is sized by. A test file that does not
+# import does not end the run; the comparison counts it.
+#
+# Runs may overlap, with each other and with the other test scripts: each
+# has its own session (/tmp/wit-*, whose .owner-pid keeps tools/clean.sh
+# off it while the run lives; tools/macos/integration/clean-selftest.sh) and
+# its own OUT. They share the build (cargo's lock orders two builds) and the
+# Mac's memory: one microVM per run (-n 1) when the Mac is short of it. The
+# disk images a session attaches (bin/losetup, the tmpfs of
+# test_snapshot_not_losing_dirty_pages.py) are detached when it ends, also
+# when a worker was killed (tools/macos/integration/disks-selftest.sh).
+#
+# --jailer asks for sudo once, at the start of pytest; run the script as the
+# user, not under sudo. Root's tests (the security suite, the [root] entries
+# of tools/macos/integration-test-differences.txt) in one run:
+#   tools/macos/integration-tests.sh --jailer -n 1 integration_tests/security \
+#     integration_tests/functional/test_snapshot_basic.py::test_negative_snapshot_permissions \
+#     integration_tests/functional/test_api_server.py::test_api_socket_in_use
 #
 # A run needs WICK_IT_FREE_GIB (default 20) GiB free; a selection of tests
 # that session-peak-kib shows to need less may ask for less.
@@ -93,7 +114,7 @@ echo aarch64 >"$out/arch"
 # What the run builds from: wick's and lib/firecracker's commits, and the
 # Rust sources that differ from them (another session's work in progress
 # in a shared checkout ends up in the binaries). Written to provenance.txt,
-# at the head of pytest.log and at the end of summary.txt; a dirty tree is
+# at the head of pytest.log and of summary.txt; a dirty tree is
 # a loud warning, and a run's results speak for the commits only when it
 # is clean.
 {
@@ -268,7 +289,10 @@ python3 -I "$ROOT/tools/macos/compare-integration-tests.py" "$out" ${compare[@]+
     --summary-txt "$out/summary.txt"
 compared=$?
 set -e
-cat "$out/provenance.txt" >>"$out/summary.txt"
+# summary.txt keeps its last line "N passed, M failed" (what tools/clean.sh
+# and the docs read): the provenance goes first.
+{ cat "$out/provenance.txt"; cat "$out/summary.txt" 2>/dev/null; } >"$out/summary.txt.new"
+mv "$out/summary.txt.new" "$out/summary.txt"
 if grep -q '^WARNING' "$out/provenance.txt"; then
     echo "WARNING: built from a dirty Rust tree (provenance.txt): the results are not the commits'" >&2
 fi
