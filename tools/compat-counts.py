@@ -60,7 +60,19 @@ MACOS_MODE = "user"
 # Suites a host has not run in full (docs/PORTING.md row 12, "To do"). Their
 # cells say so, rather than a 0 that would read as "no difference".
 NOT_RUN = {
-    "macOS": ("integration_tests/security/",),
+    # test_fips.py and test_nv.py have run as the user (5 passed,
+    # build/integration-tests/fips-nv, 2026-11-12).
+    "macOS": tuple(
+        f"integration_tests/security/{name}.py"
+        for name in (
+            "test_custom_seccomp",
+            "test_jail",
+            "test_sec_audit",
+            "test_seccomp",
+            "test_seccomp_validate",
+            "test_vulnerabilities",
+        )
+    ),
     "Windows": (),
 }
 
