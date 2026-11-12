@@ -194,8 +194,9 @@ jailed Firecracker is not root, which vmnet's bridged mode (and every mode befor
 and vmnet-host on macOS 26 need no root but have not yet been run in a jail. The endpoint is in the jail, or in
 the jail's network, as on Windows: `--netns DIR` names a directory of
 endpoints you made, where a `host_dev_name` without `/` is then made, and your host-side switch binds its own
-socket there too (by the directory's real path or a name relative to it). Two jails given one directory share a
-network; a jail given its own reaches no other's. [SECURITY.md](../SECURITY.md) has how each control is held.
+socket there too (by the directory's real path or a name relative to it). Give each jail a directory of its
+own: a jail given its own reaches no other's, but two jails given one directory are not yet separated from each
+other's endpoints (one can read and inject the other's frames and delete its endpoint; being closed). [SECURITY.md](../SECURITY.md) has how each control is held.
 
 ## Windows (preview)
 

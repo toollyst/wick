@@ -182,9 +182,13 @@ fn jail_dir_from_args() -> Result<PathBuf, JailerError> {
 /// macOS has no network namespaces. As on Windows, a jail's network is a
 /// directory of endpoints the operator made (it must exist, as the
 /// namespace file must on Linux): Firecracker makes its network endpoints
-/// there (`vmm::platform::net`) instead of in its temporary directory, so
-/// two jails given one directory share a network, as two Firecrackers in
-/// one namespace do, and a jail given its own reaches no other's. The
+/// there (`vmm::platform::net`) instead of in its temporary directory. A
+/// jail given its own directory reaches no other's. Two jails given one
+/// directory are not separated from each other's endpoints, unlike two
+/// Firecrackers in one namespace, whose TAPs are each their own
+/// (drivers/net/tun.c tun_not_capable, tun_attach): each is granted
+/// write and delete on the other's endpoint, and an endpoint takes
+/// whoever sends to it as a peer. Not done yet: being closed. The
 /// jail's uid is granted the directory and what is made in it at the exec
 /// ([`grant_to_jail`]); Firecracker opens it before its chroot
 /// (`WICK_NETNS`, `vmm::ext::jail::netns_dir`), and its sandbox lets it
@@ -288,7 +292,8 @@ const NETNS_ENTRY_PERMS: &[i32] = &[
 /// itself (list, search, make and remove entries), one that what is made
 /// in it inherits (read and write: a socket is reached by writing to it),
 /// and the same on the entries already there, keeping every other entry
-/// (another jail sharing the network keeps its own). An entry already
+/// (another jail given the same directory keeps its own, and so reaches
+/// this jail's endpoints: see [`join_netns`]). An entry already
 /// granted is not added twice. As the Windows jailer grants the jail's SID.
 pub(crate) fn grant_to_jail(dir: &Path, uid: u32) -> io::Result<()> {
     grant(dir, uid, NETNS_DIR_PERMS, &[])?;
