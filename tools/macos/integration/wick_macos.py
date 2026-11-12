@@ -33,6 +33,7 @@ import select
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
 
@@ -409,16 +410,18 @@ VM_SELF_REGION_FOOTPRINT = b"vm.self_region_footprint"
 _FOOTPRINT_REGION_TAG = 0xFFFFFFFF
 
 
-def _set_self_region_footprint():
-    one, now, size = ctypes.c_int(1), ctypes.c_int(0), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
-    if _libsystem.sysctlbyname(VM_SELF_REGION_FOOTPRINT, None, None, ctypes.byref(one), ctypes.sizeof(one)):
-        raise OSError(ctypes.get_errno(), f"sysctl {VM_SELF_REGION_FOOTPRINT.decode()}=1")
+def _set_self_region_footprint(value=1):
+    want, now, size = ctypes.c_int(value), ctypes.c_int(-1), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+    if _libsystem.sysctlbyname(VM_SELF_REGION_FOOTPRINT, None, None, ctypes.byref(want), ctypes.sizeof(want)):
+        raise OSError(ctypes.get_errno(), f"sysctl {VM_SELF_REGION_FOOTPRINT.decode()}={value}")
     if _libsystem.sysctlbyname(VM_SELF_REGION_FOOTPRINT, ctypes.byref(now), ctypes.byref(size), None, 0) \
-            or now.value != 1:
-        raise OSError(errno.EINVAL, f"sysctl {VM_SELF_REGION_FOOTPRINT.decode()} did not take 1")
+            or now.value != value:
+        raise OSError(errno.EINVAL, f"sysctl {VM_SELF_REGION_FOOTPRINT.decode()} did not take {value}")
 
 
 _set_self_region_footprint()
+# The mode is the process's: region_breakdown leaves it for one read.
+_FOOTPRINT_LOCK = threading.Lock()
 
 
 def memory_maps(self, grouped=True):
@@ -439,6 +442,11 @@ def memory_maps(self, grouped=True):
     """
     if grouped:
         raise NotImplementedError("grouped memory maps")
+    with _FOOTPRINT_LOCK:
+        return _memory_maps(self)
+
+
+def _memory_maps(self):
     page = os.sysconf("SC_PAGE_SIZE")
     lo, hi = _shared_cache()
     maps, addr, last = [], 0, None
@@ -462,6 +470,7 @@ def memory_maps(self, grouped=True):
             maps[-1].rss += r.pages_resident * page
             continue
         maps.append(_MemoryMap(path, r.address, r.size, r.pages_resident * page))
+        maps[-1].tag = r.user_tag
         last = (kind,)
     if not maps and not psutil.pid_exists(self.pid):
         raise psutil.NoSuchProcess(self.pid)
@@ -471,6 +480,73 @@ def memory_maps(self, grouped=True):
 import psutil  # noqa: E402  pylint: disable=wrong-import-position
 
 psutil.Process.memory_maps = memory_maps
+
+
+def region_breakdown(pid, skip=lambda m: False):
+    """[(name, KiB mapped, KiB present in the page tables, KiB resident in
+    the object)] of `pid`'s regions but those `skip` names, largest first:
+    what the memory monitor counted, and what proc_pidinfo's default mode
+    would have, to name what holds the memory when the monitor trips. A
+    region is named by its file, or by its VM tag (<mach/vm_statistics.h>
+    VM_MEMORY_*: 1 malloc, 2 malloc small, 3 malloc large, 7 malloc tiny,
+    11 malloc nano, 30 stack)."""
+    with _FOOTPRINT_LOCK:
+        mapped = _memory_maps(psutil.Process(pid))
+        _set_self_region_footprint(0)
+        try:
+            cached = _memory_maps(psutil.Process(pid))
+        finally:
+            _set_self_region_footprint(1)
+    rows = defaultdict(lambda: [0, 0, 0])
+    for maps, col in ((mapped, 1), (cached, 2)):
+        for m in maps:
+            if skip(m):
+                continue
+            name = os.path.basename(m.path) if m.path else f"tag {m.tag}"
+            if col == 1:
+                rows[name][0] += m.size
+            rows[name][col] += m.rss
+    return sorted(((k, v[0] >> 10, v[1] >> 10, v[2] >> 10) for k, v in rows.items()),
+                  key=lambda r: -r[2])
+
+
+import host_tools.memory as _memory  # noqa: E402  pylint: disable=wrong-import-position
+
+_real_monitor_run = _memory.MemoryMonitor.run
+_real_check_samples = _memory.MemoryMonitor.check_samples
+
+
+def monitor_run(self):
+    """MemoryMonitor.run; when it stops on a sample over the threshold, the
+    process's regions as they are then (region_breakdown), for
+    check_samples to log."""
+    _real_monitor_run(self)
+    self.wick_breakdown = None
+    if self._exceeded is not None:  # pylint: disable=protected-access
+        guest = self._vm.mem_size_bytes  # pylint: disable=protected-access
+        with contextlib.suppress(psutil.NoSuchProcess, ProcessLookupError):
+            self.wick_breakdown = region_breakdown(
+                self._exceeded.pid, skip=lambda m: self.is_guest_mem(m.size, guest))  # pylint: disable=protected-access
+
+
+def check_samples(self):
+    """MemoryMonitor.check_samples, with the regions logged when it raises."""
+    if self._exceeded is not None:  # pylint: disable=protected-access
+        rows = getattr(self, "wick_breakdown", None)
+        import logging  # pylint: disable=import-outside-toplevel
+        log = logging.getLogger("wick_macos")
+        if rows is None:
+            log.warning("memory monitor tripped at %.2f MiB; the process was gone before its regions were read",
+                        self._current_rss / (1 << 20))  # pylint: disable=protected-access
+        else:
+            log.warning("memory monitor tripped at %.2f MiB (KiB: mapped, in the page tables, resident in the "
+                        "object): %s", self._current_rss / (1 << 20),  # pylint: disable=protected-access
+                        "; ".join(f"{n} {s}/{f}/{c}" for n, s, f, c in rows if f or c))
+    _real_check_samples(self)
+
+
+_memory.MemoryMonitor.run = monitor_run
+_memory.MemoryMonitor.check_samples = check_samples
 
 
 def prlimit(pid, which, limits=None):
