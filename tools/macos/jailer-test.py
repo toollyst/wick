@@ -231,17 +231,23 @@ int main(int argc, char **argv) {
     for (int fd = 0; fd < 65536; fd++) if (fcntl(fd, F_GETFD) != -1) open_before++;
     int opened = 0, err = 0;
     for (;;) { if (open("/dev/null", O_RDONLY) < 0) { err = errno; break; } opened++; }
-    long long written = -1; int werr = 0;
+    long long written = -1; int werr = 0, oerr = 0;
     if (fsize.rlim_cur != RLIM_INFINITY && argc > 1) {
         signal(SIGXFSZ, SIG_IGN);
         close(3);  /* a descriptor for the file */
         int f = open(argv[argc - 1], O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        char buf[4096]; memset(buf, 7, sizeof buf); written = 0;
-        for (;;) { ssize_t n = write(f, buf, sizeof buf); if (n < 0) { werr = errno; break; } written += n; }
+        if (f < 0) {
+            oerr = errno;
+        } else {
+            char buf[4096]; memset(buf, 7, sizeof buf); written = 0;
+            for (;;) { ssize_t n = write(f, buf, sizeof buf); if (n < 0) { werr = errno; break; } written += n; }
+        }
     }
-    printf("RLIMITS nofile %lld %lld fsize %lld %lld open_before %d opened %d errno %d written %lld werrno %d mark %c\n",
+    char cwd[1024] = "?"; getcwd(cwd, sizeof cwd);
+    printf("RLIMITS nofile %lld %lld fsize %lld %lld open_before %d opened %d errno %d written %lld werrno %d "
+           "oerrno %d uid %d mark %c cwd %s file %s\n",
            lim(nofile.rlim_cur), lim(nofile.rlim_max), lim(fsize.rlim_cur), lim(fsize.rlim_max),
-           open_before, opened, err, written, werr, mark[0]);
+           open_before, opened, err, written, werr, oerr, (int)getuid(), mark[0], cwd, argc > 1 ? argv[argc - 1] : "-");
     return 0;
 }
 """
@@ -271,7 +277,8 @@ def parse_probe(out):
         if name in ("nofile", "fsize"):
             vals[name] = (int(words[i + 1]), int(words[i + 2]))
             i += 3
-        elif name == "mark":
+        elif name in ("mark", "cwd", "file"):
+            vals[name] = words[i + 1]
             i += 2
         else:
             vals[name] = int(words[i + 1])
@@ -290,6 +297,8 @@ def check_probe(vals, nofile, fsize, what):
           f"{what}: {vals['open_before']} open + {vals['opened']} opened before errno {vals['errno']}, "
           f"wanted EMFILE at descriptor {nofile + 1}")
     if fsize != -1:
+        check(vals["oerrno"] == 0, f"{what}: opening {vals['file']} (uid {vals['uid']}, cwd {vals['cwd']}) "
+              f"failed with errno {vals['oerrno']}")
         check(vals["written"] == fsize and vals["werrno"] == errno_mod.EFBIG,
               f"{what}: {vals['written']} bytes written before errno {vals['werrno']}, wanted EFBIG at {fsize}")
 
@@ -351,15 +360,19 @@ def probe_dir(base):
 
 def jailed_probe(ctx, name, limits_args):
     """Runs the probe through the jailer with `limits_args`; returns its report.
-    The probe writes the file at /big of its jail (the jailer gives the jail's
-    root to the jailed user, as upstream's does)."""
+    The macOS jailer sets the limits, leaves its chroot and execs the binary
+    as root outside the jail (overlay/jailer/platform/macos exec): Firecracker
+    takes the jail over itself (WICK_JAIL), the probe does not. So it runs as
+    root with the host's paths and writes the file at the jail root's host
+    path (a path in the jail would be the host's read-only /)."""
     if ctx.rlimit_probe is None:
         os.makedirs(probe_dir(ctx.base))
         ctx.rlimit_probe = build_rlimit_probe(probe_dir(ctx.base))
     root = chroot_of(ctx.base, ctx.rlimit_probe, name)
-    rc, out = run_jailer(ctx, jailer_base(ctx, name, ctx.rlimit_probe) + list(limits_args) + ["--", "/big"])
-    check(rc == 0, f"{name}: the jailed probe exited {rc}: {out!r}")
     big = os.path.join(root, "big")
+    rc, out = run_jailer(ctx, jailer_base(ctx, name, ctx.rlimit_probe) + list(limits_args) + ["--", big])
+    check(rc == 0, f"{name}: the jailed probe exited {rc}: {out!r}")
+    print(f"   {name}: {out.strip()}", flush=True)
     if os.path.exists(big):
         os.unlink(big)
     return parse_probe(out)
