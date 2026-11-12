@@ -19,14 +19,25 @@
 #   losetup device and was killed: both disks still attached and recorded,
 #   then detached by detach-session-disks.sh, records gone;
 # - losetup --find --show / --detach: a user-owned block device of the
-#   file's size (DKIOCGETBLOCKCOUNT x DKIOCGETBLOCKSIZE).
+#   file's size (DKIOCGETBLOCKCOUNT x DKIOCGETBLOCKSIZE);
+# - losetup --detach of a device a process holds open: returns 0 at once
+#   (Linux: lazy destruction, losetup(8)), the disk stays attached while it
+#   is open and is detached, its record gone and its waiter ended, after the
+#   last close.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 session="$(mktemp -d /tmp/wit-XXXX)"
 fails=0
 ok() { echo "ok: $*"; }
 fail() { echo "FAIL: $*"; fails=$((fails + 1)); }
-attached() { hdiutil info | grep -qE "^$1([[:space:]]|$)"; }
+# hdiutil's whole output first: with pipefail, `hdiutil info | grep -q`
+# fails when grep's early exit kills hdiutil with SIGPIPE (measured: 24 of
+# 60 checks of the first of two attached disks reported it gone).
+attached() {
+    local info
+    info="$(hdiutil info 2>/dev/null)"
+    grep -qE "^$1([[:space:]]|$)" <<<"$info"
+}
 finish() {
     "$HERE/detach-session-disks.sh" "$session" >/dev/null 2>&1 || true
     rm -rf "$session"
@@ -124,5 +135,27 @@ assert os.stat(sys.argv[1]).st_uid == os.getuid() and bs * n == 3 << 20, (bs, n)
 EOF
 WICK_IT_ROOT="$session" "$HERE/bin/losetup" --detach "$dev" && ! attached "$dev" && [[ ! -e "$session/.attached/${dev#/dev/}" ]] &&
     ok "losetup --detach: detached, record gone" || fail "losetup --detach"
+
+# losetup --detach of a disk in use: detached on its last close.
+dev="$(WICK_IT_ROOT="$session" "$HERE/bin/losetup" --find --show "$img")"
+python3 -I -c 'import os, sys, time; fd = os.open(sys.argv[1], os.O_RDWR); print(flush=True); time.sleep(600)' "$dev" >"$session/holder" &
+holder=$!
+for _ in $(seq 50); do [[ -s "$session/holder" ]] && break; sleep 0.1; done
+if WICK_IT_ROOT="$session" "$HERE/bin/losetup" --detach "$dev"; then
+    sleep 2
+    attached "$dev" && [[ -e "$session/.attached/${dev#/dev/}" ]] &&
+        ok "losetup --detach of $dev in use: 0, still attached while open" ||
+        fail "losetup --detach in use: the disk went while open"
+else
+    fail "losetup --detach of $dev in use: not 0"
+fi
+kill "$holder"; wait "$holder" 2>/dev/null || true
+for _ in $(seq 100); do attached "$dev" || break; sleep 0.1; done
+sleep 0.5
+if ! attached "$dev" && [[ ! -e "$session/.attached/${dev#/dev/}" ]] && ! pgrep -f "losetup-lazy-detach $dev " >/dev/null; then
+    ok "last close: $dev detached, record gone, waiter ended"
+else
+    fail "last close: attached $(attached "$dev" && echo yes || echo no), waiter $(pgrep -f "losetup-lazy-detach $dev " || echo none)"
+fi
 
 ((fails == 0)) && echo "all passed" || { echo "$fails failed"; exit 1; }

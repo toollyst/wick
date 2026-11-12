@@ -10,8 +10,27 @@
 # device's are). Its /dev/diskN is the user's who attached it (measured:
 # brw-r----- <user> staff), so the user opens it read-write, where Linux's
 # loop devices need root. Its size is the file's.
+#
+# --detach of a device still open (test_rescan_dev's Firecracker holds it):
+# Linux returns 0 and destroys the device on its last close (losetup(8),
+# util-linux, --detach: since Linux 3.7 "lazy device destruction", the
+# device "marked by autoclear flag and destroyed later"; drivers/block/loop.c
+# loop_clr_fd sets LO_FLAGS_AUTOCLEAR and returns 0 while disk_openers > 1,
+# and lo_release tears the device down on the last close). hdiutil refuses a
+# disk in use, also with -force (measured: "couldn't eject", exit 16, EBUSY),
+# so a busy disk is detached by a waiter that retries until the last close,
+# and --detach returns 0 as Linux's does. The waiter detaches the disk only
+# while it is still the same image (a /dev/diskN number is reused once
+# detached), and gives up when the disk or the session is gone; the
+# session's end (detach-session-disks.sh) detaches what is still attached.
 set -eu
 die() { echo "losetup (wick, macOS): $*" >&2; exit 1; }
+# The image attached as DEV, or nothing.
+image_of() {
+    hdiutil info 2>/dev/null | awk -v dev="$1" '
+        /^image-path/ { sub(/^image-path *: /, ""); image = $0 }
+        $1 == dev { print image; exit }'
+}
 case "${1:-}" in
 --find)
     [ "$#" -eq 3 ] && [ "$2" = --show ] || die "only --find --show FILE and --detach DEV are supported"
@@ -27,10 +46,35 @@ case "${1:-}" in
     ;;
 --detach | -d)
     [ "$#" -eq 2 ] || die "--detach DEV"
-    hdiutil detach "$2" >/dev/null 2>&1 || hdiutil detach -force "$2" >/dev/null 2>&1 ||
-        die "hdiutil detach $2 failed"
-    [ -n "${WICK_IT_ROOT:-}" ] && rm -f "$WICK_IT_ROOT/.attached/${2#/dev/}"
-    true
+    dev="$2"
+    record="${WICK_IT_ROOT:+$WICK_IT_ROOT/.attached/${dev#/dev/}}"
+    image="$(image_of "$dev")"
+    [ -n "$image" ] || die "$dev: not an attached disk image"
+    rc=0
+    hdiutil detach "$dev" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        [ -n "$record" ] && rm -f "$record"
+        exit 0
+    fi
+    [ "$rc" -eq 16 ] || die "hdiutil detach $dev failed ($rc)"
+    # In use: detached on its last close. The waiter names the session in
+    # its command line, so that tools/clean.sh leaves it while the session
+    # lives and stops it after.
+    # shellcheck disable=SC2016 # the waiter's script expands its own arguments
+    nohup /bin/sh -c '
+        dev=$1 image=$2 record=$3 session=$4
+        while [ -z "$session" ] || [ -d "$session" ]; do
+            now="$(hdiutil info 2>/dev/null | awk -v dev="$dev" "
+                /^image-path/ { sub(/^image-path *: /, \"\"); image = \$0 }
+                \$1 == dev { print image; exit }")"
+            [ "$now" = "$image" ] || exit 0
+            if hdiutil detach "$dev" >/dev/null 2>&1; then
+                [ -n "$record" ] && rm -f "$record"
+                exit 0
+            fi
+            sleep 1
+        done' losetup-lazy-detach "$dev" "$image" "$record" "${WICK_IT_ROOT:-}" </dev/null >/dev/null 2>&1 &
+    exit 0
     ;;
 *) die "only --find --show FILE and --detach DEV are supported, not '$*'" ;;
 esac

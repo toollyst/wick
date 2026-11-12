@@ -210,8 +210,11 @@ all bug integration_tests/functional/test_net.py::test_tap_offload
 # which refuses a disk in use even with -force (measured, also outside a
 # VM with a process holding the disk open: "couldn't eject", exit 16,
 # EBUSY). Linux detaches a loop device in use on its last close instead
-# (losetup(8), util-linux: "lazy device destruction" since Linux 3.7, the
-# autoclear flag). To do: detach on the disk's last close.
+# (losetup(8), util-linux, --detach: "lazy device destruction" since Linux
+# 3.7; drivers/block/loop.c loop_clr_fd sets LO_FLAGS_AUTOCLEAR and returns
+# 0 while the disk has other openers, lo_release tears it down on the last
+# close). bin/losetup now does the same (a waiter detaches the disk on its
+# last close; disks-selftest.sh). Not yet re-run.
 all bug integration_tests/functional/test_drive_virtio.py::test_rescan_dev
 
 # No SIGPIPE in 100 host connections closed with data in flight

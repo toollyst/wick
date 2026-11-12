@@ -18,7 +18,9 @@ for a in "$session"/.attached/disk*; do
     dev="/dev/${a##*/}"
     if hdiutil detach "$dev" >/dev/null 2>&1 || hdiutil detach -force "$dev" >/dev/null 2>&1; then
         rm -f "$a"
-    elif ! hdiutil info | grep -qE "^$dev([[:space:]]|$)"; then
+    # hdiutil's whole output first: under pipefail, grep -q's early exit
+    # would fail the pipeline (SIGPIPE) for a disk still attached.
+    elif info="$(hdiutil info 2>/dev/null)" && ! grep -qE "^$dev([[:space:]]|$)" <<<"$info"; then
         rm -f "$a" # gone already
     else
         echo "cannot detach $dev (attached by the session $session)" >&2
