@@ -147,6 +147,9 @@ firecracker, jailer, vmm          upstream source + patches/
 - **New releases are a rebase.** `tools/rebase.sh v1.19.0` moves the series onto a new upstream tag.
 - **Versions say what you get.** A release carries upstream's version (`v1.18.0` is wick on Firecracker v1.18.0);
   wick's own fixes on the same base are `v1.18.0+wick.1`, `+wick.2`, and so on, which never sort below upstream.
+- **Snapshots taken on macOS before `v1.18.0+wick.1` must be taken again.** Their guests saw pointer
+  authentication without asking for it, which KVM never shows; such a state is now refused at the load, as KVM
+  refuses it ([Snapshots](docs/COMPATIBILITY.md#snapshots-and-userfaultfd)).
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the design, including the POSIX layer that lets upstream's
 `RawFd`, epoll, eventfd and `SCM_RIGHTS` code run on Windows.

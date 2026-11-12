@@ -1201,6 +1201,120 @@ def resident(pid):
     return struct.unpack_from("<Q", buf, 8)[0]
 
 
+# Guest hwcaps (Linux arch/arm64/kernel/cpufeature.c) of the ID register
+# fields V1N1 (vmm/src/cpu_config/aarch64/static_cpu_templates/v1n1.rs)
+# lowers: what a host has of them the guest loses under the template, and
+# nothing else. Upstream's test_guest_cpu_features expects G2_FEATS under
+# V1N1, which is a Neoverse V1 less these.
+V1N1_HWCAPS = set(
+    "sve svebf16 svei8mm dit sha3 sha512 sm3 sm4 asimdfhm flagm flagm2 rng "
+    "dcpodp jscvt fcma ilrcpc i8mm bf16 ebf16 dgh uscat".split()
+)
+
+
+def guest_features(vm):
+    """The guest's /proc/cpuinfo Features of every CPU, as one set, after
+    checking all CPUs list the same and the kernel saw no variation between
+    them (cpufeature.c's SANITY CHECK)."""
+    _, out = vm.sh("grep Features /proc/cpuinfo")
+    sets = [frozenset(line.split(":", 1)[1].split()) for line in out.splitlines()]
+    check(len(sets) == 2 and sets[0] == sets[1], f"CPUs differ: {out!r}")
+    _, out = vm.sh("dmesg | grep -iE 'sanity check|unexpected variation|will not boot' | head -3; true")
+    check(not out, f"guest kernel: {out!r}")
+    return set(sets[0])
+
+
+def stage_cpu_templates(ctx):
+    """CPU templates on the ID registers: the static V1N1 template and the
+    same as a custom template through PUT /cpu-config take the features V1N1
+    lowers from the guest, on every vCPU, and a restored snapshot keeps
+    them; a template that raises a feature is refused."""
+    cfg = config(ctx, vcpus=2)
+    vm = ctx.vm("tmpl-none", [], cfg)
+    vm.shell()
+    host = guest_features(vm)
+    vm.kill()
+    check({"aes", "sha3", "asimdfhm"} <= host, f"this host's guest lacks aes, sha3 or asimdfhm: {sorted(host)}")
+    want = host - V1N1_HWCAPS
+
+    vm = ctx.vm("tmpl-static", [], config(ctx, vcpus=2, machine={"cpu_template": "V1N1"}))
+    vm.shell()
+    got = guest_features(vm)
+    check(got == want, f"V1N1: lost {sorted(host - got)}, kept {sorted(got & V1N1_HWCAPS)}")
+    # The template survives a snapshot (the ID registers are in it).
+    state, mem = os.path.join(ctx.out, "tmpl.state"), os.path.join(ctx.out, "tmpl.mem")
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    vm.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": state, "mem_file_path": mem})
+    vm.kill()
+    vm = ctx.vm("tmpl-restored", [])
+    vm.api("PUT", "/snapshot/load", {"snapshot_path": state,
+                                     "mem_backend": {"backend_type": "File", "backend_path": mem},
+                                     "resume_vm": True})
+    # cpu1 offline and online again (PSCI CPU_ON resets it): Linux compares
+    # each CPU that comes up with the boot CPU's ID registers and warns of a
+    # difference (arch/arm64/kernel/smp.c secondary_start_kernel ->
+    # cpuinfo.c cpuinfo_store_cpu -> cpufeature.c update_cpu_features,
+    # "SANITY CHECK"), so none means cpu1 has the VM's values at boot, after
+    # the restore and after its reset.
+    cpu_offline_online(vm, "V1N1 restored")
+    got = guest_features(vm)
+    check(got == want, f"V1N1 restored: lost {sorted(host - got)}, kept {sorted(got & V1N1_HWCAPS)}")
+    _, out = vm.sh("dmesg | grep -c 'SANITY CHECK'; true")
+    check(out.splitlines()[-1] == "0", f"V1N1 restored: a CPU's ID registers differ from the boot CPU's: {out!r}")
+    vm.kill()
+    os.unlink(mem)
+
+    custom = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib", "firecracker",
+                          "tests", "data", "custom_cpu_templates", "V1N1.json")
+    with open(custom) as f:
+        template = json.load(f)
+    vm = ctx.vm("tmpl-custom", [])
+    vm.api("PUT", "/boot-source", cfg["boot-source"])
+    vm.api("PUT", "/drives/rootfs", cfg["drives"][0])
+    vm.api("PUT", "/machine-config", cfg["machine-config"])
+    vm.api("PUT", "/cpu-config", template)
+    vm.api("PUT", "/actions", {"action_type": "InstanceStart"})
+    vm.shell()
+    got = guest_features(vm)
+    check(got == want, f"custom V1N1: lost {sorted(host - got)}, kept {sorted(got & V1N1_HWCAPS)}")
+    vm.kill()
+
+    # Pointer authentication through a template's vcpu_features (PTRAUTH_ADDRESS
+    # and _GENERIC, bits 5 and 6), the only way KVM shows it: the guest has
+    # paca and pacg, which it lacks without; a snapshot of it restores, and
+    # cpu1 comes back online after the restore with the boot CPU's ID registers.
+    pac = {"kvm_capabilities": ["171", "172"], "vcpu_features": [{"index": 0, "bitmap": "0b11xxxxx"}]}
+    check(not {"paca", "pacg"} & host, f"pointer authentication shown without vcpu_features: {sorted(host)}")
+    vm = ctx.vm("tmpl-pac", [], config(ctx, vcpus=2, cpu_config=pac))
+    vm.shell()
+    got = guest_features(vm)
+    check(got == host | {"paca", "pacg"}, f"PAC template: gained {sorted(got - host)}, lost {sorted(host - got)}")
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    vm.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": state, "mem_file_path": mem})
+    vm.kill()
+    vm = ctx.vm("tmpl-pac-restored", [])
+    vm.api("PUT", "/snapshot/load", {"snapshot_path": state,
+                                     "mem_backend": {"backend_type": "File", "backend_path": mem},
+                                     "resume_vm": True})
+    cpu_offline_online(vm, "PAC restored")
+    got = guest_features(vm)
+    check(got == host | {"paca", "pacg"}, f"PAC restored: gained {sorted(got - host)}, lost {sorted(host - got)}")
+    _, out = vm.sh("dmesg | grep -c 'SANITY CHECK'; true")
+    check(out.splitlines()[-1] == "0", f"PAC restored: a CPU's ID registers differ from the boot CPU's: {out!r}")
+    vm.kill()
+    os.unlink(mem)
+
+    # AES raised to 0b1111: no host has that; KVM refuses it (EINVAL).
+    raise_aes = {"reg_modifiers": [{"addr": "0x603000000013c030", "bitmap": "0b" + "x" * 56 + "1111" + "x" * 4}]}
+    vm = ctx.vm("tmpl-raise", [], config(ctx, vcpus=2, cpu_config=raise_aes), api=False)
+    code = vm.wait_exit(30)
+    check(code != 0 and "Invalid argument (os error 22)" in vm.buf, f"raised AES: exit {code}, {vm.exit_reason()}")
+    return (f"V1N1 static, custom through PUT /cpu-config and restored: the guest loses "
+            f"{len(host - want)} features ({' '.join(sorted(host - want))}), the same on both vCPUs, also after "
+            f"cpu1's restart; pointer authentication only through vcpu_features, restored with cpu1's restart; "
+            f"a raised feature refused")
+
+
 def stage_memory_hotplug(ctx):
     """virtio-mem, as upstream's test_virtio_mem_hotplug_hotunplug
     (performance/test_hotplug_memory.py) checks it: the guest's driver gets
@@ -1682,6 +1796,7 @@ STAGES = {
     "tools": stage_tools,
     "no-seccomp": stage_no_seccomp,
     "memory-hotplug": stage_memory_hotplug,
+    "cpu-templates": stage_cpu_templates,
 }
 
 

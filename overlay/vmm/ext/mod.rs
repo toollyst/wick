@@ -16,6 +16,8 @@
 pub mod api_process;
 pub mod jail;
 pub mod sandbox;
+#[cfg(all(test, target_os = "macos"))]
+mod snapshot_vcpu_tests;
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;

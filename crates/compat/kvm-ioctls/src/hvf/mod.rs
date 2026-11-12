@@ -27,6 +27,7 @@ mod device;
 mod exit;
 mod ffi;
 mod gic;
+mod idregs;
 mod regs;
 mod vcpu;
 mod vm;

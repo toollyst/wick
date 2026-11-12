@@ -196,6 +196,16 @@ pub(crate) struct VmInner {
     /// Register values of a freshly created Hypervisor.framework vCPU, read
     /// once from a scratch vCPU (see `VcpuFd::get_one_reg`).
     pub(crate) reset_regs: OnceLock<std::result::Result<HashMap<u64, Vec<u8>>, i32>>,
+    /// ID registers user space wrote (`super::idregs`): the VM's, given to
+    /// each vCPU when it is created.
+    pub(crate) id_regs: Mutex<HashMap<u16, u64>>,
+    /// Set when the first vCPU is created: the ID registers can no longer
+    /// change, as on KVM once the VM has run.
+    pub(crate) id_locked: AtomicBool,
+    /// Whether the vCPUs have pointer authentication (`KVM_ARM_VCPU_INIT`'s
+    /// PTRAUTH features): one choice for the VM, set by the first vCPU's
+    /// init, as KVM requires every vCPU to have the same features.
+    pub(crate) ptrauth: Mutex<Option<bool>>,
     /// GIC registers of a freshly created vCPU, read from the first one.
     pub(crate) gic_cpu_reset: OnceLock<HashMap<super::gic::CpuReg, u64>>,
 }
@@ -806,6 +816,9 @@ impl VmFd {
             deferred_spis: Mutex::new(Vec::new()),
             deferred_active: Mutex::new(Vec::new()),
             reset_regs: OnceLock::new(),
+            id_regs: Mutex::new(HashMap::new()),
+            id_locked: AtomicBool::new(false),
+            ptrauth: Mutex::new(None),
             gic_cpu_reset: OnceLock::new(),
         });
         libc::wick_guest::set_hooks(libc::wick_guest::Hooks {
@@ -1796,8 +1809,11 @@ mod tests {
         // A new vCPU's register values come from a scratch vCPU on a thread
         // of its own (`probe_reset_regs`). The run phase may make no thread
         // (Firecracker's host sandbox, as Linux's vCPU filter has no clone),
-        // and it needs them: a vCPU that PSCI CPU_ON starts again is reset
-        // to them. So the first vcpu_init, in the setup phase, reads them.
+        // and it needs them: a snapshot's register list, and a vCPU that
+        // PSCI CPU_ON starts again, which is reset to them. So the first
+        // vcpu_init, in the setup phase, reads them (a release build that
+        // read them lazily died at a vCPU's first run: SYS_bsdthread_create
+        // denied).
         let vm = Kvm::new().unwrap().create_vm().unwrap();
         assert!(vm.inner.reset_regs.get().is_none());
         let vcpu = vm.create_vcpu(0).unwrap();
@@ -1885,6 +1901,155 @@ mod tests {
             assert!((0.1..2.0).contains(&elapsed(*c)), "{:.3}s", elapsed(*c));
         }
         assert!((elapsed(counts[1]) - elapsed(counts[0])).abs() < 0.05, "{counts:?}");
+    }
+
+    #[test]
+    fn test_id_register_writes_reach_the_guest() {
+        // As on KVM (Linux 6.7 and later): the ID registers are the VM's; a
+        // write through one vCPU before the VM runs is what every vCPU's
+        // guest reads with `mrs`; a field may be lowered, not raised, and
+        // only those KVM lets user space change; once the VM has run a
+        // different value is refused with EBUSY.
+        use super::super::regs::{reg_list, sys_id};
+        const ISAR0: u16 = 0xc030;
+        const ISAR1: u16 = 0xc031;
+        // mrs x0, ID_AA64ISAR0_EL1; str x0, [x4]; mrs x0, ID_AA64ISAR1_EL1;
+        // str x0, [x4]; b .
+        const CODE: [u32; 5] = [0xd5380600, 0xf9000080, 0xd5380620, 0xf9000080, 0x14000000];
+        let (vm, vcpu0, _mem, _len) = vm_with_memory(1, &CODE);
+        let mut kvi = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        let vcpu1 = vm.create_vcpu(1).unwrap();
+        vcpu1.vcpu_init(&kvi).unwrap();
+        let read = |v: &VcpuFd, r: u16| {
+            let mut buf = [0u8; 8];
+            v.get_one_reg(sys_id(r), &mut buf).unwrap();
+            u64::from_le_bytes(buf)
+        };
+        let write = |v: &VcpuFd, r: u16, x: u64| v.set_one_reg(sys_id(r), &x.to_le_bytes()).map(|_| ());
+        let isar0 = read(&vcpu0, ISAR0);
+        let isar1 = read(&vcpu0, ISAR1);
+        assert_ne!(isar0 & 0xf0, 0, "the host has AES: {isar0:#x}");
+        // Listed for snapshots, as KVM lists them.
+        let mut list = kvm_bindings::RegList::new(500).unwrap();
+        vcpu0.get_reg_list(&mut list).unwrap();
+        assert!(list.as_slice().contains(&sys_id(ISAR0)) && !reg_list().contains(&sys_id(ISAR0)));
+        // AES off: lowered, through vCPU 0, read back through vCPU 1.
+        let lowered = isar0 & !0xf0;
+        write(&vcpu0, ISAR0, lowered).unwrap();
+        assert_eq!(read(&vcpu1, ISAR0), lowered);
+        // Raised above the host's: refused.
+        let raised = (isar0 & !0xf0) | ((((isar0 >> 4) & 0xf) + 1) << 4);
+        assert_eq!(write(&vcpu0, ISAR0, raised).unwrap_err().errno(), libc::EINVAL);
+        // Without the PTRAUTH vCPU features, pointer authentication is
+        // hidden (as KVM does), and not shown by a write either.
+        assert_eq!(isar1 & super::super::idregs::ptrauth_fields(ISAR1), 0, "{isar1:#x}");
+        assert_eq!(write(&vcpu0, ISAR1, isar1 | 0x200).unwrap_err().errno(), libc::EINVAL);
+        // MIDR_EL1 is invariant.
+        let midr = read(&vcpu0, 0xc000);
+        assert_eq!(write(&vcpu0, 0xc000, midr ^ 0x10).unwrap_err().errno(), libc::EINVAL);
+        write(&vcpu0, 0xc000, midr).unwrap();
+        // An unallocated ID register: reads 0, takes only 0.
+        assert_eq!(read(&vcpu0, 0xc03f), 0);
+        write(&vcpu0, 0xc03f, 0).unwrap();
+        assert_eq!(write(&vcpu0, 0xc03f, 1).unwrap_err().errno(), libc::EINVAL);
+        // Both guests read the VM's values.
+        let seen: Vec<(u64, u64)> = [vcpu0, vcpu1]
+            .into_iter()
+            .map(|mut vcpu| {
+                std::thread::spawn(move || {
+                    for (id, v) in [(PC, GUEST_BASE), (PSTATE, 0x3c5), (x_reg(4), MMIO)] {
+                        vcpu.set_one_reg(id, &v.to_le_bytes()).unwrap();
+                    }
+                    let mut got = [0u64; 2];
+                    for g in &mut got {
+                        match vcpu.run().unwrap() {
+                            crate::VcpuExit::MmioWrite(MMIO, data) => {
+                                *g = u64::from_le_bytes(data.try_into().unwrap());
+                            }
+                            other => panic!("{other:?}"),
+                        }
+                    }
+                    // The VM has run: a different value is refused, the same taken.
+                    assert_eq!(write(&vcpu, ISAR0, isar0).unwrap_err().errno(), libc::EBUSY);
+                    write(&vcpu, ISAR0, lowered).unwrap();
+                    assert_eq!(read(&vcpu, ISAR0), lowered);
+                    (got[0], got[1])
+                })
+                .join()
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(seen, vec![(lowered, isar1); 2]);
+    }
+
+    #[test]
+    fn test_ptrauth_keys_are_hidden_without_ptrauth() {
+        // As on KVM, the pointer authentication key registers (APIA, APIB,
+        // APDA, APDB, APGA, LO and HI) belong to a vCPU given
+        // KVM_ARM_VCPU_PTRAUTH_ADDRESS and _GENERIC only: without them they
+        // are not in KVM_GET_REG_LIST, and KVM_GET_ONE_REG and
+        // KVM_SET_ONE_REG fail with ENOENT (arch/arm64/kvm/sys_regs.c
+        // ptrauth_visibility, REG_HIDDEN; walk_one_sys_reg,
+        // kvm_sys_reg_get_user, kvm_sys_reg_set_user). So a state with keys
+        // is refused by a vCPU without the features.
+        use super::super::regs::sys_id;
+        use kvm_bindings::{KVM_ARM_VCPU_PTRAUTH_ADDRESS, KVM_ARM_VCPU_PTRAUTH_GENERIC};
+        let keys = [0xc108u16, 0xc109, 0xc10a, 0xc10b, 0xc110, 0xc111, 0xc112, 0xc113, 0xc118, 0xc119];
+        for ptrauth in [false, true] {
+            let vm = Kvm::new().unwrap().create_vm().unwrap();
+            let mut kvi = kvm_vcpu_init::default();
+            vm.get_preferred_target(&mut kvi).unwrap();
+            if ptrauth {
+                kvi.features[0] |= (1 << KVM_ARM_VCPU_PTRAUTH_ADDRESS) | (1 << KVM_ARM_VCPU_PTRAUTH_GENERIC);
+            }
+            let vcpu = vm.create_vcpu(0).unwrap();
+            vcpu.vcpu_init(&kvi).unwrap();
+            let mut list = kvm_bindings::RegList::new(500).unwrap();
+            vcpu.get_reg_list(&mut list).unwrap();
+            let mut buf = [0u8; 8];
+            for k in keys {
+                let id = sys_id(k);
+                assert_eq!(list.as_slice().contains(&id), ptrauth, "{k:#x} listed, ptrauth {ptrauth}");
+                let get = vcpu.get_one_reg(id, &mut buf).map_err(|e| e.errno());
+                let set = vcpu.set_one_reg(id, &7u64.to_le_bytes()).map_err(|e| e.errno());
+                if ptrauth {
+                    assert!(get.is_ok() && set.is_ok(), "{k:#x}: {get:?} {set:?}");
+                } else {
+                    assert_eq!((get, set), (Err(libc::ENOENT), Err(libc::ENOENT)), "{k:#x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_ptrauth_is_a_vcpu_feature() {
+        // KVM_ARM_VCPU_PTRAUTH_ADDRESS and _GENERIC, together, show pointer
+        // authentication in ID_AA64ISAR1_EL1 (this host has it); one alone
+        // is refused, and so is a vCPU whose features differ from the
+        // first one's, as on KVM.
+        use super::super::regs::sys_id;
+        use kvm_bindings::{KVM_ARM_VCPU_PTRAUTH_ADDRESS, KVM_ARM_VCPU_PTRAUTH_GENERIC};
+        let vm = Kvm::new().unwrap().create_vm().unwrap();
+        let mut kvi = kvm_vcpu_init::default();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        let v0 = vm.create_vcpu(0).unwrap();
+        let mut one = kvi;
+        one.features[0] |= 1 << KVM_ARM_VCPU_PTRAUTH_ADDRESS;
+        assert_eq!(v0.vcpu_init(&one).unwrap_err().errno(), libc::EINVAL);
+        let mut both = one;
+        both.features[0] |= 1 << KVM_ARM_VCPU_PTRAUTH_GENERIC;
+        v0.vcpu_init(&both).unwrap();
+        let mut buf = [0u8; 8];
+        v0.get_one_reg(sys_id(0xc031), &mut buf).unwrap();
+        let isar1 = u64::from_le_bytes(buf);
+        assert_ne!(isar1 & super::super::idregs::ptrauth_fields(0xc031), 0, "{isar1:#x}");
+        let v1 = vm.create_vcpu(1).unwrap();
+        assert_eq!(v1.vcpu_init(&kvi).unwrap_err().errno(), libc::EINVAL);
+        v1.vcpu_init(&both).unwrap();
+        assert!(vm.check_extension(crate::Cap::ArmPtrAuthAddress));
+        assert!(vm.check_extension(crate::Cap::ArmPtrAuthGeneric));
+        assert!(!vm.check_extension(crate::Cap::ArmSve));
     }
 
     #[test]

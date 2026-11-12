@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use kvm_bindings::{
-    KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, KVM_MP_STATE_RUNNABLE, KVM_MP_STATE_STOPPED,
+    KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, KVM_ARM_VCPU_PTRAUTH_ADDRESS, KVM_ARM_VCPU_PTRAUTH_GENERIC, KVM_MP_STATE_RUNNABLE, KVM_MP_STATE_STOPPED,
     KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, RegList, kvm_device_attr, kvm_mp_state,
     kvm_run, kvm_vcpu_init,
 };
@@ -20,6 +20,7 @@ use kvm_bindings::{
 use super::exit::{self, DebugRegs, Exit, Mmio, Psci, SysregAccess, SysregResult};
 use super::ffi::*;
 use super::gic::{CpuReg, GicCpu};
+use super::idregs;
 use super::regs::{self, Reg, reg_size};
 use super::vm::VmInner;
 use super::{Error, Handle, Result, VcpuExit, err};
@@ -323,6 +324,23 @@ impl VcpuFd {
         if gic_created {
             super::gic::reroute_spis(super::gic::packed_affinity(self.shared.mpidr))?;
         }
+        // The VM's ID registers, fixed from now on (`idregs`).
+        vm.id_locked.store(true, Ordering::Release);
+        // Every one the guest does not see as the host has it: written by
+        // user space, or pointer authentication hidden.
+        for r in idregs::ID_REGS {
+            if self.host_id_reg(*r)?.is_none() {
+                continue;
+            }
+            let v = self.id_reg(*r)?;
+            let mut host = 0;
+            // SAFETY: `hv` was just created on this thread.
+            check(unsafe { hv_vcpu_get_sys_reg(hv, *r, &mut host) })?;
+            if v != host {
+                // SAFETY: as above.
+                check(unsafe { hv_vcpu_set_sys_reg(hv, *r, v) })?;
+            }
+        }
         let pending = std::mem::take(&mut *self.shared.pending.lock().unwrap());
         for (id, data) in pending {
             self.set_reg_now(hv, id, &data)?;
@@ -422,6 +440,15 @@ fn probe_reset_regs() -> std::result::Result<HashMap<u64, Vec<u8>>, i32> {
                     result = Err(e.errno());
                     break;
                 }
+            }
+        }
+        // The ID registers this Hypervisor.framework has (some are from
+        // macOS 15.2 or 27): the others are left out.
+        for r in idregs::ID_REGS {
+            let id = regs::sys_id(*r);
+            let mut buf = vec![0u8; 8];
+            if read_reg(hv, id, &mut buf).is_ok() {
+                values.insert(id, buf);
             }
         }
         // SAFETY: destroyed on the thread that created it.
@@ -535,6 +562,15 @@ impl VcpuFd {
             return err(libc::EINVAL);
         }
         let reg = regs::decode(reg_id).ok_or_else(|| Error::new(libc::ENOENT))?;
+        self.check_visible(reg)?;
+        if let Reg::Sys(r) = reg
+            && idregs::is_id_reg(r)
+        {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&data[..8]);
+            self.set_id_reg(r, u64::from_le_bytes(buf))?;
+            return Ok(size);
+        }
         match self.live()? {
             Some(hv) => self.set_reg_now(hv, reg_id, &data[..size])?,
             // The counter is the VM's, and counts from the time of the write.
@@ -567,7 +603,15 @@ impl VcpuFd {
         if data.len() < size {
             return err(libc::EINVAL);
         }
-        regs::decode(reg_id).ok_or_else(|| Error::new(libc::ENOENT))?;
+        let reg = regs::decode(reg_id).ok_or_else(|| Error::new(libc::ENOENT))?;
+        self.check_visible(reg)?;
+        if let Reg::Sys(r) = reg
+            && idregs::is_id_reg(r)
+        {
+            let v = self.id_reg(r)?;
+            data[..8].copy_from_slice(&v.to_le_bytes());
+            return Ok(size);
+        }
         match self.live()? {
             Some(hv) => self.get_reg_now(hv, reg_id, &mut data[..size])?,
             None => self.get_reg_early(reg_id, &mut data[..size])?,
@@ -579,7 +623,17 @@ impl VcpuFd {
     pub fn get_reg_list(&self, reg_list: &mut RegList) -> Result<()> {
         self.fd.check()?;
         self.check_initialized()?;
-        let ids = regs::reg_list();
+        let mut ids = regs::reg_list();
+        if self.ptrauth_hidden()? {
+            ids.retain(|id| !matches!(regs::decode(*id), Some(Reg::Sys(r)) if idregs::is_ptrauth_key(r)));
+        }
+        let host = self.host_regs()?;
+        ids.extend(
+            idregs::ID_REGS
+                .iter()
+                .map(|r| regs::sys_id(*r))
+                .filter(|id| host.contains_key(id)),
+        );
         let capacity = reg_list.as_fam_struct_ref().n as usize;
         // SAFETY: only the header's `n` is written, like the kernel does.
         unsafe { (*reg_list.as_mut_fam_struct_ptr()).n = ids.len() as u64 };
@@ -590,24 +644,117 @@ impl VcpuFd {
         Ok(())
     }
 
-    /// Initializes the vCPU. Supported features: `POWER_OFF` and `PSCI_0_2`.
+    /// Whether the vCPUs were given no pointer authentication, which hides
+    /// its key registers, as on KVM.
+    fn ptrauth_hidden(&self) -> Result<bool> {
+        Ok(*self.vm()?.ptrauth.lock().unwrap() != Some(true))
+    }
+
+    /// `ENOENT` for a register KVM hides from this vCPU: the pointer
+    /// authentication keys without `KVM_ARM_VCPU_PTRAUTH_ADDRESS` and
+    /// `_GENERIC` (sys_regs.c `ptrauth_visibility`; `kvm_sys_reg_get_user`
+    /// and `kvm_sys_reg_set_user` refuse a hidden register). A state that
+    /// has them is refused by such a vCPU, as on KVM.
+    fn check_visible(&self, reg: Reg) -> Result<()> {
+        match reg {
+            Reg::Sys(r) if idregs::is_ptrauth_key(r) && self.ptrauth_hidden()? => err(libc::ENOENT),
+            _ => Ok(()),
+        }
+    }
+
+    /// The register values of a new Hypervisor.framework vCPU.
+    fn host_regs(&self) -> Result<HashMap<u64, Vec<u8>>> {
+        let vm = self.vm()?;
+        vm.reset_regs.get_or_init(probe_reset_regs).clone().map_err(Error::new)
+    }
+
+    /// The host's value of an ID register, `None` if this
+    /// Hypervisor.framework does not have it; without pointer
+    /// authentication in the vCPU features, with its fields 0, as KVM
+    /// shows it.
+    fn host_id_reg(&self, r: u16) -> Result<Option<u64>> {
+        let vm = self.vm()?;
+        let reset = vm
+            .reset_regs
+            .get_or_init(probe_reset_regs)
+            .as_ref()
+            .map_err(|e| Error::new(*e))?;
+        let hidden = if *vm.ptrauth.lock().unwrap() == Some(true) { 0 } else { idregs::ptrauth_fields(r) };
+        Ok(reset.get(&regs::sys_id(r)).map(|v| {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&v[..8]);
+            u64::from_le_bytes(buf) & !hidden
+        }))
+    }
+
+    /// An ID register as the guest sees it: the VM's value if user space
+    /// wrote one, else the host's; 0 for one the host does not have.
+    fn id_reg(&self, r: u16) -> Result<u64> {
+        if let Some(v) = self.vm()?.id_regs.lock().unwrap().get(&r) {
+            return Ok(*v);
+        }
+        Ok(self.host_id_reg(r)?.unwrap_or(0))
+    }
+
+    /// Writes an ID register for the whole VM (`idregs`): `EBUSY` once a
+    /// vCPU has run, unless unchanged; `EINVAL` for a field raised above the
+    /// host's or one KVM does not let user space change.
+    fn set_id_reg(&self, r: u16, v: u64) -> Result<()> {
+        let vm = self.vm()?;
+        let host = self.host_id_reg(r)?;
+        let mut id_regs = vm.id_regs.lock().unwrap();
+        let current = id_regs.get(&r).copied().unwrap_or(host.unwrap_or(0));
+        if v == current {
+            return Ok(());
+        }
+        if vm.id_locked.load(Ordering::Acquire) {
+            return err(libc::EBUSY);
+        }
+        match host {
+            // One the host does not have takes only 0 (above).
+            None => return err(libc::EINVAL),
+            Some(h) => idregs::check_write(r, h, v).map_err(|_| Error::new(libc::EINVAL))?,
+        }
+        id_regs.insert(r, v);
+        Ok(())
+    }
+
+    /// Initializes the vCPU. Supported features: `POWER_OFF`, `PSCI_0_2`, and
+    /// `PTRAUTH_ADDRESS` with `PTRAUTH_GENERIC`.
     pub fn vcpu_init(&self, kvi: &kvm_vcpu_init) -> Result<()> {
         self.fd.check()?;
         // The target must be the one `get_preferred_target` reports, as on KVM.
         if kvi.target != kvm_bindings::KVM_ARM_TARGET_GENERIC_V8 {
             return err(libc::EINVAL);
         }
-        let allowed = (1 << KVM_ARM_VCPU_POWER_OFF) | (1 << KVM_ARM_VCPU_PSCI_0_2);
+        let ptrauth = (1 << KVM_ARM_VCPU_PTRAUTH_ADDRESS) | (1 << KVM_ARM_VCPU_PTRAUTH_GENERIC);
+        let allowed = (1 << KVM_ARM_VCPU_POWER_OFF) | (1 << KVM_ARM_VCPU_PSCI_0_2) | ptrauth;
         if kvi.features[0] & !allowed != 0 || kvi.features[1..].iter().any(|f| *f != 0) {
             return err(libc::EINVAL);
         }
-        // A new vCPU's register values come from a scratch vCPU on a thread
-        // of its own: read now, while the host sandbox still lets a thread
-        // be made (Firecracker inits its vCPUs before it narrows it), not
-        // when a vCPU the guest starts again (PSCI CPU_ON) is reset in the
-        // run phase, which makes no thread (SYS_bsdthread_create denied, as
-        // Linux's vCPU filter has no clone).
-        let _ = self.vm()?.reset_regs.get_or_init(probe_reset_regs);
+        // Both pointer authentication features or neither, as KVM requires;
+        // and the same for every vCPU of the VM.
+        let has_ptrauth = match kvi.features[0] & ptrauth {
+            0 => false,
+            p if p == ptrauth => true,
+            _ => return err(libc::EINVAL),
+        };
+        {
+            let vm = self.vm()?;
+            // A new vCPU's register values come from a scratch vCPU on a
+            // thread of its own: read now, while the host sandbox still lets
+            // a thread be made (Firecracker inits its vCPUs before it narrows
+            // it), not in the run phase, which makes no thread
+            // (SYS_bsdthread_create denied, as Linux's vCPU filter has no
+            // clone): when a snapshot first lists the registers, or when a
+            // vCPU the guest starts again (PSCI CPU_ON) is reset.
+            let _ = vm.reset_regs.get_or_init(probe_reset_regs);
+            let mut chosen = vm.ptrauth.lock().unwrap();
+            if chosen.is_some_and(|c| c != has_ptrauth) {
+                return err(libc::EINVAL);
+            }
+            *chosen = Some(has_ptrauth);
+        }
         // KVM resets the vCPU: PSTATE and SCTLR_EL1 get their reset values
         // (other registers start as Hypervisor.framework creates them).
         let reset = [
@@ -812,8 +959,13 @@ impl VcpuFd {
         }
         self.set_reg_now(hv, regs::SCTLR_ID, &regs::SCTLR_RESET.to_le_bytes())?;
         // Breakpoints (DBGBVRn, DBGBCRn) and watchpoints (DBGWVRn,
-        // DBGWCRn), as many as ID_AA64DFR0_EL1 says the vCPU has.
-        let dfr0 = self.sys(hv, HV_SYS_REG_ID_AA64DFR0_EL1)?;
+        // DBGWCRn): every one the host has (its ID_AA64DFR0_EL1, not the
+        // VM's, which a CPU template may lower), as KVM resets them all.
+        let dfr0 = reset
+            .get(&regs::sys_id(HV_SYS_REG_ID_AA64DFR0_EL1))
+            .and_then(|v| v.as_slice().try_into().ok())
+            .map(u64::from_le_bytes)
+            .ok_or_else(|| Error::new(libc::ENOENT))?;
         let breakpoints = ((dfr0 >> 12) & 0xf) + 1;
         let watchpoints = ((dfr0 >> 20) & 0xf) + 1;
         for n in 0..16u16 {
