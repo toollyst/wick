@@ -226,6 +226,12 @@ mod macos {
         "issetugid", "proc_info_extended_id", "terminate_with_payload",
         // getrandom, clock_gettime, gettid.
         "getentropy", "gettimeofday", "thread_selfid",
+        // clock_gettime(CLOCK_PROCESS_CPUTIME_ID): libc reads the process's
+        // CPU clock with getrusage(RUSAGE_SELF) (utils::time's ProcessCpu; the
+        // boot timer reads it on a vCPU thread when the guest writes to it,
+        // measured: denied, the microVM stopped with SIGSYS). getrusage
+        // reports on the process itself or its children only.
+        "getrusage",
         // rt_sigaction, rt_sigprocmask, rt_sigreturn, sigaltstack, tkill.
         "sigaction", "sigprocmask", "__pthread_sigmask", "sigreturn", "sigaltstack",
         "__pthread_kill",
@@ -430,7 +436,7 @@ mod macos {
     /// runs unfiltered until then), measured as [`SYSCALLS`] are.
     pub const SETUP_SYSCALLS: &[&str] = &[
         "geteuid", "access", "dup", "pipe", "getegid", "dup2", "bind",
-        "listen", "getrusage", "socketpair", "csops", "csops_audittoken",
+        "listen", "socketpair", "csops", "csops_audittoken",
         "kdebug_typefilter", "kdebug_trace_string", "kdebug_trace64", "getrlimit", "sysctl",
         "getattrlist", "shm_open", "shm_unlink", "gettid", "proc_info",
         "getdirentries64", "bsdthread_create", "kqueue", "sigsuspend_nocancel", "fileport_makefd",
