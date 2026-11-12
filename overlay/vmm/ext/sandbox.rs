@@ -59,8 +59,8 @@ pub use macos::{
     ABSENT, FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MEASURED_MAJORS, MIG_ROUTINES,
     PROFILE, RUN_DENIED_OPERATIONS, SETUP_MIG_ROUTINES_IF_DEFINED, SYSCALLS, Skip,
     SIGSYS_DEADLINE, SigsysHandler, UNFILTERED_SYSCALLS, api_profile, apply, apply_api, narrowed,
-    denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select, selected,
-    set_sigsys_handler,
+    denied_elsewhere, denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select,
+    selected, set_sigsys_handler, set_sigsys_report,
 };
 
 /// Narrows the sandbox to what a running microVM needs, for good. Called
@@ -1269,10 +1269,15 @@ mod macos {
         if kq < 0 {
             return Err(fail(std::io::Error::last_os_error()));
         }
+        // A thread's start (its QoS, its name) makes calls the API
+        // process's sandbox does not allow: each says when it waits.
+        let (started, wait) = std::sync::mpsc::channel();
+        let deadline_started = started.clone();
         std::thread::Builder::new()
             .name("fc_sigsys_deadline".into())
             .spawn(move || {
                 block_all_signals();
+                let _ = deadline_started.send(());
                 if read_byte(start_r) != 1 {
                     park_forever();
                 }
@@ -1301,6 +1306,7 @@ mod macos {
             .name("fc_sigsys".into())
             .spawn(move || {
                 block_all_signals();
+                let _ = started.send(());
                 if read_byte(wake_r) != 1 {
                     park_forever();
                 }
@@ -1312,18 +1318,79 @@ mod macos {
                 info.si_signo = libc::SIGSYS;
                 info.si_pid = SIGSYS_PID.load(Ordering::Acquire);
                 info.si_code = SIGSYS_CODE.load(Ordering::Relaxed);
-                // SAFETY: stored by set_sigsys_handler (checked above).
-                let handler: SigsysHandler =
-                    unsafe { std::mem::transmute(SIGSYS_HANDLER.load(Ordering::Acquire)) };
-                handler(libc::SIGSYS, &mut info, std::ptr::null_mut());
+                match SIGSYS_REPORT.load(Ordering::Acquire) {
+                    // Firecracker: upstream's handler.
+                    0 => {
+                        // SAFETY: stored by set_sigsys_handler (checked
+                        // above).
+                        let handler: SigsysHandler =
+                            unsafe { std::mem::transmute(SIGSYS_HANDLER.load(Ordering::Acquire)) };
+                        handler(libc::SIGSYS, &mut info, std::ptr::null_mut());
+                    }
+                    // The API process: Firecracker is told, and ends as for
+                    // its own denied call.
+                    report => {
+                        // SAFETY: a fn() stored by set_sigsys_report.
+                        let report: fn() = unsafe { std::mem::transmute(report) };
+                        report();
+                    }
+                }
                 // Upstream's handler exits; if it returns, so does this.
                 // SAFETY: ends the process.
                 unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) };
             })
             .map_err(fail)?;
+        for _ in 0..2 {
+            wait.recv().map_err(|_| fail(std::io::Error::other("a SIGSYS thread ended")))?;
+        }
         WAITER_PID.store(me, Ordering::Release);
         WAITER_PIPE.store(wake_w, Ordering::Release);
         Ok(())
+    }
+
+    /// What the waiter runs in place of upstream's handler, if set
+    /// ([`set_sigsys_report`]).
+    static SIGSYS_REPORT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Makes the waiter run `report`, then exit 148, in place of upstream's
+    /// handler: the API process tells Firecracker of its denied call
+    /// (`api_process`), as an API thread's ends Firecracker on Linux.
+    pub fn set_sigsys_report(report: fn()) {
+        SIGSYS_REPORT.store(report as usize, Ordering::Release);
+    }
+
+    /// Ends Firecracker as for a call its own sandbox denied, for a denial
+    /// elsewhere (the API process's): the waiter runs upstream's handler
+    /// (its log line, metrics, exit 148). Does not return.
+    pub fn denied_elsewhere() -> ! {
+        // SAFETY: no arguments.
+        let me = unsafe { libc::getpid() };
+        let pipe = WAITER_PIPE.load(Ordering::Acquire);
+        if pipe >= 0 && WAITER_PID.load(Ordering::Acquire) == me {
+            SIGSYS_CODE.store(0, Ordering::Relaxed);
+            SIGSYS_PID.store(me, Ordering::Release);
+            let byte = 1u8;
+            // SAFETY: one byte from the stack to the waiter's pipe.
+            let n = unsafe { libc::write(pipe, (&raw const byte).cast(), 1) };
+            // SAFETY: errno of this thread.
+            if n != 1 && unsafe { *errno_location() } != libc::EAGAIN {
+                // SAFETY: ends the process.
+                unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) };
+            }
+            park_forever();
+        }
+        // No waiter (no sandbox here): upstream's handler on this thread.
+        // SAFETY: a zeroed siginfo with the sandbox's fields.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        info.si_signo = libc::SIGSYS;
+        info.si_pid = me;
+        if let handler @ 1.. = SIGSYS_HANDLER.load(Ordering::Acquire) {
+            // SAFETY: stored by set_sigsys_handler.
+            let handler: SigsysHandler = unsafe { std::mem::transmute(handler) };
+            handler(libc::SIGSYS, &mut info, std::ptr::null_mut());
+        }
+        // SAFETY: ends the process.
+        unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) }
     }
 
     /// Installs `compiled`, marked installed first: from its first denial on,

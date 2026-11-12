@@ -603,7 +603,10 @@ mod imp {
                     drop(ours);
                     api_process(theirs, uid, gid, api_cpu, api_memory);
                 }
-                _ => drop(theirs),
+                child => {
+                    drop(theirs);
+                    crate::ext::api_process::watch_child(child);
+                }
             }
             if let Some(mib) = vmm_memory {
                 limit_memory(mib)?;

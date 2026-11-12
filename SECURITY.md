@@ -138,7 +138,12 @@ upstream Firecracker and its jailer.
   socket's HTTP server and upstream's request parsing run in a process sandboxed as upstream's `api` filter (its
   system calls only, no files, no shared memory, no executable mappings), and Firecracker's API thread handles the
   requests it passes on with upstream's code; either process's end ends the other (`test_api_profile_*`,
-  `boot-test api-process`). In a jail the two share the jail's memory and CPU limits, so together they stay within
+  `boot-test api-process`). A call the API process's sandbox denies ends Firecracker with the bad-syscall code,
+  its log line and metrics, as the API thread's trapped call does on Linux: the API process says so over the link,
+  or Firecracker, its parent, reads its exit status
+  (`test_a_denied_call_in_the_api_process_ends_firecracker_as_its_own`,
+  `test_an_api_process_that_exits_148_ends_firecracker_as_its_own`). A compromised API process that says so
+  falsely can do no more than end Firecracker, which it can do anyway by ending the link. In a jail the two share the jail's memory and CPU limits, so together they stay within
   them (`test_limits_are_shared_with_the_api_process`; the jailer-test stage needs root). On Windows the same is
   in place without a fork: the API process is a second process from Firecracker's binary, made by Firecracker
   before its sandbox is set, or by the jailer in a jail on the jail's token and in its Job Object, with its end of
