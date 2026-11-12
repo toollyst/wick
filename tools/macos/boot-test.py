@@ -1981,7 +1981,13 @@ def stage_pvtime(ctx):
     # that time as the wait's, so the guest is given no steal for it, where
     # KVM counts the woken thread's run delay (docs/COMPATIBILITY.md, PV time).
     check(idle_hogs < 200, f"steal counted while the guest idled: {detail}")
-    check(results["idle guest"][2] < 5, f"kicks while the guest idled: {detail}")
+    # Each kick takes a vCPU kept off its CPU for 1 ms while runnable, and a
+    # mostly waiting vCPU is kept off its CPU no more than the control, which
+    # never waits: at most 2 kicks/s (two vCPUs) per ms/s the control lost,
+    # plus 5/s. On a quiet host about 5/s; the host's load raises the bound,
+    # as it raises the kicks.
+    idle_control_ms_per_s = results["idle guest"][1] / PVTIME_CASE_S
+    check(results["idle guest"][2] < 5 + 2 * idle_control_ms_per_s, f"kicks while the guest idled: {detail}")
     vm.reboot()
     return detail
 
