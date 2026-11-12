@@ -1057,9 +1057,14 @@ def stage_cgroup_devices(ctx):
     return _cgroup_test().stage_cgroup_devices(ctx, types.SimpleNamespace(**globals()))
 
 
+def stage_freeze(ctx):
+    return _cgroup_test().stage_freeze(ctx, types.SimpleNamespace(**globals()))
+
+
 STAGES = {
     "refuse": stage_refuse,
     "cgroup-devices": stage_cgroup_devices,
+    "freeze": stage_freeze,
     "jail": stage_jail,
     "daemonize": stage_daemonize,
     "pidns": stage_pidns,

@@ -166,7 +166,7 @@ The short version; the [full roadmap](docs/ROADMAP.md) has the status of every r
 - [x] Windows: WHP backend and the POSIX layer, native CI
 - [x] Windows: boot, snapshots, PCI, userfaultfd and vhost-user on real hardware (one PC so far)
 - [ ] Security parity: the upstream `jailer` CLI with native backends (macOS: chroot, uid/gid, memory and CPU
-  limits; Windows: the jail drive and token, Job Object limits, the mitigation profile, `--daemonize`; both:
+  limits, the freezer; Windows: the jail drive and token, Job Object limits, the mitigation profile, `--daemonize`; both:
   `--netns` as a directory of network endpoints)
 - [ ] Images everywhere: x86_64 images on Apple silicon (FEX-Emu with hardware TSO), arm64 images on Windows
 - [ ] Desktop devices: user-mode networking, virtio-fs

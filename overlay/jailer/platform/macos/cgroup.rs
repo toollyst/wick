@@ -16,14 +16,19 @@
 //! blocks the process's threads once they used their share of each second,
 //! as CFS throttles a cgroup once it used its quota of each period.
 //! `cpuset.cpus` and `cpuset.mems` naming every CPU and memory node are no
-//! restriction, on macOS as on Linux. Every other controller and property is
-//! refused with its reason ([`refusal`]), never accepted without effect. macOS has no cgroup hierarchy, so
-//! the v2 hierarchy is an empty directory: there is no parent cgroup to join.
+//! restriction, on macOS as on Linux. The freezer is upstream's files next to
+//! the jail, kept by a supervisor process (`platform::freezer`); as on Linux,
+//! `freezer.state=FROZEN|THAWED` is the one freezer value taken at the start
+//! (v1: the jailer stops at this step until thawed), and `cgroup.*` is
+//! refused as upstream refuses it, `cgroup` being no controller. Every other
+//! controller and property is refused with its reason ([`refusal`]), never
+//! accepted without effect. macOS has no cgroup hierarchy, so the v2
+//! hierarchy is an empty directory: there is no parent cgroup to join.
 
 use std::path::{Path, PathBuf};
 
 use crate::JailerError;
-use crate::platform::{self, HostError};
+use crate::platform::{self, FreezerState, FreezerVersion, HostError};
 
 /// The (empty) cgroup v2 hierarchy on macOS.
 const NO_HIERARCHY: &str = "/var/empty";
@@ -39,6 +44,7 @@ pub struct CgroupConfigurationBuilder {
     hierarchy: PathBuf,
     memory_limit_mib: Option<i32>,
     cpu: CpuBandwidth,
+    freezer: Option<FreezerState>,
 }
 
 /// The CPU bandwidth asked for: quota and period in microseconds, as given.
@@ -53,12 +59,16 @@ struct CpuBandwidth {
 impl CgroupConfigurationBuilder {
     pub fn new(ver: u8, _proc_mounts_path: &str) -> Result<Self, JailerError> {
         match ver {
-            1 | 2 => Ok(CgroupConfigurationBuilder {
-                version: ver,
-                hierarchy: PathBuf::from(NO_HIERARCHY),
-                memory_limit_mib: None,
-                cpu: CpuBandwidth::default(),
-            }),
+            1 | 2 => {
+                platform::set_cgroup_version(if ver == 1 { FreezerVersion::V1 } else { FreezerVersion::V2 });
+                Ok(CgroupConfigurationBuilder {
+                    version: ver,
+                    hierarchy: PathBuf::from(NO_HIERARCHY),
+                    memory_limit_mib: None,
+                    cpu: CpuBandwidth::default(),
+                    freezer: None,
+                })
+            }
             _ => Err(JailerError::CgroupInvalidVersion(ver.to_string())),
         }
     }
@@ -70,10 +80,33 @@ impl CgroupConfigurationBuilder {
         _id: &str,
         _parent_cg: &Path,
     ) -> Result<(), JailerError> {
+        let controller = file.split_once('.').map_or(file.as_str(), |(c, _)| c);
         match (self.version, file.as_str()) {
-            // v2 has no devices controller: upstream's error.
-            (2, f) if f.starts_with("devices.") => {
-                return Err(JailerError::CgroupControllerUnavailable("devices".to_owned()));
+            // `cgroup` is no controller: upstream finds no hierarchy (v1) or
+            // no entry in cgroup.controllers (v2) for it.
+            _ if controller == "cgroup" => {
+                return Err(JailerError::CgroupControllerUnavailable(controller.to_owned()));
+            }
+            // v2 has no devices controller, and no freezer controller (its
+            // freezer is cgroup.freeze): upstream's error.
+            (2, _) if controller == "devices" || controller == "freezer" => {
+                return Err(JailerError::CgroupControllerUnavailable(controller.to_owned()));
+            }
+            (1, "freezer.state") => {
+                self.freezer = Some(platform::parse_freezer_start(&value).ok_or_else(|| {
+                    HostError::CgroupValue(
+                        format!("{file}={value}"),
+                        "only FROZEN or THAWED: the kernel refuses any other value written to freezer.state",
+                    )
+                })?);
+            }
+            (1, _) if controller == "freezer" => {
+                return Err(HostError::CgroupValue(
+                    format!("{file}={value}"),
+                    "not a file the jailer can write: the kernel refuses its write to it (freezer.self_freezing and \
+                     freezer.parent_freezing are read-only)",
+                )
+                .into());
             }
             (2, "cpu.max") => self.cpu = cpu_max(&file, &value)?,
             (1, "cpu.cfs_quota_us") => self.cpu.quota_us = cfs_quota(&file, &value)?,
@@ -89,6 +122,7 @@ impl CgroupConfigurationBuilder {
         CgroupConfiguration {
             memory_limit_mib: self.memory_limit_mib,
             cpu: self.cpu,
+            freezer: self.freezer,
         }
     }
 
@@ -104,6 +138,7 @@ impl CgroupConfigurationBuilder {
 pub struct CgroupConfiguration {
     memory_limit_mib: Option<i32>,
     cpu: CpuBandwidth,
+    freezer: Option<FreezerState>,
 }
 
 impl CgroupConfiguration {
@@ -112,6 +147,11 @@ impl CgroupConfiguration {
         let cpu_percent = cpu_percent(self.cpu)?;
         platform::set_memory_limit_mib(self.memory_limit_mib);
         platform::set_cpu_limit_percent(cpu_percent);
+        // Last, as Linux attaches the jailer to its cgroups after writing
+        // every property: FROZEN stops the jailer here.
+        if let Some(state) = self.freezer {
+            platform::freezer_at_cgroup_step(state)?;
+        }
         Ok(())
     }
 }
@@ -432,6 +472,43 @@ mod tests {
             }
             let err = limit(v, &["cpuset.cpus=0-1"]).unwrap_err();
             assert!(err.to_string().contains("KERN_NOT_SUPPORTED"), "{err}");
+        }
+    }
+
+    fn builder(version: u8, props: &[&str]) -> Result<CgroupConfigurationBuilder, JailerError> {
+        let mut b = CgroupConfigurationBuilder::new(version, "/proc/mounts")?;
+        for p in props {
+            let (f, v) = p.split_once('=').unwrap();
+            b.add_cgroup_property(f.into(), v.into(), "id", Path::new("fc"))?;
+        }
+        Ok(b)
+    }
+
+    // The freezer at the start, as upstream's jailer on Linux: v1
+    // freezer.state takes FROZEN or THAWED (the kernel refuses any other
+    // value written to it, and the other freezer files are read-only);
+    // `cgroup` is no controller, with either version (upstream finds no
+    // hierarchy or cgroup.controllers entry for it), so v2's cgroup.freeze is
+    // refused at the start; v2 has no freezer controller.
+    #[test]
+    fn test_freezer_at_the_start() {
+        for (p, want) in [("freezer.state=FROZEN", FreezerState::Frozen), ("freezer.state=THAWED", FreezerState::Thawed)] {
+            assert_eq!(builder(1, &[p]).unwrap().build().freezer, Some(want), "{p}");
+        }
+        assert_eq!(builder(1, &["memory.limit_in_bytes=-1"]).unwrap().build().freezer, None);
+        for p in ["freezer.state=FREEZING", "freezer.state=", "freezer.state=frozen", "freezer.self_freezing=1"] {
+            let err = builder(1, &[p]).unwrap_err();
+            assert!(matches!(err, JailerError::Host(HostError::CgroupValue(..))), "{p}: {err}");
+        }
+        for (v, p, controller) in [
+            (2, "cgroup.freeze=1", "cgroup"),
+            (2, "cgroup.freeze=0", "cgroup"),
+            (2, "cgroup.procs=1", "cgroup"),
+            (1, "cgroup.freeze=1", "cgroup"),
+            (2, "freezer.state=FROZEN", "freezer"),
+        ] {
+            let err = builder(v, &[p]).unwrap_err();
+            assert_eq!(err.to_string(), format!("Controller {controller} is unavailable"), "v{v} {p}");
         }
     }
 

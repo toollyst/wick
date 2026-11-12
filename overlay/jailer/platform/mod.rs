@@ -12,12 +12,12 @@
 //! | Interface (upstream)                       | Linux (upstream)              | macOS                                                        |
 //! |--------------------------------------------|-------------------------------|--------------------------------------------------------------|
 //! | `chroot::chroot`                           | mount namespace + `pivot_root`| `chroot(2)`, left again for the exec only (below)            |
-//! | `cgroup::CgroupConfigurationBuilder`       | cgroup v1/v2 files            | `memory.max` / `memory.limit_in_bytes` → jetsam limit at exec; `cpu.max` / `cpu.cfs_*` → a CPU limit Firecracker applies to itself; other controllers refused; an empty hierarchy (no parent cgroup to join) |
+//! | `cgroup::CgroupConfigurationBuilder`       | cgroup v1/v2 files            | `memory.max` / `memory.limit_in_bytes` → jetsam limit at exec; `cpu.max` / `cpu.cfs_*` → a CPU limit Firecracker applies to itself; the freezer → upstream's files next to the jail, kept by a supervisor (`freezer`); other controllers refused; an empty hierarchy (no parent cgroup to join) |
 //! | `Env::join_netns` → [`join_netns`]         | `setns(CLONE_NEWNET)`         | a directory of endpoints, granted to the jail's uid and named to Firecracker at the exec (`WICK_NETNS`); the sandbox denies all IP networking |
 //! | `Env::exec_into_new_pid_ns` → [`new_pid_ns`] | `clone(CLONE_NEWPID)`       | a fork; the jail holds what the namespace would (`new_pid_ns`) |
 //! | `Env::mknod_and_own_dev` → [`mknod_and_own_dev`] | device nodes in the jail | none needed: Hypervisor.framework, vmnet, `getentropy` and wick's userfaultfd use no device node |
 //! | `Env::copy_midr_el1_info` → [`copy_midr_el1_info`] | sysfs file in the jail | nothing to copy: macOS has no sysfs, the same inside the jail as outside |
-//! | `Env::exec_command` → [`exec_command`]     | exec as `uid:gid`             | exec with the jail handed over to Firecracker (`vmm::ext::jail`) |
+//! | `Env::exec_command` → [`exec_command`]     | exec as `uid:gid`             | exec with the jail handed over to Firecracker (`vmm::ext::jail`), after the jail's freezer supervisor is started |
 //! | `close_fds_by_close_range` → [`close_fds_by_close_range`] | `close_range` | descriptors listed with `proc_pidinfo` and closed      |
 //!
 //! No program can start inside a chroot on macOS: dyld maps the system

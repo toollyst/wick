@@ -14,6 +14,9 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::JailerError;
 
+mod freezer;
+pub(crate) use freezer::{State as FreezerState, Version as FreezerVersion, parse_start as parse_freezer_start};
+
 /// Environment variable through which Firecracker takes the jail over
 /// (`vmm::ext::jail::ENV`).
 const JAIL_ENV: &str = "WICK_JAIL";
@@ -76,8 +79,8 @@ unsafe extern "C" {
 pub enum HostError {
     #[error(
         "--cgroup {0} is not supported on macOS: {1} (supported: memory.max and cpu.max with \
-         --cgroup-version 2, memory.limit_in_bytes, cpu.cfs_quota_us and cpu.cfs_period_us with \
-         --cgroup-version 1, and cpuset.cpus and cpuset.mems naming every CPU and memory node). \
+         --cgroup-version 2, memory.limit_in_bytes, cpu.cfs_quota_us, cpu.cfs_period_us and \
+         freezer.state with --cgroup-version 1, and cpuset.cpus and cpuset.mems naming every CPU and memory node). \
          The jailer never accepts a limit it cannot enforce."
     )]
     UnsupportedCgroup(String, &'static str),
@@ -94,6 +97,8 @@ pub enum HostError {
          unjailed as root"
     )]
     NoHandover(PathBuf),
+    #[error("The jail's freezer: {0}")]
+    Freezer(String),
     #[error("Failed to copy {0:?} to {1:?} for the exec: {2}")]
     CopyExec(PathBuf, PathBuf, io::Error),
     #[error("Failed to make the jail's temporary directory: {0}")]
@@ -131,6 +136,40 @@ pub(crate) fn set_memory_limit_mib(limit: Option<i32>) {
 
 pub(crate) fn set_cpu_limit_percent(limit: Option<u8>) {
     *CPU_LIMIT_PERCENT.lock().unwrap() = limit;
+}
+
+/// The jail's cgroup version, whose freezer files it gets (`freezer`).
+pub(crate) fn set_cgroup_version(version: FreezerVersion) {
+    freezer::set_version(version);
+}
+
+/// `--cgroup freezer.state=<state>` (v1), at the cgroup step: the freezer's
+/// files are made now and, for `FROZEN`, the jailer stops here until they
+/// say `THAWED`, as on Linux the jailer freezes itself at this step
+/// (`freezer`).
+pub(crate) fn freezer_at_cgroup_step(state: FreezerState) -> Result<(), JailerError> {
+    let dir = jail_dir_from_args()?;
+    freezer::at_cgroup_step(&dir, state).map_err(|e| HostError::Freezer(e.to_string()).into())
+}
+
+/// The jail's directory (`<chroot-base>/<exec file name>/<id>`), as
+/// `Env::new` makes it from the same command line (the cgroup step is not
+/// given it; upstream's `main` has made it already).
+fn jail_dir_from_args() -> Result<PathBuf, JailerError> {
+    let mut parser = crate::build_arg_parser();
+    parser.parse_from_cmdline().map_err(JailerError::ArgumentParsing)?;
+    let args = parser.arguments();
+    let value = |name: &'static str| {
+        args.single_value(name)
+            .cloned()
+            .ok_or_else(|| HostError::Freezer(format!("no --{name} on the command line")))
+    };
+    let base = value("chroot-base-dir")?;
+    let exec = value("exec-file")?;
+    let base = std::fs::canonicalize(&base).map_err(|e| JailerError::Canonicalize(PathBuf::from(&base), e))?;
+    let exec = std::fs::canonicalize(&exec).map_err(|e| JailerError::Canonicalize(PathBuf::from(&exec), e))?;
+    let name = exec.file_name().ok_or_else(|| JailerError::ExtractFileName(exec.clone()))?;
+    Ok(base.join(name).join(value("id")?))
 }
 
 /// `--netns`: the jail's network.
@@ -410,7 +449,9 @@ pub fn copy_midr_el1_info() -> Result<(), JailerError> {
 /// (`POSIX_SPAWN_SETEXEC`: same PID) with only the standard descriptors,
 /// `WICK_JAIL` (and `WICK_JAIL_CPU`, `WICK_JAIL_MEMORY` for the limits,
 /// `WICK_NETNS` for the jail's network) as its whole environment
-/// and the jetsam memory limit. Returns only on failure.
+/// and the jetsam memory limit. Just before, it starts the jail's freezer
+/// supervisor (`freezer`), which holds the exec back while the jail is
+/// frozen. Returns only on failure.
 pub fn exec_command(
     exec_file_path: &Path,
     chroot_dir: &Path,
@@ -434,6 +475,8 @@ fn exec(
     jail_tmp(uid, gid)?;
     leave_chroot()?;
     let exec_file = copy_for_exec(exec_file_path, chroot_dir)?;
+    let jail_dir = chroot_dir.parent().unwrap_or(chroot_dir);
+    let freezer = freezer::files_for_exec(jail_dir).map_err(|e| HostError::Freezer(e.to_string()))?;
 
     let mut argv = vec![CString::new(exec_file.as_os_str().as_bytes()).expect("path has no NUL")];
     for arg in args {
@@ -518,6 +561,9 @@ fn exec(
             return Err(fail("posix_spawnattr_setjetsam_ext", ret));
         }
     }
+    // Last before the exec: the jail's supervisor, which may hold the exec
+    // back while the jail is frozen.
+    freezer::start_supervisor(freezer).map_err(HostError::Freezer)?;
     // SAFETY: NUL-terminated path, argument and environment vectors that
     // outlive the call; attributes initialised above.
     let ret = unsafe {
