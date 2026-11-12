@@ -60,6 +60,20 @@ struct Timer {
     interval: Duration,
 }
 
+impl Timer {
+    /// Whether the caller closed the timer: no reader is left on the FIFO.
+    /// A write of no bytes fails with `EPIPE` then, and writes nothing
+    /// while there is one (measured). Linux frees a timer at its close;
+    /// here that cannot be seen, so a closed timer is found by this, at its
+    /// next expiration or the next time a timer is made or a timer thread
+    /// wakes, and its FIFO released then.
+    fn closed(&self) -> bool {
+        // SAFETY: a write of no bytes to a descriptor we own.
+        let n = unsafe { libc::write(self.write_end.as_raw_fd(), [0u8; 1].as_ptr().cast(), 0) };
+        n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE)
+    }
+}
+
 #[derive(Debug, Default)]
 struct Timers {
     by_fd: Mutex<HashMap<c_int, Timer>>,
@@ -195,7 +209,11 @@ pub unsafe fn timerfd_create(_clockid: clockid_t, flags: c_int) -> c_int {
 
     let fd = std::os::fd::IntoRawFd::into_raw_fd(read_end);
     let timers = *TIMERS;
-    timers.by_fd.lock().unwrap().insert(
+    let mut by_fd = timers.by_fd.lock().unwrap();
+    // Timers closed since: one closed while disarmed is never written, so
+    // nothing else finds it gone.
+    by_fd.retain(|_, timer| !timer.closed());
+    by_fd.insert(
         fd,
         Timer {
             write_end,
@@ -266,6 +284,7 @@ pub unsafe fn timerfd_gettime(fd: c_int, curr_value: *mut itimerspec) -> c_int {
 fn run(timers: &'static Timers) {
     let mut by_fd = timers.by_fd.lock().unwrap();
     loop {
+        by_fd.retain(|_, timer| !timer.closed());
         let now = Instant::now();
         let mut closed = Vec::new();
         for (fd, timer) in by_fd.iter_mut() {
@@ -422,6 +441,40 @@ mod tests {
     }
 
     #[test]
+    fn test_a_timer_closed_disarmed_is_released() {
+        // SAFETY: plain call.
+        let fd = unsafe { timerfd_create(libc::CLOCK_MONOTONIC, TFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: fstat into a zeroed struct.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
+        let fifo = (st.st_dev, st.st_ino);
+        let held = || {
+            TIMERS.by_fd.lock().unwrap().values().any(|t| {
+                // SAFETY: fstat into a zeroed struct, of a descriptor the
+                // registry owns.
+                let mut s: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: as above.
+                let ok = unsafe { libc::fstat(t.write_end.as_raw_fd(), &mut s) } == 0;
+                ok && (s.st_dev, s.st_ino) == fifo
+            })
+        };
+        // Never armed, then closed: on Linux the timer is gone; here the
+        // next timer made releases it.
+        // SAFETY: closing our descriptor.
+        unsafe { libc::close(fd) };
+        // SAFETY: plain call.
+        let next = unsafe { timerfd_create(libc::CLOCK_MONOTONIC, TFD_CLOEXEC) };
+        assert!(next >= 0);
+        assert!(!held());
+        // A timer still open is kept.
+        assert!(TIMERS.by_fd.lock().unwrap().contains_key(&next));
+        // SAFETY: closing our descriptor.
+        unsafe { libc::close(next) };
+    }
+
+    #[test]
     fn test_a_timer_is_a_fifo_and_its_close_is_seen() {
         // SAFETY: plain call.
         let fd = unsafe { timerfd_create(libc::CLOCK_MONOTONIC, TFD_NONBLOCK) };
@@ -435,17 +488,43 @@ mod tests {
         assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFIFO);
         // SAFETY: fcntl on our descriptor; not asked for, not set.
         assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+        // SAFETY: closing our descriptor.
+        unsafe { libc::close(fd) };
+
+        // The close of a timer: with TFD_CLOEXEC, so that no child another
+        // test spawns meanwhile holds the FIFO's read end (its expiration
+        // would then find a reader).
+        // SAFETY: plain call.
+        let fd = unsafe { timerfd_create(libc::CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
+        // The timer is known by its FIFO, not by the descriptor's number,
+        // which another test's thread may be given once it is closed.
+        let fifo = (st.st_dev, st.st_ino);
+        let held = || {
+            TIMERS.by_fd.lock().unwrap().values().any(|t| {
+                // SAFETY: fstat into a zeroed struct, of a descriptor the
+                // registry owns.
+                let mut s: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: as above.
+                let ok = unsafe { libc::fstat(t.write_end.as_raw_fd(), &mut s) } == 0;
+                ok && (s.st_dev, s.st_ino) == fifo
+            })
+        };
+        assert!(held());
         // SAFETY: valid descriptor and spec.
         assert_eq!(
-            unsafe { timerfd_settime(fd, 0, &spec(1, 0), std::ptr::null_mut()) },
+            unsafe { timerfd_settime(fd, 0, &spec(20, 0), std::ptr::null_mut()) },
             0
         );
         // SAFETY: closing our descriptor before the timer fires: its
         // expiration finds no reader (EPIPE, no SIGPIPE) and drops it.
         unsafe { libc::close(fd) };
-        let gone = (0..200).any(|_| {
+        // Well past the expiration, for a loaded host.
+        let gone = (0..1000).any(|_| {
             std::thread::sleep(Duration::from_millis(5));
-            !TIMERS.by_fd.lock().unwrap().contains_key(&fd)
+            !held()
         });
         assert!(gone);
     }
