@@ -67,8 +67,10 @@ impossible integration_tests/security/test_custom_seccomp.py
 
 # Signals sent to Firecracker from outside (SIGBUS, SIGSEGV, SIGXFSZ, SIGXCPU,
 # SIGSYS, SIGHUP, SIGPIPE, ... with kill(2)), which it logs or ignores.
-# Windows has no signals: a process can only be ended from outside
-# (TerminateProcess, what os.kill does there), which no handler sees.
+# Windows has no such signals: from outside, a process gets only a console's
+# Ctrl+C and Ctrl+Break (GenerateConsoleCtrlEvent, to the processes on the
+# caller's console), or is ended (TerminateProcess, what os.kill does there),
+# which no handler sees.
 impossible integration_tests/functional/test_signals.py::test_generic_signal_handler
 impossible integration_tests/functional/test_signals.py::test_sigxfsz_handler
 impossible integration_tests/functional/test_signals.py::test_handled_signals
@@ -92,8 +94,10 @@ impossible integration_tests/security/test_jail.py::test_cgroups_parent_cgroup_b
 impossible integration_tests/security/test_jail.py::test_cgroupsv2_written_only_once
 
 # Bind mounts into the jail (mount --bind of the kernel and rootfs) and
-# their propagation: Windows has no bind mounts; a jail's files are linked
-# into its directory.
+# their propagation: Windows has no mount namespaces, and bind mounts only as
+# bind links (CreateBindLink, bindlink.dll), from Windows 11 24H2: made by an
+# administrator, seen by every process. Windows Server 2022 has no bindlink.dll
+# (measured). A jail's files are linked into its directory.
 impossible integration_tests/security/test_jail.py::test_jailer_bind_mount_propagation
 
 # A 512 MiB tmpfs mounted for the snapshot, to make it run out of space:

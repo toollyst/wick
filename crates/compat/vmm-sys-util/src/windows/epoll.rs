@@ -21,15 +21,18 @@
 //! - a [`Redirect`]ed socket: the socket it currently names, else itself (a
 //!   listening socket that hands its traffic to the connection it accepted).
 //! - the read end of a pipe (a standard input redirected from another
-//!   process): Windows pipes have no readiness to wait for, and a pending
-//!   read would hold up every other call on a synchronous handle, so a
+//!   process): a zero-byte read waits for data, but a pending read holds
+//!   up every other call on a synchronous handle
+//!   (`test_a_pending_pipe_read_holds_up_the_handle`), so a
 //!   watcher thread checks the pipe with `PeekNamedPipe` (which consumes
 //!   nothing and does not wait) and signals an event the wait is woken by.
 //!   It checks every millisecond after it saw data, backing off to every
 //!   16 ms while the pipe stays empty. The pipe is readable when it has data
 //!   and, as on Linux, reports [`EventSet::IN`] with [`EventSet::HANG_UP`]
 //!   once every writer closed and it is empty. Only [`EventSet::IN`] can be
-//!   asked for: a pipe's room for writing cannot be queried, so
+//!   asked for: the write end's `WriteQuotaAvailable` follows the room left,
+//!   but reads 0 while the reader waits in a read, when a write completes at
+//!   once (`test_pipe_write_room_reads_0_while_a_read_waits`), so
 //!   [`EventSet::OUT`] fails with `ERROR_NOT_SUPPORTED`.
 //!
 //! - another [`Epoll`] (a nested epoll): readable while it has something to
@@ -1432,6 +1435,80 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(ERROR_NOT_SUPPORTED as i32));
+        close_handle(r);
+        close_handle(w);
+    }
+
+    /// `FILE_PIPE_LOCAL_INFORMATION` of a pipe end (ntifs.h; class 24 of
+    /// `NtQueryInformationFile`): `(ReadDataAvailable, WriteQuotaAvailable)`.
+    fn pipe_local(fd: RawFd) -> (u32, u32) {
+        #[link(name = "ntdll", kind = "raw-dylib")]
+        extern "system" {
+            fn NtQueryInformationFile(h: HANDLE, io: *mut [usize; 2], info: *mut [u32; 10], len: u32, class: u32) -> i32;
+        }
+        let (mut io, mut info) = ([0usize; 2], [0u32; 10]);
+        // SAFETY: a pipe handle and out-buffers of the sizes given.
+        let status = unsafe { NtQueryInformationFile(handle(fd), &mut io, &mut info, 40, 24) };
+        assert_eq!(status, 0);
+        (info[5], info[7])
+    }
+
+    // Why `EventSet::OUT` is refused on a pipe: the write end's room reads 0
+    // while the reader waits in a read, although a write then completes at
+    // once, so it cannot tell a full pipe from one a reader drains.
+    #[test]
+    fn test_pipe_write_room_reads_0_while_a_read_waits() {
+        let (r, w) = pipe();
+        let room = pipe_local(w).1;
+        assert!(room > 0);
+        pipe_write(w, b"abc");
+        assert_eq!(pipe_local(w).1, room - 3);
+        let mut buf = [0u8; 3];
+        let mut n = 0;
+        // SAFETY: a valid buffer.
+        assert_ne!(unsafe { windows_sys::Win32::Storage::FileSystem::ReadFile(handle(r), buf.as_mut_ptr(), 3, &mut n, std::ptr::null_mut()) }, 0);
+        assert_eq!(pipe_local(w).1, room);
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0u8; room as usize];
+            let mut n = 0;
+            // SAFETY: a valid buffer.
+            unsafe { windows_sys::Win32::Storage::FileSystem::ReadFile(handle(r), buf.as_mut_ptr(), room, &mut n, std::ptr::null_mut()) };
+            n
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(pipe_local(w).1, 0);
+        pipe_write(w, b"x");
+        assert_eq!(reader.join().unwrap(), 1);
+        close_handle(r);
+        close_handle(w);
+    }
+
+    // Why the read end is watched with `PeekNamedPipe` rather than a pending
+    // zero-byte read: that read waits for data, but while it waits every
+    // other call on the (synchronous) handle waits behind it.
+    #[test]
+    fn test_a_pending_pipe_read_holds_up_the_handle() {
+        let (r, w) = pipe();
+        let reader = std::thread::spawn(move || {
+            let mut n = 0;
+            let start = std::time::Instant::now();
+            // SAFETY: zero bytes into a valid pointer.
+            let ok = unsafe { windows_sys::Win32::Storage::FileSystem::ReadFile(handle(r), [0u8; 1].as_mut_ptr(), 0, &mut n, std::ptr::null_mut()) };
+            (ok, start.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let query = std::thread::spawn(move || {
+            pipe_local(r);
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "the query did not wait");
+        pipe_write(w, b"x");
+        let (ok, took) = reader.join().unwrap();
+        assert_ne!(ok, 0);
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        query.join().unwrap();
         close_handle(r);
         close_handle(w);
     }

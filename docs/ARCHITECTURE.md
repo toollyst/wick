@@ -130,9 +130,17 @@ Upstream and the external crates (`vmm-sys-util`, `event-manager`,
 semantics on Win32. The details are in the comments of each
 `crates/compat/*/src/windows*` module.
 
-- **fd = kernel handle value.** Windows guarantees that kernel handles fit in
-  32 bits and are multiples of 4, so `RawFd` (i32, sign-extended) is the
-  `HANDLE` or `SOCKET` value itself, and 0, 1, 2 are the standard handles.
+- **fd = kernel handle value.** 64-bit Windows keeps handles in 32 bits: only
+  the low 32 bits are significant, and a handle truncated to them sign-extends
+  back (Microsoft, "Interprocess communication", 64-bit Windows programming).
+  The system ignores a handle's low two bits, which ntdef.h leaves to
+  applications as tag bits, and the kernel hands out handles that are
+  multiples of 4 (Raymond Chen, The Old New Thing, 2005-01-21; Microsoft
+  documents the tag bits, not the multiple). So `RawFd` (i32,
+  sign-extended) is the `HANDLE` or `SOCKET` value itself, and 0, 1, 2 are the
+  standard handles. Winsock promises neither for a `SOCKET` ("any value in the
+  range 0 to INVALID_SOCKET-1", Socket Data Type): the system's providers
+  return kernel handles (AFD), and the mapping relies on it.
   `wick-os` re-exports `std::os::{unix, fd}` on Unix and defines the same
   traits and types on handles on Windows (`AsRawFd`, `AsFd`, `OwnedFd`, ...;
   `unix::net`'s `UnixStream` and `UnixListener` are Winsock `AF_UNIX`).
@@ -157,8 +165,17 @@ semantics on Win32. The details are in the comments of each
   `libc`'s `read` and `recv` report `EAGAIN` through `wick_fd::drained`, which
   re-arms). `Redirect` makes a registered listening socket's readiness follow
   the connection it accepted, so a network endpoint keeps one fd for its
-  lifetime. Regular files are `EPERM` and pipes `ENOTSUP` (Windows cannot wait
-  for their readiness).
+  lifetime. Regular files are `EPERM`, as on Linux (`test_regular_file_rejected`).
+  The read end of a pipe is watched by a thread with `PeekNamedPipe`: a
+  zero-byte `ReadFile` waits for data, but on a synchronous handle it holds up
+  every other call on that handle until data comes
+  (`test_a_pending_pipe_read_holds_up_the_handle`; the watcher:
+  `test_pipe_in_and_hang_up`, `test_pipe_wakes_a_blocked_wait`).
+  `EPOLLOUT` on a pipe fails with `ERROR_NOT_SUPPORTED`
+  (`test_pipe_out_not_supported`): the write end's `WriteQuotaAvailable`
+  (`FILE_PIPE_LOCAL_INFORMATION`) follows the room left, but reads 0 while
+  the reader waits in a read, when a write completes at once
+  (`test_pipe_write_room_reads_0_while_a_read_waits`).
 - **eventfd = counter + manual-reset event.** The event is signalled while the
   counter is above zero. Counter, flags and lock live in a 4 KiB paging-file
   section, with a space event (counter < MAX). Every change happens under a

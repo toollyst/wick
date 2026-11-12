@@ -3,8 +3,11 @@
 
 //! `std::os::fd` on Windows. A descriptor is the value of a kernel handle:
 //! a `HANDLE` (files, pipes, events, consoles, processes) or a `SOCKET`.
-//! Windows guarantees handle values fit in 32 bits, and conversions back
-//! sign-extend, so `-1` is `INVALID_HANDLE_VALUE` and `INVALID_SOCKET`.
+//! 64-bit Windows keeps handle values in 32 bits and conversions back
+//! sign-extend (Microsoft, "Interprocess communication"), so `-1` is
+//! `INVALID_HANDLE_VALUE` and `INVALID_SOCKET`. Winsock does not promise it
+//! for a `SOCKET` (any value below `INVALID_SOCKET`); the system's providers
+//! return kernel handles.
 
 use std::fmt;
 use std::fs::File;
@@ -30,13 +33,15 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcess
 pub type RawFd = i32;
 
 // The conversions below are where handle values become descriptors and
-// back. They cannot lose bits: Windows keeps handle and socket values in 32
+// back. They cannot lose bits for a kernel handle: Windows keeps those in 32
 // bits (sign-extended), so 64-bit values convert to `i32` and back exactly.
+// A socket is one when it comes from the system's providers.
 
 /// The handle a descriptor names. `0`, `1` and `2` (`STDIN_FILENO`,
 /// `STDOUT_FILENO`, `STDERR_FILENO`) name this process's standard handles,
-/// as in the compatibility libc: no kernel handle has those values (handles
-/// are multiples of 4 and 0 is `NULL`), so the mapping is unambiguous.
+/// as in the compatibility libc: no kernel handle has those values (the
+/// kernel hands out multiples of 4, its low two bits being tag bits the
+/// system ignores, ntdef.h; 0 is `NULL`), so the mapping is unambiguous.
 #[allow(clippy::as_conversions)]
 pub fn handle(fd: RawFd) -> HANDLE {
     let std = match fd {
