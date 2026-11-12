@@ -107,8 +107,10 @@ upstream Firecracker and its jailer.
   session of its own, chrooted to `/var/empty`, with only its standard descriptors (standard error is
   Firecracker's), the jail's directory and a pipe to the jailer. It reads one file that only root can write, by
   name in that directory: no link followed, only a regular, root-owned file with one link that root alone can
-  write, at most 64 bytes, its content driving no allocation. It writes `cgroup.events` and suspends and resumes
-  the jail's processes, known by pid and start time; it execs nothing and reads no environment. The jail cannot
+  write, at most 64 bytes, its content driving no allocation. It writes `cgroup.events` and, after a value not in
+  the kernel's form, the control file itself, in place and only while it holds what was read; it suspends and
+  resumes the jail's processes, known by pid and start time; it execs nothing and reads no environment. The jail
+  cannot
   reach it: it is outside the chroot and root's, and Firecracker's sandbox allows signals to itself only. It ends
   with the jail and ignores every signal it can; if it cannot freeze a process of the jail, it kills the jail.
   Root can SIGKILL it, which leaves the jail as it is (a frozen jail stays frozen until root kills it) and

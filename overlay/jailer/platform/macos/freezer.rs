@@ -52,6 +52,36 @@
 //!   restored to the current state with a line on the supervisor's stderr
 //!   (Firecracker's, /dev/null with `--daemonize`): the value read back is
 //!   always the state;
+//! - the files are plain files, not kernfs ones, whose content the kernel
+//!   makes at each read (`cgroup_freeze_show`, `freezer_read`) and whose
+//!   size no open changes (`kernfs_iop_setattr`: "this ignores size
+//!   changes"), so that a read there is never empty and a write
+//!   (`cgroup_freeze_write`, under `cgroup_kn_lock_live`) is never undone.
+//!   Here ([`Files::restore`], [`Files::write_events`]):
+//!   - what the supervisor writes is never read empty or in part: a file is
+//!     made aside and given its name whole, and written in place after
+//!     that, never cut first. A reader finds what the file held, or the
+//!     state's value, followed by newlines alone for the moment in which a
+//!     longer value is written over (a value longer than [`MAX_FILE`] bytes,
+//!     which is invalid, can be read half written over);
+//!   - the supervisor writes the control file only where Linux would read
+//!     another text than the one written: a valid value not in the kernel's
+//!     form, and an invalid one after the settle. It reads the file again
+//!     through the descriptor it writes with, under `flock(LOCK_EX)` on the
+//!     file, and writes nothing if the file holds another text than the one
+//!     it handled: that write is handled as any, from its own event. So a
+//!     write that lands before that second read is never lost, and a writer
+//!     that holds the file's `flock` for its write (`open` with `O_EXLOCK`,
+//!     which XNU's `open1` takes before it truncates, bsd/vfs/
+//!     vfs_syscalls.c) never loses one. `flock` is advisory and macOS has no
+//!     lock a writer cannot ignore: a writer that takes none (the shell's
+//!     `>`) can still lose a write that lands whole between the
+//!     supervisor's second read and its write, two system calls in a row,
+//!     and only when the supervisor is writing the file back at all;
+//!   - an operator's own write through `open(O_TRUNC)` (the shell's `>`)
+//!     empties the file before it writes: a reader can read it empty
+//!     between the two, which the supervisor cannot prevent (it never
+//!     takes an empty file for a value);
 //! - the supervisor ends only with the jail: it ignores every signal it can.
 //!   Killed with SIGKILL (root only), it leaves the jail as it is: frozen
 //!   stays frozen until root kills the jail, and nothing thaws it through the
@@ -103,6 +133,73 @@ fn control(version: Version) -> &'static CStr {
 /// [`fv::EVENTS`], as a C string.
 const EVENTS: &CStr = c"cgroup.events";
 const EVENTS_TMP: &CStr = c".cgroup.events.tmp";
+
+/// The name the control file is written under before it gets its own.
+fn control_tmp(version: Version) -> &'static CStr {
+    match version {
+        Version::V1 => c".freezer.state.tmp",
+        Version::V2 => c".cgroup.freeze.tmp",
+    }
+}
+
+/// What a file of the freezer holds, up to [`MAX_FILE`] + 1 bytes (a longer
+/// one is invalid whatever follows).
+#[derive(Clone, Copy)]
+pub(crate) struct Content {
+    buf: [u8; MAX_FILE + 1],
+    len: usize,
+}
+
+impl Content {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    fn none() -> Content {
+        Content { buf: [0; MAX_FILE + 1], len: 0 }
+    }
+
+    /// Reads `file` from its start.
+    fn of(file: &OwnedFd) -> io::Result<Content> {
+        let mut content = Content::none();
+        while content.len < content.buf.len() {
+            let rest = &mut content.buf[content.len..];
+            // SAFETY: the rest of the buffer.
+            let n = unsafe {
+                libc::pread(
+                    file.as_raw_fd(),
+                    rest.as_mut_ptr().cast(),
+                    rest.len(),
+                    libc::off_t::try_from(content.len).expect("a short file"),
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if errno(&err) == libc::EINTR {
+                    continue;
+                }
+                return Err(err);
+            }
+            if n == 0 {
+                break;
+            }
+            content.len += n.unsigned_abs();
+        }
+        Ok(content)
+    }
+}
+
+/// What writing the control file back came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Restored {
+    /// It holds the state's value (written, or there already).
+    Done,
+    /// A writer wrote it after the supervisor read it: left as that writer
+    /// left it, to be handled as written.
+    Changed,
+    /// A writer holds its lock: tried again after [`fv::SETTLE_MS`].
+    Busy,
+}
 
 /// Whether C string `c` holds `s`.
 const fn same_name(c: &CStr, s: &str) -> bool {
@@ -163,11 +260,45 @@ impl Files {
             )));
         }
         let files = Files { dir, path: jail_dir.to_owned(), version, owner };
-        files.create_file(control(version), version.canonical(state))?;
+        files.make(control(version), control_tmp(version), version.canonical(state), true)?;
         if version == Version::V2 {
-            files.create_file(EVENTS, &fv::events(true, state == State::Frozen))?;
+            files.make(EVENTS, EVENTS_TMP, &fv::events(true, state == State::Frozen), true)?;
         }
         Ok(files)
+    }
+
+    /// `name` with `content`: written as `tmp`, which no one else opens,
+    /// then given its name, so that it is whole from the moment it is there.
+    /// `exclusive`: fails if `name` is there (a link is made, which never
+    /// replaces a file); else `name` is replaced, whatever it is (a link, not
+    /// what it names).
+    fn make(&self, name: &CStr, tmp: &CStr, content: &[u8], exclusive: bool) -> io::Result<()> {
+        let dir = self.dir.as_raw_fd();
+        let unlink_tmp = || {
+            // SAFETY: a directory descriptor and a NUL-terminated name.
+            let ret = unsafe { libc::unlinkat(dir, tmp.as_ptr(), 0) };
+            if ret != 0 && errno(&io::Error::last_os_error()) != libc::ENOENT {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        unlink_tmp()?;
+        self.create_file(tmp, content)?;
+        // SAFETY: a directory descriptor and NUL-terminated names.
+        let named = check(unsafe {
+            if exclusive {
+                libc::linkat(dir, tmp.as_ptr(), dir, name.as_ptr(), 0)
+            } else {
+                libc::renameat(dir, tmp.as_ptr(), dir, name.as_ptr())
+            }
+        })
+        .map_err(|e| io::Error::new(e.kind(), format!("{}/{}: {e}", self.path.display(), name.to_string_lossy())));
+        if exclusive || named.is_err() {
+            let removed = unlink_tmp();
+            named?;
+            removed?;
+        }
+        Ok(())
     }
 
     fn create_file(&self, name: &CStr, content: &[u8]) -> io::Result<()> {
@@ -242,77 +373,88 @@ impl Files {
         Ok(Some((file, (u64::from(st.st_dev.cast_unsigned()), st.st_ino))))
     }
 
-    /// Reads the control file: the request, and whether the file holds
-    /// the request's canonical form.
-    pub(crate) fn read(&self) -> io::Result<(Request, bool)> {
+    /// Reads the control file: the request, whether the file holds the
+    /// request's canonical form, and what it holds (what
+    /// [`restore`](Self::restore) is given).
+    pub(crate) fn read(&self) -> io::Result<(Request, bool, Content)> {
         let Some((file, _)) = self.open_trusted(control(self.version), libc::O_RDONLY)? else {
-            return Ok((Request::Invalid, false));
+            return Ok((Request::Invalid, false, Content::none()));
         };
-        let mut buf = [0u8; MAX_FILE + 1];
-        let mut len = 0;
-        while len < buf.len() {
-            // SAFETY: the rest of the buffer.
-            let n = unsafe { libc::read(file.as_raw_fd(), buf[len..].as_mut_ptr().cast(), buf.len() - len) };
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                if errno(&err) == libc::EINTR {
-                    continue;
-                }
-                return Err(err);
-            }
-            if n == 0 {
-                break;
-            }
-            len += n.unsigned_abs();
-        }
-        let request = parse(self.version, &buf[..len]);
-        let canonical = matches!(request, Request::Set(s) if &buf[..len] == self.version.canonical(s));
-        Ok((request, canonical))
+        let content = Content::of(&file)?;
+        let request = parse(self.version, content.bytes());
+        let canonical = matches!(request, Request::Set(s) if content.bytes() == self.version.canonical(s));
+        Ok((request, canonical, content))
     }
 
-    /// Writes the control file back to `state`, in place: a writer that has
-    /// it open writes to the same file (a file renamed over it would take
-    /// that write away unseen). One that is not a trusted file is replaced.
-    pub(crate) fn restore(&self, state: State) -> io::Result<()> {
+    /// Writes the control file back to `state`, in place (a writer that has
+    /// it open writes to the same file; a file renamed over it would take
+    /// that write away unseen), unless it holds another text than `seen`,
+    /// what the supervisor read from it: then a writer wrote it since, and
+    /// it is left as it is ([`Restored::Changed`]). It is read again through
+    /// the descriptor that writes it, under the file's `flock`: a writer
+    /// that holds that lock for its write makes this [`Restored::Busy`] or
+    /// waits for it, and never loses a write; no lock on macOS stops a
+    /// writer that takes none (the module's text says what is left). One
+    /// that is not a trusted file is replaced.
+    pub(crate) fn restore(&self, state: State, seen: &[u8]) -> io::Result<Restored> {
         let name = control(self.version);
-        match self.open_trusted(name, libc::O_WRONLY)? {
-            Some((file, _)) => {
-                // SAFETY: a descriptor of ours.
-                check(unsafe { libc::ftruncate(file.as_raw_fd(), 0) })?;
-                write_all_at(&file, self.version.canonical(state))
-            }
-            None => {
-                // Not there, or not a file root alone controls: removed (a
-                // link is removed, not what it names) and made again.
-                // SAFETY: a directory descriptor and a NUL-terminated name.
-                let ret = unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) };
-                if ret != 0 && errno(&io::Error::last_os_error()) != libc::ENOENT {
-                    return Err(io::Error::last_os_error());
-                }
-                self.create_file(name, self.version.canonical(state))
-            }
+        let canonical = self.version.canonical(state);
+        let Some((file, _)) = self.open_trusted(name, libc::O_RDWR)? else {
+            // Not there, or not a file root alone controls: replaced (a
+            // link is replaced, not what it names).
+            self.make(name, control_tmp(self.version), canonical, false)?;
+            return Ok(Restored::Done);
+        };
+        // SAFETY: a descriptor of ours.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let err = io::Error::last_os_error();
+            return if errno(&err) == libc::EWOULDBLOCK { Ok(Restored::Busy) } else { Err(err) };
         }
+        let restored = Self::write_over(&file, canonical, Some(seen));
+        // Released now, not with the last copy of the descriptor.
+        // SAFETY: a descriptor of ours.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        restored
     }
 
-    /// v2: rewrites `cgroup.events` whole (a reader never sees half of it).
+    /// Writes `content` into `file` in place, only while it holds `seen` if
+    /// given. Never cut first (a reader would find it empty): what it holds
+    /// beyond `content` is first written over with newlines, in the one
+    /// write that writes `content`, then cut, so that a reader finds what
+    /// it held, or `content` and newlines.
+    fn write_over(file: &OwnedFd, content: &[u8], seen: Option<&[u8]>) -> io::Result<Restored> {
+        let held = Content::of(file)?;
+        if seen.is_some_and(|seen| held.bytes() != seen) {
+            return Ok(Restored::Changed);
+        }
+        if held.bytes() == content {
+            return Ok(Restored::Done);
+        }
+        let mut padded = [b'\n'; MAX_FILE + 1];
+        padded[..content.len()].copy_from_slice(content);
+        let len = held.len.max(content.len());
+        write_all_at(file, &padded[..len])?;
+        if len > content.len() {
+            // SAFETY: a descriptor of ours.
+            check(unsafe { libc::ftruncate(file.as_raw_fd(), libc::off_t::try_from(content.len()).expect("a short file")) })?;
+        }
+        Ok(Restored::Done)
+    }
+
+    /// v2: writes `cgroup.events`, in place: one write of a text as long as
+    /// the one it holds, so a reader never sees half of it and one that
+    /// keeps it open reads the new state from its start, as on Linux.
     pub(crate) fn write_events(&self, populated: bool, frozen: bool) -> io::Result<()> {
         if self.version != Version::V2 {
             return Ok(());
         }
-        // SAFETY: a directory descriptor and a NUL-terminated name.
-        let ret = unsafe { libc::unlinkat(self.dir.as_raw_fd(), EVENTS_TMP.as_ptr(), 0) };
-        if ret != 0 && errno(&io::Error::last_os_error()) != libc::ENOENT {
-            return Err(io::Error::last_os_error());
+        let content = fv::events(populated, frozen);
+        match self.open_trusted(EVENTS, libc::O_RDWR)? {
+            Some((file, _)) => Self::write_over(&file, &content, None).map(|_| ()),
+            None => self.make(EVENTS, EVENTS_TMP, &content, false),
         }
-        self.create_file(EVENTS_TMP, &fv::events(populated, frozen))?;
-        // SAFETY: a directory descriptor and NUL-terminated names.
-        check(unsafe {
-            libc::renameat(self.dir.as_raw_fd(), EVENTS_TMP.as_ptr(), self.dir.as_raw_fd(), EVENTS.as_ptr())
-        })?;
-        Ok(())
     }
 
-    /// A descriptor of the control file to watch, and its identity.
     fn watch_fd(&self) -> io::Result<Option<(OwnedFd, Ident)>> {
         self.open_trusted(control(self.version), libc::O_EVTONLY)
     }
@@ -535,24 +677,26 @@ impl Control {
         log: &mut dyn FnMut(&str),
     ) -> io::Result<Option<State>> {
         watch.rearm(files)?;
-        let (request, canonical) = files.read()?;
+        let (request, canonical, seen) = files.read()?;
         match request {
             Request::Set(state) => {
                 if self.settling {
                     watch.settle_cancel();
                     self.settling = false;
                 }
-                if !canonical {
-                    // As Linux reads the file back.
-                    files.restore(state)?;
-                }
                 self.state = state;
+                if !canonical {
+                    // As Linux reads the file back; nothing is written when
+                    // it holds that already.
+                    self.write_back(files, watch, seen.bytes())?;
+                }
                 Ok(Some(state))
             }
             Request::Empty | Request::Invalid if event == Event::Settled => {
                 self.settling = false;
-                log(&fv::ignored(files.version, request));
-                files.restore(self.state)?;
+                if self.write_back(files, watch, seen.bytes())? == Restored::Done {
+                    log(&fv::ignored(files.version, request));
+                }
                 watch.rearm(files)?;
                 Ok(None)
             }
@@ -564,6 +708,20 @@ impl Control {
                 Ok(None)
             }
         }
+    }
+
+    /// Writes the control file back to the state, `seen` being what was
+    /// read from it. Written since by a writer: left as it is, and handled
+    /// from that write's own event (the watch was armed before the read),
+    /// so that write is not undone. Its lock held by a writer: tried again
+    /// after [`fv::SETTLE_MS`], the file holding meanwhile what was written.
+    fn write_back(&mut self, files: &Files, watch: &mut Watch, seen: &[u8]) -> io::Result<Restored> {
+        let restored = files.restore(self.state, seen)?;
+        if restored == Restored::Busy {
+            watch.settle_later()?;
+            self.settling = true;
+        }
+        Ok(restored)
     }
 }
 
@@ -1411,6 +1569,18 @@ mod tests {
         std::fs::read_to_string(path).unwrap()
     }
 
+    /// The request and whether it is canonical.
+    fn request(files: &Files) -> (Request, bool) {
+        let (request, canonical, _) = files.read().unwrap();
+        (request, canonical)
+    }
+
+    /// Restores the control file after reading it.
+    fn restore(files: &Files, state: State) -> Restored {
+        let (_, _, seen) = files.read().unwrap();
+        files.restore(state, seen.bytes()).unwrap()
+    }
+
     // The files: made exclusive, root-owned (here: the test's user), 0644,
     // the directory locked while they are kept; only a regular file with one
     // link that only its owner writes is read, and one that is not is
@@ -1430,19 +1600,46 @@ mod tests {
         }
         // Not twice: the lock is held, and the files are there.
         Files::create(dir, Version::V2, State::Thawed, uid()).unwrap_err();
-        assert_eq!(files.read().unwrap(), (Request::Set(State::Thawed), true));
+        assert_eq!(request(&files), (Request::Set(State::Thawed), true));
         std::fs::write(dir.join("cgroup.freeze"), "0x1").unwrap();
-        assert_eq!(files.read().unwrap(), (Request::Set(State::Frozen), false));
-        files.restore(State::Frozen).unwrap();
+        assert_eq!(request(&files), (Request::Set(State::Frozen), false));
+        assert_eq!(restore(&files, State::Frozen), Restored::Done);
         assert_eq!(content(&dir.join("cgroup.freeze")), "1\n");
+        // Written in place: the same file, and a reader that keeps
+        // cgroup.events open reads the new state from its start.
+        let ino = |name: &str| std::fs::metadata(dir.join(name)).unwrap().ino();
+        let (control_ino, events_ino) = (ino("cgroup.freeze"), ino("cgroup.events"));
+        let holder = std::fs::File::open(dir.join("cgroup.events")).unwrap();
         files.write_events(true, true).unwrap();
         assert_eq!(content(&dir.join("cgroup.events")), "populated 1\nfrozen 1\n");
-        assert!(!dir.join(".cgroup.events.tmp").exists());
+        let mut held = [0u8; 64];
+        let n = std::os::unix::fs::FileExt::read_at(&holder, &mut held, 0).unwrap();
+        assert_eq!(&held[..n], b"populated 1\nfrozen 1\n");
+        assert!(!dir.join(".cgroup.events.tmp").exists() && !dir.join(".cgroup.freeze.tmp").exists());
+        // A longer value written over, valid or not: cut after the value.
+        for longer in ["  1  \n\n", "frozen, please\n"] {
+            std::fs::write(dir.join("cgroup.freeze"), longer).unwrap();
+            assert_eq!(restore(&files, State::Frozen), Restored::Done);
+            assert_eq!(content(&dir.join("cgroup.freeze")), "1\n");
+        }
+        // Longer than a value can be: the same.
+        std::fs::write(dir.join("cgroup.freeze"), "1".repeat(4 * MAX_FILE)).unwrap();
+        assert_eq!(request(&files), (Request::Invalid, false));
+        assert_eq!(restore(&files, State::Thawed), Restored::Done);
+        assert_eq!(content(&dir.join("cgroup.freeze")), "0\n");
+        assert_eq!((ino("cgroup.freeze"), ino("cgroup.events")), (control_ino, events_ino));
+        // It holds the value already: nothing is written.
+        let mtime = |name: &str| std::fs::metadata(dir.join(name)).unwrap().modified().unwrap();
+        let before = mtime("cgroup.freeze");
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(restore(&files, State::Thawed), Restored::Done);
+        assert_eq!(mtime("cgroup.freeze"), before);
+        std::fs::write(dir.join("cgroup.freeze"), "1\n").unwrap();
 
         // Writable by others: not taken.
         std::fs::set_permissions(dir.join("cgroup.freeze"), std::fs::Permissions::from_mode(0o666)).unwrap();
         assert_eq!(files.read().unwrap().0, Request::Invalid);
-        files.restore(State::Frozen).unwrap();
+        assert_eq!(restore(&files, State::Frozen), Restored::Done);
         assert_eq!(std::fs::metadata(dir.join("cgroup.freeze")).unwrap().mode() & 0o777, 0o644);
         // A link to another file: not followed, and replaced, the file it
         // names left alone (as a hard link: one with two links).
@@ -1456,7 +1653,7 @@ mod tests {
             std::fs::remove_file(dir.join("cgroup.freeze")).unwrap();
             link(&victim, &dir.join("cgroup.freeze"));
             assert_eq!(files.read().unwrap().0, Request::Invalid);
-            files.restore(State::Thawed).unwrap();
+            assert_eq!(restore(&files, State::Thawed), Restored::Done);
             assert_eq!(content(&victim), "keep\n");
             assert_eq!(content(&dir.join("cgroup.freeze")), "0\n");
             let md = std::fs::symlink_metadata(dir.join("cgroup.freeze")).unwrap();
@@ -1468,12 +1665,12 @@ mod tests {
         // SAFETY: a NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
         assert_eq!(files.read().unwrap().0, Request::Invalid);
-        files.restore(State::Thawed).unwrap();
+        assert_eq!(restore(&files, State::Thawed), Restored::Done);
         assert!(std::fs::symlink_metadata(dir.join("cgroup.freeze")).unwrap().is_file());
         // Gone: made again.
         std::fs::remove_file(dir.join("cgroup.freeze")).unwrap();
         assert_eq!(files.read().unwrap().0, Request::Invalid);
-        files.restore(State::Thawed).unwrap();
+        assert_eq!(restore(&files, State::Thawed), Restored::Done);
         assert_eq!(content(&dir.join("cgroup.freeze")), "0\n");
         // Another owner than the one required: not taken.
         let other = Files { dir: files.dir.try_clone().unwrap(), path: dir.to_owned(), version: Version::V2, owner: uid() + 1 };
@@ -1490,6 +1687,80 @@ mod tests {
         assert!(!tmp.as_path().join("cgroup.events").exists());
         files.write_events(false, false).unwrap();
         assert!(!tmp.as_path().join("cgroup.events").exists());
+    }
+
+    // A write that lands after the supervisor's read is not written over:
+    // the file is left as that writer left it. A writer that holds the
+    // file's lock is waited for, and its write is the file's.
+    #[test]
+    fn test_a_write_after_the_read_is_applied() {
+        for (version, first, second) in [(Version::V1, "FROZEN", "THAWED"), (Version::V2, "1", "0")] {
+            let tmp = vmm_sys_util::tempdir::TempDir::new().unwrap();
+            let files = Files::create(tmp.as_path(), version, State::Thawed, uid()).unwrap();
+            let path = tmp.as_path().join(version.control());
+            std::fs::write(&path, first).unwrap();
+            let (got, canonical, seen) = files.read().unwrap();
+            assert_eq!((got, canonical), (Request::Set(State::Frozen), false));
+            std::fs::write(&path, second).unwrap();
+            assert_eq!(files.restore(State::Frozen, seen.bytes()).unwrap(), Restored::Changed);
+            assert_eq!(content(&path), second);
+            assert_eq!(request(&files), (Request::Set(State::Thawed), false));
+
+            // Emptied by a writer that has not written yet: left to it.
+            std::fs::write(&path, first).unwrap();
+            let (_, _, seen) = files.read().unwrap();
+            let writer = std::fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+            assert_eq!(files.restore(State::Frozen, seen.bytes()).unwrap(), Restored::Changed);
+            std::os::unix::fs::FileExt::write_all_at(&writer, second.as_bytes(), 0).unwrap();
+            drop(writer);
+            assert_eq!(content(&path), second);
+
+            // A writer holds the lock: busy, then its write is what is read.
+            std::fs::write(&path, first).unwrap();
+            let (_, _, seen) = files.read().unwrap();
+            let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            // SAFETY: a descriptor of the test's.
+            assert_eq!(unsafe { libc::flock(writer.as_raw_fd(), libc::LOCK_EX) }, 0);
+            assert_eq!(files.restore(State::Frozen, seen.bytes()).unwrap(), Restored::Busy);
+            assert_eq!(content(&path), first);
+            drop(writer);
+            assert_eq!(files.restore(State::Frozen, seen.bytes()).unwrap(), Restored::Done);
+            assert_eq!(content(&path), String::from_utf8_lossy(version.canonical(State::Frozen)));
+        }
+    }
+
+    // While a writer holds the control file's lock the state it asked for
+    // is applied at once and the write-back waits: tried again every
+    // SETTLE_MS, done once the lock is free.
+    #[test]
+    fn test_a_held_lock_delays_the_write_back_only() {
+        let tmp = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let dir = tmp.as_path();
+        let files = Files::create(dir, Version::V1, State::Thawed, uid()).unwrap();
+        let mut watch = Watch::new(&files).unwrap();
+        let mut control = Control::new(State::Thawed);
+        let mut log = Vec::new();
+        let state = dir.join("freezer.state");
+        let writer = std::fs::OpenOptions::new().write(true).open(&state).unwrap();
+        // SAFETY: a descriptor of the test's.
+        assert_eq!(unsafe { libc::flock(writer.as_raw_fd(), libc::LOCK_EX) }, 0);
+        std::os::unix::fs::FileExt::write_all_at(&writer, b"FROZEN  ", 0).unwrap();
+        expect(&files, &mut watch, &mut control, &mut log, State::Frozen);
+        assert_eq!(control.state, State::Frozen);
+        // Two settles later: still the writer's text.
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(u64::from(fv::SETTLE_MS) * 2 + 50) {
+            next(&files, &mut watch, &mut control, &mut log);
+        }
+        assert_eq!(content(&state), "FROZEN  ");
+        drop(writer);
+        let t0 = Instant::now();
+        while content(&state) != "FROZEN\n" {
+            assert!(t0.elapsed() < Duration::from_secs(3), "not written back: {:?}", content(&state));
+            next(&files, &mut watch, &mut control, &mut log);
+        }
+        assert_eq!(control.state, State::Frozen);
+        assert!(log.is_empty(), "{log:?}");
     }
 
     /// Waits for the watch's next events, handling file ones with `control`.
@@ -1605,6 +1876,192 @@ mod tests {
         std::fs::write(&state, "  FROZEN").unwrap();
         expect(&files, &mut watch, &mut control, &mut log, State::Frozen);
         assert_eq!(content(&state), "FROZEN\n");
+    }
+
+    /// The control side of the files, served on a thread as the supervisor
+    /// serves it: the state it was last asked for is in `state` (0 thawed,
+    /// 1 frozen).
+    fn serve(files: &Files, state: &std::sync::atomic::AtomicU8, stop: &std::sync::atomic::AtomicBool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut watch = Watch::new(files).unwrap();
+        let mut control = Control::new(State::Thawed);
+        let mut events = vec![Event::File];
+        while !stop.load(SeqCst) {
+            for &e in &events {
+                if let Some(s) = control.handle(files, &mut watch, e, &mut |_: &str| {}).unwrap() {
+                    state.store(u8::from(s == State::Frozen), SeqCst);
+                }
+            }
+            watch.wait(Some(20), &mut events).unwrap();
+        }
+    }
+
+    /// Writes `text` into `path` in one write, in place, as a writer that
+    /// keeps the file open does (no truncation: nothing of the writer's own
+    /// for a reader to find empty).
+    fn write_in_place(path: &Path, text: &[u8]) {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.write_all_at(text, 0).unwrap();
+    }
+
+    /// Whether `text` is `canonical` followed by newlines alone.
+    fn canonical_and_newlines(text: &[u8], canonical: &[u8]) -> bool {
+        text.starts_with(canonical) && text[canonical.len()..].iter().all(|&b| b == b'\n')
+    }
+
+    /// Four readers read the control file as fast as they can while a writer
+    /// flips the state 500 times, each time in a form that is written back
+    /// (and longer than the canonical one, so the write-back shortens the
+    /// file). A reader must find the writer's text or the state's canonical
+    /// one (with newlines alone after it), never an empty file and never a
+    /// mix; every flip must be applied and written back. The writer's text
+    /// cut at the length the file had is its own too: macOS shows a reader
+    /// a file that one write is making longer at its old length (measured
+    /// here, macOS 27.2, APFS: " FROZEN" for " FROZEN\n" written over
+    /// "THAWED\n", nothing else), where a write to a kernfs file has no
+    /// reader in its middle.
+    fn readers_read_whole_values(version: Version, forms: [&'static [u8]; 2]) {
+        use std::sync::atomic::Ordering::SeqCst;
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
+        const FLIPS: usize = 2000;
+        let tmp = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let files = Files::create(tmp.as_path(), version, State::Thawed, uid()).unwrap();
+        let path = tmp.as_path().join(version.control());
+        let (state, stop) = (AtomicU8::new(0), AtomicBool::new(false));
+        let (reads, empty) = (AtomicU64::new(0), AtomicU64::new(0));
+        let torn = Mutex::new(Vec::<String>::new());
+        let canon = [version.canonical(State::Thawed), version.canonical(State::Frozen)];
+        std::thread::scope(|scope| {
+            scope.spawn(|| serve(&files, &state, &stop));
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while !stop.load(SeqCst) {
+                        let text = std::fs::read(&path).unwrap();
+                        reads.fetch_add(1, SeqCst);
+                        if text.is_empty() {
+                            empty.fetch_add(1, SeqCst);
+                        } else if !forms.contains(&text.as_slice())
+                            && !canon.iter().any(|c| canonical_and_newlines(&text, c))
+                            && !forms.iter().any(|f| text == f[..canon[0].len()])
+                        {
+                            let mut torn = torn.lock().unwrap();
+                            if torn.len() < 10 {
+                                torn.push(String::from_utf8_lossy(&text).into_owned());
+                            }
+                        }
+                    }
+                });
+            }
+            let mut lost = Vec::new();
+            for flip in 0..FLIPS {
+                let want = (flip + 1) % 2;
+                write_in_place(&path, forms[want]);
+                let t0 = Instant::now();
+                while usize::from(state.load(SeqCst)) != want || std::fs::read(&path).unwrap() != canon[want] {
+                    if t0.elapsed() > Duration::from_secs(3) {
+                        lost.push((flip, state.load(SeqCst), content(&path)));
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+            stop.store(true, SeqCst);
+            let (reads, empty) = (reads.load(SeqCst), empty.load(SeqCst));
+            let torn = torn.lock().unwrap();
+            println!("{version:?}: {FLIPS} flips, {reads} reads, {empty} empty, torn {torn:?}, flips not applied or not written back {lost:?}");
+            assert!(reads > 1000, "the readers did not read: {reads}");
+            assert!(empty == 0 && torn.is_empty() && lost.is_empty(), "{empty} empty reads of {reads}, torn {torn:?}, lost {lost:?}");
+        });
+    }
+
+    #[test]
+    fn test_readers_read_whole_values_v1() {
+        readers_read_whole_values(Version::V1, [b" THAWED\n", b" FROZEN\n"]);
+    }
+
+    #[test]
+    fn test_readers_read_whole_values_v2() {
+        readers_read_whole_values(Version::V2, [b"0 \n\n", b"1 \n\n"]);
+    }
+
+    /// A writer's way to write the control file.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Writer {
+        /// `open(O_WRONLY | O_TRUNC | O_EXLOCK)`, one write, close: the
+        /// file's `flock` held from before the truncation to the close.
+        Locked,
+        /// `open(O_WRONLY | O_TRUNC)`, one write, close: the shell's `>`.
+        Plain,
+    }
+
+    impl Writer {
+        fn write(self, path: &Path, text: &[u8]) {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let lock = if self == Writer::Locked { libc::O_EXLOCK } else { 0 };
+            let mut f = std::fs::OpenOptions::new().write(true).truncate(true).custom_flags(lock).open(path).unwrap();
+            f.write_all(text).unwrap();
+        }
+    }
+
+    /// `ROUNDS` times: a value that is written back (not canonical), then,
+    /// 0 to 60 us later, the other state's. The second write is the last:
+    /// the state must become it and the file must read its canonical text.
+    /// Returns the rounds in which it was lost (the file read the first
+    /// write's state for 2 s; at most 5 are waited for).
+    fn lost_writes(version: Version, writer: Writer, forms: [&'static [u8]; 2]) -> Vec<(usize, String)> {
+        use std::sync::atomic::Ordering::SeqCst;
+        use std::sync::atomic::{AtomicBool, AtomicU8};
+        const ROUNDS: usize = 3000;
+        let tmp = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let files = Files::create(tmp.as_path(), version, State::Thawed, uid()).unwrap();
+        let path = tmp.as_path().join(version.control());
+        let (state, stop) = (AtomicU8::new(0), AtomicBool::new(false));
+        let canon = [version.canonical(State::Thawed), version.canonical(State::Frozen)];
+        let mut lost = Vec::new();
+        let mut ran = 0;
+        std::thread::scope(|scope| {
+            scope.spawn(|| serve(&files, &state, &stop));
+            for round in 0..ROUNDS {
+                ran += 1;
+                let (first, last) = (round % 2, (round + 1) % 2);
+                writer.write(&path, forms[first]);
+                let gap = Duration::from_micros(u64::try_from(round % 61).unwrap());
+                let t0 = Instant::now();
+                while t0.elapsed() < gap {
+                    std::hint::spin_loop();
+                }
+                writer.write(&path, forms[last]);
+                let t0 = Instant::now();
+                while usize::from(state.load(SeqCst)) != last || std::fs::read(&path).unwrap() != canon[last] {
+                    if t0.elapsed() > Duration::from_secs(2) {
+                        lost.push((round, content(&path)));
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                if lost.len() == 5 {
+                    break;
+                }
+            }
+            stop.store(true, SeqCst);
+        });
+        println!("{version:?} {writer:?}: lost {} (rounds {lost:?}) of {ran}", lost.len());
+        lost
+    }
+
+    // No write of a writer that holds the file's lock is lost. One that
+    // takes no lock can lose a write that lands whole between two system
+    // calls of the supervisor (the module's text): its count is printed, not
+    // held to zero.
+    #[test]
+    fn test_no_write_is_lost() {
+        for (version, forms) in [(Version::V1, [b"THAWED".as_slice(), b"FROZEN".as_slice()]), (Version::V2, [b"0".as_slice(), b"1".as_slice()])] {
+            let plain = lost_writes(version, Writer::Plain, forms);
+            let locked = lost_writes(version, Writer::Locked, forms);
+            assert!(locked.is_empty(), "{version:?}: writes lost under the lock: {locked:?} (without it: {plain:?})");
+        }
     }
 
     /// An OS for the jail's logic: a process table, and the calls made.
