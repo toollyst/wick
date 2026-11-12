@@ -672,6 +672,41 @@ mod tests {
         assert!(CALLED.load(Ordering::SeqCst) > before);
     }
 
+    // pthread_kill of a thread that has returned but is not joined: Linux
+    // sends nothing and returns 0 (musl pthread_kill.c: `r = t->tid ?
+    // -__syscall(SYS_tkill, t->tid, sig) : ... 0`, and __pthread_exit sets
+    // tid to 0 before the kernel thread exits; glibc 2.34+ likewise for an
+    // exiting thread). vmm's test_vcpu_dump_cpu_config failed in its last
+    // kick with Error(31) (CI run 43292883636). This prints what kill gives
+    // here for a live thread, for one whose function has just returned, and
+    // for one that has had 200 ms to exit (KILLTEST lines, CI's last step),
+    // before kill's handling of an exited thread is decided.
+    #[test]
+    #[ignore = "records; CI's last step runs it with --nocapture"]
+    fn test_kill_of_an_exited_thread_on_record() {
+        let num = SIGRTMIN() + 5;
+        register_signal_handler(num, count).unwrap();
+        let (tx, rx) = mpsc::channel::<()>();
+        let live = std::thread::spawn(move || {
+            let _ = rx.recv_timeout(Duration::from_secs(10));
+        });
+        let r = live.kill(num);
+        std::println!("KILLTEST live thread: {r:?}");
+        tx.send(()).unwrap();
+        live.join().unwrap();
+        let t = std::thread::spawn(|| {});
+        while !t.is_finished() {
+            std::thread::yield_now();
+        }
+        let r = t.kill(num);
+        std::println!("KILLTEST thread whose function returned: {r:?}");
+        std::thread::sleep(Duration::from_millis(200));
+        let r = t.kill(num);
+        let e = r.as_ref().err().map(|e| io::Error::from_raw_os_error(e.errno()));
+        std::println!("KILLTEST thread 200 ms after its function returned: {r:?} {e:?}");
+        t.join().unwrap();
+    }
+
     #[test]
     fn test_kill_right_after_spawn() {
         // Sent while the thread may still be starting: delivered once it can

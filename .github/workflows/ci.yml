@@ -687,11 +687,14 @@ jobs:
       # next), with --nocapture so the WHPCAP, BPTEST and MAPTEST lines it
       # prints are in the log, and must pass; what each expects is in its
       # comment. The bp tests were first measured on an AMD PC (70dfabf);
-      # run 43292883636's runner was AMD too, so an Intel runner, when one
-      # comes, gives their first Intel measurement (test_bp_ways_on_record
-      # prints how each way to hand a #BP back fares). Then libc's record of
-      # an AF_UNIX bind of each path form (BINDTEST lines; vmm's vhost-user
-      # tests fail in create_tmp_socket's bind). Last, after the kit's
+      # runs 43292883636 and 43298293407 had AMD runners too, so an Intel
+      # runner, when one comes, gives their first Intel measurement
+      # (test_bp_ways_on_record prints how each way to hand a #BP back
+      # fares). Then libc's record of an AF_UNIX bind of each path form
+      # (BINDTEST lines), and vmm-sys-util's record of a kill of a thread
+      # that has exited (KILLTEST lines; vmm's test_vcpu_dump_cpu_config
+      # failed in a kick). Records only print; a crash in one fails this
+      # step, never the kit. Last, after the kit's
       # upload, so a WHP result never costs the PC its kit; it runs whatever
       # the steps before gave.
       - name: WHP tests on the runner
@@ -729,4 +732,6 @@ jobs:
           done
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
+          k=../../crates/compat/vmm-sys-util/Cargo.toml
+          alone windows::signal::tests::test_kill_of_an_exited_thread_on_record
           exit $failed
