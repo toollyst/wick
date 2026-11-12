@@ -428,6 +428,12 @@ jobs:
           cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- \
             --skip whp::vm::tests::test_vms_one_after_another_map_their_memory \
             --skip whp::vm::tests::test_one_partition_of_a_process_maps_memory
+          # The gdb stub's guest debugging and connection, which only
+          # Firecracker's gdb feature builds (whp/debug.rs checks that a build
+          # without it makes the partition as before).
+          cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml --features gdb -- \
+            whp::debug
+          cargo test --locked --manifest-path ../../crates/compat/os/Cargo.toml --features gdbstub -- gdb
           cargo test --locked --manifest-path ../../crates/compat/vm-memory/Cargo.toml \
             --features backend-mmap,backend-bitmap,backend-atomic
           cargo test --locked --manifest-path ../../crates/compat/vhost/Cargo.toml \
@@ -460,6 +466,11 @@ jobs:
       - name: Smoke-test the binary
         working-directory: lib/firecracker
         run: build/cargo_target/release/firecracker.exe --version
+      # Firecracker's gdb stub (upstream's test_gdb builds it), built only:
+      # running it needs WHP (boot-test.ps1 gdb on a WHP machine).
+      - name: Build firecracker with the gdb feature
+        working-directory: lib/firecracker
+        run: cargo build --locked -p firecracker --features gdb
       # The boot test's diff stage merges snapshots with it.
       - name: Build snapshot-editor
         working-directory: lib/firecracker

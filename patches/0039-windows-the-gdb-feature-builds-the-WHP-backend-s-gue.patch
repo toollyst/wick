@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 16:50:03 +0900
+Subject: [PATCH] windows: the gdb feature builds the WHP backend's guest
+ debugging
+
+Firecracker's gdb stub calls VcpuFd::translate_gva and set_guest_debug
+and serves gdb on a std::os::unix::net::UnixStream. On Windows those are
+wick's: the WHP backend's guest debugging is behind kvm-ioctls's gdb
+feature (the partition gets exception exits only then), and gdbstub's
+connection traits for wick's UnixStream behind wick-std's gdbstub
+feature. vmm's gdb feature turns both on; nothing changes on Linux or
+macOS, or on Windows without the feature.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock         | 1 +
+ src/vmm/Cargo.toml | 4 +++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 6556a8f2808529cc0f02fea6b451e8fbad96a5cc..4c7dbd01188feab1d6f7b67bb531778b6386738d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2074,6 +2074,7 @@ dependencies = [
+ name = "wick-os"
+ version = "0.1.0"
+ dependencies = [
++ "gdbstub",
+  "windows-sys",
+ ]
+ 
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index 7d6d670e06fa44f3f3eff418ff448fce689c55a4..784efa2c87b3d30a683114f93dae8d9e66fb21c8 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -11,7 +11,9 @@ bench = false
+ [features]
+ default = []
+ tracing = ["log-instrument"]
+-gdb = ["arrayvec", "gdbstub", "gdbstub_arch"]
++# wick: on Windows also the WHP backend's guest debugging (kvm-ioctls) and
++# gdbstub's connection for wick's UnixStream (wick-std, wick-os).
++gdb = ["arrayvec", "gdbstub", "gdbstub_arch", "kvm-ioctls/gdb", "wick-std/gdbstub"]
+ fuzzing = []
+ 
+ [dependencies]

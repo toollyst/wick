@@ -321,8 +321,9 @@ impl VmInner {
         }
         // Exit on CPUID and MSR accesses so the backend can answer them
         // (X64CpuidExit | X64MsrExit), and on hypercalls (HypercallExit), so
-        // a guest's VMCALL/VMMCALL gets KVM's answers instead of #UD.
-        let mut exits_bits: u64 = (1 << 0) | (1 << 1);
+        // a guest's VMCALL/VMMCALL gets KVM's answers instead of #UD; with
+        // the `gdb` feature, on exceptions too (ExceptionExit), for the gdb
+        // stub's #DB and #BP (`debug`).
         let mut supported: u64 = 0;
         let mut n = 0u32;
         // SAFETY: an output buffer of the size passed.
@@ -333,10 +334,11 @@ impl VmInner {
                 8,
                 &mut n,
             )
-        } >= 0
+        } < 0
         {
-            exits_bits |= supported & (1 << 5);
+            supported = 0;
         }
+        let exits_bits = super::debug::extended_vm_exits(supported);
         // SAFETY: a u64 value for ExtendedVmExits.
         unsafe {
             ffi::set_partition_property(

@@ -26,7 +26,7 @@ use windows_sys::Win32::Networking::WinSock::{
     SO_ERROR, SO_RCVTIMEO, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR,
     SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSADATA, WSAGetLastError,
     WSAIoctl, WSASocketW, WSAStartup, accept, bind, connect, getpeername, getsockname, getsockopt,
-    ioctlsocket, listen, recv, send, setsockopt, shutdown,
+    MSG_PEEK, ioctlsocket, listen, recv, send, setsockopt, shutdown,
 };
 
 use super::fd::{
@@ -363,9 +363,19 @@ impl UnixStream {
     }
 
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_with(buf, 0)
+    }
+
+    /// Reads what is waiting without taking it (`recv` with `MSG_PEEK`), as
+    /// std's `UnixStream::peek` does on Unix.
+    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_with(buf, MSG_PEEK)
+    }
+
+    fn recv_with(&self, buf: &mut [u8], flags: i32) -> io::Result<usize> {
         let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
         // SAFETY: the buffer is valid for `len` bytes.
-        let n = cvt(unsafe { recv(self.sock(), buf.as_mut_ptr(), len, 0) })?;
+        let n = cvt(unsafe { recv(self.sock(), buf.as_mut_ptr(), len, flags) })?;
         Ok(usize::try_from(n).unwrap())
     }
 

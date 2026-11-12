@@ -113,6 +113,9 @@ pub(crate) struct VcpuShared {
     /// The `deadline_gen` of a timer that fired and whose interrupt the run
     /// loop is to raise before it next enters the guest (0: none).
     deadline_fired: AtomicU64,
+    /// Guest debugging for the gdb stub ([`super::debug`]); untouched
+    /// without the `gdb` feature.
+    debug: Mutex<super::debug::State>,
 }
 
 impl VcpuShared {
@@ -215,6 +218,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         tsc_deadline: AtomicU64::new(0),
         deadline_gen: AtomicU64::new(0),
         deadline_fired: AtomicU64::new(0),
+        debug: Mutex::new(super::debug::State::default()),
     });
     {
         let mut vcpus = ALL_VCPUS.lock().unwrap();
@@ -270,10 +274,114 @@ impl VcpuFd {
     // ---- register state (delegated to `regs`) ----
 
     pub fn get_regs(&self) -> Result<kvm_regs> {
-        regs::get_regs(self.part(), self.vp())
+        #[cfg_attr(not(feature = "gdb"), allow(unused_mut))]
+        let mut r = regs::get_regs(self.part(), self.vp())?;
+        // A single step's TF is gdb's, not the guest's (KVM hides it too).
+        #[cfg(feature = "gdb")]
+        {
+            r.rflags = super::debug::guest_rflags(r.rflags, &self.shared.debug.lock().unwrap());
+        }
+        Ok(r)
     }
     pub fn set_regs(&self, regs: &kvm_regs) -> Result<()> {
+        // A register write keeps gdb's single step going.
+        #[cfg(feature = "gdb")]
+        let regs = &kvm_regs {
+            rflags: super::debug::vcpu_rflags(regs.rflags, &self.shared.debug.lock().unwrap()),
+            ..*regs
+        };
         regs::set_regs(self.part(), self.vp(), regs)
+    }
+
+    /// `KVM_TRANSLATE`: the guest physical address `gva` maps to in the
+    /// vCPU's current paging mode, from `WHvTranslateGva` without access
+    /// checks (a page walk, as KVM's); `writeable` from a second walk that
+    /// checks for a write ([`super::debug::translation`]).
+    pub fn translate_gva(&self, gva: u64) -> Result<kvm_bindings::kvm_translation> {
+        let walk = |flags| -> Result<(i32, u64)> {
+            // SAFETY: plain data; zero is a valid value.
+            let mut result: whv::WHV_TRANSLATE_GVA_RESULT = unsafe { std::mem::zeroed() };
+            let mut gpa = 0u64;
+            // SAFETY: out-pointers valid for the call.
+            super::ffi::hr(unsafe {
+                whv::WHvTranslateGva(self.part(), self.vp(), gva, flags, &mut result, &mut gpa)
+            })?;
+            Ok((result.ResultCode, gpa))
+        };
+        let (code, gpa) = walk(whv::WHvTranslateGvaFlagNone)?;
+        let (wcode, _) = walk(whv::WHvTranslateGvaFlagValidateWrite | whv::WHvTranslateGvaFlagPrivilegeExempt)?;
+        Ok(super::debug::translation(gva, code, gpa, wcode == whv::WHvTranslateGvaResultSuccess))
+    }
+
+    /// `KVM_SET_GUEST_DEBUG` ([`super::debug`]): the partition's exception
+    /// exits for #DB and #BP, gdb's hardware breakpoints in DR0-DR3 and DR7
+    /// (the guest's own put back when it has none), `RFLAGS.TF` for a single
+    /// step, a #BP for the guest at the next entry. Every WHP call that fails
+    /// fails this with its errno; nothing is accepted that is not done.
+    pub fn set_guest_debug(&self, dbg: &kvm_bindings::kvm_guest_debug) -> Result<()> {
+        let plan = super::debug::plan(dbg.control)?;
+        let part = self.part();
+        let vp = self.vp();
+        let mut state = self.shared.debug.lock().unwrap();
+        if dbg.control & kvm_bindings::KVM_GUESTDBG_ENABLE != 0 || state.saved.is_some() || state.tf_owned {
+            // SAFETY: a u64 value for ExceptionExitBitmap.
+            unsafe {
+                super::ffi::set_partition_property(part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &plan.bitmap)?;
+            }
+        }
+        if plan.hw {
+            if state.saved.is_none() {
+                let d = regs::get_debugregs(part, vp)?;
+                state.saved = Some([d.db[0], d.db[1], d.db[2], d.db[3], d.dr6, d.dr7]);
+            }
+            let r = &dbg.arch.debugreg;
+            let hw = ([r[0], r[1], r[2], r[3]], r[7]);
+            write_hw_breakpoints(part, vp, hw)?;
+            state.hw = Some(hw);
+        } else if let Some(s) = state.saved.take() {
+            let d = kvm_debugregs { db: [s[0], s[1], s[2], s[3]], dr6: s[4], dr7: s[5], ..Default::default() };
+            regs::set_debugregs(part, vp, &d)?;
+            state.hw = None;
+        }
+        if plan.step || state.tf_owned {
+            let rflags = super::ffi::as_u64(&super::ffi::get_register(part, vp, whv::WHvX64RegisterRflags)?);
+            let new = super::debug::step_rflags(rflags, plan.step, &mut state);
+            if new != rflags {
+                super::ffi::set_register(part, vp, whv::WHvX64RegisterRflags, super::ffi::reg64(new))?;
+            }
+        }
+        state.inject_bp = plan.inject_bp;
+        Ok(())
+    }
+
+    /// What gdb's debugging needs before an entry into the guest: its
+    /// hardware breakpoints again (the guest may have written DR7), `RF` to
+    /// leave the instruction breakpoint the vCPU stopped on, a #BP for the
+    /// guest's own `INT3`.
+    #[cfg(feature = "gdb")]
+    fn prepare_debug_entry(&self) -> Result<()> {
+        let part = self.part();
+        let vp = self.vp();
+        let mut state = self.shared.debug.lock().unwrap();
+        if let Some(hw) = state.hw {
+            write_hw_breakpoints(part, vp, hw)?;
+        }
+        if std::mem::take(&mut state.resume_rf) {
+            let rflags = super::ffi::as_u64(&super::ffi::get_register(part, vp, whv::WHvX64RegisterRflags)?);
+            super::ffi::set_register(part, vp, whv::WHvX64RegisterRflags, super::ffi::reg64(rflags | super::debug::RFLAGS_RF))?;
+        }
+        if std::mem::take(&mut state.inject_bp) {
+            // The exit left RIP at the INT3: the guest's #BP returns past it.
+            let rip = super::ffi::as_u64(&super::ffi::get_register(part, vp, whv::WHvX64RegisterRip)?);
+            super::ffi::set_register(part, vp, whv::WHvX64RegisterRip, super::ffi::reg64(rip + state.last_len))?;
+            super::ffi::set_register(
+                part,
+                vp,
+                whv::WHvRegisterPendingInterruption,
+                super::ffi::reg64(super::debug::pending_bp()),
+            )?;
+        }
+        Ok(())
     }
     pub fn get_sregs(&self) -> Result<kvm_sregs> {
         regs::get_sregs(self.part(), self.vp())
@@ -652,6 +760,8 @@ impl VcpuFd {
         }
 
         loop {
+            #[cfg(feature = "gdb")]
+            self.prepare_debug_entry()?;
             let Some(ctx) = self.enter()? else {
                 return err(libc::EINTR);
             };
@@ -826,6 +936,25 @@ impl VcpuFd {
                 | whv::WHvRunVpExitReasonX64ApicEoi => continue,
 
                 whv::WHvRunVpExitReasonUnrecoverableException => return Ok(VcpuExit::Shutdown),
+
+                // #DB or #BP for the gdb stub (only a partition made with
+                // the `gdb` feature has exception exits).
+                #[cfg(feature = "gdb")]
+                whv::WHvRunVpExitReasonException => {
+                    // SAFETY: the union arm matches the exit reason.
+                    let ex = unsafe { ctx.Anonymous.VpException };
+                    let mut state = self.shared.debug.lock().unwrap();
+                    let dr7 = state.hw.map_or(0, |(_, dr7)| dr7);
+                    let Some(arch) = super::debug::debug_exit(ex.ExceptionType, rip, ex.ExceptionParameter, dr7)
+                    else {
+                        return Ok(VcpuExit::InternalError);
+                    };
+                    state.last_len = instr_len.max(1);
+                    if ex.ExceptionType == super::debug::DB_VECTOR && super::debug::at_hw_breakpoint(rip, &state) {
+                        state.resume_rf = true;
+                    }
+                    return Ok(VcpuExit::Debug(arch));
+                }
 
                 _ => return Ok(VcpuExit::InternalError),
             }
@@ -1039,6 +1168,19 @@ impl VcpuFd {
             regs::set_msr_result(self.part(), self.vp(), value, rip_after)
         }
     }
+}
+
+/// gdb's hardware breakpoints into the vCPU's DR0-DR3 and DR7.
+fn write_hw_breakpoints(part: WHV_PARTITION_HANDLE, vp: u32, (addrs, dr7): ([u64; 4], u64)) -> Result<()> {
+    const NAMES: [whv::WHV_REGISTER_NAME; 5] = [
+        whv::WHvX64RegisterDr0,
+        whv::WHvX64RegisterDr1,
+        whv::WHvX64RegisterDr2,
+        whv::WHvX64RegisterDr3,
+        whv::WHvX64RegisterDr7,
+    ];
+    let r = super::ffi::reg64;
+    super::ffi::set_registers(part, vp, &NAMES, &[r(addrs[0]), r(addrs[1]), r(addrs[2]), r(addrs[3]), r(dr7)])
 }
 
 impl AsRawFd for VcpuFd {

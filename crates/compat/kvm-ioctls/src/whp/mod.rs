@@ -29,6 +29,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 pub mod cap;
+mod debug;
 mod emulate;
 mod exit;
 mod ffi;

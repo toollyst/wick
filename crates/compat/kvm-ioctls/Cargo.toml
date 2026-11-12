@@ -15,6 +15,12 @@ publish = false
 [lib]
 bench = false
 
+[features]
+# Guest debugging for Firecracker's gdb stub (vmm's `gdb`): on Windows the
+# partition is made with exception exits (src/whp/debug.rs). No effect on
+# Linux or macOS.
+gdb = []
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Same source as the crates.io 0.25.0 release (src/ is identical, checked 2026-11-09).
 # kvm-bindings is patched to the same tag in the root Cargo.toml so there is one copy.

@@ -38,3 +38,4 @@
 0036-windows-no-fdtable-resize-which-Windows-has-no-table.patch
 0037-windows-rebase-refuses-a-diff-file-that-is-not-spars.patch
 0038-windows-the-jailer-refuses-every-no-file-limit.patch
+0039-windows-the-gdb-feature-builds-the-WHP-backend-s-gue.patch

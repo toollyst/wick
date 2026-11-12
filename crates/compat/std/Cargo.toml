@@ -18,6 +18,10 @@ name = "wick_std"
 bench = false
 doctest = false
 
+[features]
+# wick-os's gdbstub connection for UnixStream (vmm's `gdb` feature).
+gdbstub = ["wick-os/gdbstub"]
+
 [target.'cfg(windows)'.dependencies]
 wick-os = { path = "../os" }
 

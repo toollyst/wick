@@ -15,7 +15,14 @@ name = "wick_os"
 bench = false
 doctest = false
 
+[features]
+# gdbstub's connection traits for `UnixStream`, which gdbstub implements for
+# std's only on Unix: Firecracker's gdb feature (vmm's `gdb`) serves a gdb
+# client on a Unix socket.
+gdbstub = ["dep:gdbstub"]
+
 [target.'cfg(windows)'.dependencies]
+gdbstub = { version = "0.7.10", optional = true }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",

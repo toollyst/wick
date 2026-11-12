@@ -5,6 +5,8 @@
 
 pub mod fd;
 mod fs;
+#[cfg(feature = "gdbstub")]
+mod gdb;
 mod net;
 
 pub use net::{peer_pid, set_broken_pipe_hook, startup};
