@@ -46,3 +46,4 @@
 0044-windows-the-compatibility-kvm-ioctls-logs-through-Fi.patch
 0045-macos-a-FIFO-for-the-log-metrics-or-serial-output-ho.patch
 0046-vmm-a-vCPU-thread-is-the-host-s-to-prepare-when-it-i.patch
+0047-macos-the-descriptor-table-is-sized-to-what-the-proc.patch

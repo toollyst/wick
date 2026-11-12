@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Fri, 13 Nov 2026 06:21:51 +0900
+Subject: [PATCH] macos: the descriptor table is sized to what the process can
+ use, so its resize at the start succeeds as on Linux
+
+resize_fdtable dup2s stdin to RLIMIT_NOFILE's soft limit less one, so
+that the table is allocated once at the start rather than grown later.
+On Linux, growing it in a multithreaded process waits for an RCU grace
+period (fs/file.c expand_fdtable: synchronize_rcu), which upstream
+measured as 30 to 70 ms on snapshot restore. Linux refuses a soft limit
+above fs.nr_open, so that number is always one dup2 takes.
+
+macOS keeps a soft limit above kern.maxfilesperproc and applies the lower
+of the two (xnu bsd/kern/kern_resource.c proc_limitgetcur_nofile). dup2
+refuses a number at or above it with EBADF (bsd/kern/kern_descrip.c dup2),
+so with an inherited soft limit of 1048576 every start logged "Failed to
+resize fdtable: Failed to call dup2 to resize fdtable".
+
+Measured with the release binary: soft limits 1048576 and 122881 log the
+failure, 122880 (kern.maxfilesperproc) and 256 do not. The limit is now
+clamped to getdtablesize(2), which xnu's sys_getdtablesize returns as that
+lower value, so the table is sized to what the process can use.
+
+On xnu, dup2 above the table grows it (fdalloc: new arrays, copied under
+the fd lock, with no grace period), so the start's resize also spares
+later growth there.
+
+test_resize_fdtable_with_a_soft_limit_above_the_tables_maximum sets the
+soft limit to kern.maxfilesperproc + 1 in a child. It failed with
+resize_fdtable's Dup2 error before the clamp and passes with it.
+---
+ src/firecracker/src/main.rs | 80 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 80 insertions(+)
+
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index b8b01d400f3535e471dad4aba63bbadfa2afcb30..8c615bced0d1becfdfa9def686535000751dc13f 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -523,6 +523,14 @@ fn resize_fdtable() -> Result<(), ResizeFdTableError> {
+     } else {
+         rlimit.rlim_cur.try_into().unwrap_or(2048)
+     };
++    // wick: Linux refuses a soft limit above its table's maximum (fs.nr_open), so the
++    // number above is always one dup2 takes. macOS keeps such a soft limit and applies
++    // the lower of it and kern.maxfilesperproc (xnu proc_limitgetcur_nofile), which
++    // getdtablesize(2) returns; dup2 refuses a number at or above it (EBADF). Size the
++    // table to what this process can use, as Linux does.
++    #[cfg(target_os = "macos")]
++    // SAFETY: no arguments.
++    let limit = limit.min(unsafe { libc::getdtablesize() });
+ 
+     // Resize the file descriptor table to its maximal possible size, to ensure that
+     // firecracker will not need to reallocate it later. If the file descriptor table
+@@ -721,6 +729,78 @@ fn run_without_api(
+     Ok(())
+ }
+ 
++// wick: the descriptor table is sized at the start on macOS too (resize_fdtable).
++#[cfg(test)]
++#[cfg(target_os = "macos")]
++mod wick_fdtable_tests {
++    use super::*;
++
++    // A soft RLIMIT_NOFILE above kern.maxfilesperproc, which macOS keeps (Linux refuses
++    // one above fs.nr_open): the table is sized to getdtablesize(), not refused.
++    #[test]
++    fn test_resize_fdtable_with_a_soft_limit_above_the_tables_maximum() {
++        // In a child: the limit is the whole process's.
++        // SAFETY: the child sets its own limit, makes the calls below and exits.
++        match unsafe { libc::fork() } {
++            0 => {
++                let mut per_proc: libc::c_int = 0;
++                let mut len = std::mem::size_of::<libc::c_int>();
++                // SAFETY: a NUL-terminated name and an int-sized output.
++                let got = unsafe {
++                    libc::sysctlbyname(
++                        c"kern.maxfilesperproc".as_ptr(),
++                        (&raw mut per_proc).cast(),
++                        &mut len,
++                        std::ptr::null_mut(),
++                        0,
++                    )
++                };
++                let mut rl = libc::rlimit {
++                    rlim_cur: 0,
++                    rlim_max: 0,
++                };
++                // SAFETY: an rlimit to fill.
++                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
++                let want = libc::rlim_t::try_from(per_proc).unwrap() + 1;
++                let code = if got != 0 {
++                    2
++                } else if rl.rlim_max < want {
++                    // The hard limit leaves no room above the maximum: say so (exit 3).
++                    3
++                } else {
++                    rl.rlim_cur = want;
++                    // SAFETY: an rlimit we filled.
++                    let set = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) };
++                    // SAFETY: no arguments.
++                    let table = unsafe { libc::getdtablesize() };
++                    match (set, resize_fdtable()) {
++                        (0, Ok(())) if table == per_proc => 0,
++                        (0, Ok(())) => 4,
++                        (0, Err(_)) => 1,
++                        _ => 5,
++                    }
++                };
++                // SAFETY: ends the child.
++                unsafe { libc::_exit(code) }
++            }
++            -1 => panic!("fork: {}", io::Error::last_os_error()),
++            pid => {
++                let mut status = 0;
++                // SAFETY: our child; an out-pointer.
++                assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
++                assert!(libc::WIFEXITED(status), "status {status:#x}");
++                let code = libc::WEXITSTATUS(status);
++                assert_eq!(
++                    code, 0,
++                    "1: resize_fdtable failed; 2: sysctl failed; 3: the hard RLIMIT_NOFILE is \
++                     below kern.maxfilesperproc + 1; 4: getdtablesize is not kern.maxfilesperproc; \
++                     5: setrlimit refused"
++                );
++            }
++        }
++    }
++}
++
+ // wick: the binary reports wick's version, built on this tree's upstream release.
+ #[cfg(test)]
+ mod wick_version_tests {
