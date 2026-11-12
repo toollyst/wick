@@ -2235,13 +2235,77 @@ mod macos {
         #[test]
         #[ignore = "run by test_api_profile_raises_sigsys_outside_its_list in a separate process"]
         fn api_child() {
+            use std::os::unix::process::ExitStatusExt;
+            // The API process is a fork made with one thread
+            // (`api_process::fork` checks it), and nothing else runs in it
+            // when its profile is applied. Here the test thread runs beside
+            // libtest's main thread, which waits for the test's end on its
+            // thread parker, a libdispatch semaphore whose kernel semaphore
+            // is made at the first wait (libdispatch src/semaphore.c,
+            // src/shims/lock.c `_dispatch_sema4_create_slow`:
+            // `semaphore_create`, a Mach message). When that first wait came
+            // after the profile, mach_msg2_trap was denied and the process
+            // ended with SIGSYS before SETUP-OK (CI run 43316721239, macOS
+            // 15: "SIGSYS step 01 O", its only denial `syscall-mach 47`; 1
+            // run in 20 on macOS 26 before). So the profile is applied in a
+            // fork of this thread, as in the API process, and its end is
+            // this process's.
+            // SAFETY: the child runs only this thread's code and ends with
+            // `_exit` or a signal, never returning into libtest.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                let ok = std::panic::catch_unwind(api_child_body).is_ok();
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                // SAFETY: ends the forked child.
+                unsafe { libc::_exit(if ok { 0 } else { 101 }) };
+            }
+            let mut status = 0;
+            // SAFETY: our child; an out-pointer.
+            while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+                let err = std::io::Error::last_os_error();
+                assert_eq!(err.raw_os_error(), Some(libc::EINTR), "waitpid: {err}");
+            }
+            let status = std::process::ExitStatus::from_raw(status);
+            if let Some(signal) = status.signal() {
+                // The child's signal ends this process too, as the test reads it.
+                // SAFETY: the default action of a valid signal, then the signal.
+                unsafe {
+                    libc::signal(signal, libc::SIG_DFL);
+                    libc::raise(signal);
+                }
+            }
+            assert!(status.success(), "the forked child: {status:?}");
+        }
+
+        /// This process's threads.
+        fn process_threads() -> usize {
+            // SAFETY: an all-zero proc_taskinfo is a valid output buffer.
+            let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+            let size = i32::try_from(std::mem::size_of::<libc::proc_taskinfo>()).unwrap();
+            // SAFETY: a valid output buffer of the size passed.
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    libc::getpid(),
+                    libc::PROC_PIDTASKINFO,
+                    0,
+                    std::ptr::from_mut(&mut info).cast(),
+                    size,
+                )
+            };
+            assert_eq!(got, size, "proc_pidinfo: {}", std::io::Error::last_os_error());
+            usize::try_from(info.pti_threadnum).unwrap()
+        }
+
+        /// [`api_child`]'s work, in its one-thread fork.
+        fn api_child_body() {
             use std::io::{Read, Write};
             use std::sync::atomic::{AtomicU8, AtomicUsize};
-            // Diagnosis of a SIGSYS before SETUP-OK (1 run in 20 on macOS 26
-            // CI): which step the test thread had reached, and the thread
-            // the signal came on (T: the test thread, O: another). Seatbelt
-            // signals the process, so the thread is not the offender's
-            // (measured: the expected denials after SETUP-OK come on O).
+            // Diagnosis of a SIGSYS before SETUP-OK: which step the thread
+            // had reached, and the thread the signal came on (T: this
+            // thread, O: another). Seatbelt signals the process, so the
+            // thread is not the offender's.
+            assert_eq!(process_threads(), 1, "the API profile is applied in a process of one thread");
             static STEP: AtomicU8 = AtomicU8::new(0);
             static TEST_THREAD: AtomicUsize = AtomicUsize::new(0);
             extern "C" fn on_sigsys(_: libc::c_int) {
