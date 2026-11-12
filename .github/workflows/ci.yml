@@ -289,7 +289,8 @@ jobs:
           # The tests that create a VM need Hypervisor.framework, which GitHub's
           # macOS runners (virtual machines) do not have; tools/macos/test.sh
           # runs them, and tools/macos/boot-test.sh the scenarios.
-          cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- --skip hvf::vm::tests::
+          cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- --skip hvf::vm::tests:: \
+            --skip hvf::vcpu::tests::test_kvm_ptp_counters
       - name: Host sandbox and jail hand-over tests
         working-directory: lib/firecracker
         run: cargo test --locked -p vmm --lib "ext::"
