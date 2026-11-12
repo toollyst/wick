@@ -26,8 +26,10 @@ use crate::platform::fs::HoleKeeper;
 
 /// `DKIOCGETBLOCKSIZE` (`_IOR('d', 24, uint32_t)`): a block device's
 /// logical block size.
+#[cfg(not(windows))]
 pub const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x4004_6418;
 /// `DKIOCGETBLOCKCOUNT` (`_IOR('d', 25, uint64_t)`): its number of blocks.
+#[cfg(not(windows))]
 pub const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x4008_6419;
 
 /// A block device's capacity in bytes (`None` for any other file). On
