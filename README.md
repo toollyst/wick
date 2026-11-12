@@ -78,6 +78,7 @@ wick removes that limit without forking Firecracker in the usual sense:
 | Host sandbox | A Seatbelt profile in place of seccomp-BPF |
 
 The full feature × host matrix is at the top of the [roadmap](docs/ROADMAP.md).
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) has every endpoint, device and flag per host, each with its test.
 
 ## Get started
 
