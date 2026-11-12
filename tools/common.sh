@@ -15,6 +15,27 @@ die() {
     exit 1
 }
 
+# For a script that builds as the user and then asks for sudo itself for
+# what needs root (tools/macos/jailer-test.sh, integration-tests.sh): it
+# refuses to start as root, before it builds or makes anything. Under sudo,
+# cargo builds as root, and the root-owned files it leaves in the build
+# directories the user's builds share can make a later build of the user's
+# fail: two runs of jailer-test.sh under sudo (build/jailer-test/20261112-13*,
+# root-owned) left 272 (cargo's fingerprints and incremental state for the
+# jailer, build/jailer-test itself), and the user's jailer build of
+# 2026-11-13 failed writing its fingerprint, "Permission denied".
+# $1: the script as invoked, $2...: its arguments, for the command to run
+# instead.
+not_as_root() {
+    ((EUID != 0)) && return 0
+    local script="$1"
+    shift
+    die "$script refuses to run as root: it builds as you and asks for sudo itself for what needs root. As root,
+cargo would build as root, and the root-owned files left in the build directories your own builds share
+(lib/firecracker/build, build/) can make your next build fail with \"Permission denied\".
+Run it as yourself, without sudo: $script${*:+ $*}"
+}
+
 # git in the upstream checkout. Commits made by the tools (git am, rebase) get
 # an identity even on a machine without git config.
 up() {

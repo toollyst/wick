@@ -32,7 +32,7 @@ entitlement: use `tools/macos/run.sh` to run Firecracker and
 tests against upstream's aarch64 CI guest (boot, SMP, block, vsock,
 networking, snapshots, userfaultfd, PCI, vhost-user, the devices, the command
 line, memory hotplug and more); run it before sending a
-change to the macOS backends. `tools/macos/jailer-test.sh` (it asks for sudo)
+change to the macOS backends. `tools/macos/jailer-test.sh` (run it as yourself: it asks for sudo, and refuses to start under it)
 starts Firecracker through the jailer and checks the jail from outside; run it
 before a change to the jailer's macOS backend or the Seatbelt profile. The macOS sandbox
 allows only the system calls in `SYSCALLS` (overlay/vmm/ext/sandbox.rs), as
@@ -275,7 +275,8 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   (process waiting, memory maps, networks and their host side, the jailer's stand-in for
   runs without root) is `tools/macos/integration/`. Without arguments it runs
   the functional and security suites as the user; `--jailer` runs them as root
-  with wick's jailer, as upstream's CI does on Linux. `WICK_IT_DIAG_MEMORY=1`
+  with wick's jailer, as upstream's CI does on Linux (it asks for sudo itself,
+  and refuses to start under sudo). `WICK_IT_DIAG_MEMORY=1`
   (each memory reading `get_stable_rss_mem` takes logged with its parts, the
   host's paging and the guest's `/proc/meminfo`, in `OUT/memory-diag.jsonl`),
   `WICK_IT_DIAG_RSS_LESS=vmm` (that reading without the VMM's own part too;

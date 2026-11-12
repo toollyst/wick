@@ -48,7 +48,8 @@
 # when a worker was killed (tools/macos/integration/disks-selftest.sh).
 #
 # --jailer asks for sudo once, at the start of pytest; run the script as the
-# user, not under sudo. Root's tests (the security suite, the [root] entries
+# user, not under sudo (as root it refuses to start: not_as_root,
+# tools/common.sh). Root's tests (the security suite, the [root] entries
 # of tools/macos/integration-test-differences.txt) in one run:
 #   tools/macos/integration-tests.sh --jailer -n 1 integration_tests/security \
 #     integration_tests/functional/test_snapshot_basic.py::test_negative_snapshot_permissions \
@@ -74,6 +75,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT/tools/common.sh"
+not_as_root "$0" "$@"
 mode=user
 out=""
 while [[ $# -gt 0 ]]; do

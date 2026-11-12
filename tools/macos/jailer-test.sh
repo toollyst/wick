@@ -12,11 +12,13 @@
 # vmnet-guest memory cpu hugepages uffd vhost-user. fsize, no-api, boot, netns, vmnet-guest, memory, cpu,
 # hugepages, uffd and vhost-user start a VM and need Hypervisor.framework; --no-vm skips them (GitHub's
 # macOS runners have no Hypervisor.framework). Results and logs go to
-# build/jailer-test/<time>. Run tools/setup.sh first.
+# build/jailer-test/<time>. Run tools/setup.sh first. Run it as yourself, not
+# under sudo: as root it refuses to start (not_as_root, tools/common.sh).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT/tools/common.sh"
+not_as_root "$0" "$@"
 PROFILE=debug
 cargo_profile=()
 if [[ "${1:-}" == "--release" ]]; then

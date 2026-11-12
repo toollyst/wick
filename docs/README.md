@@ -72,7 +72,7 @@ cd ../..
 
 tools/macos/test.sh                     # upstream's vmm unit tests with Hypervisor.framework (macOS)
 tools/macos/boot-test.sh                # scenario tests in a real guest (macOS), before any change to a macOS backend
-sudo -v && tools/macos/jailer-test.sh   # the jailer's scenario tests (macOS): builds as you, then runs them as root; not under sudo
+sudo -v && tools/macos/jailer-test.sh   # the jailer's scenario tests (macOS): builds as you, then runs them as root; refuses to start under sudo
 tools/patches.sh export                 # after committing a change on branch `wick` in lib/firecracker
 tools/patches.sh check                  # what CI checks about patches/
 ```
