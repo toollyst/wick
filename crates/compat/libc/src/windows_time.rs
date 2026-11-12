@@ -599,4 +599,54 @@ mod tests {
         // SAFETY: closes the timer.
         unsafe { crate::windows_fd::close(fd) };
     }
+
+    #[test]
+    fn test_a_timer_closed_disarmed_is_released() {
+        // macOS kept a timer closed while disarmed (d291b9d). Here no worker
+        // thread holds a timer: its state lives in the descriptor table,
+        // and a close through this crate removes it at once.
+        // SAFETY: plain call.
+        let fd = unsafe { timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC) };
+        assert!(fd != -1);
+        let state = Arc::downgrade(&lookup(fd).unwrap());
+        // SAFETY: closes the timer, never armed.
+        assert_eq!(unsafe { crate::windows_fd::close(fd) }, 0);
+        assert!(state.upgrade().is_none(), "the timer outlived its close");
+    }
+
+    #[test]
+    fn test_a_timer_closed_behind_the_table_is_released() {
+        // Firecracker's `TimerFd` holds the descriptor in a `std::fs::File`,
+        // whose drop calls `CloseHandle` itself, not this crate's `close`.
+        // The table's own handle of the timer then keeps it until the
+        // table next sweeps closed descriptors, which it does each time it
+        // has doubled (at 64 entries at the latest): a bounded delay, not
+        // a leak. Disarmed, as in the macOS leak.
+        // SAFETY: plain call.
+        let fd = unsafe { timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC) };
+        assert!(fd != -1);
+        let state = Arc::downgrade(&lookup(fd).unwrap());
+        // SAFETY: what `File`'s drop does with the descriptor's handle.
+        assert_ne!(unsafe { CloseHandle(handle(fd)) }, 0);
+        // Other descriptors made meanwhile, held open so that the table
+        // grows to its sweep: the closed timer must be gone by then.
+        let mut held = std::vec::Vec::new();
+        let mut released = false;
+        for _ in 0..200 {
+            // SAFETY: plain call.
+            let other = unsafe { timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC) };
+            assert!(other != -1);
+            held.push(other);
+            if state.upgrade().is_none() {
+                released = true;
+                break;
+            }
+        }
+        let made = held.len();
+        for other in held {
+            // SAFETY: closes the timers made above.
+            unsafe { crate::windows_fd::close(other) };
+        }
+        assert!(released, "a timer closed by CloseHandle was kept past {made} timers made");
+    }
 }
