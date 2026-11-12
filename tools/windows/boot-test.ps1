@@ -11,11 +11,13 @@
 #   smp    2 vCPUs: AP start-up, work on each CPU, the clock agrees between
 #          them
 #   block  Async read-only drive (md5), Sync and Async writable drives (the
-#          host sees the guest's writes), read-only enforced
+#          host sees the guest's writes), read-only enforced, each drive's
+#          serial from its file
 #   vsock  host -> guest CONNECT, 4 MiB echo; guest -> host <uds>_53
 #   net    virtio-net over the Windows endpoint (Unix stream, 32-bit
 #          big-endian length before each frame): a switch here answers ARP,
-#          ICMP echo and UDP echo and checks every checksum the guest sends
+#          ICMP echo and UDP echo and checks every checksum the guest sends;
+#          rx and tx rate limiters set while it runs hold it to 1 MiB/s
 #   snapshot  full snapshot of a 2 vCPU guest (data drive, vsock) restored in
 #          a new process: shell state, clock, drives, vsock
 #   diff   diff snapshot with dirty page tracking (holes kept), merged by
@@ -45,6 +47,8 @@
 #          it, in Firecracker and its API process (no guest)
 #   foreign-snapshot  a state file made on another host (-ForeignState) is
 #          refused at the load (no guest)
+#   memory-hotplug  virtio-mem: 512 MiB plugged, seen in MemTotal and used,
+#          then unplugged
 #
 # Before each reset the guest kernel log must be free of stalls, BUGs, oopses
 # and warnings.
@@ -884,6 +888,13 @@ namespace Wick {
                     lock (Bad) Bad.Add("UDP checksum " + ck.ToString("x4") + " in " + HexHead(f));
                     return;
                 }
+                if (dport == 9) {
+                    // The discard port: what the guest sends, timed (net
+                    // rate limiters).
+                    var sink = Sink;
+                    if (sink != null) lock (sink) sink.Add(new long[] { Stopwatch.GetTimestamp(), ulen - 8 });
+                    return;
+                }
                 if (dport != 7) return;
                 Udp++;
                 var udp = new byte[ulen];
@@ -897,8 +908,49 @@ namespace Wick {
             }
         }
 
+        // Datagrams the guest sent to the host's port 9 while set: each its
+        // arrival (Stopwatch ticks) and its payload bytes.
+        public volatile List<long[]> Sink;
+
+        public static readonly byte[] GuestIp = { 10, 0, 0, 2 };
+        Thread flooder;
+        volatile bool flooding;
+        long flooded;
+
+        // Sends UDP datagrams of 1400 bytes to the guest's port 9 as fast as
+        // the endpoint takes them, until StopFlood; returns at once.
+        public void StartFlood(byte[] guestMac) {
+            flooding = true;
+            flooded = 0;
+            flooder = new Thread(() => {
+                var udp = new byte[8 + 1400];
+                Put16(udp, 0, 9999);
+                Put16(udp, 2, 9);
+                Put16(udp, 4, udp.Length);
+                int c = Csum(udp, 0, udp.Length, Pseudo(HostIp, 0, GuestIp, 0, 17, udp.Length));
+                Put16(udp, 6, c == 0 ? 0xffff : c);
+                var ip = Ipv4(17, GuestIp, 0, udp);
+                try {
+                    while (flooding) {
+                        Send(guestMac, 0, 0x0800, ip);
+                        Interlocked.Add(ref flooded, udp.Length - 8);
+                    }
+                } catch (Exception) { }
+            });
+            flooder.IsBackground = true;
+            flooder.Start();
+        }
+
+        // Stops the flood; returns the payload bytes it sent.
+        public long StopFlood() {
+            flooding = false;
+            if (flooder != null) flooder.Join(5000);
+            return Interlocked.Read(ref flooded);
+        }
+
         public void Close() {
             stop = true;
+            flooding = false;
             t.Join(2000);
             conn.Dispose();
         }
@@ -1236,6 +1288,42 @@ namespace Wick {
         }
     }
 
+    // What Firecracker gives a drive as its serial (VIRTIO_BLK_GET_ID) on
+    // Windows: the file's volume serial number and NTFS file index as one
+    // number, in 20 base-32 digits (vmm platform::fs::device_id).
+    public static class DriveId {
+        [StructLayout(LayoutKind.Sequential)]
+        struct Info {
+            public uint Attributes;
+            public long Created, Accessed, Written;
+            public uint VolumeSerial, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+        }
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetFileInformationByHandle(IntPtr h, out Info info);
+
+        public static string Of(string path) {
+            Info info;
+            using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+                if (!GetFileInformationByHandle(f.SafeFileHandle.DangerousGetHandle(), out info))
+                    throw new InvalidOperationException("GetFileInformationByHandle " + path + ": error " + Marshal.GetLastWin32Error());
+            }
+            ulong index = ((ulong)info.IndexHigh << 32) | info.IndexLow;
+            ulong volume = info.VolumeSerial;
+            const string digits = "0123456789abcdefghijklmnopqrstuv";
+            var sb = new StringBuilder();
+            for (int d = 19; d >= 0; d--) {
+                int v = 0;
+                for (int b = 4; b >= 0; b--) {
+                    int bit = 5 * d + b;
+                    ulong word = bit < 64 ? index >> bit : (bit < 128 ? volume >> (bit - 64) : 0);
+                    v = (v << 1) | (int)(word & 1);
+                }
+                sb.Append(digits[v]);
+            }
+            return sb.ToString();
+        }
+    }
+
     public static class PipeSelfTest {
         // A client writes to the reader's pipe, as Firecracker's logger does.
         public static string Run() {
@@ -1474,6 +1562,19 @@ function Stage-Block {
     $cfg['drives'] += [ordered]@{ drive_id = 'asyncw'; path_on_host = $asyncW; is_root_device = $false; is_read_only = $false; io_engine = 'Async' }
     $vm = Start-Vm 'block' $cfg
     Wait-Shell $vm
+    # The drive's serial (VIRTIO_BLK_GET_ID): upstream builds it from the
+    # file's st_dev, st_rdev and st_ino; on Windows from its volume serial
+    # number and file index, in 20 base-32 digits (row of the drive's serial
+    # in docs/COMPATIBILITY.md). Each must be what the file gives, and
+    # distinct.
+    $serials = @{}
+    foreach ($d in @(@('vda', $Rootfs), @('vdb', $data), @('vdc', $syncW), @('vdd', $asyncW))) {
+        $want = [Wick.DriveId]::Of($d[1])
+        $got = $vm.Sh("cat /sys/block/$($d[0])/serial")
+        Check ($got -eq $want) "$($d[0]) serial '$got', the file gives '$want'"
+        $serials[$d[0]] = $got
+    }
+    Check (@($serials.Values | Sort-Object -Unique).Count -eq 4) "drive serials not distinct: $(($serials.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ')"
     $want = [Wick.Util]::Md5File($data, -1)
     $out = $vm.Sh('md5sum /dev/vdb')
     Check ((($out -split '\s+')[0]) -eq $want) "guest md5 of the Async read-only drive '$out', host $want"
@@ -1489,7 +1590,7 @@ function Stage-Block {
     $want4 = [Wick.Util]::Md5File($data, 4MB)
     Check ([Wick.Util]::Md5File($syncW, 4MB) -eq $want4) 'Sync drive: the host file does not hold what the guest wrote'
     Check ([Wick.Util]::Md5File($asyncW, 4MB) -eq $want4) 'Async drive: the host file does not hold what the guest wrote'
-    return "Async read md5, Sync and Async writes reach the host file, read-only enforced (root bash $($rootMd5.Substring(0, 8)))"
+    return "Async read md5, Sync and Async writes reach the host file, read-only enforced, serials from the volume and file index (root bash $($rootMd5.Substring(0, 8)))"
 }
 
 function Stage-Vsock {
@@ -1514,6 +1615,68 @@ function Stage-Vsock {
 }
 
 $GuestMac = '06:00:0a:00:00:02'
+
+# 1 MiB/s: a bucket of 128 KiB refilled every 125 ms (upstream's token
+# bucket: `size` bytes, `refill_time` ms, full at the start).
+$NetLimit = [ordered]@{ bandwidth = [ordered]@{ size = 128KB; refill_time = 125 } }
+$NetLimitBps = 128KB * 1000 / 125
+$NoLimit = [ordered]@{ bandwidth = [ordered]@{ size = 0; refill_time = 0 } }
+
+# The rate at which `total` bytes the guest sends to the host's port 9 reach
+# the switch (bytes per second, between the first and the last datagram);
+# returns the bytes and the rate.
+function Get-NetTxRate($vm, $switch, [int]$total = 3MB) {
+    $sink = New-Object 'System.Collections.Generic.List[long[]]'
+    $switch.Sink = $sink
+    $vm.Sh("head -c $total /dev/zero | socat -b 1400 -u - UDP:10.0.0.1:9", 120000, $true) | Out-Null
+    Start-Sleep -Milliseconds 500
+    $switch.Sink = $null
+    $got = 0; $first = $null; $last = $null
+    foreach ($e in @($sink.ToArray())) { $got += $e[1]; if ($null -eq $first) { $first = $e }; $last = $e }
+    Check ($sink.Count -ge 2) "the host got $($sink.Count) datagrams of $total bytes sent"
+    $secs = [math]::Max(($last[0] - $first[0]) / [Diagnostics.Stopwatch]::Frequency, 1e-6)
+    return @($got, (($got - $first[1]) / $secs))
+}
+
+# The guest's receive rate (its rx_bytes over `seconds`) while the host
+# floods it with UDP to port 9 (bytes per second).
+function Get-NetRxRate($vm, $switch, [int]$seconds = 2) {
+    $mac = [byte[]]($GuestMac -split ':' | ForEach-Object { [Convert]::ToByte($_, 16) })
+    $switch.StartFlood($mac)
+    try {
+        Start-Sleep -Milliseconds 500  # past the bucket's first, full, budget
+        $out = $vm.Sh('a=$(cat /sys/class/net/eth0/statistics/rx_bytes); S=$(date +%s%N); ' +
+            "sleep $seconds; " + 'b=$(cat /sys/class/net/eth0/statistics/rx_bytes); echo $((b - a)) $(( ($(date +%s%N) - S) / 1000 ))', 60000, $true)
+    } finally {
+        $sent = $switch.StopFlood()
+    }
+    $f = Get-Fields $out
+    $got = [long]$f[0]; $us = [long]$f[1]
+    Check ($sent -gt $got) "host flood sent $sent bytes, guest counted $got"
+    return $got / ($us / 1e6)
+}
+
+# rx and tx bandwidth limiters set on the running device (PATCH): each
+# direction runs at the limit, and without one at three times it or more
+# (the counterpart of the macOS stage's net_rate_limiters).
+function Test-NetRateLimiters($vm, $switch) {
+    $mib = 1MB
+    $txFree = (Get-NetTxRate $vm $switch)[1]
+    $rxFree = Get-NetRxRate $vm $switch
+    Invoke-Api $vm 'PATCH' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; tx_rate_limiter = $NetLimit }) | Out-Null
+    $r = Get-NetTxRate $vm $switch
+    $txGot = $r[0]; $tx = $r[1]
+    Invoke-Api $vm 'PATCH' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; rx_rate_limiter = $NetLimit; tx_rate_limiter = $NoLimit }) | Out-Null
+    $rx = Get-NetRxRate $vm $switch
+    Invoke-Api $vm 'PATCH' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; rx_rate_limiter = $NoLimit }) | Out-Null
+    $txAfter = (Get-NetTxRate $vm $switch)[1]
+    $summary = 'tx {0:N1} -> {1:N2} MiB/s, rx {2:N1} -> {3:N2} MiB/s at a 1 MiB/s limit; tx {4:N1} MiB/s once removed' -f ($txFree / $mib), ($tx / $mib), ($rxFree / $mib), ($rx / $mib), ($txAfter / $mib)
+    Check ($txGot -ge 1MB) "throttled tx: only $txGot bytes reached the host ($summary)"
+    Check ($tx -ge 0.5 * $NetLimitBps -and $tx -le 1.25 * $NetLimitBps) "tx limiter: $summary"
+    Check ($rx -ge 0.5 * $NetLimitBps -and $rx -le 1.25 * $NetLimitBps) "rx limiter: $summary"
+    Check ($txFree -ge 3 * $NetLimitBps -and $rxFree -ge 3 * $NetLimitBps -and $txAfter -ge 3 * $NetLimitBps) "unthrottled rates not above the limit: $summary"
+    return $summary
+}
 
 function Stage-Net {
     $endpoint = Join-Path $SockDir 'n.ep'
@@ -1542,6 +1705,7 @@ function Stage-Net {
         Check ($out -match ' 0% packet loss') "ping -c 200 -i 0.01: $out"
         $out = $vm.Sh('echo udp-$((6*7)) | socat -t 3 - UDP:10.0.0.1:7')
         Check ($out -eq 'udp-42') "UDP echo '$out'"
+        $rates = Test-NetRateLimiters $vm $switch
         Save-Dmesg $vm 'net'
         $switch.Closing = $true
         $vm.Reboot()
@@ -1551,7 +1715,7 @@ function Stage-Net {
     Check ($switch.ReadError -eq $null) "switch: $($switch.ReadError) ($($switch.Counts))"
     Check ($switch.Bad.Count -eq 0) "bad frames from the guest: $(($switch.Bad | Select-Object -First 3) -join '; ')"
     Check ($switch.Arp -ge 1 -and $switch.Icmp -ge 205 -and $switch.Udp -ge 1) "switch saw $($switch.Counts)"
-    return "Unix stream endpoint: ARP, ICMP (1400 B, 200 back to back), UDP echo, checksums valid ($($switch.Counts))"
+    return "Unix stream endpoint: ARP, ICMP (1400 B, 200 back to back), UDP echo, checksums valid ($($switch.Counts)); $rates"
 }
 
 # A helper binary: next to firecracker.exe or this script, else where the
@@ -2409,6 +2573,49 @@ function Stage-NoSeccomp {
     return 'without --no-seccomp the setup-phase mitigations in Firecracker and the whole profile in its API process; with it none in either'
 }
 
+# virtio-mem, as upstream's test_virtio_mem_hotplug_hotunplug does it: 512 MiB
+# plugged into a guest of 512 MiB (a 1 GiB hotplug area, 128 MiB slots, 2 MiB
+# blocks) and seen in its MemTotal, used, then unplugged again.
+function Stage-MemoryHotplug {
+    $cfg = Base-Config 2 512 ($BootArgs + ' memhp_default_state=online_movable')
+    $cfg['memory-hotplug'] = [ordered]@{ total_size_mib = 1024; slot_size_mib = 128; block_size_mib = 2 }
+    $vm = Start-Vm 'memory-hotplug' $cfg -Api
+    Wait-Shell $vm
+    $memTotal = { [math]::Floor([long]$vm.Sh("awk '/MemTotal/ {print `$2}' /proc/meminfo") / 1024) }
+    $base = & $memTotal
+    $plug = {
+        param([int]$mib)
+        Invoke-Api $vm 'PATCH' '/hotplug/memory' ([ordered]@{ requested_size_mib = $mib }) | Out-Null
+        $until = [DateTime]::UtcNow.AddSeconds(60)
+        while ($true) {
+            $hp = (Invoke-Api $vm 'GET' '/hotplug/memory') | ConvertFrom-Json
+            if ($hp.plugged_size_mib -eq $mib) { break }
+            Check ([DateTime]::UtcNow -lt $until) "plugged_size_mib $($hp.plugged_size_mib) 60 s after asking for $mib MiB"
+            Start-Sleep -Milliseconds 100
+        }
+        # The guest's driver received the request ...
+        $req = $vm.Sh("dmesg | grep virtio_mem | grep 'requested size' | tail -1 | awk -F': ' '{print `$NF}'")
+        Check ([Convert]::ToInt64($req.Trim(), 16) -eq ([long]$mib -shl 20)) "virtio_mem's requested size '$req' for $mib MiB"
+        # ... and carried it out.
+        $until = [DateTime]::UtcNow.AddSeconds(5)
+        while ($true) {
+            $now = & $memTotal
+            if ($now -eq $base + $mib) { break }
+            Check ([DateTime]::UtcNow -lt $until) "MemTotal $now MiB, $base + $mib expected"
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    & $plug 512
+    # Memory past what the guest booted with, written and read back.
+    $out = $vm.Sh('mount -t tmpfs -o size=900m tmpfs /mnt && head -c 600m /dev/urandom > /mnt/f && md5sum /mnt/f > /tmp/a && md5sum /mnt/f | cmp - /tmp/a && echo same', 180000, $true)
+    Check ($out -eq 'same') "600 MiB in a guest of $base + 512 MiB read back differently: '$out'"
+    $vm.Sh('rm /mnt/f && umount /mnt') | Out-Null
+    & $plug 0
+    Save-Dmesg $vm 'memory-hotplug'
+    $vm.Reboot()
+    return "virtio-mem: MemTotal $base -> $($base + 512) MiB and back, 600 MiB written and read back while plugged"
+}
+
 $Stages = [ordered]@{
     boot     = { Stage-Boot }
     smp      = { Stage-Smp }
@@ -2429,6 +2636,7 @@ $Stages = [ordered]@{
     tools    = { Stage-Tools }
     'no-seccomp' = { Stage-NoSeccomp }
     'foreign-snapshot' = { Stage-ForeignSnapshot }
+    'memory-hotplug' = { Stage-MemoryHotplug }
 }
 
 # --- run ------------------------------------------------------------------------
