@@ -2847,8 +2847,13 @@ function Get-GdbBytes([string]$text, [string]$marker) {
 # must be the vmlinux's bytes: at start_kernel (a page offset kept, the
 # kernel text's large page) and, at a software breakpoint at rest_init, at
 # the kernel's start through the direct map (2 MiB or 1 GiB pages); the guest
-# then boots on under gdb. Whether this gdb reaches the socket by its path
-# (`target remote <path>`) is tried first and reported; otherwise it goes
+# then boots on under gdb.
+# Expected in Firecracker's log at a stop before the guest enables kvm-clock
+# (start_kernel's is): "KVM_KVMCLOCK_CTRL call failed (os error 87)", EINVAL,
+# as Linux's kvm_set_guest_paused returns while !pv_time.active (x86.c
+# 5687-5690, v6.12); not a defect.
+# Whether this gdb reaches the socket by its path (`target remote <path>`) is
+# tried first and reported; otherwise it goes
 # through a TCP relay (Wick.Relay).
 function Stage-Gdb {
     $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)

@@ -1293,3 +1293,260 @@ fn write_scratch(scratch: *mut u8, value: u64, len: usize) {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch, n) };
 }
 
+// How WHP hands a #BP the partition exited on back to the guest, which
+// upstream's gdb stub asks for (`KVM_GUESTDBG_INJECT_BP`) when the INT3 is
+// the guest's own: the kernel's `int3_selftest` (Linux v6.12,
+// arch/x86/kernel/alternative.c:1608-1668, from arch_cpu_finalize_init)
+// executes one during boot, and the gdb stage's vCPU run failed with
+// `os error 87` there (kit fb9d77b). KVM queues the #BP (x86.c,
+// kvm_arch_vcpu_ioctl_set_guest_debug) and delivers it as a software
+// exception from RIP at the INT3 (SVM: RIP put back and NextRIP past it,
+// svm.c svm_update_soft_interrupt_rip; VMX: the exit's instruction
+// length). QEMU's WHPX never intercepts INT3 (whpx-all.c: "the WHPX API
+// does not offer an easy way to pass the intercepted exception back to the
+// guest"; WHvRegisterPendingEvent "seems to only work for interrupts and
+// not software exceptions"); its own breakpoints are INT1. Not tried here,
+// as a fifth way: no #BP intercept at all, the guest handling every INT3,
+// and gdb's breakpoints then needing another mechanism than INT3.
+#[cfg(all(test, feature = "gdb"))]
+mod bp_tests {
+    use super::*;
+    use kvm_bindings::{
+        kvm_guest_debug, kvm_segment, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_INJECT_BP,
+        KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    const MEM: usize = 4 << 20;
+    /// The INT3, followed by `out 0x80, al` and `jmp $`.
+    const CODE: u64 = 0x6000;
+    /// The #BP handler: records the RIP the CPU pushed and a mark, `iretq`.
+    const HANDLER: u64 = 0x7000;
+    const PUSHED: u64 = 0x8000;
+    const MARK: u64 = 0x8008;
+    const STACK: u64 = 0x9000;
+    const GDT: u64 = 0x4000;
+    const IDT: u64 = 0x5000;
+    const PORT: u16 = 0x80;
+    /// `WHvRegisterPendingEvent` (WinHvPlatformDefs.h).
+    const PENDING_EVENT: whv::WHV_REGISTER_NAME = 0x8000_0002u32 as i32;
+    /// `WHvCapabilityCodeExceptionExitBitmap`, `WHvCapabilityCodeProcessorVendor`.
+    const CAP_EXCEPTION_EXIT_BITMAP: whv::WHV_CAPABILITY_CODE = 3;
+    const CAP_PROCESSOR_VENDOR: whv::WHV_CAPABILITY_CODE = 0x1000;
+
+    /// `WHV_X64_PENDING_INTERRUPTION_REGISTER` for #BP: pending, `kind`
+    /// (3 exception; 6 Hyper-V's software exception, which WHP's header does
+    /// not list), instruction length `len`, vector 3.
+    fn pending_interruption(kind: u64, len: u64) -> u64 {
+        1 | (kind << 1) | (len << 5) | (3 << 16)
+    }
+
+    /// Guest memory with long mode's tables (the first 2 MiB identity
+    /// mapped), a GDT (64-bit code at 8, data at 0x10), an IDT whose vector 3
+    /// is the handler, the code and the handler.
+    fn guest() -> *mut u8 {
+        // SAFETY: anonymous memory for the test, unmapped by the caller.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                MEM,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let m = p.cast::<u8>();
+        let put = |at: u64, bytes: &[u8]| {
+            // SAFETY: within the mapping.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), m.add(at as usize), bytes.len()) };
+        };
+        let q = |at: u64, v: u64| put(at, &v.to_le_bytes());
+        q(0x1000, 0x2000 | 3);
+        q(0x2000, 0x3000 | 3);
+        q(0x3000, 0x83);
+        q(GDT + 8, 0x00AF_9A00_0000_FFFF);
+        q(GDT + 16, 0x00CF_9200_0000_FFFF);
+        // An interrupt gate (0x8E) to the handler through selector 8.
+        q(IDT + 3 * 16, (HANDLER & 0xFFFF) | (8 << 16) | (0x8E << 40) | (((HANDLER >> 16) & 0xFFFF) << 48));
+        q(IDT + 3 * 16 + 8, HANDLER >> 32);
+        put(CODE, &[0xCC, 0xE6, PORT as u8, 0xEB, 0xFE]);
+        put(
+            HANDLER,
+            &[
+                0x48, 0x8B, 0x04, 0x24, // mov rax, [rsp]
+                0x48, 0x89, 0x04, 0x25, 0x00, 0x80, 0x00, 0x00, // mov [0x8000], rax
+                0xC6, 0x04, 0x25, 0x08, 0x80, 0x00, 0x00, 0x01, // mov byte [0x8008], 1
+                0x48, 0xCF, // iretq
+            ],
+        );
+        m
+    }
+
+    fn segment(selector: u16, type_: u8, l: u8, db: u8) -> kvm_segment {
+        kvm_segment {
+            base: 0,
+            limit: 0xFFFF_FFFF,
+            selector,
+            type_,
+            present: 1,
+            dpl: 0,
+            db,
+            s: 1,
+            l,
+            g: 1,
+            ..Default::default()
+        }
+    }
+
+    /// The vCPU in long mode at the INT3, #BP intercepted as gdb's
+    /// software breakpoints are.
+    fn start(vcpu: &VcpuFd) {
+        let mut s = vcpu.get_sregs().unwrap();
+        s.cr0 = 0x8000_0031; // PG, NE, ET, PE
+        s.cr3 = 0x1000;
+        s.cr4 = 0x20; // PAE
+        s.efer = 0x500; // LME, LMA
+        s.cs = segment(8, 11, 1, 0);
+        let data = segment(0x10, 3, 0, 1);
+        (s.ds, s.es, s.fs, s.gs, s.ss) = (data, data, data, data, data);
+        s.tr.type_ = 11;
+        s.tr.present = 1;
+        s.tr.s = 0;
+        (s.gdt.base, s.gdt.limit) = (GDT, 23);
+        (s.idt.base, s.idt.limit) = (IDT, 4095);
+        vcpu.set_sregs(&s).unwrap();
+        vcpu.set_regs(&kvm_regs { rip: CODE, rsp: STACK, rflags: 2, ..Default::default() }).unwrap();
+        let control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP;
+        vcpu.set_guest_debug(&kvm_guest_debug { control, ..Default::default() }).unwrap();
+    }
+
+    /// One `run`, kicked after 5 s if it has not returned, as a line.
+    fn run_once(vcpu: &mut VcpuFd) -> String {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
+        let watch = Arc::clone(&done);
+        let watchdog = std::thread::spawn(move || {
+            for _ in 0..500 {
+                if watch.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            kicker.set_kvm_immediate_exit(1);
+        });
+        let line = match vcpu.run() {
+            Ok(VcpuExit::IoOut(port, _)) => format!("exit IoOut port {port:#x}"),
+            Ok(VcpuExit::Debug(arch)) => format!("exit Debug vector {} pc {:#x}", arch.exception, arch.pc),
+            Ok(VcpuExit::Shutdown) => "exit Shutdown".to_string(),
+            Ok(VcpuExit::InternalError) => "exit InternalError".to_string(),
+            Ok(_) => "exit (another)".to_string(),
+            Err(e) if e.errno() == libc::EINTR => "no exit within 5 s (kicked)".to_string(),
+            Err(e) => format!("run failed, errno {}", e.errno()),
+        };
+        done.store(true, Ordering::SeqCst);
+        watchdog.join().unwrap();
+        line
+    }
+
+    fn capability(code: whv::WHV_CAPABILITY_CODE) -> String {
+        let mut buf = [0u64; 4];
+        let mut written = 0u32;
+        // SAFETY: a buffer of the size passed.
+        let hres = unsafe { whv::WHvGetCapability(code, buf.as_mut_ptr().cast(), 32, &mut written) };
+        format!("HRESULT {:#010x}, {written} bytes, {:#x}", hres.cast_unsigned(), buf[0])
+    }
+
+    /// Each way to hand the #BP back, in a VM of its own, from the exit of
+    /// the guest's INT3: what each call returned, the exit that followed,
+    /// whether the guest's handler ran, the RIP it was given (the INT3 is at
+    /// 0x6000; Linux's handler expects 0x6001) and RIP after.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_bp_handed_back_to_the_guest() {
+        eprintln!("BPTEST exception exit bitmap capability: {}", capability(CAP_EXCEPTION_EXIT_BITMAP));
+        eprintln!("BPTEST processor vendor (0 AMD, 1 Intel, 2 Hygon): {}", capability(CAP_PROCESSOR_VENDOR));
+        type Way = fn(&VcpuFd) -> Vec<String>;
+        let ways: [(&str, Way); 5] = [
+            ("i: today's INJECT_BP (RIP+1, PendingInterruption exception #BP, length 0)", |v| {
+                let control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP | KVM_GUESTDBG_USE_SW_BP | KVM_GUESTDBG_INJECT_BP;
+                let r = v.set_guest_debug(&kvm_guest_debug { control, ..Default::default() });
+                vec![format!("set_guest_debug(INJECT_BP): {:?}", r.map_err(|e| e.errno()))]
+            }),
+            ("ii-a: RIP at the INT3, PendingInterruption exception #BP, length 1", |v| {
+                let r = super::super::ffi::set_register(
+                    v.part(),
+                    v.vp(),
+                    whv::WHvRegisterPendingInterruption,
+                    super::super::ffi::reg64(pending_interruption(3, 1)),
+                );
+                vec![format!("set PendingInterruption {:#x}: {:?}", pending_interruption(3, 1), r.map_err(|e| e.errno()))]
+            }),
+            ("ii-b: RIP at the INT3, PendingInterruption type 6 (software exception) #BP, length 1", |v| {
+                let r = super::super::ffi::set_register(
+                    v.part(),
+                    v.vp(),
+                    whv::WHvRegisterPendingInterruption,
+                    super::super::ffi::reg64(pending_interruption(6, 1)),
+                );
+                vec![format!("set PendingInterruption {:#x}: {:?}", pending_interruption(6, 1), r.map_err(|e| e.errno()))]
+            }),
+            ("iii: RIP+1, PendingEvent exception event #BP", |v| {
+                let rip = super::super::ffi::set_register(v.part(), v.vp(), whv::WHvX64RegisterRip, super::super::ffi::reg64(CODE + 1));
+                let event = 1 | (3 << 16);
+                let r = super::super::ffi::set_register(v.part(), v.vp(), PENDING_EVENT, super::super::ffi::reg64(event));
+                vec![
+                    format!("set RIP {:#x}: {:?}", CODE + 1, rip.map_err(|e| e.errno())),
+                    format!("set PendingEvent {event:#x}: {:?}", r.map_err(|e| e.errno())),
+                ]
+            }),
+            ("iv: #BP out of the exit bitmap, RIP at the INT3, the guest runs it", |v| {
+                let control = KVM_GUESTDBG_ENABLE;
+                let r = v.set_guest_debug(&kvm_guest_debug { control, ..Default::default() });
+                vec![format!("set_guest_debug(ENABLE only: bitmap 0): {:?}", r.map_err(|e| e.errno()))]
+            }),
+        ];
+        let mut scaffold = Vec::new();
+        for (name, way) in ways {
+            let vm = super::super::VmFd::create().unwrap();
+            let m = guest();
+            let region = kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: MEM as u64,
+                userspace_addr: m as u64,
+            };
+            // SAFETY: the memory stays mapped while the VM has it.
+            unsafe { vm.set_user_memory_region(region) }.unwrap();
+            let mut vcpu = vm.create_vcpu(0).unwrap();
+            start(&vcpu);
+            let first = run_once(&mut vcpu);
+            eprintln!("BPTEST {name}: first {first}");
+            scaffold.push((name, first.clone()));
+            if first == format!("exit Debug vector 3 pc {CODE:#x}") {
+                for line in way(&vcpu) {
+                    eprintln!("BPTEST {name}: {line}");
+                }
+                let then = run_once(&mut vcpu);
+                // SAFETY: within the mapping, 8-byte aligned.
+                let (pushed, mark) = unsafe { (*m.add(PUSHED as usize).cast::<u64>(), *m.add(MARK as usize)) };
+                let rip = vcpu.get_regs().map(|r| r.rip);
+                eprintln!(
+                    "BPTEST {name}: then {then}; handler ran {}; pushed RIP {pushed:#x}; RIP after {:?}",
+                    mark == 1,
+                    rip.map(|r| format!("{r:#x}"))
+                );
+            }
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: our mapping.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+        // The scaffold itself: each VM stops at the guest's INT3 first.
+        for (name, first) in scaffold {
+            assert_eq!(first, format!("exit Debug vector 3 pc {CODE:#x}"), "{name}");
+        }
+    }
+}
