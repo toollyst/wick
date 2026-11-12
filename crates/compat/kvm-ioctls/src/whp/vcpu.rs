@@ -483,39 +483,21 @@ impl VcpuFd {
             let _ = self.shared.close_window(&w);
             return Err(e);
         }
+        #[cfg(test)]
+        eprintln!(
+            "BPTEST window open: vCPU {vp}, #BP handler {:?}, NMIs masked before: {}",
+            w.handler.map(|h| format!("{h:#x}")),
+            w.nmi_masked
+        );
         self.watch_window();
         Ok(Some(w))
     }
 
-    /// Makes every other vCPU of the partition leave the guest: its run is
-    /// cancelled until its run sequence is even. It cannot enter again
-    /// while the window is open: `enter` makes the sequence odd before it
-    /// reads the window's owner, which was stored before this reads the
-    /// sequence (both sequentially consistent), as the kick does.
+    /// Makes every other vCPU of the partition leave the guest
+    /// ([`hold_vcpus`]).
     #[cfg(feature = "gdb")]
     fn hold_others(&self) {
-        let others: Vec<Arc<VcpuShared>> = self
-            .shared
-            .inner
-            .vcpus
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter(|s| s.index != self.shared.index)
-            .collect();
-        for other in &others {
-            let mut spins = 0u32;
-            while other.run_seq.load(Ordering::SeqCst) % 2 == 1 {
-                let _ = super::ffi::cancel_run(other.part, other.index);
-                spins += 1;
-                if spins < 64 {
-                    std::thread::yield_now();
-                } else {
-                    std::thread::sleep(std::time::Duration::from_micros(100));
-                }
-            }
-        }
+        hold_vcpus(&self.shared.inner, Some(self.shared.index));
     }
 
     /// The last resort for a window whose end never comes (see
@@ -1060,6 +1042,12 @@ impl VcpuFd {
         {
             let open = shared.debug.lock().unwrap().window.take();
             if let Some(w) = open {
+                #[cfg(test)]
+                eprintln!(
+                    "BPTEST window closed by the run's return ({}), delivering vector {}",
+                    if exit.is_ok() { "an exit" } else { "an error" },
+                    w.vector
+                );
                 if let Err(e) = shared.close_window(&w) {
                     if exit.is_ok() {
                         return Err(e);
@@ -1305,6 +1293,18 @@ impl VcpuFd {
                         } else {
                             ctx.VpContext.Cs.Base.wrapping_add(rip) & 0xFFFF_FFFF
                         };
+                        // The sequence of a window's exits, for the tests on a
+                        // WHP machine (`bp_tests`).
+                        #[cfg(test)]
+                        eprintln!(
+                            "BPTEST window exit: vector {vector}, RIP {rip:#x} (linear {at:#x}), error code {:#x}, \
+                             parameter {:#x}; delivering vector {} to handler {:?}, faults intercepted {:#x}",
+                            ex.ErrorCode,
+                            ex.ExceptionParameter,
+                            w.vector,
+                            w.handler.map(|h| format!("{h:#x}")),
+                            w.faults
+                        );
                         if vector == super::debug::DB_VECTOR && w.handler == Some(at) {
                             // The delivery reached its handler: the window's
                             // end. The guest goes on into the handler.
@@ -1558,6 +1558,35 @@ impl VcpuFd {
     }
 }
 
+/// Makes every vCPU of `inner`'s partition but `except` leave the guest,
+/// for one that has the exception exits (`VmInner::bp_owner`): its run is
+/// cancelled until its run sequence is even. It cannot enter again until
+/// they are let go: `enter` makes the sequence odd before it reads the
+/// owner, which was stored before this reads the sequence (both
+/// sequentially consistent), as the kick does.
+pub(crate) fn hold_vcpus(inner: &VmInner, except: Option<u32>) {
+    let others: Vec<Arc<VcpuShared>> = inner
+        .vcpus
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|s| Some(s.index) != except)
+        .collect();
+    for other in &others {
+        let mut spins = 0u32;
+        while other.run_seq.load(Ordering::SeqCst) % 2 == 1 {
+            let _ = super::ffi::cancel_run(other.part, other.index);
+            spins += 1;
+            if spins < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+        }
+    }
+}
+
 /// What an entry into the guest came to ([`VcpuFd::enter`]).
 enum Entry {
     Ran(whv::WHV_RUN_VP_EXIT_CONTEXT),
@@ -1728,6 +1757,15 @@ mod bp_tests {
         q(GDT + 16, 0x00CF_9200_0000_FFFF);
         if bp_gate {
             gate(m, 3, HANDLER);
+        } else {
+            // Absent: an interrupt gate (type 0xE) whose P bit is clear, so
+            // that the INT3 raises #NP. An all-zero entry is not a gate type
+            // at all, which raises #GP first (the INT instruction's checks
+            // in order: type, then DPL, then P; SDM vol. 2A, INT n/INTO/INT3
+            // operation); with no #GP gate that is #DF and then a triple
+            // fault, as the first run on a WHP machine gave (578b04f).
+            gate(m, 3, HANDLER);
+            put(m, IDT + 3 * 16 + 5, &[0x0E]);
         }
         gate(m, 11, NP_HANDLER);
         put(m, CODE, &[0xCC, 0xE6, PORT as u8, 0x90, 0xCC, 0xEB, 0xFE]);

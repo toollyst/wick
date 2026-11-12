@@ -106,14 +106,35 @@ pub(crate) struct VmInner {
     /// The last `WHvRequestInterrupt` failure reported, so each kind is
     /// reported once.
     request_failure: AtomicI32,
-    /// The #BP window (`debug`'s module notes): gdb's exception-exit
-    /// bitmap, which a window replaces while it is open, and the condvar
-    /// the held vCPUs wait on. A leaf lock: nothing else is locked while it
-    /// is held, so it is in no lock-order cycle.
-    bp_window: (Mutex<u64>, Condvar),
-    /// The vCPU whose window is open, -1 for none (read by every entry).
+    /// The partition's exception exits ([`Exits`]) and the condvar the
+    /// vCPUs held out of the guest wait on. A leaf lock: nothing else is
+    /// locked while it is held, so it is in no lock-order cycle.
+    bp_window: (Mutex<Exits>, Condvar),
+    /// Who has the exception exits, with every other vCPU held out of the
+    /// guest: a vCPU's index (its #BP window), [`OWNER_ALL`] (a change of
+    /// gdb's), -1 nobody. Read by every entry.
     pub(crate) bp_owner: AtomicI64,
 }
+
+/// The partition's exception exits (`ExceptionExitBitmap`), which are
+/// changed only with every vCPU out of the guest, as QEMU changes them
+/// ("whpx_set_exception_exit_bitmap() cannot be called if one or more VCPUs
+/// are already running", target/i386/whpx/whpx-all.c, v9.2.0). In
+/// `test_bp_window_holds_the_other_vcpus` at 578b04f, where the test's
+/// set_guest_debug of vCPU 0 changed them while vCPU 1 ran, vCPU 1's run
+/// failed with WHV_E_INVALID_VP_STATE (0x80370308; measured on an AMD host,
+/// the cause read from the code and QEMU's note).
+#[derive(Debug, Default)]
+struct Exits {
+    /// gdb's, from the last `KVM_SET_GUEST_DEBUG`.
+    gdb: u64,
+    /// What the partition has, if known.
+    written: Option<u64>,
+}
+
+/// [`VmInner::bp_owner`] for a change of gdb's exception exits: no vCPU
+/// enters the guest.
+const OWNER_ALL: i64 = i64::MAX;
 
 // SAFETY: the partition handle is an opaque value WHP accepts from any thread;
 // all mutable state is behind locks.
@@ -213,46 +234,75 @@ impl VmInner {
         cv.notify_all();
     }
 
-    /// Sets the partition's exception exits to gdb's `bitmap`: now, or when
-    /// the open #BP window closes (a window's bitmap never has #BP).
-    pub(crate) fn set_debug_bitmap(&self, bitmap: u64) -> Result<()> {
-        let mut gdb = self.bp_window.0.lock().unwrap();
-        *gdb = bitmap;
-        if self.bp_owner.load(Ordering::SeqCst) < 0 {
-            // SAFETY: a u64 value for ExceptionExitBitmap.
-            unsafe { ffi::set_partition_property(self.part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &bitmap) }?;
+    /// Writes `bitmap` as the partition's exception exits, unless it has
+    /// them. The caller has every vCPU out of the guest ([`Exits`]).
+    fn write_exits(&self, exits: &mut Exits, bitmap: u64) -> Result<()> {
+        if exits.written == Some(bitmap) {
+            return Ok(());
         }
+        // SAFETY: a u64 value for ExceptionExitBitmap.
+        unsafe { ffi::set_partition_property(self.part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &bitmap) }?;
+        exits.written = Some(bitmap);
         Ok(())
     }
 
-    /// Makes vCPU `vp` the owner of the #BP window, once no other window is
-    /// open: from then on no other vCPU enters the guest. The exception
-    /// exits are its to change ([`Self::set_window_bitmap`]) once the others
-    /// are out. `false`, with nothing taken, if `immediate_exit` is set
-    /// meanwhile.
-    #[cfg_attr(not(feature = "gdb"), allow(dead_code))]
-    pub(crate) fn open_bp_window(&self, vp: u32, immediate_exit: &AtomicU8) -> bool {
+    /// Takes the exception exits for `owner` once nobody has them: from then
+    /// on no other vCPU enters the guest. `false`, with nothing taken, if
+    /// `immediate_exit` (a vCPU's) is set meanwhile.
+    fn take_exits(&self, owner: i64, immediate_exit: Option<&AtomicU8>) -> bool {
         let (lock, cv) = &self.bp_window;
-        let mut gdb = lock.lock().unwrap();
+        let mut exits = lock.lock().unwrap();
         loop {
-            if immediate_exit.load(Ordering::SeqCst) != 0 {
+            if immediate_exit.is_some_and(|flag| flag.load(Ordering::SeqCst) != 0) {
                 return false;
             }
             if self.bp_owner.load(Ordering::SeqCst) < 0 {
                 break;
             }
-            gdb = cv.wait(gdb).unwrap();
+            exits = cv.wait(exits).unwrap();
         }
-        self.bp_owner.store(i64::from(vp), Ordering::SeqCst);
+        self.bp_owner.store(owner, Ordering::SeqCst);
         true
+    }
+
+    /// Sets gdb's exception exits to `bitmap`: with every vCPU held out of
+    /// the guest for the write, or, while a #BP window or another change
+    /// has them, at its end (which writes gdb's under the same lock).
+    pub(crate) fn set_debug_bitmap(&self, bitmap: u64) -> Result<()> {
+        let (lock, cv) = &self.bp_window;
+        {
+            let mut exits = lock.lock().unwrap();
+            exits.gdb = bitmap;
+            if self.bp_owner.load(Ordering::SeqCst) >= 0 || exits.written == Some(bitmap) {
+                return Ok(());
+            }
+        }
+        self.take_exits(OWNER_ALL, None);
+        super::vcpu::hold_vcpus(self, None);
+        let mut exits = lock.lock().unwrap();
+        let gdb = exits.gdb;
+        let result = self.write_exits(&mut exits, gdb);
+        self.bp_owner.store(-1, Ordering::SeqCst);
+        drop(exits);
+        cv.notify_all();
+        result
+    }
+
+    /// Makes vCPU `vp` the owner of the #BP window, once nobody has the
+    /// exception exits: from then on no other vCPU enters the guest. They
+    /// are its to change ([`Self::set_window_bitmap`]) once the others are
+    /// out. `false`, with nothing taken, if `immediate_exit` is set
+    /// meanwhile.
+    #[cfg_attr(not(feature = "gdb"), allow(dead_code))]
+    pub(crate) fn open_bp_window(&self, vp: u32, immediate_exit: &AtomicU8) -> bool {
+        self.take_exits(i64::from(vp), Some(immediate_exit))
     }
 
     /// Sets the window's exception exits to `bitmap` (a new round).
     #[cfg_attr(not(feature = "gdb"), allow(dead_code))]
     pub(crate) fn set_window_bitmap(&self, bitmap: u64) -> Result<()> {
-        let _gdb = self.bp_window.0.lock().unwrap();
-        // SAFETY: a u64 value for ExceptionExitBitmap.
-        unsafe { ffi::set_partition_property(self.part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &bitmap) }
+        let mut exits = self.bp_window.0.lock().unwrap();
+        self.write_exits(&mut exits, bitmap)
     }
 
     /// Closes the open #BP window: gdb's exception exits back, the held
@@ -261,11 +311,11 @@ impl VmInner {
     #[cfg_attr(not(feature = "gdb"), allow(dead_code))]
     pub(crate) fn close_bp_window(&self) -> Result<()> {
         let (lock, cv) = &self.bp_window;
-        let gdb = lock.lock().unwrap();
-        // SAFETY: a u64 value for ExceptionExitBitmap.
-        let result = unsafe { ffi::set_partition_property(self.part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &*gdb) };
+        let mut exits = lock.lock().unwrap();
+        let gdb = exits.gdb;
+        let result = self.write_exits(&mut exits, gdb);
         self.bp_owner.store(-1, Ordering::SeqCst);
-        drop(gdb);
+        drop(exits);
         cv.notify_all();
         result
     }
@@ -502,7 +552,7 @@ impl VmInner {
             has_irqchip: AtomicBool::new(false),
             halt_wake: (Mutex::new(0), Condvar::new()),
             request_failure: AtomicI32::new(0),
-            bp_window: (Mutex::new(0), Condvar::new()),
+            bp_window: (Mutex::new(Exits::default()), Condvar::new()),
             bp_owner: AtomicI64::new(-1),
         })
     }
