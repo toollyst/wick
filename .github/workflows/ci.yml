@@ -186,6 +186,10 @@ jobs:
         run: git -C lib/firecracker diff --exit-code -- Cargo.lock
       - name: Boot test
         run: tools/linux/boot-test.sh --workdir "$RUNNER_TEMP/boot-test"
+      # A host without /dev/nitro_enclaves: the start of an enclave is refused,
+      # and the same script checks the same replies on macOS.
+      - name: Nitro Enclave refused without the device
+        run: python3 -I tools/macos/enclave-refusal-test.py "lib/firecracker/build/cargo_target/$(uname -m)-unknown-linux-musl/release/firecracker"
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -289,6 +293,10 @@ jobs:
       - name: Clippy
         working-directory: lib/firecracker
         run: cargo clippy --locked -p vmm -p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings
+      # As upstream on a Linux host without /dev/nitro_enclaves (linux-boot
+      # runs the same script there).
+      - name: Nitro Enclave refused without the device
+        run: python3 -I tools/macos/enclave-refusal-test.py lib/firecracker/build/cargo_target/debug/firecracker
       - name: Compatibility crate tests
         working-directory: lib/firecracker
         run: |
