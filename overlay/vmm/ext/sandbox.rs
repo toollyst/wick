@@ -212,6 +212,18 @@ mod macos {
         // msync (MS_SYNC): the pmem device writes its guest's flush to the
         // file (test_pmem.py: denied, the microVM stopped with SIGSYS).
         "msync", "msync_nocancel",
+        // What macOS 27 lets through by an operation's rule, not by number
+        // (UNFILTERED_SYSCALLS), where an older major's Seatbelt checks the
+        // number (15; 26 for getumask and proc_info_extended_id): listed so
+        // that every major behaves as 27 does. pwritev (write); the
+        // process's own ids and file mode mask, which nothing in Seatbelt
+        // limits (getpid names a hot-plugged device's eventfd and timer
+        // FIFOs); proc_info_extended_id and terminate_with_payload, which
+        // their rules (process-info*, signal) still hold to this process.
+        // By reasoning, not discovery: on 27 the number rule is not
+        // consulted for them, so a discovery run cannot show who calls them.
+        "pwritev", "pwritev_nocancel", "getpid", "getuid", "getgid", "umask", "getumask",
+        "issetugid", "proc_info_extended_id", "terminate_with_payload",
         // getrandom, clock_gettime, gettid.
         "getentropy", "gettimeofday", "thread_selfid",
         // rt_sigaction, rt_sigprocmask, rt_sigreturn, sigaltstack, tkill.
@@ -255,7 +267,7 @@ mod macos {
     /// macOS matrix runs: .github/workflows/ci.yml). On another major that
     /// test and `test_unfiltered_syscalls_are_limited_by_their_rule` fail,
     /// naming it, the first with what it measured there.
-    pub const MEASURED_MAJORS: &[u32] = &[26, 27];
+    pub const MEASURED_MAJORS: &[u32] = &[15, 26, 27];
 
     /// On which of [`MEASURED_MAJORS`] Seatbelt skips the rule on a call's
     /// number.
@@ -299,18 +311,18 @@ mod macos {
         ("mknod", 14, Limit::Number, Skip::All),
         ("chmod", 15, Limit::Signal("file-write-mode"), Skip::All),
         ("chown", 16, Limit::Signal("file-write-owner"), Skip::All),
-        ("getpid", 20, Limit::Impossible(NO_OPERATION), Skip::All),
-        ("getuid", 24, Limit::Impossible(NO_OPERATION), Skip::All),
+        ("getpid", 20, Limit::Impossible(NO_OPERATION), Skip::On(&[26, 27])),
+        ("getuid", 24, Limit::Impossible(NO_OPERATION), Skip::On(&[26, 27])),
         ("ptrace", 26, Limit::Signal("system-debug"), Skip::All),
         ("chflags", 34, Limit::Signal("file-write-flags"), Skip::All),
         ("fchflags", 35, Limit::Signal("file-write-flags"), Skip::All),
         ("kill", 37, Limit::Signal("signal"), Skip::All),
-        ("getgid", 47, Limit::Impossible(NO_OPERATION), Skip::All),
+        ("getgid", 47, Limit::Impossible(NO_OPERATION), Skip::On(&[26, 27])),
         ("acct", 51, Limit::Signal("system-acct"), Skip::All),
         ("ioctl", 54, Limit::Signal("file-ioctl"), Skip::All),
         ("reboot", 55, Limit::Signal("system-reboot"), Skip::All),
         ("revoke", 56, Limit::Signal("file-revoke"), Skip::All),
-        ("umask", 60, Limit::Impossible(NO_OPERATION), Skip::All),
+        ("umask", 60, Limit::Impossible(NO_OPERATION), Skip::On(&[26, 27])),
         ("chroot", 61, Limit::Signal("file-chroot"), Skip::All),
         ("swapon", 85, Limit::Signal("system-swap"), Skip::All),
         ("setpriority", 96, Limit::Signal("system-sched"), Skip::All),
@@ -362,8 +374,8 @@ mod macos {
         ("sysctlbyname", 274, Limit::Signal("sysctl-read"), Skip::All),
         ("chmod_extended", 282, Limit::Signal("file-write-mode file-write-acl"), Skip::All),
         ("fchmod_extended", 283, Limit::Signal("file-write-mode file-write-acl"), Skip::All),
-        ("issetugid", 327, Limit::Impossible(NO_OPERATION), Skip::All),
-        ("__pthread_kill", 328, Limit::Upstream("tkill"), Skip::All),
+        ("issetugid", 327, Limit::Impossible(NO_OPERATION), Skip::On(&[26, 27])),
+        ("__pthread_kill", 328, Limit::Upstream("tkill"), Skip::On(&[26, 27])),
         ("proc_info", 336, Limit::Error("process-info*"), Skip::All),
         ("lchown", 364, Limit::Signal("file-write-owner"), Skip::All),
         ("write_nocancel", 397, Limit::Upstream("write"), Skip::All),
@@ -387,11 +399,11 @@ mod macos {
         ("unlinkat", 472, Limit::Signal("file-write-unlink"), Skip::All),
         ("fclonefileat", 517, Limit::Signal("file-clone"), Skip::All),
         ("fs_snapshot", 518, Limit::Signal("fs-snapshot*"), Skip::All),
-        ("terminate_with_payload", 520, Limit::Signal("signal"), Skip::All),
-        ("abort_with_payload", 521, Limit::Upstream("exit_group"), Skip::All),
+        ("terminate_with_payload", 520, Limit::Signal("signal"), Skip::On(&[26, 27])),
+        ("abort_with_payload", 521, Limit::Upstream("exit_group"), Skip::On(&[26, 27])),
         ("fmount", 526, Limit::Signal("file-mount"), Skip::All),
-        ("pwritev", 541, Limit::Upstream("writev"), Skip::All),
-        ("pwritev_nocancel", 543, Limit::Upstream("writev"), Skip::All),
+        ("pwritev", 541, Limit::Upstream("writev"), Skip::On(&[26, 27])),
+        ("pwritev_nocancel", 543, Limit::Upstream("writev"), Skip::On(&[26, 27])),
         ("proc_info_extended_id", 545, Limit::Error("process-info*"), Skip::On(&[27])),
     ];
 
@@ -410,10 +422,10 @@ mod macos {
     /// [`SYSCALLS`]: what building the microVM takes (on Linux the VMM thread
     /// runs unfiltered until then), measured as [`SYSCALLS`] are.
     pub const SETUP_SYSCALLS: &[&str] = &[
-        "getpid", "getuid", "geteuid", "access", "dup", "pipe", "getegid", "dup2", "bind",
+        "geteuid", "access", "dup", "pipe", "getegid", "dup2", "bind",
         "listen", "getrusage", "socketpair", "csops", "csops_audittoken",
         "kdebug_typefilter", "kdebug_trace_string", "kdebug_trace64", "getrlimit", "sysctl",
-        "getattrlist", "shm_open", "shm_unlink", "gettid", "issetugid", "proc_info",
+        "getattrlist", "shm_open", "shm_unlink", "gettid", "proc_info",
         "getdirentries64", "bsdthread_create", "kqueue", "sigsuspend_nocancel", "fileport_makefd",
         // vmnet.framework's XPC connection reads the process's persona once
         // the process forked (the API process, ext::api_process): measured,
@@ -517,6 +529,12 @@ mod macos {
         // exit, exit_group: a thread's exit, a panic.
         "exit", "bsdthread_terminate", "__disable_threadsignal", "abort_with_payload",
         "os_fault_with_payload",
+        // As in SYSCALLS: what macOS 27 lets through by an operation's rule
+        // where an older major checks the number, so that every major
+        // behaves as 27 (the API process's profile has no file rule, so
+        // pwritev reaches no file; getpid: api_process's own checks).
+        "pwritev", "pwritev_nocancel", "getpid", "getuid", "getgid", "umask", "getumask",
+        "issetugid", "proc_info_extended_id", "terminate_with_payload",
     ];
 
     /// The API process's Mach traps: memory (mmap, munmap), port rights of
@@ -860,7 +878,9 @@ mod macos {
         ),
         (
             "system-info (info-type \"vfs.disk-space\")",
-            "fstatfs (fallocate's hole punching, for the block size) then reports no exact free space.",
+            "fstatfs (fallocate's hole punching, for the block size: a guest's discard on a \
+             drive with discard on; test_run_phase_ioctls_and_holes) then reports no exact free \
+             space, and the hole is punched.",
         ),
     ];
 
