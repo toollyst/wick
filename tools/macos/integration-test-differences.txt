@@ -65,8 +65,12 @@ all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
 # a process sets for itself: XNU vm_map_region_walk then asks the target's
 # pmap per page), so a page counts when Firecracker has it mapped, as on
 # Linux (measured: the idle Firecracker's binary 0.92 MiB, 2.25 MiB in all,
-# from a binary all in the cache). Not yet re-run with either. Only a test
-# whose every failing phase failed with this error is excused.
+# from a binary all in the cache). Run with both (clean tree, m2-queue):
+# the monitor still trips, at 5.03 to 5.44 MiB in most tests and at 6.48
+# to 6.91 MiB in test_vsock_epipe and test_vsock_bare_pause_resume, so what
+# is left is not the binary's cached pages. To find: which regions hold it
+# (the regions at the trip, in both modes). Only a test whose every failing
+# phase failed with this error is excused.
 all bug failure:host_tools.memory.MemoryUsageExceededError
 
 # The test looks in Firecracker's log for the API socket by its path in the
@@ -102,18 +106,6 @@ all impossible integration_tests/functional/test_huge_pages.py::test_transparent
 # synthetic.conf, at boot), so Firecracker exits 1 (measured: `ls /run`, No
 # such file or directory; `mount`: / is "sealed, local, read-only").
 all impossible integration_tests/functional/test_cmd_line_parameters.py::test_cli_no_params
-
-# The test mounts a 512 MiB tmpfs at /mnt/<worker>, which macOS's sealed,
-# read-only system volume cannot have; the harness gives it a RAM disk with
-# an APFS volume instead (wick_macos.small_tmpfs, on the session's
-# t<worker>), and the test then fails the framework's check that the API
-# socket is in a jail directory (measured, clean tree: "API socket
-# /tmp/wit-*/t0/firecracker/<id>/root/run/firecracker.socket is not in a
-# jail directory"). That check was the harness's (wick_macos._chroot_of,
-# which read the jail back from the socket's path and expected upstream's
-# default chroot base, <session>/jailer); it now takes the jail
-# JailerContext.api_socket_path names, for any chroot_base. Not yet re-run.
-all bug integration_tests/functional/test_snapshot_not_losing_dirty_pages.py::test_diff_snapshot_works_after_error
 
 # Signal 35 is musl's SIGRTMIN, the signal Firecracker on Linux kicks its
 # vCPU threads with and handles. macOS has no real-time signals (NSIG 32):
@@ -209,27 +201,29 @@ user root integration_tests/functional/test_snapshot_basic.py::test_negative_sna
 all arch integration_tests/functional/test_cpu_features_x86_64.py
 all arch integration_tests/functional/test_gdb.py::test_gdb_connects
 
-# Listed when the harness lacked socat, a TAP's transmit queue length and a
-# host program in a test's network, which it has now (socat from Homebrew;
-# netns-slirp's txqueuelen; ip netns exec through netns-preload.dylib). Not
-# yet run on a clean tree since: their reason is to measure.
-all bug integration_tests/functional/test_vsock.py::test_vsock
-all bug integration_tests/functional/test_vsock.py::test_vsock_bare_pause_resume
-all bug integration_tests/functional/test_vsock.py::test_vsock_after_override
+# The test's host program (host_tools/udp_offload.py, in the microVM's
+# network) sets UDP_SEGMENT, Linux's UDP segmentation offload, on its
+# socket, so that the host's stack hands the TAP a datagram whose checksum
+# is left to the device, which only a TAP Firecracker set TUN_F_CSUM on
+# takes. macOS's UDP has no such option (netinet/udp.h: UDP_NOCKSUM only)
+# and the call fails (measured, clean tree: "[Errno 42] Protocol not
+# available"), before anything reaches Firecracker. To do: the harness's
+# network takes UDP_SEGMENT (netns-preload) and hands the endpoint the
+# datagram as Linux's stack hands the TAP, its checksum left to the device
+# (the TUN header wick's vnet layer reads).
 all bug integration_tests/functional/test_net.py::test_tap_offload
 
-# The test's body passes (the drive moved to a block device, the guest
-# reads its new size), and its last step fails: `losetup --detach` of the
-# device Firecracker still has open. bin/losetup detaches with hdiutil,
-# which refuses a disk in use even with -force (measured, also outside a
-# VM with a process holding the disk open: "couldn't eject", exit 16,
-# EBUSY). Linux detaches a loop device in use on its last close instead
-# (losetup(8), util-linux, --detach: "lazy device destruction" since Linux
-# 3.7; drivers/block/loop.c loop_clr_fd sets LO_FLAGS_AUTOCLEAR and returns
-# 0 while the disk has other openers, lo_release tears it down on the last
-# close). bin/losetup now does the same (a waiter detaches the disk on its
-# last close; disks-selftest.sh). Not yet re-run.
-all bug integration_tests/functional/test_drive_virtio.py::test_rescan_dev
+# The test passes (measured, clean tree: all four, the drive moved to a
+# host block device and the guest reading its new size), and on PCI_ON the
+# framework then failed it: once it killed Firecracker it looks for any
+# command line naming the jail's id (microvm.py kill), and found
+# bin/losetup's waiter, which detaches the disk on Firecracker's last close
+# as Linux's lazy detach does (losetup(8), --detach; drivers/block/loop.c
+# loop_clr_fd, LO_FLAGS_AUTOCLEAR) and had the image's path, in the jail,
+# in its command line. The path is in its environment now
+# (disks-selftest.sh). Not yet re-run.
+all bug integration_tests/functional/test_drive_virtio.py::test_rescan_dev[kvm-vmlinux-6.1.188-PCI_ON-Sync]
+all bug integration_tests/functional/test_drive_virtio.py::test_rescan_dev[kvm-vmlinux-6.1.188-PCI_ON-Async]
 
 # No SIGPIPE in 100 host connections closed with data in flight
 # (metrics: signals.sigpipe 0, which Linux counts at least once). To find:

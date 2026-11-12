@@ -146,6 +146,14 @@ if WICK_IT_ROOT="$session" "$HERE/bin/losetup" --detach "$dev"; then
     attached "$dev" && [[ -e "$session/.attached/${dev#/dev/}" ]] &&
         ok "losetup --detach of $dev in use: 0, still attached while open" ||
         fail "losetup --detach in use: the disk went while open"
+    # Upstream's framework fails a test when a command line names the jail
+    # (the image's path) after Firecracker was killed.
+    waiter="$(pgrep -f "losetup-lazy-detach $dev " || true)"
+    if [[ -n "$waiter" ]] && ! ps -ww -o args= -p "$waiter" | grep -qF "$img"; then
+        ok "the waiter's command line does not name the image"
+    else
+        fail "waiter ${waiter:-none}: $(ps -ww -o args= -p "${waiter:-1}" | tr '\n' ' ' | cut -c1-200)"
+    fi
 else
     fail "losetup --detach of $dev in use: not 0"
 fi

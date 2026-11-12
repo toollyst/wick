@@ -59,10 +59,14 @@ case "${1:-}" in
     [ "$rc" -eq 16 ] || die "hdiutil detach $dev failed ($rc)"
     # In use: detached on its last close. The waiter names the session in
     # its command line, so that tools/clean.sh leaves it while the session
-    # lives and stops it after.
+    # lives and stops it after. The image's path is given in its environment,
+    # not its command line: the path is in the jail, whose id upstream's
+    # framework looks for in every command line once it killed Firecracker
+    # (microvm.py kill: "processes using the supposedly dead Firecracker's
+    # jailer_id"), and a waiter is no Firecracker process.
     # shellcheck disable=SC2016 # the waiter's script expands its own arguments
-    nohup /bin/sh -c '
-        dev=$1 image=$2 record=$3 session=$4
+    WICK_LOSETUP_IMAGE="$image" nohup /bin/sh -c '
+        dev=$1 image=$WICK_LOSETUP_IMAGE record=$2 session=$3
         while [ -z "$session" ] || [ -d "$session" ]; do
             now="$(hdiutil info 2>/dev/null | awk -v dev="$dev" "
                 /^image-path/ { sub(/^image-path *: /, \"\"); image = \$0 }
@@ -73,7 +77,7 @@ case "${1:-}" in
                 exit 0
             fi
             sleep 1
-        done' losetup-lazy-detach "$dev" "$image" "$record" "${WICK_IT_ROOT:-}" </dev/null >/dev/null 2>&1 &
+        done' losetup-lazy-detach "$dev" "$record" "${WICK_IT_ROOT:-}" </dev/null >/dev/null 2>&1 &
     exit 0
     ;;
 *) die "only --find --show FILE and --detach DEV are supported, not '$*'" ;;
