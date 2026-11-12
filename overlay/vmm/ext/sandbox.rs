@@ -56,7 +56,7 @@ pub enum SandboxError {
 #[cfg(target_os = "macos")]
 pub use macos::{
     API_FCNTL_COMMANDS, API_MACH_TRAPS, API_MIG_ROUTINES, API_SYSCALLS, FCNTL_COMMANDS,
-    FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MEASURED_MAJORS, MIG_ROUTINES,
+    ABSENT, FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MEASURED_MAJORS, MIG_ROUTINES,
     PROFILE, RUN_DENIED_OPERATIONS, SETUP_MIG_ROUTINES_IF_DEFINED, SYSCALLS, Skip,
     UNFILTERED_SYSCALLS, api_profile, apply, apply_api, narrowed,
     denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select, selected,
@@ -268,6 +268,13 @@ mod macos {
     /// test and `test_unfiltered_syscalls_are_limited_by_their_rule` fail,
     /// naming it, the first with what it measured there.
     pub const MEASURED_MAJORS: &[u32] = &[15, 26, 27];
+
+    /// The calls of [`UNFILTERED_SYSCALLS`] a measured major's kernel does
+    /// not have: their number is `nosys`, which raises SIGSYS itself, with
+    /// or without a sandbox, and their libsandbox has no `SYS_` name for
+    /// them. Measured on each major by running the call with no sandbox
+    /// (`test_seatbelt_skips_the_number_of_these`).
+    pub const ABSENT: &[(&str, &[u32])] = &[("getumask", &[15, 26])];
 
     /// On which of [`MEASURED_MAJORS`] Seatbelt skips the rule on a call's
     /// number.
@@ -1428,6 +1435,11 @@ mod macos {
         use std::process::Command;
 
         use super::*;
+
+        /// Whether macOS `major`'s kernel has no `name` ([`ABSENT`]).
+        fn absent(name: &str, major: u32) -> bool {
+            ABSENT.iter().any(|(n, majors)| *n == name && majors.contains(&major))
+        }
 
         // The sandbox is permanent, so it is tested in a child process
         // (the test binary itself, filtered to the child test below).
@@ -2743,7 +2755,9 @@ mod macos {
         // denying one number, exactly the calls of UNFILTERED_SYSCALLS that
         // Skip says it skips on this major run (each other one raises
         // SIGSYS). Measured here, every number in turn; a major outside
-        // MEASURED_MAJORS fails with what was measured there.
+        // MEASURED_MAJORS fails with what was measured there. A call of the
+        // table that raises SIGSYS with no sandbox at all is one the kernel
+        // does not have (nosys): exactly ABSENT's for this major.
         #[test]
         fn test_seatbelt_skips_the_number_of_these() {
             use std::os::unix::process::ExitStatusExt;
@@ -2760,13 +2774,38 @@ mod macos {
                     ran.push(u16::try_from(n).unwrap());
                 }
             }
-            let table: Vec<u16> =
-                UNFILTERED_SYSCALLS.iter().filter(|(.., s)| s.on(major)).map(|(_, n, ..)| *n).collect();
+            let plain = children(
+                "number_child",
+                UNFILTERED_SYSCALLS
+                    .iter()
+                    .map(|(_, n, ..)| {
+                        vec![
+                            ("WICK_TEST_SYSCALL".to_owned(), n.to_string()),
+                            ("WICK_TEST_NO_SANDBOX".to_owned(), "1".to_owned()),
+                        ]
+                    })
+                    .collect(),
+            );
+            let missing: Vec<&str> = UNFILTERED_SYSCALLS
+                .iter()
+                .zip(&plain)
+                .filter(|(_, out)| out.status.signal() == Some(libc::SIGSYS))
+                .map(|((name, ..), _)| *name)
+                .collect();
+            let table: Vec<u16> = UNFILTERED_SYSCALLS
+                .iter()
+                .filter(|(name, .., s)| s.on(major) && !absent(name, major))
+                .map(|(_, n, ..)| *n)
+                .collect();
             assert!(
                 MEASURED_MAJORS.contains(&major),
                 "macOS {major} is not measured: Seatbelt skips the number of {ran:?} there (the table says \
-                 {table:?}); add it to MEASURED_MAJORS and to the Skip of each entry it differs on"
+                 {table:?}), and the kernel has none of {missing:?}; add it to MEASURED_MAJORS, to the Skip \
+                 of each entry it differs on, and to ABSENT"
             );
+            let want: Vec<&str> =
+                UNFILTERED_SYSCALLS.iter().map(|(name, ..)| *name).filter(|name| absent(name, major)).collect();
+            assert_eq!(missing, want, "macOS {major}: the calls its kernel does not have (ABSENT)");
             assert_eq!(ran, table, "macOS {major}");
         }
 
@@ -2776,10 +2815,13 @@ mod macos {
             // SAFETY: no arguments.
             assert_ne!(unsafe { libc::geteuid() }, 0, "never as root: the calls run");
             let n: u16 = std::env::var("WICK_TEST_SYSCALL").unwrap().parse().unwrap();
-            install(&format!(
-                "(version 1)(allow default)(deny syscall-unix (syscall-number {n}) (with send-signal SIGSYS))"
-            ))
-            .unwrap();
+            // With no sandbox: whether the kernel has the call (ABSENT).
+            if std::env::var_os("WICK_TEST_NO_SANDBOX").is_none() {
+                install(&format!(
+                    "(version 1)(allow default)(deny syscall-unix (syscall-number {n}) (with send-signal SIGSYS))"
+                ))
+                .unwrap();
+            }
             println!("APPLIED");
             use std::io::Write;
             std::io::stdout().flush().unwrap();
@@ -2910,6 +2952,8 @@ mod macos {
                 let denied = DENIED_NAMES.iter().any(|(_, names)| names.contains(lift));
                 let ok = stdout.contains("NARROWED")
                     && match (limit, *lift) {
+                        // The kernel's nosys raises it (ABSENT).
+                        _ if absent(name, major) => signal == Some(libc::SIGSYS),
                         _ if *by_number => signal == Some(libc::SIGSYS),
                         _ if allowed => out.status.success() && ret == "ok 0" && stdout.contains("SURVIVED"),
                         _ if denied => signal == Some(libc::SIGSYS),
