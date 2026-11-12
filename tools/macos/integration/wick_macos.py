@@ -769,11 +769,30 @@ def _task_memory(pid):
     """KiB: the task's resident size and phys_footprint (proc_pid_rusage,
     RUSAGE_INFO_V0: ri_resident_size, ri_phys_footprint, the 9th and 10th
     64-bit words). phys_footprint counts the task's compressed pages, which
-    the resident size does not."""
+    the resident size does not. And its compressed, internal and external
+    pages: task_info(TASK_VM_INFO) on the task's name port, which
+    task_name_for_pid gives the user for a process of the same user
+    (measured); `compressed` is the internal_compressed ledger (XNU
+    osfmk/kern/task.c task_info, TASK_VM_INFO)."""
     buf = (ctypes.c_uint64 * 12)()
     if _libsystem.proc_pid_rusage(pid, 0, ctypes.byref(buf)):
         return {"error": os.strerror(ctypes.get_errno())}
-    return {"resident_kib": buf[8] >> 10, "phys_footprint_kib": buf[9] >> 10}
+    out = {"resident_kib": buf[8] >> 10, "phys_footprint_kib": buf[9] >> 10}
+    port = ctypes.c_uint(0)
+    kr = _libsystem.task_name_for_pid(ctypes.c_uint.in_dll(_libsystem, "mach_task_self_"), pid, ctypes.byref(port))
+    if kr:
+        out["vm_info_error"] = f"task_name_for_pid: {kr}"
+        return out
+    # struct task_vm_info as 64-bit words: [2] resident_size, [6] internal,
+    # [8] external, [15] compressed, [18] phys_footprint.
+    info, count = (ctypes.c_uint64 * 100)(), ctypes.c_uint32(200)
+    kr = _libsystem.task_info(port, 22, ctypes.byref(info), ctypes.byref(count))  # TASK_VM_INFO
+    _libsystem.mach_port_deallocate(ctypes.c_uint.in_dll(_libsystem, "mach_task_self_"), port)
+    if kr:
+        out["vm_info_error"] = f"task_info: {kr}"
+        return out
+    out.update(internal_kib=info[6] >> 10, external_kib=info[8] >> 10, compressed_kib=info[15] >> 10)
+    return out
 
 
 def _region_groups(pid):
