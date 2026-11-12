@@ -14,7 +14,9 @@
 //! the userfaultfd is released and no descriptor it was sent stays open.
 //!
 //! Registering memory outside the arena would make the fuzzer's own memory
-//! fault, so registers name the arena, or lengths no mapping has.
+//! fault, so registers name the arena, or lengths past the address space
+//! (as Linux's, a register takes what is mapped in a range and leaves its
+//! holes out).
 
 #![no_main]
 
@@ -345,8 +347,8 @@ mod imp {
                             u64::from(*n) % (PAGES as u64 - (start - arena.base) / ps + 1) * ps
                         }
                         Len::Bytes(b) => u64::from(*b),
-                        // Beyond any mapping.
-                        Len::Raw(v) => (v | 1 << 40) & !(ps - 1),
+                        // Past the address space (128 TiB less 32 MiB).
+                        Len::Raw(v) => (v | 1 << 47) & !(ps - 1),
                     };
                     [proto::OP_REGISTER, start, len, 0]
                 }

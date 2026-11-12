@@ -828,9 +828,14 @@ mod tests {
         let e = uffd.register(mem.wrapping_add(1).cast(), ps);
         assert!(matches!(e, Err(Error::SystemError(Errno::EINVAL))), "{e:?}");
         uffd.register(mem.cast(), ps).unwrap();
-        // Registered twice.
-        let e = uffd.register(mem.cast(), ps);
+        // Registered twice: nothing to do, as Linux; by another, EBUSY.
+        uffd.register(mem.cast(), ps).unwrap();
+        let other = UffdBuilder::new().create().unwrap();
+        let e = other.register(mem.cast(), ps);
         assert!(matches!(e, Err(Error::SystemError(Errno::EBUSY))), "{e:?}");
+        // Nothing mapped there.
+        let e = uffd.register(std::ptr::null_mut::<u8>().wrapping_add(ps).cast(), ps);
+        assert!(matches!(e, Err(Error::SystemError(Errno::EINVAL))), "{e:?}");
     }
 
     fn socket_pair() -> [RawFd; 2] {

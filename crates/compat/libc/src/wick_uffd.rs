@@ -196,6 +196,15 @@ unsafe extern "C" {
     ) -> c_int;
     fn semaphore_signal(semaphore: u32) -> c_int;
     fn semaphore_wait(semaphore: u32) -> c_int;
+    fn mach_vm_region(
+        target_task: libc::mach_port_t,
+        address: *mut u64,
+        size: *mut u64,
+        flavor: c_int,
+        info: *mut c_int,
+        count: *mut u32,
+        object_name: *mut libc::mach_port_t,
+    ) -> c_int;
     fn mach_vm_remap(
         target_task: libc::mach_port_t,
         target_address: *mut u64,
@@ -609,123 +618,315 @@ fn overlaps_an_alias(start: u64, end: u64) -> bool {
     })
 }
 
-/// Registers `[start, start + len)` (page aligned) with userfaultfd `ctx`.
-/// Pages that are not resident are missing from now on. The range must be
-/// mapped (`ENOMEM`) and readable and writable (`EPERM`; Linux also takes
-/// anonymous memory with other protections, which fills here would change),
-/// and no part of it the alias of a registered range (`EINVAL`,
-/// [`overlaps_an_alias`]). A `MAP_HUGETLB` mapping ([`note_mapping`]) is registered in huge pages:
-/// the range must be aligned to them (`EINVAL`, as Linux's hugetlb
-/// registration), a huge page is missing when any host page of it is, and
-/// faults and fills work on whole huge pages.
-pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
+/// One past the highest address a process maps: `MACH_VM_MAX_ADDRESS`
+/// (mach/arm/vm_param.h, 128 TiB less 32 MiB), what Linux's
+/// `validate_range` checks against its `TASK_SIZE`.
+const TASK_SIZE: u64 = 0x0000_7FFF_FE00_0000;
+
+/// Linux's `validate_range` (fs/userfaultfd.c): a start aligned to host
+/// pages and not 0 (Linux: below `mmap_min_addr`), a length of whole host
+/// pages and not 0, the range below [`TASK_SIZE`], else `EINVAL`. Returns
+/// the range's end.
+fn validate_range(start: u64, len: u64) -> Result<u64, c_int> {
     let host = page_size();
-    if len == 0 || start == 0 || !start.is_multiple_of(host) || !len.is_multiple_of(host) {
-        return Err(errno_err(libc::EINVAL));
+    if host == 0
+        || start == 0
+        || !start.is_multiple_of(host)
+        || len == 0
+        || !len.is_multiple_of(host)
+        || start >= TASK_SIZE
+        || len > TASK_SIZE - start
+    {
+        return Err(libc::EINVAL);
     }
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| errno_err(libc::EINVAL))?;
-    let ps = huge_page_of(start, end).unwrap_or(host);
-    if !start.is_multiple_of(ps) || !len.is_multiple_of(ps) {
-        return Err(errno_err(libc::EINVAL));
+    Ok(start + len)
+}
+
+/// The VM map entries in `[start, end)`, cut to it, in order: Linux's vmas
+/// of the range, holes left out. Each with whether all of it is readable
+/// and writable.
+fn mapped_entries(start: u64, end: u64) -> Vec<(u64, u64, bool)> {
+    const VM_REGION_BASIC_INFO_64: c_int = 9;
+    let rw = libc::PROT_READ | libc::PROT_WRITE;
+    let mut entries = Vec::new();
+    let mut at = start;
+    while at < end {
+        let (mut addr, mut size, mut object) = (at, 0u64, 0);
+        let mut info = [0 as c_int; 16];
+        let mut count = 9u32;
+        // SAFETY: valid output buffers, `info` larger than the flavor's 9
+        // words. The entry at or after `addr`; KERN_INVALID_ADDRESS when
+        // there is none.
+        let kr = unsafe {
+            mach_vm_region(
+                mach_task_self_,
+                &mut addr,
+                &mut size,
+                VM_REGION_BASIC_INFO_64,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut object,
+            )
+        };
+        if kr != 0 || addr >= end || size == 0 {
+            break;
+        }
+        // vm_region_basic_info_64 starts with the current protection
+        // (VM_PROT_* bits are PROT_* bits).
+        entries.push((addr.max(at), (addr + size).min(end), info[0] & rw == rw));
+        at = addr + size;
     }
-    let _guard = LOCK.lock().unwrap();
-    if overlaps_an_alias(start, end) {
-        return Err(errno_err(libc::EINVAL));
-    }
-    if RANGES.iter().any(|r| {
+    entries
+}
+
+/// The occupied range slots that overlap `[start, end)`.
+fn slots(start: u64, end: u64) -> impl Iterator<Item = &'static Range> {
+    RANGES.iter().filter(move |r| {
         let s = r.start.load(Ordering::Acquire);
         s != 0 && start < r.end.load(Ordering::Acquire) && s < end
-    }) {
-        return Err(errno_err(libc::EBUSY));
-    }
-    let Some(range) = RANGES.iter().find(|r| r.start.load(Ordering::Acquire) == 0) else {
-        return Err(errno_err(libc::ENOMEM));
-    };
-    let pages = len / ps;
-    let mut alias = 0u64;
-    let (mut cur, mut max) = (0, 0);
-    // SAFETY: maps the same memory a second time, shared, anywhere. It fails
-    // unless all of the range is mapped, so it comes before anything sized
-    // by `len`, which a handler process sends (macOS' mincore accepts
-    // unmapped pages).
-    let kr = unsafe {
-        mach_vm_remap(
-            mach_task_self_,
-            &mut alias,
-            len,
-            0,
-            VM_FLAGS_ANYWHERE,
-            mach_task_self_,
-            start,
-            0,
-            &mut cur,
-            &mut max,
-            1, // VM_INHERIT_NONE
-        )
-    };
-    if kr != 0 {
-        return Err(errno_err(libc::ENOMEM));
-    }
-    // The alias has the protection of the memory (the most restrictive of
-    // the range), and pages are filled through it and then made readable and
-    // writable: memory that is not would fault on a fill, or change its
-    // protection. Guest memory always is.
-    let rw = libc::PROT_READ | libc::PROT_WRITE;
-    if cur & rw != rw {
-        // SAFETY: unmaps the alias made above.
-        unsafe { libc::munmap(alias as *mut _, len as usize) };
-        return Err(errno_err(libc::EPERM));
-    }
-    // Residency decides what is missing: Linux's, where a page the
-    // compressor or swap holds has data and is not missing (crate::mincore).
+    })
+}
+
+/// Which of the `len / ps` pages from `start` on are missing: a page is
+/// when any host page of it is not resident. Residency is Linux's, where a
+/// page the compressor or swap holds has data and is not missing
+/// (crate::mincore).
+fn missing_pages(start: u64, len: u64, ps: u64) -> io::Result<Vec<bool>> {
+    let host = page_size();
     let mut resident = std::vec![0u8; (len / host) as usize];
     // SAFETY: `resident` has one byte per host page of the range.
     if unsafe { crate::mincore(start as *mut _, len as usize, resident.as_mut_ptr()) } != 0 {
-        let err = io::Error::last_os_error();
-        // SAFETY: unmaps the alias made above.
-        unsafe { libc::munmap(alias as *mut _, len as usize) };
-        return Err(err);
+        return Err(io::Error::last_os_error());
     }
-    let missing = alloc_bitmap(pages, false);
-    let tracked = alloc_bitmap(pages, true);
-    range.end.store(end, Ordering::Release);
-    range.ctx.store(ctx, Ordering::Release);
-    range.page.store(ps, Ordering::Release);
-    range.alias.store(alias, Ordering::Release);
-    range.missing.store(missing, Ordering::Release);
-    range.tracked.store(tracked, Ordering::Release);
-    // Trailing bits of the last word stay set in `tracked`; they are past `end`.
-    let per_page = (ps / host) as usize;
-    for page in 0..pages {
-        let host_pages = &resident[page as usize * per_page..(page as usize + 1) * per_page];
-        if host_pages.iter().any(|r| r & 1 == 0) {
-            Range::set(&range.missing, page, true);
+    Ok(resident
+        .chunks((ps / host) as usize)
+        .map(|page| page.iter().any(|r| r & 1 == 0))
+        .collect())
+}
+
+/// Whether all of `[start, end)` is in registered ranges, whose missing
+/// pages are inaccessible only to make accesses fault: to the process they
+/// are readable and writable memory.
+fn all_registered(start: u64, end: u64) -> bool {
+    let mut spans: Vec<(u64, u64)> = slots(start, end)
+        .map(|r| (r.start.load(Ordering::Acquire), r.end.load(Ordering::Acquire)))
+        .collect();
+    spans.sort_unstable();
+    let mut at = start;
+    for (s, e) in spans {
+        if s > at {
+            return false;
+        }
+        at = at.max(e);
+    }
+    at >= end
+}
+
+/// Whether any page of the range in slot `r` is still registered.
+fn any_tracked(r: &Range) -> bool {
+    let pages = (r.end.load(Ordering::Acquire) - r.start.load(Ordering::Acquire)) / r.page_size();
+    (0..pages).any(|page| Range::test(&r.tracked, page))
+}
+
+/// Frees slot `r`: its range is no longer registered memory and its alias
+/// goes. Its bitmaps stay (the signal handler may be reading them).
+fn release(r: &Range) {
+    let s = r.start.swap(0, Ordering::AcqRel);
+    REGISTERED.fetch_sub(1, Ordering::AcqRel);
+    let alias = r.alias.swap(0, Ordering::AcqRel);
+    if alias != 0 {
+        // SAFETY: unmaps the alias created at register.
+        unsafe { libc::munmap(alias as *mut _, (r.end.load(Ordering::Acquire) - s) as usize) };
+    }
+}
+
+/// Registers `[start, start + len)` with userfaultfd `ctx`, as Linux's
+/// `userfaultfd_register` (fs/userfaultfd.c, v6.12): the range is checked
+/// as `validate_range` checks it, then every VM map entry in it, in order
+/// (holes are left out; none at all is `EINVAL`), and the first entry that
+/// fails decides, with nothing registered:
+///
+/// - the alias of a registered range: `EINVAL` ([`overlaps_an_alias`]);
+/// - not readable and writable: `EPERM` (Linux refuses only memory that can
+///   never be written, and takes anonymous memory with other protections,
+///   which fills here would change); registered memory is, whatever its
+///   missing pages' protection ([`all_registered`]);
+/// - a `MAP_HUGETLB` mapping ([`note_mapping`]) that holds the start or the
+///   end of the range not at a huge page boundary: `EINVAL`;
+/// - registered with another userfaultfd: `EBUSY`. Pages this one has are
+///   left as they are, as Linux leaves a vma already registered with it.
+///
+/// Pages that are not resident are missing from now on. A `MAP_HUGETLB`
+/// mapping is registered in huge pages: a huge page is missing when any
+/// host page of it is, and faults and fills work on whole huge pages.
+pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
+    let end = validate_range(start, len).map_err(errno_err)?;
+    let huge = crate::linux_items::HUGE_PAGE;
+    let _guard = LOCK.lock().unwrap();
+    let entries = mapped_entries(start, end);
+    let Some(&(first, first_end, _)) = entries.first() else {
+        return Err(errno_err(libc::EINVAL));
+    };
+    if huge_segment(first, first_end).1 && !start.is_multiple_of(huge) {
+        return Err(errno_err(libc::EINVAL));
+    }
+    // The parts to register: the entries, cut where huge page mappings
+    // begin and end, adjacent ones of one page size joined.
+    let mut parts: Vec<(u64, u64, u64)> = Vec::new();
+    for &(s, e, rw) in &entries {
+        if overlaps_an_alias(s, e) {
+            return Err(errno_err(libc::EINVAL));
+        }
+        if !rw && !all_registered(s, e) {
+            return Err(errno_err(libc::EPERM));
+        }
+        let mut at = s;
+        while at < e {
+            let (next, is_huge) = huge_segment(at, e);
+            if is_huge && next == end && !end.is_multiple_of(huge) {
+                return Err(errno_err(libc::EINVAL));
+            }
+            let ps = if is_huge { huge } else { page_size() };
+            match parts.last_mut() {
+                Some(last) if last.1 == at && last.2 == ps => last.1 = next,
+                _ => parts.push((at, next, ps)),
+            }
+            at = next;
+        }
+        if slots(s, e).any(|r| r.ctx.load(Ordering::Acquire) != ctx) {
+            return Err(errno_err(libc::EBUSY));
         }
     }
-    range.start.store(start, Ordering::Release);
-    REGISTERED.fetch_add(1, Ordering::AcqRel);
-    // Missing pages fault from now on.
+    // What this userfaultfd has not registered yet is new ranges; pages of
+    // its ranges that were unregistered are registered again.
+    let mut new = Vec::new();
+    for &(s, e, ps) in &parts {
+        let mut at = s;
+        let mut mine: Vec<(u64, u64)> = slots(s, e)
+            .map(|r| (r.start.load(Ordering::Acquire), r.end.load(Ordering::Acquire)))
+            .collect();
+        mine.sort_unstable();
+        for (a, b) in mine {
+            if a > at {
+                new.push((at, a, ps));
+            }
+            at = at.max(b);
+        }
+        if at < e {
+            new.push((at, e, ps));
+        }
+    }
+    // Pages of this userfaultfd's ranges that were unregistered, with
+    // whether they are missing now.
+    let mut again = Vec::new();
+    for &(s, e, _) in &parts {
+        for r in slots(s, e) {
+            let base = r.start.load(Ordering::Acquire);
+            let ps = r.page_size();
+            let (a, b) = (s.max(base), e.min(r.end.load(Ordering::Acquire)));
+            for page in (a - base) / ps..(b - base) / ps {
+                if !Range::test(&r.tracked, page) {
+                    let at = base + page * ps;
+                    again.push((r, page, missing_pages(at, ps, ps)?[0]));
+                }
+            }
+        }
+    }
+    if RANGES.iter().filter(|r| r.start.load(Ordering::Acquire) == 0).count() < new.len() {
+        return Err(errno_err(libc::ENOMEM));
+    }
+    let mut made: Vec<(u64, u64, u64, u64, Vec<bool>)> = Vec::new();
+    let undo = |made: &[(u64, u64, u64, u64, Vec<bool>)]| {
+        for &(s, e, _, alias, _) in made {
+            // SAFETY: unmaps an alias made below.
+            unsafe { libc::munmap(alias as *mut _, (e - s) as usize) };
+        }
+    };
+    for &(s, e, ps) in &new {
+        let mut alias = 0u64;
+        let (mut cur, mut max) = (0, 0);
+        // SAFETY: maps the same memory a second time, shared, anywhere.
+        let kr = unsafe {
+            mach_vm_remap(
+                mach_task_self_,
+                &mut alias,
+                e - s,
+                0,
+                VM_FLAGS_ANYWHERE,
+                mach_task_self_,
+                s,
+                0,
+                &mut cur,
+                &mut max,
+                1, // VM_INHERIT_NONE
+            )
+        };
+        if kr != 0 {
+            undo(&made);
+            return Err(errno_err(libc::ENOMEM));
+        }
+        made.push((s, e, ps, alias, Vec::new()));
+        // The alias has the protection of the memory (the most restrictive
+        // of the part), and pages are filled through it and then made
+        // readable and writable: memory that is not would fault on a fill,
+        // or change its protection. Guest memory always is.
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        if cur & rw != rw {
+            undo(&made);
+            return Err(errno_err(libc::EPERM));
+        }
+        match missing_pages(s, e - s, ps) {
+            Ok(missing) => made.last_mut().unwrap().4 = missing,
+            Err(err) => {
+                undo(&made);
+                return Err(err);
+            }
+        }
+    }
+    for (s, e, ps, alias, missing) in made {
+        let range = RANGES.iter().find(|r| r.start.load(Ordering::Acquire) == 0).unwrap();
+        let pages = (e - s) / ps;
+        range.end.store(e, Ordering::Release);
+        range.ctx.store(ctx, Ordering::Release);
+        range.page.store(ps, Ordering::Release);
+        range.alias.store(alias, Ordering::Release);
+        range.missing.store(alloc_bitmap(pages, false), Ordering::Release);
+        // Trailing bits of the last word stay set; they are past `end`.
+        range.tracked.store(alloc_bitmap(pages, true), Ordering::Release);
+        for (page, &m) in missing.iter().enumerate() {
+            if m {
+                Range::set(&range.missing, page as u64, true);
+            }
+        }
+        range.start.store(s, Ordering::Release);
+        REGISTERED.fetch_add(1, Ordering::AcqRel);
+    }
     let mut runs = Vec::new();
-    for_each_missing(start, len, |s, l| runs.push((s, l)));
-    for (s, l) in runs {
-        protect(s, l, libc::PROT_NONE)?;
-        stage2(s, l, false);
+    for (r, page, missing) in again {
+        Range::set(&r.missing, page, missing);
+        Range::set(&r.tracked, page, true);
+        if missing {
+            let ps = r.page_size();
+            runs.push((r.start.load(Ordering::Acquire) + page * ps, ps));
+        }
+    }
+    for &(s, e, _) in &new {
+        for_each_missing(s, e - s, |a, l| runs.push((a, l)));
+    }
+    // Missing pages fault from now on.
+    for (a, l) in runs {
+        protect(a, l, libc::PROT_NONE)?;
+        stage2(a, l, false);
     }
     Ok(())
 }
 
 /// The registered range holding all of `[start, start + len)`, which must be
 /// aligned to its pages (huge ones for a huge page range, as Linux's
-/// hugetlb `UFFDIO_COPY` requires) and must not wrap (`EINVAL`, as Linux's
-/// `validate_range`).
+/// hugetlb `UFFDIO_COPY` requires) and checked as Linux's `validate_range`
+/// checks it (`EINVAL`).
 fn range_of(ctx: usize, start: u64, len: u64) -> Result<&'static Range, c_int> {
-    let host = page_size();
-    if host == 0 || !start.is_multiple_of(host) || !len.is_multiple_of(host) || len == 0 {
-        return Err(libc::EINVAL);
-    }
-    let end = start.checked_add(len).ok_or(libc::EINVAL)?;
+    let end = validate_range(start, len)?;
     let (range, _) = find(start).ok_or(libc::ENOENT)?;
     if range.ctx.load(Ordering::Acquire) != ctx || end > range.end.load(Ordering::Acquire) {
         return Err(libc::ENOENT);
@@ -737,24 +938,62 @@ fn range_of(ctx: usize, start: u64, len: u64) -> Result<&'static Range, c_int> {
     Ok(range)
 }
 
-/// Unregisters `[start, start + len)`: its missing pages become ordinary
-/// (zero-filled) memory and their waiters are woken.
-pub fn unregister(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
+/// Unregisters `[start, start + len)`, as Linux's `userfaultfd_unregister`
+/// (fs/userfaultfd.c, v6.12): the range is checked as `validate_range`
+/// checks it; it must hold a VM map entry (holes are left out), none of
+/// them the alias of a registered range, and a `MAP_HUGETLB` mapping at
+/// its start, or a registered one cut by it, only at huge page boundaries
+/// (`EINVAL`). Its registered pages, whichever userfaultfd has them (Linux
+/// does not ask), become ordinary memory: missing ones zero pages, their
+/// waiters woken. Memory not registered is left as it is. A range no page
+/// of which is registered any more is freed.
+pub fn unregister(_ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
+    let end = validate_range(start, len)?;
+    let huge = crate::linux_items::HUGE_PAGE;
     let _guard = LOCK.lock().unwrap();
-    let range = range_of(ctx, start, len)?;
-    let base = range.start.load(Ordering::Acquire);
-    let ps = range.page_size();
-    let mut runs = Vec::new();
-    for_each_missing(start, len, |s, l| runs.push((s, l)));
-    for page in (start - base) / ps..(start + len - base) / ps {
-        Range::set(&range.tracked, page, false);
+    let entries = mapped_entries(start, end);
+    let Some(&(first, first_end, _)) = entries.first() else {
+        return Err(libc::EINVAL);
+    };
+    if huge_segment(first, first_end).1 && !start.is_multiple_of(huge) {
+        return Err(libc::EINVAL);
     }
-    for (s, l) in runs {
-        protect(s, l, libc::PROT_READ | libc::PROT_WRITE)
-            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-        stage2(s, l, true);
-        for page in (s - base) / ps..(s + l - base) / ps {
-            Range::set(&range.missing, page, false);
+    if entries.iter().any(|&(s, e, _)| overlaps_an_alias(s, e)) {
+        return Err(libc::EINVAL);
+    }
+    // Linux cuts a registered hugetlb vma only at huge page boundaries.
+    for r in slots(start, end) {
+        let (s, e, ps) = (
+            r.start.load(Ordering::Acquire),
+            r.end.load(Ordering::Acquire),
+            r.page_size(),
+        );
+        if !(start.max(s) - s).is_multiple_of(ps) || !(end.min(e) - s).is_multiple_of(ps) {
+            return Err(libc::EINVAL);
+        }
+    }
+    for &(s, e, _) in &entries {
+        for r in slots(s, e) {
+            let base = r.start.load(Ordering::Acquire);
+            let ps = r.page_size();
+            let (a, b) = (s.max(base), e.min(r.end.load(Ordering::Acquire)));
+            // Accessible first, then not missing: a thread that faulted on
+            // a page before it was accessible finds it missing and waits for
+            // the wake below.
+            let mut runs = Vec::new();
+            for_each_missing(a, b - a, |x, l| runs.push((x, l)));
+            for (x, l) in runs {
+                protect(x, l, libc::PROT_READ | libc::PROT_WRITE)
+                    .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                stage2(x, l, true);
+            }
+            for page in (a - base) / ps..(b - base) / ps {
+                Range::set(&r.missing, page, false);
+                Range::set(&r.tracked, page, false);
+            }
+            if !any_tracked(r) {
+                release(r);
+            }
         }
     }
     wake(start, len);
@@ -958,13 +1197,7 @@ fn destroy(ctx: usize) {
                 Range::set(&r.missing, page, false);
             }
         }
-        r.start.store(0, Ordering::Release);
-        REGISTERED.fetch_sub(1, Ordering::AcqRel);
-        let alias = r.alias.swap(0, Ordering::AcqRel);
-        if alias != 0 {
-            // SAFETY: unmaps the alias created at register.
-            unsafe { libc::munmap(alias as *mut _, (e - s) as usize) };
-        }
+        release(r);
         wake(s, e - s);
     }
     let fd = CTXS[ctx].fd.swap(-1, Ordering::AcqRel);
@@ -1672,53 +1905,170 @@ mod tests {
     }
 
     #[test]
-    fn test_register_names_mapped_memory() {
+    fn test_register_checks_the_range_as_linux() {
+        // Linux's validate_range: past the address space is EINVAL, before
+        // anything sized by the length.
         let (ctx, user) = create(0, false, true).unwrap();
         let ps = page_size();
         let mem = map(4);
-        // Lengths no mapping has fail, without memory sized by them.
-        for len in [1 << 62, 1 << 40, (u64::MAX - mem) & !(ps - 1)] {
-            assert!(register(ctx, mem, len).is_err(), "{len:#x}");
+        for len in [1 << 62, TASK_SIZE - mem + ps, (u64::MAX - mem) & !(ps - 1)] {
+            let e = register(ctx, mem, len).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "{len:#x}");
+            assert_eq!(unregister(ctx, mem, len), Err(libc::EINVAL), "{len:#x}");
         }
+        let e = register(ctx, TASK_SIZE, ps).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
         register(ctx, mem, 2 * ps).unwrap();
         assert!(is_missing(mem));
         // Through a handler's channel too.
         let chan = channel(user);
         let other = map(1);
         let (r, _) = request(chan, [proto::OP_REGISTER, other, 1 << 62, 0], &[]);
-        assert!(r < 0);
+        assert_eq!(r, err(libc::EINVAL));
         let (r, _) = request(chan, [proto::OP_REGISTER, other, ps, 0], &[]);
         assert_eq!(r, 0);
         assert!(is_missing(other));
         close(&[chan, user]);
     }
 
-    /// A range with an unmapped part is refused, and nothing is registered.
-    /// Nothing but this test may map memory while the hole is open, or a
-    /// mapping can take it. Among other tests' threads, one did (their
-    /// mappings, the aliases `register` makes), and the range was registered
-    /// whole over another test's memory or alias, so it runs in a process of
-    /// its own: this binary again, this test only. There the serving thread
-    /// did (Rust's start of a thread maps its signal stack and guard page),
-    /// so the hole is made only once that thread has answered a request.
+    /// As Linux's `userfaultfd_register` and `userfaultfd_unregister`, the
+    /// mapped parts of a range are registered and unregistered and its holes
+    /// left out; a range of holes only is `EINVAL`. Nothing but this test
+    /// may map memory while the holes are open, or a mapping can take them.
+    /// Among other tests' threads, one did (their mappings, the aliases
+    /// `register` makes), so it runs in a process of its own: this binary
+    /// again, this test only. There the serving thread did (Rust's start of
+    /// a thread maps its signal stack and guard page), so the holes are made
+    /// only once that thread has answered a request.
     #[test]
-    fn test_register_refuses_a_range_with_a_hole() {
-        if !in_own_process("wick_uffd::tests::test_register_refuses_a_range_with_a_hole") {
+    fn test_register_takes_the_mapped_parts_of_a_range() {
+        if !in_own_process("wick_uffd::tests::test_register_takes_the_mapped_parts_of_a_range") {
             return;
         }
         let (ctx, user) = create(0, false, true).unwrap();
         let ps = page_size();
-        let mem = map(4);
+        // Parts of two pages, holes of one: no alias `register` makes (one
+        // per part, its size) fits in a hole.
+        let mem = map(8);
         let chan = channel(user);
-        // SAFETY: the last two pages of the mapping above.
-        let r = unsafe { libc::munmap((mem + 2 * ps) as *mut _, (2 * ps) as usize) };
-        assert_eq!(r, 0);
-        let e = register(ctx, mem, 4 * ps).unwrap_err();
-        assert_eq!(e.raw_os_error(), Some(libc::ENOMEM));
-        assert!(!is_missing(mem));
-        register(ctx, mem, 2 * ps).unwrap();
-        assert!(is_missing(mem));
+        for page in [2, 5] {
+            // SAFETY: a page of the mapping above.
+            let r = unsafe { libc::munmap((mem + page * ps) as *mut _, ps as usize) };
+            assert_eq!(r, 0);
+        }
+        let e = register(ctx, mem + 2 * ps, ps).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(unregister(ctx, mem + 5 * ps, ps), Err(libc::EINVAL));
+        let (r, _) = request(chan, [proto::OP_UNREGISTER, mem + 2 * ps, ps, 0], &[]);
+        assert_eq!(r, err(libc::EINVAL));
+        register(ctx, mem, 8 * ps).unwrap();
+        let mapped = [0, 1, 3, 4, 6, 7];
+        for page in mapped {
+            assert!(is_missing(mem + page * ps), "{page}");
+        }
+        // Memory mapped in a hole afterwards is not registered, as a new vma.
+        assert!(mapped_entries(mem + 2 * ps, mem + 3 * ps).is_empty());
+        // SAFETY: maps over the hole made above, still a hole.
+        let p = unsafe {
+            libc::mmap(
+                (mem + 2 * ps) as *mut _,
+                ps as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(p as u64, mem + 2 * ps);
+        assert!(!is_missing(mem + 2 * ps));
+        // SAFETY: the page just mapped.
+        unsafe { ptr::write_volatile((mem + 2 * ps) as *mut u8, 7) };
+        assert_eq!(zeropage(ctx, mem + 3 * ps, 2 * ps, true), Ok(2 * ps));
+        // Over the hole left, the page mapped in the other, and memory
+        // never registered.
+        assert_eq!(unregister(ctx, mem, 8 * ps), Ok(()));
+        for page in mapped {
+            assert!(!is_missing(mem + page * ps), "{page}");
+        }
+        // SAFETY: mapped and no longer registered.
+        unsafe {
+            assert_eq!(ptr::read_volatile((mem + 2 * ps) as *const u8), 7);
+            assert_eq!(ptr::read_volatile((mem + 7 * ps) as *const u8), 0);
+        }
         close(&[chan, user]);
+    }
+
+    #[test]
+    fn test_register_and_unregister_as_linux() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let (b, ub) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(3);
+        register(a, mem, 2 * ps).unwrap();
+        assert_eq!(zeropage(a, mem, ps, true), Ok(ps));
+        // Again, and further: what the userfaultfd has stays as it is, as
+        // Linux skips a vma registered with it; the rest is registered.
+        register(a, mem, 3 * ps).unwrap();
+        assert!(!is_missing(mem) && is_missing(mem + ps) && is_missing(mem + 2 * ps));
+        // Another userfaultfd's: EBUSY, and nothing of the range registered.
+        let next = map(1);
+        for (start, len) in [(mem + 2 * ps, ps), (mem, 3 * ps)] {
+            let e = register(b, start, len).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::EBUSY));
+        }
+        // Linux's unregister clears a vma whichever userfaultfd has it.
+        assert_eq!(unregister(b, mem + ps, ps), Ok(()));
+        assert!(!is_missing(mem + ps));
+        // Not Linux's, which would take it: part of a range of another
+        // userfaultfd, until all of that range is unregistered.
+        let e = register(b, mem + ps, ps).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EBUSY));
+        // Registered again: not resident, so missing.
+        register(a, mem, 3 * ps).unwrap();
+        assert!(!is_missing(mem) && is_missing(mem + ps));
+        // Unregistered whole, the memory is free for another userfaultfd.
+        assert_eq!(unregister(a, mem, 3 * ps), Ok(()));
+        register(b, mem, 3 * ps).unwrap();
+        assert!(!is_missing(mem) && is_missing(mem + ps) && is_missing(mem + 2 * ps));
+        assert_eq!(zeropage(b, mem + ps, 2 * ps, true), Ok(2 * ps));
+        assert_eq!(zeropage(a, mem + ps, ps, true), Err((libc::ENOENT, 0)));
+        register(a, next, ps).unwrap();
+        close(&[ua, ub]);
+    }
+
+    /// Not Linux's: a private file mapping is registered, where Linux's
+    /// `vma_can_userfault` refuses it (`EINVAL`), as a memfd here is a file
+    /// and Linux takes a memfd's mappings (shmem).
+    #[test]
+    fn test_register_takes_a_private_file_mapping() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let path = std::env::temp_dir().join(std::format!("wick-uffd-file-{}", std::process::id()));
+        let file = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file.set_len(2 * ps).unwrap();
+        // SAFETY: a private mapping of the file above.
+        let mem = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                (2 * ps) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        assert_ne!(mem, libc::MAP_FAILED);
+        register(ctx, mem as u64, 2 * ps).unwrap();
+        assert_eq!(zeropage(ctx, mem as u64, 2 * ps, true), Ok(2 * ps));
+        assert_eq!(unregister(ctx, mem as u64, 2 * ps), Ok(()));
+        close(&[user]);
     }
 
     #[test]
@@ -1761,9 +2111,9 @@ mod tests {
         let alias = find(mem).unwrap().0.alias.load(Ordering::Acquire);
         let whole = register(ctx, alias, 2 * ps);
         let part = register(ctx, alias + ps, ps);
-        // Through a handler's channel too, over the alias and memory before it.
+        // Through a handler's channel too, over the alias and what follows.
         let other = map(1);
-        let (around, _) = request(chan, [proto::OP_REGISTER, alias - ps, 2 * ps, 0], &[]);
+        let (around, _) = request(chan, [proto::OP_REGISTER, alias + ps, 2 * ps, 0], &[]);
         // SAFETY: plain alarm; its default action ends the process.
         unsafe { libc::alarm(10) };
         assert_eq!(zeropage(ctx, mem, 2 * ps, true), Ok(2 * ps));
@@ -1772,7 +2122,7 @@ mod tests {
         assert_eq!(whole.unwrap_err().raw_os_error(), Some(libc::EINVAL));
         assert_eq!(part.unwrap_err().raw_os_error(), Some(libc::EINVAL));
         assert_eq!(around, err(libc::EINVAL));
-        assert!(!is_missing(alias) && !is_missing(alias - ps));
+        assert!(!is_missing(alias) && !is_missing(alias + ps));
         // Other memory is taken.
         let (r, _) = request(chan, [proto::OP_REGISTER, other, ps, 0], &[]);
         assert_eq!(r, 0);
