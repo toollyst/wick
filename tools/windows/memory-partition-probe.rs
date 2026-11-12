@@ -7,8 +7,8 @@
 //! sections escape it; `jailer-test.ps1 sections`).
 //!
 //! Needs an elevated prompt and an account holding "Lock pages in memory"
-//! (SeLockMemoryPrivilege; the hugepages stage needs it too). It says so and
-//! stops if the privilege is missing. CI's kit has it built
+//! (SeLockMemoryPrivilege; the hugepages stage needs it too) for everything
+//! past step 1. It says so and stops if the privilege is missing. CI's kit has it built
 //! (`tools\windows\memory-partition-probe.exe`); otherwise, with no
 //! dependencies:
 //!
@@ -17,18 +17,41 @@
 //! memory-partition-probe.exe [partition MiB, default 256] > partition.txt
 //! ```
 //!
+//! The calls are undocumented. Their prototypes and layouts are phnt's
+//! (winsiderss/phnt ntmmapi.h and ntpsapi.h, read 2026-11-13; NtTrace.cfg
+//! agrees on the prototypes), with three points measured on Windows Server
+//! 2022 build 20348, where phnt says nothing or names a field otherwise:
+//! - SystemMemoryPartitionInformation takes its structure (240 bytes; any
+//!   other length is STATUS_INFO_LENGTH_MISMATCH) as input too: `Channel`
+//!   must be 0xFFFFFFFF and `NumaNode` 0xFFFFFFFF for all nodes, or it fails
+//!   with STATUS_INVALID_PARAMETER (what every query of the first version
+//!   returned);
+//! - SystemMemoryPartitionMoveMemory needs the source partition's handle with
+//!   modify access: a NULL source is STATUS_INVALID_HANDLE (what the first
+//!   version's move returned), a query-only handle STATUS_ACCESS_DENIED. The
+//!   system partition is opened by name, `\KernelObjects\MemoryPartition0`;
+//! - JobObjectMemoryPartitionInformation (43) takes a partition HANDLE,
+//!   although phnt names its field `PartitionId`: the id 0 is
+//!   STATUS_INVALID_HANDLE, the system partition's handle
+//!   STATUS_NOT_SUPPORTED.
+//!
 //! What it does, in order, each step on one line:
-//! 1. Prints the Windows build and the host's memory.
+//! 1. Prints the Windows build, the host's memory and the system partition's
+//!    information (needs no privilege).
 //! 2. Enables SeLockMemoryPrivilege.
-//! 3. Creates a partition (NtCreatePartition), moves the size's pages into it
-//!    (NtManagePartition, SystemMemoryPartitionMoveMemory), and reads its
-//!    information before and after. It also reads the host's free memory, to
-//!    see whether the pages leave the host up front.
-//! 4. For each kind, starts a child process suspended. The child enables no
-//!    privilege, except for large pages. The probe puts the child in a new
-//!    kill-on-close job, associates the job with the partition
-//!    (JobObjectMemoryPartitionInformation, 43) BEFORE the child runs, then
-//!    lets it take twice the partition's size of that kind:
+//! 3. For each kind, creates a partition of its own (NtCreatePartition),
+//!    moves the size's pages into it from the system partition (NtManagePartition,
+//!    SystemMemoryPartitionMoveMemory), and reads its information before and
+//!    after, with the host's free memory, to see whether the pages leave the
+//!    host up front. A partition of its own per kind, so that no kind runs in
+//!    what another left.
+//! 4. Makes a kill-on-close job and associates it with the partition
+//!    (JobObjectMemoryPartitionInformation, 43) while it is empty, then
+//!    creates the child IN the job (PROC_THREAD_ATTRIBUTE_JOB_LIST), so that
+//!    the child is the partition's from its first page: a process made
+//!    outside and assigned later (what the first version did) did not join
+//!    the job. The child enables no privilege, except for large pages, and
+//!    takes twice the partition's size of its kind:
 //!    - private memory (VirtualAlloc, written);
 //!    - pagefile-backed sections, mapped and written, and created only;
 //!    - temporary-file sections (wick's memfd), mapped and written;
@@ -38,7 +61,8 @@
 //!    killed (its exit code), and the partition's and the host's memory.
 //! 5. The same for private memory with a job memory limit of half the
 //!    partition as well (nesting).
-//! 6. Closes the partition and reads the host's memory again (cleanup).
+//! 6. Closes each partition after its kind and reads the host's memory
+//!    again (cleanup).
 
 #![allow(non_snake_case, clippy::upper_case_acronyms)]
 
@@ -104,6 +128,29 @@ struct StartupInfo {
 }
 
 #[repr(C)]
+struct StartupInfoEx {
+    si: StartupInfo,
+    attributes: *mut c_void,
+}
+
+#[repr(C)]
+struct UnicodeString {
+    len: u16,
+    max: u16,
+    buf: *const u16,
+}
+
+#[repr(C)]
+struct ObjectAttributes {
+    len: u32,
+    root: H,
+    name: *const UnicodeString,
+    attributes: u32,
+    sd: *const c_void,
+    sqos: *const c_void,
+}
+
+#[repr(C)]
 #[derive(Default)]
 struct ProcessInfo {
     process: usize,
@@ -140,9 +187,11 @@ struct TokenPrivileges {
 
 #[link(name = "ntdll")]
 extern "system" {
-    fn NtCreatePartition(parent: H, out: *mut H, access: u32, oa: *const c_void, node: u32) -> i32;
+    fn NtCreatePartition(parent: H, out: *mut H, access: u32, oa: *const ObjectAttributes) -> i32;
+    fn NtOpenPartition(out: *mut H, access: u32, oa: *const ObjectAttributes) -> i32;
     fn NtManagePartition(target: H, source: H, class: u32, info: *mut c_void, len: u32) -> i32;
     fn NtSetInformationJobObject(j: H, class: u32, info: *const c_void, len: u32) -> i32;
+    fn NtQueryInformationJobObject(j: H, class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
     fn RtlGetVersion(v: *mut u32) -> i32;
 }
 #[link(name = "kernel32")]
@@ -152,7 +201,10 @@ extern "system" {
     fn K32GetPerformanceInfo(p: *mut PerfInfo, cb: u32) -> i32;
     fn CreateJobObjectW(a: *const c_void, name: *const u16) -> H;
     fn SetInformationJobObject(j: H, class: u32, info: *const c_void, len: u32) -> i32;
-    fn AssignProcessToJobObject(j: H, p: H) -> i32;
+    fn InitializeProcThreadAttributeList(list: *mut c_void, count: u32, flags: u32, size: *mut usize) -> i32;
+    fn UpdateProcThreadAttribute(list: *mut c_void, flags: u32, attr: usize, value: *const c_void, size: usize, prev: *mut c_void, ret: *mut usize) -> i32;
+    fn DeleteProcThreadAttributeList(list: *mut c_void);
+    fn IsProcessInJob(p: H, j: H, result: *mut i32) -> i32;
     fn CreateProcessW(app: *const u16, cmd: *mut u16, pa: *const c_void, ta: *const c_void, inherit: i32, flags: u32, env: *const c_void, cwd: *const u16, si: *mut StartupInfo, pi: *mut ProcessInfo) -> i32;
     fn ResumeThread(t: H) -> u32;
     fn WaitForSingleObject(h: H, ms: u32) -> u32;
@@ -176,6 +228,8 @@ extern "system" {
 }
 
 const MIB: usize = 1 << 20;
+/// MEMORY_PARTITION_ALL_ACCESS (phnt).
+const PARTITION_ALL_ACCESS: u32 = 0x001F_0003;
 
 fn w(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -193,14 +247,68 @@ fn host() -> String {
 }
 
 fn partition_info(p: H) -> String {
-    let mut i = PartitionInfo::default();
-    // SAFETY: an output structure of the size given; class 0 is the information.
+    // Input as well as output: all NUMA nodes, and a Channel of 0xFFFFFFFF
+    // (anything else is STATUS_INVALID_PARAMETER; measured).
+    let mut i = PartitionInfo { numa_node: u32::MAX, channel: u32::MAX, ..Default::default() };
+    // SAFETY: an in/out structure of the size given; class 0 is the information.
     let st = unsafe { NtManagePartition(p, std::ptr::null_mut(), 0, (&raw mut i).cast(), size_of::<PartitionInfo>() as u32) };
     let m = |v: usize| v * 4096 / MIB;
     format!(
         "partition (status {st:#x}): id {} total {} MiB, available {} MiB, free {} MiB, committed {} MiB, commit limit {} MiB (max {} MiB), resident available {} MiB",
         i.id, m(i.total_pages), m(i.available), m(i.free), m(i.committed), m(i.commit_limit), m(i.maximum_commit_limit), m(i.resident_available)
     )
+}
+
+/// The system partition, opened by name with modify access (the source of a
+/// move).
+fn system_partition() -> Result<H, i32> {
+    let name: Vec<u16> = "\\KernelObjects\\MemoryPartition0".encode_utf16().collect();
+    let bytes = (name.len() * 2) as u16;
+    let us = UnicodeString { len: bytes, max: bytes, buf: name.as_ptr() };
+    let oa = ObjectAttributes {
+        len: size_of::<ObjectAttributes>() as u32,
+        root: std::ptr::null_mut(),
+        name: &us,
+        attributes: 0x40, // OBJ_CASE_INSENSITIVE
+        sd: std::ptr::null(),
+        sqos: std::ptr::null(),
+    };
+    let mut p = std::ptr::null_mut();
+    // SAFETY: an output handle and attributes that live through the call.
+    let st = unsafe { NtOpenPartition(&mut p, PARTITION_ALL_ACCESS, &oa) };
+    if st < 0 { Err(st) } else { Ok(p) }
+}
+
+/// A new partition with `size` MiB moved into it from `system`; None (said)
+/// if either step fails.
+fn new_partition(system: H, size: usize) -> Option<H> {
+    let mut p = std::ptr::null_mut();
+    // SAFETY: an output handle; no parent (the system partition), no name.
+    let st = unsafe { NtCreatePartition(std::ptr::null_mut(), &mut p, PARTITION_ALL_ACCESS, std::ptr::null()) };
+    println!("NtCreatePartition: {st:#x}");
+    if st < 0 {
+        return None;
+    }
+    println!("  created: {}", partition_info(p));
+    // MEMORY_PARTITION_TRANSFER_INFORMATION: pages, NUMA node, flags.
+    #[repr(C)]
+    struct Transfer {
+        pages: usize,
+        node: u32,
+        flags: u32,
+    }
+    let mut t = Transfer { pages: size * MIB / 4096, node: 0, flags: 0 };
+    // SAFETY: class 1, SystemMemoryPartitionMoveMemory, from the system partition's handle.
+    let st = unsafe { NtManagePartition(p, system, 1, (&raw mut t).cast(), size_of::<Transfer>() as u32) };
+    println!("  move {size} MiB into it from the system partition: {st:#x}");
+    println!("  sized: {}", partition_info(p));
+    println!("  sized: {}", host());
+    if st < 0 {
+        // SAFETY: our handle.
+        unsafe { CloseHandle(p) };
+        return None;
+    }
+    Some(p)
 }
 
 /// Enables a privilege of this process's token; Err if the token does not hold it.
@@ -315,34 +423,61 @@ fn run(partition: H, kind: &str, mib: usize, job_mib: usize) {
             l.job_memory = job_mib * MIB;
         }
         SetInformationJobObject(j, 9, (&raw const l).cast(), size_of::<ExtendedLimit>() as u32);
+        // The partition's handle (not its id, whatever phnt calls the field), while the job is empty.
         let hv = partition as usize;
         let st = NtSetInformationJobObject(j, 43, (&raw const hv).cast(), size_of::<usize>() as u32);
+        let mut back = 0u8;
+        let mut n = 0u32;
+        let qst = NtQueryInformationJobObject(j, 43, (&raw mut back).cast(), 1, &mut n);
+        // The child is made in the job, so it is the partition's from its first page.
+        let mut size = 0usize;
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
+        let mut list = vec![0u8; size];
+        let mut jobs = [j];
+        if InitializeProcThreadAttributeList(list.as_mut_ptr().cast(), 1, 0, &mut size) == 0
+            // PROC_THREAD_ATTRIBUTE_JOB_LIST
+            || UpdateProcThreadAttribute(list.as_mut_ptr().cast(), 0, 0x0002_000D, jobs.as_mut_ptr().cast(), size_of::<H>(), std::ptr::null_mut(), std::ptr::null_mut()) == 0
+        {
+            println!("{kind}: the job attribute: error {}", GetLastError());
+            CloseHandle(j);
+            return;
+        }
         let exe = std::env::current_exe().unwrap();
         let mut cmd = w(&format!("\"{}\" child {kind} {mib}", exe.display()));
         let out = GetStdHandle(-11i32 as u32);
         SetHandleInformation(out, 1, 1);
-        let mut si = StartupInfo {
-            cb: size_of::<StartupInfo>() as u32,
-            reserved: [std::ptr::null_mut(); 3],
-            dims: [0; 7],
-            flags: 0x100,
-            show: 0,
-            cb_reserved2: 0,
-            reserved2: std::ptr::null_mut(),
-            stdin: std::ptr::null_mut(),
-            stdout: out,
-            stderr: out,
+        let mut si = StartupInfoEx {
+            si: StartupInfo {
+                cb: size_of::<StartupInfoEx>() as u32,
+                reserved: [std::ptr::null_mut(); 3],
+                dims: [0; 7],
+                flags: 0x100,
+                show: 0,
+                cb_reserved2: 0,
+                reserved2: std::ptr::null_mut(),
+                stdin: std::ptr::null_mut(),
+                stdout: out,
+                stderr: out,
+            },
+            attributes: list.as_mut_ptr().cast(),
         };
         let mut pi = ProcessInfo::default();
-        if CreateProcessW(std::ptr::null(), cmd.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, 4, std::ptr::null(), std::ptr::null(), &mut si, &mut pi) == 0 {
-            println!("{kind}: CreateProcessW error {}", GetLastError());
+        // CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT.
+        let created = CreateProcessW(std::ptr::null(), cmd.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, 4 | 0x0008_0000, std::ptr::null(), std::ptr::null(), &mut si.si, &mut pi);
+        let created_error = GetLastError();
+        DeleteProcThreadAttributeList(list.as_mut_ptr().cast());
+        println!(
+            "{kind}{}: job tied to the partition: status {st:#x} (read back {qst:#x}: {back}); child made in the job: {}",
+            if job_mib > 0 { format!(" (and a job memory limit of {job_mib} MiB)") } else { String::new() },
+            if created == 0 { format!("no, CreateProcessW error {created_error}") } else { String::from("yes") }
+        );
+        if created == 0 {
+            CloseHandle(j);
             return;
         }
-        let assigned = AssignProcessToJobObject(j, pi.process as H);
-        println!(
-            "{kind}{}: job tied to the partition: status {st:#x}; child in the job: {assigned}",
-            if job_mib > 0 { format!(" (and a job memory limit of {job_mib} MiB)") } else { String::new() }
-        );
+        let mut inside = 0;
+        IsProcessInJob(pi.process as H, j, &mut inside);
+        println!("  {kind}: child in the job: {inside}");
         ResumeThread(pi.thread as H);
         if WaitForSingleObject(pi.process as H, 120_000) != 0 {
             TerminateProcess(pi.process as H, 1);
@@ -372,39 +507,28 @@ fn main() {
     unsafe { RtlGetVersion(v.as_mut_ptr()) };
     println!("windows {}.{} build {}", v[1], v[2], v[3]);
     println!("{}", host());
+    let system = match system_partition() {
+        Ok(h) => h,
+        Err(st) => {
+            println!("FAIL: NtOpenPartition(\\KernelObjects\\MemoryPartition0): {st:#x}");
+            std::process::exit(3);
+        }
+    };
+    println!("system {}", partition_info(system));
     if let Err(e) = enable("SeLockMemoryPrivilege") {
         println!("FAIL: {e}: give the account \"Lock pages in memory\" (secpol.msc, Local Policies, User Rights Assignment), sign out and in, and run this again elevated");
         std::process::exit(2);
     }
     println!("SeLockMemoryPrivilege enabled");
-    let mut p = std::ptr::null_mut();
-    // SAFETY: an output handle; MEMORY_PARTITION_ALL_ACCESS, no parent (the system partition), node 0.
-    let st = unsafe { NtCreatePartition(std::ptr::null_mut(), &mut p, 0x001F_0003, std::ptr::null(), 0) };
-    println!("NtCreatePartition: {st:#x}");
-    if st < 0 {
-        println!("FAIL: no partition");
-        std::process::exit(3);
+    let runs = [("private", 0), ("sections", 0), ("sections-created", 0), ("filesections", 0), ("largepages", 0), ("events", 0), ("private", size / 2)];
+    for (kind, job_mib) in runs {
+        let Some(p) = new_partition(system, size) else {
+            println!("FAIL {kind}: no partition of {size} MiB");
+            continue;
+        };
+        run(p, kind, size * 2, job_mib);
+        // SAFETY: our handle.
+        unsafe { CloseHandle(p) };
+        println!("  partition closed: {}", host());
     }
-    println!("created: {}", partition_info(p));
-    println!("created: {}", host());
-    // MEMORY_PARTITION_TRANSFER_INFORMATION: pages, NUMA node, flags.
-    #[repr(C)]
-    struct Transfer {
-        pages: usize,
-        node: u32,
-        flags: u32,
-    }
-    let mut t = Transfer { pages: size * MIB / 4096, node: 0, flags: 0 };
-    // SAFETY: class 1, SystemMemoryPartitionMoveMemory, from the system partition (no source handle).
-    let st = unsafe { NtManagePartition(p, std::ptr::null_mut(), 1, (&raw mut t).cast(), size_of::<Transfer>() as u32) };
-    println!("move {size} MiB into it: {st:#x}");
-    println!("sized: {}", partition_info(p));
-    println!("sized: {}", host());
-    for kind in ["private", "sections", "sections-created", "filesections", "largepages", "events"] {
-        run(p, kind, size * 2, 0);
-    }
-    run(p, "private", size * 2, size / 2);
-    // SAFETY: our handle.
-    unsafe { CloseHandle(p) };
-    println!("partition closed: {}", host());
 }
