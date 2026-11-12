@@ -257,4 +257,6 @@ semantics on Win32. The details are in the comments of each
 - **`net`**: a Unix stream endpoint that a host switch connects to. Ethernet
   frames are prefixed with a 32-bit big-endian length, QEMU's
   `-netdev stream` framing (compatible with gvisor-tap-vsock and passt); one
-  switch at a time. `platform::vnet` handles the virtio-net header.
+  switch at a time: one that connects while another is there waits its turn,
+  and what it sent reaches the guest once the other leaves. `platform::vnet`
+  handles the virtio-net header.

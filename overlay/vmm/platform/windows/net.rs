@@ -8,9 +8,11 @@
 //! `-netdev stream`, which gvisor-tap-vsock and passt also speak. The
 //! virtio-net header is handled by [`vnet`].
 //!
-//! - One switch is connected at a time. When it leaves, the next one that
-//!   connects takes its place; one that connects while another is there is
-//!   refused (closed at once).
+//! - One switch is connected at a time. One that connects while another is
+//!   there waits in the listener's queue, and takes its place when it
+//!   leaves; what it sent meanwhile reaches the guest then. So no frame a
+//!   switch sent is lost to the order in which switches came and went, as
+//!   on a TAP, where every host-side writer's frames reach the guest.
 //! - Frames the guest sends while no switch is connected are dropped, as on
 //!   a link without a peer.
 //! - The guest's frames are never sent in part: a frame the connection
@@ -113,19 +115,22 @@ impl Endpoint {
         })
     }
 
-    /// Takes a waiting switch if none is connected; refuses others.
+    /// Takes the first waiting switch if none is connected. Later ones stay
+    /// in the listener's queue until this one leaves: one taken in the same
+    /// call would be closed with whatever it had sent unread, though the
+    /// one before it may have left already, its end not read yet (a switch
+    /// that sends and closes, then the next that connects and sends, before
+    /// a read: two frames, and the second was lost).
     fn accept(&mut self) {
-        loop {
-            match self.listener.accept() {
-                Ok((conn, _)) if self.conn.is_none() => {
-                    if conn.set_nonblocking(true).is_ok() {
-                        self.redirect.set(Some(conn.as_raw_fd()));
-                        self.conn = Some(conn);
-                    }
-                }
-                // Someone else is connected: dropped, which closes it.
-                Ok(_) => {}
-                Err(_) => return,
+        while self.conn.is_none() {
+            let Ok((conn, _)) = self.listener.accept() else {
+                return;
+            };
+            // A connection that cannot be made non-blocking is dropped; the
+            // next waiting one is tried.
+            if conn.set_nonblocking(true).is_ok() {
+                self.redirect.set(Some(conn.as_raw_fd()));
+                self.conn = Some(conn);
             }
         }
     }
@@ -553,6 +558,23 @@ mod tests {
         assert!(matches!(parse_name("%s"), Err(TapError::InvalidIfname)));
     }
 
+    /// `tap.read_iovec`, retried for up to 0.5 s while it finds nothing.
+    fn read_frame(tap: &mut Tap, rx: &mut [u8]) -> io::Result<usize> {
+        let mut iov = [libc::iovec {
+            iov_base: rx.as_mut_ptr().cast(),
+            iov_len: rx.len(),
+        }];
+        let mut n = Err(io::Error::from_raw_os_error(libc::EAGAIN));
+        for _ in 0..100 {
+            n = tap.read_iovec(&mut iov);
+            if n.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        n
+    }
+
     #[test]
     fn test_one_switch_at_a_time() {
         let mut tap = Tap::open_named("fcsw%d").unwrap();
@@ -561,27 +583,48 @@ mod tests {
         let mut out = vec![0u8; 12];
         out.extend_from_slice(&frame(100));
         tap.write_iovec(&IoVecBuffer::from(out.as_slice())).unwrap();
+        // b connects while a is there, and sends: it waits.
         let b = TapTrafficSimulator::new(if_index(&tap));
+        b.push_tx_packet(&frame(70));
         tap.write_iovec(&IoVecBuffer::from(out.as_slice())).unwrap();
         let mut buf = vec![0u8; 200];
         assert!(a.pop_rx_packet(&mut buf));
         assert_eq!(&buf[..100], &out[12..]);
         assert!(a.pop_rx_packet(&mut buf));
-        assert!(!b.pop_rx_packet(&mut buf), "refused");
-
-        // The switch leaves; the next one takes its place.
-        drop(a);
+        assert!(!b.pop_rx_packet(&mut buf), "the guest's frames go to the connected switch only");
         let mut rx = vec![0u8; 200];
         let mut iov = [libc::iovec {
             iov_base: rx.as_mut_ptr().cast(),
             iov_len: rx.len(),
         }];
         let err = tap.read_iovec(&mut iov).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EAGAIN), "b's frame waits while a is there");
+
+        // a leaves; b takes its place, and what it sent comes in.
+        drop(a);
+        assert_eq!(read_frame(&mut tap, &mut rx).unwrap(), 12 + 70);
+        assert_eq!(&rx[12..82], &frame(70)[..]);
+        tap.write_iovec(&IoVecBuffer::from(out.as_slice())).unwrap();
+        assert!(b.pop_rx_packet(&mut buf));
+        assert_eq!(&buf[..100], &out[12..]);
+    }
+
+    #[test]
+    fn test_switches_that_come_and_go_lose_no_frame() {
+        // What upstream's rx tests do (inject_tap_tx_frame): each frame
+        // through a switch of its own that sends it and leaves, all before
+        // the interface reads. A TAP gives the guest every one.
+        let mut tap = Tap::open_named("fcseq%d").unwrap();
+        for len in [200, 300, 60] {
+            TapTrafficSimulator::new(if_index(&tap)).push_tx_packet(&frame(len));
+        }
+        let mut rx = vec![0u8; 1000];
+        for len in [200, 300, 60] {
+            assert_eq!(read_frame(&mut tap, &mut rx).unwrap(), vnet::MIN_HDR_LEN + len);
+            assert_eq!(&rx[vnet::MIN_HDR_LEN..vnet::MIN_HDR_LEN + len], &frame(len)[..]);
+        }
+        let err = read_frame(&mut tap, &mut rx).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EAGAIN));
-        let c = TapTrafficSimulator::new(if_index(&tap));
-        c.push_tx_packet(&frame(60));
-        assert_eq!(tap.read_iovec(&mut iov).unwrap(), 12 + 60);
-        assert_eq!(&rx[12..72], &frame(60)[..]);
     }
 
     #[test]

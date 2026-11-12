@@ -55,8 +55,12 @@ error-text vmm vmm_config::net::tests::test_insert_error_cases
 # vmm: to root-cause before any fix.
 bug vmm devices::virtio::net::device::tests::test_rx_multiple_frames
 bug vmm devices::virtio::net::device::tests::test_rx_multiple_frames_mrg
-#   (2 frames injected into the tap, 1 counted in 100 ms: rx_packets_count 1, not 2;
-#   a real rx difference until shown otherwise)
+#   (2 frames injected into the tap, 1 counted in 100 ms: rx_packets_count 1, not 2.
+#   Cause, from code: inject_tap_tx_frame connects a switch per frame, which
+#   sends and leaves; the endpoint's accept took the first and closed the
+#   second, frame and all. Fixed in platform/windows/net.rs (later switches
+#   wait their turn; test_switches_that_come_and_go_lose_no_frame); the
+#   entries go once the fix has run)
 bug vmm devices::virtio::net::device::tests::test_tx_tap_failure
 bug vmm devices::virtio::net::device::tests::test_read_tap_fail_event_handler
 #   (the test closes the tap's fd to make its next write/read fail; tap_write_fails /
@@ -70,7 +74,11 @@ bug vmm devices::virtio::block::vhost_user::device::tests::test_new_no_features
 bug vmm devices::virtio::vhost_user::tests::test_new
 #   (test_utils::create_tmp_socket: libc::bind of an AF_UNIX path in a TempDir fails)
 bug vmm platform::windows::net::tests::test_one_switch_at_a_time
-#   (wick's own test: unwrap of WSAEWOULDBLOCK, 10035, at net.rs:583)
+#   (wick's own test: unwrap of WSAEWOULDBLOCK, 10035, at net.rs:583. Cause, from
+#   code: a switch connecting while another was there was not refused, as the
+#   test expected, but accepted once the first left, so c's frame was never
+#   read; the same accept as test_rx_multiple_frames. The test now checks
+#   that a later switch waits its turn; the entry goes once it has run)
 
 # Other packages.
 no-whp cpu-template-helper template::dump::tests::test_dump
