@@ -40,9 +40,14 @@ fn wfi_time_fn() -> Option<WfiTime> {
     (f != 0).then(|| unsafe { std::mem::transmute::<usize, WfiTime>(f) })
 }
 
-/// Tests force the path of a macOS without the WFI figure.
 #[cfg(test)]
-pub(crate) static FORCE_UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// Tests force the path of a macOS without the WFI figure, on their
+    /// own thread only: another test in the same process (cargo's
+    /// threads, or check-unit-tests.py's one thread after it) keeps the
+    /// host's answer.
+    pub(crate) static FORCE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Whether PV time is offered: only where the vCPU's steal can be told
 /// from its guest idling. With the framework's GIC a guest's `WFI` waits
@@ -57,7 +62,7 @@ pub(crate) static FORCE_UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::
 /// gives the guest none (builder.rs: "steal time will not be reported").
 pub(crate) fn supported() -> bool {
     #[cfg(test)]
-    if FORCE_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+    if FORCE_UNSUPPORTED.with(std::cell::Cell::get) {
         return false;
     }
     wfi_time_fn().is_some()
@@ -534,6 +539,69 @@ mod tests {
     }
 
     #[test]
+    fn test_the_attribute_is_enxio_where_pv_time_is_not_offered() {
+        // No VM needed: KVM_HAS_DEVICE_ATTR and KVM_SET_DEVICE_ATTR of PV
+        // time's IPA are answered from the host's capability before any
+        // vCPU is looked at. Where the framework has no WFI figure (macOS
+        // 15 and 26, CI's runners among them) both are ENXIO, as on a KVM
+        // that cannot account steal (pvtime.c kvm_arm_pvtime_has_attr,
+        // kvm_arm_pvtime_set_attr); where it has one (macOS 27) the
+        // attribute exists, and forcing the other path on this thread
+        // gives ENXIO there too.
+        let ipa = ST;
+        let a = attr(PVTIME_CTRL, PVTIME_IPA, &ipa);
+        let errno = |r: crate::Result<()>| r.map_err(|e| e.errno()).err();
+        let set = |a: &kvm_device_attr| super::requested_ipa(a).map(|_| ());
+        let offered = super::wfi_time_fn().is_some();
+        if offered {
+            assert_eq!(errno(super::has_attr(&a)), None);
+            assert_eq!(errno(set(&a)), None);
+        }
+        {
+            let _forced = Forced::new();
+            assert!(!super::supported());
+            assert_eq!(errno(super::has_attr(&a)), Some(libc::ENXIO));
+            assert_eq!(errno(set(&a)), Some(libc::ENXIO));
+        }
+        assert_eq!(super::supported(), offered);
+        println!("the framework's WFI figure: {}", if offered { "present (macOS 27)" } else { "absent" });
+    }
+
+    /// The path of a macOS without the WFI figure, on this thread, until
+    /// dropped (a test that runs after this one on the same thread, as
+    /// libtest may with one test thread, keeps the host's answer).
+    struct Forced;
+
+    impl Forced {
+        fn new() -> Self {
+            super::FORCE_UNSUPPORTED.with(|f| f.set(true));
+            Forced
+        }
+    }
+
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            super::FORCE_UNSUPPORTED.with(|f| f.set(false));
+        }
+    }
+
+    /// Makes a VM and a vCPU (so that a host without Hypervisor.framework
+    /// fails here, as every test that needs one does); where PV time is
+    /// not offered, checks that its attribute is refused (ENXIO) and says
+    /// so. Whether PV time is offered.
+    fn offered_or_refused() -> bool {
+        let (vm, _) = vm_with_code(&[0x1400_0000], 0);
+        let vcpu = new_vcpu(&vm, 0);
+        if super::supported() {
+            return true;
+        }
+        let e = vcpu.set_device_attr(&attr(PVTIME_CTRL, PVTIME_IPA, &ST)).map_err(|e| e.errno()).err();
+        assert_eq!(e, Some(libc::ENXIO));
+        println!("PV time is not offered on this macOS (no hv_vcpu_get_wait_for_interrupt_time): its attribute is ENXIO");
+        false
+    }
+
+    #[test]
     fn test_pvtime_attribute_as_on_kvm() {
         // KVM's KVM_ARM_VCPU_PVTIME_CTRL (arch/arm64/kvm/pvtime.c
         // kvm_arm_pvtime_has_attr/set_attr): the IPA attribute exists;
@@ -541,6 +609,9 @@ mod tests {
         // vCPU (a reset by KVM_ARM_VCPU_INIT keeps it: only vCPU creation
         // clears it, arm.c kvm_arch_vcpu_create -> kvm_arm_pvtime_vcpu_init);
         // any other attribute or group is ENXIO.
+        if !offered_or_refused() {
+            return;
+        }
         let (vm, _) = vm_with_code(&[0x1400_0000], 0);
         let vcpu = new_vcpu(&vm, 0);
         let errno = |r: crate::Result<()>| r.map_err(|e| e.errno()).err();
@@ -608,6 +679,9 @@ mod tests {
         //   x0 = 0xc5000021;                  hvc #0; str x0, [x9]
         //   x0 = 0x85000021;                  hvc #0; str x0, [x9]
         //   b .
+        if !offered_or_refused() {
+            return;
+        }
         let code = [
             0xd280_0020, 0xf2b0_0000, 0xd280_0401, 0xf2b8_a001, 0xd400_0002, 0xf900_0120,
             0xd280_0400, 0xf2b8_a000, 0xd280_0421, 0xf2b8_a001, 0xd400_0002, 0xf900_0120,
@@ -642,7 +716,7 @@ mod tests {
         // (pvtime.c kvm_arm_pvtime_supported): the attribute is ENXIO and
         // the guest's calls find no structure. SMCCC_ARCH_FEATURES of
         // PV_TIME_FEATURES stays SUCCESS, as KVM's bitmap answers it.
-        super::FORCE_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _forced = Forced::new();
         let code = [
             0xd280_0020, 0xf2b0_0000, 0xd280_0401, 0xf2b8_a001, 0xd400_0002, 0xf900_0120,
             0xd280_0400, 0xf2b8_a000, 0xd280_0421, 0xf2b8_a001, 0xd400_0002, 0xf900_0120,
@@ -763,8 +837,7 @@ mod tests {
         // the call goes on. Under 2 hogs per CPU the thread loses a large
         // part of its time (measured: 30 to 70%, test_steal_time_is_what_
         // the_host_kept_from_the_vcpu).
-        if !super::supported() {
-            println!("PV time is not offered on this macOS (no hv_vcpu_get_wait_for_interrupt_time)");
+        if !offered_or_refused() {
             return;
         }
         let ncpu = std::thread::available_parallelism().unwrap().get();
@@ -779,8 +852,7 @@ mod tests {
         // A guest idle in WFI waits inside the framework, its thread
         // blocked, not runnable: no time is stolen from it, hogs or not, and
         // the kicker leaves it there.
-        if !super::supported() {
-            println!("PV time is not offered on this macOS (no hv_vcpu_get_wait_for_interrupt_time)");
+        if !offered_or_refused() {
             return;
         }
         let ncpu = std::thread::available_parallelism().unwrap().get();
@@ -798,8 +870,7 @@ mod tests {
         // thread is in run() (Steal::running, under the vCPU's lock), so
         // none of this gives it a stale thread port or a destroyed vCPU; its
         // thread is joined with the VM, holding the last reference to it.
-        if !super::supported() {
-            println!("PV time is not offered on this macOS (no hv_vcpu_get_wait_for_interrupt_time)");
+        if !offered_or_refused() {
             return;
         }
         let ncpu = std::thread::available_parallelism().unwrap().get();
@@ -955,8 +1026,7 @@ mod tests {
         // WFI time, which also counts the framework's work as lost, so the
         // guest's figure is at most that and at least that less the CPU
         // time the thread spent outside the guest.
-        if !super::supported() {
-            println!("PV time is not offered on this macOS (no hv_vcpu_get_wait_for_interrupt_time)");
+        if !offered_or_refused() {
             return;
         }
         let run = std::time::Duration::from_millis(1000);

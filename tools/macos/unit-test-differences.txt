@@ -38,8 +38,11 @@
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
 #   cpu-template-helper: 29 tests; 23 pass, 6 fail (4 no-hvf, 2 below).
-#   compat-kvm-ioctls: 56 tests; 23 pass, 33 fail, all no-hvf (Error(1) at
-#   hv_vm_create; counted again with the guest-debug tests, and with the
+#   compat-kvm-ioctls: 64 tests; 24 pass, 40 fail, all no-hvf (Error(1) at
+#   hv_vm_create; counted again with the guest-debug tests, with PV time's
+#   (the attribute's refusal where PV time is not offered is checked
+#   without a VM: test_the_attribute_is_enxio_where_pv_time_is_not_offered,
+#   which passes on the runners, macOS 26), and with the
 #   vCPU thread's latency tier: test_a_wfi_ends_when_its_timer_is_due
 #   fails on a runner before it makes its VM, at its own requirement of a
 #   foreground process, since the runners' processes are coalesced as
@@ -81,6 +84,13 @@ no-hvf compat-kvm-ioctls hvf::debug::tests::test_set_guest_debug_rejects_unknown
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_single_step_exits_after_one_instruction
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_the_guests_os_lock_blocks_its_own_breakpoints
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_watchpoint_exit_gives_the_address
+no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_a_vcpu_kept_off_its_cpu_has_its_steal_updated_while_it_runs
+no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_pv_time_calls_as_on_kvm
+no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_pv_time_is_not_offered_without_the_wfi_figure
+no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_pvtime_attribute_as_on_kvm
+no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_steal_time_is_what_the_host_kept_from_the_vcpu
+no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_the_kicker_ends_with_its_vm_and_outlives_paused_vcpus
+no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_the_kicker_leaves_a_waiting_vcpu_alone
 no-hvf compat-kvm-ioctls hvf::vcpu::tests::test_kvm_ptp_counters
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_new_vcpu_has_kvms_reset_values
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_wfi_ends_when_its_timer_is_due
