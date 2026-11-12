@@ -136,6 +136,18 @@ upstream Firecracker and its jailer.
   rule still limits Firecracker to Unix sockets, and the mitigation profile has no counterpart of that rule yet
   (docs/PORTING.md, row 2). `--netns` needs an elevated jailer, as `setns` needs root. Without the
   jailer, Windows confinement is the mitigation profile only (no jail directory, token or Job Object).
+- **Windows jailer: the jail reads what every process of the session may read.** On Linux the chroot leaves the
+  host's files out of reach. A Windows jail is a drive letter of its own: every other path stays reachable, and only
+  the jail's token confines it. Its restricting SIDs are the jail's own SID and four groups
+  every process of the session has: Everyone, Users, Authenticated Users and Interactive
+  (overlay/jailer/platform/windows/mod.rs, `RESTRICTING_SIDS`). A restricted token is granted only what both its
+  enabled SIDs and its restricting SIDs are granted (Microsoft, CreateRestrictedToken), so a jailed Firecracker can
+  read what those groups may read: the Windows directory, Program Files, and files under ProgramData,
+  `C:\Users\Public` or a data volume, and HKLM registry keys, that grant one of them read. Its integrity level,
+  below medium, keeps it from writing them, and the user's own files stay denied (`jailer-test.ps1 isolation`).
+  Not done yet: ALL APPLICATION PACKAGES, what an AppContainer may read (the Windows directory and Program Files),
+  in place of the four groups, once measured, since whether WHP and Winsock accept such a token is not known; then
+  a less-privileged AppContainer for the API process, which needs no WHP.
 - **Windows jailer: `memory.max` does not bound memory in sections.** The jailer sets `memory.max` as a Job Object
   memory limit, which charges private memory only. Sections (pagefile-backed, or of a file: wick's memfd is a
   temporary file's) are not charged to the job, and the jail's token does not stop a process making them: under
