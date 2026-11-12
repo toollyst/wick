@@ -268,7 +268,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 
 | Feature | macOS | Windows |
 | --- | --- | --- |
-| virtio-net | 🟡 the host side is a Unix datagram endpoint, or vmnet as root, instead of a TAP (`boot-test net`, `boot-test vmnet`) | 🟡 the host side is a Unix stream endpoint with QEMU's stream framing, instead of a TAP (`boot-test.ps1 net`) |
+| virtio-net | 🟡 the host side is a Unix datagram endpoint, or vmnet (root for bridged mode and before macOS 26), instead of a TAP (`boot-test net`, `boot-test vmnet`) | 🟡 the host side is a Unix stream endpoint with QEMU's stream framing, instead of a TAP (`boot-test.ps1 net`) |
 | MTU advertised to the guest | 🟢 `test_tap_mtu_advertised_to_guest` | 🟢 `test_tap_mtu_advertised_to_guest` |
 | Checksum, TSO, UFO offloads | 🟡 done in user space, as TUN's header (fuzz `vnet_offload`); the upstream test needs a host program the harness cannot run (`test_tap_offload` [bug]) | 🟡 the same code; untested end to end: the test needs a host program the harness cannot run yet (`test_tap_offload` [bug]) |
 | Guest changes its MAC | ❔ the test needs a host program in the network (`test_net_change_mac_address` [bug]) | ❔ the same (`test_net_change_mac_address` [bug]) |
@@ -276,7 +276,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | Multi-queue TAP refused | ⚪ no TAP devices (`test_multi_queue_unsupported` [impossible]) | ⚪ no TAP devices (`test_multi_queue_unsupported` [impossible]) |
 | rx/tx rate limiters | 🟢 the API takes them (`test_rate_limiters_api_config`); set with `PATCH` on a running device at 1 MiB/s, each direction runs at 0.5 to 1.25 times the limit (measured 0.99 and 1.02 MiB/s), and at three times it or more without one (`boot-test net`) | ❔ the API takes them (`test_rate_limiters_api_config`); throttling: written, not yet run on a WHP machine, as on macOS (`boot-test.ps1 net`) |
 | Net hotplug | 🟡 any free endpoint name opens, so plugging a device nobody prepared succeeds, where Linux refuses it (`test_hotplug_net` [row-6]) | 🟡 refused, as on Linux, with Windows' error (`ERROR_BUSY`, 170) (`test_hotplug_net` [error-text]) |
-| vmnet (macOS' own network) | 🟢 `boot-test vmnet` (root) | ⚪ |
+| vmnet (macOS' own network) | 🟢 `boot-test vmnet` (root before macOS 26) | ⚪ |
 
 ### vsock
 

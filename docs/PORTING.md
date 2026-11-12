@@ -32,7 +32,7 @@ and the [roadmap](ROADMAP.md) say what is in place. This page says what each bac
 | --- | --- | --- | --- | --- |
 | `async_io::AsyncIo` | io_uring | worker threads, `F_FULLFSYNC`; io_uring's submission and completion model, restrictions and queue limits (`macos/async_io.rs`) | `platform::async_io::tests`, `boot-test block` | the same file as macOS, on the compatibility `libc` |
 | `fs` (`keep_holes`, `SparseWriter`, `StatIds`) | ext4/tmpfs holes | `SEEK_HOLE` recorded, holes punched again with `F_PUNCHHOLE` after the flush (APFS fills them) | `platform::fs::tests`, `boot-test diff` | the same file as macOS; NTFS's 64 KiB sparse units are checked after each restore |
-| `net::TapDevice` | TAP | vmnet (`vmnet.rs`, root) or a Unix datagram endpoint (`net.rs`) | `platform::net::tests`, `boot-test net`, `boot-test vmnet` | a Unix stream endpoint, QEMU `-netdev stream` framing (`windows/net.rs`) |
+| `net::TapDevice` | TAP | vmnet (`vmnet.rs`; root for bridged mode, and before macOS 26) or a Unix datagram endpoint (`net.rs`) | `platform::net::tests`, `boot-test net`, `boot-test vmnet` | a Unix stream endpoint, QEMU `-netdev stream` framing (`windows/net.rs`) |
 | `vnet` (TUN's virtio-net header) | the kernel | shared, OS-independent: checksum, TSO, UFO | `platform::vnet::tests`, fuzz `vnet_segment`, `vnet_offload` | shared |
 
 ## The jailer's primitives (`overlay/jailer/platform`)
@@ -92,7 +92,7 @@ exemption.
 | Stage | macOS (`tools/macos/boot-test.sh`) | Windows (`tools/windows/boot-test.ps1`) |
 | --- | --- | --- |
 | `boot`, `smp`, `block`, `vsock`, `net` | yes | yes |
-| `vmnet` | yes (root) | no counterpart (vmnet is macOS's) |
+| `vmnet` | yes (root before macOS 26) | no counterpart (vmnet is macOS's) |
 | `snapshot`, `diff`, `uffd`, `pci`, `restores`, `vhost-user` | yes | yes |
 | `devices`: logger, metrics, MMDS, balloon, entropy, a rate limiter | yes | yes (`boot-test.ps1 devices`, row 15) |
 | `balloon`: a 150 MiB balloon cycle on a guest restored from a memory file, then on a booted guest | yes: the guest keeps the pages the host and the devices use (O_DIRECT reads of the drive match the file 6 of 6 times after each cycle; before the fix 6 of 6 read stale data, as Hypervisor.framework had kept the pages a `MAP_FIXED` discard replaced), and the pages the balloon took leave the VMM's footprint (the jailer's limit is on it) and are charged again when the guest writes them (measured 263 → 114 → 270 MiB; `test_madvise_dontneed_replaces_guest_pages`: 66 → 2 → 66 MiB for 64 MiB of guest pages) | written, not yet run on a WHP machine: the same cycles, with the commit charge (what the jail's `memory.max` limits, row 15) for the footprint (`boot-test.ps1 balloon`) |

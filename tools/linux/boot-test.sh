@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Boots upstream Firecracker's x86_64 CI guest with wick on Linux (KVM) and
-# checks, stage by stage, the same as tools/windows/boot-test.ps1: boot to
+# checks, stage by stage, what tools/windows/boot-test.ps1's first stages do: boot to
 # user space, serial output and input (stdin is a pipe), SMP start-up,
 # reboot, the Async block engine (io_uring) and vsock.
 #

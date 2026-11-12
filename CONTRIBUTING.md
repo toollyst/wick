@@ -30,7 +30,8 @@ Binaries that create a VM must be signed with the Hypervisor.framework
 entitlement: use `tools/macos/run.sh` to run Firecracker and
 `tools/macos/test.sh` for tests. `tools/macos/boot-test.sh` runs scenario
 tests against upstream's aarch64 CI guest (boot, SMP, block, vsock,
-networking, snapshots, userfaultfd, PCI, vhost-user); run it before sending a
+networking, snapshots, userfaultfd, PCI, vhost-user, the devices, the command
+line, memory hotplug and more); run it before sending a
 change to the macOS backends. `tools/macos/jailer-test.sh` (it asks for sudo)
 starts Firecracker through the jailer and checks the jail from outside; run it
 before a change to the jailer's macOS backend or the Seatbelt profile. The macOS sandbox
@@ -44,9 +45,9 @@ Natively on Windows (MSVC), `cargo build -p firecracker` runs in a Visual
 Studio developer shell (`vcvars64.bat`) with [NASM](https://www.nasm.us/) on
 `PATH` for aws-lc-sys (debug builds can set `AWS_LC_SYS_NO_ASM=1` instead).
 On a Windows machine with the Windows Hypervisor Platform feature,
-`tools/windows/boot-test.ps1` boots upstream's x86_64 CI guest and checks boot,
-serial I/O, SMP, Sync and Async block devices, vsock and virtio-net
-(`tools/windows/README.md` has the steps); `tools/windows/winprobe.c`
+`tools/windows/boot-test.ps1` boots upstream's x86_64 CI guest and runs the
+macOS boot test's stages (`tools/windows/README.md` has the steps), and
+`tools/windows/jailer-test.ps1` the jailer's; `tools/windows/winprobe.c`
 measures the host mechanisms the sandbox and jailer backends use.
 
 Editors: `.vscode/settings.json` points rust-analyzer at
@@ -90,7 +91,7 @@ discard local commits on `wick` unless given `--force`.
   requested. An error is acceptable only where the hardware or OS physically
   cannot do it, and the roadmap's status table says so.
 - Test-only shortcuts live in `cfg(test)` or in `tools/`.
-- A table cell in README.md, SECURITY.md or docs/ROADMAP.md that says a
+- A table cell in README.md, SECURITY.md, docs/ROADMAP.md or docs/PORTING.md that says a
   control is "in place", "verified" or "measured" names, in backticks, the
   test that checks it (`jailer-test cpu`, `test_sandbox_restricts_child`).
   `tools/check-claims.py` enforces it on CI. A probe that once showed
@@ -244,8 +245,8 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   runs without root) is `tools/macos/integration/`. Without arguments it runs
   the functional and security suites as the user; `--jailer` runs them as root
   with wick's jailer, as upstream's CI does on Linux.
-- `tools/linux/boot-test.sh` is `tools/windows/boot-test.ps1` for Linux: it
-  boots upstream's CI guest with the musl release binary (seccomp filters on
+- `tools/linux/boot-test.sh` runs the first stages of
+  `tools/windows/boot-test.ps1` on Linux: it boots upstream's CI guest with the musl release binary (seccomp filters on
   every thread) and checks serial I/O, SMP, the Async (io_uring) block engine
   and vsock.
 - `tools/linux/jailer-cgroup-check.py` measures, as root in the Linux CI, what

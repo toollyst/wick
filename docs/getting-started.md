@@ -22,7 +22,7 @@ tools/macos/run.sh --build-only --release
 ```
 
 `tools/macos/run.sh` builds `firecracker`, signs it ad hoc with the Hypervisor.framework entitlement
-(`com.apple.security.hypervisor`) and, unless given `--build-only`, runs it with the arguments after `--`. The
+(`com.apple.security.hypervisor`, and `com.apple.security.virtualization` for vmnet) and, unless given `--build-only`, runs it with the arguments after `--`. The
 binary is at `lib/firecracker/build/cargo_target/release/firecracker`; if you rebuild with plain `cargo`, run
 `run.sh` again (or `codesign` yourself) so it keeps the entitlement.
 
@@ -155,7 +155,7 @@ example. In the guest, give `eth0` another address on that network:
 # ping -c 3 192.168.64.1
 ```
 
-Older macOS releases need root for vmnet.framework; a Unix datagram endpoint never does.
+Bridged mode, and every mode before macOS 26, needs root for vmnet.framework; a Unix datagram endpoint never does.
 
 ## 6. Run it jailed (macOS)
 
@@ -194,8 +194,9 @@ network; a jail given its own reaches no other's. [SECURITY.md](../SECURITY.md) 
 wick on Windows uses the Windows Hypervisor Platform and x86_64 guests. Turn the feature on first (in
 `optionalfeatures.exe`, or as administrator: `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`).
 
-The fastest way to try it is the boot test, which downloads upstream's x86_64 CI guest and checks boot, serial I/O,
-SMP, Sync and Async block devices, vsock and virtio-net stage by stage
+The fastest way to try it is the boot test, which downloads upstream's x86_64 CI guest and checks, stage by stage,
+what the macOS boot test checks (boot, serial I/O, SMP, block devices, vsock, virtio-net, snapshots, uffd, PCI,
+vhost-user, the devices, the command line and more)
 ([tools/windows/README.md](../tools/windows/README.md) has the steps):
 
 ```powershell
@@ -206,8 +207,9 @@ It uses `firecracker.exe` next to the script, or the one under `lib\firecracker\
 natively built `firecracker.exe` with the script as a workflow artifact on every run. Network interfaces on Windows
 are Unix stream endpoints that a host switch such as gvisor-tap-vsock or passt connects to.
 
-The Windows build has not booted a guest on real hardware yet, so the results of a run are genuinely useful:
-please [open an issue](https://github.com/toollyst/wick/issues/new/choose) with the zip the script writes.
+The Windows build has booted guests on one Windows 11 PC so far ([PORTING.md](PORTING.md) lists the stages that
+have run there), so the results of a run on other hardware are genuinely useful: please [open an issue](https://github.com/toollyst/wick/issues/new/choose)
+with the zip the script writes.
 
 ## When something goes wrong
 
