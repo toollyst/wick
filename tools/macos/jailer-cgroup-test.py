@@ -464,6 +464,35 @@ def stage_freeze(ctx, jt):
         finally:
             vm.kill()
 
+    def case_many_starts():
+        # Starts without a freezer option, many of each kind: a start that
+        # fails only now and then (as --daemonize and --new-pid-ns starts
+        # did) shows its rate, and with --new-pid-ns its error (the forked
+        # jailer keeps the log as its standard error; --daemonize gives it
+        # /dev/null).
+        tally, errors = {}, []
+        for i in range(30):
+            mode = ("plain", "daemonize", "new-pid-ns")[i % 3]
+            kw = {"daemonize": {"daemonize": True}, "new-pid-ns": {"new_pid_ns": True}}.get(mode, {})
+            name = f"fz-many{i}"
+            p, jd = fz.start(name, [], **kw)
+            deadline = time.time() + 5
+            while not (fz.has_pid(jd) and fz.started(jd)) and time.time() < deadline:
+                time.sleep(0.02)
+            ok = fz.has_pid(jd) and fz.started(jd)
+            tally.setdefault(mode, [0, 0])[0 if ok else 1] += 1
+            if ok:
+                pid = fz.pid(jd)
+                os.kill(pid, signal.SIGKILL)
+                p.wait(10)
+            else:
+                errors.append(f"{name} ({mode})")
+                diagnose(fz, name, jd, p)
+                subprocess.run(["pkill", "-9", "-f", "--", f"--id {name} "], check=False)
+                p.wait(10)
+        print(f"   starts that ran / failed: {tally}", flush=True)
+        check(not errors, f"starts failed: {errors} of {tally}")
+
     cases = [
         ("v1", "freezer.state: frozen (no CPU time) and thawed, the same value twice a no-op, the jail's uid "
                "cannot thaw it, an invalid value restored, SIGTERM to the supervisor ignored, SIGKILL ends a "
@@ -485,6 +514,8 @@ def stage_freeze(ctx, jt):
         ("start-pidns", "FROZEN at the start with --new-pid-ns holds the jailer until THAWED",
          lambda: frozen_at_start("fz-start-pidns", new_pid_ns=True)),
         ("firecracker", "Firecracker's API silent while frozen, answering once thawed", case_firecracker),
+        ("many-starts", "30 starts without a freezer option: plain, --daemonize, --new-pid-ns",
+         case_many_starts),
     ]
     results = []
     for key, what, run in cases:
