@@ -1,0 +1,35 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Upstream integration tests that pass on Linux
+# (tools/macos/integration-linux-baseline.txt) and do not pass on Windows, each
+# with the reason. tools/windows/compare-integration-tests.py fails on any
+# other difference, and on an entry whose tests pass.
+#
+# Format: <kind> <pytest node id, relative to tests/; a test function for all
+# its parameters, or a file>, below a comment that gives the reason. kind:
+#   row-N       a Linux feature Windows does not have yet: docs/PORTING.md row N
+#   error-text  the test matches the text of Linux's error (strerror and
+#               errno); Firecracker reports the host's, as on Linux: on
+#               Windows its code and its message, in the system's language.
+#               The API's answer is otherwise the same.
+#   impossible  the host cannot do it; the comment says why
+#   bug         a wick bug, to fix
+
+# "The kernel file cannot be opened: No such file or directory (os error 2)":
+# Windows says "The system cannot find the file specified. (os error 2)".
+error-text integration_tests/functional/test_api.py::test_api_put_update_pre_boot
+error-text integration_tests/functional/test_api.py::test_drive_patch
+
+# "Cannot create mmap region: Out of memory (os error 12)": Windows's is
+# ERROR_NOT_ENOUGH_MEMORY, 8. The limit itself holds: the test's prlimit is a
+# job's memory limit here (tools/windows/integration/resource.py), and the
+# mapping fails.
+error-text integration_tests/functional/test_api.py::test_api_machine_config
+
+# libseccomp's Python binding, which the test compiles Firecracker's filters
+# with, is Linux's: Windows has no seccomp, and no module to import. What a
+# jailed Firecracker may do is bounded by its token and its process
+# mitigations instead (docs/PORTING.md rows 1 and 2;
+# tools/windows/mitigation-audit.ps1).
+impossible integration_tests/security/test_seccomp_validate.py

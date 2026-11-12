@@ -17,8 +17,9 @@
 # Windows Filtering Platform filters).
 #
 # OUT (default build\integration-tests\<time>) gets the pytest JSON report
-# (test-report.json), pytest's output (pytest.log) and upstream's
-# test_results directory; summary.txt ends "N passed, M failed".
+# (test-report.json), pytest's output (pytest.log), upstream's test_results
+# directory and the comparison with Linux's results (comparison.md); the
+# script fails on a difference not in tools\windows\integration-test-differences.txt.
 # (The pytest arguments are one string: PowerShell would take "-x" or "-k" for its own.)
 param([string]$Out = '', [string]$Pytest = '')
 $ErrorActionPreference = 'Stop'
@@ -66,8 +67,14 @@ $env:TEMP = $env:TMP
 Remove-Item -Recurse -Force (Join-Path $Fc 'test_results') -ErrorAction SilentlyContinue
 Push-Location (Join-Path $Fc 'tests')
 try {
-    & $py -m pytest -p wick_windows --binary-dir $bin @PytestArgs 2>&1 | Tee-Object -FilePath (Join-Path $Out 'pytest.log')
-    $status = $LASTEXITCODE
+    # A module that imports what Windows lacks (seccomp) is one error, not the
+    # end of the session. The log in UTF-8 (Tee-Object writes UTF-16).
+    $log = New-Object IO.StreamWriter((Join-Path $Out 'pytest.log'), $false, (New-Object Text.UTF8Encoding $false))
+    try {
+        & $py -m pytest -p wick_windows --continue-on-collection-errors --binary-dir $bin @PytestArgs 2>&1 |
+            ForEach-Object { $line = "$_"; $log.WriteLine($line); $log.Flush(); $line }
+        $status = $LASTEXITCODE
+    } finally { $log.Close() }
 } finally {
     Pop-Location
     # Everything the session started runs from its bin directory or its root.
@@ -79,11 +86,14 @@ try {
 $results = Join-Path $Fc 'test_results'
 if (Test-Path $results) { Copy-Item -Recurse -Force $results (Join-Path $Out 'test_results') }
 $report = Join-Path $results 'test-report.json'
-if (Test-Path $report) {
-    Copy-Item $report (Join-Path $Out 'test-report.json')
-    $s = (Get-Content -Raw $report | ConvertFrom-Json).summary
-    "$([int]$s.passed) passed, $([int]$s.failed + [int]$s.error) failed, $([int]$s.skipped) skipped" | Set-Content (Join-Path $Out 'summary.txt')
-    Get-Content (Join-Path $Out 'summary.txt')
-}
-Write-Host "pytest exited with $status; results in $Out"
-exit $status
+if (Test-Path $report) { Copy-Item $report (Join-Path $Out 'test-report.json') }
+# Against Linux's results (tools/windows/compare-integration-tests.py):
+# comparison.md, and summary.txt's "N passed, M failed" counts the tests that
+# agree with Linux and the differences not listed with a reason.
+$full = if ($Pytest) { @() } else { @('--full') }
+& $py -I (Join-Path $Root 'tools\windows\compare-integration-tests.py') $Out @full `
+    --summary (Join-Path $Out 'comparison.md') --summary-txt (Join-Path $Out 'summary.txt') | Out-Null
+$compared = $LASTEXITCODE
+if (Test-Path (Join-Path $Out 'summary.txt')) { Get-Content (Join-Path $Out 'summary.txt') }
+Write-Host "pytest exited with $status; comparison with Linux: $(if ($compared -eq 0) { 'no unlisted difference' } else { 'differences, see comparison.md' }); results in $Out"
+exit $compared
