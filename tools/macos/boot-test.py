@@ -1307,6 +1307,71 @@ def stage_cli(ctx):
     return "; ".join(done)
 
 
+def stage_tools(ctx):
+    """rebase-snap and snapshot-editor's info-vmstate commands on snapshots of
+    a 2 vCPU guest."""
+    cfg = config(ctx, vcpus=2, machine={"track_dirty_pages": True})
+    vm = ctx.vm("tools1", [], cfg)
+    vm.shell()
+    vm.sh("A=before-$((6*7))")
+    _, bash_md5 = vm.sh("md5sum /usr/bin/bash")
+    base = os.path.join(ctx.out, "tools-base.mem")
+    diff = os.path.join(ctx.out, "tools-diff.mem")
+    full_state = os.path.join(ctx.out, "tools-full.state")
+    state = os.path.join(ctx.out, "tools-diff.state")
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    vm.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": full_state, "mem_file_path": base})
+    vm.api("PATCH", "/vm", {"state": "Resumed"})
+    vm.sh("B=second-$((7*7)); cat /usr/bin/* > /dev/null 2>&1; true")
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    vm.api("PUT", "/snapshot/create", {"snapshot_type": "Diff", "snapshot_path": state, "mem_file_path": diff})
+    vm.kill()
+
+    # snapshot-editor info-vmstate: the version, the vCPU states and the
+    # whole state (info.rs).
+    def editor(*args):
+        return subprocess.run([ctx.snapshot_editor, "info-vmstate", *args], capture_output=True, text=True)
+
+    r = editor("version", "--vmstate-path", state)
+    check(r.returncode == 0 and r.stdout.strip() == "v12.0.0", f"info-vmstate version: {r.returncode} {r.stdout!r} {r.stderr!r}")
+    r = editor("vcpu-states", "--vmstate-path", state)
+    check(r.returncode == 0, f"info-vmstate vcpu-states: {r.returncode} {r.stderr!r}")
+    vcpus = re.split(r"^vcpu (\d+):$", r.stdout, flags=re.M)[1:]
+    check([vcpus[i] for i in range(0, len(vcpus), 2)] == ["0", "1"], f"vcpu-states lists {vcpus[0::2]}")
+    for i in (0, 1):
+        body = vcpus[2 * i + 1]
+        check("kvm_mp_state: 0x0" in body and f"mpidr: {0x80000000 + i:#x}" in body,
+              f"vcpu {i}: {body.strip()[:200]!r}")
+        # KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | regs.pc: a kernel address.
+        pc = re.search(r"^0x6030000000100040 0x([0-9a-f]+)$", body, re.M)
+        check(pc and pc.group(1).startswith("ffff"), f"vcpu {i}: PC {pc and pc.group(1)}")
+    r = editor("vm-state", "--vmstate-path", state)
+    check(r.returncode == 0 and "mem_size_mib: 256" in r.stdout and r.stdout.count("kvm_mp_state:") == 2
+          and "device_states:" in r.stdout, f"info-vmstate vm-state: {r.returncode} {r.stdout[:300]!r} {r.stderr!r}")
+    r = editor("version", "--vmstate-path", ctx.kernel)
+    check(r.returncode != 0, f"info-vmstate version of a kernel image: {r.returncode} {r.stdout!r}")
+
+    # rebase-snap (deprecated for snapshot-editor edit-memory rebase): the
+    # diff's data regions written over the base; both tools give the same file.
+    other = os.path.join(ctx.out, "tools-base2.mem")
+    shutil.copyfile(base, other)
+    r = subprocess.run([ctx.rebase_snap, "--base-file", base, "--diff-file", diff], capture_output=True, text=True)
+    check(r.returncode == 0, f"rebase-snap: {r.returncode} {r.stderr.strip()}")
+    r = subprocess.run([ctx.snapshot_editor, "edit-memory", "rebase", "--memory-path", other, "--diff-path", diff],
+                       capture_output=True, text=True)
+    check(r.returncode == 0, f"snapshot-editor rebase: {r.returncode} {r.stderr.strip()}")
+    check(md5(base) == md5(other), "rebase-snap and snapshot-editor rebase give different memory files")
+    os.unlink(other)
+    vm = ctx.vm("tools2", [])
+    vm.api("PUT", "/snapshot/load", {"snapshot_path": state,
+                                     "mem_backend": {"backend_type": "File", "backend_path": base},
+                                     "resume_vm": True})
+    restored_checks(vm, bash_md5, None)
+    _, out = vm.sh("echo $A $B")
+    check(out == "before-42 second-49", f"after a rebase-snap restore: {out!r}")
+    vm.reboot()
+    return ("info-vmstate version v12.0.0, vcpu-states (2 vCPUs, mpidr, PC), vm-state; a non-snapshot refused; "
+            "rebase-snap equals snapshot-editor rebase and restores")
 
 
 STAGES = {
@@ -1327,6 +1392,7 @@ STAGES = {
     "restores": stage_restores,
     "api-process": stage_api_process,
     "cli": stage_cli,
+    "tools": stage_tools,
 }
 
 
@@ -1337,6 +1403,7 @@ class Context:
     def __init__(self, args):
         self.firecracker = args.firecracker
         self.snapshot_editor = args.snapshot_editor
+        self.rebase_snap = args.rebase_snap
         self.uffd_handler = args.uffd_handler
         self.vub = args.vhost_user_blk
         self.out = args.out
@@ -1398,6 +1465,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--firecracker", required=True)
     p.add_argument("--snapshot-editor", required=True)
+    p.add_argument("--rebase-snap", required=True)
     p.add_argument("--uffd-handler", required=True)
     p.add_argument("--vhost-user-blk", required=True)
     p.add_argument("--cache", required=True)
