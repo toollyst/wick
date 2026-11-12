@@ -6,13 +6,14 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
 #
 # `refuse`, `freeze`, `cpuset`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
 # and reads it); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
 # Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
-# fails, saying so, without it).
+# fails, saying so, without it). `bindlink` needs an elevated PowerShell and Windows 11
+# 24H2 or later (bindlink.dll; it fails, saying so, without it).
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build),
 # `examples\uffd_on_demand_handler.exe` for `uffd` and, for `vhost-user`,
@@ -24,7 +25,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'bindlink', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -1252,6 +1253,83 @@ function Stage-Boot {
         Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
         "a 2 vCPU microVM boots in the jail (WHP under the restricted token) and the jailer exits 0 with it"
     } finally { Stop-Jailed }
+}
+
+# Upstream's test_jailer_bind_mount_propagation on Windows: files bound into
+# the jail's root before the jailer starts are what the jailed Firecracker
+# opens at /vmlinux.bin and /rootfs.img, and the guest boots from them.
+# Linux's `mount --bind` is a bind link here (CreateBindLink, bindlink.dll,
+# from Windows 11 24H2; the API from build 25314): made by an administrator, as the mount needs
+# root, and seen by every process at that path, as a mount in the host's
+# namespace is (Windows has no mount namespace of the jail's own). The
+# backing files are copies under the stage's directory, so what the jailer
+# does to them through the links touches no guest asset. A bind link takes
+# the backing file's security for the virtual path (Microsoft, Bindlink API
+# overview), and the jailer sets the jail directory's DACL, which Windows
+# passes on to what the directory holds: the stage fails if a backing file's
+# security descriptor differs while the jail runs or after it, as Linux's
+# jailer leaves a bind-mounted file's owner and mode alone.
+Add-Type -Namespace WickJailerTest -Name Bind -MemberDefinition @'
+[DllImport("bindlink.dll", CharSet = CharSet.Unicode)] public static extern int CreateBindLink(string virtualPath, string backingPath, uint flags, uint exceptionCount, System.IntPtr exceptionPaths);
+[DllImport("bindlink.dll", CharSet = CharSet.Unicode)] public static extern int RemoveBindLink(string virtualPath);
+'@
+function Stage-Bindlink {
+    $dll = Join-Path $env:SystemRoot 'System32\bindlink.dll'
+    Check (Test-Path $dll) "this Windows (build $([Environment]::OSVersion.Version.Build)) has no bind links: no $dll (Microsoft: the Bindlink API is available from Windows 11 build 25314, and bind links from 24H2)"
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Check $elevated 'needs an elevated PowerShell: CreateBindLink is for administrators, as mount --bind is for root'
+    $base = New-Base 'bindlink'
+    $id = 'bind'
+    $backing = Join-Path $base 'backing'
+    New-Item -ItemType Directory -Force -Path $backing | Out-Null
+    $kernel = Join-Path $backing 'vmlinux'
+    $rootfs = Join-Path $backing 'rootfs'
+    Copy-Item (Join-Path $Assets 'vmlinux-6.1.188') $kernel
+    Copy-Item (Join-Path $Assets 'ubuntu-24.04.squashfs') $rootfs
+    $root = Join-Path $base "firecracker.exe\$id\root"
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    # As upstream's test: the mount points exist (touched) before the binds.
+    $links = [ordered]@{ (Join-Path $root 'vmlinux.bin') = $kernel; (Join-Path $root 'rootfs.img') = $rootfs }
+    $sddl = { ($links.Values | ForEach-Object { "$(Split-Path -Leaf $_): $((Get-Acl $_).Sddl)" }) -join '; ' }
+    $before = & $sddl
+    $made = @()
+    try {
+        foreach ($v in $links.Keys) {
+            New-Item -ItemType File -Force -Path $v | Out-Null
+            $hr = [WickJailerTest.Bind]::CreateBindLink($v, $links[$v], 0, 0, [IntPtr]::Zero)
+            Check ($hr -eq 0) ("CreateBindLink({0} -> {1}): HRESULT 0x{2:x8}" -f $v, $links[$v], $hr)
+            $made += $v
+        }
+        foreach ($v in $links.Keys) {
+            Check ((Get-Item $v).Length -eq (Get-Item $links[$v]).Length) "$v does not show its backing file before the jailer starts"
+        }
+        $cfg = [ordered]@{
+            'boot-source'    = [ordered]@{ kernel_image_path = '/vmlinux.bin'; boot_args = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd root=/dev/vda ro rootfstype=squashfs init=/bin/sh' }
+            'drives'         = @([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs.img'; is_root_device = $true; is_read_only = $true })
+            'machine-config' = [ordered]@{ vcpu_count = 2; mem_size_mib = 256 }
+        }
+        Set-Content -Encoding ASCII (Join-Path $root 'vm.json') ($cfg | ConvertTo-Json -Depth 5)
+        $line = (@('--id', $id, '--exec-file', "`"$Fc`"", '--uid', '0', '--gid', '0', '--chroot-base-dir', "`"$base`"", '--', '--no-api', '--config-file', '/vm.json')) -join ' '
+        $vm = [JailedVm]::new($Jailer, $line, (Join-Path $base "$id-console.txt"))
+        try {
+            Wait-Shell $vm
+            $out = $vm.Sh('echo $((6*7)) $(nproc)', 10)
+            Check ($out -eq '42 2') "guest: '$out'"
+            $during = & $sddl
+            $vm.Send('reboot -ff')
+            Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
+            Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
+        } finally { Stop-Jailed }
+        $after = & $sddl
+        # As on Linux, where the jailer leaves a bind-mounted file's owner and
+        # mode alone, the jail's setup must not change what the backing files
+        # allow (the jail's DACL, passed on through the links, would grant the
+        # jail access to files outside it).
+        Check ($during -eq $before -and $after -eq $before) "the guest booted, but the jail changed the backing files' security: before [$before] during [$during] after [$after]"
+        "the jailed guest booted from the kernel and root drive bound into its root before the jailer started (bind links); the backing files' security unchanged: $before"
+    } finally {
+        foreach ($v in $made) { [void][WickJailerTest.Bind]::RemoveBindLink($v) }
+    }
 }
 
 # docs/PORTING.md row 10: a jailed guest's memory on large pages. A token
