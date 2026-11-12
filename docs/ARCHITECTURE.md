@@ -45,7 +45,7 @@ Code that is new rather than a change to an upstream file lives outside the
 submodule. The overlay modules are declared from upstream's `vmm/src/lib.rs`
 with `#[path = "../../../../../overlay/vmm/..."]`, so they are part of the vmm
 crate (`crate::` paths work) while their files belong to wick. The patches
-therefore only change existing upstream files: 15 feature patches touching 62
+therefore only change existing upstream files: 40 feature patches touching 80
 files.
 
 ## Layers

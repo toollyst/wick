@@ -96,6 +96,20 @@ check)
         fi
     done < <(series)
 
+    # The documents that count the series say what it is: "N small patches
+    # (... in M files)" in README.md, "N feature patches touching M files"
+    # in docs/ARCHITECTURE.md.
+    n="$(series | wc -l | tr -d ' ')"
+    m="$("$0" list | wc -l | tr -d ' ')"
+    for doc in README.md docs/ARCHITECTURE.md; do
+        said="$(tr '\n' ' ' <"$WICK_ROOT/$doc" | grep -oE '[0-9]+ (small|feature) patches[^.]*[0-9]+ +files' | head -1 || true)"
+        [[ -n "$said" ]] || { echo "FAIL $doc no longer counts the patches and the files they change"; errors=$((errors + 1)); continue; }
+        if [[ "$said" != "$n "* || "$said" != *" $m files" && "$said" != *" $m  files" ]]; then
+            echo "FAIL $doc says \"$said\", but the series is $n patches changing $m files"
+            errors=$((errors + 1))
+        fi
+    done
+
     ((errors == 0)) || die "$errors problem(s) with patches/"
     echo "OK: $(series | wc -l | tr -d ' ') patches on upstream $base"
     ;;
