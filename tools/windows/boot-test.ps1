@@ -2917,7 +2917,7 @@ continue
 '@
     # By the socket's path first, then through the relay.
     $out = Join-Path $dir 'gdb-direct.txt'
-    $g = Start-Gdb $gdb $symbols ($session -replace 'TARGET', $sock) $out
+    $g = Start-Gdb $gdb $symbols ($session.Replace('TARGET', $sock)) $out
     $direct = $false
     $t = [DateTime]::UtcNow.AddSeconds(20)
     while ([DateTime]::UtcNow -lt $t -and -not $g.HasExited) {
@@ -2932,7 +2932,7 @@ continue
         Check (Test-Path $sock) 'the gdb socket went away after the direct attempt'
         $relay = New-Object Wick.Relay($sock)
         $out = Join-Path $dir 'gdb-relay.txt'
-        $g = Start-Gdb $gdb $symbols ($session -replace 'TARGET', "127.0.0.1:$($relay.Port)") $out
+        $g = Start-Gdb $gdb $symbols ($session.Replace('TARGET', "127.0.0.1:$($relay.Port)")) $out
     } else {
         Write-Step 'gdb reaches the Unix socket by its path'
     }
