@@ -105,6 +105,13 @@ upstream Firecracker and its jailer.
   rule still limits Firecracker to Unix sockets, and the mitigation profile has no counterpart of that rule yet
   (docs/PORTING.md, row 2). `--netns` needs an elevated jailer, as `setns` needs root. Without the
   jailer, Windows confinement is the mitigation profile only (no jail directory, token or Job Object).
+- **Windows jailer: no limit on the number of handles.** Upstream's jailer limits Firecracker to 2048 descriptors
+  by default (`RLIMIT_NOFILE`). Windows has no per-process handle limit to set: a process's pool quota is accepted
+  and ignored, and a Job Object has no handle limit and its memory limit does not count handles (measured: 300,000
+  handles under a 32 MiB job memory limit; `jailer-test.ps1 nofile` checks 100,000). Nothing bounds the handles of
+  a compromised jailed Firecracker, or the kernel memory they take, short of Windows' fixed per-process maximum
+  (2^24 handles, documented, not measured). The jailer refuses `--resource-limit no-file=` and says at its start,
+  on stderr, that upstream's default is not enforced.
 - **No per-thread filters outside Linux.** Neither macOS nor Windows filters system calls per thread. Threads of a
   process share its address space, so the union of upstream's filters applies process-wide, and the API server,
   whose separate filter is a real boundary, moves into a process of its own. On macOS that is in place: the API
