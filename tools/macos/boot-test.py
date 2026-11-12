@@ -1040,6 +1040,77 @@ def vhost_user_round(ctx, name, machine):
         log.close()
 
 
+def stage_vhost_user_hotplug(ctx):
+    """A vhost-user drive hot-plugged into a running microVM, after the
+    sandbox has narrowed for good, as upstream's test_hotplug_block plugs a
+    file (PCI, the guest rescans its bus): the new backend's handshake and
+    its memory and queue descriptors passed over its socket, the guest's
+    read and write through it, a PATCH of each vhost-user drive (the
+    backend's configuration read again, rpc_interface
+    update_vhost_user_block_config), and the unplug. The microVM is built
+    with one vhost-user drive, so that its memory is the memfd a backend
+    maps (a microVM built without one has private memory, which no backend
+    can map, on Linux as here)."""
+    backends = []
+
+    def backend(name):
+        img = os.path.join(ctx.out, f"{name}.img")
+        random_file(img, 8 << 20)
+        sock = os.path.join(ctx.sock, f"{name}.vub")
+        log = open(os.path.join(ctx.out, f"{name}-backend.log"), "w")
+        proc = subprocess.Popen([ctx.vub, sock, img], stdout=log, stderr=subprocess.STDOUT)
+        backends.append((proc, log))
+        deadline = time.time() + 10
+        while not os.path.exists(sock):
+            check(proc.poll() is None and time.time() < deadline, f"vhost-user backend {name} did not start ({proc.poll()})")
+            time.sleep(0.05)
+        return img, sock
+
+    try:
+        img1, sock1 = backend("vuhp1")
+        img2, sock2 = backend("vuhp2")
+        drives = [{"drive_id": "vub1", "socket": sock1, "is_root_device": False}]
+        vm = ctx.vm("vhost-user-hotplug", ["--enable-pci"], config(ctx, vcpus=2, drives=drives))
+        vm.shell()
+        _, out = vm.sh("md5sum /dev/vdb")
+        check(out.split()[0] == md5(img1), f"guest md5 over the vhost-user drive built in {out!r}")
+        _, before = vm.sh("ls /sys/block")
+        vm.api("PUT", "/drives/vub2", {"drive_id": "vub2", "socket": sock2, "is_root_device": False})
+        vm.sh("echo 1 > /sys/bus/pci/rescan")
+        _, after = vm.sh("ls /sys/block")
+        new = sorted(set(after.split()) - set(before.split()))
+        check(len(new) == 1, f"one new block device after the hot-plug: {before!r} -> {after!r}")
+        dev = new[0]
+        _, out = vm.sh(f"md5sum /dev/{dev}")
+        check(out.split()[0] == md5(img2), f"guest md5 over the hot-plugged vhost-user drive {out!r}")
+        vm.sh(f"echo hotplug-$((6*7)) | dd of=/dev/{dev} bs=512 seek=8 conv=fsync,notrunc 2>/dev/null")
+        with open(img2, "rb") as f:
+            f.seek(4096)
+            check(f.read(11) == b"hotplug-42\n", "the guest's write is not in the hot-plugged backend's image")
+        for drive in ("vub1", "vub2"):
+            vm.api("PATCH", f"/drives/{drive}", {"drive_id": drive})
+        _, out = vm.sh(f"md5sum /dev/vdb /dev/{dev} | wc -l")
+        check(out == "2", f"both drives readable after their PATCH: {out!r}")
+        # The unplug, as upstream's test makes it: the guest lets the
+        # device go, then the API removes it.
+        _, bdf = vm.sh(f"basename $(readlink -f /sys/block/{dev}/device/..)")
+        vm.sh(f"echo 1 > /sys/bus/pci/devices/{bdf}/remove")
+        vm.api("DELETE", "/drives/vub2")
+        vm.sh("echo 1 > /sys/bus/pci/rescan")
+        _, out = vm.sh("ls /sys/block")
+        check(set(out.split()) == set(before.split()), f"block devices after the unplug: {out!r}, before {before!r}")
+        vm.healthy()
+        vm.reboot()
+    finally:
+        for proc, log in backends:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(5)
+            log.close()
+    return ("vhost-user-blk drive hot-plugged after the sandbox narrowed: handshake, read, write, "
+            "PATCH of both vhost-user drives, unplug")
+
+
 def stage_devices(ctx):
     """Logger, metrics, MMDS, balloon, entropy and a rate limiter: what upstream
     configures beside the devices above (and the system calls they make)."""
@@ -2006,6 +2077,7 @@ STAGES = {
     "hugepages": stage_hugepages,
     "pci": stage_pci,
     "vhost-user": stage_vhost_user,
+    "vhost-user-hotplug": stage_vhost_user_hotplug,
     "devices": stage_devices,
     "balloon": stage_balloon,
     "restores": stage_restores,

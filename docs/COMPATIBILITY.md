@@ -243,7 +243,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | A file-backed drive changed and rescanned | 🟢 `test_rescan_file` | 🟢 `test_rescan_file` |
 | A drive on a host block device | 🟢 `test_rescan_dev` (the drive moves to a host block device and the guest reads its new size; patches/0040, `test_block_device_size`) | 🔴 impossible: no device nodes or loop devices (`test_rescan_dev` [impossible]) |
 | The drive's serial (`VIRTIO_BLK_GET_ID`) | 🟢 upstream's rule: the guest's `/sys/block/vdX/serial` is the file's `st_dev`, `st_rdev` and `st_ino` in decimal, cut to 20 bytes, distinct per drive (`boot-test block`) | 🟡 20 base-32 digits of the file's volume serial number and file index, distinct per file (`test_disk_image_id_is_per_file_and_stable`); the guest's `/sys/block/vdX/serial` is that, distinct per drive (`boot-test.ps1 block`, kit 8d577b7, and 5 of 5 runs on kit dd657f4, Windows 11 10.0.26300.9711) |
-| Drive hotplug | 🟢 `test_hotplug_block` | 🟡 errors in Windows' text (`test_hotplug_block` [error-text]) |
+| Drive hotplug | 🟢 `test_hotplug_block`; a vhost-user drive too, hot-plugged after the sandbox has narrowed: the backend's handshake, read and written in the guest, both vhost-user drives PATCHed, unplugged (`boot-test vhost-user-hotplug`) | 🟡 errors in Windows' text (`test_hotplug_block` [error-text]) |
 | vhost-user-blk | 🟢 `boot-test vhost-user`, `jailer-test vhost-user`, `test_vhost_user_block_read_write`; on huge page memory too (`boot-test hugepages`, `jailer-test hugepages`) | 🟡 `boot-test.ps1 vhost-user`, `jailer-test.ps1 vhost-user`, `test_vhost_user_block_read_write`. Not with huge pages: `MFD_HUGETLB` memfds fail with `EINVAL` (row 10, not done yet) |
 
 ### Network
