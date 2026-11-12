@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Fri, 13 Nov 2026 03:14:43 +0900
+Subject: [PATCH] windows: the compatibility kvm-ioctls logs through
+ Firecracker's logger
+
+A failed WHP call and a #BP window that needed its bound are reported on
+standard error, which Firecracker's log file does not hold. The crate now
+depends on log (the version Firecracker's lock has), so the same lines go
+through Firecracker's logger as well.
+---
+ Cargo.lock | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 4c7dbd01188feab1d6f7b67bb531778b6386738d..bec2ed55da69f049b432f17bf998b2171b56763d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -959,6 +959,7 @@ dependencies = [
+  "kvm-bindings 0.14.1",
+  "kvm-ioctls 0.25.0 (git+https://github.com/rust-vmm/kvm?tag=kvm-ioctls-v0.25.0)",
+  "libc 0.2.189",
++ "log",
+  "vmm-sys-util 0.15.0",
+  "wick-os",
+  "windows-sys",

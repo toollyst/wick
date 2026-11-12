@@ -537,13 +537,16 @@ impl VcpuFd {
             None => "no handler could be read from its gate, and no fault came",
             Some(_) => "the delivery did not reach the handler",
         };
-        eprintln!(
-            "whp: warning: vCPU {}'s #BP window (vector {}, handler {:?}) closed after {:?}, its bound: {reason}; \
-             the other vCPUs were held until then",
-            self.vp(),
-            w.vector,
-            w.handler.map(|h| format!("{h:#x}")),
-            w.opened.elapsed()
+        super::ffi::report(
+            log::Level::Warn,
+            &format!(
+                "whp: warning: vCPU {}'s #BP window (vector {}, handler {:?}) closed after {:?}, its bound: \
+                 {reason}; the other vCPUs were held until then",
+                self.vp(),
+                w.vector,
+                w.handler.map(|h| format!("{h:#x}")),
+                w.opened.elapsed()
+            ),
         );
         super::debug::WINDOWS_EXPIRED.fetch_add(1, Ordering::SeqCst);
         self.shared.close_window(&w)
@@ -1234,7 +1237,10 @@ impl VcpuFd {
                                 std::thread::yield_now();
                                 continue;
                             }
-                            eprintln!("whp: guest RAM at {:#x} stays inaccessible", mem.Gpa);
+                            super::ffi::report(
+                                log::Level::Error,
+                                &format!("whp: guest RAM at {:#x} stays inaccessible", mem.Gpa),
+                            );
                         }
                     }
                     if let Some(exit) = self.mmio(&ctx.VpContext, &mem, scratch, mmio_completion)? {

@@ -218,10 +218,13 @@ impl VmInner {
             )
         };
         if hres != 0 && self.request_failure.swap(hres, Ordering::Relaxed) != hres {
-            eprintln!(
-                "wick: WHvRequestInterrupt(destination {}, vector {:#x}) failed: HRESULT {:#010x}; \
-                 the interrupt is lost",
-                control.Destination, control.Vector, hres as u32
+            ffi::report(
+                log::Level::Error,
+                &format!(
+                    "wick: WHvRequestInterrupt(destination {}, vector {:#x}) failed: HRESULT {:#010x}; \
+                     the interrupt is lost",
+                    control.Destination, control.Vector, hres as u32
+                ),
             );
         }
         self.wake_halted();

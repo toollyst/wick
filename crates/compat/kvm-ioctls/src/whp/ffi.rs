@@ -45,16 +45,28 @@ pub(crate) fn quietly<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// [`hr`] for the WHP call `call`, which on a failure also writes to
-/// standard error the call, what it was given (`detail`: the vCPU, the
+/// [`hr`] for the WHP call `call`, which on a failure also reports
+/// ([`report`]) the call, what it was given (`detail`: the vCPU, the
 /// registers and values) and its `HRESULT`. The errno a failure becomes
 /// names neither the call nor the register (an `os error 87` is any
 /// `E_INVALIDARG` and every `WHV_E_*`), and Firecracker logs only that.
 pub(crate) fn hr_of(call: &str, hres: i32, detail: impl FnOnce() -> String) -> Result<()> {
     if hres != S_OK && !QUIET.get() {
-        eprintln!("whp: {call}({}) failed: HRESULT {:#010x}", detail(), hres.cast_unsigned());
+        report(
+            log::Level::Error,
+            &format!("whp: {call}({}) failed: HRESULT {:#010x}", detail(), hres.cast_unsigned()),
+        );
     }
     hr(hres)
+}
+
+/// Reports what the backend found wrong: on standard error, the only output
+/// before Firecracker's logger is set up (and the one a test sees), and
+/// through the `log` facade, which is Firecracker's logger: its log file
+/// holds the line too, with its time and thread.
+pub(crate) fn report(level: log::Level, line: &str) {
+    eprintln!("{line}");
+    log::log!(level, "{line}");
 }
 
 /// The registers of a call, `name` or `name=value` (the low 64 bits).

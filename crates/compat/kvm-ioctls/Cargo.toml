@@ -35,6 +35,9 @@ vmm-sys-util = "0.15.0"
 wick-os = { path = "../os" }
 kvm-bindings = { version = "0.14.0", features = ["fam-wrappers"] }
 libc = "0.2.186"
+# What the backend reports goes through Firecracker's logger as well
+# (whp/ffi.rs, `report`).
+log = "0.4.33"
 vmm-sys-util = "0.15.0"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
