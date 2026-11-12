@@ -121,7 +121,7 @@ print("; ".join(res))
 # EPERM into EACCES ("traditional behaviour"); vnode_authattr's own EPERM
 # is for a flag outside UF_SETTABLE, which UF_IMMUTABLE is not. Measured
 # the same as a plain user on a root-owned file on macOS 27.2, and by this
-# stage on CI's macOS 26.
+# stage on CI's macOS 26. macOS 15: from the source only, no run.
 CHFLAGS_AS_JAIL_UID_PY = r"""
 import os, sys
 uid, gid, path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
