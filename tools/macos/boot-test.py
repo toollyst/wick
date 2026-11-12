@@ -312,6 +312,17 @@ def stage_block(ctx):
     ]
     vm = ctx.vm("block", [], config(ctx, vcpus=2, drives=drives))
     vm.shell()
+    # The drive's serial (VIRTIO_BLK_GET_ID): upstream's build_device_id, in
+    # kvmtool's form, the opened file's st_dev, st_rdev and st_ino in decimal,
+    # cut to the driver's 20 bytes.
+    serials = {}
+    for dev, path in (("vda", ctx.rootfs), ("vdb", data), ("vdc", sync_w), ("vdd", async_w)):
+        st = os.stat(path)
+        want = f"{st.st_dev}{st.st_rdev}{st.st_ino}"[:20]
+        _, got = vm.sh(f"cat /sys/block/{dev}/serial")
+        check(got == want, f"{dev} serial {got!r}, upstream's rule gives {want!r}")
+        serials[dev] = got
+    check(len(set(serials.values())) == len(serials), f"drive serials not distinct: {serials}")
     _, out = vm.sh("md5sum /dev/vdb")
     check(out.split()[0] == md5(data), f"guest md5 of the Async drive {out!r}")
     _, out = vm.sh("md5sum /usr/bin/bash")
@@ -324,7 +335,8 @@ def stage_block(ctx):
     want = md5(data, 4 << 20)
     check(md5(sync_w, 4 << 20) == want, "Sync drive: host sees different data")
     check(md5(async_w, 4 << 20) == want, "Async drive: host sees different data")
-    return f"Async read md5, Sync and Async writes reach the host, read-only enforced (root bash {root_md5[:8]})"
+    return (f"Async read md5, Sync and Async writes reach the host, read-only enforced, serials from "
+            f"st_dev/st_rdev/st_ino (root bash {root_md5[:8]})")
 
 
 def guest_vsock_services(vm, uds):
@@ -437,11 +449,18 @@ class Switch:
     def __init__(self, endpoint, path):
         self.endpoint = endpoint
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        # The buffers of Firecracker's own endpoint (platform::net): macOS's
+        # default receive buffer for a datagram socket is 4 KiB
+        # (net.local.dgram.recvspace), and a frame the endpoint cannot send
+        # without blocking is dropped, as a TAP drops one.
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
         self.sock.bind(path)
         self.sock.settimeout(0.2)
         self.path = path
         self.bad = []
         self.counts = {"arp": 0, "icmp": 0, "udp": 0}
+        self.sink = []  # (arrival time, bytes) of UDP datagrams to port 9 (discard)
         self.stop = False
         deadline = time.time() + 10
         while not os.path.exists(endpoint):
@@ -504,6 +523,9 @@ class Switch:
             if ck == 0 or csum(pseudo + l4[:length]) != 0:
                 self.bad.append(f"UDP checksum {ck:#x}")
                 return
+            if dport == 9:
+                self.sink.append((time.monotonic(), length - 8))
+                return
             if dport != 7:
                 return
             self.counts["udp"] += 1
@@ -512,6 +534,26 @@ class Switch:
             pseudo = ip[16:20] + s_ip + struct.pack("!BBH", 0, 17, len(udp))
             udp = udp[:6] + struct.pack("!H", csum(pseudo + udp) or 0xFFFF) + udp[8:]
             self.send(src, 0x0800, self.ipv4(17, s_ip, udp))
+
+    def flood(self, stop, size=1400):
+        """Sends UDP datagrams of `size` bytes to the guest's port 9 until
+        `stop` is set, as fast as the endpoint takes them; returns the bytes
+        sent. A full endpoint (timeout, ENOBUFS) drops the datagram, as a TAP
+        whose queue is full does."""
+        guest_ip, sent = socket.inet_aton(GUEST_IP), 0
+        guest_mac = bytes.fromhex(GUEST_MAC.replace(":", ""))
+        data = b"\0" * size
+        udp = struct.pack("!HHHH", 4000, 9, 8 + size, 0) + data
+        pseudo = socket.inet_aton(HOST_IP) + guest_ip + struct.pack("!BBH", 0, 17, len(udp))
+        udp = udp[:6] + struct.pack("!H", csum(pseudo + udp) or 0xFFFF) + udp[8:]
+        frame = guest_mac + HOST_MAC + struct.pack("!H", 0x0800) + self.ipv4(17, guest_ip, udp)
+        while not stop.is_set():
+            try:
+                self.sock.sendto(frame, self.endpoint)
+                sent += size
+            except (socket.timeout, OSError):
+                time.sleep(0.001)
+        return sent
 
     def ipv4(self, proto, dst, payload):
         hdr = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 0, 0x4000, 64, proto, 0,
@@ -547,13 +589,76 @@ def stage_net(ctx):
         check(" 0% packet loss" in out, f"ping -s 1400: {out}")
         _, out = vm.sh(f"echo udp-$((6*7)) | socat -t 3 - UDP:{HOST_IP}:7")
         check(out == "udp-42", f"UDP echo {out!r}")
+        rates = net_rate_limiters(vm, switch)
         vm.reboot()
     finally:
         switch.close()
     check(not switch.bad, f"bad frames from the guest: {switch.bad[:3]}")
     c = switch.counts
     check(c["arp"] >= 1 and c["icmp"] >= 5 and c["udp"] >= 1, f"switch saw {c}")
-    return f"Unix datagram endpoint: ARP, ICMP (1400 B), UDP echo, checksums valid ({c})"
+    return f"Unix datagram endpoint: ARP, ICMP (1400 B), UDP echo, checksums valid ({c}); {rates}"
+
+
+# 1 MiB/s: a bucket of 128 KiB refilled every 125 ms (upstream's token bucket:
+# `size` bytes, `refill_time` ms, full at the start).
+NET_LIMIT = {"bandwidth": {"size": 128 << 10, "refill_time": 125}}
+NET_LIMIT_BPS = (128 << 10) * 1000 // 125
+
+
+def net_tx_rate(vm, switch, total=3 << 20):
+    """The rate at which `total` bytes the guest sends to the host's port 9
+    reach the host (bytes per second, between the first and the last datagram)."""
+    switch.sink = []
+    vm.sh(f"head -c {total} /dev/zero | socat -b 1400 -u - UDP:{HOST_IP}:9", timeout=60)
+    time.sleep(0.5)  # the last frames through the endpoint
+    sink = list(switch.sink)
+    check(len(sink) >= 2, f"the host got {len(sink)} datagrams of {total} bytes sent")
+    got = sum(n for _, n in sink)
+    return got, (got - sink[0][1]) / max(sink[-1][0] - sink[0][0], 1e-6)
+
+
+def net_rx_rate(vm, switch, seconds=2):
+    """The guest's receive rate (its rx_bytes over `seconds`) while the host
+    floods it with UDP to port 9 (bytes per second)."""
+    stop = threading.Event()
+    sent = {}
+    t = threading.Thread(target=lambda: sent.update(n=switch.flood(stop)), daemon=True)
+    t.start()
+    try:
+        time.sleep(0.5)  # past the bucket's first, full, budget
+        _, out = vm.sh("a=$(cat /sys/class/net/eth0/statistics/rx_bytes); S=$(date +%s%N); "
+                       f"sleep {seconds}; b=$(cat /sys/class/net/eth0/statistics/rx_bytes); "
+                       "echo $((b - a)) $(( ($(date +%s%N) - S) / 1000 ))")
+    finally:
+        stop.set()
+        t.join(10)
+    got, us = (int(x) for x in out.split())
+    check(sent.get("n", 0) > got, f"host flood sent {sent.get('n')} bytes, guest counted {got}")
+    return got / (us / 1e6)
+
+
+def net_rate_limiters(vm, switch):
+    """rx and tx bandwidth limiters set on the running device (PATCH): each
+    direction runs at the limit, and without one at three times it or more."""
+    mib = 1 << 20
+    _, tx_free = net_tx_rate(vm, switch)
+    rx_free = net_rx_rate(vm, switch)
+    vm.api("PATCH", "/network-interfaces/eth0", {"iface_id": "eth0", "tx_rate_limiter": NET_LIMIT})
+    tx_got, tx = net_tx_rate(vm, switch)
+    vm.api("PATCH", "/network-interfaces/eth0", {"iface_id": "eth0", "rx_rate_limiter": NET_LIMIT,
+                                                 "tx_rate_limiter": {"bandwidth": {"size": 0, "refill_time": 0}}})
+    rx = net_rx_rate(vm, switch)
+    vm.api("PATCH", "/network-interfaces/eth0", {"iface_id": "eth0",
+                                                 "rx_rate_limiter": {"bandwidth": {"size": 0, "refill_time": 0}}})
+    _, tx_after = net_tx_rate(vm, switch)
+    summary = (f"tx {tx_free / mib:.1f} -> {tx / mib:.2f} MiB/s, rx {rx_free / mib:.1f} -> {rx / mib:.2f} MiB/s "
+               f"at a 1 MiB/s limit; tx {tx_after / mib:.1f} MiB/s once removed")
+    check(tx_got >= 1 << 20, f"throttled tx: only {tx_got} bytes reached the host ({summary})")
+    check(0.5 * NET_LIMIT_BPS <= tx <= 1.25 * NET_LIMIT_BPS, f"tx limiter: {summary}")
+    check(0.5 * NET_LIMIT_BPS <= rx <= 1.25 * NET_LIMIT_BPS, f"rx limiter: {summary}")
+    check(tx_free >= 3 * NET_LIMIT_BPS and rx_free >= 3 * NET_LIMIT_BPS and tx_after >= 3 * NET_LIMIT_BPS,
+          f"unthrottled rates not above the limit: {summary}")
+    return summary
 
 
 def stage_vmnet(ctx):

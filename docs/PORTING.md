@@ -100,6 +100,7 @@ exemption.
 | `api-process` | yes | yes (row 4, `boot-test.ps1 api-process` on a WHP machine) |
 | `cli`: exit codes 153 (bad arguments), 152 (bad `--level`) and 1 (bad configuration file); `--module`; `--start-time-us`, `--start-time-cpu-us`, `--parent-cpu-time-us` (the start time metrics); the logger and metrics on FIFOs; `--boot-timer` (upstream's `/usr/local/bin/init` writes the boot timer) | yes | **missing** |
 | `tools`: `rebase-snap` (the same file as `snapshot-editor edit-memory rebase`, then a restore); `snapshot-editor info-vmstate` `version`, `vcpu-states`, `vm-state` | yes | **missing** |
+| (`block`: each drive's serial is upstream's, from the file's `st_dev`, `st_rdev`, `st_ino`; `net`: tx and rx bandwidth limiters set with `PATCH` hold the rate to the limit) | part of `block`, `net` | **missing** |
 
 | Stage | macOS (`tools/macos/jailer-test.sh`, root) | Windows (`tools/windows/jailer-test.ps1`) |
 | --- | --- | --- |
