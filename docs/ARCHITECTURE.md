@@ -135,7 +135,9 @@ does not leave `hv_vcpu_run` when the host deschedules the thread, so the backen
 time inside `run()` the thread was neither on a CPU nor waiting for an interrupt, and writes it at each entry; a
 thread of each microVM reads its running vCPU threads' state every 2 ms (`thread_info`) and makes one kept off
 its CPU for 1 ms leave the guest (`hv_vcpus_exit`), which the run loop enters again with the steal written. It
-sleeps while no vCPU is in the guest and ends with the microVM. Cost and lateness: docs/COMPATIBILITY.md, PV time.
+sleeps while no vCPU is in the guest and ends with the microVM. It is an ordinary thread: on a contended host it
+waits for a CPU like the vCPUs, and the steal reaches the guest later by that wait (not closed). Cost and lateness:
+docs/COMPATIBILITY.md, PV time.
 
 ## The POSIX layer on Windows
 
