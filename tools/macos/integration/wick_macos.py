@@ -1072,15 +1072,49 @@ def pytest_pycollect_makemodule(module_path, parent):  # pylint: disable=unused-
     return mod
 
 
+PROC_PIDFDVNODEPATHINFO = 2
+_VNODE_FDINFOWITHPATH = 24 + 152 + 1024  # proc_fileinfo, vnode_info, vip_path[MAXPATHLEN]
+_PROC_FD = re.compile(r"^/proc/(\d+)/fd/(\d+)$")
+
+
+def proc_fd_path(pid, fd):
+    """The file `pid`'s descriptor `fd` names, which Linux's /proc/<pid>/fd/<fd>
+    opens: proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO), <sys/proc_info.h> struct
+    vnode_fdinfowithpath's vip_path. Measured: a child's stdin on a pty gives
+    its /dev/ttysNNN."""
+    buf = ctypes.create_string_buffer(_VNODE_FDINFOWITHPATH)
+    if _libsystem.proc_pidfdinfo(pid, fd, PROC_PIDFDVNODEPATHINFO, buf, len(buf)) != len(buf):
+        err = ctypes.get_errno() or errno.ENOENT
+        raise OSError(err, f"/proc/{pid}/fd/{fd}: {os.strerror(err)} (proc_pidfdinfo)")
+    return buf.raw[176:].split(b"\0", 1)[0].decode()
+
+
+class _ProcFdOs:
+    """The `os` module, but `open` of /proc/<pid>/fd/<fd> opens the file the
+    descriptor names (proc_fd_path), as Linux's /proc does for a terminal."""
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    @staticmethod
+    def open(path, flags, mode=0o777, **kwargs):
+        m = _PROC_FD.match(os.fspath(path))
+        return os.open(proc_fd_path(int(m[1]), int(m[2])) if m else path, flags, mode, **kwargs)
+
+
 def pytest_runtest_setup(item):
     """test_pmem reads RssAnon from /proc, which macOS does not have: its
-    helper reads it as `rss_anon_kib` does. A test of NOISE_ONLY_PINNING
-    runs unpinned (`set_cpu_affinity`)."""
+    helper reads it as `rss_anon_kib` does. test_serial_io opens Firecracker's
+    terminal through /proc/<pid>/fd/0: its `os.open` opens it by its device
+    (_ProcFdOs). A test of NOISE_ONLY_PINNING runs unpinned
+    (`set_cpu_affinity`)."""
     global _unpinned_test  # pylint: disable=global-statement
     _unpinned_test = item if item.nodeid.split("[", 1)[0] in NOISE_ONLY_PINNING else None
     module = getattr(item, "module", None)
     if module is not None and module.__name__.endswith("test_pmem") and hasattr(module, "outside_rssanon"):
         module.outside_rssanon = _outside_rssanon
+    if module is not None and module.__name__.endswith("test_serial_io") and getattr(module, "os", None) is os:
+        module.os = _ProcFdOs()
 
 
 import pytest as _pytest  # noqa: E402  pylint: disable=wrong-import-position

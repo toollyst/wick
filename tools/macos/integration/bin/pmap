@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+"""procps' `pmap PID`, as upstream's test_serial_io.py reads it: the
+process's mappings, then a last line " total <KiB>K", the sum of every
+mapping's size (procps pmap.c: the total of the sizes it printed, from
+/proc/<pid>/maps). macOS has no pmap: the mappings are the process's regions
+from proc_pidinfo(PROC_PIDREGIONPATHINFO), the dyld shared cache's among
+them, as /proc/<pid>/maps lists a process's libraries. Only `pmap PID`.
+"""
+import ctypes
+import sys
+
+
+class RegionInfo(ctypes.Structure):
+    """<sys/proc_info.h> struct proc_regioninfo."""
+
+    _fields_ = [
+        ("protection", ctypes.c_uint32), ("max_protection", ctypes.c_uint32),
+        ("inheritance", ctypes.c_uint32), ("flags", ctypes.c_uint32),
+        ("offset", ctypes.c_uint64), ("behavior", ctypes.c_uint32),
+        ("user_wired_count", ctypes.c_uint32), ("user_tag", ctypes.c_uint32),
+        ("pages_resident", ctypes.c_uint32), ("pages_shared_now_private", ctypes.c_uint32),
+        ("pages_swapped_out", ctypes.c_uint32), ("pages_dirtied", ctypes.c_uint32),
+        ("ref_count", ctypes.c_uint32), ("shadow_depth", ctypes.c_uint32),
+        ("share_mode", ctypes.c_uint32), ("private_pages_resident", ctypes.c_uint32),
+        ("shared_pages_resident", ctypes.c_uint32), ("obj_id", ctypes.c_uint32),
+        ("depth", ctypes.c_uint32), ("address", ctypes.c_uint64), ("size", ctypes.c_uint64),
+    ]
+
+
+class RegionPathInfo(ctypes.Structure):
+    """<sys/proc_info.h> struct proc_regionwithpathinfo."""
+
+    _fields_ = [("info", RegionInfo), ("vnode_info", ctypes.c_char * 152), ("path", ctypes.c_char * 1024)]
+
+
+PROC_PIDREGIONPATHINFO = 8
+
+
+def main():
+    if len(sys.argv) != 2 or not sys.argv[1].isdigit():
+        sys.exit(f"pmap (wick, macOS): only `pmap PID` is supported, not {sys.argv[1:]}")
+    pid = int(sys.argv[1])
+    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+    addr, total, lines = 0, 0, []
+    while True:
+        info = RegionPathInfo()
+        if lib.proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, addr, ctypes.byref(info), ctypes.sizeof(info)) <= 0:
+            break
+        r = info.info
+        addr = r.address + r.size
+        total += r.size
+        prot = "".join(c if r.protection & b else "-" for c, b in (("r", 1), ("w", 2), ("x", 4)))
+        lines.append(f"{r.address:016x} {r.size >> 10:6}K {prot}-- {info.path.decode(errors='replace') or '[ anon ]'}")
+    if not lines:
+        sys.exit(f"pmap (wick, macOS): no process {pid}, or not the user's")
+    print(f"{pid}:")
+    print("\n".join(lines))
+    print(f" total {total >> 10:16}K")
+
+
+main()

@@ -131,12 +131,17 @@ all impossible integration_tests/functional/test_signals.py::test_sigxfsz_handle
 all impossible integration_tests/functional/test_uffd.py::test_unbinded_socket
 
 # The test writes to Firecracker's terminal through /proc/<pid>/fd/0 with
-# TIOCSTI and reads its size with pmap. macOS has no /proc and no pmap;
-# TIOCSTI on a terminal not the caller's controlling one needs root there.
-# To do: the harness opens the terminal by its device (proc_pidfdinfo) and
-# reads the sizes with proc_pidinfo, as wick_macos.memory_maps does (as
-# wick_macos.rss_anon_kib does for test_pmem_dax_memory_saving's RssAnon).
-all bug integration_tests/functional/test_serial_io.py::test_serial_dos
+# TIOCSTI and reads its size with pmap. The harness gives both: the
+# terminal opened by the device the descriptor names (wick_macos
+# proc_fd_path, proc_pidfdinfo), and bin/pmap from the process's regions.
+# TIOCSTI needs root on both hosts for a terminal that is not the
+# caller's controlling one: Linux drivers/tty/tty_io.c tiocsti
+# ("current->signal->tty != tty && !capable(CAP_SYS_ADMIN)": EPERM),
+# XNU bsd/kern/tty.c TIOCSTI (suser, or a readable descriptor of the
+# caller's controlling terminal, else EACCES; measured as the user on a
+# pty: EACCES). Firecracker's terminal is screen's, so upstream's CI runs
+# it as root. Not yet run with --jailer.
+user root integration_tests/functional/test_serial_io.py::test_serial_dos
 
 # The guest's cache hierarchy is the host's, which Firecracker on Linux
 # reads in /sys/devices/system/cpu/cpu0/cache and gives the guest in its
