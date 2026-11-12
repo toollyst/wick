@@ -2802,6 +2802,7 @@ mod tests {
     fn test_self_check_under_load() {
         // SAFETY: no arguments.
         if unsafe { libc::geteuid() } != 0 {
+            eprintln!("test_self_check_under_load: NOT RUN: pid_suspend needs root (see test_pid_suspend_binding)");
             return;
         }
         let busy = load();
@@ -2827,41 +2828,54 @@ mod tests {
         drop(busy);
     }
 
+    // As root only, as the supervisor is (the jailer cannot start one
+    // otherwise: it is made after the chroot, which is root's). Not as a
+    // plain user: for a caller that is not root, XNU's pid_suspend and
+    // pid_resume ask taskgated and wait for its answer (bsd/kern/
+    // kern_proc.c `pid_suspend`: `!kauth_cred_issuser`, then
+    // `__KERNEL_WAITING_ON_TASKGATED_CHECK_ACCESS_UPCALL__`, as
+    // `task_for_pid` does). That answer was EPERM at once, which this test
+    // used to assert, until taskgated asked authd for
+    // `system.privilege.taskport.debug` and authd put up the "Developer
+    // Tools Access" password dialog (macOS 27.2, 5 h after the login): the
+    // call then never returned, and every later task-port request of the
+    // Mac (`sample`, `lldb -p`, `vmmap`, any pid_suspend by a user) queued
+    // behind the unanswered dialog. The jail's uid being refused is the
+    // stage's to show (`jailer-test freeze`: `pid_resume -1 EPERM`).
     #[test]
     fn test_pid_suspend_binding() {
+        // SAFETY: no arguments.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!(
+                "test_pid_suspend_binding: NOT RUN: pid_suspend needs root; as a plain user it waits on taskgated, \
+                 which can put up a password dialog and block every debugger of the host"
+            );
+            return;
+        }
         let mut child = std::process::Command::new("/usr/bin/yes").stdout(std::process::Stdio::null()).spawn().unwrap();
         let pid = libc::pid_t::try_from(child.id()).unwrap();
         let mut os = RealOs;
-        // SAFETY: no arguments.
-        if unsafe { libc::geteuid() } != 0 {
-            let err = os.suspend(pid).unwrap_err();
-            assert_eq!(errno(&err), libc::EPERM, "{err}");
-            assert_eq!(errno(&os.resume(pid).unwrap_err()), libc::EPERM);
-            let err = self_check(&mut os).unwrap_err();
-            assert!(err.contains("the freezer cannot work on this host: pid_suspend of a child"), "{err}");
-        } else {
-            std::thread::sleep(Duration::from_millis(100));
-            os.suspend(pid).unwrap();
-            let a = parked_cpu_time(pid).unwrap();
-            std::thread::sleep(Duration::from_millis(300));
-            let b = cpu_time(pid).unwrap();
-            assert_eq!(a, b, "CPU time while suspended and parked");
-            // Not nested: a second suspend is refused, one resume resumes.
-            assert_eq!(errno(&os.suspend(pid).unwrap_err()), libc::EPERM);
-            os.resume(pid).unwrap();
-            std::thread::sleep(Duration::from_millis(300));
-            assert!(cpu_time(pid).unwrap() > b, "no CPU time once resumed");
-            assert_eq!(errno(&os.resume(pid).unwrap_err()), libc::EPERM);
-            // SIGKILL ends a suspended process.
-            os.suspend(pid).unwrap();
-            child.kill().unwrap();
-            let t0 = Instant::now();
-            while child.try_wait().unwrap().is_none() {
-                assert!(t0.elapsed() < Duration::from_secs(5), "a suspended process outlived SIGKILL");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            self_check(&mut os).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        os.suspend(pid).unwrap();
+        let a = parked_cpu_time(pid).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let b = cpu_time(pid).unwrap();
+        assert_eq!(a, b, "CPU time while suspended and parked");
+        // Not nested: a second suspend is refused, one resume resumes.
+        assert_eq!(errno(&os.suspend(pid).unwrap_err()), libc::EPERM);
+        os.resume(pid).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(cpu_time(pid).unwrap() > b, "no CPU time once resumed");
+        assert_eq!(errno(&os.resume(pid).unwrap_err()), libc::EPERM);
+        // SIGKILL ends a suspended process.
+        os.suspend(pid).unwrap();
+        child.kill().unwrap();
+        let t0 = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            assert!(t0.elapsed() < Duration::from_secs(5), "a suspended process outlived SIGKILL");
+            std::thread::sleep(Duration::from_millis(10));
         }
+        self_check(&mut os).unwrap();
         let _ = child.kill();
         let _ = child.wait();
     }

@@ -9,6 +9,14 @@
 #   - an entry naming a test that does not exist.
 # So nothing goes unrun silently, and the list cannot rot.
 #
+# Root only, among the jailer's tests: test_pid_suspend_binding and
+# test_self_check_under_load (platform::macos::freezer) call pid_suspend.
+# Run by a plain user they print "NOT RUN: pid_suspend needs root" and pass
+# without having run: as a user the call waits on taskgated, which can put
+# up a password dialog and block every task-port request of the host (the
+# comment at test_pid_suspend_binding). CI's "Jailer unit tests" step runs
+# both as root, as does `sudo env RUST_TEST_THREADS=1 <jailer test binary>`.
+#
 # Format: <kind> <crate> <test path>, below a comment that gives the reason.
 # <crate> is a name of check-unit-tests.py's: the package, or compat-<name> for
 # crates/compat/<name>. kind:
