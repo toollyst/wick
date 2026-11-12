@@ -25,14 +25,33 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 TOOLCHAIN="${WICK_FUZZ_TOOLCHAIN:-nightly-2026-11-01}"
 FUZZ_DIR="$WICK_ROOT/fuzz"
 
+# The targets this host runs; with `all`, those of every host.
 host_targets() {
     echo vnet_segment
     echo vnet_offload
     echo hvf_exit
     echo whp_irqchip
-    if [[ "$(uname -s)" == Darwin ]]; then
+    echo whp_exit
+    if [[ "${1:-}" == all || "$(uname -s)" == Darwin ]]; then
         echo uffd_protocol
     fi
+}
+
+# Targets of fuzz/Cargo.toml no host runs, one per line: the name, then why.
+# None today.
+not_run() {
+    :
+}
+
+# Every target in fuzz/Cargo.toml runs on some host or says why not: a target
+# left out of host_targets() would otherwise build on CI and never run.
+check_targets() {
+    local bin
+    while read -r bin; do
+        host_targets all | grep -qx "$bin" && continue
+        not_run | awk '{ print $1 }' | grep -qx "$bin" && continue
+        die "fuzz/Cargo.toml's target $bin is in neither host_targets() nor not_run() (tools/fuzz.sh)"
+    done < <(awk '/^\[\[bin\]\]/ { bin = 1; next } bin && /^name *=/ { gsub(/[" ]/, ""); sub(/^name=/, ""); print; bin = 0 }' "$FUZZ_DIR/Cargo.toml")
 }
 
 # libFuzzer options per target.
@@ -73,6 +92,7 @@ if ((${#targets[@]} == 0)); then
     # No mapfile: macOS ships bash 3.2.
     while read -r t; do targets+=("$t"); done < <(host_targets)
 fi
+check_targets
 for t in "${targets[@]}"; do target_args "$t" >/dev/null; done
 
 cargo "+$TOOLCHAIN" fuzz --version >/dev/null 2>&1 \

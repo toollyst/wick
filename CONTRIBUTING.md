@@ -276,6 +276,7 @@ compiles wick's sources directly, so upstream's workspace does not change.
 | `hvf_exit` | `crates/compat/kvm-ioctls/src/hvf/exit.rs` | the exits a guest makes the Hypervisor.framework run loop decode: any exception syndrome, store register, device data, PSTATE and PSCI function id | a reference written from the Arm ARM (ESR_EL2, AArch64 loads and stores, the exception vectors) and PSCI 0.2: exit class, MMIO size, bytes stored and register loaded, the debug registers' state, undefined accesses |
 | `uffd_protocol` (macOS) | `crates/compat/libc/src/wick_uffd.rs` | the requests and records a page fault handler process sends | the state Linux's `UFFDIO_*` leave memory in; no descriptor left open |
 | `whp_irqchip` | `crates/compat/kvm-ioctls/src/whp/irqchip.rs` (built on any host) | any sequence of the port and MMIO accesses the WHP run loop hands it (PICs, ELCR, PIT, speaker port, I/O APIC), interrupt lines, MSI routes, PIT state from a snapshot file, and a snapshot at any point | a VM restored from the snapshot saves the same state and answers every later access as the original does (but for what follows the host clock); each MSI's interrupt request carries its vector and destination |
+| `whp_exit` | `crates/compat/kvm-ioctls/src/whp/exit.rs` (built on any host) | the fields of a sequence of WHP vCPU exits, which the guest controls | a reference written from the x86 architecture (the Intel SDM: port I/O sizes, 32-bit register writes zero-extending, `WRMSR` taking `EDX:EAX`, CPUID's OSXSAVE and OSPKE) and KVM's hypercall ABI: instruction length, port and memory access direction, size and kind, MSR accesses, the `RAX` an `IN` leaves, the hypercall answered |
 
 ```sh
 tools/fuzz.sh                          # every target this host runs, 60 s each
@@ -284,7 +285,9 @@ tools/fuzz.sh -t 3600 -j 4 vnet_offload
 
 `tools/fuzz.sh --toolchain` names the pinned nightly the targets build with;
 cargo-fuzz comes from `cargo install cargo-fuzz --locked`. CI runs every
-target for a minute on Linux and macOS. An input that fails is saved in
+target for a minute on Linux and macOS (`uffd_protocol` on macOS only), and
+`tools/fuzz.sh` fails when a target of `fuzz/Cargo.toml` is run on no host
+without a reason in its `not_run()`. An input that fails is saved in
 `fuzz/artifacts/<target>/`, and
 `cargo +<toolchain> fuzz run --fuzz-dir fuzz <target> <file>` runs it again.
 
