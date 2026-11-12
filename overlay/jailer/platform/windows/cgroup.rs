@@ -223,8 +223,6 @@ const CAP_AND_WEIGHT: &str = "a Job Object takes a CPU rate cap (cpu.max) or a C
 const MEMS_BIND: &str = "Windows cannot bind a process's memory to NUMA nodes; only a list of every \
                          memory node of the host, which binds nothing, is accepted";
 
-/// Why Windows cannot do what the cgroup file `file` does, for the
-/// controllers and files Windows has no counterpart for.
 /// Why `cgroup.freeze` (v1: `freezer.*`) is refused. A Job Object's
 /// processes can be frozen and thawed as a group (`JobObjectFreezeInformation`,
 /// measured on Windows Server 2022: no CPU time while frozen, a process added
@@ -235,6 +233,8 @@ const FREEZE: &str = "the jailer has no freezer yet: a Job Object can be frozen 
                       group, but there is no counterpart of the cgroup file an operator writes \
                       to freeze or thaw the jail later";
 
+/// Why Windows cannot do what the cgroup file `file` does, for the
+/// controllers and files Windows has no counterpart for.
 fn impossible(version: u8, file: &str) -> Option<&'static str> {
     let controller = file.split('.').next().unwrap_or("");
     Some(match (version, controller) {
