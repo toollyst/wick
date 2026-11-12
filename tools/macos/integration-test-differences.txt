@@ -70,8 +70,11 @@ all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
 # cached file pages (a pmem file's, the binary's own) are superseded: in
 # the page tables they count only as mapped. To find: what Firecracker
 # holds in the small zone. Only a test whose every failing phase failed
-# with this error is excused.
-# excused: at least 19 (run m2-parts at 8d577b7): pass their own assertions and fail only the memory budget of the VMM's own part
+# with this error is excused. Upstream raises it when a microVM is killed
+# (microvm.py kill, check_samples): a test that kills one inside its body
+# stops there, and its steps after that kill did not run, untested rather
+# than passed.
+# excused: at least 19 (run m2-parts at 8d577b7): pass their own assertions up to the memory budget of the VMM's own part, which fails them in the teardown or, in 6, at a kill inside the test, whose later steps then did not run (test_vsock_transport_reset_h2g, all four, and test_snapshot_restore_with_inflight_vsock_tx[PCI_ON] before their restore; test_vsock_transport_reset_g2h[PCI_ON-2vcpu] after 3 of its 5 restores)
 all bug failure:host_tools.memory.MemoryUsageExceededError
 
 # The test looks in Firecracker's log for the API socket by its path in the
