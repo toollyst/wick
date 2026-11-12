@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 14:28:06 +0900
+Subject: [PATCH] windows: rebase refuses a diff file that is not sparse
+
+rebase-snap and snapshot-editor edit-memory rebase copy a diff file's
+data over the base and skip its holes. On Linux a file extended by
+set_len, or written past a gap, has holes there; on Windows only a file
+marked sparse does, and any other has allocated zeros, which SEEK_DATA
+rightly reports as data. Given such a file, both tools copied its zeros
+over the base and exited 0 (measured: 979244 of 1048576 base bytes
+zeroed). Firecracker's own diff snapshots are sparse (keep_holes), but
+every ordinary copy (Copy-Item, copy, xcopy, robocopy, esentutl)
+drops the attribute and allocates the file.
+
+So on Windows both tools refuse a diff file with data that is not
+sparse, before writing anything (vmm_sys_util::seek_hole::holes_kept):
+the base is left as it was. A dense file marked sparse afterwards is
+still copied whole, as on Linux a diff file that lost its holes is:
+neither can tell a lost hole from a page of zeros.
+
+Upstream's unit tests that make holes with set_len in a file that is not
+sparse (rebase-snap's test_rebase, test_rebase_corner_cases;
+snapshot-editor's test_rebase, test_rebase_empty_diff,
+test_rebase_full_diff) now fail on Windows with that refusal, where they
+failed with a corrupted base before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/rebase-snap/src/main.rs            | 3 +++
+ src/snapshot-editor/src/edit_memory.rs | 3 +++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/src/rebase-snap/src/main.rs b/src/rebase-snap/src/main.rs
+index 3950dca27ba7a64e5b7ca88f982198eb209ee022..3690da6c721f7e485b7509f9474dda3bb5b38687 100644
+--- a/src/rebase-snap/src/main.rs
++++ b/src/rebase-snap/src/main.rs
+@@ -87,6 +87,9 @@ fn get_files(args: &Arguments) -> Result<(File, File), FileError> {
+ }
+ 
+ fn rebase(base_file: &mut File, diff_file: &mut File) -> Result<(), FileError> {
++    // wick: on Windows only a sparse file has holes; any other would be copied whole.
++    #[cfg(windows)]
++    vmm_sys_util::seek_hole::holes_kept(diff_file).map_err(FileError::InvalidDiffFile)?;
+     let mut cursor: u64 = 0;
+     while let Some(block_start) = diff_file.seek_data(cursor).map_err(FileError::SeekData)? {
+         cursor = block_start;
+diff --git a/src/snapshot-editor/src/edit_memory.rs b/src/snapshot-editor/src/edit_memory.rs
+index eca61afa2ff96849e0201fe9f4a2803d5afd8715..0f44a0d1a3716f3d98e5e02b4a70d6d8c63e6967 100644
+--- a/src/snapshot-editor/src/edit_memory.rs
++++ b/src/snapshot-editor/src/edit_memory.rs
+@@ -61,6 +61,9 @@ fn rebase(memory_path: PathBuf, diff_path: PathBuf) -> Result<(), EditMemoryErro
+         .read(true)
+         .open(diff_path)
+         .map_err(EditMemoryError::OpenDiffFile)?;
++    // wick: on Windows only a sparse file has holes; any other would be copied whole.
++    #[cfg(windows)]
++    vmm_sys_util::seek_hole::holes_kept(&diff_file).map_err(EditMemoryError::OpenDiffFile)?;
+ 
+     let mut cursor: u64 = 0;
+     while let Some(block_start) = diff_file
