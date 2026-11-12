@@ -363,6 +363,18 @@ mod tests {
         }
     }
 
+    /// Waits until `fd` is readable, for at most `limit`. A timer fires
+    /// from a thread here (`run`), as Linux's from an hrtimer: never early,
+    /// late by however long the host takes to schedule it, which on a
+    /// loaded host has no bound. The tests wait for the firing rather than
+    /// sleep a fixed time, and check it was not early.
+    fn wait_readable(fd: c_int, limit: Duration) -> bool {
+        let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let ms = c_int::try_from(limit.as_millis()).unwrap();
+        // SAFETY: one valid pollfd.
+        unsafe { libc::poll(&mut p, 1, ms) == 1 }
+    }
+
     fn gettime(fd: c_int) -> itimerspec {
         let mut cur = spec(0, 0);
         // SAFETY: valid descriptor and output pointer.
@@ -380,13 +392,16 @@ mod tests {
         assert_eq!(read_u64(&mut file), None);
         assert_eq!(gettime(fd).it_value.tv_nsec, 0);
 
+        let armed = Instant::now();
         // SAFETY: valid descriptor and spec.
         assert_eq!(
             unsafe { timerfd_settime(fd, 0, &spec(20, 0), std::ptr::null_mut()) },
             0
         );
         assert!(gettime(fd).it_value.tv_nsec > 0);
-        std::thread::sleep(Duration::from_millis(80));
+        assert!(wait_readable(fd, Duration::from_secs(30)), "a 20 ms timer did not fire in 30 s");
+        let at = armed.elapsed();
+        assert!(at >= Duration::from_millis(20), "fired early, after {at:?}");
         assert_eq!(read_u64(&mut file), Some(1));
         assert_eq!(read_u64(&mut file), None);
         // Disarmed after firing.
@@ -400,26 +415,32 @@ mod tests {
         let fd = unsafe { timerfd_create(libc::CLOCK_MONOTONIC, TFD_NONBLOCK) };
         // SAFETY: we own `fd`.
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let armed = Instant::now();
         // SAFETY: valid descriptor and spec.
         assert_eq!(
             unsafe { timerfd_settime(fd, 0, &spec(10, 10), std::ptr::null_mut()) },
             0
         );
-        std::thread::sleep(Duration::from_millis(100));
+        // Two expirations (a late thread writes the ones it missed at once),
+        // the second not before 20 ms.
         let mut fired = 0;
-        while read_u64(&mut file).is_some() {
-            fired += 1;
+        while fired < 2 {
+            assert!(wait_readable(fd, Duration::from_secs(30)), "fired {fired} times in 30 s");
+            while read_u64(&mut file).is_some() {
+                fired += 1;
+            }
         }
-        assert!(fired >= 2, "fired {fired} times");
+        let at = armed.elapsed();
+        assert!(at >= Duration::from_millis(20), "{fired} expirations after {at:?}");
 
         let mut old = spec(0, 0);
         // SAFETY: valid descriptor and specs.
         assert_eq!(unsafe { timerfd_settime(fd, 0, &spec(0, 0), &mut old) }, 0);
         assert_eq!(old.it_interval.tv_nsec, 10_000_000);
-        std::thread::sleep(Duration::from_millis(50));
+        // Disarmed under the timers' lock, which the thread holds while it
+        // writes: nothing is written after, whatever was before.
         while read_u64(&mut file).is_some() {}
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(read_u64(&mut file), None);
+        assert!(!wait_readable(fd, Duration::from_millis(50)));
     }
 
     #[test]
