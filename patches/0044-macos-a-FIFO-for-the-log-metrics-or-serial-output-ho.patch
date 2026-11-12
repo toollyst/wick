@@ -48,7 +48,7 @@ index 794dacdcdd61f2907d8e9f65b9cf4966fb91a76c..b8b01d400f3535e471dad4aba63bbadf
  
      let http_max_payload_size_str = HTTP_MAX_PAYLOAD_SIZE.to_string();
 diff --git a/src/vmm/src/devices/legacy/serial.rs b/src/vmm/src/devices/legacy/serial.rs
-index 6e7f596788c89af0c7dc6479c352e88ddf8295a6..47b5cff5e5a571e739b9c5962bae5ed7c4a410ce 100644
+index d11dfc27512ef90c4b76d5dbef8133064cf05b0c..88be201f7fa487406a639f0774c19b8901bc2fbe 100644
 --- a/src/vmm/src/devices/legacy/serial.rs
 +++ b/src/vmm/src/devices/legacy/serial.rs
 @@ -7,7 +7,6 @@
@@ -69,7 +69,7 @@ index 6e7f596788c89af0c7dc6479c352e88ddf8295a6..47b5cff5e5a571e739b9c5962bae5ed7
  }
  
  /// Output sink for the serial device, with optional rate limiting.
-@@ -544,7 +544,8 @@ mod tests {
+@@ -538,7 +538,8 @@ mod tests {
          let tmp = vmm_sys_util::tempfile::TempFile::new().unwrap();
          let file = tmp.into_file();
          let mut serial_out = SerialOut::new(
@@ -79,7 +79,7 @@ index 6e7f596788c89af0c7dc6479c352e88ddf8295a6..47b5cff5e5a571e739b9c5962bae5ed7
              Some(TokenBucket::new(1024, 0, 1000).unwrap()),
          );
  
-@@ -565,7 +566,8 @@ mod tests {
+@@ -559,7 +560,8 @@ mod tests {
          let tmp = vmm_sys_util::tempfile::TempFile::new().unwrap();
          let file = tmp.into_file();
          let mut serial_out = SerialOut::new(

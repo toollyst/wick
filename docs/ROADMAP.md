@@ -118,7 +118,7 @@ machine. The vmm library and the firecracker binary build and link for
   corrupted a 2 vCPU guest's memory), irqfds cleared through their eventfd, an epoll nested in another (the vsock
   muxer's; it ended Firecracker with `STATUS_THREADPOOL_HANDLE_EXCEPTION`), `SEEK_HOLE` on a write-only file,
   16-byte aligned WHP register arrays (a snapshot restore faulted inside `WHvSetVirtualProcessorRegisters`), diff
-  snapshots in 64 KiB units (patch 0021) and a guest RAM access under userfaultfd never treated as MMIO.
+  snapshots in 64 KiB units (patch 0020) and a guest RAM access under userfaultfd never treated as MMIO.
 - Found since, by reading the path `huge_pages` takes: Firecracker 1.18 maps guest memory `MAP_FIXED` over a
   `PROT_NONE` reservation, which the libc layer refused for large pages, so `hugepages` could not have passed.
   Fixed (docs/PORTING.md, row 10); a jailed Firecracker, whose token can have no privilege enabled, gets its large
