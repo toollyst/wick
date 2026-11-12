@@ -386,11 +386,50 @@ def _shared_cache():
     return (base or 0), (base or 0) + length.value
 
 
+# A process's regions as this process reads them with proc_pidinfo: by
+# default each region's resident pages are its object's (XNU
+# osfmk/vm/vm_map.c vm_map_region_look_for_page: vm_page_lookup in the
+# object), so a mapped file counts its pages in the buffer cache, whoever
+# read them. With vm.self_region_footprint set, which a process sets for
+# itself (bsd/vm/vm_unix.c sysctl_vm_self_region_footprint, CTLFLAG_ANYBODY;
+# osfmk/kern/task.c task_self_region_footprint reads the caller's flag, and
+# a new task starts without it), vm_map_region_walk asks the target's pmap
+# for each page instead (vm_map_footprint_query_page_info_exclusive ->
+# pmap_query_page_info): a page counts when the process has it mapped, as
+# Linux's smaps Rss counts present page-table entries (fs/proc/task_mmu.c
+# smaps_pte_entry). Measured, as the user, on another process: a 4 MiB
+# file in the cache with 2 pages touched, 4096 KiB by default and 32 KiB
+# with the flag; an idle Firecracker run from a binary all in the cache,
+# its binary's mappings 3.84 MiB by default and 0.92 MiB with the flag.
+VM_SELF_REGION_FOOTPRINT = b"vm.self_region_footprint"
+# The region the footprint mode adds after the last one (bsd_vm.c
+# fill_procregioninfo): the purgeable and ledger-tagged memory the task
+# owns, mapped or not, whose mapped pages its regions report already.
+# Linux has no such mapping.
+_FOOTPRINT_REGION_TAG = 0xFFFFFFFF
+
+
+def _set_self_region_footprint():
+    one, now, size = ctypes.c_int(1), ctypes.c_int(0), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+    if _libsystem.sysctlbyname(VM_SELF_REGION_FOOTPRINT, None, None, ctypes.byref(one), ctypes.sizeof(one)):
+        raise OSError(ctypes.get_errno(), f"sysctl {VM_SELF_REGION_FOOTPRINT.decode()}=1")
+    if _libsystem.sysctlbyname(VM_SELF_REGION_FOOTPRINT, ctypes.byref(now), ctypes.byref(size), None, 0) \
+            or now.value != 1:
+        raise OSError(errno.EINVAL, f"sysctl {VM_SELF_REGION_FOOTPRINT.decode()} did not take 1")
+
+
+_set_self_region_footprint()
+
+
 def memory_maps(self, grouped=True):
     """psutil's `Process.memory_maps` on macOS (psutil has it on Linux only).
 
-    Linux: /proc/<pid>/smaps, one entry per mapping with its resident size.
-    macOS: the process's regions from proc_pidinfo(PROC_PIDREGIONPATHINFO).
+    Linux: /proc/<pid>/smaps, one entry per mapping with its resident size
+    (Rss: the pages present in the process's page tables).
+    macOS: the process's regions from proc_pidinfo(PROC_PIDREGIONPATHINFO),
+    in the footprint mode (VM_SELF_REGION_FOOTPRINT above): the pages the
+    process has mapped. The footprint mode's region of owned memory is left
+    out (_FOOTPRINT_REGION_TAG).
     The dyld shared cache is left out: every process on macOS maps the
     system libraries from it and shares their pages (upstream's Firecracker is
     a static binary on Linux, so it has no such mapping). XNU splits a large
@@ -414,7 +453,7 @@ def memory_maps(self, grouped=True):
             break
         r = info.info
         addr = r.address + r.size
-        if lo <= r.address < hi:
+        if lo <= r.address < hi or r.user_tag == _FOOTPRINT_REGION_TAG:
             continue
         path = info.path.decode(errors="replace")
         kind = (r.protection, r.max_protection, r.share_mode, r.user_tag, path)
@@ -472,8 +511,9 @@ def get_resident_memory(process):
     libraries where upstream's static Firecracker on Linux carries 1.6 MiB of
     its own text.
 
-    Not the resident pages of the regions `memory_maps` reads (c8d26ac):
-    pages_resident is the mapped object's residency, not the page tables',
+    Not the regions' resident pages as proc_pidinfo gives them by default
+    (c8d26ac; `memory_maps` reads them in the footprint mode since):
+    pages_resident is then the mapped object's residency, not the page tables',
     so a mapped file counts whole once it is in the buffer cache: after a
     restore from a snapshot file the 256 MiB guest reads 267,792 KiB whether
     the guest has touched a page or not, and test_balloon_snapshot's reading
@@ -740,12 +780,15 @@ if RUNS_AS_USER:
 # ------------------------------------------------- files Firecracker maps
 
 # Upstream's memory monitor counts the pages each mapping has resident: on
-# Linux, the pages Firecracker mapped. For a file, an observer on macOS sees
-# the file's pages in the buffer cache, all of them for a file the test has
-# just written. A pmem backing file, the one file Firecracker maps besides its
-# binary (tools/macos/integration-tests.sh), is rewritten in place without
-# caching before Firecracker is given it, so its resident pages are those its
-# guest touches. Its contents and inode stay the same.
+# Linux, the pages Firecracker mapped. For a file, proc_pidinfo's default
+# mode shows the file's pages in the buffer cache, all of them for a file the
+# test has just written. A pmem backing file, the one file Firecracker maps
+# besides its binary (tools/macos/integration-tests.sh), is rewritten in
+# place without caching before Firecracker is given it, so its resident
+# pages are those its guest touches. Its contents and inode stay the same.
+# `memory_maps` now reads in the footprint mode, where a cached page that is
+# not mapped does not count; the rewrite stays until a pmem run shows the
+# footprint mode alone gives the same counts.
 F_NOCACHE = 48
 
 
@@ -792,9 +835,10 @@ def rss_anon_kib(pid):
     or shared anonymous memory; guest memory not backed by a file is one).
     macOS: the resident pages of the regions that map no file (no vnode
     path in proc_pidinfo(PROC_PIDREGIONPATHINFO)), without the dyld shared
-    cache, as `memory_maps` reads them. For an anonymous region the object's
-    resident pages are the process's (a mapped file's are the buffer
-    cache's, which is why `get_resident_memory` does not use this)."""
+    cache, as `memory_maps` reads them: the pages the process has mapped
+    (the footprint mode), as Linux's RssAnon counts its anonymous pages
+    (fs/proc/task_mmu.c task_mem: get_mm_counter(mm, MM_ANONPAGES), the
+    anonymous pages mapped in its page tables)."""
     return sum(m.rss for m in memory_maps(psutil.Process(pid), grouped=False) if not m.path) // 1024
 
 

@@ -60,9 +60,13 @@ all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
 # of them ran (measured, idle Firecracker without a guest: 5.22 MiB from a
 # binary all in the cache, its binary's mappings 3.84 MiB; 2.84 MiB from
 # the stand-in's copy in the jail, now a clone with no page cached, as
-# upstream's jailer copies the binary into each jail). Not yet re-run with
-# the copy. Only a test whose every failing phase failed with this error is
-# excused.
+# upstream's jailer copies the binary into each jail). wick_macos.memory_maps
+# now reads the regions in the footprint mode (vm.self_region_footprint, which
+# a process sets for itself: XNU vm_map_region_walk then asks the target's
+# pmap per page), so a page counts when Firecracker has it mapped, as on
+# Linux (measured: the idle Firecracker's binary 0.92 MiB, 2.25 MiB in all,
+# from a binary all in the cache). Not yet re-run with either. Only a test
+# whose every failing phase failed with this error is excused.
 all bug failure:host_tools.memory.MemoryUsageExceededError
 
 # The test looks in Firecracker's log for the API socket by its path in the
