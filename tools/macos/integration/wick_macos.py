@@ -559,6 +559,26 @@ _network.Tap = Tap
 # ------------------------------------------------------------ user mode
 
 
+# The jail of each API socket, as the jail named it: Microvm.spawn makes
+# its Api from JailerContext.api_socket_path() (framework/microvm.py),
+# which is chroot_path() joined with the socket's name, and chroot_path()
+# is <chroot_base>/<exec file>/<id>/root (framework/jailer.py) for any
+# chroot_base a test gives (test_diff_snapshot_works_after_error's is its
+# tmpfs), so the jail is not read back from the socket's path.
+_CHROOT_OF_SOCKET = {}
+_real_api_socket_path = _jailer.JailerContext.api_socket_path
+
+
+def api_socket_path(self):
+    """`JailerContext.api_socket_path`, its jail recorded."""
+    path = _real_api_socket_path(self)
+    _CHROOT_OF_SOCKET[str(path)] = str(self.chroot_path())
+    return path
+
+
+_jailer.JailerContext.api_socket_path = api_socket_path
+
+
 if RUNS_AS_USER:
     import framework.utils_drive as _utils_drive  # noqa: E402  pylint: disable=wrong-import-position
 
@@ -621,23 +641,6 @@ if RUNS_AS_USER:
     JAIL_RELATIVE = ".//"
     # A path given as JAIL_RELATIVE, where it starts in a text.
     _JAIL_RELATIVE_IN_TEXT = re.compile(r"(?:^|(?<=[\s'\"(\[=:,]))\.//")
-
-    # The jail of each API socket, as the jail named it: Microvm.spawn makes
-    # its Api from JailerContext.api_socket_path() (framework/microvm.py),
-    # which is chroot_path() joined with the socket's name, and chroot_path()
-    # is <chroot_base>/<exec file>/<id>/root (framework/jailer.py) for any
-    # chroot_base a test gives (test_diff_snapshot_works_after_error's is its
-    # tmpfs), so the jail is not read back from the socket's path.
-    _CHROOT_OF_SOCKET = {}
-    _real_api_socket_path = _jailer.JailerContext.api_socket_path
-
-    def api_socket_path(self):
-        """`JailerContext.api_socket_path`, its jail recorded."""
-        path = _real_api_socket_path(self)
-        _CHROOT_OF_SOCKET[str(path)] = str(self.chroot_path())
-        return path
-
-    _jailer.JailerContext.api_socket_path = api_socket_path
 
     def _chroot_of(api):
         root = _CHROOT_OF_SOCKET.get(str(api.socket))
@@ -771,8 +774,8 @@ def request_mapping_files(self, method, path, **kwargs):
     """Resource.request, with a pmem backing file out of the buffer cache."""
     backing = kwargs.get("path_on_host")
     if self.resource == "/pmem" and method.upper() == "PUT" and isinstance(backing, str):
-        m = re.match(r"^(.*/jailer/[^/]+/[^/]+/root)/", self._api.socket)
-        host = m.group(1) + backing if m and backing.startswith("/") else backing
+        root = _CHROOT_OF_SOCKET.get(str(self._api.socket))
+        host = root + backing if root and backing.startswith("/") else backing
         if os.path.isfile(host):
             evict_cached_pages(host)
     return _request_mapping_files(self, method, path, **kwargs)
