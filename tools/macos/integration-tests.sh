@@ -20,9 +20,12 @@
 # its debug build, Ubuntu 24.04 and Amazon Linux 2023), prepared by
 # tools/macos/integration/setup-artifacts.sh in
 # ~/Library/Caches/wick/integration. Needs squashfs, e2fsprogs, screen 5 and
-# zig (the guest's helper programs, wick_macos.gcc_compile) and coreutils (GNU
-# truncate and du, tools/macos/integration/bin) from Homebrew
-# (brew install squashfs e2fsprogs screen zig coreutils).
+# zig (the guest's helper programs, wick_macos.gcc_compile), coreutils (GNU
+# truncate and du, tools/macos/integration/bin), libslirp and pkg-config (the
+# networks' host side), socat (the vsock tests' host side) and iperf3 (the
+# network tests' host side), as upstream's container has them, from Homebrew
+# (brew install squashfs e2fsprogs screen zig coreutils libslirp pkg-config
+# socat iperf3). A missing one stops the run before any test.
 #
 # OUT (default build/integration-tests/<time>) gets the pytest JSON report
 # (test-report.json), pytest's output (pytest.log), upstream's test_results
@@ -66,6 +69,10 @@ SCREEN_DIR="$(env PATH="/opt/homebrew/bin:$PATH" brew --prefix screen 2>/dev/nul
 [[ -x "$SCREEN_DIR/screen" ]] || die "screen 5 missing: brew install screen (macOS's screen 4.0 has no -Logfile)"
 PATH="/opt/homebrew/bin:$PATH" command -v zig >/dev/null ||
     die "zig missing: brew install zig (it builds the programs the tests run in the guest)"
+for tool in socat iperf3; do
+    PATH="/opt/homebrew/bin:$PATH" command -v "$tool" >/dev/null ||
+        die "$tool missing: brew install $tool (the host side of upstream's vsock and network tests)"
+done
 
 free_gib="${WICK_IT_FREE_GIB:-20}"
 [[ "$free_gib" =~ ^[0-9]+$ ]] || die "WICK_IT_FREE_GIB must be a number of GiB"
@@ -173,7 +180,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
 env_args=(
-    "PATH=$ROOT/tools/macos/integration/bin:$SCREEN_DIR:/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
+    "PATH=$ROOT/tools/macos/integration/bin:$SCREEN_DIR:/opt/homebrew/opt/e2fsprogs/sbin:$PATH:/opt/homebrew/bin"
     "PYTHONPATH=$ROOT/tools/macos/integration"
     "WICK_IT_MODE=$mode" "WICK_IT_ROOT=$session" "TMPDIR=$session/tmp"
     "WICK_IT_NETNS_HELPER=$bin/netns-slirp" "WICK_IT_VHOST_USER_BLK=$bin/vhost-user-blk"

@@ -163,22 +163,43 @@ _utils.wait_process_termination = wait_process_termination
 _libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
 PROC_PIDLISTTHREADIDS = 28
 PROC_PIDTHREADID64INFO = 15
+PROC_PIDTBSDINFO = 3
 
 
 def get_threads(pid):
     """{thread name: [thread id]} of `pid` (upstream: psutil's threads, which
     on macOS needs the process's task port, and each thread's name from
-    /proc). proc_pidinfo lists a process's threads and names to its user."""
+    /proc). proc_pidinfo lists a process's threads and names to its user.
+
+    The main thread: on Linux its name (comm) is the executable's, cut to 15
+    bytes (TASK_COMM_LEN), which is how Microvm.pin_vmm finds Firecracker's
+    ("firecracker"). On macOS Rust's runtime names a program's main thread
+    "main" before `main` runs, on Apple targets only (library/std/src/sys/
+    pal/unix/mod.rs: "We only do this on Apple targets"; measured: a
+    Firecracker started alone has the one thread "main"). The main thread
+    (the oldest: the lowest thread id) named "main" or unnamed is given the
+    process's name (p_comm, PROC_PIDTBSDINFO) cut to 15 bytes, Linux's.
+    Another unnamed thread is too: on Linux it would carry its creator's
+    name, which macOS does not record; Firecracker names every thread it
+    starts."""
     ids = (ctypes.c_uint64 * 1024)()
     n = _libsystem.proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, ctypes.c_uint64(0), ids, ctypes.sizeof(ids))
     if n <= 0:
         return {}
+    bsd = ctypes.create_string_buffer(136)  # struct proc_bsdinfo; pbi_comm at 48, 16 bytes
+    comm = ""
+    if _libsystem.proc_pidinfo(pid, PROC_PIDTBSDINFO, ctypes.c_uint64(0), bsd, 136) == 136:
+        comm = bsd.raw[48:64].split(b"\0", 1)[0].decode(errors="replace")[:15]
     threads = defaultdict(list)
     info = ctypes.create_string_buffer(112)  # struct proc_threadinfo
-    for tid in ids[: n // 8]:
+    tids = list(ids[: n // 8])
+    main = min(tids) if tids else None
+    for tid in tids:
         if _libsystem.proc_pidinfo(pid, PROC_PIDTHREADID64INFO, ctypes.c_uint64(tid), info, 112) <= 0:
             continue
         name = info.raw[48:112].split(b"\0", 1)[0].decode(errors="replace")
+        if not name or (tid == main and name == "main"):
+            name = comm
         threads[name].append(tid)
     return dict(threads)
 
@@ -204,8 +225,38 @@ def _no_affinity(pid, *args):
                   "(thread_policy_set's affinity tag is a hint, not a CPU set)")
 
 
+# The functional tests whose pinning only reduces noise: test_vsock.py's
+# `vsock_uvm` fixture (boot_vsock_vm(pin_threads=True)), the only pinning in
+# integration_tests/functional, used by test_vsock_transport_reset_h2g,
+# _g2h and test_snapshot_restore_with_inflight_vsock_tx. What they assert is
+# that vsock connections are reset by a snapshot and work after a restore;
+# nothing is timed or counted per CPU. Upstream ran them unpinned until
+# e7a459f74 ("refactor fixtures") gave them the fixture its vsock latency
+# test (0a0cdb147, performance/test_vsock.py) pins for. For them pinning is
+# skipped, and said so in the test's log and report; everywhere else (the
+# performance tests, which pin to measure) it still fails with ENOSYS.
+NOISE_ONLY_PINNING = {
+    "integration_tests/functional/test_vsock.py::test_vsock_transport_reset_h2g",
+    "integration_tests/functional/test_vsock.py::test_vsock_transport_reset_g2h",
+    "integration_tests/functional/test_vsock.py::test_snapshot_restore_with_inflight_vsock_tx",
+}
+_unpinned_test = None
+
+
+def set_cpu_affinity(pid, cpulist):
+    """`utils.set_cpu_affinity`: a no-op, logged, in a test of
+    NOISE_ONLY_PINNING; `_no_affinity` everywhere else."""
+    if _unpinned_test is None:
+        _no_affinity(pid, cpulist)
+    msg = (f"CPU affinity of {pid} not set to {cpulist}: macOS has no CPU affinity, and "
+           f"this test's pinning only reduces noise (wick_macos.NOISE_ONLY_PINNING)")
+    _unpinned_test.user_properties.append(("wick_unpinned", msg))
+    import logging  # pylint: disable=import-outside-toplevel
+    logging.getLogger("wick_macos").warning(msg)
+
+
 _utils.get_cpu_affinity = _no_affinity
-_utils.set_cpu_affinity = _no_affinity
+_utils.set_cpu_affinity = set_cpu_affinity
 
 # ------------------------------------------------------- programs it builds
 
@@ -722,7 +773,10 @@ def _outside_rssanon(vm):
 
 def pytest_runtest_setup(item):
     """test_pmem reads RssAnon from /proc, which macOS does not have: its
-    helper reads it as `rss_anon_kib` does."""
+    helper reads it as `rss_anon_kib` does. A test of NOISE_ONLY_PINNING
+    runs unpinned (`set_cpu_affinity`)."""
+    global _unpinned_test  # pylint: disable=global-statement
+    _unpinned_test = item if item.nodeid.split("[", 1)[0] in NOISE_ONLY_PINNING else None
     module = getattr(item, "module", None)
     if module is not None and module.__name__.endswith("test_pmem") and hasattr(module, "outside_rssanon"):
         module.outside_rssanon = _outside_rssanon
