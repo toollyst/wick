@@ -50,8 +50,18 @@ all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
 # also a drive's counts the file's pages the drive read: macOS reports a
 # shared file mapping's resident pages per file, not per process (14 MiB of
 # pmem in test_get_full_config_after_restoring_snapshot, whose guest never
-# touches the pmem device). To do: bring the VMM's own memory under the
-# budget. Only a test whose every failing phase failed with this error is
+# touches the pmem device). The same holds for Firecracker's binary, and
+# its text was the largest part: Linux counts a file mapping's pages the
+# process mapped (smaps Rss, present page-table entries: fs/proc/task_mmu.c
+# smaps_pte_entry), macOS the file's pages in the buffer cache (XNU
+# osfmk/vm/bsd_vm.c fill_procregioninfo -> vm_map_region_look_for_page,
+# vm_page_lookup in the file's object). The user mode's stand-in ran every
+# Firecracker of the session from one binary, so each counted the code all
+# of them ran (measured, idle Firecracker without a guest: 5.22 MiB from a
+# binary all in the cache, its binary's mappings 3.84 MiB; 2.84 MiB from
+# the stand-in's copy in the jail, now a clone with no page cached, as
+# upstream's jailer copies the binary into each jail). Not yet re-run with
+# the copy. Only a test whose every failing phase failed with this error is
 # excused.
 all bug failure:host_tools.memory.MemoryUsageExceededError
 

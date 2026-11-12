@@ -5,7 +5,7 @@
 
 Upstream's framework starts every microVM through the jailer, which needs
 root. In user mode this script takes the jailer's place: it starts
-Firecracker as the jailer's process tree does (`--daemonize`'s double fork
+Firecracker from a copy in the jail (copy_exec) as the jailer's process tree does (`--daemonize`'s double fork
 and new session, `--new-pid-ns`'s child whose pid goes to `<exec>.pid` while
 the launcher exits 0, `--resource-limit`, `--netns`'s network), with the jail's directory as the
 root of every path Firecracker is given on its command line and in its
@@ -19,6 +19,9 @@ the jail's uid and gid, cgroups) is the jailer's own and is tested in the
 does.
 """
 
+import ctypes
+import errno
+import fcntl
 import json
 import os
 import resource
@@ -103,6 +106,47 @@ def join_netns(path):
     os.environ["WICK_NETNS"] = real
 
 
+_libc = ctypes.CDLL(None, use_errno=True)
+F_NOCACHE = 48
+
+
+def copy_exec(src, dst):
+    """The jailer's copy of Firecracker into the jail (env.rs
+    copy_exec_to_chroot: a copy, not a link, so that two Firecrackers share
+    no memory), made so that the copy has no page in the buffer cache.
+
+    Upstream's memory monitor (host_tools/memory.py) counts what each
+    mapping has resident. Linux counts the pages the process mapped (smaps
+    Rss: present page-table entries, fs/proc/task_mmu.c smaps_pte_entry).
+    macOS counts the pages of the mapped file resident in the buffer cache
+    (proc_pidinfo PROC_PIDREGIONINFO, XNU osfmk/vm/bsd_vm.c
+    fill_procregioninfo -> vm_map_region_walk -> vm_map_region_look_for_page:
+    vm_page_lookup in the file's object), whoever brought them in. A
+    binary every Firecracker of the session runs counted the code all of
+    them ran, and a copy written through the cache counts all of it
+    (measured, idle Firecracker: its binary's mappings 1.1 MiB from a clone,
+    3.8 MiB after the binary was read). A clone (clonefile(2), APFS) is a
+    new file whose pages are not resident; where the jail is on another
+    volume, the copy is written past the cache (F_NOCACHE)."""
+    if _libc.clonefile(os.fsencode(src), os.fsencode(dst), 0) == 0:
+        return
+    err = ctypes.get_errno()
+    if err not in (errno.EXDEV, errno.ENOTSUP):
+        die(f"clonefile {src} {dst}: {os.strerror(err)}")
+    fd_in = os.open(src, os.O_RDONLY)
+    fd_out = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o755)
+    try:
+        fcntl.fcntl(fd_in, F_NOCACHE, 1)
+        fcntl.fcntl(fd_out, F_NOCACHE, 1)
+        while chunk := os.read(fd_in, 1 << 20):
+            os.write(fd_out, chunk)
+        os.fchmod(fd_out, os.fstat(fd_in).st_mode & 0o7777)
+        os.fsync(fd_out)
+    finally:
+        os.close(fd_in)
+        os.close(fd_out)
+
+
 def main():
     opts, flags, fc_args = parse(sys.argv[1:])
     if opts["cgroup"] or "parent-cgroup" in opts or "cgroup-version" in opts:
@@ -143,6 +187,12 @@ def main():
     if not has_api:
         # Firecracker's default, /run/firecracker.socket, in the jail.
         args = ["--api-sock", root + "/run/firecracker.socket"] + args
+
+    jailed_exec = os.path.join(root, os.path.basename(exec_file))
+    if os.path.lexists(jailed_exec):
+        os.unlink(jailed_exec)
+    copy_exec(exec_file, jailed_exec)
+    exec_file = jailed_exec
 
     start_us = time.time_ns() // 1000
     cpu_us = time.process_time_ns() // 1000
