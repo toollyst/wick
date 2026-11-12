@@ -5,8 +5,8 @@
 //! itself (Linux's are the kernel's): the values a write may give, parsed as
 //! the kernel parses them, the canonical values it reads back, and the texts
 //! of the jailer's refusals and log lines. The files are upstream's cgroup
-//! freezer files, kept next to the jail by the host's backend (Windows:
-//! `windows::freezer`).
+//! freezer files, kept next to the jail by the host's backend (macOS:
+//! `macos::freezer`, Windows: `windows::freezer`).
 //!
 //! The kernel's side (Linux v6.12, the cgroup core and the v1 freezer):
 //!

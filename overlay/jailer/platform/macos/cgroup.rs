@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::JailerError;
-use crate::platform::{self, FreezerState, FreezerVersion, HostError};
+use crate::platform::{self, FreezerState, FreezerVersion, HostError, freezer_values};
 
 /// The (empty) cgroup v2 hierarchy on macOS.
 const NO_HIERARCHY: &str = "/var/empty";
@@ -94,19 +94,11 @@ impl CgroupConfigurationBuilder {
             }
             (1, "freezer.state") => {
                 self.freezer = Some(platform::parse_freezer_start(&value).ok_or_else(|| {
-                    HostError::CgroupValue(
-                        format!("{file}={value}"),
-                        "only FROZEN or THAWED: the kernel refuses any other value written to freezer.state",
-                    )
+                    HostError::CgroupValue(format!("{file}={value}"), freezer_values::STATE_VALUES)
                 })?);
             }
             (1, _) if controller == "freezer" => {
-                return Err(HostError::CgroupValue(
-                    format!("{file}={value}"),
-                    "not a file the jailer can write: the kernel refuses its write to it (freezer.self_freezing and \
-                     freezer.parent_freezing are read-only)",
-                )
-                .into());
+                return Err(HostError::CgroupValue(format!("{file}={value}"), freezer_values::READ_ONLY).into());
             }
             (2, "cpu.max") => self.cpu = cpu_max(&file, &value)?,
             (1, "cpu.cfs_quota_us") => self.cpu.quota_us = cfs_quota(&file, &value)?,

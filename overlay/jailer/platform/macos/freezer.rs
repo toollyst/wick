@@ -48,7 +48,7 @@
 //! Where the supervisor cannot do as the kernel does, it says so:
 //!
 //! - a write of an invalid value cannot fail as on Linux (EINVAL). It is
-//!   ignored and, once the file has kept it for [`SETTLE_MS`], the file is
+//!   ignored and, once the file has kept it for [`fv::SETTLE_MS`], the file is
 //!   restored to the current state with a line on the supervisor's stderr
 //!   (Firecracker's, /dev/null with `--daemonize`): the value read back is
 //!   always the state;
@@ -82,142 +82,44 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// The cgroup version whose files the jail has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Version {
-    /// `freezer.state`.
-    V1,
-    /// `cgroup.freeze` and `cgroup.events`.
-    V2,
-}
+pub(crate) use super::super::freezer_values::{MAX_FILE, Request, State, Version, parse};
+use super::super::freezer_values as fv;
 
-/// The jail's state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum State {
-    Thawed,
-    Frozen,
-}
-
-/// What the control file holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Request {
-    /// Nothing (yet): a write truncates the file first.
-    Empty,
-    Set(State),
-    /// Not a value the kernel takes, or not a file only root controls.
-    Invalid,
-}
-
-/// The longest control file read; anything longer is invalid.
-pub(crate) const MAX_FILE: usize = 64;
-/// How long an empty or invalid control file is left before it is restored.
-pub(crate) const SETTLE_MS: isize = 200;
 /// The most processes a jail may have (Firecracker, its API process, the
 /// short-lived child that compiles its sandbox profile); more fail the jail.
 const MAX_MEMBERS: usize = 16;
 /// The supervisor's working root.
 const EMPTY_ROOT: &CStr = c"/var/empty";
 
-impl Version {
-    fn control(self) -> &'static CStr {
-        match self {
-            Version::V1 => c"freezer.state",
-            Version::V2 => c"cgroup.freeze",
-        }
-    }
-
-    /// The control file's content for `state`, as Linux reads it back.
-    fn canonical(self, state: State) -> &'static [u8] {
-        match (self, state) {
-            (Version::V1, State::Thawed) => b"THAWED\n",
-            (Version::V1, State::Frozen) => b"FROZEN\n",
-            (Version::V2, State::Thawed) => b"0\n",
-            (Version::V2, State::Frozen) => b"1\n",
-        }
+/// The control file's name ([`Version::control`]) for the calls that take a
+/// C string.
+fn control(version: Version) -> &'static CStr {
+    match version {
+        Version::V1 => c"freezer.state",
+        Version::V2 => c"cgroup.freeze",
     }
 }
 
+/// [`fv::EVENTS`], as a C string.
 const EVENTS: &CStr = c"cgroup.events";
 const EVENTS_TMP: &CStr = c".cgroup.events.tmp";
 
-/// The kernel's `strstrip`: `isspace` characters at both ends.
-fn strstrip(mut b: &[u8]) -> &[u8] {
-    let space = |c: &u8| matches!(c, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r');
-    while b.first().is_some_and(space) {
-        b = &b[1..];
+/// Whether C string `c` holds `s`.
+const fn same_name(c: &CStr, s: &str) -> bool {
+    let (a, b) = (c.to_bytes(), s.as_bytes());
+    if a.len() != b.len() {
+        return false;
     }
-    while b.last().is_some_and(space) {
-        b = &b[..b.len() - 1];
-    }
-    b
-}
-
-/// The kernel's `kstrtoint(s, 0)`: an optional sign, then `0x` hex, `0`
-/// octal or decimal digits, nothing else, within an `int`.
-fn kstrtoint(s: &[u8]) -> Option<i32> {
-    let (neg, s) = match s.first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let s = if !neg && s.first() == Some(&b'+') { &s[1..] } else { s };
-    let (radix, digits) = if s.len() >= 3 && s[0] == b'0' && s[1] | 0x20 == b'x' && s[2].is_ascii_hexdigit() {
-        (16, &s[2..])
-    } else if s.first() == Some(&b'0') {
-        (8, s)
-    } else {
-        (10, s)
-    };
-    if digits.is_empty() {
-        return None;
-    }
-    let mut v: i64 = 0;
-    for &c in digits {
-        let d = char::from(c).to_digit(radix)?;
-        v = v.checked_mul(i64::from(radix))?.checked_add(i64::from(d))?;
-        if v > i64::from(i32::MAX) + 1 {
-            return None;
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
         }
+        i += 1;
     }
-    i32::try_from(if neg { -v } else { v }).ok()
+    true
 }
-
-/// What `content` of the control file asks for, as the kernel parses a
-/// write to it: v1 `freezer_write` (`THAWED` or `FROZEN` after strstrip),
-/// v2 `cgroup_freeze_write` (`kstrtoint` of 0 or 1).
-pub(crate) fn parse(version: Version, content: &[u8]) -> Request {
-    if content.is_empty() {
-        return Request::Empty;
-    }
-    if content.len() > MAX_FILE {
-        return Request::Invalid;
-    }
-    let s = strstrip(content);
-    let state = match version {
-        Version::V1 => match s {
-            b"THAWED" => Some(State::Thawed),
-            b"FROZEN" => Some(State::Frozen),
-            _ => None,
-        },
-        Version::V2 => match kstrtoint(s) {
-            Some(0) => Some(State::Thawed),
-            Some(1) => Some(State::Frozen),
-            _ => None,
-        },
-    };
-    state.map_or(Request::Invalid, Request::Set)
-}
-
-/// `--cgroup freezer.state=<value>` (v1) at the start: the state, or why
-/// the kernel would refuse the jailer's write of it.
-pub(crate) fn parse_start(value: &str) -> Option<State> {
-    let mut content = value.as_bytes().to_vec();
-    content.push(b'\n');
-    match parse(Version::V1, &content) {
-        Request::Set(state) => Some(state),
-        _ => None,
-    }
-}
+const _: () = assert!(same_name(EVENTS, fv::EVENTS));
 
 fn check(ret: libc::c_int) -> io::Result<libc::c_int> {
     if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(ret) }
@@ -261,9 +163,9 @@ impl Files {
             )));
         }
         let files = Files { dir, path: jail_dir.to_owned(), version, owner };
-        files.create_file(version.control(), version.canonical(state))?;
+        files.create_file(control(version), version.canonical(state))?;
         if version == Version::V2 {
-            files.create_file(EVENTS, &events(true, state == State::Frozen))?;
+            files.create_file(EVENTS, &fv::events(true, state == State::Frozen))?;
         }
         Ok(files)
     }
@@ -343,7 +245,7 @@ impl Files {
     /// Reads the control file: the request, and whether the file holds
     /// the request's canonical form.
     pub(crate) fn read(&self) -> io::Result<(Request, bool)> {
-        let Some((file, _)) = self.open_trusted(self.version.control(), libc::O_RDONLY)? else {
+        let Some((file, _)) = self.open_trusted(control(self.version), libc::O_RDONLY)? else {
             return Ok((Request::Invalid, false));
         };
         let mut buf = [0u8; MAX_FILE + 1];
@@ -372,7 +274,7 @@ impl Files {
     /// it open writes to the same file (a file renamed over it would take
     /// that write away unseen). One that is not a trusted file is replaced.
     pub(crate) fn restore(&self, state: State) -> io::Result<()> {
-        let name = self.version.control();
+        let name = control(self.version);
         match self.open_trusted(name, libc::O_WRONLY)? {
             Some((file, _)) => {
                 // SAFETY: a descriptor of ours.
@@ -402,7 +304,7 @@ impl Files {
         if ret != 0 && errno(&io::Error::last_os_error()) != libc::ENOENT {
             return Err(io::Error::last_os_error());
         }
-        self.create_file(EVENTS_TMP, &events(populated, frozen))?;
+        self.create_file(EVENTS_TMP, &fv::events(populated, frozen))?;
         // SAFETY: a directory descriptor and NUL-terminated names.
         check(unsafe {
             libc::renameat(self.dir.as_raw_fd(), EVENTS_TMP.as_ptr(), self.dir.as_raw_fd(), EVENTS.as_ptr())
@@ -412,12 +314,8 @@ impl Files {
 
     /// A descriptor of the control file to watch, and its identity.
     fn watch_fd(&self) -> io::Result<Option<(OwnedFd, Ident)>> {
-        self.open_trusted(self.version.control(), libc::O_EVTONLY)
+        self.open_trusted(control(self.version), libc::O_EVTONLY)
     }
-}
-
-fn events(populated: bool, frozen: bool) -> Vec<u8> {
-    format!("populated {}\nfrozen {}\n", u8::from(populated), u8::from(frozen)).into_bytes()
 }
 
 fn write_all_at(file: &OwnedFd, content: &[u8]) -> io::Result<()> {
@@ -492,7 +390,7 @@ pub(crate) struct Watch {
 pub(crate) enum Event {
     /// The control file or the directory changed.
     File,
-    /// The control file stayed empty or invalid for [`SETTLE_MS`].
+    /// The control file stayed empty or invalid for [`fv::SETTLE_MS`].
     Settled,
     /// A process event (`NOTE_EXIT`, `NOTE_FORK`, `NOTE_EXEC` bits).
     Proc(libc::pid_t, u32),
@@ -552,7 +450,7 @@ impl Watch {
     }
 
     fn settle_later(&self) -> io::Result<()> {
-        self.change(&[kev(TIMER_SETTLE, libc::EVFILT_TIMER, libc::EV_ADD | libc::EV_ONESHOT, 0, SETTLE_MS)])
+        self.change(&[kev(TIMER_SETTLE, libc::EVFILT_TIMER, libc::EV_ADD | libc::EV_ONESHOT, 0, isize::try_from(fv::SETTLE_MS).unwrap_or(isize::MAX))])
     }
 
     fn settle_cancel(&self) {
@@ -618,7 +516,7 @@ impl Watch {
 pub(crate) struct Control {
     /// The state the jail is in (or is being put in).
     pub(crate) state: State,
-    /// An empty or invalid file waits for [`SETTLE_MS`] to be restored.
+    /// An empty or invalid file waits for [`fv::SETTLE_MS`] to be restored.
     settling: bool,
 }
 
@@ -653,11 +551,7 @@ impl Control {
             }
             Request::Empty | Request::Invalid if event == Event::Settled => {
                 self.settling = false;
-                let what = if request == Request::Empty { "empty" } else { "not a valid value, or not a file root alone controls" };
-                log(&format!(
-                    "{}: {what}, ignored (Linux refuses such a write); the file reads the current state again",
-                    files.version.control().to_string_lossy()
-                ));
+                log(&fv::ignored(files.version, request));
                 files.restore(self.state)?;
                 watch.rearm(files)?;
                 Ok(None)
@@ -1016,7 +910,7 @@ pub(crate) fn self_check(os: &mut dyn Os) -> Result<(), String> {
     let mut status = 0;
     // SAFETY: our child; an out-pointer.
     while unsafe { libc::waitpid(child, &mut status, 0) } < 0 && errno(&io::Error::last_os_error()) == libc::EINTR {}
-    result.map_err(|e| format!("the freezer cannot work on this host: {e}"))
+    result.map_err(|e| format!("{}: {e}", fv::CANNOT_WORK))
 }
 
 // ---------------------------------------------------------------- the supervisor
@@ -1190,7 +1084,7 @@ impl<'a> Supervisor<'a> {
         match result {
             Ok(()) => End::Empty,
             Err(failure) => {
-                (self.log)(&format!("{failure}: the jail is killed rather than left unfrozen or frozen against the request"));
+                (self.log)(&format!("{failure}: {}", fv::KILLED));
                 self.jail.kill_all(self.os);
                 let _ = self.files.write_events(false, self.control.state == State::Frozen);
                 End::Killed
@@ -1444,6 +1338,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::platform::freezer_values::parse_start;
 
     fn uid() -> u32 {
         // SAFETY: no arguments.
@@ -1501,6 +1396,15 @@ mod tests {
         for bad in ["", "FREEZING", "bogus", "1"] {
             assert_eq!(parse_start(bad), None, "{bad}");
         }
+    }
+
+    // The C string names are the shared module's.
+    #[test]
+    fn test_c_names() {
+        for v in [Version::V1, Version::V2] {
+            assert!(same_name(control(v), v.control()), "{v:?}");
+        }
+        assert!(!same_name(c"cgroup.event", fv::EVENTS));
     }
 
     fn content(path: &Path) -> String {
@@ -1661,7 +1565,7 @@ mod tests {
                 restored |= e == Event::Settled;
             }
         }
-        assert!(restored && t0.elapsed() >= Duration::from_millis(SETTLE_MS as u64), "{:?}", t0.elapsed());
+        assert!(restored && t0.elapsed() >= Duration::from_millis(u64::from(fv::SETTLE_MS)), "{:?}", t0.elapsed());
         assert_eq!(content(&state), "FROZEN\n");
         assert_eq!(control.state, State::Frozen);
         assert_eq!(log.len(), 1, "{log:?}");
@@ -1675,7 +1579,7 @@ mod tests {
         std::fs::write(&state, "THAWED\n").unwrap();
         let t0 = Instant::now();
         let mut thawed = false;
-        while t0.elapsed() < Duration::from_millis(SETTLE_MS as u64 * 2) {
+        while t0.elapsed() < Duration::from_millis(u64::from(fv::SETTLE_MS) * 2) {
             let mut events = Vec::new();
             watch.wait(Some(50), &mut events).unwrap();
             for e in events {

@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::JailerError;
 
 mod freezer;
-pub(crate) use freezer::{State as FreezerState, Version as FreezerVersion, parse_start as parse_freezer_start};
+pub(crate) use super::freezer_values::{State as FreezerState, Version as FreezerVersion, parse_start as parse_freezer_start};
 
 /// Environment variable through which Firecracker takes the jail over
 /// (`vmm::ext::jail::ENV`).
