@@ -58,14 +58,25 @@ fn real(slot: &AtomicUsize, name: &std::ffi::CStr) -> usize {
 
 /// Resolved when the binary is loaded, before any sandbox narrows what
 /// the process may do.
-extern "C" fn resolve() {
+#[no_mangle]
+extern "C" fn wick_compat_unix_stream_resolve() {
     real(&REAL_SOCKET, c"socket");
     real(&REAL_SOCKETPAIR, c"socketpair");
 }
 
-#[used]
-#[link_section = "__DATA,__mod_init_func"]
-static RESOLVE: extern "C" fn() = resolve;
+// The initializer's pointer is written in assembly, not as a Rust static in
+// `__DATA,__mod_init_func`: AddressSanitizer (the fuzz targets build with
+// it) pads every global it may instrument to 32 bytes, and on Mach-O it has
+// no exception for this section (LLVM AddressSanitizer.cpp,
+// shouldInstrumentGlobal: .init_array is exempt, __mod_init_func is not), so
+// the static's redzone became three null initializers and ld refused to link
+// ("initializer pointer has no target"). Assembly is not instrumented.
+core::arch::global_asm!(
+    ".section __DATA,__mod_init_func,mod_init_funcs",
+    ".p2align 3",
+    ".quad _wick_compat_unix_stream_resolve",
+    ".text",
+);
 
 /// Gives `fd` Linux's default send buffer. On failure `fd` is closed and
 /// the error is the call's, so no stream is left with xnu's 8 KiB.
