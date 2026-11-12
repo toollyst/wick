@@ -426,6 +426,11 @@ mod tests {
     const MSR_DAIFCLR_D: u32 = 0xd503_48ff;
     const ISB: u32 = 0xd503_3fdf;
 
+    /// msr DBGBVR1_EL1, x1 (2, 0, 0, 1, 4).
+    const MSR_DBGBVR1_X1: u32 = 0xd510_0181;
+    /// mrs x0, DBGBVR1_EL1.
+    const MRS_X0_DBGBVR1: u32 = 0xd530_0180;
+
     /// DBGBCR as Firecracker's gdb stub writes it (gdb/arch/aarch64.rs
     /// `set_kvm_debug`): enabled, EL1 and EL0, all four bytes.
     const BCR: u64 = 0b1 | (0b11 << 1) | (0b1111 << 5);
@@ -738,6 +743,48 @@ mod tests {
             set(&vcpu, id, v);
         }
         assert_eq!(reported(&mut vcpu) >> 26, 0x31);
+    }
+
+    #[test]
+    fn test_debug_registers_are_listed_and_restored_as_kvms() {
+        // KVM_GET_REG_LIST lists DBGB{V,C}R0-15 and DBGW{V,C}R0-15 whatever
+        // the host has (sys_regs.c DBG_BCR_BVR_WCR_WVR_EL1(0..15)), reset to
+        // 0, and keeps each one's value (get_bvr/set_bvr), so a snapshot
+        // carries the guest's own and a restore gives them back.
+        let (_vm, mut vcpu) = guest(&[MSR_DBGBVR1_X1, STR_X0_X4, MRS_X0_DBGBVR1, STR_X0_X4, B_SELF], &[]);
+        let mut list = kvm_bindings::RegList::new(500).unwrap();
+        vcpu.get_reg_list(&mut list).unwrap();
+        let ids: Vec<u64> = (0..16).flat_map(|n| (4..=7).map(move |op2| sys_id(dbg_reg(n, op2)))).collect();
+        for id in &ids {
+            assert!(list.as_slice().contains(id), "{id:#x} not listed");
+            assert_eq!(get(&vcpu, *id), 0, "{id:#x} not reset to 0");
+        }
+        // Above the host's count too (KVM keeps all 16).
+        let last = sys_id(dbg_reg(15, 6));
+        set(&vcpu, last, 0x1234_5000);
+        assert_eq!(get(&vcpu, last), 0x1234_5000);
+        // The guest writes its own DBGBVR1; a snapshot of every listed
+        // register is taken; the register is changed, the snapshot
+        // restored, and the guest reads its own value back.
+        set(&vcpu, x_reg(1), 0xffff_8000_0812_3400);
+        reported(&mut vcpu);
+        let snapshot: Vec<(u64, Vec<u8>)> = list
+            .as_slice()
+            .iter()
+            .map(|id| {
+                let mut buf = vec![0u8; super::super::regs::reg_size(*id)];
+                vcpu.get_one_reg(*id, &mut buf).unwrap();
+                (*id, buf)
+            })
+            .collect();
+        let bvr1 = sys_id(dbg_reg(1, 4));
+        set(&vcpu, bvr1, 0);
+        set(&vcpu, last, 0);
+        for (id, value) in &snapshot {
+            vcpu.set_one_reg(*id, value).unwrap_or_else(|e| panic!("{id:#x}: {e}"));
+        }
+        assert_eq!((get(&vcpu, bvr1), get(&vcpu, last)), (0xffff_8000_0812_3400, 0x1234_5000));
+        assert_eq!(reported(&mut vcpu), 0xffff_8000_0812_3400);
     }
 
     #[test]

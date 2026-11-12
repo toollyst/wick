@@ -177,6 +177,17 @@ pub fn reg_list() -> Vec<u64> {
     ids.push(core_id(KVM_REG_SIZE_U32, OFF_FPSR));
     ids.push(core_id(KVM_REG_SIZE_U32, OFF_FPCR));
     ids.extend(STATE_SYSREGS.iter().map(|r| sys_id(*r)));
+    // DBGBVRn, DBGBCRn, DBGWVRn, DBGWCRn (op0 2, op1 0, CRn 0, CRm n, op2 4
+    // to 7), all 16 of each whatever the host has, as KVM lists them
+    // (arch/arm64/kvm/sys_regs.c DBG_BCR_BVR_WCR_WVR_EL1(0..15), kept per
+    // vCPU in vcpu_debug_state by get_bvr/set_bvr); Hypervisor.framework
+    // keeps all 16 too (measured on a host with 6 breakpoints and 4
+    // watchpoints: every one reads back what was written).
+    for n in 0..16u16 {
+        for op2 in 4..=7u16 {
+            ids.push(sys_id(0x8000 | n << 3 | op2));
+        }
+    }
     // KVM lists OSLSR_EL1 (its descriptor has set_user), so a snapshot keeps
     // the OS lock.
     ids.push(sys_id(OSLSR_EL1));
