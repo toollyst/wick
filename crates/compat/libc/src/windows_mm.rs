@@ -1866,114 +1866,191 @@ pub(crate) fn uffd_unalias(alias: usize) {
     unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, 0) };
 }
 
-/// `madvise`. Discarding registered userfaultfd memory makes its pages
-/// missing again (`wick_uffd::discarding`), as on Linux.
+/// `madvise`. Discarding registered userfaultfd memory makes the pages of
+/// what was discarded missing again (`wick_uffd::discarding`), as on Linux.
 ///
 /// # Safety
 /// Same contract as `madvise(2)`.
 pub unsafe fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
     if (advice == MADV_DONTNEED || advice == MADV_FREE) && crate::wick_uffd::active() {
         let end = (addr as usize).saturating_add(len.div_ceil(PAGE) * PAGE);
-        return crate::wick_uffd::discarding(addr as u64, (end - addr as usize) as u64, || {
+        return crate::wick_uffd::discarding(addr as u64, (end - addr as usize) as u64, |done| {
             // SAFETY: the caller's contract.
-            unsafe { madvise_plain(addr, len, advice) }
+            unsafe { madvise_plain(addr, len, advice, done) }
         });
     }
     // SAFETY: the caller's contract.
-    unsafe { madvise_plain(addr, len, advice) }
+    unsafe { madvise_plain(addr, len, advice, &mut Vec::new()) }
 }
 
-/// `madvise` without the userfaultfd side.
+/// The parts of `[s, e)` of the region at `b` that are mapped (not its holes).
+fn mapped_parts(r: &Region, b: usize, s: usize, e: usize) -> Vec<(usize, usize)> {
+    let mut parts = Vec::new();
+    let mut at = s;
+    for &(off, n) in &r.holes {
+        let (hs, he) = (b + off, b + off + n);
+        if he <= at || hs >= e {
+            continue;
+        }
+        if hs > at {
+            parts.push((at, hs));
+        }
+        at = at.max(he);
+    }
+    if at < e {
+        parts.push((at, e));
+    }
+    parts
+}
+
+/// `madvise` without the userfaultfd side; `done` gets the pieces a
+/// `MADV_DONTNEED` or `MADV_FREE` discarded.
+///
+/// As Linux (mm/madvise.c): `EINVAL` for an unknown advice, an unaligned
+/// start or a length that wraps; 0 for no length; the advice goes to each
+/// mapped part in turn and, if part of the range is not mapped, `ENOMEM`
+/// after; an error stops the walk, the parts before it advised. Large pages
+/// are Linux's hugetlb: a discard's start must be a whole large page
+/// (`EINVAL`), its end is rounded down to one, and `MADV_FREE` is `EINVAL`.
 ///
 /// # Safety
 /// Same contract as `madvise(2)`.
-unsafe fn madvise_plain(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
-    let start = addr as usize;
-    if !start.is_multiple_of(PAGE) {
-        return fail(crate::EINVAL, -1);
-    }
-    let end = start + len.div_ceil(PAGE) * PAGE;
+unsafe fn madvise_plain(addr: *mut c_void, len: size_t, advice: c_int, done: &mut Vec<(u64, u64)>) -> c_int {
     match advice {
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_DONTFORK | MADV_DOFORK
         | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP
         | MADV_DODUMP | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE => {}
         _ => return fail(crate::EINVAL, -1),
     }
+    let start = addr as usize;
+    if !start.is_multiple_of(PAGE) {
+        return fail(crate::EINVAL, -1);
+    }
+    let Some(end) = len.checked_next_multiple_of(PAGE).and_then(|n| start.checked_add(n)) else {
+        return fail(crate::EINVAL, -1);
+    };
+    if end == start {
+        return 0;
+    }
     let t = table().lock().unwrap();
-    if !covered(&t, start, end) {
-        return fail(crate::ENOMEM, -1);
-    }
-    if advice == MADV_WILLNEED {
-        let range = WIN32_MEMORY_RANGE_ENTRY {
-            VirtualAddress: start as *mut c_void,
-            NumberOfBytes: end - start,
-        };
-        // SAFETY: prefetches our mapping; advisory.
-        unsafe { PrefetchVirtualMemory(proc(), 1, &range, 0) };
-        return 0;
-    }
-    if advice != MADV_DONTNEED && advice != MADV_FREE {
-        return 0;
-    }
+    let mut unmapped = !covered(&t, start, end);
+    let discard = advice == MADV_DONTNEED || advice == MADV_FREE;
     for b in overlapping(&t, start, end) {
         let r = &t[&b];
         let (s, e) = (start.max(b), end.min(b + r.len));
-        if let Kind::Large { page, fresh, .. } = r.kind {
+        let parts = mapped_parts(r, b, s, e);
+        if parts.iter().map(|(a, z)| z - a).sum::<usize>() != e - s {
+            unmapped = true;
+        }
+        for (s, e) in parts {
+            if advice == MADV_WILLNEED {
+                let range = WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: s as *mut c_void, NumberOfBytes: e - s };
+                // SAFETY: prefetches our mapping; advisory.
+                unsafe { PrefetchVirtualMemory(proc(), 1, &range, 0) };
+            }
+            if !discard {
+                continue;
+            }
+            // SAFETY: the caller's contract, for this part.
+            if let Err(errno) = unsafe { discard_part(r, b, s, e, advice, done) } {
+                return fail(errno, -1);
+            }
+        }
+    }
+    if unmapped {
+        return fail(crate::ENOMEM, -1);
+    }
+    0
+}
+
+/// `MADV_DONTNEED` or `MADV_FREE` of `[s, e)`, a mapped part of the region at
+/// `b`; what it discarded goes to `done`.
+///
+/// # Safety
+/// Same contract as `madvise(2)`.
+unsafe fn discard_part(
+    r: &Region,
+    b: usize,
+    s: usize,
+    e: usize,
+    advice: c_int,
+    done: &mut Vec<(u64, u64)>,
+) -> Result<(), c_int> {
+    match &r.kind {
+        Kind::Large { page, fresh, .. } => {
             // Locked large pages cannot be dropped: they are zeroed in place,
             // whole pages only, as Linux drops whole huge pages (pages never
             // writable are zeros still).
-            if !(s - b).is_multiple_of(page) || !(e - b).is_multiple_of(page) {
-                return fail(crate::EINVAL, -1);
+            if advice == MADV_FREE || !(s - b).is_multiple_of(*page) {
+                return Err(crate::EINVAL);
             }
-            if !fresh {
-                zero_large(s, e - s);
-            }
-            continue;
-        }
-        let Kind::Private { file } = &r.kind else {
-            continue;
-        };
-        if !r.mapped_in(s - b, e - s) {
-            return fail(crate::ENOMEM, -1);
-        }
-        // Run by run of equal protection, restored after.
-        let mut at = s;
-        while at < e {
-            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid.
-            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-            // SAFETY: queries our memory.
-            if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) }
-                == 0
-            {
-                return fail(crate::ENOMEM, -1);
-            }
-            let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(e) - at;
-            if mbi.State != MEM_COMMIT {
-                // Mapped `PROT_NONE` and decommitted: no pages to drop.
-                at += run;
-                continue;
-            }
-            // SAFETY: drops the pages of our private memory.
-            unsafe { VirtualFree(at as *mut c_void, run, MEM_DECOMMIT) };
-            // Lazy memory gets zero pages again at its next access.
-            if !lazy_within(at, run).is_empty() {
-                at += run;
-                continue;
-            }
-            if !commit(at, run, PAGE_READWRITE, false) {
-                return fail(crate::ENOMEM, -1);
-            }
-            if let Some((f, off)) = file {
-                let from = *off + i64::try_from(at - b).unwrap();
-                if !fill_from_file(at, run, f.0, from) {
-                    return fail(crate::EIO, -1);
+            let e = b + (e - b) / page * page;
+            if e > s {
+                if !fresh {
+                    zero_large(s, e - s);
                 }
+                done.push((s as u64, e as u64));
             }
-            protect(at, run, mbi.Protect);
-            at += run;
+            Ok(())
+        }
+        Kind::Private { file } => {
+            // SAFETY: the caller's contract.
+            unsafe { discard_private(b, s, e, file.as_ref()) }?;
+            done.push((s as u64, e as u64));
+            Ok(())
+        }
+        // Shared views keep their pages, which hold the file's (or the
+        // userfaultfd's, which discards them itself) contents.
+        _ => {
+            done.push((s as u64, e as u64));
+            Ok(())
         }
     }
-    0
+}
+
+/// Drops the pages of `[s, e)` of the private mapping at `b`, which read as
+/// zeros again, or as the file's contents for a private file mapping.
+///
+/// # Safety
+/// Same contract as `madvise(2)`.
+unsafe fn discard_private(b: usize, s: usize, e: usize, file: Option<&(Arc<Owned>, i64)>) -> Result<(), c_int> {
+    // Run by run of equal protection, restored after.
+    let mut at = s;
+    while at < e {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: queries our memory.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) }
+            == 0
+        {
+            return Err(crate::ENOMEM);
+        }
+        let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(e) - at;
+        if mbi.State != MEM_COMMIT {
+            // Mapped `PROT_NONE` and decommitted: no pages to drop.
+            at += run;
+            continue;
+        }
+        // SAFETY: drops the pages of our private memory.
+        unsafe { VirtualFree(at as *mut c_void, run, MEM_DECOMMIT) };
+        // Lazy memory gets zero pages again at its next access.
+        if !lazy_within(at, run).is_empty() {
+            at += run;
+            continue;
+        }
+        if !commit(at, run, PAGE_READWRITE, false) {
+            return Err(crate::ENOMEM);
+        }
+        if let Some((f, off)) = file {
+            let from = *off + i64::try_from(at - b).unwrap();
+            if !fill_from_file(at, run, f.0, from) {
+                return Err(crate::EIO);
+            }
+        }
+        protect(at, run, mbi.Protect);
+        at += run;
+    }
+    Ok(())
 }
 
 /// `mincore`: 1 for pages in the working set.
@@ -2073,6 +2150,50 @@ mod tests {
     }
 
     const ANON: c_int = MAP_PRIVATE | MAP_ANONYMOUS;
+
+    /// `madvise`'s range and errors are Linux's (mm/madvise.c): `EINVAL` for
+    /// an unknown advice, an unaligned start or a length that wraps; 0 for
+    /// no length; the mapped parts are advised and `ENOMEM` follows for the
+    /// rest, a hole or the end of the mapping.
+    #[test]
+    fn test_madvise_range_as_linux() {
+        let _serial = serial();
+        let errno = || std::io::Error::last_os_error().raw_os_error();
+        let m = map(0, 4 * PAGE, PROT_READ | PROT_WRITE, ANON, -1, 0);
+        // SAFETY: our mapping, and the pages of it each check leaves mapped.
+        unsafe {
+            for i in 0..4u8 {
+                *((m + usize::from(i) * PAGE) as *mut u8) = 1 + i;
+            }
+            assert_eq!(madvise((m + 1) as *mut c_void, PAGE, MADV_DONTNEED), -1, "unaligned");
+            assert_eq!(errno(), Some(crate::EINVAL));
+            assert_eq!(madvise(m as *mut c_void, usize::MAX - PAGE, MADV_DONTNEED), -1, "wraps");
+            assert_eq!(errno(), Some(crate::EINVAL));
+            assert_eq!(madvise(m as *mut c_void, PAGE, 999), -1, "unknown advice");
+            assert_eq!(errno(), Some(crate::EINVAL));
+            assert_eq!(madvise(m as *mut c_void, 0, MADV_DONTNEED), 0);
+            assert_eq!(*(m as *const u8), 1, "nothing discarded");
+            // A hole: the pages on either side of it are discarded, then ENOMEM.
+            assert_eq!(munmap((m + PAGE) as *mut c_void, PAGE), 0);
+            for advice in [MADV_NORMAL, MADV_WILLNEED] {
+                assert_eq!(madvise(m as *mut c_void, 3 * PAGE, advice), -1, "advice {advice}");
+                assert_eq!(errno(), Some(crate::ENOMEM));
+            }
+            assert_eq!(*(m as *const u8), 1);
+            assert_eq!(madvise(m as *mut c_void, 3 * PAGE, MADV_DONTNEED), -1, "hole");
+            assert_eq!(errno(), Some(crate::ENOMEM));
+            assert_eq!(*(m as *const u8), 0, "before the hole");
+            assert_eq!(*((m + 2 * PAGE) as *const u8), 0, "after the hole");
+            assert_eq!(*((m + 3 * PAGE) as *const u8), 4, "past the range");
+            // The end of the mapping: the mapped page is discarded, then ENOMEM.
+            *((m + 2 * PAGE) as *mut u8) = 5;
+            assert_eq!(munmap((m + 3 * PAGE) as *mut c_void, PAGE), 0);
+            assert_eq!(madvise((m + 2 * PAGE) as *mut c_void, 2 * PAGE, MADV_DONTNEED), -1, "past the end");
+            assert_eq!(errno(), Some(crate::ENOMEM));
+            assert_eq!(*((m + 2 * PAGE) as *const u8), 0);
+            assert_eq!(munmap(m as *mut c_void, 4 * PAGE), 0);
+        }
+    }
 
     fn state(addr: usize) -> u32 {
         // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
@@ -2761,8 +2882,15 @@ mod tests {
             *(page as *mut u8) = 7;
             *((page + (4 << 20) - 1) as *mut u8) = 9;
             assert_eq!(munmap(page as *mut c_void, large), -1, "part of a large-page mapping");
-            assert_eq!(madvise(page as *mut c_void, PAGE, MADV_DONTNEED), -1, "part of a large page");
-            assert_eq!(madvise(page as *mut c_void, large, MADV_DONTNEED), 0);
+            // Linux's hugetlb MADV_DONTNEED: the start a whole huge page
+            // (EINVAL), the end rounded down to one; no MADV_FREE.
+            assert_eq!(madvise((page + PAGE) as *mut c_void, large, MADV_DONTNEED), -1, "unaligned start");
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EINVAL));
+            assert_eq!(madvise(page as *mut c_void, large, MADV_FREE), -1, "MADV_FREE");
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EINVAL));
+            assert_eq!(madvise(page as *mut c_void, PAGE, MADV_DONTNEED), 0, "rounded down to nothing");
+            assert_eq!(*(page as *const u8), 7);
+            assert_eq!(madvise(page as *mut c_void, large + PAGE, MADV_DONTNEED), 0);
             assert_eq!(*(page as *const u8), 0);
             assert_eq!(*((page + (4 << 20) - 1) as *const u8), 9);
             // The protection it has, and no other (Windows changes no large

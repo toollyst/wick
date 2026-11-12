@@ -356,7 +356,22 @@ pub fn for_each_missing(start: u64, len: u64, mut f: impl FnMut(u64, u64)) {
     let mut run: Option<u64> = None;
     let mut addr = start - start % PAGE;
     while addr < end {
-        let missing = is_missing(addr);
+        let (missing, next) = match find(addr) {
+            Some((r, page)) => (Range::test(&r.tracked, page) && Range::test(&r.missing, page), addr + PAGE),
+            // Unregistered memory holds no missing page: on to the next
+            // range (a walk by pages over a span as large as a
+            // `MADV_DONTNEED` may name would not end).
+            None => {
+                let next = RANGES
+                    .iter()
+                    .map(|r| r.start.load(Ordering::Acquire))
+                    .filter(|&s| s > addr)
+                    .min()
+                    .unwrap_or(end)
+                    .min(end);
+                (false, next.max(addr + PAGE))
+            }
+        };
         match (missing, run) {
             (true, None) => run = Some(addr),
             (false, Some(s)) => {
@@ -365,7 +380,7 @@ pub fn for_each_missing(start: u64, len: u64, mut f: impl FnMut(u64, u64)) {
             }
             _ => {}
         }
-        addr += PAGE;
+        addr = next;
     }
     if let Some(s) = run {
         f(s, end.min(addr) - s);
@@ -678,51 +693,58 @@ pub fn wake_range(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
 }
 
 /// Wraps a `MADV_DONTNEED` of `[start, start + len)`: `discard` runs on the
-/// memory that is not registered; registered pages are missing again, their
-/// memory discarded, and a remove event is queued (with `EVENT_REMOVE`).
-pub fn discarding(start: u64, len: u64, discard: impl FnOnce() -> c_int) -> c_int {
+/// memory that is not registered and reports the pieces it reached (all of
+/// the mapped memory, or what it reached before an error); the registered
+/// pages of those pieces are missing again, their memory discarded, and a
+/// remove event is queued for each piece (with `EVENT_REMOVE`). Pages the
+/// discard did not reach keep their contents, as on Linux when it stops at
+/// an error.
+pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)>) -> c_int) -> c_int {
     let end = start.saturating_add(len);
+    let mut done = Vec::new();
     let touches = RANGES.iter().any(|r| {
         let s = r.start.load(Ordering::Acquire);
         s != 0 && start < r.end.load(Ordering::Acquire) && s < end
     });
     if !touches {
-        return discard();
+        return discard(&mut done);
     }
     let _guard = LOCK.lock().unwrap();
-    let ret = discard();
+    let ret = discard(&mut done);
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::Acquire);
         let e = r.end.load(Ordering::Acquire);
         if s == 0 || start >= e || s >= end {
             continue;
         }
-        let (from, to) = (start.max(s) - start.max(s) % PAGE, end.min(e));
         let alias = r.alias.load(Ordering::Acquire);
-        let mut any = false;
-        let mut addr = from;
-        while addr < to {
-            let page = (addr - s) / PAGE;
-            if Range::test(&r.tracked, page) {
-                Range::set(&r.missing, page, true);
-                any = true;
-            }
-            addr += PAGE;
-        }
-        if !any {
-            continue;
-        }
-        let mut runs = Vec::new();
-        for_each_missing(from, to - from, |a, l| runs.push((a, l)));
-        for (a, l) in runs {
-            let _ = protect(a, l, false);
-            // Filling a missing page writes all of it: its content can go.
-            // SAFETY: the alias of registered memory.
-            unsafe { DiscardVirtualMemory((alias + (a - s)) as *mut c_void, l as usize) };
-        }
         let ctx = r.ctx.load(Ordering::Acquire);
-        if CTXS[ctx].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0 {
-            post(ctx, [proto::EVENT_REMOVE, from, to, 0]);
+        let remove = CTXS[ctx].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0;
+        for &(a, b) in &done {
+            // The range's whole pages inside the piece.
+            let (first, last) = ((a.max(s) - s).div_ceil(PAGE), (b.min(e).max(s) - s) / PAGE);
+            let mut any = false;
+            for page in first..last {
+                if Range::test(&r.tracked, page) {
+                    Range::set(&r.missing, page, true);
+                    any = true;
+                }
+            }
+            if !any {
+                continue;
+            }
+            let (from, to) = (s + first * PAGE, s + last * PAGE);
+            let mut runs = Vec::new();
+            for_each_missing(from, to - from, |a, l| runs.push((a, l)));
+            for (a, l) in runs {
+                let _ = protect(a, l, false);
+                // Filling a missing page writes all of it: its content can go.
+                // SAFETY: the alias of registered memory.
+                unsafe { DiscardVirtualMemory((alias + (a - s)) as *mut c_void, l as usize) };
+            }
+            if remove {
+                post(ctx, [proto::EVENT_REMOVE, from, to, 0]);
+            }
         }
     }
     ret
@@ -1010,6 +1032,16 @@ mod tests {
         assert!(recv_all(user, &mut buf));
         assert_eq!(words(&buf)[..3], [proto::EVENT_REMOVE, mem + PAGE, mem + 2 * PAGE]);
         assert!(is_missing(mem + PAGE));
+        // A refused discard (an unaligned start) makes nothing missing.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::madvise((mem + 2 * PAGE + 1) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, -1);
+        assert!(!is_missing(mem + 2 * PAGE));
+        // The missing runs of a span as large as the address space, found
+        // without a walk by pages over the memory nobody registered.
+        let mut runs = Vec::new();
+        for_each_missing(PAGE, u64::MAX / 2, |a, l| runs.push((a, l)));
+        runs.retain(|&(a, _)| a >= mem && a < mem + len as u64);
+        assert_eq!(runs, [(mem + PAGE, PAGE), (mem + 4 * PAGE, len as u64 - 4 * PAGE)]);
 
         // Unregistered: missing pages read as zeros, nothing faults.
         unregister(ctx, mem, len as u64).unwrap();
