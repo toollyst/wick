@@ -1779,6 +1779,61 @@ mod macos {
 
         use super::*;
 
+        /// The end of a stream, as an epoll user meets it after the sandbox
+        /// has narrowed: an epoll instance, a socket pair and a pipe, made
+        /// before (as Firecracker makes them before its filters), and in
+        /// [`EndOfStream::check`] an ADD of each, the peer's close and the
+        /// events of a wait. The compatibility epoll reads the end of a
+        /// socket's stream with only what the narrowed lists allow (until
+        /// it did, a peer's close raised SIGSYS on `kqueue`).
+        struct EndOfStream {
+            epoll: vmm_sys_util::epoll::Epoll,
+            socket: std::os::unix::net::UnixStream,
+            peer: std::os::unix::net::UnixStream,
+            read_end: std::fs::File,
+            write_end: std::fs::File,
+        }
+
+        impl EndOfStream {
+            fn new() -> Self {
+                use std::os::fd::FromRawFd;
+                let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                let mut fds = [0; 2];
+                // SAFETY: a two-element output buffer.
+                assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+                EndOfStream {
+                    epoll: vmm_sys_util::epoll::Epoll::new().unwrap(),
+                    socket,
+                    peer,
+                    // SAFETY: descriptors just made, owned here.
+                    read_end: unsafe { std::fs::File::from_raw_fd(fds[0]) },
+                    // SAFETY: as above.
+                    write_end: unsafe { std::fs::File::from_raw_fd(fds[1]) },
+                }
+            }
+
+            /// Linux's events for a peer's close (`unix_poll`) and a pipe's
+            /// last writer's (`pipe_poll`).
+            fn check(self) {
+                use std::os::fd::AsRawFd;
+                use vmm_sys_util::epoll::{ControlOperation, EpollEvent, EventSet};
+                let EndOfStream { epoll, socket, peer, read_end, write_end } = self;
+                let socket_events = EventSet::IN | EventSet::READ_HANG_UP;
+                epoll
+                    .ctl(ControlOperation::Add, socket.as_raw_fd(), EpollEvent::new(socket_events, 1))
+                    .unwrap();
+                epoll
+                    .ctl(ControlOperation::Add, read_end.as_raw_fd(), EpollEvent::new(EventSet::IN, 2))
+                    .unwrap();
+                drop((peer, write_end));
+                let mut got = [EpollEvent::default(); 4];
+                let n = epoll.wait(1000, &mut got).unwrap();
+                let of = |data| got[..n].iter().find(|e| e.data() == data).map(EpollEvent::event_set);
+                assert_eq!(of(1), Some(socket_events | EventSet::HANG_UP));
+                assert_eq!(of(2), Some(EventSet::HANG_UP));
+            }
+        }
+
         /// Whether macOS `major`'s kernel has no `name` ([`ABSENT`]).
         fn absent(name: &str, major: u32) -> bool {
             ABSENT.iter().any(|(n, majors)| *n == name && majors.contains(&major))
@@ -1883,6 +1938,7 @@ mod macos {
             let out = child("narrowed_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(stdout.contains("SETUP-OK"), "{}", text(&out));
+            assert!(stdout.contains("EPOLL-OK"), "{}", text(&out));
             assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
             assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
@@ -1905,6 +1961,7 @@ mod macos {
         #[test]
         #[ignore = "run by test_narrow_ends_the_setup_phase in a separate process"]
         fn narrowed_child() {
+            let end_of_stream = EndOfStream::new();
             select(Policy::Default);
             apply().unwrap();
             // SAFETY: dup of the standard output, closed again.
@@ -1916,6 +1973,10 @@ mod macos {
             narrow().unwrap();
             // A second call does nothing.
             narrow().unwrap();
+            // A VMM thread's epoll at the end of a stream (a vsock
+            // connection's, the serial's): the run phase's lists.
+            end_of_stream.check();
+            println!("EPOLL-OK");
             // SAFETY: as above.
             unsafe { libc::dup(1) };
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -1981,6 +2042,7 @@ mod macos {
             let step = |n: u8| STEP.store(n, Ordering::Relaxed);
             let case = std::env::var("WICK_TEST_CASE").unwrap();
             let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+            let end_of_stream = EndOfStream::new();
             select(Policy::Default);
             step(1);
             apply_api().unwrap();
@@ -2017,10 +2079,13 @@ mod macos {
             step(8);
             // SAFETY: a descriptor of this process.
             assert_eq!(unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&a), libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+            // The API server's epoll at a client's close.
             step(9);
+            end_of_stream.check();
+            step(10);
             println!("SETUP-OK");
             std::io::stdout().flush().unwrap();
-            step(10);
+            step(11);
             match case.as_str() {
                 "allowed" => {
                     println!("CHILD-OK");

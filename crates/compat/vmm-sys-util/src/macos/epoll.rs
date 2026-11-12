@@ -36,6 +36,12 @@ pub use crate::epoll_types::{ControlOperation, EpollEvent, EventSet, epoll_event
 #[derive(Debug)]
 pub struct Epoll {
     kq: RawFd,
+    /// A second kqueue, made with the first, on which [`shut_sides`] asks
+    /// which sides of a socket are shut. Made here and not when asked: a
+    /// narrowed sandbox allows `kevent` and no `kqueue` (Linux's
+    /// `epoll_create1` comes before seccomp too). The lock serialises its
+    /// use.
+    probe: Mutex<RawFd>,
     /// Registered descriptors, their user data, events and kind.
     interests: Mutex<HashMap<RawFd, (u64, EventSet, Kind)>>,
 }
@@ -67,24 +73,26 @@ impl Kind {
 }
 
 /// Which sides of socket `fd` are shut (receiving, sending), as kqueue's
-/// `EV_EOF` on its read and write filters tells it, asked of a kqueue of its
-/// own so that a side the caller has no filter for is known too.
-fn shut_sides(fd: RawFd) -> (bool, bool) {
-    // SAFETY: kqueue() takes no arguments; the result is checked.
-    let kq = unsafe { libc::kqueue() };
-    if kq < 0 {
-        return (false, false);
-    }
+/// `EV_EOF` on its read and write filters tells it, asked of the instance's
+/// probe kqueue (`probe`, held locked) so that a side the caller has no
+/// filter for is known too. Only `kevent`: the filters are added, read at
+/// once and deleted again.
+fn shut_sides(probe: RawFd, fd: RawFd) -> (bool, bool) {
     let changes = [
         kevent_for(fd, libc::EVFILT_READ, libc::EV_ADD),
         kevent_for(fd, libc::EVFILT_WRITE, libc::EV_ADD),
     ];
     let mut out = [kevent_for(0, 0, 0); 2];
     let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: both buffers hold two kevents; `kq` is ours.
-    let n = unsafe { libc::kevent(kq, changes.as_ptr(), 2, out.as_mut_ptr(), 2, &zero) };
-    // SAFETY: closing the kqueue made above.
-    unsafe { libc::close(kq) };
+    // SAFETY: both buffers hold two kevents; `probe` is ours.
+    let n = unsafe { libc::kevent(probe, changes.as_ptr(), 2, out.as_mut_ptr(), 2, &zero) };
+    let delete = [
+        kevent_for(fd, libc::EVFILT_READ, libc::EV_DELETE),
+        kevent_for(fd, libc::EVFILT_WRITE, libc::EV_DELETE),
+    ];
+    // Errors (a filter that was not added) leave nothing behind to delete.
+    // SAFETY: two kevents in; no output.
+    unsafe { libc::kevent(probe, delete.as_ptr(), 2, ptr::null_mut(), 0, &zero) };
     let eof = |filter| {
         out.iter()
             .take(usize::try_from(n).unwrap_or(0))
@@ -95,7 +103,7 @@ fn shut_sides(fd: RawFd) -> (bool, bool) {
 
 /// The events a fired filter stands for on a descriptor of `kind`, as
 /// Linux's poll function for it reports them.
-fn events_for(fd: RawFd, kind: Kind, ev: &libc::kevent) -> EventSet {
+fn events_for(probe: &Mutex<RawFd>, fd: RawFd, kind: Kind, ev: &libc::kevent) -> EventSet {
     let read = ev.filter == libc::EVFILT_READ;
     let eof = ev.flags & libc::EV_EOF != 0;
     let mut bits = if read { EventSet::IN } else { EventSet::OUT };
@@ -108,7 +116,7 @@ fn events_for(fd: RawFd, kind: Kind, ev: &libc::kevent) -> EventSet {
             if ev.fflags != 0 {
                 bits |= EventSet::ERROR;
             }
-            let (rcv, snd) = shut_sides(fd);
+            let (rcv, snd) = shut_sides(*probe.lock().unwrap(), fd);
             if rcv {
                 bits |= EventSet::IN | EventSet::READ_HANG_UP;
             }
@@ -130,6 +138,23 @@ fn events_for(fd: RawFd, kind: Kind, ev: &libc::kevent) -> EventSet {
     bits
 }
 
+/// A new kqueue, closed on exec.
+fn new_kqueue() -> io::Result<RawFd> {
+    // SAFETY: kqueue() takes no arguments; the result is checked.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `kq` is a descriptor we own.
+    if unsafe { libc::fcntl(kq, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        let err = io::Error::last_os_error();
+        // SAFETY: closing the descriptor we just opened.
+        unsafe { libc::close(kq) };
+        return Err(err);
+    }
+    Ok(kq)
+}
+
 fn kevent_for(fd: RawFd, filter: i16, flags: u16) -> libc::kevent {
     libc::kevent {
         ident: fd as usize,
@@ -144,20 +169,14 @@ fn kevent_for(fd: RawFd, filter: i16, flags: u16) -> libc::kevent {
 impl Epoll {
     /// Creates a new instance.
     pub fn new() -> io::Result<Self> {
-        // SAFETY: kqueue() takes no arguments; the result is checked.
-        let kq = unsafe { libc::kqueue() };
-        if kq < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `kq` is a descriptor we own.
-        if unsafe { libc::fcntl(kq, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            let err = io::Error::last_os_error();
+        let kq = new_kqueue()?;
+        let probe = new_kqueue().inspect_err(|_| {
             // SAFETY: closing the descriptor we just opened.
             unsafe { libc::close(kq) };
-            return Err(err);
-        }
+        })?;
         Ok(Epoll {
             kq,
+            probe: Mutex::new(probe),
             interests: Mutex::new(HashMap::new()),
         })
     }
@@ -254,7 +273,9 @@ impl Epoll {
     /// In a forked child: a kqueue is not inherited across `fork` (an epoll
     /// instance is, on Linux), so this makes the instance a new kqueue under
     /// the same descriptor, with the same interests. A one-shot interest that
-    /// fired is armed again.
+    /// fired is armed again. The probe kqueue is made again too, under a new
+    /// descriptor (it is not inherited either, and nothing outside knows its
+    /// number). Called before the API process's sandbox (`ext::api_process`).
     pub fn reopen_after_fork(&self) -> io::Result<()> {
         let interests = self.interests.lock().unwrap();
         // SAFETY: kqueue() takes no arguments; the result is checked.
@@ -277,6 +298,8 @@ impl Epoll {
         if unsafe { libc::fcntl(self.kq, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
+        // After the main one, which may take the probe's old (free) number.
+        *self.probe.lock().unwrap() = new_kqueue()?;
         for (&fd, &(_, events, _)) in interests.iter() {
             self.apply(&Self::filter_changes(fd, events))?;
         }
@@ -326,7 +349,7 @@ impl Epoll {
                 continue;
             };
             let mut bits = if ev.filter == libc::EVFILT_READ || ev.filter == libc::EVFILT_WRITE {
-                events_for(fd, kind, ev)
+                events_for(&self.probe, fd, kind, ev)
             } else {
                 EventSet::empty()
             };
@@ -366,8 +389,11 @@ impl AsRawFd for Epoll {
 
 impl Drop for Epoll {
     fn drop(&mut self) {
-        // SAFETY: we own the kqueue descriptor.
-        unsafe { libc::close(self.kq) };
+        // SAFETY: we own both kqueue descriptors.
+        unsafe {
+            libc::close(self.kq);
+            libc::close(*self.probe.get_mut().unwrap());
+        }
     }
 }
 
