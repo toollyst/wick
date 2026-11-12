@@ -67,7 +67,7 @@ semantics, on that host's facilities.
 tools/setup.sh                          # after cloning and after pulling changes to patches/
 cd lib/firecracker
 cargo build -p firecracker              # build
-cargo clippy -p vmm -p firecracker -p wick-ext --lib --bins --tests -- -D warnings
+cargo clippy -p vmm -p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings
 cd ../..
 
 tools/macos/test.sh                     # upstream's vmm unit tests with Hypervisor.framework (macOS)
