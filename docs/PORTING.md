@@ -109,7 +109,7 @@ exemption.
 | `jail`: chroot, user, descriptors, the hand-over | yes | `isolation`, `drives` |
 | `daemonize` | yes | `daemonize` (the launcher returns 0; a detached Firecracker runs with no console) |
 | (a handle the jailer inherited is not open in the jail) | part of `jail` | `handles` |
-| (only the jail's identity reaches a jail) | part of `jail` | `low` (a low-integrity process of the user is kept out) |
+| (only the jail's identity reaches a jail) | part of `jail` | `low` (a low-integrity process of the user is kept out); `links` (a jail makes no hard link to a file outside it, which a later jailer would act on, and no entry above its root; no guest) |
 | (`--new-pid-ns`: no other process to see or signal) | `pidns` (upstream's process tree; dropped signals have no effect, SIGHUP ends it) | `pidns` (no process, thread or console of anyone else; the jailer's return) |
 | (a jailed process hands a file and a socket to a helper outside) | part of `jail` (`SCM_RIGHTS` works from a chroot) | `handoff` (pulled out by the operator and by a medium-integrity process of the user; no guest) |
 | (a snapshot restored through a uffd handler, and a vhost-user block device, under the jailer) | `uffd`, `vhost-user` (the uffd handler and the vhost-user backend outside the jail) | `uffd`, `vhost-user` (row 14, on a WHP machine) |

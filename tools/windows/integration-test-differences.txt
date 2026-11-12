@@ -117,14 +117,13 @@ impossible integration_tests/security/test_jail.py::test_new_pid_ns_resource_lim
 impossible integration_tests/security/test_jail.py::test_new_pid_namespace
 
 # The test writes host paths into regular expressions unescaped, and a
-# jail under /srv: a Windows path's \ is an escape there.
+# jail under /srv: a Windows path's \ is an escape there. The jailer's
+# answers are upstream's: a missing or non-file --exec-file refused (the same
+# code), a symbolic link or hard link where it copies Firecracker refused
+# with upstream's errors (test_copy_exec_refuses_a_planted_link).
 impossible integration_tests/security/test_jail.py::test_exec_file_not_exist
-
-# The same, and the jailer differs: it refuses a symbolic link planted where
-# it copies Firecracker as a hard link, and does not see a hard link there,
-# writing Firecracker into the linked file (platform/windows copy_exec).
-bug integration_tests/security/test_jail.py::test_exec_destination_path_is_symlink
-bug integration_tests/security/test_jail.py::test_exec_destination_path_is_hardlink
+impossible integration_tests/security/test_jail.py::test_exec_destination_path_is_symlink
+impossible integration_tests/security/test_jail.py::test_exec_destination_path_is_hardlink
 
 # Transparent huge pages (/sys/kernel/mm/transparent_hugepage, AnonHugePages
 # in smaps): Windows has no transparent huge pages; its large pages are
