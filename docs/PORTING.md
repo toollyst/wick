@@ -107,7 +107,7 @@ exemption.
 | Stage | macOS (`tools/macos/jailer-test.sh`, root) | Windows (`tools/windows/jailer-test.ps1`) |
 | --- | --- | --- |
 | `refuse`: unsupported isolation refused | yes | yes |
-| `freeze`: a jail and its child frozen and thawed through `freezer.state` and `cgroup.freeze`, the jail's uid unable to thaw it, invalid values restored, `FROZEN` at the start holding the jailer (also with `--daemonize` and `--new-pid-ns`), the supervisor's SIGKILL leaving the jail frozen, Firecracker's API silent while frozen | written, not yet run (needs root: CI's macos job) | no stage yet (refused today) |
+| `freeze`: a jail and its child frozen and thawed through `freezer.state` and `cgroup.freeze`, the jail's uid unable to thaw it, invalid values restored, `FROZEN` at the start holding the jailer (also with `--daemonize` and `--new-pid-ns`), the supervisor's SIGKILL leaving the jail frozen, Firecracker's API silent while frozen | run as root in CI's macos job (76ab6c7, macOS 26.7.2): it passes up to a jail started `FROZEN` with `--daemonize`, which does not run once thawed (a bug, to fix); the `--new-pid-ns` start and the API check after it not reached | no stage yet (refused today) |
 | `cgroup-devices`: `devices.*` refused at the start with exit 1, as upstream's jailer refuses it on Linux (`tools/linux/jailer-cgroup-check.py`), and no jail made | yes (run on a Mac as the user, which the refusal needs no more than root; as root in CI's macos job from its next run) | no counterpart (refused: Windows has no device nodes) |
 | `jail`: chroot, user, descriptors, the hand-over | yes | `isolation`, `drives` |
 | `daemonize` | yes | `daemonize` (the launcher returns 0; a detached Firecracker runs with no console) |
