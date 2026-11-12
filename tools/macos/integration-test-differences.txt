@@ -278,8 +278,9 @@ all bug integration_tests/functional/test_net.py::test_tap_offload
 # 4.8 MiB (the memory entry above has what holds it). A run where it passes
 # before that part comes down passes at the margin, by luck: the entry stays
 # until then. At the margin: both passed in mac1-vsock-balloon-ff84c70
-# (ff84c70) with the VMM's own part unchanged, 4.62 and 4.36 MiB (balloon 62
-# and 65 MiB).
+# (ff84c70) with the VMM's own part unchanged, 4.62 and 4.36 MiB
+# (memory-parts.jsonl); the balloon deflated from 62 to 59 and from 65 to
+# 61 MiB (the tests' "size before/after" lines, test-report.json).
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_ON-True-kvm]
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_OFF-True-kvm]
 
