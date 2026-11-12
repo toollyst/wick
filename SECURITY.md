@@ -201,7 +201,12 @@ upstream Firecracker and its jailer.
   temporary file's) are not charged to the job, and the jail's token does not stop a process making them: under
   `memory.max` of 32 MiB a jailed process stops after 30 MiB of private memory but maps and writes 256 MiB of
   each kind of section (`jailer-test.ps1 sections`, measured elevated on Windows Server 2022; with 4 GiB of
-  sections the host's commit grew by 4.1 GiB while the job's peak stayed at 9 MiB). A compromised jailed
+  sections the host's commit grew by 4.1 GiB while the job's peak stayed at 9 MiB; the same on Windows 11 build
+  26300, elevated, kit 7952d31, 2026-11-13: private memory denied after 30 MiB, 256 MiB of each kind of section
+  allowed). A memory partition tied to the job does not charge sections either: under a partition of 256 MiB,
+  private memory stopped at 254 of 512 MiB and sections of each kind reached 512 of 512, the partition's
+  committed count 0 after (tools/windows/memory-partition-probe.rs, the kit's `memory-partition-probe.exe 256`,
+  same PC and day). A compromised jailed
   Firecracker can so take host memory past its limit, and guest memory backed by a memfd (with vhost-user
   devices) is not charged either.
 - **Windows jailer: the handle limit holds only in the jailed process.** Upstream's jailer limits Firecracker to

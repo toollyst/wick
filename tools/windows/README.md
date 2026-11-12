@@ -43,7 +43,9 @@
   guest boots from a kernel and root drive bound into the jail's root before
   the jailer starts, and the backing files' security descriptors are the same
   before, during and after; elevated, Windows 11 24H2 or later, else it fails
-  saying so; written, not yet run), `limits`
+  saying so; run once, elevated, on Windows 11 build 26300, where it failed
+  at that check: no `System32\bindlink.dll`, though Microsoft gives the
+  Bindlink API as available from build 25314; the rest has not run), `limits`
   (`memory.max` below the guest's memory: the VMM ends with 137), `memory`
   (a guest past the limit ends the VMM, and runs on under a larger one),
   `cpu` (`cpu.max` from Firecracker's start: twelve boots under it, each
