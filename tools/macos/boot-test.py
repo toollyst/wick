@@ -1932,7 +1932,41 @@ def stage_tools(ctx):
 # time kicker's exits and CPU time (its debug line, every 10 s). Then, the
 # guest spinning under the host's spinners: a pause and resume loop, and a
 # restore in a new process (upstream's performance test_pvtime_snapshot).
-PVTIME_CASE_S = 12
+PVTIME_CASE_S = 10  # the interval of the kicker's debug line (pvtime.rs KICK_LOG_NS)
+# The kicker's period (pvtime.rs KICK_PERIOD): its readings are at least
+# this far apart.
+PVTIME_KICK_PERIOD_MS = 2
+
+
+def _vcpu_times(pid):
+    """(the CPU time of `pid`'s vCPU threads, the time its threads were
+    runnable but kept off a CPU), in ns: proc_pidinfo PROC_PIDTHREADINFO of
+    each `fc_vcpu` thread, and proc_pid_rusage's ri_runnable_time less its
+    CPU time. XNU's runnable timer runs while a thread is runnable or on a
+    CPU, not while it waits (thread.h runnable_timer; task.c
+    task_power_info_locked sums it), so a vCPU thread in WFI adds nothing
+    and one woken and kept off its CPU adds that time."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    ids = (ctypes.c_uint64 * 1024)()
+    n = libc.proc_pidinfo(pid, 6, ctypes.c_uint64(0), ids, ctypes.sizeof(ids))  # PROC_PIDLISTTHREADS
+    check(n > 0, f"proc_pidinfo PROC_PIDLISTTHREADS for {pid}: errno {ctypes.get_errno()}")
+    vcpu = 0
+    for tid in ids[: n // 8]:
+        info = (ctypes.c_uint8 * 112)()  # struct proc_threadinfo
+        if libc.proc_pidinfo(pid, 5, ctypes.c_uint64(tid), info, 112) != 112:  # PROC_PIDTHREADINFO
+            continue  # a thread that ended between the two calls
+        if bytes(info[48:112]).split(b"\0")[0].startswith(b"fc_vcpu"):
+            user, system = struct.unpack_from("<QQ", info, 0)  # ns (bsd_kern.c fill_taskthreadinfo)
+            vcpu += user + system
+    ri = (ctypes.c_uint8 * 512)()
+    check(libc.proc_pid_rusage(pid, 4, ri) == 0, f"proc_pid_rusage for {pid}: errno {ctypes.get_errno()}")
+    # rusage_info_v4: ri_uuid[16], then 64-bit counters in mach time units:
+    # ri_user_time, ri_system_time first, ri_runnable_time the 35th.
+    user, system = struct.unpack_from("<QQ", ri, 16)
+    runnable = struct.unpack_from("<Q", ri, 16 + 34 * 8)[0]
+    tb = (ctypes.c_uint32 * 2)()
+    libc.mach_timebase_info(tb)
+    return vcpu, (runnable - user - system) * tb[0] // tb[1]
 
 
 def _off_cpu_ms(seconds):
@@ -1961,21 +1995,41 @@ def stage_pvtime(ctx):
         _, out = vm.sh("awk '/^cpu /{print $9}' /proc/stat")
         return int(out.strip().splitlines()[-1]) * 1000 // int(hz)
 
-    kick_rx = re.compile(r"pvtime: (\d+) vCPU exits for steal time in ([\d.]+) s; "
-                         r"the kicker's own CPU time ([\d.]+) ms")
+    kick_rx = r"pvtime: (\d+) vCPU exits for steal time in ([\d.]+) s; the kicker's own CPU time ([\d.]+) ms"
+
+    def wakes():
+        # The guest's interrupts on all its CPUs, of every kind: each ends
+        # at most one wait in WFI.
+        _, out = vm.sh("cat /proc/interrupts")
+        rows = out.splitlines()
+        ncpu = len(rows[0].split())
+        total = 0
+        for row in rows[1:]:
+            for field in row.split()[1:1 + ncpu]:
+                if not field.isdigit():
+                    break
+                total += int(field)
+        return total
 
     def case():
-        start = len(vm.buf)
+        # One whole interval of the kicker's debug line, from one line to
+        # the next, so that its kicks and the guest's wakes cover the same
+        # time; the readings at both ends take a few tens of ms.
+        m = vm.wait_for(kick_rx, PVTIME_CASE_S + 5, len(vm.buf))
         control = _off_cpu_ms(PVTIME_CASE_S)
-        s0 = steal_ms()
-        time.sleep(PVTIME_CASE_S)
-        stolen = steal_ms() - s0
+        # The host's figures are read first and last, so that their interval
+        # holds the guest's.
+        h0 = _vcpu_times(vm.proc.pid)
+        t0 = time.monotonic()
+        w0, s0 = wakes(), steal_ms()
+        m = vm.wait_for(kick_rx, PVTIME_CASE_S + 5, m.end())
+        s1, w1 = steal_ms(), wakes()
+        h1 = _vcpu_times(vm.proc.pid)
+        secs = time.monotonic() - t0
         off = int(control.communicate()[0])
-        lines = kick_rx.findall(vm.buf[start:])
-        secs = sum(float(s) for _, s, _ in lines) or 1.0
-        kicks = sum(int(k) for k, _, _ in lines) / secs
-        cpu = sum(float(c) for _, _, c in lines) / secs
-        return stolen, off, kicks, cpu
+        kicks, cpu = int(m.group(1)) / float(m.group(2)), float(m.group(3)) / float(m.group(2))
+        return {"steal": s1 - s0, "control": off, "kicks": kicks, "kicker": cpu, "wakes": (w1 - w0) / secs,
+                "vcpu cpu": (h1[0] - h0[0]) / 1e6 / secs, "wait": (h1[1] - h0[1]) / 1e6 / secs, "secs": secs}
 
     def spin_guest():
         # Both vCPUs spinning; their pids kept in the shell, which keeps no
@@ -2029,36 +2083,59 @@ def stage_pvtime(ctx):
             h.kill()
             h.wait()
     detail = "; ".join(
-        f"{name}: steal {stolen} ms over {2 * PVTIME_CASE_S} s of vCPU time (control: a host spinner lost "
-        f"{off} ms of {PVTIME_CASE_S} s), {kicks:.1f} kicks/s, kicker {cpu:.2f} ms CPU/s"
-        for name, (stolen, off, kicks, cpu) in results.items()) + (
+        f"{name}: steal {r['steal']} ms over {2 * r['secs']:.1f} s of vCPU time (control: a host spinner lost "
+        f"{r['control']} ms of {PVTIME_CASE_S} s), {r['kicks']:.1f} kicks/s, {r['wakes']:.0f} guest interrupts/s, "
+        f"vCPU threads {r['vcpu cpu']:.1f} ms CPU/s, the VMM's threads kept off a CPU {r['wait']:.1f} ms/s, "
+        f"kicker {r['kicker']:.2f} ms CPU/s"
+        for name, r in results.items()) + (
         f"; busy guest, host spinners: steal {paused} ms over 20 pauses and 2 s; "
         f"restore in a new process: {before} -> {after_snap} ms, {after_resume} ms 2 s later")
     check(paused > 0, f"no steal over 20 pauses and 2 s after: {detail}")
     check(before < after_snap < before + 10000, f"steal across the restore: {detail}")
     check(after_resume > after_snap, f"no steal after the restore: {detail}")
-    busy, busy_hogs, idle_hogs = (results[k][0] for k in
+    busy, busy_hogs, idle_hogs = (results[k]["steal"] for k in
                                   ("busy guest", "busy guest, host spinners", "idle guest, host spinners"))
     check(busy_hogs > 2000 * PVTIME_CASE_S // 5, f"too little steal under contention: {detail}")
     # The guest's steal on the host as it is follows what the host took from
     # its own spinner (both vCPUs: up to twice the control), plus 1 ms per
     # second per vCPU of granularity.
-    control = results["busy guest"][1]
+    control = results["busy guest"]["control"]
     check(busy <= 2 * control + 2 * PVTIME_CASE_S + 200, f"steal beyond the host's own load: {detail}")
     # An idle guest waits in WFI, where the kicker leaves it
     # (test_the_kicker_leaves_a_waiting_vcpu_alone). It wakes for its timer
-    # ticks, and a wake-up the host's spinners hold off its CPU for 1 ms is
-    # kicked (measured: about 100 kicks/s), but Hypervisor.framework counts
-    # that time as the wait's, so the guest is given no steal for it, where
+    # ticks, and a wake-up the host's spinners hold off its CPU for 1 ms can
+    # be kicked (bounded below), but Hypervisor.framework counts that time
+    # as the wait's, so the guest is given no steal for it, where
     # KVM counts the woken thread's run delay (docs/COMPATIBILITY.md, PV time).
     check(idle_hogs < 200, f"steal counted while the guest idled: {detail}")
-    # Each kick takes a vCPU kept off its CPU for 1 ms while runnable, and a
-    # mostly waiting vCPU is kept off its CPU no more than the control, which
-    # never waits: at most 2 kicks/s (two vCPUs) per ms/s the control lost,
-    # plus 5/s. On a quiet host about 5/s; the host's load raises the bound,
-    # as it raises the kicks.
-    idle_control_ms_per_s = results["idle guest"][1] / PVTIME_CASE_S
-    check(results["idle guest"][2] < 5 + 2 * idle_control_ms_per_s, f"kicks while the guest idled: {detail}")
+    # An idle guest's kicks, from the kicker's rule (pvtime.rs Kicker::look):
+    # a kick needs two readings, at least PVTIME_KICK_PERIOD_MS apart, of
+    # a vCPU thread runnable in run() with the same accounting `seq`, and a
+    # reading of the thread waiting, or a kick, starts the measure again. A
+    # vCPU in WFI waits; a guest interrupt wakes it, and it is runnable
+    # until its next WFI: a span of S ms holds at most 1 + S / period
+    # readings, so at most 1 + S / (2 period) kicks (the first may measure
+    # from a span before it, as a WFI inside hv_vcpu_run keeps the `seq`).
+    # A span not begun by an interrupt (run() left and entered again, a kick
+    # that lands as the vCPU waits) starts its measure afresh: S / period
+    # kicks at most. The spans' S is the vCPU threads' CPU time and their
+    # time runnable off a CPU, which the VMM's whole run-queue wait bounds.
+    # Per second, two vCPUs together:
+    #   kicks <= interrupts + (vCPU CPU + run-queue wait) / period.
+    # On a quiet host the second term is small and the bound is the
+    # guest's wakes. A wake held off longer than a period can be kicked
+    # again every 2 periods, so the host's load does raise the bound, by
+    # the very wait that it adds.
+    # The guest's steal is the vCPU threads' time off a CPU in run() but
+    # outside the framework's WFI figure (KVM's run delay): no more than the
+    # VMM's run-queue wait, plus the involuntary blocks counted as steal
+    # (none expected in an idle guest), plus one USER_HZ tick of rounding.
+    for name in ("idle guest", "idle guest, host spinners"):
+        r = results[name]
+        kick_bound = r["wakes"] + (r["vcpu cpu"] + r["wait"]) / PVTIME_KICK_PERIOD_MS
+        check(r["kicks"] <= kick_bound, f"{name}: {r['kicks']:.1f} kicks/s over the bound {kick_bound:.1f}: {detail}")
+        check(r["steal"] <= r["wait"] * r["secs"] + 10,
+              f"{name}: steal {r['steal']} ms over the VMM's run-queue wait: {detail}")
     vm.reboot()
     return detail
 
