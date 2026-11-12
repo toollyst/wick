@@ -1,0 +1,232 @@
+# The workspace's unit tests that do not pass on Windows, each with its reason.
+#
+# tools/windows/check-unit-tests.py runs the packages' tests as upstream's CI
+# does on Linux (host_tools/cargo_build.py cargo_test: RUST_TEST_THREADS=1,
+# --no-fail-fast; tools/linux/unit-tests.sh does the same) and fails on:
+#   - a failure not listed here;
+#   - an entry whose test passes (on a host without WHP; with --whp the
+#     no-whp entries must pass);
+#   - an entry naming no test the run reported.
+# So nothing goes unrun silently, and the list cannot rot.
+#
+# Format: <kind> <package> <test path>; the comment after a group gives its reason.
+#   no-whp      creates a VM: Kvm::new() fails with ENODEV without WHP (CI's
+#               windows-latest); must pass on a WHP machine (--whp)
+#   error-text  the test builds Linux's error text from a Linux errno number
+#   linux-path  the test names a Linux path or builds JSON from a host path
+#   bug         a wick bug or an unexplained difference, to fix (root cause
+#               first)
+#
+# First measured on Windows Server 2022 without WHP (fc-win), the tree of
+# 51be34e plus the MSR change, 4 test threads: vmm --lib 974 tests, 794 pass,
+# 168 fail, 12 ignored (the ext:: child-process helpers, which their parent
+# tests run). Of the 168, five passed alone and failed only beside others
+# (balloon test_hinting_invalid_cmd, _misaligned_value, _no_cmd_set; block
+# test_read_write; vsock muxer test_muxer_killq): they read the process-wide
+# METRICS. Upstream runs its unit tests one at a time for that reason
+# (RUST_TEST_THREADS=1, above), as does this checker, so they are not
+# entries; their collision is not a Windows difference and is not checked
+# on Linux.
+#
+# The checker reports every disagreement of a run (it does not stop at the
+# first), so one run is enough to bring the list in step.
+
+# vmm: Linux paths and errno numbers in the tests themselves.
+linux-path vmm resources::tests::test_from_json
+linux-path vmm resources::tests::test_cast_to_vmm_config
+linux-path vmm resources::tests::test_cpu_config_from_invalid_json
+linux-path vmm resources::tests::test_cpu_config_from_valid_json
+linux-path vmm resources::tests::test_cpu_config_inline
+#   (the JSON is built with format! from a temp file path; a Windows path's
+#   backslashes are invalid JSON escapes: "invalid escape, line 9, column 50")
+linux-path vmm nitro_enclave::ne_ioctl::tests::test_update_device_config_issues_ioctl
+linux-path vmm nitro_enclave::ne_ioctl::tests::test_update_device_config_rejects_bad_arguments
+linux-path vmm device_manager::nitro_enclave::tests::test_update_device_config_unknown_device
+linux-path vmm device_manager::nitro_enclave::tests::test_update_device_config_keeps_host_update_on_ioctl_error
+linux-path vmm devices::virtio::transport::nitro_enclave::tests::test_registration_failure_preserves_device_config
+#   (EnclaveFd::dev_null opens /dev/null: ERROR_PATH_NOT_FOUND, os error 3)
+error-text vmm devices::virtio::vsock::csm::txbuf::tests::test_flush_error
+#   (from_raw_os_error(13) as EACCES: on Windows 13 is ERROR_INVALID_DATA, kind
+#   Uncategorized, not PermissionDenied)
+error-text vmm vmm_config::net::tests::test_insert_error_cases
+#   (expected text from os error 16, Linux's EBUSY: Windows' 16 is "The directory
+#   cannot be removed"; Firecracker reports ERROR_BUSY, 170, as test_hotplug_net)
+
+# vmm: to root-cause before any fix.
+bug vmm devices::virtio::net::device::tests::test_rx_multiple_frames
+bug vmm devices::virtio::net::device::tests::test_rx_multiple_frames_mrg
+#   (2 frames injected into the tap, 1 counted in 100 ms: rx_packets_count 1, not 2;
+#   a real rx difference until shown otherwise)
+bug vmm devices::virtio::net::device::tests::test_tx_tap_failure
+bug vmm devices::virtio::net::device::tests::test_read_tap_fail_event_handler
+#   (the test closes the tap's fd to make its next write/read fail; tap_write_fails /
+#   tap_read_fails stay 0)
+bug vmm devices::virtio::rng::device::tests::test_bandwidth_rate_limiter
+#   (entropy_bytes 0, not 1000, 350 ms after the limiter blocked: the replenish
+#   timer's event did not arrive in the 100 ms emulated)
+bug vmm devices::virtio::block::vhost_user::device::tests::test_activate
+bug vmm devices::virtio::block::vhost_user::device::tests::test_new_all_features
+bug vmm devices::virtio::block::vhost_user::device::tests::test_new_no_features
+bug vmm devices::virtio::vhost_user::tests::test_new
+#   (test_utils::create_tmp_socket: libc::bind of an AF_UNIX path in a TempDir fails)
+bug vmm platform::windows::net::tests::test_one_switch_at_a_time
+#   (wick's own test: unwrap of WSAEWOULDBLOCK, 10035, at net.rs:583)
+
+# Other packages.
+no-whp cpu-template-helper template::dump::tests::test_dump
+no-whp cpu-template-helper utils::tests::test_build_microvm
+no-whp cpu-template-helper tests::test_template_dump_command
+no-whp cpu-template-helper tests::test_fingerprint_dump_command
+no-whp cpu-template-helper tests::test_template_verify_command
+linux-path firecracker seccomp::tests::test_seccomp_config
+#   (SeccompConfig::from_args(false, Some("/dev/null")))
+bug clippy-tracing integration_tests::exclude
+bug clippy-tracing integration_tests::exec_error
+#   (exclude: the file is left uninstrumented; exec_error: the error text differs)
+# firecracker runs with --bins --tests: `cargo test -p firecracker` also builds the
+# example seccomp_jailer, which uses std::os::unix and Command::exec and does not
+# compile on Windows (88 run, 1 fails, above).
+# Pass: acpi_tables 22, utils 16, wick-ext 1, wick-version 2, compat kvm-bindings 1,
+# firecracker 87 of 88 (bins and tests). seccompiler, log-instrument and
+# log-instrument-macros have no tests that build on Windows (0 run).
+
+# vmm: tests that create a VM (no WHP on CI's runner).
+no-whp vmm acpi::tests::test_write_acpi_table_memory_allocation
+no-whp vmm acpi::tests::test_write_acpi_table_small_memory
+no-whp vmm arch::x86_64::interrupts::tests::test_setlint
+no-whp vmm arch::x86_64::interrupts::tests::test_setlint_fails
+no-whp vmm arch::x86_64::msr::tests::test_set_valid_msrs
+no-whp vmm arch::x86_64::msr::tests::test_set_invalid_msrs
+no-whp vmm arch::x86_64::msr::tests::test_setup_msrs
+no-whp vmm arch::x86_64::regs::tests::test_setup_fpu
+no-whp vmm arch::x86_64::regs::tests::test_setup_regs
+no-whp vmm arch::x86_64::regs::tests::test_setup_sregs
+no-whp vmm arch::x86_64::vcpu::tests::test_configure_vcpu
+no-whp vmm arch::x86_64::vcpu::tests::test_dump_cpu_config_with_configured_vcpu
+no-whp vmm arch::x86_64::vcpu::tests::test_dump_cpu_config_with_non_configured_vcpu
+no-whp vmm arch::x86_64::vcpu::tests::test_empty_cpuid_entries_removed
+no-whp vmm arch::x86_64::vcpu::tests::test_get_msr_chunks_preserved_order
+no-whp vmm arch::x86_64::vcpu::tests::test_get_msrs_with_invalid_msr_index
+no-whp vmm arch::x86_64::vcpu::tests::test_get_msrs_with_msrs_to_dump
+no-whp vmm arch::x86_64::vcpu::tests::test_get_msrs_with_msrs_to_save
+no-whp vmm arch::x86_64::vcpu::tests::test_is_tsc_scaling_required
+no-whp vmm arch::x86_64::vcpu::tests::test_set_tsc
+no-whp vmm arch::x86_64::vcpu::tests::test_vcpu_cpuid_restore
+no-whp vmm arch::x86_64::vm::tests::test_vm_save_restore_state
+no-whp vmm arch::x86_64::vm::tests::test_vm_save_restore_state_bad_irqchip
+no-whp vmm arch::x86_64::vm::tests::test_vm_save_restore_state_kvm_clock_realtime
+no-whp vmm arch::x86_64::vm::tests::test_vmstate_serde
+no-whp vmm builder::tests::test_attach_block_devices
+no-whp vmm builder::tests::test_attach_balloon_device
+no-whp vmm builder::tests::test_attach_boot_timer_device
+no-whp vmm builder::tests::test_attach_entropy_device
+no-whp vmm builder::tests::test_attach_net_devices
+no-whp vmm builder::tests::test_attach_pmem_devices
+no-whp vmm builder::tests::test_attach_virtio_mem_device
+no-whp vmm builder::tests::test_attach_vsock_device
+no-whp vmm device_manager::legacy::tests::test_register_legacy_devices
+no-whp vmm device_manager::mmio::tests::test_device_info
+no-whp vmm device_manager::mmio::tests::test_register_too_many_devices
+no-whp vmm device_manager::mmio::tests::test_register_virtio_device
+no-whp vmm device_manager::pci_mngr::tests::test_device_manager_persistence
+no-whp vmm device_manager::persist::tests::test_device_manager_persistence
+no-whp vmm device_manager::tests::test_hotplug_block
+no-whp vmm device_manager::tests::test_hotplug_net
+no-whp vmm device_manager::tests::test_hotplug_pci_not_enabled
+no-whp vmm device_manager::tests::test_hotplug_pmem
+no-whp vmm device_manager::tests::test_hotunplug_pci_not_enabled
+no-whp vmm device_manager::tests::test_pci_bar_is_freed_on_unplug
+no-whp vmm device_manager::tests::test_unplug_root_block
+no-whp vmm device_manager::tests::test_unplug_root_pmem
+no-whp vmm devices::pci::pci_segment::tests::test_io_bus
+no-whp vmm devices::pci::pci_segment::tests::test_next_device_bdf
+no-whp vmm devices::pci::pci_segment::tests::test_pci_segment_build
+no-whp vmm devices::pci::pci_segment::tests::test_mmio_bus
+no-whp vmm devices::virtio::mem::device::tests::test_config_as_bytes
+no-whp vmm devices::virtio::mem::device::tests::test_event_fail_descriptor_chain_too_short
+no-whp vmm devices::virtio::mem::device::tests::test_event_fail_descriptor_length_too_small
+no-whp vmm devices::virtio::mem::device::tests::test_event_fail_response_descriptor_length_too_small
+no-whp vmm devices::virtio::mem::device::tests::test_event_fail_unexpected_readonly_descriptor
+no-whp vmm devices::virtio::mem::device::tests::test_event_fail_unexpected_writeonly_descriptor
+no-whp vmm devices::virtio::mem::device::tests::test_from_state
+no-whp vmm devices::virtio::mem::device::tests::test_invalid_range_out_of_bounds
+no-whp vmm devices::virtio::mem::device::tests::test_invalid_range_unaligned
+no-whp vmm devices::virtio::mem::device::tests::test_invalid_range_zero_blocks
+no-whp vmm devices::virtio::mem::device::tests::test_new
+no-whp vmm devices::virtio::mem::device::tests::test_plug_partial_kvm_failure_keeps_state_consistent
+no-whp vmm devices::virtio::mem::device::tests::test_plug_request_already_plugged
+no-whp vmm devices::virtio::mem::device::tests::test_plug_request_success
+no-whp vmm devices::virtio::mem::device::tests::test_plug_request_too_big
+no-whp vmm devices::virtio::mem::device::tests::test_repeated_unplug_all_is_noop
+no-whp vmm devices::virtio::mem::device::tests::test_set_features
+no-whp vmm devices::virtio::mem::device::tests::test_state_request_mixed
+no-whp vmm devices::virtio::mem::device::tests::test_state_request_plugged
+no-whp vmm devices::virtio::mem::device::tests::test_state_request_unplugged
+no-whp vmm devices::virtio::mem::device::tests::test_status
+no-whp vmm devices::virtio::mem::device::tests::test_unplug_all_request
+no-whp vmm devices::virtio::mem::device::tests::test_unplug_request_not_plugged
+no-whp vmm devices::virtio::mem::device::tests::test_unplug_request_success
+no-whp vmm devices::virtio::mem::device::tests::test_unsupported_request
+no-whp vmm devices::virtio::mem::device::tests::test_update_requested_size_device_not_active
+no-whp vmm devices::virtio::mem::device::tests::test_update_requested_size_invalid_size
+no-whp vmm devices::virtio::mem::device::tests::test_update_requested_size_success
+no-whp vmm devices::virtio::mem::device::tests::test_write_config
+no-whp vmm devices::virtio::mem::event_handler::tests::test_event_handler_activation
+no-whp vmm devices::virtio::mem::event_handler::tests::test_process_mem_queue_event
+no-whp vmm devices::virtio::mem::event_handler::tests::test_spurious_event_before_activation
+no-whp vmm devices::virtio::mem::persist::tests::test_save_restore_state
+no-whp vmm devices::virtio::mem::persist::tests::test_save_state
+no-whp vmm devices::virtio::pmem::device::tests::test_from_config
+no-whp vmm devices::virtio::pmem::device::tests::test_process_chain
+no-whp vmm devices::virtio::pmem::persist::tests::test_persistence
+no-whp vmm devices::virtio::pmem::persist::tests::test_restore_rejects_mismatched_config_space_size
+no-whp vmm devices::virtio::transport::pci::device::tests::test_activate_failure_sets_needs_reset
+no-whp vmm devices::virtio::transport::pci::device::tests::test_bar_relocation
+no-whp vmm devices::virtio::transport::pci::device::tests::test_bar_relocation_on_memory_space_enable_only
+no-whp vmm devices::virtio::transport::pci::device::tests::test_bar_relocation_refused
+no-whp vmm devices::virtio::transport::pci::device::tests::test_capabilities
+no-whp vmm devices::virtio::transport::pci::device::tests::test_device_initialization
+no-whp vmm devices::virtio::transport::pci::device::tests::test_isr_capability
+no-whp vmm devices::virtio::transport::pci::device::tests::test_notification_capability
+no-whp vmm devices::virtio::transport::pci::device::tests::test_pci_configuration_cap
+no-whp vmm devices::virtio::transport::pci::device::tests::test_pci_device_config
+no-whp vmm devices::virtio::transport::pci::device::tests::test_reading_bars
+no-whp vmm devices::virtio::transport::pci::device::tests::test_reset_and_reinitialization
+no-whp vmm pci::msix::tests::test_access_table
+no-whp vmm pci::msix::tests::test_enable_msix_vectors
+no-whp vmm pci::msix::tests::test_from_state_rejects_size_mismatches
+no-whp vmm pci::msix::tests::test_msix_from_state
+no-whp vmm pci::msix::tests::test_new_msix_config
+no-whp vmm pci::msix::tests::test_pba_bit_invalid_vector
+no-whp vmm pci::msix::tests::test_pba_invalid_offset
+no-whp vmm pci::msix::tests::test_pba_read
+no-whp vmm pci::msix::tests::test_pba_read_too_big
+no-whp vmm pci::msix::tests::test_pending_interrupt
+no-whp vmm pci::msix::tests::test_read_table_bad_length
+no-whp vmm pci::msix::tests::test_read_table_past_end
+no-whp vmm persist::tests::test_microvm_state_snapshot
+no-whp vmm rpc_interface::tests::test_runtime_disallowed
+no-whp vmm rpc_interface::tests::test_runtime_get_enclave_config_on_kvm_vm
+no-whp vmm rpc_interface::tests::test_runtime_get_mmds
+no-whp vmm rpc_interface::tests::test_runtime_get_vm_config
+no-whp vmm vstate::vcpu::tests::test_handle_kvm_exit
+no-whp vmm vstate::vcpu::tests::test_immediate_exit_shortcircuits_execution
+no-whp vmm vstate::vcpu::tests::test_set_mmio_bus
+no-whp vmm vstate::vcpu::tests::test_vcpu_dump_cpu_config
+no-whp vmm vstate::vcpu::tests::test_vcpu_kick
+no-whp vmm vstate::vcpu::tests::test_vcpu_pause_resume
+no-whp vmm vstate::vcpu::tests::test_vcpu_save_state_events
+no-whp vmm vstate::vm::tests::test_create_vcpus
+no-whp vmm vstate::vm::tests::test_msi_vector_group_disable
+no-whp vmm vstate::vm::tests::test_msi_vector_group_drop_frees_gsis
+no-whp vmm vstate::vm::tests::test_msi_vector_group_new
+no-whp vmm vstate::vm::tests::test_msi_vector_group_notifier
+no-whp vmm vstate::vm::tests::test_msi_vector_group_persistence
+no-whp vmm vstate::vm::tests::test_msi_vector_group_restore_rejects_out_of_range_gsi
+no-whp vmm vstate::vm::tests::test_msi_vector_group_trigger
+no-whp vmm vstate::vm::tests::test_msi_vector_group_update
+no-whp vmm vstate::vm::tests::test_msi_vector_group_update_invalid_vector
+no-whp vmm vstate::vm::tests::test_new
+no-whp vmm vstate::vm::tests::test_register_memory_regions
+no-whp vmm vstate::vm::tests::test_restore_state_resource_allocator
+no-whp vmm vstate::vm::tests::test_too_many_regions
