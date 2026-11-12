@@ -402,6 +402,55 @@ mod tests {
     use super::*;
     use crate::eventfd::{EventFd, EFD_NONBLOCK};
 
+    /// A wait's timeout here is a `kevent` timeout, which macOS may fire late
+    /// to coalesce it with other timers (by up to 100 ms in a background
+    /// process, XNU osfmk/kern/timer_call.c `timer_compute_leeway`), where
+    /// Linux's `epoll_wait` takes a slack of the larger of the task's
+    /// `timer_slack_ns` and 0.1 % of the timeout (fs/select.c
+    /// `select_estimate_accuracy`). No Firecracker code but its tests waits
+    /// with a timeout (its loops wait with none, `-1`, or poll with `0`):
+    /// this keeps it so. Upstream's Firecracker sources, outside test code
+    /// (a file under `tests/`, a `test_utils.rs`, or after a file's first
+    /// `#[cfg(test)]`), may hold no `run_with_timeout(` and no two-argument
+    /// `.wait(` whose timeout is not `0` or `-1`.
+    #[test]
+    fn test_only_tests_wait_with_a_timeout() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../lib/firecracker/src");
+        let mut files = Vec::new();
+        let mut dirs = vec![root.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if path.file_name().unwrap() != "tests" {
+                        dirs.push(path);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && path.file_name().unwrap() != "test_utils.rs"
+                {
+                    files.push(path);
+                }
+            }
+        }
+        assert!(files.len() > 100, "{} files under {}", files.len(), root.display());
+        let mut timed = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let product = text.split("#[cfg(test)]").next().unwrap();
+            for (n, line) in product.lines().enumerate() {
+                let code = line.split("//").next().unwrap();
+                let two_arg_wait = code.split(".wait(").skip(1).any(|rest| {
+                    let arg = rest.split([',', ')']).next().unwrap().trim();
+                    rest.contains(',') && !rest.starts_with(')') && arg != "0" && arg != "-1"
+                });
+                if code.contains("run_with_timeout(") || two_arg_wait {
+                    timed.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(timed.is_empty(), "waits with a timeout outside tests:\n{}", timed.join("\n"));
+    }
+
     #[test]
     fn test_event_ops() {
         let mut event = EpollEvent::default();
