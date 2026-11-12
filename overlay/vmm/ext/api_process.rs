@@ -596,7 +596,7 @@ mod macos {
     /// one thread (where upstream starts the API thread, it has): with more,
     /// the API process could inherit a lock another thread held; that fails.
     pub fn split(
-        mut server: HttpServer,
+        server: HttpServer,
         kill_switch: EventFd,
         socket_path: &Path,
         payload_limit: usize,
@@ -617,6 +617,24 @@ mod macos {
             // first message comes after it received them.
             return Ok(ApiLink::keeping(link, Box::new((server, kill_switch))));
         }
+        // The thread that moves the FIFOs' overflows (`ext::fifo`), made at
+        // the first FIFO's open (`--metrics-path`, `--log-path`), stops for
+        // the fork, and runs again after it, whether or not it was made.
+        crate::ext::fifo::before_fork();
+        let forked = fork(server, kill_switch, payload_limit);
+        let relay = crate::ext::fifo::after_fork(false)
+            .map_err(|e| ApiProcessError::Fork(std::io::Error::other(format!("the FIFO relay: {e}"))));
+        let link = forked?;
+        relay?;
+        Ok(link)
+    }
+
+    /// [`split`]'s fork, from one thread.
+    fn fork(
+        mut server: HttpServer,
+        kill_switch: EventFd,
+        payload_limit: usize,
+    ) -> Result<ApiLink<UnixStream>, ApiProcessError> {
         let n = threads()?;
         if n != 1 {
             return Err(ApiProcessError::Threads(n));
@@ -627,6 +645,8 @@ mod macos {
             -1 => Err(ApiProcessError::Fork(std::io::Error::last_os_error())),
             0 => {
                 drop(ours);
+                // Firecracker's overflows are Firecracker's to write.
+                let _ = crate::ext::fifo::after_fork(true);
                 // As upstream's API thread, the API process opens no
                 // network interface: it keeps no way into the jail's network.
                 // SAFETY: the child of a fork made with one thread.
@@ -700,6 +720,9 @@ mod macos {
                 1
             }
         };
+        // What it wrote and found its FIFO full: an orderly end, as
+        // Firecracker's exit (`ext::fifo`).
+        crate::ext::fifo::drain();
         // SAFETY: ends this process.
         unsafe { libc::_exit(code) }
     }
@@ -1054,6 +1077,187 @@ mod macos {
                 "{}",
                 text(&out)
             );
+        }
+
+        // Firecracker started with --metrics-path and --log-path on FIFOs
+        // opens them before it splits the API process off (main.rs:
+        // init_metrics, the logger), and ext::fifo's relay thread with the
+        // first: the split's fork must still be made, from one thread; what
+        // Firecracker's overflow held at the fork is written once (by
+        // Firecracker, not again by the API process's exit); and
+        // Firecracker's relay runs again after it. No VM.
+        #[test]
+        fn test_fifos_opened_before_the_split_leave_it_one_thread() {
+            use std::io::{Read, Write};
+            use std::time::{Duration, Instant};
+
+            use crate::ext::fifo::tests::{fifo, reader};
+            let (_dir, log) = fifo("log");
+            let metrics = log.with_file_name("metrics");
+            let c = std::ffi::CString::new(metrics.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: a NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            let log_r = reader(&log);
+            let _metrics_r = reader(&metrics);
+            let sock = std::path::PathBuf::from(format!("/tmp/wick-apif-{}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&sock);
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ext::api_process::macos::tests::api_fifo_child", "--ignored", "--nocapture"])
+                .env("WICK_TEST_LOG", &log)
+                .env("WICK_TEST_METRICS", &metrics)
+                .env("WICK_TEST_SOCK", &sock)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let fail = |child: &mut std::process::Child, why: String| -> ! {
+                let _ = child.kill();
+                let out = child.wait_with_output_ref();
+                panic!("{why}\n{out}");
+            };
+            // The API socket listens, in the API process; nothing is read
+            // from the log FIFO yet, so Firecracker's overflow holds the
+            // end of its lines across the fork.
+            let mut conn = loop {
+                if let Ok(c) = std::os::unix::net::UnixStream::connect(&sock) {
+                    break c;
+                }
+                if child.try_wait().unwrap().is_some() || Instant::now() > deadline {
+                    fail(&mut child, "no API socket".into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            conn.write_all(b"GET /machine-config HTTP/1.1\r\n\r\n").unwrap();
+            // Everything written to the log FIFO, until its last writer
+            // (the API process, which ends with Firecracker) has gone.
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                if Instant::now() > deadline {
+                    fail(&mut child, format!("log FIFO: {}", String::from_utf8_lossy(&got)));
+                }
+                // SAFETY: reading into our buffer.
+                let n = unsafe { libc::read(log_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                match n {
+                    0 => break,
+                    n if n > 0 => got.extend_from_slice(&buf[..n.cast_unsigned()]),
+                    _ => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+            drop(conn);
+            let _ = std::fs::remove_file(&sock);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() > deadline {
+                    fail(&mut child, "Firecracker's side did not end".into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let mut out = String::new();
+            child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+            assert!(out.contains("API-FIFO-SPLIT-OK"), "{out}");
+            assert!(out.contains("API-FIFO-RELAYED"), "{out}");
+            // Each line once, in order.
+            let text = String::from_utf8_lossy(&got);
+            let marks: Vec<&str> =
+                text.lines().filter_map(|l| l.split("WICK-FIFO-SPLIT ").nth(1)?.split(' ').next()).collect();
+            let want: Vec<String> =
+                (0..API_FIFO_LINES).map(|i| format!("{i:05}")).chain(["after".to_owned()]).collect();
+            assert_eq!(marks, want, "{out}");
+        }
+
+        /// Lines Firecracker's side logs before the split: about 100 bytes
+        /// each, so more than the FIFO's 8192 and less than its overflow.
+        const API_FIFO_LINES: usize = 300;
+
+        trait WaitRef {
+            fn wait_with_output_ref(&mut self) -> String;
+        }
+
+        impl WaitRef for std::process::Child {
+            fn wait_with_output_ref(&mut self) -> String {
+                use std::io::Read;
+                let _ = self.wait();
+                let mut out = String::new();
+                let mut err = String::new();
+                if let Some(mut o) = self.stdout.take() {
+                    let _ = o.read_to_string(&mut out);
+                }
+                if let Some(mut e) = self.stderr.take() {
+                    let _ = e.read_to_string(&mut err);
+                }
+                format!("--- stdout\n{out}\n--- stderr\n{err}")
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_fifos_opened_before_the_split_leave_it_one_thread"]
+        fn api_fifo_child() {
+            use crate::ext::sandbox::{self, Policy};
+            use crate::logger::{FcLineWriter, LOGGER, LevelFilter, LoggerConfig, METRICS};
+            // In a fork, whose only thread is this one, as api_violation_child.
+            // SAFETY: the fork runs Firecracker's side and ends; this
+            // process waits for it and ends as it ended.
+            match unsafe { libc::fork() } {
+                0 => {}
+                // SAFETY: the fork's pid; ends this process as it ended.
+                pid => unsafe {
+                    let mut status = 0;
+                    libc::waitpid(pid, &mut status, 0);
+                    if libc::WIFEXITED(status) {
+                        libc::_exit(libc::WEXITSTATUS(status));
+                    }
+                    libc::_exit(128 + libc::WTERMSIG(status));
+                },
+            }
+            let path = |name| std::path::PathBuf::from(std::env::var_os(name).unwrap());
+            crate::signal_handler::register_signal_handlers().unwrap();
+            let _ = LOGGER.init();
+            // As main.rs: the metrics from --metrics-path, the log from --log-path.
+            METRICS
+                .init(FcLineWriter::new(crate::utils::open_file_nonblock(&path("WICK_TEST_METRICS")).unwrap()))
+                .unwrap();
+            LOGGER
+                .update(LoggerConfig {
+                    log_path: Some(path("WICK_TEST_LOG")),
+                    level: Some(LevelFilter::Info),
+                    show_level: None,
+                    show_log_origin: None,
+                    module: None,
+                })
+                .unwrap();
+            for i in 0..API_FIFO_LINES {
+                crate::logger::info_unrestricted!("WICK-FIFO-SPLIT {i:05} {}", "x".repeat(40));
+            }
+            sandbox::select(Policy::Default);
+            let sock = path("WICK_TEST_SOCK");
+            let server = micro_http::HttpServer::new(&sock).unwrap();
+            let kill_switch = vmm_sys_util::eventfd::EventFd::new(libc::O_NONBLOCK).unwrap();
+            let mut link = match super::split(server, kill_switch, &sock, 51200) {
+                Ok(link) => link,
+                Err(err) => {
+                    println!("API-FIFO-SPLIT-FAILED {err}");
+                    // SAFETY: ends the fork.
+                    unsafe { libc::_exit(1) }
+                }
+            };
+            println!("API-FIFO-SPLIT-OK");
+            sandbox::apply().unwrap();
+            link.receive().unwrap();
+            // The test reads now: Firecracker's relay, running again, moves
+            // what its overflow held at the fork.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while crate::ext::fifo::queued() > 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if crate::ext::fifo::queued() == 0 {
+                println!("API-FIFO-RELAYED");
+            }
+            crate::logger::info_unrestricted!("WICK-FIFO-SPLIT after");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            // exit(3): the drains run.
+            // SAFETY: ends the fork.
+            unsafe { libc::exit(0) }
         }
 
         #[test]

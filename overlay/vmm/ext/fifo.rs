@@ -22,7 +22,8 @@
 //! less the FIFO's buffer, after which writes fail as Linux's do; once
 //! anything is in the overflow every write goes behind it, so the order is
 //! kept; a thread made at the first FIFO's open (before the host sandbox
-//! narrows) moves the overflow into the FIFO as the reader makes room. A
+//! narrows) moves the overflow into the FIFO as the reader makes room; it
+//! stops for the API process's fork ([`before_fork`], [`after_fork`]). A
 //! write of up to 4096 bytes (Linux's `PIPE_BUF`) is taken whole or not at
 //! all. Only the overflow can be lost at an abrupt end (`SIGKILL`, and
 //! `SIGTERM`, `SIGINT`, `SIGQUIT`, which Firecracker leaves at their default
@@ -48,6 +49,18 @@ pub type OutFile = std::fs::File;
 #[cfg(not(target_os = "macos"))]
 pub fn drain() {}
 
+/// Called before a `fork`: no thread of this module's to stop where the
+/// file is the FIFO itself.
+#[cfg(not(target_os = "macos"))]
+pub fn before_fork() {}
+
+/// Called after a `fork`, on both sides: nothing to do where the file is
+/// the FIFO itself.
+#[cfg(not(target_os = "macos"))]
+pub fn after_fork(_in_child: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// `file` as an [`OutFile`] written directly, whatever it is (tests that
 /// write to a file they opened themselves).
 #[cfg(not(target_os = "macos"))]
@@ -56,7 +69,9 @@ pub fn plain(file: std::fs::File) -> OutFile {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{OutFile, drain, plain};
+pub use macos::{OutFile, after_fork, before_fork, drain, plain};
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use macos::queued;
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -536,20 +551,64 @@ mod macos {
         relay::each(until, |fifo| fifo.drain(until));
     }
 
+    /// Stops the relay thread before a `fork` (`ext::api_process::split`,
+    /// which forks only from one thread): it holds the overflows' locks
+    /// while it runs, and a fork copies only the calling thread. Waits for
+    /// a relay pass in progress to end. [`after_fork`] starts it again.
+    pub fn before_fork() {
+        relay::stop();
+    }
+
+    /// After a `fork` that [`before_fork`] preceded, or after the `fork`
+    /// was not made. In Firecracker (`in_child` false) the relay runs
+    /// again, and moves what the overflows hold, written once, by
+    /// Firecracker. In the child (the API process), whose copies of the
+    /// overflows are Firecracker's bytes, the copies are emptied, so that
+    /// its drains (its exit, its panic hook) do not write them a second
+    /// time, and it gets no relay: it writes no log (`serve` turns the
+    /// log off), so a line it wrote before that and found the FIFO full
+    /// waits for its drain at its end.
+    pub fn after_fork(in_child: bool) -> io::Result<()> {
+        if in_child {
+            relay::forget_in_child();
+            Ok(())
+        } else {
+            relay::restart()
+        }
+    }
+
+    /// The bytes all overflows hold now (the split test: Firecracker's relay
+    /// runs again after it).
+    #[cfg(test)]
+    pub(crate) fn queued() -> usize {
+        let total = AtomicUsize::new(0);
+        relay::each(Instant::now() + DRAIN_STALL, |fifo| {
+            total.fetch_add(fifo.queued.load(Ordering::Acquire), Ordering::Relaxed);
+        });
+        total.into_inner()
+    }
+
     /// The thread that moves overflows into their FIFOs.
     mod relay {
         use super::*;
+        use std::sync::Mutex;
+        use std::thread::JoinHandle;
 
         struct Relay {
             /// The open FIFOs. An owner lock: a signal handler's drain on a
             /// thread interrupted while registering one skips the list.
             fifos: OwnerLock<Vec<Weak<Fifo>>>,
-            /// The wake pipe: written by a write that queued bytes.
-            wake_r: OwnedFd,
-            wake_w: OwnedFd,
+            /// The wake pipe, written by a write that queued bytes; -1 in
+            /// a fork's child, which has no relay.
+            wake_r: AtomicI32,
+            wake_w: AtomicI32,
+            /// The relay thread, while it runs.
+            thread: Mutex<Option<JoinHandle<()>>>,
         }
 
         static RELAY: OnceLock<Relay> = OnceLock::new();
+        /// The relay ends at its next pass ([`stop`]).
+        static STOP: AtomicBool = AtomicBool::new(false);
 
         /// The relay moves nothing (tests of what the drain alone moves).
         #[cfg(test)]
@@ -583,10 +642,15 @@ mod macos {
             let mut fresh = false;
             let relay = RELAY.get_or_init(|| {
                 fresh = true;
-                Relay { fifos: OwnerLock::new(Vec::new()), wake_r: r, wake_w: w }
+                Relay {
+                    fifos: OwnerLock::new(Vec::new()),
+                    wake_r: AtomicI32::new(r.into_raw_fd()),
+                    wake_w: AtomicI32::new(w.into_raw_fd()),
+                    thread: Mutex::new(None),
+                }
             });
             if fresh {
-                std::thread::Builder::new().name("fc_fifo".into()).spawn(|| run(RELAY.get().unwrap()))?;
+                spawn(relay)?;
                 // SAFETY: a plain extern "C" fn.
                 if unsafe { libc::atexit(at_exit) } != 0 {
                     return Err(io::Error::other("atexit refused the FIFO drain"));
@@ -595,12 +659,65 @@ mod macos {
             Ok(relay)
         }
 
+        fn spawn(relay: &'static Relay) -> io::Result<()> {
+            let mut thread = relay.thread.lock().unwrap();
+            if thread.is_none() {
+                STOP.store(false, Ordering::Release);
+                *thread = Some(std::thread::Builder::new().name("fc_fifo".into()).spawn(move || run(relay))?);
+            }
+            Ok(())
+        }
+
         pub(super) fn register(fifo: &Arc<Fifo>) -> io::Result<()> {
             let relay = start()?;
             let mut list = relay.fifos.lock().expect("not registering from a signal handler");
             list.retain(|f| f.strong_count() > 0);
             list.push(Arc::downgrade(fifo));
             Ok(())
+        }
+
+        /// Ends the relay thread, if it runs, and waits for it.
+        pub(super) fn stop() {
+            let Some(relay) = RELAY.get() else { return };
+            let thread = relay.thread.lock().unwrap().take();
+            if let Some(thread) = thread {
+                STOP.store(true, Ordering::Release);
+                wake();
+                // A relay that panicked has ended too (and the panic aborts
+                // Firecracker: panic = "abort").
+                let _ = thread.join();
+            }
+        }
+
+        /// Starts the relay thread again after [`stop`].
+        pub(super) fn restart() -> io::Result<()> {
+            match RELAY.get() {
+                Some(relay) if relay.wake_r.load(Ordering::Acquire) >= 0 => spawn(relay),
+                _ => Ok(()),
+            }
+        }
+
+        /// In a fork's child: the overflows' copies emptied, and the
+        /// parent's wake pipe closed here (no relay reads it in this
+        /// process; the parent's relay must not be woken by it).
+        pub(super) fn forget_in_child() {
+            let Some(relay) = RELAY.get() else { return };
+            each(Instant::now() + DRAIN_STALL, |fifo| {
+                if let Some(mut ring) = fifo.ring.lock() {
+                    ring.clear();
+                    fifo.queued.store(0, Ordering::Release);
+                }
+            });
+            for fd in [&relay.wake_r, &relay.wake_w] {
+                let fd = fd.swap(-1, Ordering::AcqRel);
+                if fd >= 0 {
+                    // SAFETY: this process's copy of the wake pipe's end.
+                    unsafe { libc::close(fd) };
+                }
+            }
+            // The copy of the parent's handle names a thread that is not
+            // in this process.
+            std::mem::forget(relay.thread.lock().unwrap().take());
         }
 
         /// Runs `f` on each open FIFO, without allocating (a signal
@@ -620,36 +737,56 @@ mod macos {
 
         pub(super) fn wake() {
             if let Some(r) = RELAY.get() {
-                // A full pipe is a wake already pending.
-                let _ = raw_write(r.wake_w.as_raw_fd(), &[1]);
+                // A full pipe is a wake already pending; -1 (a fork's
+                // child) fails, and none is needed.
+                let _ = raw_write(r.wake_w.load(Ordering::Acquire), &[1]);
+            }
+        }
+
+        /// The relay's signal mask: the signals a fault raises on the
+        /// faulting thread reach upstream's handlers here as on any thread
+        /// (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP; SIGABRT for a panic's
+        /// abort). Every other signal is blocked, so that one sent to the
+        /// process (upstream's SIGXCPU, SIGHUP, the sandbox's SIGSYS: xnu
+        /// bsd/kern/kern_sig.c `get_signalthread` takes the first thread
+        /// that does not block it) runs its handler on a thread of
+        /// Firecracker's own, not on this one while it holds an overflow's
+        /// lock, where the handler's drain would skip that FIFO. The vCPU
+        /// kick is sent to vCPU threads only (`pthread_kill`, vcpu.rs).
+        fn set_mask() {
+            // SAFETY: a set built here, applied to this thread.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigfillset(&mut set);
+                for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGTRAP, libc::SIGABRT] {
+                    libc::sigdelset(&mut set, sig);
+                }
+                libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
             }
         }
 
         fn run(relay: &'static Relay) {
-            // Signals go to Firecracker's other threads: this one holds the
-            // overflows' locks.
-            // SAFETY: a full set, applied to this thread.
-            unsafe {
-                let mut all: libc::sigset_t = std::mem::zeroed();
-                libc::sigfillset(&mut all);
-                libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
-            }
+            set_mask();
             let mut buf = [0u8; 64];
             loop {
+                if STOP.load(Ordering::Acquire) {
+                    return;
+                }
                 #[cfg(test)]
                 if PAUSED.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
+                let wake_r = relay.wake_r.load(Ordering::Acquire);
                 let fifos: Vec<Arc<Fifo>> = relay
                     .fifos
                     .lock()
-                    .expect("this thread takes no signals")
+                    .expect("this thread takes no signal that writes")
                     .iter()
                     .filter_map(Weak::upgrade)
                     .filter(|f| f.queued.load(Ordering::Acquire) > 0 && !f.broken.load(Ordering::Acquire))
                     .collect();
-                let mut fds = vec![libc::pollfd { fd: relay.wake_r.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+                let mut fds = vec![libc::pollfd { fd: wake_r, events: libc::POLLIN, revents: 0 }];
                 fds.extend(fifos.iter().map(|f| libc::pollfd { fd: f.w.as_raw_fd(), events: libc::POLLOUT, revents: 0 }));
                 // SAFETY: `fds` is valid for its length.
                 if unsafe { libc::poll(fds.as_mut_ptr(), libc::nfds_t::try_from(fds.len()).unwrap_or(libc::nfds_t::MAX), -1) } < 0 {
@@ -657,7 +794,7 @@ mod macos {
                 }
                 if fds[0].revents != 0 {
                     // SAFETY: reading into our buffer.
-                    while unsafe { libc::read(relay.wake_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+                    while unsafe { libc::read(wake_r, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
                 }
                 for (f, p) in fifos.iter().zip(&fds[1..]) {
                     if p.revents != 0 {
