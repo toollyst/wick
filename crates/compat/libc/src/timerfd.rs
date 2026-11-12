@@ -91,6 +91,15 @@ static TIMERS: LazyLock<&'static Timers> = LazyLock::new(|| {
 
 use crate::linux_items::set_errno;
 
+/// Starts the thread that fires the timers, if it is not running yet.
+/// A timer can be made after the host sandbox stops the process from making
+/// threads (a hot-plugged device's rate limiter, when no timer was made at
+/// boot): the sandbox's narrow() calls this first, as it starts the Async
+/// block engine's workers.
+pub fn timerfd_start_thread() {
+    LazyLock::force(&TIMERS);
+}
+
 fn to_duration(ts: &timespec) -> Option<Duration> {
     let secs = u64::try_from(ts.tv_sec).ok()?;
     let nanos = u32::try_from(ts.tv_nsec)

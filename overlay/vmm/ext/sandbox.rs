@@ -1191,6 +1191,9 @@ mod macos {
         // bsdthread_create): the Async block engine's workers start now.
         crate::platform::async_io::seal_workers()
             .map_err(|err| fail("starting the async I/O workers", err))?;
+        // And the thread that fires the timers (timerfd_create), which a
+        // timer made after this would otherwise start.
+        libc::timerfd_start_thread();
         let token = state.narrowed.take().expect("the narrowed token is kept until narrow()");
         token.consume().map_err(|err| fail("taking the narrowed extension", err))?;
         drop(token);
@@ -1813,6 +1816,39 @@ mod macos {
             // returns EPERM here until the signal lands on a thread.
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED {p:?}");
+        }
+
+        // What the running microVM needs a thread for exists before narrow()
+        // forbids making one: a timer made only after it (a hot-plugged
+        // device's rate limiter, with no timer made at boot) fires, with no
+        // thread made then (a new thread would raise SIGSYS, as in
+        // test_narrowing_is_one_way).
+        #[test]
+        fn test_threads_the_run_phase_needs_exist_before_narrow() {
+            let out = child("late_timer_child", &[]);
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(String::from_utf8_lossy(&out.stdout).contains("CHILD-OK"), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_threads_the_run_phase_needs_exist_before_narrow in a separate process"]
+        fn late_timer_child() {
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            // SAFETY: plain call.
+            let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            let spec = libc::itimerspec {
+                it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+                it_value: libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 },
+            };
+            // SAFETY: valid descriptor and spec.
+            assert_eq!(unsafe { libc::timerfd_settime(fd, 0, &spec, std::ptr::null_mut()) }, 0);
+            let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            // SAFETY: one valid pollfd.
+            assert_eq!(unsafe { libc::poll(&mut p, 1, 30_000) }, 1, "the timer did not fire");
+            println!("CHILD-OK");
         }
 
         #[test]
