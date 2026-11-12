@@ -205,6 +205,10 @@ semantics on Win32. The details are in the comments of each
   and macOS). `print!`/`println!` keep std's own buffer, so they interleave
   with it by line; its buffer is not flushed at exit, where std's is. Libtest
   writes through std's, so the unit-test checker still gives tests a file.
+  `std::fs`'s opening calls (`OpenOptions::open`, `read`, `write`, `copy`,
+  `read_dir`, ...) fail with `EMFILE` past the jail's `no-file` limit, as the
+  compat libc's descriptor calls do (`libc::wick_nofile`: a count of the
+  process's handles; std's own `File::open` is not shadowed).
 - **errno = Win32/WSA codes**, chosen so that the `io::ErrorKind` mapping
   matches Linux (`EPERM`=`WSAEACCES`, `EAGAIN`=`EWOULDBLOCK`,
   `ENOTTY`=`ERROR_INVALID_FUNCTION`, ...). A code Windows gives beside one of

@@ -508,7 +508,8 @@ pub(crate) fn socket_fd(s: ws::SOCKET, fits: fn(ws::SOCKET) -> Option<c_int>) ->
 }
 
 /// `socket`, with Linux families and the `SOCK_NONBLOCK`/`SOCK_CLOEXEC`
-/// flags. Returns a descriptor.
+/// flags. Returns a descriptor; `EMFILE` past the no-file limit
+/// (`crate::wick_nofile`), after the family is checked, as on Linux.
 ///
 /// # Safety
 /// No requirements; `unsafe` like the libc function.
@@ -518,6 +519,9 @@ pub unsafe fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int {
         set_errno(crate::EAFNOSUPPORT);
         return -1;
     };
+    if !crate::wick_nofile::room(1) {
+        return -1;
+    }
     let base = ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
     let mut flags = WSA_FLAG_OVERLAPPED;
     if ty & SOCK_CLOEXEC != 0 {
@@ -591,12 +595,18 @@ pub unsafe fn listen(fd: c_int, backlog: c_int) -> c_int {
     0
 }
 
-/// `accept`. Returns a descriptor.
+/// `accept`. Returns a descriptor. Past the no-file limit
+/// (`crate::wick_nofile`) it fails with `EMFILE` before it takes a
+/// connection, which stays queued, as Linux takes the descriptor number
+/// before it accepts (linux v6.12 net/socket.c, `__sys_accept4_file`).
 ///
 /// # Safety
 /// `addr` and `len` may be null; otherwise as for `accept(2)`.
 pub unsafe fn accept(fd: c_int, addr: *mut crate::sockaddr, len: *mut u32) -> c_int {
     wick_wsa_startup();
+    if !crate::wick_nofile::room(1) {
+        return -1;
+    }
     // SAFETY: an all-zero storage is valid.
     let mut s: sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut n = c_int::try_from(std::mem::size_of_val(&s)).unwrap();
@@ -661,7 +671,8 @@ pub const MFD_ALLOW_SEALING: core::ffi::c_uint = 2;
 /// `flags` may hold `MFD_CLOEXEC` and `MFD_ALLOW_SEALING`; seals are added
 /// through the `memfd` crate (`fcntl(F_ADD_SEALS)` does not exist here and
 /// fails). Other flags (`MFD_HUGETLB` and its sizes, `MFD_NOEXEC_SEAL`, ...)
-/// ask for what this cannot give and fail with `EINVAL`. On other failures
+/// ask for what this cannot give and fail with `EINVAL`. Past the no-file
+/// limit it fails with `EMFILE` (`crate::wick_nofile`). On other failures
 /// the Windows error is the thread's last error.
 ///
 /// # Safety
@@ -683,6 +694,9 @@ pub unsafe fn memfd_create(_name: *const c_char, flags: core::ffi::c_uint) -> c_
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
         set_errno(crate::EINVAL);
+        return -1;
+    }
+    if !crate::wick_nofile::room(1) {
         return -1;
     }
     let sa = SECURITY_ATTRIBUTES {

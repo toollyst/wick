@@ -44,9 +44,11 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
 
-/// A new temporary file with no name.
+/// A new temporary file with no name. `EMFILE` past the jail's no-file
+/// limit (`libc::wick_nofile`), as `memfd_create` on Linux.
 pub(crate) fn create(cloexec: bool) -> io::Result<File> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    libc::wick_nofile::check(1)?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap(),
         lpSecurityDescriptor: std::ptr::null_mut(),

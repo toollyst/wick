@@ -130,9 +130,10 @@ pub fn close(fd: RawFd) -> bool {
 
 /// Duplicates a descriptor in this process (`dup`). Sockets are duplicated
 /// through Winsock, as Microsoft requires; other handles with
-/// `DuplicateHandle`.
+/// `DuplicateHandle`. `EMFILE` past the no-file limit ([`super::nofile`]).
 pub fn dup(fd: RawFd) -> std::io::Result<RawFd> {
     super::net::startup();
+    super::nofile::check(1)?;
     // SAFETY: an all-zero `WSAPROTOCOL_INFOW` is valid.
     let mut info: WSAPROTOCOL_INFOW = unsafe { std::mem::zeroed() };
     // SAFETY: duplicates a socket of this process into this process.

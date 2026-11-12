@@ -204,14 +204,19 @@ upstream Firecracker and its jailer.
   sections the host's commit grew by 4.1 GiB while the job's peak stayed at 9 MiB). A compromised jailed
   Firecracker can so take host memory past its limit, and guest memory backed by a memfd (with vhost-user
   devices) is not charged either.
-- **Windows jailer: no limit on the number of handles.** Upstream's jailer limits Firecracker to 2048 descriptors
-  by default (`RLIMIT_NOFILE`). Windows has no per-process handle limit to set: a process's pool quota is accepted
-  and ignored (200,000 handles made after a 1 MiB paged-pool quota, measured on Windows Server 2022), and a Job
-  Object has no handle limit and its memory limit does not count handles (a jailed process opens 100,000 files
-  under `memory.max` of 32 MiB: `jailer-test.ps1 nofile`). Nothing bounds the handles of
-  a compromised jailed Firecracker, or the kernel memory they take, short of Windows' fixed per-process maximum
-  (2^24 handles, documented, not measured). The jailer refuses `--resource-limit no-file=` and says at its start,
-  on stderr, that upstream's default is not enforced.
+- **Windows jailer: the handle limit holds only in the jailed process.** Upstream's jailer limits Firecracker to
+  2048 descriptors by default (`RLIMIT_NOFILE`), and the kernel enforces it. Windows has no per-process handle limit
+  to set: a process's pool quota is accepted and ignored (200,000 handles made after a 1 MiB paged-pool quota,
+  measured on Windows Server 2022), and a Job Object has no handle limit and its memory limit does not count
+  handles (a jailed process opened 100,000 files under `memory.max` of 32 MiB). The Windows jailer gives each
+  jailed process `--resource-limit no-file=` (2048 by default) in its environment, and wick's POSIX layer fails a
+  call that would make descriptors past it with `EMFILE`, counting the process's handles, Windows' own among them
+  (crates/compat/libc, `wick_nofile`, which names what it does not cover). That holds a well-behaved Firecracker
+  to upstream's semantics. A compromised one makes handles with Windows' own calls, and nothing bounds those, or
+  the kernel memory they take, short of Windows' fixed per-process maximum (2^24 handles, documented, not
+  measured): `jailer-test.ps1 nofile` checks that the jailed probe still opens 5000 files under `no-file=512`, and
+  100,000 under `memory.max` of 32 MiB with it (written, not yet run).
+  The bound a jailed process cannot pass, the jailer ending a jail whose handles pass the limit, is not written.
 - **No per-thread filters outside Linux.** Neither macOS nor Windows filters system calls per thread. Threads of a
   process share its address space, so the union of upstream's filters applies process-wide, and the API server,
   whose separate filter is a real boundary, moves into a process of its own. On macOS that is in place: the API

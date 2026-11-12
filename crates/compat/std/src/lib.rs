@@ -18,8 +18,10 @@
 //! non-blocking pipe reads as `EWOULDBLOCK`, as on Linux, not as the end
 //! (Firecracker's serial input), and a write to a full non-blocking pipe fails
 //! with `EWOULDBLOCK`, as on Linux, not with 0 bytes written (its serial
-//! output and its logger). Macros (`println!`, `vec!`, ...) still come from
-//! the real `std`, so `print!`/`println!` write through std's own buffer.
+//! output and its logger); and `std::fs`'s opening calls fail with `EMFILE`
+//! past the jailer's `--resource-limit no-file=` ([`fs`]). Macros
+//! (`println!`, `vec!`, ...) still come from the real `std`, so
+//! `print!`/`println!` write through std's own buffer.
 //!
 //! On Windows `std::os::raw::c_long` and `c_ulong` are also 64 bits wide: the
 //! upstream crates use them in bindings of Linux kernel ABIs (`ifreq`,
@@ -38,6 +40,138 @@ pub mod io {
     pub use std::io::*;
 
     pub use wick_os::stdio::{Stdin, Stdout, stdin, stdout};
+}
+
+/// `std::fs`. On Windows, the calls that make a descriptor on Linux fail
+/// with `EMFILE` (the compat libc's, `WSAEMFILE`) past the jailer's
+/// `--resource-limit no-file=`, before they open anything, as an `open`
+/// past `RLIMIT_NOFILE` does (crates/compat/libc/src/windows_nofile.rs):
+/// `OpenOptions::open`, `read`, `read_to_string`, `write`, `copy` (two
+/// descriptors) and `read_dir`. `File::open`, `File::create` and
+/// `File::try_clone` are std's own: shadowing them would replace `File`, the
+/// type every crate shares, so they are counted and not refused.
+pub mod fs {
+    pub use std::fs::*;
+
+    #[cfg(windows)]
+    pub use self::windows::{OpenOptions, copy, read, read_dir, read_to_string, write};
+
+    #[cfg(windows)]
+    mod windows {
+        use std::fs::{File, ReadDir};
+        use std::io;
+        use std::path::Path;
+
+        use wick_os::windows::nofile::check;
+
+        /// `std::fs::OpenOptions`, whose `open` fails with `EMFILE` past the
+        /// no-file limit.
+        #[derive(Clone, Debug)]
+        pub struct OpenOptions(std::fs::OpenOptions);
+
+        impl Default for OpenOptions {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl OpenOptions {
+            /// `std::fs::OpenOptions::new`.
+            pub fn new() -> Self {
+                OpenOptions(std::fs::OpenOptions::new())
+            }
+            /// `std::fs::OpenOptions::read`.
+            pub fn read(&mut self, read: bool) -> &mut Self {
+                self.0.read(read);
+                self
+            }
+            /// `std::fs::OpenOptions::write`.
+            pub fn write(&mut self, write: bool) -> &mut Self {
+                self.0.write(write);
+                self
+            }
+            /// `std::fs::OpenOptions::append`.
+            pub fn append(&mut self, append: bool) -> &mut Self {
+                self.0.append(append);
+                self
+            }
+            /// `std::fs::OpenOptions::truncate`.
+            pub fn truncate(&mut self, truncate: bool) -> &mut Self {
+                self.0.truncate(truncate);
+                self
+            }
+            /// `std::fs::OpenOptions::create`.
+            pub fn create(&mut self, create: bool) -> &mut Self {
+                self.0.create(create);
+                self
+            }
+            /// `std::fs::OpenOptions::create_new`.
+            pub fn create_new(&mut self, create_new: bool) -> &mut Self {
+                self.0.create_new(create_new);
+                self
+            }
+            /// `std::fs::OpenOptions::open`; `EMFILE` past the no-file limit.
+            pub fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
+                check(1)?;
+                self.0.open(path)
+            }
+        }
+
+        impl std::os::windows::fs::OpenOptionsExt for OpenOptions {
+            fn access_mode(&mut self, access: u32) -> &mut Self {
+                self.0.access_mode(access);
+                self
+            }
+            fn share_mode(&mut self, val: u32) -> &mut Self {
+                self.0.share_mode(val);
+                self
+            }
+            fn custom_flags(&mut self, flags: u32) -> &mut Self {
+                self.0.custom_flags(flags);
+                self
+            }
+            fn attributes(&mut self, val: u32) -> &mut Self {
+                self.0.attributes(val);
+                self
+            }
+            fn security_qos_flags(&mut self, flags: u32) -> &mut Self {
+                self.0.security_qos_flags(flags);
+                self
+            }
+        }
+
+        /// `std::fs::read`; `EMFILE` past the no-file limit.
+        pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+            check(1)?;
+            std::fs::read(path)
+        }
+
+        /// `std::fs::read_to_string`; `EMFILE` past the no-file limit.
+        pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
+            check(1)?;
+            std::fs::read_to_string(path)
+        }
+
+        /// `std::fs::write`; `EMFILE` past the no-file limit.
+        pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result<()> {
+            check(1)?;
+            std::fs::write(path, contents)
+        }
+
+        /// `std::fs::copy`; `EMFILE` unless two descriptors fit, as Linux
+        /// opens both files.
+        pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
+            check(2)?;
+            std::fs::copy(from, to)
+        }
+
+        /// `std::fs::read_dir`; `EMFILE` past the no-file limit (Linux's
+        /// `opendir` holds a descriptor, as the search handle is held here).
+        pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
+            check(1)?;
+            std::fs::read_dir(path)
+        }
+    }
 }
 
 /// `std::os`, plus `unix` and `fd` on Windows.

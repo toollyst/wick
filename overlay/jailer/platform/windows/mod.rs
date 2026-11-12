@@ -71,9 +71,16 @@
 //!   of Firecracker gets no IP networking at all (Windows Filtering
 //!   Platform). Needs an elevated jailer, as `setns` needs root.
 //!
-//! Refused, never accepted without effect: `--resource-limit fsize=` and a
-//! `no-file=` other than the default (Windows cannot limit file sizes or the
-//! number of handles; the default is not enforced either).
+//! - **`--resource-limit no-file=`** ([`install_resource_limits`]): each
+//!   process of the jail gets the limit in `WICK_NO_FILE` (upstream's 2048
+//!   when none is given) and counts it in handles, where Linux counts
+//!   descriptors; wick's POSIX layer fails a call that would make
+//!   descriptors past it with `EMFILE`, as past `RLIMIT_NOFILE`
+//!   (crates/compat/libc, `wick_nofile`). It is enforced inside the jailed
+//!   process, so it does not bound a compromised one.
+//!
+//! Refused, never accepted without effect: `--resource-limit fsize=`
+//! (Windows cannot limit file sizes).
 
 use std::ffi::{CStr, OsStr};
 use std::io::{self, Read, Write};
@@ -166,6 +173,13 @@ const API_WAITING_ENV: &str = "WICK_API_WAITING";
 /// Firecracker's handle to the API process, `SYNCHRONIZE` and
 /// `PROCESS_DUP_HANDLE` (`vmm::ext::api_process::API_PROCESS_ENV`).
 const API_PROCESS_ENV: &str = "WICK_API_PROCESS";
+/// Environment variable through which each process of the jail gets
+/// `--resource-limit no-file=`, a number of handles (the compat libc's
+/// `wick_nofile::ENV`, wick-os's `nofile::ENV`).
+const NO_FILE_ENV: &str = "WICK_NO_FILE";
+/// Upstream's default `no-file` (src/jailer/src/resource_limits.rs,
+/// `NO_FILE`, private there), when none is given.
+const NO_FILE_DEFAULT: u64 = 2048;
 /// `PROCESS_DUP_HANDLE` (winnt.h).
 const PROCESS_DUP_HANDLE: u32 = 0x0040;
 /// `SYNCHRONIZE` (winnt.h).
@@ -1078,20 +1092,28 @@ pub fn copy_exec(src: &Path, dst: &Path) -> Result<(), JailerError> {
     Ok(())
 }
 
-/// What the jailer says at its start when no `--resource-limit no-file=` is
-/// given: upstream then limits Firecracker to 2048 descriptors, and nothing
-/// on Windows can (measured: a process's pool quota, `ProcessQuotaLimits`,
-/// is accepted and ignored; a Job Object has no handle limit, and its memory
-/// limit does not count handles).
-pub const NO_FILE_WARNING: &str = "jailer: warning: Windows cannot limit the number of handles a process \
-                                   opens: upstream's default --resource-limit no-file=2048 is not enforced, \
-                                   and nothing bounds the jailed Firecracker's handles";
+/// The jail's `no-file` limit ([`install_resource_limits`]).
+static NO_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NO_FILE_DEFAULT);
 
-/// Upstream's resource limits. Windows cannot limit the size of the files a
-/// process writes or its number of handles: an explicit limit is refused,
-/// `no-file=` with upstream's default value too, and without one the jailer
-/// warns ([`NO_FILE_WARNING`], on stderr, where its errors go) that
-/// upstream's default is not enforced.
+/// The `no-file` limit each process of the jail gets ([`NO_FILE_ENV`]).
+fn no_file_limit() -> u64 {
+    NO_FILE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Upstream's resource limits.
+///
+/// - `fsize=` is refused: Windows cannot limit the size of the files a
+///   process writes.
+/// - `no-file=`, upstream's 2048 when not given (`no_file` is `None`), is
+///   given to each process of the jail in [`NO_FILE_ENV`], as Linux's
+///   `setrlimit` holds across the exec: a number of handles of the process,
+///   where Linux counts descriptors, with nothing added or taken (a value
+///   below the handles a process starts with fails its first descriptor, as
+///   upstream's `test_negative_no_file_limit` expects of 3). wick's POSIX
+///   layer fails a call that would make descriptors past it with `EMFILE`
+///   (crates/compat/libc, `wick_nofile`, which names what it does not
+///   cover). Enforced inside the process, it is not a bound a compromised
+///   Firecracker can be held to.
 pub fn install_resource_limits(file_size: Option<u64>, no_file: Option<u64>) -> Result<(), JailerError> {
     if file_size.is_some() {
         return Err(HostError::UnsupportedLimit(
@@ -1100,14 +1122,7 @@ pub fn install_resource_limits(file_size: Option<u64>, no_file: Option<u64>) -> 
         )
         .into());
     }
-    if no_file.is_some() {
-        return Err(HostError::UnsupportedLimit(
-            "no-file",
-            "Windows cannot limit the number of handles a process opens",
-        )
-        .into());
-    }
-    eprintln!("{NO_FILE_WARNING}");
+    NO_FILE.store(no_file.unwrap_or(NO_FILE_DEFAULT), std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -2244,6 +2259,7 @@ fn exec(
     let tmp = format!("{drive_root}{JAIL_TMP}");
     vars.extend([
         format!("{JAIL_ENV}={uid}:{gid}:{}", chroot_dir.display()),
+        format!("{NO_FILE_ENV}={}", no_file_limit()),
         format!("SystemRoot={system_root}"),
         format!("TEMP={tmp}"),
         format!("TMP={tmp}"),
@@ -2725,14 +2741,20 @@ mod tests {
         // setrlimit takes it.
         for n in [3, 512, 2048] {
             install_resource_limits(None, Some(n)).unwrap();
+            assert_eq!(no_file_limit(), n);
         }
         // Without it: upstream's default.
         install_resource_limits(None, None).unwrap();
+        assert_eq!(no_file_limit(), 2048);
         // Through upstream's argument parsing: given or not.
         let mut limits = crate::resource_limits::ResourceLimits::default();
-        limits.install().unwrap();
         limits.set_no_file(512);
         limits.install().unwrap();
+        assert_eq!(no_file_limit(), 512);
+        crate::resource_limits::ResourceLimits::default().install().unwrap();
+        assert_eq!(no_file_limit(), 2048);
+        // The variable is the one the compat libc and wick-os read.
+        assert_eq!(NO_FILE_ENV, "WICK_NO_FILE");
     }
 
     #[test]

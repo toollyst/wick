@@ -317,6 +317,10 @@ pub unsafe fn timerfd_create(clockid: clockid_t, flags: c_int) -> c_int {
         set_errno(crate::EINVAL);
         return -1;
     }
+    // A new descriptor: refused past the jail's no-file limit.
+    if !crate::wick_nofile::room(1) {
+        return -1;
+    }
     let make = |hires: u32| {
         // SAFETY: creates an unnamed timer.
         unsafe {

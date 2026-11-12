@@ -269,9 +269,16 @@ impl UnixStream {
         raw(&self.0)
     }
 
-    /// Connects to the socket named by `path`.
+    /// Connects to the socket named by `path`. `EMFILE` past the no-file
+    /// limit ([`super::nofile`]).
     pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
         let addr = SocketAddr::from_path(path.as_ref())?;
+        super::nofile::check(1)?;
+        UnixStream::connect_addr(path.as_ref(), &addr)
+    }
+
+    /// [`UnixStream::connect`], unchecked against the no-file limit.
+    fn connect_addr(path: &Path, addr: &SocketAddr) -> io::Result<UnixStream> {
         let fd = new_socket()?;
         // SAFETY: the address and its length are valid.
         if let Err(e) = cvt(unsafe { connect(raw(&fd), (&raw const addr.addr).cast(), addr.len) }) {
@@ -280,7 +287,7 @@ impl UnixStream {
             // ECONNREFUSED. Winsock refuses both (WSAECONNREFUSED, measured);
             // a missing path is ERROR_FILE_NOT_FOUND here, of kind NotFound
             // as ENOENT is.
-            if std::fs::symlink_metadata(path.as_ref())
+            if std::fs::symlink_metadata(path)
                 .is_err_and(|m| m.kind() == io::ErrorKind::NotFound)
             {
                 return Err(io::Error::from_raw_os_error(2));
@@ -291,8 +298,12 @@ impl UnixStream {
     }
 
     /// Two connected sockets, like `socketpair(AF_UNIX, SOCK_STREAM)`.
+    /// `EMFILE` unless both fit under the no-file limit
+    /// ([`super::nofile`]): checked once, for the two descriptors returned;
+    /// the listener between is this call's own, closed before it returns.
     pub fn pair() -> io::Result<(UnixStream, UnixStream)> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
+        super::nofile::check(2)?;
         let dir = std::env::temp_dir();
         loop {
             let name = format!(
@@ -301,13 +312,14 @@ impl UnixStream {
                 SEQ.fetch_add(1, Ordering::Relaxed)
             );
             let path = dir.join(name);
-            let listener = match UnixListener::bind(&path) {
+            let addr = SocketAddr::from_path(&path)?;
+            let listener = match UnixListener::bind_addr(&addr) {
                 Ok(l) => l,
                 Err(e) if e.kind() == io::ErrorKind::AddrInUse => continue,
                 Err(e) => return Err(e),
             };
-            let result = UnixStream::connect(&path)
-                .and_then(|a| listener.accept().map(|(b, _)| (a, b)));
+            let result = UnixStream::connect_addr(&path, &addr)
+                .and_then(|a| listener.accept_unchecked().map(|(b, _)| (a, b)));
             let _ = std::fs::remove_file(&path);
             return result;
         }
@@ -470,9 +482,16 @@ impl UnixListener {
         raw(&self.0)
     }
 
-    /// Binds a socket to `path` and listens on it.
+    /// Binds a socket to `path` and listens on it. `EMFILE` past the
+    /// no-file limit ([`super::nofile`]).
     pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
         let addr = SocketAddr::from_path(path.as_ref())?;
+        super::nofile::check(1)?;
+        UnixListener::bind_addr(&addr)
+    }
+
+    /// [`UnixListener::bind`], unchecked against the no-file limit.
+    fn bind_addr(addr: &SocketAddr) -> io::Result<UnixListener> {
         let fd = new_socket()?;
         // SAFETY: the address and its length are valid.
         cvt(unsafe { bind(raw(&fd), (&raw const addr.addr).cast(), addr.len) })?;
@@ -481,8 +500,18 @@ impl UnixListener {
         Ok(UnixListener(fd))
     }
 
-    /// Accepts a connection.
+    /// Accepts a connection. Past the no-file limit ([`super::nofile`]) it
+    /// fails with `EMFILE` before it takes one, which stays queued (the
+    /// listener stays readable), as Linux takes the descriptor number before
+    /// it accepts (linux v6.12 net/socket.c, `__sys_accept4_file`). Upstream's
+    /// API server (micro-http) and vsock muxer accept here.
     pub fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
+        super::nofile::check(1)?;
+        self.accept_unchecked()
+    }
+
+    /// [`UnixListener::accept`], unchecked against the no-file limit.
+    fn accept_unchecked(&self) -> io::Result<(UnixStream, SocketAddr)> {
         // SAFETY: an all-zero `SOCKADDR_UN` is valid.
         let mut addr: SOCKADDR_UN = unsafe { mem::zeroed() };
         let mut len = i32::try_from(mem::size_of::<SOCKADDR_UN>()).unwrap();

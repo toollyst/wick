@@ -1,10 +1,155 @@
 // Copyright 2026 toollyst contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `RLIMIT_NOFILE` on Windows: the jailer's `--resource-limit no-file=`,
-//! counted in handles of the process (a wick API, not part of `libc`).
+//! `RLIMIT_NOFILE` on Windows: the jailer's `--resource-limit no-file=`
+//! (a wick API, not part of `libc`).
 //!
-//! Tests first: what the limit must do, as Linux's `alloc_fd` does it.
+//! **What the number counts.** On Linux it bounds a process's descriptors:
+//! `alloc_fd` fails the call that would take a number at or past
+//! `rlimit(RLIMIT_NOFILE)` with `EMFILE`, and the process goes on (linux
+//! v6.12 fs/file.c). Windows has no descriptor table and no settable
+//! per-process handle limit (agent-state/win1/nofile-windows.md §1, §2, §9b,
+//! measured; Microsoft, "Kernel Objects": a fixed 2^24). Here the number
+//! bounds the process's **handles**, as Windows counts them
+//! (`GetProcessHandleCount`), read at each call: Windows' own handles count
+//! too, where Linux counts only descriptors. Measured on Windows Server 2022
+//! (nofile-windows.md §10): Firecracker has 94 handles 3 s after its start
+//! with the API, and 117 after an `InstanceStart`, where Linux has about 10
+//! descriptors; upstream's default 2048 leaves about 1930 of them, the same
+//! order of headroom. Nothing is added to or taken from the number given: a
+//! limit below the handles a process already holds fails its next
+//! descriptor at once, as a Linux limit below the open descriptors does
+//! (upstream's `test_negative_no_file_limit` gives 3).
+//!
+//! **Where it comes from.** Linux's jailer calls `setrlimit`, which the exec
+//! keeps. The Windows jailer starts Firecracker (and its API server's
+//! process, each with the whole limit, where on Linux the API thread shares
+//! Firecracker's descriptors) with [`ENV`] in the environment it gives them;
+//! it is read once,
+//! at the first call that asks ([`limit`]), and never written back. Without
+//! it (Firecracker not started by the jailer) nothing is limited but
+//! Windows' 2^24, which `getrlimit` reports, as a Linux process run without
+//! the jailer has its shell's limit. A value that is no number refuses every
+//! descriptor, with a line on stderr (fails closed).
+//!
+//! **Which calls.** Every call of wick's POSIX layer that makes a descriptor
+//! on Linux asks [`room`] or [`check`] for the descriptors it returns, before
+//! it makes anything, and fails with `EMFILE` (`WSAEMFILE`, through the
+//! errno table) when the count plus them would pass the limit; nothing else
+//! fails (Linux's `ksys_dup3` gives `EBADF` for a target number at or past
+//! the limit, and so does `dup2` here):
+//! - this crate: `socket`, `accept`, `pipe` (two), `dup`, `fcntl`
+//!   `F_DUPFD`/`F_DUPFD_CLOEXEC`, `memfd_create`, `timerfd_create`, a
+//!   userfaultfd (`wick_uffd::create`); `getrlimit(RLIMIT_NOFILE)` and
+//!   `sysconf(_SC_OPEN_MAX)` report the limit;
+//! - wick-os (`std::os::unix` on Windows, its own copy of this check, as it
+//!   does not depend on this crate): `UnixListener::bind`/`accept`,
+//!   `UnixStream::connect`/`pair` (two), `try_clone` and `fd::dup`;
+//! - wick-std's `std::fs` shadow: `OpenOptions::open`, `read`,
+//!   `read_to_string`, `write`, `copy` (two), `read_dir`;
+//! - vmm-sys-util: `EventFd::new`/`try_clone`, `Epoll::new`; memfd:
+//!   `MemfdOptions::create`.
+//!
+//! `accept` asks before it takes a connection, so a refused one stays
+//! queued and the listener readable, as Linux takes the number before
+//! `do_accept` (linux v6.12 net/socket.c, `__sys_accept4_file`). Upstream's
+//! API server logs the error and serves on (micro-http `requests` returns
+//! it; src/firecracker/src/api_server/mod.rs, and the API process forwards
+//! it, `vmm::ext::api_process`), and the vsock muxer warns and goes on
+//! (src/vmm/src/devices/virtio/vsock/unix/muxer.rs): the same as on Linux.
+//!
+//! **What it does not cover**, counted but never refused: handles a call
+//! makes besides the descriptors it returns (an eventfd's section and second
+//! event, an epoll's completion port helpers, the duplicate `wick_fd` keeps
+//! of a descriptor with state, Winsock's helpers): a call refused only for
+//! the descriptors it returns may so leave the count a few handles past the
+//! limit, and the next call is refused; std's own `File::open`,
+//! `File::create` and `File::try_clone` (std's type, which wick-std cannot
+//! shadow without replacing it in every crate); threads; WHP's partition,
+//! vCPU and timer handles (crates/compat/kvm-ioctls); sections for guest
+//! memory and mappings (no descriptor on Linux); handles received from
+//! another process (`sock_ctrl_msg`, where Linux truncates past the limit);
+//! and Windows' own (the loader, the registry, the thread pool). Threads
+//! making descriptors at the same instant may each pass the check before
+//! either makes its handle (Linux reserves the number under the table's
+//! lock).
+//!
+//! **Not a security bound.** The check runs in the process it limits: a
+//! compromised Firecracker calls Windows directly. It gives upstream's
+//! semantics to a well-behaved Firecracker; the bound a jailed process
+//! cannot pass is the jailer's (not written yet).
+//!
+//! **Cost.** Without a limit, a call reads a cached `None`. With one, each
+//! call above makes one `GetProcessHandleCount` (0.15 µs at 1,000,082
+//! handles, measured, nofile-windows.md §8). At run time that is per
+//! connection accepted (the API process, the vsock muxer), per device
+//! activation and setup (eventfds, timerfds, epoll), per snapshot or file
+//! opened; never per I/O.
+
+use std::ffi::OsStr;
+use std::sync::OnceLock;
+
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+/// The environment variable the Windows jailer gives the limit in (a
+/// decimal number of handles).
+pub const ENV: &str = "WICK_NO_FILE";
+
+/// Windows' own maximum of handles per process, 2^24 (Microsoft, "Kernel
+/// Objects"; 16,711,680 measured, nofile-windows.md §7): `getrlimit` without
+/// a limit.
+pub const MAX: u64 = 1 << 24;
+
+static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+
+/// The limit [`ENV`] gives: a number of handles, `None` without it, 0 (every
+/// descriptor refused) for a value that is no number.
+pub fn parse(value: Option<&OsStr>) -> Option<u64> {
+    let value = value?;
+    if let Some(n) = value.to_str().and_then(|v| v.parse::<u64>().ok()) {
+        return Some(n);
+    }
+    std::eprintln!(
+        "{ENV}={}: not a number of handles; every descriptor is refused (EMFILE)",
+        value.to_string_lossy()
+    );
+    Some(0)
+}
+
+/// This process's limit, read from [`ENV`] once.
+pub fn limit() -> Option<u64> {
+    *LIMIT.get_or_init(|| parse(std::env::var_os(ENV).as_deref()))
+}
+
+/// The handles this process holds, as Windows counts them.
+pub fn handles() -> Option<u64> {
+    let mut n = 0u32;
+    // SAFETY: the current process's pseudo handle and an out-parameter.
+    (unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) } != 0).then_some(u64::from(n))
+}
+
+/// Whether `n` more descriptors fit under the limit; if not, errno is
+/// `EMFILE`. A count Windows does not give fits nothing.
+pub fn room(n: u64) -> bool {
+    let Some(limit) = limit() else {
+        return true;
+    };
+    let fits = handles().is_some_and(|count| count.saturating_add(n) <= limit);
+    if !fits {
+        crate::windows_fd::set_errno(crate::EMFILE);
+    }
+    fits
+}
+
+/// [`room`], as an `io::Result`: `EMFILE` when `n` more descriptors do not
+/// fit.
+pub fn check(n: u64) -> std::io::Result<()> {
+    if room(n) {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(crate::EMFILE))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -24,7 +169,8 @@ mod tests {
     };
 
     /// The variable the Windows jailer gives Firecracker the limit in
-    /// (overlay/jailer/platform/windows, `NO_FILE_ENV`).
+    /// (overlay/jailer/platform/windows, `NO_FILE_ENV`), spelled out: the
+    /// two must agree.
     const VAR: &str = "WICK_NO_FILE";
     /// Which child scenario [`nofile_child`] runs.
     const CHILD: &str = "WICK_NOFILE_CHILD";
@@ -105,6 +251,19 @@ mod tests {
     #[test]
     fn test_no_limit_without_the_variable() {
         child("none", None);
+    }
+
+    /// The variable the jailer sets, and what its values limit to.
+    #[test]
+    fn test_the_variable_and_its_values() {
+        use std::ffi::OsStr;
+        assert_eq!(super::ENV, VAR);
+        assert_eq!(super::parse(None), None);
+        assert_eq!(super::parse(Some(OsStr::new("512"))), Some(512));
+        assert_eq!(super::parse(Some(OsStr::new("0"))), Some(0));
+        for bad in ["2048 handles", "-1", ""] {
+            assert_eq!(super::parse(Some(OsStr::new(bad))), Some(0), "{bad:?}");
+        }
     }
 
     /// The scenarios, each in a process of its own ([`child`]).

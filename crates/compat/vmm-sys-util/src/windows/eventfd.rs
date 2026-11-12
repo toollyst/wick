@@ -267,11 +267,14 @@ fn wait(h: HANDLE) -> io::Result<()> {
 
 impl EventFd {
     /// Creates a new counter set to zero. `flag` is a combination of
-    /// [`EFD_NONBLOCK`], [`EFD_CLOEXEC`] and [`EFD_SEMAPHORE`].
+    /// [`EFD_NONBLOCK`], [`EFD_CLOEXEC`] and [`EFD_SEMAPHORE`]. `EMFILE`
+    /// past the jail's no-file limit (`libc::wick_nofile`), for its one
+    /// descriptor; its section and second event are not reserved.
     pub fn new(flag: i32) -> result::Result<EventFd, io::Error> {
         if flag & !(EFD_NONBLOCK | EFD_CLOEXEC | EFD_SEMAPHORE) != 0 {
             return Err(einval());
         }
+        libc::wick_nofile::check(1)?;
         let inherit = flag & EFD_CLOEXEC == 0;
         // SAFETY: creates unnamed objects; results are checked.
         let (section, event, space) = unsafe {
@@ -378,8 +381,10 @@ impl EventFd {
         }
     }
 
-    /// Returns a new handle to the same counter.
+    /// Returns a new handle to the same counter. `EMFILE` past the jail's
+    /// no-file limit, as a `dup` on Linux.
     pub fn try_clone(&self) -> result::Result<EventFd, io::Error> {
+        libc::wick_nofile::check(1)?;
         // SAFETY: duplicates our own handle.
         let event = duplicate(self.event, unsafe { GetCurrentProcess() })?;
         let evt = EventFd {

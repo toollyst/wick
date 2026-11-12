@@ -604,8 +604,11 @@ pub struct Epoll {
 }
 
 impl Epoll {
-    /// Creates a new instance.
+    /// Creates a new instance. `EMFILE` past the jail's no-file limit
+    /// (`libc::wick_nofile`), as `epoll_create1` on Linux, for its one
+    /// descriptor; the port's helpers are not reserved.
     pub fn new() -> io::Result<Self> {
+        libc::wick_nofile::check(1)?;
         let poller = Arc::new(Poller::new()?);
         let nest = Nest::new(poller.clone())?;
         let epoll = Epoll {

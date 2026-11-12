@@ -496,6 +496,9 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
     // Windows handles are not inherited by the processes this one starts
     // unless asked for: every descriptor here is close-on-exec.
     let _ = cloexec;
+    // One descriptor for the user, as Linux's userfaultfd returns: refused
+    // past the jail's no-file limit (the serving end is this layer's own).
+    crate::wick_nofile::check(1)?;
     init()?;
     let (kernel, user) = socket_pair()?;
     let buf: c_int = 1 << 20;

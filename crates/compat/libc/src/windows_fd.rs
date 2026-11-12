@@ -1143,6 +1143,10 @@ pub unsafe fn close(fd: c_int) -> c_int {
 }
 
 fn dup_inherit(fd: c_int, inherit: bool) -> c_int {
+    // A new descriptor: refused past the jail's no-file limit.
+    if !crate::wick_nofile::room(1) {
+        return -1;
+    }
     let mut out: HANDLE = std::ptr::null_mut();
     // SAFETY: duplicates a handle of this process. Sockets are duplicated
     // the same way: Winsock duplicates in-process handles correctly for the
@@ -1176,7 +1180,10 @@ pub unsafe fn dup(fd: c_int) -> c_int {
 }
 
 /// `dup2`: only onto the standard descriptors 0, 1 and 2, as Windows does
-/// not let handle values be chosen; other targets fail with `EBADF`.
+/// not let handle values be chosen; other targets fail with `EBADF`, and so
+/// does a target at or past the no-file limit, as Linux's `ksys_dup3` checks
+/// (linux v6.12 fs/file.c). It fills a slot that exists, so it is not
+/// refused with `EMFILE` (`crate::wick_nofile`).
 ///
 /// # Safety
 /// No requirements; `unsafe` like the libc function.
@@ -1190,10 +1197,30 @@ pub unsafe fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
             return -1;
         }
     };
-    let new = dup_inherit(oldfd, true);
-    if new < 0 {
-        return raw_failed();
+    if crate::wick_nofile::limit().is_some_and(|limit| u64::try_from(newfd).unwrap_or(0) >= limit) {
+        set_errno(crate::EBADF);
+        return -1;
     }
+    let mut out: HANDLE = std::ptr::null_mut();
+    // SAFETY: duplicates a handle of this process, inherited by children.
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle(oldfd),
+            GetCurrentProcess(),
+            &mut out,
+            0,
+            1,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        set_errno(crate::EBADF);
+        return -1;
+    }
+    // Not `dup_inherit`: the slot exists, so no EMFILE (above).
+    let new = to_fd(out);
+    wick_fd::duplicated(oldfd, new);
     // SAFETY: plain call; the duplicate becomes the standard handle.
     if unsafe { SetStdHandle(std, handle(new)) } == 0 {
         return raw_failed();
@@ -1442,11 +1469,16 @@ pub unsafe fn fstat(fd: c_int, buf: *mut stat) -> c_int {
 }
 
 /// `pipe`: an anonymous pipe, read end first. Both ends are inherited by
-/// children, as on Linux without `O_CLOEXEC`.
+/// children, as on Linux without `O_CLOEXEC`. `EMFILE` unless both fit
+/// under the no-file limit (`crate::wick_nofile`).
 ///
 /// # Safety
 /// `fds` must be valid for two writes.
 pub unsafe fn pipe(fds: *mut c_int) -> c_int {
+    // Two new descriptors: refused past the jail's no-file limit.
+    if !crate::wick_nofile::room(2) {
+        return -1;
+    }
     let mut r: HANDLE = std::ptr::null_mut();
     let mut w: HANDLE = std::ptr::null_mut();
     // SAFETY: plain call with out-parameters.
@@ -1481,7 +1513,7 @@ pub const _SC_NPROCESSORS_ONLN: c_int = 84;
 pub const _SC_PHYS_PAGES: c_int = 85;
 
 /// Most handles a Windows process can have.
-const HANDLE_LIMIT: u64 = 1 << 24;
+const HANDLE_LIMIT: u64 = crate::wick_nofile::MAX;
 
 /// `sysconf`.
 ///
@@ -1500,7 +1532,7 @@ pub unsafe fn sysconf(name: c_int) -> crate::c_long {
     match name {
         _SC_PAGESIZE => si.dwPageSize as crate::c_long,
         _SC_CLK_TCK => 100,
-        _SC_OPEN_MAX => HANDLE_LIMIT as crate::c_long,
+        _SC_OPEN_MAX => crate::wick_nofile::limit().unwrap_or(HANDLE_LIMIT) as crate::c_long,
         _SC_NPROCESSORS_CONF => si.dwNumberOfProcessors as crate::c_long,
         // SAFETY: plain call; all processor groups.
         _SC_NPROCESSORS_ONLN => (unsafe { GetActiveProcessorCount(0xffff) }) as crate::c_long,
@@ -1541,7 +1573,8 @@ pub struct rlimit {
     pub rlim_max: rlim_t,
 }
 
-/// `getrlimit`: `RLIMIT_NOFILE` is Windows' per-process handle limit; the
+/// `getrlimit`: `RLIMIT_NOFILE` is the jail's no-file limit, soft and hard
+/// (`crate::wick_nofile`), else Windows' per-process handle limit; the
 /// other Linux resources (0..=15) have no Windows limit outside a job
 /// object, so they report `RLIM_INFINITY`.
 ///
@@ -1549,7 +1582,7 @@ pub struct rlimit {
 /// `rlim` must be valid for writes.
 pub unsafe fn getrlimit(resource: c_int, rlim: *mut rlimit) -> c_int {
     let v = match resource {
-        RLIMIT_NOFILE => HANDLE_LIMIT,
+        RLIMIT_NOFILE => crate::wick_nofile::limit().unwrap_or(HANDLE_LIMIT),
         0..=15 => RLIM_INFINITY,
         _ => {
             set_errno(crate::EINVAL);

@@ -11,7 +11,7 @@ authors = ["toollyst contributors"]
 edition = "2021"
 license = "Apache-2.0"
 publish = false
-description = "std with std::os::{unix, fd} from wick-os on Windows."
+description = "std with std::os::{unix, fd} from wick-os, and std::fs opens under the no-file limit, on Windows."
 
 [lib]
 name = "wick_std"

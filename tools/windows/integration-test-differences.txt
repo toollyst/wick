@@ -106,16 +106,22 @@ impossible integration_tests/security/test_jail.py::test_jailer_bind_mount_propa
 # Windows mounts no tmpfs of a size.
 impossible integration_tests/functional/test_snapshot_not_losing_dirty_pages.py::test_diff_snapshot_works_after_error
 
-# --resource-limit fsize= and no-file=, and reading them back with prlimit:
-# Windows cannot limit the size of the files a process writes or the number
-# of its handles; the jailer refuses both rather than accept them without
-# effect.
+# --resource-limit fsize=, and reading the limits back with prlimit:
+# Windows cannot limit the size of the files a process writes, and the
+# jailer refuses it rather than accept it without effect; no-file= is the
+# jailed process's own count of its handles (crates/compat/libc,
+# wick_nofile), which no call reads back from outside the process as
+# prlimit reads a kernel limit.
 impossible integration_tests/security/test_jail.py::test_args_default_resource_limits
 impossible integration_tests/security/test_jail.py::test_args_resource_limits
 impossible integration_tests/security/test_jail.py::test_positive_file_size_limit
 impossible integration_tests/security/test_jail.py::test_negative_file_size_limit
-impossible integration_tests/security/test_jail.py::test_negative_no_file_limit
 impossible integration_tests/security/test_jail.py::test_new_pid_ns_resource_limits
+
+# "No file descriptors available (os error 24)" (EMFILE, musl's text) when
+# no-file=3 stops Firecracker: Windows's EMFILE is WSAEMFILE, 10024, with
+# its own text (`jailer-test.ps1 nofile`; not yet run).
+error-text integration_tests/security/test_jail.py::test_negative_no_file_limit
 
 # Firecracker's pid in its namespace (NStgid: 1). Windows has one process
 # table outside a server silo; a jail holds the namespace's isolation, not
