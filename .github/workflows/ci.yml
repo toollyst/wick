@@ -334,6 +334,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/no-guest-artifacts" lib/firecracker/build
           echo "$RUNNER_TEMP/no-guest-artifacts" >lib/firecracker/build/current_artifacts
           build/integration/venv/bin/python tools/macos/integration/memory-selftest.py
+      # How late this runner fires a timer, by kind of wait (macOS coalesces
+      # timers; the compat timerfd waits on a NOTE_CRITICAL one, a88980c).
+      # It prints and never fails: it is what a timing test's failure below is
+      # read against.
+      - name: Timer coalescing on this runner (informational)
+        run: python3 -I tools/macos/timer-coalescing.py
       # Every test of every crate but the jailer runs; the ones that cannot
       # pass on a runner (they create a VM, and GitHub's macOS runners have no
       # Hypervisor.framework) are listed by name and reason, and the check
