@@ -95,7 +95,10 @@ all impossible integration_tests/functional/test_cmd_line_parameters.py::test_cl
 # t<worker>), and the test then fails the framework's check that the API
 # socket is in a jail directory (measured, clean tree: "API socket
 # /tmp/wit-*/t0/firecracker/<id>/root/run/firecracker.socket is not in a
-# jail directory"). To find: where that check looks for the jail.
+# jail directory"). That check was the harness's (wick_macos._chroot_of,
+# which read the jail back from the socket's path and expected upstream's
+# default chroot base, <session>/jailer); it now takes the jail
+# JailerContext.api_socket_path names, for any chroot_base. Not yet re-run.
 all bug integration_tests/functional/test_snapshot_not_losing_dirty_pages.py::test_diff_snapshot_works_after_error
 
 # Signal 35 is musl's SIGRTMIN, the signal Firecracker on Linux kicks its

@@ -622,11 +622,28 @@ if RUNS_AS_USER:
     # A path given as JAIL_RELATIVE, where it starts in a text.
     _JAIL_RELATIVE_IN_TEXT = re.compile(r"(?:^|(?<=[\s'\"(\[=:,]))\.//")
 
+    # The jail of each API socket, as the jail named it: Microvm.spawn makes
+    # its Api from JailerContext.api_socket_path() (framework/microvm.py),
+    # which is chroot_path() joined with the socket's name, and chroot_path()
+    # is <chroot_base>/<exec file>/<id>/root (framework/jailer.py) for any
+    # chroot_base a test gives (test_diff_snapshot_works_after_error's is its
+    # tmpfs), so the jail is not read back from the socket's path.
+    _CHROOT_OF_SOCKET = {}
+    _real_api_socket_path = _jailer.JailerContext.api_socket_path
+
+    def api_socket_path(self):
+        """`JailerContext.api_socket_path`, its jail recorded."""
+        path = _real_api_socket_path(self)
+        _CHROOT_OF_SOCKET[str(path)] = str(self.chroot_path())
+        return path
+
+    _jailer.JailerContext.api_socket_path = api_socket_path
+
     def _chroot_of(api):
-        m = re.match(r"^(.*/jailer/[^/]+/[^/]+/root)/", api.socket)
-        if not m:
-            raise AssertionError(f"API socket {api.socket} is not in a jail directory")
-        return m.group(1)
+        root = _CHROOT_OF_SOCKET.get(str(api.socket))
+        if root is None:
+            raise AssertionError(f"API socket {api.socket} is not one of a jail's")
+        return root
 
     def _to_host(value, key=None):
         if isinstance(value, dict):
