@@ -464,12 +464,25 @@ fn wait_tls_ready(thread: HANDLE) -> bool {
         // Not a thread of ours to inspect: queue as is.
         return true;
     }
-    let field = (info.teb + TEB_TLS_POINTER) as *const usize;
+    let field = (info.teb + TEB_TLS_POINTER) as *const c_void;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
-        // SAFETY: the TEB of a live thread of this process; the field is
-        // written by the loader, so it is read volatile.
-        if unsafe { field.read_volatile() } != 0 {
+        // The field is written by the loader. Read with ReadProcessMemory,
+        // which fails where a plain read would fault: the thread may exit
+        // and its TEB go between the caller's check and this read.
+        let mut value = 0usize;
+        // SAFETY: reads one word of this process into `value`.
+        let read = unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                field,
+                (&raw mut value).cast(),
+                std::mem::size_of::<usize>(),
+                std::ptr::null_mut(),
+            )
+        };
+        if read == 0 || value != 0 {
+            // Ready, or the TEB is gone: queue, and send judges the result.
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -519,10 +532,34 @@ fn queue() -> &'static Queue {
     })
 }
 
+/// How long a thread whose APC could not be queued is given to finish
+/// exiting before the failure is the caller's.
+const EXITING_MS: u32 = 100;
+
+/// Whether `thread` has exited (its handle is signalled), waiting up to
+/// `ms` for it.
+fn exited(thread: HANDLE, ms: u32) -> bool {
+    // SAFETY: waits on a thread handle the caller holds.
+    unsafe {
+        windows_sys::Win32::System::Threading::WaitForSingleObject(thread, ms)
+            == windows_sys::Win32::Foundation::WAIT_OBJECT_0
+    }
+}
+
 /// Sends `num` to the thread `thread` (`pthread_kill`).
 fn send(thread: HANDLE, num: c_int) -> errno::Result<()> {
     validate_signal_num(num)?;
     let arg = usize::try_from(num).unwrap();
+    // A thread that has exited, not yet joined, is sent nothing, and the
+    // call succeeds, as Linux's pthread_kill: musl's pthread_kill.c returns
+    // 0 for a valid signal once the thread's tid is 0, which __pthread_exit
+    // sets before the kernel thread exits (glibc 2.34+ likewise, for an
+    // exiting thread). Queueing an APC to one fails with ERROR_GEN_FAILURE
+    // (31: KILLTEST, CI run 43306073982), which vmm's kick of a vCPU thread
+    // that had finished returned (test_vcpu_dump_cpu_config, run 43292883636).
+    if exited(thread, 0) {
+        return Ok(());
+    }
     if !wait_tls_ready(thread) {
         return Err(errno::Error::new(libc::EAGAIN));
     }
@@ -530,13 +567,18 @@ fn send(thread: HANDLE, num: c_int) -> errno::Result<()> {
         // SAFETY: queues an APC on a thread handle the caller holds.
         Queue::Kernel32(f) => {
             if unsafe { f(Some(apc), thread, arg, SPECIAL_USER_APC as i32) } == 0 {
-                return Err(errno::Error::last());
+                let e = errno::Error::last();
+                // It exited since the check above, or is exiting.
+                return if exited(thread, EXITING_MS) { Ok(()) } else { Err(e) };
             }
         }
         // SAFETY: as above.
         Queue::Ntdll(f) => {
             let status = unsafe { f(thread, SPECIAL_USER_APC, nt_apc, arg, 0, 0) };
             if status < 0 {
+                if exited(thread, EXITING_MS) {
+                    return Ok(());
+                }
                 #[allow(clippy::cast_possible_wrap)]
                 return Err(errno::Error::new(ERROR_NOT_SUPPORTED as i32));
             }
@@ -676,34 +718,38 @@ mod tests {
     // sends nothing and returns 0 (musl pthread_kill.c: `r = t->tid ?
     // -__syscall(SYS_tkill, t->tid, sig) : ... 0`, and __pthread_exit sets
     // tid to 0 before the kernel thread exits; glibc 2.34+ likewise for an
-    // exiting thread). vmm's test_vcpu_dump_cpu_config failed in its last
-    // kick with Error(31) (CI run 43292883636). This prints what kill gives
-    // here for a live thread, for one whose function has just returned, and
-    // for one that has had 200 ms to exit (KILLTEST lines, CI's last step),
-    // before kill's handling of an exited thread is decided.
+    // exiting thread). Before send checked for it, the last kill here was
+    // Err(Error(31)), ERROR_GEN_FAILURE from QueueUserAPC2 (KILLTEST, CI
+    // run 43306073982), and vmm's test_vcpu_dump_cpu_config failed when its
+    // last kick came after the vCPU thread had finished. A live thread
+    // still gets the signal.
     #[test]
-    #[ignore = "records; CI's last step runs it with --nocapture"]
-    fn test_kill_of_an_exited_thread_on_record() {
+    fn test_kill_of_an_exited_thread_succeeds() {
         let num = SIGRTMIN() + 5;
         register_signal_handler(num, count).unwrap();
+        let before = CALLED.load(Ordering::SeqCst);
         let (tx, rx) = mpsc::channel::<()>();
         let live = std::thread::spawn(move || {
             let _ = rx.recv_timeout(Duration::from_secs(10));
         });
-        let r = live.kill(num);
-        std::println!("KILLTEST live thread: {r:?}");
+        live.kill(num).unwrap();
+        let start = std::time::Instant::now();
+        while CALLED.load(Ordering::SeqCst) == before {
+            assert!(start.elapsed() < Duration::from_secs(5), "not delivered to a live thread");
+            std::thread::yield_now();
+        }
         tx.send(()).unwrap();
         live.join().unwrap();
         let t = std::thread::spawn(|| {});
         while !t.is_finished() {
             std::thread::yield_now();
         }
-        let r = t.kill(num);
-        std::println!("KILLTEST thread whose function returned: {r:?}");
+        // While it exits, and once it has.
+        t.kill(num).unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        let r = t.kill(num);
-        let e = r.as_ref().err().map(|e| io::Error::from_raw_os_error(e.errno()));
-        std::println!("KILLTEST thread 200 ms after its function returned: {r:?} {e:?}");
+        t.kill(num).unwrap();
+        // An invalid signal is still refused, as musl checks it first.
+        t.kill(65).unwrap_err();
         t.join().unwrap();
     }
 

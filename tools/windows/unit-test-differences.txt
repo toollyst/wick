@@ -133,12 +133,13 @@ error-text vmm vstate::vm::tests::test_register_memory_regions
 # by KVM's rule (virt/kvm/eventfd.c, ioeventfd_check_collision; whp/vm.rs
 # collides): a second ioeventfd at an address one was registered at had been
 # accepted (device.rs:1514 and :1572, unwrap_err of Ok), run 43292883636.)
-bug vmm vstate::vcpu::tests::test_vcpu_dump_cpu_config
-#   (its last send_event(Finish) fails: VcpuSendEventError(Error(31)), the
-#   last error of the vCPU thread's kick (vmm-sys-util windows/signal.rs
-#   send, QueueUserAPC2); Linux's pthread_kill of a thread that has exited
-#   returns 0 (musl: tid 0; glibc 2.34+: pd->exiting). To measure whether the
-#   thread had exited)
+# (vstate::vcpu's test_vcpu_dump_cpu_config was listed until vmm-sys-util's
+# kill of a thread that has exited succeeded, sending nothing, as Linux's
+# pthread_kill (musl pthread_kill.c: tid 0). It failed when its last kick
+# came after the vCPU thread had finished, VcpuSendEventError(Error(31))
+# (runs 43292883636, 43306073982), and passed when the kick came first (run
+# 43302372278): QueueUserAPC2 to an exited thread fails with
+# ERROR_GEN_FAILURE (KILLTEST, run 43306073982).)
 error-text vmm vstate::vcpu::tests::test_handle_kvm_exit
 #   (expects Linux's text for libc::EINVAL, "Invalid argument (os error 22)";
 #   on Windows libc::EINVAL is ERROR_INVALID_PARAMETER: "The parameter is
