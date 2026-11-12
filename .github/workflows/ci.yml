@@ -595,22 +595,6 @@ jobs:
             --skip edit_memory::tests::test_rebase \
             --skip edit_memory::tests::test_rebase_empty_diff \
             --skip edit_memory::tests::test_rebase_full_diff
-      # Every package's unit tests, as upstream's CI runs them on Linux (one
-      # at a time: host_tools/cargo_build.py, RUST_TEST_THREADS=1), against
-      # the differences tools/windows/unit-test-differences.txt lists with
-      # their reasons: an unlisted failure, a listed test that passes and an
-      # entry naming no test all fail the step.
-      - name: Unit tests against their listed differences
-        if: success() || failure()
-        run: python -I tools/windows/check-unit-tests.py --out "$RUNNER_TEMP/unit" --summary "$GITHUB_STEP_SUMMARY"
-      - name: Upload the unit tests' output
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: windows-unit-tests
-          path: ${{ runner.temp }}/unit/*.log
-          if-no-files-found: warn
-          retention-days: 14
       # Upstream's jailer with the Windows backend (overlay/jailer/platform):
       # its tests (tokens, job limits) and the binary.
       - name: Jailer tests and build
@@ -678,6 +662,25 @@ jobs:
             tools/windows/memory-partition-probe.exe
             tools/windows/README.md
           if-no-files-found: error
+          retention-days: 14
+      # Every package's unit tests, as upstream's CI runs them on Linux (one
+      # at a time: host_tools/cargo_build.py, RUST_TEST_THREADS=1), against
+      # the differences tools/windows/unit-test-differences.txt lists with
+      # their reasons: an unlisted failure, a listed test that passes and an
+      # entry naming no test all fail the step.
+      # After the kit's upload: a list that disagrees (a listed test that
+      # passes, as test_vcpu_dump_cpu_config did in run 43302372278) fails the
+      # job without costing the jailer's tests and build or the kit.
+      - name: Unit tests against their listed differences
+        if: success() || failure()
+        run: python -I tools/windows/check-unit-tests.py --out "$RUNNER_TEMP/unit" --summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload the unit tests' output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-unit-tests
+          path: ${{ runner.temp }}/unit/*.log
+          if-no-files-found: warn
           retention-days: 14
       # CI's runner has WHP (run 43277608081), so it is a WHP machine too
       # (the Host step records which): WHP's capabilities, then kvm-ioctls'
