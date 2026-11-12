@@ -393,9 +393,15 @@ jobs:
       - name: Compatibility crate tests
         working-directory: lib/firecracker
         run: |
-          for c in os std libc vmm-sys-util memfd event-manager micro-http kvm-ioctls userfaultfd; do
+          for c in os std libc vmm-sys-util memfd event-manager micro-http userfaultfd; do
             cargo test --locked --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
+          # The tests that create a partition need WHP, which hosted runners
+          # do not have (WHvCreatePartition: ERROR_MOD_NOT_FOUND); they run on
+          # a WHP machine, as the boot test does.
+          cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- \
+            --skip whp::vm::tests::test_vms_one_after_another_map_their_memory \
+            --skip whp::vm::tests::test_one_partition_of_a_process_maps_memory
           cargo test --locked --manifest-path ../../crates/compat/vm-memory/Cargo.toml \
             --features backend-mmap,backend-bitmap,backend-atomic
           cargo test --locked --manifest-path ../../crates/compat/vhost/Cargo.toml \
