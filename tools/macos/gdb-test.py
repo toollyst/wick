@@ -15,9 +15,9 @@ the CI kernel every other test boots (vmlinux-6.1.188, an Image) and takes
 the addresses from the guest itself, in a first boot without gdb: the
 symbols from /proc/kallsyms (no KASLR: CONFIG_RANDOMIZE_BASE is not set, so
 the next boot has the same), and the kernel's start through the linear map
-from /proc/kcore (fs/proc/kcore.c: a KCORE_RAM segment's p_vaddr is the
-linear map's address of its p_paddr; the KCORE_TEXT one's p_paddr is
-_text's physical address). gdb then needs no symbol file. The checks are
+from /proc/iomem and /proc/kcore (GUEST_ADDRESSES says how; _text, which
+neither lists, is _stext less the Image's offset of _stext). gdb then needs
+no symbol file. The checks are
 those of the Windows gdb stage (tools/windows/boot-test.ps1, Stage-Gdb), on
 aarch64:
 
@@ -67,17 +67,30 @@ bt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bt)
 Failure, check = bt.Failure, bt.check
 
-# Run in the guest (python3 of the CI rootfs) as root: the symbols, and the
-# linear map's address of _text's physical address, from the kernel's own
-# /proc/kallsyms and /proc/kcore program headers.
+# Run in the guest (python3 of the CI rootfs) as root, each address from its
+# source:
+# - _stext, start_kernel and rest_init: /proc/kallsyms;
+# - _stext's physical address: /proc/iomem's "Kernel code", which starts at
+#   __pa_symbol(_stext) (arm64 kernel/setup.c, request_standard_resources);
+# - its linear map address: the /proc/kcore KCORE_RAM segment that holds it
+#   (p_vaddr is the linear map's address of p_paddr, fs/proc/kcore.c), not
+#   the kernel text's (KCORE_TEXT, p_paddr __pa_symbol(_text)), which holds
+#   the same page at _stext's own address (measured: arm64 6.1 has both).
+# _text is in neither: kallsyms keeps only the symbols from _stext on
+# (measured on the CI kernel: its first is _stext, there is no _text), and
+# kcore has a segment at _text only with CONFIG_ARCH_PROC_KCORE_TEXT. The host
+# takes _text, its physical address and its linear map address as these less
+# the Image's offset of _stext (`stext_offset`).
 GUEST_ADDRESSES = r"""
 import struct
-want = {"start_kernel", "rest_init", "_text"}
+want = {"start_kernel", "rest_init", "_stext"}
 syms = {}
 for line in open("/proc/kallsyms"):
     a, _, n = line.split()[:3]
     if n in want:
         syms.setdefault(n, int(a, 16))
+code = [ln for ln in open("/proc/iomem") if ln.strip().endswith(": Kernel code")]
+stext_phys = int(code[0].split("-")[0], 16)
 with open("/proc/kcore", "rb") as f:
     h = f.read(64)
     phoff, = struct.unpack_from("<Q", h, 0x20)
@@ -86,11 +99,24 @@ with open("/proc/kcore", "rb") as f:
     ph = f.read(phentsize * phnum)
 loads = [struct.unpack_from("<IIQQQQQQ", ph, i * phentsize) for i in range(phnum)]
 loads = [(v, p, m) for t, _, _, v, p, _, m, _ in loads if t == 1]
-text_phys = next(p for v, p, m in loads if v == syms["_text"])
-linear = next(v + text_phys - p for v, p, m in loads
-              if v != syms["_text"] and p <= text_phys < p + m and v >= 0xffff000000000000)
-print("WICK-ADDR", *(f"{n}={syms[n]:x}" for n in sorted(want)), f"text_phys={text_phys:x}", f"text_linear={linear:x}")
+linear = next(v + stext_phys - p for v, p, m in loads
+              if p <= stext_phys < p + m and not v <= syms["_stext"] < v + m)
+print("WICK-ADDR", *(f"{n}={syms[n]:x}" for n in sorted(want)), f"stext_phys={stext_phys:x}",
+      f"stext_linear={linear:x}")
 """
+
+
+def stext_offset(image):
+    """_stext's offset in the arm64 Image from _text: the PE header's
+    BaseOfCode, which arm64's efi-header.S sets to `efi_header_end - _head`
+    (_head is _text; efi_header_end is at _stext, as the guest's kallsyms
+    lists them)."""
+    with open(image, "rb") as f:
+        head = f.read(4096)
+    pe = struct.unpack_from("<I", head, 0x3C)[0]
+    check(head[pe:pe + 4] == b"PE\0\0", f"{image}: no PE header at {pe:#x}")
+    check(struct.unpack_from("<H", head, pe + 24)[0] == 0x20B, f"{image}: not PE32+")
+    return struct.unpack_from("<I", head, pe + 24 + 20)[0]
 
 
 def image_bytes(image, offset, n=16):
@@ -269,8 +295,13 @@ def guest_addresses(ctx):
                    timeout=60)
     m = re.search(r"WICK-ADDR (.*)$", out, re.M)
     check(m is not None, f"the guest's addresses: {out!r}")
-    addr = {k: int(v, 16) for k, v in (kv.split("=") for kv in m.group(1).split())}
+    got = {k: int(v, 16) for k, v in (kv.split("=") for kv in m.group(1).split())}
     vm.reboot()
+    offset = stext_offset(ctx.kernel)
+    addr = {"_text": got["_stext"] - offset, "start_kernel": got["start_kernel"], "rest_init": got["rest_init"],
+            "text_phys": got["stext_phys"] - offset, "text_linear": got["stext_linear"] - offset}
+    print("   addresses: " + " ".join(f"{k}={v:#x}" for k, v in sorted(got.items()))
+          + f"; the Image's _stext offset {offset:#x}", flush=True)
     return addr
 
 
@@ -367,7 +398,13 @@ class Context(bt.Context):
         self.dir = os.path.join(args.out, "gdb")
         os.makedirs(self.dir, exist_ok=True)
         self.timeout = args.timeout
-        self.gdb = Gdb(find_gdb(args.gdb))
+        # gdb is the client that counts; without it the stage fails, and
+        # lldb still runs (its result is printed, not counted).
+        try:
+            self.gdb = Gdb(find_gdb(args.gdb))
+            self.no_gdb = None
+        except Failure as e:
+            self.gdb, self.no_gdb = None, str(e)
         lldb = None if args.no_lldb else (args.lldb or shutil.which("lldb", path="/usr/bin"))
         self.lldb = Lldb(lldb) if lldb else None
         self.kernel = bt.fetch(args.cache, bt.KERNEL)
@@ -397,8 +434,11 @@ def main():
         t0 = time.time()
         try:
             ctx = Context(args)
-            print(f"   gdb: {ctx.gdb.path}; lldb: {ctx.lldb.path if ctx.lldb else 'none'}", flush=True)
+            print(f"   gdb: {ctx.gdb.path if ctx.gdb else 'none'}; lldb: {ctx.lldb.path if ctx.lldb else 'none'}",
+                  flush=True)
             addr, file_bytes = expected(ctx)
+            if ctx.gdb is None:
+                raise Failure(ctx.no_gdb)
             results.append(("gdb", True, session(ctx, ctx.gdb, addr, file_bytes)))
         except Failure as e:
             results.append(("gdb", False, str(e)))

@@ -2,8 +2,10 @@
 # Copyright 2026 toollyst contributors.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Firecracker's gdb stub on macOS, with upstream's aarch64 debug kernel and a
-# gdb client: tools/macos/gdb-test.py says what it checks.
+# Firecracker's gdb stub on macOS, with boot-test's guest (the CI Image; the
+# guest's own addresses, as upstream's aarch64 debug kernel is a PE file
+# Firecracker's loader refuses) and a gdb client: tools/macos/gdb-test.py says
+# what it checks.
 #
 #   tools/macos/gdb-test.sh [--gdb PATH] [--lldb PATH | --no-lldb]
 #
@@ -12,8 +14,8 @@
 # lib/firecracker/build/gdb), signs it with the Hypervisor.framework
 # entitlement and runs the stage. Needs gdb (brew install gdb: it connects to
 # an aarch64 remote stub; it does not debug macOS processes, which this does
-# not ask), the client that counts; the system's lldb, when there, runs the
-# same checks as an additional client.
+# not ask), the client that counts: without it the stage fails; the system's
+# lldb, when there, runs the same checks as an additional client either way.
 # Results go to build/boot-test/<time> (tools/clean.sh keeps the newest).
 set -euo pipefail
 
