@@ -37,3 +37,4 @@
 0035-windows-cpu-template-helper-s-fingerprint-names-the-.patch
 0036-windows-no-fdtable-resize-which-Windows-has-no-table.patch
 0037-windows-rebase-refuses-a-diff-file-that-is-not-spars.patch
+0038-windows-the-jailer-refuses-every-no-file-limit.patch

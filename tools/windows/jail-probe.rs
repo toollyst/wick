@@ -23,7 +23,7 @@
 //!                               token:0 tokenopen:0 mitigations:<pid>
 //!                               job:0 affinity:0 spin:<seconds>
 //!                               privileges:0 largepage:<MiB>
-//!                               link:<new name>|<existing file>
+//!                               link:<new name>|<existing file> files:<n>
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
@@ -435,6 +435,19 @@ fn check(c: &str) -> String {
             .and_then(|mut f| f.write_all(b"x"))),
         // A hard link (CreateHardLinkW), which needs write access to the
         // existing file's attributes.
+        // Opens <n> files (NUL) and keeps them, as many descriptors; says
+        // how many it opened, and why it stopped if it did.
+        "files" => {
+            let Ok(n) = arg.parse::<usize>() else { return "unknown check".into() };
+            let mut kept = Vec::new();
+            for _ in 0..n {
+                match std::fs::File::open("NUL") {
+                    Ok(f) => kept.push(f),
+                    Err(e) => return format!("denied after {}: {e}", kept.len()),
+                }
+            }
+            format!("allowed {}", kept.len())
+        }
         "link" => match arg.split_once('|') {
             Some((new, existing)) => io(std::fs::hard_link(existing, new)),
             None => "unknown check".into(),

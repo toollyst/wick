@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 16:00:44 +0900
+Subject: [PATCH] windows: the jailer refuses every no-file limit
+
+Windows cannot limit the number of handles a process opens (a process's
+pool quota is accepted and ignored; a Job Object has no handle limit and
+its memory limit does not count handles). The Windows jailer refused a
+no-file= value other than upstream's default, but accepted
+--resource-limit no-file=2048 without effect. ResourceLimits records on
+Windows whether no-file= was given, and the backend refuses it whatever
+the value; without it the backend warns that the default is not enforced.
+Nothing changes on Linux or macOS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/jailer/src/resource_limits.rs | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/jailer/src/resource_limits.rs b/src/jailer/src/resource_limits.rs
+index 66ef3259c43a6fc36fc19ad166da9113d0b05b48..77648a218b866d48caaa975788e4538c7ca21ec3 100644
+--- a/src/jailer/src/resource_limits.rs
++++ b/src/jailer/src/resource_limits.rs
+@@ -80,6 +80,10 @@ impl Display for Resource {
+ pub struct ResourceLimits {
+     file_size: Option<u64>,
+     no_file: u64,
++    // wick: whether `no-file=` was given; Windows refuses it, the default's
++    // value included (platform::install_resource_limits).
++    #[cfg(windows)]
++    no_file_given: bool,
+ }
+ 
+ impl Default for ResourceLimits {
+@@ -87,16 +91,22 @@ impl Default for ResourceLimits {
+         ResourceLimits {
+             file_size: None,
+             no_file: NO_FILE,
++            #[cfg(windows)]
++            no_file_given: false,
+         }
+     }
+ }
+ 
+ impl ResourceLimits {
+     // wick: Windows cannot enforce these limits; the backend refuses explicit
+-    // ones (platform::install_resource_limits).
++    // ones and warns that the default is not enforced
++    // (platform::install_resource_limits).
+     #[cfg(windows)]
+     pub fn install(self) -> Result<(), JailerError> {
+-        crate::platform::install_resource_limits(self.file_size, self.no_file, NO_FILE)
++        crate::platform::install_resource_limits(
++            self.file_size,
++            self.no_file_given.then_some(self.no_file),
++        )
+     }
+ 
+     #[cfg(not(windows))]
+@@ -131,6 +141,10 @@ impl ResourceLimits {
+ 
+     pub fn set_no_file(&mut self, no_file: u64) {
+         self.no_file = no_file;
++        #[cfg(windows)] // wick: see no_file_given
++        {
++            self.no_file_given = true;
++        }
+     }
+ }
+ 

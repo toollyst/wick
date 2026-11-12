@@ -6,9 +6,9 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,links,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,links,nofile,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
 #
-# `refuse`, `cpuset`, `weight`, `low`, `links`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
+# `refuse`, `cpuset`, `weight`, `low`, `links`, `nofile`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
 # and reads it); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
 # Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
@@ -23,7 +23,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'links', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'links', 'nofile', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -163,6 +163,8 @@ function Stage-Refuse {
     $cases = [ordered]@{
         '--netns of a missing directory' = @('--netns', (Join-Path $WorkDir 'no-such-network'))
         'fsize'                          = @('--resource-limit', 'fsize=1024')
+        'no-file=512'                    = @('--resource-limit', 'no-file=512')
+        'no-file=2048'                   = @('--resource-limit', 'no-file=2048')  # upstream's default, given
         'memory.high'                    = @('--cgroup', 'memory.high=1048576', '--cgroup-version', '2')
     }
     # docs/PORTING.md row 8: each controller Windows has no counterpart for
@@ -195,8 +197,10 @@ function Stage-Refuse {
         Check ($r[0] -ne 0) "$k accepted (exit $($r[0])): $($r[1])"
         Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue)) "$k started Firecracker"
         if ($reasoned.Contains($k)) { Check ($r[1] -match 'is refused on Windows: \S') "${k}: refused without its reason: $($r[1])" }
+        if ($k -like 'no-file=*') { Check ($r[1].Contains('--resource-limit no-file is not supported on Windows: Windows cannot limit the number of handles a process opens')) "${k}: refused without its reason: $($r[1])" }
+        if ($k -eq 'fsize') { Check ($r[1].Contains('--resource-limit fsize is not supported on Windows: Windows cannot limit the size of the files a process writes')) "${k}: refused without its reason: $($r[1])" }
     }
-    "--netns of a missing directory, fsize=, an unsupported cgroup file and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
+    "--netns of a missing directory, fsize=, no-file= (512, and upstream's default 2048 given), an unsupported cgroup file and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
 }
 
 Add-Type -Namespace WickJailerTest -Name Numa -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool GetNumaHighestNodeNumber(ref uint n);'
@@ -699,6 +703,26 @@ function Stage-Links {
         Remove-Item $readable -ErrorAction SilentlyContinue
         Stop-Jailed
     }
+}
+
+# Upstream's default limit of 2048 descriptors (no --resource-limit no-file=
+# given), which Windows cannot enforce: the jailer says so at its start, on
+# stderr, and the jailed process opens more (jail-probe as the jailed
+# binary), under the jail's memory limit too (a Job Object's memory limit
+# does not count handles). An explicit no-file= is refused (`refuse`). This
+# records the missing guarantee: it fails once something bounds the handles.
+# Needs no guest.
+function Stage-Nofile {
+    $probe = Get-Probe
+    $base = New-Base 'nofile'
+    $warning = "jailer: warning: Windows cannot limit the number of handles a process opens: upstream's default --resource-limit no-file=2048 is not enforced, and nothing bounds the jailed Firecracker's handles"
+    $common = @('--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base)
+    $r = Invoke-Jailer (@('--id', 'default') + $common + @('--', 'files:5000')) 60000
+    Check ($r[0] -eq 0 -and $r[1].Contains($warning)) "without no-file=, the jailer's warning: exit $($r[0]): $($r[1])"
+    Check ($r[1] -match 'files:5000 allowed 5000') "without no-file=, the jailed process: $($r[1])"
+    $r = Invoke-Jailer (@('--id', 'memory', '--cgroup-version', '2', '--cgroup', 'memory.max=33554432') + $common + @('--', 'files:100000')) 120000
+    Check ($r[0] -eq 0 -and $r[1].Contains($warning) -and $r[1] -match 'files:100000 allowed 100000') "under memory.max=32 MiB: exit $($r[0]): $($r[1])"
+    "without --resource-limit no-file= the jailer warns that upstream's default is not enforced; the jailed process opens 5000 files, and 100000 under memory.max=32 MiB"
 }
 
 function Stage-Pidns {

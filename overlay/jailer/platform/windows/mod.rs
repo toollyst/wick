@@ -855,7 +855,7 @@ fn open_own(path: &Path) -> Result<std::fs::File, NotOwn> {
         return Err(NotOwn::Metadata(last_error()));
     }
     if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
-        return Err(NotOwn::Open(io::Error::from_raw_os_error(ERROR_STOPPED_ON_SYMLINK as i32)));
+        return Err(NotOwn::Open(io::Error::from_raw_os_error(ERROR_STOPPED_ON_SYMLINK.cast_signed())));
     }
     if info.nNumberOfLinks > 1 {
         return Err(NotOwn::HardLink);
@@ -880,14 +880,21 @@ pub fn copy_exec(src: &Path, dst: &Path) -> Result<(), JailerError> {
     Ok(())
 }
 
+/// What the jailer says at its start when no `--resource-limit no-file=` is
+/// given: upstream then limits Firecracker to 2048 descriptors, and nothing
+/// on Windows can (measured: a process's pool quota, `ProcessQuotaLimits`,
+/// is accepted and ignored; a Job Object has no handle limit, and its memory
+/// limit does not count handles).
+pub const NO_FILE_WARNING: &str = "jailer: warning: Windows cannot limit the number of handles a process \
+                                   opens: upstream's default --resource-limit no-file=2048 is not enforced, \
+                                   and nothing bounds the jailed Firecracker's handles";
+
 /// Upstream's resource limits. Windows cannot limit the size of the files a
-/// process writes or its number of handles: an explicit limit is refused, and
-/// the default number of files (which upstream always sets) is not enforced.
-pub fn install_resource_limits(
-    file_size: Option<u64>,
-    no_file: u64,
-    default_no_file: u64,
-) -> Result<(), JailerError> {
+/// process writes or its number of handles: an explicit limit is refused,
+/// `no-file=` with upstream's default value too, and without one the jailer
+/// warns ([`NO_FILE_WARNING`], on stderr, where its errors go) that
+/// upstream's default is not enforced.
+pub fn install_resource_limits(file_size: Option<u64>, no_file: Option<u64>) -> Result<(), JailerError> {
     if file_size.is_some() {
         return Err(HostError::UnsupportedLimit(
             "fsize",
@@ -895,13 +902,14 @@ pub fn install_resource_limits(
         )
         .into());
     }
-    if no_file != default_no_file {
+    if no_file.is_some() {
         return Err(HostError::UnsupportedLimit(
             "no-file",
             "Windows cannot limit the number of handles a process opens",
         )
         .into());
     }
+    eprintln!("{NO_FILE_WARNING}");
     Ok(())
 }
 
@@ -2340,13 +2348,28 @@ mod tests {
 
     #[test]
     fn test_resource_limits() {
-        install_resource_limits(None, 2048, 2048).unwrap();
+        // Without a limit: accepted (with NO_FILE_WARNING).
+        install_resource_limits(None, None).unwrap();
         assert!(matches!(
-            install_resource_limits(Some(1 << 20), 2048, 2048).unwrap_err(),
+            install_resource_limits(Some(1 << 20), None).unwrap_err(),
             JailerError::Host(HostError::UnsupportedLimit("fsize", _))
         ));
+        // Any no-file=, upstream's default value too.
+        for n in [512, 2048] {
+            let err = install_resource_limits(None, Some(n)).unwrap_err();
+            assert!(matches!(err, JailerError::Host(HostError::UnsupportedLimit("no-file", _))));
+            assert_eq!(
+                err.to_string(),
+                "--resource-limit no-file is not supported on Windows: Windows cannot limit the number of \
+                 handles a process opens. The jailer never accepts a limit it cannot enforce."
+            );
+        }
+        // Through upstream's argument parsing: given or not.
+        let mut limits = crate::resource_limits::ResourceLimits::default();
+        limits.install().unwrap();
+        limits.set_no_file(2048);
         assert!(matches!(
-            install_resource_limits(None, 100, 2048).unwrap_err(),
+            limits.install().unwrap_err(),
             JailerError::Host(HostError::UnsupportedLimit("no-file", _))
         ));
     }
