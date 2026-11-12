@@ -34,7 +34,16 @@ aarch64:
 
 gdb reaches the socket by its path (`target remote <path>`, as upstream's
 test) if it can; otherwise through a TCP relay, and the summary says which.
-The VM helpers are tools/macos/boot-test.py's; results go to OUT/gdb.
+gdb is the client that counts, as in upstream's test. When the system's lldb
+is there, a third boot runs the same checks with it as an additional client
+(its own line in the summary): LLDB connects to a Unix socket by its path
+(unix-connect://, lldb/source/Host/posix/ConnectionFileDescriptorPosix.cpp),
+asks for a hardware breakpoint with Z1 when `breakpoint set -H` requires one
+and a software one with Z0 (ProcessGDBRemote.cpp EnableBreakpointSite), and
+reads registers with `g` when the stub has no `p` (ThreadGDBRemote.cpp), as
+Firecracker's stub has not (gdbstub's SingleRegisterAccess is not
+implemented in gdb/target.rs). The VM helpers are tools/macos/boot-test.py's;
+results go to OUT/gdb.
 """
 
 import argparse
@@ -99,21 +108,15 @@ def image_bytes(image, offset, n=16):
     return data
 
 
+def find_tool(given, name, hint):
+    tool = given or shutil.which(name) or shutil.which(name, path="/opt/homebrew/bin:/usr/bin")
+    check(tool is not None, hint)
+    return tool
+
+
 def find_gdb(given):
-    gdb = given or shutil.which("gdb") or shutil.which("gdb", path="/opt/homebrew/bin")
-    check(gdb is not None, "no gdb: brew install gdb (it debugs aarch64 Linux targets through a remote stub), "
-          "or pass --gdb")
-    return gdb
-
-
-def run_gdb(gdb, script, out):
-    """gdb in batch mode with `script`, without a symbol file; its output
-    (both streams) in `out`. Returns the process."""
-    with open(out + ".gdb", "w") as f:
-        f.write(script)
-    log = open(out, "w")
-    return subprocess.Popen([gdb, "-nx", "-batch", "-x", out + ".gdb"],
-                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+    return find_tool(given, "gdb", "no gdb: brew install gdb (it debugs aarch64 Linux targets through a remote "
+                     "stub), or pass --gdb")
 
 
 def text_of(out):
@@ -121,14 +124,93 @@ def text_of(out):
         return f.read()
 
 
-def gdb_bytes(text, marker):
-    """The bytes gdb's `x/16xb` printed on the two lines after `marker`."""
+def client_bytes(text, marker, client):
+    """The 16 bytes the client printed (gdb's `x/16xb`, lldb's `memory
+    read`) on the first two lines after `marker` that start with an
+    address."""
     at = text.find(marker + "\n")
-    check(at >= 0, f"no {marker} in gdb's output:\n{text}")
-    lines = text[at + len(marker) + 1:].splitlines()[:2]
+    check(at >= 0, f"no {marker} in {client}'s output:\n{text}")
+    lines = [ln for ln in text[at + len(marker) + 1:].splitlines() if re.match(r"\s*0x[0-9a-f]+.*:", ln)][:2]
     values = [int(v, 16) for line in lines for v in re.findall(r"0x([0-9a-f]{2})\b", line.split(":", 1)[-1])]
-    check(len(values) == 16, f"gdb's x/16xb after {marker}: {lines}")
+    check(len(values) == 16, f"{client}'s 16 bytes after {marker}: {lines}")
     return bytes(values)
+
+
+class Gdb:
+    """gdb in batch mode, without a symbol file (upstream's client)."""
+
+    name = "gdb"
+    script = """set pagination off
+set confirm off
+set architecture aarch64
+target remote @TARGET@
+hbreak *0x@start_kernel@
+continue
+printf "WICK-PC %lx\\n", $pc
+printf "WICK-X1\\n"
+x/16xb 0x@start_kernel@
+break *0x@rest_init@
+continue
+printf "WICK-REST %lx\\n", $pc
+printf "WICK-X2\\n"
+x/16xb 0x@text_linear@
+continue
+"""
+    connected = r"WICK-PC|Remote debugging using"
+    hw_hit = r"(Hardware assisted breakpoint|Breakpoint) 1, 0x0*{:x}\b"
+    sw_hit = r"Breakpoint 2, 0x0*{:x}\b"
+
+    def __init__(self, path):
+        self.path = path
+
+    @staticmethod
+    def target(sock=None, port=None):
+        return sock if sock else f"127.0.0.1:{port}"
+
+    def run(self, script, out):
+        with open(out + ".gdb", "w") as f:
+            f.write(script)
+        log = open(out, "w")
+        return subprocess.Popen([self.path, "-nx", "-batch", "-x", out + ".gdb"],
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+
+
+class Lldb:
+    """The system's lldb in batch mode, without a target file (an additional
+    client)."""
+
+    name = "lldb"
+    script = """settings set plugin.process.gdb-remote.packet-timeout 30
+process connect --plugin gdb-remote @TARGET@
+breakpoint set -H -a 0x@start_kernel@
+process continue
+script print("WICK-PC %x" % lldb.frame.GetPC())
+script print("WICK-X1")
+memory read -s1 -fx -c16 -l8 0x@start_kernel@
+breakpoint set -a 0x@rest_init@
+process continue
+script print("WICK-REST %x" % lldb.frame.GetPC())
+script print("WICK-X2")
+memory read -s1 -fx -c16 -l8 0x@text_linear@
+process continue
+"""
+    connected = r"WICK-PC|Process \d+ stopped"
+    hw_hit = r"stop reason = breakpoint 1\.1.*\n(?:.*\n)*?.*0x0*{:x}\b"
+    sw_hit = r"stop reason = breakpoint 2\.1.*\n(?:.*\n)*?.*0x0*{:x}\b"
+
+    def __init__(self, path):
+        self.path = path
+
+    @staticmethod
+    def target(sock=None, port=None):
+        return f"unix-connect://{sock}" if sock else f"connect://127.0.0.1:{port}"
+
+    def run(self, script, out):
+        with open(out + ".lldb", "w") as f:
+            f.write(script)
+        log = open(out, "w")
+        return subprocess.Popen([self.path, "--no-lldbinit", "--batch", "--source", out + ".lldb"],
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
 
 
 class Relay:
@@ -174,24 +256,6 @@ class Relay:
             s.close()
 
 
-SESSION = """set pagination off
-set confirm off
-set architecture aarch64
-target remote @TARGET@
-hbreak *0x@start_kernel@
-continue
-printf "WICK-PC %lx\\n", $pc
-printf "WICK-X1\\n"
-x/16xb 0x@start_kernel@
-break *0x@rest_init@
-continue
-printf "WICK-REST %lx\\n", $pc
-printf "WICK-X2\\n"
-x/16xb 0x@text_linear@
-continue
-"""
-
-
 def guest_addresses(ctx):
     """A boot without gdb: the guest's addresses (GUEST_ADDRESSES)."""
     vm = ctx.vm("gdb-addresses", [], bt.config(ctx), api=False)
@@ -210,28 +274,37 @@ def guest_addresses(ctx):
     return addr
 
 
-def stage_gdb(ctx):
+def expected(ctx):
+    """The guest's addresses (a boot without a client) and the Image's bytes
+    the client must read through the stub."""
     addr = guest_addresses(ctx)
     for name in ("start_kernel", "rest_init"):
         check(addr["_text"] < addr[name], f"{name} {addr[name]:#x} before _text {addr['_text']:#x}")
     file_bytes = {"start_kernel": image_bytes(ctx.kernel, addr["start_kernel"] - addr["_text"]),
                   "_text": image_bytes(ctx.kernel, 0)}
-    sock = os.path.join(ctx.sock, "gdb.sock")
-    vm = ctx.vm("gdb", [], bt.config(ctx, machine={"gdb_socket_path": sock}), api=False)
-    # Firecracker waits for gdb before it runs the guest.
+    return addr, file_bytes
+
+
+def session(ctx, client, addr, file_bytes):
+    """A boot under `client` (Gdb or Lldb) with upstream's session and the
+    Windows stage's checks; returns how the client connected."""
+    name = client.name
+    sock = os.path.join(ctx.sock, f"{name}.sock")
+    vm = ctx.vm(name, [], bt.config(ctx, machine={"gdb_socket_path": sock}), api=False)
+    # Firecracker waits for the client before it runs the guest.
     deadline = time.time() + 30
     while not os.path.exists(sock):
         check(vm.proc.poll() is None and time.time() < deadline, f"no gdb socket at {sock} ({vm.exit_reason()})")
         time.sleep(0.05)
-    session = SESSION
+    script = client.script
     for k, v in addr.items():
-        session = session.replace(f"@{k}@", f"{v:x}")
-    out = os.path.join(ctx.dir, "gdb-direct.txt")
-    g = run_gdb(ctx.gdb, session.replace("@TARGET@", sock), out)
+        script = script.replace(f"@{k}@", f"{v:x}")
+    out = os.path.join(ctx.dir, f"{name}-direct.txt")
+    g = client.run(script.replace("@TARGET@", client.target(sock=sock)), out)
     direct, relay = False, None
     deadline = time.time() + 20
     while time.time() < deadline and g.poll() is None:
-        if re.search(r"WICK-PC|Remote debugging using", text_of(out)):
+        if re.search(client.connected, text_of(out)):
             direct = True
             break
         time.sleep(0.2)
@@ -240,39 +313,40 @@ def stage_gdb(ctx):
             tail = " | ".join(text_of(out).strip().splitlines()[-2:])
             g.kill()
             g.wait()
-            print(f"   gdb does not reach the Unix socket by its path ({tail}); through a TCP relay", flush=True)
+            print(f"   {name} does not reach the Unix socket by its path ({tail}); through a TCP relay", flush=True)
             check(os.path.exists(sock), "the gdb socket went away after the direct attempt")
             relay = Relay(sock)
-            out = os.path.join(ctx.dir, "gdb-relay.txt")
-            g = run_gdb(ctx.gdb, session.replace("@TARGET@", f"127.0.0.1:{relay.port}"), out)
-        done = re.compile(r"WICK-X2\n.*\n.*\n", re.M)
+            out = os.path.join(ctx.dir, f"{name}-relay.txt")
+            g = client.run(script.replace("@TARGET@", client.target(port=relay.port)), out)
+        done = re.compile(r"WICK-X2\n(?:.*\n)*?\s*0x[0-9a-f]+.*:.*\n(?:.*\n)*?\s*0x[0-9a-f]+.*:.*\n", re.M)
         deadline = time.time() + ctx.timeout
         while time.time() < deadline and g.poll() is None and not done.search(text_of(out)):
             time.sleep(0.2)
         text = text_of(out)
-        shutil.copyfile(out, os.path.join(ctx.dir, "gdb-session.txt"))
+        shutil.copyfile(out, os.path.join(ctx.dir, f"{name}-session.txt"))
         check(relay is None or relay.error is None, f"relay: {relay and relay.error}")
         start = addr["start_kernel"]
-        check(re.search(rf"(Hardware assisted breakpoint|Breakpoint) 1, 0x0*{start:x}\b", text),
-              f"the hardware breakpoint at start_kernel ({start:#x}) was not hit:\n{text}")
+        check(re.search(client.hw_hit.format(start), text),
+              f"{name}: the hardware breakpoint at start_kernel ({start:#x}) was not hit:\n{text}")
         m = re.search(r"^WICK-PC ([0-9a-f]+)$", text, re.M)
-        check(m and int(m.group(1), 16) == start, f"the PC at the breakpoint is not start_kernel ({start:#x}):\n{text}")
-        seen = gdb_bytes(text, "WICK-X1")
+        check(m and int(m.group(1), 16) == start,
+              f"{name}: the PC at the breakpoint is not start_kernel ({start:#x}):\n{text}")
+        seen = client_bytes(text, "WICK-X1", name)
         check(seen == file_bytes["start_kernel"],
-              f"start_kernel through the stub: {seen.hex()}, in the Image: {file_bytes['start_kernel'].hex()}")
+              f"{name}: start_kernel through the stub: {seen.hex()}, in the Image: {file_bytes['start_kernel'].hex()}")
         rest = addr["rest_init"]
-        check(re.search(rf"Breakpoint 2, 0x0*{rest:x}\b", text),
-              f"the software breakpoint at rest_init ({rest:#x}) was not hit:\n{text}")
+        check(re.search(client.sw_hit.format(rest), text),
+              f"{name}: the software breakpoint at rest_init ({rest:#x}) was not hit:\n{text}")
         m = re.search(r"^WICK-REST ([0-9a-f]+)$", text, re.M)
-        check(m and int(m.group(1), 16) == rest, f"the PC at the software breakpoint is not rest_init:\n{text}")
-        seen = gdb_bytes(text, "WICK-X2")
+        check(m and int(m.group(1), 16) == rest, f"{name}: the PC at the software breakpoint is not rest_init:\n{text}")
+        seen = client_bytes(text, "WICK-X2", name)
         check(seen == file_bytes["_text"],
-              f"_text through the linear map ({addr['text_linear']:#x}): {seen.hex()}, "
+              f"{name}: _text through the linear map ({addr['text_linear']:#x}): {seen.hex()}, "
               f"in the Image: {file_bytes['_text'].hex()}")
-        # gdb's last `continue`: the guest boots on under it.
+        # The client's last continue: the guest boots on under it.
         vm.shell()
         _, said = vm.sh("echo gdb-$((6*7))")
-        check(said == "gdb-42", f"the guest under gdb: {said!r}")
+        check(said == "gdb-42", f"the guest under {name}: {said!r}")
     finally:
         if g.poll() is None:
             g.kill()
@@ -280,8 +354,9 @@ def stage_gdb(ctx):
         if relay:
             relay.stop()
     vm.kill()
-    how = "by the socket's path" if direct else "through a TCP relay (this gdb does not reach a Unix socket by its path)"
-    return (f"gdb {how}: hardware breakpoint at start_kernel, its bytes and _text's through the linear map as "
+    how = ("by the socket's path" if direct
+           else f"through a TCP relay (this {name} does not reach a Unix socket by its path)")
+    return (f"{name} {how}: hardware breakpoint at start_kernel, its bytes and _text's through the linear map as "
             "in the Image, software breakpoint at rest_init, the guest boots on")
 
 
@@ -292,7 +367,9 @@ class Context(bt.Context):
         self.dir = os.path.join(args.out, "gdb")
         os.makedirs(self.dir, exist_ok=True)
         self.timeout = args.timeout
-        self.gdb = find_gdb(args.gdb)
+        self.gdb = Gdb(find_gdb(args.gdb))
+        lldb = None if args.no_lldb else (args.lldb or shutil.which("lldb", path="/usr/bin"))
+        self.lldb = Lldb(lldb) if lldb else None
         self.kernel = bt.fetch(args.cache, bt.KERNEL)
         self.rootfs = bt.fetch(args.cache, bt.ROOTFS)
         # Unix socket paths must be shorter than 104 bytes; tools/clean.sh
@@ -305,27 +382,43 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--firecracker", required=True, help="a Firecracker built with the gdb feature")
     p.add_argument("--gdb", help="the gdb client (default: gdb on PATH, else Homebrew's)")
+    p.add_argument("--lldb", help="the additional lldb client (default: /usr/bin/lldb)")
+    p.add_argument("--no-lldb", action="store_true", help="without the additional lldb client")
     p.add_argument("--cache", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--timeout", type=int, default=300, help="seconds for the gdb session")
+    p.add_argument("--timeout", type=int, default=300, help="seconds for each client's session")
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     bt.exit_on_signals()
-    print("== gdb", flush=True)
-    t0 = time.time()
-    ctx = None
+    results = []
+    ctx = addr = None
     try:
-        ctx = Context(args)
-        print(f"   gdb: {ctx.gdb}", flush=True)
-        results = [("gdb", True, stage_gdb(ctx))]
-    except Failure as e:
-        results = [("gdb", False, str(e))]
+        print("== gdb", flush=True)
+        t0 = time.time()
+        try:
+            ctx = Context(args)
+            print(f"   gdb: {ctx.gdb.path}; lldb: {ctx.lldb.path if ctx.lldb else 'none'}", flush=True)
+            addr, file_bytes = expected(ctx)
+            results.append(("gdb", True, session(ctx, ctx.gdb, addr, file_bytes)))
+        except Failure as e:
+            results.append(("gdb", False, str(e)))
+        print(f"   {'PASS' if results[-1][1] else 'FAIL'} ({time.time() - t0:.1f}s): {results[-1][2]}", flush=True)
+        # lldb runs whatever gdb's result: an additional client's reading
+        # of the same stub, once the guest's addresses are known.
+        if addr is not None and ctx.lldb is not None:
+            ctx.cleanup()
+            print("== gdb-lldb (an additional client)", flush=True)
+            t0 = time.time()
+            try:
+                results.append(("gdb-lldb", True, session(ctx, ctx.lldb, addr, file_bytes)))
+            except Failure as e:
+                results.append(("gdb-lldb", False, str(e)))
+            print(f"   {'PASS' if results[-1][1] else 'FAIL'} ({time.time() - t0:.1f}s): {results[-1][2]}",
+                  flush=True)
     finally:
         if ctx is not None:
             ctx.cleanup()
             shutil.rmtree(ctx.sock, ignore_errors=True)
-    ok, detail = results[0][1:]
-    print(f"   {'PASS' if ok else 'FAIL'} ({time.time() - t0:.1f}s): {detail}", flush=True)
     sys.exit(1 if bt.summarize(args.out, results) else 0)
 
 
