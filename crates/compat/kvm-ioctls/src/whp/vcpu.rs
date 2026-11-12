@@ -482,9 +482,17 @@ impl VcpuFd {
         Ok(())
     }
 
-    /// No paravirtual clock to pause, so nothing to do.
+    /// `KVM_KVMCLOCK_CTRL`: tells the guest it was stopped by the host
+    /// (`PVCLOCK_GUEST_STOPPED` in its kvm-clock time info), as Firecracker
+    /// does on pause; `EINVAL` if the guest has no kvm-clock, as KVM.
     pub fn kvmclock_ctrl(&self) -> Result<()> {
-        Ok(())
+        let value = self.shared.system_time_msr.load(Ordering::Acquire);
+        let inner = &self.shared.inner;
+        if pvclock::set_guest_stopped(value, |gpa| inner.host_addr(gpa)) {
+            Ok(())
+        } else {
+            err(libc::EINVAL)
+        }
     }
 
     // ---- LAPIC ----
