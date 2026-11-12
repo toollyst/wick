@@ -225,6 +225,16 @@ const MEMS_BIND: &str = "Windows cannot bind a process's memory to NUMA nodes; o
 
 /// Why Windows cannot do what the cgroup file `file` does, for the
 /// controllers and files Windows has no counterpart for.
+/// Why `cgroup.freeze` (v1: `freezer.*`) is refused. A Job Object's
+/// processes can be frozen and thawed as a group (`JobObjectFreezeInformation`,
+/// measured on Windows Server 2022: no CPU time while frozen, a process added
+/// meanwhile frozen too, one thaw resumes all), but a cgroup's freezer is a
+/// file the operator writes at any time, and the jailer has no counterpart of
+/// it through which the jail could be thawed again. Not done yet.
+const FREEZE: &str = "the jailer has no freezer yet: a Job Object can be frozen and thawed as a \
+                      group, but there is no counterpart of the cgroup file an operator writes \
+                      to freeze or thaw the jail later";
+
 fn impossible(version: u8, file: &str) -> Option<&'static str> {
     let controller = file.split('.').next().unwrap_or("");
     Some(match (version, controller) {
@@ -248,9 +258,10 @@ fn impossible(version: u8, file: &str) -> Option<&'static str> {
         }
         (2, "rdma") => "Windows has no limit on a job's RDMA resources",
         (2, "misc") => "Windows has no counterpart for the misc controller's resources",
-        (1, "freezer") | (2, "cgroup") => {
-            "the jailer cannot freeze Firecracker or limit nested cgroups: a Job Object has no \
-             freezer and no limit on nested jobs"
+        (1, "freezer") => FREEZE,
+        (2, "cgroup") if file.starts_with("cgroup.freeze") => FREEZE,
+        (2, "cgroup") => {
+            "the jailer cannot limit nested cgroups: a Job Object has no limit on nested jobs"
         }
         (1, "devices") => {
             "Windows has no device nodes: what the jailed process opens is decided by the jail's \
@@ -568,9 +579,12 @@ mod tests {
     fn test_other_controllers_are_refused_with_the_reason() {
         assert!(reason(2, "rdma.max=mlx4_0 hca_handle=2").contains("RDMA"));
         assert!(reason(2, "misc.max=sev 1").contains("misc"));
-        assert!(reason(2, "cgroup.freeze=1").contains("freeze"));
+        assert_eq!(reason(2, "cgroup.freeze=1"), FREEZE);
+        assert_eq!(reason(2, "cgroup.freeze=0"), FREEZE);
         assert!(reason(2, "cgroup.max.descendants=0").contains("nested"));
-        assert!(reason(1, "freezer.state=FROZEN").contains("freeze"));
+        assert!(reason(2, "cgroup.max.depth=1").contains("nested"));
+        assert_eq!(reason(1, "freezer.state=FROZEN"), FREEZE);
+        assert_eq!(reason(1, "freezer.state=THAWED"), FREEZE);
         assert!(reason(1, "devices.deny=a").contains("device"));
         assert!(reason(1, "net_cls.classid=1").contains("network"));
         assert!(reason(1, "net_prio.ifpriomap=eth0 1").contains("network"));
