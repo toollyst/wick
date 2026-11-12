@@ -635,6 +635,62 @@ mod tests {
     }
 
     #[test]
+    fn test_closed_descriptor_fails_io_with_a_switch_connected() {
+        // Upstream's test_tx_tap_failure and test_read_tap_fail_event_handler
+        // close the tap's descriptor under the device and count the I/O
+        // that fails; no switch is connected there. With one connected the
+        // answer is the same on Linux: the write and the read are refused
+        // at the descriptor (EBADF) whoever is at the tap's other side.
+        let mut tap = Tap::open_named("fcclosed%d").unwrap();
+        tap.set_vnet_hdr_size(12).unwrap();
+        let mut switch = UnixStream::connect(&tap.endpoint.path).unwrap();
+        switch.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut out = vec![0u8; 12];
+        out.extend_from_slice(&frame(100));
+
+        // The switch is the connected one: a frame each way.
+        tap.write_iovec(&IoVecBuffer::from(out.as_slice())).unwrap();
+        let mut got = [0u8; 4 + 100];
+        switch.read_exact(&mut got).unwrap();
+        assert_eq!(&got[..4], &100u32.to_be_bytes()[..]);
+        assert_eq!(&got[4..], &frame(100)[..]);
+        let mut msg = 70u32.to_be_bytes().to_vec();
+        msg.extend_from_slice(&frame(70));
+        switch.write_all(&msg).unwrap();
+        let mut rx = vec![0u8; 200];
+        assert_eq!(read_frame(&mut tap, &mut rx).unwrap(), 12 + 70);
+
+        // SAFETY: closes the tap's descriptor under it, as upstream's tests
+        // do. Nothing uses the value again: see the end of the test.
+        assert_eq!(unsafe { libc::close(tap.as_raw_fd()) }, 0);
+
+        let err = tap
+            .write_iovec(&IoVecBuffer::from(out.as_slice()))
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF), "tx on the closed descriptor");
+        let mut iov = [libc::iovec {
+            iov_base: rx.as_mut_ptr().cast(),
+            iov_len: rx.len(),
+        }];
+        let err = tap.read_iovec(&mut iov).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF), "rx on the closed descriptor");
+
+        // The switch's connection went with the descriptor, and the frame
+        // written after the close did not reach it: end of stream, at once
+        // or within the read's timeout (an error here is the test's
+        // failure).
+        let mut byte = [0u8; 1];
+        assert_eq!(switch.read(&mut byte).unwrap(), 0, "the switch reads end of stream");
+
+        // The listener's descriptor is closed already. Dropping the tap
+        // would close its value a second time, which by then may name a
+        // handle made since.
+        let path = tap.endpoint.path.clone();
+        std::mem::forget(tap);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn test_switches_that_come_and_go_lose_no_frame() {
         // What upstream's rx tests do (inject_tap_tx_frame): each frame
         // through a switch of its own that sends it and leaves, all before
