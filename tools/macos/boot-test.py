@@ -1118,6 +1118,197 @@ def stage_restores(ctx, rounds=20):
     return f"{rounds} restores of one snapshot, each paused and snapshotted again"
 
 
+# ---------------------------------------------------------------- the command line and the tools
+
+
+def fc_run(ctx, args, timeout=30):
+    """Runs Firecracker to its end; returns (exit status, its output)."""
+    r = subprocess.run([ctx.firecracker] + args, stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, timeout=timeout)
+    return r.returncode, r.stdout + r.stderr
+
+
+LOG_LINE = re.compile(r"^\S+ \[[^:\]]*:([^:\]]*)(?::[A-Z][a-z]+)?:([^:\]]+):(\d+)\] ", re.M)
+
+
+def log_origins(text):
+    """The source files of the lines of a log written with --show-log-origin."""
+    return [m.group(2) for m in LOG_LINE.finditer(text)]
+
+
+def read_metrics(path_or_text):
+    text = path_or_text
+    if os.path.exists(path_or_text):
+        with open(path_or_text) as f:
+            text = f.read()
+    return [json.loads(line) for line in text.splitlines() if line.strip().startswith("{")]
+
+
+class FifoReader:
+    """Reads a FIFO into memory from when it is made, as upstream's
+    docs/logger.md has an operator do (the reader may come after the writer)."""
+
+    def __init__(self, path):
+        os.mkfifo(path)
+        self.path = path
+        self.data = b""
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        import select
+        fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            while not self.stop.is_set():
+                r, _, _ = select.select([fd], [], [], 0.1)
+                if r:
+                    b = os.read(fd, 65536)
+                    if b:
+                        self.data += b
+                    else:
+                        time.sleep(0.05)  # no writer yet, or between writers
+        finally:
+            os.close(fd)
+
+    def text(self, wait_for=None, timeout=10):
+        deadline = time.time() + timeout
+        while wait_for is not None and wait_for not in self.data.decode("utf-8", "replace"):
+            if time.time() > deadline:
+                break
+            time.sleep(0.05)
+        return self.data.decode("utf-8", "replace")
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(5)
+
+
+def stage_cli(ctx):
+    """Firecracker's own command line: exit codes, --module, the start time
+    flags, the logger and metrics on FIFOs, --boot-timer."""
+    done = []
+    # Exit codes: upstream maps an argument parsing error to 153 (ArgParsing)
+    # and an invalid --level to 152 (BadConfiguration); a configuration file
+    # that does not parse is a generic error, 1 (main.rs, FcExitCode).
+    good = os.path.join(ctx.out, "cli-good.json")
+    with open(good, "w") as f:
+        json.dump(config(ctx), f)
+    bad = os.path.join(ctx.out, "cli-bad.json")
+    with open(bad, "w") as f:
+        f.write('{"boot-source": {"kernel_image_path": ')
+    for args, want, text in ((["--no-such-flag"], 153, "ParseArguments"),
+                             (["--api-sock"], 153, "ParseArguments"),
+                             (["--no-api", "--config-file", good, "--level", "Bogus"], 152, "InvalidLogLevel"),
+                             (["--no-api", "--config-file", bad], 1, "ParseFromJson")):
+        code, out = fc_run(ctx, args)
+        check(code == want and text in out, f"firecracker {' '.join(args)}: exit {code}, wanted {want}; {out.strip()[-300:]}")
+    done.append("exit 153 for bad arguments, 152 for a bad --level, 1 for a bad configuration file")
+
+    # --module: only log lines from modules under the filter are written.
+    # file!() of a line names its crate's directory.
+    crates = {"vmm": "src/vmm/", "firecracker": "src/firecracker/"}
+    seen = {}
+    for module in ("vmm", "firecracker", None):
+        name = f"cli-module-{module or 'all'}"
+        log = os.path.join(ctx.out, f"{name}.fc.log")
+        metrics = os.path.join(ctx.out, f"{name}.metrics")
+        args = ["--log-path", log, "--level", "Debug", "--show-log-origin", "--metrics-path", metrics]
+        if module:
+            args += ["--module", module]
+        vm = ctx.vm(name, args, config(ctx))
+        vm.shell()
+        vm.api("GET", "/machine-config")
+        vm.api("PUT", "/actions", {"action_type": "FlushMetrics"})
+        vm.reboot()
+        with open(log) as f:
+            origins = log_origins(f.read())
+        check(origins, f"--module {module}: no log lines with an origin in {log}")
+        if module:
+            stray = sorted({o for o in origins if not o.startswith(crates[module])})
+            check(not stray, f"--module {module}: lines from {stray[:5]}")
+        else:
+            for crate, prefix in crates.items():
+                check(any(o.startswith(prefix) for o in origins), f"no filter: no line from {crate}")
+            # Without the start time flags the metrics stay 0.
+            api = read_metrics(metrics)[-1]["api_server"]
+            check(api["process_startup_time_us"] == 0 and api["process_startup_time_cpu_us"] == 0,
+                  f"start time metrics without the flags: {api}")
+        seen[module or "all"] = len(origins)
+    done.append(f"--module keeps its crate's lines ({seen})")
+
+    # --start-time-us is CLOCK_MONOTONIC in us (what the jailer passes),
+    # --start-time-cpu-us the CPU time the process had at the exec,
+    # --parent-cpu-time-us the jailer's: once the API server is up the
+    # metrics hold the time since the start and the CPU time since then plus
+    # the parent's (ProcessTimeReporter). The metrics go to a FIFO given on
+    # the command line, the log to a FIFO given through the API.
+    mfifo = FifoReader(os.path.join(ctx.sock, "m.fifo"))
+    lfifo = FifoReader(os.path.join(ctx.sock, "l.fifo"))
+    try:
+        parent = 1000
+        t0 = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000
+        vm = ctx.vm("cli-time", ["--start-time-us", str(t0), "--start-time-cpu-us", "0",
+                                 "--parent-cpu-time-us", str(parent), "--metrics-path", mfifo.path])
+        vm.api("PUT", "/logger", {"log_path": lfifo.path, "level": "Info"})
+        vm.api("GET", "/machine-config")
+        # Metrics are flushed on demand once the microVM runs.
+        cfg = config(ctx)
+        vm.api("PUT", "/boot-source", cfg["boot-source"])
+        vm.api("PUT", "/drives/rootfs", cfg["drives"][0])
+        vm.api("PUT", "/machine-config", cfg["machine-config"])
+        vm.api("PUT", "/actions", {"action_type": "InstanceStart"})
+        vm.api("PUT", "/actions", {"action_type": "FlushMetrics"})
+        wall = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000 - t0
+        metrics = read_metrics(mfifo.text(wait_for="utc_timestamp_ms"))
+        log = lfifo.text(wait_for='Get request on "/machine-config"')
+        vm.kill()
+    finally:
+        mfifo.close()
+        lfifo.close()
+    check(metrics and "utc_timestamp_ms" in metrics[-1], f"no metrics through the FIFO: {mfifo.data[:200]!r}")
+    check('The API server received a Get request on "/machine-config"' in log, f"no log lines through the FIFO: {log[:300]!r}")
+    api = metrics[-1]["api_server"]
+    start, cpu = api["process_startup_time_us"], api["process_startup_time_cpu_us"]
+    check(0 < start <= wall, f"process_startup_time_us {start}, {wall} us since --start-time-us")
+    check(parent < cpu < parent + wall * os.cpu_count(), f"process_startup_time_cpu_us {cpu} (parent {parent}, wall {wall})")
+    done.append(f"start time metrics {start} us, {cpu} CPU us (of {wall} us); logger and metrics on FIFOs")
+
+    # --boot-timer: the guest's /usr/local/bin/init (upstream's rootfs
+    # overlay) writes 123 to the boot timer device at the start of the MMIO
+    # space (0x40000000 on aarch64) through /dev/mem, then runs /sbin/init;
+    # upstream's test_boottime boots it so. Without the flag there is no device.
+    timer = re.compile(r"Guest-boot-time =\s+(\d+) us\s+(\d+) ms,\s+(\d+) CPU us\s+(\d+) CPU ms")
+    boot = config(ctx)
+    boot["boot-source"]["boot_args"] = BOOT_ARGS.replace("init=/bin/sh", "init=/usr/local/bin/init")
+    t0 = time.time()
+    vm = ctx.vm("cli-boot-timer", ["--boot-timer", "--level", "Info"], boot)
+    m = vm.wait_for(timer.pattern, 60)
+    wall = (time.time() - t0) * 1e6
+    us, cpu_us = int(m.group(1)), int(m.group(3))
+    # Both are differences of two clock reads (boot_timer.rs, unsigned): a
+    # read that fails leaves 0, and the difference wraps to near 2^64
+    # (measured before the run phase allowed getrusage, the process CPU
+    # clock's call here: 18446744073709538027 CPU us). The process's CPU time
+    # since the build is at most its wall time on every host CPU.
+    check(0 < us < wall and 0 < cpu_us < wall * os.cpu_count()
+          and int(m.group(2)) == us // 1000 and int(m.group(4)) == cpu_us // 1000,
+          f"Guest-boot-time {m.group(0)!r}; {wall:.0f} us since the start, {os.cpu_count()} host CPUs")
+    # The guest goes on to /sbin/init (a denied call stopped the microVM here).
+    vm.wait_for(r"systemd\[1\]|Welcome to", 60, m.end())
+    check(vm.proc.poll() is None, f"Firecracker after the boot timer write: {vm.exit_reason()}")
+    vm.kill()
+    vm = ctx.vm("cli-no-boot-timer", ["--level", "Info"], boot)
+    vm.wait_for(r"Run /usr/local/bin/init as init process", 60)
+    vm.wait_for(r"systemd\[1\]|Welcome to", 60)  # past the init's write
+    check(not timer.search(vm.buf), "Guest-boot-time without --boot-timer")
+    vm.kill()
+    done.append(f"--boot-timer: Guest-boot-time {us} us ({cpu_us} CPU us), none without it")
+    return "; ".join(done)
+
+
+
+
 STAGES = {
     "boot": stage_boot,
     "smp": stage_smp,
@@ -1135,6 +1326,7 @@ STAGES = {
     "balloon": stage_balloon,
     "restores": stage_restores,
     "api-process": stage_api_process,
+    "cli": stage_cli,
 }
 
 

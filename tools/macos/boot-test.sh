@@ -9,13 +9,15 @@
 # backend, PCI with snapshot restore, a vhost-user-blk backend, the
 # logger, metrics, MMDS, balloon, entropy device and a rate limiter, and
 # balloon cycles after a restore from file and on a booted guest (the guest
-# keeps the host's pages; the footprint follows the balloon).
+# keeps the host's pages; the footprint follows the balloon); Firecracker's
+# command line (exit codes, --module, the start time flags, the logger and
+# metrics on FIFOs, --boot-timer).
 #
 #   tools/macos/boot-test.sh [--release] [stage...]
 #
 # Stages (default: all, in this order): boot smp block vsock net vmnet
 # snapshot diff uffd hugepages pci vhost-user devices balloon restores
-# api-process. vmnet uses vmnet-shared (NAT); older macOS releases need root
+# api-process cli. vmnet uses vmnet-shared (NAT); older macOS releases need root
 # for vmnet.framework.
 # The guest images are cached in ~/Library/Caches/wick/boot-test; results and
 # logs go to build/boot-test/<time>. Run tools/setup.sh first.
