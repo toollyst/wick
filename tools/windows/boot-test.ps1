@@ -44,7 +44,8 @@
 #          info-vmstate; state files with another arch's magic or a newer
 #          version refused at the load
 #   no-seccomp  the mitigation profile on without --no-seccomp and off with
-#          it, in Firecracker and its API process (no guest)
+#          it, in Firecracker and its API process, before a boot (no guest)
+#          and with a guest running
 #   foreign-snapshot  a state file made on another host (-ForeignState) is
 #          refused at the load (no guest)
 #   memory-hotplug  virtio-mem: 512 MiB plugged, seen in MemTotal and used,
@@ -2433,14 +2434,18 @@ function Stage-Tools {
     $diff = Join-Path $dir 'diff.mem'
     $state = Join-Path $dir 'diff.state'
     Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
-    Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = (Join-Path $dir 'full.state'); mem_file_path = $mem }) | Out-Null
+    $fullState = Join-Path $dir 'full.state'
+    Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $fullState; mem_file_path = $mem }) | Out-Null
     Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Resumed' } | Out-Null
     $vm.Sh('B=second-$((7*7)); cat /usr/bin/* > /dev/null 2>&1; true', 120000, $true) | Out-Null
     Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
     Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Diff'; snapshot_path = $state; mem_file_path = $diff }) | Out-Null
     $vm.Kill()
-    # Firecracker writes a diff snapshot as a sparse file (keep_holes).
-    Check ([Wick.Sparse]::Is($diff)) "the diff snapshot Firecracker wrote is not a sparse file ($((Get-Item $diff).Attributes))"
+    # Firecracker writes a diff snapshot as a sparse file (keep_holes), with
+    # holes where no page was dirtied (what rebase-snap copies around).
+    $size = (Get-Item $diff).Length
+    $allocated = [Wick.Util]::Allocated($diff)
+    Check ([Wick.Sparse]::Is($diff) -and $size -eq 256MB -and $allocated -lt $size) "diff memory file: $size bytes, $allocated allocated, $((Get-Item $diff).Attributes)"
 
     # snapshot-editor info-vmstate: the version, the vCPU states and the
     # whole state (info.rs).
@@ -2489,15 +2494,15 @@ function Stage-Tools {
     $done += 'rebase-snap equals snapshot-editor rebase and restores'
     Write-Step $done[-1]
 
-    # The state file with another architecture's magic, then with a newer
-    # snapshot version: refused at the load (snapshot/mod.rs), and
-    # Firecracker ends, as after any failed load. The header is the first
-    # thing bitcode writes: a byte, the magic (8 bytes, little-endian), then
-    # the version as a length and its text.
-    $bytes = [IO.File]::ReadAllBytes($state)
+    # A state file with another architecture's magic, then with a newer
+    # version, is refused at the load with upstream's error (snapshot/mod.rs,
+    # checked before the CRC), by snapshot-editor and by Firecracker, which
+    # then ends as after any failed load. bitcode writes the header first: a
+    # byte, the magic (8 bytes, little-endian), the version's length and text.
+    $bytes = [IO.File]::ReadAllBytes($fullState)
     $x86 = [BitConverter]::GetBytes([UInt64]'0x0710198486640000')
-    for ($i = 0; $i -lt 8; $i++) { Check ($bytes[1 + $i] -eq $x86[$i]) "the x86_64 magic is not at offset 1 of $state" }
-    Check ([Text.Encoding]::ASCII.GetString($bytes, 10, 6) -eq '12.0.0') "the version is not at offset 10 of $state"
+    for ($i = 0; $i -lt 8; $i++) { Check ($bytes[1 + $i] -eq $x86[$i]) "the x86_64 magic is not at offset 1 of $fullState" }
+    Check ([Text.Encoding]::ASCII.GetString($bytes, 10, 6) -eq '12.0.0') "the version is not at offset 10 of $fullState"
     $arm = [byte[]]$bytes.Clone()
     [Array]::Copy([BitConverter]::GetBytes([UInt64]'0x07101984AAAA0000'), 0, $arm, 1, 8)
     $newer = [byte[]]$bytes.Clone()
@@ -2505,6 +2510,8 @@ function Stage-Tools {
     foreach ($case in @(@('aarch64 magic', $arm, 'Magic value does not match arch'), @('version 99.0.0', $newer, 'Invalid data version'))) {
         $f = Join-Path $dir 'patched.state'
         [IO.File]::WriteAllBytes($f, $case[1])
+        $r = Invoke-Exe $editor @('info-vmstate', 'version', '--vmstate-path', $f)
+        Check ($r[0] -ne 0 -and $r[1].Contains($case[2])) "info-vmstate of a state file with $($case[0]): $($r[0]) $($r[1].Trim())"
         $vm = Start-Vm "tools-$($case[0] -replace '\W', '')" $null -Api
         $status = 0
         $body = [ordered]@{ snapshot_path = $f; mem_backend = [ordered]@{ backend_type = 'File'; backend_path = $mem } } | ConvertTo-Json -Compress
@@ -2512,9 +2519,9 @@ function Stage-Tools {
         Check ($status -eq 400 -and $out.Contains($case[2])) "a state file with $($case[0]): $status $out"
         $until = [DateTime]::UtcNow.AddSeconds(10)
         while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
-        Check $vm.Exited "Firecracker went on after a failed load ($($case[0]))"
+        Check ($vm.Exited -and $vm.ExitCode -ne 0) "Firecracker after a failed load ($($case[0])): $($vm.ExitReason())"
     }
-    $done += 'a state file with the aarch64 magic or a newer version refused at the load'
+    $done += 'a state file with the aarch64 magic or a newer version refused by snapshot-editor and the load'
     return ($done -join '; ')
 }
 
@@ -2531,7 +2538,7 @@ function Stage-ForeignSnapshot {
     Check ($status -eq 400 -and $out -match 'Failed to load snapshot state from file') "PUT /snapshot/load of $ForeignState`: $status $out"
     $until = [DateTime]::UtcNow.AddSeconds(10)
     while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
-    Check $vm.Exited 'Firecracker went on after a failed load'
+    Check ($vm.Exited -and $vm.ExitCode -ne 0) "Firecracker after a failed load: $($vm.ExitReason())"
     $why = ([regex]::Match($out, 'Failed to load snapshot state from file: ([^"]*)')).Groups[1].Value
     $r = Invoke-Exe (Find-Tool 'snapshot-editor.exe') @('info-vmstate', 'version', '--vmstate-path', $ForeignState)
     Check ($r[0] -ne 0) "snapshot-editor info-vmstate version of it: $($r[0]) $($r[1])"
@@ -2570,7 +2577,31 @@ function Stage-NoSeccomp {
         Check ($info -match '"state":"Not started"') "${name}: instance information: $info"
         $vm.Kill()
     }
-    return 'without --no-seccomp the setup-phase mitigations in Firecracker and the whole profile in its API process; with it none in either'
+    Write-Step 'before a boot: the setup-phase mitigations in Firecracker and the whole profile in its API process without --no-seccomp, none in either with it'
+    # With a guest running, as the macOS stage: Firecracker under the whole
+    # profile (the run phase's mitigations since the boot) and the API
+    # process too, or neither; the guest runs either way.
+    foreach ($off in @($false, $true)) {
+        $name = if ($off) { 'no-seccomp-guest-off' } else { 'no-seccomp-guest-on' }
+        $vm = Start-Vm $name (Base-Config 1) $(if ($off) { '--no-seccomp' } else { '' }) -Api
+        Wait-Shell $vm
+        $out = $vm.Sh('echo guest-$((6*7))')
+        Check ($out -eq 'guest-42') "${name}: guest '$out'"
+        $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($vm.Pid)" | Where-Object { $_.Name -eq 'firecracker.exe' })
+        Check ($kids.Count -eq 1) "${name}: Firecracker's child processes from its binary: $($kids.Count)"
+        foreach ($proc in @(@('Firecracker', $vm.Pid), @('the API process', [int]$kids[0].ProcessId))) {
+            $m = [Wick.Mitigation]::Of($proc[1])
+            if ($off) {
+                $on = @($all.Keys | Where-Object { ($m[$_] -band $all[$_]) -ne 0 })
+                Check ($on.Count -eq 0) "--no-seccomp, a guest running: in force in $($proc[0]): $($on -join ', ')"
+            } else {
+                $missing = @($all.Keys | Where-Object { ($m[$_] -band $all[$_]) -ne $all[$_] })
+                Check ($missing.Count -eq 0) "a guest running: not in force in $($proc[0]): $($missing -join ', ')"
+            }
+        }
+        $vm.Reboot()
+    }
+    return 'without --no-seccomp the setup-phase mitigations in Firecracker and the whole profile in its API process before a boot, the whole profile in both with a guest running; with it none in either; the guest runs in both'
 }
 
 # virtio-mem, as upstream's test_virtio_mem_hotplug_hotunplug does it: 512 MiB
