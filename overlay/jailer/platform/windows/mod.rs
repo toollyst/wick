@@ -52,6 +52,9 @@
 //!   limit, CPU rate hard cap (from Firecracker's start, as a cgroup's
 //!   limit holds from the exec) or CPU weight, processor affinity; the job
 //!   kills Firecracker when the jailer goes and limits its UI access.
+//! - **The freezer** ([`freezer`]): upstream's cgroup freezer files next to
+//!   the jail's root, for every jail, kept by the jailer, which freezes and
+//!   thaws the job as a whole.
 //! - **No exec**: the jailer starts Firecracker suspended in the job with the
 //!   tokens, waits for it, removes the jail's drive and exits with its status.
 //! - **`--daemonize`** ([`daemonize`]): Windows has no fork, so the jailer
@@ -122,7 +125,7 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
     JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
@@ -131,12 +134,15 @@ use windows_sys::Win32::System::Threading::{
     LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, SetEvent,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, SetThreadToken, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 mod console;
+mod freezer;
 mod large_pages;
 mod netns;
+
+pub(crate) use super::freezer_values::{State as FreezerState, Version as FreezerVersion, parse_start as parse_freezer_start};
 
 /// `SE_GROUP_INTEGRITY` (winnt.h).
 const SE_GROUP_INTEGRITY: u32 = 0x20;
@@ -250,8 +256,8 @@ pub enum HostError {
     #[error(
         "--cgroup {0} is not supported on Windows (supported: memory.max, cpu.max, cpu.weight, \
          cpu.weight.nice, cpuset.cpus and cpuset.mems with --cgroup-version 2; \
-         memory.limit_in_bytes, cpu.cfs_quota_us, cpu.cfs_period_us, cpu.shares, cpuset.cpus and \
-         cpuset.mems with --cgroup-version 1). The jailer never accepts a limit it cannot enforce."
+         memory.limit_in_bytes, cpu.cfs_quota_us, cpu.cfs_period_us, cpu.shares, cpuset.cpus, \
+         cpuset.mems and freezer.state with --cgroup-version 1). The jailer never accepts a limit it cannot enforce."
     )]
     UnsupportedCgroup(String),
     #[error("--cgroup {0} is refused on Windows: {1}. The jailer never accepts a limit it cannot enforce.")]
@@ -278,6 +284,8 @@ pub enum HostError {
     Spawn(&'static str, io::Error),
     #[error("--netns {0:?}: {1}")]
     Netns(PathBuf, String),
+    #[error("The jail's freezer: {0}")]
+    Freezer(String),
 }
 
 impl From<HostError> for JailerError {
@@ -339,6 +347,46 @@ static LIMITS: Mutex<Limits> = Mutex::new(Limits {
 
 pub(crate) fn set_limits(limits: Limits) {
     *LIMITS.lock().unwrap() = limits;
+}
+
+/// The jail's cgroup version, whose freezer files it gets ([`freezer`]).
+pub(crate) fn set_cgroup_version(version: FreezerVersion) {
+    freezer::set_version(version);
+}
+
+/// `--cgroup freezer.state=<state>` (v1), at the cgroup step: the freezer's
+/// files are made now and, for `FROZEN`, the jailer waits here until they
+/// say `THAWED`, as on Linux the jailer freezes itself at this step
+/// ([`freezer`]).
+pub(crate) fn freezer_at_cgroup_step(state: FreezerState) -> Result<(), JailerError> {
+    let dir = jail_dir_from_args()?;
+    freezer::at_cgroup_step(&dir, state).map_err(|e| HostError::Freezer(e.to_string()).into())
+}
+
+/// The jail's directory (`<chroot-base>\<exec file name>\<id>`), as
+/// `Env::new` makes it from the same command line (the cgroup step is not
+/// given it; upstream's `main` has made it already).
+fn jail_dir_from_args() -> Result<PathBuf, JailerError> {
+    let mut parser = crate::build_arg_parser();
+    parser.parse_from_cmdline().map_err(JailerError::ArgumentParsing)?;
+    let args = parser.arguments();
+    let value = |name: &'static str| {
+        args.single_value(name)
+            .cloned()
+            .ok_or_else(|| HostError::Freezer(format!("no --{name} on the command line")))
+    };
+    let base = value("chroot-base-dir")?;
+    let exec = value("exec-file")?;
+    let base = std::fs::canonicalize(&base).map_err(|e| JailerError::Canonicalize(PathBuf::from(&base), e))?;
+    let exec = std::fs::canonicalize(&exec).map_err(|e| JailerError::Canonicalize(PathBuf::from(&exec), e))?;
+    let name = exec.file_name().ok_or_else(|| JailerError::ExtractFileName(exec.clone()))?;
+    Ok(plain(&base.join(name).join(value("id")?)))
+}
+
+/// The freezer's files made at the cgroup step, handed to the jailer this
+/// one starts again (`--daemonize`, `--new-pid-ns`): the handle it inherits.
+fn freezer_handover() -> io::Result<Vec<OwnedHandle>> {
+    Ok(freezer::handover()?.into_iter().collect())
 }
 
 /// The jail's network (`--netns`): the directory of its endpoints, and the
@@ -608,7 +656,10 @@ fn hand_over_to_keeper() -> io::Result<std::convert::Infallible> {
     unsafe { std::env::set_var(KEEPER_ENV, (event.as_raw_handle() as usize).to_string()) };
     // SAFETY: plain calls.
     let std_handles = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|w| unsafe { GetStdHandle(w) });
-    let keeper = spawn_jailer(&argv, std_handles, &[event.as_raw_handle()], 0)?;
+    let freezer = freezer_handover()?;
+    let inherit: Vec<HANDLE> =
+        std::iter::once(event.as_raw_handle()).chain(freezer.iter().map(AsRawHandle::as_raw_handle)).collect();
+    let keeper = spawn_jailer(&argv, std_handles, &inherit, 0)?;
     let both = [event.as_raw_handle(), keeper.as_raw_handle()];
     // SAFETY: two handles we own.
     match unsafe { WaitForMultipleObjects(2, both.as_ptr(), 0, INFINITE) } {
@@ -762,8 +813,10 @@ fn relaunch_detached() -> io::Result<std::convert::Infallible> {
     argv.extend(std::env::args().skip(1).filter(|a| a != "--daemonize"));
     let nul = open_nul()?;
     let nul = nul.as_raw_handle();
+    let freezer = freezer_handover()?;
+    let inherit: Vec<HANDLE> = freezer.iter().map(AsRawHandle::as_raw_handle).collect();
     // The detached jailer runs on; its handle is not needed.
-    drop(spawn_jailer(&argv, [nul; 3], &[], DETACHED_PROCESS)?);
+    drop(spawn_jailer(&argv, [nul; 3], &inherit, DETACHED_PROCESS)?);
     std::process::exit(0);
 }
 
@@ -2013,8 +2066,15 @@ fn exec(
         format!("TMP={tmp}"),
     ]);
 
+    // The freezer (`freezer`): proven on this host first, as its job
+    // information class is not documented; then the jail's files, in the
+    // directory that holds `root`.
+    freezer::self_check().map_err(HostError::Freezer)?;
+    let mut freezer = freezer::Freezer::for_exec(jail.root.parent().unwrap_or(jail.root.as_path())).map_err(HostError::Freezer)?;
+
     let tokens = tokens()?;
     let job = job(&limits)?;
+    let mut job_freeze = freezer::Job(job.as_raw_handle());
 
     // The standard handles, inheritable, and only them; those that are the
     // jailer's console are pipes it relays (`console`).
@@ -2116,6 +2176,12 @@ fn exec(
     if let Err(e) = open_own(&pid_file).map_err(io::Error::from).and_then(|mut f| write!(f, "{}", fc.pid)) {
         return Err(kill("the pid file", e));
     }
+    // Frozen now if the file says so: a process resumed in a frozen job does
+    // not run (measured, `freezer`).
+    if let Err(f) = freezer.before_resume(&mut job_freeze) {
+        freezer.killed(&f);
+        return Err(kill("the jail's freezer", io::Error::other(f.to_string())));
+    }
     for p in std::iter::once(&fc).chain(api_process.as_ref()) {
         // SAFETY: the suspended main thread.
         if unsafe { ResumeThread(p.thread.as_raw_handle()) } == u32::MAX {
@@ -2135,14 +2201,46 @@ fn exec(
             windows_sys::Win32::Foundation::CloseHandle(event as HANDLE);
         }
     }
-    // SAFETY: our child.
-    unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
+    // Firecracker's end, and meanwhile what the freezer's files ask for. A
+    // request that cannot be carried out kills the jail.
+    let [change, timer] = freezer.handles();
+    let waits = [process.as_raw_handle(), change, timer];
+    let mut killed = false;
+    loop {
+        // SAFETY: three handles we hold.
+        let r = unsafe { WaitForMultipleObjects(3, waits.as_ptr(), 0, INFINITE) };
+        let result = match r.wrapping_sub(WAIT_OBJECT_0) {
+            0 => break,
+            which @ (1 | 2) => freezer.woken(&mut job_freeze, usize::try_from(which - 1).unwrap()),
+            _ => Err(freezer::Failure::Files("waiting for Firecracker", last_error())),
+        };
+        if let Err(f) = result {
+            freezer.killed(&f);
+            killed = true;
+            // SAFETY: the jail's job; its processes end with exit code 1.
+            unsafe {
+                TerminateJobObject(job.as_raw_handle(), 1);
+                WaitForSingleObject(process.as_raw_handle(), INFINITE);
+            }
+            break;
+        }
+    }
+    // What is left of the jail ends with Firecracker, as without the
+    // freezer: thawed, if it was frozen.
+    if !killed
+        && let Err(f) = freezer.firecracker_exited(&mut job_freeze)
+    {
+        freezer.killed(&f);
+        // SAFETY: the jail's job.
+        unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
+    }
     let mut code = 1u32;
     // SAFETY: our child, ended.
     unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) };
     terminal.finish();
     unmap_drive(jail);
     drop(job);
+    freezer.emptied();
     std::process::exit(code.cast_signed());
 }
 

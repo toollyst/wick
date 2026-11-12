@@ -6,9 +6,9 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,cpuset,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
 #
-# `refuse`, `cpuset`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
+# `refuse`, `freeze`, `cpuset`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
 # and reads it); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
 # Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
@@ -24,7 +24,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'cpuset', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -185,12 +185,10 @@ function Stage-Refuse {
         'hugetlb'       = 'hugetlb.1GB.max=1073741824'
         'rdma'          = 'rdma.max=mlx4_0'  # upstream's parser takes one '=' only
         'misc'          = 'misc.max=sev 1'
-        'cgroup.freeze' = 'cgroup.freeze=1'
         'cpuset excl'   = 'cpuset.cpus.exclusive=0'
     }
     $v1 = [ordered]@{
         'blkio'         = 'blkio.throttle.read_bps_device=8:0 1048576'
-        'freezer'       = 'freezer.state=FROZEN'
         'devices'       = 'devices.deny=a'
         'net_cls'       = 'net_cls.classid=1'
         'net_prio'      = 'net_prio.ifpriomap=eth0 1'
@@ -1415,6 +1413,216 @@ function Stage-Cpu([int]$Boots = 12) {
         } finally { Stop-Jailed }
     }
     "cpu.max=25000 100000 from the start: $Boots boots, held to $($booting -join '%, ')% of a CPU up to init and $($used -join '%, ')% in a spin, local timers in TSC-deadline mode"
+}
+
+# Row 8 of docs/PORTING.md, the freezer (overlay/jailer/platform/windows/freezer.rs):
+# upstream's cgroup freezer files in <chroot-base>\<exec>\<id>\, kept by the
+# jailer, which freezes and thaws the jail's Job Object. The jailed binary is
+# jail-probe spinning in Firecracker's place (in the API process's place it
+# has nothing to serve and ends). Every case runs and is reported, failed or
+# not:
+# - v1 at run time (upstream's default --cgroup-version 1): freezer.state
+#   reads THAWED; FROZEN stops both processes (no CPU time), written again it
+#   changes nothing, an invalid value is ignored and the file restored, a
+#   value in another form (CRLF) is read back canonical, THAWED resumes it;
+# - v2 at run time: cgroup.freeze and cgroup.events (populated, frozen) as on
+#   Linux; Firecracker killed while frozen ends the jail, populated 0;
+# - the jail cannot write its own control file;
+# - the jailer killed while the jail is frozen: the jail ends with it;
+# - --cgroup freezer.state=FROZEN at the start, plain, with --daemonize, with
+#   --new-pid-ns and with both: the jail does not start and the operator's
+#   command does not return until THAWED is written; then the jail runs (the
+#   command returns as without the option) and the relaunched jailer still
+#   keeps the files (frozen and thawed again);
+# - at the start: THAWED runs; FREEZING, freezer.self_freezing and v2's
+#   cgroup.freeze are refused as on Linux.
+# Prints the Windows build: the freezer's job information class is not
+# documented by Microsoft, so where it was measured matters. Needs no guest.
+function Stage-Freeze {
+    $base = New-Base 'freeze'
+    $probe = Get-Probe
+    $exe = Split-Path -Leaf $probe
+    $reg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $build = "$($reg.CurrentMajorVersionNumber).$($reg.CurrentMinorVersionNumber).$($reg.CurrentBuildNumber).$($reg.UBR)"
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $report = @(); $fails = @()
+    $dirOf = { param($id) Join-Path $base "$exe\$id" }
+    # The jail's processes (jail-probe in its root).
+    $procs = { param($id) @(Get-Process jail-probe -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$(& $dirOf $id)\root\*" }) }
+    # Firecracker's place: the process the pid file names, once it runs.
+    $fc = {
+        param($id)
+        $f = Join-Path (& $dirOf $id) "root\$exe.pid"
+        if (-not (Test-Path $f)) { return $null }
+        $n = [int](Get-Content $f -ErrorAction SilentlyContinue)
+        Get-Process -Id $n -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$(& $dirOf $id)\root\*" }
+    }
+    $started = { param($id, [int]$ms = 10000) & $until { $null -ne (& $fc $id) } $ms }
+    # CPU milliseconds Firecracker's place used over $ms.
+    $cpu = {
+        param($id, $ms = 1000)
+        $p = & $fc $id
+        if ($null -eq $p) { return -1 }
+        $a = $p.TotalProcessorTime.TotalMilliseconds
+        Start-Sleep -Milliseconds $ms
+        $p.Refresh()
+        [math]::Round($p.TotalProcessorTime.TotalMilliseconds - $a)
+    }
+    $read = { param($id, $f) $p = Join-Path (& $dirOf $id) $f; if (Test-Path $p) { [IO.File]::ReadAllText($p) } else { '<none>' } }
+    $write = { param($id, $f, $v) [IO.File]::WriteAllText((Join-Path (& $dirOf $id) $f), $v) }
+    $until = {
+        param([scriptblock]$cond, [int]$ms = 5000)
+        $t = [DateTime]::Now.AddMilliseconds($ms)
+        while (-not (& $cond)) { if ([DateTime]::Now -gt $t) { return $false }; Start-Sleep -Milliseconds 50 }
+        $true
+    }
+    $start = {
+        param($id, [string[]]$extra, [string]$check = 'spin:120')
+        $out = Join-Path $base "$id.txt"
+        $line = "--id $id --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" $($extra -join ' ') -- $check"
+        $p = Start-Process $Jailer -ArgumentList $line -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+        $null = $p.Handle
+        $p
+    }
+    $said = { param($id) (Get-Content (Join-Path $base "$id.txt"), (Join-Path $base "$id.txt.err") -Raw -ErrorAction SilentlyContinue) -join '' }
+    $stop = { param($id) & $procs $id | Stop-Process -Force -ErrorAction SilentlyContinue }
+    $case = {
+        param([string]$name, [scriptblock]$body)
+        try { $script:report += "${name}: $(& $body)" } catch { $script:fails += "${name}: $($_.Exception.Message)" }
+    }
+    $script:report = @(); $script:fails = @()
+    try {
+        & $case 'v1 at run time' {
+            $p = & $start 'v1' @()
+            Check (& $started 'v1') "the jail did not start: $(& $said 'v1')"
+            Check ((& $read 'v1' 'freezer.state') -eq "THAWED`n") "freezer.state reads $(& $read 'v1' 'freezer.state')"
+            Check (-not (Test-Path (Join-Path (& $dirOf 'v1') 'cgroup.events'))) 'a v1 jail has cgroup.events'
+            $run = & $cpu 'v1'
+            Check ($run -gt 200) "running: CPU $($run -join ', ') ms per s"
+            Set-Content (Join-Path (& $dirOf 'v1') 'freezer.state') 'FROZEN'   # CRLF, as PowerShell writes
+            Check (& $until { (& $read 'v1' 'freezer.state') -eq "FROZEN`n" }) "FROZEN`r`n not read back canonical: $(& $read 'v1' 'freezer.state')"
+            Start-Sleep -Milliseconds 300
+            $frozen = & $cpu 'v1'
+            Check ($frozen -eq 0) "frozen: CPU $($frozen -join ', ') ms per s"
+            & $write 'v1' 'freezer.state' "FROZEN`n"
+            Start-Sleep -Milliseconds 300
+            $again = & $cpu 'v1'
+            Check ($again -eq 0) "FROZEN written again: CPU $($again -join ', ') ms per s"
+            & $write 'v1' 'freezer.state' 'BOGUS'
+            Check (& $until { (& $read 'v1' 'freezer.state') -eq "FROZEN`n" } 3000) "an invalid value was not restored: $(& $read 'v1' 'freezer.state')"
+            $bogus = & $cpu 'v1' 500
+            Check ($bogus -eq 0) "after an invalid value: CPU $($bogus -join ', ') ms per 0.5 s"
+            Check (-not $p.HasExited) 'the jailer ended'
+            & $write 'v1' 'freezer.state' 'THAWED'
+            Start-Sleep -Milliseconds 300
+            $thawed = & $cpu 'v1'
+            Check ($thawed -gt 200) "thawed: CPU $($thawed -join ', ') ms per s"
+            Check ((& $said 'v1') -match 'freezer.state: not a valid value') "no line about the invalid value: $(& $said 'v1')"
+            & $stop 'v1'
+            "running $($run -join '/') ms/s, FROZEN $($frozen -join '/'), again $($again -join '/'), invalid restored $($bogus -join '/'), THAWED $($thawed -join '/')"
+        }
+        & $case 'v2 at run time' {
+            $p = & $start 'v2' @('--cgroup-version', '2')
+            Check (& $started 'v2') "the jail did not start: $(& $said 'v2')"
+            Check ((& $read 'v2' 'cgroup.freeze') -eq "0`n") "cgroup.freeze reads $(& $read 'v2' 'cgroup.freeze')"
+            Check ((& $read 'v2' 'cgroup.events') -eq "populated 1`nfrozen 0`n") "cgroup.events reads $(& $read 'v2' 'cgroup.events')"
+            & $write 'v2' 'cgroup.freeze' '1'
+            Check (& $until { (& $read 'v2' 'cgroup.events') -eq "populated 1`nfrozen 1`n" }) "cgroup.events after 1: $(& $read 'v2' 'cgroup.events')"
+            $frozen = & $cpu 'v2'
+            Check ($frozen -eq 0) "frozen: CPU $($frozen -join ', ') ms per s"
+            & $write 'v2' 'cgroup.freeze' '0'
+            Check (& $until { (& $read 'v2' 'cgroup.events') -eq "populated 1`nfrozen 0`n" }) "cgroup.events after 0: $(& $read 'v2' 'cgroup.events')"
+            $thawed = & $cpu 'v2'
+            Check ($thawed -gt 200) "thawed: CPU $($thawed -join ', ') ms per s"
+            & $write 'v2' 'cgroup.freeze' '1'
+            Check (& $until { (& $read 'v2' 'cgroup.events') -eq "populated 1`nfrozen 1`n" }) 'not frozen again'
+            (& $fc 'v2') | Stop-Process -Force
+            Check ($p.WaitForExit(10000)) 'the jailer did not end after Firecracker was killed while frozen'
+            Check ((& $procs 'v2').Count -eq 0) 'the API process outlived Firecracker'
+            Check ((& $read 'v2' 'cgroup.events') -match "^populated 0`n") "cgroup.events after the end: $(& $read 'v2' 'cgroup.events')"
+            "0/1 with cgroup.events following, frozen $($frozen -join '/') ms/s, thawed $($thawed -join '/'); Firecracker killed while frozen: the jailer exited $($p.ExitCode), $((& $read 'v2' 'cgroup.events').Trim() -replace "`n", ', ')"
+        }
+        & $case 'the jail writes its own control file' {
+            $file = Join-Path (& $dirOf 'own') 'freezer.state'
+            $p = & $start 'own' @() "write:$file"
+            Check ($p.WaitForExit(20000)) 'the jailer did not end'
+            $out = & $said 'own'
+            Check ($out -match "write:\S+ denied") "the jail's write: $out"
+            Check ((& $read 'own' 'freezer.state') -eq "THAWED`n") "the file reads $(& $read 'own' 'freezer.state')"
+            ($out -split "`r?`n" | Where-Object { $_ -like 'write:*' } | Select-Object -First 1) -replace '^write:\S+ ', ''
+        }
+        & $case 'the jailer killed while frozen' {
+            $p = & $start 'kj' @()
+            Check (& $started 'kj') "the jail did not start: $(& $said 'kj')"
+            & $write 'kj' 'freezer.state' 'FROZEN'
+            Check (& $until { (& $read 'kj' 'freezer.state') -eq "FROZEN`n" }) 'not frozen'
+            Start-Sleep -Milliseconds 300
+            $p.Kill()
+            Check (& $until { (& $procs 'kj').Count -eq 0 }) "the frozen jail outlived its jailer: $((& $procs 'kj').Count) processes"
+            'the frozen jail ended with it'
+        }
+        $n = 0
+        foreach ($flags in @(@(), @('--daemonize'), @('--new-pid-ns'), @('--daemonize', '--new-pid-ns'))) {
+            $name = "FROZEN at the start$(if ($flags) { ' with ' + ($flags -join ' ') } else { '' })"
+            $id = "s$n"; $n++
+            & $case $name {
+                $p = & $start $id (@('--cgroup', 'freezer.state=FROZEN') + $flags)
+                Check (& $until { (& $read $id 'freezer.state') -eq "FROZEN`n" }) "no freezer.state: $(& $said $id)"
+                Start-Sleep -Milliseconds 1500
+                Check ((& $procs $id).Count -eq 0) "the jail started while frozen ($((& $procs $id).Count) processes)"
+                Check (-not $p.HasExited) "the operator's jailer returned while frozen (exit $($p.ExitCode)): $(& $said $id)"
+                Check (-not (Test-Path (Join-Path (& $dirOf $id) "root\$exe.pid"))) 'a pid file while frozen'
+                & $write $id 'freezer.state' 'THAWED'
+                Check (& $started $id) "the jail did not start after THAWED: $(& $said $id)"
+                $run = & $cpu $id
+                Check ($run -gt 200) "after THAWED: CPU $($run -join ', ') ms per s"
+                $returned = if ($flags) {
+                    Check ($p.WaitForExit(10000)) "the operator's jailer did not return with $($flags -join ' ')"
+                    Check ($p.ExitCode -eq 0) "the operator's jailer exited $($p.ExitCode): $(& $said $id)"
+                    'returned 0'
+                } else {
+                    Check (-not $p.HasExited) 'the jailer ended while its jail runs'
+                    'waits for the jail'
+                }
+                # The jailer that runs the jail (relaunched, with the flags) keeps the files.
+                & $write $id 'freezer.state' 'FROZEN'
+                Check (& $until { (& $read $id 'freezer.state') -eq "FROZEN`n" }) 'not frozen at run time'
+                Start-Sleep -Milliseconds 300
+                $frozen = & $cpu $id
+                Check ($frozen -eq 0) "frozen at run time: CPU $($frozen -join ', ') ms per s"
+                & $write $id 'freezer.state' 'THAWED'
+                Start-Sleep -Milliseconds 300
+                $again = & $cpu $id
+                Check ($again -gt 200) "thawed at run time: CPU $($again -join ', ') ms per s"
+                & $stop $id
+                "held (no process, no pid file, the command not returned) until THAWED; then ran $($run -join '/') ms/s, the command $returned; frozen again $($frozen -join '/'), thawed $($again -join '/')"
+            }
+        }
+        & $case 'start values' {
+            $common = @('--id', 'sv', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base)
+            $r = Invoke-Jailer ($common + @('--cgroup', 'freezer.state=THAWED', '--', 'job:0')) 30000
+            Check ($r[0] -eq 0 -and $r[1] -match 'job:0 allowed') "freezer.state=THAWED: exit $($r[0]): $($r[1])"
+            $out = @()
+            foreach ($c in @(
+                    @('1', 'freezer.state=FREEZING', 'only FROZEN or THAWED'),
+                    @('1', 'freezer.self_freezing=1', 'read-only'),
+                    @('2', 'cgroup.freeze=1', 'Controller cgroup is unavailable'),
+                    @('2', 'cgroup.freeze=0', 'Controller cgroup is unavailable'),
+                    @('2', 'freezer.state=FROZEN', 'Controller freezer is unavailable'))) {
+                $r = Invoke-Jailer (@('--id', "sv$($out.Count)", '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--cgroup-version', $c[0], '--cgroup', $c[1], '--', 'job:0'))
+                Check ($r[0] -ne 0 -and $r[1].Contains($c[2])) "v$($c[0]) $($c[1]): exit $($r[0]): $($r[1])"
+                Check ($r[1] -notmatch 'job:0') "v$($c[0]) $($c[1]): the jail ran"
+                $out += "v$($c[0]) $($c[1])"
+            }
+            "THAWED runs; refused: $($out -join ', ')"
+        }
+    } finally {
+        Get-Process jail-probe -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$base\*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($l in $script:report) { Write-Host "     $l" }
+    foreach ($l in $script:fails) { Write-Host "     FAIL $l" }
+    Check ($script:fails.Count -eq 0) "Windows $build$(if ($elevated) { ', elevated' } else { ', unelevated' }): $($script:fails.Count) of $($script:report.Count + $script:fails.Count) cases failed: $($script:fails -join ' | ')"
+    "Windows $build$(if ($elevated) { ', elevated' } else { ', unelevated' }): $($script:report.Count) cases: $($script:report -join ' | ')"
 }
 
 # --- run ----------------------------------------------------------------------

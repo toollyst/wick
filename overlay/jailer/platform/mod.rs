@@ -44,6 +44,11 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::*;
 
+// What the freezer files hold, the same on the hosts that keep them
+// (Windows; macOS's freezer moves to it).
+#[cfg(windows)]
+pub(crate) mod freezer_values;
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

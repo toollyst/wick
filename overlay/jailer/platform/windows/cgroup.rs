@@ -30,11 +30,17 @@
 //! and the rest. Every other property is refused too, never accepted
 //! without effect. Windows has no cgroup hierarchy, so the v2 hierarchy is a
 //! path that does not exist: there is no parent cgroup to join.
+//!
+//! The freezer is upstream's files next to the jail, kept by the jailer
+//! (`platform::freezer`); as on Linux, `freezer.state=FROZEN|THAWED` is the
+//! one freezer value taken at the start (v1: the jailer stops at this step
+//! until thawed), and `cgroup.*` is refused as upstream refuses it, `cgroup`
+//! being no controller.
 
 use std::path::{Path, PathBuf};
 
 use crate::JailerError;
-use crate::platform::{self, HostError, Limits};
+use crate::platform::{self, FreezerState, FreezerVersion, HostError, Limits};
 
 /// The (absent) cgroup v2 hierarchy on Windows.
 const NO_HIERARCHY: &str = r"\\?\GLOBALROOT\wick-no-cgroup-hierarchy";
@@ -49,18 +55,24 @@ pub struct CgroupConfigurationBuilder {
     /// cgroup v1's quota and period, combined at `build`.
     v1_quota_us: Option<Option<u64>>,
     v1_period_us: Option<u64>,
+    /// `freezer.state` (v1) at the start.
+    freezer: Option<FreezerState>,
 }
 
 impl CgroupConfigurationBuilder {
     pub fn new(ver: u8, _proc_mounts_path: &str) -> Result<Self, JailerError> {
         match ver {
-            1 | 2 => Ok(CgroupConfigurationBuilder {
-                version: ver,
-                hierarchy: PathBuf::from(NO_HIERARCHY),
-                limits: Limits::default(),
-                v1_quota_us: None,
-                v1_period_us: None,
-            }),
+            1 | 2 => {
+                platform::set_cgroup_version(if ver == 1 { FreezerVersion::V1 } else { FreezerVersion::V2 });
+                Ok(CgroupConfigurationBuilder {
+                    version: ver,
+                    hierarchy: PathBuf::from(NO_HIERARCHY),
+                    limits: Limits::default(),
+                    v1_quota_us: None,
+                    v1_period_us: None,
+                    freezer: None,
+                })
+            }
             _ => Err(JailerError::CgroupInvalidVersion(ver.to_string())),
         }
     }
@@ -74,7 +86,22 @@ impl CgroupConfigurationBuilder {
     ) -> Result<(), JailerError> {
         let cg = || format!("{file}={value}");
         let bad = |why| -> JailerError { HostError::CgroupValue(cg(), why).into() };
+        let controller = file.split_once('.').map_or(file.as_str(), |(c, _)| c);
         match (self.version, file.as_str()) {
+            // `cgroup` is no controller: upstream finds no hierarchy (v1) or
+            // no entry in cgroup.controllers (v2) for it.
+            _ if controller == "cgroup" => {
+                return Err(JailerError::CgroupControllerUnavailable(controller.to_owned()));
+            }
+            // v2 has no freezer controller (its freezer is cgroup.freeze):
+            // upstream's error.
+            (2, _) if controller == "freezer" => {
+                return Err(JailerError::CgroupControllerUnavailable(controller.to_owned()));
+            }
+            (1, "freezer.state") => {
+                self.freezer = Some(platform::parse_freezer_start(&value).ok_or_else(|| bad(STATE_VALUES))?);
+            }
+            (1, _) if controller == "freezer" => return Err(bad(READ_ONLY)),
             (2, "memory.max") | (1, "memory.limit_in_bytes") => {
                 let unlimited = if self.version == 2 { value == "max" } else { value == "-1" };
                 self.limits.memory_bytes = if unlimited {
@@ -195,7 +222,7 @@ impl CgroupConfigurationBuilder {
     }
 
     pub fn build(self) -> CgroupConfiguration {
-        CgroupConfiguration { limits: self.limits }
+        CgroupConfiguration { limits: self.limits, freezer: self.freezer }
     }
 
     pub fn get_v2_hierarchy_path(&self) -> Result<&PathBuf, JailerError> {
@@ -209,11 +236,17 @@ impl CgroupConfigurationBuilder {
 #[derive(Debug)]
 pub struct CgroupConfiguration {
     limits: Limits,
+    freezer: Option<FreezerState>,
 }
 
 impl CgroupConfiguration {
     pub fn setup(&self) -> Result<(), JailerError> {
         platform::set_limits(self.limits.clone());
+        // Last, as Linux attaches the jailer to its cgroups after writing
+        // every property: FROZEN stops the jailer here.
+        if let Some(state) = self.freezer {
+            platform::freezer_at_cgroup_step(state)?;
+        }
         Ok(())
     }
 }
@@ -223,15 +256,7 @@ const CAP_AND_WEIGHT: &str = "a Job Object takes a CPU rate cap (cpu.max) or a C
 const MEMS_BIND: &str = "Windows cannot bind a process's memory to NUMA nodes; only a list of every \
                          memory node of the host, which binds nothing, is accepted";
 
-/// Why `cgroup.freeze` (v1: `freezer.*`) is refused. A Job Object's
-/// processes can be frozen and thawed as a group (`JobObjectFreezeInformation`,
-/// measured on Windows Server 2022: no CPU time while frozen, a process added
-/// meanwhile frozen too, one thaw resumes all), but a cgroup's freezer is a
-/// file the operator writes at any time, and the jailer has no counterpart of
-/// it through which the jail could be thawed again. Not done yet.
-const FREEZE: &str = "the jailer has no freezer yet: a Job Object can be frozen and thawed as a \
-                      group, but there is no counterpart of the cgroup file an operator writes \
-                      to freeze or thaw the jail later";
+use crate::platform::freezer_values::{READ_ONLY, STATE_VALUES};
 
 /// Why Windows cannot do what the cgroup file `file` does, for the
 /// controllers and files Windows has no counterpart for.
@@ -258,11 +283,6 @@ fn impossible(version: u8, file: &str) -> Option<&'static str> {
         }
         (2, "rdma") => "Windows has no limit on a job's RDMA resources",
         (2, "misc") => "Windows has no counterpart for the misc controller's resources",
-        (1, "freezer") => FREEZE,
-        (2, "cgroup") if file.starts_with("cgroup.freeze") => FREEZE,
-        (2, "cgroup") => {
-            "the jailer cannot limit nested cgroups: a Job Object has no limit on nested jobs"
-        }
         (1, "devices") => {
             "Windows has no device nodes: what the jailed process opens is decided by the jail's \
              token and ACLs"
@@ -579,12 +599,6 @@ mod tests {
     fn test_other_controllers_are_refused_with_the_reason() {
         assert!(reason(2, "rdma.max=mlx4_0 hca_handle=2").contains("RDMA"));
         assert!(reason(2, "misc.max=sev 1").contains("misc"));
-        assert_eq!(reason(2, "cgroup.freeze=1"), FREEZE);
-        assert_eq!(reason(2, "cgroup.freeze=0"), FREEZE);
-        assert!(reason(2, "cgroup.max.descendants=0").contains("nested"));
-        assert!(reason(2, "cgroup.max.depth=1").contains("nested"));
-        assert_eq!(reason(1, "freezer.state=FROZEN"), FREEZE);
-        assert_eq!(reason(1, "freezer.state=THAWED"), FREEZE);
         assert!(reason(1, "devices.deny=a").contains("device"));
         assert!(reason(1, "net_cls.classid=1").contains("network"));
         assert!(reason(1, "net_prio.ifpriomap=eth0 1").contains("network"));
@@ -599,6 +613,49 @@ mod tests {
             // checked through `check_mems` above.
         } else {
             assert_eq!(reason(2, "cpuset.mems=0"), MEMS_BIND);
+        }
+    }
+
+    // The freezer at the start, as upstream's jailer on Linux
+    // (`tools/linux/jailer-cgroup-check.py`): v1 freezer.state takes FROZEN or
+    // THAWED (the kernel refuses any other value written to it, and the other
+    // freezer files are read-only); `cgroup` is no controller, with either
+    // version (upstream finds no hierarchy or cgroup.controllers entry for
+    // it), so v2's cgroup.freeze is refused at the start; v2 has no freezer
+    // controller.
+    #[test]
+    fn test_freezer_at_the_start() {
+        let freezer = |v, p: &str| {
+            let mut b = CgroupConfigurationBuilder::new(v, "")?;
+            let (f, val) = p.split_once('=').unwrap();
+            b.add_cgroup_property(f.into(), val.into(), "id", Path::new("fc"))?;
+            Ok::<_, JailerError>(b.build().freezer)
+        };
+        assert_eq!(freezer(1, "freezer.state=FROZEN").unwrap(), Some(FreezerState::Frozen));
+        assert_eq!(freezer(1, "freezer.state=THAWED").unwrap(), Some(FreezerState::Thawed));
+        assert_eq!(freezer(1, "memory.limit_in_bytes=-1").unwrap(), None);
+        for (p, why) in [
+            ("freezer.state=FREEZING", STATE_VALUES),
+            ("freezer.state=", STATE_VALUES),
+            ("freezer.state=frozen", STATE_VALUES),
+            ("freezer.self_freezing=1", READ_ONLY),
+            ("freezer.parent_freezing=1", READ_ONLY),
+        ] {
+            match freezer(1, p) {
+                Err(JailerError::Host(HostError::CgroupValue(cg, w))) => assert_eq!((cg.as_str(), w), (p, why)),
+                other => panic!("{p}: {other:?}"),
+            }
+        }
+        for (v, p, controller) in [
+            (2, "cgroup.freeze=1", "cgroup"),
+            (2, "cgroup.freeze=0", "cgroup"),
+            (2, "cgroup.max.descendants=0", "cgroup"),
+            (2, "cgroup.procs=1", "cgroup"),
+            (1, "cgroup.freeze=1", "cgroup"),
+            (2, "freezer.state=FROZEN", "freezer"),
+        ] {
+            let err = freezer(v, p).unwrap_err();
+            assert_eq!(err.to_string(), format!("Controller {controller} is unavailable"), "v{v} {p}");
         }
     }
 
