@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 04:06:02 +0900
+Subject: [PATCH] windows: a log line's origin names its source file with /
+
+A Windows build's file!() paths use \ (src\firecracker\src\main.rs); the
+log's origin is written as upstream writes it, src/firecracker/src/main.rs,
+which test_logging and log readers match.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vmm/src/logger/logging.rs | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/vmm/src/logger/logging.rs b/src/vmm/src/logger/logging.rs
+index 1f2eff75d3e1d1244d10b9770e0fa09994627d11..0b3cf94faaf2d17f0ebc9b5a011c4a864965f580 100644
+--- a/src/vmm/src/logger/logging.rs
++++ b/src/vmm/src/logger/logging.rs
+@@ -146,6 +146,10 @@ impl Log for Logger {
+             let origin = match guard.format.show_log_origin {
+                 true => {
+                     let file = record.file().unwrap_or("?");
++                    // wick: a Windows build names its source files with `\`; the
++                    // log's origin is the path as upstream writes it.
++                    #[cfg(windows)]
++                    let file = &file.replace('\\', "/");
+                     let line = match record.line() {
+                         Some(x) => x.to_string(),
+                         None => String::from("?"),

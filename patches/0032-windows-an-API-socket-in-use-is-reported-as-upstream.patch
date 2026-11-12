@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 03:34:03 +0900
+Subject: [PATCH] windows: an API socket in use is reported as upstream reports
+ it
+
+On Windows Firecracker binds the API socket before handing it to the API
+process (vmm::ext::api_process::split); a socket already bound there came
+back as the API process's bind error. It is ApiServerError::FailedToBindSocket
+now, as HttpServer::new's AddrInUse is on Linux: "Failed to open the API
+socket at: <path>. Check that it is not already used." (test_api_server).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/src/api_server_adapter.rs | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/firecracker/src/api_server_adapter.rs b/src/firecracker/src/api_server_adapter.rs
+index 034f00765565106b41e36760f40fe4f0cc26d847..841bcf4abba49023c7c31a179b7e8d13a33b116c 100644
+--- a/src/firecracker/src/api_server_adapter.rs
++++ b/src/firecracker/src/api_server_adapter.rs
+@@ -222,11 +222,19 @@ pub(crate) fn run_with_api(
+         api_payload_limit,
+     )
+     .map_err(ApiServerError::ApiProcess)?;
+-    // wick: the same on Windows, where the API process binds the socket.
++    // wick: the same on Windows, where the API process binds the socket; a socket
++    // in use is reported as upstream reports it.
+     #[cfg(windows)]
+     let api_link =
+         vmm::ext::api_process::split(api_kill_switch_clone, &bind_path, api_payload_limit)
+-            .map_err(ApiServerError::ApiProcess)?;
++            .map_err(|err| match err {
++                vmm::ext::api_process::ApiProcessError::Bind(path, e)
++                    if e.kind() == std::io::ErrorKind::AddrInUse =>
++                {
++                    ApiServerError::FailedToBindSocket(path.display().to_string())
++                }
++                err => ApiServerError::ApiProcess(err),
++            })?;
+ 
+     // Start the separate API thread.
+     let api_thread = thread::Builder::new()

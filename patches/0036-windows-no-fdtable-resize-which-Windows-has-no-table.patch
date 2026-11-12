@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 04:23:09 +0900
+Subject: [PATCH] windows: no fdtable resize, which Windows has no table for
+
+Firecracker grows the kernel's descriptor table at start (dup2 to the
+RLIMIT_NOFILE limit), so that a snapshot restore does not pay for its
+reallocation. Windows numbers handles into no table of a size, and wick's
+descriptors are a map that grows as they are made: the step is skipped, and
+the debug line it logged on every Windows start ("Failed to resize fdtable")
+is gone. FailedToBindAndRunHttpServer is not made on Windows, where the API
+process binds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/src/api_server_adapter.rs | 2 ++
+ src/firecracker/src/main.rs               | 5 ++++-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/firecracker/src/api_server_adapter.rs b/src/firecracker/src/api_server_adapter.rs
+index 841bcf4abba49023c7c31a179b7e8d13a33b116c..9af4ed487af0c25dc8cfca974bc70972c6bc421a 100644
+--- a/src/firecracker/src/api_server_adapter.rs
++++ b/src/firecracker/src/api_server_adapter.rs
+@@ -32,6 +32,8 @@ pub enum ApiServerError {
+     /// Failed to open the API socket at: {0}. Check that it is not already used.
+     FailedToBindSocket(String),
+     /// Failed to bind and run the HTTP server: {0}
++    // wick: on Windows the API process binds; its failures are ApiProcess's.
++    #[cfg_attr(windows, allow(dead_code))]
+     FailedToBindAndRunHttpServer(ServerError),
+     /// Failed to build MicroVM from Json: {0}
+     BuildFromJson(crate::BuildFromJsonError),
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index 905abb41f4cdfc8851630d8dd33c8f75d75f75f2..794dacdcdd61f2907d8e9f65b9cf4966fb91a76c 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -362,7 +362,10 @@ fn main_exec() -> Result<(), MainError> {
+     #[cfg(target_arch = "aarch64")]
+     enable_ssbd_mitigation();
+ 
+-    if let Err(err) = resize_fdtable() {
++    // wick: Windows has no descriptor table of a size to grow: handles are not
++    // numbered into one, and wick's descriptors are a map that grows as they are
++    // made (libc's windows_fd), so the restore path pays no reallocation.
++    if let Err(err) = if cfg!(windows) { Ok(()) } else { resize_fdtable() } {
+         match err {
+             // These errors are non-critical: In the worst case we have worse snapshot restore
+             // performance.

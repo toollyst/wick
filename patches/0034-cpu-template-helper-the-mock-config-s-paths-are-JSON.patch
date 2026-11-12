@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 04:19:16 +0900
+Subject: [PATCH] cpu-template-helper: the mock config's paths are JSON strings
+
+The VM the helper builds is configured by JSON with the temporary kernel's
+and rootfs's paths in it, as written. A Windows temporary path has \, which
+JSON takes for an escape: every command that builds the VM failed with
+"Invalid JSON: invalid escape". The paths are encoded as JSON strings now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/cpu-template-helper/src/utils/mod.rs | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/src/cpu-template-helper/src/utils/mod.rs b/src/cpu-template-helper/src/utils/mod.rs
+index f23871df1a9e84eaff9e697b224f039293049ea6..148bdf7c522f3ceaae9af36efdb3883d3c53efa1 100644
+--- a/src/cpu-template-helper/src/utils/mod.rs
++++ b/src/cpu-template-helper/src/utils/mod.rs
+@@ -88,22 +88,25 @@ fn build_mock_config() -> Result<(TempFile, TempFile, String), UtilsError> {
+         .as_file()
+         .write_all(include_bytes!("mock_kernel/kernel.bin"))?;
+     let rootfs = TempFile::new()?;
++    // wick: the paths as JSON strings: a Windows temporary path has `\`, which
++    // JSON takes for an escape.
++    let json = |p: &std::path::Path| serde_json::to_string(p.to_str().unwrap()).unwrap();
+     let config = format!(
+         r#"{{
+             "boot-source": {{
+-                "kernel_image_path": "{}"
++                "kernel_image_path": {}
+             }},
+             "drives": [
+                 {{
+                     "drive_id": "rootfs",
+                     "is_root_device": true,
+-                    "path_on_host": "{}"
++                    "path_on_host": {}
+                 }}
+             ]
+         }}"#,
+         // Temporary file path consists of alphanumerics.
+-        kernel.as_path().to_str().unwrap(),
+-        rootfs.as_path().to_str().unwrap(),
++        json(kernel.as_path()),
++        json(rootfs.as_path()),
+     );
+     Ok((kernel, rootfs, config))
+ }

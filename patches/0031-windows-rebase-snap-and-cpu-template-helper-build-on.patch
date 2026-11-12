@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 03:28:08 +0900
+Subject: [PATCH] windows: rebase-snap and cpu-template-helper build on Windows
+
+rebase-snap's root declares wick-std as snapshot-editor's does (patch
+0017), for std::os::unix's AsRawFd; sendfile64 and SEEK_DATA/SEEK_HOLE come
+from wick's POSIX layer. cpu-template-helper's build script links its mock
+x86_64 kernel (a _start that spins) with gcc, which makes no Linux ELF on a
+Windows host: there the script writes that ELF itself, one loadable segment
+at gcc's static address with `jmp .`. Upstream's integration tests run both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                       |  1 +
+ src/cpu-template-helper/build.rs | 33 +++++++++++++++++++++++++++++++-
+ src/rebase-snap/Cargo.toml       |  4 ++++
+ src/rebase-snap/src/main.rs      |  4 ++++
+ 4 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 461066c9f26930348a4c08f7944a56ac413bd48c..e2987d317f825629781d914a98f0e71aabc5c7ee 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1380,6 +1380,7 @@ dependencies = [
+  "thiserror 2.0.20",
+  "utils",
+  "vmm-sys-util 0.15.0",
++ "wick-std",
+  "wick-version",
+ ]
+ 
+diff --git a/src/cpu-template-helper/build.rs b/src/cpu-template-helper/build.rs
+index 5cd73550815ec3289f7ea89335b047b54a8e0e5b..58489eb9882b1ed0a479a69d1bbb60d544440012 100644
+--- a/src/cpu-template-helper/build.rs
++++ b/src/cpu-template-helper/build.rs
+@@ -21,8 +21,39 @@ struct KernelHeader {
+     res5: u32,        // reserved (used for PE COFF offset)
+ }
+ 
++// wick: the mock kernel as gcc links main.c (`_start` spinning), written out where
++// the host's compiler makes no Linux ELF (a Windows host): one loadable segment at
++// gcc's static address, the code `jmp .`.
++fn write_mock_elf(path: &str) {
++    const ENTRY: u64 = 0x401000;
++    let mut elf = Vec::new();
++    // ELF header: 64-bit, little endian, version 1, System V.
++    elf.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
++    elf.extend_from_slice(&2u16.to_le_bytes()); // ET_EXEC
++    elf.extend_from_slice(&0x3eu16.to_le_bytes()); // EM_X86_64
++    elf.extend_from_slice(&1u32.to_le_bytes());
++    elf.extend_from_slice(&ENTRY.to_le_bytes());
++    elf.extend_from_slice(&64u64.to_le_bytes()); // program headers after this one
++    elf.extend_from_slice(&0u64.to_le_bytes()); // no section headers
++    elf.extend_from_slice(&0u32.to_le_bytes());
++    for v in [64u16, 56, 1, 64, 0, 0] {
++        elf.extend_from_slice(&v.to_le_bytes());
++    }
++    // PT_LOAD, R+X, from file offset 0x1000.
++    elf.extend_from_slice(&1u32.to_le_bytes());
++    elf.extend_from_slice(&5u32.to_le_bytes());
++    for v in [0x1000u64, ENTRY, ENTRY, 2, 2, 0x1000] {
++        elf.extend_from_slice(&v.to_le_bytes());
++    }
++    elf.resize(0x1000, 0);
++    elf.extend_from_slice(&[0xeb, 0xfe]); // jmp .
++    std::fs::write(path, elf).expect("Failed to write the mock kernel");
++}
++
+ fn main() {
+-    if cfg!(target_arch = "x86_64") {
++    if cfg!(target_arch = "x86_64") && cfg!(windows) {
++        write_mock_elf(MOCK_KERNEL_PATH);
++    } else if cfg!(target_arch = "x86_64") {
+         println!("cargo:rerun-if-changed=src/utils/mock_kernel/main.c");
+         let status = std::process::Command::new("gcc")
+             .args([
+diff --git a/src/rebase-snap/Cargo.toml b/src/rebase-snap/Cargo.toml
+index 599038f983a235b622c8c6a2b2c9d783fde554cc..c33c2d6f5c8c5ed48a8c692fa8dcbbd18a1789ea 100644
+--- a/src/rebase-snap/Cargo.toml
++++ b/src/rebase-snap/Cargo.toml
+@@ -23,5 +23,9 @@ utils = { path = "../utils" }
+ # wick: wick's release version, <upstream>[+wick.<N>] (crates/version).
+ wick-version = { path = "../../../../crates/version" }
+ 
++# wick: std::os::{unix, fd} on Windows (`extern crate wick_std as std` at the root).
++[target.'cfg(windows)'.dependencies]
++wick-std = { path = "../../../../crates/compat/std" }
++
+ [lints]
+ workspace = true
+diff --git a/src/rebase-snap/src/main.rs b/src/rebase-snap/src/main.rs
+index a069fd1fe54687d72a9fdd81a0b5b36721c3c790..3950dca27ba7a64e5b7ca88f982198eb209ee022 100644
+--- a/src/rebase-snap/src/main.rs
++++ b/src/rebase-snap/src/main.rs
+@@ -1,6 +1,10 @@
+ // Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++// wick: std::os::{unix, fd} on Windows from wick's POSIX layer.
++#[cfg(windows)]
++extern crate wick_std as std;
++
+ // wick: this import only brought in the `env!` macro for the version, which
+ // now comes from wick_version::version!().
+ #[allow(unused_imports)]

@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use wick_os::fd::{AsRawFd, RawFd};
 use kvm_bindings::{
     kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2, kvm_userspace_memory_region,
-    KvmIrqRouting, KVM_CLOCK_HOST_TSC, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
+    KvmIrqRouting, KVM_CLOCK_HOST_TSC, KVM_CLOCK_REALTIME, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
 };
 use vmm_sys_util::errno::Error;
 use vmm_sys_util::eventfd::EventFd;
@@ -429,15 +429,23 @@ impl VmFd {
             flags |= whv::WHvMapGpaRangeFlagTrackDirtyPages;
         }
         // SAFETY: the caller's contract for `userspace_addr`/`memory_size`.
-        ffi::hr(unsafe {
-            whv::WHvMapGpaRange(
-                self.inner.part,
-                region.userspace_addr as *const core::ffi::c_void,
-                region.guest_phys_addr,
-                region.memory_size,
-                flags,
-            )
-        })?;
+        let map = || {
+            ffi::hr(unsafe {
+                whv::WHvMapGpaRange(
+                    self.inner.part,
+                    region.userspace_addr as *const core::ffi::c_void,
+                    region.guest_phys_addr,
+                    region.memory_size,
+                    flags,
+                )
+            })
+        };
+        // WHP maps guest memory for one partition of a process at a time: while
+        // another VM of the process has memory mapped, this fails with
+        // ERROR_INVALID_PARAMETER whatever the addresses (measured:
+        // test_one_partition_of_a_process_maps_memory). KVM has no such limit;
+        // Firecracker makes one VM per process.
+        map()?;
         memory.insert(
             region.slot,
             Slot {
@@ -622,9 +630,13 @@ impl VmFd {
 
     /// The guest clock: once the guest has kvm-clock, the guest's kvm-clock
     /// at the guest TSC returned with it (`host_tsc`, `pvclock`), as KVM
-    /// returns its kvm-clock; before, the VM clock.
+    /// returns its kvm-clock; before, the VM clock. With the host's wall
+    /// clock at the same moment (`realtime`, `KVM_CLOCK_REALTIME`), which a
+    /// restore with that flag advances the guest clock by.
     pub fn get_clock(&self) -> Result<kvm_clock_data> {
         let mut clock = self.inner.irqchip.lock().unwrap().clock();
+        clock.realtime = realtime_ns();
+        clock.flags |= KVM_CLOCK_REALTIME;
         // vCPU 0's TSC, which every vCPU's follows (`pvclock`).
         if let Ok(value) = ffi::get_register(self.inner.part, 0, whv::WHvX64RegisterTsc) {
             let tsc = ffi::as_u64(&value);
@@ -640,9 +652,13 @@ impl VmFd {
     /// Restores the guest clock; with the guest TSC it was saved with
     /// (`host_tsc`, [`Self::get_clock`]), the restored guest's kvm-clock goes
     /// on from its TSC as before the snapshot. Upstream overwrites `flags`
-    /// before the call, so a non-zero `host_tsc` is what tells.
+    /// before the call, so a non-zero `host_tsc` is what tells. With
+    /// `KVM_CLOCK_REALTIME`, as KVM: the clock goes on from `clock` plus the
+    /// wall-clock time since `realtime` (the time a snapshot spent on disk).
     pub fn set_clock(&self, clock: &kvm_clock_data) -> Result<()> {
-        self.inner.irqchip.lock().unwrap().set_clock(clock);
+        let mut clock = *clock;
+        clock.clock = restored_clock(&clock, realtime_ns());
+        self.inner.irqchip.lock().unwrap().set_clock(&clock);
         let mut pvclock = self.inner.pvclock.lock().unwrap();
         pvclock.reset();
         if clock.host_tsc != 0 {
@@ -804,10 +820,126 @@ fn watch_irqfds(inner: &Arc<VmInner>) {
     }
 }
 
+/// The host's wall clock, in nanoseconds since the Unix epoch (Linux's
+/// CLOCK_REALTIME, which KVM reads for `KVM_CLOCK_REALTIME`).
+fn realtime_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// The guest clock `set_clock` restores at wall-clock time `now`: `clock`,
+/// plus the wall time since `realtime` when the flag asks for it (a clock
+/// does not go back for a wall clock set back).
+fn restored_clock(clock: &kvm_clock_data, now: u64) -> u64 {
+    if clock.flags & KVM_CLOCK_REALTIME != 0 {
+        clock.clock + now.saturating_sub(clock.realtime)
+    } else {
+        clock.clock
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use windows_sys::Win32::Foundation::GetHandleInformation;
+
+    // One process may make VMs one after another (cpu-template-helper's
+    // tests build one per test), each with its guest memory.
+    // The guest-memory tests take addresses another could get between a
+    // munmap and a MAP_FIXED: one at a time.
+    static GUEST_MEMORY: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_vms_one_after_another_map_their_memory() {
+        let _one = GUEST_MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for round in 0..3 {
+            let vm = VmFd::create().unwrap();
+            let len = 64usize << 20;
+            // SAFETY: anonymous memory for the test, unmapped below.
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(p, libc::MAP_FAILED);
+            let region = kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: len as u64,
+                userspace_addr: p as u64,
+            };
+            // SAFETY: the memory stays mapped while the VM has it.
+            let r = unsafe { vm.set_user_memory_region(region) };
+            assert!(r.is_ok(), "round {round}: {r:?}");
+            drop(vm);
+            // SAFETY: our mapping.
+            assert_eq!(unsafe { libc::munmap(p, len) }, 0);
+        }
+    }
+
+    // WHP maps guest memory for one partition of a process at a time
+    // (measured on Windows 11 26H2): while one VM has memory mapped, a map in
+    // another fails, whatever the addresses; once the first has none, the
+    // other maps. If Windows lifts this, the test says so.
+    #[test]
+    fn test_one_partition_of_a_process_maps_memory() {
+        let _one = GUEST_MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = 16usize << 20;
+        let mem = || {
+            // SAFETY: anonymous memory for the test, left to the process's end.
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(p, libc::MAP_FAILED);
+            p as u64
+        };
+        let region = |gpa: u64, host: u64, size: u64| kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: gpa,
+            memory_size: size,
+            userspace_addr: host,
+        };
+        let (a, b) = (VmFd::create().unwrap(), VmFd::create().unwrap());
+        let (ma, mb) = (mem(), mem());
+        // SAFETY: the memory outlives the VMs.
+        unsafe {
+            a.set_user_memory_region(region(0, ma, len as u64)).unwrap();
+            assert_eq!(
+                b.set_user_memory_region(region(1 << 32, mb, len as u64)).unwrap_err().errno(),
+                87,
+                "a second partition mapped memory: WHP's limit is gone"
+            );
+            a.set_user_memory_region(region(0, ma, 0)).unwrap();
+            b.set_user_memory_region(region(1 << 32, mb, len as u64)).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_clock_realtime_advances_by_the_wall_time_since() {
+        // SAFETY: an all-zero kvm_clock_data is valid.
+        let mut c: kvm_clock_data = unsafe { std::mem::zeroed() };
+        c.clock = 5_000;
+        c.realtime = 1_000_000;
+        assert_eq!(restored_clock(&c, 3_000_000), 5_000, "without the flag: as saved");
+        c.flags = KVM_CLOCK_REALTIME;
+        assert_eq!(restored_clock(&c, 3_000_000), 2_005_000);
+        assert_eq!(restored_clock(&c, 10), 5_000, "a wall clock set back does not take it back");
+    }
 
     fn open(fd: RawFd) -> bool {
         let mut flags = 0u32;

@@ -101,6 +101,7 @@ def main():  # pylint: disable=too-many-locals,too-many-branches,too-many-statem
         return next((e for e in listed if matches(nodeid, e[0])), None)
 
     excused = defaultdict(list)
+    passing = defaultdict(list)  # listed tests that pass
     used = set()
     agree = 0
     for nodeid, lo in sorted(linux.items()):
@@ -118,7 +119,7 @@ def main():  # pylint: disable=too-many-locals,too-many-branches,too-many-statem
         if wo == "passed":
             agree += 1
             if e:
-                problems.append(f"{nodeid}: passes, but listed ({e[1]}): remove the entry")
+                passing[e].append(nodeid)
         elif e:
             used.add(e[0])
             excused[e].append(f"{nodeid}: {wo}")
@@ -131,12 +132,17 @@ def main():  # pylint: disable=too-many-locals,too-many-branches,too-many-statem
         if wo in GOOD:
             agree += 1
             if e and wo == "passed":
-                problems.append(f"{nodeid}: passes, but listed ({e[1]}): remove the entry")
+                passing[e].append(nodeid)
         elif e:
             used.add(e[0])
             excused[e].append(f"{nodeid}: {wo} (no Linux result)")
         else:
             problems.append(f"{nodeid}: {wo} on Windows, no Linux result")
+    # An entry is stale when everything it names passes (a test function's
+    # entry may name parameters that pass, beside the ones it is for).
+    for e, nodeids in passing.items():
+        if e not in excused:
+            problems.append(f"'{e[0]}' ({e[1]}): every test it names passes ({len(nodeids)}): remove the entry")
     if args.full:
         for entry, kind, _ in listed:
             module = entry.split("::", 1)[0]

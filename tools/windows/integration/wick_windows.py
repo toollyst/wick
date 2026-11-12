@@ -107,22 +107,85 @@ def _sddl(path, info):
         _kernel32.LocalFree(sd)
 
 
-def give_to_jail(path, root):
-    """`chown(path, uid, gid)` for a jail: `path` gets the security the jail
-    directory `root` hands down (its DACL, its integrity label). A file
-    that is a hard link shares it with the source, as a chown does on Linux.
-    Before the jailer has protected `root`, nothing: the jailer passes its
-    security down to what is in the directory already."""
-    if not _sddl(root, _DACL_INFO).startswith("D:P"):
-        return
-    acl = ctypes.create_string_buffer(64)
-    if not _advapi.InitializeAcl(acl, 64, 2):
+_PROTECTED_DACL = 0x80000000
+
+
+def _set_dacl(path, edit):
+    """Sets `path`'s DACL to `edit(aces)`, the DACL's ACEs as SDDL strings
+    in order (icacls cannot name a SID no account has, as a jail's: 1332).
+    Explicit denies come first, then explicit allows, as Windows orders an
+    ACL; inherited ACEs are recomputed from the parent."""
+    dacl = _sddl(path, _DACL_INFO)
+    m = re.match(r"D:([A-Z]*)(.*)$", dacl)
+    flags, aces = m.group(1), re.findall(r"\([^)]*\)", m.group(2))
+    aces = [a for a in edit(aces) if ";ID;" not in a and not re.match(r"\([AD];[A-Z]*ID", a)]
+    aces.sort(key=lambda a: 0 if a.startswith("(D;") else 1)
+    sd = ctypes.c_void_p()
+    if not _advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            f"D:{flags}{''.join(aces)}", 1, ctypes.byref(sd), None):
         raise ctypes.WinError(ctypes.get_last_error())
-    # An empty DACL, unprotected: what the parent hands down, nothing else.
-    rc = _advapi.SetNamedSecurityInfoW(str(path), _SE_FILE_OBJECT, _DACL_INFO | _UNPROTECTED_DACL,
-                                       None, None, acl, None)
-    if rc:
-        raise OSError(rc, f"SetNamedSecurityInfo({path})", None, rc)
+    try:
+        present, defaulted, acl = ctypes.c_int(), ctypes.c_int(), ctypes.c_void_p()
+        _advapi.GetSecurityDescriptorDacl.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                                                      ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int)]
+        if not _advapi.GetSecurityDescriptorDacl(sd, ctypes.byref(present), ctypes.byref(acl), ctypes.byref(defaulted)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        info = _DACL_INFO | (_PROTECTED_DACL if "P" in flags else _UNPROTECTED_DACL)
+        rc = _advapi.SetNamedSecurityInfoW(str(path), _SE_FILE_OBJECT, info, None, None, acl, None)
+        if rc:
+            raise OSError(rc, f"SetNamedSecurityInfo({path})", None, rc)
+    finally:
+        _kernel32.LocalFree(sd)
+
+
+_real_chmod = os.chmod
+
+
+def _chmod(path, mode, *args, **kwargs):
+    """`os.chmod`. Windows's sets the read-only attribute only, which keeps
+    no one from writing a directory. Linux's mode bits bind the jail's uid,
+    the files' owner, and not root (the test session): a file or directory
+    granted to jails (S-1-9-... in its DACL, `give_to_jail`) also denies
+    those SIDs what `mode` leaves the owner without (write, read), and has
+    that taken back by a mode that gives it."""
+    _real_chmod(path, mode, *args, **kwargs)
+    if not isinstance(path, (str, os.PathLike)) or not os.path.exists(path):
+        return
+    try:
+        sids = sorted(set(re.findall(r"S-1-9-[0-9-]+", _sddl(path, _DACL_INFO))))
+    except OSError:
+        return
+    # FILE_GENERIC_WRITE and FILE_GENERIC_READ less SYNCHRONIZE (a denied
+    # SYNCHRONIZE would keep the owner from waiting on its own handles).
+    denied = (0x116 if not mode & 0o200 else 0) | (0x89 if not mode & 0o400 else 0)
+
+    def edit(aces):
+        kept = [a for a in aces if not (a.startswith("(D;") and any(a.endswith(f";{s})") for s in sids))]
+        return kept + ([f"(D;;{denied:#x};;;{s})" for s in sids] if denied else [])
+
+    if sids:
+        _set_dacl(path, edit)
+
+
+os.chmod = _chmod
+
+
+def give_to_jail(path, root):
+    """`chown(path, uid, gid)` for a jail: `path` is granted to the jail's
+    SID, the one the jail directory `root` grants (S-1-9-..., the jailer's
+    per-microVM SID), and gets the directory's integrity label. Added to what
+    the file grants already: a file that is a hard link shares its security
+    with the source and with every jail it is linked into (a read-only
+    artifact is), and on Linux every jail of the session is the same uid, so
+    each keeps its access. Before the jailer has made `root` the jail's,
+    nothing: the jailer passes its security down to what is in the directory
+    already."""
+    dacl = _sddl(root, _DACL_INFO)
+    sid = re.search(r"S-1-9-[0-9-]+", dacl)
+    if not dacl.startswith("D:P") or sid is None:
+        return
+    grant = f"(A;;FA;;;{sid.group(0)})"
+    _set_dacl(path, lambda aces: aces if grant in aces else aces + [grant])
     label = _sddl(root, _LABEL_INFO)
     if "ML;" not in label:
         return
@@ -206,6 +269,26 @@ class _Popen(_real_popen):
         super().__init__(args, *a, shell=shell, **kw)
 
 
+    # Linux: terminate() sends SIGTERM and kill() SIGKILL; a process that
+    # dies of them exits with 128 + the signal, as tests check (socat's 143).
+    # Windows ends a process (TerminateProcess) with the status it is given.
+    def terminate(self):
+        self._end(128 + 15)
+
+    def kill(self):
+        self._end(128 + 9)
+
+    def _end(self, status):
+        import _winapi  # pylint: disable=import-outside-toplevel
+
+        if self.returncode is None:
+            try:
+                _winapi.TerminateProcess(self._handle, status)
+            except PermissionError:
+                if _winapi.GetExitCodeProcess(self._handle) == _winapi.STILL_ACTIVE:
+                    raise
+
+
 subprocess.Popen = _Popen
 
 # The host's processor, which Linux's lscpu and /proc/cpuinfo name: from the
@@ -229,26 +312,95 @@ import contextlib  # noqa: E402  pylint: disable=wrong-import-position
 import pathlib  # noqa: E402  pylint: disable=wrong-import-position
 
 
-@contextlib.contextmanager
-def _os_release():
-    """`/etc/os-release` as Windows's own, while framework.properties reads it."""
-    name = f'PRETTY_NAME="Windows {platform.release()} {platform.version()}"\n'
-    real = pathlib.Path.read_text
-
-    def read_text(self, *args, **kwargs):
-        if self.as_posix() in ("/etc/os-release", "\\etc\\os-release") or str(self) == "\\etc\\os-release":
-            return name
-        return real(self, *args, **kwargs)
-
-    pathlib.Path.read_text = read_text
-    try:
-        yield
-    finally:
-        pathlib.Path.read_text = real
+def _cpu_list(cpus):
+    """CPUs in Linux's list syntax (0-3,6)."""
+    out, cpus = [], sorted(cpus)
+    while cpus:
+        start = end = cpus.pop(0)
+        while cpus and cpus[0] == end + 1:
+            end = cpus.pop(0)
+        out.append(f"{start}-{end}" if end != start else f"{start}")
+    return ",".join(out)
 
 
-with _os_release():
-    import framework.properties  # noqa: E402,F401  pylint: disable=wrong-import-position,unused-import
+def _node_cpus(node):
+    """The logical CPUs of a NUMA node (GetNumaNodeProcessorMaskEx, group 0)."""
+
+    class _GroupAffinity(ctypes.Structure):
+        _fields_ = [("Mask", ctypes.c_size_t), ("Group", ctypes.c_ushort), ("Reserved", ctypes.c_ushort * 3)]
+
+    aff = _GroupAffinity()
+    if not ctypes.windll.kernel32.GetNumaNodeProcessorMaskEx(ctypes.c_ushort(node), ctypes.byref(aff)):
+        raise FileNotFoundError(2, f"no NUMA node {node}")
+    return [c for c in range(64) if aff.Mask >> c & 1]
+
+
+# Linux files the framework reads on the host, from Windows's own data.
+_VIRTUAL_FILES = {
+    "/etc/os-release": lambda: f'PRETTY_NAME="Windows {platform.release()} {platform.version()}"\n',
+    "/sys/devices/system/cpu/online": lambda: _cpu_list(range(os.cpu_count())) + "\n",
+}
+_real_read_text = pathlib.Path.read_text
+
+
+def _read_text(self, *args, **kwargs):
+    name = self.as_posix()
+    if name in _VIRTUAL_FILES:
+        return _VIRTUAL_FILES[name]()
+    m = re.fullmatch(r"/sys/devices/system/node/node(\d+)/cpulist", name)
+    if m:
+        return _cpu_list(_node_cpus(int(m.group(1)))) + "\n"
+    return _real_read_text(self, *args, **kwargs)
+
+
+pathlib.Path.read_text = _read_text
+
+
+class _Stat:
+    """`os.stat_result` with st_blocks, which Windows's lacks: the 512-byte
+    blocks the file has on disk, what a sparse file's holes do not take
+    (GetCompressedFileSizeW, the allocated size)."""
+
+    def __init__(self, path, st):
+        self._path, self._st = path, st
+
+    def __getattr__(self, name):
+        if name == "st_blocks":
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.GetCompressedFileSizeW.restype = ctypes.c_uint32
+            high = ctypes.c_uint32()
+            low = k32.GetCompressedFileSizeW(str(self._path), ctypes.byref(high))
+            if low == 0xFFFFFFFF and ctypes.get_last_error():
+                raise ctypes.WinError(ctypes.get_last_error())
+            return ((high.value << 32) | low) // 512
+        return getattr(self._st, name)
+
+    def __getitem__(self, i):
+        return self._st[i]
+
+    def __iter__(self):
+        return iter(self._st)
+
+    def __len__(self):
+        return len(self._st)
+
+    def __eq__(self, other):
+        return self._st == (other._st if isinstance(other, _Stat) else other)
+
+    def __repr__(self):
+        return repr(self._st)
+
+
+_real_path_stat = pathlib.Path.stat
+
+
+def _path_stat(self, *, follow_symlinks=True):
+    return _Stat(self, _real_path_stat(self, follow_symlinks=follow_symlinks))
+
+
+pathlib.Path.stat = _path_stat
+
+import framework.properties  # noqa: E402,F401  pylint: disable=wrong-import-position,unused-import
 
 # Signals. Windows's os.kill ends a process (TerminateProcess) for any signal
 # but its console events: what SIGKILL does on Linux. SIGALRM stays undefined
@@ -333,6 +485,138 @@ import psutil  # noqa: E402  pylint: disable=wrong-import-position
 
 import wick_windows_mem  # noqa: E402  pylint: disable=wrong-import-position
 
+# os.kill: Linux raises ProcessLookupError (ESRCH) for a pid no process has.
+# Windows's os.kill fails with ERROR_INVALID_PARAMETER for one, and with
+# access denied for a process that has ended while a handle keeps its pid.
+_real_kill = os.kill
+_SYNCHRONIZE = 0x00100000
+
+
+def _ended(pid):
+    """Whether no running process has `pid`."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(_SYNCHRONIZE | 0x1000, False, pid)  # | PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ctypes.get_last_error() == 87
+    try:
+        return k32.WaitForSingleObject(ctypes.c_void_p(h), 0) == 0
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def _kill(pid, sig):
+    try:
+        _real_kill(pid, sig)
+    except OSError as err:
+        if isinstance(err, ProcessLookupError) or _ended(pid):
+            raise ProcessLookupError(3, f"kill({pid}): no such process") from None
+        raise
+
+
+os.kill = _kill
+
+
+def _killpg(pgid, sig):
+    """`os.killpg`: the process and what it started (Windows has no process
+    groups to signal; a process group's leader and its descendants)."""
+    try:
+        leader = psutil.Process(pgid)
+    except psutil.NoSuchProcess:
+        raise ProcessLookupError(3, f"killpg({pgid}): no such process group") from None
+    for p in [*leader.children(recursive=True), leader]:
+        try:
+            _kill(p.pid, sig)
+        except ProcessLookupError:
+            pass
+
+
+os.killpg = _killpg
+
+# Threads. Linux names a thread in /proc/<tid>/comm, and a tid is a pid
+# psutil can open (utils.get_threads, set_cpu_affinity). Windows's thread
+# ids are not processes: a thread's name is its description (Rust's std sets
+# it), its CPUs its affinity mask (SetThreadAffinityMask).
+
+
+def get_threads(pid):
+    """`utils.get_threads`: thread name -> thread ids."""
+    from collections import defaultdict  # pylint: disable=import-outside-toplevel
+
+    try:
+        out = defaultdict(list)
+        for t in psutil.Process(pid).threads():
+            out[hosttools.thread_name(t.id) or psutil.Process(pid).name().removesuffix(".exe")].append(t.id)
+        return out
+    except psutil.NoSuchProcess:
+        return {}
+
+
+def _thread_affinity(tid, cpus=None):
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenThread.restype = ctypes.c_void_p
+    k32.SetThreadAffinityMask.restype = ctypes.c_size_t
+    k32.SetThreadAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    # THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION
+    h = k32.OpenThread(0x0020 | 0x0040, False, tid)
+    if not h:
+        return None
+    try:
+        allowed = psutil.Process().cpu_affinity()
+        mask = sum(1 << c for c in (cpus if cpus is not None else allowed))
+        old = k32.SetThreadAffinityMask(ctypes.c_void_p(h), mask)
+        if not old:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if cpus is None:  # a read: put the old mask back
+            k32.SetThreadAffinityMask(ctypes.c_void_p(h), old)
+            return [c for c in range(64) if old >> c & 1]
+        return cpus
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def get_cpu_affinity(pid):
+    """`utils.get_cpu_affinity` for a process or a thread."""
+    got = None if psutil.pid_exists(pid) else _thread_affinity(pid)
+    return got if got is not None else psutil.Process(pid).cpu_affinity()
+
+
+def set_cpu_affinity(pid, cpulist):
+    """`utils.set_cpu_affinity` for a process or a thread."""
+    real = list(map(_utils.CpuMap, cpulist))
+    if not psutil.pid_exists(pid):
+        got = _thread_affinity(pid, real)
+        if got is not None:
+            return got
+    return psutil.Process(pid).cpu_affinity(real)
+
+
+_utils.get_threads = get_threads
+_utils.get_cpu_affinity = get_cpu_affinity
+_utils.set_cpu_affinity = set_cpu_affinity
+
+# Removing a jail: a process of it that has just ended may still hold a file
+# there for a moment (the jailer's keeper, which waits for Firecracker); Linux
+# unlinks open files. Retried for a few seconds.
+import shutil  # noqa: E402  pylint: disable=wrong-import-position
+
+_real_rmtree = shutil.rmtree
+
+
+def rmtree(path, *args, **kwargs):
+    """`shutil.rmtree`, retried while a file is in use (WinError 32)."""
+    deadline = time.time() + 10
+    while True:
+        try:
+            return _real_rmtree(path, *args, **kwargs)
+        except PermissionError as err:
+            if getattr(err, "winerror", None) != 32 or time.time() > deadline:
+                raise
+            time.sleep(0.2)
+
+
+shutil.rmtree = rmtree
+
 # Upstream's memory monitor reads Linux's smaps through psutil
 # (tools/windows/integration/wick_windows_mem.py).
 wick_windows_mem.install()
@@ -351,7 +635,11 @@ _real_get_binary = _cargo_build.get_binary
 
 
 def get_binary(name, *, binary_dir=_cargo_build.DEFAULT_BINARY_DIR, example=None):
-    """`get_binary`, with the `.exe` Windows gives the file."""
+    """`get_binary`, with the `.exe` Windows gives the file. Upstream's default
+    directory is Linux's musl target's; the session's binaries are in its
+    bin directory (WICK_IT_BIN, tools/windows/integration-tests.ps1)."""
+    if pathlib.Path(binary_dir) == pathlib.Path(_cargo_build.DEFAULT_BINARY_DIR) and os.environ.get("WICK_IT_BIN"):
+        binary_dir = pathlib.Path(os.environ["WICK_IT_BIN"])
     path = _real_get_binary(name, binary_dir=binary_dir, example=example)
     exe = path.with_name(path.name + ".exe")
     return exe if not path.exists() and exe.exists() else path
@@ -398,6 +686,35 @@ def copy_to_chroot(self, chroot):
 
 
 _microvm.Snapshot.copy_to_chroot = copy_to_chroot
+
+# The uffd page fault handler. Linux: started chrooted in the jail, so its
+# socket (/firecracker-uffd.sock) is where the jailed Firecracker connects,
+# then chowned to the jail. Windows has no chroot: the handler starts in the
+# jail directory with the jail's paths spelled out, and its socket is given
+# to the jail (`give_to_jail`).
+import framework.utils_uffd as _utils_uffd  # noqa: E402  pylint: disable=wrong-import-position
+
+
+def _uffd_spawn(self, uid, gid):  # pylint: disable=unused-argument
+    """`UffdHandler.spawn` without chroot."""
+    root = pathlib.Path(self._chroot)  # pylint: disable=protected-access
+    socket_path = root / self.socket_path.lstrip("/")
+    with open(root / self._log_file, "w", encoding="utf-8") as logfile:  # pylint: disable=protected-access
+        # Paths relative to the jail, as the chrooted handler's are: its
+        # command line names no jail (the framework looks for processes left
+        # with a jail's id in theirs).
+        args = [f"/{self._handler_name}", self.socket_path.lstrip("/"), self.snapshot.mem.name]  # pylint: disable=protected-access
+        # The file as named (CreateProcess would look for <name>.exe).
+        self._proc = subprocess.Popen(args, executable=str(root / self._handler_name), cwd=root,  # pylint: disable=protected-access,consider-using-with
+                                      stdout=logfile, stderr=subprocess.STDOUT)
+    time.sleep(1)
+    if not self.is_running():
+        print(self.log_data)
+        assert False, "Could not start PF handler!"
+    give_to_jail(socket_path, root)
+
+
+_utils_uffd.UffdHandler.spawn = _uffd_spawn
 
 # ----------------------------------------------------------- the backends
 
@@ -644,6 +961,26 @@ def _ssh_exec(self, cmd, timeout=100, check=False):
     return _utils.CommandReturn(*result)
 
 
+_real_scp_put = _network.SSHConnection.scp_put
+
+
+def _scp_put(self, local_path, remote_path, recursive=False):
+    """`SSHConnection.scp_put`. scp gives the guest's copy the host file's
+    mode; a Windows file has no execute bit, so a Linux program built for
+    the guest (an ELF file, built in WSL: hosttools.py) arrives without it.
+    It is set in the guest, as the file's mode is on Linux."""
+    _real_scp_put(self, local_path, remote_path, recursive)
+    if recursive or not os.path.isfile(local_path):
+        return
+    with open(local_path, "rb") as f:
+        if f.read(4) != b"\x7fELF":
+            return
+    name = os.path.basename(str(local_path))
+    self.check_output(f"if [ -d {remote_path} ]; then chmod a+x {remote_path}/{name}; "
+                      f"else chmod a+x {remote_path}; fi")
+
+
+_network.SSHConnection.scp_put = _scp_put
 _network.SSHConnection.__init__ = _ssh_init
 _network.SSHConnection._exec = _ssh_exec  # pylint: disable=protected-access
 

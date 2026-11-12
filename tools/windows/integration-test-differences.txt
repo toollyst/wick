@@ -16,10 +16,27 @@
 #   impossible  the host cannot do it; the comment says why
 #   bug         a wick bug, to fix
 
-# "The kernel file cannot be opened: No such file or directory (os error 2)":
-# Windows says "The system cannot find the file specified. (os error 2)".
+# "No such file or directory (os error 2)" (ENOENT): Windows says "The system
+# cannot find the file specified. (os error 2)" (ERROR_FILE_NOT_FOUND), for a
+# kernel, drive, pmem or metadata file that is not there, and for a uffd
+# handler socket that is not there.
 error-text integration_tests/functional/test_api.py::test_api_put_update_pre_boot
 error-text integration_tests/functional/test_api.py::test_drive_patch
+error-text integration_tests/functional/test_logging.py::test_api_requests_logs
+error-text integration_tests/functional/test_hotplug.py::test_hotplug_block
+error-text integration_tests/functional/test_hotplug.py::test_hotplug_pmem
+error-text integration_tests/functional/test_cmd_line_start.py::test_start_with_missing_metadata
+error-text integration_tests/functional/test_uffd.py::test_bad_socket_path
+
+# "Connection refused (os error 111)" (ECONNREFUSED) for a uffd handler socket
+# nothing listens on: Windows's is WSAECONNREFUSED, 10061.
+error-text integration_tests/functional/test_uffd.py::test_unbinded_socket
+
+# "Permission denied" (EACCES, 13) for a snapshot written to a directory the
+# jail may not write and loaded from files it may not read (the test's chmod
+# is the jail's ACL here: tools/windows/integration/wick_windows.py): Windows
+# says "Access is denied. (os error 5)" (ERROR_ACCESS_DENIED).
+error-text integration_tests/functional/test_snapshot_basic.py::test_negative_snapshot_permissions
 
 # "Cannot create mmap region: Out of memory (os error 12)": Windows's is
 # ERROR_NOT_ENOUGH_MEMORY, 8. The limit itself holds: the test's prlimit is a
@@ -33,3 +50,85 @@ error-text integration_tests/functional/test_api.py::test_api_machine_config
 # mitigations instead (docs/PORTING.md rows 1 and 2;
 # tools/windows/mitigation-audit.ps1).
 impossible integration_tests/security/test_seccomp_validate.py
+
+# The tests read a thread's seccomp mode (/proc/<pid>/status, Seccomp:) or
+# run Firecracker's seccomp examples and custom BPF filters. Windows has no
+# seccomp: Firecracker refuses --seccomp-filter there ("Custom seccomp-BPF
+# filters can only be enforced on Linux"), as on macOS (docs/PORTING.md,
+# "--seccomp-filter FILE").
+impossible integration_tests/security/test_seccomp.py
+impossible integration_tests/security/test_custom_seccomp.py
+
+# Signals sent to Firecracker from outside (SIGBUS, SIGSEGV, SIGXFSZ, SIGXCPU,
+# SIGSYS, SIGHUP, SIGPIPE, ... with kill(2)), which it logs or ignores.
+# Windows has no signals: a process can only be ended from outside
+# (TerminateProcess, what os.kill does there), which no handler sees.
+impossible integration_tests/functional/test_signals.py::test_generic_signal_handler
+impossible integration_tests/functional/test_signals.py::test_sigxfsz_handler
+impossible integration_tests/functional/test_signals.py::test_handled_signals
+
+# The jail's files owned by the jail's uid and gid (st_uid, st_gid): Windows
+# has no numeric owners; a jail's files are its SID's by their ACL
+# (overlay/jailer/platform/windows/mod.rs).
+impossible integration_tests/security/test_jail.py::test_default_chroot_hierarchy
+impossible integration_tests/security/test_jail.py::test_arbitrary_usocket_location
+
+# cgroup files: v1 and v2 hierarchies under /sys/fs/cgroup, NUMA nodes'
+# cpusets, cpu.shares down to 2. A Windows jail's cgroups are a Job Object
+# (overlay/jailer/platform/windows/cgroup.rs); a weight Windows cannot give
+# (cpu.shares=2 is below its range) is refused, never accepted without effect.
+impossible integration_tests/security/test_jail.py::test_cgroups
+impossible integration_tests/security/test_jail.py::test_cgroups_custom_parent
+impossible integration_tests/security/test_jail.py::test_node_cgroups
+impossible integration_tests/security/test_jail.py::test_cgroups_without_numa
+impossible integration_tests/security/test_jail.py::test_v1_default_cgroups
+
+# --resource-limit fsize= and no-file=, and reading them back with prlimit:
+# Windows cannot limit the size of the files a process writes or the number
+# of its handles; the jailer refuses both rather than accept them without
+# effect.
+impossible integration_tests/security/test_jail.py::test_args_default_resource_limits
+impossible integration_tests/security/test_jail.py::test_args_resource_limits
+impossible integration_tests/security/test_jail.py::test_positive_file_size_limit
+impossible integration_tests/security/test_jail.py::test_negative_file_size_limit
+impossible integration_tests/security/test_jail.py::test_negative_no_file_limit
+impossible integration_tests/security/test_jail.py::test_new_pid_ns_resource_limits
+
+# Firecracker's pid in its namespace (NStgid: 1). Windows has one process
+# table outside a server silo; a jail holds the namespace's isolation, not
+# its numbering (docs/PORTING.md row 7).
+impossible integration_tests/security/test_jail.py::test_new_pid_namespace
+
+# The test writes host paths into regular expressions unescaped, and a
+# jail under /srv: a Windows path's \ is an escape there.
+impossible integration_tests/security/test_jail.py::test_exec_file_not_exist
+impossible integration_tests/security/test_jail.py::test_exec_destination_path_is_symlink
+impossible integration_tests/security/test_jail.py::test_exec_destination_path_is_hardlink
+
+# Transparent huge pages (/sys/kernel/mm/transparent_hugepage, AnonHugePages
+# in smaps): Windows has no transparent huge pages; its large pages are
+# explicit (docs/PORTING.md row 10).
+impossible integration_tests/functional/test_huge_pages.py::test_transparent_huge_pages_allocation
+
+# A statically linked ELF: a Windows program is a PE image that loads the
+# system's DLLs (ntdll, kernel32, WinHvPlatform); there is no static form.
+impossible integration_tests/functional/test_binary.py::test_firecracker_binary_static_linking
+
+# A host program run inside the network namespace (udp_offload.py), a TAP's
+# transmit queue length, a multi-queue TAP: a Windows network is a directory
+# of stream endpoints, which a host program cannot run in and which have no
+# TAP queues (docs/PORTING.md row 6).
+row-6 integration_tests/functional/test_net.py::test_tap_offload
+row-6 integration_tests/functional/test_net.py::test_high_ingress_traffic
+row-6 integration_tests/functional/test_net.py::test_multi_queue_unsupported
+
+# Firecracker's memory beyond its guest's goes just above the tests' 5 MiB
+# (5.0 to 5.6 MiB), most with 16 vCPUs: each vCPU adds about 58 KiB of heap
+# and 78 KiB of stack (measured with 1, 2 and 16 vCPUs and a network
+# interface: 3.4, 3.5, 5.6 MiB). The heap's share is not root-caused yet.
+bug integration_tests/functional/test_cpu_all.py::test_all_vcpus_online
+bug integration_tests/functional/test_cpu_all.py::test_all_vcpus_have_same_features
+bug integration_tests/functional/test_cpu_features_x86_64.py::test_cpuid
+bug integration_tests/functional/test_topology.py::test_cache_topology
+bug integration_tests/functional/test_hotplug.py::test_hotplug_max_devices
+bug integration_tests/functional/test_metrics.py::test_net_metrics

@@ -245,7 +245,19 @@ impl UnixStream {
         let addr = SocketAddr::from_path(path.as_ref())?;
         let fd = new_socket()?;
         // SAFETY: the address and its length are valid.
-        cvt(unsafe { connect(raw(&fd), (&raw const addr.addr).cast(), addr.len) })?;
+        if let Err(e) = cvt(unsafe { connect(raw(&fd), (&raw const addr.addr).cast(), addr.len) }) {
+            // Linux fails a connect to a path where no socket file is with
+            // ENOENT, and to a socket file nothing listens on with
+            // ECONNREFUSED. Winsock refuses both (WSAECONNREFUSED, measured);
+            // a missing path is ERROR_FILE_NOT_FOUND here, of kind NotFound
+            // as ENOENT is.
+            if std::fs::symlink_metadata(path.as_ref())
+                .is_err_and(|m| m.kind() == io::ErrorKind::NotFound)
+            {
+                return Err(io::Error::from_raw_os_error(2));
+            }
+            return Err(e);
+        }
         Ok(UnixStream(fd))
     }
 

@@ -38,13 +38,16 @@ if (-not (Test-Path (Join-Path $Fc 'build\current_artifacts'))) { throw "no gues
 $release = Join-Path $Fc 'build\cargo_target\release'
 $bin = Join-Path $Out 'bin'
 New-Item -ItemType Directory -Force -Path (Join-Path $bin 'examples') | Out-Null
-foreach ($b in 'firecracker', 'jailer', 'snapshot-editor', 'rebase-snap', 'cpu-template-helper', 'seccompiler-bin') {
+foreach ($b in 'firecracker', 'jailer', 'snapshot-editor', 'rebase-snap', 'cpu-template-helper', 'seccompiler-bin', 'clippy-tracing') {
     $exe = Join-Path $release "$b.exe"
     # Both names: the framework checks for the Linux name and runs it (CreateProcess takes a binary without the extension).
     if (Test-Path $exe) { Copy-Item $exe (Join-Path $bin "$b.exe"); Copy-Item $exe (Join-Path $bin $b) }
 }
 Get-ChildItem (Join-Path $release 'examples') -Filter '*.exe' -ErrorAction SilentlyContinue |
-    Where-Object { $_.BaseName -notmatch '-' } | ForEach-Object { Copy-Item $_.FullName (Join-Path $bin "examples\$($_.Name)") }
+    Where-Object { $_.BaseName -notmatch '-' } | ForEach-Object {
+        Copy-Item $_.FullName (Join-Path $bin "examples\$($_.Name)")
+        Copy-Item $_.FullName (Join-Path $bin "examples\$($_.BaseName)")
+    }
 if (-not (Test-Path (Join-Path $bin 'firecracker.exe'))) { throw "no release build in $release" }
 # The vhost-user-blk backend upstream's tests start is crosvm's, which has no
 # Windows build: tools/vhost-user-blk takes crosvm's command lines when named
@@ -60,10 +63,19 @@ $session = Join-Path $env:SystemDrive ("wit-" + [Guid]::NewGuid().ToString('N').
 New-Item -ItemType Directory -Force -Path (Join-Path $session 'tmp') | Out-Null
 $env:PYTHONPATH = Join-Path $Root 'tools\windows\integration'
 $env:WICK_IT_ROOT = $session
+$env:WICK_IT_BIN = $bin
 # Text files and pipes in UTF-8, as on Linux (Windows's default is the code page).
 $env:PYTHONUTF8 = '1'
 $env:TMP = Join-Path $session 'tmp'
 $env:TEMP = $env:TMP
+# Upstream's tests write to lib\firecracker (test_results, a build of the
+# instrumented binary that rewrites the sources with clippy-tracing): one run
+# at a time, and what a test leaves in the sources is put back after it.
+$lock = Join-Path $Fc 'build\integration-tests.lock'
+New-Item -ItemType Directory -Force -Path (Split-Path $lock) | Out-Null
+try { $lockFile = [IO.File]::Open($lock, 'OpenOrCreate', 'ReadWrite', 'None') }
+catch { throw "another integration test run is going on ($lock)" }
+$sourcesBefore = @(git -C $Fc diff --name-only)
 Remove-Item -Recurse -Force (Join-Path $Fc 'test_results') -ErrorAction SilentlyContinue
 Push-Location (Join-Path $Fc 'tests')
 try {
@@ -81,6 +93,12 @@ try {
     Get-Process | Where-Object { $_.Path -and ($_.Path.StartsWith($bin) -or $_.Path.StartsWith($session)) } |
         Stop-Process -Force -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $session -ErrorAction SilentlyContinue
+    $touched = @(git -C $Fc diff --name-only | Where-Object { $sourcesBefore -notcontains $_ })
+    if ($touched.Count) {
+        Write-Warning "the tests changed $($touched.Count) upstream source files; put back: $($touched -join ', ')"
+        git -C $Fc checkout -- @touched
+    }
+    $lockFile.Close()
 }
 "$status" | Set-Content (Join-Path $Out 'status')
 $results = Join-Path $Fc 'test_results'
