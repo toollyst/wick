@@ -19,7 +19,17 @@ entry that names it.
 The table counts the Linux-passing tests an entry names, by kind. It is a
 count of listed differences, not a measured pass rate: no run report is
 committed. A `failure:<exception>` entry names no test (it excuses whatever
-fails only with that exception), so it is a footnote, never a count.
+fails only with that exception), so its reason must say how many tests it
+excused in which run, in a comment line of its own, which the comparators
+ignore:
+
+    # excused: 22 (run m2-queue at 27c2d4e): pass their own assertions and fail only the teardown's memory budget
+    # excused: at least 22 (run m2-queue at 27c2d4e): ...
+
+the number from that run's comparison.md, "at least" when the run was not
+the full suites. The progress block takes them out of the tests that agree
+(so its count is then "at most"), and both blocks say how many and why.
+Without the line, every mode fails.
 
 The progress block counts the status icons of every feature table in the
 document (a table with macOS and Windows columns): each cell must start with
@@ -77,6 +87,24 @@ NOT_RUN = {
 }
 
 
+# (file, failure: entry, mode) -> (at_least, n, run, what), filled as the files are read.
+EXCUSES = {}
+# "excused: [at least] N (run ID): what the tests do", in a failure: entry's reason.
+EXCUSED = re.compile(r"^excused:\s+(at least\s+)?(\d+)\s+\(run\s+([^)]+)\):\s*(\S.*)$")
+
+
+def excused_line(path, raw, entry, reason):
+    """(at_least, n, run, what) from a failure: entry's reason, or exit naming the entry."""
+    for text in reason:
+        m = EXCUSED.match(text)
+        if m:
+            return bool(m.group(1)), int(m.group(2)), m.group(3).strip(), m.group(4).strip()
+    raise SystemExit(
+        f"{path.relative_to(ROOT)}: `{entry}` excuses tests no entry names, so its reason must say how many and in which "
+        f"run: a comment line `# excused: [at least] N (run ID): what they do` ({raw.strip()})"
+    )
+
+
 def baseline():
     out = {}
     for line in BASELINE.read_text(encoding="utf-8").splitlines():
@@ -106,6 +134,8 @@ def macos_entries():
             raise SystemExit(f"{MACOS.name}: mode must be all, user or jailer: {raw}")
         if not reason:
             raise SystemExit(f"{MACOS.name}: no reason above {raw}")
+        if entry.strip().startswith("failure:"):
+            EXCUSES[(MACOS, entry.strip(), mode)] = excused_line(MACOS, raw, entry.strip(), reason)
         entries.append((entry.strip(), kind, mode))
     return entries
 
@@ -130,6 +160,8 @@ def windows_entries():
         kind, entry = line.split(None, 1)
         if not reason:
             raise SystemExit(f"{WINDOWS.name}: no reason above {raw}")
+        if entry.strip().startswith("failure:"):
+            EXCUSES[(WINDOWS, entry.strip(), "all")] = excused_line(WINDOWS, raw, entry.strip(), reason)
         entries.append((entry.strip(), kind, "all"))
     return entries
 
@@ -140,6 +172,12 @@ def matches(nodeid, entry):
 
 def module(nodeid):
     return nodeid.split("::", 1)[0]
+
+
+def excuses(host, entries):
+    """(entry, kind, at_least, n, run, what) of the failure: entries among `entries`."""
+    path = MACOS if host == "macOS" else WINDOWS
+    return [(e, k) + EXCUSES[(path, e, m)] for e, k, m in entries if e.startswith("failure:")]
 
 
 def kinds_cell(counter):
@@ -165,12 +203,12 @@ def tally(host, entries, linux):
         else:
             not_passing[outcome] += 1
     notes = []
-    for entry, kind, _ in entries:
-        if entry.startswith("failure:"):
-            notes.append(
-                f"{host}: `{entry}` ({kind}) excuses any test whose every failing phase failed with "
-                "that exception, in any file; the tests it excuses are not counted above."
-            )
+    for entry, kind, at_least, n, run, what in excuses(host, entries):
+        notes.append(
+            f"{host}: `{entry}` ({kind}) excuses any test whose every failing phase failed with that exception, "
+            f"in any file: {'at least ' if at_least else ''}{n} in run {run}, which {what}. They are not in "
+            "the counts above (no entry names them by file), and the progress block counts them as not agreeing."
+        )
     unmatched = [e for e in named if e[0] not in hit]
     for entry, kind, _ in unmatched:
         notes.append(f"{host}: `{entry}` ({kind}) names no test with a Linux result.")
@@ -231,22 +269,28 @@ def progress_cell(counts):
     return bar(done, of) + f" ({done} of {of})"
 
 
-def integration(linux, files, host):
-    """Linux-passing tests in the suites `host` has run: all, listed, and listed as impossible or arch."""
+def integration(linux, files, host, failures):
+    """Linux-passing tests in the suites `host` has run: all, listed by name or excused by a failure:
+    entry, listed as impossible or arch, and whether the excused count is only a lower bound."""
     passed = [n for n, o in linux.items() if o == "passed" and not any(n.startswith(p) for p in NOT_RUN[host])]
     listed = Counter()
     for name, kinds in files.items():
         if not any(name.startswith(p) for p in NOT_RUN[host]):
             listed.update(kinds)
-    return len(passed), sum(listed.values()), listed["impossible"] + listed["arch"]
+    excused = sum(f[3] for f in failures)
+    at_least = any(f[2] for f in failures)
+    return len(passed), sum(listed.values()) + excused, listed["impossible"] + listed["arch"], at_least
 
 
 def progress(text):
     rows = feature_rows(text)
     linux = baseline()
-    mac_files, _ = tally("macOS", [e for e in macos_entries() if e[2] in ("all", MACOS_MODE)], linux)
-    win_files, _ = tally("Windows", windows_entries(), linux)
+    mac = [e for e in macos_entries() if e[2] in ("all", MACOS_MODE)]
+    win = windows_entries()
+    mac_files, _ = tally("macOS", mac, linux)
+    win_files, _ = tally("Windows", win, linux)
     files = {"macOS": mac_files, "Windows": win_files}
+    failures = {"macOS": excuses("macOS", mac), "Windows": excuses("Windows", win)}
     per_host = {h: Counter(r[2][h] for r in rows) for h in HOSTS}
     areas = []
     for area, _, _ in rows:
@@ -264,10 +308,10 @@ def progress(text):
         out.append(f"| {label} | " + " | ".join(str(per_host[h][key]) for h in HOSTS) + " |")
     cells = []
     for h in HOSTS:
-        total, listed, impossible = integration(linux, files[h], h)
+        total, listed, impossible, at_least = integration(linux, files[h], h, failures[h])
         suites = "functional" if NOT_RUN[h] else "functional and security"
-        cells.append(f"{bar(total - listed, total - impossible)} ({total - listed} of {total - impossible}; "
-                     f"{suites})")
+        cells.append(f"{bar(total - listed, total - impossible)} ({'at most ' if at_least else ''}"
+                     f"{total - listed} of {total - impossible}; {suites})")
     out.append("| **Upstream integration tests that agree with Linux**, of those the host can run | "
                + " | ".join(cells) + " |")
     out += ["", "| Area | macOS | Windows |", "| --- | --- | --- |"]
@@ -275,10 +319,16 @@ def progress(text):
         anchor = re.sub(r"[^a-z0-9 -]", "", area.lower()).replace(" ", "-")
         counts = {h: Counter(r[2][h] for r in rows if r[0] == area) for h in HOSTS}
         out.append(f"| [{area}](#{anchor}) | " + " | ".join(progress_cell(counts[h]) for h in HOSTS) + " |")
+    excused = []
+    for h in HOSTS:
+        for entry, _, at_least, n, run, what in failures[h]:
+            excused.append(f"{h}: {'at least ' if at_least else ''}{n} more {what} (`{entry}`, run {run}); "
+                           "they are counted as not agreeing.")
     out += ["", "Integration tests: Linux's passing tests in the suites the host has run, less the ones its "
-            "differences file lists; tests listed as impossible or x86_64-only are left out of the total. "
-            "macOS runs them as the user, without its security suite, and its memory-budget entry can excuse "
-            "more (see [Upstream integration tests](#upstream-integration-tests))."]
+            "differences file lists by name and the ones a `failure:` entry excused in its last run; tests "
+            "listed as impossible or x86_64-only are left out of the total. \"At most\" when an excused count "
+            "is a lower bound (a run of part of the suites). macOS runs them as the user, without its security "
+            "suite (see [Upstream integration tests](#upstream-integration-tests))." + "".join(" " + e for e in excused)]
     for h in HOSTS:
         left = [(a, f, s[h]) for a, f, s in rows if s[h] in ("not yet", "untested")]
         out += ["", f"<details><summary>{h}: {len(left)} rows left (🔴 not done yet or ❔ not tested)</summary>", ""]
