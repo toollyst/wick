@@ -58,8 +58,9 @@ pub use macos::{
     API_FCNTL_COMMANDS, API_MACH_TRAPS, API_MIG_ROUTINES, API_SYSCALLS, FCNTL_COMMANDS,
     ABSENT, FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MEASURED_MAJORS, MIG_ROUTINES,
     PROFILE, RUN_DENIED_OPERATIONS, SETUP_MIG_ROUTINES_IF_DEFINED, SYSCALLS, Skip,
-    UNFILTERED_SYSCALLS, api_profile, apply, apply_api, narrowed,
+    SIGSYS_DEADLINE, SigsysHandler, UNFILTERED_SYSCALLS, api_profile, apply, apply_api, narrowed,
     denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select, selected,
+    set_sigsys_handler,
 };
 
 /// Narrows the sandbox to what a running microVM needs, for good. Called
@@ -101,7 +102,7 @@ mod macos {
     use std::ffi::{CStr, c_char};
     use std::path::Path;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
     use super::{Policy, SandboxError};
 
@@ -612,9 +613,9 @@ mod macos {
         if state.policy == Policy::None || state.installed {
             return Ok(());
         }
-        install_compiled(&compiled_api_profile()?)?;
+        start_sigsys_waiter()?;
+        install_and_mark(&compiled_api_profile()?)?;
         state.installed = true;
-        INSTALLED.store(true, Ordering::Relaxed);
         state.narrowed_done = true;
         if !cfg!(wick_sandbox_discovery) {
             libc::wick_mm::deny_exec(exec_denied);
@@ -1070,6 +1071,268 @@ mod macos {
         unsafe { (*info).si_pid == libc::getpid() }
     }
 
+    // SIGSYS from a thread of its own.
+    //
+    // Seccomp's SIGSYS is forced on the thread that made the call, which runs
+    // upstream's handler before it goes on (Linux kernel/seccomp.c,
+    // __seccomp_filter, SECCOMP_RET_TRAP: force_sig_seccomp; kernel/signal.c
+    // force_sig_info_to_task). The sandbox signals the process instead, and
+    // the kernel gives that to the first thread that does not block it (xnu
+    // bsd/kern/kern_sig.c, get_signalthread; measured, every time), which may
+    // hold the lock upstream's handler then takes to log or write metrics:
+    // that thread would wait on itself. So the handler Firecracker registers
+    // for SIGSYS runs on a thread of its own, the waiter, made before the
+    // sandbox; the signal's handler only wakes it ([`forward_sigsys`]): it
+    // takes no lock, and every thread that held one goes on and releases it.
+    // The kernel's own SIGSYS, for a call number it has no entry for (xnu
+    // bsd/kern/subr_xxx.c nosys: psignal_uthread, to the calling thread), is
+    // forwarded the same way.
+
+    /// The type of a SIGSYS handler (upstream's `sigsys_handler`).
+    pub type SigsysHandler = extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void);
+
+    /// The handler Firecracker registered for SIGSYS ([`set_sigsys_handler`]).
+    static SIGSYS_HANDLER: AtomicUsize = AtomicUsize::new(0);
+    /// The waiter's pipe (write end, non-blocking), -1 before it runs.
+    static WAITER_PIPE: AtomicI32 = AtomicI32::new(-1);
+    /// The process the waiter runs in (a fork has none of its parent's
+    /// threads, so not its waiter).
+    static WAITER_PID: AtomicI32 = AtomicI32::new(-1);
+    /// The signal's code and sender, for the waiter.
+    static SIGSYS_CODE: AtomicI32 = AtomicI32::new(0);
+    static SIGSYS_PID: AtomicI32 = AtomicI32::new(0);
+
+    /// How long upstream's handler work (the metric, the log line, the
+    /// metrics written, the exit) may take on the waiter before the process
+    /// exits 148 without it. It can take longer only when the thread that
+    /// holds the logger's or the metrics' lock is blocked writing to a
+    /// destination nobody reads (standard output to a pipe; the log and
+    /// metrics paths are opened non-blocking), and then what is lost (the
+    /// log line, the metrics) would not be read either. Linux's handler, on
+    /// the calling thread, waits on such a write for as long as it blocks.
+    /// More than ten times the longest the work took, from the denied call
+    /// to the exit (`test_sigsys_handler_work_is_far_within_its_deadline`,
+    /// which checks the tenth: 22 ms in 60 runs on an M1 Pro with 40 busy
+    /// threads on its 10 cores, 8 ms without them).
+    pub const SIGSYS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Registers `handler` for SIGSYS, to run on the waiter. Upstream's
+    /// `register_signal_handlers` calls this for its `sigsys_handler`.
+    pub fn set_sigsys_handler(handler: SigsysHandler) -> vmm_sys_util::errno::Result<()> {
+        SIGSYS_HANDLER.store(handler as usize, Ordering::Release);
+        // SAFETY: a zeroed sigaction, then its fields; forward_sigsys is
+        // async-signal-safe.
+        unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = forward_sigsys as *const () as usize;
+            // SA_RESTART: a thread the signal interrupts goes on with what
+            // it was doing (its read or write), as if it had not come.
+            act.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+            libc::sigfillset(&mut act.sa_mask);
+            if libc::sigaction(libc::SIGSYS, &act, std::ptr::null_mut()) != 0 {
+                return vmm_sys_util::errno::errno_result();
+            }
+        }
+        Ok(())
+    }
+
+    fn errno_location() -> *mut libc::c_int {
+        // SAFETY: the calling thread's errno.
+        unsafe { libc::__error() }
+    }
+
+    /// The SIGSYS handler: async-signal-safe (atomics, `getpid`, `write`,
+    /// `_exit`), with errno kept.
+    extern "C" fn forward_sigsys(num: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+        // SAFETY: errno of this thread; the kernel's siginfo, if any.
+        let saved = unsafe { *errno_location() };
+        let (code, pid) = if info.is_null() {
+            (-1, -1)
+        } else {
+            // SAFETY: as above.
+            unsafe { ((*info).si_code, (*info).si_pid) }
+        };
+        // SAFETY: no arguments.
+        let me = unsafe { libc::getpid() };
+        // The kernel's (nosys) or the sandbox's: no sender, code 0.
+        let from_kernel = code == 0 && pid == me;
+        if from_kernel && !INSTALLED.load(Ordering::Acquire) {
+            // No sandbox: a call number the kernel has none for fails with
+            // ENOSYS and the process goes on, as on Linux without seccomp.
+            // SAFETY: as above.
+            unsafe { *errno_location() = saved };
+            return;
+        }
+        let pipe = WAITER_PIPE.load(Ordering::Acquire);
+        if from_kernel && pipe >= 0 && WAITER_PID.load(Ordering::Acquire) == me {
+            SIGSYS_CODE.store(code, Ordering::Relaxed);
+            SIGSYS_PID.store(pid, Ordering::Release);
+            let byte = 1u8;
+            // SAFETY: one byte from the stack to the waiter's pipe.
+            let n = unsafe { libc::write(pipe, (&raw const byte).cast(), 1) };
+            // SAFETY: as above.
+            if n == 1 || unsafe { *errno_location() } == libc::EAGAIN {
+                // Woken (or awake: its pipe is full of earlier ones).
+                // SAFETY: as above.
+                unsafe { *errno_location() = saved };
+                return;
+            }
+            // The waiter cannot be woken: exit as upstream's handler would,
+            // without its log line and metrics.
+            // SAFETY: ends the process.
+            unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) };
+        }
+        // Another process's SIGSYS (kill), or the waiter not made: upstream's
+        // handler here, as without the waiter.
+        match SIGSYS_HANDLER.load(Ordering::Acquire) {
+            0 => {
+                // SAFETY: ends the process.
+                unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) }
+            }
+            handler => {
+                // SAFETY: a SigsysHandler stored by set_sigsys_handler.
+                let handler: SigsysHandler = unsafe { std::mem::transmute(handler) };
+                handler(num, info, ctx);
+            }
+        }
+    }
+
+    /// Blocks every signal in the calling thread: the waiter runs upstream's
+    /// handler as a handler runs, with its signals blocked
+    /// (`register_signal_handler`'s mask).
+    fn block_all_signals() {
+        // SAFETY: a full set, for this thread.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigfillset(&mut set);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+        }
+    }
+
+    /// Waits for good: a thread whose pipe broke (it cannot be, as its write
+    /// end is never closed) neither runs the handler nor exits.
+    fn park_forever() -> ! {
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// Reads one byte, again if interrupted.
+    fn read_byte(fd: libc::c_int) -> isize {
+        let mut byte = 0u8;
+        loop {
+            // SAFETY: one byte into the stack.
+            let n = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+            // SAFETY: errno of this thread.
+            if n >= 0 || unsafe { *errno_location() } != libc::EINTR {
+                return n;
+            }
+        }
+    }
+
+    /// `fcntl` command: a write to a pipe with no reader fails with EPIPE
+    /// without raising SIGPIPE (<sys/fcntl.h>).
+    const F_SETNOSIGPIPE: libc::c_int = 73;
+
+    /// A pipe, both ends close-on-exec, the write end non-blocking.
+    fn waiter_pipe() -> std::io::Result<(libc::c_int, libc::c_int)> {
+        let mut fds = [0; 2];
+        // SAFETY: two descriptors into the array; fcntl on them.
+        unsafe {
+            if libc::pipe(fds.as_mut_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for fd in fds {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fds[1], F_SETNOSIGPIPE, 1);
+        }
+        Ok((fds[0], fds[1]))
+    }
+
+    /// Makes the waiter and its deadline, if Firecracker registered a SIGSYS
+    /// handler and this process has none yet. Called before the sandbox,
+    /// which makes no threads (the API process's at once, Firecracker's
+    /// after narrow()).
+    fn start_sigsys_waiter() -> Result<(), SandboxError> {
+        // SAFETY: no arguments.
+        let me = unsafe { libc::getpid() };
+        if SIGSYS_HANDLER.load(Ordering::Acquire) == 0 || WAITER_PID.load(Ordering::Acquire) == me {
+            return Ok(());
+        }
+        let fail = |err: std::io::Error| SandboxError::Install(format!("the SIGSYS waiter: {err}"));
+        let (wake_r, wake_w) = waiter_pipe().map_err(fail)?;
+        let (start_r, start_w) = waiter_pipe().map_err(fail)?;
+        // SAFETY: no arguments.
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return Err(fail(std::io::Error::last_os_error()));
+        }
+        std::thread::Builder::new()
+            .name("fc_sigsys_deadline".into())
+            .spawn(move || {
+                block_all_signals();
+                if read_byte(start_r) != 1 {
+                    park_forever();
+                }
+                let end = std::time::Instant::now() + SIGSYS_DEADLINE;
+                loop {
+                    let left = end.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    let timeout = libc::timespec {
+                        tv_sec: left.as_secs().try_into().unwrap_or(libc::time_t::MAX),
+                        tv_nsec: left.subsec_nanos().into(),
+                    };
+                    // SAFETY: a zeroed event; an empty kqueue, so kevent
+                    // waits for the timeout.
+                    unsafe {
+                        let mut event: libc::kevent = std::mem::zeroed();
+                        libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &timeout);
+                    }
+                }
+                // SAFETY: ends the process, without the handler's work.
+                unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) };
+            })
+            .map_err(fail)?;
+        std::thread::Builder::new()
+            .name("fc_sigsys".into())
+            .spawn(move || {
+                block_all_signals();
+                if read_byte(wake_r) != 1 {
+                    park_forever();
+                }
+                let byte = 1u8;
+                // SAFETY: one byte from the stack: the deadline starts.
+                unsafe { libc::write(start_w, (&raw const byte).cast(), 1) };
+                // SAFETY: a zeroed siginfo with the signal's fields.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                info.si_signo = libc::SIGSYS;
+                info.si_pid = SIGSYS_PID.load(Ordering::Acquire);
+                info.si_code = SIGSYS_CODE.load(Ordering::Relaxed);
+                // SAFETY: stored by set_sigsys_handler (checked above).
+                let handler: SigsysHandler =
+                    unsafe { std::mem::transmute(SIGSYS_HANDLER.load(Ordering::Acquire)) };
+                handler(libc::SIGSYS, &mut info, std::ptr::null_mut());
+                // Upstream's handler exits; if it returns, so does this.
+                // SAFETY: ends the process.
+                unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) };
+            })
+            .map_err(fail)?;
+        WAITER_PID.store(me, Ordering::Release);
+        WAITER_PIPE.store(wake_w, Ordering::Release);
+        Ok(())
+    }
+
+    /// Installs `compiled`, marked installed first: from its first denial on,
+    /// a SIGSYS is the sandbox's ([`forward_sigsys`], [`denied_syscall`]).
+    fn install_and_mark(compiled: &Compiled) -> Result<(), SandboxError> {
+        INSTALLED.store(true, Ordering::Release);
+        install_compiled(compiled).inspect_err(|_| INSTALLED.store(false, Ordering::Release))
+    }
+
     unsafe extern "C" {
         // libsystem_sandbox (part of libSystem).
         fn sandbox_free_error(errorbuf: *mut c_char);
@@ -1162,9 +1425,9 @@ mod macos {
         // Issued before the sandbox, which denies issuing; an extension
         // taken before the sandbox is installed would not attach to it.
         let narrowed = Token::issue(NARROWED)?;
-        install_compiled(&compiled_profile()?)?;
+        start_sigsys_waiter()?;
+        install_and_mark(&compiled_profile()?)?;
         state.installed = true;
-        INSTALLED.store(true, Ordering::Relaxed);
         state.narrowed = Some(narrowed);
         Ok(())
     }
@@ -1885,6 +2148,445 @@ mod macos {
             // SAFETY: no arguments.
             unsafe { libc::getppid() };
             std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        /// How a SIGSYS case ended: its status (None: it hung, and was
+        /// killed), its output and error output, and how long after the
+        /// denied call.
+        struct SigsysRun {
+            status: Option<std::process::ExitStatus>,
+            stdout: String,
+            stderr: String,
+            after: std::time::Duration,
+        }
+
+        impl SigsysRun {
+            fn text(&self) -> String {
+                format!(
+                    "{:?} {:?} after the denied call\n--- stdout (last 2000 bytes)\n{}\n--- stderr\n{}",
+                    self.status,
+                    self.after,
+                    &self.stdout[self.stdout.len().saturating_sub(2000)..],
+                    self.stderr
+                )
+            }
+
+            fn code(&self) -> Option<i32> {
+                self.status.and_then(|s| s.code())
+            }
+        }
+
+        /// Runs `sigsys_lock_child` with `case`. Its standard output (where
+        /// it logs and writes metrics) is left unread until `drain` after
+        /// the denied call (never if None); the case must end within
+        /// `within` of it, or it is killed as hung.
+        fn sigsys_run(
+            case: &str,
+            drain: Option<std::time::Duration>,
+            within: std::time::Duration,
+        ) -> SigsysRun {
+            use std::io::{BufRead, Read};
+            use std::os::unix::process::CommandExt;
+            use std::process::Stdio;
+            use std::time::{Duration, Instant};
+            // A process group of its own: a hung case is killed with its
+            // fork (which, stuck in a handler, blocks every signal but
+            // SIGKILL).
+            let mut proc = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ext::sandbox::macos::tests::sigsys_lock_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("WICK_TEST_CASE", case)
+                .process_group(0)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (denied_tx, denied_rx) = std::sync::mpsc::channel();
+            let stderr = proc.stderr.take().unwrap();
+            let errors = std::thread::spawn(move || {
+                let mut all = String::new();
+                for line in std::io::BufReader::new(stderr).lines() {
+                    let line = line.unwrap_or_default();
+                    if line.contains("DENYING") {
+                        let _ = denied_tx.send(Instant::now());
+                    }
+                    all.push_str(&line);
+                    all.push('\n');
+                }
+                all
+            });
+            let (drain_tx, drain_rx) = std::sync::mpsc::channel::<()>();
+            let mut stdout = proc.stdout.take().unwrap();
+            let output = std::thread::spawn(move || {
+                // Unread until told, or until the case ended.
+                let _ = drain_rx.recv();
+                let mut all = Vec::new();
+                let _ = stdout.read_to_end(&mut all);
+                String::from_utf8_lossy(&all).into_owned()
+            });
+            let denied = denied_rx.recv_timeout(Duration::from_secs(60));
+            let start = denied.unwrap_or_else(|_| Instant::now());
+            let mut drain_tx = Some(drain_tx);
+            let status = loop {
+                if let Some(status) = proc.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if drain.is_some_and(|d| start.elapsed() >= d) {
+                    drain_tx.take();
+                }
+                if start.elapsed() > within {
+                    // SAFETY: the case's own process group.
+                    unsafe { libc::killpg(proc.id() as libc::pid_t, libc::SIGKILL) };
+                    let _ = proc.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let after = start.elapsed();
+            drop(drain_tx);
+            // The fork may outlive the case (ended by its deadline thread
+            // only after the case's process): end it too.
+            // SAFETY: as above.
+            unsafe { libc::killpg(proc.id() as libc::pid_t, libc::SIGKILL) };
+            let run = SigsysRun {
+                status,
+                stdout: output.join().unwrap(),
+                stderr: errors.join().unwrap(),
+                after,
+            };
+            assert!(denied.is_ok(), "the case did not reach its denied call: {}", run.text());
+            run
+        }
+
+        /// The metrics upstream's handler writes: the seccomp fault stored.
+        const FAULT_METRIC: &str = "\"seccomp\":{\"num_faults\":1}";
+
+        // A SIGSYS from the sandbox comes to whichever thread the kernel
+        // picks, not to the thread that made the call (as seccomp's does);
+        // here to the thread that holds the metrics lock, blocked writing
+        // metrics to a pipe nobody reads yet. Upstream's handler work
+        // (metric, log line, metrics, exit 148) must not wait on that
+        // thread: once the pipe is read, the process exits 148 and the
+        // metrics written last have the fault. A second denied call while
+        // the first is handled changes nothing.
+        #[test]
+        fn test_sigsys_does_not_wait_on_the_metrics_lock() {
+            use std::time::Duration;
+            let run = sigsys_run("metrics", Some(Duration::from_millis(500)), Duration::from_secs(20));
+            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
+            assert!(run.stdout.contains(FAULT_METRIC), "{}", run.text());
+            assert!(!run.stdout.contains("CHILD-SURVIVED"), "{}", run.text());
+        }
+
+        // The same with the logger's lock held (as upstream's update() does
+        // while configuring the logger): the log line comes once it is
+        // released, then exit 148.
+        #[test]
+        fn test_sigsys_does_not_wait_on_the_logger_lock() {
+            use std::time::Duration;
+            let run = sigsys_run("logger", Some(Duration::ZERO), Duration::from_secs(20));
+            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
+            assert!(
+                run.stdout.contains("Shutting down VM after the host sandbox denied a system call."),
+                "{}",
+                run.text()
+            );
+            assert!(run.stdout.contains(FAULT_METRIC), "{}", run.text());
+        }
+
+        // A thread's panic (upstream's hook writes metrics, then aborts)
+        // while a SIGSYS is handled, with the metrics lock held as above:
+        // the process ends, by the sandbox's exit code or the abort,
+        // whichever comes first (as on Linux, where both run at once), and
+        // does not hang.
+        #[test]
+        fn test_sigsys_during_a_panic_ends_the_process() {
+            use std::os::unix::process::ExitStatusExt;
+            use std::time::Duration;
+            let run = sigsys_run("panic", Some(Duration::from_millis(500)), Duration::from_secs(20));
+            let status = run.status.unwrap_or_else(|| panic!("hung: {}", run.text()));
+            assert!(
+                status.code() == Some(crate::FcExitCode::BadSyscall as i32)
+                    || status.signal() == Some(libc::SIGABRT),
+                "{}",
+                run.text()
+            );
+        }
+
+        // If upstream's handler work cannot finish (the thread that holds
+        // the metrics lock is blocked writing to a pipe nobody reads, and
+        // the handler's own metrics would wait behind it), the process exits
+        // 148 by SIGSYS_DEADLINE, without that work: the log line and
+        // metrics nobody was reading. On Linux the handler waits as long
+        // as the write blocks.
+        #[test]
+        fn test_sigsys_exits_by_its_deadline() {
+            use std::time::Duration;
+            let run = sigsys_run("undrained", None, SIGSYS_DEADLINE + Duration::from_secs(20));
+            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
+            assert!(run.after >= SIGSYS_DEADLINE, "{}", run.text());
+            assert!(!run.stdout.contains(FAULT_METRIC), "{}", run.text());
+        }
+
+        // If the waiter cannot be woken (its pipe broken), the signal's
+        // handler exits 148 at once, without upstream's handler work.
+        #[test]
+        fn test_sigsys_without_its_waiter_exits_at_once() {
+            use std::time::Duration;
+            let run = sigsys_run("brokenpipe", Some(Duration::ZERO), Duration::from_secs(20));
+            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
+            assert!(!run.stdout.contains(FAULT_METRIC), "{}", run.text());
+            assert!(run.after < SIGSYS_DEADLINE, "{}", run.text());
+        }
+
+        // With nothing in its way, upstream's handler work (on the waiter)
+        // and the exit take a small part of SIGSYS_DEADLINE, which is ten
+        // times the longest measured: 20 runs, each from the denied call to
+        // the exit (the test's stderr says how long, and how long the
+        // denying thread ran on after its call returned).
+        #[test]
+        fn test_sigsys_handler_work_is_far_within_its_deadline() {
+            use std::time::Duration;
+            let mut after = Vec::new();
+            let mut run_on = Vec::new();
+            for _ in 0..20 {
+                let run = sigsys_run("free", Some(Duration::ZERO), Duration::from_secs(20));
+                assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
+                assert!(run.stdout.contains(FAULT_METRIC), "{}", run.text());
+                let ns: u64 = run
+                    .stdout
+                    .split("RUN-ON-NS ")
+                    .nth(1)
+                    .and_then(|r| r.split_whitespace().next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| panic!("{}", run.text()));
+                after.push(run.after);
+                run_on.push(Duration::from_nanos(ns));
+            }
+            after.sort();
+            run_on.sort();
+            eprintln!(
+                "denied call to exit: median {:?}, longest {:?}; the denying thread ran on: median {:?}, longest {:?}",
+                after[10], after[19], run_on[10], run_on[19]
+            );
+            assert!(after[19] * 10 <= SIGSYS_DEADLINE, "{after:?}");
+        }
+
+        /// A system call number the kernel has no entry for (macOS has
+        /// `SYS_MAXSYSCALL` 558): xnu's `unix_syscall` runs `nosys` for it
+        /// (bsd/dev/arm/systemcalls.c), which fails with ENOSYS and signals
+        /// the calling thread (bsd/kern/subr_xxx.c, `psignal_uthread`).
+        const UNKNOWN_SYSCALL: u16 = 1000;
+
+        // With the sandbox, a call the kernel has no number for raises
+        // SIGSYS on the calling thread itself (the kernel's, not the
+        // sandbox's: Seatbelt lets it through), and Firecracker exits as for
+        // any denied call, as upstream's filters trap a number they do not
+        // list.
+        #[test]
+        fn test_an_unknown_syscall_number_exits_as_a_denied_one() {
+            let out = child("unknown_syscall_child", &[("WICK_TEST_POLICY", "default")]);
+            assert_eq!(out.status.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", text(&out));
+        }
+
+        // Without the sandbox (--no-seccomp) the same call fails with ENOSYS
+        // and Firecracker runs on, as on Linux with no seccomp filter.
+        #[test]
+        fn test_an_unknown_syscall_number_without_the_sandbox_fails_with_enosys() {
+            let out = child("unknown_syscall_child", &[("WICK_TEST_POLICY", "none")]);
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(String::from_utf8_lossy(&out.stdout).contains("ENOSYS-AND-ALIVE"), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by the test_an_unknown_syscall_number_* tests in a separate process"]
+        fn unknown_syscall_child() {
+            crate::signal_handler::register_signal_handlers().unwrap();
+            let none = std::env::var("WICK_TEST_POLICY").unwrap() == "none";
+            select(if none { Policy::None } else { Policy::Default });
+            apply().unwrap();
+            let (r0, _, failed) = std::thread::spawn(|| {
+                // SAFETY: a number the kernel has no call for; it reads none
+                // of its arguments.
+                unsafe { svc(UNKNOWN_SYSCALL, [0; 8]) }
+            })
+            .join()
+            .unwrap();
+            assert!(failed && r0 == libc::ENOSYS as usize, "{r0} {failed}");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            println!("ENOSYS-AND-ALIVE");
+        }
+
+        /// Runs `body` in a fork of this process and ends as the fork ends:
+        /// the fork's only thread, which `body` runs on, is then the
+        /// process's first, the one the kernel gives a process's signal to
+        /// if it does not block it (xnu `get_signalthread`).
+        fn in_fork(body: impl FnOnce()) -> ! {
+            // SAFETY: the fork runs `body` and ends; this process waits.
+            match unsafe { libc::fork() } {
+                -1 => panic!("fork: {}", std::io::Error::last_os_error()),
+                0 => {
+                    body();
+                    // SAFETY: ends the fork.
+                    unsafe { libc::_exit(0) }
+                }
+                pid => {
+                    let mut status = 0;
+                    // SAFETY: the fork's pid; ends this process as the fork
+                    // ended (by its code, or its signal's default action).
+                    unsafe {
+                        libc::waitpid(pid, &mut status, 0);
+                        let page = RUN_ON.load(Ordering::Acquire);
+                        if !page.is_null() && (*page).load(Ordering::Acquire) != 0 {
+                            let ran = (*page.add(1)).load(Ordering::Acquire);
+                            println!("RUN-ON-NS {}", ran.saturating_sub((*page).load(Ordering::Acquire)));
+                        }
+                        if libc::WIFEXITED(status) {
+                            libc::_exit(libc::WEXITSTATUS(status));
+                        }
+                        libc::signal(libc::WTERMSIG(status), libc::SIG_DFL);
+                        libc::raise(libc::WTERMSIG(status));
+                        libc::_exit(1)
+                    }
+                }
+            }
+        }
+
+        /// Blocks SIGSYS in the calling thread.
+        fn block_sigsys() {
+            // SAFETY: a set of one signal, for this thread.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGSYS);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            }
+        }
+
+        /// Writes to standard output until it is full (nobody reads it yet).
+        fn fill_stdout() {
+            // SAFETY: standard output's flags, set back after.
+            unsafe {
+                let flags = libc::fcntl(1, libc::F_GETFL);
+                libc::fcntl(1, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                let chunk = [b'.'; 4096];
+                while libc::write(1, chunk.as_ptr().cast(), chunk.len()) > 0 {}
+                libc::fcntl(1, libc::F_SETFL, flags);
+            }
+        }
+
+        /// A page the fork and this process share: when the denied call
+        /// returned, and the last time the denying thread ran after it
+        /// (nanoseconds of CLOCK_MONOTONIC_RAW).
+        static RUN_ON: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicU64> =
+            std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+        fn now_ns() -> u64 {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: plain call; the clock is the same in every process.
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
+            u64::try_from(ts.tv_sec).unwrap() * 1_000_000_000 + u64::try_from(ts.tv_nsec).unwrap()
+        }
+
+        #[test]
+        #[ignore = "run by the test_sigsys_* tests in a separate process"]
+        fn sigsys_lock_child() {
+            let case = std::env::var("WICK_TEST_CASE").unwrap();
+            // SAFETY: an anonymous shared page, kept for the process.
+            let page = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(page, libc::MAP_FAILED);
+            RUN_ON.store(page.cast(), Ordering::Release);
+            in_fork(move || sigsys_case(&case));
+        }
+
+        fn sigsys_case(case: &str) {
+            use std::os::fd::FromRawFd;
+            use std::time::Duration;
+
+            use crate::logger::{LOGGER, METRICS, StoreMetric};
+            crate::signal_handler::register_signal_handlers().unwrap();
+            let _ = LOGGER.init();
+            // Logs (with no target) and metrics go to standard output.
+            // SAFETY: a new descriptor of standard output, owned here.
+            let out = unsafe { std::fs::File::from_raw_fd(libc::dup(1)) };
+            METRICS.init(std::io::LineWriter::new(out)).unwrap();
+            if case == "panic" {
+                // Upstream's hook (firecracker/src/main.rs), with the abort
+                // of its panic = "abort".
+                std::panic::set_hook(Box::new(|info| {
+                    crate::logger::error_unrestricted!("Firecracker {}", info);
+                    METRICS.vmm.panic_count.store(1);
+                    let _ = METRICS.write();
+                    std::process::abort();
+                }));
+            }
+            select(Policy::Default);
+            apply().unwrap();
+            if case == "brokenpipe" {
+                // The waiter's pipe, with no reader: the signal's handler
+                // cannot wake it.
+                let (r, w) = waiter_pipe().unwrap();
+                // SAFETY: the read end, made just above.
+                unsafe { libc::close(r) };
+                WAITER_PIPE.store(w, Ordering::Release);
+            }
+            let panics = case == "panic";
+            let free = case == "free";
+            // The offender blocks SIGSYS for itself: the sandbox's signal
+            // then goes to the first thread, which holds the lock.
+            let offender = std::thread::spawn(move || {
+                block_sigsys();
+                std::thread::sleep(Duration::from_millis(200));
+                eprintln!("DENYING");
+                // SAFETY: no arguments; denied, which raises SIGSYS.
+                unsafe { libc::getppid() };
+                if free {
+                    // How long this thread runs on, until the exit.
+                    let page = RUN_ON.load(Ordering::Acquire);
+                    // SAFETY: the shared page sigsys_lock_child mapped.
+                    unsafe {
+                        (*page).store(now_ns(), Ordering::Release);
+                        loop {
+                            (*page.add(1)).store(now_ns(), Ordering::Release);
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                // SAFETY: as above: a second one while the first is handled.
+                unsafe { libc::getppid() };
+                if panics {
+                    panic!("a thread's panic while a SIGSYS is handled");
+                }
+            });
+            match case {
+                "free" | "brokenpipe" => {}
+                "metrics" | "undrained" | "panic" => {
+                    fill_stdout();
+                    let _ = METRICS.write();
+                }
+                "logger" => {
+                    let guard = LOGGER.0.write().unwrap();
+                    std::thread::sleep(Duration::from_secs(1));
+                    drop(guard);
+                }
+                other => panic!("{other}"),
+            }
+            let _ = offender.join();
+            std::thread::sleep(Duration::from_secs(5));
             println!("CHILD-SURVIVED");
         }
 

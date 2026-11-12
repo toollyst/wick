@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 23:12:44 +0900
+Subject: [PATCH] macos: SIGSYS's handler runs on a thread of its own
+
+The host sandbox signals the process, not the thread that made the denied
+call, so the signal can come to a thread that holds the lock upstream's
+handler takes to log or write metrics. On macOS the handler is registered
+through vmm::ext::sandbox::set_sigsys_handler, which runs it on a thread
+made before the sandbox.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vmm/src/signal_handler.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/vmm/src/signal_handler.rs b/src/vmm/src/signal_handler.rs
+index 5100dd301d9fda408988edc7613810fd5ce1957d..b123031161ac5137b9bbeb6408d18df78cd9e9c2 100644
+--- a/src/vmm/src/signal_handler.rs
++++ b/src/vmm/src/signal_handler.rs
+@@ -167,6 +167,12 @@ pub fn register_signal_handlers() -> vmm_sys_util::errno::Result<()> {
+     // register a signal handler which will be called in the current thread and will interrupt
+     // whatever work is done on the current thread, so we have to keep in mind that the registered
+     // signal handler must only do async-signal-safe operations.
++    // wick: on macOS the host sandbox signals the process, not the thread that made the
++    // denied call, so the handler runs on a thread of its own and never waits on a lock
++    // the interrupted thread holds (vmm::ext::sandbox::set_sigsys_handler).
++    #[cfg(target_os = "macos")]
++    crate::ext::sandbox::set_sigsys_handler(sigsys_handler)?;
++    #[cfg(not(target_os = "macos"))]
+     register_signal_handler(SIGSYS, sigsys_handler)?;
+     register_signal_handler(SIGBUS, sigbus_handler)?;
+     register_signal_handler(SIGSEGV, sigsegv_handler)?;
