@@ -41,7 +41,11 @@ def stage_cgroup_devices(ctx, jt):
         # macOS refuses while parsing the options: no jail directory (Linux,
         # for v1, has made <id>/root and copied the binary into it by then).
         check(not os.path.exists(jail_dir), f"{extra}: {jail_dir} was made")
-        running = subprocess.run(["pgrep", "-f", f"--id {vm_id} "], capture_output=True, text=True).stdout.split()
+        # pgrep: 0 with matches, 1 without; anything else (a usage error) is
+        # no answer.
+        pg = subprocess.run(["pgrep", "-f", "--", f"--id {vm_id} "], capture_output=True, text=True)
+        check(pg.returncode in (0, 1) and not pg.stderr, f"pgrep: {pg.returncode} {pg.stderr!r}")
+        running = pg.stdout.split()
         check(not running, f"{extra}: processes of the jail: {running}")
     return f"{len(cases)} devices options refused, exit 1, no jail made"
 
@@ -115,6 +119,7 @@ class Freeze:
         os.chmod(build, 0o755)
         self.spinner = self.cc(build, "spinner", SPINNER_C, [f"-DUID={jt.UID}", f"-DGID={jt.GID}"])
         self.resumer = self.cc(build, "pid-resume", PID_RESUME_C, [])
+        self.last = None
 
     @staticmethod
     def cc(build, name, src, flags):
@@ -135,6 +140,7 @@ class Freeze:
         cmd += ["--", os.path.join(jd, "root", "started")]
         with open(os.path.join(self.ctx.out, f"{vm_id}.log"), "w") as f:
             p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
+        self.last = (p, jd)
         return p, jd
 
     def wait(self, what, cond, timeout=10):
@@ -234,125 +240,186 @@ def api_answers(sock, timeout=1.5):
         s.close()
 
 
+def diagnose(fz, name, jd, p):
+    """What a jail that did not start shows: its files, its processes (with
+    their stacks: the stage runs as root) and the jailer's output, so that one
+    run names the stuck process and where it is."""
+    print(f"   -- {name}: diagnosis", flush=True)
+    print(f"      jailer {p.pid}: {'running' if p.poll() is None else f'exit {p.returncode}'}", flush=True)
+    files = sorted(os.path.relpath(os.path.join(d, f), jd) for d, ds, fs in os.walk(jd) for f in ds + fs) \
+        if os.path.isdir(jd) else None
+    print(f"      in the jail's directory: {files}", flush=True)
+    for f in ("freezer.state", "cgroup.freeze", "cgroup.events", "root/spinner.pid"):
+        path = os.path.join(jd, f)
+        if os.path.exists(path):
+            with open(path) as fh:
+                print(f"      {f}: {fh.read()!r}", flush=True)
+    if os.path.isdir(jd):
+        print(f"      the directory's lock held: {fz.maintained(jd)}", flush=True)
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,sess=,uid=,stat=,time=,command="],
+                         capture_output=True, text=True).stdout
+    procs = []
+    for line in out.splitlines():
+        f = line.split(None, 7)
+        if len(f) == 8 and (f" --id {name} " in f" {f[7]} " or f"/{name}/" in f[7]):
+            procs.append(int(f[0]))
+            print(f"      ps: {line.strip()[:300]}", flush=True)
+    if not procs:
+        print("      ps: no process of the jail", flush=True)
+    for pid in procs:
+        kids = fz.kids(pid)
+        if kids:
+            print(f"      children of {pid}: {kids}", flush=True)
+        report = os.path.join(fz.ctx.out, f"{name}-{pid}.sample")
+        subprocess.run(["/usr/bin/sample", str(pid), "1", "-file", report], capture_output=True, timeout=30)
+        if os.path.exists(report):
+            with open(report) as fh:
+                text = fh.read()
+            graph = text[text.find("Call graph:"):].split("\n\n")[0].splitlines()[1:40]
+            print(f"      stack of {pid}:", *[g[:160] for g in graph], sep="\n        ", flush=True)
+    log = os.path.join(fz.ctx.out, f"{name}.log")
+    if os.path.exists(log):
+        with open(log) as fh:
+            print(f"      jailer output: {fh.read()[-1500:]!r}", flush=True)
+
+
 def stage_freeze(ctx, jt):
-    """The freezer: upstream's cgroup files next to the jail, kept by a supervisor per jail."""
+    """The freezer: upstream's cgroup files next to the jail, kept by a supervisor per jail.
+
+    Its cases do not depend on each other: each runs, a failed one is
+    diagnosed and its processes ended, and the stage reports every case."""
     fz = Freeze(ctx, jt)
     check = jt.check
     os_version = subprocess.run(["sw_vers", "-productVersion"], capture_output=True, text=True).stdout.strip()
     print(f"   macOS {os_version}", flush=True)
+    facts = {}
 
-    # v1, upstream's default: freezer.state.
-    p, jd = fz.start("fz-v1")
-    fz.wait("the spinner runs", lambda: fz.started(jd) and fz.has_pid(jd))
-    pid = fz.pid(jd)
-    check(pid == p.pid, f"pid file {pid}, jailer {p.pid}: the exec keeps the jailer's pid")
-    fz.wait("the API stand-in", lambda: len(fz.kids(pid)) == 1)
-    kid = fz.kids(pid)[0]
-    st = os.stat(os.path.join(jd, "freezer.state"))
-    check((st.st_uid, st.st_mode & 0o777) == (0, 0o644), f"freezer.state {st.st_uid} {oct(st.st_mode)}")
-    check(fz.read(jd, "freezer.state") == "THAWED\n", "freezer.state at the start")
-    check(not os.path.exists(os.path.join(jd, "cgroup.events")), "a v1 jail has no cgroup.events")
-    sup = fz.supervisor("fz-v1")
-    print(f"   supervisor {sup}", flush=True)
-    check(sup["pgid"] == sup["pid"] and sup["tty"] in ("??", "-"), f"the supervisor's session {sup}")
-    check(fz.maintained(jd), "the supervisor holds the jail directory's lock")
-    fz.running([pid, kid], "thawed")
-    fz.write(jd, "freezer.state", "FROZEN\n")
-    time.sleep(0.3)
-    fz.frozen([pid, kid], "FROZEN")
-    check(fz.read(jd, "freezer.state") == "FROZEN\n", "freezer.state reads FROZEN")
-    stat = subprocess.run(["ps", "-o", "stat=", "-p", f"{pid},{kid}"], capture_output=True, text=True).stdout.split()
-    print(f"   ps state while frozen: {stat}", flush=True)
-    # The same value again changes nothing.
-    fz.write(jd, "freezer.state", "FROZEN\n")
-    time.sleep(0.3)
-    fz.frozen([pid, kid], "FROZEN twice")
-    # The jail's uid cannot thaw it.
-    got = fz.as_jail_uid(jd, "freezer.state", pid)
-    print(f"   as the jail's uid: {got}", flush=True)
-    check(f"write {errno.EACCES}" in got and "sigcont ok" in got and f"pid_resume -1 {errno.EPERM}" in got,
-          f"as the jail's uid: {got}")
-    fz.frozen([pid, kid], "after the jail's uid tried")
-    # An invalid value: ignored, the file restored to the state.
-    fz.write(jd, "freezer.state", "FREEZING\n")
-    time.sleep(0.6)
-    check(fz.read(jd, "freezer.state") == "FROZEN\n", f"invalid value kept: {fz.read(jd, 'freezer.state')!r}")
-    fz.frozen([pid, kid], "after an invalid value")
-    # SIGTERM to the supervisor is ignored: it still thaws.
-    os.kill(sup["pid"], signal.SIGTERM)
-    time.sleep(0.3)
-    check(jt.alive(sup["pid"]), "the supervisor ended on SIGTERM")
-    fz.write(jd, "freezer.state", "THAWED\n")
-    time.sleep(0.3)
-    fz.running([pid, kid], "THAWED")
-    # SIGKILL ends a frozen jail; the API stand-in ends with it (resumed by
-    # the supervisor), and the supervisor with the jail.
-    fz.write(jd, "freezer.state", "FROZEN\n")
-    time.sleep(0.3)
-    fz.frozen([pid, kid], "FROZEN again")
-    os.kill(pid, signal.SIGKILL)
-    fz.wait("the frozen jail ends on SIGKILL", lambda: p.poll() is not None)
-    check(p.returncode == -signal.SIGKILL, f"exit {p.returncode}")
-    fz.wait("the API stand-in ends", lambda: fz.gone(kid))
-    fz.wait("the supervisor ends with the jail", lambda: fz.gone(sup["pid"]))
-    check(not fz.maintained(jd), "the lock is released")
+    def case_v1():
+        # v1, upstream's default: freezer.state.
+        p, jd = fz.start("fz-v1")
+        fz.wait("the spinner runs", lambda: fz.started(jd) and fz.has_pid(jd))
+        pid = fz.pid(jd)
+        check(pid == p.pid, f"pid file {pid}, jailer {p.pid}: the exec keeps the jailer's pid")
+        fz.wait("the API stand-in", lambda: len(fz.kids(pid)) == 1)
+        kid = fz.kids(pid)[0]
+        st = os.stat(os.path.join(jd, "freezer.state"))
+        check((st.st_uid, st.st_mode & 0o777) == (0, 0o644), f"freezer.state {st.st_uid} {oct(st.st_mode)}")
+        check(fz.read(jd, "freezer.state") == "THAWED\n", "freezer.state at the start")
+        check(not os.path.exists(os.path.join(jd, "cgroup.events")), "a v1 jail has no cgroup.events")
+        sup = fz.supervisor("fz-v1")
+        print(f"   supervisor {sup}", flush=True)
+        check(sup["pgid"] == sup["pid"] and sup["tty"] in ("??", "-"), f"the supervisor's session {sup}")
+        check(fz.maintained(jd), "the supervisor holds the jail directory's lock")
+        fz.running([pid, kid], "thawed")
+        fz.write(jd, "freezer.state", "FROZEN\n")
+        time.sleep(0.3)
+        fz.frozen([pid, kid], "FROZEN")
+        check(fz.read(jd, "freezer.state") == "FROZEN\n", "freezer.state reads FROZEN")
+        stat = subprocess.run(["ps", "-o", "stat=", "-p", f"{pid},{kid}"], capture_output=True, text=True).stdout.split()
+        print(f"   ps state while frozen: {stat}", flush=True)
+        # The same value again changes nothing.
+        fz.write(jd, "freezer.state", "FROZEN\n")
+        time.sleep(0.3)
+        fz.frozen([pid, kid], "FROZEN twice")
+        # The jail's uid cannot thaw it.
+        got = fz.as_jail_uid(jd, "freezer.state", pid)
+        print(f"   as the jail's uid: {got}", flush=True)
+        check(f"write {errno.EACCES}" in got and "sigcont ok" in got and f"pid_resume -1 {errno.EPERM}" in got,
+              f"as the jail's uid: {got}")
+        fz.frozen([pid, kid], "after the jail's uid tried")
+        # An invalid value: ignored, the file restored to the state.
+        fz.write(jd, "freezer.state", "FREEZING\n")
+        time.sleep(0.6)
+        check(fz.read(jd, "freezer.state") == "FROZEN\n", f"invalid value kept: {fz.read(jd, 'freezer.state')!r}")
+        fz.frozen([pid, kid], "after an invalid value")
+        # SIGTERM to the supervisor is ignored: it still thaws.
+        os.kill(sup["pid"], signal.SIGTERM)
+        time.sleep(0.3)
+        check(jt.alive(sup["pid"]), "the supervisor ended on SIGTERM")
+        fz.write(jd, "freezer.state", "THAWED\n")
+        time.sleep(0.3)
+        fz.running([pid, kid], "THAWED")
+        # SIGKILL ends a frozen jail; the API stand-in ends with it (resumed by
+        # the supervisor), and the supervisor with the jail.
+        fz.write(jd, "freezer.state", "FROZEN\n")
+        time.sleep(0.3)
+        fz.frozen([pid, kid], "FROZEN again")
+        os.kill(pid, signal.SIGKILL)
+        fz.wait("the frozen jail ends on SIGKILL", lambda: p.poll() is not None)
+        check(p.returncode == -signal.SIGKILL, f"exit {p.returncode}")
+        fz.wait("the API stand-in ends", lambda: fz.gone(kid))
+        fz.wait("the supervisor ends with the jail", lambda: fz.gone(sup["pid"]))
+        check(not fz.maintained(jd), "the lock is released")
 
-    # v2: cgroup.freeze and cgroup.events.
-    p, jd = fz.start("fz-v2", ["--cgroup-version", "2"])
-    fz.wait("the spinner runs", lambda: fz.has_pid(jd))
-    pid = fz.pid(jd)
-    fz.wait("the API stand-in", lambda: len(fz.kids(pid)) == 1)
-    kid = fz.kids(pid)[0]
-    check(fz.read(jd, "cgroup.freeze") == "0\n", "cgroup.freeze at the start")
-    check(fz.read(jd, "cgroup.events") == "populated 1\nfrozen 0\n", "cgroup.events at the start")
-    fz.write(jd, "cgroup.freeze", "1\n")
-    fz.wait("frozen 1", lambda: fz.read(jd, "cgroup.events") == "populated 1\nfrozen 1\n", 3)
-    fz.frozen([pid, kid], "cgroup.freeze 1")
-    fz.write(jd, "cgroup.freeze", "2\n")
-    time.sleep(0.6)
-    check(fz.read(jd, "cgroup.freeze") == "1\n", "invalid value restored")
-    check(fz.read(jd, "cgroup.events") == "populated 1\nfrozen 1\n", "still frozen")
-    # What a supervisor costs: every jail has one.
-    sup = fz.supervisor("fz-v2")
-    fz.write(jd, "cgroup.freeze", "0\n")
-    fz.wait("frozen 0", lambda: fz.read(jd, "cgroup.events") == "populated 1\nfrozen 0\n", 3)
-    fz.running([pid, kid], "cgroup.freeze 0")
-    sup_cpu = fz.cpu([sup["pid"]], 1.0)[0]
-    print(f"   supervisor: {sup['rss_kib']} KiB resident, {sup_cpu} s CPU over 1 s", flush=True)
-    # The supervisor killed (root only) while the jail is frozen: the jail is
-    # left frozen, the lock is gone, the file no longer acts, root can still
-    # kill the jail.
-    fz.write(jd, "cgroup.freeze", "1\n")
-    fz.wait("frozen 1", lambda: fz.read(jd, "cgroup.events") == "populated 1\nfrozen 1\n", 3)
-    os.kill(sup["pid"], signal.SIGKILL)
-    fz.wait("the supervisor ends", lambda: fz.gone(sup["pid"]))
-    check(not fz.maintained(jd), "a dead supervisor's lock is released")
-    fz.write(jd, "cgroup.freeze", "0\n")
-    time.sleep(0.5)
-    fz.frozen([pid, kid], "supervisor killed: the jail is left frozen")
-    os.kill(pid, signal.SIGKILL)
-    os.kill(kid, signal.SIGKILL)
-    fz.wait("the frozen jail ends on SIGKILL", lambda: p.poll() is not None and fz.gone(kid))
+    def case_v2():
+        # v2: cgroup.freeze and cgroup.events.
+        p, jd = fz.start("fz-v2", ["--cgroup-version", "2"])
+        fz.wait("the spinner runs", lambda: fz.has_pid(jd))
+        pid = fz.pid(jd)
+        fz.wait("the API stand-in", lambda: len(fz.kids(pid)) == 1)
+        kid = fz.kids(pid)[0]
+        check(fz.read(jd, "cgroup.freeze") == "0\n", "cgroup.freeze at the start")
+        check(fz.read(jd, "cgroup.events") == "populated 1\nfrozen 0\n", "cgroup.events at the start")
+        fz.write(jd, "cgroup.freeze", "1\n")
+        fz.wait("frozen 1", lambda: fz.read(jd, "cgroup.events") == "populated 1\nfrozen 1\n", 3)
+        fz.frozen([pid, kid], "cgroup.freeze 1")
+        fz.write(jd, "cgroup.freeze", "2\n")
+        time.sleep(0.6)
+        check(fz.read(jd, "cgroup.freeze") == "1\n", "invalid value restored")
+        check(fz.read(jd, "cgroup.events") == "populated 1\nfrozen 1\n", "still frozen")
+        # What a supervisor costs: every jail has one.
+        sup = fz.supervisor("fz-v2")
+        fz.write(jd, "cgroup.freeze", "0\n")
+        fz.wait("frozen 0", lambda: fz.read(jd, "cgroup.events") == "populated 1\nfrozen 0\n", 3)
+        fz.running([pid, kid], "cgroup.freeze 0")
+        sup_cpu = fz.cpu([sup["pid"]], 1.0)[0]
+        print(f"   supervisor: {sup['rss_kib']} KiB resident, {sup_cpu} s CPU over 1 s", flush=True)
+        facts["supervisor"] = f"the supervisor {sup['rss_kib']} KiB resident and {sup_cpu} s CPU per idle second"
+        # The supervisor killed (root only) while the jail is frozen: the jail is
+        # left frozen, the lock is gone, the file no longer acts, root can still
+        # kill the jail.
+        fz.write(jd, "cgroup.freeze", "1\n")
+        fz.wait("frozen 1", lambda: fz.read(jd, "cgroup.events") == "populated 1\nfrozen 1\n", 3)
+        os.kill(sup["pid"], signal.SIGKILL)
+        fz.wait("the supervisor ends", lambda: fz.gone(sup["pid"]))
+        check(not fz.maintained(jd), "a dead supervisor's lock is released")
+        fz.write(jd, "cgroup.freeze", "0\n")
+        time.sleep(0.5)
+        fz.frozen([pid, kid], "supervisor killed: the jail is left frozen")
+        os.kill(pid, signal.SIGKILL)
+        os.kill(kid, signal.SIGKILL)
+        fz.wait("the frozen jail ends on SIGKILL", lambda: p.poll() is not None and fz.gone(kid))
 
-    # At the start, as upstream's jailer: v2 cgroup.* is refused, v1
-    # freezer.state takes FROZEN or THAWED only.
-    for i, (extra, want) in enumerate([
-        (["--cgroup-version", "2", "--cgroup", "cgroup.freeze=1"], "Controller cgroup is unavailable"),
-        (["--cgroup-version", "2", "--cgroup", "cgroup.freeze=0"], "Controller cgroup is unavailable"),
-        (["--cgroup-version", "1", "--cgroup", "freezer.state=FREEZING"], "only FROZEN or THAWED"),
-    ]):
-        rc, out = jt.run_jailer(ctx, jt.jailer_base(ctx, f"fz-refuse{i}", fz.spinner) + extra + ["--", "/x"])
-        check(rc == 1 and want in out, f"{extra}: exit {rc}, {out!r}")
-    p, jd = fz.start("fz-thawed", ["--cgroup", "freezer.state=THAWED"])
-    fz.wait("THAWED at the start: it runs", lambda: fz.has_pid(jd) and fz.started(jd))
-    os.kill(fz.pid(jd), signal.SIGKILL)
-    p.wait(10)
+    def case_refused():
+        # At the start, as upstream's jailer: v2 cgroup.* is refused, v1
+        # freezer.state takes FROZEN or THAWED only.
+        for i, (extra, want) in enumerate([
+            (["--cgroup-version", "2", "--cgroup", "cgroup.freeze=1"], "Controller cgroup is unavailable"),
+            (["--cgroup-version", "2", "--cgroup", "cgroup.freeze=0"], "Controller cgroup is unavailable"),
+            (["--cgroup-version", "1", "--cgroup", "freezer.state=FREEZING"], "only FROZEN or THAWED"),
+        ]):
+            rc, out = jt.run_jailer(ctx, jt.jailer_base(ctx, f"fz-refuse{i}", fz.spinner) + extra + ["--", "/x"])
+            check(rc == 1 and want in out, f"{extra}: exit {rc}, {out!r}")
+
+    def runs(name, extra, **kw):
+        """A jail started with `extra` (and --daemonize or --new-pid-ns): the
+        spinner runs, with its pid file and its API stand-in."""
+        p, jd = fz.start(name, extra, **kw)
+        fz.wait(f"{name}: it runs", lambda: fz.has_pid(jd) and fz.started(jd))
+        pid = fz.pid(jd)
+        if kw:
+            p.wait(10)
+            check(p.returncode == 0, f"{name}: jailer exit {p.returncode}")
+        fz.wait(f"{name}: the API stand-in", lambda: len(fz.kids(pid)) == 1)
+        fz.running([pid], f"{name}: running")
+        os.kill(pid, signal.SIGKILL)
+        if not kw:
+            p.wait(10)
 
     # FROZEN at the start: the jailer stops at the cgroup step (no chroot, no
     # fork, no pid file) until THAWED; with --daemonize and --new-pid-ns too,
     # its command not returning meanwhile.
-    for name, kw in [("fz-start", {}), ("fz-start-daemon", {"daemonize": True}),
-                     ("fz-start-pidns", {"new_pid_ns": True})]:
+    def frozen_at_start(name, **kw):
         p, jd = fz.start(name, ["--cgroup", "freezer.state=FROZEN"], **kw)
         fz.wait(f"{name}: freezer.state", lambda: os.path.exists(os.path.join(jd, "freezer.state")))
         time.sleep(1.5)
@@ -364,7 +431,8 @@ def stage_freeze(ctx, jt):
         check(os.path.realpath(os.path.join(jd, "root")) not in roots, f"{name}: chrooted while frozen: {roots}")
         fz.frozen([p.pid], f"{name}: the jailer")
         fz.write(jd, "freezer.state", "THAWED\n")
-        fz.wait(f"{name}: it runs once thawed", lambda: fz.has_pid(jd) and fz.started(jd))
+        fz.wait(f"{name}: the pid file once thawed", lambda: fz.has_pid(jd))
+        fz.wait(f"{name}: Firecracker's stand-in runs once thawed", lambda: fz.started(jd))
         pid = fz.pid(jd)
         if kw:
             p.wait(10)
@@ -375,26 +443,69 @@ def stage_freeze(ctx, jt):
         if not kw:
             p.wait(10)
 
-    # Firecracker itself (no VM): frozen, its API does not answer; thawed, it does.
-    jail = jt.Jail(ctx, "fz-fc")
-    vm = jt.JailedVm(ctx, "fz-fc", jail)
-    jd = os.path.dirname(jail.root)
-    sock = jail.host("/run/firecracker.socket")
-    api = jt.api_process(vm)
-    check(api_answers(sock), "Firecracker's API before the freeze")
-    fz.write(jd, "freezer.state", "FROZEN\n")
-    time.sleep(0.3)
-    check(not api_answers(sock), "the API answered while frozen")
-    stat = subprocess.run(["ps", "-o", "pid=,stat=", "-p", f"{vm.proc.pid},{api}"],
-                          capture_output=True, text=True).stdout.split()
-    print(f"   Firecracker and its API process, frozen: {stat}", flush=True)
-    fz.write(jd, "freezer.state", "THAWED\n")
-    time.sleep(0.3)
-    check(api_answers(sock), "Firecracker's API after the thaw")
-    vm.kill()
-    return (f"macOS {os_version}: a jail and its child frozen (no CPU time) and thawed, the same value twice "
-            "a no-op, the jail's uid cannot thaw it, an invalid value restored, SIGTERM to the supervisor ignored, "
-            "SIGKILL ends a frozen jail; the supervisor "
-            f"{sup['rss_kib']} KiB resident and {sup_cpu} s CPU per idle second; killed, it leaves the jail frozen "
-            "and its lock released; v2 cgroup.freeze refused at the start; FROZEN at the start holds the jailer "
-            "(plain, --daemonize, --new-pid-ns) until THAWED; Firecracker's API silent while frozen")
+    def case_firecracker():
+        # Firecracker itself (no VM): frozen, its API does not answer; thawed, it does.
+        jail = jt.Jail(ctx, "fz-fc")
+        vm = jt.JailedVm(ctx, "fz-fc", jail)
+        jd = os.path.dirname(jail.root)
+        sock = jail.host("/run/firecracker.socket")
+        api = jt.api_process(vm)
+        try:
+            check(api_answers(sock), "Firecracker's API before the freeze")
+            fz.write(jd, "freezer.state", "FROZEN\n")
+            time.sleep(0.3)
+            check(not api_answers(sock), "the API answered while frozen")
+            stat = subprocess.run(["ps", "-o", "pid=,stat=", "-p", f"{vm.proc.pid},{api}"],
+                                  capture_output=True, text=True).stdout.split()
+            print(f"   Firecracker and its API process, frozen: {stat}", flush=True)
+            fz.write(jd, "freezer.state", "THAWED\n")
+            time.sleep(0.3)
+            check(api_answers(sock), "Firecracker's API after the thaw")
+        finally:
+            vm.kill()
+
+    cases = [
+        ("v1", "freezer.state: frozen (no CPU time) and thawed, the same value twice a no-op, the jail's uid "
+               "cannot thaw it, an invalid value restored, SIGTERM to the supervisor ignored, SIGKILL ends a "
+               "frozen jail", case_v1),
+        ("v2", "cgroup.freeze and cgroup.events; the supervisor killed leaves the jail frozen, its lock released",
+         case_v2),
+        ("refused", "v2 cgroup.freeze=0/1 and freezer.state=FREEZING refused at the start", case_refused),
+        ("thawed-start", "freezer.state=THAWED at the start: a no-op",
+         lambda: runs("fz-thawed", ["--cgroup", "freezer.state=THAWED"])),
+        ("start", "FROZEN at the start holds the jailer until THAWED", lambda: frozen_at_start("fz-start")),
+        # What --daemonize alone and with the freezer files made at the cgroup
+        # step do, beside FROZEN: which of them a failure needs.
+        ("daemon", "--daemonize, the spinner, no freezer option",
+         lambda: runs("fz-daemon", [], daemonize=True)),
+        ("daemon-thawed", "--daemonize with freezer.state=THAWED at the start",
+         lambda: runs("fz-daemon-thawed", ["--cgroup", "freezer.state=THAWED"], daemonize=True)),
+        ("start-daemon", "FROZEN at the start with --daemonize holds the jailer until THAWED",
+         lambda: frozen_at_start("fz-start-daemon", daemonize=True)),
+        ("start-pidns", "FROZEN at the start with --new-pid-ns holds the jailer until THAWED",
+         lambda: frozen_at_start("fz-start-pidns", new_pid_ns=True)),
+        ("firecracker", "Firecracker's API silent while frozen, answering once thawed", case_firecracker),
+    ]
+    results = []
+    for key, what, run in cases:
+        fz.last = None
+        try:
+            run()
+            results.append((key, True, what))
+            print(f"   case {key}: PASS: {what}", flush=True)
+        except jt.Failure as e:
+            results.append((key, False, f"{what}: {e}"))
+            print(f"   case {key}: FAIL: {e}", flush=True)
+            if fz.last:
+                p, jd = fz.last
+                name = os.path.basename(jd)
+                diagnose(fz, name, jd, p)
+                # Independent cases: what this one left is ended.
+                subprocess.run(["pkill", "-9", "-f", "--", f"--id {name} "], check=False)
+                time.sleep(0.5)
+    failed = [f"{k}: {d}" for k, ok, d in results if not ok]
+    passed = [k for k, ok, _ in results if ok]
+    summary = (f"macOS {os_version}: {len(passed)} of {len(results)} cases pass ({', '.join(passed)})"
+               + (f"; {facts['supervisor']}" if "supervisor" in facts else ""))
+    check(not failed, summary + "; FAILED: " + " | ".join(failed))
+    return summary
