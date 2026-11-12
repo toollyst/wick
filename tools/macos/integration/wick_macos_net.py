@@ -11,9 +11,10 @@ network's host side is a tools/macos/integration/netns-slirp process, whose
 interfaces have the host's address on them as a TAP does on Linux.
 
 What runs "in the namespace" on Linux: ssh and scp to the guest go through
-the network's forwards (tools/macos/integration/bin/ip). Any other host
-program cannot run inside a network that is a directory, so `check_output`
-and the `ip` shim refuse it, naming the reason.
+the network's forwards, and any other host program runs with its IPv4
+sockets put into the network (tools/macos/integration/bin/ip,
+netns-preload.c). Linux's own network tools (`ip tuntap`, `ifconfig` in
+the namespace) have no macOS counterpart there and fail, naming the reason.
 """
 
 import logging
@@ -126,11 +127,10 @@ class NetNs:
         return f"ip netns exec {self.id}"
 
     def check_output(self, cmd):
-        """Linux: a command run in the namespace (`ip netns exec`)."""
-        raise NotImplementedError(
-            f"{cmd!r} in network namespace {self.id}: a macOS network is a directory of "
-            "endpoints, a host program cannot run inside it (docs/PORTING.md row 6)"
-        )
+        """A command run in the namespace, as upstream's (`ip netns exec`):
+        tools/macos/integration/bin/ip runs it in the network."""
+        import framework.utils as utils  # pylint: disable=import-outside-toplevel
+        return utils.check_output(f"{self.cmd_prefix()} {cmd}")
 
     def setup(self):
         """Creates the network."""
