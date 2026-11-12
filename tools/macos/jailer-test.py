@@ -196,8 +196,89 @@ def jetsam(pid):
 
 
 def run_jailer(ctx, args, timeout=20):
-    p = subprocess.run([ctx.jailer] + args, capture_output=True, text=True, timeout=timeout)
-    return p.returncode, (p.stdout + p.stderr).strip()
+    """Runs the jailer to its end and returns (exit status, its output).
+
+    The output is read to EOF, which every process holding the pipes must
+    give: the jailer (Firecracker after its exec), Firecracker's API process,
+    and the jail's freezer supervisor, which keeps standard error. On a
+    timeout, before anything is killed, what is left is printed: the output
+    so far, the processes of this jail (`jail_processes`) and a 1 s `sample`
+    of each (`<out>/hang-<id>-<pid>.sample.txt`, its call graph printed),
+    so that a hang says which process waits and where; then the jailer is
+    killed, its pipes closed unread, and the timeout raised."""
+    p = subprocess.Popen([ctx.jailer] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        describe_hang(ctx, p.pid, args, e.stdout, e.stderr, timeout)
+        p.kill()
+        p.wait()
+        p.stdout.close()
+        p.stderr.close()
+        raise
+    return p.returncode, (out.decode(errors="replace") + err.decode(errors="replace")).strip()
+
+
+def jail_processes(jailer_pid, vm_id):
+    """`ps` lines of the processes a jailer run made: the jailer's pid
+    (Firecracker after the exec) and its descendants, and any process whose
+    command line names the jail (the supervisor, a fork of the jailer that
+    launchd adopted, keeps the jailer's arguments; Firecracker runs from its
+    copy in `.../<id>/root/`)."""
+    ps = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat=,etime=,command="],
+                        capture_output=True, text=True).stdout.splitlines()
+    rows = []
+    for line in ps:
+        f = line.split(None, 5)
+        if len(f) == 6 and f[0].isdigit() and f[1].isdigit():
+            rows.append((int(f[0]), int(f[1]), line))
+    mine = {jailer_pid}
+    grew = True
+    while grew:
+        grew = False
+        for pid, ppid, _ in rows:
+            if ppid in mine and pid not in mine:
+                mine.add(pid)
+                grew = True
+    named = (f"--id {vm_id} ", f"/{vm_id}/")
+    return [(pid, line) for pid, _, line in rows
+            if pid in mine or (vm_id and any(n in line + " " for n in named))]
+
+
+def describe_hang(ctx, jailer_pid, args, out, err, timeout):
+    vm_id = args[args.index("--id") + 1] if "--id" in args else ""
+
+    def text(b):
+        return (b or b"").decode(errors="replace").strip()
+
+    print(f"   TIMEOUT after {timeout} s: jailer pid {jailer_pid}, jail {vm_id!r}", flush=True)
+    print(f"   output so far: stdout {text(out)!r}, stderr {text(err)!r}", flush=True)
+    procs = jail_processes(jailer_pid, vm_id)
+    print("   processes of the jail (pid ppid pgid stat etime command):", flush=True)
+    for _, line in procs or [(0, "(none)")]:
+        print(f"     {line}", flush=True)
+    # `sample` takes the task's port: as root at once, as a user only after
+    # taskgated answers (xnu bsd/kern/kern_proc.c task_for_pid: the upcall
+    # is for a caller that is not root), which can wait on a password
+    # dialog (freezer.rs, test_pid_suspend_binding). Bounded here, and said.
+    for pid, _ in procs[:4]:
+        path = os.path.join(ctx.out, f"hang-{vm_id}-{pid}.sample.txt")
+        try:
+            s = subprocess.run(["/usr/bin/sample", str(pid), "1", "-mayDie", "-file", path],
+                               capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            print(f"   sample of {pid}: did not end in 20 s", flush=True)
+            continue
+        try:
+            with open(path, errors="replace") as f:
+                report = f.read()
+        except OSError as e:
+            print(f"   sample of {pid} (exit {s.returncode}): no report ({e}): {s.stderr.strip()!r}", flush=True)
+            continue
+        stacks = report.split("Call graph:", 1)[-1].split("Total number in stack", 1)[0]
+        print(f"   sample of {pid} (exit {s.returncode}, {path}):", flush=True)
+        for line in stacks.strip().splitlines()[:60]:
+            print(f"     {line}", flush=True)
 
 
 def jailer_base(ctx, vm_id, exec_file=None):
