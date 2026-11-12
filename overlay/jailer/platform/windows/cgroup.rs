@@ -257,7 +257,7 @@ fn impossible(version: u8, file: &str) -> Option<&'static str> {
              token and ACLs"
         }
         (1, "net_cls" | "net_prio") => {
-            "Windows has no network classes or priorities per job (and --netns is refused)"
+            "Windows has no network classes or priorities per job"
         }
         (1, "perf_event") => "Windows has no performance event group per job",
         _ => return None,

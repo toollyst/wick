@@ -94,10 +94,10 @@ exemption.
 | `boot`, `smp`, `block`, `vsock`, `net` | yes | yes |
 | `vmnet` | yes (root) | no counterpart (vmnet is macOS's) |
 | `snapshot`, `diff`, `uffd`, `pci`, `restores`, `vhost-user` | yes | yes |
-| `devices`: logger, metrics, MMDS, balloon, entropy, a rate limiter | yes | **missing** |
+| `devices`: logger, metrics, MMDS, balloon, entropy, a rate limiter | yes | yes (`boot-test.ps1 devices`, row 15) |
 | `balloon`: a 150 MiB balloon cycle on a guest restored from a memory file, then on a booted guest | yes: the guest keeps the pages the host and the devices use (O_DIRECT reads of the drive match the file 6 of 6 times after each cycle; before the fix 6 of 6 read stale data, as Hypervisor.framework had kept the pages a `MAP_FIXED` discard replaced), and the pages the balloon took leave the VMM's footprint (the jailer's limit is on it) and are charged again when the guest writes them (measured 263 → 114 → 270 MiB; `test_madvise_dontneed_replaces_guest_pages`: 66 → 2 → 66 MiB for 64 MiB of guest pages) | written, not yet run on a WHP machine: the same cycles, with the commit charge (what the jail's `memory.max` limits, row 15) for the footprint (`boot-test.ps1 balloon`) |
-| `hugepages` | yes (2 MiB pages on host pages: row 10) | yes, unjailed; needs "Lock pages in memory" (a jail maps none: row 10, `jailer-test.ps1 hugepages`) |
-| `api-process` | yes | yes (written; wait for a WHP machine) |
+| `hugepages` | yes (2 MiB pages on host pages: row 10) | yes; unjailed it needs "Lock pages in memory", jailed the large pages come from the jailer (row 10, `jailer-test.ps1 hugepages`) |
+| `api-process` | yes | yes (row 4, `boot-test.ps1 api-process` on a WHP machine) |
 
 | Stage | macOS (`tools/macos/jailer-test.sh`, root) | Windows (`tools/windows/jailer-test.ps1`) |
 | --- | --- | --- |
@@ -108,12 +108,12 @@ exemption.
 | (only the jail's identity reaches a jail) | part of `jail` | `low` (a low-integrity process of the user is kept out) |
 | (`--new-pid-ns`: no other process to see or signal) | `pidns` (upstream's process tree; dropped signals have no effect, SIGHUP ends it) | `pidns` (no process, thread or console of anyone else; the jailer's return) |
 | (a jailed process hands a file and a socket to a helper outside) | part of `jail` (`SCM_RIGHTS` works from a chroot) | `handoff` (pulled out by the operator and by a medium-integrity process of the user; no guest) |
-| (a snapshot restored through a uffd handler, and a vhost-user block device, under the jailer) | `boot-test uffd`, `vhost-user` (no jailer) | `uffd`, `vhost-user` (written; wait for a WHP machine) |
+| (a snapshot restored through a uffd handler, and a vhost-user block device, under the jailer) | `boot-test uffd`, `vhost-user` (no jailer) | `uffd`, `vhost-user` (row 14, on a WHP machine) |
 | (the API server's process is a process of the jail) | **missing** (the shared limits, root) | `api` (the whole mitigation profile; each one's end ends the other; no guest) |
 | (`--netns`: a jail reaches only its own network) | `netns` (two jails, a network each, a third sharing one; no frame across) | `netns` (two jails, a network each; no IP for a jail with a network; an unelevated jailer refused) |
 | `limits`: cgroups and resource limits applied | yes | yes |
 | `boot`: a jailed guest boots | yes | yes |
-| `memory`: a guest past the memory limit kills the VMM | yes | **missing** |
+| `memory`: a guest past the memory limit kills the VMM | yes | `memory` (row 15) |
 | `cpu`: a jailed guest's spinning vCPUs held to the limit | yes | yes |
 
 ## Where behaviour is not the same yet

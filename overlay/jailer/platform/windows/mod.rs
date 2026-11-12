@@ -1407,7 +1407,8 @@ fn tokens() -> Result<Tokens, HostError> {
 /// enabled (setting the level disables it, and enabling it again reports
 /// success and leaves it disabled; measured on Windows 11 26H2 at
 /// `S-1-16-6144` and `4096`, where `8192` and up keep it), so a jailed
-/// Firecracker maps no large pages (docs/PORTING.md row 10).
+/// Firecracker maps no large pages itself: the jailer makes them for it
+/// (docs/PORTING.md row 10).
 const KEPT_PRIVILEGES: [&str; 1] = ["SeChangeNotifyPrivilege"];
 
 /// The privileges in `token`: (name, LUID and attributes).

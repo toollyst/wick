@@ -14,8 +14,9 @@
 
 > [!IMPORTANT]
 > **macOS works end to end; Windows is a preview.** On Apple silicon, wick boots upstream's own CI guests and passes
-> scenario tests for SMP, block, vsock, networking, snapshots, userfaultfd, PCI and vhost-user. The Windows build is
-> complete but has not yet booted a guest on real hardware. Upstream's jailer runs on both with native backends
+> scenario tests for SMP, block, vsock, networking, snapshots, userfaultfd, PCI and vhost-user. On Windows it boots
+> the same guests on the Windows Hypervisor Platform and passes the same scenario tests, so far on one Windows 11 PC
+> ([docs/PORTING.md](docs/PORTING.md) lists each stage). Upstream's jailer runs on both with native backends
 > (on Windows: the jail as a drive and a restricted token, the Job Object, the mitigation profile); its parts that
 > need no guest are tested in CI, the rest on a WHP PC. Read [SECURITY.md](SECURITY.md) before
 > running untrusted multi-tenant workloads on either.
@@ -40,7 +41,7 @@ runs on Linux with KVM. If you build on Firecracker, your laptop needs a Linux V
 wick removes that limit without forking Firecracker in the usual sense:
 
 - **Upstream stays upstream.** `lib/firecracker` is the official repository at a release tag. wick changes it
-  through 15 small feature patches (about 1,000 lines in 63 files), each marked with a `wick:` comment. Everything
+  through 36 small patches (about 2,000 lines in 79 files), each marked with a `wick:` comment. Everything
   else is new code outside the submodule.
 - **Same API, same meaning.** Tools that drive Firecracker work unchanged: the binary is still called `firecracker`,
   and the API, the config file, the snapshot format and the vsock convention mean the same on all three hosts.
@@ -49,7 +50,8 @@ wick removes that limit without forking Firecracker in the usual sense:
   rebuilt on `PROT_NONE` and stage-2 faults. Where a host truly cannot do something, wick fails loudly and the
   [roadmap](docs/ROADMAP.md) says so.
 - **Security is not downgraded.** The goal is Firecracker's isolation on every host, with each Linux control mapped
-  to a native mechanism: Seatbelt and AppContainer for seccomp and chroot, jetsam limits and Job Objects for cgroups.
+  to a native mechanism: Seatbelt, and on Windows a process mitigation profile, for seccomp; a chroot, and on Windows
+  a jail drive and a restricted token, for the jail; jetsam limits and Job Objects for cgroups.
   [SECURITY.md](SECURITY.md) lists every control and where it stands.
 
 ## Hosts
@@ -57,8 +59,8 @@ wick removes that limit without forking Firecracker in the usual sense:
 | Host | Hypervisor | Guests | Status |
 | --- | --- | --- | --- |
 | Linux x86_64, aarch64 | KVM | x86_64, aarch64 | **Upstream Firecracker** from the same source: the compatibility crates re-export the original crates, and the Linux backends are upstream's code. CI runs upstream's unit and integration tests on plain upstream and on wick, on the same machine, and requires the same result test by test |
-| macOS 15+ on Apple silicon | Hypervisor.framework | aarch64 | **Works.** Checked end to end against upstream's CI guest by [`tools/macos/boot-test.sh`](tools/macos/boot-test.sh) |
-| Windows 10 (1803+) and 11, x86_64 | Windows Hypervisor Platform | x86_64 | **Preview.** Builds and links, and its POSIX layer is tested natively in CI; first boot on real hardware pending |
+| macOS 15+ on Apple silicon | Hypervisor.framework | aarch64 | **Works.** Checked end to end against upstream's CI guest by [`tools/macos/boot-test.sh`](tools/macos/boot-test.sh) on macOS 27; on 15 and 26, CI runs the sandbox's tests (GitHub's macOS runners cannot boot a guest) |
+| Windows 10 (1803+) and 11, x86_64 | Windows Hypervisor Platform | x86_64 | **Preview.** The boot test's stages and upstream's integration suites run on one Windows 11 PC (WHP needs real hardware: CI runs everything that needs no guest) |
 
 ### What works on macOS
 
@@ -161,10 +163,10 @@ The short version; the [full roadmap](docs/ROADMAP.md) has the status of every r
 - [x] Upstream as a submodule plus a checked patch series, rebase tooling, CI on three OSes
 - [x] macOS: devices, snapshots, userfaultfd, PCI, vhost-user, Seatbelt sandbox, checked end to end
 - [x] Windows: WHP backend and the POSIX layer, native CI
-- [ ] Windows: first boot on real hardware, then snapshots and PCI
+- [x] Windows: boot, snapshots, PCI, userfaultfd and vhost-user on real hardware (one PC so far)
 - [ ] Security parity: the upstream `jailer` CLI with native backends (macOS: chroot, uid/gid, memory and CPU
-  limits; Windows: the jail drive and token, Job Object limits, the mitigation profile, `--daemonize`; network
-  confinement next)
+  limits; Windows: the jail drive and token, Job Object limits, the mitigation profile, `--daemonize`; both:
+  `--netns` as a directory of network endpoints)
 - [ ] Images everywhere: x86_64 images on Apple silicon (FEX-Emu with hardware TSO), arm64 images on Windows
 - [ ] Desktop devices: user-mode networking, virtio-fs
 - [ ] Distribution: release binaries, Homebrew, automatic rebase attempts on new upstream tags
