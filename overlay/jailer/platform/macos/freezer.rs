@@ -895,31 +895,121 @@ impl Os for RealOs {
     }
 }
 
+/// `PROC_PIDLISTTHREADS` (sys/proc_info.h): a process's thread handles.
+const PROC_PIDLISTTHREADS: libc::c_int = 6;
+
+/// Whether no thread of `pid` is runnable (`None`: it cannot be read).
+///
+/// A suspended thread stops accruing CPU time only once it has parked.
+/// `pid_suspend` returns when every thread is off its CPU (osfmk/kern/task.c
+/// `place_task_hold` -> `task_wait_locked(task, FALSE)`; sched_prim.c
+/// `thread_wait`: "Wait until not running on a CPU"), and a thread that is
+/// off its CPU but still runnable (preempted) runs again, in the kernel
+/// only, to take the hold: the AST on its way back to user code
+/// (thread_act.c `thread_apc_ast`) parks it, waiting on its suspend count,
+/// so that path's system time is charged after the call returned. A parked
+/// thread is not `TH_RUN` and reads `TH_STATE_WAITING` (thread.c
+/// `retrieve_thread_basic_info`); only `TH_RUN` reads `TH_STATE_RUNNING`.
+pub(crate) fn no_thread_runs(pid: libc::pid_t) -> Option<bool> {
+    let mut handles = [0u64; 64];
+    let size = libc::c_int::try_from(std::mem::size_of_val(&handles)).ok()?;
+    // SAFETY: an output buffer of `size` bytes.
+    let n = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, handles.as_mut_ptr().cast(), size) };
+    let n = usize::try_from(n).ok()? / std::mem::size_of::<u64>();
+    if n == 0 || n == handles.len() {
+        return None;
+    }
+    let info_size = libc::c_int::try_from(std::mem::size_of::<libc::proc_threadinfo>()).ok()?;
+    for &handle in &handles[..n] {
+        // SAFETY: zeroed is a valid proc_threadinfo to fill.
+        let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: an output buffer of `info_size` bytes.
+        let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTHREADINFO, handle, (&raw mut info).cast(), info_size) };
+        if got != info_size {
+            return None;
+        }
+        if info.pth_run_state == libc::TH_STATE_RUNNING {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// `pid`'s CPU time once its threads have settled: no thread runs, now and
+/// [`SETTLE_GAP_MS`] later, and the time has not changed between the two.
+/// From then on a suspended process's time stands still.
+///
+/// One not-running read is not enough: on its way to park (see
+/// [`no_thread_runs`]) a held thread can wait briefly in the kernel (for
+/// its thread mutex in `thread_apc_ast`, or, held by SIGSTOP, in the stop
+/// signal's path), reading not-running, and then run on to park. Those
+/// waits are short and end in the park; the park lasts until the hold is
+/// released. A thread that spins in user code cannot read not-running at
+/// both ends of the gap with no CPU time between them, so a process that is
+/// not held fails here (after a second) or in the window that follows.
+pub(crate) fn parked_cpu_time(pid: libc::pid_t) -> Result<u64, String> {
+    let t0 = std::time::Instant::now();
+    let unreadable = || "cannot read the child's threads or CPU time".to_owned();
+    loop {
+        if no_thread_runs(pid).ok_or_else(unreadable)? {
+            let before = cpu_time(pid).ok_or_else(unreadable)?;
+            std::thread::sleep(std::time::Duration::from_millis(SETTLE_GAP_MS));
+            if no_thread_runs(pid).ok_or_else(unreadable)? && cpu_time(pid).ok_or_else(unreadable)? == before {
+                return Ok(before);
+            }
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if t0.elapsed() > std::time::Duration::from_secs(1) {
+            return Err("pid_suspend returned 0, but the child's threads did not stop within 1 s".to_owned());
+        }
+    }
+}
+
+/// The gap over which a suspended process's threads must stay stopped
+/// before its CPU time is taken as settled ([`parked_cpu_time`]).
+const SETTLE_GAP_MS: u64 = 5;
+
 /// Checks that suspending works on this host: a throwaway child that spins
-/// is suspended, uses no CPU time for 30 ms, and is resumed.
+/// is suspended, uses no CPU time for 30 ms once its threads have parked,
+/// and is resumed.
 pub(crate) fn self_check(os: &mut dyn Os) -> Result<(), String> {
+    // SAFETY: no arguments.
+    let parent = unsafe { libc::getpid() };
     // SAFETY: the supervisor has one thread; the child only spins.
     let child = unsafe { libc::fork() };
     if child < 0 {
         return Err(format!("fork: {}", io::Error::last_os_error()));
     }
     if child == 0 {
+        // Spins until killed, or until its parent is gone (a supervisor
+        // killed mid-check leaves no spinner).
         loop {
-            std::hint::spin_loop();
+            for _ in 0..100_000 {
+                std::hint::spin_loop();
+            }
+            // SAFETY: no arguments.
+            if unsafe { libc::getppid() } != parent {
+                // SAFETY: ends the child of a fork.
+                unsafe { libc::_exit(0) };
+            }
         }
     }
     let result = (|| {
         std::thread::sleep(std::time::Duration::from_millis(5));
         os.suspend(child).map_err(|e| format!("pid_suspend of a child: {e}"))?;
-        let before = cpu_time(child);
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        let after = cpu_time(child);
+        let held = (|| {
+            let before = parked_cpu_time(child)?;
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let after = cpu_time(child).ok_or("cannot read the child's CPU time")?;
+            if before == after {
+                Ok(())
+            } else {
+                Err(format!("pid_suspend returned 0, but the child used CPU time while parked ({before} -> {after})"))
+            }
+        })();
         os.resume(child).map_err(|e| format!("pid_resume of a child: {e}"))?;
-        match (before, after) {
-            (Some(a), Some(b)) if a == b => Ok(()),
-            (Some(a), Some(b)) => Err(format!("pid_suspend returned 0, but the child used CPU time ({a} -> {b})")),
-            _ => Err("cannot read the child's CPU time".to_owned()),
-        }
+        held
     })();
     // SAFETY: our child.
     unsafe { libc::kill(child, libc::SIGKILL) };
@@ -1977,6 +2067,91 @@ mod tests {
     // root (CI runs these tests with sudo) a spinning child stops using CPU
     // time while suspended and uses it again once resumed, and the
     // self-check passes.
+    // Spinners keeping every CPU busy, so that threads are preempted (the
+    // case that made the check fail before it waited for the parked state).
+    struct Load(Vec<std::process::Child>);
+
+    impl Drop for Load {
+        fn drop(&mut self) {
+            for c in &mut self.0 {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    fn load() -> Load {
+        let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        Load(
+            (0..cpus * 2)
+                // Each ends with the test process, even one that aborts.
+                .map(|_| {
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", "while kill -0 $PPID 2>/dev/null; do :; done"])
+                        .spawn()
+                        .unwrap()
+                })
+                .collect(),
+        )
+    }
+
+    // The parked state, as a user (SIGSTOP holds a task the same way:
+    // kern_sig.c, SIGSTOP -> task_suspend_internal -> place_task_hold): once
+    // no thread runs, the CPU time stands still, every time, under load.
+    #[test]
+    fn test_parked_cpu_time_stands_still() {
+        let busy = load();
+        for i in 0..40 {
+            // Killed and reaped when dropped, a failed round too.
+            let child = Load(vec![std::process::Command::new("/usr/bin/yes").stdout(std::process::Stdio::null()).spawn().unwrap()]);
+            let pid = libc::pid_t::try_from(child.0[0].id()).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            // SAFETY: our child.
+            unsafe { libc::kill(pid, libc::SIGSTOP) };
+            let a = parked_cpu_time(pid).unwrap();
+            assert_eq!(no_thread_runs(pid), Some(true));
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(cpu_time(pid).unwrap(), a, "round {i}: CPU time once parked");
+            drop(child);
+        }
+        drop(busy);
+    }
+
+    // The self-check in a loop, under load: before it waited for the parked
+    // state, about one start in six failed it on CI's runner (5 of 30 starts,
+    // run 50435b5, macOS 26.7.2: "pid_suspend returned 0, but the child used
+    // CPU time", 72 to 147 Mach time units more). As root only (pid_suspend);
+    // also counts how often the time read right after pid_suspend returned
+    // differs from the parked one (the old check), which is not asserted.
+    #[test]
+    fn test_self_check_under_load() {
+        // SAFETY: no arguments.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let busy = load();
+        let mut os = RealOs;
+        let mut early = 0;
+        for i in 0..200 {
+            self_check(&mut os).unwrap_or_else(|e| panic!("round {i}: {e}"));
+            // Killed and reaped when dropped, a failed round too.
+            let child = Load(vec![std::process::Command::new("/usr/bin/yes").stdout(std::process::Stdio::null()).spawn().unwrap()]);
+            let pid = libc::pid_t::try_from(child.0[0].id()).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            os.suspend(pid).unwrap();
+            let right_after = cpu_time(pid).unwrap();
+            let parked = parked_cpu_time(pid).unwrap();
+            early += usize::from(right_after != parked);
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(cpu_time(pid).unwrap(), parked, "round {i}: CPU time once parked");
+            os.resume(pid).unwrap();
+            drop(child);
+        }
+        eprintln!("test_self_check_under_load: 200 self-checks passed; the time right after pid_suspend \
+                   differed from the parked one {early} times in 200");
+        drop(busy);
+    }
+
     #[test]
     fn test_pid_suspend_binding() {
         let mut child = std::process::Command::new("/usr/bin/yes").stdout(std::process::Stdio::null()).spawn().unwrap();
@@ -1992,10 +2167,10 @@ mod tests {
         } else {
             std::thread::sleep(Duration::from_millis(100));
             os.suspend(pid).unwrap();
-            let a = cpu_time(pid).unwrap();
+            let a = parked_cpu_time(pid).unwrap();
             std::thread::sleep(Duration::from_millis(300));
             let b = cpu_time(pid).unwrap();
-            assert_eq!(a, b, "CPU time while suspended");
+            assert_eq!(a, b, "CPU time while suspended and parked");
             // Not nested: a second suspend is refused, one resume resumes.
             assert_eq!(errno(&os.suspend(pid).unwrap_err()), libc::EPERM);
             os.resume(pid).unwrap();
