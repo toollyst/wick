@@ -94,9 +94,12 @@ discard local commits on `wick` unless given `--force`.
 - A table cell in README.md, SECURITY.md, docs/ROADMAP.md or docs/PORTING.md that says a
   control is "in place", "verified" or "measured" names, in backticks, the
   test that checks it (`jailer-test cpu`, `test_sandbox_restricts_child`).
-  `tools/check-claims.py` enforces it on CI. A probe that once showed
-  something is not a test; the claim waits until the product does it and a
-  test in the repository shows it.
+  `tools/check-claims.py` enforces it on CI, and also that every
+  `test_...` and every scenario stage a document names exists: a stage
+  (`boot-test snapshot`, `jailer-test.ps1 nofile`) must be in that script's
+  own stage table, so renaming a stage fails CI until the documents follow.
+  A probe that once showed something is not a test; the claim waits until
+  the product does it and a test in the repository shows it.
 - A number in a doc says how it was measured. On a loaded machine, measure
   against a control run at the same time, or state only bounds the kernel
   reports back (a limit read back, CPU time used), never wall-clock alone.

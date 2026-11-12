@@ -22,6 +22,13 @@ Every test these files and docs/COMPATIBILITY.md name in backquotes
 Python or PowerShell sources or in the patch series, an upstream test file of
 that name, or a test of the Linux baseline. A renamed test leaves a claim
 that names nothing.
+
+Every scenario stage these files, CONTRIBUTING.md, docs/*.md and
+tools/windows/README.md name in backquotes (`boot-test snapshot`,
+`jailer-test.ps1 nofile`) must be a stage of that script: a key of STAGES in
+tools/macos/boot-test.py or jailer-test.py, of $Stages in
+tools/windows/boot-test.ps1, of -Stage's default in jailer-test.ps1, or one
+of the result lines a script always reports (STAGE_RESULTS below).
 """
 import re
 import sys
@@ -35,6 +42,12 @@ SOURCES = ["crates", "overlay", "tools", "fuzz", "patches", "lib/firecracker/src
 SKIP_DIRS = {"target", "build", ".git", "__pycache__"}
 DEFINED = re.compile(r"\b(?:fn|def|function)\s+(test_[A-Za-z0-9_]+)")
 NAMED = re.compile(r"`([^`]*)`")
+# Documents whose `boot-test <stage>` and `jailer-test <stage>` are checked.
+STAGE_DOCS = NAMING + ["CONTRIBUTING.md", "docs/README.md", "docs/ARCHITECTURE.md", "docs/getting-started.md",
+                       "tools/windows/README.md"]
+# A result line a script reports on every run, named like a stage.
+STAGE_RESULTS = {"jailer-test.ps1": {"drives"}}
+STAGE_NAMED = re.compile(r"^(?:tools/(?:macos|windows)/)?(boot-test|jailer-test)(\.ps1|\.sh|\.py)?\s+(.+)$")
 CLAIM = re.compile(r"\bverified\b|\bmeasured\b|\bin place\b(?! of)", re.I)
 EVIDENCE = re.compile(
     r"`[^`]*(boot-test|jailer-test|test_[a-z0-9_]+|ext::[a-z_:]+|cargo test|integration-tests|"
@@ -75,9 +88,43 @@ def known_tests():
     return known
 
 
+def stages():
+    """Each scenario script's stage names, by the name a document uses for it."""
+    def table(path, pattern, key):
+        text = (ROOT / path).read_text()
+        block = re.search(pattern, text, re.S)
+        if not block:
+            sys.exit(f"check-claims: no stage table found in {path}")
+        return set(re.findall(key, block.group(1), re.M))
+
+    boot = table("tools/macos/boot-test.py", r"\nSTAGES = \{(.*?)\n\}", r'^\s*"([a-z-]+)":')
+    jail = table("tools/macos/jailer-test.py", r"\nSTAGES = \{(.*?)\n\}", r'^\s*"([a-z-]+)":')
+    boot_win = table("tools/windows/boot-test.ps1", r"\n\$Stages = \[ordered\]@\{(.*?)\n\}", r"^\s*'?([a-z-]+)'?\s*=")
+    jail_win = table("tools/windows/jailer-test.ps1", r"\[string\[\]\]\$Stage = @\(([^)]*)\)", r"'([a-z-]+)'")
+    named = {"boot-test": boot, "jailer-test": jail, "boot-test.ps1": boot_win, "jailer-test.ps1": jail_win}
+    for script, results in STAGE_RESULTS.items():
+        named[script] = named[script] | results
+    for macos in ("boot-test", "jailer-test"):
+        named[macos + ".sh"] = named[macos + ".py"] = named[macos]
+    return named
+
+
 def main():
     strict_windows = "--strict-windows" in sys.argv[1:]
     errors = warnings = 0
+    named_stages = stages()
+    for name in STAGE_DOCS:
+        for n, line in enumerate((ROOT / name).read_text().splitlines(), 1):
+            for quoted in NAMED.findall(line):
+                m = STAGE_NAMED.match(quoted)
+                if not m:
+                    continue
+                script = m.group(1) + (m.group(2) or "")
+                for word in re.split(r"[ ,/]+", m.group(3)):
+                    if re.fullmatch(r"[a-z][a-z-]*", word) and word not in ("and", "or", "all") \
+                            and word not in named_stages[script]:
+                        print(f"error: {name}:{n} names `{quoted}`, but {script} has no stage {word}")
+                        errors += 1
     known = known_tests()
     for name in NAMING:
         for n, line in enumerate((ROOT / name).read_text().splitlines(), 1):
