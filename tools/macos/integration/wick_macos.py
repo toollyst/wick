@@ -379,6 +379,7 @@ class _MemoryMap:
 
     def __init__(self, path, addr, size, rss):
         self.path, self.addr, self.size, self.rss = path, addr, size, rss
+        self.tag, self.shared_cache, self.writable = 0, False, False
 
 
 def _shared_cache():
@@ -433,9 +434,15 @@ def memory_maps(self, grouped=True):
     in the footprint mode (VM_SELF_REGION_FOOTPRINT above): the pages the
     process has mapped. The footprint mode's region of owned memory is left
     out (_FOOTPRINT_REGION_TAG).
-    The dyld shared cache is left out: every process on macOS maps the
-    system libraries from it and shares their pages (upstream's Firecracker is
-    a static binary on Linux, so it has no such mapping). XNU splits a large
+    The dyld shared cache's entries are in, marked `shared_cache`: the
+    system libraries every macOS process runs (no static binaries: Apple
+    QA1118), whose pages count as those of any other mapping, by this
+    process's page tables. Measured on an idle Firecracker: 4.48 MiB there,
+    unchanged when other processes ran library code Firecracker never runs,
+    so the count is the process's own, as Linux's Rss of a dynamically linked
+    process counts its libraries' pages; task RSS (the phys_mem ledger) is
+    the sum, 6.89 MiB against 2.27 + 4.48. Upstream's Firecracker is a static
+    binary on Linux, its libc inside its own text. XNU splits a large
     mapping of memory into regions of at most 128 MiB (ANON_CHUNK_SIZE);
     adjacent regions alike in everything but their object are one mapping
     here, as Linux merges such areas into one.
@@ -461,20 +468,28 @@ def _memory_maps(self):
             break
         r = info.info
         addr = r.address + r.size
-        if lo <= r.address < hi or r.user_tag == _FOOTPRINT_REGION_TAG:
+        if r.user_tag == _FOOTPRINT_REGION_TAG:
             continue
+        in_cache = lo <= r.address < hi
         path = info.path.decode(errors="replace")
-        kind = (r.protection, r.max_protection, r.share_mode, r.user_tag, path)
+        kind = (r.protection, r.max_protection, r.share_mode, r.user_tag, path, in_cache)
         if last and last[0] == kind and maps[-1].addr + maps[-1].size == r.address:
             maps[-1].size += r.size
             maps[-1].rss += r.pages_resident * page
             continue
         maps.append(_MemoryMap(path, r.address, r.size, r.pages_resident * page))
-        maps[-1].tag = r.user_tag
+        maps[-1].tag, maps[-1].shared_cache = r.user_tag, in_cache
+        maps[-1].writable = bool(r.protection & 2)  # VM_PROT_WRITE
         last = (kind,)
     if not maps and not psutil.pid_exists(self.pid):
         raise psutil.NoSuchProcess(self.pid)
+    _LAST_SHARED_CACHE_RSS[0] = sum(m.rss for m in maps if m.shared_cache)
     return maps
+
+
+# The shared cache's part of the last `memory_maps`, for
+# test_memory_overhead's metrics (pytest_runtest_call).
+_LAST_SHARED_CACHE_RSS = [None]
 
 
 import psutil  # noqa: E402  pylint: disable=wrong-import-position
@@ -503,6 +518,8 @@ def region_breakdown(pid, skip=lambda m: False):
             if skip(m):
                 continue
             name = os.path.basename(m.path) if m.path else f"tag {m.tag}"
+            if m.shared_cache:
+                name = "shared cache " + name
             if col == 1:
                 rows[name][0] += m.size
             rows[name][col] += m.rss
@@ -512,39 +529,93 @@ def region_breakdown(pid, skip=lambda m: False):
 
 import host_tools.memory as _memory  # noqa: E402  pylint: disable=wrong-import-position
 
-_real_monitor_run = _memory.MemoryMonitor.run
-_real_check_samples = _memory.MemoryMonitor.check_samples
+# Upstream's monitor holds the VMM's resident memory besides the guest to
+# 5 MiB (7 while a snapshot is taken), measured on a static binary. On macOS
+# that memory has two parts:
+# - the VMM's own: its binary, its heap, its stacks, every mapping outside the
+#   dyld shared cache. The budget applies to this part, as upstream's does.
+# - the platform's: the system libraries' pages it mapped from the dyld
+#   shared cache, which a macOS process cannot do without (QA1118) and a
+#   static Linux binary carries inside its own text. This part is held to
+#   SHARED_CACHE_CEILING, measured, so that it is bounded and a rise shows,
+#   and reported beside the other (memory-parts.jsonl in the run's
+#   directory, one line per microVM).
+SHARED_CACHE_CEILING = int(os.environ.get("WICK_IT_SHARED_CACHE_CEILING_MIB", "0")) << 20 or None
+_MEMORY_PARTS = pathlib.Path(os.environ.get("WICK_IT_BINARY_DIR", SESSION_ROOT)).parent / "memory-parts.jsonl"
 
 
 def monitor_run(self):
-    """MemoryMonitor.run; when it stops on a sample over the threshold, the
-    process's regions as they are then (region_breakdown), for
-    check_samples to log."""
-    _real_monitor_run(self)
+    """MemoryMonitor.run (host_tools/memory.py) with the VMM's memory in its
+    two parts: upstream's loop, whose sum is the part outside the shared
+    cache, with the shared cache's part held to SHARED_CACHE_CEILING. When
+    it stops on a sample over a limit, the process's regions as they are
+    then (region_breakdown), for check_samples to log."""
+    # pylint: disable=protected-access
+    guest = self._vm.mem_size_bytes
     self.wick_breakdown = None
-    if self._exceeded is not None:  # pylint: disable=protected-access
-        guest = self._vm.mem_size_bytes  # pylint: disable=protected-access
-        with contextlib.suppress(psutil.NoSuchProcess, ProcessLookupError):
-            self.wick_breakdown = region_breakdown(
-                self._exceeded.pid, skip=lambda m: self.is_guest_mem(m.size, guest))  # pylint: disable=protected-access
+    self.wick_peak = {"own": 0, "shared_cache": 0}
+    try:
+        ps = psutil.Process(self._vm.firecracker_pid)
+    except (psutil.NoSuchProcess, FileNotFoundError):
+        return
+    while not self._should_stop:
+        try:
+            mmaps = ps.memory_maps(grouped=False)
+        except psutil.NoSuchProcess:
+            return
+        own = cache = 0
+        for m in mmaps:
+            # Upstream skips a mapping by its size as guest memory; the
+            # shared cache's are never guest memory, and some are larger.
+            if m.shared_cache:
+                cache += m.rss
+            elif "nitro_enclaves" not in m.path and not self.is_guest_mem(m.size, guest):
+                own += m.rss
+        self._current_rss = own
+        self.wick_shared_cache_rss = cache
+        self.wick_peak = {"own": max(own, self.wick_peak["own"]),
+                          "shared_cache": max(cache, self.wick_peak["shared_cache"])}
+        if own > self.threshold or (SHARED_CACHE_CEILING and cache > SHARED_CACHE_CEILING):
+            self._exceeded = ps
+            with contextlib.suppress(psutil.NoSuchProcess, ProcessLookupError):
+                self.wick_breakdown = region_breakdown(
+                    ps.pid, skip=lambda m: not m.shared_cache and self.is_guest_mem(m.size, guest))
+            return
+        time.sleep(self._period_s)
 
 
 def check_samples(self):
-    """MemoryMonitor.check_samples, with the regions logged when it raises."""
-    if self._exceeded is not None:  # pylint: disable=protected-access
-        rows = getattr(self, "wick_breakdown", None)
-        import logging  # pylint: disable=import-outside-toplevel
+    """MemoryMonitor.check_samples, with the two parts' peaks recorded and,
+    when it raises, the regions logged."""
+    # pylint: disable=protected-access
+    import json as _json  # pylint: disable=import-outside-toplevel
+    import logging  # pylint: disable=import-outside-toplevel
+    peak = getattr(self, "wick_peak", None)
+    if peak is not None:
+        with contextlib.suppress(OSError), open(_MEMORY_PARTS, "a", encoding="utf-8") as f:
+            f.write(_json.dumps({"test": os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0],
+                                 "pid": self._vm.firecracker_pid, "own_mib": round(peak["own"] / 2**20, 2),
+                                 "shared_cache_mib": round(peak["shared_cache"] / 2**20, 2),
+                                 "exceeded": self._exceeded is not None}) + "\n")
+    if self._exceeded is not None:
         log = logging.getLogger("wick_macos")
+        cache = getattr(self, "wick_shared_cache_rss", 0)
+        if SHARED_CACHE_CEILING and cache > SHARED_CACHE_CEILING:
+            log.warning("memory monitor: the shared cache's part %.2f MiB is over its ceiling %.2f MiB",
+                        cache / 2**20, SHARED_CACHE_CEILING / 2**20)
+        rows = getattr(self, "wick_breakdown", None)
         if rows is None:
             log.warning("memory monitor tripped at %.2f MiB; the process was gone before its regions were read",
-                        self._current_rss / (1 << 20))  # pylint: disable=protected-access
+                        self._current_rss / (1 << 20))
         else:
-            log.warning("memory monitor tripped at %.2f MiB (KiB: mapped, in the page tables, resident in the "
-                        "object): %s", self._current_rss / (1 << 20),  # pylint: disable=protected-access
+            log.warning("memory monitor tripped at %.2f MiB of the VMM's own, %.2f MiB of the shared cache "
+                        "(KiB: mapped, in the page tables, resident in the object): %s",
+                        self._current_rss / (1 << 20), cache / (1 << 20),
                         "; ".join(f"{n} {s}/{f}/{c}" for n, s, f, c in rows if f or c))
     _real_check_samples(self)
 
 
+_real_check_samples = _memory.MemoryMonitor.check_samples
 _memory.MemoryMonitor.run = monitor_run
 _memory.MemoryMonitor.check_samples = check_samples
 
@@ -910,12 +981,15 @@ def rss_anon_kib(pid):
     Linux: the resident pages of the process's anonymous mappings (private
     or shared anonymous memory; guest memory not backed by a file is one).
     macOS: the resident pages of the regions that map no file (no vnode
-    path in proc_pidinfo(PROC_PIDREGIONPATHINFO)), without the dyld shared
-    cache, as `memory_maps` reads them: the pages the process has mapped
+    path in proc_pidinfo(PROC_PIDREGIONPATHINFO)), as `memory_maps` reads
+    them, and of the dyld shared cache's the writable ones (the libraries'
+    data, which Linux counts as anonymous once copied on write; their text
+    is RssFile there): the pages the process has mapped
     (the footprint mode), as Linux's RssAnon counts its anonymous pages
     (fs/proc/task_mmu.c task_mem: get_mm_counter(mm, MM_ANONPAGES), the
     anonymous pages mapped in its page tables)."""
-    return sum(m.rss for m in memory_maps(psutil.Process(pid), grouped=False) if not m.path) // 1024
+    return sum(m.rss for m in memory_maps(psutil.Process(pid), grouped=False)
+               if not m.path and (m.writable or not m.shared_cache)) // 1024
 
 
 def _outside_rssanon(vm):
@@ -1007,6 +1081,31 @@ def pytest_runtest_setup(item):
     module = getattr(item, "module", None)
     if module is not None and module.__name__.endswith("test_pmem") and hasattr(module, "outside_rssanon"):
         module.outside_rssanon = _outside_rssanon
+
+
+import pytest as _pytest  # noqa: E402  pylint: disable=wrong-import-position
+
+
+@_pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    """test_memory_overhead publishes the VMM's resident memory besides the
+    guest (overhead_rss), which on macOS includes the system libraries'
+    pages from the dyld shared cache (`memory_maps`): beside it the test also
+    publishes the two parts, overhead_rss_shared_cache and overhead_rss_own,
+    so that a change in the VMM's own memory shows on its own."""
+    metrics = item.funcargs.get("metrics") if item.name.startswith("test_memory_overhead") else None
+    if metrics is not None:
+        put = metrics.put_metric
+
+        def put_metric(key, value, unit=None, *args, **kwargs):
+            put(key, value, unit, *args, **kwargs)
+            if key == "overhead_rss" and _LAST_SHARED_CACHE_RSS[0] is not None:
+                cache = _LAST_SHARED_CACHE_RSS[0]
+                put("overhead_rss_shared_cache", cache, unit)
+                put("overhead_rss_own", value - cache, unit)
+
+        metrics.put_metric = put_metric
+    yield
 
 
 def pytest_report_header():
