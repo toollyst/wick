@@ -67,8 +67,13 @@ the firmware, and nothing else installed: the script is Windows PowerShell 5.1.
    Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
    ```
 
-   `(Get-CimInstance Win32_ComputerSystem).HypervisorPresent` is `True`
-   afterwards.
+   The check is the boot test's own: it prints `Windows Hypervisor Platform:
+   available` (and `host.txt` says `WHP: available`) when `WinHvPlatform.dll` loads and reports a
+   hypervisor, or why not. Neither `HypervisorPresent` (true whenever a
+   hypervisor runs: Hyper-V, virtualization-based security) nor the feature's
+   `State` is that test: on a Windows 11 build 26300 PC
+   `Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform` read
+   `Disabled` while WHP worked and guests booted.
 
 2. **The binaries.** From the latest green `ci` run on `main`: GitHub,
    Actions, `ci`, the run, Artifacts, `wick-windows-x86_64-<commit>`; unzip
@@ -131,7 +136,7 @@ warnings, and the reset must end Firecracker with exit status 0.
 | `tools` | `rebase-snap` and `snapshot-editor edit-memory rebase` on a sparse and a dense synthetic diff file (the dense one refused, the base untouched), without a guest; then a diff snapshot (written as a sparse file) rebased by both alike and restored; `snapshot-editor info-vmstate` `version`, `vcpu-states`, `vm-state`; the state file with the aarch64 magic or a newer version refused at the load |
 | `no-seccomp` | without `--no-seccomp` the setup-phase mitigations are in force in Firecracker and the whole profile in its API process; with it none in either. Before a boot (no guest), then with a guest running |
 | `foreign-snapshot` | a state file made on another host, given as `-ForeignState <file>` (the macOS boot test's snapshot stage makes an aarch64 one), is refused at the load and Firecracker ends. No guest |
-| `memory-hotplug` | virtio-mem: 512 MiB plugged into a 512 MiB guest, seen in `MemTotal`, 600 MiB written and read back, then unplugged |
+| `memory-hotplug` | virtio-mem: 512 MiB plugged into a 512 MiB guest, seen in `MemTotal`, 600 MiB written and read back, then unplugged (Firecracker's commit charge goes down) and plugged again |
 | `gdb` | not in `all`: Firecracker built with the gdb feature (`-GdbFirecracker`) and gdb (`-Gdb`, or MSYS2's `gdb-multiarch`) on upstream's debug kernel: a hardware breakpoint at `start_kernel`, the kernel's bytes read through the stub as in the vmlinux, a software breakpoint at `rest_init`, the guest boots on. gdb reaches the gdb socket by its path, or through a TCP relay of the stage's own |
 
 `uffd` needs the `snapshot` stage's files: run it after `snapshot` (as `all` does).

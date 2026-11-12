@@ -38,7 +38,8 @@
 #          and the commit charge goes down and up again with the balloon
 #   cli    Firecracker's command line: exit codes 152 and 153 (no guest),
 #          --module, the start time flags, the logger and metrics on named
-#          pipes (a stalled and a vanished reader included), --boot-timer
+#          pipes, set before the microVM starts (a reader that never reads
+#          and readers that go away included), --boot-timer
 #   tools  rebase-snap and snapshot-editor rebase on sparse and dense
 #          synthetic diff files (no guest), then on a diff snapshot;
 #          info-vmstate; state files with another arch's magic or a newer
@@ -49,7 +50,7 @@
 #   foreign-snapshot  a state file made on another host (-ForeignState) is
 #          refused at the load (no guest)
 #   memory-hotplug  virtio-mem: 512 MiB plugged, seen in MemTotal and used,
-#          then unplugged
+#          then unplugged (the commit charge goes down) and plugged again
 #   gdb    (not in `all`: needs a Firecracker built with the gdb feature and
 #          a gdb) upstream's debug kernel under gdb: a hardware breakpoint at
 #          start_kernel, the kernel's bytes read through the stub's address
@@ -99,6 +100,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# Firecracker, the jailer and the probes write UTF-8 (Rust's strings,
+# Windows' error texts in them included, which are in the system's language);
+# Windows PowerShell reads a file in the ANSI code page and a redirected
+# stream in the console's unless told: on a Korean or Japanese Windows their
+# text came out garbled.
+$PSDefaultParameterValues['Get-Content:Encoding'] = 'UTF8'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
 
 # Upstream's CI artifacts (resources/rebuild.sh builds them); the prefix is the
@@ -155,6 +162,8 @@ namespace Wick {
             psi.RedirectStandardInput = true;
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError = true;
+            psi.StandardOutputEncoding = new UTF8Encoding(false);
+            psi.StandardErrorEncoding = new UTF8Encoding(false);
             // Process.Start makes the stdin writer with the console's input
             // encoding and flushes its preamble at once: with a UTF-8 code
             // page (65001) the child's stdin would start with a byte order
@@ -1356,23 +1365,55 @@ namespace Wick {
     // Windows: the file's volume serial number and NTFS file index as one
     // number, in 20 base-32 digits (vmm platform::fs::device_id).
     public static class DriveId {
+        // BY_HANDLE_FILE_INFORMATION (fileapi.h): every FILETIME is two
+        // DWORDs, so the structure is 52 bytes with no padding. (A `long`
+        // for a FILETIME makes the CLR align it to 8 and read every field
+        // after Attributes 4 bytes off.)
         [StructLayout(LayoutKind.Sequential)]
         struct Info {
             public uint Attributes;
-            public long Created, Accessed, Written;
+            public uint CreatedLow, CreatedHigh, AccessedLow, AccessedHigh, WrittenLow, WrittenHigh;
             public uint VolumeSerial, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
         }
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool GetFileInformationByHandle(IntPtr h, out Info info);
 
+        // FILE_ID_INFO (winbase.h): a 64-bit volume serial number and a
+        // 128-bit file id, the reference -SelfTest checks Of against.
+        [StructLayout(LayoutKind.Sequential)]
+        struct IdInfo {
+            public ulong VolumeSerial;
+            public ulong IdLow, IdHigh;
+        }
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetFileInformationByHandleEx(IntPtr h, int infoClass, out IdInfo info, uint size);
+        const int FileIdInfo = 0x12;
+
+        static FileStream Open(string path) {
+            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        }
+
         public static string Of(string path) {
             Info info;
-            using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+            using (var f = Open(path)) {
                 if (!GetFileInformationByHandle(f.SafeFileHandle.DangerousGetHandle(), out info))
                     throw new InvalidOperationException("GetFileInformationByHandle " + path + ": error " + Marshal.GetLastWin32Error());
             }
-            ulong index = ((ulong)info.IndexHigh << 32) | info.IndexLow;
-            ulong volume = info.VolumeSerial;
+            return Encode(info.VolumeSerial, ((ulong)info.IndexHigh << 32) | info.IndexLow);
+        }
+
+        // The volume serial number and the file id from FILE_ID_INFO, for
+        // the self-test (NTFS: the file index is the id's low 64 bits).
+        public static ulong[] Reference(string path) {
+            IdInfo info;
+            using (var f = Open(path)) {
+                if (!GetFileInformationByHandleEx(f.SafeFileHandle.DangerousGetHandle(), FileIdInfo, out info, (uint)Marshal.SizeOf(typeof(IdInfo))))
+                    throw new InvalidOperationException("GetFileInformationByHandleEx " + path + ": error " + Marshal.GetLastWin32Error());
+            }
+            return new ulong[] { info.VolumeSerial, info.IdLow, info.IdHigh };
+        }
+
+        public static string Encode(ulong volume, ulong index) {
             const string digits = "0123456789abcdefghijklmnopqrstuv";
             var sb = new StringBuilder();
             for (int d = 19; d >= 0; d--) {
@@ -1457,12 +1498,18 @@ function Base-Config([int]$vcpus, [int]$mem = 256, [string]$bootArgs = $BootArgs
 # logs kept when the stage ends.
 # `$config` may be $null (a VM restored through the API). With -Api the VM gets
 # an API socket, returned as the `ApiSock` note property and waited for.
-function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api) {
+# -LogPath gives Firecracker another --log-path (a named pipe) than the
+# stage's file.
+function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api, [string]$LogPath = '') {
     $dir = Join-Path $Results $name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $logPath = Join-Path $dir 'firecracker.log'
-    # Firecracker opens the log file, it does not create it.
-    New-Item -ItemType File -Force -Path $logPath | Out-Null
+    if ($LogPath) {
+        $logPath = $LogPath
+    } else {
+        $logPath = Join-Path $dir 'firecracker.log'
+        # Firecracker opens the log file, it does not create it.
+        New-Item -ItemType File -Force -Path $logPath | Out-Null
+    }
     $fcArgs = "--log-path `"$logPath`" --level Debug --show-level --show-log-origin"
     if ($config) {
         $cfgPath = Join-Path $dir 'vm-config.json'
@@ -1494,6 +1541,7 @@ function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api) {
 
 # One API request; fails unless the status is 2xx. Returns the body.
 function Invoke-Api($vm, [string]$method, [string]$path, $body = $null) {
+    Check ([bool]$vm.ApiSock) "$method $path`: the VM was started without -Api"
     $json = if ($null -ne $body) { $body | ConvertTo-Json -Depth 8 -Compress } else { $null }
     $status = 0
     $out = [Wick.Api]::Call($vm.ApiSock, $method, $path, $json, 120000, [ref]$status)
@@ -1747,7 +1795,7 @@ function Stage-Net {
     if (Test-Path $endpoint) { Remove-Item $endpoint -Force }
     $cfg = Base-Config 2
     $cfg['network-interfaces'] = @([ordered]@{ iface_id = 'eth0'; host_dev_name = $endpoint; guest_mac = $GuestMac })
-    $vm = Start-Vm 'net' $cfg
+    $vm = Start-Vm 'net' $cfg -Api
     try {
         $switch = New-Object Wick.Switch($endpoint, 10000)
     } catch {
@@ -2258,6 +2306,9 @@ function Invoke-Exe([string]$exe, [string[]]$argv, [int]$ms = 30000) {
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    # What Rust writes: UTF-8 (the console's code page otherwise).
+    $psi.StandardOutputEncoding = New-Object Text.UTF8Encoding($false)
+    $psi.StandardErrorEncoding = New-Object Text.UTF8Encoding($false)
     $p = [Diagnostics.Process]::Start($psi)
     $out = $p.StandardOutput.ReadToEndAsync()
     $err = $p.StandardError.ReadToEndAsync()
@@ -2354,22 +2405,29 @@ function Stage-Cli {
     # --parent-cpu-time-us the jailer's: once the API server is up the
     # metrics hold the time since the start and the CPU time since then plus
     # the parent's (ProcessTimeReporter). The metrics go to a named pipe
-    # given on the command line, the log to one given through the API.
-    # Unlike a FIFO, a pipe exists only while its reader holds it, so the
-    # readers are made first; Firecracker connects to them.
+    # given on the command line, the log to one given through the API,
+    # before the microVM is configured and started there (upstream refuses
+    # PUT /logger once it runs: OperationNotSupportedPostBoot), as the
+    # macOS stage does with FIFOs. Unlike a FIFO, a pipe exists only while
+    # its reader holds it, so the readers are made first; Firecracker
+    # connects to them.
     $tag = "wick-bt-$PID"
     $mpipe = New-Object Wick.PipeReader("$tag-metrics", $true, 65536)
     $lpipe = New-Object Wick.PipeReader("$tag-log", $true, 65536)
-    $stall = New-Object Wick.PipeReader("$tag-stall", $false, 4096)
     try {
         $parent = 1000
         $t0 = Get-MonotonicUs
-        $vm = Start-Vm 'cli-time' (Base-Config 1) "--start-time-us $t0 --start-time-cpu-us 0 --parent-cpu-time-us $parent --metrics-path $($mpipe.Path)" -Api
+        $vm = Start-Vm 'cli-time' $null "--start-time-us $t0 --start-time-cpu-us 0 --parent-cpu-time-us $parent --metrics-path $($mpipe.Path)" -Api
         Check ($mpipe.WaitConnected(10000)) "Firecracker did not open the metrics pipe $($mpipe.Path)"
-        Wait-Shell $vm
         Invoke-Api $vm 'PUT' '/logger' ([ordered]@{ log_path = $lpipe.Path; level = 'Info' }) | Out-Null
         Check ($lpipe.WaitConnected(10000)) "Firecracker did not open the log pipe $($lpipe.Path)"
         Invoke-Api $vm 'GET' '/machine-config' | Out-Null
+        # Metrics are flushed on demand once the microVM runs.
+        $cfg = Base-Config 1
+        Invoke-Api $vm 'PUT' '/boot-source' $cfg['boot-source'] | Out-Null
+        Invoke-Api $vm 'PUT' '/drives/rootfs' $cfg['drives'][0] | Out-Null
+        Invoke-Api $vm 'PUT' '/machine-config' $cfg['machine-config'] | Out-Null
+        Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'InstanceStart' }) | Out-Null
         Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
         $wall = (Get-MonotonicUs) - $t0
         Check ($mpipe.WaitFor('utc_timestamp_ms', 10000)) "no metrics through the pipe: '$($mpipe.Text)'"
@@ -2380,29 +2438,48 @@ function Stage-Cli {
         $ncpu = [Environment]::ProcessorCount
         Check ($start -gt 0 -and $start -le $wall) "process_startup_time_us $start, $wall us since --start-time-us"
         Check ($cpu -gt $parent -and $cpu -lt $parent + $wall * $ncpu) "process_startup_time_cpu_us $cpu (parent $parent, wall $wall us, $ncpu CPUs)"
-        $done += "start time metrics $start us, $cpu CPU us (of $wall us); logger and metrics on named pipes"
-        Write-Step $done[-1]
-        # A reader that stops reading, then one that goes away: on Linux a
-        # FIFO opened O_RDWR never blocks the writer nor fails it with EPIPE.
-        # Firecracker must go on serving either way.
-        Invoke-Api $vm 'PUT' '/logger' ([ordered]@{ log_path = $stall.Path; level = 'Debug' }) | Out-Null
-        Check ($stall.WaitConnected(10000)) "Firecracker did not open the stalled pipe"
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        for ($i = 0; $i -lt 200; $i++) { Invoke-Api $vm 'GET' '/' | Out-Null }
-        $out = $vm.Sh('echo still-$((6*7))')
-        Check ($out -eq 'still-42') "the guest after 200 requests logged to a pipe nobody reads: '$out'"
-        $stalled = [int]$sw.Elapsed.TotalMilliseconds
-        $stall.Close()
-        for ($i = 0; $i -lt 50; $i++) { Invoke-Api $vm 'GET' '/' | Out-Null }
-        $out = $vm.Sh('echo after-$((6*7))')
-        Check ($out -eq 'after-42' -and -not $vm.Exited) "after the log pipe's reader went away: '$out' ($($vm.ExitReason()))"
+        # The readers go away mid-run. On Linux Firecracker holds both FIFOs
+        # open read-write and non-blocking (open_file_nonblock), so a write
+        # past a full pipe fails with EAGAIN; on Windows a write to a pipe
+        # whose reader left fails at once (ERROR_PIPE_NOT_CONNECTED, 233).
+        # Either way the line is lost and counted (upstream's logger and
+        # metrics: missed_log_count, missed_metrics_count, "Failed to write
+        # metrics"), and the microVM and the API go on.
+        $mpipe.Close()
+        $lpipe.Close()
+        for ($i = 0; $i -lt 500; $i++) { Invoke-Api $vm 'GET' '/machine-config' | Out-Null }
         Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
-        Check ($mpipe.WaitFor('"missed_log_count":[1-9]', 10000)) "logger.missed_log_count stayed 0 while nobody read the log pipe"
-        $done += "a log pipe nobody reads (200 requests in $stalled ms, lines missed and counted) or whose reader left does not stop Firecracker"
+        Wait-Shell $vm
+        $out = $vm.Sh('echo after-$((6*7))')
+        Check ($out -eq 'after-42' -and -not $vm.Exited) "after the pipes' readers went away: '$out' ($($vm.ExitReason()))"
+        $vm.Reboot()
+        $done += "start time metrics $start us, $cpu CPU us (of $wall us); logger and metrics on named pipes, and the microVM goes on once their readers went"
         Write-Step $done[-1]
-        $vm.Kill()
     } finally {
-        $mpipe.Close(); $lpipe.Close(); $stall.Close()
+        $mpipe.Close(); $lpipe.Close()
+    }
+
+    # A log pipe nobody ever reads, given on the command line: once its
+    # buffer is full each line is lost and counted in
+    # logger.missed_log_count (logging.rs), as on Linux with a FIFO.
+    $unread = New-Object Wick.PipeReader("$tag-unread", $false, 4096)
+    try {
+        $metrics = Join-Path $dir 'cli-unread.metrics'
+        New-Item -ItemType File -Force -Path $metrics | Out-Null
+        $vm = Start-Vm 'cli-unread' (Base-Config 1) "--metrics-path `"$metrics`"" -Api -LogPath $unread.Path
+        Check ($unread.WaitConnected(10000)) "Firecracker did not open the log pipe nobody reads"
+        Wait-Shell $vm
+        for ($i = 0; $i -lt 2000; $i++) { Invoke-Api $vm 'GET' '/machine-config' | Out-Null }
+        Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
+        $missed = [long](Get-MetricsLines (Get-Content -Raw $metrics))[-1].logger.missed_log_count
+        Check ($missed -gt 0) "logger.missed_log_count $missed after 2000 requests logged to a pipe nobody reads"
+        $out = $vm.Sh('echo unread-$((6*7))')
+        Check ($out -eq 'unread-42' -and -not $vm.Exited) "guest with an unread log pipe: '$out' ($($vm.ExitReason()))"
+        $vm.Reboot()
+        $done += "a log pipe nobody reads: $missed lines missed and counted, the microVM goes on"
+        Write-Step $done[-1]
+    } finally {
+        $unread.Close()
     }
 
     # (e) --boot-timer: the guest's /usr/local/bin/init (upstream's rootfs
@@ -2515,22 +2592,37 @@ function Stage-Tools {
     $r = Invoke-Exe $editor @('info-vmstate', 'version', '--vmstate-path', $state)
     Check ($r[0] -eq 0 -and $r[1].Trim() -eq 'v12.0.0') "info-vmstate version: $($r[0]) '$($r[1].Trim())'"
     $r = Invoke-Exe $editor @('info-vmstate', 'vcpu-states', '--vmstate-path', $state)
+    # Kept with the results: the state file (a few KiB) and the listing.
+    $keep = Join-Path $Results 'tools'
+    New-Item -ItemType Directory -Force -Path $keep | Out-Null
+    Copy-Item $state (Join-Path $keep 'diff.state')
+    [IO.File]::WriteAllText((Join-Path $keep 'vcpu-states.txt'), $r[1])
     Check ($r[0] -eq 0) "info-vmstate vcpu-states: $($r[0]) $($r[1])"
     $parts = [regex]::Split($r[1], '(?m)^vcpu (\d+):\r?$')
     $ids = @(); for ($i = 1; $i -lt $parts.Count; $i += 2) { $ids += $parts[$i] }
     Check (($ids -join ',') -eq '0,1') "vcpu-states lists vCPUs $($ids -join ',')"
+    $seen = @()
     for ($i = 0; $i -lt 2; $i++) {
         $body = $parts[2 * $i + 2]
-        # x86_64: kvm_mp_state, and the instruction pointer in kernel space.
+        # x86_64: kvm_mp_state RUNNABLE (0) or, for a vCPU idle in HLT,
+        # HALTED (3), as KVM reports a paused guest's (x86.c:
+        # __kvm_emulate_halt sets HALTED, kvm_arch_vcpu_ioctl_get_mpstate
+        # returns it); and the instruction pointer in kernel space (a guest
+        # whose only process is an idle shell).
+        $mp = [regex]::Match($body, 'mp_state: (\d+),')
         $rip = [regex]::Match($body, '(?m)^\s*rip: (\d+),')
-        $ripOk = $rip.Success -and ([UInt64]::Parse($rip.Groups[1].Value) -ge [UInt64]'18446603336221196288')
-        Check ($body -match 'mp_state: 0,' -and $ripOk) "vcpu ${i}: $($body.Trim().Substring(0, [math]::Min(200, $body.Trim().Length)))"
+        $mpv = if ($mp.Success) { [int]$mp.Groups[1].Value } else { -1 }
+        $ripv = if ($rip.Success) { [UInt64]::Parse($rip.Groups[1].Value) } else { [UInt64]0 }
+        $what = "vcpu ${i}: mp_state $(if ($mp.Success) { $mpv } else { 'missing' }), rip $(if ($rip.Success) { '0x{0:x}' -f $ripv } else { 'missing' }) (listing in $keep\vcpu-states.txt)"
+        Check ($mpv -eq 0 -or $mpv -eq 3) $what
+        Check ($ripv -ge [UInt64]'18446603336221196288') $what
+        $seen += "mp_state $mpv"
     }
     $r = Invoke-Exe $editor @('info-vmstate', 'vm-state', '--vmstate-path', $state)
     Check ($r[0] -eq 0 -and $r[1] -match 'mem_size_mib: 256' -and ([regex]::Matches($r[1], 'kvm_mp_state \{')).Count -eq 2 -and $r[1] -match 'device_states:') "info-vmstate vm-state: $($r[0]) $($r[1].Substring(0, [math]::Min(300, $r[1].Length)))"
     $r = Invoke-Exe $editor @('info-vmstate', 'version', '--vmstate-path', $Kernel)
     Check ($r[0] -ne 0) "info-vmstate version of a kernel image: $($r[0]) $($r[1])"
-    $done += 'info-vmstate version v12.0.0, vcpu-states (2 vCPUs, mp_state, RIP), vm-state; a non-snapshot refused'
+    $done += "info-vmstate version v12.0.0, vcpu-states (2 vCPUs: $($seen -join ', '), RIP in the kernel), vm-state; a non-snapshot refused"
     Write-Step $done[-1]
 
     # rebase-snap (deprecated for snapshot-editor edit-memory rebase): the
@@ -2690,7 +2782,11 @@ function Find-Gdb {
 function Start-Gdb([string]$gdb, [string]$symbols, [string]$script, [string]$out) {
     $scriptPath = "$out.gdb"
     [IO.File]::WriteAllText($scriptPath, $script)
-    return Start-Process -FilePath $gdb -ArgumentList @('-nx', '-batch', '-x', "`"$scriptPath`"", "`"$symbols`"") -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+    $p = Start-Process -FilePath $gdb -ArgumentList @('-nx', '-batch', '-x', "`"$scriptPath`"", "`"$symbols`"") -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+    # Windows PowerShell 5.1 keeps no exit code for a Start-Process process
+    # unless its handle was taken while it ran.
+    $null = $p.Handle
+    return $p
 }
 
 function Get-GdbText([string]$out) {
@@ -2734,16 +2830,23 @@ function Stage-Gdb {
         } finally { $in.Close() }
         Move-Item -Force "$symbols.part" $symbols
     }
-    # What the kernel file holds, read by gdb without a target.
+    # What the kernel file holds, read by gdb without a target: from the
+    # kernel itself (its code is PROGBITS), with the split debug file's
+    # symbols, which the live session uses. The debug file alone has the
+    # code sections as NOBITS, which gdb reads as zeros.
     $dir = Join-Path $Results 'gdb'
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $offline = Join-Path $dir 'offline.txt'
-    $p = Start-Gdb $gdb $symbols "printf `"WICK-X1\n`"`nx/16xb start_kernel`nprintf `"WICK-X3\n`"`nx/16xb _text`n" $offline
-    Check ($p.WaitForExit(120000) -and $p.ExitCode -eq 0) "gdb cannot read $symbols ($gdb must read x86-64 Linux kernels): $(Get-GdbText $offline)"
+    # gdb's argument parser takes backslashes as escapes: forward slashes.
+    $symbolFile = $symbols -replace '\\', '/'
+    $p = Start-Gdb $gdb $kernel "symbol-file `"$symbolFile`"`nprintf `"WICK-X1\n`"`nx/16xb start_kernel`nprintf `"WICK-X3\n`"`nx/16xb _text`n" $offline
+    Check ($p.WaitForExit(120000) -and $p.ExitCode -eq 0) "gdb cannot read $kernel with the symbols of $symbols ($gdb must read x86-64 Linux kernels): exit $($p.ExitCode): $(Get-GdbText $offline)"
     $offlineText = Get-GdbText $offline
     $fileStart = Get-GdbBytes $offlineText 'WICK-X1'
     $fileText = Get-GdbBytes $offlineText 'WICK-X3'
-    Check ($fileStart -match '^(0x[0-9a-f]{2} ){15}0x[0-9a-f]{2}$' -and $fileText -match '^(0x[0-9a-f]{2} ){15}') "gdb's reading of start_kernel and _text in $symbols`: $offlineText"
+    Check ($fileStart -match '^(0x[0-9a-f]{2} ){15}0x[0-9a-f]{2}$' -and $fileText -match '^(0x[0-9a-f]{2} ){15}') "gdb's reading of start_kernel and _text in $kernel`: $offlineText"
+    # Code is not all zeros: zeros are what a section without its bytes reads as.
+    Check ($fileStart -notmatch '^(0x00 ?)+$' -and $fileText -notmatch '^(0x00 ?)+$') "gdb read zeros for start_kernel or _text in $kernel (no code bytes in the file it read): $offlineText"
 
     $sock = Join-Path $SockDir 'gdb.sock'
     if (Test-Path $sock) { [IO.File]::Delete($sock) }
@@ -2858,14 +2961,23 @@ function Stage-MemoryHotplug {
         }
     }
     & $plug 512
-    # Memory past what the guest booted with, written and read back.
-    $out = $vm.Sh('mount -t tmpfs -o size=900m tmpfs /mnt && head -c 600m /dev/urandom > /mnt/f && md5sum /mnt/f > /tmp/a && md5sum /mnt/f | cmp - /tmp/a && echo same', 180000, $true)
+    # Memory past what the guest booted with, written and read back. (The
+    # root file system is read-only: the tmpfs goes on /tmp, as in the
+    # macOS stage.)
+    $out = $vm.Sh('mount -t tmpfs -o size=900m tmpfs /tmp && head -c 600m /dev/urandom > /tmp/f && md5sum /tmp/f > /tmp/a && md5sum /tmp/f | cmp - /tmp/a && echo same', 180000, $true)
     Check ($out -eq 'same') "600 MiB in a guest of $base + 512 MiB read back differently: '$out'"
-    $vm.Sh('rm /mnt/f && umount /mnt') | Out-Null
+    $vm.Sh('rm /tmp/f /tmp/a && umount /tmp') | Out-Null
+    # The unplugged memory leaves Firecracker's commit charge (the
+    # counterpart of the macOS stage's resident size).
+    $commit = { (Get-Process -Id $vm.Pid).PrivateMemorySize64 }
+    $plugged = & $commit
     & $plug 0
+    $unplugged = & $commit
+    Check ($unplugged -lt $plugged) ("commit charge {0} -> {1} MiB after the unplug" -f ($plugged -shr 20), ($unplugged -shr 20))
+    & $plug 512  # again, as upstream's test does
     Save-Dmesg $vm 'memory-hotplug'
     $vm.Reboot()
-    return "virtio-mem: MemTotal $base -> $($base + 512) MiB and back, 600 MiB written and read back while plugged"
+    return ("virtio-mem: MemTotal $base -> $($base + 512) MiB and back and again, 600 MiB written and read back while plugged, commit charge {0} -> {1} MiB at the unplug" -f ($plugged -shr 20), ($unplugged -shr 20))
 }
 
 $Stages = [ordered]@{
@@ -2928,6 +3040,26 @@ if ($SelfTest) {
                 $c.Dispose()
             } finally { $tcp.Close(); $relay.Stop(); $stub.Dispose() }
             return 'Relay: TCP to a Unix socket and back'
+        }
+        driveid = {
+            # The block stage's expected serial: Of (BY_HANDLE_FILE_INFORMATION)
+            # against FILE_ID_INFO and against `vol`'s serial number (its
+            # text is localised; the number is not).
+            $f = Join-Path $dir 'drive.img'
+            [IO.File]::WriteAllBytes($f, (New-Object byte[] 4096))
+            $ref = [Wick.DriveId]::Reference($f)
+            Check ($ref[2] -eq 0) "a 128-bit file id ($('{0:x16}{1:x16}' -f $ref[2], $ref[1])): not NTFS"
+            # The low 32 bits (0xffffffff alone is the Int32 -1 in PowerShell).
+            $serialRef = $ref[0] -band [UInt64]4294967295
+            $want = [Wick.DriveId]::Encode($serialRef, $ref[1])
+            $got = [Wick.DriveId]::Of($f)
+            Check ($got -eq $want) "DriveId.Of '$got', FILE_ID_INFO gives '$want'"
+            $vol = (cmd /c "vol $($f.Substring(0, 2))" 2>&1) -join ' '
+            $m = [regex]::Match($vol, '([0-9A-Fa-f]{4})-([0-9A-Fa-f]{4})')
+            Check $m.Success "no serial number in 'vol': $vol"
+            $serial = [Convert]::ToUInt64($m.Groups[1].Value + $m.Groups[2].Value, 16)
+            Check ($serial -eq $serialRef) ("vol says {0:x8}, FILE_ID_INFO {1:x8}" -f $serial, $serialRef)
+            return ("DriveId: '{0}' = volume {1:x8}, file index {2:x16} (FILE_ID_INFO, vol)" -f $got, $serial, $ref[1])
         }
         sparse = {
             # The synthetic diff files of the tools stage.
@@ -3025,7 +3157,7 @@ $hostInfo = @(
     "windows: $($os.Caption) $($os.Version) build $($os.BuildNumber).$ubr",
     "cpu: $($cpu.Name) ($($cpu.NumberOfCores) cores, $($cpu.NumberOfLogicalProcessors) threads)",
     "memory: $([math]::Round($cs.TotalPhysicalMemory / 1GB, 1)) GiB",
-    "HypervisorPlatform feature: $feature",
+    "HypervisorPlatform feature: $feature (not the test for WHP: see WHP below)",
     "hypervisor present: $($cs.HypervisorPresent)",
     "virtualization firmware enabled: $($cpu.VirtualizationFirmwareEnabled)",
     "WHP: $whpState",
