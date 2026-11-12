@@ -31,9 +31,9 @@ rootfs; on Windows, by [`tools/windows/boot-test.ps1`](../tools/windows/boot-tes
 | Snapshots | upstream | works (full and diff, restore in another process, `snapshot-editor rebase`, with PCI) | works (full and diff, restore in another process, `snapshot-editor rebase`, with PCI; diff dumps 64 KiB units, NTFS's sparse granularity) |
 | userfaultfd (`Uffd` memory backend) | upstream | works | works (WHP memory access exits, vectored exception handler, section alias; upstream's `uffd_on_demand_handler`) |
 | vhost-user | upstream | works (vhost-user-blk backend in another process) | works (vhost-user-blk backend in another process) |
-| hugepages | upstream | works as far as the host allows: 2 MiB pages on host pages, faulted and filled whole through a userfaultfd (no superpage for user space on Apple silicon: measured; `boot-test hugepages`, docs/PORTING.md row 10) | built unjailed (`MEM_LARGE_PAGES`, needs "Lock pages in memory"; Firecracker's `MAP_FIXED` guest memory over its reservation; `boot-test hugepages`); refused in a jail, where no privilege can be enabled (`jailer-test.ps1 hugepages`; a broker from the jailer is the open work) |
+| hugepages | upstream | works as far as the host allows: 2 MiB pages on host pages, faulted and filled whole through a userfaultfd (no superpage for user space on Apple silicon: measured; `boot-test hugepages`, docs/PORTING.md row 10) | built unjailed (`MEM_LARGE_PAGES`, needs "Lock pages in memory"; Firecracker's `MAP_FIXED` guest memory over its reservation; `boot-test hugepages`); in a jail, where no privilege can be enabled, the jailer makes them for Firecracker (`jailer-test.ps1 hugepages`, docs/PORTING.md row 10) |
 | seccomp | upstream | Seatbelt | process mitigation policies |
-| jailer | upstream | in place: upstream's jailer; chroot, uid/gid, memory and CPU cgroups, resource limits, daemonize (`jailer-test`) | in place: upstream's jailer; the jail as a drive, a restricted low-integrity token with a SID per jail, memory and CPU limits through a Job Object (`tools/windows/jailer-test.ps1`) |
+| jailer | upstream | in place: upstream's jailer; chroot, uid/gid, memory and CPU cgroups, resource limits, daemonize (`jailer-test`) | in place: upstream's jailer; the jail as a drive, a restricted token below medium integrity with a SID per jail, memory and CPU limits through a Job Object (`tools/windows/jailer-test.ps1`) |
 
 ## M1. Foundation
 
@@ -78,10 +78,10 @@ What is left on macOS belongs to other milestones: the jailer (M5) and x86_64 im
 **Done when** `tools/windows/boot-test.ps1` passes every stage on a real Windows PC with the Windows Hypervisor
 Platform, and the Windows column of [At a glance](#at-a-glance) says "works" for each row it covers.
 
-**Every boot test stage but `hugepages` passes on real hardware** (AMD Ryzen 9 7900, Windows 11 Pro build 26300):
-boot, smp, block, vsock, net, snapshot, diff, uffd, pci, restores (20 restores, each paused and snapshotted
-again) and vhost-user. `hugepages` needs the account to hold "Lock
-pages in memory", which that machine's does not yet. The vmm library and the firecracker binary build and link for
+**Every boot test stage but the new `balloon` passes on real hardware** (AMD Ryzen 9 7900, Windows 11 Pro build
+26300): boot, smp, block, vsock, net, snapshot, diff, uffd, pci, restores (20 restores, each paused and snapshotted
+again), vhost-user, hugepages, api-process and devices (docs/PORTING.md rows 4, 10 and 15). `balloon` is written and
+waits for that machine. The vmm library and the firecracker binary build and link for
 `x86_64-pc-windows-gnu` (cross) and `x86_64-pc-windows-msvc` (native, the binary CI publishes).
 
 - Done: the POSIX layer (`wick-os`, `wick-std`, `libc`, `vmm-sys-util`, `memfd`, generated
@@ -106,7 +106,7 @@ pages in memory", which that machine's does not yet. The vmm library and the fir
   vhost-user-blk test backend, and huge pages (`MEM_LARGE_PAGES`).
 - Measured on that machine: WHP honours the host protection of guest RAM (a guest access to a `PAGE_NOACCESS` page
   exits at the instruction and re-runs once the page is accessible), which the Uffd backend relies on; WHP is
-  refused inside an AppContainer (`E_ACCESSDENIED`) but works for a process on a restricted, low integrity token
+  refused inside an AppContainer (`E_ACCESSDENIED`) but works for a process on a restricted token below medium integrity
   that has no access to the user's files ([M5](#m5-security-parity-the-jailer-on-every-host)).
 - What the hardware runs found, each fixed and covered by its stage: the guest's CPUID (KVM's supported set, no
   MWAIT or nested virtualisation; OSXSAVE, OSPKE and the XSAVE sizes from the vCPU's state at each CPUID exit; the TSC
@@ -118,8 +118,9 @@ pages in memory", which that machine's does not yet. The vmm library and the fir
   snapshots in 64 KiB units (patch 0021) and a guest RAM access under userfaultfd never treated as MMIO.
 - Found since, by reading the path `huge_pages` takes: Firecracker 1.18 maps guest memory `MAP_FIXED` over a
   `PROT_NONE` reservation, which the libc layer refused for large pages, so `hugepages` could not have passed.
-  Fixed (docs/PORTING.md, row 10), and a jailed Firecracker keeps the privilege when the operator holds it.
-- Next: `hugepages` (boot test and jailer test) on a machine whose account holds the privilege.
+  Fixed (docs/PORTING.md, row 10); a jailed Firecracker, whose token can have no privilege enabled, gets its large
+  pages from the jailer (`test_hugetlb_through_the_broker`), and `hugepages` passes there, unjailed and jailed.
+- Next: the `balloon` stage on that machine.
 
 ## M4. Linux: upstream parity
 

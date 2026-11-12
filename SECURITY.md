@@ -117,8 +117,8 @@ upstream Firecracker and its jailer.
   before its sandbox is set, or by the jailer in a jail on the jail's token and in its Job Object, with its end of
   the link and a handle to Firecracker inherited; it has the whole mitigation profile from its start, before it
   reads a byte from the socket (`test_api_profile_is_the_whole_profile_at_once`,
-  `test_the_api_process_serves_under_the_api_profile`, `jailer-test.ps1 api`; `boot-test api-process` waits for a
-  WHP machine).
+  `test_the_api_process_serves_under_the_api_profile`, `jailer-test.ps1 api`, and `boot-test api-process` on a WHP
+  machine).
 - **wick's host-side code is young.** The compatibility crates and the macOS and Windows backends (the
   Hypervisor.framework and WHP run loops, the userfaultfd kernel side, the network backends) have not had the years
   of review and fuzzing upstream's code has had, and have not had a third-party audit. Fuzzing has started: the

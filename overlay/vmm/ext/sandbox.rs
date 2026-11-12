@@ -2283,7 +2283,7 @@ mod macos {
         }
 
         #[test]
-        #[ignore = "run by test_unix_bind_is_setups_only in a separate process"]
+        #[ignore = "run by test_unix_bind_after_narrow_is_where_setup_binds in a separate process"]
         fn bind_after_narrow_child() {
             let case = std::env::var("WICK_TEST_CASE").unwrap();
             let jail = std::path::PathBuf::from(std::env::var("WICK_TEST_JAIL").unwrap());

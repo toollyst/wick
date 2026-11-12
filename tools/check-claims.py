@@ -16,6 +16,12 @@ than what the product does.
 Cells of a Windows column are reported as warnings unless --strict-windows
 is given (docs/ROADMAP.md, M5, tracks making them errors); all other cells
 are errors.
+
+Every test these files and docs/COMPATIBILITY.md name in backquotes
+(`test_...`) must exist: a function of that name in the repository's Rust,
+Python or PowerShell sources or in the patch series, an upstream test file of
+that name, or a test of the Linux baseline. A renamed test leaves a claim
+that names nothing.
 """
 import re
 import sys
@@ -23,6 +29,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FILES = ["README.md", "SECURITY.md", "docs/ROADMAP.md", "docs/PORTING.md"]
+# Also checked for the tests they name.
+NAMING = FILES + ["docs/COMPATIBILITY.md"]
+SOURCES = ["crates", "overlay", "tools", "fuzz", "patches", "lib/firecracker/src", "lib/firecracker/tests"]
+SKIP_DIRS = {"target", "build", ".git", "__pycache__"}
+DEFINED = re.compile(r"\b(?:fn|def|function)\s+(test_[A-Za-z0-9_]+)")
+NAMED = re.compile(r"`([^`]*)`")
 CLAIM = re.compile(r"\bverified\b|\bmeasured\b|\bin place\b(?! of)", re.I)
 EVIDENCE = re.compile(
     r"`[^`]*(boot-test|jailer-test|test_[a-z0-9_]+|ext::[a-z_:]+|cargo test|integration-tests|"
@@ -47,9 +59,35 @@ def cells(path):
             yield n, header[i] if i < len(header) else str(i), text
 
 
+def known_tests():
+    """Every test name defined in the sources, upstream's test files, and the Linux baseline."""
+    known = set()
+    for top in SOURCES:
+        for path in (ROOT / top).rglob("*"):
+            if SKIP_DIRS & set(path.relative_to(ROOT).parts) or not path.is_file():
+                continue
+            if path.name.startswith("test_") and path.suffix == ".py":
+                known.add(path.stem)
+            if path.suffix in (".rs", ".py", ".patch", ".ps1", ".sh"):
+                known.update(DEFINED.findall(path.read_text(errors="replace")))
+    baseline = ROOT / "tools/macos/integration-linux-baseline.txt"
+    known.update(re.findall(r"::(test_[A-Za-z0-9_]+)", baseline.read_text()))
+    return known
+
+
 def main():
     strict_windows = "--strict-windows" in sys.argv[1:]
     errors = warnings = 0
+    known = known_tests()
+    for name in NAMING:
+        for n, line in enumerate((ROOT / name).read_text().splitlines(), 1):
+            for quoted in NAMED.findall(line):
+                for test in re.findall(r"\b(test_[a-z0-9_]+)", quoted):
+                    # `test_api_profile_*`: a prefix.
+                    if test in known or test.endswith("_") and any(k.startswith(test) for k in known):
+                        continue
+                    print(f"error: {name}:{n} names {test}, which no source, test file or baseline defines")
+                    errors += 1
     for name in FILES:
         for n, column, text in cells(ROOT / name):
             claim = CLAIM.search(text)

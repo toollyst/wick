@@ -51,7 +51,7 @@ jobs:
           unpinned="$(grep -nE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s*[^@ ]+@[0-9a-f]{40}( |$)' || true)"
           [[ -z "$unpinned" ]] || { echo "::error::actions not pinned by full commit SHA:"; echo "$unpinned"; exit 1; }
       # Every "in place", "verified" or "measured" in the docs' tables names
-      # the test that checks it (Windows cells: warnings for now, M5).
+      # the test that checks it, Windows cells included.
       - name: Doc claims name their tests
         run: python3 tools/check-claims.py --strict-windows
       - name: Compatibility matrix counts are current
