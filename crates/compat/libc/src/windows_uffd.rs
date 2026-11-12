@@ -1038,9 +1038,20 @@ mod tests {
         assert!(!is_missing(mem + 2 * PAGE));
         // The missing runs of a span as large as the address space, found
         // without a walk by pages over the memory nobody registered.
+        // Other tests' registrations can lie right next to this one, and a
+        // run of missing pages goes on across them
+        // (`test_adjacent_ranges_stay_apart`): only the part of each run in
+        // this range is this test's.
         let mut runs = Vec::new();
         for_each_missing(PAGE, u64::MAX / 2, |a, l| runs.push((a, l)));
-        runs.retain(|&(a, _)| a >= mem && a < mem + len as u64);
+        let end = mem + len as u64;
+        let runs: Vec<_> = runs
+            .into_iter()
+            .filter_map(|(a, l)| {
+                let (s, e) = (a.max(mem), (a + l).min(end));
+                (s < e).then(|| (s, e - s))
+            })
+            .collect();
         assert_eq!(runs, [(mem + PAGE, PAGE), (mem + 4 * PAGE, len as u64 - 4 * PAGE)]);
 
         // Unregistered: missing pages read as zeros, nothing faults.
@@ -1077,6 +1088,90 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         // SAFETY: as above.
         unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// Two registrations side by side, of two userfaultfds (as two tests'
+    /// mappings, or two of Firecracker's, can be): a run of missing pages
+    /// goes on across the boundary, but nothing is reported past the span
+    /// asked for, and a discard of one range never touches the other or
+    /// tells the other's userfaultfd.
+    #[test]
+    fn test_adjacent_ranges_stay_apart() {
+        let len = 64 * 1024usize;
+        let ulen = len as u64;
+        // SAFETY: a reservation, then two mappings over it, as Firecracker maps guest memory.
+        let base = unsafe {
+            crate::mmap(ptr::null_mut(), 2 * len, crate::PROT_NONE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0)
+        };
+        assert_ne!(base, crate::MAP_FAILED);
+        let (a, b) = (base as u64, base as u64 + ulen);
+        for m in [a, b] {
+            // SAFETY: over our reservation.
+            let p = unsafe {
+                crate::mmap(
+                    m as *mut c_void,
+                    len,
+                    crate::PROT_READ | crate::PROT_WRITE,
+                    crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            assert_eq!(p as u64, m);
+        }
+        let (ca, ua) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let (cb, ub) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        register(ca, a, ulen).unwrap();
+        register(cb, b, ulen).unwrap();
+
+        // All pages of both are missing: one run across the boundary, as the
+        // CI failure of test_host_fault_copy_zeropage saw it (28 pages from
+        // its range's 12 and a neighbour's 16) ...
+        let mut runs = Vec::new();
+        for_each_missing(PAGE, u64::MAX / 2, |s, l| runs.push((s, l)));
+        assert!(runs.iter().any(|&(s, l)| s <= a && s + l >= b + ulen), "{runs:x?}");
+        // ... but never past the span asked for.
+        let mut runs = Vec::new();
+        for_each_missing(a, ulen, |s, l| runs.push((s, l)));
+        assert_eq!(runs, [(a, ulen)]);
+        let mut runs = Vec::new();
+        for_each_missing(b + PAGE, PAGE, |s, l| runs.push((s, l)));
+        assert_eq!(runs, [(b + PAGE, PAGE)]);
+
+        // B's first page filled, with content.
+        let five = std::vec![5u8; PAGE as usize];
+        // SAFETY: a page-sized buffer into B's missing first page.
+        assert_eq!(unsafe { copy(cb, five.as_ptr(), b, PAGE, true) }.unwrap(), PAGE);
+        // A discard of A alone: A's event only; B's page is still there.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::madvise(a as *mut c_void, len, crate::MADV_DONTNEED) }, 0);
+        let mut buf = [0u8; proto::RECORD];
+        assert!(recv_all(ua, &mut buf));
+        assert_eq!(words(&buf)[..3], [proto::EVENT_REMOVE, a, b]);
+        assert!(!is_missing(b));
+        // SAFETY: B's present page.
+        assert_eq!(unsafe { *(b as *const u8) }, 5);
+        // B's first event is its own discard, not A's.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::madvise(b as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        assert!(recv_all(ub, &mut buf));
+        assert_eq!(words(&buf)[..3], [proto::EVENT_REMOVE, b, b + PAGE]);
+        // A discard of both: each userfaultfd hears of its own range only.
+        // SAFETY: our mappings.
+        assert_eq!(unsafe { crate::madvise(a as *mut c_void, 2 * len, crate::MADV_DONTNEED) }, 0);
+        assert!(recv_all(ua, &mut buf));
+        assert_eq!(words(&buf)[..3], [proto::EVENT_REMOVE, a, b]);
+        assert!(recv_all(ub, &mut buf));
+        assert_eq!(words(&buf)[..3], [proto::EVENT_REMOVE, b, b + ulen]);
+
+        unregister(ca, a, ulen).unwrap();
+        unregister(cb, b, ulen).unwrap();
+        // SAFETY: closes the user ends; our mappings.
+        unsafe {
+            ws::closesocket(sock(ua));
+            ws::closesocket(sock(ub));
+            crate::munmap(base, 2 * len);
+        }
     }
 
     #[test]
