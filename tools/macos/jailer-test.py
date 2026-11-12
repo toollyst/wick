@@ -1213,8 +1213,25 @@ def main():
     finally:
         subprocess.run(["pkill", "-9", "-f", ctx.base], check=False)
         leftover = []
+
+        def not_removed(func, path, _exc):
+            # A freezer file a supervisor killed while writing it back left
+            # immutable (UF_IMMUTABLE, 2): the flag is lifted, said, and the
+            # removal tried once more.
+            try:
+                flags = os.lstat(path).st_flags
+                if flags & 2 and os.path.basename(path) in ("freezer.state", "cgroup.freeze"):
+                    os.chflags(path, flags & ~2)
+                    print(f"cleanup: {path} was left immutable by a killed supervisor: chflags nouchg, then removed",
+                          file=sys.stderr)
+                    func(path)
+                    return
+            except OSError:
+                pass
+            leftover.append(path)
+
         # onerror: sudo's python3 can be the system's 3.9, without onexc.
-        shutil.rmtree(ctx.base, onerror=lambda _f, path, _e: leftover.append(path))
+        shutil.rmtree(ctx.base, onerror=not_removed)
         if leftover:
             # Reported, never left silently: tools/clean.sh removes them later.
             print(f"cleanup: could not remove {len(leftover)} paths, e.g. {leftover[0]}", file=sys.stderr)

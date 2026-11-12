@@ -90,6 +90,10 @@ remove() {
         freed_kb=$((freed_kb + kb))
     else
         echo "cannot remove $p ($why)$( ((EUID)) && echo ': run as root (sudo tools/clean.sh)')" >&2
+        # A jail's freezer file that a supervisor killed while writing it
+        # back left immutable: named with the command that lifts the flag.
+        find "$p" \( -name freezer.state -o -name cgroup.freeze \) -flags +uchg -print 2>/dev/null |
+            while IFS= read -r f; do echo "  left immutable by a killed supervisor: chflags nouchg $f" >&2; done
         failed=1
     fi
 }

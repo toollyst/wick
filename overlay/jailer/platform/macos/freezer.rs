@@ -74,10 +74,31 @@
 //!     that holds the file's `flock` for its write (`open` with `O_EXLOCK`,
 //!     which XNU's `open1` takes before it truncates, bsd/vfs/
 //!     vfs_syscalls.c) never loses one. `flock` is advisory and macOS has no
-//!     lock a writer cannot ignore: a writer that takes none (the shell's
-//!     `>`) can still lose a write that lands whole between the
-//!     supervisor's second read and its write, two system calls in a row,
-//!     and only when the supervisor is writing the file back at all;
+//!     lock a writer cannot ignore, so for the write-back itself the
+//!     supervisor closes the file to new writers ([`Immutable`]): it sets
+//!     the file's user-immutable flag (`UF_IMMUTABLE`, `chflags uchg`),
+//!     reads the file once more, writes, and lifts the flag. While it is
+//!     set, an `open` for writing fails with `EPERM` (XNU checks it when it
+//!     authorizes the open: bsd/vfs/vfs_subr.c
+//!     `vnode_authorize_checkimmutable`), so the shell's `>` fails with
+//!     "Operation not permitted" for those microseconds and is to be tried
+//!     again, where it was written over unseen before; one that truncated
+//!     the file just before is seen by that last read. Only the file's
+//!     owner or root sets or lifts the flag (`vnode_authattr`: a change of
+//!     flags needs `KAUTH_VNODE_WRITE_SECURITY`), so the jail's uid cannot.
+//!     It is set only when the file is about to be written, never for a
+//!     file left as it is. What is left: the flag stops opens, not writes
+//!     through a descriptor that is open already (measured, macOS 27.2), so
+//!     a writer that keeps the file open and writes without truncating, or
+//!     one whose open was past that check when the flag was set, is still
+//!     written over if its write lands between the supervisor's last read
+//!     and its write;
+//!   - a supervisor killed (SIGKILL, root only) between setting and lifting
+//!     the flag leaves the file immutable: `rm` of the jail's directory then
+//!     fails on it with "Operation not permitted" until `chflags nouchg
+//!     <jail>/freezer.state` (or `cgroup.freeze`). A jailer started on that
+//!     directory lifts the flag itself before it refuses the directory, as
+//!     it refuses any that holds freezer files ([`Files::make`]);
 //!   - an operator's own write through `open(O_TRUNC)` (the shell's `>`)
 //!     empties the file before it writes: a reader can read it empty
 //!     between the two, which the supervisor cannot prevent (it never
@@ -189,6 +210,92 @@ impl Content {
     }
 }
 
+/// The control file closed to new writers while it is written back: its
+/// user-immutable flag set, so that an `open` for writing fails with `EPERM`
+/// (the module's text has what that stops and what it does not). Lifted by
+/// [`lift`](Self::lift), or when dropped on an error's way out.
+struct Immutable<'a> {
+    file: &'a OwnedFd,
+    /// The file's flags before.
+    flags: u32,
+    set: bool,
+    #[cfg(test)]
+    since: std::time::Instant,
+}
+
+impl<'a> Immutable<'a> {
+    fn set(file: &'a OwnedFd) -> io::Result<Immutable<'a>> {
+        // SAFETY: zeroed is a valid stat to fill.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a descriptor of ours, an out-pointer.
+        check(unsafe { libc::fstat(file.as_raw_fd(), &mut st) })?;
+        // SAFETY: a descriptor of ours.
+        check(unsafe { libc::fchflags(file.as_raw_fd(), st.st_flags | libc::UF_IMMUTABLE) })?;
+        Ok(Immutable {
+            file,
+            flags: st.st_flags,
+            set: true,
+            #[cfg(test)]
+            since: std::time::Instant::now(),
+        })
+    }
+
+    fn lift(&mut self) -> io::Result<()> {
+        if self.set {
+            // SAFETY: a descriptor of ours.
+            check(unsafe { libc::fchflags(self.file.as_raw_fd(), self.flags & !libc::UF_IMMUTABLE) })?;
+            self.set = false;
+            #[cfg(test)]
+            window::closed(self.since.elapsed());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Immutable<'_> {
+    fn drop(&mut self) {
+        // An error is on its way out already; the supervisor fails with it.
+        let _ = self.lift();
+    }
+}
+
+/// For the tests: how long the control file was immutable, on this thread,
+/// and a way to stop a process while it is.
+#[cfg(test)]
+pub(crate) mod window {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::time::Duration;
+
+    thread_local! {
+        /// How often the flag was set on this thread, for how long in all,
+        /// and the longest time.
+        pub(crate) static STATS: Cell<(u64, Duration, Duration)> = const { Cell::new((0, Duration::ZERO, Duration::ZERO)) };
+    }
+    /// A descriptor to write a byte to, then wait for ever, with the flag
+    /// set (-1: none).
+    pub(crate) static PAUSE: AtomicI32 = AtomicI32::new(-1);
+
+    pub(super) fn opened() {
+        let fd = PAUSE.load(Ordering::SeqCst);
+        if fd >= 0 {
+            // SAFETY: a descriptor of the test's and one byte.
+            unsafe { libc::write(fd, b"w".as_ptr().cast(), 1) };
+            loop {
+                // SAFETY: waits for a signal (the test's SIGKILL).
+                unsafe { libc::pause() };
+            }
+        }
+    }
+
+    pub(super) fn closed(took: Duration) {
+        STATS.with(|s| {
+            let (count, sum, max) = s.get();
+            s.set((count + 1, sum + took, max.max(took)));
+        });
+    }
+}
+
 /// What writing the control file back came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Restored {
@@ -292,13 +399,68 @@ impl Files {
                 libc::renameat(dir, tmp.as_ptr(), dir, name.as_ptr())
             }
         })
-        .map_err(|e| io::Error::new(e.kind(), format!("{}/{}: {e}", self.path.display(), name.to_string_lossy())));
+        .map_err(|e| {
+            let file = format!("{}/{}", self.path.display(), name.to_string_lossy());
+            // The file is there (the jailer takes over no jail): if a
+            // supervisor killed while it wrote the file back left it
+            // immutable, nothing could remove the directory, so that is
+            // lifted here, where the directory's lock is held, and said.
+            let stale = if exclusive && errno(&e) == libc::EEXIST {
+                match self.lift_stale_immutable(name) {
+                    Ok(false) => String::new(),
+                    Ok(true) => format!(
+                        " (it was left immutable by a supervisor killed while writing it; that flag is lifted now, as \
+                         `chflags nouchg {file}` does, and the directory can be removed)"
+                    ),
+                    Err(why) => format!(
+                        " (it was left immutable by a supervisor killed while writing it, and the flag could not be \
+                         lifted: {why}; `chflags nouchg {file}` lifts it, then the directory can be removed)"
+                    ),
+                }
+            } else {
+                String::new()
+            };
+            io::Error::new(e.kind(), format!("{file}: {e}{stale}"))
+        });
         if exclusive || named.is_err() {
             let removed = unlink_tmp();
             named?;
             removed?;
         }
         Ok(())
+    }
+
+    /// Lifts the user-immutable flag of `name` if it is a regular file of
+    /// the files' owner that carries it; whether it did. Not followed if a
+    /// link, and looked at again once open.
+    fn lift_stale_immutable(&self, name: &CStr) -> io::Result<bool> {
+        let stale = |st: &libc::stat| {
+            st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_uid == self.owner && st.st_flags & libc::UF_IMMUTABLE != 0
+        };
+        let before = self.stat_at(name)?;
+        if !stale(&before) {
+            return Ok(false);
+        }
+        // SAFETY: a directory descriptor and a NUL-terminated name.
+        let fd = check(unsafe {
+            libc::openat(
+                self.dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        })?;
+        // SAFETY: a descriptor we own from here on.
+        let file = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: zeroed is a valid stat to fill.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a descriptor of ours, an out-pointer.
+        check(unsafe { libc::fstat(file.as_raw_fd(), &mut st) })?;
+        if !stale(&st) || (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino) {
+            return Ok(false);
+        }
+        // SAFETY: a descriptor of ours.
+        check(unsafe { libc::fchflags(file.as_raw_fd(), st.st_flags & !libc::UF_IMMUTABLE) })?;
+        Ok(true)
     }
 
     fn create_file(&self, name: &CStr, content: &[u8]) -> io::Result<()> {
@@ -393,9 +555,10 @@ impl Files {
     /// it is left as it is ([`Restored::Changed`]). It is read again through
     /// the descriptor that writes it, under the file's `flock`: a writer
     /// that holds that lock for its write makes this [`Restored::Busy`] or
-    /// waits for it, and never loses a write; no lock on macOS stops a
-    /// writer that takes none (the module's text says what is left). One
-    /// that is not a trusted file is replaced.
+    /// waits for it, and never loses a write. If it is to be written, it is
+    /// first closed to new writers ([`Immutable`]) and read once more: an
+    /// `open` for writing fails meanwhile with `EPERM` (the module's text
+    /// says what is left). One that is not a trusted file is replaced.
     pub(crate) fn restore(&self, state: State, seen: &[u8]) -> io::Result<Restored> {
         let name = control(self.version);
         let canonical = self.version.canonical(state);
@@ -410,7 +573,23 @@ impl Files {
             let err = io::Error::last_os_error();
             return if errno(&err) == libc::EWOULDBLOCK { Ok(Restored::Busy) } else { Err(err) };
         }
-        let restored = Self::write_over(&file, canonical, Some(seen));
+        let restored = (|| {
+            // Left as it is, or holding the value already: not closed to
+            // anyone.
+            let held = Content::of(&file)?;
+            if held.bytes() != seen {
+                return Ok(Restored::Changed);
+            }
+            if held.bytes() == canonical {
+                return Ok(Restored::Done);
+            }
+            let mut gate = Immutable::set(&file)?;
+            #[cfg(test)]
+            window::opened();
+            let restored = Self::write_over(&file, canonical, Some(seen));
+            gate.lift()?;
+            restored
+        })();
         // Released now, not with the last copy of the descriptor.
         // SAFETY: a descriptor of ours.
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
@@ -1702,9 +1881,14 @@ mod tests {
             let (got, canonical, seen) = files.read().unwrap();
             assert_eq!((got, canonical), (Request::Set(State::Frozen), false));
             std::fs::write(&path, second).unwrap();
+            let closed = || window::STATS.with(std::cell::Cell::get).0;
+            let before = closed();
             assert_eq!(files.restore(State::Frozen, seen.bytes()).unwrap(), Restored::Changed);
             assert_eq!(content(&path), second);
             assert_eq!(request(&files), (Request::Set(State::Thawed), false));
+            // Left as it is: never made immutable (nor below, when emptied
+            // or locked), and once when written.
+            assert_eq!(closed(), before);
 
             // Emptied by a writer that has not written yet: left to it.
             std::fs::write(&path, first).unwrap();
@@ -1724,7 +1908,16 @@ mod tests {
             assert_eq!(files.restore(State::Frozen, seen.bytes()).unwrap(), Restored::Busy);
             assert_eq!(content(&path), first);
             drop(writer);
+            assert_eq!(closed(), before);
             assert_eq!(files.restore(State::Frozen, seen.bytes()).unwrap(), Restored::Done);
+            assert_eq!(closed(), before + 1);
+            let (_, _, seen) = files.read().unwrap();
+            assert_eq!(files.restore(State::Frozen, seen.bytes()).unwrap(), Restored::Done);
+            assert_eq!(closed(), before + 1, "holding the value already: not made immutable");
+            {
+                use std::os::darwin::fs::MetadataExt as _;
+                assert_eq!(std::fs::metadata(&path).unwrap().st_flags() & libc::UF_IMMUTABLE, 0);
+            }
             assert_eq!(content(&path), String::from_utf8_lossy(version.canonical(State::Frozen)));
         }
     }
@@ -1881,7 +2074,11 @@ mod tests {
     /// The control side of the files, served on a thread as the supervisor
     /// serves it: the state it was last asked for is in `state` (0 thawed,
     /// 1 frozen).
-    fn serve(files: &Files, state: &std::sync::atomic::AtomicU8, stop: &std::sync::atomic::AtomicBool) {
+    fn serve(
+        files: &Files,
+        state: &std::sync::atomic::AtomicU8,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> (u64, Duration, Duration) {
         use std::sync::atomic::Ordering::SeqCst;
         let mut watch = Watch::new(files).unwrap();
         let mut control = Control::new(State::Thawed);
@@ -1894,6 +2091,8 @@ mod tests {
             }
             watch.wait(Some(20), &mut events).unwrap();
         }
+        // How often and how long this thread held the file immutable.
+        window::STATS.with(std::cell::Cell::get)
     }
 
     /// Writes `text` into `path` in one write, in place, as a writer that
@@ -1933,7 +2132,7 @@ mod tests {
         let torn = Mutex::new(Vec::<String>::new());
         let canon = [version.canonical(State::Thawed), version.canonical(State::Frozen)];
         std::thread::scope(|scope| {
-            scope.spawn(|| serve(&files, &state, &stop));
+            let served = scope.spawn(|| serve(&files, &state, &stop));
             for _ in 0..4 {
                 scope.spawn(|| {
                     while !stop.load(SeqCst) {
@@ -1967,9 +2166,16 @@ mod tests {
                 }
             }
             stop.store(true, SeqCst);
+            let (closed, sum, max) = served.join().unwrap();
             let (reads, empty) = (reads.load(SeqCst), empty.load(SeqCst));
             let torn = torn.lock().unwrap();
             println!("{version:?}: {FLIPS} flips, {reads} reads, {empty} empty, torn {torn:?}, flips not applied or not written back {lost:?}");
+            println!(
+                "{version:?}: the file was immutable {closed} times, {:?} on average, {max:?} at most",
+                sum.checked_div(u32::try_from(closed.max(1)).unwrap()).unwrap()
+            );
+            // Once for each write-back, never more.
+            assert_eq!(closed, u64::try_from(FLIPS).unwrap());
             assert!(reads > 1000, "the readers did not read: {reads}");
             assert!(empty == 0 && torn.is_empty() && lost.is_empty(), "{empty} empty reads of {reads}, torn {torn:?}, lost {lost:?}");
         });
@@ -1993,24 +2199,52 @@ mod tests {
         Locked,
         /// `open(O_WRONLY | O_TRUNC)`, one write, close: the shell's `>`.
         Plain,
+        /// One write in place through a descriptor opened once and kept:
+        /// what the supervisor cannot close the file to.
+        Held,
     }
 
     impl Writer {
-        fn write(self, path: &Path, text: &[u8]) {
+        /// Writes `text`, trying again when the open is refused with EPERM
+        /// (the supervisor is writing the file back); how often it was.
+        fn write(self, path: &Path, text: &[u8], held: &std::fs::File) -> u64 {
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::{FileExt, OpenOptionsExt};
+            if self == Writer::Held {
+                held.write_all_at(text, 0).unwrap();
+                return 0;
+            }
             let lock = if self == Writer::Locked { libc::O_EXLOCK } else { 0 };
-            let mut f = std::fs::OpenOptions::new().write(true).truncate(true).custom_flags(lock).open(path).unwrap();
-            f.write_all(text).unwrap();
+            let mut refused = 0;
+            loop {
+                match std::fs::OpenOptions::new().write(true).truncate(true).custom_flags(lock).open(path) {
+                    Ok(mut f) => {
+                        f.write_all(text).unwrap();
+                        return refused;
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::EPERM) => refused += 1,
+                    Err(e) => panic!("{e}"),
+                }
+            }
         }
+    }
+
+    /// What [`lost_writes`] counted.
+    #[derive(Debug)]
+    struct Lost {
+        rounds: usize,
+        /// The rounds whose last write was lost, and what the file read.
+        lost: Vec<(usize, String)>,
+        /// Opens refused with EPERM (each tried again).
+        refused: u64,
     }
 
     /// `ROUNDS` times: a value that is written back (not canonical), then,
     /// 0 to 60 us later, the other state's. The second write is the last:
     /// the state must become it and the file must read its canonical text.
-    /// Returns the rounds in which it was lost (the file read the first
+    /// Counts the rounds in which it was lost (the file read the first
     /// write's state for 2 s; at most 5 are waited for).
-    fn lost_writes(version: Version, writer: Writer, forms: [&'static [u8]; 2]) -> Vec<(usize, String)> {
+    fn lost_writes(version: Version, writer: Writer, forms: [&'static [u8]; 2]) -> Lost {
         use std::sync::atomic::Ordering::SeqCst;
         use std::sync::atomic::{AtomicBool, AtomicU8};
         const ROUNDS: usize = 3000;
@@ -2020,19 +2254,20 @@ mod tests {
         let (state, stop) = (AtomicU8::new(0), AtomicBool::new(false));
         let canon = [version.canonical(State::Thawed), version.canonical(State::Frozen)];
         let mut lost = Vec::new();
-        let mut ran = 0;
-        std::thread::scope(|scope| {
-            scope.spawn(|| serve(&files, &state, &stop));
+        let (mut ran, mut refused) = (0, 0);
+        let held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let window = std::thread::scope(|scope| {
+            let served = scope.spawn(|| serve(&files, &state, &stop));
             for round in 0..ROUNDS {
                 ran += 1;
                 let (first, last) = (round % 2, (round + 1) % 2);
-                writer.write(&path, forms[first]);
+                refused += writer.write(&path, forms[first], &held);
                 let gap = Duration::from_micros(u64::try_from(round % 61).unwrap());
                 let t0 = Instant::now();
                 while t0.elapsed() < gap {
                     std::hint::spin_loop();
                 }
-                writer.write(&path, forms[last]);
+                refused += writer.write(&path, forms[last], &held);
                 let t0 = Instant::now();
                 while usize::from(state.load(SeqCst)) != last || std::fs::read(&path).unwrap() != canon[last] {
                     if t0.elapsed() > Duration::from_secs(2) {
@@ -2046,22 +2281,101 @@ mod tests {
                 }
             }
             stop.store(true, SeqCst);
+            served.join().unwrap()
         });
-        println!("{version:?} {writer:?}: lost {} (rounds {lost:?}) of {ran}", lost.len());
-        lost
+        let (closed, sum, max) = window;
+        println!(
+            "{version:?} {writer:?}: lost {} (rounds {lost:?}) of {ran}, {refused} opens refused; the file was immutable \
+             {closed} times, {:?} on average, {max:?} at most",
+            lost.len(),
+            sum.checked_div(u32::try_from(closed.max(1)).unwrap()).unwrap()
+        );
+        Lost { rounds: ran, lost, refused }
     }
 
     // No write of a writer that holds the file's lock is lost. One that
-    // takes no lock can lose a write that lands whole between two system
-    // calls of the supervisor (the module's text): its count is printed, not
-    // held to zero.
+    // takes no lock (the shell's `>`) is refused while the supervisor
+    // writes the file back, and tries again. Its lost writes are printed,
+    // not held to zero: an open that was past the kernel's check when the
+    // flag was set can still be written over (the module's text; none was
+    // in the runs of this test). One that keeps a descriptor open and
+    // writes in place is not stopped by the flag: its lost writes are
+    // counted and printed.
     #[test]
     fn test_no_write_is_lost() {
-        for (version, forms) in [(Version::V1, [b"THAWED".as_slice(), b"FROZEN".as_slice()]), (Version::V2, [b"0".as_slice(), b"1".as_slice()])] {
+        for (version, forms, in_place) in [
+            (Version::V1, [b"THAWED".as_slice(), b"FROZEN".as_slice()], [b"THAWED ".as_slice(), b"FROZEN ".as_slice()]),
+            (Version::V2, [b"0".as_slice(), b"1".as_slice()], [b"0 ".as_slice(), b"1 ".as_slice()]),
+        ] {
             let plain = lost_writes(version, Writer::Plain, forms);
             let locked = lost_writes(version, Writer::Locked, forms);
-            assert!(locked.is_empty(), "{version:?}: writes lost under the lock: {locked:?} (without it: {plain:?})");
+            let held = lost_writes(version, Writer::Held, in_place);
+            assert!(locked.lost.is_empty(), "{version:?}: writes lost under the lock: {locked:?} (without it: {plain:?})");
+            assert_eq!((locked.rounds, plain.rounds.min(held.rounds) > 0), (3000, true));
+            assert_eq!(held.refused, 0, "a descriptor kept open is never refused");
         }
+    }
+
+    // A supervisor killed while the control file is immutable (between
+    // setting and lifting the flag: a stop is put there) leaves it so. While
+    // it is, a reader reads and a writer's open is refused with EPERM; after
+    // the kill nothing can remove the file, until a jailer started on the
+    // directory lifts the flag (and refuses the directory, as any that
+    // holds freezer files, naming `chflags nouchg`); then it is removed.
+    #[test]
+    fn test_a_supervisor_killed_while_writing_back_leaves_a_removable_jail() {
+        use std::os::darwin::fs::MetadataExt as _;
+        let immutable = |p: &Path| std::fs::metadata(p).unwrap().st_flags() & libc::UF_IMMUTABLE != 0;
+        let tmp = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let dir = tmp.as_path();
+        let files = Files::create(dir, Version::V1, State::Thawed, uid()).unwrap();
+        let state = dir.join("freezer.state");
+        std::fs::write(&state, "FROZEN").unwrap();
+        let (_, _, seen) = files.read().unwrap();
+        let mut ends = [0; 2];
+        // SAFETY: an array of two descriptors to fill.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        // SAFETY: the child calls restore, which stops at the window's stop.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            window::PAUSE.store(ends[1], std::sync::atomic::Ordering::SeqCst);
+            let _ = files.restore(State::Frozen, seen.bytes());
+            // SAFETY: ends the child of a fork (not reached: it is stopped).
+            unsafe { libc::_exit(9) };
+        }
+        let mut byte = 0u8;
+        // SAFETY: a descriptor of the test's and one byte.
+        assert_eq!(unsafe { libc::read(ends[0], std::ptr::from_mut(&mut byte).cast(), 1) }, 1);
+        assert!(immutable(&state));
+        assert_eq!(content(&state), "FROZEN");
+        for truncate in [false, true] {
+            let err = std::fs::OpenOptions::new().write(true).truncate(truncate).open(&state).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+        }
+        // SAFETY: the test's child.
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        reap(child);
+        for fd in ends {
+            // SAFETY: descriptors of the test's.
+            unsafe { libc::close(fd) };
+        }
+        drop(files);
+        // Left so: nothing removes it.
+        assert!(immutable(&state));
+        assert_eq!(std::fs::remove_file(&state).unwrap_err().raw_os_error(), Some(libc::EPERM));
+        std::fs::remove_dir_all(dir).unwrap_err();
+        // The next jailer on the directory.
+        let err = Files::create(dir, Version::V1, State::Thawed, uid()).unwrap_err().to_string();
+        assert!(err.contains("File exists") && err.contains(&format!("`chflags nouchg {}`", state.display())), "{err}");
+        assert!(!immutable(&state));
+        assert_eq!(content(&state), "FROZEN");
+        std::fs::remove_dir_all(dir).unwrap();
+        // A file that is there and not immutable: refused as before.
+        std::fs::create_dir(dir).unwrap();
+        std::fs::write(&state, "THAWED\n").unwrap();
+        let err = Files::create(dir, Version::V1, State::Thawed, uid()).unwrap_err().to_string();
+        assert!(err.contains("File exists") && !err.contains("chflags"), "{err}");
     }
 
     /// An OS for the jail's logic: a process table, and the calls made.

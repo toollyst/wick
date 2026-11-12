@@ -185,7 +185,8 @@ memory included. It also takes the CPU limit (`cpu.cfs_quota_us` and `cpu.cfs_pe
 `--cgroup-version 2`): the VMM's threads are held to that share of a CPU, refilled each second. The freezer's files
 are upstream's, in `/private/var/wick/firecracker/vm1/` next to `root/` (`freezer.state`, or `cgroup.freeze` with
 `--cgroup-version 2`): writing `FROZEN` (or `1`) as root suspends the jail, kept by a root supervisor process the
-jailer leaves for each jail until it ends. The jailer refuses
+jailer leaves for each jail until it ends. A write that fails with "Operation not permitted" met the supervisor
+writing the file back (after a value without its newline, or an invalid one): write it again. The jailer refuses
 what macOS cannot enforce, each with its reason: other cgroup controllers (`cpuset.cpus` and `cpuset.mems` only
 when they name every CPU and memory node) and CPU limits below 1% or above
 255% of one CPU. Networking inside a jail is a Unix datagram endpoint, since the sandbox denies IP networking, and the

@@ -105,6 +105,14 @@ try:
 except OSError as e:
     res.append(f"sigcont {e.errno}")
 res.append("pid_resume " + subprocess.run([resumer, str(pid)], capture_output=True, text=True).stdout.strip())
+# The flag the supervisor closes the file with while it writes it back
+# (UF_IMMUTABLE): only the file's owner or root sets or lifts it.
+for what, flags in (("uchg", os.stat(path).st_flags | 2), ("nouchg", os.stat(path).st_flags & ~2)):
+    try:
+        os.chflags(path, flags)
+        res.append(f"chflags {what} ok")
+    except OSError as e:
+        res.append(f"chflags {what} {e.errno}")
 print("; ".join(res))
 """
 
@@ -238,8 +246,22 @@ class Freeze:
 
     @staticmethod
     def write(jd, name, value):
-        with open(os.path.join(jd, name), "w") as f:
-            f.write(value)
+        # While the supervisor writes the file back (after a value not in
+        # canonical form, or an invalid one), an open for writing is refused
+        # with EPERM for those microseconds: tried again, and said.
+        for attempt in range(1000):
+            try:
+                with open(os.path.join(jd, name), "w") as f:
+                    f.write(value)
+                break
+            except PermissionError as e:
+                if e.errno != errno.EPERM:
+                    raise
+                print(f"   write of {name}: refused with EPERM (the supervisor is writing it back), try {attempt + 2}",
+                      flush=True)
+        else:
+            raise PermissionError(errno.EPERM, f"{name}: an open for writing was refused with EPERM 1000 times: "
+                                               f"left immutable? (chflags nouchg {os.path.join(jd, name)})")
         Freeze.written_at = time.monotonic()
 
     def as_jail_uid(self, jd, name, pid):
@@ -349,8 +371,10 @@ def stage_freeze(ctx, jt):
         # The jail's uid cannot thaw it.
         got = fz.as_jail_uid(jd, "freezer.state", pid)
         print(f"   as the jail's uid: {got}", flush=True)
-        check(f"write {errno.EACCES}" in got and "sigcont ok" in got and f"pid_resume -1 {errno.EPERM}" in got,
+        check(f"write {errno.EACCES}" in got and "sigcont ok" in got and f"pid_resume -1 {errno.EPERM}" in got
+              and f"chflags uchg {errno.EPERM}" in got and f"chflags nouchg {errno.EPERM}" in got,
               f"as the jail's uid: {got}")
+        check(os.stat(os.path.join(jd, "freezer.state")).st_flags & 2 == 0, "freezer.state is not immutable")
         fz.frozen([pid, kid], "after the jail's uid tried")
         # An invalid value: ignored, the file restored to the state.
         fz.write(jd, "freezer.state", "FREEZING\n")

@@ -1175,6 +1175,13 @@ def _remove_tree(path):
         for p in (parent, failed):
             with contextlib.suppress(OSError):
                 os.chmod(p, 0o700, follow_symlinks=False)
+        # A freezer file a supervisor killed while writing it back left
+        # immutable (UF_IMMUTABLE, 2): lifted, and said.
+        with contextlib.suppress(OSError):
+            flags = os.lstat(failed).st_flags
+            if flags & 2 and os.path.basename(failed) in ("freezer.state", "cgroup.freeze"):
+                os.chflags(failed, flags & ~2, follow_symlinks=False)
+                print(f"cleanup: {failed} was left immutable by a killed supervisor: chflags nouchg", file=sys.stderr)
         func(failed)
     shutil.rmtree(path, onexc=again)
 
