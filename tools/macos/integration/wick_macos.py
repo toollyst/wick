@@ -917,6 +917,45 @@ def _host_memory():
     return out
 
 
+# The guest's RAM pages in use, per 4 KiB page and per 16 KiB frame (four
+# aligned pages, an Apple silicon host page) with any page in use: from
+# /proc/kpageflags (Documentation/admin-guide/mm/pagemap.rst: KPF_BUDDY,
+# bit 10, is set for the first page of a free block only; the block's other
+# pages carry no flags, so a block is the largest aligned power of two, up
+# to order 10, whose other pages have none) over /proc/iomem's System RAM.
+# Prints "ram_pages free_pages used_4k used_16k_frames" per RAM range.
+_GUEST_KPAGEFLAGS = r"""KPF=/proc/kpageflags; IOMEM=/proc/iomem
+grep "System RAM" "$IOMEM" | while read -r range _; do
+    s=$((0x${range%-*} / 4096)); e=$(((0x${range#*-} + 1) / 4096))
+    od -An -v -tu8 -j $((s * 8)) -N $(((e - s) * 8)) "$KPF" | tr -s ' ' '\n' | grep -v '^$' |
+        awk -v s="$s" '{ f[NR - 1] = $1 } END {
+            n = NR; free = 0
+            for (i = 0; i < n; i++) used[i] = 1
+            for (i = 0; i < n; i++) {
+                if (int(f[i] / 1024) % 2 != 1) continue
+                # the block: the largest aligned power of two from i whose
+                # other pages have no flags (MAX_ORDER 10)
+                order = 0
+                for (o = 1; o <= 10; o++) {
+                    len = 2 ^ o
+                    if ((s + i) % len != 0 || i + len > n) break
+                    ok = 1
+                    for (j = i + 2 ^ (o - 1); j < i + len; j++) if (f[j] != 0) { ok = 0; break }
+                    if (!ok) break
+                    order = o
+                }
+                for (j = i; j < i + 2 ^ order; j++) { used[j] = 0; free++ }
+                i += 2 ^ order - 1
+            }
+            u4 = 0; u16 = 0
+            for (i = 0; i < n; i++) u4 += used[i]
+            for (i = 0; i < n; i += 4) if (used[i] || used[i + 1] || used[i + 2] || used[i + 3]) u16++
+            print n, free, u4, u16
+        }'
+done
+"""
+
+
 def _guest_memory(uvm):
     """The guest's /proc/meminfo (kB) and the balloon's statistics, read
     after a stable reading (over ssh and the API: they touch the guest, so
@@ -933,6 +972,16 @@ def _guest_memory(uvm):
             out["meminfo_error"] = f"rc {rc}: {err.strip()[:200]}"
     except Exception as exc:  # pylint: disable=broad-exception-caught
         out["meminfo_error"] = repr(exc)[:200]
+    try:
+        rc, text, err = uvm.ssh.run(_GUEST_KPAGEFLAGS, timeout=60)
+        rows = [[int(x) for x in line.split()] for line in text.splitlines() if len(line.split()) == 4]
+        if rc == 0 and rows:
+            out["kpageflags"] = dict(zip(("ram_pages", "free_pages", "used_4k", "used_16k_frames"),
+                                         (sum(c) for c in zip(*rows))))
+        else:
+            out["kpageflags_error"] = f"rc {rc}: {err.strip()[:200]}"
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        out["kpageflags_error"] = repr(exc)[:200]
     try:
         stats = uvm.api.balloon_stats.get().json()
         out["balloon"] = {k: stats.get(k) for k in ("target_mib", "actual_mib", "free_memory",
