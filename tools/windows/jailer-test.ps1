@@ -1629,7 +1629,12 @@ function Stage-Freeze {
             Check (-not (Test-Path (Join-Path (& $dirOf 'v1') 'cgroup.events'))) 'a v1 jail has cgroup.events'
             $run = & $cpu 'v1'
             Check ($run -gt 200) "running: CPU $($run -join ', ') ms per s"
-            Set-Content (Join-Path (& $dirOf 'v1') 'freezer.state') 'FROZEN'   # CRLF, as PowerShell writes
+            # CRLF, as PowerShell's Set-Content writes, written with the stage's own writer: Set-Content opens
+            # read|write, and when that open fails (another handle on the file for an instant, which one not
+            # traced yet) it opens write-only and still builds a reader on it, and fails with "Stream was not
+            # readable" (PowerShell's FileSystemContentStream.cs, CreateStreams; once in 30 runs on Windows 11
+            # 26300, kit dd657f4).
+            & $write 'v1' 'freezer.state' "FROZEN`r`n"
             Check (& $until { (& $read 'v1' 'freezer.state') -eq "FROZEN`n" }) "FROZEN`r`n not read back canonical: $(& $read 'v1' 'freezer.state')"
             Start-Sleep -Milliseconds 300
             $frozen = & $cpu 'v1'
