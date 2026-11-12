@@ -309,19 +309,57 @@ def self_check_probe():
         out = subprocess.run([exe, os.path.join(d, "big")], preexec_fn=limits, capture_output=True,
                              text=True, check=True, close_fds=True).stdout
         check_probe(parse_probe(out), 64, 1 << 20, "self-check")
-        print(f"probe self-check passed: {out.strip()}")
+        # The layout the limits stage gives the jailer: the probe outside
+        # every jail it is run in, no file on a jail's path.
+        base = os.path.join(d, "base")
+        os.makedirs(probe_dir(base))
+        exe = build_rlimit_probe(probe_dir(base))
+        for name in ("rlimit-default", "rlimit-set"):
+            root = chroot_of(base, exe, name)
+            os.makedirs(root)
+        # And the layout the first version had is caught.
+        try:
+            chroot_of(d, os.path.join(d, "rlimit-probe"), "rlimit-default")
+            raise Failure("a probe built in the chroot base under its own name was not caught")
+        except Failure as e:
+            check("is a file where the jailer makes the jail" in str(e), str(e))
+        print(f"probe self-check passed: {out.strip()}; jail paths free of files")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
+def chroot_of(base, exec_file, vm_id):
+    """The jail's root the jailer makes: <base>/<exec file name>/<id>/root.
+    Fails if a file in `base` stands on that path (the jailer would fail
+    with ENOTDIR creating it), as the probe did when it was built in `base`
+    under its own name."""
+    root = os.path.join(base, os.path.basename(exec_file), vm_id, "root")
+    path = base
+    for part in os.path.relpath(root, base).split(os.sep):
+        path = os.path.join(path, part)
+        check(not os.path.exists(path) or os.path.isdir(path),
+              f"{path} is a file where the jailer makes the jail of {exec_file}")
+    check(os.path.commonpath([exec_file, root]) != root, f"{exec_file} is inside its own jail")
+    return root
+
+
+def probe_dir(base):
+    """Where the probe is built: a directory of `base` no jail is made in
+    (jails are <base>/<exec file name>/...)."""
+    return os.path.join(base, "probe-build")
+
+
 def jailed_probe(ctx, name, limits_args):
-    """Runs the probe through the jailer with `limits_args`; returns its report."""
+    """Runs the probe through the jailer with `limits_args`; returns its report.
+    The probe writes the file at /big of its jail (the jailer gives the jail's
+    root to the jailed user, as upstream's does)."""
     if ctx.rlimit_probe is None:
-        ctx.rlimit_probe = build_rlimit_probe(ctx.base)
-    Jail(ctx, name)
-    big = os.path.join(ctx.base, f"{name}.big")
-    rc, out = run_jailer(ctx, jailer_base(ctx, name, ctx.rlimit_probe) + list(limits_args) + ["--", big])
+        os.makedirs(probe_dir(ctx.base))
+        ctx.rlimit_probe = build_rlimit_probe(probe_dir(ctx.base))
+    root = chroot_of(ctx.base, ctx.rlimit_probe, name)
+    rc, out = run_jailer(ctx, jailer_base(ctx, name, ctx.rlimit_probe) + list(limits_args) + ["--", "/big"])
     check(rc == 0, f"{name}: the jailed probe exited {rc}: {out!r}")
+    big = os.path.join(root, "big")
     if os.path.exists(big):
         os.unlink(big)
     return parse_probe(out)
