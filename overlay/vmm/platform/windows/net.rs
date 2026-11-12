@@ -201,7 +201,11 @@ impl Endpoint {
     /// Cost, once per [`Tap::write_iovec`] and [`Tap::read_iovec`] (not
     /// per segment of an offloaded frame): the table's lock, a hash lookup
     /// and one system call (`CompareObjectHandles`). Its time is on record
-    /// from test_descriptor_check_cost_on_record (the TAPCHECK line).
+    /// from test_descriptor_check_cost_on_record (the TAPCHECK line): 889 ns
+    /// a check, against 5,967 ns for a whole `write_iovec` of a 1514-byte
+    /// frame, in an unoptimised build on CI's runner (AMD EPYC 7763, run
+    /// 43318983352). The effect on a guest's throughput (`boot-test.ps1
+    /// net`, kit against kit) is not measured yet.
     fn check_open(&mut self) -> io::Result<()> {
         let fd = self.listener.as_raw_fd();
         let attached = libc::wick_fd::attached::<Redirect>(fd);
