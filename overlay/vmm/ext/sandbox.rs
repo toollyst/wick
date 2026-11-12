@@ -644,29 +644,61 @@ mod macos {
         Ok(path.replace('\\', "\\\\").replace('"', "\\\""))
     }
 
+    /// A regular expression for a profile that matches the names directly in
+    /// the directory `path` (absolute), and nothing below them.
+    fn names_directly_in(path: &Path, what: &str) -> Result<String, SandboxError> {
+        let path = path
+            .to_str()
+            .filter(|r| r.starts_with('/') && !r.contains(['\0', '\n', '"']))
+            .ok_or_else(|| SandboxError::Install(format!("{what} path {path:?}")))?;
+        let mut regex = String::from("^");
+        for c in path.chars() {
+            if "\\.^$*+?()[]{}|".contains(c) {
+                regex.push('\\');
+            }
+            regex.push(c);
+        }
+        Ok(format!("(regex #\"{}/[^/]+$\")", regex.trim_end_matches('/')))
+    }
+
     /// File rule in a jail: only the jail directory, by its path outside the
     /// chroot (Seatbelt matches the real path of a file, and the chroot
     /// already hides everything else; this also covers descriptors opened
     /// before the chroot).
     ///
-    /// With the jail's network (`netns`, `--netns`): also the Unix sockets
-    /// in that directory and nothing else there, as on Linux a network
-    /// namespace gives its interfaces and no file. The directory is reached
-    /// through a descriptor opened before the chroot, from which a relative
-    /// path could climb out (`..`), so Unix sockets are then connected to
-    /// only in the jail and in the network: file rules do not cover
-    /// `connect` or `sendto` (measured: both reach a socket elsewhere with
-    /// only the file rules), `network-outbound` does.
+    /// With the jail's network (`netns`, the jail's own directory in the
+    /// network directory `--netns` names, `<network>/<id>`): also the Unix
+    /// sockets in that directory and nothing else there, as on Linux a
+    /// network namespace gives its interfaces and no file; and the sockets
+    /// directly in the network directory, the operator's switch's, to send
+    /// to and to look at, not to make, remove or replace; and who owns the
+    /// network directory (its metadata: an endpoint takes as peers the
+    /// sockets of that owner, `platform::net`'s `Switch`). No other
+    /// directory of the network: another jail's endpoints are out of reach
+    /// whatever their files' permissions (two jails of one uid are told
+    /// apart by this rule alone). The jail's directory is reached through a
+    /// descriptor opened before the chroot, from which a relative path
+    /// climbs out (`..`), so Unix sockets are then connected to only in the
+    /// jail, in the jail's directory and directly in the network: file
+    /// rules do not cover `connect` or `sendto` (measured: both reach a
+    /// socket elsewhere with only the file rules), `network-outbound` does.
     pub fn files_in_jail(root: &Path, netns: Option<&Path>) -> Result<String, SandboxError> {
         let root = quoted(root, "jail")?;
         let mut rule = format!("(allow file-read* file-write* (subpath \"{root}\"))\n");
         if let Some(netns) = netns {
+            let network = netns
+                .parent()
+                .ok_or_else(|| SandboxError::Install(format!("network path {netns:?}")))?;
+            let switch = names_directly_in(network, "network")?;
+            let network = quoted(network, "network")?;
             let netns = quoted(netns, "network")?;
             rule.push_str(&format!(
                 "(allow file-read* file-write* (require-all (subpath \"{netns}\") (vnode-type SOCKET)))\n\
+                 (allow file-read-metadata file-write-data (require-all {switch} (vnode-type SOCKET)))\n\
+                 (allow file-read-metadata (literal \"{network}\"))\n\
                  (deny network-outbound (remote unix-socket))\n\
                  (allow network-outbound (remote unix-socket (subpath \"{root}\")) \
-                 (remote unix-socket (subpath \"{netns}\")))\n"
+                 (remote unix-socket (subpath \"{netns}\")) (remote unix-socket {switch}))\n"
             ));
         }
         Ok(rule)
@@ -3692,6 +3724,13 @@ mod macos {
             std::fs::remove_dir_all(&base).unwrap();
         }
 
+        // A jail's network is its own directory in the network directory
+        // (`<network>/<id>`, the jailer's `network_for_jail`). Its profile
+        // lets it make and remove its endpoints there and send to the
+        // sockets directly in the network directory, the operator's
+        // switch's; another jail's directory in the same network is out of
+        // reach, whatever the files' permissions say (two jails of one uid:
+        // the kernel's file checks do not tell them apart, this does).
         #[test]
         fn test_jail_network_profile_limits_sockets() {
             let base = std::env::temp_dir()
@@ -3699,16 +3738,21 @@ mod macos {
                 .unwrap()
                 .join(format!("wick-jail-net-{}", std::process::id()));
             let (jail, net, other) = (base.join("jail"), base.join("net"), base.join("other"));
-            for dir in [&jail, &net, &other] {
+            for dir in [&jail, &net.join("a"), &net.join("b"), &other] {
                 std::fs::create_dir_all(dir).unwrap();
             }
-            // A peer in the jail's network, and one in another network.
-            let _peer = std::os::unix::net::UnixDatagram::bind(net.join("peer")).unwrap();
+            // The switch, in the network; another jail's endpoint, in its
+            // own directory there (this user's, as a jail of the same uid's
+            // would be); a peer in another network.
+            let _switch = std::os::unix::net::UnixDatagram::bind(net.join("switch")).unwrap();
+            let _theirs = std::os::unix::net::UnixDatagram::bind(net.join("b/tap0")).unwrap();
             let _stranger = std::os::unix::net::UnixDatagram::bind(other.join("peer")).unwrap();
             run_child(
                 "jailed_net_child",
-                &[("WICK_TEST_JAIL", jail.to_str().unwrap()), ("WICK_TEST_NET", net.to_str().unwrap())],
+                &[("WICK_TEST_JAIL", jail.to_str().unwrap()), ("WICK_TEST_NET", net.join("a").to_str().unwrap())],
             );
+            // Nothing of the other jail's or the switch's was removed.
+            assert!(net.join("b/tap0").exists() && net.join("switch").exists());
             std::fs::remove_dir_all(&base).unwrap();
         }
 
@@ -3722,32 +3766,54 @@ mod macos {
             }
             let jail = std::path::PathBuf::from(std::env::var("WICK_TEST_JAIL").unwrap());
             let net = std::path::PathBuf::from(std::env::var("WICK_TEST_NET").unwrap());
+            let network = net.parent().unwrap().to_owned();
             let base = jail.parent().unwrap().to_owned();
-            // The network directory, opened before the sandbox (and, in a
-            // jail, before the chroot).
+            // The jail's directory in the network, opened before the sandbox
+            // (and, in a jail, before the chroot).
             let dir = std::fs::File::open(&net).unwrap();
             install(&format!("{PROFILE}{}{}", syscall_rule(), files_in_jail(&jail, Some(&net)).unwrap()))
                 .unwrap();
             let denied = |e: std::io::Error| e.raw_os_error() == Some(libc::EPERM);
             // SAFETY: a directory descriptor; this thread's working directory.
             assert_eq!(unsafe { pthread_fchdir_np(dir.as_raw_fd()) }, 0);
-            // In the network: an endpoint is bound, reaches a peer, is removed.
+            // In its own directory: an endpoint is bound; it reaches the
+            // switch, in the network directory, and sees that it is a socket.
             let ep = UnixDatagram::bind("tap0").unwrap();
-            ep.send_to(b"frame", "peer").unwrap();
-            std::fs::remove_file("tap0").unwrap();
+            ep.send_to(b"frame", "../switch").unwrap();
+            assert!(std::os::unix::fs::FileTypeExt::is_socket(
+                &std::fs::symlink_metadata("../switch").unwrap().file_type()
+            ));
+            // The network directory's owner is read (whose sockets the
+            // switch's are); the directory is not listed.
+            std::fs::symlink_metadata("..").unwrap();
+            assert!(denied(std::fs::read_dir("..").map(|_| ()).unwrap_err()));
             // No other file there.
             assert!(denied(std::fs::write("file", b"x").unwrap_err()));
+            // Another jail's directory in the same network: its endpoint is
+            // not sent to, connected to, looked at or removed, and no name is
+            // taken there.
+            assert!(denied(ep.send_to(b"frame", "../b/tap0").unwrap_err()), "sent to another jail's endpoint");
+            assert!(denied(UnixDatagram::unbound().unwrap().connect("../b/tap0").unwrap_err()));
+            assert!(denied(std::fs::symlink_metadata("../b/tap0").unwrap_err()));
+            assert!(denied(std::fs::remove_file("../b/tap0").unwrap_err()), "removed another jail's endpoint");
+            assert!(denied(UnixDatagram::bind("../b/tap1").unwrap_err()), "bound in another jail's directory");
+            // The network directory itself: the switch's sockets are sent
+            // to, not removed, and no name is taken next to them.
+            assert!(denied(std::fs::remove_file("../switch").unwrap_err()), "removed the switch's socket");
+            assert!(denied(UnixDatagram::bind("../tap0").unwrap_err()), "bound in the network directory");
             // Climbing out of it reaches no other network, nor anything
             // next to the jail.
-            assert!(denied(ep.send_to(b"frame", "../other/peer").unwrap_err()));
-            assert!(denied(UnixDatagram::unbound().unwrap().connect("../other/peer").unwrap_err()));
-            assert!(denied(UnixDatagram::bind("../other/tap0").unwrap_err()));
-            assert!(denied(UnixDatagram::bind("../tap0").unwrap_err()));
+            assert!(denied(ep.send_to(b"frame", "../../other/peer").unwrap_err()));
+            assert!(denied(UnixDatagram::unbound().unwrap().connect("../../other/peer").unwrap_err()));
+            assert!(denied(UnixDatagram::bind("../../other/tap0").unwrap_err()));
             // SAFETY: back to the process's working directory.
             assert_eq!(unsafe { pthread_fchdir_np(-1) }, 0);
             // By absolute path: the same.
             assert!(denied(ep.send_to(b"frame", base.join("other/peer")).unwrap_err()));
-            ep.send_to(b"frame", net.join("peer")).unwrap();
+            assert!(denied(ep.send_to(b"frame", network.join("b/tap0")).unwrap_err()));
+            ep.send_to(b"frame", network.join("switch")).unwrap();
+            // Its own endpoint is its to remove.
+            std::fs::remove_file(net.join("tap0")).unwrap();
             // The jail's own sockets still work.
             let _l = std::os::unix::net::UnixListener::bind(jail.join("s")).unwrap();
             std::os::unix::net::UnixStream::connect(jail.join("s")).unwrap();

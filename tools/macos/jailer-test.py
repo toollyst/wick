@@ -777,26 +777,40 @@ def stage_cpu(ctx):
 
 
 class Network:
-    """A jail's network (--netns): a directory of endpoints. Behind each
-    interface name, a host socket in the directory that attaches to the
-    jail's endpoint of that name once it is there, answers ARP and ICMP echo
+    """A network (--netns): a directory the operator made. Each jail given
+    it has its endpoints in a directory of its own there, <path>/<jail id>/.
+    Behind each (jail id, interface name) of `endpoints`, a host socket
+    directly in the directory, bound by its real path as an operator's
+    switch binds (an endpoint takes only such sockets as peers), that
+    attaches to that endpoint once it is there, answers ARP and ICMP echo
     for its address and records every frame it gets."""
 
-    def __init__(self, path, host_ip, names=("tap0",)):
+    def __init__(self, path, host_ip, endpoints):
         import socket as so
         self.so = so
-        self.path = path
-        self.host_ip = so.inet_aton(host_ip)
         os.makedirs(path)
+        self.path = os.path.realpath(path)
+        self.host_ip = so.inet_aton(host_ip)
         self.frames = []
         self.stop = False
         self.hosts = {}
-        for name in names:
+        for jail_id, name in endpoints:
             sock = so.socket(so.AF_UNIX, so.SOCK_DGRAM)
-            sock.bind(os.path.join(path, f"host-{name}"))
+            sock.bind(self.host(jail_id, name))
             sock.settimeout(0.2)
-            self.hosts[name] = sock
-            bt.threading.Thread(target=self._host, args=(sock, os.path.join(path, name)), daemon=True).start()
+            self.hosts[jail_id, name] = sock
+            bt.threading.Thread(target=self._host, args=(sock, self.endpoint(jail_id, name)), daemon=True).start()
+
+    def host(self, jail_id, name):
+        """The path of the host socket behind an endpoint."""
+        return os.path.join(self.path, f"h-{jail_id}-{name}")
+
+    def endpoint(self, jail_id, name):
+        """The path of a jail's endpoint."""
+        return os.path.join(self.path, jail_id, name)
+
+    def frames_to(self, mac):
+        return [f for f in self.frames if f[0:6] == bytes.fromhex(mac.replace(":", ""))]
 
     def _host(self, sock, endpoint):
         import struct
@@ -853,11 +867,48 @@ class Network:
             s.close()
 
 
+def arp_request(src_mac, src_ip, target_ip):
+    """An Ethernet broadcast ARP request for `target_ip` from `src_mac`/`src_ip`."""
+    import socket as so
+    mac = bytes.fromhex(src_mac.replace(":", ""))
+    return (b"\xff" * 6 + mac + b"\x08\x06" + b"\0\1\x08\0\x06\x04\0\1" + mac + so.inet_aton(src_ip)
+            + b"\0" * 6 + so.inet_aton(target_ip))
+
+
+def in_child(fn):
+    """Runs `fn` in a forked child (which may change its uid or its root) and
+    returns what it returned, or the OSError it raised."""
+    import pickle
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            out = fn()
+        except OSError as e:
+            out = e
+        except BaseException as e:  # pylint: disable=broad-except
+            out = RuntimeError(repr(e))
+        os.write(w, pickle.dumps(out))
+        os._exit(0)
+    os.close(w)
+    data = b""
+    while chunk := os.read(r, 65536):
+        data += chunk
+    os.close(r)
+    os.waitpid(pid, 0)
+    return pickle.loads(data)
+
+
 def stage_netns(ctx):
-    """VM: two jails, each with a network of its own, reach only their own network; jails given one share it."""
+    """VM: jails with a network each reach only their own; jails given one network are in it, each endpoint its jail's alone."""
+    import errno
+    import socket as so
     nets = {"a": ("10.0.1", "06:00:0a:00:01:02"), "b": ("10.0.2", "06:00:0a:00:02:02")}
-    spaces = {n: Network(os.path.join(ctx.base, f"net-{n}"), f"{net}.1", ("tap0", "tap1"))
-              for n, (net, _) in nets.items()}
+    spaces = {
+        "a": Network(os.path.join(ctx.base, "net-a"), "10.0.1.1", (("netns-a", "tap0"), ("netns-c", "tap1"))),
+        "b": Network(os.path.join(ctx.base, "net-b"), "10.0.2.1", (("netns-b", "tap0"),)),
+    }
     try:
         vms = {}
         for n, (net, mac) in nets.items():
@@ -871,7 +922,8 @@ def stage_netns(ctx):
             vm.sh(f"ip addr add {net}.2/24 dev eth0 && ip link set eth0 up")
             _, out = vm.sh(f"ping -c 3 -i 0.3 -W 3 {net}.1")
             check(" 0% packet loss" in out, f"jail {n}: ping its own host {net}.1: {out}")
-            check(os.path.exists(os.path.join(spaces[n].path, "tap0")), f"jail {n}: no endpoint in its network")
+            check(os.path.exists(spaces[n].endpoint(f"netns-{n}", "tap0")),
+                  f"jail {n}: no endpoint in its directory of its network")
         # Negative control: jail a, given an address on b's network, does
         # not reach b's host, and b's network never sees a frame of a's.
         a, b = vms["a"], spaces["b"]
@@ -880,8 +932,9 @@ def stage_netns(ctx):
         check(" 100% packet loss" in out, f"jail a reached b's network: {out}")
         check(not b.frames_from(nets["a"][1]), f"b's network got {len(b.frames_from(nets['a'][1]))} frames of a's")
         check(spaces["a"].frames_from(nets["a"][1]), "a's network saw none of a's frames")
-        # A third jail given a's directory shares a's network, as a second
-        # Firecracker in one namespace does: its tap1 reaches a's host.
+        # A third jail given a's directory is in a's network, as a second
+        # Firecracker in one namespace is: its tap1 reaches a's host through
+        # the switch, from a directory of its own.
         jail = Jail(ctx, "netns-c", [ctx.kernel, ctx.rootfs])
         cfg = jail_config(network_interfaces=[{"iface_id": "eth0", "host_dev_name": "tap1",
                                                "guest_mac": "06:00:0a:00:01:03"}])
@@ -890,18 +943,121 @@ def stage_netns(ctx):
         c.sh("ip addr add 10.0.1.3/24 dev eth0 && ip link set eth0 up")
         _, out = c.sh("ping -c 3 -i 0.3 -W 3 10.0.1.1")
         check(" 0% packet loss" in out, f"jail c in a's network: ping a's host: {out}")
+        net_a = spaces["a"]
+        a_tap0 = net_a.endpoint("netns-a", "tap0")
+        check(os.path.exists(net_a.endpoint("netns-c", "tap1")), "jail c: no endpoint in its own directory")
+
+        # A second jail of a's id, while a lives: refused as busy (Linux:
+        # tun_attach, EBUSY), and a keeps its endpoint and its network.
+        rc, out = run_jailer(ctx, jailer_base(ctx, "netns-a") + ["--netns", net_a.path])
+        check(rc != 0 and "(--netns)" in out and "busy" in out.lower(), f"a second jail of a's id: {rc} {out!r}")
+        _, out = a.sh("ping -c 2 -i 0.3 -W 3 10.0.1.1")
+        check(" 0% packet loss" in out, f"jail a after a second jail of its id was refused: {out}")
+
+        # Another uid (as another jail's Firecracker would run): the kernel's
+        # file checks keep it out of a's directory and from making a name in
+        # the network directory.
+        def as_other_uid():
+            os.setgid(GID + 1)
+            os.setuid(UID + 1)
+            got = {}
+            sock = so.socket(so.AF_UNIX, so.SOCK_DGRAM)
+            for what, fn in (("send", lambda: sock.sendto(b"x" * 60, a_tap0)),
+                             ("remove", lambda: os.unlink(a_tap0)),
+                             ("bind in a's directory", lambda: so.socket(so.AF_UNIX, so.SOCK_DGRAM).bind(
+                                 net_a.endpoint("netns-a", "tapx"))),
+                             ("bind in the network", lambda: so.socket(so.AF_UNIX, so.SOCK_DGRAM).bind(
+                                 os.path.join(net_a.path, "tapx")))):
+                try:
+                    fn()
+                    got[what] = 0
+                except OSError as e:
+                    got[what] = e.errno
+            return got
+        got = in_child(as_other_uid)
+        check(isinstance(got, dict) and all(e == errno.EACCES for e in got.values()),
+              f"another uid on jail a's endpoint (want EACCES, {errno.EACCES}, for each): {got}")
+        check(os.path.exists(a_tap0), "jail a's endpoint is gone")
+
+        # The jail's own uid, outside any sandbox (what a jail of the same
+        # uid that broke its profile could do): the file checks let its
+        # datagram through, and a's endpoint drops it, since its sender is
+        # not a socket of the switch's: an ARP request for a's guest from a
+        # socket in c's directory gets no reply, and a's Firecracker logs
+        # the refusal.
+        stranger, forger = "06:00:0a:00:01:aa", "06:00:0a:00:01:bb"
+
+        def as_same_uid():
+            os.setgid(GID)
+            os.setuid(UID)
+            sock = so.socket(so.AF_UNIX, so.SOCK_DGRAM)
+            sock.bind(net_a.endpoint("netns-c", "stranger"))
+            for _ in range(3):
+                sock.sendto(arp_request(stranger, "10.0.1.77", "10.0.1.2"), a_tap0)
+                time.sleep(0.2)
+            return "sent"
+        got = in_child(as_same_uid)
+        check(got == "sent", f"the jail's uid sending to jail a's endpoint: {got!r}")
+        time.sleep(1)
+        check(not net_a.frames_to(stranger), "jail a's guest answered a sender that is not the switch")
+        a.wait_for(r"takes frames only from sockets directly in", 10)
+
+        # The same, with the sender's address forged: a process whose root
+        # is elsewhere binds a socket at the switch's own path inside that
+        # root, so its address reads as the switch's (a datagram's sender
+        # address is the path its sender wrote; Unix datagrams have no peer
+        # credentials on macOS: xnu uipc_usrreq.c, LOCAL_PEERCRED). This is
+        # the injection the docs say is NOT stopped for a jail of the same
+        # uid that has broken its profile: a's guest answers, and the answer
+        # goes to the real switch only. Stated, and checked so that the docs
+        # change if the kernel does.
+        switch_path = net_a.host("netns-a", "tap0")
+        fake_root = os.path.join(ctx.base, "fake-root")
+        os.makedirs(fake_root + os.path.dirname(switch_path))
+
+        def forged():
+            jail_dir = os.open(os.path.dirname(a_tap0), os.O_RDONLY)
+            os.chroot(fake_root)
+            os.chdir("/")
+            sock = so.socket(so.AF_UNIX, so.SOCK_DGRAM)
+            sock.bind(switch_path)
+            os.fchdir(jail_dir)
+            for _ in range(3):
+                sock.sendto(arp_request(forger, "10.0.1.78", "10.0.1.2"), "tap0")
+                time.sleep(0.2)
+            return "sent"
+        got = in_child(forged)
+        check(got == "sent", f"a forged sender to jail a's endpoint: {got!r}")
+        time.sleep(1)
+        check(net_a.frames_to(forger),
+              "a sender whose address is forged as the switch's was NOT answered: the docs say such an "
+              "injection is not stopped (SECURITY.md, the --netns cell); correct them")
         c.reboot()
-        # In a network, vmnet (the host's own) is refused, and so is a name
-        # in use (jail a holds tap0), as a busy TAP.
+
+        # In a network, vmnet (the host's own) is refused; a name in use in
+        # the jail's own directory is busy, as a busy TAP; a name another
+        # jail of the network uses is free (each jail's names are its own:
+        # the stated difference from one Linux namespace).
         jail = Jail(ctx, "netns-refuse")
-        vm = JailedVm(ctx, "netns-refuse", jail, ["--netns", spaces["a"].path])
-        for name, want in (("vmnet-shared", "not the jail's"), ("tap0", "os error 16")):
-            r = vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": name},
-                       expect=(400,))
-            check(want in json.dumps(r), f"{name}: {r}")
+        vm = JailedVm(ctx, "netns-refuse", jail, ["--netns", net_a.path])
+        r = vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "vmnet-shared"},
+                   expect=(400,))
+        check("not the jail's" in json.dumps(r), f"vmnet-shared: {r}")
+        vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "tap0"}, expect=(204,))
+        r = vm.api("PUT", "/network-interfaces/eth1", {"iface_id": "eth1", "host_dev_name": "tap0"},
+                   expect=(400,))
+        check("os error 16" in json.dumps(r), f"tap0 twice in one jail: {r}")
         vm.kill()
         for vm in vms.values():
             vm.reboot()
+        # A jail of a's id again, a gone: its leftover endpoint is removed
+        # (and said so), and the jail starts.
+        check(os.path.exists(a_tap0), "jail a's endpoint did not stay behind it")
+        jail_again = os.path.join(ctx.base, "firecracker", "netns-a")
+        subprocess.run(["rm", "-rf", jail_again], check=True)
+        vm = JailedVm(ctx, "netns-a", Jail(ctx, "netns-a"), ["--netns", net_a.path])
+        check(not os.path.exists(a_tap0), "a dead jail's endpoint was not removed at the next start of its id")
+        vm.kill()
         # Not a directory: the jailer fails before anything runs.
         bogus = os.path.join(ctx.base, "not-a-network")
         open(bogus, "w").close()
@@ -911,7 +1067,11 @@ def stage_netns(ctx):
         for s in spaces.values():
             s.close()
     return ("two jails ping their own network's host; a on b's subnet: 100% loss, b saw no frame of a; "
-            "a third jail in a's directory reaches a's host; vmnet and a busy name refused; a file refused")
+            "a third jail in a's network reaches a's host from its own directory; a second jail of a's id: busy, "
+            "a keeps its network; another uid: EACCES on a's endpoint (send, remove, bind) and in the network "
+            "directory; the jail's uid outside a sandbox: its frame dropped by a's endpoint; a forged switch "
+            "address: answered (stated as not stopped); vmnet and a busy name refused; a dead jail's endpoint "
+            "removed at its id's next start; a file refused")
 
 
 def macos_major():

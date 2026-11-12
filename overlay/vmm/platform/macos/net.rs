@@ -11,6 +11,19 @@
 //! before the chroot ([`crate::ext::jail::netns_dir`]), by making it the
 //! working directory of the calling thread alone for each call that names
 //! a path ([`in_dir`]). vmnet, the host's own network, is not the jail's.
+//!
+//! A jail's directory is its own, inside the network directory the operator
+//! named (`<network>/<id>`, made by the jailer), and the operator's switch
+//! binds its sockets directly in the network directory, where no jail can
+//! make one. So a jailed endpoint sends the guest's frames only to senders
+//! whose address is such a socket, owned by the network directory's owner
+//! or root ([`Switch`]), and drops what any other sender sends it. That is
+//! not an identity check: a datagram's sender address is the path its
+//! sender bound, as it wrote it (measured), and Unix datagram sockets have
+//! no peer credentials (xnu bsd/kern/uipc_usrreq.c, `LOCAL_PEERCRED`: a
+//! stream's only). What keeps another jail from sending here at all is the
+//! kernel's file check on this directory (another uid) and the sender's
+//! own sandbox profile (the same uid).
 
 use std::ffi::{CStr, OsStr};
 use std::fmt;
@@ -205,6 +218,63 @@ impl Peer {
     }
 }
 
+/// Who a jailed endpoint's peers may be: the sockets directly in the
+/// network directory, the parent of the jail's own, that its owner or root
+/// owns.
+#[derive(Debug)]
+struct Switch {
+    /// The network directory's path outside the jail.
+    network: PathBuf,
+    /// Its owner.
+    owner: libc::uid_t,
+}
+
+impl Switch {
+    /// For an endpoint in the jail's directory `dir`, at `path` outside
+    /// the jail.
+    fn of(path: &Path, dir: BorrowedFd<'_>) -> io::Result<Self> {
+        let network = path
+            .parent()
+            .ok_or_else(|| io::Error::other("the jail's network directory has no parent"))?;
+        Ok(Switch { network: network.to_owned(), owner: Self::stat(dir, c"..")?.st_uid })
+    }
+
+    fn stat(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<libc::stat> {
+        // SAFETY: plain data, filled by fstatat.
+        let mut st: libc::stat = unsafe { mem::zeroed() };
+        // SAFETY: a directory descriptor and a NUL-terminated name; no link
+        // followed at its last name.
+        if unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(st)
+    }
+
+    /// The address a sender named `sender` is sent to from the jail's
+    /// directory (`../<name>`), if it names one name directly in the
+    /// network directory, by its path outside the jail.
+    fn address(&self, sender: &Peer) -> Option<Peer> {
+        let name = Path::new(OsStr::from_bytes(sender.path())).strip_prefix(&self.network).ok()?;
+        let mut names = name.components();
+        let (Some(std::path::Component::Normal(name)), None) = (names.next(), names.next()) else {
+            return None;
+        };
+        let (addr, len) = sockaddr(&Path::new("..").join(name)).ok()?;
+        Some(Peer(addr, len))
+    }
+
+    /// Whether `address` (of [`Switch::address`]) is a socket of the
+    /// network directory's owner or root.
+    fn owns(&self, dir: BorrowedFd<'_>, address: &Peer) -> bool {
+        let Ok(name) = std::ffi::CString::new(address.path()) else {
+            return false;
+        };
+        Self::stat(dir, &name).is_ok_and(|st| {
+            st.st_mode & libc::S_IFMT == libc::S_IFSOCK && (st.st_uid == 0 || st.st_uid == self.owner)
+        })
+    }
+}
+
 /// A Unix datagram endpoint.
 struct Endpoint {
     sock: OwnedFd,
@@ -215,9 +285,13 @@ struct Endpoint {
     /// The network's path outside the jail: a peer that names itself by it
     /// is reached relative to `dir`.
     dir_path: Option<PathBuf>,
+    /// In a jail: who may be a peer. Elsewhere any sender is one.
+    switch: Option<Switch>,
     /// Where frames from the guest go: every host-side socket that sent a
-    /// datagram here.
+    /// datagram here (in a jail: of the switch's).
     peers: Vec<Peer>,
+    /// Datagrams dropped because their sender may not be a peer.
+    refused: u64,
 }
 
 impl fmt::Debug for Endpoint {
@@ -231,22 +305,57 @@ impl fmt::Debug for Endpoint {
 
 impl Endpoint {
     /// Binds an endpoint at `path`, relative to the network `dir` (with its
-    /// path outside the jail) if given.
-    fn open(path: &Path, dir: Option<(&Path, BorrowedFd<'static>)>) -> io::Result<Self> {
+    /// path outside the jail) if given. `jail`: `dir` is a jail's own
+    /// directory in its network, whose peers are the switch's ([`Switch`]).
+    fn open(path: &Path, dir: Option<(&Path, BorrowedFd<'static>)>, jail: bool) -> io::Result<Self> {
         let sock = dgram_socket()?;
         let fd = dir.map(|(_, fd)| fd);
+        let switch = match dir {
+            Some((dir_path, fd)) if jail => Some(Switch::of(dir_path, fd)?),
+            _ => None,
+        };
         in_dir(fd, || bind(&sock, path))?;
         Ok(Endpoint {
             sock,
             path: path.to_owned(),
             dir: fd,
             dir_path: dir.map(|(p, _)| p.to_owned()),
+            switch,
             peers: Vec::new(),
+            refused: 0,
         })
     }
 
-    fn note_peer(&mut self, addr: libc::sockaddr_un, len: libc::socklen_t) {
+    /// Notes the sender of a datagram as a peer. `false`: it may not be
+    /// one (in a jail, anything but a socket of the switch's), and its
+    /// datagram is not a frame.
+    fn note_peer(&mut self, addr: libc::sockaddr_un, len: libc::socklen_t) -> bool {
         let mut peer = Peer(addr, len);
+        if let (Some(switch), Some(dir)) = (&self.switch, self.dir) {
+            let admitted = switch.address(&peer).filter(|address| {
+                // A peer already taken is not looked at again: a name in
+                // the network directory is replaced only by who may write
+                // there, its owner.
+                self.peers.iter().any(|p| p.path() == address.path()) || switch.owns(dir, address)
+            });
+            let Some(address) = admitted else {
+                if self.refused == 0 {
+                    crate::logger::warn!(
+                        "net: {:?} takes frames only from sockets directly in {:?} that its owner or root owns: \
+                         dropped a datagram from {:?} (logged once)",
+                        self.path,
+                        switch.network,
+                        OsStr::from_bytes(peer.path())
+                    );
+                }
+                self.refused += 1;
+                return false;
+            };
+            if !self.peers.iter().any(|p| p.path() == address.path()) {
+                self.peers.push(address);
+            }
+            return true;
+        }
         // A peer in the network naming itself by its path outside the jail
         // is reached by its name in the network's directory.
         if let Some(dir) = &self.dir_path
@@ -258,10 +367,12 @@ impl Endpoint {
         if !peer.path().is_empty() && !self.peers.iter().any(|p| p.path() == peer.path()) {
             self.peers.push(peer);
         }
+        true
     }
 
-    /// `recvmsg` into `iovs`, noting the sender.
-    fn recvmsg(&mut self, iovs: &mut [libc::iovec], flags: c_int) -> io::Result<usize> {
+    /// `recvmsg` into `iovs`, noting the sender: the datagram's length, and
+    /// whether its sender may be a peer ([`Endpoint::note_peer`]).
+    fn recvmsg(&mut self, iovs: &mut [libc::iovec], flags: c_int) -> io::Result<(usize, bool)> {
         // SAFETY: plain data.
         let mut addr: libc::sockaddr_un = unsafe { mem::zeroed() };
         // SAFETY: plain data.
@@ -276,21 +387,19 @@ impl Endpoint {
             match cvt(unsafe { libc::recvmsg(self.sock.as_raw_fd(), &mut msg, flags) }) {
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(err),
-                Ok(n) => {
-                    self.note_peer(addr, msg.msg_namelen);
-                    return Ok(n);
-                }
+                Ok(n) => return Ok((n, self.note_peer(addr, msg.msg_namelen))),
             }
         }
     }
 
     /// Reads one frame; `None` if none is waiting. Empty datagrams only
-    /// attach their sender.
+    /// attach their sender; a datagram whose sender may not be a peer is
+    /// dropped.
     fn recv(&mut self, iovs: &mut [libc::iovec]) -> io::Result<Option<usize>> {
         loop {
             match self.recvmsg(iovs, 0) {
-                Ok(0) => continue,
-                Ok(n) => return Ok(Some(n)),
+                Ok((0, _) | (_, false)) => continue,
+                Ok((n, true)) => return Ok(Some(n)),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
                 Err(err) => return Err(err),
             }
@@ -298,7 +407,8 @@ impl Endpoint {
     }
 
     /// Learns the senders of the datagrams waiting, without taking frames
-    /// meant for the guest: attach datagrams in front are consumed.
+    /// meant for the guest: attach datagrams in front are consumed, and so
+    /// are datagrams whose sender may not be a peer.
     fn learn_peers(&mut self) -> io::Result<()> {
         // macOS refuses a receive without buffers (EMSGSIZE): peek one byte.
         let mut byte = 0u8;
@@ -308,12 +418,12 @@ impl Endpoint {
         }];
         loop {
             match self.recvmsg(&mut iov, libc::MSG_PEEK) {
-                // An empty datagram attaches.
-                Ok(0) => {
+                // An empty datagram attaches; one that is no peer's goes.
+                Ok((0, _) | (_, false)) => {
                     self.recvmsg(&mut iov, 0)?;
                 }
                 // A frame, left for the guest.
-                Ok(_) => return Ok(()),
+                Ok((_, true)) => return Ok(()),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(err) => return Err(err),
             }
@@ -490,10 +600,12 @@ fn open_endpoint(
     network: Option<BorrowedFd<'static>>,
     name: &str,
 ) -> Result<(String, Endpoint), TapError> {
+    // In a jail the network is the jail's own directory in it.
+    let jail = crate::ext::jail::root().is_some();
     let open = |name: &str| match (dir, network) {
-        (Some(dir), Some(fd)) => Endpoint::open(Path::new(name), Some((dir, fd))),
-        (Some(dir), None) => Endpoint::open(&dir.join(name), None),
-        (None, _) => Endpoint::open(Path::new(name), None),
+        (Some(dir), Some(fd)) => Endpoint::open(Path::new(name), Some((dir, fd)), jail),
+        (Some(dir), None) => Endpoint::open(&dir.join(name), None, false),
+        (None, _) => Endpoint::open(Path::new(name), None, false),
     };
     let failed = |err: io::Error, name: &str| match err.raw_os_error() {
         Some(libc::ENAMETOOLONG) => TapError::InvalidIfname,
@@ -871,7 +983,7 @@ mod tests {
         let net = endpoint_dir().unwrap().join(format!("net-{}", std::process::id()));
         std::fs::create_dir_all(&net).unwrap();
         let dir: &'static OwnedFd = Box::leak(Box::new(OwnedFd::from(std::fs::File::open(&net).unwrap())));
-        let mut ep = Endpoint::open(Path::new("tap0"), Some((&net, dir.as_fd()))).unwrap();
+        let mut ep = Endpoint::open(Path::new("tap0"), Some((&net, dir.as_fd())), false).unwrap();
         assert!(net.join("tap0").exists());
         // Relative to the network, not to the process's working directory.
         assert!(!Path::new("tap0").exists());
@@ -892,10 +1004,78 @@ mod tests {
         // This thread resolves relative paths as the process does again.
         std::fs::metadata("tap0").unwrap_err();
         // A second endpoint of the name is busy, as a TAP opened twice.
-        let busy = Endpoint::open(Path::new("tap0"), Some((&net, dir.as_fd()))).unwrap_err();
+        let busy = Endpoint::open(Path::new("tap0"), Some((&net, dir.as_fd())), false).unwrap_err();
         assert_eq!(busy.raw_os_error(), Some(libc::EBUSY));
         drop(ep);
         assert!(net.join("tap0").exists());
+        std::fs::remove_dir_all(&net).unwrap();
+    }
+
+    // A jail's endpoint, in the jail's own directory of a network: its
+    // peers are the sockets directly in the network directory that the
+    // directory's owner owns (the operator's switch). Any other sender is
+    // not sent the guest's frames, and what it sends is not a frame: a
+    // socket in the jail's own directory, one in another jail's, one that
+    // names itself as the switch does but by a relative name or through
+    // `..`, and one with no name. Linux: a second opener of a TAP never
+    // becomes a party to it (drivers/net/tun.c tun_attach: EBUSY).
+    #[test]
+    fn test_a_jails_endpoint_takes_only_the_switch_as_a_peer() {
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixDatagram;
+
+        let net = endpoint_dir().unwrap().join(format!("jn{}", std::process::id()));
+        let (a, b) = (net.join("a"), net.join("b"));
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let open = |dir: &Path| -> &'static OwnedFd { Box::leak(Box::new(OwnedFd::from(std::fs::File::open(dir).unwrap()))) };
+        let (dir, other) = (open(&a), open(&b));
+        let mut ep = Endpoint::open(Path::new("tap0"), Some((&a, dir.as_fd())), true).unwrap();
+        let tap0 = a.join("tap0");
+        let switch = UnixDatagram::bind(net.join("switch")).unwrap();
+        let inside = UnixDatagram::bind(a.join("inside")).unwrap();
+        let theirs = UnixDatagram::bind(b.join("tap0")).unwrap();
+        // Named "switch", as the real one's last name, by a relative name
+        // bound in another directory; and one reached through `..`.
+        let relative = dgram_socket().unwrap();
+        in_dir(Some(other.as_fd()), || bind(&relative, Path::new("switch"))).unwrap();
+        let relative = UnixDatagram::from(relative);
+        let dotted = UnixDatagram::bind(b.join("../b/switch2")).unwrap();
+        let unnamed = UnixDatagram::unbound().unwrap();
+        let strangers = [&inside, &theirs, &relative, &dotted, &unnamed];
+        for sock in strangers.iter().copied().chain([&switch]) {
+            sock.set_nonblocking(true).unwrap();
+        }
+        // Each stranger attaches and sends a frame; then the switch does.
+        for (n, stranger) in strangers.iter().enumerate() {
+            stranger.send_to(b"", &tap0).unwrap();
+            stranger.send_to(&vec![u8::try_from(n).unwrap() + 1; 60], &tap0).unwrap();
+        }
+        switch.send_to(&[0xee; 64], &tap0).unwrap();
+        // The guest gets the switch's frame, and that one only.
+        let mut buf = [0u8; 100];
+        let mut iov = [libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() }];
+        assert_eq!(ep.recv(&mut iov).unwrap(), Some(64));
+        assert_eq!(buf[..64], [0xee; 64]);
+        assert_eq!(ep.recv(&mut iov).unwrap(), None);
+        assert_eq!(ep.refused, 10, "two datagrams from each of five strangers");
+        // The guest's frames go to the switch, and to it only.
+        let names: Vec<_> = ep.peers.iter().map(|p| p.path().to_vec()).collect();
+        assert_eq!(names, [b"../switch".to_vec()]);
+        ep.send(&frame(60)).unwrap();
+        assert_eq!(switch.recv(&mut buf).unwrap(), 60);
+        for stranger in strangers {
+            assert_eq!(stranger.recv(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        }
+        // A stranger's frame in front of the queue is not left there for
+        // the guest when peers are learned.
+        ep.peers.clear();
+        inside.send_to(&[1; 60], &tap0).unwrap();
+        switch.send_to(b"", &tap0).unwrap();
+        ep.send(&frame(60)).unwrap();
+        assert_eq!(switch.recv(&mut buf).unwrap(), 60);
+        assert_eq!(ep.recv(&mut iov).unwrap(), None);
         std::fs::remove_dir_all(&net).unwrap();
     }
 

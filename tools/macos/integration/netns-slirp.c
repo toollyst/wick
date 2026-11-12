@@ -7,7 +7,11 @@
 // Firecracker binds its interface `<name>` there (vmm::platform::net), and
 // behind each one this process is the host, a user-space IP stack (libslirp)
 // whose address is the one the test gives its TAP (`ifconfig tap0
-// 192.168.0.1/30 up`), bound at `.host-<name>` next to it. It attaches to
+// 192.168.0.1/30 up`), bound at `.host-<name>` directly in the directory,
+// by its real path (a jailed VMM takes only such sockets as peers). The
+// endpoint is `<name>` there for a VMM without a jail, and `<id>/<name>`,
+// in the jail's own directory, under the jailer; a test's network holds one
+// microVM, so the one directory that has the name is taken. It attaches to
 // the endpoint (an empty datagram) whenever one is bound there anew. The
 // test reaches the guest through a forward: what `ip netns exec <ns> ssh
 // <guest>` does on Linux, a Unix socket here that leads to <guest>:<port>.
@@ -69,6 +73,7 @@
 //
 // Build: cc -O2 netns-slirp.c $(pkg-config --cflags --libs slirp)
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -121,7 +126,7 @@ struct iface {
     struct in_addr guest_ip;
     uint8_t seen_mac[6];     // the guest's, from its last frame (0: none yet)
     int fd;                  // the host's socket, bound at .host-<name>
-    struct sockaddr_un vmm;  // the VMM's endpoint, <name>
+    struct sockaddr_un vmm;  // the VMM's endpoint, relative to the network (the working directory): <name> or <id>/<name>
     ino_t attached;          // the endpoint attached to (its inode), 0: none
     int txqueuelen;          // what a test asked for (0: not asked)
     uint64_t dropped;        // frames for the VMM dropped: its endpoint was full
@@ -399,8 +404,32 @@ static void drain(struct iface *i) {
     }
 }
 
+// Where the VMM's endpoint of the interface is, relative to the network
+// (this process's working directory, so that a jail's 36-character id does
+// not have to fit a socket address after the network's path): `<name>`, or
+// `<id>/<name>` in the directory of the jail that has it.
+static void locate(struct iface *i) {
+    struct stat st;
+    snprintf(i->vmm.sun_path, sizeof i->vmm.sun_path, "%s", i->name);
+    if (lstat(i->name, &st) == 0) return;
+    DIR *d = opendir(".");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        char path[sizeof i->vmm.sun_path];
+        if (e->d_type != DT_DIR || e->d_name[0] == '.') continue;
+        if ((size_t)snprintf(path, sizeof path, "%s/%s", e->d_name, i->name) >= sizeof path) continue;
+        if (lstat(path, &st) == 0 && S_ISSOCK(st.st_mode)) {
+            strcpy(i->vmm.sun_path, path);
+            break;
+        }
+    }
+    closedir(d);
+}
+
 // Whether a VMM has the endpoint bound: a socket file someone receives on.
 static int bound(struct iface *i) {
+    locate(i);
     int probe = socket(AF_UNIX, SOCK_DGRAM, 0);
     int ok = connect(probe, (struct sockaddr *)&i->vmm, sizeof i->vmm) == 0;
     close(probe);
@@ -412,6 +441,7 @@ static int bound(struct iface *i) {
 // sends its frames to whoever sent it a datagram.
 static void attach(struct iface *i) {
     struct stat st;
+    locate(i);
     if (stat(i->vmm.sun_path, &st) != 0) {
         i->attached = 0;
         return;
@@ -524,8 +554,8 @@ static void request(int conn, char *line) {
         i->vmm.sun_len = sizeof i->vmm;
         i->vmm.sun_family = AF_UNIX;
         struct sockaddr_un h = {.sun_len = sizeof h, .sun_family = AF_UNIX};
-        if ((size_t)snprintf(i->vmm.sun_path, sizeof i->vmm.sun_path, "%s/%s", net, a) >= sizeof i->vmm.sun_path ||
-            (size_t)snprintf(h.sun_path, sizeof h.sun_path, "%s/.host-%s", net, a) >= sizeof h.sun_path) {
+        snprintf(i->vmm.sun_path, sizeof i->vmm.sun_path, "%s", a);
+        if ((size_t)snprintf(h.sun_path, sizeof h.sun_path, "%s/.host-%s", net, a) >= sizeof h.sun_path) {
             reply(conn, ENAMETOOLONG, NULL);
             return;
         }
@@ -708,6 +738,11 @@ int main(int argc, char **argv) {
     // (vmm::platform::net reaches a peer that names itself by it).
     if (!realpath(argv[1], net)) {
         fprintf(stderr, "netns-slirp: %s: %s\n", argv[1], strerror(errno));
+        return 1;
+    }
+    // Endpoints are named relative to the network (locate).
+    if (chdir(net) != 0) {
+        fprintf(stderr, "netns-slirp: %s: %s\n", net, strerror(errno));
         return 1;
     }
     dir = argv[3];

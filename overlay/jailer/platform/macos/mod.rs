@@ -179,20 +179,19 @@ fn jail_dir_from_args() -> Result<PathBuf, JailerError> {
 
 /// `--netns`: the jail's network.
 ///
-/// macOS has no network namespaces. As on Windows, a jail's network is a
-/// directory of endpoints the operator made (it must exist, as the
-/// namespace file must on Linux): Firecracker makes its network endpoints
-/// there (`vmm::platform::net`) instead of in its temporary directory. A
-/// jail given its own directory reaches no other's. Two jails given one
-/// directory are not separated from each other's endpoints, unlike two
-/// Firecrackers in one namespace, whose TAPs are each their own
-/// (drivers/net/tun.c tun_not_capable, tun_attach): each is granted
-/// write and delete on the other's endpoint, and an endpoint takes
-/// whoever sends to it as a peer. Not done yet: being closed. The
-/// jail's uid is granted the directory and what is made in it at the exec
-/// ([`grant_to_jail`]); Firecracker opens it before its chroot
-/// (`WICK_NETNS`, `vmm::ext::jail::netns_dir`), and its sandbox lets it
-/// reach Unix sockets only there and in the jail, and no IP network.
+/// macOS has no network namespaces. As on Windows, a network is a
+/// directory the operator made (it must exist, as the namespace file must
+/// on Linux), where the operator's switch binds its sockets. Each jail
+/// given it has a directory of its own inside, `<dir>/<id>`, made at the
+/// exec ([`network_for_jail`]): Firecracker makes its network endpoints
+/// there (`vmm::platform::net`), `<dir>/<id>/<host_dev_name>`, instead of
+/// in its temporary directory. So jails given one directory are in one
+/// network, as Firecrackers in one namespace are, and each one's endpoints
+/// are its own, as a TAP is its owner's (drivers/net/tun.c
+/// tun_not_capable, tun_attach). Firecracker opens its directory before
+/// its chroot (`WICK_NETNS`, `vmm::ext::jail::netns_dir`), and its sandbox
+/// lets it reach Unix sockets only there, directly in the network (the
+/// switch's) and in the jail, and no IP network.
 pub fn join_netns(path: &str) -> Result<(), JailerError> {
     let dir = std::fs::canonicalize(path).map_err(|e| HostError::Netns(PathBuf::from(path), e))?;
     if !dir.is_dir() {
@@ -249,24 +248,22 @@ mod acl {
         pub fn acl_free(obj: *mut c_void) -> c_int;
         pub fn acl_get_entry(acl: Acl, id: c_int, entry: *mut Entry) -> c_int;
         pub fn acl_create_entry(acl: *mut Acl, entry: *mut Entry) -> c_int;
-        pub fn acl_get_tag_type(entry: Entry, tag: *mut c_int) -> c_int;
+        pub fn acl_delete_entry(acl: Acl, entry: Entry) -> c_int;
         pub fn acl_set_tag_type(entry: Entry, tag: c_int) -> c_int;
         pub fn acl_get_qualifier(entry: Entry) -> *mut c_void;
         pub fn acl_set_qualifier(entry: Entry, qualifier: *const c_void) -> c_int;
         pub fn acl_get_permset(entry: Entry, set: *mut Set) -> c_int;
         pub fn acl_add_perm(set: Set, perm: c_int) -> c_int;
-        pub fn acl_get_perm_np(set: Set, perm: c_int) -> c_int;
         pub fn acl_set_permset(entry: Entry, set: Set) -> c_int;
         pub fn acl_get_flagset_np(obj: *mut c_void, set: *mut Set) -> c_int;
         pub fn acl_add_flag_np(set: Set, flag: c_int) -> c_int;
-        pub fn acl_get_flag_np(set: Set, flag: c_int) -> c_int;
         pub fn acl_set_flagset_np(obj: *mut c_void, set: Set) -> c_int;
         pub fn mbr_uid_to_uuid(uid: u32, uuid: *mut u8) -> c_int;
     }
 }
 
-/// What the jail's uid is granted on its network directory, and on what is
-/// made in it (inherited) or already there.
+/// What a jail's uid, and the network's owner, are granted on the jail's
+/// own directory in the network: to list it and to make and remove entries.
 const NETNS_DIR_PERMS: &[i32] = &[
     acl::LIST_DIRECTORY,
     acl::SEARCH,
@@ -276,6 +273,8 @@ const NETNS_DIR_PERMS: &[i32] = &[
     acl::READ_EXTATTRIBUTES,
     acl::READ_SECURITY,
 ];
+/// What the network's owner is granted on what a jail makes in its
+/// directory (inherited): a socket is reached by writing to it.
 const NETNS_ENTRY_PERMS: &[i32] = &[
     acl::READ_DATA,
     acl::WRITE_DATA,
@@ -287,43 +286,189 @@ const NETNS_ENTRY_PERMS: &[i32] = &[
     acl::WRITE_EXTATTRIBUTES,
     acl::READ_SECURITY,
 ];
+/// What a jail's uid is granted on the network directory itself: to pass
+/// through it, to its own directory and to the switch's sockets.
+const NETNS_PASS_PERMS: &[i32] = &[acl::SEARCH];
+/// What a jail's uid is granted on the switch's sockets, those directly in
+/// the network directory: to send to them.
+const NETNS_SWITCH_PERMS: &[i32] = &[acl::WRITE_DATA];
 
-/// Grants `uid` its network directory `dir`: an entry for the directory
-/// itself (list, search, make and remove entries), one that what is made
-/// in it inherits (read and write: a socket is reached by writing to it),
-/// and the same on the entries already there, keeping every other entry
-/// (another jail given the same directory keeps its own, and so reaches
-/// this jail's endpoints: see [`join_netns`]). An entry already
-/// granted is not added twice. As the Windows jailer grants the jail's SID.
-pub(crate) fn grant_to_jail(dir: &Path, uid: u32) -> io::Result<()> {
-    grant(dir, uid, NETNS_DIR_PERMS, &[])?;
-    grant(dir, uid, NETNS_ENTRY_PERMS, &[acl::ENTRY_FILE_INHERIT, acl::ENTRY_ONLY_INHERIT])?;
+/// An entry of an ACL to write: who, what, and the inheritance flags.
+type AclEntry<'a> = (u32, &'a [i32], &'a [i32]);
+
+/// The jail `id`'s own directory in the network `dir`, for the jail's
+/// `uid`: `<dir>/<id>`, returned with the lock that says a jail lives
+/// there, which Firecracker holds for its life (the descriptor is its
+/// inheritance; a lock goes with its last descriptor, so it frees itself
+/// however the jail ends).
+///
+/// - The network directory lets the jail's uid pass through
+///   ([`NETNS_PASS_PERMS`]) and send to the sockets directly in it, the
+///   operator's switch's, made before or after ([`NETNS_SWITCH_PERMS`]):
+///   it cannot list the directory, nor make, remove or replace anything
+///   in it. Whatever else an earlier jailer granted that uid there is
+///   taken back. (The grant for what is made after is inherited by any
+///   file made directly there, not sockets alone: the directory is for
+///   the switch's sockets, and the docs say to keep nothing else in it.
+///   A switch started or restarted after the jail must be reachable.)
+/// - `<dir>/<id>` is the jailer's (mode 0700) and grants the jail's uid
+///   and the network's owner only: the uid makes and removes its endpoints
+///   there, the owner's switch reaches them. No other uid has an entry, so
+///   another jail gets nothing there from the kernel's file checks. Two
+///   jails of one uid are told apart by nothing a file has: each
+///   Firecracker's sandbox profile names its own directory only
+///   (`vmm::ext::sandbox::files_in_jail`).
+/// - A jail of this id that lives keeps its directory: the second start
+///   fails with `EBUSY` and nothing of the first's is touched, as a TAP
+///   with a queue attached refuses a second attach (drivers/net/tun.c
+///   tun_attach). With the lock free the directory is a dead jail's: its
+///   sockets are removed (each one logged), by name on the directory's
+///   own descriptor, no link followed; nothing that is not a socket is.
+/// - A link at `<dir>/<id>`, or anything that is not a directory of the
+///   jailer's own user, is refused. The path's length is not: Firecracker
+///   names its endpoints and the switch's sockets relative to its
+///   directory, and a switch for which `<dir>/<id>/<name>` is too long for
+///   a socket address (104 bytes) names it relative to `<dir>`.
+pub(crate) fn network_for_jail(dir: &Path, id: &str, uid: u32) -> io::Result<(PathBuf, OwnedFd)> {
+    if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\0']) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{id:?} names no directory")));
+    }
+    let sub = dir.join(id);
+    let c_sub = CString::new(sub.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: a NUL-terminated path.
+    if unsafe { libc::mkdir(c_sub.as_ptr(), 0o700) } != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::AlreadyExists {
+            return Err(err);
+        }
+    }
+    // SAFETY: a NUL-terminated path; no link followed at its last name.
+    let fd = unsafe {
+        libc::open(c_sub.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor we own.
+    let lock = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let meta = File::from(lock.try_clone()?).metadata()?;
+    // SAFETY: no arguments.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{sub:?} is uid {}'s, not the jailer's ({me}): remove it", meta.uid()),
+        ));
+    }
+    // SAFETY: a descriptor we own; does not block.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = io::Error::last_os_error();
+        return Err(if err.kind() == io::ErrorKind::WouldBlock {
+            io::Error::from_raw_os_error(libc::EBUSY)
+        } else {
+            err
+        });
+    }
+    // From here the directory is this jail's and no other's.
+    remove_dead_sockets(&lock, &sub)?;
+    // SAFETY: a descriptor we own.
+    if unsafe { libc::fchmod(lock.as_raw_fd(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let owner = std::fs::metadata(dir)?.uid();
+    let mut entries: Vec<AclEntry> = vec![(uid, NETNS_DIR_PERMS, &[])];
+    if owner != 0 {
+        entries.push((owner, NETNS_DIR_PERMS, &[]));
+        entries.push((owner, NETNS_ENTRY_PERMS, &[acl::ENTRY_FILE_INHERIT, acl::ENTRY_ONLY_INHERIT]));
+    }
+    write_acl(&sub, None, &entries)?;
+    write_acl(
+        dir,
+        Some(uid),
+        &[
+            (uid, NETNS_PASS_PERMS, &[]),
+            (uid, NETNS_SWITCH_PERMS, &[acl::ENTRY_FILE_INHERIT, acl::ENTRY_ONLY_INHERIT]),
+        ],
+    )?;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if entry.file_type()?.is_symlink() {
+        let meta = std::fs::symlink_metadata(entry.path())?;
+        if std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()) && (meta.uid() == owner || meta.uid() == 0) {
+            write_acl(&entry.path(), Some(uid), &[(uid, NETNS_SWITCH_PERMS, &[])])?;
+        }
+    }
+    Ok((sub, lock))
+}
+
+/// Removes the sockets in the directory `dir` is open on (`path`, for the
+/// log): what a jail that is gone left there. Each name is looked at and
+/// removed on the descriptor, without following a link.
+fn remove_dead_sockets(dir: &OwnedFd, path: &Path) -> io::Result<()> {
+    // readdir on a descriptor of its own: closedir closes it.
+    let list = dir.try_clone()?;
+    // SAFETY: a directory descriptor, owned by the stream from here.
+    let stream = unsafe { libc::fdopendir(std::os::fd::IntoRawFd::into_raw_fd(list)) };
+    if stream.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: a valid stream; the entry is read before the next call.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: a NUL-terminated name in the entry.
+        names.push(unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_owned());
+    }
+    // SAFETY: the stream opened above.
+    unsafe { libc::closedir(stream) };
+    for name in names {
+        // SAFETY: plain data, filled by fstatat.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a name in the directory; no link followed.
+        if unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0
+            || st.st_mode & libc::S_IFMT != libc::S_IFSOCK
+        {
             continue;
         }
-        grant(&entry.path(), uid, NETNS_ENTRY_PERMS, &[])?;
+        // SAFETY: as above; removes that name only.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        eprintln!(
+            "jailer: removed the socket {:?} a jail that is gone left in {path:?}",
+            std::ffi::OsStr::from_bytes(name.to_bytes())
+        );
     }
     Ok(())
 }
 
-/// Adds an allow entry for `uid` with `perms` and `flags` to `path`'s ACL,
-/// unless one with at least those is there.
-fn grant(path: &Path, uid: u32, perms: &[i32], flags: &[i32]) -> io::Result<()> {
+/// Writes `path`'s ACL: `add`'s allow entries, after the entries it has
+/// that are not `without`'s uid's (`Some`), or after none (`None`: the ACL
+/// is `add` alone).
+fn write_acl(path: &Path, without: Option<u32>, add: &[AclEntry]) -> io::Result<()> {
     let c_path = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
-    let mut uuid = [0u8; 16];
-    // SAFETY: a 16-byte uuid_t.
-    if unsafe { acl::mbr_uid_to_uuid(uid, uuid.as_mut_ptr()) } != 0 {
-        return Err(io::Error::other(format!("no UUID for uid {uid}")));
-    }
+    let uuid_of = |uid: u32| {
+        let mut uuid = [0u8; 16];
+        // SAFETY: a 16-byte uuid_t.
+        if unsafe { acl::mbr_uid_to_uuid(uid, uuid.as_mut_ptr()) } != 0 {
+            return Err(io::Error::other(format!("no UUID for uid {uid}")));
+        }
+        Ok(uuid)
+    };
     let check = |ret: i32| if ret == 0 { Ok(()) } else { Err(io::Error::last_os_error()) };
-    // SAFETY: a NUL-terminated path; a null ACL is no ACL yet.
-    let mut list = unsafe { acl::acl_get_file(c_path.as_ptr(), acl::TYPE_EXTENDED) };
+    let mut list = match without {
+        // SAFETY: a NUL-terminated path; a null ACL is no ACL yet.
+        Some(_) => unsafe { acl::acl_get_file(c_path.as_ptr(), acl::TYPE_EXTENDED) },
+        None => std::ptr::null_mut(),
+    };
     if list.is_null() {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ENOENT) {
-            return Err(err);
+        if without.is_some() {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOENT) {
+                return Err(err);
+            }
         }
         // SAFETY: a new, empty ACL.
         list = unsafe { acl::acl_init(1) };
@@ -332,71 +477,66 @@ fn grant(path: &Path, uid: u32, perms: &[i32], flags: &[i32]) -> io::Result<()> 
         }
     }
     let result = (|| {
-        // Already granted?
-        let mut entry: acl::Entry = std::ptr::null_mut();
-        let mut id = acl::FIRST_ENTRY;
-        // SAFETY: entries of a valid ACL, read only; the qualifier is freed.
-        while unsafe { acl::acl_get_entry(list, id, &mut entry) } == 0 {
-            id = acl::NEXT_ENTRY;
-            let mut tag = 0;
-            // SAFETY: as above.
-            unsafe { acl::acl_get_tag_type(entry, &mut tag) };
-            if tag != acl::EXTENDED_ALLOW {
-                continue;
-            }
-            // SAFETY: as above.
-            let qualifier = unsafe { acl::acl_get_qualifier(entry) };
-            if qualifier.is_null() {
-                continue;
-            }
-            // SAFETY: a guid_t (16 bytes), freed after.
-            let same = unsafe { std::slice::from_raw_parts(qualifier.cast::<u8>(), 16) } == uuid;
-            // SAFETY: allocated by acl_get_qualifier.
-            unsafe { acl::acl_free(qualifier) };
-            let (mut pset, mut fset): (acl::Set, acl::Set) = (std::ptr::null_mut(), std::ptr::null_mut());
-            // SAFETY: as above.
-            unsafe {
-                acl::acl_get_permset(entry, &mut pset);
-                acl::acl_get_flagset_np(entry, &mut fset);
-            }
-            let has = |set: acl::Set, all: &[i32], get: unsafe extern "C" fn(acl::Set, i32) -> i32| {
-                // SAFETY: a set of the entry, and a bit of its kind.
-                all.iter().all(|&b| unsafe { get(set, b) } == 1)
-            };
-            let all_flags = [acl::ENTRY_FILE_INHERIT, acl::ENTRY_ONLY_INHERIT];
-            let flags_match = all_flags
-                .iter()
-                // SAFETY: the entry's flag set.
-                .all(|&f| (unsafe { acl::acl_get_flag_np(fset, f) } == 1) == flags.contains(&f));
-            if same && flags_match && has(pset, perms, acl::acl_get_perm_np) {
-                return Ok(());
+        if let Some(uid) = without {
+            let uuid = uuid_of(uid)?;
+            // One entry of that uid's removed per pass: an entry's place is
+            // not kept across a removal.
+            loop {
+                let mut found = None;
+                let mut entry: acl::Entry = std::ptr::null_mut();
+                let mut id = acl::FIRST_ENTRY;
+                // SAFETY: entries of a valid ACL, read only; the qualifier is freed.
+                while unsafe { acl::acl_get_entry(list, id, &mut entry) } == 0 {
+                    id = acl::NEXT_ENTRY;
+                    // SAFETY: as above.
+                    let qualifier = unsafe { acl::acl_get_qualifier(entry) };
+                    if qualifier.is_null() {
+                        continue;
+                    }
+                    // SAFETY: a guid_t (16 bytes), freed after.
+                    let same = unsafe { std::slice::from_raw_parts(qualifier.cast::<u8>(), 16) } == uuid;
+                    // SAFETY: allocated by acl_get_qualifier.
+                    unsafe { acl::acl_free(qualifier) };
+                    if same {
+                        found = Some(entry);
+                        break;
+                    }
+                }
+                match found {
+                    // SAFETY: an entry of this ACL.
+                    Some(entry) => check(unsafe { acl::acl_delete_entry(list, entry) })?,
+                    None => break,
+                }
             }
         }
-        let mut entry: acl::Entry = std::ptr::null_mut();
-        // SAFETY: a new entry of the ACL, filled in below.
-        check(unsafe { acl::acl_create_entry(&mut list, &mut entry) })?;
-        // SAFETY: the new entry.
-        check(unsafe { acl::acl_set_tag_type(entry, acl::EXTENDED_ALLOW) })?;
-        // SAFETY: a guid_t.
-        check(unsafe { acl::acl_set_qualifier(entry, uuid.as_ptr().cast()) })?;
-        let mut pset: acl::Set = std::ptr::null_mut();
-        // SAFETY: the new entry's permission set.
-        check(unsafe { acl::acl_get_permset(entry, &mut pset) })?;
-        for &perm in perms {
+        for &(uid, perms, flags) in add {
+            let uuid = uuid_of(uid)?;
+            let mut entry: acl::Entry = std::ptr::null_mut();
+            // SAFETY: a new entry of the ACL, filled in below.
+            check(unsafe { acl::acl_create_entry(&mut list, &mut entry) })?;
+            // SAFETY: the new entry.
+            check(unsafe { acl::acl_set_tag_type(entry, acl::EXTENDED_ALLOW) })?;
+            // SAFETY: a guid_t.
+            check(unsafe { acl::acl_set_qualifier(entry, uuid.as_ptr().cast()) })?;
+            let mut pset: acl::Set = std::ptr::null_mut();
+            // SAFETY: the new entry's permission set.
+            check(unsafe { acl::acl_get_permset(entry, &mut pset) })?;
+            for &perm in perms {
+                // SAFETY: as above.
+                check(unsafe { acl::acl_add_perm(pset, perm) })?;
+            }
             // SAFETY: as above.
-            check(unsafe { acl::acl_add_perm(pset, perm) })?;
-        }
-        // SAFETY: as above.
-        check(unsafe { acl::acl_set_permset(entry, pset) })?;
-        let mut fset: acl::Set = std::ptr::null_mut();
-        // SAFETY: the new entry's flag set.
-        check(unsafe { acl::acl_get_flagset_np(entry, &mut fset) })?;
-        for &flag in flags {
+            check(unsafe { acl::acl_set_permset(entry, pset) })?;
+            let mut fset: acl::Set = std::ptr::null_mut();
+            // SAFETY: the new entry's flag set.
+            check(unsafe { acl::acl_get_flagset_np(entry, &mut fset) })?;
+            for &flag in flags {
+                // SAFETY: as above.
+                check(unsafe { acl::acl_add_flag_np(fset, flag) })?;
+            }
             // SAFETY: as above.
-            check(unsafe { acl::acl_add_flag_np(fset, flag) })?;
+            check(unsafe { acl::acl_set_flagset_np(entry, fset) })?;
         }
-        // SAFETY: as above.
-        check(unsafe { acl::acl_set_flagset_np(entry, fset) })?;
         // SAFETY: a NUL-terminated path and a valid ACL.
         check(unsafe { acl::acl_set_file(c_path.as_ptr(), acl::TYPE_EXTENDED, list) })
     })();
@@ -512,11 +652,16 @@ fn exec(
     if NEW_PID_NS.load(std::sync::atomic::Ordering::Relaxed) {
         env.push(CString::new(format!("{JAIL_PID_NS_ENV}=1")).expect("no NUL"));
     }
+    // The jail's own directory in its network, and the lock on it, which
+    // Firecracker inherits and holds for its life.
+    let mut network_lock = None;
     if let Some(dir) = NETNS.lock().unwrap().as_ref() {
-        grant_to_jail(dir, uid).map_err(|e| HostError::Netns(dir.clone(), e))?;
+        let id = jail_dir.file_name().and_then(|id| id.to_str()).unwrap_or("");
+        let (sub, lock) = network_for_jail(dir, id, uid).map_err(|e| HostError::Netns(dir.join(id), e))?;
         let mut var = format!("{NETNS_ENV}=").into_bytes();
-        var.extend_from_slice(dir.as_os_str().as_bytes());
+        var.extend_from_slice(sub.as_os_str().as_bytes());
         env.push(CString::new(var).map_err(|e| HostError::Spawn("WICK_NETNS", io::Error::other(e)))?);
+        network_lock = Some(lock);
     }
     let mut argv_ptrs: Vec<*mut libc::c_char> = argv.iter().map(|a| a.as_ptr().cast_mut()).collect();
     argv_ptrs.push(std::ptr::null_mut());
@@ -548,7 +693,10 @@ fn exec(
     if ret != 0 {
         return Err(fail("posix_spawnattr_setflags", ret));
     }
-    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+    let inherited = [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        .into_iter()
+        .chain(network_lock.as_ref().map(AsRawFd::as_raw_fd));
+    for fd in inherited {
         // SAFETY: initialised above.
         let ret = unsafe { posix_spawn_file_actions_addinherit_np(actions.as_mut_ptr(), fd) };
         if ret != 0 {
@@ -775,38 +923,119 @@ mod tests {
             .collect()
     }
 
+    /// `ls`'s name for a uid nobody has.
+    fn who(uid: u32) -> String {
+        format!("{uid:X}")
+    }
+
+    // Linux: a TAP that has a queue attached refuses a second attach with
+    // EBUSY and the first keeps it (drivers/net/tun.c tun_attach). Here: a
+    // second jail of the same id, whatever its uid, is refused while the
+    // first lives, and the first's endpoint is neither removed nor
+    // regranted; once the first is gone its leftover sockets go, and
+    // nothing else does.
     #[test]
-    fn test_grant_to_jail_keeps_other_entries() {
+    fn test_a_second_jail_of_one_id_is_refused_and_the_first_keeps_its_endpoint() {
+        use std::os::unix::net::UnixDatagram;
         let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let net = dir.as_path().to_owned();
-        // A socket made before the grant, another jail's entry.
-        let before = std::os::unix::net::UnixDatagram::bind(net.join("before")).unwrap();
-        grant_to_jail(&net, 54321).unwrap();
-        let first = acl_lines(&net);
-        grant_to_jail(&net, 54320).unwrap();
-        // Granted again: no entry added twice.
-        grant_to_jail(&net, 54321).unwrap();
-        let lines = acl_lines(&net);
-        let uuid = |uid: u32| format!("{uid:X}");
-        let theirs: Vec<_> = lines.iter().filter(|l| l.contains(&uuid(54321))).collect();
-        assert_eq!(theirs.len(), 2, "{lines:?}");
-        assert!(theirs[0].contains("allow list,add_file,search,delete_child"), "{lines:?}");
-        assert!(theirs[1].contains("file_inherit,only_inherit"), "{lines:?}");
-        // (ls names a directory's entry's rights as a directory's: read,
-        // write, append are list, add_file, add_subdirectory.)
-        assert!(theirs[1].contains("allow list,add_file,delete,add_subdirectory"), "{lines:?}");
-        assert_eq!(lines.iter().filter(|l| l.contains(&uuid(54320))).count(), 2, "{lines:?}");
-        assert_eq!(&lines[..2], &first[..], "{lines:?}");
-        // The socket already there, and one made after: reachable by the jail.
-        let after = std::os::unix::net::UnixDatagram::bind(net.join("after")).unwrap();
-        for name in ["before", "after"] {
-            let entry = acl_lines(&net.join(name));
-            assert!(
-                entry.iter().any(|l| l.contains(&uuid(54321)) && l.contains("allow read,write")),
-                "{name}: {entry:?}"
-            );
+        let net = dir.as_path().canonicalize().unwrap();
+        let (sub, lock) = network_for_jail(&net, "a", 54321).unwrap();
+        assert_eq!(sub, net.join("a"));
+        let ep = UnixDatagram::bind(sub.join("tap0")).unwrap();
+        for uid in [54321, 54320] {
+            let err = network_for_jail(&net, "a", uid).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EBUSY), "uid {uid}: {err}");
         }
-        drop((before, after));
+        UnixDatagram::unbound().unwrap().send_to(b"frame", sub.join("tap0")).unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(ep.recv(&mut buf).unwrap(), 5);
+        let lines = acl_lines(&sub);
+        assert!(lines.iter().any(|l| l.contains(&who(54321))), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains(&who(54320))), "{lines:?}");
+        // The first jail is gone (its descriptors closed with it).
+        drop((lock, ep));
+        std::fs::write(sub.join("note"), b"x").unwrap();
+        let (again, _lock) = network_for_jail(&net, "a", 54320).unwrap();
+        assert_eq!(again, sub);
+        assert!(!sub.join("tap0").exists(), "the leftover socket stayed");
+        assert!(sub.join("note").exists(), "a file that is no socket was removed");
+        let lines = acl_lines(&sub);
+        assert!(lines.iter().any(|l| l.contains(&who(54320))), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains(&who(54321))), "{lines:?}");
+    }
+
+    // Two jails given one network: each has a directory of its own in it,
+    // which grants the other's uid nothing, and the network directory
+    // itself lets a jail pass through and write to the switch's sockets,
+    // no more (what an earlier jailer granted there is taken back).
+    #[test]
+    fn test_each_jail_has_a_network_directory_of_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixDatagram;
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let net = dir.as_path().canonicalize().unwrap();
+        // As a jailer before this one left it.
+        let old = [acl::LIST_DIRECTORY, acl::SEARCH, acl::ADD_FILE, acl::DELETE_CHILD];
+        write_acl(&net, None, &[(54321, &old, &[]), (54321, NETNS_ENTRY_PERMS, &[acl::ENTRY_FILE_INHERIT, acl::ENTRY_ONLY_INHERIT])])
+            .unwrap();
+        let switch = UnixDatagram::bind(net.join("switch")).unwrap();
+        let (a, _la) = network_for_jail(&net, "a", 54321).unwrap();
+        let (b, _lb) = network_for_jail(&net, "b", 54320).unwrap();
+        let later = UnixDatagram::bind(net.join("later")).unwrap();
+        let lines = acl_lines(&net);
+        for uid in [54321, 54320] {
+            let theirs: Vec<_> = lines.iter().filter(|l| l.contains(&who(uid))).collect();
+            assert_eq!(theirs.len(), 2, "{lines:?}");
+            assert!(theirs.iter().any(|l| l.ends_with("allow search")), "{lines:?}");
+            // (ls names a directory's entry's write right add_file.)
+            assert!(theirs.iter().any(|l| l.ends_with("allow add_file,file_inherit,only_inherit")), "{lines:?}");
+            for name in ["switch", "later"] {
+                let entry = acl_lines(&net.join(name));
+                assert!(
+                    entry.iter().any(|l| l.contains(&who(uid)) && l.ends_with("allow write")),
+                    "{name}: {entry:?}"
+                );
+            }
+        }
+        for (sub, own, other) in [(&a, 54321, 54320), (&b, 54320, 54321)] {
+            assert_eq!(sub.parent(), Some(net.as_path()));
+            assert_eq!(std::fs::metadata(sub).unwrap().permissions().mode() & 0o7777, 0o700);
+            let lines = acl_lines(sub);
+            assert!(
+                lines.iter().any(|l| l.contains(&who(own)) && l.contains("allow list,add_file,search,delete_child")),
+                "{lines:?}"
+            );
+            assert!(!lines.iter().any(|l| l.contains(&who(other))), "{lines:?}");
+            // SAFETY: no arguments.
+            let me = unsafe { libc::geteuid() };
+            if me != 0 {
+                // The network's owner, who is not root, reaches the endpoints made there.
+                assert!(lines.iter().any(|l| !l.contains(&who(own)) && l.contains("file_inherit")), "{lines:?}");
+            }
+        }
+        drop((switch, later));
+    }
+
+    // What stands at <network>/<id> is the jailer's own directory or
+    // nothing: a link is refused before the jail starts, and so is an id
+    // that names no directory there. An id of the longest kind is taken
+    // (upstream's tests use 36-character ones).
+    #[test]
+    fn test_a_network_directory_that_cannot_hold_the_jail_is_refused() {
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let net = dir.as_path().canonicalize().unwrap();
+        std::fs::create_dir(net.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(net.join("elsewhere"), net.join("linked")).unwrap();
+        let err = network_for_jail(&net, "linked", 54321).unwrap_err();
+        // (O_DIRECTORY with O_NOFOLLOW on a link: ENOTDIR on macOS.)
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err}");
+        assert!(acl_lines(&net.join("elsewhere")).is_empty());
+        let long = "i".repeat(64);
+        let (sub, _lock) = network_for_jail(&net, &long, 54321).unwrap();
+        assert_eq!(sub, net.join(&long));
+        for bad in ["", ".", "..", "a/b"] {
+            network_for_jail(&net, bad, 54321).unwrap_err();
+        }
     }
 
     // --new-pid-ns: a child, as upstream's clone, and Firecracker is told

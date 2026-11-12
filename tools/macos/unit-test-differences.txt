@@ -34,7 +34,7 @@
 #
 # Measured on an M1 Pro, macOS 27.2, 2026-11-13, unsigned (as CI), one test
 # thread, then each failure alone unsigned and signed:
-#   vmm --lib: 1003 tests; 825 pass, 138 fail, 40 ignored (the ext:: helpers
+#   vmm --lib: 1038 tests; 850 pass, 138 fail, 50 ignored (the ext:: helpers
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
 #   cpu-template-helper: 29 tests; 23 pass, 6 fail (4 no-hvf, 2 below).

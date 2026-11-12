@@ -192,11 +192,14 @@ when they name every CPU and memory node) and CPU limits below 1% or above
 255% of one CPU. Networking inside a jail is a Unix datagram endpoint, since the sandbox denies IP networking, and the
 jailed Firecracker is not root, which vmnet's bridged mode (and every mode before macOS 26) needs; vmnet-shared
 and vmnet-host on macOS 26 need no root but have not yet been run in a jail. The endpoint is in the jail, or in
-the jail's network, as on Windows: `--netns DIR` names a directory of
-endpoints you made, where a `host_dev_name` without `/` is then made, and your host-side switch binds its own
-socket there too (by the directory's real path or a name relative to it). Give each jail a directory of its
-own: a jail given its own reaches no other's, but two jails given one directory are not yet separated from each
-other's endpoints (one can read and inject the other's frames and delete its endpoint; being closed). [SECURITY.md](../SECURITY.md) has how each control is held.
+the jail's network: `--netns DIR` names a directory you made, the network. Each jail given it has a directory of its
+own inside, `DIR/<id>/`, made by the jailer, where a `host_dev_name` without `/` is then made: `DIR/<id>/<name>`.
+Your host-side switch binds its own sockets directly in `DIR`, by the directory's real path (an endpoint takes
+frames only from such sockets, owned by `DIR`'s owner or root), and sends to `DIR/<id>/<name>`, or to
+`<id>/<name>` from `DIR` when that path is longer than a socket address holds. Keep nothing in `DIR` but
+your switch's sockets: the jailer lets the jails' uids send to (write) what is made directly there. Jails given one `DIR` are in one
+network and reach each other only through your switch; give each jail a uid of its own.
+[SECURITY.md](../SECURITY.md) has how each control is held.
 
 ## Windows (preview)
 
