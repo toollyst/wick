@@ -277,7 +277,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | Feature | macOS | Windows |
 | --- | --- | --- |
 | Host to guest `CONNECT`, guest to host `<uds>_<port>`, over MMIO and PCI | 🟢 `boot-test vsock`, `boot-test pci`. Most upstream tests need `socat`, which the harness now takes from Homebrew; not yet run with them (`test_vsock` [bug]) | 🟢 `boot-test.ps1 vsock`, `test_vsock` |
-| Transport reset on snapshot, in-flight data | 🟡 passes on PCI_OFF (`test_vsock_transport_reset_g2h`, `test_snapshot_restore_with_inflight_vsock_tx`); every other variant fails only on the memory monitor's 5 MiB budget, at 5.05 to 5.45 MiB (`failure:host_tools.memory.MemoryUsageExceededError` [bug]); the tests' CPU pinning is noise only and skipped | 🟢 `test_vsock_transport_reset_h2g`, `test_snapshot_restore_with_inflight_vsock_tx` |
+| Transport reset on snapshot, in-flight data | 🟡 passes on PCI_OFF (`test_vsock_transport_reset_g2h`, `test_snapshot_restore_with_inflight_vsock_tx`); every other variant failed only on the memory monitor's 5 MiB budget, at 5.05 to 5.45 MiB, measured before the harness ran each Firecracker from its own copy (see VMM memory; `failure:host_tools.memory.MemoryUsageExceededError` [bug]); the tests' CPU pinning is noise only and skipped | 🟢 `test_vsock_transport_reset_h2g`, `test_snapshot_restore_with_inflight_vsock_tx` |
 | A peer that closes with data in flight | 🟡 no SIGPIPE is counted where Linux counts one (`test_vsock_epipe` [bug]) | 🟢 `test_vsock_epipe` |
 
 ### Balloon, entropy, pmem, MMDS
