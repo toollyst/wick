@@ -1610,38 +1610,80 @@ mod macos {
         #[ignore = "run by test_api_profile_raises_sigsys_outside_its_list in a separate process"]
         fn api_child() {
             use std::io::{Read, Write};
+            use std::sync::atomic::{AtomicU8, AtomicUsize};
+            // Diagnosis of a SIGSYS before SETUP-OK (1 run in 20 on macOS 26
+            // CI): which step the test thread had reached, and the thread
+            // the signal came on (T: the test thread, O: another). Seatbelt
+            // signals the process, so the thread is not the offender's
+            // (measured: the expected denials after SETUP-OK come on O).
+            static STEP: AtomicU8 = AtomicU8::new(0);
+            static TEST_THREAD: AtomicUsize = AtomicUsize::new(0);
+            extern "C" fn on_sigsys(_: libc::c_int) {
+                // SAFETY: TLS read, no system call.
+                let me = unsafe { libc::pthread_self() } as usize;
+                let which = if me == TEST_THREAD.load(Ordering::Relaxed) { b'T' } else { b'O' };
+                let step = STEP.load(Ordering::Relaxed);
+                let msg = [b'S', b'I', b'G', b'S', b'Y', b'S', b' ', b's', b't', b'e', b'p', b' ',
+                    b'0' + step / 10, b'0' + step % 10, b' ', which, b'\n'];
+                // SAFETY: async-signal-safe calls; the handler was reset to
+                // the default action (SA_RESETHAND), so the signal ends the
+                // process as before.
+                unsafe {
+                    libc::write(2, msg.as_ptr().cast(), msg.len());
+                    libc::pthread_kill(libc::pthread_self(), libc::SIGSYS);
+                }
+            }
+            // SAFETY: a plain handler, installed once.
+            unsafe {
+                let mut act: libc::sigaction = std::mem::zeroed();
+                act.sa_sigaction = on_sigsys as *const () as usize;
+                act.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER;
+                assert_eq!(libc::sigaction(libc::SIGSYS, &act, std::ptr::null_mut()), 0);
+                TEST_THREAD.store(libc::pthread_self() as usize, Ordering::Relaxed);
+            }
+            let step = |n: u8| STEP.store(n, Ordering::Relaxed);
             let case = std::env::var("WICK_TEST_CASE").unwrap();
             let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
             select(Policy::Default);
+            step(1);
             apply_api().unwrap();
             // What the API process does: Unix socket I/O, memory, time,
             // randomness, threads' locks.
+            step(2);
             a.write_all(b"ping").unwrap();
             let mut buf = [0u8; 4];
             b.read_exact(&mut buf).unwrap();
             assert_eq!(&buf, b"ping");
+            step(3);
             let v: Vec<u8> = vec![7; 1 << 20];
             assert_eq!(v.iter().map(|&x| u64::from(x)).sum::<u64>(), 7 << 20);
+            step(4);
             let _ = std::time::SystemTime::now();
+            step(5);
             let mut entropy = [0u8; 16];
             // SAFETY: a 16-byte output buffer.
             assert_eq!(unsafe { libc::getentropy(entropy.as_mut_ptr().cast(), 16) }, 0);
             // Files fail with an error.
+            step(6);
             std::fs::File::open("/etc/hosts").unwrap_err();
             // Upstream's api filter: fcntl F_SETFD. (Its madvise with
             // MADV_DONTNEED reads the region first with a Mach message here,
             // which the API process's lists do not allow.)
             const PAGE: usize = 16384;
+            step(7);
             // SAFETY: a new anonymous mapping.
             let page = unsafe {
                 libc::mmap(std::ptr::null_mut(), PAGE, libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
             };
             assert_ne!(page, libc::MAP_FAILED);
+            step(8);
             // SAFETY: a descriptor of this process.
             assert_eq!(unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&a), libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+            step(9);
             println!("SETUP-OK");
             std::io::stdout().flush().unwrap();
+            step(10);
             match case.as_str() {
                 "allowed" => {
                     println!("CHILD-OK");
@@ -3064,11 +3106,15 @@ mod macos {
             };
             // What unlink and unlinkat remove: a file outside the jail,
             // unless a case of ALLOWED_NAMES or DENIED_NAMES. Each is made
-            // here, before the sandbox.
+            // here, before the sandbox. Another process's name is the live
+            // `other` process's: a name with this pid + 1, which a denied
+            // unlink leaves in the shared jail, was the name of a later
+            // child that got that pid (mkfifo: EEXIST, CI on macOS 26).
             let fifo = |dir: &std::path::Path, prefix: &str, pid: u32| {
                 let path = dir.join(format!("{prefix}{pid}-0"));
                 // SAFETY: a NUL-terminated path.
-                assert_eq!(unsafe { libc::mkfifo(c(&path).as_ptr(), 0o600) }, 0, "{path:?}");
+                let ret = unsafe { libc::mkfifo(c(&path).as_ptr(), 0o600) };
+                assert_eq!(ret, 0, "{path:?}: {}", std::io::Error::last_os_error());
                 path
             };
             let socket = |path: std::path::PathBuf| {
@@ -3084,11 +3130,11 @@ mod macos {
                 "inside" => jail.join(format!("inside-{tag}")),
                 "fifo" => fifo(&jail.join("tmp"), vmm_sys_util::eventfd::FIFO_PREFIX, pid),
                 "timer" => fifo(&jail.join("tmp"), libc::TIMERFD_FIFO_PREFIX, pid),
-                "timer-other" => fifo(&jail.join("tmp"), libc::TIMERFD_FIFO_PREFIX, pid + 1),
+                "timer-other" => fifo(&jail.join("tmp"), libc::TIMERFD_FIFO_PREFIX, other as u32),
                 "fifo-name" => {
                     file(jail.join("tmp").join(format!("{}{pid}-1", vmm_sys_util::eventfd::FIFO_PREFIX)))
                 }
-                "fifo-other" => fifo(&jail.join("tmp"), vmm_sys_util::eventfd::FIFO_PREFIX, pid + 1),
+                "fifo-other" => fifo(&jail.join("tmp"), vmm_sys_util::eventfd::FIFO_PREFIX, other as u32),
                 "endpoint" => socket(base.join("net").join(format!("e-{n}"))),
                 "socket" => socket(base.join(format!("s-{n}"))),
                 "free-fifo" => fifo(&free_tmp, vmm_sys_util::eventfd::FIFO_PREFIX, pid),
