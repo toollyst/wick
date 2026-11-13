@@ -708,11 +708,14 @@ jobs:
       - name: Build the uffd page fault handler example
         working-directory: lib/firecracker
         run: cargo build --locked -p firecracker --example uffd_on_demand_handler --release
-      # The boot test's vhost-user stage serves a drive with it.
+      # The boot test's vhost-user stage serves a drive with it. The target
+      # directory absolute: a relative one stays in every path cargo gives
+      # the linker as ..\..\, which on a PC took link.exe past 260
+      # characters (LNK1104).
       - name: Build the vhost-user-blk test backend
         working-directory: tools/vhost-user-blk
         env:
-          CARGO_TARGET_DIR: ../../lib/firecracker/build/vhost-user-blk
+          CARGO_TARGET_DIR: ${{ github.workspace }}/lib/firecracker/build/vhost-user-blk
         run: cargo build --release --locked
       # The host capability probe (tools/windows/winprobe.c), built with the
       # same MSVC toolchain the binary uses.

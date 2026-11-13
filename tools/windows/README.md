@@ -140,7 +140,11 @@ CI builds the binaries on every push and uploads them as the artifact
 `lib/firecracker/build/cargo_target/debug/firecracker.exe` (built with the gdb
 feature, for the `gdb` stage),
 `lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe` (the
-vhost-user test backend), `winprobe.exe`, and in `tools/windows/`
+vhost-user test backend; to build it on a PC, in `tools\vhost-user-blk`:
+`$env:CARGO_TARGET_DIR = (Resolve-Path ..\..).Path + '\lib\firecracker\build\vhost-user-blk'; cargo build --release --locked`,
+the target directory absolute: a relative one stays in every path cargo
+gives the linker as `..\..`, which took link.exe past 260 characters on a
+PC, LNK1104), `winprobe.exe`, and in `tools/windows/`
 `boot-test.ps1`, `jailer-test.ps1` with `jail-probe.exe` and `jail-parent.exe` built,
 `job-freeze-probe.ps1`, `memory-partition-probe.exe`, `vmm-memory-record.py` and this file, at those
 paths. The kit needs no Rust.
