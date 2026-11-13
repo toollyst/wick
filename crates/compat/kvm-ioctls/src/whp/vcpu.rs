@@ -2176,3 +2176,316 @@ mod bp_tests {
         }
     }
 }
+
+// KVM_SET_FPU and KVM_GET_FPU against a guest that says what it finds: the
+// claim (a write to a vCPU whose guest has used x87 and SSE is what the
+// guest finds, MXCSR excepted; regs.rs has Linux's source for both) and the
+// record of what WHP holds before and after (FPUTEST lines), for the cases
+// Linux's source decides by a header bit and nobody has measured on WHP: a
+// vCPU that has not run, and an area written with a bit changed.
+#[cfg(test)]
+mod fpu_tests {
+    use super::*;
+    use kvm_bindings::{kvm_segment, Xsave};
+    use std::sync::atomic::AtomicBool;
+
+    const MEM: usize = 4 << 20;
+    const GDT: u64 = 0x4000;
+    /// The guest: stores its control word, status word, MXCSR, XMM3 and
+    /// ST0, then leaves the initial x87 and SSE state for good (`fninit`,
+    /// `fld1`; `pcmpeqd xmm5, xmm5`), `out 0x80, al`, `jmp $`.
+    const CODE: u64 = 0x6000;
+    const FCW: u64 = 0x8000;
+    const MXCSR: u64 = 0x8010;
+    const XMM3: u64 = 0x8020;
+    const ST0: u64 = 0x8040;
+    const PORT: u16 = 0x80;
+    /// 1.5 and 2.5 as x87 registers hold them (80 bits, in 16 bytes).
+    const ONE_AND_A_HALF: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0xC0, 0xFF, 0x3F, 0, 0, 0, 0, 0, 0];
+    const TWO_AND_A_HALF: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0xA0, 0x00, 0x40, 0, 0, 0, 0, 0, 0];
+
+    fn put(m: *mut u8, at: u64, bytes: &[u8]) {
+        // SAFETY: within the test's mapping.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), m.add(at as usize), bytes.len()) };
+    }
+
+    fn bytes_at<const N: usize>(m: *mut u8, at: u64) -> [u8; N] {
+        let mut b = [0u8; N];
+        // SAFETY: within the test's mapping.
+        unsafe { std::ptr::copy_nonoverlapping(m.add(at as usize), b.as_mut_ptr(), N) };
+        b
+    }
+
+    /// Guest memory with long mode's tables (the first 2 MiB identity
+    /// mapped), a GDT (64-bit code at 8, data at 0x10) and the code.
+    fn guest() -> *mut u8 {
+        // SAFETY: anonymous memory for the test, unmapped by the caller.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                MEM,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let m = p.cast::<u8>();
+        let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
+        q(0x1000, 0x2000 | 3);
+        q(0x2000, 0x3000 | 3);
+        q(0x3000, 0x83);
+        q(GDT + 8, 0x00AF_9A00_0000_FFFF);
+        q(GDT + 16, 0x00CF_9200_0000_FFFF);
+        put(
+            m,
+            CODE,
+            &[
+                0xD9, 0x3C, 0x25, 0x00, 0x80, 0x00, 0x00, // fnstcw [FCW]
+                0xDD, 0x3C, 0x25, 0x08, 0x80, 0x00, 0x00, // fnstsw [FCW + 8]
+                0x0F, 0xAE, 0x1C, 0x25, 0x10, 0x80, 0x00, 0x00, // stmxcsr [MXCSR]
+                0x0F, 0x11, 0x1C, 0x25, 0x20, 0x80, 0x00, 0x00, // movups [XMM3], xmm3
+                0xDB, 0x3C, 0x25, 0x40, 0x80, 0x00, 0x00, // fstp tword [ST0]
+                0xDB, 0xE3, // fninit
+                0xD9, 0xE8, // fld1
+                0x66, 0x0F, 0x76, 0xED, // pcmpeqd xmm5, xmm5
+                0xE6, PORT as u8, // out 0x80, al
+                0xEB, 0xFE, // jmp $
+            ],
+        );
+        m
+    }
+
+    fn segment(selector: u16, type_: u8, l: u8, db: u8) -> kvm_segment {
+        kvm_segment {
+            base: 0,
+            limit: 0xFFFF_FFFF,
+            selector,
+            type_,
+            present: 1,
+            dpl: 0,
+            db,
+            s: 1,
+            l,
+            g: 1,
+            ..Default::default()
+        }
+    }
+
+    /// The vCPU in long mode at the code's start, with the operating
+    /// system's say that SSE may be used (CR4.OSFXSR).
+    fn start(vcpu: &VcpuFd) {
+        let mut s = vcpu.get_sregs().unwrap();
+        s.cr0 = 0x8000_0031; // PG, NE, ET, PE
+        s.cr3 = 0x1000;
+        s.cr4 = 0x220; // OSFXSR, PAE
+        s.efer = 0x500; // LME, LMA
+        s.cs = segment(8, 11, 1, 0);
+        let data = segment(0x10, 3, 0, 1);
+        (s.ds, s.es, s.fs, s.gs, s.ss) = (data, data, data, data, data);
+        s.tr.type_ = 11;
+        s.tr.present = 1;
+        s.tr.s = 0;
+        (s.gdt.base, s.gdt.limit) = (GDT, 23);
+        vcpu.set_sregs(&s).unwrap();
+        again(vcpu);
+    }
+
+    /// The vCPU back at the code's start.
+    fn again(vcpu: &VcpuFd) {
+        vcpu.set_regs(&kvm_regs { rip: CODE, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+    }
+
+    /// One `run`, kicked after 5 s if it has not returned, as a line.
+    fn run_once(vcpu: &mut VcpuFd) -> String {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
+        let watch = Arc::clone(&done);
+        let watchdog = std::thread::spawn(move || {
+            for _ in 0..500 {
+                if watch.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            kicker.set_kvm_immediate_exit(1);
+        });
+        let line = match vcpu.run() {
+            Ok(VcpuExit::IoOut(port, _)) => format!("exit IoOut port {port:#x}"),
+            Ok(VcpuExit::Shutdown) => "exit Shutdown".to_string(),
+            Ok(_) => "exit (another)".to_string(),
+            Err(e) if e.errno() == libc::EINTR => "no exit within 5 s (kicked)".to_string(),
+            Err(e) => format!("run failed, errno {}", e.errno()),
+        };
+        done.store(true, Ordering::SeqCst);
+        watchdog.join().unwrap();
+        line
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// The vCPU's XSAVE area through `KVM_GET_XSAVE2`.
+    fn area_of(vcpu: &VcpuFd) -> Vec<u8> {
+        let mut x = Xsave::new((regs::xsave_area_len() - 4096).div_ceil(4)).unwrap();
+        // SAFETY: an area of the capability's size.
+        unsafe { vcpu.get_xsave2(&mut x) }.unwrap();
+        let p = x.as_fam_struct_ptr();
+        // SAFETY: the wrapper's `kvm_xsave` and the `len` entries after it.
+        unsafe { std::slice::from_raw_parts((&raw const (*p).xsave).cast::<u8>(), 4096 + 4 * (*p).len) }.to_vec()
+    }
+
+    fn xstate_bv(area: &[u8]) -> u64 {
+        u64::from_le_bytes(area[512..520].try_into().unwrap())
+    }
+
+    /// What an XSAVE area holds of the fields `kvm_fpu` has.
+    fn held(area: &[u8]) -> String {
+        format!(
+            "XSTATE_BV {:#x}, control word {:#x}, status word {:#x}, tags {:#x}, MXCSR {:#x}, ST0 {}, XMM3 {}",
+            xstate_bv(area),
+            u16::from_le_bytes([area[0], area[1]]),
+            u16::from_le_bytes([area[2], area[3]]),
+            u16::from_le_bytes([area[4], area[5]]),
+            u32::from_le_bytes(area[24..28].try_into().unwrap()),
+            hex(&area[32..42]),
+            hex(&area[160 + 48..160 + 64]),
+        )
+    }
+
+    fn got(fpu: &kvm_fpu) -> String {
+        format!(
+            "control word {:#x}, status word {:#x}, tags {:#x}, mxcsr {:#x}, ST0 {}, XMM3 {}",
+            fpu.fcw,
+            fpu.fsw,
+            fpu.ftwx,
+            fpu.mxcsr,
+            hex(&fpu.fpr[0][..10]),
+            hex(&fpu.xmm[3]),
+        )
+    }
+
+    /// What the guest stored of its own state: control word, MXCSR, XMM3,
+    /// ST0.
+    fn seen(m: *mut u8) -> (u16, u32, [u8; 16], [u8; 10]) {
+        (
+            u16::from_le_bytes(bytes_at(m, FCW)),
+            u32::from_le_bytes(bytes_at(m, MXCSR)),
+            bytes_at(m, XMM3),
+            bytes_at(m, ST0),
+        )
+    }
+
+    /// `KVM_SET_FPU` of `fpu` with the lines of what the vCPU held before
+    /// and after it, through `KVM_GET_XSAVE2` and `KVM_GET_FPU`. What
+    /// `KVM_GET_FPU` returned after it.
+    fn set_on_record(vcpu: &VcpuFd, name: &str, fpu: &kvm_fpu) -> kvm_fpu {
+        eprintln!("FPUTEST {name}, before: area {}", held(&area_of(vcpu)));
+        eprintln!("FPUTEST {name}, before: KVM_GET_FPU {}", got(&vcpu.get_fpu().unwrap()));
+        eprintln!("FPUTEST {name}: KVM_SET_FPU {}", got(fpu));
+        vcpu.set_fpu(fpu).unwrap();
+        let back = vcpu.get_fpu().unwrap();
+        eprintln!("FPUTEST {name}, after: area {}", held(&area_of(vcpu)));
+        eprintln!("FPUTEST {name}, after: KVM_GET_FPU {}", got(&back));
+        assert_eq!(back.mxcsr, 0, "KVM_GET_FPU returns no MXCSR (Linux: a zeroed struct, the field not written)");
+        back
+    }
+
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_set_fpu_on_record() {
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+
+        // A vCPU that has not run. Linux: its saved state has no component
+        // in use, so its guest starts with the initial x87 and SSE state
+        // whatever was written (control word 0x37f, MXCSR 0x1f80, XMM3
+        // zero, no ST0: the store gives the indefinite value), and
+        // KVM_GET_FPU returns what was written all the same. Printed, not
+        // asserted: WHP's new area has the SSE bit, and what WHP does with
+        // the fields of a component whose bit is clear is not known.
+        // SAFETY (both `zeroed` below): an all-zero kvm_fpu is valid.
+        let mut fpu: kvm_fpu = unsafe { std::mem::zeroed() };
+        (fpu.fcw, fpu.ftwx, fpu.mxcsr) = (0x27f, 1, 0x9f80);
+        fpu.fpr[0] = ONE_AND_A_HALF;
+        fpu.xmm[3] = [0xA1; 16];
+        set_on_record(&vcpu, "a vCPU that has not run", &fpu);
+        let exit = run_once(&mut vcpu);
+        let (fcw1, mxcsr1, xmm1, st1) = seen(m);
+        eprintln!(
+            "FPUTEST a vCPU that has not run: {exit}; its guest found control word {fcw1:#x}, MXCSR {mxcsr1:#x}, \
+             ST0 {}, XMM3 {} (Linux, by its source: 0x37f, 0x1f80, the indefinite value 000000000000c0ffff, zeros)",
+            hex(&st1),
+            hex(&xmm1)
+        );
+        assert_eq!(exit, format!("exit IoOut port {PORT:#x}"));
+        assert_ne!(mxcsr1, 0x9f80, "KVM_SET_FPU's mxcsr reached the guest, which Linux's never does");
+
+        // The same vCPU, whose guest has now left the initial state of
+        // both components (ST0 holds 1.0, XMM5 all ones): they are in use,
+        // and a write to them is what the guest finds, on Linux and here.
+        // MXCSR is the guest's own still.
+        let in_use = xstate_bv(&area_of(&vcpu)) & 3 == 3;
+        let mut fpu: kvm_fpu = unsafe { std::mem::zeroed() };
+        (fpu.fcw, fpu.ftwx, fpu.mxcsr) = (0x7f, 1, 0x9f80);
+        fpu.fpr[0] = TWO_AND_A_HALF;
+        fpu.xmm[3] = [0xB2; 16];
+        let back = set_on_record(&vcpu, "a vCPU whose guest has used x87 and SSE", &fpu);
+        put(m, FCW, &[0; 0x50]);
+        again(&vcpu);
+        let exit = run_once(&mut vcpu);
+        let (fcw2, mxcsr2, xmm2, st2) = seen(m);
+        eprintln!(
+            "FPUTEST a vCPU whose guest has used x87 and SSE (both in XSTATE_BV: {in_use}): {exit}; its guest \
+             found control word {fcw2:#x}, MXCSR {mxcsr2:#x}, ST0 {}, XMM3 {}",
+            hex(&st2),
+            hex(&xmm2)
+        );
+        assert_eq!(exit, format!("exit IoOut port {PORT:#x}"));
+        assert!(in_use, "x87 and SSE are not in XSTATE_BV after a guest that left their initial state");
+        assert_eq!((back.fcw, back.ftwx, back.fpr[0], back.xmm[3]), (0x7f, 1, TWO_AND_A_HALF, [0xB2; 16]));
+        assert_eq!((fcw2, xmm2, &st2[..]), (0x7f, [0xB2; 16], &TWO_AND_A_HALF[..10]), "what the guest found");
+        assert_eq!(mxcsr2, mxcsr1, "the guest's MXCSR is its own after KVM_SET_FPU");
+
+        // What WHP does with a header bit as written, on a vCPU of its
+        // own: the area written back with x87 and SSE cleared in XSTATE_BV
+        // and fields of both in its FXSAVE region, then with both set.
+        // Not asserted. If WHP keeps a cleared bit and gives such a
+        // component its initial state, a new vCPU's SSE bit can be cleared
+        // to have Linux's new state exactly.
+        let other = vm.create_vcpu(1).unwrap();
+        let (mut area, written) = regs::read_xsave(other.part(), other.vp()).unwrap();
+        eprintln!("FPUTEST an area written with header bits changed, new ({written} bytes): {}", held(&area));
+        let bv = xstate_bv(&area);
+        area[0..2].copy_from_slice(&0x27fu16.to_le_bytes());
+        area[160 + 48..160 + 64].copy_from_slice(&[0xC3; 16]);
+        for (name, bits) in [("x87 and SSE cleared", bv & !3), ("x87 and SSE set", bv | 3)] {
+            area[512..520].copy_from_slice(&bits.to_le_bytes());
+            let set = regs::set_xsave(other.part(), other.vp(), &area);
+            let after = regs::read_xsave(other.part(), other.vp()).map(|(a, _)| held(&a));
+            eprintln!(
+                "FPUTEST an area written with {name} (XSTATE_BV {bits:#x}, control word 0x27f, XMM3 c3..): \
+                 {set:?}; read back {after:?}"
+            );
+        }
+
+        drop(other);
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+}

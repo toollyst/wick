@@ -508,21 +508,53 @@ pub(crate) fn read_xsave(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<(Vec<u8>
     Ok((area, written))
 }
 
-/// `kvm_fpu` is the legacy FXSAVE region at the start of the XSAVE area.
+// `KVM_GET_FPU` and `KVM_SET_FPU`, as Linux has them (v6.1,
+// arch/x86/kvm/x86.c, `kvm_arch_vcpu_ioctl_get_fpu` and `_set_fpu`): they
+// copy the x87 fields and the XMM registers between `struct kvm_fpu` and the
+// FXSAVE region at the start of the vCPU's saved state, and nothing else:
+//
+// - not MXCSR. Neither function names `mxcsr`: a write leaves the vCPU's
+//   MXCSR as it was, and a read returns 0 in it (virt/kvm/kvm_main.c,
+//   `KVM_GET_FPU`: the struct is `kzalloc`ed). Upstream's `setup_fpu` passes
+//   0x1f80 and its test notes that this "does not influence anything".
+// - not the state's header. The fields are written into the saved image
+//   whatever its `xfeatures` (`XSTATE_BV`) say, and the bits stay as they
+//   were. The image is loaded with XRSTOR(S) (arch/x86/kernel/fpu/core.c,
+//   `restore_fpregs_from_fpstate`), which takes a component's registers
+//   from the image only where its bit is set and gives the others their
+//   initial values (Intel SDM volume 1, 13.8 and 13.12). A new vCPU's image
+//   has no bit set (`fpu_alloc_guest_fpstate`: `vzalloc`, then
+//   `fpstate_init_user`, which writes the control word and MXCSR but not
+//   `xfeatures`), so what `KVM_SET_FPU` writes to a vCPU that has not run
+//   does not reach its guest: the guest starts with the initial x87 and SSE
+//   state. Once the guest has run, the bits are the processor's (XSAVES at
+//   the exit: set for a component not in its initial state), and a write to
+//   a component in use is what the guest finds.
+//
+// Here the saved image is WHP's XSAVE area, and the same is done to it: the
+// same fields replaced, MXCSR and the header left. A new vCPU's header has
+// the SSE bit where Linux's has none (`XSTATE_BV` 0x1802 on an AMD EPYC
+// 7763, CI run 43363585319: SSE and the two CET components); what WHP then
+// does with the fields is what `test_set_fpu_on_record` prints (FPUTEST
+// lines).
+
+/// `KVM_GET_FPU`: the x87 fields and XMM registers of the FXSAVE region at
+/// the start of the XSAVE area; `mxcsr` is 0, as Linux returns it.
 pub(crate) fn get_fpu(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<kvm_fpu> {
     let (area, _) = read_xsave(part, vp)?;
     Ok(fpu_from_fxsave(&area[..512]))
 }
 
+/// `KVM_SET_FPU`: the whole state as it is, with the x87 fields and XMM
+/// registers of its FXSAVE region replaced.
 pub(crate) fn set_fpu(part: WHV_PARTITION_HANDLE, vp: u32, fpu: &kvm_fpu) -> Result<()> {
-    // The whole state as it is, with its first 512 bytes, the FXSAVE
-    // region, replaced.
     let (mut area, _) = read_xsave(part, vp)?;
     fxsave_from_fpu(fpu, &mut area[..512]);
     set_xsave(part, vp, &area)
 }
 
-/// Reads a `kvm_fpu` out of a 512-byte FXSAVE area.
+/// What `KVM_GET_FPU` reads out of a 512-byte FXSAVE region: every field
+/// of `kvm_fpu` but `mxcsr`, which Linux leaves 0.
 fn fpu_from_fxsave(b: &[u8]) -> kvm_fpu {
     let u16_at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
     let u64_at = |o: usize| {
@@ -534,17 +566,14 @@ fn fpu_from_fxsave(b: &[u8]) -> kvm_fpu {
         fpr: [[0; 16]; 8],
         fcw: u16_at(0),
         fsw: u16_at(2),
+        // `fpu->ftwx = fxsave->twd`: the low byte of the 16-bit field.
         ftwx: b[4],
         pad1: 0,
         last_opcode: u16_at(6),
         last_ip: u64_at(8),
         last_dp: u64_at(16),
         xmm: [[0; 16]; 16],
-        mxcsr: {
-            let mut x = [0u8; 4];
-            x.copy_from_slice(&b[24..28]);
-            u32::from_le_bytes(x)
-        },
+        mxcsr: 0,
         pad2: 0,
     };
     for (i, fpr) in fpu.fpr.iter_mut().enumerate() {
@@ -556,15 +585,18 @@ fn fpu_from_fxsave(b: &[u8]) -> kvm_fpu {
     fpu
 }
 
-/// Writes a `kvm_fpu` into a 512-byte FXSAVE area.
+/// What `KVM_SET_FPU` writes into a 512-byte FXSAVE region: every field of
+/// `kvm_fpu` but `mxcsr`; bytes 24 to 31 (MXCSR and its mask) and those
+/// from 416 on stay as they were.
 fn fxsave_from_fpu(fpu: &kvm_fpu, b: &mut [u8]) {
     b[0..2].copy_from_slice(&fpu.fcw.to_le_bytes());
     b[2..4].copy_from_slice(&fpu.fsw.to_le_bytes());
-    b[4] = fpu.ftwx;
+    // `fxsave->twd = fpu->ftwx`: the 16-bit field takes the byte, its high
+    // byte 0.
+    b[4..6].copy_from_slice(&u16::from(fpu.ftwx).to_le_bytes());
     b[6..8].copy_from_slice(&fpu.last_opcode.to_le_bytes());
     b[8..16].copy_from_slice(&fpu.last_ip.to_le_bytes());
     b[16..24].copy_from_slice(&fpu.last_dp.to_le_bytes());
-    b[24..28].copy_from_slice(&fpu.mxcsr.to_le_bytes());
     for (i, fpr) in fpu.fpr.iter().enumerate() {
         b[32 + i * 16..32 + i * 16 + 16].copy_from_slice(fpr);
     }
@@ -1481,19 +1513,52 @@ mod tests {
         assert_eq!(events_to_whp(&smm).unwrap_err().errno(), libc::EINVAL);
     }
 
+    // `KVM_SET_FPU` writes Linux's fields into the saved state and leaves
+    // the rest: MXCSR and its mask, the bytes after the XMM registers, and
+    // the header, whose `XSTATE_BV` decides what of the region the guest is
+    // given (arch/x86/kvm/x86.c, `kvm_arch_vcpu_ioctl_set_fpu`).
+    // `KVM_GET_FPU` reads the same fields back and 0 for MXCSR.
     #[test]
-    fn test_fpu_roundtrip() {
+    fn test_set_fpu_leaves_mxcsr_and_the_header() {
+        // An area as WHP gives one for a new vCPU: compacted, SSE and CET
+        // in `XSTATE_BV`, x87 not.
+        let mut area: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8 | 1).collect();
+        area[512..520].copy_from_slice(&0x1802u64.to_le_bytes());
+        area[520..528].copy_from_slice(&(1u64 << 63 | 0x1807).to_le_bytes());
+        area[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        let before = area.clone();
+        // SAFETY: an all-zero kvm_fpu is valid.
         let mut fpu: kvm_fpu = unsafe { std::mem::zeroed() };
-        fpu.fcw = 0x37f;
-        fpu.mxcsr = 0x1f80;
-        fpu.xmm[3][0] = 0xAB;
-        fpu.fpr[1][2] = 0xCD;
-        let mut b = [0u8; 512];
-        fxsave_from_fpu(&fpu, &mut b);
-        let back = fpu_from_fxsave(&b);
-        assert_eq!(back.fcw, 0x37f);
-        assert_eq!(back.mxcsr, 0x1f80);
-        assert_eq!(back.xmm[3][0], 0xAB);
-        assert_eq!(back.fpr[1][2], 0xCD);
+        fpu.fcw = 0x27f;
+        fpu.fsw = 0x3800;
+        fpu.ftwx = 0x81;
+        fpu.last_opcode = 0x1d8;
+        fpu.last_ip = 0x1122_3344_5566_7788;
+        fpu.last_dp = 0x99aa_bbcc_ddee_ff00;
+        fpu.mxcsr = 0x9fc0;
+        fpu.fpr[0] = [0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f, 0, 0, 0, 0, 0, 0];
+        fpu.fpr[7][2] = 0xCD;
+        fpu.xmm[3] = [0xAB; 16];
+        fpu.xmm[15][15] = 0xEF;
+        fxsave_from_fpu(&fpu, &mut area[..512]);
+        assert_eq!(area[0..8], [0x7f, 0x02, 0x00, 0x38, 0x81, 0x00, 0xd8, 0x01]);
+        assert_eq!(area[8..16], fpu.last_ip.to_le_bytes());
+        assert_eq!(area[16..24], fpu.last_dp.to_le_bytes());
+        assert!(area[24..32] == before[24..32], "MXCSR and its mask");
+        assert!(area[32..48] == fpu.fpr[0] && area[32 + 7 * 16 + 2] == 0xCD);
+        assert!(area[160 + 3 * 16..160 + 4 * 16] == [0xAB; 16] && area[160 + 15 * 16 + 15] == 0xEF);
+        assert!(area[416..] == before[416..], "the region's end, the header and the components after it");
+        assert_eq!((xstate_bv(&area), xcomp_bv(&area)), (Some(0x1802), Some(1 << 63 | 0x1807)));
+
+        let back = fpu_from_fxsave(&area[..512]);
+        assert_eq!((back.fcw, back.fsw, back.ftwx, back.last_opcode), (0x27f, 0x3800, 0x81, 0x1d8));
+        assert_eq!((back.last_ip, back.last_dp), (fpu.last_ip, fpu.last_dp));
+        assert!(back.fpr == fpu.fpr && back.xmm == fpu.xmm);
+        assert_eq!(back.mxcsr, 0, "KVM_GET_FPU returns no MXCSR");
+        assert_eq!((back.pad1, back.pad2), (0, 0));
+        // The tag byte's neighbour is the 16-bit field's high byte: 0.
+        area[5] = 0xff;
+        fxsave_from_fpu(&fpu, &mut area[..512]);
+        assert_eq!(area[5], 0);
     }
 }

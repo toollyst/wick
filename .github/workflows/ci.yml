@@ -798,6 +798,15 @@ jobs:
               test_bp_ways_on_record; do
             alone "whp::vcpu::bp_tests::$t" --features gdb
           done
+          # KVM_SET_FPU against a guest that stores what it finds: a write
+          # to a vCPU whose guest has used x87 and SSE reaches the guest,
+          # MXCSR excepted, as on Linux (asserted); the FPUTEST lines record
+          # what WHP held before and after each write (KVM_GET_XSAVE2 and
+          # KVM_GET_FPU), what the guest of a vCPU that had not run found
+          # (Linux: the initial state, whatever was written), and what WHP
+          # reads back of an area written with the x87 and SSE header bits
+          # cleared, then set.
+          alone whp::vcpu::fpu_tests::test_set_fpu_on_record
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
           alone windows_fd::tests::test_non_blocking_pipe_writes_on_record
