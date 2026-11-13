@@ -1795,8 +1795,9 @@ class FifoReader:
     """Reads a FIFO into memory from when it is made, as upstream's
     docs/logger.md has an operator do (the reader may come after the writer)."""
 
-    def __init__(self, path):
-        os.mkfifo(path)
+    def __init__(self, path, existing=False):
+        if not existing:
+            os.mkfifo(path)
         self.path = path
         self.data = b""
         self.stop = threading.Event()
@@ -2030,6 +2031,7 @@ def stage_cli(ctx):
         vm.api("PUT", "/drives/rootfs", cfg["drives"][0])
         vm.api("PUT", "/machine-config", cfg["machine-config"])
         vm.api("PUT", "/actions", {"action_type": "InstanceStart"})
+        started = time.monotonic()
         vm.api("PUT", "/actions", {"action_type": "FlushMetrics"})
         wall = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) // 1000 - t0
         metrics = read_metrics(mfifo.text(wait_for="utc_timestamp_ms"))
@@ -2040,9 +2042,85 @@ def stage_cli(ctx):
         # raising SIGPIPE or blocking, and the microVM and the API go on.
         mfifo.close()
         lfifo.close()
+        # As the Windows PC ran it (500 GETs in 789 s there, and FlushMetrics
+        # refused with "operation would block"): 500 logged requests, each
+        # timed; then past upstream's periodic flush, which the API server's
+        # adapter starts once the microVM is built (WRITE_METRICS_PERIOD_MS,
+        # 60 s: src/firecracker/src/metrics.rs, api_server_adapter.rs); then
+        # FlushMetrics, which must succeed as on Linux, where Firecracker's
+        # own O_RDWR descriptor keeps it a reader (v6.1 fs/pipe.c fifo_open),
+        # so a write never meets EPIPE and only a full pipe gives EAGAIN
+        # (pipe_write): 64 KiB (PIPE_DEF_BUFFERS pages), which three metrics
+        # writes do not fill. The log does fill it: each request logs two
+        # lines, and a line that finds the pipe full is lost and counted in
+        # logger.missed_log_count (logging.rs), a count each metrics write
+        # gives since the one before (SharedIncMetric).
+        gets = []
         for _ in range(500):
+            g0 = time.monotonic()
             vm.api("GET", "/machine-config")
+            gets.append(time.monotonic() - g0)
+        gets.sort()
+        while time.monotonic() - started < 65:
+            time.sleep(0.5)
         vm.api("PUT", "/actions", {"action_type": "FlushMetrics"})
+        # What waited in the FIFOs for a reader: the periodic flush's
+        # metrics and FlushMetrics's, and the 500 requests' log lines.
+        later_m = FifoReader(mfifo.path, existing=True)
+        later_l = FifoReader(lfifo.path, existing=True)
+        request = 'The API server received a Get request on "/machine-config"'
+        settle = time.monotonic() + 10
+        while time.monotonic() < settle and (later_m.text().count("utc_timestamp_ms") < 2
+                                             or later_l.text().count(request) < 500):
+            time.sleep(0.1)
+        queued = read_metrics(later_m.text())
+        kept = later_l.data.count(b"\n")
+        later_m.close()
+        later_l.close()
+        for name, reader in (("cli-time-later.metrics", later_m), ("cli-time-later.log", later_l)):
+            with open(os.path.join(ctx.out, name), "wb") as f:
+                f.write(reader.data)
+        check(len(queued) >= 2, f"{len(queued)} metrics writes waited in the FIFO for a reader, not the periodic "
+              f"flush's and FlushMetrics's: {later_m.data[:300]!r}")
+        missed = sum(m["logger"]["missed_log_count"] for m in queued)
+        # Logged since the readers went, before the last metrics write: the
+        # two lines of each GET (its request, its success) and FlushMetrics's
+        # request (its success comes after the write that counts). Other
+        # lines may come between (a device's debug line). As on Linux, the
+        # FIFO took lines until 64 KiB held no further one, and every line
+        # after is lost and counted: so each request line that was not kept
+        # is among the missed, and the rest of the missed are other lines.
+        # How much is kept is the FIFO cell's known difference (docs/
+        # COMPATIBILITY.md, "Logger or metrics to a FIFO"): Linux packs the
+        # lines into the pipe's 16 pages of 4096 bytes, a line into the last
+        # page only if it fits there (pipe_write), and refuses the first that
+        # finds no room; macOS's FIFO and Firecracker's overflow hold up to
+        # 64 KiB of bytes, less what the FIFO's socket buffer counts for its
+        # mbufs. So the lines Linux keeps, macOS keeps: Linux's packing of the
+        # lines kept here must refuse one of them, or Linux would have kept
+        # a line that macOS lost.
+        lines = later_l.data.split(b"\n")[:-1]
+        ours = [b'Get request on "/machine-config"', b"executed successfully", b'Put request on "/actions"']
+        logged = 2 * 500 + 1
+        kept_ours = sum(1 for line in lines if any(o in line for o in ours))
+        pages, linux = [], None
+        for line in lines:
+            n = len(line) + 1
+            if pages and pages[-1] + n <= 4096:
+                pages[-1] += n
+            elif len(pages) < 16:
+                pages.append(n)
+            else:
+                linux = sum(pages)
+                break
+        check(missed >= logged - kept_ours and len(later_l.data) <= 65536 and (linux is not None or missed == 0),
+              f"after the readers went: {kept} lines ({len(later_l.data)} bytes), {kept_ours} of the {logged} "
+              f"request lines, kept, and {missed} counted as missed: a request line lost uncounted, more than "
+              "64 KiB kept, or a line lost that Linux's pipe would have kept")
+        gets_text = (f"500 GETs with no reader: median {gets[250] * 1000:.1f} ms, slowest {gets[-1] * 1000:.1f} ms; "
+                     f"after the periodic flush FlushMetrics succeeds; {len(queued)} metrics writes waited for the "
+                     f"next reader, and the log's {len(later_l.data)} bytes ({kept} lines, {kept_ours} of the {logged} "
+                     f"request lines; Linux's pipe {linux} bytes of them), {missed} lines counted as missed")
         vm.shell()
         _, out = vm.sh("echo after-$((6*7))")
         check(out == "after-42", f"guest after the FIFO readers went: {out!r}")
@@ -2057,7 +2135,7 @@ def stage_cli(ctx):
     check(0 < start <= wall, f"process_startup_time_us {start}, {wall} us since --start-time-us")
     check(parent < cpu < parent + wall * os.cpu_count(), f"process_startup_time_cpu_us {cpu} (parent {parent}, wall {wall})")
     done.append(f"start time metrics {start} us, {cpu} CPU us (of {wall} us); logger and metrics on FIFOs, "
-                "and the microVM goes on once their readers went")
+                f"and the microVM goes on once their readers went ({gets_text})")
 
     # SIGTERM, SIGINT and SIGQUIT, at their default action as upstream leaves
     # them, end Firecracker by the signal, and a reader that holds the log
