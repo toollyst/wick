@@ -626,8 +626,13 @@ mod macos {
         /// How long [`stop`] waits for the kernel to take the relay's
         /// thread, joined, off the process's list of threads.
         const REAP: Duration = Duration::from_secs(10);
-        /// proc_info(2)'s flavor that lists a process's thread ids (xnu
-        /// bsd/sys/proc_info.h).
+        /// proc_info(2)'s flavor that lists a process's thread ids, one
+        /// `uint64_t` each (xnu bsd/sys/proc_info_private.h, 28 in
+        /// xnu-11215.1.10, macOS 15.0, through xnu-12377.121.6, macOS 26;
+        /// the header is xnu's private one, which the SDK does not carry:
+        /// its `sys/proc_info.h` has only `PROC_PIDLISTTHREADS`, 6, whose
+        /// entries are not thread ids). A kernel without the flavor fails
+        /// the call, and the split with it.
         const PROC_PIDLISTTHREADIDS: libc::c_int = 28;
 
         static RELAY: OnceLock<Relay> = OnceLock::new();
