@@ -1716,14 +1716,26 @@ impl VcpuFd {
                     // and has WHP map it at once, as Linux's huge page fault
                     // does (`VmInner::populate_huge_page`); a read commits
                     // its page only (`wick_mm`: Linux's huge zero page).
+                    #[cfg(test)]
+                    let looked_up = std::time::Instant::now();
                     if let Some(host) = self.shared.inner.host_addr(mem.Gpa) {
+                        #[cfg(test)]
+                        let committing = std::time::Instant::now();
                         #[allow(clippy::cast_possible_truncation)]
                         let write = super::exit::memory_write(unsafe { mem.AccessInfo.AsUINT32 });
                         match libc::wick_mm::commit_block_on_access(host as usize, write) {
                             (libc::wick_mm::Access::Committed, block) => {
-                                if write && block.len() >= libc::wick_mm::HUGE_PAGE {
+                                #[cfg(test)]
+                                let populating = std::time::Instant::now();
+                                #[cfg(test)]
+                                let each = super::vm::POPULATE_EACH_PAGE_FOR_TESTS.get();
+                                #[cfg(not(test))]
+                                let each = false;
+                                if write && (each || block.len() >= libc::wick_mm::HUGE_PAGE) {
                                     self.shared.inner.populate_huge_page(mem.Gpa, block);
                                 }
+                                #[cfg(test)]
+                                super::ffi::trace::split_lazy(looked_up, committing, populating);
                                 continue;
                             }
                             (libc::wick_mm::Access::Exhausted(err), _) => libc::wick_mm::out_of_memory(host as usize, err),
@@ -6683,6 +6695,422 @@ mod fpu_tests {
             eprintln!("ZEROREAD {l}");
         }
         assert!(wrong.iter().all(|w| w.starts_with("a write to a zero-mapped page")), "{wrong:#?}");
+    }
+
+    /// The record for the per-page cost of lazy guest RAM (FIRSTTOUCH
+    /// lines): what a guest's first write to a 4 KiB page of lazy guest RAM
+    /// (anonymous `MAP_NORESERVE`, committed a page at a time) costs, set
+    /// against Linux's 10.40 us a page (LINUXGRAIN, the linux-boot job:
+    /// one 4 KiB page charged an anonymous fault, with the mTHP sizes the
+    /// GUESTRAM host line prints), and what each way to make it cheaper
+    /// that still charges the touched page only would cost. Each line names
+    /// its build (CI runs this record in a debug and in a release build)
+    /// and whether the WHP calls were traced (each kept,
+    /// [`super::super::ffi::trace::begin`]); untraced, a step's run calls
+    /// and lazy exits are only summed ([`super::super::ffi::trace::Split`]).
+    /// 1024 accesses a step:
+    /// - today's path, `run` committing each page at its exit
+    ///   (`commit_block_on_access`), untraced and then traced: the time a
+    ///   write; each lazy exit's run call, the slot's lookup, the commit
+    ///   and the rest of the backend's time; the commit and working set;
+    /// - L1: the same with WHP made to map each page the exit committed
+    ///   (`WHvAdviseGpaRange(Populate)` of 4 KiB, as the backend does a
+    ///   huge page, [`super::super::vm::POPULATE_EACH_PAGE_FOR_TESTS`])
+    ///   before the re-run, which takes WHP's fault in the run on committed
+    ///   memory it has not mapped (POPULATETEST) out of the run;
+    /// - exit baselines: an `out` that exits, through `run` and through
+    ///   `WHvRunVirtualProcessor` alone, the RIP set past it;
+    /// - today's path driven by `WHvRunVirtualProcessor` alone, the commit
+    ///   and the re-run only: the least the backend could take a page;
+    /// - L3: guest pages not mapped in WHP at all, each exit committing
+    ///   its host page and mapping it (`WHvMapGpaRange`, 4 KiB): the run
+    ///   call, the commit and the map; then the same pages again (no exits
+    ///   expected) and the `out` baseline again, after 1024 such mappings.
+    ///
+    /// Printed, not asserted, but for each step reaching its end.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_first_touch_of_lazy_ram_by_way_on_record() {
+        use super::super::ffi::trace;
+        use std::time::Instant;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PROGRAM: u64 = 0xB000;
+        const PAGES: u32 = 1024;
+        const PART: usize = 4 << 20;
+        // Lazy guest RAM, a 4 MiB part a step (the sixth for the warm-up).
+        const LAZY_GPA: u64 = 0x100_0000;
+        const LAZY_LEN: usize = 6 * PART;
+        // Guest RAM WHP does not map until an exit has it mapped (L3).
+        const UNMAPPED_GPA: u64 = 0x400_0000;
+        const UNMAPPED_LEN: usize = PART;
+        const OTHER_PORT: u16 = 0x81;
+        fn us(since: Instant) -> f64 {
+            since.elapsed().as_secs_f64() * 1e6
+        }
+        fn spread(t: &[f64]) -> String {
+            let mut t = t.to_vec();
+            t.sort_by(f64::total_cmp);
+            match t.len() {
+                0 => "none".to_string(),
+                n => format!("median {:.2} us (least {:.2}, most {:.2})", t[n / 2], t[0], t[n - 1]),
+            }
+        }
+        fn each(total: f64, n: u32) -> f64 {
+            if n == 0 { 0.0 } else { total / f64::from(n) }
+        }
+        let build = if cfg!(debug_assertions) { "debug build" } else { "release build" };
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        let mut gpa = LAZY_GPA;
+        while gpa < UNMAPPED_GPA + UNMAPPED_LEN as u64 {
+            put(m, 0x3000 + (gpa >> 21) * 8, &(gpa | 0x83).to_le_bytes());
+            gpa += 2 << 20;
+        }
+        // mov edi, base; mov ecx, count; a byte written at rdi and rdi
+        // moved a page on, count times; out 0x80, al.
+        let writes = |base: u64, count: u32| {
+            let mut b = vec![0xBF];
+            b.extend_from_slice(&u32::try_from(base).unwrap().to_le_bytes());
+            b.push(0xB9);
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&[0xC6, 0x07, 0x01, 0x81, 0xC7, 0x00, 0x10, 0x00, 0x00, 0xFF, 0xC9, 0x75, 0xF3, 0xE6, PORT as u8]);
+            b
+        };
+        // mov ecx, 1024; out 0x81, al, 1024 times; out 0x80, al.
+        let outs = || {
+            let mut b = vec![0xB9];
+            b.extend_from_slice(&PAGES.to_le_bytes());
+            b.extend_from_slice(&[0xE6, OTHER_PORT as u8, 0xFF, 0xC9, 0x75, 0xFA, 0xE6, PORT as u8]);
+            b
+        };
+        let part_gpa = |i: usize| LAZY_GPA + (i * PART) as u64;
+        let program = [
+            writes(part_gpa(5), 1),
+            outs(),
+            writes(part_gpa(0), PAGES),
+            writes(part_gpa(1), PAGES),
+            writes(part_gpa(2), PAGES),
+            writes(part_gpa(3), PAGES),
+            outs(),
+            writes(part_gpa(4), PAGES),
+            writes(UNMAPPED_GPA, PAGES),
+            writes(UNMAPPED_GPA, PAGES),
+            outs(),
+            vec![0xF4, 0xEB, 0xFD],
+        ]
+        .concat();
+        put(m, PROGRAM, &program);
+        // SAFETY: anonymous memory for the test, unmapped below.
+        let lazy = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LAZY_LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(lazy, libc::MAP_FAILED);
+        for (slot, gpa, len, host) in [(0, 0, MEM, m as u64), (1, LAZY_GPA, LAZY_LEN, lazy as u64)] {
+            // SAFETY: the memory stays mapped while the VM has it.
+            unsafe {
+                vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                    slot,
+                    flags: 0,
+                    guest_phys_addr: gpa,
+                    memory_size: len as u64,
+                    userspace_addr: host,
+                })
+            }
+            .unwrap();
+        }
+        // SAFETY: reserved memory for the test, released below.
+        let unmapped_host = unsafe { VirtualAlloc(std::ptr::null(), UNMAPPED_LEN, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(unmapped_host, 0);
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+        let part = vcpu.part();
+        let host = lazy as usize;
+        let mut lines = Vec::new();
+        let mut wrong = Vec::new();
+
+        // A step through `run`, to the guest's `out 0x80`: the `out 0x81`s
+        // on the way, what ended it if not that `out`, and its time.
+        let through_run = |vcpu: &mut VcpuFd| {
+            let watchdog = super::Watchdog::arm(vcpu);
+            let t = Instant::now();
+            let mut outs = 0u32;
+            let end = loop {
+                match vcpu.run() {
+                    Ok(VcpuExit::IoOut(PORT, _)) => break None,
+                    Ok(VcpuExit::IoOut(OTHER_PORT, _)) => outs += 1,
+                    Ok(VcpuExit::IoOut(port, _)) => break Some(format!("IoOut {port:#x}")),
+                    Ok(VcpuExit::Hlt) => break Some("Hlt".to_string()),
+                    Ok(VcpuExit::Shutdown) => break Some("Shutdown".to_string()),
+                    Ok(_) => break Some("another exit".to_string()),
+                    Err(e) if e.errno() == libc::EINTR => break Some("none within 5 s (kicked)".to_string()),
+                    Err(e) => break Some(format!("run failed, errno {}", e.errno())),
+                }
+            };
+            let took = us(t);
+            drop(watchdog);
+            vcpu.set_kvm_immediate_exit(0);
+            (outs, end, took)
+        };
+        // A step driven by `WHvRunVirtualProcessor` alone: each run call's
+        // time by its exit (an `out 0x81`, a memory exit), the test's time
+        // after each (the RIP set past an `out`, `memory`'s for a memory
+        // exit), what ended it if not the `out 0x80`, and its time.
+        #[derive(Default)]
+        struct Raw {
+            out_runs: Vec<f64>,
+            memory_runs: Vec<f64>,
+            unmapped: u32,
+            out_after: f64,
+            memory_after: f64,
+            end: Option<String>,
+            took: f64,
+        }
+        let raw = |vcpu: &mut VcpuFd, memory: &mut dyn FnMut(u64, bool, bool) -> std::result::Result<(), String>| {
+            let watchdog = super::Watchdog::arm(vcpu);
+            let (part, vp) = (vcpu.part(), vcpu.vp());
+            let mut r = Raw::default();
+            let t = Instant::now();
+            let end = loop {
+                if r.out_runs.len() + r.memory_runs.len() > 4 * PAGES as usize {
+                    break Some("more exits than the step has accesses".to_string());
+                }
+                if vcpu.shared.immediate_exit.load(Ordering::SeqCst) != 0 {
+                    break Some("none within 5 s (kicked)".to_string());
+                }
+                let t0 = Instant::now();
+                let ctx = match super::super::ffi::run_vp(part, vp) {
+                    Ok(c) => c,
+                    Err(e) => break Some(format!("run failed, errno {}", e.errno())),
+                };
+                let run = us(t0);
+                let t1 = Instant::now();
+                match ctx.ExitReason {
+                    whv::WHvRunVpExitReasonX64IoPortAccess => {
+                        // SAFETY: the union arm matches the exit reason.
+                        let port = unsafe { ctx.Anonymous.IoPortAccess.PortNumber };
+                        let next = ctx.VpContext.Rip + super::super::exit::instruction_length(ctx.VpContext._bitfield);
+                        if let Err(e) = regs::set_rip(part, vp, next) {
+                            break Some(format!("the RIP not set, errno {}", e.errno()));
+                        }
+                        if port == PORT {
+                            break None;
+                        }
+                        if port != OTHER_PORT {
+                            break Some(format!("IoOut {port:#x}"));
+                        }
+                        r.out_runs.push(run);
+                        r.out_after += us(t1);
+                    }
+                    whv::WHvRunVpExitReasonMemoryAccess => {
+                        // SAFETY: as above; the access-info bitfield overlaps the u32.
+                        let (gpa, info) = unsafe { (ctx.Anonymous.MemoryAccess.Gpa, ctx.Anonymous.MemoryAccess.AccessInfo.AsUINT32) };
+                        // `WHV_MEMORY_ACCESS_INFO`: AccessType in bits 0-1, GpaUnmapped bit 2.
+                        let unmapped = info & 4 != 0;
+                        if let Err(e) = memory(gpa, info & 3 == 1, unmapped) {
+                            break Some(e);
+                        }
+                        r.memory_runs.push(run);
+                        r.unmapped += u32::from(unmapped);
+                        r.memory_after += us(t1);
+                    }
+                    reason => break Some(format!("exit reason {reason:#x} at RIP {:#x}", ctx.VpContext.Rip)),
+                }
+            };
+            r.end = end;
+            r.took = us(t);
+            drop(watchdog);
+            vcpu.set_kvm_immediate_exit(0);
+            r
+        };
+        let mut ended = |name: &str, end: Option<String>| {
+            if let Some(e) = end {
+                wrong.push(format!("{name}: the step did not reach its end: {e}"));
+            }
+        };
+
+        // The thread's first lazy exit is a warm-up of its own (0.9 to 7.1
+        // ms on a PC, LAZYGRAIN).
+        let (_, end, took) = through_run(&mut vcpu);
+        ended("warm-up", end);
+        lines.push(format!("{build}, untraced: warm-up, the thread's first write to lazy guest RAM, the step {took:.1} us"));
+        let (outs, end, took) = through_run(&mut vcpu);
+        ended("out through run", end);
+        lines.push(format!(
+            "{build}, untraced: an out that exits, through run, {} times: {:.2} us a round trip",
+            outs + 1,
+            took / f64::from(outs + 1)
+        ));
+        for (way, first, populate) in [("today's path", 0, false), ("L1, each page populated before the re-run", 2, true)] {
+            for (traced, i) in [(false, first), (true, first + 1)] {
+                let at = host + i * PART;
+                let before = process_memory();
+                super::super::vm::POPULATE_EACH_PAGE_FOR_TESTS.set(populate);
+                if traced {
+                    trace::begin();
+                }
+                trace::split_begin();
+                let (_, end, took) = through_run(&mut vcpu);
+                let s = trace::split_end();
+                let calls = if traced { trace::end() } else { Vec::new() };
+                super::super::vm::POPULATE_EACH_PAGE_FOR_TESTS.set(false);
+                let after = process_memory();
+                ended(way, end);
+                let process = match (before, after) {
+                    (Some(a), Some(b)) => format!("the process's commit {:+} KiB", (b.0 as i64 - a.0 as i64) / 1024),
+                    _ => "the process's commit not read".to_string(),
+                };
+                let rest = took - s.run_us - s.lookup_us - s.commit_us - s.populate_us;
+                let mut line = format!(
+                    "{build}, {}: {way}, a write to each of {PAGES} untouched pages through run: {:.2} us a write; \
+                     {} run calls, {:.2} us each; {} lazy exits, each: the slot's lookup {:.2} us, the commit {:.2} \
+                     us, the populate {:.2} us, the rest of the backend {:.2} us; the part committed {} KiB, resident \
+                     {} KiB; {process}",
+                    if traced { "traced" } else { "untraced" },
+                    took / f64::from(PAGES),
+                    s.runs,
+                    each(s.run_us, s.runs),
+                    s.lazy,
+                    each(s.lookup_us, s.lazy),
+                    each(s.commit_us, s.lazy),
+                    each(s.populate_us, s.lazy),
+                    each(rest, s.lazy),
+                    committed_bytes(at, PART) / 1024,
+                    resident_bytes(at, PART) / 1024
+                );
+                if traced {
+                    let exits = lazy_exits(&calls);
+                    let n = exits.len().max(1) as f64;
+                    line += &format!(
+                        "; the trace's {} lazy exits, each {:.2} us in its run call and {:.2} us in the backend after it",
+                        exits.len(),
+                        exits.iter().map(|e| e.0).sum::<f64>() / n,
+                        exits.iter().map(|e| e.1).sum::<f64>() / n
+                    );
+                }
+                lines.push(line);
+            }
+        }
+        let mut no_memory = |gpa: u64, _: bool, _: bool| -> std::result::Result<(), String> { Err(format!("a memory exit at {gpa:#x}")) };
+        let out_line = |r: &Raw, when: &str| {
+            format!(
+                "{build}, untraced: an out that exits, WHvRunVirtualProcessor alone, {} times{when}: the run call {}; \
+                 the RIP set after it {:.2} us; {:.2} us a round trip",
+                r.out_runs.len() + 1,
+                spread(&r.out_runs),
+                each(r.out_after, r.out_runs.len() as u32),
+                r.took / (r.out_runs.len() + 1) as f64
+            )
+        };
+        let r = raw(&mut vcpu, &mut no_memory);
+        ended("out, WHvRunVirtualProcessor alone", r.end.clone());
+        lines.push(out_line(&r, ""));
+        let mut commit_today = |gpa: u64, write: bool, unmapped: bool| {
+            if unmapped || !(LAZY_GPA..LAZY_GPA + LAZY_LEN as u64).contains(&gpa) {
+                return Err(format!("a memory exit at {gpa:#x} outside lazy guest RAM"));
+            }
+            match libc::wick_mm::commit_block_on_access(host + (gpa - LAZY_GPA) as usize, write) {
+                (libc::wick_mm::Access::Committed, _) => Ok(()),
+                _ => Err(format!("{gpa:#x} not committed")),
+            }
+        };
+        let r = raw(&mut vcpu, &mut commit_today);
+        ended("today's path, WHvRunVirtualProcessor alone", r.end.clone());
+        lines.push(format!(
+            "{build}, untraced: today's path, a write to each of {PAGES} untouched pages, WHvRunVirtualProcessor alone \
+             with the commit: {:.2} us a write; {} memory exits, the run call {}, the commit after it {:.2} us; the part \
+             committed {} KiB, resident {} KiB",
+            r.took / f64::from(PAGES),
+            r.memory_runs.len(),
+            spread(&r.memory_runs),
+            each(r.memory_after, r.memory_runs.len() as u32),
+            committed_bytes(host + 4 * PART, PART) / 1024,
+            resident_bytes(host + 4 * PART, PART) / 1024
+        ));
+        let (mut commits, mut maps, mut results) = (Vec::new(), Vec::new(), std::collections::BTreeMap::<String, u32>::new());
+        let mut commit_and_map = |gpa: u64, _: bool, unmapped: bool| {
+            if !unmapped || !(UNMAPPED_GPA..UNMAPPED_GPA + UNMAPPED_LEN as u64).contains(&gpa) {
+                return Err(format!("a memory exit at {gpa:#x}, unmapped {unmapped}"));
+            }
+            let page = gpa & !0xFFF;
+            let t = Instant::now();
+            // SAFETY: a page of the reservation above, released below.
+            let p = unsafe { VirtualAlloc((unmapped_host + (page - UNMAPPED_GPA) as usize) as *const _, 4096, MEM_COMMIT, PAGE_READWRITE) };
+            commits.push(us(t));
+            if p.is_null() {
+                return Err(format!("the commit for {page:#x} failed"));
+            }
+            let t = Instant::now();
+            // SAFETY: a committed page that stays so while the VM has it;
+            // unmapped below.
+            let hres = unsafe {
+                whv::WHvMapGpaRange(
+                    part,
+                    p,
+                    page,
+                    4096,
+                    whv::WHvMapGpaRangeFlagRead | whv::WHvMapGpaRangeFlagWrite | whv::WHvMapGpaRangeFlagExecute,
+                )
+            };
+            maps.push(us(t));
+            *results.entry(format!("{:#010x}", hres.cast_unsigned())).or_default() += 1;
+            if hres != 0 {
+                return Err(format!("WHvMapGpaRange of {page:#x}: {:#010x}", hres.cast_unsigned()));
+            }
+            Ok(())
+        };
+        let l3 = raw(&mut vcpu, &mut commit_and_map);
+        ended("L3", l3.end.clone());
+        let again = raw(&mut vcpu, &mut no_memory);
+        ended("L3's pages again", again.end.clone());
+        let after = raw(&mut vcpu, &mut no_memory);
+        ended("out after L3", after.end.clone());
+        let tail = maps.len().saturating_sub(64);
+        lines.push(format!(
+            "{build}, untraced: L3, guest pages not mapped in WHP, a write to each of {PAGES}, WHvRunVirtualProcessor \
+             alone with a commit and a 4 KiB WHvMapGpaRange at each exit: {:.2} us a write; {} memory exits ({} of \
+             them of an unmapped GPA), the run call {}, the commit {}, the map {} (the first 64 {}, the last 64 {}), \
+             HRESULTs {results:?}, the test's time after the run call {:.2} us; the range committed {} KiB, resident \
+             {} KiB",
+            l3.took / f64::from(PAGES),
+            l3.memory_runs.len(),
+            l3.unmapped,
+            spread(&l3.memory_runs),
+            spread(&commits),
+            spread(&maps),
+            spread(&maps[..maps.len().min(64)]),
+            spread(&maps[tail..]),
+            each(l3.memory_after, l3.memory_runs.len() as u32),
+            committed_bytes(unmapped_host, UNMAPPED_LEN) / 1024,
+            resident_bytes(unmapped_host, UNMAPPED_LEN) / 1024
+        ));
+        lines.push(format!(
+            "{build}, untraced: L3's {PAGES} pages written again: {} memory exits, {:.2} us a write",
+            again.memory_runs.len(),
+            again.took / f64::from(PAGES)
+        ));
+        lines.push(out_line(&after, ", after the 1024 mappings of 4 KiB"));
+        for l in &lines {
+            eprintln!("FIRSTTOUCH {l}");
+        }
+        // SAFETY: the ranges mapped above, unmapped before the VM goes.
+        unsafe { whv::WHvUnmapGpaRange(part, UNMAPPED_GPA, UNMAPPED_LEN as u64) };
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's memory, no VM left using it.
+        unsafe {
+            VirtualFree(unmapped_host as *mut _, 0, MEM_RELEASE);
+            assert_eq!(libc::munmap(lazy, LAZY_LEN), 0);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// ZEROREAD's lines on a guest write to memory WHP maps read only, on a

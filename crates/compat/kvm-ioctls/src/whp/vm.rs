@@ -41,6 +41,11 @@ thread_local! {
     /// beyond the backend's, where WHP offers them
     /// (`test_a_guest_read_of_untouched_ram_on_record`: GpaAccessFaultExit).
     pub(crate) static EXTRA_EXITS_FOR_TESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Whether a guest write's first access to lazy guest RAM run on this
+    /// thread has WHP map the page it committed at once, whatever its size,
+    /// as a huge page's is (`populate_huge_page`): option L1 of the
+    /// per-page cost (`test_a_first_touch_of_lazy_ram_by_way_on_record`).
+    pub(crate) static POPULATE_EACH_PAGE_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 use super::guest_mem::{self, Slot};
 use super::irqchip::{Irqchip, MsiRoutes};

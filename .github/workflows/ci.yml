@@ -199,7 +199,9 @@ jobs:
       # (LINUXGRAIN lines; LAZYGRAIN in the windows job); and upstream
       # Firecracker booted with huge_pages None and Transparent, its guest
       # memory after the shell and after a guest's tmpfs work (GUESTRAM
-      # lines; VMMGUEST in the windows job's vmm-memory-record.py --boot).
+      # lines; VMMGUEST in the windows job's vmm-memory-record.py --boot);
+      # the host lines name each mTHP size's setting, the grain of the
+      # LINUXGRAIN per-page cost FIRSTTOUCH is set against.
       # Then, under the runner's own setting, what a 1 GiB guest that touched
       # 64 MiB is charged after a full and a diff snapshot, and what a
       # restore from the full snapshot's file is charged (anon and the page
@@ -1135,6 +1137,18 @@ jobs:
           # slot, without and with the GpaAccessFaultExit exit: which exits
           # WHP makes and what the run gives.
           alone whp::vcpu::fpu_tests::test_a_guest_read_of_untouched_ram_on_record
+          # A first write to a 4 KiB page of lazy guest RAM (FIRSTTOUCH
+          # lines): today's path through run, untraced and traced, its
+          # run call, lookup, commit and the rest of the backend apart; L1,
+          # each page populated before the re-run; an out's round trip
+          # through run and through WHvRunVirtualProcessor alone; today's
+          # path driven by WHvRunVirtualProcessor alone; L3, the page left
+          # unmapped in WHP and mapped at its exit. In the debug build as
+          # every record here, then in a release build, as Firecracker
+          # runs: the per-page cost set against Linux's (LINUXGRAIN) is
+          # the release build's. Each line names its build.
+          alone whp::vcpu::fpu_tests::test_a_first_touch_of_lazy_ram_by_way_on_record
+          alone whp::vcpu::fpu_tests::test_a_first_touch_of_lazy_ram_by_way_on_record --release
           # What each call of the backend commits of its thread's stack
           # (STACKTEST lines), each on a thread of its own: which one leaves
           # a vCPU's thread 48 to 52 KiB deep, as the boot record of run

@@ -576,6 +576,50 @@ pub(crate) mod trace {
     thread_local! {
         /// The calls of this thread since [`begin`]; none kept before it.
         static CALLS: RefCell<Option<Vec<Call>>> = const { RefCell::new(None) };
+        /// This thread's [`Split`] since [`split_begin`], kept whether its
+        /// calls are or not.
+        static SPLIT: Cell<Option<Split>> = const { Cell::new(None) };
+    }
+
+    /// For a record (FIRSTTOUCH): a thread's run calls and the backend's
+    /// handling of the memory exits of lazy guest RAM, summed since
+    /// [`split_begin`], without the cost of keeping each call ([`begin`]):
+    /// the run calls' time, and for each lazy exit the slot's lookup, the
+    /// commit (`wick_mm::commit_block_on_access`) and the populate after it
+    /// (`VmInner::populate_huge_page`, where there is one), in microseconds.
+    #[derive(Clone, Copy, Default)]
+    pub(crate) struct Split {
+        pub runs: u32,
+        pub run_us: f64,
+        pub lazy: u32,
+        pub lookup_us: f64,
+        pub commit_us: f64,
+        pub populate_us: f64,
+    }
+
+    /// From here the calling thread's [`Split`] is summed.
+    pub(crate) fn split_begin() {
+        SPLIT.set(Some(Split::default()));
+    }
+
+    /// The [`Split`] summed since [`split_begin`], which sums no more.
+    pub(crate) fn split_end() -> Split {
+        SPLIT.take().unwrap_or_default()
+    }
+
+    /// Adds a lazy exit's handling to the thread's [`Split`]: its lookup
+    /// began at `lookup`, its commit at `commit` and its populate at
+    /// `populate`, which ends now.
+    #[cfg(test)]
+    pub(crate) fn split_lazy(lookup: Instant, commit: Instant, populate: Instant) {
+        if let Some(mut s) = SPLIT.get() {
+            let us = |from: Instant, to: Instant| to.duration_since(from).as_secs_f64() * 1e6;
+            s.lazy += 1;
+            s.lookup_us += us(lookup, commit);
+            s.commit_us += us(commit, populate);
+            s.populate_us += us(populate, Instant::now());
+            SPLIT.set(Some(s));
+        }
     }
 
     /// How much of the calling thread's stack is committed, in bytes: the
@@ -640,6 +684,13 @@ pub(crate) mod trace {
         let after = stack();
         let ended = Instant::now();
         let began = STARTED.take();
+        if exit.is_some()
+            && let (Some(b), Some(mut s)) = (began, SPLIT.get())
+        {
+            s.runs += 1;
+            s.run_us += ended.duration_since(b).as_secs_f64() * 1e6;
+            SPLIT.set(Some(s));
+        }
         let now = RAISED.get();
         let raised = now.since(LAST_RAISED.replace(now));
         #[cfg(feature = "whp-trace")]

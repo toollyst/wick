@@ -25,8 +25,11 @@ process's smaps_rollup Rss and AnonHugePages; and, run as root, the
 memory.current and memory.stat anon of a cgroup of the case's own
 (memory.max's count). The host's transparent_hugepage settings come first:
 whether huge_pages "None" faults its guest memory in 4 KiB pages ("madvise",
-"never") or 2 MiB ("always"). A record: it fails only when a guest does not
-boot to its shell.
+"never") or 2 MiB ("always"), and each multi-size THP size's setting
+(hugepages-<size>kB/enabled, Linux 6.8 and later): with all of them
+"never", an anonymous fault is one 4 KiB page, the grain FIRSTTOUCH's
+per-page cost on Windows is set against. A record: it fails only when a
+guest does not boot to its shell.
 
 With --snapshot it prints GUESTSNAP lines instead: what the host's reads of
 guest memory for a snapshot charge, and what a restore from the snapshot's
@@ -84,6 +87,22 @@ def read(path, default="(not read)"):
             return f.read().strip()
     except OSError:
         return default
+
+
+def mthp_sizes(thp):
+    """Each multi-size THP size's setting under the transparent_hugepage
+    directory `thp` (hugepages-<size>kB/enabled, Linux 6.8 and later), in
+    size order, as one text: a size "never" (or "inherit" of a top-level
+    "never" or "madvise" without MADV_HUGEPAGE) leaves an anonymous fault
+    one 4 KiB page, which FIRSTTOUCH's per-page comparison takes."""
+    try:
+        names = [n for n in os.listdir(thp) if re.fullmatch(r"hugepages-\d+kB", n)]
+    except OSError:
+        return "(no mTHP sizes: not read)"
+    if not names:
+        return "(no mTHP sizes: a kernel before 6.8)"
+    names.sort(key=lambda n: int(n[len("hugepages-"):-len("kB")]))
+    return ", ".join(f"{n[len('hugepages-'):]} {read(os.path.join(thp, n, 'enabled'))}" for n in names)
 
 
 def guest_mappings(smaps):
@@ -435,6 +454,17 @@ def selftest():
         (0x7f2000000000, 0x7f2040000000, 65536, 4096, "of full.mem"),
         (0x7f3000000000, 0x7f3040000000, 8, 8, "anonymous")], snapshot_mappings(smaps, "/w/full.mem")
     assert [m[4] for m in snapshot_mappings(smaps, None)] == ["anonymous", "anonymous"]
+    with tempfile.TemporaryDirectory() as thp:
+        assert mthp_sizes(thp) == "(no mTHP sizes: a kernel before 6.8)"
+        for size, setting in (("2048kB", "[always] inherit madvise never"), ("16kB", "always inherit madvise [never]"),
+                              ("64kB", "always [inherit] madvise never")):
+            os.mkdir(os.path.join(thp, "hugepages-" + size))
+            with open(os.path.join(thp, "hugepages-" + size, "enabled"), "w", encoding="utf-8") as f:
+                f.write(setting + "\n")
+        os.mkdir(os.path.join(thp, "khugepaged"))
+        assert mthp_sizes(thp) == ("16kB always inherit madvise [never], 64kB always [inherit] madvise never, "
+                                   "2048kB [always] inherit madvise never"), mthp_sizes(thp)
+    assert mthp_sizes("/nonexistent-thp") == "(no mTHP sizes: not read)"
     print("guest-ram-record.py: selftest ok")
 
 
@@ -448,6 +478,7 @@ def main(args):
         fc, workdir = os.path.abspath(args[1]), os.path.abspath(args[2])
         thp = "/sys/kernel/mm/transparent_hugepage"
         print(f"GUESTSNAP host: Linux {platform.release()}; transparent_hugepage enabled: {read(thp + '/enabled')}; "
+              f"mTHP sizes: {mthp_sizes(thp)}; "
               f"{subprocess.run([fc, '--version'], capture_output=True, text=True).stdout.splitlines()[0]}")
         with tempfile.TemporaryDirectory(prefix="guest-snap-") as work:
             if not snapshot_case(fc, workdir, work):
@@ -462,7 +493,7 @@ def main(args):
     counts = [int(a) for a in args[2:]] or [1, 2, 16]
     thp = "/sys/kernel/mm/transparent_hugepage"
     print(f"GUESTRAM host: Linux {platform.release()}; transparent_hugepage enabled: {read(thp + '/enabled')}; "
-          f"defrag: {read(thp + '/defrag')}; overcommit_memory {read('/proc/sys/vm/overcommit_memory')}; "
+          f"defrag: {read(thp + '/defrag')}; mTHP sizes: {mthp_sizes(thp)}; overcommit_memory {read('/proc/sys/vm/overcommit_memory')}; "
           f"{subprocess.run([fc, '--version'], capture_output=True, text=True).stdout.splitlines()[0]}")
     ok, n = True, 0
     with tempfile.TemporaryDirectory(prefix="guest-ram-") as work:
