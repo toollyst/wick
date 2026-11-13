@@ -6945,7 +6945,11 @@ mod fpu_tests {
     /// change, exactly, `adjust_tsc_offset_guest`); the guest's WRMSR of
     /// IA32_TSC, whether the backend sees it, and what TSC_ADJUST reads
     /// after (KVM adds the change to it, x86.c:3664-3667); KVM_GET_MSRS of
-    /// 0x3b after. Printed, not asserted, but for each step's end.
+    /// 0x3b after. Then, for an exact move and for the TSC write's exit:
+    /// `WHvX64RegisterTscVirtualOffset` read and written plus the change,
+    /// with the skew it made and after a run; whether WHP offers the
+    /// `TscMsrWrite` exit, and whether a guest's WRMSR 0x10 comes to the
+    /// backend with it set. Printed, not asserted, but for each step's end.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_tsc_adjust_offered_to_the_guest_on_record() {
@@ -7009,6 +7013,55 @@ mod fpu_tests {
         let mut host = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry { index: 0x3B, ..Default::default() }]).unwrap();
         let n = v0.get_msrs(&mut host).unwrap();
         lines.push(format!("KVM_GET_MSRS of 0x3b: {n} entries, {:#x}", host.as_slice()[0].data));
+        // An exact move of the TSC, as KVM's offset change: vCPU 0's
+        // WHvX64RegisterTscVirtualOffset (0x2087 in WinHvPlatformDefs.h;
+        // what it holds is not documented) read, written plus `by`, and the
+        // skew against vCPU 1 before, after, and after a run of vCPU 0.
+        let get = |name| super::super::ffi::get_register(part, v0.vp(), name).map(|v| super::super::ffi::as_u64(&v)).map_err(|e| e.errno());
+        let offset = get(whv::WHvX64RegisterTscVirtualOffset);
+        lines.push(format!("WHvX64RegisterTscVirtualOffset of vCPU 0: {offset:?}; its TSC {:?}", get(whv::WHvX64RegisterTsc)));
+        if let Ok(offset) = offset {
+            let before = tsc_skew(part);
+            let set = super::super::ffi::set_register(part, v0.vp(), whv::WHvX64RegisterTscVirtualOffset, super::super::ffi::reg64(offset.wrapping_add(by)))
+                .map_err(|e| e.errno());
+            let after = tsc_skew(part);
+            let read = get(whv::WHvX64RegisterTscVirtualOffset);
+            let (how, _) = probe(&mut v0, CPUID_AT, 0, 0, 0);
+            let ran = tsc_skew(part);
+            lines.push(format!(
+                "WHvX64RegisterTscVirtualOffset written plus {by}: {set:?}, read back {read:?}; vCPU 0's TSC against vCPU 1's \
+                 {before:?} before, {after:?} after: moved by {} (exact: {by}); after a run ({how}) {ran:?}: moved by {} since",
+                before.0 - after.0,
+                after.0 - ran.0
+            ));
+        }
+        // The guest's TSC write as an exit: whether WHP offers TscMsrWrite
+        // (WHV_X64_MSR_EXIT_BITMAP bit 1), and whether a guest's WRMSR 0x10
+        // then comes to the backend (KVM adds its change to TSC_ADJUST).
+        let mut offered = 0u64;
+        let mut written = 0u32;
+        // SAFETY: a u64 output buffer of the size passed.
+        let cap = unsafe { whv::WHvGetCapability(whv::WHvCapabilityCodeX64MsrExitBitmap, (&raw mut offered).cast(), 8, &mut written) };
+        let mut bitmap = 0u64;
+        // SAFETY: as above.
+        let got = unsafe { whv::WHvGetPartitionProperty(part, whv::WHvPartitionPropertyCodeX64MsrExitBitmap, (&raw mut bitmap).cast(), 8, &mut written) };
+        lines.push(format!(
+            "WHvGetCapability(X64MsrExitBitmap): {:#010x}, {offered:#x} (TscMsrWrite {}); the partition's: {:#010x}, {bitmap:#x}",
+            cap.cast_unsigned(),
+            offered >> 1 & 1,
+            got.cast_unsigned()
+        ));
+        let with = bitmap | 1 << 1;
+        // SAFETY: a u64 property value.
+        let set = unsafe { super::super::ffi::set_partition_property(part, whv::WHvPartitionPropertyCodeX64MsrExitBitmap, &with) };
+        lines.push(format!("X64MsrExitBitmap set with TscMsrWrite ({with:#x}): {:?}", set.map_err(|e| e.errno())));
+        let (l, tsc) = msr(&mut v0, "TSC", 0x10, None);
+        lines.push(l);
+        lines.push(msr(&mut v0, "TSC, with TscMsrWrite", 0x10, Some(tsc.wrapping_add(0x1000_0000))).0);
+        lines.push(msr(&mut v0, "TSC after it", 0x10, None).0);
+        // SAFETY: as above, the partition's bitmap as it was.
+        let back = unsafe { super::super::ffi::set_partition_property(part, whv::WHvPartitionPropertyCodeX64MsrExitBitmap, &bitmap) };
+        lines.push(format!("X64MsrExitBitmap set back: {:?}", back.map_err(|e| e.errno())));
         for l in &lines {
             eprintln!("TSCADJREC {l}");
         }
