@@ -53,6 +53,13 @@
 #          and with a guest running
 #   foreign-snapshot  a state file made on another host (-ForeignState) is
 #          refused at the load (no guest)
+#   diff-nospace  (not in `all`: needs an elevated prompt, for diskpart) a
+#          diff snapshot written to a volume without the room fails with
+#          "not enough space on the disk" and leaves the guest as it was;
+#          with the room made, the next diff snapshot succeeds and restores
+#          with what the guest wrote before the failed one. Upstream's
+#          test_diff_snapshot_works_after_error on a 512 MiB virtual disk
+#          in place of its 512 MiB tmpfs
 #   linux-snapshot  (not in `all`: needs -LinuxSnapshot) a whole snapshot
 #          made on Linux x86_64 with KVM by tools/linux/make-vmstate.py, same
 #          Firecracker version, same root drive file, loaded and resumed
@@ -666,6 +673,19 @@ namespace Wick {
     public static class Util {
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         static extern uint GetCompressedFileSizeW(string path, out uint high);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool GetDiskFreeSpaceExW(string dir, out ulong toCaller, out ulong total, out ulong free);
+
+        // Free bytes of the volume `dir` is on; any directory of it will do
+        // (GetDiskFreeSpaceExW, lpDirectoryName: "does not have to specify
+        // the root directory on a disk").
+        public static long FreeSpace(string dir) {
+            ulong toCaller, total, free;
+            if (!GetDiskFreeSpaceExW(dir, out toCaller, out total, out free))
+                throw new Failure("GetDiskFreeSpaceEx " + dir + ": error " + Marshal.GetLastWin32Error());
+            return (long)toCaller;
+        }
 
         // Bytes the file system allocates for `path` (sparse files: without holes).
         public static long Allocated(string path) {
@@ -2800,6 +2820,113 @@ function Stage-ForeignSnapshot {
     return "refused at the load ($why), Firecracker exits; snapshot-editor refuses it too"
 }
 
+# Upstream's test_diff_snapshot_works_after_error
+# (test_snapshot_not_losing_dirty_pages.py): a diff snapshot that fails for
+# lack of space must not lose the dirty pages, so that the next one, with
+# the space there, is whole. Upstream puts the jail on a 512 MiB tmpfs and
+# fills 90% of what is free with fallocate. Windows has no tmpfs; a small
+# volume is a virtual disk file, made, attached, formatted and mounted on
+# a directory by diskpart (create vdisk, attach vdisk, create partition
+# primary, format, assign: the sequence of Microsoft's "Boot to a virtual
+# hard disk", step 1; `assign mount=<path>` for the directory), which
+# needs an elevated prompt. The fill is a file extended to its size: NTFS
+# allocates the clusters of a file that is not sparse, as fallocate does.
+# The error is Windows's for a full volume, ERROR_DISK_FULL (112), where
+# upstream's test reads Linux's "No space left on device".
+function Invoke-Diskpart([string]$dir, [string[]]$commands) {
+    $script = Join-Path $dir 'diskpart.txt'
+    Set-Content -Path $script -Value $commands -Encoding ASCII
+    return Invoke-Exe (Join-Path $env:SystemRoot 'System32\diskpart.exe') @('/s', $script) 120000
+}
+
+function Stage-DiffNoSpace {
+    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Check $admin 'this stage makes and attaches a virtual disk with diskpart, which needs an elevated prompt (run as administrator)'
+    $dir = Join-Path $Scratch 'diff-nospace'
+    $vhd = Join-Path $dir 'small.vhdx'
+    $mnt = Join-Path $dir 'mnt'
+    $detach = @("select vdisk file=`"$vhd`"", 'detach vdisk')
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    if (Test-Path $vhd) {
+        # What a killed run left: attached or not, the file must go, and
+        # removing it fails if it is still attached.
+        Invoke-Diskpart $dir $detach | Out-Null
+        Remove-Item -Force $vhd
+    }
+    if (Test-Path $mnt) { [IO.Directory]::Delete($mnt) }
+    New-Item -ItemType Directory -Path $mnt | Out-Null
+    $r = Invoke-Diskpart $dir @("create vdisk file=`"$vhd`" maximum=512 type=expandable", 'attach vdisk', 'create partition primary',
+        'format fs=ntfs quick', "assign mount=`"$mnt`"")
+    Check ($r[0] -eq 0) "diskpart (a 512 MiB virtual disk mounted on $mnt): exit $($r[0]) $($r[1].Trim())"
+    $vm = $null
+    $vm2 = $null
+    try {
+        $free = [Wick.Util]::FreeSpace($mnt)
+        Check ($free -gt 400MB -and $free -lt 512MB) "the new volume has $([math]::Round($free / 1MB)) MiB free of 512"
+        $cfg = Base-Config 2
+        $cfg['machine-config']['track_dirty_pages'] = $true
+        $vm = Start-Vm 'diff-nospace-1' $cfg -Api
+        Wait-Shell $vm
+        $vm.Sh('A=before-$((6*7))') | Out-Null
+        $bashMd5 = $vm.Sh('md5sum /usr/bin/bash')
+        # 100 MiB the guest wrote: more than the failed snapshot has room
+        # for, and what the second one must not have lost.
+        $vm.Sh('mount -t tmpfs -o size=128m tmpfs /tmp && dd if=/dev/urandom of=/tmp/f bs=1M count=100 2>/dev/null', 120000, $true) | Out-Null
+        $written = $vm.Sh('md5sum /tmp/f')
+
+        $fill = Join-Path $mnt 'fill'
+        $target = [long][math]::Round($free * 0.9)
+        $f = [IO.File]::Create($fill)
+        try { $f.SetLength($target) } finally { $f.Close() }
+        $left = [Wick.Util]::FreeSpace($mnt)
+        Check ($left -lt 100MB -and $left -le $free - $target) "after a $([math]::Round($target / 1MB)) MiB fill the volume has $([math]::Round($left / 1MB)) MiB free (it had $([math]::Round($free / 1MB)))"
+
+        $state = Join-Path $mnt 'diff.state'
+        $mem = Join-Path $mnt 'diff.mem'
+        $body = [ordered]@{ snapshot_type = 'Diff'; snapshot_path = $state; mem_file_path = $mem } | ConvertTo-Json -Compress
+        Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+        $status = 0
+        $out = [Wick.Api]::Call($vm.ApiSock, 'PUT', '/snapshot/create', $body, 120000, [ref]$status)
+        Check ($status -eq 400 -and $out -match 'os error 112') "a diff snapshot with $([math]::Round($left / 1MB)) MiB free: $status $out"
+        $why = ([regex]::Match($out, '"fault_message":\s*"(.*)"')).Groups[1].Value
+        Check (-not $vm.Exited) "Firecracker after the failed snapshot: $($vm.ExitReason())"
+        Write-Step "with $([math]::Round($left / 1MB)) MiB free: $status $why"
+
+        Remove-Item -Force $fill
+        Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Diff'; snapshot_path = $state; mem_file_path = $mem }) | Out-Null
+        $vm.Kill()
+        $allocated = [Wick.Util]::Allocated($mem)
+        Check ((Get-Item $mem).Length -eq 256MB -and $allocated -ge 100MB) "the second diff file: $((Get-Item $mem).Length) bytes, $([math]::Round($allocated / 1MB)) MiB allocated"
+
+        # As upstream: the diff alone is the memory file (the first diff of
+        # a guest holds every page it has touched).
+        $vm2 = Start-Vm 'diff-nospace-2' $null -Api
+        Invoke-Api $vm2 'PUT' '/snapshot/load' ([ordered]@{
+            snapshot_path = $state
+            mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = $mem }
+            resume_vm     = $true
+        }) | Out-Null
+        Test-Restored $vm2 $bashMd5 $null
+        $out = $vm2.Sh('md5sum /tmp/f')
+        Check ($out -eq $written) "the 100 MiB written before the failed snapshot, after the restore: '$out', before '$written'"
+        Save-Dmesg $vm2 'diff-nospace-2'
+        $vm2.Reboot()
+        $result = "a diff snapshot with $([math]::Round($left / 1MB)) MiB free fails ($why) and Firecracker stays; with the space back the next one ($([math]::Round($allocated / 1MB)) MiB) restores with the 100 MiB the guest wrote before"
+    } finally {
+        # Nothing may hold the volume when its disk is detached.
+        if ($vm) { $vm.Kill() }
+        if ($vm2) { $vm2.Kill() }
+        $r = Invoke-Diskpart $dir $detach
+        if ($r[0] -ne 0) { Write-Host "  ! diskpart detach of $vhd`: exit $($r[0]) $($r[1].Trim())" }
+    }
+    # Reached only when the steps above passed; a failure of theirs is the
+    # stage's, with the detach's own printed above.
+    Check ($r[0] -eq 0) "diskpart detach of $vhd`: exit $($r[0]) $($r[1].Trim())"
+    [IO.Directory]::Delete($mnt)
+    Remove-Item -Force $vhd
+    return $result
+}
+
 # A whole snapshot made on Linux x86_64 (KVM) by the same Firecracker
 # version (-LinuxSnapshot: tools/linux/make-vmstate.py's fourth argument,
 # CI's artifact linux-snapshot), loaded and resumed here. Upstream supports
@@ -3190,12 +3317,13 @@ $Stages = [ordered]@{
     tools    = { Stage-Tools }
     'no-seccomp' = { Stage-NoSeccomp }
     'foreign-snapshot' = { Stage-ForeignSnapshot }
+    'diff-nospace' = { Stage-DiffNoSpace }
     'linux-snapshot' = { Stage-LinuxSnapshot }
     'memory-hotplug' = { Stage-MemoryHotplug }
     gdb      = { Stage-Gdb }
 }
 # Stages `all` leaves out: they need what a plain kit does not have.
-$NotInAll = @('gdb', 'linux-snapshot')
+$NotInAll = @('gdb', 'diff-nospace', 'linux-snapshot')
 
 # --- run ------------------------------------------------------------------------
 
