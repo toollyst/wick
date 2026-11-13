@@ -127,6 +127,10 @@
   is in: each group of allocations (kind, size, and a mark: a heap's later
   segment, the allocation that holds the threads' TEBs) whose number or
   resident memory differs between the fewest and the most vCPUs.
+  firecracker.exe's own pages are in neither that nor the "each vCPU adds"
+  line: which of them a process has resident is how it paged the file in
+  (11616 and 5632 KiB in two cases of one PC run at 9af0b63), so a line of
+  their own gives each case's.
 
 CI builds the binaries on every push and uploads them as the artifact
 `wick-windows-x86_64-<commit>`: `lib/firecracker/build/cargo_target/release/firecracker.exe`,

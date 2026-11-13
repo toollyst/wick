@@ -376,6 +376,13 @@ def measure(k32, psapi, ntdll, pid, system):
 
 
 COUNTED = ("image code", "image private", "image rest", "stacks", "heaps", "private", "mapped")
+# firecracker.exe's pages: in the count, but no cost of a vCPU. Which of the
+# file's pages a process has resident is how it paged them in, which the
+# file cache decides: one PC run (9af0b63, --boot, 1 and 16 vCPUs, the first
+# after a build) had 11616 and 5632 KiB of it resident, so a difference
+# between two cases is no figure per vCPU and is not given as one.
+IMAGE = ("image code", "image private", "image rest")
+PER_VCPU = tuple(k for k in COUNTED if k not in IMAGE)
 # The allocations of each case, for the VMMGROW lines.
 ROWS = {}
 
@@ -389,10 +396,13 @@ def mark_of(path):
 def growth_lines(low, high, vcpus):
     """Which allocations differ between two cases' rows: per kind, size and
     mark, the number of allocations and their resident bytes in each, for
-    the groups that differ, the largest difference first."""
+    the groups that differ, the largest difference first. The image's rows
+    are left out (`IMAGE`; `image_line` gives them)."""
     def groups(rows):
         out = {}
         for rss, what, _base, size, path in rows:
+            if what == "image":
+                continue
             n, total = out.get((what, size, mark_of(path)), (0, 0))
             out[(what, size, mark_of(path))] = (n + 1, total + rss)
         return out
@@ -407,6 +417,20 @@ def growth_lines(low, high, vcpus):
                           f"{r0 // 1024} KiB resident, then {n1} with {r1 // 1024} KiB: each vCPU adds "
                           f"{(n1 - n0) / vcpus:.2f} allocations and {(r1 - r0) / 1024 / vcpus:.1f} KiB"))
     return [line for _d, line in sorted(lines, reverse=True)]
+
+
+def per_vcpu_line(results, lo, hi):
+    """What each vCPU adds from `lo` to `hi` vCPUs, per kind but the image's."""
+    return ", ".join(f"{k} {(results[hi][k] - results[lo][k]) / 1024 / (hi - lo):.1f}" for k in PER_VCPU)
+
+
+def image_line(results):
+    """The image's resident pages in each case, as measured: not a cost per
+    vCPU (`IMAGE`)."""
+    cases = "; ".join(f"{n} vCPUs: " + ", ".join(f"{k[len('image '):]} {results[n][k] // 1024}" for k in IMAGE)
+                      for n in sorted(results))
+    return (f"firecracker.exe resident in each case, KiB: {cases}; how the process paged the file in, which the "
+            f"file cache decides, not a cost per vCPU")
 
 
 # --- a thread's stack: what is resident and which calls left it so ----------
@@ -1023,17 +1047,28 @@ def selftest():
     assert heap_of_segment(header, {0x5000}) is None and heap_of_segment(bytes(0x20), {0}) is None
     assert heap_of_segment(None, {0}) is None and heap_of_segment(header[:0x18], {0x1b935590000}) is None
     # What grows: a second stack-sized private allocation per vCPU, a heap segment that fills.
+    # The image's rows differ too, and are left out.
     one = [(40 << 10, "private", 0x1000, 64 << 10, ""), (96 << 10, "heaps", 0x2000, 1 << 20, "(a later segment of the heap at 0x9000)"),
-           (8 << 10, "private", 0x3000, 2 << 20, "(10 TEBs)"), (4 << 10, "mapped", 0x4000, 4 << 10, "")]
+           (8 << 10, "private", 0x3000, 2 << 20, "(10 TEBs)"), (4 << 10, "mapped", 0x4000, 4 << 10, ""),
+           (11616 << 10, "image", 0x140000000, 24 << 20, "C:\\x\\firecracker.exe")]
     many = [(40 << 10, "private", 0x1000, 64 << 10, ""), (16 << 10, "private", 0x7000, 64 << 10, ""),
             (552 << 10, "heaps", 0x2000, 1 << 20, "(a later segment of the heap at 0x8000)"),
-            (128 << 10, "private", 0x3000, 2 << 20, "(25 TEBs)"), (4 << 10, "mapped", 0x4000, 4 << 10, "")]
+            (128 << 10, "private", 0x3000, 2 << 20, "(25 TEBs)"), (4 << 10, "mapped", 0x4000, 4 << 10, ""),
+            (5632 << 10, "image", 0x140000000, 24 << 20, "C:\\x\\firecracker.exe")]
     assert growth_lines(one, many, 15) == [
         "heaps of 1024 KiB (a later segment of the heap at N): 1 with 96 KiB resident, then 1 with 552 KiB: "
         "each vCPU adds 0.00 allocations and 30.4 KiB",
         "private of 2048 KiB (N TEBs): 1 with 8 KiB resident, then 1 with 128 KiB: each vCPU adds 0.00 allocations and 8.0 KiB",
         "private of 64 KiB: 1 with 40 KiB resident, then 2 with 56 KiB: each vCPU adds 0.07 allocations and 1.1 KiB",
     ], growth_lines(one, many, 15)
+    # The image is in neither the per-vCPU line nor a negative figure; its line gives each case.
+    zero = dict.fromkeys(COUNTED, 0)
+    results = {1: {**zero, "image code": 11616 << 10, "stacks": 100 << 10},
+               16: {**zero, "image code": 5632 << 10, "stacks": 880 << 10}}
+    assert per_vcpu_line(results, 1, 16) == "stacks 52.0, heaps 0.0, private 0.0, mapped 0.0", per_vcpu_line(results, 1, 16)
+    assert image_line(results).startswith(
+        "firecracker.exe resident in each case, KiB: 1 vCPUs: code 11616, private 0, rest 0; "
+        "16 vCPUs: code 5632, private 0, rest 0; "), image_line(results)
     # link.exe's map.
     text = (" firecracker\n\n Preferred load address is 0000000140000000\n\n"
             "  Address         Publics by Value              Rva+Base               Lib:Object\n\n"
@@ -1081,9 +1116,9 @@ def main(args):
         raise SystemExit("VMMMEM: a Firecracker did not start" if boot is None
                          else "VMMMEM: a guest did not boot to its shell")
     lo, hi = min(counts), max(counts)
+    print(f"VMMMEM{' boot' if boot else ''} {image_line(results)}")
     if hi > lo:
-        per = ", ".join(f"{k} {(results[hi][k] - results[lo][k]) / 1024 / (hi - lo):.1f}" for k in COUNTED)
-        print(f"VMMMEM{' boot' if boot else ''} each vCPU from {lo} to {hi} adds, KiB: {per}")
+        print(f"VMMMEM{' boot' if boot else ''} each vCPU from {lo} to {hi} adds, KiB: {per_vcpu_line(results, lo, hi)}")
         for line in growth_lines(ROWS[lo], ROWS[hi], hi - lo):
             print(f"VMMGROW{' boot' if boot else ''} from {lo} to {hi} vCPUs: {line}")
 
