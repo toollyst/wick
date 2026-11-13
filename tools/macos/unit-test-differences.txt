@@ -17,6 +17,21 @@
 # comment at test_pid_suspend_binding). CI's "Jailer unit tests" step runs
 # both as root, as does `sudo env RUST_TEST_THREADS=1 <jailer test binary>`.
 #
+# One thread, always: upstream runs its unit tests with RUST_TEST_THREADS=1
+# (tests/host_tools/cargo_build.py cargo_test), and the jailer's need it.
+# Its own tests::test_sanitize_process and tests::test_fds_close_range close
+# every descriptor of the process from 3 up, and the freezer's tests fork: in
+# a threaded run (a plain `cargo test -p jailer`) a test loses its
+# descriptors to the first two, and a fork made by another test's thread
+# keeps a file lock a test has just dropped. Measured on macOS 27.2, without
+# root: threaded, one run stayed at 0% CPU until it was killed and one
+# aborted ("IO Safety violation: owned file descriptor already closed");
+# threaded without those two tests, test_a_write_after_the_read_is_applied
+# found the lock still held ("Busy"); with one thread, 47 of 48 pass in 84 s
+# and the 48th, upstream's resource_limits::tests::test_set_resource_limits,
+# fails at raising the descriptor limit, which takes root. The product makes
+# its forks from one thread (the jailer has no other).
+#
 # Root only, among vmm's tests: two cases of
 # ext::sandbox::macos::tests::test_unfiltered_syscalls_are_limited_by_their_rule,
 # pid_suspend and pid_resume with their rule lifted (the cases that show the
