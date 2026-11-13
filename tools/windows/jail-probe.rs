@@ -26,6 +26,7 @@
 //!                               privileges:0 largepage:<MiB>
 //!                               link:<new name>|<existing file> files:<n>
 //!                               private:<MiB> sections:<MiB> filesections:<MiB>
+//!                               namedjob:<object name>
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
@@ -148,6 +149,7 @@ extern "system" {
     fn WriteConsoleInputW(h: HANDLE, recs: *const KEY_RECORD, n: u32, written: *mut u32) -> i32;
     fn WriteFile(h: HANDLE, buf: *const u8, n: u32, written: *mut u32, ov: *mut c_void) -> i32;
     fn QueryInformationJobObject(job: HANDLE, class: i32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+    fn CreateJobObjectW(sa: *const c_void, name: *const u16) -> HANDLE;
     fn GetProcessAffinityMask(p: HANDLE, mine: *mut usize, system: *mut usize) -> i32;
     fn GetProcessTimes(p: HANDLE, c: *mut u64, e: *mut u64, k: *mut u64, u: *mut u64) -> i32;
     fn GetLargePageMinimum() -> usize;
@@ -997,6 +999,22 @@ fn check(c: &str) -> String {
             let flags = basic[2] as u32;
             let affinity = if flags & 0x10 != 0 { format!("{:#x}", basic[6]) } else { "none".into() };
             format!("allowed affinity={affinity} cpu={:#x}:{}", cpu[0], cpu[1])
+        }
+        // Makes a Job Object of the name (`Local\wick-cgroup-<parent>` is a
+        // parent cgroup's, which a jail must not be able to pass off as the
+        // operator's): `allowed made` or `allowed opened`, the handle kept
+        // for as long as this process runs, or `denied`.
+        "namedjob" => {
+            // SAFETY: a NUL-terminated name; the last error read at once.
+            let (h, err) = unsafe {
+                let h = CreateJobObjectW(std::ptr::null(), wide(arg).as_ptr());
+                (h, GetLastError())
+            };
+            if h.is_null() {
+                return format!("denied {}", std::io::Error::from_raw_os_error(err as i32));
+            }
+            // 183: ERROR_ALREADY_EXISTS, the job was there and is opened.
+            format!("allowed {}", if err == 183 { "opened" } else { "made" })
         }
         // The processors this process may run on.
         "affinity" => {

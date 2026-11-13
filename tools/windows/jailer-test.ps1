@@ -6,9 +6,9 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
 #
-# `refuse`, `freeze`, `cpuset`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
+# `refuse`, `freeze`, `cpuset`, `parent`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
 # and reads it); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
 # Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
@@ -21,11 +21,12 @@
 # Needs the boot test's guest files in -Assets (vmlinux-6.1.188 and
 # ubuntu-24.04.squashfs; tools/windows/boot-test.ps1 downloads them) and
 # the probe: -Probe, else jail-probe.exe next to this script (CI's kit has
-# it), else rustc to build it from jail-probe.rs.
+# it), else rustc to build it from jail-probe.rs. `parent` needs
+# jail-parent.exe the same way (the kit's, else built from jail-parent.rs).
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'bindlink', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'parent', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'bindlink', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = ''
@@ -175,10 +176,11 @@ function Stage-Refuse {
         # A page size an x86_64 Linux has no hugetlb files for: refused at
         # the value that sets no limit too, as the write fails there.
         'hugetlb.64KB.max=max'           = @('--cgroup', 'hugetlb.64KB.max=max', '--cgroup-version', '2')
-        # A named parent cgroup, where upstream reads it: with --cgroup, and
-        # with cgroup v2 and no --cgroup.
-        '--parent-cgroup with --cgroup'  = @('--parent-cgroup', 'tenants', '--cgroup', 'memory.max=1073741824', '--cgroup-version', '2')
-        '--parent-cgroup alone, v2'      = @('--parent-cgroup', 'tenants', '--cgroup-version', '2')
+        # A parent cgroup of several levels (a job in a job in a job): not
+        # built, refused where upstream reads the parent: with --cgroup, and
+        # with cgroup v2 and no --cgroup. One level is the `parent` stage.
+        '--parent-cgroup a/b with --cgroup' = @('--parent-cgroup', 'tenants/a', '--cgroup', 'memory.max=1073741824', '--cgroup-version', '2')
+        '--parent-cgroup a/b alone, v2'     = @('--parent-cgroup', 'tenants/a', '--cgroup-version', '2')
     }
     # docs/PORTING.md row 8: each controller Windows has no counterpart for
     # is refused with the reason (the message says "refused on Windows: why").
@@ -210,9 +212,9 @@ function Stage-Refuse {
         if ($reasoned.Contains($k)) { Check ($r[1] -match 'is refused on Windows: \S') "${k}: refused without its reason: $($r[1])" }
         if ($k -eq 'hugetlb.64KB.max=max') { Check ($r[1].Contains('--cgroup hugetlb.64KB.max=max: an x86_64 Linux host has no hugetlb files for this page size')) "${k}: refused without its reason: $($r[1])" }
         if ($k -eq 'fsize') { Check ($r[1].Contains('--resource-limit fsize is not supported on Windows: Windows cannot limit the size of the files a process writes')) "${k}: refused without its reason: $($r[1])" }
-        if ($k -like '--parent-cgroup*') { Check ($r[1].Contains('--parent-cgroup is not supported on Windows: not done yet: a parent cgroup that bounds a group of jails')) "${k}: refused without its reason: $($r[1])" }
+        if ($k -like '--parent-cgroup*') { Check ($r[1].Contains('--parent-cgroup is not supported on Windows: not done yet: a parent cgroup of one name is a Job Object')) "${k}: refused without its reason: $($r[1])" }
     }
-    "--netns of a missing directory, fsize=, an unsupported cgroup file, a hugetlb page size Linux does not have, a named --parent-cgroup and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
+    "--netns of a missing directory, fsize=, an unsupported cgroup file, a hugetlb page size Linux does not have, a --parent-cgroup of several levels and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
 }
 
 Add-Type -Namespace WickJailerTest -Name Numa -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool GetNumaHighestNodeNumber(ref uint n);'
@@ -251,6 +253,114 @@ function Stage-Cpuset {
         $results += "$($case[1]) -> $want"
     }
     "the job's and the jailed process's affinity: $($results -join ', '); cpuset.mems=0-$nodes accepted"
+}
+
+# tools\windows\jail-parent.rs, as Get-Probe finds the probe.
+function Get-ParentTool {
+    if ($script:ParentTool) { return $script:ParentTool }
+    $kit = Join-Path $Here 'jail-parent.exe'
+    if (Test-Path $kit) {
+        $script:ParentTool = $kit
+        return $kit
+    }
+    $p = Join-Path $WorkDir 'jail-parent.exe'
+    $rustc = Get-Command rustc -ErrorAction SilentlyContinue
+    Check ($null -ne $rustc) 'needs rustc to build tools\windows\jail-parent.rs (or the kit, which has jail-parent.exe)'
+    & $rustc.Source --edition 2021 -O -o $p (Join-Path $Here 'jail-parent.rs') 2>&1 | Out-Host
+    Check (Test-Path $p) 'jail-parent.rs did not build'
+    $script:ParentTool = $p
+    $p
+}
+
+# docs/PORTING.md row 8: --parent-cgroup. A parent made with jail-parent,
+# 256 MiB and processor 0, and jails under it, each allowed 1 GiB of its own:
+# - the first commits 200 MiB and runs on processor 0 though it asked for 0
+#   and 1 (cgroup v2: the processors it has in common with its parent);
+# - the second, while the first holds its memory, is stopped short of 200
+#   MiB: the parent's limit bounds the two together;
+# - cgroup v1 refuses a jail that asks for processor 1 (not in its parent's);
+# - with the tool ended and the first jail still running, a jail that names
+#   the parent with cgroup v2 and no --cgroup joins it and is bounded by it:
+#   a jailer keeps the parent of its jail;
+# - a jailed process tries to make the job of a parent's name itself, for
+#   later jails to join a job of its own: either Windows refuses it, or a
+#   jailer that is then given that parent stops (the job is labelled below
+#   medium integrity) and starts no jail. Which of the two is printed.
+# Needs no guest.
+function Stage-Parent {
+    $base = New-Base 'parent'
+    $cpus = [Environment]::ProcessorCount
+    Check ($cpus -ge 2) "needs 2 processors, the host has $cpus"
+    $name = "wjt-$PID"
+    $probe = Get-Probe
+    $psi = New-Object Diagnostics.ProcessStartInfo((Get-ParentTool), "--name $name --cgroup memory.max=268435456 --cgroup cpuset.cpus=0")
+    $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
+    $holder = [Diagnostics.Process]::Start($psi)
+    $first = $null
+    $squat = $null
+    try {
+        $said = ''
+        while ($null -ne ($line = $holder.StandardOutput.ReadLine())) { $said += "$line; "; if ($line -match 'held until') { break } }
+        Check ($said -match "${name}: made" -and $said -match 'held until') "jail-parent did not make and hold the parent: $said"
+        $jail = @('--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--parent-cgroup', $name)
+        $own = @('--cgroup', 'memory.max=1073741824')
+
+        $out = Join-Path $base 'first.txt'
+        $line = "--id first --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" --parent-cgroup $name --cgroup-version 2 --cgroup memory.max=1073741824 --cgroup cpuset.cpus=0-1 -- private:200 affinity:0 wait:60"
+        $first = Start-Process $Jailer -ArgumentList $line -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+        $null = $first.Handle
+        $text = ''
+        $t = [DateTime]::Now.AddSeconds(30)
+        while ([DateTime]::Now -lt $t -and -not $first.HasExited -and $text -notmatch 'affinity:0 ') {
+            Start-Sleep -Milliseconds 200
+            $text = (Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join ''
+        }
+        Check ($text -match 'private:200 allowed 200') "the first jail's 200 MiB under a parent of 256: $text"
+        Check ($text -match 'affinity:0 allowed 0x1 of ') "the first jail asked for processors 0-1 under a parent on processor 0 (cgroup v2: processor 0): $text"
+
+        $r = Invoke-Jailer (@('--id', 'second') + $jail + @('--cgroup-version', '2') + $own + @('--', 'private:200')) 60000
+        Check ($r[1] -match 'private:200 denied after (\d+)' -and [int]$Matches[1] -le 60) "the second jail under the parent of 256 MiB, 200 held by the first: exit $($r[0]): $($r[1])"
+        $second = [int]$Matches[1]
+
+        $r = Invoke-Jailer (@('--id', 'v1') + $jail + @('--cgroup-version', '1', '--cgroup', 'cpuset.cpus=1', '--', 'affinity:0'))
+        Check ($r[0] -ne 0 -and $r[1].Contains("CPUs outside the parent cgroup's")) "cgroup v1, processor 1 under a parent on processor 0, was not refused: exit $($r[0]): $($r[1])"
+        Check ($r[1] -notmatch 'affinity:0 allowed') "cgroup v1, processor 1 under a parent on processor 0: the jail ran: $($r[1])"
+
+        $holder.StandardInput.Close()
+        Check ($holder.WaitForExit(10000)) 'jail-parent did not end with its standard input'
+        Check (-not $first.HasExited) "the first jail ended before the tool: $text"
+        $r = Invoke-Jailer (@('--id', 'joins') + $jail + @('--cgroup-version', '2', '--', 'private:200')) 60000
+        Check ($r[1] -match 'private:200 denied after (\d+)' -and [int]$Matches[1] -le 60) "with the tool ended and a jail left, a jail that joins the parent (v2, no --cgroup): exit $($r[0]): $($r[1])"
+        $joined = [int]$Matches[1]
+
+        $taken = "wjt-taken-$PID"
+        $sout = Join-Path $base 'squat.txt'
+        $line = "--id squat --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- namedjob:Local\wick-cgroup-$taken wait:30"
+        $squat = Start-Process $Jailer -ArgumentList $line -PassThru -NoNewWindow -RedirectStandardOutput $sout -RedirectStandardError "$sout.err"
+        $null = $squat.Handle
+        $stext = ''
+        $t = [DateTime]::Now.AddSeconds(30)
+        while ([DateTime]::Now -lt $t -and -not $squat.HasExited -and $stext -notmatch 'namedjob:\S+ (allowed|denied)') {
+            Start-Sleep -Milliseconds 200
+            $stext = (Get-Content $sout, "$sout.err" -Raw -ErrorAction SilentlyContinue) -join ''
+        }
+        Check ($stext -match 'namedjob:\S+ (allowed \w+|denied [^\r\n]*)') "a jailed process making a job of a parent's name said neither allowed nor denied: $stext"
+        $made = $Matches[1]
+        if ($made -like 'allowed*') {
+            foreach ($with in @(@('--cgroup', 'memory.max=1073741824'), @())) {
+                $r = Invoke-Jailer (@('--id', 'fooled', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--parent-cgroup', $taken, '--cgroup-version', '2') + $with + @('--', 'affinity:0'))
+                Check ($r[0] -ne 0 -and $r[1] -match 'below medium') "a jailer joined a parent's job that a jailed process made (--cgroup: $($with.Count -gt 0)): exit $($r[0]): $($r[1])"
+                Check ($r[1] -notmatch 'affinity:0 allowed') "a jail ran under a parent's job that a jailed process made: $($r[1])"
+            }
+            $made = "$made, and a jailer given that parent stopped (its job is below medium integrity)"
+        }
+        "a parent of 256 MiB on processor 0 (jail-parent): the first jail took 200 MiB and ran on processor 0 of the 0-1 it asked for; the second stopped after $second MiB; cgroup v1 refused processor 1; with the tool ended, a jail joining the parent stopped after $joined MiB; a jailed process making the job of a parent's name: $made"
+    } finally {
+        if (-not $holder.HasExited) { $holder.Kill() }
+        if ($first -and -not $first.HasExited) { $first.Kill() }
+        if ($squat -and -not $squat.HasExited) { $squat.Kill() }
+        Get-Process jail-probe -ErrorAction SilentlyContinue | Stop-Process -Force
+    }
 }
 
 # docs/PORTING.md row 8: cpu.weight is the job's CPU weight. Two jailed

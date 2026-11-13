@@ -690,6 +690,11 @@ jobs:
       - name: Build the probes
         run: |
           rustc --edition 2021 -O -o tools/windows/jail-probe.exe tools/windows/jail-probe.rs
+          # The operator's tool for a parent cgroup, and its own tests (how
+          # it reads its arguments), which need nothing of the host.
+          rustc --edition 2021 -O -o tools/windows/jail-parent.exe tools/windows/jail-parent.rs
+          rustc --edition 2021 --test -o "$RUNNER_TEMP/jail-parent-test.exe" tools/windows/jail-parent.rs
+          "$RUNNER_TEMP/jail-parent-test.exe"
           rustc --edition 2021 -O -o tools/windows/memory-partition-probe.exe tools/windows/memory-partition-probe.rs
       # Firecracker's gdb stub (upstream's test_gdb builds it), for
       # boot-test.ps1 gdb on a WHP machine. Built right before the kit's
@@ -725,6 +730,7 @@ jobs:
             tools/windows/boot-test.ps1
             tools/windows/jailer-test.ps1
             tools/windows/jail-probe.exe
+            tools/windows/jail-parent.exe
             tools/windows/job-freeze-probe.ps1
             tools/windows/memory-partition-probe.exe
             tools/windows/vmm-memory-record.py
@@ -851,8 +857,21 @@ jobs:
           # With them, the hugetlb page sizes test for its HUGETLBTEST line:
           # whether this runner's processor has 1 GiB pages, which decides
           # which of the test's two 1GB halves ran.
+          # Then --parent-cgroup itself (platform::parent), each test alone
+          # as it makes named jobs and processes: a parent's memory limit
+          # bounds two jails together; a jailer's handle keeps the parent
+          # and its limit when the tool is gone; a jail's processors and CPU
+          # rate under a parent are Linux's by cgroup version (v1 refuses
+          # what is outside the parent's, v2 takes what is common), nothing
+          # narrowed without a word; a job of the parent's name labelled
+          # below medium integrity, as a jailed process's would be, is not
+          # joined. They assert the jailer's rules and print what Windows
+          # answered (PARENTTEST lines).
           for t in test_a_jails_job_under_a_parent_job_on_record test_nested_jobs_on_record \
-              test_hugetlb_page_sizes_are_linuxs; do
+              test_hugetlb_page_sizes_are_linuxs \
+              test_a_parent_bounds_its_jails_together test_a_parent_lasts_while_a_jail_holds_it \
+              test_a_jail_under_a_parent_has_linuxs_cpus_and_rate \
+              test_a_parent_made_below_medium_integrity_is_refused; do
             out=$(cargo test --locked -p jailer -- \
               --include-ignored --nocapture --test-threads=1 "$t" 2>&1) || true
             printf '%s\n' "$out"

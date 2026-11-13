@@ -145,10 +145,12 @@ use windows_sys::Win32::System::Threading::{
     UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
+pub(crate) mod cgroup_values;
 mod console;
 mod freezer;
 mod large_pages;
 mod netns;
+pub(crate) mod parent;
 
 pub(crate) use super::freezer_values::{State as FreezerState, Version as FreezerVersion, parse_start as parse_freezer_start};
 
@@ -279,6 +281,8 @@ pub enum HostError {
     ImpossibleCgroup(String, &'static str),
     #[error("--cgroup {0}: {1}")]
     CgroupValue(String, &'static str),
+    #[error("--parent-cgroup {0:?}: {1}")]
+    Parent(String, String),
     #[error(
         "--resource-limit {0} is not supported on Windows: {1}. The jailer never accepts a limit \
          it cannot enforce."
@@ -2106,7 +2110,8 @@ struct Spawned {
 }
 
 /// Starts `exe` suspended as a process of the jail: on the lockdown token,
-/// in `job`, with the initial token on its main thread, `vars` as its whole
+/// in the parent cgroup's job, if the jail has one, and in `job`
+/// (`parent::enter`), with the initial token on its main thread, `vars` as its whole
 /// environment, `std_handles` as its standard handles and `inherit` (which
 /// holds them) as the only handles it inherits, and `cwd` as its current
 /// directory. A step that fails after the creation ends the process.
@@ -2119,6 +2124,7 @@ fn spawn_jailed(
     inherit: &[HANDLE],
     cwd: &str,
     tokens: &Tokens,
+    parent: Option<&parent::Parent>,
     job: &OwnedHandle,
 ) -> Result<Spawned, HostError> {
     let mut cmd: Vec<u16> = wide(cmd);
@@ -2205,9 +2211,8 @@ fn spawn_jailed(
         unsafe { TerminateProcess(process.as_raw_handle(), 1) };
         HostError::Spawn(what, err)
     };
-    // SAFETY: handles we own.
-    if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) } == 0 {
-        return Err(kill("AssignProcessToJobObject", last_error()));
+    if let Err((step, err)) = parent::enter(parent, job, process.as_raw_handle()) {
+        return Err(kill(step, err));
     }
     let mut thread_h = thread.as_raw_handle();
     // SAFETY: the child's main thread and the impersonation token.
@@ -2279,6 +2284,13 @@ fn exec(
     let mut freezer = freezer::Freezer::for_exec(jail.root.parent().unwrap_or(jail.root.as_path())).map_err(HostError::Freezer)?;
 
     let tokens = tokens()?;
+    // The parent cgroup, if the jail has one: held until the jailer ends,
+    // with its jail, and the jail's limits as its job under it takes them.
+    let parent = parent::for_jail()?;
+    let limits = match &parent {
+        Some(parent) => parent.limits(&limits)?,
+        None => limits,
+    };
     let job = job(&limits)?;
     let mut job_freeze = freezer::Job(job.as_raw_handle());
 
@@ -2307,7 +2319,7 @@ fn exec(
         Some(path) => {
             let mut api_vars = vars.clone();
             api_vars.push(format!("{API_LINK_ENV}={path}"));
-            Some(spawn_jailed(&exe, &cmd, &api_vars, std_handles, &handles, &drive_root, &tokens, &job)?)
+            Some(spawn_jailed(&exe, &cmd, &api_vars, std_handles, &handles, &drive_root, &tokens, parent.as_ref(), &job)?)
         }
         None => None,
     };
@@ -2358,7 +2370,7 @@ fn exec(
         fc_vars.push(format!("{}={}", large_pages::ENV, b.child_value()));
         fc_handles.extend(b.child_handles());
     }
-    let fc = match spawn_jailed(&exe, &cmd, &fc_vars, std_handles, &fc_handles, &drive_root, &tokens, &job) {
+    let fc = match spawn_jailed(&exe, &cmd, &fc_vars, std_handles, &fc_handles, &drive_root, &tokens, parent.as_ref(), &job) {
         Ok(fc) => fc,
         Err(err) => {
             if let Some(api) = api_handle {
@@ -2452,6 +2464,8 @@ fn exec(
     terminal.finish();
     unmap_drive(jail);
     drop(job);
+    // The jail is gone: its hold on the parent cgroup's job ends here.
+    drop(parent);
     freezer.emptied();
     std::process::exit(code.cast_signed());
 }
@@ -3032,8 +3046,8 @@ mod tests {
 
     /// A suspended process of this user's (cmd.exe, never resumed) for a job
     /// to hold; ended when dropped.
-    struct Held {
-        process: OwnedHandle,
+    pub(super) struct Held {
+        pub(super) process: OwnedHandle,
         _thread: OwnedHandle,
     }
 
@@ -3044,7 +3058,7 @@ mod tests {
         }
     }
 
-    fn held_process() -> Held {
+    pub(super) fn held_process() -> Held {
         use windows_sys::Win32::System::Threading::{CreateProcessW, STARTUPINFOW};
         let exe = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("cmd.exe");
         let mut cmd = wide("cmd.exe");
@@ -3105,7 +3119,7 @@ mod tests {
     }
 
     /// Sets a job information class; the Windows error code when refused.
-    fn set_job<T>(job: &OwnedHandle, class: i32, info: &T) -> Result<(), i32> {
+    pub(super) fn set_job<T>(job: &OwnedHandle, class: i32, info: &T) -> Result<(), i32> {
         // SAFETY: a structure of the size passed, for this class.
         let ok = unsafe {
             SetInformationJobObject(
@@ -3118,8 +3132,8 @@ mod tests {
         if ok == 0 { Err(last_error().raw_os_error().unwrap_or(0)) } else { Ok(()) }
     }
 
-    /// On record, for the design of `--parent-cgroup` (refused meanwhile:
-    /// cgroup.rs, `PARENT_NOT_DONE`): whether a process in a job, as a jail
+    /// On record, what `--parent-cgroup` (`parent`) stands on: whether a
+    /// process in a job, as a jail
     /// under a parent job would be, joins the job the jailer makes for a
     /// jail, which sets UI limits. Microsoft Learn says it does not: "the
     /// jobs are nested by default if the system can form a valid job

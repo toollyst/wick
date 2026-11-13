@@ -7,8 +7,12 @@
 - `jailer-test.ps1`: the jailer on WHP hardware, the counterpart of
   `tools/macos/jailer-test.py`. Stages without a guest: `refuse` (what
   Windows cannot enforce is refused, each cgroup controller and resource
-  limit with its reason, and a named `--parent-cgroup`, which the jailer
-  does not do yet), `freeze` (upstream's freezer files next to the
+  limit with its reason, and a `--parent-cgroup` of several levels, which
+  the jailer does not do yet), `parent` (`--parent-cgroup`: a parent made
+  and limited with `jail-parent.exe` bounds two jails' memory together, a
+  jail's processors under it are Linux's by cgroup version, a jailer keeps
+  its jail's parent when the tool has ended, and a job of a parent's name
+  that a jailed process made is not joined), `freeze` (upstream's freezer files next to the
   jail: a jail frozen and thawed through `freezer.state` and through
   `cgroup.freeze` and `cgroup.events`, invalid values restored, the jail
   unable to write its control file, the jailer's death ending a frozen jail,
@@ -63,6 +67,21 @@
   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir C:\wjt
   ```
 
+- `jail-parent.rs` (`jail-parent.exe` in CI's artifact): the operator's tool
+  for a parent cgroup, what `mkdir` and `echo` into the parent's directory
+  are on Linux. The jailer's `--parent-cgroup <name>` is the Job Object
+  `Local\wick-cgroup-<name>`; the tool makes it, writes the limits named
+  (`memory.max`, `cpu.max`, `cpuset.cpus`, or their cgroup v1 names with
+  `--cgroup-version 1`) and holds it until its standard input ends, or for
+  ever with `--forever`. Each jailer holds its jail's parent too, so a
+  parent lasts while the tool or a jail of it runs. Run it in the session
+  and as the account the jailers run in:
+
+  ```
+  tools\windows\jail-parent.exe --name tenants --cgroup memory.max=4294967296 --cgroup cpuset.cpus=0-3 --forever
+  jailer.exe --id a --exec-file firecracker.exe --uid 0 --gid 0 --parent-cgroup tenants --cgroup memory.max=1073741824 ...
+  ```
+
 - `vmm-memory-record.py`: what Firecracker's own memory besides its guest's
   is made of (its image's code and written pages, thread stacks, heaps, other
   private memory, sections), counted as the integration tests' memory monitor
@@ -112,7 +131,7 @@ CI builds the binaries on every push and uploads them as the artifact
 feature, for the `gdb` stage),
 `lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe` (the
 vhost-user test backend), `winprobe.exe`, and in `tools/windows/`
-`boot-test.ps1`, `jailer-test.ps1` with `jail-probe.exe` built,
+`boot-test.ps1`, `jailer-test.ps1` with `jail-probe.exe` and `jail-parent.exe` built,
 `job-freeze-probe.ps1`, `memory-partition-probe.exe`, `vmm-memory-record.py` and this file, at those
 paths. The kit needs no Rust.
 

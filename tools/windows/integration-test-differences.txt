@@ -96,12 +96,13 @@ impossible integration_tests/security/test_jail.py::test_cgroupsv2_written_only_
 # the jail's cgroup files below it (check_cgroups_v1, check_cgroups_v2).
 # Windows has no cgroup file system, so they cannot pass there whatever the
 # jailer does with a parent: that is what "impossible" says of them. What a
-# parent cgroup is for, one limit over a group of jails, is not impossible on
-# Windows (a Job Object that holds the jails' jobs) and is not done yet: the
-# jailer refuses a --parent-cgroup named on its command line, as the tests
-# name one, rather than accept it without effect
-# (overlay/jailer/platform/windows/cgroup.rs, PARENT_NOT_DONE;
-# docs/COMPATIBILITY.md, `--parent-cgroup`).
+# parent cgroup is for, one limit over a group of jails, is a named Job
+# Object that holds the jails' jobs, which the operator limits with
+# tools/windows/jail-parent.rs where the tests write the directory's files
+# (overlay/jailer/platform/windows/parent.rs; docs/COMPATIBILITY.md,
+# `--parent-cgroup`; `jailer-test.ps1 parent`). The first of the two names a
+# parent of several levels (custom_cgroup/group2), which the jailer refuses,
+# not done yet.
 impossible integration_tests/security/test_jail.py::test_cgroups_custom_parent
 impossible integration_tests/security/test_jail.py::test_cgroups_parent_cgroup_but_no_cgroup
 

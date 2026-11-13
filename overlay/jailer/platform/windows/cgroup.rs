@@ -29,13 +29,12 @@
 //! NUMA memory binding (`cpuset.mems` short of every node), exclusive CPUs
 //! and the rest. Every other property is refused too, never accepted
 //! without effect. Windows has no cgroup hierarchy, so the v2 hierarchy is a
-//! path that does not exist: there is no parent cgroup to join. A
-//! `--parent-cgroup` the operator names is refused ([`refuse_named_parent`]):
-//! on Linux it bounds a group of jails together, which on Windows is a job
-//! that holds the jails' jobs, and the jailer makes and joins none yet
-//! ([`PARENT_NOT_DONE`]). Upstream's default parent, the exec file's name, is
-//! accepted and places nothing, as on Linux when no such parent was made
-//! beforehand.
+//! path that does not exist, and upstream's own look for the parent's
+//! directory there finds none. The parent cgroup is a named Job Object that
+//! holds the jails' jobs (`platform::parent`): what the command line says of
+//! it is kept where upstream makes this builder, which is where upstream
+//! reads the parent (with `--cgroup`, and with `--cgroup-version 2` and no
+//! `--cgroup`), and the jail's processes are put in it when they start.
 //!
 //! The freezer is upstream's files next to the jail, kept by the jailer
 //! (`platform::freezer`); as on Linux, `freezer.state=FROZEN|THAWED` is the
@@ -46,61 +45,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::JailerError;
+use crate::platform::cgroup_values::{DEFAULT_PERIOD_US, cpu_groups, cpu_rate, parse_list, strstrip};
 use crate::platform::{self, FreezerState, FreezerVersion, HostError, Limits};
-
-/// Why a `--parent-cgroup` on the command line is refused. It opens and
-/// ends as macOS's text does, so the two hosts refuse alike; the middle is
-/// Windows's.
-///
-/// On Linux the jail's cgroup is `<base>/<parent>/<id>` (upstream's
-/// cgroup.rs, `CgroupV1::new`, `CgroupV2::new`), and the parent's own limits,
-/// which the operator sets, bound every jail under it together. On Windows
-/// that is a Job Object that holds the jails' jobs: a process in a job can
-/// be put in a second job, nested in the first, whose limits then bound it
-/// too (Microsoft Learn, "Nested Jobs"). The same page says "the jobs are
-/// nested by default if the system can form a valid job hierarchy and
-/// neither job sets UI limits", and `AssignProcessToJobObject` that a
-/// process already in a job joins only a job that "cannot have UI limits
-/// set", which every jail's job does (`platform::job`). Windows Server 2025
-/// (build 26100) nests a jail's job under a parent all the same, and bounds
-/// two jobs by their parent's memory limit together
-/// (`test_a_jails_job_under_a_parent_job_on_record`,
-/// `test_nested_jobs_on_record`: CI run 43359525691); Windows 10, 11 and
-/// Server 2022 are not measured. The parent job itself (who makes it and
-/// keeps it: a job's name does not outlive its handles) is designed and not
-/// built, so no parent job is made or joined, and the flag is refused
-/// rather than accepted without effect.
-pub(crate) const PARENT_NOT_DONE: &str = "not done yet: a parent cgroup that bounds a group of \
-    jails is on Windows a Job Object that holds the jails' jobs, which the jailer does not make or \
-    join yet; leave --parent-cgroup out, and each jail's own --cgroup limits still apply";
-
-/// Refuses a `--parent-cgroup` named on the jailer's command line (`args`,
-/// the program first; Firecracker's arguments, after `--`, are not the
-/// jailer's). Upstream reads the parent only where the builder is made: with
-/// `--cgroup`, or with `--cgroup-version 2` and no `--cgroup` (env.rs), so
-/// this runs there; with v1 and no `--cgroup` upstream ignores the parent,
-/// and so does Windows. The flag cannot be refused by its value: upstream
-/// defaults it to the exec file's name, so every start has one, and the
-/// default is accepted. No value can be `--parent-cgroup`: upstream's parser
-/// takes no value that starts with `--`. The same rule as macOS's
-/// (overlay/jailer/platform/macos/cgroup.rs).
-fn refuse_named_parent<S: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = S>) -> Result<(), JailerError> {
-    let named = args
-        .into_iter()
-        .map(|a| a.as_ref().to_os_string())
-        .skip(1)
-        .take_while(|a| a != "--")
-        .any(|a| a == "--parent-cgroup");
-    if named {
-        return Err(HostError::Unsupported("parent-cgroup", PARENT_NOT_DONE).into());
-    }
-    Ok(())
-}
 
 /// The (absent) cgroup v2 hierarchy on Windows.
 const NO_HIERARCHY: &str = r"\\?\GLOBALROOT\wick-no-cgroup-hierarchy";
-/// The default CFS period, as Linux's.
-const DEFAULT_PERIOD_US: u64 = 100_000;
 
 #[derive(Debug)]
 pub struct CgroupConfigurationBuilder {
@@ -116,9 +65,11 @@ pub struct CgroupConfigurationBuilder {
 
 impl CgroupConfigurationBuilder {
     pub fn new(ver: u8, _proc_mounts_path: &str) -> Result<Self, JailerError> {
-        refuse_named_parent(std::env::args_os())?;
         match ver {
             1 | 2 => {
+                // Upstream makes a builder exactly where it reads the
+                // parent cgroup (env.rs): the parent is read here too.
+                platform::parent::set_plan(ver)?;
                 platform::set_cgroup_version(if ver == 1 { FreezerVersion::V1 } else { FreezerVersion::V2 });
                 Ok(CgroupConfigurationBuilder {
                     version: ver,
@@ -350,14 +301,6 @@ fn host_gb_pages() -> bool {
     std::arch::x86_64::__cpuid(0x8000_0000).eax >= leaf && std::arch::x86_64::__cpuid(leaf).edx & (1 << 26) != 0
 }
 
-/// A value as Linux's cgroup files take it: they strip the white space
-/// around what is written before they parse it (`strstrip`, lib/string.c,
-/// in each write handler named at [`no_limit`]; the kernel's `isspace` is
-/// the C locale's, U+00A0 besides, which no value here holds).
-fn strstrip(value: &str) -> &str {
-    value.trim_matches(|c| matches!(c, ' ' | '\t'..='\r'))
-}
-
 /// Whether `file` = `value` is one of Linux's limit files at the value that
 /// sets no limit, the file's default, which the jailer accepts although the
 /// host has no such limit: there is nothing to enforce. From Linux v6.1,
@@ -496,58 +439,6 @@ pub(crate) fn cpu_weight(share: f64) -> Result<u32, &'static str> {
     Ok(u32::try_from(i).unwrap() + 1)
 }
 
-/// The numbers of a cpuset list (`0-3,8,10-11`), sorted, without repeats.
-fn parse_list(list: &str) -> Result<Vec<u32>, &'static str> {
-    let mut out = Vec::new();
-    for part in list.trim().split(',') {
-        let part = part.trim();
-        let (lo, hi) = match part.split_once('-') {
-            Some((a, b)) => (a.trim(), b.trim()),
-            None => (part, part),
-        };
-        let lo: u32 = lo.parse().map_err(|_| "not a list such as 0-3,8")?;
-        let hi: u32 = hi.parse().map_err(|_| "not a list such as 0-3,8")?;
-        if lo > hi {
-            return Err("a range that ends below its start");
-        }
-        if hi - lo > 4096 {
-            return Err("a range of more than 4096");
-        }
-        out.extend(lo..=hi);
-    }
-    out.sort_unstable();
-    out.dedup();
-    Ok(out)
-}
-
-/// The processors `cpus` (numbered across the host's processor groups in
-/// order, as Windows lists logical processors) as an affinity mask per
-/// group: `(group, mask)` for each group with one of them. `group_sizes`
-/// holds the active processors of each group.
-pub(crate) fn cpu_groups(cpus: &[u32], group_sizes: &[u32]) -> Result<Vec<(u16, u64)>, &'static str> {
-    let mut out: Vec<(u16, u64)> = Vec::new();
-    for &cpu in cpus {
-        let mut first = 0u32;
-        let mut found = None;
-        for (g, &size) in group_sizes.iter().enumerate() {
-            if cpu < first + size {
-                found = Some((u16::try_from(g).unwrap(), cpu - first));
-                break;
-            }
-            first += size;
-        }
-        let (group, bit) = found.ok_or("a CPU this host does not have")?;
-        match out.iter_mut().find(|(g, _)| *g == group) {
-            Some((_, mask)) => *mask |= 1 << bit,
-            None => out.push((group, 1 << bit)),
-        }
-    }
-    if out.is_empty() {
-        return Err("no CPUs");
-    }
-    Ok(out)
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MemsError {
     NoSuchNode,
@@ -590,20 +481,6 @@ fn host_highest_node() -> u32 {
         return 0;
     }
     highest
-}
-
-/// The job CPU rate (hundredths of a percent of all `cpus`) for a cgroup
-/// quota of `quota` microseconds per `period`: `quota / period` CPUs. Rounded
-/// down, so the cap is at or below the one asked for.
-fn cpu_rate(quota: u64, period: u64, cpus: u64) -> Result<u32, &'static str> {
-    if period == 0 {
-        return Err("a period of 0");
-    }
-    let rate = u128::from(quota) * 10_000 / (u128::from(period) * u128::from(cpus.max(1)));
-    if rate == 0 {
-        return Err("below the 0.01% of the host's CPUs a job can be capped at");
-    }
-    Ok(u32::try_from(rate.min(10_000)).unwrap())
 }
 
 #[cfg(test)]
@@ -1037,29 +914,14 @@ mod tests {
         }
     }
 
-    // A parent the operator names is refused, with the reason; the default
-    // parent (none named) is accepted; a `--parent-cgroup` among
-    // Firecracker's arguments is not the jailer's. The same cases as macOS's
-    // test of this name.
+    // The builder, as upstream makes it, takes a command line without a
+    // parent (this test binary's) and keeps no plan for one; what a
+    // command line says of the parent is `platform::parent`'s tests.
     #[test]
-    fn test_parent_cgroup_is_refused() {
-        let jailer = ["jailer", "--id", "a", "--cgroup-version", "2"];
-        let with = |extra: &[&'static str]| refuse_named_parent(jailer.iter().chain(extra));
-        match with(&["--parent-cgroup", "tenants"]) {
-            Err(JailerError::Host(HostError::Unsupported("parent-cgroup", why))) => assert_eq!(why, PARENT_NOT_DONE),
-            other => panic!("{other:?}"),
-        }
-        // The default's own value, named, is refused too: naming it is the
-        // operator's intent.
-        let text = with(&["--cgroup", "memory.max=1G", "--parent-cgroup", "firecracker"]).unwrap_err().to_string();
-        assert!(text.starts_with("--parent-cgroup is not supported on Windows: not done yet: a parent cgroup that bounds"), "{text}");
-        assert!(text.contains("leave --parent-cgroup out, and each jail's own --cgroup limits still apply"), "{text}");
-        with(&[]).unwrap();
-        with(&["--cgroup", "memory.max=1G"]).unwrap();
-        with(&["--", "--parent-cgroup", "x"]).unwrap();
-        // The builder itself, as upstream makes it (this test binary's
-        // arguments name no parent).
+    fn test_the_builder_reads_the_parent_cgroup() {
         CgroupConfigurationBuilder::new(2, "").unwrap();
+        CgroupConfigurationBuilder::new(1, "").unwrap();
+        assert!(crate::platform::parent::for_jail().unwrap().is_none());
     }
 
     #[test]
