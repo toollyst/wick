@@ -16,8 +16,8 @@
 > **macOS works end to end; Windows is a preview.** On Apple silicon, wick boots upstream's own CI guests and passes
 > scenario tests for SMP, block, vsock, networking, snapshots, userfaultfd, PCI and vhost-user. On Windows it boots
 > the same guests on the Windows Hypervisor Platform and passes the same scenario tests, so far on one Windows 11 PC
-> and on CI's Windows Server 2025 runner with an AMD EPYC 7763 (CI run 43442912128; [docs/PORTING.md](docs/PORTING.md)
-> lists each stage). Upstream's jailer runs on both with native backends
+> and on CI's Windows Server 2025 runner with an AMD EPYC 7763 (CI run 43492153393, all 20 default stages of
+> `boot-test.ps1`; [docs/PORTING.md](docs/PORTING.md) lists each stage). Upstream's jailer runs on both with native backends
 > (on Windows: the jail as a drive and a restricted token, the Job Object, the mitigation profile); its parts that
 > need no guest are tested in CI, the rest on a Mac and, for Windows, in CI's windows-guest job and on a WHP PC. Read [SECURITY.md](SECURITY.md) before
 > running untrusted multi-tenant workloads on either.
@@ -61,7 +61,7 @@ wick removes that limit without forking Firecracker in the usual sense:
 | --- | --- | --- | --- |
 | Linux x86_64, aarch64 | KVM | x86_64, aarch64 | **Upstream Firecracker** from the same source: the compatibility crates re-export the original crates, and the Linux backends are upstream's code. CI runs upstream's unit and integration tests on plain upstream and on wick, on the same machine, and requires the same result test by test |
 | macOS 15+ on Apple silicon | Hypervisor.framework | aarch64 | **Works.** Checked end to end against upstream's CI guest by [`tools/macos/boot-test.sh`](tools/macos/boot-test.sh) on macOS 27; on 15 and 26, CI runs the sandbox's tests, and on 26 also every crate's unit tests that make no VM, the jailer's unit tests as root and its scenario stages that start no VM (GitHub's macOS runners cannot boot a guest) |
-| Windows 10 (1803+) and 11, x86_64 | Windows Hypervisor Platform | x86_64 | **Preview.** The boot test's stages (all but the newest: [M3](docs/ROADMAP.md#m3-windows-first-boot-on-real-hardware)) and upstream's integration suites run on one Windows 11 PC; the boot and jailer tests' guest stages also run in CI's windows-guest job, on a runner whose WHP is nested (CI run 43442912128, AMD EPYC 7763; on other runner models guests have not reached init: [Host CPU](docs/COMPATIBILITY.md#host-requirements)) |
+| Windows 10 (1803+) and 11, x86_64 | Windows Hypervisor Platform | x86_64 | **Preview.** The boot test's stages (all but the newest: [M3](docs/ROADMAP.md#m3-windows-first-boot-on-real-hardware)) and upstream's integration suites run on one Windows 11 PC; the boot and jailer tests' guest stages also run in CI's windows-guest job, on a runner whose WHP is nested (CI runs 43442912128 and 43492153393, AMD EPYC 7763; on other runner models guests have not reached init: [Host CPU](docs/COMPATIBILITY.md#host-requirements)) |
 
 ### What works on macOS
 
