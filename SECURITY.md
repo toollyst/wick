@@ -233,8 +233,11 @@ upstream Firecracker and its jailer.
   files, a snapshot's state and memory files, the kernel, the initrd and a seccomp filter file
   (`test_a_pipe_opened_by_path_gives_its_maker_no_identity`, `test_a_pipe_opened_again_gives_its_maker_no_identity`:
   a pipe's server calls `ImpersonateNamedPipeClient` on such an open and gets a refusal or an anonymous token, where
-  an open without the flag, the control, gives it the impersonation level; CI run 43372137748, Windows Server
-  2025, where both passed; which of the two answers Windows gave is not in that run's log). For a file the
+  an open without the flag, the control, gives it the impersonation level; CI runs 43372137748 and 43377614564,
+  Windows Server 2025. Windows's answer there, from the tests' SQOSTEST lines of the second run: the control
+  gives the pipe's maker a token at the impersonation level (2), and Firecracker's open leaves it with error 1347,
+  `ERROR_CANT_OPEN_ANONYMOUS`, "Cannot open an anonymous level security token": it holds an anonymous token
+  that it cannot so much as open, for the first open of a path and for a pipe opened again alike). For a file the
   same bit is `FILE_FLAG_OPEN_NO_RECALL`: a file of remote storage is read where it is, not brought back to the
   disk. What is not at parity: when a pipe's reader has gone, Firecracker gives what it kept to a new pipe of the
   name only if that pipe has the first pipe's owner, and an owner is an account. Two processes of one account are
