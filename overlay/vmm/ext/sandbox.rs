@@ -3280,12 +3280,59 @@ mod macos {
         /// Runs `ending_child` with `case`, "<who>-<how>": the thread
         /// `who` (`first`, the process's first thread; `other`, one it
         /// made; `none`, as `other` with no denied call) makes a denied
-        /// call and at once ends the process `how`.
+        /// call and at once ends the process `how`. `diagother` and
+        /// `diagfirst` are `none` with [`diagnose_sigsys`] in place of the
+        /// sandbox's handler, SIGSYS blocked on the first thread (and the
+        /// sandbox's own, made by it) or on the other.
         fn ending(case: &str) -> std::process::Output {
             child("ending_child", &[("WICK_TEST_CASE", case)])
         }
 
         const HOWS: [&str; 5] = ["abort", "panic", "fault", "exit", "trap"];
+
+        /// A failed case's output, with what Seatbelt reported for its
+        /// process (the fork, whose pid is the case's `CHILD-PID` line): the
+        /// kernel logs each call it denies by its number or name
+        /// ("deny(1) syscall-unix 39"), which the signal does not carry.
+        /// Read from the log store here, since a CI step that reads it
+        /// after all the tests has thousands of other tests' lines. Not
+        /// every denied call has a line: the kernel leaves out a report it
+        /// takes for a duplicate (ten test processes that each had
+        /// getppid denied left two lines, macOS 27.2), so no line is not
+        /// no denied call; `diagnose_sigsys` is what names the call.
+        fn text_and_denials(out: &std::process::Output) -> String {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let Some(pid) = stdout.lines().find_map(|l| l.strip_prefix("CHILD-PID ")) else {
+                return format!("{}
+--- Seatbelt's reports: no CHILD-PID line", text(out));
+            };
+            let predicate = format!("sender == \"Sandbox\" AND eventMessage CONTAINS \"({pid}) \"");
+            // A report reaches the store after the call it is for: read
+            // until one is there, 10 s at most (a case with no denied call
+            // has none).
+            let start = std::time::Instant::now();
+            let reports = loop {
+                let log = Command::new("/usr/bin/log")
+                    .args(["show", "--last", "5m", "--style", "compact", "--predicate", &predicate])
+                    .output();
+                let lines = match &log {
+                    Ok(log) => String::from_utf8_lossy(&log.stdout)
+                        .lines()
+                        .filter(|l| l.contains("Sandbox: "))
+                        .map(|l| format!("{l}\n"))
+                        .collect::<String>(),
+                    Err(e) => break format!("/usr/bin/log: {e}"),
+                };
+                if !lines.is_empty() {
+                    break lines;
+                }
+                if start.elapsed() > std::time::Duration::from_secs(10) {
+                    break "none in 10 s".to_owned();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            };
+            format!("{}\n--- Seatbelt's reports for process {pid}\n{reports}", text(out))
+        }
 
         // The thread whose call the sandbox denied runs on with the call
         // failed, and what it does next would end Firecracker before the
@@ -3298,29 +3345,38 @@ mod macos {
         // each.)
         #[test]
         fn test_a_denied_calls_thread_cannot_end_firecracker_another_way() {
+            // Every case runs, and each one that fails is reported.
+            let mut failed = Vec::new();
             for who in ["first", "other"] {
                 for how in HOWS {
                     let case = format!("{who}-{how}");
                     let out = ending(&case);
-                    assert_eq!(
-                        out.status.code(),
-                        Some(crate::FcExitCode::BadSyscall as i32),
-                        "{case}: {}",
-                        text(&out)
-                    );
                     let stdout = String::from_utf8_lossy(&out.stdout);
-                    assert!(stdout.contains("the host sandbox denied a system call"), "{case}: {}", text(&out));
-                    assert!(stdout.contains(FAULT_METRIC), "{case}: {}", text(&out));
+                    let mut wrong = Vec::new();
+                    if out.status.code() != Some(crate::FcExitCode::BadSyscall as i32) {
+                        wrong.push("not exit 148".to_owned());
+                    }
+                    for needed in ["the host sandbox denied a system call", FAULT_METRIC] {
+                        if !stdout.contains(needed) {
+                            wrong.push(format!("no {needed:?}"));
+                        }
+                    }
                     for other in [
                         "Firecracker panicked",
                         "intercepting signal 10",
                         "intercepting signal 11",
                         "\"panic_count\":1",
                     ] {
-                        assert!(!stdout.contains(other), "{case}: {other:?} in {}", text(&out));
+                        if stdout.contains(other) {
+                            wrong.push(format!("{other:?}"));
+                        }
+                    }
+                    if !wrong.is_empty() {
+                        failed.push(format!("{case}: {}: {}", wrong.join(", "), text_and_denials(&out)));
                     }
                 }
             }
+            assert!(failed.is_empty(), "{} of 10 cases:\n{}", failed.len(), failed.join("\n=====\n"));
         }
 
         // With no denied call each of those ends is what it was: the
@@ -3329,6 +3385,8 @@ mod macos {
         #[test]
         fn test_the_other_ends_are_unchanged_without_a_denied_call() {
             use std::os::unix::process::ExitStatusExt;
+            // Every case runs, and each one that fails is reported.
+            let mut failed = Vec::new();
             for how in HOWS {
                 let out = ending(&format!("none-{how}"));
                 let (code, signal) = (out.status.code(), out.status.signal());
@@ -3342,8 +3400,101 @@ mod macos {
                     "exit" => code == Some(7),
                     _ => signal == Some(libc::SIGTRAP),
                 };
-                assert!(ok, "{how}: {}", text(&out));
-                assert!(!stdout.contains(FAULT_METRIC), "{how}: {}", text(&out));
+                if !ok || stdout.contains(FAULT_METRIC) {
+                    // Which call was denied, and where: the case again with
+                    // SIGSYS taken by the thread that ends the process
+                    // (`diagother`) and by the first thread (`diagfirst`),
+                    // each printing the call it was in (`diagnose_sigsys`).
+                    let diagnosis: String = ["diagother", "diagfirst"]
+                        .iter()
+                        .map(|who| format!("\n--- {who}-{how}\n{}", text(&ending(&format!("{who}-{how}")))))
+                        .collect();
+                    failed.push(format!("{how}: {}{diagnosis}", text_and_denials(&out)));
+                }
+            }
+            assert!(failed.is_empty(), "{} of 5 cases:\n{}", failed.len(), failed.join("\n=====\n"));
+        }
+
+        /// A SIGSYS handler for a case that should have had no denied call:
+        /// prints the thread that took the signal and the call it was in,
+        /// and ends the process with 99. The signal is the process's, and
+        /// the kernel gives it to the first thread that does not block it,
+        /// so the case blocks it on the threads that are not looked at.
+        /// The thread's registers at the signal: x16 is the call's number
+        /// in libsystem's stubs (negative: a Mach trap), the instruction
+        /// before pc is `svc 0x80` if it was in a call, x0 and the carry
+        /// flag are the call's result (carry set: x0 is the errno; EINTR
+        /// for a wait the signal interrupted, which is not the denied
+        /// call). Then pc, lr and the stack's return addresses by symbol.
+        /// A diagnosis: it formats and symbolizes in a signal handler.
+        extern "C" fn diagnose_sigsys(_: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+            use std::fmt::Write as _;
+            struct Line([u8; 512], usize);
+            impl std::fmt::Write for Line {
+                fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                    let n = s.len().min(self.0.len() - self.1);
+                    self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+                    self.1 += n;
+                    Ok(())
+                }
+            }
+            // SAFETY: the handler's arguments, as the kernel passes them to
+            // an SA_SIGINFO handler on arm64; the instruction before pc is
+            // mapped text when pc is.
+            unsafe {
+                let state = &(*(*ctx.cast::<libc::ucontext_t>()).uc_mcontext).__ss;
+                let (pc, lr) = (state.__pc, state.__lr);
+                let before = if pc >= 4 { (pc as *const u32).sub(1).read_unaligned() } else { 0 };
+                let mut line = Line([0; 512], 0);
+                let _ = writeln!(
+                    line,
+                    "DIAG SIGSYS code {} pid {} taken by the {} thread: x16 {} in_svc {} x0 {} carry {} pc {pc:#x} lr {lr:#x}",
+                    (*info).si_code,
+                    (*info).si_pid,
+                    if RECEIVER.load(Ordering::Acquire) == libc::pthread_self() as usize { "first" } else { "other" },
+                    state.__x[16].cast_signed(),
+                    before == 0xd400_1001,
+                    state.__x[0].cast_signed(),
+                    (state.__cpsr >> 29) & 1,
+                );
+                libc::write(1, line.0.as_ptr().cast(), line.1);
+                let mut frames = [std::ptr::null_mut::<libc::c_void>(); 34];
+                frames[0] = pc as *mut libc::c_void;
+                frames[1] = lr as *mut libc::c_void;
+                let n = libc::backtrace(frames[2..].as_mut_ptr(), 32);
+                libc::backtrace_symbols_fd(frames.as_ptr(), n + 2, 1);
+                libc::_exit(99);
+            }
+        }
+
+        // The diagnosis the test above runs for a case that fails names
+        // the denied call and its thread: getppid (39) here, made by the
+        // other thread, or by it while the first thread takes the signal
+        // inside its wait for that thread (not in the denied call: it
+        // shows the wait, on macOS 27 ulock_wait, 515, interrupted, x0 -4).
+        #[test]
+        fn test_the_diagnosis_of_an_unexpected_sigsys_names_the_call() {
+            for (who, expected) in [
+                ("diagother", "taken by the other thread: x16 39 in_svc true"),
+                ("diagfirst", "taken by the first thread: x16 "),
+            ] {
+                let out = child(
+                    "ending_child",
+                    &[("WICK_TEST_CASE", &format!("{who}-wait")), ("WICK_TEST_DIAG_DENIES", "1")],
+                );
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(out.status.code() == Some(99) && stdout.contains(expected), "{who}: {}", text(&out));
+                assert!(who != "diagother" || stdout.contains("getppid"), "{who}: {}", text(&out));
+            }
+        }
+
+        /// Blocks or unblocks SIGSYS on the calling thread.
+        fn mask_sigsys(how: libc::c_int) {
+            // SAFETY: a set of one valid signal.
+            unsafe {
+                let mut set: libc::sigset_t = 0;
+                libc::sigaddset(&mut set, libc::SIGSYS);
+                assert_eq!(libc::pthread_sigmask(how, &set, std::ptr::null_mut()), 0);
             }
         }
 
@@ -3360,6 +3511,9 @@ mod macos {
             use crate::logger::{LOGGER, METRICS, StoreMetric};
             let (who, how) = case.split_once('-').unwrap();
             let how = how.to_owned();
+            // For the parent's read of Seatbelt's reports (`text_and_denials`).
+            // SAFETY: no arguments.
+            println!("CHILD-PID {}", unsafe { libc::getpid() });
             crate::signal_handler::register_signal_handlers().unwrap();
             let _ = LOGGER.init();
             // SAFETY: a new descriptor of standard output, owned here.
@@ -3373,10 +3527,32 @@ mod macos {
                 let _ = METRICS.write();
                 std::process::abort();
             }));
+            // The threads the sandbox makes inherit the mask.
+            if who == "diagother" {
+                mask_sigsys(libc::SIG_BLOCK);
+            }
             select(Policy::Default);
             apply().unwrap();
-            let denies = who != "none";
+            let diagnosis = who.starts_with("diag");
+            if diagnosis {
+                // SAFETY: a zeroed sigaction with a handler of its kind.
+                unsafe {
+                    let mut act: libc::sigaction = std::mem::zeroed();
+                    act.sa_sigaction = diagnose_sigsys as *const () as usize;
+                    act.sa_flags = libc::SA_SIGINFO;
+                    assert_eq!(libc::sigaction(libc::SIGSYS, &act, std::ptr::null_mut()), 0);
+                }
+            }
+            let denies = matches!(who, "first" | "other") || std::env::var_os("WICK_TEST_DIAG_DENIES").is_some();
+            let blocks = match who {
+                "diagother" => Some(libc::SIG_UNBLOCK),
+                "diagfirst" => Some(libc::SIG_BLOCK),
+                _ => None,
+            };
             let act = move || {
+                if let Some(how) = blocks {
+                    mask_sigsys(how);
+                }
                 if denies {
                     // SAFETY: no arguments; denied, which raises SIGSYS.
                     unsafe { libc::getppid() };
@@ -3389,6 +3565,8 @@ mod macos {
                     "fault" => unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) },
                     // SAFETY: ends the process, through its atexit handlers.
                     "exit" => unsafe { libc::exit(7) },
+                    // No end: the diagnosis's own test.
+                    "wait" => std::thread::sleep(std::time::Duration::from_secs(5)),
                     // SAFETY: a breakpoint trap, as libdispatch's for a
                     // Mach call that failed.
                     _ => unsafe { std::arch::asm!("brk #1") },

@@ -517,12 +517,16 @@ jobs:
           cargo test --locked -p vmm --lib "ext::api_process" -- --test-threads=1
       # What the sandbox denied the test processes (vmm-<hash>), for a
       # failure above: the kernel reports a denied call by its number
-      # ("deny(1) syscall-unix 117"), SIGSYS or not.
+      # ("deny(1) syscall-unix 117"), SIGSYS or not. All of the lines: the
+      # last 300 began after the failing test's process (run 1866e32, whose
+      # tests of every number leave one line a process). A test of a
+      # process that should have had no denied call prints the call itself
+      # (sandbox.rs `diagnose_sigsys`).
       - name: Sandbox reports
         if: failure()
         run: |
           /usr/bin/log show --last 20m --style compact --predicate 'sender == "Sandbox"' |
-            grep -E 'Sandbox: vmm-[0-9a-f]+\(' | grep -v ' allow ' | tail -300 || true
+            grep -E 'Sandbox: vmm-[0-9a-f]+\(' | grep -v ' allow ' || true
 
   # A minute of each fuzz target (fuzz/, CONTRIBUTING.md "Fuzzing"): they
   # build, their seeds pass, and a minute of new inputs finds nothing. Long
