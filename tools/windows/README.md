@@ -74,8 +74,22 @@
   python -I tools\windows\vmm-memory-record.py <firecracker.exe> [vcpus ...]
   ```
 
+  With `--boot <dir>` the guest is upstream's CI kernel and root file system
+  (downloaded into `<dir>` when not there; the ones `boot-test.ps1` boots),
+  with a network interface: every vCPU runs. Besides the VMMMEM lines it
+  prints each thread's stack (VMMSTACK lines: reserved, committed, resident,
+  how deep) and, for the deepest and the median thread of each kind, the
+  return addresses on its stack's resident pages (module and offset, with
+  the nearest symbol when `firecracker.pdb` is beside the binary, as in the
+  kit), so that the calls that reached deep are named:
+
+  ```
+  python -I tools\windows\vmm-memory-record.py --boot C:\wbt lib\firecracker\build\cargo_target\release\firecracker.exe 1 2 16
+  ```
+
 CI builds the binaries on every push and uploads them as the artifact
 `wick-windows-x86_64-<commit>`: `lib/firecracker/build/cargo_target/release/firecracker.exe`,
+`firecracker.pdb` (its symbols, for `vmm-memory-record.py --boot`),
 `snapshot-editor.exe`, `jailer.exe`, `rebase-snap.exe` and
 `examples/uffd_on_demand_handler.exe` next to it,
 `lib/firecracker/build/cargo_target/debug/firecracker.exe` (built with the gdb

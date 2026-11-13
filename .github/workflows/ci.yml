@@ -609,6 +609,7 @@ jobs:
           python -I tools/windows/integration/selftest.py
           python -m py_compile tools/windows/integration/*.py
           python -m py_compile tools/windows/vmm-memory-record.py
+          python -I tools/windows/vmm-memory-record.py --selftest
       # aws-lc-sys assembles its x86_64 code with NASM in release builds
       # (built from source rather than with its prebuilt objects).
       - name: Install NASM
@@ -705,6 +706,7 @@ jobs:
           name: wick-windows-x86_64-${{ github.sha }}
           path: |
             lib/firecracker/build/cargo_target/release/firecracker.exe
+            lib/firecracker/build/cargo_target/release/firecracker.pdb
             lib/firecracker/build/cargo_target/release/snapshot-editor.exe
             lib/firecracker/build/cargo_target/release/jailer.exe
             lib/firecracker/build/cargo_target/release/rebase-snap.exe
@@ -851,6 +853,19 @@ jobs:
           if ! python -I ../../tools/windows/vmm-memory-record.py build/cargo_target/release/firecracker.exe; then
             echo "::error::vmm-memory-record.py did not finish"
             failed=1
+          fi
+          # The same with a guest whose vCPUs all run: upstream's CI kernel
+          # and root file system (the linux-boot job's, from the same
+          # bucket), a network interface, the guest's shell on the serial
+          # console. Besides the VMMMEM lines, each thread's stack and the
+          # return addresses on the deepest stacks (VMMSTACK lines), named
+          # with firecracker.pdb: what a running vCPU's 78 KiB of stack is
+          # made of. No Linux guest has booted on a runner before: if this
+          # one does not, the lines say how far it came and the step notes
+          # it with a warning; it fails nothing.
+          if ! python -I ../../tools/windows/vmm-memory-record.py --boot "$RUNNER_TEMP/vmmmem-guest" \
+              build/cargo_target/release/firecracker.exe 1 2 16; then
+            echo "::warning::vmm-memory-record.py --boot: no record of a booted guest on this runner"
           fi
           exit $failed
       # wick-os's standard input on a console (a hidden console of its own,
