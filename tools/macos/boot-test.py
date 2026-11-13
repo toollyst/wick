@@ -67,10 +67,102 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock.connect(self.path)
 
 
+def wait_api(sock, ended, bound=10):
+    """Waits until the API at `sock` answers: a GET / that returns 200.
+    The socket's path does not say so. It is there from bind(2), the server
+    accepts from listen(2) (std's `UnixListener::bind` makes both calls), a
+    connection in between is refused, as on Linux, and a Firecracker that
+    ended leaves the path behind. So the wait is for the answer itself, and
+    it is its own step before a caller's first request, which is made once.
+    `ended()` is None while the process whose API it is runs, else the text
+    of how it ended: looked at before every attempt, so a dead Firecracker
+    fails at once. No answer within `bound` seconds fails. Returns what the
+    wait saw: attempts with no path yet, attempts refused, attempts accepted
+    and closed unanswered, ms to the answer."""
+    t0 = time.monotonic()
+    absent = refused = closed = 0
+
+    def seen():
+        return (f"{absent} attempts found no socket, {refused} were refused, {closed} were accepted and closed "
+                f"without an answer, {(time.monotonic() - t0) * 1000:.0f} ms")
+
+    while True:
+        end = ended()
+        if end is not None:
+            raise Failure(f"the process ended before its API answered ({seen()}): {end}")
+        left = bound - (time.monotonic() - t0)
+        if left <= 0:
+            raise Failure(f"the API at {sock} did not answer within {bound} s ({seen()})")
+        conn = UnixHTTPConnection(sock, timeout=left)
+        try:
+            conn.request("GET", "/")
+            resp = conn.getresponse()
+            data = resp.read()
+            if resp.status != 200:
+                raise Failure(f"the API's first answer: GET / -> {resp.status} {data[:300]!r} ({seen()})")
+            return {"absent": absent, "refused": refused, "closed": closed, "ms": (time.monotonic() - t0) * 1000}
+        except FileNotFoundError:
+            absent += 1
+        except ConnectionRefusedError:
+            refused += 1
+        except socket.timeout:
+            raise Failure(f"the API at {sock} accepted a connection and did not answer GET / within "
+                          f"{bound} s ({seen()}; {ended() or 'its process runs'})") from None
+        except (ConnectionResetError, BrokenPipeError, http.client.RemoteDisconnected):
+            # A server that goes away with its process: the next look at
+            # the process says so; one that stays and closes fails at the bound.
+            closed += 1
+        finally:
+            conn.close()
+        time.sleep(0.02)
+
+
+def listens(pid, path):
+    """Whether process `pid` holds a Unix socket bound at `path` that
+    listens, read from the kernel without a connection: a uffd handler, a
+    vhost-user backend and Firecracker's gdb socket accept one connection,
+    their client's, so a probe's would be taken for it. The path alone says
+    bind(2) was made, not listen(2). proc_pidinfo PROC_PIDLISTFDS, then
+    proc_pidfdinfo PROC_PIDFDSOCKETINFO of each socket: `soi_options` is the
+    socket's so_options (xnu bsd/kern/socket_info.c fill_socketinfo), in
+    which listen sets SO_ACCEPTCONN (uipc_socket.c solisten), and a Unix
+    socket's bound address is `unsi_addr` (struct socket_fdinfo,
+    <sys/proc_info.h>: 792 bytes, soi_family at 184, soi_options at 188,
+    sun_path at 282)."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    fds = (ctypes.c_uint8 * (8 * 4096))()  # struct proc_fdinfo: int32 fd, uint32 type
+    n = libc.proc_pidinfo(pid, 1, ctypes.c_uint64(0), fds, ctypes.sizeof(fds))  # PROC_PIDLISTFDS
+    want = os.fsencode(path)
+    for i in range(0, max(n, 0), 8):
+        fd, kind = struct.unpack_from("<iI", fds, i)
+        if kind != 2:  # PROX_FDTYPE_SOCKET
+            continue
+        info = (ctypes.c_uint8 * 792)()
+        if libc.proc_pidfdinfo(pid, fd, 3, info, 792) != 792:  # PROC_PIDFDSOCKETINFO
+            continue  # closed between the two calls
+        family, options = struct.unpack_from("<ih", info, 184)
+        bound = bytes(info[282:282 + 104]).split(b"\0")[0]
+        if family == socket.AF_UNIX and options & 0x2 and bound == want:  # SO_ACCEPTCONN
+            return True
+    return False
+
+
+def wait_listens(proc, path, what, bound=10):
+    """Waits until `proc` (a Popen) listens on the Unix socket at `path`
+    (`listens`); fails at once if it ended, and after `bound` seconds."""
+    deadline = time.monotonic() + bound
+    while not listens(proc.pid, path):
+        check(proc.poll() is None, f"{what} ended before it listened on {path} (exit {proc.poll()})")
+        check(time.monotonic() < deadline, f"{what} did not listen on {path} within {bound} s")
+        time.sleep(0.02)
+
+
 class Vm:
     """A Firecracker process with its serial console on a pipe."""
 
-    def __init__(self, ctx, name, args, config=None, api=True):
+    def __init__(self, ctx, name, args, config=None, api=True, wait=True):
+        """`wait`: the start returns once the API answers (`wait_api`);
+        False for a start that is to end by itself before it serves."""
         self.ctx = ctx
         self.name = name
         self.log_path = os.path.join(ctx.out, f"{name}.log")
@@ -102,12 +194,8 @@ class Vm:
         # still kills it.
         ctx.vms.append(self)
         self.seq = 0
-        if self.api_sock:
-            deadline = time.time() + 10
-            while not os.path.exists(self.api_sock):
-                if self.proc.poll() is not None or time.time() > deadline:
-                    raise Failure(f"no API socket ({self.exit_reason()})")
-                time.sleep(0.02)
+        if self.api_sock and wait:
+            self.api_wait = wait_api(self.api_sock, self.ended)
 
     def _pump(self):
         while True:
@@ -122,6 +210,13 @@ class Vm:
                 self.cond.notify_all()
         with self.cond:
             self.cond.notify_all()
+
+    def ended(self):
+        """None while the process started runs, else how it ended (for `wait_api`)."""
+        if self.proc.poll() is None:
+            return None
+        self.pump.join(5)
+        return self.exit_reason()
 
     def exit_reason(self):
         code = self.proc.poll()
@@ -946,10 +1041,7 @@ def stage_uffd(ctx):
     log = open(os.path.join(ctx.out, "uffd-handler.log"), "w")
     handler = subprocess.Popen([ctx.uffd_handler, sock, mem], stdout=log, stderr=subprocess.STDOUT)
     try:
-        deadline = time.time() + 10
-        while not os.path.exists(sock):
-            check(handler.poll() is None and time.time() < deadline, f"uffd handler did not start ({handler.poll()})")
-            time.sleep(0.05)
+        wait_listens(handler, sock, "the uffd handler")
         vm = ctx.vm("uffd", [])
         vm.api("PUT", "/snapshot/load", {"snapshot_path": state,
                                          "mem_backend": {"backend_type": "Uffd", "backend_path": sock},
@@ -977,7 +1069,7 @@ def stage_hugepages(ctx):
     # serves it: test_huge_page_ranges_fault_and_fill_whole_pages). With a
     # vhost-user device the memory is a huge page memfd, shared with the
     # backend (memfd test_hugetlb_memfd_maps_huge).
-    vm = ctx.vm("huge-odd", [], config(ctx, mem=255, machine={"huge_pages": "2M"}))
+    vm = ctx.vm("huge-odd", [], config(ctx, mem=255, machine={"huge_pages": "2M"}), wait=False)
     code = vm.wait_exit(15)
     vm.pump.join(5)  # the last lines of the console, drained after the exit
     check(code not in (None, 0), f"255 MiB on 2 MiB pages accepted: exit {code}")
@@ -1005,10 +1097,7 @@ def stage_hugepages(ctx):
     log = open(os.path.join(ctx.out, "huge-uffd-handler.log"), "w")
     handler = subprocess.Popen([ctx.uffd_handler, sock, mem_file], stdout=log, stderr=subprocess.STDOUT)
     try:
-        deadline = time.time() + 10
-        while not os.path.exists(sock):
-            check(handler.poll() is None and time.time() < deadline, f"uffd handler did not start ({handler.poll()})")
-            time.sleep(0.05)
+        wait_listens(handler, sock, "the uffd handler")
         vm = ctx.vm("huge2", [])
         vm.api("PUT", "/snapshot/load", {"snapshot_path": state,
                                          "mem_backend": {"backend_type": "Uffd", "backend_path": sock},
@@ -1050,10 +1139,7 @@ def vhost_user_round(ctx, name, machine):
     log = open(os.path.join(ctx.out, f"{name}-backend.log"), "w")
     backend = subprocess.Popen([ctx.vub, sock, img], stdout=log, stderr=subprocess.STDOUT)
     try:
-        deadline = time.time() + 10
-        while not os.path.exists(sock):
-            check(backend.poll() is None and time.time() < deadline, f"vhost-user backend did not start ({backend.poll()})")
-            time.sleep(0.05)
+        wait_listens(backend, sock, "the vhost-user backend")
         drives = [{"drive_id": "vub", "socket": sock, "is_root_device": False}]
         vm = ctx.vm(name, [], config(ctx, vcpus=2, drives=drives, machine=machine))
         vm.shell()
@@ -1091,10 +1177,7 @@ def stage_vhost_user_hotplug(ctx):
         log = open(os.path.join(ctx.out, f"{name}-backend.log"), "w")
         proc = subprocess.Popen([ctx.vub, sock, img], stdout=log, stderr=subprocess.STDOUT)
         backends.append((proc, log))
-        deadline = time.time() + 10
-        while not os.path.exists(sock):
-            check(proc.poll() is None and time.time() < deadline, f"vhost-user backend {name} did not start ({proc.poll()})")
-            time.sleep(0.05)
+        wait_listens(proc, sock, f"the vhost-user backend {name}")
         return img, sock
 
     try:

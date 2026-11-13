@@ -56,6 +56,33 @@ class _Connection(http.client.HTTPConnection):
         self.sock.connect(self._path)
 
 
+def _wait_api(sock, proc, bound=10):
+    """Waits until Firecracker's API answers a GET / with 200; returns None
+    then, else why it did not. The socket's path does not say the API is
+    there: the path exists from bind(2), the server accepts from listen(2),
+    a connection in between is refused, and a Firecracker that ended leaves
+    the path behind. This is its own step before the test's first request,
+    which is made once. The process is looked at before every attempt."""
+    start, last = time.monotonic(), "none made"
+    while True:
+        if proc.poll() is not None:
+            return f"Firecracker ended (exit {proc.returncode}) before its API answered; last attempt: {last}"
+        if time.monotonic() - start > bound:
+            return f"no answer within {bound} s; last attempt: {last}"
+        conn = _Connection(sock)
+        try:
+            conn.request("GET", "/")
+            status = conn.getresponse().status
+            return None if status == 200 else f"GET / -> {status}"
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            last = type(e).__name__
+        except (OSError, http.client.HTTPException) as e:
+            return f"GET /: {e!r}"
+        finally:
+            conn.close()
+        time.sleep(0.02)
+
+
 def request(sock, method, path, body=None):
     """(status, parsed body or None) of one API request."""
     conn = _Connection(sock)
@@ -92,14 +119,11 @@ def main():
         log = open(os.path.join(work, "out"), "wb")  # pylint: disable=consider-using-with
         proc = subprocess.Popen([firecracker, "--api-sock", sock], stdout=log, stderr=subprocess.STDOUT)
         try:
-            for _ in range(100):
-                if os.path.exists(sock) or proc.poll() is not None:
-                    break
-                time.sleep(0.1)
-            if not os.path.exists(sock):
+            why = _wait_api(sock, proc)
+            if why:
                 log.close()
                 with open(os.path.join(work, "out"), encoding="utf-8", errors="replace") as f:
-                    sys.exit(f"FAIL: Firecracker made no API socket (exit {proc.poll()}): {f.read()[-2000:]}")
+                    sys.exit(f"FAIL: {why}: {f.read()[-2000:]}")
 
             status, body = request(sock, "GET", "/enclave")
             check("GET /enclave before PUT: status", status, 400)

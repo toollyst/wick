@@ -85,11 +85,7 @@ class JailedVm(bt.Vm):
         ctx.vms.append(self)
         self.seq = 0
         if wait_api:
-            deadline = time.time() + 10
-            while not os.path.exists(self.api_sock):
-                if self.proc.poll() is not None or time.time() > deadline:
-                    raise Failure(f"no API socket ({self.exit_reason()})")
-                time.sleep(0.02)
+            self.api_wait = bt.wait_api(self.api_sock, self.ended)
 
 
 def jail_config(vcpus=1, mem=256, machine=None, drives=(), **extra):
@@ -118,11 +114,7 @@ class OperatorServer:
             self.proc = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT)
         finally:
             os.umask(old)
-        deadline = time.time() + 10
-        while not os.path.exists(sock):
-            check(self.proc.poll() is None and time.time() < deadline,
-                  f"{name} did not listen ({self.proc.poll()}; log {self.log_path})")
-            time.sleep(0.05)
+        bt.wait_listens(self.proc, sock, f"{name} (log {self.log_path})")
 
     def alive(self):
         check(self.proc.poll() is None, f"{self.name} exited {self.proc.poll()}; log {self.log_path}")
@@ -568,20 +560,38 @@ def stage_jail(ctx):
             "outside files unreachable")
 
 
+def daemon_pid(jail):
+    """The pid in the jail's pid file, once the jailer that ran in the
+    background has written it whole (a number and nothing else)."""
+    path = jail.host("/firecracker.pid")
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            with open(path) as f:
+                text = f.read()
+        except FileNotFoundError:
+            text = ""
+        if text.strip().isdigit():
+            return int(text)
+        check(time.monotonic() < deadline, f"no pid in {path} within 10 s: {text!r}")
+        time.sleep(0.05)
+
+
+def wait_daemon_api(jail, pid):
+    """Waits until the API of the jail's Firecracker `pid`, which is no
+    child of this process, answers (`bt.wait_api`)."""
+    return bt.wait_api(jail.host("/run/firecracker.socket"),
+                       lambda: None if alive(pid) else f"process {pid} is gone")
+
+
 def stage_daemonize(ctx):
     jail = Jail(ctx, "daemon")
     rc, out = run_jailer(ctx, jailer_base(ctx, "daemon") + ["--daemonize", "--", "--api-sock",
                                                              "/run/firecracker.socket"])
     check(rc == 0, f"jailer exit {rc}: {out!r}")
-    deadline = time.time() + 10
-    while not os.path.exists(jail.host("/firecracker.pid")) and time.time() < deadline:
-        time.sleep(0.05)
-    with open(jail.host("/firecracker.pid")) as f:
-        pid = int(f.read())
+    pid = daemon_pid(jail)
     try:
-        deadline = time.time() + 10
-        while not os.path.exists(jail.host("/run/firecracker.socket")) and time.time() < deadline:
-            time.sleep(0.05)
+        wait_daemon_api(jail, pid)
         uid, gid, ppid = proc_ids(pid)
         check((uid, gid, ppid) == (UID, GID, 1), f"daemon uid/gid/ppid {uid}/{gid}/{ppid}")
         conn = bt.UnixHTTPConnection(jail.host("/run/firecracker.socket"))
@@ -628,13 +638,10 @@ def stage_pidns(ctx):
     with open(log) as f:
         out = f.read()
     check(rc == 0, f"jailer exit {rc}: {out!r}")
-    with open(jail.host("/firecracker.pid")) as f:
-        pid = int(f.read())
+    pid = daemon_pid(jail)
     try:
         check(pid != p.pid, f"pid file names the jailer ({pid})")
-        deadline = time.time() + 10
-        while not os.path.exists(jail.host("/run/firecracker.socket")) and time.time() < deadline:
-            time.sleep(0.05)
+        wait_daemon_api(jail, pid)
         uid, gid, _ = proc_ids(pid)
         check((uid, gid) == (UID, GID), f"uid/gid {uid}/{gid}")
         check(api_ok(jail.host("/run/firecracker.socket")), "API of Firecracker in its namespace")
@@ -659,12 +666,9 @@ def stage_pidns(ctx):
     rc, out = run_jailer(ctx, jailer_base(ctx, "pidns-control") + ["--daemonize", "--", "--api-sock",
                                                                     "/run/firecracker.socket"])
     check(rc == 0, f"control jailer exit {rc}: {out!r}")
-    deadline = time.time() + 10
-    while not os.path.exists(jail.host("/run/firecracker.socket")) and time.time() < deadline:
-        time.sleep(0.05)
-    with open(jail.host("/firecracker.pid")) as f:
-        control = int(f.read())
+    control = daemon_pid(jail)
     try:
+        wait_daemon_api(jail, control)
         os.kill(control, signal.SIGTERM)
         deadline = time.time() + 5
         while alive(control) and time.time() < deadline:

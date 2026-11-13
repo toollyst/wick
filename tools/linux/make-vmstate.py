@@ -44,6 +44,35 @@ class Api(http.client.HTTPConnection):
         self.sock.connect(self.path)
 
 
+def _wait_api(sock, proc, bound=10):
+    """Waits until Firecracker's API answers a GET / with 200; returns None
+    then, else why it did not. The socket's path does not say the API is
+    there: the path exists from bind(2), the server accepts from listen(2),
+    a connection in between is refused, and a Firecracker that ended leaves
+    the path behind. This is its own step before the test's first request,
+    which is made once. The process is looked at before every attempt."""
+    start, last = time.monotonic(), "none made"
+    while True:
+        if proc.poll() is not None:
+            return f"Firecracker ended (exit {proc.returncode}) before its API answered; last attempt: {last}"
+        if time.monotonic() - start > bound:
+            return f"no answer within {bound} s; last attempt: {last}"
+        conn = Api(sock)
+        try:
+            conn.connect()
+            conn.sock.settimeout(bound)
+            conn.request("GET", "/")
+            status = conn.getresponse().status
+            return None if status == 200 else f"GET / -> {status}"
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            last = type(e).__name__
+        except (OSError, http.client.HTTPException) as e:
+            return f"GET /: {e!r}"
+        finally:
+            conn.close()
+        time.sleep(0.02)
+
+
 def call(sock, method, path, body):
     conn = Api(sock)
     conn.request(method, path, json.dumps(body), {"Content-Type": "application/json"})
@@ -71,11 +100,9 @@ def main():
         proc = subprocess.Popen([fc, "--api-sock", sock], stdin=subprocess.DEVNULL, stdout=console,
                                 stderr=subprocess.STDOUT)
         try:
-            deadline = time.time() + 10
-            while not os.path.exists(sock):
-                if proc.poll() is not None or time.time() > deadline:
-                    sys.exit(f"make-vmstate: no API socket (Firecracker: {proc.poll()})")
-                time.sleep(0.05)
+            why = _wait_api(sock, proc)
+            if why:
+                sys.exit(f"make-vmstate: {why}")
             call(sock, "PUT", "/boot-source", {"kernel_image_path": kernel, "boot_args": BOOT_ARGS})
             call(sock, "PUT", "/drives/rootfs", {"drive_id": "rootfs", "path_on_host": rootfs, "is_root_device": True,
                                                 "is_read_only": True})

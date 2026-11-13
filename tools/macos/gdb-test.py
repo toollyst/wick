@@ -323,10 +323,7 @@ def session(ctx, client, addr, file_bytes):
     sock = os.path.join(ctx.sock, f"{name}.sock")
     vm = ctx.vm(name, [], bt.config(ctx, machine={"gdb_socket_path": sock}), api=False)
     # Firecracker waits for the client before it runs the guest.
-    deadline = time.time() + 30
-    while not os.path.exists(sock):
-        check(vm.proc.poll() is None and time.time() < deadline, f"no gdb socket at {sock} ({vm.exit_reason()})")
-        time.sleep(0.05)
+    bt.wait_listens(vm.proc, sock, f"Firecracker (log {vm.log_path})", 30)
     script = client.script
     for k, v in addr.items():
         script = script.replace(f"@{k}@", f"{v:x}")
