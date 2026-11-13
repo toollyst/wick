@@ -430,7 +430,7 @@ impl VcpuFd {
     }
 
     /// Creates the Hypervisor.framework vCPU on the calling thread.
-    fn ensure_created(&mut self) -> Result<hv_vcpu_t> {
+    pub(crate) fn ensure_created(&mut self) -> Result<hv_vcpu_t> {
         if let Some(hv) = self.shared.hv() {
             return if self.created_here {
                 Ok(hv)

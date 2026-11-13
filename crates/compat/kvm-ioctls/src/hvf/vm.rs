@@ -1959,7 +1959,12 @@ mod tests {
     #[test]
     fn test_virtual_count_is_the_vms() {
         // As on KVM, writing one vCPU's TIMER_CNT sets the counter of every
-        // vCPU, from the time of the write (not the time a vCPU first runs).
+        // vCPU, from the time of the write (not the time a vCPU first runs):
+        // one offset for the VM, which every vCPU is given, so their
+        // counters read the same at any instant (Linux v6.1
+        // arch/arm64/kvm/arch_timer.c `update_vtimer_cntvoff` sets the
+        // written CNTVOFF on every vCPU). A restore writes each vCPU's saved
+        // TIMER_CNT in turn: the last write is the VM's, on KVM and here.
         let vm = Kvm::new().unwrap().create_vm().unwrap();
         let mut kvi = kvm_vcpu_init::default();
         vm.get_preferred_target(&mut kvi).unwrap();
@@ -1974,7 +1979,7 @@ mod tests {
         let start = 1u64 << 40;
         vcpus[0].set_one_reg(id, &start.to_le_bytes()).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        let counts: Vec<u64> = vcpus
+        let (counts, offsets): (Vec<u64>, Vec<u64>) = vcpus
             .into_iter()
             .map(|mut vcpu| {
                 std::thread::spawn(move || {
@@ -1982,12 +1987,18 @@ mod tests {
                     vcpu.run().unwrap_err();
                     let mut buf = [0u8; 8];
                     vcpu.get_one_reg(id, &mut buf).unwrap();
-                    u64::from_le_bytes(buf)
+                    let hv = vcpu.ensure_created().unwrap();
+                    let mut offset = 0;
+                    // SAFETY: `hv` belongs to this thread.
+                    check(unsafe { hv_vcpu_get_vtimer_offset(hv, &mut offset) }).unwrap();
+                    (u64::from_le_bytes(buf), offset)
                 })
                 .join()
                 .unwrap()
             })
-            .collect();
+            .unzip();
+        let vms = vm.inner.vtimer_offset.load(Ordering::Acquire);
+        assert_eq!(offsets, [vms, vms], "each vCPU's CNTVOFF is the VM's");
         let mut freq = 0u64;
         // SAFETY: reads CNTFRQ_EL0, readable at EL0.
         unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
