@@ -1236,6 +1236,11 @@ jobs:
           # commit to a process, and whether a pagefile quota can be set and
           # refuses a section (SECTREC-e).
           alone windows_sectrec::test_section_memory_and_a_charge_for_it_on_record
+          # SECTREC-h: a SEC_RESERVE section's page committed through one
+          # of two views, no access, and what the other shows; committed
+          # through the other; decommitted through a view; for the
+          # userfaultfd restore's section made SEC_RESERVE (S1).
+          alone windows_sectrec::test_a_reserved_section_committed_through_one_view_on_record
           # What Windows' cycle counters count (CPUCYCLEREC lines), for the
           # CPU clocks: a PC read the thread's QueryThreadCycleTime at 1.32 x
           # the TSC while spinning and the process's at 1.01 x. The thread's

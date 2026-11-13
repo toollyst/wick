@@ -1174,3 +1174,125 @@ fn test_section_memory_and_a_charge_for_it_on_record() {
     unsafe { CloseHandle(job) };
     assert!(ended && status.success(), "the child ended {status:?} before its end");
 }
+
+/// SECTREC-h, for S1's second part: the userfaultfd restore's section made
+/// `SEC_RESERVE`, whose missing pages must stay inaccessible through the
+/// guest's view until the handler has filled them through the alias (today
+/// the section is `SEC_COMMIT` and the guest's view is made `PAGE_NOACCESS`
+/// page by page, `windows_uffd`). Two views of a `SEC_RESERVE` section, A
+/// (the guest's) and B (the alias), both mapped read-write. Printed, from
+/// `VirtualQuery` (state and protection) and reads made only where the
+/// page reads:
+/// - a page committed through A with `PAGE_NOACCESS`: what A and B show;
+///   B written, then A made read-write: what A reads;
+/// - a page committed through B (read-write): what A shows, so whether a
+///   fill through the alias opens the guest's view at once (a race: a
+///   vCPU could read the page before the fill ends);
+/// - a committed page decommitted through a view (`MEM_DECOMMIT`): the
+///   result, for `MADV_DONTNEED` of registered memory;
+/// - A's committed page made `PAGE_NOACCESS` again: what B shows.
+#[test]
+#[ignore = "a record: run on Windows with --ignored --nocapture"]
+fn test_a_reserved_section_committed_through_one_view_on_record() {
+    let say = |l: String| eprintln!("SECTREC-h {l}");
+    let len = MIB;
+    // SAFETY: a pagefile-backed SEC_RESERVE section of our own.
+    let s = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, core::ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, len as u32, core::ptr::null()) };
+    assert!(!s.is_null());
+    // SAFETY: two views of it.
+    let (a, b) = unsafe {
+        (
+            MapViewOfFile(s, FILE_MAP_ALL_ACCESS, 0, 0, len).Value as usize,
+            MapViewOfFile(s, FILE_MAP_ALL_ACCESS, 0, 0, len).Value as usize,
+        )
+    };
+    assert!(a != 0 && b != 0);
+    let q = |at: usize| {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+        // SAFETY: as above.
+        unsafe { VirtualQuery(at as *const c_void, &mut mbi, core::mem::size_of_val(&mbi)) };
+        (mbi.State, mbi.Protect)
+    };
+    let shows = |what: &str, at: usize| {
+        let (state, protect) = q(at);
+        format!("{what}: state {state:#x} ({}), protection {protect:#x}", if state == MEM_COMMIT { "committed" } else if state == MEM_RESERVE { "reserved" } else { "other" })
+    };
+    let readable = |at: usize| {
+        let (state, protect) = q(at);
+        state == MEM_COMMIT && matches!(protect, PAGE_READWRITE | 0x02 | 0x40 | 0x20)
+    };
+    let err = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+
+    // A page committed through A, no access.
+    // SAFETY: commits a page of our view.
+    let p = unsafe { VirtualAlloc(a as *const c_void, PAGE, MEM_COMMIT, PAGE_NOACCESS) };
+    let e = err();
+    say(format!(
+        "page 0 committed through A with PAGE_NOACCESS: {}; {}; {}",
+        if p.is_null() { format!("refused, error {e}") } else { "done".into() },
+        shows("A", a),
+        shows("B", b)
+    ));
+    if readable(b) {
+        // SAFETY: B's page reads and writes (checked above).
+        unsafe { *(b as *mut u8) = 0x5a };
+        let mut old = 0;
+        // SAFETY: our view's page.
+        let ok = unsafe { VirtualProtect(a as *const c_void, PAGE, PAGE_READWRITE, &mut old) } != 0;
+        let e = err();
+        let read = if readable(a) {
+            // SAFETY: A's page reads (checked).
+            format!("{:#x}", unsafe { *(a as *const u8) })
+        } else {
+            "not readable".into()
+        };
+        say(format!(
+            "B written 0x5a; A made read-write: {} (old {old:#x}); A reads {read}; {}",
+            if ok { "done".into() } else { format!("refused, error {e}") },
+            shows("A", a)
+        ));
+    } else {
+        say("B's page does not read: not written".into());
+    }
+
+    // A page committed through B.
+    // SAFETY: commits a page of our view.
+    let p = unsafe { VirtualAlloc((b + PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) };
+    let e = err();
+    say(format!(
+        "page 1 committed through B with PAGE_READWRITE: {}; {}; {}",
+        if p.is_null() { format!("refused, error {e}") } else { "done".into() },
+        shows("A", a + PAGE),
+        shows("B", b + PAGE)
+    ));
+
+    // Decommit through a view.
+    // SAFETY: our view's committed page.
+    let ok = unsafe { VirtualFree(a as *mut c_void, PAGE, 0x4000) } != 0;
+    let e = err();
+    say(format!(
+        "page 0 decommitted through A (MEM_DECOMMIT): {}; {}; {}",
+        if ok { "done".into() } else { format!("refused, error {e}") },
+        shows("A", a),
+        shows("B", b)
+    ));
+
+    // A's page made inaccessible again.
+    let mut old = 0;
+    // SAFETY: our view's page.
+    let ok = unsafe { VirtualProtect((a + PAGE) as *const c_void, PAGE, PAGE_NOACCESS, &mut old) } != 0;
+    let e = err();
+    say(format!(
+        "page 1 made PAGE_NOACCESS through A: {}; {}; {}",
+        if ok { "done".into() } else { format!("refused, error {e}") },
+        shows("A", a + PAGE),
+        shows("B", b + PAGE)
+    ));
+    // SAFETY: our views and section.
+    unsafe {
+        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void });
+        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut c_void });
+        CloseHandle(s);
+    }
+}
