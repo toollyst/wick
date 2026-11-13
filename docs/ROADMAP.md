@@ -72,7 +72,7 @@ after a Uffd restore); both are fixed.
 | eventfd, epoll, timerfd, signals | `vmm-sys-util`, `libc` | pipes, kqueue, timer threads | works |
 | seccomp | `vmm::ext::sandbox` | Seatbelt | works; see [M5](#m5-security-parity-the-jailer-on-every-host) |
 
-What is left on macOS: the GDB stub, whose stage has run with LLDB but not with gdb (docs/COMPATIBILITY.md, CPU, GDB stub: not done yet); and in other milestones the jailer (M5) and x86_64 images (M6); hugepages are in place as far as the host allows (docs/PORTING.md row 10).
+What is left on macOS: upstream's own gdb test, which its aarch64 debug kernel keeps from running (the GDB stub's stage passes with gdb and LLDB: docs/COMPATIBILITY.md, CPU, GDB stub); and in other milestones the jailer (M5) and x86_64 images (M6); hugepages are in place as far as the host allows (docs/PORTING.md row 10).
 
 ## M3. Windows: first boot on real hardware
 
