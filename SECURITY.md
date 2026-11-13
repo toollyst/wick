@@ -206,8 +206,9 @@ upstream Firecracker and its jailer.
   devices) is not charged either.
 - **Windows jailer: no limit on the number of handles.** Upstream's jailer limits Firecracker to 2048 descriptors
   by default (`RLIMIT_NOFILE`). Windows has no per-process handle limit to set: a process's pool quota is accepted
-  and ignored, and a Job Object has no handle limit and its memory limit does not count handles (measured: 300,000
-  handles under a 32 MiB job memory limit; `jailer-test.ps1 nofile` checks 100,000). Nothing bounds the handles of
+  and ignored (200,000 handles made after a 1 MiB paged-pool quota, measured on Windows Server 2022), and a Job
+  Object has no handle limit and its memory limit does not count handles (a jailed process opens 100,000 files
+  under `memory.max` of 32 MiB: `jailer-test.ps1 nofile`). Nothing bounds the handles of
   a compromised jailed Firecracker, or the kernel memory they take, short of Windows' fixed per-process maximum
   (2^24 handles, documented, not measured). The jailer refuses `--resource-limit no-file=` and says at its start,
   on stderr, that upstream's default is not enforced.
