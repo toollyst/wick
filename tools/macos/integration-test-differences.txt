@@ -257,9 +257,9 @@ all impossible integration_tests/functional/test_net.py::test_tap_offload
 # of memory when it dirties 128 MiB, and with deflate_on_oom the balloon
 # deflates. Every MiB the reading holds beyond the guest's memory is a MiB
 # more the guest has free (upstream tuned this sizing three times for guests
-# a few MiB smaller: 214314d30, 80abdb211, 4f3d8cd27). On macOS the guest
-# does not run out of memory ("Balloon did not deflate"; both variants in
-# m2-parts2, d706d9a). The variant without deflate_on_oom passes. Measured
+# a few MiB smaller, upstream's commits 214314d30, 80abdb211, 4f3d8cd27). On
+# macOS the guest does not run out of memory ("Balloon did not deflate";
+# both variants in m2-parts2, d706d9a). The variant without deflate_on_oom passes. Measured
 # in the diagnostic run m2-kpf (33b9eec, the guest's /proc/kpageflags): the
 # guest has 31,532 of its 65,024 RAM pages in use (123 MiB, its reserved
 # memory among them) and they fill 7,939 16 KiB frames (124 MiB): the

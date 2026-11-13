@@ -29,9 +29,35 @@ tools/windows/README.md name in backquotes (`boot-test snapshot`,
 tools/macos/boot-test.py or jailer-test.py, of $Stages in
 tools/windows/boot-test.ps1, of -Stage's default in jailer-test.ps1, or one
 of the result lines a script always reports (STAGE_RESULTS below).
+
+Every commit of this repository a document cites (any tracked .md or .txt
+outside lib/) must be an ancestor of HEAD: landings cherry-pick, so a
+branch's hash never reaches main, and a doc citing one names a commit no
+clone has. A citation is a lower-case token of 7 to 40 hex digits with at
+least one digit and one letter (an English word such as "defaced" has no
+digit, a CI run number no letter), not after "0x" (the docs write HRESULTs,
+addresses and register values that way) and not part of a longer word, path,
+URL or run label ("mac1-vsock-balloon-ff84c70"). Not this repository's:
+- another project's commit: the clause it is in (back to the last ". ",
+  ";", "|" or blank line) names the project (FOREIGN), the table row's
+  first cell does, or the paragraph starts with the project's bold label;
+- upstream Firecracker's, written "upstream's commits <hash>, <hash>".
+
+A branch's hash followed in its clause by "main's <hash>" (a run's own
+commit and the same change on main) is accepted when that hash is an
+ancestor. Any other hash that is unknown or not an ancestor is an error; if
+the clone has it and main has a commit of the same subject, the error names
+it. The check needs the whole history: in a shallow clone it is an error
+("history too shallow"), never a pass. `--repo PATH` names the clone to ask
+when the files are a copy outside it.
+
+    tools/check-claims.py --selftest    checks the commit check on a fake repository
 """
+import os
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -109,9 +135,170 @@ def stages():
     return named
 
 
+HASH = re.compile(r"(?<![0-9A-Za-z_\-./:#])([0-9a-f]{7,40})(?![0-9A-Za-z_\-])")
+# Projects whose commits the design notes cite.
+FOREIGN = re.compile(r"\b(virtiofsd|crosvm|libkrun|krunkit|crun|hcsshim|QEMU|qemu)\b")
+UPSTREAM = re.compile(r"\b[Uu]pstream's commits? ([0-9a-f]{7,40}(?:(?:,\s+(?:and\s+)?|\s+and\s+)[0-9a-f]{7,40})*)")
+CLAUSE_END = re.compile(r"[.;|!?](?:\s|$)|\n\s*\n")
+MAINS = re.compile(r"\bmain's ([0-9a-f]{7,40})\b")
+
+
+def git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+
+
+def cited_commits(text):
+    """(offset, hash, alias) of each commit of this repository a document's
+    text cites; `alias` is the "main's <hash>" after it in its clause."""
+    upstream = set()
+    for m in UPSTREAM.finditer(text):
+        upstream.update(range(m.start(1), m.end(1)))
+    out = []
+    for m in HASH.finditer(text):
+        h, at = m.group(1), m.start()
+        if not re.search(r"[a-f]", h) or not re.search(r"[0-9]", h) or text[max(0, at - 2):at] == "0x":
+            continue
+        if at in upstream:
+            continue
+        before = text[max(0, at - 300):at]
+        ends = [e.end() for e in CLAUSE_END.finditer(before)]
+        if FOREIGN.search(before[ends[-1]:] if ends else before):
+            continue
+        start = text.rfind("\n", 0, at) + 1
+        line = text[start:text.find("\n", at) if "\n" in text[at:] else len(text)]
+        if line.startswith("|") and FOREIGN.search(line.strip("|").split("|")[0]):
+            continue
+        para = text.rfind("\n\n", 0, at)
+        head = text[para + 2 if para >= 0 else 0:][:40]
+        if re.match(r"\s*\*\*", head) and FOREIGN.search(head):
+            continue
+        after = text[m.end():m.end() + 200]
+        cut = CLAUSE_END.search(after)
+        alias = MAINS.search(after[:cut.start()] if cut else after)
+        out.append((at, h, alias.group(1) if alias else None))
+    return out
+
+
+def check_commits(repo, docs):
+    """Errors for the commits `docs` ((name, text) pairs) cite that are not
+    ancestors of the repository's HEAD."""
+    shallow = git(repo, "rev-parse", "--git-path", "shallow")
+    if shallow.returncode != 0:
+        return [f"error: {repo} is not a git repository, so the commits the docs cite cannot be checked "
+                f"(--repo names the clone): {shallow.stderr.strip()}"]
+    # A shallow clone's boundary commits; HEAD's history is cut if one of
+    # them is HEAD or an ancestor of it (a clone can be shallow only in a
+    # fetched ref HEAD does not reach).
+    path = Path(shallow.stdout.strip())
+    path = path if path.is_absolute() else Path(repo) / path
+    bounds = path.read_text().split() if path.is_file() else []
+    if any(git(repo, "merge-base", "--is-ancestor", b, "HEAD").returncode == 0 for b in bounds):
+        return [f"error: history too shallow in {repo}: the commits the docs cite cannot be checked against "
+                f"HEAD's ancestors (fetch the whole history: actions/checkout's fetch-depth: 0, or git fetch --unshallow)"]
+    subjects = {}
+    for line in git(repo, "log", "--format=%h %s", "HEAD").stdout.splitlines():
+        h, _, s = line.partition(" ")
+        subjects.setdefault(s, h)
+    verdicts = {}
+
+    def ancestor(h):
+        if h not in verdicts:
+            full = git(repo, "rev-parse", "--verify", "--quiet", f"{h}^{{commit}}")
+            if full.returncode != 0:
+                verdicts[h] = (False, "which this clone does not have (a branch's, or another project's)", None)
+            elif git(repo, "merge-base", "--is-ancestor", full.stdout.strip(), "HEAD").returncode == 0:
+                verdicts[h] = (True, "", None)
+            else:
+                subject = git(repo, "log", "-1", "--format=%s", full.stdout.strip()).stdout.strip()
+                verdicts[h] = (False, f"which is not an ancestor of HEAD (\"{subject[:80]}\")", subjects.get(subject))
+        return verdicts[h]
+
+    errors = []
+    for name, text in docs:
+        for at, h, alias in cited_commits(text):
+            ok, why, same = ancestor(h)
+            if ok:
+                continue
+            n = text.count("\n", 0, at) + 1
+            if alias and ancestor(alias)[0]:
+                continue
+            hint = f"; main has the same change as {same}" if same else ""
+            errors.append(f"error: {name}:{n} cites commit {h}, {why}{hint}")
+    return errors
+
+
+def commit_docs(root, repo):
+    """(name, text) of every tracked .md and .txt outside lib/."""
+    listed = git(repo, "ls-files", "*.md", "*.txt").stdout.split()
+    return [(name, (root / name).read_text(errors="replace")) for name in listed
+            if not name.startswith("lib/") and (root / name).is_file()]
+
+
+def selftest():
+    def run(*args, cwd):
+        subprocess.run(args, cwd=cwd, check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                            "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        run("git", "init", "-q", "-b", "main", cwd=repo)
+        (repo / "a").write_text("a")
+        run("git", "add", "a", cwd=repo)
+        run("git", "commit", "-q", "-m", "first", cwd=repo)
+        run("git", "switch", "-q", "-c", "side", cwd=repo)
+        (repo / "b").write_text("b")
+        run("git", "add", "b", cwd=repo)
+        run("git", "commit", "-q", "-m", "the change", cwd=repo)
+        side = git(repo, "rev-parse", "--short=7", "HEAD").stdout.strip()
+        run("git", "switch", "-q", "main", cwd=repo)
+        # Another commit first, so that the pick is a commit of its own.
+        (repo / "c").write_text("c")
+        run("git", "add", "c", cwd=repo)
+        run("git", "commit", "-q", "-m", "second", cwd=repo)
+        run("git", "cherry-pick", side, cwd=repo)
+        first = git(repo, "rev-parse", "--short=7", "HEAD~2").stdout.strip()
+        picked = git(repo, "rev-parse", "--short=9", "HEAD").stdout.strip()
+        # Hashes that cannot be of the repository: they have a digit and a letter.
+        unknown, other = "1abcdef", "2bcdef0"
+        doc = (f"| Row | passed at {first}, kit {picked}; HRESULT 0x800703e6, rip 0xffffffff8124f971 |\n"
+               f"| Other | at {side}, on a branch |\n"
+               f"| Third | runs at {side} (main's {picked}) and fixed by {unknown}. |\n"
+               f"| virtiofsd | since 2026-11-06 (commits {other}) |\n\n"
+               f"virtiofsd 1.14.0 ({other}, 2026-11-12), crosvm ({other}); upstream's commits 214314d30, 80abdb211.\n"
+               f"A label mac1-vsock-balloon-{unknown} and a [crun {other}](https://example.com/{other}); "
+               f"defaced, 43442912128, {'f' * 6}0.\n")
+        errors = check_commits(repo, [("fake.md", doc)])
+        assert errors == [
+            f"error: fake.md:2 cites commit {side}, which is not an ancestor of HEAD (\"the change\"); "
+            f"main has the same change as {picked[:7]}",
+            f"error: fake.md:3 cites commit {unknown}, which this clone does not have (a branch's, or another "
+            f"project's)",
+            f"error: fake.md:7 cites commit {'f' * 6}0, which this clone does not have (a branch's, or another "
+            f"project's)",
+        ], errors
+        shallow = Path(tmp) / "shallow"
+        run("git", "clone", "-q", "--depth", "1", repo.as_uri(), str(shallow), cwd=tmp)
+        errors = check_commits(shallow, [("fake.md", doc)])
+        assert len(errors) == 1 and errors[0].startswith("error: history too shallow"), errors
+        errors = check_commits(Path(tmp) / "none", [("fake.md", doc)])
+        assert len(errors) == 1 and "is not a git repository" in errors[0], errors
+    print("check-claims: selftest ok")
+
+
 def main():
+    if sys.argv[1:] == ["--selftest"]:
+        selftest()
+        return 0
     strict_windows = "--strict-windows" in sys.argv[1:]
+    repo = ROOT
+    if "--repo" in sys.argv[1:]:
+        repo = Path(sys.argv[sys.argv.index("--repo") + 1]).resolve()
     errors = warnings = 0
+    for line in check_commits(repo, commit_docs(ROOT, repo)):
+        print(line)
+        errors += 1
     named_stages = stages()
     for name in STAGE_DOCS:
         for n, line in enumerate((ROOT / name).read_text().splitlines(), 1):

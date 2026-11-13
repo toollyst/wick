@@ -109,8 +109,14 @@ and the main checkout use; they never set the variable.
   `test_...` and every scenario stage a document names exists: a stage
   (`boot-test snapshot`, `jailer-test.ps1 nofile`) must be in that script's
   own stage table, so renaming a stage fails CI until the documents follow.
-  A probe that once showed something is not a test; the claim waits until
-  the product does it and a test in the repository shows it.
+  It also checks that every commit a document cites is on main (an ancestor
+  of HEAD): landings cherry-pick, so cite the commit on main, or a run's own
+  branch commit followed by `main's <hash>` for the same change. Another
+  project's commit is cited with the project's name in its clause
+  (`virtiofsd 1.14.0 (a8b65ed`), upstream Firecracker's as
+  `upstream's commits <hash>, ...`. A probe that once showed something is
+  not a test; the claim waits until the product does it and a test in the
+  repository shows it.
 - A number in a doc says how it was measured. On a loaded machine, measure
   against a control run at the same time, or state only bounds the kernel
   reports back (a limit read back, CPU time used), never wall-clock alone.

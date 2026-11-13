@@ -20,7 +20,7 @@
 #               first)
 #
 # First measured on Windows Server 2022 without WHP (fc-win), the tree of
-# 51be34e plus the MSR change, 4 test threads: vmm --lib 974 tests, 794 pass,
+# 51be34e (main's acc6b6d) plus the MSR change, 4 test threads: vmm --lib 974 tests, 794 pass,
 # 168 fail, 12 ignored (the ext:: child-process helpers, which their parent
 # tests run). Of the 168, five passed alone and failed only beside others
 # (balloon test_hinting_invalid_cmd, _misaligned_value, _no_cmd_set; block
@@ -86,7 +86,7 @@ error-text vmm vmm_config::net::tests::test_insert_error_cases
 # vmm: to root-cause before any fix.
 # (test_rx_multiple_frames and _mrg, and wick's own platform::windows::net
 # test_one_switch_at_a_time, were listed until the net endpoint's fix,
-# b113a1e: a switch that connects while another is there waits its turn.
+# 374f02a: a switch that connects while another is there waits its turn.
 # Measured fixed by this check in CI run 43277608081, where all three pass.)
 bug vmm devices::virtio::rng::device::tests::test_bandwidth_rate_limiter
 #   (entropy_bytes 0, not 1000, 350 ms after the limiter blocked: the replenish

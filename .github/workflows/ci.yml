@@ -33,9 +33,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # The whole history: check-claims.py checks that every commit a doc
+      # cites is an ancestor of HEAD, and fails in a shallow clone.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
+          fetch-depth: 0
           persist-credentials: false
       - name: Apply the patch series
         run: tools/setup.sh
@@ -51,9 +54,12 @@ jobs:
           unpinned="$(grep -nE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s*[^@ ]+@[0-9a-f]{40}( |$)' || true)"
           [[ -z "$unpinned" ]] || { echo "::error::actions not pinned by full commit SHA:"; echo "$unpinned"; exit 1; }
       # Every "in place", "verified" or "measured" in the docs' tables names
-      # the test that checks it, Windows cells included.
+      # the test that checks it, Windows cells included; every commit a doc
+      # cites is on main (an ancestor of HEAD), not a branch's.
       - name: Doc claims name their tests
-        run: python3 tools/check-claims.py --strict-windows
+        run: |
+          python3 tools/check-claims.py --selftest
+          python3 tools/check-claims.py --strict-windows
       - name: Compatibility matrix progress and counts are current
         run: python3 -I tools/compat-counts.py --check docs/COMPATIBILITY.md
       - name: Cleanup script
