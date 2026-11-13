@@ -37,9 +37,8 @@
 # W=$W'piece' ...), and run
 #   python3 -c "import base64,zlib;exec(zlib.decompress(base64.b64decode('$W'),-15))" A B
 #
-# The loop, compiled with clang -O2 -fPIC -ffreestanding for each machine
-# (no relocations, no calls); s[0] lock, s[1] last value, s[2] last reader
-# (CPU + 1); out: max warp, warps, max forward step, hand-overs, iterations:
+# The loop (s[0] lock, s[1] last value, s[2] last reader, CPU + 1; out: max
+# warp, warps, max forward step, hand-overs, iterations), in short:
 #   void warp_loop(volatile u64 *s, u64 me, u64 n, u64 *out) {
 #     u64 max_warp = 0, warps = 0, max_gap = 0, handovers = 0, i;
 #     for (i = 0; i < n; i++) {
@@ -57,6 +56,23 @@
 #     out[0..5] = max_warp, warps, max_gap, handovers, i;
 #   }
 # counter() is RDTSCP on x86_64, ISB; MRS CNTVCT_EL0 on aarch64.
+#
+# Where CODE comes from: the full source is tools/guest-counter-warp-loop.c.
+# Each machine's bytes are the .text section of the ELF object that
+#   Apple clang version 21.0.0 (clang-2100.4.1.1)
+# makes with, for MACHINE x86_64 and aarch64,
+#   clang -target MACHINE-linux-gnu -O2 -fno-stack-protector -ffreestanding \
+#         -fPIC -fno-asynchronous-unwind-tables -c guest-counter-warp-loop.c
+# cut by reading the object's section headers (e_shoff; .text by name in
+# the section-name table) and taking that section's bytes; the object has no
+# relocation section, so the bytes run wherever they are mapped, and no
+# other code or data section. tools/check-guest-counter-warp.py does exactly
+# this and compares: that clang on this repo's Mac rebuilds both byte for
+# byte. Another clang may choose other instructions for the same source
+# (Ubuntu 24.04's clang 18.1.3 does: other x86_64 bytes, and an aarch64 call
+# to an outlined atomic), so the check says SKIP (exit 3) when its clang is
+# another and differs, and when no clang is on PATH; it never passes
+# silently.
 import ctypes
 import mmap
 import os
