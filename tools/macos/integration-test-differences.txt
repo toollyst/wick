@@ -210,17 +210,6 @@ all arch integration_tests/functional/test_topology.py::test_cache_topology[vmli
 all arch integration_tests/functional/test_pause_resume.py::test_kvmclock_ctrl
 all arch integration_tests/functional/test_cpu_template_helper.py::test_cpu_config_dump_vs_actual
 
-# The test reads 100 times the rate limiter's bucket from /dev/hwrng within
-# ssh's 100 s, and its 1000 KB/s case needs the device to give at least
-# 1 MB/s. Measured without a rate limiter (scratch probe, load ~80): 80 KB/s,
-# one 64-byte request per guest notification and interrupt, about 0.75 ms
-# each: the vCPU's notification, the event loop's wakeup and the interrupt's
-# injection are three thread hand-offs here (the irqfd thread among them)
-# where KVM handles two in the kernel. The 100 KB/s case fails the same way
-# when the Mac is loaded. To do: inject an irqfd's interrupt from the thread
-# that signals it.
-all bug integration_tests/functional/test_rng.py::test_rng_bw_rate_limiter
-
 # The test makes a multi-queue TAP (`ip tuntap add ... multi_queue`) and
 # expects Firecracker to refuse it. macOS has no TAP devices: an interface
 # is a datagram endpoint (docs/PORTING.md row 6), one queue by design.
