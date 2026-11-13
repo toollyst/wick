@@ -5920,24 +5920,31 @@ mod fpu_tests {
     /// partition (as KVM's, which a Linux guest's snapshot needs) where
     /// WHP's own x2APIC refuses the TSC-deadline mode of the LVT timer with
     /// #GP (X2APICREC: WRMSR 0x832 of 0x40041 is #GP, answered by WHP, and
-    /// an MSR action list for 0x832 is taken but never exits, the PC at
-    /// 87d0328). E would take the guest's #GP as an exception exit
+    /// an MSR action list for 0x832 is taken but never exits, the PC and CI
+    /// at 87d0328). E would take the guest's #GP as an exception exit
     /// (`ExtendedVmExits` ExceptionExit, vector 13 in the exception exit
     /// bitmap), emulate that one WRMSR, and give every other #GP back to
     /// the guest unchanged, as KVM gives back an exception it intercepts.
-    /// Printed:
-    /// - whether ExceptionExit is offered, the partition made with it, and
-    ///   the bitmap of vector 13 taken;
-    /// - the guest's WRMSR 0x832 of 0x40041: the run's exits, with the
-    ///   exception's vector, error code, parameter, RIP and instruction
-    ///   bytes (what the backend would decode);
-    /// - that #GP given back (`WHvRegisterPendingInterruption`, an exception
-    ///   with its error code, RIP at the WRMSR): the HRESULT, the exits of
-    ///   the next run and whether the guest's #GP handler ran (`out 0x8d`)
-    ///   with the error code on its stack;
-    /// - the cost: 1000 #GPs in a guest loop whose handler skips the WRMSR
-    ///   and returns, without the bitmap (WHP delivers them) and with it
-    ///   (each an exit and the backend's re-injection), per #GP.
+    ///
+    /// Until 81072df this record never set APIC_BASE.EXTD, which
+    /// X2APICREC's guest writes first (0xfee00d00), so its WRMSR 0x832 was
+    /// one with the local APIC in xAPIC mode: WHP gave it to the backend as
+    /// an MSR exit (reason 0x1000, `WHvRunVpExitReasonX64MsrAccess`, not
+    /// an exception's 0x1002), which skipped it, and the loop's "#GP"s were
+    /// MSR exits, 9.8 us each with the bitmap empty or not (the PC at
+    /// 81072df). Now a matrix, a partition each: APIC_BASE.EXTD clear or
+    /// set by the guest, ExceptionExit off or on, vector 13 in the bitmap
+    /// or not (only with ExceptionExit). Printed for each cell:
+    /// - who answers the guest's WRMSR 0x832 of 0x40041 (WHP or the
+    ///   backend, by the backend's MSR exit count) and how it ends (done,
+    ///   the guest's #GP handler, or an exception exit), with WHP's exits;
+    /// - where it is an exception exit: that #GP given back
+    ///   (`WHvRegisterPendingInterruption`, an exception with its error
+    ///   code, RIP at the WRMSR), the next run's exits and the error code
+    ///   on the handler's stack;
+    /// - the cost: 1000 such WRMSRs in a guest loop whose #GP handler skips
+    ///   the WRMSR and returns, each exception exit given back as above:
+    ///   the time a WRMSR, the MSR exits and the exception exits.
     ///
     /// Nothing is asserted but the test's own setup.
     #[test]
@@ -5954,66 +5961,7 @@ mod fpu_tests {
         // SAFETY: a u64 output buffer of the size passed.
         let hres = unsafe { whv::WHvGetCapability(whv::WHvCapabilityCodeExtendedVmExits, (&raw mut offered).cast(), 8, &mut n) };
         say(format!("ExtendedVmExits offered {:#010x} {offered:#x}: ExceptionExit {}", hres.cast_unsigned(), offered >> 2 & 1));
-        if offered & EXCEPTION_EXIT == 0 {
-            say("ExceptionExit not offered: not run".to_string());
-            return;
-        }
-        super::super::vm::APIC_MODE_FOR_TESTS.set(Some(whv::WHvX64LocalApicEmulationModeX2Apic));
-        super::super::vm::EXTRA_EXITS_FOR_TESTS.set(EXCEPTION_EXIT);
-        let made = super::super::VmFd::create();
-        super::super::vm::EXTRA_EXITS_FOR_TESTS.set(0);
-        super::super::vm::APIC_MODE_FOR_TESTS.set(None);
-        let vm = match made {
-            Ok(vm) => vm,
-            Err(e) => {
-                say(format!("the x2APIC partition with ExceptionExit is not made: errno {}", e.errno()));
-                return;
-            }
-        };
-        let m = guest();
-        probes(m);
-        // #GP's other handler: drop the error code, step over the 2-byte
-        // WRMSR, return (`add rsp, 8; add qword [rsp], 2; iretq`).
-        put(m, SKIP_AT, &[0x48, 0x83, 0xC4, 0x08, 0x48, 0x83, 0x04, 0x24, 0x02, 0x48, 0xCF]);
-        let gate = |handler: u64| -> [u8; 16] {
-            let low = (handler & 0xFFFF) | (8 << 16) | (0x8E << 40) | (((handler >> 16) & 0xFFFF) << 48);
-            let mut g = [0u8; 16];
-            g[..8].copy_from_slice(&low.to_le_bytes());
-            g[8..].copy_from_slice(&(handler >> 32).to_le_bytes());
-            g
-        };
-        // SAFETY: the memory stays mapped while the VM has it.
-        unsafe {
-            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
-                slot: 0,
-                flags: 0,
-                guest_phys_addr: 0,
-                memory_size: MEM as u64,
-                userspace_addr: m as u64,
-            })
-        }
-        .unwrap();
-        let mut vcpu = vm.create_vcpu(0).unwrap();
-        vcpu.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
-        start(&vcpu);
-        let mut s = vcpu.get_sregs().unwrap();
-        (s.idt.base, s.idt.limit) = (IDT, 16 * 14 - 1);
-        vcpu.set_sregs(&s).unwrap();
-        let part = vcpu.part();
-        let bitmap = |on: bool| -> String {
-            let value: u64 = if on { 1 << GP } else { 0 };
-            // SAFETY: a u64 value for ExceptionExitBitmap; no vCPU runs.
-            let r = unsafe { super::super::ffi::set_partition_property(part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &value) };
-            format!("ExceptionExitBitmap {value:#x}: {:?}", r.map_err(|e| e.errno()))
-        };
-        // The exits of one run, with their details, and how it ended.
-        let traced = |vcpu: &mut VcpuFd| -> (String, Vec<String>) {
-            super::super::ffi::trace::begin();
-            let line = run_once(vcpu);
-            let calls = super::super::ffi::trace::end();
-            let exits = calls.iter().filter_map(|c| c.exit.map(|e| format!("reason {e:#x} ({})", c.detail))).collect();
-            (line, exits)
-        };
+        let came = || MSR_INTERCEPTS.with(std::cell::Cell::get);
         // A #GP given back: pending, an exception (type 3) with its error
         // code (bit 4), the vector at bits 16-31, the code at 32-63.
         let give_back = |vcpu: &VcpuFd, code: u32| {
@@ -6021,45 +5969,149 @@ mod fpu_tests {
             let r = super::super::ffi::set_register(vcpu.part(), vcpu.vp(), whv::WHvRegisterPendingInterruption, super::super::ffi::reg64(event));
             (event, r.map_err(|e| e.errno()))
         };
-        say(bitmap(true));
-        vcpu.set_regs(&kvm_regs { rip: WRMSR_AT, rsp: 0x9000, rflags: 2, rax: 0x4_0041, rcx: 0x832, ..Default::default() }).unwrap();
-        let (line, exits) = traced(&mut vcpu);
-        say(format!("WRMSR 0x832 of 0x40041 at {WRMSR_AT:#x}: the run gave [{line}]; WHP's exits {exits:?}"));
-        let r = vcpu.get_regs().unwrap();
-        say(format!("after it: RIP {:#x}, RSP {:#x}", r.rip, r.rsp));
-        let (event, set) = give_back(&vcpu, 0);
-        let (line, exits) = traced(&mut vcpu);
-        let r = vcpu.get_regs().unwrap();
-        // SAFETY: the stack page is the test's mapping; the handler's frame
-        // is the error code then RIP.
-        let (code, rip) = unsafe { (*(m.add(r.rsp as usize) as *const u64), *(m.add(r.rsp as usize + 8) as *const u64)) };
-        say(format!(
-            "the #GP given back (PendingInterruption {event:#x}: {set:?}): the run gave [{line}] (out 0x8d is the guest's #GP \
-             handler); WHP's exits {exits:?}; the handler's frame: error code {code:#x}, RIP {rip:#x}"
-        ));
-        // The cost of a #GP, without and with the exit.
-        let mut code = vec![0xBB];
-        code.extend_from_slice(&ROUNDS.to_le_bytes());
-        code.extend_from_slice(&[0xB9, 0x32, 0x08, 0x00, 0x00, 0xB8, 0x41, 0x00, 0x04, 0x00]);
-        code.extend_from_slice(&[0x31, 0xD2, 0x0F, 0x30, 0xFF, 0xCB, 0x75, 0xEE, 0xE6, PORT as u8, 0xEB, 0xFE]);
-        put(m, LOOP_AT, &code);
-        put(m, IDT + GP * 16, &gate(SKIP_AT));
-        for on in [false, true] {
-            say(bitmap(on));
+        for (extd, exception_exit, bitmap) in
+            [(false, false, false), (false, true, false), (false, true, true), (true, false, false), (true, true, false), (true, true, true)]
+        {
+            let cell = format!(
+                "APIC_BASE.EXTD {}, ExceptionExit {}, vector 13 {}in the bitmap",
+                if extd { "set" } else { "clear" },
+                if exception_exit { "on" } else { "off" },
+                if bitmap { "" } else { "not " }
+            );
+            if exception_exit && offered & EXCEPTION_EXIT == 0 {
+                say(format!("{cell}: ExceptionExit not offered, not run"));
+                continue;
+            }
+            super::super::vm::APIC_MODE_FOR_TESTS.set(Some(whv::WHvX64LocalApicEmulationModeX2Apic));
+            super::super::vm::EXTRA_EXITS_FOR_TESTS.set(if exception_exit { EXCEPTION_EXIT } else { 0 });
+            let made = super::super::VmFd::create();
+            super::super::vm::EXTRA_EXITS_FOR_TESTS.set(0);
+            super::super::vm::APIC_MODE_FOR_TESTS.set(None);
+            let vm = match made {
+                Ok(vm) => vm,
+                Err(e) => {
+                    say(format!("{cell}: the x2APIC partition is not made: errno {}", e.errno()));
+                    continue;
+                }
+            };
+            let m = guest();
+            probes(m);
+            // #GP's other handler: drop the error code, step over the 2-byte
+            // WRMSR, return (`add rsp, 8; add qword [rsp], 2; iretq`).
+            put(m, SKIP_AT, &[0x48, 0x83, 0xC4, 0x08, 0x48, 0x83, 0x04, 0x24, 0x02, 0x48, 0xCF]);
+            // SAFETY: the memory stays mapped while the VM has it.
+            unsafe {
+                vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                    slot: 0,
+                    flags: 0,
+                    guest_phys_addr: 0,
+                    memory_size: MEM as u64,
+                    userspace_addr: m as u64,
+                })
+            }
+            .unwrap();
+            let mut vcpu = vm.create_vcpu(0).unwrap();
+            vcpu.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
+            start(&vcpu);
+            let mut s = vcpu.get_sregs().unwrap();
+            (s.idt.base, s.idt.limit) = (IDT, 16 * 14 - 1);
+            vcpu.set_sregs(&s).unwrap();
+            let part = vcpu.part();
+            if bitmap {
+                let value: u64 = 1 << GP;
+                // SAFETY: a u64 value for ExceptionExitBitmap; no vCPU runs.
+                let r = unsafe { super::super::ffi::set_partition_property(part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &value) };
+                if let Err(e) = r {
+                    say(format!("{cell}: ExceptionExitBitmap {value:#x} refused: errno {}", e.errno()));
+                }
+            }
+            if extd {
+                // The guest's own WRMSR of APIC_BASE, as X2APICREC's and
+                // Linux's x2apic_enable.
+                vcpu.set_regs(&kvm_regs { rip: WRMSR_AT, rsp: 0x9000, rflags: 2, rax: 0xFEE0_0D00, rcx: 0x1B, ..Default::default() }).unwrap();
+                let end = run_once(&mut vcpu);
+                if end != "exit IoOut port 0x80" {
+                    say(format!("{cell}: the guest's WRMSR of APIC_BASE 0xfee00d00 ended by {end}"));
+                }
+            }
+            // The exits of one run, with their details, and how it ended.
+            let traced = |vcpu: &mut VcpuFd| -> (String, Vec<String>) {
+                super::super::ffi::trace::begin();
+                let line = run_once(vcpu);
+                let calls = super::super::ffi::trace::end();
+                let exits = calls.iter().filter_map(|c| c.exit.map(|e| format!("reason {e:#x} ({})", c.detail))).collect();
+                (line, exits)
+            };
+            let before = came();
+            vcpu.set_regs(&kvm_regs { rip: WRMSR_AT, rsp: 0x9000, rflags: 2, rax: 0x4_0041, rcx: 0x832, ..Default::default() }).unwrap();
+            let (line, exits) = traced(&mut vcpu);
+            let by = if came() > before { "the backend (an MSR exit)" } else { "WHP" };
+            let how = match line.as_str() {
+                "exit IoOut port 0x80" => "done",
+                "exit IoOut port 0x8d" => "the guest's #GP handler ran",
+                "exit (another)" => "the run returned another exit (an exception exit is InternalError)",
+                _ => "ended otherwise",
+            };
+            say(format!("{cell}: WRMSR 0x832 of 0x40041: {how} [{line}], answered by {by}; WHP's exits {exits:?}"));
+            if extd && !bitmap {
+                // The timer's other writes a Linux guest makes: one-shot and
+                // periodic, TSC-deadline masked (lapic_timer_shutdown), the
+                // initial count, the deadline.
+                for (index, value) in [(0x832u32, 0x4_0041u64 | 1 << 16), (0x832, 0x0_0041), (0x832, 0x2_0041), (0x838, 0x1000), (0x6E0, 0)] {
+                    let before = came();
+                    vcpu.set_regs(&kvm_regs {
+                        rip: WRMSR_AT,
+                        rsp: 0x9000,
+                        rflags: 2,
+                        rax: value & 0xFFFF_FFFF,
+                        rcx: u64::from(index),
+                        rdx: value >> 32,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                    let line = run_once(&mut vcpu);
+                    let by = if came() > before { "the backend (an MSR exit)" } else { "WHP" };
+                    say(format!("{cell}: WRMSR {index:#x} of {value:#x}: [{line}] (0x8d is the guest's #GP handler), answered by {by}"));
+                }
+            }
+            if line == "exit (another)" {
+                let r = vcpu.get_regs().unwrap();
+                let (event, set) = give_back(&vcpu, 0);
+                let (line, exits) = traced(&mut vcpu);
+                let after = vcpu.get_regs().unwrap();
+                // SAFETY: the stack page is the test's mapping; the
+                // handler's frame is the error code then RIP.
+                let (code, rip) = unsafe { (*(m.add(after.rsp as usize) as *const u64), *(m.add(after.rsp as usize + 8) as *const u64)) };
+                say(format!(
+                    "{cell}: at the exit RIP {:#x}; the #GP given back (PendingInterruption {event:#x}: {set:?}): the run gave \
+                     [{line}] (out 0x8d is the guest's #GP handler); WHP's exits {exits:?}; the handler's frame: error code \
+                     {code:#x}, RIP {rip:#x}",
+                    r.rip
+                ));
+            }
+            // The cost of such a WRMSR in a loop.
+            let mut code = vec![0xBB];
+            code.extend_from_slice(&ROUNDS.to_le_bytes());
+            code.extend_from_slice(&[0xB9, 0x32, 0x08, 0x00, 0x00, 0xB8, 0x41, 0x00, 0x04, 0x00]);
+            code.extend_from_slice(&[0x31, 0xD2, 0x0F, 0x30, 0xFF, 0xCB, 0x75, 0xEE, 0xE6, PORT as u8, 0xEB, 0xFE]);
+            put(m, LOOP_AT, &code);
+            let low = (SKIP_AT & 0xFFFF) | (8 << 16) | (0x8E << 40) | (((SKIP_AT >> 16) & 0xFFFF) << 48);
+            put(m, IDT + GP * 16, &low.to_le_bytes());
+            put(m, IDT + GP * 16 + 8, &(SKIP_AT >> 32).to_le_bytes());
             let mut best = f64::MAX;
-            let (mut exits, mut end, mut refused) = (0u32, String::new(), None);
+            let (mut exceptions, mut msr_exits, mut end) = (0u32, 0u64, String::new());
             for _ in 0..3 {
                 vcpu.set_regs(&kvm_regs { rip: LOOP_AT, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
                 let watchdog = super::Watchdog::arm(&vcpu);
+                let msr_before = came();
                 let t = std::time::Instant::now();
-                exits = 0;
+                exceptions = 0;
                 end = loop {
                     match vcpu.run() {
                         Ok(VcpuExit::IoOut(PORT, _)) => break "the loop's end".to_string(),
-                        Ok(VcpuExit::InternalError) if on && exits <= 2 * ROUNDS => {
-                            exits += 1;
+                        Ok(VcpuExit::InternalError) if exceptions <= 2 * ROUNDS => {
+                            exceptions += 1;
                             if let (_, Err(e)) = give_back(&vcpu, 0) {
-                                refused = Some(e);
                                 break format!("the #GP not given back: errno {e}");
                             }
                         }
@@ -6071,22 +6123,23 @@ mod fpu_tests {
                     }
                 };
                 best = best.min(t.elapsed().as_secs_f64() * 1e6 / f64::from(ROUNDS));
+                msr_exits = came() - msr_before;
                 drop(watchdog);
                 vcpu.set_kvm_immediate_exit(0);
-                if refused.is_some() {
+                if end != "the loop's end" {
                     break;
                 }
             }
             say(format!(
-                "{ROUNDS} #GPs (WRMSR 0x832 of 0x40041) in a guest loop, the bitmap {}: the least of 3 runs {best:.3} us a #GP, \
-                 {exits} exception exits, ended by {end}",
-                if on { "with vector 13" } else { "empty" }
+                "{cell}: {ROUNDS} WRMSRs 0x832 of 0x40041 in a guest loop (its #GP handler skips the WRMSR): the least of 3 \
+                 runs {best:.3} us a WRMSR, {msr_exits} MSR exits, {exceptions} exception exits (each given back), ended by \
+                 {end}"
             ));
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
         }
-        drop(vcpu);
-        drop(vm);
-        // SAFETY: the test's mapping, no VM left using it.
-        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
     }
 
     /// Record A of lazy-ram-options.md (COMMITTEST lines; no WHP): what
