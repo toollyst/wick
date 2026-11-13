@@ -581,6 +581,14 @@ jobs:
             cargo test --locked -p vmm --lib \
             ext::sandbox::macos::tests::test_system_socket_is_not_consulted_for_these \
             -- --exact --nocapture
+      # A probe, not a check of wick: whether Seatbelt's SIGKILL action ends a
+      # process inside the denied call on this major, as macOS 27.2 measured
+      # (tools/macos/seatbelt-kill-probe.py), for the choice of how a denied
+      # call ends Firecracker. It prints and never decides the job.
+      - name: Seatbelt SIGKILL action probe
+        if: success() || failure()
+        continue-on-error: true
+        run: python3 -I tools/macos/seatbelt-kill-probe.py --runs 50
       # The API process's profile test once failed on macos-15 with its child
       # dead before its first marker (c7d32e2); run alone, repeatedly, it
       # shows whether that is intermittent and how often.
