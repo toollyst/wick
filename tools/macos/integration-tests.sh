@@ -12,7 +12,8 @@
 # as upstream's CI runs it on Linux. Without it the session runs as the user,
 # with tools/macos/integration/jailer in the jailer's place (what that leaves
 # out is listed in its header). Upstream's framework is unchanged but for one
-# patch to tests/conftest.py; the host side it needs on macOS is
+# patch to tests/conftest.py (and test_api_version accepts the +wick.N
+# version: patches/0015); the host side it needs on macOS is
 # tools/macos/integration/wick_macos.py.
 #
 # The binaries are the release build, signed as tools/macos/run.sh signs

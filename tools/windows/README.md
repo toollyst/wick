@@ -164,7 +164,9 @@ before starting, for example "the Windows hypervisor is not running".
 ## Upstream's integration tests
 
 `integration-tests.ps1` runs upstream's pytest suites (functional and
-security by default) against the Windows build, unchanged, with the host side
+security by default) against the Windows build, unchanged (patches/0027's
+`tests/conftest.py` change acts on macOS only; `test_api_version` accepts
+the `+wick.N` version, patches/0015), with the host side
 in `integration/` (the pytest plugin `wick_windows.py`), and compares each
 test with Linux's results (`compare-integration-tests.py`,
 `integration-test-differences.txt`). Unlike the boot test it needs a source

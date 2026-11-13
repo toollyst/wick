@@ -271,7 +271,8 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   reason, in `tools/macos/integration-test-differences.txt`: a wick bug (fix
   it), a Linux feature macOS does not have yet (its `docs/PORTING.md` row), an
   x86_64-only test, or what the host cannot do (and why). Upstream's framework
-  is unchanged but for one patch to `tests/conftest.py`; the macOS host side
+  is unchanged but for one patch to `tests/conftest.py` (and one test,
+  `test_api_version`, accepts the `+wick.N` version: patches/0015); the macOS host side
   (process waiting, memory maps, networks and their host side, the jailer's stand-in for
   runs without root) is `tools/macos/integration/`. Without arguments it runs
   the functional and security suites as the user; `--jailer` runs them as root

@@ -3,7 +3,9 @@
 #
 # Runs upstream's integration tests (pytest, tests/integration_tests) against
 # the Windows build, as tools/macos/integration-tests.sh runs them against the
-# macOS one (docs/PORTING.md row 12). Upstream's framework is unchanged; the
+# macOS one (docs/PORTING.md row 12). Upstream's framework is unchanged
+# (patches/0027's conftest.py change acts on macOS only; test_api_version
+# accepts the +wick.N version, patches/0015); the
 # host side it needs on Windows is tools/windows/integration/wick_windows.py,
 # a pytest plugin loaded before upstream's conftest.py.
 #

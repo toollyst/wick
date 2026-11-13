@@ -420,7 +420,7 @@ Linux. The macOS and Windows counterparts are not written yet (SECURITY.md, "Not
 
 ## Upstream integration tests
 
-wick runs upstream's pytest suites unchanged on macOS and Windows, with a harness that supplies the host side of
+wick runs upstream's pytest suites on macOS and Windows unchanged but for two patches (`tests/conftest.py`'s root and subreaper checks on macOS, patches/0027; `test_api_version` accepting the `+wick.N` version, patches/0015), with a harness that supplies the host side of
 Linux's tools. Each host's comparison script checks every result against the Linux baseline,
 [`tools/macos/integration-linux-baseline.txt`](../tools/macos/integration-linux-baseline.txt). That baseline is one
 CI run on GitHub's ubuntu-latest (x86_64, KVM), so a test that exists only on aarch64 has no Linux result to compare.
