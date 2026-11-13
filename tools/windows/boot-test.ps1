@@ -53,6 +53,14 @@
 #          and with a guest running
 #   foreign-snapshot  a state file made on another host (-ForeignState) is
 #          refused at the load (no guest)
+#   linux-snapshot  (not in `all`: needs -LinuxSnapshot) a whole snapshot
+#          made on Linux x86_64 with KVM by tools/linux/make-vmstate.py, same
+#          Firecracker version, same root drive file, loaded and resumed
+#          here. A record of what a snapshot taken on the other host OS
+#          does: restored (the guest's shell answers, its clock runs, the
+#          drive is read) or refused, with Firecracker's error; the stage
+#          fails when it is neither (a guest that resumed and does not
+#          answer, a Firecracker that stays up after a refusal)
 #   memory-hotplug  virtio-mem: the unplugged region not charged at the
 #          boot, 512 MiB plugged, seen in MemTotal and used, then unplugged
 #          (the commit charge and private working set go down) and plugged
@@ -93,6 +101,10 @@ param(
     # For the foreign-snapshot stage: a snapshot state file made on another
     # host (the macOS boot test's snapshot stage makes an aarch64 one).
     [string]$ForeignState,
+    # For the linux-snapshot stage (not part of `all`): the directory
+    # tools/linux/make-vmstate.py kept a whole snapshot in (CI's artifact
+    # linux-snapshot: linux-x86_64.vmstate, .mem and .txt).
+    [string]$LinuxSnapshot,
     # For the gdb stage (not part of `all`): a Firecracker built with the
     # gdb feature (default: lib\firecracker\build\cargo_target\debug), and
     # a gdb that reads x86-64 Linux kernels (default: gdb-multiarch or gdb on
@@ -2788,6 +2800,64 @@ function Stage-ForeignSnapshot {
     return "refused at the load ($why), Firecracker exits; snapshot-editor refuses it too"
 }
 
+# A whole snapshot made on Linux x86_64 (KVM) by the same Firecracker
+# version (-LinuxSnapshot: tools/linux/make-vmstate.py's fourth argument,
+# CI's artifact linux-snapshot), loaded and resumed here. Upstream supports
+# a snapshot only on the host kind it was made on (docs/snapshotting/
+# snapshot-support.md), and this is another hypervisor, so the stage is a
+# record: what the load answers and, if it is taken, whether the guest
+# goes on. The state names the root drive by its file name alone, and the
+# drive is this test's own copy of the same file (the text file has its
+# SHA-256), so Firecracker runs in the directory that holds it.
+function Stage-LinuxSnapshot {
+    Check ($LinuxSnapshot -and (Test-Path $LinuxSnapshot)) 'pass -LinuxSnapshot <the directory tools/linux/make-vmstate.py kept a whole snapshot in; CI: the artifact linux-snapshot>'
+    $state = Join-Path $LinuxSnapshot 'linux-x86_64.vmstate'
+    $mem = Join-Path $LinuxSnapshot 'linux-x86_64.mem'
+    $txt = Join-Path $LinuxSnapshot 'linux-x86_64.txt'
+    foreach ($f in @($state, $mem, $txt)) { Check (Test-Path $f) "$f is missing" }
+    $about = @(Get-Content $txt)
+    $made = ($about | Select-Object -First 2) -join ', '
+    $m = [regex]::Match(($about -join "`n"), '(?m)^rootfs: (\S+), (\d+) bytes, sha256 ([0-9a-f]{64})')
+    Check $m.Success "$txt does not name the root drive's file"
+    Check ($m.Groups[1].Value -eq (Split-Path -Leaf $Rootfs)) "the snapshot's root drive is $($m.Groups[1].Value), this test's is $(Split-Path -Leaf $Rootfs)"
+    $sha = (Get-FileHash -Algorithm SHA256 $Rootfs).Hash.ToLower()
+    Check ($sha -eq $m.Groups[3].Value) "this test's $(Split-Path -Leaf $Rootfs) (sha256 $sha) is not the file the snapshot was made with ($($m.Groups[3].Value))"
+    # Firecracker in the drive's directory: a new process starts in .NET's
+    # current directory, not PowerShell's location.
+    $before = [Environment]::CurrentDirectory
+    [Environment]::CurrentDirectory = Split-Path -Parent $Rootfs
+    try { $vm = Start-Vm 'linux-snapshot' $null -Api } finally { [Environment]::CurrentDirectory = $before }
+    $status = 0
+    $body = [ordered]@{
+        snapshot_path = (Resolve-Path $state).Path
+        mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = (Resolve-Path $mem).Path }
+        resume_vm     = $true
+    } | ConvertTo-Json -Compress
+    $out = [Wick.Api]::Call($vm.ApiSock, 'PUT', '/snapshot/load', $body, 120000, [ref]$status)
+    if ($status -lt 200 -or $status -ge 300) {
+        $until = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+        Check ($vm.Exited -and $vm.ExitCode -ne 0) "Firecracker after a refused load ($status $out): $($vm.ExitReason())"
+        return "REFUSED at the load: $status $out; Firecracker exits, as after any failed load. Snapshot made by: $made"
+    }
+    $vm.Shell(60000)
+    $out = $vm.Sh('echo alive $((6*7))')
+    Check ($out -eq 'alive 42') "the resumed guest's shell: '$out'"
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $out = $vm.Sh('cat /proc/uptime; sleep 1; cat /proc/uptime')
+    $host_dt = $sw.Elapsed.TotalSeconds
+    $lines = @($out -split "`n" | Where-Object { $_.Trim() })
+    Check ($lines.Count -eq 2) "uptime twice after the restore: '$out'"
+    $a = [double]::Parse((Get-Fields $lines[0])[0], [Globalization.CultureInfo]::InvariantCulture)
+    $b = [double]::Parse((Get-Fields $lines[1])[0], [Globalization.CultureInfo]::InvariantCulture)
+    Check (($b - $a) -gt 0.9 -and ($b - $a) -le $host_dt + 0.1) ("guest clock advanced {0:N2} s in {1:N2} s after the restore" -f ($b - $a), $host_dt)
+    $out = $vm.Sh('md5sum /usr/bin/bash')
+    Check ($out -match '^[0-9a-f]{32} ') "the root drive read after the restore: '$out'"
+    Save-Dmesg $vm 'linux-snapshot'
+    $vm.Reboot()
+    return "RESTORED and resumed: the guest's shell answers, its clock runs, the root drive is read, a reset exits 0. Snapshot made by: $made"
+}
+
 # --no-seccomp turns the mitigation profile off, in Firecracker and in its
 # API process, and without it the profile is on (vmm::ext::sandbox).
 # Needs no guest: an API session reaches the sandbox's setup phase (the
@@ -3120,11 +3190,12 @@ $Stages = [ordered]@{
     tools    = { Stage-Tools }
     'no-seccomp' = { Stage-NoSeccomp }
     'foreign-snapshot' = { Stage-ForeignSnapshot }
+    'linux-snapshot' = { Stage-LinuxSnapshot }
     'memory-hotplug' = { Stage-MemoryHotplug }
     gdb      = { Stage-Gdb }
 }
 # Stages `all` leaves out: they need what a plain kit does not have.
-$NotInAll = @('gdb')
+$NotInAll = @('gdb', 'linux-snapshot')
 
 # --- run ------------------------------------------------------------------------
 

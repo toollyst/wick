@@ -193,10 +193,21 @@ jobs:
       # One snapshot's state file made here, on Linux x86_64: what the macos
       # job's foreign snapshot step (tools/macos/foreign-snapshot-test.py) is
       # given, a state made on another host OS; boot-test.ps1's
-      # foreign-snapshot stage takes one as -ForeignState, which the windows
-      # job does not run. The memory file is not kept.
+      # foreign-snapshot stage takes an aarch64 one as -ForeignState (an x86_64
+      # state decodes on Windows; that case is the linux-snapshot stage, with
+      # the whole snapshot kept below).
       - name: A snapshot's state file for the other hosts' tests
-        run: python3 -I tools/linux/make-vmstate.py "lib/firecracker/build/cargo_target/$(uname -m)-unknown-linux-musl/release/firecracker" "$RUNNER_TEMP/boot-test" "$RUNNER_TEMP/vmstate"
+        run: python3 -I tools/linux/make-vmstate.py "lib/firecracker/build/cargo_target/$(uname -m)-unknown-linux-musl/release/firecracker" "$RUNNER_TEMP/boot-test" "$RUNNER_TEMP/vmstate" "$RUNNER_TEMP/vmsnapshot"
+      # The whole snapshot, memory file too (128 MiB before the artifact's
+      # compression): what a Windows host of the same architecture restores
+      # (boot-test.ps1 linux-snapshot).
+      - name: Upload the whole snapshot
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-snapshot
+          path: ${{ runner.temp }}/vmsnapshot/
+          if-no-files-found: error
+          retention-days: 3
       - name: Upload the state file
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

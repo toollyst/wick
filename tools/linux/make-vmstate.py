@@ -6,22 +6,31 @@ of a snapshot made on another host OS.
 
 Boots upstream's CI guest that tools/linux/boot-test.sh fetched, pauses it
 and takes a full snapshot. The state file is kept (tens of kilobytes); the
-memory file is removed. CI uploads the state file: a macOS (aarch64) or
-Windows host then checks what Firecracker does with a state made on Linux
-x86_64 (tools/macos/boot-test.py and tools/windows/boot-test.ps1,
-foreign-snapshot).
+memory file is removed unless SNAPSHOTDIR is given. CI uploads the state
+file: a macOS (aarch64) host then checks that Firecracker refuses a state
+made on Linux x86_64 (tools/macos/foreign-snapshot-test.py).
 
-  tools/linux/make-vmstate.py FIRECRACKER WORKDIR OUTDIR
+  tools/linux/make-vmstate.py FIRECRACKER WORKDIR OUTDIR [SNAPSHOTDIR]
 
 WORKDIR is boot-test.sh's --workdir (the kernel and rootfs are there).
 Writes OUTDIR/linux-<machine>.vmstate and OUTDIR/linux-<machine>.txt (the
 Firecracker version and the host's kernel). Exits non-zero, with the
 reason, if any step fails.
+
+With SNAPSHOTDIR the whole snapshot is kept there as well, for a host of
+the same architecture to restore (tools/windows/boot-test.ps1,
+linux-snapshot): the state file, the memory file (128 MiB) and the text
+file, which also has the root drive's size and SHA-256. The drive is named
+in the state as Firecracker was given it, by its file name alone
+(Firecracker runs in WORKDIR), so that a restore finds it in the directory
+it runs in, on any host.
 """
+import hashlib
 import http.client
 import json
 import os
 import platform
+import shutil
 import socket
 import subprocess
 import sys
@@ -84,9 +93,10 @@ def call(sock, method, path, body):
 
 
 def main():
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         sys.exit(__doc__)
-    fc, workdir, outdir = sys.argv[1:]
+    fc, workdir, outdir = (os.path.abspath(p) for p in sys.argv[1:4])
+    keep = os.path.abspath(sys.argv[4]) if len(sys.argv) == 5 else None
     kernel, rootfs = os.path.join(workdir, KERNEL), os.path.join(workdir, ROOTFS)
     for path in (fc, kernel, rootfs):
         if not os.path.exists(path):
@@ -98,13 +108,13 @@ def main():
     sock, mem = os.path.join(tmp, "api.sock"), os.path.join(tmp, "mem")
     with open(os.path.join(tmp, "console.txt"), "w") as console:
         proc = subprocess.Popen([fc, "--api-sock", sock], stdin=subprocess.DEVNULL, stdout=console,
-                                stderr=subprocess.STDOUT)
+                                stderr=subprocess.STDOUT, cwd=workdir)
         try:
             why = _wait_api(sock, proc)
             if why:
                 sys.exit(f"make-vmstate: {why}")
             call(sock, "PUT", "/boot-source", {"kernel_image_path": kernel, "boot_args": BOOT_ARGS})
-            call(sock, "PUT", "/drives/rootfs", {"drive_id": "rootfs", "path_on_host": rootfs, "is_root_device": True,
+            call(sock, "PUT", "/drives/rootfs", {"drive_id": "rootfs", "path_on_host": ROOTFS, "is_root_device": True,
                                                 "is_read_only": True})
             call(sock, "PUT", "/machine-config", {"vcpu_count": 1, "mem_size_mib": 128})
             call(sock, "PUT", "/actions", {"action_type": "InstanceStart"})
@@ -115,6 +125,9 @@ def main():
             call(sock, "PATCH", "/vm", {"state": "Paused"})
             call(sock, "PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": state,
                                                   "mem_file_path": mem})
+            if keep and os.path.exists(mem):
+                os.makedirs(keep, exist_ok=True)
+                shutil.move(mem, os.path.join(keep, f"linux-{machine}.mem"))
         finally:
             proc.kill()
             proc.wait()
@@ -124,8 +137,20 @@ def main():
     if size == 0:
         sys.exit(f"make-vmstate: {state} is empty")
     version = subprocess.run([fc, "--version"], capture_output=True, text=True).stdout.splitlines()[0]
+    text = f"{version}\nhost: {platform.platform()}\nstate: {os.path.basename(state)}, {size} bytes\n"
     with open(os.path.join(outdir, f"linux-{machine}.txt"), "w") as f:
-        f.write(f"{version}\nhost: {platform.platform()}\nstate: {os.path.basename(state)}, {size} bytes\n")
+        f.write(text)
+    if keep:
+        digest = hashlib.sha256()
+        with open(rootfs, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                digest.update(block)
+        with open(state, "rb") as src, open(os.path.join(keep, f"linux-{machine}.vmstate"), "wb") as dst:
+            dst.write(src.read())
+        with open(os.path.join(keep, f"linux-{machine}.txt"), "w") as f:
+            f.write(text + f"memory: linux-{machine}.mem, {os.path.getsize(os.path.join(keep, f'linux-{machine}.mem'))} bytes\n"
+                    f"rootfs: {ROOTFS}, {os.path.getsize(rootfs)} bytes, sha256 {digest.hexdigest()}\n")
+        print(f"make-vmstate: the whole snapshot is in {keep}")
     print(f"make-vmstate: {state}: {size} bytes ({version}, {platform.platform()})")
 
 
