@@ -1282,6 +1282,102 @@ mod tests {
         assert_eq!(present, 1, "WHvCapabilityCodeHypervisorPresent");
     }
 
+    // The record of a partition's `ProcessorXsaveFeatures`, for setting it
+    // from a CPU template's CPUID (the components WHP lets a guest enable,
+    // `xcr`): the layout of WHV_PROCESSOR_XSAVE_FEATURES in each Windows
+    // SDK's WinHvPlatformDefs.h on this host, with the SDK's version; what
+    // WHP offers (the capability) and what a VM's partition has, named by
+    // the newest SDK's fields; and what WHP does with a partition given
+    // fewer features than it offers: the HRESULTs of the property's set and
+    // of the set-up, and the value read back. Printed, not asserted.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_xsave_features_on_record() {
+        use super::super::xsave_features::{Field, header_layout, names, sdk_headers};
+        const CODE: whv::WHV_PARTITION_PROPERTY_CODE = whv::WHvPartitionPropertyCodeProcessorXsaveFeatures;
+        let headers = sdk_headers();
+        eprintln!(
+            "XSAVEFEAT WinHvPlatformDefs.h: {} found{}",
+            headers.len(),
+            headers.iter().map(|(v, p)| format!(" | SDK {v} {}", p.display())).collect::<String>()
+        );
+        let mut layout: Vec<Field> = Vec::new();
+        for (version, path) in &headers {
+            match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| header_layout(&t)) {
+                Ok(fields) => {
+                    let list: Vec<String> = fields
+                        .iter()
+                        .map(|f| match f.width {
+                            1 => format!("{} {}", f.bit, f.name),
+                            w => format!("{}..{} {}", f.bit, f.bit + w - 1, f.name),
+                        })
+                        .collect();
+                    eprintln!("XSAVEFEAT SDK {version} WHV_PROCESSOR_XSAVE_FEATURES: {}", list.join(", "));
+                    if layout.is_empty() {
+                        layout = fields;
+                    }
+                }
+                Err(e) => eprintln!("XSAVEFEAT SDK {version}: {e}"),
+            }
+        }
+        let named = |value: u64| if layout.is_empty() { "no header read".to_string() } else { names(&layout, value) };
+        let mask = |pick: &dyn Fn(&str) -> bool| layout.iter().filter(|f| f.width == 1 && pick(&f.name)).fold(0u64, |m, f| m | 1 << f.bit);
+        let mut offered = 0u64;
+        let mut n = 0u32;
+        // SAFETY: a buffer of the size passed.
+        let hres = unsafe { whv::WHvGetCapability(whv::WHvCapabilityCodeProcessorXsaveFeatures, (&raw mut offered).cast(), 8, &mut n) };
+        eprintln!("XSAVEFEAT offered (capability): HRESULT {:#010x}, {offered:#x} ({})", hres.cast_unsigned(), named(offered));
+        let get = |part: WHV_PARTITION_HANDLE| {
+            let (mut value, mut n) = (0u64, 0u32);
+            // SAFETY: a buffer of the size passed.
+            let hres = unsafe { whv::WHvGetPartitionProperty(part, CODE, (&raw mut value).cast(), 8, &mut n) };
+            (hres.cast_unsigned(), value)
+        };
+        let vm = VmFd::create().unwrap();
+        let (hres, value) = get(vm.inner.part);
+        eprintln!("XSAVEFEAT a VM's partition: HRESULT {hres:#010x}, {value:#x} ({})", named(value));
+        drop(vm);
+        // Fewer than offered, each on a partition of its own with one vCPU:
+        // the field names are the newest header's.
+        let xsave_only = mask(&|f| f.starts_with("Xsave") || f == "Xcr1Support");
+        let cases: [(&str, u64); 6] = [
+            ("all offered", offered),
+            ("without the AVX-512 fields", offered & !mask(&|f| f.starts_with("Avx512"))),
+            ("without MpxSupport", offered & !mask(&|f| f == "MpxSupport")),
+            ("without AvxSupport, the rest kept", offered & !mask(&|f| f == "AvxSupport")),
+            ("the XSAVE instructions alone", offered & xsave_only),
+            ("none", 0),
+        ];
+        for (what, value) in cases {
+            let Ok(part) = ffi::create_partition() else {
+                eprintln!("XSAVEFEAT {what}: no partition");
+                continue;
+            };
+            let one = 1u32;
+            // SAFETY: a u32, then a u64 property value of the kinds named.
+            let (count, set) = unsafe {
+                (
+                    whv::WHvSetPartitionProperty(part, whv::WHvPartitionPropertyCodeProcessorCount, (&raw const one).cast(), 4),
+                    whv::WHvSetPartitionProperty(part, CODE, (&raw const value).cast(), 8),
+                )
+            };
+            // SAFETY: the partition made above.
+            let setup = unsafe { whv::WHvSetupPartition(part) };
+            let (got_hres, got) = get(part);
+            eprintln!(
+                "XSAVEFEAT {what}: set {value:#x} ({}): ProcessorCount {:#010x}, set {:#010x}, set-up {:#010x}; read back HRESULT \
+                 {got_hres:#010x}, {got:#x} ({})",
+                named(value),
+                count.cast_unsigned(),
+                set.cast_unsigned(),
+                setup.cast_unsigned(),
+                named(got)
+            );
+            // SAFETY: the partition made above.
+            unsafe { whv::WHvDeletePartition(part) };
+        }
+    }
+
     // A vCPU's XSAVE state is read and written whole on every host: into
     // an area of the size `KVM_CAP_XSAVE2` reports, as upstream does it,
     // the state written back reading the same; `KVM_GET_XSAVE`, whose area

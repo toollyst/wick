@@ -830,6 +830,7 @@ jobs:
           }
           for t in test_print_whp_capabilities \
               test_xsave_state_fits_the_area_the_capability_reports \
+              test_xsave_features_on_record \
               test_vms_one_after_another_map_their_memory \
               test_one_partition_of_a_process_maps_memory \
               test_translate_as_kvm_at_the_entry_and_in_long_mode \

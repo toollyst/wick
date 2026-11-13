@@ -41,6 +41,9 @@ mod regs;
 mod tscdeadline;
 mod vcpu;
 mod xcr;
+// The record and the tests read WinHvPlatformDefs.h with it.
+#[cfg(test)]
+mod xsave_features;
 mod vm;
 mod whv;
 
