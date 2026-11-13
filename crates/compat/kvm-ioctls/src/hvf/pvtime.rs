@@ -479,19 +479,19 @@ fn thread_state(port: libc::mach_port_t) -> Option<(bool, u64)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use kvm_bindings::{kvm_device_attr, kvm_userspace_memory_region, kvm_vcpu_init};
 
     use crate::{Kvm, VcpuExit, VcpuFd, VmFd};
 
     const PVTIME_CTRL: u32 = 2; // KVM_ARM_VCPU_PVTIME_CTRL
     const PVTIME_IPA: u64 = 0; // KVM_ARM_VCPU_PVTIME_IPA
-    const RAM: u64 = 0x8000_0000;
+    pub(in crate::hvf) const RAM: u64 = 0x8000_0000;
     /// Where the tests put a vCPU's stolen-time structure: in RAM, 64-byte aligned.
     const ST: u64 = RAM + 0x2000;
-    const PC: u64 = 0x6030_0000_0010_0040;
-    const PSTATE: u64 = 0x6030_0000_0010_0042;
-    const X9: u64 = 0x6030_0000_0010_0012;
+    pub(in crate::hvf) const PC: u64 = 0x6030_0000_0010_0040;
+    pub(in crate::hvf) const PSTATE: u64 = 0x6030_0000_0010_0042;
+    pub(in crate::hvf) const X9: u64 = 0x6030_0000_0010_0012;
     /// SMCCC NOT_SUPPORTED as the 64-bit X0 the guest reads.
     const NOT_SUPPORTED: u64 = u64::MAX;
 
@@ -502,7 +502,7 @@ mod tests {
     /// A VM with one page of RAM at `RAM` (slot 0, with `flags`) holding
     /// `code`; the page's host address (filled with 0xaa past the code) and
     /// the VM.
-    fn vm_with_code(code: &[u32], flags: u32) -> (VmFd, *mut u8) {
+    pub(in crate::hvf) fn vm_with_code(code: &[u32], flags: u32) -> (VmFd, *mut u8) {
         let vm = Kvm::new().unwrap().create_vm().unwrap();
         // SAFETY: plain call.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
@@ -530,7 +530,7 @@ mod tests {
         (vm, mem)
     }
 
-    fn new_vcpu(vm: &VmFd, id: u64) -> VcpuFd {
+    pub(in crate::hvf) fn new_vcpu(vm: &VmFd, id: u64) -> VcpuFd {
         let vcpu = vm.create_vcpu(id).unwrap();
         let mut kvi = kvm_vcpu_init::default();
         vm.get_preferred_target(&mut kvi).unwrap();
@@ -640,7 +640,7 @@ mod tests {
 
     /// Runs `vcpu` on a thread of its own until the guest has stored `n`
     /// values to MMIO; the values.
-    fn mmio_values(mut vcpu: VcpuFd, n: usize) -> Vec<u64> {
+    pub(in crate::hvf) fn mmio_values(mut vcpu: VcpuFd, n: usize) -> Vec<u64> {
         std::thread::spawn(move || {
             vcpu.set_one_reg(PC, &RAM.to_le_bytes()).unwrap();
             vcpu.set_one_reg(PSTATE, &0x3c5u64.to_le_bytes()).unwrap();

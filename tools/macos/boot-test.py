@@ -403,8 +403,27 @@ def stage_boot(ctx):
     _, t1 = vm.sh("cat /proc/uptime")
     dt = float(t1.split()[0]) - float(t0.split()[0])
     check(1.5 < dt < 4, f"guest clock advanced {dt:.2f}s in 2s")
+    # What the guest finds behind its hypervisor calls, as on KVM (Linux
+    # v6.1 arch/arm64/kvm): PSCI 1.1 (include/kvm/arm_psci.h
+    # KVM_ARM_PSCI_LATEST; the guest's drivers/firmware/psci/psci.c prints
+    # the version), and the SMCCC TRNG service (trng.c), for which the
+    # guest makes a platform device once TRNG_VERSION answers 1.0 or more
+    # (drivers/firmware/smccc/smccc.c).
+    _, psci = vm.sh("dmesg | grep -o 'PSCIv[0-9.]* detected in firmware'")
+    check(psci == "PSCIv1.1 detected in firmware", f"the guest's PSCI: {psci!r}")
+    vm.sh("test -d /sys/devices/platform/smccc_trng")
+    # A warm reset: with PSCI 1.1 the guest calls SYSTEM_RESET2 (psci.c
+    # psci_sys_reset), which KVM gives the VMM as a reset with the RESET2
+    # flag (psci.c kvm_psci_system_reset2); Firecracker logs the event and
+    # its flags and exits 0, as for SYSTEM_RESET (flags 0: every other
+    # stage's reset, checked in `smp`).
+    vm.sh("echo warm > /sys/kernel/reboot/mode")
     vm.reboot()
-    return f"init reached, serial in/out, clock, reset exits 0"
+    vm.pump.join(5)
+    check("Received KVM_SYSTEM_EVENT: type: 2, event: [1]" in vm.buf,
+          f"no reset event flagged RESET2 ({vm.exit_reason()})")
+    return ("init reached, serial in/out, clock, PSCI 1.1 and the SMCCC TRNG service found, "
+            "warm reset (SYSTEM_RESET2) exits 0")
 
 
 def stage_smp(ctx):
@@ -419,6 +438,9 @@ def stage_smp(ctx):
     check(out.endswith("spun"), f"parallel work: {out!r}")
     cpu_offline_online(vm, "smp")
     vm.reboot()
+    vm.pump.join(5)
+    check("Received KVM_SYSTEM_EVENT: type: 2, event: [0]" in vm.buf,
+          f"no reset event with flags 0 for SYSTEM_RESET ({vm.exit_reason()})")
     return "2 vCPUs online, work runs on each; cpu1 offline and online 3 times (PSCI CPU_OFF, CPU_ON)"
 
 

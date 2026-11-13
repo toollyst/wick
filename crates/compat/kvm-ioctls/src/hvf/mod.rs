@@ -39,6 +39,9 @@ pub fn pv_time_offered() -> bool {
     pvtime::supported()
 }
 mod regs;
+#[cfg(test)]
+mod smccc_tests;
+mod trng;
 mod vcpu;
 mod vm;
 mod wait;

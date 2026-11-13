@@ -25,6 +25,7 @@ use super::gic::{CpuReg, GicCpu};
 use super::idregs;
 use super::pvtime;
 use super::regs::{self, Reg, reg_size};
+use super::trng;
 use super::vm::VmInner;
 use super::wait::{Ended, Waiter};
 use super::{Error, Handle, Result, VcpuExit, err};
@@ -43,6 +44,7 @@ const PSCI_RET_SUCCESS: i64 = 0;
 const PSCI_RET_NOT_SUPPORTED: i64 = -1;
 const PSCI_RET_INVALID_PARAMS: i64 = -2;
 const PSCI_RET_ALREADY_ON: i64 = -4;
+const PSCI_RET_INTERNAL_FAILURE: i64 = -6;
 /// "Trusted OS not present": no migration needed.
 const PSCI_TOS_NOT_PRESENT_MP: i64 = 2;
 
@@ -50,6 +52,9 @@ const MPIDR_AFFINITY_MASK: u64 = 0xff_00ff_ffff;
 /// `kvm_run.system_event.data` of a PSCI SYSTEM_OFF or SYSTEM_RESET exit:
 /// `ndata` 1, the flags 0 (KVM since Linux 5.18).
 static SYSTEM_EVENT_DATA: [u64; 1] = [0];
+/// And of a SYSTEM_RESET2 exit: `KVM_SYSTEM_EVENT_RESET_FLAG_PSCI_RESET2`,
+/// bit 0 (arch/arm64/include/uapi/asm/kvm.h; psci.c kvm_psci_system_reset2).
+static SYSTEM_RESET2_EVENT_DATA: [u64; 1] = [1];
 
 /// KVM's MPIDR for vCPU `id` (`reset_mpidr` in Linux arch/arm64/kvm/sys_regs.c).
 fn kvm_mpidr(id: u64) -> u64 {
@@ -613,7 +618,7 @@ fn read_reg(hv: hv_vcpu_t, id: u64, out: &mut [u8]) -> Result<()> {
                 Reg::PhysicalCount => v = mach_absolute_time(),
                 Reg::Aarch32Spsr => {}
                 // A new VM's; the VM's own is read in get_reg_now.
-                Reg::PsciVersion => v = regs::PSCI_VERSION_1_0,
+                Reg::PsciVersion => v = regs::PSCI_VERSION_1_1,
                 // A new vCPU's: the lock clear, as KVM resets it.
                 Reg::OsLock => v = exit::OSLSR_RESET,
             }
@@ -665,10 +670,11 @@ impl VcpuFd {
         Ok(())
     }
 
-    /// Sets the VM's PSCI version: 1.0, or 0.2 (a snapshot taken when 0.2
-    /// was the one offered). KVM also takes 1.1, which is not offered here.
+    /// Sets the VM's PSCI version: 1.1, or 1.0 or 0.2 (a snapshot taken
+    /// when that was the one offered), the three KVM takes
+    /// (hypercalls.c kvm_arm_set_fw_reg).
     fn set_psci_version(&self, v: u64) -> Result<()> {
-        if v != regs::PSCI_VERSION_0_2 && v != regs::PSCI_VERSION_1_0 {
+        if ![regs::PSCI_VERSION_0_2, regs::PSCI_VERSION_1_0, regs::PSCI_VERSION_1_1].contains(&v) {
             return err(libc::EINVAL);
         }
         self.vm()?.psci_version.store(v, Ordering::Relaxed);
@@ -1338,17 +1344,32 @@ impl VcpuFd {
         }
     }
 
-    /// Handles a call through the SMCCC conduit (PSCI, SMCCC, KVM's vendor
-    /// services). Returns a system event to report, if any.
-    fn psci(&self, hv: hv_vcpu_t) -> Result<Option<u32>> {
+    /// Handles a call through the SMCCC conduit (PSCI, SMCCC, the TRNG and
+    /// KVM's vendor services). Returns a system event to report, if any,
+    /// with its data.
+    fn psci(&self, hv: hv_vcpu_t) -> Result<Option<(u32, &'static [u64; 1])>> {
         let call = Psci::decode(self.reg(hv, HV_REG_X0)?);
         let x1 = self.reg(hv, HV_REG_X0 + 1)?;
-        let psci_1_0 = self.vm()?.psci_version.load(Ordering::Relaxed) == regs::PSCI_VERSION_1_0;
+        // The guest's PSCI version: 1.`minor`, or 0.2 (`None`).
+        let version = self.vm()?.psci_version.load(Ordering::Relaxed);
+        let minor = match version {
+            regs::PSCI_VERSION_1_0 => Some(0),
+            regs::PSCI_VERSION_1_1 => Some(1),
+            _ => None,
+        };
         let words = match call {
             Psci::SmcccVersion => Some([exit::SMCCC_VERSION_1_1, 0, 0, 0]),
-            // PV time's calls; no SMCCC_ARCH_WORKAROUND_* (nor TRNG) is
-            // implemented: the guest relies on what its CPU features say, as
-            // on a host whose firmware has none.
+            // The TRNG service, whatever the PSCI version
+            // (hypercalls.c kvm_hvc_call_handler, trng.c kvm_trng_call).
+            Psci::TrngVersion => Some([trng::VERSION_1_0, 0, 0, 0]),
+            Psci::TrngFeatures => Some([trng::features(x1), 0, 0, 0]),
+            Psci::TrngGetUuid => Some(trng::UUID),
+            // The number of bits is W1 (`u32 num_bits = smccc_get_arg1()`).
+            Psci::TrngRnd32 => Some(trng::rnd(32, x1 as u32, trng::host_entropy)),
+            Psci::TrngRnd64 => Some(trng::rnd(64, x1 as u32, trng::host_entropy)),
+            // PV time's calls; no SMCCC_ARCH_WORKAROUND_* is implemented:
+            // the guest relies on what its CPU features say, as on a host
+            // whose firmware has none.
             Psci::SmcccArchFeatures => Some([
                 pvtime::arch_feature(x1 as u32).unwrap_or(PSCI_RET_NOT_SUPPORTED as u64),
                 0,
@@ -1373,10 +1394,23 @@ impl VcpuFd {
             return Ok(None);
         }
         let ret: i64 = match call {
-            Psci::Version if psci_1_0 => regs::PSCI_VERSION_1_0 as i64,
-            Psci::Version => regs::PSCI_VERSION_0_2 as i64,
-            Psci::Features if psci_1_0 && Psci::implemented(x1) => PSCI_RET_SUCCESS,
+            Psci::Version => version as i64,
+            Psci::Features if minor.is_some_and(|minor| Psci::implemented(x1, minor)) => PSCI_RET_SUCCESS,
             Psci::Features => PSCI_RET_NOT_SUPPORTED,
+            // PSCI 1.1 (kvm_psci_1_x_call): an architectural reset type up
+            // to SYSTEM_WARM_RESET (0), or a vendor one (bit 31), is a reset
+            // for the VMM, flagged as RESET2, with INTERNAL_FAILURE in X0
+            // should the guest run on; another type is INVALID_PARAMS. KVM
+            // keeps the type in a u32, for the SMC64 call as well.
+            Psci::SystemReset2 if minor == Some(1) => {
+                let reset_type = x1 as u32;
+                if reset_type == 0 || reset_type >= 0x8000_0000 {
+                    self.set_reg(hv, HV_REG_X0, PSCI_RET_INTERNAL_FAILURE as u64)?;
+                    return Ok(Some((KVM_SYSTEM_EVENT_RESET, &SYSTEM_RESET2_EVENT_DATA)));
+                }
+                PSCI_RET_INVALID_PARAMS
+            }
+            Psci::SystemReset2 => PSCI_RET_NOT_SUPPORTED,
             Psci::CpuSuspend => {
                 self.wait_for_interrupt(hv)?;
                 PSCI_RET_SUCCESS
@@ -1408,10 +1442,15 @@ impl VcpuFd {
                 Some(target) => i64::from(target.powered_off()),
             },
             Psci::MigrateInfoType => PSCI_TOS_NOT_PRESENT_MP,
-            Psci::SystemOff => return Ok(Some(KVM_SYSTEM_EVENT_SHUTDOWN)),
-            Psci::SystemReset => return Ok(Some(KVM_SYSTEM_EVENT_RESET)),
+            Psci::SystemOff => return Ok(Some((KVM_SYSTEM_EVENT_SHUTDOWN, &SYSTEM_EVENT_DATA))),
+            Psci::SystemReset => return Ok(Some((KVM_SYSTEM_EVENT_RESET, &SYSTEM_EVENT_DATA))),
             Psci::NotSupported => PSCI_RET_NOT_SUPPORTED,
             Psci::SmcccVersion
+            | Psci::TrngVersion
+            | Psci::TrngFeatures
+            | Psci::TrngGetUuid
+            | Psci::TrngRnd32
+            | Psci::TrngRnd64
             | Psci::SmcccArchFeatures
             | Psci::VendorHypUid
             | Psci::KvmFeatures
@@ -1706,11 +1745,11 @@ impl VcpuFd {
                     if call == Exit::Smc {
                         self.advance_pc(hv)?;
                     }
-                    if let Some(event) = self.psci(hv)? {
+                    if let Some((event, data)) = self.psci(hv)? {
                         // As KVM since Linux 5.18 (kvm_prepare_system_event):
                         // one word of data, the event's flags, 0 for PSCI's
                         // SYSTEM_OFF and SYSTEM_RESET.
-                        return Ok(VcpuExit::SystemEvent(event, &SYSTEM_EVENT_DATA));
+                        return Ok(VcpuExit::SystemEvent(event, data));
                     }
                 }
                 Exit::Wfi => {

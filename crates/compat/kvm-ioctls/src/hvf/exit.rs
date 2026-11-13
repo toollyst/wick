@@ -256,9 +256,10 @@ pub const PV_TIME_FEATURES: u32 = 0xc500_0020;
 pub const PV_TIME_ST: u32 = 0xc500_0021;
 
 /// A call through the SMCCC conduit (HVC or SMC), from the function id in
-/// W0 (SMC32 and SMC64 ids): the PSCI 1.0 calls, SMCCC 1.1's own and KVM's
-/// vendor hypervisor services, what KVM answers for a guest on Linux
-/// (arch/arm64/kvm/psci.c, hypercalls.c), and PV time's (`super::pvtime`).
+/// W0 (SMC32 and SMC64 ids): the PSCI 1.1 calls, SMCCC 1.1's own, the TRNG
+/// service's (`super::trng`) and KVM's vendor hypervisor services, what KVM
+/// answers for a guest on Linux (arch/arm64/kvm/psci.c, hypercalls.c,
+/// trng.c), and PV time's (`super::pvtime`).
 /// Without SMCCC 1.1 a Linux guest
 /// finds no hypervisor services: no `ptp_kvm` clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +282,18 @@ pub enum Psci {
     SystemReset,
     /// PSCI_FEATURES (PSCI 1.0): X1 a function id.
     Features,
+    /// SYSTEM_RESET2 (PSCI 1.1): X1 the reset type, X2 a cookie.
+    SystemReset2,
+    /// TRNG_VERSION (Arm DEN0098).
+    TrngVersion,
+    /// TRNG_FEATURES: X1 a function id.
+    TrngFeatures,
+    /// TRNG_GET_UUID.
+    TrngGetUuid,
+    /// TRNG_RND32: X1 the number of bits, at most 96.
+    TrngRnd32,
+    /// TRNG_RND64: X1 the number of bits, at most 192.
+    TrngRnd64,
     /// SMCCC_VERSION.
     SmcccVersion,
     /// SMCCC_ARCH_FEATURES: X1 a function id.
@@ -320,6 +333,12 @@ impl Psci {
             0x8400_0008 => Psci::SystemOff,
             0x8400_0009 => Psci::SystemReset,
             0x8400_000a => Psci::Features,
+            0x8400_0012 | 0xc400_0012 => Psci::SystemReset2,
+            super::trng::VERSION => Psci::TrngVersion,
+            super::trng::FEATURES => Psci::TrngFeatures,
+            super::trng::GET_UUID => Psci::TrngGetUuid,
+            super::trng::RND32 => Psci::TrngRnd32,
+            super::trng::RND64 => Psci::TrngRnd64,
             0x8000_0000 => Psci::SmcccVersion,
             0x8000_0001 => Psci::SmcccArchFeatures,
             0x8600_ff01 => Psci::VendorHypUid,
@@ -331,10 +350,16 @@ impl Psci {
         }
     }
 
-    /// PSCI_FEATURES for function id `id`: whether it is implemented (0,
-    /// and for CPU_SUSPEND: the original power_state format, no OS-initiated
-    /// mode), as KVM answers (kvm_psci_1_x_call).
-    pub fn implemented(id: u64) -> bool {
+    /// PSCI_FEATURES for function id `id` from a guest given PSCI 1.`minor`:
+    /// whether it is implemented (0, and for CPU_SUSPEND: the original
+    /// power_state format, no OS-initiated mode), as KVM answers
+    /// (kvm_psci_1_x_call): SYSTEM_RESET2 from 1.1 on; SYSTEM_SUSPEND only
+    /// when the VMM enabled it for the VM (KVM_CAP_ARM_SYSTEM_SUSPEND),
+    /// which Firecracker does not.
+    pub fn implemented(id: u64, minor: u32) -> bool {
+        if Psci::decode(id) == Psci::SystemReset2 {
+            return minor >= 1 && id >> 32 == 0;
+        }
         matches!(
             Psci::decode(id),
             Psci::Version
@@ -432,6 +457,20 @@ mod tests {
         assert_eq!(Psci::decode(0xc400_0003), Psci::CpuOn);
         assert_eq!(Psci::decode(0x8400_0005), Psci::NotSupported);
         assert_eq!(Psci::decode(0x8400_000a), Psci::Features);
+        assert_eq!(Psci::decode(0x8400_0012), Psci::SystemReset2);
+        assert_eq!(Psci::decode(0xc400_0012), Psci::SystemReset2);
+        for (id, call) in [
+            (0x8400_0050, Psci::TrngVersion),
+            (0x8400_0051, Psci::TrngFeatures),
+            (0x8400_0052, Psci::TrngGetUuid),
+            (0x8400_0053, Psci::TrngRnd32),
+            (0xc400_0053, Psci::TrngRnd64),
+            // The other calls have no SMC64 form (include/linux/arm-smccc.h).
+            (0xc400_0050, Psci::NotSupported),
+            (0x8400_0054, Psci::NotSupported),
+        ] {
+            assert_eq!(Psci::decode(id), call, "{id:#x}");
+        }
         assert_eq!(Psci::decode(0x8000_0000), Psci::SmcccVersion);
         assert_eq!(Psci::decode(0x8600_ff01), Psci::VendorHypUid);
         assert_eq!(Psci::decode(0x8600_0001), Psci::KvmPtp);
@@ -443,14 +482,33 @@ mod tests {
 
     #[test]
     fn test_psci_features_and_ptp() {
-        // PSCI_FEATURES: the PSCI 1.0 calls and SMCCC_VERSION, nothing else.
-        for id in [0x8400_0000, 0xc400_0003, 0x8400_0009, 0x8400_000a, 0x8000_0000] {
-            assert!(Psci::implemented(id), "{id:#x}");
+        // PSCI_FEATURES: the PSCI 1.0 calls and SMCCC_VERSION, and from
+        // PSCI 1.1 SYSTEM_RESET2 (both forms); nothing else.
+        for minor in [0, 1] {
+            for id in [0x8400_0000, 0xc400_0003, 0x8400_0009, 0x8400_000a, 0x8000_0000] {
+                assert!(Psci::implemented(id, minor), "{id:#x}");
+            }
+            // MIGRATE, SYSTEM_SUSPEND (not enabled for the VM), MEM_PROTECT,
+            // the workarounds, the TRNG's and KVM's services (they are not
+            // PSCI), garbage in the upper half.
+            for id in [
+                0x8400_0005,
+                0x8400_000e,
+                0xc400_000e,
+                0x8400_0013,
+                0x8000_8000,
+                0x8400_0050,
+                0x8600_0001,
+                0xc500_0020,
+                1 << 32 | 0x8400_0000,
+                1 << 32 | 0x8400_0012,
+            ] {
+                assert!(!Psci::implemented(id, minor), "{id:#x}");
+            }
         }
-        // MIGRATE, SYSTEM_SUSPEND, SYSTEM_RESET2, the workarounds, KVM's
-        // services (they are not PSCI), garbage in the upper half.
-        for id in [0x8400_0005, 0xc400_000e, 0x8400_0012, 0x8000_8000, 0x8600_0001, 0xc500_0020, 1 << 32 | 0x8400_0000] {
-            assert!(!Psci::implemented(id), "{id:#x}");
+        for id in [0x8400_0012, 0xc400_0012] {
+            assert!(!Psci::implemented(id, 0), "{id:#x}");
+            assert!(Psci::implemented(id, 1), "{id:#x}");
         }
         assert_eq!(ptp_words(0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321), [
             0x1234_5678,

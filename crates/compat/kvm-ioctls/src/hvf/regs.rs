@@ -196,8 +196,12 @@ pub fn reg_list() -> Vec<u64> {
 
 /// PSCI 0.2 as encoded in `KVM_REG_ARM_PSCI_VERSION` (`major << 16 | minor`).
 pub const PSCI_VERSION_0_2: u64 = 2;
-/// PSCI 1.0, the version a new VM's guest is given.
+/// PSCI 1.0, the version this backend offered before 1.1: a snapshot taken
+/// then restores it.
 pub const PSCI_VERSION_1_0: u64 = 0x1_0000;
+/// PSCI 1.1, the version a new VM's guest is given, as KVM's
+/// (include/kvm/arm_psci.h `KVM_ARM_PSCI_LATEST`).
+pub const PSCI_VERSION_1_1: u64 = 0x1_0001;
 
 /// KVM register id of `KVM_REG_ARM_PSCI_VERSION` (the tests'; `decode`
 /// matches its parts).
