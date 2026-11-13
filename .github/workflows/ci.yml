@@ -1118,9 +1118,11 @@ jobs:
           # Linux gives the zero page uncharged: what it commits here, and
           # what a read-only zero page mapped at the guest's pages would
           # cost in WHvMapGpaRange calls (Linux's: LINUXGRAIN read steps);
-          # then a guest write to a page mapped read only and to a
-          # KVM_MEM_READONLY slot, without and with the GpaAccessFaultExit
-          # exit: which exits WHP makes and what the run gives.
+          # and a guest write to one of them (its address was 3 MiB, not
+          # the zero page's, until 87d0328: a triple fault); then a guest
+          # write to a page mapped read only and to a KVM_MEM_READONLY
+          # slot, without and with the GpaAccessFaultExit exit: which exits
+          # WHP makes and what the run gives.
           alone whp::vcpu::fpu_tests::test_a_guest_read_of_untouched_ram_on_record
           # What each call of the backend commits of its thread's stack
           # (STACKTEST lines), each on a thread of its own: which one leaves

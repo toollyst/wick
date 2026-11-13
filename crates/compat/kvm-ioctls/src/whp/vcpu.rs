@@ -6321,7 +6321,14 @@ mod fpu_tests {
             pass(LAZY_GPA as u32, false),
             pass(LAZY_GPA as u32, true),
             pass(ZERO_GPA as u32, false),
-            vec![0xC6, 0x04, 0x25, 0x00, 0x00, 0x30, 0x00, 0x01, 0xE6, PORT as u8], // mov byte [ZERO_GPA], 1; out
+            // mov byte [ZERO_GPA], 1; out. Its address was written out by
+            // hand until 87d0328 as 0x0030_0000 (3 MiB) for ZERO_GPA's
+            // 0x0300_0000 (48 MiB): a linear address these page tables do
+            // not map (the PD has 2 MiB pages from 0 and from LAZY_GPA up)
+            // and no handler in the IDT, so a #PF, then #DF and a triple
+            // fault: the "exits Shutdown" of the PC's 87d0328 run, not a
+            // write of the zero page.
+            [&[0xC6, 0x04, 0x25][..], &(ZERO_GPA as u32).to_le_bytes(), &[0x01, 0xE6, PORT as u8]].concat(),
             vec![0xF4, 0xEB, 0xFD],
         ]
         .concat();
