@@ -593,6 +593,21 @@ impl From<&Event> for Fired {
     }
 }
 
+/// The calling thread's buffers for [`Epoll::wait`], kept between waits.
+#[derive(Default)]
+struct Scratch {
+    /// The completion port's packets.
+    packets: Option<Events>,
+    /// What was found ready: packets and direct checks.
+    fired: Vec<Fired>,
+    /// A descriptor's slot in the caller's array.
+    slot_of: HashMap<RawFd, usize>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
 /// An epoll instance backed by an I/O completion port.
 #[derive(Debug)]
 pub struct Epoll {
@@ -828,21 +843,48 @@ impl Epoll {
 
     /// Waits up to `timeout` milliseconds (`-1`: forever) and fills `events`.
     /// Returns the number of events written.
+    ///
+    /// Allocates nothing once its thread has waited with as much room
+    /// before, as Linux's `epoll_wait` writes into the caller's array: the
+    /// port's packets, what is found ready and the map of a descriptor to
+    /// its slot are the thread's, kept between waits ([`SCRATCH`]). Each
+    /// wait allocated them before (the packets' room twice the caller's,
+    /// for the event manager's 256 events), on every pass of the VMM's
+    /// event loop, as the macOS instance did (d0dbe31;
+    /// `test_a_wait_allocates_nothing`). A nested instance's packets
+    /// (`Nest::take`) and a console in line input mode (`line_ready`) still
+    /// allocate when they are there.
     pub fn wait(&self, timeout: i32, events: &mut [EpollEvent]) -> io::Result<usize> {
         let Some(cap) = NonZeroUsize::new(events.len()) else {
             return Err(einval());
         };
+        SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+            Ok(mut scratch) => self.wait_with(timeout, events, cap, &mut scratch),
+            // Not reached: nothing a wait calls waits again. Fresh ones then.
+            Err(_) => self.wait_with(timeout, events, cap, &mut Scratch::default()),
+        })
+    }
+
+    fn wait_with(&self, timeout: i32, events: &mut [EpollEvent], cap: NonZeroUsize, scratch: &mut Scratch) -> io::Result<usize> {
         let timeout = u64::try_from(timeout).ok().map(Duration::from_millis);
         let deadline = timeout.map(|t| std::time::Instant::now() + t);
-        let mut fired = Events::with_capacity(cap.saturating_mul(NonZeroUsize::new(2).unwrap()));
+        let room = cap.saturating_mul(NonZeroUsize::new(2).unwrap());
+        let Scratch { packets, fired, slot_of } = scratch;
+        let packets = match packets {
+            Some(p) if p.capacity() >= room => p,
+            _ => packets.insert(Events::with_capacity(room)),
+        };
         loop {
             self.rearm()?;
             // What is ready already, without waiting for its packet.
             let nested = self.nest.active.load(Ordering::Acquire);
-            let mut ready = if nested { self.nest.take() } else { Vec::new() };
-            ready.extend(self.sweep());
-            if !ready.is_empty() {
-                let count = self.collect(&ready, events)?;
+            fired.clear();
+            if nested {
+                fired.extend(self.nest.take());
+            }
+            self.sweep(fired);
+            if !fired.is_empty() {
+                let count = self.collect(fired, events, slot_of)?;
                 if count > 0 {
                     return Ok(count);
                 }
@@ -861,27 +903,28 @@ impl Epoll {
                 }
                 continue;
             }
-            fired.clear();
+            packets.clear();
             let left = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
-            self.poller.wait(&mut fired, left)?;
-            let mut all: Vec<Fired> = fired.iter().map(|ev| Fired::from(&ev)).collect();
-            if !all.is_empty() {
-                all.extend(self.sweep());
+            self.poller.wait(packets, left)?;
+            fired.clear();
+            fired.extend(packets.iter().map(|ev| Fired::from(&ev)));
+            if !fired.is_empty() {
+                self.sweep(fired);
             }
-            let count = self.collect(&all, events)?;
+            let count = self.collect(fired, events, slot_of)?;
             // Readiness that turned out to be none (console records with no
             // bytes, a packet gone stale) does not end the wait, as epoll
             // would not have woken.
-            if count > 0 || fired.is_empty() || left == Some(Duration::ZERO) {
+            if count > 0 || packets.is_empty() || left == Some(Duration::ZERO) {
                 return Ok(count);
             }
         }
     }
 
-    /// The level-triggered eventfds and sockets that are ready now.
-    fn sweep(&self) -> Vec<Fired> {
+    /// Adds the level-triggered eventfds and sockets that are ready now to
+    /// `out`.
+    fn sweep(&self, out: &mut Vec<Fired>) {
         let interests = self.interests.lock().unwrap();
-        let mut out = Vec::new();
         for (fd, interest) in interests.iter() {
             if interest.disarmed || interest.edge() {
                 continue;
@@ -946,13 +989,12 @@ impl Epoll {
                 }
             }
         }
-        out
     }
 
-    fn collect(&self, fired: &[Fired], events: &mut [EpollEvent]) -> io::Result<usize> {
+    fn collect(&self, fired: &[Fired], events: &mut [EpollEvent], slot_of: &mut HashMap<RawFd, usize>) -> io::Result<usize> {
         let mut interests = self.interests.lock().unwrap();
         let mut count = 0usize;
-        let mut slot_of: HashMap<RawFd, usize> = HashMap::new();
+        slot_of.clear();
         for ev in fired {
             let (fd, sub) = unkey(ev.key);
             let Some(interest) = interests.get(&fd).copied() else {
@@ -1095,6 +1137,64 @@ mod tests {
             .iter()
             .map(|e| (e.data(), e.event_set()))
             .collect()
+    }
+
+    /// Counts the calling thread's allocations, for
+    /// [`test_a_wait_allocates_nothing`].
+    struct Counting;
+    thread_local! {
+        static ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    // SAFETY: the system allocator's, with a count beside it.
+    unsafe impl std::alloc::GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+            // SAFETY: the caller's layout.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            // SAFETY: a block of this allocator, with its layout.
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    // A wait allocates nothing once its thread has waited before, as
+    // Linux's epoll_wait writes into the caller's array, and as the macOS
+    // instance's does since d0dbe31 (its wait allocated 70 MB in one vsock
+    // test). Each wait here allocated the port's packets (room for twice
+    // the caller's events), the list of what was ready and the map of a
+    // descriptor to its slot, on every pass of the VMM's event loop. Both
+    // ways a wait ends: with eventfds found ready by the direct check, and
+    // with nothing ready, through the completion port.
+    #[test]
+    fn test_a_wait_allocates_nothing() {
+        let epoll = Epoll::new().unwrap();
+        let evts: Vec<EventFd> = (0..3).map(|_| EventFd::new(EFD_NONBLOCK).unwrap()).collect();
+        for (i, evt) in evts.iter().enumerate() {
+            epoll
+                .ctl(ControlOperation::Add, evt.as_raw_fd(), EpollEvent::new(EventSet::IN, i as u64))
+                .unwrap();
+            evt.write(1).unwrap();
+        }
+        let mut ready = [EpollEvent::default(); 256];
+        assert_eq!(epoll.wait(0, &mut ready).unwrap(), 3);
+        let before = ALLOCATIONS.with(std::cell::Cell::get);
+        for _ in 0..100 {
+            assert_eq!(epoll.wait(0, &mut ready).unwrap(), 3);
+        }
+        let ready_ones = ALLOCATIONS.with(std::cell::Cell::get) - before;
+        for evt in &evts {
+            evt.read().unwrap();
+        }
+        assert_eq!(epoll.wait(0, &mut ready).unwrap(), 0);
+        let before = ALLOCATIONS.with(std::cell::Cell::get);
+        for _ in 0..100 {
+            assert_eq!(epoll.wait(0, &mut ready).unwrap(), 0);
+        }
+        let none = ALLOCATIONS.with(std::cell::Cell::get) - before;
+        assert_eq!((ready_ones, none), (0, 0), "allocations in 100 waits with 3 eventfds ready, and in 100 with none");
     }
 
     // A rate limiter's timer (vmm's rng test_bandwidth_rate_limiter: the
