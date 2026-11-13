@@ -114,8 +114,6 @@ bug vmm arch::x86_64::interrupts::tests::test_setlint_fails
 #   unwrap_err of Ok); on KVM its KVM_GET_LAPIC fails there)
 bug vmm arch::x86_64::msr::tests::test_set_invalid_msrs
 #   (set_msrs of MSR 2, which KVM does not support, succeeds (msr.rs:537))
-bug vmm arch::x86_64::regs::tests::test_setup_fpu
-#   (after setup_fpu, get_fpu reads fcw 0, not the 0x37f set (regs.rs:366))
 bug vmm arch::x86_64::vcpu::tests::test_get_msrs_with_invalid_msr_index
 #   (get_msrs of MSRs 2..=4, which KVM does not support, succeeds (vcpu.rs:1214))
 bug vmm arch::x86_64::vm::tests::test_vm_save_restore_state
