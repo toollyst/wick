@@ -3096,14 +3096,42 @@ mod tests {
     /// report) commits as a host access does; the data is the section's
     /// through an `mprotect`; an `munmap` gives the charge back. Before,
     /// such memory was committed whole at the mmap and charged to no job.
+    ///
+    /// The checks run in a process of their own ([`charge_child`]):
+    /// `PagefileUsage` is the whole process's, and in the crate's test
+    /// process the other tests run beside this one on other threads, so
+    /// what they free at the same time is netted out of it. CI run
+    /// 43521200989 read 3012 KiB for the 1024 pages there, where the
+    /// pages committed (`committed`) were the 1024 written. The charge's
+    /// own reservation is checked too: one page of it committed for each
+    /// page of the section, which no other thread's memory moves.
     #[test]
     fn test_anonymous_shared_memory_is_charged_at_first_touch() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "windows_mm::tests::charge_child", "--ignored", "--nocapture"])
+            .output()
+            .unwrap();
+        let text = std::format!("{}{}", std::string::String::from_utf8_lossy(&out.stdout), std::string::String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && text.contains("test result: ok. 1 passed"), "{text}");
+    }
+
+    /// The charge's reservation for the view at `p`: pages of it committed.
+    fn charge_committed(p: usize) -> usize {
+        let (base, n) = CHARGES.lock().unwrap().get(&p).map(|(n, c)| (c.base, *n)).expect("no charge for the view");
+        committed(base, n)
+    }
+
+    #[test]
+    #[ignore = "run by test_anonymous_shared_memory_is_charged_at_first_touch, in a process of its own"]
+    fn charge_child() {
         let _serial = serial();
         let len = 16 << 20;
         let before = private_commit();
         let p = map(0, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
         assert_eq!(state(p), MEM_RESERVE, "committed at the mmap");
         assert_eq!(committed(p, len), 0);
+        assert_eq!(charge_committed(p), 0, "the charge committed at the mmap");
         let mapped = private_commit();
         assert!(mapped < before + (1 << 20), "the mmap charged {} KiB", (mapped - before) / 1024);
         for i in 0..1024 {
@@ -3111,8 +3139,16 @@ mod tests {
             unsafe { *((p + 2 * i * PAGE) as *mut u8) = (i % 251) as u8 + 1 };
         }
         assert_eq!(committed(p, len), 1024 * PAGE, "a write committed more or less than its page");
+        assert_eq!(charge_committed(p), 1024 * PAGE, "the charge for 1024 pages written");
         let written = private_commit();
-        assert!(written >= mapped + 1024 * PAGE, "1024 pages written charged {} KiB", (written - mapped) / 1024);
+        assert!(
+            written >= mapped + 1024 * PAGE,
+            "1024 pages written charged {} KiB (private commit {} KiB at the start, {} KiB mapped, {} KiB written)",
+            written.saturating_sub(mapped) / 1024,
+            before / 1024,
+            mapped / 1024,
+            written / 1024
+        );
         // A read of an untouched page.
         // SAFETY: as above.
         assert_eq!(unsafe { *((p + PAGE) as *const u8) }, 0);
@@ -3124,6 +3160,7 @@ mod tests {
         // SAFETY: our mapping.
         assert_eq!(unsafe { mprotect(p as *mut c_void, len, PROT_READ) }, 0);
         assert_eq!(committed(p, len), 1026 * PAGE);
+        assert_eq!(charge_committed(p), 1026 * PAGE, "the charge for a read and the guest's access");
         for i in 0..1024 {
             // SAFETY: as above.
             assert_eq!(unsafe { *((p + 2 * i * PAGE) as *const u8) }, (i % 251) as u8 + 1);
