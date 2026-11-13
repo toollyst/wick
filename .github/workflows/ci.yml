@@ -1127,6 +1127,12 @@ jobs:
           alone whp::vcpu::fpu_tests::test_msi_triggers_against_the_irqfd_watcher_on_record
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
+          # What Windows' cycle counters count (CPUCYCLEREC lines), for the
+          # CPU clocks: a PC read the thread's QueryThreadCycleTime at 1.32 x
+          # the TSC while spinning and the process's at 1.01 x. The thread's
+          # through both handles, the process's, GetThreadTimes and
+          # GetProcessTimes, idle, loaded, read by another thread, asleep.
+          alone windows_time::tests::test_cpu_cycle_counters_on_record
           alone windows_fd::tests::test_non_blocking_pipe_writes_on_record
           # A pipe's maker gets no identity of Firecracker's: the two tests
           # pass in the crates' own steps, which do not print a passing

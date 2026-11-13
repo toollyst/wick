@@ -20,6 +20,10 @@
 //!   whose TSC is not invariant, where cycles are no measure of time
 //!   (Learn, `QueryThreadCycleTime`: "Do not attempt to convert the CPU
 //!   clock cycles ... to elapsed time" for CPUs that vary the timer's rate).
+//!   An invariant TSC does not make the thread's count TSC ticks: on a PC
+//!   (Ryzen 9 7900) the thread's clock read 1.32 x the TSC while spinning,
+//!   and the process's 1.01 x, so these clocks overstate CPU time there
+//!   (`test_cpu_cycle_counters_on_record` prints what each counter counts).
 //!
 //! A timerfd is a manual-reset, high-resolution waitable timer: signalled
 //! while expirations are waiting to be read, which is what `epoll` waits on.
@@ -702,6 +706,232 @@ mod tests {
         assert!((t - k).abs() <= 31_250_000 + t / 20, "300 ms spinning: {t} ns against GetThreadTimes' {k} ns");
         let (t, _, _, _) = asleep;
         assert!(t < 1_000_000, "100 ms asleep: the thread clock moved {t} ns");
+    }
+
+    /// The counters a CPU clock can be made of, read together.
+    #[derive(Clone, Copy)]
+    struct Counters {
+        /// The performance counter, in ns.
+        wall: i64,
+        tsc: u64,
+        /// `QueryThreadCycleTime` through the pseudo-handle and through a
+        /// handle of the thread's own (`OpenThread`).
+        thread: u64,
+        thread_by_handle: u64,
+        process: u64,
+        /// `GetThreadTimes` and `GetProcessTimes`, kernel plus user, in ns.
+        thread_times: i64,
+        process_times: i64,
+    }
+
+    fn counters(handle: HANDLE) -> Counters {
+        let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut c, mut e, mut k, mut u) = (z, z, z, z);
+        let (mut pc, mut pe, mut pk, mut pu) = (z, z, z, z);
+        let (mut thread, mut thread_by_handle, mut process) = (0, 0, 0);
+        let mut q = 0;
+        // SAFETY: pseudo-handles and the thread's own handle; each call writes its out-parameters.
+        let tsc = unsafe {
+            QueryPerformanceCounter(&mut q);
+            let tsc = core::arch::x86_64::_rdtsc();
+            QueryThreadCycleTime(GetCurrentThread(), &mut thread);
+            QueryThreadCycleTime(handle, &mut thread_by_handle);
+            QueryProcessCycleTime(GetCurrentProcess(), &mut process);
+            GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u);
+            GetProcessTimes(GetCurrentProcess(), &mut pc, &mut pe, &mut pk, &mut pu);
+            tsc
+        };
+        let mut f = 0;
+        // SAFETY: writes `f`.
+        unsafe { QueryPerformanceFrequency(&mut f) };
+        Counters {
+            wall: i64::try_from(i128::from(q) * i128::from(NANOS) / i128::from(f)).unwrap(),
+            tsc,
+            thread,
+            thread_by_handle,
+            process,
+            thread_times: (filetime_100ns(k) + filetime_100ns(u)) * 100,
+            process_times: (filetime_100ns(pk) + filetime_100ns(pu)) * 100,
+        }
+    }
+
+    /// A CPUCYCLEREC line's text for the span from `a` to `b`: each cycle
+    /// counter's change against the TSC's, and each time against the wall's.
+    fn cycles_line(a: Counters, b: Counters) -> std::string::String {
+        use std::format;
+        let tsc = b.tsc.wrapping_sub(a.tsc).max(1);
+        let wall = (b.wall - a.wall).max(1);
+        #[allow(clippy::cast_precision_loss)]
+        let r = |n: u64| n as f64 / tsc as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let w = |n: i64| n as f64 / wall as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let ghz = tsc as f64 / wall as f64;
+        format!(
+            "wall {wall} ns, TSC +{tsc} ({:.4} GHz); thread cycles (pseudo-handle) +{} ({:.4} x TSC), (own handle) +{} \
+             ({:.4} x TSC); process cycles +{} ({:.4} x TSC); GetThreadTimes +{} ns ({:.3} x wall), GetProcessTimes +{} ns \
+             ({:.3} x wall)",
+            ghz,
+            b.thread - a.thread,
+            r(b.thread - a.thread),
+            b.thread_by_handle - a.thread_by_handle,
+            r(b.thread_by_handle - a.thread_by_handle),
+            b.process - a.process,
+            r(b.process - a.process),
+            b.thread_times - a.thread_times,
+            w(b.thread_times - a.thread_times),
+            b.process_times - a.process_times,
+            w(b.process_times - a.process_times),
+        )
+    }
+
+    /// A record (CPUCYCLEREC lines) of what Windows' cycle counters count,
+    /// for the CPU clocks, after a PC (Ryzen 9 7900, 4999ff6) read the
+    /// calling thread's `QueryThreadCycleTime` at 1.32 x the TSC over 2 ms
+    /// of spinning while `QueryProcessCycleTime` read 1.01 x: Learn says not
+    /// to convert those cycles to time ("some CPUs will vary the frequency
+    /// of the timer when changing the frequency at which the CPU runs").
+    /// Printed: the host (CPU, hypervisor, its vendor and feature leaves);
+    /// then for spins of 2, 20 and 200 ms on an otherwise idle process, the
+    /// thread's cycles through its pseudo-handle and through a handle of its
+    /// own, the process's cycles (each against the TSC), and
+    /// `GetThreadTimes` and `GetProcessTimes` (against the wall); the same
+    /// 200 ms read again after a `Sleep(1)` (the running stretch accounted
+    /// at a switch); a spinning thread read by another thread; the 200 ms
+    /// spin with every other logical processor spinning (no boost headroom)
+    /// and the process's cycles against the sum of its threads'; and 100 ms
+    /// asleep.
+    #[test]
+    #[ignore = "a record: run with --ignored --nocapture"]
+    fn test_cpu_cycle_counters_on_record() {
+        use core::arch::x86_64::__cpuid;
+        use std::string::{String, ToString};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::vec::Vec;
+        use std::{eprintln, format};
+        use windows_sys::Win32::System::Threading::{GetCurrentThreadId, OpenThread, Sleep, THREAD_QUERY_LIMITED_INFORMATION};
+        let own = || {
+            // SAFETY: the calling thread's id; closed by the caller.
+            let h = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, GetCurrentThreadId()) };
+            assert!(!h.is_null());
+            h
+        };
+        let mut brand = Vec::new();
+        for leaf in 0x8000_0002u32..=0x8000_0004 {
+            let r = __cpuid(leaf);
+            for v in [r.eax, r.ebx, r.ecx, r.edx] {
+                brand.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let brand = String::from_utf8_lossy(&brand).trim_matches(char::from(0)).trim().to_string();
+        let hv = __cpuid(1).ecx >> 31 & 1 == 1;
+        let vendor = if hv {
+            let r = __cpuid(0x4000_0000);
+            let mut v = Vec::new();
+            for x in [r.ebx, r.ecx, r.edx] {
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+            let f = __cpuid(0x4000_0003);
+            format!(
+                "{} (max leaf {:#x}); leaf 0x40000003 EAX {:#x} EBX {:#x} EDX {:#x}",
+                String::from_utf8_lossy(&v),
+                r.eax,
+                f.eax,
+                f.ebx,
+                f.edx
+            )
+        } else {
+            "none".to_string()
+        };
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        eprintln!(
+            "CPUCYCLEREC host: {brand}; {cpus} logical processors; invariant TSC {}; hypervisor {vendor}",
+            tsc_invariant()
+        );
+        let handle = own();
+        for ms in [2, 20, 200] {
+            let a = counters(handle);
+            spin(Duration::from_millis(ms));
+            let b = counters(handle);
+            eprintln!("CPUCYCLEREC {ms} ms spinning: {}", cycles_line(a, b));
+            if ms == 200 {
+                // SAFETY: plain call.
+                unsafe { Sleep(1) };
+                eprintln!("CPUCYCLEREC the same 200 ms read again after Sleep(1): {}", cycles_line(a, counters(handle)));
+            }
+        }
+        // A spinning thread read by another: its cycles through a handle.
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let raw = std::sync::Arc::new(AtomicU64::new(0));
+        let spinner = {
+            let (started, stop, raw) = (started.clone(), stop.clone(), raw.clone());
+            std::thread::spawn(move || {
+                raw.store(own() as u64, Ordering::SeqCst);
+                started.store(true, Ordering::SeqCst);
+                while !stop.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            })
+        };
+        while !started.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        let other = raw.load(Ordering::SeqCst) as HANDLE;
+        let read_other = || {
+            let mut c = 0;
+            // SAFETY: the spinner's handle, open until it is closed below.
+            unsafe { QueryThreadCycleTime(other, &mut c) };
+            // SAFETY: plain call.
+            (c, unsafe { core::arch::x86_64::_rdtsc() })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        let (c0, t0) = read_other();
+        std::thread::sleep(Duration::from_millis(200));
+        let (c1, t1) = read_other();
+        stop.store(true, Ordering::SeqCst);
+        spinner.join().unwrap();
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = (c1 - c0) as f64 / t1.wrapping_sub(t0) as f64;
+        eprintln!("CPUCYCLEREC a spinning thread read by another over 200 ms: cycles +{} against TSC +{} ({ratio:.4} x TSC)", c1 - c0, t1 - t0);
+        // SAFETY: the spinner's own handle, no longer used.
+        unsafe { CloseHandle(other) };
+        // Every other logical processor spinning.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let others: Vec<_> = (1..cpus)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut a = 0;
+                    // SAFETY: the pseudo-handle; writes `a`.
+                    unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut a) };
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                    let mut b = 0;
+                    // SAFETY: as above.
+                    unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut b) };
+                    b - a
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(50));
+        let a = counters(handle);
+        spin(Duration::from_millis(200));
+        let b = counters(handle);
+        stop.store(true, Ordering::SeqCst);
+        let spun: u64 = others.into_iter().map(|t| t.join().unwrap()).sum();
+        eprintln!("CPUCYCLEREC 200 ms spinning with {} other threads spinning: {}", cpus - 1, cycles_line(a, b));
+        eprintln!(
+            "CPUCYCLEREC with them: the other threads' own cycles summed +{spun} over their whole run (the process's over \
+             the 200 ms above: +{})",
+            b.process - a.process
+        );
+        let a = counters(handle);
+        std::thread::sleep(Duration::from_millis(100));
+        eprintln!("CPUCYCLEREC 100 ms asleep: {}", cycles_line(a, counters(handle)));
+        // SAFETY: the handle opened above.
+        unsafe { CloseHandle(handle) };
     }
 
     #[test]
