@@ -1252,17 +1252,38 @@ jobs:
           $out += 'a serial console someone types at, and boot-test.ps1 foreign-snapshot (it needs a state file of another'
           $out += 'architecture, the macOS boot test''s; no job of this workflow makes one).'
           $out | Add-Content -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
+      # The jails' directories hold what the jailed processes made, under
+      # their own ACLs: the upload's glob walked them and stopped at the
+      # first entry it could not stat (run 43428124115: EACCES on a jail's
+      # API socket under wjt-pidns), uploading nothing. The logs are copied
+      # out first, each entry that cannot be read named, and the upload
+      # takes the copy.
+      - name: Collect the stages' logs
+        if: always()
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP 'guest-logs'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $root = (Get-Location).Path
+          $unread = @()
+          $found = @(Get-Item -Path "$env:WBT\results-*.zip" -ErrorAction SilentlyContinue)
+          foreach ($d in Get-ChildItem -Directory -Path "$env:WJT*" -ErrorAction SilentlyContinue) {
+            $found += @(Get-ChildItem -Recurse -File -Path $d.FullName -Include *.txt, *.log -ErrorAction SilentlyContinue -ErrorVariable +walk)
+          }
+          foreach ($e in $walk) { $unread += "$($e.TargetObject): $($e.Exception.Message)" }
+          $found += @(Get-Item -Path "$env:RUNNER_TEMP\hugepages\*.txt", "$env:RUNNER_TEMP\hugepages\*.exit" -ErrorAction SilentlyContinue)
+          foreach ($f in $found) {
+            $rel = if ($f.FullName.StartsWith($root)) { $f.FullName.Substring($root.Length + 1) } else { Join-Path 'temp' $f.FullName.Substring($env:RUNNER_TEMP.Length + 1) }
+            $to = Join-Path $dest $rel
+            New-Item -ItemType Directory -Force -Path (Split-Path $to) | Out-Null
+            try { Copy-Item -LiteralPath $f.FullName -Destination $to -ErrorAction Stop } catch { $unread += "$($f.FullName): $($_.Exception.Message)" }
+          }
+          Write-Host "$($found.Count) files found, $($unread.Count) entries not read"
+          foreach ($u in $unread) { Write-Host "  not read: $u" }
       - name: Upload the stages' logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-guest-logs
-          path: |
-            wbt/results-*.zip
-            wjt*/summary.txt
-            wjt*/**/*.txt
-            wjt*/**/*.log
-            ${{ runner.temp }}/hugepages/*.txt
-            ${{ runner.temp }}/hugepages/*.exit
+          path: ${{ runner.temp }}/guest-logs
           if-no-files-found: warn
           retention-days: 14
