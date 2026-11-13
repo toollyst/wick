@@ -101,6 +101,29 @@ fn test_trng_calls_as_on_kvm() {
     assert_eq!(v[31], NOT_SUPPORTED);
 }
 
+// A guest's SMC is answered as its HVC, as KVM since Linux 6.4 answers it
+// (so on a 6.18 host, the newest upstream supports); KVM on Linux 6.1 sets
+// X0 to -1 and runs no service (arch/arm64/kvm/handle_exit.c handle_smc).
+// The trap leaves the PC at an SMC, where it leaves it past an HVC: the
+// guest goes on after the instruction either way.
+#[test]
+fn test_an_smc_is_answered_as_an_hvc() {
+    const SMC: u32 = 0xd400_0003;
+    const VERSION: u32 = 0x8400_0000;
+    let smc = |id: u32| {
+        let mut code = call3(id, [5, 6, 7], 0..4);
+        let at = code.iter().position(|&word| word == HVC).unwrap();
+        code[at] = SMC;
+        code
+    };
+    let code = program(&[smc(VERSION), smc(trng::VERSION), call3(VERSION, [5, 6, 7], 0..4)]);
+    let (vm, _) = vm_with_code(&code, 0);
+    let v = mmio_values(new_vcpu(&vm, 0), 12);
+    assert_eq!(v[..4], [PSCI_VERSION_1_1, 0, 0, 0], "PSCI_VERSION by SMC");
+    assert_eq!(v[4], 0x1_0000, "TRNG_VERSION by SMC");
+    assert_eq!(v[8..], [PSCI_VERSION_1_1, 0, 0, 0], "the HVC after them");
+}
+
 /// Runs `vcpu` from the program's start; its MMIO stores, and the system
 /// event that ended the run.
 fn until_system_event(mut vcpu: VcpuFd) -> (Vec<u64>, u32, Vec<u64>) {

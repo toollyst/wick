@@ -124,6 +124,7 @@ no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_the_kicker_leaves_a_waiting_vc
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_a_reset_leaves_the_registers_kvm_leaves
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_a_service_turned_off_by_its_bit_is_not_supported_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_a_snapshots_registers_restore_the_firmware_registers
+no-hvf compat-kvm-ioctls hvf::smccc_tests::test_an_smc_is_answered_as_an_hvc
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_cpu_off_leaves_the_registers_kvm_leaves
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_firmware_registers_are_listed_and_kept_as_kvms
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_psci_1_1_system_reset2_as_on_kvm
