@@ -532,24 +532,142 @@ pub(crate) fn read_xsave(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<(Vec<u8>
 //   a component in use is what the guest finds.
 //
 // Here the saved image is WHP's XSAVE area, and the same is done to it: the
-// same fields replaced, MXCSR and the header left. A new vCPU's header has
-// the SSE bit where Linux's has none (`XSTATE_BV` 0x1802 on an AMD EPYC
-// 7763, CI run 43363585319: SSE and the two CET components); what WHP then
-// does with the fields is what `test_set_fpu_on_record` prints (FPUTEST
-// lines).
+// same fields replaced, MXCSR and the header left.
+//
+// A vCPU that has not run is where WHP's area is not Linux's image. A new
+// vCPU's header has the SSE bit where Linux's has none (`XSTATE_BV` 0x1802
+// on an AMD EPYC 7763, CI run 43363585319; 0x2 on an Intel Xeon Platinum
+// 8573C, run 43374475718), WHP does not keep the bit cleared (an area
+// written with `XSTATE_BV` 0 reads back 0x2 with the initial values), and
+// it reads the x87 fields of an area whose x87 bit is clear as zeros. So,
+// measured in run 43374475718 (FPUTEST lines), XMM registers written by
+// `KVM_SET_FPU` to a vCPU that had not run reached its guest, where Linux's
+// guest finds zeros, and `KVM_GET_FPU` read a control word of 0 from a new
+// vCPU, where Linux reads the 0x37f of its image.
+//
+// Until a vCPU's first `KVM_RUN` Linux's image is known exactly, whatever
+// the processor: `xfeatures` is 0 from `fpu_alloc_guest_fpstate`, and the
+// one call that changes it before a run is `KVM_SET_XSAVE`, which sets the
+// user components' bits to the header it is given and copies the
+// components that header names (arch/x86/kernel/fpu/xstate.c,
+// `copy_uabi_to_xstate`: `xsave->header.xfeatures &=
+// XFEATURE_MASK_SUPERVISOR_ALL`, then `|= hdr.xfeatures`); `KVM_SET_FPU`,
+// `KVM_SET_SREGS`, `KVM_SET_MSRS`, `KVM_SET_XCRS` and `KVM_SET_LAPIC` do
+// not touch it (arch/x86/kvm/x86.c: the image is named in
+// `kvm_arch_vcpu_ioctl_get_fpu`, `_set_fpu`, the two XSAVE ioctls and the
+// reset of the MPX components on INIT). So that image is kept here
+// ([`BeforeRun`]) for as long as the vCPU has not run: `KVM_GET_FPU` reads
+// it, and `KVM_SET_FPU` writes it and gives WHP only the component whose
+// bit Linux's header has, which is the component the guest would be given.
+// From the first `KVM_RUN` on, the header is the processor's on Linux
+// (XSAVES at the end of every run, with the bits of the components the
+// processor holds as in use, which the SDM leaves to the processor) and
+// WHP's here.
+
+/// `XFEATURE_MASK_FP` and `XFEATURE_MASK_SSE`: the two components
+/// `struct kvm_fpu` has fields of.
+const XFEATURE_FP: u64 = 1 << 0;
+const XFEATURE_SSE: u64 = 1 << 1;
+/// `XFEATURE_MASK_YMM`: AVX, whose MXCSR is the region's too.
+const XFEATURE_YMM: u64 = 1 << 2;
+
+/// Linux's saved image of the x87 and SSE state of a vCPU that has not run
+/// yet: its FXSAVE region and the two components' bits in its header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BeforeRun {
+    /// `fpstate->regs.xsave.header.xfeatures`, the x87 and SSE bits.
+    bits: u64,
+    /// `fpstate->regs.fxsave`.
+    fxsave: [u8; 512],
+}
+
+impl BeforeRun {
+    /// A new vCPU's: no component in use, and the control word and MXCSR
+    /// `fpstate_init_fxstate` writes (0x37f, 0x1f80).
+    pub(crate) fn new() -> BeforeRun {
+        let mut fxsave = [0u8; 512];
+        fxsave[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
+        fxsave[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        BeforeRun { bits: 0, fxsave }
+    }
+
+    /// `KVM_GET_FPU`: the image's fields.
+    pub(crate) fn get_fpu(&self) -> kvm_fpu {
+        fpu_from_fxsave(&self.fxsave)
+    }
+
+    /// `KVM_SET_XSAVE` of `area`, already accepted: the header's bits, and
+    /// the components it names (`copy_uabi_to_xstate`: x87 is the region's
+    /// first 160 bytes, MXCSR and its mask among them; SSE the XMM
+    /// registers; MXCSR and its mask also with SSE or AVX and no x87).
+    pub(crate) fn set_xsave(&mut self, area: &[u8]) {
+        let bv = xstate_bv(area).unwrap_or(0);
+        if bv & XFEATURE_FP != 0 {
+            self.fxsave[..160].copy_from_slice(&area[..160]);
+        } else if bv & (XFEATURE_SSE | XFEATURE_YMM) != 0 {
+            self.fxsave[24..32].copy_from_slice(&area[24..32]);
+        }
+        if bv & XFEATURE_SSE != 0 {
+            self.fxsave[160..416].copy_from_slice(&area[160..416]);
+        }
+        self.bits = bv & (XFEATURE_FP | XFEATURE_SSE);
+    }
+
+    /// `KVM_SET_FPU`: the fields into the image, and into `area`, WHP's,
+    /// those of the components Linux's header has, which are what the guest
+    /// is given when it first runs. Whether `area` was changed.
+    fn set_fpu(&mut self, fpu: &kvm_fpu, area: &mut [u8]) -> bool {
+        fxsave_from_fpu(fpu, &mut self.fxsave);
+        if self.bits & XFEATURE_FP != 0 {
+            area[..24].copy_from_slice(&self.fxsave[..24]);
+            area[32..160].copy_from_slice(&self.fxsave[32..160]);
+        }
+        if self.bits & XFEATURE_SSE != 0 {
+            area[160..416].copy_from_slice(&self.fxsave[160..416]);
+        }
+        self.bits != 0
+    }
+
+    /// `KVM_GET_XSAVE` of a vCPU that has not run: Linux's header bits for
+    /// the two components in `area`, WHP's (which has the SSE bit from the
+    /// start), and for an x87 not in use the initial control word, which
+    /// Linux copies out for it (`__copy_xstate_to_uabi_buf`: a component
+    /// that is not in the header is copied from the initial state).
+    pub(crate) fn as_linux_reads(&self, area: &mut [u8]) {
+        let Some(bv) = xstate_bv(area) else { return };
+        let bv = (bv & !(XFEATURE_FP | XFEATURE_SSE)) | self.bits;
+        area[512..520].copy_from_slice(&bv.to_le_bytes());
+        if self.bits & XFEATURE_FP == 0 {
+            area[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
+        }
+    }
+}
 
 /// `KVM_GET_FPU`: the x87 fields and XMM registers of the FXSAVE region at
 /// the start of the XSAVE area; `mxcsr` is 0, as Linux returns it.
-pub(crate) fn get_fpu(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<kvm_fpu> {
+/// For a vCPU that has not run, Linux's image (`before_run`).
+pub(crate) fn get_fpu(part: WHV_PARTITION_HANDLE, vp: u32, before_run: Option<&BeforeRun>) -> Result<kvm_fpu> {
+    if let Some(image) = before_run {
+        return Ok(image.get_fpu());
+    }
     let (area, _) = read_xsave(part, vp)?;
     Ok(fpu_from_fxsave(&area[..512]))
 }
 
 /// `KVM_SET_FPU`: the whole state as it is, with the x87 fields and XMM
-/// registers of its FXSAVE region replaced.
-pub(crate) fn set_fpu(part: WHV_PARTITION_HANDLE, vp: u32, fpu: &kvm_fpu) -> Result<()> {
+/// registers of its FXSAVE region replaced. For a vCPU that has not run
+/// (`before_run`), Linux's image takes them, and WHP those of the
+/// components the guest would be given.
+pub(crate) fn set_fpu(part: WHV_PARTITION_HANDLE, vp: u32, fpu: &kvm_fpu, before_run: Option<&mut BeforeRun>) -> Result<()> {
     let (mut area, _) = read_xsave(part, vp)?;
-    fxsave_from_fpu(fpu, &mut area[..512]);
+    match before_run {
+        Some(image) => {
+            if !image.set_fpu(fpu, &mut area) {
+                return Ok(());
+            }
+        }
+        None => fxsave_from_fpu(fpu, &mut area[..512]),
+    }
     set_xsave(part, vp, &area)
 }
 
@@ -1518,6 +1636,66 @@ mod tests {
     // the header, whose `XSTATE_BV` decides what of the region the guest is
     // given (arch/x86/kvm/x86.c, `kvm_arch_vcpu_ioctl_set_fpu`).
     // `KVM_GET_FPU` reads the same fields back and 0 for MXCSR.
+    // A vCPU that has not run, as Linux has it: KVM_GET_FPU reads the
+    // image (control word 0x37f from the start, then what KVM_SET_FPU
+    // wrote), and WHP is given the fields of a component only once
+    // KVM_SET_XSAVE has put the component in the header.
+    #[test]
+    fn test_a_vcpu_that_has_not_run_has_linuxs_image() {
+        let mut image = BeforeRun::new();
+        let new = image.get_fpu();
+        assert_eq!((new.fcw, new.mxcsr, new.xmm[3]), (0x37f, 0, [0; 16]));
+        // SAFETY: an all-zero kvm_fpu is valid.
+        let mut fpu: kvm_fpu = unsafe { std::mem::zeroed() };
+        (fpu.fcw, fpu.mxcsr) = (0x27f, 0x9f80);
+        fpu.fpr[0] = [7; 16];
+        fpu.xmm[3] = [0xA1; 16];
+        // WHP's area for a new vCPU: the SSE bit, everything initial.
+        let mut area = vec![0u8; 4096];
+        area[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        area[512..520].copy_from_slice(&2u64.to_le_bytes());
+        let before = area.clone();
+        assert!(!image.set_fpu(&fpu, &mut area), "nothing is in use: nothing is WHP's to take");
+        assert_eq!(area, before);
+        let back = image.get_fpu();
+        assert_eq!((back.fcw, back.fpr[0], back.xmm[3], back.mxcsr), (0x27f, [7; 16], [0xA1; 16], 0));
+        // What KVM_GET_XSAVE gives of it: no component in use, the initial
+        // control word.
+        let mut read = before.clone();
+        image.as_linux_reads(&mut read);
+        assert_eq!((xstate_bv(&read), &read[0..2]), (Some(0), &0x37fu16.to_le_bytes()[..]));
+
+        // KVM_SET_XSAVE with SSE alone in its header: SSE is in use, and
+        // its registers and MXCSR are the area's; x87 stays as it was.
+        let mut given = vec![0u8; 4096];
+        given[512..520].copy_from_slice(&2u64.to_le_bytes());
+        given[24..28].copy_from_slice(&0x1fa0u32.to_le_bytes());
+        given[160 + 48..160 + 64].copy_from_slice(&[0xC3; 16]);
+        image.set_xsave(&given);
+        let back = image.get_fpu();
+        assert_eq!((back.fcw, back.fpr[0], back.xmm[3]), (0x27f, [7; 16], [0xC3; 16]));
+        assert_eq!(&image.fxsave[24..28], &0x1fa0u32.to_le_bytes());
+        fpu.xmm[3] = [0xB2; 16];
+        fpu.fcw = 0x7f;
+        let mut area = given.clone();
+        assert!(image.set_fpu(&fpu, &mut area));
+        assert_eq!(&area[160 + 48..160 + 64], &[0xB2; 16], "SSE is in use: its registers are the guest's");
+        assert_eq!((&area[0..2], &area[32..48]), (&[0u8; 2][..], &[0u8; 16][..]), "x87 is not: WHP keeps its own");
+        assert_eq!(&area[24..28], &0x1fa0u32.to_le_bytes(), "MXCSR is not KVM_SET_FPU's");
+        let mut read = given.clone();
+        image.as_linux_reads(&mut read);
+        assert_eq!(xstate_bv(&read), Some(2));
+
+        // With x87 in the header too, both are written.
+        given[512..520].copy_from_slice(&3u64.to_le_bytes());
+        given[0..2].copy_from_slice(&0x17fu16.to_le_bytes());
+        image.set_xsave(&given);
+        assert_eq!(image.get_fpu().fcw, 0x17f);
+        let mut area = given.clone();
+        assert!(image.set_fpu(&fpu, &mut area));
+        assert_eq!((&area[0..2], &area[32..48]), (&0x7fu16.to_le_bytes()[..], &[7u8; 16][..]));
+    }
+
     #[test]
     fn test_set_fpu_leaves_mxcsr_and_the_header() {
         // An area as WHP gives one for a new vCPU: compacted, SSE and CET

@@ -94,6 +94,9 @@ pub(crate) struct VcpuShared {
     cpuid: Mutex<Vec<kvm_cpuid_entry2>>,
     pending: Mutex<Option<Pending>>,
     tsc_khz: AtomicU64,
+    /// Linux's image of the x87 and SSE state until the first `KVM_RUN`
+    /// (`regs::BeforeRun`); `None` from then on.
+    before_run: Mutex<Option<regs::BeforeRun>>,
     /// The last `MSR_KVM_SYSTEM_TIME_NEW` value.
     system_time_msr: AtomicU64,
     /// The clock generation (`pvclock::State::generation`) this vCPU's time
@@ -244,6 +247,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         run: KvmRunPage::new(),
         inner: inner.clone(),
         cpuid: Mutex::new(Vec::new()),
+        before_run: Mutex::new(Some(regs::BeforeRun::new())),
         pending: Mutex::new(None),
         tsc_khz: AtomicU64::new(0),
         system_time_msr: AtomicU64::new(0),
@@ -627,10 +631,10 @@ impl VcpuFd {
         regs::set_sregs(self.part(), self.vp(), sregs)
     }
     pub fn get_fpu(&self) -> Result<kvm_fpu> {
-        regs::get_fpu(self.part(), self.vp())
+        regs::get_fpu(self.part(), self.vp(), self.shared.before_run.lock().unwrap().as_ref())
     }
     pub fn set_fpu(&self, fpu: &kvm_fpu) -> Result<()> {
-        regs::set_fpu(self.part(), self.vp(), fpu)
+        regs::set_fpu(self.part(), self.vp(), fpu, self.shared.before_run.lock().unwrap().as_mut())
     }
     pub fn get_xcrs(&self) -> Result<kvm_xcrs> {
         regs::get_xcrs(self.part(), self.vp())
@@ -660,6 +664,9 @@ impl VcpuFd {
         // SAFETY: the region's 4096 bytes, as bytes.
         let bytes = unsafe { std::slice::from_raw_parts_mut(out.region.as_mut_ptr().cast::<u8>(), regs::KVM_XSAVE_LEN) };
         regs::get_xsave(self.part(), self.vp(), bytes)?;
+        if let Some(image) = self.shared.before_run.lock().unwrap().as_ref() {
+            image.as_linux_reads(bytes);
+        }
         Ok(out)
     }
     /// # Safety
@@ -667,7 +674,16 @@ impl VcpuFd {
     pub unsafe fn set_xsave(&self, xsave: &kvm_xsave) -> Result<()> {
         // SAFETY: the region's 4096 bytes, as bytes.
         let bytes = unsafe { std::slice::from_raw_parts(xsave.region.as_ptr().cast::<u8>(), regs::KVM_XSAVE_LEN) };
-        regs::set_xsave(self.part(), self.vp(), bytes)
+        self.set_xsave_bytes(bytes)
+    }
+    /// `KVM_SET_XSAVE`, and for a vCPU that has not run what it makes of
+    /// Linux's image.
+    fn set_xsave_bytes(&self, bytes: &[u8]) -> Result<()> {
+        regs::set_xsave(self.part(), self.vp(), bytes)?;
+        if let Some(image) = self.shared.before_run.lock().unwrap().as_mut() {
+            image.set_xsave(bytes);
+        }
+        Ok(())
     }
     /// # Safety
     /// As [`Self::get_xsave`].
@@ -682,6 +698,9 @@ impl VcpuFd {
             std::slice::from_raw_parts_mut((&raw mut (*p).xsave).cast::<u8>(), len)
         };
         regs::get_xsave(self.part(), self.vp(), bytes)?;
+        if let Some(image) = self.shared.before_run.lock().unwrap().as_ref() {
+            image.as_linux_reads(bytes);
+        }
         Ok(())
     }
     /// # Safety
@@ -694,7 +713,7 @@ impl VcpuFd {
             let len = regs::KVM_XSAVE_LEN + 4 * (*p).len;
             std::slice::from_raw_parts((&raw const (*p).xsave).cast::<u8>(), len)
         };
-        regs::set_xsave(self.part(), self.vp(), bytes)
+        self.set_xsave_bytes(bytes)
     }
 
     /// The bytes WHP writes for this vCPU's XSAVE state now (the record of
@@ -1090,6 +1109,9 @@ impl VcpuFd {
     }
 
     fn run_loop(&mut self) -> Result<VcpuExit<'_>> {
+        // From its first KVM_RUN on, the vCPU's x87 and SSE state is the
+        // one it runs with (`regs::BeforeRun`).
+        *self.shared.before_run.lock().unwrap() = None;
         let part = self.part();
         let vp = self.vp();
         let run_ptr = self.shared.run.ptr();
@@ -2414,15 +2436,19 @@ mod fpu_tests {
         // in use, so its guest starts with the initial x87 and SSE state
         // whatever was written (control word 0x37f, MXCSR 0x1f80, XMM3
         // zero, no ST0: the store gives the indefinite value), and
-        // KVM_GET_FPU returns what was written all the same. Printed, not
-        // asserted: WHP's new area has the SSE bit, and what WHP does with
-        // the fields of a component whose bit is clear is not known.
+        // KVM_GET_FPU returns what was written all the same. Asserted: the
+        // backend keeps Linux's image until the first run
+        // (`regs::BeforeRun`), since WHP's new area has the SSE bit and
+        // gave the guest the XMM registers written (run 43374475718).
         // SAFETY (both `zeroed` below): an all-zero kvm_fpu is valid.
         let mut fpu: kvm_fpu = unsafe { std::mem::zeroed() };
         (fpu.fcw, fpu.ftwx, fpu.mxcsr) = (0x27f, 1, 0x9f80);
         fpu.fpr[0] = ONE_AND_A_HALF;
         fpu.xmm[3] = [0xA1; 16];
-        set_on_record(&vcpu, "a vCPU that has not run", &fpu);
+        let new = vcpu.get_fpu().unwrap();
+        assert_eq!((new.fcw, new.xmm[3]), (0x37f, [0; 16]), "a new vCPU's KVM_GET_FPU: Linux's initial image");
+        let back = set_on_record(&vcpu, "a vCPU that has not run", &fpu);
+        assert_eq!((back.fcw, back.ftwx, back.fpr[0], back.xmm[3]), (0x27f, 1, ONE_AND_A_HALF, [0xA1; 16]), "KVM_GET_FPU reads what was written");
         let exit = run_once(&mut vcpu);
         let (fcw1, mxcsr1, xmm1, st1) = seen(m);
         eprintln!(
@@ -2433,6 +2459,8 @@ mod fpu_tests {
         );
         assert_eq!(exit, format!("exit IoOut port {PORT:#x}"));
         assert_ne!(mxcsr1, 0x9f80, "KVM_SET_FPU's mxcsr reached the guest, which Linux's never does");
+        assert_eq!((fcw1, mxcsr1, xmm1), (0x37f, 0x1f80, [0; 16]), "the guest of a vCPU that had not run: the initial state, as on Linux");
+        assert_eq!(&st1[7..], &[0xc0, 0xff, 0xff], "no ST0: the store gives the indefinite value");
 
         // The same vCPU, whose guest has now left the initial state of
         // both components (ST0 holds 1.0, XMM5 all ones): they are in use,
