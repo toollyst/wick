@@ -53,6 +53,11 @@
 #          and with a guest running
 #   foreign-snapshot  a state file made on another host (-ForeignState) is
 #          refused at the load (no guest)
+#   cpu-templates  a custom CPU template through PUT /cpu-config: the CPUID
+#          bits it clears are gone from the guest on every vCPU, also after
+#          a restore; a template that changes a CPUID leaf the host lacks,
+#          and one that changes an MSR the backend keeps nowhere (0x10a,
+#          as T2S and T2CL do), are refused at the start
 #   diff-nospace  (not in `all`: needs an elevated prompt, for diskpart) a
 #          diff snapshot written to a volume without the room fails with
 #          "not enough space on the disk" and leaves the guest as it was;
@@ -2820,6 +2825,107 @@ function Stage-ForeignSnapshot {
     return "refused at the load ($why), Firecracker exits; snapshot-editor refuses it too"
 }
 
+# The guest's CPU flags (/proc/cpuinfo), after checking that every CPU
+# lists the same.
+function Get-GuestFlags($vm, [string]$when) {
+    $out = $vm.Sh('grep ^flags /proc/cpuinfo')
+    $lines = @($out -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { ($_ -split ':', 2)[1].Trim() })
+    Check ($lines.Count -eq 2 -and $lines[0] -eq $lines[1]) "$when`: the guest's two CPUs list different flags, or not two CPUs: '$out'"
+    return @(Get-Fields $lines[0])
+}
+
+# A guest started through the API with a CPU template put before the
+# start. Returns the VM and the start's status and body.
+function Start-WithTemplate([string]$name, $cfg, $template) {
+    $vm = Start-Vm $name $null -Api
+    Invoke-Api $vm 'PUT' '/boot-source' $cfg['boot-source'] | Out-Null
+    Invoke-Api $vm 'PUT' '/drives/rootfs' $cfg['drives'][0] | Out-Null
+    Invoke-Api $vm 'PUT' '/machine-config' $cfg['machine-config'] | Out-Null
+    Invoke-Api $vm 'PUT' '/cpu-config' $template | Out-Null
+    $status = 0
+    $out = [Wick.Api]::Call($vm.ApiSock, 'PUT', '/actions', '{"action_type":"InstanceStart"}', 120000, [ref]$status)
+    return @($vm, $status, $out)
+}
+
+# Custom CPU templates on x86_64 (upstream's test_api_cpu_config and
+# test_cpu_template are skipped on a processor that is not in their table,
+# which is every host here). A template is CPUID modifiers and MSR
+# modifiers (cpu_config/x86_64/custom_cpu_template.rs); upstream applies the
+# first to the supported CPUID and sets the result on every vCPU, and reads
+# the MSRs of the second from vCPU 0, modifies and writes them
+# (arch/x86_64/mod.rs, configure_vcpus_for_boot).
+#
+# The bits cleared here are three that every x86-64-v3 processor has, one
+# in each leaf upstream's templates change most, and that no other flag of
+# Linux's depends on (arch/x86/kernel/cpu/cpuid-deps.c): MOVBE (leaf 1 ECX
+# bit 22), BMI1 (leaf 7 EBX bit 3), ABM (leaf 0x80000001 ECX bit 5).
+function Stage-CpuTemplates {
+    $bit = { param([int]$n) '0b' + ('x' * (31 - $n)) + '0' + ('x' * $n) }
+    $leaf = { param([string]$l, [int]$flags, [string]$reg, [int]$n)
+        [ordered]@{ leaf = $l; subleaf = '0x0'; flags = $flags; modifiers = @([ordered]@{ register = $reg; bitmap = (& $bit $n) }) } }
+    $template = [ordered]@{ cpuid_modifiers = @((& $leaf '0x1' 0 'ecx' 22), (& $leaf '0x7' 1 'ebx' 3), (& $leaf '0x80000001' 0 'ecx' 5)) }
+    $lost = @('movbe', 'bmi1', 'abm')
+    $cfg = Base-Config 2
+
+    $vm = Start-Vm 'tmpl-none' $cfg
+    Wait-Shell $vm
+    $hostFlags = Get-GuestFlags $vm 'no template'
+    $vm.Kill()
+    foreach ($f in $lost) { Check ($hostFlags -contains $f) "this host's guest has no $f without a template: $($hostFlags -join ' ')" }
+    $want = @($hostFlags | Where-Object { $lost -notcontains $_ })
+
+    $r = Start-WithTemplate 'tmpl-custom' $cfg $template
+    $vm = $r[0]
+    Check ($r[1] -eq 204) "InstanceStart with the template: $($r[1]) $($r[2])"
+    Wait-Shell $vm
+    $got = Get-GuestFlags $vm 'the template'
+    $diff = @(Compare-Object $want $got | ForEach-Object { "$($_.SideIndicator)$($_.InputObject)" })
+    Check ($diff.Count -eq 0) "the template's guest against the host's less $($lost -join ', '): $($diff -join ' ') (<= missing, => extra)"
+    $vm.Sh('A=before-$((6*7))') | Out-Null
+    $bashMd5 = $vm.Sh('md5sum /usr/bin/bash')
+
+    # The template is in the snapshot (each vCPU's CPUID is part of its state).
+    $dir = Join-Path $Scratch 'cpu-templates'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $state = Join-Path $dir 'tmpl.state'
+    $mem = Join-Path $dir 'tmpl.mem'
+    Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+    Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $state; mem_file_path = $mem }) | Out-Null
+    $vm.Kill()
+    $vm = Start-Vm 'tmpl-restored' $null -Api
+    Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
+        snapshot_path = $state
+        mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = $mem }
+        resume_vm     = $true
+    }) | Out-Null
+    Test-Restored $vm $bashMd5 $null
+    # cpu1 offline and online: it comes back with the template's CPUID.
+    Test-CpuOfflineOnline $vm 'the template restored'
+    $got = Get-GuestFlags $vm 'the template restored'
+    $diff = @(Compare-Object $want $got | ForEach-Object { "$($_.SideIndicator)$($_.InputObject)" })
+    Check ($diff.Count -eq 0) "the restored guest against the host's less $($lost -join ', '): $($diff -join ' ')"
+    Save-Dmesg $vm 'tmpl-restored'
+    $vm.Reboot()
+    Remove-Item -Force $mem
+
+    # A leaf the supported CPUID lacks: upstream's own refusal
+    # (CpuConfigurationError::CpuidFeatureNotSupported), at the start.
+    $r = Start-WithTemplate 'tmpl-leaf' $cfg ([ordered]@{ cpuid_modifiers = @((& $leaf '0x8fffffff' 0 'eax' 0)) })
+    Check ($r[1] -eq 400 -and $r[2] -match 'CPUID entry not supported by KVM: Leaf: 8fffffff') "a template of a CPUID leaf no host has: $($r[1]) $($r[2])"
+    $r[0].Kill()
+
+    # An MSR modifier of 0x10a (IA32_ARCH_CAPABILITIES), the one MSR
+    # upstream's templates modify (T2S, T2CL). KVM keeps it for each vCPU;
+    # this backend keeps it nowhere, so its KVM_GET_MSRS ends there and
+    # upstream reports the MSR, where before the modifier was dropped and
+    # the guest started without it.
+    $r = Start-WithTemplate 'tmpl-msr' $cfg ([ordered]@{ msr_modifiers = @([ordered]@{ addr = '0x10a'; bitmap = '0b' + ('x' * 64) }) })
+    Check ($r[1] -eq 400 -and $r[2] -match 'msr: 0x10a') "a template with a modifier of MSR 0x10a: $($r[1]) $($r[2])"
+    $why = ([regex]::Match($r[2], '"fault_message":\s*"(.*)"')).Groups[1].Value
+    $r[0].Kill()
+    return "a template through PUT /cpu-config takes $($lost -join ', ') from the guest on both vCPUs, also after a restore and cpu1's restart; a leaf no host has is refused; a modifier of MSR 0x10a is refused ($why)"
+}
+
 # Upstream's test_diff_snapshot_works_after_error
 # (test_snapshot_not_losing_dirty_pages.py): a diff snapshot that fails for
 # lack of space must not lose the dirty pages, so that the next one, with
@@ -3317,6 +3423,7 @@ $Stages = [ordered]@{
     tools    = { Stage-Tools }
     'no-seccomp' = { Stage-NoSeccomp }
     'foreign-snapshot' = { Stage-ForeignSnapshot }
+    'cpu-templates' = { Stage-CpuTemplates }
     'diff-nospace' = { Stage-DiffNoSpace }
     'linux-snapshot' = { Stage-LinuxSnapshot }
     'memory-hotplug' = { Stage-MemoryHotplug }
