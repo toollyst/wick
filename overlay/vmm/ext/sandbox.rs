@@ -56,7 +56,7 @@ pub enum SandboxError {
 #[cfg(target_os = "macos")]
 pub use macos::{
     API_FCNTL_COMMANDS, API_MACH_TRAPS, API_MIG_ROUTINES, API_SYSCALLS, FCNTL_COMMANDS,
-    ABSENT, FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MEASURED_MAJORS, MIG_ROUTINES,
+    ABSENT, EXCEPTION_MIG_ROUTINES, FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MEASURED_MAJORS, MIG_ROUTINES,
     PROFILE, RUN_DENIED_OPERATIONS, SETUP_MIG_ROUTINES_IF_DEFINED, SYSCALLS, Skip,
     SIGSYS_DEADLINE, SigsysHandler, UNFILTERED_SYSCALLS, api_profile, apply, apply_api, narrowed,
     denied_elsewhere, denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select,
@@ -139,7 +139,8 @@ mod macos {
 (deny file-map-executable (with send-signal SIGSYS))
 (deny dynamic-code-generation (with send-signal SIGSYS))
 ; System calls: only those in SYSCALLS, Mach traps: only those in MACH_TRAPS,
-; kernel MIG routines: only those in MIG_ROUTINES. Any other one fails and
+; kernel MIG routines: only those in MIG_ROUTINES, and the kernel's own
+; message for a thread's fault (EXCEPTION_MIG_ROUTINES). Any other one fails and
 ; raises SIGSYS, on which Firecracker exits as for a seccomp violation
 ; (upstream's filters trap, and its SIGSYS handler exits with the bad-syscall
 ; code).
@@ -501,6 +502,60 @@ mod macos {
         "mach_vm_remap_external", "mach_vm_region", "task_get_special_port_from_user",
     ];
 
+    /// The message by which the kernel turns a thread's fault or trap into
+    /// its signal, allowed in every phase and in the API process's profile.
+    /// Not a call of Firecracker's: the kernel sends it itself, on the
+    /// faulting thread, to the host's exception port (XNU
+    /// osfmk/kern/exception.c `exception_triage_thread`, `exception_deliver`:
+    /// the port's behaviour is EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, so
+    /// the message is `mach_exception_raise`; the port is the kernel object
+    /// bsd/uxkern/ux_handler.c `ux_handler_setup` installs), and a message to
+    /// a kernel object is served on the sending thread after a check against
+    /// its task's MIG filter (osfmk/kern/ipc_kobject.c
+    /// `ipc_kobject_server_internal`: `task_get_mach_kobj_filter_mask(curtask)`,
+    /// `mac_task_kobj_msg_evaluate`). macOS 15 denies it there when it is not
+    /// listed ("deny(1) syscall-mig 53", CI run 43396747298, 15.8.2): the
+    /// message fails, the thread goes back to the instruction
+    /// (`thread_exception_return`) and faults again (hundreds of reports for
+    /// one process), and the process gets the denial's SIGSYS in place of
+    /// SIGSEGV, SIGBUS or SIGTRAP. macOS 26 and 27 do not consult the filter
+    /// for it (the same tests pass without the allowance). On Linux the
+    /// kernel raises a fault's signal with no call a filter sees.
+    ///
+    /// What the allowance gives the process itself (SECURITY.md, the system
+    /// call filter): the kernel finds a kernel object's routine by the
+    /// message's id alone (ipc_kobject.c `mig_init`, `find_mig_hash_entry`),
+    /// so this id passes the filter whichever kernel object the process sends
+    /// it to, and runs `catch_mach_exception_raise` (ux_handler.c), which
+    /// fails unless the port is the host's exception port. The process holds
+    /// no send right to that port and nothing allowed gives it one
+    /// (`host_get_exception_ports`, `task_get_exception_ports`,
+    /// `thread_get_exception_ports` and the swap routines are in no list; the
+    /// host's privileged port is denied, `mach-priv-host-port`, and so are
+    /// Mach lookups). With one, it could only raise the exception's signal on
+    /// the thread whose port it puts in the message (ux_exception.c
+    /// `handle_ux_exception`), and the only thread ports it can name are its
+    /// own threads', which it can already signal (`__pthread_kill`). The API
+    /// process sends no Mach message at all (no `mach_msg2_trap` in
+    /// [`API_MACH_TRAPS`]). `test_an_exception_message_of_its_own_does_nothing`.
+    pub const EXCEPTION_MIG_ROUTINES: &[&str] = &["mach_exception_raise"];
+
+    /// The rule for [`EXCEPTION_MIG_ROUTINES`], where Seatbelt knows the
+    /// name, as for [`SETUP_MIG_ROUTINES_IF_DEFINED`]: a profile naming a
+    /// routine its major's Seatbelt does not know does not compile at all.
+    /// Known on macOS 27 (`sandbox-exec`, `defined?`); on 15, where the
+    /// allowance matters, CI's macos-15 job shows it: there
+    /// `test_a_fault_is_its_signal_under_each_profile` fails if a fault still
+    /// ends by SIGSYS, the name being unknown or not the routine denied.
+    fn exception_rule() -> String {
+        EXCEPTION_MIG_ROUTINES
+            .iter()
+            .map(|name| {
+                format!("(when (defined? '{name}) (allow syscall-mig (kernel-mig-routine {name})))\n")
+            })
+            .collect()
+    }
+
     /// System calls a running microVM makes only where PV steal time is
     /// offered (macOS 27, `kvm_ioctls::pv_time_offered`; nowhere else is
     /// either list in the profile): a vCPU thread reads its own CPU time,
@@ -634,6 +689,7 @@ mod macos {
         rule.push_str(&allow("syscall-unix", "", "syscall-number", "SYS_", API_SYSCALLS));
         rule.push_str(&allow("syscall-mach", "", "machtrap-number", "MSC_", API_MACH_TRAPS));
         rule.push_str(&allow("syscall-mig", "", "kernel-mig-routine", "", API_MIG_ROUTINES));
+        rule.push_str(&exception_rule());
         rule.push_str(&fcntl_rule("", API_FCNTL_COMMANDS));
         rule
     }
@@ -1104,6 +1160,7 @@ mod macos {
             rule.push_str(&allow("syscall-unix", "", "syscall-number", "SYS_", PVTIME_SYSCALLS));
             rule.push_str(&allow("syscall-mig", "", "kernel-mig-routine", "", PVTIME_MIG_ROUTINES));
         }
+        rule.push_str(&exception_rule());
         for name in MACH_TRAPS_IF_DEFINED {
             rule.push_str(&format!(
                 "(when (defined? 'MSC_{name}) (allow syscall-mach (machtrap-number MSC_{name})))\n"
@@ -2396,6 +2453,261 @@ mod macos {
                 assert!(stdout.contains("SANDBOXED"), "{case}: {}", text(&out));
                 assert!(out.status.success() && stdout.contains("CHILD-OK"), "{case}: {}", text(&out));
             }
+        }
+
+        // A fault or a trap of a thread is its signal under every profile,
+        // as on Linux, where no filter sees the kernel raise it: the
+        // process ends by SIGSEGV or SIGBUS (a store to address 0) or by
+        // SIGTRAP (`brk`), at their default action here. Under macOS 15's
+        // Seatbelt the kernel's own message for it has to be allowed
+        // (`EXCEPTION_MIG_ROUTINES`): without the allowance each case ends
+        // by SIGSYS there.
+        #[test]
+        fn test_a_fault_is_its_signal_under_each_profile() {
+            use std::os::unix::process::ExitStatusExt;
+            let mut failed = Vec::new();
+            for profile in ["setup", "run", "api"] {
+                for how in ["fault", "trap"] {
+                    let out = child("faulting_child", &[("WICK_TEST_CASE", &format!("{profile}-{how}"))]);
+                    let signal = out.status.signal();
+                    let ok = match how {
+                        "fault" => signal == Some(libc::SIGSEGV) || signal == Some(libc::SIGBUS),
+                        _ => signal == Some(libc::SIGTRAP),
+                    };
+                    if !ok || !String::from_utf8_lossy(&out.stdout).contains("SANDBOXED") {
+                        failed.push(format!("{profile}-{how}: {}", text(&out)));
+                    }
+                }
+            }
+            assert!(failed.is_empty(), "{} of 6 cases:\n{}", failed.len(), failed.join("\n=====\n"));
+        }
+
+        #[test]
+        #[ignore = "run by test_a_fault_is_its_signal_under_each_profile in a separate process"]
+        fn faulting_child() {
+            // In a fork of this thread, one thread, as the API process is
+            // when its profile is applied (as api_child).
+            in_fork(|| {
+                let case = std::env::var("WICK_TEST_CASE").unwrap();
+                let (profile, how) = case.split_once('-').unwrap();
+                // The default action for each: no handler of the test
+                // harness's (std's for a stack overflow) or of the sandbox's.
+                for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGTRAP, libc::SIGSYS] {
+                    // SAFETY: the default action for a valid signal.
+                    unsafe { libc::signal(sig, libc::SIG_DFL) };
+                }
+                select(Policy::Default);
+                match profile {
+                    "setup" => apply().unwrap(),
+                    "run" => {
+                        apply().unwrap();
+                        narrow().unwrap();
+                    }
+                    _ => apply_api().unwrap(),
+                }
+                // SAFETY: the default action again where `apply` put the
+                // sandbox's handlers; then a store to address 0, which
+                // faults, or a breakpoint trap.
+                unsafe {
+                    for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGTRAP] {
+                        libc::signal(sig, libc::SIG_DFL);
+                    }
+                    libc::write(1, c"SANDBOXED\n".as_ptr().cast(), 10);
+                    if how == "fault" {
+                        std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1);
+                    } else {
+                        std::arch::asm!("brk #1");
+                    }
+                }
+            })
+        }
+
+        // What the allowance of EXCEPTION_MIG_ROUTINES lets the process do
+        // itself: its own `mach_exception_raise` message, sent to a kernel
+        // object it holds (its task port; the id alone picks the routine,
+        // XNU osfmk/kern/ipc_kobject.c `find_mig_hash_entry`), is answered
+        // KERN_FAILURE by `catch_mach_exception_raise` (bsd/uxkern/
+        // ux_handler.c: not the host's exception port) and raises no signal,
+        // here at a fault's default action, as without a sandbox (the
+        // control); the routines that would hand it an exception port are
+        // denied (SIGSYS), and the API process sends no Mach message at all.
+        // On macOS 26 and 27 the filter is not consulted for the message, so
+        // there the cases show what the routine does; on 15 they also show
+        // the allowance.
+        #[test]
+        fn test_an_exception_message_of_its_own_does_nothing() {
+            use std::os::unix::process::ExitStatusExt;
+            let lists = [
+                SETUP_MIG_ROUTINES, SETUP_MIG_ROUTINES_IF_DEFINED, MIG_ROUTINES, PVTIME_MIG_ROUTINES,
+                API_MIG_ROUTINES, EXCEPTION_MIG_ROUTINES,
+            ]
+            .concat();
+            for denied in [
+                "host_get_exception_ports", "host_swap_exception_ports", "task_get_exception_ports",
+                "task_swap_exception_ports", "thread_get_exception_ports", "thread_swap_exception_ports",
+                "host_get_special_port", "host_get_host_priv_port",
+            ] {
+                assert!(!lists.contains(&denied), "{denied}");
+            }
+            let mut failed = Vec::new();
+            let cases = ["none-raise", "setup-raise", "setup-get_ports", "run-raise", "run-get_ports", "api-raise", "api-get_ports"];
+            for name in cases {
+                let out = child("exception_message_child", &[("WICK_TEST_CASE", name)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let ok = stdout.contains("SANDBOXED")
+                    && match name {
+                        // KERN_FAILURE (5) in the routine's reply (2405 + 100).
+                        "none-raise" | "setup-raise" | "run-raise" => {
+                            out.status.success() && stdout.contains("MACH-MSG 0 REPLY-ID 2505\nRETCODE 5\n")
+                        }
+                        _ => out.status.signal() == Some(libc::SIGSYS) && !stdout.contains("RETCODE"),
+                    };
+                if !ok {
+                    failed.push(format!("{name}: {}", text(&out)));
+                }
+            }
+            assert!(failed.is_empty(), "{} of {} cases:\n{}", failed.len(), cases.len(), failed.join("\n=====\n"));
+        }
+
+        #[test]
+        #[ignore = "run by test_an_exception_message_of_its_own_does_nothing in a separate process"]
+        fn exception_message_child() {
+            #[repr(C, packed(4))]
+            struct Raise {
+                // mach_msg_header_t
+                bits: u32,
+                size: u32,
+                remote: u32,
+                local: u32,
+                voucher: u32,
+                id: i32,
+                // mach_msg_body_t, two mach_msg_port_descriptor_t
+                descriptors: u32,
+                thread: [u32; 3],
+                task: [u32; 3],
+                ndr: [u8; 8],
+                exception: i32,
+                code_count: u32,
+                code: [i64; 2],
+            }
+            unsafe extern "C" {
+                static mach_task_self_: libc::mach_port_t;
+                static NDR_record: [u8; 8];
+                fn mig_get_reply_port() -> libc::mach_port_t;
+                // libsystem_kernel's way into mach_msg2_trap, called as its
+                // MIG clients call it (each pair of 32-bit fields in one
+                // word; disassembled task_get_exception_ports, macOS 27.2).
+                fn mach_msg2_internal(
+                    data: *mut u8,
+                    options: u64,
+                    bits_and_send_size: u64,
+                    remote_and_local: u64,
+                    voucher_and_id: u64,
+                    descriptors_and_rcv_name: u64,
+                    rcv_size_and_priority: u64,
+                    timeout: u64,
+                ) -> i32;
+                fn task_get_exception_ports(
+                    task: libc::mach_port_t,
+                    mask: u32,
+                    masks: *mut u32,
+                    count: *mut u32,
+                    handlers: *mut libc::mach_port_t,
+                    behaviors: *mut i32,
+                    flavors: *mut i32,
+                ) -> i32;
+            }
+            // In a fork of this thread, one thread, as faulting_child.
+            in_fork(|| {
+                let case = std::env::var("WICK_TEST_CASE").unwrap();
+                let (profile, case) = case.split_once('-').unwrap();
+                // SAFETY: set by libSystem before main; this thread's port
+                // and its MIG reply port (made here, before the profile).
+                let (task, thread, reply) = unsafe {
+                    (mach_task_self_, libc::pthread_mach_thread_np(libc::pthread_self()), mig_get_reply_port())
+                };
+                for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGTRAP, libc::SIGSYS] {
+                    // SAFETY: the default action for a valid signal.
+                    unsafe { libc::signal(sig, libc::SIG_DFL) };
+                }
+                select(Policy::Default);
+                match profile {
+                    "setup" => apply().unwrap(),
+                    "run" => {
+                        apply().unwrap();
+                        narrow().unwrap();
+                    }
+                    // The control: the same message without a sandbox.
+                    "none" => {}
+                    _ => apply_api().unwrap(),
+                }
+                for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGTRAP] {
+                    // SAFETY: as above, where `apply` put the sandbox's handlers.
+                    unsafe { libc::signal(sig, libc::SIG_DFL) };
+                }
+                // SAFETY: a valid buffer.
+                unsafe { libc::write(1, c"SANDBOXED\n".as_ptr().cast(), 10) };
+                if case == "get_ports" {
+                    let (mut masks, mut handlers, mut behaviors, mut flavors) = ([0u32; 32], [0; 32], [0; 32], [0; 32]);
+                    let mut count = 32;
+                    // SAFETY: arrays of `count` entries each.
+                    let kr = unsafe {
+                        task_get_exception_ports(
+                            task,
+                            0x7ffe, // EXC_MASK_ALL
+                            masks.as_mut_ptr(),
+                            &mut count,
+                            handlers.as_mut_ptr(),
+                            behaviors.as_mut_ptr(),
+                            flavors.as_mut_ptr(),
+                        )
+                    };
+                    println!("GOT-PORTS {kr}");
+                    return;
+                }
+                // EXC_BAD_ACCESS (1) with KERN_INVALID_ADDRESS (1): SIGSEGV if
+                // the routine raised it.
+                let copy_send = 19 << 16; // MACH_MSG_TYPE_COPY_SEND, a port descriptor
+                let mut msg = Raise {
+                    // MACH_MSGH_BITS_COMPLEX, COPY_SEND to the remote, MAKE_SEND_ONCE for the reply.
+                    bits: 0x8000_0000 | 19 | (21 << 8),
+                    size: u32::try_from(std::mem::size_of::<Raise>()).unwrap(),
+                    remote: task,
+                    local: reply,
+                    voucher: 0,
+                    id: 2405, // mach_exception_raise, osfmk/mach/mach_exc.defs
+                    descriptors: 2,
+                    thread: [thread, 0, copy_send],
+                    task: [task, 0, copy_send],
+                    // SAFETY: a constant of libSystem's.
+                    ndr: unsafe { NDR_record },
+                    exception: 1,
+                    code_count: 2,
+                    code: [1, 0],
+                };
+                let mut buf = [0u8; 256];
+                // SAFETY: `msg` is copied into `buf`, which takes the reply.
+                let mr = unsafe {
+                    std::ptr::copy_nonoverlapping((&raw mut msg).cast::<u8>(), buf.as_mut_ptr(), std::mem::size_of::<Raise>());
+                    // MACH64_SEND_KOBJECT_CALL | MACH_RCV_MSG | MACH_SEND_MSG, as
+                    // libsystem's clients send to a kernel object.
+                    mach_msg2_internal(
+                        buf.as_mut_ptr(),
+                        0x2_0000_0003,
+                        u64::from(msg.bits) | (u64::from(msg.size) << 32),
+                        u64::from(task) | (u64::from(reply) << 32),
+                        2405 << 32,
+                        2 | (u64::from(reply) << 32),
+                        256,
+                        0,
+                    )
+                };
+                // mig_reply_error_t: the header, NDR, then RetCode.
+                let retcode = i32::from_ne_bytes(buf[32..36].try_into().unwrap());
+                let id = i32::from_ne_bytes(buf[20..24].try_into().unwrap());
+                println!("MACH-MSG {mr} REPLY-ID {id}");
+                println!("RETCODE {retcode}");
+            })
         }
 
         #[test]
@@ -4699,13 +5011,26 @@ mod macos {
             let mut names = SETUP_MIG_ROUTINES.to_vec();
             names.extend(SETUP_MIG_ROUTINES_IF_DEFINED);
             names.extend(MIG_ROUTINES);
+            names.extend(EXCEPTION_MIG_ROUTINES);
             names.sort_unstable();
             names.dedup();
             assert_eq!(
                 names.len(),
-                SETUP_MIG_ROUTINES.len() + SETUP_MIG_ROUTINES_IF_DEFINED.len() + MIG_ROUTINES.len()
+                SETUP_MIG_ROUTINES.len()
+                    + SETUP_MIG_ROUTINES_IF_DEFINED.len()
+                    + MIG_ROUTINES.len()
+                    + EXCEPTION_MIG_ROUTINES.len()
             );
             assert!(SETUP_MIG_ROUTINES_IF_DEFINED.contains(&"mach_vm_reallocate"));
+            // The kernel's message for a fault is allowed by every profile.
+            for rule in [syscall_rule(), api_profile()] {
+                assert!(
+                    rule.contains(
+                        "(when (defined? 'mach_exception_raise) (allow syscall-mig (kernel-mig-routine mach_exception_raise)))"
+                    ),
+                    "{rule}"
+                );
+            }
         }
 
         // The profiles compile on this host, whatever its macOS major: a
