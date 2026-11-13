@@ -269,10 +269,23 @@ const HV_FEATURE_REG_CLIDR_EL1: u32 = 10;
 /// `hv_cache_type_t`.
 const HV_CACHE_TYPE_DATA: u32 = 0;
 const HV_CACHE_TYPE_INSTRUCTION: u32 = 1;
+/// `hv_return_t` (hv_error.h): the host has no Hypervisor.framework, as a
+/// virtual machine has none (`kern.hv_support` 0), and the call is refused.
+const HV_UNSUPPORTED: i32 = 0xfae9_400f_u32.cast_signed();
+const HV_DENIED: i32 = 0xfae9_4007_u32.cast_signed();
+
+/// A status of the calls above, named as hv_error.h names it.
+fn hv_status(r: i32) -> String {
+    match r {
+        HV_UNSUPPORTED => format!("HV_UNSUPPORTED ({r:#x}): this host has no Hypervisor.framework"),
+        HV_DENIED => format!("HV_DENIED ({r:#x})"),
+        _ => format!("{r:#x}"),
+    }
+}
 
 impl Hvf {
     fn query() -> io::Result<Hvf> {
-        let fail = |what: &str, r: i32| io::Error::other(format!("Hypervisor.framework {what}: {r:#x}"));
+        let fail = |what: &str, r: i32| io::Error::other(format!("Hypervisor.framework {what}: {}", hv_status(r)));
         // SAFETY: plain calls into a configuration made here and released
         // before returning; each buffer is as large as the call writes.
         unsafe {
@@ -366,11 +379,55 @@ mod tests {
         assert_eq!(bitmap(1, 64), "00000000,00000001");
     }
 
+    /// Whether this host has Hypervisor.framework: `kern.hv_support`, the
+    /// sysctl Apple names for that question (xnu-12377.1.9
+    /// bsd/kern/kern_sysctl.c, only in a kernel built with HYPERVISOR, so
+    /// no such sysctl is no support; on arm64 the value is set outside the
+    /// open source). 1 on an M1 Pro (macOS 27.2); that GitHub's runners,
+    /// virtual machines, read 0 is inferred from their HV_UNSUPPORTED, and
+    /// printed here so a run shows it.
+    fn hv_support() -> bool {
+        let support = match sysctl_int("kern.hv_support") {
+            Ok(v) => v == 1,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => panic!("{e}"),
+        };
+        println!("kern.hv_support: {support}");
+        support
+    }
+
+    /// Hypervisor.framework's view of the vCPU, which needs the framework
+    /// but no entitlement. On a host without it (CI run 43442912128's
+    /// runner: CLIDR_EL1 refused with HV_UNSUPPORTED) the query must fail
+    /// and name that, which is what a file read gives there; `None` then.
+    fn hvf_or_its_refusal() -> Option<Hvf> {
+        if hv_support() {
+            return Some(Hvf::query().unwrap());
+        }
+        let err = Hvf::query().unwrap_err().to_string();
+        assert!(
+            err.contains("HV_UNSUPPORTED") && err.contains("no Hypervisor.framework"),
+            "kern.hv_support 0, and the query failed otherwise: {err}"
+        );
+        let read = read(&format!("{CACHE}0/level")).unwrap_err().to_string();
+        assert_eq!(read, err);
+        println!("kern.hv_support 0: refused as it should be: {err}");
+        None
+    }
+
+    #[test]
+    fn test_hv_status_names() {
+        assert_eq!(hv_status(HV_UNSUPPORTED), "HV_UNSUPPORTED (0xfae9400f): this host has no Hypervisor.framework");
+        assert_eq!(hv_status(HV_DENIED), "HV_DENIED (0xfae94007)");
+        assert_eq!(hv_status(0xfae9_4001_u32.cast_signed()), "0xfae94001");
+    }
+
     // This host's caches: each leaf's files, with sizes XNU's and geometry
     // the vCPU's, and nothing past the last leaf.
     #[test]
     fn test_host_caches() {
-        let found = leaves(&Hvf::query().unwrap()).unwrap();
+        let Some(hvf) = hvf_or_its_refusal() else { return };
+        let found = leaves(&hvf).unwrap();
         assert!(!found.is_empty());
         for (i, leaf) in found.iter().enumerate() {
             let file = |name: &str| read(&format!("{CACHE}{i}/{name}")).unwrap();
@@ -396,7 +453,7 @@ mod tests {
     }
 
     // The sizes are the lowest performance level's, as kern_mib.c gives
-    // them, and the vCPU's CCSIDR_EL1 describes caches of those sizes.
+    // them: XNU only, on every host.
     #[test]
     fn test_sizes_are_the_lowest_perflevel() {
         let low = sysctl_int("hw.nperflevels").unwrap() - 1;
@@ -404,7 +461,13 @@ mod tests {
         assert_eq!(sysctl_u64("hw.l1dcachesize").unwrap(), level("l1dcachesize"));
         assert_eq!(sysctl_u64("hw.l1icachesize").unwrap(), level("l1icachesize"));
         assert_eq!(sysctl_u64("hw.l2cachesize").unwrap(), level("l2cachesize"));
-        for leaf in &leaves(&Hvf::query().unwrap()).unwrap() {
+    }
+
+    // The vCPU's CCSIDR_EL1 describes caches of XNU's sizes.
+    #[test]
+    fn test_vcpu_geometry_is_xnus_sizes() {
+        let Some(hvf) = hvf_or_its_refusal() else { return };
+        for leaf in &leaves(&hvf).unwrap() {
             leaf.geometry().unwrap();
         }
     }
