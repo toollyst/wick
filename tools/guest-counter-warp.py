@@ -60,17 +60,24 @@
 # Where CODE comes from: the full source is tools/guest-counter-warp-loop.c.
 # Each machine's bytes are the .text section of the ELF object that
 #   Apple clang version 21.0.0 (clang-2100.4.1.1)
-# makes with, for MACHINE x86_64 and aarch64,
-#   clang -target MACHINE-linux-gnu -O2 -fno-stack-protector -ffreestanding \
+# makes with
+#   clang -target x86_64-linux-gnu -O2 -fno-stack-protector -ffreestanding \
 #         -fPIC -fno-asynchronous-unwind-tables -c guest-counter-warp-loop.c
+#   clang -target aarch64-linux-gnu -mno-outline-atomics -O2 \
+#         -fno-stack-protector -ffreestanding -fPIC \
+#         -fno-asynchronous-unwind-tables -c guest-counter-warp-loop.c
+# (-mno-outline-atomics: upstream clang's default for aarch64-linux-gnu
+# makes the atomic exchange a call to libgcc's __aarch64_swp8_acq, which
+# this blob, mapped alone, cannot have; Apple clang's default does not, and
+# its object is the same with the flag or without it)
 # cut by reading the object's section headers (e_shoff; .text by name in
 # the section-name table) and taking that section's bytes; the object has no
 # relocation section, so the bytes run wherever they are mapped, and no
 # other code or data section. tools/check-guest-counter-warp.py does exactly
 # this and compares: that clang on this repo's Mac rebuilds both byte for
 # byte. Another clang may choose other instructions for the same source
-# (Ubuntu 24.04's clang 18.1.3 does: other x86_64 bytes, and an aarch64 call
-# to an outlined atomic), so the check says SKIP (exit 3) when its clang is
+# (Ubuntu 24.04's clang 18.1.3 does, on both machines: 225 and 220
+# bytes), so the check says SKIP (exit 3) when its clang is
 # another and differs, and when no clang is on PATH; it never passes
 # silently.
 import ctypes

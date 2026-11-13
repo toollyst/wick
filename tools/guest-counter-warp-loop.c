@@ -5,6 +5,8 @@
 // (its CODE table). Built for each machine with
 //   clang -target <x86_64|aarch64>-linux-gnu -O2 -fno-stack-protector
 //         -ffreestanding -fPIC -fno-asynchronous-unwind-tables -c
+// with -mno-outline-atomics for aarch64 (the exchange must be inline: the
+// code has no library to call),
 // and cut as the object's .text section; tools/check-guest-counter-warp.py
 // does both and compares.
 //

@@ -8,8 +8,16 @@
 # the ELF object (read here; the object must have no relocation section, as
 # the code runs wherever it is mapped).
 #
-#   clang -target <machine>-linux-gnu -O2 -fno-stack-protector -ffreestanding
-#         -fPIC -fno-asynchronous-unwind-tables -c guest-counter-warp-loop.c
+#   clang -target <machine>-linux-gnu [-mno-outline-atomics] -O2
+#         -fno-stack-protector -ffreestanding -fPIC
+#         -fno-asynchronous-unwind-tables -c guest-counter-warp-loop.c
+#
+# -mno-outline-atomics is for aarch64 only: upstream clang's default for
+# aarch64-linux-gnu turns the atomic exchange into a call to libgcc's
+# __aarch64_swp8_acq, which the blob, run alone wherever it is mapped,
+# cannot have; Apple clang's default does not, so the flag leaves its bytes
+# as they were (the same object with and without it; with
+# -moutline-atomics it makes that call too).
 #
 # The bytes were made with RECORDED_CLANG below. Another clang may emit other
 # instructions for the same source: its bytes are then not comparable.
@@ -20,11 +28,11 @@
 #           clang other than the recorded one whose bytes differ or whose
 #           object has relocations. Ubuntu clang version 18.1.3 (1ubuntu1),
 #           the clang of Ubuntu 24.04 (in Docker, 2026-11-14), is such a
-#           one: 225 x86_64 bytes, not 231, and an aarch64 call to
-#           __aarch64_swp8_acq (R_AARCH64_CALL26: upstream clang outlines
-#           atomics for aarch64-linux-gnu, Apple clang does not), so CI's
-#           Linux runners cannot check the bytes and the check is not a CI
-#           step; run it on a Mac with the recorded clang.
+#           one: 225 x86_64 bytes, not 231, and 220 aarch64 bytes, not
+#           228 (with no relocation now; without -mno-outline-atomics its
+#           aarch64 object called __aarch64_swp8_acq, R_AARCH64_CALL26),
+#           so CI's Linux runners cannot check the bytes and the check is
+#           not a CI step; run it on a Mac with the recorded clang.
 #   python3 tools/check-guest-counter-warp.py [--clang PATH]
 import os
 import re
@@ -34,6 +42,7 @@ import sys
 import tempfile
 
 RECORDED_CLANG = "Apple clang version 21.0.0 (clang-2100.4.1.1)"
+MACHINE_FLAGS = {"x86_64": [], "aarch64": ["-mno-outline-atomics"]}
 FLAGS = ["-O2", "-fno-stack-protector", "-ffreestanding", "-fPIC", "-fno-asynchronous-unwind-tables", "-c"]
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 
@@ -68,7 +77,7 @@ def main(argv):
     with tempfile.TemporaryDirectory() as tmp:
         for machine in ("x86_64", "aarch64"):
             obj_path = os.path.join(tmp, machine + ".o")
-            subprocess.run([clang, "-target", machine + "-linux-gnu", *FLAGS, os.path.join(TOOLS, "guest-counter-warp-loop.c"), "-o", obj_path], check=True)
+            subprocess.run([clang, "-target", machine + "-linux-gnu", *MACHINE_FLAGS[machine], *FLAGS, os.path.join(TOOLS, "guest-counter-warp-loop.c"), "-o", obj_path], check=True)
             obj = open(obj_path, "rb").read()
             secs = sections(obj)
             relocs = [n for n in secs if n.startswith(".rel")]
