@@ -23,8 +23,10 @@
 # (lib/firecracker/rust-toolchain.toml).
 #
 # The binary needs macOS 15 or later on Apple silicon (hv_gic_*). The signature
-# is ad hoc; a copy downloaded by a browser gets a quarantine attribute that has
-# to be removed (`xattr -d com.apple.quarantine`), one fetched with curl does not.
+# is ad hoc and not notarized. A copy downloaded by a browser carries
+# com.apple.quarantine, which tar copies onto what it extracts; one fetched with
+# curl does not. If macOS refuses to run it, `xattr -d com.apple.quarantine` on
+# the archive (or -dr on the extracted directory) clears it (README.md).
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 ROOT="$WICK_ROOT"

@@ -92,6 +92,28 @@ tools/setup.sh
 tools/macos/run.sh --release -- --api-sock /tmp/firecracker.socket
 ```
 
+Or take a [release](https://github.com/toollyst/wick/releases) (none is tagged yet): `wick-<tag>-darwin-aarch64.tgz`
+holds the binary, ad hoc signed with that entitlement and not notarized. Fetched with curl it runs as it is:
+
+```sh
+curl -fLO https://github.com/toollyst/wick/releases/download/<tag>/wick-<tag>-darwin-aarch64.tgz
+tar -xzf wick-<tag>-darwin-aarch64.tgz
+release-<tag>-darwin-aarch64/firecracker-<tag>-darwin-aarch64 --version
+```
+
+A browser marks what it downloads with `com.apple.quarantine`, and tar copies the mark onto every file it extracts;
+Gatekeeper rejects an ad hoc signature (`spctl --assess` says "rejected"), and Apple says it asks before downloaded
+software is opened the first time ([Gatekeeper](https://support.apple.com/guide/security/gatekeeper-and-runtime-protection-sec5599b66df/web)).
+On macOS 27.2 a quarantined copy still ran from a shell and as a launchd job, with no assessment logged. If macOS
+refuses to run it, clear the mark, on the archive before extracting or on the extracted directory:
+
+```sh
+xattr -d com.apple.quarantine wick-<tag>-darwin-aarch64.tgz
+xattr -dr com.apple.quarantine release-<tag>-darwin-aarch64
+```
+
+Check a release before you use it as [SECURITY.md](SECURITY.md#verifying-a-release) says.
+
 **Linux.** This is upstream Firecracker; build it the usual way:
 
 ```sh

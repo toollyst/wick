@@ -167,8 +167,10 @@ jobs:
           notes="wick $TAG, built from upstream Firecracker $BASE.
 
           - $name.tgz: macOS 15+ on Apple silicon (Hypervisor.framework),
-            ad-hoc signed with the com.apple.security.hypervisor entitlement. If a browser
-            downloaded it, clear the quarantine attribute: xattr -d com.apple.quarantine <file>.
+            ad-hoc signed with the com.apple.security.hypervisor entitlement, not notarized.
+            A browser's download carries com.apple.quarantine, and tar copies it onto the
+            files; if macOS refuses to run the binary, clear it: xattr -d com.apple.quarantine
+            $name.tgz before extracting (README.md, \"Get started\").
           - $name.cdx.json: the SBOM (CycloneDX 1.5), every crate the binary is built from.
           - SHA256SUMS: SHA-256 of every file. Check: shasum -a 256 -c SHA256SUMS
           - Build provenance and the SBOM are signed attestations of this repository's
