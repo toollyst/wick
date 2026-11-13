@@ -1236,16 +1236,23 @@ fn candidates() -> Vec<(u32, WHV_REGISTER_NAME)> {
 }
 
 /// Those of [`candidates`] that a VM's partition lets a vCPU read and
-/// write ([`super::vm::probe_registers`], once per process). With no WHP,
-/// none: the MSRs are then dropped and read as 0, as before.
-fn partition_msrs() -> &'static [(u32, WHV_REGISTER_NAME)] {
-    static PRESENT: std::sync::OnceLock<Vec<(u32, WHV_REGISTER_NAME)>> = std::sync::OnceLock::new();
+/// write ([`super::vm::probe_registers`], once per process), or the errno
+/// of the probe's failure: no VM is made then ([`probe_partition`]).
+fn probe() -> &'static std::result::Result<Vec<(u32, WHV_REGISTER_NAME)>, i32> {
+    static PRESENT: std::sync::OnceLock<std::result::Result<Vec<(u32, WHV_REGISTER_NAME)>, i32>> =
+        std::sync::OnceLock::new();
     PRESENT.get_or_init(|| {
         let all = candidates();
         let names: Vec<WHV_REGISTER_NAME> = all.iter().map(|&(_, n)| n).collect();
-        let ok = super::vm::probe_registers(&names);
-        all.into_iter().zip(ok).filter_map(|(c, ok)| ok.then_some(c)).collect()
+        let ok = super::vm::probe_registers(&names).map_err(|e| e.errno())?;
+        Ok(all.into_iter().zip(ok).filter_map(|(c, ok)| ok.then_some(c)).collect())
     })
+}
+
+/// [`probe`]'s registers; none where the probe failed, where no VM is
+/// made.
+fn partition_msrs() -> &'static [(u32, WHV_REGISTER_NAME)] {
+    probe().as_deref().unwrap_or(&[])
 }
 
 /// Whether a VM's partition keeps `name`, one of the registers of
@@ -1263,9 +1270,12 @@ pub(crate) fn partition_keeps(name: WHV_REGISTER_NAME) -> bool {
 /// exception and looks a message up; CI run 43392627996, STACKCALL lines:
 /// `WHvGetVirtualProcessorRegisters(0x2096)`, 0xc0350005, the stack from
 /// 20 to 52 KiB). Left to its first use, the probe ran on whichever thread
-/// first asked, which a vCPU's can be (an MSR exit, CPUID leaf 0xd).
-pub(crate) fn probe_partition() {
-    let _ = partition_msrs();
+/// first asked, which a vCPU's can be (an MSR exit, CPUID leaf 0xd). A
+/// probe that could not make its partition is the VM's error: answered as
+/// none, it would have every VM keep those MSRs nowhere without a word
+/// (at 5386efc on a PC, whose set-up refused every partition).
+pub(crate) fn probe_partition() -> Result<()> {
+    probe().as_ref().map(|_| ()).map_err(|&e| super::Error::new(e))
 }
 
 /// FS_BASE (0xc000_0100) and GS_BASE (0xc000_0101) are the base of the FS/GS
@@ -1285,9 +1295,10 @@ fn msr_segment_base(index: u32) -> Option<WHV_REGISTER_NAME> {
 /// saves 0x400 to 0x47f of every guest whose CPUID has MCE
 /// (cpu_config/x86_64/cpuid/common.rs, `msrs_to_save_by_cpuid`), which is
 /// every guest: a call that ended at 0x400 failed every vCPU's save (CI run
-/// 43392627996, vmm's `test_vcpu_save_state_events`).
+/// 43392627996, vmm's `test_vcpu_save_state_events`). Not IA32_MCG_CAP
+/// and IA32_MCG_STATUS, which WHP keeps itself ([`super::mce::whp_answers`]).
 fn mce_msr(index: u32) -> bool {
-    super::mce::is_mce(index)
+    super::mce::is_mce(index) && !super::mce::whp_answers(index)
 }
 
 /// Whether `KVM_GET_MSRS` and `KVM_SET_MSRS` have `index` here: an MSR with
@@ -1386,9 +1397,11 @@ pub(crate) fn msr_index_list() -> Result<MsrList> {
         super::pvclock::MSR_WALL_CLOCK, super::pvclock::MSR_SYSTEM_TIME,
         // IA32_TSC_DEADLINE (tscdeadline).
         super::tscdeadline::MSR_TSC_DEADLINE,
-        // IA32_MCG_STATUS, IA32_MCG_CTL and HWCR, in KVM's emulated list
-        // (x86.c, `emulated_msrs_all`) and kept by the vCPU (mce).
-        super::mce::MCG_STATUS, super::mce::MCG_CTL, super::mce::HWCR,
+        // IA32_MCG_CTL and HWCR, in KVM's emulated list (x86.c,
+        // `emulated_msrs_all`) and kept by the vCPU (mce). Not
+        // IA32_MCG_STATUS, which KVM lists too: WHP keeps it, and the
+        // backend can neither read nor write it (`mce::whp_answers`).
+        super::mce::MCG_CTL, super::mce::HWCR,
     ]
     .into_iter()
     // KVM's others that this partition keeps (the MTRRs are not listed),
@@ -1461,8 +1474,9 @@ mod tests {
         for saved in [0xd90].into_iter().chain(mtrr).chain(0x400..0x480) {
             assert!(has_msr(saved), "{saved:#x}");
         }
-        // KVM's other machine-check MSRs, and what is past the banks.
-        assert!(has_msr(0x179) && has_msr(0x17a) && has_msr(0x17b));
+        // KVM's other machine-check MSRs, and what is past the banks;
+        // not the two WHP keeps itself.
+        assert!(!has_msr(0x179) && !has_msr(0x17a) && has_msr(0x17b));
         assert!(has_msr(0) && has_msr(1) && has_msr(0x280) && has_msr(0x29f));
         assert!(!has_msr(0x480) && !has_msr(0x3ff) && !has_msr(0x2a0));
     }

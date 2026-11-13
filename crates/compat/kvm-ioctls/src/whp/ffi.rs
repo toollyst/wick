@@ -93,7 +93,7 @@ const WHV_E_VP_ALREADY_EXISTS: i32 = 0x8037_0306u32 as i32;
 /// exists already is `EEXIST`, as `KVM_CREATE_VCPU` answers; every other
 /// `HRESULT` (WHP's own `WHV_E_*`, the generic ones) is `EINVAL`, what KVM
 /// returns for an argument it rejects.
-fn from_hresult(hres: i32) -> Error {
+pub(crate) fn from_hresult(hres: i32) -> Error {
     use windows_sys::Win32::Foundation::E_NOTIMPL;
     const WIN32_FACILITY: i32 = 0x8007_0000u32 as i32;
     if (hres & 0xFFFF_0000u32 as i32) == WIN32_FACILITY {
@@ -130,7 +130,7 @@ pub(crate) fn whp_present() -> bool {
 pub(crate) fn create_partition() -> Result<WHV_PARTITION_HANDLE> {
     let mut part: WHV_PARTITION_HANDLE = 0;
     // SAFETY: valid out-parameter.
-    hr(unsafe { whv::WHvCreatePartition(&mut part) })?;
+    hr_of("WHvCreatePartition", unsafe { whv::WHvCreatePartition(&mut part) }, String::new)?;
     Ok(part)
 }
 

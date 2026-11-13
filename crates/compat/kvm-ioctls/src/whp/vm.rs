@@ -394,8 +394,8 @@ impl VmFd {
         // before the VM's own partition is made: the probe of the registers
         // a partition keeps, whose refused calls cost the calling thread
         // 32 KiB of stack for good (`regs::probe_partition`).
-        super::regs::probe_partition();
-        let part = ffi::create_partition()?;
+        super::regs::probe_partition()?;
+        let part = make_partition()?;
         let inner = VmInner::setup(part).inspect_err(|_| {
             // SAFETY: cleans up the partition we just created on failure.
             unsafe { whv::WHvDeletePartition(part) };
@@ -410,27 +410,41 @@ impl VmFd {
 
 /// Which of `names` a partition configured as a VM's ([`configure`]) lets
 /// vCPU 0 read and write back: a throwaway partition with no memory, made
-/// and deleted here. All false if WHP cannot make one.
-pub(crate) fn probe_registers(names: &[WHV_REGISTER_NAME]) -> Vec<bool> {
-    let mut ok = vec![false; names.len()];
-    let Ok(part) = ffi::create_partition() else { return ok };
+/// and deleted here. An error, the failing call reported by name, if WHP
+/// cannot make one: an answer of none would make every VM of the process
+/// keep those MSRs nowhere without a word.
+pub(crate) fn probe_registers(names: &[WHV_REGISTER_NAME]) -> Result<Vec<bool>> {
+    let part = make_partition()?;
     // SAFETY: vCPU 0 of the partition just configured.
-    if configure(part).is_ok() && ffi::hr(unsafe { whv::WHvCreateVirtualProcessor(part, 0, 0) }).is_ok() {
-        for (i, &name) in names.iter().enumerate() {
-            ok[i] = ffi::quietly(|| {
-                ffi::get_register(part, 0, name).is_ok_and(|v| ffi::set_register(part, 0, name, v).is_ok())
-            });
-        }
-    }
+    let vp = ffi::hr_of("WHvCreateVirtualProcessor", unsafe { whv::WHvCreateVirtualProcessor(part, 0, 0) }, || {
+        "vp 0".into()
+    });
+    let ok = vp.map(|()| {
+        names
+            .iter()
+            .map(|&name| {
+                ffi::quietly(|| ffi::get_register(part, 0, name).is_ok_and(|v| ffi::set_register(part, 0, name, v).is_ok()))
+            })
+            .collect()
+    });
     // SAFETY: the partition made above, deleted with its vCPU.
     unsafe { whv::WHvDeletePartition(part) };
     ok
 }
 
-/// What WHP answered the first partition's MSR action list with (`configure`).
-pub(crate) static MSR_ACTIONS: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+/// A new partition, configured as every VM's and set up ([`configure`]);
+/// deleted again if that fails.
+fn make_partition() -> Result<WHV_PARTITION_HANDLE> {
+    let part = ffi::create_partition()?;
+    configure(part).inspect_err(|_| {
+        // SAFETY: the partition made above, which nothing else has.
+        unsafe { whv::WHvDeletePartition(part) };
+    })?;
+    Ok(part)
+}
 
-/// Sets a new partition's properties and sets it up, as every VM's.
+/// Sets a new partition's properties and sets it up, as every VM's. Each
+/// WHP call that fails is reported by name and HRESULT ([`ffi::hr_of`]).
 fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
         // Processor count must be set before the partition is set up.
         let count = u32::try_from(MAX_VCPUS).unwrap();
@@ -510,42 +524,15 @@ fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
                 ffi::set_partition_property(part, whv::WHvPartitionPropertyCodeProcessorXsaveFeatures, &xsave)?;
             }
         }
-        // IA32_MCG_CAP and IA32_MCG_STATUS: WHP answers a guest's RDMSR and
-        // WRMSR of them itself, with no MSR exit (measured on a Ryzen 9 7900,
-        // Windows 11 build 26300: `test_what_a_cpu_template_changes_on_record`,
-        // "intercepts 0", MCG_CAP read as 0, a write of MCG_STATUS taken),
-        // where every other machine-check MSR exits; the vCPU keeps them as
-        // KVM keeps them (`mce`), so a guest and a snapshot would see two
-        // values. An MSR action of Exit for each (MsrActionList,
-        // `WHvMsrActionExit`) makes them exit as the rest do. A WHP that
-        // does not take the list is reported, once, and the difference
-        // stays: the guest's are WHP's (`msr_actions`).
-        let actions = [super::mce::MCG_CAP, super::mce::MCG_STATUS].map(|index| whv::WHV_MSR_ACTION_ENTRY {
-            Index: index,
-            ReadAction: whv::WHvMsrActionExit as u8,
-            WriteAction: whv::WHvMsrActionExit as u8,
-            Reserved: 0,
-        });
-        // SAFETY: an array of MSR action entries of the size passed.
-        let hres = unsafe {
-            whv::WHvSetPartitionProperty(
-                part,
-                whv::WHvPartitionPropertyCodeMsrActionList,
-                actions.as_ptr().cast(),
-                u32::try_from(std::mem::size_of_val(&actions)).unwrap(),
-            )
-        };
-        if MSR_ACTIONS.set(hres).is_ok() && hres < 0 {
-            ffi::report(
-                log::Level::Error,
-                &format!(
-                    "whp: this host's WHP does not take an MSR action list (HRESULT {:#010x}): a guest's RDMSR and WRMSR of \
-                     IA32_MCG_CAP and IA32_MCG_STATUS are answered by WHP, not from the vCPU's machine-check MSRs, which \
-                     KVM_GET_MSRS and a snapshot have",
-                    hres.cast_unsigned()
-                ),
-            );
-        }
+        // No MSR action list (MsrActionList). IA32_MCG_CAP and
+        // IA32_MCG_STATUS, which WHP answers a guest itself (`mce`), cannot be
+        // made to exit with one: on a Windows 11 PC (build 26300) the list's
+        // set returns S_OK, and the set-up of a partition whose list holds
+        // either of them, for any action, fails with 0xc0350006
+        // (STATUS_HV_ACCESS_DENIED), as for every architectural MSR tried;
+        // Microsoft Learn's Partition Property Data Types gives the property
+        // and no rule for its entries (`test_msr_action_list_on_record`
+        // prints which indices this host's set-up takes).
         // Emulate the local APIC in WHP (xAPIC).
         let apic_mode: i32 = whv::WHvX64LocalApicEmulationModeXApic;
         // SAFETY: an i32 property value for LocalApicEmulationMode.
@@ -594,22 +581,24 @@ fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
             .chain(0x8000_0000..=0x8000_0028)
             .collect();
         // SAFETY: an array of u32 CPUID function numbers.
-        ffi::hr(unsafe {
+        let hres = unsafe {
             whv::WHvSetPartitionProperty(
                 part,
                 whv::WHvPartitionPropertyCodeCpuidExitList,
                 cpuid_exits.as_ptr().cast(),
                 u32::try_from(std::mem::size_of_val(cpuid_exits.as_slice())).unwrap(),
             )
-        })?;
+        };
+        ffi::hr_of("WHvSetPartitionProperty", hres, || "CpuidExitList".into())?;
         // SAFETY: completes partition setup.
-        ffi::hr(unsafe { whv::WHvSetupPartition(part) })
+        let hres = unsafe { whv::WHvSetupPartition(part) };
+        ffi::hr_of("WHvSetupPartition", hres, String::new)
 }
 
 impl VmInner {
+    /// The state of a VM whose partition `part` is configured and set up
+    /// ([`make_partition`]).
     fn setup(part: WHV_PARTITION_HANDLE) -> Result<VmInner> {
-        configure(part)?;
-
         let stop_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(io_err)?;
         Ok(VmInner {
             part,
@@ -1391,6 +1380,63 @@ mod tests {
             // SAFETY: the partition made above.
             unsafe { whv::WHvDeletePartition(part) };
         }
+    }
+
+    // Which MSR indices this host's WHP takes in a partition's MSR action
+    // list (MsrActionList, one entry, both actions Exit): for each, the
+    // HRESULTs of the list's set and of the set-up of a partition that has
+    // it, on a partition of its own with one vCPU. The backend sets no list
+    // (`configure`): on a Windows 11 PC, build 26300, the set-up refused
+    // every architectural MSR tried, IA32_MCG_CAP and IA32_MCG_STATUS
+    // among them, with 0xc0350006. Printed, not asserted.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_msr_action_list_on_record() {
+        let indices: [u32; 20] = [
+            0x179, 0x17a, 0x400, 0x10, 0x1b, 0x3a, 0x8b, 0x174, 0x277, 0x6e0, 0xc000_0080, 0xc000_0081, 0xc000_0102,
+            0xc001_0010, 0xc001_0015, 0xc001_0114, 0xc001_001f, 0xc001_1020, 0x4b56_4d00, 0x4000_0000,
+        ];
+        let mut taken = Vec::new();
+        for index in indices {
+            let Ok(part) = ffi::create_partition() else {
+                eprintln!("MSRACTION {index:#x}: no partition");
+                continue;
+            };
+            let one = 1u32;
+            let entry = whv::WHV_MSR_ACTION_ENTRY {
+                Index: index,
+                ReadAction: whv::WHvMsrActionExit as u8,
+                WriteAction: whv::WHvMsrActionExit as u8,
+                Reserved: 0,
+            };
+            // SAFETY: a u32 property value, then one MSR action entry, of the
+            // sizes passed.
+            let (count, set) = unsafe {
+                (
+                    whv::WHvSetPartitionProperty(part, whv::WHvPartitionPropertyCodeProcessorCount, (&raw const one).cast(), 4),
+                    whv::WHvSetPartitionProperty(
+                        part,
+                        whv::WHvPartitionPropertyCodeMsrActionList,
+                        (&raw const entry).cast(),
+                        u32::try_from(std::mem::size_of_val(&entry)).unwrap(),
+                    ),
+                )
+            };
+            // SAFETY: the partition made above.
+            let setup = unsafe { whv::WHvSetupPartition(part) };
+            eprintln!(
+                "MSRACTION {index:#x}: ProcessorCount {:#010x}, list set {:#010x}, set-up {:#010x}",
+                count.cast_unsigned(),
+                set.cast_unsigned(),
+                setup.cast_unsigned()
+            );
+            if set == 0 && setup == 0 {
+                taken.push(index);
+            }
+            // SAFETY: the partition made above.
+            unsafe { whv::WHvDeletePartition(part) };
+        }
+        eprintln!("MSRACTION taken at the set-up: {taken:x?}");
     }
 
     // A vCPU's XSAVE state is read and written whole on every host: into

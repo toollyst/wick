@@ -2108,6 +2108,22 @@ impl VcpuFd {
         // SAFETY: the access-info bitfield overlaps the u32.
         let (is_write, value) = super::exit::msr_access(unsafe { m.AccessInfo.AsUINT32 }, m.Rax, m.Rdx);
         let index = m.MsrNumber;
+        if super::mce::whp_answers(index) {
+            // Measured to be answered by WHP itself, with no exit; one that
+            // exits is answered as KVM would from the vCPU's value, which
+            // `KVM_GET_MSRS` does not read (`mce::whp_answers`): said once.
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                super::ffi::report(
+                    log::Level::Warn,
+                    &format!(
+                        "whp: a guest's {} of MSR {index:#x} exited to the backend, which the WHP measured answers \
+                         itself; answered as KVM answers it, from a value KVM_GET_MSRS and a snapshot do not have",
+                        if is_write { "WRMSR" } else { "RDMSR" }
+                    ),
+                );
+            });
+        }
         if super::mce::is_mce(index) {
             // As KVM's `set_msr_mce`, `get_msr_mce` and its HWCR case for
             // the guest: a bank's STATUS other than 0 only with HWCR's
@@ -4129,17 +4145,13 @@ mod fpu_tests {
             }
         }
 
-        eprintln!(
-            "TMPLTEST MsrActionList (an exit for IA32_MCG_CAP and IA32_MCG_STATUS): HRESULT {:#010x?}",
-            super::super::vm::MSR_ACTIONS.get().map(|h| h.cast_unsigned())
-        );
         // The machine-check MSRs (`mce`): what a guest's RDMSR gets and
         // its WRMSR does, whether each came to the backend, and what
         // KVM_GET_MSRS reads after; KVM's answer in each line. On record:
         // whether these reach the backend is WHP's.
         for (index, write, kvm) in [
-            (0x179u32, 32u64, "rdmsr 32, wrmsr #GP"),
-            (0x17a, 0x5, "rdmsr 0, wrmsr kept: 0x5"),
+            (0x179u32, 32u64, "rdmsr 32, wrmsr #GP; here WHP's, the backend's call ends at it"),
+            (0x17a, 0x5, "rdmsr 0, wrmsr kept: 0x5; here WHP's, the backend's call ends at it"),
             (0x17b, 0, "rdmsr #GP, wrmsr #GP"),
             (0x400, u64::MAX, "rdmsr 0, wrmsr kept: all ones"),
             (0x401, 0xbe00_0000_0000_0000, "rdmsr 0, wrmsr #GP (non-zero STATUS without McStatusWrEn)"),
@@ -4165,20 +4177,26 @@ mod fpu_tests {
         }
         // The VMM's writes and reads of them, which are the backend's own:
         // what KVM's `set_msr_mce` keeps, a refused write ending the call.
-        let entries = [(0x17a, 0x5), (0x400, u64::MAX), (0x401, 0xbe00_0000_0000_0000), (0x402, 0x1234), (0x404, 0x99)];
+        let entries = [(0x400, u64::MAX), (0x401, 0xbe00_0000_0000_0000), (0x402, 0x1234), (0x404, 0x99)];
         let msrs = Msrs::from_entries(
             &entries.map(|(index, data)| kvm_bindings::kvm_msr_entry { index, data, ..Default::default() }),
         )
         .unwrap();
-        assert_eq!(vcpu.set_msrs(&msrs).unwrap(), 4, "a bank's CTL other than 0 or all ones ends KVM_SET_MSRS");
+        assert_eq!(vcpu.set_msrs(&msrs).unwrap(), 3, "a bank's CTL other than 0 or all ones ends KVM_SET_MSRS");
         let mut back = Msrs::from_entries(
-            &[0x179, 0x17a, 0x17b, 0x400, 0x401, 0x402, 0x404, 0x280]
-                .map(|index| kvm_bindings::kvm_msr_entry { index, ..Default::default() }),
+            &[0x17b, 0x400, 0x401, 0x402, 0x404, 0x280].map(|index| kvm_bindings::kvm_msr_entry { index, ..Default::default() }),
         )
         .unwrap();
-        assert_eq!(vcpu.get_msrs(&mut back).unwrap(), 8);
+        assert_eq!(vcpu.get_msrs(&mut back).unwrap(), 6);
         let values: Vec<u64> = back.as_slice().iter().map(|e| e.data).collect();
-        assert_eq!(values, [32, 0x5, 0, u64::MAX, 0xbe00_0000_0000_0000, 0x1234, 0, 0]);
+        assert_eq!(values, [0, u64::MAX, 0xbe00_0000_0000_0000, 0x1234, 0, 0]);
+        // IA32_MCG_CAP and IA32_MCG_STATUS, which WHP keeps: both calls end
+        // at them (`mce::whp_answers`).
+        for index in [0x179, 0x17a] {
+            let one = || Msrs::from_entries(&[kvm_bindings::kvm_msr_entry { index, data: 0, ..Default::default() }]).unwrap();
+            assert_eq!(vcpu.get_msrs(&mut one()).unwrap(), 0, "{index:#x}: KVM_GET_MSRS");
+            assert_eq!(vcpu.set_msrs(&one()).unwrap(), 0, "{index:#x}: KVM_SET_MSRS");
+        }
 
         drop(vcpu);
         drop(vm);

@@ -43,6 +43,20 @@ const MCG_CMCI_P: u64 = 1 << 10;
 /// `MCI_CTL2_CMCI_EN`, `MCI_CTL2_CMCI_THRESHOLD_MASK`.
 const MCI_CTL2_WRITABLE: u64 = (1 << 30) | 0x7fff;
 
+/// Whether WHP answers a guest's RDMSR and WRMSR of `index` itself, with
+/// no MSR exit and no register the backend can read or write: IA32_MCG_CAP
+/// and IA32_MCG_STATUS (a Windows 11 PC, build 26300, Ryzen 9 7900:
+/// `test_what_a_cpu_template_changes_on_record`, "intercepts 0", MCG_CAP
+/// read as 0, a write of MCG_STATUS taken). WHP has no register name for
+/// either (WinHvPlatformDefs.h, WHV_REGISTER_NAME), and a partition whose
+/// MSR action list holds either is refused at its set-up (`vm::configure`).
+/// So their values are WHP's, which neither `KVM_GET_MSRS` nor a snapshot
+/// can have: the calls end at them (`regs::has_msr`), and they are not in
+/// the MSR index list.
+pub fn whp_answers(index: u32) -> bool {
+    matches!(index, MCG_CAP | MCG_STATUS)
+}
+
 /// Whether `index` is one of the machine-check MSRs KVM has a case for:
 /// the P5 pair, MCG_CAP/STATUS/CTL, the 32 banks' CTL2 and their four
 /// registers each; or HWCR.
@@ -173,6 +187,7 @@ mod tests {
     // The MSRs KVM has a case for, and the edges of their ranges.
     #[test]
     fn test_is_mce() {
+        assert!(whp_answers(0x179) && whp_answers(0x17a) && !whp_answers(0x17b) && !whp_answers(0x400));
         for yes in [0, 1, 0x179, 0x17a, 0x17b, 0x280, 0x29f, 0x400, 0x47f, HWCR] {
             assert!(is_mce(yes), "{yes:#x}");
         }
