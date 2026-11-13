@@ -271,9 +271,13 @@ upstream Firecracker and its jailer.
   charged, as Linux charges a shmem page when it is touched: its section is reserved, and each page is committed
   at its first access together with a page of private commit that pays for it, so the job refuses at
   `memory.max` and the process ends with 137, as for private memory
-  (`test_anonymous_shared_memory_is_charged_at_first_touch`, `test_shared_memory_past_the_job_limit_ends_the_process`;
-  not yet run on Windows). A touched page so takes twice its size of host commit and once of memory. Still not
-  charged: the userfaultfd restore's section (the next step), memfds, and sections made around wick.
+  (`test_shared_memory_past_the_job_limit_ends_the_process`, which passed in CI run 43521200989;
+  `test_anonymous_shared_memory_is_charged_at_first_touch`, not yet run since it was made to run alone). A touched page so takes twice its size of host commit and once of memory.
+  The userfaultfd restore's section is charged the same way: reserved at the registration, each page committed with
+  its charge when the handler fills it, and a fill past `memory.max` fails with `ENOMEM`, as Linux's `UFFDIO_COPY`
+  does when the memory cgroup refuses the page (`test_registered_memory_is_charged_as_it_is_filled`,
+  `test_a_fill_past_the_job_limit_fails_with_enomem`; not yet run on Windows). Still not charged: memfds and
+  sections made around wick.
 - **Windows jailer: the handle limit holds only in the jailed process.** Upstream's jailer limits Firecracker to
   2048 descriptors by default (`RLIMIT_NOFILE`), and the kernel enforces it. Windows has no per-process handle limit
   to set: a process's pool quota is accepted and ignored (200,000 handles made after a 1 MiB paged-pool quota,

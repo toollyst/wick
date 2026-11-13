@@ -22,7 +22,13 @@
 //! - Registered memory is moved into a pagefile-backed section mapped twice:
 //!   at its address, and as an alias that is always writable. Pages are
 //!   filled through the alias and only then made accessible, so no thread
-//!   sees a page half filled.
+//!   sees a page half filled. With the lazy-memory exception handler the
+//!   section is reserved: a missing page is not committed, and faults as a
+//!   `PAGE_NOACCESS` one does; a fill commits it first, charged to the
+//!   job's memory limit, through the view at its address with no access
+//!   (`windows_mm::uffd_commit`), as Linux charges the page a `UFFDIO_COPY`
+//!   allocates (`ENOMEM` when refused). A page never filled becomes lazy
+//!   memory when it is unregistered (`windows_mm::uffd_lazy`).
 //! - `madvise(MADV_DONTNEED)` on registered pages makes them missing again
 //!   and queues a remove event ([`discarding`]); their memory is discarded.
 //! - System calls that copy to or from missing pages fail on Windows
@@ -110,6 +116,9 @@ struct Range {
     ctx: AtomicUsize,
     /// Second view of `[start, end)`, always readable and writable.
     alias: AtomicU64,
+    /// The section is reserved: missing pages that were never filled are
+    /// not committed (`windows_mm::uffd_alias`).
+    reserved: AtomicBool,
     /// One bit per page: the page is missing.
     missing: AtomicPtr<AtomicU64>,
     /// One bit per page: the page is registered (cleared by unregister).
@@ -123,6 +132,7 @@ impl Range {
             end: AtomicU64::new(0),
             ctx: AtomicUsize::new(0),
             alias: AtomicU64::new(0),
+            reserved: AtomicBool::new(false),
             missing: AtomicPtr::new(ptr::null_mut()),
             tracked: AtomicPtr::new(ptr::null_mut()),
         }
@@ -394,6 +404,43 @@ pub fn for_each_missing(start: u64, len: u64, mut f: impl FnMut(u64, u64)) {
     }
 }
 
+/// The runs of `[addr, addr + len)` of `range` that have memory: all of it,
+/// or, in a reserved section, its committed runs (an uncommitted page
+/// faults already, and has no protection to change or memory to discard).
+fn with_memory(range: &Range, addr: u64, len: u64) -> Vec<(u64, u64)> {
+    if !range.reserved.load(Ordering::Acquire) {
+        return std::vec![(addr, len)];
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    crate::windows_mm::committed_runs(addr as usize, len as usize)
+        .into_iter()
+        .map(|(s, l)| (s as u64, l as u64))
+        .collect()
+}
+
+/// Missing pages `[s, s + len)` of `range`, whose alias is at `alias` and
+/// which starts at `base`, become ordinary memory: those with memory
+/// (filled once, then discarded) read zeros, as Linux gives, and are made
+/// accessible; those never filled, in a reserved section, become lazy
+/// memory (`windows_mm::uffd_lazy`).
+fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io::Result<()> {
+    let runs = with_memory(range, s, len);
+    let mut at = s;
+    for &(a, l) in runs.iter().chain([(s + len, 0)].iter()) {
+        if a > at {
+            #[allow(clippy::cast_possible_truncation)]
+            crate::windows_mm::uffd_lazy(at as usize, (a - at) as usize);
+        }
+        if l > 0 {
+            // SAFETY: the alias of registered memory.
+            unsafe { ptr::write_bytes((alias + (a - base)) as *mut u8, 0, l as usize) };
+            protect(a, l, true)?;
+        }
+        at = a + l;
+    }
+    Ok(())
+}
+
 fn protect(addr: u64, len: u64, accessible: bool) -> io::Result<()> {
     let prot = if accessible { PAGE_READWRITE } else { PAGE_NOACCESS };
     let mut old = 0;
@@ -573,8 +620,9 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     if unsafe { crate::mincore(start as *mut _, len as usize, resident.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let alias = crate::windows_mm::uffd_alias(start as usize, len as usize, &resident)
-        .map_err(errno_err)? as u64;
+    let (alias, reserved) = crate::windows_mm::uffd_alias(start as usize, len as usize, &resident).map_err(errno_err)?;
+    let alias = alias as u64;
+    range.reserved.store(reserved, Ordering::Release);
     let missing = alloc_bitmap(pages, false);
     let tracked = alloc_bitmap(pages, true);
     range.end.store(end, Ordering::Release);
@@ -590,11 +638,14 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     }
     range.start.store(start, Ordering::Release);
     REGISTERED.fetch_add(1, Ordering::AcqRel);
-    // Missing pages fault from now on.
-    let mut runs = Vec::new();
-    for_each_missing(start, len, |s, l| runs.push((s, l)));
-    for (s, l) in runs {
-        protect(s, l, false)?;
+    // Missing pages fault from now on (in a reserved section they are not
+    // committed, and fault already).
+    if !reserved {
+        let mut runs = Vec::new();
+        for_each_missing(start, len, |s, l| runs.push((s, l)));
+        for (s, l) in runs {
+            protect(s, l, false)?;
+        }
     }
     Ok(())
 }
@@ -626,9 +677,7 @@ pub fn unregister(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
     }
     for (s, l) in runs {
         // Missing pages may hold discarded data: zeros, as Linux gives.
-        // SAFETY: the alias of registered memory.
-        unsafe { ptr::write_bytes((alias + (s - base)) as *mut u8, 0, l as usize) };
-        protect(s, l, true).map_err(|e| e.raw_os_error().unwrap_or(crate::EIO))?;
+        release_missing(range, base, alias, s, l).map_err(|e| e.raw_os_error().unwrap_or(crate::EIO))?;
         for page in (s - base) / PAGE..(s + l - base) / PAGE {
             Range::set(&range.missing, page, false);
         }
@@ -664,6 +713,12 @@ fn fill(
         return Err((crate::EEXIST, 0));
     }
     let bytes = n * PAGE;
+    // A reserved section's pages are committed, and charged, first; the job's
+    // limit refuses with ENOMEM, as the memory cgroup refuses Linux's copy.
+    #[allow(clippy::cast_possible_truncation)]
+    if range.reserved.load(Ordering::Acquire) && !crate::windows_mm::uffd_commit(dst as usize, bytes as usize) {
+        return Err((crate::ENOMEM, 0));
+    }
     fill((alias + (dst - base)) as *mut u8, bytes as usize);
     protect(dst, bytes, true).map_err(|e| (e.raw_os_error().unwrap_or(crate::EIO), 0))?;
     for page in first..first + n {
@@ -754,7 +809,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
             }
             let (from, to) = (s + first * PAGE, s + last * PAGE);
             let mut runs = Vec::new();
-            for_each_missing(from, to - from, |a, l| runs.push((a, l)));
+            for_each_missing(from, to - from, |a, l| runs.extend(with_memory(r, a, l)));
             for (a, l) in runs {
                 let _ = protect(a, l, false);
                 // Filling a missing page writes all of it: its content can go.
@@ -783,9 +838,7 @@ fn destroy(ctx: usize) {
         let mut runs = Vec::new();
         for_each_missing(s, e - s, |a, l| runs.push((a, l)));
         for (a, l) in runs {
-            // SAFETY: the alias of registered memory.
-            unsafe { ptr::write_bytes((alias + (a - s)) as *mut u8, 0, l as usize) };
-            let _ = protect(a, l, true);
+            let _ = release_missing(r, s, alias, a, l);
             for page in (a - s) / PAGE..(a + l - s) / PAGE {
                 Range::set(&r.missing, page, false);
             }
@@ -1087,6 +1140,156 @@ mod tests {
         assert_eq!(unsafe { *((mem + PAGE) as *const u8) }, 0);
         assert_eq!(unsafe { *((mem + 4 * PAGE) as *const u8) }, 0);
         // SAFETY: closes the user end; the serving thread ends.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// The bytes of `[mem, mem + len)` committed.
+    fn committed(mem: u64, len: u64) -> u64 {
+        #[allow(clippy::cast_possible_truncation)]
+        crate::windows_mm::committed_runs(mem as usize, len as usize).iter().map(|r| r.1 as u64).sum()
+    }
+
+    /// Registered memory is a reserved section, charged a page at a time as
+    /// the handler fills it, as Linux charges the page a `UFFDIO_COPY`
+    /// allocates to the memory cgroup (v6.1 mm/userfaultfd.c,
+    /// `mcopy_atomic_pte`, `mem_cgroup_charge` at :205): at the registration
+    /// only the resident page is committed and charged; each page filled is
+    /// committed and charged; a discarded page keeps its commit and charge
+    /// (a section's page cannot be decommitted: SECTREC-h, error 87); once
+    /// unregistered, a page never filled is committed and charged at its
+    /// first access, a read included, as a shmem page is; the charge goes
+    /// with the mapping. Before, the whole section was committed at the
+    /// registration and charged to no job.
+    #[test]
+    fn test_registered_memory_is_charged_as_it_is_filled() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 64 * PAGE;
+        let mem = map(len as usize);
+        // SAFETY: our mapping.
+        unsafe { *(mem as *mut u8) = 7 };
+        register(ctx, mem, len).unwrap();
+        assert!(range_of(ctx, mem, len).unwrap().reserved.load(Ordering::Acquire), "the section is not reserved");
+        let charged = || crate::windows_mm::charged(mem as usize).expect("no charge for the range");
+        assert_eq!(committed(mem, len), PAGE, "committed at the registration");
+        assert_eq!(charged(), PAGE as usize, "charged at the registration");
+        let data = std::vec![0x5au8; 3 * PAGE as usize];
+        // SAFETY: `data` holds three pages.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem + PAGE, 3 * PAGE, true) }.unwrap(), 3 * PAGE);
+        assert_eq!(zeropage(ctx, mem + 8 * PAGE, PAGE, true).unwrap(), PAGE);
+        assert_eq!(committed(mem, len), 5 * PAGE);
+        assert_eq!(charged(), 5 * PAGE as usize);
+        // SAFETY: filled pages.
+        unsafe {
+            assert_eq!(*(mem as *const u8), 7);
+            assert_eq!(*((mem + 3 * PAGE + 9) as *const u8), 0x5a);
+            assert_eq!(*((mem + 8 * PAGE) as *const u8), 0);
+        }
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::madvise((mem + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        assert!(is_missing(mem + PAGE));
+        assert_eq!(charged(), 5 * PAGE as usize, "a discarded page's charge");
+        unregister(ctx, mem, len).unwrap();
+        // SAFETY: ordinary memory now: the discarded page reads zeros, and
+        // a page never filled is committed at its read.
+        unsafe {
+            assert_eq!(*((mem + PAGE) as *const u8), 0);
+            assert_eq!(*((mem + 3 * PAGE + 9) as *const u8), 0x5a);
+            assert_eq!(*((mem + 20 * PAGE) as *const u8), 0);
+            *((mem + 21 * PAGE) as *mut u8) = 1;
+        }
+        assert_eq!(committed(mem, len), 7 * PAGE);
+        assert_eq!(charged(), 7 * PAGE as usize);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::munmap(mem as *mut c_void, len as usize) }, 0);
+        assert!(crate::windows_mm::charged(mem as usize).is_none(), "the charge outlived the mapping");
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// In a process whose job may commit 64 MiB, 256 MiB are registered and
+    /// filled 1 MiB at a time: a fill past the limit fails with `ENOMEM`,
+    /// as Linux's `UFFDIO_COPY` does when the memory cgroup refuses the
+    /// page's charge, and the process goes on. Before, the 256 MiB were
+    /// committed at the registration and no job charged them.
+    #[test]
+    fn test_a_fill_past_the_job_limit_fails_with_enomem() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(exe)
+            .args(["--exact", "windows_uffd::tests::fill_limit_child", "--ignored", "--nocapture"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The job is set before the child registers anything (it sleeps 300 ms first).
+        // SAFETY: a new unnamed job.
+        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        assert!(!job.is_null());
+        // SAFETY: plain data.
+        let mut limit: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+        limit.JobMemoryLimit = 64 << 20;
+        // SAFETY: a structure of the size passed; the child's handle.
+        unsafe {
+            #[allow(clippy::cast_possible_truncation)]
+            let size = std::mem::size_of_val(&limit) as u32;
+            assert_ne!(SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const limit).cast(), size), 0);
+            use std::os::windows::io::AsRawHandle;
+            assert_ne!(AssignProcessToJobObject(job, child.as_raw_handle()), 0, "{}", io::Error::last_os_error());
+        }
+        let out = child.wait_with_output().unwrap();
+        let text = std::format!("{}{}", std::string::String::from_utf8_lossy(&out.stdout), std::string::String::from_utf8_lossy(&out.stderr));
+        // SAFETY: our job handle.
+        unsafe { CloseHandle(job) };
+        assert!(text.contains("registered 256 MiB"), "{text}");
+        assert!(text.contains("refused with ENOMEM after"), "the job's limit did not hold: {text}");
+        assert!(text.contains("test result: ok. 1 passed"), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_fill_past_the_job_limit_fails_with_enomem in a job of its own"]
+    fn fill_limit_child() {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len: u64 = 256 << 20;
+        // As Firecracker maps guest memory: committed at first touch, so the
+        // mapping itself fits the job.
+        // SAFETY: a new anonymous mapping.
+        let mem = unsafe {
+            crate::mmap(
+                ptr::null_mut(),
+                len as usize,
+                crate::PROT_READ | crate::PROT_WRITE,
+                crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, crate::MAP_FAILED);
+        let mem = mem as u64;
+        register(ctx, mem, len).unwrap();
+        std::println!("registered 256 MiB");
+        let mib: u64 = 1 << 20;
+        let mut done = 0;
+        let refused = loop {
+            assert!(done < len, "256 MiB filled under a 64 MiB limit");
+            match zeropage(ctx, mem + done, mib, false) {
+                Ok(n) => done += n,
+                Err((e, n)) => break (e, n),
+            }
+        };
+        std::println!("refused with {} after {} MiB", if refused.0 == crate::ENOMEM { "ENOMEM" } else { "another error" }, done >> 20);
+        assert_eq!(refused, (crate::ENOMEM, 0));
+        assert!((16 << 20..64 << 20).contains(&done), "{} MiB filled under a 64 MiB limit", done >> 20);
+        // The pages filled are there, the refused ones still missing.
+        // SAFETY: filled.
+        assert_eq!(unsafe { *(mem as *const u8) }, 0);
+        assert!(is_missing(mem + done));
+        // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
 

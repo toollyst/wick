@@ -2316,7 +2316,18 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
 /// maps the section a second time: the alias, returned, through which
 /// `wick_uffd` fills pages. The pages `resident` marks (one byte per page,
 /// bit 0) keep their content; the others read as zeros.
-pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<usize, c_int> {
+///
+/// With the exception handler (as anonymous shared memory, [`fill`]) the
+/// section is reserved (`SEC_RESERVE`, the second value returned) and
+/// charged ([`Charge`], registered for the view at `start`): the resident
+/// pages are committed here with their charge, and every other page when
+/// it is filled ([`uffd_commit`]), as Linux charges the page a
+/// `UFFDIO_COPY` allocates to the memory cgroup (v6.1 mm/userfaultfd.c,
+/// `mcopy_atomic_pte`: `mem_cgroup_charge` at :205, `-ENOMEM` when refused).
+/// Before, the whole section was committed here and charged to no job. A
+/// resident page is charged before the private page it is copied from is
+/// freed, so it counts twice for that moment.
+pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(usize, bool), c_int> {
     let mut t = table().lock().unwrap();
     match t.get(&start) {
         Some(r)
@@ -2329,9 +2340,11 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<us
     let hi = u32::try_from((len as u64) >> 32).unwrap();
     #[allow(clippy::cast_possible_truncation)]
     let lo = len as u32;
+    let reserved = lazy_handler();
+    let reserve = if reserved { SEC_RESERVE } else { 0 };
     // SAFETY: creates a pagefile-backed section.
     let s = unsafe {
-        CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, hi, lo, std::ptr::null())
+        CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | reserve, hi, lo, std::ptr::null())
     };
     if s.is_null() {
         return Err(crate::ENOMEM);
@@ -2358,24 +2371,54 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<us
     if alias == 0 {
         return Err(crate::ENOMEM);
     }
-    for (i, &b) in resident.iter().enumerate() {
-        if b & 1 != 0 {
-            // SAFETY: a resident page of the mapping, into the alias.
-            unsafe { std::ptr::copy_nonoverlapping((start + i * PAGE) as *const u8, (alias + i * PAGE) as *mut u8, PAGE) };
-        }
-    }
     let unmap = |a: usize| {
         // SAFETY: unmaps a view made here.
         unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void }, 0) };
     };
+    let paid = if reserved {
+        let Some(c) = charge_add(start, len) else {
+            unmap(alias);
+            return Err(crate::ENOMEM);
+        };
+        Some(c)
+    } else {
+        None
+    };
+    let mut i = 0;
+    while i < resident.len() {
+        if resident[i] & 1 == 0 {
+            i += 1;
+            continue;
+        }
+        let first = i;
+        while i < resident.len() && resident[i] & 1 != 0 {
+            i += 1;
+        }
+        let (off, n) = (first * PAGE, (i - first) * PAGE);
+        // The charge of the run (registered at `start`), then the section's
+        // pages through the alias.
+        if reserved && (!charge(start + off, n) || !commit_now(alias + off, n, PAGE_READWRITE, false)) {
+            charge_remove(start);
+            unmap(alias);
+            return Err(crate::ENOMEM);
+        }
+        // SAFETY: resident pages of the mapping, into the alias.
+        unsafe { std::ptr::copy_nonoverlapping((start + off) as *const u8, (alias + off) as *mut u8, n) };
+    }
     // SAFETY: gives the private allocation back as a placeholder.
     if unsafe { VirtualFree(start as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        if reserved {
+            charge_remove(start);
+        }
         unmap(alias);
         return Err(crate::EINVAL);
     }
     if view(start, MEM_REPLACE_PLACEHOLDER) != start {
         // The address space stays reserved; the memory is gone.
         t.get_mut(&start).unwrap().kind = Kind::Placeholder;
+        if reserved {
+            charge_remove(start);
+        }
         unmap(alias);
         return Err(crate::ENOMEM);
     }
@@ -2383,7 +2426,7 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<us
     r.kind = Kind::View {
         _section: section,
         file: None,
-        charge: None,
+        charge: paid,
     };
     // A section is committed when it is touched, as the userfaultfd fills it.
     if r.lazy {
@@ -2391,7 +2434,64 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<us
         touched_remove(start);
         r.lazy = false;
     }
-    Ok(alias)
+    Ok((alias, reserved))
+}
+
+/// Commits the pages `[s, s + len)` of a userfaultfd range's reserved
+/// section ([`uffd_alias`]) through its view at their address, with no
+/// access and their charge first, before they are filled through the alias
+/// and made accessible: a commit through one view leaves the other's
+/// protection as it was, so the alias stays writable and no thread sees
+/// the page before it is filled (SECTREC-h, CI run 43521200989: committed
+/// `PAGE_NOACCESS` through A, B read committed and `PAGE_READWRITE`, B's
+/// write read back through A once A was opened). `false` if the charge or
+/// the commit is refused (the job's memory limit).
+pub(crate) fn uffd_commit(s: usize, len: usize) -> bool {
+    commit(s, len, PAGE_NOACCESS, false)
+}
+
+/// The bytes of the charge registered for the view at `view` that are
+/// committed, if one is registered ([`Charge`]): for tests.
+#[cfg(test)]
+pub(crate) fn charged(view: usize) -> Option<usize> {
+    let (base, n) = CHARGES.lock().unwrap().get(&view).map(|(n, c)| (c.base, *n))?;
+    Some(committed_runs(base, n).iter().map(|r| r.1).sum())
+}
+
+/// The committed runs of `[s, s + len)`, as `(start, len)`.
+pub(crate) fn committed_runs(s: usize, len: usize) -> Vec<(usize, usize)> {
+    let (mut out, mut at, e) = (Vec::new(), s, s + len);
+    while at < e {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            break;
+        }
+        let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(e) - at;
+        if mbi.State == MEM_COMMIT {
+            out.push((at, run));
+        }
+        at += run;
+    }
+    out
+}
+
+/// Pages `[s, s + len)` of a userfaultfd range's reserved section that were
+/// never filled, once the range is unregistered: lazy, committed and
+/// charged at their first access, read or write, as the rest of an
+/// anonymous shared mapping ([`fill`]), and as Linux's shmem allocates an
+/// unregistered page at its fault.
+/// Nothing is done unless a view of a mapping holds all of the pages (one
+/// unmapped since is left alone).
+pub(crate) fn uffd_lazy(s: usize, len: usize) {
+    let mut t = table().lock().unwrap();
+    if let Some((&b, r)) = t.range_mut(..=s).next_back() {
+        if matches!(r.kind, Kind::View { .. }) && s + len <= b + r.len {
+            r.lazy = true;
+            lazy_add(s, len, PAGE_READWRITE);
+        }
+    }
 }
 
 /// Unmaps an alias made by [`uffd_alias`].
