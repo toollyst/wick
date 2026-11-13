@@ -222,6 +222,32 @@ upstream Firecracker and its jailer.
   measured): `jailer-test.ps1 nofile` checks that the jailed probe still opens 5000 files under `no-file=512`, and
   100,000 under `memory.max` of 32 MiB with it (written, not yet run).
   The bound a jailed process cannot pass, the jailer ending a jail whose handles pass the limit, is not written.
+- **Windows: a pipe's maker gets no identity of Firecracker's, and a pipe's owner is an account, not a jail.** A
+  path Firecracker is given may name a pipe (`\\.\pipe\<name>`, the counterpart of a FIFO for the log, the metrics
+  and a serial device's output), and whoever made a pipe is its server, which Windows lets act as a client that
+  opens it unless the client says otherwise ("The SecurityImpersonation level is the default for named pipe, RPC,
+  and DDE servers": Microsoft Learn, Impersonation Levels). A FIFO's maker on Linux gets nothing of the kind. So
+  Firecracker opens every path it is given at the anonymous level (`SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS`,
+  "The server cannot impersonate or identify the client": CreateFileW): the log, metrics and serial output paths,
+  the first time and each time a pipe is opened again, the drives, a pmem device's file, the config and metadata
+  files, a snapshot's state and memory files, the kernel, the initrd and a seccomp filter file
+  (`test_a_pipe_opened_by_path_gives_its_maker_no_identity`, `test_a_pipe_opened_again_gives_its_maker_no_identity`:
+  a pipe's server calls `ImpersonateNamedPipeClient` on such an open and gets a refusal or an anonymous token, where
+  an open without the flag, the control, gives it the impersonation level; written, not yet run). For a file the
+  same bit is `FILE_FLAG_OPEN_NO_RECALL`: a file of remote storage is read where it is, not brought back to the
+  disk. What is not at parity: when a pipe's reader has gone, Firecracker gives what it kept to a new pipe of the
+  name only if that pipe has the first pipe's owner, and an owner is an account. Two processes of one account are
+  not told apart, two jails of one user among them: every jail's token has the user as its owner, and the jail's
+  own SID is a restricting SID, which owns nothing and which a pipe's maker could write into a DACL itself, so the
+  check has nothing of a jail's to compare. Processes of one account are one trust domain here, as two processes
+  of one uid are for a FIFO on Linux (either may open it), with this difference: on Linux a FIFO is a file in the
+  jail's chroot, which another jail does not reach, and a Windows pipe's name is the session's. What the jail's
+  token gives: a pipe a jailed process makes with the token's default DACL grants SYSTEM, that jail's SID and its
+  owner, so another jail's Firecracker, whose token must also pass by a restricting SID, is refused by it (from
+  the token's construction; not measured for pipes); a pipe made with a DACL that grants everyone is opened. So a
+  jail that can make pipes could, once the first reader has gone, take the log or metrics another jail of the same
+  user wrote meanwhile (up to 64 KiB), if it knows the name. Run each jail's pipes under names the others cannot
+  guess, or run tenants under different accounts.
 - **No per-thread filters outside Linux.** Neither macOS nor Windows filters system calls per thread. Threads of a
   process share its address space, so the union of upstream's filters applies process-wide, and the API server,
   whose separate filter is a real boundary, moves into a process of its own. On macOS that is in place: the API

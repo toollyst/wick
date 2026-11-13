@@ -41,7 +41,7 @@ Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
  8 files changed, 36 insertions(+), 16 deletions(-)
 
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
-index 794dacdcdd61f2907d8e9f65b9cf4966fb91a76c..b8b01d400f3535e471dad4aba63bbadfa2afcb30 100644
+index 10ab6054e5ccff31d9fd8f83eb441d3077b19092..cf6a759a95b190259cb8bdd988325c630dc31408 100644
 --- a/src/firecracker/src/main.rs
 +++ b/src/firecracker/src/main.rs
 @@ -169,6 +169,8 @@ fn main_exec() -> Result<(), MainError> {

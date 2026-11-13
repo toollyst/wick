@@ -41,7 +41,7 @@ runs on Linux with KVM. If you build on Firecracker, your laptop needs a Linux V
 wick removes that limit without forking Firecracker in the usual sense:
 
 - **Upstream stays upstream.** `lib/firecracker` is the official repository at a release tag. wick changes it
-  through 46 small patches (about 2,200 lines in 84 files), each marked with a `wick:` comment. Everything
+  through 46 small patches (about 2,200 lines in 86 files), each marked with a `wick:` comment. Everything
   else is new code outside the submodule.
 - **Same API, same meaning.** Tools that drive Firecracker work unchanged: the binary is still called `firecracker`,
   and the API, the config file, the snapshot format and the vsock convention mean the same on all three hosts.
@@ -183,7 +183,7 @@ The short version; the [full roadmap](docs/ROADMAP.md) has the status of every r
 <summary><b>Is this a fork of Firecracker?</b></summary>
 
 Not in the usual sense. Upstream lives unmodified in a submodule at a release tag, and wick applies a small patch
-series on top: about 2,200 added lines in 84 files, most of them a `cfg` block or a call into an interface. Everything else is
+series on top: about 2,200 added lines in 86 files, most of them a `cfg` block or a call into an interface. Everything else is
 new code in its own crates. Following a new upstream release is a rebase of that series, not a merge of two diverged
 trees.
 

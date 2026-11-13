@@ -13,16 +13,66 @@ on macOS (Hypervisor.framework cannot map shared memory of a file
 opened read-only; a read-only device is never written, so a private
 mapping holds the same bytes).
 
+The files Firecracker opens for reading by a path the operator gave (the
+kernel image, the initrd, a snapshot's state and memory files, a seccomp
+filter file) are opened with OpenOptions::new().read(true), which is what
+File::open is. On Windows OpenOptions is wick's (crates/compat/std): a
+path may name a pipe, whose maker could act as the client that opens it,
+so it opens at the anonymous impersonation level, and it counts against
+the jail's no-file limit, where File::open, std's own, does neither.
+Nothing changes on Linux or macOS.
+
 Test: utils and vmm unit tests on each host.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
+ src/firecracker/src/main.rs               |  5 +++--
+ src/firecracker/src/seccomp.rs            |  3 ++-
  src/utils/src/time.rs                     | 20 ++++++++++++++++++--
  src/vmm/src/devices/virtio/pmem/device.rs | 12 ++++++++++--
+ src/vmm/src/persist.rs                    |  8 +++++---
  src/vmm/src/utils/mod.rs                  | 18 ++++++++++++++++++
  src/vmm/src/utils/signal.rs               | 12 ++++++++++--
- 4 files changed, 56 insertions(+), 6 deletions(-)
+ src/vmm/src/vmm_config/boot_source.rs     |  6 ++++--
+ 8 files changed, 70 insertions(+), 14 deletions(-)
 
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index a92dbf32c7e0591a9d34513950da87d589c7bd52..5f3b97595f79f8cd2f4d5dfb0b8e3cc96b99bc39 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -17,7 +17,7 @@ mod generated;
+ mod metrics;
+ mod seccomp;
+ 
+-use std::fs::{self, File};
++use std::fs;
+ use std::path::PathBuf;
+ use std::process::ExitCode;
+ use std::str::FromStr;
+@@ -572,7 +572,8 @@ enum SnapshotVersionError {
+ // Print data format of provided snapshot state file.
+ fn print_snapshot_data_format(snapshot_path: &str) -> Result<(), SnapshotVersionError> {
+     let mut snapshot_reader =
+-        File::open(snapshot_path).map_err(SnapshotVersionError::OpenSnapshot)?;
++        // wick: through `OpenOptions`, which is wick's on Windows (a path may name a pipe).
++        fs::OpenOptions::new().read(true).open(snapshot_path).map_err(SnapshotVersionError::OpenSnapshot)?;
+ 
+     let data_format_version =
+         get_format_version(&mut snapshot_reader).map_err(SnapshotVersionError::SnapshotVersion)?;
+diff --git a/src/firecracker/src/seccomp.rs b/src/firecracker/src/seccomp.rs
+index f073641bb1dcfa68213585e241b917be9b9f351d..a217349e667979aef96b9bfd54b56d2c2d513407 100644
+--- a/src/firecracker/src/seccomp.rs
++++ b/src/firecracker/src/seccomp.rs
+@@ -46,7 +46,8 @@ impl SeccompConfig {
+         } else {
+             match seccomp_filter {
+                 Some(path) => Ok(SeccompConfig::Custom(
+-                    File::open(path).map_err(FilterError::FileOpen)?,
++                    // wick: through `OpenOptions`, which is wick's on Windows (a path may name a pipe).
++                    std::fs::OpenOptions::new().read(true).open(path).map_err(FilterError::FileOpen)?,
+                 )),
+                 None => Ok(SeccompConfig::Advanced),
+             }
 diff --git a/src/utils/src/time.rs b/src/utils/src/time.rs
 index f6935eb48c6b82f5e2f3a7c4b340c81d51020143..fe21516de6cc405ea03e4f752ddff725c4960fec 100644
 --- a/src/utils/src/time.rs
@@ -105,6 +155,39 @@ index 92c33243f2768be7ab539899a068a4f71ab3ea07..1197d4745b64d7e977808ba929d2f159
                      file.as_raw_fd(),
                      0,
                  );
+diff --git a/src/vmm/src/persist.rs b/src/vmm/src/persist.rs
+index cfa7121008e838ed5d0aa8a391bbc9dc95caefbd..8cec58e22e724df796a3681c2dbd5e9c5fa2eddb 100644
+--- a/src/vmm/src/persist.rs
++++ b/src/vmm/src/persist.rs
+@@ -4,7 +4,7 @@
+ //! Defines state structures for saving/restoring a Firecracker microVM.
+ 
+ use std::fmt::Debug;
+-use std::fs::{File, OpenOptions};
++use std::fs::OpenOptions;
+ use std::io::{self, Write};
+ use std::mem::forget;
+ use std::os::unix::io::AsRawFd;
+@@ -508,7 +508,8 @@ pub enum SnapshotStateFromFileError {
+ fn snapshot_state_from_file(
+     snapshot_path: &Path,
+ ) -> Result<MicrovmState, SnapshotStateFromFileError> {
+-    let mut snapshot_reader = File::open(snapshot_path)?;
++    // wick: through `OpenOptions`, which is wick's on Windows (a path may name a pipe).
++    let mut snapshot_reader = OpenOptions::new().read(true).open(snapshot_path)?;
+     let snapshot = Snapshot::load(&mut snapshot_reader)?;
+ 
+     Ok(snapshot.data)
+@@ -531,7 +532,8 @@ fn guest_memory_from_file(
+     track_dirty_pages: bool,
+     huge_pages: HugePageConfig,
+ ) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
+-    let mem_file = File::open(mem_file_path)?;
++    // wick: through `OpenOptions`, which is wick's on Windows (a path may name a pipe).
++    let mem_file = OpenOptions::new().read(true).open(mem_file_path)?;
+     let guest_mem =
+         memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages, huge_pages)?;
+     Ok(guest_mem)
 diff --git a/src/vmm/src/utils/mod.rs b/src/vmm/src/utils/mod.rs
 index 642c7d980c76e4850827966f02a25746282b705c..decf9d1823decbd65ee2b923955b1f6a7bfbbfd5 100644
 --- a/src/vmm/src/utils/mod.rs
@@ -173,3 +256,21 @@ index 5178c7ec3c1d4d6c9d24184eff33d83229fe8a2b..be98b9a8bbc112934d04a333f280ab62
 +    #[cfg(not(target_os = "linux"))]
 +    return SIGRTMAX();
  }
+diff --git a/src/vmm/src/vmm_config/boot_source.rs b/src/vmm/src/vmm_config/boot_source.rs
+index 20d3f40350ebb2ca0da35b38de580488758dcae8..929fda9cf8079115e49ee5e98252ce0446eeb2d9 100644
+--- a/src/vmm/src/vmm_config/boot_source.rs
++++ b/src/vmm/src/vmm_config/boot_source.rs
+@@ -101,9 +101,11 @@ impl BootConfig {
+         };
+ 
+         // Validate boot source config.
+-        let kernel_file = File::open(&cfg.kernel_image_path).map_err(InvalidKernelPath)?;
++        // wick: through `OpenOptions`, which is wick's on Windows (a path may name a pipe).
++        let open = |path: &String| std::fs::OpenOptions::new().read(true).open(path);
++        let kernel_file = open(&cfg.kernel_image_path).map_err(InvalidKernelPath)?;
+         let initrd_file: Option<File> = match &cfg.initrd_path {
+-            Some(path) => Some(File::open(path).map_err(InvalidInitrdPath)?),
++            Some(path) => Some(open(path).map_err(InvalidInitrdPath)?),
+             None => None,
+         };
+ 

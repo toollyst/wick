@@ -31,7 +31,7 @@ index 841bcf4abba49023c7c31a179b7e8d13a33b116c..9af4ed487af0c25dc8cfca974bc70972
      /// Failed to build MicroVM from Json: {0}
      BuildFromJson(crate::BuildFromJsonError),
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
-index 905abb41f4cdfc8851630d8dd33c8f75d75f75f2..794dacdcdd61f2907d8e9f65b9cf4966fb91a76c 100644
+index 4b3902af2e7c482b154868d5a7aa0f8ee65b1fae..10ab6054e5ccff31d9fd8f83eb441d3077b19092 100644
 --- a/src/firecracker/src/main.rs
 +++ b/src/firecracker/src/main.rs
 @@ -362,7 +362,10 @@ fn main_exec() -> Result<(), MainError> {

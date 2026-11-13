@@ -175,7 +175,7 @@ index 02c59cbdec2c7f197f9d95ce19f49b97a621f4a5..034f00765565106b41e36760f40fe4f0
          .expect("API thread spawn failed.");
  
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
-index d94e0686fc674d9193b8ab4047c4be3db622964c..905abb41f4cdfc8851630d8dd33c8f75d75f75f2 100644
+index 6474c5928447e0c7fc0dc2f88fff08298b6f5f91..4b3902af2e7c482b154868d5a7aa0f8ee65b1fae 100644
 --- a/src/firecracker/src/main.rs
 +++ b/src/firecracker/src/main.rs
 @@ -130,6 +130,9 @@ fn main_exec() -> Result<(), MainError> {

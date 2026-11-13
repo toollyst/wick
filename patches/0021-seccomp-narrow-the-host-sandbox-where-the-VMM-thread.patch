@@ -41,10 +41,10 @@ index 70abff48ce870067f0431108618be9914854fabf..02c59cbdec2c7f197f9d95ce19f49b97
          firecracker_metrics
              .lock()
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
-index e6e9f0bdd8477030559cd09647b16c64af9d5a83..d94e0686fc674d9193b8ab4047c4be3db622964c 100644
+index a317c22e19b3ec79a282df712b4987ef70baee68..6474c5928447e0c7fc0dc2f88fff08298b6f5f91 100644
 --- a/src/firecracker/src/main.rs
 +++ b/src/firecracker/src/main.rs
-@@ -687,6 +687,10 @@ fn run_without_api(
+@@ -688,6 +688,10 @@ fn run_without_api(
              .ok_or(RunWithoutApiError::MissingSeccompFilter)?,
      )
      .map_err(RunWithoutApiError::SeccompFilter)?;

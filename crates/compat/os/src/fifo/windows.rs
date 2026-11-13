@@ -720,6 +720,59 @@ mod tests {
         assert!(other.read_available(usize::MAX).is_empty(), "bytes went into another owner's pipe");
     }
 
+    /// What the pipe's maker gets when it asks to act as the client that
+    /// opened its pipe (`ImpersonateNamedPipeClient`, after a read, then
+    /// the thread's token's level): the refusal's error code, or the level
+    /// (`SECURITY_IMPERSONATION_LEVEL`: 0 anonymous, 1 identification, 2
+    /// impersonation).
+    fn impersonation(server: &Server) -> Result<i32, u32> {
+        use windows_sys::Win32::Security::{GetTokenInformation, RevertToSelf, TOKEN_QUERY, TokenImpersonationLevel};
+        use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        // SAFETY: plain calls on this thread and our handles; the thread is
+        // itself again before the function returns.
+        unsafe {
+            if ImpersonateNamedPipeClient(server.0) == 0 {
+                return Err(GetLastError());
+            }
+            let mut token: HANDLE = std::ptr::null_mut();
+            let opened = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token);
+            let open_error = GetLastError();
+            let (mut level, mut len) = (0i32, 0u32);
+            let got = opened != 0
+                && GetTokenInformation(token, TokenImpersonationLevel, (&raw mut level).cast(), 4, &mut len) != 0;
+            let level_error = GetLastError();
+            assert_ne!(RevertToSelf(), 0, "the thread could not be itself again");
+            if opened == 0 {
+                return Err(open_error);
+            }
+            CloseHandle(token);
+            if got { Ok(level) } else { Err(level_error) }
+        }
+    }
+
+    // The pipe a reader makes again is opened before its owner is known,
+    // so at the anonymous level: its maker cannot act as Firecracker, nor
+    // learn who it is. The first pipe here is opened as std opens a path,
+    // the control: its maker gets the impersonation level.
+    #[test]
+    fn test_a_pipe_opened_again_gives_its_maker_no_identity() {
+        let p = path("sqos");
+        let reader = server(&p, 65536);
+        let out = open(&p);
+        out.write(&line(0)).unwrap();
+        assert_eq!(reader.read_exactly(100), line(0));
+        let first = impersonation(&reader);
+        drop(reader);
+        out.write(&line(1)).unwrap();
+        let reader = server(&p, 65536);
+        assert_eq!(reader.read_exactly(100), line(1));
+        let again = impersonation(&reader);
+        println!("SQOSTEST fifo: opened as std opens a path: {first:?}; opened again: {again:?}");
+        assert_eq!(first, Ok(2), "the control: std's open of a pipe");
+        assert!(matches!(again, Err(_) | Ok(0)), "the pipe's maker got level {again:?} of Firecracker");
+    }
+
     // The relay fills the reader's pipe to its last byte, whatever room
     // the reader made: every byte written so far is there to read, as in a
     // FIFO, while more waits than fits.

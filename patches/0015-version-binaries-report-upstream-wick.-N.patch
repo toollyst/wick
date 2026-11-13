@@ -134,7 +134,7 @@ index 37c2a2a3a62a03a8d755047702451e9f1bbb50cb..38728c506c0dc24f1293a4fbe4b2a277
  log-instrument = { path = "../log-instrument", optional = true }
  # wick: by path, built over wick's POSIX layer on Windows (a [patch] of the
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
-index a92dbf32c7e0591a9d34513950da87d589c7bd52..e0db3b38293d78a325337c72f88e91ac757f72a1 100644
+index 5f3b97595f79f8cd2f4d5dfb0b8e3cc96b99bc39..09479206170e2c49ba8e0ae97ed13fefa2788361 100644
 --- a/src/firecracker/src/main.rs
 +++ b/src/firecracker/src/main.rs
 @@ -53,10 +53,12 @@ use crate::seccomp::SeccompConfig;
@@ -152,7 +152,7 @@ index a92dbf32c7e0591a9d34513950da87d589c7bd52..e0db3b38293d78a325337c72f88e91ac
  };
  const MMDS_CONTENT_ARG: &str = "metadata";
  
-@@ -699,3 +701,25 @@ fn run_without_api(
+@@ -700,3 +702,25 @@ fn run_without_api(
      }
      Ok(())
  }

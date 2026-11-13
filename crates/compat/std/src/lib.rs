@@ -50,6 +50,22 @@ pub mod io {
 /// descriptors) and `read_dir`. `File::open`, `File::create` and
 /// `File::try_clone` are std's own: shadowing them would replace `File`, the
 /// type every crate shares, so they are counted and not refused.
+///
+/// A path may name a pipe (`\\.\pipe\<name>`, the counterpart of a FIFO for
+/// the log, the metrics and a serial device's output), and whoever made a
+/// pipe is its server, who may act as a client that opens it: "The
+/// SecurityImpersonation level is the default for named pipe, RPC, and DDE
+/// servers" (Microsoft Learn, Impersonation Levels), and `CreateFile` asks
+/// for another level only with `SECURITY_SQOS_PRESENT` (CreateFileW,
+/// `dwFlagsAndAttributes`). So `OpenOptions::open`, `read`,
+/// `read_to_string` and `write` open at the anonymous level
+/// (`SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS`: "The server cannot
+/// impersonate or identify the client"), whatever the path names
+/// (`test_a_pipe_opened_by_path_gives_its_maker_no_identity`). For a file
+/// the same bit is `FILE_FLAG_OPEN_NO_RECALL`, which leaves a file of
+/// remote storage where it is (CreateFileW). Not covered: `copy`
+/// (`CopyFileEx` opens both files itself) and std's own `File::open` and
+/// `File::create`.
 pub mod fs {
     pub use std::fs::*;
 
@@ -64,8 +80,11 @@ pub mod fs {
 
         use wick_os::windows::nofile::check;
 
+        /// `SECURITY_ANONYMOUS` (winbase.h: `SecurityAnonymous << 16`).
+        const SECURITY_ANONYMOUS: u32 = 0;
+
         /// `std::fs::OpenOptions`, whose `open` fails with `EMFILE` past the
-        /// no-file limit.
+        /// no-file limit and gives a pipe's maker no identity.
         #[derive(Clone, Debug)]
         pub struct OpenOptions(std::fs::OpenOptions);
 
@@ -76,9 +95,14 @@ pub mod fs {
         }
 
         impl OpenOptions {
-            /// `std::fs::OpenOptions::new`.
+            /// `std::fs::OpenOptions::new`, at the anonymous impersonation
+            /// level (the module's comment); `security_qos_flags` sets
+            /// another.
             pub fn new() -> Self {
-                OpenOptions(std::fs::OpenOptions::new())
+                let mut options = std::fs::OpenOptions::new();
+                // std adds SECURITY_SQOS_PRESENT itself.
+                std::os::windows::fs::OpenOptionsExt::security_qos_flags(&mut options, SECURITY_ANONYMOUS);
+                OpenOptions(options)
             }
             /// `std::fs::OpenOptions::read`.
             pub fn read(&mut self, read: bool) -> &mut Self {
@@ -142,20 +166,22 @@ pub mod fs {
 
         /// `std::fs::read`; `EMFILE` past the no-file limit.
         pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
-            check(1)?;
-            std::fs::read(path)
+            let mut bytes = Vec::new();
+            io::Read::read_to_end(&mut OpenOptions::new().read(true).open(path)?, &mut bytes)?;
+            Ok(bytes)
         }
 
         /// `std::fs::read_to_string`; `EMFILE` past the no-file limit.
         pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
-            check(1)?;
-            std::fs::read_to_string(path)
+            let mut text = String::new();
+            io::Read::read_to_string(&mut OpenOptions::new().read(true).open(path)?, &mut text)?;
+            Ok(text)
         }
 
         /// `std::fs::write`; `EMFILE` past the no-file limit.
         pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result<()> {
-            check(1)?;
-            std::fs::write(path, contents)
+            let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+            io::Write::write_all(&mut file, contents.as_ref())
         }
 
         /// `std::fs::copy`; `EMFILE` unless two descriptors fit, as Linux
@@ -240,6 +266,94 @@ mod tests {
             std::string::String::from_utf8_lossy(&out.stderr)
         );
         assert!(out.status.success() && text.contains("nofile child: ok"), "exit {:?}: {text}", out.status.code());
+    }
+
+    /// A path Firecracker opens may name a pipe, whose maker is then its
+    /// server: `fs`'s opens give it no identity to act with
+    /// (`ImpersonateNamedPipeClient` is refused, or the thread's token is
+    /// at the anonymous level), where std's own open, the control, gives
+    /// the impersonation level.
+    #[cfg(windows)]
+    #[test]
+    fn test_a_pipe_opened_by_path_gives_its_maker_no_identity() {
+        use std::os::windows::ffi::OsStrExt;
+        type Handle = *mut core::ffi::c_void;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateNamedPipeW(
+                name: *const u16,
+                open: u32,
+                mode: u32,
+                instances: u32,
+                out: u32,
+                input: u32,
+                timeout: u32,
+                sa: *const core::ffi::c_void,
+            ) -> Handle;
+            fn ReadFile(h: Handle, buf: *mut u8, len: u32, read: *mut u32, ov: *mut core::ffi::c_void) -> i32;
+            fn CloseHandle(h: Handle) -> i32;
+            fn GetCurrentThread() -> Handle;
+            fn GetLastError() -> u32;
+        }
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn ImpersonateNamedPipeClient(pipe: Handle) -> i32;
+            fn RevertToSelf() -> i32;
+            fn OpenThreadToken(thread: Handle, access: u32, as_self: i32, token: *mut Handle) -> i32;
+            fn GetTokenInformation(token: Handle, class: i32, info: *mut core::ffi::c_void, len: u32, ret: *mut u32) -> i32;
+        }
+        const PIPE_ACCESS_DUPLEX: u32 = 3;
+        const TOKEN_QUERY: u32 = 8;
+        const TOKEN_IMPERSONATION_LEVEL: i32 = 9;
+
+        // What the maker of a pipe gets of the client `open` gives, once
+        // that client wrote a byte: the refusal's error code, or the level
+        // (0 anonymous, 1 identification, 2 impersonation).
+        let level_of = |name: &str, open: &dyn Fn(&std::path::Path) -> std::io::Result<std::fs::File>| -> Result<i32, u32> {
+            let path = std::path::PathBuf::from(std::format!(r"\\.\pipe\wick-std-sqos-{}-{name}", std::process::id()));
+            let wide: std::vec::Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+            // SAFETY: a NUL-terminated name; a byte pipe of one instance.
+            let server =
+                unsafe { CreateNamedPipeW(wide.as_ptr(), PIPE_ACCESS_DUPLEX, 0, 1, 4096, 4096, 0, core::ptr::null()) };
+            assert!(!server.is_null() && server as isize != -1, "{}", std::io::Error::last_os_error());
+            let client = open(&path).unwrap();
+            std::io::Write::write_all(&mut &client, b"x").unwrap();
+            // SAFETY: plain calls on this thread and our handles; the
+            // thread is itself again before the block ends.
+            unsafe {
+                let (mut byte, mut n) = (0u8, 0u32);
+                assert_ne!(ReadFile(server, &mut byte, 1, &mut n, core::ptr::null_mut()), 0);
+                let result = if ImpersonateNamedPipeClient(server) == 0 {
+                    Err(GetLastError())
+                } else {
+                    let mut token: Handle = core::ptr::null_mut();
+                    let opened = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token);
+                    let open_error = GetLastError();
+                    let (mut level, mut len) = (0i32, 0u32);
+                    let got = opened != 0
+                        && GetTokenInformation(token, TOKEN_IMPERSONATION_LEVEL, (&raw mut level).cast(), 4, &mut len)
+                            != 0;
+                    let level_error = GetLastError();
+                    assert_ne!(RevertToSelf(), 0, "the thread could not be itself again");
+                    if opened == 0 {
+                        Err(open_error)
+                    } else {
+                        CloseHandle(token);
+                        if got { Ok(level) } else { Err(level_error) }
+                    }
+                };
+                drop(client);
+                CloseHandle(server);
+                result
+            }
+        };
+        let control = level_of("control", &|p| std::fs::OpenOptions::new().read(true).write(true).open(p));
+        // `fs::read`, `read_to_string` and `write` open through the same
+        // `OpenOptions`.
+        let options = level_of("options", &|p| super::fs::OpenOptions::new().read(true).write(true).open(p));
+        std::println!("SQOSTEST std: std's own open: {control:?}; fs::OpenOptions: {options:?}");
+        assert_eq!(control, Ok(2), "the control: std's own open of a pipe");
+        assert!(matches!(options, Err(_) | Ok(0)), "the pipe's maker got level {options:?} of Firecracker");
     }
 
     #[cfg(windows)]

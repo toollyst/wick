@@ -34,7 +34,7 @@ resize_fdtable's Dup2 error before the clamp and passes with it.
  1 file changed, 80 insertions(+)
 
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
-index b8b01d400f3535e471dad4aba63bbadfa2afcb30..8c615bced0d1becfdfa9def686535000751dc13f 100644
+index cf6a759a95b190259cb8bdd988325c630dc31408..8c3feb840496e9ea0e64ca8a40d9d598d264b2ce 100644
 --- a/src/firecracker/src/main.rs
 +++ b/src/firecracker/src/main.rs
 @@ -523,6 +523,14 @@ fn resize_fdtable() -> Result<(), ResizeFdTableError> {
@@ -52,7 +52,7 @@ index b8b01d400f3535e471dad4aba63bbadfa2afcb30..8c615bced0d1becfdfa9def686535000
  
      // Resize the file descriptor table to its maximal possible size, to ensure that
      // firecracker will not need to reallocate it later. If the file descriptor table
-@@ -721,6 +729,78 @@ fn run_without_api(
+@@ -722,6 +730,78 @@ fn run_without_api(
      Ok(())
  }
  
