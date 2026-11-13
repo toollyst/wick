@@ -330,6 +330,12 @@ pub(crate) fn pending_gp() -> u64 {
     1 | (3 << 1) | (1 << 4) | (13 << 16)
 }
 
+/// WHP's `WHV_X64_PENDING_INTERRUPTION_REGISTER` for a #SS(0): a hardware
+/// exception (type 3), vector 12, with an error code (bit 4) of 0.
+pub(crate) fn pending_ss() -> u64 {
+    1 | (3 << 1) | (1 << 4) | (12 << 16)
+}
+
 /// WHP's `WHV_X64_PENDING_INTERRUPTION_REGISTER` for a #PF with `code`: a
 /// hardware exception (type 3), vector 14, with its error code (bit 4) in
 /// the upper half. The faulting address goes in CR2 with it.

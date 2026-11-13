@@ -5,8 +5,9 @@
 //! controls (`crates/compat/kvm-ioctls/src/whp/exit.rs`): the instruction
 //! length, a port access's direction, size and kind, a memory access's
 //! direction, an MSR access and the value it writes, the `RAX` an `IN`
-//! leaves, the CPUID bits that follow CR4, and the hypercall answered (at
-//! the privilege level and operand size the exit context gives).
+//! leaves, the CPUID bits that follow CR4, the hypercall answered (at
+//! the privilege level and operand size the exit context gives), and a
+//! string instruction's addressing and segment checks.
 //! Checked against a reference written here from the x86 architecture (the
 //! Intel SDM: port I/O sizes, 32-bit register writes zero-extending,
 //! `WRMSR` taking `EDX:EAX`, CPUID's OSXSAVE and OSPKE) and KVM's hypercall
@@ -17,8 +18,9 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use wick_fuzz::whp_exit::{
-    Hypercall, PortAccess, cpl, cpuid_ecx, hypercall, hypercall_rax, in_result, ins_read_ahead, instruction_length, linear_address,
-    long_mode_code, memory_write, msr_access, port_access, string_addressing, string_advance, string_count, string_offset,
+    CodeMode, Hypercall, PortAccess, Segment, SegmentFault, SegmentView, code_mode, cpl, cpuid_ecx, hypercall, hypercall_rax,
+    in_result, ins_read_ahead, instruction_length, linearize, long_mode_code, memory_write, msr_access, port_access,
+    string_addressing, string_advance, string_count, string_offset,
 };
 
 #[derive(Arbitrary, Debug)]
@@ -28,7 +30,8 @@ enum Exit {
     Msr { info: u32, rax: u64, rdx: u64 },
     Cpuid { function: u8, index: u8, ecx: u32, cr4: u64 },
     Hypercall { nr: u64, a0: u64, a1: u64, state: u16, cs: u16 },
-    String { bytes: Vec<u8>, long: bool, default_32: bool, reg: u64, rcx: u64, base: u64, size: u8, rep: bool, down: bool },
+    String { bytes: Vec<u8>, long: bool, default_32: bool, reg: u64, rcx: u64, size: u8, rep: bool, down: bool },
+    Linear { state: u16, rflags: u64, cs: u16, seg: u8, base: u64, limit: u32, attributes: u16, offset: u64, size: u16, write: bool, la57: bool },
 }
 
 #[derive(Arbitrary, Debug)]
@@ -106,7 +109,7 @@ fn check(e: &Exit) {
                 assert_eq!(hypercall_rax(rax, wide), low(rax));
             }
         }
-        Exit::String { ref bytes, long, default_32, reg, rcx, base, size, rep, down } => {
+        Exit::String { ref bytes, long, default_32, reg, rcx, size, rep, down } => {
             // INS and OUTS (`VcpuFd::string_io`): the guest chooses the
             // instruction's bytes and every register.
             let size = [1usize, 2, 4][usize::from(size % 3)];
@@ -136,8 +139,66 @@ fn check(e: &Exit) {
             let n = ins_read_ahead(size, reg, count, down);
             assert!(n >= 1 && n * size <= 1024, "{n} elements of {size}");
             assert!(n as u64 <= count.max(1));
-            let la = linear_address(base, string_offset(reg, wide), long);
-            assert!(long || la <= 0xffff_ffff);
+        }
+        Exit::Linear { state, rflags, cs, seg, base, limit, attributes, offset, size, write, la57 } => {
+            // KVM's emulator modes (x86.c, `init_emulate_ctxt`) and its
+            // segment checks (emulate.c, `__linearize`), against the Intel
+            // SDM's rules: canonical addresses in 64-bit code; elsewhere
+            // 32-bit addresses, a present segment, every byte within the
+            // limit.
+            let mode = code_mode(state, rflags, cs);
+            let want = if state & 4 == 0 {
+                CodeMode::Real
+            } else if rflags & (1 << 17) != 0 {
+                CodeMode::Vm86
+            } else if state & 0x10 != 0 && cs & 0x2000 != 0 {
+                CodeMode::Prot64
+            } else if cs & 0x4000 != 0 {
+                CodeMode::Prot32
+            } else {
+                CodeMode::Prot16
+            };
+            assert_eq!(mode, want);
+            let segment = [Segment::Es, Segment::Cs, Segment::Ss, Segment::Ds, Segment::Fs, Segment::Gs][usize::from(seg % 6)];
+            let va = if la57 { 57 } else { 48 };
+            let size = u64::from(size % 1024) + 1;
+            let view = SegmentView { base, limit, attributes };
+            let got = linearize(segment, view, offset, size, write, mode, va);
+            if let Err(fault) = got {
+                assert_eq!(fault == SegmentFault::Ss, segment == Segment::Ss, "#SS through SS only");
+            }
+            if mode == CodeMode::Prot64 {
+                let la = if matches!(segment, Segment::Fs | Segment::Gs) { base } else { 0 }.wrapping_add(offset);
+                let top = la >> (va - 1);
+                let canonical = top == 0 || top == u64::MAX >> (va - 1);
+                if !canonical {
+                    assert!(got.is_err(), "{la:#x} is not canonical at {va} bits");
+                }
+                if let Ok(at) = got {
+                    assert_eq!(at, la);
+                }
+                return;
+            }
+            let Ok(at) = got else { return };
+            assert_eq!(at, base.wrapping_add(offset) & 0xffff_ffff);
+            assert!(attributes & 0x80 != 0, "a segment that is not present");
+            let kind = attributes & 0xf;
+            if write {
+                assert!(kind & 0xa == 2 || (kind & 8 != 0 && mode == CodeMode::Real && kind & 2 != 0), "a write through type {kind:#x}");
+            }
+            let expand_down = kind & 0xc == 4;
+            if expand_down {
+                assert!(offset > u64::from(limit));
+                let top = if attributes & 0x4000 != 0 { 0xffff_ffff } else { 0xffff };
+                assert!(offset <= top);
+                if top != 0xffff_ffff {
+                    assert!(offset + size - 1 <= top);
+                }
+            } else if limit == u32::MAX {
+                assert!(offset <= u64::from(limit));
+            } else {
+                assert!(offset + size - 1 <= u64::from(limit), "{size} bytes at {offset:#x} past the limit {limit:#x}");
+            }
         }
     }
 }

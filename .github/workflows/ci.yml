@@ -880,6 +880,12 @@ jobs:
           # after (asserted; STRTEST lines, with REP MOVSB to and from a
           # device on record).
           alone whp::vcpu::fpu_tests::test_string_io_and_device_memory_beside_ram
+          # KVM's emulator around those data (asserted; STRTEST lines): a
+          # REP prefix on a plain OUT is no string instruction; RIP and
+          # RFLAGS.RF at each element of a REP OUTSB; #GP(0) for a
+          # non-canonical RSI; a REP INSW written in one write that faults
+          # on the page above, RDI and RCX unmoved.
+          alone whp::vcpu::fpu_tests::test_string_io_checks_and_flags_as_kvm
           # What each call of the backend commits of its thread's stack
           # (STACKTEST lines), each on a thread of its own: which one leaves
           # a vCPU's thread 48 to 52 KiB deep, as the boot record of run

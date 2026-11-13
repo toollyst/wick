@@ -94,16 +94,35 @@ struct StringIn {
     size: usize,
     n: usize,
     rep: bool,
-    /// The address size, the direction flag, 64-bit code, privilege level 3.
+    /// The address size, the direction flag, the mode, the width of a
+    /// linear address in 64-bit code, privilege level 3.
     wide: u8,
     down: bool,
-    long: bool,
+    mode: super::exit::CodeMode,
+    va_bits: u32,
     user: bool,
-    /// `ES`'s base.
-    base: u64,
-    /// The instruction's address and the one after it.
+    /// `ES` as the exit had it.
+    es: super::exit::SegmentView,
+    /// `RIP` and RFLAGS once the elements are written.
     rip: u64,
-    rip_after: u64,
+    rflags: u64,
+}
+
+/// RFLAGS.RF (bit 16), which KVM's emulator sets while a `REP` string
+/// instruction is not done and clears at the end of an instruction.
+const RFLAGS_RF: u64 = 1 << 16;
+
+/// A fault a string instruction's memory access takes.
+#[derive(Debug, Clone, Copy)]
+enum Fault {
+    Page(GuestFault),
+    Segment(super::exit::SegmentFault),
+}
+
+/// A segment register as [`super::exit::linearize`] reads it.
+fn segment_view(s: &whv::WHV_X64_SEGMENT_REGISTER) -> super::exit::SegmentView {
+    // SAFETY: the attributes' 16-bit view of the bit field.
+    super::exit::SegmentView { base: s.Base, limit: s.Limit, attributes: unsafe { s.Anonymous.Attributes } }
 }
 
 /// A page fault the guest is to take for an access the backend made for it.
@@ -1259,7 +1278,10 @@ impl VcpuFd {
                     let super::exit::PortAccess { write: is_write, size, string, rep } = access;
                     let port = io.PortNumber;
 
-                    if string || rep {
+                    // A string instruction only: a REP prefix on a plain IN
+                    // or OUT does nothing, and KVM looks at the string bit
+                    // alone (vmx.c handle_io, svm.c io_interception).
+                    if string {
                         if let Some(exit) =
                             self.string_io(&ctx.VpContext, &io, is_write, size, rep, scratch, rip + instr_len)?
                         {
@@ -1525,26 +1547,46 @@ impl VcpuFd {
 
     /// `INS` and `OUTS`, with or without `REP`, done as KVM's emulator does
     /// them (Linux v6.1 arch/x86/kvm/emulate.c: `em_out`, `em_in`,
-    /// `pio_in_emulated`; both vendors' string port exits go to it), so that
-    /// Firecracker sees KVM's exits:
+    /// `pio_in_emulated`, `__linearize`, `x86_emulate_insn`; both vendors'
+    /// string port exits go to it), so that Firecracker sees KVM's exits and
+    /// the guest KVM's registers and faults:
     ///
     /// - `OUTS` is one `KVM_EXIT_IO` an element (`em_out` passes a count of
     ///   1): the element is read from the guest's memory at the source
     ///   segment's `RSI`, `RSI` moves by its size, `RCX` goes down by one
-    ///   with `REP`, and `RIP` passes the instruction once none is left.
+    ///   with `REP`.
     /// - `INS` asks the port for several elements at once
     ///   ([`super::exit::ins_read_ahead`]), one `KVM_EXIT_IO` with that
     ///   count; at the next run they are written to `ES:RDI` and the
     ///   registers move by as many ([`VcpuFd::complete_string_in`]).
+    /// - Without `REP`, `RIP` passes the instruction and RFLAGS.RF is
+    ///   cleared. With it, `RIP` stays at the instruction and RF is set
+    ///   after every element, also the last: KVM ends a `REP` instruction
+    ///   only when it finds `RCX` at 0 (the guest's next entry runs it
+    ///   again with nothing left, and the processor, or the `count == 0`
+    ///   case here if the processor exits for it, passes it).
+    /// - `REP` with nothing left passes the instruction, RF cleared, and on
+    ///   a guest whose CPUID names Intel, with 32-bit addresses, `RCX`
+    ///   becomes 0 whole (`string_registers_quirk`).
     ///
-    /// The guest's memory is reached as the processor would reach it: each
-    /// page translated with the access's right at the guest's privilege
-    /// level (`WHvTranslateGva`), a refusal delivered as the page fault it
-    /// is, with nothing of the element done. The registers and the segment
-    /// are used at the instruction's address size and segment prefix
-    /// ([`super::exit::string_addressing`]). Not checked, where KVM does:
-    /// the segment's limit, the I/O permission bitmap (WHP reports the exit
-    /// after the processor's own check).
+    /// The address is checked as KVM's emulator checks it
+    /// ([`super::exit::linearize`]: canonical in 64-bit code; the
+    /// segment's presence, type and limit elsewhere), a failure being the
+    /// guest's #GP(0), or #SS(0) through SS. The guest's memory is then
+    /// reached as the processor would reach it: each page translated with
+    /// the access's right at the guest's privilege level
+    /// (`WHvTranslateGva`), a refusal delivered as the page fault it is.
+    /// After a fault nothing of the element is done and `RIP` and RFLAGS
+    /// stay. The registers and the segment are used at the instruction's
+    /// address size and segment prefix ([`super::exit::string_addressing`]).
+    /// The I/O permission bitmap is not checked here: the processor checks
+    /// it before it exits (Intel SDM vol. 3C 26.1.1, the general-protection
+    /// exceptions based on the TSS's I/O permission bits come before a VM
+    /// exit).
+    ///
+    /// Not as KVM: a string operand whose guest physical address no memory
+    /// slot backs fails the run with `EFAULT` and a report, where KVM's
+    /// emulator makes MMIO exits for it.
     ///
     /// Before, the instruction went to WHP's emulator, whose memory
     /// callback took the string's own memory for a device's: an `OUTS`
@@ -1567,8 +1609,11 @@ impl VcpuFd {
         let (part, vp) = (self.part(), self.vp());
         // SAFETY: plain 16-bit views of the exit context's bit fields.
         let (state, cs) = unsafe { (vpctx.ExecutionState.AsUINT16, vpctx.Cs.Anonymous.Attributes) };
-        let long = exit::long_mode_code(state, cs);
+        let mode = exit::code_mode(state, vpctx.Rflags, cs);
+        let long = mode == exit::CodeMode::Prot64;
         let bytes = &io.InstructionBytes[..usize::from(io.InstructionByteCount).min(16)];
+        // The default address size outside 64-bit code is CS.D's, in real
+        // and virtual-8086 mode too (emulate.c, `x86_decode_insn`).
         let addressing = exit::string_addressing(bytes, long, cs >> 14 & 1 == 1);
         let wide = addressing.address_bytes;
         let down = vpctx.Rflags >> 10 & 1 == 1;
@@ -1577,25 +1622,44 @@ impl VcpuFd {
         let count = exit::string_count(rep, io.Rcx, wide);
         if count == 0 {
             // REP with nothing left: the instruction does nothing.
-            regs::set_rip(part, vp, rip_after)?;
+            let mut names = vec![whv::WHvX64RegisterRip, whv::WHvX64RegisterRflags];
+            let mut values = vec![reg64(rip_after), reg64(vpctx.Rflags & !RFLAGS_RF)];
+            if wide == 4 && self.guest_vendor_intel() {
+                names.push(whv::WHvX64RegisterRcx);
+                values.push(reg64(0));
+            }
+            super::ffi::set_registers(part, vp, &names, &values)?;
             return Ok(None);
         }
+        let va_bits = if long { self.virtual_address_bits()? } else { 48 };
+        // RFLAGS and RIP once an element is done.
+        let rflags = if rep { vpctx.Rflags | RFLAGS_RF } else { vpctx.Rflags & !RFLAGS_RF };
+        let rip = if rep { vpctx.Rip } else { rip_after };
 
         if write {
-            let base = self.string_segment_base(addressing.segment.unwrap_or(exit::Segment::Ds), long, io)?;
-            let at = exit::linear_address(base, exit::string_offset(io.Rsi, wide), long);
+            let segment = addressing.segment.unwrap_or(exit::Segment::Ds);
+            let view = self.string_segment(segment, io)?;
+            let offset = exit::string_offset(io.Rsi, wide);
+            let at = match exit::linearize(segment, view, offset, size as u64, false, mode, va_bits) {
+                Ok(at) => at,
+                Err(fault) => {
+                    self.segment_fault(fault)?;
+                    return Ok(None);
+                }
+            };
             let mut element = [0u8; 4];
             if let Some(fault) = self.read_guest_va(at, &mut element[..size], user)? {
                 self.page_fault(fault)?;
                 return Ok(None);
             }
-            let names = [whv::WHvX64RegisterRsi, whv::WHvX64RegisterRip, whv::WHvX64RegisterRcx];
+            let names = [whv::WHvX64RegisterRsi, whv::WHvX64RegisterRip, whv::WHvX64RegisterRflags, whv::WHvX64RegisterRcx];
             let values = [
                 reg64(exit::string_advance(io.Rsi, wide, size as u64, down)),
-                reg64(if count == 1 { rip_after } else { vpctx.Rip }),
+                reg64(rip),
+                reg64(rflags),
                 reg64(exit::string_advance(io.Rcx, wide, 1, true)),
             ];
-            let n = if rep { 3 } else { 2 };
+            let n = if rep { 4 } else { 3 };
             super::ffi::set_registers(part, vp, &names[..n], &values[..n])?;
             // SAFETY: at most 4 bytes into the 8-byte data area.
             unsafe { std::ptr::copy_nonoverlapping(element.as_ptr(), scratch, size) };
@@ -1622,12 +1686,12 @@ impl VcpuFd {
             rep,
             wide,
             down,
-            long,
+            mode,
+            va_bits,
             user,
-            // In 64-bit code ES's base is not used.
-            base: if long { 0 } else { io.Es.Base },
-            rip: vpctx.Rip,
-            rip_after,
+            es: segment_view(&io.Es),
+            rip,
+            rflags,
         };
         // SAFETY: `n * size` is at most the buffer (`ins_read_ahead`); the
         // buffer is the vCPU's, used by its run loop and, between two runs,
@@ -1648,65 +1712,106 @@ impl VcpuFd {
         Ok(Some(VcpuExit::IoIn(port, buf)))
     }
 
-    /// The elements an `INS` was given, written to `ES:RDI` one after the
-    /// other; `RDI` moves and `RCX` goes down by as many, and `RIP` passes
-    /// the instruction if none is left (KVM writes its read-ahead to the
-    /// guest before it asks the port again). An element whose page refuses
-    /// the write is the guest's page fault: those before it stay written
-    /// and counted, it and those after it are dropped with the fault.
+    /// The elements an `INS` was given, written to `ES:RDI`; `RDI` moves
+    /// and `RCX` goes down by as many, and `RIP` and RFLAGS become what
+    /// [`VcpuFd::string_io`] says. As KVM's emulator writes them
+    /// (emulate.c, `pio_in_emulated`, `writeback`): with `REP` and the
+    /// direction flag clear, all of them in one write (`OP_MEM_STR`), its
+    /// address checked for all of them at once; a fault anywhere in it
+    /// moves no register (the pages before the faulting one keep what was
+    /// written in them). Otherwise one element after the other, a fault
+    /// keeping those before it written and counted and dropping the rest.
     fn complete_string_in(&self, ins: &StringIn) -> Result<()> {
         use super::exit;
         use super::ffi::{as_u64, reg64};
         let (part, vp) = (self.part(), self.vp());
-        let names = [whv::WHvX64RegisterRdi, whv::WHvX64RegisterRcx, whv::WHvX64RegisterRip];
+        let names = [whv::WHvX64RegisterRdi, whv::WHvX64RegisterRcx, whv::WHvX64RegisterRip, whv::WHvX64RegisterRflags];
         let mut values = [reg64(0); 2];
         super::ffi::get_registers(part, vp, &names[..2], &mut values)?;
         let (mut rdi, mut rcx) = (as_u64(&values[0]), as_u64(&values[1]));
         // SAFETY: the vCPU's buffer, which Firecracker filled through the
         // exit's slice and no longer holds (it called `run` again).
         let data = unsafe { std::slice::from_raw_parts(self.shared.string_data.get().cast::<u8>(), ins.n * ins.size) };
+        let whole = ins.rep && !ins.down;
+        let element = if whole { data.len() } else { ins.size };
         let mut fault = None;
-        for element in data.chunks(ins.size) {
-            let at = exit::linear_address(ins.base, exit::string_offset(rdi, ins.wide), ins.long);
-            fault = self.write_guest_va(at, element, ins.user)?;
-            if fault.is_some() {
+        let mut done = 0u64;
+        for piece in data.chunks(element) {
+            let offset = exit::string_offset(rdi, ins.wide);
+            let at = match exit::linearize(exit::Segment::Es, ins.es, offset, piece.len() as u64, true, ins.mode, ins.va_bits) {
+                Ok(at) => at,
+                Err(f) => {
+                    fault = Some(Fault::Segment(f));
+                    break;
+                }
+            };
+            if let Some(f) = self.write_guest_va(at, piece, ins.user)? {
+                fault = Some(Fault::Page(f));
                 break;
             }
-            rdi = exit::string_advance(rdi, ins.wide, ins.size as u64, ins.down);
+            let elements = (piece.len() / ins.size) as u64;
+            rdi = exit::string_advance(rdi, ins.wide, elements * ins.size as u64, ins.down);
             if ins.rep {
-                rcx = exit::string_advance(rcx, ins.wide, 1, true);
+                rcx = exit::string_advance(rcx, ins.wide, elements, true);
             }
+            done += elements;
         }
-        let done = fault.is_none() && (!ins.rep || exit::string_offset(rcx, ins.wide) == 0);
-        let rip = if done { ins.rip_after } else { ins.rip };
-        super::ffi::set_registers(part, vp, &names, &[reg64(rdi), reg64(rcx), reg64(rip)])?;
+        if done > 0 {
+            // The registers of the elements done; RIP and RFLAGS only if
+            // none faulted (a fault is not a trap: KVM writes neither).
+            let n = if fault.is_none() { 4 } else { 2 };
+            let values = [reg64(rdi), reg64(rcx), reg64(ins.rip), reg64(ins.rflags)];
+            super::ffi::set_registers(part, vp, &names[..n], &values[..n])?;
+        }
         match fault {
-            Some(fault) => self.page_fault(fault),
+            Some(Fault::Page(f)) => self.page_fault(f),
+            Some(Fault::Segment(f)) => self.segment_fault(f),
             None => Ok(()),
         }
     }
 
-    /// The base of the segment an `OUTS` reads through. In 64-bit code only
-    /// FS and GS have one; otherwise DS's and ES's are the exit's, and
-    /// another segment's is read.
-    fn string_segment_base(
-        &self,
-        segment: super::exit::Segment,
-        long: bool,
-        io: &whv::WHV_X64_IO_PORT_ACCESS_CONTEXT,
-    ) -> Result<u64> {
+    /// The segment an `OUTS` reads through: DS's and ES's from the exit,
+    /// another one read.
+    fn string_segment(&self, segment: super::exit::Segment, io: &whv::WHV_X64_IO_PORT_ACCESS_CONTEXT) -> Result<super::exit::SegmentView> {
         use super::exit::Segment;
-        let name = match (segment, long) {
-            (Segment::Fs, _) => whv::WHvX64RegisterFs,
-            (Segment::Gs, _) => whv::WHvX64RegisterGs,
-            (_, true) => return Ok(0),
-            (Segment::Ds, false) => return Ok(io.Ds.Base),
-            (Segment::Es, false) => return Ok(io.Es.Base),
-            (Segment::Cs, false) => whv::WHvX64RegisterCs,
-            (Segment::Ss, false) => whv::WHvX64RegisterSs,
+        let name = match segment {
+            Segment::Ds => return Ok(segment_view(&io.Ds)),
+            Segment::Es => return Ok(segment_view(&io.Es)),
+            Segment::Fs => whv::WHvX64RegisterFs,
+            Segment::Gs => whv::WHvX64RegisterGs,
+            Segment::Cs => whv::WHvX64RegisterCs,
+            Segment::Ss => whv::WHvX64RegisterSs,
         };
         // SAFETY: a segment register's value.
-        Ok(unsafe { super::ffi::get_register(self.part(), self.vp(), name)?.Segment }.Base)
+        Ok(segment_view(&unsafe { super::ffi::get_register(self.part(), self.vp(), name)?.Segment }))
+    }
+
+    /// The width of a linear address in 64-bit code: 57 bits with CR4.LA57
+    /// (bit 12), 48 without (emulate.c, `ctxt_virt_addr_bits`).
+    fn virtual_address_bits(&self) -> Result<u32> {
+        let cr4 = super::ffi::as_u64(&super::ffi::get_register(self.part(), self.vp(), whv::WHvX64RegisterCr4)?);
+        Ok(if cr4 >> 12 & 1 == 1 { 57 } else { 48 })
+    }
+
+    /// Whether the guest's CPUID leaf 0, as the table set on this vCPU has
+    /// it, names Intel (KVM's `vendor_intel` reads the guest's CPUID; no
+    /// leaf 0 is no vendor).
+    fn guest_vendor_intel(&self) -> bool {
+        let table = self.shared.cpuid.lock().unwrap();
+        table
+            .iter()
+            .find(|e| e.function == 0)
+            .is_some_and(|e| super::exit::guest_vendor_intel(e.ebx, e.ecx, e.edx))
+    }
+
+    /// Leaves the guest the #GP(0) or #SS(0) a segment check gives, to take
+    /// at its next entry. `RIP` stays at the instruction.
+    fn segment_fault(&self, fault: super::exit::SegmentFault) -> Result<()> {
+        let pending = match fault {
+            super::exit::SegmentFault::Gp => super::debug::pending_gp(),
+            super::exit::SegmentFault::Ss => super::debug::pending_ss(),
+        };
+        super::ffi::set_register(self.part(), self.vp(), whv::WHvRegisterPendingInterruption, super::ffi::reg64(pending))
     }
 
     /// The guest physical address of the guest's linear address `gva` for
@@ -3263,8 +3368,10 @@ mod fpu_tests {
     /// The exits of a guest until its `out 0x80`, as Firecracker sees
     /// them, each with its bytes: an `IN` and an MMIO read are answered
     /// from `feed`, in order (a read with nothing left is answered with
-    /// 0xEE). At most 40 exits, and a kick 5 s after the first run began.
-    fn exits_with_their_bytes(vcpu: &mut VcpuFd, feed: &mut std::collections::VecDeque<Vec<u8>>) -> Vec<String> {
+    /// 0xEE). With `registers`, each exit also has the RIP and RFLAGS.RF
+    /// that `KVM_GET_REGS` gives at it. At most 40 exits, and a kick 5 s
+    /// after the first run began.
+    fn exits_with_their_bytes(vcpu: &mut VcpuFd, feed: &mut std::collections::VecDeque<Vec<u8>>, registers: bool) -> Vec<String> {
         let done = Arc::new(AtomicBool::new(false));
         let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
         let watch = Arc::clone(&done);
@@ -3301,6 +3408,12 @@ mod fpu_tests {
                 Ok(_) => ("(another)".to_string(), false),
                 Err(e) if e.errno() == libc::EINTR => ("none within 5 s (kicked)".to_string(), false),
                 Err(e) => (format!("run failed, errno {}", e.errno()), false),
+            };
+            let line = if registers {
+                let r = vcpu.get_regs().unwrap();
+                format!("{line} rip {:#x} rf {}", r.rip, r.rflags >> 16 & 1)
+            } else {
+                line
             };
             exits.push(line);
             if !more {
@@ -3391,7 +3504,7 @@ mod fpu_tests {
 
         let mut feed: std::collections::VecDeque<Vec<u8>> =
             [vec![1, 2, 3], vec![0x44, 0x33, 0x22, 0x11], vec![9, 8], vec![0x5A]].into();
-        let exits = exits_with_their_bytes(&mut vcpu, &mut feed);
+        let exits = exits_with_their_bytes(&mut vcpu, &mut feed, false);
         let word = |at: u64| u64::from_le_bytes(bytes_at::<8>(m, at));
         let memory = format!(
             "after REP OUTSB RSI {:#x} RCX {:#x}; after REP INSB RDI {:#x} RCX {:#x}, memory {:02x?}; INSD {:02x?}; \
@@ -3423,12 +3536,12 @@ mod fpu_tests {
 
         // On record: the two REP MOVSB with a device.
         let mut feed: std::collections::VecDeque<Vec<u8>> = [vec![0xA1], vec![0xA2]].into();
-        let from_device = exits_with_their_bytes(&mut vcpu, &mut feed);
+        let from_device = exits_with_their_bytes(&mut vcpu, &mut feed, false);
         eprintln!(
             "STRTEST REP MOVSB of 2 from a device to RAM (device reads answered a1, then a2): exits {from_device:?}; memory {:02x?}",
             bytes_at::<2>(m, 0x8510)
         );
-        let to_device = exits_with_their_bytes(&mut vcpu, &mut feed);
+        let to_device = exits_with_their_bytes(&mut vcpu, &mut feed, false);
         eprintln!("STRTEST REP MOVSB of 2 (\"ab\") from RAM to a device: exits {to_device:?}");
 
         drop(vcpu);
@@ -3441,6 +3554,130 @@ mod fpu_tests {
             "after REP OUTSB RSI 0x8303 RCX 0x0; after REP INSB RDI 0x8403 RCX 0x0, memory [01, 02, 03]; INSD [44, 33, 22, 11]; \
              REP INSB downwards [08, 09], RDI 0x841f; MOVSB from the device [5a]"
         );
+    }
+
+    // What KVM's emulator does beyond the data of INS and OUTS (Linux v6.1
+    // arch/x86/kvm/emulate.c), asserted:
+    // - A REP prefix on a plain OUT is no string instruction: one exit with
+    //   AL (vmx.c handle_io, svm.c io_interception read the string bit only).
+    // - REP OUTSB: at each element's exit RIP is still the instruction's and
+    //   RFLAGS.RF is set (`x86_emulate_insn`: RF while a REP string
+    //   instruction runs; it ends when it finds RCX at 0); at the next
+    //   instruction's exit RF is clear. Without REP: RIP past it, RF clear.
+    // - OUTSB from a non-canonical RSI in 64-bit code: #GP(0) at the
+    //   instruction (`__linearize`), no exit for the port.
+    // - REP INSW of 16 words at 0x200ff0, the page above not present: one
+    //   exit asks for 16 words (`pio_in_emulated` counts the bytes left in
+    //   the page as elements), written in one write that faults at
+    //   0x201000: #PF with a write's error code (2), CR2 0x201000, RDI and
+    //   RCX as they were before the instruction, the first page's 16 bytes
+    //   written.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_string_io_checks_and_flags_as_kvm() {
+        const PROGRAM: u64 = 0xB000;
+        const IDT: u64 = 0x5000;
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
+        // 2 MiB to 4 MiB through a page table at 0xD000: its first page
+        // present, the second not.
+        q(0x3008, 0xD000 | 3);
+        q(0xD000, 0x20_0000 | 3);
+        q(0xD008, 0);
+        put(m, 0x8300, b"ab");
+        let gate = |vector: u64, handler: u64| {
+            let low = (handler & 0xFFFF) | (8 << 16) | (0x8E << 40) | (((handler >> 16) & 0xFFFF) << 48);
+            q(IDT + vector * 16, low);
+            q(IDT + vector * 16 + 8, handler >> 32);
+        };
+        // Assembled with clang (x86_64, Intel syntax); offsets from PROGRAM.
+        let program: Vec<u8> = [
+            // 0x00: mov al, 0x5a; mov esi, 0x8300; mov dx, 0x8c; rep out dx, al
+            &[0xB0, 0x5A, 0xBE, 0x00, 0x83, 0x00, 0x00, 0x66, 0xBA, 0x8C, 0x00, 0xF3, 0xEE][..],
+            // 0x0d: mov esi, 0x8300; mov ecx, 2; mov dx, 0x82; cld; rep outsb (at 0x1c)
+            &[0xBE, 0x00, 0x83, 0x00, 0x00, 0xB9, 0x02, 0x00, 0x00, 0x00, 0x66, 0xBA, 0x82, 0x00, 0xFC, 0xF3, 0x6E],
+            // 0x1e: out 0x84, al; mov esi, 0x8300; outsb (at 0x25); out 0x80, al; hlt
+            &[0xE6, 0x84, 0xBE, 0x00, 0x83, 0x00, 0x00, 0x6E, 0xE6, 0x80, 0xF4],
+            // 0x29: mov rsi, 0x8000000000000000; mov dx, 0x82; outsb (at 0x37); hlt
+            &[0x48, 0xBE, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x66, 0xBA, 0x82, 0x00, 0x6E, 0xF4],
+            // 0x39, #GP: pop rax; mov [0x8700], rax; pop rax; mov [0x8708], rax;
+            // out 0x80, al; hlt; jmp 0x39
+            &[0x58, 0x48, 0x89, 0x04, 0x25, 0x00, 0x87, 0x00, 0x00, 0x58, 0x48, 0x89, 0x04, 0x25, 0x08, 0x87, 0x00, 0x00],
+            &[0xE6, 0x80, 0xF4, 0xEB, 0xE9],
+            // 0x50: mov edi, 0x200ff0; mov ecx, 16; mov dx, 0x8a; cld; rep insw; hlt
+            &[0xBF, 0xF0, 0x0F, 0x20, 0x00, 0xB9, 0x10, 0x00, 0x00, 0x00, 0x66, 0xBA, 0x8A, 0x00, 0xFC, 0xF3, 0x66, 0x6D, 0xF4],
+            // 0x63, #PF: pop rax; mov [0x8710], rax; mov rax, cr2; mov [0x8718], rax;
+            // mov [0x8720], rdi; mov [0x8728], rcx; out 0x80, al; hlt; jmp 0x63
+            &[0x58, 0x48, 0x89, 0x04, 0x25, 0x10, 0x87, 0x00, 0x00, 0x0F, 0x20, 0xD0],
+            &[0x48, 0x89, 0x04, 0x25, 0x18, 0x87, 0x00, 0x00, 0x48, 0x89, 0x3C, 0x25, 0x20, 0x87, 0x00, 0x00],
+            &[0x48, 0x89, 0x0C, 0x25, 0x28, 0x87, 0x00, 0x00, 0xE6, 0x80, 0xF4, 0xEB, 0xD7],
+        ]
+        .concat();
+        assert_eq!(program.len(), 0x8c);
+        put(m, PROGRAM, &program);
+        gate(13, PROGRAM + 0x39);
+        gate(14, PROGRAM + 0x63);
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        let mut s = vcpu.get_sregs().unwrap();
+        (s.idt.base, s.idt.limit) = (IDT, 4095);
+        vcpu.set_sregs(&s).unwrap();
+        let at = |vcpu: &VcpuFd, offset: u64| {
+            vcpu.set_regs(&kvm_regs { rip: PROGRAM + offset, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+        };
+        let word = |at: u64| u64::from_le_bytes(bytes_at::<8>(m, at));
+
+        at(&vcpu, 0);
+        let mut feed = std::collections::VecDeque::new();
+        let plain = exits_with_their_bytes(&mut vcpu, &mut feed, true);
+        eprintln!("STRTEST REP OUT, REP OUTSB of 2, OUT, OUTSB: exits {plain:?}");
+        at(&vcpu, 0x29);
+        let canonical = exits_with_their_bytes(&mut vcpu, &mut feed, false);
+        let gp = format!("error code {:#x}, RIP pushed {:#x}", word(0x8700), word(0x8708));
+        eprintln!("STRTEST OUTSB from a non-canonical RSI: exits {canonical:?}; #GP {gp}");
+        at(&vcpu, 0x50);
+        let mut feed: std::collections::VecDeque<Vec<u8>> = [(0x40..0x60).collect()].into();
+        let crossing = exits_with_their_bytes(&mut vcpu, &mut feed, false);
+        let pf = format!(
+            "error code {:#x}, CR2 {:#x}, RDI {:#x}, RCX {:#x}, first page {:02x?}",
+            word(0x8710),
+            word(0x8718),
+            word(0x8720),
+            word(0x8728),
+            bytes_at::<16>(m, 0x20_0ff0)
+        );
+        eprintln!("STRTEST REP INSW across into a page not present: exits {crossing:?}; #PF {pf}");
+
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        assert_eq!(
+            plain,
+            [
+                "out 0x8c [5a] rip 0xb00d rf 0",
+                "out 0x82 [61] rip 0xb01c rf 1",
+                "out 0x82 [62] rip 0xb01c rf 1",
+                "out 0x84 [5a] rip 0xb020 rf 0",
+                "out 0x82 [61] rip 0xb026 rf 0",
+                "the end rip 0xb028 rf 0",
+            ]
+        );
+        assert_eq!(canonical, ["the end"]);
+        assert_eq!(gp, "error code 0x0, RIP pushed 0xb037");
+        assert_eq!(crossing, ["in 0x8a x32", "the end"]);
+        let first: Vec<u8> = (0x40..0x50).collect();
+        assert_eq!(pf, format!("error code 0x2, CR2 0x201000, RDI 0x200ff0, RCX 0x10, first page {first:02x?}"));
     }
 
     /// A record of what each call of the backend commits of the stack of

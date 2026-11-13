@@ -238,11 +238,119 @@ pub fn ins_read_ahead(size: usize, rdi: u64, count: u64, down: bool) -> usize {
     n.max(1)
 }
 
-/// The linear address of `offset` in a segment of base `base`: 64 bits in
-/// 64-bit code, 32 otherwise (KVM's `linearize`).
-pub fn linear_address(base: u64, offset: u64, long: bool) -> u64 {
-    let la = base.wrapping_add(offset);
-    if long { la } else { la & 0xffff_ffff }
+/// The mode KVM's emulator decodes and checks an instruction in, as
+/// `init_emulate_ctxt` sets it (Linux v6.1 arch/x86/kvm/x86.c): real mode
+/// without CR0.PE, virtual-8086 with RFLAGS.VM, 64-bit with EFER.LMA and a
+/// 64-bit code segment, else protected mode of CS's default size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeMode {
+    Real,
+    Vm86,
+    Prot16,
+    Prot32,
+    Prot64,
+}
+
+/// The [`CodeMode`] of a vCPU from its exit context: `ExecutionState`
+/// (`Cr0Pe` is bit 2, `EferLma` bit 4), RFLAGS (VM is bit 17) and the code
+/// segment's attributes (`Long` bit 13, `Default` bit 14).
+pub fn code_mode(execution_state: u16, rflags: u64, cs_attributes: u16) -> CodeMode {
+    if execution_state >> 2 & 1 == 0 {
+        CodeMode::Real
+    } else if rflags >> 17 & 1 == 1 {
+        CodeMode::Vm86
+    } else if long_mode_code(execution_state, cs_attributes) {
+        CodeMode::Prot64
+    } else if cs_attributes >> 14 & 1 == 1 {
+        CodeMode::Prot32
+    } else {
+        CodeMode::Prot16
+    }
+}
+
+/// A segment register as WHP holds it (`WHV_X64_SEGMENT_REGISTER`): its
+/// base, its limit in bytes (the granularity already applied, as
+/// `kvm_segment.limit`), and its attributes (the type in bits 0-3, `Present`
+/// bit 7, `Default` bit 14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentView {
+    pub base: u64,
+    pub limit: u32,
+    pub attributes: u16,
+}
+
+/// The exception a segment check gives: #SS(0) for an access through SS,
+/// #GP(0) for any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentFault {
+    Gp,
+    Ss,
+}
+
+/// The linear address of a data access of `size` bytes at `offset` (at the
+/// instruction's address size) through `segment`, or the fault it takes, as
+/// KVM's emulator checks it (Linux v6.1 arch/x86/kvm/emulate.c,
+/// `__linearize`, for an access that is not a fetch; string instructions
+/// have no alignment rule there). In 64-bit code: the base of FS and GS only
+/// (`seg_base`), and the address canonical for `va_bits` (48, or 57 with
+/// CR4.LA57) with `size` bytes below the end of the address space. In any
+/// other mode: 32 bits of address, the segment present (WHP's segments have
+/// no unusable bit; KVM reads AMD's the same way, `!present`), no write to a
+/// code segment outside real mode nor to a data segment without write
+/// access, no read of an execute-only code segment, and the access within
+/// the limit, an expand-down segment's limit being its lowest address.
+pub fn linearize(
+    segment: Segment,
+    view: SegmentView,
+    offset: u64,
+    size: u64,
+    write: bool,
+    mode: CodeMode,
+    va_bits: u32,
+) -> Result<u64, SegmentFault> {
+    let bad = if segment == Segment::Ss { SegmentFault::Ss } else { SegmentFault::Gp };
+    if mode == CodeMode::Prot64 {
+        let base = if matches!(segment, Segment::Fs | Segment::Gs) { view.base } else { 0 };
+        let la = base.wrapping_add(offset);
+        let shift = 64 - va_bits;
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+        let canonical = (((la << shift) as i64) >> shift) as u64 == la;
+        // `min_t(u64, ~0u, (1ull << va_bits) - la)`, in u64 arithmetic.
+        let max_size = (1u64 << va_bits).wrapping_sub(la).min(u64::from(u32::MAX));
+        return if canonical && size <= max_size { Ok(la) } else { Err(bad) };
+    }
+    let la = view.base.wrapping_add(offset) & 0xffff_ffff;
+    let kind = view.attributes & 0xf;
+    let (code, writable_or_readable, expand_down) = (kind & 8 != 0, kind & 2 != 0, kind & 8 == 0 && kind & 4 != 0);
+    if view.attributes >> 7 & 1 == 0 {
+        return Err(bad);
+    }
+    if write && ((mode != CodeMode::Real && code) || !writable_or_readable) {
+        return Err(bad);
+    }
+    if code && !writable_or_readable {
+        return Err(bad);
+    }
+    let mut limit = u64::from(view.limit);
+    if expand_down {
+        if offset <= limit {
+            return Err(bad);
+        }
+        limit = if view.attributes >> 14 & 1 == 1 { 0xffff_ffff } else { 0xffff };
+    }
+    if offset > limit {
+        return Err(bad);
+    }
+    if limit != 0xffff_ffff && size > limit + 1 - offset {
+        return Err(bad);
+    }
+    Ok(la)
+}
+
+/// Whether a guest's CPUID leaf 0 names Intel ("GenuineIntel" in EBX, EDX,
+/// ECX), as KVM's `is_guest_vendor_intel` decides.
+pub fn guest_vendor_intel(ebx: u32, ecx: u32, edx: u32) -> bool {
+    ebx == 0x756e_6547 && ecx == 0x6c65_746e && edx == 0x4965_6e69
 }
 
 /// A page fault's error code: `P` for a fault on a page that is present,
@@ -290,8 +398,6 @@ mod tests {
         assert_eq!(string_advance(r, 2, 1, false), 0x1122_3344_ffff_0000);
         assert_eq!(string_advance(0x1_0000_0000, 4, 4, true), 0xffff_fffc);
         assert_eq!(string_advance(0x10, 8, 4, true), 0xc);
-        assert_eq!(linear_address(u64::MAX, 2, true), 1);
-        assert_eq!(linear_address(0xffff_fff0, 0x20, false), 0x10);
     }
 
     // KVM's read-ahead for INS, with its own arithmetic: bytes to the page's
@@ -308,6 +414,54 @@ mod tests {
         // At a page's start going down, nothing is "in the page": one.
         assert_eq!(ins_read_ahead(4, 0x8000, 9, true), 1);
         assert_eq!(ins_read_ahead(1, 0x8400, 1, false), 1);
+    }
+
+    // KVM's emulator modes and its segment checks (emulate.c, `__linearize`).
+    #[test]
+    fn test_linearize() {
+        let flat = SegmentView { base: 0, limit: 0xffff_ffff, attributes: 0xc093 };
+        let lin = |seg, view, offset, size, write, mode| linearize(seg, view, offset, size, write, mode, 48);
+        // The mode: no PE, VM, LMA with CS.L, CS.D.
+        assert_eq!(code_mode(0, 0, 0x2000), CodeMode::Real);
+        assert_eq!(code_mode(0x4, 1 << 17, 0), CodeMode::Vm86);
+        assert_eq!(code_mode(0x14, 2, 0x209b), CodeMode::Prot64);
+        assert_eq!(code_mode(0x4, 2, 0x409b), CodeMode::Prot32);
+        assert_eq!(code_mode(0x4, 2, 0x9b), CodeMode::Prot16);
+        // 64-bit: only FS and GS have a base; canonical or #GP, #SS by SS.
+        let based = SegmentView { base: 0x1000, ..flat };
+        assert_eq!(lin(Segment::Ds, based, 0x10, 1, false, CodeMode::Prot64), Ok(0x10));
+        assert_eq!(lin(Segment::Gs, based, 0x10, 1, false, CodeMode::Prot64), Ok(0x1010));
+        assert_eq!(lin(Segment::Ds, flat, 0x0000_8000_0000_0000, 1, false, CodeMode::Prot64), Err(SegmentFault::Gp));
+        assert_eq!(lin(Segment::Ss, flat, 0x0000_8000_0000_0000, 1, true, CodeMode::Prot64), Err(SegmentFault::Ss));
+        assert_eq!(lin(Segment::Es, flat, 0xffff_8000_0000_0000, 4, true, CodeMode::Prot64), Ok(0xffff_8000_0000_0000));
+        assert!(lin(Segment::Es, flat, 0x0000_8000_0000_0000, 1, true, CodeMode::Prot64).is_err());
+        assert_eq!(linearize(Segment::Es, flat, 0x0000_8000_0000_0000, 1, true, CodeMode::Prot64, 57), Ok(0x0000_8000_0000_0000));
+        // Elsewhere: 32 bits, the limit, the last byte within it.
+        let small = SegmentView { base: 0xffff_fff0, limit: 0xff, attributes: 0x93 };
+        assert_eq!(lin(Segment::Ds, small, 0x20, 1, false, CodeMode::Prot32), Ok(0x10));
+        assert!(lin(Segment::Ds, small, 0xff, 1, false, CodeMode::Prot32).is_ok());
+        assert_eq!(lin(Segment::Ds, small, 0xff, 2, false, CodeMode::Prot32), Err(SegmentFault::Gp));
+        assert_eq!(lin(Segment::Ds, small, 0x100, 1, false, CodeMode::Real), Err(SegmentFault::Gp));
+        assert_eq!(lin(Segment::Ss, small, 0x100, 1, false, CodeMode::Prot16), Err(SegmentFault::Ss));
+        // Not present; read-only data written; code written outside real
+        // mode; execute-only code read.
+        assert_eq!(lin(Segment::Es, SegmentView { attributes: 0x13, ..flat }, 0, 1, false, CodeMode::Prot32), Err(SegmentFault::Gp));
+        assert_eq!(lin(Segment::Es, SegmentView { attributes: 0xc091, ..flat }, 0, 1, true, CodeMode::Prot32), Err(SegmentFault::Gp));
+        assert_eq!(lin(Segment::Es, SegmentView { attributes: 0xc091, ..flat }, 0, 1, false, CodeMode::Prot32), Ok(0));
+        let code = SegmentView { attributes: 0xc09b, ..flat };
+        assert_eq!(lin(Segment::Cs, code, 0, 1, true, CodeMode::Prot32), Err(SegmentFault::Gp));
+        assert_eq!(lin(Segment::Cs, code, 0, 1, true, CodeMode::Real), Ok(0));
+        assert_eq!(lin(Segment::Cs, code, 0, 1, false, CodeMode::Prot32), Ok(0));
+        assert_eq!(lin(Segment::Cs, SegmentView { attributes: 0xc099, ..flat }, 0, 1, false, CodeMode::Prot32), Err(SegmentFault::Gp));
+        // Expand-down: above the limit, up to 64 KiB or 4 GiB by D.
+        let down = SegmentView { base: 0, limit: 0xfff, attributes: 0x97 };
+        assert_eq!(lin(Segment::Ds, down, 0xfff, 1, true, CodeMode::Prot16), Err(SegmentFault::Gp));
+        assert_eq!(lin(Segment::Ds, down, 0x1000, 1, true, CodeMode::Prot16), Ok(0x1000));
+        assert_eq!(lin(Segment::Ds, down, 0xffff, 2, true, CodeMode::Prot16), Err(SegmentFault::Gp));
+        assert_eq!(lin(Segment::Ds, SegmentView { attributes: 0x4097, ..down }, 0xffff, 2, true, CodeMode::Prot32), Ok(0xffff));
+        // "GenuineIntel"; "AuthenticAMD" is not.
+        assert!(guest_vendor_intel(0x756e_6547, 0x6c65_746e, 0x4965_6e69));
+        assert!(!guest_vendor_intel(0x6874_7541, 0x444d_4163, 0x6974_6e65));
     }
 
     #[test]
