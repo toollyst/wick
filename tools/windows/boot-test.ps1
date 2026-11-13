@@ -2195,6 +2195,33 @@ $GuestInterrupts = '$(awk ''/^intr/ {print $2}'' /proc/stat)'
 # 7), as a shell expression of three numbers.
 $GuestTxCounts = '$(cat /sys/class/net/eth0/statistics/tx_packets) $(cat /sys/class/net/eth0/statistics/tx_dropped) $(awk ''/^Udp:/ {n++; if (n == 2) print $7}'' /proc/net/snmp)'
 
+# The interrupts of eth0's own virtio device since the guest's boot, over
+# all its CPUs, as a shell expression (-1 when /proc/interrupts has no line
+# for it): virtio-mmio names its interrupt after the device, virtioN
+# (drivers/virtio/virtio_mmio.c, vm_find_vqs), the last directory of the
+# path /sys/class/net/eth0/device leads to.
+$GuestNetIrq = '$(d=$(cd /sys/class/net/eth0/device && pwd -P); awk -v d="${d##*/}" ''BEGIN {s = -1} $NF == d {if (s < 0) s = 0; for (i = 2; i < NF; i++) if ($i ~ /^[0-9]+$/) s += $i} END {print s}'' /proc/interrupts)'
+
+# The sum over the metrics lines Firecracker wrote to `path` past byte
+# `from` of each of the "net" object's counters below (each line holds what
+# a counter gained since the line before: SharedIncMetric's serialize,
+# src/vmm/src/logger/metrics.rs), and of tap_write_agg.sum_us.
+function Get-NetMetricsSince([string]$path, [long]$from) {
+    $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+    try {
+        $fs.Seek($from, 'Begin') | Out-Null
+        $text = (New-Object IO.StreamReader($fs)).ReadToEnd()
+    } finally { $fs.Close() }
+    $sum = [ordered]@{ lines = 0; tx_queue_event_count = 0; tx_packets_count = 0; tx_bytes_count = 0; no_tx_avail_buffer = 0; tx_rate_limiter_throttled = 0; tx_fails = 0; tap_write_us = 0 }
+    foreach ($m in (Get-MetricsLines $text)) {
+        if ($null -eq $m.net) { continue }
+        $sum['lines'] += 1
+        foreach ($k in @('tx_queue_event_count', 'tx_packets_count', 'tx_bytes_count', 'no_tx_avail_buffer', 'tx_rate_limiter_throttled', 'tx_fails')) { $sum[$k] += [long]$m.net.$k }
+        $sum['tap_write_us'] += [long]$m.net.tap_write_agg.sum_us
+    }
+    return $sum
+}
+
 # The rate at which `total` bytes the guest sends to the host's port 9 reach
 # the switch (bytes per second, between the first and the last datagram);
 # returns the bytes, the rate, and the guest's interrupts a second while it
@@ -2209,15 +2236,35 @@ $GuestTxCounts = '$(cat /sys/class/net/eth0/statistics/tx_packets) $(cat /sys/cl
 # endpoint drops a frame its connection cannot take: net.rs,
 # Endpoint::send); the largest gap between two datagrams and the time in
 # gaps over 1 ms tell one stall from a slow steady rate.
-function Get-NetTxRate($vm, $switch, [int]$total = 3MB) {
+#
+# The line also gives the interrupts of the guest's net device alone, and,
+# when `metrics` is the VM's metrics file, what the VMM counted over the
+# same send (a FlushMetrics before it and one after): the TX queue events
+# it handled (each a wake of its event loop for one guest notification or
+# more), the packets and bytes it wrote, the time those writes took, and
+# its no-buffer, throttle and failure counts. Packets to an event and
+# device interrupts to a packet tell a guest that notifies and is
+# interrupted once a packet (each notification an MMIO exit) from one that
+# batches.
+function Get-NetTxRate($vm, $switch, [int]$total = 3MB, [string]$metrics = '') {
+    $from = -1
+    if ($metrics) {
+        Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
+        $from = (Get-Item -LiteralPath $metrics).Length
+    }
     $sink = New-Object 'System.Collections.Generic.List[long[]]'
     $switch.Sink = $sink
-    $out = $vm.Sh("a=$GuestInterrupts; c=`"$GuestTxCounts`"; " + 'S=$(date +%s%N); ' + "head -c $total /dev/zero | socat -b 1400 -u - UDP:10.0.0.1:9; " +
-        "b=$GuestInterrupts; " + 'echo $((b - a)) $(( ($(date +%s%N) - S) / 1000 )) $c ' + $GuestTxCounts, 120000, $true)
+    $out = $vm.Sh("a=$GuestInterrupts; c=`"$GuestTxCounts`"; n=$GuestNetIrq; " + 'S=$(date +%s%N); ' + "head -c $total /dev/zero | socat -b 1400 -u - UDP:10.0.0.1:9; " +
+        "b=$GuestInterrupts; " + 'echo $((b - a)) $(( ($(date +%s%N) - S) / 1000 )) $c ' + $GuestTxCounts + ' $n ' + $GuestNetIrq, 120000, $true)
     $f = Get-Fields $out
     $irq = [long]$f[0] / [math]::Max([long]$f[1] / 1e6, 1e-6)
     Start-Sleep -Milliseconds 500
     $switch.Sink = $null
+    $vmm = $null
+    if ($from -ge 0) {
+        Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
+        $vmm = Get-NetMetricsSince $metrics $from
+    }
     $got = 0; $first = $null; $last = $null; $prev = $null
     $hz = [Diagnostics.Stopwatch]::Frequency
     $maxGap = 0; $longGaps = 0; $longTicks = 0
@@ -2234,10 +2281,16 @@ function Get-NetTxRate($vm, $switch, [int]$total = 3MB) {
     Check ($sink.Count -ge 2) "the host got $($sink.Count) datagrams of $total bytes sent"
     $secs = [math]::Max(($last[0] - $first[0]) / $hz, 1e-6)
     $rate = ($got - $first[1]) / $secs
-    if ($f.Count -ge 8) {
-        Write-Host ('  NETTX {0:N1} MiB/s: guest sent {1:N0} bytes in {2:N1} ms ({3:N0} packets to its driver, {4:N0} dropped by the driver, {5:N0} by its queue; {6:N0} interrupts); switch got {7:N0} datagrams, {8:N0} bytes, over {9:N1} ms; largest gap {10:N2} ms, {11:N0} gaps over 1 ms for {12:N1} ms' -f `
+    if ($f.Count -ge 10) {
+        $line = '  NETTX {0:N1} MiB/s: guest sent {1:N0} bytes in {2:N1} ms ({3:N0} packets to its driver, {4:N0} dropped by the driver, {5:N0} by its queue; {6:N0} interrupts, {7} of its net device); switch got {8:N0} datagrams, {9:N0} bytes, over {10:N1} ms; largest gap {11:N2} ms, {12:N0} gaps over 1 ms for {13:N1} ms' -f `
             ($rate / 1MB), $total, ([long]$f[1] / 1e3), ([long]$f[5] - [long]$f[2]), ([long]$f[6] - [long]$f[3]), ([long]$f[7] - [long]$f[4]), [long]$f[0],
-            $sink.Count, $got, ($secs * 1e3), ($maxGap * 1e3 / $hz), $longGaps, ($longTicks * 1e3 / $hz))
+            $(if ([long]$f[8] -ge 0 -and [long]$f[9] -ge 0) { '{0:N0}' -f ([long]$f[9] - [long]$f[8]) } else { 'none found' }),
+            $sink.Count, $got, ($secs * 1e3), ($maxGap * 1e3 / $hz), $longGaps, ($longTicks * 1e3 / $hz)
+        if ($null -ne $vmm) {
+            $line += '; VMM over {0} metrics lines: {1:N0} TX queue events, {2:N0} packets and {3:N0} bytes written in {4:N1} ms, {5:N0} without a buffer, {6:N0} throttled, {7:N0} failed' -f `
+                $vmm.lines, $vmm.tx_queue_event_count, $vmm.tx_packets_count, $vmm.tx_bytes_count, ($vmm.tap_write_us / 1e3), $vmm.no_tx_avail_buffer, $vmm.tx_rate_limiter_throttled, $vmm.tx_fails
+        }
+        Write-Host $line
     } else {
         Write-Host "  NETTX: the guest's counters did not parse: '$out'"
     }
@@ -2266,9 +2319,9 @@ function Get-NetRxRate($vm, $switch, [int]$seconds = 2) {
 # rx and tx bandwidth limiters set on the running device (PATCH): each
 # direction runs at the limit, and without one at three times it or more
 # (the counterpart of the macOS stage's net_rate_limiters).
-function Test-NetRateLimiters($vm, $switch) {
+function Test-NetRateLimiters($vm, $switch, [string]$metrics = '') {
     $mib = 1MB
-    $r = Get-NetTxRate $vm $switch
+    $r = Get-NetTxRate $vm $switch 3MB $metrics
     $txFree = $r[1]; $txIrq = $r[2]
     $r = Get-NetRxRate $vm $switch
     $rxFree = $r[0]; $rxIrq = $r[1]
@@ -2277,12 +2330,12 @@ function Test-NetRateLimiters($vm, $switch) {
     # PC at 81072df) would cost such a guest.
     Write-Host ('  NETIRQ unlimited: tx {0:N1} MiB/s with {1:N0} guest interrupts a second; rx {2:N1} MiB/s with {3:N0} a second' -f ($txFree / $mib), $txIrq, ($rxFree / $mib), $rxIrq)
     Invoke-Api $vm 'PATCH' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; tx_rate_limiter = $NetLimit }) | Out-Null
-    $r = Get-NetTxRate $vm $switch
+    $r = Get-NetTxRate $vm $switch 3MB $metrics
     $txGot = $r[0]; $tx = $r[1]
     Invoke-Api $vm 'PATCH' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; rx_rate_limiter = $NetLimit; tx_rate_limiter = $NoLimit }) | Out-Null
     $rx = (Get-NetRxRate $vm $switch)[0]
     Invoke-Api $vm 'PATCH' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; rx_rate_limiter = $NoLimit }) | Out-Null
-    $txAfter = (Get-NetTxRate $vm $switch)[1]
+    $txAfter = (Get-NetTxRate $vm $switch 3MB $metrics)[1]
     $summary = 'tx {0:N1} -> {1:N2} MiB/s, rx {2:N1} -> {3:N2} MiB/s at a 1 MiB/s limit; tx {4:N1} MiB/s once removed; guest interrupts a second unlimited: tx {5:N0}, rx {6:N0}' -f ($txFree / $mib), ($tx / $mib), ($rxFree / $mib), ($rx / $mib), ($txAfter / $mib), $txIrq, $rxIrq
     Check ($txGot -ge 1MB) "throttled tx: only $txGot bytes reached the host ($summary)"
     Check ($tx -ge 0.5 * $NetLimitBps -and $tx -le 1.25 * $NetLimitBps) "tx limiter: $summary"
@@ -2294,8 +2347,15 @@ function Test-NetRateLimiters($vm, $switch) {
 function Stage-Net {
     $endpoint = Get-SockPath 'n.ep'
     if (Test-Path $endpoint) { Remove-Item $endpoint -Force }
+    $dir = Join-Path $Results 'net'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    # For the NETTX lines' VMM counts; Firecracker opens it, it does not
+    # create it.
+    $metrics = Join-Path $dir 'metrics.json'
+    New-Item -ItemType File -Force -Path $metrics | Out-Null
     $cfg = Base-Config 2
     $cfg['network-interfaces'] = @([ordered]@{ iface_id = 'eth0'; host_dev_name = $endpoint; guest_mac = $GuestMac })
+    $cfg['metrics'] = [ordered]@{ metrics_path = $metrics }
     $vm = Start-Vm 'net' $cfg -Api
     try {
         $switch = New-Object Wick.Switch($endpoint, 10000)
@@ -2318,7 +2378,7 @@ function Stage-Net {
         Check ($out -match ' 0% packet loss') "ping -c 200 -i 0.01: $out"
         $out = $vm.Sh('echo udp-$((6*7)) | socat -t 3 - UDP:10.0.0.1:7')
         Check ($out -eq 'udp-42') "UDP echo '$out'"
-        $rates = Test-NetRateLimiters $vm $switch
+        $rates = Test-NetRateLimiters $vm $switch $metrics
         Save-Dmesg $vm 'net'
         $switch.Closing = $true
         $vm.Reboot()
