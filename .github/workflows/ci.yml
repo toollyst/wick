@@ -287,17 +287,28 @@ jobs:
       # thread stacks and kvm vcpu pages apart; Windows fails it on the
       # 5 MiB budget at 16. test_all_vcpus_online, which fails there too,
       # takes as many vCPUs as the host has processors, up to 32: on this
-      # runner that is a few (the table's vcpus column says how many).
+      # runner that is a few (the table's vcpus column says how many). The
+      # other five tests Windows fails on that budget are run for their
+      # rows as well. Run 43388798760's table had thread stacks and anon
+      # other at 0 and every anonymous mapping under file other: psutil
+      # names an anonymous mapping "[anon]", which the classifier now
+      # reads (its selftest runs first).
       - name: VMM memory by kind of mapping (informational)
         if: success() || failure()
         continue-on-error: true
         run: |
+          python3 -I tools/linux/integration/wick_memdiag.py selftest
           WICK_IT_MEMDIAG=1 tools/linux/integration-tests.sh wick "$RUNNER_TEMP/it/memdiag" -n 1 \
             integration_tests/functional/test_vsock.py::test_vsock_epipe \
             integration_tests/functional/test_vsock.py::test_vsock_transport_reset_h2g \
             integration_tests/functional/test_balloon.py::test_deflate_on_oom \
             integration_tests/functional/test_cpu_features_x86_64.py::test_cpuid \
-            integration_tests/functional/test_cpu_all.py::test_all_vcpus_online
+            integration_tests/functional/test_cpu_all.py::test_all_vcpus_online \
+            integration_tests/functional/test_cpu_all.py::test_all_vcpus_have_same_features \
+            integration_tests/functional/test_topology.py::test_cache_topology \
+            integration_tests/functional/test_hotplug.py::test_hotplug_max_devices \
+            integration_tests/functional/test_metrics.py::test_net_metrics \
+            integration_tests/functional/test_api.py::test_get_full_config_after_restoring_snapshot
           python3 -I tools/linux/integration/wick_memdiag.py summary \
             "$RUNNER_TEMP/it/memdiag/memory-peaks.jsonl" | tee -a "$GITHUB_STEP_SUMMARY"
       # Upstream's release.sh, which the tests build with, has no --locked.

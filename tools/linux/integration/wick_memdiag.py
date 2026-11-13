@@ -25,6 +25,13 @@ it was made of:
 - file other: other file mappings
 - vdso: [vdso], [vvar], [vsyscall]
 
+An anonymous mapping has no name in /proc/<pid>/smaps, and psutil gives it
+the path "[anon]" (psutil/_pslinux.py, memory_maps: `if not path: path =
+'[anon]'`), not an empty one. Until that was read here, every anonymous
+mapping was counted as "file other" and the two anonymous kinds were 0 (CI
+run 43388798760's table: thread stacks 0 with 16 vCPUs, file other growing
+by 18 KiB a vCPU in a static binary that maps no other file).
+
 Each microVM appends one JSON line to $WICK_MEMDIAG_OUT, with its number of
 vCPUs (a vCPU has a thread, whose stack is among the thread stacks, and a
 kvm_run mapping). The macOS harness
@@ -87,7 +94,7 @@ def classify(maps, exe):
             kind = "vdso"
         elif "kvm-vcpu" in path:
             kind = "kvm vcpu"
-        elif not path:
+        elif not path or path == "[anon]":
             kind = "thread stacks" if _range(m.addr)[0] in guard_ends else "anon other"
         else:
             kind = "file other"
@@ -199,7 +206,50 @@ def summary(path):
     return "\n".join(lines)
 
 
+def selftest():
+    """classify on mappings as psutil gives them on Linux (an anonymous
+    one named "[anon]"): each kind gets its own."""
+    from collections import namedtuple  # pylint: disable=import-outside-toplevel
+
+    Map = namedtuple("Map", "addr perms path rss")
+    kib = 1024
+    maps = [
+        Map("00400000-00500000", "r-xp", "/fc", 700 * kib),
+        Map("00500000-00510000", "rw-p", "/fc", 68 * kib),
+        Map("00600000-00700000", "rw-p", "[heap]", 8 * kib),
+        # A thread's stack above its guard, as musl's pthread_create maps it.
+        Map("7f0000000000-7f0000001000", "---p", "[anon]", 0),
+        Map("7f0000001000-7f0000201000", "rw-p", "[anon]", 20 * kib),
+        # An allocation with no guard below it.
+        Map("7f0001000000-7f0001100000", "rw-p", "[anon]", 100 * kib),
+        Map("7f0002000000-7f0002003000", "rw-s", "anon_inode:kvm-vcpu:0", 12 * kib),
+        Map("7f0003000000-7f0003001000", "r--p", "/some/file", 4 * kib),
+        Map("7ffd00000000-7ffd00100000", "rw-p", "[stack]", 300 * kib),
+        Map("7ffd00200000-7ffd00202000", "r-xp", "[vdso]", 8 * kib),
+    ]
+    got = classify(maps, "/fc")
+    want = {
+        "binary text": 700,
+        "binary data": 68,
+        "heap": 8,
+        "main stack": 300,
+        "thread stacks": 20,
+        "kvm vcpu": 12,
+        "anon other": 100,
+        "file other": 4,
+        "vdso": 8,
+    }
+    assert got == want, got
+    # An empty path, as /proc gives it, is anonymous too.
+    unnamed = [m._replace(path="") if m.path == "[anon]" else m for m in maps]
+    assert classify(unnamed, "/fc") == want
+    print("wick_memdiag: selftest ok")
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "selftest":
+        selftest()
+        sys.exit(0)
     if len(sys.argv) != 3 or sys.argv[1] != "summary":
-        sys.exit(f"usage: {sys.argv[0]} summary FILE")
+        sys.exit(f"usage: {sys.argv[0]} summary FILE | selftest")
     print(summary(sys.argv[2]))
