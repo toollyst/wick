@@ -2520,20 +2520,28 @@ function Stage-Cli {
         Check ($cpu -gt $parent -and $cpu -lt $parent + $wall * $ncpu) "process_startup_time_cpu_us $cpu (parent $parent, wall $wall us, $ncpu CPUs)"
         # The readers go away mid-run. On Linux Firecracker holds both FIFOs
         # open read-write and non-blocking (open_file_nonblock), so a write
-        # past a full pipe fails with EAGAIN; on Windows a write to a pipe
-        # whose reader left fails at once (ERROR_PIPE_NOT_CONNECTED, 233).
-        # Either way the line is lost and counted (upstream's logger and
-        # metrics: missed_log_count, missed_metrics_count, "Failed to write
-        # metrics"), and the microVM and the API go on.
+        # with no reader goes into the FIFO, and fails with EAGAIN only past
+        # its 64 KiB; a reader that opens the FIFO later reads what is in
+        # it. A Windows pipe ends with its reader (a write then fails with
+        # 232 or 233), so Firecracker keeps what it writes meanwhile, to
+        # the same 64 KiB, and gives it to the reader that makes the pipe
+        # again (overlay/vmm/ext/fifo.rs, wick_os::fifo). So FlushMetrics
+        # answers 204 here, as on Linux (Invoke-Api fails on anything else),
+        # and new readers of the two names get that metrics line and log
+        # lines of these requests.
         $mpipe.Close()
         $lpipe.Close()
         for ($i = 0; $i -lt 500; $i++) { Invoke-Api $vm 'GET' '/machine-config' | Out-Null }
         Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
+        $mpipe = New-Object Wick.PipeReader("$tag-metrics", $true, 65536)
+        $lpipe = New-Object Wick.PipeReader("$tag-log", $true, 65536)
+        Check ($mpipe.WaitFor('utc_timestamp_ms', 10000)) "the metrics pipe's new reader did not get the line flushed while there was none: '$($mpipe.Text)'"
+        Check ($lpipe.WaitFor('Get request on "/machine-config"', 10000)) "the log pipe's new reader did not get the lines written while there was none: '$($lpipe.Text)'"
         Wait-Shell $vm
         $out = $vm.Sh('echo after-$((6*7))')
         Check ($out -eq 'after-42' -and -not $vm.Exited) "after the pipes' readers went away: '$out' ($($vm.ExitReason()))"
         $vm.Reboot()
-        $done += "start time metrics $start us, $cpu CPU us (of $wall us); logger and metrics on named pipes, and the microVM goes on once their readers went"
+        $done += "start time metrics $start us, $cpu CPU us (of $wall us); logger and metrics on named pipes; once their readers went FlushMetrics answers 204, new readers get what was written meanwhile, and the microVM goes on"
         Write-Step $done[-1]
     } finally {
         $mpipe.Close(); $lpipe.Close()

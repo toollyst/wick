@@ -28,6 +28,8 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Networking_WinSock",
     # CreatePipe and CreateFileW (stdio's tests).
     "Win32_Security",
+    # GetSecurityInfo: the owner of a named pipe (fifo).
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_IO",

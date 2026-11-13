@@ -181,6 +181,11 @@ pub mod os {
     #[cfg(windows)]
     pub use wick_os::{fd, unix};
 
+    /// What a Linux FIFO does for its writer, on a named pipe
+    /// (`wick_os::fifo`): Firecracker's log, metrics and serial output.
+    #[cfg(windows)]
+    pub use wick_os::fifo;
+
     /// `std::os::raw`, with 64-bit `c_long` and `c_ulong` on Windows.
     #[cfg(windows)]
     pub mod raw {

@@ -43,6 +43,6 @@
 0041-windows-a-read-only-drive-syncs-as-fsync-on-Linux.patch
 0042-windows-the-dirty-dump-tests-write-in-hole-units-as-.patch
 0043-windows-the-compatibility-kvm-ioctls-logs-through-Fi.patch
-0044-macos-a-FIFO-for-the-log-metrics-or-serial-output-ho.patch
+0044-macos-windows-a-FIFO-for-the-log-metrics-or-serial-o.patch
 0045-vmm-a-vCPU-thread-is-the-host-s-to-prepare-when-it-i.patch
 0046-macos-the-descriptor-table-is-sized-to-what-the-proc.patch

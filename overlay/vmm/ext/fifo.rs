@@ -32,8 +32,20 @@
 //! own buffer behind. An orderly end (`exit`, the panic hook, upstream's
 //! signal handlers) drains it first ([`drain`]).
 //!
-//! Windows: Windows 2's half (agent-state/win2); until then the file
-//! itself, as before.
+//! Windows: the path names a pipe its reader made, and Firecracker is the
+//! pipe's client. Such a pipe ends with its reader, and a write to it then
+//! fails (os error 232 or 233), which a Linux FIFO held read-write never
+//! does. So `OutFile` writes into the reader's pipe directly while it
+//! lives and has room, and keeps what it does not take, and everything
+//! once the reader has gone, in an overflow of 65536 bytes less what the
+//! live pipe holds; past that writes fail as Linux's do; a thread moves the
+//! overflow into the pipe as its reader makes room, and into the pipe a
+//! new reader makes under the same name, if its owner is the first's. The
+//! rules, the pipe and the thread are `wick_os::fifo` (`std::os::fifo`
+//! here), where their tests are; this file has only the type. Left to
+//! Windows: bytes a reader left unread in its pipe end with that pipe, and
+//! the overflow is lost at an abrupt end, as on macOS. Windows has no fork
+//! ([`before_fork`] and [`after_fork`] do nothing there).
 
 /// How long the orderly drain waits for a reader that holds the FIFO open
 /// and takes nothing, and for a lock another thread holds (Linux's end does
@@ -41,13 +53,13 @@
 /// adds on macOS).
 pub const DRAIN_STALL: std::time::Duration = std::time::Duration::from_secs(1);
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 /// The file itself: Linux's FIFO is what upstream expects.
 pub type OutFile = std::fs::File;
 
 /// Moves what Firecracker still holds for a FIFO's reader into the FIFO
 /// before an orderly end. Nothing to do where the file is the FIFO itself.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn drain() {}
 
 /// Called before a `fork`: no thread of this module's to stop where the
@@ -66,9 +78,105 @@ pub fn after_fork(_in_child: bool) -> std::io::Result<()> {
 
 /// `file` as an [`OutFile`] written directly, whatever it is (tests that
 /// write to a file they opened themselves).
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn plain(file: std::fs::File) -> OutFile {
     file
+}
+
+#[cfg(windows)]
+pub use windows::{OutFile, drain, plain};
+
+#[cfg(windows)]
+mod windows {
+    use std::fs::File;
+    use std::io::{self, Write};
+    use std::os::fifo::{OutPipe, PIPE_BUF};
+    use std::path::Path;
+
+    use vm_memory::bitmap::BitmapSlice;
+    use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
+
+    /// Where Firecracker's log, metrics and serial output go.
+    #[derive(Debug)]
+    pub struct OutFile(Kind);
+
+    #[derive(Debug)]
+    enum Kind {
+        /// A regular file or device: written directly, as upstream does.
+        File(File),
+        /// A named pipe, with its overflow.
+        Pipe(OutPipe),
+    }
+
+    impl OutFile {
+        /// `file` as upstream opened `path` (for reading and writing,
+        /// created if missing): a pipe gets its overflow, anything else is
+        /// written directly.
+        pub fn opened(file: File, path: &Path) -> io::Result<OutFile> {
+            Ok(OutFile(match OutPipe::from_file(file, path)? {
+                Ok(pipe) => Kind::Pipe(pipe),
+                Err(file) => Kind::File(file),
+            }))
+        }
+
+        fn write_any(&self, buf: &[u8]) -> io::Result<usize> {
+            match &self.0 {
+                Kind::File(f) => (&*f).write(buf),
+                Kind::Pipe(p) => p.write(buf),
+            }
+        }
+    }
+
+    /// `file` as an [`OutFile`] written directly, whatever it is (tests
+    /// that write to a file they opened themselves).
+    pub fn plain(file: File) -> OutFile {
+        OutFile(Kind::File(file))
+    }
+
+    /// Moves what Firecracker still holds for each pipe's reader into its
+    /// pipe before an orderly end (the panic hook; a return from `main`
+    /// runs it through the C runtime's `atexit`, `wick_os::fifo`).
+    pub fn drain() {
+        std::os::fifo::drain();
+    }
+
+    impl Write for &OutFile {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_any(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            match &self.0 {
+                Kind::File(f) => (&*f).flush(),
+                Kind::Pipe(_) => Ok(()),
+            }
+        }
+    }
+
+    impl Write for OutFile {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_any(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            (&*self).flush()
+        }
+    }
+
+    impl WriteVolatile for OutFile {
+        fn write_volatile<B: BitmapSlice>(&mut self, buf: &VolatileSlice<B>) -> Result<usize, VolatileMemoryError> {
+            match &mut self.0 {
+                Kind::File(f) => f.write_volatile(buf),
+                Kind::Pipe(p) => {
+                    // At most PIPE_BUF at a time, through a buffer of ours.
+                    let mut bytes = [0u8; PIPE_BUF];
+                    let n = buf.len().min(PIPE_BUF);
+                    let n = buf.subslice(0, n)?.copy_to(&mut bytes[..n]);
+                    p.write(&bytes[..n]).map_err(VolatileMemoryError::IOError)
+                }
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

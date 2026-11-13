@@ -13,6 +13,11 @@
 #[cfg(unix)]
 pub use std::os::{fd, unix};
 
+// What a Linux FIFO does for its writer, on a Windows named pipe: Windows'
+// alone, built for tests on every host (its rules have no Windows call).
+#[cfg(any(windows, test))]
+pub mod fifo;
+
 #[cfg(windows)]
 pub mod windows;
 #[cfg(windows)]

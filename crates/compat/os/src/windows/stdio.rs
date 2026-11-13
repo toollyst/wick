@@ -347,15 +347,22 @@ unsafe extern "system" {
 /// of a pipe that holds a page. The compatibility libc's `write` has the
 /// same rule.
 fn pipe_atom(h: HANDLE) -> usize {
+    PIPE_BUF.min(pipe_quota(h).unwrap_or(PIPE_BUF))
+}
+
+/// What the pipe `h` writes to holds at most, in bytes: the quota of the
+/// queue this end writes to (see [`pipe_atom`]); `None` for a handle that
+/// cannot be asked.
+pub(crate) fn pipe_quota(h: HANDLE) -> Option<usize> {
     let (mut io, mut info) = ([0usize; 2], [0u32; 10]);
     // SAFETY: a pipe handle and out-buffers of the sizes given (class 24,
     // FilePipeLocalInformation, 40 bytes).
     if unsafe { NtQueryInformationFile(h, &mut io, info.as_mut_ptr().cast(), 40, 24) } != 0 {
-        return PIPE_BUF;
+        return None;
     }
     // NamedPipeEnd: FILE_PIPE_SERVER_END is 1.
     let quota = if info[9] == 1 { info[6] } else { info[4] };
-    PIPE_BUF.min(usize::try_from(quota).unwrap_or(usize::MAX))
+    Some(usize::try_from(quota).unwrap_or(usize::MAX))
 }
 
 /// Writes to `h`, a pipe or a file, with Linux's results (see [`Stdout`]).

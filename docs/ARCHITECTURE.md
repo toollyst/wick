@@ -205,6 +205,15 @@ semantics on Win32. The details are in the comments of each
   and macOS). `print!`/`println!` keep std's own buffer, so they interleave
   with it by line; its buffer is not flushed at exit, where std's is. Libtest
   writes through std's, so the unit-test checker still gives tests a file.
+  A named pipe given for the log, the metrics or a serial device's output
+  is `wick_os::fifo`'s (`std::os::fifo`; overlay/vmm/ext/fifo.rs holds the
+  type upstream's writers take): a Linux FIFO held read-write takes writes
+  with no reader and holds 64 KiB, where a Windows pipe ends with its
+  reader and holds what the reader gave it, so what the pipe does not take
+  waits in the process, up to 64 KiB with the pipe's own, for that reader
+  or the next of the name (`test_a_pipe_whose_reader_left_takes_writes_as_a_fifo_does`,
+  `test_a_new_reader_of_the_name_gets_what_was_written_meanwhile`; its
+  rules have no Windows call and their tests run on every host).
   `std::fs`'s opening calls (`OpenOptions::open`, `read`, `write`, `copy`,
   `read_dir`, ...) fail with `EMFILE` past the jail's `no-file` limit, as the
   compat libc's descriptor calls do (`libc::wick_nofile`: a count of the
