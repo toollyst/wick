@@ -503,10 +503,7 @@ function Stage-Daemonize {
         # Two processes of the binary run the jail, Firecracker and its API
         # process (`api`); Firecracker is the one without the API process's
         # whole mitigation profile (no dynamic code policy before a guest).
-        $procs = @(Get-Process firecracker | Where-Object { $_.Path -like "$root*" })
-        Check ($procs.Count -eq 2) "processes of the jail's binary: $($procs.Count) (expected Firecracker and its API process)"
-        $fcp = $procs | Where-Object { (Get-Mitigations $_.Id).DynamicCode -eq 0 } | Select-Object -First 1
-        Check ($null -ne $fcp) 'no detached Firecracker (both processes of the binary carry the API profile)'
+        $fcp = Get-JailFirecracker $root
         $pidFile = Join-Path $root 'firecracker.exe.pid'
         Check (Test-Path $pidFile) 'no pid file'
         $written = [int](Get-Content $pidFile)
@@ -532,6 +529,28 @@ function Get-Mitigations([int]$id) {
     $m = @{}
     foreach ($kv in ($line -split ' ' | Where-Object { $_ -match '=' })) { $k, $v = $kv -split '='; $m[$k] = [Convert]::ToInt32($v, 16) }
     $m
+}
+
+# The jailed Firecracker of the jail at `root`, of the two processes of the
+# binary there (Firecracker and its API process, `api`): the one without the
+# API process's whole mitigation profile (no dynamic code policy before a
+# guest). The API process sets that profile itself once Firecracker has
+# linked to it (vmm::ext::api_process, sandbox::apply_api), after both run
+# and after the API socket exists (Firecracker binds it and hands it over):
+# until then neither has the policy, and taking "the first without it" took
+# the API process on CI (run 43428124115, pidns: "the pid file holds 9040,
+# Firecracker is 7240"). So this waits, up to 10 s, until exactly one has it.
+function Get-JailFirecracker([string]$root) {
+    $t = [DateTime]::Now.AddSeconds(10)
+    while ($true) {
+        $procs = @(Get-Process firecracker -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$root*" })
+        $plain = @($procs | Where-Object { (Get-Mitigations $_.Id).DynamicCode -eq 0 })
+        if ($procs.Count -eq 2 -and $plain.Count -eq 1) { return $plain[0] }
+        if ([DateTime]::Now -ge $t) {
+            Check $false "the jail's Firecracker and its API process are not told apart after 10 s: $($procs.Count) processes of the binary in $root, $($plain.Count) without the dynamic code policy ($(@($procs | ForEach-Object { "$($_.Id) DynamicCode=$((Get-Mitigations $_.Id).DynamicCode)" }) -join ', '))"
+        }
+        Start-Sleep -Milliseconds 100
+    }
 }
 
 function Get-Probe {
@@ -1131,8 +1150,7 @@ function Stage-Pidns {
         Check ($code -eq 0) "--new-pid-ns: the jailer exited $code (-1: did not return)"
         $root = Join-Path $base 'firecracker.exe\ns\root'
         # Firecracker, not its API process (which has the whole profile, ACG among it).
-        $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$root*" -and (Get-Mitigations $_.Id).DynamicCode -eq 0 } | Select-Object -First 1
-        Check ($null -ne $fcp) '--new-pid-ns: Firecracker is not running after the jailer returned'
+        $fcp = Get-JailFirecracker $root
         $written = [int](Get-Content (Join-Path $root 'firecracker.exe.pid'))
         Check ($written -eq $fcp.Id) "--new-pid-ns: the pid file holds $written, Firecracker is $($fcp.Id)"
         $sock = Join-Path $root 'run\firecracker.socket'
