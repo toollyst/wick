@@ -10,6 +10,7 @@ arguments, memory size, network interface and work.
 
   sudo tools/linux/guest-ram-record.py [--tap NAME] FIRECRACKER WORKDIR [VCPUS ...]
   sudo tools/linux/guest-ram-record.py --snapshot FIRECRACKER WORKDIR
+  sudo tools/linux/guest-ram-record.py --apic FIRECRACKER WORKDIR
   tools/linux/guest-ram-record.py --selftest
 
 WORKDIR is tools/linux/boot-test.sh's --workdir (the kernel and rootfs are
@@ -30,6 +31,23 @@ whether huge_pages "None" faults its guest memory in 4 KiB pages ("madvise",
 "never", an anonymous fault is one 4 KiB page, the grain FIRSTTOUCH's
 per-page cost on Windows is set against. A record: it fails only when a
 guest does not boot to its shell.
+
+With --apic it prints GUESTAPIC lines instead, for the choice between the
+two ways to give a Windows guest KVM's x2APIC (COMPATIBILITY.md's x2APIC
+cell, options E and C): what the same guest writes to its local APIC's
+timer and how many #GPs KVM gives it, counted by KVM's own tracepoints
+(v6.1 arch/x86/kvm/trace.h:255 kvm_apic for each write of the LVT timer
+entry, register 0x320, which lapic.c:2098 kvm_lapic_reg_write traces;
+:422 kvm_msr for each write of IA32_TSC_DEADLINE, 0x6e0; :366
+kvm_inj_exception for each #GP, vector 13, KVM injects) in the host's tracefs, for 1, 2 and 16 vCPUs: over the
+boot to the shell, over 10 s of the idle shell and over GUEST_WORK, as
+counts and a second. Option E's exits are the LVT timer writes that select
+TSC-deadline mode, or every #GP where it needs #GP in the exception
+bitmap; Linux writes the entry at a CPU's bring-up and at each change of
+its clock event device out of the stopped state (kernel/time/
+tick-oneshot.c tick_program_event, arch/x86/kernel/apic/apic.c
+lapic_timer_set_oneshot and lapic_timer_shutdown). The events are the
+host's, for every guest it runs: the record runs nothing else.
 
 With --snapshot it prints GUESTSNAP lines instead: what the host's reads of
 guest memory for a snapshot charge, and what a restore from the snapshot's
@@ -253,6 +271,82 @@ def run_case(fc, workdir, work, huge, vcpus, tap, n):
                     time.sleep(0.1)
 
 
+TRACEFS = "/sys/kernel/tracing"
+# Each event the --apic record counts: its tracefs directory, its filter,
+# and its name in the lines.
+APIC_EVENTS = (("kvm/kvm_apic", "rw == 1 && reg == 800", "LVT timer writes"),
+               ("kvm/kvm_msr", "write == 1 && ecx == 0x6e0", "TSC_DEADLINE writes"),
+               ("kvm/kvm_inj_exception", "exception == 13", "#GPs injected"))
+
+
+def trace_counts(text):
+    """The events of each of APIC_EVENTS in tracefs `trace` text, by the
+    event's name in its lines ("kvm_apic:" and so on)."""
+    counts = {}
+    for directory, _, name in APIC_EVENTS:
+        event = directory.split("/")[1] + ":"
+        counts[name] = sum(1 for line in text.splitlines() if not line.startswith("#") and f" {event} " in line)
+    return counts
+
+
+def trace_take():
+    """The counts since the last take, and the trace buffer emptied."""
+    with open(f"{TRACEFS}/trace", "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    with open(f"{TRACEFS}/trace", "w", encoding="utf-8") as f:
+        f.write("")
+    return trace_counts(text)
+
+
+def trace_set(on):
+    for directory, condition, _ in APIC_EVENTS:
+        with open(f"{TRACEFS}/events/{directory}/filter", "w", encoding="utf-8") as f:
+            f.write(condition if on else "0")
+        with open(f"{TRACEFS}/events/{directory}/enable", "w", encoding="utf-8") as f:
+            f.write("1" if on else "0")
+
+
+def apic_text(counts, seconds):
+    return "; ".join(f"{name} {n} ({n / seconds:.1f} a second)" for name, n in counts.items())
+
+
+def apic_case(fc, workdir, work, vcpus, n):
+    """The GUESTAPIC lines of one guest; False when it does not boot to its
+    shell."""
+    config = {"boot-source": {"kernel_image_path": os.path.join(workdir, KERNEL), "boot_args": BOOT_ARGS},
+              "drives": [{"drive_id": "rootfs", "path_on_host": os.path.join(workdir, ROOTFS),
+                          "is_root_device": True, "is_read_only": True}],
+              "machine-config": {"vcpu_count": vcpus, "mem_size_mib": GUEST_MIB}}
+    path = os.path.join(work, f"apic-config-{n}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f)
+    tag = f"GUESTAPIC vcpus={vcpus}"
+    out = os.path.join(work, f"apic-serial-{n}.txt")
+    trace_take()
+    started = time.monotonic()
+    with open(out, "wb") as console_file:
+        proc = subprocess.Popen([fc, "--no-api", "--config-file", path], stdin=subprocess.PIPE,
+                                stdout=console_file, stderr=subprocess.STDOUT)
+    try:
+        console = Console(proc, out)
+        if not console.wait(r"WICK-42-UP", 300, again="echo WICK-$((6*7))-UP"):
+            print(f"{tag}: no shell (exit {proc.poll()})")
+            return False
+        took = time.monotonic() - started
+        print(f"{tag} the boot to the shell ({took:.1f} s): {apic_text(trace_take(), took)}")
+        time.sleep(10)
+        print(f"{tag} the idle shell (10 s): {apic_text(trace_take(), 10.0)}")
+        started = time.monotonic()
+        console.send(GUEST_WORK)
+        worked = console.wait(r"WICK-42-WORKED", 120)
+        took = time.monotonic() - started
+        print(f"{tag} GUEST_WORK ({took:.1f} s{'' if worked else ', not finished'}): {apic_text(trace_take(), took)}")
+        return True
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 def snapshot_mappings(smaps, path):
     """The guest memory's mappings in an smaps text: the anonymous ones of at
     least GUEST_MIB and those of the file `path` (a restored guest's):
@@ -465,12 +559,40 @@ def selftest():
         assert mthp_sizes(thp) == ("16kB always inherit madvise [never], 64kB always [inherit] madvise never, "
                                    "2048kB [always] inherit madvise never"), mthp_sizes(thp)
     assert mthp_sizes("/nonexistent-thp") == "(no mTHP sizes: not read)"
+    trace = ("# tracer: nop\n"
+             "   fc_vcpu 0-4211  [003] ..... 12.5: kvm_apic: apic_write APIC_LVTT = 0x400ec\n"
+             "   fc_vcpu 0-4211  [003] ..... 12.6: kvm_msr: msr_write 6e0 = 0x1234\n"
+             "   fc_vcpu 1-4212  [001] ..... 12.7: kvm_msr: msr_write 6e0 = 0x1240\n"
+             "   fc_vcpu 1-4212  [001] ..... 12.8: kvm_inj_exception: #GP (0x0)\n")
+    assert trace_counts(trace) == {"LVT timer writes": 1, "TSC_DEADLINE writes": 2, "#GPs injected": 1}, trace_counts(trace)
+    assert apic_text({"LVT timer writes": 5}, 10.0) == "LVT timer writes 5 (0.5 a second)"
     print("guest-ram-record.py: selftest ok")
 
 
 def main(args):
     if args == ["--selftest"]:
         selftest()
+        return
+    if args[:1] == ["--apic"]:
+        if len(args) != 3:
+            sys.exit(__doc__)
+        fc, workdir = os.path.abspath(args[1]), os.path.abspath(args[2])
+        model = next((line.split(":", 1)[1].strip() for line in read("/proc/cpuinfo", "").splitlines()
+                      if line.startswith("model name")), "(not read)")
+        print(f"GUESTAPIC host: Linux {platform.release()}; {model}; kvm_intel enable_apicv "
+              f"{read('/sys/module/kvm_intel/parameters/enable_apicv')}, kvm_amd avic "
+              f"{read('/sys/module/kvm_amd/parameters/avic')}; "
+              f"{subprocess.run([fc, '--version'], capture_output=True, text=True).stdout.splitlines()[0]}")
+        with open(f"{TRACEFS}/buffer_size_kb", "w", encoding="utf-8") as f:
+            f.write("16384")
+        trace_set(True)
+        try:
+            with tempfile.TemporaryDirectory(prefix="guest-apic-") as work:
+                for n, vcpus in enumerate((1, 2, 16)):
+                    if not apic_case(fc, workdir, work, vcpus, n):
+                        sys.exit("GUESTAPIC: a guest did not boot to its shell")
+        finally:
+            trace_set(False)
         return
     if args[:1] == ["--snapshot"]:
         if len(args) != 3:

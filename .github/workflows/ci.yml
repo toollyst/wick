@@ -205,7 +205,8 @@ jobs:
       # Then, under the runner's own setting, what a 1 GiB guest that touched
       # 64 MiB is charged after a full and a diff snapshot, and what a
       # restore from the full snapshot's file is charged (anon and the page
-      # cache, in a cgroup each; GUESTSNAP lines; VMMSNAP in the windows job).
+      # cache, in a cgroup each; GUESTSNAP lines; VMMSNAP in the windows job),
+      # and the guest's LVT timer writes and #GPs (GUESTAPIC lines).
       - name: Guest RAM by the host's THP setting (records)
         run: |
           python3 -I tools/linux/guest-ram-record.py --selftest
@@ -228,6 +229,12 @@ jobs:
           echo "$was" | sudo tee "$thp" >/dev/null
           sudo python3 -I tools/linux/guest-ram-record.py --snapshot "$fc" "$RUNNER_TEMP/boot-test" \
             || echo "::warning::guest-ram-record.py --snapshot did not finish"
+          # The same guest's LVT timer writes, TSC_DEADLINE writes and the
+          # #GPs KVM injects, by KVM's tracepoints, over the boot, the idle
+          # shell and GUEST_WORK (GUESTAPIC lines): the rate option E of
+          # the Windows x2APIC cell would exit at.
+          sudo python3 -I tools/linux/guest-ram-record.py --apic "$fc" "$RUNNER_TEMP/boot-test" \
+            || echo "::warning::guest-ram-record.py --apic did not finish"
           sudo rmdir /sys/fs/cgroup/wick-grain || true
           sudo ip link del wickgr0
       # A host without /dev/nitro_enclaves: the start of an enclave is refused,

@@ -2186,38 +2186,47 @@ $NetLimit = [ordered]@{ bandwidth = [ordered]@{ size = 128KB; refill_time = 125 
 $NetLimitBps = 128KB * 1000 / 125
 $NoLimit = [ordered]@{ bandwidth = [ordered]@{ size = 0; refill_time = 0 } }
 
+# The guest's interrupts since its boot (/proc/stat's intr total), as a
+# shell expression.
+$GuestInterrupts = '$(awk ''/^intr/ {print $2}'' /proc/stat)'
+
 # The rate at which `total` bytes the guest sends to the host's port 9 reach
 # the switch (bytes per second, between the first and the last datagram);
-# returns the bytes and the rate.
+# returns the bytes, the rate, and the guest's interrupts a second while it
+# sent (/proc/stat, over the send's own time).
 function Get-NetTxRate($vm, $switch, [int]$total = 3MB) {
     $sink = New-Object 'System.Collections.Generic.List[long[]]'
     $switch.Sink = $sink
-    $vm.Sh("head -c $total /dev/zero | socat -b 1400 -u - UDP:10.0.0.1:9", 120000, $true) | Out-Null
+    $out = $vm.Sh("a=$GuestInterrupts; " + 'S=$(date +%s%N); ' + "head -c $total /dev/zero | socat -b 1400 -u - UDP:10.0.0.1:9; " +
+        "b=$GuestInterrupts; " + 'echo $((b - a)) $(( ($(date +%s%N) - S) / 1000 ))', 120000, $true)
+    $f = Get-Fields $out
+    $irq = [long]$f[0] / [math]::Max([long]$f[1] / 1e6, 1e-6)
     Start-Sleep -Milliseconds 500
     $switch.Sink = $null
     $got = 0; $first = $null; $last = $null
     foreach ($e in @($sink.ToArray())) { $got += $e[1]; if ($null -eq $first) { $first = $e }; $last = $e }
     Check ($sink.Count -ge 2) "the host got $($sink.Count) datagrams of $total bytes sent"
     $secs = [math]::Max(($last[0] - $first[0]) / [Diagnostics.Stopwatch]::Frequency, 1e-6)
-    return @($got, (($got - $first[1]) / $secs))
+    return @($got, (($got - $first[1]) / $secs), $irq)
 }
 
 # The guest's receive rate (its rx_bytes over `seconds`) while the host
-# floods it with UDP to port 9 (bytes per second).
+# floods it with UDP to port 9 (bytes per second), and its interrupts a
+# second over the same time (/proc/stat).
 function Get-NetRxRate($vm, $switch, [int]$seconds = 2) {
     $mac = [byte[]]($GuestMac -split ':' | ForEach-Object { [Convert]::ToByte($_, 16) })
     $switch.StartFlood($mac)
     try {
         Start-Sleep -Milliseconds 500  # past the bucket's first, full, budget
-        $out = $vm.Sh('a=$(cat /sys/class/net/eth0/statistics/rx_bytes); S=$(date +%s%N); ' +
-            "sleep $seconds; " + 'b=$(cat /sys/class/net/eth0/statistics/rx_bytes); echo $((b - a)) $(( ($(date +%s%N) - S) / 1000 ))', 60000, $true)
+        $out = $vm.Sh("i=$GuestInterrupts; " + 'a=$(cat /sys/class/net/eth0/statistics/rx_bytes); S=$(date +%s%N); ' +
+            "sleep $seconds; j=$GuestInterrupts; " + 'b=$(cat /sys/class/net/eth0/statistics/rx_bytes); echo $((b - a)) $(( ($(date +%s%N) - S) / 1000 )) $((j - i))', 60000, $true)
     } finally {
         $sent = $switch.StopFlood()
     }
     $f = Get-Fields $out
     $got = [long]$f[0]; $us = [long]$f[1]
     Check ($sent -gt $got) "host flood sent $sent bytes, guest counted $got"
-    return $got / ($us / 1e6)
+    return @(($got / ($us / 1e6)), ([long]$f[2] / ($us / 1e6)))
 }
 
 # rx and tx bandwidth limiters set on the running device (PATCH): each
@@ -2225,16 +2234,22 @@ function Get-NetRxRate($vm, $switch, [int]$seconds = 2) {
 # (the counterpart of the macOS stage's net_rate_limiters).
 function Test-NetRateLimiters($vm, $switch) {
     $mib = 1MB
-    $txFree = (Get-NetTxRate $vm $switch)[1]
-    $rxFree = Get-NetRxRate $vm $switch
+    $r = Get-NetTxRate $vm $switch
+    $txFree = $r[1]; $txIrq = $r[2]
+    $r = Get-NetRxRate $vm $switch
+    $rxFree = $r[0]; $rxIrq = $r[1]
+    # The guest's interrupts a second under net load, unlimited: what
+    # option C (an EOI through the backend, about 9.5 us more each on the
+    # PC at 81072df) would cost such a guest.
+    Write-Host ('  NETIRQ unlimited: tx {0:N1} MiB/s with {1:N0} guest interrupts a second; rx {2:N1} MiB/s with {3:N0} a second' -f ($txFree / $mib), $txIrq, ($rxFree / $mib), $rxIrq)
     Invoke-Api $vm 'PATCH' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; tx_rate_limiter = $NetLimit }) | Out-Null
     $r = Get-NetTxRate $vm $switch
     $txGot = $r[0]; $tx = $r[1]
     Invoke-Api $vm 'PATCH' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; rx_rate_limiter = $NetLimit; tx_rate_limiter = $NoLimit }) | Out-Null
-    $rx = Get-NetRxRate $vm $switch
+    $rx = (Get-NetRxRate $vm $switch)[0]
     Invoke-Api $vm 'PATCH' '/network-interfaces/eth0' ([ordered]@{ iface_id = 'eth0'; rx_rate_limiter = $NoLimit }) | Out-Null
     $txAfter = (Get-NetTxRate $vm $switch)[1]
-    $summary = 'tx {0:N1} -> {1:N2} MiB/s, rx {2:N1} -> {3:N2} MiB/s at a 1 MiB/s limit; tx {4:N1} MiB/s once removed' -f ($txFree / $mib), ($tx / $mib), ($rxFree / $mib), ($rx / $mib), ($txAfter / $mib)
+    $summary = 'tx {0:N1} -> {1:N2} MiB/s, rx {2:N1} -> {3:N2} MiB/s at a 1 MiB/s limit; tx {4:N1} MiB/s once removed; guest interrupts a second unlimited: tx {5:N0}, rx {6:N0}' -f ($txFree / $mib), ($tx / $mib), ($rxFree / $mib), ($rx / $mib), ($txAfter / $mib), $txIrq, $rxIrq
     Check ($txGot -ge 1MB) "throttled tx: only $txGot bytes reached the host ($summary)"
     Check ($tx -ge 0.5 * $NetLimitBps -and $tx -le 1.25 * $NetLimitBps) "tx limiter: $summary"
     Check ($rx -ge 0.5 * $NetLimitBps -and $rx -le 1.25 * $NetLimitBps) "rx limiter: $summary"
