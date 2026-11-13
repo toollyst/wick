@@ -286,9 +286,9 @@ jobs:
             integration_tests/functional/test_vsock.py::test_vsock_transport_reset_h2g \
             integration_tests/functional/test_balloon.py::test_deflate_on_oom \
             integration_tests/functional/test_cpu_features_x86_64.py::test_cpuid \
-            integration_tests/functional/test_cpu_all.py::test_all_vcpus_online || true
+            integration_tests/functional/test_cpu_all.py::test_all_vcpus_online
           python3 -I tools/linux/integration/wick_memdiag.py summary \
-            "$RUNNER_TEMP/it/memdiag/memory-peaks.jsonl" | tee -a "$GITHUB_STEP_SUMMARY" || true
+            "$RUNNER_TEMP/it/memdiag/memory-peaks.jsonl" | tee -a "$GITHUB_STEP_SUMMARY"
       # Upstream's release.sh, which the tests build with, has no --locked.
       - name: The build kept Cargo.lock
         if: always()

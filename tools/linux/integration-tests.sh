@@ -71,9 +71,15 @@ for name in "${ARTIFACTS[@]}"; do
 done
 art="$(cd "$art" && pwd)"
 
+# The tests run as root in the container and leave their results root's
+# (each microVM's metrics.json in a directory of its own): given back with
+# the rest, so that the next run on this tree can remove them. Without it a
+# second run on a tree stopped at its `rm -rf` of them with "Permission
+# denied" (CI run 43380840011, the memory step after the counted wick run:
+# 395 files, no test run).
 devctr() {
     "$WICK_ROOT/tools/linux/devctr.sh" -v "$out" -v "$art" -w "$tree" \
-        --chown "$out" --chown "$art" --chown "$tree/build" "$@"
+        --chown "$out" --chown "$art" --chown "$tree/build" --chown "$tree/test_results" "$@"
 }
 mkdir -p "$tree/build"
 if [[ ! -e "$art/.setup-done" ]]; then
