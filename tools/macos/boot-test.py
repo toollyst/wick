@@ -322,31 +322,18 @@ class Vm:
         except subprocess.TimeoutExpired:
             raise Failure(f"VMM did not exit within {timeout}s ({self.exit_reason()})")
 
-    # What the guest kernel reports when its health fails (Linux v6.1, the
-    # guest's): an RCU stall (`rcu: INFO`, `self-detected stall`), a soft
-    # lockup, a hung task, a BUG, an oops; a WARN()'s report, "WARNING: CPU:
-    # <n> PID: <pid> at ..." (kernel/panic.c `__warn`, both of its forms);
-    # the stack dump each of those prints, arm64's "Call trace:"
-    # (arch/arm64/kernel/stacktrace.c `dump_backtrace`; x86's is "Call
-    # Trace:"); and the three other "WARNING:" lines the guest kernel has
-    # (its strings) that a VMM's fault prints: boot registers x1-x3 not zero
-    # (arch/arm64/kernel/setup.c `setup_arch`), a timer interrupt the device
-    # tree gives a bad trigger (drivers/clocksource/arm_arch_timer.c
-    # `check_ppi_trigger`: "arch_timer: WARNING: Invalid trigger" and "Please
-    # fix your firmware"), and CPU masks that disagree (kernel/workqueue.c
-    # `wq_calc_node_cpumask`). Not any line with "WARNING:" in it: the
-    # kernel's own notices use the word too, as arm64's Spectre-BHB notice
-    # on unprivileged eBPF (arch/arm64/kernel/proton-pack.c, "WARNING: %s"),
-    # or x86's SRSO notice under KVM on an AMD host, which boot-test.ps1
-    # met; the guest's EFI and file system notices cannot appear here (no
-    # EFI, a squashfs root).
-    HEALTH = ("rcu: INFO|self-detected stall|soft lockup|hung_task|BUG:|Oops|WARNING: CPU:|Call trace:"
-              "|WARNING: x1-x3 nonzero|arch_timer: WARNING:|WARNING: workqueue cpumask")
+    # What the guest kernel reports when its health fails: the patterns of
+    # tools/guest-health.txt for an aarch64 guest, which also says where the
+    # kernel prints each, and why a line with "WARNING:" alone is not one.
+    HEALTH = None
 
     def healthy(self):
         """Fails if the guest kernel logged a stall, a BUG, an oops or a
-        warning (HEALTH)."""
-        _, out = self.sh(f"dmesg | grep -E '{self.HEALTH}' | head -5; true")
+        warning (tools/guest-health.txt)."""
+        if Vm.HEALTH is None:
+            Vm.HEALTH = guest_health("aarch64")
+        grep = " ".join(f"-e '{p}'" for p in Vm.HEALTH)
+        _, out = self.sh(f"dmesg | grep -F {grep} | head -5; true")
         check(not out, f"guest kernel reports:\n    {out}")
 
     def reboot(self):
@@ -362,6 +349,29 @@ class Vm:
             self.proc.wait()
         self.pump.join(5)
         self.log.close()
+
+
+GUEST_HEALTH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "guest-health.txt")
+GUEST_ARCHES = ("all", "x86_64", "aarch64")
+
+
+def guest_health(arch, path=GUEST_HEALTH):
+    """The patterns of tools/guest-health.txt for a guest of `arch`, read as
+    its header says; a line that is not a comment or `<arch> <pattern>` is an
+    error naming it."""
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    patterns = []
+    for n, line in enumerate(text.split("\n"), 1):
+        if line == "" or line.startswith("#"):
+            continue
+        name, sep, pattern = line.partition(" ")
+        if (not sep or name not in GUEST_ARCHES or not pattern or pattern != pattern.strip(" ")
+                or any(c in line for c in "\t\r'")):
+            raise Failure(f"{path}:{n}: not a comment or <arch> <pattern>: {line!r}")
+        if name in ("all", arch):
+            patterns.append(pattern)
+    return patterns
 
 
 def config(ctx, vcpus=1, mem=256, drives=(), **extra):
@@ -2692,6 +2702,8 @@ def main():
             p.error(f"unknown stage {s}")
     os.makedirs(args.out, exist_ok=True)
     exit_on_signals()
+    # A garbled tools/guest-health.txt stops the run before any stage.
+    Vm.HEALTH = guest_health("aarch64")
     ctx = Context(args)
     results = []
     try:

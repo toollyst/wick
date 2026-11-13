@@ -1,0 +1,61 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# What a guest kernel prints when its health fails: the boot tests fail a
+# guest whose dmesg has a line with any of these before each reset
+# (tools/linux/boot-test.sh, tools/macos/boot-test.py; tools/windows/
+# boot-test.ps1 has the x86_64 rule of its own until it reads this file). The guest kernel is upstream's CI kernel, Linux v6.1 (6.1.188);
+# each pattern names the source that prints it. Every string either guest
+# kernel has (strings of vmlinux-6.1.188, x86_64 and aarch64) that contains
+# one of these is such a report, so a healthy guest prints none of them.
+# Not every line with "WARNING:" in it: the kernel's own notices use the
+# word, as x86's SRSO notice (arch/x86/kernel/cpu/bugs.c,
+# srso_select_mitigation, printed under KVM too on an AMD host) and arm64's
+# Spectre-BHB notice on unprivileged eBPF (arch/arm64/kernel/proton-pack.c,
+# "WARNING: %s").
+#
+# Format, read the same way by every reader:
+# - a line that is empty, or whose first character is '#', is a comment;
+# - any other line is <arch><one space><pattern>: <arch> is all, x86_64 or
+#   aarch64 (the guest's), and <pattern> is the rest of the line, a fixed
+#   string (no regular expression), matched case-sensitively anywhere in a
+#   dmesg line. A pattern is not empty, does not start or end with a space,
+#   and has no tab and no single quote;
+# - any other line is an error: the reader stops and names the line.
+# A reader uses the lines of `all` and of its guest's arch.
+
+# RCU stalls: kernel/rcu/tree_stall.h (print_cpu_stall, print_other_cpu_stall),
+# kernel/rcu/tree_exp.h (synchronize_rcu_expedited_wait).
+all rcu: INFO
+all self-detected stall
+# A soft lockup: kernel/watchdog.c watchdog_timer_fn ("watchdog: BUG: soft
+# lockup - CPU#%d stuck"); a hung task: kernel/hung_task.c check_hung_task
+# (its "hung_task_timeout_secs" line) and check_hung_uninterruptible_tasks'
+# panic ("hung_task: blocked tasks").
+all soft lockup
+all hung_task
+# BUG: reports: mm (x86 arch/x86/mm/fault.c show_fault_oops, kernel/fork.c
+# check_mm), the scheduler (kernel/sched/core.c __schedule_bug), workqueues
+# (kernel/workqueue.c), the soft lockup above.
+all BUG:
+# An oops: x86 arch/x86/mm/fault.c page_fault_oops (__die("Oops", ...));
+# arm64 arch/arm64/kernel/traps.c __die ("Internal error: %s", with "Oops -
+# ..." from its callers).
+all Oops
+# A WARN()'s report: kernel/panic.c __warn, both of its forms ("WARNING:
+# CPU: %d PID: %d at %s:%d %pS" and "... at %pS").
+all WARNING: CPU:
+# CPU masks that disagree: kernel/workqueue.c wq_calc_node_cpumask.
+all WARNING: workqueue cpumask
+# The stack dump each report above prints: x86 arch/x86/kernel/dumpstack.c
+# show_trace_log_lvl ("Call Trace:"); arm64 arch/arm64/kernel/stacktrace.c
+# dump_backtrace ("Call trace:").
+x86_64 Call Trace:
+aarch64 Call trace:
+# arm64 notices a VMM's fault prints: boot registers x1-x3 not zero
+# (arch/arm64/kernel/setup.c setup_arch), and a timer interrupt whose
+# trigger the device tree gives wrong (drivers/clocksource/arm_arch_timer.c
+# check_ppi_trigger: "arch_timer: WARNING: Invalid trigger for IRQ%d" and
+# "WARNING: Please fix your firmware").
+aarch64 WARNING: x1-x3 nonzero
+aarch64 arch_timer: WARNING:

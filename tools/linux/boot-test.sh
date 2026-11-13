@@ -5,7 +5,9 @@
 # Boots upstream Firecracker's x86_64 CI guest with wick on Linux (KVM) and
 # checks, stage by stage, what tools/windows/boot-test.ps1's first stages do: boot to
 # user space, serial output and input (stdin is a pipe), SMP start-up,
-# reboot, the Async block engine (io_uring) and vsock.
+# reboot, the Async block engine (io_uring) and vsock; before each reset,
+# that the guest kernel logged no stall, BUG, oops or warning
+# (tools/guest-health.txt, the macOS boot test's rule).
 #
 #   tools/linux/boot-test.sh [--firecracker PATH] [--workdir DIR]
 #                            [--stage all|boot|smp|block|vsock] [--timeout SEC]
@@ -49,7 +51,7 @@ while [[ $# -gt 0 ]]; do
         --stage) stage="$2"; shift 2 ;;
         --timeout) timeout="$2"; shift 2 ;;
         --seccomp) seccomp="$2"; shift 2 ;;
-        -h|--help) sed -n '4,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '4,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -260,7 +262,39 @@ check_seccomp() {
     fi
 }
 
+# The patterns of tools/guest-health.txt for this host's guest (KVM's guest
+# is the host's arch), read as its header says; a line that is not a
+# comment or "<arch> <pattern>" stops the test, naming it.
+guest_health() {
+    local n=0 line name pattern
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        [[ -z "$line" || "$line" == "#"* ]] && continue
+        name="${line%% *}" pattern="${line#* }"
+        if [[ "$line" != *" "* || -z "$pattern" || "$pattern" == " "* || "$pattern" == *" " \
+              || "$line" == *$'\t'* || "$line" == *$'\r'* || "$line" == *"'"* ]] \
+              || [[ "$name" != all && "$name" != x86_64 && "$name" != aarch64 ]]; then
+            die "tools/guest-health.txt:$n: not a comment or <arch> <pattern>: $line"
+        fi
+        if [[ "$name" == all || "$name" == "$1" ]]; then printf '%s\n' "$pattern"; fi
+    done <"$root/tools/guest-health.txt"
+}
+health_patterns="$(guest_health "$(uname -m)")" || exit 1
+[[ -n "$health_patterns" ]] || die "tools/guest-health.txt has no pattern for $(uname -m)"
+HEALTH_GREP=""
+while IFS= read -r p; do HEALTH_GREP+=" -e '$p'"; done <<<"$health_patterns"
+
+# Fails if the guest kernel logged a stall, a BUG, an oops or a warning
+# (tools/guest-health.txt), as the macOS and Windows boot tests check
+# before each reset.
+check_health() {
+    local out
+    out="$(get_value HEALTH "dmesg | grep -F$HEALTH_GREP | head -5 | tr '\n' '|'")"
+    check "guest kernel healthy" "$([[ -z "$out" ]] && echo 1 || echo 0)" "${out:-no stall, BUG, oops or warning}"
+}
+
 stop_guest() {
+    check_health
     # No systemd as PID 1: reboot(2) straight away, or through sysrq.
     vm_send 'reboot -ff || echo b > /proc/sysrq-trigger'
     local until=$((SECONDS + 30))
