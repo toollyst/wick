@@ -10,7 +10,7 @@ rootfs; on Windows, by [`tools/windows/boot-test.ps1`](../tools/windows/boot-tes
 | | Milestone | State |
 | --- | --- | --- |
 | M1 | [Foundation](#m1-foundation) | done |
-| M2 | [macOS: Hypervisor.framework, aarch64 guests](#m2-macos-hypervisorframework-aarch64-guests) | done |
+| M2 | [macOS: Hypervisor.framework, aarch64 guests](#m2-macos-hypervisorframework-aarch64-guests) | in progress: the GDB stub is left |
 | M3 | [Windows: first boot on real hardware](#m3-windows-first-boot-on-real-hardware) | in progress |
 | M4 | [Linux: upstream parity](#m4-linux-upstream-parity) | in progress |
 | M5 | [Security parity: the jailer on every host](#m5-security-parity-the-jailer-on-every-host) | in progress |
