@@ -829,6 +829,7 @@ jobs:
             winprobe.exe
             tools/windows/boot-test.ps1
             tools/guest-health.txt
+            tools/guest-counter-warp.py
             tools/windows/jailer-test.ps1
             tools/windows/jail-probe.exe
             tools/windows/jail-parent.exe

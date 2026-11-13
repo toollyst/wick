@@ -83,6 +83,7 @@ tools/patches.sh check                  # what CI checks about patches/
 | --- | --- |
 | [`tools/setup.sh`](../tools/setup.sh) | Checks out upstream at `patches/base` and applies the series as commits on branch `wick` (`--force` discards local commits) |
 | [`tools/patches.sh`](../tools/patches.sh) | `export` writes `patches/` from branch `wick`; `check` verifies it matches, that every changed upstream file carries a `wick:` comment, that the submodule is at `patches/base`, and that README.md and docs/ARCHITECTURE.md count the series and its files right |
+| [`tools/guest-counter-warp.py`](../tools/guest-counter-warp.py) | Run in a Linux guest by the boot tests of all three hosts: two CPUs' counters (the TSC; the virtual counter on aarch64) against each other by the kernel's TSC warp check's algorithm, one pass or FAIL line naming the ticks; its header states the interface and how it is sent |
 | [`tools/rebase.sh`](../tools/rebase.sh) | Moves the series to a new upstream tag (`--finish` after resolving conflicts) |
 | [`tools/macos/run.sh`](../tools/macos/run.sh) | Builds, signs with the Hypervisor.framework entitlement and runs `firecracker` |
 | [`tools/macos/test.sh`](../tools/macos/test.sh) | Runs unit tests with the entitlement (through [`sign-and-run.sh`](../tools/macos/sign-and-run.sh) as the cargo runner) |

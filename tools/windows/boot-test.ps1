@@ -2023,6 +2023,38 @@ function Test-CpuOfflineOnline($vm, [string]$when) {
     $vm.Sh("dmesg | grep -c 'Spurious LAPIC timer interrupt'; true")
 }
 
+# tools/guest-counter-warp.py as its header says it is sent: its bytes as
+# raw deflate (DeflateStream writes no zlib header), in base64.
+function Get-GuestTool([string]$path) {
+    Check (Test-Path -LiteralPath $path) "no $path (the kit has it as tools\$(Split-Path -Leaf $path))"
+    $bytes = [IO.File]::ReadAllBytes($path)
+    $ms = New-Object IO.MemoryStream
+    $ds = New-Object IO.Compression.DeflateStream($ms, [IO.Compression.CompressionMode]::Compress)
+    $ds.Write($bytes, 0, $bytes.Length)
+    $ds.Close()
+    return [Convert]::ToBase64String($ms.ToArray())
+}
+
+# The two vCPUs' TSCs against each other, in the guest, by the kernel's
+# warp check's algorithm (tools/guest-counter-warp.py): the guest kernel
+# runs its own only when a CPU comes online, and not at all once the guest
+# has TSC_ADJUST. Sent into the shell variable W 2000 characters at a time
+# (a console line holds 4095 bytes). Fails naming the step and the ticks the
+# TSC went back; returns the pass line's numbers.
+function Test-CounterWarp($vm, [string]$when) {
+    $b64 = $script:CounterWarp
+    for ($i = 0; $i -lt $b64.Length; $i += 2000) {
+        $piece = $b64.Substring($i, [Math]::Min(2000, $b64.Length - $i))
+        $line = if ($i -eq 0) { "W=$piece" } else { "W=`$W'$piece'" }
+        $vm.Sh($line) | Out-Null
+    }
+    $out = ''
+    $rc = $vm.Sh("python3 -c `"import base64,zlib;exec(zlib.decompress(base64.b64decode('`$W'),-15))`" 0 1", 120000, $false, [ref]$out)
+    $line = @($out -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -like 'counter-warp: *' }) | Select-Object -Last 1
+    Check ($rc -eq 0 -and $line -like 'counter-warp: pass: *') "the vCPUs' TSCs $when (tools/guest-counter-warp.py, exit $rc): $out"
+    return ($line -replace '^counter-warp: pass: ', '')
+}
+
 function Stage-Smp {
     $vm = Start-Vm 'smp' (Base-Config 2) -Api
     Wait-Shell $vm
@@ -2045,6 +2077,7 @@ function Stage-Smp {
     $a = [double]::Parse(($lines[0] -split '\s+')[0], [Globalization.CultureInfo]::InvariantCulture)
     $b = [double]::Parse(($lines[1] -split '\s+')[0], [Globalization.CultureInfo]::InvariantCulture)
     Check (($b - $a) -gt 0.9 -and ($b - $a) -le $host_dt + 0.1) ("guest clock advanced {0:N2} s across vCPUs in {1:N2} s" -f ($b - $a), $host_dt)
+    $warp = Test-CounterWarp $vm 'after the boot'
     $spurious = Test-CpuOfflineOnline $vm 'after boot'
     # The same in a microVM restored from a snapshot, in a new process.
     $dir = Join-Path $Scratch 'smp'
@@ -2063,11 +2096,14 @@ function Stage-Smp {
     }) | Out-Null
     $online = $vm.Sh('cat /sys/devices/system/cpu/online')
     Check ($online -eq '0-1') "online CPUs after restore '$online'"
+    # Before CPU 1 goes offline and online, whose own TSC check would fail
+    # first, in the guest health check.
+    $warpRestored = Test-CounterWarp $vm 'after a snapshot restore'
     $spuriousRestored = Test-CpuOfflineOnline $vm 'after a snapshot restore'
     Save-Dmesg $vm 'smp-restored'
     $vm.Reboot()
     Remove-Item $state, $mem -ErrorAction SilentlyContinue
-    return "2 vCPUs online, work runs on each, clock agrees across vCPUs, CPU 1 offline and online 3 times then working, after boot and after a snapshot restore (spurious LAPIC timer interrupts: $spurious, $spuriousRestored), reset exits 0"
+    return "2 vCPUs online, work runs on each, clock agrees across vCPUs, TSCs agree (after boot: $warp; after the restore: $warpRestored), CPU 1 offline and online 3 times then working, after boot and after a snapshot restore (spurious LAPIC timer interrupts: $spurious, $spuriousRestored), reset exits 0"
 }
 
 function Stage-Block {
@@ -3208,6 +3244,7 @@ function Stage-CpuTemplates {
     $got = Get-GuestFlags $vm 'the template'
     $diff = @(Compare-Object $want $got | ForEach-Object { "$($_.SideIndicator)$($_.InputObject)" })
     Check ($diff.Count -eq 0) "the template's guest against the host's less $($lost -join ', '): $($diff -join ' ') (<= missing, => extra)"
+    $warp = Test-CounterWarp $vm 'with the template, after the boot'
     $vm.Sh('A=before-$((6*7))') | Out-Null
     $bashMd5 = $vm.Sh('md5sum /usr/bin/bash')
 
@@ -3226,6 +3263,7 @@ function Stage-CpuTemplates {
         resume_vm     = $true
     }) | Out-Null
     Test-Restored $vm $bashMd5 $null
+    $warpRestored = Test-CounterWarp $vm 'with the template, after a snapshot restore'
     # cpu1 offline and online: it comes back with the template's CPUID.
     $spurious = Test-CpuOfflineOnline $vm 'the template restored'
     $got = Get-GuestFlags $vm 'the template restored'
@@ -3250,7 +3288,7 @@ function Stage-CpuTemplates {
     Check ($r[1] -eq 400 -and $r[2] -match 'msr: 0x10a') "a template with a modifier of MSR 0x10a: $($r[1]) $($r[2])"
     $why = ([regex]::Match($r[2], '"fault_message":\s*"(.*)"')).Groups[1].Value
     $r[0].Kill()
-    return "a template through PUT /cpu-config takes $($lost -join ', ') from the guest on both vCPUs, also after a restore and cpu1's restart (spurious LAPIC timer interrupts: $spurious); a leaf no host has is refused; a modifier of MSR 0x10a is refused ($why)"
+    return "a template through PUT /cpu-config takes $($lost -join ', ') from the guest on both vCPUs, also after a restore and cpu1's restart (spurious LAPIC timer interrupts: $spurious); TSCs agree (after the boot: $warp; after the restore: $warpRestored); a leaf no host has is refused; a modifier of MSR 0x10a is refused ($why)"
 }
 
 # Upstream's test_diff_snapshot_works_after_error
@@ -3849,6 +3887,25 @@ if ($SelfTest) {
             }
             return "Guest health: tools/guest-health.txt read ($($real.Count) x86_64 patterns), and 9 malformed files refused, each naming its line"
         }
+        counterwarp = {
+            # tools/guest-counter-warp.py as Test-CounterWarp sends it: the
+            # raw deflate inflates back to the file, and the pieces of W
+            # are lines the guest's console takes.
+            $path = Join-Path (Split-Path -Parent $PSScriptRoot) 'guest-counter-warp.py'
+            $b64 = Get-GuestTool $path
+            $in = New-Object IO.Compression.DeflateStream((New-Object IO.MemoryStream(, [Convert]::FromBase64String($b64))), [IO.Compression.CompressionMode]::Decompress)
+            $back = New-Object IO.MemoryStream
+            $in.CopyTo($back)
+            $want = [IO.File]::ReadAllBytes($path)
+            Check ([Convert]::ToBase64String($back.ToArray()) -ceq [Convert]::ToBase64String($want)) "the tool does not inflate back to its $($want.Length) bytes"
+            $text = [Text.Encoding]::UTF8.GetString($want)
+            foreach ($need in @('counter-warp: pass: ', 'counter-warp: FAIL: ', "b64decode('`$W'),-15)")) {
+                Check ($text.Contains($need)) "the tool's header does not say '$need'"
+            }
+            $longest = 2000 + "W=`$W''".Length + '; echo RC=$?:K999Z'.Length
+            Check ($longest -lt 4095) "a piece of W is $longest bytes"
+            return "Guest TSC check: tools/guest-counter-warp.py ($($want.Length) bytes) sent as $($b64.Length) base64 characters in $([Math]::Ceiling($b64.Length / 2000)) lines, which inflate back to it"
+        }
         socknames = {
             # Every socket name of the stages within the bound the start
             # takes (a name over it once failed the cli stage on the PC),
@@ -3964,6 +4021,8 @@ $selected = @($selected | Where-Object { $left -notcontains $_ })
 # (Wick.Vm.Healthy): tools/guest-health.txt's x86_64 and `all` patterns.
 $healthPatterns = Read-GuestHealth (Join-Path (Split-Path -Parent $PSScriptRoot) 'guest-health.txt') 'x86_64'
 [Wick.Vm]::HealthGrep = ($healthPatterns | ForEach-Object { "-e '$_'" }) -join ' '
+# The guest's TSC check (Test-CounterWarp), as it is sent.
+$script:CounterWarp = Get-GuestTool (Join-Path (Split-Path -Parent $PSScriptRoot) 'guest-counter-warp.py')
 
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $WorkDir = (Resolve-Path $WorkDir).Path

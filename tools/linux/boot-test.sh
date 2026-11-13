@@ -4,8 +4,11 @@
 #
 # Boots upstream Firecracker's x86_64 CI guest with wick on Linux (KVM) and
 # checks, stage by stage, what tools/windows/boot-test.ps1's first stages do: boot to
-# user space, serial output and input (stdin is a pipe), SMP start-up,
-# reboot, the Async block engine (io_uring) and vsock; before each reset,
+# user space, serial output and input (stdin is a pipe), SMP start-up, the
+# two vCPUs' TSCs against each other after the boot and after a snapshot
+# restored in a new process (tools/guest-counter-warp.py, KVM's reference
+# for the same check on Windows and macOS), reboot, the Async block engine
+# (io_uring) and vsock; before each reset,
 # that the guest kernel logged no stall, BUG, oops or warning
 # (tools/guest-health.txt, the macOS boot test's rule).
 #
@@ -122,20 +125,29 @@ KERNEL="$(get_asset "$KERNEL_NAME")"
 ROOTFS="$(get_asset "$ROOTFS_NAME")"
 
 # --- one VM ------------------------------------------------------------------
-# vm_start NAME CONFIG_JSON: starts Firecracker with its stdin a FIFO held
-# open read-write in fd $VM_IN, its console in $VM_DIR/console.txt.
+# vm_start NAME CONFIG_JSON [API_SOCKET]: starts Firecracker with its stdin a
+# FIFO held open read-write in fd $VM_IN, its console in
+# $VM_DIR/console.txt; without API_SOCKET from CONFIG_JSON with no API, with
+# it serving the API there (VM_SOCK), from CONFIG_JSON if it is not empty.
 vm_start() {
     VM_NAME="$1"
     VM_DIR="$results/$1"
     mkdir -p "$VM_DIR"
     printf '%s\n' "$2" >"$VM_DIR/vm-config.json"
+    local how=(--no-api --config-file "$VM_DIR/vm-config.json")
+    VM_SOCK="${3:-}"
+    if [[ -n "$VM_SOCK" ]]; then
+        rm -f "$VM_SOCK"
+        how=(--api-sock "$VM_SOCK")
+        [[ -n "$2" ]] && how+=(--config-file "$VM_DIR/vm-config.json")
+    fi
     # Firecracker opens the log file, it does not create it.
     : >"$VM_DIR/firecracker.log"
     : >"$VM_DIR/console.txt"
     rm -f "$VM_DIR/stdin"
     mkfifo "$VM_DIR/stdin"
     exec {VM_IN}<>"$VM_DIR/stdin"
-    "$fc" --no-api --config-file "$VM_DIR/vm-config.json" \
+    "$fc" "${how[@]}" \
         --log-path "$VM_DIR/firecracker.log" --level Debug --show-level --show-log-origin \
         <"$VM_DIR/stdin" >"$VM_DIR/console.txt" 2>&1 &
     VM_PID=$!
@@ -162,6 +174,19 @@ vm_stop() {
 }
 
 vm_send() { printf '%s\n' "$1" >&"$VM_IN"; }
+
+# api METHOD PATH [JSON]: the HTTP status of an API request to $VM_SOCK
+# (its body in $VM_DIR/api-reply.txt), once the socket is there (10 s).
+api() {
+    local n body=()
+    [[ -n "${3:-}" ]] && body=(-d "$3")
+    for ((n = 0; n < 100; n++)); do
+        [[ -S "$VM_SOCK" ]] && break
+        sleep 0.1
+    done
+    curl -s -o "$VM_DIR/api-reply.txt" -w '%{http_code}' --unix-socket "$VM_SOCK" \
+        -X "$1" -H 'Content-Type: application/json' "${body[@]}" "http://localhost$2" || true
+}
 
 # The console size now: wait_for looks only at what comes after a mark.
 vm_mark() { stat -c %s "$VM_DIR/console.txt"; }
@@ -293,6 +318,22 @@ check_health() {
     check "guest kernel healthy" "$([[ -z "$out" ]] && echo 1 || echo 0)" "${out:-no stall, BUG, oops or warning}"
 }
 
+# counter_warp WHEN: the two vCPUs' counters against each other in the
+# guest (tools/guest-counter-warp.py, sent as its header says: raw deflate
+# in base64, into W 2000 characters at a time).
+counter_warp() {
+    local b64 i mark line
+    b64="$(python3 -c 'import base64, sys, zlib
+c = zlib.compressobj(9, zlib.DEFLATED, -15)
+print(base64.b64encode(c.compress(open(sys.argv[1], "rb").read()) + c.flush()).decode())' "$root/tools/guest-counter-warp.py")"
+    vm_send "W=${b64:0:2000}"
+    for ((i = 2000; i < ${#b64}; i += 2000)); do vm_send "W=\$W'${b64:i:2000}'"; done
+    mark="$(vm_mark)"
+    vm_send "python3 -c \"import base64,zlib;exec(zlib.decompress(base64.b64decode('\$W'),-15))\" 0 1"
+    line="$(wait_for "$mark" '^counter-warp: ' 120000 || true)"
+    check "vCPU TSCs agree ($1)" "$([[ "$line" == "counter-warp: pass: "* ]] && echo 1 || echo 0)" "${line:-no answer within 120 s}"
+}
+
 stop_guest() {
     check_health
     # No systemd as PID 1: reboot(2) straight away, or through sysrq.
@@ -354,16 +395,34 @@ if [[ "$stage" == all || "$stage" == boot ]]; then
 fi
 
 if [[ "$stage" == all || "$stage" == smp ]]; then
-    echo "[smp] 2 vCPUs: AP start-up (INIT/SIPI), both CPUs online, reboot with 2 vCPUs"
-    vm_start smp "$(base_config 2)"
+    echo "[smp] 2 vCPUs: AP start-up (INIT/SIPI), both CPUs online, TSCs agree, reboot with 2 vCPUs; restored in a new process, TSCs agree"
+    snap_state="$results/smp.state" snap_mem="$results/smp.mem" snapped=0
+    vm_start smp "$(base_config 2)" "$results/smp.sock"
     if start_shell; then
         check_value "guest sees 2 CPUs" "$(get_value CPUS 'grep -c ^processor /proc/cpuinfo')" 2
         check_value "both online" "$(get_value ONLINE 'cat /sys/devices/system/cpu/online')" 0-1
         # Work on both CPUs (taskset is in util-linux).
         check_value "runs on CPU 1" "$(get_value ON1 'taskset -c 1 sh -c "echo ok"')" ok
+        counter_warp "after the boot"
+        # A full snapshot, restored below in a new process, as the Windows
+        # and macOS smp stages do; this microVM resumes and resets.
+        check_value "paused" "$(api PATCH /vm '{"state": "Paused"}')" 204
+        code="$(api PUT /snapshot/create "{\"snapshot_type\": \"Full\", \"snapshot_path\": \"$snap_state\", \"mem_file_path\": \"$snap_mem\"}")"
+        check_value "full snapshot" "$code" 204
+        [[ "$code" == 204 ]] && snapped=1
+        check_value "resumed" "$(api PATCH /vm '{"state": "Resumed"}')" 204
         stop_guest
     fi
     finish_vm
+    if [[ "$snapped" == 1 ]]; then
+        vm_start smp-restored "" "$results/smp-restored.sock"
+        check_value "snapshot loaded, resumed" "$(api PUT /snapshot/load "{\"snapshot_path\": \"$snap_state\", \"mem_backend\": {\"backend_type\": \"File\", \"backend_path\": \"$snap_mem\"}, \"resume_vm\": true}")" 204
+        check_value "shell answers after the restore" "$(get_value RESTORED 'echo $((6*7))')" 42
+        counter_warp "after a restore in a new process"
+        stop_guest
+        finish_vm
+    fi
+    rm -f "$snap_state" "$snap_mem"
 fi
 
 if [[ "$stage" == all || "$stage" == block ]]; then
