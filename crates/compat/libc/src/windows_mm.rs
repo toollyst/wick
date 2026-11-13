@@ -305,6 +305,88 @@ fn dup(h: HANDLE) -> Option<Owned> {
     (ok != 0).then_some(Owned(out))
 }
 
+/// `SEC_RESERVE` (winnt.h): a pagefile-backed section whose pages are
+/// reserved when it is made and committed with `VirtualAlloc` on a view.
+const SEC_RESERVE: PAGE_PROTECTION_FLAGS = 0x0400_0000;
+
+/// The commit charge that pays for the pages of an anonymous shared
+/// mapping, as the cgroup is charged for a shmem page when it is touched
+/// (Linux v6.1 mm/shmem.c:1738 and :1862, `charge_mm`; :691-710,
+/// `mem_cgroup_charge`): a private reservation as long as the section, of
+/// which the page at each offset is committed `PAGE_NOACCESS` (commit,
+/// never memory) before that page of the section is ([`charge`]). A Job
+/// Object charges no section, private commit it does: so the jail's
+/// `memory.max` refuses the page's charge at once, and the VMM ends with
+/// 137 as for private memory, where a section's own commit would go
+/// unseen (SECTREC-a and SECTREC-b, `test_section_memory_and_a_charge_for_it_on_record`).
+/// Released with the mapping's last view.
+#[derive(Debug)]
+struct Charge {
+    base: usize,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        // SAFETY: releases the reservation this object made.
+        unsafe { VirtualFree(self.base as *mut c_void, 0, MEM_RELEASE) };
+    }
+}
+
+/// The views whose pages are charged ([`Charge`]): view start to `(len,
+/// charge)`, the view's offset being its section's (a view of a whole
+/// anonymous section). A leaf lock, held only around the charge's commits.
+static CHARGES: Mutex<BTreeMap<usize, (usize, Arc<Charge>)>> = Mutex::new(BTreeMap::new());
+/// Whether [`CHARGES`] has any: the commit's one look at it otherwise.
+static CHARGES_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A charge reservation for `len` bytes of section, registered for the view
+/// at `view`.
+fn charge_add(view: usize, len: usize) -> Option<Arc<Charge>> {
+    // SAFETY: reserves address space of our own.
+    let base = unsafe { VirtualAlloc2(proc(), std::ptr::null(), len, MEM_RESERVE, PAGE_NOACCESS, std::ptr::null_mut(), 0) };
+    if base.is_null() {
+        return None;
+    }
+    let c = Arc::new(Charge { base: base as usize });
+    let mut m = CHARGES.lock().unwrap();
+    m.insert(view, (len, c.clone()));
+    CHARGES_SET.store(true, std::sync::atomic::Ordering::Release);
+    Some(c)
+}
+
+/// The view at `view` is gone: its charge is released with its last holder.
+fn charge_remove(view: usize) {
+    let mut m = CHARGES.lock().unwrap();
+    m.remove(&view);
+    CHARGES_SET.store(!m.is_empty(), std::sync::atomic::Ordering::Release);
+}
+
+/// Commits the charge of the pages of `[base, base + len)` that lie in
+/// charged views ([`Charge`]); `false`, with the error for `GetLastError`,
+/// if the commit is refused (the job's memory limit).
+fn charge(base: usize, len: usize) -> bool {
+    if !CHARGES_SET.load(std::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    let end = base.saturating_add(len);
+    let m = CHARGES.lock().unwrap();
+    let first = m.range(..=base).next_back().map_or(base, |(v, _)| *v);
+    for (&v, (n, c)) in m.range(first..end) {
+        let (s, e) = (base.max(v), end.min(v + n));
+        if s >= e {
+            continue;
+        }
+        // SAFETY: commits pages of our reservation, never accessed.
+        let p = unsafe {
+            VirtualAlloc2(proc(), (c.base + (s - v)) as *const c_void, e - s, MEM_COMMIT, PAGE_NOACCESS, std::ptr::null_mut(), 0)
+        };
+        if p.is_null() {
+            return false;
+        }
+    }
+    true
+}
+
 #[derive(Debug)]
 enum Kind {
     Placeholder,
@@ -314,9 +396,12 @@ enum Kind {
         file: Option<(Arc<Owned>, i64)>,
     },
     /// A view of `section`, for shared file mappings with the file too.
+    /// `charge`: for anonymous shared memory, the commit that pays for its
+    /// pages ([`Charge`]).
     View {
         _section: Arc<Owned>,
         file: Option<Arc<Owned>>,
+        charge: Option<Arc<Charge>>,
     },
     /// Anonymous private memory on large pages of `page` bytes
     /// (`MAP_HUGETLB`): committed and locked when mapped, never a
@@ -576,6 +661,9 @@ fn to_placeholder(t: &mut Table, base: usize) -> bool {
         touched_remove(base);
         r.lazy = false;
     }
+    if matches!(r.kind, Kind::View { charge: Some(_), .. }) {
+        charge_remove(base);
+    }
     r.kind = Kind::Placeholder;
     r.holes.clear();
     r.noaccess.clear();
@@ -588,6 +676,9 @@ fn release(t: &mut Table, base: usize) -> bool {
     if r.lazy {
         lazy_remove(base, r.len);
         touched_remove(base);
+    }
+    if matches!(r.kind, Kind::View { charge: Some(_), .. }) {
+        charge_remove(base);
     }
     // SAFETY: frees our allocation, view or placeholder.
     let ok = unsafe {
@@ -1268,6 +1359,11 @@ fn protect_lazy(t: &mut Table, b: usize, s: usize, e: usize, wprot: PAGE_PROTECT
 }
 
 fn commit(base: usize, len: usize, prot: PAGE_PROTECTION_FLAGS, replace: bool) -> bool {
+    // A charged view's pages: their charge first, so that the job's limit
+    // refuses before the section's page is taken ([`Charge`]).
+    if !replace && !charge(base, len) {
+        return false;
+    }
     let done = commit_now(base, len, prot, replace);
     // Before the caller (and so the guest or the thread that faulted) can
     // write the pages: a page whose bit is clear is asked about, so a bit set
@@ -1303,6 +1399,25 @@ fn protect(base: usize, len: usize, prot: PAGE_PROTECTION_FLAGS) -> bool {
     let mut old = 0;
     // SAFETY: changes the protection of our memory.
     unsafe { VirtualProtect(base as *const c_void, len, prot, &mut old) != 0 }
+}
+
+/// [`protect`] of the committed pages of `[s, e)`.
+fn protect_committed(s: usize, e: usize, prot: PAGE_PROTECTION_FLAGS) -> bool {
+    let mut at = s;
+    while at < e {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            return false;
+        }
+        let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(e) - at;
+        if mbi.State == MEM_COMMIT && !protect(at, run, prot) {
+            return false;
+        }
+        at += run;
+    }
+    true
 }
 
 /// Reads the file into private memory; past the end it stays zero.
@@ -1391,6 +1506,8 @@ fn fill(
     let anon = flags & MAP_ANONYMOUS != 0;
     let shared = flags & MAP_SHARED != 0;
     let mut lazy = false;
+    // An anonymous shared mapping whose pages are charged ([`Charge`]).
+    let mut charged = false;
     let kind = if anon && !shared {
         if prot == PROT_NONE {
             Kind::Placeholder
@@ -1470,12 +1587,18 @@ fn fill(
             let hi = u32::try_from((len as u64) >> 32).unwrap();
             #[allow(clippy::cast_possible_truncation)]
             let lo = len as u32;
+            // Reserved, and committed a page at a time at its first access
+            // with the page's charge ([`Charge`], [`LAZY`]), as Linux
+            // allocates and charges a shmem page when it is touched. Without
+            // the exception handler, committed whole, as before.
+            charged = lazy_handler();
+            let reserve = if charged { SEC_RESERVE } else { 0 };
             // SAFETY: creates a pagefile-backed section.
             let s = unsafe {
                 CreateFileMappingW(
                     INVALID_HANDLE_VALUE,
                     std::ptr::null(),
-                    PAGE_EXECUTE_READWRITE,
+                    PAGE_EXECUTE_READWRITE | reserve,
                     hi,
                     lo,
                     std::ptr::null(),
@@ -1512,9 +1635,20 @@ fn fill(
         if v.Value.is_null() {
             return Err(crate::EACCES);
         }
+        let charge = if charged {
+            let Some(c) = charge_add(base, len) else {
+                // SAFETY: unmaps the view made above, keeping the placeholder.
+                unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) };
+                return Err(crate::ENOMEM);
+            };
+            Some(c)
+        } else {
+            None
+        };
         Kind::View {
             _section: section,
             file,
+            charge,
         }
     };
     t.get_mut(&base).unwrap().kind = kind;
@@ -1522,6 +1656,19 @@ fn fill(
         t.get_mut(&base).unwrap().lazy = true;
         lazy_add(base, len, wprot);
         touched_add(base, len);
+    }
+    if charged {
+        // Lazy, as private memory is, but not in [`TOUCHED`]: a host read of
+        // an untouched page commits and charges it, as Linux's shmem fault
+        // allocates and charges a page for a read (mm/shmem.c,
+        // `shmem_fault`), where an anonymous private page reads as the zero
+        // page.
+        t.get_mut(&base).unwrap().lazy = true;
+        lazy_add(base, len, wprot);
+        if flags & MAP_POPULATE != 0 && prot != PROT_NONE && !commit(base, len, wprot, false) {
+            // SAFETY: plain call.
+            out_of_memory(base, unsafe { GetLastError() });
+        }
     }
     if flags & MAP_POPULATE != 0 && prot != PROT_NONE {
         let range = WIN32_MEMORY_RANGE_ENTRY {
@@ -2059,7 +2206,15 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
                 lazy_remove(s, e - s);
             }
             Kind::View { .. } => {
-                protect(s, e - s, PAGE_NOACCESS);
+                if r.lazy {
+                    // Its pages not committed fault already; the committed
+                    // ones are made to (Windows protects no page that is only
+                    // reserved).
+                    lazy_remove(s, e - s);
+                    protect_committed(s, e, PAGE_NOACCESS);
+                } else {
+                    protect(s, e - s, PAGE_NOACCESS);
+                }
             }
         }
         let r = t.get_mut(&b).unwrap();
@@ -2228,6 +2383,7 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<us
     r.kind = Kind::View {
         _section: section,
         file: None,
+        charge: None,
     };
     // A section is committed when it is touched, as the userfaultfd fills it.
     if r.lazy {
@@ -2917,6 +3073,128 @@ mod tests {
         assert_eq!(out.status.code(), Some(OOM_EXIT as i32), "{text}");
     }
 
+    /// The process's private commit (`PagefileUsage`), which a Job Object's
+    /// memory limit charges.
+    fn private_commit() -> usize {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        // SAFETY: plain data.
+        let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        c.cb = std::mem::size_of_val(&c) as u32;
+        // SAFETY: an output structure of the size given.
+        assert_ne!(unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) }, 0);
+        c.PagefileUsage
+    }
+
+    /// Anonymous shared memory is a section reserved at the mmap, each page
+    /// committed at its first access together with a page of private commit
+    /// that pays for it ([`Charge`]), as Linux charges a shmem page to the
+    /// cgroup when it is touched (mm/shmem.c v6.1:1738, :1862): mapped,
+    /// nothing is committed and the private commit does not move; 1024
+    /// pages written, those are committed and the private commit is up by
+    /// as much; a read of an untouched page commits and charges it too, as
+    /// Linux's shmem fault allocates for a read; the guest's access (WHP's
+    /// report) commits as a host access does; the data is the section's
+    /// through an `mprotect`; an `munmap` gives the charge back. Before,
+    /// such memory was committed whole at the mmap and charged to no job.
+    #[test]
+    fn test_anonymous_shared_memory_is_charged_at_first_touch() {
+        let _serial = serial();
+        let len = 16 << 20;
+        let before = private_commit();
+        let p = map(0, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        assert_eq!(state(p), MEM_RESERVE, "committed at the mmap");
+        assert_eq!(committed(p, len), 0);
+        let mapped = private_commit();
+        assert!(mapped < before + (1 << 20), "the mmap charged {} KiB", (mapped - before) / 1024);
+        for i in 0..1024 {
+            // SAFETY: our mapping.
+            unsafe { *((p + 2 * i * PAGE) as *mut u8) = (i % 251) as u8 + 1 };
+        }
+        assert_eq!(committed(p, len), 1024 * PAGE, "a write committed more or less than its page");
+        let written = private_commit();
+        assert!(written >= mapped + 1024 * PAGE, "1024 pages written charged {} KiB", (written - mapped) / 1024);
+        // A read of an untouched page.
+        // SAFETY: as above.
+        assert_eq!(unsafe { *((p + PAGE) as *const u8) }, 0);
+        assert_eq!(state(p + PAGE), MEM_COMMIT);
+        // The guest's access, as WHP reports it.
+        assert_eq!(wick_mm::commit_on_access(p + 3 * PAGE, true), Access::Committed);
+        assert_eq!(state(p + 3 * PAGE), MEM_COMMIT);
+        // mprotect: nothing more committed, the data kept.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { mprotect(p as *mut c_void, len, PROT_READ) }, 0);
+        assert_eq!(committed(p, len), 1026 * PAGE);
+        for i in 0..1024 {
+            // SAFETY: as above.
+            assert_eq!(unsafe { *((p + 2 * i * PAGE) as *const u8) }, (i % 251) as u8 + 1);
+        }
+        assert_eq!(wick_mm::commit_on_access(p + 5 * PAGE, true), Access::NotLazy, "a write to read-only memory");
+        // Part unmapped: its pages fault; the rest stays.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { munmap((p + len / 2) as *mut c_void, len / 2) }, 0);
+        assert!(lazy_within(p + len / 2, len / 2).is_empty(), "the unmapped part is still lazy");
+        // SAFETY: as above.
+        assert_eq!(unsafe { munmap(p as *mut c_void, len / 2) }, 0);
+        let unmapped = private_commit();
+        assert!(
+            unmapped + 1024 * PAGE <= written + (1 << 20),
+            "the charge outlived the mapping: {} KiB before, {} KiB written, {} KiB after",
+            before / 1024,
+            written / 1024,
+            unmapped / 1024
+        );
+        assert!(!CHARGES.lock().unwrap().contains_key(&p), "the charge's registration outlived the mapping");
+    }
+
+    /// In a process whose job may commit 64 MiB, 256 MiB of anonymous shared
+    /// memory is mapped; 32 MiB of it are written; writing past the limit
+    /// ends the process with the OOM exit code, as the cgroup OOM killer
+    /// ends a process whose shmem pages reach `memory.max`. Before, the
+    /// whole section was committed at the mmap and no job charged it.
+    #[test]
+    fn test_shared_memory_past_the_job_limit_ends_the_process() {
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        if std::env::var_os("WICK_SHARED_CHILD").is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(exe)
+            .args(["--exact", "windows_mm::tests::shared_child", "--ignored", "--nocapture"])
+            .env("WICK_SHARED_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The job is set before the child maps anything (it sleeps 300 ms first).
+        // SAFETY: a new unnamed job.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!job.is_null());
+        // SAFETY: plain data.
+        let mut limit: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+        limit.JobMemoryLimit = 64 << 20;
+        // SAFETY: a structure of the size passed; the child's handle.
+        unsafe {
+            assert_ne!(
+                SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const limit).cast(), std::mem::size_of_val(&limit) as u32),
+                0
+            );
+            use std::os::windows::io::AsRawHandle;
+            assert_ne!(AssignProcessToJobObject(job, child.as_raw_handle()), 0, "{}", std::io::Error::last_os_error());
+        }
+        let out = child.wait_with_output().unwrap();
+        let text = std::format!("{}{}", std::string::String::from_utf8_lossy(&out.stdout), std::string::String::from_utf8_lossy(&out.stderr));
+        // SAFETY: our job handle.
+        unsafe { CloseHandle(job) };
+        assert!(text.contains("mapped 256 MiB shared") && text.contains("wrote 32 MiB"), "{text}");
+        assert!(!text.contains("wrote 256 MiB"), "the job's limit did not hold: {text}");
+        assert!(text.contains("the memory limit"), "{text}");
+        assert_eq!(out.status.code(), Some(OOM_EXIT as i32), "{text}");
+    }
+
     /// A process that maps large pages through the jailer's broker (a
     /// jailed Firecracker, made to take that path here): this test is the
     /// jailer, answering each request with a large-page section duplicated
@@ -3038,6 +3316,25 @@ mod tests {
         // SAFETY: our mapping.
         assert_eq!(unsafe { munmap(base as *mut c_void, len) }, 0);
         std::println!("brokered large pages: ok");
+    }
+
+    #[test]
+    #[ignore = "run by test_shared_memory_past_the_job_limit_ends_the_process in a job of its own"]
+    fn shared_child() {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let len = 256 << 20;
+        let p = map(0, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        std::println!("mapped 256 MiB shared");
+        let write = |mib: usize| {
+            for at in (0..mib << 20).step_by(PAGE) {
+                // SAFETY: our mapping.
+                unsafe { *((p + at) as *mut u8) = 1 };
+            }
+        };
+        write(32);
+        std::println!("wrote 32 MiB");
+        write(256);
+        std::println!("wrote 256 MiB");
     }
 
     #[test]

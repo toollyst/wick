@@ -267,7 +267,13 @@ upstream Firecracker and its jailer.
   committed count 0 after (tools/windows/memory-partition-probe.rs, the kit's `memory-partition-probe.exe 256`,
   same PC and day). A compromised jailed
   Firecracker can so take host memory past its limit, and guest memory backed by a memfd (with vhost-user
-  devices) is not charged either.
+  devices) is not charged either. Anonymous shared memory that wick maps (`MAP_SHARED | MAP_ANONYMOUS`) is now
+  charged, as Linux charges a shmem page when it is touched: its section is reserved, and each page is committed
+  at its first access together with a page of private commit that pays for it, so the job refuses at
+  `memory.max` and the process ends with 137, as for private memory
+  (`test_anonymous_shared_memory_is_charged_at_first_touch`, `test_shared_memory_past_the_job_limit_ends_the_process`;
+  not yet run on Windows). A touched page so takes twice its size of host commit and once of memory. Still not
+  charged: the userfaultfd restore's section (the next step), memfds, and sections made around wick.
 - **Windows jailer: the handle limit holds only in the jailed process.** Upstream's jailer limits Firecracker to
   2048 descriptors by default (`RLIMIT_NOFILE`), and the kernel enforces it. Windows has no per-process handle limit
   to set: a process's pool quota is accepted and ignored (200,000 handles made after a 1 MiB paged-pool quota,
