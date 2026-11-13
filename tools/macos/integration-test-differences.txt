@@ -381,3 +381,21 @@ all impossible integration_tests/security/test_jail.py::test_negative_no_file_li
 # (inferred: no Linux host to time it on).
 all bug integration_tests/security/test_jail.py::test_firecracker_kill_by_pid[kvm-PCI_OFF-True-False-vmlinux-6.1.188]
 all bug integration_tests/security/test_jail.py::test_firecracker_kill_by_pid[kvm-PCI_ON-True-False-vmlinux-6.1.188]
+
+# Not an entry, a residual to watch for: screen's terminal. XNU can give two
+# terminals opened at the same moment the same minor (xnu-12377.1.9
+# bsd/kern/tty_ptmx.c ptmx_clone); the loser's open fails with EREDRIVEOPEN,
+# which vn_open_auth retries 10 times and then returns as errno -6, logging
+# "vn_open_auth: reached max_retries error -6" (bsd/vfs/vfs_vnops.c). Linux
+# takes the index from an IDA and has no such failure (fs/devpts/inode.c
+# devpts_new_index). Each microVM's screen 5.0.2 opens its window's terminal
+# with openpty (src/pty.c OpenPTY) in its back end, after `screen -dmS` has
+# returned (src/screen.c: the front end exits after the fork, then
+# MakeWindow), so a lock around the screen call would not cover it. With -n 2
+# two screens rarely open at once (16 processes opening 400 terminals each
+# lost none here; 32 opening 300 each lost 18 to 36), and none has failed
+# so far. If a test fails because its screen session is gone and the
+# screen log says "Sorry, could not find a PTY or TTY.", this is why
+# (`/usr/bin/log show --predicate 'process == "kernel" AND eventMessage
+# CONTAINS "max_retries"'` shows it); vmm's sandbox tests serialize their
+# own opens (overlay/vmm/ext/sandbox.rs pty()).

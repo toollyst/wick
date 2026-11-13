@@ -4550,19 +4550,41 @@ mod macos {
         fn pty() -> libc::c_int {
             // SAFETY: plain calls on a descriptor this function opens.
             unsafe {
+                // XNU hands two terminals opened at the same moment the same
+                // minor (xnu-12377.1.9 tty_ptmx.c ptmx_clone: "if we did this
+                // twice at the same time, we could return the same minor to
+                // two callers"); the loser's open fails with EREDRIVEOPEN
+                // (tty_dev.c ptcopen), which vn_open_auth retries 10 times
+                // and then returns to the caller as errno -6 (vfs_vnops.c,
+                // sys/errno.h). Linux v6.1 takes a pty's index from an IDA,
+                // which allocates under its own lock (drivers/tty/pty.c
+                // ptmx_open, fs/devpts/inode.c devpts_new_index:
+                // ida_alloc_max), and has no such failure. CI run 43435331370 (macOS 26) lost
+                // 3 children of test_unfiltered_syscalls_are_limited_by_their_rule
+                // to it; on macOS 27.2 32 processes opening 300 terminals
+                // each lost 36 opens, all errno -6, with 36 "vn_open_auth:
+                // reached max_retries error -6" kernel lines
+                // (agent-state/mac9/ptyrace/race3.c). So the test processes
+                // open their terminals one at a time, under an flock on one
+                // path for every process (not under TMPDIR, which the
+                // children of that test set differently): with it the same
+                // run lost none and the kernel printed nothing. A process
+                // outside the tests opening a terminal at that moment can
+                // still race with one; that is XNU's, and fails below.
+                let lock = libc::open(
+                    c"/tmp/wick-test-posix_openpt.lock".as_ptr(),
+                    libc::O_RDONLY | libc::O_CREAT | libc::O_CLOEXEC,
+                    0o644,
+                );
+                assert!(lock >= 0, "the terminal lock: {}", std::io::Error::last_os_error());
+                assert_eq!(libc::flock(lock, libc::LOCK_EX), 0, "{}", std::io::Error::last_os_error());
                 let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-                // A run on macOS 26 (CI 43435331370) saw this fail in 3 of
-                // the 16-at-a-time children of
-                // test_unfiltered_syscalls_are_limited_by_their_rule, with
-                // the errno unknown: it says why, and how many terminals
-                // the host has against its limit. In XNU (xnu-12377.1.9),
-                // ENXIO is the limit (tty_dev.c ptcopen, tty_ptmx.c
-                // ptmx_get_ioctl), and -6 (EREDRIVEOPEN, sys/errno.h) the
-                // minor two openers raced for (tty_ptmx.c ptmx_clone),
-                // returned once vn_open_auth's 10 retries run out
-                // (vfs_vnops.c).
+                let err = std::io::Error::last_os_error();
+                libc::close(lock);
+                // A failure says why, and how many terminals the host has
+                // against its limit: ENXIO is the limit (tty_dev.c ptcopen,
+                // tty_ptmx.c ptmx_get_ioctl), -6 the race above.
                 if fd < 0 {
-                    let err = std::io::Error::last_os_error();
                     let mut max: libc::c_int = 0;
                     let mut len = size_of_val(&max);
                     let max = if libc::sysctlbyname(
