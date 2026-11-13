@@ -252,6 +252,45 @@ fn same_except(a: &[u8], b: &[u8], skip: &[std::ops::Range<usize>], what: &str) 
 /// Checks what `vnet::segment(hdr, input, ..)` did: `result` is what it
 /// returned and `out` the frames it sent. Panics if Linux would have sent
 /// other frames, or if it accepted a frame Linux rejects in the same way.
+/// Whether a TAP takes a frame written with `hdr` (`frame` without the
+/// header), from Linux v6.1: `tun_get_user` (drivers/net/tun.c :1765 to
+/// :1785) and `virtio_net_hdr_to_skb` (include/linux/virtio_net.h :55 to
+/// :139) on a TAP's skb, whose network header is not set yet there, so the
+/// protocol probe of :103 is skipped. Written from those sources, apart
+/// from `vnet::tx_offload`.
+pub fn tap_accepts(hdr: &VnetHdr, frame: &[u8]) -> bool {
+    let len = frame.len() as u64;
+    let start = u64::from(hdr.csum_start);
+    let off = u64::from(hdr.csum_offset);
+    let needs_csum = hdr.flags & F_NEEDS_CSUM != 0;
+    let mut hdr_len = u64::from(hdr.hdr_len);
+    if needs_csum && start + off + 2 > hdr_len {
+        hdr_len = start + off + 2;
+    }
+    if hdr_len > len || len < 14 || (hdr_len != 0 && hdr_len < 14) {
+        return false;
+    }
+    let thlen = if hdr.gso_type == GSO_NONE {
+        0
+    } else {
+        match hdr.gso_type & !GSO_ECN {
+            GSO_TCPV4 | GSO_TCPV6 => 20,
+            GSO_UDP => 8,
+            _ => return false,
+        }
+    };
+    if hdr.gso_type != GSO_NONE && hdr.gso_size == 0 {
+        return false;
+    }
+    if needs_csum {
+        // pskb_may_pull(start + max(thlen, off + 2)), skb_partial_csum_set,
+        // pskb_may_pull(transport offset + thlen).
+        start + thlen.max(off + 2) <= len && start + off + 2 <= len && start + thlen <= len
+    } else {
+        thlen <= len
+    }
+}
+
 pub fn check(hdr: &VnetHdr, input: &[u8], result: &io::Result<()>, out: &[Vec<u8>]) {
     let gso = hdr.gso_type & !GSO_ECN;
     if let Err(e) = result {

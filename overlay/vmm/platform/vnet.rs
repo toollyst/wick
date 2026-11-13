@@ -360,6 +360,106 @@ pub fn segment(
     }
 }
 
+/// What a backend that takes the virtio-net header itself (vmnet's virtio
+/// header mode) is given for one frame the guest wrote ([`tx_offload`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tx {
+    /// The frame and the guest's header as they are: a TCP superframe whose
+    /// checksum and segmentation the backend completes, as the host stack
+    /// does with what a TAP passes it.
+    Offload,
+    /// [`segment`]'s frames, each complete, with a zeroed header.
+    Segment,
+}
+
+/// The checks the Linux TUN driver makes of a frame written with header
+/// `hdr` (`frame` excludes the header), and whether the frame can go to a
+/// backend that takes the header itself as [`Tx::Offload`].
+///
+/// An error is a frame a TAP refuses with `EINVAL`:
+/// - `tun_get_user` (drivers/net/tun.c, v6.1, :1765 to :1785): `hdr_len`,
+///   raised to `csum_start + csum_offset + 2` with `NEEDS_CSUM`, beyond the
+///   frame, or set and shorter than an Ethernet header; a frame shorter than
+///   an Ethernet header;
+/// - `virtio_net_hdr_to_skb` (include/linux/virtio_net.h, v6.1, :55 to
+///   :139): a GSO type other than TCPv4, TCPv6 and UDP (with or without the
+///   ECN bit); a GSO type with `gso_size` 0; with `NEEDS_CSUM`, the
+///   checksum field or the transport header (from `csum_start`) beyond the
+///   frame (`skb_partial_csum_set`, net/core/skbuff.c :5043); without it, a
+///   GSO frame shorter than the transport header's minimum (:135 to :139).
+///   A TAP's frame does not reach the protocol checks of :103 to :134: its
+///   skb's `network_header` is still 0 there (net/core/skbuff.c :326,
+///   `__build_skb_around` :273 sets only the MAC and transport offsets; tun
+///   resets it at tun.c :1920, after the call at :1868).
+///
+/// A superframe is not refused for its size: past what the device takes,
+/// Firecracker drops it before the backend (`MAX_BUFFER_SIZE`, upstream's
+/// net device), and the kernel segments what is over a device's
+/// `gso_max_size` in software rather than refusing it.
+///
+/// [`Tx::Offload`] is a TCPv4 or TCPv6 superframe with `NEEDS_CSUM`, the
+/// checksum field at TCP's offset 16 of the TCP header that `csum_start`
+/// names and that follows the frame's IP header, no ECN bit, and more
+/// payload than `gso_size` (a frame with less is not GSO for Linux,
+/// virtio_net.h :151). Everything else is segmented here, as before.
+pub fn tx_offload(hdr: &VnetHdr, frame: &[u8]) -> io::Result<Tx> {
+    const ETH_HLEN: usize = 14;
+    const TCP_HLEN: usize = 20;
+    const UDP_HLEN: usize = 8;
+    let needs_csum = hdr.flags & F_NEEDS_CSUM != 0;
+    let start = usize::from(hdr.csum_start);
+    let offset = usize::from(hdr.csum_offset);
+    // tun_get_user.
+    let mut hdr_len = usize::from(hdr.hdr_len);
+    if needs_csum && start + offset + 2 > hdr_len {
+        hdr_len = start + offset + 2;
+    }
+    if hdr_len > frame.len() || frame.len() < ETH_HLEN || (hdr_len != 0 && hdr_len < ETH_HLEN) {
+        return Err(einval());
+    }
+    // virtio_net_hdr_to_skb.
+    let gso = hdr.gso_type & !GSO_ECN;
+    let (thlen, proto) = match hdr.gso_type {
+        GSO_NONE => (0, None),
+        _ => match gso {
+            GSO_TCPV4 | GSO_TCPV6 => (TCP_HLEN, Some(IPPROTO_TCP)),
+            GSO_UDP => (UDP_HLEN, Some(IPPROTO_UDP)),
+            _ => return Err(einval()),
+        },
+    };
+    if proto.is_some() && hdr.gso_size == 0 {
+        return Err(einval());
+    }
+    let l3 = parse_l3(frame);
+    let p_off = if needs_csum {
+        if start + thlen.max(offset + 2) > frame.len() {
+            return Err(einval());
+        }
+        start + thlen
+    } else if proto.is_some() {
+        if thlen > frame.len() {
+            return Err(einval());
+        }
+        thlen
+    } else {
+        0
+    };
+    // UFO's gso_size may leave out the transport header.
+    let nh_off = if gso == GSO_UDP { p_off - thlen } else { p_off };
+    let is_gso = proto.is_some() && frame.len() - nh_off > usize::from(hdr.gso_size);
+    let offload = is_gso
+        && needs_csum
+        && hdr.gso_type & GSO_ECN == 0
+        && offset == 16
+        && match (gso, &l3) {
+            (GSO_TCPV4 | GSO_TCPV6, Some(l3)) => {
+                l3.v6 == (gso == GSO_TCPV6) && l3.proto == IPPROTO_TCP && start == l3.off + l3.len
+            }
+            _ => false,
+        };
+    Ok(if offload { Tx::Offload } else { Tx::Segment })
+}
+
 /// TCP segmentation (`tcp_gso_segment`): every segment carries at most `mss`
 /// bytes of payload, the sequence number of its first byte, FIN and PSH only
 /// on the last segment and CWR only on the first, an incremented IPv4 ID, and
@@ -556,6 +656,183 @@ mod tests {
             Ok(())
         })?;
         Ok(out)
+    }
+
+    /// A TCP superframe as a guest's TSO writes it.
+    fn tso_frame(v6: bool, len: usize) -> (VnetHdr, Vec<u8>) {
+        let t = tcp(0x18, &payload(len));
+        let mut f = if v6 {
+            ipv6(IPPROTO_TCP, &[], &t)
+        } else {
+            ipv4(IPPROTO_TCP, &t)
+        };
+        let mut hdr = partial(&mut f, 16);
+        hdr.gso_type = if v6 { GSO_TCPV6 } else { GSO_TCPV4 };
+        hdr.gso_size = 1448;
+        hdr.hdr_len = hdr.csum_start + 20;
+        (hdr, f)
+    }
+
+    #[test]
+    fn test_tx_offload_takes_tcp_superframes() {
+        for v6 in [false, true] {
+            let (hdr, f) = tso_frame(v6, 20000);
+            assert_eq!(tx_offload(&hdr, &f).unwrap(), Tx::Offload, "v6 {v6}");
+            // A frame with no more payload than gso_size is not GSO for
+            // Linux (virtio_net.h :151): segmented here, as one frame.
+            let (hdr, f) = tso_frame(v6, 1448);
+            assert_eq!(tx_offload(&hdr, &f).unwrap(), Tx::Segment, "v6 {v6}");
+        }
+    }
+
+    #[test]
+    fn test_tx_offload_segments_what_it_does_not_hand_over() {
+        // ECN, a GSO frame without NEEDS_CSUM, UFO, checksum offload alone,
+        // a plain frame, a TCPv4 type on an IPv6 frame with NEEDS_CSUM (Linux
+        // takes it: the type is checked against the frame only without it),
+        // and a csum_start that is not the TCP header.
+        let (mut hdr, f) = tso_frame(false, 20000);
+        hdr.gso_type |= GSO_ECN;
+        assert_eq!(tx_offload(&hdr, &f).unwrap(), Tx::Segment);
+        let (mut hdr, f) = tso_frame(false, 20000);
+        hdr.flags = 0;
+        assert_eq!(tx_offload(&hdr, &f).unwrap(), Tx::Segment);
+        let mut f = ipv4(IPPROTO_UDP, &udp(&payload(4000)));
+        let mut hdr = partial(&mut f, 6);
+        hdr.gso_type = GSO_UDP;
+        hdr.gso_size = 1472;
+        assert_eq!(tx_offload(&hdr, &f).unwrap(), Tx::Segment);
+        let mut f = ipv4(IPPROTO_TCP, &tcp(0x18, &payload(100)));
+        let hdr = partial(&mut f, 16);
+        assert_eq!(tx_offload(&hdr, &f).unwrap(), Tx::Segment);
+        assert_eq!(tx_offload(&VnetHdr::default(), &f).unwrap(), Tx::Segment);
+        let (mut hdr, f) = tso_frame(true, 20000);
+        hdr.gso_type = GSO_TCPV4;
+        assert_eq!(tx_offload(&hdr, &f).unwrap(), Tx::Segment);
+        let (mut hdr, f) = tso_frame(false, 20000);
+        hdr.csum_start += 4;
+        hdr.csum_offset = 12;
+        assert_eq!(tx_offload(&hdr, &f).unwrap(), Tx::Segment);
+    }
+
+    #[test]
+    fn test_tx_offload_refuses_what_a_tap_refuses() {
+        let (good, f) = tso_frame(false, 20000);
+        let refused = |hdr: VnetHdr, f: &[u8], why: &str| {
+            let err = tx_offload(&hdr, f).expect_err(why);
+            assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "{why}");
+        };
+        // virtio_net_hdr_to_skb: GSO types it does not know.
+        for t in [2, 5, 6, 0x7f, 0x80 | 2] {
+            refused(
+                VnetHdr {
+                    gso_type: t,
+                    ..good
+                },
+                &f,
+                &format!("gso_type {t:#x}"),
+            );
+        }
+        // A GSO type with gso_size 0.
+        refused(
+            VnetHdr {
+                gso_size: 0,
+                ..good
+            },
+            &f,
+            "gso_size 0",
+        );
+        // NEEDS_CSUM: the checksum field past the frame, and the transport
+        // header past it.
+        let end = f.len() as u16;
+        refused(
+            VnetHdr {
+                csum_start: end - 1,
+                csum_offset: 0,
+                hdr_len: 0,
+                ..good
+            },
+            &f,
+            "csum field past the frame",
+        );
+        refused(
+            VnetHdr {
+                csum_start: 0,
+                csum_offset: end,
+                hdr_len: 0,
+                ..good
+            },
+            &f,
+            "csum_offset past the frame",
+        );
+        refused(
+            VnetHdr {
+                csum_start: end - 10,
+                csum_offset: 0,
+                hdr_len: 0,
+                ..good
+            },
+            &f,
+            "TCP header past the frame",
+        );
+        // tun_get_user: hdr_len past the frame, or shorter than Ethernet's.
+        refused(
+            VnetHdr {
+                hdr_len: end + 1,
+                ..good
+            },
+            &f,
+            "hdr_len past the frame",
+        );
+        refused(
+            VnetHdr {
+                flags: 0,
+                hdr_len: 13,
+                ..good
+            },
+            &f,
+            "hdr_len 13",
+        );
+        refused(
+            VnetHdr::default(),
+            &f[..13],
+            "a frame shorter than Ethernet's header",
+        );
+        // Without NEEDS_CSUM, a GSO frame shorter than the transport header.
+        let mut arp = MAC.to_vec();
+        arp.extend_from_slice(&[0x08, 0x06]);
+        let gso = VnetHdr {
+            gso_type: GSO_TCPV4,
+            gso_size: 1448,
+            ..Default::default()
+        };
+        arp.resize(19, 0);
+        refused(gso, &arp, "TCPv4 GSO, 19 bytes");
+        // What Linux takes, so do we: without NEEDS_CSUM a TAP does not
+        // check the frame against the type (the skb has no network header
+        // yet), whatever the frame.
+        tx_offload(&good, &f).unwrap();
+        tx_offload(
+            &VnetHdr {
+                flags: 0,
+                hdr_len: 0,
+                ..good
+            },
+            &f,
+        )
+        .unwrap();
+        let (v6, f6) = tso_frame(true, 20000);
+        tx_offload(
+            &VnetHdr {
+                flags: 0,
+                gso_type: GSO_TCPV4,
+                ..v6
+            },
+            &f6,
+        )
+        .unwrap();
+        arp.resize(60, 0);
+        tx_offload(&gso, &arp).unwrap();
     }
 
     #[test]

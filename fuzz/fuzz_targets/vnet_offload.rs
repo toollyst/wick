@@ -8,7 +8,8 @@
 //! Every such frame must be accepted, the frames sent must be those Linux
 //! would send ([`wick_fuzz::frame::check`]), and their checksums must
 //! verify: each TCP segment's, and the UDP checksum of the datagram the
-//! fragments reassemble to.
+//! fragments reassemble to. `vnet::tx_offload` takes every such frame and
+//! hands over exactly the TCP superframes without ECN.
 
 #![no_main]
 
@@ -219,6 +220,18 @@ fuzz_target!(|input: Input| {
             Some(usize::from(hdr.gso_size))
         }
     };
+    // A backend that takes the header is handed the TCP superframes, with no
+    // ECN bit, that are GSO for Linux; the rest is segmented.
+    let tx = vnet::tx_offload(&hdr, &f).unwrap_or_else(|e| panic!("{hdr:?} refused: {e}"));
+    let expect = match input.offload {
+        Offload::Gso { ecn, .. }
+            if tcp && !ecn && f.len() - l4 - 20 > usize::from(hdr.gso_size) =>
+        {
+            vnet::Tx::Offload
+        }
+        _ => vnet::Tx::Segment,
+    };
+    assert_eq!(tx, expect, "{hdr:?}");
     let input_frame = f.clone();
     let mut out = Vec::new();
     let result = vnet::segment(&hdr, &mut f, &mut Vec::new(), &mut |seg| {
