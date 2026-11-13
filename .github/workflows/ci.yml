@@ -454,7 +454,11 @@ jobs:
       - name: Unit tests of every crate but the jailer (tools/macos/unit-test-differences.txt)
         # Runs after an earlier step's failure too: each step answers its own question.
         if: success() || failure()
-        run: python3 -I tools/macos/check-unit-tests.py --out "$RUNNER_TEMP/unit" --summary "$GITHUB_STEP_SUMMARY"
+        # Under the watchdog (macos-seatbelt's steps say why): about twice its
+        # usual 8 minutes, and inside the job's 30.
+        run: >-
+          python3 -I tools/macos/watchdog.py 900 --out "$RUNNER_TEMP/unit/watchdog" --
+          python3 -I tools/macos/check-unit-tests.py --out "$RUNNER_TEMP/unit" --summary "$GITHUB_STEP_SUMMARY"
       # Every test's result by name (tests.tsv) and each crate's output.
       - name: Upload the unit tests' output
         if: always()
@@ -464,6 +468,7 @@ jobs:
           path: |
             ${{ runner.temp }}/unit/*.log
             ${{ runner.temp }}/unit/tests.tsv
+            ${{ runner.temp }}/unit/watchdog/
           if-no-files-found: warn
           retention-days: 14
       # Why a test's terminal could not be opened (run 43435331370: posix_openpt
@@ -503,21 +508,34 @@ jobs:
           submodules: true
           persist-credentials: false
       - run: tools/setup.sh
+      # Run 43442912128's macos-15 job was cancelled by the job's timeout in
+      # the step below, and GitHub kept no log of it. So the tests are built
+      # first, and each test command runs under tools/macos/watchdog.py: one
+      # still running at its limit (about five times its usual time) has
+      # every process it started listed and sampled (each thread's stack)
+      # into the log, then is killed, and the step fails with that evidence
+      # before the job's timeout.
+      - name: Build the tests
+        working-directory: lib/firecracker
+        run: cargo test --locked -p vmm --lib --no-run
       - name: Host sandbox tests
         working-directory: lib/firecracker
         run: |
           sw_vers
-          cargo test --locked -p vmm --lib "ext::sandbox" -- \
+          python3 -I ../../tools/macos/watchdog.py 600 --out "$RUNNER_TEMP/watchdog" -- \
+            cargo test --locked -p vmm --lib "ext::sandbox" -- \
             --skip ext::sandbox::macos::tests::test_sigsys_handler_work_ends_the_process_within_its_deadline \
             --skip ext::sandbox::macos::tests::test_system_socket_is_not_consulted_for_these
           # Alone and with --nocapture, so its stages and their distribution
           # (SIGSYS_DEADLINE's measurement) are in the log, passing or not.
-          cargo test --locked -p vmm --lib \
+          python3 -I ../../tools/macos/watchdog.py 180 --out "$RUNNER_TEMP/watchdog" -- \
+            cargo test --locked -p vmm --lib \
             ext::sandbox::macos::tests::test_sigsys_handler_work_ends_the_process_within_its_deadline \
             -- --exact --nocapture
           # Which socket families Seatbelt consults system-socket for, alone
           # and with --nocapture so that each major's findings are in the log.
-          cargo test --locked -p vmm --lib \
+          python3 -I ../../tools/macos/watchdog.py 180 --out "$RUNNER_TEMP/watchdog" -- \
+            cargo test --locked -p vmm --lib \
             ext::sandbox::macos::tests::test_system_socket_is_not_consulted_for_these \
             -- --exact --nocapture
       # The API process's profile test once failed on macos-15 with its child
@@ -529,7 +547,8 @@ jobs:
         run: |
           failed=0
           for i in $(seq 20); do
-            cargo test --locked -q -p vmm --lib \
+            python3 -I ../../tools/macos/watchdog.py 120 --out "$RUNNER_TEMP/watchdog" -- \
+              cargo test --locked -q -p vmm --lib \
               ext::sandbox::macos::tests::test_api_profile_raises_sigsys_outside_its_list -- --exact \
               > "$RUNNER_TEMP/api-profile-$i.log" 2>&1 || { failed=$((failed + 1)); cat "$RUNNER_TEMP/api-profile-$i.log"; }
           done
@@ -545,8 +564,10 @@ jobs:
         if: success() || failure()
         working-directory: lib/firecracker
         run: |
-          cargo test --locked -p vmm --lib "ext::fifo" -- --test-threads=1
-          cargo test --locked -p vmm --lib "ext::api_process" -- --test-threads=1
+          python3 -I ../../tools/macos/watchdog.py 300 --out "$RUNNER_TEMP/watchdog" -- \
+            cargo test --locked -p vmm --lib "ext::fifo" -- --test-threads=1
+          python3 -I ../../tools/macos/watchdog.py 300 --out "$RUNNER_TEMP/watchdog" -- \
+            cargo test --locked -p vmm --lib "ext::api_process" -- --test-threads=1
       # What the sandbox denied the test processes (vmm-<hash>), for a
       # failure above: the kernel reports a denied call by its number
       # ("deny(1) syscall-unix 117"), SIGSYS or not. All of the lines: the
@@ -566,6 +587,15 @@ jobs:
         run: |
           /usr/bin/log show --last 30m --style compact \
             --predicate 'process == "kernel" AND (eventMessage CONTAINS "max_retries" OR eventMessage CONTAINS "ptmx_max")' || true
+      # A watchdog's samples with the loaded images, for symbolising by hand.
+      - name: Upload the watchdog's samples
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-seatbelt-watchdog-${{ matrix.runner }}
+          path: ${{ runner.temp }}/watchdog/
+          if-no-files-found: ignore
+          retention-days: 14
 
   # A minute of each fuzz target (fuzz/, CONTRIBUTING.md "Fuzzing"): they
   # build, their seeds pass, and a minute of new inputs finds nothing. Long
