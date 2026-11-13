@@ -1163,14 +1163,37 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage linux-snapshot `
             -LinuxSnapshot "$env:RUNNER_TEMP\linux-snapshot"
           exit $LASTEXITCODE
-      # The guest files are the boot test's (-Assets). pidns, bindlink and
-      # hugepages have steps of their own.
+      # The guest files are the boot test's (-Assets). pidns, bindlink,
+      # sections and hugepages have steps of their own.
       - name: jailer-test.ps1
         if: success() || failure()
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir $env:WJT -Assets $env:WBT `
-            -Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,uffd,vhost-user
+            -Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,daemonize,handles,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,uffd,vhost-user
           exit $LASTEXITCODE
+      # A known gap, as an expected failure: memory.max does not bound
+      # memory in sections (docs/COMPATIBILITY.md, the memory.max row's
+      # Windows cell, 🔴 not done yet; W2, the user's decision). The stage
+      # asserts the goal and fails today; this step passes only when it
+      # fails with exactly that result (the private-memory control held
+      # within 32 MiB, and both kinds of section took all 256 MiB) and
+      # nothing else failed or was left mapped, and says so. Any other
+      # result fails it, the gap closing among them, which the docs must
+      # then follow.
+      - name: jailer-test.ps1 sections (known gap, expected to fail)
+        if: success() || failure()
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir "$env:WJT-sections" -Assets $env:WBT -Stage sections
+          $lines = @(Get-Content "$env:WJT-sections\summary.txt" -ErrorAction SilentlyContinue)
+          $gap = @($lines | Where-Object { $_ -match '^FAIL  sections: memory\.max=32 MiB holds private memory \(denied after \d+ MiB\) but not: sections: sections:256 allowed 256 \(exit 0\); filesections: filesections:256 allowed 256 \(exit 0\)$' })
+          $drives = @($lines | Where-Object { $_ -eq 'PASS  drives: every jail drive was removed' })
+          $failed = @($lines | Where-Object { $_.StartsWith('FAIL') })
+          if ($gap.Count -eq 1 -and $drives.Count -eq 1 -and $failed.Count -eq 1) {
+            Write-Host "::notice::sections: the known gap, as documented: memory.max does not bound sections (docs/COMPATIBILITY.md, memory.max row, Windows: not done yet). W2: user decision pending."
+            exit 0
+          }
+          Write-Host "::error::sections: not the documented known gap (or the gap closed: update docs/COMPATIBILITY.md and this step): $($lines -join ' | ')"
+          exit 1
       # pidns types into its console and reads it, and a step has none: the
       # script runs in a console of its own, as in a PowerShell window, and
       # its output is the summary it writes.
@@ -1296,6 +1319,10 @@ jobs:
           foreach ($f in Get-ChildItem -Path "$env:RUNNER_TEMP\hugepages\*.exit" -ErrorAction SilentlyContinue) { $out += "- hugepages: $(Get-Content $f)" }
           $out += ''
           $out += 'boot-test.ps1 prints its stages in its step and keeps them in the results archive of the artifact.'
+          $out += ''
+          $out += 'Known gaps, steps that pass only on their documented failure (a green job is not "everything passes"):'
+          $out += '- jailer-test.ps1 sections: memory.max does not bound memory in sections (docs/COMPATIBILITY.md, memory.max row; W2, the user''s decision).'
+          $out += '- jailer-test.ps1 bindlink: no bindlink.dll on this image, so no bind links (test_jailer_bind_mount_propagation impossible here); with the DLL the stage''s result counts.'
           $out += ''
           $out += 'Not run here, the PC''s: the jailer unelevated (this token is elevated), Windows 11 (this is Windows Server),'
           $out += 'a serial console someone types at, and boot-test.ps1 foreign-snapshot (it needs a state file of another'
