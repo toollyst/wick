@@ -1198,7 +1198,7 @@ function Stage-Handoff {
         $listener = Start-Process $probe -ArgumentList "listenpull:$sock" -PassThru -NoNewWindow -RedirectStandardOutput $listenOut
         $t = [DateTime]::Now.AddSeconds(5); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
         Check (Test-Path $sock) 'the receiver did not listen'
-        $j = Start-Process $Jailer -ArgumentList "--id h --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- sockpull:$sock hold:${file}:20 signal:$PID" -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+        $j = Start-Process $Jailer -ArgumentList "--id h --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- sockpull:$sock signal:$PID hold:${file}:20" -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
         $t = [DateTime]::Now.AddSeconds(15); $held = $null
         while ([DateTime]::Now -lt $t -and -not $held -and -not $j.HasExited) {
             Start-Sleep -Milliseconds 200
@@ -1228,9 +1228,13 @@ function Stage-Handoff {
             Check ($m[1] -match "allowed $secret") "a medium-integrity process pulling the handle: $($m[1])"
             $medium = ' and by a medium-integrity process of the user'
         }
-        [void]$j.WaitForExit(30000)
+        # The signal check ran before the hold (its line came first); the
+        # hold's 20 s are a bound for the pulls above, not something to
+        # wait out: the jailed process is ended once they are done, and its
+        # jailer then exits and removes the jail's drive (Stop-Jailers).
         $sig = Get-Content $out | Where-Object { $_.StartsWith("signal:$PID ") } | Select-Object -First 1
         Check ($sig -and $sig -notmatch ' allowed') "the jailed process can open the operator: $sig"
+        Stop-Jailers @($j)
         "a socket and a file handle held by the jailed process were pulled out by the operator$medium; the jailed process cannot open the operator ($sig)"
     } finally {
         if ($listener -and -not $listener.HasExited) { $listener.Kill() }
