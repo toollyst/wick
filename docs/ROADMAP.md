@@ -17,6 +17,7 @@ rootfs; on Windows, by [`tools/windows/boot-test.ps1`](../tools/windows/boot-tes
 | M6 | [Images everywhere](#m6-images-everywhere) | planned |
 | M7 | [Desktop devices](#m7-desktop-devices) | planned |
 | M8 | [Distribution](#m8-distribution) | planned |
+| M9 | [GPU (headless Vulkan)](#m9-gpu-headless-vulkan) | planned: design only, no code yet |
 
 ## At a glance
 
@@ -204,9 +205,52 @@ images and OCI images run unchanged.
 Through `wick-ext` (`PUT /extensions/{name}`): user-mode networking (no vmnet or host switch needed), virtio-fs, a
 capability query API.
 
+**virtio-fs: designed, no code yet** ([design-fs.md](design-fs.md)). The plan:
+
+- The device in Firecracker only copies bounded, unparsed requests between the virtqueues and one socket.
+- A separate server, `wick-fsd`, one per share, parses FUSE and does the file operations. It never sees guest
+  memory, confines itself on each host (Linux: namespaces, `pivot_root`, seccomp; macOS: Seatbelt limited to the
+  share; Windows: an LPAC token with an ACE on the share, a Job Object and wick's mitigation profile), and refuses to
+  start if any of that fails.
+- The jailer starts it next to Firecracker.
+- It is off by default (a cargo feature `fs`), with no DAX window and no snapshots in the first version.
+- Every known risk is in the design with the fix planned for each host and the test meant to prove it. The Windows
+  parts come from documentation and are to be measured on a Windows PC with WHP.
+
 ## M8. Distribution
 
 **Done when** each host installs wick in one step and new upstream releases reach users without manual work.
 
 Release binaries for macOS (the release workflow already builds and packages the Apple silicon binary on a tag) and
 Windows, Homebrew, automatic rebase attempts on new upstream tags.
+
+## M9. GPU (headless Vulkan)
+
+**Done when** a guest on each host runs a Vulkan compute workload (llama.cpp's Vulkan backend) on the host's GPU,
+with the VMM's sandbox unchanged and the GPU code in sandboxed processes of its own.
+
+Designed, no code yet ([design-gpu.md](design-gpu.md)).
+
+**The device.** A virtio-gpu device offering the Venus (Vulkan) context type only: headless, no OpenGL, no
+passthrough, no snapshots.
+
+**The processes.**
+
+- The VMM runs a vhost-user-gpu front-end and never opens the GPU.
+- A back-end, `wick-gpu`, has no GPU access.
+- Render workers, one per guest context, hold the driver in the tightest sandbox each host allows.
+
+**Even then a guest's Vulkan calls reach the host's GPU driver.** So the design's rule is one GPU per trust domain,
+and it is staged:
+
+| Stage | Adds |
+| --- | --- |
+| v1 | the sandboxed processes, a fixed memory pool, and a validation stage that passes calls through; the risk stated in SECURITY.md |
+| v2 | resource limits in that stage: allocation sizes, dispatches, queue depth, one GPU hang per VM |
+| v3 | a shader rewrite that zeroes GPU local memory (LeftoverLocals) |
+| v4 | a validated compute-only Vulkan subset, or WebGPU through Dawn, chosen after a research pass |
+
+**Open host differences on Windows**, not decided yet (the design's §2a):
+
+- A GPU worker there cannot have win32k lockdown.
+- The host bug-checks after five GPU hangs within a minute.

@@ -255,3 +255,30 @@ upstream Firecracker and its jailer.
 - **Side channels** between VMs on the same host follow upstream's
   [production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md)
   guidance on Linux; the equivalent guidance for macOS and Windows hosts is not written yet.
+
+## Planned: GPU access (no code yet)
+
+wick has no GPU device today: `PUT /extensions/gpu` is refused as an unknown extension. The design
+([docs/design-gpu.md](docs/design-gpu.md), roadmap M9) states now what a GPU-enabled microVM would add to the host's
+attack surface, so that it is known before the feature exists. As designed, the feature would be off by default and
+compiled out unless enabled, with the VMM's own sandbox unchanged.
+
+- **The host GPU driver is reached by the guest.** In the first version a guest's Vulkan calls and shaders reach the
+  host's GPU user-mode driver (in a sandboxed worker process) and, below it, the GPU kernel driver and firmware,
+  without validation. A single driver bug can be enough to reach the host kernel. Later stages of the design add
+  resource limits, a shader rewrite and a validation layer; none of them is in the first version.
+- **One GPU per trust domain.** Guests that share a GPU, or a guest and host processes, can leak data through GPU
+  local memory on affected GPUs (LeftoverLocals, CVE-2023-4969: Apple M2 (M1 not stated by the advisory; M3 fixed),
+  AMD, Qualcomm) and through side channels (GPU.zip) that no software in wick can close. Upstream Firecracker says
+  the same: "We can only run 1 customer workload securely per physical GPU"
+  ([#849](https://github.com/firecracker-microvm/firecracker/issues/849)).
+- **Windows: two open host differences, not decided.** These fall short of the rule of equal security on every
+  host. Whether GPU ships on Windows with them is not decided:
+  - A GPU worker there cannot have win32k lockdown, because the D3DKMT calls a GPU driver needs are win32k system
+    calls. A compromised worker would reach all of win32k.
+  - Windows bug-checks the host after five GPU hangs within 60 seconds (its default TDR keys), so several GPU
+    microVMs together could take the host down.
+
+  Both come from Microsoft's documentation and browser sandbox source; wick has not measured either. The options
+  and their consequences are in the design (§2a).
+- **No snapshots of a GPU microVM:** they would be refused.

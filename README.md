@@ -221,6 +221,22 @@ space inside an arm64 guest, through FEX-Emu with Apple's hardware TSO, is plann
 </details>
 
 <details>
+<summary><b>Can a guest share host folders or use the host's GPU?</b></summary>
+
+Not yet: wick has neither today. Both are designed, with no code yet, and both will be off by default.
+
+- **Host folders:** virtio-fs, served by a separate process that confines itself on each host and never sees guest
+  memory ([design](docs/design-fs.md), [roadmap](docs/ROADMAP.md#m7-desktop-devices) M7).
+- **GPU:** headless Vulkan (Venus) for compute such as llama.cpp ([design](docs/design-gpu.md),
+  [roadmap](docs/ROADMAP.md#m9-gpu-headless-vulkan) M9). The VMM's sandbox stays as it is, but a guest's Vulkan
+  calls would still reach the host's GPU driver. So the design's rule is one GPU per trust domain, and
+  [SECURITY.md](SECURITY.md) lists what it would add to the host's attack surface.
+
+Each design lists the known risks, the fix planned for each host and the test meant to prove it.
+
+</details>
+
+<details>
 <summary><b>Will this be merged into upstream Firecracker?</b></summary>
 
 That is up to the Firecracker maintainers. wick is built so that it never has to be: the patch series stays small,
