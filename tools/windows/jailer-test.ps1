@@ -266,14 +266,16 @@ function Get-ParentTool {
     $p
 }
 
-# jail-parent run to its end, for a command line it must refuse: its exit
-# code (none if it had to be stopped, which is that it held a parent) and
-# what it wrote.
+# jail-parent run to its end, its standard input at its end from the start,
+# so that it holds nothing after what it does: for a command line it must
+# refuse, or for a write to a level another jail-parent holds. Its exit code
+# (none if it had to be stopped) and what it wrote.
 function Invoke-ParentTool([string]$Arguments) {
     $psi = New-Object Diagnostics.ProcessStartInfo((Get-ParentTool), $Arguments)
     $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
     $p = [Diagnostics.Process]::Start($psi)
+    $p.StandardInput.Close()
     $err = $p.StandardError.ReadToEndAsync()
     if (-not $p.WaitForExit(10000)) {
         $p.Kill()
@@ -296,7 +298,10 @@ function Invoke-ParentTool([string]$Arguments) {
 #   while the parent's is running): a jail under it is stopped short of 150
 #   MiB, the least limit along the path, and runs on the parent's processor;
 #   the tool refuses, for cgroup v1, a level on a processor its parent has
-#   not, and refuses to change the processors of a parent that is there;
+#   not; a write of the processors of the parent that is there is taken, as
+#   Linux takes a write to cpuset.cpus at any time: a jail that asks for
+#   processors 0 and 1 then has both, and processor 0 again after the write
+#   back (the jobs below a level written to: jail-parent's own test);
 # - a jailed process tries to reach the parent cgroups' private namespace,
 #   to make a parent's job itself for later jails to join: it can neither
 #   open nor make it. What it may make in the session's own namespace is
@@ -325,7 +330,11 @@ function Stage-Parent {
         $r = Invoke-ParentTool "--name $name/bad --cgroup-version 1 --cgroup cpuset.cpus=1"
         Check ($r[0] -eq 1 -and $r[1].Contains("CPUs outside the parent cgroup's")) "cgroup v1: a level on processor 1 under a parent on processor 0 was not refused by the tool: exit $($r[0]): $($r[1])"
         $r = Invoke-ParentTool "--name $name --cgroup cpuset.cpus=0-1"
-        Check ($r[0] -eq 1 -and $r[1].Contains('not changed while it is there')) "the tool changed the processors of a parent that was there: exit $($r[0]): $($r[1])"
+        Check ($r[0] -eq 0 -and $r[1] -match "${name}: opened" -and $r[1] -match "${name}: 0 jobs below it") "the tool did not write the processors of the parent that was there: exit $($r[0]): $($r[1])"
+        $r = Invoke-Jailer (@('--id', 'wide') + $jail + @('--cgroup-version', '2', '--cgroup', 'cpuset.cpus=0-1', '--', 'affinity:0')) 60000
+        Check ($r[1] -match 'affinity:0 allowed 0x3 of ') "a jail that asked for processors 0-1 under the parent written to 0-1: exit $($r[0]): $($r[1])"
+        $r = Invoke-ParentTool "--name $name --cgroup cpuset.cpus=0"
+        Check ($r[0] -eq 0 -and $r[1] -match "${name}: opened") "the tool did not write the parent's processors back: exit $($r[0]): $($r[1])"
         $psi2 = New-Object Diagnostics.ProcessStartInfo((Get-ParentTool), "--name $name/inner --cgroup memory.max=104857600")
         $psi2.UseShellExecute = $false; $psi2.RedirectStandardInput = $true; $psi2.RedirectStandardOutput = $true; $psi2.CreateNoWindow = $true
         $inner = [Diagnostics.Process]::Start($psi2)
