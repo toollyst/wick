@@ -26,9 +26,7 @@
 # networks' host side), socat (the vsock tests' host side) and iperf3 (the
 # network tests' host side), as upstream's container has them, from Homebrew
 # (brew install squashfs e2fsprogs screen zig coreutils libslirp pkg-config
-# socat iperf3). A missing one stops the run before any test, but for
-# coreutils: without it the wrappers in tools/macos/integration/bin exit 127
-# when a test calls truncate or du, and only those tests fail.
+# socat iperf3). A missing one stops the run before any test.
 #
 # OUT (default build/integration-tests/<time>) gets the pytest JSON report
 # (test-report.json; upstream's per-test test_results directory beside it, in
@@ -112,6 +110,12 @@ PATH="/opt/homebrew/bin:$PATH" command -v zig >/dev/null ||
 for tool in socat iperf3; do
     PATH="/opt/homebrew/bin:$PATH" command -v "$tool" >/dev/null ||
         die "$tool missing: brew install $tool (the host side of upstream's vsock and network tests)"
+done
+# GNU truncate and du, where the wrappers in tools/macos/integration/bin look
+# for them (without them a wrapper exits 127 in the middle of a test).
+for tool in truncate du; do
+    [[ -x "/opt/homebrew/opt/coreutils/libexec/gnubin/$tool" || -x "/usr/local/opt/coreutils/libexec/gnubin/$tool" ]] ||
+        die "GNU $tool missing: brew install coreutils (upstream's framework calls $tool with GNU's options)"
 done
 
 free_gib="${WICK_IT_FREE_GIB:-20}"
