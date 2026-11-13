@@ -205,8 +205,10 @@ pub(crate) fn supported(c: u64) -> i32 {
             i32::try_from(super::vm::MAX_VCPUS).unwrap_or(i32::MAX)
         }
         KVM_CAP_NR_MEMSLOTS => i32::try_from(super::NR_MEMSLOTS).unwrap_or(i32::MAX),
-        // Dynamically-sized XSTATE (XSAVE2) is not exposed; the fixed-size
-        // XSAVE path is used instead.
+        // The size of a vCPU's XSAVE area on this host, at least `struct
+        // kvm_xsave`'s 4096 as on Linux (5.17 and later): past it on a
+        // processor with AMX (`regs::xsave_area_len`).
+        KVM_CAP_XSAVE2 => i32::try_from(super::regs::xsave_area_len()).unwrap_or(i32::MAX),
         _ => 0,
     }
 }

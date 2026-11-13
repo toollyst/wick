@@ -1228,6 +1228,98 @@ mod tests {
         assert_eq!(present, 1, "WHvCapabilityCodeHypervisorPresent");
     }
 
+    // A vCPU's XSAVE state is read and written whole on every host: into
+    // an area of the size `KVM_CAP_XSAVE2` reports, as upstream does it,
+    // the state written back reading the same; `KVM_GET_XSAVE`, whose area
+    // is 4096 bytes, gives the same bytes where the state fits them and
+    // EINVAL where it does not (a processor with AMX: CI run 43359525691,
+    // where Firecracker did not start). The XSAVETEST lines are each run's
+    // record of its processor: WHP's XSAVE features (bit 27 is AMX tile:
+    // WHV_PROCESSOR_XSAVE_FEATURES), CPUID leaf 0xD's sizes, and the bytes
+    // WHP wrote; then what WHP does with an area three pages longer than
+    // the capability's (not asserted: no caller makes one).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_xsave_state_fits_the_area_the_capability_reports() {
+        use core::arch::x86_64::__cpuid_count;
+        use kvm_bindings::Xsave;
+        use super::super::regs;
+        let bytes_of = |x: &Xsave| -> Vec<u8> {
+            let p = x.as_fam_struct_ptr();
+            // SAFETY: the wrapper's `kvm_xsave` and the `len` entries after it.
+            unsafe { std::slice::from_raw_parts((&raw const (*p).xsave).cast::<u8>(), 4096 + 4 * (*p).len) }.to_vec()
+        };
+        let vm = VmFd::create().unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let cap = usize::try_from(vm.check_extension_int(Cap::Xsave2)).unwrap();
+        let mut features = 0u64;
+        let mut n = 0u32;
+        // SAFETY: a buffer of the size passed.
+        let hres = unsafe { whv::WHvGetCapability(0x1003, (&raw mut features).cast(), 8, &mut n) };
+        let (d0, d1) = (__cpuid_count(0xd, 0), __cpuid_count(0xd, 1));
+        let (user, supervisor) = regs::host_xfeatures();
+        let written = vcpu.xsave_state_len().unwrap();
+        eprintln!(
+            "XSAVETEST WHP XSAVE features {features:#x} (HRESULT {:#010x}), AMX tile {}; CPUID 0xD.0 XCR0 bits \
+             {user:#x}, EBX {} ECX {}; 0xD.1 EAX {:#x}, XSS bits {supervisor:#x}, EBX {}; standard {} compacted \
+             {} bytes; KVM_CAP_XSAVE2 {cap}; WHP wrote {written} bytes",
+            hres.cast_unsigned(),
+            features >> 27 & 1,
+            d0.ebx,
+            d0.ecx,
+            d1.eax,
+            d1.ebx,
+            regs::xsave_size(user, false),
+            regs::xsave_size(user | supervisor, true),
+        );
+        assert!(cap >= 4096 && cap % 4096 == 0 && written <= cap, "{written} bytes for an area of {cap}");
+        // The guest's CPUID leaf 0xD is the processor's, and its partition
+        // has what WHP offers: the two agree on AMX.
+        assert_eq!(features >> 27 & 1, user >> 18 & 1, "AMX tile data: WHP's XSAVE features and CPUID leaf 0xD");
+        let len = (cap - 4096).div_ceil(4);
+        let mut first = Xsave::new(len).unwrap();
+        // SAFETY: an area of the capability's size.
+        unsafe { vcpu.get_xsave2(&mut first) }.unwrap();
+        let header = |at: usize| u64::from_le_bytes(bytes_of(&first)[at..at + 8].try_into().unwrap());
+        eprintln!(
+            "XSAVETEST a new vCPU's area: XSTATE_BV {:#x}, XCOMP_BV {:#x} (bit 63: the compacted format)",
+            header(512),
+            header(520)
+        );
+        // SAFETY: the state just read.
+        unsafe { vcpu.set_xsave2(&first) }.unwrap();
+        let mut again = Xsave::new(len).unwrap();
+        // SAFETY: as above.
+        unsafe { vcpu.get_xsave2(&mut again) }.unwrap();
+        assert!(bytes_of(&first) == bytes_of(&again), "the state written back reads otherwise");
+        // SAFETY: plain calls.
+        let legacy = unsafe { vcpu.get_xsave() };
+        if written <= 4096 {
+            let legacy = legacy.unwrap();
+            // SAFETY: the region's 4096 bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(legacy.region.as_ptr().cast::<u8>(), 4096) };
+            assert!(bytes == &bytes_of(&first)[..4096], "KVM_GET_XSAVE reads otherwise than KVM_GET_XSAVE2");
+            // SAFETY: the state just read.
+            unsafe { vcpu.set_xsave(&legacy) }.unwrap();
+        } else {
+            assert_eq!(legacy.unwrap_err().errno(), libc::EINVAL, "KVM_GET_XSAVE of a state of {written} bytes");
+        }
+        // An area smaller than the state is refused, not overrun: one
+        // without its flexible array on a host whose state passes 4096.
+        if written > 4096 {
+            let mut small = Xsave::new(0).unwrap();
+            // SAFETY: the refusal is what is tested.
+            assert_eq!(unsafe { vcpu.get_xsave2(&mut small) }.unwrap_err().errno(), libc::EINVAL);
+        }
+        let mut long = Xsave::new(len + 3 * 1024).unwrap();
+        // SAFETY: an area larger than the capability's.
+        let got = unsafe { vcpu.get_xsave2(&mut long) };
+        let same = got.is_ok() && bytes_of(&long)[..cap] == bytes_of(&first)[..];
+        // SAFETY: the state just read, in the longer area.
+        let set = got.as_ref().ok().map(|()| unsafe { vcpu.set_xsave2(&long) });
+        eprintln!("XSAVETEST an area of {} bytes: read {got:?} (the same bytes: {same}), written back {set:?}", cap + 12288);
+    }
+
     // CI run 43277608081: from a point on, every map of vmm's process failed
     // with ERROR_INVALID_PARAMETER (87). Two causes give that: WHP keeping
     // something of a refused map, or of a VM, after it is gone; or a VM kept

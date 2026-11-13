@@ -324,58 +324,187 @@ pub(crate) fn set_xcrs(part: WHV_PARTITION_HANDLE, vp: u32, x: &kvm_xcrs) -> Res
 
 // ---- XSAVE and FPU ----
 
-/// The XSAVE area size WHP uses (the full area; 4 KiB covers current CPUs).
-const XSAVE_AREA_LEN: usize = std::mem::size_of::<kvm_xsave>();
+// How large a vCPU's XSAVE state is depends on the processor. `struct
+// kvm_xsave` is 4096 bytes, which held every state until Intel AMX: its tile
+// data alone is 8192 bytes (CPUID leaf 0xD, sub-leaf 18), and a processor
+// with it has an area of 11008. A fixed 4096-byte buffer made
+// `WHvGetVirtualProcessorXsaveState` fail there with
+// `WHV_E_INSUFFICIENT_BUFFER` (0x80370301: "If the buffer is not large
+// enough ... `BytesWritten` receives the required buffer size", Microsoft
+// Learn), at the first read of a vCPU's state: Firecracker did not start on
+// an Intel Xeon 6973P-C (CI run 43359525691; every host before was AMD).
+//
+// Linux: `KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2)` is the size a vCPU's state
+// needs, at least 4096 (arch/x86/kvm/x86.c: `xstate_required_size` of the
+// supported XCR0 the process may use for guests, by CPUID leaf 0xD);
+// `KVM_GET_XSAVE2` copies that many bytes; `KVM_GET_XSAVE` fails with
+// `EINVAL` when the state is larger than `struct kvm_xsave`; `KVM_SET_XSAVE`
+// reads that many bytes and fails with `EINVAL` for a state component the
+// host does not have (arch/x86/kernel/fpu/core.c,
+// `fpu_copy_uabi_to_guest_fpstate`). Upstream asks for the size once and
+// uses the `XSAVE2` calls with it; it also asks Linux for AMX for its
+// guests (`arch_prctl(ARCH_REQ_XCOMP_GUEST_PERM)`,
+// src/vmm/src/arch/x86_64/xstate.rs), so its guests have AMX on such a
+// host and their state is the large one. The partition here has every
+// XSAVE feature WHP offers (`vm.rs`), AMX among them: the same.
 
-pub(crate) fn get_xsave(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<kvm_xsave> {
-    let mut out = kvm_xsave { region: [0; 1024], extra: Default::default() };
+/// `sizeof(struct kvm_xsave)`: the area without its flexible array.
+pub(crate) const KVM_XSAVE_LEN: usize = std::mem::size_of::<kvm_xsave>();
+
+/// `WHV_E_INSUFFICIENT_BUFFER` (WinHvPlatformDefs.h).
+const WHV_E_INSUFFICIENT_BUFFER: i32 = 0x8037_0301u32 as i32;
+
+/// The state components an XSAVE area's header may name on this host:
+/// CPUID leaf 0xD's XCR0 bits (sub-leaf 0, EDX:EAX) and IA32_XSS bits
+/// (sub-leaf 1, EDX:ECX).
+pub(crate) fn host_xfeatures() -> (u64, u64) {
+    use core::arch::x86_64::__cpuid_count;
+    let (user, supervisor) = (__cpuid_count(0xd, 0), __cpuid_count(0xd, 1));
+    (
+        u64::from(user.edx) << 32 | u64::from(user.eax),
+        u64::from(supervisor.edx) << 32 | u64::from(supervisor.ecx),
+    )
+}
+
+/// The size `KVM_CAP_XSAVE2` reports for a processor whose largest XSAVE
+/// area is `standard` bytes in the standard format and `compacted` in the
+/// compacted one: the larger (WHP does not say which format its buffer
+/// has), at least `struct kvm_xsave`'s 4096, in whole pages (4096 was
+/// taken, read and written, on every AMD host; whether WHP takes a buffer
+/// that ends inside a page is not measured).
+pub(crate) fn xsave_area_len_of(standard: u32, compacted: u32) -> usize {
+    (standard.max(compacted) as usize).max(KVM_XSAVE_LEN).next_multiple_of(KVM_XSAVE_LEN)
+}
+
+/// The size of the XSAVE area a vCPU's state is read into and written from
+/// on this host: what `KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2)` returns.
+pub(crate) fn xsave_area_len() -> usize {
+    static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEN.get_or_init(|| {
+        let (user, supervisor) = host_xfeatures();
+        xsave_area_len_of(xsave_size(user, false), xsave_size(user | supervisor, true))
+    })
+}
+
+/// One `WHvGetVirtualProcessorXsaveState` into `out`: the call's result and
+/// the bytes written, or needed when the result is
+/// `WHV_E_INSUFFICIENT_BUFFER`.
+fn xsave_state(part: WHV_PARTITION_HANDLE, vp: u32, out: &mut [u8]) -> (i32, usize) {
     let mut written = 0u32;
-    // SAFETY: valid output buffer of the given size.
+    // SAFETY: an output buffer of the size passed.
     let hres = unsafe {
         whv::WHvGetVirtualProcessorXsaveState(
             part,
             vp,
-            out.region.as_mut_ptr().cast(),
-            u32::try_from(XSAVE_AREA_LEN).unwrap(),
+            out.as_mut_ptr().cast(),
+            u32::try_from(out.len()).unwrap_or(u32::MAX),
             &mut written,
         )
     };
-    ffi::hr_of("WHvGetVirtualProcessorXsaveState", hres, || format!("vp {vp}"))?;
-    Ok(out)
+    (hres, written as usize)
 }
 
-pub(crate) fn set_xsave(part: WHV_PARTITION_HANDLE, vp: u32, x: &kvm_xsave) -> Result<()> {
-    // SAFETY: the region is valid for its size.
+/// `KVM_GET_XSAVE` and `KVM_GET_XSAVE2`: the vCPU's XSAVE state into `out`,
+/// the caller's `struct kvm_xsave` with its flexible array. The bytes
+/// written. `EINVAL` when the state does not fit, as `KVM_GET_XSAVE` for a
+/// state larger than `struct kvm_xsave` (Linux's `KVM_GET_XSAVE2` trusts
+/// its caller's buffer to be `KVM_CAP_XSAVE2`'s size).
+pub(crate) fn get_xsave(part: WHV_PARTITION_HANDLE, vp: u32, out: &mut [u8]) -> Result<usize> {
+    let (hres, written) = xsave_state(part, vp, out);
+    if hres == WHV_E_INSUFFICIENT_BUFFER {
+        ffi::report(
+            log::Level::Error,
+            &format!(
+                "whp: the XSAVE state of vp {vp} is {written} bytes and the buffer given for it {} \
+                 (KVM_CAP_XSAVE2 reports {})",
+                out.len(),
+                xsave_area_len()
+            ),
+        );
+        return err(libc::EINVAL);
+    }
+    ffi::hr_of("WHvGetVirtualProcessorXsaveState", hres, || format!("vp {vp}, {} bytes", out.len()))?;
+    Ok(written)
+}
+
+/// The XSAVE header's `XSTATE_BV` (bytes 512 to 519 of an area, in both
+/// formats: Intel SDM volume 1, 13.4.2), or `None` for an area that ends
+/// before its header does.
+fn xstate_bv(area: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(area.get(512..520)?.try_into().ok()?))
+}
+
+/// What `KVM_SET_XSAVE` refuses with `EINVAL`: an area whose header names a
+/// state component outside `supported` (arch/x86/kernel/fpu/core.c,
+/// `fpu_copy_uabi_to_guest_fpstate`: `xfeatures & ~xcr0`), which a snapshot
+/// of a host with other processor features has; and an area too short to
+/// have a header.
+fn check_xsave_area(area: &[u8], supported: u64) -> Result<()> {
+    match xstate_bv(area) {
+        Some(bv) if bv & !supported == 0 => Ok(()),
+        _ => err(libc::EINVAL),
+    }
+}
+
+/// `area` as `KVM_SET_XSAVE` reads it: `len` bytes, this host's size,
+/// whatever size its maker had. Linux reads that many from the caller's
+/// address, past the end of an area made on a host with a smaller state
+/// (upstream restores a snapshot's area as it is: "Safe unless the snapshot
+/// is corrupted"); here the bytes such an area does not have are zero,
+/// which is what the components its header does not name are.
+fn xsave_area_of_len(area: &[u8], len: usize) -> std::borrow::Cow<'_, [u8]> {
+    if area.len() >= len {
+        return std::borrow::Cow::Borrowed(area);
+    }
+    let mut whole = vec![0u8; len];
+    whole[..area.len()].copy_from_slice(area);
+    std::borrow::Cow::Owned(whole)
+}
+
+/// `KVM_SET_XSAVE`: the vCPU's XSAVE state from `area`, the caller's
+/// `struct kvm_xsave` with its flexible array, whole.
+pub(crate) fn set_xsave(part: WHV_PARTITION_HANDLE, vp: u32, area: &[u8]) -> Result<()> {
+    let (user, supervisor) = host_xfeatures();
+    check_xsave_area(area, user | supervisor)?;
+    let area = &*xsave_area_of_len(area, xsave_area_len());
+    // SAFETY: a buffer valid for the size passed.
     let hres = unsafe {
         whv::WHvSetVirtualProcessorXsaveState(
             part,
             vp,
-            x.region.as_ptr().cast(),
-            u32::try_from(XSAVE_AREA_LEN).unwrap(),
+            area.as_ptr().cast(),
+            u32::try_from(area.len()).unwrap_or(u32::MAX),
         )
     };
-    ffi::hr_of("WHvSetVirtualProcessorXsaveState", hres, || format!("vp {vp}"))
+    ffi::hr_of("WHvSetVirtualProcessorXsaveState", hres, || format!("vp {vp}, {} bytes", area.len()))
+}
+
+/// The vCPU's XSAVE state in a buffer of this module's own: of
+/// [`xsave_area_len`], or, should WHP need more than CPUID led to, of the
+/// size it then reports, in whole pages. The buffer and the bytes written.
+pub(crate) fn read_xsave(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<(Vec<u8>, usize)> {
+    let mut area = vec![0u8; xsave_area_len()];
+    let (mut hres, mut written) = xsave_state(part, vp, &mut area);
+    if hres == WHV_E_INSUFFICIENT_BUFFER && written > area.len() {
+        area = vec![0u8; written.next_multiple_of(KVM_XSAVE_LEN)];
+        (hres, written) = xsave_state(part, vp, &mut area);
+    }
+    ffi::hr_of("WHvGetVirtualProcessorXsaveState", hres, || format!("vp {vp}, {} bytes", area.len()))?;
+    Ok((area, written))
 }
 
 /// `kvm_fpu` is the legacy FXSAVE region at the start of the XSAVE area.
 pub(crate) fn get_fpu(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<kvm_fpu> {
-    let xsave = get_xsave(part, vp)?;
-    // SAFETY: the first 512 bytes of the XSAVE area are the FXSAVE region,
-    // whose layout matches `kvm_fpu`'s leading fields; read it as bytes.
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(xsave.region.as_ptr().cast::<u8>(), 512)
-    };
-    Ok(fpu_from_fxsave(bytes))
+    let (area, _) = read_xsave(part, vp)?;
+    Ok(fpu_from_fxsave(&area[..512]))
 }
 
 pub(crate) fn set_fpu(part: WHV_PARTITION_HANDLE, vp: u32, fpu: &kvm_fpu) -> Result<()> {
-    let mut xsave = get_xsave(part, vp)?;
-    // SAFETY: overwrite the 512-byte FXSAVE region at the start of the area.
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(xsave.region.as_mut_ptr().cast::<u8>(), 512)
-    };
-    fxsave_from_fpu(fpu, bytes);
-    set_xsave(part, vp, &xsave)
+    // The whole state as it is, with its first 512 bytes, the FXSAVE
+    // region, replaced.
+    let (mut area, _) = read_xsave(part, vp)?;
+    fxsave_from_fpu(fpu, &mut area[..512]);
+    set_xsave(part, vp, &area)
 }
 
 /// Reads a `kvm_fpu` out of a 512-byte FXSAVE area.
@@ -742,23 +871,34 @@ pub(crate) fn mask_unsupported(e: &mut kvm_bindings::kvm_cpuid_entry2) {
 /// components' sizes and offsets are the processor's (leaf 0xD.i).
 pub(crate) fn xsave_size(mask: u64, compacted: bool) -> u32 {
     use core::arch::x86_64::__cpuid_count;
+    xsave_size_by(mask, compacted, |i| {
+        let r = __cpuid_count(0xd, i);
+        (r.eax, r.ebx, r.ecx)
+    })
+}
+
+/// [`xsave_size`] for a processor whose CPUID leaf 0xD, sub-leaf `i`, is
+/// `leaf(i)`: EAX (the component's size), EBX (its offset in the standard
+/// format) and ECX (bit 1: aligned to 64 bytes in the compacted format).
+/// Linux's `xstate_required_size` (arch/x86/kvm/cpuid.c).
+fn xsave_size_by(mask: u64, compacted: bool, leaf: impl Fn(u32) -> (u32, u32, u32)) -> u32 {
     const START: u32 = 512 + 64;
     let mut size = START;
     for i in 2..64u32 {
         if mask & (1 << i) == 0 {
             continue;
         }
-        let r = __cpuid_count(0xd, i);
-        if r.eax == 0 {
+        let (eax, ebx, ecx) = leaf(i);
+        if eax == 0 {
             continue;
         }
         if compacted {
-            if r.ecx & 2 != 0 {
+            if ecx & 2 != 0 {
                 size = size.div_ceil(64) * 64;
             }
-            size += r.eax;
+            size += eax;
         } else {
-            size = size.max(r.ebx + r.eax);
+            size = size.max(ebx + eax);
         }
     }
     size
@@ -1144,6 +1284,92 @@ mod tests {
         // SAFETY: XGETBV of XCR0 on a host that has XSAVE (every x86_64 Windows host).
         let xcr0 = unsafe { _xgetbv(0) };
         assert_eq!(xsave_size(xcr0, false), __cpuid_count(0xd, 0).ebx);
+    }
+
+    /// CPUID leaf 0xD's sub-leaves of an Intel processor with AVX-512,
+    /// PKRU, CET and AMX (Intel SDM volume 1, 13.5; Linux's
+    /// Documentation/arch/x86/xstate.rst gives the same total, 11008): EAX
+    /// size, EBX offset in the standard format, ECX (bit 0 supervisor, bit
+    /// 1 aligned to 64 bytes when compacted).
+    fn amx_leaf(i: u32) -> (u32, u32, u32) {
+        match i {
+            2 => (256, 576, 0),     // AVX
+            5 => (64, 1088, 0),     // opmask
+            6 => (512, 1152, 0),    // ZMM_Hi256
+            7 => (1024, 1664, 0),   // Hi16_ZMM
+            9 => (8, 2688, 0),      // PKRU
+            11 => (16, 0, 1),       // CET_U
+            12 => (24, 0, 1),       // CET_S
+            17 => (64, 2752, 2),    // AMX TILECFG
+            18 => (8192, 2816, 6),  // AMX TILEDATA
+            _ => (0, 0, 0),
+        }
+    }
+
+    /// The same without AMX: the largest state before it.
+    fn avx512_leaf(i: u32) -> (u32, u32, u32) {
+        if i >= 17 { (0, 0, 0) } else { amx_leaf(i) }
+    }
+
+    // The area's size on a processor with AMX, where it passes `struct
+    // kvm_xsave`'s 4096 bytes (the host of CI run 43359525691, on which
+    // Firecracker did not start), and on one without: computed from the
+    // processor's leaf 0xD, so on any host.
+    #[test]
+    fn test_xsave_area_of_a_processor_with_amx() {
+        let user = 0b110_0000_0010_1110_0111u64;
+        let supervisor = (1 << 11) | (1 << 12);
+        assert_eq!(xsave_size_by(user, false, amx_leaf), 11008);
+        // Compacted: 2440 after PKRU, CET_U and CET_S to 2480, TILECFG
+        // aligned to 2496, TILEDATA from 2560.
+        assert_eq!(xsave_size_by(user | supervisor, true, amx_leaf), 10752);
+        assert_eq!(xsave_area_len_of(11008, 10752), 12288);
+        assert_eq!(xsave_size_by(user, false, avx512_leaf), 2696);
+        assert_eq!(xsave_size_by(user | supervisor, true, avx512_leaf), 2480);
+        assert_eq!(xsave_area_len_of(2696, 2480), 4096);
+        // x87 and SSE alone, and an area of exactly a page or just past it.
+        assert_eq!(xsave_area_len_of(576, 576), 4096);
+        assert_eq!(xsave_area_len_of(4096, 0), 4096);
+        assert_eq!(xsave_area_len_of(4097, 0), 8192);
+        // This host's is what the capability reports: whole pages that hold
+        // its largest area in either format.
+        let (user, supervisor) = host_xfeatures();
+        let len = xsave_area_len();
+        assert_eq!(len % 4096, 0);
+        assert!(len >= 4096 && len >= xsave_size(user, false) as usize);
+        assert!(len >= xsave_size(user | supervisor, true) as usize);
+        assert_eq!(super::super::cap::supported(u64::from(kvm_bindings::KVM_CAP_XSAVE2)), i32::try_from(len).unwrap());
+    }
+
+    // An area is refused, as `KVM_SET_XSAVE` refuses it with EINVAL, when
+    // its header names a state component the host does not have (a
+    // snapshot of a processor with AMX on one without), or when it has no
+    // header.
+    #[test]
+    fn test_an_xsave_area_of_another_processor_is_refused() {
+        let host = 0xe7u64;
+        let mut area = vec![0u8; 12288];
+        check_xsave_area(&area, host).unwrap();
+        area[512..520].copy_from_slice(&0xe7u64.to_le_bytes());
+        check_xsave_area(&area, host).unwrap();
+        area[512..520].copy_from_slice(&(0xe7u64 | 1 << 18).to_le_bytes());
+        assert_eq!(check_xsave_area(&area, host).unwrap_err().errno(), libc::EINVAL);
+        check_xsave_area(&area, host | 3 << 17).unwrap();
+        assert_eq!(check_xsave_area(&area[..519], u64::MAX).unwrap_err().errno(), libc::EINVAL);
+        check_xsave_area(&area[..520], u64::MAX).unwrap();
+    }
+
+    // An area of a host with a smaller state (a snapshot made without AMX,
+    // restored with it) is written as one of this host's size, the rest
+    // zero; one of this size or longer as it is.
+    #[test]
+    fn test_a_shorter_xsave_area_is_written_whole() {
+        let area: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let whole = xsave_area_of_len(&area, 12288);
+        assert_eq!(whole.len(), 12288);
+        assert!(whole[..4096] == area[..] && whole[4096..].iter().all(|&b| b == 0));
+        assert!(matches!(xsave_area_of_len(&area, 4096), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(xsave_area_of_len(&whole, 4096).len(), 12288);
     }
 
     #[test]

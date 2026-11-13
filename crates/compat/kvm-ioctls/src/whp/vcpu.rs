@@ -653,27 +653,55 @@ impl VcpuFd {
 
     /// # Safety
     /// Matches kvm-ioctls: the XSAVE region must be a valid XSAVE image.
+    /// `KVM_GET_XSAVE`: `EINVAL` on a host whose state is larger than
+    /// `struct kvm_xsave`, as on Linux (`regs::get_xsave`).
     pub unsafe fn get_xsave(&self) -> Result<kvm_xsave> {
-        regs::get_xsave(self.part(), self.vp())
+        let mut out = kvm_xsave { region: [0; 1024], extra: Default::default() };
+        // SAFETY: the region's 4096 bytes, as bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(out.region.as_mut_ptr().cast::<u8>(), regs::KVM_XSAVE_LEN) };
+        regs::get_xsave(self.part(), self.vp(), bytes)?;
+        Ok(out)
     }
     /// # Safety
     /// As [`Self::get_xsave`].
     pub unsafe fn set_xsave(&self, xsave: &kvm_xsave) -> Result<()> {
-        regs::set_xsave(self.part(), self.vp(), xsave)
+        // SAFETY: the region's 4096 bytes, as bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(xsave.region.as_ptr().cast::<u8>(), regs::KVM_XSAVE_LEN) };
+        regs::set_xsave(self.part(), self.vp(), bytes)
     }
     /// # Safety
     /// As [`Self::get_xsave`].
+    /// `KVM_GET_XSAVE2`: into the whole of `xsave`, which its caller made
+    /// of `KVM_CAP_XSAVE2`'s size; `EINVAL` if the state does not fit it.
     pub unsafe fn get_xsave2(&self, xsave: &mut Xsave) -> Result<()> {
-        let got = regs::get_xsave(self.part(), self.vp())?;
-        // SAFETY: the wrapper owns a `kvm_xsave2` header to write into.
-        unsafe { (*xsave.as_mut_fam_struct_ptr()).xsave = got };
+        let p = xsave.as_mut_fam_struct_ptr();
+        // SAFETY: the wrapper owns a `kvm_xsave2` followed by `len` entries
+        // of 4 bytes, which continue its `xsave`'s region.
+        let bytes = unsafe {
+            let len = regs::KVM_XSAVE_LEN + 4 * (*p).len;
+            std::slice::from_raw_parts_mut((&raw mut (*p).xsave).cast::<u8>(), len)
+        };
+        regs::get_xsave(self.part(), self.vp(), bytes)?;
         Ok(())
     }
     /// # Safety
     /// As [`Self::get_xsave`].
+    /// `KVM_SET_XSAVE` with the whole of `xsave`.
     pub unsafe fn set_xsave2(&self, xsave: &Xsave) -> Result<()> {
-        let inner = &xsave.as_fam_struct_ref().xsave;
-        regs::set_xsave(self.part(), self.vp(), inner)
+        let p = xsave.as_fam_struct_ptr();
+        // SAFETY: as in `get_xsave2`.
+        let bytes = unsafe {
+            let len = regs::KVM_XSAVE_LEN + 4 * (*p).len;
+            std::slice::from_raw_parts((&raw const (*p).xsave).cast::<u8>(), len)
+        };
+        regs::set_xsave(self.part(), self.vp(), bytes)
+    }
+
+    /// The bytes WHP writes for this vCPU's XSAVE state now (the record of
+    /// each host's size).
+    #[cfg(test)]
+    pub(crate) fn xsave_state_len(&self) -> Result<usize> {
+        regs::read_xsave(self.part(), self.vp()).map(|(_, written)| written)
     }
 
     // ---- MSRs and CPUID ----

@@ -751,7 +751,11 @@ jobs:
       # runs 43292883636 and 43298293407 had AMD runners too, so an Intel
       # runner, when one comes, gives their first Intel measurement
       # (test_bp_ways_on_record prints how each way to hand a #BP back
-      # fares). Then libc's records of an AF_UNIX bind of each path form
+      # fares). The XSAVETEST lines say which kind of processor a run had:
+      # WHP's XSAVE features, CPUID leaf 0xD's sizes, the size
+      # KVM_CAP_XSAVE2 reports and the bytes WHP wrote for a vCPU's state
+      # (past 4096 on a processor with AMX: run 43359525691, the first Intel
+      # runner, where a fixed 4096 kept Firecracker from starting). Then libc's records of an AF_UNIX bind of each path form
       # (BINDTEST lines) and of what a non-blocking pipe takes of a write,
       # by size, room, kind of pipe and with a read waiting (PIPETEST
       # lines), and the vmm's record of what the network
@@ -777,6 +781,7 @@ jobs:
             fi
           }
           for t in test_print_whp_capabilities \
+              test_xsave_state_fits_the_area_the_capability_reports \
               test_vms_one_after_another_map_their_memory \
               test_one_partition_of_a_process_maps_memory \
               test_translate_as_kvm_at_the_entry_and_in_long_mode \
