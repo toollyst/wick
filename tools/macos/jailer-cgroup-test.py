@@ -6,14 +6,18 @@ there). Loaded by tools/macos/jailer-test.py, which passes itself as `jt`;
 run as root like every jailer-test stage, with no VM.
 """
 
+import ctypes
 import errno
 import fcntl
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+import types
 
 
 def stage_cgroup_devices(ctx, jt):
@@ -146,6 +150,43 @@ print("; ".join(res))
 """
 
 
+class ProcTaskInfo(ctypes.Structure):
+    """struct proc_taskinfo (bsd/sys/proc_info.h, xnu-12377.1.9, :127)."""
+    _fields_ = [(n, ctypes.c_uint64) for n in ("virtual_size", "resident_size", "total_user", "total_system",
+                                               "threads_user", "threads_system")] + \
+               [(n, ctypes.c_int32) for n in ("policy", "faults", "pageins", "cow_faults", "messages_sent",
+                                              "messages_received", "syscalls_mach", "syscalls_unix", "csw",
+                                              "threadnum", "numrunning", "priority")]
+
+
+class MachTimebase(ctypes.Structure):
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+
+_libc = ctypes.CDLL(None, use_errno=True)
+_libc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+_timebase = MachTimebase()
+_libc.mach_timebase_info(ctypes.byref(_timebase))
+PROC_PIDTASKINFO = 4
+
+
+def task_state(pid):
+    """(CPU seconds, runnable threads) of `pid`, from the kernel, or None if
+    it is gone: proc_pidinfo(PROC_PIDTASKINFO). XNU's fill_taskprocinfo
+    (osfmk/kern/bsd_kern.c, xnu-12377.1.9, :1067 to :1117) gives the task's
+    user and system time in Mach time units (recount_task_times) and counts
+    in pti_numrunning the threads whose state has TH_RUN: on a CPU or
+    waiting for one. A thread held by a suspension (pid_suspend's
+    place_task_hold, osfmk/kern/task.c :4092, as SIGSTOP's) or blocked is
+    not TH_RUN; a runnable one is, however long the CPUs are taken."""
+    info = ProcTaskInfo()
+    size = ctypes.sizeof(info)
+    if _libc.proc_pidinfo(pid, PROC_PIDTASKINFO, 0, ctypes.byref(info), size) != size:
+        return None
+    ticks = info.total_user + info.total_system
+    return ticks * _timebase.numer / _timebase.denom / 1e9, info.numrunning
+
+
 class Freeze:
     """Helpers of the freeze stage."""
 
@@ -205,42 +246,99 @@ class Freeze:
     # When the stage last wrote a control file (time.monotonic()).
     written_at = None
 
-    def cpu(self, pids, seconds=1.5):
-        """CPU seconds each of `pids` used over `seconds` (ps: 10 ms steps).
-        Also keeps, in self.trace, the CPU each used in every 100 ms of the
-        window, with the time since the stage's last write: a jail thawed
-        late shows no CPU and then full CPU, one starved by other processes
-        a low rate throughout."""
-        start = time.monotonic()
-        before = [self.jt.cpu_seconds(p) for p in pids]
-        last, self.trace = before, []
-        while time.monotonic() - start < seconds:
-            time.sleep(max(0.0, min(0.1, seconds - (time.monotonic() - start))))
-            now = [self.jt.cpu_seconds(p) for p in pids]
-            since = time.monotonic() - (self.written_at or start)
-            self.trace.append((round(since * 1000), [round((n - l) * 1000) for n, l in zip(now, last)]))
-            last = now
-        return [round(n - b, 2) for n, b in zip(last, before)]
+    def control(self):
+        """An unjailed spinner of the same binary, with its child: [pid,
+        child]. It runs beside a jail's through a CPU window, as its
+        concurrent control: what CPU a process that nothing holds gets on
+        this machine meanwhile."""
+        marker = os.path.join(self.ctx.base, "freeze-build", f"control-{time.monotonic_ns()}")
+        p = subprocess.Popen([self.spinner, marker], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        self.wait("the control spinner and its child", lambda: os.path.exists(marker) and len(self.kids(p.pid)) == 1)
+        return p, [p.pid, self.kids(p.pid)[0]]
+
+    def cpu(self, pids, seconds=1.5, control=True):
+        """What each of `pids` did over `seconds`, from the kernel
+        (`task_state`), beside a control spinner (`control`):
+        {"used": CPU seconds of each, "control": the control's two,
+        "runnable": per pid, how many of the window's reads found a thread
+        runnable, "reads": how many reads}. Also keeps, in self.trace, the
+        CPU each used in every 100 ms of the window, with the time since the
+        stage's last write: a jail thawed late shows no CPU and then full
+        CPU, one starved by other processes a low rate throughout."""
+        ctl, ctl_pids = self.control() if control else (None, [])
+        try:
+            every = list(pids) + ctl_pids
+            start = time.monotonic()
+            before = [task_state(p) for p in every]
+            self.check(all(before), f"cannot read the CPU time of {every}: {before}")
+            last, self.trace = before, []
+            runnable, reads = [0] * len(every), 0
+            while time.monotonic() - start < seconds:
+                time.sleep(max(0.0, min(0.1, seconds - (time.monotonic() - start))))
+                now = [task_state(p) for p in every]
+                self.check(all(now), f"a process ended in the window: {list(zip(every, now))}")
+                reads += 1
+                runnable = [r + (n[1] > 0) for r, n in zip(runnable, now)]
+                since = time.monotonic() - (self.written_at or start)
+                self.trace.append((round(since * 1000), [round((n[0] - l[0]) * 1000) for n, l in zip(now, last)]))
+                last = now
+        finally:
+            if ctl:
+                ctl.kill()
+                ctl.wait()
+        used = [round(n[0] - b[0], 3) for n, b in zip(last, before)]
+        k = len(pids)
+        return {"used": used[:k], "control": used[k:], "runnable": runnable[:k], "reads": reads}
 
     def explain_cpu(self, what):
         """The window's trace, the load and the top CPU users, for a check
         on the CPU a jail got."""
-        print(f"   {what}: CPU ms per 100 ms, as (ms since the last write, [per pid]): {self.trace}", flush=True)
+        print(f"   {what}: CPU ms per 100 ms, as (ms since the last write, [per pid, then the control's]): "
+              f"{self.trace}", flush=True)
         print(f"   {what}: load average {os.getloadavg()}", flush=True)
         top = subprocess.run(["ps", "-A", "-r", "-o", "pid=,pcpu=,comm="], capture_output=True, text=True).stdout
         print(f"   {what}: top CPU users: {top.splitlines()[:8]}", flush=True)
 
     def frozen(self, pids, what):
-        used = self.cpu(pids)
-        print(f"   {what}: CPU seconds over 1.5 s {used}", flush=True)
-        self.check(all(u == 0 for u in used), f"{what}: CPU time while frozen {used}")
+        """Frozen: no read of the window finds a thread of `pids` runnable
+        (the kernel's answer), and they use no CPU time while the unjailed
+        control beside them does (so the window had CPU to give)."""
+        m = self.cpu(pids)
+        print(f"   {what}: over 1.5 s, CPU seconds {m['used']}, the control's {m['control']}; "
+              f"reads with a runnable thread {m['runnable']} of {m['reads']}", flush=True)
+        ok = all(r == 0 for r in m["runnable"]) and all(u == 0 for u in m["used"]) and all(
+            c > 0 for c in m["control"])
+        if not ok:
+            self.explain_cpu(what)
+        self.check(all(r == 0 for r in m["runnable"]), f"{what}: runnable while frozen {m}")
+        self.check(all(u == 0 for u in m["used"]), f"{what}: CPU time while frozen {m}")
+        self.check(all(c > 0 for c in m["control"]), f"{what}: the control got no CPU either, so a frozen "
+                                                     f"jail cannot be told from a starved one {m}")
+
+    # A thawed spinner's share of the CPU against the unjailed control's:
+    # both spin at the same priority, so the scheduler gives them alike;
+    # this leaves room for the window's 100 ms of luck.
+    SHARE = 1 / 3
 
     def running(self, pids, what):
-        used = self.cpu(pids)
-        print(f"   {what}: CPU seconds over 1.5 s {used}", flush=True)
-        if not all(u > 0.3 for u in used):
+        """Thawed: every read of the window finds a thread of each of `pids`
+        runnable (the kernel's answer, whatever the load), and each gets CPU
+        time, at least a third of what the unjailed control beside it gets
+        (a share alike, not a number of seconds, so a loaded machine does
+        not fail it)."""
+        m = self.cpu(pids)
+        ctl = sum(m["control"]) / len(m["control"])
+        print(f"   {what}: over 1.5 s, CPU seconds {m['used']}, the control's {m['control']}; "
+              f"reads with a runnable thread {m['runnable']} of {m['reads']}", flush=True)
+        ok = all(r == m["reads"] for r in m["runnable"]) and all(u > 0 and u >= ctl * self.SHARE for u in m["used"])
+        if not ok:
             self.explain_cpu(what)
-        self.check(all(u > 0.3 for u in used), f"{what}: too little CPU time while thawed {used}")
+        self.check(m["reads"] > 0 and all(r == m["reads"] for r in m["runnable"]),
+                   f"{what}: not runnable while thawed {m}")
+        self.check(all(u > 0 for u in m["used"]), f"{what}: no CPU time while thawed {m}")
+        self.check(all(u >= ctl * self.SHARE for u in m["used"]),
+                   f"{what}: less than a third of the control's CPU time while thawed {m}")
 
     def supervisor(self, vm_id):
         """The jail's supervisor: root, parent launchd, the jailer's command line."""
@@ -305,6 +403,61 @@ class Freeze:
 
     def gone(self, pid):
         return not self.jt.alive(pid)
+
+
+def self_check_freeze(jt):
+    """What runs without root: the freeze stage's judgement of frozen and
+    thawed (`Freeze.frozen`, `Freeze.running`) on spinners of this user
+    held and released with SIGSTOP and SIGCONT, whose hold is the one
+    pid_suspend places (bsd/kern/kern_sig.c's SIGSTOP and kern_proc.c's
+    pid_suspend both reach place_task_hold, osfmk/kern/task.c :4092): on
+    the machine as it is, and again with twice as many extra spinners as
+    CPUs taking them. Each time a held spinner judged thawed (what a
+    supervisor that does not resume leaves) and a running one judged frozen
+    must fail, by name."""
+    base = tempfile.mkdtemp(prefix="wick-jt-freeze-")
+    procs = []
+    try:
+        ctx = types.SimpleNamespace(base=base, out=base)
+        me = types.SimpleNamespace(UID=os.getuid(), GID=os.getgid(), check=jt.check, bt=jt.bt)
+        fz = Freeze(ctx, me)
+
+        def spinner():
+            p, pids = fz.control()
+            procs.append(p)
+            return pids
+
+        def fails(judge, pids, what, want):
+            try:
+                judge(pids, what)
+            except jt.Failure as e:
+                jt.check(want in str(e), f"{what}: failed for another reason: {e}")
+                print(f"   {what}: fails, as it must: {e}", flush=True)
+                return
+            raise jt.Failure(f"{what}: passed")
+
+        for load in (0, 2 * os.cpu_count()):
+            loaders = [spinner() for _ in range(load // 2)]
+            print(f"   {load} extra spinners, load average {os.getloadavg()}", flush=True)
+            jail = spinner()
+            fz.running(jail, "running")
+            fails(fz.frozen, jail, "running, judged frozen", "runnable while frozen")
+            for pid in jail:
+                os.kill(pid, signal.SIGSTOP)
+            time.sleep(0.3)
+            fz.frozen(jail, "held")
+            fails(fz.running, jail, "held and not resumed, judged thawed", "not runnable while thawed")
+            for pid in jail:
+                os.kill(pid, signal.SIGCONT)
+            fz.running(jail, "resumed")
+            for pid in jail + [q for pids in loaders for q in pids]:
+                os.kill(pid, signal.SIGKILL)
+        print(f"freeze self-check passed, load average {os.getloadavg()}")
+    finally:
+        for p in procs:
+            p.kill()
+            p.wait()
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def api_answers(sock, timeout=1.5):
@@ -478,7 +631,7 @@ def stage_freeze(ctx, jt):
         fz.write(jd, "cgroup.freeze", "0\n")
         fz.wait("frozen 0", lambda: fz.read(jd, "cgroup.events") == "populated 1\nfrozen 0\n", 3)
         fz.running([pid, kid], "cgroup.freeze 0")
-        sup_cpu = fz.cpu([sup["pid"]], 1.0)[0]
+        sup_cpu = fz.cpu([sup["pid"]], 1.0, control=False)["used"][0]
         print(f"   supervisor: {sup['rss_kib']} KiB resident, {sup_cpu} s CPU over 1 s", flush=True)
         facts["supervisor"] = f"the supervisor {sup['rss_kib']} KiB resident and {sup_cpu} s CPU per idle second"
         # The supervisor killed (root only) while the jail is frozen: the jail is

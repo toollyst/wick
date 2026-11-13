@@ -1429,8 +1429,13 @@ def main():
     p.add_argument("--probe-self-check", action="store_true",
                    help="build the resource limit probe and check it without root, then exit")
     p.add_argument("stages", nargs="*", help=f"stages (default: all): {', '.join(STAGES)}")
+    p.add_argument("--freeze-self-check", action="store_true",
+                   help="check the freeze stage's judgement of frozen and thawed without root, then exit")
     if "--probe-self-check" in sys.argv[1:]:
         self_check_probe()
+        return
+    if "--freeze-self-check" in sys.argv[1:]:
+        _cgroup_test().self_check_freeze(types.SimpleNamespace(**globals()))
         return
     args = p.parse_args()
     if os.geteuid() != 0:
