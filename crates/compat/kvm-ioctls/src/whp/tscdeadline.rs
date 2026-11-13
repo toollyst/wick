@@ -74,6 +74,8 @@ const APIC_LVTT: usize = 0x320;
 const APIC_TMICT: usize = 0x380;
 /// `APIC_SPIV_APIC_ENABLED`.
 const SVR_ENABLED: u32 = 1 << 8;
+/// `X2APIC_ENABLE` in `IA32_APIC_BASE` (EXTD).
+pub(crate) const APIC_BASE_EXTD: u64 = 1 << 10;
 /// `APIC_LVT_MASKED`.
 #[cfg(test)]
 const LVT_MASKED: u32 = 1 << 16;
@@ -102,20 +104,29 @@ pub(crate) fn page_in_deadline_mode(page: &[u8]) -> bool {
     deadline_mode(reg(page, APIC_LVTT), reg(page, APIC_TMICT))
 }
 
-/// The interrupt an expired deadline raises, from the APIC register page:
-/// `(APIC ID, vector)`, or `None` when none is raised: the APIC
-/// software-disabled, the timer not in TSC-deadline mode, or the entry's
-/// vector not a valid one (below 16: the guest's write of the vector was
-/// lost too). The entry's mask bit is not the guest's (module
-/// documentation) and is not consulted.
-pub(crate) fn deadline_interrupt(page: &[u8]) -> Option<(u32, u8)> {
+/// The interrupt an expired deadline raises, from the APIC register page
+/// of a vCPU whose `IA32_APIC_BASE` is `apic_base`: `(APIC ID, vector)`, or
+/// `None` when none is raised: the APIC software-disabled, the timer not in
+/// TSC-deadline mode, or the entry's vector not a valid one (below 16: the
+/// guest's write of the vector was lost too). The entry's mask bit is not
+/// the guest's (module documentation) and is not consulted.
+///
+/// The ID register is in the page as the APIC's mode has it: in xAPIC mode
+/// the ID in bits 31:24, in x2APIC mode (EXTD set) the 32-bit x2APIC ID,
+/// which WHP's page holds as it is (vCPU 1 read `0x1000000`, then `0x1`
+/// once the host set EXTD: X2E0REC c, CI run 43521200989), as KVM's own
+/// register does (Linux v6.1 arch/x86/kvm/lapic.c, `kvm_apic_set_x2apic_id`
+/// and `kvm_apic_id`). KVM raises the timer's interrupt in the vCPU's own
+/// APIC (`kvm_apic_local_deliver`); here it is an MSI to that APIC's ID.
+pub(crate) fn deadline_interrupt(page: &[u8], apic_base: u64) -> Option<(u32, u8)> {
     let lvtt = reg(page, APIC_LVTT);
     #[allow(clippy::cast_possible_truncation)]
     let vector = lvtt as u8;
     if reg(page, APIC_SVR) & SVR_ENABLED == 0 || !page_in_deadline_mode(page) || vector < 16 {
         return None;
     }
-    Some((reg(page, APIC_ID) >> 24, vector))
+    let id = reg(page, APIC_ID);
+    Some((if apic_base & APIC_BASE_EXTD != 0 { id } else { id >> 24 }, vector))
 }
 
 /// How long until a guest TSC at `tsc` reaches `deadline`, at `hz`. Rounded
@@ -287,6 +298,7 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    /// An xAPIC-mode page: the ID in bits 31:24.
     fn page(svr: u32, lvtt: u32, tmict: u32, id: u32) -> Vec<u8> {
         let mut p = vec![0u8; 4096];
         p[APIC_SVR..APIC_SVR + 4].copy_from_slice(&svr.to_le_bytes());
@@ -295,6 +307,17 @@ mod tests {
         p[APIC_ID..APIC_ID + 4].copy_from_slice(&(id << 24).to_le_bytes());
         p
     }
+
+    /// An x2APIC-mode page: the 32-bit ID as it is.
+    fn x2apic_page(svr: u32, lvtt: u32, tmict: u32, id: u32) -> Vec<u8> {
+        let mut p = page(svr, lvtt, tmict, 0);
+        p[APIC_ID..APIC_ID + 4].copy_from_slice(&id.to_le_bytes());
+        p
+    }
+
+    /// `IA32_APIC_BASE` enabled, in xAPIC and in x2APIC mode.
+    const XAPIC: u64 = 0xfee0_0800;
+    const X2APIC: u64 = 0xfee0_0c00;
 
     #[test]
     fn test_deadline_mode() {
@@ -312,19 +335,25 @@ mod tests {
     #[test]
     fn test_deadline_interrupt() {
         // Linux's LOCAL_TIMER_VECTOR on APIC 1.
-        assert_eq!(deadline_interrupt(&page(0x1ff, 0x4_00ec, 0, 1)), Some((1, 0xec)));
-        assert_eq!(deadline_interrupt(&page(0x1ff, 0xec, 0, 3)), Some((3, 0xec)));
+        assert_eq!(deadline_interrupt(&page(0x1ff, 0x4_00ec, 0, 1), XAPIC), Some((1, 0xec)));
+        assert_eq!(deadline_interrupt(&page(0x1ff, 0xec, 0, 3), XAPIC), Some((3, 0xec)));
+        // In x2APIC mode the page holds the 32-bit ID as it is (vCPU 1:
+        // 0x1, X2E0REC c): the interrupt is vCPU 1's, not APIC 0's.
+        assert_eq!(deadline_interrupt(&x2apic_page(0x1ff, 0xec, 0, 1), X2APIC), Some((1, 0xec)));
+        assert_eq!(deadline_interrupt(&x2apic_page(0x1ff, 0xec, 0, 31), X2APIC), Some((31, 0xec)));
+        assert_eq!(deadline_interrupt(&x2apic_page(0x1ff, 0xec, 0, 0), X2APIC), Some((0, 0xec)));
         // The entry as WHP shows it after refusing the guest's write that
         // selected TSC-deadline mode: Linux's lapic_timer_shutdown write,
         // masked, with the vector (0x100ec measured on Windows 11 26H2). The
         // mask is not the guest's: the interrupt is raised.
-        assert_eq!(deadline_interrupt(&page(0x1ff, LVT_MASKED | 0xec, 0, 1)), Some((1, 0xec)));
-        assert_eq!(deadline_interrupt(&page(0x1ff, 0x5_00ec, 0, 0)), Some((0, 0xec)));
+        assert_eq!(deadline_interrupt(&page(0x1ff, LVT_MASKED | 0xec, 0, 1), XAPIC), Some((1, 0xec)));
+        assert_eq!(deadline_interrupt(&page(0x1ff, 0x5_00ec, 0, 0), XAPIC), Some((0, 0xec)));
         // Software-disabled APIC, other modes, no vector written.
-        assert_eq!(deadline_interrupt(&page(0x0ff, 0x4_00ec, 0, 0)), None);
-        assert_eq!(deadline_interrupt(&page(0x1ff, 0x2_00ec, 0, 0)), None);
-        assert_eq!(deadline_interrupt(&page(0x1ff, 0xec, 5, 0)), None);
-        assert_eq!(deadline_interrupt(&page(0x1ff, LVT_MASKED, 0, 0)), None);
+        assert_eq!(deadline_interrupt(&page(0x0ff, 0x4_00ec, 0, 0), XAPIC), None);
+        assert_eq!(deadline_interrupt(&page(0x1ff, 0x2_00ec, 0, 0), XAPIC), None);
+        assert_eq!(deadline_interrupt(&page(0x1ff, 0xec, 5, 0), XAPIC), None);
+        assert_eq!(deadline_interrupt(&page(0x1ff, LVT_MASKED, 0, 0), XAPIC), None);
+        assert_eq!(deadline_interrupt(&x2apic_page(0x0ff, 0xec, 0, 1), X2APIC), None);
     }
 
     #[test]

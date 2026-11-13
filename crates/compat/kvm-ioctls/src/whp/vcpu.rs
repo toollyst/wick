@@ -1225,12 +1225,14 @@ impl VcpuFd {
 
     /// The deadline was reached: clears `IA32_TSC_DEADLINE` and requests the
     /// LVT timer entry's interrupt for this vCPU, unless the processor would
-    /// raise none ([`tscdeadline::deadline_interrupt`]). On the vCPU's
-    /// thread, while it is out of the guest.
+    /// raise none ([`tscdeadline::deadline_interrupt`]), at the APIC ID its
+    /// mode has (`IA32_APIC_BASE`'s EXTD). On the vCPU's thread, while it is
+    /// out of the guest.
     fn raise_tsc_deadline(&self) -> Result<()> {
         self.shared.tsc_deadline.store(0, Ordering::SeqCst);
         let (page, _) = self.lapic_page()?;
-        if let Some((apic_id, vector)) = tscdeadline::deadline_interrupt(&page[..]) {
+        let apic_base = self.register(whv::WHvX64RegisterApicBase)?;
+        if let Some((apic_id, vector)) = tscdeadline::deadline_interrupt(&page[..], apic_base) {
             // Fixed delivery, edge, physical destination: an MSI to the APIC.
             let address = 0xFEE0_0000 | (u64::from(apic_id & 0xff) << 12);
             self.shared.inner.inject_msi(address, u32::from(vector));
@@ -6141,6 +6143,62 @@ mod fpu_tests {
             drop(vm);
             // SAFETY: the test's mapping, no VM left using it.
             assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+    }
+
+    /// An expired TSC deadline's interrupt goes to its own vCPU, in x2APIC
+    /// mode as in xAPIC mode: KVM raises it in the vCPU's own APIC (Linux
+    /// v6.1 arch/x86/kvm/lapic.c, `kvm_apic_local_deliver`). WHP's register
+    /// page holds an x2APIC-mode vCPU's ID as it is (X2E0REC c, CI run
+    /// 43521200989: vCPU 1's read `0x1000000` in xAPIC mode and `0x1` once
+    /// EXTD was set), so reading it in the xAPIC format (`>> 24`) sent
+    /// vCPU 1's interrupt to APIC 0. On an x2APIC partition, vCPU 1 in each
+    /// mode in turn, a deadline already reached raises the LVT timer's
+    /// vector, a different one each time: it is pending in vCPU 1's IRR and
+    /// not in vCPU 0's.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_deadline_interrupt_goes_to_its_own_vcpu_in_x2apic_mode() {
+        use super::super::ffi;
+        super::super::vm::APIC_MODE_FOR_TESTS.set(Some(whv::WHvX64LocalApicEmulationModeX2Apic));
+        let made = super::super::VmFd::create();
+        super::super::vm::APIC_MODE_FOR_TESTS.set(None);
+        let vm = made.unwrap();
+        let zero = vm.create_vcpu(0).unwrap();
+        let one = vm.create_vcpu(1).unwrap();
+        let put = |l: &mut kvm_lapic_state, at: usize, v: u32| {
+            for (i, b) in v.to_le_bytes().into_iter().enumerate() {
+                l.regs[at + i] = b as std::os::raw::c_char;
+            }
+        };
+        // Software-enabled; for vCPU 1 the timer one-shot with no count, as
+        // the page shows TSC-deadline mode, at `vector`.
+        let enable = |v: &VcpuFd, vector: Option<u32>| {
+            let mut l = v.get_lapic().unwrap();
+            put(&mut l, 0xf0, 0x1ff);
+            if let Some(vector) = vector {
+                put(&mut l, 0x320, vector);
+                put(&mut l, 0x380, 0);
+            }
+            v.set_lapic(&l).unwrap();
+        };
+        let pending = |v: &VcpuFd, vector: u32| {
+            let (p, _) = v.lapic_page().unwrap();
+            let at = 0x200 + 0x10 * (vector as usize / 32);
+            u32::from_le_bytes(p[at..at + 4].try_into().unwrap()) & (1 << (vector % 32)) != 0
+        };
+        enable(&zero, None);
+        for (x2apic, vector) in [(false, 0xec), (true, 0xed)] {
+            if x2apic {
+                ffi::set_register(one.part(), one.vp(), whv::WHvX64RegisterApicBase, ffi::reg64(0xFEE0_0C00)).unwrap();
+            }
+            enable(&one, Some(vector));
+            one.write_tsc_deadline(1).unwrap();
+            let (to_zero, to_one) = (pending(&zero, vector), pending(&one, vector));
+            assert!(
+                to_one && !to_zero,
+                "x2APIC mode {x2apic}: vector {vector:#x} pending in vCPU 0's IRR: {to_zero}, in vCPU 1's: {to_one}"
+            );
         }
     }
 
