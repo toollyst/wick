@@ -59,7 +59,7 @@ wick removes that limit without forking Firecracker in the usual sense:
 | Host | Hypervisor | Guests | Status |
 | --- | --- | --- | --- |
 | Linux x86_64, aarch64 | KVM | x86_64, aarch64 | **Upstream Firecracker** from the same source: the compatibility crates re-export the original crates, and the Linux backends are upstream's code. CI runs upstream's unit and integration tests on plain upstream and on wick, on the same machine, and requires the same result test by test |
-| macOS 15+ on Apple silicon | Hypervisor.framework | aarch64 | **Works.** Checked end to end against upstream's CI guest by [`tools/macos/boot-test.sh`](tools/macos/boot-test.sh) on macOS 27; on 15 and 26, CI runs the sandbox's tests (GitHub's macOS runners cannot boot a guest) |
+| macOS 15+ on Apple silicon | Hypervisor.framework | aarch64 | **Works.** Checked end to end against upstream's CI guest by [`tools/macos/boot-test.sh`](tools/macos/boot-test.sh) on macOS 27; on 15 and 26, CI runs the sandbox's tests, and on 26 also every crate's unit tests that make no VM, the jailer's unit tests as root and its scenario stages that start no VM (GitHub's macOS runners cannot boot a guest) |
 | Windows 10 (1803+) and 11, x86_64 | Windows Hypervisor Platform | x86_64 | **Preview.** The boot test's stages (all but the newest: [M3](docs/ROADMAP.md#m3-windows-first-boot-on-real-hardware)) and upstream's integration suites run on one Windows 11 PC (WHP needs real hardware: CI runs everything that needs no guest) |
 
 ### What works on macOS
