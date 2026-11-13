@@ -108,10 +108,13 @@ impossible integration_tests/security/test_jail.py::test_cgroups_parent_cgroup_b
 # Bind mounts into the jail (mount --bind of the kernel and rootfs) and
 # their propagation: Windows has no mount namespaces, and bind mounts only as
 # bind links (CreateBindLink, bindlink.dll), from Windows 11 24H2: made by an
-# administrator, seen by every process. Windows Server 2022 has no bindlink.dll
-# (measured). A jail's files are linked into its directory. The test's
-# counterpart through bind links, `jailer-test.ps1 bindlink`, is written and
-# not yet run; this stays impossible until it has.
+# administrator, seen by every process. No host it has run on has
+# System32\bindlink.dll: Windows Server 2022, Windows Server 2025 build 26100
+# (CI run 43428124115) and Windows 11 build 26300 (a PC). A jail's files are
+# linked into its directory. The test's counterpart through bind links,
+# `jailer-test.ps1 bindlink`, fails at that check on each (CI's step records
+# it and fails on anything else); this stays impossible until a host with the
+# DLL has run it.
 impossible integration_tests/security/test_jail.py::test_jailer_bind_mount_propagation
 
 # A 512 MiB tmpfs mounted for the snapshot, to make it run out of space:

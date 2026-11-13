@@ -1159,16 +1159,33 @@ jobs:
             'tools\windows\jailer-test.ps1', '-WorkDir', "$env:WJT-pidns", '-Assets', $env:WBT, '-Stage', 'pidns')
           Get-Content "$env:WJT-pidns\summary.txt" -ErrorAction SilentlyContinue
           if ($p.ExitCode -ne 0) { Write-Host "::error::jailer-test.ps1 pidns: exit $($p.ExitCode)"; exit 1 }
-      # A record: the stage has passed its first check nowhere (the one PC,
-      # Windows 11 build 26300, has no bindlink.dll). What this image answers
-      # is in the stage's line.
+      # Bind links need System32\bindlink.dll, which neither this image
+      # (Windows Server 2025, build 26100: run 43428124115) nor the one PC
+      # (Windows 11 build 26300) has. Without it the stage can only fail at
+      # that check, which is what the docs say (tools/windows/
+      # integration-test-differences.txt, test_jailer_bind_mount_propagation
+      # impossible here): the step then passes only if the stage failed with
+      # exactly that line and left no drive, and says so; anything else
+      # fails it. With the DLL the stage's result is the step's.
       - name: jailer-test.ps1 bindlink
         if: success() || failure()
         run: |
           Get-Item "$env:SystemRoot\System32\bindlink.dll", "$env:SystemRoot\System32\bindfltapi.dll" -ErrorAction SilentlyContinue |
             Format-Table Name, Length, @{ n = 'Version'; e = { $_.VersionInfo.FileVersion } }
+          $dll = Test-Path "$env:SystemRoot\System32\bindlink.dll"
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir "$env:WJT-bindlink" -Assets $env:WBT -Stage bindlink
-          exit $LASTEXITCODE
+          $rc = $LASTEXITCODE
+          if ($dll) { exit $rc }
+          $lines = @(Get-Content "$env:WJT-bindlink\summary.txt" -ErrorAction SilentlyContinue)
+          $refused = @($lines | Where-Object { $_ -match '^FAIL  bindlink: this Windows \(build \d+\) has no bind links: no .*\\bindlink\.dll ' })
+          $drives = @($lines | Where-Object { $_ -eq 'PASS  drives: every jail drive was removed' })
+          $failed = @($lines | Where-Object { $_.StartsWith('FAIL') })
+          if ($refused.Count -eq 1 -and $drives.Count -eq 1 -and $failed.Count -eq 1) {
+            Write-Host "::notice::bindlink: no bindlink.dll on this image; the stage failed at that check, as documented (test_jailer_bind_mount_propagation is impossible here)"
+            exit 0
+          }
+          Write-Host "::error::bindlink without bindlink.dll: expected only the stage's no-DLL failure and no drive left; got: $($lines -join ' | ')"
+          exit 1
       # Large pages need "Lock pages in memory" in the token, and a right
       # given to an account reaches only a logon made after it. So: the right
       # is given to this account (secedit), the account gets a password of

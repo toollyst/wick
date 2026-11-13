@@ -48,9 +48,11 @@
   guest boots from a kernel and root drive bound into the jail's root before
   the jailer starts, and the backing files' security descriptors are the same
   before, during and after; elevated, Windows 11 24H2 or later, else it fails
-  saying so; run once, elevated, on Windows 11 build 26300, where it failed
-  at that check: no `System32\bindlink.dll`, though Microsoft gives the
-  Bindlink API as available from build 25314; the rest has not run), `limits`
+  saying so; it has failed at that check, no `System32\bindlink.dll`, on
+  each host it ran on, though Microsoft gives the Bindlink API as available
+  from build 25314: Windows 11 build 26300 (a PC, elevated and not) and
+  Windows Server 2025 build 26100 (CI run 43428124115); the rest has not
+  run), `limits`
   (`memory.max` below the guest's memory: the VMM ends with 137), `memory`
   (a guest past the limit ends the VMM, and runs on under a larger one),
   `cpu` (`cpu.max` from Firecracker's start: twelve boots under it, each
@@ -172,7 +174,10 @@ every push, from the kit the `windows` job uploaded, in Windows PowerShell
   account. `gdb` installs MSYS2's `gdb-multiarch` (one package, pinned by
   file and checksum) and uses the kit's gdb build.
 - `jailer-test.ps1`: every stage; `pidns` in a console of its own (it types
-  into its console, and a step has none), `bindlink` in a step of its own.
+  into its console, and a step has none), `bindlink` in a step of its own:
+  on an image without `bindlink.dll` the step passes only when the stage
+  failed at that check alone and left no drive, and says so in a notice;
+  with the DLL the stage's result is the step's.
 
 A failed stage fails the job, the stages after it still run, and the logs
 are the artifact `windows-guest-logs`. A stage's result on the runner is a
