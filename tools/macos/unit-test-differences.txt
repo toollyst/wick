@@ -67,7 +67,7 @@
 #   vmm --lib: 1038 tests; 850 pass, 138 fail, 50 ignored (the ext:: helpers
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
-#   cpu-template-helper: 29 tests; 23 pass, 6 fail (4 no-hvf, 2 below).
+#   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf).
 #   compat-kvm-ioctls: 64 tests; 24 pass, 40 fail, all no-hvf (Error(1) at
 #   hv_vm_create; counted again with the guest-debug tests, with PV time's
 #   (the attribute's refusal where PV time is not offered is checked
@@ -85,15 +85,8 @@
 #   compat-event-manager, compat-kvm-bindings, compat-micro-http, compat-os,
 #   compat-vhost, compat-vm-memory.
 
-# cpu-template-helper: the fingerprint is read from Linux sysfs, which macOS
-# has not (docs/COMPATIBILITY.md, the cpu-template-helper row: 🟡). Windows
-# reads the same values from the registry (fingerprint/dump.rs
-# read_sysfs_file); macOS has no equivalent yet. test_fingerprint_dump_command
-# also creates a VM: without Hypervisor.framework it fails at that first.
-bug cpu-template-helper fingerprint::dump::tests::test_read_valid_sysfs_file
-bug cpu-template-helper tests::test_fingerprint_dump_command
-
-# cpu-template-helper: builds a microVM.
+# cpu-template-helper: builds a microVM (the fingerprint's dump too).
+no-hvf cpu-template-helper tests::test_fingerprint_dump_command
 no-hvf cpu-template-helper template::dump::tests::test_dump
 no-hvf cpu-template-helper tests::test_template_dump_command
 no-hvf cpu-template-helper tests::test_template_verify_command

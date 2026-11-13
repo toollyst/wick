@@ -1900,6 +1900,59 @@ def stage_machine_config(ctx):
         ", ".join(done)
 
 
+# MIDR_EL1's id in a CPU template's reg_modifiers (KVM_REG_ARM64_SYSREG op0
+# 3, op1 0, CRn 0, CRm 0, op2 0).
+MIDR_EL1_ID = "0x603000000013c000"
+
+
+def stage_fingerprint(ctx):
+    """cpu-template-helper's fingerprint names what a guest of this host
+    reads: on Linux its microcode_version is the host's REVIDR_EL1 from sysfs,
+    which a KVM guest reads too (arch/arm64/kvm/sys_regs.c
+    invariant_sys_regs); macOS cannot read the host's, so the field holds
+    what a guest reads under Hypervisor.framework (fingerprint/dump.rs), and
+    a guest's REVIDR_EL1 must be that value; the template's MIDR_EL1 is the
+    one the guest reads. The firmware fields are IODeviceTree:/chosen's
+    system-firmware-version, as ioreg shows it, and its major.minor; the
+    kernel is this host's release. Two dumps agree (upstream's
+    test_consecutive_fingerprint_consistency)."""
+    dumps = []
+    for i in (1, 2):
+        path = os.path.join(ctx.out, f"fingerprint-{i}.json")
+        r = subprocess.run([ctx.cpu_template_helper, "fingerprint", "dump", "--output", path],
+                           capture_output=True, text=True, timeout=120, check=False)
+        check(r.returncode == 0, f"fingerprint dump: exit {r.returncode}: {r.stderr.strip()[-500:]}")
+        with open(path, encoding="utf-8") as f:
+            dumps.append(json.load(f))
+    fp = dumps[0]
+    check(dumps[0] == dumps[1], "two consecutive fingerprints differ")
+    shown = subprocess.run(["/usr/sbin/ioreg", "-p", "IODeviceTree", "-r", "-n", "chosen", "-d", "1", "-l"],
+                           capture_output=True, text=True, timeout=60, check=True).stdout
+    m = re.search(r'"system-firmware-version" = <"([^"]*)">', shown)
+    check(m is not None, "ioreg shows no system-firmware-version in IODeviceTree:/chosen")
+    check(fp["bios_version"] == m[1], f"bios_version {fp['bios_version']!r}, ioreg shows {m[1]!r}")
+    release = re.fullmatch(r".*-(\d+)\.(\d+)(\.\d+)*", m[1])
+    check(release is not None and fp["bios_revision"] == f"{release[1]}.{release[2]}",
+          f"bios_revision {fp['bios_revision']!r} for firmware {m[1]!r}")
+    check(fp["kernel_version"] == os.uname().release,
+          f"kernel_version {fp['kernel_version']!r}, uname -r {os.uname().release!r}")
+    midr = [r["bitmap"] for r in fp["guest_cpu_config"]["reg_modifiers"] if r["addr"] == MIDR_EL1_ID]
+    check(len(midr) == 1, f"the fingerprint's CPU configuration has {len(midr)} MIDR_EL1 entries")
+    template_midr = int(midr[0].removeprefix("0b"), 2)
+    vm = ctx.vm("fingerprint", [], config(ctx))
+    vm.shell()
+    ident = "/sys/devices/system/cpu/cpu0/regs/identification"
+    _, revidr = vm.sh(f"cat {ident}/revidr_el1")
+    _, guest_midr = vm.sh(f"cat {ident}/midr_el1")
+    check(fp["microcode_version"] == revidr,
+          f"microcode_version {fp['microcode_version']!r}, the guest's REVIDR_EL1 {revidr!r}")
+    check(int(guest_midr, 16) == template_midr,
+          f"the template's MIDR_EL1 {template_midr:#x}, the guest's {guest_midr!r}")
+    vm.reboot()
+    return (f"REVIDR_EL1 {revidr} and MIDR_EL1 {guest_midr} as the guest reads them; firmware {fp['bios_version']} "
+            f"({fp['bios_revision']}), kernel {fp['kernel_version']}; two dumps agree")
+
+
 def stage_cli(ctx):
     """Firecracker's own command line: exit codes, --module, the start time
     flags, the logger and metrics on FIFOs, --boot-timer."""
@@ -2612,6 +2665,7 @@ STAGES = {
     "api-process": stage_api_process,
     "cli": stage_cli,
     "machine-config": stage_machine_config,
+    "fingerprint": stage_fingerprint,
     "tools": stage_tools,
     "no-seccomp": stage_no_seccomp,
     "memory-hotplug": stage_memory_hotplug,
@@ -2630,6 +2684,7 @@ class Context:
         self.rebase_snap = args.rebase_snap
         self.uffd_handler = args.uffd_handler
         self.vub = args.vhost_user_blk
+        self.cpu_template_helper = args.cpu_template_helper
         self.out = args.out
         # Unix socket paths must be shorter than 104 bytes.
         self.sock = tempfile.mkdtemp(prefix="wick-bt-", dir="/tmp")
@@ -2692,6 +2747,7 @@ def main():
     p.add_argument("--rebase-snap", required=True)
     p.add_argument("--uffd-handler", required=True)
     p.add_argument("--vhost-user-blk", required=True)
+    p.add_argument("--cpu-template-helper", required=True)
     p.add_argument("--cache", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("stages", nargs="*", default=list(STAGES),

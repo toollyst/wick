@@ -55,6 +55,7 @@ def main():
     vcpus = int(sys.argv[2]) if len(sys.argv) > 2 else 1
     args = types.SimpleNamespace(
         firecracker=sys.argv[1], snapshot_editor="", rebase_snap="", uffd_handler="", vhost_user_blk="",
+        cpu_template_helper="",
         cache=os.path.expanduser("~/Library/Caches/wick/boot-test"), out=tempfile.mkdtemp(prefix="guest-timer-"))
     ctx = bt.Context(args)
     try:

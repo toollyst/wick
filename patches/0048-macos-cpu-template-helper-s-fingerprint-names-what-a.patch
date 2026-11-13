@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Fri, 13 Nov 2026 23:07:16 +0900
+Subject: [PATCH] macos: cpu-template-helper's fingerprint names what a guest
+ of the host reads
+
+The fingerprint reads three Linux sysfs files about the host. macOS has
+none of them, so `fingerprint dump` failed at the first one ("Failed to
+read .../revidr_el1: No such file or directory"). On macOS
+read_sysfs_file now gives each file from macOS's sources, holding what
+the field tells of a guest's host. Linux's code path is unchanged; the
+read_to_string import and read_sysfs_file are left out on macOS as on
+Windows.
+
+- revidr_el1 (the field microcode_version on aarch64):
+  - On Linux this is the host's REVIDR_EL1, and a KVM guest reads the
+    same value (v6.1 arch/arm64/kvm/sys_regs.c, invariant_sys_regs).
+  - The host's REVIDR_EL1 cannot be read on macOS. It is an EL1 register,
+    no sysctl gives it, and Hypervisor.framework has no register for it
+    (hv_vcpu_types.h).
+  - So the file holds what every guest reads under Hypervisor.framework:
+    0, in Linux's "0x%016llx" (arch/arm64/kernel/cpuinfo.c).
+  - wick's boot-test `fingerprint` stage reads it in a guest and compares.
+- bios_version: Apple silicon has no SMBIOS. The file holds
+  IODeviceTree:/chosen's system-firmware-version, the Mac's firmware
+  ("mBoot-20457.41.3"), read through IOKit. A missing entry or property is
+  an error naming it.
+- bios_release: SMBIOS's BIOS release is the firmware's major.minor
+  release ("%u.%u", drivers/firmware/dmi_scan.c). The file holds that of
+  the firmware version ("20457.41"). A version without one is refused.
+
+Upstream test it unlocks: test_consecutive_fingerprint_consistency
+(passes, macOS 27.2). fingerprint::dump::tests::test_read_valid_sysfs_file
+passes too. New test: test_macos_firmware_is_ioregs (the values ioreg shows,
+and the refusals).
+
+Still different: a change of the host CPU's revision does not show in
+microcode_version, which is the same on every Mac. The CPU configuration's
+MIDR_EL1 is Hypervisor.framework's generic Apple MIDR (0x610f0000), what
+the guest reads, not the host's part number.
+---
+ .../src/fingerprint/dump.rs                   | 174 +++++++++++++++++-
+ 1 file changed, 171 insertions(+), 3 deletions(-)
+
+diff --git a/src/cpu-template-helper/src/fingerprint/dump.rs b/src/cpu-template-helper/src/fingerprint/dump.rs
+index 3beaa8ae77a9f55ac12a80ba96a9daecbe4e07a2..ecf60a0a02826095756fc9089393b80ced99d9e8 100644
+--- a/src/cpu-template-helper/src/fingerprint/dump.rs
++++ b/src/cpu-template-helper/src/fingerprint/dump.rs
+@@ -1,8 +1,8 @@
+ // Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
+-// wick: Linux's files are not read on Windows (read_sysfs_file).
+-#[cfg(not(windows))]
++// wick: Linux's files are not read on Windows or macOS (read_sysfs_file).
++#[cfg(not(any(windows, target_os = "macos")))]
+ use std::fs::read_to_string;
+ use std::sync::{Arc, Mutex};
+ 
+@@ -61,7 +61,7 @@ fn get_kernel_version() -> Result<String, FingerprintDumpError> {
+     Ok(version.to_string())
+ }
+ 
+-#[cfg(not(windows))]
++#[cfg(not(any(windows, target_os = "macos")))]
+ fn read_sysfs_file(path: &str) -> Result<String, FingerprintDumpError> {
+     let s = read_to_string(path)
+         .map_err(|err| FingerprintDumpError::ReadSysfsFile(path.to_string(), err))?;
+@@ -87,6 +87,142 @@ fn read_sysfs_file(path: &str) -> Result<String, FingerprintDumpError> {
+     value.map_err(|err| FingerprintDumpError::ReadSysfsFile(path.to_string(), err))
+ }
+ 
++// wick: macOS has no sysfs; each file the fingerprint reads holds what it
++// tells of a guest's host, from macOS's sources. Any other path is not
++// found, as on Linux.
++// - revidr_el1: the host's REVIDR_EL1 cannot be read on macOS: it is an EL1
++//   register, no sysctl gives it, and Hypervisor.framework has no register
++//   for it (hv_vcpu_types.h lists MIDR_EL1 and MPIDR_EL1 of the ID
++//   registers). On Linux the file is also what a KVM guest reads, as KVM
++//   gives the guest the host's (Linux v6.1 arch/arm64/kvm/sys_regs.c,
++//   invariant_sys_regs); here it holds what every guest reads under
++//   Hypervisor.framework, 0 (tools/macos/boot-test.py `fingerprint` reads
++//   it in a guest), in Linux's format (arch/arm64/kernel/cpuinfo.c,
++//   "0x%016llx").
++// - bios_version: Apple silicon has no SMBIOS; the Mac's firmware version is
++//   IODeviceTree:/chosen's system-firmware-version ("mBoot-20457.41.3", the
++//   System Firmware Version System Information shows).
++// - bios_release: SMBIOS's BIOS release is the firmware's major.minor
++//   release ("%u.%u", drivers/firmware/dmi_scan.c); here that of the
++//   firmware version ("20457.41").
++#[cfg(target_os = "macos")]
++fn read_sysfs_file(path: &str) -> Result<String, FingerprintDumpError> {
++    let value = match path {
++        "/sys/devices/system/cpu/cpu0/regs/identification/revidr_el1" => {
++            Ok(format!("0x{:016x}", 0u64))
++        }
++        "/sys/devices/virtual/dmi/id/bios_version" => iokit::firmware_version(),
++        "/sys/devices/virtual/dmi/id/bios_release" => {
++            iokit::firmware_version().and_then(|version| firmware_release(&version))
++        }
++        _ => Err(std::io::ErrorKind::NotFound.into()),
++    };
++    value.map_err(|err| FingerprintDumpError::ReadSysfsFile(path.to_string(), err))
++}
++
++// wick: "<name>-<major>.<minor>[.<more>]" gives "<major>.<minor>".
++#[cfg(target_os = "macos")]
++fn firmware_release(version: &str) -> std::io::Result<String> {
++    let numbers = version.rsplit_once('-').map_or(version, |(_, n)| n);
++    let mut parts = numbers.split('.');
++    match (parts.next(), parts.next()) {
++        (Some(major), Some(minor))
++            if [major, minor]
++                .iter()
++                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) =>
++        {
++            Ok(format!("{major}.{minor}"))
++        }
++        _ => Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidData,
++            format!("the firmware version {version:?} has no major.minor release"),
++        )),
++    }
++}
++
++// wick: a data property of an IORegistry entry, read through IOKit; a
++// missing entry or property is an error naming it.
++#[cfg(target_os = "macos")]
++mod iokit {
++    use std::ffi::{CStr, c_char, c_void};
++    use std::io;
++
++    type CFTypeRef = *const c_void;
++
++    #[link(name = "IOKit", kind = "framework")]
++    unsafe extern "C" {
++        fn IORegistryEntryFromPath(main_port: u32, path: *const c_char) -> u32;
++        fn IORegistryEntryCreateCFProperty(
++            entry: u32,
++            key: CFTypeRef,
++            allocator: CFTypeRef,
++            options: u32,
++        ) -> CFTypeRef;
++        fn IOObjectRelease(object: u32) -> i32;
++    }
++
++    #[link(name = "CoreFoundation", kind = "framework")]
++    unsafe extern "C" {
++        fn CFStringCreateWithCString(alloc: CFTypeRef, s: *const c_char, encoding: u32) -> CFTypeRef;
++        fn CFGetTypeID(cf: CFTypeRef) -> usize;
++        fn CFDataGetTypeID() -> usize;
++        fn CFDataGetLength(data: CFTypeRef) -> isize;
++        fn CFDataGetBytePtr(data: CFTypeRef) -> *const u8;
++        fn CFRelease(cf: CFTypeRef);
++    }
++
++    /// kCFStringEncodingUTF8.
++    const UTF8: u32 = 0x0800_0100;
++
++    pub fn data(path: &CStr, key: &CStr) -> io::Result<Vec<u8>> {
++        let missing = |what: &str| io::Error::new(io::ErrorKind::NotFound, format!("{what}: not found"));
++        // SAFETY: NUL-terminated strings; each object made here is released
++        // here, and the data's bytes are copied before it is.
++        unsafe {
++            // kIOMainPortDefault is MACH_PORT_NULL.
++            let entry = IORegistryEntryFromPath(0, path.as_ptr());
++            if entry == 0 {
++                return Err(missing(&path.to_string_lossy()));
++            }
++            let name = CFStringCreateWithCString(std::ptr::null(), key.as_ptr(), UTF8);
++            let value = if name.is_null() {
++                std::ptr::null()
++            } else {
++                IORegistryEntryCreateCFProperty(entry, name, std::ptr::null(), 0)
++            };
++            if !name.is_null() {
++                CFRelease(name);
++            }
++            IOObjectRelease(entry);
++            let what = format!("{} {}", path.to_string_lossy(), key.to_string_lossy());
++            if value.is_null() {
++                return Err(missing(&what));
++            }
++            let bytes = if CFGetTypeID(value) == CFDataGetTypeID() {
++                let len = usize::try_from(CFDataGetLength(value)).unwrap_or(0);
++                Ok(std::slice::from_raw_parts(CFDataGetBytePtr(value), len).to_vec())
++            } else {
++                Err(io::Error::new(io::ErrorKind::InvalidData, format!("{what}: not data")))
++            };
++            CFRelease(value);
++            bytes
++        }
++    }
++
++    /// IODeviceTree:/chosen's system-firmware-version, without its NULs.
++    pub fn firmware_version() -> io::Result<String> {
++        let bytes = data(c"IODeviceTree:/chosen", c"system-firmware-version")?;
++        let text = String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string();
++        if text.is_empty() || text.contains('\0') {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                format!("IODeviceTree:/chosen system-firmware-version: {bytes:?}"),
++            ));
++        }
++        Ok(text)
++    }
++}
++
+ #[cfg(all(target_arch = "x86_64", windows))]
+ fn get_microcode_version() -> Result<String, FingerprintDumpError> {
+     // wick: the revision Windows read from the processor at boot, as Linux's
+@@ -186,6 +322,38 @@ mod tests {
+         read_sysfs_file(valid_sysfs_path).unwrap();
+     }
+ 
++    // wick: the firmware's version and release on macOS are those ioreg(8)
++    // shows, and a version without a major.minor release is refused.
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn test_macos_firmware_is_ioregs() {
++        let out = std::process::Command::new("/usr/sbin/ioreg")
++            .args(["-p", "IODeviceTree", "-r", "-n", "chosen", "-d", "1", "-l"])
++            .output()
++            .unwrap();
++        let text = String::from_utf8(out.stdout).unwrap();
++        let line = text
++            .lines()
++            .find(|l| l.contains("\"system-firmware-version\" = <\""))
++            .unwrap();
++        let shown = line.split("<\"").nth(1).unwrap().trim_end_matches("\">");
++        let version = read_sysfs_file("/sys/devices/virtual/dmi/id/bios_version").unwrap();
++        assert_eq!(version, shown);
++        let release = read_sysfs_file("/sys/devices/virtual/dmi/id/bios_release").unwrap();
++        assert!(version.contains(&format!("-{release}.")) || version.ends_with(&format!("-{release}")));
++        assert_eq!(
++            read_sysfs_file("/sys/devices/system/cpu/cpu0/regs/identification/revidr_el1").unwrap(),
++            "0x0000000000000000"
++        );
++        assert_eq!(firmware_release("mBoot-20457.41.3").unwrap(), "20457.41");
++        assert_eq!(firmware_release("iBoot-11881.1").unwrap(), "11881.1");
++        for bad in ["mBoot-20457", "mBoot-", "mBoot-a.b", ""] {
++            firmware_release(bad).unwrap_err();
++        }
++        iokit::data(c"IODeviceTree:/chosen", c"no-such-property").unwrap_err();
++        iokit::data(c"IODeviceTree:/no-such-node", c"system-firmware-version").unwrap_err();
++    }
++
+     #[test]
+     fn test_read_invalid_sysfs_file() {
+         let invalid_sysfs_path = "/sys/invalid/path";

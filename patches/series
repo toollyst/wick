@@ -47,3 +47,4 @@
 0045-vmm-a-vCPU-thread-is-the-host-s-to-prepare-when-it-i.patch
 0046-macos-the-descriptor-table-is-sized-to-what-the-proc.patch
 0047-macos-the-guest-s-caches-are-the-host-s-read-from-XN.patch
+0048-macos-cpu-template-helper-s-fingerprint-names-what-a.patch

@@ -18,7 +18,7 @@
 #
 # Stages (default: all, in this order): boot smp block vsock net vmnet
 # snapshot snapshot-permissions diff uffd hugepages pci vhost-user
-# vhost-user-hotplug devices balloon restores api-process cli machine-config tools
+# vhost-user-hotplug devices balloon restores api-process cli machine-config fingerprint tools
 # no-seccomp memory-hotplug cpu-templates pvtime (PV steal time: on macOS 27 its figures,
 # elsewhere that it is not offered). vmnet uses vmnet-shared (NAT); older macOS
 # releases need root for vmnet.framework.
@@ -42,11 +42,16 @@ export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/lib/firecracker/build/cargo_target}"
 "$ROOT/tools/macos/run.sh" --build-only ${cargo_profile[@]+"${cargo_profile[@]}"}
 (cd "$ROOT/lib/firecracker" &&
-    CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked ${cargo_profile[@]+"${cargo_profile[@]}"} -p snapshot-editor -p rebase-snap &&
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked ${cargo_profile[@]+"${cargo_profile[@]}"} -p snapshot-editor -p rebase-snap \
+        -p cpu-template-helper &&
     CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked ${cargo_profile[@]+"${cargo_profile[@]}"} -p firecracker \
         --example uffd_on_demand_handler)
 (cd "$ROOT/tools/vhost-user-blk" && CARGO_TARGET_DIR="$ROOT/lib/firecracker/build/vhost-user-blk" \
     cargo build --release --locked)
+# cpu-template-helper boots a microVM for its fingerprint (the fingerprint
+# stage): Hypervisor.framework serves only a signed entitlement.
+codesign --force --sign - --entitlements "$ROOT/tools/macos/hypervisor.entitlements" \
+    "$TARGET_DIR/$PROFILE/cpu-template-helper"
 
 OUT="$ROOT/build/boot-test/$(date +%Y%m%d-%H%M%S)"
 exec python3 -I "$ROOT/tools/macos/boot-test.py" \
@@ -55,5 +60,6 @@ exec python3 -I "$ROOT/tools/macos/boot-test.py" \
     --rebase-snap "$TARGET_DIR/$PROFILE/rebase-snap" \
     --uffd-handler "$TARGET_DIR/$PROFILE/examples/uffd_on_demand_handler" \
     --vhost-user-blk "$ROOT/lib/firecracker/build/vhost-user-blk/release/vhost-user-blk" \
+    --cpu-template-helper "$TARGET_DIR/$PROFILE/cpu-template-helper" \
     --cache "$HOME/Library/Caches/wick/boot-test" \
     --out "$OUT" "$@"

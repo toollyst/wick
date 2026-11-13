@@ -208,13 +208,6 @@ all arch integration_tests/functional/test_topology.py::test_cache_topology[vmli
 all arch integration_tests/functional/test_pause_resume.py::test_kvmclock_ctrl
 all arch integration_tests/functional/test_cpu_template_helper.py::test_cpu_config_dump_vs_actual
 
-# cpu-template-helper's fingerprint reads the host CPU's identification
-# registers in /sys/devices/system/cpu/cpu0/regs/identification
-# ("Failed to read .../revidr_el1: No such file or directory"); macOS has
-# no such directory. To do: the fingerprint's host fields from macOS
-# (sysctl hw.*, the vCPU's own ID registers).
-all bug integration_tests/functional/test_cpu_template_helper.py::test_consecutive_fingerprint_consistency
-
 # The test reads 100 times the rate limiter's bucket from /dev/hwrng within
 # ssh's 100 s, and its 1000 KB/s case needs the device to give at least
 # 1 MB/s. Measured without a rate limiter (scratch probe, load ~80): 80 KB/s,
