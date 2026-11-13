@@ -7,7 +7,10 @@
 //! and written as KVM's, a service turned off by its bit, and the whole
 //! register list saved and written to a new VM as a snapshot does.
 
-use kvm_bindings::{KVM_REG_SIZE_MASK, KVM_REG_SIZE_U32, KVM_SYSTEM_EVENT_RESET, RegList};
+use kvm_bindings::{
+    KVM_ARM_VCPU_POWER_OFF, KVM_MP_STATE_STOPPED, KVM_REG_SIZE_MASK, KVM_REG_SIZE_U32, KVM_SYSTEM_EVENT_RESET,
+    KVM_SYSTEM_EVENT_SHUTDOWN, RegList, kvm_vcpu_init,
+};
 
 use super::exit::{KVM_UID, PV_TIME_FEATURES, PV_TIME_ST};
 use super::pvtime::tests::{PC, PSTATE, RAM, X9, mmio_values, new_vcpu, vm_with_code};
@@ -21,6 +24,8 @@ const HVC: u32 = 0xd400_0002;
 /// -1, -2 as the 64-bit X0 the guest reads.
 const NOT_SUPPORTED: u64 = -1i64 as u64;
 const INVALID_PARAMS: u64 = -2i64 as u64;
+const ALREADY_ON: u64 = -4i64 as u64;
+const INTERNAL_FAILURE: u64 = -6i64 as u64;
 
 /// `xN = value` (movz, then a movk for each other non-zero 16 bits).
 fn mov(reg: u32, value: u64) -> Vec<u32> {
@@ -36,12 +41,17 @@ fn mov(reg: u32, value: u64) -> Vec<u32> {
 
 /// `x0 = id; x1 = arg; hvc #0`, then `str xN, [x9]` for each of `stored`.
 fn call(id: u32, arg: u64, stored: std::ops::Range<u32>) -> Vec<u32> {
-    let mut code = mov(0, u64::from(id));
-    code.extend(mov(1, arg));
     // X2 and X3 hold what the call before left: cleared, so that a call
     // that does not write them shows.
-    code.extend(mov(2, 0));
-    code.extend(mov(3, 0));
+    call3(id, [arg, 0, 0], stored)
+}
+
+/// [`call`] with X1 to X3 given.
+fn call3(id: u32, args: [u64; 3], stored: std::ops::Range<u32>) -> Vec<u32> {
+    let mut code = mov(0, u64::from(id));
+    for (reg, arg) in (1..).zip(args) {
+        code.extend(mov(reg, arg));
+    }
     code.push(HVC);
     code.extend(stored.map(|reg| 0xf900_0120 | reg));
     code
@@ -164,6 +174,209 @@ fn test_psci_1_1_system_reset2_as_on_kvm() {
         assert_eq!((event, data), (KVM_SYSTEM_EVENT_RESET, vec![0]), "{version:#x}");
         drop(vm);
     }
+}
+
+/// The core register `xN`'s id (KVM_REG_ARM_CORE, two 32-bit words a register).
+fn x(n: u64) -> u64 {
+    0x6030_0000_0010_0000 + 2 * n
+}
+
+/// A vCPU that starts powered off (KVM_ARM_VCPU_POWER_OFF).
+fn new_vcpu_off(vm: &crate::VmFd, id: u64) -> VcpuFd {
+    let vcpu = vm.create_vcpu(id).unwrap();
+    let mut kvi = kvm_vcpu_init::default();
+    vm.get_preferred_target(&mut kvi).unwrap();
+    kvi.features[0] |= 1 << KVM_ARM_VCPU_POWER_OFF;
+    vcpu.vcpu_init(&kvi).unwrap();
+    vcpu
+}
+
+// Every PSCI call returns as KVM's (Linux 6.1 arch/arm64/kvm/psci.c
+// kvm_psci_0_2_call, kvm_psci_1_x_call: `smccc_set_retval(vcpu, val, 0, 0,
+// 0)`): X1 to X3 are 0 after the call, whatever the guest had in them.
+// PSCI_FEATURES looks at the low half of X1 (`u32 arg`). AFFINITY_INFO
+// (kvm_psci_vcpu_affinity_info) is INVALID_PARAMS for a target with a bit
+// outside the MPIDR's affinity fields, for a level over 3 and when no vCPU
+// matches, and looks only at the fields from the level upwards; CPU_ON
+// (kvm_psci_vcpu_on) refuses the same targets, and one that is on with
+// ALREADY_ON; their SMC32 forms take the low half of each argument
+// (kvm_psci_narrow_to_32bit). SYSTEM_OFF leaves [INTERNAL_FAILURE, 0, 0, 0]
+// in the registers of the vCPU that called it.
+#[test]
+fn test_psci_calls_return_as_kvms() {
+    const VERSION: u32 = 0x8400_0000;
+    const FEATURES: u32 = 0x8400_000a;
+    const AFFINITY_INFO: u32 = 0x8400_0004;
+    const AFFINITY_INFO_64: u32 = 0xc400_0004;
+    const CPU_ON: u32 = 0x8400_0003;
+    const CPU_ON_64: u32 = 0xc400_0003;
+    let hi = 1u64 << 40;
+    let code = program(&[
+        call3(VERSION, [5, 6, 7], 0..4),
+        call3(FEATURES, [u64::from(VERSION), 6, 7], 0..4),
+        call3(FEATURES, [1 << 32 | u64::from(CPU_ON_64), 6, 7], 0..4),
+        call3(FEATURES, [0x8400_0005, 6, 7], 0..4),
+        // MIGRATE_INFO_TYPE, and an id PSCI does not have.
+        call3(0x8400_0006, [5, 6, 7], 0..4),
+        call3(0x8400_0005, [5, 6, 7], 0..4),
+        // vCPU 1 is off, vCPU 0 (the caller) on, there is no vCPU 2.
+        call3(AFFINITY_INFO_64, [1, 0, 7], 0..4),
+        call3(AFFINITY_INFO_64, [0, 0, 7], 0..4),
+        call3(AFFINITY_INFO_64, [2, 0, 7], 0..4),
+        // From level 1 upwards vCPU 0 and 1 are the same: one is on.
+        call3(AFFINITY_INFO_64, [1, 1, 7], 0..4),
+        call3(AFFINITY_INFO_64, [0x100, 1, 7], 0..4),
+        call3(AFFINITY_INFO_64, [0x100, 2, 7], 0..4),
+        call3(AFFINITY_INFO_64, [1, 4, 7], 0..4),
+        // Bit 24 is in no affinity field; bit 40 neither, and the SMC32
+        // call does not see it, nor the upper half of the level.
+        call3(AFFINITY_INFO_64, [1 << 24 | 1, 0, 7], 0..4),
+        call3(AFFINITY_INFO_64, [hi | 1, 0, 7], 0..4),
+        call3(AFFINITY_INFO, [hi | 1, hi, 7], 0..4),
+        call3(AFFINITY_INFO_64, [1, hi, 7], 0..4),
+        call3(CPU_ON_64, [0, 6, 7], 0..4),
+        call3(CPU_ON_64, [2, 6, 7], 0..4),
+        call3(CPU_ON_64, [1 << 24 | 1, 6, 7], 0..4),
+        call3(CPU_ON_64, [hi, 6, 7], 0..4),
+        call3(CPU_ON, [hi, 6, 7], 0..4),
+        // SYSTEM_OFF.
+        call3(0x8400_0008, [5, 6, 7], 0..4),
+    ]);
+    let (vm, _) = vm_with_code(&code, 0);
+    let mut vcpu = new_vcpu(&vm, 0);
+    let _off = new_vcpu_off(&vm, 1);
+    let (values, event, data, regs) = std::thread::spawn(move || {
+        vcpu.set_one_reg(PC, &RAM.to_le_bytes()).unwrap();
+        vcpu.set_one_reg(PSTATE, &0x3c5u64.to_le_bytes()).unwrap();
+        vcpu.set_one_reg(X9, &0x1000u64.to_le_bytes()).unwrap();
+        let mut values = Vec::new();
+        let (event, data) = loop {
+            match vcpu.run().unwrap() {
+                VcpuExit::MmioWrite(0x1000, data) => values.push(u64::from_le_bytes(data.try_into().unwrap())),
+                VcpuExit::SystemEvent(event, data) => break (event, data.to_vec()),
+                other => panic!("unexpected exit {other:?}"),
+            }
+        };
+        (values, event, data, [0, 1, 2, 3].map(|n| read(&vcpu, x(n))))
+    })
+    .join()
+    .unwrap();
+    let want: [(&str, u64); 22] = [
+        ("PSCI_VERSION", PSCI_VERSION_1_1),
+        ("PSCI_FEATURES of PSCI_VERSION", 0),
+        ("PSCI_FEATURES of CPU_ON with the upper half of X1 set", 0),
+        ("PSCI_FEATURES of MIGRATE", NOT_SUPPORTED),
+        ("MIGRATE_INFO_TYPE", 2),
+        ("MIGRATE", NOT_SUPPORTED),
+        ("AFFINITY_INFO of vCPU 1", 1),
+        ("AFFINITY_INFO of vCPU 0", 0),
+        ("AFFINITY_INFO of vCPU 2", INVALID_PARAMS),
+        ("AFFINITY_INFO of 1 at level 1", 0),
+        ("AFFINITY_INFO of 0x100 at level 1", INVALID_PARAMS),
+        ("AFFINITY_INFO of 0x100 at level 2", 0),
+        ("AFFINITY_INFO at level 4", INVALID_PARAMS),
+        ("AFFINITY_INFO with bit 24", INVALID_PARAMS),
+        ("AFFINITY_INFO with bit 40", INVALID_PARAMS),
+        ("SMC32 AFFINITY_INFO with bit 40", 1),
+        ("AFFINITY_INFO at level 1 << 40", INVALID_PARAMS),
+        ("CPU_ON of the caller", ALREADY_ON),
+        ("CPU_ON of vCPU 2", INVALID_PARAMS),
+        ("CPU_ON with bit 24", INVALID_PARAMS),
+        ("CPU_ON with bit 40", INVALID_PARAMS),
+        ("SMC32 CPU_ON with bit 40: the caller", ALREADY_ON),
+    ];
+    assert_eq!(values.len(), 4 * want.len());
+    for ((name, x0), answer) in want.iter().zip(values.chunks(4)) {
+        assert_eq!(answer, [*x0, 0, 0, 0], "{name}");
+    }
+    assert_eq!((event, data), (KVM_SYSTEM_EVENT_SHUTDOWN, vec![0]));
+    assert_eq!(regs, [INTERNAL_FAILURE, 0, 0, 0], "after SYSTEM_OFF");
+}
+
+/// Runs `code` on one vCPU until its system event; the event and X0 to X3
+/// after it.
+fn registers_at_system_event(code: &[u32], version: u64) -> (u32, Vec<u64>, [u64; 4]) {
+    let (vm, _) = vm_with_code(code, 0);
+    let mut vcpu = new_vcpu(&vm, 0);
+    vcpu.set_one_reg(PSCI_VERSION_ID, &version.to_le_bytes()).unwrap();
+    std::thread::spawn(move || {
+        vcpu.set_one_reg(PC, &RAM.to_le_bytes()).unwrap();
+        vcpu.set_one_reg(PSTATE, &0x3c5u64.to_le_bytes()).unwrap();
+        match vcpu.run().unwrap() {
+            VcpuExit::SystemEvent(event, data) => (event, data.to_vec(), [0, 1, 2, 3].map(|n| read(&vcpu, x(n)))),
+            other => panic!("unexpected exit {other:?}"),
+        }
+    })
+    .join()
+    .unwrap()
+}
+
+// What SYSTEM_RESET and SYSTEM_RESET2 leave in the caller's registers, as
+// KVM (psci.c): SYSTEM_RESET [INTERNAL_FAILURE, 0, 0, 0], under every PSCI
+// version; a SYSTEM_RESET2 that resets writes X0 alone (`vcpu_set_reg(vcpu,
+// 0, PSCI_RET_INTERNAL_FAILURE); return 0`), X1 to X3 staying the guest's,
+// which the SMC32 call has cut to their low halves before
+// (kvm_psci_narrow_to_32bit).
+#[test]
+fn test_a_reset_leaves_the_registers_kvm_leaves() {
+    let hi = 1u64 << 32;
+    for version in [PSCI_VERSION_1_1, PSCI_VERSION_1_0, PSCI_VERSION_0_2] {
+        let code = program(&[call3(0x8400_0009, [5, hi | 6, 7], 0..0)]);
+        assert_eq!(
+            registers_at_system_event(&code, version),
+            (KVM_SYSTEM_EVENT_RESET, vec![0], [INTERNAL_FAILURE, 0, 0, 0]),
+            "{version:#x}"
+        );
+    }
+    let args = [hi | 0x8000_0001, hi | 6, hi | 7];
+    for (id, left) in [(0xc400_0012, args), (0x8400_0012, [0x8000_0001, 6, 7])] {
+        let code = program(&[call3(id, args, 0..0)]);
+        assert_eq!(
+            registers_at_system_event(&code, PSCI_VERSION_1_1),
+            (KVM_SYSTEM_EVENT_RESET, vec![1], [INTERNAL_FAILURE, left[0], left[1], left[2]]),
+            "{id:#x}"
+        );
+    }
+}
+
+// CPU_OFF returns SUCCESS through the same path (kvm_psci_0_2_call: `val =
+// PSCI_RET_SUCCESS`, then smccc_set_retval): the stopped vCPU's X0 to X3
+// are 0, which is what a snapshot of it holds. vCPU 1 calls CPU_OFF; vCPU
+// 0 asks AFFINITY_INFO until vCPU 1 is off and then stores to MMIO, at
+// which vCPU 1 is kicked out of its run and read.
+#[test]
+fn test_cpu_off_leaves_the_registers_kvm_leaves() {
+    let mut code = call3(0xc400_0004, [1, 0, 0], 0..0);
+    let back = code.len() as u32 + 1;
+    code.push(0xf100_041f); // cmp x0, #1
+    code.push(0x5400_0001 | (back.wrapping_neg() & 0x7_ffff) << 5); // b.ne to the start
+    code.push(0xf900_0120); // str x0, [x9]
+    code.push(0x1400_0000); // b .
+    let entry = RAM + 4 * code.len() as u64;
+    code.extend(program(&[call3(0x8400_0002, [5, 6, 7], 0..0)]));
+    let (vm, _) = vm_with_code(&code, 0);
+    let mut first = new_vcpu(&vm, 0);
+    let mut second = new_vcpu(&vm, 1);
+    let kick = second.kick_for_test();
+    let stopped = std::thread::spawn(move || {
+        second.set_one_reg(PC, &entry.to_le_bytes()).unwrap();
+        second.set_one_reg(PSTATE, &0x3c5u64.to_le_bytes()).unwrap();
+        assert_eq!(second.run().unwrap_err().errno(), libc::EINTR);
+        (second.get_mp_state().unwrap().mp_state, [0, 1, 2, 3].map(|n| read(&second, x(n))))
+    });
+    std::thread::spawn(move || {
+        first.set_one_reg(PC, &RAM.to_le_bytes()).unwrap();
+        first.set_one_reg(PSTATE, &0x3c5u64.to_le_bytes()).unwrap();
+        first.set_one_reg(X9, &0x1000u64.to_le_bytes()).unwrap();
+        match first.run().unwrap() {
+            VcpuExit::MmioWrite(0x1000, data) => assert_eq!(data, 1u64.to_le_bytes()),
+            other => panic!("unexpected exit {other:?}"),
+        }
+    })
+    .join()
+    .unwrap();
+    kick();
+    assert_eq!(stopped.join().unwrap(), (KVM_MP_STATE_STOPPED, [0, 0, 0, 0]));
 }
 
 fn read(vcpu: &VcpuFd, id: u64) -> u64 {

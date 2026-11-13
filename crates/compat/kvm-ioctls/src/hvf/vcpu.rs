@@ -48,6 +48,8 @@ const PSCI_RET_ALREADY_ON: i64 = -4;
 const PSCI_RET_INTERNAL_FAILURE: i64 = -6;
 /// "Trusted OS not present": no migration needed.
 const PSCI_TOS_NOT_PRESENT_MP: i64 = 2;
+/// PSCI_0_2_64BIT: the bit of a function id that makes it the SMC64 call.
+const PSCI_0_2_64BIT: u32 = 0x4000_0000;
 
 const MPIDR_AFFINITY_MASK: u64 = 0xff_00ff_ffff;
 /// `kvm_run.system_event.data` of a PSCI SYSTEM_OFF or SYSTEM_RESET exit:
@@ -1392,7 +1394,8 @@ impl VcpuFd {
     /// KVM's vendor services). Returns a system event to report, if any,
     /// with its data.
     fn psci(&self, hv: hv_vcpu_t) -> Result<Option<(u32, &'static [u64; 1])>> {
-        let call = Psci::decode(self.reg(hv, HV_REG_X0)?);
+        let id = self.reg(hv, HV_REG_X0)?;
+        let call = Psci::decode(id);
         let x1 = self.reg(hv, HV_REG_X0 + 1)?;
         // The guest's PSCI version: 1.`minor`, or 0.2 (`None`).
         let version = self.vm()?.psci_version.load(Ordering::Relaxed);
@@ -1447,19 +1450,35 @@ impl VcpuFd {
             }
             return Ok(None);
         }
+        // PSCI's own calls (psci.c kvm_psci_call). An SMC32 CPU_ON,
+        // AFFINITY_INFO or SYSTEM_RESET2 takes the low 32 bits of its
+        // arguments (kvm_psci_narrow_to_32bit).
+        let narrow = id as u32 & PSCI_0_2_64BIT == 0;
+        let arg = |n: hv_reg_t| -> Result<u64> {
+            let v = self.reg(hv, HV_REG_X0 + n)?;
+            Ok(if narrow { u64::from(v as u32) } else { v })
+        };
+        let mut event = None;
         let ret: i64 = match call {
             Psci::Version => version as i64,
-            Psci::Features if minor.is_some_and(|minor| Psci::implemented(x1, minor)) => PSCI_RET_SUCCESS,
+            // The function asked about is a u32 (`u32 arg =
+            // smccc_get_arg1()`): the upper half of X1 is not looked at.
+            Psci::Features if minor.is_some_and(|minor| Psci::implemented(x1 as u32, minor)) => PSCI_RET_SUCCESS,
             Psci::Features => PSCI_RET_NOT_SUPPORTED,
             // PSCI 1.1 (kvm_psci_1_x_call): an architectural reset type up
             // to SYSTEM_WARM_RESET (0), or a vendor one (bit 31), is a reset
             // for the VMM, flagged as RESET2, with INTERNAL_FAILURE in X0
             // should the guest run on; another type is INVALID_PARAMS. KVM
-            // keeps the type in a u32, for the SMC64 call as well.
+            // keeps the type in a u32, for the SMC64 call as well. This one
+            // return writes X0 alone (`vcpu_set_reg(vcpu, 0, ...)`): X1 to
+            // X3 stay the guest's, narrowed in place for the SMC32 call.
             Psci::SystemReset2 if minor == Some(1) => {
                 let reset_type = x1 as u32;
                 if reset_type == 0 || reset_type >= 0x8000_0000 {
                     self.set_reg(hv, HV_REG_X0, PSCI_RET_INTERNAL_FAILURE as u64)?;
+                    for n in 1..4 {
+                        self.set_reg(hv, HV_REG_X0 + n, arg(n)?)?;
+                    }
                     return Ok(Some((KVM_SYSTEM_EVENT_RESET, &SYSTEM_RESET2_EVENT_DATA)));
                 }
                 PSCI_RET_INVALID_PARAMS
@@ -1471,12 +1490,14 @@ impl VcpuFd {
             }
             Psci::CpuOff => {
                 self.shared.power.lock().unwrap().off = true;
-                return Ok(None);
+                PSCI_RET_SUCCESS
             }
             Psci::CpuOn => {
-                let entry = self.reg(hv, HV_REG_X0 + 2)?;
-                let context = self.reg(hv, HV_REG_X0 + 3)?;
-                match self.find_vcpu(x1)? {
+                let (target, entry, context) = (arg(1)?, arg(2)?, arg(3)?);
+                // kvm_psci_vcpu_on: a target with a bit outside the MPIDR's
+                // affinity fields is INVALID_PARAMS (kvm_psci_valid_affinity),
+                // as is one no vCPU has.
+                match self.find_vcpu(target)? {
                     None => PSCI_RET_INVALID_PARAMS,
                     Some(target) => {
                         let mut power = target.power.lock().unwrap();
@@ -1491,13 +1512,19 @@ impl VcpuFd {
                     }
                 }
             }
-            Psci::AffinityInfo => match self.find_vcpu(x1)? {
-                None => PSCI_RET_INVALID_PARAMS,
-                Some(target) => i64::from(target.powered_off()),
-            },
+            Psci::AffinityInfo => self.affinity_info(arg(1)?, arg(2)?)?,
             Psci::MigrateInfoType => PSCI_TOS_NOT_PRESENT_MP,
-            Psci::SystemOff => return Ok(Some((KVM_SYSTEM_EVENT_SHUTDOWN, &SYSTEM_EVENT_DATA))),
-            Psci::SystemReset => return Ok(Some((KVM_SYSTEM_EVENT_RESET, &SYSTEM_EVENT_DATA))),
+            // The guest must not run on; should user space run the vCPU
+            // again, the call has failed (kvm_psci_0_2_call: "we preload r0
+            // (or x0) with PSCI return value INTERNAL_FAILURE").
+            Psci::SystemOff => {
+                event = Some((KVM_SYSTEM_EVENT_SHUTDOWN, &SYSTEM_EVENT_DATA));
+                PSCI_RET_INTERNAL_FAILURE
+            }
+            Psci::SystemReset => {
+                event = Some((KVM_SYSTEM_EVENT_RESET, &SYSTEM_EVENT_DATA));
+                PSCI_RET_INTERNAL_FAILURE
+            }
             Psci::NotSupported => PSCI_RET_NOT_SUPPORTED,
             Psci::SmcccVersion
             | Psci::TrngVersion
@@ -1512,8 +1539,32 @@ impl VcpuFd {
             | Psci::PvTimeFeatures
             | Psci::PvTimeSt => unreachable!("answered above"),
         };
-        self.set_reg(hv, HV_REG_X0, ret as u64)?;
-        Ok(None)
+        // Every PSCI call returns through `smccc_set_retval(vcpu, val, 0,
+        // 0, 0)` (psci.c kvm_psci_0_2_call, kvm_psci_1_x_call): X1 to X3
+        // are 0 after it, CPU_OFF, SYSTEM_OFF and SYSTEM_RESET included.
+        for (n, w) in [ret as u64, 0, 0, 0].into_iter().enumerate() {
+            self.set_reg(hv, HV_REG_X0 + n as hv_reg_t, w)?;
+        }
+        Ok(event)
+    }
+
+    /// AFFINITY_INFO (psci.c kvm_psci_vcpu_affinity_info): ON (0) if a vCPU
+    /// whose MPIDR matches `target` from affinity level `level` upwards is
+    /// on, OFF (1) if all that match are off; INVALID_PARAMS for a target
+    /// with a bit outside the affinity fields, a level over 3, or no match.
+    fn affinity_info(&self, target: u64, level: u64) -> Result<i64> {
+        if target & !MPIDR_AFFINITY_MASK != 0 || level > 3 {
+            return Ok(PSCI_RET_INVALID_PARAMS);
+        }
+        // MPIDR_LEVEL_BITS is 8; level 3 is the field at bit 32.
+        let mask = MPIDR_AFFINITY_MASK & !((1u64 << (level * 8)) - 1);
+        let vm = self.vm()?;
+        let vcpus = vm.vcpus.lock().unwrap();
+        let mut matching = vcpus.iter().filter(|v| v.mpidr & mask == target & mask).peekable();
+        if matching.peek().is_none() {
+            return Ok(PSCI_RET_INVALID_PARAMS);
+        }
+        Ok(i64::from(matching.all(|v| v.powered_off())))
     }
 
     /// PV_TIME_ST (kvm_init_stolen_time): the IPA of the vCPU's stolen-time
@@ -1595,6 +1646,9 @@ impl VcpuFd {
     }
 
     fn find_vcpu(&self, mpidr: u64) -> Result<Option<Arc<VcpuShared>>> {
+        if mpidr & !MPIDR_AFFINITY_MASK != 0 {
+            return Ok(None);
+        }
         let vm = self.vm()?;
         let vcpus = vm.vcpus.lock().unwrap();
         Ok(vcpus
@@ -1679,6 +1733,18 @@ impl VcpuFd {
             kicker.left();
         }
         exit
+    }
+
+    /// What another thread kicks this vCPU out of `run()` with, as
+    /// [`VcpuFd::set_kvm_immediate_exit`]`(1)` does on a handle.
+    #[cfg(test)]
+    pub(crate) fn kick_for_test(&self) -> impl Fn() + Send + 'static {
+        let shared = self.shared.clone();
+        move || {
+            shared.immediate_exit().store(1, Ordering::Release);
+            shared.cancel_run();
+            shared.wake();
+        }
     }
 
     /// The framework's vCPU, for tests that read its counters on the owner thread.

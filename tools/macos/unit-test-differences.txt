@@ -121,10 +121,13 @@ no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_pvtime_attribute_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_steal_time_is_what_the_host_kept_from_the_vcpu
 no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_the_kicker_ends_with_its_vm_and_outlives_paused_vcpus
 no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_the_kicker_leaves_a_waiting_vcpu_alone
+no-hvf compat-kvm-ioctls hvf::smccc_tests::test_a_reset_leaves_the_registers_kvm_leaves
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_a_service_turned_off_by_its_bit_is_not_supported_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_a_snapshots_registers_restore_the_firmware_registers
+no-hvf compat-kvm-ioctls hvf::smccc_tests::test_cpu_off_leaves_the_registers_kvm_leaves
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_firmware_registers_are_listed_and_kept_as_kvms
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_psci_1_1_system_reset2_as_on_kvm
+no-hvf compat-kvm-ioctls hvf::smccc_tests::test_psci_calls_return_as_kvms
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_trng_calls_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::vcpu::tests::test_kvm_ptp_counters
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_new_vcpu_has_kvms_reset_values

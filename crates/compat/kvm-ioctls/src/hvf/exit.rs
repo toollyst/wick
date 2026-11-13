@@ -352,24 +352,23 @@ impl Psci {
     /// power_state format, no OS-initiated mode), as KVM answers
     /// (kvm_psci_1_x_call): SYSTEM_RESET2 from 1.1 on; SYSTEM_SUSPEND only
     /// when the VMM enabled it for the VM (KVM_CAP_ARM_SYSTEM_SUSPEND),
-    /// which Firecracker does not.
-    pub fn implemented(id: u64, minor: u32) -> bool {
-        if Psci::decode(id) == Psci::SystemReset2 {
-            return minor >= 1 && id >> 32 == 0;
-        }
-        matches!(
-            Psci::decode(id),
+    /// which Firecracker does not. The id is the low half of the guest's
+    /// X1, as KVM's (`u32 arg = smccc_get_arg1(vcpu)`).
+    pub fn implemented(id: u32, minor: u32) -> bool {
+        match Psci::decode(u64::from(id)) {
+            Psci::SystemReset2 => minor >= 1,
             Psci::Version
-                | Psci::CpuSuspend
-                | Psci::CpuOff
-                | Psci::CpuOn
-                | Psci::AffinityInfo
-                | Psci::MigrateInfoType
-                | Psci::SystemOff
-                | Psci::SystemReset
-                | Psci::Features
-                | Psci::SmcccVersion
-        ) && id >> 32 == 0
+            | Psci::CpuSuspend
+            | Psci::CpuOff
+            | Psci::CpuOn
+            | Psci::AffinityInfo
+            | Psci::MigrateInfoType
+            | Psci::SystemOff
+            | Psci::SystemReset
+            | Psci::Features
+            | Psci::SmcccVersion => true,
+            _ => false,
+        }
     }
 }
 
@@ -487,7 +486,7 @@ mod tests {
             }
             // MIGRATE, SYSTEM_SUSPEND (not enabled for the VM), MEM_PROTECT,
             // the workarounds, the TRNG's and KVM's services (they are not
-            // PSCI), garbage in the upper half.
+            // PSCI).
             for id in [
                 0x8400_0005,
                 0x8400_000e,
@@ -497,8 +496,6 @@ mod tests {
                 0x8400_0050,
                 0x8600_0001,
                 0xc500_0020,
-                1 << 32 | 0x8400_0000,
-                1 << 32 | 0x8400_0012,
             ] {
                 assert!(!Psci::implemented(id, minor), "{id:#x}");
             }
