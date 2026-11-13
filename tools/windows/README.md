@@ -286,7 +286,8 @@ an NMI of no source, TSCs apart, an interrupt nothing asked for, an AP that did 
 the reset must end Firecracker with exit status 0. A kernel notice that only uses the word (`WARNING: See ...` of SRSO on an
 AMD host) is not a warning of the guest's health. A stage's PASS line is the one summary it
 returns; a stage that leaves any other value unread fails as a script error naming it
-(`-SelfTest`'s `summary` case).
+(`-SelfTest`'s `summary` case). Each step a stage prints has the time since the stage began
+(`- [12.3 s] ...`), so a slow run says which step took the time.
 
 A guest that does not reach init, in a VM with an API socket, is paused and snapshotted twice a
 second apart before the stage fails, and the failure adds what the two states hold (kept as

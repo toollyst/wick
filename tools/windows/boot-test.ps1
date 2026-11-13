@@ -1364,7 +1364,17 @@ namespace Wick {
     // The reading end of a named pipe Firecracker writes its log or metrics
     // to (\\.\pipe\<name>): the Windows counterpart of a FIFO. The pipe
     // exists from here on; Firecracker connects to it as a client. With
-    // `read` false nobody reads it (a reader that stalls).
+    // `read` false nobody reads it (a reader that stalls). The pipe is
+    // opened for overlapped I/O: on a handle opened for synchronous I/O
+    // the system runs one request at a time (Microsoft Learn,
+    // "Synchronous and Asynchronous I/O"), so Close's DisconnectNamedPipe
+    // waited for the reading thread's ReadFile, which returns only when
+    // the client writes. In the cli stage the log pipe's Close so waited
+    // until Firecracker logged again: its "Failed to write metrics" once
+    // the periodic metrics (every 60 s, ~5.6 KiB each) had filled the
+    // metrics pipe's 64 KiB with no reader, about 13 minutes, after which
+    // FlushMetrics was refused (would block), as on Linux with a FIFO
+    // full. A PC's runs took 789 s there.
     public class PipeReader {
         NamedPipeServerStream s;
         StringBuilder text = new StringBuilder();
@@ -1372,7 +1382,7 @@ namespace Wick {
         public readonly string Path;
         public PipeReader(string name, bool read, int buffer) {
             Path = @"\\.\pipe\" + name;
-            s = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.None, buffer, buffer);
+            s = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, buffer, buffer);
             t = new Thread(() => {
                 try {
                     s.WaitForConnection();
@@ -1403,10 +1413,12 @@ namespace Wick {
             while (!s.IsConnected && DateTime.UtcNow < until) Thread.Sleep(20);
             return s.IsConnected;
         }
-        // The reader goes away while Firecracker still writes.
+        // The reader goes away while Firecracker still writes, at once:
+        // a read the thread has pending ends with the pipe.
         public void Close() {
             try { if (s.IsConnected) s.Disconnect(); } catch (Exception) { }
             try { s.Dispose(); } catch (Exception) { }
+            t.Join(2000);
         }
     }
 
@@ -1523,14 +1535,37 @@ namespace Wick {
                     c.Flush();
                     if (!r.WaitFor("line two", 5000)) throw new InvalidOperationException("pipe reader got '" + r.Text + "'");
                 }
-                return "PipeReader: a client's writes are read";
             } finally { r.Close(); }
+            // Close while the reading thread waits for a client that writes
+            // nothing: it returns at once, and the client's next write fails
+            // (the pipe has gone), as Firecracker's does when its reader goes.
+            r = new PipeReader("wick-bt-self-close-" + System.Diagnostics.Process.GetCurrentProcess().Id, true, 4096);
+            using (var c = new NamedPipeClientStream(".", r.Path.Substring(9), PipeDirection.InOut)) {
+                c.Connect(5000);
+                Thread.Sleep(200);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var closer = new Thread(() => r.Close());
+                closer.IsBackground = true;
+                closer.Start();
+                if (!closer.Join(5000)) throw new InvalidOperationException("PipeReader.Close() still waits after 5 s for a client that writes nothing");
+                long ms = sw.ElapsedMilliseconds;
+                bool failed = false;
+                try { var b = Encoding.UTF8.GetBytes("late\n"); c.Write(b, 0, b.Length); c.Flush(); } catch (System.IO.IOException) { failed = true; }
+                if (!failed) throw new InvalidOperationException("a client's write after the reader's Close() did not fail");
+                return "PipeReader: a client's writes are read; Close() with a silent client returns in " + ms + " ms and the client's next write fails";
+            }
         }
     }
 }
 '@
 
-function Write-Step([string]$msg) { Write-Host "  - $msg" }
+# A step of a stage, with the time since the stage began ($StageClock), so
+# a run says which of its steps took the time.
+$script:StageClock = $null
+function Write-Step([string]$msg) {
+    $at = if ($script:StageClock) { '[{0:N1} s] ' -f $script:StageClock.Elapsed.TotalSeconds } else { '' }
+    Write-Host "  - $at$msg"
+}
 
 function Get-Asset([string]$name) {
     $path = Join-Path $WorkDir $name
@@ -2831,11 +2866,12 @@ function Stage-Cli {
         # and new readers of the two names get that metrics line and log
         # lines of these requests.
         #
-        # Each request's time, with the readers and without: a PC's run
-        # took 789 s here and its FlushMetrics after the requests was
-        # refused (would block), as if each request without a reader took
-        # about 1.5 s and the periodic metrics (every 60 s) filled the
-        # metrics pipe's 64 KiB meanwhile. Printed, and in the failure.
+        # Each request's time, with the readers and without, printed and in
+        # the failure: a PC's runs took 789 s here and their FlushMetrics
+        # after the requests was refused (would block). The requests took
+        # under 3 ms each either way (PC, c2042da); the time was the log
+        # reader's Close, which waited for Firecracker's next log line
+        # (PipeReader). The steps' times say where a run spends it.
         $timed = {
             param([int]$n)
             $each = New-Object Collections.Generic.List[double]
@@ -2850,6 +2886,7 @@ function Stage-Cli {
         $with = & $timed 50
         $mpipe.Close()
         $lpipe.Close()
+        Write-Step "the pipes' readers closed"
         $without = & $timed 500
         $requests = "with the readers $with; without them $without"
         Write-Step "requests' times: $requests"
@@ -4007,6 +4044,7 @@ $Rootfs = Get-Asset $RootfsName
 foreach ($name in $selected) {
     Write-Host "== $name"
     $sw = [Diagnostics.Stopwatch]::StartNew()
+    $script:StageClock = $sw
     $result = 'PASS'
     try {
         $detail = Get-StageSummary $Stages[$name]
