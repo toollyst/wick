@@ -61,6 +61,13 @@ pub mod whp_exit;
 #[path = "../../crates/compat/kvm-ioctls/src/whp/apicmode.rs"]
 pub mod whp_apicmode;
 
+/// The CR4 values the WHP backend's `KVM_SET_SREGS` takes, as KVM decides
+/// them (`crates/compat/kvm-ioctls/src/whp/cr4.rs`), compiled from its
+/// source (it uses nothing but `core`) so its tests run on every host.
+#[allow(unreachable_pub, dead_code)]
+#[path = "../../crates/compat/kvm-ioctls/src/whp/cr4.rs"]
+pub mod whp_cr4;
+
 /// KVM's TSC matching as the WHP backend decides it
 /// (`crates/compat/kvm-ioctls/src/whp/tscsync.rs`), compiled from its source
 /// (it uses nothing but `core`) so its tests run on every host.

@@ -50,6 +50,35 @@ const LAPIC_REGS: usize = 1024;
 /// the run loop, so the wait is bounded (see the `X64Halt` exit).
 const HALT_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 
+/// Whether a CPUID table has a flag (leaf, sub-leaf, register: 1 EBX,
+/// 2 ECX, 3 EDX; bit), its entry found as the guest's CPUID exit finds it
+/// (`handle_cpuid`); a leaf the table lacks has none, as KVM's
+/// `guest_cpuid_has`.
+fn cpuid_has(table: &[kvm_cpuid_entry2], leaf: u32, index: u32, register: u8, bit: u32) -> bool {
+    table
+        .iter()
+        .find(|e| e.function == leaf && (e.flags & kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX == 0 || e.index == index))
+        .is_some_and(|e| {
+            let value = match register {
+                1 => e.ebx,
+                2 => e.ecx,
+                _ => e.edx,
+            };
+            value >> bit & 1 == 1
+        })
+}
+
+/// KVM's `cr4_reserved_bits` here: those of the supported CPUID, the
+/// host's capabilities (`cr4`), computed once.
+fn host_cr4_reserved() -> u64 {
+    static RESERVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESERVED.get_or_init(|| match regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES) {
+        Ok(c) => super::cr4::reserved_bits(|l, i, r, b| cpuid_has(c.as_slice(), l, i, r, b)),
+        // No CPUID: every gated bit reserved, as for a host with none.
+        Err(_) => super::cr4::reserved_bits(|_, _, _, _| false),
+    })
+}
+
 /// A heap-allocated `kvm_run`, shared (as KVM's `mmap` of the vCPU fd is)
 /// through [`super::KvmRunWrapper`].
 pub(crate) struct KvmRunPage(Box<UnsafeCell<kvm_run>>);
@@ -156,6 +185,9 @@ pub(crate) struct VcpuShared {
     pub(crate) run: KvmRunPage,
     inner: Arc<VmInner>,
     cpuid: Mutex<Vec<kvm_cpuid_entry2>>,
+    /// The CR4 bits the CPUID of the last `KVM_SET_CPUID2` reserves, as
+    /// KVM's `cr4_guest_rsvd_bits` (`cr4`): none before one, as KVM's.
+    cr4_guest_rsvd: AtomicU64,
     pending: Mutex<Option<Pending>>,
     /// The data of an `INS` between its exit and the next run, as KVM's
     /// `pio_data` page is: Firecracker writes it through the slice the exit
@@ -442,6 +474,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         run: KvmRunPage::new(),
         inner: inner.clone(),
         cpuid: Mutex::new(Vec::new()),
+        cr4_guest_rsvd: AtomicU64::new(0),
         before_run: Mutex::new(Some(regs::BeforeRun::new())),
         pending: Mutex::new(None),
         string_data: Box::new(UnsafeCell::new([0; STRING_DATA])),
@@ -830,7 +863,25 @@ impl VcpuFd {
     pub fn get_sregs(&self) -> Result<kvm_sregs> {
         regs::get_sregs(self.part(), self.vp())
     }
+    /// Refused (`EINVAL`, as KVM's `kvm_is_valid_sregs`) when CR4 has a bit
+    /// KVM would refuse: one it does not know, or one whose CPUID flag the
+    /// host's supported CPUID or the vCPU's own lacks (`cr4`), named in a
+    /// `whp:` line, before WHP is asked.
     pub fn set_sregs(&self, sregs: &kvm_sregs) -> Result<()> {
+        let guest = self.shared.cr4_guest_rsvd.load(Ordering::Acquire);
+        if let Some((bits, lacking)) = super::cr4::refused(sregs.cr4, host_cr4_reserved(), guest) {
+            let whose = match lacking {
+                super::cr4::Lacking::Host => {
+                    "this host's supported CPUID (its root partition's) lacks the flag, as KVM refuses on a host without the feature"
+                }
+                super::cr4::Lacking::Guest => "the vCPU's CPUID (KVM_SET_CPUID2) lacks the flag, as KVM refuses",
+            };
+            super::ffi::report(
+                log::Level::Error,
+                &format!("whp: KVM_SET_SREGS refused: CR4 {:#x} has {}: {whose}", sregs.cr4, super::cr4::names(bits)),
+            );
+            return err(libc::EINVAL);
+        }
         regs::set_sregs(self.part(), self.vp(), sregs)
     }
     pub fn get_fpu(&self) -> Result<kvm_fpu> {
@@ -1204,6 +1255,7 @@ impl VcpuFd {
             );
             return err(libc::ENOTSUP);
         }
+        self.shared.cr4_guest_rsvd.store(super::cr4::reserved_bits(|l, i, r, b| cpuid_has(table, l, i, r, b)), Ordering::Release);
         *self.shared.cpuid.lock().unwrap() = table.to_vec();
         Ok(())
     }
@@ -4729,6 +4781,89 @@ mod fpu_tests {
                 assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
             }
         }
+    }
+
+    /// KVM's CR4 rule (`cr4`) against what WHP takes, on this host (CR4TEST
+    /// lines): with the supported CPUID set on the vCPU, each CR4 bit KVM
+    /// knows set alone on a vCPU in long mode through `KVM_SET_SREGS`. A bit
+    /// the rule refuses is refused with `EINVAL` before WHP is asked; a bit
+    /// the rule allows must be taken by WHP, and one WHP refuses is a
+    /// finding, named, that fails the test. Then the measured side of the
+    /// host's CPUID: the guest's own CPUID leaf 1 and leaf 7 (from a CPUID
+    /// exit) against the table, for each gated flag. A Linux snapshot's CR4
+    /// 0x370eb0 is tried last.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_cr4_bits_kvm_takes_are_taken_by_whp() {
+        use super::super::cr4;
+        let program = [
+            vec![0xB8, 0x01, 0x00, 0x00, 0x00, 0x31, 0xC9, 0x0F, 0xA2], // mov eax, 1; xor ecx, ecx; cpuid
+            vec![0x89, 0x0C, 0x25, 0x00, 0x71, 0x00, 0x00],             // mov [0x7100], ecx
+            vec![0x89, 0x14, 0x25, 0x04, 0x71, 0x00, 0x00],             // mov [0x7104], edx
+            vec![0xB8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xC9, 0x0F, 0xA2], // mov eax, 7; xor ecx, ecx; cpuid
+            vec![0x89, 0x1C, 0x25, 0x08, 0x71, 0x00, 0x00],             // mov [0x7108], ebx
+            vec![0x89, 0x0C, 0x25, 0x0C, 0x71, 0x00, 0x00],             // mov [0x710c], ecx
+            vec![0xE6, PORT as u8, 0xEB, 0xFE],
+        ]
+        .concat();
+        let (vm, mut vcpu, m) = mmio_guest(&program);
+        let supported = regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap();
+        let table = supported.as_slice().to_vec();
+        vcpu.set_cpuid2(&supported).unwrap();
+        let has = |l: u32, i: u32, r: u8, b: u32| super::cpuid_has(&table, l, i, r, b);
+        let reserved = cr4::reserved_bits(has);
+        let base = vcpu.get_sregs().unwrap();
+        let mut findings = Vec::new();
+        for n in 0..23u32 {
+            let bit = 1u64 << n;
+            if cr4::KNOWN & bit == 0 || base.cr4 & bit != 0 {
+                continue;
+            }
+            let mut s = base;
+            s.cr4 |= bit;
+            let allowed = cr4::refused(s.cr4, reserved, reserved).is_none();
+            let got = vcpu.set_sregs(&s).map_err(|e| e.errno());
+            vcpu.set_sregs(&base).unwrap();
+            let name = cr4::names(bit);
+            eprintln!(
+                "CR4TEST {name}: KVM's rule {}; KVM_SET_SREGS {got:?}",
+                if allowed { "takes it" } else { "refuses it" }
+            );
+            if allowed && got.is_err() {
+                findings.push(format!("{name}: KVM takes it, WHP refused it ({got:?})"));
+            }
+            if !allowed {
+                assert_eq!(got, Err(libc::EINVAL), "{name}: refused by the rule, so EINVAL before WHP");
+            }
+        }
+        let mut snap = base;
+        snap.cr4 = 0x37_0eb0;
+        eprintln!(
+            "CR4TEST a Linux snapshot's CR4 0x370eb0: KVM's rule {:?}; KVM_SET_SREGS {:?}",
+            cr4::refused(snap.cr4, reserved, reserved).map(|(b, w)| (cr4::names(b), w)),
+            vcpu.set_sregs(&snap).map_err(|e| e.errno())
+        );
+        vcpu.set_sregs(&base).unwrap();
+        let watchdog = super::Watchdog::arm(&vcpu);
+        let mut reads = 0;
+        let end = one_run(&mut vcpu, &[], &mut reads);
+        drop(watchdog);
+        let word = |at: u64| u32::from_le_bytes(bytes_at::<4>(m, at));
+        let guest = [(1u32, 2u8, word(0x7100)), (1, 3, word(0x7104)), (7, 1, word(0x7108)), (7, 2, word(0x710c))];
+        for (bit, name, (leaf, index, register, flag), feature) in cr4::GATED {
+            let in_table = has(leaf, index, register, flag);
+            let seen = guest.iter().find(|g| g.0 == leaf && g.1 == register).map(|g| g.2 >> flag & 1 == 1);
+            eprintln!(
+                "CR4TEST CPUID {feature} (CR4 {name}, bit {}): the supported table {in_table}, the guest's CPUID {seen:?}",
+                bit.trailing_zeros()
+            );
+        }
+        assert!(end.starts_with("out 0x80"), "the guest did not reach its end: {end}");
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        assert!(findings.is_empty(), "CR4 bits KVM's rule takes and WHP refuses on this host: {findings:#?}");
     }
 
     /// A record (SREGSREC lines) for CI run 43442912128's linux-snapshot

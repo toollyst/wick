@@ -624,8 +624,9 @@ jobs:
       # (fuzz/src/lib.rs: hvf/exit.rs, whp/exit.rs, ...) with their own
       # unit tests, on every host: the WHP run loop's MMIO read bookkeeping
       # (whp_exit::tests), the WHP backend's TSC matching
-      # (whp_tscsync::tests) and its CPUID x2APIC rule (whp_apicmode::tests)
-      # are checked on Linux and macOS too.
+      # (whp_tscsync::tests), its CPUID x2APIC rule (whp_apicmode::tests)
+      # and KVM's CR4 rule (whp_cr4::tests) are checked on Linux and macOS
+      # too.
       - name: The fuzzed modules' unit tests
         run: cargo test --manifest-path fuzz/Cargo.toml --lib
       - name: Fuzz each target for 60 seconds
@@ -1018,6 +1019,12 @@ jobs:
           # EXTD a #GP, as KVM's for a guest whose CPUID lacks the bit (run
           # 43452122814: an Intel runner's guests offered x2APIC froze).
           alone whp::vcpu::fpu_tests::test_a_guest_without_x2apic_in_its_cpuid_is_refused_x2apic_as_kvm
+          # KVM's CR4 rule against what WHP takes (CR4TEST lines): each CR4
+          # bit KVM knows, alone, through KVM_SET_SREGS with the supported
+          # CPUID; a bit the rule refuses is EINVAL before WHP, and one it
+          # allows that WHP refuses fails the test by name; then each gated
+          # flag in the table and in the guest's own CPUID.
+          alone whp::vcpu::fpu_tests::test_cr4_bits_kvm_takes_are_taken_by_whp
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # What each call of the backend commits of its thread's stack

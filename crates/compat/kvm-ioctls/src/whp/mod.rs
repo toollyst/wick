@@ -30,6 +30,7 @@
 
 mod apicmode;
 pub mod cap;
+mod cr4;
 mod debug;
 mod emulate;
 mod exit;
