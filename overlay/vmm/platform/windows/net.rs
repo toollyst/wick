@@ -451,10 +451,8 @@ impl Tap {
         self.endpoint.check_open()?;
         let total = buffer.len() as usize;
         let hdr_len = self.hdr_len.load(Ordering::Relaxed);
-        self.tx.clear();
-        buffer
-            .read_volatile_at(&mut self.tx, 0, total)
-            .map_err(io::Error::other)?;
+        copy_frame(buffer, &mut self.tx);
+        debug_assert_eq!(self.tx.len(), total);
         // As the TUN driver: a header and at least an Ethernet header.
         if self.tx.len() < hdr_len + 14 {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -499,6 +497,38 @@ impl Tap {
             Some(n) => Ok(hdr_len + n),
             None => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
         }
+    }
+}
+
+/// Copies the frame the guest's descriptors name into `tx` (cleared first),
+/// taking the guest's pages that were never committed as the zeros they
+/// read as, without touching them: a copy that touched them would commit
+/// and charge them (the exception handler of lazy guest RAM), where Linux's
+/// TAP write copies them with `copy_from_user`, whose read fault maps the
+/// zero page and charges nothing (mm/memory.c v6.1 4088-4091,
+/// `do_anonymous_page`). The host-read plan's U1; the rest is copied as
+/// `IoVecBuffer::read_volatile_at` copies it.
+fn copy_frame(buffer: &IoVecBuffer, tx: &mut Vec<u8>) {
+    tx.clear();
+    tx.reserve(buffer.len() as usize);
+    // SAFETY: the buffer's iovecs, which it keeps valid while it lives.
+    let iovecs = unsafe { std::slice::from_raw_parts(buffer.as_iovec_ptr(), buffer.iovec_count()) };
+    for v in iovecs {
+        libc::wick_mm::zero_runs(v.iov_base as usize, v.iov_len, |start, len, zeros| {
+            let at = tx.len();
+            if zeros {
+                tx.resize(at + len, 0);
+                return;
+            }
+            tx.reserve(len);
+            // SAFETY: `[start, start + len)` is guest memory a descriptor
+            // names (valid for reads while the buffer lives), and `tx` has
+            // room for `len` bytes past `at`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(start as *const u8, tx.as_mut_ptr().add(at), len);
+                tx.set_len(at + len);
+            }
+        });
     }
 }
 
@@ -631,6 +661,49 @@ mod tests {
 
     fn frame(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// U1: the guest's frame is copied with its untouched lazy pages as
+    /// zeros, and those pages stay uncommitted (not in the working set:
+    /// `mincore`), as Linux's copy maps the zero page for them.
+    #[test]
+    fn test_a_frame_from_untouched_guest_memory_commits_nothing() {
+        const PAGE: usize = 4096;
+        let len = 16 * PAGE;
+        // SAFETY: lazy anonymous memory for the test, unmapped below.
+        let m = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(m, libc::MAP_FAILED);
+        let m = m.cast::<u8>();
+        let mut want = vec![0u8; len];
+        for i in [1usize, 2, 9] {
+            want[i * PAGE + 3] = u8::try_from(i).unwrap();
+            // SAFETY: our mapping.
+            unsafe { *m.add(i * PAGE + 3) = want[i * PAGE + 3] };
+        }
+        let resident = || {
+            let mut v = vec![0u8; 16];
+            // SAFETY: our mapping and a byte a page.
+            assert_eq!(unsafe { libc::mincore(m.cast(), len, v.as_mut_ptr()) }, 0);
+            v.iter().filter(|b| **b & 1 != 0).count()
+        };
+        assert_eq!(resident(), 3);
+        // SAFETY: our mapping, read as guest memory is.
+        let guest = unsafe { std::slice::from_raw_parts(m.add(100), len - 200) };
+        let mut tx = vec![7u8; 5];
+        copy_frame(&IoVecBuffer::from(guest), &mut tx);
+        assert_eq!(tx, &want[100..len - 100]);
+        assert_eq!(resident(), 3, "the copy committed untouched memory");
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { libc::munmap(m.cast(), len) }, 0);
     }
 
     #[test]
