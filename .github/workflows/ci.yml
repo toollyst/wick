@@ -1219,7 +1219,9 @@ jobs:
           # of a CPU at a poll a millisecond, what it counts, and whether
           # this process is elevated and given the kernel's object
           # addresses (CI's runner; the PC runs it unelevated, and elevated
-          # when the user starts it so).
+          # when the user starts it so); how fast a process takes section
+          # commit and RAM, and what cheap signs of new section memory cost
+          # the jailer a poll (SECTREC-e).
           alone windows_sectrec::test_section_memory_and_a_charge_for_it_on_record
           # What Windows' cycle counters count (CPUCYCLEREC lines), for the
           # CPU clocks: a PC read the thread's QueryThreadCycleTime at 1.32 x

@@ -33,7 +33,15 @@
 //!   poll a millisecond, and what it counts against what the child made;
 //!   whether the kernel's object addresses are given to this process
 //!   (`SystemExtendedHandleInformation`), and whether this process is
-//!   elevated. The elevated case is the user's to start on the PC.
+//!   elevated. The elevated case is the user's to start on the PC;
+//! - e: what the poll could miss between two polls and what a cheaper poll
+//!   would cost: the time a SEC_COMMIT section of 1 and 4 GiB takes to
+//!   make, with the host's commit it takes; 256 MiB committed on a
+//!   SEC_RESERVE view in one call and then written (how much RAM a
+//!   millisecond takes); and, on the jailer's side, each cheap sign of new
+//!   section memory (the child's handle count, its virtual size, the host's
+//!   commit) and `GetMappedFileNameW` of each view (a file's view or the
+//!   pagefile's).
 //!
 //! Printed, not asserted, but for each step running and the child ending
 //! well.
@@ -140,6 +148,7 @@ unsafe extern "system" {
     fn K32GetPerformanceInfo(info: *mut PerformanceInformation, cb: u32) -> i32;
     fn K32GetProcessMemoryInfo(process: HANDLE, counters: *mut Counters, cb: u32) -> i32;
     fn K32QueryWorkingSetEx(process: HANDLE, info: *mut c_void, cb: u32) -> i32;
+    fn K32GetMappedFileNameW(process: HANDLE, address: *const c_void, name: *mut u16, len: u32) -> u32;
 }
 
 #[link(name = "ntdll")]
@@ -528,6 +537,51 @@ fn sectrec_child() {
     unsafe { CloseHandle(s) };
     drop(file);
 
+    // e: how fast a process takes section memory: what the jailer's poll
+    // could miss between two polls.
+    for size in [1usize << 30, 4 << 30] {
+        let c0 = charge();
+        let start = Instant::now();
+        // SAFETY: an unnamed section; closed below.
+        let s = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, core::ptr::null(), PAGE_READWRITE | SEC_COMMIT, (size as u64 >> 32) as u32, size as u32, core::ptr::null())
+        };
+        let took = us(start);
+        let c1 = charge();
+        say(format!(
+            "SECTREC-e a SEC_COMMIT section of {} GiB made in {took:.1} us: {}; {}",
+            size >> 30,
+            if s.is_null() { format!("refused, error {}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0)) } else { "made".to_string() },
+            delta(c0, c1)
+        ));
+        if !s.is_null() {
+            // SAFETY: ours.
+            unsafe { CloseHandle(s) };
+        }
+    }
+    let s = pagefile_section(1 << 30, true);
+    let v = view(s, 1 << 30);
+    let start = Instant::now();
+    // SAFETY: the first 256 MiB of our view.
+    let p = unsafe { VirtualAlloc(v as *const c_void, 256 * MIB, MEM_COMMIT, PAGE_READWRITE) };
+    let took = us(start);
+    let start = Instant::now();
+    if !p.is_null() {
+        write_pages(v, 256 * MIB, |_| 1);
+    }
+    let wrote = us(start);
+    say(format!(
+        "SECTREC-e a SEC_RESERVE section's view: 256 MiB committed in one VirtualAlloc in {took:.1} us ({}); its 65536 pages \
+         then written in {:.1} ms, {:.0} MiB a second, {:.0} MiB in a millisecond",
+        if p.is_null() { "refused" } else { "done" },
+        wrote / 1000.0,
+        256.0 / (wrote / 1e6),
+        256.0 / (wrote / 1000.0)
+    ));
+    unmap(v);
+    // SAFETY: ours.
+    unsafe { CloseHandle(s) };
+
     // d: a jail as Firecracker's with vhost-user and a uffd restore.
     const GUEST: usize = 1 << 30;
     const TOUCHED: usize = 64 * MIB;
@@ -763,6 +817,77 @@ fn object_addresses(pid: usize) -> String {
     }
 }
 
+/// SECTREC-e, the jailer's side: what each cheap sign of new section memory
+/// costs a poll (the child's handle count, its virtual size, the host's
+/// commit), 1000 times each, and what telling a view of a file from one of
+/// the pagefile costs (`GetMappedFileNameW`, which names a file view's file
+/// and fails for a pagefile-backed one), for each of the child's views.
+fn triggers(process: HANDLE) -> String {
+    const PROCESS_HANDLE_COUNT: u32 = 20;
+    const PROCESS_VM_COUNTERS: u32 = 3;
+    let timed = |f: &mut dyn FnMut() -> bool| {
+        let mut t = Vec::with_capacity(1000);
+        let mut failed = 0;
+        for _ in 0..1000 {
+            let start = Instant::now();
+            failed += usize::from(!f());
+            t.push(us(start));
+        }
+        format!("{}{}", spread(&t), if failed > 0 { format!(", {failed} failed") } else { String::new() })
+    };
+    let handles = timed(&mut || {
+        let mut n = 0u32;
+        // SAFETY: a u32 of the size given.
+        unsafe { NtQueryInformationProcess(process, PROCESS_HANDLE_COUNT, (&raw mut n).cast(), 4, core::ptr::null_mut()) >= 0 }
+    });
+    let virtual_size = timed(&mut || {
+        // VM_COUNTERS: PeakVirtualSize, VirtualSize, then the rest.
+        let mut counters = [0usize; 16];
+        // SAFETY: a buffer larger than VM_COUNTERS.
+        unsafe { NtQueryInformationProcess(process, PROCESS_VM_COUNTERS, counters.as_mut_ptr().cast(), 88, core::ptr::null_mut()) >= 0 }
+    });
+    let host = timed(&mut || {
+        let mut perf = PerformanceInformation { cb: core::mem::size_of::<PerformanceInformation>() as u32, ..Default::default() };
+        // SAFETY: an output structure of the size given.
+        unsafe { K32GetPerformanceInfo(&mut perf, perf.cb) != 0 }
+    });
+    let list = timed(&mut || !handles_of(process).is_empty());
+    // Each view's base, by a walk; then its file's name, or none.
+    let mut views = Vec::new();
+    let mut at = 0usize;
+    let mut last = usize::MAX;
+    loop {
+        // SAFETY: plain data; a query of the child's memory.
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQueryEx(process, at as *const c_void, &mut m, core::mem::size_of_val(&m)) } == 0 {
+            break;
+        }
+        if m.Type == MEM_MAPPED && m.AllocationBase as usize != last {
+            last = m.AllocationBase as usize;
+            views.push(last);
+        }
+        at = m.BaseAddress as usize + m.RegionSize;
+    }
+    let mut named = 0;
+    let mut t = Vec::new();
+    for &v in &views {
+        let mut name = [0u16; 512];
+        let start = Instant::now();
+        // SAFETY: a buffer of the length given.
+        let n = unsafe { K32GetMappedFileNameW(process, v as *const c_void, name.as_mut_ptr(), 512) };
+        t.push(us(start));
+        named += usize::from(n > 0);
+    }
+    format!(
+        "SECTREC-e the jailer's cheap signs, 1000 times each: the child's handle count {handles}; its virtual size \
+         (VM_COUNTERS) {virtual_size}; the host's commit (GetPerformanceInfo) {host}; the whole handle list {list}. \
+         GetMappedFileNameW of each of the {} views: {}, {named} named a file (the rest pagefile-backed)",
+        views.len(),
+        spread(&t)
+    )
+}
+
 /// The jailer's side: the child in a job, its lines relayed, the
 /// cross-process step and the polls.
 #[test]
@@ -874,6 +999,7 @@ fn test_section_memory_and_a_charge_for_it_on_record() {
                     if resident { format!(", {} MiB resident", p.resident / MIB) } else { String::new() }
                 ));
             }
+            say(triggers(process));
             writeln!(to_child, "done").unwrap();
             continue;
         }
