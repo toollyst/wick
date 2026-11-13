@@ -22,11 +22,14 @@
 # (:297); loop_timeout gives 2 ms, or 20 ms for a CPU alone in its package
 # (:341-343). Here the bound is BOUND_S, 2 s, with ITERATIONS kept as the
 # most turns. Not the kernel's 2 or 20 ms: the kernel's loop runs with both
-# CPUs' interrupts off, while this one runs in user space, where a nested
-# KVM runner (GitHub's) made about 10000 hand-overs a second (999971 in
-# about 100 s, CI run 43480682094); 2 s gives such a host twenty times the
-# 1000 hand-overs a measurement needs, and the fastest hosts stop at the
-# iteration count first. The counter's rate, for the bound, is measured
+# CPUs' interrupts off, while this one runs in user space, where either CPU
+# can be taken away for milliseconds; 2 s leaves room for that. Measured, the
+# turns run out first: 500000 turns took 0.10 s on GitHub's nested KVM
+# runner (CI run 43486495448, both smp checks) and 0.06 to 0.10 s on a
+# Windows PC (3393774). (CI run 43480682094's "no answer within 120 s" was
+# not a slow run: the guest's pass line was there, after the shell's
+# prompts on the same console line, where the Linux boot test's
+# line-anchored match missed it. Hence the newline below.) The counter's rate, for the bound, is measured
 # against CLOCK_MONOTONIC over 50 ms before the run (the loop called with no
 # turns reads the counter); on aarch64 that is CNTFRQ_EL0's rate, read the
 # same way rather than from the register, so both machines share one path.
@@ -35,7 +38,8 @@
 #   python3 guest-counter-warp.py [CPU_A CPU_B [ITERATIONS]]
 #     CPU_A, CPU_B  the two CPUs (default 0 1); ITERATIONS per CPU at most
 #     (default 500000); the run also ends after BOUND_S seconds.
-#   Output: one line, then the exit status:
+#   Output: an empty line and one line (so the line starts the console's
+#   line, whatever prompts stand before it), then the exit status:
 #     counter-warp: pass: <counter> CPUs A and B, I iterations each,
 #       H hand-overs, largest forward step at a hand-over G ticks,
 #       in R s                                                          exit 0
@@ -116,7 +120,10 @@ BOUND_S = 2.0
 
 
 def stop(code, line):
-    print("counter-warp: " + line, flush=True)
+    # A newline first: the shell's prompts for the commands before this one
+    # can still stand on the console's line ("# # "), and the boot tests
+    # look for the line at its start.
+    print("\ncounter-warp: " + line, flush=True)
     sys.exit(code)
 
 
