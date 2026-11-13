@@ -17,37 +17,44 @@ import time
 
 
 def stage_cgroup_devices(ctx, jt):
-    """`devices.*` refused at the start, as upstream's jailer refuses it on Linux: exit 1, before the jail exists."""
+    """`devices.*` refused with exit 1 where upstream's jailer refuses it on Linux: v1 at the cgroup step, with the
+    jail's root made and the binary copied into it; v2 while the options are read, before the jail exists."""
     check = jt.check
     cases = [
         # v1: Linux fails reading the parent cgroup's write-only file (EINVAL),
-        # or writing the read-only devices.list.
-        (["--cgroup-version", "1", "--cgroup", "devices.deny=a"],
-         "upstream's jailer cannot set it on Linux either"),
-        (["--cgroup-version", "1", "--cgroup", "devices.allow=c 1:3 rwm"],
-         "devices.allow and devices.deny are write-only (EINVAL)"),
-        (["--cgroup-version", "1", "--cgroup", "devices.list=a *:* rwm"], "devices.list read-only"),
+        # or writing the read-only devices.list, at Env::run's cgroup step.
+        ("1", "devices.deny=a", "upstream's jailer cannot set it on Linux either"),
+        ("1", "devices.allow=c 1:3 rwm", "devices.allow and devices.deny are write-only (EINVAL)"),
+        ("1", "devices.list=a *:* rwm", "devices.list read-only"),
         # v2: no devices controller; upstream's own error.
-        (["--cgroup-version", "2", "--cgroup", "devices.deny=a"], "Controller devices is unavailable"),
-        (["--cgroup-version", "2", "--cgroup", "devices.allow=c 1:3 rwm"], "Controller devices is unavailable"),
+        ("2", "devices.deny=a", "Controller devices is unavailable"),
+        ("2", "devices.allow=c 1:3 rwm", "Controller devices is unavailable"),
     ]
-    for i, (extra, want) in enumerate(cases):
+    for i, (version, value, want) in enumerate(cases):
         vm_id = f"cgroup-devices{i}"
+        extra = ["--cgroup-version", version, "--cgroup", value]
         jail_dir = os.path.join(ctx.base, os.path.basename(ctx.firecracker), vm_id)
         rc, out = jt.run_jailer(ctx, jt.jailer_base(ctx, vm_id) + extra + [
             "--", "--api-sock", "/run/firecracker.socket"])
-        print(f"   {' '.join(extra)}: exit {rc}: {out!r}", flush=True)
+        left = sorted(os.path.relpath(os.path.join(d, f), jail_dir)
+                      for d, ds, fs in os.walk(jail_dir) for f in ds + fs) if os.path.isdir(jail_dir) else None
+        print(f"   {' '.join(extra)}: exit {rc}: {out!r}; left in the jail: {left}", flush=True)
         check(rc == 1 and want in out, f"{extra}: exit {rc}, {out!r}")
-        # macOS refuses while parsing the options: no jail directory (Linux,
-        # for v1, has made <id>/root and copied the binary into it by then).
-        check(not os.path.exists(jail_dir), f"{extra}: {jail_dir} was made")
+        if version == "1":
+            # What Linux leaves at this step (tools/linux/jailer-cgroup-check.py
+            # case_devices): the jail's root and the copied binary; Linux has
+            # made the cgroup too, which macOS has no counterpart of.
+            exe = os.path.join("root", os.path.basename(ctx.firecracker))
+            check(left == ["root", exe], f"{extra}: the jail holds {left}, not the copied binary only")
+        else:
+            check(left is None, f"{extra}: {jail_dir} was made")
         # pgrep: 0 with matches, 1 without; anything else (a usage error) is
         # no answer.
         pg = subprocess.run(["pgrep", "-f", "--", f"--id {vm_id} "], capture_output=True, text=True)
         check(pg.returncode in (0, 1) and not pg.stderr, f"pgrep: {pg.returncode} {pg.stderr!r}")
         running = pg.stdout.split()
         check(not running, f"{extra}: processes of the jail: {running}")
-    return f"{len(cases)} devices options refused, exit 1, no jail made"
+    return f"{len(cases)} devices options refused, exit 1; v1 at the cgroup step (the binary copied), v2 with no jail"
 
 
 # ---------------------------------------------------------------- freeze

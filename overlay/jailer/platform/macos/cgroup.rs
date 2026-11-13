@@ -93,6 +93,9 @@ pub struct CgroupConfigurationBuilder {
     memory_limit_mib: Option<i32>,
     cpu: CpuBandwidth,
     freezer: Option<FreezerState>,
+    /// The first v1 `devices.*` property (file, value), refused by
+    /// [`CgroupConfiguration::setup`].
+    devices: Option<(String, String)>,
 }
 
 /// The CPU bandwidth asked for: quota and period in microseconds, as given.
@@ -116,6 +119,7 @@ impl CgroupConfigurationBuilder {
                     memory_limit_mib: None,
                     cpu: CpuBandwidth::default(),
                     freezer: None,
+                    devices: None,
                 })
             }
             _ => Err(JailerError::CgroupInvalidVersion(ver.to_string())),
@@ -149,6 +153,11 @@ impl CgroupConfigurationBuilder {
             (1, _) if controller == "freezer" => {
                 return Err(HostError::CgroupValue(format!("{file}={value}"), freezer_values::READ_ONLY).into());
             }
+            // v1: refused at the cgroup step, where upstream's jailer fails
+            // on Linux (`CgroupConfiguration::setup`).
+            (1, _) if controller == "devices" => {
+                self.devices.get_or_insert((file, value));
+            }
             (2, "cpu.max") => self.cpu = cpu_max(&file, &value)?,
             (1, "cpu.cfs_quota_us") => self.cpu.quota_us = cfs_quota(&file, &value)?,
             (1, "cpu.cfs_period_us") => self.cpu.period_us = Some(period(&file, &value)?),
@@ -169,6 +178,7 @@ impl CgroupConfigurationBuilder {
             memory_limit_mib: self.memory_limit_mib,
             cpu: self.cpu,
             freezer: self.freezer,
+            devices: self.devices,
         }
     }
 
@@ -185,10 +195,20 @@ pub struct CgroupConfiguration {
     memory_limit_mib: Option<i32>,
     cpu: CpuBandwidth,
     freezer: Option<FreezerState>,
+    devices: Option<(String, String)>,
 }
 
 impl CgroupConfiguration {
     pub fn setup(&self) -> Result<(), JailerError> {
+        // First, before any limit is set: a v1 `devices.*` property is
+        // refused at this step, as on Linux, where upstream's jailer fails
+        // here (Env::run's cgroup step, after the jail's root is made and the
+        // binary copied into it) reading the parent cgroup's write-only
+        // `devices.allow` or `devices.deny` (EINVAL), or writing the read-only
+        // `devices.list` (tools/linux/jailer-cgroup-check.py `case_devices`).
+        if let Some((file, value)) = &self.devices {
+            return Err(HostError::UnsupportedCgroup(format!("{file}={value}"), refusal(file)).into());
+        }
         // Checked here, once both v1 properties are known.
         let cpu_percent = cpu_percent(self.cpu)?;
         platform::set_memory_limit_mib(self.memory_limit_mib);
@@ -553,9 +573,6 @@ mod tests {
             (2, "hugetlb.2MB.max=0", "no hugetlb page pool"),
             (2, "cpuset.cpus.exclusive=0", "only cpuset.cpus and cpuset.mems"),
             (2, "rdma.max=x", "no macOS counterpart"),
-            (1, "devices.deny=a", "cannot set it on Linux either"),
-            (1, "devices.allow=c 1:3 rwm", "devices.allow and devices.deny are write-only"),
-            (1, "devices.list=a *:* rwm", "devices.list read-only"),
         ] {
             let err = limit(v, &[p]).unwrap_err();
             assert!(matches!(err, JailerError::Host(HostError::UnsupportedCgroup(..))), "{p}: {err}");
@@ -569,6 +586,31 @@ mod tests {
             CgroupConfigurationBuilder::new(3, "").unwrap_err(),
             JailerError::CgroupInvalidVersion(_)
         ));
+    }
+
+    // v1 `devices.*`: taken while the options are read and refused at the
+    // cgroup step (setup), with the reason, before any limit is set, as
+    // upstream's jailer on Linux refuses it there; v2 has no devices
+    // controller (test_other_controllers_are_refused).
+    #[test]
+    fn test_v1_devices_are_refused_at_the_cgroup_step() {
+        for (p, why) in [
+            ("devices.deny=a", "cannot set it on Linux either"),
+            ("devices.allow=c 1:3 rwm", "devices.allow and devices.deny are write-only"),
+            ("devices.list=a *:* rwm", "devices.list read-only"),
+        ] {
+            let conf = builder(1, &[p]).unwrap_or_else(|e| panic!("{p}: refused while read: {e}")).build();
+            let err = conf.setup().unwrap_err();
+            assert!(matches!(err, JailerError::Host(HostError::UnsupportedCgroup(..))), "{p}: {err}");
+            assert!(err.to_string().contains(why), "{p}: {err}");
+            assert!(err.to_string().contains(p), "{p}: {err}");
+        }
+        // The first one named is the one refused, whatever follows it; and
+        // before a freezer state (FROZEN would stop the jailer at this step).
+        let conf = builder(1, &["memory.limit_in_bytes=1048576", "devices.deny=a", "devices.list=a", "freezer.state=FROZEN"])
+            .unwrap()
+            .build();
+        assert!(conf.setup().unwrap_err().to_string().contains("devices.deny=a"));
     }
 
     // A limit macOS does not have, at the kernel's word for "no limit": valid
