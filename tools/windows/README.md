@@ -123,7 +123,9 @@
   committed and resident, and the first accesses it takes at today's 4 KiB
   commit grain against what the 64 KiB grain before or a 2 MiB grain take
   (the 64 KiB blocks, 4 KiB pages and 2 MiB ranges it is in); Linux's for the same guest
-  and work are `tools/linux/guest-ram-record.py`'s:
+  and work are `tools/linux/guest-ram-record.py`'s. VMMIRQ lines give the
+  interrupts the guest took by then (`/proc/interrupts`, each row summed over
+  the CPUs) and its uptime: the count an EOI that exits would be paid for:
 
   ```
   python -I tools\windows\vmm-memory-record.py --boot C:\wbt lib\firecracker\build\cargo_target\release\firecracker.exe 1 2 16

@@ -545,6 +545,15 @@ pub(crate) mod trace {
                 d.push(format!("gva {:#x}", mem.Gva));
             }
         }
+        if ctx.ExitReason == super::whv::WHvRunVpExitReasonException {
+            // SAFETY: the union arm matches the exit reason.
+            let ex = unsafe { ctx.Anonymous.VpException };
+            let bytes = &ex.InstructionBytes[..usize::from(ex.InstructionByteCount).min(16)];
+            d.push(format!(
+                "exception vector {}, error code {:#x}, parameter {:#x}, instruction bytes {bytes:02x?}",
+                ex.ExceptionType, ex.ErrorCode, ex.ExceptionParameter
+            ));
+        }
         d.push(format!("rip {:#x}", ctx.VpContext.Rip));
         let (now, deepest) = libc::wick_mm::host_faults_on_this_thread();
         if now != faults {

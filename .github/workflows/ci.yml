@@ -1098,11 +1098,18 @@ jobs:
           # on an xAPIC one; WHP's own TSC-deadline timer, its exits and APIC
           # write traps, this runner's own CPUID from Hyper-V, and the
           # TscDeadline register; and on an xAPIC partition who answers the
-          # x2APIC MSRs, with EXTD clear and after its write exited; and on
+          # x2APIC MSRs, with EXTD clear and after its write exited, and
+          # what an EOI by WRMSR that exits costs there (option C); and on
           # an x2APIC partition whose MSR action list holds the LVT timer
           # and the initial count, who answers them (the TSC-deadline mode
           # write too) and what a WRMSR the list traps costs.
           alone whp::vcpu::fpu_tests::test_an_x2apic_partition_on_record
+          # Option E (GPEXITREC lines): an x2APIC partition with #GP in its
+          # exception exits; the exit of the guest's TSC-deadline WRMSR
+          # (vector, error code, RIP, instruction bytes), that #GP given
+          # back to the guest's handler, and a #GP's cost with and without
+          # the exit.
+          alone whp::vcpu::fpu_tests::test_gp_exits_on_an_x2apic_partition_on_record
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # The lazy-RAM grain (LAZYGRAIN lines): guest RAM mapped as

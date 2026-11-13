@@ -66,6 +66,11 @@ besides the VMMMEM lines:
               linker's map of the same build (link.exe /MAP), whose
               addresses are the image's
 
+  VMMIRQ      the interrupts the guest took (/proc/interrupts, each row
+              summed over its CPUs) and its uptime, after the shell and
+              after GUEST_WORK: what a local APIC EOI that exits would cost
+              is a count of them (the B plan's option C)
+
   VMMGUEST    the guest's memory after the shell answered and again after
               GUEST_WORK (a 32 MiB file and 32 sparse pages of tmpfs): what
               is committed (the job's memory limit counts it) and resident
@@ -1031,6 +1036,36 @@ class Console:
         return re.search(pattern, self.text())
 
 
+# What the guest prints for a VMMIRQ line, between two marks.
+IRQ_COMMAND = ("echo WICK-$((6*7))-IRQS; cat /proc/uptime; cat /proc/interrupts; echo WICK-$((6*7))-IRQE")
+
+
+def irq_summary(text):
+    """A VMMIRQ line's text from the console's text: the last block between
+    the marks IRQ_COMMAND prints. Each row of /proc/interrupts summed over
+    its CPU columns, the largest first; None without a block."""
+    found = re.findall(r"WICK-42-IRQS\s*\n(.*?)WICK-42-IRQE", text, re.S)
+    if not found:
+        return None
+    lines = found[-1].splitlines()
+    uptime = next((float(m.group(1)) for m in (re.match(r"^\s*([\d.]+)\s+[\d.]+\s*$", l) for l in lines) if m), None)
+    header = next((l for l in lines if re.match(r"^\s+CPU0", l)), None)
+    cpus = len(header.split()) if header else 1
+    rows = {}
+    for line in lines:
+        m = re.match(r"^\s*(\w+):\s+(.*)$", line)
+        if not m:
+            continue
+        fields = m.group(2).split()
+        counts = [int(f) for f in fields[:cpus] if f.isdigit()]
+        if counts:
+            rows[m.group(1)] = sum(counts)
+    total = sum(n for name, n in rows.items() if name not in ("ERR", "MIS"))
+    per_second = f"{total / uptime:.0f} a second" if uptime else "uptime not read"
+    top = ", ".join(f"{name} {n}" for name, n in sorted(rows.items(), key=lambda r: -r[1]) if n)
+    return f"uptime {uptime} s; interrupts {total} ({per_second}): {top}"
+
+
 def run_boot_case(binds, firecracker, vcpus, work, system, kernel, rootfs, chains):
     """A microVM that boots Linux with a network interface: the VMMMEM lines
     of `run_case`, then the VMMSTACK lines. The kinds, or None when
@@ -1088,6 +1123,9 @@ def run_boot_case(binds, firecracker, vcpus, work, system, kernel, rootfs, chain
         booted = time.monotonic() - started
         console.send("mount -t proc proc /proc; echo WICK-CPUS=$(grep -c ^processor /proc/cpuinfo)")
         cpus = console.wait(r"WICK-CPUS=(\d+)", 60)
+        console.send(IRQ_COMMAND)
+        console.wait(r"WICK-42-IRQE", 30)
+        print(f"VMMIRQ boot vcpus={vcpus} after the shell: {irq_summary(console.text()) or 'not read'}")
         # Frames with nobody to take them: the interface up, an address, a
         # few pings of a neighbour that is not there (each an ARP request).
         console.send("ip link set eth0 up; ip addr add 192.168.241.2/30 dev eth0; "
@@ -1120,6 +1158,13 @@ def run_boot_case(binds, firecracker, vcpus, work, system, kernel, rootfs, chain
         worked = console.wait(r"WICK-42-WORKED", 120)
         took = time.monotonic() - started
         guest = guest_memory(binds[0], binds[1], proc.pid) if worked else None
+        if worked:
+            before = console.text().count("WICK-42-IRQE")
+            console.send(IRQ_COMMAND)
+            deadline = time.monotonic() + 30
+            while console.text().count("WICK-42-IRQE") == before and time.monotonic() < deadline:
+                time.sleep(0.5)
+            print(f"VMMIRQ boot vcpus={vcpus} after the work: {irq_summary(console.text()) or 'not read'}")
         print(f"VMMGUEST boot vcpus={vcpus} after the work ({took:.1f} s): "
               + (guest_line(guest) if guest else "the guest did not finish it" if not worked else "no guest memory found"))
         return kinds
@@ -1372,6 +1417,13 @@ def selftest():
                                   "4 KiB pages 2 (today), 2 MiB ranges 3"), guest_line(counts)
     assert "WICK-$((6*7))-WORKED" in GUEST_WORK and "WICK-42-WORKED" not in GUEST_WORK
     assert "WICK-$((6*7))-WORKED" in SNAP_WORK and "WICK-$((6*7))-MORE" in SNAP_MORE
+    # The command's echo has the marks unexpanded; the second block is the last one's.
+    text = (IRQ_COMMAND + "\nWICK-42-IRQS\n1.00 0.50\nWICK-42-IRQE\n" + IRQ_COMMAND + "\nWICK-42-IRQS\n"
+            "12.50 20.00\n           CPU0       CPU1\n  4:        310          0   IO-APIC   4-edge      ttyS0\n"
+            "  5:         20          5   IO-APIC   5-edge      virtio0\nLOC:       1000        250   Local timer interrupts\n"
+            "CAL:          3          4   Function call interrupts\nERR:          0\nMIS:          0\nWICK-42-IRQE\n")
+    assert irq_summary(text) == ("uptime 12.5 s; interrupts 1592 (127 a second): LOC 1250, 4 310, 5 25, CAL 7"), irq_summary(text)
+    assert irq_summary("nothing") is None
     # psapi.h: two DWORDs and nine SIZE_Ts (80 bytes on x64), PrivateUsage last.
     word, size = ctypes.sizeof(wintypes.DWORD), ctypes.sizeof(ctypes.c_size_t)
     assert ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX) == 2 * word + 9 * size
