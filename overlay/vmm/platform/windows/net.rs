@@ -34,11 +34,27 @@
 //! - The descriptor is the interface: once it is closed, reads and writes
 //!   fail with `EBADF` and the connected switch is disconnected, whoever
 //!   closed it (`Endpoint::check_open`).
-//! - The guest's frames are never sent in part: a frame the connection
-//!   cannot take at all is dropped, as when a TAP queue is full, and a frame
-//!   it took part of is completed, waiting up to [`SEND_STALL`] for the
-//!   switch, after which the switch is disconnected (a byte stream cannot
-//!   skip the rest of a frame).
+//! - The guest's frames are never sent in part. A frame the connection
+//!   cannot take at all is dropped and its write fails with `ENOBUFS`,
+//!   which upstream logs and counts in `tap_write_fails` (net/device.rs,
+//!   `write_to_mmds_or_tap`), as on macOS, where a `sendto` the datagram
+//!   endpoint's peer refuses fails the write (`send_to_peers`). Linux's
+//!   write to a TAP is never refused for room: the TAP's socket has
+//!   `sk_sndbuf` `INT_MAX` (v6.1 drivers/net/tun.c:3455), and `tun_get_user`
+//!   hands the frame to the host's stack and returns its length (:1544 to
+//!   :1548, :2010 to :2020); a frame lost after that is counted by the
+//!   host, in the receiving socket's `RcvbufErrors` (net/ipv4/udp.c:2094)
+//!   or the TAP's `rx_dropped` (net/core/dev.c:4694 to :4697). Nothing past
+//!   the endpoint counts a frame, so the endpoint does not drop one
+//!   silently (`test_a_frame_the_connection_cannot_take_fails_with_enobufs`).
+//!   A frame segmented here (an offloaded superframe) fails the same way if
+//!   the connection had no room for one of its segments, once every
+//!   segment was tried (`test_a_superframe_with_a_segment_dropped_fails_with_enobufs`).
+//!   A frame the connection took part of is completed, waiting up to
+//!   [`SEND_STALL`] for the switch, after which the switch is disconnected
+//!   (a byte stream cannot skip the rest of a frame). The write does not
+//!   wait for room otherwise: Firecracker's event loop serves every device
+//!   from one thread, and a TAP never makes it wait for a reader.
 //! - The descriptor that is polled is the listening socket for the life of
 //!   the interface; the epoll follows it to the connection it accepted
 //!   ([`vmm_sys_util::epoll::Redirect`]), and reads report when they leave
@@ -287,7 +303,9 @@ impl Endpoint {
         }
     }
 
-    /// Sends one frame to the switch, or drops it (see the module docs).
+    /// Sends one frame to the switch, or drops it (see the module docs):
+    /// `ENOBUFS` if the connection had no room for any of it; no error
+    /// with no switch connected.
     fn send(&mut self, frame: &[u8]) -> io::Result<()> {
         if self.conn.is_none() {
             self.accept()?;
@@ -302,7 +320,9 @@ impl Endpoint {
         msg.extend_from_slice(frame);
         let sent = match conn.write(&msg) {
             Ok(n) => n,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::Error::from_raw_os_error(libc::ENOBUFS));
+            }
             Err(_) => {
                 self.disconnect();
                 return Ok(());
@@ -460,7 +480,20 @@ impl Tap {
         let (hdr, frame) = self.tx.split_at_mut(hdr_len);
         let hdr = VnetHdr::parse(hdr).ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         let endpoint = &mut self.endpoint;
-        vnet::segment(&hdr, frame, &mut self.scratch, &mut |seg| endpoint.send(seg))?;
+        // A segment the connection had no room for is dropped and the
+        // others are still tried, as the host's stack would take each
+        // segment of a frame a TAP was given; the write then fails.
+        let mut dropped = false;
+        vnet::segment(&hdr, frame, &mut self.scratch, &mut |seg| match endpoint.send(seg) {
+            Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => {
+                dropped = true;
+                Ok(())
+            }
+            other => other,
+        })?;
+        if dropped {
+            return Err(io::Error::from_raw_os_error(libc::ENOBUFS));
+        }
         Ok(total)
     }
 
@@ -845,6 +878,197 @@ mod tests {
         assert_eq!(&got[4..], &frame(60)[..]);
     }
 
+    /// A switch connected to an endpoint that reads nothing until
+    /// [`Holder::finish`], so that the connection fills. One exception: a
+    /// write that has been inside [`Tap::write_iovec`] for 200 ms is
+    /// completing a frame the connection took part of ([`SEND_STALL`]),
+    /// and the switch then reads 64 KiB, room for the rest, so that the
+    /// completion is not stalled into a disconnect (`stalls` counts them).
+    struct Holder {
+        go: std::sync::mpsc::Sender<()>,
+        reader: std::thread::JoinHandle<(Vec<u8>, String, usize)>,
+        base: std::time::Instant,
+        writing_since: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl Holder {
+        fn connect(tap: &Tap) -> Self {
+            use std::sync::mpsc::RecvTimeoutError;
+            let mut switch = UnixStream::connect(&tap.endpoint.path).unwrap();
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            let base = std::time::Instant::now();
+            let writing_since = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let since = Arc::clone(&writing_since);
+            let reader = std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let mut chunk = vec![0u8; 64 << 10];
+                let mut stalls = 0;
+                loop {
+                    match wait.recv_timeout(Duration::from_millis(20)) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {
+                            let at = since.load(Ordering::SeqCst);
+                            let now = u64::try_from(base.elapsed().as_nanos()).unwrap() + 1;
+                            if at != 0 && at != u64::MAX && now.saturating_sub(at) > 200_000_000 {
+                                stalls += 1;
+                                let n = switch.read(&mut chunk).unwrap();
+                                bytes.extend_from_slice(&chunk[..n]);
+                                // Not again for the same write.
+                                let _ = since.compare_exchange(at, u64::MAX, Ordering::SeqCst, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                }
+                switch.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                loop {
+                    match switch.read(&mut chunk) {
+                        Ok(0) => return (bytes, "end of stream".to_string(), stalls),
+                        Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                        Err(err) => return (bytes, format!("{err}"), stalls),
+                    }
+                }
+            });
+            Holder { go, reader, base, writing_since }
+        }
+
+        fn write(&self, tap: &mut Tap, buffer: &IoVecBuffer) -> io::Result<usize> {
+            let now = u64::try_from(self.base.elapsed().as_nanos()).unwrap() + 1;
+            self.writing_since.store(now, Ordering::SeqCst);
+            let result = tap.write_iovec(buffer);
+            self.writing_since.store(0, Ordering::SeqCst);
+            result
+        }
+
+        /// Shuts the tap's side down for writing, lets the switch read to
+        /// the end, and returns the frames it got and its stalls.
+        fn finish(self, tap: &mut Tap) -> (Vec<Vec<u8>>, usize) {
+            if let Some(conn) = tap.endpoint.conn.as_ref() {
+                conn.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            self.go.send(()).unwrap();
+            let (bytes, end, stalls) = self.reader.join().unwrap();
+            assert_eq!(end, "end of stream");
+            let mut frames = Vec::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                assert!(at + 4 <= bytes.len(), "a length sent in part");
+                let len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                assert!(at + 4 + len <= bytes.len(), "a frame sent in part: {} bytes after the last whole one", bytes.len() - at);
+                frames.push(bytes[at + 4..at + 4 + len].to_vec());
+                at += 4 + len;
+            }
+            (frames, stalls)
+        }
+    }
+
+    #[test]
+    fn test_a_frame_the_connection_cannot_take_fails_with_enobufs() {
+        // A switch that reads nothing: the frames go into the connection
+        // until it is full, and the first it cannot take fails with
+        // ENOBUFS, so upstream counts it in tap_write_fails, where it was
+        // dropped with the write's whole length returned and nothing
+        // counted it (the module docs). The switch then gets exactly the
+        // frames whose writes succeeded, whole.
+        const LIMIT: usize = 200_000;
+        let mut tap = Tap::open_named("fcfull%d").unwrap();
+        tap.set_vnet_hdr_size(12).unwrap();
+        let holder = Holder::connect(&tap);
+        let mut out = vec![0u8; 12];
+        out.extend_from_slice(&frame(1514));
+        let buffer = IoVecBuffer::from(out.as_slice());
+        let mut taken = 0;
+        let mut refused = None;
+        for _ in 0..LIMIT {
+            match holder.write(&mut tap, &buffer) {
+                Ok(n) => {
+                    assert_eq!(n, out.len());
+                    taken += 1;
+                }
+                Err(err) => {
+                    refused = Some(err);
+                    break;
+                }
+            }
+        }
+        let connected = tap.endpoint.conn.is_some();
+        let (frames, stalls) = holder.finish(&mut tap);
+        let err = refused.unwrap_or_else(|| {
+            panic!("{LIMIT} frames written to a switch that reads nothing and none refused ({} reached it)", frames.len())
+        });
+        assert_eq!(err.raw_os_error(), Some(libc::ENOBUFS), "{err}");
+        assert!(connected, "the switch was disconnected");
+        assert_eq!(frames.len(), taken, "frames the switch got against writes that succeeded ({stalls} stalls)");
+        assert!(frames.iter().all(|f| f[..] == frame(1514)[..]));
+    }
+
+    /// An IPv4 TCP superframe of `payload` bytes as a guest's TSO writes
+    /// it, its virtio-net header (12 bytes) first: segments of `mss`.
+    fn tso_superframe(payload: usize, mss: u16) -> Vec<u8> {
+        let mut f = vec![0u8; 12];
+        VnetHdr {
+            flags: vnet::F_NEEDS_CSUM,
+            gso_type: vnet::GSO_TCPV4,
+            hdr_len: 54,
+            gso_size: mss,
+            csum_start: 34,
+            csum_offset: 16,
+        }
+        .write(&mut f);
+        f.extend_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2, 0x08, 0x00]);
+        let total = u16::try_from(40 + payload).unwrap();
+        f.extend_from_slice(&[0x45, 0]);
+        f.extend_from_slice(&total.to_be_bytes());
+        f.extend_from_slice(&[0x12, 0x34, 0x40, 0, 64, 6, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1]);
+        f.extend_from_slice(&[0x30, 0x39, 0x00, 0x50, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x18, 0xff, 0xff, 0, 0, 0, 0]);
+        f.extend((0..payload).map(|i| (i * 7 % 251) as u8));
+        f
+    }
+
+    #[test]
+    fn test_a_superframe_with_a_segment_dropped_fails_with_enobufs() {
+        // Superframes segmented here, to a switch that reads nothing:
+        // the first whose segments the connection does not all take fails
+        // with ENOBUFS once every segment was tried, and the switch gets
+        // the segments of the frames that succeeded, and those of the
+        // refused one that fitted, never all of them.
+        const LIMIT: usize = 20_000;
+        const PAYLOAD: usize = 64_000;
+        const MSS: u16 = 1448;
+        let segments = PAYLOAD.div_ceil(usize::from(MSS));
+        let mut tap = Tap::open_named("fcfullso%d").unwrap();
+        tap.set_vnet_hdr_size(12).unwrap();
+        let holder = Holder::connect(&tap);
+        let out = tso_superframe(PAYLOAD, MSS);
+        let buffer = IoVecBuffer::from(out.as_slice());
+        let mut taken = 0;
+        let mut refused = None;
+        for _ in 0..LIMIT {
+            match holder.write(&mut tap, &buffer) {
+                Ok(n) => {
+                    assert_eq!(n, out.len());
+                    taken += 1;
+                }
+                Err(err) => {
+                    refused = Some(err);
+                    break;
+                }
+            }
+        }
+        let connected = tap.endpoint.conn.is_some();
+        let (frames, stalls) = holder.finish(&mut tap);
+        let err = refused.unwrap_or_else(|| {
+            panic!("{LIMIT} superframes written to a switch that reads nothing and none refused ({} segments reached it)", frames.len())
+        });
+        assert_eq!(err.raw_os_error(), Some(libc::ENOBUFS), "{err}");
+        assert!(connected, "the switch was disconnected");
+        assert!(frames.iter().all(|f| f.len() <= 14 + 40 + usize::from(MSS)));
+        let of_refused = frames.len().checked_sub(taken * segments).unwrap_or_else(|| {
+            panic!("{} segments for {taken} superframes of {segments} that succeeded ({stalls} stalls)", frames.len())
+        });
+        assert!(of_refused < segments, "all {segments} segments of the refused superframe reached the switch");
+        println!("SOFULL superframes={taken} segments_each={segments} of_the_refused_one={of_refused} stalls={stalls}");
+    }
+
     /// What [`Endpoint::check_open`] costs, on record: the time of a check
     /// alone, and of a whole `write_iovec` of a 1514-byte frame (which
     /// holds one check) to a switch that reads. Times are the test
@@ -863,9 +1087,11 @@ mod tests {
         // not full for long. `write_iovec` here is as fast as the loop
         // goes, with no guest in between, so the reading thread can fall
         // behind: a frame the full connection cannot take at all is
-        // dropped, as in the product ([`Endpoint::send`] and the module
-        // docs), and is not in `delivered` (run 43323860314: 19929 of 20000; run 43318983352:
-        // all 20000). The tap's side is shut down for writing before the
+        // dropped and its write fails with ENOBUFS, as in the product
+        // ([`Endpoint::send`] and the module docs), so it is in `refused`
+        // and not in `delivered` (before the write failed, run
+        // 43323860314: 19929 of 20000 delivered; run 43318983352: all
+        // 20000). The tap's side is shut down for writing before the
         // tap goes, so everything the connection took is read first
         // (`end` is how the stream ended, `rest` the bytes after the last
         // whole frame): `frames - delivered` are then the dropped ones,
@@ -886,8 +1112,13 @@ mod tests {
         let buffer = IoVecBuffer::from(out.as_slice());
 
         let start = std::time::Instant::now();
+        let mut refused = 0u32;
         for _ in 0..N {
-            tap.write_iovec(&buffer).unwrap();
+            match tap.write_iovec(&buffer) {
+                Ok(_) => {}
+                Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => refused += 1,
+                Err(err) => panic!("{err}"),
+            }
         }
         let write = start.elapsed();
         let start = std::time::Instant::now();
@@ -902,7 +1133,7 @@ mod tests {
         let (bytes, end) = reader.join().unwrap();
         drop(tap);
         println!(
-            "TAPCHECK frames={N} delivered={} rest={} end=\"{end}\" connected={connected} \
+            "TAPCHECK frames={N} delivered={} refused={refused} rest={} end=\"{end}\" connected={connected} \
              write_iovec_ns={} check_ns={} (per call, test profile)",
             bytes / (4 + 1514),
             bytes % (4 + 1514),
