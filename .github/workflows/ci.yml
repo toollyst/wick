@@ -971,8 +971,8 @@ jobs:
           # direction flag too) and a device's memory with a second operand
           # in RAM (MOVSB either way): the exits and bytes Firecracker's
           # devices see are KVM's, and the guest's memory and registers
-          # after (asserted; STRTEST lines, with REP MOVSB to and from a
-          # device on record).
+          # after, and a REP MOVSB of 2 to and from a device, an exit for
+          # each element (asserted; STRTEST lines).
           alone whp::vcpu::fpu_tests::test_string_io_and_device_memory_beside_ram
           # KVM's emulator around those data (asserted; STRTEST lines): a
           # REP prefix on a plain OUT is no string instruction; RIP and

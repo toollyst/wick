@@ -5510,9 +5510,14 @@ mod fpu_tests {
     // - MOVSB from a device to RAM: one read of the device, the byte in
     //   RAM; MOVSB from RAM to a device: one write to the device with the
     //   byte from RAM, and no read asked of Firecracker for it.
-    // On record, not asserted (how many elements WHP's emulator does in one
-    // call is not documented): REP MOVSB of 2 from a device to RAM and
-    // from RAM to a device (STRTEST lines).
+    // - REP MOVSB of 2 from a device to RAM: one read exit of one byte for
+    //   each element, each answered once, both bytes in RAM; from RAM to a
+    //   device: one write exit for each element with its byte from RAM,
+    //   and no read asked of Firecracker (KVM's emulator does a string
+    //   instruction with a device operand an element at a time). Printed
+    //   on record first (how many elements WHP's emulator does in one call
+    //   is not documented): the PC (Ryzen 9 7900, kit f35e353) and CI run
+    //   43467381837 (AMD EPYC 9V74) gave these exits.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_string_io_and_device_memory_beside_ram() {
@@ -5551,8 +5556,8 @@ mod fpu_tests {
             // MOVSB from 0x8300 to the device at 0x600004.
             vec![0xBE, 0x00, 0x83, 0x00, 0x00, 0xBF, 0x04, 0x00, 0x60, 0x00, 0xA4],
             vec![0xE6, PORT as u8],
-            // On record: REP MOVSB of 2 from the device to 0x8510, then from
-            // 0x8300 to the device at 0x600008.
+            // REP MOVSB of 2 from the device to 0x8510, then from 0x8300
+            // to the device at 0x600008.
             vec![0xBE, 0x00, 0x00, 0x60, 0x00, 0xBF, 0x10, 0x85, 0x00, 0x00, 0xB9, 0x02, 0x00, 0x00, 0x00, 0xF3, 0xA4],
             vec![0xE6, PORT as u8],
             vec![0xBE, 0x00, 0x83, 0x00, 0x00, 0xBF, 0x08, 0x00, 0x60, 0x00, 0xB9, 0x02, 0x00, 0x00, 0x00, 0xF3, 0xA4],
@@ -5605,12 +5610,12 @@ mod fpu_tests {
             "the end",
         ];
 
-        // On record: the two REP MOVSB with a device.
+        // The two REP MOVSB with a device, asserted below.
         let mut feed: std::collections::VecDeque<Vec<u8>> = [vec![0xA1], vec![0xA2]].into();
         let from_device = exits_with_their_bytes(&mut vcpu, &mut feed, false, "REP MOVSB of 2 from a device to RAM");
+        let from_device_memory = bytes_at::<2>(m, 0x8510);
         eprintln!(
-            "STRTEST REP MOVSB of 2 from a device to RAM (device reads answered a1, then a2): exits {from_device:?}; memory {:02x?}",
-            bytes_at::<2>(m, 0x8510)
+            "STRTEST REP MOVSB of 2 from a device to RAM (device reads answered a1, then a2): exits {from_device:?}; memory {from_device_memory:02x?}"
         );
         let to_device = exits_with_their_bytes(&mut vcpu, &mut feed, false, "REP MOVSB of 2 from RAM to a device");
         eprintln!("STRTEST REP MOVSB of 2 (\"ab\") from RAM to a device: exits {to_device:?}");
@@ -5620,6 +5625,9 @@ mod fpu_tests {
         // SAFETY: the test's mapping, no VM left using it.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
         assert_eq!(exits, wanted);
+        assert_eq!(from_device, ["read 0x600000 x1", "read 0x600001 x1", "the end"], "REP MOVSB of 2 from a device to RAM");
+        assert_eq!(from_device_memory, [0xA1, 0xA2], "REP MOVSB of 2 from a device: the bytes in RAM");
+        assert_eq!(to_device, ["write 0x600008 [61]", "write 0x600009 [62]", "the end"], "REP MOVSB of 2 from RAM to a device");
         assert_eq!(
             memory,
             "after REP OUTSB RSI 0x8303 RCX 0x0; after REP INSB RDI 0x8403 RCX 0x0, memory [01, 02, 03]; INSD [44, 33, 22, 11]; \
