@@ -369,9 +369,161 @@ pub fn page_fault_code(present: bool, write: bool, user: bool, reserved: bool) -
     u32::from(present || reserved) | u32::from(write) << 1 | u32::from(user) << 2 | u32::from(reserved) << 3
 }
 
+/// A device read of an MMIO instruction with the data the device gave
+/// (`VcpuExit::MmioRead`, filled by Firecracker), kept until the
+/// instruction finishes ([`answer_read`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRead {
+    pub addr: u64,
+    pub len: usize,
+    pub data: [u8; 8],
+}
+
+/// What the emulator's device read of `len` bytes at `addr` is answered
+/// with when the instruction is emulated again from its exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAnswer {
+    /// The data of the read given for it: the next of `reads`, for the same
+    /// access.
+    Data([u8; 8]),
+    /// None given yet: the emulation stops here and the device is asked.
+    Ask,
+    /// The next read given was for another access: the instruction is not
+    /// the one the data was for.
+    Mismatch,
+}
+
+/// The answer to an emulator's device read of an instruction whose reads
+/// before `next` were answered from `reads`, in order: the same
+/// instruction from the same state asks for the same accesses again, so
+/// the `next`th read given is for this one (KVM's emulator replays its
+/// reads from its read cache the same way, `read_emulated`).
+pub fn answer_read(reads: &[DeviceRead], next: &mut usize, addr: u64, len: usize) -> ReadAnswer {
+    match reads.get(*next) {
+        None => ReadAnswer::Ask,
+        Some(r) if r.addr == addr && r.len == len => {
+            *next += 1;
+            ReadAnswer::Data(r.data)
+        }
+        Some(_) => ReadAnswer::Mismatch,
+    }
+}
+
+/// How an emulation of an MMIO instruction ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Emulated {
+    /// Finished, nothing for a device but what the irqchip took.
+    Completed,
+    /// The emulator could not do it.
+    Failed,
+    /// A device read did not match the data given ([`ReadAnswer::Mismatch`]).
+    Mismatch,
+    /// A device read with no data yet.
+    Read { addr: u64, len: usize },
+    /// Finished with a write to a device.
+    Write,
+}
+
+/// What the run loop does after an emulation that ended as `e`, with
+/// `answered` device reads of the instruction answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmioStep {
+    /// The instruction is done: the run goes on (enters the guest).
+    Done,
+    /// The instruction is done; its device write is the exit.
+    Write,
+    /// The device is asked for this read (`VcpuExit::MmioRead`), and the
+    /// instruction finishes at the next run.
+    Ask { addr: u64, len: usize },
+    /// The vCPU stops (`VcpuExit::InternalError`): entering the guest
+    /// would run the instruction again and ask its devices again.
+    Stop,
+}
+
+/// [`MmioStep`] for an emulation that ended as `e`. An instruction the
+/// emulator cannot do before any device read is entered again, as before
+/// (its exit comes back); after one, it is stopped, as is one whose read
+/// does not match the data given.
+pub fn mmio_step(e: Emulated, answered: usize) -> MmioStep {
+    match e {
+        Emulated::Completed => MmioStep::Done,
+        Emulated::Failed if answered == 0 => MmioStep::Done,
+        Emulated::Failed | Emulated::Mismatch => MmioStep::Stop,
+        Emulated::Read { addr, len } => MmioStep::Ask { addr, len },
+        Emulated::Write => MmioStep::Write,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The device reads of an MMIO instruction, kept between its exits and
+    // answered in order when it is emulated again from its exit, as the run
+    // loop does (`vcpu.rs`, `emulate_mmio`), with a model of the emulator:
+    // an instruction that asks for `asks`, in order, stopping at the first
+    // read it has no data for.
+    #[test]
+    fn test_an_mmio_instructions_device_reads() {
+        fn emulate(asks: &[(u64, usize)], reads: &[DeviceRead]) -> (Emulated, Vec<[u8; 8]>) {
+            let mut next = 0;
+            let mut got = Vec::new();
+            for &(addr, len) in asks {
+                match answer_read(reads, &mut next, addr, len) {
+                    ReadAnswer::Data(d) => got.push(d),
+                    ReadAnswer::Ask => return (Emulated::Read { addr, len }, got),
+                    ReadAnswer::Mismatch => return (Emulated::Mismatch, got),
+                }
+            }
+            (Emulated::Completed, got)
+        }
+        // The run loop: an exit for each read with no data, the device's
+        // data kept, the instruction emulated again from its exit.
+        fn run(asks: &[(u64, usize)]) -> (Vec<(u64, usize)>, Vec<[u8; 8]>) {
+            let mut reads: Vec<DeviceRead> = Vec::new();
+            let mut exits = Vec::new();
+            loop {
+                let (e, got) = emulate(asks, &reads);
+                match mmio_step(e, reads.len()) {
+                    MmioStep::Ask { addr, len } => {
+                        exits.push((addr, len));
+                        let n = u8::try_from(exits.len()).unwrap();
+                        reads.push(DeviceRead { addr, len, data: [n; 8] });
+                    }
+                    MmioStep::Done => return (exits, got),
+                    s => panic!("{asks:?}: {s:?}"),
+                }
+                assert!(exits.len() <= asks.len(), "{asks:?} asked again: {exits:?}");
+            }
+        }
+        // One read: one exit, then done with its data.
+        assert_eq!(run(&[(0x60_0000, 4)]), (vec![(0x60_0000, 4)], vec![[1; 8]]));
+        // Two device reads in one instruction (an access split at a page,
+        // two operands): an exit for each, in order, each answered with its
+        // own data. The data of one read went to the first device read
+        // before, and the second was asked again on every run.
+        assert_eq!(
+            run(&[(0x60_0FFC, 4), (0x60_1000, 4)]),
+            (vec![(0x60_0FFC, 4), (0x60_1000, 4)], vec![[1; 8], [2; 8]])
+        );
+        // No device read: done at once.
+        assert_eq!(run(&[]), (vec![], vec![]));
+        // A read other than the one the data was for stops the vCPU.
+        let given = [DeviceRead { addr: 0x60_0000, len: 4, data: [7; 8] }];
+        assert_eq!(emulate(&[(0x60_0004, 4)], &given).0, Emulated::Mismatch);
+        assert_eq!(emulate(&[(0x60_0000, 2)], &given).0, Emulated::Mismatch);
+        assert_eq!(mmio_step(Emulated::Mismatch, 1), MmioStep::Stop);
+        // The data given is used once: a second read of the same access
+        // is a read of its own.
+        let mut next = 0;
+        assert_eq!(answer_read(&given, &mut next, 0x60_0000, 4), ReadAnswer::Data([7; 8]));
+        assert_eq!(answer_read(&given, &mut next, 0x60_0000, 4), ReadAnswer::Ask);
+        // An emulation that fails after a device read stops; before one, it
+        // is entered again; a write is the exit.
+        assert_eq!(mmio_step(Emulated::Failed, 1), MmioStep::Stop);
+        assert_eq!(mmio_step(Emulated::Failed, 0), MmioStep::Done);
+        assert_eq!(mmio_step(Emulated::Write, 1), MmioStep::Write);
+    }
 
     // The address size of INS and OUTS by mode and prefix, and the segment
     // an OUTS reads through.

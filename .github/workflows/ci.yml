@@ -620,6 +620,12 @@ jobs:
         run: |
           rustup toolchain install "$(tools/fuzz.sh --toolchain)" --profile minimal
           cargo install cargo-fuzz --locked --version 0.13.2
+      # The decoding modules the targets compile from their sources
+      # (fuzz/src/lib.rs: hvf/exit.rs, whp/exit.rs, ...) with their own
+      # unit tests, on every host: the WHP run loop's MMIO read bookkeeping
+      # (whp_exit::tests) is checked on Linux and macOS too.
+      - name: The fuzzed modules' unit tests
+        run: cargo test --manifest-path fuzz/Cargo.toml --lib
       - name: Fuzz each target for 60 seconds
         run: tools/fuzz.sh -t 60
       - name: Upload the inputs that failed

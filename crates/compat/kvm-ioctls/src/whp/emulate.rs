@@ -77,14 +77,7 @@ pub(crate) enum Outcome {
     Mismatch { asked: (u64, usize), given: (u64, usize) },
 }
 
-/// A device read of an instruction, with the data the device gave, to be
-/// handed to the emulator when it asks for the same access again.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DeviceRead {
-    pub addr: u64,
-    pub len: usize,
-    pub data: [u8; 8],
-}
+pub(crate) use super::exit::DeviceRead;
 
 /// State shared with the WHP emulator callbacks for one emulation attempt.
 #[repr(C)]
@@ -284,25 +277,25 @@ unsafe extern "system" fn mem_cb(
         a.Data[..size].copy_from_slice(&bytes[..size]);
         return S_OK;
     }
-    if ctx.next_read < ctx.reads_len {
-        // A device read answered before: the same access, in the same
-        // order, as the instruction is the same from the same state.
-        // SAFETY: within the caller's slice of `reads_len` reads.
-        let given = unsafe { &*ctx.reads.add(ctx.next_read) };
-        if given.addr != a.GpaAddress || given.len != size {
-            ctx.mismatch = Some((a.GpaAddress, size));
-            return E_FAIL;
+    // SAFETY: the caller's slice of `reads_len` reads, held for the call.
+    let reads = unsafe { std::slice::from_raw_parts(ctx.reads, ctx.reads_len) };
+    match super::exit::answer_read(reads, &mut ctx.next_read, a.GpaAddress, size) {
+        super::exit::ReadAnswer::Data(data) => {
+            a.Data[..size].copy_from_slice(&data[..size]);
+            S_OK
         }
-        ctx.next_read += 1;
-        a.Data[..size].copy_from_slice(&given.data[..size]);
-        S_OK
-    } else {
-        // Read with no data yet: abort so RIP does not advance.
-        ctx.exit_kind = 0;
-        ctx.exit_len = size as u32;
-        ctx.exit_addr = a.GpaAddress;
-        ctx.exit_mmio = true;
-        E_FAIL
+        super::exit::ReadAnswer::Mismatch => {
+            ctx.mismatch = Some((a.GpaAddress, size));
+            E_FAIL
+        }
+        super::exit::ReadAnswer::Ask => {
+            // Read with no data yet: abort so RIP does not advance.
+            ctx.exit_kind = 0;
+            ctx.exit_len = size as u32;
+            ctx.exit_addr = a.GpaAddress;
+            ctx.exit_mmio = true;
+            E_FAIL
+        }
     }
 }
 

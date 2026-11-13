@@ -1612,41 +1612,40 @@ impl VcpuFd {
         loop {
             let mut more = Vec::new();
             let outcome = emulate::mmio(part, vp, vpctx, mem, scratch, &reads, ram, &mut more)?;
-            match outcome {
-                emulate::Outcome::Completed => {
+            let ended = match outcome {
+                emulate::Outcome::Completed => super::exit::Emulated::Completed,
+                emulate::Outcome::Failed => super::exit::Emulated::Failed,
+                emulate::Outcome::Mismatch { .. } => super::exit::Emulated::Mismatch,
+                emulate::Outcome::Read { addr, len, .. } => super::exit::Emulated::Read { addr, len },
+                emulate::Outcome::Write { .. } => super::exit::Emulated::Write,
+            };
+            match super::exit::mmio_step(ended, reads.len()) {
+                super::exit::MmioStep::Done => {
                     self.shared.device_writes.lock().unwrap().append(&mut more);
                     return Ok(None);
                 }
-                // The instruction had device reads answered and cannot
-                // finish: entering the guest would run it again and ask the
-                // devices again. Refused, as KVM's emulator failure is an
-                // internal error.
-                emulate::Outcome::Failed if !reads.is_empty() => {
-                    super::ffi::report(
-                        log::Level::Error,
-                        &format!("whp: the MMIO instruction at {:#x} did not finish after its device reads", vpctx.Rip),
-                    );
-                    return Ok(Some(VcpuExit::InternalError));
-                }
-                emulate::Outcome::Failed => return Ok(None),
-                emulate::Outcome::Mismatch { asked, given } => {
-                    super::ffi::report(
-                        log::Level::Error,
-                        &format!(
-                            "whp: the MMIO instruction at {:#x} asked for a read of {} bytes at {:#x} where the data \
-                             given was for {} bytes at {:#x}",
-                            vpctx.Rip, asked.1, asked.0, given.1, given.0
-                        ),
-                    );
-                    return Ok(Some(VcpuExit::InternalError));
-                }
-                emulate::Outcome::Write { addr, len, .. } => {
+                super::exit::MmioStep::Write => {
+                    let emulate::Outcome::Write { addr, len, .. } = outcome else { unreachable!() };
                     self.shared.device_writes.lock().unwrap().append(&mut more);
                     return Ok(self.device_write(addr, len, scratch));
                 }
+                // Entering the guest would run the instruction again and
+                // ask its devices again: refused, as KVM's emulator failure
+                // is an internal error.
+                super::exit::MmioStep::Stop => {
+                    let why = match outcome {
+                        emulate::Outcome::Mismatch { asked, given } => format!(
+                            "asked for a read of {} bytes at {:#x} where the data given was for {} bytes at {:#x}",
+                            asked.1, asked.0, given.1, given.0
+                        ),
+                        _ => format!("did not finish after {} device reads", reads.len()),
+                    };
+                    super::ffi::report(log::Level::Error, &format!("whp: the MMIO instruction at {:#x} {why}", vpctx.Rip));
+                    return Ok(Some(VcpuExit::InternalError));
+                }
                 // Device writes before an aborted read are not kept: the
                 // emulation that finishes the instruction makes them again.
-                emulate::Outcome::Read { addr, len, .. } => {
+                super::exit::MmioStep::Ask { addr, len } => {
                     let mut chip = self.shared.inner.irqchip.lock().unwrap();
                     if chip.mmio_handles(addr) {
                         let mut data = [0u8; 8];
