@@ -330,6 +330,13 @@ pub(crate) fn pending_gp() -> u64 {
     1 | (3 << 1) | (1 << 4) | (13 << 16)
 }
 
+/// WHP's `WHV_X64_PENDING_INTERRUPTION_REGISTER` for a #PF with `code`: a
+/// hardware exception (type 3), vector 14, with its error code (bit 4) in
+/// the upper half. The faulting address goes in CR2 with it.
+pub(crate) fn pending_pf(code: u32) -> u64 {
+    1 | (3 << 1) | (1 << 4) | (14 << 16) | (u64::from(code) << 32)
+}
+
 /// KVM's `INVALID_GPA` (`~0ull`, include/linux/kvm_types.h): the
 /// physical address of a translation that failed.
 pub(crate) const INVALID_GPA: u64 = u64::MAX;

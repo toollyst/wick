@@ -179,40 +179,6 @@ pub(crate) unsafe fn WHvEmulatorDestroyEmulator(emulator: *mut core::ffi::c_void
     }
 }
 
-/// `WHvEmulatorTryIoEmulation` from `winhvemulation.dll`, loaded at first use.
-///
-/// # Safety
-/// As the Windows function.
-pub(crate) unsafe fn WHvEmulatorTryIoEmulation(
-    emulator: *const core::ffi::c_void,
-    context: *const core::ffi::c_void,
-    vpcontext: *const WHV_VP_EXIT_CONTEXT,
-    ioinstructioncontext: *const WHV_X64_IO_PORT_ACCESS_CONTEXT,
-    emulatorreturnstatus: *mut WHV_EMULATOR_STATUS,
-) -> HRESULT {
-    type F = unsafe extern "system" fn(
-        *const core::ffi::c_void,
-        *const core::ffi::c_void,
-        *const WHV_VP_EXIT_CONTEXT,
-        *const WHV_X64_IO_PORT_ACCESS_CONTEXT,
-        *mut WHV_EMULATOR_STATUS,
-    ) -> HRESULT;
-    static P: OnceLock<Option<usize>> = OnceLock::new();
-    match *P.get_or_init(|| proc_address(Dll::Emulation, c"WHvEmulatorTryIoEmulation")) {
-        // SAFETY: the address of `WHvEmulatorTryIoEmulation`, whose signature `F` is.
-        Some(p) => unsafe {
-            std::mem::transmute::<usize, F>(p)(
-                emulator,
-                context,
-                vpcontext,
-                ioinstructioncontext,
-                emulatorreturnstatus,
-            )
-        },
-        None => unavailable(Dll::Emulation),
-    }
-}
-
 /// `WHvEmulatorTryMmioEmulation` from `winhvemulation.dll`, loaded at first use.
 ///
 /// # Safety

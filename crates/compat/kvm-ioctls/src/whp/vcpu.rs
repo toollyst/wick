@@ -82,7 +82,40 @@ enum Pending {
     Mmio,
     /// A port-I/O `IN`: completed directly by writing `RAX` and advancing.
     PioIn { len: usize, rip_after: u64, rax: u64 },
+    /// An `INS`: the elements Firecracker put in the string buffer are
+    /// written to the guest's memory at the next run.
+    StringIn(StringIn),
 }
+
+/// An `INS` waiting for its data (`VcpuFd::string_io`).
+#[derive(Debug, Clone, Copy)]
+struct StringIn {
+    /// Bytes an element, and how many elements were asked of the port.
+    size: usize,
+    n: usize,
+    rep: bool,
+    /// The address size, the direction flag, 64-bit code, privilege level 3.
+    wide: u8,
+    down: bool,
+    long: bool,
+    user: bool,
+    /// `ES`'s base.
+    base: u64,
+    /// The instruction's address and the one after it.
+    rip: u64,
+    rip_after: u64,
+}
+
+/// A page fault the guest is to take for an access the backend made for it.
+#[derive(Debug, Clone, Copy)]
+struct GuestFault {
+    address: u64,
+    code: u32,
+}
+
+/// The size of the buffer an `INS`'s data is read into, KVM's
+/// (`struct read_cache`, arch/x86/kvm/kvm_emulate.h: `u8 data[1024]`).
+const STRING_DATA: usize = 1024;
 
 /// State shared between a vCPU's handles and its run loop.
 pub(crate) struct VcpuShared {
@@ -93,6 +126,14 @@ pub(crate) struct VcpuShared {
     inner: Arc<VmInner>,
     cpuid: Mutex<Vec<kvm_cpuid_entry2>>,
     pending: Mutex<Option<Pending>>,
+    /// The data of an `INS` between its exit and the next run, as KVM's
+    /// `pio_data` page is: Firecracker writes it through the slice the exit
+    /// gave it, the run loop reads it after.
+    string_data: Box<UnsafeCell<[u8; STRING_DATA]>>,
+    /// Device writes of an emulated instruction after its first
+    /// (`emulate::mmio`), handed to Firecracker one run each before the
+    /// guest is entered again.
+    device_writes: Mutex<Vec<emulate::DeviceWrite>>,
     tsc_khz: AtomicU64,
     /// Linux's image of the x87 and SSE state until the first `KVM_RUN`
     /// (`regs::BeforeRun`); `None` from then on.
@@ -249,6 +290,8 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         cpuid: Mutex::new(Vec::new()),
         before_run: Mutex::new(Some(regs::BeforeRun::new())),
         pending: Mutex::new(None),
+        string_data: Box::new(UnsafeCell::new([0; STRING_DATA])),
+        device_writes: Mutex::new(Vec::new()),
         tsc_khz: AtomicU64::new(0),
         system_time_msr: AtomicU64::new(0),
         clock_gen: AtomicU64::new(0),
@@ -1128,12 +1171,28 @@ impl VcpuFd {
         // byte slices point here and stay valid until the next `run`.
         let scratch = unsafe { (*run_ptr).__bindgen_anon_1.mmio.data.as_mut_ptr() };
 
+        // The device writes an instruction made after its first: each is
+        // an exit of its own, as KVM's.
+        loop {
+            let next = {
+                let mut queued = self.shared.device_writes.lock().unwrap();
+                if queued.is_empty() { None } else { Some(queued.remove(0)) }
+            };
+            let Some(write) = next else { break };
+            // SAFETY: at most 8 bytes into the 8-byte data area.
+            unsafe { std::ptr::copy_nonoverlapping(write.data.as_ptr(), scratch, write.len.min(8)) };
+            if let Some(exit) = self.device_write(write.addr, write.len.min(8), scratch) {
+                return Ok(exit);
+            }
+        }
+
         // Complete a read deferred from the previous exit.
         let mut mmio_completion = false;
         let mut ram_retries = 0u32;
         if let Some(pending) = self.shared.pending.lock().unwrap().take() {
             match pending {
                 Pending::Mmio => mmio_completion = true,
+                Pending::StringIn(ins) => self.complete_string_in(&ins)?,
                 Pending::PioIn {
                     len,
                     rip_after,
@@ -1202,7 +1261,7 @@ impl VcpuFd {
 
                     if string || rep {
                         if let Some(exit) =
-                            self.string_io(&ctx.VpContext, &io, scratch, &mut mmio_completion)?
+                            self.string_io(&ctx.VpContext, &io, is_write, size, rep, scratch, rip + instr_len)?
                         {
                             return Ok(exit);
                         }
@@ -1415,31 +1474,13 @@ impl VcpuFd {
     ) -> Result<Option<VcpuExit<'_>>> {
         let part = self.part();
         let vp = self.vp();
-        match emulate::mmio(part, vp, vpctx, mem, scratch, completion)? {
+        let ram = self.shared.inner.ram();
+        let mut more = Vec::new();
+        let outcome = emulate::mmio(part, vp, vpctx, mem, scratch, completion, ram, &mut more)?;
+        self.shared.device_writes.lock().unwrap().append(&mut more);
+        match outcome {
             emulate::Outcome::Completed | emulate::Outcome::Failed => Ok(None),
-            emulate::Outcome::Write { addr, len, .. } => {
-                let mut chip = self.shared.inner.irqchip.lock().unwrap();
-                if chip.mmio_handles(addr) {
-                    let data = unsafe { slice(scratch, len) };
-                    let inject = chip.mmio_write(addr, data);
-                    drop(chip);
-                    if let Some((a, d)) = inject {
-                        self.shared.inner.inject_msi(a, d);
-                    }
-                    return Ok(None);
-                }
-                drop(chip);
-                let data = unsafe { slice(scratch, len) };
-                if self
-                    .shared
-                    .inner
-                    .match_ioevent(&IoEventAddress::Mmio(addr), data)
-                {
-                    return Ok(None);
-                }
-                let data = unsafe { slice(scratch, len) };
-                Ok(Some(VcpuExit::MmioWrite(addr, data)))
-            }
+            emulate::Outcome::Write { addr, len, .. } => Ok(self.device_write(addr, len, scratch)),
             emulate::Outcome::Read { addr, len, .. } => {
                 let mut chip = self.shared.inner.irqchip.lock().unwrap();
                 if chip.mmio_handles(addr) {
@@ -1447,7 +1488,8 @@ impl VcpuFd {
                     chip.mmio_read(addr, buf);
                     drop(chip);
                     // Re-run the emulator with the data now in the scratch.
-                    let _ = emulate::mmio(part, vp, vpctx, mem, scratch, true)?;
+                    let _ = emulate::mmio(part, vp, vpctx, mem, scratch, true, ram, &mut more)?;
+                    self.shared.device_writes.lock().unwrap().append(&mut more);
                     return Ok(None);
                 }
                 drop(chip);
@@ -1459,39 +1501,303 @@ impl VcpuFd {
         }
     }
 
-    /// Handles string/`rep` port I/O through the emulator.
+    /// A write of the `len` bytes in `scratch` to the device at `addr`: the
+    /// irqchip's, an ioeventfd's, or an exit to Firecracker.
+    fn device_write(&self, addr: u64, len: usize, scratch: *mut u8) -> Option<VcpuExit<'_>> {
+        let mut chip = self.shared.inner.irqchip.lock().unwrap();
+        if chip.mmio_handles(addr) {
+            let data = unsafe { slice(scratch, len) };
+            let inject = chip.mmio_write(addr, data);
+            drop(chip);
+            if let Some((a, d)) = inject {
+                self.shared.inner.inject_msi(a, d);
+            }
+            return None;
+        }
+        drop(chip);
+        let data = unsafe { slice(scratch, len) };
+        if self.shared.inner.match_ioevent(&IoEventAddress::Mmio(addr), data) {
+            return None;
+        }
+        let data = unsafe { slice(scratch, len) };
+        Some(VcpuExit::MmioWrite(addr, data))
+    }
+
+    /// `INS` and `OUTS`, with or without `REP`, done as KVM's emulator does
+    /// them (Linux v6.1 arch/x86/kvm/emulate.c: `em_out`, `em_in`,
+    /// `pio_in_emulated`; both vendors' string port exits go to it), so that
+    /// Firecracker sees KVM's exits:
+    ///
+    /// - `OUTS` is one `KVM_EXIT_IO` an element (`em_out` passes a count of
+    ///   1): the element is read from the guest's memory at the source
+    ///   segment's `RSI`, `RSI` moves by its size, `RCX` goes down by one
+    ///   with `REP`, and `RIP` passes the instruction once none is left.
+    /// - `INS` asks the port for several elements at once
+    ///   ([`super::exit::ins_read_ahead`]), one `KVM_EXIT_IO` with that
+    ///   count; at the next run they are written to `ES:RDI` and the
+    ///   registers move by as many ([`VcpuFd::complete_string_in`]).
+    ///
+    /// The guest's memory is reached as the processor would reach it: each
+    /// page translated with the access's right at the guest's privilege
+    /// level (`WHvTranslateGva`), a refusal delivered as the page fault it
+    /// is, with nothing of the element done. The registers and the segment
+    /// are used at the instruction's address size and segment prefix
+    /// ([`super::exit::string_addressing`]). Not checked, where KVM does:
+    /// the segment's limit, the I/O permission bitmap (WHP reports the exit
+    /// after the processor's own check).
+    ///
+    /// Before, the instruction went to WHP's emulator, whose memory
+    /// callback took the string's own memory for a device's: an `OUTS`
+    /// asked Firecracker for an `IN` from "port" `RSI` and never completed
+    /// (CI run 43392627996, a `REP OUTSB` from 0x8300: twelve `IoIn 0x8300`
+    /// in a row), and an `INS` was never given its data.
+    #[allow(clippy::too_many_arguments)]
     fn string_io(
         &self,
         vpctx: &whv::WHV_VP_EXIT_CONTEXT,
         io: &whv::WHV_X64_IO_PORT_ACCESS_CONTEXT,
+        write: bool,
+        size: usize,
+        rep: bool,
         scratch: *mut u8,
-        _completion: &mut bool,
+        rip_after: u64,
     ) -> Result<Option<VcpuExit<'_>>> {
-        let part = self.part();
-        let vp = self.vp();
-        match emulate::io(part, vp, vpctx, io, scratch, false)? {
-            emulate::Outcome::Completed | emulate::Outcome::Failed => Ok(None),
-            emulate::Outcome::Write { addr, len, .. } => {
-                let port = addr as u16;
-                let data = unsafe { slice(scratch, len) };
-                if self
-                    .shared
-                    .inner
-                    .match_ioevent(&IoEventAddress::Pio(u64::from(port)), data)
-                {
+        use super::exit;
+        use super::ffi::reg64;
+        let (part, vp) = (self.part(), self.vp());
+        // SAFETY: plain 16-bit views of the exit context's bit fields.
+        let (state, cs) = unsafe { (vpctx.ExecutionState.AsUINT16, vpctx.Cs.Anonymous.Attributes) };
+        let long = exit::long_mode_code(state, cs);
+        let bytes = &io.InstructionBytes[..usize::from(io.InstructionByteCount).min(16)];
+        let addressing = exit::string_addressing(bytes, long, cs >> 14 & 1 == 1);
+        let wide = addressing.address_bytes;
+        let down = vpctx.Rflags >> 10 & 1 == 1;
+        let user = exit::cpl(state) == 3;
+        let port = io.PortNumber;
+        let count = exit::string_count(rep, io.Rcx, wide);
+        if count == 0 {
+            // REP with nothing left: the instruction does nothing.
+            regs::set_rip(part, vp, rip_after)?;
+            return Ok(None);
+        }
+
+        if write {
+            let base = self.string_segment_base(addressing.segment.unwrap_or(exit::Segment::Ds), long, io)?;
+            let at = exit::linear_address(base, exit::string_offset(io.Rsi, wide), long);
+            let mut element = [0u8; 4];
+            if let Some(fault) = self.read_guest_va(at, &mut element[..size], user)? {
+                self.page_fault(fault)?;
+                return Ok(None);
+            }
+            let names = [whv::WHvX64RegisterRsi, whv::WHvX64RegisterRip, whv::WHvX64RegisterRcx];
+            let values = [
+                reg64(exit::string_advance(io.Rsi, wide, size as u64, down)),
+                reg64(if count == 1 { rip_after } else { vpctx.Rip }),
+                reg64(exit::string_advance(io.Rcx, wide, 1, true)),
+            ];
+            let n = if rep { 3 } else { 2 };
+            super::ffi::set_registers(part, vp, &names[..n], &values[..n])?;
+            // SAFETY: at most 4 bytes into the 8-byte data area.
+            unsafe { std::ptr::copy_nonoverlapping(element.as_ptr(), scratch, size) };
+            {
+                let mut chip = self.shared.inner.irqchip.lock().unwrap();
+                if chip.pio_handles(port) {
+                    let data = unsafe { slice(scratch, size) };
+                    chip.pio_write(port, data, &self.shared.inner);
                     return Ok(None);
                 }
-                let data = unsafe { slice(scratch, len) };
-                Ok(Some(VcpuExit::IoOut(port, data)))
             }
-            emulate::Outcome::Read { addr, len, .. } => {
-                // One element at a time; complete on re-execution.
-                *self.shared.pending.lock().unwrap() = Some(Pending::Mmio);
-                let port = addr as u16;
-                let buf = unsafe { slice_mut(scratch, len) };
-                Ok(Some(VcpuExit::IoIn(port, buf)))
+            let data = unsafe { slice(scratch, size) };
+            if self.shared.inner.match_ioevent(&IoEventAddress::Pio(u64::from(port)), data) {
+                return Ok(None);
+            }
+            let data = unsafe { slice(scratch, size) };
+            return Ok(Some(VcpuExit::IoOut(port, data)));
+        }
+
+        let n = exit::ins_read_ahead(size, io.Rdi, count, down);
+        let ins = StringIn {
+            size,
+            n,
+            rep,
+            wide,
+            down,
+            long,
+            user,
+            // In 64-bit code ES's base is not used.
+            base: if long { 0 } else { io.Es.Base },
+            rip: vpctx.Rip,
+            rip_after,
+        };
+        // SAFETY: `n * size` is at most the buffer (`ins_read_ahead`); the
+        // buffer is the vCPU's, used by its run loop and, between two runs,
+        // by the holder of this exit.
+        let buf = unsafe { std::slice::from_raw_parts_mut(self.shared.string_data.get().cast::<u8>(), n * size) };
+        {
+            let mut chip = self.shared.inner.irqchip.lock().unwrap();
+            if chip.pio_handles(port) {
+                for element in buf.chunks_mut(size) {
+                    chip.pio_read(port, element);
+                }
+                drop(chip);
+                self.complete_string_in(&ins)?;
+                return Ok(None);
             }
         }
+        *self.shared.pending.lock().unwrap() = Some(Pending::StringIn(ins));
+        Ok(Some(VcpuExit::IoIn(port, buf)))
+    }
+
+    /// The elements an `INS` was given, written to `ES:RDI` one after the
+    /// other; `RDI` moves and `RCX` goes down by as many, and `RIP` passes
+    /// the instruction if none is left (KVM writes its read-ahead to the
+    /// guest before it asks the port again). An element whose page refuses
+    /// the write is the guest's page fault: those before it stay written
+    /// and counted, it and those after it are dropped with the fault.
+    fn complete_string_in(&self, ins: &StringIn) -> Result<()> {
+        use super::exit;
+        use super::ffi::{as_u64, reg64};
+        let (part, vp) = (self.part(), self.vp());
+        let names = [whv::WHvX64RegisterRdi, whv::WHvX64RegisterRcx, whv::WHvX64RegisterRip];
+        let mut values = [reg64(0); 2];
+        super::ffi::get_registers(part, vp, &names[..2], &mut values)?;
+        let (mut rdi, mut rcx) = (as_u64(&values[0]), as_u64(&values[1]));
+        // SAFETY: the vCPU's buffer, which Firecracker filled through the
+        // exit's slice and no longer holds (it called `run` again).
+        let data = unsafe { std::slice::from_raw_parts(self.shared.string_data.get().cast::<u8>(), ins.n * ins.size) };
+        let mut fault = None;
+        for element in data.chunks(ins.size) {
+            let at = exit::linear_address(ins.base, exit::string_offset(rdi, ins.wide), ins.long);
+            fault = self.write_guest_va(at, element, ins.user)?;
+            if fault.is_some() {
+                break;
+            }
+            rdi = exit::string_advance(rdi, ins.wide, ins.size as u64, ins.down);
+            if ins.rep {
+                rcx = exit::string_advance(rcx, ins.wide, 1, true);
+            }
+        }
+        let done = fault.is_none() && (!ins.rep || exit::string_offset(rcx, ins.wide) == 0);
+        let rip = if done { ins.rip_after } else { ins.rip };
+        super::ffi::set_registers(part, vp, &names, &[reg64(rdi), reg64(rcx), reg64(rip)])?;
+        match fault {
+            Some(fault) => self.page_fault(fault),
+            None => Ok(()),
+        }
+    }
+
+    /// The base of the segment an `OUTS` reads through. In 64-bit code only
+    /// FS and GS have one; otherwise DS's and ES's are the exit's, and
+    /// another segment's is read.
+    fn string_segment_base(
+        &self,
+        segment: super::exit::Segment,
+        long: bool,
+        io: &whv::WHV_X64_IO_PORT_ACCESS_CONTEXT,
+    ) -> Result<u64> {
+        use super::exit::Segment;
+        let name = match (segment, long) {
+            (Segment::Fs, _) => whv::WHvX64RegisterFs,
+            (Segment::Gs, _) => whv::WHvX64RegisterGs,
+            (_, true) => return Ok(0),
+            (Segment::Ds, false) => return Ok(io.Ds.Base),
+            (Segment::Es, false) => return Ok(io.Es.Base),
+            (Segment::Cs, false) => whv::WHvX64RegisterCs,
+            (Segment::Ss, false) => whv::WHvX64RegisterSs,
+        };
+        // SAFETY: a segment register's value.
+        Ok(unsafe { super::ffi::get_register(self.part(), self.vp(), name)?.Segment }.Base)
+    }
+
+    /// The guest physical address of the guest's linear address `gva` for
+    /// a read or a write at the guest's privilege level, as the processor's
+    /// own access would find it (the accessed and dirty bits set, SMAP
+    /// enforced); the page fault that access would take; or, for a page the
+    /// guest's tables put where there is no access for another reason
+    /// (`WHV_TRANSLATE_GVA_RESULT_CODE`: an address outside the guest's
+    /// physical memory, an intercept), `EFAULT` with a report: the run
+    /// fails rather than the access be made up.
+    fn gpa_of(&self, gva: u64, write: bool, user: bool) -> Result<std::result::Result<u64, GuestFault>> {
+        let right = if write { whv::WHvTranslateGvaFlagValidateWrite } else { whv::WHvTranslateGvaFlagValidateRead };
+        let flags = right | whv::WHvTranslateGvaFlagSetPageTableBits | whv::WHvTranslateGvaFlagEnforceSmap;
+        let (code, gpa) = self.translate_walk(gva, flags)?;
+        match code {
+            whv::WHvTranslateGvaResultSuccess => Ok(Ok(gpa)),
+            whv::WHvTranslateGvaResultPageNotPresent
+            | whv::WHvTranslateGvaResultPrivilegeViolation
+            | whv::WHvTranslateGvaResultInvalidPageTableFlags => Ok(Err(GuestFault {
+                address: gva,
+                code: super::exit::page_fault_code(
+                    code == whv::WHvTranslateGvaResultPrivilegeViolation,
+                    write,
+                    user,
+                    code == whv::WHvTranslateGvaResultInvalidPageTableFlags,
+                ),
+            })),
+            other => {
+                super::ffi::report(
+                    log::Level::Error,
+                    &format!("whp: a string instruction's memory at {gva:#x}: WHvTranslateGva result {other}, no access the backend can make"),
+                );
+                err(libc::EFAULT)
+            }
+        }
+    }
+
+    /// Reads the guest's memory at the linear address `gva`, page by page;
+    /// `Some` for the page fault the read takes (nothing is then used).
+    fn read_guest_va(&self, gva: u64, buf: &mut [u8], user: bool) -> Result<Option<GuestFault>> {
+        let mut done = 0;
+        while done < buf.len() {
+            let at = gva.wrapping_add(done as u64);
+            #[allow(clippy::cast_possible_truncation)]
+            let piece = ((4096 - at % 4096) as usize).min(buf.len() - done);
+            let gpa = match self.gpa_of(at, false, user)? {
+                Ok(gpa) => gpa,
+                Err(fault) => return Ok(Some(fault)),
+            };
+            if !self.shared.inner.read_guest(gpa, &mut buf[done..done + piece]) {
+                super::ffi::report(log::Level::Error, &format!("whp: a string instruction reads {gpa:#x}, which no memory slot backs"));
+                return err(libc::EFAULT);
+            }
+            done += piece;
+        }
+        Ok(None)
+    }
+
+    /// Writes the guest's memory at the linear address `gva`, page by page;
+    /// `Some` for the page fault the write takes.
+    fn write_guest_va(&self, gva: u64, data: &[u8], user: bool) -> Result<Option<GuestFault>> {
+        let mut done = 0;
+        while done < data.len() {
+            let at = gva.wrapping_add(done as u64);
+            #[allow(clippy::cast_possible_truncation)]
+            let piece = ((4096 - at % 4096) as usize).min(data.len() - done);
+            let gpa = match self.gpa_of(at, true, user)? {
+                Ok(gpa) => gpa,
+                Err(fault) => return Ok(Some(fault)),
+            };
+            if !self.shared.inner.write_guest(gpa, &data[done..done + piece]) {
+                super::ffi::report(
+                    log::Level::Error,
+                    &format!("whp: a string instruction writes {gpa:#x}, which no memory slot backs or a read-only one does"),
+                );
+                return err(libc::EFAULT);
+            }
+            done += piece;
+        }
+        Ok(None)
+    }
+
+    /// Leaves the guest a page fault to take at its next entry: the address
+    /// in CR2, the exception pending. `RIP` stays at the instruction.
+    fn page_fault(&self, fault: GuestFault) -> Result<()> {
+        super::ffi::set_registers(
+            self.part(),
+            self.vp(),
+            &[whv::WHvX64RegisterCr2, whv::WHvRegisterPendingInterruption],
+            &[super::ffi::reg64(fault.address), super::ffi::reg64(super::debug::pending_pf(fault.code))],
+        )
     }
 
     /// Answers a CPUID intercept from the installed table (or WHP's default).
@@ -2878,15 +3184,10 @@ mod fpu_tests {
                     0x0F, 0x01, if amd { 0xD9 } else { 0xC1 }, // vmmcall or vmcall
                 ],
             ),
-            // Last: run 43392627996 never got past it. The emulator reads
-            // the string's bytes from guest RAM through the memory callback,
-            // which takes every read for an MMIO read and stops the
-            // instruction, so the run loop hands Firecracker an IoIn of
-            // "port" 0x8300 (the string's address) and the instruction never
-            // completes. A defect of the backend's string I/O, on record in
-            // this step's line until it is fixed.
+            // Last: run 43392627996 never got past it (the backend's string
+            // output did not complete then; `string_io` now does it).
             (
-                "REP OUTSB of 2 bytes to port 0x82 (the emulator)",
+                "REP OUTSB of 2 bytes to port 0x82",
                 vec![
                     0xBE, 0x00, 0x83, 0x00, 0x00, // mov esi, 0x8300
                     0xB9, 0x02, 0x00, 0x00, 0x00, // mov ecx, 2
@@ -2957,6 +3258,189 @@ mod fpu_tests {
         // SAFETY: the test's mapping, no VM left using it.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
         assert!(wrong.is_empty(), "on a vCPU's thread: {wrong:#?}");
+    }
+
+    /// The exits of a guest until its `out 0x80`, as Firecracker sees
+    /// them, each with its bytes: an `IN` and an MMIO read are answered
+    /// from `feed`, in order (a read with nothing left is answered with
+    /// 0xEE). At most 40 exits, and a kick 5 s after the first run began.
+    fn exits_with_their_bytes(vcpu: &mut VcpuFd, feed: &mut std::collections::VecDeque<Vec<u8>>) -> Vec<String> {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
+        let watch = Arc::clone(&done);
+        let watchdog = std::thread::spawn(move || {
+            for _ in 0..500 {
+                if watch.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            kicker.set_kvm_immediate_exit(1);
+        });
+        let mut answer = |data: &mut [u8]| {
+            let given = feed.pop_front().unwrap_or_default();
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = given.get(i).copied().unwrap_or(0xEE);
+            }
+        };
+        let mut exits = Vec::new();
+        while exits.len() < 40 {
+            let (line, more) = match vcpu.run() {
+                Ok(VcpuExit::IoOut(PORT, _)) => ("the end".to_string(), false),
+                Ok(VcpuExit::IoOut(port, data)) => (format!("out {port:#x} {data:02x?}"), true),
+                Ok(VcpuExit::IoIn(port, data)) => {
+                    answer(data);
+                    (format!("in {port:#x} x{}", data.len()), true)
+                }
+                Ok(VcpuExit::MmioRead(address, data)) => {
+                    answer(data);
+                    (format!("read {address:#x} x{}", data.len()), true)
+                }
+                Ok(VcpuExit::MmioWrite(address, data)) => (format!("write {address:#x} {data:02x?}"), true),
+                Ok(VcpuExit::Shutdown) => ("Shutdown".to_string(), false),
+                Ok(_) => ("(another)".to_string(), false),
+                Err(e) if e.errno() == libc::EINTR => ("none within 5 s (kicked)".to_string(), false),
+                Err(e) => (format!("run failed, errno {}", e.errno()), false),
+            };
+            exits.push(line);
+            if !more {
+                break;
+            }
+        }
+        done.store(true, Ordering::SeqCst);
+        watchdog.join().unwrap();
+        vcpu.set_kvm_immediate_exit(0);
+        exits
+    }
+
+    // String port I/O and device memory with a second operand in RAM, as
+    // Firecracker's devices see them and as the guest's memory and
+    // registers are left. Asserted, each as KVM does it (Linux v6.1
+    // arch/x86/kvm/emulate.c):
+    // - REP OUTSB of "abc": three exits of one byte (em_out: a count of 1),
+    //   RSI past the string, RCX 0; OUTSW: one exit of two bytes.
+    // - REP INSB of 3: one exit that asks for 3 bytes (pio_in_emulated's
+    //   read-ahead), all three in the guest's memory after, RDI past them,
+    //   RCX 0; INSD: one exit of four bytes; REP INSB of 2 with the
+    //   direction flag set: one exit of 2, written downwards.
+    // - MOVSB from a device to RAM: one read of the device, the byte in
+    //   RAM; MOVSB from RAM to a device: one write to the device with the
+    //   byte from RAM, and no read asked of Firecracker for it.
+    // On record, not asserted (how many elements WHP's emulator does in one
+    // call is not documented): REP MOVSB of 2 from a device to RAM and
+    // from RAM to a device (STRTEST lines).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_string_io_and_device_memory_beside_ram() {
+        const PROGRAM: u64 = 0xB000;
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        // A page 6 MiB up that no memory slot backs: a device's.
+        put(m, 0x3018, &(0x60_0000u64 | 0x83).to_le_bytes());
+        put(m, 0x8300, b"abc");
+        put(m, 0x8310, b"12");
+        let store = |reg: u8, at: u32| {
+            // mov [at], reg (rsi 0x34, rcx 0x0c, rdi 0x3c)
+            let mut b = vec![0x48, 0x89, reg, 0x25];
+            b.extend_from_slice(&at.to_le_bytes());
+            b
+        };
+        let (rsi, rcx, rdi) = (0x34, 0x0C, 0x3C);
+        let program: Vec<u8> = [
+            // REP OUTSB of 3 from 0x8300 to port 0x82.
+            vec![0xBE, 0x00, 0x83, 0x00, 0x00, 0xB9, 0x03, 0x00, 0x00, 0x00, 0x66, 0xBA, 0x82, 0x00, 0xFC, 0xF3, 0x6E],
+            store(rsi, 0x8600),
+            store(rcx, 0x8608),
+            // OUTSW from 0x8310 to port 0x84.
+            vec![0xBE, 0x10, 0x83, 0x00, 0x00, 0x66, 0xBA, 0x84, 0x00, 0x66, 0x6F],
+            // REP INSB of 3 to 0x8400 from port 0x86.
+            vec![0xBF, 0x00, 0x84, 0x00, 0x00, 0xB9, 0x03, 0x00, 0x00, 0x00, 0x66, 0xBA, 0x86, 0x00, 0xF3, 0x6C],
+            store(rdi, 0x8610),
+            store(rcx, 0x8618),
+            // INSD to 0x8410 from port 0x88.
+            vec![0xBF, 0x10, 0x84, 0x00, 0x00, 0x66, 0xBA, 0x88, 0x00, 0x6D],
+            // STD; REP INSB of 2 to 0x8421 from port 0x8a; CLD.
+            vec![0xFD, 0xBF, 0x21, 0x84, 0x00, 0x00, 0xB9, 0x02, 0x00, 0x00, 0x00, 0x66, 0xBA, 0x8A, 0x00, 0xF3, 0x6C, 0xFC],
+            store(rdi, 0x8620),
+            // MOVSB from the device at 0x600000 to 0x8500.
+            vec![0xBE, 0x00, 0x00, 0x60, 0x00, 0xBF, 0x00, 0x85, 0x00, 0x00, 0xA4],
+            // MOVSB from 0x8300 to the device at 0x600004.
+            vec![0xBE, 0x00, 0x83, 0x00, 0x00, 0xBF, 0x04, 0x00, 0x60, 0x00, 0xA4],
+            vec![0xE6, PORT as u8],
+            // On record: REP MOVSB of 2 from the device to 0x8510, then from
+            // 0x8300 to the device at 0x600008.
+            vec![0xBE, 0x00, 0x00, 0x60, 0x00, 0xBF, 0x10, 0x85, 0x00, 0x00, 0xB9, 0x02, 0x00, 0x00, 0x00, 0xF3, 0xA4],
+            vec![0xE6, PORT as u8],
+            vec![0xBE, 0x00, 0x83, 0x00, 0x00, 0xBF, 0x08, 0x00, 0x60, 0x00, 0xB9, 0x02, 0x00, 0x00, 0x00, 0xF3, 0xA4],
+            vec![0xE6, PORT as u8, 0xF4, 0xEB, 0xFD],
+        ]
+        .concat();
+        put(m, PROGRAM, &program);
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+
+        let mut feed: std::collections::VecDeque<Vec<u8>> =
+            [vec![1, 2, 3], vec![0x44, 0x33, 0x22, 0x11], vec![9, 8], vec![0x5A]].into();
+        let exits = exits_with_their_bytes(&mut vcpu, &mut feed);
+        let word = |at: u64| u64::from_le_bytes(bytes_at::<8>(m, at));
+        let memory = format!(
+            "after REP OUTSB RSI {:#x} RCX {:#x}; after REP INSB RDI {:#x} RCX {:#x}, memory {:02x?}; INSD {:02x?}; \
+             REP INSB downwards {:02x?}, RDI {:#x}; MOVSB from the device {:02x?}",
+            word(0x8600),
+            word(0x8608),
+            word(0x8610),
+            word(0x8618),
+            bytes_at::<3>(m, 0x8400),
+            bytes_at::<4>(m, 0x8410),
+            bytes_at::<2>(m, 0x8420),
+            word(0x8620),
+            bytes_at::<1>(m, 0x8500)
+        );
+        eprintln!("STRTEST exits: {exits:?}");
+        eprintln!("STRTEST {memory}");
+        let wanted = [
+            "out 0x82 [61]",
+            "out 0x82 [62]",
+            "out 0x82 [63]",
+            "out 0x84 [31, 32]",
+            "in 0x86 x3",
+            "in 0x88 x4",
+            "in 0x8a x2",
+            "read 0x600000 x1",
+            "write 0x600004 [61]",
+            "the end",
+        ];
+
+        // On record: the two REP MOVSB with a device.
+        let mut feed: std::collections::VecDeque<Vec<u8>> = [vec![0xA1], vec![0xA2]].into();
+        let from_device = exits_with_their_bytes(&mut vcpu, &mut feed);
+        eprintln!(
+            "STRTEST REP MOVSB of 2 from a device to RAM (device reads answered a1, then a2): exits {from_device:?}; memory {:02x?}",
+            bytes_at::<2>(m, 0x8510)
+        );
+        let to_device = exits_with_their_bytes(&mut vcpu, &mut feed);
+        eprintln!("STRTEST REP MOVSB of 2 (\"ab\") from RAM to a device: exits {to_device:?}");
+
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        assert_eq!(exits, wanted);
+        assert_eq!(
+            memory,
+            "after REP OUTSB RSI 0x8303 RCX 0x0; after REP INSB RDI 0x8403 RCX 0x0, memory [01, 02, 03]; INSD [44, 33, 22, 11]; \
+             REP INSB downwards [08, 09], RDI 0x841f; MOVSB from the device [5a]"
+        );
     }
 
     /// A record of what each call of the backend commits of the stack of

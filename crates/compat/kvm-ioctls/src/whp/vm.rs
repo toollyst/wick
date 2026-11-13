@@ -196,6 +196,12 @@ impl VmInner {
         guest_mem::write(&mut self.memory.lock().unwrap(), gpa, data)
     }
 
+    /// Reads guest RAM at `gpa` into `buf` as KVM's `kvm_read_guest` does
+    /// ([`guest_mem::read`]): false at a page no slot maps.
+    pub(crate) fn read_guest(&self, gpa: u64, buf: &mut [u8]) -> bool {
+        guest_mem::read(&mut self.memory.lock().unwrap(), gpa, buf)
+    }
+
     /// If a guest access at `addr` of `data` matches an ioeventfd, signals it
     /// and returns true (the access is consumed, no exit to Firecracker).
     pub(crate) fn match_ioevent(&self, addr: &IoEventAddress, data: &[u8]) -> bool {

@@ -1,12 +1,26 @@
 // Copyright 2026 toollyst contributors.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! The WHP instruction emulator, used to complete the MMIO (and string/`rep`
-//! port I/O) accesses that leave the guest through `WHvRunVirtualProcessor`.
+//! The WHP instruction emulator, used to complete the MMIO accesses that
+//! leave the guest through `WHvRunVirtualProcessor`. (String port I/O is
+//! done by the run loop itself, as KVM's emulator does it: `VcpuFd::string_io`.)
 //!
-//! WHP reports a memory or I/O intercept but does not decode the faulting
-//! instruction. `WHvEmulatorTryMmioEmulation` / `WHvEmulatorTryIoEmulation`
-//! decode it and drive it through callbacks here. The device I/O itself lives
+//! WHP reports a memory intercept but does not decode the faulting
+//! instruction. `WHvEmulatorTryMmioEmulation` decodes it and drives it
+//! through callbacks here.
+//!
+//! The memory callback is called for every memory operand of the
+//! instruction, not only the one that left the guest (Microsoft Learn,
+//! "WHV_EMULATOR_MEMORY_ACCESS_INFO": the guest physical address, the
+//! direction, a size of 1 to 8 bytes and the data, read or to write). An
+//! address a memory slot backs is guest RAM and is read and written there
+//! (`movs` between a device and RAM, a `push` of a device register): only
+//! an address no slot backs, or a write to a read-only slot, is the
+//! device's, as KVM's emulator reads and writes RAM through
+//! `kvm_read_guest`/`kvm_write_guest` and exits only for the rest. Before,
+//! every operand was taken for the device's: RAM read through a string was
+//! asked of Firecracker as an MMIO read, and RAM written was handed to it
+//! as an MMIO write and never reached the guest's memory. The device I/O itself lives
 //! in Firecracker, reached only through `VcpuExit`, so the completion mirrors
 //! KVM's re-execution model:
 //! - a **write** is captured in the memory/I/O callback (which has the data),
@@ -29,7 +43,6 @@ use super::whv::{
     self as whv, WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO,
     WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME,
     WHV_REGISTER_VALUE, WHV_TRANSLATE_GVA_RESULT, WHV_VP_EXIT_CONTEXT,
-    WHV_X64_IO_PORT_ACCESS_CONTEXT,
 };
 
 use super::ffi;
@@ -62,6 +75,20 @@ struct EmuCtx {
     exit_mmio: bool,
     /// Whether a read's completion data is already in `data`.
     have_completion: bool,
+    /// The VM's memory slots: what is RAM.
+    ram: *const super::pvclock::Ram,
+    /// Device writes of this instruction after its first, in order (a
+    /// `rep movs` to a device, if the emulator does several elements in
+    /// one call): the run loop hands them to Firecracker one exit each.
+    more: *mut Vec<DeviceWrite>,
+}
+
+/// A write to a device captured after an instruction's first.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeviceWrite {
+    pub addr: u64,
+    pub len: usize,
+    pub data: [u8; 8],
 }
 
 /// An emulator handle, destroyed with the thread that made it.
@@ -106,6 +133,9 @@ fn emulator() -> Result<*mut core::ffi::c_void> {
 
 /// Emulates the MMIO instruction that caused `mem`. `scratch` is an 8-byte
 /// buffer holding, for a read completion, the data Firecracker supplied.
+/// `ram` is the VM's slot table; device writes after the instruction's
+/// first are added to `more`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mmio(
     part: WHV_PARTITION_HANDLE,
     vp: u32,
@@ -113,6 +143,8 @@ pub(crate) fn mmio(
     mem: &WHV_MEMORY_ACCESS_CONTEXT,
     scratch: *mut u8,
     have_completion: bool,
+    ram: &super::pvclock::Ram,
+    more: &mut Vec<DeviceWrite>,
 ) -> Result<Outcome> {
     let emu = emulator()?;
     let mut ctx = EmuCtx {
@@ -124,6 +156,8 @@ pub(crate) fn mmio(
         exit_addr: 0,
         exit_mmio: true,
         have_completion,
+        ram,
+        more,
     };
     let mut status: WHV_EMULATOR_STATUS = unsafe { std::mem::zeroed() };
     // SAFETY: valid emulator, context and exit structures.
@@ -133,40 +167,6 @@ pub(crate) fn mmio(
             (&raw mut ctx).cast(),
             vpctx,
             mem,
-            &mut status,
-        )
-    };
-    Ok(interpret(&ctx, hres))
-}
-
-/// Emulates the string/`rep` port-I/O instruction that caused `io`.
-pub(crate) fn io(
-    part: WHV_PARTITION_HANDLE,
-    vp: u32,
-    vpctx: &WHV_VP_EXIT_CONTEXT,
-    io: &WHV_X64_IO_PORT_ACCESS_CONTEXT,
-    scratch: *mut u8,
-    have_completion: bool,
-) -> Result<Outcome> {
-    let emu = emulator()?;
-    let mut ctx = EmuCtx {
-        part,
-        vp,
-        data: scratch,
-        exit_kind: -1,
-        exit_len: 0,
-        exit_addr: 0,
-        exit_mmio: false,
-        have_completion,
-    };
-    let mut status: WHV_EMULATOR_STATUS = unsafe { std::mem::zeroed() };
-    // SAFETY: valid emulator, context and exit structures.
-    let hres = unsafe {
-        whv::WHvEmulatorTryIoEmulation(
-            emu,
-            (&raw mut ctx).cast(),
-            vpctx,
-            io,
             &mut status,
         )
     };
@@ -201,16 +201,39 @@ unsafe extern "system" fn mem_cb(
     let ctx = unsafe { &mut *(context as *mut EmuCtx) };
     let a = unsafe { &mut *access };
     let size = (a.AccessSize as usize).min(8);
+    // SAFETY: the slot table the caller of `mmio` holds for the call.
+    let ram = unsafe { &*ctx.ram };
     if a.Direction == 1 {
+        // Guest RAM: written there (and marked dirty), nothing for a device.
+        if super::guest_mem::write(&mut ram.lock().unwrap(), a.GpaAddress, &a.Data[..size]) {
+            return S_OK;
+        }
+        if ctx.exit_kind == 1 {
+            // A further device write of the same instruction.
+            let mut data = [0u8; 8];
+            data[..size].copy_from_slice(&a.Data[..size]);
+            // SAFETY: the list the caller of `mmio` holds for the call.
+            unsafe { &mut *ctx.more }.push(DeviceWrite { addr: a.GpaAddress, len: size, data });
+            return S_OK;
+        }
         // Write: capture the bytes and let the emulator finish.
         unsafe { std::ptr::copy_nonoverlapping(a.Data.as_ptr(), ctx.data, size) };
         ctx.exit_kind = 1;
         ctx.exit_len = size as u32;
         ctx.exit_addr = a.GpaAddress;
         ctx.exit_mmio = true;
-        S_OK
-    } else if ctx.have_completion {
-        // Read completion: hand the supplied data to the emulator.
+        return S_OK;
+    }
+    // Guest RAM: read there.
+    let mut bytes = [0u8; 8];
+    if super::guest_mem::read(&mut ram.lock().unwrap(), a.GpaAddress, &mut bytes[..size]) {
+        a.Data[..size].copy_from_slice(&bytes[..size]);
+        return S_OK;
+    }
+    if ctx.have_completion {
+        // Read completion: hand the supplied data to the emulator, once (a
+        // second device read of the instruction is a new read to ask for).
+        ctx.have_completion = false;
         unsafe { std::ptr::copy_nonoverlapping(ctx.data, a.Data.as_mut_ptr(), size) };
         S_OK
     } else {
@@ -223,34 +246,14 @@ unsafe extern "system" fn mem_cb(
     }
 }
 
+/// The emulator is given a port callback, and is never asked to emulate
+/// port I/O (`VcpuFd::string_io` does the string instructions): an
+/// instruction that reaches it is refused.
 unsafe extern "system" fn io_cb(
-    context: *const core::ffi::c_void,
-    access: *mut WHV_EMULATOR_IO_ACCESS_INFO,
+    _context: *const core::ffi::c_void,
+    _access: *mut WHV_EMULATOR_IO_ACCESS_INFO,
 ) -> i32 {
-    // SAFETY: `context` is the `EmuCtx` passed to the Try*Emulation call.
-    let ctx = unsafe { &mut *(context as *mut EmuCtx) };
-    let a = unsafe { &mut *access };
-    let size = (a.AccessSize as usize).min(4);
-    if a.Direction == 1 {
-        let bytes = a.Data.to_le_bytes();
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ctx.data, size) };
-        ctx.exit_kind = 1;
-        ctx.exit_len = size as u32;
-        ctx.exit_addr = u64::from(a.Port);
-        ctx.exit_mmio = false;
-        S_OK
-    } else if ctx.have_completion {
-        let mut bytes = [0u8; 4];
-        unsafe { std::ptr::copy_nonoverlapping(ctx.data, bytes.as_mut_ptr(), size) };
-        a.Data = u32::from_le_bytes(bytes);
-        S_OK
-    } else {
-        ctx.exit_kind = 0;
-        ctx.exit_len = size as u32;
-        ctx.exit_addr = u64::from(a.Port);
-        ctx.exit_mmio = false;
-        E_FAIL
-    }
+    E_FAIL
 }
 
 unsafe extern "system" fn get_regs_cb(

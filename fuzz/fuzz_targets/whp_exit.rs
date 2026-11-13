@@ -17,8 +17,8 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use wick_fuzz::whp_exit::{
-    Hypercall, PortAccess, cpl, cpuid_ecx, hypercall, hypercall_rax, in_result, instruction_length, long_mode_code, memory_write, msr_access,
-    port_access,
+    Hypercall, PortAccess, cpl, cpuid_ecx, hypercall, hypercall_rax, in_result, ins_read_ahead, instruction_length, linear_address,
+    long_mode_code, memory_write, msr_access, port_access, string_addressing, string_advance, string_count, string_offset,
 };
 
 #[derive(Arbitrary, Debug)]
@@ -28,6 +28,7 @@ enum Exit {
     Msr { info: u32, rax: u64, rdx: u64 },
     Cpuid { function: u8, index: u8, ecx: u32, cr4: u64 },
     Hypercall { nr: u64, a0: u64, a1: u64, state: u16, cs: u16 },
+    String { bytes: Vec<u8>, long: bool, default_32: bool, reg: u64, rcx: u64, base: u64, size: u8, rep: bool, down: bool },
 }
 
 #[derive(Arbitrary, Debug)]
@@ -104,6 +105,39 @@ fn check(e: &Exit) {
             if let Hypercall::Error(rax) = want {
                 assert_eq!(hypercall_rax(rax, wide), low(rax));
             }
+        }
+        Exit::String { ref bytes, long, default_32, reg, rcx, base, size, rep, down } => {
+            // INS and OUTS (`VcpuFd::string_io`): the guest chooses the
+            // instruction's bytes and every register.
+            let size = [1usize, 2, 4][usize::from(size % 3)];
+            let wide = string_addressing(bytes, long, default_32).address_bytes;
+            assert!(matches!(wide, 2 | 4 | 8), "an address size of {wide} bytes");
+            assert!(wide == 8 || !long || bytes.contains(&0x67), "64-bit code without the prefix has 64-bit addresses");
+            let mask = match wide {
+                8 => u64::MAX,
+                4 => 0xffff_ffff,
+                _ => 0xffff,
+            };
+            assert_eq!(string_offset(reg, wide), reg & mask);
+            let count = string_count(rep, rcx, wide);
+            assert_eq!(count, if rep { rcx & mask } else { 1 });
+            // The register moves by the element within the address size; at
+            // 32 bits its upper half is cleared, at 16 the rest is kept.
+            let moved = string_advance(reg, wide, size as u64, down);
+            let want = if down { reg.wrapping_sub(size as u64) } else { reg.wrapping_add(size as u64) };
+            assert_eq!(moved & mask, want & mask);
+            match wide {
+                8 => {}
+                4 => assert_eq!(moved >> 32, 0),
+                _ => assert_eq!(moved >> 16, reg >> 16),
+            }
+            // What is asked of the port at once fits KVM's 1024 bytes, is
+            // at least one element and no more than is left.
+            let n = ins_read_ahead(size, reg, count, down);
+            assert!(n >= 1 && n * size <= 1024, "{n} elements of {size}");
+            assert!(n as u64 <= count.max(1));
+            let la = linear_address(base, string_offset(reg, wide), long);
+            assert!(long || la <= 0xffff_ffff);
         }
     }
 }

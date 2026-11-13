@@ -867,12 +867,19 @@ jobs:
           # vCPU started by INIT and SIPI on its own thread, interrupts
           # (running, and ending a HLT), the TSC-deadline timer, a KVM
           # hypercall, and last a REP OUTSB (which run 43392627996 did not
-          # get past: the backend's string output from guest RAM does not
-          # complete, on record in its line). Asserted for every step: no
+          # get past; the run loop does the string instructions itself
+          # since). Asserted for every step: no
           # WHP call of the vCPU's thread fails, and the thread's stack
           # stays within 40 KiB (16 to 24 measured without a refused call,
           # 52 with one, in that run).
           alone whp::vcpu::fpu_tests::test_the_stack_each_whp_call_commits_on_record
+          # String port I/O (REP OUTSB, OUTSW, REP INSB, INSD, with the
+          # direction flag too) and a device's memory with a second operand
+          # in RAM (MOVSB either way): the exits and bytes Firecracker's
+          # devices see are KVM's, and the guest's memory and registers
+          # after (asserted; STRTEST lines, with REP MOVSB to and from a
+          # device on record).
+          alone whp::vcpu::fpu_tests::test_string_io_and_device_memory_beside_ram
           # What each call of the backend commits of its thread's stack
           # (STACKTEST lines), each on a thread of its own: which one leaves
           # a vCPU's thread 48 to 52 KiB deep, as the boot record of run
