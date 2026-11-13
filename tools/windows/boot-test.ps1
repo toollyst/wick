@@ -1612,7 +1612,9 @@ function Invoke-Api($vm, [string]$method, [string]$path, $body = $null) {
     $json = if ($null -ne $body) { $body | ConvertTo-Json -Depth 8 -Compress } else { $null }
     $status = 0
     $out = [Wick.Api]::Call($vm.ApiSock, $method, $path, $json, 120000, [ref]$status)
-    Check ($status -ge 200 -and $status -lt 300) "$method $path -> $status $out"
+    # The body names which request it was (PUT /actions: the action).
+    $sent = if ($null -ne $json -and $json.Length -le 200) { " $json" } else { '' }
+    Check ($status -ge 200 -and $status -lt 300) "$method $path$sent -> $status $out"
     return $out
 }
 
@@ -2594,10 +2596,36 @@ function Stage-Cli {
         # answers 204 here, as on Linux (Invoke-Api fails on anything else),
         # and new readers of the two names get that metrics line and log
         # lines of these requests.
+        #
+        # Each request's time, with the readers and without: a PC's run
+        # took 789 s here and its FlushMetrics after the requests was
+        # refused (would block), as if each request without a reader took
+        # about 1.5 s and the periodic metrics (every 60 s) filled the
+        # metrics pipe's 64 KiB meanwhile. Printed, and in the failure.
+        $timed = {
+            param([int]$n)
+            $each = New-Object Collections.Generic.List[double]
+            for ($i = 0; $i -lt $n; $i++) {
+                $sw = [Diagnostics.Stopwatch]::StartNew()
+                Invoke-Api $vm 'GET' '/machine-config' | Out-Null
+                $each.Add($sw.Elapsed.TotalMilliseconds)
+            }
+            $sorted = @($each | Sort-Object)
+            '{0} GET /machine-config in {1:N1} s: median {2:N1} ms, max {3:N1} ms' -f $n, (($each | Measure-Object -Sum).Sum / 1000), $sorted[[int]($n / 2)], $sorted[-1]
+        }
+        $with = & $timed 50
         $mpipe.Close()
         $lpipe.Close()
-        for ($i = 0; $i -lt 500; $i++) { Invoke-Api $vm 'GET' '/machine-config' | Out-Null }
-        Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
+        $without = & $timed 500
+        $requests = "with the readers $with; without them $without"
+        Write-Step "requests' times: $requests"
+        try {
+            Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'FlushMetrics' }) | Out-Null
+        } catch {
+            $f = Get-Failure $_
+            if (-not $f) { throw }
+            Fail "$($f.Message) (after the pipes' readers went: $requests)"
+        }
         $mpipe = New-Object Wick.PipeReader("$tag-metrics", $true, 65536)
         $lpipe = New-Object Wick.PipeReader("$tag-log", $true, 65536)
         Check ($mpipe.WaitFor('utc_timestamp_ms', 10000)) "the metrics pipe's new reader did not get the line flushed while there was none: '$($mpipe.Text)'"
@@ -2606,7 +2634,7 @@ function Stage-Cli {
         $out = $vm.Sh('echo after-$((6*7))')
         Check ($out -eq 'after-42' -and -not $vm.Exited) "after the pipes' readers went away: '$out' ($($vm.ExitReason()))"
         $vm.Reboot()
-        $done += "start time metrics $start us, $cpu CPU us (of $wall us); logger and metrics on named pipes; once their readers went FlushMetrics answers 204, new readers get what was written meanwhile, and the microVM goes on"
+        $done += "start time metrics $start us, $cpu CPU us (of $wall us); logger and metrics on named pipes; once their readers went FlushMetrics answers 204, new readers get what was written meanwhile, and the microVM goes on ($requests)"
         Write-Step $done[-1]
     } finally {
         $mpipe.Close(); $lpipe.Close()
