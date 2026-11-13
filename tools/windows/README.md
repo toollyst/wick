@@ -141,6 +141,37 @@ vhost-user test backend), `winprobe.exe`, and in `tools/windows/`
 `job-freeze-probe.ps1`, `memory-partition-probe.exe`, `vmm-memory-record.py` and this file, at those
 paths. The kit needs no Rust.
 
+## What CI runs of the two scripts
+
+GitHub's Windows runner has WHP and boots Linux (first seen in CI run
+43377614564), so the `windows-guest` job of `ci` runs the scripts there on
+every push, from the kit the `windows` job uploaded, in Windows PowerShell
+5.1 as on a PC:
+
+- `boot-test.ps1`: every stage but `foreign-snapshot`; `hugepages`, `gdb`
+  and `linux-snapshot` in steps of their own. `linux-snapshot` is given the
+  snapshot the `linux-boot` job of the same run made (artifact
+  `linux-snapshot`). `hugepages` needs "Lock pages in memory" in a logon made after the
+  right was given: the job gives it to the runner's account and runs the
+  stage (and `jailer-test.ps1 hugepages`) in a scheduled task as that
+  account. `gdb` installs MSYS2's `gdb-multiarch` (one package, pinned by
+  file and checksum) and uses the kit's gdb build.
+- `jailer-test.ps1`: every stage; `pidns` in a console of its own (it types
+  into its console, and a step has none), `bindlink` in a step of its own.
+
+A failed stage fails the job, the stages after it still run, and the logs
+are the artifact `windows-guest-logs`. A stage's result on the runner is a
+result on Windows Server, elevated. What only a PC shows, and is run there:
+
+- the jailer started unelevated (the runner's token is elevated);
+- Windows 11, and Windows 10;
+- a serial console someone types at, on conhost and on Windows Terminal;
+- `boot-test.ps1 foreign-snapshot`: it needs a state file of another
+  architecture (the macOS boot test's), which no CI job makes.
+
+Whether a stage has passed on the runner is in docs/COMPATIBILITY.md with
+the run, once one has; until then its claims are the PC's.
+
 ## Running it on a Windows PC
 
 Needs Windows 10 (1803 or later) or 11 on x86_64, virtualization turned on in

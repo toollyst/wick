@@ -194,8 +194,8 @@ jobs:
       # job's foreign snapshot step (tools/macos/foreign-snapshot-test.py) is
       # given, a state made on another host OS; boot-test.ps1's
       # foreign-snapshot stage takes an aarch64 one as -ForeignState (an x86_64
-      # state decodes on Windows; that case is the linux-snapshot stage, with
-      # the whole snapshot kept below).
+      # state decodes on Windows; that case is the linux-snapshot stage, in
+      # the windows-guest job, with the whole snapshot kept below).
       - name: A snapshot's state file for the other hosts' tests
         run: python3 -I tools/linux/make-vmstate.py "lib/firecracker/build/cargo_target/$(uname -m)-unknown-linux-musl/release/firecracker" "$RUNNER_TEMP/boot-test" "$RUNNER_TEMP/vmstate" "$RUNNER_TEMP/vmsnapshot"
       # The whole snapshot, memory file too (128 MiB before the artifact's
@@ -988,3 +988,204 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/stdio-console.log"
           test "${PIPESTATUS[0]}" -eq 0
           grep -q "1 passed" "$RUNNER_TEMP/stdio-console.log"
+
+  # The Windows scenario tests with a guest, on the hosted runner: it has
+  # WHP and boots Linux (run 43377614564, the windows job's memory record).
+  # tools/windows/boot-test.ps1 and jailer-test.ps1 run as on a PC, from the
+  # kit the windows job uploaded (no second build), in Windows PowerShell
+  # 5.1, each script collecting its own stages' PASS and FAIL. Every step
+  # runs whatever failed before it, and a failed stage fails the job; each
+  # script's logs are uploaded. The runner is elevated, Windows Server, and
+  # has no interactive desktop: the jailer unelevated, Windows 11 and a
+  # serial console someone types at stay with the PC (tools/windows/README.md).
+  windows-guest:
+    # linux-boot makes the snapshot of the linux-snapshot stage; without it
+    # that stage alone fails, saying what it lacks.
+    needs: [windows, linux-boot]
+    if: ${{ !cancelled() && needs.windows.result == 'success' }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: powershell
+    env:
+      WBT: ${{ github.workspace }}\wbt
+      WJT: ${{ github.workspace }}\wjt
+    steps:
+      - name: The kit of this commit
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wick-windows-x86_64-${{ github.sha }}
+          path: .
+      - name: The snapshot made on Linux
+        id: snapshot
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-snapshot
+          path: ${{ runner.temp }}/linux-snapshot
+      # The machine on record: the image, the processor, whether this token
+      # is elevated and what it holds.
+      - name: Host
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Format-List Caption, Version, BuildNumber
+          Get-CimInstance Win32_Processor | Format-List Name, NumberOfCores, NumberOfLogicalProcessors
+          Get-CimInstance Win32_ComputerSystem | Format-List Model, TotalPhysicalMemory, HypervisorPresent
+          whoami /user /priv
+          Get-ChildItem -Recurse -File lib, tools, winprobe.exe | Select-Object Length, FullName | Format-Table -AutoSize
+      # Every stage of `all` but hugepages (its own step below) and
+      # foreign-snapshot (it wants a state of another architecture, which no
+      # job makes: the summary says so), and diff-nospace, which needs the
+      # elevation this runner has. A stage that fails does not stop the
+      # others; the script's exit status fails the step.
+      - name: boot-test.ps1
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT `
+            -Stage boot,smp,block,vsock,net,snapshot,diff,diff-nospace,uffd,pci,restores,vhost-user,api-process,devices,balloon,cli,tools,no-seccomp,memory-hotplug,cpu-templates
+          exit $LASTEXITCODE
+      # The snapshot the linux-boot job of this run made (KVM, this commit's
+      # build), loaded and resumed on WHP. A record: the stage's line says
+      # RESTORED or REFUSED with Firecracker's error, and it fails only on
+      # what is neither.
+      - name: boot-test.ps1 linux-snapshot
+        if: success() || failure()
+        run: |
+          Get-Content "$env:RUNNER_TEMP\linux-snapshot\linux-x86_64.txt" -ErrorAction SilentlyContinue
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage linux-snapshot `
+            -LinuxSnapshot "$env:RUNNER_TEMP\linux-snapshot"
+          exit $LASTEXITCODE
+      # The guest files are the boot test's (-Assets). pidns, bindlink and
+      # hugepages have steps of their own.
+      - name: jailer-test.ps1
+        if: success() || failure()
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir $env:WJT -Assets $env:WBT `
+            -Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,uffd,vhost-user
+          exit $LASTEXITCODE
+      # pidns types into its console and reads it, and a step has none: the
+      # script runs in a console of its own, as in a PowerShell window, and
+      # its output is the summary it writes.
+      - name: jailer-test.ps1 pidns, in a console of its own
+        if: success() || failure()
+        run: |
+          $p = Start-Process powershell -PassThru -Wait -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+            'tools\windows\jailer-test.ps1', '-WorkDir', "$env:WJT-pidns", '-Assets', $env:WBT, '-Stage', 'pidns')
+          Get-Content "$env:WJT-pidns\summary.txt" -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { Write-Host "::error::jailer-test.ps1 pidns: exit $($p.ExitCode)"; exit 1 }
+      # A record: the stage has passed its first check nowhere (the one PC,
+      # Windows 11 build 26300, has no bindlink.dll). What this image answers
+      # is in the stage's line.
+      - name: jailer-test.ps1 bindlink
+        if: success() || failure()
+        run: |
+          Get-Item "$env:SystemRoot\System32\bindlink.dll", "$env:SystemRoot\System32\bindfltapi.dll" -ErrorAction SilentlyContinue |
+            Format-Table Name, Length, @{ n = 'Version'; e = { $_.VersionInfo.FileVersion } }
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir "$env:WJT-bindlink" -Assets $env:WBT -Stage bindlink
+          exit $LASTEXITCODE
+      # Large pages need "Lock pages in memory" in the token, and a right
+      # given to an account reaches only a logon made after it. So: the right
+      # is given to this account (secedit), the account gets a password of
+      # this job's making, and the two hugepages stages run in a scheduled
+      # task as that account, which is a new logon. The task's own first
+      # lines say whether its token holds the privilege; if this cannot be
+      # set up, the step fails saying which part, and the stages stay the
+      # PC's.
+      - name: hugepages stages, in a logon that holds Lock pages in memory
+        if: success() || failure()
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $user = "$env:COMPUTERNAME\$env:USERNAME"
+          $dir = Join-Path $env:RUNNER_TEMP 'hugepages'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $cfg = Join-Path $dir 'rights.inf'
+          secedit /export /cfg $cfg /areas USER_RIGHTS | Out-Null
+          $lines = Get-Content $cfg
+          if ($lines -match '^SeLockMemoryPrivilege') {
+              $lines = $lines | ForEach-Object { if ($_ -match '^SeLockMemoryPrivilege' -and $_ -notmatch [regex]::Escape($sid)) { "$_,*$sid" } else { $_ } }
+          } else {
+              $lines = $lines | ForEach-Object { $_; if ($_ -eq '[Privilege Rights]') { "SeLockMemoryPrivilege = *$sid" } }
+          }
+          $lines | Set-Content -Encoding Unicode $cfg
+          secedit /configure /db (Join-Path $dir 'rights.sdb') /cfg $cfg /areas USER_RIGHTS | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::hugepages: secedit could not give $user Lock pages in memory (exit $LASTEXITCODE)"; exit 1 }
+          $bytes = New-Object byte[] 18
+          [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+          $password = 'Wk1!' + [Convert]::ToBase64String($bytes)
+          net user $env:USERNAME $password | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::hugepages: the account's password could not be set (exit $LASTEXITCODE)"; exit 1 }
+          $script = Join-Path $dir 'run.ps1'
+          $root = (Get-Location).Path
+          @"
+          Set-Location '$root'
+          whoami /priv > '$dir\priv.txt' 2>&1
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir '$env:WBT' -Stage hugepages > '$dir\boot-test.txt' 2>&1
+          "boot-test `$LASTEXITCODE" > '$dir\boot-test.exit'
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir '$env:WJT-hugepages' -Assets '$env:WBT' -Stage hugepages > '$dir\jailer-test.txt' 2>&1
+          "jailer-test `$LASTEXITCODE" > '$dir\jailer-test.exit'
+          'done' > '$dir\done'
+          "@ | Set-Content -Encoding UTF8 $script
+          schtasks /Create /F /TN wick-hugepages /SC ONCE /ST 00:00 /RL HIGHEST /RU $user /RP $password `
+            /TR "powershell -NoProfile -ExecutionPolicy Bypass -File `"$script`"" | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::hugepages: the task could not be made for $user (exit $LASTEXITCODE)"; exit 1 }
+          schtasks /Run /TN wick-hugepages | Out-Null
+          $deadline = [DateTime]::Now.AddMinutes(15)
+          while (-not (Test-Path "$dir\done") -and [DateTime]::Now -lt $deadline) { Start-Sleep -Seconds 2 }
+          schtasks /Query /TN wick-hugepages /V /FO LIST | Select-String 'Status|Last Result|Run As User'
+          schtasks /Delete /F /TN wick-hugepages | Out-Null
+          foreach ($f in 'priv.txt', 'boot-test.txt', 'jailer-test.txt', 'boot-test.exit', 'jailer-test.exit') {
+              Write-Host "== $f"; Get-Content "$dir\$f" -ErrorAction SilentlyContinue
+          }
+          if (-not (Test-Path "$dir\done")) { Write-Host '::error::hugepages: the task did not finish in 15 minutes (see its status above)'; exit 1 }
+          if (-not (Select-String -Quiet 'SeLockMemoryPrivilege' "$dir\priv.txt")) {
+              Write-Host "::error::hugepages: the task's token does not hold SeLockMemoryPrivilege: the stages ran without what they need"
+          }
+          $bad = @(Get-Content "$dir\boot-test.exit", "$dir\jailer-test.exit" | Where-Object { $_ -notmatch ' 0$' })
+          if ($bad) { Write-Host "::error::hugepages stages failed: $($bad -join ', ')"; exit 1 }
+      # A gdb that reads x86-64 Linux kernels: MSYS2's gdb-multiarch, the
+      # package pinned by its file and checksum, its dependencies from the
+      # image's MSYS2. The Firecracker is the kit's gdb build (the debug one).
+      - name: boot-test.ps1 gdb
+        if: success() || failure()
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = 'mingw-w64-ucrt-x86_64-gdb-multiarch-18.1-3-any.pkg.tar.zst'
+          $pkg = Join-Path $env:RUNNER_TEMP $name
+          Invoke-WebRequest -UseBasicParsing "https://repo.msys2.org/mingw/ucrt64/$name" -OutFile $pkg
+          $hash = (Get-FileHash -Algorithm SHA256 $pkg).Hash.ToLower()
+          if ($hash -ne '7012a9a85024bf721c8195b0724e7f88aac922d6ae38ce10793bab904f69fb22') { Write-Host "::error::gdb: $name has checksum $hash"; exit 1 }
+          if (-not (Test-Path C:\msys64\usr\bin\pacman.exe)) { Write-Host '::error::gdb: this image has no MSYS2 at C:\msys64 to install the package with'; exit 1 }
+          $env:PATH = "C:\msys64\usr\bin;$env:PATH"
+          pacman -U --noconfirm --needed ($pkg -replace '\\', '/')
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::gdb: pacman could not install $name (exit $LASTEXITCODE)"; exit 1 }
+          & C:\msys64\ucrt64\bin\gdb-multiarch.exe --version | Select-Object -First 1
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage gdb `
+            -Gdb C:\msys64\ucrt64\bin\gdb-multiarch.exe
+          exit $LASTEXITCODE
+      - name: What ran, and what stays with the PC
+        if: always()
+        run: |
+          $out = @('## Windows stages on the runner', '')
+          foreach ($f in Get-ChildItem -Path "$env:WJT*\summary.txt" -ErrorAction SilentlyContinue) { $out += '```'; $out += Get-Content $f; $out += '```' }
+          foreach ($f in Get-ChildItem -Path "$env:RUNNER_TEMP\hugepages\*.exit" -ErrorAction SilentlyContinue) { $out += "- hugepages: $(Get-Content $f)" }
+          $out += ''
+          $out += 'boot-test.ps1 prints its stages in its step and keeps them in the results archive of the artifact.'
+          $out += ''
+          $out += 'Not run here, the PC''s: the jailer unelevated (this token is elevated), Windows 11 (this is Windows Server),'
+          $out += 'a serial console someone types at, and boot-test.ps1 foreign-snapshot (it needs a state file of another'
+          $out += 'architecture, the macOS boot test''s; no job of this workflow makes one).'
+          $out | Add-Content -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
+      - name: Upload the stages' logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-guest-logs
+          path: |
+            wbt/results-*.zip
+            wjt*/summary.txt
+            wjt*/**/*.txt
+            wjt*/**/*.log
+            ${{ runner.temp }}/hugepages/*.txt
+            ${{ runner.temp }}/hugepages/*.exit
+          if-no-files-found: warn
+          retention-days: 14

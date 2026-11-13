@@ -48,7 +48,11 @@ On a Windows machine with the Windows Hypervisor Platform feature,
 `tools/windows/boot-test.ps1` boots upstream's x86_64 CI guest and runs the
 macOS boot test's stages (`tools/windows/README.md` has the steps), and
 `tools/windows/jailer-test.ps1` the jailer's; `tools/windows/winprobe.c`
-measures the host mechanisms the sandbox and jailer backends use.
+measures the host mechanisms the sandbox and jailer backends use. CI's
+`windows-guest` job runs both scripts on GitHub's runner, which has the
+feature, from the `windows` job's binaries; the jailer unelevated, Windows
+11 and a console someone types at are run on a PC
+(`tools/windows/README.md`, "What CI runs of the two scripts").
 
 Editors: `.vscode/settings.json` points rust-analyzer at
 `lib/firecracker/Cargo.toml`; other editors need the same.
@@ -220,7 +224,7 @@ the runner image (`macos-15`) is GitHub's and changes over time.
 | L1 | upstream unit tests + compatibility crate tests | CI (three OSes); on Linux x86_64 (KVM) and aarch64 against plain upstream |
 | L2 | upstream integration tests that work on nested KVM | Linux CI against plain upstream: a subset on every push, the functional and security suites weekly |
 | L2' | all of upstream's tests, including performance | a Linux machine, before a release |
-| L3 | API-driven scenarios: boot and serial, vsock, block, shutdown | Linux CI, a Mac, a Windows PC |
+| L3 | API-driven scenarios: boot and serial, vsock, block, shutdown | Linux CI, a Mac, Windows CI (`windows-guest`) and a Windows PC |
 
 - On Linux, wick must match plain upstream (`patches/base`, no patches)
   **test by test**, run the same way on the same machine.
