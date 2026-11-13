@@ -78,6 +78,8 @@ fn write_message(link: &mut impl Write, parts: &[&[u8]]) -> io::Result<()> {
     // whole between two messages.
     #[cfg(target_os = "macos")]
     let _whole = macos::LINK_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(target_os = "macos")]
+    let _turn = macos::LinkTurn::wait();
     let len: usize = parts.iter().map(|p| p.len()).sum();
     let len = u32::try_from(len).map_err(|_| io::Error::other("message too long"))?;
     let mut buf = Vec::with_capacity(4 + len as usize);
@@ -320,12 +322,18 @@ impl<S: Read + Write> ApiLink<S> {
             Ok(None) => {
                 // A denied call ended it, but its report did not come.
                 #[cfg(target_os = "macos")]
-                if macos::api_process_was_denied() {
-                    crate::logger::error_unrestricted!(
-                        "The API server process ended after its sandbox denied a system call."
-                    );
-                    crate::ext::sandbox::denied_elsewhere();
+                match macos::api_process_end() {
+                    macos::End::Denied => {
+                        crate::logger::error_unrestricted!(
+                            "The API server process ended after its sandbox denied a system call."
+                        );
+                        crate::ext::sandbox::denied_elsewhere();
+                    }
+                    // How it ended, as far as Firecracker can tell, for
+                    // whoever reads the panic.
+                    macos::End::Other(how) => panic!("The API server process ended ({how})"),
                 }
+                #[cfg(not(target_os = "macos"))]
                 panic!("The API server process ended")
             }
             // A Windows process that ends resets its connections rather
@@ -429,6 +437,7 @@ mod macos {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use micro_http::{HttpServer, ServerError};
     use vmm_sys_util::eventfd::EventFd;
@@ -440,44 +449,145 @@ mod macos {
     /// Held while a message is written to the link ([`super::write_message`]).
     pub(super) static LINK_WRITE: Mutex<()> = Mutex::new(());
 
-    /// The API process's end of the link, for [`report_denied`].
+    /// Set while bytes go to the link, a message's ([`LINK_WRITE`]'s holder)
+    /// or the report's: what the signal's handler, which takes no lock, may
+    /// try ([`report_denied_at_once`]).
+    static LINK_BUSY: AtomicBool = AtomicBool::new(false);
+
+    /// The link's turn, [`LINK_BUSY`] set until it is dropped.
+    pub(super) struct LinkTurn;
+
+    impl LinkTurn {
+        /// The turn if nothing is being written.
+        fn try_take() -> Option<Self> {
+            LINK_BUSY
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+                .then_some(Self)
+        }
+
+        /// The turn, once the report in a signal's handler on another thread
+        /// (five bytes) is written: nothing else holds it without
+        /// [`LINK_WRITE`].
+        pub(super) fn wait() -> Self {
+            loop {
+                if let Some(turn) = Self::try_take() {
+                    return turn;
+                }
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    impl Drop for LinkTurn {
+        fn drop(&mut self) {
+            LINK_BUSY.store(false, Ordering::Release);
+        }
+    }
+
+    /// The API process's end of the link, for its report.
     static LINK: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-    /// The API process's report that its sandbox denied a call (the
-    /// waiter's, in place of upstream's handler): a `D` message, written
-    /// whole between two others. The waiter then exits 148.
-    fn report_denied() {
-        let _whole = LINK_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    /// Set once the report is in the link.
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+
+    /// Writes the report, a `D` message, to the link. `wait`: for room in
+    /// the link, from the first byte; a report with a byte in the link is
+    /// finished either way. Async-signal-safe (`send`). MSG_NOSIGNAL:
+    /// Firecracker gone, the waiter exits 148 all the same (and a write's
+    /// SIGPIPE would have the compatibility libc ask the socket's options,
+    /// outside the API process's sandbox).
+    fn send_report(_turn: &LinkTurn, wait: bool) {
         let msg = [1u8, 0, 0, 0, b'D'];
-        let fd = LINK.load(std::sync::atomic::Ordering::Acquire);
+        let fd = LINK.load(Ordering::Acquire);
         let mut done = 0;
         while done < msg.len() {
-            // SAFETY: the rest of `msg` to the link. MSG_NOSIGNAL: Firecracker
-            // gone, the waiter exits 148 all the same (and a write's SIGPIPE
-            // would have the compatibility libc ask the socket's options,
-            // outside the API process's sandbox).
-            let n = unsafe {
-                libc::send(fd, msg[done..].as_ptr().cast(), msg.len() - done, libc::MSG_NOSIGNAL)
+            let flags = if wait || done > 0 {
+                libc::MSG_NOSIGNAL
+            } else {
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT
             };
+            // SAFETY: the rest of `msg` to the link.
+            let n = unsafe { libc::send(fd, msg[done..].as_ptr().cast(), msg.len() - done, flags) };
             if n > 0 {
                 done += n.unsigned_abs();
             } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                 return;
             }
         }
+        REPORTED.store(true, Ordering::Release);
+    }
+
+    /// The API process's report that its sandbox denied a call, from the
+    /// signal's handler (`sandbox::forward_sigsys`), before the thread the
+    /// signal came to runs on. The denied call has failed, and what its
+    /// thread does with that may end the process by another signal before
+    /// the waiter has run: an abort, or libdispatch's, whose semaphore wait
+    /// makes its Mach semaphore at the first wait and crashes if that fails
+    /// (libdispatch src/shims/lock.c `_dispatch_sema4_create_slow`,
+    /// `DISPATCH_SEMAPHORE_VERIFY_KR`). Firecracker would then read the end
+    /// of the link and an exit that is not 148, and panic, where the API
+    /// thread's trapped call ends it with the bad-syscall code on Linux. The
+    /// signal comes to the first thread that does not block it (xnu
+    /// bsd/kern/kern_sig.c `get_signalthread`), which in the API process is
+    /// the one that makes its calls: its report is in the link before it
+    /// runs another instruction. Not written here when a message is being
+    /// written (the report goes between two, and this takes no lock) or the
+    /// link has no room: the waiter writes it then ([`report_denied`]).
+    /// Async-signal-safe: atomics and `send`.
+    fn report_denied_at_once() {
+        if REPORTED.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(turn) = LinkTurn::try_take() {
+            send_report(&turn, false);
+        }
+    }
+
+    /// The waiter's report (in place of upstream's handler), if the signal's
+    /// handler could not write it: a `D` message, written whole between two
+    /// others. The waiter then exits 148.
+    fn report_denied() {
+        let _whole = LINK_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        let turn = LinkTurn::wait();
+        if !REPORTED.load(Ordering::Acquire) {
+            send_report(&turn, true);
+        }
     }
 
     /// A kqueue with the API process's exit (the fork's: its parent may ask
     /// for its exit status, xnu bsd/kern/kern_event.c `filt_procattach`),
-    /// -1 when the jail made it.
+    /// -1 when there is none.
     static CHILD_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+    /// The API process's wait status, when it had begun its exit before the
+    /// watch could be made ([`watch_child`]); -1 otherwise.
+    static CHILD_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    /// Why there is no watch and no status, for [`End::Other`]; 0 if there
+    /// is one of them, or `watch_child` was not called.
+    static CHILD_UNWATCHED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
     /// Watches the API process's exit, with its status: Firecracker forked
-    /// it ([`split`], or the jail).
+    /// it ([`split`], or the jail), and calls this before its sandbox.
+    ///
+    /// The watch cannot be made once the process has begun its exit: from
+    /// then on its pid finds no process (xnu bsd/kern/kern_exit.c
+    /// `proc_prepareexit` sets `P_REF_DEAD`, bsd/kern/kern_proc.c
+    /// `proc_find` takes no reference then, and `filt_procattach` fails with
+    /// `ESRCH`), and a watch made later would not tell of an exit made
+    /// before it (`filt_procattach`: "only captures edge-triggered events
+    /// after this point"). An API process whose sandbox denied a call at its
+    /// start can be that far before Firecracker, which has only forked it,
+    /// runs again. Its status is then asked for here, as its parent: it is
+    /// exiting, so the wait ends with the kernel's work.
     pub fn watch_child(pid: libc::pid_t) {
+        #[cfg(test)]
+        tests::hold_before_the_child_is_watched();
         // SAFETY: no arguments.
         let kq = unsafe { libc::kqueue() };
         if kq < 0 {
+            CHILD_UNWATCHED.store(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1), Ordering::Release);
             return;
         }
         let change = libc::kevent {
@@ -490,31 +600,96 @@ mod macos {
         };
         // SAFETY: one change, no output buffer.
         if unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) } == 0 {
-            CHILD_EXIT.store(kq, std::sync::atomic::Ordering::Release);
+            CHILD_EXIT.store(kq, Ordering::Release);
+            return;
+        }
+        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        // SAFETY: a descriptor made above, with nothing in it.
+        unsafe { libc::close(kq) };
+        if err == libc::ESRCH {
+            let mut status = 0;
+            loop {
+                // SAFETY: this process's child, which is exiting.
+                let got = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if got == pid {
+                    CHILD_STATUS.store(status, Ordering::Release);
+                    return;
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
+        }
+        CHILD_UNWATCHED.store(err, Ordering::Release);
+    }
+
+    /// How the API process ended, once its link has.
+    pub(super) enum End {
+        /// It exited 148, the code of a denied call (its waiter's, when its
+        /// report could not be written).
+        Denied,
+        /// Any other way, in words.
+        Other(String),
+    }
+
+    /// A wait status, as [`End`].
+    fn end_of(status: libc::c_int) -> End {
+        if libc::WIFEXITED(status) {
+            match libc::WEXITSTATUS(status) {
+                code if code == crate::FcExitCode::BadSyscall as i32 => End::Denied,
+                code => End::Other(format!("it exited with code {code}")),
+            }
+        } else if libc::WIFSIGNALED(status) {
+            End::Other(format!("signal {} ended it", libc::WTERMSIG(status)))
+        } else {
+            End::Other(format!("its wait status is {status:#x}"))
         }
     }
 
-    /// Whether the forked API process exited 148, the code of a denied call
-    /// (its waiter's, when its report could not be written), waiting for its
-    /// exit at most [`sandbox::SIGSYS_DEADLINE`] after the link's end.
-    pub(super) fn api_process_was_denied() -> bool {
-        let kq = CHILD_EXIT.load(std::sync::atomic::Ordering::Acquire);
-        if kq < 0 {
-            return false;
+    /// How the forked API process ended, waiting for its exit at most
+    /// [`sandbox::SIGSYS_DEADLINE`] after the link's end.
+    pub(super) fn api_process_end() -> End {
+        let status = CHILD_STATUS.load(Ordering::Acquire);
+        if status >= 0 {
+            return end_of(status);
         }
-        let d = sandbox::SIGSYS_DEADLINE;
-        let timeout = libc::timespec {
-            tv_sec: d.as_secs().try_into().unwrap(),
-            tv_nsec: d.subsec_nanos().into(),
-        };
-        // SAFETY: a zeroed event for the output.
-        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
-        // SAFETY: one output event, with the timeout.
-        let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &timeout) };
-        let status = i32::try_from(event.data).unwrap_or(0);
-        n == 1
-            && libc::WIFEXITED(status)
-            && libc::WEXITSTATUS(status) == crate::FcExitCode::BadSyscall as i32
+        let kq = CHILD_EXIT.load(Ordering::Acquire);
+        if kq < 0 {
+            return End::Other(match CHILD_UNWATCHED.load(Ordering::Acquire) {
+                0 => "its exit was not watched".to_owned(),
+                err => format!("its exit could not be watched: {}", std::io::Error::from_raw_os_error(err)),
+            });
+        }
+        let end = std::time::Instant::now() + sandbox::SIGSYS_DEADLINE;
+        loop {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            let timeout = libc::timespec {
+                tv_sec: left.as_secs().try_into().unwrap(),
+                tv_nsec: left.subsec_nanos().into(),
+            };
+            // SAFETY: a zeroed event for the output.
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            // SAFETY: one output event, with the timeout.
+            let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &timeout) };
+            match n {
+                1 => return end_of(i32::try_from(event.data).unwrap_or(-1)),
+                0 => {
+                    return End::Other(format!(
+                        "it had not exited {:?} after its link ended",
+                        sandbox::SIGSYS_DEADLINE
+                    ));
+                }
+                _ => {
+                    // A signal's handler ran in this thread: kevent is not
+                    // restarted (xnu bsd/kern/kern_event.c, "don't restart
+                    // after signals"), and the exit is still to come.
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EINTR) {
+                        return End::Other(format!("waiting for its exit failed: {err}"));
+                    }
+                }
+            }
+        }
     }
 
     /// The API process the jail made (`ext::jail::enter`), which waits for
@@ -827,7 +1002,7 @@ mod macos {
         log::set_max_level(log::LevelFilter::Off);
         // A call its sandbox denies ends Firecracker, told over the link.
         LINK.store(link.as_raw_fd(), std::sync::atomic::Ordering::Release);
-        sandbox::set_sigsys_report(report_denied);
+        sandbox::set_sigsys_report(report_denied_at_once, report_denied);
         sandbox::apply_api().map_err(|e| ApiProcessError::Message(e.to_string()))?;
         #[cfg(test)]
         tests::misbehave();
@@ -1023,8 +1198,8 @@ mod macos {
 
         /// What the API process of `api_violation_child` does once
         /// sandboxed (`WICK_TEST_API`): makes a call its sandbox denies
-        /// (`getppid`, outside API_SYSCALLS), exits 148 without telling
-        /// Firecracker, or is killed.
+        /// (`getppid`, outside API_SYSCALLS), and then also kills itself;
+        /// exits 148 without telling Firecracker; or is killed.
         pub(super) fn misbehave() {
             match std::env::var("WICK_TEST_API").as_deref() {
                 Ok("deny") => {
@@ -1035,8 +1210,16 @@ mod macos {
                         std::thread::park();
                     }
                 }
+                // The denied call's thread ends the process itself, as a
+                // thread does that aborts on the call's failure.
+                Ok("deny-then-kill") => {
+                    // SAFETY: no arguments; denied, which raises SIGSYS.
+                    unsafe { libc::getppid() };
+                    // SAFETY: ends this process.
+                    unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+                }
                 // SAFETY: ends this process.
-                Ok("exit148") => unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) },
+                Ok("exit148" | "exit148-early") => unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) },
                 // SAFETY: ends this process.
                 Ok("kill") => unsafe {
                     libc::kill(libc::getpid(), libc::SIGKILL);
@@ -1082,6 +1265,63 @@ mod macos {
             assert_eq!(out.status.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", text(&out));
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(stdout.contains("The API server process's sandbox denied a system call."), "{}", text(&out));
+            assert!(stdout.contains(FAULT_METRIC), "{}", text(&out));
+        }
+
+        // The thread whose call was denied runs on (the signal is the
+        // process's, and its handler returns), and may end the API process
+        // before the waiter has run: here it kills it at once. The report
+        // is in the link by then, written by the signal's handler, and
+        // Firecracker ends as for the denied call. (Left to the waiter, the
+        // report did not come and Firecracker panicked: 50 runs of 50; and
+        // once on a macOS 15 runner in the test above, whose thread parks:
+        // a first wait on its dispatch semaphore is a Mach call the sandbox
+        // denies, which libdispatch crashes on.)
+        #[test]
+        fn test_a_denied_call_is_reported_before_its_thread_runs_on() {
+            let out = api_violation("deny-then-kill");
+            assert_eq!(out.status.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", text(&out));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("The API server process's sandbox denied a system call."), "{}", text(&out));
+            assert!(stdout.contains(FAULT_METRIC), "{}", text(&out));
+        }
+
+        /// The descriptors `api_violation_child` leaves in the environment
+        /// for Firecracker's side to wait on before it watches its API
+        /// process: `<read end>,<write end>` of a pipe the API process
+        /// inherits.
+        const LATE_WATCH_ENV: &str = "WICK_TEST_API_LATE_WATCH";
+
+        /// Firecracker's side of `api_violation_child`, between the fork
+        /// and the watch of the API process: waits for the API process's
+        /// end (the end of the pipe it alone writes to), if the test asked.
+        pub(super) fn hold_before_the_child_is_watched() {
+            let Ok(fds) = std::env::var(LATE_WATCH_ENV) else {
+                return;
+            };
+            let (rd, wr) = fds.split_once(',').unwrap();
+            let (rd, wr): (libc::c_int, libc::c_int) = (rd.parse().unwrap(), wr.parse().unwrap());
+            let mut byte = 0u8;
+            // SAFETY: closes this process's write end, the API process's
+            // being the last then; one byte from the pipe, at its end.
+            unsafe {
+                libc::close(wr);
+                assert_eq!(libc::read(rd, (&raw mut byte).cast(), 1), 0);
+                libc::close(rd);
+            }
+        }
+
+        // The API process has exited 148 before Firecracker, which forked
+        // it, runs again and watches it (Firecracker is held there until
+        // the API process is gone): no watch can be made then (ESRCH), and
+        // Firecracker takes its status as its parent. (It took the missing
+        // watch for "not denied" and panicked.)
+        #[test]
+        fn test_an_api_process_that_exits_148_before_its_watch_ends_firecracker_as_its_own() {
+            let out = api_violation("exit148-early");
+            assert_eq!(out.status.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", text(&out));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("ended after its sandbox denied a system call"), "{}", text(&out));
             assert!(stdout.contains(FAULT_METRIC), "{}", text(&out));
         }
 
@@ -1438,6 +1678,15 @@ mod macos {
                 let out = unsafe { std::fs::File::from_raw_fd(libc::dup(1)) };
                 METRICS.init(std::io::LineWriter::new(crate::ext::fifo::plain(out))).unwrap();
                 sandbox::select(Policy::Default);
+                if std::env::var("WICK_TEST_API").as_deref() == Ok("exit148-early") {
+                    let mut fds = [-1; 2];
+                    // SAFETY: an array of two descriptors; the variable is
+                    // set in a process with one thread.
+                    unsafe {
+                        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+                        std::env::set_var(LATE_WATCH_ENV, format!("{},{}", fds[0], fds[1]));
+                    }
+                }
                 let dir = std::path::PathBuf::from(format!("/tmp/wick-apiv-{}", std::process::id()));
                 std::fs::create_dir_all(&dir).unwrap();
                 let path = dir.join("api.sock");

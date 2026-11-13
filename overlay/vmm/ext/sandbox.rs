@@ -1260,7 +1260,7 @@ mod macos {
     }
 
     /// The SIGSYS handler: async-signal-safe (atomics, `getpid`, `write`,
-    /// `_exit`), with errno kept.
+    /// `_exit`; the API process's report, `send`), with errno kept.
     extern "C" fn forward_sigsys(num: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
         // SAFETY: errno of this thread; the kernel's siginfo, if any.
         let saved = unsafe { *errno_location() };
@@ -1285,6 +1285,11 @@ mod macos {
         if from_kernel && pipe >= 0 && WAITER_PID.load(Ordering::Acquire) == me {
             SIGSYS_CODE.store(code, Ordering::Relaxed);
             SIGSYS_PID.store(pid, Ordering::Release);
+            if let at_once @ 1.. = SIGSYS_REPORT_AT_ONCE.load(Ordering::Acquire) {
+                // SAFETY: a fn() stored by set_sigsys_report.
+                let at_once: fn() = unsafe { std::mem::transmute(at_once) };
+                at_once();
+            }
             let byte = 1u8;
             #[cfg(test)]
             stamp(SigsysStage::Forwarded);
@@ -1477,10 +1482,18 @@ mod macos {
     /// ([`set_sigsys_report`]).
     static SIGSYS_REPORT: AtomicUsize = AtomicUsize::new(0);
 
+    /// What the signal's handler runs before it wakes the waiter, if set
+    /// ([`set_sigsys_report`]).
+    static SIGSYS_REPORT_AT_ONCE: AtomicUsize = AtomicUsize::new(0);
+
     /// Makes the waiter run `report`, then exit 148, in place of upstream's
     /// handler: the API process tells Firecracker of its denied call
     /// (`api_process`), as an API thread's ends Firecracker on Linux.
-    pub fn set_sigsys_report(report: fn()) {
+    /// `at_once` runs first, in the signal's handler, on the thread the
+    /// signal came to and before that thread runs on: it is
+    /// async-signal-safe and takes no lock.
+    pub fn set_sigsys_report(at_once: fn(), report: fn()) {
+        SIGSYS_REPORT_AT_ONCE.store(at_once as usize, Ordering::Release);
         SIGSYS_REPORT.store(report as usize, Ordering::Release);
     }
 
