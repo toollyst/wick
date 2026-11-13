@@ -384,6 +384,11 @@ impl VmInner {
 /// ioeventfd/irqchip callbacks, which are reached through the VcpuShared).
 impl VmFd {
     pub(crate) fn create() -> Result<VmFd> {
+        // What a vCPU's thread would otherwise do at its first use, here,
+        // before the VM's own partition is made: the probe of the registers
+        // a partition keeps, whose refused calls cost the calling thread
+        // 32 KiB of stack for good (`regs::probe_partition`).
+        super::regs::probe_partition();
         let part = ffi::create_partition()?;
         let inner = VmInner::setup(part).inspect_err(|_| {
             // SAFETY: cleans up the partition we just created on failure.

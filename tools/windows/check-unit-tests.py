@@ -12,7 +12,12 @@ and compares every test's result with tools/windows/unit-test-differences.txt.
 It fails on a failure the file does not list, on an entry whose test passes
 (an entry is a test that fails, so a fixed test leaves the list), and on an
 entry that names no test of the run. A whp-pc entry fails on CI's runner
-for its listed reason; with --whp (the WHP PC) it must pass.
+for its listed reason; with --whp (the WHP PC) it must pass. A test process
+that ended before its tests did (an abort, a fast fail, a stack overflow)
+is named with the test it ended in and its exit code: the tests after that
+one did not run, which is not the same as their not being there (run
+43392627996 reported seven listed tests as "no such test" when vmm's
+process had ended in test_vcpu_save_state_events).
 
 Each package's output is kept in DIR (default: a temporary directory) as
 <package>.log.
@@ -48,6 +53,50 @@ RUNS = [
 ]
 
 RESULT = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored)\b")
+# One test thread: a test's name is printed before it runs and its result
+# after, so a name with something else behind it is where the process ended.
+STARTED = re.compile(r"^test (.+?) \.\.\. (?!ok\b|FAILED\b|ignored\b)")
+DIED = re.compile(r"process didn't exit successfully: .*\((exit code: [^)]*|signal: [^)]*)\)")
+
+
+def died(output):
+    """(test, how) for each test process of `output` that ended before its
+    tests did: the test it was in ("" if none had begun) and cargo's words
+    for how it ended."""
+    found = []
+    unfinished = ""
+    for line in output.splitlines():
+        m = STARTED.match(line)
+        if m:
+            unfinished = m.group(1).removesuffix(" - should panic")
+        elif RESULT.match(line):
+            unfinished = ""
+        d = DIED.search(line)
+        # cargo says the same of a process whose tests failed (exit code
+        # 101): that one ended after its last test.
+        if d and "exit code: 101" not in d.group(1):
+            found.append((unfinished, d.group(1)))
+            unfinished = ""
+    return found
+
+
+def selftest():
+    """died() on a process that ended in a test, and on one whose tests failed."""
+    aborted = (
+        "test a::ok ... ok\n"
+        "test a::dies ... error: test failed, to rerun pass `-p vmm --lib`\n\n"
+        "Caused by:\n"
+        "  process didn't exit successfully: `D:\\x\\vmm-0b.exe` (exit code: 0xc0000409, STATUS_STACK_BUFFER_OVERRUN)\n"
+    )
+    assert died(aborted) == [("a::dies", "exit code: 0xc0000409, STATUS_STACK_BUFFER_OVERRUN")], died(aborted)
+    failed = (
+        "test a::ok ... ok\ntest a::bad ... FAILED\n\ntest result: FAILED. 1 passed; 1 failed\n"
+        "error: test failed, to rerun pass `-p vmm --lib`\n\nCaused by:\n"
+        "  process didn't exit successfully: `D:\\x\\vmm-0b.exe` (exit code: 101)\n"
+    )
+    assert died(failed) == [], died(failed)
+    assert died("test a::ok ... ok\n") == []
+    print("check-unit-tests: selftest ok")
 
 
 def read_list(path):
@@ -106,7 +155,7 @@ def run(package, args, out_dir):
     # libtest could not write its report (it says "listing" for any run):
     # results it did not print are lost, so the run cannot be compared.
     cut = "error: io error when listing tests" in output
-    return results, built, proc.returncode, cut
+    return results, built, proc.returncode, cut, died(output)
 
 
 def main():
@@ -114,7 +163,11 @@ def main():
     ap.add_argument("--whp", action="store_true", help="the WHP PC: whp-pc entries must pass")
     ap.add_argument("--out", type=pathlib.Path, help="where each package's output is kept")
     ap.add_argument("--summary", type=pathlib.Path, help="append a Markdown summary here")
+    ap.add_argument("--selftest", action="store_true", help="test this script's reading of a run, and stop")
     opts = ap.parse_args()
+    if opts.selftest:
+        selftest()
+        return 0
     entries = read_list(LIST)
     out_dir = opts.out or pathlib.Path(tempfile.mkdtemp(prefix="wick-unit-"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -122,12 +175,18 @@ def main():
     problems = []
     counts = []
     for package, args in RUNS:
-        results, built, code, cut = run(package, args, out_dir)
+        results, built, code, cut, ended = run(package, args, out_dir)
         if not built:
             problems.append(f"{package}: did not build (see {out_dir / (package + '.log')})")
             continue
         if cut:
             problems.append(f"{package}: libtest's output was cut short, results lost (see {out_dir / (package + '.log')})")
+        for test, how in ended:
+            where = f"in {test}" if test else "before a test began"
+            problems.append(
+                f"{package}: the test process ended {where} ({how}): the tests after it did not run "
+                f"(see {out_dir / (package + '.log')})"
+            )
         listed = {t: k for (k, p, t) in entries if p == package}
         n = {"ok": 0, "FAILED": 0, "ignored": 0}
         for test, result in sorted(results.items()):
@@ -140,7 +199,9 @@ def main():
             elif result == "ok" and kind is not None and not (kind == "whp-pc" and opts.whp):
                 problems.append(f"{package} {test}: listed as {kind}, and passes: remove its entry")
         for test, kind in sorted(listed.items()):
-            if test not in results:
+            # A process that ended early ran no test after the one it ended
+            # in: which listed tests are there is then unknown.
+            if test not in results and not ended:
                 problems.append(f"{package} {test}: listed as {kind}, and the run has no such test")
         if code != 0 and n["FAILED"] == 0:
             problems.append(f"{package}: cargo test exited {code} with no failed test (see its log)")

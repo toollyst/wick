@@ -1189,6 +1189,7 @@ const LISTED_WHERE_PRESENT: &[(u32, WHV_REGISTER_NAME)] = &[
     (0x1c4, whv::WHvX64RegisterXfd),            // IA32_XFD
     (0x1c5, whv::WHvX64RegisterXfdErr),         // IA32_XFD_ERR
     (0xda0, whv::WHvX64RegisterXss),            // IA32_XSS
+    (0xd90, whv::WHvX64RegisterBndcfgs),        // IA32_BNDCFGS
     (0xc000_0103, whv::WHvX64RegisterTscAux),   // IA32_TSC_AUX
 ];
 
@@ -1259,6 +1260,19 @@ pub(crate) fn partition_keeps(name: WHV_REGISTER_NAME) -> bool {
     partition_msrs().iter().any(|&(_, n)| n == name)
 }
 
+/// Finds out which registers a VM's partition keeps ([`partition_msrs`]),
+/// if this process has not yet: on the thread that makes a VM, never on a
+/// vCPU's. The probe asks WHP for registers a partition may lack, and the
+/// first call WHP refuses a thread commits 32 KiB of that thread's stack
+/// for the thread's life (WinHvPlatform.dll raises and catches a C++
+/// exception and looks a message up; CI run 43392627996, STACKCALL lines:
+/// `WHvGetVirtualProcessorRegisters(0x2096)`, 0xc0350005, the stack from
+/// 20 to 52 KiB). Left to its first use, the probe ran on whichever thread
+/// first asked, which a vCPU's can be (an MSR exit, CPUID leaf 0xd).
+pub(crate) fn probe_partition() {
+    let _ = partition_msrs();
+}
+
 /// FS_BASE (0xc000_0100) and GS_BASE (0xc000_0101) are the base of the FS/GS
 /// segment registers. Returns the WHP segment register name for those MSRs.
 fn msr_segment_base(index: u32) -> Option<WHV_REGISTER_NAME> {
@@ -1269,12 +1283,30 @@ fn msr_segment_base(index: u32) -> Option<WHV_REGISTER_NAME> {
     }
 }
 
+/// The machine-check MSRs: IA32_MCG_CAP, _STATUS and _CTL (0x179 to 0x17b)
+/// and the registers of 32 banks (0x400 to 0x47f). KVM keeps them for each
+/// vCPU (x86.c, `get_msr_mce` and `set_msr_mce`, 32 banks by default), and
+/// upstream saves 0x400 to 0x47f of every guest whose CPUID has MCE
+/// (cpu_config/x86_64/cpuid/common.rs, `msrs_to_save_by_cpuid`), which is
+/// every guest. No WHP register holds them, so `KVM_GET_MSRS` reads them
+/// as 0 and `KVM_SET_MSRS` drops them, as before the calls ended at an MSR
+/// kept nowhere: with these taken for such, the call ended at 0x400 and no
+/// vCPU's state could be saved (CI run 43392627996: vmm's
+/// `test_vcpu_save_state_events` got an error for the saved state, and its
+/// panic with the vCPU still running took the test process down). What a
+/// guest itself reads and writes of them is WHP's; a snapshot does not
+/// carry it.
+fn mce_msr(index: u32) -> bool {
+    matches!(index, 0x179..=0x17b | 0x400..=0x47f)
+}
+
 /// Whether `KVM_GET_MSRS` and `KVM_SET_MSRS` have `index` here: an MSR with
 /// a WHP register or a segment's base, one the vCPU keeps (kvm-clock's two,
 /// IA32_TSC_DEADLINE, [`KVM_SOFTWARE_MSRS`]), or one of KVM's that a
 /// partition has only on some hosts ([`LISTED_WHERE_PRESENT`], the MTRRs),
 /// which stays as it was where the partition lacks it: read as 0, a write
-/// dropped (Firecracker's boot writes IA32_MTRR_DEF_TYPE on every host).
+/// dropped (Firecracker's boot writes IA32_MTRR_DEF_TYPE on every host),
+/// as the machine-check MSRs do on every host ([`mce_msr`]).
 ///
 /// Any other MSR is one this backend keeps nowhere, so a value written to
 /// it would reach no guest: it ends the call, as an MSR KVM does not have
@@ -1284,6 +1316,7 @@ pub(crate) fn has_msr(index: u32) -> bool {
         || msr_segment_base(index).is_some()
         || LISTED_WHERE_PRESENT.iter().any(|&(i, _)| i == index)
         || mtrr_register(index).is_some()
+        || mce_msr(index)
         || matches!(
             index,
             super::pvclock::MSR_WALL_CLOCK | super::pvclock::MSR_SYSTEM_TIME | super::tscdeadline::MSR_TSC_DEADLINE
@@ -1424,6 +1457,22 @@ mod tests {
     // (T2S, T2CL), which KVM keeps per vCPU and no WHP register holds.
     // What Firecracker's boot and a restore write stays: the boot entries
     // (arch/x86_64/msr.rs, create_boot_msr_entries) and kvm-clock's.
+    // Every MSR upstream saves of a guest by its CPUID
+    // (cpu_config/x86_64/cpuid/common.rs, msrs_to_save_by_cpuid: IA32_BNDCFGS
+    // with MPX; the MTRRs, IA32_PAT and IA32_MTRR_DEF_TYPE with MTRR; 32
+    // machine-check banks with MCE) is one KVM_GET_MSRS has here: a call
+    // that ended at one of them would fail every snapshot.
+    #[test]
+    fn test_what_upstream_saves_by_cpuid_is_had() {
+        let mtrr = (0x200..0x210).chain([0x250, 0x258, 0x259]).chain(0x268..=0x26f).chain([0x277, 0x2ff]);
+        for saved in [0xd90].into_iter().chain(mtrr).chain(0x400..0x480) {
+            assert!(has_msr(saved), "{saved:#x}");
+        }
+        // KVM's other machine-check MSRs, and what is past the banks.
+        assert!(has_msr(0x179) && has_msr(0x17a) && has_msr(0x17b));
+        assert!(!has_msr(0x480) && !has_msr(0x3ff));
+    }
+
     #[test]
     fn test_msrs_kept_nowhere_end_the_call() {
         for kept_nowhere in [2, 3, 4, 0x10a, 0xce, 0x8b] {

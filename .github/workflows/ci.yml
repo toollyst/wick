@@ -638,6 +638,7 @@ jobs:
           python -m py_compile tools/windows/integration/*.py tools/windows/integration/netns_site/*.py
           python -m py_compile tools/windows/vmm-memory-record.py
           python -I tools/windows/vmm-memory-record.py --selftest
+          python -I tools/windows/check-unit-tests.py --selftest
       # aws-lc-sys assembles its x86_64 code with NASM in release builds
       # (built from source rather than with its prebuilt objects).
       - name: Install NASM
@@ -854,7 +855,12 @@ jobs:
           # and MMIO through the emulator, the local APIC's page, a second
           # vCPU started by INIT and SIPI on its own thread, interrupts
           # (running, and ending a HLT), the TSC-deadline timer, a KVM
-          # hypercall. Asserted: no WHP call fails while CPUID is answered.
+          # hypercall, and last a REP OUTSB (which run 43392627996 did not
+          # get past: the backend's string output from guest RAM does not
+          # complete, on record in its line). Asserted for every step: no
+          # WHP call of the vCPU's thread fails, and the thread's stack
+          # stays within 40 KiB (16 to 24 measured without a refused call,
+          # 52 with one, in that run).
           alone whp::vcpu::fpu_tests::test_the_stack_each_whp_call_commits_on_record
           # What each call of the backend commits of its thread's stack
           # (STACKTEST lines), each on a thread of its own: which one leaves

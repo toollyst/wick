@@ -2661,13 +2661,27 @@ mod fpu_tests {
         format!("exits {}", exits.join(", "))
     }
 
+    /// What a vCPU thread's stack may have committed after any step of
+    /// [`test_the_stack_each_whp_call_commits_on_record`], in bytes. Run
+    /// 43392627996 (this test build, Windows Server 2025): a step that made
+    /// no refused call left 16 to 24 KiB committed (the run loop's frames,
+    /// WHvRunVirtualProcessor's, the emulator's, the test's own lines),
+    /// and the one thread on which WHP refused a call 52 (the refusal alone
+    /// from 20 to 52). 40 KiB is 16 above the deepest of the first and 12
+    /// below the second: a thread past it has had a call refused, or a new
+    /// path as deep as that. A bound on this backend's own behaviour (no
+    /// call WHP refuses is made on a vCPU's thread), not the tests' budget.
+    const STACK_BOUND: usize = 40 << 10;
+
     /// [`run_a_step`] on a thread of its own, made as Firecracker makes a
     /// vCPU's (its name, 2 MiB of stack reserved), with the WHP calls the
     /// thread made (`ffi::trace`): one STACKTEST line of what the thread's
     /// stack had committed before and after the step, and one STACKCALL
     /// line for each call (past 40 calls, for those that left more of the
-    /// stack committed than they found, or failed). Returns the calls.
-    fn a_step_with_its_calls(vcpu: &mut VcpuFd, thread: &str, name: &str) -> Vec<super::super::ffi::trace::Call> {
+    /// stack committed than they found, or failed). Returns what is wrong
+    /// with the step: each WHP call that failed, and a stack committed
+    /// past [`STACK_BOUND`].
+    fn a_step_with_its_calls(vcpu: &mut VcpuFd, thread: &str, name: &str) -> Vec<String> {
         std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .name(thread.to_string())
@@ -2695,7 +2709,16 @@ mod fpu_tests {
                             eprintln!("STACKCALL {thread}, {name}: #{} {}", i + 1, c.line());
                         }
                     }
-                    calls
+                    let mut wrong: Vec<String> =
+                        calls.iter().filter(|c| c.hres != 0).map(|c| format!("{thread}, {name}: {}", c.line())).collect();
+                    if after > STACK_BOUND {
+                        wrong.push(format!(
+                            "{thread}, {name}: {} KiB of the stack committed, over {}",
+                            after / 1024,
+                            STACK_BOUND / 1024
+                        ));
+                    }
+                    wrong
                 })
                 .unwrap()
                 .join()
@@ -2723,8 +2746,11 @@ mod fpu_tests {
     /// emulator), the local APIC through its page, an application
     /// processor started with INIT and SIPI (on its own thread), an
     /// interrupt taken while running and one that ends a HLT, the
-    /// TSC-deadline timer, and a KVM hypercall. The CPUID step asserts that
-    /// no call failed: IA32_XSS is read only where the partition keeps it.
+    /// TSC-deadline timer, and a KVM hypercall. Asserted for every step:
+    /// no WHP call of the vCPU's thread fails (IA32_XSS is read only where
+    /// the partition keeps it, and which registers it keeps is found out
+    /// when the VM is made, not on this thread), and the thread's stack
+    /// stays within [`STACK_BOUND`].
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_the_stack_each_whp_call_commits_on_record() {
@@ -2801,15 +2827,6 @@ mod fpu_tests {
                 vec![0xE4, 0x21, 0xE4, 0x60], // in al, 0x21; in al, 0x60
             ),
             (
-                "REP OUTSB of 2 bytes to port 0x82 (the emulator)",
-                vec![
-                    0xBE, 0x00, 0x83, 0x00, 0x00, // mov esi, 0x8300
-                    0xB9, 0x02, 0x00, 0x00, 0x00, // mov ecx, 2
-                    0x66, 0xBA, 0x82, 0x00, // mov dx, 0x82
-                    0xF3, 0x6E, // rep outsb
-                ],
-            ),
-            (
                 "an MMIO write (the emulator)",
                 vec![0xC7, 0x04, 0x25, 0x00, 0x00, 0x60, 0x00, 0x78, 0x56, 0x34, 0x12], // mov dword [0x600000], 0x12345678
             ),
@@ -2861,6 +2878,22 @@ mod fpu_tests {
                     0x0F, 0x01, if amd { 0xD9 } else { 0xC1 }, // vmmcall or vmcall
                 ],
             ),
+            // Last: run 43392627996 never got past it. The emulator reads
+            // the string's bytes from guest RAM through the memory callback,
+            // which takes every read for an MMIO read and stops the
+            // instruction, so the run loop hands Firecracker an IoIn of
+            // "port" 0x8300 (the string's address) and the instruction never
+            // completes. A defect of the backend's string I/O, on record in
+            // this step's line until it is fixed.
+            (
+                "REP OUTSB of 2 bytes to port 0x82 (the emulator)",
+                vec![
+                    0xBE, 0x00, 0x83, 0x00, 0x00, // mov esi, 0x8300
+                    0xB9, 0x02, 0x00, 0x00, 0x00, // mov ecx, 2
+                    0x66, 0xBA, 0x82, 0x00, // mov dx, 0x82
+                    0xF3, 0x6E, // rep outsb
+                ],
+            ),
         ];
         let mut program = Vec::new();
         for (_, code) in &steps {
@@ -2898,9 +2931,9 @@ mod fpu_tests {
         vcpu.set_sregs(&s).unwrap();
         vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
 
-        let mut cpuid_failures = Vec::new();
-        for (i, (name, _)) in steps.iter().enumerate() {
-            let calls = if name.starts_with("INIT") {
+        let mut wrong = Vec::new();
+        for (name, _) in &steps {
+            let of_the_step = if name.starts_with("INIT") {
                 // The application processor's thread is in its run, waiting
                 // for its start, while the boot processor sends it.
                 std::thread::scope(|scope| {
@@ -2908,16 +2941,14 @@ mod fpu_tests {
                     let waiting = scope.spawn(move || {
                         a_step_with_its_calls(ap, "fc_vcpu 1", "the application processor's first run, started by the SIPI")
                     });
-                    let calls = a_step_with_its_calls(&mut vcpu, "fc_vcpu 0", name);
-                    waiting.join().unwrap();
-                    calls
+                    let mut both = a_step_with_its_calls(&mut vcpu, "fc_vcpu 0", name);
+                    both.extend(waiting.join().unwrap());
+                    both
                 })
             } else {
                 a_step_with_its_calls(&mut vcpu, "fc_vcpu 0", name)
             };
-            if i == 0 {
-                cpuid_failures = calls.iter().filter(|c| c.hres != 0).map(super::super::ffi::trace::Call::line).collect();
-            }
+            wrong.extend(of_the_step);
         }
 
         drop(ap);
@@ -2925,7 +2956,7 @@ mod fpu_tests {
         drop(vm);
         // SAFETY: the test's mapping, no VM left using it.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
-        assert!(cpuid_failures.is_empty(), "a WHP call failed while CPUID was answered: {cpuid_failures:?}");
+        assert!(wrong.is_empty(), "on a vCPU's thread: {wrong:#?}");
     }
 
     /// A record of what each call of the backend commits of the stack of
