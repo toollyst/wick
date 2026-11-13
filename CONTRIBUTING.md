@@ -314,6 +314,16 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   `freezer.state` and `devices.*` on mounted v1 hierarchies, v2
   `cgroup.freeze`), the reference the other hosts' jailers follow: it asserts
   each exit code and error text and prints them.
+- `tools/linux/guest-ram-grain.c` and `tools/linux/guest-ram-record.py` print
+  Linux's side of the lazy-RAM grain, in the Linux CI under THP `madvise`
+  and `always`. The first is KVM guest RAM mapped as upstream maps it, with
+  the guest steps of the Windows record (`test_lazy_guest_ram_by_grain_on_record`):
+  its Rss, AnonHugePages and cgroup charge after each step (LINUXGRAIN lines).
+  The second is upstream Firecracker booted with `huge_pages` None and
+  Transparent, its guest memory after the shell and after a guest's tmpfs
+  work (GUESTRAM lines), as `vmm-memory-record.py --boot` prints Windows'.
+  Records: they print, and fail only when KVM or the guest does not get
+  through.
 - Upstream tests left out on purpose: `test_licenses.py::test_for_valid_licenses`
   (wick's copyright headers), `tests/integration_tests/performance/`
   (baselines measured on AWS bare metal), and in CI the 5.10 and 6.18 guest
