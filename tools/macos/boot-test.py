@@ -9,6 +9,7 @@ with the reason, and the exit status is non-zero if any stage failed.
 """
 
 import argparse
+import base64
 import ctypes
 import hashlib
 import http.client
@@ -27,6 +28,7 @@ import threading
 import time
 import traceback
 import urllib.request
+import zlib
 
 ASSETS = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261105-6ea6634994fa-0/aarch64"
 KERNEL = "vmlinux-6.1.188"
@@ -490,6 +492,28 @@ def stage_boot(ctx):
             "warm reset (SYSTEM_RESET2) exits 0")
 
 
+GUEST_COUNTER_WARP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "guest-counter-warp.py")
+
+
+def counter_warp(vm, when):
+    """The two vCPUs' counters against each other in the guest
+    (tools/guest-counter-warp.py, sent and run as its header says: raw
+    deflate in base64, into W 2000 characters at a time). Fails the stage by
+    the tool's FAIL line; returns its pass line, less the prefix."""
+    with open(GUEST_COUNTER_WARP, "rb") as f:
+        c = zlib.compressobj(9, zlib.DEFLATED, -15)
+        b64 = base64.b64encode(c.compress(f.read()) + c.flush()).decode()
+    vm.sh(f"W={b64[:2000]}")
+    for i in range(2000, len(b64), 2000):
+        vm.sh(f"W=$W'{b64[i:i + 2000]}'")
+    rc, out = vm.sh("""python3 -c "import base64,zlib;exec(zlib.decompress(base64.b64decode('$W'),-15))" 0 1""",
+                    timeout=180, ok=False)
+    lines = [line for line in out.splitlines() if line.startswith("counter-warp: ")]
+    line = lines[-1] if lines else f"no counter-warp line (exit {rc}): {out!r}"
+    check(rc == 0 and line.startswith("counter-warp: pass: "), f"the vCPUs' counters {when}: {line}")
+    return line[len("counter-warp: pass: "):]
+
+
 def stage_smp(ctx):
     vm = ctx.vm("smp", [], config(ctx, vcpus=2))
     vm.shell()
@@ -500,12 +524,31 @@ def stage_smp(ctx):
         check(out == str(cpu + 100), f"taskset {cpu}: {out!r}")
     _, out = vm.sh("for c in 0 1; do taskset -c $c sh -c 'i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done' & done; wait; echo spun")
     check(out.endswith("spun"), f"parallel work: {out!r}")
+    booted = counter_warp(vm, "after the boot")
+    # A full snapshot, restored below in a new process, as the Linux and
+    # Windows smp stages do (KVM's reference: tools/linux/boot-test.sh);
+    # this microVM resumes and goes on.
+    state, mem = os.path.join(ctx.out, "smp.state"), os.path.join(ctx.out, "smp.mem")
+    vm.api("PATCH", "/vm", {"state": "Paused"})
+    vm.api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": state, "mem_file_path": mem})
+    vm.api("PATCH", "/vm", {"state": "Resumed"})
     cpu_offline_online(vm, "smp")
     vm.reboot()
     vm.pump.join(5)
     check("Received KVM_SYSTEM_EVENT: type: 2, event: [0]" in vm.buf,
           f"no reset event with flags 0 for SYSTEM_RESET ({vm.exit_reason()})")
-    return "2 vCPUs online, work runs on each; cpu1 offline and online 3 times (PSCI CPU_OFF, CPU_ON)"
+    vm = ctx.vm("smp-restored", [])
+    vm.api("PUT", "/snapshot/load", {"snapshot_path": state,
+                                     "mem_backend": {"backend_type": "File", "backend_path": mem},
+                                     "resume_vm": True})
+    _, out = vm.sh("echo $((6*7))")
+    check(out == "42", f"shell after the restore: {out!r}")
+    restored = counter_warp(vm, "after a restore in a new process")
+    vm.reboot()
+    for f in (state, mem):
+        os.unlink(f)
+    return ("2 vCPUs online, work runs on each; cpu1 offline and online 3 times (PSCI CPU_OFF, CPU_ON); "
+            f"counters agree after the boot ({booted}) and after a restore in a new process ({restored})")
 
 
 # A CPU taken offline and back online (PSCI CPU_OFF, then CPU_ON, which KVM
