@@ -941,14 +941,19 @@ jobs:
           done
           # The operator's tool for a parent cgroup against real jobs: a
           # write to a level that is there is read back from every job below
-          # it (TOOLTEST lines), with the test of how it reads its arguments.
+          # it (TOOLTEST lines), with the test of how it reads its arguments;
+          # and the same writes while a process runs in each jail's job, put
+          # in its jobs from the top level down (TOOLTEST live lines: what
+          # Windows answers each write of a job that has jobs nested under
+          # it, each job's cap, each process's processors and CPU time).
           out=$("$RUNNER_TEMP/jail-parent-test.exe" --include-ignored --nocapture --test-threads=1 2>&1) || true
           printf '%s\n' "$out"
           # Every test of the binary must pass (it holds the shared value
-          # tests too, so their number is not fixed here), and the test
-          # against real jobs must have printed its lines.
+          # tests too, so their number is not fixed here), and the tests
+          # against real jobs must have printed their lines.
           if ! grep -Eq "test result: ok\. [1-9][0-9]* passed; 0 failed" <<<"$out" \
-              || ! grep -q "^TOOLTEST " <<<"$out"; then
+              || ! grep -q "^TOOLTEST a level at 5000" <<<"$out" \
+              || ! grep -q "^TOOLTEST live: the processes ended" <<<"$out"; then
             echo "::error::jail-parent's tests did not pass"
             failed=1
           fi

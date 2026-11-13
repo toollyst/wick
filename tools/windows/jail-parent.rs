@@ -959,6 +959,196 @@ mod tests {
         assert_eq!(hard_cap(top_job).unwrap(), None);
     }
 
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AssignProcessToJobObject(job: HANDLE, process: HANDLE) -> i32;
+        fn GetProcessAffinityMask(process: HANDLE, process_mask: *mut usize, system_mask: *mut usize) -> i32;
+        fn GetProcessTimes(process: HANDLE, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+    }
+
+    /// The variable that makes this test program the process of a jail in
+    /// `test_a_write_to_a_level_reaches_the_processes_running_below`.
+    const SPIN: &str = "WICK_TEST_SPIN";
+
+    /// A jail's process for the test below: a thread for every processor of
+    /// the host, each in a loop, until its standard input ends. Nothing
+    /// without the variable.
+    #[test]
+    fn spins_for_another_process() {
+        if std::env::var_os(SPIN).is_none() {
+            return;
+        }
+        // SAFETY: a plain query.
+        for _ in 0..unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) } {
+            std::thread::spawn(|| loop {
+                std::hint::spin_loop();
+            });
+        }
+        println!("SPINNING");
+        let mut rest = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut rest);
+        std::process::exit(0);
+    }
+
+    /// A process that spins (`spins_for_another_process`), put in `jobs`
+    /// in their order, as the jailer puts a jail's process in its parent's
+    /// levels from the top down and then in the jail's own job
+    /// (`platform::parent`, `enter`). With what Windows answered each.
+    fn spinning_in(jobs: &[HANDLE]) -> (std::process::Child, Vec<Result<(), String>>) {
+        use std::os::windows::io::AsRawHandle;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::spins_for_another_process", "--nocapture"])
+            .env(SPIN, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let said = std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap()));
+        assert!(said.map_while(Result::ok).any(|line| line.contains("SPINNING")), "the process did not start");
+        let assigned = jobs
+            .iter()
+            // SAFETY: the test's job and the child's handle.
+            .map(|&job| if unsafe { AssignProcessToJobObject(job, child.as_raw_handle().cast()) } == 0 { Err(last()) } else { Ok(()) })
+            .collect();
+        (child, assigned)
+    }
+
+    /// The processors a process may run on, as Windows says (group 0's).
+    fn mask_of(child: &std::process::Child) -> Result<usize, String> {
+        use std::os::windows::io::AsRawHandle;
+        let (mut process, mut system) = (0usize, 0usize);
+        // SAFETY: the child's handle and two out values.
+        if unsafe { GetProcessAffinityMask(child.as_raw_handle().cast(), &mut process, &mut system) } == 0 {
+            return Err(last());
+        }
+        Ok(process)
+    }
+
+    /// The CPU time of each process over half a second, in the units of a
+    /// job's rate: 10000 is every processor of the host for all of it. A
+    /// measurement on a host that runs other things: printed, never
+    /// asserted.
+    fn measured(children: &[&std::process::Child]) -> Vec<u64> {
+        use std::os::windows::io::AsRawHandle;
+        let used = |child: &std::process::Child| {
+            let (mut creation, mut exit, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+            // SAFETY: the child's handle and four out values of a FILETIME's size.
+            unsafe { GetProcessTimes(child.as_raw_handle().cast(), &mut creation, &mut exit, &mut kernel, &mut user) };
+            kernel + user
+        };
+        let before: Vec<u64> = children.iter().map(|c| used(c)).collect();
+        let started = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // A FILETIME counts 100 ns.
+        let wall = started.elapsed().as_nanos() as u64 / 100;
+        // SAFETY: a plain query.
+        let cpus = u64::from(unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) });
+        children.iter().zip(before).map(|(c, before)| (used(c) - before) * 10_000 / (wall * cpus)).collect()
+    }
+
+    // The writes of the test above while processes run in the jobs: a
+    // level, a level under it, and two jails whose jobs each hold a
+    // process that spins on every processor, put in its jobs from the top
+    // down as the jailer puts a jail's. Windows forms its job hierarchy
+    // from processes (Microsoft Learn, "Nested Jobs"), so only now are the
+    // jobs nested for it, and only now can it refuse a rate or a set of
+    // processors for a job with jobs nested under it or a job nested under
+    // another. Each write is printed with what Windows answered, each
+    // job's cap read back, the processors each process has
+    // (`GetProcessAffinityMask`) and the CPU time each took over half a
+    // second (a measurement, not asserted). Asserted: every job's cap is
+    // Linux's rule for it, and a jail's process has the processors its job
+    // was given.
+    #[test]
+    #[ignore = "makes named jobs: run alone by CI's windows job, with --nocapture"]
+    fn test_a_write_to_a_level_reaches_the_processes_running_below() {
+        let top = format!("wjp-live-{}", std::process::id());
+        let inner = format!("{top}/in");
+        let write = |name: &str, cgroups: &[String]| run(name, 2, cgroups);
+        let top_job = *write(&top, &[quota(5000)]).unwrap().get(1).unwrap();
+        let inner_job = *write(&inner, &[quota(2500)]).unwrap().get(3).unwrap();
+        // SAFETY: a plain query.
+        let cpus = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+        let on = |mask: u64| (cpus >= 2).then(|| vec![(0u16, mask)]);
+        let vm1 = jail(&inner, "vm-1", Some(&Asked { version: 2, rate: Some(1250), cpus: on(0b10) }));
+        let vm2 = jail(&top, "vm-2", Some(&Asked { version: 1, rate: Some(4000), cpus: None }));
+        let (mut p1, in1) = spinning_in(&[top_job, inner_job, vm1]);
+        let (mut p2, in2) = spinning_in(&[top_job, vm2]);
+        let caps = || [hard_cap(top_job), hard_cap(inner_job), hard_cap(vm1), hard_cap(vm2)];
+        let active = |job| query::<ACCOUNTING>(job, BASIC_ACCOUNTING, "the job's processes").map(|a| a.ActiveProcesses);
+        println!(
+            "TOOLTEST live: a level at 5000, a level under it at 2500 of the host, {cpus} processors; a process put in the top, the \
+             level and its jail's job: {in1:?}; a process put in the top and its jail's job: {in2:?}; processes in each job: {:?}",
+            [active(top_job), active(inner_job), active(vm1), active(vm2)]
+        );
+        let state = |p1: &std::process::Child, p2: &std::process::Child| {
+            format!(
+                "caps of the top, the level, its jail, the top's jail {:?}; the two processes' processors {:x?}, CPU taken {:?} of 10000",
+                caps(),
+                [mask_of(p1), mask_of(p2)],
+                measured(&[p1, p2])
+            )
+        };
+        println!("TOOLTEST live: before any write with them running: {}", state(&p1, &p2));
+        let share = |asked, of| Some(rate_under_parent(2, asked, of).unwrap());
+        let failures = std::cell::RefCell::new(Vec::new());
+        let expect = |what: &str, wanted: [Option<u32>; 4]| {
+            let got = caps();
+            if got.iter().map(|c| c.as_ref().ok().copied()).collect::<Vec<_>>() != wanted.iter().map(|w| Some(*w)).collect::<Vec<_>>() {
+                failures.borrow_mut().push(format!("{what}: the caps are {got:?}, not {wanted:?}"));
+            }
+        };
+
+        // Lowered, raised: every job below is written again while it runs.
+        let lowered = write(&top, &[quota(4000)]).map(|_| ());
+        println!("TOOLTEST live: the top lowered to 4000: {lowered:?}; {}", state(&p1, &p2));
+        expect("lowered to 4000", [Some(4000), share(2500, 4000), share(1250, 2500), share(4000, 4000)]);
+        let raised = write(&top, &[quota(6000)]).map(|_| ());
+        println!("TOOLTEST live: the top raised to 6000: {raised:?}; {}", state(&p1, &p2));
+        expect("raised to 6000", [Some(6000), share(2500, 6000), share(1250, 2500), share(4000, 6000)]);
+
+        // cgroup v1: the jail that asked for 4000 cannot follow 3000.
+        let refused = write(&top, &[quota(3000)]).map(|_| ());
+        println!("TOOLTEST live: the top to 3000, under which a cgroup v1 jail asked for 4000: {refused:?}; {}", state(&p1, &p2));
+        expect("refused at 3000", [Some(6000), share(2500, 6000), share(1250, 2500), share(4000, 6000)]);
+        if !refused.as_ref().is_err_and(|why| why.contains(RATE_ABOVE_PARENT) && why.ends_with("nothing was written")) {
+            failures.borrow_mut().push(format!("the top to 3000 over a v1 jail that asked for 4000: {refused:?}"));
+        }
+
+        // Processors: the jail that asked for processor 1 has it, then the
+        // level's when the level leaves it none, then its own again.
+        if cpus >= 2 {
+            for (set, wanted) in [("0-1", 0b10usize), ("0", 0b01), ("0-1", 0b10)] {
+                let moved = write(&top, &[format!("cpuset.cpus={set}")]).map(|_| ());
+                let (job, process) = (processors(vm1), mask_of(&p1));
+                println!(
+                    "TOOLTEST live: the top on processors {set}: {moved:?}; the jail that asked for processor 1: its job {job:x?}, its \
+                     process {process:x?}; the top's other jail's process {:x?}; the top's job {:x?}",
+                    mask_of(&p2),
+                    processors(top_job)
+                );
+                if job != Ok(Some(vec![(0, wanted as u64)])) || process != Ok(wanted) {
+                    failures.borrow_mut().push(format!("the top on {set}: the jail's job has {job:x?} and its process {process:x?}, not {wanted:#x}"));
+                }
+            }
+        } else {
+            println!("TOOLTEST live: processors: one processor, not run");
+        }
+
+        // The cap taken off: each job has its own again.
+        let off = write(&top, &["cpu.max=max".to_string()]).map(|_| ());
+        println!("TOOLTEST live: the top's cap taken off: {off:?}; {}", state(&p1, &p2));
+        expect("the cap taken off", [None, Some(2500), share(1250, 2500), Some(4000)]);
+
+        // The processes end when their standard input does.
+        drop((p1.stdin.take(), p2.stdin.take()));
+        let ended = (p1.wait().map(|s| s.success()), p2.wait().map(|s| s.success()));
+        println!("TOOLTEST live: the processes ended: {ended:?}");
+        assert!(in1.iter().chain(&in2).all(Result::is_ok), "a process was not put in its jobs: {in1:?}, {in2:?}");
+        let failures = failures.into_inner();
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
     #[test]
     fn test_parse() {
         let of = |version, list: &[&str]| parse(version, &list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
