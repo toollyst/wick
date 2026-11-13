@@ -62,6 +62,10 @@ pub use macos::{
     denied_elsewhere, denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select,
     selected, set_sigsys_handler,
 };
+/// Applies `profile` to this process for good: for tests of other modules
+/// under a profile of their own (`ext::fifo`).
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use macos::install as install_for_test;
 
 /// Narrows the sandbox to what a running microVM needs, for good. Called
 /// where upstream installs the VMM thread's seccomp filter, after the microVM
@@ -1534,7 +1538,7 @@ mod macos {
 
     /// Installs `profile` for the whole process, permanently.
     #[cfg(test)]
-    fn install(profile: &str) -> Result<(), SandboxError> {
+    pub(crate) fn install(profile: &str) -> Result<(), SandboxError> {
         install_compiled(&Compiled::here(profile)?)
     }
 

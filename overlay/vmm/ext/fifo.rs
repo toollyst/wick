@@ -862,8 +862,20 @@ mod macos {
                     let mut act: libc::sigaction = std::mem::zeroed();
                     act.sa_sigaction = on_signal as *const () as usize;
                     // A handler that returns (the end deferred, or left to
-                    // an earlier signal's) disturbs no system call.
-                    act.sa_flags = libc::SA_RESTART;
+                    // an earlier signal's) disturbs no system call. The
+                    // kernel puts the default action back as it delivers
+                    // the signal (SA_RESETHAND: xnu bsd/kern/kern_sig.c
+                    // `postsig`, for every signal but SIGILL and SIGTRAP),
+                    // so the end sets no handler itself: a running
+                    // microVM's sandbox denies `sigaction`, and this is
+                    // installed only while Firecracker sets up (a FIFO is
+                    // opened by `--log-path`, `--metrics-path` or a
+                    // pre-boot request: upstream refuses `PUT /logger`,
+                    // `PUT /metrics` and the serial's after the boot,
+                    // rpc_interface.rs `handle_request`). A second signal of
+                    // the same number before the end ends Firecracker at
+                    // once, as on Linux the first does.
+                    act.sa_flags = libc::SA_RESTART | libc::SA_RESETHAND;
                     // The three block one another, and nothing else.
                     for other in SIGNALS {
                         libc::sigaddset(&mut act.sa_mask, other);
@@ -921,22 +933,19 @@ mod macos {
             }
         }
 
-        /// Drains, then ends the process by `sig` at its default action.
-        /// Async-signal-safe: the drain, `sigaction`, `pthread_sigmask`,
-        /// `pthread_kill`.
+        /// Drains, then ends the process by `sig` at its default action,
+        /// which the kernel put back as it delivered `sig` ([`install`]).
+        /// Async-signal-safe: the drain, `pthread_sigmask`, `raise`.
         fn finish(sig: libc::c_int) {
             if ENDING.compare_exchange(0, sig, Ordering::AcqRel, Ordering::Acquire).is_err() {
                 return;
             }
             super::drain();
-            // SAFETY: the default action for `sig`, unblocked on this
-            // thread (it is blocked inside its handler, and on the relay's
-            // thread always), then `sig` to this thread: the kernel ends
-            // the process by it before `raise` returns.
+            // SAFETY: `sig` unblocked on this thread (it is blocked inside
+            // its handler, and on the relay's thread always), then `sig` to
+            // this thread: the kernel ends the process by it before `raise`
+            // returns.
             unsafe {
-                let mut act: libc::sigaction = std::mem::zeroed();
-                act.sa_sigaction = libc::SIG_DFL;
-                libc::sigaction(sig, &act, std::ptr::null_mut());
                 let mut set: libc::sigset_t = std::mem::zeroed();
                 libc::sigemptyset(&mut set);
                 libc::sigaddset(&mut set, sig);
@@ -1753,11 +1762,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// From here on `sigaction` ends this process by the sandbox's kill, as
+    /// in a running microVM, whose profile denies it (`ext::sandbox`,
+    /// `SETUP_SYSCALLS`): an end that set a handler itself would end by
+    /// SIGKILL, not by its signal. The rest is allowed.
+    #[cfg(target_os = "macos")]
+    fn deny_sigaction() {
+        crate::ext::sandbox::install_for_test(
+            "(version 1)(allow default)\
+             (deny syscall-unix (syscall-number SYS_sigaction) (with send-signal SIGKILL))",
+        )
+        .unwrap();
+    }
+
     // SIGTERM, SIGINT and SIGQUIT, which upstream leaves at their default
     // action, end Firecracker by the signal, and a reader that holds the
     // FIFO reads everything written: on Linux it is all in the FIFO; on
     // macOS a handler moves the overflow into it first, then ends the
-    // process by the same signal (the wait status is the signal's).
+    // process by the same signal (the wait status is the signal's), with
+    // no `sigaction`, which a running microVM's sandbox denies.
     #[test]
     fn test_a_terminating_signal_leaves_the_reader_every_line() {
         use std::os::unix::process::ExitStatusExt;
@@ -1784,6 +1807,8 @@ pub(crate) mod tests {
         }
         #[cfg(target_os = "macos")]
         assert_eq!(out.pause_relay(), 30000 - fifo_buffer() / 100 * 100);
+        #[cfg(target_os = "macos")]
+        deny_sigaction();
         println!("WICK-WRITTEN");
         std::io::stdout().flush().unwrap();
         loop {
@@ -1814,6 +1839,7 @@ pub(crate) mod tests {
     fn child_is_signalled_inside_a_write() {
         default_ending_signals();
         let out = child_fills();
+        deny_sigaction();
         out.wait_reader();
         out.holding(|| {
             // SAFETY: SIGTERM to this thread, taken before raise returns.
