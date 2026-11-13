@@ -62,11 +62,17 @@ firecracker binary, vmm   (upstream source + patches/)
    │
    ├─ vmm::ext ──▶ wick-ext    wick features (extension point)
    │
-   └─ external crates ([patch.crates-io] in lib/firecracker/Cargo.toml)
+   └─ external crates ([patch.crates-io] in lib/firecracker/Cargo.toml; micro_http,
+      a git dependency upstream, by path in the crates that use it)
         libc, vmm-sys-util, memfd, userfaultfd, kvm-ioctls, kvm-bindings,
         vm-memory, event-manager, vhost, micro_http → crates/compat/<crate>
-            Linux : re-exports the original crate from the same git tag, unchanged
-            macOS : the same API on macOS facilities (kvm-ioctls → Hypervisor.framework)
+            Linux : re-exports the original crate from the same git tag (micro_http:
+                    a git revision), unchanged
+            macOS : libc and vmm-sys-util are the original plus the Linux-only items
+                    on macOS facilities; memfd, userfaultfd and kvm-ioctls are the same
+                    API on macOS facilities (kvm-ioctls → Hypervisor.framework);
+                    kvm-bindings, vm-memory, event-manager, vhost and micro_http are
+                    the original crate
             Windows: the same API on Win32 (kvm-ioctls → Windows Hypervisor Platform)
 ```
 
