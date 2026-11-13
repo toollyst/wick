@@ -694,23 +694,6 @@ namespace Wick {
         }
     }
 
-    // WHvGetCapability (WinHvPlatform.dll; Microsoft Learn, WHvGetCapability),
-    // for the host's line: the capabilities a guest's clock and timer rest on.
-    public static class Whp {
-        [DllImport("WinHvPlatform.dll")]
-        static extern int WHvGetCapability(int code, out ulong value, uint size, out uint written);
-        // The value, or null with `why` the HRESULT or the exception.
-        public static ulong? Capability(int code, out string why) {
-            why = null;
-            try {
-                ulong v; uint n;
-                int hr = WHvGetCapability(code, out v, 8, out n);
-                if (hr < 0) { why = string.Format("HRESULT 0x{0:x8}", hr); return null; }
-                return v;
-            } catch (Exception e) { why = e.GetType().Name + ": " + e.Message; return null; }
-        }
-    }
-
     public static class Util {
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         static extern uint GetCompressedFileSizeW(string path, out uint high);
@@ -1108,10 +1091,25 @@ namespace Wick {
         }
     }
 
-    // Whether this host can run a WHP partition, asked the way wick does.
+    // WHvGetCapability (WinHvPlatform.dll; Microsoft Learn, WHvGetCapability):
+    // whether this host can run a WHP partition, asked the way wick does, and
+    // for the host's line the capabilities a guest's clock and timer rest on.
+    // One class: a second `Whp` in this Add-Type block does not compile.
     public static class Whp {
         [DllImport("WinHvPlatform.dll")]
         static extern int WHvGetCapability(int code, out long value, int size, out int written);
+
+        // The value (its 8 bytes, unsigned), or null with `why` the HRESULT
+        // or the exception.
+        public static ulong? Capability(int code, out string why) {
+            why = null;
+            try {
+                long v; int n;
+                int hr = WHvGetCapability(code, out v, 8, out n);
+                if (hr < 0) { why = string.Format("HRESULT 0x{0:x8}", hr); return null; }
+                return unchecked((ulong)v);
+            } catch (Exception e) { why = e.GetType().Name + ": " + e.Message; return null; }
+        }
 
         // null when available, otherwise why not.
         public static string Unavailable() {
