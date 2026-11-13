@@ -37,8 +37,10 @@ starts Firecracker through the jailer and checks the jail from outside; run it
 before a change to the jailer's macOS backend or the Seatbelt profile. The macOS sandbox
 allows only the system calls in `SYSCALLS` (overlay/vmm/ext/sandbox.rs), as
 upstream's seccomp filters do on Linux: a change that makes Firecracker call
-another one exits with code 148 under boot-test until the call is added there,
-with the reason in the commit. Windows builds cross-compile from macOS or
+another one is killed by the sandbox inside that call under boot-test (SIGKILL;
+the kernel's "Sandbox: firecracker(pid) deny(1) syscall-unix N" log line names
+it; a call denied in the API process ends Firecracker with exit 148) until the
+call is added there, with the reason in the commit. Windows builds cross-compile from macOS or
 Linux with mingw-w64:
 `AWS_LC_SYS_NO_ASM=1 cargo build -p firecracker --target x86_64-pc-windows-gnu`.
 Natively on Windows (MSVC), `cargo build -p firecracker` runs in a Visual
