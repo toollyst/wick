@@ -772,16 +772,24 @@ jobs:
             --features backend-mmap,backend-bitmap,backend-atomic
           cargo test --locked --manifest-path ../../crates/compat/vhost/Cargo.toml \
             --features vhost-user-frontend,vhost-user-backend
+      # Every step from here to the kit's upload runs whatever failed before
+      # it (success() || failure()), as the steps after the upload do: a
+      # failed crate test keeps the job red and no longer skips the build,
+      # the kit and so windows-guest, which needs the kit. Runs 43521200989
+      # and 43524342863 (one failed crate test each) built no kit and booted
+      # no guest.
       # The boot test's own helpers (serial-console protocol, vsock, network
       # switch) against stand-ins, in Windows PowerShell 5.1 as users run it.
       # Its boot stages run on the WHP PC, with its guest image.
       - name: Boot test harness self-test
+        if: success() || failure()
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -SelfTest
       # Upstream's integration tests need WHP (tools/windows/integration-tests.ps1
       # runs them on Windows hardware); their harness's AF_UNIX sockets,
       # network host side and host tools run here.
       - name: Integration test harness (without a VM)
+        if: success() || failure()
         run: |
           # upstream's pin (tools/devctr/poetry.lock)
           python -m pip install --quiet psutil==6.1.1
@@ -793,28 +801,34 @@ jobs:
       # aws-lc-sys assembles its x86_64 code with NASM in release builds
       # (built from source rather than with its prebuilt objects).
       - name: Install NASM
+        if: success() || failure()
         shell: pwsh
         run: |
           choco install nasm -y --no-progress
           "$env:ProgramFiles\NASM" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Build firecracker (WHP backend)
+        if: success() || failure()
         working-directory: lib/firecracker
         run: cargo build --locked -p firecracker --release
       - name: Smoke-test the binary
+        if: success() || failure()
         working-directory: lib/firecracker
         run: build/cargo_target/release/firecracker.exe --version
       # The Linux and macOS jobs' check, through the harness's AF_UNIX
       # sockets: Windows has no /dev/nitro_enclaves either, and the start is
       # refused with Windows' error for the missing path (os error 3).
       - name: Nitro Enclave refused without the device
+        if: success() || failure()
         run: python -I tools/windows/enclave-refusal-test.py lib/firecracker/build/cargo_target/release/firecracker.exe
       # The boot test's diff stage merges snapshots with it.
       - name: Build snapshot-editor
+        if: success() || failure()
         working-directory: lib/firecracker
         run: cargo build --locked -p snapshot-editor --release
       # Upstream's other tools, which its integration tests run
       # (tools/windows/integration-tests.ps1).
       - name: Build rebase-snap, cpu-template-helper, seccompiler
+        if: success() || failure()
         working-directory: lib/firecracker
         run: cargo build --locked -p rebase-snap -p cpu-template-helper -p seccompiler --release
       # The two rebase tools' tests. The five skipped write their diff file
@@ -823,6 +837,7 @@ jobs:
       # than copy its zeros over the base (patches/0036), so these fail
       # with that refusal.
       - name: rebase-snap and snapshot-editor tests
+        if: success() || failure()
         working-directory: lib/firecracker
         run: |
           cargo test --locked -p rebase-snap -p snapshot-editor -- --exact \
@@ -834,12 +849,14 @@ jobs:
       # Upstream's jailer with the Windows backend (overlay/jailer/platform):
       # its tests (tokens, job limits) and the binary.
       - name: Jailer tests and build
+        if: success() || failure()
         working-directory: lib/firecracker
         run: |
           cargo test --locked -p jailer
           cargo build --locked -p jailer --release
       # The boot test's uffd stage serves a snapshot's pages with it.
       - name: Build the uffd page fault handler example
+        if: success() || failure()
         working-directory: lib/firecracker
         run: cargo build --locked -p firecracker --example uffd_on_demand_handler --release
       # The boot test's vhost-user stage serves a drive with it. The target
@@ -847,6 +864,7 @@ jobs:
       # the linker as ..\..\, which on a PC took link.exe past 260
       # characters (LNK1104).
       - name: Build the vhost-user-blk test backend
+        if: success() || failure()
         working-directory: tools/vhost-user-blk
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/lib/firecracker/build/vhost-user-blk
@@ -854,6 +872,7 @@ jobs:
       # The host capability probe (tools/windows/winprobe.c), built with the
       # same MSVC toolchain the binary uses.
       - name: Build winprobe
+        if: success() || failure()
         shell: pwsh
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
@@ -863,6 +882,7 @@ jobs:
       # runs on a PC without Rust (tools/windows/jailer-test.ps1 uses the
       # built jail-probe.exe next to it).
       - name: Build the probes
+        if: success() || failure()
         run: |
           rustc --edition 2021 -O -o tools/windows/jail-probe.exe tools/windows/jail-probe.rs
           # The operator's tool for a parent cgroup, and its own tests (how
@@ -881,6 +901,7 @@ jobs:
       # the upload, so it replaces only the copy on the runner. The check
       # fails the job if the uploaded binary is not the gdb build.
       - name: Build firecracker with the gdb feature
+        if: success() || failure()
         working-directory: lib/firecracker
         run: |
           cargo build --locked -p firecracker --features gdb
@@ -889,6 +910,7 @@ jobs:
       # For validation on Windows hardware with WHP (tools/windows/boot-test.ps1,
       # jailer-test.ps1): everything the stages need, at the paths they look in.
       - name: Upload Windows binaries
+        if: success() || failure()
         id: kit
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
