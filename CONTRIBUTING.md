@@ -257,10 +257,13 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   its measured cause, and with `--whp`, on the PC, it must pass (none is
   listed at present: each failure there has a cause of another kind). The
   job's first step, "Host", prints the runner's processor, Windows build
-  and whether WHP is there; its last step, "WHP tests on the runner",
-  prints WHP's capabilities and runs kvm-ioctls' tests that need WHP
-  (`#[ignore]`d in `cargo test`), and libc's record of an AF_UNIX bind of
-  each path form, each alone in a process of its own; on a WHP machine run one as
+  and whether WHP is there; its step "WHP tests on the runner", after the
+  kit's upload, prints WHP's capabilities and runs kvm-ioctls' tests that
+  need WHP (`#[ignore]`d in `cargo test`), libc's records of an AF_UNIX bind
+  of each path form and of what a non-blocking pipe takes of a write, and
+  the vmm's record of the network endpoint's descriptor check, each alone in
+  a process of its own; its last step, "Standard input on a console", runs
+  wick-os's console test on a hidden console of its own. On a WHP machine run one as
   `cargo test --manifest-path crates/compat/kvm-ioctls/Cargo.toml
   [--features gdb] -- --include-ignored --exact --nocapture <test>`.
 - On macOS, `tools/macos/integration-tests.sh` runs upstream's pytest suites

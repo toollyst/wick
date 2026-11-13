@@ -730,9 +730,9 @@ jobs:
       # lines), and the vmm's record of what the network
       # endpoint's descriptor check costs a frame (the TAPCHECK line: the
       # unit tests' step built that test binary). Records only print; a
-      # crash in one fails this step, never the kit. Last, after the kit's
-      # upload, so a WHP result never costs the PC its kit; it runs whatever
-      # the steps before gave.
+      # crash in one fails this step, never the kit. After the kit's upload,
+      # so a WHP result never costs the PC its kit; it runs whatever the
+      # steps before gave.
       - name: WHP tests on the runner
         if: success() || failure()
         working-directory: lib/firecracker
