@@ -7516,16 +7516,21 @@ mod fpu_tests {
     /// equivalent of KVM's injection of an MSI irqfd in the signaller's
     /// context (Linux v6.1 virt/kvm/eventfd.c:186-210, `irqfd_wakeup` calls
     /// `kvm_arch_set_irq_inatomic`, arch/x86/kvm/irq_comm.c:157-191, which
-    /// delivers an MSI there and then), against the two ways this backend
-    /// has: the irqfd watcher thread (an eventfd write, the watcher's
-    /// wake-up, `raise_gsi`, `WHvRequestInterrupt`, `wake_halted`) and a
-    /// direct `inject_msi` from the signalling thread. With the guest's two
-    /// vCPUs spinning, then halted:
+    /// delivers an MSI there and then), against the ways this backend has:
+    /// an irqfd's write taken by its consumer, which injects in the
+    /// writer's thread (`VmInner::inject_irqfd_in_place`); the irqfd
+    /// watcher thread, for an irqfd whose consumer is removed (an eventfd
+    /// write, the watcher's wake-up, `raise_gsi`, `WHvRequestInterrupt`,
+    /// `wake_halted`), the way of a write the consumer leaves and of
+    /// another process's; and a direct `inject_msi` from the signalling
+    /// thread. With the guest's two vCPUs spinning, then halted:
     /// - `WHvCreateTrigger` of the MSI's interrupt control: HRESULT,
     ///   handles;
+    /// - what `WHvRequestInterrupt` returns for an MSI to an APIC ID no
+    ///   vCPU has (a request the consumer leaves to the watcher if refused);
     /// - the latency of each way, seen from the signalling thread (the
     ///   signal to the guest handler's count moving in guest RAM), 300 each,
-    ///   in turn;
+    ///   in turn: the consumer's should match the direct inject's;
     /// - the vCPU threads' runs by exit reason (whether a halted vCPU comes
     ///   back to the backend's run loop: Halt exits, after which a trigger's
     ///   interrupt waits for the loop's `HALT_POLL` re-entry, as
@@ -7560,13 +7565,21 @@ mod fpu_tests {
             let (vm, v0, v1, m) = trig_guest(halted);
             let inner = Arc::clone(&v0.shared.inner);
             let part = v0.part();
-            // The watcher's way: an irqfd on GSI 24, routed to the MSI.
+            // The consumer's way: an irqfd on GSI 24, routed to the MSI;
+            // the watcher's: one on GSI 25, the same MSI, without its
+            // consumer.
             vm.create_irq_chip().unwrap();
-            let mut entry = kvm_bindings::kvm_irq_routing_entry { gsi: 24, type_: kvm_bindings::KVM_IRQ_ROUTING_MSI, ..Default::default() };
-            entry.u.msi = kvm_bindings::kvm_irq_routing_msi { address_lo: TRIG_MSI as u32, data: MMIO_VECTOR as u32, ..Default::default() };
-            vm.set_gsi_routing(&kvm_bindings::KvmIrqRouting::from_entries(&[entry]).unwrap()).unwrap();
+            let route = |gsi| {
+                let mut entry = kvm_bindings::kvm_irq_routing_entry { gsi, type_: kvm_bindings::KVM_IRQ_ROUTING_MSI, ..Default::default() };
+                entry.u.msi = kvm_bindings::kvm_irq_routing_msi { address_lo: TRIG_MSI as u32, data: MMIO_VECTOR as u32, ..Default::default() };
+                entry
+            };
+            vm.set_gsi_routing(&kvm_bindings::KvmIrqRouting::from_entries(&[route(24), route(25)]).unwrap()).unwrap();
             let irqfd = vmm_sys_util::eventfd::EventFd::new(0).unwrap();
             vm.register_irqfd(&irqfd, 24).unwrap();
+            let watched = vmm_sys_util::eventfd::EventFd::new(0).unwrap();
+            vm.register_irqfd(&watched, 25).unwrap();
+            vm.leave_irqfd_to_the_watcher(&watched);
             // The trigger's way.
             let mut trigger: *mut core::ffi::c_void = std::ptr::null_mut();
             let mut event: HANDLE = std::ptr::null_mut();
@@ -7581,7 +7594,8 @@ mod fpu_tests {
             let kickers = [VcpuFd { shared: Arc::clone(&v0.shared), own: None }, VcpuFd { shared: Arc::clone(&v1.shared), own: None }];
             let threads = [trig_spawn(v0), trig_spawn(v1)];
             let direct = || inner.inject_msi(TRIG_MSI, MMIO_VECTOR as u32);
-            let watcher = || irqfd.write(1).unwrap();
+            let consumer = || irqfd.write(1).unwrap();
+            let watcher = || watched.write(1).unwrap();
             let event_at = event as usize;
             let signal = move || {
                 // SAFETY: the trigger's event, open until the end.
@@ -7592,11 +7606,16 @@ mod fpu_tests {
             let warm1 = trig_once(m, TRIG_PER_CPU + 8, ms(5), limit, &|| inner.inject_msi(TRIG_MSI | 1 << 12, MMIO_VECTOR as u32));
             eprintln!("TRIGREC {mode}: a first direct delivery to vCPU 0 {warm:?} ticks, to vCPU 1 {warm1:?}");
             assert!(warm.is_some(), "{mode}: the guest took no direct interrupt: the record has no guest");
-            let ways: Vec<(&str, &dyn Fn())> = if triggered {
-                vec![("direct inject_msi", &direct), ("irqfd watcher", &watcher), ("trigger", &signal)]
-            } else {
-                vec![("direct inject_msi", &direct), ("irqfd watcher", &watcher)]
-            };
+            let nobody = inner.request_interrupt(TRIG_MSI | 200 << 12, MMIO_VECTOR as u32);
+            eprintln!(
+                "TRIGREC {mode}: WHvRequestInterrupt of the MSI to APIC ID 200 (no such vCPU): HRESULT {:#010x}",
+                nobody.cast_unsigned()
+            );
+            let mut ways: Vec<(&str, &dyn Fn())> =
+                vec![("direct inject_msi", &direct), ("irqfd write, its consumer", &consumer), ("irqfd watcher", &watcher)];
+            if triggered {
+                ways.push(("trigger", &signal));
+            }
             let mut ticks = vec![Vec::new(); ways.len()];
             for _ in 0..300 {
                 for (i, (_, way)) in ways.iter().enumerate() {
@@ -7746,6 +7765,7 @@ mod fpu_tests {
             drop(kickers);
             drop(ended);
             drop(irqfd);
+            drop(watched);
             // The partition goes with the VM's last reference, this one.
             drop(inner);
             drop(vm);

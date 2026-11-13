@@ -26,15 +26,26 @@
 //! together as Linux keeps one open file behind duplicated descriptors. Descriptors sent to another process go with their
 //! section and space event ([`companions`], [`adopt`]); `sock_ctrl_msg` does
 //! that, as `SCM_RIGHTS` carries an eventfd on Linux.
+//!
+//! A consumer ([`EventFd::add_consumer`]) is what KVM's irqfd is to an
+//! eventfd, as on macOS: KVM hooks the eventfd's wait queue, so a write
+//! raises the interrupt in the writing thread and takes the count (Linux
+//! v6.1 fs/eventfd.c `eventfd_write` wakes the queue under its lock, :304-310;
+//! virt/kvm/eventfd.c `irqfd_wakeup` reads the count and injects, :186-210,
+//! for a write of 0 too). A write through a descriptor of this process is
+//! handed to the consumers instead of being counted, unless none takes it.
+//! The consumers live with the section's mapping in this process, so a
+//! write of another process (a vhost-user backend's, through a descriptor
+//! [`adopt`]ed there) is counted, for whoever reads the counter.
 
 use std::io;
 use std::result;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, TryLockError};
 
 use wick_os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd, from_handle, handle};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+    CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
     HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Memory::{
@@ -60,6 +71,24 @@ const MAGIC: u64 = u64::from_le_bytes(*b"FCEVTFD1");
 const SECTION_SIZE: u32 = 4096;
 const FLAG_SEMAPHORE: u32 = 1;
 const FLAG_NONBLOCK: u32 = 2;
+
+/// Takes a write in place of the counter ([`EventFd::add_consumer`]):
+/// returns whether it did.
+pub type Consumer = Box<dyn Fn() -> bool + Send + Sync>;
+
+/// Names a consumer added with [`EventFd::add_consumer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumerId(u64);
+
+/// The consumers of an eventfd in this process.
+#[derive(Default)]
+struct Consumers(RwLock<Vec<(ConsumerId, Consumer)>>);
+
+impl std::fmt::Debug for Consumers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Consumers").finish_non_exhaustive()
+    }
+}
 
 /// The shared page.
 #[repr(C)]
@@ -132,6 +161,11 @@ struct Shared {
     view: *mut Header,
     /// Signalled while the counter is below [`MAX`].
     space: Handle,
+    /// Held for reading while a write calls them, and never with the
+    /// page's lock: a consumer may take locks of its own (a VM's), and a
+    /// thread that holds those may read the counter (the irqfd watcher
+    /// reads an irqfd under the VM's `irqfds` lock).
+    consumers: Consumers,
 }
 
 // SAFETY: the view is shared memory accessed with atomics under the lock.
@@ -172,6 +206,7 @@ impl Shared {
             section,
             view: view.Value.cast(),
             space,
+            consumers: Consumers::default(),
         })
     }
 
@@ -318,10 +353,14 @@ impl EventFd {
         self.shared.flags() & FLAG_NONBLOCK != 0
     }
 
-    /// Adds `v` to the counter.
+    /// Adds `v` to the counter, or hands the write to the consumers.
     pub fn write(&self, v: u64) -> result::Result<(), io::Error> {
         if v == u64::MAX {
             return Err(einval());
+        }
+        // Not under the page's lock (see `Shared::consumers`).
+        if self.consumed() {
+            return Ok(());
         }
         loop {
             {
@@ -379,6 +418,65 @@ impl EventFd {
             }
             wait(self.event)?;
         }
+    }
+
+    /// Hands a write to the consumers; whether one took it. Each is called,
+    /// as each of KVM's irqfds on one eventfd injects (`irqfd_wakeup` does
+    /// not look at the count it read).
+    fn consumed(&self) -> bool {
+        let consumers = self.shared.consumers.0.read().unwrap_or_else(PoisonError::into_inner);
+        consumers.iter().fold(false, |taken, (_, consume)| consume() | taken)
+    }
+
+    /// Adds a consumer: from now on a write through a descriptor of this
+    /// process calls it, in the writing thread, and is not counted if it
+    /// returns true (see the module's documentation). Waits for consumers
+    /// running. A consumer must not write this eventfd, or add or remove a
+    /// consumer of it.
+    pub fn add_consumer(&self, consumer: Consumer) -> ConsumerId {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = ConsumerId(NEXT.fetch_add(1, Ordering::Relaxed));
+        self.shared
+            .consumers
+            .0
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((id, consumer));
+        id
+    }
+
+    /// Removes a consumer; once it returns, the consumer is not running and
+    /// is not called again, as KVM's irqfd deassignment waits for the
+    /// injections under way (virt/kvm/eventfd.c `kvm_irqfd_deassign`). So it
+    /// must not be called while holding a lock the consumer takes. Whether
+    /// it was there.
+    pub fn remove_consumer(&self, id: ConsumerId) -> bool {
+        let mut consumers = self.shared.consumers.0.write().unwrap_or_else(PoisonError::into_inner);
+        let before = consumers.len();
+        consumers.retain(|(c, _)| *c != id);
+        consumers.len() != before
+    }
+
+    /// As [`Self::remove_consumer`] if no consumer runs; otherwise leaves it
+    /// and returns false. For a consumer's owner going away inside a
+    /// consumer's call, which would wait for itself.
+    pub fn try_remove_consumer(&self, id: ConsumerId) -> bool {
+        let mut consumers = match self.shared.consumers.0.try_write() {
+            Ok(consumers) => consumers,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        let before = consumers.len();
+        consumers.retain(|(c, _)| *c != id);
+        consumers.len() != before
+    }
+
+    /// Whether `other` is a descriptor of the same eventfd: of one kernel
+    /// event (`CompareObjectHandles`), as KVM compares the `eventfd_ctx`
+    /// two descriptors open (virt/kvm/eventfd.c `kvm_irqfd_assign`).
+    pub fn is_same(&self, other: &EventFd) -> bool {
+        // SAFETY: two handles we hold.
+        unsafe { CompareObjectHandles(self.event, other.event) != 0 }
     }
 
     /// Returns a new handle to the same counter. `EMFILE` past the jail's
@@ -541,6 +639,185 @@ mod tests {
         let received = unsafe { EventFd::from_raw_fd(fd) };
         received.write(9).unwrap();
         assert_eq!(evt.read().unwrap(), 9);
+    }
+
+    /// An eventfd as another process holds it: the three handles duplicated
+    /// and adopted, with a mapping of the section of its own.
+    fn as_another_process_has_it(evt: &EventFd) -> EventFd {
+        let [section, space] = companions(evt.as_raw_fd()).unwrap();
+        // SAFETY: duplicates our own handles.
+        let me = unsafe { GetCurrentProcess() };
+        let fd = from_handle(duplicate(evt.event, me).unwrap());
+        let section = from_handle(duplicate(handle(section), me).unwrap());
+        let space = from_handle(duplicate(handle(space), me).unwrap());
+        // SAFETY: the handles are fresh duplicates of one eventfd.
+        unsafe { adopt(fd, section, space).unwrap() };
+        // SAFETY: adopted above.
+        unsafe { EventFd::from_raw_fd(fd) }
+    }
+
+    fn counting(calls: &Arc<AtomicU64>, takes: bool) -> Consumer {
+        let calls = calls.clone();
+        Box::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            takes
+        })
+    }
+
+    fn signalled(evt: &EventFd) -> bool {
+        // SAFETY: waits with a zero timeout on a handle the eventfd holds.
+        unsafe { WaitForSingleObject(evt.event, 0) == WAIT_OBJECT_0 }
+    }
+
+    #[test]
+    fn test_a_consumer_takes_the_writes_of_this_process() {
+        // As KVM's irqfd takes an eventfd's writes: in the writing thread,
+        // and the count is gone; a write of 0 too, which Linux's
+        // eventfd_write passes to the wait queue as any other.
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        evt.add_consumer(counting(&calls, true));
+        evt.write(3).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        evt.try_clone().unwrap().write(1).unwrap();
+        evt.write(0).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(evt.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        // Nothing waits in the descriptor either.
+        assert!(!signalled(&evt));
+        // An invalid write reaches no consumer.
+        assert_eq!(evt.write(u64::MAX).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_a_write_no_consumer_takes_is_counted() {
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        evt.add_consumer(counting(&calls, false));
+        evt.write(5).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(signalled(&evt));
+        assert_eq!(evt.read().unwrap(), 5);
+        // Each consumer is called; one that takes the write is enough.
+        let other = Arc::new(AtomicU64::new(0));
+        evt.add_consumer(counting(&other, true));
+        evt.write(2).unwrap();
+        assert_eq!((calls.load(Ordering::SeqCst), other.load(Ordering::SeqCst)), (2, 1));
+        assert_eq!(evt.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn test_a_write_of_another_process_is_not_consumed() {
+        // Its descriptor maps the section on its own: its writes are
+        // counted, for whoever reads the counter (an irqfd watcher).
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        evt.add_consumer(counting(&calls, true));
+        let other = as_another_process_has_it(&evt);
+        other.write(4).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(evt.read().unwrap(), 4);
+    }
+
+    #[test]
+    fn test_a_removed_consumer_is_not_called() {
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let id = evt.add_consumer(counting(&calls, true));
+        assert!(evt.remove_consumer(id));
+        assert!(!evt.remove_consumer(id));
+        assert!(!evt.try_remove_consumer(id));
+        evt.write(6).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(evt.read().unwrap(), 6);
+    }
+
+    #[test]
+    fn test_descriptors_of_one_eventfd_are_the_same() {
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let other = EventFd::new(EFD_NONBLOCK).unwrap();
+        assert!(evt.is_same(&evt.try_clone().unwrap()));
+        assert!(evt.is_same(&as_another_process_has_it(&evt)));
+        assert!(!evt.is_same(&other));
+    }
+
+    /// A consumer that says it started, then waits for `gate`.
+    fn gated(
+        gate: &Arc<std::sync::Mutex<()>>,
+    ) -> (Consumer, std::sync::mpsc::Receiver<()>, Arc<AtomicU64>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (gate, done) = (gate.clone(), Arc::new(AtomicU64::new(0)));
+        let finished = done.clone();
+        let consumer: Consumer = Box::new(move || {
+            let _ = tx.send(());
+            drop(gate.lock().unwrap());
+            finished.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        (consumer, rx, done)
+    }
+
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn test_a_consumer_runs_without_the_pages_lock() {
+        // A consumer takes locks of its own (a VM's), and the thread that
+        // holds them may read the counter meanwhile (the irqfd watcher reads
+        // an irqfd under the VM's `irqfds` lock): were the consumer called
+        // with the page's lock held, the two would wait for each other
+        // forever.
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let (consumer, started, _) = gated(&gate);
+        evt.add_consumer(consumer);
+        let held = gate.lock().unwrap();
+        let writer = evt.try_clone().unwrap();
+        let write = std::thread::spawn(move || writer.write(1).unwrap());
+        started.recv_timeout(BOUND).expect("the consumer did not start");
+        let reader = evt.try_clone().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(reader.read().map_err(|e| e.kind())).unwrap());
+        let read = rx.recv_timeout(BOUND).unwrap_or_else(|_| {
+            panic!("a read waited for a running consumer: the consumer holds the page's lock")
+        });
+        assert_eq!(read, Err(io::ErrorKind::WouldBlock));
+        drop(held);
+        write.join().unwrap();
+    }
+
+    #[test]
+    fn test_removing_a_consumer_waits_for_its_run() {
+        // As KVM's deassignment: once removed, the consumer is not running.
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let (consumer, started, finished) = gated(&gate);
+        let id = evt.add_consumer(consumer);
+        let held = gate.lock().unwrap();
+        let writer = evt.try_clone().unwrap();
+        let write = std::thread::spawn(move || writer.write(1).unwrap());
+        started.recv_timeout(BOUND).expect("the consumer did not start");
+        // From inside a run (an owner dropped by its own consumer) it does
+        // not wait for itself.
+        assert!(!evt.try_remove_consumer(id));
+        let remover = evt.try_clone().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let removed = remover.remove_consumer(id);
+            tx.send((removed, finished.load(Ordering::SeqCst))).unwrap();
+        });
+        // It waits while the consumer runs (any time it returns before the
+        // gate opens is an error; the wait cannot make a correct removal
+        // fail).
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "the removal returned while its consumer ran"
+        );
+        drop(held);
+        let (removed, runs) = rx.recv_timeout(BOUND).expect("the removal did not end");
+        assert!(removed);
+        assert_eq!(runs, 1, "the consumer's run had ended when the removal returned");
+        write.join().unwrap();
     }
 }
 

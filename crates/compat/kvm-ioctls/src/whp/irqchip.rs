@@ -460,6 +460,34 @@ fn timer_loop(shared: &Arc<(Mutex<TimerCmd>, Condvar)>, irq0: &Irq0) {
     }
 }
 
+/// The MSI routes of a GSI routing table (`KVM_SET_GSI_ROUTING`), each
+/// GSI's `(address, data)`; a GSI without one is an I/O APIC pin. Kept by
+/// the VM apart from [`Irqchip`] (`VmInner::raise_gsi`, which looks a GSI's
+/// route up first: a routed MSI takes precedence, as PCI/MSI-X vectors).
+#[derive(Debug, Default)]
+pub(crate) struct MsiRoutes(std::collections::HashMap<u32, (u64, u32)>);
+
+impl MsiRoutes {
+    /// The MSI routes of `entries`.
+    pub(crate) fn new(entries: &[kvm_bindings::kvm_irq_routing_entry]) -> Self {
+        let mut routes = std::collections::HashMap::new();
+        for e in entries {
+            if e.type_ == KVM_IRQ_ROUTING_MSI {
+                // SAFETY: the entry is tagged as an MSI route.
+                let msi = unsafe { e.u.msi };
+                let address = u64::from(msi.address_lo) | (u64::from(msi.address_hi) << 32);
+                routes.insert(e.gsi, (address, msi.data));
+            }
+        }
+        MsiRoutes(routes)
+    }
+
+    /// `gsi`'s MSI, if it is routed to one.
+    pub(crate) fn get(&self, gsi: u32) -> Option<(u64, u32)> {
+        self.0.get(&gsi).copied()
+    }
+}
+
 /// The whole user-space interrupt controller.
 #[derive(Debug)]
 pub(crate) struct Irqchip {
@@ -467,9 +495,6 @@ pub(crate) struct Irqchip {
     ioapic: IoApic,
     pics: [Pic; 2],
     pit: Option<Pit>,
-    /// GSI routing entries that are MSIs (`gsi -> (address, data)`); legacy
-    /// IOAPIC-pin routes use the I/O APIC entry directly.
-    msi_routes: std::collections::HashMap<u32, (u64, u32)>,
     /// Guest clock offset (nanoseconds), for get/set_clock.
     clock_base: Instant,
     clock_offset: u64,
@@ -482,7 +507,6 @@ impl Irqchip {
             ioapic: IoApic::new(),
             pics: [Pic::new(0xf8), Pic::new(0xde)],
             pit: None,
-            msi_routes: std::collections::HashMap::new(),
             clock_base: Instant::now(),
             clock_offset: 0,
         }
@@ -498,14 +522,10 @@ impl Irqchip {
 
     // ---- GSI delivery ----
 
-    /// Raises or lowers GSI `gsi`. Returns an `(msi_address, msi_data)` pair to
-    /// inject on a rising edge, or `None`.
+    /// Raises or lowers GSI `gsi`, an I/O APIC pin (a GSI routed to an MSI
+    /// is the VM's, [`MsiRoutes`]). Returns an `(msi_address, msi_data)`
+    /// pair to inject on a rising edge, or `None`.
     pub(crate) fn raise_gsi(&mut self, gsi: u32, level: bool) -> Option<(u64, u32)> {
-        // A routed MSI takes precedence (PCI/MSI-X vectors).
-        if let Some(&msi) = self.msi_routes.get(&gsi) {
-            return level.then_some(msi);
-        }
-        // Otherwise it is an I/O APIC pin.
         let pin = gsi as usize;
         if pin >= IOAPIC_PINS {
             return None;
@@ -517,18 +537,6 @@ impl Irqchip {
         } else {
             self.ioapic.asserted &= !bit;
             None
-        }
-    }
-
-    pub(crate) fn set_gsi_routing(&mut self, entries: &[kvm_bindings::kvm_irq_routing_entry]) {
-        self.msi_routes.clear();
-        for e in entries {
-            if e.type_ == KVM_IRQ_ROUTING_MSI {
-                // SAFETY: the entry is tagged as an MSI route.
-                let msi = unsafe { e.u.msi };
-                let address = u64::from(msi.address_lo) | (u64::from(msi.address_hi) << 32);
-                self.msi_routes.insert(e.gsi, (address, msi.data));
-            }
         }
     }
 

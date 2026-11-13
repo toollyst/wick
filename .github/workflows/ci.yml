@@ -1134,12 +1134,14 @@ jobs:
           # WHP's triggers for an MSI route (TRIGREC lines), the equivalent of
           # KVM's MSI irqfd injected in the signaller's context: created for
           # the MSI's interrupt control, signalled from another thread; the
-          # latency of a trigger, of the irqfd watcher and of a direct
-          # inject_msi with the guest spinning and halted, and the vCPU
-          # threads' runs by exit reason; coalescing of bursts and of spaced
-          # signals; WHvUpdateTriggerParameters on a route change and racing
-          # signals; WHvDeleteTrigger. Record only: the backend has no
-          # trigger.
+          # latency of a trigger, of an irqfd write its consumer injects in
+          # the writer's thread, of the irqfd watcher (an irqfd without its
+          # consumer) and of a direct inject_msi, with the guest spinning
+          # and halted, what WHP returns for an MSI to an APIC ID no vCPU
+          # has, and the vCPU threads' runs by exit reason; coalescing of
+          # bursts and of spaced signals; WHvUpdateTriggerParameters on a
+          # route change and racing signals; WHvDeleteTrigger. Record only:
+          # the backend has no trigger.
           alone whp::vcpu::fpu_tests::test_msi_triggers_against_the_irqfd_watcher_on_record
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record

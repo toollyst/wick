@@ -8,8 +8,10 @@
 //! front (WHP fixes it before the partition is set up; fewer vCPUs may be
 //! created). Guest RAM is mapped with `WHvMapGpaRange`. The I/O APIC, the
 //! 8259 PICs and the 8254 PIT live in [`super::irqchip`]; GSIs raised by
-//! devices (through `irqfd`s) or by `set_irq_line` are routed by it to the
-//! local APIC with `WHvRequestInterrupt`.
+//! devices (through `irqfd`s) or by `set_irq_line` are routed by it, or by
+//! the MSI routes of `set_gsi_routing`, to the local APIC with
+//! `WHvRequestInterrupt`. An irqfd routed to an MSI is injected in the
+//! writer's thread, as KVM injects it ([`VmFd::register_irqfd`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, Ordering};
@@ -21,7 +23,7 @@ use kvm_bindings::{
     KvmIrqRouting, KVM_CLOCK_HOST_TSC, KVM_CLOCK_REALTIME, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
 };
 use vmm_sys_util::errno::Error;
-use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::eventfd::{ConsumerId, EventFd};
 use super::whv;
 use super::whv::{WHV_PARTITION_HANDLE, WHV_REGISTER_NAME};
 
@@ -34,7 +36,7 @@ thread_local! {
     pub(crate) static APIC_MODE_FOR_TESTS: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 use super::guest_mem::{self, Slot};
-use super::irqchip::Irqchip;
+use super::irqchip::{Irqchip, MsiRoutes};
 use super::vcpu::{VcpuFd, VcpuShared};
 use super::{err, Cap, DeviceFd, Handle, IoEventAddress, Result};
 
@@ -90,9 +92,21 @@ impl IoEvent {
 #[derive(Debug)]
 struct IrqFd {
     gsi: u32,
-    /// The eventfd's descriptor, to match on unregister.
-    fd: RawFd,
+    /// Our clone of the eventfd, which the watcher waits on and reads.
     eventfd: EventFd,
+    /// What takes a write of this process in the writer's thread
+    /// ([`VmFd::register_irqfd`]).
+    consumer: ConsumerId,
+}
+
+impl Drop for IrqFd {
+    /// The VM is going away, or the watcher drops a retired irqfd whose
+    /// consumer [`VmFd::unregister_irqfd`] removed: a consumer left behind
+    /// (one running now, which may be what drops the VM) finds no VM and
+    /// leaves the write counted.
+    fn drop(&mut self) {
+        self.eventfd.try_remove_consumer(self.consumer);
+    }
 }
 
 /// The partition and everything attached to it.
@@ -107,6 +121,11 @@ pub(crate) struct VmInner {
     /// KVM's irqfd holds its eventfd until it is deassigned (see
     /// [`retire_irqfd`]). Locked after `irqfds`.
     retired_irqfds: Mutex<Vec<IrqFd>>,
+    /// The MSI routes of `set_gsi_routing`. Apart from `irqchip`, so that
+    /// an irqfd's consumer, in the writer's thread, looks its route up
+    /// without a lock the vCPUs take for the I/O APIC and the PIT; it only
+    /// tries it ([`VmInner::inject_irqfd_in_place`]). Taken alone.
+    msi_routes: RwLock<MsiRoutes>,
     pub(crate) irqchip: Mutex<Irqchip>,
     /// kvm-clock: the VM-wide reference and the wall clock MSR.
     pub(crate) pvclock: Mutex<super::pvclock::State>,
@@ -291,12 +310,57 @@ impl VmInner {
         false
     }
 
-    /// Raises `gsi`: the irqchip routes it to the local APIC.
+    /// Raises `gsi`: an MSI route's message on a rising edge, or the
+    /// irqchip's I/O APIC pin, which it routes to the local APIC.
     pub(crate) fn raise_gsi(&self, gsi: u32, level: bool) {
-        let msi = self.irqchip.lock().unwrap().raise_gsi(gsi, level);
+        // A routed MSI takes precedence (PCI/MSI-X vectors).
+        let route = self.msi_routes.read().unwrap().get(gsi);
+        let msi = match route {
+            Some(msi) => level.then_some(msi),
+            None => self.irqchip.lock().unwrap().raise_gsi(gsi, level),
+        };
         if let Some(msi) = msi {
             self.inject_msi(msi.0, msi.1);
         }
+    }
+
+    /// An irqfd's write of `gsi` injected in the writer's thread, as KVM's
+    /// `irqfd_wakeup` injects with `kvm_arch_set_irq_inatomic` (Linux v6.1
+    /// virt/kvm/eventfd.c:186-210, arch/x86/kvm/irq_comm.c:157-191): an MSI
+    /// route there and then, anything else handed to a thread of its own
+    /// (`-EWOULDBLOCK`, `schedule_work`, `irqfd_inject`). Whether it was
+    /// injected; when it was not, the caller counts the write and the irqfd
+    /// watcher raises it, which is KVM's fallback:
+    /// - the GSI is an I/O APIC pin, or has no route: KVM's
+    ///   `kvm_arch_set_irq_inatomic` returns `-EWOULDBLOCK` for every route
+    ///   but an MSI (and Hyper-V's and Xen's);
+    /// - `set_gsi_routing` is replacing the routes (`msi_routes` held for
+    ///   writing): only tried here, as KVM reads the irqfd's route under a
+    ///   seqcount and never waits; the watcher takes the new routes;
+    /// - `WHvRequestInterrupt` refused it: the watcher requests it again
+    ///   (`inject_msi`), and reports a refusal once per HRESULT, so nothing
+    ///   is dropped here unreported.
+    ///
+    /// Locks: `msi_routes` (tried, for reading), then, with it released,
+    /// `halt_wake`'s mutex in [`Self::wake_halted`], held for an increment.
+    /// No other lock of the VM: not `irqchip`, `irqfds`, `retired_irqfds`,
+    /// `ioevents`, `memory`, `vcpus`, `pvclock` or `tsc_sync`, so a writer
+    /// may hold any of them (the backend writes ioeventfds under `ioevents`;
+    /// Firecracker writes under its devices' locks), and nothing of ours
+    /// writes an eventfd under `halt_wake`.
+    fn inject_irqfd_in_place(&self, gsi: u32) -> bool {
+        let route = match self.msi_routes.try_read() {
+            Ok(routes) => routes.get(gsi),
+            Err(_) => return false,
+        };
+        let Some((address, data)) = route else {
+            return false;
+        };
+        if self.request_interrupt(address, data) != 0 {
+            return false;
+        }
+        self.wake_halted();
+        true
     }
 
     /// Injects an interrupt described by an MSI address/data pair.
@@ -308,6 +372,23 @@ impl VmInner {
     /// exist; there is no caller to return the error to (irqfds, the PIT),
     /// so it is reported on standard error, once per error code.
     pub(crate) fn inject_msi(&self, address: u64, data: u32) {
+        let hres = self.request_interrupt(address, data);
+        if hres != 0 && self.request_failure.swap(hres, Ordering::Relaxed) != hres {
+            let control = super::irqchip::interrupt_control(address, data);
+            ffi::report(
+                log::Level::Error,
+                &format!(
+                    "wick: WHvRequestInterrupt(destination {}, vector {:#x}) failed: HRESULT {:#010x}; \
+                     the interrupt is lost",
+                    control.Destination, control.Vector, hres as u32
+                ),
+            );
+        }
+        self.wake_halted();
+    }
+
+    /// `WHvRequestInterrupt` of an MSI address/data pair; its HRESULT.
+    pub(crate) fn request_interrupt(&self, address: u64, data: u32) -> i32 {
         let control = super::irqchip::interrupt_control(address, data);
         #[cfg(any(test, feature = "whp-trace"))]
         let before = ffi::trace::stack();
@@ -321,17 +402,7 @@ impl VmInner {
         };
         #[cfg(any(test, feature = "whp-trace"))]
         ffi::trace::note("WHvRequestInterrupt", control.Destination, &[], None, before, hres);
-        if hres != 0 && self.request_failure.swap(hres, Ordering::Relaxed) != hres {
-            ffi::report(
-                log::Level::Error,
-                &format!(
-                    "wick: WHvRequestInterrupt(destination {}, vector {:#x}) failed: HRESULT {:#010x}; \
-                     the interrupt is lost",
-                    control.Destination, control.Vector, hres as u32
-                ),
-            );
-        }
-        self.wake_halted();
+        hres
     }
 
     /// Wakes vCPUs waiting in [`Self::wait_halted`].
@@ -694,6 +765,7 @@ impl VmInner {
             ioevents: RwLock::new(Vec::new()),
             irqfds: Mutex::new(Vec::new()),
             retired_irqfds: Mutex::new(Vec::new()),
+            msi_routes: RwLock::new(MsiRoutes::default()),
             irqchip: Mutex::new(Irqchip::new()),
             pvclock: Mutex::new(super::pvclock::State::default()),
             deadlines: super::tscdeadline::Timers::new().map_err(io_err)?,
@@ -856,13 +928,38 @@ impl VmFd {
     }
 
     /// Routes `fd` to raise `gsi` when signalled.
+    ///
+    /// A write through a descriptor of this process is taken by a consumer
+    /// of the eventfd ([`EventFd::add_consumer`]) in the writer's thread,
+    /// which injects an MSI route there and then, as KVM's `irqfd_wakeup`
+    /// does, and otherwise leaves the write counted
+    /// ([`VmInner::inject_irqfd_in_place`] says when, and which locks it
+    /// takes). A counted write, and a write of another process (a
+    /// vhost-user backend's), is raised by the irqfd watcher thread, which
+    /// reads the counter: KVM's `irqfd_inject` work. A write before the
+    /// registration is counted, and raised by the watcher once it looks
+    /// again, as KVM schedules the injection of an eventfd already readable
+    /// at `kvm_irqfd_assign`.
+    ///
+    /// The consumer is added under `irqfds`, which it does not take; the
+    /// addition waits only for consumers running on the eventfd (another
+    /// VM's).
+    ///
+    /// An eventfd already registered with this VM fails with `EBUSY`, as on
+    /// KVM (`kvm_irqfd_assign`: "This fd is used for another irq already").
     pub fn register_irqfd(&self, fd: &EventFd, gsi: u32) -> Result<()> {
         let eventfd = fd.try_clone().map_err(io_err)?;
-        self.inner.irqfds.lock().unwrap().push(IrqFd {
-            gsi,
-            fd: fd.as_raw_fd(),
-            eventfd,
-        });
+        let mut irqfds = self.inner.irqfds.lock().unwrap();
+        if irqfds.iter().any(|i| i.eventfd.is_same(fd)) {
+            return err(libc::EBUSY);
+        }
+        let vm = Arc::downgrade(&self.inner);
+        let consumer = fd.add_consumer(Box::new(move || match vm.upgrade() {
+            Some(vm) if !vm.stop.load(Ordering::Acquire) => vm.inject_irqfd_in_place(gsi),
+            _ => false,
+        }));
+        irqfds.push(IrqFd { gsi, eventfd, consumer });
+        drop(irqfds);
         self.ensure_watcher();
         // The watcher waits on the irqfds it knew of: it looks again now,
         // so a signal right after registration is delivered at once.
@@ -870,27 +967,47 @@ impl VmFd {
         Ok(())
     }
 
-    /// Stops routing `fd` to `gsi`.
+    /// Stops routing `fd` to `gsi`. Once it returns, a write of the eventfd
+    /// raises nothing, as KVM's deassignment waits for the injections under
+    /// way (`kvm_irqfd_deassign`): its consumer is removed with no lock of
+    /// the VM held, as a running consumer may wait for one (`halt_wake`).
     pub fn unregister_irqfd(&self, fd: &EventFd, gsi: u32) -> Result<()> {
         let mut irqfds = self.inner.irqfds.lock().unwrap();
         let mut retired = self.inner.retired_irqfds.lock().unwrap();
-        if !retire_irqfd(&mut irqfds, &mut retired, fd.as_raw_fd(), gsi) {
+        let Some(consumer) = retire_irqfd(&mut irqfds, &mut retired, fd, gsi) else {
             return err(libc::ENOENT);
-        }
+        };
         drop(retired);
         drop(irqfds);
+        fd.remove_consumer(consumer);
         let _ = self.inner.stop_evt.write(1);
         Ok(())
     }
 
     /// Sets the GSI routing table (legacy IOAPIC pins and MSI entries).
     pub fn set_gsi_routing(&self, irq_routing: &KvmIrqRouting) -> Result<()> {
-        self.inner
-            .irqchip
+        let routes = MsiRoutes::new(irq_routing.as_slice());
+        *self.inner.msi_routes.write().unwrap() = routes;
+        Ok(())
+    }
+
+    /// Removes the consumers of the irqfds of `fd`, which leaves their
+    /// writes to the watcher: the watcher's way on record against the
+    /// writer's (`test_msi_triggers_against_the_irqfd_watcher_on_record`).
+    #[cfg(test)]
+    pub(crate) fn leave_irqfd_to_the_watcher(&self, fd: &EventFd) {
+        let consumers: Vec<ConsumerId> = self
+            .inner
+            .irqfds
             .lock()
             .unwrap()
-            .set_gsi_routing(irq_routing.as_slice());
-        Ok(())
+            .iter()
+            .filter(|i| i.eventfd.is_same(fd))
+            .map(|i| i.consumer)
+            .collect();
+        for c in consumers {
+            fd.remove_consumer(c);
+        }
     }
 
     /// Raises or lowers a legacy IRQ line.
@@ -1058,23 +1175,24 @@ impl AsRawFd for VmFd {
     }
 }
 
-/// Moves the irqfds of `fd` and `gsi` from `irqfds` to `retired`, where
-/// their eventfd stays open until the watcher has taken it out of its epoll
-/// and drops them: closing it at once would leave a closed handle in an
-/// epoll that waits on it, which strict handle checks (the sandbox) end the
-/// process for (`STATUS_INVALID_HANDLE`, measured: boot-test pci, an MSI-X
-/// irqfd unregistered at the guest's reset). Whether any was registered.
-fn retire_irqfd(irqfds: &mut Vec<IrqFd>, retired: &mut Vec<IrqFd>, fd: RawFd, gsi: u32) -> bool {
-    let before = retired.len();
-    let mut i = 0;
-    while i < irqfds.len() {
-        if irqfds[i].gsi == gsi && irqfds[i].fd == fd {
-            retired.push(irqfds.remove(i));
-        } else {
-            i += 1;
-        }
-    }
-    retired.len() > before
+/// Moves the irqfd of the eventfd `fd` and `gsi` (KVM matches both,
+/// `kvm_irqfd_deassign`) from `irqfds` to `retired`, where its eventfd stays
+/// open until the watcher has taken it out of its epoll and drops it:
+/// closing it at once would leave a closed handle in an epoll that waits on
+/// it, which strict handle checks (the sandbox) end the process for
+/// (`STATUS_INVALID_HANDLE`, measured: boot-test pci, an MSI-X irqfd
+/// unregistered at the guest's reset). Its consumer, if it was registered.
+fn retire_irqfd(
+    irqfds: &mut Vec<IrqFd>,
+    retired: &mut Vec<IrqFd>,
+    fd: &EventFd,
+    gsi: u32,
+) -> Option<ConsumerId> {
+    let i = irqfds.iter().position(|i| i.gsi == gsi && i.eventfd.is_same(fd))?;
+    let irqfd = irqfds.remove(i);
+    let consumer = irqfd.consumer;
+    retired.push(irqfd);
+    Some(consumer)
 }
 
 /// Waits on every registered irqfd; when one signals, raises its GSI. Woken
@@ -1981,21 +2099,325 @@ mod tests {
     fn test_an_unregistered_irqfd_stays_open_until_retired() {
         let device = EventFd::new(0).unwrap();
         let other = EventFd::new(0).unwrap();
-        let mut irqfds = vec![
-            IrqFd { gsi: 5, fd: device.as_raw_fd(), eventfd: device.try_clone().unwrap() },
-            IrqFd { gsi: 6, fd: other.as_raw_fd(), eventfd: other.try_clone().unwrap() },
-        ];
+        let irqfd = |gsi, evt: &EventFd| IrqFd {
+            gsi,
+            eventfd: evt.try_clone().unwrap(),
+            consumer: evt.add_consumer(Box::new(|| false)),
+        };
+        let mut irqfds = vec![irqfd(5, &device), irqfd(6, &other)];
         let watched = irqfds[0].eventfd.as_raw_fd();
         let mut retired = Vec::new();
-        assert!(!retire_irqfd(&mut irqfds, &mut retired, device.as_raw_fd(), 6), "a gsi it was not registered for");
-        assert!(retire_irqfd(&mut irqfds, &mut retired, device.as_raw_fd(), 5));
+        assert!(retire_irqfd(&mut irqfds, &mut retired, &device, 6).is_none(), "a gsi it was not registered for");
+        // Another descriptor of the eventfd names it, as KVM's eventfd_ctx.
+        assert!(retire_irqfd(&mut irqfds, &mut retired, &device.try_clone().unwrap(), 5).is_some());
         assert_eq!(irqfds.len(), 1);
         assert_eq!(irqfds[0].gsi, 6);
         assert!(open(watched), "the watcher's eventfd closed while it may still be in the epoll");
-        assert!(!retire_irqfd(&mut irqfds, &mut retired, device.as_raw_fd(), 5), "unregistered twice");
+        assert!(retire_irqfd(&mut irqfds, &mut retired, &device, 5).is_none(), "unregistered twice");
         retired.clear();
         assert!(!open(watched), "the retired eventfd was not closed");
         assert!(open(device.as_raw_fd()), "the caller's eventfd is the caller's");
+        // Its consumer went with it.
+        device.write(2).unwrap();
+        assert_eq!(device.read().unwrap(), 2);
+    }
+
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A VM with vCPU 0, its irqchip, and an MSI route of `gsi` to the vCPU.
+    fn vm_with_an_msi_route(gsi: u32) -> (VmFd, VcpuFd) {
+        let vm = VmFd::create().unwrap();
+        vm.create_irq_chip().unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let mut entry = kvm_bindings::kvm_irq_routing_entry {
+            gsi,
+            type_: kvm_bindings::KVM_IRQ_ROUTING_MSI,
+            ..Default::default()
+        };
+        entry.u.msi = kvm_bindings::kvm_irq_routing_msi { address_lo: 0xFEE0_0000, data: 0x40, ..Default::default() };
+        vm.set_gsi_routing(&KvmIrqRouting::from_entries(&[entry]).unwrap()).unwrap();
+        (vm, vcpu)
+    }
+
+    /// The HRESULTs of the `WHvRequestInterrupt` calls `f` made in this
+    /// thread.
+    fn requests_in(f: impl FnOnce()) -> Vec<i32> {
+        ffi::trace::begin();
+        f();
+        ffi::trace::end()
+            .into_iter()
+            .filter(|c| c.call == "WHvRequestInterrupt")
+            .map(|c| c.hres)
+            .collect()
+    }
+
+    /// Whether the eventfd's counter is non-zero (its event is signalled
+    /// exactly then), without taking it.
+    fn counted(evt: &EventFd) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: waits with a zero timeout on the eventfd's handle.
+        unsafe { WaitForSingleObject(wick_os::fd::handle(evt.as_raw_fd()), 0) == WAIT_OBJECT_0 }
+    }
+
+    /// Waits up to `limit` for `done`.
+    fn within(limit: std::time::Duration, done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while !done() {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// How many interrupt requests and kicks the VM has woken halted
+    /// vCPUs for: one per `inject_msi` and per injection in a writer's
+    /// thread, whichever thread made it.
+    fn wakes(inner: &VmInner) -> u64 {
+        *inner.halt_wake.0.lock().unwrap()
+    }
+
+    /// What became of one write that made `requests` in the writer's
+    /// thread, with `before` the VM's [`wakes`] before it: injected there
+    /// (a request WHP took, and its wake, nothing counted), or left counted
+    /// and raised by the watcher (its `inject_msi`'s wake, after). Whether
+    /// it was injected in the writer's thread.
+    fn injected_in_place(requests: &[i32], evt: &EventFd, inner: &VmInner, before: u64) -> bool {
+        match requests {
+            [0] => {
+                assert_eq!(wakes(inner), before + 1, "a write injected in its thread did not wake the vCPUs");
+                assert!(!counted(evt), "a write injected in its thread was counted too");
+                true
+            }
+            [] | [_] => {
+                assert!(within(BOUND, || wakes(inner) > before), "the watcher did not raise a write left counted");
+                assert!(!counted(evt));
+                false
+            }
+            _ => panic!("one write made {} requests in its thread: {requests:x?}", requests.len()),
+        }
+    }
+
+    // As KVM's irqfd_wakeup with an MSI route: the write injects in the
+    // writer's thread (Linux v6.1 virt/kvm/eventfd.c:186-210). Whether WHP
+    // takes a request for a vCPU that has not run is printed (IRQFDTEST);
+    // a refusal leaves the write to the watcher, which is asserted.
+    #[test]
+    fn test_an_irqfd_write_of_an_msi_is_injected_in_the_writers_thread() {
+        let (vm, _vcpu) = vm_with_an_msi_route(24);
+        let evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        vm.register_irqfd(&evt, 24).unwrap();
+        // The watcher's first look, which register_irqfd asked for.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let before = wakes(&vm.inner);
+        let requests = requests_in(|| evt.write(1).unwrap());
+        let in_place = injected_in_place(&requests, &evt, &vm.inner, before);
+        eprintln!(
+            "IRQFDTEST an MSI irqfd's write: the WHvRequestInterrupt HRESULTs of the writer's thread {:x?}, \
+             injected there {in_place}",
+            requests.iter().map(|h| h.cast_unsigned()).collect::<Vec<_>>()
+        );
+        assert_eq!(requests.len(), 1, "the write made no request in its thread");
+    }
+
+    // A writer may hold any lock of the VM but `halt_wake` (and Firecracker
+    // writes under its devices' locks): with each of them held by the
+    // writing thread, the write is still injected there, so the consumer
+    // takes none of them; with `msi_routes` held for writing, as
+    // set_gsi_routing holds it, the write is left counted and the watcher
+    // raises it once the routes are back, as KVM's fallback
+    // (kvm_arch_set_irq_inatomic's -EWOULDBLOCK, irqfd_inject).
+    #[test]
+    fn test_an_irqfd_write_under_the_vms_locks() {
+        let (vm, _vcpu) = vm_with_an_msi_route(24);
+        let evt = Arc::new(EventFd::new(libc::EFD_NONBLOCK).unwrap());
+        vm.register_irqfd(&evt, 24).unwrap();
+        let (inner, writer) = (vm.inner.clone(), evt.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let before = wakes(&vm.inner);
+        std::thread::spawn(move || {
+            let held = requests_in(|| {
+                let _irqfds = inner.irqfds.lock().unwrap();
+                let _retired = inner.retired_irqfds.lock().unwrap();
+                let _irqchip = inner.irqchip.lock().unwrap();
+                let _ioevents = inner.ioevents.read().unwrap();
+                let _memory = inner.memory.lock().unwrap();
+                let _vcpus = inner.vcpus.lock().unwrap();
+                let _pvclock = inner.pvclock.lock().unwrap();
+                let _tsc_sync = inner.tsc_sync.lock().unwrap();
+                writer.write(1).unwrap();
+            });
+            // The first write is done (in place or by the watcher, which
+            // takes no lock held above but `irqfds`) before the second.
+            let first = within(BOUND, || wakes(&inner) > before);
+            let after_first = wakes(&inner);
+            let routes = requests_in(|| {
+                let _routes = inner.msi_routes.write().unwrap();
+                writer.write(1).unwrap();
+            });
+            let _ = tx.send((held, first, after_first, routes));
+        });
+        let (held, first, after_first, routes) = rx
+            .recv_timeout(BOUND)
+            .expect("a write under the VM's locks did not return: the consumer waits for one of them");
+        eprintln!(
+            "IRQFDTEST a write under the VM's locks: the WHvRequestInterrupt HRESULTs of the writer's thread {:x?}",
+            held.iter().map(|h| h.cast_unsigned()).collect::<Vec<_>>()
+        );
+        assert_eq!(held.len(), 1, "a write under the VM's locks made no request in its thread");
+        assert!(first, "the write under the VM's locks was not raised");
+        assert_eq!(routes, Vec::<i32>::new(), "a write with the routes held for writing requested in its thread");
+        assert!(
+            within(BOUND, || wakes(&vm.inner) > after_first),
+            "the watcher did not raise the write the consumer left"
+        );
+        assert!(!counted(&evt));
+    }
+
+    // A pin's irqfd is raised by the watcher, as KVM leaves anything but an
+    // MSI to irqfd_inject.
+    #[test]
+    fn test_an_irqfd_write_of_a_pin_is_left_to_the_watcher() {
+        let (vm, _vcpu) = vm_with_an_msi_route(24);
+        let evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        vm.register_irqfd(&evt, 5).unwrap();
+        let requests = requests_in(|| evt.write(1).unwrap());
+        assert_eq!(requests, Vec::<i32>::new(), "a pin's write requested in its thread");
+        assert!(within(BOUND, || !counted(&evt)), "the watcher did not take the pin's write");
+    }
+
+    #[test]
+    fn test_an_unregistered_irqfd_raises_nothing() {
+        let (vm, _vcpu) = vm_with_an_msi_route(24);
+        let evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        vm.register_irqfd(&evt, 24).unwrap();
+        vm.unregister_irqfd(&evt, 24).unwrap();
+        assert_eq!(vm.unregister_irqfd(&evt, 24).unwrap_err().errno(), libc::ENOENT);
+        let requests = requests_in(|| evt.write(1).unwrap());
+        assert_eq!(requests, Vec::<i32>::new());
+        // No watcher takes it either.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(evt.read().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_an_eventfd_is_one_irqfd_of_a_vm() {
+        // kvm_irqfd_assign: "This fd is used for another irq already."
+        let (vm, _vcpu) = vm_with_an_msi_route(24);
+        let evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        vm.register_irqfd(&evt, 24).unwrap();
+        assert_eq!(vm.register_irqfd(&evt, 25).unwrap_err().errno(), libc::EBUSY);
+        assert_eq!(vm.register_irqfd(&evt.try_clone().unwrap(), 24).unwrap_err().errno(), libc::EBUSY);
+        vm.unregister_irqfd(&evt.try_clone().unwrap(), 24).unwrap();
+        vm.register_irqfd(&evt, 25).unwrap();
+    }
+
+    // Once the VM is gone, its consumer finds no VM: a write is counted,
+    // as KVM leaves an eventfd's count once its irqfd is released.
+    #[test]
+    fn test_an_irqfd_outlives_its_vm() {
+        let evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let (vm, vcpu) = vm_with_an_msi_route(24);
+        vm.register_irqfd(&evt, 24).unwrap();
+        let weak = Arc::downgrade(&vm.inner);
+        drop(vcpu);
+        drop(vm);
+        // The watcher may be handling the wake register_irqfd gave it.
+        assert!(within(BOUND, || weak.strong_count() == 0), "the VM outlived its last reference");
+        evt.write(1).unwrap();
+        assert_eq!(evt.read().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_irqfd_writes_registrations_and_the_watcher_do_not_wait_for_each_other() {
+        // Writers injecting in their threads, registrations coming and
+        // going, writes through another process's handle that the watcher
+        // reads under the VM's `irqfds` lock, and a thread that holds
+        // `irqfds`, `irqchip` and `vcpus` and reads the eventfd: none may
+        // wait for another forever. A removal under `irqfds`, or a consumer
+        // called under the eventfd's own lock, deadlocks here. The threads
+        // are not scoped: a deadlocked one is left behind, and the test
+        // fails by its name rather than waiting for it.
+        use std::sync::atomic::AtomicU64;
+        let (vm, _vcpu) = vm_with_an_msi_route(26);
+        let vm = Arc::new(vm);
+        let evt = Arc::new(EventFd::new(libc::EFD_NONBLOCK).unwrap());
+        let other = {
+            let [section, space] = vmm_sys_util::eventfd::companions(evt.as_raw_fd()).unwrap();
+            let dup = |fd: RawFd| {
+                let mut out = std::ptr::null_mut();
+                // SAFETY: duplicates a handle of this process into it.
+                let ok = unsafe {
+                    windows_sys::Win32::Foundation::DuplicateHandle(
+                        windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                        wick_os::fd::handle(fd),
+                        windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                        &mut out,
+                        0,
+                        0,
+                        windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+                    )
+                };
+                assert_ne!(ok, 0);
+                wick_os::fd::from_handle(out)
+            };
+            let fd = dup(evt.as_raw_fd());
+            // SAFETY: fresh duplicates of one eventfd's three handles.
+            unsafe { vmm_sys_util::eventfd::adopt(fd, dup(section), dup(space)).unwrap() };
+            // SAFETY: adopted above.
+            unsafe { <EventFd as wick_os::fd::FromRawFd>::from_raw_fd(fd) }
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let rounds = Arc::new(AtomicU64::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..3 {
+            let (evt, stop) = (evt.clone(), stop.clone());
+            threads.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    evt.write(1).unwrap();
+                }
+            }));
+        }
+        let s = stop.clone();
+        threads.push(std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                other.write(1).unwrap();
+            }
+        }));
+        let (v, e, s) = (vm.clone(), evt.clone(), stop.clone());
+        threads.push(std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let _irqfds = v.inner.irqfds.lock().unwrap();
+                let _irqchip = v.inner.irqchip.lock().unwrap();
+                let _vcpus = v.inner.vcpus.lock().unwrap();
+                let _ = e.read();
+                drop((_irqfds, _irqchip, _vcpus));
+                std::thread::yield_now();
+            }
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (v, e, r) = (vm.clone(), evt.clone(), rounds.clone());
+        std::thread::spawn(move || {
+            for _ in 0..2000 {
+                v.register_irqfd(&e, 26).unwrap();
+                v.unregister_irqfd(&e, 26).unwrap();
+                r.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = tx.send(());
+        });
+        let ended = rx.recv_timeout(std::time::Duration::from_secs(60)).is_ok();
+        assert!(
+            ended,
+            "registrations stopped after {} of 2000 rounds: a lock order deadlock",
+            rounds.load(Ordering::Relaxed)
+        );
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
     }
 
     // KVM's collision rule for ioeventfds, which register_ioevent refuses

@@ -104,6 +104,8 @@ fn bytes<T>(v: &T) -> Vec<u8> {
 pub struct Chip {
     chip: irqchip::Irqchip,
     vm: Arc<vm::VmInner>,
+    /// The VM's MSI routes, which the backend keeps beside the controller.
+    msi: irqchip::MsiRoutes,
     routes: Vec<(u32, u64, u32)>,
 }
 
@@ -121,7 +123,7 @@ impl Chip {
         // SAFETY: plain data.
         let config: kvm_pit_config = unsafe { std::mem::zeroed() };
         chip.create_pit(config, &vm);
-        Chip { chip, vm, routes: Vec::new() }
+        Chip { chip, vm, msi: irqchip::MsiRoutes::default(), routes: Vec::new() }
     }
 
     /// Whether the run loop gives an access to `port` to the controller
@@ -156,8 +158,13 @@ impl Chip {
         self.chip.mmio_write(addr, &value.to_le_bytes()[..len])
     }
 
+    /// A GSI raised or lowered as the backend's `VmInner::raise_gsi` does:
+    /// a routed MSI's message on a rising edge, else the I/O APIC pin.
     pub fn raise_gsi(&mut self, gsi: u32, level: bool) -> Option<(u64, u32)> {
-        self.chip.raise_gsi(gsi, level)
+        match self.msi.get(gsi) {
+            Some(msi) => level.then_some(msi),
+            None => self.chip.raise_gsi(gsi, level),
+        }
     }
 
     /// `KVM_SET_GSI_ROUTING` with MSI routes `(gsi, address, data)`.
@@ -175,7 +182,7 @@ impl Chip {
                 e
             })
             .collect();
-        self.chip.set_gsi_routing(&entries);
+        self.msi = irqchip::MsiRoutes::new(&entries);
         self.routes = routes.to_vec();
     }
 
