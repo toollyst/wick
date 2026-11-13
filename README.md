@@ -173,7 +173,8 @@ The short version; the [full roadmap](docs/ROADMAP.md) has the status of every r
   limits, the freezer; Windows: the jail drive and token, Job Object limits, the freezer, the mitigation profile, `--daemonize`; both:
   `--netns` as a directory of network endpoints)
 - [ ] Images everywhere: x86_64 images on Apple silicon (FEX-Emu with hardware TSO), arm64 images on Windows
-- [ ] Desktop devices: user-mode networking, virtio-fs
+- [ ] Desktop devices: user-mode networking, virtio-fs (designed, no code yet: [design](docs/design-fs.md))
+- [ ] GPU: headless Vulkan for a guest (designed, no code yet: [design](docs/design-gpu.md))
 - [ ] Distribution: release binaries, Homebrew, automatic rebase attempts on new upstream tags
 
 ## FAQ

@@ -7,6 +7,8 @@
 | [../SECURITY.md](../SECURITY.md) | Know how each of Firecracker's controls is held on each host, and what is not at parity yet |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Understand the design: the layers, the compatibility crates, the POSIX layer on Windows |
 | [PORTING.md](PORTING.md) | Write or check a host backend: each Linux facility, its macOS backend, the test that proves it, and where Windows stands |
+| [design-fs.md](design-fs.md) | Read the plan for sharing host folders with a guest (virtio-fs): the risks, the fix planned on each host, the tests meant to prove it. No code yet |
+| [design-gpu.md](design-gpu.md) | Read the plan for giving a guest the host's GPU (headless Vulkan): the stages, the risks and what stays open on each host. No code yet |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | Change wick: where code goes, the patch workflow, commits, tests and releases |
 | This page | Find your way around the repository as a contributor |
 
