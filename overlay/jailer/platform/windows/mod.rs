@@ -1935,7 +1935,13 @@ fn job(limits: &Limits) -> Result<OwnedHandle, HostError> {
         return Err(HostError::Spawn("CreateJobObject", last_error()));
     }
     // SAFETY: a handle we own.
-    let job = unsafe { OwnedHandle::from_raw_handle(h) };
+    limit_job(unsafe { OwnedHandle::from_raw_handle(h) }, limits)
+}
+
+/// Gives a job made just now what a jail's job has: the cgroup limits,
+/// kill on close and no UI access. A jail under a parent cgroup has a job
+/// with a name (`parent::Parent::jail_job`), any other the one of [`job`].
+fn limit_job(job: OwnedHandle, limits: &Limits) -> Result<OwnedHandle, HostError> {
     // SAFETY: plain data.
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     let basic = &mut info.BasicLimitInformation;
@@ -2285,13 +2291,16 @@ fn exec(
 
     let tokens = tokens()?;
     // The parent cgroup, if the jail has one: held until the jailer ends,
-    // with its jail, and the jail's limits as its job under it takes them.
+    // with its jail, and the jail's job under it, with the limits as a job
+    // there takes them, a name, and what it was asked for kept beside it.
     let parent = parent::for_jail()?;
-    let limits = match &parent {
-        Some(parent) => parent.limits(&limits)?,
-        None => limits,
+    let (job, _asked) = match &parent {
+        Some(parent) => {
+            let (job, asked) = parent.jail_job(&limits)?;
+            (job, Some(asked))
+        }
+        None => (job(&limits)?, None),
     };
-    let job = job(&limits)?;
     let mut job_freeze = freezer::Job(job.as_raw_handle());
 
     // The standard handles, inheritable, and only them; those that are the

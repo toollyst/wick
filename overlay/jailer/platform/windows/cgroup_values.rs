@@ -251,27 +251,234 @@ pub fn rate_under_parent(version: u8, asked: u32, parent: u32) -> Result<u32, &'
     Ok(u32::try_from(share.clamp(1, 10_000)).unwrap())
 }
 
-/// Why the operator's tool does not change the CPU cap or the processors
-/// of a level that is there already.
-pub const LEVEL_NOT_CHANGED: &str = "not done yet: the CPU cap and the processors of a level are written when \
-    the level is made and not changed while it is there: the levels and jails under it were given theirs as a \
-    share of them, or within them, and would not be given them again (end what holds the parent and make it anew)";
+// ---- A write to a level that is there ----
+//
+// On Linux a write to a cgroup's `cpu.max` or `cpuset.cpus` is taken at any
+// time and the kernel works out again what every cgroup below has
+// (kernel/sched/core.c, `tg_set_cfs_bandwidth` walks the tree with
+// `tg_cfs_schedulable_down`; kernel/cgroup/cpuset.c, `update_cpumasks_hier`).
+// A job under another holds a number worked out once: its rate as a share
+// of the job above, its processors already within those above. So whoever
+// writes a level writes every job below it again, from what each was asked
+// for, which is kept beside each job (`Asked`, in a section named after the
+// job), and finds the jobs below by the names in the namespace: a jail's
+// job under a parent is named `<level>//<id>` there.
 
-/// What the operator's tool writes of a level's CPU cap or processors:
-/// `wanted` when the level was made just now, nothing when it was there
-/// with `now` equal to it, and a refusal otherwise ([`LEVEL_NOT_CHANGED`]).
-/// On Linux such a write is taken at any time and the kernel works the
-/// hierarchy out again (`tg_set_cfs_bandwidth`, `update_cpumasks_hier`);
-/// a job under another holds a number worked out once, here or in the
-/// jailer.
-pub fn level_write<T: PartialEq + Clone>(made: bool, now: &T, wanted: &T) -> Result<Option<T>, &'static str> {
-    if made {
-        Ok(Some(wanted.clone()))
-    } else if now == wanted {
-        Ok(None)
-    } else {
-        Err(LEVEL_NOT_CHANGED)
+/// What a job, a level's or a jail's, was asked for, in Linux's terms: the
+/// CPU rate of the host's processors and the processors, before the levels
+/// above made anything of them, and the cgroup version whose rule applies.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Asked {
+    pub version: u8,
+    pub rate: Option<u32>,
+    pub cpus: Option<Vec<(u16, u64)>>,
+}
+
+/// The size of the section that keeps an [`Asked`].
+pub const ASKED_BYTES: usize = 4096;
+const ASKED_MAGIC: &[u8; 4] = b"WCG1";
+
+impl Asked {
+    /// The bytes kept in the section: a mark, the version, the rate if
+    /// there is one, and the processors by group.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = ASKED_MAGIC.to_vec();
+        out.push(self.version);
+        out.push(u8::from(self.rate.is_some()));
+        out.extend(self.rate.unwrap_or(0).to_le_bytes());
+        let cpus = self.cpus.as_deref().unwrap_or(&[]);
+        out.push(u8::from(self.cpus.is_some()));
+        out.extend(u16::try_from(cpus.len()).unwrap().to_le_bytes());
+        for &(group, mask) in cpus {
+            out.extend(group.to_le_bytes());
+            out.extend(mask.to_le_bytes());
+        }
+        out
     }
+
+    pub fn decode(bytes: &[u8]) -> Result<Asked, &'static str> {
+        const BAD: &str = "what the job was asked for, kept beside it, is not readable";
+        if bytes.len() < 13 || &bytes[..4] != ASKED_MAGIC || !matches!(bytes[4], 1 | 2) {
+            return Err(BAD);
+        }
+        let rate = (bytes[5] != 0).then(|| u32::from_le_bytes(bytes[6..10].try_into().unwrap()));
+        let count = usize::from(u16::from_le_bytes(bytes[11..13].try_into().unwrap()));
+        let groups = bytes.get(13..13 + count * 10).ok_or(BAD)?;
+        let cpus: Vec<(u16, u64)> = groups
+            .chunks_exact(10)
+            .map(|g| (u16::from_le_bytes(g[..2].try_into().unwrap()), u64::from_le_bytes(g[2..].try_into().unwrap())))
+            .collect();
+        Ok(Asked { version: bytes[4], rate, cpus: (bytes[10] != 0).then_some(cpus) })
+    }
+}
+
+/// The name of a jail's job under the parent level whose job is `level`.
+/// No level's name holds `//` ([`parent_job_names`]), and a jail's id is
+/// letters, digits and hyphens (upstream's `validate_instance_id`).
+pub fn jail_job_name(level: &str, id: &str) -> String {
+    format!("{level}//{id}")
+}
+
+/// The name of the section that keeps what the job `job` was asked for.
+pub fn asked_name(job: &str) -> String {
+    if job.contains("//") { format!("{job}#values") } else { format!("{job}//#values") }
+}
+
+/// The name of the mutex that whoever reads the levels to give a job its
+/// values, or writes a level, holds meanwhile.
+pub fn parent_lock_name() -> String {
+    format!("{PARENT_JOB_PREFIX}//lock")
+}
+
+/// What a job holds: the CPU rate as Windows has it (of the host's
+/// processors for a job under none with a cap, a share of the job above
+/// otherwise) and its processors; `None`, none of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Held {
+    pub rate: Option<u32>,
+    pub cpus: Option<Vec<(u16, u64)>>,
+}
+
+/// A job below the level that is written: its name, what it was asked for
+/// and what it holds now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Below {
+    pub name: String,
+    pub asked: Asked,
+    pub now: Held,
+}
+
+/// One write to a job: the level's own is job 0, `below[i]` is job `i + 1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// The CPU rate hard cap; `None` takes it off.
+    Rate(usize, Option<u32>),
+    Cpus(usize, Vec<(u16, u64)>),
+}
+
+/// The name of the job above `name`: a jail's level, or the level above.
+fn above_of(name: &str) -> Option<&str> {
+    name.rsplit_once("//").or_else(|| name.rsplit_once('/')).map(|(above, _)| above)
+}
+
+fn cpus_union(a: &[(u16, u64)], b: &[(u16, u64)]) -> Vec<(u16, u64)> {
+    let mut out = a.to_vec();
+    for &(group, mask) in b {
+        match out.iter_mut().find(|(g, _)| *g == group) {
+            Some((_, m)) => *m |= mask,
+            None => out.push((group, mask)),
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// The writes that give the level `name` what it is now asked for and every
+/// job below it what Linux would give it then, in an order in which no job
+/// has, at any moment, more than Linux gave it before or gives it after.
+/// `above`: what the levels above come to (`rate_of_levels`,
+/// `cpus_of_levels`). `now`: what the level's job holds.
+///
+/// What each job is to hold is worked out from the top down, each against
+/// what the jobs above it come to, by the rule of its own cgroup version
+/// ([`rate_under_parent`], [`cpus_under_parent`]). Where cgroup v1 refuses
+/// a job below (a quota above the new one: `tg_cfs_schedulable_down`,
+/// `-EINVAL`; processors outside the new ones: `validate_change_legacy`,
+/// "Each of our child cpusets must be a subset of us", `-EBUSY`), Linux
+/// fails the write to the level, and so does this.
+///
+/// The order, derived. A job's rate is a share of the job above's, so what
+/// it gets is the product of the shares down to it; and Windows keeps, or
+/// may keep, a job's processors within the job above's.
+///
+/// 1. Every job, the top first, is written the lower of the share it holds
+///    and the share it is to hold. Each write lowers one factor of some
+///    products and raises none: every job has at most what it had.
+/// 2. Every job is written the share it is to hold. Each write raises one
+///    factor to its final value, and every factor is at or below its final
+///    value: every job has at most what it is to have.
+///
+/// For the processors, a set cannot go through "the lower of the two" (two
+/// sets may have nothing in common), so:
+///
+/// 1. every job, the top first, is written the processors it holds and
+///    those it is to hold together: each stays within the job above, which
+///    was widened before it;
+/// 2. every job, the lowest first, is written those it is to hold: each
+///    stays within the job above, which still has both.
+///
+/// A set that only narrows, or only widens, is never wider than Linux gave
+/// before or gives after; one that moves has both for the time between the
+/// two passes, and never a processor that is in neither.
+pub fn rewrite(above: &Held, name: &str, asked: &Asked, now: &Held, below: &[Below]) -> Result<(Vec<Step>, Vec<Held>), String> {
+    // The jobs, the level first, each after the job above it.
+    let mut jobs: Vec<(&str, &Asked, &Held)> = vec![(name, asked, now)];
+    jobs.extend(below.iter().map(|b| (b.name.as_str(), &b.asked, &b.now)));
+    let mut order: Vec<usize> = (0..jobs.len()).collect();
+    order.sort_by_key(|&i| (jobs[i].0.len(), i));
+    if order[0] != 0 {
+        return Err(format!("{}: not a job below {name}", jobs[order[0]].0));
+    }
+    // What each job is to hold, and what it then comes to with those above.
+    let mut held: Vec<Held> = vec![Held::default(); jobs.len()];
+    let mut comes_to: Vec<Held> = vec![Held::default(); jobs.len()];
+    for &i in &order {
+        let (job, asked, _) = jobs[i];
+        let up = if i == 0 {
+            above.clone()
+        } else {
+            let parent = above_of(job).and_then(|p| jobs.iter().position(|(n, ..)| *n == p));
+            let parent = parent.ok_or_else(|| format!("{job}: the job above it is not among those below {name}"))?;
+            comes_to[parent].clone()
+        };
+        let refused = |why: &str| {
+            if i == 0 { format!("{job}: {why}") } else { format!("{job}, below {name}: {why} (Linux fails the write to the level above)") }
+        };
+        held[i].rate = match (asked.rate, up.rate) {
+            (None, _) => None,
+            (Some(rate), None) => Some(rate),
+            (Some(rate), Some(up)) => Some(rate_under_parent(asked.version, rate, up).map_err(&refused)?),
+        };
+        held[i].cpus = match (&asked.cpus, &up.cpus) {
+            (None, _) => None,
+            (Some(cpus), None) => Some(cpus.clone()),
+            (Some(cpus), Some(up)) => Some(cpus_under_parent(asked.version, cpus, up).map_err(&refused)?),
+        };
+        comes_to[i] = Held { rate: rate_of_levels(&[up.rate, held[i].rate]), cpus: held[i].cpus.clone().or(up.cpus) };
+    }
+    // What each job holds as the writes go.
+    let same = |a: &Option<Vec<(u16, u64)>>, b: &Option<Vec<(u16, u64)>>| a.as_ref().map(|c| cpus_union(c, &[])) == b.as_ref().map(|c| cpus_union(c, &[]));
+    let mut steps = Vec::new();
+    let mut has: Vec<Held> = jobs.iter().map(|(_, _, now)| (*now).clone()).collect();
+    for &i in &order {
+        // The lower of the two shares; no cap at all is the highest, and a
+        // cap that is to be taken off stays until the second pass.
+        let lower = match (has[i].rate, held[i].rate) {
+            (Some(now), Some(to)) => Some(now.min(to)),
+            (now, to) => now.or(to),
+        };
+        if lower != has[i].rate {
+            steps.push(Step::Rate(i, lower));
+            has[i].rate = lower;
+        }
+        if let (Some(now), Some(to)) = (&has[i].cpus, &held[i].cpus) {
+            let both = Some(cpus_union(now, to));
+            if !same(&both, &has[i].cpus) {
+                steps.push(Step::Cpus(i, both.clone().unwrap()));
+                has[i].cpus = both;
+            }
+        }
+    }
+    for &i in order.iter().rev() {
+        if has[i].rate != held[i].rate {
+            steps.push(Step::Rate(i, held[i].rate));
+        }
+        match &held[i].cpus {
+            Some(to) if !same(&has[i].cpus, &held[i].cpus) => steps.push(Step::Cpus(i, to.clone())),
+            _ => {}
+        }
+    }
+    Ok((steps, held))
 }
 
 /// The lowest integrity level a parent's job may carry: medium
@@ -392,12 +599,183 @@ mod tests {
     }
 
     #[test]
-    fn test_a_levels_cap_and_processors_are_written_once() {
-        assert_eq!(level_write(true, &None, &Some(5000u32)), Ok(Some(Some(5000))));
-        assert_eq!(level_write(false, &Some(5000u32), &Some(5000)), Ok(None));
-        assert_eq!(level_write(false, &Some(5000u32), &Some(2500)), Err(LEVEL_NOT_CHANGED));
-        assert_eq!(level_write(false, &None, &Some(2500u32)), Err(LEVEL_NOT_CHANGED));
-        assert_eq!(level_write(false, &Some(2500u32), &None), Err(LEVEL_NOT_CHANGED));
+    fn test_what_a_job_was_asked_for_is_kept_whole() {
+        for asked in [
+            Asked { version: 2, rate: None, cpus: None },
+            Asked { version: 1, rate: Some(2500), cpus: Some(vec![(0, 0b1010), (3, u64::MAX)]) },
+            Asked { version: 2, rate: Some(10_000), cpus: Some(vec![]) },
+        ] {
+            let mut section = asked.encode();
+            section.resize(ASKED_BYTES, 0);
+            assert_eq!(Asked::decode(&section).unwrap(), asked);
+        }
+        // A section nobody wrote does not read as asked for nothing.
+        Asked::decode(&[0; ASKED_BYTES]).unwrap_err();
+        Asked::decode(b"WCG1").unwrap_err();
+        let p = PARENT_JOB_PREFIX;
+        assert_eq!(jail_job_name(&format!("{p}a/b"), "vm-1"), format!("{p}a/b//vm-1"));
+        assert_eq!(asked_name(&format!("{p}a/b")), format!("{p}a/b//#values"));
+        assert_eq!(asked_name(&format!("{p}a/b//vm-1")), format!("{p}a/b//vm-1#values"));
+        assert_eq!(parent_lock_name(), format!("{p}//lock"));
+        assert_eq!(above_of("a/b//vm-1"), Some("a/b"));
+        assert_eq!(above_of("a/b"), Some("a"));
+        assert_eq!(above_of("a"), None);
+    }
+
+    // What Linux gives a cgroup, from what each on the path was asked for
+    // (cgroup v2): the lowest quota, and the processors in common with
+    // those above, or those above's.
+    fn linux(above: &Held, name: &str, asked: &Asked, below: &[Below]) -> Vec<Held> {
+        let mut names = vec![(name, asked)];
+        names.extend(below.iter().map(|b| (b.name.as_str(), &b.asked)));
+        names
+            .iter()
+            .map(|(job, _)| {
+                let mut has = above.clone();
+                for (other, asked) in &names {
+                    if *job == *other || job.starts_with(&format!("{other}/")) {
+                        has.rate = match (has.rate, asked.rate) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        };
+                        has.cpus = match (&has.cpus, &asked.cpus) {
+                            (Some(up), Some(cpus)) => Some(cpus_under_parent(2, cpus, up).unwrap()),
+                            (up, cpus) => cpus.clone().or_else(|| up.clone()),
+                        };
+                    }
+                }
+                has
+            })
+            .collect()
+    }
+
+    // What every job has while the jobs hold `held`: the product of the
+    // shares down to it, and its processors within those above.
+    fn windows(above: &Held, names: &[&str], held: &[Held]) -> Vec<Held> {
+        names
+            .iter()
+            .map(|job| {
+                let mut has = above.clone();
+                let mut path: Vec<usize> = (0..names.len()).filter(|&i| *job == names[i] || job.starts_with(&format!("{}/", names[i]))).collect();
+                path.sort_by_key(|&i| names[i].len());
+                for i in path {
+                    has.rate = rate_of_levels(&[has.rate, held[i].rate]);
+                    if let Some(cpus) = &held[i].cpus {
+                        if let Some(up) = &has.cpus {
+                            assert_eq!(cpus_under_parent(1, cpus, up).as_deref(), Ok(cpus.as_slice()), "{job}: {cpus:x?} is not within the job above's {up:x?}");
+                        }
+                        has.cpus = Some(cpus.clone());
+                    }
+                }
+                has
+            })
+            .collect()
+    }
+
+    fn within(cpus: &Option<Vec<(u16, u64)>>, a: &Option<Vec<(u16, u64)>>, b: &Option<Vec<(u16, u64)>>) -> bool {
+        match (cpus, a, b) {
+            (Some(cpus), Some(a), Some(b)) => cpus_under_parent(1, cpus, &cpus_union(a, b)).is_ok(),
+            (None, Some(_), Some(_)) => false,
+            _ => true,
+        }
+    }
+
+    // The order of the writes: at every write no job has more CPU than
+    // Linux gave it before or gives it after (a share is rounded down, so
+    // within a hundredth of a percent), nor a processor Linux gave it
+    // neither before nor after, nor processors outside the job above's;
+    // and when the writes are done every job has what Linux gives it.
+    #[test]
+    fn test_a_write_to_a_level_reaches_every_job_below_in_a_safe_order() {
+        let job = |name: &str, rate, cpus: Option<u64>| Below {
+            name: name.to_string(),
+            asked: Asked { version: 2, rate, cpus: cpus.map(|mask| vec![(0, mask)]) },
+            now: Held::default(),
+        };
+        // A level `t` with a level, jails under both, and a level of three.
+        let below = [
+            job("t//vm-1", Some(2000), Some(0b0011)),
+            job("t//vm-2", None, None),
+            job("t/a", Some(4000), Some(0b0110)),
+            job("t/a//vm-3", Some(1000), Some(0b0100)),
+            job("t/a//vm-4", Some(9000), None),
+            job("t/a/b", None, Some(0b1100)),
+            job("t/a/b//vm-5", Some(3000), Some(0b1000)),
+        ];
+        let names: Vec<&str> = std::iter::once("t").chain(below.iter().map(|b| b.name.as_str())).collect();
+        let level = |rate, cpus: Option<u64>| Asked { version: 2, rate, cpus: cpus.map(|mask| vec![(0, mask)]) };
+        let settings = [
+            level(Some(5000), Some(0b1111)),
+            level(Some(2500), Some(0b0110)),
+            level(Some(8000), Some(0b1001)),
+            level(None, Some(0b1111)),
+            level(Some(100), Some(0b0001)),
+            level(Some(10_000), Some(0b1110)),
+            level(Some(3000), Some(0b1111)),
+        ];
+        for above in [Held::default(), Held { rate: Some(6000), cpus: Some(vec![(0, 0b0111)]) }] {
+            // Made with the first setting, then written each other one.
+            let mut asked = settings[0].clone();
+            let (_, mut held) = rewrite(&above, "t", &asked, &Held::default(), &below).unwrap();
+            for to in &settings {
+                let before = linux(&above, "t", &asked, &below);
+                let after = linux(&above, "t", to, &below);
+                let now: Vec<Below> = below.iter().zip(&held[1..]).map(|(b, now)| Below { now: now.clone(), ..b.clone() }).collect();
+                let (steps, last) = rewrite(&above, "t", to, &held[0], &now).unwrap();
+                for step in &steps {
+                    match step.clone() {
+                        Step::Rate(i, rate) => held[i].rate = rate,
+                        Step::Cpus(i, cpus) => held[i].cpus = Some(cpus),
+                    }
+                    for (i, has) in windows(&above, &names, &held).iter().enumerate() {
+                        let most = match (before[i].rate, after[i].rate) {
+                            (Some(a), Some(b)) => a.max(b),
+                            _ => 10_000,
+                        };
+                        assert!(has.rate.unwrap_or(10_000) <= most.max(1), "{}: {has:?} above {most} at {step:?}, to {to:?}", names[i]);
+                        assert!(within(&has.cpus, &before[i].cpus, &after[i].cpus), "{}: {has:?} at {step:?}, to {to:?}", names[i]);
+                    }
+                }
+                assert_eq!(held, last, "to {to:?}");
+                for (i, has) in windows(&above, &names, &held).iter().enumerate() {
+                    assert_eq!(has.cpus, after[i].cpus, "{}: to {to:?}", names[i]);
+                    match (has.rate, after[i].rate) {
+                        (Some(has), Some(linux)) => assert!(has <= linux.max(1) && has + 4 >= linux, "{}: {has} for {linux}, to {to:?}", names[i]),
+                        (has, linux) => assert_eq!(has, linux, "{}: to {to:?}", names[i]),
+                    }
+                }
+                // The same setting again writes nothing.
+                let again: Vec<Below> = below.iter().zip(&held[1..]).map(|(b, now)| Below { now: now.clone(), ..b.clone() }).collect();
+                assert_eq!(rewrite(&above, "t", to, &held[0], &again).unwrap().0, []);
+                asked = to.clone();
+            }
+        }
+    }
+
+    // cgroup v1: a write to a level that a job below could not follow is
+    // refused, as Linux fails it, and names the job; a job among those
+    // below whose level is not there is refused too.
+    #[test]
+    fn test_a_write_to_a_level_is_refused_as_linux_fails_it() {
+        let v1 = |name: &str, rate, mask| Below {
+            name: name.to_string(),
+            asked: Asked { version: 1, rate, cpus: Some(vec![(0, mask)]) },
+            now: Held::default(),
+        };
+        let below = [v1("t//vm-1", Some(4000), 0b0011)];
+        let level = |rate, mask| Asked { version: 1, rate, cpus: Some(vec![(0, mask)]) };
+        rewrite(&Held::default(), "t", &level(Some(5000), 0b0111), &Held::default(), &below).unwrap();
+        let quota = rewrite(&Held::default(), "t", &level(Some(3000), 0b0111), &Held::default(), &below).unwrap_err();
+        assert!(quota.starts_with("t//vm-1, below t: ") && quota.contains(RATE_ABOVE_PARENT), "{quota}");
+        let cpus = rewrite(&Held::default(), "t", &level(Some(5000), 0b0001), &Held::default(), &below).unwrap_err();
+        assert!(cpus.starts_with("t//vm-1, below t: ") && cpus.contains(CPUS_OUTSIDE_PARENT), "{cpus}");
+        // The level's own write against the levels above it.
+        let above = Held { rate: Some(2000), cpus: None };
+        let own = rewrite(&above, "t", &level(Some(5000), 0b0111), &Held::default(), &[]).unwrap_err();
+        assert!(own.starts_with("t: ") && own.contains(RATE_ABOVE_PARENT), "{own}");
+        let orphan = [v1("t/a//vm-1", None, 0b1)];
+        let lost = rewrite(&Held::default(), "t", &level(None, 0b1), &Held::default(), &orphan).unwrap_err();
+        assert!(lost.contains("the job above it is not among those below t"), "{lost}");
     }
 
     #[test]

@@ -40,12 +40,22 @@
 //! lives, so ending the tool takes nothing from running jails or from jails
 //! started while one still runs; once the tool and the last jail are gone
 //! the parent is gone, and a jail that names it then makes a new one without
-//! limits. Run again, it changes the memory limit of the parent that is
-//! there. The CPU cap and the processors of a level are written when the
-//! level is made and not changed while it is there (refused, with the
-//! reason; the same values again are accepted): a job under another holds
-//! its rate as a share of that one's, worked out once, where Linux works
-//! the hierarchy out again at every write.
+//! limits. Run again, it changes the limits of the level that is there, as a
+//! write to a cgroup's file does at any time. A job under another holds its
+//! CPU rate as a share of that one's and its processors within that one's,
+//! worked out once, where Linux works the hierarchy out again at every
+//! write; so a write to a level's CPU cap or processors writes every job
+//! below it again, levels and jails, from what each was asked for, which is
+//! kept beside each job (`cgroup_values::rewrite`, where the order of the
+//! writes is derived: no job has at any moment more CPU than Linux gave it
+//! before or gives it after, nor a processor Linux gave it neither before
+//! nor after). The jobs below are those the namespace lists
+//! (`NtQueryDirectoryObject`, which Microsoft documents as subject to
+//! change: Microsoft Learn, "NtQueryDirectoryObject function"); if they
+//! cannot be listed, or one cannot be opened, or what it was asked for is
+//! not beside it, nothing is written and the tool says which. Where cgroup
+//! v1 fails such a write on Linux (a jail below asked for more than the new
+//! quota, or for processors outside the new ones), the tool fails it too.
 //!
 //! Run as the account the jailers run as, at medium integrity or above: the
 //! namespace's boundary is that account's SID, the namespace and the job
@@ -64,8 +74,9 @@ use std::ffi::c_void;
 use std::io::Read;
 
 use cgroup_values::{
-    DEFAULT_PERIOD_US, PARENT_JOB_PREFIX, PARENT_NAMESPACE, cpu_groups, cpu_rate, cpus_of_levels, cpus_under_parent, level_write, parent_job_names,
-    parent_namespace_sddl, parse_list, rate_of_levels, rate_under_parent, strstrip, trusted_parent,
+    DEFAULT_PERIOD_US, PARENT_JOB_PREFIX, PARENT_NAMESPACE, cpu_groups, cpu_rate, cpus_of_levels, parent_job_names,
+    parent_namespace_sddl, parse_list, rate_of_levels, rewrite, strstrip, trusted_parent, ASKED_BYTES, Asked, Below, Held, Step,
+    asked_name, parent_lock_name,
 };
 
 type HANDLE = *mut c_void;
@@ -172,6 +183,16 @@ extern "system" {
     fn OpenPrivateNamespaceW(boundary: *const c_void, alias: *const u16) -> HANDLE;
     fn GetActiveProcessorCount(group: u16) -> u32;
     fn Sleep(milliseconds: u32);
+    fn CreateMutexW(attributes: *const SECURITY_ATTRIBUTES, owned: i32, name: *const u16) -> HANDLE;
+    fn WaitForSingleObject(handle: HANDLE, milliseconds: u32) -> u32;
+    fn ReleaseMutex(mutex: HANDLE) -> i32;
+    fn CreateFileMappingW(file: HANDLE, attributes: *const SECURITY_ATTRIBUTES, protect: u32, high: u32, low: u32, name: *const u16) -> HANDLE;
+    fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> HANDLE;
+    fn MapViewOfFile(section: HANDLE, access: u32, high: u32, low: u32, bytes: usize) -> *mut c_void;
+    fn UnmapViewOfFile(address: *const c_void) -> i32;
+    fn OpenJobObjectW(access: u32, inherit: i32, name: *const u16) -> HANDLE;
+    fn GetModuleHandleW(name: *const u16) -> HANDLE;
+    fn GetProcAddress(module: HANDLE, name: *const u8) -> *const c_void;
 }
 
 #[link(name = "advapi32")]
@@ -299,7 +320,7 @@ fn set<T>(job: HANDLE, class: i32, info: &T, len: usize, what: &str) -> Result<(
 
 /// The limits the command line names, as a job takes them.
 #[derive(Default, Debug, PartialEq)]
-struct Asked {
+struct Wanted {
     /// `Some(None)`: no limit, written as such.
     memory: Option<Option<usize>>,
     quota: Option<Option<u64>>,
@@ -307,8 +328,8 @@ struct Asked {
     cpus: Option<Vec<u32>>,
 }
 
-fn parse(version: u8, cgroups: &[String]) -> Result<Asked, String> {
-    let mut asked = Asked::default();
+fn parse(version: u8, cgroups: &[String]) -> Result<Wanted, String> {
+    let mut asked = Wanted::default();
     for cg in cgroups {
         let (file, value) = cg.split_once('=').ok_or_else(|| format!("--cgroup {cg}: expected <file>=<value>"))?;
         let bad = |why: &str| format!("--cgroup {cg}: {why}");
@@ -470,24 +491,221 @@ fn level(job_name: &str, user: &str) -> Result<(HANDLE, bool), String> {
     Ok((job, !existed))
 }
 
-/// Makes or opens every level of `name` and writes the limits to the last.
-/// The handles, which hold the levels while this process runs.
+/// `JOB_OBJECT_SET_ATTRIBUTES | JOB_OBJECT_QUERY | READ_CONTROL`: what
+/// writing a job below a level again needs of it.
+const JOB_WRITE: u32 = 0x2 | 0x4 | 0x0002_0000;
+const PAGE_READWRITE: u32 = 4;
+const FILE_MAP_ALL: u32 = 0x2 | 0x4;
+const STATUS_NO_MORE_ENTRIES: u32 = 0x8000_001A;
+
+/// Security attributes for an object of the namespace, for one call.
+fn with_security<T>(user: &str, call: impl FnOnce(&SECURITY_ATTRIBUTES) -> T) -> Result<T, String> {
+    let sddl = wide(&parent_namespace_sddl(user));
+    let mut sd = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated string and an out-pointer; freed below.
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut()) == 0 {
+            return Err(format!("the security descriptor: {}", last()));
+        }
+        let result = call(&SECURITY_ATTRIBUTES { nLength: 24, lpSecurityDescriptor: sd, bInheritHandle: 0 });
+        LocalFree(sd);
+        Ok(result)
+    }
+}
+
+/// The namespace's mutex, held: the jailers take it to read the levels and
+/// make a jail's job, this tool to write a level and the jobs below it.
+struct Lock(HANDLE);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // SAFETY: the mutex this thread holds, and its handle.
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+fn lock(user: &str) -> Result<Lock, String> {
+    let name = wide(&parent_lock_name());
+    // SAFETY: the attributes of the call and a NUL-terminated name. A
+    // holder that died gives the mutex up (WAIT_ABANDONED).
+    let mutex = with_security(user, |attributes| unsafe { CreateMutexW(attributes, 0, name.as_ptr()) })?;
+    if mutex.is_null() {
+        return Err(format!("the parent cgroups' mutex: {}", last()));
+    }
+    // SAFETY: the handle made above.
+    unsafe { WaitForSingleObject(mutex, u32::MAX) };
+    Ok(Lock(mutex))
+}
+
+/// The section beside the job `job_name`, which keeps what the job was
+/// asked for: made, or opened.
+fn asked_section(job_name: &str, user: &str, make: bool) -> Result<HANDLE, String> {
+    let name = wide(&asked_name(job_name));
+    // SAFETY: the attributes of the call and a NUL-terminated name; a
+    // section of the paging file (no file).
+    let section = if make {
+        with_security(user, |attributes| unsafe {
+            CreateFileMappingW(usize::MAX as HANDLE, attributes, PAGE_READWRITE, 0, ASKED_BYTES as u32, name.as_ptr())
+        })?
+    } else {
+        unsafe { OpenFileMappingW(FILE_MAP_ALL, 0, name.as_ptr()) }
+    };
+    if section.is_null() {
+        return Err(format!("what the job {job_name} was asked for, kept beside it, could not be {}: {}", if make { "made" } else { "opened" }, last()));
+    }
+    Ok(section)
+}
+
+fn read_asked(section: HANDLE, job_name: &str) -> Result<Asked, String> {
+    let mut bytes = vec![0u8; ASKED_BYTES];
+    // SAFETY: a view of the whole section, copied and unmapped.
+    unsafe {
+        let view = MapViewOfFile(section, FILE_MAP_ALL, 0, 0, ASKED_BYTES);
+        if view.is_null() {
+            return Err(format!("reading what the job {job_name} was asked for: {}", last()));
+        }
+        std::ptr::copy_nonoverlapping(view.cast::<u8>(), bytes.as_mut_ptr(), ASKED_BYTES);
+        UnmapViewOfFile(view);
+    }
+    Asked::decode(&bytes).map_err(|why| format!("{job_name}: {why}"))
+}
+
+fn write_asked(section: HANDLE, asked: &Asked, job_name: &str) -> Result<(), String> {
+    let bytes = asked.encode();
+    // SAFETY: a view of the whole section, longer than the bytes, unmapped.
+    unsafe {
+        let view = MapViewOfFile(section, FILE_MAP_ALL, 0, 0, ASKED_BYTES);
+        if view.is_null() {
+            return Err(format!("writing what the job {job_name} was asked for: {}", last()));
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), view.cast::<u8>(), bytes.len());
+        UnmapViewOfFile(view);
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct UNICODE_STRING {
+    Length: u16,
+    MaximumLength: u16,
+    Buffer: *const u16,
+}
+
+/// `OBJECT_DIRECTORY_INFORMATION` (Microsoft Learn, "NtQueryDirectoryObject
+/// function").
+#[repr(C)]
+struct DIRECTORY_ENTRY {
+    Name: UNICODE_STRING,
+    TypeName: UNICODE_STRING,
+}
+
+const _: () = assert!(std::mem::size_of::<DIRECTORY_ENTRY>() == 32);
+
+/// The names, as the namespace has them, of the jobs below the level
+/// `path`: the levels under it and the jails under it and them. The
+/// namespace is a directory of the object manager, and its handle lists it,
+/// one entry a call ("This function has no associated import library or
+/// header file; you must call it using the LoadLibrary and GetProcAddress
+/// functions": Microsoft Learn). A status that is not success ends in an
+/// error, never in a shorter list.
+fn jobs_below(namespace: HANDLE, path: &str) -> Result<Vec<String>, String> {
+    type Query = unsafe extern "system" fn(HANDLE, *mut c_void, u32, u8, u8, *mut u32, *mut u32) -> i32;
+    let under = format!("{path}/");
+    let mut names = Vec::new();
+    // SAFETY: ntdll is in every process; the function is called as
+    // Microsoft declares it, with a buffer of the size passed, which the
+    // entry and its strings are in.
+    unsafe {
+        let function = GetProcAddress(GetModuleHandleW(wide("ntdll.dll").as_ptr()), b"NtQueryDirectoryObject\0".as_ptr());
+        if function.is_null() {
+            return Err("this Windows has no NtQueryDirectoryObject: the jobs below a level cannot be listed".to_string());
+        }
+        let query: Query = std::mem::transmute(function);
+        let mut buffer = [0u64; 1024];
+        let (mut context, mut restart) = (0u32, 1u8);
+        loop {
+            let status = query(namespace, buffer.as_mut_ptr().cast(), 8192, 1, restart, &mut context, std::ptr::null_mut());
+            restart = 0;
+            if status as u32 == STATUS_NO_MORE_ENTRIES {
+                break;
+            }
+            if status < 0 {
+                return Err(format!(
+                    "the jobs below {path} could not be listed (NtQueryDirectoryObject: status {:#x}): nothing was written",
+                    status as u32
+                ));
+            }
+            let entry = &*buffer.as_ptr().cast::<DIRECTORY_ENTRY>();
+            let text = |s: &UNICODE_STRING| String::from_utf16_lossy(std::slice::from_raw_parts(s.Buffer, usize::from(s.Length) / 2));
+            let name = text(&entry.Name);
+            if text(&entry.TypeName) == "Job" && name.starts_with(&under) {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// What a job holds, read from it: its hard cap, and its processors if it
+/// was asked for any (a job that was not has those of the job above).
+fn holds(job: HANDLE, asked: &Asked) -> Result<Held, String> {
+    Ok(Held { rate: hard_cap(job)?, cpus: if asked.cpus.is_some() { processors(job)? } else { None } })
+}
+
+fn set_rate(job: HANDLE, rate: Option<u32>) -> Result<(), String> {
+    let cpu = match rate {
+        Some(rate) => CPU_RATE { ControlFlags: RATE_ENABLE | RATE_HARD_CAP, CpuRate: rate },
+        None => CPU_RATE::default(),
+    };
+    set(job, CPU_RATE_CONTROL, &cpu, std::mem::size_of::<CPU_RATE>(), "the CPU rate")
+}
+
+fn set_cpus(job: HANDLE, groups: &[(u16, u64)]) -> Result<(), String> {
+    if let [(0, mask)] = groups {
+        let mut info: EXTENDED = query(job, EXTENDED_LIMIT, "the job's limits")?;
+        info.Basic.LimitFlags |= LIMIT_AFFINITY;
+        info.Basic.Affinity = *mask as usize;
+        return set(job, EXTENDED_LIMIT, &info, std::mem::size_of::<EXTENDED>(), "the processors");
+    }
+    let list: Vec<GROUP_AFFINITY> = groups.iter().map(|&(group, mask)| GROUP_AFFINITY { Mask: mask as usize, Group: group, Reserved: [0; 3] }).collect();
+    if list.is_empty() {
+        return Err("no processors".to_string());
+    }
+    set(job, GROUP_INFORMATION_EX, &list[0], std::mem::size_of_val(list.as_slice()), "the processors")
+}
+
+/// Makes or opens every level of `name` and writes the limits to the last,
+/// and with them every job below it (the module's description). The
+/// handles, which hold the namespace, the levels and what they were asked
+/// for while this process runs.
 fn run(name: &str, version: u8, cgroups: &[String]) -> Result<Vec<HANDLE>, String> {
     let names = parent_job_names(name).map_err(|why| format!("--name {name}: {why}"))?;
-    let asked = parse(version, cgroups)?;
+    let wanted = parse(version, cgroups)?;
     let user = token_sid(TOKEN_USER_CLASS)?;
-    // First of what is held: the namespace the jobs are named in.
-    let mut jobs = vec![enter_namespace(&user)?];
-    let namespace = jobs.len();
-    let mut made = false;
+    let namespace = enter_namespace(&user)?;
+    let _lock = lock(&user)?;
+    let mut kept = vec![namespace];
+    let mut jobs = Vec::new();
+    let (mut made, mut section) = (false, std::ptr::null_mut());
     for job_name in &names {
         let (job, new) = level(job_name, &user)?;
+        section = asked_section(job_name, &user, new)?;
+        if new {
+            // Asked for nothing yet, as a directory Linux makes has no limit.
+            write_asked(section, &Asked { version, rate: None, cpus: None }, job_name)?;
+        }
         jobs.push(job);
+        kept.extend([job, section]);
         made = new;
     }
-    let (job, above) = (jobs[jobs.len() - 1], &jobs[namespace..jobs.len() - 1]);
+    let (job, above) = (jobs[jobs.len() - 1], &jobs[..jobs.len() - 1]);
+    let job_name = &names[names.len() - 1];
+    let path = job_name.strip_prefix(PARENT_JOB_PREFIX).unwrap_or(job_name);
 
-    if let Some(memory) = asked.memory {
+    if let Some(memory) = wanted.memory {
         let mut info: EXTENDED = query(job, EXTENDED_LIMIT, "the job's limits")?;
         match memory {
             Some(bytes) => {
@@ -499,63 +717,91 @@ fn run(name: &str, version: u8, cgroups: &[String]) -> Result<Vec<HANDLE>, Strin
         set(job, EXTENDED_LIMIT, &info, std::mem::size_of::<EXTENDED>(), "the memory limit")?;
         println!("jail-parent: {name}: memory limit {memory:?} bytes (commit, of all its jails together)");
     }
-    if let Some(quota) = asked.quota {
-        let caps = above.iter().map(|&job| hard_cap(job)).collect::<Result<Vec<_>, _>>()?;
-        let of_above = rate_of_levels(&caps);
-        let wanted = match quota {
-            None => None,
-            Some(quota) => {
-                // SAFETY: plain queries.
-                let cpus = u64::from(unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) });
-                let host = cpu_rate(quota, asked.period.unwrap_or(DEFAULT_PERIOD_US), cpus).map_err(|why| format!("the CPU quota: {why}"))?;
-                Some(match of_above {
-                    Some(parent) => rate_under_parent(version, host, parent).map_err(|why| format!("--name {name}: {why}"))?,
-                    None => host,
-                })
-            }
-        };
-        let write = level_write(made, &hard_cap(job)?, &wanted).map_err(|why| format!("--name {name}: the CPU cap: {why}"))?;
-        if let Some(Some(rate)) = write {
-            let cpu = CPU_RATE { ControlFlags: RATE_ENABLE | RATE_HARD_CAP, CpuRate: rate };
-            set(job, CPU_RATE_CONTROL, &cpu, std::mem::size_of::<CPU_RATE>(), "the CPU rate")?;
-        }
-        match (wanted, of_above) {
-            (None, _) => println!("jail-parent: {name}: no CPU cap of its own"),
-            (Some(rate), None) => println!("jail-parent: {name}: CPU rate {rate} of 10000 of the host's processors"),
-            (Some(rate), Some(parent)) => println!(
-                "jail-parent: {name}: CPU rate {rate} of 10000 of what the levels above have, which is {parent} of 10000 of the \
-                 host's processors"
-            ),
-        }
-    } else if asked.period.is_some() {
+    if wanted.quota.is_none() && wanted.period.is_some() {
         return Err("a CPU period without a quota".to_string());
     }
-    if let Some(cpus) = &asked.cpus {
+    if wanted.quota.is_none() && wanted.cpus.is_none() {
+        return Ok(kept);
+    }
+
+    // What the level is asked for now: what it was, with what is named.
+    let was = read_asked(section, job_name)?;
+    let mut asked = Asked { version, rate: was.rate, cpus: was.cpus.clone() };
+    if let Some(quota) = wanted.quota {
+        asked.rate = match quota {
+            None => None,
+            Some(quota) => {
+                // SAFETY: a plain query.
+                let cpus = u64::from(unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) });
+                Some(cpu_rate(quota, wanted.period.unwrap_or(DEFAULT_PERIOD_US), cpus).map_err(|why| format!("the CPU quota: {why}"))?)
+            }
+        };
+    }
+    if let Some(cpus) = &wanted.cpus {
         // SAFETY: plain queries.
         let sizes: Vec<u32> = unsafe { (0..GetActiveProcessorGroupCount()).map(|g| GetActiveProcessorCount(g)).collect() };
         let mut groups = cpu_groups(cpus, &sizes).map_err(|why| format!("cpuset.cpus: {why}"))?;
-        let levels = above.iter().map(|&job| processors(job)).collect::<Result<Vec<_>, _>>()?;
-        if let Some(parent) = cpus_of_levels(&levels) {
-            groups = cpus_under_parent(version, &groups, &parent).map_err(|why| format!("--name {name}: cpuset.cpus: {why}"))?;
-        }
         groups.sort_unstable();
-        let now = processors(job)?.unwrap_or_default();
-        let write = level_write(made, &now, &groups).map_err(|why| format!("--name {name}: cpuset.cpus: {why}"))?;
-        if write.is_some() {
-            if let [(0, mask)] = groups.as_slice() {
-                let mut info: EXTENDED = query(job, EXTENDED_LIMIT, "the job's limits")?;
-                info.Basic.LimitFlags |= LIMIT_AFFINITY;
-                info.Basic.Affinity = *mask as usize;
-                set(job, EXTENDED_LIMIT, &info, std::mem::size_of::<EXTENDED>(), "the processors")?;
-            } else {
-                let list: Vec<GROUP_AFFINITY> =
-                    groups.iter().map(|&(group, mask)| GROUP_AFFINITY { Mask: mask as usize, Group: group, Reserved: [0; 3] }).collect();
-                set(job, GROUP_INFORMATION_EX, &list[0], std::mem::size_of_val(list.as_slice()), "the processors")?;
-            }
-        }
-        println!("jail-parent: {name}: processors {groups:x?} (group, mask)");
+        asked.cpus = Some(groups);
     }
-    Ok(jobs)
+    // What the levels above come to, and the jobs below with what each was
+    // asked for and holds.
+    let caps = above.iter().map(|&job| hard_cap(job)).collect::<Result<Vec<_>, _>>()?;
+    let sets = above.iter().map(|&job| processors(job)).collect::<Result<Vec<_>, _>>()?;
+    let up = Held { rate: rate_of_levels(&caps), cpus: if above.is_empty() { None } else { cpus_of_levels(&sets) } };
+    let now = if made { Held::default() } else { holds(job, &was)? };
+    let mut below = Vec::new();
+    let mut below_jobs = Vec::new();
+    if !made {
+        for found in jobs_below(namespace, path)? {
+            let full = format!("{PARENT_JOB_PREFIX}{found}");
+            let unreached = |what: &str, why: String| format!("{found}, a job below {path}, {what}: {why}; nothing was written");
+            // SAFETY: a NUL-terminated name.
+            let below_job = unsafe { OpenJobObjectW(JOB_WRITE, 0, wide(&full).as_ptr()) };
+            if below_job.is_null() {
+                return Err(unreached("could not be opened", last()));
+            }
+            below_jobs.push(below_job);
+            let kept_beside = asked_section(&full, &user, false).map_err(|why| unreached("cannot be written again", why))?;
+            let its = read_asked(kept_beside, &full);
+            // SAFETY: the section opened above.
+            unsafe { CloseHandle(kept_beside) };
+            let its = its.map_err(|why| unreached("cannot be written again", why))?;
+            below.push(Below { name: found.clone(), now: holds(below_job, &its)?, asked: its });
+        }
+    }
+    let (steps, _) = rewrite(&up, path, &asked, &now, &below).map_err(|why| format!("--name {name}: {why}; nothing was written"))?;
+    for (done, step) in steps.iter().enumerate() {
+        let (index, written) = match step {
+            Step::Rate(index, rate) => (*index, set_rate(if *index == 0 { job } else { below_jobs[index - 1] }, *rate)),
+            Step::Cpus(index, cpus) => (*index, set_cpus(if *index == 0 { job } else { below_jobs[index - 1] }, cpus)),
+        };
+        written.map_err(|why| {
+            let which = if index == 0 { path } else { below[index - 1].name.as_str() };
+            format!(
+                "{which}: {why}. The write stopped after {done} of {} writes: no job has more than it had or is to have, and \
+                 running this again completes it",
+                steps.len()
+            )
+        })?;
+    }
+    write_asked(section, &asked, job_name)?;
+    for below_job in below_jobs {
+        // SAFETY: the handles opened above.
+        unsafe { CloseHandle(below_job) };
+    }
+    match (asked.rate, up.rate) {
+        (None, _) => println!("jail-parent: {name}: no CPU cap of its own"),
+        (Some(rate), None) => println!("jail-parent: {name}: CPU rate {rate} of 10000 of the host's processors"),
+        (Some(rate), Some(up)) => {
+            println!("jail-parent: {name}: CPU rate {rate} of 10000 of the host's processors, under levels that come to {up}")
+        }
+    }
+    if let Some(cpus) = &asked.cpus {
+        println!("jail-parent: {name}: processors {cpus:x?} (group, mask)");
+    }
+    println!("jail-parent: {name}: {} jobs below it, {} writes", below.len(), steps.len());
+    Ok(kept)
 }
 
 fn main() {
@@ -604,18 +850,111 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cgroup_values::{CPUS_OUTSIDE_PARENT, RATE_ABOVE_PARENT, jail_job_name, rate_under_parent};
+
+    /// A job below a level as a jailer makes a jail's: named, with what it
+    /// was asked for beside it (`None`: without), and no values yet, which
+    /// the next write of a level above gives it.
+    fn jail(level: &str, id: &str, asked: Option<&Asked>) -> HANDLE {
+        let user = token_sid(TOKEN_USER_CLASS).unwrap();
+        let name = jail_job_name(&parent_job_names(level).unwrap().pop().unwrap(), id);
+        // SAFETY: the attributes of the call and a NUL-terminated name.
+        let job = with_security(&user, |attributes| unsafe { CreateJobObjectW(attributes, wide(&name).as_ptr()) }).unwrap();
+        assert!(!job.is_null(), "{}", last());
+        if let Some(asked) = asked {
+            write_asked(asked_section(&name, &user, true).unwrap(), asked, &name).unwrap();
+        }
+        job
+    }
+
+    /// `cpu.max` for a rate of the host's processors.
+    fn quota(rate: u64) -> String {
+        // SAFETY: a plain query.
+        let cpus = u64::from(unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) });
+        format!("cpu.max={} 100000", rate * 10 * cpus)
+    }
+
+    // A write to a level that is there, on the host: the tool's own steps
+    // against real jobs. A level, a level under it, a jail under each;
+    // every write of the top level's CPU cap or processors is read back
+    // from each job below as Linux's rule gives it; cgroup v1 fails the
+    // write a jail below cannot follow and nothing changes; a job below
+    // without what it was asked for stops the write.
+    #[test]
+    #[ignore = "makes named jobs: run alone by CI's windows job, with --nocapture"]
+    fn test_a_write_to_a_level_that_is_there_reaches_the_jobs_below() {
+        let top = format!("wjp-test-{}", std::process::id());
+        let inner = format!("{top}/in");
+        let write = |name: &str, cgroups: &[String]| run(name, 2, cgroups);
+        let top_job = *write(&top, &[quota(5000)]).unwrap().get(1).unwrap();
+        let inner_job = *write(&inner, &[quota(2500)]).unwrap().get(3).unwrap();
+        let cpus = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+        let on = |mask: u64| (cpus >= 2).then(|| vec![(0u16, mask)]);
+        let vm1 = jail(&inner, "vm-1", Some(&Asked { version: 2, rate: Some(1250), cpus: on(0b10) }));
+        let vm2 = jail(&top, "vm-2", Some(&Asked { version: 1, rate: Some(4000), cpus: None }));
+        let caps = || [hard_cap(top_job), hard_cap(inner_job), hard_cap(vm1), hard_cap(vm2)];
+        println!("TOOLTEST a level at 5000, a level under it at 2500 of the host, jails made under each: {:?}", caps());
+        assert_eq!(hard_cap(inner_job).unwrap(), Some(5000), "a quarter of the host is half of a level of half");
+
+        // Lowered: every job below is written again.
+        write(&top, &[quota(4000)]).unwrap();
+        println!("TOOLTEST the top lowered to 4000: {:?}", caps());
+        let share = |asked, of| Some(rate_under_parent(2, asked, of).unwrap());
+        assert_eq!(caps().map(Result::unwrap), [Some(4000), share(2500, 4000), share(1250, 2500), share(4000, 4000)]);
+
+        // cgroup v1: the jail that asked for 4000 cannot follow 3000.
+        let refused = write(&top, &[quota(3000)]).unwrap_err();
+        println!("TOOLTEST the top to 3000, under which a cgroup v1 jail asked for 4000: {refused}; then {:?}", caps());
+        assert!(refused.contains(RATE_ABOVE_PARENT) && refused.contains("vm-2, below") && refused.ends_with("nothing was written"), "{refused}");
+        assert_eq!(caps().map(Result::unwrap), [Some(4000), share(2500, 4000), share(1250, 2500), share(4000, 4000)]);
+
+        if cpus >= 2 {
+            write(&top, &["cpuset.cpus=0-1".to_string()]).unwrap();
+            let first = processors(vm1);
+            write(&top, &["cpuset.cpus=0".to_string()]).unwrap();
+            let moved = processors(vm1);
+            write(&top, &["cpuset.cpus=0-1".to_string()]).unwrap();
+            let back = processors(vm1);
+            println!("TOOLTEST a jail that asked for processor 1, the top on 0-1, then 0, then 0-1 again: {first:x?}, {moved:x?}, {back:x?}");
+            assert_eq!(first.unwrap(), Some(vec![(0, 0b10)]));
+            assert_eq!(moved.unwrap(), Some(vec![(0, 0b01)]), "cgroup v2: none in common, the level's");
+            assert_eq!(back.unwrap(), Some(vec![(0, 0b10)]));
+            // cgroup v1 fails a level's write that leaves a jail below
+            // processors outside it.
+            let vm3 = jail(&top, "vm-3", Some(&Asked { version: 1, rate: None, cpus: on(0b10) }));
+            let outside = write(&top, &["cpuset.cpus=0".to_string()]).unwrap_err();
+            println!("TOOLTEST the top to processor 0, under which a cgroup v1 jail asked for 1: {outside}");
+            assert!(outside.contains(CPUS_OUTSIDE_PARENT) && outside.contains("vm-3, below"), "{outside}");
+            // SAFETY: the test's own handle; the job goes with it.
+            unsafe { CloseHandle(vm3) };
+        } else {
+            println!("TOOLTEST processors: one processor, not run");
+        }
+
+        // Raised, and the cap taken off: each job has its own again.
+        write(&top, &["cpu.max=max".to_string()]).unwrap();
+        println!("TOOLTEST the top's cap taken off: {:?}", caps());
+        assert_eq!(caps().map(Result::unwrap), [None, Some(2500), share(1250, 2500), Some(4000)]);
+
+        // A job below that nobody wrote what it was asked for beside.
+        let _ghost = jail(&top, "ghost", None);
+        let unreached = write(&top, &[quota(5000)]).unwrap_err();
+        println!("TOOLTEST a job below without what it was asked for: {unreached}; then {:?}", caps());
+        assert!(unreached.contains("ghost, a job below") && unreached.ends_with("nothing was written"), "{unreached}");
+        assert_eq!(hard_cap(top_job).unwrap(), None);
+    }
 
     #[test]
     fn test_parse() {
         let of = |version, list: &[&str]| parse(version, &list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
         assert_eq!(
             of(2, &["memory.max=67108864", "cpu.max=50000 100000", "cpuset.cpus=0-1,3"]).unwrap(),
-            Asked { memory: Some(Some(64 << 20)), quota: Some(Some(50_000)), period: Some(100_000), cpus: Some(vec![0, 1, 3]) }
+            Wanted { memory: Some(Some(64 << 20)), quota: Some(Some(50_000)), period: Some(100_000), cpus: Some(vec![0, 1, 3]) }
         );
-        assert_eq!(of(2, &["memory.max=max", "cpu.max=max"]).unwrap(), Asked { memory: Some(None), quota: Some(None), ..Asked::default() });
+        assert_eq!(of(2, &["memory.max=max", "cpu.max=max"]).unwrap(), Wanted { memory: Some(None), quota: Some(None), ..Wanted::default() });
         assert_eq!(
             of(1, &["memory.limit_in_bytes=-1", "cpu.cfs_quota_us=25000", "cpu.cfs_period_us=50000"]).unwrap(),
-            Asked { memory: Some(None), quota: Some(Some(25_000)), period: Some(50_000), cpus: None }
+            Wanted { memory: Some(None), quota: Some(Some(25_000)), period: Some(50_000), cpus: None }
         );
         // Another version's file, a limit a parent does not take, a value
         // that is none: refused, not accepted without effect.

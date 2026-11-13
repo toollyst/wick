@@ -70,6 +70,16 @@
 //! (`cgroup_values::trusted_parent`); otherwise the jailer stops. Every
 //! level is checked.
 //!
+//! **A write to a level that is there.** Linux works out what every cgroup
+//! below a level has at each write to it; a job holds a number worked out
+//! once. So a jail's job under a parent has a name in the namespace
+//! (`<level>//<id>`), every job has beside it, in a section named after it,
+//! what it was asked for (`cgroup_values::Asked`), and the operator's tool,
+//! when it writes a level's CPU cap or processors, writes every job below
+//! again (`cgroup_values::rewrite`). The jailer keeps a level's section as
+//! it keeps its job, and reads the levels and makes its jail's job while it
+//! holds the namespace's mutex, which the tool holds while it writes.
+//!
 //! **What is never done.** If Windows refuses to put a process in the
 //! parent's job, or in the jail's job once it is in the parent's (Microsoft
 //! Learn says a job with UI limits, as a jail's is, is not nested; build
@@ -100,10 +110,10 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::cgroup_values::{
-    PARENT_JOB_PREFIX, PARENT_NAMESPACE, cpus_of_levels, cpus_under_parent, parent_job_names, parent_namespace_sddl, rate_of_levels, rate_under_parent,
+    ASKED_BYTES, Asked, PARENT_JOB_PREFIX, PARENT_NAMESPACE, asked_name, cpus_of_levels, cpus_under_parent, jail_job_name, parent_job_names, parent_lock_name, parent_namespace_sddl, rate_of_levels, rate_under_parent,
     trusted_parent,
 };
-use super::{GroupAffinity, HostError, Limits, Sid, last_error, sid_string, token_info, user_sid, wide};
+use super::{GroupAffinity, HostError, Limits, SessionLock, Sid, last_error, sid_string, token_info, user_sid, wide};
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -113,6 +123,76 @@ unsafe extern "system" {
     fn DeleteBoundaryDescriptor(boundary: HANDLE);
     fn CreatePrivateNamespaceW(attributes: *const SECURITY_ATTRIBUTES, boundary: *const std::ffi::c_void, alias: *const u16) -> HANDLE;
     fn OpenPrivateNamespaceW(boundary: *const std::ffi::c_void, alias: *const u16) -> HANDLE;
+    fn CreateFileMappingW(file: HANDLE, attributes: *const SECURITY_ATTRIBUTES, protect: u32, high: u32, low: u32, name: *const u16) -> HANDLE;
+    fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> HANDLE;
+    fn MapViewOfFile(section: HANDLE, access: u32, high: u32, low: u32, bytes: usize) -> *mut std::ffi::c_void;
+    fn UnmapViewOfFile(address: *const std::ffi::c_void) -> i32;
+}
+
+/// `PAGE_READWRITE`, `FILE_MAP_WRITE`, `FILE_MAP_READ` (winnt.h, memoryapi.h).
+const PAGE_READWRITE: u32 = 4;
+const FILE_MAP_WRITE: u32 = 2;
+const FILE_MAP_READ: u32 = 4;
+
+/// The namespace's mutex, taken: held by whoever reads the levels to give
+/// a job its values and makes that job, and by the tool while it writes a
+/// level and the jobs below it. A holder that died gives it up
+/// (`WAIT_ABANDONED`), and what it left half written the next write of the
+/// level completes.
+fn lock() -> io::Result<SessionLock> {
+    use windows_sys::Win32::System::Threading::{CreateMutexW, INFINITE, WaitForSingleObject};
+    namespace()?;
+    // SAFETY: the attributes of the call and a NUL-terminated name.
+    let h = with_security(&parent_namespace_sddl(&user_sid()?), |attributes| unsafe {
+        CreateMutexW(attributes, 0, wide(parent_lock_name()).as_ptr())
+    })?;
+    if h.is_null() {
+        return Err(last_error());
+    }
+    // SAFETY: the mutex handle, which the lock closes.
+    unsafe { WaitForSingleObject(h, INFINITE) };
+    Ok(SessionLock(h))
+}
+
+/// Makes the section beside the job `job_name` and writes `asked` to it:
+/// what the tool reads when a level above is written. The handle keeps it.
+fn keep_asked(job_name: &str, asked: &Asked) -> io::Result<OwnedHandle> {
+    let name = wide(asked_name(job_name));
+    // SAFETY: the attributes of the call and a NUL-terminated name; a
+    // section of the paging file (no file handle).
+    let h = with_security(&parent_namespace_sddl(&user_sid()?), |attributes| unsafe {
+        CreateFileMappingW(usize::MAX as HANDLE, attributes, PAGE_READWRITE, 0, u32::try_from(ASKED_BYTES).unwrap(), name.as_ptr())
+    })?;
+    if h.is_null() {
+        return Err(last_error());
+    }
+    // SAFETY: a handle we own.
+    let section = unsafe { OwnedHandle::from_raw_handle(h) };
+    let bytes = asked.encode();
+    // SAFETY: a view of the whole section, which is longer than the bytes,
+    // unmapped before the block ends.
+    unsafe {
+        let view = MapViewOfFile(section.as_raw_handle(), FILE_MAP_WRITE, 0, 0, ASKED_BYTES);
+        if view.is_null() {
+            return Err(last_error());
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), view.cast::<u8>(), bytes.len());
+        UnmapViewOfFile(view);
+    }
+    Ok(section)
+}
+
+/// Opens the section beside a job that was there, to keep it as the job is
+/// kept. A job without one is not a parent's level as this jailer and the
+/// tool make them.
+fn hold_asked(job_name: &str) -> io::Result<OwnedHandle> {
+    // SAFETY: a NUL-terminated name.
+    let h = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide(asked_name(job_name)).as_ptr()) };
+    if h.is_null() {
+        return Err(last_error());
+    }
+    // SAFETY: a handle we own.
+    Ok(unsafe { OwnedHandle::from_raw_handle(h) })
 }
 
 /// `S-1-16-8192`: the medium integrity level, as a SID.
@@ -135,9 +215,10 @@ impl Boundary {
         let mut boundary = Boundary(h);
         // SAFETY: the descriptor made above, which the calls may move, and
         // valid SIDs.
-        if unsafe { AddSIDToBoundaryDescriptor(&mut boundary.0, user.0) } == 0
-            || unsafe { AddIntegrityLabelToBoundaryDescriptor(&mut boundary.0, level.0) } == 0
-        {
+        let added = unsafe {
+            AddSIDToBoundaryDescriptor(&mut boundary.0, user.0) != 0 && AddIntegrityLabelToBoundaryDescriptor(&mut boundary.0, level.0) != 0
+        };
+        if !added {
             return Err(last_error());
         }
         Ok(boundary)
@@ -233,6 +314,8 @@ pub(crate) struct Plan {
     pub named: bool,
     /// Whether a `--cgroup` is.
     pub with_cgroup: bool,
+    /// `--id`: the jail's job under the parent is named after it.
+    pub id: String,
 }
 
 static PLAN: Mutex<Option<Plan>> = Mutex::new(None);
@@ -257,7 +340,13 @@ pub(crate) fn plan_of<S: AsRef<OsStr>>(version: u8, args: impl IntoIterator<Item
     let Some(parent) = named.clone().or(default) else {
         return Ok(None);
     };
-    let plan = Plan { version, parent, named: named.is_some(), with_cgroup: args.iter().any(|a| a == "--cgroup") };
+    let plan = Plan {
+        version,
+        parent,
+        named: named.is_some(),
+        with_cgroup: args.iter().any(|a| a == "--cgroup"),
+        id: value_of("--id").unwrap_or_default(),
+    };
     // A named parent that cannot be a job's name is refused here, at the
     // argument, not when the jail starts.
     if plan.named {
@@ -286,6 +375,12 @@ pub(crate) fn for_jail() -> Result<Option<Parent>, HostError> {
 #[derive(Debug)]
 pub(crate) struct Parent {
     jobs: Vec<OwnedHandle>,
+    /// The name of the last level's job, which the jail's is named under,
+    /// and the jail's id.
+    last: String,
+    id: String,
+    /// The sections beside the levels' jobs, kept as the jobs are.
+    _asked: Vec<OwnedHandle>,
     /// The parent as the command line has it.
     name: String,
     version: u8,
@@ -300,6 +395,10 @@ impl Parent {
         // The default parent's name is a file's name: it has one level.
         let names = parent_job_names(&plan.parent).map_err(|why| fail(why.to_string()))?;
         let make = plan.named && plan.with_cgroup;
+        // A level and the section beside it are made together, as the tool
+        // that lists the jobs below a level sees them.
+        let _lock = lock().map_err(|e| fail(format!("the parent cgroups' mutex could not be taken: {e}")))?;
+        let mut asked = Vec::new();
         let mut jobs = Vec::new();
         let mut created = false;
         let mut missing = None;
@@ -329,19 +428,62 @@ impl Parent {
                 let mine = mine.map_err(|e| fail(format!("this process's account could not be read: {e}")))?;
                 trusted_parent(&owner, label, &mine).map_err(|why| fail(format!("{name}: {why}")))?;
             }
+            // A level this jailer makes is asked for nothing, as a
+            // directory Linux makes has no limit; one that was there has
+            // its section, from whoever made it.
+            let section = if made {
+                keep_asked(name, &Asked { version: plan.version, rate: None, cpus: None })
+            } else {
+                hold_asked(name)
+            };
+            asked.push(section.map_err(|e| fail(format!("what the job of {name} was asked for, kept beside it, could not be {}: {e}", if made { "written" } else { "opened" })))?);
             created = made;
             jobs.push(job);
         }
         if missing.is_some() {
             return Ok(None);
         }
-        Ok(Some(Parent { jobs, name: plan.parent.clone(), version: plan.version, created }))
+        let last = names.last().expect("a parent has a level").clone();
+        Ok(Some(Parent { jobs, last, id: plan.id.clone(), _asked: asked, name: plan.parent.clone(), version: plan.version, created }))
     }
 
     /// The job of the parent's last level, which a jail's own job is put
     /// under.
     pub(crate) fn job(&self) -> &OwnedHandle {
         self.jobs.last().expect("a parent has a level")
+    }
+
+    /// The jail's job under this parent: named `<level>//<id>` in the
+    /// namespace, with the limits as a job there takes them
+    /// ([`Parent::limits`]) and, beside it, what the jail was asked for,
+    /// which the tool reads when a level above is written. Read and made
+    /// under the namespace's mutex, so that a write to a level either comes
+    /// before this job is given its values or finds the job. A job of the
+    /// name that is there is another jail of the id under this parent: on
+    /// Linux the two would share a cgroup; here the jailer stops.
+    pub(crate) fn jail_job(&self, limits: &Limits) -> Result<(OwnedHandle, OwnedHandle), HostError> {
+        let fail = |why: String| HostError::Parent(self.name.clone(), why);
+        let _lock = lock().map_err(|e| fail(format!("the parent cgroups' mutex could not be taken: {e}")))?;
+        let under = self.limits(limits)?;
+        let name = jail_job_name(&self.last, &self.id);
+        // SAFETY: the attributes of the call and a NUL-terminated name;
+        // the last error says whether the job was there.
+        let (h, err) = with_security(&parent_namespace_sddl(&user_sid().map_err(|e| fail(e.to_string()))?), |attributes| unsafe {
+            let h = CreateJobObjectW(attributes, wide(&name).as_ptr());
+            (h, GetLastError())
+        })
+        .map_err(|e| fail(e.to_string()))?;
+        if h.is_null() {
+            return Err(HostError::Spawn("CreateJobObject: the jail's job under its parent cgroup", io::Error::from_raw_os_error(err.cast_signed())));
+        }
+        // SAFETY: a handle we own.
+        let job = unsafe { OwnedHandle::from_raw_handle(h) };
+        if err == ERROR_ALREADY_EXISTS {
+            return Err(fail(format!("a jail of the id {:?} has its job under this parent already", self.id)));
+        }
+        let asked = Asked { version: self.version, rate: limits.cpu_rate, cpus: limits.cpus.clone() };
+        let section = keep_asked(&name, &asked).map_err(|e| fail(format!("what the jail was asked for could not be kept beside its job: {e}")))?;
+        Ok((super::limit_job(job, &under)?, section))
     }
 
     /// The jail's limits as its job under this parent takes them: the CPU
@@ -590,10 +732,10 @@ mod tests {
     #[test]
     fn test_the_parent_is_the_named_one_or_the_exec_files_name() {
         let plan = |extra: &[&str]| plan_of(2, args(extra)).unwrap().unwrap();
-        assert_eq!(plan(&[]), Plan { version: 2, parent: "firecracker.exe".into(), named: false, with_cgroup: false });
+        assert_eq!(plan(&[]), Plan { version: 2, parent: "firecracker.exe".into(), named: false, with_cgroup: false, id: "a".into() });
         assert_eq!(
             plan(&["--cgroup", "memory.max=1073741824", "--parent-cgroup", "tenants"]),
-            Plan { version: 2, parent: "tenants".into(), named: true, with_cgroup: true }
+            Plan { version: 2, parent: "tenants".into(), named: true, with_cgroup: true, id: "a".into() }
         );
         assert!(!plan(&["--parent-cgroup", "tenants"]).with_cgroup);
         let after = plan(&["--", "--parent-cgroup", "x", "--cgroup", "y"]);
@@ -618,14 +760,23 @@ mod tests {
     }
 
     fn plan(parent: &str, version: u8, named: bool, with_cgroup: bool) -> Plan {
-        Plan { version, parent: parent.to_string(), named, with_cgroup }
+        Plan { version, parent: parent.to_string(), named, with_cgroup, id: "vm-1".to_string() }
     }
 
     /// What the operator's tool does to a parent: its limits, through a
     /// handle of its own.
     fn tool(parent: &str) -> OwnedHandle {
         let names = parent_job_names(parent).unwrap();
-        names.iter().map(|name| create_or_open(name).unwrap().0).last().unwrap()
+        let mut last = None;
+        for name in &names {
+            let (job, made) = create_or_open(name).unwrap();
+            if made {
+                // Kept for the test's life, as the tool keeps it for its own.
+                std::mem::forget(keep_asked(name, &Asked { version: 2, rate: None, cpus: None }).unwrap());
+            }
+            last = Some(job);
+        }
+        last.unwrap()
     }
 
     fn extended(flags: u32, memory: usize, affinity: usize) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
@@ -875,7 +1026,8 @@ mod tests {
         let asking = |cpus: Option<Vec<(u16, u64)>>, cpu_rate| Limits { cpus, cpu_rate, ..Limits::default() };
         let parent = |version| Parent::of(&plan(&both, version, true, true)).unwrap().unwrap();
         let eighth = parent(1).limits(&asking(None, Some(1250)));
-        let (_p, job, entered) = jailed(Some(&under_both), eighth.as_ref().unwrap_or(&Limits::default()));
+        let unlimited = Limits::default();
+        let (_p, job, entered) = jailed(Some(&under_both), eighth.as_ref().unwrap_or(&unlimited));
         println!(
             "PARENTTEST two levels capped at 5000 ({top_rate:?}) and, for a quarter of the host, 5000 of that \
              ({level_rate:?}): a jail that asks for 1250 of the host is given {:?} (nested {entered:?}) and reads back {:?}",
@@ -922,6 +1074,53 @@ mod tests {
         drop(lower);
     }
 
+    // A jail's job under a parent, as the jailer makes it: it has a name
+    // in the namespace, under the parent's last level, the limits a job
+    // there takes, and beside it what the jail was asked for, which is what
+    // the tool reads to write it again when a level above is written. A
+    // second jail of the id under the parent is refused.
+    #[test]
+    #[ignore = "makes named jobs: run alone by CI's windows job, with --nocapture"]
+    fn test_a_jails_job_under_a_parent_has_a_name_and_what_it_was_asked() {
+        let name = fresh("named");
+        let operator = tool(&name);
+        // SAFETY: plain data.
+        let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+        cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+        cpu.Anonymous.CpuRate = 5000;
+        set_job(&operator, JobObjectCpuRateControlInformation, &cpu).unwrap();
+        let parent = Parent::of(&plan(&name, 2, true, true)).unwrap().unwrap();
+        let limits = Limits { cpu_rate: Some(2500), memory_bytes: Some(48 << 20), ..Limits::default() };
+        let (job, _section) = parent.jail_job(&limits).unwrap();
+        let job_name = jail_job_name(&parent_job_names(&name).unwrap()[0], "vm-1");
+        // SAFETY: NUL-terminated names; handles of this test.
+        let (by_name, section) = unsafe {
+            (OpenJobObjectW(JAILER_ACCESS, 0, wide(&job_name).as_ptr()), OpenFileMappingW(FILE_MAP_READ, 0, wide(asked_name(&job_name)).as_ptr()))
+        };
+        let found = (!by_name.is_null(), !section.is_null());
+        let mut kept = vec![0u8; ASKED_BYTES];
+        if found.1 {
+            // SAFETY: a view of the whole section, read and unmapped.
+            unsafe {
+                let view = MapViewOfFile(section, FILE_MAP_READ, 0, 0, ASKED_BYTES);
+                assert!(!view.is_null(), "{}", last_error());
+                std::ptr::copy_nonoverlapping(view.cast::<u8>(), kept.as_mut_ptr(), ASKED_BYTES);
+                UnmapViewOfFile(view);
+            }
+        }
+        let asked = Asked::decode(&kept);
+        let again = parent.jail_job(&limits).map(|_| ()).map_err(|e| e.to_string());
+        println!(
+            "PARENTTEST a jail's job under a parent capped at 5000: found by its name and its section {found:?}, its rate \
+             {:?}, what it was asked for {asked:?}; a second jail of the id: {again:?}",
+            hard_cap(&job)
+        );
+        assert_eq!(found, (true, true));
+        assert_eq!(hard_cap(&job).unwrap(), Some(5000), "a quarter of the host is half of a parent of half");
+        assert_eq!(asked, Ok(Asked { version: 2, rate: Some(2500), cpus: None }));
+        assert!(again.unwrap_err().contains("has its job under this parent already"));
+    }
+
     // What a jailed process can do about a parent's name, with the jail's
     // own lockdown token (`tokens`, as the jailer makes it) on this thread;
     // an access check reads the thread's token. Asserted, the rule: it
@@ -940,8 +1139,8 @@ mod tests {
         let name = fresh("reach");
         let operators = tool(&name);
         let job_name = wide(&parent_job_names(&name).unwrap()[0]);
-        let local = wide(&format!("Local\\wick-test-local-{}", std::process::id()));
-        let taken = wide(&format!("Local\\wick-test-taken-{}", std::process::id()));
+        let local = wide(format!("Local\\wick-test-local-{}", std::process::id()));
+        let taken = wide(format!("Local\\wick-test-taken-{}", std::process::id()));
         // SAFETY: NUL-terminated names; a job of the operator's in `Local\`.
         let in_local = unsafe { CreateJobObjectW(std::ptr::null(), local.as_ptr()) };
         assert!(!in_local.is_null(), "{}", last_error());

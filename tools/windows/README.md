@@ -78,10 +78,10 @@
   parent lasts while the tool or a jail of it runs. `--name a/b` is a level
   under `a`, a job under `a`'s: the tool makes the levels that are missing
   and writes the limits to the last, against the levels above by Linux's
-  rule for the cgroup version, so a parent is written from the top down. A
-  level's CPU cap and processors are written when it is made and not
-  changed while it is there; its memory limit at any time. Run it in the
-  session and as the account the jailers run in:
+  rule for the cgroup version. Run again, it writes the level that is
+  there, and with its CPU cap or processors every job below it, levels and
+  jails, as Linux works the hierarchy out again at every write. Run it as
+  the account the jailers run as:
 
   ```
   tools\windows\jail-parent.exe --name tenants --cgroup memory.max=4294967296 --cgroup cpuset.cpus=0-3 --forever

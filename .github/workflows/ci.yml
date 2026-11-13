@@ -871,14 +871,17 @@ jobs:
           # boundary, nor opens a parent's job (and what that token may do
           # in the session's own namespace, printed). They assert the
           # jailer's rules and print what Windows answered (PARENTTEST
-          # lines).
+          # lines). A jail's job under a parent has a name and, beside it,
+          # what the jail was asked for, which the tool reads when a level
+          # above is written.
           for t in test_a_jails_job_under_a_parent_job_on_record test_nested_jobs_on_record \
               test_hugetlb_page_sizes_are_linuxs \
               test_a_parent_bounds_its_jails_together test_a_parent_lasts_while_a_jail_holds_it \
               test_a_jail_under_a_parent_has_linuxs_cpus_and_rate \
               test_a_parent_made_below_medium_integrity_is_refused \
               test_a_parent_of_several_levels_bounds_by_each \
-              test_a_jails_token_does_not_reach_a_parents_name; do
+              test_a_jails_token_does_not_reach_a_parents_name \
+              test_a_jails_job_under_a_parent_has_a_name_and_what_it_was_asked; do
             out=$(cargo test --locked -p jailer -- \
               --include-ignored --nocapture --test-threads=1 "$t" 2>&1) || true
             printf '%s\n' "$out"
@@ -887,6 +890,15 @@ jobs:
               failed=1
             fi
           done
+          # The operator's tool for a parent cgroup against real jobs: a
+          # write to a level that is there is read back from every job below
+          # it (TOOLTEST lines), with the test of how it reads its arguments.
+          out=$("$RUNNER_TEMP/jail-parent-test.exe" --include-ignored --nocapture --test-threads=1 2>&1) || true
+          printf '%s\n' "$out"
+          if ! grep -q "test result: ok. 2 passed" <<<"$out"; then
+            echo "::error::jail-parent's tests did not pass"
+            failed=1
+          fi
           # What Firecracker's own memory besides its guest's is made of with
           # 1, 2 and 16 vCPUs (VMMMEM lines), against upstream's tests' 5 MiB
           # for it: a microVM whose guest is the script's own `hlt` loop.
