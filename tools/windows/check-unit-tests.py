@@ -221,4 +221,13 @@ def main():
 
 
 if __name__ == "__main__":
+    # Output never fails on a character: a console or a file the output is
+    # redirected to has the ANSI code page (cp949, cp1252) unless Python is
+    # run with -X utf8, which -I does not give (PYTHONUTF8 is an environment
+    # variable), and a symbol name, a path or a program's output can hold
+    # what that page has not (a WinHvPlatform symbol from dbghelp, U+A390,
+    # ended vmm-memory-record.py on a PC). UTF-8, and what is not text
+    # escaped.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     sys.exit(main())

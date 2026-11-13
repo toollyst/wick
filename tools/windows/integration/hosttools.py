@@ -357,8 +357,10 @@ def windows_cargo_args(cargo_args):
 
 def main():
     tool, args = sys.argv[1], sys.argv[2:]
-    sys.stdout.reconfigure(newline="\n", encoding="utf-8")  # Linux's line ends
-    sys.stderr.reconfigure(newline="\n", encoding="utf-8")
+    # Linux's line ends; UTF-8, and what is not text escaped, so that the
+    # output never fails on a character.
+    sys.stdout.reconfigure(newline="\n", encoding="utf-8", errors="backslashreplace")
+    sys.stderr.reconfigure(newline="\n", encoding="utf-8", errors="backslashreplace")
     if tool in E2FSPROGS:
         return e2fsprogs(tool, args)
     return {"ps": ps, "pgrep": pgrep, "pidof": pidof, "dmesg": dmesg, "socat": socat,

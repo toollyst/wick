@@ -897,6 +897,28 @@ def run_boot_case(binds, firecracker, vcpus, work, system, kernel, rootfs, chain
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             return " | ".join(line.strip() for line in f.read().splitlines()[-lines:])
 
+    def reports_and_traces():
+        # What Firecracker itself reported while the guest ran (a report is
+        # made on the thread it is about, and costs that thread stack): on
+        # its standard error, and in its log, which without a log file is
+        # on its standard output, among the console's lines.
+        reports = []
+        for path in (err_path, out_path):
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                reports += [line for line in f.read().splitlines()
+                            if "whp:" in line or ":WARN:" in line or ":ERROR:" in line]
+        print(f"{tag} Firecracker's own reports: {len(reports)} lines with whp:, :WARN: or :ERROR:"
+              + "".join(f" | {line.strip()[:200]}" for line in reports[:5]))
+        # A build with kvm-ioctls' whp-trace feature prints each WHP call
+        # that committed 16 KiB or more of its thread's stack; any other
+        # build prints none (0 lines).
+        with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+            traces = [line.strip() for line in f.read().splitlines() if line.startswith("WHPTRACE")]
+        print(f"{tag} WHPTRACE lines: {len(traces)}")
+        for line in traces[:64]:
+            print(f"{tag} {line[:800]}")
+
+    reported = False
     try:
         console = Console(proc, out_path)
         # The shell answers: the sum is the shell's, not the line's echo.
@@ -929,28 +951,16 @@ def run_boot_case(binds, firecracker, vcpus, work, system, kernel, rootfs, chain
         for rss, what, base, size, path in sorted(rows, reverse=True)[:12]:
             print(f"{tag}   {what:8} {base:#014x} size {size // 1024:8} KiB resident {rss // 1024:6} KiB"
                   f" {os.path.basename(path)}")
+        # Read before the stacks, whose walk can fail: the work directory
+        # goes with this run, and with it Firecracker's output.
+        reported = True
+        reports_and_traces()
         record_stacks(binds, proc.pid, vcpus, rows, chains)
-        # What Firecracker itself reported while the guest ran (a report is
-        # made on the thread it is about, and costs that thread stack): on
-        # its standard error, and in its log, which without a log file is
-        # on its standard output, among the console's lines.
-        reports = []
-        for path in (err_path, out_path):
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                reports += [line for line in f.read().splitlines()
-                            if "whp:" in line or ":WARN:" in line or ":ERROR:" in line]
-        print(f"{tag} Firecracker's own reports: {len(reports)} lines with whp:, :WARN: or :ERROR:"
-              + "".join(f" | {line.strip()[:200]}" for line in reports[:5]))
-        # A build with kvm-ioctls' whp-trace feature prints each WHP call
-        # that committed 16 KiB or more of its thread's stack; any other
-        # build prints none (0 lines).
-        with open(err_path, "r", encoding="utf-8", errors="replace") as f:
-            traces = [line.strip() for line in f.read().splitlines() if line.startswith("WHPTRACE")]
-        print(f"{tag} WHPTRACE lines: {len(traces)}")
-        for line in traces[:64]:
-            print(f"{tag} {line[:800]}")
         return kinds
     finally:
+        # On every way out, a failure's included, if not read yet.
+        if not reported:
+            reports_and_traces()
         proc.kill()
         proc.wait()
 
@@ -1063,6 +1073,15 @@ def main(args):
 
 
 if __name__ == "__main__":
+    # Output never fails on a character: a console or a file the output is
+    # redirected to has the ANSI code page (cp949, cp1252) unless Python is
+    # run with -X utf8, which -I does not give (PYTHONUTF8 is an environment
+    # variable), and a symbol name, a path or a program's output can hold
+    # what that page has not (a WinHvPlatform symbol from dbghelp, U+A390,
+    # ended vmm-memory-record.py on a PC). UTF-8, and what is not text
+    # escaped.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     if len(sys.argv) > 1 and sys.argv[1] == "--kernel":
         # The guest alone, for a look at it: python vmm-memory-record.py --kernel out.elf
         with open(sys.argv[2], "wb") as out:
