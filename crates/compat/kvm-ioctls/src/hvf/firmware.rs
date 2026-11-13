@@ -375,7 +375,10 @@ mod tests {
         use Spectre::{Mitigated, Unaffected, Vulnerable};
         // An Apple core (implementer 0x61): on none of Linux's lists.
         let apple = 0x611f_0250;
-        let cases: [(&str, HostCpu, [Spectre; 3], [Option<u64>; 3], [u64; 3]); 10] = [
+        // A core, its states (v2, v4, BHB), KVM's answers to the three
+        // ARCH_WORKAROUND calls, and the firmware registers' levels.
+        type Case = (&'static str, HostCpu, [Spectre; 3], [Option<u64>; 3], [u64; 3]);
+        let cases: [Case; 10] = [
             // No CSV2, no SSBS, a loop count for BHB, but v2 vulnerable.
             ("Cortex-A72", cpu(0x410f_d080, 0, 0, 0, 0), [Vulnerable; 3], [None; 3], [0; 3]),
             // On all three safe lists, every revision.

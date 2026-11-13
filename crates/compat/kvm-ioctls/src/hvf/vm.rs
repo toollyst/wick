@@ -2626,6 +2626,8 @@ mod tests {
                 crate::VcpuExit::MmioWrite(MMIO, _) => {}
                 other => panic!("{other:?}"),
             }
+            // `back` is indexed by clock and by read, as the report reads it.
+            #[allow(clippy::needless_range_loop)]
             for nth in 0..3 {
                 let now = read();
                 for c in 0..7 {
