@@ -8,8 +8,18 @@
 //! - `CLOCK_MONOTONIC` (and `_RAW`, `_COARSE`): the performance counter,
 //!   the clock of `std::time::Instant`;
 //! - `CLOCK_BOOTTIME`: interrupt time, which counts while suspended;
-//! - `CLOCK_PROCESS_CPUTIME_ID` / `CLOCK_THREAD_CPUTIME_ID`: kernel plus user
-//!   time of the process / calling thread.
+//! - `CLOCK_PROCESS_CPUTIME_ID` / `CLOCK_THREAD_CPUTIME_ID`: the CPU time of
+//!   the process / calling thread, kernel and user, to the nanosecond as
+//!   Linux counts it (the scheduler's run time): the cycles Windows counts
+//!   for them (`QueryProcessCycleTime`, `QueryThreadCycleTime`, read from the
+//!   TSC at each switch) at the TSC's rate, which an invariant TSC keeps
+//!   constant; the rate is measured against the performance counter since
+//!   the process started ([`cpu_ns`]). `GetProcessTimes`'s kernel and user
+//!   times, which Windows charges a clock tick at a time (15.6 ms), read 0
+//!   for a process that ran a few milliseconds; they are used only on a host
+//!   whose TSC is not invariant, where cycles are no measure of time
+//!   (Learn, `QueryThreadCycleTime`: "Do not attempt to convert the CPU
+//!   clock cycles ... to elapsed time" for CPUs that vary the timer's rate).
 //!
 //! A timerfd is a manual-reset, high-resolution waitable timer: signalled
 //! while expirations are waiting to be read, which is what `epoll` waits on.
@@ -32,7 +42,9 @@ use windows_sys::Win32::System::Threading::{
     GetProcessTimes, GetThreadTimes, INFINITE, SetWaitableTimer, TIMER_ALL_ACCESS,
     WaitForSingleObject,
 };
-use windows_sys::Win32::System::WindowsProgramming::QueryInterruptTimePrecise;
+use windows_sys::Win32::System::WindowsProgramming::{
+    QueryInterruptTimePrecise, QueryProcessCycleTime, QueryThreadCycleTime,
+};
 
 use crate::{c_char, c_int, time_t};
 
@@ -121,6 +133,81 @@ fn filetime_100ns(ft: FILETIME) -> i64 {
     v
 }
 
+/// The TSC and the performance counter read together: the TSC at the
+/// middle of the counter's read.
+fn tsc_and_counter() -> (u64, i64) {
+    // SAFETY: RDTSC has no preconditions.
+    let a = unsafe { core::arch::x86_64::_rdtsc() };
+    let mut q = 0;
+    // SAFETY: writes `q`.
+    unsafe { QueryPerformanceCounter(&mut q) };
+    // SAFETY: as above.
+    let b = unsafe { core::arch::x86_64::_rdtsc() };
+    (a + (b.wrapping_sub(a) / 2), q)
+}
+
+/// [`tsc_and_counter`] at the process's start, before `main`
+/// ([`ANCHOR_AT_START`]), from which the TSC's rate is measured.
+static START: OnceLock<(u64, i64)> = OnceLock::new();
+/// Set by [`anchor_at_start`]: [`START`] was read by the C runtime's
+/// initializers, not at a first use.
+static ANCHORED_AT_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn anchor_at_start() {
+    START.get_or_init(tsc_and_counter);
+    ANCHORED_AT_START.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Run by the C runtime before `main` (its `.CRT$XCU` initializers), so that
+/// the TSC's rate is measured over the process's life, not from a first
+/// use. Referenced by [`cpu_ns`], so the object that holds it is linked
+/// wherever the CPU clocks are.
+#[used]
+#[link_section = ".CRT$XCU"]
+static ANCHOR_AT_START: extern "C" fn() = anchor_at_start;
+
+/// Whether the host's TSC is invariant (CPUID.80000007H:EDX bit 8): it then
+/// runs at one rate in every power state, and cycles are a measure of time.
+fn tsc_invariant() -> bool {
+    use core::arch::x86_64::__cpuid;
+    static INVARIANT: OnceLock<bool> = OnceLock::new();
+    *INVARIANT.get_or_init(|| __cpuid(0x8000_0000).eax >= 0x8000_0007 && __cpuid(0x8000_0007).edx & (1 << 8) != 0)
+}
+
+/// `cycles` of CPU time in nanoseconds at the TSC's rate, measured against
+/// the performance counter from the process's start ([`START`]) to now:
+/// the rate's error is a counter tick (100 ns) over that span, so the time's
+/// error is about that tick for each thread that ran, whatever the span
+/// (the time is at most the span for each thread).
+/// Should the start not have been read before `main`, the span is waited
+/// out to 1 ms once. `None` where the TSC is not invariant.
+pub(crate) fn cpu_ns(cycles: u64) -> Option<i64> {
+    if !tsc_invariant() {
+        return None;
+    }
+    std::hint::black_box(&ANCHOR_AT_START);
+    let freq = *COUNTER_HZ.get_or_init(|| {
+        let mut f = 0;
+        // SAFETY: writes `f`; cannot fail on Windows XP and later.
+        unsafe { QueryPerformanceFrequency(&mut f) };
+        f
+    });
+    let (t0, q0) = *START.get_or_init(tsc_and_counter);
+    let (mut t1, mut q1) = tsc_and_counter();
+    while i128::from(q1 - q0) * 1000 < i128::from(freq) {
+        std::hint::spin_loop();
+        (t1, q1) = tsc_and_counter();
+    }
+    let hz = u128::from(t1.wrapping_sub(t0)) * u128::try_from(freq).ok()? / u128::try_from(q1 - q0).ok()?;
+    if hz == 0 {
+        return None;
+    }
+    i64::try_from(u128::from(cycles) * 1_000_000_000 / hz).ok()
+}
+
+/// The performance counter's frequency.
+static COUNTER_HZ: OnceLock<i64> = OnceLock::new();
+
 /// Nanoseconds on `clock`, or `None` for an unknown clock.
 pub(crate) fn now_ns(clock: clockid_t) -> Option<i64> {
     let mut ft = FILETIME {
@@ -156,6 +243,37 @@ pub(crate) fn now_ns(clock: clockid_t) -> Option<i64> {
             #[allow(clippy::cast_possible_wrap)]
             let ns = t as i64 * 100;
             ns
+        }
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID if tsc_invariant() => {
+            let mut cycles = 0u64;
+            // SAFETY: pseudo-handles of this process/thread; writes `cycles`.
+            let ok = unsafe {
+                if clock == CLOCK_PROCESS_CPUTIME_ID {
+                    QueryProcessCycleTime(GetCurrentProcess(), &mut cycles)
+                } else {
+                    QueryThreadCycleTime(GetCurrentThread(), &mut cycles)
+                }
+            };
+            if ok == 0 {
+                return None;
+            }
+            // The rate is measured again at each reading, a little better
+            // each time; a reading never goes below the last one of its
+            // clock, as Linux's never do.
+            let ns = cpu_ns(cycles)?;
+            if clock == CLOCK_PROCESS_CPUTIME_ID {
+                static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+                LAST.fetch_max(ns, std::sync::atomic::Ordering::Relaxed).max(ns)
+            } else {
+                std::thread_local! {
+                    static LAST: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+                }
+                LAST.with(|last| {
+                    let ns = ns.max(last.get());
+                    last.set(ns);
+                    ns
+                })
+            }
         }
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
             let (mut c, mut e, mut k, mut u) = (ft, ft, ft, ft);
@@ -521,6 +639,69 @@ mod tests {
         assert!((sys.as_secs() as i64 - a.tv_sec).abs() <= 1);
         // SAFETY: as above.
         assert_eq!(unsafe { clock_gettime(99, &mut a) }, -1);
+    }
+
+    fn clock_ns(clock: clockid_t) -> i64 {
+        let mut t = timespec::default();
+        // SAFETY: a valid out-parameter.
+        assert_eq!(unsafe { clock_gettime(clock, &mut t) }, 0);
+        t.tv_sec * NANOS + t.tv_nsec
+    }
+
+    /// The calling thread's kernel plus user time as Windows charges it, a
+    /// clock tick at a time.
+    fn thread_times_ns() -> i64 {
+        let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut c, mut e, mut k, mut u) = (z, z, z, z);
+        // SAFETY: the calling thread's pseudo-handle; writes the times.
+        assert_ne!(unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) }, 0);
+        (filetime_100ns(k) + filetime_100ns(u)) * 100
+    }
+
+    fn spin(d: Duration) {
+        let start = std::time::Instant::now();
+        while start.elapsed() < d {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// The CPU clocks count what runs as Linux's do, to well under a
+    /// millisecond (CPUCLOCK lines): 2 ms of spinning moves the thread's
+    /// clock by up to 2 ms (what the thread ran of them), where
+    /// `GetThreadTimes` moves by a clock tick or not at all; 300 ms of spinning agrees with `GetThreadTimes` within
+    /// two ticks and 5%; 100 ms asleep moves it by under a millisecond; the
+    /// process's clock moves at least as much as the thread's. The TSC's
+    /// start was read before `main`. On a host whose TSC is not invariant
+    /// the clocks are `GetProcessTimes`'s and the test says so.
+    #[test]
+    fn test_cpu_clocks_count_what_runs_finely() {
+        use std::eprintln;
+        if !tsc_invariant() {
+            eprintln!("CPUCLOCK the host's TSC is not invariant: the CPU clocks are GetProcessTimes' and GetThreadTimes' ticks");
+            return;
+        }
+        assert!(ANCHORED_AT_START.load(std::sync::atomic::Ordering::Relaxed), "the TSC's start was not read before main");
+        let measure = |work: &dyn Fn()| {
+            let (t, p, k, w) = (clock_ns(CLOCK_THREAD_CPUTIME_ID), clock_ns(CLOCK_PROCESS_CPUTIME_ID), thread_times_ns(), std::time::Instant::now());
+            work();
+            let wall = i64::try_from(w.elapsed().as_nanos()).unwrap();
+            (clock_ns(CLOCK_THREAD_CPUTIME_ID) - t, clock_ns(CLOCK_PROCESS_CPUTIME_ID) - p, thread_times_ns() - k, wall)
+        };
+        let short = measure(&|| spin(Duration::from_millis(2)));
+        let long = measure(&|| spin(Duration::from_millis(300)));
+        let asleep = measure(&|| std::thread::sleep(Duration::from_millis(100)));
+        for (what, (t, p, k, w)) in [("2 ms spinning", short), ("300 ms spinning", long), ("100 ms asleep", asleep)] {
+            eprintln!("CPUCLOCK {what}: thread clock +{t} ns, process clock +{p} ns, GetThreadTimes +{k} ns, wall {w} ns");
+            assert!(p >= t, "{what}: the process's clock moved less than the thread's");
+        }
+        let (t, _, _, w) = short;
+        // Not all 2 ms where other tests' threads take the CPU, but some of
+        // it, and never a clock tick of it.
+        assert!(t >= 100_000 && t <= w + 200_000, "2 ms spinning: the thread clock moved {t} ns in {w} ns");
+        let (t, _, k, _) = long;
+        assert!((t - k).abs() <= 31_250_000 + t / 20, "300 ms spinning: {t} ns against GetThreadTimes' {k} ns");
+        let (t, _, _, _) = asleep;
+        assert!(t < 1_000_000, "100 ms asleep: the thread clock moved {t} ns");
     }
 
     #[test]
