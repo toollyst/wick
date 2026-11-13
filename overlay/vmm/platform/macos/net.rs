@@ -120,6 +120,62 @@ pub fn user_endpoint_dir() -> io::Result<PathBuf> {
     Ok(Path::new(OsStr::from_bytes(dir.to_bytes())).join("firecracker-net"))
 }
 
+/// How long an opener waits for its turn in a directory ([`bind`]): far
+/// longer than any turn takes (a bind, a connect and an unlink).
+const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// An exclusive flock(2) on the directory of a path (its parent, or the
+/// working directory for a bare name), held until dropped.
+struct DirTurn {
+    /// Read by nothing: closing it releases the lock.
+    _dir: OwnedFd,
+}
+
+impl DirTurn {
+    /// Takes the lock, waiting at most `wait`; past it, fails with
+    /// [`io::ErrorKind::TimedOut`] and a message that names the directory.
+    fn take(path: &Path, wait: std::time::Duration) -> io::Result<Self> {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let name = std::ffi::CString::new(dir.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        // SAFETY: open of a NUL-terminated path.
+        let fd = unsafe {
+            libc::open(name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor was just opened and is owned here.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let start = std::time::Instant::now();
+        loop {
+            // SAFETY: flock of a descriptor owned here.
+            if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(DirTurn { _dir: fd });
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EWOULDBLOCK) | Some(libc::EINTR) => {}
+                _ => return Err(err),
+            }
+            if start.elapsed() >= wait {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{}: another opener of an endpoint there has held the directory's lock for \
+                         {wait:?} (flock); an endpoint is opened in turn with the others there",
+                        dir.display()
+                    ),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
 fn sockaddr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     // SAFETY: sockaddr_un is plain data.
     let mut addr: libc::sockaddr_un = unsafe { mem::zeroed() };
@@ -175,13 +231,33 @@ pub(crate) fn dgram_socket() -> io::Result<OwnedFd> {
 }
 
 /// Binds `sock` at `path`. A socket file nobody listens on any more is
-/// replaced; one in use fails with `EBUSY`, as a TAP opened twice does.
+/// replaced; one in use fails with `EBUSY`, as a TAP opened twice does
+/// (drivers/net/tun.c, v6.1, `tun_attach` :769 to :771).
+///
+/// Openers of names in one directory take turns, under an flock(2) on the
+/// directory, so that the bind, the probe of a file in the way and its
+/// replacement are one step to every other opener: of openers of one stale
+/// name at once, one replaces it and the others find it in use (`EBUSY`),
+/// and openers of `name%d` each get a unit of their own. Without the turns
+/// two openers could both find the file stale, and one remove the socket
+/// the other had just bound (`test_openers_of_a_stale_name_take_turns`: 1
+/// opener of 8 got the name, 6 `EADDRINUSE` and 1 `ENOENT`). The lock is
+/// the directory's open file, released however its holder ends; an opener
+/// waits for it at most [`TURN_WAIT`] and then fails, naming the directory,
+/// so that a stuck holder cannot hold Firecracker's start for ever.
+///
 /// Once the sandbox is narrowed (a device hot-plugged into a running
 /// microVM), a stale socket file is not replaced: removing it is setup's
 /// (`vmm::ext::sandbox`'s unlink rule), so the bind fails with
-/// `EADDRINUSE`, which the API reports, and the microVM runs on.
+/// `EADDRINUSE`, which the API reports, and the microVM runs on; that bind
+/// replaces nothing, so it takes no turn.
 pub(crate) fn bind(sock: &OwnedFd, path: &Path) -> io::Result<()> {
     let (addr, len) = sockaddr(path)?;
+    let _turn = if crate::ext::sandbox::narrowed() {
+        None
+    } else {
+        Some(DirTurn::take(path, TURN_WAIT)?)
+    };
     let try_bind = || {
         // SAFETY: bind with a valid address.
         let ret = unsafe { libc::bind(sock.as_raw_fd(), std::ptr::from_ref(&addr).cast(), len) };
@@ -1105,22 +1181,104 @@ mod tests {
 
     #[test]
     fn test_stale_endpoint_replaced() {
-        let path = endpoint_dir().unwrap().join("fcstale");
+        // This process's own name: a test run beside another (another
+        // worktree's) shares the user's endpoint directory.
+        let name = format!("fcstale{}", std::process::id());
+        let path = endpoint_dir().unwrap().join(&name);
         let _ = std::fs::remove_file(&path);
         // A process that died leaves its socket file behind.
         let sock = dgram_socket().unwrap();
         bind(&sock, &path).unwrap();
         drop(sock);
         assert!(path.exists());
-        let tap = Tap::open_named("fcstale").unwrap();
+        let tap = Tap::open_named(&name).unwrap();
         // A live one is busy, as a TAP opened twice.
-        let busy = Tap::open_named("fcstale").unwrap_err();
+        let busy = Tap::open_named(&name).unwrap_err();
         assert!(matches!(&busy, TapError::IfreqExecuteError(e, _) if e.raw_os_error() == Some(libc::EBUSY)), "{busy:?}");
         // Left behind by an ended VM, replaced by the next.
         drop(tap);
         assert!(path.exists());
-        drop(Tap::open_named("fcstale").unwrap());
+        drop(Tap::open_named(&name).unwrap());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Openers of one name at once, on a socket file a VM that ended left:
+    /// one gets it and every other one EBUSY, as a second TUNSETIFF on a TAP
+    /// another file holds (drivers/net/tun.c, v6.1, tun_attach :769 to :771);
+    /// and openers of `name%d` each get a unit of their own, as the kernel
+    /// numbers TAPs. Never AddrInUse, and never two holders of one name.
+    #[test]
+    fn test_openers_of_a_stale_name_take_turns() {
+        use std::sync::{Arc, Barrier};
+        const OPENERS: usize = 8;
+        let dir = std::env::temp_dir().join(format!("fc-turns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = |name: &str| {
+            let sock = dgram_socket().unwrap();
+            bind(&sock, &dir.join(name)).unwrap();
+        };
+        for round in 0..40 {
+            for (name, units) in [("one", false), ("unit%d", true)] {
+                if units {
+                    (0..4).for_each(|u| stale(&format!("unit{u}")));
+                } else {
+                    stale("one");
+                }
+                let start = Arc::new(Barrier::new(OPENERS));
+                let hold = Arc::new(Barrier::new(OPENERS));
+                let path = dir.join(name);
+                let results: Vec<Result<String, String>> = (0..OPENERS)
+                    .map(|_| {
+                        let (start, hold, path) = (start.clone(), hold.clone(), path.clone());
+                        std::thread::spawn(move || {
+                            start.wait();
+                            let got = Tap::open_named(path.to_str().unwrap());
+                            hold.wait();
+                            got.map(|tap| tap.if_name_as_str().to_owned()).map_err(|e| match &e {
+                                TapError::IfreqExecuteError(err, _) if err.raw_os_error() == Some(libc::EBUSY) => {
+                                    "EBUSY".to_owned()
+                                }
+                                other => format!("{other:?}"),
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|t| t.join().unwrap())
+                    .collect();
+                let held: Vec<&String> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+                let other: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).filter(|e| *e != "EBUSY").collect();
+                assert!(other.is_empty(), "round {round}, {name}: {results:?}");
+                if units {
+                    let mut names = held.clone();
+                    names.sort();
+                    names.dedup();
+                    assert_eq!(names.len(), OPENERS, "round {round}, {name}: {results:?}");
+                } else {
+                    assert_eq!(held.len(), 1, "round {round}, {name}: {results:?}");
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An opener waits for its turn only so long, then fails naming the
+    /// directory: a stuck holder of the directory's lock does not hold
+    /// Firecracker's start for ever.
+    #[test]
+    fn test_a_held_turn_fails_the_opener_by_name() {
+        let dir = std::env::temp_dir().join(format!("fc-held-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("held");
+        let holder = DirTurn::take(&path, TURN_WAIT).unwrap();
+        let start = std::time::Instant::now();
+        let err = DirTurn::take(&path, std::time::Duration::from_millis(200)).err().unwrap();
+        assert!(start.elapsed() >= std::time::Duration::from_millis(200));
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains(&*dir.to_string_lossy()), "{err}");
+        drop(holder);
+        drop(DirTurn::take(&path, std::time::Duration::from_millis(200)).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // An endpoint in a jail's network: made, reached and removed in the

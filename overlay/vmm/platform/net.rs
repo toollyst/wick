@@ -130,14 +130,20 @@ mod tests {
             Tap::open_named("a123456789abcdef"),
             Err(TapError::InvalidIfname)
         ));
-        let tap = Tap::open_named("a123456789abcde").unwrap();
-        assert_eq!(tap.if_name_as_str(), "a123456789abcde");
+        // 15 bytes, the longest name; this process's own, as a test run
+        // beside another (another worktree's) would find another's interface
+        // busy, as a TAP another process holds.
+        let longest = format!("a{:014}", std::process::id());
+        let tap = Tap::open_named(&longest).unwrap();
+        assert_eq!(tap.if_name_as_str(), longest);
     }
 
     #[test]
     fn test_exclusive_open() {
-        let _tap = Tap::open_named("fcexclusive").unwrap();
-        Tap::open_named("fcexclusive").unwrap_err();
+        // This process's own name (see test_names).
+        let name = format!("fcx{}", std::process::id());
+        let _tap = Tap::open_named(&name).unwrap();
+        Tap::open_named(&name).unwrap_err();
     }
 
     #[test]

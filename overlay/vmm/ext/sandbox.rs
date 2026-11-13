@@ -460,6 +460,12 @@ mod macos {
         // The Sandbox call narrow() takes the narrowed extension with
         // (PROFILE's system-mac-syscall rules).
         "__mac_syscall",
+        // platform::net::bind: openers of endpoints in one directory take
+        // turns under its flock, so that a stale socket file is replaced
+        // once and a live one is refused with EBUSY, as a TAP another file
+        // holds (test_openers_of_a_stale_name_take_turns). Once narrowed a
+        // bind replaces nothing and takes no turn.
+        "flock",
     ];
 
     /// The Mach traps a running microVM may make (`MSC_<name>`, XNU's
