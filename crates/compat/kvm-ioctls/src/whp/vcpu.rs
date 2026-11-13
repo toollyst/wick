@@ -6514,4 +6514,405 @@ mod fpu_tests {
         // SAFETY: the test's mapping, no VM left using it.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
     }
+
+    /// The MSI trigger record's guest memory: each handler's count, each
+    /// vCPU's (at `TRIG_PER_CPU` + 8 x its APIC ID) and the stop flag.
+    const TRIG_COUNT_A: u64 = 0x7000;
+    const TRIG_COUNT_B: u64 = 0x7008;
+    const TRIG_STOP: u64 = 0x7010;
+    const TRIG_PER_CPU: u64 = 0x7020;
+    /// The second handler's vector and code (the first is `MMIO_VECTOR`'s,
+    /// at `MMIO_HANDLER`).
+    const TRIG_VECTOR_B: u64 = 0x42;
+    const TRIG_HANDLER_B: u64 = 0xB900;
+    /// The MSI address of APIC ID 0, physical destination mode.
+    const TRIG_MSI: u64 = 0xFEE0_0000;
+
+    fn trig_read(m: *mut u8, at: u64) -> u64 {
+        // SAFETY: within the test's mapping, 8-byte aligned; the guest
+        // writes it with locked instructions.
+        unsafe { std::ptr::read_volatile(m.add(at as usize).cast::<u64>()) }
+    }
+
+    fn trig_now() -> u64 {
+        // SAFETY: RDTSC, which every x86-64 CPU has.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    /// A handler that adds one at `count` and at its CPU's slot (from the
+    /// local APIC's ID register; RBX holds the APIC's base), writes the EOI
+    /// and returns; RAX kept.
+    fn trig_handler(count: u64) -> Vec<u8> {
+        let mut h = vec![
+            0x50, // push rax
+            0x8B, 0x43, 0x20, // mov eax, [rbx + 0x20] (APIC ID)
+            0xC1, 0xE8, 0x18, // shr eax, 24
+            0xF0, 0x48, 0xFF, 0x04, 0xC5, // lock inc qword [rax * 8 + TRIG_PER_CPU]
+        ];
+        h.extend_from_slice(&(TRIG_PER_CPU as u32).to_le_bytes());
+        h.extend_from_slice(&[0xF0, 0x48, 0xFF, 0x04, 0x25]); // lock inc qword [count]
+        h.extend_from_slice(&(count as u32).to_le_bytes());
+        h.extend_from_slice(&[
+            0x58, // pop rax
+            0xC7, 0x83, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov dword [rbx + 0xB0], 0 (EOI)
+            0x48, 0xCF, // iretq
+        ]);
+        h
+    }
+
+    /// The record's VM: two vCPUs, each with its local APIC on and
+    /// interrupts on, in a loop that spins (`pause`) or halts (`hlt`) until
+    /// the stop flag is set, then `out 0x80`; vector `MMIO_VECTOR` counts at
+    /// `TRIG_COUNT_A`, `TRIG_VECTOR_B` at `TRIG_COUNT_B`.
+    fn trig_guest(halted: bool) -> (super::super::VmFd, VcpuFd, VcpuFd, *mut u8) {
+        let mut program = APIC_ON.to_vec();
+        // loop: cmp qword [TRIG_STOP], 0
+        program.extend_from_slice(&[0x48, 0x83, 0x3C, 0x25]);
+        program.extend_from_slice(&(TRIG_STOP as u32).to_le_bytes());
+        program.push(0x00);
+        if halted {
+            program.extend_from_slice(&[0x75, 0x03, 0xF4, 0xEB, 0xF2]); // jne out; hlt; jmp loop
+        } else {
+            program.extend_from_slice(&[0x75, 0x04, 0xF3, 0x90, 0xEB, 0xF1]); // jne out; pause; jmp loop
+        }
+        program.extend_from_slice(&[0xE6, PORT as u8, 0xEB, 0xFE]); // out: out 0x80, al; jmp $
+        let (vm, v0, m) = mmio_guest(&program);
+        put(m, MMIO_HANDLER, &trig_handler(TRIG_COUNT_A));
+        put(m, TRIG_HANDLER_B, &trig_handler(TRIG_COUNT_B));
+        let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
+        q(MMIO_IDT + TRIG_VECTOR_B * 16, (TRIG_HANDLER_B & 0xffff) | (8 << 16) | (0x8E << 40));
+        q(MMIO_IDT + TRIG_VECTOR_B * 16 + 8, 0);
+        let v1 = vm.create_vcpu(1).unwrap();
+        start(&v1);
+        let mut s = v1.get_sregs().unwrap();
+        (s.idt.base, s.idt.limit) = (MMIO_IDT, 0xfff);
+        v1.set_sregs(&s).unwrap();
+        v1.set_regs(&kvm_regs { rip: MMIO_PROGRAM, rsp: 0x8800, rflags: 2, ..Default::default() }).unwrap();
+        // Runnable: an AP is made waiting for a SIPI, as KVM makes one.
+        v1.set_mp_state(kvm_bindings::kvm_mp_state { mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE }).unwrap();
+        (vm, v0, v1, m)
+    }
+
+    /// Runs `vcpu` on a thread of its own, its WHP calls traced, until its
+    /// `out 0x80` (the guest's stop), a kick, an error or 20 other exits:
+    /// the vCPU, what the runs returned, and its `WHvRunVirtualProcessor`
+    /// calls counted by exit reason.
+    #[allow(clippy::type_complexity)]
+    fn trig_spawn(vcpu: VcpuFd) -> std::thread::JoinHandle<(VcpuFd, Vec<String>, String)> {
+        std::thread::spawn(move || {
+            let mut vcpu = vcpu;
+            let mut exits = Vec::new();
+            let mut reads = 0;
+            super::super::ffi::trace::begin();
+            loop {
+                let e = one_run(&mut vcpu, &[], &mut reads);
+                let end = e.starts_with("out 0x80") || e == "EINTR" || e.starts_with("run failed") || exits.len() >= 20;
+                exits.push(e);
+                if end {
+                    break;
+                }
+            }
+            let mut reasons = std::collections::BTreeMap::new();
+            for c in super::super::ffi::trace::end() {
+                if let (true, Some(exit)) = (c.call == "WHvRunVirtualProcessor", c.exit) {
+                    *reasons.entry(exit).or_insert(0u64) += 1;
+                }
+            }
+            let runs: Vec<String> = reasons.iter().map(|(r, n)| format!("{n} with exit reason {r:#x}")).collect();
+            (vcpu, exits, runs.join(", "))
+        })
+    }
+
+    /// One delivery: waits `settle`, calls `signal`, and gives the TSC
+    /// ticks until the guest's count at `at` moved, `None` after `limit`.
+    fn trig_once(m: *mut u8, at: u64, settle: std::time::Duration, limit: u64, signal: &dyn Fn()) -> Option<u64> {
+        spin(settle);
+        let before = trig_read(m, at);
+        let t0 = trig_now();
+        signal();
+        loop {
+            if trig_read(m, at) != before {
+                return Some(trig_now() - t0);
+            }
+            if trig_now() - t0 > limit {
+                return None;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Latencies as a line, in microseconds.
+    fn trig_line(ticks: &[Option<u64>], per_us: f64) -> String {
+        let lost = ticks.iter().filter(|t| t.is_none()).count();
+        let mut got: Vec<u64> = ticks.iter().flatten().copied().collect();
+        got.sort_unstable();
+        if got.is_empty() {
+            return format!("none of {} seen within 50 ms", ticks.len());
+        }
+        let at = |q: f64| got[((got.len() - 1) as f64 * q) as usize] as f64 / per_us;
+        format!(
+            "median {:.1} us, p90 {:.1}, p99 {:.1}, min {:.1}, max {:.1}; {lost} of {} not seen within 50 ms",
+            at(0.5),
+            at(0.9),
+            at(0.99),
+            at(0.0),
+            at(1.0),
+            ticks.len()
+        )
+    }
+
+    /// A trigger's parameters for the MSI `address`/`data` as the backend
+    /// would make them: `WHvTriggerTypeInterrupt` with the control
+    /// `inject_msi` requests (`irqchip::interrupt_control`).
+    fn trig_params(address: u64, data: u32) -> whv::WHV_TRIGGER_PARAMETERS {
+        whv::WHV_TRIGGER_PARAMETERS {
+            TriggerType: whv::WHvTriggerTypeInterrupt,
+            Reserved: 0,
+            Anonymous: whv::WHV_TRIGGER_PARAMETERS_0 { Interrupt: super::super::irqchip::interrupt_control(address, data) },
+        }
+    }
+
+    /// A record (TRIGREC lines) of WHP's triggers for an MSI route
+    /// (`WHvCreateTrigger`, Windows 10 20H2 and later on x64: an event
+    /// handle whose signal WHP turns into the interrupt itself), the
+    /// equivalent of KVM's injection of an MSI irqfd in the signaller's
+    /// context (Linux v6.1 virt/kvm/eventfd.c:186-210, `irqfd_wakeup` calls
+    /// `kvm_arch_set_irq_inatomic`, arch/x86/kvm/irq_comm.c:157-191, which
+    /// delivers an MSI there and then), against the two ways this backend
+    /// has: the irqfd watcher thread (an eventfd write, the watcher's
+    /// wake-up, `raise_gsi`, `WHvRequestInterrupt`, `wake_halted`) and a
+    /// direct `inject_msi` from the signalling thread. With the guest's two
+    /// vCPUs spinning, then halted:
+    /// - `WHvCreateTrigger` of the MSI's interrupt control: HRESULT,
+    ///   handles;
+    /// - the latency of each way, seen from the signalling thread (the
+    ///   signal to the guest handler's count moving in guest RAM), 300 each,
+    ///   in turn;
+    /// - the vCPU threads' runs by exit reason (whether a halted vCPU comes
+    ///   back to the backend's run loop: Halt exits, after which a trigger's
+    ///   interrupt waits for the loop's `HALT_POLL` re-entry, as
+    ///   `wake_halted` is not called);
+    /// - after a delivered signal, whether the event still reads signalled;
+    /// - coalescing: 1000 signals back to back, and 200 50 us apart, the
+    ///   deliveries counted for each way;
+    /// - `WHvUpdateTriggerParameters` on a route change: to vector B, to
+    ///   APIC ID 1, back; then 500 updates while another thread signals
+    ///   every 20 us (failed updates, deliveries to each vector and CPU),
+    ///   and the route that a signal after the last update takes;
+    /// - `WHvDeleteTrigger`, then a signal of its event, and the event's
+    ///   state after two waits (auto or manual reset).
+    ///
+    /// Printed, not asserted, but for each step's own end: the direct way
+    /// delivers at all, and each vCPU stops at its `out 0x80`.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture, alone"]
+    fn test_msi_triggers_against_the_irqfd_watcher_on_record() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::Threading::{SetEvent, WaitForSingleObject};
+        let ms = std::time::Duration::from_millis;
+        let us = std::time::Duration::from_micros;
+        let (i0, t0) = (std::time::Instant::now(), trig_now());
+        spin(ms(50));
+        let per_us = (trig_now() - t0) as f64 / i0.elapsed().as_secs_f64() / 1e6;
+        let limit = (per_us * 50_000.0) as u64;
+        eprintln!("TRIGREC host TSC {per_us:.1} ticks per us; the vCPU threads' WHP calls traced");
+        for halted in [false, true] {
+            let mode = if halted { "halted" } else { "spinning" };
+            let settle = if halted { us(300) } else { us(50) };
+            let (vm, v0, v1, m) = trig_guest(halted);
+            let inner = Arc::clone(&v0.shared.inner);
+            let part = v0.part();
+            // The watcher's way: an irqfd on GSI 24, routed to the MSI.
+            vm.create_irq_chip().unwrap();
+            let mut entry = kvm_bindings::kvm_irq_routing_entry { gsi: 24, type_: kvm_bindings::KVM_IRQ_ROUTING_MSI, ..Default::default() };
+            entry.u.msi = kvm_bindings::kvm_irq_routing_msi { address_lo: TRIG_MSI as u32, data: MMIO_VECTOR as u32, ..Default::default() };
+            vm.set_gsi_routing(&kvm_bindings::KvmIrqRouting::from_entries(&[entry]).unwrap()).unwrap();
+            let irqfd = vmm_sys_util::eventfd::EventFd::new(0).unwrap();
+            vm.register_irqfd(&irqfd, 24).unwrap();
+            // The trigger's way.
+            let mut trigger: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut event: HANDLE = std::ptr::null_mut();
+            let params = trig_params(TRIG_MSI, MMIO_VECTOR as u32);
+            // SAFETY: valid parameters and out pointers.
+            let created = unsafe { whv::WHvCreateTrigger(part, &params, &mut trigger, &mut event) };
+            eprintln!(
+                "TRIGREC {mode}: WHvCreateTrigger(interrupt, the MSI's control: vector {MMIO_VECTOR:#x}, APIC ID 0): HRESULT {:#010x}, trigger {trigger:p}, event {event:p}",
+                created.cast_unsigned()
+            );
+            let triggered = created == 0 && !event.is_null();
+            let kickers = [VcpuFd { shared: Arc::clone(&v0.shared), own: None }, VcpuFd { shared: Arc::clone(&v1.shared), own: None }];
+            let threads = [trig_spawn(v0), trig_spawn(v1)];
+            let direct = || inner.inject_msi(TRIG_MSI, MMIO_VECTOR as u32);
+            let watcher = || irqfd.write(1).unwrap();
+            let event_at = event as usize;
+            let signal = move || {
+                // SAFETY: the trigger's event, open until the end.
+                unsafe { SetEvent(event_at as HANDLE) };
+            };
+            // Both guests in their loop: a delivery to each.
+            let warm = trig_once(m, TRIG_COUNT_A, ms(5), limit, &direct);
+            let warm1 = trig_once(m, TRIG_PER_CPU + 8, ms(5), limit, &|| inner.inject_msi(TRIG_MSI | 1 << 12, MMIO_VECTOR as u32));
+            eprintln!("TRIGREC {mode}: a first direct delivery to vCPU 0 {warm:?} ticks, to vCPU 1 {warm1:?}");
+            assert!(warm.is_some(), "{mode}: the guest took no direct interrupt: the record has no guest");
+            let ways: Vec<(&str, &dyn Fn())> = if triggered {
+                vec![("direct inject_msi", &direct), ("irqfd watcher", &watcher), ("trigger", &signal)]
+            } else {
+                vec![("direct inject_msi", &direct), ("irqfd watcher", &watcher)]
+            };
+            let mut ticks = vec![Vec::new(); ways.len()];
+            for _ in 0..300 {
+                for (i, (_, way)) in ways.iter().enumerate() {
+                    ticks[i].push(trig_once(m, TRIG_COUNT_A, settle, limit, *way));
+                }
+            }
+            for (i, (name, _)) in ways.iter().enumerate() {
+                eprintln!("TRIGREC {mode}: latency, {name}: {}", trig_line(&ticks[i], per_us));
+            }
+            if triggered {
+                let got = trig_once(m, TRIG_COUNT_A, settle, limit, &signal);
+                spin(ms(1));
+                // SAFETY: the trigger's event.
+                let state = unsafe { WaitForSingleObject(event, 0) };
+                eprintln!("TRIGREC {mode}: after a delivered signal ({got:?} ticks) the event reads {state:#x} (0 signalled, 0x102 not)");
+            }
+            for (name, way) in &ways {
+                let before = trig_read(m, TRIG_COUNT_A);
+                for _ in 0..1000 {
+                    way();
+                }
+                spin(ms(20));
+                let burst = trig_read(m, TRIG_COUNT_A) - before;
+                let before = trig_read(m, TRIG_COUNT_A);
+                for _ in 0..200 {
+                    way();
+                    spin(us(50));
+                }
+                spin(ms(20));
+                let spaced = trig_read(m, TRIG_COUNT_A) - before;
+                eprintln!("TRIGREC {mode}: coalescing, {name}: 1000 back to back gave {burst} deliveries, 200 50 us apart gave {spaced}");
+            }
+            if triggered {
+                let counts = || [TRIG_COUNT_A, TRIG_COUNT_B, TRIG_PER_CPU, TRIG_PER_CPU + 8].map(|at| trig_read(m, at));
+                let update = |address: u64, vector: u64| {
+                    let p = trig_params(address, vector as u32);
+                    // SAFETY: valid parameters for the live trigger.
+                    unsafe { whv::WHvUpdateTriggerParameters(part, &p, trigger) }
+                };
+                for (what, address, vector) in [
+                    ("to vector B", TRIG_MSI, TRIG_VECTOR_B),
+                    ("to APIC ID 1", TRIG_MSI | 1 << 12, MMIO_VECTOR),
+                    ("back to vector A, APIC ID 0", TRIG_MSI, MMIO_VECTOR),
+                ] {
+                    let hres = update(address, vector);
+                    let before = counts();
+                    signal();
+                    spin(ms(20));
+                    let after = counts();
+                    let moved: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+                    eprintln!(
+                        "TRIGREC {mode}: WHvUpdateTriggerParameters {what}: HRESULT {:#010x}; one signal then moved vector A {}, B {}, vCPU 0 {}, vCPU 1 {}",
+                        hres.cast_unsigned(),
+                        moved[0],
+                        moved[1],
+                        moved[2],
+                        moved[3]
+                    );
+                }
+                let before = counts();
+                let stop = std::sync::atomic::AtomicBool::new(false);
+                let (failed, first, signals) = std::thread::scope(|scope| {
+                    let signaller = scope.spawn(|| {
+                        let mut n = 0u64;
+                        while !stop.load(Ordering::Relaxed) {
+                            signal();
+                            n += 1;
+                            spin(us(20));
+                        }
+                        n
+                    });
+                    let (mut failed, mut first) = (0, 0);
+                    for i in 0..500 {
+                        let hres = if i % 2 == 0 { update(TRIG_MSI | 1 << 12, TRIG_VECTOR_B) } else { update(TRIG_MSI, MMIO_VECTOR) };
+                        if hres != 0 {
+                            failed += 1;
+                            if first == 0 {
+                                first = hres;
+                            }
+                        }
+                        spin(us(200));
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    (failed, first, signaller.join().unwrap())
+                });
+                spin(ms(20));
+                let after = counts();
+                let moved: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+                eprintln!(
+                    "TRIGREC {mode}: 500 updates (vector B to APIC ID 1, then vector A to APIC ID 0, in turn) while another thread signalled {signals} times: \
+                     {failed} failed (first HRESULT {:#010x}); delivered vector A {}, B {}, vCPU 0 {}, vCPU 1 {}",
+                    first.cast_unsigned(),
+                    moved[0],
+                    moved[1],
+                    moved[2],
+                    moved[3]
+                );
+                let before = counts();
+                signal();
+                spin(ms(20));
+                let after = counts();
+                let moved: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+                eprintln!(
+                    "TRIGREC {mode}: a signal after the last update (vector A, APIC ID 0): vector A {}, B {}, vCPU 0 {}, vCPU 1 {}",
+                    moved[0], moved[1], moved[2], moved[3]
+                );
+                // SAFETY: the live trigger, deleted once.
+                let deleted = unsafe { whv::WHvDeleteTrigger(part, trigger) };
+                let before = trig_read(m, TRIG_COUNT_A);
+                signal();
+                spin(ms(20));
+                let after_delete = trig_read(m, TRIG_COUNT_A) - before;
+                // SAFETY: the event, still open.
+                let (w1, w2) = unsafe { (WaitForSingleObject(event, 0), WaitForSingleObject(event, 0)) };
+                // SAFETY: the event handle WHvCreateTrigger gave, closed once.
+                let closed = unsafe { CloseHandle(event) };
+                eprintln!(
+                    "TRIGREC {mode}: WHvDeleteTrigger HRESULT {:#010x}; a signal after it delivered {after_delete}; then two waits read {w1:#x}, {w2:#x}; CloseHandle {closed}",
+                    deleted.cast_unsigned()
+                );
+            }
+            // SAFETY: within the test's mapping.
+            unsafe { std::ptr::write_volatile(m.add(TRIG_STOP as usize).cast::<u64>(), 1) };
+            for id in 0..2u64 {
+                inner.inject_msi(TRIG_MSI | id << 12, MMIO_VECTOR as u32);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while threads.iter().any(|t| !t.is_finished()) && std::time::Instant::now() < deadline {
+                std::thread::sleep(ms(1));
+            }
+            let mut kickers = kickers;
+            for (k, t) in kickers.iter_mut().zip(&threads) {
+                if !t.is_finished() {
+                    k.set_kvm_immediate_exit(1);
+                }
+            }
+            let ended: Vec<(VcpuFd, Vec<String>, String)> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+            for (i, (_, exits, runs)) in ended.iter().enumerate() {
+                eprintln!("TRIGREC {mode}: vCPU {i}: runs returned {exits:?}; WHvRunVirtualProcessor calls: {runs}");
+            }
+            for (i, (_, exits, _)) in ended.iter().enumerate() {
+                assert!(
+                    exits.last().is_some_and(|e| e.starts_with("out 0x80")),
+                    "{mode}: vCPU {i} did not stop at its out 0x80: {exits:?}"
+                );
+            }
+            drop(kickers);
+            drop(ended);
+            drop(irqfd);
+            // The partition goes with the VM's last reference, this one.
+            drop(inner);
+            drop(vm);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+    }
 }

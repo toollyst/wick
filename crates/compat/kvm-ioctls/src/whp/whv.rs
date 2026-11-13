@@ -113,6 +113,36 @@ pub(crate) unsafe fn WHvCreatePartition(partition: *mut WHV_PARTITION_HANDLE) ->
     }
 }
 
+/// `WHvCreateTrigger` from `winhvplatform.dll`, loaded at first use. Only
+/// the MSI trigger record calls it
+/// (`test_msi_triggers_against_the_irqfd_watcher_on_record`); the backend
+/// does not.
+///
+/// # Safety
+/// As the Windows function.
+#[cfg(test)]
+pub(crate) unsafe fn WHvCreateTrigger(
+    partition: WHV_PARTITION_HANDLE,
+    parameters: *const WHV_TRIGGER_PARAMETERS,
+    triggerhandle: *mut *mut core::ffi::c_void,
+    eventhandle: *mut windows_sys::Win32::Foundation::HANDLE,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(
+        WHV_PARTITION_HANDLE,
+        *const WHV_TRIGGER_PARAMETERS,
+        *mut *mut core::ffi::c_void,
+        *mut windows_sys::Win32::Foundation::HANDLE,
+    ) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvCreateTrigger")) {
+        // SAFETY: the address of `WHvCreateTrigger`, whose signature `F` is.
+        Some(p) => unsafe {
+            std::mem::transmute::<usize, F>(p)(partition, parameters, triggerhandle, eventhandle)
+        },
+        None => unavailable(Dll::Platform),
+    }
+}
+
 /// `WHvCreateVirtualProcessor` from `winhvplatform.dll`, loaded at first use.
 ///
 /// # Safety
@@ -141,6 +171,25 @@ pub(crate) unsafe fn WHvDeletePartition(partition: WHV_PARTITION_HANDLE) -> HRES
     match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvDeletePartition")) {
         // SAFETY: the address of `WHvDeletePartition`, whose signature `F` is.
         Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(partition) },
+        None => unavailable(Dll::Platform),
+    }
+}
+
+/// `WHvDeleteTrigger` from `winhvplatform.dll`, loaded at first use; as
+/// [`WHvCreateTrigger`], for the record only.
+///
+/// # Safety
+/// As the Windows function.
+#[cfg(test)]
+pub(crate) unsafe fn WHvDeleteTrigger(
+    partition: WHV_PARTITION_HANDLE,
+    triggerhandle: *const core::ffi::c_void,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(WHV_PARTITION_HANDLE, *const core::ffi::c_void) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvDeleteTrigger")) {
+        // SAFETY: the address of `WHvDeleteTrigger`, whose signature `F` is.
+        Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(partition, triggerhandle) },
         None => unavailable(Dll::Platform),
     }
 }
@@ -747,6 +796,30 @@ pub(crate) unsafe fn WHvUnmapGpaRange(
         Some(p) => unsafe {
             std::mem::transmute::<usize, F>(p)(partition, guestaddress, sizeinbytes)
         },
+        None => unavailable(Dll::Platform),
+    }
+}
+
+/// `WHvUpdateTriggerParameters` from `winhvplatform.dll`, loaded at first
+/// use; as [`WHvCreateTrigger`], for the record only.
+///
+/// # Safety
+/// As the Windows function.
+#[cfg(test)]
+pub(crate) unsafe fn WHvUpdateTriggerParameters(
+    partition: WHV_PARTITION_HANDLE,
+    parameters: *const WHV_TRIGGER_PARAMETERS,
+    triggerhandle: *const core::ffi::c_void,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(
+        WHV_PARTITION_HANDLE,
+        *const WHV_TRIGGER_PARAMETERS,
+        *const core::ffi::c_void,
+    ) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvUpdateTriggerParameters")) {
+        // SAFETY: the address of `WHvUpdateTriggerParameters`, whose signature `F` is.
+        Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(partition, parameters, triggerhandle) },
         None => unavailable(Dll::Platform),
     }
 }

@@ -1065,6 +1065,16 @@ jobs:
           # guest's RDMSR/WRMSR of 0x3b and how far a write moves its TSC;
           # the guest's WRMSR of IA32_TSC and TSC_ADJUST after it.
           alone whp::vcpu::fpu_tests::test_tsc_adjust_offered_to_the_guest_on_record
+          # WHP's triggers for an MSI route (TRIGREC lines), the equivalent of
+          # KVM's MSI irqfd injected in the signaller's context: created for
+          # the MSI's interrupt control, signalled from another thread; the
+          # latency of a trigger, of the irqfd watcher and of a direct
+          # inject_msi with the guest spinning and halted, and the vCPU
+          # threads' runs by exit reason; coalescing of bursts and of spaced
+          # signals; WHvUpdateTriggerParameters on a route change and racing
+          # signals; WHvDeleteTrigger. Record only: the backend has no
+          # trigger.
+          alone whp::vcpu::fpu_tests::test_msi_triggers_against_the_irqfd_watcher_on_record
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
           alone windows_fd::tests::test_non_blocking_pipe_writes_on_record
