@@ -1577,6 +1577,13 @@ function Base-Config([int]$vcpus, [int]$mem = 256, [string]$bootArgs = $BootArgs
 # an API socket, returned as the `ApiSock` note property and waited for.
 # -LogPath gives Firecracker another --log-path (a named pipe) than the
 # stage's file.
+# A socket's path in $SockDir, for a name within the bound the start
+# checked the directory against ($SockName bytes).
+function Get-SockPath([string]$name) {
+    Check ([Text.Encoding]::UTF8.GetByteCount($name) -le $SockName) "the socket name $name is longer than $SockName bytes, which the socket directory's bound assumes"
+    return (Join-Path $SockDir $name)
+}
+
 function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api, [string]$LogPath = '') {
     $dir = Join-Path $Results $name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -1595,7 +1602,7 @@ function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api, [st
     }
     $sock = $null
     if ($Api) {
-        $sock = Join-Path $SockDir "$name.api"
+        $sock = Get-SockPath "$name.api"
         if (Test-Path $sock) { [IO.File]::Delete($sock) }
         $fcArgs += " --api-sock `"$sock`""
     } else {
@@ -1863,7 +1870,7 @@ function Stage-Block {
 }
 
 function Stage-Vsock {
-    $uds = Join-Path $SockDir 'v.sock'
+    $uds = Get-SockPath 'v.sock'
     if (Test-Path $uds) { Remove-Item $uds -Force }
     $cfg = Base-Config 2
     $cfg['vsock'] = [ordered]@{ guest_cid = 3; uds_path = $uds }
@@ -1948,7 +1955,7 @@ function Test-NetRateLimiters($vm, $switch) {
 }
 
 function Stage-Net {
-    $endpoint = Join-Path $SockDir 'n.ep'
+    $endpoint = Get-SockPath 'n.ep'
     if (Test-Path $endpoint) { Remove-Item $endpoint -Force }
     $cfg = Base-Config 2
     $cfg['network-interfaces'] = @([ordered]@{ iface_id = 'eth0'; host_dev_name = $endpoint; guest_mac = $GuestMac })
@@ -2017,7 +2024,7 @@ function Stage-Snapshot([switch]$Pci) {
     $bootArgs = if ($Pci) { $BootArgs -replace ' pci=off', '' } else { $BootArgs }
     $dir = Join-Path $Scratch $tag
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $uds = Join-Path $SockDir "$tag.v"
+    $uds = Get-SockPath "$tag.v"
     if (Test-Path $uds) { [IO.File]::Delete($uds) }
     $data = Join-Path $dir 'data.img'
     [Wick.Util]::WriteRandom($data, 4MB)
@@ -2068,7 +2075,7 @@ function Stage-Snapshot([switch]$Pci) {
 function Stage-Restores([int]$Rounds = 20) {
     $dir = Join-Path $Scratch 'restores'
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $uds = Join-Path $SockDir 'rs.v'
+    $uds = Get-SockPath 'rs.v'
     if (Test-Path $uds) { [IO.File]::Delete($uds) }
     $cfg = Base-Config 2
     $cfg['vsock'] = [ordered]@{ guest_cid = 3; uds_path = $uds }
@@ -2150,7 +2157,7 @@ function Stage-Uffd {
     Check ($null -ne $f) "needs the snapshot stage's files (-Stage snapshot,uffd)"
     # The snapshot's vsock socket path is reused as it was.
     if (Test-Path $f.Uds) { [IO.File]::Delete($f.Uds) }
-    $sock = Join-Path $SockDir 'uffd'
+    $sock = Get-SockPath 'uffd'
     if (Test-Path $sock) { [IO.File]::Delete($sock) }
     $log = Join-Path (Join-Path $Results 'uffd') 'handler.txt'
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
@@ -2186,7 +2193,7 @@ function Stage-VhostUser {
     $img = Join-Path $dir 'vub.img'
     [Wick.Util]::WriteRandom($img, 8MB)
     $want = [Wick.Util]::Md5File($img, -1)
-    $sock = Join-Path $SockDir 'vub'
+    $sock = Get-SockPath 'vub'
     if (Test-Path $sock) { [IO.File]::Delete($sock) }
     $log = Join-Path (Join-Path $Results 'vhost-user') 'backend.txt'
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
@@ -2278,7 +2285,7 @@ function Stage-Devices {
     New-Item -ItemType File -Force -Path $metrics | Out-Null
     $data = Join-Path $dir 'data.img'
     [Wick.Util]::WriteRandom($data, 4MB)
-    $endpoint = Join-Path $SockDir 'd.ep'
+    $endpoint = Get-SockPath 'd.ep'
     if (Test-Path $endpoint) { Remove-Item $endpoint -Force }
     $cfg = Base-Config 2 512
     $cfg['drives'] += [ordered]@{
@@ -3316,7 +3323,7 @@ function Stage-Gdb {
     # Code is not all zeros: zeros are what a section without its bytes reads as.
     Check ($fileStart -notmatch '^(0x00 ?)+$' -and $fileText -notmatch '^(0x00 ?)+$') "gdb read zeros for start_kernel or _text in $kernel (no code bytes in the file it read): $offlineText"
 
-    $sock = Join-Path $SockDir 'gdb.sock'
+    $sock = Get-SockPath 'gdb.sock'
     if (Test-Path $sock) { [IO.File]::Delete($sock) }
     $config = Base-Config 1
     $config.'boot-source'.kernel_image_path = $kernel
@@ -3634,16 +3641,22 @@ $WorkDir = (Resolve-Path $WorkDir).Path
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $Results = Join-Path $WorkDir "results-$stamp"
 New-Item -ItemType Directory -Force -Path $Results | Out-Null
-# Unix socket paths hold at most 107 bytes.
+# An AF_UNIX socket's path holds at most 107 bytes (sun_path[108] with its
+# NUL: Linux unix(7); Winsock afunix.h, UNIX_PATH_MAX 108). Every socket of
+# the stages is a name of at most $SockName bytes in $SockDir (Start-Vm's
+# "<name>.api" the longest, 'cli-no-boot-timer.api'; Get-SockPath checks
+# each): a directory that leaves no room for one is refused before any
+# stage, naming the path and the limit.
+$SockName = 24
 $SockDir = Join-Path $Results 's'
-New-Item -ItemType Directory -Force -Path $SockDir | Out-Null
-if ((Join-Path $SockDir 'v.sock_53').Length -gt 100) {
+if ([Text.Encoding]::UTF8.GetByteCount($SockDir) + 1 + $SockName -gt 107) {
     $SockDir = Join-Path ([IO.Path]::GetTempPath()) "wbt-$stamp"
-    New-Item -ItemType Directory -Force -Path $SockDir | Out-Null
-    if ((Join-Path $SockDir 'v.sock_53').Length -gt 100) {
-        throw "socket paths under $SockDir would be too long for AF_UNIX; pass a short -WorkDir such as C:\wbt"
-    }
 }
+$longestSock = Join-Path $SockDir ('n' * $SockName)
+if ([Text.Encoding]::UTF8.GetByteCount($longestSock) -gt 107) {
+    throw "socket paths would be up to $([Text.Encoding]::UTF8.GetByteCount($longestSock)) bytes ($longestSock), and an AF_UNIX path holds 107; pass a short -WorkDir such as C:\wbt (or set TEMP shorter)"
+}
+New-Item -ItemType Directory -Force -Path $SockDir | Out-Null
 # Snapshot memory files (256 MiB each) stay out of the results archive.
 $Scratch = Join-Path $WorkDir "scratch-$stamp"
 New-Item -ItemType Directory -Force -Path $Scratch | Out-Null

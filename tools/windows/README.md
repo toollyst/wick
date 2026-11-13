@@ -67,6 +67,12 @@
   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir C:\wjt
   ```
 
+  The work directory must be short: a jail's API socket is reached at
+  `<WorkDir>\<stage>\firecracker.exe\<id>\root\run\firecracker.socket`, and an
+  AF_UNIX path holds 107 bytes. A WorkDir that leaves no room for it is
+  refused before any stage, naming the path and the limit (the boot
+  test's socket directory is checked the same way).
+
 - `jail-parent.rs` (`jail-parent.exe` in CI's artifact): the operator's tool
   for a parent cgroup, what `mkdir` and `echo` into the parent's directory
   are on Linux. The jailer's `--parent-cgroup <name>` is the Job Object

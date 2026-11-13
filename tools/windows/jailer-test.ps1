@@ -43,10 +43,32 @@ if (-not $Bin) { $Bin = Join-Path (Split-Path -Parent (Split-Path -Parent $Here)
 $Jailer = Join-Path $Bin 'jailer.exe'
 $Fc = Join-Path $Bin 'firecracker.exe'
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+$WorkDir = (Resolve-Path $WorkDir).Path
 $Results = [ordered]@{}
 
 class Failure : Exception { Failure([string]$m) : base($m) {} }
 function Check([bool]$ok, [string]$what) { if (-not $ok) { throw [Failure]::new($what) } }
+
+# An AF_UNIX socket's path holds at most 107 bytes (sun_path[108] with its
+# NUL: Linux unix(7), "path must be shorter than SUN_LEN"; Winsock afunix.h,
+# UNIX_PATH_MAX 108). The longest path the stages connect to from outside a
+# jail is a jail's API socket, <WorkDir>\<base>\firecracker.exe\<id>\root\
+# run\firecracker.socket, with a base (New-Base) and an id of at most 12
+# characters. A WorkDir that leaves no room is refused here, before any
+# stage: on a PC one 163 bytes long made 8 stages fail at their connects.
+$SockBound = 107
+$NameBound = 12
+$longestSock = Join-Path $WorkDir (('b' * $NameBound) + '\firecracker.exe\' + ('i' * $NameBound) + '\root\run\firecracker.socket')
+$longestBytes = [Text.Encoding]::UTF8.GetByteCount($longestSock)
+if ($longestBytes -gt $SockBound) {
+    throw "-WorkDir $WorkDir is too long: a jail's API socket path would be $longestBytes bytes ($longestSock), and an AF_UNIX path holds $SockBound; pass a shorter one, such as C:\wjt"
+}
+
+# Fails unless `sock` fits an AF_UNIX path, naming it and the limit.
+function Assert-SockPath([string]$sock) {
+    $n = [Text.Encoding]::UTF8.GetByteCount($sock)
+    Check ($n -le $SockBound) "the socket path $sock is $n bytes, and an AF_UNIX path holds $SockBound"
+}
 
 # Firecracker first: its jailer then exits as after a guest shutdown and
 # removes the jail's drive.
@@ -72,6 +94,7 @@ function Stop-Jailers([object[]]$jailers) {
 
 # A fresh chroot base for a stage.
 function New-Base([string]$name) {
+    Check ($name.Length -le $NameBound) "the base $name is longer than $NameBound characters, which the socket paths' bound assumes"
     $b = Join-Path $WorkDir $name
     if (Test-Path $b) { Remove-Item -Recurse -Force $b }
     New-Item -ItemType Directory -Force -Path $b | Out-Null
@@ -605,6 +628,7 @@ function Start-ApiJail([string]$base, [string]$id, [string[]]$jailerArgs = @()) 
 # sent as JSON from a file: Windows PowerShell drops the quotes of a JSON
 # argument.
 function Invoke-Api([string]$sock, [string]$method, [string]$path, $body = $null) {
+    Assert-SockPath $sock
     $a = @('-s', '-o', '-', '-w', ' %{http_code}', '--unix-socket', $sock, '-X', $method, "http://localhost$path")
     if ($null -ne $body) {
         $file = Join-Path $WorkDir "api-body-$PID.json"

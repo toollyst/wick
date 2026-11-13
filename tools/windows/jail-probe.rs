@@ -340,13 +340,21 @@ const PROTOCOL_INFO: usize = 628;
 /// `FROM_PROTOCOL_INFO`.
 const FROM_INFO: i32 = -1;
 
-/// A `sockaddr_un` for `path`.
+/// A `sockaddr_un` for `path`. A path that does not fit `sun_path`'s 108
+/// bytes with its NUL ends the probe (exit 2), saying so, as Rust's std on
+/// Linux refuses it ("path must be shorter than SUN_LEN"): a path cut to
+/// fit named another socket, whose connect failed with 10061
+/// (WSAECONNREFUSED) as if nothing listened, and a check's answer must not
+/// be a path's length.
 fn sockaddr_un(path: &str) -> [u8; 110] {
     let mut addr = [0u8; 110];
     addr[0] = 1; // AF_UNIX
-    let path = path.as_bytes();
-    let n = path.len().min(107);
-    addr[2..2 + n].copy_from_slice(&path[..n]);
+    let bytes = path.as_bytes();
+    if bytes.len() > 107 {
+        eprintln!("jail-probe: {path}: path must be shorter than SUN_LEN: {} bytes, 107 at most", bytes.len());
+        std::process::exit(2);
+    }
+    addr[2..2 + bytes.len()].copy_from_slice(bytes);
     addr
 }
 
