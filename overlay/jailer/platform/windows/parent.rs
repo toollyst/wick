@@ -18,15 +18,21 @@
 //! jail's processes are put in it and then in the jail's own job, which is
 //! thereby nested in it: Windows bounds a nested job by its parent's memory
 //! limit, CPU rate and processors (Microsoft Learn, "Nested Jobs"; measured
-//! on Windows Server 2025 build 26100, `test_nested_jobs_on_record`). The
-//! same two places read it:
+//! on Windows Server 2025 build 26100, `test_nested_jobs_on_record`). A
+//! parent of several levels (`a/b`, as upstream's own test names one) is a
+//! job for each level, `...-a` and `...-a/b`: a process is put in them from
+//! the top down, so each is nested in the one above, and every level's
+//! limits hold what is under it, as every directory's do on Linux
+//! (`cgroup_values`, "A parent cgroup"). The same two places read it:
 //!
-//! - with `--cgroup` and a parent named on the command line, the job is
-//!   opened, or made if there is none, without limits, as Linux makes the
-//!   directory;
+//! - with `--cgroup` and a parent named on the command line, the job of
+//!   every level is opened, or made if there is none, without limits, as
+//!   Linux makes the directories (`create_dir_all`);
 //! - with `--cgroup` and upstream's default parent (the exec file's name),
 //!   and with `--cgroup-version 2` and no `--cgroup`, the job is joined if it
-//!   exists and nothing is done if it does not. The default parent is not
+//!   exists and nothing is done if it does not (a parent whose last level
+//!   exists while one above it does not is no directory tree: the jailer
+//!   stops). The default parent is not
 //!   made: a parent without limits bounds nothing, and making one would nest
 //!   every jail's job on every start. Its limits come first, then its jails
 //!   (the difference from Linux, where limits written later to the default
@@ -40,9 +46,10 @@
 //! `EBUSY`). A Job Object's name lasts as long as a handle to it is open
 //! (measured: with no handle left the name is gone even while processes
 //! are in the job; the job itself and its limits last as long as its
-//! processes). So two things hold a parent: the operator's tool, for as
-//! long as it runs, which is what keeps an empty parent and its limits; and
-//! each jailer, which keeps its handle until its jail ends, so that a
+//! processes). So two things hold a parent, every level of it: the
+//! operator's tool, for as long as it runs, which is what keeps an empty
+//! parent and its limits; and
+//! each jailer, which keeps its handles until its jail ends, so that a
 //! parent with a jail in it cannot go away, name and limits, whatever
 //! becomes of the tool. With neither, the parent is gone and the next jail
 //! that names it makes a new one without limits: the one difference from
@@ -53,15 +60,15 @@
 //! join. A job the jailer did not make itself is used only when it is owned
 //! by the jailer's account, the administrators or the system and is not
 //! labelled below medium integrity, which what a jailed process makes is
-//! (`cgroup_values::trusted_parent`); otherwise the jailer stops.
+//! (`cgroup_values::trusted_parent`); otherwise the jailer stops. Every
+//! level is checked.
 //!
 //! **What is never done.** If Windows refuses to put a process in the
 //! parent's job, or in the jail's job once it is in the parent's (Microsoft
 //! Learn says a job with UI limits, as a jail's is, is not nested; build
 //! 26100 nests it; Windows 10, 11 and Server 2022 are not measured), the
 //! jailer fails with Windows's error. It never starts the jail outside the
-//! parent it was given. A parent of several path components is refused
-//! (`cgroup_values::PARENT_ONE_LEVEL`).
+//! parent it was given, nor under some of its levels only.
 
 use std::ffi::OsStr;
 use std::io;
@@ -85,7 +92,9 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-use super::cgroup_values::{cpus_under_parent, parent_job_name, rate_under_parent, trusted_parent};
+use super::cgroup_values::{
+    PARENT_JOB_PREFIX, cpus_of_levels, cpus_under_parent, parent_job_names, rate_of_levels, rate_under_parent, trusted_parent,
+};
 use super::{GroupAffinity, HostError, Limits, last_error, sid_string, token_info, user_sid, wide};
 
 /// `JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_QUERY | READ_CONTROL`: what the
@@ -134,7 +143,7 @@ pub(crate) fn plan_of<S: AsRef<OsStr>>(version: u8, args: impl IntoIterator<Item
     // A named parent that cannot be a job's name is refused here, at the
     // argument, not when the jail starts.
     if plan.named {
-        parent_job_name(&plan.parent).map_err(|why| HostError::Unsupported("parent-cgroup", why))?;
+        parent_job_names(&plan.parent).map_err(|why| HostError::Unsupported("parent-cgroup", why))?;
     }
     Ok(Some(plan))
 }
@@ -154,79 +163,117 @@ pub(crate) fn for_jail() -> Result<Option<Parent>, HostError> {
     }
 }
 
-/// A parent cgroup's job, held open for as long as the jail lives.
+/// A parent cgroup's jobs, one for each level of its path, the top first,
+/// held open for as long as the jail lives.
 #[derive(Debug)]
 pub(crate) struct Parent {
-    job: OwnedHandle,
+    jobs: Vec<OwnedHandle>,
     /// The parent as the command line has it.
     name: String,
     version: u8,
-    /// Whether this jailer made the job (there was none of the name).
+    /// Whether this jailer made the last level's job (there was none of
+    /// the name).
     pub(crate) created: bool,
 }
 
 impl Parent {
     pub(crate) fn of(plan: &Plan) -> Result<Option<Parent>, HostError> {
         let fail = |why: String| HostError::Parent(plan.parent.clone(), why);
-        // The default parent's name is a file's name: it has no separator.
-        let name = parent_job_name(&plan.parent).map_err(|why| fail(why.to_string()))?;
-        let (job, created) = if plan.named && plan.with_cgroup {
-            create_or_open(&name).map_err(|e| fail(format!("its job could not be made or opened: {e}")))?
-        } else {
-            match open(&name).map_err(|e| fail(format!("its job could not be opened: {e}")))? {
-                Some(job) => (job, false),
-                None => return Ok(None),
+        // The default parent's name is a file's name: it has one level.
+        let names = parent_job_names(&plan.parent).map_err(|why| fail(why.to_string()))?;
+        let make = plan.named && plan.with_cgroup;
+        let mut jobs = Vec::new();
+        let mut created = false;
+        let mut missing = None;
+        for name in &names {
+            let level = name.strip_prefix(PARENT_JOB_PREFIX).unwrap_or(name);
+            let (job, made) = if make {
+                create_or_open(name).map_err(|e| fail(format!("the job of {name} could not be made or opened: {e}")))?
+            } else {
+                match open(name).map_err(|e| fail(format!("the job of {name} could not be opened: {e}")))? {
+                    Some(job) => (job, false),
+                    None => {
+                        missing.get_or_insert(level);
+                        continue;
+                    }
+                }
+            };
+            if let Some(above) = missing {
+                // A level that exists under one that does not: Linux has no
+                // such tree, and the limits of the level above would not
+                // hold the jail.
+                return Err(fail(format!("the job of {name} exists and that of {above}, above it, does not")));
             }
-        };
-        if !created {
-            let (owner, label) = owner_and_label(&job).map_err(|e| fail(format!("its job's owner and label could not be read: {e}")))?;
-            let mine = [user_sid(), token_owner_sid()].into_iter().collect::<io::Result<Vec<String>>>();
-            let mine = mine.map_err(|e| fail(format!("this process's account could not be read: {e}")))?;
-            trusted_parent(&owner, label, &mine).map_err(fail)?;
+            if !made {
+                let (owner, label) =
+                    owner_and_label(&job).map_err(|e| fail(format!("the owner and label of the job of {name} could not be read: {e}")))?;
+                let mine = [user_sid(), token_owner_sid()].into_iter().collect::<io::Result<Vec<String>>>();
+                let mine = mine.map_err(|e| fail(format!("this process's account could not be read: {e}")))?;
+                trusted_parent(&owner, label, &mine).map_err(|why| fail(format!("{name}: {why}")))?;
+            }
+            created = made;
+            jobs.push(job);
         }
-        Ok(Some(Parent { job, name: plan.parent.clone(), version: plan.version, created }))
+        if missing.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(Parent { jobs, name: plan.parent.clone(), version: plan.version, created }))
+    }
+
+    /// The job of the parent's last level, which a jail's own job is put
+    /// under.
+    pub(crate) fn job(&self) -> &OwnedHandle {
+        self.jobs.last().expect("a parent has a level")
     }
 
     /// The jail's limits as its job under this parent takes them: the CPU
-    /// rate as a share of the parent's and the processors within the
-    /// parent's, by Linux's rule for the cgroup version
-    /// (`cgroup_values::rate_under_parent`, `cpus_under_parent`), which
-    /// refuses with cgroup v1 what Windows would narrow without a word. A
-    /// limit the jail does not ask for, or the parent does not have, is
-    /// left as it is; the memory limit is the jail's own under any parent,
-    /// as on Linux.
+    /// rate as a share of what the parent's levels come to and the
+    /// processors within theirs, by Linux's rule for the cgroup version
+    /// (`cgroup_values::rate_under_parent`, `cpus_under_parent`,
+    /// `rate_of_levels`, `cpus_of_levels`), which refuses with cgroup v1
+    /// what Windows would narrow without a word. A limit the jail does not
+    /// ask for, or no level of the parent has, is left as it is; the memory
+    /// limit is the jail's own under any parent, as on Linux.
     pub(crate) fn limits(&self, limits: &Limits) -> Result<Limits, HostError> {
-        let fail = |what: &str, e: io::Error| HostError::Parent(self.name.clone(), format!("its job's {what} could not be read: {e}"));
+        let fail = |what: &str, e: io::Error| HostError::Parent(self.name.clone(), format!("its jobs' {what} could not be read: {e}"));
         let mut out = limits.clone();
-        if let Some(asked) = limits.cpu_rate
-            && let Some(parent) = hard_cap(&self.job).map_err(|e| fail("CPU rate", e))?
-        {
-            let file = if self.version == 1 { "cpu.cfs_quota_us" } else { "cpu.max" };
-            let rate = rate_under_parent(self.version, asked, parent)
-                .map_err(|why| HostError::CgroupValue(format!("{file} under --parent-cgroup {}", self.name), why))?;
-            out.cpu_rate = Some(rate);
+        if let Some(asked) = limits.cpu_rate {
+            let caps = self.jobs.iter().map(hard_cap).collect::<io::Result<Vec<_>>>().map_err(|e| fail("CPU rate", e))?;
+            if let Some(parent) = rate_of_levels(&caps) {
+                let file = if self.version == 1 { "cpu.cfs_quota_us" } else { "cpu.max" };
+                let rate = rate_under_parent(self.version, asked, parent)
+                    .map_err(|why| HostError::CgroupValue(format!("{file} under --parent-cgroup {}", self.name), why))?;
+                out.cpu_rate = Some(rate);
+            }
         }
-        if let Some(asked) = &limits.cpus
-            && let Some(parent) = processors(&self.job).map_err(|e| fail("processors", e))?
-        {
-            let cpus = cpus_under_parent(self.version, asked, &parent)
-                .map_err(|why| HostError::CgroupValue(format!("cpuset.cpus under --parent-cgroup {}", self.name), why))?;
-            out.cpus = Some(cpus);
+        if let Some(asked) = &limits.cpus {
+            let levels = self.jobs.iter().map(processors).collect::<io::Result<Vec<_>>>().map_err(|e| fail("processors", e))?;
+            if let Some(parent) = cpus_of_levels(&levels) {
+                let cpus = cpus_under_parent(self.version, asked, &parent)
+                    .map_err(|why| HostError::CgroupValue(format!("cpuset.cpus under --parent-cgroup {}", self.name), why))?;
+                out.cpus = Some(cpus);
+            }
         }
         Ok(out)
     }
 }
 
 /// Puts a process of the jail, suspended still, in its jobs: the parent's
-/// first, if the jail has one, then the jail's own (the order Microsoft
-/// Learn gives for nested jobs). A refusal is Windows's error, named by the
+/// first, if the jail has one, from its top level down, then the jail's own
+/// (the order Microsoft Learn gives for nested jobs). A refusal is Windows's error, named by the
 /// step; the process is then in no job of the jail's and the caller ends
 /// it.
 pub(crate) fn enter(parent: Option<&Parent>, job: &OwnedHandle, process: HANDLE) -> Result<(), (&'static str, io::Error)> {
-    if let Some(parent) = parent {
+    for (level, job) in parent.iter().flat_map(|parent| parent.jobs.iter().enumerate()) {
         // SAFETY: handles the caller and the parent own.
-        if unsafe { AssignProcessToJobObject(parent.job.as_raw_handle(), process) } == 0 {
-            return Err(("AssignProcessToJobObject: the parent cgroup's job", last_error()));
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) } == 0 {
+            let step = if level == 0 {
+                "AssignProcessToJobObject: the job of the parent cgroup's first level"
+            } else {
+                "AssignProcessToJobObject: the job of a lower level of the parent cgroup, for a process in the level \
+                 above's (this Windows did not nest the two; the jail is not started under a part of its parent)"
+            };
+            return Err((step, last_error()));
         }
     }
     // SAFETY: handles the caller owns.
@@ -450,12 +497,14 @@ mod tests {
         assert_eq!(plan_of(2, ["jailer", "--id", "a"]).unwrap(), None);
     }
 
-    // A parent of several components is refused at the argument, with the
-    // reason; it is not a parent that silently bounds nothing.
+    // A parent of several levels is kept as it is named, upstream's own
+    // test's among them; one that names no level is refused at the argument.
     #[test]
-    fn test_a_parent_of_several_levels_is_refused() {
-        let text = plan_of(2, args(&["--parent-cgroup", "tenants/a"])).unwrap_err().to_string();
-        assert!(text.starts_with("--parent-cgroup is not supported on Windows: not done yet: a parent cgroup of one name"), "{text}");
+    fn test_a_parent_of_several_levels_is_read() {
+        let plan = plan_of(2, args(&["--parent-cgroup", "custom_cgroup/group2"])).unwrap().unwrap();
+        assert_eq!((plan.parent.as_str(), plan.named), ("custom_cgroup/group2", true));
+        let text = plan_of(2, args(&["--parent-cgroup", "/"])).unwrap_err().to_string();
+        assert!(text.starts_with("--parent-cgroup is not supported on Windows: an empty name"), "{text}");
     }
 
     /// A parent's name no other test or run uses.
@@ -470,7 +519,8 @@ mod tests {
     /// What the operator's tool does to a parent: its limits, through a
     /// handle of its own.
     fn tool(parent: &str) -> OwnedHandle {
-        create_or_open(&parent_job_name(parent).unwrap()).unwrap().0
+        let names = parent_job_names(parent).unwrap();
+        names.iter().map(|name| create_or_open(name).unwrap().0).last().unwrap()
     }
 
     fn extended(flags: u32, memory: usize, affinity: usize) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
@@ -521,7 +571,7 @@ mod tests {
         let set = set_job(&tool(&name), JobObjectExtendedLimitInformation, &limit);
         let second = Parent::of(&with).unwrap().unwrap();
         assert!(!second.created);
-        let whose = owner_and_label(&second.job);
+        let whose = owner_and_label(second.job());
         println!("PARENTTEST a parent made by one jailer, limited to 64 MiB ({set:?}), found by the next: owner and label {whose:?}");
         assert_eq!(set, Ok(()));
 
@@ -564,7 +614,7 @@ mod tests {
         let (p, _job, entered) = jailed(Some(&jailer), &Limits::default());
         drop(operator);
         let found = Parent::of(&plan(&name, 2, true, false)).unwrap();
-        let limit = found.as_ref().map(|parent| read(&parent.job));
+        let limit = found.as_ref().map(|parent| read(parent.job()));
         println!("PARENTTEST the tool gone, a jailer with a jail ({entered:?}) left: found by name {}, its limit {limit:?} MiB", found.is_some());
         entered.unwrap();
         assert!(matches!(limit, Some(Ok(64))), "a jailer's handle did not keep the parent and its limit");
@@ -580,7 +630,7 @@ mod tests {
             "PARENTTEST no handle left and a process in the job still: found by name {unheld}; after it, the next \
              jailer made a new one: {}, its limit {:?} MiB",
             again.created,
-            read(&again.job)
+            read(again.job())
         );
     }
 
@@ -664,6 +714,107 @@ mod tests {
         );
         entered.unwrap();
         assert_eq!(hard_cap(&job).unwrap(), Some(5000));
+    }
+
+    // A parent of two levels, as upstream's own test names one: a job for
+    // each, and every level's limits hold what is under it. Memory, the
+    // least limit along the path: the top at 64 MiB and the level under it
+    // at 32, a jail under both is refused 40 MiB that the top alone would
+    // have given, and takes 24; a jail under the top alone is then refused
+    // 48 (24 and 48 are above 64) and takes 32. The CPU rate: the top at
+    // half the host and the level under it asked for a quarter of the host,
+    // which is half of the top's; the two come to a quarter of the host, a
+    // jail that asks for an eighth is given half of the level's, and cgroup
+    // v1 refuses one that asks for more than the quarter. Processors: the
+    // top on 0 and 1, the level under it on 1; a jail that asks for 0 is
+    // refused by cgroup v1 and runs on 1 with v2.
+    #[test]
+    #[ignore = "makes named jobs and processes: run alone by CI's windows job, with --nocapture"]
+    fn test_a_parent_of_several_levels_bounds_by_each() {
+        use super::super::cgroup_values::{CPUS_OUTSIDE_PARENT, RATE_ABOVE_PARENT};
+        let top = fresh("levels");
+        let both = format!("{top}/group2");
+        // The jailer makes every level that is missing, the top first.
+        let under_both = Parent::of(&plan(&both, 2, true, true)).unwrap().unwrap();
+        assert!(under_both.created && under_both.jobs.len() == 2);
+        let under_top = Parent::of(&plan(&top, 2, true, false)).unwrap().unwrap();
+        assert!(!under_top.created, "the top level was not made with the level under it");
+        let (first, second) = (tool(&top), tool(&both));
+        let set = (
+            set_job(&first, JobObjectExtendedLimitInformation, &extended(JOB_OBJECT_LIMIT_JOB_MEMORY, 64 * MIB, 0)),
+            set_job(&second, JobObjectExtendedLimitInformation, &extended(JOB_OBJECT_LIMIT_JOB_MEMORY, 32 * MIB, 0)),
+        );
+        let (pa, _ja, a) = jailed(Some(&under_both), &Limits::default());
+        let (pb, _jb, b) = jailed(Some(&under_top), &Limits::default());
+        let low = (commit(&pa, 40 * MIB), commit(&pa, 24 * MIB));
+        let high = (commit(&pb, 48 * MIB), commit(&pb, 32 * MIB));
+        println!(
+            "PARENTTEST two levels, 64 MiB and under it 32 MiB ({set:?}): a jail under both (nested {a:?}) 40 MiB, then \
+             24: {low:?}; a jail under the top alone (nested {b:?}) 48 MiB, then 32: {high:?}"
+        );
+        assert_eq!(set, (Ok(()), Ok(())));
+        assert!(a.is_ok() && b.is_ok(), "a jail's job was not nested under every level of its parent");
+        assert!(low.0.is_err() && low.1.is_ok(), "the lower level's limit did not hold: {low:?}");
+        assert!(high.0.is_err() && high.1.is_ok(), "the top level's limit did not hold the two together: {high:?}");
+        drop((pa, pb));
+
+        // The CPU rate, as the operator's tool writes a level's: a share of
+        // what the levels above come to.
+        // SAFETY: plain data.
+        let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+        cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+        cpu.Anonymous.CpuRate = 5000;
+        let top_rate = set_job(&first, JobObjectCpuRateControlInformation, &cpu);
+        cpu.Anonymous.CpuRate = rate_under_parent(2, 2500, 5000).unwrap();
+        let level_rate = set_job(&second, JobObjectCpuRateControlInformation, &cpu);
+        let asking = |cpus: Option<Vec<(u16, u64)>>, cpu_rate| Limits { cpus, cpu_rate, ..Limits::default() };
+        let parent = |version| Parent::of(&plan(&both, version, true, true)).unwrap().unwrap();
+        let eighth = parent(1).limits(&asking(None, Some(1250)));
+        let (_p, job, entered) = jailed(Some(&under_both), eighth.as_ref().unwrap_or(&Limits::default()));
+        println!(
+            "PARENTTEST two levels capped at 5000 ({top_rate:?}) and, for a quarter of the host, 5000 of that \
+             ({level_rate:?}): a jail that asks for 1250 of the host is given {:?} (nested {entered:?}) and reads back {:?}",
+            eighth.as_ref().map(|l| l.cpu_rate).map_err(ToString::to_string),
+            hard_cap(&job)
+        );
+        assert_eq!((top_rate, level_rate), (Ok(()), Ok(())));
+        assert_eq!(eighth.unwrap().cpu_rate, Some(5000), "an eighth of the host is half of two levels that come to a quarter");
+        entered.unwrap();
+        assert!(parent(1).limits(&asking(None, Some(4000))).unwrap_err().to_string().ends_with(RATE_ABOVE_PARENT));
+        assert_eq!(parent(2).limits(&asking(None, Some(4000))).unwrap().cpu_rate, Some(10_000));
+
+        if std::thread::available_parallelism().map_or(1, std::num::NonZero::get) >= 2 {
+            set_job(&first, JobObjectExtendedLimitInformation, &extended(JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_AFFINITY, 64 * MIB, 0b11))
+                .unwrap();
+            set_job(&second, JobObjectExtendedLimitInformation, &extended(JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_AFFINITY, 32 * MIB, 0b10))
+                .unwrap();
+            let asked = asking(Some(vec![(0, 0b01)]), None);
+            let v1 = parent(1).limits(&asked);
+            let given = parent(2).limits(&asked).unwrap();
+            let (p, _job, entered) = jailed(Some(&under_both), &given);
+            println!(
+                "PARENTTEST two levels on processors 0-1 and 1, a jail that asks for processor 0: cgroup v1 {:?}; v2 is \
+                 given {:x?} (nested {entered:?}) and its process runs on mask {:#b}",
+                v1.as_ref().map(|l| l.cpus.clone()).map_err(ToString::to_string),
+                given.cpus,
+                mask_of(&p)
+            );
+            assert!(v1.unwrap_err().to_string().ends_with(CPUS_OUTSIDE_PARENT));
+            assert_eq!(given.cpus, Some(vec![(0, 0b10)]));
+            entered.unwrap();
+            assert_eq!(mask_of(&p), 0b10);
+        } else {
+            println!("PARENTTEST levels' processors: one processor, not run");
+        }
+
+        // A level that exists under one that does not is no tree: a jailer
+        // that would join it stops.
+        let orphan = fresh("orphan");
+        let lower = create_or_open(&parent_job_names(&format!("{orphan}/x")).unwrap()[1]).unwrap().0;
+        let refused = Parent::of(&plan(&format!("{orphan}/x"), 2, true, false)).unwrap_err().to_string();
+        println!("PARENTTEST a level whose level above has no job: {refused}");
+        assert!(refused.contains("above it, does not"), "{refused}");
+        drop(lower);
     }
 
     // A job of the parent's name that a jailed process could have made (it

@@ -7,9 +7,9 @@
 - `jailer-test.ps1`: the jailer on WHP hardware, the counterpart of
   `tools/macos/jailer-test.py`. Stages without a guest: `refuse` (what
   Windows cannot enforce is refused, each cgroup controller and resource
-  limit with its reason, and a `--parent-cgroup` of several levels, which
-  the jailer does not do yet), `parent` (`--parent-cgroup`: a parent made
+  limit with its reason), `parent` (`--parent-cgroup`: a parent made
   and limited with `jail-parent.exe` bounds two jails' memory together, a
+  level under it holds a jail to the least limit along the path, a
   jail's processors under it are Linux's by cgroup version, a jailer keeps
   its jail's parent when the tool has ended, and a job of a parent's name
   that a jailed process made is not joined), `freeze` (upstream's freezer files next to the
@@ -74,8 +74,13 @@
   (`memory.max`, `cpu.max`, `cpuset.cpus`, or their cgroup v1 names with
   `--cgroup-version 1`) and holds it until its standard input ends, or for
   ever with `--forever`. Each jailer holds its jail's parent too, so a
-  parent lasts while the tool or a jail of it runs. Run it in the session
-  and as the account the jailers run in:
+  parent lasts while the tool or a jail of it runs. `--name a/b` is a level
+  under `a`, a job under `a`'s: the tool makes the levels that are missing
+  and writes the limits to the last, against the levels above by Linux's
+  rule for the cgroup version, so a parent is written from the top down. A
+  level's CPU cap and processors are written when it is made and not
+  changed while it is there; its memory limit at any time. Run it in the
+  session and as the account the jailers run in:
 
   ```
   tools\windows\jail-parent.exe --name tenants --cgroup memory.max=4294967296 --cgroup cpuset.cpus=0-3 --forever

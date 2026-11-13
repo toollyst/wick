@@ -176,11 +176,6 @@ function Stage-Refuse {
         # A page size an x86_64 Linux has no hugetlb files for: refused at
         # the value that sets no limit too, as the write fails there.
         'hugetlb.64KB.max=max'           = @('--cgroup', 'hugetlb.64KB.max=max', '--cgroup-version', '2')
-        # A parent cgroup of several levels (a job in a job in a job): not
-        # built, refused where upstream reads the parent: with --cgroup, and
-        # with cgroup v2 and no --cgroup. One level is the `parent` stage.
-        '--parent-cgroup a/b with --cgroup' = @('--parent-cgroup', 'tenants/a', '--cgroup', 'memory.max=1073741824', '--cgroup-version', '2')
-        '--parent-cgroup a/b alone, v2'     = @('--parent-cgroup', 'tenants/a', '--cgroup-version', '2')
     }
     # docs/PORTING.md row 8: each controller Windows has no counterpart for
     # is refused with the reason (the message says "refused on Windows: why").
@@ -212,9 +207,8 @@ function Stage-Refuse {
         if ($reasoned.Contains($k)) { Check ($r[1] -match 'is refused on Windows: \S') "${k}: refused without its reason: $($r[1])" }
         if ($k -eq 'hugetlb.64KB.max=max') { Check ($r[1].Contains('--cgroup hugetlb.64KB.max=max: an x86_64 Linux host has no hugetlb files for this page size')) "${k}: refused without its reason: $($r[1])" }
         if ($k -eq 'fsize') { Check ($r[1].Contains('--resource-limit fsize is not supported on Windows: Windows cannot limit the size of the files a process writes')) "${k}: refused without its reason: $($r[1])" }
-        if ($k -like '--parent-cgroup*') { Check ($r[1].Contains('--parent-cgroup is not supported on Windows: not done yet: a parent cgroup of one name is a Job Object')) "${k}: refused without its reason: $($r[1])" }
     }
-    "--netns of a missing directory, fsize=, an unsupported cgroup file, a hugetlb page size Linux does not have, a --parent-cgroup of several levels and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
+    "--netns of a missing directory, fsize=, an unsupported cgroup file, a hugetlb page size Linux does not have and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
 }
 
 Add-Type -Namespace WickJailerTest -Name Numa -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool GetNumaHighestNodeNumber(ref uint n);'
@@ -272,6 +266,22 @@ function Get-ParentTool {
     $p
 }
 
+# jail-parent run to its end, for a command line it must refuse: its exit
+# code (none if it had to be stopped, which is that it held a parent) and
+# what it wrote.
+function Invoke-ParentTool([string]$Arguments) {
+    $psi = New-Object Diagnostics.ProcessStartInfo((Get-ParentTool), $Arguments)
+    $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    $err = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(10000)) {
+        $p.Kill()
+        return @($null, "still running after 10 s: $($err.Result)")
+    }
+    @($p.ExitCode, "$($p.StandardOutput.ReadToEnd()) $($err.Result)")
+}
+
 # docs/PORTING.md row 8: --parent-cgroup. A parent made with jail-parent,
 # 256 MiB and processor 0, and jails under it, each allowed 1 GiB of its own:
 # - the first commits 200 MiB and runs on processor 0 though it asked for 0
@@ -282,6 +292,11 @@ function Get-ParentTool {
 # - with the tool ended and the first jail still running, a jail that names
 #   the parent with cgroup v2 and no --cgroup joins it and is bounded by it:
 #   a jailer keeps the parent of its jail;
+# - a level under the parent (`<parent>/inner`, 100 MiB, made with the tool
+#   while the parent's is running): a jail under it is stopped short of 150
+#   MiB, the least limit along the path, and runs on the parent's processor;
+#   the tool refuses, for cgroup v1, a level on a processor its parent has
+#   not, and refuses to change the processors of a parent that is there;
 # - a jailed process tries to make the job of a parent's name itself, for
 #   later jails to join a job of its own: either Windows refuses it, or a
 #   jailer that is then given that parent stops (the job is labelled below
@@ -298,12 +313,31 @@ function Stage-Parent {
     $holder = [Diagnostics.Process]::Start($psi)
     $first = $null
     $squat = $null
+    $inner = $null
     try {
         $said = ''
         while ($null -ne ($line = $holder.StandardOutput.ReadLine())) { $said += "$line; "; if ($line -match 'held until') { break } }
         Check ($said -match "${name}: made" -and $said -match 'held until') "jail-parent did not make and hold the parent: $said"
         $jail = @('--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--parent-cgroup', $name)
         $own = @('--cgroup', 'memory.max=1073741824')
+
+        # A level under the parent, before any jail takes the parent's memory.
+        $r = Invoke-ParentTool "--name $name/bad --cgroup-version 1 --cgroup cpuset.cpus=1"
+        Check ($r[0] -eq 1 -and $r[1].Contains("CPUs outside the parent cgroup's")) "cgroup v1: a level on processor 1 under a parent on processor 0 was not refused by the tool: exit $($r[0]): $($r[1])"
+        $r = Invoke-ParentTool "--name $name --cgroup cpuset.cpus=0-1"
+        Check ($r[0] -eq 1 -and $r[1].Contains('not changed while it is there')) "the tool changed the processors of a parent that was there: exit $($r[0]): $($r[1])"
+        $psi2 = New-Object Diagnostics.ProcessStartInfo((Get-ParentTool), "--name $name/inner --cgroup memory.max=104857600")
+        $psi2.UseShellExecute = $false; $psi2.RedirectStandardInput = $true; $psi2.RedirectStandardOutput = $true; $psi2.CreateNoWindow = $true
+        $inner = [Diagnostics.Process]::Start($psi2)
+        $said = ''
+        while ($null -ne ($line = $inner.StandardOutput.ReadLine())) { $said += "$line; "; if ($line -match 'held until') { break } }
+        Check ($said -match "${name}: opened" -and $said -match "${name}/inner: made" -and $said -match 'held until') "jail-parent did not open the parent and make the level under it: $said"
+        $r = Invoke-Jailer (@('--id', 'level', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--parent-cgroup', "$name/inner", '--cgroup-version', '2') + $own + @('--', 'private:150', 'affinity:0')) 60000
+        Check ($r[1] -match 'private:150 denied after (\d+)' -and [int]$Matches[1] -le 100) "a jail under a level of 100 MiB under the parent of 256: exit $($r[0]): $($r[1])"
+        $level = [int]$Matches[1]
+        Check ($r[1] -match 'affinity:0 allowed 0x1 of ') "a jail under a level without processors of its own, under a parent on processor 0: $($r[1])"
+        $inner.StandardInput.Close()
+        Check ($inner.WaitForExit(10000)) 'jail-parent did not end with its standard input (the level)'
 
         $out = Join-Path $base 'first.txt'
         $line = "--id first --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" --parent-cgroup $name --cgroup-version 2 --cgroup memory.max=1073741824 --cgroup cpuset.cpus=0-1 -- private:200 affinity:0 wait:60"
@@ -354,11 +388,12 @@ function Stage-Parent {
             }
             $made = "$made, and a jailer given that parent stopped (its job is below medium integrity)"
         }
-        "a parent of 256 MiB on processor 0 (jail-parent): the first jail took 200 MiB and ran on processor 0 of the 0-1 it asked for; the second stopped after $second MiB; cgroup v1 refused processor 1; with the tool ended, a jail joining the parent stopped after $joined MiB; a jailed process making the job of a parent's name: $made"
+        "a parent of 256 MiB on processor 0 (jail-parent): a jail under a level of 100 MiB under it stopped after $level MiB, on processor 0; the tool refused a cgroup v1 level on processor 1 and a change of the parent's processors; the first jail took 200 MiB and ran on processor 0 of the 0-1 it asked for; the second stopped after $second MiB; cgroup v1 refused processor 1; with the tool ended, a jail joining the parent stopped after $joined MiB; a jailed process making the job of a parent's name: $made"
     } finally {
         if (-not $holder.HasExited) { $holder.Kill() }
         if ($first -and -not $first.HasExited) { $first.Kill() }
         if ($squat -and -not $squat.HasExited) { $squat.Kill() }
+        if ($inner -and -not $inner.HasExited) { $inner.Kill() }
         Get-Process jail-probe -ErrorAction SilentlyContinue | Stop-Process -Force
     }
 }

@@ -88,31 +88,79 @@ pub fn cpu_rate(quota: u64, period: u64, cpus: u64) -> Result<u32, &'static str>
 //
 // On Linux a jail's cgroup is `<base>/<parent>/<id>` (upstream's cgroup.rs,
 // `CgroupV1::new`, `CgroupV2::new`). On Windows the parent is a named Job
-// Object and the jail's job is nested in it (`platform::parent`). What the
-// parent's own values make of the jail's is the kernel's rule on Linux and
-// is computed here, because a nested job is given its values relative to
-// its parent's or narrowed without a word.
+// Object and the jail's job is nested in it (`platform::parent`); a parent
+// of several levels (`a/b`) is a job for each, `a/b`'s nested in `a`'s. What
+// the values of the levels above make of a level's, or of the jail's, is the
+// kernel's rule on Linux and is computed here, because a nested job is given
+// its values relative to its parent's or narrowed without a word:
+//
+// - memory: a charge is made to the cgroup and to every ancestor, and fails
+//   at the first that is over its limit (Linux v6.1 mm/page_counter.c,
+//   `page_counter_try_charge`: `for (c = counter; c; c = c->parent)`), so
+//   the least limit along the path holds, and no limit is refused for being
+//   above its parent's. A nested job is held by each job above it the same
+//   way (Microsoft Learn, "Nested Jobs"): nothing is computed;
+// - the CPU quota and the cpuset: [`rate_under_parent`], [`cpus_under_parent`],
+//   against what the levels above come to ([`rate_of_levels`],
+//   [`cpus_of_levels`]).
 
 /// The prefix of a parent's job name, in the session's object namespace.
 pub const PARENT_JOB_PREFIX: &str = "Local\\wick-cgroup-";
 
-/// Why a parent of more than one path component is refused.
-pub const PARENT_ONE_LEVEL: &str = "not done yet: a parent cgroup of one name is a Job Object that holds the \
-    jails' jobs; a path of several (a/b), each a job in the one before, is not built";
-
-/// The name of the Job Object that is the parent cgroup `parent`: one path
-/// component (upstream has refused `.`, `..` and a leading `/` before this
-/// is asked: env.rs, `CgroupInvalidParentPath`). An object name ends at a
-/// backslash, and a parent of several components is a job in a job, which
-/// is not built: both refused.
-pub fn parent_job_name(parent: &str) -> Result<String, &'static str> {
-    if parent.is_empty() {
+/// The names of the Job Objects that are the parent cgroup `parent`, one
+/// for each level of its path, the top first: `a/b` is `...-a` and
+/// `...-a/b` (upstream has refused `.`, `..` and a leading `/` before this
+/// is asked: env.rs, `CgroupInvalidParentPath`). Both separators part
+/// levels, as in a path on Windows; an object's name ends at a backslash,
+/// so the levels of a name are joined with `/`.
+pub fn parent_job_names(parent: &str) -> Result<Vec<String>, &'static str> {
+    let mut names = Vec::new();
+    let mut path = String::new();
+    for level in parent.split(['/', '\\']).filter(|level| !level.is_empty()) {
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(level);
+        names.push(format!("{PARENT_JOB_PREFIX}{path}"));
+    }
+    if names.is_empty() {
         return Err("an empty name");
     }
-    if parent.contains(['/', '\\']) {
-        return Err(PARENT_ONE_LEVEL);
+    Ok(names)
+}
+
+/// The CPU rate, of the host's processors, that the levels of a parent come
+/// to, from each level's own hard cap, the top first (`None`: a level
+/// without one). A job's rate is a share of what the job above it has, so
+/// the levels multiply; on Linux it is the cgroup's `hierarchical_quota`
+/// (kernel/sched/core.c, `tg_cfs_schedulable_down`). `None` when no level
+/// has a cap. Rounded down and never 0.
+pub fn rate_of_levels(caps: &[Option<u32>]) -> Option<u32> {
+    let mut rate: Option<u64> = None;
+    for &cap in caps.iter().flatten() {
+        rate = Some(match rate {
+            None => u64::from(cap),
+            Some(above) => (above * u64::from(cap) / 10_000).max(1),
+        });
     }
-    Ok(format!("{PARENT_JOB_PREFIX}{parent}"))
+    rate.map(|rate| u32::try_from(rate.min(10_000)).unwrap())
+}
+
+/// The processors the levels of a parent come to, from each level's own
+/// (`None`: Windows reported none for it), the top first: each level within
+/// the one above by the cgroup v2 rule, which is also what Windows gives a
+/// nested job ([`cpus_under_parent`]). A level made by the operator's tool
+/// has its set computed against the levels above already, cgroup v1's
+/// refusal made then.
+pub fn cpus_of_levels(levels: &[Option<Vec<(u16, u64)>>]) -> Option<Vec<(u16, u64)>> {
+    let mut cpus: Option<Vec<(u16, u64)>> = None;
+    for level in levels.iter().flatten() {
+        cpus = Some(match &cpus {
+            None => level.clone(),
+            Some(above) => cpus_under_parent(2, level, above).expect("the cgroup v2 rule refuses nothing"),
+        });
+    }
+    cpus
 }
 
 /// Why cgroup v1 refuses a cpuset that is not within its parent's.
@@ -177,6 +225,29 @@ pub fn rate_under_parent(version: u8, asked: u32, parent: u32) -> Result<u32, &'
     Ok(u32::try_from(share.clamp(1, 10_000)).unwrap())
 }
 
+/// Why the operator's tool does not change the CPU cap or the processors
+/// of a level that is there already.
+pub const LEVEL_NOT_CHANGED: &str = "not done yet: the CPU cap and the processors of a level are written when \
+    the level is made and not changed while it is there: the levels and jails under it were given theirs as a \
+    share of them, or within them, and would not be given them again (end what holds the parent and make it anew)";
+
+/// What the operator's tool writes of a level's CPU cap or processors:
+/// `wanted` when the level was made just now, nothing when it was there
+/// with `now` equal to it, and a refusal otherwise ([`LEVEL_NOT_CHANGED`]).
+/// On Linux such a write is taken at any time and the kernel works the
+/// hierarchy out again (`tg_set_cfs_bandwidth`, `update_cpumasks_hier`);
+/// a job under another holds a number worked out once, here or in the
+/// jailer.
+pub fn level_write<T: PartialEq + Clone>(made: bool, now: &T, wanted: &T) -> Result<Option<T>, &'static str> {
+    if made {
+        Ok(Some(wanted.clone()))
+    } else if now == wanted {
+        Ok(None)
+    } else {
+        Err(LEVEL_NOT_CHANGED)
+    }
+}
+
 /// The lowest integrity level a parent's job may carry: medium
 /// (`SECURITY_MANDATORY_MEDIUM_RID`). A jailed process runs below it
 /// (0x1800), and what it creates is labelled with its level.
@@ -208,12 +279,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parent_job_name() {
-        assert_eq!(parent_job_name("tenants").unwrap(), "Local\\wick-cgroup-tenants");
-        assert_eq!(parent_job_name("firecracker").unwrap(), "Local\\wick-cgroup-firecracker");
-        assert_eq!(parent_job_name("a/b").unwrap_err(), PARENT_ONE_LEVEL);
-        assert_eq!(parent_job_name("a\\b").unwrap_err(), PARENT_ONE_LEVEL);
-        assert_eq!(parent_job_name("").unwrap_err(), "an empty name");
+    fn test_parent_job_names() {
+        let p = PARENT_JOB_PREFIX;
+        assert_eq!(parent_job_names("tenants").unwrap(), [format!("{p}tenants")]);
+        // Upstream's own test names a parent of two levels.
+        let two = [format!("{p}custom_cgroup"), format!("{p}custom_cgroup/group2")];
+        assert_eq!(parent_job_names("custom_cgroup/group2").unwrap(), two);
+        assert_eq!(parent_job_names("custom_cgroup\\group2").unwrap(), two);
+        assert_eq!(parent_job_names("custom_cgroup//group2/").unwrap(), two);
+        assert_eq!(parent_job_names("a/b/c").unwrap().len(), 3);
+        assert_eq!(parent_job_names("").unwrap_err(), "an empty name");
+        assert_eq!(parent_job_names("/").unwrap_err(), "an empty name");
+    }
+
+    // What the levels above come to: the rates multiply (each a share of
+    // the one above), the processors narrow.
+    #[test]
+    fn test_levels_come_to_linuxs_hierarchical_values() {
+        assert_eq!(rate_of_levels(&[]), None);
+        assert_eq!(rate_of_levels(&[None, None]), None);
+        assert_eq!(rate_of_levels(&[Some(5000)]), Some(5000));
+        // Half the host, then half of that: a quarter of the host.
+        assert_eq!(rate_of_levels(&[Some(5000), Some(5000)]), Some(2500));
+        assert_eq!(rate_of_levels(&[None, Some(5000), None, Some(10_000)]), Some(5000));
+        assert_eq!(rate_of_levels(&[Some(1), Some(1)]), Some(1));
+        // A level asked for a quarter of the host under one of half is
+        // given half of it (`rate_under_parent`), and the two come to the
+        // quarter again: a jail under them is measured against that.
+        let level = rate_under_parent(2, 2500, 5000).unwrap();
+        assert_eq!(rate_of_levels(&[Some(5000), Some(level)]), Some(2500));
+        assert_eq!(rate_under_parent(1, 1250, 2500).unwrap(), 5000);
+        assert_eq!(rate_under_parent(1, 5000, 2500).unwrap_err(), RATE_ABOVE_PARENT);
+
+        assert_eq!(cpus_of_levels(&[]), None);
+        assert_eq!(cpus_of_levels(&[None]), None);
+        assert_eq!(cpus_of_levels(&[Some(vec![(0, 0b1111)]), None, Some(vec![(0, 0b0110)])]), Some(vec![(0, 0b0110)]));
+        // A level without a limit of its own reads as every processor.
+        assert_eq!(cpus_of_levels(&[Some(vec![(0, 0b0011)]), Some(vec![(0, 0b1111)])]), Some(vec![(0, 0b0011)]));
     }
 
     // Linux's rules for a cpuset under its parent's: v1 refuses what is not
@@ -258,6 +360,15 @@ mod tests {
         assert_eq!(rate_under_parent(2, 1, 3).unwrap(), 3333);
         assert_eq!(rate_under_parent(2, 1, 10_000).unwrap(), 1);
         rate_under_parent(2, 1, 0).unwrap_err();
+    }
+
+    #[test]
+    fn test_a_levels_cap_and_processors_are_written_once() {
+        assert_eq!(level_write(true, &None, &Some(5000u32)), Ok(Some(Some(5000))));
+        assert_eq!(level_write(false, &Some(5000u32), &Some(5000)), Ok(None));
+        assert_eq!(level_write(false, &Some(5000u32), &Some(2500)), Err(LEVEL_NOT_CHANGED));
+        assert_eq!(level_write(false, &None, &Some(2500u32)), Err(LEVEL_NOT_CHANGED));
+        assert_eq!(level_write(false, &Some(2500u32), &None), Err(LEVEL_NOT_CHANGED));
     }
 
     #[test]

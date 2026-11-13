@@ -100,9 +100,8 @@ impossible integration_tests/security/test_jail.py::test_cgroupsv2_written_only_
 # Object that holds the jails' jobs, which the operator limits with
 # tools/windows/jail-parent.rs where the tests write the directory's files
 # (overlay/jailer/platform/windows/parent.rs; docs/COMPATIBILITY.md,
-# `--parent-cgroup`; `jailer-test.ps1 parent`). The first of the two names a
-# parent of several levels (custom_cgroup/group2), which the jailer refuses,
-# not done yet.
+# `--parent-cgroup`; `jailer-test.ps1 parent`), a job for each level of a
+# parent such as the first test's custom_cgroup/group2.
 impossible integration_tests/security/test_jail.py::test_cgroups_custom_parent
 impossible integration_tests/security/test_jail.py::test_cgroups_parent_cgroup_but_no_cgroup
 

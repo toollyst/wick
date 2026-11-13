@@ -11,13 +11,24 @@
 //! names and values the jailer takes, and then holds it:
 //!
 //! ```text
-//! jail-parent --name <parent> [--cgroup-version 1|2] [--cgroup <file>=<value>]... [--forever]
+//! jail-parent --name <parent>[/<level>]... [--cgroup-version 1|2] [--cgroup <file>=<value>]... [--forever]
 //!   version 2 (the default): memory.max  cpu.max  cpuset.cpus
 //!   version 1:               memory.limit_in_bytes  cpu.cfs_quota_us  cpu.cfs_period_us  cpuset.cpus
 //! ```
 //!
 //! A parent's limits bound its jails together: the memory limit their sum
 //! (commit), the CPU cap their sum, the processors every one of them.
+//!
+//! A parent of several levels (`a/b`) is a job for each level, each under
+//! the one above. The tool makes the levels that are missing, the top
+//! first, without limits, as `mkdir -p` does, writes the limits named to
+//! the last, and holds them all. Every level's limits hold what is under
+//! it: memory the least limit along the path, and the CPU cap and the
+//! processors by Linux's rule for the cgroup version against what the
+//! levels above come to (cgroup v1 refuses a quota above them and
+//! processors outside theirs; v2 takes the lower quota and the processors
+//! in common, or theirs when none is). So a parent is written from the top
+//! down.
 //!
 //! A Job Object lasts while a handle to it is open, or a process is in it;
 //! its name lasts only while a handle is open. So the tool keeps running:
@@ -27,9 +38,12 @@
 //! lives, so ending the tool takes nothing from running jails or from jails
 //! started while one still runs; once the tool and the last jail are gone
 //! the parent is gone, and a jail that names it then makes a new one without
-//! limits. Run again with other values, it changes the limits of the parent
-//! that is there. The CPU cap of a parent with jails in it is not changed:
-//! each jail's rate was computed against it when the jail started.
+//! limits. Run again, it changes the memory limit of the parent that is
+//! there. The CPU cap and the processors of a level are written when the
+//! level is made and not changed while it is there (refused, with the
+//! reason; the same values again are accepted): a job under another holds
+//! its rate as a share of that one's, worked out once, where Linux works
+//! the hierarchy out again at every write.
 //!
 //! Run in the session the jailers run in, as the account they run as: the
 //! job grants the system and that account, and a jailer joins only a job of
@@ -46,7 +60,10 @@ mod cgroup_values;
 use std::ffi::c_void;
 use std::io::Read;
 
-use cgroup_values::{DEFAULT_PERIOD_US, cpu_groups, cpu_rate, parent_job_name, parse_list, strstrip, trusted_parent};
+use cgroup_values::{
+    DEFAULT_PERIOD_US, PARENT_JOB_PREFIX, cpu_groups, cpu_rate, cpus_of_levels, cpus_under_parent, level_write, parent_job_names,
+    parse_list, rate_of_levels, rate_under_parent, strstrip, trusted_parent,
+};
 
 type HANDLE = *mut c_void;
 
@@ -329,10 +346,39 @@ fn parse(version: u8, cgroups: &[String]) -> Result<Asked, String> {
     Ok(asked)
 }
 
-fn run(name: &str, version: u8, cgroups: &[String]) -> Result<HANDLE, String> {
-    let job_name = parent_job_name(name).map_err(|why| format!("--name {name}: {why}"))?;
-    let asked = parse(version, cgroups)?;
-    let user = token_sid(TOKEN_USER_CLASS)?;
+/// A level's own CPU hard cap, if it has one.
+fn hard_cap(job: HANDLE) -> Result<Option<u32>, String> {
+    let cpu: CPU_RATE = query(job, CPU_RATE_CONTROL, "the job's CPU rate")?;
+    let capped = RATE_ENABLE | RATE_HARD_CAP;
+    Ok((cpu.ControlFlags & capped == capped).then_some(cpu.CpuRate))
+}
+
+/// A level's own processors, `(group, mask)` each, sorted by group: its
+/// affinity when it has one, else what Windows reports for it by group.
+fn processors(job: HANDLE) -> Result<Option<Vec<(u16, u64)>>, String> {
+    let info: EXTENDED = query(job, EXTENDED_LIMIT, "the job's limits")?;
+    if info.Basic.LimitFlags & LIMIT_AFFINITY != 0 {
+        return Ok(Some(vec![(0, info.Basic.Affinity as u64)]));
+    }
+    let mut groups = [GROUP_AFFINITY::default(); 64];
+    let mut len = 0u32;
+    // SAFETY: an array of the size passed; the size written comes back.
+    let ok = unsafe {
+        QueryInformationJobObject(job, GROUP_INFORMATION_EX, groups.as_mut_ptr().cast(), std::mem::size_of_val(&groups) as u32, &mut len)
+    };
+    if ok == 0 {
+        return Err(format!("reading the job's processors: {}", last()));
+    }
+    let count = (len as usize / std::mem::size_of::<GROUP_AFFINITY>()).min(groups.len());
+    let mut found: Vec<(u16, u64)> = groups[..count].iter().map(|g| (g.Group, g.Mask as u64)).collect();
+    found.sort_unstable();
+    Ok((!found.is_empty()).then_some(found))
+}
+
+/// The job of one level: made, or opened if it is there and one to trust.
+/// Whether it was made.
+fn level(job_name: &str, user: &str) -> Result<(HANDLE, bool), String> {
+    let path = job_name.strip_prefix(PARENT_JOB_PREFIX).unwrap_or(job_name);
     let sddl = wide(&format!("D:P(A;;GA;;;SY)(A;;GA;;;{user})"));
     let mut sd = std::ptr::null_mut();
     // SAFETY: NUL-terminated strings; the descriptor is freed after the call
@@ -342,7 +388,7 @@ fn run(name: &str, version: u8, cgroups: &[String]) -> Result<HANDLE, String> {
             return Err(format!("the job's security descriptor: {}", last()));
         }
         let attributes = SECURITY_ATTRIBUTES { nLength: 24, lpSecurityDescriptor: sd, bInheritHandle: 0 };
-        let job = CreateJobObjectW(&attributes, wide(&job_name).as_ptr());
+        let job = CreateJobObjectW(&attributes, wide(job_name).as_ptr());
         let err = GetLastError();
         LocalFree(sd);
         if job.is_null() {
@@ -352,11 +398,28 @@ fn run(name: &str, version: u8, cgroups: &[String]) -> Result<HANDLE, String> {
     };
     if existed {
         let (owner, label) = owner_and_label(job)?;
-        let mine = [user, token_sid(TOKEN_OWNER_CLASS)?];
-        trusted_parent(&owner, label, &mine).map_err(|why| format!("--name {name}: {why}"))?;
+        let mine = [user.to_string(), token_sid(TOKEN_OWNER_CLASS)?];
+        trusted_parent(&owner, label, &mine).map_err(|why| format!("{path}: {why}"))?;
     }
     let active = query::<ACCOUNTING>(job, BASIC_ACCOUNTING, "the job's processes")?.ActiveProcesses;
-    println!("jail-parent: {name}: {} ({job_name}), {active} processes in it", if existed { "opened" } else { "made" });
+    println!("jail-parent: {path}: {} ({job_name}), {active} processes in it", if existed { "opened" } else { "made" });
+    Ok((job, !existed))
+}
+
+/// Makes or opens every level of `name` and writes the limits to the last.
+/// The handles, which hold the levels while this process runs.
+fn run(name: &str, version: u8, cgroups: &[String]) -> Result<Vec<HANDLE>, String> {
+    let names = parent_job_names(name).map_err(|why| format!("--name {name}: {why}"))?;
+    let asked = parse(version, cgroups)?;
+    let user = token_sid(TOKEN_USER_CLASS)?;
+    let mut jobs = Vec::new();
+    let mut made = false;
+    for job_name in &names {
+        let (job, new) = level(job_name, &user)?;
+        jobs.push(job);
+        made = new;
+    }
+    let (job, above) = (jobs[jobs.len() - 1], &jobs[..jobs.len() - 1]);
 
     if let Some(memory) = asked.memory {
         let mut info: EXTENDED = query(job, EXTENDED_LIMIT, "the job's limits")?;
@@ -371,48 +434,69 @@ fn run(name: &str, version: u8, cgroups: &[String]) -> Result<HANDLE, String> {
         println!("jail-parent: {name}: memory limit {memory:?} bytes (commit, of all its jails together)");
     }
     if let Some(quota) = asked.quota {
-        if active > 0 {
-            return Err(format!(
-                "--name {name}: not done yet: the CPU cap of a parent with processes in it ({active}) is not changed; \
-                 each jail's rate was computed against it when the jail started"
-            ));
+        let caps = above.iter().map(|&job| hard_cap(job)).collect::<Result<Vec<_>, _>>()?;
+        let of_above = rate_of_levels(&caps);
+        let wanted = match quota {
+            None => None,
+            Some(quota) => {
+                // SAFETY: plain queries.
+                let cpus = u64::from(unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) });
+                let host = cpu_rate(quota, asked.period.unwrap_or(DEFAULT_PERIOD_US), cpus).map_err(|why| format!("the CPU quota: {why}"))?;
+                Some(match of_above {
+                    Some(parent) => rate_under_parent(version, host, parent).map_err(|why| format!("--name {name}: {why}"))?,
+                    None => host,
+                })
+            }
+        };
+        let write = level_write(made, &hard_cap(job)?, &wanted).map_err(|why| format!("--name {name}: the CPU cap: {why}"))?;
+        if let Some(Some(rate)) = write {
+            let cpu = CPU_RATE { ControlFlags: RATE_ENABLE | RATE_HARD_CAP, CpuRate: rate };
+            set(job, CPU_RATE_CONTROL, &cpu, std::mem::size_of::<CPU_RATE>(), "the CPU rate")?;
         }
-        let mut cpu = CPU_RATE::default();
-        if let Some(quota) = quota {
-            // SAFETY: plain queries.
-            let cpus = u64::from(unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) });
-            cpu.ControlFlags = RATE_ENABLE | RATE_HARD_CAP;
-            cpu.CpuRate = cpu_rate(quota, asked.period.unwrap_or(DEFAULT_PERIOD_US), cpus).map_err(|why| format!("the CPU quota: {why}"))?;
+        match (wanted, of_above) {
+            (None, _) => println!("jail-parent: {name}: no CPU cap of its own"),
+            (Some(rate), None) => println!("jail-parent: {name}: CPU rate {rate} of 10000 of the host's processors"),
+            (Some(rate), Some(parent)) => println!(
+                "jail-parent: {name}: CPU rate {rate} of 10000 of what the levels above have, which is {parent} of 10000 of the \
+                 host's processors"
+            ),
         }
-        set(job, CPU_RATE_CONTROL, &cpu, std::mem::size_of::<CPU_RATE>(), "the CPU rate")?;
-        println!("jail-parent: {name}: CPU rate {} of 10000 of the host's processors", cpu.CpuRate);
     } else if asked.period.is_some() {
         return Err("a CPU period without a quota".to_string());
     }
     if let Some(cpus) = &asked.cpus {
         // SAFETY: plain queries.
         let sizes: Vec<u32> = unsafe { (0..GetActiveProcessorGroupCount()).map(|g| GetActiveProcessorCount(g)).collect() };
-        let groups = cpu_groups(cpus, &sizes).map_err(|why| format!("cpuset.cpus: {why}"))?;
-        if let [(0, mask)] = groups.as_slice() {
-            let mut info: EXTENDED = query(job, EXTENDED_LIMIT, "the job's limits")?;
-            info.Basic.LimitFlags |= LIMIT_AFFINITY;
-            info.Basic.Affinity = *mask as usize;
-            set(job, EXTENDED_LIMIT, &info, std::mem::size_of::<EXTENDED>(), "the processors")?;
-        } else {
-            let list: Vec<GROUP_AFFINITY> =
-                groups.iter().map(|&(group, mask)| GROUP_AFFINITY { Mask: mask as usize, Group: group, Reserved: [0; 3] }).collect();
-            set(job, GROUP_INFORMATION_EX, &list[0], std::mem::size_of_val(list.as_slice()), "the processors")?;
+        let mut groups = cpu_groups(cpus, &sizes).map_err(|why| format!("cpuset.cpus: {why}"))?;
+        let levels = above.iter().map(|&job| processors(job)).collect::<Result<Vec<_>, _>>()?;
+        if let Some(parent) = cpus_of_levels(&levels) {
+            groups = cpus_under_parent(version, &groups, &parent).map_err(|why| format!("--name {name}: cpuset.cpus: {why}"))?;
+        }
+        groups.sort_unstable();
+        let now = processors(job)?.unwrap_or_default();
+        let write = level_write(made, &now, &groups).map_err(|why| format!("--name {name}: cpuset.cpus: {why}"))?;
+        if write.is_some() {
+            if let [(0, mask)] = groups.as_slice() {
+                let mut info: EXTENDED = query(job, EXTENDED_LIMIT, "the job's limits")?;
+                info.Basic.LimitFlags |= LIMIT_AFFINITY;
+                info.Basic.Affinity = *mask as usize;
+                set(job, EXTENDED_LIMIT, &info, std::mem::size_of::<EXTENDED>(), "the processors")?;
+            } else {
+                let list: Vec<GROUP_AFFINITY> =
+                    groups.iter().map(|&(group, mask)| GROUP_AFFINITY { Mask: mask as usize, Group: group, Reserved: [0; 3] }).collect();
+                set(job, GROUP_INFORMATION_EX, &list[0], std::mem::size_of_val(list.as_slice()), "the processors")?;
+            }
         }
         println!("jail-parent: {name}: processors {groups:x?} (group, mask)");
     }
-    Ok(job)
+    Ok(jobs)
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut name, mut version, mut cgroups, mut forever) = (None, 2u8, Vec::new(), false);
     let mut it = args.iter();
-    let usage = "usage: jail-parent --name <parent> [--cgroup-version 1|2] [--cgroup <file>=<value>]... [--forever]";
+    let usage = "usage: jail-parent --name <parent>[/<level>]... [--cgroup-version 1|2] [--cgroup <file>=<value>]... [--forever]";
     while let Some(arg) = it.next() {
         match (arg.as_str(), it.clone().next()) {
             ("--forever", _) => forever = true,
@@ -433,7 +517,7 @@ fn main() {
         std::process::exit(2);
     };
     match run(&name, version, &cgroups) {
-        Ok(_job) => {
+        Ok(_jobs) => {
             println!("jail-parent: {name}: held until {}", if forever { "this process is ended" } else { "standard input ends" });
             if forever {
                 loop {
