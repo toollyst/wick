@@ -161,6 +161,21 @@ PC, LNK1104), `winprobe.exe`, and in `tools/windows/`
 `job-freeze-probe.ps1`, `memory-partition-probe.exe`, `vmm-memory-record.py` and this file, at those
 paths. The kit needs no Rust.
 
+## Checking the scripts before Windows
+
+`python3 -I tools/windows/check-ps.py` (macOS or Linux, with Mono's `mcs` on `PATH`) compiles the
+C# of every `Add-Type` in the repository's `.ps1` files as Windows PowerShell 5.1 compiles it: C# 5,
+`System.dll` and the `-ReferencedAssemblies` given, a `-MemberDefinition` wrapped as PowerShell
+wraps it. Each Add-Type alone, and all of a script's together, so a type defined twice across them
+fails as `Add-Type` would ("already contains a definition"); a compile error names the `.ps1` line.
+It also refuses a function defined twice in one scope (PowerShell keeps the later without a word)
+and a script with a byte outside ASCII and no UTF-8 byte order mark (Windows PowerShell 5.1 reads
+it in the ANSI code page). It cannot check the PowerShell itself (no PowerShell parser: syntax, a
+command's or parameter's name), whether a P/Invoke's DLL and entry point exist (Mono compiles a
+`DllImport` it never loads), or .NET Framework APIs Mono lacks; those still show only on Windows,
+in CI's `windows` job (`boot-test.ps1 -SelfTest`) and `windows-guest`. `--selftest` tests its
+checks.
+
 ## What CI runs of the two scripts
 
 GitHub's Windows runner has WHP and boots Linux (first seen in CI run
