@@ -11,7 +11,7 @@ rootfs; on Windows, by [`tools/windows/boot-test.ps1`](../tools/windows/boot-tes
 | --- | --- | --- |
 | M1 | [Foundation](#m1-foundation) | done |
 | M2 | [macOS: Hypervisor.framework, aarch64 guests](#m2-macos-hypervisorframework-aarch64-guests) | in progress: the GDB stub is left |
-| M3 | [Windows: first boot on real hardware](#m3-windows-first-boot-on-real-hardware) | in progress |
+| M3 | [Windows: first boot on real hardware](#m3-windows-first-boot-on-real-hardware) | in progress: the four stages outside `all` on the PC at one commit, and At a glance's hugepages and seccomp rows, are left |
 | M4 | [Linux: upstream parity](#m4-linux-upstream-parity) | in progress |
 | M5 | [Security parity: the jailer on every host](#m5-security-parity-the-jailer-on-every-host) | in progress |
 | M6 | [Images everywhere](#m6-images-everywhere) | planned |
@@ -78,6 +78,15 @@ What is left on macOS: upstream's own gdb test, which its aarch64 debug kernel k
 
 **Done when** `tools/windows/boot-test.ps1` passes every stage on a real Windows PC with the Windows Hypervisor
 Platform, and the Windows column of [At a glance](#at-a-glance) says "works" for each row it covers.
+
+**Not done yet, by its own terms.** All 20 stages of `boot-test.ps1 all` passed on the PC at 4999ff6, 43832df and
+87d0328, but the four stages `all` leaves out (`tools/windows/boot-test.ps1`, `$NotInAll`) have not passed on the
+PC at one recent commit: `gdb` last passed there on kit 7952d31 and `foreign-snapshot` on kit 8d577b7,
+`diff-nospace` (elevated) has passed only in CI (run 43442912128, 861d365), and `linux-snapshot` has run only in
+CI's windows-guest job. And At a glance's Windows column describes the hugepages and seccomp rows rather than
+saying "works". M3 is done when one PC run at a single commit passes `all`, `diff-nospace` elevated, `gdb`,
+`foreign-snapshot` and `linux-snapshot` with CI's artifact (a refusal it records counts as the stage passing, as
+its row in docs/COMPATIBILITY.md says), and those two rows say "works" for what the run covered.
 
 **Every boot test stage that has run on real hardware passes** (AMD Ryzen 9 7900, Windows 11 Pro build
 26300): boot, smp, block, vsock, net, snapshot, diff, uffd, pci, restores (20 restores, each paused and snapshotted
