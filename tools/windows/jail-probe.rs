@@ -1392,7 +1392,33 @@ fn main() {
     // SAFETY: plain call.
     unsafe { RevertToSelf() };
     std::hint::black_box(&HANDOVER_MARK);
-    for c in &args {
+    for c in checks(&args) {
         println!("{c} {}", check(c));
     }
+}
+
+/// The arguments the jailer puts before the operator's, each with its value
+/// (upstream's jailer, env.rs `exec_command`: `--id`, then the three times;
+/// the operator's, after the jailer's `--`, follow).
+const JAILER_ARGS: [&str; 4] = ["--id", "--start-time-us", "--start-time-cpu-us", "--parent-cpu-time-us"];
+
+/// The checks among `args`: all of them when the probe is run by itself;
+/// under the jailer, those after its arguments ([`JAILER_ARGS`]), which are
+/// not checks. Arguments that start as the jailer's and are not exactly
+/// them end the probe (exit 2), saying so: no argument is skipped unless it
+/// is the jailer's.
+fn checks(args: &[String]) -> &[String] {
+    if args.first().map(String::as_str) != Some(JAILER_ARGS[0]) {
+        return args;
+    }
+    for (i, name) in JAILER_ARGS.iter().enumerate() {
+        let value = args.get(2 * i + 1);
+        let ok = args.get(2 * i).map(String::as_str) == Some(*name)
+            && value.is_some_and(|v| i == 0 || v.parse::<u64>().is_ok());
+        if !ok {
+            eprintln!("jail-probe: arguments that start as the jailer's but are not upstream's four with values: {args:?}");
+            std::process::exit(2);
+        }
+    }
+    &args[2 * JAILER_ARGS.len()..]
 }
