@@ -1205,6 +1205,9 @@ mod macos {
     /// `register_signal_handlers` calls this for its `sigsys_handler`.
     pub fn set_sigsys_handler(handler: SigsysHandler) -> vmm_sys_util::errno::Result<()> {
         SIGSYS_HANDLER.store(handler as usize, Ordering::Release);
+        // SAFETY: plain call. Firecracker registers its handlers on its
+        // first thread ([`RECEIVER`]).
+        RECEIVER.store(unsafe { libc::pthread_self() } as usize, Ordering::Release);
         // SAFETY: a zeroed sigaction, then its fields; forward_sigsys is
         // async-signal-safe.
         unsafe {
@@ -1259,6 +1262,30 @@ mod macos {
         }
     }
 
+    /// Whether a SIGSYS with this code and sender is the kernel's (`nosys`)
+    /// or the sandbox's: both signal the process from itself, so the sender
+    /// is this process and the code 0.
+    ///
+    /// xnu keeps a caught signal's sender and code in the process, not with
+    /// the signal: written when a signal is posted (bsd/kern/kern_sig.c
+    /// `psignal_internal`: `sig_proc->si_pid`, `si_code = 0`), and when a
+    /// child exits or stops (bsd/kern/kern_exit.c `proc_exit`: the child's
+    /// pid, `CLD_EXITED`), and read and zeroed when a signal is delivered
+    /// (bsd/dev/arm/unix_signal.c `sendsig`). So the sandbox's SIGSYS, posted
+    /// with this process as its sender, is delivered with
+    /// - no sender, if another signal was delivered first;
+    /// - a child's pid and a `CLD_` code, if the API process ended in
+    ///   between;
+    /// - another process's pid, if that process signalled Firecracker in
+    ///   between, which nothing tells from that process sending SIGSYS.
+    ///
+    /// The first two are no signal another process sent (its pid is never
+    /// 0, its code 0), and are taken as the sandbox's: read as a foreign
+    /// SIGSYS, upstream's handler exited with its unexpected-error code.
+    fn own_sigsys(code: libc::c_int, pid: libc::pid_t, me: libc::pid_t) -> bool {
+        (code == 0 && (pid == me || pid == 0)) || (libc::CLD_EXITED..=libc::CLD_CONTINUED).contains(&code)
+    }
+
     /// The SIGSYS handler: async-signal-safe (atomics, `getpid`, `write`,
     /// `_exit`; the API process's report, `send`), with errno kept.
     extern "C" fn forward_sigsys(num: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
@@ -1272,8 +1299,7 @@ mod macos {
         };
         // SAFETY: no arguments.
         let me = unsafe { libc::getpid() };
-        // The kernel's (nosys) or the sandbox's: no sender, code 0.
-        let from_kernel = code == 0 && pid == me;
+        let from_kernel = own_sigsys(code, pid, me);
         if from_kernel && !INSTALLED.load(Ordering::Acquire) {
             // No sandbox: a call number the kernel has none for fails with
             // ENOSYS and the process goes on, as on Linux without seccomp.
@@ -1283,8 +1309,13 @@ mod macos {
         }
         let pipe = WAITER_PIPE.load(Ordering::Acquire);
         if from_kernel && pipe >= 0 && WAITER_PID.load(Ordering::Acquire) == me {
-            SIGSYS_CODE.store(code, Ordering::Relaxed);
-            SIGSYS_PID.store(pid, Ordering::Release);
+            // From here on no thread ends the process another way
+            // ([`settle`]).
+            DENIED.store(true, Ordering::Release);
+            // As the sandbox sent it, whatever the kernel's fields held by
+            // now ([`own_sigsys`]): upstream's handler asks the same.
+            SIGSYS_CODE.store(0, Ordering::Relaxed);
+            SIGSYS_PID.store(me, Ordering::Release);
             if let at_once @ 1.. = SIGSYS_REPORT_AT_ONCE.load(Ordering::Acquire) {
                 // SAFETY: a fn() stored by set_sigsys_report.
                 let at_once: fn() = unsafe { std::mem::transmute(at_once) };
@@ -1323,6 +1354,265 @@ mod macos {
                 handler(num, info, ctx);
             }
         }
+    }
+
+    // A denied call and the other ways its thread can end the process.
+    //
+    // On Linux the thread that made a trapped call runs the handler at once
+    // and nothing else after it. Here the signal goes to the process, its
+    // handler wakes the waiter and returns, and the thread that made the
+    // call runs on with the call failed. What it does with that can end the
+    // process before the waiter has: a panic (upstream's hook, then abort),
+    // an abort, a fault (upstream's handler and its exit code, or the
+    // default action), a trap libdispatch raises for a Mach call that
+    // failed, `exit`. Each of those ends asks first whether a call was
+    // denied ([`settle`]), and waits for the waiter's exit if one was.
+    //
+    // The answer is exact for the thread that made the call. The sandbox
+    // posts SIGSYS inside the denied call (measured: to the process, also
+    // when the calling thread does not block it), and xnu gives a process's
+    // signal to the first of its threads that does not block it (xnu
+    // bsd/kern/kern_sig.c `get_signalthread`): Firecracker's first thread,
+    // the receiver, which never blocks SIGSYS outside a handler that ends
+    // the process. So when the denied call returns, SIGSYS is pending on
+    // the receiver or delivered there.
+    // - The receiver itself, if it made the call, takes the signal as the
+    //   call returns: DENIED is set before it runs on.
+    // - Another thread asks the receiver with a signal of a higher number,
+    //   sent to that thread (`pthread_kill`). A thread takes its pending
+    //   signals lowest number first (`issignal`), and SIGSYS's handler
+    //   blocks the asking signal, so the asking signal's handler runs on
+    //   the receiver after SIGSYS's has set DENIED, and does not answer.
+    // A thread that did not make the denied call and ends the process while
+    // another's call is denied races with it, as on Linux.
+
+    /// Set by the signal's handler: a call was denied, the waiter ends the
+    /// process.
+    static DENIED: AtomicBool = AtomicBool::new(false);
+    /// The thread a process's SIGSYS goes to: Firecracker's first, which
+    /// registers its signal handlers ([`set_sigsys_handler`]); in the API
+    /// process, a fork of it, its only thread then. 0 before.
+    static RECEIVER: AtomicUsize = AtomicUsize::new(0);
+    /// A pipe nothing is written to: a thread that waits for the waiter's
+    /// exit reads from it (-1 before the waiter).
+    static PARK_PIPE: AtomicI32 = AtomicI32::new(-1);
+    /// The thread that asks the receiver (its `pthread_self`), 0 if none:
+    /// one at a time.
+    static ASK_OWNER: AtomicUsize = AtomicUsize::new(0);
+    /// A thread waits for the receiver's answer.
+    static ASKING: AtomicBool = AtomicBool::new(false);
+    /// The receiver's answer: no call had been denied.
+    static ANSWERED: AtomicBool = AtomicBool::new(false);
+    /// The handlers and flags [`guard_other_ends`] found (`sa_sigaction`,
+    /// `sa_flags`), by signal number.
+    static FOUND: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
+    static FOUND_FLAGS: [AtomicI32; 32] = [const { AtomicI32::new(0) }; 32];
+    static GUARDED: AtomicBool = AtomicBool::new(false);
+    /// The asking signal's handler is installed (not if the signal was
+    /// caught already: nothing would answer).
+    static ASK_READY: AtomicBool = AtomicBool::new(false);
+
+    /// The asking signal: above SIGSYS (12), and neither one Firecracker
+    /// handles nor the vCPU kick's (SIGUSR1, SIGUSR2). Its default action
+    /// is to be discarded.
+    const ASK_SIGNAL: libc::c_int = libc::SIGURG;
+    /// The signals by which a thread ends the process for what it did:
+    /// upstream's handlers exit with the signal's code, the default action
+    /// ends the process by the signal.
+    const ENDING_SIGNALS: [libc::c_int; 8] = [
+        libc::SIGILL,
+        libc::SIGTRAP,
+        libc::SIGABRT,
+        libc::SIGFPE,
+        libc::SIGBUS,
+        libc::SIGSEGV,
+        libc::SIGXCPU,
+        libc::SIGXFSZ,
+    ];
+
+    /// Waits for the waiter's exit: reads from a pipe nothing writes to.
+    /// Async-signal-safe.
+    fn wait_for_the_exit() -> ! {
+        let fd = PARK_PIPE.load(Ordering::Acquire);
+        let mut byte = 0u8;
+        loop {
+            // SAFETY: one byte into the stack, from a pipe with no data.
+            unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+        }
+    }
+
+    /// Called before the process ends any other way than by the waiter:
+    /// returns if no call of the calling thread's was denied, and otherwise
+    /// waits for the waiter's exit (see above). Without the sandbox it
+    /// returns at once. Async-signal-safe: atomics, `getpid`,
+    /// `pthread_self`, `pthread_kill`, `nanosleep`, `read`; errno is kept.
+    pub fn settle() {
+        // SAFETY: no arguments.
+        let pid = unsafe { libc::getpid() };
+        if !INSTALLED.load(Ordering::Acquire) || WAITER_PID.load(Ordering::Acquire) != pid {
+            return;
+        }
+        if DENIED.load(Ordering::Acquire) {
+            wait_for_the_exit();
+        }
+        // SAFETY: plain call.
+        let me = unsafe { libc::pthread_self() } as usize;
+        let receiver = RECEIVER.load(Ordering::Acquire);
+        if receiver == 0 || receiver == me || !ASK_READY.load(Ordering::Acquire) {
+            // The receiver's own denied call set DENIED as it returned.
+            return;
+        }
+        // SAFETY: this thread's errno.
+        let saved = unsafe { *errno_location() };
+        let nap = libc::timespec { tv_sec: 0, tv_nsec: 50_000 };
+        // One asker at a time; a handler on a thread that is asking asks
+        // again within its turn.
+        let nested = ASK_OWNER.load(Ordering::Acquire) == me;
+        while !nested && ASK_OWNER.compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            if DENIED.load(Ordering::Acquire) {
+                wait_for_the_exit();
+            }
+            // SAFETY: plain call; async-signal-safe.
+            unsafe { libc::nanosleep(&nap, std::ptr::null_mut()) };
+        }
+        ANSWERED.store(false, Ordering::Release);
+        ASKING.store(true, Ordering::Release);
+        // SAFETY: the receiver's thread, which lives as long as the process.
+        let sent = unsafe { libc::pthread_kill(receiver as libc::pthread_t, ASK_SIGNAL) } == 0;
+        // A receiver that cannot be asked gives no answer to wait for.
+        while sent && !ANSWERED.load(Ordering::Acquire) {
+            if DENIED.load(Ordering::Acquire) {
+                wait_for_the_exit();
+            }
+            // SAFETY: as above.
+            unsafe { libc::nanosleep(&nap, std::ptr::null_mut()) };
+        }
+        if !nested {
+            ASKING.store(false, Ordering::Release);
+            ASK_OWNER.store(0, Ordering::Release);
+        }
+        // SAFETY: as above.
+        unsafe { *errno_location() = saved };
+    }
+
+    /// The asking signal's handler, on the receiver: answers that no call
+    /// was denied, if none was. Async-signal-safe: atomics.
+    extern "C" fn on_ask(_: libc::c_int) {
+        if ASKING.load(Ordering::Acquire) && !DENIED.load(Ordering::Acquire) {
+            ANSWERED.store(true, Ordering::Release);
+        }
+    }
+
+    /// The handler [`guard_other_ends`] puts before an ending signal's:
+    /// asks first, then does what the signal did before.
+    extern "C" fn on_ending_signal(num: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+        if num == libc::SIGABRT {
+            // abort() has blocked every signal on every thread (Libc
+            // stdlib/FreeBSD/abort.c: `sigprocmask`, which xnu applies to
+            // all of the process's threads, bsd/kern/kern_sig.c
+            // `set_procsigmask`): the receiver takes SIGSYS and the asking
+            // signal again, a pending SIGSYS first.
+            // SAFETY: a set of the two signals, unblocked for the process.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGSYS);
+                libc::sigaddset(&mut set, ASK_SIGNAL);
+                libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            }
+        }
+        settle();
+        let slot = usize::try_from(num).unwrap_or(0) % FOUND.len();
+        match FOUND[slot].load(Ordering::Acquire) {
+            libc::SIG_IGN => {}
+            libc::SIG_DFL => {
+                // The default action: the signal is blocked in its handler,
+                // so the one sent here is taken as the handler returns, and
+                // ends the process by it (with the same wait status, and a
+                // core where the action has one).
+                // SAFETY: a zeroed sigaction with the default action; the
+                // signal to this thread.
+                unsafe {
+                    let mut act: libc::sigaction = std::mem::zeroed();
+                    act.sa_sigaction = libc::SIG_DFL;
+                    libc::sigaction(num, &act, std::ptr::null_mut());
+                    libc::pthread_kill(libc::pthread_self(), num);
+                }
+            }
+            found if FOUND_FLAGS[slot].load(Ordering::Acquire) & libc::SA_SIGINFO != 0 => {
+                // SAFETY: the handler registered for this signal before.
+                let handler: SigsysHandler = unsafe { std::mem::transmute(found) };
+                handler(num, info, ctx);
+            }
+            found => {
+                // SAFETY: as above, registered without SA_SIGINFO.
+                let handler: extern "C" fn(libc::c_int) = unsafe { std::mem::transmute(found) };
+                handler(num);
+            }
+        }
+    }
+
+    extern "C" fn settle_at_exit() {
+        settle();
+    }
+
+    /// Puts [`settle`] before every other way a thread ends the process
+    /// (see above), once, before the sandbox: the ending signals' handlers
+    /// (upstream's, or the default action), the panic hook, `exit`; and
+    /// installs the asking signal's handler. No handler registered so far
+    /// blocks SIGSYS any more: the receiver stays the thread a process's
+    /// SIGSYS goes to while it runs one that returns (upstream's for
+    /// SIGPIPE).
+    fn guard_other_ends() -> std::io::Result<()> {
+        let (park_r, _park_w) = waiter_pipe()?;
+        PARK_PIPE.store(park_r, Ordering::Release);
+        if GUARDED.swap(true, Ordering::AcqRel) {
+            // A fork of a process that did it (the API process).
+            return Ok(());
+        }
+        let failed = || Err(std::io::Error::last_os_error());
+        // SAFETY: zeroed sigactions, read and written for signal numbers
+        // below 32; the handlers are async-signal-safe.
+        unsafe {
+            for (slot, sig) in (1..32).enumerate().map(|(i, sig)| (i + 1, sig)) {
+                if sig == libc::SIGKILL || sig == libc::SIGSTOP || sig == libc::SIGSYS {
+                    continue;
+                }
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, std::ptr::null(), &mut old) != 0 {
+                    return failed();
+                }
+                let ending = ENDING_SIGNALS.contains(&sig);
+                let caught = old.sa_sigaction != libc::SIG_DFL && old.sa_sigaction != libc::SIG_IGN;
+                let mut act = old;
+                if ending && old.sa_sigaction != libc::SIG_IGN {
+                    FOUND[slot].store(old.sa_sigaction, Ordering::Release);
+                    FOUND_FLAGS[slot].store(old.sa_flags, Ordering::Release);
+                    act.sa_sigaction = on_ending_signal as *const () as usize;
+                    act.sa_flags = old.sa_flags | libc::SA_SIGINFO;
+                } else if sig == ASK_SIGNAL && !caught {
+                    act.sa_sigaction = on_ask as *const () as usize;
+                    act.sa_flags = libc::SA_RESTART;
+                    libc::sigfillset(&mut act.sa_mask);
+                    ASK_READY.store(true, Ordering::Release);
+                } else if !caught {
+                    continue;
+                }
+                libc::sigdelset(&mut act.sa_mask, libc::SIGSYS);
+                if libc::sigaction(sig, &act, std::ptr::null_mut()) != 0 {
+                    return failed();
+                }
+            }
+            if libc::atexit(settle_at_exit) != 0 {
+                return Err(std::io::Error::other("atexit refused the denied call's check"));
+            }
+        }
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            settle();
+            hook(info);
+        }));
+        Ok(())
     }
 
     /// Blocks every signal in the calling thread: the waiter runs upstream's
@@ -1473,6 +1763,7 @@ mod macos {
         for _ in 0..2 {
             wait.recv().map_err(|_| fail(std::io::Error::other("a SIGSYS thread ended")))?;
         }
+        guard_other_ends().map_err(fail)?;
         WAITER_PID.store(me, Ordering::Release);
         WAITER_PIPE.store(wake_w, Ordering::Release);
         Ok(())
@@ -1505,6 +1796,7 @@ mod macos {
         let me = unsafe { libc::getpid() };
         let pipe = WAITER_PIPE.load(Ordering::Acquire);
         if pipe >= 0 && WAITER_PID.load(Ordering::Acquire) == me {
+            DENIED.store(true, Ordering::Release);
             SIGSYS_CODE.store(0, Ordering::Relaxed);
             SIGSYS_PID.store(me, Ordering::Release);
             let byte = 1u8;
@@ -1685,6 +1977,9 @@ mod macos {
         // SAFETY: plain calls on this thread, with a valid signal set.
         unsafe {
             libc::pthread_kill(libc::pthread_self(), libc::SIGSYS);
+            // Taken here, this thread goes no further, as the thread a
+            // seccomp trap stops.
+            settle();
             libc::signal(libc::SIGSYS, libc::SIG_DFL);
             let mut set: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut set);
@@ -2980,6 +3275,187 @@ mod macos {
             assert!(failed && r0 == libc::ENOSYS as usize, "{r0} {failed}");
             std::thread::sleep(std::time::Duration::from_secs(1));
             println!("ENOSYS-AND-ALIVE");
+        }
+
+        /// Runs `ending_child` with `case`, "<who>-<how>": the thread
+        /// `who` (`first`, the process's first thread; `other`, one it
+        /// made; `none`, as `other` with no denied call) makes a denied
+        /// call and at once ends the process `how`.
+        fn ending(case: &str) -> std::process::Output {
+            child("ending_child", &[("WICK_TEST_CASE", case)])
+        }
+
+        const HOWS: [&str; 5] = ["abort", "panic", "fault", "exit", "trap"];
+
+        // The thread whose call the sandbox denied runs on with the call
+        // failed, and what it does next would end Firecracker before the
+        // waiter has (an abort, a panic, a fault upstream's handler exits
+        // on, exit, a trap): each of those ends asks first whether a call
+        // was denied, so Firecracker ends as for the denied call, with
+        // upstream's log line and metrics and nothing of the other end, as
+        // on Linux, where that thread runs nothing after its trapped call.
+        // (Without the asking each case ended the other way: 20 runs of 20
+        // each.)
+        #[test]
+        fn test_a_denied_calls_thread_cannot_end_firecracker_another_way() {
+            for who in ["first", "other"] {
+                for how in HOWS {
+                    let case = format!("{who}-{how}");
+                    let out = ending(&case);
+                    assert_eq!(
+                        out.status.code(),
+                        Some(crate::FcExitCode::BadSyscall as i32),
+                        "{case}: {}",
+                        text(&out)
+                    );
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    assert!(stdout.contains("the host sandbox denied a system call"), "{case}: {}", text(&out));
+                    assert!(stdout.contains(FAULT_METRIC), "{case}: {}", text(&out));
+                    for other in [
+                        "Firecracker panicked",
+                        "intercepting signal 10",
+                        "intercepting signal 11",
+                        "\"panic_count\":1",
+                    ] {
+                        assert!(!stdout.contains(other), "{case}: {other:?} in {}", text(&out));
+                    }
+                }
+            }
+        }
+
+        // With no denied call each of those ends is what it was: the
+        // signal's default action or upstream's handler, the panic hook,
+        // exit's code.
+        #[test]
+        fn test_the_other_ends_are_unchanged_without_a_denied_call() {
+            use std::os::unix::process::ExitStatusExt;
+            for how in HOWS {
+                let out = ending(&format!("none-{how}"));
+                let (code, signal) = (out.status.code(), out.status.signal());
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let ok = match how {
+                    "abort" => signal == Some(libc::SIGABRT),
+                    "panic" => signal == Some(libc::SIGABRT) && stdout.contains("Firecracker panicked"),
+                    "fault" => {
+                        code == Some(crate::FcExitCode::SIGSEGV as i32) || code == Some(crate::FcExitCode::SIGBUS as i32)
+                    }
+                    "exit" => code == Some(7),
+                    _ => signal == Some(libc::SIGTRAP),
+                };
+                assert!(ok, "{how}: {}", text(&out));
+                assert!(!stdout.contains(FAULT_METRIC), "{how}: {}", text(&out));
+            }
+        }
+
+        #[test]
+        #[ignore = "run by the tests of a denied call's thread ending the process"]
+        fn ending_child() {
+            let case = std::env::var("WICK_TEST_CASE").unwrap();
+            in_fork(move || ending_case(&case));
+        }
+
+        fn ending_case(case: &str) {
+            use std::os::fd::FromRawFd;
+
+            use crate::logger::{LOGGER, METRICS, StoreMetric};
+            let (who, how) = case.split_once('-').unwrap();
+            let how = how.to_owned();
+            crate::signal_handler::register_signal_handlers().unwrap();
+            let _ = LOGGER.init();
+            // SAFETY: a new descriptor of standard output, owned here.
+            let out = unsafe { std::fs::File::from_raw_fd(libc::dup(1)) };
+            METRICS.init(std::io::LineWriter::new(crate::ext::fifo::plain(out))).unwrap();
+            // Upstream's hook (firecracker/src/main.rs), with the abort of
+            // its panic = "abort".
+            std::panic::set_hook(Box::new(|info| {
+                crate::logger::error_unrestricted!("Firecracker {}", info);
+                METRICS.vmm.panic_count.store(1);
+                let _ = METRICS.write();
+                std::process::abort();
+            }));
+            select(Policy::Default);
+            apply().unwrap();
+            let denies = who != "none";
+            let act = move || {
+                if denies {
+                    // SAFETY: no arguments; denied, which raises SIGSYS.
+                    unsafe { libc::getppid() };
+                }
+                match how.as_str() {
+                    // SAFETY: ends the process.
+                    "abort" => unsafe { libc::abort() },
+                    "panic" => panic!("after a denied call"),
+                    // SAFETY: a write to address 0, which faults.
+                    "fault" => unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) },
+                    // SAFETY: ends the process, through its atexit handlers.
+                    "exit" => unsafe { libc::exit(7) },
+                    // SAFETY: a breakpoint trap, as libdispatch's for a
+                    // Mach call that failed.
+                    _ => unsafe { std::arch::asm!("brk #1") },
+                }
+            };
+            if who == "first" {
+                act();
+            } else {
+                let _ = std::thread::spawn(act).join();
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        // xnu keeps a caught signal's sender in the process and zeroes it
+        // when a signal is delivered, so the sandbox's SIGSYS comes with no
+        // sender if another signal is delivered first: here SIGINT, pending
+        // with it while both are blocked, and taken first as the lower
+        // number. Firecracker still ends as for the denied call. (Read as
+        // another process's SIGSYS, upstream's handler exited with its
+        // unexpected-error code, 2.)
+        #[test]
+        fn test_a_denied_calls_signal_without_its_sender_is_still_the_sandboxs() {
+            let out = child("senderless_child", &[]);
+            assert_eq!(out.status.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", text(&out));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("the host sandbox denied a system call"), "{}", text(&out));
+            assert!(stdout.contains(FAULT_METRIC), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_a_denied_calls_signal_without_its_sender_is_still_the_sandboxs"]
+        fn senderless_child() {
+            in_fork(|| {
+                use std::os::fd::FromRawFd;
+
+                use crate::logger::{LOGGER, METRICS};
+                extern "C" fn nothing(_: libc::c_int) {}
+                crate::signal_handler::register_signal_handlers().unwrap();
+                let _ = LOGGER.init();
+                // SAFETY: a new descriptor of standard output, owned here.
+                let out = unsafe { std::fs::File::from_raw_fd(libc::dup(1)) };
+                METRICS.init(std::io::LineWriter::new(crate::ext::fifo::plain(out))).unwrap();
+                // SAFETY: a handler for SIGINT that does nothing.
+                unsafe {
+                    let mut act: libc::sigaction = std::mem::zeroed();
+                    act.sa_sigaction = nothing as *const () as usize;
+                    libc::sigaction(libc::SIGINT, &act, std::ptr::null_mut());
+                }
+                select(Policy::Default);
+                apply().unwrap();
+                // SAFETY: a set of the two signals for this thread; the
+                // denied call's SIGSYS and then SIGINT pend on it, blocked,
+                // and are taken as they are unblocked, SIGINT first.
+                unsafe {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGSYS);
+                    libc::sigaddset(&mut set, libc::SIGINT);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                    libc::getppid();
+                    libc::pthread_kill(libc::pthread_self(), libc::SIGINT);
+                    libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                println!("CHILD-SURVIVED");
+            });
         }
 
         /// Runs `body` in a fork of this process and ends as the fork ends:
