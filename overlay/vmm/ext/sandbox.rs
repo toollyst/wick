@@ -6617,12 +6617,36 @@ mod windows {
             #[link(name = "kernel32")]
             unsafe extern "system" {
                 fn SetEvent(h: *mut c_void) -> i32;
+                fn GetLastError() -> u32;
+                fn GetFileType(h: *mut c_void) -> u32;
             }
             sandboxed();
-            // SAFETY: a handle value the process does not hold; strict
-            // handle checks raise for it.
-            let r = unsafe { SetEvent(0x1234 as *mut c_void) };
-            println!("CHILD-SURVIVED {r}");
+            // A value no process holds a handle at: a process holds at most
+            // 2^24 handles (Microsoft Learn, "Kernel Objects": "The
+            // per-process limit on kernel handles is 2^24"), at values four
+            // apart (the low two bits are no part of a handle:
+            // OBJ_HANDLE_TAGBITS, wdm.h), so every handle is below 2^26;
+            // positive, so no pseudo-handle (those are -1 to -6). It was
+            // 0x1234, which a process can hold: in CI run 43403250054 this
+            // child, started without handlers right after the same child
+            // with them had raised, got FALSE from SetEvent and went on
+            // (CHILD-SURVIVED 0): no exception, so 0x1234 was a handle it
+            // held, since strict handle checks raise for one that is not
+            // there (PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY,
+            // RaiseExceptionOnInvalidHandleReference), and SetEvent failed
+            // for it as for an object that is no event. A child inherits
+            // its parent's inheritable handles with "the same value"
+            // (Microsoft Learn, "Handle Inheritance"), so which values a
+            // child holds follows the test process that starts it, which
+            // on the runner had run some 600 tests by then.
+            let bad = (1usize << 30) as *mut c_void;
+            // SAFETY: a value no handle has; strict handle checks raise for
+            // it.
+            let r = unsafe { SetEvent(bad) };
+            // Only if it did not raise: why, and what the value is.
+            // SAFETY: plain calls.
+            let (error, kind) = unsafe { (GetLastError(), GetFileType(bad)) };
+            println!("CHILD-SURVIVED {r} (error {error}, file type {kind})");
         }
 
         // A descriptor closed behind the POSIX layer's back (std closes its
