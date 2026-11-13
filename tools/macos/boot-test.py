@@ -1901,6 +1901,49 @@ def stage_machine_config(ctx):
         ", ".join(done)
 
 
+def stage_sigxfsz(ctx):
+    """SIGXFSZ from a file-size limit, as upstream's test_sigxfsz_handler
+    checks it: a write past RLIMIT_FSIZE raises SIGXFSZ, and Firecracker's
+    handler logs "Shutting down VM after intercepting signal 25, code 0.",
+    sets signals.sigxfsz in the metrics it writes, and exits with
+    FcExitCode::SIGXFSZ (151). Upstream sets the limit from outside with
+    prlimit, which macOS has no form of (the test stays [impossible]), so it
+    is set here before Firecracker's exec, as the jailer's
+    --resource-limit fsize= does; XNU checks it on every write (xnu-12377.1.9
+    bsd/vfs/vfs_vnops.c vn_write: psignal(SIGXFSZ), EFBIG), as Linux does
+    (v6.1 fs/read_write.c generic_write_check_limits: send_sig(SIGXFSZ)). The write is
+    the guest's, to a drive with the Sync engine (upstream's choice: io_uring
+    gives the guest EFBIG instead), at 40 MiB under a 32 MiB limit; the
+    metrics and the log stay far under it."""
+    import resource
+    limit = 32 << 20
+    scratch = os.path.join(ctx.out, "sigxfsz.img")
+    with open(scratch, "wb") as f:
+        f.truncate(64 << 20)
+    metrics = os.path.join(ctx.out, "sigxfsz.metrics")
+
+    def capped():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (limit, resource.RLIM_INFINITY))
+
+    drives = [{"drive_id": "scratch", "path_on_host": scratch, "is_root_device": False,
+               "is_read_only": False, "io_engine": "Sync"}]
+    vm = ctx.vm("sigxfsz", ["--metrics-path", metrics], config(ctx, drives=drives), preexec=capped)
+    vm.shell()
+    # Under the limit: taken.
+    vm.sh("dd if=/dev/zero of=/dev/vdb bs=4096 count=1 seek=$((16 * 256)) conv=fsync 2>/dev/null")
+    # Past it: the guest waits for its write while Firecracker ends.
+    vm.send("dd if=/dev/zero of=/dev/vdb bs=4096 count=1 seek=$((40 * 256)) conv=fsync")
+    code = vm.wait_exit()
+    vm.pump.join(5)
+    line = "Shutting down VM after intercepting signal 25, code 0."
+    check(line in vm.buf, f"no {line!r} in Firecracker's output ({vm.exit_reason()})")
+    check(code == 151, f"exit status {code}, not FcExitCode::SIGXFSZ (151) ({vm.exit_reason()})")
+    last = read_metrics(metrics)[-1]
+    check(last["signals"]["sigxfsz"] == 1, f"signals.sigxfsz {last['signals']['sigxfsz']} in the last metrics")
+    return (f"RLIMIT_FSIZE {limit >> 20} MiB set before the exec: a guest write at 16 MiB taken, at 40 MiB "
+            f"Firecracker ends with {line!r}, exit 151, signals.sigxfsz 1")
+
+
 # MIDR_EL1's id in a CPU template's reg_modifiers (KVM_REG_ARM64_SYSREG op0
 # 3, op1 0, CRn 0, CRm 0, op2 0).
 MIDR_EL1_ID = "0x603000000013c000"
@@ -2744,6 +2787,7 @@ STAGES = {
     "cli": stage_cli,
     "machine-config": stage_machine_config,
     "fingerprint": stage_fingerprint,
+    "sigxfsz": stage_sigxfsz,
     "tools": stage_tools,
     "no-seccomp": stage_no_seccomp,
     "memory-hotplug": stage_memory_hotplug,

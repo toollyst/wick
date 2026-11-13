@@ -160,7 +160,9 @@ all impossible integration_tests/functional/test_signals.py::test_handled_signal
 
 # The test sets Firecracker's RLIMIT_FSIZE from outside with prlimit(2):
 # macOS has no prlimit (see test_api_machine_config above). The limit itself
-# exists, and the jailer's --resource-limit fsize= sets it.
+# exists, and the jailer's --resource-limit fsize= sets it; set before the
+# exec, it ends Firecracker through the same handler with the test's log
+# line, metric and exit status (tools/macos/boot-test.py sigxfsz).
 all impossible integration_tests/functional/test_signals.py::test_sigxfsz_handler
 
 # The handler's "socket" is a regular file. connect(2) to it fails on Linux
