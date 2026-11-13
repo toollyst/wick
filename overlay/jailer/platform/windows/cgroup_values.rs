@@ -104,8 +104,34 @@ pub fn cpu_rate(quota: u64, period: u64, cpus: u64) -> Result<u32, &'static str>
 //   against what the levels above come to ([`rate_of_levels`],
 //   [`cpus_of_levels`]).
 
-/// The prefix of a parent's job name, in the session's object namespace.
-pub const PARENT_JOB_PREFIX: &str = "Local\\wick-cgroup-";
+/// The private namespace of the parent cgroups' jobs: its name, which is
+/// also the name of its boundary. The boundary holds the account's SID and
+/// the medium integrity level ([`MEDIUM_INTEGRITY`]): "A process can create
+/// a private namespace only with an integrity level that is equal to or
+/// lower than the current integrity level of the process", and "would
+/// usually specify a namespace at the same integrity level as the process
+/// for protection against squatting attacks by lower integrity-level
+/// processes" (Microsoft Learn, `AddIntegrityLabelToBoundaryDescriptor`). A
+/// jailed process runs below medium: it makes no namespace of this
+/// boundary, and the namespace's own security descriptor
+/// ([`parent_namespace_sddl`]) keeps it from opening the one that is there
+/// ("a process can open an existing namespace even if it is not within the
+/// boundary unless the creator restricted access to the namespace":
+/// Microsoft Learn, "Object Namespaces"). In the session's own namespace
+/// (`Local\`), where a parent's job was first, whoever may make an object
+/// there may take a parent's name before the operator does.
+pub const PARENT_NAMESPACE: &str = "wick-cgroup";
+
+/// The security descriptor of the namespace and of each job in it: the
+/// system and the account, nothing inherited from above, and a medium label
+/// that lets nothing below it read or write. A jail's token is restricted
+/// to SIDs this grants nothing, and is below medium.
+pub fn parent_namespace_sddl(user: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;GA;;;{user})S:(ML;;NWNRNX;;;ME)")
+}
+
+/// The prefix of a parent's job name: in the private namespace.
+pub const PARENT_JOB_PREFIX: &str = "wick-cgroup\\";
 
 /// The names of the Job Objects that are the parent cgroup `parent`, one
 /// for each level of its path, the top first: `a/b` is `...-a` and
@@ -290,6 +316,9 @@ mod tests {
         assert_eq!(parent_job_names("a/b/c").unwrap().len(), 3);
         assert_eq!(parent_job_names("").unwrap_err(), "an empty name");
         assert_eq!(parent_job_names("/").unwrap_err(), "an empty name");
+        // In the private namespace, whose name the prefix starts with.
+        assert_eq!(p, format!("{PARENT_NAMESPACE}\\"));
+        assert_eq!(parent_namespace_sddl("S-1-5-21-1-2-3-1001"), "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)S:(ML;;NWNRNX;;;ME)");
     }
 
     // What the levels above come to: the rates multiply (each a share of

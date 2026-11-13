@@ -14,7 +14,8 @@
 //! does nothing if it does not. With version 1 and no `--cgroup` the parent
 //! is not read.
 //!
-//! Here the parent is the Job Object `Local\wick-cgroup-<parent>`, and a
+//! Here the parent is the Job Object `wick-cgroup\<parent>`, in a private
+//! namespace of the account's (below, "Whose job it is"), and a
 //! jail's processes are put in it and then in the jail's own job, which is
 //! thereby nested in it: Windows bounds a nested job by its parent's memory
 //! limit, CPU rate and processors (Microsoft Learn, "Nested Jobs"; measured
@@ -55,9 +56,15 @@
 //! that names it makes a new one without limits: the one difference from
 //! Linux, where the directory would still be there.
 //!
-//! **Whose job it is.** The name is in the session's object namespace, where
-//! a jailed process could make a job of that name first, for later jails to
-//! join. A job the jailer did not make itself is used only when it is owned
+//! **Whose job it is.** In the session's object namespace (`Local\`) a
+//! process that may make an object there could make a job of a parent's
+//! name first, for later jails to join, or to have them refused. So the
+//! jobs are in a private namespace whose boundary is the account's SID at
+//! medium integrity (`cgroup_values::PARENT_NAMESPACE`): a jailed process,
+//! below medium, can neither make that namespace nor open it
+//! (`test_a_jails_token_does_not_reach_a_parents_name`). The tool and each
+//! jailer make it or open it, and keep it open while they run. Besides, a
+//! job the jailer did not make itself is used only when it is owned
 //! by the jailer's account, the administrators or the system and is not
 //! labelled below medium integrity, which what a jailed process makes is
 //! (`cgroup_values::trusted_parent`); otherwise the jailer stops. Every
@@ -93,9 +100,120 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::cgroup_values::{
-    PARENT_JOB_PREFIX, cpus_of_levels, cpus_under_parent, parent_job_names, rate_of_levels, rate_under_parent, trusted_parent,
+    PARENT_JOB_PREFIX, PARENT_NAMESPACE, cpus_of_levels, cpus_under_parent, parent_job_names, parent_namespace_sddl, rate_of_levels, rate_under_parent,
+    trusted_parent,
 };
-use super::{GroupAffinity, HostError, Limits, last_error, sid_string, token_info, user_sid, wide};
+use super::{GroupAffinity, HostError, Limits, Sid, last_error, sid_string, token_info, user_sid, wide};
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateBoundaryDescriptorW(name: *const u16, flags: u32) -> HANDLE;
+    fn AddSIDToBoundaryDescriptor(boundary: *mut HANDLE, sid: PSID) -> i32;
+    fn AddIntegrityLabelToBoundaryDescriptor(boundary: *mut HANDLE, label: PSID) -> i32;
+    fn DeleteBoundaryDescriptor(boundary: HANDLE);
+    fn CreatePrivateNamespaceW(attributes: *const SECURITY_ATTRIBUTES, boundary: *const std::ffi::c_void, alias: *const u16) -> HANDLE;
+    fn OpenPrivateNamespaceW(boundary: *const std::ffi::c_void, alias: *const u16) -> HANDLE;
+}
+
+/// `S-1-16-8192`: the medium integrity level, as a SID.
+const MEDIUM_INTEGRITY_SID: &str = "S-1-16-8192";
+
+/// A boundary descriptor: the account's SID and an integrity level
+/// (Microsoft Learn, `CreateBoundaryDescriptorW`, `AddSIDToBoundaryDescriptor`,
+/// `AddIntegrityLabelToBoundaryDescriptor`). Deleted when dropped.
+struct Boundary(HANDLE);
+
+impl Boundary {
+    fn new(name: &str, user: &str, level: &str) -> io::Result<Boundary> {
+        let other = |e: HostError| io::Error::other(e.to_string());
+        let (user, level) = (Sid::new(user).map_err(other)?, Sid::new(level).map_err(other)?);
+        // SAFETY: a NUL-terminated name.
+        let h = unsafe { CreateBoundaryDescriptorW(wide(name).as_ptr(), 0) };
+        if h.is_null() {
+            return Err(last_error());
+        }
+        let mut boundary = Boundary(h);
+        // SAFETY: the descriptor made above, which the calls may move, and
+        // valid SIDs.
+        if unsafe { AddSIDToBoundaryDescriptor(&mut boundary.0, user.0) } == 0
+            || unsafe { AddIntegrityLabelToBoundaryDescriptor(&mut boundary.0, level.0) } == 0
+        {
+            return Err(last_error());
+        }
+        Ok(boundary)
+    }
+}
+
+impl Drop for Boundary {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor we made.
+        unsafe { DeleteBoundaryDescriptor(self.0) };
+    }
+}
+
+/// Security attributes from SDDL, for one call.
+fn with_security<T>(sddl: &str, call: impl FnOnce(&SECURITY_ATTRIBUTES) -> T) -> io::Result<T> {
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated SDDL string and an out-pointer.
+    if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(sddl).as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut()) }
+        == 0
+    {
+        return Err(last_error());
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap(),
+        lpSecurityDescriptor: sd,
+        bInheritHandle: 0,
+    };
+    let result = call(&attributes);
+    // SAFETY: allocated by the conversion.
+    unsafe { LocalFree(sd) };
+    Ok(result)
+}
+
+/// The private namespace `name` of this account, made, or opened if it is
+/// there: its handle, which keeps it for this process. The two calls are
+/// the usual pair for an object another process may make or leave at any
+/// moment: made unless it exists, opened unless it has just gone, a few
+/// times over before Windows's last answer is the error.
+fn enter_namespace(name: &str) -> io::Result<HANDLE> {
+    let user = user_sid()?;
+    let boundary = Boundary::new(name, &user, MEDIUM_INTEGRITY_SID)?;
+    let alias = wide(name);
+    let mut err = io::Error::other("unreachable");
+    for _ in 0..8 {
+        // SAFETY: the attributes of the call, the boundary and a
+        // NUL-terminated name; the last error read at once.
+        let (h, code) = with_security(&parent_namespace_sddl(&user), |attributes| unsafe {
+            let h = CreatePrivateNamespaceW(attributes, boundary.0, alias.as_ptr());
+            (h, GetLastError())
+        })?;
+        if !h.is_null() {
+            return Ok(h);
+        }
+        if code != ERROR_ALREADY_EXISTS {
+            return Err(io::Error::from_raw_os_error(code.cast_signed()));
+        }
+        // SAFETY: as above.
+        let h = unsafe { OpenPrivateNamespaceW(boundary.0, alias.as_ptr()) };
+        if !h.is_null() {
+            return Ok(h);
+        }
+        err = last_error();
+    }
+    Err(err)
+}
+
+/// Makes or opens the parent cgroups' namespace, once: this process keeps
+/// it until it ends, as it keeps its parent's jobs.
+fn namespace() -> io::Result<()> {
+    static HELD: Mutex<Option<usize>> = Mutex::new(None);
+    let mut held = HELD.lock().unwrap();
+    if held.is_none() {
+        *held = Some(enter_namespace(PARENT_NAMESPACE)? as usize);
+    }
+    Ok(())
+}
 
 /// `JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_QUERY | READ_CONTROL`: what the
 /// jailer needs of a parent's job, its owner and label among it.
@@ -291,6 +409,7 @@ pub(crate) fn enter(parent: Option<&Parent>, job: &OwnedHandle, process: HANDLE)
 
 /// The job of the name, or `None` when there is none.
 fn open(name: &str) -> io::Result<Option<OwnedHandle>> {
+    namespace()?;
     // SAFETY: a NUL-terminated name.
     let h = unsafe { OpenJobObjectW(JAILER_ACCESS, 0, wide(name).as_ptr()) };
     if h.is_null() {
@@ -305,29 +424,15 @@ fn open(name: &str) -> io::Result<Option<OwnedHandle>> {
 /// call, so that of two jailers that start together one makes it and the
 /// other opens it. A new job has no limits and does not end its processes
 /// when its handles close; it grants the system and this user, and nothing
-/// to a jail's SIDs.
+/// to a jail's SIDs, at medium integrity.
 fn create_or_open(name: &str) -> io::Result<(OwnedHandle, bool)> {
-    let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{})", user_sid()?);
-    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: a NUL-terminated SDDL string and an out-pointer.
-    if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(&sddl).as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut()) }
-        == 0
-    {
-        return Err(last_error());
-    }
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap(),
-        lpSecurityDescriptor: sd,
-        bInheritHandle: 0,
-    };
-    // SAFETY: the attributes above and a NUL-terminated name. An existing
-    // job is opened and the last error says so (`CreateJobObjectW`).
-    let (h, err) = unsafe {
-        let h = CreateJobObjectW(&attributes, wide(name).as_ptr());
+    namespace()?;
+    // SAFETY: the attributes of the call and a NUL-terminated name. An
+    // existing job is opened and the last error says so (`CreateJobObjectW`).
+    let (h, err) = with_security(&parent_namespace_sddl(&user_sid()?), |attributes| unsafe {
+        let h = CreateJobObjectW(attributes, wide(name).as_ptr());
         (h, GetLastError())
-    };
-    // SAFETY: allocated by the conversion.
-    unsafe { LocalFree(sd) };
+    })?;
     if h.is_null() {
         return Err(io::Error::from_raw_os_error(err.cast_signed()));
     }
@@ -815,6 +920,93 @@ mod tests {
         println!("PARENTTEST a level whose level above has no job: {refused}");
         assert!(refused.contains("above it, does not"), "{refused}");
         drop(lower);
+    }
+
+    // What a jailed process can do about a parent's name, with the jail's
+    // own lockdown token (`tokens`, as the jailer makes it) on this thread;
+    // an access check reads the thread's token. Asserted, the rule: it
+    // neither opens the parent cgroups' namespace, nor makes a namespace of
+    // that boundary, nor opens a parent's job. Printed, Windows's answers,
+    // and what the same token may do in the session's namespace (`Local\`),
+    // where a parent's job was at first. The control: the thread, as the
+    // jail, makes an object without a name, so a refusal is the token's and
+    // not a failed impersonation.
+    #[test]
+    #[ignore = "makes named jobs and a namespace: run alone by CI's windows job, with --nocapture"]
+    fn test_a_jails_token_does_not_reach_a_parents_name() {
+        use super::super::{DuplicateTokenEx, SecurityImpersonation, SetThreadToken, TOKEN_ALL_ACCESS, TokenImpersonation};
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        let answer = |h: HANDLE| if h.is_null() { Err(last_error().raw_os_error().unwrap_or(0)) } else { Ok(()) };
+        let name = fresh("reach");
+        let operators = tool(&name);
+        let job_name = wide(&parent_job_names(&name).unwrap()[0]);
+        let local = wide(&format!("Local\\wick-test-local-{}", std::process::id()));
+        let taken = wide(&format!("Local\\wick-test-taken-{}", std::process::id()));
+        // SAFETY: NUL-terminated names; a job of the operator's in `Local\`.
+        let in_local = unsafe { CreateJobObjectW(std::ptr::null(), local.as_ptr()) };
+        assert!(!in_local.is_null(), "{}", last_error());
+        let user = user_sid().unwrap();
+        let ours = Boundary::new(PARENT_NAMESPACE, &user, MEDIUM_INTEGRITY_SID).unwrap();
+        let other = format!("wick-test-ns-{}", std::process::id());
+        let (others, alias, other_alias) = (Boundary::new(&other, &user, MEDIUM_INTEGRITY_SID).unwrap(), wide(PARENT_NAMESPACE), wide(&other));
+
+        let tokens = super::super::tokens().unwrap();
+        let mut jail: HANDLE = std::ptr::null_mut();
+        // SAFETY: the lockdown token, duplicated for a thread.
+        let ok = unsafe {
+            DuplicateTokenEx(tokens.primary.as_raw_handle(), TOKEN_ALL_ACCESS, std::ptr::null(), SecurityImpersonation, TokenImpersonation, &mut jail)
+        };
+        assert_ne!(ok, 0, "{}", last_error());
+        // SAFETY: this thread takes the jail's token for the calls below and
+        // is itself again after them; every argument outlives the calls.
+        let (control, namespace_opened, namespace_made, job_opened, local_made, local_opened) = unsafe {
+            assert_ne!(SetThreadToken(std::ptr::null_mut(), jail), 0, "{}", last_error());
+            let control = answer(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()));
+            let namespace_opened = answer(OpenPrivateNamespaceW(ours.0, alias.as_ptr()));
+            let namespace_made = answer(CreatePrivateNamespaceW(std::ptr::null(), others.0, other_alias.as_ptr()));
+            let job_opened = answer(OpenJobObjectW(JAILER_ACCESS, 0, job_name.as_ptr()));
+            let local_made = answer(CreateJobObjectW(std::ptr::null(), taken.as_ptr()));
+            let local_opened = answer(OpenJobObjectW(JAILER_ACCESS, 0, local.as_ptr()));
+            assert_ne!(SetThreadToken(std::ptr::null_mut(), std::ptr::null_mut()), 0, "the thread could not be itself again");
+            (control, namespace_opened, namespace_made, job_opened, local_made, local_opened)
+        };
+        println!(
+            "PARENTTEST with a jail's token (an unnamed event, the control: {control:?}): the parents' namespace opened \
+             {namespace_opened:?}, a namespace of the same kind of boundary made {namespace_made:?}, a parent's job \
+             opened {job_opened:?} (5: access denied)"
+        );
+        println!(
+            "PARENTTEST with a jail's token, in the session's namespace: a job named in Local\\ made {local_made:?}, \
+             the operator's job there opened {local_opened:?}"
+        );
+        assert_eq!(control, Ok(()), "the thread did not act as the jail");
+        assert!(namespace_opened.is_err(), "a jail's token opened the parent cgroups' namespace");
+        assert!(namespace_made.is_err(), "a jail's token made a namespace of a medium-integrity boundary");
+        assert!(job_opened.is_err(), "a jail's token opened a parent's job");
+
+        // What the design stands on: the namespace is found by the next
+        // jailer while any holder has it open, whoever made it. A namespace
+        // made here and opened once more (a second holder), its maker's
+        // handle then closed: opened again.
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn ClosePrivateNamespace(handle: HANDLE, flags: u32) -> u8;
+        }
+        // SAFETY: a boundary and NUL-terminated names; handles of this test.
+        let (made, second, closed, third) = unsafe {
+            let made = CreatePrivateNamespaceW(std::ptr::null(), others.0, other_alias.as_ptr());
+            let made_answer = answer(made);
+            let second = answer(OpenPrivateNamespaceW(others.0, other_alias.as_ptr()));
+            let closed = ClosePrivateNamespace(made, 0);
+            (made_answer, second, closed, answer(OpenPrivateNamespaceW(others.0, other_alias.as_ptr())))
+        };
+        println!(
+            "PARENTTEST a namespace made {made:?} and opened by a second holder {second:?}; its maker's handle closed \
+             ({closed}), it is opened again: {third:?}"
+        );
+        assert_eq!((made, second), (Ok(()), Ok(())));
+        assert_eq!(third, Ok(()), "a namespace a holder has open was not found once its maker's handle was closed");
+        drop(operators);
     }
 
     // A job of the parent's name that a jailed process could have made (it

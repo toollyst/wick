@@ -11,8 +11,8 @@
   and limited with `jail-parent.exe` bounds two jails' memory together, a
   level under it holds a jail to the least limit along the path, a
   jail's processors under it are Linux's by cgroup version, a jailer keeps
-  its jail's parent when the tool has ended, and a job of a parent's name
-  that a jailed process made is not joined), `freeze` (upstream's freezer files next to the
+  its jail's parent when the tool has ended, and a jailed process does not
+  reach the namespace the parents' jobs are named in), `freeze` (upstream's freezer files next to the
   jail: a jail frozen and thawed through `freezer.state` and through
   `cgroup.freeze` and `cgroup.events`, invalid values restored, the jail
   unable to write its control file, the jailer's death ending a frozen jail,
@@ -70,7 +70,8 @@
 - `jail-parent.rs` (`jail-parent.exe` in CI's artifact): the operator's tool
   for a parent cgroup, what `mkdir` and `echo` into the parent's directory
   are on Linux. The jailer's `--parent-cgroup <name>` is the Job Object
-  `Local\wick-cgroup-<name>`; the tool makes it, writes the limits named
+  `wick-cgroup\<name>`, in a private namespace of the account's that a
+  jailed process can neither make nor open; the tool makes it, writes the limits named
   (`memory.max`, `cpu.max`, `cpuset.cpus`, or their cgroup v1 names with
   `--cgroup-version 1`) and holds it until its standard input ends, or for
   ever with `--forever`. Each jailer holds its jail's parent too, so a

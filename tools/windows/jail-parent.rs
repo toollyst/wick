@@ -5,7 +5,9 @@
 //! parent's directory are on Linux.
 //!
 //! The jailer's `--parent-cgroup <name>` is on Windows the Job Object
-//! `Local\wick-cgroup-<name>`, in which every jail of that parent has its
+//! `wick-cgroup\<name>`, in a private namespace of the account's that
+//! nothing below medium integrity, a jailed process among it, can make or
+//! open, in which every jail of that parent has its
 //! own job (overlay/jailer/platform/windows/parent.rs). This tool makes that
 //! job, or opens it, writes the limits named to it, with the cgroup file
 //! names and values the jailer takes, and then holds it:
@@ -45,9 +47,10 @@
 //! its rate as a share of that one's, worked out once, where Linux works
 //! the hierarchy out again at every write.
 //!
-//! Run in the session the jailers run in, as the account they run as: the
-//! job grants the system and that account, and a jailer joins only a job of
-//! its own account, the administrators or the system.
+//! Run as the account the jailers run as, at medium integrity or above: the
+//! namespace's boundary is that account's SID, the namespace and the job
+//! grant the system and that account, and a jailer joins only a job of its
+//! own account, the administrators or the system.
 //!
 //! No dependencies: `rustc --edition 2021 -O jail-parent.rs` builds it.
 
@@ -61,8 +64,8 @@ use std::ffi::c_void;
 use std::io::Read;
 
 use cgroup_values::{
-    DEFAULT_PERIOD_US, PARENT_JOB_PREFIX, cpu_groups, cpu_rate, cpus_of_levels, cpus_under_parent, level_write, parent_job_names,
-    parse_list, rate_of_levels, rate_under_parent, strstrip, trusted_parent,
+    DEFAULT_PERIOD_US, PARENT_JOB_PREFIX, PARENT_NAMESPACE, cpu_groups, cpu_rate, cpus_of_levels, cpus_under_parent, level_write, parent_job_names,
+    parent_namespace_sddl, parse_list, rate_of_levels, rate_under_parent, strstrip, trusted_parent,
 };
 
 type HANDLE = *mut c_void;
@@ -161,6 +164,12 @@ extern "system" {
     fn GetCurrentProcess() -> HANDLE;
     fn CloseHandle(handle: HANDLE) -> i32;
     fn GetActiveProcessorGroupCount() -> u16;
+    fn CreateBoundaryDescriptorW(name: *const u16, flags: u32) -> HANDLE;
+    fn AddSIDToBoundaryDescriptor(boundary: *mut HANDLE, sid: *mut c_void) -> i32;
+    fn AddIntegrityLabelToBoundaryDescriptor(boundary: *mut HANDLE, label: *mut c_void) -> i32;
+    fn DeleteBoundaryDescriptor(boundary: HANDLE);
+    fn CreatePrivateNamespaceW(attributes: *const SECURITY_ATTRIBUTES, boundary: *const c_void, alias: *const u16) -> HANDLE;
+    fn OpenPrivateNamespaceW(boundary: *const c_void, alias: *const u16) -> HANDLE;
     fn GetActiveProcessorCount(group: u16) -> u32;
     fn Sleep(milliseconds: u32);
 }
@@ -170,6 +179,7 @@ extern "system" {
     fn OpenProcessToken(process: HANDLE, access: u32, token: *mut HANDLE) -> i32;
     fn GetTokenInformation(token: HANDLE, class: i32, info: *mut c_void, len: u32, needed: *mut u32) -> i32;
     fn ConvertSidToStringSidW(sid: *mut c_void, text: *mut *mut u16) -> i32;
+    fn ConvertStringSidToSidW(text: *const u16, sid: *mut *mut c_void) -> i32;
     fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
         text: *const u16,
         revision: u32,
@@ -375,11 +385,65 @@ fn processors(job: HANDLE) -> Result<Option<Vec<(u16, u64)>>, String> {
     Ok((!found.is_empty()).then_some(found))
 }
 
+/// Makes the parent cgroups' private namespace, or opens it if it is
+/// there, as the jailer does (`platform::parent`, `enter_namespace`): the
+/// boundary is this account's SID at medium integrity, which a jailed
+/// process, below medium, is not within. The handle keeps the namespace
+/// while this process runs.
+fn enter_namespace(user: &str) -> Result<HANDLE, String> {
+    let (alias, sddl) = (wide(PARENT_NAMESPACE), wide(&parent_namespace_sddl(user)));
+    let (mut user_sid, mut medium, mut sd) = (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: NUL-terminated strings and out-pointers; what the calls
+    // allocate is freed below. The descriptor is made, the two SIDs added
+    // (the calls may move it), and the namespace made unless it exists,
+    // opened unless it has just gone, a few times over.
+    unsafe {
+        if ConvertStringSidToSidW(wide(user).as_ptr(), &mut user_sid) == 0
+            || ConvertStringSidToSidW(wide("S-1-16-8192").as_ptr(), &mut medium) == 0
+            || ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut()) == 0
+        {
+            return Err(format!("the namespace's SIDs and security descriptor: {}", last()));
+        }
+        let mut boundary = CreateBoundaryDescriptorW(alias.as_ptr(), 0);
+        if boundary.is_null()
+            || AddSIDToBoundaryDescriptor(&mut boundary, user_sid) == 0
+            || AddIntegrityLabelToBoundaryDescriptor(&mut boundary, medium) == 0
+        {
+            return Err(format!("the namespace's boundary: {}", last()));
+        }
+        let attributes = SECURITY_ATTRIBUTES { nLength: 24, lpSecurityDescriptor: sd, bInheritHandle: 0 };
+        let mut result = Err(String::new());
+        for _ in 0..8 {
+            let made = CreatePrivateNamespaceW(&attributes, boundary, alias.as_ptr());
+            let err = GetLastError();
+            if !made.is_null() {
+                result = Ok(made);
+                break;
+            }
+            if err != ERROR_ALREADY_EXISTS {
+                result = Err(format!("making the parent cgroups' namespace: Windows error {err}"));
+                break;
+            }
+            let opened = OpenPrivateNamespaceW(boundary, alias.as_ptr());
+            if !opened.is_null() {
+                result = Ok(opened);
+                break;
+            }
+            result = Err(format!("opening the parent cgroups' namespace: {}", last()));
+        }
+        DeleteBoundaryDescriptor(boundary);
+        LocalFree(sd);
+        LocalFree(user_sid);
+        LocalFree(medium);
+        result
+    }
+}
+
 /// The job of one level: made, or opened if it is there and one to trust.
 /// Whether it was made.
 fn level(job_name: &str, user: &str) -> Result<(HANDLE, bool), String> {
     let path = job_name.strip_prefix(PARENT_JOB_PREFIX).unwrap_or(job_name);
-    let sddl = wide(&format!("D:P(A;;GA;;;SY)(A;;GA;;;{user})"));
+    let sddl = wide(&parent_namespace_sddl(user));
     let mut sd = std::ptr::null_mut();
     // SAFETY: NUL-terminated strings; the descriptor is freed after the call
     // that reads it. An existing job is opened and the last error says so.
@@ -412,14 +476,16 @@ fn run(name: &str, version: u8, cgroups: &[String]) -> Result<Vec<HANDLE>, Strin
     let names = parent_job_names(name).map_err(|why| format!("--name {name}: {why}"))?;
     let asked = parse(version, cgroups)?;
     let user = token_sid(TOKEN_USER_CLASS)?;
-    let mut jobs = Vec::new();
+    // First of what is held: the namespace the jobs are named in.
+    let mut jobs = vec![enter_namespace(&user)?];
+    let namespace = jobs.len();
     let mut made = false;
     for job_name in &names {
         let (job, new) = level(job_name, &user)?;
         jobs.push(job);
         made = new;
     }
-    let (job, above) = (jobs[jobs.len() - 1], &jobs[..jobs.len() - 1]);
+    let (job, above) = (jobs[jobs.len() - 1], &jobs[namespace..jobs.len() - 1]);
 
     if let Some(memory) = asked.memory {
         let mut info: EXTENDED = query(job, EXTENDED_LIMIT, "the job's limits")?;

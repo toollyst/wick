@@ -26,7 +26,7 @@
 //!                               privileges:0 largepage:<MiB>
 //!                               link:<new name>|<existing file> files:<n>
 //!                               private:<MiB> sections:<MiB> filesections:<MiB>
-//!                               namedjob:<object name>
+//!                               namedjob:<object name> namespace:0
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
@@ -150,6 +150,11 @@ extern "system" {
     fn WriteFile(h: HANDLE, buf: *const u8, n: u32, written: *mut u32, ov: *mut c_void) -> i32;
     fn QueryInformationJobObject(job: HANDLE, class: i32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
     fn CreateJobObjectW(sa: *const c_void, name: *const u16) -> HANDLE;
+    fn CreateBoundaryDescriptorW(name: *const u16, flags: u32) -> HANDLE;
+    fn AddSIDToBoundaryDescriptor(boundary: *mut HANDLE, sid: *mut c_void) -> i32;
+    fn AddIntegrityLabelToBoundaryDescriptor(boundary: *mut HANDLE, label: *mut c_void) -> i32;
+    fn CreatePrivateNamespaceW(sa: *const c_void, boundary: *const c_void, alias: *const u16) -> HANDLE;
+    fn OpenPrivateNamespaceW(boundary: *const c_void, alias: *const u16) -> HANDLE;
     fn GetProcessAffinityMask(p: HANDLE, mine: *mut usize, system: *mut usize) -> i32;
     fn GetProcessTimes(p: HANDLE, c: *mut u64, e: *mut u64, k: *mut u64, u: *mut u64) -> i32;
     fn GetLargePageMinimum() -> usize;
@@ -1000,10 +1005,11 @@ fn check(c: &str) -> String {
             let affinity = if flags & 0x10 != 0 { format!("{:#x}", basic[6]) } else { "none".into() };
             format!("allowed affinity={affinity} cpu={:#x}:{}", cpu[0], cpu[1])
         }
-        // Makes a Job Object of the name (`Local\wick-cgroup-<parent>` is a
-        // parent cgroup's, which a jail must not be able to pass off as the
-        // operator's): `allowed made` or `allowed opened`, the handle kept
-        // for as long as this process runs, or `denied`.
+        // Makes a Job Object of the name, on record: what a jailed process
+        // may do in the session's namespace (`Local\`), where a parent
+        // cgroup's job is not (`namespace:0`): `allowed made` or `allowed
+        // opened`, the handle kept for as long as this process runs, or
+        // `denied`.
         "namedjob" => {
             // SAFETY: a NUL-terminated name; the last error read at once.
             let (h, err) = unsafe {
@@ -1015,6 +1021,44 @@ fn check(c: &str) -> String {
             }
             // 183: ERROR_ALREADY_EXISTS, the job was there and is opened.
             format!("allowed {}", if err == 183 { "opened" } else { "made" })
+        }
+        // The parent cgroups' private namespace, as the jailer names it
+        // (overlay/jailer/platform/windows/cgroup_values.rs: `wick-cgroup`,
+        // this account's SID at medium integrity), which a jail must not
+        // reach: `denied` when it can neither open it nor make it, with
+        // Windows's two answers, else `allowed`.
+        "namespace" => {
+            let mut t = std::ptr::null_mut();
+            let mut buf = [0u64; 32];
+            let mut len = 0u32;
+            let mut medium = std::ptr::null_mut();
+            let name = wide("wick-cgroup");
+            // SAFETY: our own token (TOKEN_QUERY, TokenUser: a pointer to
+            // the SID first); NUL-terminated strings and out-pointers.
+            unsafe {
+                if OpenProcessToken(GetCurrentProcess(), 0x8, &mut t) == 0
+                    || GetTokenInformation(t, 1, buf.as_mut_ptr().cast(), 256, &mut len) == 0
+                    || ConvertStringSidToSidW(wide("S-1-16-8192").as_ptr(), &mut medium) == 0
+                {
+                    return format!("unknown: {}", std::io::Error::last_os_error());
+                }
+                let mut boundary = CreateBoundaryDescriptorW(name.as_ptr(), 0);
+                if boundary.is_null()
+                    || AddSIDToBoundaryDescriptor(&mut boundary, buf[0] as *mut c_void) == 0
+                    || AddIntegrityLabelToBoundaryDescriptor(&mut boundary, medium) == 0
+                {
+                    return format!("unknown: the boundary: {}", std::io::Error::last_os_error());
+                }
+                let opened = OpenPrivateNamespaceW(boundary, name.as_ptr());
+                let open_error = GetLastError();
+                let made = CreatePrivateNamespaceW(std::ptr::null(), boundary, name.as_ptr());
+                let make_error = GetLastError();
+                if opened.is_null() && made.is_null() {
+                    format!("denied open: Windows error {open_error}; make: Windows error {make_error}")
+                } else {
+                    format!("allowed opened: {}; made: {}", !opened.is_null(), !made.is_null())
+                }
+            }
         }
         // The processors this process may run on.
         "affinity" => {

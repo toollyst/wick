@@ -196,6 +196,19 @@ upstream Firecracker and its jailer.
   Not done yet: ALL APPLICATION PACKAGES, what an AppContainer may read (the Windows directory and Program Files),
   in place of the four groups, once measured, since whether WHP and Winsock accept such a token is not known; then
   a less-privileged AppContainer for the API process, which needs no WHP.
+- **Windows jailer: a parent cgroup's name is not the jail's to take.** A `--parent-cgroup` is a named Job Object
+  that later jails join by its name. In the session's object namespace a process that may make an object there
+  could make a job of that name first, for later jails to join a job of its own or be refused. So the jobs are
+  named in a private namespace whose boundary is the operator's SID at medium integrity, with a security
+  descriptor that grants the system and the operator and lets nothing below medium read or write: a jailed
+  process, at integrity level 0x1800 and on a token restricted to SIDs it grants nothing, neither makes a
+  namespace of that boundary ("A process can create a private namespace only with an integrity level that is equal
+  to or lower than the current integrity level of the process": Microsoft Learn,
+  AddIntegrityLabelToBoundaryDescriptor) nor opens the one that is there
+  (`test_a_jails_token_does_not_reach_a_parents_name`, on a thread with the jail's token; `jailer-test.ps1 parent`,
+  from a jailed process: written, not yet run). A job the jailer did not make is still joined only when the
+  operator, the administrators or the system own it and it is not labelled below medium
+  (`test_a_parent_made_below_medium_integrity_is_refused`).
 - **Windows jailer: `memory.max` does not bound memory in sections.** The jailer sets `memory.max` as a Job Object
   memory limit, which charges private memory only. Sections (pagefile-backed, or of a file: wick's memfd is a
   temporary file's) are not charged to the job, and the jail's token does not stop a process making them: under

@@ -866,14 +866,19 @@ jobs:
           # narrowed without a word; a job of the parent's name labelled
           # below medium integrity, as a jailed process's would be, is not
           # joined; a parent of two levels holds a jail by each level's
-          # limits. They assert the jailer's rules and print what Windows
-          # answered (PARENTTEST lines).
+          # limits; a thread with a jail's token neither opens the private
+          # namespace the parents' jobs are named in, nor makes one of its
+          # boundary, nor opens a parent's job (and what that token may do
+          # in the session's own namespace, printed). They assert the
+          # jailer's rules and print what Windows answered (PARENTTEST
+          # lines).
           for t in test_a_jails_job_under_a_parent_job_on_record test_nested_jobs_on_record \
               test_hugetlb_page_sizes_are_linuxs \
               test_a_parent_bounds_its_jails_together test_a_parent_lasts_while_a_jail_holds_it \
               test_a_jail_under_a_parent_has_linuxs_cpus_and_rate \
               test_a_parent_made_below_medium_integrity_is_refused \
-              test_a_parent_of_several_levels_bounds_by_each; do
+              test_a_parent_of_several_levels_bounds_by_each \
+              test_a_jails_token_does_not_reach_a_parents_name; do
             out=$(cargo test --locked -p jailer -- \
               --include-ignored --nocapture --test-threads=1 "$t" 2>&1) || true
             printf '%s\n' "$out"

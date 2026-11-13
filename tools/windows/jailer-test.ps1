@@ -297,10 +297,10 @@ function Invoke-ParentTool([string]$Arguments) {
 #   MiB, the least limit along the path, and runs on the parent's processor;
 #   the tool refuses, for cgroup v1, a level on a processor its parent has
 #   not, and refuses to change the processors of a parent that is there;
-# - a jailed process tries to make the job of a parent's name itself, for
-#   later jails to join a job of its own: either Windows refuses it, or a
-#   jailer that is then given that parent stops (the job is labelled below
-#   medium integrity) and starts no jail. Which of the two is printed.
+# - a jailed process tries to reach the parent cgroups' private namespace,
+#   to make a parent's job itself for later jails to join: it can neither
+#   open nor make it. What it may make in the session's own namespace is
+#   printed, and is nothing to a jail given a parent of that name.
 # Needs no guest.
 function Stage-Parent {
     $base = New-Base 'parent'
@@ -367,9 +367,13 @@ function Stage-Parent {
         Check ($r[1] -match 'private:200 denied after (\d+)' -and [int]$Matches[1] -le 60) "with the tool ended and a jail left, a jail that joins the parent (v2, no --cgroup): exit $($r[0]): $($r[1])"
         $joined = [int]$Matches[1]
 
+        # A jailed process and a parent's name: the parents' namespace is
+        # neither opened nor made by it (asserted); what it may do in the
+        # session's own namespace is printed, and a job it makes there under
+        # a name like a parent's changes nothing for a jail given that parent.
         $taken = "wjt-taken-$PID"
         $sout = Join-Path $base 'squat.txt'
-        $line = "--id squat --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- namedjob:Local\wick-cgroup-$taken wait:30"
+        $line = "--id squat --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- namespace:0 namedjob:Local\wick-cgroup-$taken wait:30"
         $squat = Start-Process $Jailer -ArgumentList $line -PassThru -NoNewWindow -RedirectStandardOutput $sout -RedirectStandardError "$sout.err"
         $null = $squat.Handle
         $stext = ''
@@ -378,17 +382,13 @@ function Stage-Parent {
             Start-Sleep -Milliseconds 200
             $stext = (Get-Content $sout, "$sout.err" -Raw -ErrorAction SilentlyContinue) -join ''
         }
-        Check ($stext -match 'namedjob:\S+ (allowed \w+|denied [^\r\n]*)') "a jailed process making a job of a parent's name said neither allowed nor denied: $stext"
+        Check ($stext -match 'namespace:0 (denied [^\r\n]*)') "a jailed process reached the parent cgroups' namespace, or did not say: $stext"
+        $reach = $Matches[1]
+        Check ($stext -match 'namedjob:\S+ (allowed \w+|denied [^\r\n]*)') "a jailed process making a job in the session's namespace said neither allowed nor denied: $stext"
         $made = $Matches[1]
-        if ($made -like 'allowed*') {
-            foreach ($with in @(@('--cgroup', 'memory.max=1073741824'), @())) {
-                $r = Invoke-Jailer (@('--id', 'fooled', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--parent-cgroup', $taken, '--cgroup-version', '2') + $with + @('--', 'affinity:0'))
-                Check ($r[0] -ne 0 -and $r[1] -match 'below medium') "a jailer joined a parent's job that a jailed process made (--cgroup: $($with.Count -gt 0)): exit $($r[0]): $($r[1])"
-                Check ($r[1] -notmatch 'affinity:0 allowed') "a jail ran under a parent's job that a jailed process made: $($r[1])"
-            }
-            $made = "$made, and a jailer given that parent stopped (its job is below medium integrity)"
-        }
-        "a parent of 256 MiB on processor 0 (jail-parent): a jail under a level of 100 MiB under it stopped after $level MiB, on processor 0; the tool refused a cgroup v1 level on processor 1 and a change of the parent's processors; the first jail took 200 MiB and ran on processor 0 of the 0-1 it asked for; the second stopped after $second MiB; cgroup v1 refused processor 1; with the tool ended, a jail joining the parent stopped after $joined MiB; a jailed process making the job of a parent's name: $made"
+        $r = Invoke-Jailer (@('--id', 'unfooled', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--parent-cgroup', $taken, '--cgroup-version', '2', '--cgroup', 'memory.max=1073741824', '--', 'affinity:0'))
+        Check ($r[0] -eq 0 -and $r[1] -match 'affinity:0 allowed') "a jail given a parent whose name a jailed process used in the session's namespace did not start: exit $($r[0]): $($r[1])"
+        "a parent of 256 MiB on processor 0 (jail-parent): a jail under a level of 100 MiB under it stopped after $level MiB, on processor 0; the tool refused a cgroup v1 level on processor 1 and a change of the parent's processors; the first jail took 200 MiB and ran on processor 0 of the 0-1 it asked for; the second stopped after $second MiB; cgroup v1 refused processor 1; with the tool ended, a jail joining the parent stopped after $joined MiB; a jailed process and the parents' namespace: $reach; a job of a parent's name in the session's namespace: $made, and a jail given that parent started"
     } finally {
         if (-not $holder.HasExited) { $holder.Kill() }
         if ($first -and -not $first.HasExited) { $first.Kill() }
