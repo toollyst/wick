@@ -6778,26 +6778,29 @@ mod fpu_tests {
         spin(std::time::Duration::from_micros(300));
         write_tsc(&v1, saved + gap).unwrap();
         one_offset(part, "a restore's writes, vCPU 1's saved 50 us later");
-        let mut vms = vec![(vm, v0, v1)];
+        // Each round's VM is gone before the next maps the memory, as a
+        // restore in a new process follows the old one's end: WHP refuses a
+        // second partition's map of memory another partition of the process
+        // has mapped (ERROR_INVALID_PARAMETER, a PC at 4999ff6).
+        let mut current = (vm, v0, v1);
         for round in 1..=2 {
-            let (_, v0, v1) = vms.last().unwrap();
-            let s0 = read_tsc(v0);
+            let s0 = read_tsc(&current.1);
             let between = std::time::Instant::now();
             spin(std::time::Duration::from_micros(40));
-            let s1 = read_tsc(v1);
+            let s1 = read_tsc(&current.2);
             let apart = between.elapsed();
             let most = super::super::tscsync::ns_to_cycles(u64::try_from(apart.as_nanos()).unwrap(), (hz / 1000) as u32) + hz / 10_000;
             eprintln!("TSCMATCH save {round}: {s0:#x} {s1:#x}, {} apart in {apart:?}", s1.wrapping_sub(s0));
             assert!(s1 >= s0 && s1 - s0 <= most, "save {round}: the TSCs differ by more than the save's gap");
+            drop(current);
             let (vm, n0, n1) = two_vcpus(m);
             write_tsc(&n0, s0).unwrap();
             spin(std::time::Duration::from_micros(300));
             write_tsc(&n1, s1).unwrap();
             one_offset(n0.part(), &format!("restore {round} into a new VM"));
-            vms.push((vm, n0, n1));
+            current = (vm, n0, n1);
         }
-        let (vm, mut v0, v1) = vms.pop().unwrap();
-        drop(vms);
+        let (vm, mut v0, v1) = current;
         start(&v0);
         assert_eq!(run_once(&mut v0), "exit IoOut port 0x80");
         let mut kicker = VcpuFd { shared: Arc::clone(&v0.shared), own: None };
