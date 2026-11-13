@@ -25,7 +25,11 @@
 //!   0.999 x the TSC over 2 to 200 ms of spinning, idle or with 22 other
 //!   threads spinning, and less when the thread got less of the CPU
 //!   (0.72 x with 46 threads on 24 logical processors)
-//!   (`test_cpu_cycle_counters_on_record`, CPUCYCLEREC lines).
+//!   (`test_cpu_cycle_counters_on_record`, CPUCYCLEREC lines). The
+//!   process's clock has the calling thread's run time up to the reading,
+//!   as Linux's `thread_group_cputime` brings the caller's up to date
+//!   first, where Windows' process count lags its running thread's own;
+//!   see `now_ns` (`test_the_process_clock_has_the_callers_run_as_linux`).
 //!
 //! A timerfd is a manual-reset, high-resolution waitable timer: signalled
 //! while expirations are waiting to be read, which is what `epoll` waits on.
@@ -293,8 +297,40 @@ pub(crate) fn now_ns(clock: clockid_t) -> Option<i64> {
             // clock, as Linux's never do.
             let ns = cpu_ns(cycles)?;
             if clock == CLOCK_PROCESS_CPUTIME_ID {
+                // Linux's process clock has the calling thread's run time
+                // up to the reading: `thread_group_cputime` brings the
+                // caller's up to date (`task_sched_runtime(current)`)
+                // before it sums the threads' (v6.1 kernel/sched/cputime.c
+                // 316-342; core.c 5399-5404 `update_curr`), so a thread
+                // that reads the process clock around a window of its own
+                // never sees it move less than its own clock did. Windows'
+                // process count lags its running thread's own by what that
+                // thread ran since its count was last added to the
+                // process's: 14,034 cycles (3.8 us) less than the thread's
+                // over 2 ms of spinning on a PC, and 225 thousand less over
+                // 100 ms asleep (3393774, CPUCYCLEREC lines); CI run
+                // 43524342863 read the process clock 3.9 us behind the
+                // thread's over 2 ms (`test_cpu_clocks_count_what_runs_finely`).
+                // So the reading is at least the last one this thread
+                // made plus what this thread has run since, and at least
+                // this thread's own clock: never more than the process ran
+                // (each part is a time it had run by then), and lifted
+                // only while Windows' count has yet to catch up
+                // (`test_the_process_clock_has_the_callers_run_as_linux`).
+                // Linux reads its group's running sum instead while a process
+                // CPU timer is armed (kernel/time/posix-cpu-timers.c 347-354),
+                // which Firecracker and the jailer never arm (upstream has no
+                // timer_create or setitimer).
                 static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-                LAST.fetch_max(ns, std::sync::atomic::Ordering::Relaxed).max(ns)
+                std::thread_local! {
+                    /// This thread's last process reading and its own clock then.
+                    static MINE: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
+                }
+                let own = now_ns(CLOCK_THREAD_CPUTIME_ID)?;
+                let lifted = MINE.with(|m| m.get()).map_or(ns, |(p, t)| ns.max(p + (own - t))).max(own);
+                let v = LAST.fetch_max(lifted, std::sync::atomic::Ordering::Relaxed).max(lifted);
+                MINE.with(|m| m.set(Some((v, own))));
+                v
             } else {
                 std::thread_local! {
                     static LAST: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
@@ -730,11 +766,18 @@ mod tests {
         // Each clock read once before the windows: a window starts at a
         // reading, never before a first one's own work.
         let _ = (clock_ns(CLOCK_THREAD_CPUTIME_ID), clock_ns(CLOCK_PROCESS_CPUTIME_ID));
+        // The process's window is around the thread's, as on Linux it is
+        // only then that the process's clock moves at least as much as the
+        // thread's (both bring the caller's run time up to the reading;
+        // read the other way round, each reading's own run time could
+        // fall on either side).
         let measure = |work: &dyn Fn()| {
-            let (t, p, k, w) = (clock_ns(CLOCK_THREAD_CPUTIME_ID), clock_ns(CLOCK_PROCESS_CPUTIME_ID), thread_times_ns(), std::time::Instant::now());
+            let p = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+            let (t, k, w) = (clock_ns(CLOCK_THREAD_CPUTIME_ID), thread_times_ns(), std::time::Instant::now());
             work();
             let wall = i64::try_from(w.elapsed().as_nanos()).unwrap();
-            (clock_ns(CLOCK_THREAD_CPUTIME_ID) - t, clock_ns(CLOCK_PROCESS_CPUTIME_ID) - p, thread_times_ns() - k, wall)
+            let (t, k) = (clock_ns(CLOCK_THREAD_CPUTIME_ID) - t, thread_times_ns() - k);
+            (t, clock_ns(CLOCK_PROCESS_CPUTIME_ID) - p, k, wall)
         };
         let short = measure(&|| spin(Duration::from_millis(2)));
         let long = measure(&|| spin(Duration::from_millis(300)));
@@ -751,6 +794,60 @@ mod tests {
         assert!((t - k).abs() <= 31_250_000 + t / 20, "300 ms spinning: {t} ns against GetThreadTimes' {k} ns");
         let (t, _, _, _) = asleep;
         assert!(t < 1_000_000, "100 ms asleep: the thread clock moved {t} ns");
+    }
+
+    /// The process's CPU clock has the calling thread's run time up to the
+    /// reading, as Linux's has (`thread_group_cputime` brings the caller's
+    /// up to date first: v6.1 kernel/sched/cputime.c 316-325): read around
+    /// a window of the thread's own, it moves at least as much as the
+    /// thread's clock in it, each of 2,000 windows of 20 us spinning, and
+    /// reads at least the thread's clock. Windows' own counters, read the
+    /// same way round, are printed with how often the process's moved less
+    /// (CPUCLOCK lines; 3393774's CPUCYCLEREC: 3.8 us less over 2 ms).
+    #[test]
+    fn test_the_process_clock_has_the_callers_run_as_linux() {
+        use std::eprintln;
+        if !tsc_invariant() {
+            eprintln!("CPUCLOCK the host's TSC is not invariant: the CPU clocks are GetProcessTimes' and GetThreadTimes' ticks");
+            return;
+        }
+        const WINDOWS: usize = 2000;
+        let raw = |process: bool| {
+            let mut c = 0u64;
+            // SAFETY: pseudo-handles of this process and thread; writes `c`.
+            let ok = unsafe { if process { QueryProcessCycleTime(GetCurrentProcess(), &mut c) } else { QueryThreadCycleTime(GetCurrentThread(), &mut c) } };
+            assert_ne!(ok, 0);
+            c
+        };
+        let (mut behind, mut most, mut below) = (0, 0i64, 0);
+        let (mut raw_behind, mut raw_most) = (0, 0u64);
+        for _ in 0..WINDOWS {
+            let p0 = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+            let t0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+            spin(Duration::from_micros(20));
+            let t1 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+            let p1 = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+            if p1 < t1 {
+                below += 1;
+            }
+            if p1 - p0 < t1 - t0 {
+                behind += 1;
+                most = most.max((t1 - t0) - (p1 - p0));
+            }
+            let (p0, t0) = (raw(true), raw(false));
+            spin(Duration::from_micros(20));
+            let (t1, p1) = (raw(false), raw(true));
+            if p1 - p0 < t1 - t0 {
+                raw_behind += 1;
+                raw_most = raw_most.max((t1 - t0) - (p1 - p0));
+            }
+        }
+        eprintln!(
+            "CPUCLOCK {WINDOWS} windows of 20 us spinning, the process's readings around the thread's: the process clock moved \
+             less than the thread's {behind} times (by at most {most} ns) and read below it {below} times; Windows' own \
+             counters, QueryProcessCycleTime around QueryThreadCycleTime, moved less {raw_behind} times (by at most {raw_most} cycles)"
+        );
+        assert_eq!((behind, below), (0, 0), "the process clock moved less than the thread's, or read below it");
     }
 
     /// The counters a CPU clock can be made of, read together.
