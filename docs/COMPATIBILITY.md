@@ -29,7 +29,9 @@ every backend and every gap. This page is the summary.
 - **row N** is row N of PORTING.md's table
   [Where behaviour is not the same yet](PORTING.md#where-behaviour-is-not-the-same-yet).
 - Any other `test_*` name is one of two kinds:
-  - a wick unit test in this repository;
+  - a wick unit test in this repository. CI runs it on that host, except a macOS test that makes a VM, listed
+    `no-hvf` in [`tools/macos/unit-test-differences.txt`](../tools/macos/unit-test-differences.txt): CI's macOS
+    runners have no Hypervisor.framework, so it runs on a Mac (`tools/macos/test.sh`);
   - an upstream integration test from `tests/integration_tests`.
 - An upstream test written plainly, such as `test_api_balloon`, passes on Linux, and that host's differences file
   does not list it. A kind in brackets, such as `test_drive_patch` [error-text], means the host lists it as a
