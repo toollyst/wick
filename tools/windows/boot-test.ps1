@@ -1527,6 +1527,21 @@ function Find-Firecracker {
 function Fail([string]$why) { throw (New-Object Wick.Failure $why) }
 function Check([bool]$ok, [string]$why) { if (-not $ok) { Fail $why } }
 
+# A stage's summary: what its block returns, which must be one string. A
+# PowerShell function returns every value a statement leaves uncaptured, so
+# a second value is a result the stage dropped unread (Test-CpuOfflineOnline's
+# count, once, which put a "0" before the cpu-templates summary). A
+# stage runs in a scope below this function's and can read its variables,
+# so they have names no stage uses.
+function Get-StageSummary([scriptblock]$stageBlock) {
+    $stageOut = @(& $stageBlock)
+    if ($stageOut.Count -ne 1 -or $stageOut[0] -isnot [string]) {
+        $shown = @($stageOut | Select-Object -First 4 | ForEach-Object { "[$(if ($null -eq $_) { 'null' } else { $_.GetType().Name })] '$_'" }) -join ', '
+        Fail "script error: the stage returned $($stageOut.Count) values, not one summary: $shown"
+    }
+    return $stageOut[0]
+}
+
 # The Wick.Failure behind an error record (PowerShell wraps exceptions thrown
 # by .NET methods in MethodInvocationException), or $null.
 function Get-Failure($record) {
@@ -2913,7 +2928,7 @@ function Stage-CpuTemplates {
     }) | Out-Null
     Test-Restored $vm $bashMd5 $null
     # cpu1 offline and online: it comes back with the template's CPUID.
-    Test-CpuOfflineOnline $vm 'the template restored'
+    $spurious = Test-CpuOfflineOnline $vm 'the template restored'
     $got = Get-GuestFlags $vm 'the template restored'
     $diff = @(Compare-Object $want $got | ForEach-Object { "$($_.SideIndicator)$($_.InputObject)" })
     Check ($diff.Count -eq 0) "the restored guest against the host's less $($lost -join ', '): $($diff -join ' ')"
@@ -2936,7 +2951,7 @@ function Stage-CpuTemplates {
     Check ($r[1] -eq 400 -and $r[2] -match 'msr: 0x10a') "a template with a modifier of MSR 0x10a: $($r[1]) $($r[2])"
     $why = ([regex]::Match($r[2], '"fault_message":\s*"(.*)"')).Groups[1].Value
     $r[0].Kill()
-    return "a template through PUT /cpu-config takes $($lost -join ', ') from the guest on both vCPUs, also after a restore and cpu1's restart; a leaf no host has is refused; a modifier of MSR 0x10a is refused ($why)"
+    return "a template through PUT /cpu-config takes $($lost -join ', ') from the guest on both vCPUs, also after a restore and cpu1's restart (spurious LAPIC timer interrupts: $spurious); a leaf no host has is refused; a modifier of MSR 0x10a is refused ($why)"
 }
 
 # Upstream's test_diff_snapshot_works_after_error
@@ -3537,11 +3552,21 @@ if ($SelfTest) {
                 return 'Sh: status, output, multi-line'
             } finally { $vm.Kill() }
         }
+        summary = {
+            # One string passes; a stray value before it, or none, fails.
+            Check ((Get-StageSummary { 'one' }) -eq 'one') 'one summary'
+            foreach ($case in @(@('a stray value', { 0; 'two' }), @('no value', { }))) {
+                $f = $null
+                try { Get-StageSummary $case[1] | Out-Null } catch { $f = Get-Failure $_ }
+                Check ($f -and $f.Message.StartsWith('script error: the stage returned')) "a stage with $($case[0]) passed"
+            }
+            return 'a stage returns one summary; a stray value or none is a script error'
+        }
     }
     $failed = 0
     foreach ($t in $tests.Keys) {
         try {
-            $detail = (& $tests[$t]) -join ' '
+            $detail = Get-StageSummary $tests[$t]
             Write-Host "PASS  $t`: $detail" -ForegroundColor Green
         } catch {
             $failed++
@@ -3622,7 +3647,7 @@ foreach ($name in $selected) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $result = 'PASS'
     try {
-        $detail = (& $Stages[$name]) -join ' '
+        $detail = Get-StageSummary $Stages[$name]
     } catch {
         $result = 'FAIL'
         $f = Get-Failure $_
