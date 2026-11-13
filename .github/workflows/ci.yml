@@ -1247,6 +1247,14 @@ jobs:
           # through the other; decommitted through a view; for the
           # userfaultfd restore's section made SEC_RESERVE (S1).
           alone windows_sectrec::test_a_reserved_section_committed_through_one_view_on_record
+          # UFFDCHUNK b-d, for the W2 plan's "Discarded userfaultfd pages":
+          # a charge page's decommit (its time, what it gives back of the
+          # process's commit and the job's); DiscardVirtualMemory through a
+          # SEC_RESERVE section's alias (what stays resident and committed);
+          # 1 GiB as one section against 512 chunk sections over
+          # placeholders (time, the host's commit, pools, handles) and 100
+          # swaps of a chunk. Its guest's side (a) is in the WHP step.
+          alone windows_sectrec::test_chunked_sections_and_a_charge_decommit_on_record
           # What Windows' cycle counters count (CPUCYCLEREC lines), for the
           # CPU clocks: a PC read the thread's QueryThreadCycleTime at 1.32 x
           # the TSC while spinning and the process's at 1.01 x. The thread's

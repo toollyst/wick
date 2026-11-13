@@ -1296,3 +1296,237 @@ fn test_a_reserved_section_committed_through_one_view_on_record() {
         CloseHandle(s);
     }
 }
+
+/// UFFDCHUNK (b) to (d), the host's side of the W2 plan's "Discarded
+/// userfaultfd pages" (the guest's side, (a), is kvm-ioctls'
+/// `test_a_replaced_backing_under_mapped_guest_ram_on_record`):
+/// - c: a charge page's decommit: 2 MiB of private memory committed
+///   `PAGE_NOACCESS` (512 charge pages), then one page decommitted
+///   (`VirtualFree(MEM_DECOMMIT)`), then the other 511: each step's time
+///   and what it moves of the process's private commit, the job's memory
+///   and the host's commit, for part (1) of the plan;
+/// - d: a SEC_RESERVE section of 2 MiB mapped twice (A, the guest's view;
+///   B, the alias), committed through A with no access and written through
+///   B, then `DiscardVirtualMemory` of B: its result and time, and the
+///   section's pages in the working set (`QueryWorkingSetEx`) through each
+///   view, with the host's commit, before and after;
+/// - b: the price of part (2): 1 GiB made as one SEC_RESERVE section mapped
+///   twice, against 512 sections of 2 MiB, each mapped into a placeholder
+///   of the guest's run and of the alias's (`VirtualAlloc2`
+///   `MEM_RESERVE_PLACEHOLDER`, split by `VirtualFree(MEM_RELEASE |
+///   MEM_PRESERVE_PLACEHOLDER)`, `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`)
+///   with its handle closed: each one's time, and the host's commit, the
+///   kernel's paged and nonpaged pool and this process's handle count it
+///   moves; then 100 swaps of one chunk (both views back to placeholders
+///   with `UnmapViewOfFile2(MEM_PRESERVE_PLACEHOLDER)`, a new section made
+///   and mapped into both, its handle closed).
+///
+/// Run alone (its own process), as the readings are the whole process's.
+/// Printed, not asserted, but for each step running.
+#[test]
+#[ignore = "a record: run on Windows with --ignored --nocapture"]
+fn test_chunked_sections_and_a_charge_decommit_on_record() {
+    use windows_sys::Win32::System::Memory::{
+        DiscardVirtualMemory, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc2, MEM_DECOMMIT, MEM_PRESERVE_PLACEHOLDER,
+        MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER,
+    };
+    use windows_sys::Win32::System::Threading::GetProcessHandleCount;
+    let say = |l: String| eprintln!("UFFDCHUNK {l}");
+    const CHUNK: usize = 2 * MIB;
+    // SAFETY: plain call.
+    let me = unsafe { GetCurrentProcess() };
+    let err = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+
+    // c: the charge pages' decommit.
+    // SAFETY: reserves and commits memory of our own.
+    let charge_base = unsafe { VirtualAlloc(core::ptr::null(), CHUNK, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+    assert_ne!(charge_base, 0);
+    let before = charge();
+    // SAFETY: commits our reservation, no access.
+    assert!(!unsafe { VirtualAlloc(charge_base as *const c_void, CHUNK, MEM_COMMIT, PAGE_NOACCESS) }.is_null());
+    let committed = charge();
+    let t = Instant::now();
+    // SAFETY: decommits a page of our reservation.
+    let one = unsafe { VirtualFree(charge_base as *mut c_void, PAGE, MEM_DECOMMIT) } != 0;
+    let one_us = us(t);
+    let after_one = charge();
+    let t = Instant::now();
+    // SAFETY: as above.
+    let rest = unsafe { VirtualFree((charge_base + PAGE) as *mut c_void, CHUNK - PAGE, MEM_DECOMMIT) } != 0;
+    let rest_us = us(t);
+    let after_rest = charge();
+    say(format!("c: 512 charge pages committed PAGE_NOACCESS: {}", delta(before, committed)));
+    say(format!("c: one decommitted: {} in {one_us:.2} us: {}", if one { "done" } else { "refused" }, delta(committed, after_one)));
+    say(format!("c: the other 511 decommitted in one call: {} in {rest_us:.2} us: {}", if rest { "done" } else { "refused" }, delta(after_one, after_rest)));
+    // SAFETY: our reservation.
+    unsafe { VirtualFree(charge_base as *mut c_void, 0, MEM_RELEASE) };
+
+    // d: DiscardVirtualMemory through the alias.
+    // SAFETY: a pagefile-backed SEC_RESERVE section of our own, mapped twice.
+    let s = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, core::ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, CHUNK as u32, core::ptr::null()) };
+    assert!(!s.is_null());
+    // SAFETY: as above.
+    let (a, b) = unsafe { (MapViewOfFile(s, FILE_MAP_ALL_ACCESS, 0, 0, CHUNK).Value as usize, MapViewOfFile(s, FILE_MAP_ALL_ACCESS, 0, 0, CHUNK).Value as usize) };
+    assert!(a != 0 && b != 0);
+    let resident = |base: usize| {
+        let mut entries: Vec<WorkingSetEntry> = (0..CHUNK / PAGE).map(|i| WorkingSetEntry { address: base + i * PAGE, attributes: 0 }).collect();
+        // SAFETY: entries with their addresses set, of the size given.
+        let ok = unsafe { K32QueryWorkingSetEx(me, entries.as_mut_ptr().cast(), core::mem::size_of_val(entries.as_slice()) as u32) } != 0;
+        if ok { format!("{} of 512", entries.iter().filter(|e| e.attributes & 1 != 0).count()) } else { "not read".into() }
+    };
+    let shared = || shared_commit(me).map_or_else(|| "not read".to_string(), |v| format!("{} KiB", v / 1024));
+    // SAFETY: commits the section's pages through A, no access, and writes them through B.
+    let ok = unsafe { !VirtualAlloc(a as *const c_void, CHUNK, MEM_COMMIT, PAGE_NOACCESS).is_null() };
+    if ok {
+        // SAFETY: B is read-write and the pages are committed.
+        unsafe { core::ptr::write_bytes(b as *mut u8, 0x5a, CHUNK) };
+    }
+    let filled = charge();
+    say(format!(
+        "d: 2 MiB committed through A with no access ({}) and written through B: resident through A {}, through B {}; SharedCommitUsage {}",
+        if ok { "done".to_string() } else { format!("refused, error {}", err()) },
+        resident(a),
+        resident(b),
+        shared()
+    ));
+    let t = Instant::now();
+    // SAFETY: discards the alias's pages, read-write.
+    let r = unsafe { DiscardVirtualMemory(b as *mut c_void, CHUNK) };
+    let discard_us = us(t);
+    say(format!(
+        "d: DiscardVirtualMemory of B: result {r} in {discard_us:.2} us; resident through A {}, through B {}; SharedCommitUsage {}; {}",
+        resident(a),
+        resident(b),
+        shared(),
+        delta(filled, charge())
+    ));
+    // SAFETY: our views and section.
+    unsafe {
+        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void });
+        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut c_void });
+        CloseHandle(s);
+    }
+
+    // b: one section of 1 GiB against 512 of 2 MiB.
+    const GIB: usize = 1 << 30;
+    const CHUNKS: usize = GIB / CHUNK;
+    let handles = || {
+        let mut n = 0u32;
+        // SAFETY: an output count.
+        unsafe { GetProcessHandleCount(me, &mut n) };
+        n
+    };
+    let pool = || {
+        let mut perf = PerformanceInformation { cb: core::mem::size_of::<PerformanceInformation>() as u32, ..Default::default() };
+        // SAFETY: an output structure of the size given.
+        unsafe { K32GetPerformanceInfo(&mut perf, perf.cb) };
+        (perf.commit_total * perf.page_size, perf.kernel_paged * perf.page_size, perf.kernel_nonpaged * perf.page_size)
+    };
+    let moved = |x: (usize, usize, usize), y: (usize, usize, usize), hx: u32, hy: u32| {
+        let kib = |p: usize, q: usize| (q as i64 - p as i64) / 1024;
+        format!(
+            "the host's commit {:+} KiB, paged pool {:+} KiB, nonpaged pool {:+} KiB, handles {:+}",
+            kib(x.0, y.0),
+            kib(x.1, y.1),
+            kib(x.2, y.2),
+            i64::from(hy) - i64::from(hx)
+        )
+    };
+    let (p0, h0) = (pool(), handles());
+    let t = Instant::now();
+    // SAFETY: a section of our own, mapped twice.
+    let s = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, core::ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, GIB as u32, core::ptr::null()) };
+    assert!(!s.is_null());
+    // SAFETY: as above.
+    let (a, b) = unsafe { (MapViewOfFile(s, FILE_MAP_ALL_ACCESS, 0, 0, GIB).Value as usize, MapViewOfFile(s, FILE_MAP_ALL_ACCESS, 0, 0, GIB).Value as usize) };
+    // SAFETY: our handle; the views keep the section.
+    unsafe { CloseHandle(s) };
+    let one_section = us(t);
+    let (p1, h1) = (pool(), handles());
+    say(format!("b: 1 GiB as one SEC_RESERVE section, mapped twice, its handle closed: {one_section:.1} us; {}", moved(p0, p1, h0, h1)));
+    // SAFETY: our views.
+    unsafe {
+        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void });
+        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut c_void });
+    }
+    let (p0, h0) = (pool(), handles());
+    let t = Instant::now();
+    let placeholder = || {
+        // SAFETY: reserves a placeholder of our own.
+        let p = unsafe { VirtualAlloc2(me, core::ptr::null(), GIB, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, core::ptr::null_mut(), 0) } as usize;
+        assert_ne!(p, 0, "error {}", err());
+        for i in 0..CHUNKS - 1 {
+            // SAFETY: splits our placeholder at the chunk's end.
+            assert_ne!(unsafe { VirtualFree((p + i * CHUNK) as *mut c_void, CHUNK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) }, 0, "split {i}: error {}", err());
+        }
+        p
+    };
+    let (guest, alias) = (placeholder(), placeholder());
+    let split = us(t);
+    let map_chunk = |i: usize| {
+        // SAFETY: a section of our own, mapped into our placeholders.
+        unsafe {
+            let s = CreateFileMappingW(INVALID_HANDLE_VALUE, core::ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, CHUNK as u32, core::ptr::null());
+            assert!(!s.is_null());
+            for base in [guest, alias] {
+                let at = base + i * CHUNK;
+                let v = MapViewOfFile3(s, me, at as *const c_void, 0, CHUNK, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, core::ptr::null_mut(), 0);
+                assert_eq!(v.Value as usize, at, "chunk {i}: error {}", err());
+            }
+            CloseHandle(s);
+        }
+    };
+    let t = Instant::now();
+    for i in 0..CHUNKS {
+        map_chunk(i);
+    }
+    let mapped = us(t);
+    let (p1, h1) = (pool(), handles());
+    say(format!(
+        "b: 1 GiB as {CHUNKS} sections of 2 MiB: two placeholders of 1 GiB split into {CHUNKS} each in {split:.1} us; the sections \
+         made and mapped into both, their handles closed, in {mapped:.1} us ({:.2} us a chunk); {}",
+        mapped / CHUNKS as f64,
+        moved(p0, p1, h0, h1)
+    ));
+    // A chunk written through the guest's run reads through the alias's.
+    // SAFETY: commits the first chunk through the guest's view and writes it.
+    let ok = unsafe { !VirtualAlloc(guest as *const c_void, CHUNK, MEM_COMMIT, PAGE_READWRITE).is_null() };
+    if ok {
+        // SAFETY: committed above.
+        unsafe { *(guest as *mut u8) = 0x77 };
+    }
+    // SAFETY: the alias's view of the same section, committed through the guest's.
+    let read = if ok { format!("{:#x}", unsafe { *(alias as *const u8) }) } else { format!("not committed, error {}", err()) };
+    say(format!("b: chunk 0 committed and written 0x77 through the guest's run: the alias's run reads {read}"));
+    let mut swaps = Vec::new();
+    for _ in 0..100 {
+        let t = Instant::now();
+        for base in [guest, alias] {
+            // SAFETY: our view, back to its placeholder.
+            assert_ne!(unsafe { UnmapViewOfFile2(me, MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) }, 0, "error {}", err());
+        }
+        map_chunk(0);
+        swaps.push(us(t));
+    }
+    let q = || {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+        // SAFETY: as above.
+        unsafe { VirtualQuery(guest as *const c_void, &mut mbi, core::mem::size_of_val(&mbi)) };
+        mbi.State
+    };
+    say(format!(
+        "b: 100 swaps of chunk 0 (both views back to placeholders, a new section mapped into both, its handle closed): {}; \
+         chunk 0 after: {}",
+        spread(&swaps),
+        if q() == MEM_COMMIT { "committed (the old section's page?)" } else { "reserved, as a new section's" }
+    ));
+    let (p2, h2) = (pool(), handles());
+    say(format!("b: after the swaps, against the chunks just mapped: {}", moved(p1, p2, h1, h2)));
+    for base in [guest, alias] {
+        for i in 0..CHUNKS {
+            // SAFETY: our views; their address space is released.
+            unsafe { UnmapViewOfFile2(me, MEMORY_MAPPED_VIEW_ADDRESS { Value: (base + i * CHUNK) as *mut c_void }, 0) };
+        }
+    }
+}
