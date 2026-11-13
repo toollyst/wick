@@ -205,8 +205,12 @@ upstream Firecracker and its jailer.
   namespace of that boundary ("A process can create a private namespace only with an integrity level that is equal
   to or lower than the current integrity level of the process": Microsoft Learn,
   AddIntegrityLabelToBoundaryDescriptor) nor opens the one that is there
-  (`test_a_jails_token_does_not_reach_a_parents_name`, on a thread with the jail's token; `jailer-test.ps1 parent`,
-  from a jailed process: written, not yet run). A job the jailer did not make is still joined only when the
+  (`test_a_jails_token_does_not_reach_a_parents_name`, on a thread with the jail's token: both refused with access
+  denied on Windows Server 2025, CI run 43385227122; `jailer-test.ps1 parent`, from a jailed process: written, not
+  yet run). Not measured yet: that the namespace outlasts the process that made it while a jailer still has it
+  open. If it does not, a jailer started after the operator's tool has gone would make the namespace and the
+  parent's job anew, without the parent's limits, beside the jails still under the old one; the same test prints
+  what Windows does, with a second process. A job the jailer did not make is still joined only when the
   operator, the administrators or the system own it and it is not labelled below medium
   (`test_a_parent_made_below_medium_integrity_is_refused`).
 - **Windows jailer: `memory.max` does not bound memory in sections.** The jailer sets `memory.max` as a Job Object

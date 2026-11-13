@@ -406,11 +406,26 @@ fn processors(job: HANDLE) -> Result<Option<Vec<(u16, u64)>>, String> {
     Ok((!found.is_empty()).then_some(found))
 }
 
+/// The parent cgroups' private namespace, made or opened once in this
+/// process, which keeps it until it ends, as the jailer does
+/// (`platform::parent`, `namespace`). A process has a namespace under its
+/// alias one time: a second `OpenPrivateNamespaceW` by a process that has
+/// it answers `ERROR_DUP_NAME` (52; CI run 43385227122, where this file's
+/// test, which writes several times in one process, failed so at its
+/// second write). The tool itself writes once in a process.
+fn namespace(user: &str) -> Result<HANDLE, String> {
+    static HELD: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+    let mut held = HELD.lock().unwrap();
+    if held.is_none() {
+        *held = Some(enter_namespace(user)? as usize);
+    }
+    Ok(held.unwrap() as HANDLE)
+}
+
 /// Makes the parent cgroups' private namespace, or opens it if it is
 /// there, as the jailer does (`platform::parent`, `enter_namespace`): the
 /// boundary is this account's SID at medium integrity, which a jailed
-/// process, below medium, is not within. The handle keeps the namespace
-/// while this process runs.
+/// process, below medium, is not within. Called once ([`namespace`]).
 fn enter_namespace(user: &str) -> Result<HANDLE, String> {
     let (alias, sddl) = (wide(PARENT_NAMESPACE), wide(&parent_namespace_sddl(user)));
     let (mut user_sid, mut medium, mut sd) = (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
@@ -685,7 +700,7 @@ fn run(name: &str, version: u8, cgroups: &[String]) -> Result<Vec<HANDLE>, Strin
     let names = parent_job_names(name).map_err(|why| format!("--name {name}: {why}"))?;
     let wanted = parse(version, cgroups)?;
     let user = token_sid(TOKEN_USER_CLASS)?;
-    let namespace = enter_namespace(&user)?;
+    let namespace = namespace(&user)?;
     let _lock = lock(&user)?;
     let mut kept = vec![namespace];
     let mut jobs = Vec::new();

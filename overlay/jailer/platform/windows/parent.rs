@@ -63,7 +63,9 @@
 //! medium integrity (`cgroup_values::PARENT_NAMESPACE`): a jailed process,
 //! below medium, can neither make that namespace nor open it
 //! (`test_a_jails_token_does_not_reach_a_parents_name`). The tool and each
-//! jailer make it or open it, and keep it open while they run. Besides, a
+//! jailer make it or open it, once in a process (Windows refuses a second
+//! open by a process that has it, `namespace`), and keep it open while they
+//! run. Besides, a
 //! job the jailer did not make itself is used only when it is owned
 //! by the jailer's account, the administrators or the system and is not
 //! labelled below medium integrity, which what a jailed process makes is
@@ -287,6 +289,14 @@ fn enter_namespace(name: &str) -> io::Result<HANDLE> {
 
 /// Makes or opens the parent cgroups' namespace, once: this process keeps
 /// it until it ends, as it keeps its parent's jobs.
+///
+/// Once, and not only to save a call: a process has a namespace under its
+/// alias one time. A second `OpenPrivateNamespaceW` of a namespace the
+/// process already has answers `ERROR_DUP_NAME` (52), whether the process
+/// made it or opened it (CI run 43385227122, Windows Server 2025: the
+/// PARENTTEST line of `test_a_jails_token_does_not_reach_a_parents_name`,
+/// and the tool's test, whose second write in one process failed so).
+/// Every use of the namespace in this module comes through here.
 fn namespace() -> io::Result<()> {
     static HELD: Mutex<Option<usize>> = Mutex::new(None);
     let mut held = HELD.lock().unwrap();
@@ -1184,28 +1194,88 @@ mod tests {
         assert!(job_opened.is_err(), "a jail's token opened a parent's job");
 
         // What the design stands on: the namespace is found by the next
-        // jailer while any holder has it open, whoever made it. A namespace
-        // made here and opened once more (a second holder), its maker's
-        // handle then closed: opened again.
+        // jailer while any process has it open, whoever made it and
+        // whether that one is still there. Microsoft Learn
+        // (CreatePrivateNamespaceW, Remarks) says of the maker's handle
+        // alone: "After the namespace handle is closed, subsequent calls to
+        // OpenPrivateNamespace fail, but all operations on objects in the
+        // namespace succeed", and nothing of a namespace another process
+        // has open. So it is measured, as it happens between the tool and
+        // a jailer: a namespace made here, opened by a second process
+        // (this test program again, `holds_a_namespace_for_another_process`),
+        // the maker's handle closed, and the namespace opened once more
+        // while the second process has it, then after it has gone. A
+        // record, not asserted yet: the first run (43385227122) opened it a
+        // second time in this one process, which Windows refuses with 52
+        // (`namespace`), and so measured nothing of two processes. If the
+        // line says the namespace does not outlast its maker's handle, the
+        // parents' jobs cannot be named in it: a jailer left after the
+        // tool would hold jobs the next jailer no longer finds.
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn ClosePrivateNamespace(handle: HANDLE, flags: u32) -> u8;
         }
-        // SAFETY: a boundary and NUL-terminated names; handles of this test.
-        let (made, second, closed, third) = unsafe {
-            let made = CreatePrivateNamespaceW(std::ptr::null(), others.0, other_alias.as_ptr());
-            let made_answer = answer(made);
-            let second = answer(OpenPrivateNamespaceW(others.0, other_alias.as_ptr()));
-            let closed = ClosePrivateNamespace(made, 0);
-            (made_answer, second, closed, answer(OpenPrivateNamespaceW(others.0, other_alias.as_ptr())))
+        // SAFETY: a boundary and a NUL-terminated name.
+        let made = unsafe { CreatePrivateNamespaceW(std::ptr::null(), others.0, other_alias.as_ptr()) };
+        let made_answer = answer(made);
+        // SAFETY: the test's boundary, name and handles.
+        let here = unsafe { answer(OpenPrivateNamespaceW(others.0, other_alias.as_ptr())) };
+        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::windows::parent::tests::holds_a_namespace_for_another_process", "--nocapture"])
+            .env(HOLDER_NAMESPACE, &other)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut said = std::io::BufRead::lines(std::io::BufReader::new(holder.stdout.take().unwrap()));
+        let second = said
+            .by_ref()
+            .map_while(Result::ok)
+            .find_map(|line| line.split_once("HOLDER ").map(|(_, rest)| rest.to_string()))
+            .unwrap_or_else(|| "said nothing".to_string());
+        // SAFETY: the test's boundary, name and handles.
+        let closed = unsafe { ClosePrivateNamespace(made, 0) };
+        // SAFETY: the test's boundary, name and handles.
+        let third = unsafe { OpenPrivateNamespaceW(others.0, other_alias.as_ptr()) };
+        let third_answer = answer(third);
+        // The second process ends when its standard input does.
+        drop(holder.stdin.take());
+        let ended = holder.wait().map(|status| status.success());
+        // SAFETY: the test's boundary, name and handles.
+        let last = unsafe {
+            if !third.is_null() {
+                ClosePrivateNamespace(third, 0);
+            }
+            answer(OpenPrivateNamespaceW(others.0, other_alias.as_ptr()))
         };
         println!(
-            "PARENTTEST a namespace made {made:?} and opened by a second holder {second:?}; its maker's handle closed \
-             ({closed}), it is opened again: {third:?}"
+            "PARENTTEST a namespace made {made_answer:?}; opened again by the process that made it: {here:?} (52: the \
+             alias is the process's already); by a second process: {second}; its maker's handle closed ({closed}), the \
+             maker opens it again while the second process has it: {third_answer:?}; the second process gone \
+             ({ended:?}) and that handle closed, opened once more: {last:?}"
         );
-        assert_eq!((made, second), (Ok(()), Ok(())));
-        assert_eq!(third, Ok(()), "a namespace a holder has open was not found once its maker's handle was closed");
+        assert_eq!(made_answer, Ok(()));
+        assert!(second.starts_with("opened "), "the second process: {second}");
         drop(operators);
+    }
+
+    /// The variable that makes this test program the second process of
+    /// `test_a_jails_token_does_not_reach_a_parents_name`: the namespace
+    /// to open.
+    const HOLDER_NAMESPACE: &str = "WICK_TEST_HOLD_NAMESPACE";
+
+    // Not a test of its own: without the variable it does nothing. With
+    // it, this process opens the namespace named there, says what Windows
+    // answered, and keeps the handle until its standard input ends.
+    #[test]
+    fn holds_a_namespace_for_another_process() {
+        let Ok(name) = std::env::var(HOLDER_NAMESPACE) else { return };
+        let boundary = Boundary::new(&name, &user_sid().unwrap(), MEDIUM_INTEGRITY_SID).unwrap();
+        // SAFETY: the boundary and a NUL-terminated name.
+        let h = unsafe { OpenPrivateNamespaceW(boundary.0, wide(&name).as_ptr()) };
+        println!("HOLDER opened {:?}", if h.is_null() { Err(last_error().raw_os_error().unwrap_or(0)) } else { Ok(()) });
+        let mut sink = [0u8; 16];
+        while matches!(std::io::Read::read(&mut std::io::stdin(), &mut sink), Ok(n) if n > 0) {}
     }
 
     // A job of the parent's name that a jailed process could have made (it
