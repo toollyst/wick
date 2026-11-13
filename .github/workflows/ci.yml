@@ -1097,6 +1097,11 @@ jobs:
           # of 2 MiB of committed RAM, its own time. Linux's numbers for the
           # same steps are the linux-boot job's LINUXGRAIN lines.
           alone whp::vcpu::fpu_tests::test_lazy_guest_ram_by_grain_on_record
+          # A guest's read of untouched guest RAM (ZEROREAD lines), which
+          # Linux gives the zero page uncharged: what it commits here, and
+          # what a read-only zero page mapped at the guest's pages would
+          # cost in WHvMapGpaRange calls (Linux's: LINUXGRAIN read steps).
+          alone whp::vcpu::fpu_tests::test_a_guest_read_of_untouched_ram_on_record
           # What each call of the backend commits of its thread's stack
           # (STACKTEST lines), each on a thread of its own: which one leaves
           # a vCPU's thread 48 to 52 KiB deep, as the boot record of run

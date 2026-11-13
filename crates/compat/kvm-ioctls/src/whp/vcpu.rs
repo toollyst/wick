@@ -6077,6 +6077,208 @@ mod fpu_tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// The record for the zero-page parity item (ZEROREAD lines). On Linux a
+    /// guest's read of untouched anonymous guest RAM is given the shared
+    /// zero page and charged nothing: KVM's read fault takes the page
+    /// without FOLL_WRITE (v6.1 virt/kvm/kvm_main.c `hva_to_pfn_slow`,
+    /// 2514-2546), and mm/memory.c `do_anonymous_page` maps the zero page
+    /// for a read (4088-4091), in a private anonymous mapping as
+    /// Firecracker's guest memory is. Here a read exit commits the page.
+    /// Printed, on a lazy slot (`MAP_NORESERVE`, a page's grain):
+    /// - the guest reading a byte of each 4 KiB page of 4 MiB: exits, the
+    ///   slot's commit and working set, the process's commit; then writing
+    ///   the same pages;
+    /// - what a read-only zero page at the guest's addresses would take
+    ///   instead: one host page mapped read-only (`WHvMapGpaRange`, Read) at
+    ///   each of 1024 4 KiB guest pages (each call's time, and whether WHP
+    ///   takes so many mappings of one page); the guest reading them (exits,
+    ///   time); a guest write to one (the exit it makes); and, for 64 pages,
+    ///   swapping a page's mapping for a writable one (`WHvUnmapGpaRange`
+    ///   then `WHvMapGpaRange`), each one's time.
+    ///
+    /// Linux's lines for the same steps are tools/linux/guest-ram-grain.c's
+    /// (LINUXGRAIN read steps). Printed, not asserted, but for each step
+    /// reaching its end.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_guest_read_of_untouched_ram_on_record() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PROGRAM: u64 = 0xB000;
+        const LAZY_GPA: u64 = 0x200_0000;
+        const LAZY_LEN: usize = 8 << 20;
+        const ZERO_GPA: u64 = 0x300_0000;
+        const PAGES: u32 = 1024;
+        const MIB2: u64 = 2 << 20;
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        let mut gpa = LAZY_GPA;
+        while gpa < ZERO_GPA + MIB2 * 2 {
+            put(m, 0x3000 + (gpa >> 21) * 8, &(gpa | 0x83).to_le_bytes());
+            gpa += MIB2;
+        }
+        // mov edi, base; mov ecx, count; a byte read (or written) at rdi and
+        // rdi moved a page on, count times; out 0x80, al.
+        let pass = |base: u32, write: bool| {
+            let mut b = vec![0xBF];
+            b.extend_from_slice(&base.to_le_bytes());
+            b.push(0xB9);
+            b.extend_from_slice(&PAGES.to_le_bytes());
+            if write {
+                b.extend_from_slice(&[0xC6, 0x07, 0x01]); // mov byte [rdi], 1
+            } else {
+                b.extend_from_slice(&[0x8A, 0x07, 0x90]); // mov al, [rdi]; nop
+            }
+            b.extend_from_slice(&[0x81, 0xC7, 0x00, 0x10, 0x00, 0x00, 0xFF, 0xC9, 0x75, 0xF3, 0xE6, PORT as u8]);
+            b
+        };
+        let program = [
+            pass(LAZY_GPA as u32, false),
+            pass(LAZY_GPA as u32, true),
+            pass(ZERO_GPA as u32, false),
+            vec![0xC6, 0x04, 0x25, 0x00, 0x00, 0x30, 0x00, 0x01, 0xE6, PORT as u8], // mov byte [ZERO_GPA], 1; out
+            vec![0xF4, 0xEB, 0xFD],
+        ]
+        .concat();
+        put(m, PROGRAM, &program);
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: MEM as u64,
+                userspace_addr: m as u64,
+            })
+        }
+        .unwrap();
+        // SAFETY: anonymous memory for the test, unmapped below.
+        let lazy = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LAZY_LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(lazy, libc::MAP_FAILED);
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 1,
+                flags: 0,
+                guest_phys_addr: LAZY_GPA,
+                memory_size: LAZY_LEN as u64,
+                userspace_addr: lazy as u64,
+            })
+        }
+        .unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+        let part = vcpu.part();
+        let mut lines = Vec::new();
+        let mut wrong = Vec::new();
+        let mut step = |vcpu: &mut VcpuFd, name: &str| {
+            super::super::ffi::trace::begin();
+            let t = std::time::Instant::now();
+            let what = run_a_step(vcpu);
+            let took = t.elapsed().as_secs_f64() * 1e6;
+            let calls = super::super::ffi::trace::end();
+            if !what.ends_with(&format!("IoOut {PORT:#x}")) {
+                wrong.push(format!("{name}: the step did not reach its end: {what}"));
+            }
+            (lazy_exits(&calls).len(), took, what)
+        };
+        let host = lazy as usize;
+        for (name, write) in [("read", false), ("then written", true)] {
+            let before = process_memory();
+            let (exits, took, _) = step(&mut vcpu, name);
+            let after = process_memory();
+            let process = match (before, after) {
+                (Some(a), Some(b)) => format!("the process's commit {:+} KiB", (b.0 as i64 - a.0 as i64) / 1024),
+                _ => "the process's commit not read".to_string(),
+            };
+            lines.push(format!(
+                "lazy RAM, each 4 KiB page of 4 MiB {name} ({} accesses): {exits} exits of guest RAM; the step {took:.1} us; \
+                 the slot committed {} KiB, resident {} KiB; {process}",
+                if write { "1024 writes" } else { "1024 reads" },
+                committed_bytes(host, LAZY_LEN) / 1024,
+                resident_bytes(host, LAZY_LEN) / 1024
+            ));
+        }
+        // One zero page, read only, at each of 1024 guest pages.
+        // SAFETY: allocates a committed page, released below.
+        let zero = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!zero.is_null());
+        let mut map_times = Vec::new();
+        let mut results = std::collections::BTreeMap::<String, u32>::new();
+        for i in 0..u64::from(PAGES) {
+            let t = std::time::Instant::now();
+            // SAFETY: the page stays allocated while mapped; unmapped below.
+            let hres = unsafe { whv::WHvMapGpaRange(part, zero, ZERO_GPA + i * 4096, 4096, whv::WHvMapGpaRangeFlagRead) };
+            map_times.push(t.elapsed().as_secs_f64() * 1e6);
+            *results.entry(format!("{:#010x}", hres.cast_unsigned())).or_default() += 1;
+        }
+        let spread = |mut t: Vec<f64>| {
+            t.sort_by(f64::total_cmp);
+            format!("median {:.1} us (least {:.1}, most {:.1})", t[t.len() / 2], t[0], t[t.len() - 1])
+        };
+        lines.push(format!(
+            "one host page mapped read only at each of {PAGES} guest pages: HRESULTs {results:?}; each call {}",
+            spread(map_times)
+        ));
+        let (exits, took, _) = step(&mut vcpu, "zero pages read");
+        lines.push(format!("the zero-mapped pages read ({PAGES} reads): {exits} exits of guest RAM; the step {took:.1} us"));
+        let (_, _, what) = step(&mut vcpu, "a write to a zero-mapped page");
+        lines.push(format!("a guest write to a zero-mapped page: {what}"));
+        // A page's mapping swapped for a writable one, as a write would
+        // have it: unmapped, then the slot's own page mapped writable.
+        let (mut unmaps, mut maps) = (Vec::new(), Vec::new());
+        let mut swaps = std::collections::BTreeMap::<String, u32>::new();
+        for i in 0..64u64 {
+            let at = ZERO_GPA + i * 4096;
+            let t = std::time::Instant::now();
+            // SAFETY: a range mapped above.
+            let a = unsafe { whv::WHvUnmapGpaRange(part, at, 4096) };
+            unmaps.push(t.elapsed().as_secs_f64() * 1e6);
+            let t = std::time::Instant::now();
+            // SAFETY: a page of the lazy slot's memory, committed by the
+            // write step, which stays mapped while the VM has it.
+            let b = unsafe {
+                whv::WHvMapGpaRange(
+                    part,
+                    (host + i as usize * 4096) as *const _,
+                    at,
+                    4096,
+                    whv::WHvMapGpaRangeFlagRead | whv::WHvMapGpaRangeFlagWrite | whv::WHvMapGpaRangeFlagExecute,
+                )
+            };
+            maps.push(t.elapsed().as_secs_f64() * 1e6);
+            *swaps.entry(format!("{:#010x} {:#010x}", a.cast_unsigned(), b.cast_unsigned())).or_default() += 1;
+        }
+        lines.push(format!(
+            "64 pages swapped to writable: HRESULTs (unmap, map) {swaps:?}; WHvUnmapGpaRange {}; WHvMapGpaRange {}",
+            spread(unmaps),
+            spread(maps)
+        ));
+        for l in &lines {
+            eprintln!("ZEROREAD {l}");
+        }
+        // SAFETY: the ranges mapped above, unmapped before the VM goes.
+        unsafe { whv::WHvUnmapGpaRange(part, ZERO_GPA, u64::from(PAGES) * 4096) };
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's memory, no VM left using it.
+        unsafe {
+            VirtualFree(zero, 0, MEM_RELEASE);
+            assert_eq!(libc::munmap(lazy, LAZY_LEN), 0);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+        }
+        assert!(wrong.iter().all(|w| w.starts_with("a write to a zero-mapped page")), "{wrong:#?}");
+    }
+
     // String port I/O and device memory with a second operand in RAM, as
     // Firecracker's devices see them and as the guest's memory and
     // registers are left. Asserted, each as KVM does it (Linux v6.1

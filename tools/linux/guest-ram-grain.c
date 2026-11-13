@@ -22,6 +22,13 @@
 // transparent_hugepage settings are printed first: which of Linux's two
 // behaviours (a 4 KiB or a 2 MiB charge at a fault) the lines are.
 //
+// Then the zero-page steps (kvm-ioctls' ZEROREAD lines are the Windows
+// side), in an 8 MiB slot of each kind: a byte read in each 4 KiB page of
+// 4 MiB nothing touched, then a byte written in each of the same pages.
+// After each: the pages present (a read maps the zero page, or the huge
+// zero page, which pagemap shows present), the mapping's Rss and the
+// cgroup's charge, which count neither.
+//
 // The guest runs in 32-bit protected mode without paging, so its addresses
 // are guest physical ones; the program's bytes are those of the Windows
 // record's long mode program.
@@ -55,6 +62,8 @@
 #define WARM 0x800000ul
 #define SLOT_LEN (68ul << 20)
 #define DENSE_AT (64ul << 20)
+#define READ_LEN (8ul << 20)
+#define READ_GPA 0xC000000ul
 
 static const struct {
     const char *name;
@@ -144,6 +153,28 @@ static void present(int pagemap, unsigned long addr, unsigned long len, long *pa
     }
 }
 
+// A field ("Rss:", "AnonHugePages:") of the mapping that holds addr, in KiB.
+static long smaps_kib(unsigned long addr, const char *field) {
+    char line[512];
+    long kib = -1;
+    int in = 0;
+    size_t n = strlen(field);
+    FILE *f = fopen("/proc/self/smaps", "r");
+    if (!f) {
+        return -1;
+    }
+    while (fgets(line, sizeof line, f)) {
+        unsigned long s, e;
+        if (sscanf(line, "%lx-%lx ", &s, &e) == 2) {
+            in = s <= addr && addr < e;
+        } else if (in && strncmp(line, field, n) == 0 && sscanf(line + n, " %ld kB", &kib) == 1) {
+            break;
+        }
+    }
+    fclose(f);
+    return kib;
+}
+
 // The AnonHugePages of the mapping that holds addr, in KiB, and its range.
 static long anon_huge(unsigned long addr, unsigned long *start, unsigned long *end) {
     char line[512];
@@ -205,6 +236,14 @@ static void add_slot(int vm, uint32_t slot, unsigned long gpa, void *host, unsig
     }
 }
 
+// mov edi, base; mov ecx, count; then a byte read at edi and edi moved by
+// stride, count times; out 0x80, al.
+static size_t readp(uint8_t *at, uint32_t base, uint32_t count, uint32_t stride) {
+    size_t n = touch(at, base, count, stride);
+    memcpy(at + 10, "\x8A\x07\x90", 3); // mov al, [edi]; nop
+    return n;
+}
+
 // Runs the vCPU to its next `out` to PORT: the time it took, or exits.
 static double step(int vcpu, struct kvm_run *run, const char *name) {
     double t = now_us();
@@ -255,6 +294,11 @@ int main(void) {
         at += touch(low + at, (uint32_t)SLOTS[i].gpa, 32, MIB2);
         at += touch(low + at, (uint32_t)(SLOTS[i].gpa + DENSE_AT), 1024, PAGE);
     }
+    for (size_t i = 0; i < NSLOTS; i++) {
+        uint32_t base = (uint32_t)(READ_GPA + i * READ_LEN);
+        at += readp(low + at, base, 1024, PAGE);
+        at += touch(low + at, base, 1024, PAGE);
+    }
     memcpy(low + at, "\xF4\xEB\xFD", 3);
     add_slot(vm, 0, 0, low, 4ul << 20);
     void *warm = map_lazy(MIB2);
@@ -267,6 +311,15 @@ int main(void) {
             die("madvise(MADV_HUGEPAGE)");
         }
         add_slot(vm, 2 + (uint32_t)i, SLOTS[i].gpa, (void *)slots[i], SLOT_LEN);
+    }
+    unsigned long reads[NSLOTS];
+    for (size_t i = 0; i < NSLOTS; i++) {
+        uint8_t *p = map_lazy(READ_LEN + MIB2);
+        reads[i] = ((unsigned long)p + MIB2 - 1) & ~(MIB2 - 1);
+        if (SLOTS[i].hugepage && madvise(p, READ_LEN + MIB2, MADV_HUGEPAGE) < 0) {
+            die("madvise(MADV_HUGEPAGE)");
+        }
+        add_slot(vm, 2 + NSLOTS + (uint32_t)i, READ_GPA + i * READ_LEN, (void *)reads[i], READ_LEN);
     }
 
     int vcpu = ioctl(vm, KVM_CREATE_VCPU, 0);
@@ -337,6 +390,29 @@ int main(void) {
         }
         printf("LINUXGRAIN %s: 256 MiB touched page by page, at the dense step's time a page: %.0f ms\n", SLOTS[i].name,
                per_page * 65536 / 1000);
+    }
+    for (size_t i = 0; i < NSLOTS; i++) {
+        static const char *const READ_STEPS[] = {"read, a byte in each 4 KiB page of 4 MiB nothing touched (1024 reads)",
+                                                 "then written, a byte in each of the same pages (1024 writes)"};
+        for (size_t k = 0; k < 2; k++) {
+            long current0, anon0, current1, anon1, pages, blocks, ranges;
+            long rss0 = smaps_kib(reads[i], "Rss:");
+            cgroup_memory(&current0, &anon0);
+            double took = step(vcpu, run, READ_STEPS[k]);
+            cgroup_memory(&current1, &anon1);
+            long rss1 = smaps_kib(reads[i], "Rss:");
+            present(pagemap, reads[i], READ_LEN, &pages, &blocks, &ranges);
+            char cg[128];
+            if (current0 >= 0 && current1 >= 0) {
+                snprintf(cg, sizeof cg, "the cgroup's memory.current %+ld KiB, anon %+ld KiB", (current1 - current0) / 1024,
+                         anon0 >= 0 && anon1 >= 0 ? (anon1 - anon0) / 1024 : 0);
+            } else {
+                snprintf(cg, sizeof cg, "the cgroup's memory not read");
+            }
+            printf("LINUXGRAIN zero page, %s, %s: the step %.1f us; the slot's pages present %ld; its mapping's Rss "
+                   "%+ld KiB, AnonHugePages %ld KiB; %s\n",
+                   SLOTS[i].name, READ_STEPS[k], took, pages, rss1 - rss0, smaps_kib(reads[i], "AnonHugePages:"), cg);
+        }
     }
     fflush(stdout);
     return 0;
