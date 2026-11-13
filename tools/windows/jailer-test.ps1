@@ -10,7 +10,8 @@
 #
 # `refuse`, `freeze`, `cpuset`, `parent`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
-# and reads it); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
+# and reads it): run with other stages, it is run alone in a console of
+# its own, as CI's step runs it (<WorkDir>-pidns); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
 # Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
 # fails, saying so, without it). `bindlink` needs an elevated PowerShell and Windows 11
 # 24H2 or later (bindlink.dll; it fails, saying so, without it).
@@ -2036,6 +2037,29 @@ function Stage-Freeze {
     "Windows $build$(if ($elevated) { ', elevated' } else { ', unelevated' }): $($script:report.Count) cases: $($script:report -join ' | ')"
 }
 
+# A stage that needs a console of its own (pidns types into its console and
+# reads it), in a run of several stages: run alone, by this script, in a new
+# console, as CI's step runs it, with "<WorkDir>-<stage>" as its work
+# directory; its line is this run's. In the console the other stages wrote
+# to it is not a test of anything (the PC's run of the default list, 861d365,
+# gave it the list without pidns).
+function Invoke-InOwnConsole([string]$s) {
+    $dir = "$WorkDir-$s"
+    $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-WorkDir', $dir, '-Bin', $Bin, '-Assets', $Assets, '-Stage', $s)
+    if ($Probe) { $argv += @('-Probe', $Probe) }
+    # Start-Process joins the arguments with spaces as they are.
+    $argv = @($argv | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } })
+    $p = Start-Process powershell -PassThru -Wait -ArgumentList $argv
+    $lines = @(Get-Content (Join-Path $dir 'summary.txt') -ErrorAction SilentlyContinue)
+    $mine = @($lines | Where-Object { $_.StartsWith("PASS  ${s}: ") -or $_.StartsWith("FAIL  ${s}: ") })
+    Check ($mine.Count -eq 1) "the $s run in a console of its own ($dir, exit $($p.ExitCode)) wrote no line of its own: $($lines -join ' | ')"
+    $drives = @($lines | Where-Object { $_.StartsWith('FAIL  drives: ') })
+    Check ($drives.Count -eq 0) "the $s run in a console of its own ($dir): $($drives -join ' ')"
+    if ($mine[0].StartsWith('FAIL')) { throw [Failure]::new("$($mine[0].Substring("FAIL  ${s}: ".Length)) (in a console of its own, $dir)") }
+    return "$($mine[0].Substring("PASS  ${s}: ".Length)) (in a console of its own, $dir)"
+}
+$OwnConsole = @('pidns')
+
 # --- run ----------------------------------------------------------------------
 
 Stop-Jailed
@@ -2045,7 +2069,7 @@ foreach ($s in $Stage) {
     Write-Host "== $s"
     $sw = [Diagnostics.Stopwatch]::StartNew()
     try {
-        $msg = & "Stage-$((Get-Culture).TextInfo.ToTitleCase($s))"
+        $msg = if ($Stage.Count -gt 1 -and $OwnConsole -contains $s) { Invoke-InOwnConsole $s } else { & "Stage-$((Get-Culture).TextInfo.ToTitleCase($s))" }
         $Results[$s] = "PASS  ${s}: $msg"
         # A passing stage's jails (guest image copies) go; a failing one's stay to look at.
         $dir = Join-Path $WorkDir $s
