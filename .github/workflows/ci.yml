@@ -807,7 +807,11 @@ jobs:
           # The jailer's two tests of nested Job Objects (no WHP in them):
           # why a named --parent-cgroup is refused, which must hold, and
           # the record of what nesting does (NESTTEST lines).
-          for t in test_a_jails_job_does_not_nest test_nested_jobs_on_record; do
+          # With them, the hugetlb page sizes test for its HUGETLBTEST line:
+          # whether this runner's processor has 1 GiB pages, which decides
+          # which of the test's two 1GB halves ran.
+          for t in test_a_jails_job_does_not_nest test_nested_jobs_on_record \
+              test_hugetlb_page_sizes_are_linuxs; do
             out=$(cargo test --locked -p jailer -- \
               --include-ignored --nocapture --test-threads=1 "$t" 2>&1) || true
             printf '%s\n' "$out"

@@ -875,6 +875,13 @@ mod tests {
             }
             no_such_size(2, "hugetlb.1GB.max=1073741824");
         }
+        // On record (CI's record step runs this test alone with its
+        // output shown): which of the two halves above this processor took.
+        println!(
+            "HUGETLBTEST 1 GiB pages (CPUID.80000001H:EDX bit 26): {}; hugetlb.1GB files {}",
+            host_gb_pages(),
+            if host_gb_pages() { "accepted at no limit" } else { "refused as missing" }
+        );
     }
 
     #[test]
