@@ -105,6 +105,10 @@ pub(crate) struct VmInner {
     pub(crate) pvclock: Mutex<super::pvclock::State>,
     /// The vCPUs' TSC-deadline timers (`tscdeadline`).
     pub(crate) deadlines: super::tscdeadline::Timers,
+    /// KVM's TSC matching state (`kvm->arch.last_tsc_*`, the generation):
+    /// locked across a host's write of a vCPU's TSC, as KVM's
+    /// `tsc_write_lock` (`VcpuShared::synchronize_tsc`).
+    pub(crate) tsc_sync: Mutex<super::tscsync::TscSync>,
     pub(crate) vcpus: Mutex<Vec<Weak<VcpuShared>>>,
     /// The irqfd watcher thread wakes on this to stop (with `stop` set) or
     /// to watch the irqfds registered since it last looked.
@@ -375,6 +379,11 @@ impl VmInner {
         self.bp_window.1.notify_all();
     }
 
+    /// The live vCPU of index `index`.
+    pub(crate) fn vcpu(&self, index: u32) -> Option<Arc<VcpuShared>> {
+        self.vcpus.lock().unwrap().iter().filter_map(Weak::upgrade).find(|v| v.index == index)
+    }
+
     /// Waits for the next [`Self::wake_halted`], at most `timeout`.
     pub(crate) fn wait_halted(&self, timeout: std::time::Duration) {
         let (lock, cv) = &self.halt_wake;
@@ -609,6 +618,7 @@ impl VmInner {
             irqchip: Mutex::new(Irqchip::new()),
             pvclock: Mutex::new(super::pvclock::State::default()),
             deadlines: super::tscdeadline::Timers::new().map_err(io_err)?,
+            tsc_sync: Mutex::new(super::tscsync::TscSync::new()),
             vcpus: Mutex::new(Vec::new()),
             stop_evt,
             stop: AtomicBool::new(false),

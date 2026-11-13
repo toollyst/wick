@@ -431,6 +431,20 @@ pub(crate) unsafe fn WHvRequestInterrupt(
     }
 }
 
+/// `WHvResumePartitionTime` from `winhvplatform.dll`, loaded at first use.
+///
+/// # Safety
+/// As the Windows function.
+pub(crate) unsafe fn WHvResumePartitionTime(partition: WHV_PARTITION_HANDLE) -> HRESULT {
+    type F = unsafe extern "system" fn(WHV_PARTITION_HANDLE) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvResumePartitionTime")) {
+        // SAFETY: the address of `WHvResumePartitionTime`, whose signature `F` is.
+        Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(partition) },
+        None => unavailable(Dll::Platform),
+    }
+}
+
 /// `WHvRunVirtualProcessor` from `winhvplatform.dll`, loaded at first use.
 ///
 /// # Safety
@@ -627,6 +641,20 @@ pub(crate) unsafe fn WHvSetupPartition(partition: WHV_PARTITION_HANDLE) -> HRESU
     static P: OnceLock<Option<usize>> = OnceLock::new();
     match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvSetupPartition")) {
         // SAFETY: the address of `WHvSetupPartition`, whose signature `F` is.
+        Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(partition) },
+        None => unavailable(Dll::Platform),
+    }
+}
+
+/// `WHvSuspendPartitionTime` from `winhvplatform.dll`, loaded at first use.
+///
+/// # Safety
+/// As the Windows function.
+pub(crate) unsafe fn WHvSuspendPartitionTime(partition: WHV_PARTITION_HANDLE) -> HRESULT {
+    type F = unsafe extern "system" fn(WHV_PARTITION_HANDLE) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvSuspendPartitionTime")) {
+        // SAFETY: the address of `WHvSuspendPartitionTime`, whose signature `F` is.
         Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(partition) },
         None => unavailable(Dll::Platform),
     }

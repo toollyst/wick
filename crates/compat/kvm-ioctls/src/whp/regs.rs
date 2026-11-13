@@ -1208,6 +1208,8 @@ fn mtrr_register(index: u32) -> Option<WHV_REGISTER_NAME> {
     })
 }
 
+/// `IA32_TSC`.
+pub(crate) const MSR_IA32_TSC: u32 = 0x10;
 /// `IA32_TSC_ADJUST`.
 pub(crate) const MSR_IA32_TSC_ADJUST: u32 = 0x3b;
 /// `IA32_MISC_ENABLE`.
@@ -1359,19 +1361,18 @@ pub(crate) fn get_msrs(part: WHV_PARTITION_HANDLE, vp: u32, msrs: &mut Msrs) -> 
 /// KVM's `__msr_io` does ([`get_msrs`]); upstream fails on a count short of
 /// the list (`VcpuSetMsrsIncomplete`, `MsrError::SetMsrsIncomplete`).
 ///
-/// IA32_TSC goes last. KVM takes the host's writes of IA32_TSC and
-/// IA32_TSC_ADJUST as independent (x86.c, kvm_set_msr_common: only a
-/// guest's write of either moves the other), and a restore writes both in
-/// the list's order, the TSC first. Whether WHP moves the TSC at a write of
-/// its TscAdjust register is not documented, so the TSC is written after
-/// it, and the guest gets the saved TSC either way
+/// IA32_TSC is not written here: the vCPU writes it after the others, by
+/// KVM's TSC matching (`VcpuShared::synchronize_tsc`). KVM takes the host's
+/// writes of IA32_TSC and IA32_TSC_ADJUST as independent (x86.c,
+/// kvm_set_msr_common: only a guest's write of either moves the other), and
+/// a restore writes both in the list's order, the TSC first. Whether WHP
+/// moves the TSC at a write of its TscAdjust register is not documented, so
+/// the TSC is written after it, and the guest gets the saved TSC either way
 /// (`test_tsc_and_its_adjust_restore_as_saved`, on WHP).
 pub(crate) fn set_msrs(part: WHV_PARTITION_HANDLE, vp: u32, msrs: &Msrs) -> Result<usize> {
-    const IA32_TSC: u32 = 0x10;
     let count = msrs.as_slice().iter().take_while(|e| has_msr(e.index)).count();
     let entries = &msrs.as_slice()[..count];
-    let ordered = entries.iter().filter(|e| e.index != IA32_TSC).chain(entries.iter().filter(|e| e.index == IA32_TSC));
-    for e in ordered {
+    for e in entries.iter().filter(|e| e.index != MSR_IA32_TSC) {
         if let Some(name) = msr_register(e.index) {
             ffi::set_register(part, vp, name, reg64(e.data))?;
         } else if let Some(seg) = msr_segment_base(e.index) {

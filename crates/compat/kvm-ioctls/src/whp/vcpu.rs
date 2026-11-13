@@ -186,6 +186,12 @@ pub(crate) struct VcpuShared {
     /// keep them ([`regs::software_msr`]), as KVM keeps them.
     tsc_adjust: AtomicU64,
     misc_enable: AtomicU64,
+    /// `IA32_TSC_ADJUST` as it was at the host's last write of this vCPU's
+    /// TSC or TSC_ADJUST: what it has moved since is what the guest moved
+    /// the TSC by (a guest's write of either moves both, as on the
+    /// processor), which KVM's generation offset does not have
+    /// ([`VcpuShared::take_offset_of`]).
+    tsc_adjust_base: AtomicU64,
     /// The machine-check MSRs, as KVM keeps them for each vCPU (`mce`).
     mce: Mutex<super::mce::Mce>,
     /// Bumped by every write of `IA32_TSC_DEADLINE`, so that a timer armed
@@ -204,7 +210,122 @@ pub(crate) struct VcpuShared {
     window_expired: AtomicU64,
 }
 
+/// The monotonic time KVM's TSC matching measures the time between writes
+/// by (`get_kvmclock_base_ns`), in ns from the first use in the process: each
+/// VM's matching starts from no write ([`super::tscsync::TscSync::new`]).
+fn monotonic_ns() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    u64::try_from(BASE.get_or_init(std::time::Instant::now).elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Whether the host's TSC is invariant (CPUID.80000007H:EDX bit 8), which
+/// KVM's `kvm_check_tsc_unstable` stands for here: a host kernel marks its
+/// TSC unstable when it is not.
+fn host_tsc_stable() -> bool {
+    use core::arch::x86_64::__cpuid_count;
+    __cpuid_count(0x8000_0000, 0).eax >= 0x8000_0007 && __cpuid_count(0x8000_0007, 0).edx & (1 << 8) != 0
+}
+
 impl VcpuShared {
+    /// The rate of this vCPU's TSC as KVM's `virtual_tsc_khz`: the one
+    /// `KVM_SET_TSC_KHZ` set, else the host's (0 if WHP does not report it).
+    fn virtual_tsc_khz(&self) -> u32 {
+        match self.tsc_khz.load(Ordering::Relaxed) {
+            0 => u32::try_from(pvclock::tsc_hz() / 1000).unwrap_or(u32::MAX),
+            khz => u32::try_from(khz).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// This vCPU's `IA32_TSC_ADJUST`: the partition's register, or the
+    /// vCPU's copy where the partition does not keep it.
+    fn tsc_adjust_now(&self) -> Result<u64> {
+        if regs::software_msr(regs::MSR_IA32_TSC_ADJUST) {
+            return Ok(self.tsc_adjust.load(Ordering::Acquire));
+        }
+        Ok(super::ffi::as_u64(&super::ffi::get_register(self.part, self.index, whv::WHvX64RegisterTscAdjust)?))
+    }
+
+    /// A host's write of `data` to this vCPU's `IA32_TSC`, as KVM's
+    /// `kvm_synchronize_tsc` makes it (Linux v6.1 x86.c:2665-2718; the
+    /// decision is [`super::tscsync::TscSync::write`]): a write matched to
+    /// the current generation gives the vCPU the generation's offset, that of
+    /// the vCPU that began it ([`Self::take_offset_of`]); any other is
+    /// written as it is and begins a new generation; on a host whose TSC is
+    /// not invariant a matched write is the value plus the time since the
+    /// last write. Under the VM's lock, as KVM's `tsc_write_lock`; the state
+    /// changes only when the write is made.
+    pub(crate) fn synchronize_tsc(&self, data: u64) -> Result<()> {
+        use super::tscsync::TscWrite;
+        let inner = &self.inner;
+        let mut sync = inner.tsc_sync.lock().unwrap();
+        let mut next = *sync;
+        let write = next.write(self.index, data, monotonic_ns(), self.virtual_tsc_khz(), host_tsc_stable());
+        match write {
+            TscWrite::New { value } | TscWrite::MatchedUnstable { value } => {
+                super::ffi::set_register(self.part, self.index, whv::WHvX64RegisterTsc, super::ffi::reg64(value))?;
+            }
+            TscWrite::Matched { reference } => {
+                let Some(r) = inner.vcpu(reference) else {
+                    super::ffi::report(
+                        log::Level::Error,
+                        &format!("wick: vCPU {}'s TSC cannot take the offset of vCPU {reference}, which is gone", self.index),
+                    );
+                    return err(libc::EINVAL);
+                };
+                self.take_offset_of(&r)?;
+            }
+        }
+        // A host's write sets the offset whole: the guest has moved nothing
+        // since.
+        self.tsc_adjust_base.store(self.tsc_adjust_now()?, Ordering::Release);
+        *sync = next;
+        Ok(())
+    }
+
+    /// Gives this vCPU the TSC offset of the generation `reference` began:
+    /// `reference`'s TSC less what its guest has moved it by since its own
+    /// host write ([`Self::tsc_adjust_base`]), written to this vCPU while
+    /// partition time stands still, so that both TSCs are one offset from
+    /// the host's, as KVM's `offset = kvm->arch.cur_tsc_offset`. Partition
+    /// time stands still before a partition first runs if WHP keeps it so
+    /// (two reads of the TSC 20 us apart are equal), else it is suspended
+    /// for the copy (`WHvSuspendPartitionTime`, which Learn says no running
+    /// vCPU allows) and resumed after it. A refusal fails the write, naming
+    /// it, rather than writing an offset of its own.
+    fn take_offset_of(&self, reference: &VcpuShared) -> Result<()> {
+        let part = self.part;
+        let tsc = |vp: u32| -> Result<u64> {
+            Ok(super::ffi::as_u64(&super::ffi::get_register(part, vp, whv::WHvX64RegisterTsc)?))
+        };
+        let first = tsc(reference.index)?;
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_micros(20) {
+            std::hint::spin_loop();
+        }
+        let suspend = tsc(reference.index)? != first;
+        if suspend {
+            // SAFETY: the VM's partition.
+            let hres = unsafe { whv::WHvSuspendPartitionTime(part) };
+            super::ffi::hr_of("WHvSuspendPartitionTime", hres, || {
+                format!(
+                    "for vCPU {} to take vCPU {}'s TSC offset, as KVM's TSC matching does; refused while a vCPU runs",
+                    self.index, reference.index
+                )
+            })?;
+        }
+        let copied = (|| {
+            let moved = reference.tsc_adjust_now()?.wrapping_sub(reference.tsc_adjust_base.load(Ordering::Acquire));
+            let value = tsc(reference.index)?.wrapping_sub(moved);
+            super::ffi::set_register(part, self.index, whv::WHvX64RegisterTsc, super::ffi::reg64(value))
+        })();
+        if suspend {
+            // SAFETY: the VM's partition, whose time this call suspended.
+            let hres = unsafe { whv::WHvResumePartitionTime(part) };
+            super::ffi::hr_of("WHvResumePartitionTime", hres, String::new)?;
+        }
+        copied
+    }
+
     /// KVM's kick: `immediate_exit` is already set; makes a run in flight,
     /// or one about to start, return.
     ///
@@ -333,6 +454,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         tsc_deadline: AtomicU64::new(0),
         tsc_adjust: AtomicU64::new(0),
         misc_enable: AtomicU64::new(0),
+        tsc_adjust_base: AtomicU64::new(0),
         mce: Mutex::new(super::mce::Mce::default()),
         deadline_gen: AtomicU64::new(0),
         deadline_fired: AtomicU64::new(0),
@@ -346,6 +468,9 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         vcpus.push(Arc::downgrade(&shared));
     }
     inner.vcpus.lock().unwrap().push(Arc::downgrade(&shared));
+    // KVM writes 0 to a new vCPU's TSC, matched to the vCPUs made before it
+    // (x86.c:11951, kvm_arch_vcpu_postcreate).
+    shared.synchronize_tsc(0)?;
     Ok(VcpuFd { shared, own: None })
 }
 
@@ -874,13 +999,21 @@ impl VcpuFd {
         }
         drop(mce);
         for e in msrs.as_slice().iter().take(n) {
-            if e.index == MSR_TSC_DEADLINE {
+            if e.index == regs::MSR_IA32_TSC {
+                self.shared.synchronize_tsc(e.data)?;
+            } else if e.index == MSR_TSC_DEADLINE {
                 self.write_tsc_deadline(e.data)?;
             } else if regs::software_msr(e.index) {
                 self.write_software_msr(e.index, e.data, true)?;
             } else {
                 self.write_kvm_msr(e.index, e.data)?;
             }
+        }
+        // A host's write of TSC_ADJUST moves no TSC (KVM's are independent),
+        // so what it holds now is the guest's starting point.
+        if msrs.as_slice().iter().take(n).any(|e| e.index == regs::MSR_IA32_TSC_ADJUST) {
+            let now = self.shared.tsc_adjust_now()?;
+            self.shared.tsc_adjust_base.store(now, Ordering::Release);
         }
         Ok(n)
     }
@@ -5246,6 +5379,320 @@ mod fpu_tests {
 
         drop(vcpu);
         drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
+    /// The TSC of vCPU `vp` as WHP reads it.
+    fn tsc_of(part: WHV_PARTITION_HANDLE, vp: u32) -> u64 {
+        super::super::ffi::as_u64(&super::super::ffi::get_register(part, vp, whv::WHvX64RegisterTsc).unwrap())
+    }
+
+    fn spin(d: std::time::Duration) {
+        let start = std::time::Instant::now();
+        while start.elapsed() < d {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// vCPU 1's TSC less vCPU 0's, from reads in both orders (0 then 1, 1
+    /// then 0), so that the time between two reads cancels out: the median
+    /// of 9 pairs, with the longest time between two reads (in cycles).
+    fn tsc_skew(part: WHV_PARTITION_HANDLE) -> (i64, u64) {
+        let mut skews = Vec::new();
+        let mut gap = 0u64;
+        for _ in 0..9 {
+            let (a0, a1) = (tsc_of(part, 0), tsc_of(part, 1));
+            let (b1, b0) = (tsc_of(part, 1), tsc_of(part, 0));
+            let (ab, ba) = (a1.wrapping_sub(a0).cast_signed(), b1.wrapping_sub(b0).cast_signed());
+            // The time between two reads: half the difference of the two
+            // orders' differences.
+            gap = gap.max((i128::from(ab) - i128::from(ba)).unsigned_abs().div_ceil(2).try_into().unwrap_or(u64::MAX));
+            skews.push(((i128::from(ab) + i128::from(ba)) / 2) as i64);
+        }
+        skews.sort_unstable();
+        (skews[4], gap)
+    }
+
+    /// Both vCPUs' TSCs read while partition time is suspended
+    /// (`WHvSuspendPartitionTime`), or `None` if it is refused; with
+    /// whether vCPU 0's TSC stood still between two reads 1 ms apart.
+    fn tscs_held(part: WHV_PARTITION_HANDLE) -> Option<(u64, u64, bool)> {
+        // SAFETY: the test's partition.
+        if unsafe { whv::WHvSuspendPartitionTime(part) } != 0 {
+            return None;
+        }
+        let first = tsc_of(part, 0);
+        spin(std::time::Duration::from_millis(1));
+        let (t0, t1) = (tsc_of(part, 0), tsc_of(part, 1));
+        // SAFETY: the test's partition, whose time this suspended.
+        assert_eq!(unsafe { whv::WHvResumePartitionTime(part) }, 0, "WHvResumePartitionTime");
+        Some((t0, t1, first == t0))
+    }
+
+    /// A VM of two vCPUs over the test's guest memory.
+    fn two_vcpus(m: *mut u8) -> (super::super::VmFd, VcpuFd, VcpuFd) {
+        let vm = super::super::VmFd::create().unwrap();
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let v0 = vm.create_vcpu(0).unwrap();
+        let v1 = vm.create_vcpu(1).unwrap();
+        (vm, v0, v1)
+    }
+
+    fn write_tsc(vcpu: &VcpuFd, value: u64) -> Result<usize> {
+        vcpu.set_msrs(&Msrs::from_entries(&[kvm_bindings::kvm_msr_entry { index: 0x10, data: value, ..Default::default() }]).unwrap())
+    }
+
+    fn read_tsc(vcpu: &VcpuFd) -> u64 {
+        let mut m = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry { index: 0x10, ..Default::default() }]).unwrap();
+        assert_eq!(vcpu.get_msrs(&mut m).unwrap(), 1);
+        m.as_slice()[0].data
+    }
+
+    /// A record (TSCSYNC lines) of what WHP does with the vCPUs' TSCs, for
+    /// KVM's TSC matching (`VcpuShared::synchronize_tsc`), after a PC's
+    /// guests restored from a snapshot found their TSCs 5k-193k cycles apart
+    /// ("TSC warp between CPUs", c2042da): whether a TSC runs before the
+    /// partition's first run; the skew of two vCPUs after writes of the same
+    /// value 300 us apart made straight to WHP (0, as a boot writes; a saved
+    /// value, as a restore writes) and through KVM_SET_MSRS (matched); what
+    /// `WHvSuspendPartitionTime` and `WHvResumePartitionTime` return before
+    /// and after a first run, whether a TSC stands still while suspended, and
+    /// what a suspension of 50 ms costs the guest's clocks after a run: its
+    /// TSC, the partition's reference time (`WHvPartitionPropertyCodeReferenceTime`)
+    /// and its local APIC timer's count, each against the same 50 ms
+    /// without a suspension; and a suspension asked for while a vCPU runs.
+    /// Printed, not asserted, but for each step's own end.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_tsc_matching_and_partition_time_on_record() {
+        let mut lines = Vec::new();
+        let m = guest();
+        let (vm, mut v0, v1) = two_vcpus(m);
+        let part = v0.part();
+        let hz = pvclock::tsc_hz();
+        lines.push(format!("TSC {hz} Hz; host TSC invariant: {}", host_tsc_stable()));
+        let raw = |vp: u32, v: u64| {
+            super::super::ffi::set_register(part, vp, whv::WHvX64RegisterTsc, super::super::ffi::reg64(v)).unwrap();
+        };
+        let a = tsc_of(part, 0);
+        spin(std::time::Duration::from_millis(1));
+        let b = tsc_of(part, 0);
+        lines.push(format!("before a first run, vCPU 0's TSC over 1 ms of host time: +{}", b.wrapping_sub(a)));
+        lines.push(format!("after create_vcpu of both (KVM's matched writes of 0): skew {:?} (skew, longest read gap)", tsc_skew(part)));
+        let gap = std::time::Duration::from_micros(300);
+        raw(0, 0);
+        spin(gap);
+        raw(1, 0);
+        lines.push(format!("0 written straight to WHP, vCPU 1 300 us after vCPU 0: skew {:?}", tsc_skew(part)));
+        let saved = 7_000 * hz;
+        raw(0, saved);
+        spin(gap);
+        raw(1, saved);
+        lines.push(format!("{saved:#x} written straight to WHP, 300 us apart: skew {:?}", tsc_skew(part)));
+        write_tsc(&v0, saved).unwrap();
+        spin(gap);
+        write_tsc(&v1, saved + hz / 20_000).unwrap();
+        lines.push(format!("through KVM_SET_MSRS, vCPU 1's 50 us later than vCPU 0's, 300 us apart (matched): skew {:?}", tsc_skew(part)));
+        lines.push(format!("held before a first run: {:?} (vCPU 0, vCPU 1, vCPU 0 still over 1 ms)", tscs_held(part)));
+        // SAFETY: the test's partition.
+        let suspend = unsafe { whv::WHvSuspendPartitionTime(part) };
+        // SAFETY: the test's partition.
+        let again = unsafe { whv::WHvSuspendPartitionTime(part) };
+        // SAFETY: the test's partition.
+        let resume = unsafe { whv::WHvResumePartitionTime(part) };
+        // SAFETY: the test's partition.
+        let resume_again = unsafe { whv::WHvResumePartitionTime(part) };
+        lines.push(format!(
+            "before a first run: Suspend {:#010x}, Suspend again {:#010x}, Resume {:#010x}, Resume again {:#010x}",
+            suspend.cast_unsigned(),
+            again.cast_unsigned(),
+            resume.cast_unsigned(),
+            resume_again.cast_unsigned()
+        ));
+
+        start(&v0);
+        let first = run_once(&mut v0);
+        lines.push(format!("vCPU 0's first run: {first}"));
+        assert_eq!(first, "exit IoOut port 0x80", "the first run did not reach its `out`");
+        let a = tsc_of(part, 0);
+        spin(std::time::Duration::from_millis(1));
+        let b = tsc_of(part, 0);
+        lines.push(format!("after a run, vCPU 0's TSC over 1 ms: +{}; skew {:?}", b.wrapping_sub(a), tsc_skew(part)));
+        raw(1, tsc_of(part, 0));
+        lines.push(format!("vCPU 0's TSC read and written to vCPU 1 straight, time running: skew {:?}", tsc_skew(part)));
+        write_tsc(&v1, read_tsc(&v0)).unwrap();
+        lines.push(format!("the same through KVM_SET_MSRS (matched): skew {:?}", tsc_skew(part)));
+        lines.push(format!("held after a run: {:?}", tscs_held(part)));
+
+        // What 50 ms of suspended partition time costs each clock, against
+        // 50 ms without.
+        let mut page = v0.get_lapic().unwrap();
+        let set = |page: &mut kvm_bindings::kvm_lapic_state, at: usize, v: u32| {
+            for (i, b) in v.to_le_bytes().into_iter().enumerate() {
+                page.regs[at + i] = b.cast_signed();
+            }
+        };
+        set(&mut page, 0xF0, 0x1FF);
+        set(&mut page, 0x320, 0x1_0041);
+        set(&mut page, 0x3E0, 0xB);
+        set(&mut page, 0x380, u32::MAX);
+        v0.set_lapic(&page).unwrap();
+        let count = |v: &VcpuFd| {
+            let p = v.get_lapic().unwrap();
+            u32::from_le_bytes(std::array::from_fn(|i| p.regs[0x390 + i].cast_unsigned()))
+        };
+        let reference = || {
+            let mut t = 0u64;
+            let mut written = 0u32;
+            // SAFETY: an 8-byte buffer for the 8-byte property.
+            let hres = unsafe {
+                whv::WHvGetPartitionProperty(part, whv::WHvPartitionPropertyCodeReferenceTime, (&raw mut t).cast(), 8, &mut written)
+            };
+            if hres == 0 { Some(t) } else { None }
+        };
+        let clocks = |v: &VcpuFd| (std::time::Instant::now(), tsc_of(part, 0), reference(), count(v));
+        for suspended in [false, true] {
+            let before = clocks(&v0);
+            if suspended {
+                // SAFETY: the test's partition.
+                let hres = unsafe { whv::WHvSuspendPartitionTime(part) };
+                lines.push(format!("Suspend after a run: {:#010x}", hres.cast_unsigned()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if suspended {
+                // SAFETY: the test's partition.
+                let hres = unsafe { whv::WHvResumePartitionTime(part) };
+                lines.push(format!("Resume: {:#010x}", hres.cast_unsigned()));
+            }
+            let after = clocks(&v0);
+            let wall = after.0 - before.0;
+            lines.push(format!(
+                "{} {:.3} ms of host time: TSC +{} ({:.3} ms at {hz} Hz), reference time {:?} -> {:?}, APIC timer count {:#x} -> {:#x} (-{})",
+                if suspended { "suspended for" } else { "running for" },
+                wall.as_secs_f64() * 1e3,
+                after.1.wrapping_sub(before.1),
+                after.1.wrapping_sub(before.1) as f64 / hz as f64 * 1e3,
+                before.2,
+                after.2,
+                before.3,
+                after.3,
+                before.3.wrapping_sub(after.3)
+            ));
+        }
+
+        // A suspension, and a matched host write, while vCPU 0 runs (`jmp $`
+        // after its `out`).
+        let mut kicker = VcpuFd { shared: Arc::clone(&v0.shared), own: None };
+        let running = std::thread::spawn(move || {
+            let line = run_once(&mut v0);
+            (v0, line)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // SAFETY: the test's partition.
+        let hres = unsafe { whv::WHvSuspendPartitionTime(part) };
+        if hres == 0 {
+            // SAFETY: the test's partition.
+            unsafe { whv::WHvResumePartitionTime(part) };
+        }
+        let write = write_tsc(&v1, saved).map_err(|e| e.errno());
+        kicker.set_kvm_immediate_exit(1);
+        let (v0, line) = running.join().unwrap();
+        lines.push(format!(
+            "while vCPU 0 runs: Suspend {:#010x}; vCPU 1's matched KVM_SET_MSRS {write:?}; vCPU 0's run: {line}",
+            hres.cast_unsigned()
+        ));
+        assert_eq!(line, "no exit within 5 s (kicked)", "vCPU 0 was not running in `jmp $`");
+        for l in &lines {
+            eprintln!("TSCSYNC {l}");
+        }
+        drop((v0, v1, vm));
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
+    /// KVM's TSC matching on WHP: after a boot's writes of 0 and a restore's
+    /// writes of each vCPU's saved TSC, saved at different moments and
+    /// written 300 us apart, both vCPUs' TSCs are one offset from the
+    /// host's, as KVM gives them (x86.c:2665-2718, `cur_tsc_offset`): read
+    /// equal while partition time is suspended where that holds a TSC still,
+    /// else within the longest time between two reads. Saved again (vCPU 1
+    /// 40 us after vCPU 0) and restored into a new VM twice, as upstream's
+    /// save and a restore in a new process: each save's TSCs differ by the
+    /// save's gap alone, and each restore matches again. A host write while
+    /// a vCPU runs fails, with a whp: line, rather than writing an offset of
+    /// its own.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_restored_vcpus_take_one_tsc_offset_as_kvm() {
+        let m = guest();
+        let hz = pvclock::tsc_hz();
+        let one_offset = |part: WHV_PARTITION_HANDLE, step: &str| {
+            let held = tscs_held(part).unwrap_or_else(|| panic!("{step}: WHvSuspendPartitionTime refused"));
+            let (skew, gap) = tsc_skew(part);
+            eprintln!("TSCMATCH {step}: held {held:?}; skew {skew}, longest read gap {gap}");
+            if held.2 {
+                assert_eq!(held.0, held.1, "{step}: the vCPUs' TSCs differ while partition time stands still");
+            } else {
+                assert!(skew.unsigned_abs() <= gap, "{step}: skew {skew} beyond the read gap {gap}");
+            }
+        };
+        let (vm, v0, v1) = two_vcpus(m);
+        let part = v0.part();
+        one_offset(part, "created");
+        write_tsc(&v0, 0).unwrap();
+        spin(std::time::Duration::from_micros(300));
+        write_tsc(&v1, 0).unwrap();
+        one_offset(part, "a boot's writes of 0, 300 us apart");
+        let saved = 7_000 * hz;
+        let gap = hz / 20_000;
+        write_tsc(&v0, saved).unwrap();
+        spin(std::time::Duration::from_micros(300));
+        write_tsc(&v1, saved + gap).unwrap();
+        one_offset(part, "a restore's writes, vCPU 1's saved 50 us later");
+        let mut vms = vec![(vm, v0, v1)];
+        for round in 1..=2 {
+            let (_, v0, v1) = vms.last().unwrap();
+            let s0 = read_tsc(v0);
+            let between = std::time::Instant::now();
+            spin(std::time::Duration::from_micros(40));
+            let s1 = read_tsc(v1);
+            let apart = between.elapsed();
+            let most = super::super::tscsync::ns_to_cycles(u64::try_from(apart.as_nanos()).unwrap(), (hz / 1000) as u32) + hz / 10_000;
+            eprintln!("TSCMATCH save {round}: {s0:#x} {s1:#x}, {} apart in {apart:?}", s1.wrapping_sub(s0));
+            assert!(s1 >= s0 && s1 - s0 <= most, "save {round}: the TSCs differ by more than the save's gap");
+            let (vm, n0, n1) = two_vcpus(m);
+            write_tsc(&n0, s0).unwrap();
+            spin(std::time::Duration::from_micros(300));
+            write_tsc(&n1, s1).unwrap();
+            one_offset(n0.part(), &format!("restore {round} into a new VM"));
+            vms.push((vm, n0, n1));
+        }
+        let (vm, mut v0, v1) = vms.pop().unwrap();
+        drop(vms);
+        start(&v0);
+        assert_eq!(run_once(&mut v0), "exit IoOut port 0x80");
+        let mut kicker = VcpuFd { shared: Arc::clone(&v0.shared), own: None };
+        let running = std::thread::spawn(move || {
+            let line = run_once(&mut v0);
+            (v0, line)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let near = read_tsc(&v1);
+        let write = write_tsc(&v1, near);
+        kicker.set_kvm_immediate_exit(1);
+        let (v0, line) = running.join().unwrap();
+        assert_eq!(line, "no exit within 5 s (kicked)", "vCPU 0 was not running");
+        assert!(write.is_err(), "a matched host write while vCPU 0 runs was made: {write:?}");
+        drop((v0, v1, vm));
         // SAFETY: the test's mapping, no VM left using it.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
     }

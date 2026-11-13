@@ -39,6 +39,7 @@ mod mce;
 mod pvclock;
 mod regs;
 mod tscdeadline;
+mod tscsync;
 mod vcpu;
 mod xcr;
 // The record and the tests read WinHvPlatformDefs.h with it.

@@ -623,7 +623,8 @@ jobs:
       # The decoding modules the targets compile from their sources
       # (fuzz/src/lib.rs: hvf/exit.rs, whp/exit.rs, ...) with their own
       # unit tests, on every host: the WHP run loop's MMIO read bookkeeping
-      # (whp_exit::tests) is checked on Linux and macOS too.
+      # (whp_exit::tests) and the WHP backend's TSC matching
+      # (whp_tscsync::tests) are checked on Linux and macOS too.
       - name: The fuzzed modules' unit tests
         run: cargo test --manifest-path fuzz/Cargo.toml --lib
       - name: Fuzz each target for 60 seconds
@@ -1016,6 +1017,17 @@ jobs:
           # WHP register holds: KVM_GET_MSRS and KVM_SET_MSRS end there
           # (asserted), and whether a guest's RDMSR comes to the backend.
           alone whp::vcpu::fpu_tests::test_what_a_cpu_template_changes_on_record
+          # The vCPUs' TSCs (TSCSYNC lines), for KVM's TSC matching: whether
+          # a TSC runs before a first run, the skew after writes of one value
+          # 300 us apart straight to WHP and through KVM_SET_MSRS, what
+          # suspending partition time returns and costs the TSC, the
+          # reference time and the APIC timer, and a suspension while a vCPU
+          # runs. Then the matching asserted (TSCMATCH lines): a boot's and a
+          # restore's writes give both vCPUs one offset, through two more
+          # save and restore rounds into new VMs, and a host write while a
+          # vCPU runs fails.
+          alone whp::vcpu::fpu_tests::test_tsc_matching_and_partition_time_on_record
+          alone whp::vcpu::fpu_tests::test_restored_vcpus_take_one_tsc_offset_as_kvm
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
           alone windows_fd::tests::test_non_blocking_pipe_writes_on_record
