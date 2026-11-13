@@ -8032,6 +8032,277 @@ mod fpu_tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// UFFDCHUNK (a), for the W2 plan's "Discarded userfaultfd pages" part
+    /// (2): whether WHP follows the host's virtual addresses when the
+    /// section under a mapped GPA range is swapped, or keeps the pages it
+    /// was given at `WHvMapGpaRange`, and what a remap costs. Two 2 MiB
+    /// chunks of a 4 MiB placeholder (`VirtualAlloc2`
+    /// `MEM_RESERVE_PLACEHOLDER`, split by `VirtualFree(MEM_RELEASE |
+    /// MEM_PRESERVE_PLACEHOLDER)`), each a pagefile section of its own
+    /// (A filled 0xAA, B 0xBB) mapped with `MapViewOfFile3`
+    /// (`MEM_REPLACE_PLACEHOLDER`), each section also mapped elsewhere for
+    /// the host to look through; the 4 MiB mapped in WHP read, write and
+    /// execute with dirty tracking, in one call (its HRESULT; per chunk if
+    /// it is refused). Then the guest's reads and writes, each the guest's
+    /// own step ending at an `out`, or the exit it makes instead:
+    /// 1. chunk 0's and chunk 1's first byte;
+    /// 2. chunk 0's view unmapped back to its placeholder
+    ///    (`UnmapViewOfFile2(MEM_PRESERVE_PLACEHOLDER)`; its result): chunk
+    ///    0's first byte;
+    /// 3. a new section C (0xCC) mapped into the placeholder, nothing told
+    ///    WHP: chunk 0's first byte;
+    /// 4. a write of 0x5A at chunk 0 + 8 and chunk 1's first byte: where the
+    ///    write landed (A's and C's other views), and the dirty bitmap;
+    /// 5. chunk 0 mapped again in WHP (`WHvMapGpaRange` over the mapping,
+    ///    which Learn says "replaces any previous mappings for the
+    ///    specified GPA pages"; its time and HRESULT, and an unmap first if
+    ///    it is refused): chunk 0's first byte and chunk 0 + 8;
+    /// 6. a write of 0x6B at chunk 0 + 16, read back: where it landed, and
+    ///    the dirty bitmap;
+    ///
+    /// then 100 swaps of chunk 0 (the view unmapped to its placeholder, a
+    /// new section mapped into it, its handle closed) each followed by its
+    /// remap in WHP, both timed, and the guest's read of the last one's
+    /// byte. Printed, not asserted, but for each step's end.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_replaced_backing_under_mapped_guest_ram_on_record() {
+        use std::time::Instant;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile, MapViewOfFile3, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2, VirtualFree,
+            FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+            MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READWRITE,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const PROGRAM: u64 = 0xB000;
+        const CHUNK: usize = 2 << 20;
+        const GPA: u64 = 0x400_0000;
+        fn us(since: Instant) -> f64 {
+            since.elapsed().as_secs_f64() * 1e6
+        }
+        fn spread(t: &[f64]) -> String {
+            let mut t = t.to_vec();
+            t.sort_by(f64::total_cmp);
+            match t.len() {
+                0 => "none".to_string(),
+                n => format!("median {:.2} us (least {:.2}, most {:.2})", t[n / 2], t[0], t[n - 1]),
+            }
+        }
+        let err = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        // SAFETY: plain call.
+        let me = unsafe { GetCurrentProcess() };
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        for gpa in [GPA, GPA + CHUNK as u64] {
+            put(m, 0x3000 + (gpa >> 21) * 8, &(gpa | 0x83).to_le_bytes());
+        }
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: MEM as u64,
+                userspace_addr: m as u64,
+            })
+        }
+        .unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        let (part, vp) = (vcpu.part(), vcpu.vp());
+        // A section of a chunk, filled with `fill`, and a view of it for the host.
+        let section = |fill: u8| -> (HANDLE, usize) {
+            // SAFETY: an unnamed pagefile-backed section, committed; mapped anywhere and checked.
+            unsafe {
+                let s = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, CHUNK as u32, std::ptr::null());
+                assert!(!s.is_null(), "CreateFileMappingW: error {}", err());
+                let v = MapViewOfFile(s, FILE_MAP_ALL_ACCESS, 0, 0, CHUNK).Value as usize;
+                assert_ne!(v, 0, "MapViewOfFile: error {}", err());
+                std::ptr::write_bytes(v as *mut u8, fill, CHUNK);
+                (s, v)
+            }
+        };
+        let place = |s: HANDLE, at: usize| {
+            // SAFETY: maps the test's section into the test's placeholder.
+            let v = unsafe { MapViewOfFile3(s, me, at as *const _, 0, CHUNK, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0) };
+            assert_eq!(v.Value as usize, at, "MapViewOfFile3: error {}", err());
+        };
+        let unplace = |at: usize| {
+            // SAFETY: the test's view, back to its placeholder.
+            let ok = unsafe { UnmapViewOfFile2(me, MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }, MEM_PRESERVE_PLACEHOLDER) } != 0;
+            if ok { "done".to_string() } else { format!("refused, error {}", err()) }
+        };
+        // SAFETY: a placeholder of the test's own, split at its middle.
+        let base = unsafe { VirtualAlloc2(me, std::ptr::null(), 2 * CHUNK, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) } as usize;
+        assert_ne!(base, 0, "VirtualAlloc2: error {}", err());
+        // SAFETY: as above.
+        assert_ne!(unsafe { VirtualFree(base as *mut _, CHUNK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) }, 0, "split: error {}", err());
+        let (a, a_view) = section(0xAA);
+        let (b, b_view) = section(0xBB);
+        place(a, base);
+        place(b, base + CHUNK);
+        let rwx = whv::WHvMapGpaRangeFlagRead | whv::WHvMapGpaRangeFlagWrite | whv::WHvMapGpaRangeFlagExecute | whv::WHvMapGpaRangeFlagTrackDirtyPages;
+        let map = |host: usize, gpa: u64, len: usize| {
+            // SAFETY: the test's views stay mapped while the range is (unmapped below).
+            unsafe { whv::WHvMapGpaRange(part, host as *const _, gpa, len as u64, rwx) }
+        };
+        let mut lines = Vec::new();
+        let mut wrong = Vec::new();
+        let whole = map(base, GPA, 2 * CHUNK);
+        let mut line = format!("WHvMapGpaRange of the 4 MiB over two views in one call {:#010x}", whole.cast_unsigned());
+        if whole != 0 {
+            let (h0, h1) = (map(base, GPA, CHUNK), map(base + CHUNK, GPA + CHUNK as u64, CHUNK));
+            line += &format!("; a chunk a call {:#010x}, {:#010x}", h0.cast_unsigned(), h1.cast_unsigned());
+        }
+        lines.push(line);
+        // One guest step: `code` then `out PORT, al`, run until its out or
+        // another exit: AL at the out, or the exit.
+        let mut step = |code: &[u8]| -> String {
+            put(m, PROGRAM, &[code, &[0xE6, PORT as u8, 0xF4]].concat());
+            vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let end = match super::super::ffi::run_vp(part, vp) {
+                Err(e) => format!("run failed, errno {}", e.errno()),
+                Ok(ctx) => match ctx.ExitReason {
+                    whv::WHvRunVpExitReasonX64IoPortAccess => {
+                        // SAFETY: the union arm matches the exit reason.
+                        format!("AL {:#04x}", unsafe { ctx.Anonymous.IoPortAccess.Rax } & 0xff)
+                    }
+                    whv::WHvRunVpExitReasonMemoryAccess => {
+                        // SAFETY: the union arm matches the exit reason; the access-info bitfield overlaps the u32.
+                        let (at, info) = unsafe { (ctx.Anonymous.MemoryAccess.Gpa, ctx.Anonymous.MemoryAccess.AccessInfo.AsUINT32) };
+                        format!(
+                            "a memory access exit at {at:#x}, {}{}",
+                            ["read", "write", "execute", "type 3"][(info & 3) as usize],
+                            if info & 4 != 0 { ", the GPA unmapped" } else { "" }
+                        )
+                    }
+                    whv::WHvRunVpExitReasonCanceled => "none within 5 s (kicked)".to_string(),
+                    reason => format!("exit reason {reason:#x} at RIP {:#x}", ctx.VpContext.Rip),
+                },
+            };
+            drop(watchdog);
+            vcpu.set_kvm_immediate_exit(0);
+            end
+        };
+        let at = |off: u64| u32::try_from(GPA + off).unwrap().to_le_bytes();
+        // mov al, [addr]
+        let read = |off: u64| [&[0x8A, 0x04, 0x25][..], &at(off)].concat();
+        // mov byte [addr], v
+        let write = |off: u64, v: u8| [&[0xC6, 0x04, 0x25][..], &at(off), &[v]].concat();
+        let dirty = || {
+            let mut bitmap = [0u64; 16];
+            // SAFETY: a bitmap of 1024 pages' bits for the 4 MiB.
+            let h = unsafe { whv::WHvQueryGpaRangeDirtyBitmap(part, GPA, 2 * CHUNK as u64, bitmap.as_mut_ptr(), 128) };
+            let pages: Vec<usize> = (0..1024).filter(|i| bitmap[i / 64] & (1 << (i % 64)) != 0).collect();
+            format!("dirty bitmap {:#010x}: pages {pages:?}", h.cast_unsigned())
+        };
+        let host = |v: usize, off: usize| {
+            // SAFETY: a byte of one of the test's host views.
+            unsafe { ((v + off) as *const u8).read_volatile() }
+        };
+        let base_dirty = dirty();
+        lines.push(format!(
+            "1: chunk 0 reads {}, chunk 1 reads {} (A was filled 0xaa, B 0xbb); before it, {base_dirty}",
+            step(&read(0)),
+            step(&read(CHUNK as u64))
+        ));
+        let unmapped = unplace(base);
+        lines.push(format!("2: chunk 0's view unmapped to its placeholder: {unmapped}; chunk 0 reads {}", step(&read(0))));
+        if unmapped != "done" {
+            // The rest swaps a view WHP holds: not run.
+            for l in &lines {
+                eprintln!("UFFDCHUNK {l}");
+            }
+            panic!("UFFDCHUNK chunk 0's view not unmapped while WHP maps it: {unmapped}");
+        }
+        let (c, c_view) = section(0xCC);
+        place(c, base);
+        lines.push(format!("3: section C (0xcc) mapped into the placeholder, WHP not told: chunk 0 reads {}", step(&read(0))));
+        let wrote = step(&[write(8, 0x5A), read(CHUNK as u64)].concat());
+        lines.push(format!(
+            "4: 0x5a written at chunk 0 + 8, then chunk 1 read: {wrote}; A's other view reads {:#04x} there, C's {:#04x}; {}",
+            host(a_view, 8),
+            host(c_view, 8),
+            dirty()
+        ));
+        let t = Instant::now();
+        let mut remap = map(base, GPA, CHUNK);
+        let remap_us = us(t);
+        let mut line = format!("5: chunk 0 mapped again over its mapping: {:#010x} in {remap_us:.1} us", remap.cast_unsigned());
+        if remap != 0 {
+            let t = Instant::now();
+            // SAFETY: the test's range.
+            let u = unsafe { whv::WHvUnmapGpaRange(part, GPA, CHUNK as u64) };
+            remap = map(base, GPA, CHUNK);
+            line += &format!("; unmapped ({:#010x}) and mapped ({:#010x}) in {:.1} us", u.cast_unsigned(), remap.cast_unsigned(), us(t));
+        }
+        lines.push(format!("{line}; chunk 0 reads {}, chunk 0 + 8 reads {}", step(&read(0)), step(&read(8))));
+        let wrote = step(&[write(16, 0x6B), read(16)].concat());
+        lines.push(format!(
+            "6: 0x6b written at chunk 0 + 16 and read back: {wrote}; A's other view reads {:#04x} there, C's {:#04x}; {}",
+            host(a_view, 16),
+            host(c_view, 16),
+            dirty()
+        ));
+        // SAFETY: the test's own section handle; C's views keep it.
+        unsafe { CloseHandle(c) };
+        let (mut swaps, mut remaps, mut refused) = (Vec::new(), Vec::new(), 0);
+        let mut last = 0;
+        for i in 0..100u8 {
+            let t = Instant::now();
+            let unmapped = unplace(base);
+            assert_eq!(unmapped, "done", "swap {i}");
+            // SAFETY: an unnamed pagefile-backed section; checked; its handle closed once mapped.
+            let s = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, CHUNK as u32, std::ptr::null()) };
+            assert!(!s.is_null(), "CreateFileMappingW: error {}", err());
+            place(s, base);
+            // SAFETY: as above.
+            unsafe { CloseHandle(s) };
+            swaps.push(us(t));
+            // SAFETY: the new view, read-write.
+            unsafe { (base as *mut u8).write_volatile(i) };
+            last = i;
+            let t = Instant::now();
+            if map(base, GPA, CHUNK) != 0 {
+                refused += 1;
+            }
+            remaps.push(us(t));
+        }
+        lines.push(format!(
+            "100 swaps of chunk 0's section: the swap {}, its remap in WHP {} ({refused} refused); chunk 0 then reads {} (the last section's byte {last:#04x})",
+            spread(&swaps),
+            spread(&remaps),
+            step(&read(0))
+        ));
+        for l in &lines {
+            eprintln!("UFFDCHUNK {l}");
+        }
+        for (n, l) in lines.iter().enumerate().skip(1) {
+            if l.contains("run failed") || l.contains("kicked") || l.contains("exit reason") {
+                wrong.push(format!("line {n}: {l}"));
+            }
+        }
+        // SAFETY: the range mapped above, unmapped before the VM goes; then
+        // the test's views, placeholders and sections.
+        unsafe {
+            whv::WHvUnmapGpaRange(part, GPA, 2 * CHUNK as u64);
+        }
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: as above.
+        unsafe {
+            for v in [base, base + CHUNK, a_view, b_view, c_view] {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ });
+            }
+            CloseHandle(a);
+            CloseHandle(b);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// ZEROREAD's lines on a guest write to memory WHP maps read only, on a
     /// partition without and then with the `GpaAccessFaultExit` extended
     /// exit (Learn, WHV_EXTENDED_VM_EXITS: "WHvRunVpExitReasonMemoryAccess

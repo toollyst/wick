@@ -1180,6 +1180,12 @@ jobs:
           # in WHP, the exit a guest write to each page makes, and the page
           # committed on the view or opened at each exit.
           alone whp::vcpu::fpu_tests::test_guest_ram_in_sections_on_record
+          # UFFDCHUNK a: whether WHP follows the host's addresses when a
+          # mapped chunk's section is swapped over a placeholder, or keeps
+          # the old pages, and what a chunk's remap costs (the W2 plan's
+          # "Discarded userfaultfd pages", part 2). Its host's side, b-d, is
+          # in the libc records.
+          alone whp::vcpu::fpu_tests::test_a_replaced_backing_under_mapped_guest_ram_on_record
           # What each call of the backend commits of its thread's stack
           # (STACKTEST lines), each on a thread of its own: which one leaves
           # a vCPU's thread 48 to 52 KiB deep, as the boot record of run
