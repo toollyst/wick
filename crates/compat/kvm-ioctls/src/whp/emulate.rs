@@ -106,8 +106,9 @@ impl Drop for EmuHandle {
 /// thread, as QEMU's WHPX keeps one per vCPU. A process-wide one, shared by
 /// two vCPUs emulating MMIO at once, completed one vCPU's instruction with
 /// the other's state (a guest with 2 vCPUs and an Async drive had its
-/// kernel memory corrupted within seconds; 1 vCPU never did).
-fn emulator() -> Result<*mut core::ffi::c_void> {
+/// kernel memory corrupted within seconds; 1 vCPU never did). `vp` is the
+/// vCPU the thread runs, for the trace.
+fn emulator(vp: u32) -> Result<*mut core::ffi::c_void> {
     thread_local! {
         static EMU: OnceLock<Result<EmuHandle>> = const { OnceLock::new() };
     }
@@ -122,8 +123,15 @@ fn emulator() -> Result<*mut core::ffi::c_void> {
             WHvEmulatorTranslateGvaPage: Some(translate_cb),
         };
         let mut handle: *mut core::ffi::c_void = std::ptr::null_mut();
+        #[cfg(any(test, feature = "whp-trace"))]
+        let before = ffi::trace::stack();
         // SAFETY: valid callbacks and out-pointer.
-        ffi::hr(unsafe { whv::WHvEmulatorCreateEmulator(&callbacks, &mut handle) })?;
+        let hres = unsafe { whv::WHvEmulatorCreateEmulator(&callbacks, &mut handle) };
+        #[cfg(any(test, feature = "whp-trace"))]
+        ffi::trace::note("WHvEmulatorCreateEmulator", vp, &[], None, before, hres);
+        #[cfg(not(any(test, feature = "whp-trace")))]
+        let _ = vp;
+        ffi::hr(hres)?;
         Ok(EmuHandle(handle))
     })
     .as_ref()
@@ -146,7 +154,7 @@ pub(crate) fn mmio(
     ram: &super::pvclock::Ram,
     more: &mut Vec<DeviceWrite>,
 ) -> Result<Outcome> {
-    let emu = emulator()?;
+    let emu = emulator(vp)?;
     let mut ctx = EmuCtx {
         part,
         vp,
@@ -160,6 +168,10 @@ pub(crate) fn mmio(
         more,
     };
     let mut status: WHV_EMULATOR_STATUS = unsafe { std::mem::zeroed() };
+    // Traced as one call, the callbacks' within it on their own: this
+    // runs on the vCPU thread's stack, the emulator's frames and ours.
+    #[cfg(any(test, feature = "whp-trace"))]
+    let before = ffi::trace::stack();
     // SAFETY: valid emulator, context and exit structures.
     let hres = unsafe {
         whv::WHvEmulatorTryMmioEmulation(
@@ -170,6 +182,8 @@ pub(crate) fn mmio(
             &mut status,
         )
     };
+    #[cfg(any(test, feature = "whp-trace"))]
+    ffi::trace::note("WHvEmulatorTryMmioEmulation", vp, &[], None, before, hres);
     Ok(interpret(&ctx, hres))
 }
 
@@ -318,9 +332,13 @@ unsafe extern "system" fn translate_cb(
     // SAFETY: context is the EmuCtx; out-pointers are valid.
     let ctx = unsafe { &*(context as *const EmuCtx) };
     let mut result: WHV_TRANSLATE_GVA_RESULT = unsafe { std::mem::zeroed() };
+    #[cfg(any(test, feature = "whp-trace"))]
+    let before = super::ffi::trace::stack();
     let hres = unsafe {
         whv::WHvTranslateGva(ctx.part, ctx.vp, gva, flags, &mut result, gpa)
     };
+    #[cfg(any(test, feature = "whp-trace"))]
+    super::ffi::trace::note("the emulator's WHvTranslateGva", ctx.vp, &[], None, before, hres);
     if hres == S_OK {
         unsafe { *result_code = result.ResultCode };
     }

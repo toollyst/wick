@@ -3217,9 +3217,12 @@ mod fpu_tests {
     /// thread made (`ffi::trace`): one STACKTEST line of what the thread's
     /// stack had committed before and after the step, and one STACKCALL
     /// line for each call (past 40 calls, for those that left more of the
-    /// stack committed than they found, or failed). Returns what is wrong
-    /// with the step: each WHP call that failed, and a stack committed
-    /// past [`STACK_BOUND`].
+    /// stack committed than they found, or failed). The calls the emulator
+    /// makes through its callbacks are lines of their own and are not
+    /// added to the stack within WHP calls, which the emulator's call they
+    /// are made in already counts (`trace::Call::nested`). Returns what is
+    /// wrong with the step: each WHP call that failed, and a stack
+    /// committed past [`STACK_BOUND`].
     fn a_step_with_its_calls(vcpu: &mut VcpuFd, thread: &str, name: &str) -> Vec<String> {
         std::thread::scope(|scope| {
             std::thread::Builder::new()
@@ -3231,17 +3234,22 @@ mod fpu_tests {
                     let what = run_a_step(vcpu);
                     let calls = super::super::ffi::trace::end();
                     let after = super::super::ffi::trace::stack();
+                    let (faults, deepest) = libc::wick_mm::host_faults_on_this_thread();
                     let grew = |c: &super::super::ffi::trace::Call| c.after > c.before;
-                    let by_calls: usize = calls.iter().map(|c| c.after - c.before).sum();
+                    let by_calls: usize = calls.iter().filter(|c| !c.nested()).map(|c| c.after - c.before).sum();
                     eprintln!(
                         "STACKTEST {thread}, {name}: {what}; the thread's stack: {} KiB committed before, {} after, \
-                         {} of them within WHP calls; {} WHP calls, {} left more committed, {} failed",
+                         {} of them within WHP calls; {} WHP calls ({} of them the emulator's, within its own), \
+                         {} left more committed, {} failed; the thread's own accesses to lazy guest RAM that \
+                         the exception handler committed: {faults} (the stack at most {} KiB committed at its entry)",
                         before / 1024,
                         after / 1024,
                         by_calls / 1024,
                         calls.len(),
+                        calls.iter().filter(|c| c.nested()).count(),
                         calls.iter().filter(|c| grew(c)).count(),
-                        calls.iter().filter(|c| c.hres != 0).count()
+                        calls.iter().filter(|c| c.hres != 0).count(),
+                        deepest / 1024
                     );
                     for (i, c) in calls.iter().enumerate() {
                         if i < 40 || grew(c) || c.hres != 0 {
@@ -3281,8 +3289,9 @@ mod fpu_tests {
     /// (`ffi::trace`), a step at a time, each step on a thread of its own:
     /// the CPUID leaves answered from the vCPU's state, RDMSR and WRMSR of
     /// MSRs the backend keeps, port input the irqchip answers and port
-    /// input Firecracker answers, string I/O and an MMIO write (the
-    /// emulator), the local APIC through its page, an application
+    /// input Firecracker answers, string I/O, an MMIO write and an MMIO
+    /// read (the emulator), the first writes to `MAP_NORESERVE` guest RAM
+    /// (committed at the access, as Firecracker's), the local APIC through its page, an application
     /// processor started with INIT and SIPI (on its own thread), an
     /// interrupt taken while running and one that ends a HLT, the
     /// TSC-deadline timer, and a KVM hypercall. Asserted for every step:
@@ -3294,6 +3303,14 @@ mod fpu_tests {
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_the_stack_each_whp_call_commits_on_record() {
         const FRESH_PAGES: &str = "a write to each 4 KiB page from 2 MiB to 4 MiB, which nothing wrote before";
+        const MMIO_READ: &str = "an MMIO read (the emulator), the thread's first exit";
+        const LAZY_RAM: &str = "a write to each of four 64 KiB blocks of MAP_NORESERVE guest RAM at 8 MiB, \
+                                which nothing touched before, the thread's first exits";
+        // Steps printed, whose stack is not bounded (a failed call still is wrong).
+        const RECORDED: [&str; 3] = [FRESH_PAGES, MMIO_READ, LAZY_RAM];
+        // The lazy slot: 2 MiB at 8 MiB, committed by nothing before the guest.
+        const LAZY_GPA: u64 = 0x80_0000;
+        const LAZY_LEN: usize = 2 << 20;
         const PROGRAM: u64 = 0xB000;
         const HANDLER: u64 = 0xB800;
         const AP_CODE: u64 = 0xC000;
@@ -3304,6 +3321,8 @@ mod fpu_tests {
         let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
         // A page 6 MiB up that no memory slot backs: an MMIO address.
         q(0x3018, 0x60_0000 | 0x83);
+        // The lazy slot's 2 MiB page.
+        q(0x3020, LAZY_GPA | 0x83);
         // The second 2 MiB of the slot, which nothing on the host writes.
         q(0x3008, 0x20_0000 | 0x83);
         // The local APIC's page, 0xFEE0_0000: the fourth GiB's directory at
@@ -3388,6 +3407,27 @@ mod fpu_tests {
             (
                 "an MMIO write (the emulator)",
                 vec![0xC7, 0x04, 0x25, 0x00, 0x00, 0x60, 0x00, 0x78, 0x56, 0x34, 0x12], // mov dword [0x600000], 0x12345678
+            ),
+            // A booted guest's run call that commits its thread's stack
+            // returns a memory access exit (9af0b63's traced boot, exit
+            // reason 1, on every vCPU): of guest RAM that is not committed
+            // yet (Firecracker's is `MAP_NORESERVE`), or of MMIO. Each, as
+            // the first exit of a fresh thread; the run call's line names
+            // the access (`trace::exit_detail`). Printed, not bounded.
+            (
+                MMIO_READ,
+                vec![0x8B, 0x04, 0x25, 0x00, 0x00, 0x60, 0x00], // mov eax, [0x600000]
+            ),
+            (
+                LAZY_RAM,
+                vec![
+                    0xBF, 0x00, 0x00, 0x80, 0x00, // mov edi, 0x800000
+                    0xB9, 0x04, 0x00, 0x00, 0x00, // mov ecx, 4
+                    0xC6, 0x07, 0x01, // mov byte [rdi], 1
+                    0x81, 0xC7, 0x00, 0x00, 0x01, 0x00, // add edi, 0x10000
+                    0xFF, 0xC9, // dec ecx
+                    0x75, 0xF3, // jnz to the mov
+                ],
             ),
             (
                 "the local APIC enabled through its page (spurious vector register 0x1ff)",
@@ -3480,6 +3520,27 @@ mod fpu_tests {
         };
         // SAFETY: the memory stays mapped while the VM has it.
         unsafe { vm.set_user_memory_region(region) }.unwrap();
+        // SAFETY: anonymous memory for the test, unmapped at its end.
+        let lazy = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LAZY_LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(lazy, libc::MAP_FAILED);
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 1,
+            flags: 0,
+            guest_phys_addr: LAZY_GPA,
+            memory_size: LAZY_LEN as u64,
+            userspace_addr: lazy as u64,
+        };
+        // SAFETY: as the first slot's.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
         let mut vcpu = vm.create_vcpu(0).unwrap();
         let mut ap = vm.create_vcpu(1).unwrap();
         // The guest's CPUID has TSC_ADJUST (leaf 7, EBX bit 1), without
@@ -3525,7 +3586,7 @@ mod fpu_tests {
                 a_step_with_its_calls(&mut vcpu, "fc_vcpu 0", name)
             };
             // A record, not bounded: a failed call still is wrong.
-            let of_the_step: Vec<String> = if *name == FRESH_PAGES {
+            let of_the_step: Vec<String> = if RECORDED.contains(name) {
                 of_the_step.into_iter().filter(|w| !w.contains(" KiB of the stack committed, over ")).collect()
             } else {
                 of_the_step
@@ -3551,8 +3612,10 @@ mod fpu_tests {
         drop(ap);
         drop(vcpu);
         drop(vm);
-        // SAFETY: the test's mapping, no VM left using it.
+        // SAFETY: the test's mappings, no VM left using them.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::munmap(lazy, LAZY_LEN) }, 0);
         assert!(wrong.is_empty(), "on a vCPU's thread: {wrong:#?}");
     }
 

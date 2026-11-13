@@ -187,6 +187,16 @@ pub mod wick_mm {
         super::out_of_memory(addr, err)
     }
 
+    /// This thread's own accesses to lazy memory that the exception
+    /// handler committed (each an access violation the system dispatched
+    /// on the thread's stack), and the most of the thread's stack that was
+    /// committed when the handler was entered: a record for which code on
+    /// a thread touches guest RAM before the guest does, and what its
+    /// dispatch costs the thread's stack.
+    pub fn host_faults_on_this_thread() -> (u64, usize) {
+        super::HOST_FAULTS.get()
+    }
+
     /// Calls the [`deny_exec`] hook if `prot` asks for execution.
     pub(super) fn check_exec(prot: c_int) {
         if prot & PROT_EXEC == 0 {
@@ -901,6 +911,35 @@ fn out_of_memory(addr: usize, err: u32) -> ! {
     unreachable!("the process ended");
 }
 
+std::thread_local! {
+    /// [`wick_mm::host_faults_on_this_thread`]: no destructor, so that the
+    /// exception handler's access is a plain read of the thread's TLS.
+    static HOST_FAULTS: std::cell::Cell<(u64, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// How much of the calling thread's stack is committed, in bytes: the
+/// TEB's `StackBase` less its `StackLimit` (`NT_TIB`, at `gs:[8]` and
+/// `gs:[0x10]` on x86-64); 0 elsewhere.
+fn stack_committed() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (base, limit): (usize, usize);
+        // SAFETY: two reads of the thread's own TEB.
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, gs:[0x8]",
+                "mov {1}, gs:[0x10]",
+                out(reg) base,
+                out(reg) limit,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        base - limit
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    0
+}
+
 /// A host thread's access to lazy memory: its pages are committed and the
 /// access runs again.
 unsafe extern "system" fn lazy_on_exception(
@@ -911,8 +950,13 @@ unsafe extern "system" fn lazy_on_exception(
     let rec = unsafe { &*(*info).ExceptionRecord };
     if rec.ExceptionCode == ACCESS_VIOLATION && rec.NumberParameters >= 2 {
         // [0]: 0 read, 1 write, 8 execute; [1]: the address.
+        let stack = stack_committed();
         match commit_on_access(rec.ExceptionInformation[1], rec.ExceptionInformation[0] == 1) {
-            Access::Committed => return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION,
+            Access::Committed => {
+                let (n, deepest) = HOST_FAULTS.get();
+                HOST_FAULTS.set((n + 1, deepest.max(stack)));
+                return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION;
+            }
             Access::Exhausted(err) => out_of_memory(rec.ExceptionInformation[1], err),
             Access::NotLazy => {}
         }

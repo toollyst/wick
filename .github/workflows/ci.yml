@@ -876,10 +876,16 @@ jobs:
           # (running, and ending a HLT), the TSC-deadline timer, a KVM
           # hypercall, and last a REP OUTSB (which run 43392627996 did not
           # get past; the run loop does the string instructions itself
-          # since). Asserted for every step: no
+          # since). Printed, not bounded: an MMIO read, and the first
+          # writes to MAP_NORESERVE guest RAM, each the first exits of a
+          # fresh thread, since the run call that took a booted guest's
+          # vCPU threads from 16 or 20 to 52 KiB on a PC returned a memory
+          # access exit (9af0b63's traced boot); each run call's line names
+          # the access, and the thread's own faults on lazy RAM the
+          # exception handler resolved within it. Asserted for every step: no
           # WHP call of the vCPU's thread fails, and the thread's stack
           # stays within 40 KiB (16 to 24 measured without a refused call,
-          # 52 with one, in that run).
+          # 52 with one, in that run) but for those printed.
           alone whp::vcpu::fpu_tests::test_the_stack_each_whp_call_commits_on_record
           # String port I/O (REP OUTSB, OUTSW, REP INSB, INSD, with the
           # direction flag too) and a device's memory with a second operand

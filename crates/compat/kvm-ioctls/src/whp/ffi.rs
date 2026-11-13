@@ -293,6 +293,8 @@ pub(crate) fn run_vp(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<WHV_RUN_VP_E
     let mut ctx = Exit(unsafe { std::mem::zeroed() });
     #[cfg(any(test, feature = "whp-trace"))]
     let before = trace::stack();
+    #[cfg(any(test, feature = "whp-trace"))]
+    let faults = libc::wick_mm::host_faults_on_this_thread().0;
     // SAFETY: valid output buffer of the given size.
     let hres = unsafe {
         whv::WHvRunVirtualProcessor(
@@ -303,7 +305,9 @@ pub(crate) fn run_vp(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<WHV_RUN_VP_E
         )
     };
     #[cfg(any(test, feature = "whp-trace"))]
-    trace::note_exit("WHvRunVirtualProcessor", vp, &[], None, before, hres, Some(ctx.0.ExitReason));
+    trace::note_exit("WHvRunVirtualProcessor", vp, &[], None, before, hres, Some(ctx.0.ExitReason), || {
+        trace::exit_detail(&ctx.0, faults)
+    });
     hr_of("WHvRunVirtualProcessor", hres, || format!("vp {vp}"))?;
     Ok(ctx.0)
 }
@@ -368,7 +372,14 @@ pub(crate) mod trace {
         pub after: usize,
         /// For `WHvRunVirtualProcessor`, the exit reason it returned.
         pub exit: Option<i32>,
+        /// What else the call is known by ([`exit_detail`] for a run).
+        pub detail: String,
     }
+
+    /// How a call the emulator makes through its callbacks, within
+    /// `WHvEmulatorTryMmioEmulation` (traced itself), is named: a nested
+    /// call, whose stack is the outer call's too.
+    pub(crate) const NESTED: &str = "the emulator's ";
 
     impl Call {
         /// `call(vp n: name=value, ..)`.
@@ -382,8 +393,9 @@ pub(crate) mod trace {
             }
             let registers = if registers.is_empty() { String::new() } else { format!(": {}", registers.join(", ")) };
             let exit = self.exit.map_or(String::new(), |e| format!(", exit reason {e:#x}"));
+            let detail = if self.detail.is_empty() { String::new() } else { format!(" ({})", self.detail) };
             format!(
-                "{}(vp {}{registers}) HRESULT {:#010x}{exit}, stack {} -> {} KiB",
+                "{}(vp {}{registers}) HRESULT {:#010x}{exit}{detail}, stack {} -> {} KiB",
                 self.call,
                 self.vp,
                 self.hres.cast_unsigned(),
@@ -391,6 +403,45 @@ pub(crate) mod trace {
                 self.after / 1024
             )
         }
+
+        /// Whether the call was made within another traced one ([`NESTED`]).
+        pub(crate) fn nested(&self) -> bool {
+            self.call.starts_with(NESTED)
+        }
+    }
+
+    /// What a run's exit was about: for a memory access, its GPA, kind and
+    /// GVA; the RIP; and the accesses of the thread's own to lazy guest RAM
+    /// that the exception handler committed during the call
+    /// (`wick_mm::host_faults_on_this_thread`), with the most of the stack
+    /// committed at the handler's entry. `faults` is their count before the
+    /// call.
+    pub(crate) fn exit_detail(ctx: &super::WHV_RUN_VP_EXIT_CONTEXT, faults: u64) -> String {
+        let mut d = Vec::new();
+        if ctx.ExitReason == super::whv::WHvRunVpExitReasonMemoryAccess {
+            // SAFETY: the union arm matches the exit reason; the
+            // access-info bitfield overlaps the u32.
+            let (mem, info) = unsafe { (ctx.Anonymous.MemoryAccess, ctx.Anonymous.MemoryAccess.AccessInfo.AsUINT32) };
+            // `WHV_MEMORY_ACCESS_INFO`: AccessType in bits 0-1, GpaUnmapped
+            // bit 2, GvaValid bit 3.
+            let kind = ["read", "write", "execute", "access type 3"][(info & 3) as usize];
+            let unmapped = if info & 4 != 0 { ", unmapped" } else { "" };
+            d.push(format!("gpa {:#x} {kind}{unmapped}", mem.Gpa));
+            if info & 8 != 0 {
+                d.push(format!("gva {:#x}", mem.Gva));
+            }
+        }
+        d.push(format!("rip {:#x}", ctx.VpContext.Rip));
+        let (now, deepest) = libc::wick_mm::host_faults_on_this_thread();
+        if now != faults {
+            d.push(format!(
+                "the thread's own accesses to lazy guest RAM that the exception handler committed during the call: {} \
+                 (the thread's stack at most {} KiB committed at the handler's entry)",
+                now - faults,
+                deepest / 1024
+            ));
+        }
+        d.join(", ")
     }
 
     /// What a call must commit of its thread's stack for a `WHPTRACE`
@@ -441,13 +492,15 @@ pub(crate) mod trace {
         before: usize,
         hres: i32,
     ) {
-        note_exit(call, vp, names, values, before, hres, None);
+        note_exit(call, vp, names, values, before, hres, None, String::new);
     }
 
     /// [`note`] for `WHvRunVirtualProcessor`, with the exit reason it
     /// returned: which exit it is whose handling inside WHP commits a
-    /// vCPU thread's stack (a booted guest's, on a PC: 20 to 52 KiB in one
-    /// run call, 81f7970's traced boot).
+    /// vCPU thread's stack (a booted guest's, on a PC: 16 or 20 to 52 KiB
+    /// in one run call with exit reason 1, a memory access, 9af0b63's traced
+    /// boot). `detail` is made only for a call that is kept or printed.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn note_exit(
         call: &'static str,
         vp: u32,
@@ -456,37 +509,39 @@ pub(crate) mod trace {
         before: usize,
         hres: i32,
         exit: Option<i32>,
+        detail: impl FnOnce() -> String,
     ) {
         let after = stack();
         #[cfg(feature = "whp-trace")]
-        if after >= before + GREW {
-            let call = Call {
-                call,
-                vp,
-                names: names.to_vec(),
-                values: values.map(|v| v.iter().map(super::as_u64).collect()),
-                hres,
-                before,
-                after,
-                exit,
-            };
+        let print = after >= before + GREW;
+        #[cfg(not(feature = "whp-trace"))]
+        let print = false;
+        let keep = CALLS.with_borrow(Option::is_some);
+        if !print && !keep {
+            return;
+        }
+        let call = Call {
+            call,
+            vp,
+            names: names.to_vec(),
+            values: values.map(|v| v.iter().map(super::as_u64).collect()),
+            hres,
+            before,
+            after,
+            exit,
+            detail: detail(),
+        };
+        if print {
             let thread = std::thread::current();
             eprintln!("WHPTRACE thread '{}': {}", thread.name().unwrap_or("(unnamed)"), call.line());
         }
-        CALLS.with_borrow_mut(|calls| {
-            if let Some(calls) = calls {
-                calls.push(Call {
-                    call,
-                    vp,
-                    names: names.to_vec(),
-                    values: values.map(|v| v.iter().map(super::as_u64).collect()),
-                    hres,
-                    before,
-                    after,
-                    exit,
-                });
-            }
-        });
+        if keep {
+            CALLS.with_borrow_mut(|calls| {
+                if let Some(calls) = calls {
+                    calls.push(call);
+                }
+            });
+        }
     }
 }
 
