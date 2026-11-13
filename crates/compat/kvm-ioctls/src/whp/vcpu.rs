@@ -5286,7 +5286,11 @@ mod fpu_tests {
     /// WHP offers (`ExtendedVmExits`: its APIC write traps); this host's
     /// own CPUID (TSC-deadline and x2APIC in leaf 1, the hypervisor's
     /// frequency MSRs); and `WHvX64RegisterTscDeadline` read on the
-    /// partition.
+    /// partition. First, on an xAPIC partition: who answers a guest's
+    /// RDMSR and WRMSR of the x2APIC ID, EOI and LVT timer MSRs, with
+    /// APIC_BASE.EXTD clear and after the guest's write of EXTD came to the
+    /// backend through the `ApicBaseMsrWrite` exit (x2APIC mode kept by the
+    /// backend: the B plan's option C).
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_an_x2apic_partition_on_record() {
@@ -5308,6 +5312,83 @@ mod fpu_tests {
             for l in lapic_formats(&format!("xAPIC partition, requested, then run (run: {after})"), vcpu.part(), vcpu.vp()) {
                 eprintln!("X2APICREC {l}");
             }
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+        {
+            // Option C's question (x2APIC mode kept by the backend on an
+            // xAPIC partition): who answers a guest's x2APIC register MSRs
+            // there, with APIC_BASE.EXTD clear, and after the guest's write
+            // of EXTD came to the backend through the ApicBaseMsrWrite exit
+            // (WHV_X64_MSR_EXIT_BITMAP bit 3), which the backend takes
+            // without changing WHP's APIC_BASE.
+            let vm = super::super::VmFd::create().unwrap();
+            let m = guest();
+            probes(m);
+            let region = kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: MEM as u64,
+                userspace_addr: m as u64,
+            };
+            // SAFETY: the memory stays mapped while the VM has it.
+            unsafe { vm.set_user_memory_region(region) }.unwrap();
+            let mut vcpu = vm.create_vcpu(0).unwrap();
+            vcpu.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
+            start(&vcpu);
+            let mut s = vcpu.get_sregs().unwrap();
+            (s.idt.base, s.idt.limit) = (IDT, 16 * 14 - 1);
+            vcpu.set_sregs(&s).unwrap();
+            let came = || MSR_INTERCEPTS.with(std::cell::Cell::get);
+            // As `probe`, but an end other than done, #GP or #UD is printed,
+            // not a panic, so the records after it still run.
+            let msr = |vcpu: &mut VcpuFd, index: u32, write: Option<u64>| -> String {
+                let before = came();
+                let (at, rax, rdx) = match write {
+                    Some(v) => (WRMSR_AT, v & 0xFFFF_FFFF, v >> 32),
+                    None => (RDMSR_AT, 0, 0),
+                };
+                vcpu.set_regs(&kvm_regs { rip: at, rsp: 0x9000, rflags: 2, rax, rcx: u64::from(index), rdx, ..Default::default() }).unwrap();
+                let how = match run_to_a_line(vcpu).as_str() {
+                    "exit IoOut port 0x80" => "done".to_string(),
+                    "exit IoOut port 0x8d" => "#GP".to_string(),
+                    "exit IoOut port 0x86" => "#UD".to_string(),
+                    other => format!("ended by {other}"),
+                };
+                let r = vcpu.get_regs().unwrap();
+                let by = if came() > before { "the backend (an MSR exit)" } else { "WHP" };
+                match write {
+                    Some(v) => format!("WRMSR {index:#x} of {v:#x}: {how}, answered by {by}"),
+                    None => format!("RDMSR {index:#x}: {how}, {:#x}, answered by {by}", (r.rdx << 32) | (r.rax & 0xFFFF_FFFF)),
+                }
+            };
+            let x2apic_msrs = |vcpu: &mut VcpuFd, when: &str| {
+                for (index, write) in [(0x802u32, None), (0x80b, Some(0u64)), (0x832, None), (0x832, Some(0x1_0041u64))] {
+                    eprintln!("X2APICREC xAPIC partition, {when}: {}", msr(vcpu, index, write));
+                }
+            };
+            eprintln!("X2APICREC xAPIC partition: {}", msr(&mut vcpu, 0x1B, None));
+            x2apic_msrs(&mut vcpu, "EXTD clear");
+            let mut bitmap = 0u64;
+            let mut written = 0u32;
+            // SAFETY: a u64 output buffer of the size passed.
+            let got = unsafe {
+                whv::WHvGetPartitionProperty(vcpu.part(), whv::WHvPartitionPropertyCodeX64MsrExitBitmap, (&raw mut bitmap).cast(), 8, &mut written)
+            };
+            let with = bitmap | 1 << 3;
+            // SAFETY: a u64 property value.
+            let set = unsafe { super::super::ffi::set_partition_property(vcpu.part(), whv::WHvPartitionPropertyCodeX64MsrExitBitmap, &with) };
+            eprintln!(
+                "X2APICREC xAPIC partition: X64MsrExitBitmap read {:#010x} {bitmap:#x}, set with ApicBaseMsrWrite {with:#x}: {:?}",
+                got.cast_unsigned(),
+                set.map_err(|e| e.errno())
+            );
+            eprintln!("X2APICREC xAPIC partition: {}", msr(&mut vcpu, 0x1B, Some(0xFEE0_0D00)));
+            eprintln!("X2APICREC xAPIC partition, after: {}", msr(&mut vcpu, 0x1B, None));
+            x2apic_msrs(&mut vcpu, "EXTD written through the exit");
             drop(vcpu);
             drop(vm);
             // SAFETY: the test's mapping, no VM left using it.
