@@ -2829,6 +2829,10 @@ mod bp_tests {
                     eprintln!("BPTEST {name}: {line}");
                 }
                 let then = run_once(&mut vcpu);
+                // Each way's outcome is an exit (the handler's port, #BP or
+                // #DB to gdb, an internal error); no exit in 5 s measured
+                // nothing.
+                assert!(!then.contains("kicked"), "{name}: the second run came back only by the kick: {then}");
                 let rip = vcpu.get_regs().map(|r| r.rip);
                 eprintln!(
                     "BPTEST {name}: then {then}; handler ran {} time(s); pushed RIP {:#x}; RIP after {:?}",
@@ -3087,6 +3091,7 @@ mod fpu_tests {
         let back = set_on_record(&vcpu, "a vCPU that has not run", &fpu);
         assert_eq!((back.fcw, back.ftwx, back.fpr[0], back.xmm[3]), (0x27f, 1, ONE_AND_A_HALF, [0xA1; 16]), "KVM_GET_FPU reads what was written");
         let exit = run_once(&mut vcpu);
+        assert_eq!(exit, format!("exit IoOut port {PORT:#x}"), "a vCPU that has not run: the guest did not reach its end");
         let (fcw1, mxcsr1, xmm1, st1) = seen(m);
         eprintln!(
             "FPUTEST a vCPU that has not run: {exit}; its guest found control word {fcw1:#x}, MXCSR {mxcsr1:#x}, \
@@ -3112,6 +3117,7 @@ mod fpu_tests {
         put(m, FCW, &[0; 0x50]);
         again(&vcpu);
         let exit = run_once(&mut vcpu);
+        assert_eq!(exit, format!("exit IoOut port {PORT:#x}"), "a vCPU whose guest has used x87 and SSE: the guest did not reach its end");
         let (fcw2, mxcsr2, xmm2, st2) = seen(m);
         eprintln!(
             "FPUTEST a vCPU whose guest has used x87 and SSE (both in XSTATE_BV: {in_use}): {exit}; its guest \
@@ -3238,6 +3244,9 @@ mod fpu_tests {
             exits.push(line);
             if !more {
                 break;
+            }
+            if exits.len() == 12 {
+                exits.push("the cap of 12 exits reached".to_string());
             }
         }
         drop(watchdog);
@@ -3427,6 +3436,12 @@ mod fpu_tests {
                     eprintln!("STACKTIME {thread}, {name}: {}", step_time(&calls, took));
                     let mut wrong: Vec<String> =
                         calls.iter().filter(|c| c.hres != 0).map(|c| format!("{thread}, {name}: {}", c.line())).collect();
+                    // Every step ends at its `out 0x80`: one that did not
+                    // (kicked, its cap reached, another end) measured
+                    // nothing, and fails the test, printed record or not.
+                    if !what.ends_with(&format!("IoOut {PORT:#x}")) {
+                        wrong.push(format!("{thread}, {name}: the step did not reach its end: {what}"));
+                    }
                     if after > STACK_BOUND {
                         wrong.push(format!(
                             "{thread}, {name}: {} KiB of the stack committed, over {}",
@@ -4047,7 +4062,15 @@ mod fpu_tests {
     /// 0xEE). With `registers`, each exit also has the RIP and RFLAGS.RF
     /// that `KVM_GET_REGS` gives at it. At most 40 exits, and a kick 5 s
     /// after the first run began.
-    fn exits_with_their_bytes(vcpu: &mut VcpuFd, feed: &mut std::collections::VecDeque<Vec<u8>>, registers: bool) -> Vec<String> {
+    ///
+    /// A guest that does not reach its end (kicked, or its 40th exit not
+    /// the end) has measured nothing: the test fails, naming `step`.
+    fn exits_with_their_bytes(
+        vcpu: &mut VcpuFd,
+        feed: &mut std::collections::VecDeque<Vec<u8>>,
+        registers: bool,
+        step: &str,
+    ) -> Vec<String> {
         let watchdog = super::Watchdog::arm(vcpu);
         let mut answer = |data: &mut [u8]| {
             let given = feed.pop_front().unwrap_or_default();
@@ -4087,6 +4110,10 @@ mod fpu_tests {
         }
         drop(watchdog);
         vcpu.set_kvm_immediate_exit(0);
+        assert!(
+            exits.last().is_some_and(|l| l.starts_with("the end")),
+            "{step}: the guest did not reach its end within 40 exits: {exits:?}"
+        );
         exits
     }
 
@@ -4687,7 +4714,7 @@ mod fpu_tests {
 
         let mut feed: std::collections::VecDeque<Vec<u8>> =
             [vec![1, 2, 3], vec![0x44, 0x33, 0x22, 0x11], vec![9, 8], vec![0x5A]].into();
-        let exits = exits_with_their_bytes(&mut vcpu, &mut feed, false);
+        let exits = exits_with_their_bytes(&mut vcpu, &mut feed, false, "the string I/O and MOVSB with a device");
         let word = |at: u64| u64::from_le_bytes(bytes_at::<8>(m, at));
         let memory = format!(
             "after REP OUTSB RSI {:#x} RCX {:#x}; after REP INSB RDI {:#x} RCX {:#x}, memory {:02x?}; INSD {:02x?}; \
@@ -4719,12 +4746,12 @@ mod fpu_tests {
 
         // On record: the two REP MOVSB with a device.
         let mut feed: std::collections::VecDeque<Vec<u8>> = [vec![0xA1], vec![0xA2]].into();
-        let from_device = exits_with_their_bytes(&mut vcpu, &mut feed, false);
+        let from_device = exits_with_their_bytes(&mut vcpu, &mut feed, false, "REP MOVSB of 2 from a device to RAM");
         eprintln!(
             "STRTEST REP MOVSB of 2 from a device to RAM (device reads answered a1, then a2): exits {from_device:?}; memory {:02x?}",
             bytes_at::<2>(m, 0x8510)
         );
-        let to_device = exits_with_their_bytes(&mut vcpu, &mut feed, false);
+        let to_device = exits_with_their_bytes(&mut vcpu, &mut feed, false, "REP MOVSB of 2 from RAM to a device");
         eprintln!("STRTEST REP MOVSB of 2 (\"ab\") from RAM to a device: exits {to_device:?}");
 
         drop(vcpu);
@@ -4822,15 +4849,15 @@ mod fpu_tests {
 
         at(&vcpu, 0);
         let mut feed = std::collections::VecDeque::new();
-        let plain = exits_with_their_bytes(&mut vcpu, &mut feed, true);
+        let plain = exits_with_their_bytes(&mut vcpu, &mut feed, true, "REP OUT, REP OUTSB of 2, OUT, OUTSB");
         eprintln!("STRTEST REP OUT, REP OUTSB of 2, OUT, OUTSB: exits {plain:?}");
         at(&vcpu, 0x29);
-        let canonical = exits_with_their_bytes(&mut vcpu, &mut feed, false);
+        let canonical = exits_with_their_bytes(&mut vcpu, &mut feed, false, "OUTSB from a non-canonical RSI");
         let gp = format!("error code {:#x}, RIP pushed {:#x}", word(0x8700), word(0x8708));
         eprintln!("STRTEST OUTSB from a non-canonical RSI: exits {canonical:?}; #GP {gp}");
         at(&vcpu, 0x50);
         let mut feed: std::collections::VecDeque<Vec<u8>> = [(0x40..0x60).collect()].into();
-        let crossing = exits_with_their_bytes(&mut vcpu, &mut feed, false);
+        let crossing = exits_with_their_bytes(&mut vcpu, &mut feed, false, "REP INSW across into a page not present");
         let pf = format!(
             "error code {:#x}, CR2 {:#x}, RDI {:#x}, RCX {:#x}, first page {:02x?}",
             word(0x8710),
@@ -4932,15 +4959,20 @@ mod fpu_tests {
                 v.get_debug_regs().is_ok()
             )
         });
-        for name in [
-            "the vCPU's first run: cpuid, then a port write",
-            "a run to an MMIO read",
-            "a run that completes the MMIO read, to a port write",
-            "a run through a wrmsr of the kvm-clock wall clock, to a port write",
-            "a run to hlt with interrupts off, ended by a kick",
-            "a run of a halted vCPU, ended by a kick",
+        // Each run with the end it is for; any other fails the test.
+        for (name, end) in [
+            ("the vCPU's first run: cpuid, then a port write", "exit IoOut port 0x80"),
+            ("a run to an MMIO read", "exit MmioRead 0x600000"),
+            ("a run that completes the MMIO read, to a port write", "exit IoOut port 0x80"),
+            ("a run through a wrmsr of the kvm-clock wall clock, to a port write", "exit IoOut port 0x80"),
+            ("a run to hlt with interrupts off, ended by a kick", "no exit within 5 s (kicked)"),
+            ("a run of a halted vCPU, ended by a kick", "no exit within 5 s (kicked)"),
         ] {
-            on_a_thread_of_its_own(&mut vcpu, name, run_to_a_line);
+            on_a_thread_of_its_own(&mut vcpu, name, |v| {
+                let line = run_to_a_line(v);
+                assert_eq!(line, end, "{name}: not the end this run is for");
+                line
+            });
         }
 
         drop(vcpu);
@@ -4984,7 +5016,7 @@ mod fpu_tests {
             "exit IoOut port 0x80" => "done".to_string(),
             "exit IoOut port 0x8d" => "#GP".to_string(),
             "exit IoOut port 0x86" => "#UD".to_string(),
-            other => other.to_string(),
+            other => panic!("the probe at {at:#x} (RAX {rax:#x}, RCX {rcx:#x}, RDX {rdx:#x}) ended neither done nor by #GP or #UD: {other}"),
         };
         (how, vcpu.get_regs().unwrap())
     }
