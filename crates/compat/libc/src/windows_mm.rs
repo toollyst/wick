@@ -197,6 +197,21 @@ pub mod wick_mm {
         super::HOST_FAULTS.get()
     }
 
+    /// For a record only (kvm-ioctls' LAZYGRAIN): the lazy memory at
+    /// `[addr, addr + len)` commits `grain` bytes at a first access, an
+    /// aligned block clipped to its range, instead of [`super::LAZY_CHUNK`];
+    /// `grain` 0 removes the setting. `grain` is a power of two of at least
+    /// a page. Nothing else sets it, so no mapping of Firecracker's has one.
+    pub fn record_grain(addr: usize, len: usize, grain: usize) {
+        assert!(grain == 0 || (grain.is_power_of_two() && grain >= PAGE), "grain {grain:#x}");
+        let mut g = super::RECORD_GRAINS.lock().unwrap();
+        g.retain(|&(s, _, _)| s != addr);
+        if grain != 0 {
+            g.push((addr, len, grain));
+        }
+        super::RECORD_GRAINS_SET.store(!g.is_empty(), std::sync::atomic::Ordering::Release);
+    }
+
     /// Calls the [`deny_exec`] hook if `prot` asks for execution.
     pub(super) fn check_exec(prot: c_int) {
         if prot & PROT_EXEC == 0 {
@@ -751,6 +766,21 @@ static LAZY: Mutex<Vec<(usize, usize, PAGE_PROTECTION_FLAGS)>> = Mutex::new(Vec:
 /// rather than per page.
 const LAZY_CHUNK: usize = 64 << 10;
 
+/// A record's grains ([`wick_mm::record_grain`]): `(start, len, grain)`.
+static RECORD_GRAINS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+/// Whether [`RECORD_GRAINS`] has any: the commit's one look at it otherwise.
+static RECORD_GRAINS_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The block a first access to `addr` commits: [`LAZY_CHUNK`], or a
+/// record's grain there.
+fn lazy_chunk(addr: usize) -> usize {
+    if !RECORD_GRAINS_SET.load(std::sync::atomic::Ordering::Acquire) {
+        return LAZY_CHUNK;
+    }
+    let g = RECORD_GRAINS.lock().unwrap();
+    g.iter().find(|&&(s, n, _)| s <= addr && addr < s + n).map_or(LAZY_CHUNK, |&(_, _, grain)| grain)
+}
+
 /// The exit code of a VMM that reached its memory limit: what a shell shows
 /// for a process the Linux OOM killer ended (`128 + SIGKILL`).
 pub(crate) const OOM_EXIT: u32 = 137;
@@ -837,8 +867,9 @@ fn commit_on_access(addr: usize, write: bool) -> Access {
         let writable = matches!(prot, PAGE_READWRITE | PAGE_EXECUTE_READWRITE);
         return if write && !writable { Access::NotLazy } else { Access::Committed };
     }
-    let block = addr - addr % LAZY_CHUNK;
-    let (from, to) = (block.max(s), (block + LAZY_CHUNK).min(s + n));
+    let chunk = lazy_chunk(addr);
+    let block = addr - addr % chunk;
+    let (from, to) = (block.max(s), (block + chunk).min(s + n));
     if commit(from, to - from, prot, false) {
         return Access::Committed;
     }
@@ -2354,6 +2385,39 @@ mod tests {
         // SAFETY: our mapping.
         assert_eq!(unsafe { munmap(p as *mut c_void, len) }, 0);
         assert!(lazy_within(p, len).is_empty());
+    }
+
+    /// A record's grain (`wick_mm::record_grain`, for kvm-ioctls'
+    /// LAZYGRAIN) is the block a first access commits in its range only:
+    /// 4 KiB commits the page, 2 MiB the aligned 2 MiB clipped to the
+    /// mapping; the range beside it and the range after the setting is
+    /// removed commit `LAZY_CHUNK`.
+    #[test]
+    fn test_a_records_grain_is_what_a_first_access_commits() {
+        let _serial = serial();
+        let len = 8 << 20;
+        let p = map(0, len, PROT_READ | PROT_WRITE, ANON | MAP_NORESERVE, -1, 0);
+        let (small, large) = (p, p + (4 << 20));
+        wick_mm::record_grain(small, 2 << 20, PAGE);
+        wick_mm::record_grain(large, 4 << 20, 2 << 20);
+        assert_eq!(wick_mm::commit_on_access(small + 3 * PAGE, true), Access::Committed);
+        assert_eq!(committed(small, 2 << 20), PAGE);
+        // Beside the 4 KiB range: the default block.
+        assert_eq!(wick_mm::commit_on_access(p + (2 << 20), true), Access::Committed);
+        assert_eq!(committed(p + (2 << 20), 2 << 20), LAZY_CHUNK);
+        // The block around the access, aligned to 2 MiB in the address space.
+        let at = large + (1 << 20) + 5 * PAGE;
+        assert_eq!(wick_mm::commit_on_access(at, true), Access::Committed);
+        let block = at - at % (2 << 20);
+        let want = (block + (2 << 20)).min(p + len) - block.max(large);
+        assert_eq!(committed(large, 4 << 20), want);
+        wick_mm::record_grain(small, 0, 0);
+        wick_mm::record_grain(large, 0, 0);
+        assert!(!RECORD_GRAINS_SET.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(wick_mm::commit_on_access(small + (1 << 20), true), Access::Committed);
+        assert_eq!(committed(small, 2 << 20), PAGE + LAZY_CHUNK);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { munmap(p as *mut c_void, len) }, 0);
     }
 
     /// Anonymous private `MAP_NORESERVE` memory gets its pages at the first

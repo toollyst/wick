@@ -118,7 +118,12 @@
   how deep) and, for the deepest and the median thread of each kind, the
   return addresses on its stack's resident pages (module and offset, with
   the nearest symbol when `firecracker.pdb` is beside the binary, as in the
-  kit), so that the calls that reached deep are named:
+  kit), so that the calls that reached deep are named. VMMGUEST lines give
+  the guest's memory after the shell and after a guest's tmpfs work: what is
+  committed and resident, and the first accesses it took at today's 64 KiB
+  commit grain against what a 4 KiB or a 2 MiB grain would take (the 64 KiB
+  blocks, 4 KiB pages and 2 MiB ranges it is in); Linux's for the same guest
+  and work are `tools/linux/guest-ram-record.py`'s:
 
   ```
   python -I tools\windows\vmm-memory-record.py --boot C:\wbt lib\firecracker\build\cargo_target\release\firecracker.exe 1 2 16

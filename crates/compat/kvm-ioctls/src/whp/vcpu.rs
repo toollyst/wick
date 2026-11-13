@@ -3515,14 +3515,7 @@ mod fpu_tests {
             "the step {took:.1} us, {} run calls {in_runs:.1} us of it; first-chance exceptions within WHP calls: {raised}",
             runs.len()
         );
-        let lazy: Vec<(f64, f64)> = runs
-            .iter()
-            .filter(|(_, c)| c.exit == Some(whv::WHvRunVpExitReasonMemoryAccess) && !c.detail.contains("unmapped"))
-            .filter_map(|&(i, c)| {
-                let next = calls[i + 1..].iter().find_map(|n| n.began)?;
-                Some((c.micros()?, next.duration_since(c.ended).as_secs_f64() * 1e6))
-            })
-            .collect();
+        let lazy = lazy_exits(calls);
         if !lazy.is_empty() {
             let n = lazy.len() as f64;
             let (run, ours) = (lazy.iter().map(|l| l.0).sum::<f64>() / n, lazy.iter().map(|l| l.1).sum::<f64>() / n);
@@ -3537,12 +3530,28 @@ mod fpu_tests {
         line
     }
 
-    /// `WHvAdviseGpaRange(Populate)` for a write to the `size` bytes of
-    /// guest RAM at `gpa`, whose host memory is at `host`: its HRESULT, the
-    /// host memory's state before and after it (`VirtualQuery`), and the
-    /// process's commit charge (`PagefileUsage`) and working set before
-    /// and after.
-    fn populate_on_record(part: whv::WHV_PARTITION_HANDLE, host: usize, gpa: u64, size: u64) -> String {
+    /// The memory exits of mapped guest RAM (lazy RAM not yet committed)
+    /// among a thread's WHP `calls`: each one's run call and the backend's
+    /// time before the next run call (the commit), in microseconds.
+    fn lazy_exits(calls: &[super::super::ffi::trace::Call]) -> Vec<(f64, f64)> {
+        calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.micros().is_some()
+                    && c.exit == Some(whv::WHvRunVpExitReasonMemoryAccess)
+                    && !c.detail.contains("unmapped")
+            })
+            .filter_map(|(i, c)| {
+                let next = calls[i + 1..].iter().find_map(|n| n.began)?;
+                Some((c.micros()?, next.duration_since(c.ended).as_secs_f64() * 1e6))
+            })
+            .collect()
+    }
+
+    /// The process's commit charge (`PagefileUsage`, which the job's
+    /// memory limit counts) and working set, in bytes.
+    fn process_memory() -> Option<(usize, usize)> {
         #[repr(C)]
         #[derive(Default)]
         struct Counters {
@@ -3561,14 +3570,88 @@ mod fpu_tests {
         unsafe extern "system" {
             fn K32GetProcessMemoryInfo(process: windows_sys::Win32::Foundation::HANDLE, counters: *mut Counters, cb: u32) -> i32;
         }
-        let charge = || {
-            let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, ..Default::default() };
-            // SAFETY: an output buffer of the size given.
-            let ok = unsafe {
-                K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb)
-            };
-            if ok != 0 { Some((c.pagefile, c.working_set)) } else { None }
+        let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, ..Default::default() };
+        // SAFETY: an output buffer of the size given.
+        let ok =
+            unsafe { K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb) };
+        if ok != 0 { Some((c.pagefile, c.working_set)) } else { None }
+    }
+
+    /// The bytes of `[addr, addr + len)` that are committed (`VirtualQuery`).
+    fn committed_bytes(addr: usize, len: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+        let (mut at, end, mut total) = (addr, addr + len, 0);
+        while at < end {
+            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            if unsafe { VirtualQuery(at as *const _, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+                break;
+            }
+            let next = (mbi.BaseAddress as usize + mbi.RegionSize).min(end);
+            if mbi.State == MEM_COMMIT {
+                total += next - at;
+            }
+            at = next;
+        }
+        total
+    }
+
+    /// The 4 KiB pages of `[addr, addr + len)` in the process's working set
+    /// (`QueryWorkingSetEx`, the Valid bit): Linux's Rss of the range.
+    fn resident_bytes(addr: usize, len: usize) -> usize {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Entry {
+            address: usize,
+            attributes: usize,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn K32QueryWorkingSetEx(process: windows_sys::Win32::Foundation::HANDLE, info: *mut Entry, cb: u32) -> i32;
+        }
+        let mut entries: Vec<Entry> =
+            (0..len / 4096).map(|i| Entry { address: addr + i * 4096, attributes: 0 }).collect();
+        // SAFETY: a buffer of the entries given, each with its address set.
+        let ok = unsafe {
+            K32QueryWorkingSetEx(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                entries.as_mut_ptr(),
+                std::mem::size_of_val(entries.as_slice()) as u32,
+            )
         };
+        assert_ne!(ok, 0, "QueryWorkingSetEx: {}", std::io::Error::last_os_error());
+        entries.iter().filter(|e| e.attributes & 1 != 0).count() * 4096
+    }
+
+    /// `WHvAdviseGpaRange(Populate)` for a write, no flags, of the `size`
+    /// bytes of guest RAM at `gpa`: its HRESULT.
+    fn populate(part: whv::WHV_PARTITION_HANDLE, gpa: u64, size: u64) -> i32 {
+        let range = whv::WHV_MEMORY_RANGE_ENTRY { GuestAddress: gpa, SizeInBytes: size };
+        let advice = whv::WHV_ADVISE_GPA_RANGE_POPULATE {
+            Flags: whv::WHV_ADVISE_GPA_RANGE_POPULATE_FLAGS { AsUINT32: 0 },
+            AccessType: whv::WHvMemoryAccessWrite,
+        };
+        // SAFETY: one range and an advice buffer of the size given.
+        unsafe {
+            whv::WHvAdviseGpaRange(
+                part,
+                &range,
+                1,
+                whv::WHvAdviseGpaRangeCodePopulate,
+                (&raw const advice).cast(),
+                std::mem::size_of_val(&advice) as u32,
+            )
+        }
+    }
+
+    /// `WHvAdviseGpaRange(Populate)` for a write to the `size` bytes of
+    /// guest RAM at `gpa`, whose host memory is at `host`: its HRESULT, the
+    /// host memory's state before and after it (`VirtualQuery`), and the
+    /// process's commit charge (`PagefileUsage`) and working set before
+    /// and after.
+    fn populate_on_record(part: whv::WHV_PARTITION_HANDLE, host: usize, gpa: u64, size: u64) -> String {
+        let charge = process_memory;
         let state = || {
             // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
             let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -3584,22 +3667,7 @@ mod fpu_tests {
             }
         };
         let (was, charged) = (state(), charge());
-        let range = whv::WHV_MEMORY_RANGE_ENTRY { GuestAddress: gpa, SizeInBytes: size };
-        let advice = whv::WHV_ADVISE_GPA_RANGE_POPULATE {
-            Flags: whv::WHV_ADVISE_GPA_RANGE_POPULATE_FLAGS { AsUINT32: 0 },
-            AccessType: whv::WHvMemoryAccessWrite,
-        };
-        // SAFETY: one range and an advice buffer of the size given.
-        let hres = unsafe {
-            whv::WHvAdviseGpaRange(
-                part,
-                &range,
-                1,
-                whv::WHvAdviseGpaRangeCodePopulate,
-                (&raw const advice).cast(),
-                std::mem::size_of_val(&advice) as u32,
-            )
-        };
+        let hres = populate(part, gpa, size);
         let (now, after) = (state(), charge());
         let delta = match (charged, after) {
             (Some(a), Some(b)) => format!(
@@ -5495,6 +5563,240 @@ mod fpu_tests {
         assert_eq!(unsafe { libc::munmap(ram, LEN) }, 0);
         // SAFETY: as above.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
+    /// The record for the lazy-RAM grain (LAZYGRAIN lines; O4 of
+    /// lazy-ram-options.md): what guest RAM mapped as Firecracker maps it
+    /// (`MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`) is charged and
+    /// resident after the guest touches it, and what the exits cost, when
+    /// the backend commits 4 KiB, 64 KiB (today's `LAZY_CHUNK`) or 2 MiB at
+    /// a first access (`wick_mm::record_grain`, set on this test's mappings
+    /// only). Each grain has a slot of its own, 2 MiB aligned on the host as
+    /// a transparent huge page needs, and the guest's same two steps in it:
+    /// - sparse: one byte written in each 2 MiB of 64 MiB (32 writes);
+    /// - dense: a byte written in each 4 KiB page of the next 4 MiB (1024).
+    ///
+    /// After each: the slot's commit (`VirtualQuery`; the job's memory limit
+    /// counts commit) and its pages in the working set (`QueryWorkingSetEx`,
+    /// Linux's Rss), the process's commit and working set (with this
+    /// record's own allocations), the exits of guest RAM with each one's run
+    /// call and the backend's time after it, and the step's time. Linux's
+    /// numbers for the same guest addresses and steps are
+    /// tools/linux/guest-ram-grain.c's (LINUXGRAIN lines), under the THP
+    /// setting it prints. Then `WHvAdviseGpaRange(Populate)` of 2 MiB of
+    /// committed guest RAM nothing touched, 8 times: its own time and the
+    /// working set it adds (the option of a 2 MiB commit populated at once).
+    /// The guest's first lazy exit on the thread is a warm-up step of its
+    /// own (0.9 to 7.1 ms on a PC's application processors at f35e353).
+    /// Printed, not asserted, but for each step reaching its end.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_lazy_guest_ram_by_grain_on_record() {
+        const PROGRAM: u64 = 0xB000;
+        // A 2 MiB slot for the warm-up write.
+        const WARM: u64 = 0x80_0000;
+        const SLOT_LEN: usize = 68 << 20;
+        const DENSE_AT: u32 = 64 << 20;
+        const GRAINS: [(usize, u64); 3] = [(4 << 10, 0x200_0000), (64 << 10, 0x700_0000), (2 << 20, 0xC00_0000)];
+        const POPULATED: u64 = 0x1200_0000;
+        const POPULATED_LEN: usize = 16 << 20;
+        const MIB2: usize = 2 << 20;
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        // 2 MiB pages, identity mapped, from 8 MiB to the end of the last slot.
+        let mut gpa = WARM;
+        while gpa < POPULATED + POPULATED_LEN as u64 {
+            put(m, 0x3000 + (gpa >> 21) * 8, &(gpa | 0x83).to_le_bytes());
+            gpa += MIB2 as u64;
+        }
+        // mov edi, base; mov ecx, count; then a byte written at rdi and rdi
+        // moved by stride, count times; out 0x80, al.
+        let touch = |base: u32, count: u32, stride: u32| {
+            let mut b = vec![0xBF];
+            b.extend_from_slice(&base.to_le_bytes());
+            b.push(0xB9);
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&[0xC6, 0x07, 0x01, 0x81, 0xC7]); // mov byte [rdi], 1; add edi, stride
+            b.extend_from_slice(&stride.to_le_bytes());
+            b.extend_from_slice(&[0xFF, 0xC9, 0x75, 0xF3, 0xE6, PORT as u8]); // dec ecx; jnz to the mov; out
+            b
+        };
+        let mut program = touch(WARM as u32, 1, 0x1000);
+        for (_, base) in GRAINS {
+            program.extend(touch(base as u32, 32, MIB2 as u32));
+            program.extend(touch(base as u32 + DENSE_AT, 1024, 0x1000));
+        }
+        program.extend_from_slice(&[0xF4, 0xEB, 0xFD]);
+        put(m, PROGRAM, &program);
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: MEM as u64,
+                userspace_addr: m as u64,
+            })
+        }
+        .unwrap();
+        let lazy = |len: usize| {
+            // SAFETY: anonymous memory for the test, unmapped below.
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(p, libc::MAP_FAILED);
+            p as usize
+        };
+        let warm = lazy(MIB2);
+        // Each grain's mapping, 2 MiB more than its slot, which starts at
+        // the first 2 MiB boundary in it.
+        let maps: Vec<usize> = GRAINS.iter().map(|_| lazy(SLOT_LEN + MIB2)).collect();
+        let slots: Vec<usize> = maps.iter().map(|&p| p.next_multiple_of(MIB2)).collect();
+        // SAFETY: anonymous memory for the test (committed: no MAP_NORESERVE), unmapped below.
+        let populated = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                POPULATED_LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(populated, libc::MAP_FAILED);
+        let regions = [(WARM, warm, MIB2), (POPULATED, populated as usize, POPULATED_LEN)]
+            .into_iter()
+            .chain(GRAINS.iter().zip(&slots).map(|(&(_, gpa), &host)| (gpa, host, SLOT_LEN)));
+        for (slot, (gpa, host, len)) in (1..).zip(regions) {
+            // SAFETY: the memory stays mapped while the VM has it.
+            unsafe {
+                vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                    slot,
+                    flags: 0,
+                    guest_phys_addr: gpa,
+                    memory_size: len as u64,
+                    userspace_addr: host as u64,
+                })
+            }
+            .unwrap();
+        }
+        for (&(grain, _), &p) in GRAINS.iter().zip(&maps) {
+            libc::wick_mm::record_grain(p, SLOT_LEN + MIB2, grain);
+        }
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+
+        let mut lines = Vec::new();
+        let mut wrong = Vec::new();
+        // One step of the program, to its `out`: what it ended with, the
+        // lazy exits, and the step's time.
+        let mut step = |vcpu: &mut VcpuFd, name: &str| {
+            super::super::ffi::trace::begin();
+            let t = std::time::Instant::now();
+            let what = run_a_step(vcpu);
+            let took = t.elapsed().as_secs_f64() * 1e6;
+            let calls = super::super::ffi::trace::end();
+            if !what.ends_with(&format!("IoOut {PORT:#x}")) {
+                wrong.push(format!("{name}: the step did not reach its end: {what}"));
+            }
+            (lazy_exits(&calls), took)
+        };
+        let exits_text = |exits: &[(f64, f64)]| {
+            if exits.is_empty() {
+                return "no exits of guest RAM".to_string();
+            }
+            let n = exits.len() as f64;
+            format!(
+                "{} exits of guest RAM, each {:.1} us in its run call and {:.1} us in the backend after it",
+                exits.len(),
+                exits.iter().map(|e| e.0).sum::<f64>() / n,
+                exits.iter().map(|e| e.1).sum::<f64>() / n
+            )
+        };
+        let (exits, took) = step(&mut vcpu, "warm-up");
+        lines.push(format!("warm-up, the thread's first write to lazy guest RAM: {}; the step {took:.1} us", exits_text(&exits)));
+        for (&(grain, _), &slot) in GRAINS.iter().zip(&slots) {
+            let mut per_page = 0.0;
+            for (name, pages) in [
+                ("sparse, a byte in each 2 MiB of 64 MiB (32 writes)", 32.0),
+                ("dense, a byte in each 4 KiB page of 4 MiB (1024 writes)", 1024.0),
+            ] {
+                let before = process_memory();
+                let (exits, took) = step(&mut vcpu, name);
+                let after = process_memory();
+                let process = match (before, after) {
+                    (Some(a), Some(b)) => format!(
+                        "the process's commit {:+} KiB, working set {:+} KiB",
+                        (b.0 as i64 - a.0 as i64) / 1024,
+                        (b.1 as i64 - a.1 as i64) / 1024
+                    ),
+                    _ => "the process's counters not read".to_string(),
+                };
+                lines.push(format!(
+                    "grain {} KiB, {name}: {}; the step {took:.1} us, {:.2} us a write; the slot after it: committed {} KiB, \
+                     resident {} KiB; {process}",
+                    grain / 1024,
+                    exits_text(&exits),
+                    took / pages,
+                    committed_bytes(slot, SLOT_LEN) / 1024,
+                    resident_bytes(slot, SLOT_LEN) / 1024
+                ));
+                per_page = took / pages;
+            }
+            lines.push(format!(
+                "grain {} KiB: 256 MiB touched page by page, at the dense step's time a page: {:.0} ms, {} exits",
+                grain / 1024,
+                per_page * 65536.0 / 1000.0,
+                (256 << 20) / grain
+            ));
+        }
+        // Populate of committed guest RAM nothing touched, 2 MiB at a time.
+        let mut timed = Vec::new();
+        let mut added = Vec::new();
+        let mut results = std::collections::BTreeSet::new();
+        for i in 0..(POPULATED_LEN / MIB2) as u64 {
+            let host = populated as usize + i as usize * MIB2;
+            let was = resident_bytes(host, MIB2);
+            let t = std::time::Instant::now();
+            let hres = populate(vcpu.part(), POPULATED + i * MIB2 as u64, MIB2 as u64);
+            timed.push(t.elapsed().as_secs_f64() * 1e6);
+            added.push((resident_bytes(host, MIB2) - was) / 1024);
+            results.insert(format!("{:#010x}", hres.cast_unsigned()));
+        }
+        timed.sort_by(f64::total_cmp);
+        lines.push(format!(
+            "WHvAdviseGpaRange(Populate, a write) of 2 MiB of committed guest RAM nothing touched, {} times: HRESULT {results:?}; \
+             the call median {:.1} us (least {:.1}, most {:.1}); the range's working set after it {added:?} KiB",
+            timed.len(),
+            timed[timed.len() / 2],
+            timed[0],
+            timed[timed.len() - 1]
+        ));
+        for l in &lines {
+            eprintln!("LAZYGRAIN {l}");
+        }
+        drop(vcpu);
+        drop(vm);
+        for &p in &maps {
+            libc::wick_mm::record_grain(p, 0, 0);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(p as *mut _, SLOT_LEN + MIB2) }, 0);
+        }
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(libc::munmap(warm as *mut _, MIB2), 0);
+            assert_eq!(libc::munmap(populated, POPULATED_LEN), 0);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     // String port I/O and device memory with a second operand in RAM, as

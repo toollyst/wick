@@ -66,6 +66,17 @@ besides the VMMMEM lines:
               linker's map of the same build (link.exe /MAP), whose
               addresses are the image's
 
+  VMMGUEST    the guest's memory after the shell answered and again after
+              GUEST_WORK (a 32 MiB file and 32 sparse pages of tmpfs): what
+              is committed (the job's memory limit counts it) and resident
+              (Linux's Rss), and what the guest's first accesses would be at
+              each commit grain: the 64 KiB blocks committed (today's grain:
+              one first access each, a vCPU's exit or the VMM's own), the
+              4 KiB pages resident (a 4 KiB grain's) and the 2 MiB ranges
+              with any page committed (a 2 MiB grain's). Linux's figures for
+              the same guest and work are tools/linux/guest-ram-record.py's
+              (GUESTRAM lines)
+
 After the cases, VMMGROW lines say which allocations the per-vCPU growth is
 in: the allocations of each kind grouped by size (and mark), with their
 number and resident memory in the case with the fewest vCPUs and in the one
@@ -98,6 +109,13 @@ KERNEL_NAME, ROOTFS_NAME = "vmlinux-6.1.188", "ubuntu-24.04.squashfs"
 BOOT_ARGS = ("console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd "
              "root=/dev/vda ro rootfstype=squashfs init=/bin/sh")
 GUEST_MAC = "06:00:ac:10:00:02"
+# What the guest does before the second VMMGUEST line, word for word
+# tools/linux/guest-ram-record.py's GUEST_WORK: a 32 MiB tmpfs file and one
+# 4 KiB page at each 2 MiB of another, then a mark.
+GUEST_WORK = ("mount -t tmpfs tmpfs /tmp; dd if=/dev/zero of=/tmp/dense bs=1M count=32 2>/dev/null; i=0; "
+              "while [ $i -lt 32 ]; do dd if=/dev/zero of=/tmp/sparse bs=4096 count=1 seek=$((i*512)) "
+              "conv=notrunc 2>/dev/null; i=$((i+1)); done; echo WICK-$((6*7))-WORKED")
+GRANULE, HUGE = 64 << 10, 2 << 20
 THREAD_SUSPEND_RESUME, THREAD_GET_CONTEXT, THREAD_QUERY_LIMITED_INFORMATION = 0x2, 0x8, 0x800
 # CONTEXT on x86-64 (winnt.h): 1232 bytes, 16-byte aligned; ContextFlags at
 # 0x30, Rsp at 0x98, Rip at 0xF8. CONTEXT_CONTROL of CONTEXT_AMD64.
@@ -379,6 +397,63 @@ def measure(k32, psapi, ntdll, pid, system):
             kinds[what] += rss
             rows.append((rss, what, base, size, path))
         return kinds, rows, len(stacks), len(tebs)
+    finally:
+        k32.CloseHandle(handle)
+
+
+def grain_counts(committed, resident):
+    """What a guest's memory comes to by commit grain: `committed` its
+    committed (base, size) regions, `resident` the addresses of its pages in
+    the working set. The bytes committed and resident, the 64 KiB blocks
+    with a page committed, the 4 KiB pages resident and the 2 MiB ranges
+    with a page committed."""
+    blocks, ranges = set(), set()
+    for base, size in committed:
+        for at in range(base - base % GRANULE, base + size, GRANULE):
+            blocks.add(at)
+        for at in range(base - base % HUGE, base + size, HUGE):
+            ranges.add(at)
+    return {"committed": sum(size for _, size in committed), "resident": len(resident) * PAGE,
+            "blocks": len(blocks), "pages": len(resident), "ranges": len(ranges)}
+
+
+def guest_line(counts):
+    """A VMMGUEST line's text for `grain_counts`' result."""
+    return (f"committed {counts['committed'] // 1024} KiB, resident {counts['resident'] // 1024} KiB; first accesses "
+            f"by grain: 64 KiB blocks {counts['blocks']} (today), 4 KiB pages {counts['pages']}, "
+            f"2 MiB ranges {counts['ranges']}")
+
+
+def guest_memory(k32, psapi, pid):
+    """`grain_counts` of the process's guest memory (its allocations of
+    GUEST_MIB or more), or None when there is none."""
+    handle = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "OpenProcess")
+    try:
+        committed, mbi = [], MBI()
+        guest = [(alloc, size) for alloc, size, _kind, _path, _pages in allocations(k32, psapi, handle)
+                 if size >= GUEST_MIB << 20]
+        if not guest:
+            return None
+        for alloc, size in guest:
+            addr = alloc
+            while addr < alloc + size and k32.VirtualQueryEx(handle, ctypes.c_void_p(addr), ctypes.byref(mbi),
+                                                             ctypes.sizeof(mbi)):
+                base, length = mbi.BaseAddress or 0, mbi.RegionSize
+                if mbi.State == MEM_COMMIT:
+                    committed.append((base, length))
+                addr = base + length
+        resident = []
+        for base, size in committed:
+            for start in range(base, base + size, 4096 * PAGE):
+                n = min(4096, (base + size - start) // PAGE)
+                entries = (WSEX * n)()
+                for i in range(n):
+                    entries[i].VirtualAddress = start + i * PAGE
+                if psapi.QueryWorkingSetEx(handle, entries, ctypes.sizeof(entries)):
+                    resident += [e.VirtualAddress for e in entries if e.VirtualAttributes & WS_VALID]
+        return grain_counts(committed, resident)
     finally:
         k32.CloseHandle(handle)
 
@@ -994,11 +1069,20 @@ def run_boot_case(binds, firecracker, vcpus, work, system, kernel, rootfs, chain
         for rss, what, base, size, path in sorted(rows, reverse=True)[:12]:
             print(f"{tag}   {what:8} {base:#014x} size {size // 1024:8} KiB resident {rss // 1024:6} KiB"
                   f" {os.path.basename(path)}")
+        guest = guest_memory(binds[0], binds[1], proc.pid)
+        print(f"VMMGUEST boot vcpus={vcpus} after the shell: {guest_line(guest) if guest else 'no guest memory found'}")
         # Read before the stacks, whose walk can fail: the work directory
         # goes with this run, and with it Firecracker's output.
         reported = True
         reports_and_traces()
         record_stacks(binds, proc.pid, vcpus, rows, chains)
+        started = time.monotonic()
+        console.send(GUEST_WORK)
+        worked = console.wait(r"WICK-42-WORKED", 120)
+        took = time.monotonic() - started
+        guest = guest_memory(binds[0], binds[1], proc.pid) if worked else None
+        print(f"VMMGUEST boot vcpus={vcpus} after the work ({took:.1f} s): "
+              + (guest_line(guest) if guest else "the guest did not finish it" if not worked else "no guest memory found"))
         return kinds
     finally:
         # On every way out, a failure's included, if not read yet.
@@ -1091,6 +1175,15 @@ def selftest():
     assert symbols == [(0x1000, "_ZN3vmm7builder13build_microvm17h0123456789abcdefE"), (0x1340, "main")], symbols
     assert map_name(symbols, 0x1000).endswith("E+0x0") and map_name(symbols, 0x133f).endswith("E+0x33f")
     assert map_name(symbols, 0x2000) == "main+0xcc0" and map_name(symbols, 0xfff) == "" and parse_map("x") == []
+    # A guest's memory by grain: 64 KiB committed at 0, 128 KiB across a
+    # 2 MiB boundary (two blocks, two ranges), a page in a third range; two
+    # of their pages resident.
+    mib = 1 << 20
+    counts = grain_counts([(0, GRANULE), (2 * mib - GRANULE, 2 * GRANULE), (5 * mib, PAGE)], [0, 2 * mib])
+    assert counts == {"committed": 3 * GRANULE + PAGE, "resident": 2 * PAGE, "blocks": 4, "pages": 2, "ranges": 3}, counts
+    assert guest_line(counts) == ("committed 196 KiB, resident 8 KiB; first accesses by grain: 64 KiB blocks 4 (today), "
+                                  "4 KiB pages 2, 2 MiB ranges 3"), guest_line(counts)
+    assert "WICK-$((6*7))-WORKED" in GUEST_WORK and "WICK-42-WORKED" not in GUEST_WORK
     print("vmm-memory-record.py: selftest ok")
 
 
