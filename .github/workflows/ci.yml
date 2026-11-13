@@ -608,6 +608,7 @@ jobs:
           python -m pip install --quiet psutil==6.1.1
           python -I tools/windows/integration/selftest.py
           python -m py_compile tools/windows/integration/*.py
+          python -m py_compile tools/windows/vmm-memory-record.py
       # aws-lc-sys assembles its x86_64 code with NASM in release builds
       # (built from source rather than with its prebuilt objects).
       - name: Install NASM
@@ -716,6 +717,7 @@ jobs:
             tools/windows/jail-probe.exe
             tools/windows/job-freeze-probe.ps1
             tools/windows/memory-partition-probe.exe
+            tools/windows/vmm-memory-record.py
             tools/windows/README.md
           if-no-files-found: error
           retention-days: 14
@@ -814,6 +816,13 @@ jobs:
               failed=1
             fi
           done
+          # What Firecracker's own memory besides its guest's is made of with
+          # 1, 2 and 16 vCPUs (VMMMEM lines), against upstream's tests' 5 MiB
+          # for it: a microVM whose guest is the script's own `hlt` loop.
+          if ! python -I ../../tools/windows/vmm-memory-record.py build/cargo_target/release/firecracker.exe; then
+            echo "::error::vmm-memory-record.py did not finish"
+            failed=1
+          fi
           exit $failed
       # wick-os's standard input on a console (a hidden console of its own,
       # made for a child process): ignored in the crate step above so that a

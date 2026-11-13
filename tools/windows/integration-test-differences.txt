@@ -213,7 +213,10 @@ impossible integration_tests/functional/test_net.py::test_multi_queue_unsupporte
 # Firecracker's memory beyond its guest's goes just above the tests' 5 MiB
 # (5.0 to 5.6 MiB), most with 16 vCPUs: each vCPU adds about 58 KiB of heap
 # and 78 KiB of stack (measured with 1, 2 and 16 vCPUs and a network
-# interface: 3.4, 3.5, 5.6 MiB). The heap's share is not root-caused yet.
+# interface: 3.4, 3.5, 5.6 MiB). The heap's share is not root-caused yet:
+# tools/windows/vmm-memory-record.py prints what the memory is made of, by
+# kind and by allocation, for 1, 2 and 16 vCPUs (CI's windows job, VMMMEM
+# lines; not yet run).
 bug integration_tests/functional/test_cpu_all.py::test_all_vcpus_online
 bug integration_tests/functional/test_cpu_all.py::test_all_vcpus_have_same_features
 bug integration_tests/functional/test_cpu_features_x86_64.py::test_cpuid

@@ -63,6 +63,17 @@
   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir C:\wjt
   ```
 
+- `vmm-memory-record.py`: what Firecracker's own memory besides its guest's
+  is made of (its image's code and written pages, thread stacks, heaps, other
+  private memory, sections), counted as the integration tests' memory monitor
+  counts it, for a microVM with 1, 2 and 16 vCPUs whose guest is the script's
+  own `hlt` loop: no guest files, WHP only. A record (VMMMEM lines), for
+  upstream's 5 MiB budget; CI's windows job runs it:
+
+  ```
+  python -I tools\windows\vmm-memory-record.py <firecracker.exe> [vcpus ...]
+  ```
+
 CI builds the binaries on every push and uploads them as the artifact
 `wick-windows-x86_64-<commit>`: `lib/firecracker/build/cargo_target/release/firecracker.exe`,
 `snapshot-editor.exe`, `jailer.exe`, `rebase-snap.exe` and
@@ -72,7 +83,7 @@ feature, for the `gdb` stage),
 `lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe` (the
 vhost-user test backend), `winprobe.exe`, and in `tools/windows/`
 `boot-test.ps1`, `jailer-test.ps1` with `jail-probe.exe` built,
-`job-freeze-probe.ps1`, `memory-partition-probe.exe` and this file, at those
+`job-freeze-probe.ps1`, `memory-partition-probe.exe`, `vmm-memory-record.py` and this file, at those
 paths. The kit needs no Rust.
 
 ## Running it on a Windows PC
