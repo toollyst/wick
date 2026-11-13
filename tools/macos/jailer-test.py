@@ -1312,7 +1312,7 @@ def stage_hugepages(ctx):
 
     docs/PORTING.md row 10: macOS gives user space no superpage, so huge
     pages are host pages in Linux's hugetlb layout. There is no hugetlb pool
-    either (`hugetlb.2MB.max` is refused: `refuse`), so the jail's memory
+    either (a `hugetlb.2MB.max` number is refused: `refuse`), so the jail's memory
     limit is what limits a guest on huge pages: checked here, since on Linux
     the memory cgroup does not count hugetlb pages."""
     huge = {"huge_pages": "2M"}
