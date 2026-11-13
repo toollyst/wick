@@ -1421,7 +1421,32 @@ fn fill(
             Kind::Private { file: None }
         }
     } else if !shared {
-        // Private file mapping: a private copy of the file.
+        // Private file mapping: a private copy of the file, committed and
+        // read whole now, `MAP_NORESERVE` or not (a snapshot's memory file
+        // restored with the File backend: the whole guest charged and read
+        // at the load), where Linux charges by the page as it is touched
+        // (mm/filemap.c `filemap_fault`: the page cache's folio for a read,
+        // with read-around; mm/memory.c `do_cow_fault` for a write).
+        //
+        // Not filled by the page at its first access, as lazy anonymous
+        // memory is committed: there is no race-free way to fill private
+        // memory here. Committing a page makes it readable and writable to
+        // every thread and to WHP's second-level tables at once, before the
+        // file's bytes are in it, so another vCPU (whose access WHP then
+        // resolves without an exit) or a device thread can read zeros, or
+        // write what the fill then overwrites. Ruled out: committing it
+        // `PAGE_NOACCESS` and filling through the kernel (`ReadFile` into a
+        // page that is not accessible fails, as into one only reserved);
+        // `WriteProcessMemory` (kernel32 opens the page's protection while it
+        // copies); `PAGE_GUARD` (cleared by the filler's own first write);
+        // a second mapping to fill through (private memory has none; only a
+        // section does); AWE pages (`SeLockMemoryPrivilege`); and holding
+        // the vCPUs out of the guest during each fill (the device threads
+        // are left). A section filled through an alias and made accessible
+        // after, as `windows_uffd` fills registered memory, is race-free,
+        // but a Job Object does not charge sections (SECURITY.md, "memory.max
+        // does not bound memory in sections"): it waits for wick's own count
+        // of the section pages a process commits against `memory.max`.
         let file = dup(handle(fd)).map(Arc::new).ok_or(crate::EBADF)?;
         if !commit(base, len, PAGE_READWRITE, true) {
             return Err(crate::ENOMEM);

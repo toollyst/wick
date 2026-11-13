@@ -283,7 +283,9 @@ semantics on Win32. The details are in the comments of each
   Windows allocation, tracked in a table. So that partial `munmap` and
   `MAP_FIXED` behave as on Linux, reservations are placeholders
   (`VirtualAlloc2`), shared mappings are section views (`MapViewOfFile3`) and
-  private file mappings are filled from the file. `madvise(DONTNEED)`
+  private file mappings are committed and filled from the file whole when
+  mapped (a fill by the page is not race-free in private memory; see
+  `windows_mm::fill`). `madvise(DONTNEED)`
   discards private pages. File offsets not aligned to 64 KiB, shared mappings
   past EOF, `MAP_FIXED` over part of a view and `MAP_HUGETLB` fail with the
   Linux errno.
