@@ -9,7 +9,8 @@
 //!
 //! Each step is checked against a reference written from the Arm ARM
 //! (ESR_EL2; the AArch64 load and store semantics; the exception vector
-//! table) and the PSCI 0.2 function ids (DEN0022): the exit class,
+//! table) and the function ids of PSCI up to 1.1 (DEN0022), SMCCC, KVM's
+//! vendor services, PV time and the TRNG service (DEN0098): the exit class,
 //! the MMIO access (only 1, 2, 4 or 8 bytes, never past the 8-byte buffer;
 //! the bytes a store sends; the register value a load leaves, sign- or
 //! zero-extended into a W or X register), the debug registers' state after
@@ -170,6 +171,9 @@ fn step(s: &Step, debug: &mut DebugRegs, reference: &mut Reference) {
                 0x8400_0009 => Psci::SystemReset,
                 // PSCI 1.0, SMCCC 1.1 and KVM's vendor services (27d7cc5).
                 0x8400_000a => Psci::Features,
+                // PSCI 1.1 SYSTEM_RESET2 (include/uapi/linux/psci.h
+                // PSCI_1_1_FN_SYSTEM_RESET2 and its SMC64 form).
+                0x8400_0012 | 0xc400_0012 => Psci::SystemReset2,
                 0x8000_0000 => Psci::SmcccVersion,
                 0x8000_0001 => Psci::SmcccArchFeatures,
                 0x8600_ff01 => Psci::VendorHypUid,
@@ -178,6 +182,13 @@ fn step(s: &Step, debug: &mut DebugRegs, reference: &mut Reference) {
                 // PV time (Arm DEN0057A): SMC64 only.
                 0xc500_0020 => Psci::PvTimeFeatures,
                 0xc500_0021 => Psci::PvTimeSt,
+                // The SMCCC TRNG service (Arm DEN0098; include/linux/arm-smccc.h
+                // ARM_SMCCC_TRNG_*): RND64 is its one SMC64 call.
+                0x8400_0050 => Psci::TrngVersion,
+                0x8400_0051 => Psci::TrngFeatures,
+                0x8400_0052 => Psci::TrngGetUuid,
+                0x8400_0053 => Psci::TrngRnd32,
+                0xc400_0053 => Psci::TrngRnd64,
                 _ => Psci::NotSupported,
             };
             assert_eq!(Psci::decode(s.x0), want, "x0 {:#x}", s.x0);
