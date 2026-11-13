@@ -334,6 +334,10 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   64 MiB is charged after a full and a diff snapshot and after a restore
   from the full snapshot's file, anon and page cache (GUESTSNAP lines), as
   `vmm-memory-record.py --snapshot` prints Windows' (VMMSNAP lines).
+  With `--apic`, the same guest's LVT timer writes, `IA32_TSC_DEADLINE`
+  writes and the #GPs KVM gives it, counted by KVM's tracepoints for 1, 2
+  and 16 vCPUs (GUESTAPIC lines), for the Windows x2APIC choice. Each run
+  first prints the host's THP setting and each multi-size THP size's.
   Records: they print, and fail only when KVM or the guest does not get
   through.
 - Upstream tests left out on purpose: `test_licenses.py::test_for_valid_licenses`
