@@ -2333,9 +2333,43 @@ mod macos {
 
         // The sandbox is permanent, so it is tested in a child process
         // (the test binary itself, filtered to the child test below).
+        /// Processes a test started, killed and waited for when it is
+        /// dropped: at the test's end, or as a panic unwinds it.
+        struct Others(Vec<std::process::Child>);
+
+        impl Drop for Others {
+            fn drop(&mut self) {
+                for other in &mut self.0 {
+                    let _ = other.kill();
+                    let _ = other.wait();
+                }
+            }
+        }
+
+        /// How long a child test may run. Its cases take seconds at most
+        /// (16 at a time on a loaded host): one still running then is
+        /// blocked, and fails here instead of holding its test, and CI's
+        /// step, until the job's timeout (run 43442912128's macos-15
+        /// seatbelt job, cancelled in its sandbox tests with no log).
+        const CHILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+        /// Runs the ignored test `name` in a child process of its own with
+        /// `env`, at most [`CHILD_LIMIT`]. A child still running then is
+        /// sampled (`sample(1)`: each thread's stack), killed, and its test
+        /// fails with the stacks and the output it gave; a child whose
+        /// output stays open after its end (a process it started holds it)
+        /// fails too, after a short wait.
         fn child(name: &str, env: &[(&str, &str)]) -> std::process::Output {
+            child_within(name, env, CHILD_LIMIT)
+        }
+
+        /// [`child`], with its limit.
+        fn child_within(name: &str, env: &[(&str, &str)], limit: std::time::Duration) -> std::process::Output {
+            use std::io::Read;
+            use std::process::Stdio;
+            use std::sync::mpsc;
             let exe = std::env::current_exe().unwrap();
-            Command::new(exe)
+            let mut proc = Command::new(exe)
                 .args([
                     "--exact",
                     &format!("ext::sandbox::macos::tests::{name}"),
@@ -2343,8 +2377,135 @@ mod macos {
                     "--nocapture",
                 ])
                 .envs(env.iter().copied())
-                .output()
-                .unwrap()
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|e| panic!("{name} {env:?}: spawn: {e}"));
+            let pid = proc.id();
+            let read = |mut from: Box<dyn Read + Send>| {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let mut all = Vec::new();
+                    let _ = from.read_to_end(&mut all);
+                    let _ = tx.send(all);
+                });
+                rx
+            };
+            let stdout = read(Box::new(proc.stdout.take().unwrap()));
+            let stderr = read(Box::new(proc.stderr.take().unwrap()));
+            let (done_tx, done) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done_tx.send(proc.wait());
+            });
+            let status = match done.recv_timeout(limit) {
+                Ok(status) => status.unwrap(),
+                Err(_) => {
+                    let sample = Command::new("/usr/bin/sample")
+                        .args([&pid.to_string(), "1", "-mayDie"])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).split("Binary Images:").next().unwrap_or("").to_owned())
+                        .unwrap_or_else(|e| format!("sample: {e}"));
+                    // SAFETY: our child, which has not been waited for (the
+                    // waiting thread has not returned).
+                    unsafe { libc::kill(i32::try_from(pid).unwrap(), libc::SIGKILL) };
+                    let _ = done.recv();
+                    let out = |rx: mpsc::Receiver<Vec<u8>>| {
+                        String::from_utf8_lossy(&rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_default())
+                            .into_owned()
+                    };
+                    panic!(
+                        "{name} {env:?}: still running after {limit:?}, killed. Its threads:\n{sample}\n\
+                         --- stdout\n{}\n--- stderr\n{}",
+                        out(stdout),
+                        out(stderr)
+                    );
+                }
+            };
+            let end = |rx: mpsc::Receiver<Vec<u8>>, which: &str| {
+                rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
+                    panic!("{name} {env:?}: ended ({status:?}) and its {which} is still open 10 s on: a process it started holds it")
+                })
+            };
+            let stdout = end(stdout, "stdout");
+            let stderr = end(stderr, "stderr");
+            std::process::Output { status, stdout, stderr }
+        }
+
+        /// A panic's message.
+        fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> String {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                .unwrap_or_default()
+        }
+
+        // A child that blocks fails its test at the limit, with its
+        // threads' stacks, and is killed: it cannot hold the test (and CI's
+        // step) until the job's timeout.
+        #[test]
+        fn test_a_blocked_child_fails_with_its_stacks() {
+            let panic = std::panic::catch_unwind(|| {
+                child_within("blocked_child", &[("WICK_TEST_BLOCKED", "1")], std::time::Duration::from_secs(2))
+            })
+            .unwrap_err();
+            let text = panic_text(&panic);
+            assert!(text.contains("blocked_child") && text.contains("still running after 2s, killed"), "{text}");
+            assert!(text.contains("Call graph:"), "no stacks: {text}");
+            assert!(text.contains("BLOCKED-STARTED"), "not its output: {text}");
+        }
+
+        #[test]
+        #[ignore = "run by test_a_blocked_child_fails_with_its_stacks in a separate process"]
+        fn blocked_child() {
+            if std::env::var_os("WICK_TEST_BLOCKED").is_none() {
+                return;
+            }
+            println!("BLOCKED-STARTED");
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+
+        // A test's other processes are killed as its panic unwinds, not
+        // left running.
+        #[test]
+        fn test_others_are_killed_by_a_panic() {
+            let others = Others(vec![
+                Command::new("/bin/sleep")
+                    .arg("3600")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            ]);
+            let pid = i32::try_from(others.0[0].id()).unwrap();
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _others = others;
+                panic!("a test's failure");
+            }))
+            .unwrap_err();
+            assert_eq!(panic_text(&panic), "a test's failure");
+            // SAFETY: signal 0 only asks whether the pid exists.
+            let alive = unsafe { libc::kill(pid, 0) };
+            assert_eq!((alive, std::io::Error::last_os_error().raw_os_error()), (-1, Some(libc::ESRCH)));
+        }
+
+        // A terminal lock still held at the wait's end fails naming the
+        // processes that hold the file, instead of waiting on.
+        #[test]
+        fn test_a_held_terminal_lock_fails_naming_its_holders() {
+            let held = terminal_lock(TERMINAL_LOCK_WAIT);
+            let panic = std::panic::catch_unwind(|| terminal_lock(std::time::Duration::from_secs(1))).unwrap_err();
+            // SAFETY: the descriptor terminal_lock returned.
+            unsafe { libc::close(held) };
+            let text = panic_text(&panic);
+            assert!(text.contains("is still locked after 1s"), "{text}");
+            let me = format!(" {} ", std::process::id());
+            assert!(text.contains(&me), "this process is not named: {text}");
+            // Released: taken again at once.
+            // SAFETY: the descriptor terminal_lock returns.
+            unsafe { libc::close(terminal_lock(std::time::Duration::from_secs(1))) };
         }
 
         /// A child's exit status, output and error output, for an assertion's
@@ -4546,6 +4707,44 @@ mod macos {
             println!("CHILD-OK");
         }
 
+        /// The lock [`pty`]'s callers open their terminals under.
+        const TERMINAL_LOCK: &std::ffi::CStr = c"/tmp/wick-test-posix_openpt.lock";
+        /// How long [`pty`] waits for it: each holder holds it across one
+        /// posix_openpt.
+        const TERMINAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+        /// [`TERMINAL_LOCK`], taken: its descriptor, whose close releases
+        /// it. The kernel drops the lock with its holder's last descriptor
+        /// (flock(2)), so a holder's end, however it ends, frees it; it is
+        /// held across one posix_openpt, whose retries are bounded. A holder
+        /// that is stopped (SIGSTOP, a debugger) would hold it on, so the
+        /// wait ends at `wait`, failing with the processes that have the
+        /// file open (lsof).
+        fn terminal_lock(wait: std::time::Duration) -> libc::c_int {
+            let path = TERMINAL_LOCK;
+            // SAFETY: a NUL-terminated path; the descriptor is returned.
+            let lock = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o644) };
+            assert!(lock >= 0, "{path:?}: {}", std::io::Error::last_os_error());
+            let since = std::time::Instant::now();
+            // SAFETY: the descriptor opened above.
+            while unsafe { libc::flock(lock, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let err = std::io::Error::last_os_error();
+                assert_eq!(err.raw_os_error(), Some(libc::EWOULDBLOCK), "flock {path:?}: {err}");
+                if since.elapsed() >= wait {
+                    let holders = Command::new("/usr/sbin/lsof")
+                        .arg(path.to_str().unwrap())
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                        .unwrap_or_else(|e| format!("lsof: {e}"));
+                    // SAFETY: the descriptor opened above, not used after.
+                    unsafe { libc::close(lock) };
+                    panic!("{path:?} is still locked after {wait:?}; the processes with it open:\n{holders}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            lock
+        }
+
         /// A pseudo-terminal's controller, opened before the sandbox.
         fn pty() -> libc::c_int {
             // SAFETY: plain calls on a descriptor this function opens.
@@ -4571,13 +4770,7 @@ mod macos {
                 // run lost none and the kernel printed nothing. A process
                 // outside the tests opening a terminal at that moment can
                 // still race with one; that is XNU's, and fails below.
-                let lock = libc::open(
-                    c"/tmp/wick-test-posix_openpt.lock".as_ptr(),
-                    libc::O_RDONLY | libc::O_CREAT | libc::O_CLOEXEC,
-                    0o644,
-                );
-                assert!(lock >= 0, "the terminal lock: {}", std::io::Error::last_os_error());
-                assert_eq!(libc::flock(lock, libc::LOCK_EX), 0, "{}", std::io::Error::last_os_error());
+                let lock = terminal_lock(TERMINAL_LOCK_WAIT);
                 let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
                 let err = std::io::Error::last_os_error();
                 libc::close(lock);
@@ -5611,17 +5804,29 @@ mod macos {
                 }
             }
             // Another process for each case, which a lifted call may signal,
-            // stop or end: never this one. Killed below; long enough for the
-            // cases to run on a loaded host (a target gone before its case
-            // runs fails that case with ESRCH in place of the sandbox's
-            // answer).
-            let mut others: Vec<std::process::Child> = cases
-                .iter()
-                .map(|_| Command::new("/bin/sleep").arg("3600").spawn().unwrap())
-                .collect();
+            // stop or end: never this one. Long enough for the cases to run
+            // on a loaded host (a target gone before its case runs fails
+            // that case with ESRCH in place of the sandbox's answer); killed
+            // when `others` goes, by the test's end or its panic, and with
+            // none of this process's standard streams, so that one left
+            // behind cannot keep a reader of them (CI's step) waiting.
+            let others = Others(
+                cases
+                    .iter()
+                    .map(|_| {
+                        Command::new("/bin/sleep")
+                            .arg("3600")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                            .unwrap()
+                    })
+                    .collect(),
+            );
             let envs = cases
                 .iter()
-                .zip(&others)
+                .zip(&others.0)
                 .enumerate()
                 .map(|(i, ((name, _, lift, _), other))| {
                     let other = other.id().to_string();
@@ -5647,10 +5852,7 @@ mod macos {
                 })
                 .collect();
             let outs = children("unfiltered_child", envs);
-            for other in &mut others {
-                let _ = other.kill();
-                let _ = other.wait();
-            }
+            drop(others);
             // The POSIX shared memory objects and semaphores a case left.
             for i in 0..cases.len() {
                 let name = std::ffi::CString::new(ipc_name(i)).unwrap();
