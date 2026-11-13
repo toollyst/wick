@@ -543,10 +543,12 @@ mod macos {
     /// The rule for [`EXCEPTION_MIG_ROUTINES`], where Seatbelt knows the
     /// name, as for [`SETUP_MIG_ROUTINES_IF_DEFINED`]: a profile naming a
     /// routine its major's Seatbelt does not know does not compile at all.
-    /// Known on macOS 27 (`sandbox-exec`, `defined?`); on 15, where the
-    /// allowance matters, CI's macos-15 job shows it: there
-    /// `test_a_fault_is_its_signal_under_each_profile` fails if a fault still
-    /// ends by SIGSYS, the name being unknown or not the routine denied.
+    /// Known on macOS 27 (`sandbox-exec`, `defined?`) and on 15, where the
+    /// allowance matters: there `test_a_fault_is_its_signal_under_each_profile`
+    /// and the fault and trap cases of
+    /// `test_the_other_ends_are_unchanged_without_a_denied_call` pass with it
+    /// (CI run 43403250054, macos-15, 15.8.2), and would fail if a fault
+    /// still ended by SIGSYS, the name being unknown or not the routine denied.
     fn exception_rule() -> String {
         EXCEPTION_MIG_ROUTINES
             .iter()

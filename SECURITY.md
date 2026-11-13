@@ -97,7 +97,7 @@ kernels), and the only thread ports the VMM can name are its own threads', as no
 On macOS 15 and 26 neither is in the profile.
 
 Every profile, the API process's too, allows the kernel MIG routine `mach_exception_raise`, where Seatbelt knows the
-name (`defined?`; macOS 27's does). Firecracker never calls it: it is the message by which the kernel turns a
+name (`defined?`; macOS 15's and 27's do). Firecracker never calls it: it is the message by which the kernel turns a
 thread's fault or trap into SIGSEGV, SIGBUS or SIGTRAP. The kernel sends it itself, on the faulting thread, to the
 host's exception port, a kernel object (XNU osfmk/kern/exception.c `exception_triage_thread` and `exception_deliver`,
 with the behaviour bsd/uxkern/ux_handler.c `ux_handler_setup` gives the port, EXCEPTION_DEFAULT |
@@ -126,7 +126,9 @@ reaches no other process. The API process sends no Mach message at all (`mach_ms
 Measured on macOS 27.2: the process's own `mach_exception_raise` message to its task port, carrying its thread and
 task ports, is answered KERN_FAILURE and raises nothing, with or without a profile, and `task_get_exception_ports`
 raises SIGSYS in every profile (`test_an_exception_message_of_its_own_does_nothing`); a fault ends by its own signal
-in each profile (`test_a_fault_is_its_signal_under_each_profile`; on macOS 15 by CI's macos-seatbelt job only).
+in each profile (`test_a_fault_is_its_signal_under_each_profile`). On macOS 15.8.2 both tests, and the fault and
+trap cases of `test_the_other_ends_are_unchanged_without_a_denied_call`, pass with the allowance (CI run 43403250054,
+job `macos-seatbelt (macos-15)`, at 2ef0ff6), where those cases had ended 148 without it (run 43396747298).
 
 Every planned mechanism above has been measured on its host with a probe
 ([`tools/windows/winprobe.c`](tools/windows/winprobe.c) on Windows); the [roadmap](docs/ROADMAP.md), milestone M5,
