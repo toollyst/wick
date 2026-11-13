@@ -20,10 +20,12 @@
 //!   whose TSC is not invariant, where cycles are no measure of time
 //!   (Learn, `QueryThreadCycleTime`: "Do not attempt to convert the CPU
 //!   clock cycles ... to elapsed time" for CPUs that vary the timer's rate).
-//!   An invariant TSC does not make the thread's count TSC ticks: on a PC
-//!   (Ryzen 9 7900) the thread's clock read 1.32 x the TSC while spinning,
-//!   and the process's 1.01 x, so these clocks overstate CPU time there
-//!   (`test_cpu_cycle_counters_on_record` prints what each counter counts).
+//!   Both counters count at the TSC's rate while their thread runs and
+//!   never faster: on a PC (Ryzen 9 7900 under Hyper-V, 3393774) 0.994 to
+//!   0.999 x the TSC over 2 to 200 ms of spinning, idle or with 22 other
+//!   threads spinning, and less when the thread got less of the CPU
+//!   (0.72 x with 46 threads on 24 logical processors)
+//!   (`test_cpu_cycle_counters_on_record`, CPUCYCLEREC lines).
 //!
 //! A timerfd is a manual-reset, high-resolution waitable timer: signalled
 //! while expirations are waiting to be read, which is what `epoll` waits on.
@@ -138,16 +140,25 @@ fn filetime_100ns(ft: FILETIME) -> i64 {
 }
 
 /// The TSC and the performance counter read together: the TSC at the
-/// middle of the counter's read.
+/// middle of the counter's read, of the tightest of three reads (the least
+/// TSC between the two RDTSCs), so that a thread switch inside one read
+/// does not put the pair a time slice apart.
 fn tsc_and_counter() -> (u64, i64) {
-    // SAFETY: RDTSC has no preconditions.
-    let a = unsafe { core::arch::x86_64::_rdtsc() };
-    let mut q = 0;
-    // SAFETY: writes `q`.
-    unsafe { QueryPerformanceCounter(&mut q) };
-    // SAFETY: as above.
-    let b = unsafe { core::arch::x86_64::_rdtsc() };
-    (a + (b.wrapping_sub(a) / 2), q)
+    let mut best = (u64::MAX, 0u64, 0i64);
+    for _ in 0..3 {
+        // SAFETY: RDTSC has no preconditions.
+        let a = unsafe { core::arch::x86_64::_rdtsc() };
+        let mut q = 0;
+        // SAFETY: writes `q`.
+        unsafe { QueryPerformanceCounter(&mut q) };
+        // SAFETY: as above.
+        let b = unsafe { core::arch::x86_64::_rdtsc() };
+        let width = b.wrapping_sub(a);
+        if width < best.0 {
+            best = (width, a + width / 2, q);
+        }
+    }
+    (best.1, best.2)
 }
 
 /// [`tsc_and_counter`] at the process's start, before `main`
@@ -179,26 +190,42 @@ fn tsc_invariant() -> bool {
 }
 
 /// `cycles` of CPU time in nanoseconds at the TSC's rate, measured against
-/// the performance counter from the process's start ([`START`]) to now:
-/// the rate's error is a counter tick (100 ns) over that span, so the time's
-/// error is about that tick for each thread that ran, whatever the span
-/// (the time is at most the span for each thread).
-/// Should the start not have been read before `main`, the span is waited
-/// out to 1 ms once. `None` where the TSC is not invariant.
+/// the performance counter from the process's start ([`START`]) to now.
+///
+/// The error, whatever the span: over a span of `S` counter ticks (100 ns
+/// each where the counter runs at 10 MHz) the rate is the TSC's over the
+/// counter's, and the counter's count is off by at most one tick, so the
+/// rate is off by at most `1/S` of itself. A thread runs at most the whole
+/// span, `S` ticks, so its time is off by at most `S x 1/S`: one tick,
+/// 100 ns; the process's, with `N` threads that ran, by at most `N` ticks.
+/// Each TSC/counter pair adds the TSC between its two RDTSCs, halved
+/// ([`tsc_and_counter`] keeps the tightest of three). So no span need be
+/// waited out: only a span of at least one tick, which a read right after
+/// the start waits for (at most 100 ns). Before, a read in the first
+/// millisecond after the start waited the rest of it, spinning: Firecracker
+/// and the jailer read their start CPU time then, and that wait, up to
+/// 1 ms of CPU, was in `process_startup_time_cpu_us` (on a PC, 3393774:
+/// `test_cpu_clocks_count_what_runs_finely`'s first window read the thread
+/// clock 0.76 ms over its 2 ms of spinning, the process clock 0.02 ms).
+/// `None` where the TSC is not invariant.
 pub(crate) fn cpu_ns(cycles: u64) -> Option<i64> {
     if !tsc_invariant() {
         return None;
     }
     std::hint::black_box(&ANCHOR_AT_START);
+    cpu_ns_since(cycles, *START.get_or_init(tsc_and_counter))
+}
+
+/// [`cpu_ns`] with the rate measured from `start`.
+fn cpu_ns_since(cycles: u64, (t0, q0): (u64, i64)) -> Option<i64> {
     let freq = *COUNTER_HZ.get_or_init(|| {
         let mut f = 0;
         // SAFETY: writes `f`; cannot fail on Windows XP and later.
         unsafe { QueryPerformanceFrequency(&mut f) };
         f
     });
-    let (t0, q0) = *START.get_or_init(tsc_and_counter);
     let (mut t1, mut q1) = tsc_and_counter();
-    while i128::from(q1 - q0) * 1000 < i128::from(freq) {
+    while q1 <= q0 {
         std::hint::spin_loop();
         (t1, q1) = tsc_and_counter();
     }
@@ -675,7 +702,8 @@ mod tests {
     /// `GetThreadTimes` moves by a clock tick or not at all; 300 ms of spinning agrees with `GetThreadTimes` within
     /// two ticks and 5%; 100 ms asleep moves it by under a millisecond; the
     /// process's clock moves at least as much as the thread's. The TSC's
-    /// start was read before `main`. On a host whose TSC is not invariant
+    /// start was read before `main`, and a read right after a start takes
+    /// under 50 us (no wait for the rate's span). On a host whose TSC is not invariant
     /// the clocks are `GetProcessTimes`'s and the test says so.
     #[test]
     fn test_cpu_clocks_count_what_runs_finely() {
@@ -685,6 +713,23 @@ mod tests {
             return;
         }
         assert!(ANCHORED_AT_START.load(std::sync::atomic::Ordering::Relaxed), "the TSC's start was not read before main");
+        // A read right after the start waits for no more than a counter
+        // tick (before: the rest of a millisecond, spinning). The least of
+        // three fresh starts, so that a thread switch is not counted.
+        let first = (0..3)
+            .map(|_| {
+                let start = tsc_and_counter();
+                let at = std::time::Instant::now();
+                assert!(cpu_ns_since(1_000_000, start).is_some());
+                at.elapsed()
+            })
+            .min()
+            .unwrap();
+        eprintln!("CPUCLOCK a read right after the rate's start: {} ns", first.as_nanos());
+        assert!(first < Duration::from_micros(50), "a read right after the rate's start took {first:?}");
+        // Each clock read once before the windows: a window starts at a
+        // reading, never before a first one's own work.
+        let _ = (clock_ns(CLOCK_THREAD_CPUTIME_ID), clock_ns(CLOCK_PROCESS_CPUTIME_ID));
         let measure = |work: &dyn Fn()| {
             let (t, p, k, w) = (clock_ns(CLOCK_THREAD_CPUTIME_ID), clock_ns(CLOCK_PROCESS_CPUTIME_ID), thread_times_ns(), std::time::Instant::now());
             work();
@@ -787,10 +832,12 @@ mod tests {
 
     /// A record (CPUCYCLEREC lines) of what Windows' cycle counters count,
     /// for the CPU clocks, after a PC (Ryzen 9 7900, 4999ff6) read the
-    /// calling thread's `QueryThreadCycleTime` at 1.32 x the TSC over 2 ms
-    /// of spinning while `QueryProcessCycleTime` read 1.01 x: Learn says not
-    /// to convert those cycles to time ("some CPUs will vary the frequency
-    /// of the timer when changing the frequency at which the CPU runs").
+    /// thread's CPU clock at 1.32 x the wall over 2 ms of spinning while the
+    /// process's read 1.01 x (the cause was [`cpu_ns`]'s start-up wait, not
+    /// the counters: on that PC at 3393774 these lines showed both at the
+    /// TSC's rate); Learn says not to convert those cycles to time ("some
+    /// CPUs will vary the frequency of the timer when changing the
+    /// frequency at which the CPU runs").
     /// Printed: the host (CPU, hypervisor, its vendor and feature leaves);
     /// then for spins of 2, 20 and 200 ms on an otherwise idle process, the
     /// thread's cycles through its pseudo-handle and through a handle of its
