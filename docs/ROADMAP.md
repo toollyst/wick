@@ -113,7 +113,7 @@ machine. The vmm library and the firecracker binary build and link for
   refused inside an AppContainer (`E_ACCESSDENIED`) but works for a process on a restricted token below medium integrity
   that has no access to the user's files ([M5](#m5-security-parity-the-jailer-on-every-host)).
 - What the hardware runs found, each fixed and covered by its stage: the guest's CPUID (KVM's supported set, no
-  MWAIT or nested virtualisation; OSXSAVE, OSPKE and the XSAVE sizes from the vCPU's state at each CPUID exit; the TSC
+  MWAIT or nested virtualisation; no x2APIC while the partition's local APIC is an xAPIC, where KVM offers it on any host; OSXSAVE, OSPKE and the XSAVE sizes from the vCPU's state at each CPUID exit; the TSC
   deadline timer, which WHP's xAPIC lacks, now emulated as KVM does), the speculation-control MSRs, kvm-clock and KVM's hypercalls
   (the guest no longer calibrates its TSC against the PIT), one instruction emulator per vCPU thread (a shared one
   corrupted a 2 vCPU guest's memory), irqfds cleared through their eventfd, an epoll nested in another (the vsock

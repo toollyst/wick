@@ -933,6 +933,10 @@ pub(crate) fn supported_cpuid(num_entries: usize) -> Result<CpuId> {
     let mut leaves = crate::whp::regs::host_cpuid_entries();
     for e in &mut leaves {
         mask_unsupported(e);
+        // x2APIC as the partition's local APIC has it (`apicmode`).
+        if e.function == 1 {
+            e.ecx = super::apicmode::offered_leaf1_ecx(super::apicmode::PARTITION, e.ecx);
+        }
     }
     leaves.extend(kvm_leaves());
     if leaves.len() > num_entries {

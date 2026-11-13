@@ -28,6 +28,7 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+mod apicmode;
 pub mod cap;
 mod debug;
 mod emulate;

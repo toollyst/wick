@@ -542,8 +542,11 @@ fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
         // Microsoft Learn's Partition Property Data Types gives the property
         // and no rule for its entries (`test_msr_action_list_on_record`
         // prints which indices this host's set-up takes).
-        // Emulate the local APIC in WHP (xAPIC).
-        let apic_mode: i32 = whv::WHvX64LocalApicEmulationModeXApic;
+        // Emulate the local APIC in WHP, in the mode the guest's CPUID is
+        // made to agree with (`apicmode`: an xAPIC, so no x2APIC bit).
+        let apic_mode: i32 = match super::apicmode::PARTITION {
+            super::apicmode::LocalApic::XApic => whv::WHvX64LocalApicEmulationModeXApic,
+        };
         // SAFETY: an i32 property value for LocalApicEmulationMode.
         unsafe {
             ffi::set_partition_property(

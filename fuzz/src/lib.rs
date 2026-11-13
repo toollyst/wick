@@ -54,6 +54,13 @@ mod trng;
 #[path = "../../crates/compat/kvm-ioctls/src/whp/exit.rs"]
 pub mod whp_exit;
 
+/// The guest's CPUID x2APIC bit against the WHP partition's local APIC mode
+/// (`crates/compat/kvm-ioctls/src/whp/apicmode.rs`), compiled from its
+/// source (it uses nothing but `core`) so its tests run on every host.
+#[allow(unreachable_pub, dead_code)]
+#[path = "../../crates/compat/kvm-ioctls/src/whp/apicmode.rs"]
+pub mod whp_apicmode;
+
 /// KVM's TSC matching as the WHP backend decides it
 /// (`crates/compat/kvm-ioctls/src/whp/tscsync.rs`), compiled from its source
 /// (it uses nothing but `core`) so its tests run on every host.

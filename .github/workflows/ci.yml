@@ -623,8 +623,9 @@ jobs:
       # The decoding modules the targets compile from their sources
       # (fuzz/src/lib.rs: hvf/exit.rs, whp/exit.rs, ...) with their own
       # unit tests, on every host: the WHP run loop's MMIO read bookkeeping
-      # (whp_exit::tests) and the WHP backend's TSC matching
-      # (whp_tscsync::tests) are checked on Linux and macOS too.
+      # (whp_exit::tests), the WHP backend's TSC matching
+      # (whp_tscsync::tests) and its CPUID x2APIC rule (whp_apicmode::tests)
+      # are checked on Linux and macOS too.
       - name: The fuzzed modules' unit tests
         run: cargo test --manifest-path fuzz/Cargo.toml --lib
       - name: Fuzz each target for 60 seconds
@@ -1003,6 +1004,12 @@ jobs:
           # 0xfee00d00 (x2APIC) set in one call; each alone, CR4's bits
           # alone, both APIC modes, and the x2APIC bit of CPUID.
           alone whp::vcpu::fpu_tests::test_a_linux_guests_special_registers_on_record
+          # The guest's CPUID and the partition's xAPIC agree (X2APICTEST
+          # lines): no x2APIC in the supported CPUID, KVM_SET_CPUID2 of a
+          # table with it refused, and the guest's WRMSR of APIC_BASE with
+          # EXTD a #GP, as KVM's for a guest whose CPUID lacks the bit (run
+          # 43452122814: an Intel runner's guests offered x2APIC froze).
+          alone whp::vcpu::fpu_tests::test_a_guest_without_x2apic_in_its_cpuid_is_refused_x2apic_as_kvm
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # What each call of the backend commits of its thread's stack

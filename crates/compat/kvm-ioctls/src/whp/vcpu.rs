@@ -1167,9 +1167,26 @@ impl VcpuFd {
     /// partition's components after it is set up, at `KVM_CREATE_VM`
     /// (`xcr`). What a partition lets a guest enable is bounded by the
     /// host's own leaf 0xD; every XSAVE feature WHP offers is given to the
-    /// partition (`vm::configure`).
+    /// partition (`vm::configure`). Refused as well (`ENOTSUP`, the bit
+    /// named) when its leaf 1 offers x2APIC, which this partition's local
+    /// APIC, an xAPIC, does not have (`apicmode`): a Linux guest that is
+    /// offered it turns it on, ignores the refused APIC_BASE write and
+    /// drives an x2APIC that is not there.
     pub fn set_cpuid2(&self, cpuid: &CpuId) -> Result<()> {
         let table = cpuid.as_slice();
+        let leaf1 = table.iter().find(|e| e.function == 1).map(|e| e.ecx);
+        if super::apicmode::refuses_leaf1_ecx(super::apicmode::PARTITION, leaf1) {
+            super::ffi::report(
+                log::Level::Error,
+                "whp: KVM_SET_CPUID2 refused: the CPUID offers x2APIC (leaf 1 ECX bit 21), and this partition's local \
+                 APIC is an xAPIC (WHvX64LocalApicEmulationModeXApic), which refuses a guest's switch to x2APIC \
+                 (APIC_BASE bit 10): a Linux guest offered the bit turns x2APIC on all the same and its timer and \
+                 IPIs then reach no APIC. KVM emulates an x2APIC on any host; this backend offers none yet, so the \
+                 supported CPUID leaves the bit out and a table or CPU template that sets it, or a snapshot made on \
+                 KVM, is refused",
+            );
+            return err(libc::ENOTSUP);
+        }
         let leaf = table.iter().find(|e| e.function == 0xd && e.index == 0).map(|e| (e.eax, e.edx));
         let host = regs::host_xfeatures().0;
         let guest = super::xcr::guest_supported(leaf, host & super::xcr::KVM_SUPPORTED);
@@ -2222,6 +2239,11 @@ impl VcpuFd {
             (0x1, _) | (0x7, 0) => {
                 let cr4 = self.register(whv::WHvX64RegisterCr4)?;
                 ecx = super::exit::cpuid_ecx(function, index, ecx, cr4);
+                // A table without leaf 1 answers with WHP's default, the
+                // host's: its x2APIC bit is not the partition's either.
+                if function == 1 {
+                    ecx = super::apicmode::offered_leaf1_ecx(super::apicmode::PARTITION, ecx);
+                }
             }
             (0xd, 0) => {
                 let xcr0 = self.register(whv::WHvX64RegisterXCr0)?;
@@ -4614,6 +4636,107 @@ mod fpu_tests {
         drop(vm);
         // SAFETY: the test's mapping, no VM left using it.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
+    /// The guest's x2APIC as KVM's for a guest whose CPUID lacks it, the
+    /// only CPUID this backend's xAPIC partition keeps (`apicmode`; CI run
+    /// 43452122814, where an Intel runner's guests were offered x2APIC and
+    /// froze):
+    /// - the supported CPUID has no x2APIC (leaf 1 ECX bit 21);
+    /// - `KVM_SET_CPUID2` of a table with it is refused (`ENOTSUP`) and
+    ///   keeps nothing;
+    /// - with the supported table, and with a table that has no leaf 1
+    ///   (answered from WHP's default, the host's leaf), the guest's
+    ///   `CPUID` leaf 1 has no x2APIC either;
+    /// - the guest's `RDMSR` of APIC_BASE (0x1b) reads xAPIC mode, its
+    ///   `WRMSR` with EXTD (bit 10) set faults (#GP), as KVM's
+    ///   `kvm_set_apic_base` refuses a guest without the CPUID bit (Linux
+    ///   v6.1 arch/x86/kvm/x86.c:475-483: X2APIC_ENABLE reserved), and
+    ///   APIC_BASE reads as it was after it.
+    ///
+    /// The guest: a #GP handler that counts and steps over the 2-byte
+    /// instruction; `rdmsr`, the value kept; `or eax, 0x400; wrmsr`;
+    /// `rdmsr` again, kept; `cpuid` leaf 1, ECX kept; `out 0x80`.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_guest_without_x2apic_in_its_cpuid_is_refused_x2apic_as_kvm() {
+        const GP_HANDLER: u64 = 0xBA00;
+        const GP_COUNT: u64 = 0x7100;
+        const BASE_BEFORE: u64 = 0x7108;
+        const BASE_AFTER: u64 = 0x7110;
+        const LEAF1_ECX: u64 = 0x7118;
+        let x2apic = super::super::apicmode::LEAF1_ECX_X2APIC;
+        let supported = regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap();
+        let leaf1 = supported.as_slice().iter().find(|e| e.function == 1).map(|e| e.ecx).unwrap();
+        let host = core::arch::x86_64::__cpuid(1).ecx;
+        eprintln!(
+            "X2APICTEST leaf 1 ECX x2APIC: the host {}, the supported CPUID {}",
+            host & x2apic != 0,
+            leaf1 & x2apic != 0
+        );
+        assert_eq!(leaf1 & x2apic, 0, "the supported CPUID offers x2APIC on an xAPIC partition");
+        let leaf_d: Vec<_> = supported.as_slice().iter().filter(|e| e.function == 0xd).copied().collect();
+        let tables: [(&str, Vec<kvm_bindings::kvm_cpuid_entry2>); 2] =
+            [("the supported table", supported.as_slice().to_vec()), ("a table without leaf 1", leaf_d)];
+        for (name, table) in tables {
+            let a = |addr: u64| (addr as u32).to_le_bytes();
+            let mut program = vec![0xB9, 0x1B, 0x00, 0x00, 0x00, 0x0F, 0x32]; // mov ecx, 0x1b; rdmsr
+            program.extend([0x89, 0x04, 0x25]); // mov [BASE_BEFORE], eax
+            program.extend(a(BASE_BEFORE));
+            program.extend([0x89, 0x14, 0x25]); // mov [BASE_BEFORE + 4], edx
+            program.extend(a(BASE_BEFORE + 4));
+            program.extend([0x0D, 0x00, 0x04, 0x00, 0x00, 0x0F, 0x30]); // or eax, 0x400; wrmsr
+            program.extend([0x0F, 0x32, 0x89, 0x04, 0x25]); // rdmsr; mov [BASE_AFTER], eax
+            program.extend(a(BASE_AFTER));
+            program.extend([0x89, 0x14, 0x25]); // mov [BASE_AFTER + 4], edx
+            program.extend(a(BASE_AFTER + 4));
+            program.extend([0xB8, 0x01, 0x00, 0x00, 0x00, 0x31, 0xC9, 0x0F, 0xA2]); // mov eax, 1; xor ecx, ecx; cpuid
+            program.extend([0x89, 0x0C, 0x25]); // mov [LEAF1_ECX], ecx
+            program.extend(a(LEAF1_ECX));
+            program.extend([0xE6, PORT as u8, 0xEB, 0xFE]);
+            let (vm, mut vcpu, m) = mmio_guest(&program);
+            let mut handler = vec![0x48, 0x83, 0xC4, 0x08, 0x48, 0x83, 0x04, 0x24, 0x02, 0x48, 0xFF, 0x04, 0x25]; // add rsp, 8; add qword [rsp], 2; inc qword [GP_COUNT]
+            handler.extend(a(GP_COUNT));
+            handler.extend([0x48, 0xCF]); // iretq
+            put(m, GP_HANDLER, &handler);
+            let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
+            q(MMIO_IDT + 13 * 16, (GP_HANDLER & 0xffff) | (8 << 16) | (0x8E << 40));
+            q(MMIO_IDT + 13 * 16 + 8, 0);
+            let mut with = table.clone();
+            for e in with.iter_mut().filter(|e| e.function == 1) {
+                e.ecx |= x2apic;
+            }
+            if with.iter().any(|e| e.function == 1) {
+                let refused = vcpu.set_cpuid2(&CpuId::from_entries(&with).unwrap());
+                eprintln!("X2APICTEST {name} with x2APIC set: KVM_SET_CPUID2 {:?}", refused.as_ref().map_err(|e| e.errno()));
+                assert_eq!(refused.map_err(|e| e.errno()), Err(libc::ENOTSUP), "{name}: a CPUID with x2APIC was taken");
+                assert!(vcpu.get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap().as_slice().is_empty(), "the refused table was kept");
+            }
+            vcpu.set_cpuid2(&CpuId::from_entries(&table).unwrap()).unwrap();
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let mut reads = 0;
+            let mut exits = Vec::new();
+            while exits.len() < 10 && !exits.last().is_some_and(|e: &String| e.starts_with("out") || e.contains("fail") || e == "EINTR") {
+                exits.push(one_run(&mut vcpu, &[], &mut reads));
+            }
+            drop(watchdog);
+            let r = |at: u64| u64::from_le_bytes(bytes_at::<8>(m, at));
+            let (gp, before, after, ecx) = (r(GP_COUNT), r(BASE_BEFORE), r(BASE_AFTER), r(LEAF1_ECX) as u32);
+            eprintln!(
+                "X2APICTEST {name}: exits {exits:?}; APIC_BASE read {before:#x}; the WRMSR of {:#x}: {gp} #GP; APIC_BASE after it {after:#x}; the guest's leaf 1 ECX {ecx:#x} (x2APIC {})",
+                before | 0x400,
+                ecx & x2apic != 0
+            );
+            assert!(exits.last().is_some_and(|e| e.starts_with("out 0x80")), "{name}: the guest did not reach its end");
+            assert_eq!(before & 0xC00, 0x800, "{name}: APIC_BASE is not in xAPIC mode");
+            assert_eq!(gp, 1, "{name}: the guest's switch to x2APIC was not refused");
+            assert_eq!(after, before, "{name}: APIC_BASE changed");
+            assert_eq!(ecx & x2apic, 0, "{name}: the guest's CPUID offers x2APIC");
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
     }
 
     /// Record A of lazy-ram-options.md (COMMITTEST lines; no WHP): what
