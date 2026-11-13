@@ -202,10 +202,13 @@ For a fix release on the same upstream, raise it in `patches/version` in a
 commit of its own on `main` (`release: 1.18.0+wick.1`) and tag that commit
 with the same version, `v1.18.0+wick.1`. Pushing a tag runs the release workflow,
 which refuses a tag that is not exactly `v` + the version from those two
-files, runs the dependency checks, then builds and packages the macOS binary
-(`tools/package-release.sh`) and checks that it reports the tag. Hosted
-runners cannot run Hypervisor.framework guests, so run the L3 scenarios on a
-Mac before tagging.
+files, runs the dependency checks, then builds and packages the macOS binaries
+(`tools/package-release.sh`; which ones is `MACOS_RELEASE_BINS` in
+`tools/common.sh`, the one list) and checks from the unpacked archive that each
+reports the tag and has its signature. Hosted runners cannot run
+Hypervisor.framework guests, so run the L3 scenarios on a Mac before tagging,
+with the packaged binaries (boot-test.py's `--firecracker`, `--snapshot-editor`,
+`--rebase-snap` and `--cpu-template-helper`, and jailer-test.py's `--jailer`).
 
 A release has the archive, an SBOM, `SHA256SUMS` and signed build provenance
 ([SECURITY.md](SECURITY.md#verifying-a-release)). Each job of the workflow has

@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Checks and finishes the release SBOM that cargo-cyclonedx writes.
 
-    tools/sbom.py IN OUT ROOT CARGO_LOCK
+    tools/sbom.py IN OUT ROOT CARGO_LOCK [BINARY]
 
-IN is cargo-cyclonedx's CycloneDX JSON for the firecracker binary. Every
-component must be in CARGO_LOCK: a crates.io crate with the SHA-256 the
-lockfile records, a git crate at the commit it pins, a path crate inside ROOT
-(the wick checkout). OUT is IN with ROOT's absolute path, which only says
+IN is cargo-cyclonedx's CycloneDX JSON for BINARY (default firecracker),
+which it must describe. Every component must be in CARGO_LOCK: a crates.io
+crate with the SHA-256 the lockfile records, a git crate at the commit it
+pins, a path crate inside ROOT (the wick checkout). OUT is IN with ROOT's absolute path, which only says
 where the build ran, replaced by `wick`, so that the same commit gives the
 same SBOM on every machine. tools/package-release.sh runs it.
 """
@@ -37,6 +37,7 @@ def lock_packages(text):
 
 def main():
     src, dst, root, lock_path = sys.argv[1:5]
+    binary = sys.argv[5] if len(sys.argv) > 5 else "firecracker"
     root = str(Path(root).resolve())
     bom = json.loads(Path(src).read_text())
     lock = lock_packages(Path(lock_path).read_text())
@@ -45,8 +46,8 @@ def main():
     if bom.get("bomFormat") != "CycloneDX" or bom.get("specVersion") != "1.5":
         problems.append(f"not CycloneDX 1.5: {bom.get('bomFormat')} {bom.get('specVersion')}")
     main_component = bom.get("metadata", {}).get("component", {})
-    if main_component.get("name") != "firecracker":
-        problems.append(f"describes {main_component.get('name')!r}, not firecracker")
+    if main_component.get("name") != binary:
+        problems.append(f"describes {main_component.get('name')!r}, not {binary}")
     components = bom.get("components", [])
     if not components:
         problems.append("no components")

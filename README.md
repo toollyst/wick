@@ -93,7 +93,10 @@ tools/macos/run.sh --release -- --api-sock /tmp/firecracker.socket
 ```
 
 Or take a [release](https://github.com/toollyst/wick/releases) (none is tagged yet): `wick-<tag>-darwin-aarch64.tgz`
-holds the binary, ad hoc signed with that entitlement and not notarized. Fetched with curl it runs as it is:
+is in upstream's release layout, with `firecracker`, the jailer, `rebase-snap`, `snapshot-editor` and
+`cpu-template-helper`, the API specification and the aarch64 CPU template; not `seccompiler-bin` or the seccomp filter,
+as macOS has no seccomp-BPF ([`tools/package-release.sh`](tools/package-release.sh)). They are ad hoc signed, the two
+that create a VM with that entitlement, and not notarized. Fetched with curl they run as they are:
 
 ```sh
 curl -fLO https://github.com/toollyst/wick/releases/download/<tag>/wick-<tag>-darwin-aarch64.tgz

@@ -97,7 +97,7 @@ tools/patches.sh check                  # what CI checks about patches/
 | [`tools/windows/winprobe.c`](../tools/windows/winprobe.c) | Measures the Windows mechanisms the sandbox and jailer backends use |
 | [`tools/gen-windows-sources.sh`](../tools/gen-windows-sources.sh) | Generates the Windows builds of the rust-vmm crates (`--check` in CI) |
 | [`tools/gen-kvm-bindings-windows.sh`](../tools/gen-kvm-bindings-windows.sh) | Generates `kvm-bindings` with the Linux x86_64 layout for Windows (`--check` in CI) |
-| [`tools/package-release.sh`](../tools/package-release.sh) | Packages a macOS release in upstream's release layout, with its SBOM ([`tools/sbom.py`](../tools/sbom.py) checks it against `Cargo.lock`) |
+| [`tools/package-release.sh`](../tools/package-release.sh) | Packages a macOS release in upstream's release layout, with each binary's SBOM ([`tools/sbom.py`](../tools/sbom.py) checks it against `Cargo.lock`) |
 | [`tools/check-dependencies.sh`](../tools/check-dependencies.sh) | Dependency checks: advisories, licenses, banned and duplicate crates, sources ([CONTRIBUTING.md](../CONTRIBUTING.md#dependencies)) |
 | [`tools/fuzz.sh`](../tools/fuzz.sh) | Runs the fuzz targets in `fuzz/` for a given time each (`-t SECONDS`, `-j JOBS`) |
 

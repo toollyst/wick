@@ -45,6 +45,11 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
     outputs:
       base: ${{ steps.version.outputs.base }}
+      # MACOS_RELEASE_BINS and MACOS_RELEASE_HV_BINS (tools/common.sh), for
+      # the attestations (JSON) and the release notes.
+      bins: ${{ steps.version.outputs.bins }}
+      bins_text: ${{ steps.version.outputs.bins_text }}
+      hv_bins_text: ${{ steps.version.outputs.hv_bins_text }}
     steps:
       # fetch-depth 0 fetches every branch, origin/main included.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,7 +69,12 @@ jobs:
           version="$(wick_version)"
           [[ "$TAG" == "v$version" ]] \
             || { echo "::error::$TAG is not v$version (patches/base + patches/version)"; exit 1; }
-          echo "base=$(upstream_base)" >>"$GITHUB_OUTPUT"
+          {
+            echo "base=$(upstream_base)"
+            echo "bins=$(printf '%s\n' "${MACOS_RELEASE_BINS[@]}" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read().split()))')"
+            echo "bins_text=${MACOS_RELEASE_BINS[*]}"
+            echo "hv_bins_text=${MACOS_RELEASE_HV_BINS[*]}"
+          } >>"$GITHUB_OUTPUT"
       - name: Apply and check the patch series
         run: |
           tools/setup.sh
@@ -79,22 +89,35 @@ jobs:
         run: tools/check-dependencies.sh
       - name: Build, sign and package
         run: tools/package-release.sh "$TAG" dist
+      # From the archive, unpacked afresh: every binary of the list
+      # (tools/common.sh), its signature, the entitlement on exactly those
+      # that create a VM, its version, and its SBOM.
       - name: Verify the package
         run: |
+          source tools/common.sh
           cd dist
-          name="wick-$TAG-darwin-aarch64"
-          shasum -a 256 -c "$name.tgz.sha256.txt"
-          python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$name.cdx.json"
-          tar -xzf "$name.tgz"
-          bin="release-$TAG-darwin-aarch64/firecracker-$TAG-darwin-aarch64"
-          codesign --verify --strict "$bin"
-          codesign -d --entitlements - "$bin" 2>/dev/null | grep -q com.apple.security.hypervisor
-          reported="$("$bin" --version)"
-          echo "$reported"
-          reported="${reported%%$'\n'*}"
-          [[ "$reported" == "Firecracker $TAG" ]] \
-            || { echo "::error::the binary reports '$reported', not 'Firecracker $TAG'"; exit 1; }
-          rm -rf "release-$TAG-darwin-aarch64"
+          suffix="$TAG-darwin-aarch64"
+          shasum -a 256 -c "wick-$suffix.tgz.sha256.txt"
+          tar -xzf "wick-$suffix.tgz"
+          (cd "release-$suffix" && shasum -a 256 -c SHA256SUMS)
+          for bin in "${MACOS_RELEASE_BINS[@]}"; do
+            path="release-$suffix/$bin-$suffix"
+            codesign --verify --strict "$path"
+            if [[ " ${MACOS_RELEASE_HV_BINS[*]} " == *" $bin "* ]]; then
+              codesign -d --entitlements - "$path" 2>/dev/null | grep -q com.apple.security.hypervisor \
+                || { echo "::error::$bin has no hypervisor entitlement"; exit 1; }
+            elif codesign -d --entitlements - "$path" 2>/dev/null | grep -q com.apple.security; then
+              echo "::error::$bin has entitlements"; exit 1
+            fi
+            reported="$("$path" --version)"
+            reported="${reported%%$'\n'*}"
+            echo "$bin: $reported"
+            [[ "${reported##* }" == "$TAG" ]] \
+              || { echo "::error::$bin reports '$reported', not version $TAG"; exit 1; }
+            python3 -c 'import json, sys; assert json.load(open(sys.argv[1]))["metadata"]["component"]["name"] == sys.argv[2]' \
+              "$bin-$suffix.cdx.json" "$bin"
+          done
+          rm -rf "release-$suffix"
           ls -l
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -103,8 +126,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Signed SLSA build provenance and the SBOM, bound to the archive and to the
-  # binary in it (`gh attestation verify`), recorded for this repository.
+  # Signed SLSA build provenance, bound to the archive and to every binary in
+  # it, and each binary's SBOM, bound to the archive and to that binary
+  # (`gh attestation verify`), recorded for this repository. One job per
+  # binary of the build job's list, which is tools/common.sh's.
   attest:
     needs: darwin-aarch64
     runs-on: ubuntu-latest
@@ -112,6 +137,12 @@ jobs:
     permissions:
       id-token: write
       attestations: write
+    strategy:
+      fail-fast: true
+      matrix:
+        bin: ${{ fromJSON(needs.darwin-aarch64.outputs.bins) }}
+    env:
+      BIN: ${{ matrix.bin }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -120,25 +151,24 @@ jobs:
       - name: Check the archive and take out the binary
         run: |
           cd dist
-          name="wick-$TAG-darwin-aarch64"
-          sha256sum -c "$name.tgz.sha256.txt"
+          suffix="$TAG-darwin-aarch64"
+          sha256sum -c "wick-$suffix.tgz.sha256.txt"
           mkdir ../bin
-          tar -xzf "$name.tgz" -C ../bin --strip-components 1 \
-            "release-$TAG-darwin-aarch64/firecracker-$TAG-darwin-aarch64"
+          tar -xzf "wick-$suffix.tgz" -C ../bin --strip-components 1 "release-$suffix/$BIN-$suffix"
           ls -l ../bin
       - name: Build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/wick-${{ env.TAG }}-darwin-aarch64.tgz
-            bin/firecracker-${{ env.TAG }}-darwin-aarch64
+            bin/${{ matrix.bin }}-${{ env.TAG }}-darwin-aarch64
       - name: SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             dist/wick-${{ env.TAG }}-darwin-aarch64.tgz
-            bin/firecracker-${{ env.TAG }}-darwin-aarch64
-          sbom-path: dist/wick-${{ env.TAG }}-darwin-aarch64.cdx.json
+            bin/${{ matrix.bin }}-${{ env.TAG }}-darwin-aarch64
+          sbom-path: dist/${{ matrix.bin }}-${{ env.TAG }}-darwin-aarch64.cdx.json
 
   publish:
     needs: [darwin-aarch64, attest]
@@ -149,6 +179,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       BASE: ${{ needs.darwin-aarch64.outputs.base }}
+      BINS: ${{ needs.darwin-aarch64.outputs.bins_text }}
+      HV_BINS: ${{ needs.darwin-aarch64.outputs.hv_bins_text }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -166,12 +198,16 @@ jobs:
           name="wick-$TAG-darwin-aarch64"
           notes="wick $TAG, built from upstream Firecracker $BASE.
 
-          - $name.tgz: macOS 15+ on Apple silicon (Hypervisor.framework),
-            ad-hoc signed with the com.apple.security.hypervisor entitlement, not notarized.
+          - $name.tgz: macOS 15+ on Apple silicon (Hypervisor.framework). Upstream's release
+            layout: $BINS, the API specification, the aarch64 CPU template, LICENSE, NOTICE,
+            THIRD-PARTY and SHA256SUMS; not seccompiler-bin or the seccomp filter, as macOS
+            has no seccomp-BPF. Ad-hoc signed, $HV_BINS with the
+            com.apple.security.hypervisor entitlement; not notarized.
             A browser's download carries com.apple.quarantine, and tar copies it onto the
             files; if macOS refuses to run the binary, clear it: xattr -d com.apple.quarantine
             $name.tgz before extracting (README.md, \"Get started\").
-          - $name.cdx.json: the SBOM (CycloneDX 1.5), every crate the binary is built from.
+          - <binary>-$TAG-darwin-aarch64.cdx.json: each binary's SBOM (CycloneDX 1.5), every crate
+            it is built from.
           - SHA256SUMS: SHA-256 of every file. Check: shasum -a 256 -c SHA256SUMS
           - Build provenance and the SBOM are signed attestations of this repository's
             release workflow. Check: gh attestation verify $name.tgz --repo $GITHUB_REPOSITORY

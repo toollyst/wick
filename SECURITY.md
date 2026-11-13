@@ -27,10 +27,11 @@ Releases are built on GitHub-hosted runners by the release workflow
 ([CONTRIBUTING.md](CONTRIBUTING.md#dependencies)) pass. Next to each archive, a release has:
 
 - `SHA256SUMS`: the SHA-256 of every file in the release.
-- `wick-<tag>-<os>-<arch>.cdx.json`: the SBOM (CycloneDX 1.5), every crate the binary is built from, with the version
-  and the checksum or git commit `Cargo.lock` pins.
+- `<binary>-<tag>-<os>-<arch>.cdx.json`, one for each binary in the archive: its SBOM (CycloneDX 1.5), every crate it
+  is built from, with the version and the checksum or git commit `Cargo.lock` pins.
 - Attestations, signed through Sigstore by the workflow run that built the release and recorded for this repository:
-  SLSA build provenance and the SBOM, both for the archive and for the `firecracker` binary in it.
+  SLSA build provenance for the archive and for each binary in it, and each binary's SBOM for the archive and for
+  that binary.
 
 Check the files against `SHA256SUMS` (on Linux, `sha256sum -c SHA256SUMS`):
 
@@ -47,11 +48,12 @@ gh attestation verify wick-v1.18.0-darwin-aarch64.tgz --repo toollyst/wick \
     --source-ref refs/tags/v1.18.0 --deny-self-hosted-runners
 ```
 
-The same command works on the extracted binary (`release-v1.18.0-darwin-aarch64/firecracker-v1.18.0-darwin-aarch64`).
+The same command works on each extracted binary (`release-v1.18.0-darwin-aarch64/firecracker-v1.18.0-darwin-aarch64`,
+`jailer-v1.18.0-darwin-aarch64`, ...).
 `--predicate-type https://cyclonedx.org/bom` checks the SBOM attestation instead of the provenance, and
 `--format json` prints what was verified, including the commit the release was built from.
 
-The macOS binary carries only an ad-hoc code signature (it is not signed with an Apple Developer ID); the attestation
+The macOS binaries carry only an ad-hoc code signature (it is not signed with an Apple Developer ID); the attestation
 is what ties it to this repository.
 
 ## Threat model

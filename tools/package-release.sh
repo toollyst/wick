@@ -3,26 +3,37 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Package a macOS (Apple silicon) release of wick in the upstream
-# Firecracker release layout.
+# Firecracker release layout (lib/firecracker/tools/release.sh).
 #
 #   tools/package-release.sh <tag> [out-dir]      (default out-dir: dist)
 #
-# Produces, for tag T:
-#   <out>/wick-T-darwin-aarch64.tgz
-#       release-T-darwin-aarch64/firecracker-T-darwin-aarch64
-#           (release build, signed with the Hypervisor.framework entitlement)
-#       release-T-darwin-aarch64/LICENSE, NOTICE
-#   <out>/wick-T-darwin-aarch64.tgz.sha256.txt
-#       "<hex>  wick-T-darwin-aarch64.tgz"  (checked with `shasum -a 256 -c`)
-#   <out>/wick-T-darwin-aarch64.cdx.json
-#       the SBOM: CycloneDX 1.5, every crate the binary is built from on
+# Produces, for tag T and S = T-darwin-aarch64:
+#   <out>/wick-S.tgz, holding release-S/ with
+#       <bin>-S for each binary of MACOS_RELEASE_BINS (tools/common.sh):
+#           release builds; those of MACOS_RELEASE_HV_BINS signed with the
+#           Hypervisor.framework entitlement, the others ad hoc as the linker
+#           signs them; each reports "<name> T" (--version)
+#       firecracker_spec-T.yaml   the API specification (its version T's)
+#       <template>-T.json         MACOS_RELEASE_CPU_TEMPLATES
+#       LICENSE, NOTICE, THIRD-PARTY
+#       SHA256SUMS                every other file in release-S/
+#   <out>/wick-S.tgz.sha256.txt
+#       "<hex>  wick-S.tgz"  (checked with `shasum -a 256 -c`)
+#   <out>/<bin>-S.cdx.json for each binary
+#       its SBOM: CycloneDX 1.5, every crate it is built from on
 #       aarch64-apple-darwin, as Cargo.lock pins it (cargo-cyclonedx, the
 #       version in tools/common.sh)
+#
+# Left out of upstream's layout, as tools/common.sh says: seccompiler-bin and
+# the seccomp filter JSON (no seccomp-BPF on macOS), the x86_64 CPU templates,
+# and the .debug files: the binaries are Mach-O, with their symbols in them
+# (upstream's release profile, strip = "none"), and the release profile makes
+# no DWARF to split off.
 #
 # The build is `cargo build --locked` with upstream's toolchain
 # (lib/firecracker/rust-toolchain.toml).
 #
-# The binary needs macOS 15 or later on Apple silicon (hv_gic_*). The signature
+# The binaries need macOS 15 or later on Apple silicon (hv_gic_*). The signature
 # is ad hoc and not notarized. A copy downloaded by a browser carries
 # com.apple.quarantine, which tar copies onto what it extracts; one fetched with
 # curl does not. If macOS refuses to run it, `xattr -d com.apple.quarantine` on
@@ -39,7 +50,7 @@ out="${2:-dist}"
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] \
     || die "needs macOS on Apple silicon"
 
-# The tag must be the version the binary reports: the upstream release wick
+# The tag must be the version the binaries report: the upstream release wick
 # tracks (patches/base) and wick's number (patches/version).
 version="$(wick_version)"
 [[ "$tag" == "v$version" ]] \
@@ -50,33 +61,67 @@ cyclonedx="$(cargo-cyclonedx cyclonedx --version)"
 [[ "$cyclonedx" == *" $CARGO_CYCLONEDX_VERSION" ]] \
     || die "need cargo-cyclonedx $CARGO_CYCLONEDX_VERSION, found '$cyclonedx'"
 
-name="wick-$tag-darwin-aarch64"
-bin_name="firecracker-$tag-darwin-aarch64"
-dir="release-$tag-darwin-aarch64"
-target_dir="${CARGO_TARGET_DIR:-$ROOT/lib/firecracker/build/cargo_target}"
+suffix="$tag-darwin-aarch64"
+name="wick-$suffix"
+dir="release-$suffix"
+fc="$ROOT/lib/firecracker"
+target_dir="${CARGO_TARGET_DIR:-$fc/build/cargo_target}"
 
-# Build and sign (release profile).
-CARGO_TARGET_DIR="$target_dir" "$ROOT/tools/macos/run.sh" --build-only --release
+needs_hv() {
+    local b
+    for b in "${MACOS_RELEASE_HV_BINS[@]}"; do [[ "$b" == "$1" ]] && return 0; done
+    return 1
+}
 
-bin="$target_dir/release/firecracker"
-codesign -d --entitlements - "$bin" 2>/dev/null | grep -q com.apple.security.hypervisor \
-    || die "$bin is not signed with the hypervisor entitlement"
-# The first line of `--version` (not `| head`, which can cut the writer off).
-reported="$("$bin" --version)"
-reported="${reported%%$'\n'*}"
-[[ "$reported" == "Firecracker $tag" ]] \
-    || die "$bin reports '$reported', not 'Firecracker $tag'"
+# Build (release profile), and sign those that create a VM.
+packages=()
+for bin in "${MACOS_RELEASE_BINS[@]}"; do packages+=(-p "$bin"); done
+(cd "$fc" && CARGO_TARGET_DIR="$target_dir" MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}" \
+    cargo build --locked --release "${packages[@]}" --bins)
+for bin in "${MACOS_RELEASE_HV_BINS[@]}"; do
+    codesign --force --sign - --entitlements "$ROOT/tools/macos/hypervisor.entitlements" \
+        "$target_dir/release/$bin"
+done
+
+# Each binary: a valid signature, the entitlement exactly where it is needed,
+# and the tag as its version (the first line of `--version`, as upstream's
+# check_bin_artifact reads it; not `| head`, which can cut the writer off).
+check_bin() {
+    local path="$1" bin="$2" reported
+    codesign --verify --strict "$path" || die "$path: the signature does not verify"
+    if needs_hv "$bin"; then
+        codesign -d --entitlements - "$path" 2>/dev/null | grep -q com.apple.security.hypervisor \
+            || die "$path is not signed with the hypervisor entitlement"
+    elif codesign -d --entitlements - "$path" 2>/dev/null | grep -q com.apple.security; then
+        die "$path has entitlements; only ${MACOS_RELEASE_HV_BINS[*]} should"
+    fi
+    reported="$("$path" --version)"
+    reported="${reported%%$'\n'*}"
+    [[ "${reported##* }" == "$tag" ]] || die "$path reports '$reported', not version $tag"
+}
 
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
-fc="$ROOT/lib/firecracker"
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"; rm -f "$fc"/src/*/*_bin.cdx.json' EXIT
 mkdir "$stage/$dir"
-cp "$bin" "$stage/$dir/$bin_name"
-cp "$ROOT/LICENSE" "$ROOT/NOTICE" "$stage/$dir/"
-# The copy must keep the signature (it is embedded in the Mach-O).
-codesign --verify --strict "$stage/$dir/$bin_name" || die "signature broken by copy"
+for bin in "${MACOS_RELEASE_BINS[@]}"; do
+    check_bin "$target_dir/release/$bin" "$bin"
+    cp "$target_dir/release/$bin" "$stage/$dir/$bin-$suffix"
+    # The copy must keep the signature (it is embedded in the Mach-O).
+    check_bin "$stage/$dir/$bin-$suffix" "$bin"
+done
+spec="$fc/src/firecracker/swagger/firecracker.yaml"
+spec_version="$(sed -n 's/^  version: *//p' "$spec")"
+[[ "$tag" == "v$spec_version" || "$tag" == "v$spec_version+"* ]] \
+    || die "$spec is version $spec_version, not $tag's"
+cp "$spec" "$stage/$dir/firecracker_spec-$tag.yaml"
+for template in "${MACOS_RELEASE_CPU_TEMPLATES[@]}"; do
+    cp "$fc/tests/data/custom_cpu_templates/$template.json" "$stage/$dir/$template-$tag.json"
+done
+cp "$ROOT/LICENSE" "$ROOT/NOTICE" "$fc/THIRD-PARTY" "$stage/$dir/"
+(cd "$stage/$dir" && find . -type f -not -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort \
+    | xargs shasum -a 256 >SHA256SUMS && shasum -a 256 -c SHA256SUMS >/dev/null)
 
 # No AppleDouble (._*) files; owner and group normalised.
 (cd "$stage" && COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --uname root --gname wheel \
@@ -84,19 +129,21 @@ codesign --verify --strict "$stage/$dir/$bin_name" || die "signature broken by c
 (cd "$out" && shasum -a 256 "$name.tgz" >"$name.tgz.sha256.txt" \
     && shasum -a 256 -c "$name.tgz.sha256.txt" >/dev/null)
 
-# The SBOM, from Cargo.lock. cargo-cyclonedx writes one file per binary next
+# The SBOMs, from Cargo.lock. cargo-cyclonedx writes one file per binary next
 # to each package's manifest and has no --locked: the lockfile must come out
 # unchanged. The timestamp is the commit's (SOURCE_DATE_EPOCH); tools/sbom.py
 # checks every component against Cargo.lock.
 lock="$(shasum -a 256 "$fc/Cargo.lock")"
 rm -f "$fc"/src/*/*_bin.cdx.json
-(cd "$fc" && SOURCE_DATE_EPOCH="$(git -C "$ROOT" log -1 --format=%ct)" \
-    cargo cyclonedx -qq --manifest-path src/firecracker/Cargo.toml --describe binaries \
-        --target aarch64-apple-darwin --spec-version 1.5 --format json)
+for bin in "${MACOS_RELEASE_BINS[@]}"; do
+    (cd "$fc" && SOURCE_DATE_EPOCH="$(git -C "$ROOT" log -1 --format=%ct)" \
+        cargo cyclonedx -qq --manifest-path "src/$bin/Cargo.toml" --describe binaries \
+            --target aarch64-apple-darwin --spec-version 1.5 --format json)
+    python3 -I "$ROOT/tools/sbom.py" "$fc/src/$bin/${bin}_bin.cdx.json" "$out/$bin-$suffix.cdx.json" \
+        "$ROOT" "$fc/Cargo.lock" "$bin" || die "$bin's SBOM does not match Cargo.lock"
+done
 [[ "$(shasum -a 256 "$fc/Cargo.lock")" == "$lock" ]] || die "cargo-cyclonedx changed Cargo.lock"
-python3 -I "$ROOT/tools/sbom.py" "$fc/src/firecracker/firecracker_bin.cdx.json" "$out/$name.cdx.json" \
-    "$ROOT" "$fc/Cargo.lock" || die "the SBOM does not match Cargo.lock"
 
 echo "$out/$name.tgz"
 echo "$out/$name.tgz.sha256.txt"
-echo "$out/$name.cdx.json"
+for bin in "${MACOS_RELEASE_BINS[@]}"; do echo "$out/$bin-$suffix.cdx.json"; done

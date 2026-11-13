@@ -109,9 +109,23 @@ cargo_deny_version() {
     echo "$v"
 }
 
-# The cargo-cyclonedx version that writes the release SBOM
+# The cargo-cyclonedx version that writes the release SBOMs
 # (tools/package-release.sh).
 CARGO_CYCLONEDX_VERSION=0.5.9
+
+# What a macOS release holds: the one list tools/package-release.sh packages,
+# and .github/workflows/release.yml checks and attests. Upstream's release
+# (lib/firecracker/tools/release.sh, ARTIFACTS and CPU_TEMPLATES) less what
+# cannot work on macOS: seccompiler-bin and the seccomp filter JSON (no
+# seccomp-BPF or libseccomp; docs/COMPATIBILITY.md, `seccompiler-bin` and
+# `--seccomp-filter FILE`), and upstream's x86_64 CPU templates (C3, T2, T2S,
+# T2CL, T2A). Each binary is in the package of the same name under
+# lib/firecracker/src.
+MACOS_RELEASE_BINS=(firecracker jailer rebase-snap snapshot-editor cpu-template-helper)
+# Those that create a VM, signed with the Hypervisor.framework entitlement.
+MACOS_RELEASE_HV_BINS=(firecracker cpu-template-helper)
+# lib/firecracker/tests/data/custom_cpu_templates/<name>.json
+MACOS_RELEASE_CPU_TEMPLATES=(V1N1)
 
 # Before a test run: removes what earlier runs left behind (tools/clean.sh:
 # old runs, stray test processes, temporary directories), then fails unless
