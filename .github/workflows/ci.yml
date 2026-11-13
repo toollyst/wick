@@ -1028,6 +1028,11 @@ jobs:
           # vCPU runs fails.
           alone whp::vcpu::fpu_tests::test_tsc_matching_and_partition_time_on_record
           alone whp::vcpu::fpu_tests::test_restored_vcpus_take_one_tsc_offset_as_kvm
+          # TSC_ADJUST offered to the guest as KVM offers it (TSCADJREC
+          # lines): the CPUID bit in the host, the table and the guest; the
+          # guest's RDMSR/WRMSR of 0x3b and how far a write moves its TSC;
+          # the guest's WRMSR of IA32_TSC and TSC_ADJUST after it.
+          alone whp::vcpu::fpu_tests::test_tsc_adjust_offered_to_the_guest_on_record
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
           alone windows_fd::tests::test_non_blocking_pipe_writes_on_record

@@ -5622,6 +5622,88 @@ mod fpu_tests {
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
     }
 
+    /// A record (TSCADJREC lines) for offering `TSC_ADJUST` to the guest as
+    /// KVM does (Linux v6.1 cpuid.c:648-649 sets CPUID.7.0:EBX bit 1 on every
+    /// host; upstream's tests expect it in the guest, test_cpu_features_*):
+    /// the bit in the host's CPUID, in the supported table and in what the
+    /// guest's CPUID returns with the bit offered; the guest's RDMSR and
+    /// WRMSR of 0x3b (done or #GP, and whether the backend answered), and by
+    /// how much a write moved the vCPU's TSC against vCPU 1's (KVM: by the
+    /// change, exactly, `adjust_tsc_offset_guest`); the guest's WRMSR of
+    /// IA32_TSC, whether the backend sees it, and what TSC_ADJUST reads
+    /// after (KVM adds the change to it, x86.c:3664-3667); KVM_GET_MSRS of
+    /// 0x3b after. Printed, not asserted, but for each step's end.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_tsc_adjust_offered_to_the_guest_on_record() {
+        use core::arch::x86_64::__cpuid_count;
+        let mut lines = Vec::new();
+        let m = guest();
+        probes(m);
+        let (vm, mut v0, v1) = two_vcpus(m);
+        let part = v0.part();
+        let supported = regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap();
+        let bit = |ebx: u32| ebx & (1 << 1) != 0;
+        let offered = supported.as_slice().iter().find(|e| e.function == 7 && e.index == 0).map(|e| bit(e.ebx));
+        lines.push(format!(
+            "host CPUID.7.0:EBX[1] {}; in the supported table {offered:?}; the partition keeps IA32_TSC_ADJUST: {}",
+            bit(__cpuid_count(7, 0).ebx),
+            !regs::software_msr(regs::MSR_IA32_TSC_ADJUST)
+        ));
+        let mut table = supported.as_slice().to_vec();
+        for e in table.iter_mut().filter(|e| e.function == 7 && e.index == 0) {
+            e.ebx |= 1 << 1;
+        }
+        v0.set_cpuid2(&CpuId::from_entries(&table).unwrap()).unwrap();
+        start(&v0);
+        let mut s = v0.get_sregs().unwrap();
+        (s.idt.base, s.idt.limit) = (IDT, 16 * 14 - 1);
+        v0.set_sregs(&s).unwrap();
+        let (how, r) = probe(&mut v0, CPUID_AT, 7, 0, 0);
+        lines.push(format!("the guest's CPUID.7.0 with the bit offered: {how}, EBX[1] {}", bit(r.rbx as u32)));
+        let came = || MSR_INTERCEPTS.with(std::cell::Cell::get);
+        let msr = |v0: &mut VcpuFd, what: &str, index: u32, write: Option<u64>| -> (String, u64) {
+            let before = came();
+            let (how, r) = match write {
+                Some(v) => probe(v0, WRMSR_AT, v & 0xFFFF_FFFF, u64::from(index), v >> 32),
+                None => probe(v0, RDMSR_AT, 0, u64::from(index), 0),
+            };
+            let by = if came() > before { "the backend" } else { "WHP" };
+            let value = (r.rdx << 32) | (r.rax & 0xFFFF_FFFF);
+            let line = match write {
+                Some(v) => format!("WRMSR {index:#x} ({what}) of {v:#x}: {how}, answered by {by}"),
+                None => format!("RDMSR {index:#x} ({what}): {how}, {value:#x}, answered by {by}"),
+            };
+            (line, value)
+        };
+        let (l, adjust) = msr(&mut v0, "TSC_ADJUST", 0x3B, None);
+        lines.push(l);
+        let before = tsc_skew(part);
+        let by = 0x10_0000u64;
+        let (l, _) = msr(&mut v0, "TSC_ADJUST", 0x3B, Some(adjust.wrapping_add(by)));
+        lines.push(l);
+        let after = tsc_skew(part);
+        lines.push(format!(
+            "vCPU 0's TSC against vCPU 1's: {before:?} before, {after:?} after (skew, read gap); moved by {} for {by} written (KVM: exactly)",
+            before.0 - after.0
+        ));
+        lines.push(msr(&mut v0, "TSC_ADJUST", 0x3B, None).0);
+        let (l, tsc) = msr(&mut v0, "TSC", 0x10, None);
+        lines.push(l);
+        let target = tsc.wrapping_add(0x1000_0000);
+        lines.push(msr(&mut v0, "TSC", 0x10, Some(target)).0);
+        lines.push(format!("{} (KVM: the earlier value plus the change, about 0x1000_0000)", msr(&mut v0, "TSC_ADJUST after the guest's TSC write", 0x3B, None).0));
+        let mut host = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry { index: 0x3B, ..Default::default() }]).unwrap();
+        let n = v0.get_msrs(&mut host).unwrap();
+        lines.push(format!("KVM_GET_MSRS of 0x3b: {n} entries, {:#x}", host.as_slice()[0].data));
+        for l in &lines {
+            eprintln!("TSCADJREC {l}");
+        }
+        drop((v0, v1, vm));
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
     /// KVM's TSC matching on WHP: after a boot's writes of 0 and a restore's
     /// writes of each vCPU's saved TSC, saved at different moments and
     /// written 300 us apart, both vCPUs' TSCs are one offset from the
