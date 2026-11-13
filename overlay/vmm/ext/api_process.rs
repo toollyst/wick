@@ -646,6 +646,10 @@ mod macos {
             return Err(ApiProcessError::Threads(n));
         }
         let (ours, theirs) = UnixStream::pair().map_err(ApiProcessError::Link)?;
+        // Firecracker's pid, for the API process to end with it: taken here,
+        // before the fork (`end_with_firecracker`).
+        // SAFETY: no arguments.
+        let firecracker = unsafe { libc::getpid() };
         // SAFETY: one thread (checked above), so the child is a whole copy.
         match unsafe { libc::fork() } {
             -1 => Err(ApiProcessError::Fork(std::io::Error::last_os_error())),
@@ -668,7 +672,7 @@ mod macos {
                             .add_kill_switch(kill_switch)
                             .map_err(|e| ApiProcessError::Message(format!("{e:?}")))
                     });
-                exit(result.and_then(|()| serve(&mut server, theirs, payload_limit)))
+                exit(result.and_then(|()| serve(&mut server, theirs, payload_limit, firecracker)))
             }
             child => {
                 drop(theirs);
@@ -682,7 +686,9 @@ mod macos {
 
     /// The API process the jail made: waits for its server ([`split`]), or
     /// ends with Firecracker if it never gets one (`--no-api`, an error).
-    pub fn wait_for_server(link: UnixStream) -> ! {
+    /// `firecracker` is the pid of the process that forked this one, taken
+    /// there before the fork ([`end_with_firecracker`]).
+    pub fn wait_for_server(link: UnixStream, firecracker: libc::pid_t) -> ! {
         let mut buf = [0u8; 16];
         let mut fds = [-1 as RawFd; 2];
         let mut iov = [libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() }];
@@ -712,7 +718,7 @@ mod macos {
         let result = server
             .add_kill_switch(kill_switch)
             .map_err(|e| ApiProcessError::Message(format!("{e:?}")))
-            .and_then(|()| serve(&mut server, link, payload_limit));
+            .and_then(|()| serve(&mut server, link, payload_limit, firecracker));
         exit(result)
     }
 
@@ -737,10 +743,25 @@ mod macos {
     /// with it on Linux: a thread that waits for Firecracker's exit (made
     /// before the sandbox, which has no thread creation; it then only waits
     /// in `kevent`).
-    fn end_with_firecracker() -> Result<(), ApiProcessError> {
+    ///
+    /// `firecracker` is Firecracker's pid as Firecracker took it before the
+    /// fork that made this process. It is not `getppid()` asked here: a
+    /// Firecracker that ended between the fork and this call has left this
+    /// process to launchd, `getppid()` is then 1, the watch below would be
+    /// launchd's and the orphan check would compare 1 with 1, so the API
+    /// process would serve on with no Firecracker. With the pid from before
+    /// the fork, every moment Firecracker can end at is covered:
+    /// - before the watch is registered, its pid gone (reaped): `kevent`
+    ///   fails with `ESRCH`;
+    /// - before the watch is registered, its pid still there (a zombie its
+    ///   parent has not reaped) or given to another process: the watch may
+    ///   register, and `getppid()` is no longer `firecracker` (xnu
+    ///   bsd/kern/kern_exit.c `proc_exit` hands the children to launchd
+    ///   before the process becomes a zombie);
+    /// - after the watch is registered: `NOTE_EXIT`, which the kqueue holds
+    ///   until the thread below waits for it.
+    fn end_with_firecracker(firecracker: libc::pid_t) -> Result<(), ApiProcessError> {
         let fail = |e| ApiProcessError::Fork(e);
-        // SAFETY: no arguments.
-        let firecracker = unsafe { libc::getppid() };
         // SAFETY: no arguments; the result is checked.
         let kq = unsafe { libc::kqueue() };
         if kq < 0 {
@@ -764,7 +785,8 @@ mod macos {
             }
             return Err(fail(err));
         }
-        // An orphan's parent is launchd: Firecracker ended before the kevent.
+        // An orphan's parent is launchd, not Firecracker: it ended before the
+        // kevent.
         // SAFETY: no arguments.
         if unsafe { libc::getppid() } != firecracker {
             exit(Ok(()));
@@ -796,8 +818,11 @@ mod macos {
         server: &mut HttpServer,
         link: UnixStream,
         payload_limit: usize,
+        firecracker: libc::pid_t,
     ) -> Result<(), ApiProcessError> {
-        end_with_firecracker()?;
+        #[cfg(test)]
+        tests::hold_before_the_watch();
+        end_with_firecracker(firecracker)?;
         // Firecracker's API thread logs; this process only parses.
         log::set_max_level(log::LevelFilter::Off);
         // A call its sandbox denies ends Firecracker, told over the link.
@@ -1264,6 +1289,123 @@ mod macos {
             // exit(3): the drains run.
             // SAFETY: ends the fork.
             unsafe { libc::exit(0) }
+        }
+
+        /// The descriptors `api_orphan_child` leaves in the environment
+        /// for the API process it holds: `<hold read end>,<alive write end>`.
+        const HOLD_ENV: &str = "WICK_TEST_API_HOLD";
+
+        /// The API process of `api_orphan_child`, before it watches
+        /// Firecracker: writes its pid to the alive pipe and waits for a
+        /// byte on the hold pipe, which comes once Firecracker has ended
+        /// and has been reaped. Nothing in any other process.
+        pub(super) fn hold_before_the_watch() {
+            let Ok(fds) = std::env::var(HOLD_ENV) else {
+                return;
+            };
+            let (hold, alive) = fds.split_once(',').unwrap();
+            let (hold, alive): (libc::c_int, libc::c_int) = (hold.parse().unwrap(), alive.parse().unwrap());
+            // SAFETY: no arguments.
+            let pid = unsafe { libc::getpid() }.to_le_bytes();
+            let mut byte = 0u8;
+            // SAFETY: four bytes to, and one byte from, pipes this process
+            // inherited.
+            unsafe {
+                assert_eq!(libc::write(alive, pid.as_ptr().cast(), 4), 4);
+                assert_eq!(libc::read(hold, (&raw mut byte).cast(), 1), 1);
+            }
+        }
+
+        // Firecracker ends (SIGKILL) after it forked its API process and
+        // before that process watches for its end: the API process ends
+        // too, as the API thread ends with Firecracker on Linux. The API
+        // process is held before `end_with_firecracker` until Firecracker
+        // is dead and reaped, so that it is launchd's child when it goes on:
+        // with Firecracker's pid asked there (`getppid()`, 1 by then) it
+        // watched launchd and served on, for ever.
+        #[test]
+        fn test_an_api_process_orphaned_before_its_watch_ends() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ext::api_process::macos::tests::api_orphan_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&out.stdout).contains("API-ORPHAN-ENDED"), "{}", text(&out));
+            assert!(out.status.success(), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_an_api_process_orphaned_before_its_watch_ends in a separate process"]
+        fn api_orphan_child() {
+            use crate::ext::sandbox::{self, Policy};
+            let pipe = || {
+                let mut fds = [-1; 2];
+                // SAFETY: an array of two descriptors.
+                assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+                (fds[0], fds[1])
+            };
+            let (hold_rd, hold_wr) = pipe();
+            let (alive_rd, alive_wr) = pipe();
+            // Firecracker's side in a fork, whose only thread is this one
+            // (as api_violation_child); this process stays, to reap it.
+            // SAFETY: the fork runs Firecracker's side until it is killed.
+            let firecracker = unsafe { libc::fork() };
+            assert!(firecracker >= 0);
+            if firecracker == 0 {
+                // SAFETY: set in a process with one thread.
+                unsafe { std::env::set_var(HOLD_ENV, format!("{hold_rd},{alive_wr}")) };
+                sandbox::select(Policy::None);
+                let dir = std::path::PathBuf::from(format!("/tmp/wick-apio-{}", std::process::id()));
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = dir.join("api.sock");
+                let server = micro_http::HttpServer::new(&path).unwrap();
+                let kill_switch = vmm_sys_util::eventfd::EventFd::new(libc::O_NONBLOCK).unwrap();
+                let _link = super::split(server, kill_switch, &path, 51200).unwrap();
+                let _ = std::fs::remove_dir_all(&dir);
+                // The split is made; killed from outside.
+                loop {
+                    std::thread::park();
+                }
+            }
+            // SAFETY: this process's copy of the alive pipe's write end;
+            // the API process's is then the last one once Firecracker ended.
+            unsafe { libc::close(alive_wr) };
+            // The API process is made and held: its pid.
+            let mut pid = [0u8; 4];
+            // SAFETY: four bytes from the alive pipe.
+            assert_eq!(unsafe { libc::read(alive_rd, pid.as_mut_ptr().cast(), 4) }, 4);
+            let api = libc::pid_t::from_le_bytes(pid);
+            let mut status = 0;
+            // SAFETY: Firecracker's side, this process's child: killed and
+            // reaped, so its pid names no process and the API process is
+            // launchd's.
+            unsafe {
+                assert_eq!(libc::kill(firecracker, libc::SIGKILL), 0);
+                assert_eq!(libc::waitpid(firecracker, &mut status, 0), firecracker);
+            }
+            assert!(libc::WIFSIGNALED(status), "{status:#x}");
+            // SAFETY: one byte to the hold pipe: the API process goes on.
+            assert_eq!(unsafe { libc::write(hold_wr, [0u8].as_ptr().cast(), 1) }, 1);
+            // The API process's end closes the alive pipe's last write end.
+            let mut poll = libc::pollfd { fd: alive_rd, events: libc::POLLIN, revents: 0 };
+            // SAFETY: one pollfd; then one byte from the pipe, at its end.
+            let ended = unsafe {
+                libc::poll(&mut poll, 1, 10_000) == 1 && libc::read(alive_rd, pid.as_mut_ptr().cast(), 1) == 0
+            };
+            if ended {
+                println!("API-ORPHAN-ENDED");
+            } else {
+                println!("API-ORPHAN-STAYED: process {api} runs on 10 s after Firecracker was killed and reaped");
+                // SAFETY: the API process's pid, read from it above.
+                unsafe { libc::kill(api, libc::SIGKILL) };
+            }
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            // SAFETY: ends this process without the test harness's summary.
+            unsafe { libc::_exit(i32::from(!ended)) }
         }
 
         #[test]

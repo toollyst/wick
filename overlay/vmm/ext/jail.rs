@@ -502,7 +502,14 @@ mod imp {
 
     /// The API process's side of [`enter`]: its share of the limits, the
     /// same privileges as Firecracker, then it waits for the API server.
-    fn api_process(link: std::os::unix::net::UnixStream, uid: u32, gid: u32, cpu: Option<u8>, memory: Option<u32>) -> ! {
+    fn api_process(
+        link: std::os::unix::net::UnixStream,
+        firecracker: libc::pid_t,
+        uid: u32,
+        gid: u32,
+        cpu: Option<u8>,
+        memory: Option<u32>,
+    ) -> ! {
         // SAFETY: the child of a fork made with one thread.
         unsafe { close_netns_in_child() };
         let result = (|| {
@@ -520,7 +527,7 @@ mod imp {
             // SAFETY: ends this process (Firecracker's exit code is the parent's).
             unsafe { libc::_exit(1) };
         }
-        crate::ext::api_process::wait_for_server(link)
+        crate::ext::api_process::wait_for_server(link, firecracker)
     }
 
     pub fn enter() -> Result<(), JailError> {
@@ -596,12 +603,16 @@ mod imp {
             let ((vmm_cpu, api_cpu), (vmm_memory, api_memory)) = share(cpu, memory)?;
             let (ours, theirs) =
                 std::os::unix::net::UnixStream::pair().map_err(JailError::ApiProcess)?;
+            // Firecracker's pid, which the API process ends with: taken
+            // before the fork (`api_process::end_with_firecracker`).
+            // SAFETY: no arguments.
+            let firecracker = unsafe { libc::getpid() };
             // SAFETY: called first thing in main, with one thread.
             match unsafe { libc::fork() } {
                 -1 => return Err(JailError::ApiProcess(Error::last_os_error())),
                 0 => {
                     drop(ours);
-                    api_process(theirs, uid, gid, api_cpu, api_memory);
+                    api_process(theirs, firecracker, uid, gid, api_cpu, api_memory);
                 }
                 child => {
                     drop(theirs);

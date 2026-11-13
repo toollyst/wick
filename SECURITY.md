@@ -228,7 +228,9 @@ upstream Firecracker and its jailer.
   socket's HTTP server and upstream's request parsing run in a process sandboxed as upstream's `api` filter (its
   system calls only, no files, no shared memory, no executable mappings), and Firecracker's API thread handles the
   requests it passes on with upstream's code; either process's end ends the other (`test_api_profile_*`,
-  `boot-test api-process`). A call the API process's sandbox denies ends Firecracker with the bad-syscall code,
+  `boot-test api-process`), also a Firecracker killed right after the fork, before the API process watches for
+  its end: the API process is given Firecracker's pid from before the fork, and no longer asks for its parent's
+  once it runs, which is launchd's by then (`test_an_api_process_orphaned_before_its_watch_ends`). A call the API process's sandbox denies ends Firecracker with the bad-syscall code,
   its log line and metrics, as the API thread's trapped call does on Linux: the API process says so over the link,
   or Firecracker, its parent, reads its exit status
   (`test_a_denied_call_in_the_api_process_ends_firecracker_as_its_own`,
