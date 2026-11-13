@@ -810,6 +810,15 @@ jobs:
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
           alone windows_fd::tests::test_non_blocking_pipe_writes_on_record
+          # A pipe's maker gets no identity of Firecracker's: the two tests
+          # pass in the crates' own steps, which do not print a passing
+          # test's lines; here for their SQOSTEST lines, what
+          # ImpersonateNamedPipeClient answered for std's own open (the
+          # control) and for ours (a refusal, or an anonymous token).
+          k=../../crates/compat/os/Cargo.toml
+          alone fifo::windows::tests::test_a_pipe_opened_again_gives_its_maker_no_identity
+          k=../../crates/compat/std/Cargo.toml
+          alone tests::test_a_pipe_opened_by_path_gives_its_maker_no_identity
           t=platform::windows::net::tests::test_descriptor_check_cost_on_record
           out=$(cargo test --locked -p vmm --lib -- \
             --include-ignored --exact --nocapture --test-threads=1 "$t" 2>&1) || true
