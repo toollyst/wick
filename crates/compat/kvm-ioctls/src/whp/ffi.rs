@@ -586,7 +586,7 @@ pub(crate) mod trace {
     /// [`split_begin`], without the cost of keeping each call ([`begin`]):
     /// the run calls' time, and for each lazy exit the slot's lookup, the
     /// commit (`wick_mm::commit_block_on_access`) and the populate after it
-    /// (`VmInner::populate_huge_page`, where there is one), in microseconds.
+    /// (`VmInner::populate_committed`, where there is one), in microseconds.
     #[derive(Clone, Copy, Default)]
     pub(crate) struct Split {
         pub runs: u32,

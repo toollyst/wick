@@ -1711,11 +1711,13 @@ impl VcpuFd {
                     // Linux): WHP exits at the access to such a page, which
                     // re-runs once it is committed (measured), as KVM resolves
                     // the stage-2 fault through the host page.
-                    // A write's first access to a transparent huge page
-                    // (memory advised `MADV_HUGEPAGE`) commits all of it
-                    // and has WHP map it at once, as Linux's huge page fault
-                    // does (`VmInner::populate_huge_page`); a read commits
-                    // its page only (`wick_mm`: Linux's huge zero page).
+                    // A write's first access commits its block (a 4 KiB
+                    // page, or all of a transparent huge page: memory
+                    // advised `MADV_HUGEPAGE`) and has WHP map it before
+                    // the re-run, as Linux's fault maps what it charged
+                    // (`VmInner::populate_committed`); a read commits its
+                    // page only and leaves it to WHP's fault (`wick_mm`:
+                    // Linux's huge zero page).
                     #[cfg(test)]
                     let looked_up = std::time::Instant::now();
                     if let Some(host) = self.shared.inner.host_addr(mem.Gpa) {
@@ -1728,11 +1730,11 @@ impl VcpuFd {
                                 #[cfg(test)]
                                 let populating = std::time::Instant::now();
                                 #[cfg(test)]
-                                let each = super::vm::POPULATE_EACH_PAGE_FOR_TESTS.get();
+                                let small = !super::vm::POPULATE_ONLY_HUGE_PAGES_FOR_TESTS.get();
                                 #[cfg(not(test))]
-                                let each = false;
-                                if write && (each || block.len() >= libc::wick_mm::HUGE_PAGE) {
-                                    self.shared.inner.populate_huge_page(mem.Gpa, block);
+                                let small = true;
+                                if write && (small || block.len() >= libc::wick_mm::HUGE_PAGE) {
+                                    self.shared.inner.populate_committed(mem.Gpa, block);
                                 }
                                 #[cfg(test)]
                                 super::ffi::trace::split_lazy(looked_up, committing, populating);
@@ -6306,7 +6308,7 @@ mod fpu_tests {
     /// 64 KiB (its grain before) or 2 MiB (a write's, where one is) at a
     /// first access (`wick_mm::record_grain`, set on this test's mappings
     /// only; a guest write's 2 MiB block is populated as the backend does
-    /// for a transparent huge page, `VmInner::populate_huge_page`, so the
+    /// for a transparent huge page, `VmInner::populate_committed`, so the
     /// 2 MiB slot's numbers are `huge_pages: Transparent`'s). Each grain has a slot of its own, 2 MiB aligned on the host as
     /// a transparent huge page needs, and the guest's same two steps in it:
     /// - sparse: one byte written in each 2 MiB of 64 MiB (32 writes);
@@ -6762,19 +6764,22 @@ mod fpu_tests {
     /// [`super::super::ffi::trace::begin`]); untraced, a step's run calls
     /// and lazy exits are only summed ([`super::super::ffi::trace::Split`]).
     /// 1024 accesses a step:
-    /// - today's path, `run` committing each page at its exit
-    ///   (`commit_block_on_access`), untraced and then traced: the time a
-    ///   write; each lazy exit's run call, the slot's lookup, the commit
-    ///   and the rest of the backend's time; the commit and working set;
-    /// - L1: the same with WHP made to map each page the exit committed
-    ///   (`WHvAdviseGpaRange(Populate)` of 4 KiB, as the backend does a
-    ///   huge page, [`super::super::vm::POPULATE_EACH_PAGE_FOR_TESTS`])
-    ///   before the re-run, which takes WHP's fault in the run on committed
-    ///   memory it has not mapped (POPULATETEST) out of the run;
+    /// - without L1 (the path before L1 was taken, "today's path" in the
+    ///   lines made before it), `run` committing each page at its exit
+    ///   (`commit_block_on_access`) and leaving its mapping to WHP's fault
+    ///   in the re-run ([`super::super::vm::POPULATE_ONLY_HUGE_PAGES_FOR_TESTS`]),
+    ///   untraced and then traced: the time a write; each lazy exit's run
+    ///   call, the slot's lookup, the commit and the rest of the backend's
+    ///   time; the commit and working set;
+    /// - L1, the backend's path since: the same with WHP made to map each
+    ///   page the exit committed (`WHvAdviseGpaRange(Populate)` of 4 KiB,
+    ///   as of a huge page, `VmInner::populate_committed`) before the
+    ///   re-run, which takes WHP's fault in the run on committed memory it
+    ///   has not mapped (POPULATETEST) out of the run;
     /// - exit baselines: an `out` that exits, through `run` and through
     ///   `WHvRunVirtualProcessor` alone, the RIP set past it;
-    /// - today's path driven by `WHvRunVirtualProcessor` alone, the commit
-    ///   and the re-run only: the least the backend could take a page;
+    /// - the path without L1 driven by `WHvRunVirtualProcessor` alone, the
+    ///   commit and the re-run only: the least that path could take a page;
     /// - L3: guest pages not mapped in WHP at all, each exit committing
     ///   its host page and mapping it (`WHvMapGpaRange`, 4 KiB): the run
     ///   call, the commit and the map; then the same pages again (no exits
@@ -7001,11 +7006,11 @@ mod fpu_tests {
             outs + 1,
             took / f64::from(outs + 1)
         ));
-        for (way, first, populate) in [("today's path", 0, false), ("L1, each page populated before the re-run", 2, true)] {
+        for (way, first, populate) in [("without L1, the path before it", 0, false), ("L1, each page populated before the re-run", 2, true)] {
             for (traced, i) in [(false, first), (true, first + 1)] {
                 let at = host + i * PART;
                 let before = process_memory();
-                super::super::vm::POPULATE_EACH_PAGE_FOR_TESTS.set(populate);
+                super::super::vm::POPULATE_ONLY_HUGE_PAGES_FOR_TESTS.set(!populate);
                 if traced {
                     trace::begin();
                 }
@@ -7013,7 +7018,7 @@ mod fpu_tests {
                 let (_, end, took) = through_run(&mut vcpu);
                 let s = trace::split_end();
                 let calls = if traced { trace::end() } else { Vec::new() };
-                super::super::vm::POPULATE_EACH_PAGE_FOR_TESTS.set(false);
+                super::super::vm::POPULATE_ONLY_HUGE_PAGES_FOR_TESTS.set(false);
                 let after = process_memory();
                 ended(way, end);
                 let process = match (before, after) {
@@ -7075,9 +7080,9 @@ mod fpu_tests {
             }
         };
         let r = raw(&mut vcpu, &mut commit_today);
-        ended("today's path, WHvRunVirtualProcessor alone", r.end.clone());
+        ended("without L1, WHvRunVirtualProcessor alone", r.end.clone());
         lines.push(format!(
-            "{build}, untraced: today's path, a write to each of {PAGES} untouched pages, WHvRunVirtualProcessor alone \
+            "{build}, untraced: without L1, a write to each of {PAGES} untouched pages, WHvRunVirtualProcessor alone \
              with the commit: {:.2} us a write; {} memory exits, the run call {}, the commit after it {:.2} us; the part \
              committed {} KiB, resident {} KiB",
             r.took / f64::from(PAGES),

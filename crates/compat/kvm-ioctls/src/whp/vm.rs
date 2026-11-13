@@ -42,10 +42,11 @@ thread_local! {
     /// (`test_a_guest_read_of_untouched_ram_on_record`: GpaAccessFaultExit).
     pub(crate) static EXTRA_EXITS_FOR_TESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Whether a guest write's first access to lazy guest RAM run on this
-    /// thread has WHP map the page it committed at once, whatever its size,
-    /// as a huge page's is (`populate_huge_page`): option L1 of the
-    /// per-page cost (`test_a_first_touch_of_lazy_ram_by_way_on_record`).
-    pub(crate) static POPULATE_EACH_PAGE_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// thread has WHP map only a huge page it committed, not a 4 KiB page
+    /// (`populate_committed`): the path before option L1 of the per-page
+    /// cost, which its record sets against today's
+    /// (`test_a_first_touch_of_lazy_ram_by_way_on_record`).
+    pub(crate) static POPULATE_ONLY_HUGE_PAGES_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 use super::guest_mem::{self, Slot};
 use super::irqchip::{Irqchip, MsiRoutes};
@@ -162,7 +163,7 @@ pub(crate) struct VmInner {
     /// reported once.
     request_failure: AtomicI32,
     /// The last `WHvAdviseGpaRange(Populate)` failure reported
-    /// ([`VmInner::populate_huge_page`]), so each is reported once.
+    /// ([`VmInner::populate_committed`]), so each is reported once.
     populate_failure: AtomicI32,
     /// The partition's exception exits ([`Exits`]) and the condvar the
     /// vCPUs held out of the guest wait on. A leaf lock: nothing else is
@@ -228,19 +229,32 @@ impl VmInner {
     }
 
     /// Has the hypervisor map the guest RAM whose host memory `block` is
-    /// (a transparent huge page that a guest write's first access just
-    /// committed, `wick_mm::commit_block_on_access`), clipped to the slot
-    /// that holds `gpa`, the written address: Linux's huge page fault maps
-    /// the whole 2 MiB at once (mm/huge_memory.c,
-    /// `__do_huge_pmd_anonymous_page`), where WHP would otherwise take a
-    /// fault inside the hypervisor at each 4 KiB page's first access
-    /// (LAZYGRAIN on a PC: a 2 MiB block written page by page took 3.7 ms
-    /// in its run call, a `Populate` of it 92 us). Not for a read-only slot
-    /// or one logging dirty pages, whose log would then hold the whole
-    /// block where KVM logs the pages written. Advice only: a refusal is
-    /// reported once per error code and the guest's accesses fault in as
-    /// before.
-    pub(crate) fn populate_huge_page(&self, gpa: u64, block: core::ops::Range<usize>) {
+    /// (what a guest write's first access just committed,
+    /// `wick_mm::commit_block_on_access`: a transparent huge page, or a
+    /// 4 KiB page), clipped to the slot that holds `gpa`, the written
+    /// address, before the write re-runs.
+    ///
+    /// - A huge page: Linux's huge page fault maps the whole 2 MiB at once
+    ///   (mm/huge_memory.c, `__do_huge_pmd_anonymous_page`), where WHP
+    ///   would otherwise take a fault inside the hypervisor at each 4 KiB
+    ///   page's first access (LAZYGRAIN on a PC: a 2 MiB block written page
+    ///   by page took 3.7 ms in its run call, a `Populate` of it 92 us).
+    /// - A 4 KiB page (option L1 of the per-page cost): the re-run would
+    ///   otherwise take WHP's own fault on committed memory it has not
+    ///   mapped (POPULATETEST) inside its run call. A first write took
+    ///   40.58 us without this and 31.75 us with it on the PC at 2be20a5,
+    ///   45.43 and 32.88 us in CI run 43510189716 (release builds,
+    ///   untraced; `test_a_first_touch_of_lazy_ram_by_way_on_record`,
+    ///   FIRSTTOUCH). Linux maps the page in the fault that charged it
+    ///   (mm/memory.c v6.1, `do_anonymous_page`: charged at 4117, mapped
+    ///   at 4155), as this does; only the page written is mapped and
+    ///   charged.
+    ///
+    /// Not for a read-only slot or one logging dirty pages, whose log would
+    /// then hold the whole block where KVM logs the pages written. Advice
+    /// only: a refusal is reported once per error code and the guest's
+    /// accesses fault in as before.
+    pub(crate) fn populate_committed(&self, gpa: u64, block: core::ops::Range<usize>) {
         let range = {
             let memory = self.memory.lock().unwrap();
             let Some(s) = memory.values().find(|s| gpa >= s.guest_phys && gpa < s.guest_phys + s.size) else {

@@ -1146,11 +1146,12 @@ jobs:
           # WHP makes and what the run gives.
           alone whp::vcpu::fpu_tests::test_a_guest_read_of_untouched_ram_on_record
           # A first write to a 4 KiB page of lazy guest RAM (FIRSTTOUCH
-          # lines): today's path through run, untraced and traced, its
-          # run call, lookup, commit and the rest of the backend apart; L1,
-          # each page populated before the re-run; an out's round trip
-          # through run and through WHvRunVirtualProcessor alone; today's
-          # path driven by WHvRunVirtualProcessor alone; L3, the page left
+          # lines): the path without L1 through run, untraced and traced,
+          # its run call, lookup, commit and the rest of the backend apart;
+          # L1, the backend's path, each page populated before the re-run;
+          # an out's round trip through run and through
+          # WHvRunVirtualProcessor alone; the path without L1 driven by
+          # WHvRunVirtualProcessor alone; L3, the page left
           # unmapped in WHP and mapped at its exit. In the debug build as
           # every record here, then in a release build, as Firecracker
           # runs: the per-page cost set against Linux's (LINUXGRAIN) is
