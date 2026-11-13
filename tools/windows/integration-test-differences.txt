@@ -165,8 +165,12 @@ impossible integration_tests/functional/test_serial_io.py::test_serial_dos
 # Builds of Firecracker with the fuzzing and gdb features, and of the
 # instrumented binary, which the tests make for Linux's musl target and
 # wick_windows.py makes for the Windows one. The three build (measured on a
-# Windows Server 2022 host without WHP; gdb: patches/0038); their tests are
-# not run yet, as they need WHP.
+# Windows Server 2022 host without WHP; gdb: patches/0038); their tests need
+# WHP. In a first run on a WHP machine (kit dd657f4) test_fuzzing_warning and
+# test_gdb_connects failed in the harness, which looked for the binary it
+# builds without .exe (fixed in hosttools.py, d706d9a; selftest.py checks
+# it); not yet re-run. The
+# instrumented binary's test has not run (docs/COMPATIBILITY.md, Tools).
 bug integration_tests/functional/test_fuzzing.py::test_fuzzing_warning
 bug integration_tests/functional/test_gdb.py::test_gdb_connects
 bug integration_tests/functional/test_instrumented_firecracker.py::test_log_instrument_firecracker_basic_functionality
