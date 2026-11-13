@@ -235,10 +235,16 @@ def commit_docs(root, repo):
 
 
 def selftest():
+    # Fixed dates make the commits' hashes the same on every run and host. With the
+    # time of the run in them, a short hash was all digits about 1 run in 27, which
+    # the citation rule (a digit and a letter) does not take: CI run 43480682094 then
+    # missed the expected error on line 2.
     def run(*args, cwd):
         subprocess.run(args, cwd=cwd, check=True, capture_output=True,
                        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
-                            "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+                            "GIT_COMMITTER_EMAIL": "t@t", "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+0000",
+                            "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+0000", "GIT_CONFIG_GLOBAL": os.devnull,
+                            "GIT_CONFIG_NOSYSTEM": "1"})
 
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp) / "repo"
@@ -260,6 +266,9 @@ def selftest():
         run("git", "cherry-pick", side, cwd=repo)
         first = git(repo, "rev-parse", "--short=7", "HEAD~2").stdout.strip()
         picked = git(repo, "rev-parse", "--short=9", "HEAD").stdout.strip()
+        for h in (side, first, picked):
+            assert re.search(r"[a-f]", h) and re.search(r"[0-9]", h), (
+                f"the selftest's fixed dates give the hash {h}, which the citation rule does not take: change them")
         # Hashes that cannot be of the repository: they have a digit and a letter.
         unknown, other = "1abcdef", "2bcdef0"
         doc = (f"| Row | passed at {first}, kit {picked}; HRESULT 0x800703e6, rip 0xffffffff8124f971 |\n"
