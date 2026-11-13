@@ -434,14 +434,29 @@ fn xstate_bv(area: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(area.get(512..520)?.try_into().ok()?))
 }
 
+/// The XSAVE header's `XCOMP_BV` (bytes 520 to 527): bit 63 says the area
+/// is in the compacted format, and the other bits which components it then
+/// has room for, in order (Intel SDM volume 1, 13.4.2). WHP's areas are
+/// compacted, with the supervisor components (measured: `XCOMP_BV`
+/// 0x8000000000001807 on an AMD EPYC 7763, 872 bytes, CI run 43363585319);
+/// KVM's are in the standard format.
+fn xcomp_bv(area: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(area.get(520..528)?.try_into().ok()?))
+}
+
 /// What `KVM_SET_XSAVE` refuses with `EINVAL`: an area whose header names a
 /// state component outside `supported` (arch/x86/kernel/fpu/core.c,
 /// `fpu_copy_uabi_to_guest_fpstate`: `xfeatures & ~xcr0`), which a snapshot
 /// of a host with other processor features has; and an area too short to
-/// have a header.
+/// have a header. A compacted area that has room for such a component
+/// (`XCOMP_BV`) is refused as well, whether or not the component is in use:
+/// the place of every component after it depends on it.
 fn check_xsave_area(area: &[u8], supported: u64) -> Result<()> {
-    match xstate_bv(area) {
-        Some(bv) if bv & !supported == 0 => Ok(()),
+    const COMPACTED: u64 = 1 << 63;
+    match (xstate_bv(area), xcomp_bv(area)) {
+        (Some(bv), Some(comp)) if bv & !supported == 0 && (comp & COMPACTED == 0 || comp & !COMPACTED & !supported == 0) => {
+            Ok(())
+        }
         _ => err(libc::EINVAL),
     }
 }
@@ -1355,8 +1370,19 @@ mod tests {
         area[512..520].copy_from_slice(&(0xe7u64 | 1 << 18).to_le_bytes());
         assert_eq!(check_xsave_area(&area, host).unwrap_err().errno(), libc::EINVAL);
         check_xsave_area(&area, host | 3 << 17).unwrap();
-        assert_eq!(check_xsave_area(&area[..519], u64::MAX).unwrap_err().errno(), libc::EINVAL);
-        check_xsave_area(&area[..520], u64::MAX).unwrap();
+        assert_eq!(check_xsave_area(&area[..527], u64::MAX).unwrap_err().errno(), libc::EINVAL);
+        check_xsave_area(&area[..528], u64::MAX).unwrap();
+        // WHP's areas are compacted: one with room for a component the
+        // host lacks is refused though the component is not in use, and
+        // the same bits mean nothing in a standard area (bit 63 clear).
+        area[512..520].copy_from_slice(&0x1802u64.to_le_bytes());
+        area[520..528].copy_from_slice(&(1u64 << 63 | 0x1807).to_le_bytes());
+        check_xsave_area(&area, 0x1807).unwrap();
+        area[520..528].copy_from_slice(&(1u64 << 63 | 0x1807 | 1 << 18).to_le_bytes());
+        assert_eq!(check_xsave_area(&area, 0x1807).unwrap_err().errno(), libc::EINVAL);
+        check_xsave_area(&area, 0x1807 | 3 << 17).unwrap();
+        area[520..528].copy_from_slice(&(0x1807u64 | 1 << 18).to_le_bytes());
+        check_xsave_area(&area, 0x1807).unwrap();
     }
 
     // An area of a host with a smaller state (a snapshot made without AMX,
