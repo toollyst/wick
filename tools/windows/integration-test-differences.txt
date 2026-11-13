@@ -218,18 +218,28 @@ bug integration_tests/functional/test_net_config_space.py::test_net_change_mac_a
 impossible integration_tests/functional/test_net.py::test_multi_queue_unsupported
 
 # Firecracker's memory beyond its guest's goes just above the tests' 5 MiB
-# (5.0 to 5.6 MiB), most with 16 vCPUs: each vCPU adds about 58 KiB of heap
-# and 78 KiB of stack (measured with 1, 2 and 16 vCPUs and a network
-# interface: 3.4, 3.5, 5.6 MiB). Not root-caused yet.
-# tools/windows/vmm-memory-record.py prints what the memory is made of, by
-# kind and by allocation, for 1, 2 and 16 vCPUs (CI's windows job, VMMMEM
-# lines). With its own guest, a `hlt` loop on one vCPU and no device, the
-# count is 2336, 2380 and 3232 KiB and a vCPU adds 59.7 KiB, 16.5 of it
-# stack (CI run 43363585319): so the rest, about 87 KiB a vCPU and 1.1 MiB
-# besides, comes with vCPUs that run and a guest that uses its devices. The
-# script's --boot mode boots Linux with a network interface and prints each
-# thread's stack and the return addresses on it (VMMSTACK lines; not yet
-# run).
+# (5.0 to 5.6 MiB), most with 16 vCPUs. The excess is the cost of a vCPU:
+# about 137 KiB on Windows against 26.7 on Linux (test_cpuid's rows, CI run
+# 43397419784). By its parts (vmm-memory-record.py --boot, VMMMEM and
+# VMMGROW lines of a PC's traced boot at 861d365, 1 and 16 vCPUs; a debug
+# build, until CI's release record replaces the figures):
+# - its thread's stack, 52.0 KiB, of which 36 are WHP's own stack use inside
+#   WHvRunVirtualProcessor on a lazy-RAM memory exit: the guest's first
+#   write on that vCPU into guest RAM that is reserved, not yet committed
+#   (test_the_stack_each_whp_call_commits_on_record, its MAP_NORESERVE step:
+#   16 -> 52 KiB, 36 of them within WHP calls, on the PC at 861d365; in the
+#   traced boot every fc_vcpu thread's one committing call). Ours in so far
+#   as we chose exits for lazy RAM: MAP_NORESERVE is kept as charge on
+#   touch, as Linux charges a guest's memory to its cgroup when touched
+#   (memory.max, overcommit, the balloon); guest RAM committed up front
+#   would make no exit and change those. A measured difference with its
+#   cause, not a fault;
+# - heap, 62.1 KiB, in later segments of the process heap: owner not named
+#   yet (the next record walks the heap);
+# - other private memory, 22.9 KiB: three 12 KiB allocations (12.0) and the
+#   thread's TEB (8.0).
+# Listed as bugs while the heap's part is unexplained; upstream's budget
+# stays as it is.
 bug integration_tests/functional/test_cpu_all.py::test_all_vcpus_online
 bug integration_tests/functional/test_cpu_all.py::test_all_vcpus_have_same_features
 bug integration_tests/functional/test_cpu_features_x86_64.py::test_cpuid
