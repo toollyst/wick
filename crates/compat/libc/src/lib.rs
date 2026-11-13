@@ -133,6 +133,9 @@ pub use windows_socket::{
 };
 #[cfg(windows)]
 mod windows_mm;
+// The records for section memory charged against memory.max (SECTREC).
+#[cfg(all(windows, test))]
+mod windows_sectrec;
 #[cfg(windows)]
 #[rustfmt::skip]
 pub use windows_mm::{

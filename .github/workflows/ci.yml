@@ -1150,6 +1150,12 @@ jobs:
           # the release build's. Each line names its build.
           alone whp::vcpu::fpu_tests::test_a_first_touch_of_lazy_ram_by_way_on_record
           alone whp::vcpu::fpu_tests::test_a_first_touch_of_lazy_ram_by_way_on_record --release
+          # Guest RAM in a section's view (SECTREC-a WHP and SECTREC-c WHP
+          # lines), as the section charge's Layer 1 would map it: a
+          # SEC_RESERVE section's view and a memfd's no-access view mapped
+          # in WHP, the exit a guest write to each page makes, and the page
+          # committed on the view or opened at each exit.
+          alone whp::vcpu::fpu_tests::test_guest_ram_in_sections_on_record
           # What each call of the backend commits of its thread's stack
           # (STACKTEST lines), each on a thread of its own: which one leaves
           # a vCPU's thread 48 to 52 KiB deep, as the boot record of run
@@ -1196,6 +1202,18 @@ jobs:
           alone whp::vcpu::fpu_tests::test_msi_triggers_against_the_irqfd_watcher_on_record
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
+          # Section memory against memory.max (SECTREC lines, the plan's S0):
+          # a child in a job of 1 GiB; what SEC_COMMIT and SEC_RESERVE
+          # sections take of the host's commit, the job's and the process's;
+          # a charge page's cost and the job's refusal of them; a memfd view
+          # opened a page at a time, seen from another view and another
+          # process; the jailer's poll of a jail laid out as Firecracker's
+          # with vhost-user and a uffd restore: each part's time, its share
+          # of a CPU at a poll a millisecond, what it counts, and whether
+          # this process is elevated and given the kernel's object
+          # addresses (CI's runner; the PC runs it unelevated, and elevated
+          # when the user starts it so).
+          alone windows_sectrec::test_section_memory_and_a_charge_for_it_on_record
           # What Windows' cycle counters count (CPUCYCLEREC lines), for the
           # CPU clocks: a PC read the thread's QueryThreadCycleTime at 1.32 x
           # the TSC while spinning and the process's at 1.01 x. The thread's

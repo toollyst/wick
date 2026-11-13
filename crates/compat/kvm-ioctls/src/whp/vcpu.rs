@@ -7166,6 +7166,224 @@ mod fpu_tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// The guest's side of the section records (SECTREC-a WHP and SECTREC-c
+    /// WHP lines; libc's `windows_sectrec` has the host's): guest RAM in a
+    /// view of a section, as Layer 1 of the section charge would have it.
+    /// - a pagefile-backed section made `SEC_RESERVE`, its view mapped in
+    ///   WHP (`WHvMapGpaRange`) with no page committed: the HRESULT; then
+    ///   the guest writing 16 of its pages: the exit each makes (its kind,
+    ///   and whether WHP calls the GPA unmapped), the page committed on the
+    ///   view (`VirtualAlloc`) and the run again;
+    /// - a file section (wick's memfd, a temporary file deleted on close),
+    ///   its view made no-access and mapped in WHP: the same, with the page
+    ///   opened (`VirtualProtect`, read-write) at each exit, and the writes
+    ///   read through another view of the file.
+    ///
+    /// Each: the exits' run calls and the test's handling, and the view's
+    /// commit after. Printed, not asserted, but for each step's end.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_guest_ram_in_sections_on_record() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use std::time::Instant;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, VirtualAlloc, VirtualProtect, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS,
+            MEM_COMMIT, PAGE_NOACCESS, PAGE_READWRITE, SEC_RESERVE,
+        };
+        const PROGRAM: u64 = 0xB000;
+        const LEN: usize = 4 << 20;
+        const SECTION_GPA: u64 = 0x400_0000;
+        const FILE_GPA: u64 = 0x500_0000;
+        const PAGES: u32 = 16;
+        fn us(since: Instant) -> f64 {
+            since.elapsed().as_secs_f64() * 1e6
+        }
+        fn spread(t: &[f64]) -> String {
+            let mut t = t.to_vec();
+            t.sort_by(f64::total_cmp);
+            match t.len() {
+                0 => "none".to_string(),
+                n => format!("median {:.2} us (least {:.2}, most {:.2})", t[n / 2], t[0], t[n - 1]),
+            }
+        }
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        for gpa in [SECTION_GPA, SECTION_GPA + (2 << 20), FILE_GPA, FILE_GPA + (2 << 20)] {
+            put(m, 0x3000 + (gpa >> 21) * 8, &(gpa | 0x83).to_le_bytes());
+        }
+        // mov edi, base; mov ecx, 16; a byte written at rdi and rdi moved
+        // a page on, 16 times; out 0x80, al.
+        let writes = |base: u64| {
+            let mut b = vec![0xBF];
+            b.extend_from_slice(&u32::try_from(base).unwrap().to_le_bytes());
+            b.push(0xB9);
+            b.extend_from_slice(&PAGES.to_le_bytes());
+            b.extend_from_slice(&[0xC6, 0x07, 0x01, 0x81, 0xC7, 0x00, 0x10, 0x00, 0x00, 0xFF, 0xC9, 0x75, 0xF3, 0xE6, PORT as u8]);
+            b
+        };
+        put(m, PROGRAM, &[writes(SECTION_GPA), writes(FILE_GPA), vec![0xF4, 0xEB, 0xFD]].concat());
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: MEM as u64,
+                userspace_addr: m as u64,
+            })
+        }
+        .unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+        let (part, vp) = (vcpu.part(), vcpu.vp());
+        let view = |s: windows_sys::Win32::Foundation::HANDLE| {
+            // SAFETY: maps the test's section anywhere; checked.
+            let v = unsafe { MapViewOfFile(s, FILE_MAP_ALL_ACCESS, 0, 0, LEN) }.Value as usize;
+            assert_ne!(v, 0, "MapViewOfFile: {}", std::io::Error::last_os_error());
+            v
+        };
+        let rwx = whv::WHvMapGpaRangeFlagRead | whv::WHvMapGpaRangeFlagWrite | whv::WHvMapGpaRangeFlagExecute;
+        // SAFETY: an unnamed pagefile-backed section, closed below.
+        let section = unsafe {
+            CreateFileMappingW(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, LEN as u32, std::ptr::null())
+        };
+        assert!(!section.is_null());
+        let reserved = view(section);
+        let path = std::env::temp_dir().join(format!("wick-sectrec-whp-{}.tmp", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .attributes(0x100) // FILE_ATTRIBUTE_TEMPORARY
+            .custom_flags(0x0400_0000) // FILE_FLAG_DELETE_ON_CLOSE
+            .open(&path)
+            .unwrap();
+        file.set_len(LEN as u64).unwrap();
+        // SAFETY: a section of the whole file, closed below.
+        let file_section = unsafe { CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READWRITE, 0, 0, std::ptr::null()) };
+        assert!(!file_section.is_null());
+        let (noaccess, reader) = (view(file_section), view(file_section));
+        let mut old = 0;
+        // SAFETY: the test's view.
+        let protected = unsafe { VirtualProtect(noaccess as *const _, LEN, PAGE_NOACCESS, &mut old) } != 0;
+        let mut lines = Vec::new();
+        let mut wrong = Vec::new();
+        for (name, gpa, host) in [("SECTREC-a WHP, a SEC_RESERVE section's view", SECTION_GPA, reserved), ("SECTREC-c WHP, a memfd's no-access view", FILE_GPA, noaccess)] {
+            // SAFETY: the view stays mapped while the VM has it; unmapped below.
+            let hres = unsafe { whv::WHvMapGpaRange(part, host as *const _, gpa, LEN as u64, rwx) };
+            let mut line = format!(
+                "{name}: WHvMapGpaRange of its 4 MiB {:#010x}{}",
+                hres.cast_unsigned(),
+                if gpa == FILE_GPA { format!(" (the view made no-access: {protected})") } else { String::new() }
+            );
+            if hres != 0 {
+                lines.push(line + "; not run");
+                // The guest's pass over it would not end: step past it.
+                let past = writes(0).len() as u64 * if gpa == SECTION_GPA { 1 } else { 2 };
+                vcpu.set_regs(&kvm_regs { rip: PROGRAM + past, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+                continue;
+            }
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let (mut runs, mut handling, mut kinds) = (Vec::new(), Vec::new(), std::collections::BTreeMap::<String, u32>::new());
+            let end = loop {
+                if runs.len() > 4 * PAGES as usize {
+                    break "more exits than the step has writes".to_string();
+                }
+                if vcpu.shared.immediate_exit.load(Ordering::SeqCst) != 0 {
+                    break "none within 5 s (kicked)".to_string();
+                }
+                let t = Instant::now();
+                let ctx = match super::super::ffi::run_vp(part, vp) {
+                    Ok(c) => c,
+                    Err(e) => break format!("run failed, errno {}", e.errno()),
+                };
+                runs.push(us(t));
+                let t = Instant::now();
+                match ctx.ExitReason {
+                    whv::WHvRunVpExitReasonX64IoPortAccess => {
+                        let next = ctx.VpContext.Rip + super::super::exit::instruction_length(ctx.VpContext._bitfield);
+                        regs::set_rip(part, vp, next).unwrap();
+                        runs.pop();
+                        break "its out".to_string();
+                    }
+                    whv::WHvRunVpExitReasonMemoryAccess => {
+                        // SAFETY: the union arm matches the exit reason; the access-info bitfield overlaps the u32.
+                        let (at, info) = unsafe { (ctx.Anonymous.MemoryAccess.Gpa, ctx.Anonymous.MemoryAccess.AccessInfo.AsUINT32) };
+                        let kind = format!(
+                            "a memory access, {}{}",
+                            ["read", "write", "execute", "type 3"][(info & 3) as usize],
+                            if info & 4 != 0 { ", the GPA unmapped" } else { "" }
+                        );
+                        *kinds.entry(kind).or_default() += 1;
+                        if !(gpa..gpa + LEN as u64).contains(&at) {
+                            break format!("a memory exit at {at:#x}, outside the view");
+                        }
+                        let page = host + ((at - gpa) & !0xFFF) as usize;
+                        let done = if gpa == SECTION_GPA {
+                            // SAFETY: a page of the test's view.
+                            !unsafe { VirtualAlloc(page as *const _, 4096, MEM_COMMIT, PAGE_READWRITE) }.is_null()
+                        } else {
+                            // SAFETY: as above.
+                            let opened = unsafe { VirtualProtect(page as *const _, 4096, PAGE_READWRITE, &mut old) };
+                            opened != 0
+                        };
+                        handling.push(us(t));
+                        if !done {
+                            break format!("the page at {page:#x} not opened: {}", std::io::Error::last_os_error());
+                        }
+                    }
+                    reason => break format!("exit reason {reason:#x} at RIP {:#x}", ctx.VpContext.Rip),
+                }
+            };
+            drop(watchdog);
+            vcpu.set_kvm_immediate_exit(0);
+            if end != "its out" {
+                wrong.push(format!("{name}: {end}"));
+            }
+            line += &format!(
+                "; the guest's {PAGES} writes: ended by {end}; {} exits {kinds:?}, the run call {}, the test's {} after it {}",
+                runs.len(),
+                spread(&runs),
+                if gpa == SECTION_GPA { "commit (VirtualAlloc on the view)" } else { "open (VirtualProtect)" },
+                spread(&handling)
+            );
+            if gpa == SECTION_GPA {
+                line += &format!("; the view committed after: {} KiB", committed_bytes(reserved, LEN) / 1024);
+            } else {
+                let seen = (0..PAGES as usize)
+                    // SAFETY: a page of the test's other view, read-write.
+                    .filter(|&i| unsafe { ((reader + i * 4096) as *const u8).read_volatile() } == 1)
+                    .count();
+                line += &format!("; the other view reads {seen} of the {PAGES} writes");
+            }
+            lines.push(line);
+        }
+        for l in &lines {
+            eprintln!("{l}");
+        }
+        // SAFETY: the ranges mapped above, unmapped before the VM goes;
+        // then the test's views and sections.
+        unsafe {
+            whv::WHvUnmapGpaRange(part, SECTION_GPA, LEN as u64);
+            whv::WHvUnmapGpaRange(part, FILE_GPA, LEN as u64);
+        }
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: as above.
+        unsafe {
+            for v in [reserved, noaccess, reader] {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ });
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            windows_sys::Win32::Foundation::CloseHandle(file_section);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+        }
+        drop(file);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// ZEROREAD's lines on a guest write to memory WHP maps read only, on a
     /// partition without and then with the `GpaAccessFaultExit` extended
     /// exit (Learn, WHV_EXTENDED_VM_EXITS: "WHvRunVpExitReasonMemoryAccess
