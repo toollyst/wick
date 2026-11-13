@@ -1269,13 +1269,44 @@ fn msr_segment_base(index: u32) -> Option<WHV_REGISTER_NAME> {
     }
 }
 
-/// Reads MSRs into `msrs`, from the WHP registers they map to. MSRs with no
-/// WHP register are left at 0 (their reset value), as a guest MSR read of an
-/// unmodelled MSR would see.
+/// Whether `KVM_GET_MSRS` and `KVM_SET_MSRS` have `index` here: an MSR with
+/// a WHP register or a segment's base, one the vCPU keeps (kvm-clock's two,
+/// IA32_TSC_DEADLINE, [`KVM_SOFTWARE_MSRS`]), or one of KVM's that a
+/// partition has only on some hosts ([`LISTED_WHERE_PRESENT`], the MTRRs),
+/// which stays as it was where the partition lacks it: read as 0, a write
+/// dropped (Firecracker's boot writes IA32_MTRR_DEF_TYPE on every host).
+///
+/// Any other MSR is one this backend keeps nowhere, so a value written to
+/// it would reach no guest: it ends the call, as an MSR KVM does not have
+/// ends KVM's.
+pub(crate) fn has_msr(index: u32) -> bool {
+    msr_register(index).is_some()
+        || msr_segment_base(index).is_some()
+        || LISTED_WHERE_PRESENT.iter().any(|&(i, _)| i == index)
+        || mtrr_register(index).is_some()
+        || matches!(
+            index,
+            super::pvclock::MSR_WALL_CLOCK | super::pvclock::MSR_SYSTEM_TIME | super::tscdeadline::MSR_TSC_DEADLINE
+        )
+}
+
+/// Reads MSRs into `msrs`, from the WHP registers they map to, up to the
+/// first one the backend does not have ([`has_msr`]); returns how many
+/// were read, as KVM does (Linux v6.1 arch/x86/kvm/x86.c, `__msr_io`: the
+/// loop breaks at the first MSR `do_get_msr` fails for and returns its
+/// position, and `kvm_get_msr_ignored_check` fails for one KVM has no case
+/// for unless the module was loaded with `ignore_msrs`). Upstream reports
+/// the MSR at that position (`KvmVcpuError::VcpuGetMsr`). Before, every MSR
+/// counted, so a CPU template's modifier of an MSR kept nowhere (0x10a,
+/// IA32_ARCH_CAPABILITIES, in T2S and T2CL) was read as 0, modified, and
+/// dropped at the write without a word.
 pub(crate) fn get_msrs(part: WHV_PARTITION_HANDLE, vp: u32, msrs: &mut Msrs) -> Result<usize> {
     let entries = msrs.as_mut_slice();
     let mut count = 0;
     for e in entries.iter_mut() {
+        if !has_msr(e.index) {
+            break;
+        }
         if let Some(name) = msr_register(e.index) {
             e.data = as_u64(&ffi::get_register(part, vp, name)?);
         } else if let Some(seg) = msr_segment_base(e.index) {
@@ -1289,9 +1320,10 @@ pub(crate) fn get_msrs(part: WHV_PARTITION_HANDLE, vp: u32, msrs: &mut Msrs) -> 
     Ok(count)
 }
 
-/// Writes MSRs to the WHP registers they map to; unmapped MSRs are ignored
-/// (WHP models the architectural MSRs itself), as KVM ignores writes to MSRs
-/// it has no state for when they match the reset value.
+/// Writes MSRs to the WHP registers they map to, up to the first one the
+/// backend does not have ([`has_msr`]), and returns how many that is, as
+/// KVM's `__msr_io` does ([`get_msrs`]); upstream fails on a count short of
+/// the list (`VcpuSetMsrsIncomplete`, `MsrError::SetMsrsIncomplete`).
 ///
 /// IA32_TSC goes last. KVM takes the host's writes of IA32_TSC and
 /// IA32_TSC_ADJUST as independent (x86.c, kvm_set_msr_common: only a
@@ -1302,9 +1334,9 @@ pub(crate) fn get_msrs(part: WHV_PARTITION_HANDLE, vp: u32, msrs: &mut Msrs) -> 
 /// (`test_tsc_and_its_adjust_restore_as_saved`, on WHP).
 pub(crate) fn set_msrs(part: WHV_PARTITION_HANDLE, vp: u32, msrs: &Msrs) -> Result<usize> {
     const IA32_TSC: u32 = 0x10;
-    let entries = msrs.as_slice();
+    let count = msrs.as_slice().iter().take_while(|e| has_msr(e.index)).count();
+    let entries = &msrs.as_slice()[..count];
     let ordered = entries.iter().filter(|e| e.index != IA32_TSC).chain(entries.iter().filter(|e| e.index == IA32_TSC));
-    let mut count = 0;
     for e in ordered {
         if let Some(name) = msr_register(e.index) {
             ffi::set_register(part, vp, name, reg64(e.data))?;
@@ -1313,7 +1345,6 @@ pub(crate) fn set_msrs(part: WHV_PARTITION_HANDLE, vp: u32, msrs: &Msrs) -> Resu
             value.Segment.Base = e.data;
             ffi::set_register(part, vp, seg, value)?;
         }
-        count += 1;
     }
     Ok(count)
 }
@@ -1385,6 +1416,23 @@ mod tests {
         idx.sort_unstable();
         idx.dedup();
         assert_eq!(idx.len(), c.len());
+    }
+
+    // KVM_GET_MSRS and KVM_SET_MSRS end at an MSR kept nowhere: 2 to 4,
+    // which upstream's tests take for MSRs KVM lacks, and 0x10a
+    // (IA32_ARCH_CAPABILITIES), the one MSR upstream's templates modify
+    // (T2S, T2CL), which KVM keeps per vCPU and no WHP register holds.
+    // What Firecracker's boot and a restore write stays: the boot entries
+    // (arch/x86_64/msr.rs, create_boot_msr_entries) and kvm-clock's.
+    #[test]
+    fn test_msrs_kept_nowhere_end_the_call() {
+        for kept_nowhere in [2, 3, 4, 0x10a, 0xce, 0x8b] {
+            assert!(!has_msr(kept_nowhere), "{kept_nowhere:#x}");
+        }
+        let boot = [0x174, 0x175, 0x176, 0xc000_0081, 0xc000_0083, 0xc000_0102, 0xc000_0084, 0xc000_0082, 0x10, 0x1a0, 0x2ff];
+        for kept in boot.into_iter().chain([0x4b56_4d00, 0x4b56_4d01, 0x6e0, 0x3b, 0x48, 0xc000_0100, 0xc000_0080]) {
+            assert!(has_msr(kept), "{kept:#x}");
+        }
     }
 
     #[test]

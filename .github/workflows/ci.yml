@@ -858,6 +858,13 @@ jobs:
           # 43377614564 found every vCPU's (stale frames of an exception
           # raised and caught inside WinHvPlatform.dll).
           alone whp::vcpu::fpu_tests::test_the_stack_each_call_commits_on_record
+          # What a CPU template's changes come to on WHP (TMPLTEST lines):
+          # the guest's CPUID against a changed table (EAX and EDX asserted),
+          # an XSETBV the table's leaf 0xd does not allow (KVM: #GP), and
+          # for 0x10a, the MSR upstream's T2S and T2CL modify, and others no
+          # WHP register holds: KVM_GET_MSRS and KVM_SET_MSRS end there
+          # (asserted), and whether a guest's RDMSR comes to the backend.
+          alone whp::vcpu::fpu_tests::test_what_a_cpu_template_changes_on_record
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
           alone windows_fd::tests::test_non_blocking_pipe_writes_on_record

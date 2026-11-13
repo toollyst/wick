@@ -112,10 +112,6 @@ bug clippy-tracing exec_error
 bug vmm arch::x86_64::interrupts::tests::test_setlint_fails
 #   (set_lint succeeds on a vCPU of a VM without an irqchip (interrupts.rs:151,
 #   unwrap_err of Ok); on KVM its KVM_GET_LAPIC fails there)
-bug vmm arch::x86_64::msr::tests::test_set_invalid_msrs
-#   (set_msrs of MSR 2, which KVM does not support, succeeds (msr.rs:537))
-bug vmm arch::x86_64::vcpu::tests::test_get_msrs_with_invalid_msr_index
-#   (get_msrs of MSRs 2..=4, which KVM does not support, succeeds (vcpu.rs:1214))
 bug vmm arch::x86_64::vm::tests::test_vm_save_restore_state
 #   (save_state of a VM without irqchip, clock or PIT succeeds (vm.rs:284))
 error-text vmm vstate::vm::tests::test_register_memory_regions

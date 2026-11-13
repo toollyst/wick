@@ -729,7 +729,7 @@ impl VcpuFd {
         let n = regs::get_msrs(self.part(), self.vp(), msrs)?;
         // The kvm-clock MSRs and IA32_TSC_DEADLINE are this backend's (see
         // `pvclock`, `tscdeadline`).
-        for e in msrs.as_mut_slice() {
+        for e in msrs.as_mut_slice().iter_mut().take(n) {
             match e.index {
                 pvclock::MSR_SYSTEM_TIME => e.data = self.shared.system_time_msr.load(Ordering::Acquire),
                 pvclock::MSR_WALL_CLOCK => e.data = self.shared.inner.pvclock.lock().unwrap().wall_msr,
@@ -742,7 +742,7 @@ impl VcpuFd {
     }
     pub fn set_msrs(&self, msrs: &Msrs) -> Result<usize> {
         let n = regs::set_msrs(self.part(), self.vp(), msrs)?;
-        for e in msrs.as_slice() {
+        for e in msrs.as_slice().iter().take(n) {
             if e.index == MSR_TSC_DEADLINE {
                 self.write_tsc_deadline(e.data)?;
             } else if regs::software_msr(e.index) {
@@ -1600,6 +1600,8 @@ impl VcpuFd {
         m: &whv::WHV_X64_MSR_ACCESS_CONTEXT,
         rip_after: u64,
     ) -> Result<()> {
+        #[cfg(test)]
+        MSR_INTERCEPTS.with(|c| c.set(c.get() + 1));
         // SAFETY: the access-info bitfield overlaps the u32.
         let (is_write, value) = super::exit::msr_access(unsafe { m.AccessInfo.AsUINT32 }, m.Rax, m.Rdx);
         let index = m.MsrNumber;
@@ -1631,6 +1633,14 @@ impl VcpuFd {
             regs::set_msr_result(self.part(), self.vp(), value, rip_after)
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The MSR intercepts this thread's runs have answered: a record test
+    /// reads it around a guest's RDMSR to say whether the access came to
+    /// the backend or WHP answered it.
+    static MSR_INTERCEPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Makes every vCPU of `inner`'s partition but `except` leave the guest,
@@ -2996,6 +3006,180 @@ mod fpu_tests {
             "a run of a halted vCPU, ended by a kick",
         ] {
             on_a_thread_of_its_own(&mut vcpu, name, run_to_a_line);
+        }
+
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
+    /// Code a record test enters with the registers it has set: one
+    /// instruction, then `out 0x80, al; jmp $`.
+    const CPUID_AT: u64 = 0x7800;
+    const RDMSR_AT: u64 = 0x7810;
+    const WRMSR_AT: u64 = 0x7820;
+    const XSETBV_AT: u64 = 0x7830;
+    /// The #GP and #UD handlers: `out 0x8d, al` and `out 0x86, al`.
+    const GP_AT: u64 = 0x7840;
+    const UD_AT: u64 = 0x7850;
+    const IDT: u64 = 0x5000;
+
+    fn probes(m: *mut u8) {
+        put(m, CPUID_AT, &[0x0F, 0xA2, 0xE6, PORT as u8, 0xEB, 0xFE]);
+        put(m, RDMSR_AT, &[0x0F, 0x32, 0xE6, PORT as u8, 0xEB, 0xFE]);
+        put(m, WRMSR_AT, &[0x0F, 0x30, 0xE6, PORT as u8, 0xEB, 0xFE]);
+        put(m, XSETBV_AT, &[0x0F, 0x01, 0xD1, 0xE6, PORT as u8, 0xEB, 0xFE]);
+        put(m, GP_AT, &[0xE6, 0x8D, 0xEB, 0xFE]);
+        put(m, UD_AT, &[0xE6, 0x86, 0xEB, 0xFE]);
+        // 64-bit interrupt gates (type 0xE, present, code segment 8).
+        for (vector, handler) in [(6u64, UD_AT), (13, GP_AT)] {
+            let gate = (handler & 0xFFFF) | (8 << 16) | (0x8E << 40) | (((handler >> 16) & 0xFFFF) << 48);
+            put(m, IDT + vector * 16, &gate.to_le_bytes());
+            put(m, IDT + vector * 16 + 8, &(handler >> 32).to_le_bytes());
+        }
+    }
+
+    /// The vCPU entered at `at` with `rax`, `rcx` and `rdx`: how the run
+    /// ended (the instruction done, #GP, #UD, or the exit's line) and the
+    /// registers then.
+    fn probe(vcpu: &mut VcpuFd, at: u64, rax: u64, rcx: u64, rdx: u64) -> (String, kvm_regs) {
+        vcpu.set_regs(&kvm_regs { rip: at, rsp: 0x9000, rflags: 2, rax, rcx, rdx, ..Default::default() }).unwrap();
+        let how = match run_to_a_line(vcpu).as_str() {
+            "exit IoOut port 0x80" => "done".to_string(),
+            "exit IoOut port 0x8d" => "#GP".to_string(),
+            "exit IoOut port 0x86" => "#UD".to_string(),
+            other => other.to_string(),
+        };
+        (how, vcpu.get_regs().unwrap())
+    }
+
+    /// A record of what a CPU template's changes come to on WHP, for the
+    /// leaves and the MSR upstream's templates modify
+    /// (tests/data/custom_cpu_templates: CPUID 0x1, 0x7, 0xd, 0x80000001,
+    /// 0x80000008, and on Sapphire Rapids 0x1d, 0x1e; MSR 0x10a in T2S and
+    /// T2CL):
+    ///
+    /// - CPUID: a table with bits flipped in each of those leaves, set with
+    ///   KVM_SET_CPUID2, against what the guest's CPUID returns. EAX and
+    ///   EDX are asserted (the backend answers the intercept from the
+    ///   table); EBX and ECX are printed, with the bits that follow the
+    ///   vCPU's state (OSXSAVE, the XSAVE sizes).
+    /// - XCR0: with AVX cleared in the table's leaf 0xd, a guest's XSETBV
+    ///   of it. KVM refuses it with #GP (Linux v6.1 x86.c, `__kvm_set_xcr`:
+    ///   `xcr0 & ~(guest_supported_xcr0 | XFEATURE_MASK_FP)`, the mask
+    ///   being the guest's CPUID). WHP knows nothing of the table: printed.
+    /// - MSRs: for 0x10a and a few others no WHP register holds (0xce,
+    ///   0x8b, 2) and one that has a register (0x48), what KVM_GET_MSRS
+    ///   and KVM_SET_MSRS return, what a guest's RDMSR gets, and whether
+    ///   that RDMSR came to the backend. A guest's read of 0x10a that
+    ///   comes to the backend can be given a vCPU's own value, as KVM
+    ///   keeps one (`vcpu->arch.arch_capabilities`); one WHP answers
+    ///   cannot.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_what_a_cpu_template_changes_on_record() {
+        use core::arch::x86_64::__cpuid;
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        probes(m);
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        let mut s = vcpu.get_sregs().unwrap();
+        s.cr4 |= 1 << 18; // OSXSAVE, for XSETBV
+        (s.idt.base, s.idt.limit) = (IDT, 16 * 14 - 1);
+        vcpu.set_sregs(&s).unwrap();
+
+        let v = __cpuid(0);
+        let vendor: Vec<u8> = [v.ebx, v.edx, v.ecx].iter().flat_map(|r| r.to_le_bytes()).collect();
+        let fms = __cpuid(1).eax;
+        eprintln!("TMPLTEST host: {} family/model/stepping {fms:#x}", String::from_utf8_lossy(&vendor));
+
+        // CPUID.
+        let supported = regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap();
+        let mut table = supported.as_slice().to_vec();
+        let leaves = [(0x1u32, 0u32), (0x7, 0), (0x7, 1), (0xd, 0), (0xd, 1), (0x8000_0001, 0), (0x8000_0008, 0), (0x1d, 0), (0x1e, 0)];
+        let avx_in_xcr0 = table.iter().any(|e| e.function == 0xd && e.index == 0 && e.eax & 4 != 0);
+        for e in &mut table {
+            if !leaves.contains(&(e.function, e.index)) {
+                continue;
+            }
+            if (e.function, e.index) == (0xd, 0) {
+                e.eax &= !4;
+            } else {
+                (e.eax, e.ebx, e.ecx, e.edx) = (e.eax ^ 0x100, e.ebx ^ 0x8, e.ecx ^ 0x40_0000, e.edx ^ 0x2000_0000);
+            }
+        }
+        vcpu.set_cpuid2(&CpuId::from_entries(&table).unwrap()).unwrap();
+        for (function, index) in leaves {
+            let Some(e) = table.iter().find(|e| e.function == function && e.index == index) else {
+                eprintln!("TMPLTEST cpuid {function:#x}.{index}: not among the supported leaves of this host");
+                continue;
+            };
+            let (how, r) = probe(&mut vcpu, CPUID_AT, u64::from(function), u64::from(index), 0);
+            let (a, b, c, d) = (r.rax as u32, r.rbx as u32, r.rcx as u32, r.rdx as u32);
+            eprintln!(
+                "TMPLTEST cpuid {function:#x}.{index}: {how}; the table {:#x} {:#x} {:#x} {:#x}, the guest {a:#x} {b:#x} {c:#x} \
+                 {d:#x}; EBX differs in {:#x}, ECX in {:#x}",
+                e.eax,
+                e.ebx,
+                e.ecx,
+                e.edx,
+                e.ebx ^ b,
+                e.ecx ^ c
+            );
+            assert_eq!(how, "done", "cpuid {function:#x}.{index}");
+            assert_eq!((a, d), (e.eax, e.edx), "cpuid {function:#x}.{index}: EAX and EDX are the table's");
+        }
+
+        // XCR0 against the table's leaf 0xd.
+        if avx_in_xcr0 {
+            let (how, _) = probe(&mut vcpu, XSETBV_AT, 7, 0, 0);
+            let xcr0 = vcpu.get_xcrs().map(|x| x.xcrs[0].value);
+            eprintln!(
+                "TMPLTEST xsetbv of x87, SSE and AVX with AVX cleared in the table's leaf 0xd: {how}; XCR0 then {xcr0:x?} \
+                 (KVM: #GP, XCR0 unchanged)"
+            );
+        } else {
+            eprintln!("TMPLTEST xsetbv: this host's supported leaf 0xd has no AVX; not probed");
+        }
+
+        // MSRs.
+        for (index, name) in [
+            (0x10au32, "IA32_ARCH_CAPABILITIES"),
+            (0xce, "MSR_PLATFORM_INFO"),
+            (0x8b, "IA32_BIOS_SIGN_ID"),
+            (0x2, "MSR 2"),
+            (0x48, "IA32_SPEC_CTRL"),
+        ] {
+            let entry = |data| Msrs::from_entries(&[kvm_bindings::kvm_msr_entry { index, data, ..Default::default() }]).unwrap();
+            let mut one = entry(0);
+            let got = vcpu.get_msrs(&mut one).map(|n| (n, one.as_slice()[0].data));
+            let set = vcpu.set_msrs(&entry(0));
+            let before = MSR_INTERCEPTS.with(std::cell::Cell::get);
+            let (how, r) = probe(&mut vcpu, RDMSR_AT, 0, u64::from(index), 0);
+            let read_came = MSR_INTERCEPTS.with(std::cell::Cell::get) - before;
+            let value = (r.rdx << 32) | (r.rax & 0xFFFF_FFFF);
+            let before = MSR_INTERCEPTS.with(std::cell::Cell::get);
+            let (wrote, _) = probe(&mut vcpu, WRMSR_AT, r.rax & 0xFFFF_FFFF, u64::from(index), r.rdx & 0xFFFF_FFFF);
+            let write_came = MSR_INTERCEPTS.with(std::cell::Cell::get) - before;
+            eprintln!(
+                "TMPLTEST msr {index:#x} ({name}): KVM_GET_MSRS {got:x?}, KVM_SET_MSRS of 0 {set:?}; a guest's rdmsr: {how}, \
+                 value {value:#x}, intercepts at the backend {read_came}; its wrmsr of that value: {wrote}, intercepts \
+                 {write_came}"
+            );
+            if matches!(index, 0x10a | 0xce | 0x8b | 0x2) {
+                assert_eq!((got.map(|g| g.0).ok(), set.ok()), (Some(0), Some(0)), "{index:#x}: an MSR kept nowhere ends the call");
+            }
         }
 
         drop(vcpu);
