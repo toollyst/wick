@@ -16,7 +16,7 @@
 //! | `cpuset.cpus` | `cpuset.cpus` | the job's processor affinity ([`cpu_groups`]) |
 //! | `cpuset.mems` | `cpuset.mems` | every memory node of the host: nothing to bind ([`check_mems`]) |
 //! | `hugetlb.2MB.max` | `hugetlb.2MB.limit_in_bytes` | the large-page sections the jailer gives Firecracker, in all (`platform::large_pages`) |
-//! | `pids.max`, `hugetlb.<size>.max` = `max` | `pids.max` = `max`, `hugetlb.<size>.limit_in_bytes` = `-1` | no limit, as on Linux |
+//! | `pids.max`, `hugetlb.<size>.max`, `hugetlb.<size>.rsvd.max`, `memory.high`, `memory.swap.max`, `memory.swap.high`, `memory.zswap.max` = `max` | `pids.max` = `max`; `hugetlb.<size>.limit_in_bytes`, `hugetlb.<size>.rsvd.limit_in_bytes`, `memory.memsw.limit_in_bytes`, `memory.soft_limit_in_bytes` = `-1` | no limit, as on Linux ([`no_limit`]) |
 //!
 //! The CPU rate cap holds from Firecracker's start, as a cgroup's limit
 //! holds from the exec. Windows enforces the rate over its own scheduling
@@ -103,6 +103,7 @@ impl CgroupConfigurationBuilder {
             }
             (1, _) if controller == "freezer" => return Err(bad(READ_ONLY)),
             (2, "memory.max") | (1, "memory.limit_in_bytes") => {
+                let value = strstrip(&value);
                 let unlimited = if self.version == 2 { value == "max" } else { value == "-1" };
                 self.limits.memory_bytes = if unlimited {
                     None
@@ -183,10 +184,10 @@ impl CgroupConfigurationBuilder {
                     })?;
                 }
             }
-            (_, "pids.max") if value == "max" => {}
             // The host's large page is 2 MiB: its limit is the large-page
             // broker's (`large_pages`); other sizes have no pages here.
             (2, "hugetlb.2MB.max") | (1, "hugetlb.2MB.limit_in_bytes") => {
+                let value = strstrip(&value);
                 let unlimited = if self.version == 2 { value == "max" } else { value == "-1" };
                 self.limits.large_page_bytes = if unlimited {
                     None
@@ -194,8 +195,9 @@ impl CgroupConfigurationBuilder {
                     Some(value.parse().map_err(|_| bad("not a number of bytes"))?)
                 };
             }
-            (2, f) if f.starts_with("hugetlb.") && f.ends_with(".max") && value == "max" => {}
-            (1, f) if f.starts_with("hugetlb.") && f.ends_with(".limit_in_bytes") && value == "-1" => {}
+            // A limit file at the value that sets no limit: nothing to
+            // enforce, so nothing is accepted without effect.
+            (version, f) if no_limit(version, f, &value) => {}
             (version, f) => {
                 return Err(match impossible(version, f) {
                     Some(why) => HostError::ImpossibleCgroup(cg(), why).into(),
@@ -257,6 +259,63 @@ const MEMS_BIND: &str = "Windows cannot bind a process's memory to NUMA nodes; o
                          memory node of the host, which binds nothing, is accepted";
 
 use crate::platform::freezer_values::{READ_ONLY, STATE_VALUES};
+
+/// A value as Linux's cgroup files take it: they strip the white space
+/// around what is written before they parse it (`strstrip`, lib/string.c,
+/// in each write handler named at [`no_limit`]; the kernel's `isspace` is
+/// the C locale's, U+00A0 besides, which no value here holds).
+fn strstrip(value: &str) -> &str {
+    value.trim_matches(|c| matches!(c, ' ' | '\t'..='\r'))
+}
+
+/// Whether `file` = `value` is one of Linux's limit files at the value that
+/// sets no limit, the file's default, which the jailer accepts although the
+/// host has no such limit: there is nothing to enforce. From Linux v6.1,
+/// each handler parsing with `page_counter_memparse(buf, <max>, ..)`
+/// (mm/page_counter.c: a string equal to `<max>` is `PAGE_COUNTER_MAX`)
+/// unless noted:
+///
+/// - `pids.max` = `max`, both versions (kernel/cgroup/pids.c
+///   `pids_max_write`: `PIDS_MAX_STR`);
+/// - v2, `max`: `hugetlb.<size>.max` and `.rsvd.max` (mm/hugetlb_cgroup.c
+///   `hugetlb_cgroup_write_dfl`), `memory.high` (mm/memcontrol.c
+///   `memory_high_write`), `memory.swap.max` (`swap_max_write`),
+///   `memory.swap.high` (`swap_high_write`), `memory.zswap.max`
+///   (`zswap_max_write`);
+/// - v1, `-1`: `hugetlb.<size>.limit_in_bytes` and `.rsvd.limit_in_bytes`
+///   (`hugetlb_cgroup_write_legacy`), `memory.memsw.limit_in_bytes` and
+///   `memory.soft_limit_in_bytes` (mm/memcontrol.c `mem_cgroup_write`).
+///
+/// `memory.max` and `memory.limit_in_bytes`, and `hugetlb.2MB`'s own limit,
+/// are limits Windows has, with arms of their own. Not here: `memory.min`
+/// and `memory.low`, whose default is 0; their `max` protects all of a
+/// cgroup's memory, which is no absence of a limit.
+fn no_limit(version: u8, file: &str, value: &str) -> bool {
+    let value = strstrip(value);
+    let hugetlb = |suffix: &str| {
+        file.strip_prefix("hugetlb.")
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .is_some_and(|size| !size.is_empty() && !size.contains('.'))
+    };
+    match version {
+        2 => {
+            value == "max"
+                && (matches!(
+                    file,
+                    "pids.max" | "memory.high" | "memory.swap.max" | "memory.swap.high" | "memory.zswap.max"
+                ) || hugetlb(".max")
+                    || hugetlb(".rsvd.max"))
+        }
+        1 => {
+            (file == "pids.max" && value == "max")
+                || (value == "-1"
+                    && (matches!(file, "memory.memsw.limit_in_bytes" | "memory.soft_limit_in_bytes")
+                        || hugetlb(".limit_in_bytes")
+                        || hugetlb(".rsvd.limit_in_bytes")))
+        }
+        _ => false,
+    }
+}
 
 /// Why Windows cannot do what the cgroup file `file` does, for the
 /// controllers and files Windows has no counterpart for.
@@ -575,6 +634,91 @@ mod tests {
         assert!(reason(2, "pids.max=100").contains("threads"));
         assert!(reason(1, "pids.max=1").contains("threads"));
         assert_eq!(limits(2, &["pids.max=max"]).unwrap(), Limits::default());
+    }
+
+    // Linux's limit files at the value that sets no limit are accepted,
+    // with the white space Linux strips; the same files with a limit, the
+    // other version's spelling of no limit, and memory.min and memory.low
+    // (whose `max` is no absence of a limit) are refused. The same set as
+    // macOS's backend takes.
+    #[test]
+    fn test_no_limit_values_are_accepted() {
+        let v2 = [
+            "pids.max",
+            "hugetlb.2MB.max",
+            "hugetlb.1GB.max",
+            "hugetlb.2MB.rsvd.max",
+            "hugetlb.1GB.rsvd.max",
+            "memory.high",
+            "memory.swap.max",
+            "memory.swap.high",
+            "memory.zswap.max",
+            "memory.max",
+        ];
+        for f in v2 {
+            for v in ["max", " max", "max\n", "\t max \r\n"] {
+                assert_eq!(limits(2, &[&format!("{f}={v}")]).unwrap(), Limits::default(), "{f}={v:?}");
+            }
+            for v in ["-1", "MAX", "ma x", ""] {
+                assert!(limits(2, &[&format!("{f}={v}")]).is_err(), "{f}={v:?}");
+            }
+        }
+        let v1 = [
+            "hugetlb.2MB.limit_in_bytes",
+            "hugetlb.1GB.limit_in_bytes",
+            "hugetlb.2MB.rsvd.limit_in_bytes",
+            "hugetlb.1GB.rsvd.limit_in_bytes",
+            "memory.memsw.limit_in_bytes",
+            "memory.soft_limit_in_bytes",
+            "memory.limit_in_bytes",
+        ];
+        for f in v1 {
+            for v in ["-1", " -1", "-1\n"] {
+                assert_eq!(limits(1, &[&format!("{f}={v}")]).unwrap(), Limits::default(), "{f}={v:?}");
+            }
+            for v in ["max", "- 1", ""] {
+                assert!(limits(1, &[&format!("{f}={v}")]).is_err(), "{f}={v:?}");
+            }
+        }
+        assert_eq!(limits(1, &["pids.max=max"]).unwrap(), Limits::default());
+        assert_eq!(limits(1, &["pids.max= max\n"]).unwrap(), Limits::default());
+        assert!(limits(1, &["pids.max=-1"]).is_err());
+        // A limit in any of them is refused: Windows has none of these.
+        for (v, p) in [
+            (2, "memory.high=1048576"),
+            (2, "memory.swap.max=0"),
+            (2, "memory.swap.high=1048576"),
+            (2, "memory.zswap.max=0"),
+            (2, "hugetlb.2MB.rsvd.max=2097152"),
+            (2, "hugetlb.1GB.max=1073741824"),
+            (1, "memory.memsw.limit_in_bytes=1048576"),
+            (1, "memory.soft_limit_in_bytes=1048576"),
+            (1, "hugetlb.2MB.rsvd.limit_in_bytes=2097152"),
+            // The default of these two is 0, and their `max` is the most
+            // protection, not none.
+            (2, "memory.min=max"),
+            (2, "memory.low=max"),
+            (2, "memory.min=0"),
+            (2, "memory.low=0"),
+            // One version's file with the other version.
+            (1, "memory.high=max"),
+            (1, "memory.swap.max=max"),
+            (2, "memory.memsw.limit_in_bytes=-1"),
+            (2, "memory.soft_limit_in_bytes=-1"),
+            (1, "hugetlb.2MB.max=max"),
+            (2, "hugetlb.2MB.limit_in_bytes=-1"),
+            // No page size named.
+            (2, "hugetlb.max=max"),
+            (2, "hugetlb..max=max"),
+        ] {
+            assert!(limits(v, &[p]).is_err(), "v{v} {p}");
+        }
+        // A limit, then no limit: the later value holds, as the later write
+        // to the file does.
+        assert_eq!(limits(2, &["hugetlb.2MB.max=2097152", "hugetlb.2MB.max= max"]).unwrap(), Limits::default());
+        assert_eq!(limits(2, &["memory.max=1048576", "memory.max=max\n"]).unwrap(), Limits::default());
+        // A limit with white space around it, as Linux takes it.
+        assert_eq!(limits(2, &["memory.max= 1048576\n"]).unwrap().memory_bytes, Some(1 << 20));
     }
 
     #[test]
