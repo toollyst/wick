@@ -4241,9 +4241,10 @@ mod macos {
             println!("CHILD-SURVIVED");
         }
 
-        // An IP socket is made after narrow() (Seatbelt checks no family when
-        // a socket is made: socket is decided by system-socket, which covers
-        // other families), and connecting it raises SIGSYS.
+        // An IP socket is made after narrow() (socket is decided by
+        // system-socket, which Seatbelt does not consult for an IP socket:
+        // test_system_socket_is_not_consulted_for_these), and connecting it
+        // raises SIGSYS.
         #[test]
         fn test_ip_sockets_are_made_but_not_used() {
             use std::os::unix::process::ExitStatusExt;
@@ -4277,6 +4278,84 @@ mod macos {
             }
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
+        }
+
+        /// The families of [`test_system_socket_is_not_consulted_for_these`]:
+        /// name, domain, type, protocol, and whether Seatbelt consulted
+        /// `system-socket` when one was made on macOS 27.2.
+        const SOCKET_DOMAINS: &[(&str, i32, i32, i32, bool)] = &[
+            ("AF_UNIX", libc::AF_UNIX, libc::SOCK_STREAM, 0, false),
+            ("AF_INET", libc::AF_INET, libc::SOCK_STREAM, 0, false),
+            ("AF_INET6", libc::AF_INET6, libc::SOCK_STREAM, 0, false),
+            ("AF_ROUTE", libc::AF_ROUTE, libc::SOCK_RAW, 0, true),
+            ("AF_SYSTEM", libc::AF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL, true),
+        ];
+
+        // Why an IP socket is still made after narrow(): the kernel asks the
+        // MAC policies about every socket made, whatever its family
+        // (xnu-12377.1.9 bsd/kern/uipc_syscalls.c socket_common calls
+        // mac_socket_check_create, security/mac_socket.c, with the domain),
+        // but Sandbox.kext does not consult `system-socket` for a Unix or IP
+        // one: under `(deny system-socket)` they are made, a routing and a
+        // kernel control socket fail with EPERM. Measured on macOS 27.2;
+        // this sentinel fails there if that changes (a macOS that consults
+        // it for IP sockets lets the run phase refuse them when made, as
+        // Linux's filters refuse socket(AF_INET)), and on another major
+        // prints what it finds (CI runs it on macOS 15 and 26 with
+        // --nocapture).
+        #[test]
+        fn test_system_socket_is_not_consulted_for_these() {
+            let major = macos_major();
+            let out = child("socket_domain_child", &[]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && stdout.contains("APPLIED"), "{}", text(&out));
+            let mut found = Vec::new();
+            for (name, .., consulted) in SOCKET_DOMAINS {
+                let plain = format!("{name} plain made");
+                assert!(stdout.contains(&plain), "{name} is not made with no sandbox: {}", text(&out));
+                let sandboxed = format!("{name} sandboxed ");
+                let line = stdout.lines().find(|l| l.starts_with(&sandboxed)).unwrap_or("no line");
+                let made = line == format!("{name} sandboxed made");
+                println!("macOS {major}, under (deny system-socket): {line}");
+                found.push((*name, made, *consulted));
+            }
+            if major != 27 {
+                println!("macOS {major} is not measured: printed only");
+                return;
+            }
+            for (name, made, consulted) in found {
+                assert_eq!(
+                    made,
+                    !consulted,
+                    "macOS 27: Seatbelt {} system-socket for {name} now; if it consults it for IP sockets, \
+                     the run phase can refuse them when made (RUN_DENIED_OPERATIONS), as Linux's filters \
+                     refuse socket(AF_INET); update SOCKET_DOMAINS and COMPATIBILITY.md's Argument checks\n{}",
+                    if made { "skips" } else { "consults" },
+                    text(&out)
+                );
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_system_socket_is_not_consulted_for_these in a separate process"]
+        fn socket_domain_child() {
+            let make = |phase: &str| {
+                for (name, domain, kind, protocol, _) in SOCKET_DOMAINS {
+                    // SAFETY: plain calls; the descriptor is closed.
+                    let fd = unsafe { libc::socket(*domain, *kind, *protocol) };
+                    if fd >= 0 {
+                        // SAFETY: the descriptor made above.
+                        unsafe { libc::close(fd) };
+                        println!("{name} {phase} made");
+                    } else {
+                        println!("{name} {phase} failed: {}", std::io::Error::last_os_error());
+                    }
+                }
+            };
+            make("plain");
+            install("(version 1)(allow default)(deny system-socket)").unwrap();
+            println!("APPLIED");
+            make("sandboxed");
         }
 
         // IP networking: on Linux socket(AF_INET) is outside every filter.

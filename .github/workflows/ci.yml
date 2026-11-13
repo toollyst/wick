@@ -493,11 +493,17 @@ jobs:
         run: |
           sw_vers
           cargo test --locked -p vmm --lib "ext::sandbox" -- \
-            --skip ext::sandbox::macos::tests::test_sigsys_handler_work_ends_the_process_within_its_deadline
+            --skip ext::sandbox::macos::tests::test_sigsys_handler_work_ends_the_process_within_its_deadline \
+            --skip ext::sandbox::macos::tests::test_system_socket_is_not_consulted_for_these
           # Alone and with --nocapture, so its stages and their distribution
           # (SIGSYS_DEADLINE's measurement) are in the log, passing or not.
           cargo test --locked -p vmm --lib \
             ext::sandbox::macos::tests::test_sigsys_handler_work_ends_the_process_within_its_deadline \
+            -- --exact --nocapture
+          # Which socket families Seatbelt consults system-socket for: measured
+          # on macOS 27.2 only, so on these majors it prints what it finds.
+          cargo test --locked -p vmm --lib \
+            ext::sandbox::macos::tests::test_system_socket_is_not_consulted_for_these \
             -- --exact --nocapture
       # The API process's profile test once failed on macos-15 with its child
       # dead before its first marker (c7d32e2); run alone, repeatedly, it
