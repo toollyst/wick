@@ -618,6 +618,17 @@ def map_name(symbols, rva):
     return f"{symbols[i][1]}+{rva - symbols[i][0]:#x}" if i >= 0 else ""
 
 
+def symbol_text(chars, name_len, max_len):
+    """SYMBOL_INFO's name from the `max_len` characters of its Name buffer:
+    `NameLen` of them, "not including the null-terminating character"
+    (Microsoft Learn, SYMBOL_INFO), at most the buffer's `MaxNameLen`, and
+    ended at the first NUL. A name longer than the buffer (a vm-memory
+    iterator's, on a PC) came back with a NameLen past the buffer, and the
+    characters read past it were whatever the memory there held, which a
+    cp949 console could not print."""
+    return chars[:min(name_len, max_len)].split("\0", 1)[0]
+
+
 class Symbols:
     """dbghelp's nearest symbol for an address in one of the process's
     images: a PDB beside the image names its functions (firecracker.pdb),
@@ -667,8 +678,8 @@ class Symbols:
         displacement = ctypes.c_uint64()
         if not self.dbghelp.SymFromAddrW(self.handle, address, ctypes.byref(displacement), ctypes.addressof(buf)):
             return ""
-        text = ctypes.wstring_at(ctypes.addressof(buf) + SYMBOL_INFOW.Name.offset, info.NameLen)
-        return f"{text}+{displacement.value:#x}"
+        chars = ctypes.wstring_at(ctypes.addressof(buf) + SYMBOL_INFOW.Name.offset, self.MAX_NAME)
+        return f"{symbol_text(chars, info.NameLen, self.MAX_NAME)}+{displacement.value:#x}"
 
     def close(self):
         if self.dbghelp is not None:
@@ -1001,6 +1012,11 @@ def selftest():
     assert largest_frames(found, high, lambda value: "")[0] == (0x27d8, 0x2800, "b.dll+0xabc", "")
     assert dos_path({"\\device\\harddiskvolume3": "C:"}, "\\Device\\HarddiskVolume3\\x\\a.exe") == "C:\\x\\a.exe"
     assert ctypes.sizeof(SYMBOL_INFOW) == 88 and SYMBOL_INFOW.Name.offset == 84
+    # A name within the buffer; one longer than it, cut there; a NameLen
+    # past a NUL, cut at the NUL.
+    assert symbol_text("abc\0zzz", 3, 8) == "abc"
+    assert symbol_text("abcdefgh", 4000, 8) == "abcdefgh"
+    assert symbol_text("ab\0\ua390\u3000", 6, 8) == "ab"
     # A heap's later segment: the signature and a heap of the process.
     header = bytes(0x10) + struct.pack("<IIQ", HEAP_SEGMENT_SIGNATURE, 0, 0x1b935590000)
     assert heap_of_segment(header, {0x1b935590000}) == 0x1b935590000
