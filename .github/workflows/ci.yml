@@ -689,6 +689,9 @@ jobs:
     runs-on: windows-latest
     # The unit-test step builds every package's tests (vmm's among them).
     timeout-minutes: 60
+    # Whether the kit was uploaded: windows-guest runs on it.
+    outputs:
+      kit: ${{ steps.kit.outcome }}
     defaults:
       run:
         shell: bash
@@ -859,6 +862,7 @@ jobs:
       # For validation on Windows hardware with WHP (tools/windows/boot-test.ps1,
       # jailer-test.ps1): everything the stages need, at the paths they look in.
       - name: Upload Windows binaries
+        id: kit
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wick-windows-x86_64-${{ github.sha }}
@@ -1303,7 +1307,12 @@ jobs:
     # linux-boot makes the snapshot of the linux-snapshot stage; without it
     # that stage alone fails, saying what it lacks.
     needs: [windows, linux-boot]
-    if: ${{ !cancelled() && needs.windows.result == 'success' }}
+    # Runs whenever the windows job uploaded the kit, also when a step after
+    # the upload failed (the unit tests run after it): such a failure keeps
+    # the windows job, and so the run, red, and does not take the guests'
+    # results with it. Run 43480682094 (4999ff6) skipped this job for three
+    # failing unit tests and so never showed whether its guests booted.
+    if: ${{ !cancelled() && needs.windows.outputs.kit == 'success' }}
     runs-on: windows-latest
     timeout-minutes: 90
     defaults:
