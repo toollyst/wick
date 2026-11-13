@@ -957,6 +957,13 @@ jobs:
           # in its jobs from the top level down (TOOLTEST live lines: what
           # Windows answers each write of a job that has jobs nested under
           # it, each job's cap, each process's processors and CPU time).
+          # Built in this step: the probes' build step does not run once a
+          # step before it failed, and this one does (run 43397419784: the
+          # harness step failed, and this step found no jail-parent-test.exe).
+          if ! rustc --edition 2021 --test -o "$RUNNER_TEMP/jail-parent-test.exe" ../../tools/windows/jail-parent.rs; then
+            echo "::error::jail-parent's tests did not build"
+            failed=1
+          fi
           out=$("$RUNNER_TEMP/jail-parent-test.exe" --include-ignored --nocapture --test-threads=1 2>&1) || true
           printf '%s\n' "$out"
           # Every test of the binary must pass (it holds the shared value
