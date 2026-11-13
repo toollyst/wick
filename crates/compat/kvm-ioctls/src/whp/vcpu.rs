@@ -3277,6 +3277,7 @@ mod fpu_tests {
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_the_stack_each_whp_call_commits_on_record() {
+        const FRESH_PAGES: &str = "a write to each 4 KiB page from 2 MiB to 4 MiB, which nothing wrote before";
         const PROGRAM: u64 = 0xB000;
         const HANDLER: u64 = 0xB800;
         const AP_CODE: u64 = 0xC000;
@@ -3287,6 +3288,8 @@ mod fpu_tests {
         let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
         // A page 6 MiB up that no memory slot backs: an MMIO address.
         q(0x3018, 0x60_0000 | 0x83);
+        // The second 2 MiB of the slot, which nothing on the host writes.
+        q(0x3008, 0x20_0000 | 0x83);
         // The local APIC's page, 0xFEE0_0000: the fourth GiB's directory at
         // 0xA000, its 2 MiB page 0x1f7.
         q(0x2018, 0xA000 | 3);
@@ -3316,6 +3319,23 @@ mod fpu_tests {
             b
         };
         let steps: Vec<(&str, Vec<u8>)> = vec![
+            // A booted guest's vCPU thread: one WHvRunVirtualProcessor took
+            // its stack from 16 or 20 to 52 KiB on a PC (81f7970's traced
+            // boot, every vCPU; nothing else grew it), which no step below
+            // did. A booting guest touches memory nothing touched before;
+            // whether WHP's handling of that, inside the run call, is what
+            // commits it: printed, not bounded (`FRESH_PAGES`).
+            (
+                FRESH_PAGES,
+                vec![
+                    0xBF, 0x00, 0x00, 0x20, 0x00, // mov edi, 0x200000
+                    0xB9, 0x00, 0x02, 0x00, 0x00, // mov ecx, 512
+                    0xC6, 0x07, 0x01, // mov byte [rdi], 1
+                    0x81, 0xC7, 0x00, 0x10, 0x00, 0x00, // add edi, 0x1000
+                    0xFF, 0xC9, // dec ecx
+                    0x75, 0xF3, // jnz to the mov
+                ],
+            ),
             (
                 "CPUID leaves 1, 7, 0xd.0 and 0xd.1",
                 vec![
@@ -3487,6 +3507,12 @@ mod fpu_tests {
                 })
             } else {
                 a_step_with_its_calls(&mut vcpu, "fc_vcpu 0", name)
+            };
+            // A record, not bounded: a failed call still is wrong.
+            let of_the_step: Vec<String> = if *name == FRESH_PAGES {
+                of_the_step.into_iter().filter(|w| !w.contains(" KiB of the stack committed, over ")).collect()
+            } else {
+                of_the_step
             };
             if name.starts_with("the LVT timer set to TSC-deadline mode") {
                 let page = vcpu.get_lapic().unwrap();

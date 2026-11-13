@@ -303,7 +303,7 @@ pub(crate) fn run_vp(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<WHV_RUN_VP_E
         )
     };
     #[cfg(any(test, feature = "whp-trace"))]
-    trace::note("WHvRunVirtualProcessor", vp, &[], None, before, hres);
+    trace::note_exit("WHvRunVirtualProcessor", vp, &[], None, before, hres, Some(ctx.0.ExitReason));
     hr_of("WHvRunVirtualProcessor", hres, || format!("vp {vp}"))?;
     Ok(ctx.0)
 }
@@ -366,6 +366,8 @@ pub(crate) mod trace {
         /// Bytes of the thread's stack committed before and after the call.
         pub before: usize,
         pub after: usize,
+        /// For `WHvRunVirtualProcessor`, the exit reason it returned.
+        pub exit: Option<i32>,
     }
 
     impl Call {
@@ -379,8 +381,9 @@ pub(crate) mod trace {
                 });
             }
             let registers = if registers.is_empty() { String::new() } else { format!(": {}", registers.join(", ")) };
+            let exit = self.exit.map_or(String::new(), |e| format!(", exit reason {e:#x}"));
             format!(
-                "{}(vp {}{registers}) HRESULT {:#010x}, stack {} -> {} KiB",
+                "{}(vp {}{registers}) HRESULT {:#010x}{exit}, stack {} -> {} KiB",
                 self.call,
                 self.vp,
                 self.hres.cast_unsigned(),
@@ -438,6 +441,22 @@ pub(crate) mod trace {
         before: usize,
         hres: i32,
     ) {
+        note_exit(call, vp, names, values, before, hres, None);
+    }
+
+    /// [`note`] for `WHvRunVirtualProcessor`, with the exit reason it
+    /// returned: which exit it is whose handling inside WHP commits a
+    /// vCPU thread's stack (a booted guest's, on a PC: 20 to 52 KiB in one
+    /// run call, 81f7970's traced boot).
+    pub(crate) fn note_exit(
+        call: &'static str,
+        vp: u32,
+        names: &[WHV_REGISTER_NAME],
+        values: Option<&[WHV_REGISTER_VALUE]>,
+        before: usize,
+        hres: i32,
+        exit: Option<i32>,
+    ) {
         let after = stack();
         #[cfg(feature = "whp-trace")]
         if after >= before + GREW {
@@ -449,6 +468,7 @@ pub(crate) mod trace {
                 hres,
                 before,
                 after,
+                exit,
             };
             let thread = std::thread::current();
             eprintln!("WHPTRACE thread '{}': {}", thread.name().unwrap_or("(unnamed)"), call.line());
@@ -463,6 +483,7 @@ pub(crate) mod trace {
                     hres,
                     before,
                     after,
+                    exit,
                 });
             }
         });
