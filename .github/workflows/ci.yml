@@ -372,6 +372,13 @@ jobs:
           # Its count of the reads the old self-check would have failed on
           # (libtest shows a passing test's output only with --nocapture).
           sudo env RUST_TEST_THREADS=1 "$bin" platform::macos::freezer::tests::test_self_check_under_load --exact --nocapture
+      # The freeze stage's judgement of frozen and thawed (the kernel's
+      # runnable count against an unjailed control spinner), proven on this
+      # runner's own load, where an absolute CPU threshold failed (run
+      # 43467381837): spinners held with SIGSTOP judged thawed, and running
+      # ones judged frozen, must fail by name. Needs no root.
+      - name: Freeze judgement self-check
+        run: python3 -I tools/macos/jailer-test.py --freeze-self-check
       - name: Jailer scenario tests (without a VM)
         id: jailer_scenarios
         run: tools/macos/jailer-test.sh --no-vm
