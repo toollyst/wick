@@ -43,6 +43,11 @@ class Failure(Exception):
     pass
 
 
+class ApiRefused(ConnectionRefusedError):
+    """A connection to the API socket was refused; the text says what the
+    refusal was (`Vm.refused`). Still the error a caller may expect."""
+
+
 def check(cond, what):
     if not cond:
         raise Failure(what)
@@ -180,13 +185,39 @@ class Vm:
     def api(self, method, path, body=None, expect=(200, 204)):
         conn = UnixHTTPConnection(self.api_sock)
         payload = json.dumps(body) if body is not None else None
-        conn.request(method, path, payload, {"Content-Type": "application/json"})
+        try:
+            conn.request(method, path, payload, {"Content-Type": "application/json"})
+        except ConnectionRefusedError as e:
+            raise ApiRefused(e.errno, f"{method} {path}: {e.strerror}: {self.refused()}") from e
         resp = conn.getresponse()
         data = resp.read().decode()
         conn.close()
         if resp.status not in expect:
             raise Failure(f"{method} {path} -> {resp.status} {data}")
         return json.loads(data) if data.strip() else None
+
+    def refused(self):
+        """What a refused connection to the API socket was, for the failure's
+        text (the request is not made again): the socket's path is there from
+        bind(), the server accepts from listen(), and a Firecracker that ends
+        leaves the path behind. Watches for up to 10 s which it is: the
+        process started has ended, or the socket accepts after all."""
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 10:
+            ms = (time.monotonic() - t0) * 1000
+            if self.proc.poll() is not None:
+                self.pump.join(5)
+                return f"the process started had ended {ms:.0f} ms later or before ({self.exit_reason()})"
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(self.api_sock)
+                return (f"the socket accepted a connection {ms:.0f} ms later: its path was there before it "
+                        f"listened ({self.exit_reason()})")
+            except OSError:
+                time.sleep(0.001)
+            finally:
+                probe.close()
+        return f"still refused 10 s later ({self.exit_reason()})"
 
     def wait_exit(self, timeout=30):
         try:

@@ -343,7 +343,20 @@ jobs:
           # (libtest shows a passing test's output only with --nocapture).
           sudo env RUST_TEST_THREADS=1 "$bin" platform::macos::freezer::tests::test_self_check_under_load --exact --nocapture
       - name: Jailer scenario tests (without a VM)
+        id: jailer_scenarios
         run: tools/macos/jailer-test.sh --no-vm
+      # What each jailer and Firecracker of a failed stage printed (the run
+      # directory: <name>.log, the results): run 43341846250's vmnet failure
+      # (a refused connection to the API socket) left nothing to tell a
+      # Firecracker that had ended from one not yet listening.
+      - name: Upload the jailer scenarios' logs
+        if: failure() && steps.jailer_scenarios.conclusion == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-jailer-test
+          path: build/jailer-test/
+          if-no-files-found: warn
+          retention-days: 14
       # A state file made on Linux x86_64 by this run's linux-boot job is
       # refused here with upstream's error, before a VM is made (so it needs
       # no Hypervisor.framework). When linux-boot has failed there is no file:
