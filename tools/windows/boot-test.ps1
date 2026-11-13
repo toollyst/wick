@@ -1578,10 +1578,55 @@ function Base-Config([int]$vcpus, [int]$mem = 256, [string]$bootArgs = $BootArgs
 # -LogPath gives Firecracker another --log-path (a named pipe) than the
 # stage's file.
 # A socket's path in $SockDir, for a name within the bound the start
-# checked the directory against ($SockName bytes).
+# checked the directory against ($SockName bytes). Every caller passes a
+# string constant, so the bound is the longest of them, read from this
+# script (Get-SockNames); -SelfTest's socknames case holds them to that.
 function Get-SockPath([string]$name) {
     Check ([Text.Encoding]::UTF8.GetByteCount($name) -le $SockName) "the socket name $name is longer than $SockName bytes, which the socket directory's bound assumes"
     return (Join-Path $SockDir $name)
+}
+
+# Start-Vm's API sockets are numbered, "<n>.api", n from 1 to $ApiSockMax,
+# not named after their VM: a VM's name is made by its stage, in loops too,
+# and has no bound of its own ('cli-module-firecracker.api', 26 bytes, was
+# over the 24 assumed before). The VM's directory keeps its socket's path
+# (api-sock.txt).
+$ApiSockMax = 999
+$script:ApiSockSeq = 0
+function Get-ApiSockPath {
+    $script:ApiSockSeq++
+    Check ($script:ApiSockSeq -le $ApiSockMax) "more than $ApiSockMax API sockets in one run"
+    return (Join-Path $SockDir "$($script:ApiSockSeq).api")
+}
+
+# The socket names the script `$path` uses: the argument of each
+# Get-SockPath call, which must be a string constant, and the longest API
+# socket name. Names = the names; Bad = the calls whose argument is not one
+# string constant, each as "line N: text".
+function Get-SockNames([string]$path) {
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errors)
+    if ($errors -and $errors.Count) { throw "${path}: does not parse: $($errors[0].Message)" }
+    $calls = $ast.FindAll({
+        param($a)
+        $a -is [System.Management.Automation.Language.CommandAst] -and $a.GetCommandName() -eq 'Get-SockPath'
+    }, $true)
+    $names = @("$ApiSockMax.api")
+    $bad = @()
+    foreach ($c in $calls) {
+        $given = @($c.CommandElements | Select-Object -Skip 1)
+        if ($given.Count -eq 1 -and $given[0] -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            $names += $given[0].Value
+        } else {
+            $bad += "line $($c.Extent.StartLineNumber): $($c.Extent.Text)"
+        }
+    }
+    return @{ Names = $names; Bad = $bad }
+}
+
+# The bound of `$names`: the most UTF-8 bytes of any.
+function Get-SockBound([string[]]$names) {
+    return [int]($names | ForEach-Object { [Text.Encoding]::UTF8.GetByteCount($_) } | Measure-Object -Maximum).Maximum
 }
 
 function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api, [string]$LogPath = '') {
@@ -1602,7 +1647,8 @@ function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api, [st
     }
     $sock = $null
     if ($Api) {
-        $sock = Get-SockPath "$name.api"
+        $sock = Get-ApiSockPath
+        Set-Content -Encoding UTF8 (Join-Path $dir 'api-sock.txt') $sock
         if (Test-Path $sock) { [IO.File]::Delete($sock) }
         $fcArgs += " --api-sock `"$sock`""
     } else {
@@ -1881,10 +1927,15 @@ function Stage-Vsock {
     # Connections are closed with no "OK" until socat listens.
     [Wick.Vsock]::WaitListening($uds, 52, 10000)
     [Wick.Vsock]::Echo($uds, 52, 4MB)
-    $collector = New-Object Wick.Collector("$($uds)_53", 30000)
+    # A guest's connection to host port 53 reaches "<uds_path>_53", the
+    # socket Firecracker connects to (upstream's vsock docs), named here so
+    # its bound is the script's.
+    $port53 = Get-SockPath 'v.sock_53'
+    Check ($port53 -eq "$($uds)_53") "the port 53 socket $port53 is not $($uds)_53"
+    $collector = New-Object Wick.Collector($port53, 30000)
     $vm.Sh('echo guest-to-host-$((6*7)) | socat -t 5 - VSOCK-CONNECT:2:53') | Out-Null
     $got = $collector.Finish(30000)
-    Check ($got -eq "guest-to-host-42`n") "host received '$got' on $($uds)_53"
+    Check ($got -eq "guest-to-host-42`n") "host received '$got' on $port53"
     Save-Dmesg $vm 'vsock'
     $vm.Reboot()
     return 'host->guest CONNECT, 4 MiB echo; guest->host <uds>_53'
@@ -2024,7 +2075,7 @@ function Stage-Snapshot([switch]$Pci) {
     $bootArgs = if ($Pci) { $BootArgs -replace ' pci=off', '' } else { $BootArgs }
     $dir = Join-Path $Scratch $tag
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $uds = Get-SockPath "$tag.v"
+    $uds = if ($Pci) { Get-SockPath 'pci.v' } else { Get-SockPath 'snapshot.v' }
     if (Test-Path $uds) { [IO.File]::Delete($uds) }
     $data = Join-Path $dir 'data.img'
     [Wick.Util]::WriteRandom($data, 4MB)
@@ -3546,6 +3597,27 @@ if ($SelfTest) {
             } finally { $tcp.Close(); $relay.Stop(); $stub.Dispose() }
             return 'Relay: TCP to a Unix socket and back'
         }
+        socknames = {
+            # Every socket name of the stages within the bound the start
+            # takes (a name over it once failed the cli stage on the PC),
+            # and a name the bound cannot cover refused.
+            $mine = Get-SockNames $PSCommandPath
+            Check ($mine.Bad.Count -eq 0) "Get-SockPath given what is not a string constant: $($mine.Bad -join '; ')"
+            Check ($mine.Names.Count -ge 10) "only $($mine.Names.Count) socket names found: $($mine.Names -join ', ')"
+            $bound = Get-SockBound $mine.Names
+            foreach ($n in $mine.Names) { Check ([Text.Encoding]::UTF8.GetByteCount($n) -le $bound) "$n is over the bound $bound" }
+            $f = Join-Path $dir 'names.ps1'
+            Set-Content -Encoding UTF8 $f @(
+                "Get-SockPath 'a.v'",
+                'Get-SockPath "$x.v"',
+                "`$p = Get-SockPath 'longer-than-the-rest.sock'"
+            )
+            $theirs = Get-SockNames $f
+            Check ($theirs.Bad.Count -eq 1 -and $theirs.Bad[0] -like 'line 2: *') "a name made at run time not refused: $($theirs.Bad -join '; ')"
+            Check ((Get-SockBound $theirs.Names) -eq 25) "the bound of a.v, longer-than-the-rest.sock and $ApiSockMax.api is $(Get-SockBound $theirs.Names), not 25"
+            $longest = $mine.Names | Sort-Object { [Text.Encoding]::UTF8.GetByteCount($_) } | Select-Object -Last 1
+            return "Socket names: $($mine.Names.Count) in the script, the longest $longest ($bound bytes), the bound"
+        }
         driveid = {
             # The block stage's expected serial: Of (BY_HANDLE_FILE_INFORMATION)
             # against FILE_ID_INFO and against `vol`'s serial number (its
@@ -3643,11 +3715,14 @@ $Results = Join-Path $WorkDir "results-$stamp"
 New-Item -ItemType Directory -Force -Path $Results | Out-Null
 # An AF_UNIX socket's path holds at most 107 bytes (sun_path[108] with its
 # NUL: Linux unix(7); Winsock afunix.h, UNIX_PATH_MAX 108). Every socket of
-# the stages is a name of at most $SockName bytes in $SockDir (Start-Vm's
-# "<name>.api" the longest, 'cli-no-boot-timer.api'; Get-SockPath checks
-# each): a directory that leaves no room for one is refused before any
-# stage, naming the path and the limit.
-$SockName = 24
+# the stages is a name in $SockDir: a string constant passed to
+# Get-SockPath, or Start-Vm's numbered API socket. $SockName is the longest
+# of them, read from this script (Get-SockNames), and a directory that
+# leaves no room for it is refused before any stage, naming the path and
+# the limit.
+$sockNames = Get-SockNames $PSCommandPath
+if ($sockNames.Bad.Count) { throw "Get-SockPath is given a name that is not a string constant, so the socket directory's bound cannot be had: $($sockNames.Bad -join '; ')" }
+$SockName = Get-SockBound $sockNames.Names
 $SockDir = Join-Path $Results 's'
 if ([Text.Encoding]::UTF8.GetByteCount($SockDir) + 1 + $SockName -gt 107) {
     $SockDir = Join-Path ([IO.Path]::GetTempPath()) "wbt-$stamp"

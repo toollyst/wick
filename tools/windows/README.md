@@ -73,7 +73,10 @@
   `<WorkDir>\<stage>\firecracker.exe\<id>\root\run\firecracker.socket`, and an
   AF_UNIX path holds 107 bytes. A WorkDir that leaves no room for it is
   refused before any stage, naming the path and the limit (the boot
-  test's socket directory is checked the same way).
+  test's socket directory is checked the same way, against the longest
+  socket name the script uses, read from the script itself: a VM's API
+  socket is numbered, `<n>.api`, and every other socket name is a
+  constant, which `-SelfTest`'s `socknames` case holds it to).
 
 - `jail-parent.rs` (`jail-parent.exe` in CI's artifact): the operator's tool
   for a parent cgroup, what `mkdir` and `echo` into the parent's directory
