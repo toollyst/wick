@@ -21,6 +21,7 @@ use super::debug::{self, GuestDebug, Stopped};
 
 use super::exit::{self, DebugRegs, Exit, Mmio, Psci, SysregAccess, SysregResult};
 use super::ffi::*;
+use super::firmware;
 use super::gic::{CpuReg, GicCpu};
 use super::idregs;
 use super::pvtime;
@@ -502,8 +503,9 @@ impl VcpuFd {
     }
 
     fn get_reg_now(&self, hv: hv_vcpu_t, id: u64, out: &mut [u8]) -> Result<()> {
-        if regs::decode(id) == Some(Reg::PsciVersion) {
-            let v = self.vm()?.psci_version.load(Ordering::Relaxed);
+        if let Some(reg) = regs::decode(id)
+            && let Some(v) = self.fw_reg(reg)?
+        {
             let n = out.len().min(8);
             out[..n].copy_from_slice(&v.to_le_bytes()[..n]);
             return Ok(());
@@ -534,7 +536,7 @@ impl VcpuFd {
                 .wrapping_sub(vm.vtimer_offset.load(Ordering::Acquire)),
             // SAFETY: plain call.
             Some(Reg::PhysicalCount) => unsafe { mach_absolute_time() },
-            Some(Reg::PsciVersion) => vm.psci_version.load(Ordering::Relaxed),
+            Some(reg) if reg.is_firmware() => self.fw_reg(reg)?.unwrap_or_default(),
             _ => {
                 let reset = vm
                     .reset_regs
@@ -619,6 +621,8 @@ fn read_reg(hv: hv_vcpu_t, id: u64, out: &mut [u8]) -> Result<()> {
                 Reg::Aarch32Spsr => {}
                 // A new VM's; the VM's own is read in get_reg_now.
                 Reg::PsciVersion => v = regs::PSCI_VERSION_1_1,
+                Reg::Workaround(_) => v = firmware::WORKAROUND_LEVEL,
+                Reg::Bmap(bmap) => v = bmap.features(),
                 // A new vCPU's: the lock clear, as KVM resets it.
                 Reg::OsLock => v = exit::OSLSR_RESET,
             }
@@ -652,7 +656,7 @@ impl VcpuFd {
                     self.apply_vtimer_offset(hv, &vm)
                 }
                 Reg::Aarch32Spsr if v == 0 => Ok(()),
-                Reg::PsciVersion => self.set_psci_version(v),
+                Reg::PsciVersion | Reg::Workaround(_) | Reg::Bmap(_) => self.set_fw_reg(reg, v),
                 Reg::OsLock => self.set_os_lock(v),
                 Reg::PhysicalCount | Reg::Aarch32Spsr => err(libc::EINVAL),
             }
@@ -679,6 +683,37 @@ impl VcpuFd {
         }
         self.vm()?.psci_version.store(v, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The value of a firmware pseudo-register (hypercalls.c
+    /// `kvm_arm_get_fw_reg`): the VM's PSCI version and bitmaps of services,
+    /// and the workaround levels. `None` for any other register.
+    fn fw_reg(&self, reg: Reg) -> Result<Option<u64>> {
+        Ok(Some(match reg {
+            Reg::PsciVersion => self.vm()?.psci_version.load(Ordering::Relaxed),
+            Reg::Workaround(_) => firmware::WORKAROUND_LEVEL,
+            Reg::Bmap(bmap) => self.vm()?.smccc_features.lock().unwrap()[bmap as usize],
+            _ => return Ok(None),
+        }))
+    }
+
+    /// Writes a firmware pseudo-register (`kvm_arm_set_fw_reg`); `ENOENT`
+    /// for any other register.
+    fn set_fw_reg(&self, reg: Reg, v: u64) -> Result<()> {
+        match reg {
+            Reg::PsciVersion => self.set_psci_version(v),
+            Reg::Workaround(n) if firmware::workaround_accepts(n, v, firmware::WORKAROUND_LEVEL) => Ok(()),
+            Reg::Workaround(_) => err(libc::EINVAL),
+            Reg::Bmap(bmap) => {
+                let vm = self.vm()?;
+                let mut features = vm.smccc_features.lock().unwrap();
+                let ran_once = vm.ran_once.load(Ordering::Relaxed);
+                let slot = &mut features[bmap as usize];
+                *slot = firmware::bmap_write(bmap, *slot, v, ran_once).map_err(Error::new)?;
+                Ok(())
+            }
+            _ => err(libc::ENOENT),
+        }
     }
 
     /// Gives the vCPU the VM's counter offset if it changed since.
@@ -728,6 +763,14 @@ impl VcpuFd {
             self.set_os_lock(u64::from_le_bytes(buf))?;
             return Ok(size);
         }
+        // So are the firmware registers: the VM's, from any of its vCPUs,
+        // running or not (KVM takes them under the VM's lock).
+        if reg.is_firmware() {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&data[..8]);
+            self.set_fw_reg(reg, u64::from_le_bytes(buf))?;
+            return Ok(size);
+        }
         let live = match self.live() {
             Ok(live) => live,
             // Another handle (a debugger's): only while the vCPU is stopped.
@@ -751,12 +794,6 @@ impl VcpuFd {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&data[..8]);
                 self.vm()?.set_virtual_count(u64::from_le_bytes(buf));
-            }
-            // So is the PSCI version.
-            None if reg == Reg::PsciVersion => {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&data[..8]);
-                self.set_psci_version(u64::from_le_bytes(buf))?;
             }
             None => {
                 let mut pending = self.shared.pending.lock().unwrap();
@@ -788,6 +825,10 @@ impl VcpuFd {
         if reg == Reg::OsLock {
             let debug = DebugRegs { os_lock: self.shared.os_lock.load(Ordering::Relaxed) };
             data[..8].copy_from_slice(&debug.oslsr().to_le_bytes());
+            return Ok(size);
+        }
+        if let Some(v) = self.fw_reg(reg)? {
+            data[..8].copy_from_slice(&v.to_le_bytes());
             return Ok(size);
         }
         match self.live() {
@@ -822,8 +863,9 @@ impl VcpuFd {
             // Read live from the VM by other handles.
             if matches!(
                 regs::decode(id),
-                Some(Reg::VirtualCount | Reg::PhysicalCount | Reg::PsciVersion | Reg::OsLock)
-            ) {
+                Some(Reg::VirtualCount | Reg::PhysicalCount | Reg::OsLock)
+            ) || regs::decode(id).is_some_and(Reg::is_firmware)
+            {
                 continue;
             }
             let mut buf = vec![0u8; reg_size(id)];
@@ -854,7 +896,7 @@ impl VcpuFd {
         let Some(s) = stopped.as_ref() else {
             return err(libc::EBUSY);
         };
-        if matches!(reg, Reg::VirtualCount | Reg::PhysicalCount | Reg::PsciVersion) {
+        if matches!(reg, Reg::VirtualCount | Reg::PhysicalCount) || reg.is_firmware() {
             drop(stopped);
             return self.get_reg_early(reg_id, out);
         }
@@ -881,9 +923,9 @@ impl VcpuFd {
                 self.vm()?.set_virtual_count(v);
                 Ok(())
             }
-            Reg::PsciVersion => {
+            Reg::PsciVersion | Reg::Workaround(_) | Reg::Bmap(_) => {
                 drop(stopped);
-                self.set_psci_version(v)
+                self.set_fw_reg(reg, v)
             }
             Reg::Aarch32Spsr if v == 0 => Ok(()),
             Reg::PhysicalCount | Reg::Aarch32Spsr => err(libc::EINVAL),
@@ -1253,7 +1295,9 @@ impl VcpuFd {
                     | HV_SYS_REG_ELR_EL1
                     | HV_SYS_REG_SPSR_EL1,
                 )) => continue,
-                Some(Reg::VirtualCount | Reg::PhysicalCount | Reg::PsciVersion) => continue,
+                Some(Reg::VirtualCount | Reg::PhysicalCount) => continue,
+                // The VM's, which no vCPU's reset touches.
+                Some(reg) if reg.is_firmware() => continue,
                 _ => {}
             }
             let v = reset.get(&id).ok_or_else(|| Error::new(libc::ENOENT))?;
@@ -1357,7 +1401,14 @@ impl VcpuFd {
             regs::PSCI_VERSION_1_1 => Some(1),
             _ => None,
         };
+        // The services the VM's bitmaps leave the guest
+        // (KVM_REG_ARM_STD_BMAP and the two beside it): a call whose bit is
+        // clear is NOT_SUPPORTED with X1 to X3 0, before anything of it is
+        // looked at (hypercalls.c kvm_hvc_call_handler: `val[4] =
+        // {SMCCC_RET_NOT_SUPPORTED}`, `if (!kvm_hvc_call_allowed()) goto out`).
+        let features = *self.vm()?.smccc_features.lock().unwrap();
         let words = match call {
+            _ if !firmware::allowed(call, &features) => Some([PSCI_RET_NOT_SUPPORTED as u64, 0, 0, 0]),
             Psci::SmcccVersion => Some([exit::SMCCC_VERSION_1_1, 0, 0, 0]),
             // The TRNG service, whatever the PSCI version
             // (hypercalls.c kvm_hvc_call_handler, trng.c kvm_trng_call).
@@ -1371,13 +1422,16 @@ impl VcpuFd {
             // the guest relies on what its CPU features say, as on a host
             // whose firmware has none.
             Psci::SmcccArchFeatures => Some([
-                pvtime::arch_feature(x1 as u32).unwrap_or(PSCI_RET_NOT_SUPPORTED as u64),
+                pvtime::arch_feature(x1 as u32)
+                    .filter(|_| firmware::pv_time_reported(&features))
+                    .unwrap_or(PSCI_RET_NOT_SUPPORTED as u64),
                 0,
                 0,
                 0,
             ]),
             Psci::VendorHypUid => Some(exit::KVM_UID),
-            Psci::KvmFeatures => Some([exit::KVM_FEATURES, 0, 0, 0]),
+            // The vendor bitmap itself (`val[0] = smccc_feat->vendor_hyp_bmap`).
+            Psci::KvmFeatures => Some([features[regs::Bmap::VendorHyp as usize], 0, 0, 0]),
             Psci::KvmPtp => Some(self.kvm_ptp(hv, x1)?),
             Psci::PvTimeFeatures => {
                 let ipa = self.shared.pvtime.lock().unwrap().ipa;
@@ -1647,6 +1701,13 @@ impl VcpuFd {
         self.debug.take(&mut self.shared.debug.lock().unwrap());
         self.complete_mmio_read(hv)?;
         let vm = self.vm()?;
+        // The VM has run: its bitmaps of services stay as they are (arm.c
+        // kvm_arch_vcpu_run_pid_change sets KVM_ARCH_FLAG_HAS_RAN_ONCE under
+        // kvm->lock at a vCPU's first KVM_RUN).
+        if !vm.ran_once.load(Ordering::Relaxed) {
+            let _features = vm.smccc_features.lock().unwrap();
+            vm.ran_once.store(true, Ordering::Relaxed);
+        }
         let gic = vm.gic.lock().unwrap().created;
         if gic {
             self.shared.gic.lock().unwrap().flush(hv)?;

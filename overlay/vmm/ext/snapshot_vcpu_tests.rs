@@ -61,3 +61,76 @@ fn test_a_state_with_ptrauth_keys_needs_ptrauth() {
         other => panic!("restored without pointer authentication: {other:?}"),
     }
 }
+
+/// KVM's firmware pseudo-registers (Linux 6.1 arch/arm64/kvm/hypercalls.c
+/// `kvm_arm_fw_reg_ids`): the PSCI version, the three
+/// SMCCC_ARCH_WORKAROUND levels, and the standard, standard hypervisor and
+/// vendor hypervisor bitmaps of services.
+const FIRMWARE_REGS: [u64; 7] = [
+    0x6030_0000_0014_0000,
+    0x6030_0000_0014_0001,
+    0x6030_0000_0014_0002,
+    0x6030_0000_0014_0003,
+    0x6030_0000_0016_0000,
+    0x6030_0000_0016_0001,
+    0x6030_0000_0016_0002,
+];
+const PSCI_1_0: u64 = 0x1_0000;
+const PSCI_1_1: u64 = 0x1_0001;
+
+fn firmware_regs(vcpu: &KvmVcpu) -> [u64; 7] {
+    FIRMWARE_REGS.map(|id| {
+        let mut value = [0u8; 8];
+        vcpu.fd.get_one_reg(id, &mut value).unwrap();
+        u64::from_le_bytes(value)
+    })
+}
+
+/// The firmware registers of a new VM's vCPU restored from `state`.
+fn restored_firmware_regs(state: &VcpuState) -> [u64; 7] {
+    let mut vm = setup_vm_with_memory(0x1000);
+    let mut vcpu = KvmVcpu::new(0, &vm).unwrap();
+    vm.setup_irqchip(1).unwrap();
+    vcpu.restore_state(state).unwrap();
+    firmware_regs(&vcpu)
+}
+
+#[test]
+fn test_a_snapshot_keeps_the_firmware_registers() {
+    // Upstream saves every register KVM_GET_REG_LIST names and writes each
+    // back at the restore. KVM's list has its seven firmware registers, so
+    // a microVM given PSCI 1.0, no TRNG and no KVM_PTP keeps them over a
+    // snapshot; here too.
+    let state = {
+        let mut vm = setup_vm_with_memory(0x1000);
+        let mut vcpu = KvmVcpu::new(0, &vm).unwrap();
+        vm.setup_irqchip(1).unwrap();
+        vcpu.init(&[]).unwrap();
+        assert_eq!(firmware_regs(&vcpu), [PSCI_1_1, 0, 0, 0, 1, 1, 3]);
+        for (id, value) in [(FIRMWARE_REGS[0], PSCI_1_0), (FIRMWARE_REGS[4], 0), (FIRMWARE_REGS[6], 1)] {
+            vcpu.fd.set_one_reg(id, &value.to_le_bytes()).unwrap();
+        }
+        // One VM a process (Hypervisor.framework): it ends with this block.
+        vcpu.save_state().unwrap()
+    };
+    let saved: Vec<u64> = state.regs.iter().filter(|r| FIRMWARE_REGS.contains(&r.id)).map(|r| r.value()).collect();
+    assert_eq!(saved, [PSCI_1_0, 0, 0, 0, 0, 1, 1]);
+    assert_eq!(restored_firmware_regs(&state), [PSCI_1_0, 0, 0, 0, 0, 1, 1]);
+
+    // A state without them, which is what every build before the list named
+    // them saved (the PSCI version included): it restores, and the VM has a
+    // new VM's values, PSCI 1.1 whatever version its guest was given, as a
+    // KVM that is not told a version gives its latest.
+    let mut older = VcpuState {
+        mp_state: state.mp_state,
+        regs: Default::default(),
+        mpidr: state.mpidr,
+        kvi: state.kvi,
+        pvtime_ipa: state.pvtime_ipa,
+    };
+    for reg in state.regs.iter().filter(|r| !FIRMWARE_REGS.contains(&r.id)) {
+        older.regs.push(reg);
+    }
+    assert_eq!(older.regs.len() + 7, state.regs.len());
+    assert_eq!(restored_firmware_regs(&older), [PSCI_1_1, 0, 0, 0, 1, 1, 3]);
+}

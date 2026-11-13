@@ -1981,6 +1981,20 @@ def stage_cli(ctx):
     return "; ".join(done)
 
 
+# KVM_REG_ARM_PSCI_VERSION, KVM_REG_ARM_SMCCC_ARCH_WORKAROUND_1 to _3, KVM_REG_ARM_STD_BMAP,
+# KVM_REG_ARM_STD_HYP_BMAP and KVM_REG_ARM_VENDOR_HYP_BMAP (Linux 6.1 arch/arm64/include/uapi/asm/kvm.h),
+# each with the value a new VM has on KVM where no firmware workaround is offered.
+FIRMWARE_REGISTERS = {
+    0x6030000000140000: 0x10001,
+    0x6030000000140001: 0,
+    0x6030000000140002: 0,
+    0x6030000000140003: 0,
+    0x6030000000160000: 1,
+    0x6030000000160001: 1,
+    0x6030000000160002: 3,
+}
+
+
 def stage_tools(ctx):
     """rebase-snap and snapshot-editor's info-vmstate commands on snapshots of
     a 2 vCPU guest."""
@@ -2026,6 +2040,16 @@ def stage_tools(ctx):
         # KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | regs.pc: a kernel address.
         pc = re.search(r"^0x6030000000100040 0x([0-9a-f]+)$", body, re.M)
         check(pc and pc.group(1).startswith("ffff"), f"vcpu {i}: PC {pc and pc.group(1)}")
+        # KVM's firmware registers, which KVM_GET_REG_LIST names and a snapshot so keeps (Linux 6.1
+        # arch/arm64/kvm/hypercalls.c kvm_arm_fw_reg_ids), with a new microVM's values: PSCI 1.1, the
+        # three SMCCC_ARCH_WORKAROUND levels NOT_AVAIL, and every service's bit in the three bitmaps.
+        for reg, value in FIRMWARE_REGISTERS.items():
+            # info-vmstate prints a value's bytes from the highest down, each without a leading zero
+            # (snapshot-editor's info.rs: 0x10001 in 8 bytes reads "0x00000101").
+            printed = "".join(f"{byte:x}" for byte in reversed(value.to_bytes(8, "little")))
+            saved = re.search(rf"^{reg:#x} 0x([0-9a-f]+)$", body, re.M)
+            check(saved and saved.group(1) == printed,
+                  f"vcpu {i}: firmware register {reg:#x} is printed {saved and saved.group(1)}, not {printed} ({value:#x})")
     r = editor("vm-state", "--vmstate-path", state)
     check(r.returncode == 0 and "mem_size_mib: 256" in r.stdout and r.stdout.count("kvm_mp_state:") == 2
           and "device_states:" in r.stdout, f"info-vmstate vm-state: {r.returncode} {r.stdout[:300]!r} {r.stderr!r}")
@@ -2079,7 +2103,7 @@ def stage_tools(ctx):
     _, out = vm.sh("echo $A $B")
     check(out == "before-42 second-49", f"after a rebase-snap restore: {out!r}")
     vm.reboot()
-    return ("diff memory file has holes; info-vmstate version v12.0.0, vcpu-states (2 vCPUs, mpidr, PC), vm-state; "
+    return ("diff memory file has holes; info-vmstate version v12.0.0, vcpu-states (2 vCPUs, mpidr, PC, KVM's 7 firmware registers), vm-state; "
             "a non-snapshot refused; another arch's magic or a newer version refused by snapshot-editor and the "
             "load; rebase-snap equals snapshot-editor rebase and restores")
 

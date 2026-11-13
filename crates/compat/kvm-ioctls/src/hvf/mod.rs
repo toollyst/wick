@@ -27,6 +27,7 @@ mod debug;
 mod device;
 mod exit;
 mod ffi;
+mod firmware;
 mod gic;
 mod idregs;
 pub mod latency;

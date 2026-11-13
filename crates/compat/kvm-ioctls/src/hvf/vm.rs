@@ -190,6 +190,16 @@ pub(crate) struct VmInner {
     /// [`regs::PSCI_VERSION_1_1`], or 1.0 or 0.2 once a snapshot of a VM
     /// given that one is restored. One for the VM, as KVM's.
     pub(crate) psci_version: AtomicU64,
+    /// The bitmaps of the services the guest may call, indexed by
+    /// [`regs::Bmap`] (`KVM_REG_ARM_STD_BMAP` and the two beside it): every
+    /// service in a new VM. One set for the VM, as KVM's
+    /// (`kvm->arch.smccc_feat`); the lock is also what makes a write and the
+    /// first run exclude each other, as `kvm->lock` does.
+    pub(crate) smccc_features: Mutex<[u64; 3]>,
+    /// Whether a vCPU of the VM has run (`KVM_ARCH_FLAG_HAS_RAN_ONCE`):
+    /// from then on the bitmaps cannot change. Written under
+    /// `smccc_features`' lock.
+    pub(crate) ran_once: AtomicBool,
     /// vCPUs created with `create_vcpu` whose Hypervisor.framework vCPU does
     /// not exist yet (it is created on the first `run()`).
     uncreated: AtomicUsize,
@@ -859,6 +869,8 @@ impl VmFd {
             vtimer_offset: AtomicU64::new(unsafe { mach_absolute_time() }),
             vtimer_gen: AtomicU64::new(0),
             psci_version: AtomicU64::new(super::regs::PSCI_VERSION_1_1),
+            smccc_features: Mutex::new(super::regs::SMCCC_FEATURES),
+            ran_once: AtomicBool::new(false),
             uncreated: AtomicUsize::new(0),
             deferred_spis: Mutex::new(Vec::new()),
             deferred_active: Mutex::new(Vec::new()),

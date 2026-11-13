@@ -316,9 +316,6 @@ pub enum Psci {
 pub const SMCCC_VERSION_1_1: u64 = 0x1_0001;
 /// ARM_SMCCC_VENDOR_HYP_UID_KVM_REG_0..3: KVM's vendor hypervisor UID.
 pub const KVM_UID: [u64; 4] = [0xb66f_b428, 0xe911_c52e, 0x564b_caa9, 0x743a_004d];
-/// KVM's features bitmap: ARM_SMCCC_KVM_FUNC_FEATURES (0) and
-/// ARM_SMCCC_KVM_FUNC_PTP (1).
-pub const KVM_FEATURES: u64 = 0b11;
 
 impl Psci {
     /// The call `x0` names; only its low 32 bits are the function id.
