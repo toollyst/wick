@@ -198,6 +198,8 @@ pub(crate) fn get_registers(
     debug_assert_eq!(names.len(), values.len());
     let mut room = Room::new(values.len());
     let aligned = room.slice();
+    #[cfg(test)]
+    let before = trace::stack();
     // SAFETY: both arrays have `names.len()` elements; `Aligned` is a
     // `WHV_REGISTER_VALUE` aligned as WHP requires.
     let hres = unsafe {
@@ -209,6 +211,8 @@ pub(crate) fn get_registers(
             aligned.as_mut_ptr().cast(),
         )
     };
+    #[cfg(test)]
+    trace::note("WHvGetVirtualProcessorRegisters", vp, names, None, before, hres);
     hr_of("WHvGetVirtualProcessorRegisters", hres, || format!("vp {vp}: {}", registers(names, None)))?;
     for (v, a) in values.iter_mut().zip(aligned.iter()) {
         *v = a.0;
@@ -229,6 +233,8 @@ pub(crate) fn set_registers(
     for (a, v) in aligned.iter_mut().zip(values) {
         *a = Aligned(*v);
     }
+    #[cfg(test)]
+    let before = trace::stack();
     // SAFETY: both arrays have `names.len()` elements, aligned (`Aligned`).
     let hres = unsafe {
         whv::WHvSetVirtualProcessorRegisters(
@@ -239,6 +245,8 @@ pub(crate) fn set_registers(
             aligned.as_ptr().cast(),
         )
     };
+    #[cfg(test)]
+    trace::note("WHvSetVirtualProcessorRegisters", vp, names, Some(values), before, hres);
     hr_of("WHvSetVirtualProcessorRegisters", hres, || format!("vp {vp}: {}", registers(names, Some(values))))
 }
 
@@ -283,6 +291,8 @@ pub(crate) fn run_vp(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<WHV_RUN_VP_E
     struct Exit(WHV_RUN_VP_EXIT_CONTEXT);
     // SAFETY: all-zero is a valid exit context.
     let mut ctx = Exit(unsafe { std::mem::zeroed() });
+    #[cfg(test)]
+    let before = trace::stack();
     // SAFETY: valid output buffer of the given size.
     let hres = unsafe {
         whv::WHvRunVirtualProcessor(
@@ -292,6 +302,8 @@ pub(crate) fn run_vp(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<WHV_RUN_VP_E
             u32::try_from(std::mem::size_of_val(&ctx.0)).unwrap(),
         )
     };
+    #[cfg(test)]
+    trace::note("WHvRunVirtualProcessor", vp, &[], None, before, hres);
     hr_of("WHvRunVirtualProcessor", hres, || format!("vp {vp}"))?;
     Ok(ctx.0)
 }
@@ -319,6 +331,114 @@ impl Drop for OwnedHandle {
             // SAFETY: closes the handle this wrapper owns.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
         }
+    }
+}
+
+/// For a test: the WHP calls a thread makes, each with its `HRESULT` and
+/// with how much of the thread's stack was committed before and after it.
+/// A call that leaves more committed than it found is the one whose pages
+/// stay resident in that thread's stack for the thread's life (Windows
+/// commits a stack's pages as they are first touched and keeps them). The
+/// calls are kept as they were given and made into lines by the test, after
+/// it has read the stack for the last time, so that no line's making is in
+/// what it measures.
+#[cfg(test)]
+pub(crate) mod trace {
+    use std::cell::RefCell;
+
+    use super::{WHV_REGISTER_NAME, WHV_REGISTER_VALUE};
+
+    /// One WHP call.
+    pub(crate) struct Call {
+        pub call: &'static str,
+        pub vp: u32,
+        pub names: Vec<WHV_REGISTER_NAME>,
+        /// The low 64 bits of each value written; none for a read.
+        pub values: Option<Vec<u64>>,
+        pub hres: i32,
+        /// Bytes of the thread's stack committed before and after the call.
+        pub before: usize,
+        pub after: usize,
+    }
+
+    impl Call {
+        /// `call(vp n: name=value, ..)`.
+        pub(crate) fn line(&self) -> String {
+            let mut registers = Vec::with_capacity(self.names.len());
+            for (i, n) in self.names.iter().enumerate() {
+                registers.push(match &self.values {
+                    Some(v) => format!("{n:#x}={:#x}", v[i]),
+                    None => format!("{n:#x}"),
+                });
+            }
+            let registers = if registers.is_empty() { String::new() } else { format!(": {}", registers.join(", ")) };
+            format!(
+                "{}(vp {}{registers}) HRESULT {:#010x}, stack {} -> {} KiB",
+                self.call,
+                self.vp,
+                self.hres.cast_unsigned(),
+                self.before / 1024,
+                self.after / 1024
+            )
+        }
+    }
+
+    thread_local! {
+        /// The calls of this thread since [`begin`]; none kept before it.
+        static CALLS: RefCell<Option<Vec<Call>>> = const { RefCell::new(None) };
+    }
+
+    /// How much of the calling thread's stack is committed, in bytes: the
+    /// TEB's `StackBase` less its `StackLimit` (`NT_TIB`, at `gs:[8]` and
+    /// `gs:[0x10]` on x86-64).
+    pub(crate) fn stack() -> usize {
+        let (base, limit): (usize, usize);
+        // SAFETY: two reads of the thread's own TEB.
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, gs:[0x8]",
+                "mov {1}, gs:[0x10]",
+                out(reg) base,
+                out(reg) limit,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        base - limit
+    }
+
+    /// From here the calling thread's WHP calls are kept.
+    pub(crate) fn begin() {
+        CALLS.set(Some(Vec::new()));
+    }
+
+    /// The calls kept since [`begin`], which keeps no more.
+    pub(crate) fn end() -> Vec<Call> {
+        CALLS.take().unwrap_or_default()
+    }
+
+    /// Keeps a call just made, if the thread keeps its calls.
+    pub(crate) fn note(
+        call: &'static str,
+        vp: u32,
+        names: &[WHV_REGISTER_NAME],
+        values: Option<&[WHV_REGISTER_VALUE]>,
+        before: usize,
+        hres: i32,
+    ) {
+        let after = stack();
+        CALLS.with_borrow_mut(|calls| {
+            if let Some(calls) = calls {
+                calls.push(Call {
+                    call,
+                    vp,
+                    names: names.to_vec(),
+                    values: values.map(|v| v.iter().map(super::as_u64).collect()),
+                    hres,
+                    before,
+                    after,
+                });
+            }
+        });
     }
 }
 

@@ -239,7 +239,11 @@ fn time_info_gpa(value: u64) -> u64 {
 /// Handles a guest write of `MSR_KVM_SYSTEM_TIME_NEW` on vCPU `vp`: fills the
 /// `pvclock_vcpu_time_info` at the guest physical address in `value` (bit 0
 /// enables it). `host` translates a guest physical address; `now_ns` is the
-/// VM clock.
+/// VM clock. The reference, where there is none yet, is the vCPU's TSC as
+/// WHP gives it: a read that fails is the caller's error (the MSR write's,
+/// the run's) and leaves no reference, since one made of a TSC of 0 would
+/// be every vCPU's clock, wrong by the guest's whole TSC, with nothing said
+/// to the guest or to Firecracker.
 pub(crate) fn system_time(
     state: &Mutex<State>,
     part: whv::WHV_PARTITION_HANDLE,
@@ -247,22 +251,23 @@ pub(crate) fn system_time(
     value: u64,
     ram: &Ram,
     now_ns: impl Fn() -> u64,
-) {
+) -> super::Result<()> {
     if value & 1 == 0 {
-        return;
+        return Ok(());
     }
     let hz = tsc_hz();
     if hz == 0 {
-        return;
+        return Ok(());
     }
     let (tsc, ns) = {
         let mut s = state.lock().unwrap();
-        *s.reference.get_or_insert_with(|| {
-            let tsc = ffi::get_register(part, vp, whv::WHvX64RegisterTsc)
-                .map(|v| ffi::as_u64(&v))
-                .unwrap_or(0);
-            (tsc, now_ns())
-        })
+        match s.reference {
+            Some(reference) => reference,
+            None => {
+                let tsc = ffi::as_u64(&ffi::get_register(part, vp, whv::WHvX64RegisterTsc)?);
+                *s.reference.insert((tsc, now_ns()))
+            }
+        }
     };
     let (shift, mul) = time_scale(1_000_000_000, hz);
     let info = VcpuTimeInfo {
@@ -275,6 +280,7 @@ pub(crate) fn system_time(
     };
     // Where KVM's cache takes no time info, the guest gets none, as on KVM.
     update_time_info(ram, time_info_gpa(value), |_| info);
+    Ok(())
 }
 
 /// `PVCLOCK_GUEST_STOPPED`: the vCPU was stopped by the host.

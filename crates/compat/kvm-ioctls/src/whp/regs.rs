@@ -1252,6 +1252,13 @@ fn partition_msrs() -> &'static [(u32, WHV_REGISTER_NAME)] {
     })
 }
 
+/// Whether a VM's partition keeps `name`, one of the registers of
+/// [`candidates`] (read and written back on a partition of its own, once
+/// per process).
+pub(crate) fn partition_keeps(name: WHV_REGISTER_NAME) -> bool {
+    partition_msrs().iter().any(|&(_, n)| n == name)
+}
+
 /// FS_BASE (0xc000_0100) and GS_BASE (0xc000_0101) are the base of the FS/GS
 /// segment registers. Returns the WHP segment register name for those MSRs.
 fn msr_segment_base(index: u32) -> Option<WHV_REGISTER_NAME> {

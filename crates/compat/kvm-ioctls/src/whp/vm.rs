@@ -227,6 +227,8 @@ impl VmInner {
     /// so it is reported on standard error, once per error code.
     pub(crate) fn inject_msi(&self, address: u64, data: u32) {
         let control = super::irqchip::interrupt_control(address, data);
+        #[cfg(test)]
+        let before = ffi::trace::stack();
         // SAFETY: a valid interrupt control of its size.
         let hres = unsafe {
             whv::WHvRequestInterrupt(
@@ -235,6 +237,8 @@ impl VmInner {
                 u32::try_from(std::mem::size_of_val(&control)).unwrap(),
             )
         };
+        #[cfg(test)]
+        ffi::trace::note("WHvRequestInterrupt", control.Destination, &[], None, before, hres);
         if hres != 0 && self.request_failure.swap(hres, Ordering::Relaxed) != hres {
             ffi::report(
                 log::Level::Error,
@@ -1318,6 +1322,28 @@ mod tests {
         // SAFETY: the state just read, in the longer area.
         let set = got.as_ref().ok().map(|()| unsafe { vcpu.set_xsave2(&long) });
         eprintln!("XSAVETEST an area of {} bytes: read {got:?} (the same bytes: {same}), written back {set:?}", cap + 12288);
+    }
+
+    // The kvm-clock's reference is a TSC WHP gave. A VM that has no vCPU
+    // gives none: publishing fails (the MSR write's error, or the run's),
+    // and makes no reference, which one of a TSC of 0 would be for every
+    // vCPU from then on. With the MSR's enable bit off there is nothing to
+    // read or to publish.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_no_clock_reference_is_made_of_a_tsc_that_was_not_read() {
+        let vm = VmFd::create().unwrap();
+        let inner = &vm.inner;
+        let publish = |value: u64| {
+            ffi::quietly(|| super::super::pvclock::system_time(&inner.pvclock, inner.part, 0, value, inner.ram(), || 7))
+        };
+        assert!(publish(0x10000).is_ok());
+        let published = publish(0x10000 | 1);
+        let hz = super::super::pvclock::tsc_hz();
+        eprintln!("CLOCKTEST kvm-clock published for vCPU 0 of a VM that has none: {published:?} (TSC frequency {hz} Hz)");
+        // Without a TSC frequency there is no kvm-clock, and no read for one.
+        assert_eq!(published.is_err(), hz != 0);
+        assert_eq!(inner.pvclock.lock().unwrap().clock_at(0), None);
     }
 
     // CI run 43277608081: from a point on, every map of vmm's process failed

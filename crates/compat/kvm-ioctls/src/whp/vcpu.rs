@@ -748,7 +748,7 @@ impl VcpuFd {
             } else if regs::software_msr(e.index) {
                 self.write_software_msr(e.index, e.data, true)?;
             } else {
-                self.write_kvm_msr(e.index, e.data);
+                self.write_kvm_msr(e.index, e.data)?;
             }
         }
         Ok(n)
@@ -875,7 +875,7 @@ impl VcpuFd {
 
     /// A write of a kvm-clock MSR, by the guest or a restore; other MSRs are
     /// left alone. Returns whether `index` is one.
-    fn write_kvm_msr(&self, index: u32, value: u64) -> bool {
+    fn write_kvm_msr(&self, index: u32, value: u64) -> Result<bool> {
         let inner = &self.shared.inner;
         let now = || inner.irqchip.lock().unwrap().clock().clock;
         match index {
@@ -883,14 +883,14 @@ impl VcpuFd {
                 self.shared.system_time_msr.store(value, Ordering::Release);
                 let generation = inner.pvclock.lock().unwrap().generation;
                 self.shared.clock_gen.store(generation, Ordering::Release);
-                pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, inner.ram(), now);
-                true
+                pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, inner.ram(), now)?;
+                Ok(true)
             }
             pvclock::MSR_WALL_CLOCK => {
                 pvclock::wall_clock(&inner.pvclock, value, inner.ram(), now());
-                true
+                Ok(true)
             }
-            _ => false,
+            _ => Ok(false),
         }
     }
 
@@ -947,6 +947,8 @@ impl VcpuFd {
     fn lapic_page(&self) -> Result<(Box<[u8; LAPIC_PAGE]>, u32)> {
         let mut page = Box::new([0u8; LAPIC_PAGE]);
         let mut written = 0u32;
+        #[cfg(test)]
+        let before = super::ffi::trace::stack();
         // SAFETY: valid output buffer of the given size.
         let hres = unsafe {
             whv::WHvGetVirtualProcessorInterruptControllerState(
@@ -957,6 +959,8 @@ impl VcpuFd {
                 &mut written,
             )
         };
+        #[cfg(test)]
+        super::ffi::trace::note("WHvGetVirtualProcessorInterruptControllerState", self.vp(), &[], None, before, hres);
         super::ffi::hr_of("WHvGetVirtualProcessorInterruptControllerState", hres, || format!("vp {}", self.vp()))?;
         // Anything shorter is not the register page this conversion assumes.
         if (written as usize) < LAPIC_REGS {
@@ -984,10 +988,14 @@ impl VcpuFd {
         for (dst, src) in page.iter_mut().zip(klapic.regs.iter()) {
             *dst = *src as u8;
         }
+        #[cfg(test)]
+        let before = super::ffi::trace::stack();
         // SAFETY: the register page is valid for `size` bytes.
         let hres = unsafe {
             whv::WHvSetVirtualProcessorInterruptControllerState(self.part(), self.vp(), page.as_ptr().cast(), size)
         };
+        #[cfg(test)]
+        super::ffi::trace::note("WHvSetVirtualProcessorInterruptControllerState", self.vp(), &[], None, before, hres);
         super::ffi::hr_of("WHvSetVirtualProcessorInterruptControllerState", hres, || format!("vp {}", self.vp()))
     }
 
@@ -1041,8 +1049,7 @@ impl VcpuFd {
                 return Ok(Entry::Kicked);
             }
         };
-        self.update_clock();
-        let result = self.raise_fired_deadline().and_then(|()| {
+        let result = self.update_clock().and_then(|()| self.raise_fired_deadline()).and_then(|()| {
             if own_window && self.window_expired() {
                 Ok(Entry::WindowExpired)
             } else if !own_window && shared.immediate_exit.load(Ordering::SeqCst) != 0 {
@@ -1058,15 +1065,17 @@ impl VcpuFd {
     /// Publishes this vCPU's kvm-clock time info again if the VM clock was
     /// set since it was published (`pvclock`: a snapshot restore sets the
     /// clock after the vCPUs' MSRs), as KVM does on `KVM_REQ_CLOCK_UPDATE`.
-    fn update_clock(&self) {
+    fn update_clock(&self) -> Result<()> {
         let inner = &self.shared.inner;
         let generation = inner.pvclock.lock().unwrap().generation;
         if self.shared.clock_gen.swap(generation, Ordering::AcqRel) == generation {
-            return;
+            return Ok(());
         }
         let value = self.shared.system_time_msr.load(Ordering::Acquire);
         let now = || inner.irqchip.lock().unwrap().clock().clock;
-        pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, inner.ram(), now);
+        // Not published: still to be, at the next entry there is.
+        pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, inner.ram(), now)
+            .inspect_err(|_| self.shared.clock_gen.store(u64::MAX, Ordering::Release))
     }
 
     /// Raises the interrupt of a TSC-deadline timer that fired since the
@@ -1526,7 +1535,17 @@ impl VcpuFd {
             }
             (0xd, 1) if eax & (1 << 3) != 0 => {
                 let xcr0 = self.register(whv::WHvX64RegisterXCr0)?;
-                let xss = self.register(whv::WHvX64RegisterXss).unwrap_or(0);
+                // IA32_XSS where the partition keeps it; where it keeps
+                // none the guest cannot have set one (its WRMSR is an exit
+                // that is ignored, `handle_msr`) and KVM's `ia32_xss` of a
+                // vCPU without XSAVES is 0 as well. A read that fails where
+                // the register is kept fails the run, as every other read
+                // here: a size computed from a guessed 0 is not an answer.
+                let xss = if regs::partition_keeps(whv::WHvX64RegisterXss) {
+                    self.register(whv::WHvX64RegisterXss)?
+                } else {
+                    0
+                };
                 ebx = regs::xsave_size(xcr0 | xss, true);
             }
             _ => {}
@@ -1598,7 +1617,7 @@ impl VcpuFd {
                     );
                 }
             } else {
-                self.write_kvm_msr(index, value);
+                self.write_kvm_msr(index, value)?;
             }
             regs::set_rip(self.part(), self.vp(), rip_after)
         } else {
@@ -2582,6 +2601,321 @@ mod fpu_tests {
         watchdog.join().unwrap();
         vcpu.set_kvm_immediate_exit(0);
         line
+    }
+
+    /// One step of [`test_the_stack_each_whp_call_commits_on_record`]'s
+    /// guest: the runs until its `out 0x80` (at most 12 exits, and a kick
+    /// 5 s after the first run began), as the exits the test saw. An `IN`
+    /// and an MMIO read are answered with zeros.
+    fn run_a_step(vcpu: &mut VcpuFd) -> String {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
+        let watch = Arc::clone(&done);
+        let watchdog = std::thread::spawn(move || {
+            for _ in 0..500 {
+                if watch.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            kicker.set_kvm_immediate_exit(1);
+        });
+        let mut exits = Vec::new();
+        while exits.len() < 12 {
+            let (line, more) = match vcpu.run() {
+                Ok(VcpuExit::IoOut(PORT, _)) => (format!("IoOut {PORT:#x}"), false),
+                Ok(VcpuExit::IoOut(port, _)) => (format!("IoOut {port:#x}"), true),
+                Ok(VcpuExit::IoIn(port, data)) => {
+                    data.fill(0);
+                    (format!("IoIn {port:#x}"), true)
+                }
+                Ok(VcpuExit::MmioRead(address, data)) => {
+                    data.fill(0);
+                    (format!("MmioRead {address:#x}"), true)
+                }
+                Ok(VcpuExit::MmioWrite(address, _)) => (format!("MmioWrite {address:#x}"), true),
+                Ok(VcpuExit::Hlt) => ("Hlt".to_string(), false),
+                Ok(VcpuExit::Shutdown) => ("Shutdown".to_string(), false),
+                Ok(_) => ("(another)".to_string(), false),
+                Err(e) if e.errno() == libc::EINTR => ("none within 5 s (kicked)".to_string(), false),
+                Err(e) => (format!("run failed, errno {}", e.errno()), false),
+            };
+            exits.push(line);
+            if !more {
+                break;
+            }
+        }
+        done.store(true, Ordering::SeqCst);
+        watchdog.join().unwrap();
+        vcpu.set_kvm_immediate_exit(0);
+        format!("exits {}", exits.join(", "))
+    }
+
+    /// [`run_a_step`] on a thread of its own, made as Firecracker makes a
+    /// vCPU's (its name, 2 MiB of stack reserved), with the WHP calls the
+    /// thread made (`ffi::trace`): one STACKTEST line of what the thread's
+    /// stack had committed before and after the step, and one STACKCALL
+    /// line for each call (past 40 calls, for those that left more of the
+    /// stack committed than they found, or failed). Returns the calls.
+    fn a_step_with_its_calls(vcpu: &mut VcpuFd, thread: &str, name: &str) -> Vec<super::super::ffi::trace::Call> {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name(thread.to_string())
+                .stack_size(2 << 20)
+                .spawn_scoped(scope, || {
+                    let before = super::super::ffi::trace::stack();
+                    super::super::ffi::trace::begin();
+                    let what = run_a_step(vcpu);
+                    let calls = super::super::ffi::trace::end();
+                    let after = super::super::ffi::trace::stack();
+                    let grew = |c: &super::super::ffi::trace::Call| c.after > c.before;
+                    let by_calls: usize = calls.iter().map(|c| c.after - c.before).sum();
+                    eprintln!(
+                        "STACKTEST {thread}, {name}: {what}; the thread's stack: {} KiB committed before, {} after, \
+                         {} of them within WHP calls; {} WHP calls, {} left more committed, {} failed",
+                        before / 1024,
+                        after / 1024,
+                        by_calls / 1024,
+                        calls.len(),
+                        calls.iter().filter(|c| grew(c)).count(),
+                        calls.iter().filter(|c| c.hres != 0).count()
+                    );
+                    for (i, c) in calls.iter().enumerate() {
+                        if i < 40 || grew(c) || c.hres != 0 {
+                            eprintln!("STACKCALL {thread}, {name}: #{} {}", i + 1, c.line());
+                        }
+                    }
+                    calls
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    /// A record of which WHP call commits a vCPU thread's stack, for what a
+    /// booting Linux guest does and the runs of
+    /// [`test_the_stack_each_call_commits_on_record`] did not do. That
+    /// record (CI run 43385227122) showed 12 to 24 KiB for each of its
+    /// runs, while a booted guest's vCPU threads keep 48 to 52 KiB, the
+    /// pages below the live frames holding stale ones:
+    /// `WHvSetVirtualProcessorRegisters` called from the run loop, and in
+    /// WinHvPlatform.dll a C++ exception thrown and caught and a message
+    /// looked up. The boots of that run reported no WHP call that failed
+    /// (no `whp:` line on Firecracker's standard error, where every failed
+    /// call of `ffi::hr_of` is reported), so the call is one that returns
+    /// success; which one, only its stack tells. Here every WHP call of the
+    /// thread is kept with the stack committed before and after it
+    /// (`ffi::trace`), a step at a time, each step on a thread of its own:
+    /// the CPUID leaves answered from the vCPU's state, RDMSR and WRMSR of
+    /// MSRs the backend keeps, port input the irqchip answers and port
+    /// input Firecracker answers, string I/O and an MMIO write (the
+    /// emulator), the local APIC through its page, an application
+    /// processor started with INIT and SIPI (on its own thread), an
+    /// interrupt taken while running and one that ends a HLT, the
+    /// TSC-deadline timer, and a KVM hypercall. The CPUID step asserts that
+    /// no call failed: IA32_XSS is read only where the partition keeps it.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_the_stack_each_whp_call_commits_on_record() {
+        const PROGRAM: u64 = 0xB000;
+        const HANDLER: u64 = 0xB800;
+        const AP_CODE: u64 = 0xC000;
+        const IDT: u64 = 0x5000;
+        const VECTOR: u64 = 0x41;
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
+        // A page 6 MiB up that no memory slot backs: an MMIO address.
+        q(0x3018, 0x60_0000 | 0x83);
+        // The local APIC's page, 0xFEE0_0000: the fourth GiB's directory at
+        // 0xA000, its 2 MiB page 0x1f7.
+        q(0x2018, 0xA000 | 3);
+        q(0xA000 + 0x1f7 * 8, 0xFEE0_0000 | 0x83);
+        // The interrupt gate of VECTOR (64-bit, code segment 8).
+        q(IDT + VECTOR * 16, (HANDLER & 0xffff) | (8 << 16) | (0x8E << 40));
+        q(IDT + VECTOR * 16 + 8, 0);
+        put(
+            m,
+            HANDLER,
+            &[
+                0xE6, 0x81, // out 0x81, al
+                0xC7, 0x83, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov dword [rbx + 0xB0], 0 (EOI)
+                0x48, 0xCF, // iretq
+            ],
+        );
+        // The application processor, in real mode where its SIPI starts it.
+        put(m, AP_CODE, &[0xE6, PORT as u8, 0xF4, 0xEB, 0xFD]); // out 0x80, al; hlt; jmp to the hlt
+        // KVM's hypercall instruction is the vendor's (VMMCALL on AMD).
+        let amd = core::arch::x86_64::__cpuid(0).ebx == u32::from_le_bytes(*b"Auth");
+        let apic = [0xBB, 0x00, 0x00, 0xE0, 0xFE]; // mov ebx, 0xFEE00000
+        // mov dword [rbx + offset], value
+        let apic_write = |offset: u32, value: u32| {
+            let mut b = vec![0xC7, 0x83];
+            b.extend_from_slice(&offset.to_le_bytes());
+            b.extend_from_slice(&value.to_le_bytes());
+            b
+        };
+        let steps: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "CPUID leaves 1, 7, 0xd.0 and 0xd.1",
+                vec![
+                    0xB8, 0x01, 0x00, 0x00, 0x00, 0x31, 0xC9, 0x0F, 0xA2, // mov eax, 1; xor ecx, ecx; cpuid
+                    0xB8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xC9, 0x0F, 0xA2, // leaf 7
+                    0xB8, 0x0D, 0x00, 0x00, 0x00, 0x31, 0xC9, 0x0F, 0xA2, // leaf 0xd, subleaf 0
+                    0xB8, 0x0D, 0x00, 0x00, 0x00, 0xB9, 0x01, 0x00, 0x00, 0x00, 0x0F, 0xA2, // leaf 0xd, subleaf 1
+                ],
+            ),
+            (
+                "RDMSR of the kvm-clock system time MSR",
+                vec![0xB9, 0x01, 0x4D, 0x56, 0x4B, 0x0F, 0x32], // mov ecx, 0x4b564d01; rdmsr
+            ),
+            (
+                "WRMSR of the kvm-clock system time MSR (enabled, at 0x8100)",
+                vec![
+                    0xB9, 0x01, 0x4D, 0x56, 0x4B, // mov ecx, 0x4b564d01
+                    0xB8, 0x01, 0x81, 0x00, 0x00, // mov eax, 0x8101
+                    0x31, 0xD2, 0x0F, 0x30, // xor edx, edx; wrmsr
+                ],
+            ),
+            (
+                "WRMSR of IA32_TSC_ADJUST (0x1000)",
+                vec![
+                    0xB9, 0x3B, 0x00, 0x00, 0x00, // mov ecx, 0x3b
+                    0xB8, 0x00, 0x10, 0x00, 0x00, // mov eax, 0x1000
+                    0x31, 0xD2, 0x0F, 0x30, // xor edx, edx; wrmsr
+                ],
+            ),
+            (
+                "IN from a PIC port (the irqchip answers), then from port 0x60 (the VMM answers)",
+                vec![0xE4, 0x21, 0xE4, 0x60], // in al, 0x21; in al, 0x60
+            ),
+            (
+                "REP OUTSB of 2 bytes to port 0x82 (the emulator)",
+                vec![
+                    0xBE, 0x00, 0x83, 0x00, 0x00, // mov esi, 0x8300
+                    0xB9, 0x02, 0x00, 0x00, 0x00, // mov ecx, 2
+                    0x66, 0xBA, 0x82, 0x00, // mov dx, 0x82
+                    0xF3, 0x6E, // rep outsb
+                ],
+            ),
+            (
+                "an MMIO write (the emulator)",
+                vec![0xC7, 0x04, 0x25, 0x00, 0x00, 0x60, 0x00, 0x78, 0x56, 0x34, 0x12], // mov dword [0x600000], 0x12345678
+            ),
+            (
+                "the local APIC enabled through its page (spurious vector register 0x1ff)",
+                [apic.to_vec(), apic_write(0xF0, 0x1FF)].concat(),
+            ),
+            (
+                "INIT, then SIPI (vector 0xc) to APIC 1",
+                [apic.to_vec(), apic_write(0x310, 1 << 24), apic_write(0x300, 0x4500), apic_write(0x300, 0x460C)].concat(),
+            ),
+            (
+                "STI and a fixed interrupt to itself, taken while it runs",
+                [apic.to_vec(), vec![0xFB], apic_write(0x300, 0x4_0000 | VECTOR as u32), vec![0x90, 0x90, 0x90]].concat(),
+            ),
+            (
+                "the APIC timer (one shot, 0x100000 counts) and HLT, ended by its interrupt",
+                [
+                    apic.to_vec(),
+                    apic_write(0x320, VECTOR as u32),
+                    apic_write(0x3E0, 0xB),
+                    apic_write(0x380, 0x10_0000),
+                    vec![0xF4], // hlt
+                ]
+                .concat(),
+            ),
+            (
+                "the TSC-deadline timer (WRMSR 0x6e0, the TSC plus 0x10000000) and HLT, ended by its interrupt",
+                [
+                    apic.to_vec(),
+                    apic_write(0x320, 0x4_0000 | VECTOR as u32),
+                    vec![
+                        0x0F, 0x31, // rdtsc
+                        0x05, 0x00, 0x00, 0x00, 0x10, // add eax, 0x10000000
+                        0x83, 0xD2, 0x00, // adc edx, 0
+                        0xB9, 0xE0, 0x06, 0x00, 0x00, // mov ecx, 0x6e0
+                        0x0F, 0x30, // wrmsr
+                        0xF4, // hlt
+                    ],
+                ]
+                .concat(),
+            ),
+            (
+                "a KVM hypercall (KVM_HC_CLOCK_PAIRING, the structure at 0x8200)",
+                vec![
+                    0xB8, 0x09, 0x00, 0x00, 0x00, // mov eax, 9
+                    0xBB, 0x00, 0x82, 0x00, 0x00, // mov ebx, 0x8200
+                    0x31, 0xC9, // xor ecx, ecx
+                    0x0F, 0x01, if amd { 0xD9 } else { 0xC1 }, // vmmcall or vmcall
+                ],
+            ),
+        ];
+        let mut program = Vec::new();
+        for (_, code) in &steps {
+            program.extend_from_slice(code);
+            program.extend_from_slice(&[0xE6, PORT as u8]); // out 0x80, al: the step's end
+        }
+        program.extend_from_slice(&[0xF4, 0xEB, 0xFD]); // hlt; jmp to the hlt
+        assert!(program.len() < (HANDLER - PROGRAM) as usize);
+        put(m, PROGRAM, &program);
+
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        let mut ap = vm.create_vcpu(1).unwrap();
+        // The guest's CPUID has TSC_ADJUST (leaf 7, EBX bit 1), without
+        // which a write of the MSR is dropped; the other leaves are WHP's.
+        let leaf7 = kvm_cpuid_entry2 {
+            function: 7,
+            index: 0,
+            flags: kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            ebx: 1 << 1,
+            ..Default::default()
+        };
+        vcpu.set_cpuid2(&CpuId::from_entries(&[leaf7]).unwrap()).unwrap();
+        start(&vcpu);
+        let mut s = vcpu.get_sregs().unwrap();
+        (s.idt.base, s.idt.limit) = (IDT, 0xfff);
+        vcpu.set_sregs(&s).unwrap();
+        vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+
+        let mut cpuid_failures = Vec::new();
+        for (i, (name, _)) in steps.iter().enumerate() {
+            let calls = if name.starts_with("INIT") {
+                // The application processor's thread is in its run, waiting
+                // for its start, while the boot processor sends it.
+                std::thread::scope(|scope| {
+                    let ap = &mut ap;
+                    let waiting = scope.spawn(move || {
+                        a_step_with_its_calls(ap, "fc_vcpu 1", "the application processor's first run, started by the SIPI")
+                    });
+                    let calls = a_step_with_its_calls(&mut vcpu, "fc_vcpu 0", name);
+                    waiting.join().unwrap();
+                    calls
+                })
+            } else {
+                a_step_with_its_calls(&mut vcpu, "fc_vcpu 0", name)
+            };
+            if i == 0 {
+                cpuid_failures = calls.iter().filter(|c| c.hres != 0).map(super::super::ffi::trace::Call::line).collect();
+            }
+        }
+
+        drop(ap);
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        assert!(cpuid_failures.is_empty(), "a WHP call failed while CPUID was answered: {cpuid_failures:?}");
     }
 
     /// A record of what each call of the backend commits of the stack of

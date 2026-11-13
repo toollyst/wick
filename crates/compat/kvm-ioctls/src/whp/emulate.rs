@@ -261,9 +261,22 @@ unsafe extern "system" fn get_regs_cb(
 ) -> i32 {
     // SAFETY: context is the EmuCtx; the arrays have `count` elements.
     let ctx = unsafe { &*(context as *const EmuCtx) };
-    unsafe {
+    #[cfg(test)]
+    let before = super::ffi::trace::stack();
+    let hres = unsafe {
         whv::WHvGetVirtualProcessorRegisters(ctx.part, ctx.vp, names, count, values)
-    }
+    };
+    #[cfg(test)]
+    super::ffi::trace::note(
+        "the emulator's WHvGetVirtualProcessorRegisters",
+        ctx.vp,
+        // SAFETY: the emulator's array of `count` names.
+        unsafe { std::slice::from_raw_parts(names, count as usize) },
+        None,
+        before,
+        hres,
+    );
+    hres
 }
 
 unsafe extern "system" fn set_regs_cb(
@@ -274,9 +287,22 @@ unsafe extern "system" fn set_regs_cb(
 ) -> i32 {
     // SAFETY: context is the EmuCtx; the arrays have `count` elements.
     let ctx = unsafe { &*(context as *const EmuCtx) };
-    unsafe {
+    #[cfg(test)]
+    let before = super::ffi::trace::stack();
+    let hres = unsafe {
         whv::WHvSetVirtualProcessorRegisters(ctx.part, ctx.vp, names, count, values)
-    }
+    };
+    #[cfg(test)]
+    super::ffi::trace::note(
+        "the emulator's WHvSetVirtualProcessorRegisters",
+        ctx.vp,
+        // SAFETY: the emulator's arrays of `count` names and values.
+        unsafe { std::slice::from_raw_parts(names, count as usize) },
+        Some(unsafe { std::slice::from_raw_parts(values, count as usize) }),
+        before,
+        hres,
+    );
+    hres
 }
 
 unsafe extern "system" fn translate_cb(

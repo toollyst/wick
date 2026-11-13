@@ -802,6 +802,7 @@ jobs:
               test_one_partition_of_a_process_maps_memory \
               test_translate_as_kvm_at_the_entry_and_in_long_mode \
               test_tsc_and_its_adjust_restore_as_saved \
+              test_no_clock_reference_is_made_of_a_tsc_that_was_not_read \
               test_maps_after_a_refused_map_once_both_vms_are_gone \
               test_a_vm_kept_alive_keeps_later_maps_refused \
               test_a_vm_with_an_irqfd_is_dropped_with_its_last_reference; do
@@ -823,6 +824,18 @@ jobs:
           # reads back of an area written with the x87 and SSE header bits
           # cleared, then set.
           alone whp::vcpu::fpu_tests::test_set_fpu_on_record
+          # Which WHP call it is that commits a vCPU thread's stack: every
+          # call a thread makes, with the stack committed before and after
+          # it (STACKCALL lines), for what a booting Linux guest does and
+          # the STACKTEST runs below did not (run 43385227122: 12 to 24 KiB
+          # each, against a booted vCPU's 48 to 52, and no WHP call of the
+          # boots reported as failed): the CPUID leaves answered from the
+          # vCPU's state, kvm-clock and TSC_ADJUST, port input, string I/O
+          # and MMIO through the emulator, the local APIC's page, a second
+          # vCPU started by INIT and SIPI on its own thread, interrupts
+          # (running, and ending a HLT), the TSC-deadline timer, a KVM
+          # hypercall. Asserted: no WHP call fails while CPUID is answered.
+          alone whp::vcpu::fpu_tests::test_the_stack_each_whp_call_commits_on_record
           # What each call of the backend commits of its thread's stack
           # (STACKTEST lines), each on a thread of its own: which one leaves
           # a vCPU's thread 48 to 52 KiB deep, as the boot record of run
