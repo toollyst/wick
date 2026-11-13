@@ -1880,6 +1880,14 @@ impl VcpuFd {
     /// Whether the guest's CPUID leaf 0, as the table set on this vCPU has
     /// it, names Intel (KVM's `vendor_intel` reads the guest's CPUID; no
     /// leaf 0 is no vendor).
+    fn guest_vendor_amd_or_hygon(&self) -> bool {
+        let table = self.shared.cpuid.lock().unwrap();
+        table
+            .iter()
+            .find(|e| e.function == 0)
+            .is_some_and(|e| super::exit::guest_vendor_amd_or_hygon(e.ebx, e.ecx, e.edx))
+    }
+
     fn guest_vendor_intel(&self) -> bool {
         let table = self.shared.cpuid.lock().unwrap();
         table
@@ -2101,13 +2109,12 @@ impl VcpuFd {
         let (is_write, value) = super::exit::msr_access(unsafe { m.AccessInfo.AsUINT32 }, m.Rax, m.Rdx);
         let index = m.MsrNumber;
         if super::mce::is_mce(index) {
-            // As KVM's `set_msr_mce` and `get_msr_mce` for the guest. KVM
-            // lets a guest write a bank's STATUS other than 0 only with
-            // HWCR's McStatusWrEn on an AMD guest (`can_set_mci_status`);
-            // this backend keeps no HWCR, so never: as KVM with HWCR at its
-            // reset value, 0.
+            // As KVM's `set_msr_mce`, `get_msr_mce` and its HWCR case for
+            // the guest: a bank's STATUS other than 0 only with HWCR's
+            // McStatusWrEn on an AMD or Hygon guest (`can_set_mci_status`).
+            let amd = self.guest_vendor_amd_or_hygon();
             let mut mce = self.shared.mce.lock().unwrap();
-            let answer = if is_write { mce.set(index, value, false, false).then_some(None) } else { mce.get(index, false).map(Some) };
+            let answer = if is_write { mce.set(index, value, false, amd).then_some(None) } else { mce.get(index, false).map(Some) };
             drop(mce);
             return match answer {
                 Some(None) => regs::set_rip(self.part(), self.vp(), rip_after),
@@ -4096,6 +4103,10 @@ mod fpu_tests {
             }
         }
 
+        eprintln!(
+            "TMPLTEST MsrActionList (an exit for IA32_MCG_CAP and IA32_MCG_STATUS): HRESULT {:#010x?}",
+            super::super::vm::MSR_ACTIONS.get().map(|h| h.cast_unsigned())
+        );
         // The machine-check MSRs (`mce`): what a guest's RDMSR gets and
         // its WRMSR does, whether each came to the backend, and what
         // KVM_GET_MSRS reads after; KVM's answer in each line. On record:

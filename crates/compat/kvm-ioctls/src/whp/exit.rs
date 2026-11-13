@@ -353,6 +353,15 @@ pub fn guest_vendor_intel(ebx: u32, ecx: u32, edx: u32) -> bool {
     ebx == 0x756e_6547 && ecx == 0x6c65_746e && edx == 0x4965_6e69
 }
 
+/// Whether CPUID leaf 0's vendor (`ebx`, `ecx`, `edx`) is AMD's or Hygon's,
+/// as KVM's `guest_cpuid_is_amd_or_hygon` reads the guest's
+/// (arch/x86/include/asm/kvm_para.h `is_guest_vendor_amd`, `_hygon`).
+pub fn guest_vendor_amd_or_hygon(ebx: u32, ecx: u32, edx: u32) -> bool {
+    // "AuthenticAMD", "HygonGenuine".
+    (ebx == 0x6874_7541 && ecx == 0x444d_4163 && edx == 0x6974_6e65)
+        || (ebx == 0x6f67_7948 && ecx == 0x656e_6975 && edx == 0x6e65_476e)
+}
+
 /// A page fault's error code: `P` for a fault on a page that is present,
 /// `W` for a write, `U` from privilege level 3, `RSVD` for reserved bits
 /// set in a page table entry (which is a fault on a present page).

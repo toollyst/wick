@@ -427,6 +427,9 @@ pub(crate) fn probe_registers(names: &[WHV_REGISTER_NAME]) -> Vec<bool> {
     ok
 }
 
+/// What WHP answered the first partition's MSR action list with (`configure`).
+pub(crate) static MSR_ACTIONS: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+
 /// Sets a new partition's properties and sets it up, as every VM's.
 fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
         // Processor count must be set before the partition is set up.
@@ -506,6 +509,42 @@ fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
             unsafe {
                 ffi::set_partition_property(part, whv::WHvPartitionPropertyCodeProcessorXsaveFeatures, &xsave)?;
             }
+        }
+        // IA32_MCG_CAP and IA32_MCG_STATUS: WHP answers a guest's RDMSR and
+        // WRMSR of them itself, with no MSR exit (measured on a Ryzen 9 7900,
+        // Windows 11 build 26300: `test_what_a_cpu_template_changes_on_record`,
+        // "intercepts 0", MCG_CAP read as 0, a write of MCG_STATUS taken),
+        // where every other machine-check MSR exits; the vCPU keeps them as
+        // KVM keeps them (`mce`), so a guest and a snapshot would see two
+        // values. An MSR action of Exit for each (MsrActionList,
+        // `WHvMsrActionExit`) makes them exit as the rest do. A WHP that
+        // does not take the list is reported, once, and the difference
+        // stays: the guest's are WHP's (`msr_actions`).
+        let actions = [super::mce::MCG_CAP, super::mce::MCG_STATUS].map(|index| whv::WHV_MSR_ACTION_ENTRY {
+            Index: index,
+            ReadAction: whv::WHvMsrActionExit as u8,
+            WriteAction: whv::WHvMsrActionExit as u8,
+            Reserved: 0,
+        });
+        // SAFETY: an array of MSR action entries of the size passed.
+        let hres = unsafe {
+            whv::WHvSetPartitionProperty(
+                part,
+                whv::WHvPartitionPropertyCodeMsrActionList,
+                actions.as_ptr().cast(),
+                u32::try_from(std::mem::size_of_val(&actions)).unwrap(),
+            )
+        };
+        if MSR_ACTIONS.set(hres).is_ok() && hres < 0 {
+            ffi::report(
+                log::Level::Error,
+                &format!(
+                    "whp: this host's WHP does not take an MSR action list (HRESULT {:#010x}): a guest's RDMSR and WRMSR of \
+                     IA32_MCG_CAP and IA32_MCG_STATUS are answered by WHP, not from the vCPU's machine-check MSRs, which \
+                     KVM_GET_MSRS and a snapshot have",
+                    hres.cast_unsigned()
+                ),
+            );
         }
         // Emulate the local APIC in WHP (xAPIC).
         let apic_mode: i32 = whv::WHvX64LocalApicEmulationModeXApic;

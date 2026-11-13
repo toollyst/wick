@@ -1279,7 +1279,7 @@ fn msr_segment_base(index: u32) -> Option<WHV_REGISTER_NAME> {
 }
 
 /// The machine-check MSRs (the P5 pair, IA32_MCG_CAP, _STATUS and _CTL, 32
-/// banks' CTL2 and four registers each), which the vCPU keeps as KVM keeps
+/// banks' CTL2 and four registers each) and HWCR, which the vCPU keeps as KVM keeps
 /// them ([`super::mce`]): `KVM_GET_MSRS` and `KVM_SET_MSRS` have them, and
 /// a write KVM refuses ends the call there (`VcpuFd::set_msrs`). Upstream
 /// saves 0x400 to 0x47f of every guest whose CPUID has MCE
@@ -1386,9 +1386,9 @@ pub(crate) fn msr_index_list() -> Result<MsrList> {
         super::pvclock::MSR_WALL_CLOCK, super::pvclock::MSR_SYSTEM_TIME,
         // IA32_TSC_DEADLINE (tscdeadline).
         super::tscdeadline::MSR_TSC_DEADLINE,
-        // IA32_MCG_STATUS and IA32_MCG_CTL, in KVM's emulated list
+        // IA32_MCG_STATUS, IA32_MCG_CTL and HWCR, in KVM's emulated list
         // (x86.c, `emulated_msrs_all`) and kept by the vCPU (mce).
-        super::mce::MCG_STATUS, super::mce::MCG_CTL,
+        super::mce::MCG_STATUS, super::mce::MCG_CTL, super::mce::HWCR,
     ]
     .into_iter()
     // KVM's others that this partition keeps (the MTRRs are not listed),
