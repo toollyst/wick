@@ -50,6 +50,7 @@ import random
 import shutil
 import socket
 import struct
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -726,27 +727,73 @@ class NetNs:
         if key in self._forwards:
             return self._forwards[key][1]
         self._iface_of(guest_ip)
-        # A number free for both: the system picks one for TCP, and UDP may
-        # have it taken; then another is asked for.
-        for _ in range(64):
-            tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            tcp.bind(("127.0.0.1", 0))
-            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tcp, udp = pair_on_loopback(f"network {self.id}")
+        # A forward of one protocol made before has another number.
+        for old in ((str(guest_ip), port), ("udp", str(guest_ip), port)):
+            if old in self._forwards:
+                self._forwards.pop(old)[0].close()
+        local = self.forward(guest_ip, port, listener=tcp)
+        self.forward_udp(guest_ip, port, sock=udp)
+        self._forwards[key] = (tcp, local)
+        return local
+
+
+def pair_on_loopback(who, tries=64):
+    """A TCP and a UDP socket bound to one port number of 127.0.0.1.
+
+    The system gives each protocol a number of its own (bind to port 0);
+    the other protocol's bind to that number may be refused, by a socket
+    of another program or a range the system keeps out of that protocol's
+    use (Windows: `netsh interface ipv4 show excludedportrange`). Both
+    directions are asked, TCP's number for UDP and UDP's for TCP, and every
+    socket tried stays bound until a pair is found, so that each number
+    asked for is a new one. Before, the TCP socket was closed after each
+    refusal, which gives its number back to the system, and whether
+    Windows then hands the same number out again is not documented: in CI
+    run 43397419784 (at 019a0fa) 64 such tries all failed, where run
+    43392627996 (at 1866e32) found a number. Every refusal is kept, with
+    its port and error, and printed, so the log shows what refused a
+    number; when no pair is found, the error names each refusal and the
+    excluded ranges of both protocols."""
+    held, refused = [], []
+    try:
+        for i in range(tries):
+            first, second = (socket.SOCK_STREAM, socket.SOCK_DGRAM) if i % 2 == 0 else (socket.SOCK_DGRAM, socket.SOCK_STREAM)
+            a = socket.socket(socket.AF_INET, first)
+            held.append(a)
+            a.bind(("127.0.0.1", 0))
+            number = a.getsockname()[1]
+            b = socket.socket(socket.AF_INET, second)
             try:
-                udp.bind(("127.0.0.1", tcp.getsockname()[1]))
-            except OSError:
-                tcp.close()
-                udp.close()
+                b.bind(("127.0.0.1", number))
+            except OSError as e:
+                b.close()
+                kind = "UDP" if second == socket.SOCK_DGRAM else "TCP"
+                refused.append(f"{kind} {number}: errno {e.errno} winerror {getattr(e, 'winerror', None)} {e.strerror}")
                 continue
-            # A forward of one protocol made before has another number.
-            for old in ((str(guest_ip), port), ("udp", str(guest_ip), port)):
-                if old in self._forwards:
-                    self._forwards.pop(old)[0].close()
-            local = self.forward(guest_ip, port, listener=tcp)
-            self.forward_udp(guest_ip, port, sock=udp)
-            self._forwards[key] = (tcp, local)
-            return local
-        raise OSError(f"network {self.id}: no port on 127.0.0.1 is free for both TCP and UDP")
+            held.remove(a)
+            tcp, udp = (a, b) if first == socket.SOCK_STREAM else (b, a)
+            if refused:
+                print(f"{who}: port {number} for TCP and UDP after {len(refused)} refused: {refused}", file=sys.stderr)
+            return tcp, udp
+    finally:
+        for s in held:
+            s.close()
+    raise OSError(f"{who}: no port on 127.0.0.1 is free for both TCP and UDP; refused: {refused}; {excluded_ranges()}")
+
+
+def excluded_ranges():
+    """What Windows keeps out of TCP's and UDP's use, as netsh lists it
+    (nothing elsewhere)."""
+    if os.name != "nt":
+        return "no excluded ranges outside Windows"
+    import subprocess
+    out = []
+    for proto in ("tcp", "udp"):
+        r = subprocess.run(["netsh", "interface", "ipv4", "show", "excludedportrange", f"protocol={proto}"],
+                           capture_output=True, text=True, check=False)
+        out.append(f"{proto} excluded: {' '.join((r.stdout + r.stderr).split())}")
+    return "; ".join(out)
 
 
 def network(netns_id):
