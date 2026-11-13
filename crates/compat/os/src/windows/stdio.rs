@@ -29,7 +29,7 @@
 //!   read with no whole line typed is [`WOULD_BLOCK`] too, and takes
 //!   nothing, as Linux's canonical terminal gives `EAGAIN` until the line is
 //!   complete (`line_ready`); once Enter is among the records the line
-//!   reads;
+//!   reads, and ends in one newline as on Linux (`line_end`);
 //! - no standard input (`NULL`, or a handle that is not valid) as the end,
 //!   as std does (its `handle_ebadf`).
 //!
@@ -49,8 +49,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType, ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
-    ENABLE_LINE_INPUT, GetConsoleMode, GetNumberOfConsoleInputEvents, GetStdHandle, INPUT_RECORD,
-    KEY_EVENT, PeekConsoleInputW, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, GetConsoleMode, GetNumberOfConsoleInputEvents,
+    GetStdHandle, INPUT_RECORD, KEY_EVENT, PeekConsoleInputW, ReadConsoleInputW, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE,
 };
 
 use super::fd::{AsFd, AsRawFd, BorrowedFd, RawFd, from_handle};
@@ -191,8 +192,39 @@ impl Read for Raw {
         }
         // `buf` is this module's whole buffer, or a larger one (see
         // `BUF_SIZE`), so std's own buffer keeps nothing back.
-        std::io::stdin().lock().read(buf)
+        let n = std::io::stdin().lock().read(buf)?;
+        if mode & ENABLE_LINE_INPUT != 0 {
+            return Ok(line_end(&mut buf[..n], mode & ENABLE_PROCESSED_INPUT != 0));
+        }
+        Ok(n)
     }
+}
+
+/// The end of a line read in line input mode made Linux's: a console read
+/// ends the line with the Enter key's carriage return, followed by a line
+/// feed in processed input mode only (ENABLE_PROCESSED_INPUT: "carriage
+/// return, and line feed characters are handled by the system",
+/// learn.microsoft.com/windows/console/setconsolemode; conhost's
+/// `COOKED_READ_DATA::_handlePostCharInputLoop` appends `\r\n` with it and
+/// `\r` without, microsoft/terminal src/host/readDataCooked.cpp; measured
+/// without it, CI run 43323860314: "ok" and Enter read as `ok\r`). A Linux
+/// terminal gives the Enter key's carriage return as one newline
+/// (drivers/tty/n_tty.c `n_tty_receive_char_special`: `if (I_ICRNL(tty)) c
+/// = '\n';`, and ICRNL is set on a terminal as the kernel makes it,
+/// drivers/tty/tty_io.c `tty_std_termios`). Returns the length of `read`
+/// after the change. A line longer than one read ends in a later read, and
+/// is changed there; one cut between its carriage return and line feed
+/// keeps both.
+fn line_end(read: &mut [u8], processed: bool) -> usize {
+    let n = read.len();
+    if processed && read.ends_with(b"\r\n") {
+        read[n - 2] = b'\n';
+        return n - 1;
+    }
+    if !processed && read.ends_with(b"\r") {
+        read[n - 1] = b'\n';
+    }
+    n
 }
 
 /// A handle to the process's standard input, as `std::io::Stdin`, with the
@@ -267,8 +299,12 @@ impl AsFd for Stdin {
 /// linewriter.rs `LineWriter::new`).
 const OUT_BUF_SIZE: usize = 1024;
 
-/// Writes to `h`, a pipe or a file, with Linux's results (see [`Stdout`]).
-pub(crate) fn write_handle(h: HANDLE, buf: &[u8]) -> io::Result<usize> {
+/// Linux's `PIPE_BUF`: a write of at most this many bytes to a pipe is
+/// taken whole or not at all (pipe(7); include/uapi/linux/limits.h).
+const PIPE_BUF: usize = 4096;
+
+/// One `WriteFile` of `buf`: the bytes taken.
+fn write_file(h: HANDLE, buf: &[u8]) -> io::Result<usize> {
     let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
     let mut n = 0u32;
     // SAFETY: the buffer is valid for `len` bytes; a synchronous write.
@@ -284,11 +320,43 @@ pub(crate) fn write_handle(h: HANDLE, buf: &[u8]) -> io::Result<usize> {
             e => Err(io::Error::from_raw_os_error(e.cast_signed())),
         };
     }
+    Ok(usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// Writes to `h`, a pipe or a file, with Linux's results (see [`Stdout`]).
+pub(crate) fn write_handle(h: HANDLE, buf: &[u8]) -> io::Result<usize> {
+    let mut total = write_file(h, buf)?;
     // SAFETY: plain call.
-    if n == 0 && !buf.is_empty() && unsafe { GetFileType(h) } == FILE_TYPE_PIPE {
+    if total == buf.len() || unsafe { GetFileType(h) } != FILE_TYPE_PIPE {
+        return Ok(total);
+    }
+    // A non-blocking pipe that did not take the write (see [`Stdout`]): up
+    // to PIPE_BUF bytes that is Linux's result too; a larger write goes in
+    // pieces of PIPE_BUF, each taken whole or refused, until one is
+    // refused, as Linux takes what fits page by page.
+    if buf.len() > PIPE_BUF {
+        while total < buf.len() {
+            let rest = &buf[total..];
+            let piece = &rest[..rest.len().min(PIPE_BUF)];
+            match write_file(h, piece) {
+                // The reader went away meanwhile: the error if nothing was
+                // written, else the count (fs/pipe.c anon_pipe_write, `if
+                // (!ret) ret = -EPIPE;`).
+                Err(e) if total == 0 => return Err(e),
+                Err(_) => break,
+                Ok(n) => {
+                    total += n;
+                    if n < piece.len() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if total == 0 {
         return Err(would_block());
     }
-    Ok(usize::try_from(n).unwrap_or(usize::MAX))
+    Ok(total)
 }
 
 /// The standard output handle, read on each call as std does; `None` when the
@@ -330,16 +398,24 @@ impl Write for RawOut {
 ///
 /// Firecracker makes its standard output non-blocking when the serial writes
 /// there (`set_stdout_nonblocking`; the compatibility `fcntl` makes a pipe
-/// `PIPE_NOWAIT`). A full non-blocking pipe takes nothing: on Linux the write
-/// fails with `EAGAIN` (fs/pipe.c `anon_pipe_write`, `if (!ret) ret =
-/// -EAGAIN`), `ErrorKind::WouldBlock`; on Windows `WriteFile` returns success
-/// with 0 bytes written ("Named Pipe Type, Read, and Wait Modes"), and std's
-/// writer passes the 0 on, which `write_all` and the buffer's flush report as
-/// `ErrorKind::WriteZero`. This one writes:
+/// `PIPE_NOWAIT`). A non-blocking pipe without room for a write: on Linux a
+/// write of at most `PIPE_BUF` (4096) bytes fails with `EAGAIN`,
+/// `ErrorKind::WouldBlock`, and nothing of it is taken, and a larger one is
+/// taken as far as it fits (pipe(7); fs/pipe.c `anon_pipe_write`, `if (!ret)
+/// ret = -EAGAIN`); on Windows `WriteFile` takes nothing of a write of any
+/// size that does not fit whole and returns success with 0 bytes written
+/// (measured, CI run 43323860314; the compatibility libc's module
+/// documentation has the numbers), and std's writer passes the 0 on, which
+/// `write_all` and the buffer's flush report as `ErrorKind::WriteZero`. This
+/// one writes:
 /// - a pipe or a file with `WriteFile`: 0 bytes of a non-empty write to a
 ///   pipe is [`WOULD_BLOCK`] (a pipe in blocking mode completes a write only
-///   once all of it is written, `SetNamedPipeHandleState`, so it is a full
-///   non-blocking pipe, whichever handle made it non-blocking);
+///   once all of it is written, `SetNamedPipeHandleState`, so it is a
+///   non-blocking pipe without room, whichever handle made it
+///   non-blocking), after a write of more than `PIPE_BUF` bytes was tried in
+///   pieces of `PIPE_BUF`, which gives the count of those taken
+///   (`test_a_write_that_does_not_fit_takes_nothing`,
+///   `test_a_large_write_is_taken_as_far_as_it_fits`);
 ///   `ERROR_BROKEN_PIPE`/`ERROR_NO_DATA` (no reader) fails with
 ///   `ErrorKind::BrokenPipe` and calls the `SIGPIPE` hook
 ///   ([`super::set_broken_pipe_hook`]), as Linux sends `SIGPIPE` there;
@@ -353,9 +429,7 @@ impl Write for RawOut {
 /// line, not by byte; and std flushes its buffer at exit
 /// (`std::process::exit` and the return from `main` call `rt::cleanup`, which
 /// replaces the buffer), this one is not, so bytes left in it by a write that
-/// failed are not written at exit. A non-blocking pipe also takes part of a
-/// write that does not fit, where Linux writes up to `PIPE_BUF` bytes all or
-/// nothing (the compatibility libc's module documentation says why).
+/// failed are not written at exit.
 pub struct Stdout {
     inner: &'static Mutex<LineWriter<RawOut>>,
 }
@@ -446,10 +520,9 @@ mod tests {
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Console::{
-        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, FOCUS_EVENT,
-        FOCUS_EVENT_RECORD, GetConsoleProcessList, GetNumberOfConsoleInputEvents, INPUT_RECORD_0,
-        KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, STD_INPUT_HANDLE, SetConsoleMode, SetStdHandle,
-        WriteConsoleInputW,
+        ENABLE_ECHO_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, FOCUS_EVENT, FOCUS_EVENT_RECORD,
+        GetConsoleProcessList, INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
+        SetConsoleMode, SetStdHandle, WriteConsoleInputW,
     };
     use windows_sys::Win32::System::Pipes::{
         CreatePipe, PIPE_NOWAIT, PIPE_READMODE_BYTE, SetNamedPipeHandleState,
@@ -655,31 +728,102 @@ mod tests {
         // And then nothing again.
         assert_eq!(input.read(&mut buf).unwrap_err().raw_os_error(), Some(WOULD_BLOCK));
 
-        // Line input mode, as before Firecracker sets raw mode: part of a
-        // line typed is EAGAIN, as on a canonical terminal on Linux
-        // (n_tty_read), and nothing of it is taken.
-        // SAFETY: our console input handle.
-        unsafe {
-            let raw = mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
-            assert_ne!(SetConsoleMode(conin, raw | ENABLE_LINE_INPUT), 0);
-        }
-        write(&[key(true, b'o'), key(false, b'o'), key(true, b'k')]);
-        let err = input.read(&mut buf).unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(WOULD_BLOCK), "part of a line");
-        assert_eq!(pending(), 3, "the records of the unfinished line stay");
-        // Enter (VK_RETURN) ends the line, and it reads, with its end.
-        write(&[key_vk(true, b'\r', 0x0d)]);
-        let mut got = Vec::new();
-        while !got.ends_with(b"\n") {
-            match input.read(&mut buf) {
-                Ok(n) => {
-                    assert!(n > 0, "the end of a console");
-                    got.extend_from_slice(&buf[..n]);
-                }
-                Err(e) => panic!("after {got:?}: {e}"),
+        // Line input mode. First as vmm_sys_util's `set_canon_mode` leaves
+        // the console (line input, echo and processed input: a console's
+        // mode before Firecracker sets raw mode and after it sets canonical
+        // mode back); then line input alone, which run 43323860314 had.
+        // Part of a line typed is EAGAIN, as on a canonical terminal on
+        // Linux (n_tty_read), and nothing of it is taken; Enter (VK_RETURN)
+        // ends the line, and it reads with one newline at its end, as on
+        // Linux (`line_end`), where the console gives `\r\n` in the first
+        // mode and `\r` in the second.
+        let raw = mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+        let canon = (mode | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)
+            & !ENABLE_VIRTUAL_TERMINAL_INPUT;
+        // The records waiting, for a failure's message: (event type, key
+        // down, repeat count, virtual key, character, control keys).
+        let records = || {
+            // SAFETY: an all-zero INPUT_RECORD is valid.
+            let mut recs: [INPUT_RECORD; 32] = unsafe { std::mem::zeroed() };
+            let mut n = 0u32;
+            // SAFETY: room for 32 records.
+            if unsafe { PeekConsoleInputW(conin, recs.as_mut_ptr(), 32, &mut n) } == 0 {
+                return format!("PeekConsoleInputW: {}", io::Error::last_os_error());
             }
+            let mut text = format!("{n} records");
+            for rec in &recs[..n as usize] {
+                if u32::from(rec.EventType) == KEY_EVENT {
+                    // SAFETY: the record is a key event; the union's u16.
+                    let (k, c) = unsafe { (rec.Event.KeyEvent, rec.Event.KeyEvent.uChar.UnicodeChar) };
+                    text += &format!(
+                        " (key, {}, {}, {:#x}, {c:#x}, {:#x})",
+                        k.bKeyDown, k.wRepeatCount, k.wVirtualKeyCode, k.dwControlKeyState
+                    );
+                } else {
+                    text += &format!(" (type {})", rec.EventType);
+                }
+            }
+            text
+        };
+        for (name, line_mode, a, b) in [
+            ("line, echo and processed input", canon, b'o', b'k'),
+            ("line input alone", raw | ENABLE_LINE_INPUT, b'n', b'o'),
+        ] {
+            let mut now = 0;
+            // SAFETY: our console input handle.
+            unsafe {
+                assert_ne!(SetConsoleMode(conin, line_mode), 0, "{name}");
+                assert_ne!(GetConsoleMode(conin, &mut now), 0);
+            }
+            write(&[key(true, a), key(false, a), key(true, b)]);
+            let err = input.read(&mut buf).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(WOULD_BLOCK), "{name}: part of a line");
+            assert_eq!(pending(), 3, "{name}: the records of the unfinished line stay");
+            write(&[key_vk(true, b'\r', 0x0d)]);
+            let before = records();
+            let mut got = Vec::new();
+            while !got.ends_with(b"\n") {
+                match input.read(&mut buf) {
+                    Ok(n) => {
+                        assert!(n > 0, "{name}: the end of a console");
+                        got.extend_from_slice(&buf[..n]);
+                    }
+                    Err(e) => panic!(
+                        "{name} (mode {now:#x}), after {got:?}: {e}; before the read {before}; \
+                         now {}",
+                        records()
+                    ),
+                }
+            }
+            assert_eq!(got, [a, b, b'\n'], "{name} (mode {now:#x}); before the read {before}");
+            // On record: what the console itself gives for a line in this
+            // mode (std's reader, without `line_end`).
+            write(&[key(true, b'x'), key_vk(true, b'\r', 0x0d)]);
+            let mut line = [0u8; 64];
+            let n = std::io::stdin().lock().read(&mut line).unwrap();
+            println!("CONSOLETEST {name} (mode {now:#x}): the console reads \"x\" and Enter as {:?}", &line[..n]);
         }
-        assert_eq!(got, b"ok\r\n");
+    }
+
+    // The end of a line read in line input mode: one newline, as on Linux.
+    #[test]
+    fn test_a_line_ends_in_one_newline() {
+        let end = |bytes: &[u8], processed: bool| {
+            let mut b = bytes.to_vec();
+            let n = line_end(&mut b, processed);
+            b.truncate(n);
+            b
+        };
+        assert_eq!(end(b"ok\r\n", true), b"ok\n");
+        assert_eq!(end(b"ok\r", false), b"ok\n");
+        assert_eq!(end(b"\r\n", true), b"\n");
+        assert_eq!(end(b"\r", false), b"\n");
+        // Not a line's end as that mode gives it: left as read.
+        assert_eq!(end(b"ok\r", true), b"ok\r");
+        assert_eq!(end(b"ok", true), b"ok");
+        assert_eq!(end(b"ok", false), b"ok");
+        assert_eq!(end(b"", true), b"");
+        assert_eq!(end(b"", false), b"");
     }
 
     /// Runs `console_child` with a console of its own, hidden:
@@ -783,6 +927,8 @@ mod tests {
             CloseHandle(pi.hProcess);
         }
         let text = String::from_utf8_lossy(&out);
+        // The child's CONSOLETEST lines, for the log (--nocapture).
+        println!("{text}");
         assert!(code == 0 && text.contains("1 passed"), "exit {code}: {text}");
     }
 
@@ -845,6 +991,95 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err:?}");
         // SAFETY: the writer, ours.
         unsafe { CloseHandle(w) };
+    }
+
+    fn nowait_pipe() -> (HANDLE, HANDLE) {
+        let (r, w) = pipe();
+        let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+        // SAFETY: our pipe's write end.
+        assert_ne!(
+            unsafe { SetNamedPipeHandleState(w, &mode, std::ptr::null(), std::ptr::null()) },
+            0
+        );
+        (r, w)
+    }
+
+    /// Reads the pipe to its end, once its writers are closed.
+    fn read_to_end(r: HANDLE) -> Vec<u8> {
+        let mut all = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = read_handle(r, &mut buf).unwrap();
+            if n == 0 {
+                return all;
+            }
+            all.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    // A line that does not fit in a non-blocking pipe is refused whole, as
+    // on Linux for up to PIPE_BUF bytes (pipe(7), "O_NONBLOCK enabled, n <=
+    // PIPE_BUF"): the reader never gets the first part of it. Two pipes,
+    // filled in lines of 1000 and of 999 bytes after one byte: whatever a
+    // pipe holds, it is not full to the byte in both, so one refused line
+    // at least had room for a part (CI run 43323860314: a pipe of 4096
+    // bytes with 4000 in it refused 1000).
+    #[test]
+    fn test_a_write_that_does_not_fit_takes_nothing() {
+        let fill = |len: usize| {
+            let (r, w) = nowait_pipe();
+            let line = vec![b'.'; len];
+            assert_eq!(write_handle(w, b"1").unwrap(), 1);
+            let mut total = 1usize;
+            let err = loop {
+                match write_handle(w, &line) {
+                    Ok(n) => {
+                        assert_eq!(n, len, "a line is taken whole or refused");
+                        total += n;
+                        assert!(total < 64 << 20, "the pipe never filled");
+                    }
+                    Err(e) => break e,
+                }
+            };
+            assert_eq!(err.raw_os_error(), Some(WOULD_BLOCK));
+            let room_left = write_handle(w, b"2").is_ok();
+            // SAFETY: the writer, ours.
+            unsafe { CloseHandle(w) };
+            let held = read_to_end(r);
+            // SAFETY: the reader, ours.
+            unsafe { CloseHandle(r) };
+            assert_eq!(held.len(), total + usize::from(room_left), "nothing of the refused line");
+            println!("lines of {len}: {total} bytes taken, then one refused; room for a byte more: {room_left}");
+            room_left
+        };
+        let (a, b) = (fill(1000), fill(999));
+        assert!(a || b, "neither refused line had room for a part of it");
+    }
+
+    // A write of more than PIPE_BUF bytes is taken as far as it fits, as on
+    // Linux (pipe(7), "n > PIPE_BUF": "from 1 to n bytes may be written"),
+    // where Windows refuses it whole (CI run 43323860314: 1 MiB into an
+    // empty pipe takes 0 bytes): 70 KiB into an empty pipe, as upstream's
+    // unix test of a full pipe writes them (the vmm's
+    // nonblocking_pipe_tests).
+    #[test]
+    fn test_a_large_write_is_taken_as_far_as_it_fits() {
+        const LEN: usize = 70 * 1024;
+        let (r, w) = nowait_pipe();
+        let big = vec![7u8; LEN];
+        let taken = write_handle(w, &big).unwrap();
+        println!("a write of {LEN} bytes into the empty pipe took {taken}");
+        assert!(taken > 0 && taken < LEN, "{taken}");
+        assert_eq!(taken % PIPE_BUF, 0, "whole pieces");
+        let err = write_handle(w, &big).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(WOULD_BLOCK));
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        // SAFETY: the writer, ours.
+        unsafe { CloseHandle(w) };
+        let held = read_to_end(r);
+        assert!(held.len() == taken && held.iter().all(|&b| b == 7), "{}", held.len());
+        // SAFETY: the reader, ours.
+        unsafe { CloseHandle(r) };
     }
 
     // No standard output (a NULL handle: ERROR_INVALID_HANDLE) takes the

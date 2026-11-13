@@ -11,20 +11,27 @@
 //!   `recv`/`send`, on other handles `ReadFile`/`WriteFile`; a pipe whose
 //!   writer is gone reads as end of file, a pipe whose reader is gone fails
 //!   with `EPIPE`; `pread`/`pwrite` leave the file position alone;
-//! - `write`/`writev` to a full non-blocking pipe fail with `EAGAIN`, as on
-//!   Linux. One difference: Linux writes at most `PIPE_BUF` (4096) bytes
-//!   all or nothing (pipe(7)), and here a write that does not fit is
-//!   written in part, whatever its size (a non-blocking byte pipe takes "as
-//!   many bytes as the buffer holds", Named Pipe Type, Read, and Wait
-//!   Modes; `test_a_small_write_that_does_not_fit_is_written_in_part`), and
-//!   what was written cannot be taken back. The room left cannot be told
-//!   beforehand: the write end's
-//!   `WriteQuotaAvailable` (FILE_PIPE_LOCAL_INFORMATION) reads 0 while the
-//!   reader waits in a read, though a write then completes at once
-//!   (vmm-sys-util's `test_pipe_write_room_reads_0_while_a_read_waits`), so
-//!   refusing on it would refuse every write while a reader waits; and
-//!   `PeekNamedPipe` takes only a read end ("a handle to the read end of an
-//!   anonymous pipe");
+//! - `write`/`writev` to a non-blocking pipe (`PIPE_NOWAIT`) follow Linux
+//!   (pipe(7), "O_NONBLOCK enabled"; fs/pipe.c `anon_pipe_write`,
+//!   `pipe_write` before v6.15): a write of at most `PIPE_BUF` (4096)
+//!   bytes is taken whole, or fails with `EAGAIN` and nothing of it is
+//!   taken; a larger one is taken as far as it fits, or fails with `EAGAIN`
+//!   if nothing fits. Windows takes a non-blocking write to a byte pipe
+//!   whole or not at all, whatever its size: when it does not fit in the
+//!   room left, `WriteFile` returns TRUE with 0 bytes written (measured with
+//!   no read waiting at the other end, CI
+//!   run 43323860314: with 96 bytes free, 1000 bytes are refused and 16
+//!   taken; 1 MiB into an empty pipe of 4096 or of 65536 bytes is refused).
+//!   That is within `WriteFile`'s "returns TRUE with *lpNumberOfBytesWritten
+//!   < nNumberOfBytesToWrite", and is not "after writing as many bytes as
+//!   the buffer holds" (Named Pipe Type, Read, and Wait Modes). So up to
+//!   `PIPE_BUF` the two agree
+//!   (`test_a_small_write_that_does_not_fit_takes_nothing`), and a larger
+//!   write that Windows refused whole is written here in pieces of
+//!   `PIPE_BUF` until one is refused, each piece whole, as Linux fills a
+//!   pipe page by page (`test_a_large_write_is_taken_as_far_as_it_fits`).
+//!   `test_non_blocking_pipe_writes_on_record` prints what `WriteFile`
+//!   takes for each size, room, kind of pipe and with a read waiting;
 //! - `read` on a timerfd returns its expiration count;
 //! - `close`, `dup` and `dup2` keep the [`wick_fd`] attachments of a
 //!   descriptor (an eventfd's counter, a timer's schedule) with every handle
@@ -510,9 +517,29 @@ fn read_handle(h: HANDLE, buf: *mut c_void, count: usize, at: Option<i64>) -> ss
     n as ssize_t
 }
 
+/// Linux's `PIPE_BUF`: a write of at most this many bytes to a pipe is
+/// taken whole or not at all (pipe(7); include/uapi/linux/limits.h).
+const PIPE_BUF: usize = 4096;
+
+/// One `WriteFile` of `len` bytes: the bytes taken, or `None` with errno
+/// set (`EPIPE`, and the `SIGPIPE` hook, when the pipe's reader is gone).
+fn write_file(h: HANDLE, buf: *const u8, len: u32, ovp: *mut OVERLAPPED) -> Option<u32> {
+    let mut n = 0u32;
+    // SAFETY: the buffer is valid for `len` bytes (caller's contract).
+    if unsafe { WriteFile(h, buf, len, &mut n, ovp) } == 0 {
+        // SAFETY: plain call.
+        if matches!(unsafe { GetLastError() }, ERROR_BROKEN_PIPE | ERROR_NO_DATA) {
+            set_errno(crate::EPIPE);
+            wick_signal::broken_pipe();
+        }
+        let _: ssize_t = raw_failed();
+        return None;
+    }
+    Some(n)
+}
+
 fn write_handle(h: HANDLE, buf: *const c_void, count: usize, at: Option<i64>) -> ssize_t {
     let len = u32::try_from(count).unwrap_or(u32::MAX);
-    let mut n = 0u32;
     // SAFETY: an all-zero OVERLAPPED is valid.
     let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
     let ovp = match at {
@@ -527,29 +554,55 @@ fn write_handle(h: HANDLE, buf: *const c_void, count: usize, at: Option<i64>) ->
         None => std::ptr::null_mut(),
     };
     // SAFETY: the buffer is valid for `len` bytes (caller's contract).
-    if unsafe { WriteFile(h, buf.cast(), len, &mut n, ovp) } == 0 {
-        // SAFETY: plain call.
-        if matches!(unsafe { GetLastError() }, ERROR_BROKEN_PIPE | ERROR_NO_DATA) {
-            set_errno(crate::EPIPE);
-            wick_signal::broken_pipe();
-        }
-        return raw_failed();
-    }
-    // A full non-blocking pipe takes nothing and returns success with 0
-    // written (WriteFile, "Pipes"): EAGAIN, as Linux's pipe write gives
-    // with O_NONBLOCK and the pipe full (fs/pipe.c anon_pipe_write: `if
-    // (!ret) ret = -EAGAIN; break;`), never 0. A pipe in blocking mode does
-    // not complete a write before all is written (SetNamedPipeHandleState,
-    // PIPE_WAIT), so 0 of a non-zero count is PIPE_NOWAIT, whoever set it:
-    // this descriptor, a duplicate or another process, as the mode is the
-    // pipe end's (test_pipe_wait_mode_is_shared_with_a_child_process), not
-    // only what this process's flags table knows.
+    let Some(n) = write_file(h, buf.cast(), len, ovp) else {
+        return -1;
+    };
+    let mut total = n as usize;
     // SAFETY: plain call.
-    if n == 0 && count > 0 && at.is_none() && unsafe { GetFileType(h) } == FILE_TYPE_PIPE {
+    if total == count || at.is_some() || unsafe { GetFileType(h) } != FILE_TYPE_PIPE {
+        return total as ssize_t;
+    }
+    // A pipe took less than it was given. A pipe in blocking mode does not
+    // complete a write before all is written (SetNamedPipeHandleState,
+    // PIPE_WAIT), so this is PIPE_NOWAIT, whoever set it: this descriptor,
+    // a duplicate or another process, as the mode is the pipe end's
+    // (test_pipe_wait_mode_is_shared_with_a_child_process), not only what
+    // this process's flags table knows. Windows refused the write whole
+    // (the module docs have the measurement).
+    //
+    // Linux takes what fits, page by page, and with O_NONBLOCK and no room
+    // left returns what it has taken, or EAGAIN for nothing (fs/pipe.c
+    // anon_pipe_write: `if (!ret) ret = -EAGAIN; break;`), never 0. Up to
+    // PIPE_BUF that is all or nothing, which Windows has just done. Above
+    // it, the write goes in pieces of PIPE_BUF, each taken whole or
+    // refused, until one is refused.
+    if count > PIPE_BUF {
+        while total < count {
+            #[allow(clippy::cast_possible_truncation)]
+            let piece = (count - total).min(PIPE_BUF) as u32;
+            // SAFETY: `total < count`: the piece lies in the caller's buffer.
+            let rest = unsafe { buf.cast::<u8>().add(total) };
+            match write_file(h, rest, piece, std::ptr::null_mut()) {
+                // The reader went away meanwhile: EPIPE if nothing was
+                // written, else the count (Linux sends SIGPIPE in both:
+                // anon_pipe_write, `send_sig(SIGPIPE, current, 0); if (!ret)
+                // ret = -EPIPE;`).
+                None if total == 0 => return -1,
+                None => break,
+                Some(n) => {
+                    total += n as usize;
+                    if n < piece {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if total == 0 {
         set_errno(crate::EAGAIN);
         return -1;
     }
-    n as ssize_t
+    total as ssize_t
 }
 
 /// `read`.
@@ -1706,9 +1759,10 @@ mod tests {
     // when the serial writes there (upstream's set_stdout_nonblocking):
     // `write` here fails with EAGAIN, as on Linux. std on the same handle
     // gets a write of 0 bytes, which write_all reports as WriteZero, "failed
-    // to write whole buffer": a full non-blocking byte pipe takes what fits
-    // and returns success (WriteFile, "Pipes": "WriteFile returns TRUE with
-    // *lpNumberOfBytesWritten < nNumberOfBytesToWrite"), and std's
+    // to write whole buffer": a non-blocking byte pipe takes nothing of a
+    // write that does not fit and returns success (WriteFile, "Pipes":
+    // "WriteFile returns TRUE with *lpNumberOfBytesWritten <
+    // nNumberOfBytesToWrite"), and std's
     // Handle::write passes that on. How libtest lost its report in CI run
     // 43277608081 (cpu-template-helper; tools/windows/check-unit-tests.py).
     #[test]
@@ -1747,9 +1801,10 @@ mod tests {
     // A pipe made non-blocking through another handle of its write end (a
     // duplicate here; in CI's case another process's inherited copy), which
     // this descriptor's flags do not show: once full, `write` and `writev`
-    // still fail with EAGAIN as on Linux, never return 0. A write that does
-    // not fit is written in part, whatever its size (the module docs say
-    // why Linux's all-or-nothing for PIPE_BUF bytes is not kept).
+    // still fail with EAGAIN as on Linux, never return 0. The pipe is filled
+    // to its last byte first: a write of 1000 bytes is refused with less
+    // room than that, and 16 bytes still fit then (CI run 43323860314: 4000
+    // bytes in, 1000 refused, 16 taken).
     #[test]
     fn test_a_pipe_made_non_blocking_elsewhere_is_eagain_when_full() {
         let mut fds = [0; 2];
@@ -1773,19 +1828,19 @@ mod tests {
             assert_eq!(fcntl(fds[1], F_GETFL) & O_NONBLOCK, 0, "this descriptor's flags do not know");
             let chunk = [7u8; 1000];
             let mut total = 0usize;
-            let mut last = 0usize;
-            loop {
-                let n = write(fds[1], chunk.as_ptr().cast(), chunk.len());
-                if n < 0 {
-                    break;
+            for len in [chunk.len(), 1] {
+                loop {
+                    let n = write(fds[1], chunk.as_ptr().cast(), len);
+                    if n < 0 {
+                        break;
+                    }
+                    assert_eq!(n.unsigned_abs(), len, "a write of {len} is taken whole or fails");
+                    total += len;
+                    assert!(total < 64 << 20, "the pipe never filled");
                 }
-                assert!(n > 0, "a write that takes nothing fails");
-                last = n.unsigned_abs();
-                total += last;
-                assert!(total < 64 << 20, "the pipe never filled");
+                assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EAGAIN));
+                std::println!("{total} bytes in when a write of {len} was refused");
             }
-            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EAGAIN));
-            std::println!("filled with {total} bytes; the last write took {last} of 1000");
             let iov = [iovec {
                 iov_base: chunk.as_ptr().cast_mut().cast(),
                 iov_len: 16,
@@ -1898,23 +1953,24 @@ mod tests {
         (r, w)
     }
 
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    extern "system" {
+        fn NtQueryInformationFile(
+            h: HANDLE,
+            io: *mut [usize; 2],
+            info: *mut c_void,
+            len: u32,
+            class: u32,
+        ) -> i32;
+    }
+
     /// `FILE_PIPE_INFORMATION` of a pipe handle (ntifs.h; class 23 of
     /// `NtQueryInformationFile`): `(ReadMode, CompletionMode)`. A
     /// completion mode of 1 (FILE_PIPE_COMPLETE_OPERATION) is PIPE_NOWAIT.
     fn pipe_modes(h: HANDLE) -> (u32, u32) {
-        #[link(name = "ntdll", kind = "raw-dylib")]
-        extern "system" {
-            fn NtQueryInformationFile(
-                h: HANDLE,
-                io: *mut [usize; 2],
-                info: *mut [u32; 2],
-                len: u32,
-                class: u32,
-            ) -> i32;
-        }
         let (mut io, mut info) = ([0usize; 2], [0u32; 2]);
         // SAFETY: a pipe handle and out-buffers of the sizes given.
-        let status = unsafe { NtQueryInformationFile(h, &mut io, &mut info, 8, 23) };
+        let status = unsafe { NtQueryInformationFile(h, &mut io, info.as_mut_ptr().cast(), 8, 23) };
         assert_eq!(status, 0, "NtQueryInformationFile(FilePipeInformation): {status:#x}");
         (info[0], info[1])
     }
@@ -2017,76 +2073,25 @@ mod tests {
         }
     }
 
-    // CreatePipe's buffer: GetNamedPipeInfo's sizes of each end, and what
-    // one non-blocking write of 1 MiB puts into the empty pipe ("as many
-    // bytes as the buffer holds", Named Pipe Type, Read, and Wait Modes).
-    // nSize 0 is the system's default, and what Python's subprocess asks
-    // for (Lib/subprocess.py, `_winapi.CreatePipe(None, 0)`), the pipe of
-    // tools/windows/check-unit-tests.py before it gave the tests a file.
-    // Linux's pipe holds 64 KiB (16 pages, PIPE_DEF_BUFFERS).
+    // Linux's rule for a write of at most PIPE_BUF (4096) bytes to a
+    // non-blocking pipe: taken whole, or EAGAIN and nothing of it taken
+    // (pipe(7), "O_NONBLOCK enabled, n <= PIPE_BUF"; fs/pipe.c
+    // anon_pipe_write, pipe_write before v6.15: a write of at most a page
+    // merges whole into the last buffer or takes a buffer of its own, and
+    // with none free returns EAGAIN with nothing written). Two pipes,
+    // filled in writes of 3000 and of 2999 bytes after one byte: whatever a
+    // pipe holds, it cannot be full to the byte in both, so in one at least
+    // the refused write had room for part of it, and took none (CI run
+    // 43323860314: a pipe of 4096 bytes took 1 + 3000, then refused 3000
+    // with 1095 free).
     #[test]
-    fn test_create_pipe_sizes() {
-        let measure = |size: u32| {
-            let (r, w) = raw_pipe(size);
-            let info = |h: HANDLE| {
-                let (mut flags, mut out, mut inb, mut max) = (0u32, 0u32, 0u32, 0u32);
-                // SAFETY: out-pointers to u32s.
-                let ok = unsafe { GetNamedPipeInfo(h, &mut flags, &mut out, &mut inb, &mut max) };
-                if ok == 0 {
-                    std::format!("GetNamedPipeInfo failed: {}", std::io::Error::last_os_error())
-                } else {
-                    std::format!("OutBufferSize {out}, InBufferSize {inb}")
-                }
-            };
-            let (read_info, write_info) = (info(r), info(w));
-            set_nowait(w);
-            let big = std::vec![7u8; 1 << 20];
-            let mut taken = 0u32;
-            // SAFETY: a valid buffer.
-            let ok = unsafe {
-                WriteFile(w, big.as_ptr(), 1 << 20, &mut taken, std::ptr::null_mut())
-            };
-            assert_ne!(ok, 0, "WriteFile: {}", std::io::Error::last_os_error());
-            std::println!(
-                "CreatePipe nSize {size}: read end {read_info}; write end {write_info}; \
-                 a non-blocking 1 MiB write into the empty pipe takes {taken} bytes"
-            );
-            // SAFETY: our handles.
-            unsafe {
-                CloseHandle(w);
-                CloseHandle(r);
-            }
-            taken
-        };
-        let default = measure(0);
-        let asked_64k = measure(65536);
-        assert!(default > 0 && default < 64 * 1024, "nSize 0 holds {default} bytes");
-        assert!(asked_64k > 0, "nSize 65536 holds {asked_64k} bytes");
-    }
-
-    // The difference from Linux the module docs state, as what `write`
-    // does: a non-blocking write of at most PIPE_BUF (4096) bytes into a
-    // pipe with less room is taken in part. Linux takes such a write whole
-    // or fails it with EAGAIN (pipe(7), "O_NONBLOCK enabled, n <=
-    // PIPE_BUF"; fs/pipe.c pipe_write, anon_pipe_write since v6.15: a
-    // write of at most a page merges whole into the last buffer or takes a
-    // buffer of its own, and with none free returns EAGAIN with nothing
-    // written). Windows: "When writing to a non-blocking, byte-mode pipe
-    // handle with insufficient buffer space, WriteFile returns TRUE with
-    // *lpNumberOfBytesWritten < nNumberOfBytesToWrite" (WriteFile,
-    // learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-writefile).
-    // Two pipes, filled in writes of 3000 and of 2999 bytes after one
-    // byte: whatever a pipe holds, the last write that takes anything
-    // cannot be whole in both.
-    #[test]
-    fn test_a_small_write_that_does_not_fit_is_written_in_part() {
+    fn test_a_small_write_that_does_not_fit_takes_nothing() {
         let fill = |len: usize| {
             let mut fds = [0; 2];
             let chunk = std::vec![7u8; len];
-            let mut total = 0usize;
-            let mut last = 0usize;
+            let mut total = 1usize;
             // SAFETY: valid buffers and descriptors.
-            unsafe {
+            let room_left = unsafe {
                 assert_eq!(pipe(fds.as_mut_ptr()), 0);
                 assert_eq!(fcntl(fds[1], F_SETFL, O_NONBLOCK), 0);
                 assert_eq!(write(fds[1], chunk.as_ptr().cast(), 1), 1);
@@ -2095,22 +2100,366 @@ mod tests {
                     if n < 0 {
                         break;
                     }
-                    last = n.unsigned_abs();
-                    assert!(last > 0 && last <= len);
-                    total += last;
+                    assert_eq!(n.unsigned_abs(), len, "a write of {len} is taken whole or fails");
+                    total += len;
                     assert!(total < 64 << 20, "the pipe never filled");
                 }
                 assert_eq!(
                     std::io::Error::last_os_error().raw_os_error(),
                     Some(crate::EAGAIN)
                 );
+                // Whether the refused write had room for a part of it.
+                let room_left = write(fds[1], chunk.as_ptr().cast(), 1) == 1;
+                // Everything the pipe holds, to its end.
                 assert_eq!(close(fds[1]), 0);
+                let mut held = 0usize;
+                let mut b = [0u8; 4096];
+                loop {
+                    let n = read(fds[0], b.as_mut_ptr().cast(), b.len());
+                    assert!(n >= 0, "{}", std::io::Error::last_os_error());
+                    if n == 0 {
+                        break;
+                    }
+                    held += n.unsigned_abs();
+                }
                 assert_eq!(close(fds[0]), 0);
-            }
-            std::println!("writes of {len}: the pipe took 1 + {total} bytes, the last write {last}");
-            last < len
+                assert_eq!(
+                    held,
+                    total + usize::from(room_left),
+                    "the pipe holds the whole writes and nothing of the refused one"
+                );
+                room_left
+            };
+            std::println!(
+                "writes of {len}: the pipe took {total} bytes, then refused {len}; room for \
+                 one byte more: {room_left}"
+            );
+            room_left
         };
         let (a, b) = (fill(3000), fill(2999));
-        assert!(a || b, "a write of at most PIPE_BUF bytes was taken in part");
+        assert!(a || b, "neither refused write had room for a part of it");
+    }
+
+    // Linux's rule for a larger write: taken as far as it fits, or EAGAIN
+    // if nothing fits (pipe(7), "O_NONBLOCK enabled, n > PIPE_BUF": "from 1
+    // to n bytes may be written"; fs/pipe.c: a page at a time while a
+    // buffer is free, then `if (!ret) ret = -EAGAIN`). 70 KiB into an empty
+    // pipe, more than Linux's 64 KiB and than CreatePipe's default: Windows
+    // refuses it whole (CI run 43323860314: 1 MiB into an empty pipe takes
+    // 0 bytes), and `write` gives it in pieces of PIPE_BUF.
+    #[test]
+    fn test_a_large_write_is_taken_as_far_as_it_fits() {
+        const LEN: usize = 70 * 1024;
+        let mut fds = [0; 2];
+        let big = std::vec![7u8; LEN];
+        // SAFETY: valid buffers and descriptors.
+        unsafe {
+            assert_eq!(pipe(fds.as_mut_ptr()), 0);
+            assert_eq!(fcntl(fds[1], F_SETFL, O_NONBLOCK), 0);
+            let n = write(fds[1], big.as_ptr().cast(), LEN);
+            std::println!("a write of {LEN} bytes into the empty pipe took {n}");
+            assert!(n > 0, "{}", std::io::Error::last_os_error());
+            let taken = n.unsigned_abs();
+            assert!(taken < LEN, "the pipe holds less than 70 KiB");
+            assert_eq!(taken % PIPE_BUF, 0, "whole pieces");
+            // Full for a write of this size now: EAGAIN, through writev too.
+            assert_eq!(write(fds[1], big.as_ptr().cast(), LEN), -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EAGAIN));
+            let iov = [iovec {
+                iov_base: big.as_ptr().cast_mut().cast(),
+                iov_len: LEN,
+            }];
+            assert_eq!(writev(fds[1], iov.as_ptr(), 1), -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EAGAIN));
+            // What was taken is what the reader gets, and there is room again.
+            let mut got = std::vec![0u8; LEN];
+            let mut held = 0usize;
+            while held < taken {
+                let r = read(fds[0], got.as_mut_ptr().cast(), LEN);
+                assert!(r > 0, "{}", std::io::Error::last_os_error());
+                assert!(got[..r.unsigned_abs()].iter().all(|&b| b == 7));
+                held += r.unsigned_abs();
+            }
+            assert_eq!(held, taken);
+            assert_eq!(write(fds[1], big.as_ptr().cast(), LEN).unsigned_abs(), taken);
+            assert_eq!(close(fds[1]), 0);
+            assert_eq!(close(fds[0]), 0);
+        }
+    }
+
+    // --- A record of what WriteFile takes on a non-blocking byte pipe
+    // (PIPETEST lines): nothing here asserts a size. CI's last step runs it
+    // alone with --nocapture. What `write` builds on is in the module docs;
+    // these lines are where its numbers come from and what a change in
+    // Windows would show in.
+
+    /// `FILE_PIPE_LOCAL_INFORMATION` of a pipe handle (ntifs.h; class 24 of
+    /// `NtQueryInformationFile`), as text; the status if the query fails.
+    fn pipe_local(h: HANDLE) -> std::string::String {
+        let (mut io, mut i) = ([0usize; 2], [0u32; 10]);
+        // SAFETY: a pipe handle and out-buffers of the sizes given.
+        let status = unsafe { NtQueryInformationFile(h, &mut io, i.as_mut_ptr().cast(), 40, 24) };
+        if status != 0 {
+            return std::format!("(local information: status {status:#x})");
+        }
+        std::format!(
+            "(type {} configuration {} instances {}/{} InboundQuota {} ReadDataAvailable {} \
+             OutboundQuota {} WriteQuotaAvailable {} state {} end {})",
+            i[0], i[1], i[3], i[2], i[4], i[5], i[6], i[7], i[8], i[9]
+        )
+    }
+
+    /// `GetNamedPipeInfo` of a pipe handle, as text.
+    fn pipe_info(h: HANDLE) -> std::string::String {
+        let (mut flags, mut out, mut inb, mut max) = (0u32, 0u32, 0u32, 0u32);
+        // SAFETY: out-pointers to u32s.
+        if unsafe { GetNamedPipeInfo(h, &mut flags, &mut out, &mut inb, &mut max) } == 0 {
+            return std::format!("(GetNamedPipeInfo: {})", std::io::Error::last_os_error());
+        }
+        std::format!("(flags {flags:#x} OutBufferSize {out} InBufferSize {inb})")
+    }
+
+    /// One `WriteFile` of `len` bytes: the bytes taken, or -(error code).
+    fn raw_write(h: HANDLE, len: usize) -> i64 {
+        let data = std::vec![7u8; len];
+        let mut taken = 0u32;
+        // SAFETY: a valid buffer of `len` bytes.
+        let ok = unsafe {
+            WriteFile(h, data.as_ptr(), u32::try_from(len).unwrap(), &mut taken, std::ptr::null_mut())
+        };
+        if ok == 0 {
+            // SAFETY: plain call.
+            return -i64::from(unsafe { GetLastError() });
+        }
+        i64::from(taken)
+    }
+
+    /// One `ReadFile` of up to `len` bytes: the bytes read, or -(error code).
+    fn raw_read(h: HANDLE, len: usize) -> i64 {
+        let mut data = std::vec![0u8; len];
+        let mut got = 0u32;
+        // SAFETY: a valid buffer of `len` bytes.
+        let ok = unsafe {
+            ReadFile(h, data.as_mut_ptr(), u32::try_from(len).unwrap(), &mut got, std::ptr::null_mut())
+        };
+        if ok == 0 {
+            // SAFETY: plain call.
+            return -i64::from(unsafe { GetLastError() });
+        }
+        i64::from(got)
+    }
+
+    /// Fills the non-blocking write end `w` in writes of 1024 bytes, then
+    /// of one: the bytes it took (at most 64 MiB are tried).
+    fn raw_fill(w: HANDLE) -> i64 {
+        let mut total = 0i64;
+        for len in [1024usize, 1] {
+            while total < 64 << 20 {
+                let n = raw_write(w, len);
+                if n <= 0 {
+                    break;
+                }
+                total += n;
+            }
+        }
+        total
+    }
+
+    /// Sets the wait mode (`PIPE_NOWAIT` or `PIPE_WAIT`) of a pipe handle.
+    fn set_wait_mode(h: HANDLE, wait: u32) -> std::io::Result<()> {
+        let mode = PIPE_READMODE_BYTE | wait;
+        // SAFETY: a pipe handle of this process.
+        if unsafe { SetNamedPipeHandleState(h, &mode, std::ptr::null(), std::ptr::null()) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// What a pipe whose write end `w` is non-blocking takes, on record.
+    fn record_writes(name: &str, r: HANDLE, w: HANDLE) {
+        std::println!(
+            "PIPETEST {name}: read end {} {}; write end {} {}",
+            pipe_info(r),
+            pipe_local(r),
+            pipe_info(w),
+            pipe_local(w)
+        );
+        if let Err(e) = set_wait_mode(w, PIPE_NOWAIT) {
+            std::println!("PIPETEST {name}: PIPE_NOWAIT on the write end: {e}");
+            return;
+        }
+        let mib = raw_write(w, 1 << 20);
+        let held = raw_fill(w) + mib.max(0);
+        let full = pipe_local(w);
+        let (over, one) = (raw_write(w, 1000), raw_write(w, 1));
+        // 96 bytes of room, as in CI run 43323860314 (the read end waits
+        // for data, so it is read only when the pipe took some).
+        let read = if held > 0 { raw_read(r, 96) } else { 0 };
+        let room = pipe_local(w);
+        let (r1000, r97, r96, r1) = (raw_write(w, 1000), raw_write(w, 97), raw_write(w, 96), raw_write(w, 1));
+        std::println!(
+            "PIPETEST {name}: non-blocking: 1 MiB into the empty pipe takes {mib}; filled, it \
+             holds {held} {full}; then 1000 takes {over}, 1 takes {one}; after a read of {read} \
+             {room}: 1000 takes {r1000}, 97 takes {r97}, 96 takes {r96}, then 1 takes {r1}"
+        );
+    }
+
+    #[test]
+    #[ignore = "records; CI's last step runs it with --nocapture"]
+    fn test_non_blocking_pipe_writes_on_record() {
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_READ_ATTRIBUTES, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
+            PIPE_ACCESS_OUTBOUND,
+        };
+        use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE};
+
+        let close = |hs: &[HANDLE]| {
+            for &h in hs {
+                // SAFETY: our handles.
+                unsafe { CloseHandle(h) };
+            }
+        };
+
+        // (a) CreatePipe, by the size asked. nSize 0 is the system's
+        // default, and what Python's subprocess asks for (Lib/subprocess.py,
+        // `_winapi.CreatePipe(None, 0)`) and `pipe` here. Linux's pipe holds
+        // 64 KiB (16 pages, PIPE_DEF_BUFFERS).
+        for size in [0u32, 1, 512, 4096, 65536] {
+            let (r, w) = raw_pipe(size);
+            record_writes(&std::format!("CreatePipe nSize {size}"), r, w);
+            close(&[w, r]);
+        }
+
+        // (b) A named pipe, by its buffer sizes, written from the server
+        // end (outbound) and from the client end (inbound).
+        for (i, size) in [0u32, 512, 4096, 65536].into_iter().enumerate() {
+            for outbound in [true, false] {
+                let name = std::format!(
+                    r"\\.\pipe\wick-pipetest-{}-{i}-{}",
+                    std::process::id(),
+                    u8::from(outbound)
+                );
+                let wide: std::vec::Vec<u16> = name.encode_utf16().chain([0]).collect();
+                let label = std::format!(
+                    "CreateNamedPipe {} buffers {size}",
+                    if outbound { "outbound, server writes," } else { "inbound, client writes," }
+                );
+                let (open, access) = if outbound {
+                    (PIPE_ACCESS_OUTBOUND, GENERIC_READ)
+                } else {
+                    (PIPE_ACCESS_INBOUND, GENERIC_WRITE | FILE_READ_ATTRIBUTES)
+                };
+                // SAFETY: a NUL-terminated name; no security attributes.
+                let server = unsafe {
+                    CreateNamedPipeW(wide.as_ptr(), open, PIPE_TYPE_BYTE, 1, size, size, 0, std::ptr::null())
+                };
+                if server == INVALID_HANDLE_VALUE {
+                    std::println!("PIPETEST {label}: CreateNamedPipeW: {}", std::io::Error::last_os_error());
+                    continue;
+                }
+                // SAFETY: a NUL-terminated name; no security attributes or template.
+                let client = unsafe {
+                    CreateFileW(
+                        wide.as_ptr(),
+                        access,
+                        0,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if client == INVALID_HANDLE_VALUE {
+                    std::println!("PIPETEST {label}: CreateFileW: {}", std::io::Error::last_os_error());
+                    close(&[server]);
+                    continue;
+                }
+                if outbound {
+                    record_writes(&label, client, server);
+                } else {
+                    record_writes(&label, server, client);
+                }
+                close(&[client, server]);
+            }
+        }
+
+        // (c) With a read waiting at the other end (a blocking ReadFile of
+        // `want` bytes, begun 200 ms before; the write end's
+        // WriteQuotaAvailable, printed, is below the pipe's quota while one
+        // waits: vmm-sys-util's
+        // test_pipe_write_room_reads_0_while_a_read_waits). The write end
+        // is closed after the write, which ends a read still waiting.
+        for size in [0u32, 65536] {
+            for (want, len) in [
+                (10usize, 5usize),
+                (10, 10),
+                (10, 3000),
+                (10, 4096),
+                (10, 4106),
+                (10, 4107),
+                (10, 70 * 1024),
+                (10, 1 << 20),
+                (100_000, 3000),
+                (100_000, 8192),
+                (100_000, 1 << 20),
+            ] {
+                let (r, w) = raw_pipe(size);
+                set_nowait(w);
+                let rv = r as usize;
+                let reader = std::thread::spawn(move || raw_read(rv as HANDLE, want));
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let before = pipe_local(w);
+                let taken = raw_write(w, len);
+                close(&[w]);
+                let got = reader.join().unwrap();
+                let mut left = 0i64;
+                loop {
+                    let n = raw_read(r, 65536);
+                    if n <= 0 {
+                        break;
+                    }
+                    left += n;
+                }
+                close(&[r]);
+                std::println!(
+                    "PIPETEST CreatePipe nSize {size}, a read of {want} waiting {before}: a \
+                     non-blocking write of {len} takes {taken}; the read got {got}, {left} more \
+                     were in the pipe"
+                );
+            }
+        }
+
+        // (d) Whose wait mode a write follows: PIPE_NOWAIT on the read end
+        // only, and one byte written to the full pipe from a thread. If the
+        // write waits (the write end's own mode counts), reading lets it go.
+        // (Filled without waiting, then the write end waits again.)
+        let (r, w) = raw_pipe(0);
+        set_nowait(w);
+        let held = raw_fill(w);
+        set_wait_mode(w, PIPE_WAIT).unwrap();
+        set_nowait(r);
+        let wv = w as usize;
+        let writer = std::thread::spawn(move || raw_write(wv as HANDLE, 1));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let waited = !writer.is_finished();
+        let mut drained = 0i64;
+        loop {
+            let n = raw_read(r, 65536);
+            if n <= 0 {
+                break;
+            }
+            drained += n;
+        }
+        let taken = writer.join().unwrap();
+        std::println!(
+            "PIPETEST PIPE_NOWAIT on the read end only, {held} bytes in a CreatePipe nSize 0 \
+             pipe: a write of 1 byte from the blocking write end waited: {waited}; after {drained} \
+             bytes were read it had taken {taken}; modes (read mode, completion mode) read end \
+             {:?}, write end {:?}",
+            pipe_modes(r),
+            pipe_modes(w)
+        );
+        close(&[w, r]);
     }
 }

@@ -172,14 +172,22 @@ semantics on Win32. The details are in the comments of each
   `Stdin` are `wick_os::stdio`'s on Windows: std's reads an empty
   non-blocking pipe as the end (`Ok(0)`), which the serial takes as its
   input closed; this one gives `EWOULDBLOCK` as Linux does, for a console
-  with nothing typed too, and reads console input with std's console reader
+  with nothing typed too, and reads console input with std's console reader,
+  a line typed in line input mode with one newline at its end
   (`test_a_pipe_reads_as_on_linux`,
   `test_a_console_without_characters_reads_as_eagain`,
-  `test_serial_input_reads_an_emptied_pipe_as_eagain`). `lock()` is std's
+  `test_serial_input_reads_an_emptied_pipe_as_eagain`,
+  `test_a_line_ends_in_one_newline`). `lock()` is std's
   lock, for the terminal modes. `std::io::stdout` and `Stdout` are
-  `wick_os::stdio`'s too: a full non-blocking pipe takes 0 bytes of a write
-  and std passes the 0 on (`WriteZero` from `write_all` and the buffer's
-  flush); this one fails with `EWOULDBLOCK` as Linux does, keeps std's
+  `wick_os::stdio`'s too: a non-blocking pipe takes 0 bytes of a write that
+  does not fit in the room it has left, whatever the write's size (run
+  43323860314), and std passes the 0 on (`WriteZero` from `write_all` and
+  the buffer's flush); this one fails with `EWOULDBLOCK` as Linux does,
+  after trying a write of more than 4096 bytes in pieces of 4096, which
+  Linux takes as far as it fits
+  (`test_a_write_that_does_not_fit_takes_nothing`,
+  `test_a_large_write_is_taken_as_far_as_it_fits`; the compatibility
+  `write` does the same), keeps std's
   1024-byte line buffer so a failed write leaves the same bytes buffered,
   reports a pipe with no reader as `BrokenPipe` with the `SIGPIPE` hook, and
   writes a console with std's writer (`test_a_full_pipe_writes_as_on_linux`,

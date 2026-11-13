@@ -722,8 +722,10 @@ jobs:
       # runs 43292883636 and 43298293407 had AMD runners too, so an Intel
       # runner, when one comes, gives their first Intel measurement
       # (test_bp_ways_on_record prints how each way to hand a #BP back
-      # fares). Then libc's record of an AF_UNIX bind of each path form
-      # (BINDTEST lines), and the vmm's record of what the network
+      # fares). Then libc's records of an AF_UNIX bind of each path form
+      # (BINDTEST lines) and of what a non-blocking pipe takes of a write,
+      # by size, room, kind of pipe and with a read waiting (PIPETEST
+      # lines), and the vmm's record of what the network
       # endpoint's descriptor check costs a frame (the TAPCHECK line: the
       # unit tests' step built that test binary). Records only print; a
       # crash in one fails this step, never the kit. Last, after the kit's
@@ -764,6 +766,7 @@ jobs:
           done
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
+          alone windows_fd::tests::test_non_blocking_pipe_writes_on_record
           t=platform::windows::net::tests::test_descriptor_check_cost_on_record
           out=$(cargo test --locked -p vmm --lib -- \
             --include-ignored --exact --nocapture --test-threads=1 "$t" 2>&1) || true

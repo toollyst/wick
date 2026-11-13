@@ -77,8 +77,9 @@ def run(package, args, out_dir):
     # that builds a microVM with the serial on standard output makes that
     # output non-blocking (upstream's set_stdout_nonblocking), on Windows
     # PIPE_NOWAIT on standard output's pipe handle (the compatibility
-    # fcntl). A full non-blocking pipe then takes part of a write and
-    # libtest's next write_all fails with WriteZero, losing the failures'
+    # fcntl). A non-blocking pipe then takes nothing of a write that does
+    # not fit in the room it has left (0 bytes written, run 43323860314),
+    # and libtest's write_all fails with WriteZero, losing the failures'
     # messages (run 43277608081, cpu-template-helper). O_NONBLOCK on a file
     # changes nothing, on Windows as on Linux.
     log = out_dir / f"{package}.log"
