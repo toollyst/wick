@@ -312,13 +312,8 @@ pub(crate) fn get_xcrs(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<kvm_xcrs> 
     Ok(out)
 }
 
-pub(crate) fn set_xcrs(part: WHV_PARTITION_HANDLE, vp: u32, x: &kvm_xcrs) -> Result<()> {
-    let xcr0 = x
-        .xcrs
-        .iter()
-        .take(x.nr_xcrs as usize)
-        .find(|e| e.xcr == 0)
-        .map_or(1, |e| e.value);
+/// Writes XCR0, checked by the caller as KVM checks it (`VcpuFd::set_xcrs`).
+pub(crate) fn set_xcr0(part: WHV_PARTITION_HANDLE, vp: u32, xcr0: u64) -> Result<()> {
     ffi::set_register(part, vp, whv::WHvX64RegisterXCr0, reg64(xcr0))
 }
 

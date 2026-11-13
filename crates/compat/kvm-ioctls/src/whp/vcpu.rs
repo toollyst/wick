@@ -704,8 +704,33 @@ impl VcpuFd {
     pub fn get_xcrs(&self) -> Result<kvm_xcrs> {
         regs::get_xcrs(self.part(), self.vp())
     }
+    /// As Linux v6.1's `kvm_vcpu_ioctl_x86_set_xcrs` (x86.c): `EINVAL` for
+    /// flags or more than `KVM_MAX_XCRS` (16) entries; the first entry for
+    /// XCR0 is written if `__kvm_set_xcr` takes it against the vCPU's CPUID
+    /// ([`super::xcr::refused`]), else `EINVAL`; without one nothing is.
     pub fn set_xcrs(&self, xcrs: &kvm_xcrs) -> Result<()> {
-        regs::set_xcrs(self.part(), self.vp(), xcrs)
+        const KVM_MAX_XCRS: u32 = 16;
+        if xcrs.flags != 0 || xcrs.nr_xcrs > KVM_MAX_XCRS {
+            return err(libc::EINVAL);
+        }
+        let Some(xcr0) = xcrs.xcrs.iter().take(xcrs.nr_xcrs as usize).find(|e| e.xcr == 0).map(|e| e.value) else {
+            return Ok(());
+        };
+        if super::xcr::refused(xcr0, self.guest_supported_xcr0()) {
+            return err(libc::EINVAL);
+        }
+        regs::set_xcr0(self.part(), self.vp(), xcr0)
+    }
+
+    /// KVM's `guest_supported_xcr0` for this vCPU's CPUID: its leaf 0xD's
+    /// components that KVM supports and the host has (`kvm_caps.supported_xcr0`
+    /// is the host's XCR0 and `KVM_SUPPORTED_XCR0`; here the host's CPUID
+    /// leaf 0xD, as the backend's supported CPUID is the host's); 0 before
+    /// `KVM_SET_CPUID2`, as KVM's.
+    fn guest_supported_xcr0(&self) -> u64 {
+        let table = self.shared.cpuid.lock().unwrap();
+        let leaf = table.iter().find(|e| e.function == 0xd && e.index == 0).map(|e| (e.eax, e.edx));
+        super::xcr::guest_supported(leaf, regs::host_xfeatures().0 & super::xcr::KVM_SUPPORTED)
     }
     pub fn get_debug_regs(&self) -> Result<kvm_debugregs> {
         regs::get_debugregs(self.part(), self.vp())
@@ -988,8 +1013,35 @@ impl VcpuFd {
         }
     }
 
+    /// Keeps the table the backend answers the guest's CPUID from. Refused
+    /// (`ENOTSUP`, the reason reported) when its leaf 0xD leaves out a state
+    /// component a guest of this partition can enable all the same: KVM
+    /// keeps a guest's XSETBV and `KVM_SET_XCRS` to the table's components
+    /// (`__kvm_set_xcr`), and WHP neither exits on XSETBV nor takes a
+    /// partition's components after it is set up, at `KVM_CREATE_VM`
+    /// (`xcr`). What a partition lets a guest enable is bounded by the
+    /// host's own leaf 0xD; every XSAVE feature WHP offers is given to the
+    /// partition (`vm::configure`).
     pub fn set_cpuid2(&self, cpuid: &CpuId) -> Result<()> {
-        *self.shared.cpuid.lock().unwrap() = cpuid.as_slice().to_vec();
+        let table = cpuid.as_slice();
+        let leaf = table.iter().find(|e| e.function == 0xd && e.index == 0).map(|e| (e.eax, e.edx));
+        let host = regs::host_xfeatures().0;
+        let guest = super::xcr::guest_supported(leaf, host & super::xcr::KVM_SUPPORTED);
+        let unenforced = super::xcr::unenforced(host, guest);
+        if unenforced != 0 {
+            super::ffi::report(
+                log::Level::Error,
+                &format!(
+                    "whp: KVM_SET_CPUID2 refused: the CPUID's leaf 0xD leaves out the XSAVE state components {} ({unenforced:#x}), \
+                     which this host's partition lets a guest enable with XSETBV all the same (WHP has no XSETBV exit, and a \
+                     partition's components are fixed when the VM is made), where KVM refuses a guest the components its CPUID \
+                     leaves out; a CPU template that clears them is refused on this host",
+                    super::xcr::names(unenforced)
+                ),
+            );
+            return err(libc::ENOTSUP);
+        }
+        *self.shared.cpuid.lock().unwrap() = table.to_vec();
         Ok(())
     }
     pub fn get_cpuid2(&self, num_entries: usize) -> Result<CpuId> {
@@ -3396,7 +3448,16 @@ mod fpu_tests {
             ebx: 1 << 1,
             ..Default::default()
         };
-        vcpu.set_cpuid2(&CpuId::from_entries(&[leaf7]).unwrap()).unwrap();
+        // With the host's leaf 0xD, without which the table is refused
+        // (`set_cpuid2`: its XSAVE components left out).
+        let leaf_d = regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .unwrap()
+            .as_slice()
+            .iter()
+            .copied()
+            .find(|e| e.function == 0xd && e.index == 0)
+            .unwrap();
+        vcpu.set_cpuid2(&CpuId::from_entries(&[leaf7, leaf_d]).unwrap()).unwrap();
         start(&vcpu);
         let mut s = vcpu.get_sregs().unwrap();
         (s.idt.base, s.idt.limit) = (IDT, 0xfff);
@@ -3898,10 +3959,13 @@ mod fpu_tests {
     ///   EDX are asserted (the backend answers the intercept from the
     ///   table); EBX and ECX are printed, with the bits that follow the
     ///   vCPU's state (OSXSAVE, the XSAVE sizes).
-    /// - XCR0: with AVX cleared in the table's leaf 0xd, a guest's XSETBV
-    ///   of it. KVM refuses it with #GP (Linux v6.1 x86.c, `__kvm_set_xcr`:
-    ///   `xcr0 & ~(guest_supported_xcr0 | XFEATURE_MASK_FP)`, the mask
-    ///   being the guest's CPUID). WHP knows nothing of the table: printed.
+    /// - XCR0: a table with AVX cleared in its leaf 0xd is refused
+    ///   (`set_cpuid2`: run 43397419784 showed a guest's XSETBV of AVX
+    ///   taken under such a table, where KVM gives #GP: Linux v6.1 x86.c,
+    ///   `__kvm_set_xcr`); asserted. What WHP lets a guest enable, which
+    ///   the refusal takes to be the host's leaf 0xd: a guest's XSETBV of
+    ///   each group of state components the host has, and of all of them
+    ///   together; printed.
     /// - MSRs: for 0x10a and a few others no WHP register holds (0xce,
     ///   0x8b, 2) and one that has a register (0x48), what KVM_GET_MSRS
     ///   and KVM_SET_MSRS return, what a guest's RDMSR gets, and whether
@@ -3941,14 +4005,24 @@ mod fpu_tests {
         let supported = regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap();
         let mut table = supported.as_slice().to_vec();
         let leaves = [(0x1u32, 0u32), (0x7, 0), (0x7, 1), (0xd, 0), (0xd, 1), (0x8000_0001, 0), (0x8000_0008, 0), (0x1d, 0), (0x1e, 0)];
-        let avx_in_xcr0 = table.iter().any(|e| e.function == 0xd && e.index == 0 && e.eax & 4 != 0);
-        for e in &mut table {
-            if !leaves.contains(&(e.function, e.index)) {
-                continue;
-            }
-            if (e.function, e.index) == (0xd, 0) {
+        let host_xcr0 = regs::host_xfeatures().0;
+        // A table without AVX in its leaf 0xd, on a host that has it:
+        // refused, nothing kept.
+        if host_xcr0 & super::super::xcr::YMM != 0 {
+            let mut no_avx = table.clone();
+            for e in no_avx.iter_mut().filter(|e| e.function == 0xd && e.index == 0) {
                 e.eax &= !4;
-            } else {
+            }
+            let refused = vcpu.set_cpuid2(&CpuId::from_entries(&no_avx).unwrap());
+            eprintln!("TMPLTEST cpuid 0xd.0 without AVX, which this host has: KVM_SET_CPUID2 {refused:?}");
+            assert!(refused.is_err(), "a table without AVX was taken");
+            assert!(vcpu.get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap().as_slice().is_empty(), "the refused table was kept");
+        }
+        // Bits flipped in each leaf: in 0xd.0, components the host does
+        // not have (bit 8, a supervisor one, and bit 61), which leaves out
+        // none it has.
+        for e in &mut table {
+            if leaves.contains(&(e.function, e.index)) {
                 (e.eax, e.ebx, e.ecx, e.edx) = (e.eax ^ 0x100, e.ebx ^ 0x8, e.ecx ^ 0x40_0000, e.edx ^ 0x2000_0000);
             }
         }
@@ -3974,16 +4048,23 @@ mod fpu_tests {
             assert_eq!((a, d), (e.eax, e.edx), "cpuid {function:#x}.{index}: EAX and EDX are the table's");
         }
 
-        // XCR0 against the table's leaf 0xd.
-        if avx_in_xcr0 {
-            let (how, _) = probe(&mut vcpu, XSETBV_AT, 7, 0, 0);
-            let xcr0 = vcpu.get_xcrs().map(|x| x.xcrs[0].value);
-            eprintln!(
-                "TMPLTEST xsetbv of x87, SSE and AVX with AVX cleared in the table's leaf 0xd: {how}; XCR0 then {xcr0:x?} \
-                 (KVM: #GP, XCR0 unchanged)"
-            );
-        } else {
-            eprintln!("TMPLTEST xsetbv: this host's supported leaf 0xd has no AVX; not probed");
+        // What WHP lets a guest enable: each group of components the
+        // host's leaf 0xd has, with x87 and SSE (and AVX, which AVX-512
+        // needs), then all of them.
+        {
+            use super::super::xcr::{AVX512, BNDCSR, BNDREGS, FP, KVM_SUPPORTED, PKRU, SSE, XTILE, YMM, names};
+            eprintln!("TMPLTEST xsetbv: the host's leaf 0xd XCR0 components {host_xcr0:#x} ({})", names(host_xcr0));
+            let all = host_xcr0 & KVM_SUPPORTED;
+            for group in [YMM, BNDREGS | BNDCSR, YMM | AVX512, PKRU, XTILE, all] {
+                if host_xcr0 & group != group {
+                    eprintln!("TMPLTEST xsetbv of {}: the host has not all of it; not probed", names(group));
+                    continue;
+                }
+                let xcr0 = FP | SSE | group;
+                let (how, _) = probe(&mut vcpu, XSETBV_AT, xcr0 & 0xFFFF_FFFF, 0, xcr0 >> 32);
+                let now = vcpu.get_xcrs().map(|x| x.xcrs[0].value);
+                eprintln!("TMPLTEST xsetbv of {xcr0:#x} ({}): {how}; XCR0 then {now:x?}", names(xcr0));
+            }
         }
 
         // MSRs.

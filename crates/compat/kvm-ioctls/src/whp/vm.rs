@@ -1587,7 +1587,16 @@ mod tests {
         let vm = VmFd::create().unwrap();
         let vcpu = vm.create_vcpu(0).unwrap();
         let tsc_adjust_cpuid = kvm_cpuid_entry2 { function: 7, index: 0, ebx: 1 << 1, ..Default::default() };
-        vcpu.set_cpuid2(&CpuId::from_entries(&[tsc_adjust_cpuid]).unwrap()).unwrap();
+        // With the host's leaf 0xD, without which the table is refused
+        // (`set_cpuid2`: its XSAVE components left out).
+        let leaf_d = super::super::regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .unwrap()
+            .as_slice()
+            .iter()
+            .copied()
+            .find(|e| e.function == 0xd && e.index == 0)
+            .unwrap();
+        vcpu.set_cpuid2(&CpuId::from_entries(&[tsc_adjust_cpuid, leaf_d]).unwrap()).unwrap();
         let (tsc, adjust) = (0x1234_5678_9abc_u64, 0x10_0000_u64);
         let entry = |index, data| kvm_msr_entry { index, data, ..Default::default() };
         let mut msrs = Msrs::from_entries(&[entry(0x10, tsc), entry(0x3b, adjust)]).unwrap();

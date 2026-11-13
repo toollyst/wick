@@ -40,6 +40,7 @@ mod pvclock;
 mod regs;
 mod tscdeadline;
 mod vcpu;
+mod xcr;
 mod vm;
 mod whv;
 
