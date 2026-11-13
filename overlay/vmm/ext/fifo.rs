@@ -208,7 +208,7 @@ mod macos {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{Arc, OnceLock, Weak};
+    use std::sync::{Arc, OnceLock};
     use std::time::{Duration, Instant};
 
     use super::DRAIN_STALL;
@@ -605,10 +605,24 @@ mod macos {
         }
     }
 
+    impl Drop for OutFile {
+        /// A FIFO's `OutFile` takes it off the relay's list (`relay::unregister`):
+        /// then its last reference is this one, or the relay's for a pass
+        /// in progress, and its memory is freed on this thread or the
+        /// relay's, never in a signal handler.
+        fn drop(&mut self) {
+            if let Kind::Fifo(fifo) = &self.0 {
+                relay::unregister(fifo);
+            }
+        }
+    }
+
     impl Drop for Fifo {
         /// A FIFO's `OutFile` dropped (a serial device's, with its VM) is
         /// drained first: on Linux its bytes are in the FIFO already.
         fn drop(&mut self) {
+            #[cfg(test)]
+            DROPPED_ON.store(me(), Ordering::Release);
             self.drain(Instant::now() + DRAIN_STALL);
             let keep = *self.keep.get_mut();
             if keep >= 0 {
@@ -616,6 +630,24 @@ mod macos {
                 unsafe { libc::close(keep) };
             }
         }
+    }
+
+    /// The thread that ran the last `Fifo`'s drop (`pthread_self`), for
+    /// `test_a_fifo_is_freed_by_its_owner_not_a_handler`.
+    #[cfg(test)]
+    pub(crate) static DROPPED_ON: AtomicU64 = AtomicU64::new(0);
+
+    /// [`relay::each`] for the test of who frees a FIFO: `f` runs while the
+    /// list is held, as a signal handler's drain runs.
+    #[cfg(test)]
+    pub(crate) fn while_listed(f: impl Fn()) {
+        relay::each(Instant::now() + DRAIN_STALL, |_| f());
+    }
+
+    /// `pthread_self` of the calling thread, as [`DROPPED_ON`] records it.
+    #[cfg(test)]
+    pub(crate) fn this_thread() -> u64 {
+        me()
     }
 
     /// `file` as an [`OutFile`] written directly, whatever it is (tests
@@ -715,9 +747,13 @@ mod macos {
     /// Firecracker. In the child (the API process), whose copies of the
     /// overflows are Firecracker's bytes, the copies are emptied, so that
     /// its drains (its exit, its panic hook) do not write them a second
-    /// time, and it gets no relay: it writes no log (`serve` turns the
-    /// log off), so a line it wrote before that and found the FIFO full
-    /// waits for its drain at its end.
+    /// time, and it gets no relay: it writes no FIFO (the API process
+    /// turns its log off right after this call, `api_process::fork`).
+    ///
+    /// That is also why the child's drains never wait: its profile has
+    /// neither `poll` nor `nanosleep` (`sandbox::API_SYSCALLS`), and an
+    /// overflow emptied here and never written again gives them nothing
+    /// to wait for (`test_the_api_process_drain_waits_for_nothing`).
     pub fn after_fork(in_child: bool) -> io::Result<()> {
         if in_child {
             relay::forget_in_child();
@@ -921,7 +957,17 @@ mod macos {
         struct Relay {
             /// The open FIFOs. An owner lock: a signal handler's drain on a
             /// thread interrupted while registering one skips the list.
-            fifos: OwnerLock<Vec<Weak<Fifo>>>,
+            ///
+            /// The list holds a strong reference to each, which only
+            /// [`unregister`] (an `OutFile`'s drop) takes out, under this
+            /// lock. So a signal handler, which reaches a FIFO only through
+            /// [`each`] or [`held_by_this_thread`] while it holds the lock
+            /// and only borrows it there, never owns the last reference: a
+            /// FIFO's memory is freed (its `Drop`, the drain and `free`) by
+            /// the thread that drops its `OutFile` or by the relay thread,
+            /// never in a signal handler, where `free` is not
+            /// async-signal-safe (`test_a_fifo_is_freed_by_its_owner_not_a_handler`).
+            fifos: OwnerLock<Vec<Arc<Fifo>>>,
             /// The wake pipe, written by a write that queued bytes; -1 in
             /// a fork's child, which has no relay.
             wake_r: AtomicI32,
@@ -1014,9 +1060,23 @@ mod macos {
         pub(super) fn register(fifo: &Arc<Fifo>) -> io::Result<()> {
             let relay = start()?;
             let mut list = relay.fifos.lock().expect("not registering from a signal handler");
-            list.retain(|f| f.strong_count() > 0);
-            list.push(Arc::downgrade(fifo));
+            list.push(Arc::clone(fifo));
             Ok(())
+        }
+
+        /// Takes `fifo` off the list, under its lock, so that the caller's
+        /// reference is the last but the relay's for a pass in progress
+        /// (an `OutFile`'s drop; never in a signal handler). A handler that
+        /// holds the lock meanwhile, on another thread, is waited for: its
+        /// use of the FIFO ends before the FIFO can be freed.
+        pub(super) fn unregister(fifo: &Arc<Fifo>) {
+            let Some(relay) = RELAY.get() else { return };
+            // `None`: this thread holds the list already (a drop inside
+            // `each`'s callback, which only borrows: not done): the FIFO
+            // stays registered rather than be freed under its borrower.
+            if let Some(mut list) = relay.fifos.lock() {
+                list.retain(|f| !Arc::ptr_eq(f, fifo));
+            }
         }
 
         /// Ends the relay thread, if it runs, and waits for it: for its
@@ -1137,16 +1197,13 @@ mod macos {
         }
 
         /// Runs `f` on each open FIFO, without allocating (a signal
-        /// handler's drain).
-        /// (The last `Arc` of a FIFO whose `OutFile` is dropped at that same
-        /// moment would be released here, freeing memory in a signal
-        /// handler: the logger's and the metrics' `OutFile`s live in
-        /// statics and are never dropped; a serial device's lives as long as
-        /// its VM.)
+        /// handler's drain). Each FIFO is borrowed from the list while its
+        /// lock is held, never cloned: the list's reference outlives the
+        /// call ([`Relay::fifos`]).
         pub(super) fn each(until: Instant, f: impl Fn(&Fifo)) {
             if let Some(list) = RELAY.get().and_then(|r| r.fifos.lock_until(until)) {
-                for fifo in list.iter().filter_map(Weak::upgrade) {
-                    f(&fifo);
+                for fifo in list.iter() {
+                    f(fifo);
                 }
             }
         }
@@ -1161,7 +1218,7 @@ mod macos {
             }
             // Another thread's at `until` still: not this thread's.
             let Some(list) = relay.fifos.lock_until(until) else { return false };
-            let held = list.iter().filter_map(Weak::upgrade).any(|fifo| fifo.ring.mine());
+            let held = list.iter().any(|fifo| fifo.ring.mine());
             // Released without the look for a deferred end, which asks this.
             list.release_quietly();
             held
@@ -1221,8 +1278,8 @@ mod macos {
                     .lock()
                     .expect("this thread takes no signal that writes")
                     .iter()
-                    .filter_map(Weak::upgrade)
                     .filter(|f| f.queued.load(Ordering::Acquire) > 0 && !f.broken.load(Ordering::Acquire))
+                    .cloned()
                     .collect();
                 let mut fds = vec![libc::pollfd { fd: wake_r, events: libc::POLLIN, revents: 0 }];
                 fds.extend(fifos.iter().map(|f| libc::pollfd { fd: f.w.as_raw_fd(), events: libc::POLLOUT, revents: 0 }));
@@ -2092,6 +2149,128 @@ pub(crate) mod tests {
         held_rx.recv().unwrap();
         on_sigusr2(handler_drains_then_exits);
         raise_sigusr2();
+    }
+
+    // A FIFO is freed by the thread that drops its OutFile, never by a
+    // signal handler that reached it through the relay's list at that same
+    // moment (its `free` is not async-signal-safe): the list holds a strong
+    // reference, taken out only under the list's lock, and a handler only
+    // borrows. Here the "handler" holds the list (as `drain` does) while
+    // another thread drops the OutFile, and lets that drop finish if it can
+    // (up to 200 ms): with the list's reference, the drop waits for the
+    // list and the FIFO is freed by the dropping thread after it; with a
+    // weak list and a handler's own reference, the handler's would be the
+    // last and the FIFO freed by the handler.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_a_fifo_is_freed_by_its_owner_not_a_handler() {
+        let (_dir, path) = fifo("freed");
+        let _r = reader(&path);
+        let mut c = child("child_drops_while_a_handler_holds_the_list", &path);
+        let mut out = out_lines(&mut c);
+        assert_eq!(until(&mut out, "WICK-FREED-BY"), "the dropping thread");
+        assert!(wait_child(out.child).success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_a_fifo_is_freed_by_its_owner_not_a_handler"]
+    fn child_drops_while_a_handler_holds_the_list() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        // The only FIFO of this process.
+        let out = open_file_nonblock(&child_path()).unwrap();
+        let (go, went) = mpsc::channel::<()>();
+        let (done, dropped) = mpsc::channel::<u64>();
+        let dropper = std::thread::spawn(move || {
+            went.recv().unwrap();
+            drop(out);
+            done.send(super::macos::this_thread()).unwrap();
+        });
+        let once = AtomicBool::new(false);
+        super::macos::while_listed(|| {
+            if !once.swap(true, Ordering::AcqRel) {
+                go.send(()).unwrap();
+                // The drop's end, if it can end while the list is held.
+                let _ = dropped.recv_timeout(Duration::from_millis(200));
+            }
+        });
+        assert!(once.load(Ordering::Acquire), "the FIFO was not listed");
+        let handler = super::macos::this_thread();
+        dropper.join().unwrap();
+        let by = super::macos::DROPPED_ON.load(Ordering::Acquire);
+        let who = if by == handler { "the handler" } else if by == 0 { "nobody" } else { "the dropping thread" };
+        println!("WICK-FREED-BY {who}");
+        std::io::stdout().flush().unwrap();
+    }
+
+    // The API process's end drains its FIFOs (`api_process::exit`, its
+    // panic hook) under its own profile, which has neither `poll` nor
+    // `nanosleep` (`sandbox::API_SYSCALLS`): the drain's wait for a slow
+    // reader would be a denied call there, and end Firecracker 148. It is
+    // never one: the fork's copies of Firecracker's overflows are emptied
+    // (`after_fork(true)`) and the API process writes no FIFO after that
+    // (its log is off from then on), so its drain finds nothing to wait
+    // for. Here Firecracker's side leaves its log FIFO full with an
+    // overflow behind it and its reader reading nothing, forks as the
+    // split does, and the fork takes the API profile and drains: it ends 0,
+    // not by SIGSYS, and wrote nothing of Firecracker's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_the_api_process_drain_waits_for_nothing() {
+        let (_dir, path) = fifo("api-drain");
+        let r = reader(&path);
+        let mut c = child("child_forks_an_api_process_that_drains", &path);
+        let mut out = out_lines(&mut c);
+        assert_eq!(until(&mut out, "WICK-API-DRAIN"), "exit 0", "the API process's drain");
+        assert!(wait_child(out.child).success());
+        // Only what the FIFO took before the fork (the reader read nothing
+        // until now): the fork wrote none of the overflow.
+        let mut buf = vec![0u8; 65536];
+        // SAFETY: reading into our buffer.
+        let n = unsafe { libc::read(r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(usize::try_from(n).unwrap(), fifo_buffer() / 100 * 100);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_the_api_process_drain_waits_for_nothing"]
+    fn child_forks_an_api_process_that_drains() {
+        let mut out = open_file_nonblock(&child_path()).unwrap();
+        for i in 0..300 {
+            out.write_all(&line(i)).unwrap();
+        }
+        // The overflow stays: what the drain would have to wait for.
+        assert_eq!(out.pause_relay(), 30000 - fifo_buffer() / 100 * 100);
+        super::before_fork().unwrap();
+        // SAFETY: one thread forks (the relay is stopped); the fork takes
+        // the API profile, drains as the API process's exit does, and ends.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            super::after_fork(true).unwrap();
+            crate::ext::sandbox::select(crate::ext::sandbox::Policy::Default);
+            crate::ext::sandbox::apply_api().unwrap();
+            super::drain();
+            // SAFETY: ends the fork.
+            unsafe { libc::_exit(0) }
+        }
+        super::after_fork(false).unwrap();
+        let mut status = 0;
+        // SAFETY: the fork's pid.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let how = if libc::WIFEXITED(status) {
+            format!("exit {}", libc::WEXITSTATUS(status))
+        } else {
+            format!("signal {}", libc::WTERMSIG(status))
+        };
+        println!("WICK-API-DRAIN {how}");
+        std::io::stdout().flush().unwrap();
+        // This process's own end drains nothing either: the test reads what
+        // the FIFO held before the fork, nothing more.
+        std::mem::forget(out);
+        // SAFETY: ends this process without its drain.
+        unsafe { libc::_exit(0) }
     }
 
     // A FIFO's OutFile dropped (a serial device's, with its VM) gives the

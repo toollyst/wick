@@ -830,8 +830,14 @@ mod macos {
             -1 => Err(ApiProcessError::Fork(std::io::Error::last_os_error())),
             0 => {
                 drop(ours);
-                // Firecracker's overflows are Firecracker's to write.
+                // Firecracker's overflows are Firecracker's to write. From
+                // here on this process writes no FIFO (its log is off now,
+                // as `serve` keeps it), so the drains at its end, under its
+                // profile, which has no `poll` or `nanosleep`, find nothing
+                // to wait for (`ext::fifo`
+                // test_the_api_process_drain_waits_for_nothing).
                 let _ = crate::ext::fifo::after_fork(true);
+                log::set_max_level(log::LevelFilter::Off);
                 // As upstream's API thread, the API process opens no
                 // network interface: it keeps no way into the jail's network.
                 // SAFETY: the child of a fork made with one thread.

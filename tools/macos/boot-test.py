@@ -160,9 +160,11 @@ def wait_listens(proc, path, what, bound=10):
 class Vm:
     """A Firecracker process with its serial console on a pipe."""
 
-    def __init__(self, ctx, name, args, config=None, api=True, wait=True):
+    def __init__(self, ctx, name, args, config=None, api=True, wait=True, preexec=None):
         """`wait`: the start returns once the API answers (`wait_api`);
-        False for a start that is to end by itself before it serves."""
+        False for a start that is to end by itself before it serves.
+        `preexec`: run in the child before the exec (a signal's disposition,
+        a resource limit)."""
         self.ctx = ctx
         self.name = name
         self.log_path = os.path.join(ctx.out, f"{name}.log")
@@ -186,7 +188,7 @@ class Vm:
         self.cond = threading.Condition()
         self.log = open(self.log_path, "w")
         self.proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, preexec_fn=preexec
         )
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
@@ -1914,17 +1916,28 @@ def stage_cli(ctx):
     import select
     line = b'The API server received a Get request on "/machine-config"'
     ends = []
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGQUIT):
-        if signal.getsignal(sig) == signal.SIG_IGN:
-            # Inherited ignored (a background job of a shell without job
-            # control): Firecracker would inherit it ignored too.
-            ends.append(f"{sig.name} NOT RUN (ignored in this run's process)")
-            continue
+    ending = (signal.SIGTERM, signal.SIGINT, signal.SIGQUIT)
+    # This run may have the three ignored (a background job of a shell
+    # without job control ignores SIGINT and SIGQUIT), and an exec keeps an
+    # ignored signal ignored: Firecracker then leaves it so, as upstream
+    # does, and there would be nothing to test. Firecracker is started with
+    # their default action, as from a shell in the foreground.
+    libsystem = ctypes.CDLL(None, use_errno=True)
+    libsystem.signal.restype = ctypes.c_void_p
+    libsystem.signal.argtypes = [ctypes.c_int, ctypes.c_void_p]
+
+    def default_ending_signals():
+        for s in ending:
+            libsystem.signal(int(s), None)  # SIG_DFL, 0
+
+    inherited = [s.name for s in ending if signal.getsignal(s) == signal.SIG_IGN]
+    for sig in ending:
         path = os.path.join(ctx.sock, f"end-{sig.name.lower()}.fifo")
         os.mkfifo(path)
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         try:
-            vm = ctx.vm(f"cli-end-{sig.name.lower()}", ["--log-path", path, "--level", "Info"], config(ctx))
+            vm = ctx.vm(f"cli-end-{sig.name.lower()}", ["--log-path", path, "--level", "Info"], config(ctx),
+                        preexec=default_ending_signals)
             vm.shell()
             for _ in range(150):
                 vm.api("GET", "/machine-config")
@@ -1942,7 +1955,9 @@ def stage_cli(ctx):
               f"{sig.name}: {data.count(line)} of 150 request lines in {len(data)} bytes read after the signal")
         vm.kill()
         ends.append(f"{sig.name} {len(data)} bytes")
-    done.append("a log FIFO read only after a terminating signal has every line, and Firecracker ends by the signal: " + ", ".join(ends))
+    done.append("a log FIFO read only after a terminating signal has every line, and Firecracker ends by the signal: "
+                + ", ".join(ends) + (f" (this run had {', '.join(inherited)} ignored; Firecracker had them at their "
+                                     "default action)" if inherited else ""))
 
     # A caller that passes macOS's own CLOCK_MONOTONIC (the wall clock since
     # the boot) instead: the metric is off by what the two clocks differ by,
