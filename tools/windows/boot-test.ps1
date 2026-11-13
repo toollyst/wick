@@ -2190,24 +2190,58 @@ $NoLimit = [ordered]@{ bandwidth = [ordered]@{ size = 0; refill_time = 0 } }
 # shell expression.
 $GuestInterrupts = '$(awk ''/^intr/ {print $2}'' /proc/stat)'
 
+# The guest's eth0 tx_packets and tx_dropped, and its UDP SndbufErrors (the
+# datagrams its own queue dropped: /proc/net/snmp's second Udp line, field
+# 7), as a shell expression of three numbers.
+$GuestTxCounts = '$(cat /sys/class/net/eth0/statistics/tx_packets) $(cat /sys/class/net/eth0/statistics/tx_dropped) $(awk ''/^Udp:/ {n++; if (n == 2) print $7}'' /proc/net/snmp)'
+
 # The rate at which `total` bytes the guest sends to the host's port 9 reach
 # the switch (bytes per second, between the first and the last datagram);
 # returns the bytes, the rate, and the guest's interrupts a second while it
 # sent (/proc/stat, over the send's own time).
+#
+# Each call also prints a NETTX record line, for the run-to-run spread of
+# the unlimited rate (16-19 against 60-83 MiB/s on the PC at 87d0328, and
+# 30-132 MiB/s in the macOS stage): where the time and the frames went.
+# The guest's own time against the switch's span tells a guest that sent
+# slowly from a host that took slowly; the datagrams the guest handed its
+# driver against those the switch got tell frames dropped on the way (the
+# endpoint drops a frame its connection cannot take: net.rs,
+# Endpoint::send); the largest gap between two datagrams and the time in
+# gaps over 1 ms tell one stall from a slow steady rate.
 function Get-NetTxRate($vm, $switch, [int]$total = 3MB) {
     $sink = New-Object 'System.Collections.Generic.List[long[]]'
     $switch.Sink = $sink
-    $out = $vm.Sh("a=$GuestInterrupts; " + 'S=$(date +%s%N); ' + "head -c $total /dev/zero | socat -b 1400 -u - UDP:10.0.0.1:9; " +
-        "b=$GuestInterrupts; " + 'echo $((b - a)) $(( ($(date +%s%N) - S) / 1000 ))', 120000, $true)
+    $out = $vm.Sh("a=$GuestInterrupts; c=`"$GuestTxCounts`"; " + 'S=$(date +%s%N); ' + "head -c $total /dev/zero | socat -b 1400 -u - UDP:10.0.0.1:9; " +
+        "b=$GuestInterrupts; " + 'echo $((b - a)) $(( ($(date +%s%N) - S) / 1000 )) $c ' + $GuestTxCounts, 120000, $true)
     $f = Get-Fields $out
     $irq = [long]$f[0] / [math]::Max([long]$f[1] / 1e6, 1e-6)
     Start-Sleep -Milliseconds 500
     $switch.Sink = $null
-    $got = 0; $first = $null; $last = $null
-    foreach ($e in @($sink.ToArray())) { $got += $e[1]; if ($null -eq $first) { $first = $e }; $last = $e }
+    $got = 0; $first = $null; $last = $null; $prev = $null
+    $hz = [Diagnostics.Stopwatch]::Frequency
+    $maxGap = 0; $longGaps = 0; $longTicks = 0
+    foreach ($e in @($sink.ToArray())) {
+        $got += $e[1]
+        if ($null -eq $first) { $first = $e }
+        if ($null -ne $prev) {
+            $gap = $e[0] - $prev[0]
+            if ($gap -gt $maxGap) { $maxGap = $gap }
+            if ($gap -gt $hz / 1000) { $longGaps++; $longTicks += $gap }
+        }
+        $prev = $e; $last = $e
+    }
     Check ($sink.Count -ge 2) "the host got $($sink.Count) datagrams of $total bytes sent"
-    $secs = [math]::Max(($last[0] - $first[0]) / [Diagnostics.Stopwatch]::Frequency, 1e-6)
-    return @($got, (($got - $first[1]) / $secs), $irq)
+    $secs = [math]::Max(($last[0] - $first[0]) / $hz, 1e-6)
+    $rate = ($got - $first[1]) / $secs
+    if ($f.Count -ge 8) {
+        Write-Host ('  NETTX {0:N1} MiB/s: guest sent {1:N0} bytes in {2:N1} ms ({3:N0} packets to its driver, {4:N0} dropped by the driver, {5:N0} by its queue; {6:N0} interrupts); switch got {7:N0} datagrams, {8:N0} bytes, over {9:N1} ms; largest gap {10:N2} ms, {11:N0} gaps over 1 ms for {12:N1} ms' -f `
+            ($rate / 1MB), $total, ([long]$f[1] / 1e3), ([long]$f[5] - [long]$f[2]), ([long]$f[6] - [long]$f[3]), ([long]$f[7] - [long]$f[4]), [long]$f[0],
+            $sink.Count, $got, ($secs * 1e3), ($maxGap * 1e3 / $hz), $longGaps, ($longTicks * 1e3 / $hz))
+    } else {
+        Write-Host "  NETTX: the guest's counters did not parse: '$out'"
+    }
+    return @($got, $rate, $irq)
 }
 
 # The guest's receive rate (its rx_bytes over `seconds`) while the host
