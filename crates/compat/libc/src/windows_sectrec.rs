@@ -40,8 +40,18 @@
 //!   SEC_RESERVE view in one call and then written (how much RAM a
 //!   millisecond takes); and, on the jailer's side, each cheap sign of new
 //!   section memory (the child's handle count, its virtual size, the host's
-//!   commit) and `GetMappedFileNameW` of each view (a file's view or the
-//!   pagefile's).
+//!   commit, its `SharedCommitUsage`) and `GetMappedFileNameW` of each view
+//!   (a file's view or the pagefile's); then whether a section's commit is
+//!   charged to a process: `PROCESS_MEMORY_COUNTERS_EX2.SharedCommitUsage`
+//!   (Learn: "The current shared commit usage, in bytes"; Windows 10 or 11
+//!   22H2 with the September 2023 update and later) of the child as a 1
+//!   GiB SEC_COMMIT section is made, mapped, its handle closed with the view
+//!   kept, unmapped; a SEC_RESERVE section committed on a view; a section
+//!   whose handle the jailer's side duplicates and holds while the child
+//!   closes its own (both processes' values); and the pagefile quota
+//!   (`QUOTA_LIMITS.PagefileLimit`, `ProcessQuotaLimits`): whether the
+//!   jailer's side and the child itself can set it, and whether a SEC_COMMIT
+//!   section, and private memory, are refused past it.
 //!
 //! Printed, not asserted, but for each step running and the child ending
 //! well.
@@ -157,6 +167,7 @@ unsafe extern "system" {
     fn NtQueryObject(handle: HANDLE, class: u32, info: *mut c_void, len: u32, returned: *mut u32) -> i32;
     fn NtQuerySection(section: HANDLE, class: u32, info: *mut c_void, len: usize, returned: *mut usize) -> i32;
     fn NtQuerySystemInformation(class: u32, info: *mut c_void, len: u32, returned: *mut u32) -> i32;
+    fn NtSetInformationProcess(process: HANDLE, class: u32, info: *const c_void, len: u32) -> i32;
 }
 
 const PROCESS_HANDLE_INFORMATION: u32 = 51;
@@ -165,6 +176,44 @@ const SECTION_BASIC_INFORMATION: u32 = 0;
 const SYSTEM_EXTENDED_HANDLE_INFORMATION: u32 = 64;
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
 const JOB_OBJECT_MEMORY_USAGE_INFORMATION: i32 = 28;
+
+const PROCESS_QUOTA_LIMITS: u32 = 1;
+
+/// `PROCESS_MEMORY_COUNTERS_EX2` (Learn: Windows 10 22H2 or Windows 11
+/// 22H2 with the September 2023 update and later).
+#[repr(C)]
+#[derive(Default)]
+struct CountersEx2 {
+    cb: u32,
+    page_faults: u32,
+    sizes: [usize; 10],
+    shared_commit: u64,
+}
+
+/// A process's `SharedCommitUsage`, or none where `GetProcessMemoryInfo`
+/// refuses the structure's size.
+fn shared_commit(process: HANDLE) -> Option<u64> {
+    let mut c = CountersEx2 { cb: core::mem::size_of::<CountersEx2>() as u32, ..Default::default() };
+    // SAFETY: a structure of the size given.
+    (unsafe { K32GetProcessMemoryInfo(process, (&raw mut c).cast(), c.cb) } != 0).then_some(c.shared_commit)
+}
+
+/// `QUOTA_LIMITS`: paged pool, nonpaged pool, the working set's least and
+/// most, the pagefile limit, the time limit.
+fn quota_limits(process: HANDLE) -> Result<[usize; 6], i32> {
+    let mut q = [0usize; 6];
+    // SAFETY: a buffer of QUOTA_LIMITS' size.
+    let status = unsafe { NtQueryInformationProcess(process, PROCESS_QUOTA_LIMITS, q.as_mut_ptr().cast(), 48, core::ptr::null_mut()) };
+    if status < 0 { Err(status) } else { Ok(q) }
+}
+
+/// Sets a process's pagefile quota to `limit` bytes, the rest left at zero
+/// (unchanged): the NTSTATUS.
+fn set_pagefile_limit(process: HANDLE, limit: usize) -> i32 {
+    let q = [0, 0, 0, 0, limit, 0usize];
+    // SAFETY: a QUOTA_LIMITS of the size given.
+    unsafe { NtSetInformationProcess(process, PROCESS_QUOTA_LIMITS, q.as_ptr().cast(), 48) }
+}
 
 fn us(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1e6
@@ -582,6 +631,43 @@ fn sectrec_child() {
     // SAFETY: ours.
     unsafe { CloseHandle(s) };
 
+    // e: SharedCommitUsage, whether a section's commit is charged to the
+    // process that made it, held it, or mapped it.
+    let me = unsafe { GetCurrentProcess() };
+    let shared = || shared_commit(me).map_or("not read (the structure's size refused)".to_string(), |v| format!("{} KiB", v / 1024));
+    say(format!("SECTREC-e shared: this process's SharedCommitUsage at the start {}", shared()));
+    let s = pagefile_section(1 << 30, false);
+    say(format!("SECTREC-e shared: a SEC_COMMIT section of 1 GiB made: {}", shared()));
+    let v = view(s, 1 << 30);
+    say(format!("SECTREC-e shared: mapped: {}", shared()));
+    // SAFETY: ours; the view stays.
+    unsafe { CloseHandle(s) };
+    say(format!("SECTREC-e shared: its handle closed, the view kept: {}", shared()));
+    unmap(v);
+    say(format!("SECTREC-e shared: unmapped (the section gone): {}", shared()));
+    let s = pagefile_section(256 * MIB, true);
+    let v = view(s, 256 * MIB);
+    say(format!("SECTREC-e shared: a SEC_RESERVE section of 256 MiB made and mapped: {}", shared()));
+    // SAFETY: the first 64 MiB of our view.
+    let p = unsafe { VirtualAlloc(v as *const c_void, 64 * MIB, MEM_COMMIT, PAGE_READWRITE) };
+    say(format!("SECTREC-e shared: 64 MiB of it committed on the view ({}): {}", if p.is_null() { "refused" } else { "done" }, shared()));
+    unmap(v);
+    // SAFETY: ours.
+    unsafe { CloseHandle(s) };
+    say(format!("SECTREC-e shared: unmapped and closed: {}", shared()));
+    // A section made here whose handle the jailer's side duplicates and
+    // holds while this process closes its own.
+    let s = pagefile_section(1 << 30, false);
+    say(format!("SECTREC-e shared: a second SEC_COMMIT section of 1 GiB made: {}", shared()));
+    say(format!("SECTREC-SHARED {}", s as usize));
+    assert_eq!(wait_for_the_parent(), "held");
+    // SAFETY: ours; the jailer's side holds its own.
+    unsafe { CloseHandle(s) };
+    say(format!("SECTREC-e shared: its handle closed here, the jailer's side holding a duplicate: {}", shared()));
+    say("SECTREC-SHARED-CLOSED".to_string());
+    assert_eq!(wait_for_the_parent(), "released");
+    say(format!("SECTREC-e shared: the jailer's side's duplicate closed: {}", shared()));
+
     // d: a jail as Firecracker's with vhost-user and a uffd restore.
     const GUEST: usize = 1 << 30;
     const TOUCHED: usize = 64 * MIB;
@@ -633,6 +719,37 @@ fn sectrec_child() {
         VirtualFree(ram as *mut c_void, 0, MEM_RELEASE);
     }
     drop(memfd_file);
+    // e: the pagefile quota (QUOTA_LIMITS.PagefileLimit), whether the
+    // jailer's side or this process can set it, and whether a section's
+    // creation is then refused at it.
+    say(format!("SECTREC-e quota: this process's QUOTA_LIMITS {:?}; private commit {} MiB", quota_limits(me), charge().private / MIB));
+    let limit = charge().private + 64 * MIB;
+    say(format!("SECTREC-QUOTA {limit}"));
+    let answer = wait_for_the_parent();
+    let own = set_pagefile_limit(me, limit);
+    say(format!(
+        "SECTREC-e quota: the jailer's side's set of a pagefile limit of {} MiB: {answer}; this process's own set: NTSTATUS {own:#010x}; \
+         its QUOTA_LIMITS now {:?}",
+        limit / MIB,
+        quota_limits(me)
+    ));
+    // SAFETY: an unnamed section; closed below.
+    let s = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, core::ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, 256 * MIB as u32, core::ptr::null()) };
+    let section = if s.is_null() { format!("refused, error {}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0)) } else { "made".to_string() };
+    if !s.is_null() {
+        // SAFETY: ours.
+        unsafe { CloseHandle(s) };
+    }
+    // SAFETY: a private reservation, committed, released below.
+    let p = unsafe { VirtualAlloc(core::ptr::null(), 128 * MIB, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+    let private = if p.is_null() { format!("refused, error {}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0)) } else { "done".to_string() };
+    if !p.is_null() {
+        // SAFETY: ours.
+        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+    }
+    say(format!(
+        "SECTREC-e quota: past that limit, a SEC_COMMIT section of 256 MiB: {section}; 128 MiB of private memory committed: {private}"
+    ));
     say("SECTREC-END".to_string());
 }
 
@@ -852,6 +969,8 @@ fn triggers(process: HANDLE) -> String {
         unsafe { K32GetPerformanceInfo(&mut perf, perf.cb) != 0 }
     });
     let list = timed(&mut || !handles_of(process).is_empty());
+    let shared = timed(&mut || shared_commit(process).is_some());
+    let shared_now = shared_commit(process).map_or("not read".to_string(), |v| format!("{} MiB", v >> 20));
     // Each view's base, by a walk; then its file's name, or none.
     let mut views = Vec::new();
     let mut at = 0usize;
@@ -881,7 +1000,8 @@ fn triggers(process: HANDLE) -> String {
     }
     format!(
         "SECTREC-e the jailer's cheap signs, 1000 times each: the child's handle count {handles}; its virtual size \
-         (VM_COUNTERS) {virtual_size}; the host's commit (GetPerformanceInfo) {host}; the whole handle list {list}. \
+         (VM_COUNTERS) {virtual_size}; the host's commit (GetPerformanceInfo) {host}; the whole handle list {list}; its \
+         SharedCommitUsage (PROCESS_MEMORY_COUNTERS_EX2) {shared}, {shared_now} with the jail made. \
          GetMappedFileNameW of each of the {} views: {}, {named} named a file (the rest pagefile-backed)",
         views.len(),
         spread(&t)
@@ -923,6 +1043,7 @@ fn test_section_memory_and_a_charge_for_it_on_record() {
     writeln!(to_child, "go").unwrap();
     let say = |l: String| eprintln!("{l}");
     let mut ended = false;
+    let mut held: Option<HANDLE> = None;
     for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
         let line = line.unwrap();
         if let Some(rest) = line.strip_prefix("SECTREC-SECTION ") {
@@ -1001,6 +1122,44 @@ fn test_section_memory_and_a_charge_for_it_on_record() {
             }
             say(triggers(process));
             writeln!(to_child, "done").unwrap();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("SECTREC-SHARED ") {
+            let handle = rest.parse::<usize>().unwrap();
+            let own = || shared_commit(unsafe { GetCurrentProcess() }).map_or("not read".to_string(), |v| format!("{} KiB", v / 1024));
+            let before = own();
+            held = duplicated(process, handle);
+            say(format!(
+                "SECTREC-e shared: the jailer's side duplicated the child's section handle ({}): its own SharedCommitUsage {before} \
+                 before, {} after",
+                if held.is_some() { "done" } else { "refused" },
+                own()
+            ));
+            writeln!(to_child, "held").unwrap();
+            continue;
+        }
+        if line == "SECTREC-SHARED-CLOSED" {
+            let own = || shared_commit(unsafe { GetCurrentProcess() }).map_or("not read".to_string(), |v| format!("{} KiB", v / 1024));
+            let child_now = shared_commit(process).map_or("not read".to_string(), |v| format!("{} KiB", v / 1024));
+            let mine = own();
+            if let Some(h) = held.take() {
+                // SAFETY: ours.
+                unsafe { CloseHandle(h) };
+            }
+            say(format!(
+                "SECTREC-e shared: the child's own handle closed: the child's SharedCommitUsage read by the jailer's side \
+                 {child_now}, the jailer's side's own {mine} while it held the duplicate, {} once it closed it",
+                own()
+            ));
+            writeln!(to_child, "released").unwrap();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("SECTREC-QUOTA ") {
+            let limit = rest.parse::<usize>().unwrap();
+            let status = set_pagefile_limit(process, limit);
+            let answer = format!("NTSTATUS {status:#010x}, the child's QUOTA_LIMITS read here {:?}", quota_limits(process));
+            say(format!("SECTREC-e quota: the jailer's side (elevated {:?}) set the child's pagefile limit: {answer}", elevated()));
+            writeln!(to_child, "{answer}").unwrap();
             continue;
         }
         if line == "SECTREC-END" {
