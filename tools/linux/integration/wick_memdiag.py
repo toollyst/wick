@@ -25,7 +25,9 @@ it was made of:
 - file other: other file mappings
 - vdso: [vdso], [vvar], [vsyscall]
 
-Each microVM appends one JSON line to $WICK_MEMDIAG_OUT. The macOS harness
+Each microVM appends one JSON line to $WICK_MEMDIAG_OUT, with its number of
+vCPUs (a vCPU has a thread, whose stack is among the thread stacks, and a
+kvm_run mapping). The macOS harness
 reports the same kinds (tools/macos/integration). Run as a program,
 `wick_memdiag.py summary FILE` prints a Markdown table of a file.
 """
@@ -146,6 +148,7 @@ def _run(self):
             {
                 "test": test,
                 "pid": ps.pid,
+                "vcpus": getattr(self._vm, "vcpus_count", None),
                 "peak_kib": peak // 1024,
                 "kinds_kib": peak_kinds,
                 "first_over_kib": None if first_over is None else first_over // 1024,
@@ -177,15 +180,17 @@ def summary(path):
         "",
         CAVEAT,
         "",
-        "| test | peak | first over | " + " | ".join(KINDS) + " |",
-        "|---|---:|---:|" + "---:|" * len(KINDS),
+        "| test | vcpus | peak | first over | " + " | ".join(KINDS) + " |",
+        "|---|---:|---:|---:|" + "---:|" * len(KINDS),
     ]
     for r in rows:
         kinds = r["kinds_kib"] or {}
         test = (r["test"] or "?").split("::", 1)[-1]
         over = "" if r["first_over_kib"] is None else str(r["first_over_kib"])
+        # A record without the count (the macOS harness's) leaves it empty.
+        vcpus = "" if r.get("vcpus") is None else str(r["vcpus"])
         lines.append(
-            f"| {test} | {r['peak_kib']} | {over} | "
+            f"| {test} | {vcpus} | {r['peak_kib']} | {over} | "
             + " | ".join(str(kinds.get(k, 0)) for k in KINDS)
             + " |"
         )

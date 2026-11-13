@@ -236,7 +236,8 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   with the reason, in `tools/linux/unit-test-exclusions.txt` and
   `tools/linux/integration-test-exclusions.txt`. An informational step of
   the same job (never counted, never failing it) runs the vsock and balloon
-  tests whose memory macOS compares with Linux's with
+  tests whose memory macOS compares with Linux's, and `test_cpuid` (1, 2 and
+  16 vCPUs) and `test_all_vcpus_online`, whose memory Windows compares, with
   `tools/linux/integration/wick_memdiag.py` (`WICK_IT_MEMDIAG=1`): the
   VMM's own memory at its peak, by kind of mapping, in the step summary.
 - On macOS, `tools/macos/check-unit-tests.py` runs every crate's unit tests

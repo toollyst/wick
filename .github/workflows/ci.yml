@@ -270,7 +270,13 @@ jobs:
       # Informational, never fails the job: the VMM's own memory at its peak,
       # by kind of mapping, for the tests whose memory macOS compares with
       # Linux's (tools/linux/integration/wick_memdiag.py, loaded in this step
-      # only: the steps above keep upstream's monitor as it is).
+      # only: the steps above keep upstream's monitor as it is). With them,
+      # the tests Windows compares: test_cpuid boots 1, 2 and 16 vCPUs on
+      # any host (its own parameters), which gives what a vCPU adds here,
+      # thread stacks and kvm vcpu pages apart; Windows fails it on the
+      # 5 MiB budget at 16. test_all_vcpus_online, which fails there too,
+      # takes as many vCPUs as the host has processors, up to 32: on this
+      # runner that is a few (the table's vcpus column says how many).
       - name: VMM memory by kind of mapping (informational)
         if: success() || failure()
         continue-on-error: true
@@ -278,7 +284,9 @@ jobs:
           WICK_IT_MEMDIAG=1 tools/linux/integration-tests.sh wick "$RUNNER_TEMP/it/memdiag" -n 1 \
             integration_tests/functional/test_vsock.py::test_vsock_epipe \
             integration_tests/functional/test_vsock.py::test_vsock_transport_reset_h2g \
-            integration_tests/functional/test_balloon.py::test_deflate_on_oom || true
+            integration_tests/functional/test_balloon.py::test_deflate_on_oom \
+            integration_tests/functional/test_cpu_features_x86_64.py::test_cpuid \
+            integration_tests/functional/test_cpu_all.py::test_all_vcpus_online || true
           python3 -I tools/linux/integration/wick_memdiag.py summary \
             "$RUNNER_TEMP/it/memdiag/memory-peaks.jsonl" | tee -a "$GITHUB_STEP_SUMMARY" || true
       # Upstream's release.sh, which the tests build with, has no --locked.
