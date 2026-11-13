@@ -2516,4 +2516,157 @@ mod fpu_tests {
         // SAFETY: the test's mapping, no VM left using it.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
     }
+
+    /// How much of the calling thread's stack is committed: the TEB's
+    /// `StackBase` less its `StackLimit` (`NT_TIB`, at `gs:[8]` and
+    /// `gs:[0x10]` on x86-64), in KiB. It only grows: Windows commits a
+    /// stack's pages as they are first touched and keeps them.
+    fn stack_committed() -> usize {
+        let (base, limit): (usize, usize);
+        // SAFETY: two reads of the thread's own TEB.
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, gs:[0x8]",
+                "mov {1}, gs:[0x10]",
+                out(reg) base,
+                out(reg) limit,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        (base - limit) / 1024
+    }
+
+    /// `step` on a thread of its own, made as Firecracker makes a vCPU's
+    /// (2 MiB of stack reserved), with the line of what the thread's stack
+    /// had committed before and after it.
+    fn on_a_thread_of_its_own(vcpu: &mut VcpuFd, name: &str, step: impl FnOnce(&mut VcpuFd) -> String + Send) {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("fc_vcpu 0".to_string())
+                .stack_size(2 << 20)
+                .spawn_scoped(scope, || {
+                    let before = stack_committed();
+                    let what = step(vcpu);
+                    let after = stack_committed();
+                    eprintln!("STACKTEST {name}: {what}; the thread's stack: {before} KiB committed before, {after} after");
+                })
+                .unwrap();
+        });
+    }
+
+    /// One `run` as a line; a guest that does not come back is kicked
+    /// after 5 s.
+    fn run_to_a_line(vcpu: &mut VcpuFd) -> String {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
+        let watch = Arc::clone(&done);
+        let watchdog = std::thread::spawn(move || {
+            for _ in 0..500 {
+                if watch.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            kicker.set_kvm_immediate_exit(1);
+        });
+        let line = match vcpu.run() {
+            Ok(VcpuExit::IoOut(port, _)) => format!("exit IoOut port {port:#x}"),
+            Ok(VcpuExit::MmioRead(address, _)) => format!("exit MmioRead {address:#x}"),
+            Ok(VcpuExit::Hlt) => "exit Hlt".to_string(),
+            Ok(VcpuExit::Shutdown) => "exit Shutdown".to_string(),
+            Ok(_) => "exit (another)".to_string(),
+            Err(e) if e.errno() == libc::EINTR => "no exit within 5 s (kicked)".to_string(),
+            Err(e) => format!("run failed, errno {}", e.errno()),
+        };
+        done.store(true, Ordering::SeqCst);
+        watchdog.join().unwrap();
+        vcpu.set_kvm_immediate_exit(0);
+        line
+    }
+
+    /// A record of what each call of the backend commits of the stack of
+    /// the thread that makes it, each on a thread of its own. In a booted
+    /// Linux guest every vCPU thread had 48 to 52 KiB of stack resident
+    /// while its stack pointer was 15 KiB deep (CI run 43377614564,
+    /// tools/windows/vmm-memory-record.py), the pages below holding stale
+    /// frames of WinHvPlatform.dll raising and catching a C++ exception
+    /// (`CxxThrowException`, `RaiseException`, the unwind) and formatting a
+    /// message; the stale frames do not say which call of the backend's
+    /// that was. The lines here do: the state calls Firecracker makes for a
+    /// vCPU, and a run to each kind of exit the run loop handles.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_the_stack_each_call_commits_on_record() {
+        const CODE2: u64 = 0x7000;
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        // A page 6 MiB up that no memory slot backs: an MMIO address.
+        put(m, 0x3018, &(0x60_0000u64 | 0x83).to_le_bytes());
+        put(
+            m,
+            CODE2,
+            &[
+                0x0F, 0xA2, // cpuid
+                0xE6, PORT as u8, // out 0x80, al
+                0x8B, 0x04, 0x25, 0x00, 0x00, 0x60, 0x00, // mov eax, [0x600000]
+                0xE6, PORT as u8, // out 0x80, al
+                0xB9, 0x00, 0x4D, 0x56, 0x4B, // mov ecx, 0x4b564d00 (MSR_KVM_WALL_CLOCK_NEW)
+                0x31, 0xC0, // xor eax, eax
+                0x31, 0xD2, // xor edx, edx
+                0x0F, 0x30, // wrmsr
+                0xE6, PORT as u8, // out 0x80, al
+                0xF4, // hlt
+                0xEB, 0xFD, // jmp to the hlt
+            ],
+        );
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+
+        on_a_thread_of_its_own(&mut vcpu, "nothing (the control)", |_| "no call".to_string());
+        on_a_thread_of_its_own(&mut vcpu, "KVM_GET_SREGS, KVM_SET_SREGS, KVM_SET_REGS", |v| {
+            start(v);
+            v.set_regs(&kvm_regs { rip: CODE2, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+            "set".to_string()
+        });
+        on_a_thread_of_its_own(&mut vcpu, "KVM_GET_XSAVE2", |v| format!("{} bytes", area_of(v).len()));
+        on_a_thread_of_its_own(&mut vcpu, "KVM_GET_FPU, KVM_SET_FPU", |v| {
+            let fpu = v.get_fpu().unwrap();
+            format!("{:?}", v.set_fpu(&fpu))
+        });
+        on_a_thread_of_its_own(&mut vcpu, "KVM_GET_LAPIC, KVM_SET_LAPIC", |v| {
+            format!("{:?}", v.get_lapic().and_then(|l| v.set_lapic(&l)))
+        });
+        on_a_thread_of_its_own(&mut vcpu, "KVM_GET_VCPU_EVENTS, KVM_GET_MP_STATE, KVM_GET_XCRS, KVM_GET_DEBUGREGS", |v| {
+            format!(
+                "{} {} {} {}",
+                v.get_vcpu_events().is_ok(),
+                v.get_mp_state().is_ok(),
+                v.get_xcrs().is_ok(),
+                v.get_debug_regs().is_ok()
+            )
+        });
+        for name in [
+            "the vCPU's first run: cpuid, then a port write",
+            "a run to an MMIO read",
+            "a run that completes the MMIO read, to a port write",
+            "a run through a wrmsr of the kvm-clock wall clock, to a port write",
+            "a run to hlt with interrupts off, ended by a kick",
+            "a run of a halted vCPU, ended by a kick",
+        ] {
+            on_a_thread_of_its_own(&mut vcpu, name, run_to_a_line);
+        }
+
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
 }

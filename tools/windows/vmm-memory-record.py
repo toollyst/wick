@@ -26,8 +26,11 @@ Kinds:
               the rest (read-only data, shared)
   stacks      the allocations that are a thread's stack (TEB DeallocationStack)
   heaps       the allocations a heap of the process starts in (PEB ProcessHeaps)
-  private     other private memory: later heap segments, large allocations,
-              VirtualAlloc'd buffers, TEBs and the PEB
+              and the heaps' later segments (an allocation that starts with
+              a heap segment's header naming one of those heaps)
+  private     other private memory: large allocations, VirtualAlloc'd
+              buffers, TEBs and the PEB (an allocation that holds threads'
+              TEBs is marked with their number)
   mapped      sections that are neither the guest's memory nor a system file
 Not counted by the tests, printed beside them: the guest's memory, and the
 system's DLLs and files (their private pages too).
@@ -57,7 +60,16 @@ besides the VMMMEM lines:
               (the size of the frame of the function it returns into), the
               module and offset, and the nearest symbol when dbghelp finds
               one (firecracker.pdb beside firecracker.exe names
-              Firecracker's own; a system DLL has its exports)
+              Firecracker's own; a system DLL has its exports). A release
+              build has no PDB of Firecracker's own functions: `--map
+              <file>` before the other arguments names them from the
+              linker's map of the same build (link.exe /MAP), whose
+              addresses are the image's
+
+After the cases, VMMGROW lines say which allocations the per-vCPU growth is
+in: the allocations of each kind grouped by size (and mark), with their
+number and resident memory in the case with the fewest vCPUs and in the one
+with the most, for every group that differs.
 
 The offsets are symbolized again anywhere with the PDB beside the binary:
 `llvm-symbolizer --relative-address -f -C -e firecracker.exe 0x<offset>`.
@@ -255,6 +267,23 @@ def heap_bases(k32, ntdll, handle):
     return (set(struct.unpack(f"<{count}Q", raw)) if raw else set()), peb
 
 
+# An NT heap's later segments start with a _HEAP_SEGMENT: its signature
+# 0xFFEEFFEE at offset 0x10 and its heap's address at 0x18 (x86-64; the
+# public symbols of ntdll, as WinDbg's `dt ntdll!_HEAP_SEGMENT` prints
+# them). The heap's first segment is the heap itself, with the same header.
+HEAP_SEGMENT_SIGNATURE = 0xFFEEFFEE
+
+
+def heap_of_segment(header, heaps):
+    """The heap a private allocation is a segment of, from the allocation's
+    first 0x20 bytes, or None: the signature, and a heap of the process."""
+    if not header or len(header) < 0x20:
+        return None
+    signature, = struct.unpack_from("<I", header, 0x10)
+    heap, = struct.unpack_from("<Q", header, 0x18)
+    return heap if signature == HEAP_SEGMENT_SIGNATURE and heap in heaps else None
+
+
 def allocations(k32, psapi, handle):
     """Every allocation of the process: (base, size, type, path, pages), with
     `pages` the attributes of each page in the working set."""
@@ -329,8 +358,14 @@ def measure(k32, psapi, ntdll, pid, system):
                 what = "stacks"
             elif kind == MEM_PRIVATE and base in heaps:
                 what = "heaps"
+            elif kind == MEM_PRIVATE and heap_of_segment(read(k32, handle, base, 0x20), heaps) is not None:
+                what = "heaps"
+                path = f"(a later segment of the heap at {heap_of_segment(read(k32, handle, base, 0x20), heaps):#x})"
             elif kind == MEM_PRIVATE:
                 what = "private"
+                held = sum(1 for t in tebs if base <= t < base + size)
+                if held:
+                    path = f"({held} TEBs)"
             else:
                 what = "mapped"
             kinds[what] += rss
@@ -341,6 +376,37 @@ def measure(k32, psapi, ntdll, pid, system):
 
 
 COUNTED = ("image code", "image private", "image rest", "stacks", "heaps", "private", "mapped")
+# The allocations of each case, for the VMMGROW lines.
+ROWS = {}
+
+
+def mark_of(path):
+    """A row's mark without what differs from case to case: an address, a
+    count."""
+    return re.sub(r"0x[0-9a-f]+|\d+", "N", os.path.basename(path))
+
+
+def growth_lines(low, high, vcpus):
+    """Which allocations differ between two cases' rows: per kind, size and
+    mark, the number of allocations and their resident bytes in each, for
+    the groups that differ, the largest difference first."""
+    def groups(rows):
+        out = {}
+        for rss, what, _base, size, path in rows:
+            n, total = out.get((what, size, mark_of(path)), (0, 0))
+            out[(what, size, mark_of(path))] = (n + 1, total + rss)
+        return out
+
+    a, b = groups(low), groups(high)
+    lines = []
+    for key in set(a) | set(b):
+        (n0, r0), (n1, r1) = a.get(key, (0, 0)), b.get(key, (0, 0))
+        if (n0, r0) != (n1, r1):
+            what, size, mark = key
+            lines.append((abs(r1 - r0), f"{what} of {size // 1024} KiB{' ' + mark if mark else ''}: {n0} with "
+                          f"{r0 // 1024} KiB resident, then {n1} with {r1 // 1024} KiB: each vCPU adds "
+                          f"{(n1 - n0) / vcpus:.2f} allocations and {(r1 - r0) / 1024 / vcpus:.1f} KiB"))
+    return [line for _d, line in sorted(lines, reverse=True)]
 
 
 # --- a thread's stack: what is resident and which calls left it so ----------
@@ -524,6 +590,34 @@ class SYMBOL_INFOW(ctypes.Structure):
                 ("Name", ctypes.c_uint16 * 1)]
 
 
+# The image's functions from link.exe's map of it: `--map`.
+MAP = []
+
+
+def parse_map(text):
+    """link.exe /MAP: the symbols with their addresses relative to the
+    image's base, sorted. A line is ` 0001:00000010  name  0000000140001010
+    f  lib:object`; the base is the "Preferred load address"."""
+    base = re.search(r"Preferred load address is ([0-9A-Fa-f]+)", text)
+    if not base:
+        return []
+    base = int(base.group(1), 16)
+    out = []
+    for m in re.finditer(r"^ [0-9A-Fa-f]{4}:[0-9A-Fa-f]{8}\s+(\S+)\s+([0-9A-Fa-f]{16})\s", text, re.M):
+        rva = int(m.group(2), 16) - base
+        if rva > 0:
+            out.append((rva, m.group(1)))
+    return sorted(out)
+
+
+def map_name(symbols, rva):
+    """The symbol at or below `rva`, as `name+0x<distance>`; "" before the first."""
+    import bisect  # pylint: disable=import-outside-toplevel
+
+    i = bisect.bisect_right(symbols, (rva, "\U0010ffff")) - 1
+    return f"{symbols[i][1]}+{rva - symbols[i][0]:#x}" if i >= 0 else ""
+
+
 class Symbols:
     """dbghelp's nearest symbol for an address in one of the process's
     images: a PDB beside the image names its functions (firecracker.pdb),
@@ -534,6 +628,8 @@ class Symbols:
 
     def __init__(self, k32, modules):
         self.handle, self.dbghelp, self.note = ctypes.c_void_p(0x5749434B), None, ""
+        self.mapped = next(((base, end) for base, end, name, _path in modules
+                            if MAP and name.lower() == "firecracker.exe"), None)
         try:
             dbghelp = ctypes.WinDLL("dbghelp", use_last_error=True)
             dbghelp.SymSetOptions.restype = wintypes.DWORD
@@ -561,6 +657,8 @@ class Symbols:
             self.note = f"no dbghelp: {e}"
 
     def name(self, address):
+        if self.mapped and self.mapped[0] <= address < self.mapped[1]:
+            return map_name(MAP, address - self.mapped[0])
         if self.dbghelp is None:
             return ""
         buf = ctypes.create_string_buffer(ctypes.sizeof(SYMBOL_INFOW) + 2 * self.MAX_NAME)
@@ -637,7 +735,8 @@ def record_stacks(binds, pid, vcpus, rows, chains):
                           for base, size, path in system_images(k32, psapi, handle))
         modules.sort()
         symbols = Symbols(k32, modules)
-        print(f"{tag} symbols: {symbols.note}")
+        print(f"{tag} symbols: {symbols.note}"
+              + (f"; firecracker.exe from the linker's map, {len(MAP)} symbols" if symbols.mapped else ""))
         code = {}
 
         def code_before(value):
@@ -715,6 +814,7 @@ def run_case(binds, firecracker, vcpus, work, system):
         print(f"VMMMEM vcpus={vcpus} threads={threads} stacks={stacks} counted={counted // 1024} KiB: {parts}; "
               f"not counted: system image private {kinds['system image private'] // 1024}, "
               f"system rest {kinds['system rest'] // 1024}")
+        ROWS[vcpus] = rows
         for rss, what, base, size, path in sorted(rows, reverse=True)[:12]:
             print(f"VMMMEM vcpus={vcpus}   {what:8} {base:#014x} size {size // 1024:8} KiB resident {rss // 1024:6} KiB"
                   f" {os.path.basename(path)}")
@@ -825,6 +925,7 @@ def run_boot_case(binds, firecracker, vcpus, work, system, kernel, rootfs, chain
               f"not counted: system image private {kinds['system image private'] // 1024}, "
               f"system rest {kinds['system rest'] // 1024}; the guest's shell after {booted:.0f} s, "
               f"processors online {cpus.group(1) if cpus else 'not read'}, frames sent: {bool(sent)}")
+        ROWS[vcpus] = rows
         for rss, what, base, size, path in sorted(rows, reverse=True)[:12]:
             print(f"{tag}   {what:8} {base:#014x} size {size // 1024:8} KiB resident {rss // 1024:6} KiB"
                   f" {os.path.basename(path)}")
@@ -882,11 +983,44 @@ def selftest():
     assert largest_frames(found, high, lambda value: "")[0] == (0x27d8, 0x2800, "b.dll+0xabc", "")
     assert dos_path({"\\device\\harddiskvolume3": "C:"}, "\\Device\\HarddiskVolume3\\x\\a.exe") == "C:\\x\\a.exe"
     assert ctypes.sizeof(SYMBOL_INFOW) == 88 and SYMBOL_INFOW.Name.offset == 84
+    # A heap's later segment: the signature and a heap of the process.
+    header = bytes(0x10) + struct.pack("<IIQ", HEAP_SEGMENT_SIGNATURE, 0, 0x1b935590000)
+    assert heap_of_segment(header, {0x1b935590000}) == 0x1b935590000
+    assert heap_of_segment(header, {0x5000}) is None and heap_of_segment(bytes(0x20), {0}) is None
+    assert heap_of_segment(None, {0}) is None and heap_of_segment(header[:0x18], {0x1b935590000}) is None
+    # What grows: a second stack-sized private allocation per vCPU, a heap segment that fills.
+    one = [(40 << 10, "private", 0x1000, 64 << 10, ""), (96 << 10, "heaps", 0x2000, 1 << 20, "(a later segment of the heap at 0x9000)"),
+           (8 << 10, "private", 0x3000, 2 << 20, "(10 TEBs)"), (4 << 10, "mapped", 0x4000, 4 << 10, "")]
+    many = [(40 << 10, "private", 0x1000, 64 << 10, ""), (16 << 10, "private", 0x7000, 64 << 10, ""),
+            (552 << 10, "heaps", 0x2000, 1 << 20, "(a later segment of the heap at 0x8000)"),
+            (128 << 10, "private", 0x3000, 2 << 20, "(25 TEBs)"), (4 << 10, "mapped", 0x4000, 4 << 10, "")]
+    assert growth_lines(one, many, 15) == [
+        "heaps of 1024 KiB (a later segment of the heap at N): 1 with 96 KiB resident, then 1 with 552 KiB: "
+        "each vCPU adds 0.00 allocations and 30.4 KiB",
+        "private of 2048 KiB (N TEBs): 1 with 8 KiB resident, then 1 with 128 KiB: each vCPU adds 0.00 allocations and 8.0 KiB",
+        "private of 64 KiB: 1 with 40 KiB resident, then 2 with 56 KiB: each vCPU adds 0.07 allocations and 1.1 KiB",
+    ], growth_lines(one, many, 15)
+    # link.exe's map.
+    text = (" firecracker\n\n Preferred load address is 0000000140000000\n\n"
+            "  Address         Publics by Value              Rva+Base               Lib:Object\n\n"
+            " 0000:00000000       __guard_flags              0000000000000000     <absolute>\n"
+            " 0001:00000000       _ZN3vmm7builder13build_microvm17h0123456789abcdefE 0000000140001000 f   vmm.o\n"
+            " 0001:00000340       main                       0000000140001340 f   firecracker.o\n")
+    symbols = parse_map(text)
+    assert symbols == [(0x1000, "_ZN3vmm7builder13build_microvm17h0123456789abcdefE"), (0x1340, "main")], symbols
+    assert map_name(symbols, 0x1000).endswith("E+0x0") and map_name(symbols, 0x133f).endswith("E+0x33f")
+    assert map_name(symbols, 0x2000) == "main+0xcc0" and map_name(symbols, 0xfff) == "" and parse_map("x") == []
     print("vmm-memory-record.py: selftest ok")
 
 
 def main(args):
     boot = None
+    if args and args[0] == "--map":
+        with open(args[1], "r", encoding="utf-8", errors="replace") as f:
+            MAP[:] = parse_map(f.read())
+        if not MAP:
+            raise SystemExit(f"VMMMEM: {args[1]} is not a linker's map with symbols")
+        args = args[2:]
     if args and args[0] == "--boot":
         boot, args = os.path.abspath(args[1]), args[2:]
     if not args:
@@ -916,6 +1050,8 @@ def main(args):
     if hi > lo:
         per = ", ".join(f"{k} {(results[hi][k] - results[lo][k]) / 1024 / (hi - lo):.1f}" for k in COUNTED)
         print(f"VMMMEM{' boot' if boot else ''} each vCPU from {lo} to {hi} adds, KiB: {per}")
+        for line in growth_lines(ROWS[lo], ROWS[hi], hi - lo):
+            print(f"VMMGROW{' boot' if boot else ''} from {lo} to {hi} vCPUs: {line}")
 
 
 if __name__ == "__main__":

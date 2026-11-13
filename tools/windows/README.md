@@ -87,6 +87,22 @@
   python -I tools\windows\vmm-memory-record.py --boot C:\wbt lib\firecracker\build\cargo_target\release\firecracker.exe 1 2 16
   ```
 
+  The release build's `firecracker.pdb` names the standard library's
+  functions and none of Firecracker's own (CI run 43377614564: its frames
+  came out as the nearest of std's). `--map <file>`, before the other
+  arguments, names them from the linker's map of the same build, which CI
+  makes for its own record:
+
+  ```
+  cargo rustc --locked -p firecracker --release --bin firecracker -- -C link-arg=-MAP:C:\wbt\firecracker.map
+  python -I tools\windows\vmm-memory-record.py --map C:\wbt\firecracker.map --boot C:\wbt lib\firecracker\build\cargo_target\release\firecracker.exe 1 2 16
+  ```
+
+  After the cases, VMMGROW lines name the allocations the growth per vCPU
+  is in: each group of allocations (kind, size, and a mark: a heap's later
+  segment, the allocation that holds the threads' TEBs) whose number or
+  resident memory differs between the fewest and the most vCPUs.
+
 CI builds the binaries on every push and uploads them as the artifact
 `wick-windows-x86_64-<commit>`: `lib/firecracker/build/cargo_target/release/firecracker.exe`,
 `firecracker.pdb` (its symbols, for `vmm-memory-record.py --boot`),

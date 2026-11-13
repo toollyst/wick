@@ -817,6 +817,12 @@ jobs:
           # reads back of an area written with the x87 and SSE header bits
           # cleared, then set.
           alone whp::vcpu::fpu_tests::test_set_fpu_on_record
+          # What each call of the backend commits of its thread's stack
+          # (STACKTEST lines), each on a thread of its own: which one leaves
+          # a vCPU's thread 48 to 52 KiB deep, as the boot record of run
+          # 43377614564 found every vCPU's (stale frames of an exception
+          # raised and caught inside WinHvPlatform.dll).
+          alone whp::vcpu::fpu_tests::test_the_stack_each_call_commits_on_record
           k=../../crates/compat/libc/Cargo.toml
           alone windows_linux::tests::test_unix_bind_of_each_path_form_on_record
           alone windows_fd::tests::test_non_blocking_pipe_writes_on_record
@@ -858,7 +864,18 @@ jobs:
           # What Firecracker's own memory besides its guest's is made of with
           # 1, 2 and 16 vCPUs (VMMMEM lines), against upstream's tests' 5 MiB
           # for it: a microVM whose guest is the script's own `hlt` loop.
-          if ! python -I ../../tools/windows/vmm-memory-record.py build/cargo_target/release/firecracker.exe; then
+          # The release build has no PDB of Firecracker's own functions (run
+          # 43377614564 named its frames by the nearest symbol of std's):
+          # the same binary linked again with the linker's map, which names
+          # them by address. `-MAP`, not `/MAP`: Git Bash rewrites an
+          # argument that looks like a path.
+          map="$(cygpath -w "$RUNNER_TEMP")\\firecracker.map"
+          if ! cargo rustc --locked -p firecracker --release --bin firecracker -- -C "link-arg=-MAP:$map"; then
+            echo "::error::firecracker did not link with a map"
+            failed=1
+          fi
+          if ! python -I ../../tools/windows/vmm-memory-record.py --map "$RUNNER_TEMP/firecracker.map" \
+              build/cargo_target/release/firecracker.exe; then
             echo "::error::vmm-memory-record.py did not finish"
             failed=1
           fi
@@ -867,11 +884,12 @@ jobs:
           # bucket), a network interface, the guest's shell on the serial
           # console. Besides the VMMMEM lines, each thread's stack and the
           # return addresses on the deepest stacks (VMMSTACK lines), named
-          # with firecracker.pdb: what a running vCPU's 78 KiB of stack is
-          # made of. No Linux guest has booted on a runner before: if this
-          # one does not, the lines say how far it came and the step notes
-          # it with a warning; it fails nothing.
-          if ! python -I ../../tools/windows/vmm-memory-record.py --boot "$RUNNER_TEMP/vmmmem-guest" \
+          # from the map: what a running vCPU's stack is made of; and which
+          # allocations grow with each vCPU (VMMGROW lines). A Linux guest
+          # boots on the runner (run 43377614564); should one not, the
+          # lines say how far it came and the step notes it with a warning.
+          if ! python -I ../../tools/windows/vmm-memory-record.py --map "$RUNNER_TEMP/firecracker.map" \
+              --boot "$RUNNER_TEMP/vmmmem-guest" \
               build/cargo_target/release/firecracker.exe 1 2 16; then
             echo "::warning::vmm-memory-record.py --boot: no record of a booted guest on this runner"
           fi
