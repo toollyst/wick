@@ -165,6 +165,8 @@ pub(crate) unsafe fn set_partition_property<T>(
 struct Aligned(WHV_REGISTER_VALUE);
 
 /// Aligned room for `n` register values: on the stack for the usual few.
+/// The stack variant's size is the point (no heap allocation per call).
+#[allow(clippy::large_enum_variant)]
 enum Room {
     Stack([Aligned; 64], usize),
     Heap(Vec<Aligned>),

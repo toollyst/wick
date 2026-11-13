@@ -634,11 +634,12 @@ impl VcpuFd {
             let rflags = super::ffi::as_u64(&super::ffi::get_register(part, vp, whv::WHvX64RegisterRflags)?);
             super::ffi::set_register(part, vp, whv::WHvX64RegisterRflags, super::ffi::reg64(rflags | super::debug::RFLAGS_RF))?;
         }
-        if state.inject_bp && state.window.is_none() {
-            if let Some(w) = self.open_window()? {
-                state.window = Some(w);
-                state.inject_bp = false;
-            }
+        if state.inject_bp
+            && state.window.is_none()
+            && let Some(w) = self.open_window()?
+        {
+            state.window = Some(w);
+            state.inject_bp = false;
         }
         Ok(())
     }
@@ -1398,10 +1399,10 @@ impl VcpuFd {
                     if exit.is_ok() { "an exit" } else { "an error" },
                     w.vector
                 );
-                if let Err(e) = shared.close_window(&w) {
-                    if exit.is_ok() {
-                        return Err(e);
-                    }
+                if let Err(e) = shared.close_window(&w)
+                    && exit.is_ok()
+                {
+                    return Err(e);
                 }
             }
         }
@@ -1604,24 +1605,24 @@ impl VcpuFd {
                     // A page filled between the exit and the check (by the
                     // handler, or for another vCPU) is not reported: the
                     // access re-runs, never as MMIO, which would read zeros.
-                    if libc::wick_uffd::active() {
-                        if let Some(host) = self.shared.inner.host_addr(mem.Gpa) {
-                            // SAFETY: the access-info bitfield overlaps the u32.
-                            let write = super::exit::memory_write(unsafe { mem.AccessInfo.AsUINT32 });
-                            if libc::wick_uffd::fault(host, write) {
-                                ram_retries = 0;
-                                continue;
-                            }
-                            ram_retries += 1;
-                            if ram_retries < 1_000_000 {
-                                std::thread::yield_now();
-                                continue;
-                            }
-                            super::ffi::report(
-                                log::Level::Error,
-                                &format!("whp: guest RAM at {:#x} stays inaccessible", mem.Gpa),
-                            );
+                    if libc::wick_uffd::active()
+                        && let Some(host) = self.shared.inner.host_addr(mem.Gpa)
+                    {
+                        // SAFETY: the access-info bitfield overlaps the u32.
+                        let write = super::exit::memory_write(unsafe { mem.AccessInfo.AsUINT32 });
+                        if libc::wick_uffd::fault(host, write) {
+                            ram_retries = 0;
+                            continue;
                         }
+                        ram_retries += 1;
+                        if ram_retries < 1_000_000 {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        super::ffi::report(
+                            log::Level::Error,
+                            &format!("whp: guest RAM at {:#x} stays inaccessible", mem.Gpa),
+                        );
                     }
                     if let Some(exit) = self.emulate_mmio(&ctx.VpContext, &mem, Vec::new(), scratch)? {
                         return Ok(exit);
@@ -2438,7 +2439,10 @@ pub(crate) fn hold_vcpus(inner: &VmInner, except: Option<u32>) {
     }
 }
 
-/// What an entry into the guest came to ([`VcpuFd::enter`]).
+/// What an entry into the guest came to ([`VcpuFd::enter`]). The exit
+/// context is returned by value, as WHP writes it, rather than boxed: one
+/// entry is made per exit, and a box would be a heap allocation each.
+#[allow(clippy::large_enum_variant)]
 enum Entry {
     Ran(whv::WHV_RUN_VP_EXIT_CONTEXT),
     /// `immediate_exit`: the run returns `EINTR`.
@@ -2530,7 +2534,6 @@ mod bp_tests {
         kvm_guest_debug, kvm_mp_state, kvm_segment, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_INJECT_BP,
         KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP, KVM_MP_STATE_RUNNABLE,
     };
-    use std::sync::atomic::AtomicBool;
 
     const MEM: usize = 4 << 20;
     /// vCPU 0: the guest's own INT3, `out 0x80, al`, a `nop` (where gdb
