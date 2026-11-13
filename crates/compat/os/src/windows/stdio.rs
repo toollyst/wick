@@ -323,6 +323,41 @@ fn write_file(h: HANDLE, buf: &[u8]) -> io::Result<usize> {
     Ok(usize::try_from(n).unwrap_or(usize::MAX))
 }
 
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn NtQueryInformationFile(
+        h: HANDLE,
+        io: *mut [usize; 2],
+        info: *mut std::ffi::c_void,
+        len: u32,
+        class: u32,
+    ) -> i32;
+}
+
+/// The most bytes a non-blocking write to the pipe `h` is taken whole or
+/// not at all: `PIPE_BUF`, or what the pipe holds if that is less, which no
+/// Linux pipe does (fs/pipe.c `round_pipe_size`: at least a page). A
+/// Windows pipe holds exactly the bytes it was made with, the quota of the
+/// queue this end writes to (`FILE_PIPE_LOCAL_INFORMATION`, ntifs.h:
+/// `OutboundQuota` at the server end, `InboundQuota` at the client end;
+/// measured, CI run 43341846250: `CreatePipe` with nSize 512 holds 512
+/// bytes), and refuses whole a write larger than that while no read waits
+/// for it. A handle that cannot be asked (no `FILE_READ_ATTRIBUTES`: the
+/// server end of an outbound named pipe, in the same run) is taken to be
+/// of a pipe that holds a page. The compatibility libc's `write` has the
+/// same rule.
+fn pipe_atom(h: HANDLE) -> usize {
+    let (mut io, mut info) = ([0usize; 2], [0u32; 10]);
+    // SAFETY: a pipe handle and out-buffers of the sizes given (class 24,
+    // FilePipeLocalInformation, 40 bytes).
+    if unsafe { NtQueryInformationFile(h, &mut io, info.as_mut_ptr().cast(), 40, 24) } != 0 {
+        return PIPE_BUF;
+    }
+    // NamedPipeEnd: FILE_PIPE_SERVER_END is 1.
+    let quota = if info[9] == 1 { info[6] } else { info[4] };
+    PIPE_BUF.min(usize::try_from(quota).unwrap_or(usize::MAX))
+}
+
 /// Writes to `h`, a pipe or a file, with Linux's results (see [`Stdout`]).
 pub(crate) fn write_handle(h: HANDLE, buf: &[u8]) -> io::Result<usize> {
     let mut total = write_file(h, buf)?;
@@ -333,11 +368,13 @@ pub(crate) fn write_handle(h: HANDLE, buf: &[u8]) -> io::Result<usize> {
     // A non-blocking pipe that did not take the write (see [`Stdout`]): up
     // to PIPE_BUF bytes that is Linux's result too; a larger write goes in
     // pieces of PIPE_BUF, each taken whole or refused, until one is
-    // refused, as Linux takes what fits page by page.
-    if buf.len() > PIPE_BUF {
+    // refused, as Linux takes what fits page by page. On a pipe that holds
+    // less than PIPE_BUF the pieces are of what it holds (`pipe_atom`).
+    let atom = pipe_atom(h);
+    if buf.len() > atom && atom > 0 {
         while total < buf.len() {
             let rest = &buf[total..];
-            let piece = &rest[..rest.len().min(PIPE_BUF)];
+            let piece = &rest[..rest.len().min(atom)];
             match write_file(h, piece) {
                 // The reader went away meanwhile: the error if nothing was
                 // written, else the count (fs/pipe.c anon_pipe_write, `if
@@ -1080,6 +1117,39 @@ mod tests {
         assert!(held.len() == taken && held.iter().all(|&b| b == 7), "{}", held.len());
         // SAFETY: the reader, ours.
         unsafe { CloseHandle(r) };
+    }
+
+    // A pipe that holds less than a page, which Linux has none of
+    // (CreatePipe with nSize 512 holds 512 bytes, CI run 43341846250): a
+    // write larger than the pipe goes in pieces of what it holds; up to
+    // that, a write is whole or refused.
+    #[test]
+    fn test_a_write_larger_than_a_small_pipe_goes_in_pieces() {
+        let (mut r, mut w): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: two out-pointers to handles.
+        assert_ne!(unsafe { CreatePipe(&mut r, &mut w, std::ptr::null(), 512) }, 0);
+        let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+        // SAFETY: our pipe's write end.
+        assert_ne!(
+            unsafe { SetNamedPipeHandleState(w, &mode, std::ptr::null(), std::ptr::null()) },
+            0
+        );
+        let data = [7u8; 1000];
+        let mut buf = [0u8; 4096];
+        assert_eq!(write_handle(w, &data).unwrap(), 512, "the first piece");
+        let err = write_handle(w, &data).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(WOULD_BLOCK));
+        assert_eq!(read_handle(r, &mut buf).unwrap(), 512);
+        assert_eq!(write_handle(w, &data[..300]).unwrap(), 300);
+        let err = write_handle(w, &data[..300]).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(WOULD_BLOCK), "212 bytes of room");
+        assert_eq!(write_handle(w, &data[..212]).unwrap(), 212);
+        assert_eq!(read_handle(r, &mut buf).unwrap(), 512);
+        // SAFETY: our handles.
+        unsafe {
+            CloseHandle(w);
+            CloseHandle(r);
+        }
     }
 
     // No standard output (a NULL handle: ERROR_INVALID_HANDLE) takes the

@@ -30,6 +30,17 @@
 //!   write that Windows refused whole is written here in pieces of
 //!   `PIPE_BUF` until one is refused, each piece whole, as Linux fills a
 //!   pipe page by page (`test_a_large_write_is_taken_as_far_as_it_fits`).
+//!   With a read waiting at the other end Windows gives it its bytes
+//!   first, and takes the rest whole or not at all (CI run 43341846250: a
+//!   read of 10 waiting on a pipe of 4096, a write of 4106 is taken, of
+//!   4107 only 10), so up to `PIPE_BUF` nothing changes, and the pieces
+//!   go on from what the read took. One difference, in the pipe and not
+//!   in the call: a Windows pipe can hold less than a page, which no Linux
+//!   pipe does (`CreatePipe` with a size under 4096, in the same run), and
+//!   a write of up to `PIPE_BUF` bytes that is larger than such a pipe
+//!   could never be taken whole; it goes in pieces of what the pipe
+//!   holds, so it can be taken in part
+//!   (`test_a_write_larger_than_a_small_pipe_goes_in_pieces`).
 //!   `test_non_blocking_pipe_writes_on_record` prints what `WriteFile`
 //!   takes for each size, room, kind of pipe and with a read waiting;
 //! - `read` on a timerfd returns its expiration count;
@@ -538,6 +549,45 @@ fn write_file(h: HANDLE, buf: *const u8, len: u32, ovp: *mut OVERLAPPED) -> Opti
     Some(n)
 }
 
+#[link(name = "ntdll", kind = "raw-dylib")]
+extern "system" {
+    fn NtQueryInformationFile(
+        h: HANDLE,
+        io: *mut [usize; 2],
+        info: *mut c_void,
+        len: u32,
+        class: u32,
+    ) -> i32;
+}
+
+/// The most bytes a non-blocking write to the pipe `h` is taken whole or
+/// not at all: `PIPE_BUF`, or what the pipe holds if that is less.
+///
+/// A Linux pipe holds at least a page (fs/pipe.c `pipe_set_size`,
+/// `round_pipe_size`: a size is rounded up to whole pages), so a write of
+/// `PIPE_BUF` bytes fits an empty one. A Windows pipe holds exactly the
+/// bytes it was made with, also fewer than 4096 (measured, CI run
+/// 43341846250: `CreatePipe` with nSize 1 holds 1 byte and with 512 holds
+/// 512, a named pipe with buffers of 512 holds 512 and with 0 holds
+/// nothing), and refuses whole a write larger than that for as long as no
+/// read waits for it. What it holds is the quota of the queue this end
+/// writes to (`FILE_PIPE_LOCAL_INFORMATION`, ntifs.h: `OutboundQuota` at
+/// the server end, `InboundQuota` at the client end, by `NamedPipeEnd`).
+/// A handle without `FILE_READ_ATTRIBUTES` cannot be asked (the server end
+/// of an outbound named pipe: STATUS_ACCESS_DENIED in the same run); its
+/// pipe is taken to hold a page, as a Linux pipe does.
+fn pipe_atom(h: HANDLE) -> usize {
+    let (mut io, mut info) = ([0usize; 2], [0u32; 10]);
+    // SAFETY: a pipe handle and out-buffers of the sizes given (class 24,
+    // FilePipeLocalInformation, 40 bytes).
+    if unsafe { NtQueryInformationFile(h, &mut io, info.as_mut_ptr().cast(), 40, 24) } != 0 {
+        return PIPE_BUF;
+    }
+    // NamedPipeEnd: FILE_PIPE_SERVER_END is 1.
+    let quota = if info[9] == 1 { info[6] } else { info[4] };
+    PIPE_BUF.min(quota as usize)
+}
+
 fn write_handle(h: HANDLE, buf: *const c_void, count: usize, at: Option<i64>) -> ssize_t {
     let len = u32::try_from(count).unwrap_or(u32::MAX);
     // SAFETY: an all-zero OVERLAPPED is valid.
@@ -575,11 +625,15 @@ fn write_handle(h: HANDLE, buf: *const c_void, count: usize, at: Option<i64>) ->
     // anon_pipe_write: `if (!ret) ret = -EAGAIN; break;`), never 0. Up to
     // PIPE_BUF that is all or nothing, which Windows has just done. Above
     // it, the write goes in pieces of PIPE_BUF, each taken whole or
-    // refused, until one is refused.
-    if count > PIPE_BUF {
+    // refused, until one is refused. On a pipe that holds less than
+    // PIPE_BUF the pieces are of what it holds, and so is the largest
+    // write that is all or nothing (`pipe_atom`); one that holds nothing
+    // takes only what a waiting read took.
+    let atom = pipe_atom(h);
+    if count > atom && atom > 0 {
         while total < count {
             #[allow(clippy::cast_possible_truncation)]
-            let piece = (count - total).min(PIPE_BUF) as u32;
+            let piece = (count - total).min(atom) as u32;
             // SAFETY: `total < count`: the piece lies in the caller's buffer.
             let rest = unsafe { buf.cast::<u8>().add(total) };
             match write_file(h, rest, piece, std::ptr::null_mut()) {
@@ -1953,17 +2007,6 @@ mod tests {
         (r, w)
     }
 
-    #[link(name = "ntdll", kind = "raw-dylib")]
-    extern "system" {
-        fn NtQueryInformationFile(
-            h: HANDLE,
-            io: *mut [usize; 2],
-            info: *mut c_void,
-            len: u32,
-            class: u32,
-        ) -> i32;
-    }
-
     /// `FILE_PIPE_INFORMATION` of a pipe handle (ntifs.h; class 23 of
     /// `NtQueryInformationFile`): `(ReadMode, CompletionMode)`. A
     /// completion mode of 1 (FILE_PIPE_COMPLETE_OPERATION) is PIPE_NOWAIT.
@@ -2184,6 +2227,35 @@ mod tests {
             assert_eq!(write(fds[1], big.as_ptr().cast(), LEN).unsigned_abs(), taken);
             assert_eq!(close(fds[1]), 0);
             assert_eq!(close(fds[0]), 0);
+        }
+    }
+
+    // A pipe that holds less than a page, which Linux has none of
+    // (fs/pipe.c round_pipe_size: `if (size < PAGE_SIZE) return
+    // PAGE_SIZE;`): CreatePipe with nSize 512 holds 512 bytes (CI run
+    // 43341846250). A write larger than the pipe could never be taken
+    // whole, so it goes in pieces of what the pipe holds; up to that, a
+    // write is whole or EAGAIN, as up to PIPE_BUF on a pipe of a page.
+    #[test]
+    fn test_a_write_larger_than_a_small_pipe_goes_in_pieces() {
+        let (r, w) = raw_pipe(512);
+        set_nowait(w);
+        let (rfd, wfd) = (to_fd(r), to_fd(w));
+        let data = [7u8; 1000];
+        let mut b = [0u8; 4096];
+        // SAFETY: valid buffers and descriptors.
+        unsafe {
+            assert_eq!(write(wfd, data.as_ptr().cast(), 1000), 512, "the first piece");
+            assert_eq!(write(wfd, data.as_ptr().cast(), 1000), -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EAGAIN));
+            assert_eq!(read(rfd, b.as_mut_ptr().cast(), b.len()), 512);
+            assert_eq!(write(wfd, data.as_ptr().cast(), 300), 300);
+            assert_eq!(write(wfd, data.as_ptr().cast(), 300), -1, "212 bytes of room");
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(crate::EAGAIN));
+            assert_eq!(write(wfd, data.as_ptr().cast(), 212), 212);
+            assert_eq!(read(rfd, b.as_mut_ptr().cast(), b.len()), 512);
+            assert_eq!(close(wfd), 0);
+            assert_eq!(close(rfd), 0);
         }
     }
 

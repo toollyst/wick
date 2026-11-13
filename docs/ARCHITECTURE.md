@@ -187,7 +187,9 @@ semantics on Win32. The details are in the comments of each
   Linux takes as far as it fits
   (`test_a_write_that_does_not_fit_takes_nothing`,
   `test_a_large_write_is_taken_as_far_as_it_fits`; the compatibility
-  `write` does the same), keeps std's
+  `write` does the same; on a pipe made to hold less than 4096 bytes, which
+  Linux has none of, the pieces are of what it holds:
+  `test_a_write_larger_than_a_small_pipe_goes_in_pieces`), keeps std's
   1024-byte line buffer so a failed write leaves the same bytes buffered,
   reports a pipe with no reader as `BrokenPipe` with the `SIGPIPE` hook, and
   writes a console with std's writer (`test_a_full_pipe_writes_as_on_linux`,
