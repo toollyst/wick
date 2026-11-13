@@ -228,8 +228,10 @@ the firmware, and nothing else installed: the script is Windows PowerShell 5.1.
 ## What the boot test checks
 
 Every stage that needs a guest boots its own VM; before each guest reset the guest kernel log
-must be free of RCU stalls, soft lockups, hung tasks, BUGs, oopses and
-warnings, and the reset must end Firecracker with exit status 0.
+must be free of RCU stalls, soft lockups, hung tasks, BUGs, oopses,
+`WARN()` reports (`WARNING: CPU:`) and stack dumps (`Call Trace:`), and the reset must end Firecracker
+with exit status 0. A kernel notice that only uses the word (`WARNING: See ...` of SRSO on an
+AMD host) is not a warning of the guest's health.
 
 | Stage | Checks |
 |---|---|

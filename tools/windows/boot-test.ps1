@@ -333,9 +333,18 @@ namespace Wick {
 
         public string Sh(string cmd) { return Sh(cmd, 60000, true); }
 
-        // Fails if the guest kernel logged a stall, a BUG, an oops or a warning.
+        // Fails if the guest kernel logged a stall, a BUG, an oops or a
+        // warning: a WARN()'s report, "WARNING: CPU: <n> PID: <pid> at ..."
+        // (Linux v6.1 kernel/panic.c, __warn), and a stack dump's "Call
+        // Trace:" (arch/x86/kernel/dumpstack.c; arm64's is "Call trace:").
+        // Not any line with "WARNING:" in it: the kernel's own notices use
+        // the word, such as the SRSO one a guest prints on an AMD Zen 3 host
+        // whose IBPB it cannot tell flushes branch types
+        // (arch/x86/kernel/cpu/bugs.c, srso_select_mitigation; the same
+        // under KVM before Linux 6.7, upstream's test_vulnerabilities.py),
+        // which failed 16 stages on CI's EPYC 7763 runner, run 43428124115.
         public void Healthy() {
-            string out1 = Sh("dmesg | grep -E 'rcu: INFO|self-detected stall|soft lockup|hung_task|BUG:|Oops|WARNING:|Call trace' | head -5; true");
+            string out1 = Sh("dmesg | grep -E 'rcu: INFO|self-detected stall|soft lockup|hung_task|BUG:|Oops|WARNING: CPU:|Call Trace:' | head -5; true");
             if (out1.Length > 0) throw new Failure("guest kernel reports:\n    " + out1);
         }
 
@@ -1708,9 +1717,13 @@ function Stage-Boot {
     $dt = $t1 - $t0
     Check ($dt -gt 1.5 -and $dt -le $host_dt + 0.5) ("guest clock advanced {0:N2} s in {1:N2} s (clocksource {2})" -f $dt, $host_dt, $clock)
     Test-SerialInput $vm
+    # Recorded: the guest's view of SRSO (Speculative Return Stack
+    # Overflow, AMD Zen 1 to 4), which its CPUID leaf 0x80000021 and its
+    # write of IA32_PRED_CMD's SBPB decide (arch/x86/kernel/cpu/bugs.c).
+    $srso = $vm.Sh('cat /sys/devices/system/cpu/vulnerabilities/spec_rstack_overflow 2>/dev/null; dmesg | grep -m2 "Speculative Return Stack Overflow" | sed "s/^.*] //"; true')
     Save-Dmesg $vm 'boot'
     $vm.Reboot()
-    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0" -f $dt, $host_dt)
+    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0; SRSO: {2}" -f $dt, $host_dt, (($srso -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | '))
 }
 
 # CPU 1 taken offline and back online three times, then work on it: on x86

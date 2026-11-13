@@ -4175,6 +4175,28 @@ mod fpu_tests {
                  {write:#x}: {wrote}, intercepts {write_came}; KVM_GET_MSRS after {after:x?} (KVM: {kvm})"
             );
         }
+        // SRSO (Linux v6.1.188 arch/x86/kernel/cpu/bugs.c,
+        // srso_select_mitigation; amd.c, cpu_has_ibpb_brtype_microcode): a
+        // family 0x19 guest without IBPB_BRTYPE (leaf 0x80000021 EAX bit 28)
+        // writes SBPB (bit 7) to IA32_PRED_CMD, and a #GP there is "no
+        // microcode" and the WARNING notice. KVM v6.1 refuses that write
+        // (svm.c, svm_set_msr: `data & ~PRED_CMD_IBPB`) and lists neither
+        // bit (cpuid.c); from 6.7 it lists them where its host has them.
+        // What this host's leaf has, and what a guest's write of SBPB and of
+        // IBPB gets. Printed, not asserted.
+        {
+            let max = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+            let eax = if max >= 0x8000_0021 { core::arch::x86_64::__cpuid_count(0x8000_0021, 0).eax } else { 0 };
+            let (sbpb, _) = probe(&mut vcpu, WRMSR_AT, 0x80, 0x49, 0);
+            let (ibpb, _) = probe(&mut vcpu, WRMSR_AT, 0x1, 0x49, 0);
+            eprintln!(
+                "TMPLTEST srso: host leaf 0x80000021 EAX {eax:#x} (max extended leaf {max:#x}; SBPB {}, IBPB_BRTYPE {}, \
+                 SRSO_NO {}); a guest's wrmsr of IA32_PRED_CMD with SBPB: {sbpb}; with IBPB: {ibpb} (KVM v6.1: #GP, taken)",
+                eax >> 27 & 1,
+                eax >> 28 & 1,
+                eax >> 29 & 1
+            );
+        }
         // The VMM's writes and reads of them, which are the backend's own:
         // what KVM's `set_msr_mce` keeps, a refused write ending the call.
         let entries = [(0x400, u64::MAX), (0x401, 0xbe00_0000_0000_0000), (0x402, 0x1234), (0x404, 0x99)];
