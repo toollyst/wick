@@ -3,8 +3,9 @@
 #
 # Scenario tests of wick on Windows (Windows Hypervisor Platform) against
 # upstream Firecracker's x86_64 CI guest; the Windows counterpart of
-# tools/macos/boot-test.py. Every stage boots its own VM and checks what the
-# guest and the host see:
+# tools/macos/boot-test.py. Every stage that needs a guest boots its own VM
+# and checks what the guest and the host see (the parts marked "no guest"
+# below boot none):
 #
 #   boot   1 vCPU: init, serial out and in (stdin is a pipe), CPU, memory,
 #          guest clock, CPUID hypervisor bit; serial input still read after

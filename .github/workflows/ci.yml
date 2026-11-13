@@ -190,9 +190,11 @@ jobs:
       # and the same script checks the same replies on macOS.
       - name: Nitro Enclave refused without the device
         run: python3 -I tools/macos/enclave-refusal-test.py "lib/firecracker/build/cargo_target/$(uname -m)-unknown-linux-musl/release/firecracker"
-      # One snapshot's state file made here, on Linux x86_64: what the macOS
-      # and Windows boot tests' foreign-snapshot stages are given (a state
-      # made on another host OS). The memory file is not kept.
+      # One snapshot's state file made here, on Linux x86_64: what the macos
+      # job's foreign snapshot step (tools/macos/foreign-snapshot-test.py) is
+      # given, a state made on another host OS; boot-test.ps1's
+      # foreign-snapshot stage takes one as -ForeignState, which the windows
+      # job does not run. The memory file is not kept.
       - name: A snapshot's state file for the other hosts' tests
         run: python3 -I tools/linux/make-vmstate.py "lib/firecracker/build/cargo_target/$(uname -m)-unknown-linux-musl/release/firecracker" "$RUNNER_TEMP/boot-test" "$RUNNER_TEMP/vmstate"
       - name: Upload the state file
