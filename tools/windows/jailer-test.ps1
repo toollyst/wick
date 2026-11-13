@@ -57,6 +57,19 @@ function Stop-Jailed {
     Get-Process jailer -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 
+# Ends the jailers a stage started and still runs: their jailed processes
+# first, after which each jailer exits by itself and removes its jail's drive
+# (`unmap_at_exit`); one still running after 10 s is killed, and the drive
+# it leaves is reported by the end's `drives` check. Killing a jailer first
+# left its drive mapped for the logon session (run 43428124115's parent
+# stage: Y: and Z:).
+function Stop-Jailers([object[]]$jailers) {
+    Get-Process firecracker, jail-probe -ErrorAction SilentlyContinue | Stop-Process -Force
+    foreach ($j in $jailers) {
+        if ($j -and -not $j.WaitForExit(10000)) { $j.Kill() }
+    }
+}
+
 # A fresh chroot base for a stage.
 function New-Base([string]$name) {
     $b = Join-Path $WorkDir $name
@@ -73,7 +86,7 @@ function Invoke-Jailer([string[]]$argv, [int]$ms = 20000) {
     # Holding the process handle keeps its exit code (else ExitCode is empty
     # once it has exited).
     $null = $p.Handle
-    if (-not $p.WaitForExit($ms)) { $p.Kill(); throw [Failure]::new("jailer did not exit: $line") }
+    if (-not $p.WaitForExit($ms)) { Stop-Jailers @($p); throw [Failure]::new("jailer did not exit: $line") }
     @($p.ExitCode, ((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join ''))
 }
 
@@ -399,11 +412,9 @@ function Stage-Parent {
         Check ($r[0] -eq 0 -and $r[1] -match 'affinity:0 allowed') "a jail given a parent whose name a jailed process used in the session's namespace did not start: exit $($r[0]): $($r[1])"
         "a parent of 256 MiB on processor 0 (jail-parent): a jail under a level of 100 MiB under it stopped after $level MiB, on processor 0; the tool refused a cgroup v1 level on processor 1 and a change of the parent's processors; the first jail took 200 MiB and ran on processor 0 of the 0-1 it asked for; the second stopped after $second MiB; cgroup v1 refused processor 1; with the tool ended, a jail joining the parent stopped after $joined MiB; a jailed process and the parents' namespace: $reach; a job of a parent's name in the session's namespace: $made, and a jail given that parent started"
     } finally {
+        Stop-Jailers @($first, $squat)
         if (-not $holder.HasExited) { $holder.Kill() }
-        if ($first -and -not $first.HasExited) { $first.Kill() }
-        if ($squat -and -not $squat.HasExited) { $squat.Kill() }
         if ($inner -and -not $inner.HasExited) { $inner.Kill() }
-        Get-Process jail-probe -ErrorAction SilentlyContinue | Stop-Process -Force
     }
 }
 
@@ -438,8 +449,7 @@ function Stage-Weight([int]$Seconds = 6) {
         Check ($ratio -ge 0.3 -and $ratio -le 0.7) ("cpu.weight 50 against 100 on one processor: {0:N2} s against {1:N2} s of CPU (ratio {2:N2}; Linux gives 0.5)" -f $cpu[50], $cpu[100], $ratio)
         "cpu.weight=50 and 100 on one processor: Windows weights 2 and 5, {0:N2} s against {1:N2} s of CPU in {2} s (ratio {3:N2}; Linux gives 0.5)" -f $cpu[50], $cpu[100], $Seconds, $ratio
     } finally {
-        foreach ($r in $runs) { if (-not $r.P.HasExited) { $r.P.Kill() } }
-        Get-Process jail-probe -ErrorAction SilentlyContinue | Stop-Process -Force
+        Stop-Jailers @($runs | ForEach-Object { $_.P })
     }
 }
 
