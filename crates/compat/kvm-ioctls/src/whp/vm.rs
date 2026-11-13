@@ -34,6 +34,9 @@ thread_local! {
     /// The local APIC emulation mode a record test's VM is made with on
     /// this thread, in place of xAPIC (`test_an_x2apic_partition_on_record`).
     pub(crate) static APIC_MODE_FOR_TESTS: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    /// The MSRs a record test's VM made on this thread has in its MSR
+    /// action list, both actions Exit (`test_an_x2apic_partition_on_record`).
+    pub(crate) static MSR_ACTIONS_FOR_TESTS: std::cell::Cell<&'static [u32]> = const { std::cell::Cell::new(&[]) };
 }
 use super::guest_mem::{self, Slot};
 use super::irqchip::{Irqchip, MsiRoutes};
@@ -701,6 +704,31 @@ fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
                 whv::WHvPartitionPropertyCodeLocalApicEmulationMode,
                 &apic_mode,
             )?;
+        }
+        #[cfg(test)]
+        {
+            let entries: Vec<whv::WHV_MSR_ACTION_ENTRY> = MSR_ACTIONS_FOR_TESTS
+                .get()
+                .iter()
+                .map(|&index| whv::WHV_MSR_ACTION_ENTRY {
+                    Index: index,
+                    ReadAction: whv::WHvMsrActionExit as u8,
+                    WriteAction: whv::WHvMsrActionExit as u8,
+                    Reserved: 0,
+                })
+                .collect();
+            if !entries.is_empty() {
+                // SAFETY: the entries, of the size passed.
+                let hres = unsafe {
+                    whv::WHvSetPartitionProperty(
+                        part,
+                        whv::WHvPartitionPropertyCodeMsrActionList,
+                        entries.as_ptr().cast(),
+                        u32::try_from(std::mem::size_of_val(entries.as_slice())).unwrap(),
+                    )
+                };
+                ffi::hr_of("WHvSetPartitionProperty(MsrActionList)", hres, String::new)?;
+            }
         }
         // Exit on CPUID and MSR accesses so the backend can answer them
         // (X64CpuidExit | X64MsrExit), and on hypercalls (HypercallExit), so

@@ -5290,7 +5290,12 @@ mod fpu_tests {
     /// RDMSR and WRMSR of the x2APIC ID, EOI and LVT timer MSRs, with
     /// APIC_BASE.EXTD clear and after the guest's write of EXTD came to the
     /// backend through the `ApicBaseMsrWrite` exit (x2APIC mode kept by the
-    /// backend: the B plan's option C).
+    /// backend: the B plan's option C). Then, on an x2APIC partition whose
+    /// MSR action list holds the LVT timer (0x832) and the initial count
+    /// (0x838), both actions Exit (the B plan's option B): who answers the
+    /// guest's RDMSR and WRMSR of them, the TSC-deadline mode write among
+    /// them, and of EOI and TDCR, left out of the list; and how much more a
+    /// WRMSR the list traps takes than one WHP answers, over a guest loop.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_an_x2apic_partition_on_record() {
@@ -5393,6 +5398,127 @@ mod fpu_tests {
             drop(vm);
             // SAFETY: the test's mapping, no VM left using it.
             assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+        {
+            // Option B's question: MSRACTION took 0x832, 0x838 and 0x80b in an
+            // x2APIC partition's MSR action list on the PC (43832df). With the
+            // LVT timer (0x832) and the initial count (0x838) in the list,
+            // both actions Exit, who answers a guest's RDMSR and WRMSR of
+            // them, the TSC-deadline mode write WHP's x2APIC refuses with #GP
+            // among them, and what a WRMSR the list traps costs against one
+            // WHP answers (TDCR, 0x83e). EOI (0x80b) is left out: Linux writes
+            // it at the end of every interrupt, which an exit would slow.
+            const LOOP_AT: u64 = 0x7900;
+            const ROUNDS: u32 = 1000;
+            super::super::vm::APIC_MODE_FOR_TESTS.set(Some(whv::WHvX64LocalApicEmulationModeX2Apic));
+            super::super::vm::MSR_ACTIONS_FOR_TESTS.set(&[0x832, 0x838]);
+            let made = super::super::VmFd::create();
+            super::super::vm::MSR_ACTIONS_FOR_TESTS.set(&[]);
+            super::super::vm::APIC_MODE_FOR_TESTS.set(None);
+            match made {
+                Err(e) => eprintln!(
+                    "X2APICREC listed: the x2APIC partition with 0x832 and 0x838 in its MSR action list is not made: errno {} \
+                     (the whp: line above has the HRESULT)",
+                    e.errno()
+                ),
+                Ok(vm) => {
+                    let m = guest();
+                    probes(m);
+                    let region = kvm_bindings::kvm_userspace_memory_region {
+                        slot: 0,
+                        flags: 0,
+                        guest_phys_addr: 0,
+                        memory_size: MEM as u64,
+                        userspace_addr: m as u64,
+                    };
+                    // SAFETY: the memory stays mapped while the VM has it.
+                    unsafe { vm.set_user_memory_region(region) }.unwrap();
+                    let mut vcpu = vm.create_vcpu(0).unwrap();
+                    vcpu.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
+                    start(&vcpu);
+                    let mut s = vcpu.get_sregs().unwrap();
+                    (s.idt.base, s.idt.limit) = (IDT, 16 * 14 - 1);
+                    vcpu.set_sregs(&s).unwrap();
+                    let came = || MSR_INTERCEPTS.with(std::cell::Cell::get);
+                    let msr = |vcpu: &mut VcpuFd, index: u32, write: Option<u64>| -> String {
+                        let before = came();
+                        let (at, rax, rdx) = match write {
+                            Some(v) => (WRMSR_AT, v & 0xFFFF_FFFF, v >> 32),
+                            None => (RDMSR_AT, 0, 0),
+                        };
+                        vcpu.set_regs(&kvm_regs { rip: at, rsp: 0x9000, rflags: 2, rax, rcx: u64::from(index), rdx, ..Default::default() })
+                            .unwrap();
+                        let how = match run_to_a_line(vcpu).as_str() {
+                            "exit IoOut port 0x80" => "done".to_string(),
+                            "exit IoOut port 0x8d" => "#GP".to_string(),
+                            "exit IoOut port 0x86" => "#UD".to_string(),
+                            other => format!("ended by {other}"),
+                        };
+                        let r = vcpu.get_regs().unwrap();
+                        let by = if came() > before { "the backend (an MSR exit)" } else { "WHP" };
+                        match write {
+                            Some(v) => format!("WRMSR {index:#x} of {v:#x}: {how}, answered by {by}"),
+                            None => format!("RDMSR {index:#x}: {how}, {:#x}, answered by {by}", (r.rdx << 32) | (r.rax & 0xFFFF_FFFF)),
+                        }
+                    };
+                    for (index, write) in [
+                        (0x1Bu32, None),
+                        (0x1B, Some(0xFEE0_0D00u64)),
+                        (0x1B, None),
+                        (0x832, None),
+                        (0x832, Some(0x4_0041)),
+                        (0x832, None),
+                        (0x832, Some(0x1_0041)),
+                        (0x832, None),
+                        (0x838, None),
+                        (0x838, Some(0x1000)),
+                        (0x838, None),
+                        (0x839, None),
+                        (0x80B, Some(0)),
+                        (0x83E, Some(0xB)),
+                        (0x83E, None),
+                    ] {
+                        eprintln!("X2APICREC listed: {}", msr(&mut vcpu, index, write));
+                    }
+                    // `mov ebx, ROUNDS; 1: mov ecx, index; mov eax, value;
+                    // xor edx, edx; wrmsr; dec ebx; jnz 1b; out PORT, al; jmp $`
+                    let timed = |vcpu: &mut VcpuFd, index: u32, value: u32| -> (f64, u64, String) {
+                        let mut code = vec![0xBB];
+                        code.extend_from_slice(&ROUNDS.to_le_bytes());
+                        code.push(0xB9);
+                        code.extend_from_slice(&index.to_le_bytes());
+                        code.push(0xB8);
+                        code.extend_from_slice(&value.to_le_bytes());
+                        code.extend_from_slice(&[0x31, 0xD2, 0x0F, 0x30, 0xFF, 0xCB, 0x75, 0xEE, 0xE6, PORT as u8, 0xEB, 0xFE]);
+                        put(m, LOOP_AT, &code);
+                        let mut best = f64::MAX;
+                        let mut exits = 0;
+                        let mut end = String::new();
+                        for _ in 0..5 {
+                            vcpu.set_regs(&kvm_regs { rip: LOOP_AT, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+                            let before = came();
+                            let t = std::time::Instant::now();
+                            end = run_to_a_line(vcpu);
+                            let us = t.elapsed().as_secs_f64() * 1e6 / f64::from(ROUNDS);
+                            exits = came() - before;
+                            best = best.min(us);
+                        }
+                        (best, exits, end)
+                    };
+                    let (listed, listed_exits, listed_end) = timed(&mut vcpu, 0x832, 0x1_0041);
+                    let (whp, whp_exits, whp_end) = timed(&mut vcpu, 0x83E, 0xB);
+                    eprintln!(
+                        "X2APICREC listed: {ROUNDS} WRMSRs in a guest loop, the least of 5 runs: of 0x832 (listed) {listed:.3} us each, \
+                         {listed_exits} MSR exits, {listed_end}; of 0x83e (WHP's) {whp:.3} us each, {whp_exits} MSR exits, {whp_end}; \
+                         a listed WRMSR costs {:.3} us more",
+                        listed - whp
+                    );
+                    drop(vcpu);
+                    drop(vm);
+                    // SAFETY: the test's mapping, no VM left using it.
+                    assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+                }
+            }
         }
         const VECTOR: u32 = 0x41;
         const HANDLER: u64 = 0x7A00;
