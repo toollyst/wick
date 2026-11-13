@@ -2212,11 +2212,11 @@ function Get-NetMetricsSince([string]$path, [long]$from) {
         $fs.Seek($from, 'Begin') | Out-Null
         $text = (New-Object IO.StreamReader($fs)).ReadToEnd()
     } finally { $fs.Close() }
-    $sum = [ordered]@{ lines = 0; tx_queue_event_count = 0; tx_packets_count = 0; tx_bytes_count = 0; no_tx_avail_buffer = 0; tx_rate_limiter_throttled = 0; tx_fails = 0; tap_write_us = 0 }
+    $sum = [ordered]@{ lines = 0; tx_queue_event_count = 0; tx_packets_count = 0; tx_bytes_count = 0; no_tx_avail_buffer = 0; tx_rate_limiter_throttled = 0; tx_fails = 0; tap_write_fails = 0; tap_write_us = 0 }
     foreach ($m in (Get-MetricsLines $text)) {
         if ($null -eq $m.net) { continue }
         $sum['lines'] += 1
-        foreach ($k in @('tx_queue_event_count', 'tx_packets_count', 'tx_bytes_count', 'no_tx_avail_buffer', 'tx_rate_limiter_throttled', 'tx_fails')) { $sum[$k] += [long]$m.net.$k }
+        foreach ($k in @('tx_queue_event_count', 'tx_packets_count', 'tx_bytes_count', 'no_tx_avail_buffer', 'tx_rate_limiter_throttled', 'tx_fails', 'tap_write_fails')) { $sum[$k] += [long]$m.net.$k }
         $sum['tap_write_us'] += [long]$m.net.tap_write_agg.sum_us
     }
     return $sum
@@ -2242,7 +2242,10 @@ function Get-NetMetricsSince([string]$path, [long]$from) {
 # same send (a FlushMetrics before it and one after): the TX queue events
 # it handled (each a wake of its event loop for one guest notification or
 # more), the packets and bytes it wrote, the time those writes took, and
-# its no-buffer, throttle and failure counts. Packets to an event and
+# its no-buffer, throttle and failure counts (tx_fails: a descriptor chain
+# that did not load; tap_write_fails: a write the interface refused, the
+# frame then dropped: device.rs, process_tx and write_to_mmds_or_tap).
+# Packets to an event and
 # device interrupts to a packet tell a guest that notifies and is
 # interrupted once a packet (each notification an MMIO exit) from one that
 # batches.
@@ -2287,8 +2290,8 @@ function Get-NetTxRate($vm, $switch, [int]$total = 3MB, [string]$metrics = '') {
             $(if ([long]$f[8] -ge 0 -and [long]$f[9] -ge 0) { '{0:N0}' -f ([long]$f[9] - [long]$f[8]) } else { 'none found' }),
             $sink.Count, $got, ($secs * 1e3), ($maxGap * 1e3 / $hz), $longGaps, ($longTicks * 1e3 / $hz)
         if ($null -ne $vmm) {
-            $line += '; VMM over {0} metrics lines: {1:N0} TX queue events, {2:N0} packets and {3:N0} bytes written in {4:N1} ms, {5:N0} without a buffer, {6:N0} throttled, {7:N0} failed' -f `
-                $vmm.lines, $vmm.tx_queue_event_count, $vmm.tx_packets_count, $vmm.tx_bytes_count, ($vmm.tap_write_us / 1e3), $vmm.no_tx_avail_buffer, $vmm.tx_rate_limiter_throttled, $vmm.tx_fails
+            $line += '; VMM over {0} metrics lines: {1:N0} TX queue events, {2:N0} packets and {3:N0} bytes written in {4:N1} ms, {5:N0} without a buffer, {6:N0} throttled, {7:N0} descriptor chains that failed to load, {8:N0} writes that failed' -f `
+                $vmm.lines, $vmm.tx_queue_event_count, $vmm.tx_packets_count, $vmm.tx_bytes_count, ($vmm.tap_write_us / 1e3), $vmm.no_tx_avail_buffer, $vmm.tx_rate_limiter_throttled, $vmm.tx_fails, $vmm.tap_write_fails
         }
         Write-Host $line
     } else {
