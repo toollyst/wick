@@ -170,7 +170,7 @@ index 1db4f31ff0acbbb65306184e94bb98774e1e4242..5d27c6e8798149124151b4646a11bede
      #[cfg(test)]
      Test(PartialSink),
 diff --git a/src/vmm/src/signal_handler.rs b/src/vmm/src/signal_handler.rs
-index b123031161ac5137b9bbeb6408d18df78cd9e9c2..54dbc9d8d87d228befc9f67c6ecc336f57d02b4e 100644
+index 7d9ca61344ca3479a1e3d400b6cbbd2fa0368865..06ab9dafbd83a539e3d9fd6be06b6859d9e81eb1 100644
 --- a/src/vmm/src/signal_handler.rs
 +++ b/src/vmm/src/signal_handler.rs
 @@ -24,6 +24,8 @@ fn exit_with_code(exit_code: FcExitCode) {

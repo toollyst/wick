@@ -298,7 +298,7 @@ all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinu
 # test_default_seccomp_level read `Seccomp:` from /proc/<tid>/status, which
 # macOS has not ("No such file or directory"). macOS's filter is a Seatbelt
 # profile, tested by the sandbox's own tests (test_narrowing_is_one_way,
-# test_unlisted_syscalls_raise_sigsys). The seccomp demos'
+# test_unlisted_syscalls_are_denials). The seccomp demos'
 # test_seccomp_rust_panic failed at seccompiler-bin too: its demo never ran.
 all impossible integration_tests/security/test_custom_seccomp.py
 all impossible integration_tests/security/test_seccomp.py

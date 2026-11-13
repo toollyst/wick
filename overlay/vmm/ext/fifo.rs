@@ -864,9 +864,7 @@ mod macos {
                     // A handler that returns (the end deferred, or left to
                     // an earlier signal's) disturbs no system call.
                     act.sa_flags = libc::SA_RESTART;
-                    // The three block one another, and nothing else: not
-                    // SIGSYS, which the first thread keeps taking
-                    // (`ext::sandbox`).
+                    // The three block one another, and nothing else.
                     for other in SIGNALS {
                         libc::sigaddset(&mut act.sa_mask, other);
                     }
@@ -1236,7 +1234,7 @@ mod macos {
         /// faulting thread reach upstream's handlers here as on any thread
         /// (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP; SIGABRT for a panic's
         /// abort). Every other signal is blocked, so that one sent to the
-        /// process (upstream's SIGXCPU, SIGHUP, the sandbox's SIGSYS: xnu
+        /// process (upstream's SIGXCPU, SIGHUP, another process's SIGSYS: xnu
         /// bsd/kern/kern_sig.c `get_signalthread` takes the first thread
         /// that does not block it) runs its handler on a thread of
         /// Firecracker's own, not on this one while it holds an overflow's
@@ -2214,7 +2212,7 @@ pub(crate) mod tests {
     // for. Here Firecracker's side leaves its log FIFO full with an
     // overflow behind it and its reader reading nothing, forks as the
     // split does, and the fork takes the API profile and drains: it ends 0,
-    // not by SIGSYS, and wrote nothing of Firecracker's.
+    // not by the sandbox's kill, and wrote nothing of Firecracker's.
     #[cfg(target_os = "macos")]
     #[test]
     fn test_the_api_process_drain_waits_for_nothing() {

@@ -39,7 +39,7 @@
 0037-windows-the-jailer-tells-its-backend-whether-no-file.patch
 0038-windows-the-gdb-feature-builds-the-WHP-backend-s-gue.patch
 0039-macos-a-drive-on-a-block-device-has-the-device-s-siz.patch
-0040-macos-SIGSYS-s-handler-runs-on-a-thread-of-its-own.patch
+0040-macos-SIGSYS-s-handler-leaves-the-kernel-s-own-SIGSY.patch
 0041-windows-a-read-only-drive-syncs-as-fsync-on-Linux.patch
 0042-windows-the-dirty-dump-tests-write-in-hole-units-as-.patch
 0043-windows-the-compatibility-kvm-ioctls-logs-through-Fi.patch

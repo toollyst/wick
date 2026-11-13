@@ -573,13 +573,16 @@ jobs:
           sw_vers
           python3 -I ../../tools/macos/watchdog.py 600 --out "$RUNNER_TEMP/watchdog" -- \
             cargo test --locked -p vmm --lib "ext::sandbox" -- \
-            --skip ext::sandbox::macos::tests::test_sigsys_handler_work_ends_the_process_within_its_deadline \
+            --skip ext::sandbox::macos::tests::test_a_denied_call_never_returns_to_its_thread \
             --skip ext::sandbox::macos::tests::test_system_socket_is_not_consulted_for_these
-          # Alone and with --nocapture, so its stages and their distribution
-          # (SIGSYS_DEADLINE's measurement) are in the log, passing or not.
-          python3 -I ../../tools/macos/watchdog.py 180 --out "$RUNNER_TEMP/watchdog" -- \
+          # Alone and with --nocapture, so each kind of call's count of kills
+          # and of returns is in the log, passing or not: wick's denials rest
+          # on Seatbelt's SIGKILL action ending a process inside the call, on
+          # every major. Its 600 kills wait on the crash reporter (30 s per 200
+          # at load average 30 on macOS 27.2), hence the limit.
+          python3 -I ../../tools/macos/watchdog.py 900 --out "$RUNNER_TEMP/watchdog" -- \
             cargo test --locked -p vmm --lib \
-            ext::sandbox::macos::tests::test_sigsys_handler_work_ends_the_process_within_its_deadline \
+            ext::sandbox::macos::tests::test_a_denied_call_never_returns_to_its_thread \
             -- --exact --nocapture
           # Which socket families Seatbelt consults system-socket for, alone
           # and with --nocapture so that each major's findings are in the log.
@@ -587,10 +590,11 @@ jobs:
             cargo test --locked -p vmm --lib \
             ext::sandbox::macos::tests::test_system_socket_is_not_consulted_for_these \
             -- --exact --nocapture
-      # A probe, not a check of wick: whether Seatbelt's SIGKILL action ends a
-      # process inside the denied call on this major, as macOS 27.2 measured
-      # (tools/macos/seatbelt-kill-probe.py), for the choice of how a denied
-      # call ends Firecracker. It prints and never decides the job.
+      # Seatbelt's SIGKILL action alone, with a one-rule profile and no wick
+      # code (tools/macos/seatbelt-kill-probe.py): if the test above fails on
+      # a major, this tells a change in Seatbelt from a change in wick. Run
+      # 43497862443 (87d0328) passed it on macOS 15 and 26. It prints and
+      # never decides the job; the test above does.
       - name: Seatbelt SIGKILL action probe
         if: success() || failure()
         continue-on-error: true
@@ -606,7 +610,7 @@ jobs:
           for i in $(seq 20); do
             python3 -I ../../tools/macos/watchdog.py 120 --out "$RUNNER_TEMP/watchdog" -- \
               cargo test --locked -q -p vmm --lib \
-              ext::sandbox::macos::tests::test_api_profile_raises_sigsys_outside_its_list -- --exact \
+              ext::sandbox::macos::tests::test_api_profile_denies_outside_its_list -- --exact \
               > "$RUNNER_TEMP/api-profile-$i.log" 2>&1 || { failed=$((failed + 1)); cat "$RUNNER_TEMP/api-profile-$i.log"; }
           done
           echo "$failed of 20 runs failed"
@@ -627,11 +631,11 @@ jobs:
             cargo test --locked -p vmm --lib "ext::api_process" -- --test-threads=1
       # What the sandbox denied the test processes (vmm-<hash>), for a
       # failure above: the kernel reports a denied call by its number
-      # ("deny(1) syscall-unix 117"), SIGSYS or not. All of the lines: the
+      # ("deny(1) syscall-unix 117"), killed or not. All of the lines: the
       # last 300 began after the failing test's process (run 1866e32, whose
-      # tests of every number leave one line a process). A test of a
-      # process that should have had no denied call prints the call itself
-      # (sandbox.rs `diagnose_sigsys`).
+      # tests of every number leave one line a process). A test process that
+      # a denial killed, but should have had none, is named only here: the
+      # kill leaves it no way to print the call.
       - name: Sandbox reports
         if: failure()
         run: |

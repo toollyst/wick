@@ -759,7 +759,7 @@ impl Tap {
             Target::Vmnet(_) if crate::ext::sandbox::narrowed() => {
                 // A vmnet start makes setup's calls (a pipe, the lookup of
                 // NetworkSharing, the root daemon behind vmnet, over XPC),
-                // which the narrowed sandbox raises SIGSYS for: refused before
+                // which the narrowed sandbox denies: refused before
                 // any of them, so the API reports it and the microVM runs on
                 // (sandbox::tests::test_vmnet_hotplug_after_narrow_is_refused).
                 return Err(TapError::Backend(

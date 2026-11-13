@@ -627,7 +627,7 @@ it means layer 1 let the request through.
 7. **Sandbox checks of wick-fsd:**
    - Linux: `/proc/<pid>/status` (`Seccomp: 2`, `NoNewPrivs: 1`, `CapEff: 0`), `/` = the share, an open of an outside
      path fails;
-   - macOS: a profile test like `test_unlisted_syscalls_raise_sigsys`, plus `/.vol` and firmlink-alias opens denied;
+   - macOS: a profile test like `test_unlisted_syscalls_are_denials`, plus `/.vol` and firmlink-alias opens denied;
    - Windows: `TokenIsLessPrivilegedAppContainer`, Job limits, `GetProcessMitigationPolicy`, outside open and
      open-by-id → `ACCESS_DENIED`;
    - all hosts: the server refuses to start when any control cannot be installed (one test per control).

@@ -58,9 +58,9 @@ pub use macos::{
     API_FCNTL_COMMANDS, API_MACH_TRAPS, API_MIG_ROUTINES, API_SYSCALLS, FCNTL_COMMANDS,
     ABSENT, EXCEPTION_MIG_ROUTINES, FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MEASURED_MAJORS, MIG_ROUTINES,
     PROFILE, RUN_DENIED_OPERATIONS, SETUP_MIG_ROUTINES_IF_DEFINED, SYSCALLS, Skip,
-    SIGSYS_DEADLINE, SigsysHandler, UNFILTERED_SYSCALLS, api_profile, apply, apply_api, narrowed,
+    SigsysHandler, UNFILTERED_SYSCALLS, api_profile, apply, apply_api, narrowed,
     denied_elsewhere, denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select,
-    selected, set_sigsys_handler, set_sigsys_report,
+    selected, set_sigsys_handler,
 };
 
 /// Narrows the sandbox to what a running microVM needs, for good. Called
@@ -102,7 +102,7 @@ mod macos {
     use std::ffi::{CStr, c_char};
     use std::path::Path;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::{Policy, SandboxError};
 
@@ -110,8 +110,12 @@ mod macos {
     /// ([`FILES_ANYWHERE`], or [`files_in_jail`] when the jailer started
     /// Firecracker).
     pub const PROFILE: &str = r#"(version 1)
-; Whatever no rule below allows raises SIGSYS, on which Firecracker exits as
-; for a seccomp violation, except what DENIED_WITH_ERROR lists (default_rule).
+; Whatever no rule below allows is a denial, except what DENIED_WITH_ERROR
+; lists (default_rule): the kernel kills the process inside the denied call
+; (the action SIGKILL), where upstream's filters trap the call and its SIGSYS
+; handler exits with the bad-syscall code. Seatbelt has no action that stops
+; the calling thread alone, and a signal to the process (as SIGSYS was) let
+; that thread run on with the call failed (docs/COMPATIBILITY.md).
 (deny default)
 ; Unix sockets only: API server, vsock backends, console. Binding one is
 ; setup's (RUN_DENIED_OPERATIONS), as on Linux the VMM thread's filter has no
@@ -126,35 +130,40 @@ mod macos {
 ; proc_listallpids of another process succeed), so it is denied here: it
 ; fails with an error, as /proc/<pid> of another process is not there in a
 ; Linux jail (no /proc in the chroot, nor the pid in its PID namespace). A
-; signal to another process raises SIGSYS (the default rule), as kill is in
-; none of upstream's filters.
+; signal to another process is a denial (the default rule), as kill is in
+; none of upstream's filters. Firecracker's children, the API process, are
+; its own: it reads how the API process ended (its exit reason, which only
+; the parent may read: xnu bsd/kern/proc_info.c `proc_pidexitreasoninfo`),
+; as on Linux the API thread is Firecracker's own.
 (allow signal (target self))
 (deny process-info*)
 (allow process-info* (target self))
+(allow process-info-pidinfo (target children))
 ; No code mapped in: upstream's filters trap mmap and mprotect asking for
-; PROT_EXEC. A file mapped executable and a MAP_JIT mapping raise SIGSYS here
+; PROT_EXEC. A file mapped executable and a MAP_JIT mapping are denials here
 ; (without the explicit rule Seatbelt lets a file under /usr/lib be mapped
 ; executable); an anonymous mapping is the compatibility libc's check
-; (libc::wick_mm), turned on by narrow().
-(deny file-map-executable (with send-signal SIGSYS))
-(deny dynamic-code-generation (with send-signal SIGSYS))
+; (libc::wick_mm), turned on by narrow(), which ends the process by a denied
+; call (DENIED_CALL_RULE).
+(deny file-map-executable (with send-signal SIGKILL))
+(deny dynamic-code-generation (with send-signal SIGKILL))
 ; System calls: only those in SYSCALLS, Mach traps: only those in MACH_TRAPS,
 ; kernel MIG routines: only those in MIG_ROUTINES, and the kernel's own
-; message for a thread's fault (EXCEPTION_MIG_ROUTINES). Any other one fails and
-; raises SIGSYS, on which Firecracker exits as for a seccomp violation
-; (upstream's filters trap, and its SIGSYS handler exits with the bad-syscall
-; code).
-(deny syscall-unix (with send-signal SIGSYS))
-(deny syscall-mach (with send-signal SIGSYS))
-(deny syscall-mig (with send-signal SIGSYS))
+; message for a thread's fault (EXCEPTION_MIG_ROUTINES). Any other one is a
+; denial, a number the kernel has no call for too (xnu bsd/dev/arm/
+; systemcalls.c `unix_syscall` checks such a number as SYS_invalid, which no
+; list has), as upstream's filters trap a number they do not list.
+(deny syscall-unix (with send-signal SIGKILL))
+(deny syscall-mach (with send-signal SIGKILL))
+(deny syscall-mig (with send-signal SIGKILL))
 ; Two phases, as upstream's filters have: setup, until the microVM is built
 ; (on Linux the VMM thread runs unfiltered until then), and run. What only
 ; setup needs is allowed until the process holds the narrowed extension,
 ; which narrow() takes. Then it cannot be undone: no extension can be issued,
 ; and the Sandbox call that takes one (mac-syscall 6) and every other
-; mac-syscall raise SIGSYS; none releases one.
+; mac-syscall are denials; none releases one.
 (deny generic-issue-extension)
-(deny system-mac-syscall (with send-signal SIGSYS))
+(deny system-mac-syscall (with send-signal SIGKILL))
 (allow system-mac-syscall (require-all (mac-policy-name "Sandbox") (mac-syscall-number 6)
     (require-not (extension "com.toollyst.wick.narrowed"))))
 "#;
@@ -258,19 +267,19 @@ mod macos {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Limit {
         /// No rule allows the operation the call makes, so the rule on its
-        /// number decides: it is in none of the lists, and raises SIGSYS.
+        /// number decides: it is in none of the lists, and is a denial.
         Number,
         /// The rule of this operation (or these, space separated): a call
-        /// it denies raises SIGSYS.
+        /// it denies is a denial (the kernel's kill).
         Signal(&'static str),
         /// The rule of this operation: a call it denies fails with `EPERM`,
         /// as a path outside the chroot or another process's `/proc` entry
         /// does on Linux.
         Error(&'static str),
-        /// No rule allows what it asks for, and the default rule raises
-        /// SIGSYS; no single operation's rule lifts it (measured for `link`:
-        /// with files, and every other class of operation, allowed, it still
-        /// raises SIGSYS; only `(allow default)` lets it run).
+        /// No rule allows what it asks for, and the default rule denies it;
+        /// no single operation's rule lifts it (measured for `link`: with
+        /// files, and every other class of operation, allowed, it is still
+        /// denied; only `(allow default)` lets it run).
         Default,
         /// Allowed after narrowing, as the rule of upstream's filters named
         /// allows it, with no argument checked there (descriptors are opened
@@ -523,7 +532,7 @@ mod macos {
     /// listed ("deny(1) syscall-mig 53", CI run 43396747298, 15.8.2): the
     /// message fails, the thread goes back to the instruction
     /// (`thread_exception_return`) and faults again (hundreds of reports for
-    /// one process), and the process gets the denial's SIGSYS in place of
+    /// one process), and the process gets the denial's kill in place of
     /// SIGSEGV, SIGBUS or SIGTRAP. macOS 26 and 27 do not consult the filter
     /// for it (the same tests pass without the allowance). On Linux the
     /// kernel raises a fault's signal with no call a filter sees.
@@ -554,7 +563,8 @@ mod macos {
     /// and the fault and trap cases of
     /// `test_the_other_ends_are_unchanged_without_a_denied_call` pass with it
     /// (CI run 43403250054, macos-15, 15.8.2), and would fail if a fault
-    /// still ended by SIGSYS, the name being unknown or not the routine denied.
+    /// still ended by the sandbox's kill, the name being unknown or not the
+    /// routine denied.
     fn exception_rule() -> String {
         EXCEPTION_MIG_ROUTINES
             .iter()
@@ -678,13 +688,13 @@ mod macos {
 (allow signal (target self))
 (deny process-info*)
 (allow process-info* (target self))
-(deny file-map-executable (with send-signal SIGSYS))
-(deny dynamic-code-generation (with send-signal SIGSYS))
-(deny syscall-unix (with send-signal SIGSYS))
-(deny syscall-mach (with send-signal SIGSYS))
-(deny syscall-mig (with send-signal SIGSYS))
+(deny file-map-executable (with send-signal SIGKILL))
+(deny dynamic-code-generation (with send-signal SIGKILL))
+(deny syscall-unix (with send-signal SIGKILL))
+(deny syscall-mach (with send-signal SIGKILL))
+(deny syscall-mig (with send-signal SIGKILL))
 (deny generic-issue-extension)
-(deny system-mac-syscall (with send-signal SIGSYS))
+(deny system-mac-syscall (with send-signal SIGKILL))
 "#;
 
     /// The API process's profile: only its lists, no files, Unix sockets only
@@ -699,6 +709,7 @@ mod macos {
         rule.push_str(&allow("syscall-mig", "", "kernel-mig-routine", "", API_MIG_ROUTINES));
         rule.push_str(&exception_rule());
         rule.push_str(&fcntl_rule("", API_FCNTL_COMMANDS));
+        rule.push_str(DENIED_CALL_RULE);
         rule
     }
 
@@ -720,8 +731,7 @@ mod macos {
         if state.policy == Policy::None || state.installed {
             return Ok(());
         }
-        start_sigsys_waiter()?;
-        install_and_mark(&compiled_api_profile()?)?;
+        install_compiled(&compiled_api_profile()?)?;
         state.installed = true;
         state.narrowed_done = true;
         if !cfg!(wick_sandbox_discovery) {
@@ -820,7 +830,7 @@ mod macos {
         };
         let profile = PROFILE.replacen("(deny default)\n", &default_rule(), 1);
         Ok(format!(
-            "{profile}{}{}{}{files}{}{}",
+            "{profile}{}{}{}{files}{}{}{DENIED_CALL_RULE}",
             shm_rule(std::process::id()),
             syscall_rule(),
             operation_rule(),
@@ -829,11 +839,22 @@ mod macos {
         ))
     }
 
+    /// The system call a check of the compatibility libc's ends the process
+    /// by, as a denial ([`exec_denied`]), last in both profiles so that no
+    /// rule allows it: SYS_invalid (63), the slot xnu's `unix_syscall`
+    /// checks and runs for any number it has no call for (bsd/dev/arm/
+    /// systemcalls.c: `syscode = (code < nsysent) ? code : SYS_invalid`).
+    /// Its entry is `nosys` (bsd/kern/syscalls.master: "used internally and
+    /// reserved"), which does nothing but fail: were it ever let through, it
+    /// would change nothing, and [`exec_denied`] ends the process anyway.
+    const DENIED_CALL: u16 = 63;
+    const DENIED_CALL_RULE: &str = "(deny syscall-unix (syscall-number SYS_invalid) (with send-signal SIGKILL))\n";
+
     /// The POSIX shared memory objects of the process `pid`: the names the
     /// compatibility memfd gives them (`/fcm.<pid>.<n>`, and
     /// `/fcmH.<pid>.<n>` for a huge page one, `libc::HUGE_MEMFD_PREFIX`;
-    /// made and unlinked at once). Another name fails and raises SIGSYS (the
-    /// default rule): on Linux a memfd has no name another process could
+    /// made and unlinked at once). Another name is a denial (the default
+    /// rule): on Linux a memfd has no name another process could
     /// open.
     fn shm_rule(pid: u32) -> String {
         format!(
@@ -851,7 +872,7 @@ mod macos {
     /// in the temporary directory and remove once open (an eventfd made when
     /// the guest activates a device; a timer made for a hot-plugged device's
     /// rate limiter, where Linux's filter allows `timerfd_create`). Any other
-    /// name raises SIGSYS, as upstream's
+    /// name is a denial, as upstream's
     /// filters have no `unlink` (Linux's eventfd and tap have no name): a
     /// network endpoint's socket is left behind when the device goes, as
     /// the API socket is, and the next bind at the path replaces a stale one
@@ -881,7 +902,7 @@ mod macos {
                 .map_err(|err| SandboxError::Install(format!("temporary directory {tmp:?}: {err}")))?,
         };
         let narrowed = format!("(extension \"{}\")", NARROWED.to_str().unwrap());
-        let mut rule = format!("(deny file-write-unlink {narrowed} (with send-signal SIGSYS))\n");
+        let mut rule = format!("(deny file-write-unlink {narrowed} (with send-signal SIGKILL))\n");
         // Discovery build: allowed and reported instead.
         #[cfg(wick_sandbox_discovery)]
         rule.push_str(&format!("(allow file-write-unlink {narrowed} (with report))\n"));
@@ -897,7 +918,7 @@ mod macos {
     /// Operations a running microVM may not ask for, after the file rule
     /// (which allows them on the files it covers until [`narrow`]):
     /// changing a file's mode, owner, flags, times, extended attributes or
-    /// ACL, and cloning one. They raise SIGSYS, as `chmod`, `fchmod`,
+    /// ACL, and cloning one. They are denials, as `chmod`, `fchmod`,
     /// `chown`, `utimensat`, `setxattr` and `copy_file_range` are in none
     /// of upstream's filters. And binding a socket, which the
     /// `network-inbound` rule allows until then (it decides a bind no
@@ -919,8 +940,8 @@ mod macos {
 
     /// The `fcntl` commands a running microVM may use (`F_<name>`,
     /// <sys/fcntl.h>), each line for the rule of upstream's filters in its
-    /// comment, measured as [`SYSCALLS`] are. Any other command raises
-    /// SIGSYS after [`narrow`] (Seatbelt's `system-fcntl`, which checks
+    /// comment, measured as [`SYSCALLS`] are. Any other command is a
+    /// denial after [`narrow`] (Seatbelt's `system-fcntl`, which checks
     /// every command).
     pub const FCNTL_COMMANDS: &[&str] = &[
         // fcntl F_SETFD FD_CLOEXEC.
@@ -949,14 +970,14 @@ mod macos {
     /// `F_SETFD`.
     pub const API_FCNTL_COMMANDS: &[&str] = &["F_GETFD", "F_SETFD"];
 
-    /// `(allow system-fcntl ...)` for `commands` after a deny with SIGSYS
+    /// `(allow system-fcntl ...)` for `commands` after a deny with the kill
     /// under `condition` (none: always).
     #[allow(unexpected_cfgs)]
     fn fcntl_rule(condition: &str, commands: &[&str]) -> String {
         let mut rule = if condition.is_empty() {
-            "(deny system-fcntl (with send-signal SIGSYS))\n".to_owned()
+            "(deny system-fcntl (with send-signal SIGKILL))\n".to_owned()
         } else {
-            format!("(deny system-fcntl {condition} (with send-signal SIGSYS))\n")
+            format!("(deny system-fcntl {condition} (with send-signal SIGKILL))\n")
         };
         rule.push_str(&allow("system-fcntl", "", "fcntl-command", "", commands));
         // Discovery build: another command is allowed and reported.
@@ -970,7 +991,7 @@ mod macos {
 
     /// The rules of the run phase that come after the file rule: the
     /// operations of [`RUN_DENIED_OPERATIONS`] and the `fcntl` commands
-    /// outside [`FCNTL_COMMANDS`] raise SIGSYS once the process holds the
+    /// outside [`FCNTL_COMMANDS`] are denials once the process holds the
     /// narrowed extension; but a Unix socket binds where setup could bind
     /// one, for a hot-plugged network device's endpoint (a rule with a
     /// filter: the more specific one decides): in the jail (`root`) and its
@@ -981,7 +1002,7 @@ mod macos {
     fn run_rule(root: Option<&Path>, netns: Option<&Path>) -> Result<String, SandboxError> {
         let narrowed = format!("(extension \"{}\")", NARROWED.to_str().unwrap());
         let mut rule = format!(
-            "(deny {} {narrowed} (with send-signal SIGSYS))\n",
+            "(deny {} {narrowed} (with send-signal SIGKILL))\n",
             RUN_DENIED_OPERATIONS.join(" ")
         );
         // Discovery build: allowed and reported instead.
@@ -1006,12 +1027,12 @@ mod macos {
     }
 
     /// What a denied operation does: on Linux a system call outside a
-    /// thread's filter traps, so here an operation no rule allows raises
-    /// SIGSYS. Except for files, which fail with an error, as on Linux a path
+    /// thread's filter traps, so here an operation no rule allows is a
+    /// denial, which the kernel ends the process in (see [`PROFILE`]). Except for files, which fail with an error, as on Linux a path
     /// outside the chroot does, and what [`DENIED_WITH_ERROR`] lists.
     #[allow(unexpected_cfgs)]
     fn default_rule() -> String {
-        let mut rule = String::from("(deny default (with send-signal SIGSYS))\n(deny file-read* file-write*)\n");
+        let mut rule = String::from("(deny default (with send-signal SIGKILL))\n(deny file-read* file-write*)\n");
         for (op, why) in DENIED_WITH_ERROR {
             rule.push_str(&format!("; {why}\n(deny {op})\n"));
         }
@@ -1022,7 +1043,7 @@ mod macos {
         rule
     }
 
-    /// Operations denied with an error rather than SIGSYS: ones the system
+    /// Operations denied with an error rather than the kill: ones the system
     /// libraries make and handle failing, that Firecracker never asks for.
     pub const DENIED_WITH_ERROR: &[(&str, &str)] = &[
         (
@@ -1184,7 +1205,7 @@ mod macos {
 
     /// The discovery build's rule (`tools/macos/sandbox-discovery.sh`, never
     /// released): after narrow(), a call outside the run phase's lists is
-    /// allowed and reported instead of raising SIGSYS, so that one run of the
+    /// allowed and reported instead of denied, so that one run of the
     /// scenario tests lists every call they are missing.
     #[allow(unexpected_cfgs)]
     fn discovery_rule() -> String {
@@ -1197,17 +1218,24 @@ mod macos {
         String::new()
     }
 
-    /// Set once the sandbox is installed, for [`denied_syscall`].
-    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    /// Set by [`denied_elsewhere`]: the SIGSYS it hands upstream's handler
+    /// stands for the API process's denied call.
+    static DENIED_ELSEWHERE: AtomicBool = AtomicBool::new(false);
 
-    /// Whether a SIGSYS is the sandbox denying a system call: the sandbox
-    /// signals the process itself, with no code (and does not say which
-    /// call). Async-signal-safe.
+    /// Whether a SIGSYS stands for a call a host sandbox denied, on which
+    /// upstream's handler exits as for a seccomp violation. The sandbox's own
+    /// denials raise no SIGSYS here: the kernel ends the process inside the
+    /// denied call (see [`PROFILE`]). The one SIGSYS that stands for a denial
+    /// is the one [`denied_elsewhere`] hands upstream's handler, for the API
+    /// process's. Any other (another process's `kill`, a thread's own
+    /// `raise`) is not one, and upstream's handler exits with its
+    /// unexpected-error code, as on Linux for a SIGSYS seccomp did not send.
+    /// Async-signal-safe.
     ///
     /// # Safety
-    /// `info` is the siginfo the kernel passed to a SIGSYS handler.
+    /// `info` is the siginfo passed to a SIGSYS handler.
     pub unsafe fn denied_syscall(si_code: libc::c_int, info: *mut libc::siginfo_t) -> bool {
-        if !INSTALLED.load(Ordering::Relaxed) || si_code != 0 || info.is_null() {
+        if !DENIED_ELSEWHERE.load(Ordering::Acquire) || si_code != 0 || info.is_null() {
             return false;
         }
         // SAFETY: the caller passes the handler's siginfo; getpid has no
@@ -1215,72 +1243,38 @@ mod macos {
         unsafe { (*info).si_pid == libc::getpid() }
     }
 
-    // SIGSYS from a thread of its own.
+    // SIGSYS.
     //
-    // Seccomp's SIGSYS is forced on the thread that made the call, which runs
-    // upstream's handler before it goes on (Linux kernel/seccomp.c,
-    // __seccomp_filter, SECCOMP_RET_TRAP: force_sig_seccomp; kernel/signal.c
-    // force_sig_info_to_task). The sandbox signals the process instead, and
-    // the kernel gives that to the first thread that does not block it (xnu
-    // bsd/kern/kern_sig.c, get_signalthread; measured, every time), which may
-    // hold the lock upstream's handler then takes to log or write metrics:
-    // that thread would wait on itself. So the handler Firecracker registers
-    // for SIGSYS runs on a thread of its own, the waiter, made before the
-    // sandbox; the signal's handler only wakes it ([`forward_sigsys`]): it
-    // takes no lock, and every thread that held one goes on and releases it.
-    // The kernel's own SIGSYS, for a call number it has no entry for (xnu
-    // bsd/kern/subr_xxx.c nosys: psignal_uthread, to the calling thread), is
-    // forwarded the same way.
+    // A call the sandbox denies raises none: the kernel kills the process
+    // inside the call ([`PROFILE`]). What remains is the kernel's own SIGSYS
+    // for a call it has no entry for (xnu bsd/kern/subr_xxx.c `nosys`:
+    // `psignal_uthread`, to the calling thread), and a SIGSYS a process
+    // sends, which upstream's handler takes as on Linux. `nosys` runs only
+    // for a number the sandbox let through: one it has no number for is
+    // checked as SYS_invalid and denied ([`PROFILE`]); one it allows that
+    // this macOS has no call for ([`ABSENT`]), or any without the sandbox
+    // (`--no-seccomp`). There the call fails with ENOSYS and the process goes
+    // on, as Linux runs a number its filter allows and has no call for, and
+    // any without a filter.
 
     /// The type of a SIGSYS handler (upstream's `sigsys_handler`).
     pub type SigsysHandler = extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void);
 
     /// The handler Firecracker registered for SIGSYS ([`set_sigsys_handler`]).
     static SIGSYS_HANDLER: AtomicUsize = AtomicUsize::new(0);
-    /// The waiter's pipe (write end, non-blocking), -1 before it runs.
-    static WAITER_PIPE: AtomicI32 = AtomicI32::new(-1);
-    /// The process the waiter runs in (a fork has none of its parent's
-    /// threads, so not its waiter).
-    static WAITER_PID: AtomicI32 = AtomicI32::new(-1);
-    /// The signal's code and sender, for the waiter.
-    static SIGSYS_CODE: AtomicI32 = AtomicI32::new(0);
-    static SIGSYS_PID: AtomicI32 = AtomicI32::new(0);
 
-    /// How long upstream's handler work (the metric, the log line, the
-    /// metrics written, the exit) may take on the waiter before the process
-    /// exits 148 without it. It can take longer only when the thread that
-    /// holds the logger's or the metrics' lock is blocked writing to a
-    /// destination nobody reads (standard output to a pipe; the log and
-    /// metrics paths are opened non-blocking), and then what is lost (the
-    /// log line, the metrics) would not be read either. Linux's handler, on
-    /// the calling thread, waits on such a write for as long as it blocks.
-    /// More than ten times the longest the whole path took, from the denied
-    /// call to the exit, on an M1 Pro (macOS 27.2,
-    /// `test_sigsys_handler_work_ends_the_process_within_its_deadline`'s
-    /// printed stages): 15 ms in 60 runs idle; 25 ms in 200 runs beside six
-    /// copies of the sandbox tests (load average 45 on its 10 cores), where
-    /// the time is spread over the signal's delivery (up to 6.5 ms), the
-    /// waiter's wake-up (13 ms) and the handler's work and exit (24 ms). A
-    /// shared CI runner took 118 ms once (macos-26, beside the 35 other
-    /// sandbox tests on 3 cores); none of these is a guarantee, so the test
-    /// asserts the deadline itself.
-    pub const SIGSYS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
-
-    /// Registers `handler` for SIGSYS, to run on the waiter. Upstream's
+    /// Registers `handler` for SIGSYS, behind [`forward_sigsys`]. Upstream's
     /// `register_signal_handlers` calls this for its `sigsys_handler`.
     pub fn set_sigsys_handler(handler: SigsysHandler) -> vmm_sys_util::errno::Result<()> {
         SIGSYS_HANDLER.store(handler as usize, Ordering::Release);
-        // SAFETY: plain call. Firecracker registers its handlers on its
-        // first thread ([`RECEIVER`]).
-        RECEIVER.store(unsafe { libc::pthread_self() } as usize, Ordering::Release);
         // SAFETY: a zeroed sigaction, then its fields; forward_sigsys is
-        // async-signal-safe.
+        // async-signal-safe as far as upstream's handler is.
         unsafe {
             let mut act: libc::sigaction = std::mem::zeroed();
             act.sa_sigaction = forward_sigsys as *const () as usize;
-            // SA_RESTART: a thread the signal interrupts goes on with what
-            // it was doing (its read or write), as if it had not come.
-            act.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+            // As upstream's register_signal_handler: its siginfo, every
+            // signal blocked while it runs.
+            act.sa_flags = libc::SA_SIGINFO;
             libc::sigfillset(&mut act.sa_mask);
             if libc::sigaction(libc::SIGSYS, &act, std::ptr::null_mut()) != 0 {
                 return vmm_sys_util::errno::errno_result();
@@ -1294,41 +1288,8 @@ mod macos {
         unsafe { libc::__error() }
     }
 
-    /// Tests: a page (shared with a test's fork) where the SIGSYS path
-    /// stamps when each stage ran ([`SigsysStage`]), null otherwise.
-    #[cfg(test)]
-    static SIGSYS_STAGES: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicU64> =
-        std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-    /// The stages of a SIGSYS the tests time, by their slot on that page.
-    #[cfg(test)]
-    #[derive(Clone, Copy)]
-    enum SigsysStage {
-        /// The signal's handler runs and wakes the waiter.
-        Forwarded = 2,
-        /// The waiter woke and starts upstream's handler.
-        Woken = 3,
-    }
-
-    /// Stamps `stage` (CLOCK_MONOTONIC_RAW nanoseconds; async-signal-safe:
-    /// the clock reads the commpage), if a test asked for it.
-    #[cfg(test)]
-    fn stamp(stage: SigsysStage) {
-        let page = SIGSYS_STAGES.load(Ordering::Acquire);
-        if !page.is_null() {
-            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            // SAFETY: plain call; the page is the test's shared mapping.
-            unsafe {
-                libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts);
-                #[allow(clippy::cast_sign_loss)]
-                (*page.add(stage as usize))
-                    .store(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64, Ordering::Release);
-            }
-        }
-    }
-
-    /// Whether a SIGSYS with this code and sender is the kernel's (`nosys`)
-    /// or the sandbox's: both signal the process from itself, so the sender
+    /// Whether a SIGSYS with this code and sender is the kernel's (`nosys`):
+    /// it signals the calling thread from the process itself, so the sender
     /// is this process and the code 0.
     ///
     /// xnu keeps a caught signal's sender and code in the process, not with
@@ -1336,7 +1297,7 @@ mod macos {
     /// `psignal_internal`: `sig_proc->si_pid`, `si_code = 0`), and when a
     /// child exits or stops (bsd/kern/kern_exit.c `proc_exit`: the child's
     /// pid, `CLD_EXITED`), and read and zeroed when a signal is delivered
-    /// (bsd/dev/arm/unix_signal.c `sendsig`). So the sandbox's SIGSYS, posted
+    /// (bsd/dev/arm/unix_signal.c `sendsig`). So the kernel's SIGSYS, posted
     /// with this process as its sender, is delivered with
     /// - no sender, if another signal was delivered first;
     /// - a child's pid and a `CLD_` code, if the API process ended in
@@ -1345,14 +1306,17 @@ mod macos {
     ///   between, which nothing tells from that process sending SIGSYS.
     ///
     /// The first two are no signal another process sent (its pid is never
-    /// 0, its code 0), and are taken as the sandbox's: read as a foreign
-    /// SIGSYS, upstream's handler exited with its unexpected-error code.
+    /// 0, its code 0), and are taken as the kernel's. So is a SIGSYS the
+    /// process sends itself (`raise`), which nothing tells from the kernel's
+    /// and nothing in Firecracker sends; on Linux upstream's handler exits on
+    /// it with its unexpected-error code.
     fn own_sigsys(code: libc::c_int, pid: libc::pid_t, me: libc::pid_t) -> bool {
         (code == 0 && (pid == me || pid == 0)) || (libc::CLD_EXITED..=libc::CLD_CONTINUED).contains(&code)
     }
 
-    /// The SIGSYS handler: async-signal-safe (atomics, `getpid`, `write`,
-    /// `_exit`; the API process's report, `send`), with errno kept.
+    /// The SIGSYS handler: the kernel's own SIGSYS for a call it has none
+    /// for is the call's ENOSYS alone (errno kept), and the process goes on
+    /// (see above); any other SIGSYS goes to upstream's handler.
     extern "C" fn forward_sigsys(num: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
         // SAFETY: errno of this thread; the kernel's siginfo, if any.
         let saved = unsafe { *errno_location() };
@@ -1364,535 +1328,46 @@ mod macos {
         };
         // SAFETY: no arguments.
         let me = unsafe { libc::getpid() };
-        let from_kernel = own_sigsys(code, pid, me);
-        if from_kernel && !INSTALLED.load(Ordering::Acquire) {
-            // No sandbox: a call number the kernel has none for fails with
-            // ENOSYS and the process goes on, as on Linux without seccomp.
+        if own_sigsys(code, pid, me) {
             // SAFETY: as above.
             unsafe { *errno_location() = saved };
             return;
         }
-        let pipe = WAITER_PIPE.load(Ordering::Acquire);
-        if from_kernel && pipe >= 0 && WAITER_PID.load(Ordering::Acquire) == me {
-            // From here on no thread ends the process another way
-            // ([`settle`]).
-            DENIED.store(true, Ordering::Release);
-            // As the sandbox sent it, whatever the kernel's fields held by
-            // now ([`own_sigsys`]): upstream's handler asks the same.
-            SIGSYS_CODE.store(0, Ordering::Relaxed);
-            SIGSYS_PID.store(me, Ordering::Release);
-            if let at_once @ 1.. = SIGSYS_REPORT_AT_ONCE.load(Ordering::Acquire) {
-                // SAFETY: a fn() stored by set_sigsys_report.
-                let at_once: fn() = unsafe { std::mem::transmute(at_once) };
-                at_once();
-            }
-            let byte = 1u8;
-            #[cfg(test)]
-            stamp(SigsysStage::Forwarded);
-            // SAFETY: one byte from the stack to the waiter's pipe.
-            let n = unsafe { libc::write(pipe, (&raw const byte).cast(), 1) };
-            // SAFETY: as above.
-            if n == 1 || unsafe { *errno_location() } == libc::EAGAIN {
-                // Woken (or awake: its pipe is full of earlier ones).
-                // SAFETY: as above.
-                unsafe { *errno_location() = saved };
-                return;
-            }
-            // The waiter cannot be woken: exit as upstream's handler would,
-            // without its log line and metrics, but with what waits for a
-            // FIFO's reader in the FIFO.
-            crate::ext::fifo::drain();
-            // SAFETY: ends the process.
-            unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) };
-        }
-        // Another process's SIGSYS (kill), or the waiter not made: upstream's
-        // handler here, as without the waiter.
-        match SIGSYS_HANDLER.load(Ordering::Acquire) {
-            0 => {
-                crate::ext::fifo::drain();
-                // SAFETY: ends the process.
-                unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) }
-            }
-            handler => {
-                // SAFETY: a SigsysHandler stored by set_sigsys_handler.
-                let handler: SigsysHandler = unsafe { std::mem::transmute(handler) };
-                handler(num, info, ctx);
-            }
-        }
+        // SAFETY: a SigsysHandler stored by set_sigsys_handler, which
+        // registered this.
+        let handler: SigsysHandler = unsafe { std::mem::transmute(SIGSYS_HANDLER.load(Ordering::Acquire)) };
+        handler(num, info, ctx);
     }
 
-    // A denied call and the other ways its thread can end the process.
-    //
-    // On Linux the thread that made a trapped call runs the handler at once
-    // and nothing else after it. Here the signal goes to the process, its
-    // handler wakes the waiter and returns, and the thread that made the
-    // call runs on with the call failed. What it does with that can end the
-    // process before the waiter has: a panic (upstream's hook, then abort),
-    // an abort, a fault (upstream's handler and its exit code, or the
-    // default action), a trap libdispatch raises for a Mach call that
-    // failed, `exit`. Each of those ends asks first whether a call was
-    // denied ([`settle`]), and waits for the waiter's exit if one was.
-    //
-    // The answer is exact for the thread that made the call. The sandbox
-    // posts SIGSYS inside the denied call (measured: to the process, also
-    // when the calling thread does not block it), and xnu gives a process's
-    // signal to the first of its threads that does not block it (xnu
-    // bsd/kern/kern_sig.c `get_signalthread`): Firecracker's first thread,
-    // the receiver, which never blocks SIGSYS outside a handler that ends
-    // the process. So when the denied call returns, SIGSYS is pending on
-    // the receiver or delivered there.
-    // - The receiver itself, if it made the call, takes the signal as the
-    //   call returns: DENIED is set before it runs on.
-    // - Another thread asks the receiver with a signal of a higher number,
-    //   sent to that thread (`pthread_kill`). A thread takes its pending
-    //   signals lowest number first (`issignal`), and SIGSYS's handler
-    //   blocks the asking signal, so the asking signal's handler runs on
-    //   the receiver after SIGSYS's has set DENIED, and does not answer.
-    // A thread that did not make the denied call and ends the process while
-    // another's call is denied races with it, as on Linux.
-
-    /// Set by the signal's handler: a call was denied, the waiter ends the
-    /// process.
-    static DENIED: AtomicBool = AtomicBool::new(false);
-    /// The thread a process's SIGSYS goes to: Firecracker's first, which
-    /// registers its signal handlers ([`set_sigsys_handler`]); in the API
-    /// process, a fork of it, its only thread then. 0 before.
-    static RECEIVER: AtomicUsize = AtomicUsize::new(0);
-    /// A pipe nothing is written to: a thread that waits for the waiter's
-    /// exit reads from it (-1 before the waiter).
-    static PARK_PIPE: AtomicI32 = AtomicI32::new(-1);
-    /// The thread that asks the receiver (its `pthread_self`), 0 if none:
-    /// one at a time.
-    static ASK_OWNER: AtomicUsize = AtomicUsize::new(0);
-    /// A thread waits for the receiver's answer.
-    static ASKING: AtomicBool = AtomicBool::new(false);
-    /// The receiver's answer: no call had been denied.
-    static ANSWERED: AtomicBool = AtomicBool::new(false);
-    /// The handlers and flags [`guard_other_ends`] found (`sa_sigaction`,
-    /// `sa_flags`), by signal number.
-    static FOUND: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
-    static FOUND_FLAGS: [AtomicI32; 32] = [const { AtomicI32::new(0) }; 32];
-    static GUARDED: AtomicBool = AtomicBool::new(false);
-    /// The asking signal's handler is installed (not if the signal was
-    /// caught already: nothing would answer).
-    static ASK_READY: AtomicBool = AtomicBool::new(false);
-
-    /// The asking signal: above SIGSYS (12), and neither one Firecracker
-    /// handles nor the vCPU kick's (SIGUSR1, SIGUSR2). Its default action
-    /// is to be discarded.
-    const ASK_SIGNAL: libc::c_int = libc::SIGURG;
-    /// The signals by which a thread ends the process for what it did:
-    /// upstream's handlers exit with the signal's code, the default action
-    /// ends the process by the signal.
-    const ENDING_SIGNALS: [libc::c_int; 8] = [
-        libc::SIGILL,
-        libc::SIGTRAP,
-        libc::SIGABRT,
-        libc::SIGFPE,
-        libc::SIGBUS,
-        libc::SIGSEGV,
-        libc::SIGXCPU,
-        libc::SIGXFSZ,
-    ];
-
-    /// Waits for the waiter's exit: reads from a pipe nothing writes to.
-    /// Async-signal-safe.
-    fn wait_for_the_exit() -> ! {
-        let fd = PARK_PIPE.load(Ordering::Acquire);
-        let mut byte = 0u8;
-        loop {
-            // SAFETY: one byte into the stack, from a pipe with no data.
-            unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
-        }
-    }
-
-    /// Called before the process ends any other way than by the waiter:
-    /// returns if no call of the calling thread's was denied, and otherwise
-    /// waits for the waiter's exit (see above). Without the sandbox it
-    /// returns at once. Async-signal-safe: atomics, `getpid`,
-    /// `pthread_self`, `pthread_kill`, `nanosleep`, `read`; errno is kept.
-    pub fn settle() {
-        // SAFETY: no arguments.
-        let pid = unsafe { libc::getpid() };
-        if !INSTALLED.load(Ordering::Acquire) || WAITER_PID.load(Ordering::Acquire) != pid {
-            return;
-        }
-        if DENIED.load(Ordering::Acquire) {
-            wait_for_the_exit();
-        }
-        // SAFETY: plain call.
-        let me = unsafe { libc::pthread_self() } as usize;
-        let receiver = RECEIVER.load(Ordering::Acquire);
-        if receiver == 0 || receiver == me || !ASK_READY.load(Ordering::Acquire) {
-            // The receiver's own denied call set DENIED as it returned.
-            return;
-        }
-        // SAFETY: this thread's errno.
-        let saved = unsafe { *errno_location() };
-        let nap = libc::timespec { tv_sec: 0, tv_nsec: 50_000 };
-        // One asker at a time; a handler on a thread that is asking asks
-        // again within its turn.
-        let nested = ASK_OWNER.load(Ordering::Acquire) == me;
-        while !nested && ASK_OWNER.compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            if DENIED.load(Ordering::Acquire) {
-                wait_for_the_exit();
-            }
-            // SAFETY: plain call; async-signal-safe.
-            unsafe { libc::nanosleep(&nap, std::ptr::null_mut()) };
-        }
-        ANSWERED.store(false, Ordering::Release);
-        ASKING.store(true, Ordering::Release);
-        // SAFETY: the receiver's thread, which lives as long as the process.
-        let sent = unsafe { libc::pthread_kill(receiver as libc::pthread_t, ASK_SIGNAL) } == 0;
-        // A receiver that cannot be asked gives no answer to wait for.
-        while sent && !ANSWERED.load(Ordering::Acquire) {
-            if DENIED.load(Ordering::Acquire) {
-                wait_for_the_exit();
-            }
-            // SAFETY: as above.
-            unsafe { libc::nanosleep(&nap, std::ptr::null_mut()) };
-        }
-        if !nested {
-            ASKING.store(false, Ordering::Release);
-            ASK_OWNER.store(0, Ordering::Release);
-        }
-        // SAFETY: as above.
-        unsafe { *errno_location() = saved };
-    }
-
-    /// The asking signal's handler, on the receiver: answers that no call
-    /// was denied, if none was. Async-signal-safe: atomics.
-    extern "C" fn on_ask(_: libc::c_int) {
-        if ASKING.load(Ordering::Acquire) && !DENIED.load(Ordering::Acquire) {
-            ANSWERED.store(true, Ordering::Release);
-        }
-    }
-
-    /// The handler [`guard_other_ends`] puts before an ending signal's:
-    /// asks first, then does what the signal did before.
-    extern "C" fn on_ending_signal(num: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
-        if num == libc::SIGABRT {
-            // abort() has blocked every signal on every thread (Libc
-            // stdlib/FreeBSD/abort.c: `sigprocmask`, which xnu applies to
-            // all of the process's threads, bsd/kern/kern_sig.c
-            // `set_procsigmask`): the receiver takes SIGSYS and the asking
-            // signal again, a pending SIGSYS first.
-            // SAFETY: a set of the two signals, unblocked for the process.
-            unsafe {
-                let mut set: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut set);
-                libc::sigaddset(&mut set, libc::SIGSYS);
-                libc::sigaddset(&mut set, ASK_SIGNAL);
-                libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-            }
-        }
-        settle();
-        let slot = usize::try_from(num).unwrap_or(0) % FOUND.len();
-        match FOUND[slot].load(Ordering::Acquire) {
-            libc::SIG_IGN => {}
-            libc::SIG_DFL => {
-                // The default action: the signal is blocked in its handler,
-                // so the one sent here is taken as the handler returns, and
-                // ends the process by it (with the same wait status, and a
-                // core where the action has one).
-                // SAFETY: a zeroed sigaction with the default action; the
-                // signal to this thread.
-                unsafe {
-                    let mut act: libc::sigaction = std::mem::zeroed();
-                    act.sa_sigaction = libc::SIG_DFL;
-                    libc::sigaction(num, &act, std::ptr::null_mut());
-                    libc::pthread_kill(libc::pthread_self(), num);
-                }
-            }
-            found if FOUND_FLAGS[slot].load(Ordering::Acquire) & libc::SA_SIGINFO != 0 => {
-                // SAFETY: the handler registered for this signal before.
-                let handler: SigsysHandler = unsafe { std::mem::transmute(found) };
-                handler(num, info, ctx);
-            }
-            found => {
-                // SAFETY: as above, registered without SA_SIGINFO.
-                let handler: extern "C" fn(libc::c_int) = unsafe { std::mem::transmute(found) };
-                handler(num);
-            }
-        }
-    }
-
-    extern "C" fn settle_at_exit() {
-        settle();
-    }
-
-    /// Puts [`settle`] before every other way a thread ends the process
-    /// (see above), once, before the sandbox: the ending signals' handlers
-    /// (upstream's, or the default action), the panic hook, `exit`; and
-    /// installs the asking signal's handler. No handler registered so far
-    /// blocks SIGSYS any more: the receiver stays the thread a process's
-    /// SIGSYS goes to while it runs one that returns (upstream's for
-    /// SIGPIPE).
-    fn guard_other_ends() -> std::io::Result<()> {
-        let (park_r, _park_w) = waiter_pipe()?;
-        PARK_PIPE.store(park_r, Ordering::Release);
-        if GUARDED.swap(true, Ordering::AcqRel) {
-            // A fork of a process that did it (the API process).
-            return Ok(());
-        }
-        let failed = || Err(std::io::Error::last_os_error());
-        // SAFETY: zeroed sigactions, read and written for signal numbers
-        // below 32; the handlers are async-signal-safe.
-        unsafe {
-            for (slot, sig) in (1..32).enumerate().map(|(i, sig)| (i + 1, sig)) {
-                if sig == libc::SIGKILL || sig == libc::SIGSTOP || sig == libc::SIGSYS {
-                    continue;
-                }
-                let mut old: libc::sigaction = std::mem::zeroed();
-                if libc::sigaction(sig, std::ptr::null(), &mut old) != 0 {
-                    return failed();
-                }
-                let ending = ENDING_SIGNALS.contains(&sig);
-                let caught = old.sa_sigaction != libc::SIG_DFL && old.sa_sigaction != libc::SIG_IGN;
-                let mut act = old;
-                if ending && old.sa_sigaction != libc::SIG_IGN {
-                    FOUND[slot].store(old.sa_sigaction, Ordering::Release);
-                    FOUND_FLAGS[slot].store(old.sa_flags, Ordering::Release);
-                    act.sa_sigaction = on_ending_signal as *const () as usize;
-                    act.sa_flags = old.sa_flags | libc::SA_SIGINFO;
-                } else if sig == ASK_SIGNAL && !caught {
-                    act.sa_sigaction = on_ask as *const () as usize;
-                    act.sa_flags = libc::SA_RESTART;
-                    libc::sigfillset(&mut act.sa_mask);
-                    ASK_READY.store(true, Ordering::Release);
-                } else if !caught {
-                    continue;
-                }
-                libc::sigdelset(&mut act.sa_mask, libc::SIGSYS);
-                if libc::sigaction(sig, &act, std::ptr::null_mut()) != 0 {
-                    return failed();
-                }
-            }
-            if libc::atexit(settle_at_exit) != 0 {
-                return Err(std::io::Error::other("atexit refused the denied call's check"));
-            }
-        }
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            settle();
-            hook(info);
-        }));
-        Ok(())
-    }
-
-    /// Blocks every signal in the calling thread: the waiter runs upstream's
-    /// handler as a handler runs, with its signals blocked
-    /// (`register_signal_handler`'s mask).
-    fn block_all_signals() {
+    /// Ends Firecracker as for a call its own sandbox denied, for the API
+    /// process's, which the kernel ended by SIGKILL and Firecracker, its
+    /// parent, knows by its exit reason (`api_process`): upstream's handler,
+    /// on this thread, with every signal blocked as a handler runs (its log
+    /// line, the fault metric, exit 148), as on Linux the API thread's
+    /// trapped call ends Firecracker. Does not return.
+    pub fn denied_elsewhere() -> ! {
         // SAFETY: a full set, for this thread.
         unsafe {
             let mut set: libc::sigset_t = std::mem::zeroed();
             libc::sigfillset(&mut set);
             libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
         }
-    }
-
-    /// Waits for good: a thread whose pipe broke (it cannot be, as its write
-    /// end is never closed) neither runs the handler nor exits.
-    fn park_forever() -> ! {
-        loop {
-            std::thread::park();
-        }
-    }
-
-    /// Reads one byte, again if interrupted.
-    fn read_byte(fd: libc::c_int) -> isize {
-        let mut byte = 0u8;
-        loop {
-            // SAFETY: one byte into the stack.
-            let n = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
-            // SAFETY: errno of this thread.
-            if n >= 0 || unsafe { *errno_location() } != libc::EINTR {
-                return n;
-            }
-        }
-    }
-
-    /// `fcntl` command: a write to a pipe with no reader fails with EPIPE
-    /// without raising SIGPIPE (<sys/fcntl.h>).
-    const F_SETNOSIGPIPE: libc::c_int = 73;
-
-    /// A pipe, both ends close-on-exec, the write end non-blocking.
-    fn waiter_pipe() -> std::io::Result<(libc::c_int, libc::c_int)> {
-        let mut fds = [0; 2];
-        // SAFETY: two descriptors into the array; fcntl on them.
-        unsafe {
-            if libc::pipe(fds.as_mut_ptr()) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for fd in fds {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-            libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
-            libc::fcntl(fds[1], F_SETNOSIGPIPE, 1);
-        }
-        Ok((fds[0], fds[1]))
-    }
-
-    /// Makes the waiter and its deadline, if Firecracker registered a SIGSYS
-    /// handler and this process has none yet. Called before the sandbox,
-    /// which makes no threads (the API process's at once, Firecracker's
-    /// after narrow()).
-    fn start_sigsys_waiter() -> Result<(), SandboxError> {
-        // SAFETY: no arguments.
-        let me = unsafe { libc::getpid() };
-        if SIGSYS_HANDLER.load(Ordering::Acquire) == 0 || WAITER_PID.load(Ordering::Acquire) == me {
-            return Ok(());
-        }
-        let fail = |err: std::io::Error| SandboxError::Install(format!("the SIGSYS waiter: {err}"));
-        let (wake_r, wake_w) = waiter_pipe().map_err(fail)?;
-        let (start_r, start_w) = waiter_pipe().map_err(fail)?;
-        // SAFETY: no arguments.
-        let kq = unsafe { libc::kqueue() };
-        if kq < 0 {
-            return Err(fail(std::io::Error::last_os_error()));
-        }
-        // A thread's start (its QoS, its name) makes calls the API
-        // process's sandbox does not allow: each says when it waits.
-        let (started, wait) = std::sync::mpsc::channel();
-        let deadline_started = started.clone();
-        std::thread::Builder::new()
-            .name("fc_sigsys_deadline".into())
-            .spawn(move || {
-                block_all_signals();
-                let _ = deadline_started.send(());
-                if read_byte(start_r) != 1 {
-                    park_forever();
-                }
-                let end = std::time::Instant::now() + SIGSYS_DEADLINE;
-                loop {
-                    let left = end.saturating_duration_since(std::time::Instant::now());
-                    if left.is_zero() {
-                        break;
-                    }
-                    let timeout = libc::timespec {
-                        tv_sec: left.as_secs().try_into().unwrap_or(libc::time_t::MAX),
-                        tv_nsec: left.subsec_nanos().into(),
-                    };
-                    // SAFETY: a zeroed event; an empty kqueue, so kevent
-                    // waits for the timeout.
-                    unsafe {
-                        let mut event: libc::kevent = std::mem::zeroed();
-                        libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &timeout);
-                    }
-                }
-                // SAFETY: ends the process, without the handler's work.
-                unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) };
-            })
-            .map_err(fail)?;
-        std::thread::Builder::new()
-            .name("fc_sigsys".into())
-            .spawn(move || {
-                block_all_signals();
-                let _ = started.send(());
-                if read_byte(wake_r) != 1 {
-                    park_forever();
-                }
-                #[cfg(test)]
-                stamp(SigsysStage::Woken);
-                let byte = 1u8;
-                // SAFETY: one byte from the stack: the deadline starts.
-                unsafe { libc::write(start_w, (&raw const byte).cast(), 1) };
-                // SAFETY: a zeroed siginfo with the signal's fields.
-                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                info.si_signo = libc::SIGSYS;
-                info.si_pid = SIGSYS_PID.load(Ordering::Acquire);
-                info.si_code = SIGSYS_CODE.load(Ordering::Relaxed);
-                match SIGSYS_REPORT.load(Ordering::Acquire) {
-                    // Firecracker: upstream's handler.
-                    0 => {
-                        // SAFETY: stored by set_sigsys_handler (checked
-                        // above).
-                        let handler: SigsysHandler =
-                            unsafe { std::mem::transmute(SIGSYS_HANDLER.load(Ordering::Acquire)) };
-                        handler(libc::SIGSYS, &mut info, std::ptr::null_mut());
-                    }
-                    // The API process: Firecracker is told, and ends as for
-                    // its own denied call.
-                    report => {
-                        // SAFETY: a fn() stored by set_sigsys_report.
-                        let report: fn() = unsafe { std::mem::transmute(report) };
-                        report();
-                    }
-                }
-                // Upstream's handler exits; if it returns, so does this.
-                // SAFETY: ends the process.
-                unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) };
-            })
-            .map_err(fail)?;
-        for _ in 0..2 {
-            wait.recv().map_err(|_| fail(std::io::Error::other("a SIGSYS thread ended")))?;
-        }
-        guard_other_ends().map_err(fail)?;
-        WAITER_PID.store(me, Ordering::Release);
-        WAITER_PIPE.store(wake_w, Ordering::Release);
-        Ok(())
-    }
-
-    /// What the waiter runs in place of upstream's handler, if set
-    /// ([`set_sigsys_report`]).
-    static SIGSYS_REPORT: AtomicUsize = AtomicUsize::new(0);
-
-    /// What the signal's handler runs before it wakes the waiter, if set
-    /// ([`set_sigsys_report`]).
-    static SIGSYS_REPORT_AT_ONCE: AtomicUsize = AtomicUsize::new(0);
-
-    /// Makes the waiter run `report`, then exit 148, in place of upstream's
-    /// handler: the API process tells Firecracker of its denied call
-    /// (`api_process`), as an API thread's ends Firecracker on Linux.
-    /// `at_once` runs first, in the signal's handler, on the thread the
-    /// signal came to and before that thread runs on: it is
-    /// async-signal-safe and takes no lock.
-    pub fn set_sigsys_report(at_once: fn(), report: fn()) {
-        SIGSYS_REPORT_AT_ONCE.store(at_once as usize, Ordering::Release);
-        SIGSYS_REPORT.store(report as usize, Ordering::Release);
-    }
-
-    /// Ends Firecracker as for a call its own sandbox denied, for a denial
-    /// elsewhere (the API process's): the waiter runs upstream's handler
-    /// (its log line, metrics, exit 148). Does not return.
-    pub fn denied_elsewhere() -> ! {
-        // SAFETY: no arguments.
-        let me = unsafe { libc::getpid() };
-        let pipe = WAITER_PIPE.load(Ordering::Acquire);
-        if pipe >= 0 && WAITER_PID.load(Ordering::Acquire) == me {
-            DENIED.store(true, Ordering::Release);
-            SIGSYS_CODE.store(0, Ordering::Relaxed);
-            SIGSYS_PID.store(me, Ordering::Release);
-            let byte = 1u8;
-            // SAFETY: one byte from the stack to the waiter's pipe.
-            let n = unsafe { libc::write(pipe, (&raw const byte).cast(), 1) };
-            // SAFETY: errno of this thread.
-            if n != 1 && unsafe { *errno_location() } != libc::EAGAIN {
-                // SAFETY: ends the process.
-                unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) };
-            }
-            park_forever();
-        }
-        // No waiter (no sandbox here): upstream's handler on this thread.
-        // SAFETY: a zeroed siginfo with the sandbox's fields.
+        DENIED_ELSEWHERE.store(true, Ordering::Release);
+        // SAFETY: a zeroed siginfo with a denial's fields (no code, this
+        // process: denied_syscall).
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         info.si_signo = libc::SIGSYS;
-        info.si_pid = me;
+        // SAFETY: no arguments.
+        info.si_pid = unsafe { libc::getpid() };
         if let handler @ 1.. = SIGSYS_HANDLER.load(Ordering::Acquire) {
             // SAFETY: stored by set_sigsys_handler.
             let handler: SigsysHandler = unsafe { std::mem::transmute(handler) };
             handler(libc::SIGSYS, &mut info, std::ptr::null_mut());
         }
+        // Upstream's handler exits; without one, its exit code.
+        crate::ext::fifo::drain();
         // SAFETY: ends the process.
         unsafe { libc::_exit(crate::FcExitCode::BadSyscall as i32) }
-    }
-
-    /// Installs `compiled`, marked installed first: from its first denial on,
-    /// a SIGSYS is the sandbox's ([`forward_sigsys`], [`denied_syscall`]).
-    fn install_and_mark(compiled: &Compiled) -> Result<(), SandboxError> {
-        INSTALLED.store(true, Ordering::Release);
-        install_compiled(compiled).inspect_err(|_| INSTALLED.store(false, Ordering::Release))
     }
 
     unsafe extern "C" {
@@ -1987,8 +1462,7 @@ mod macos {
         // Issued before the sandbox, which denies issuing; an extension
         // taken before the sandbox is installed would not attach to it.
         let narrowed = Token::issue(NARROWED)?;
-        start_sigsys_waiter()?;
-        install_and_mark(&compiled_profile()?)?;
+        install_compiled(&compiled_profile()?)?;
         state.installed = true;
         state.narrowed = Some(narrowed);
         Ok(())
@@ -2031,26 +1505,30 @@ mod macos {
         Ok(())
     }
 
-    /// Raises SIGSYS on this thread for an `mmap` or `mprotect` asking for
-    /// `PROT_EXEC` after [`narrow`], or the API process's `madvise` with
-    /// advice other than `MADV_DONTNEED`, as a seccomp trap does: the signal is
-    /// the one Seatbelt sends (no code, this process), so upstream's handler
-    /// exits with the bad-syscall code ([`denied_syscall`]). If the signal is
-    /// blocked or ignored, the default action, as the kernel forces a seccomp
-    /// trap's SIGSYS.
+    /// Ends the process as a denied call does, for an `mmap` or `mprotect`
+    /// asking for `PROT_EXEC` after [`narrow`], or the API process's
+    /// `madvise` with advice other than `MADV_DONTNEED`: the compatibility
+    /// libc's checks of what upstream's filters trap. It makes the call
+    /// [`DENIED_CALL_RULE`] denies, and the kernel kills the process inside
+    /// it, with the sandbox's exit reason and a crash report naming this
+    /// thread, as for any denial. It does not return: were the call let
+    /// through, the process ends by SIGKILL all the same.
     extern "C" fn exec_denied(_prot: libc::c_int) {
-        // SAFETY: plain calls on this thread, with a valid signal set.
+        // SAFETY: a system call that reads no argument (`nosys`), then a
+        // signal to this process.
         unsafe {
-            libc::pthread_kill(libc::pthread_self(), libc::SIGSYS);
-            // Taken here, this thread goes no further, as the thread a
-            // seccomp trap stops.
-            settle();
-            libc::signal(libc::SIGSYS, libc::SIG_DFL);
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            libc::sigaddset(&mut set, libc::SIGSYS);
-            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-            libc::pthread_kill(libc::pthread_self(), libc::SIGSYS);
+            std::arch::asm!(
+                "svc #0x80",
+                inout("x16") usize::from(DENIED_CALL) => _,
+                inout("x0") 0usize => _,
+                out("x1") _,
+                out("x17") _,
+                options(nostack),
+            );
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+        loop {
+            std::hint::spin_loop();
         }
     }
 
@@ -2371,6 +1849,67 @@ mod macos {
 
         /// [`child`], with its limit.
         fn child_within(name: &str, env: &[(&str, &str)], limit: std::time::Duration) -> std::process::Output {
+            child_run(name, env, limit).0
+        }
+
+        /// [`child`], with the child's exit reason ([`exit_reason`]).
+        fn child_reason(name: &str, env: &[(&str, &str)]) -> (std::process::Output, Option<ExitReason>) {
+            child_run(name, env, CHILD_LIMIT)
+        }
+
+        /// What xnu recorded as a process's reason to exit: its namespace
+        /// and code (<sys/proc_info.h> `proc_exitreasonbasicinfo`).
+        type ExitReason = (u32, u64);
+
+        /// The namespace of a kill by a Seatbelt action (OS_REASON_SANDBOX,
+        /// xnu bsd/sys/reason.h). Its code is Seatbelt's own, by the kind of
+        /// operation (measured on 27.2: 0xdd for a system call, 0x1 for a
+        /// network operation).
+        const OS_REASON_SANDBOX: u32 = 25;
+
+        /// Whether `reason` is the sandbox's kill.
+        fn sandbox_kill(reason: Option<ExitReason>) -> bool {
+            reason.is_some_and(|(namespace, _)| namespace == OS_REASON_SANDBOX)
+        }
+
+        /// The exit reason of `pid`, this process's child, once it has
+        /// exited and before it is reaped (`waitid` with `WNOWAIT`): only
+        /// the parent may read it (xnu bsd/kern/proc_info.c
+        /// `proc_pidexitreasoninfo`), and only while the child is a zombie.
+        /// None when it has none (an exit by `exit`).
+        fn exit_reason(pid: libc::pid_t) -> Option<ExitReason> {
+            loop {
+                // SAFETY: a zeroed siginfo for the output; our child.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                // SAFETY: as above.
+                let got = unsafe {
+                    libc::waitid(libc::P_PID, libc::id_t::try_from(pid).unwrap(), &mut info, libc::WEXITED | libc::WNOWAIT)
+                };
+                if got == 0 {
+                    break;
+                }
+                assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINTR), "waitid {pid}");
+            }
+            // proc_exitreasonbasicinfo: namespace u32, code u64, flags u64,
+            // reason buffer size u32, packed (24 bytes).
+            let mut buf = [0u8; 24];
+            // SAFETY: an output buffer of the size passed; flavour 25 is
+            // PROC_PIDEXITREASONBASICINFO.
+            let n = unsafe { libc::proc_pidinfo(pid, 25, 0, buf.as_mut_ptr().cast(), 24) };
+            (n == 24).then(|| {
+                (
+                    u32::from_ne_bytes(buf[0..4].try_into().unwrap()),
+                    u64::from_ne_bytes(buf[4..12].try_into().unwrap()),
+                )
+            })
+        }
+
+        /// [`child_within`], with the child's exit reason.
+        fn child_run(
+            name: &str,
+            env: &[(&str, &str)],
+            limit: std::time::Duration,
+        ) -> (std::process::Output, Option<ExitReason>) {
             use std::io::Read;
             use std::process::Stdio;
             use std::sync::mpsc;
@@ -2402,9 +1941,10 @@ mod macos {
             let stderr = read(Box::new(proc.stderr.take().unwrap()));
             let (done_tx, done) = mpsc::channel();
             std::thread::spawn(move || {
-                let _ = done_tx.send(proc.wait());
+                let reason = exit_reason(i32::try_from(proc.id()).unwrap());
+                let _ = done_tx.send(proc.wait().map(|status| (status, reason)));
             });
-            let status = match done.recv_timeout(limit) {
+            let (status, reason) = match done.recv_timeout(limit) {
                 Ok(status) => status.unwrap(),
                 Err(_) => {
                     let sample = Command::new("/usr/bin/sample")
@@ -2433,9 +1973,27 @@ mod macos {
                     panic!("{name} {env:?}: ended ({status:?}) and its {which} is still open 10 s on: a process it started holds it")
                 })
             };
-            let stdout = end(stdout, "stdout");
+            let mut stdout = end(stdout, "stdout");
             let stderr = end(stderr, "stderr");
-            std::process::Output { status, stdout, stderr }
+            // For [`denied`], which reads the output alone.
+            if let Some((namespace, code)) = reason {
+                stdout.extend(format!("\n{EXIT_REASON_LINE}{namespace} {code:#x}\n").into_bytes());
+            }
+            (std::process::Output { status, stdout, stderr }, reason)
+        }
+
+        /// The line [`child_run`] adds to a child's output with its exit
+        /// reason.
+        const EXIT_REASON_LINE: &str = "WICK-EXIT-REASON ";
+
+        /// Whether a child ended by a denied call: by SIGKILL, with the
+        /// sandbox's exit reason. Where Linux's seccomp traps the call and
+        /// upstream's handler exits 148, the kernel kills the process inside
+        /// the call ([`PROFILE`]).
+        fn denied(out: &std::process::Output) -> bool {
+            use std::os::unix::process::ExitStatusExt;
+            let want = format!("{EXIT_REASON_LINE}{OS_REASON_SANDBOX} ");
+            out.status.signal() == Some(libc::SIGKILL) && String::from_utf8_lossy(&out.stdout).contains(&want)
         }
 
         /// A panic's message.
@@ -2555,50 +2113,240 @@ mod macos {
             assert!(err.contains("no-such-operation"), "{err}");
         }
 
-        // A system call outside SYSCALLS raises SIGSYS, as a seccomp filter's
+        // A system call outside SYSCALLS is a denial, as a seccomp filter's
         // trap does (the test binary has no handler, so it dies of it).
         #[test]
-        fn test_unlisted_syscalls_raise_sigsys() {
-            use std::os::unix::process::ExitStatusExt;
+        fn test_unlisted_syscalls_are_denials() {
             for name in [
                 "exec_child", "unlisted_child", "unlisted_trap_child", "unlisted_mig_child", "tcp_child",
                 "udp_child", "listen_after_narrow_child",
             ] {
                 let out = child(name, &[]);
-                assert_eq!(
-                    out.status.signal(),
-                    Some(libc::SIGSYS),
-                    "{name}: {}",
-                    text(&out)
-                );
+                assert!(denied(&out), "{name}: {}", text(&out));
                 assert!(!String::from_utf8_lossy(&out.stdout).contains("CHILD-SURVIVED"), "{name}: {}", text(&out));
             }
         }
 
-        // With upstream's signal handlers, a denied call ends Firecracker as a
-        // seccomp violation does: the bad-syscall exit code.
+        // With upstream's signal handlers, a denied call ends Firecracker by
+        // the kernel's kill: SIGKILL, with the sandbox's exit reason. On
+        // Linux a seccomp violation exits 148 through upstream's handler,
+        // with its log line and fault metric; Seatbelt has no action that
+        // traps the call (docs/COMPATIBILITY.md).
         #[test]
-        fn test_denied_syscall_exits_as_seccomp() {
+        fn test_a_denied_syscall_ends_firecracker_by_the_sandboxs_kill() {
             let out = child("handled_child", &[]);
-            assert_eq!(
-                out.status.code(),
-                Some(crate::FcExitCode::BadSyscall as i32),
-                "{}",
-                text(&out)
-            );
+            assert!(denied(&out), "{}", text(&out));
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("CHILD-SURVIVED"), "{}", text(&out));
+        }
+
+        /// How many times each kind of denied call is made, each in a
+        /// process of its own.
+        const DENIED_CALL_TRIALS: usize = 200;
+
+        // A denied call never returns to the thread that made it: the
+        // kernel ends the process inside the call, as Linux's seccomp ends
+        // the calling thread's run there (a trap's SIGSYS is forced on that
+        // thread before it returns to user space, kernel/seccomp.c
+        // `__seccomp_filter`, SECCOMP_RET_TRAP). Each kind of call (a raw
+        // `svc` that no libc stub wraps, a libc stub, a Mach trap) is made
+        // DENIED_CALL_TRIALS times on a thread that stamps a shared page as
+        // the call returns; the page is never stamped, and every process
+        // ends by SIGKILL with the sandbox's exit reason. Where Linux exits
+        // 148 with upstream's log line and fault metric, here the process
+        // ends by SIGKILL: Seatbelt has no action that traps the calling
+        // thread, and a signal to the process left the thread running on
+        // (docs/COMPATIBILITY.md).
+        //
+        // Each kill leaves the process exiting until the crash reporter has
+        // taken its corpse (the exit reason asks for a crash report): 200
+        // kills took 30 s at load average 30 (macOS 27.2, M1 Pro), so the
+        // three kinds run at once, each with a limit of its own.
+        #[test]
+        fn test_a_denied_call_never_returns_to_its_thread() {
+            let outs: Vec<_> = std::thread::scope(|s| {
+                let runs: Vec<_> = ["svc", "libc", "machtrap"]
+                    .into_iter()
+                    .map(|call| {
+                        s.spawn(move || {
+                            let limit = std::time::Duration::from_secs(600);
+                            (call, child_within("denied_call_child", &[("WICK_TEST_CALL", call)], limit))
+                        })
+                    })
+                    .collect();
+                runs.into_iter().map(|r| r.join().unwrap()).collect()
+            });
+            for (call, out) in outs {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let want = format!("{call}: returned 0, sandbox kills {DENIED_CALL_TRIALS}, other ends []");
+                assert!(stdout.contains(&want), "{call}: {}", text(&out));
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_a_denied_call_never_returns_to_its_thread in a separate process"]
+        fn denied_call_child() {
+            unsafe extern "C" {
+                static mach_task_self_: libc::mach_port_t;
+                fn pid_for_task(task: libc::mach_port_t, pid: *mut libc::c_int) -> libc::c_int;
+            }
+            let call = std::env::var("WICK_TEST_CALL").unwrap();
+            crate::signal_handler::register_signal_handlers().unwrap();
+            select(Policy::Default);
+            let _ = COMPILED.set((Compiled::here(&profile().unwrap()).unwrap(), Compiled::here(&api_profile()).unwrap()));
+            // SAFETY: a shared anonymous page, kept for the process's life.
+            let page = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    16384,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_SHARED,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(page, libc::MAP_FAILED);
+            let stamp = page.cast::<std::sync::atomic::AtomicU64>();
+            let (mut returned, mut killed, mut others) = (0, 0, Vec::new());
+            for _ in 0..DENIED_CALL_TRIALS {
+                // SAFETY: the shared page above.
+                unsafe { (*stamp).store(0, Ordering::SeqCst) };
+                // SAFETY: the child calls only what a fork's child may before
+                // it exits or is killed: the sandbox's apply, a thread, the
+                // call.
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0);
+                if pid == 0 {
+                    apply().unwrap();
+                    let stamp = stamp as usize;
+                    let call = call.clone();
+                    let thread = std::thread::spawn(move || {
+                        match call.as_str() {
+                            // SAFETY: getppid takes no arguments; not in
+                            // SYSCALLS.
+                            "svc" => unsafe {
+                                svc(39, [0; 8]);
+                            },
+                            // SAFETY: as above, through its libc stub.
+                            "libc" => unsafe {
+                                libc::getppid();
+                            },
+                            // SAFETY: the task's own port, set before main; a
+                            // valid output pointer; not in MACH_TRAPS.
+                            _ => unsafe {
+                                let mut pid = 0;
+                                pid_for_task(mach_task_self_, &mut pid);
+                            },
+                        }
+                        // SAFETY: the shared page.
+                        unsafe { (*(stamp as *const std::sync::atomic::AtomicU64)).store(1, Ordering::SeqCst) };
+                    });
+                    let _ = thread.join();
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    // SAFETY: ends the child.
+                    unsafe { libc::_exit(0) };
+                }
+                let reason = exit_reason(pid);
+                let mut status = 0;
+                // SAFETY: our child, exited.
+                assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+                // SAFETY: the shared page.
+                if unsafe { (*stamp).load(Ordering::SeqCst) } != 0 {
+                    returned += 1;
+                }
+                if libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL && sandbox_kill(reason)
+                {
+                    killed += 1;
+                } else if others.len() < 5 {
+                    others.push(format!("status {status:#x} reason {reason:x?}"));
+                }
+            }
+            println!("{call}: returned {returned}, sandbox kills {killed}, other ends {others:?}");
+        }
+
+        // A process whose SIGSYS is ignored or caught by a handler that
+        // returns is ended by its denied call all the same: the kernel's
+        // kill does not go through the signal's disposition, as Linux's
+        // seccomp trap does not (kernel/signal.c `force_sig_info_to_task`
+        // resets an ignored or blocked SIGSYS before it delivers it). Set in
+        // the setup phase, where `sigaction` is allowed.
+        #[test]
+        fn test_an_ignored_or_replaced_sigsys_cannot_keep_a_denied_process_running() {
+            use std::os::unix::process::ExitStatusExt;
+            for case in ["ignored", "replaced"] {
+                let (out, reason) = child_reason("sigsys_disposition_child", &[("WICK_TEST_CASE", case)]);
+                assert!(!String::from_utf8_lossy(&out.stdout).contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
+                assert_eq!(out.status.signal(), Some(libc::SIGKILL), "{case}: {}", text(&out));
+                assert!(sandbox_kill(reason), "{case}: {}", text(&out));
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_an_ignored_or_replaced_sigsys_cannot_keep_a_denied_process_running in a separate process"]
+        fn sigsys_disposition_child() {
+            extern "C" fn returns(_: libc::c_int) {}
+            crate::signal_handler::register_signal_handlers().unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            let handler = match std::env::var("WICK_TEST_CASE").unwrap().as_str() {
+                "ignored" => libc::SIG_IGN,
+                _ => returns as *const () as usize,
+            };
+            // SAFETY: a zeroed sigaction with the case's handler.
+            unsafe {
+                let mut act: libc::sigaction = std::mem::zeroed();
+                act.sa_sigaction = handler;
+                assert_eq!(libc::sigaction(libc::SIGSYS, &act, std::ptr::null_mut()), 0);
+            }
+            // SAFETY: no arguments; not in SYSCALLS.
+            std::thread::spawn(|| unsafe { libc::getppid() }).join().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            println!("CHILD-SURVIVED");
+        }
+
+        // A process that blocks SIGSYS on all of its threads at once (xnu's
+        // `sigprocmask` sets every thread's mask, bsd/kern/kern_sig.c
+        // `sigprocmask` and `set_procsigmask`; Apple's `abort` does it) is
+        // ended by its denied call all the same, as Linux's seccomp trap
+        // unblocks SIGSYS to deliver it (kernel/signal.c
+        // `force_sig_info_to_task`).
+        #[test]
+        fn test_a_process_wide_sigsys_block_cannot_keep_a_denied_process_running() {
+            use std::os::unix::process::ExitStatusExt;
+            let (out, reason) = child_reason("sigsys_blocked_child", &[]);
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("CHILD-SURVIVED"), "{}", text(&out));
+            assert_eq!(out.status.signal(), Some(libc::SIGKILL), "{}", text(&out));
+            assert!(sandbox_kill(reason), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_a_process_wide_sigsys_block_cannot_keep_a_denied_process_running in a separate process"]
+        fn sigsys_blocked_child() {
+            crate::signal_handler::register_signal_handlers().unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            // SAFETY: a set of SIGSYS, blocked for the whole process.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGSYS);
+                assert_eq!(libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()), 0);
+            }
+            // SAFETY: no arguments; not in SYSCALLS.
+            std::thread::spawn(|| unsafe { libc::getppid() }).join().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            println!("CHILD-SURVIVED");
         }
 
         // Before narrow(), what building the microVM takes is allowed; after
-        // it, only the run phase's lists: a call of the setup phase raises
-        // SIGSYS, as one outside the VMM thread's filter does on Linux.
+        // it, only the run phase's lists: a call of the setup phase is a
+        // denial, as one outside the VMM thread's filter does on Linux.
         #[test]
         fn test_narrow_ends_the_setup_phase() {
-            use std::os::unix::process::ExitStatusExt;
             let out = child("narrowed_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(stdout.contains("SETUP-OK"), "{}", text(&out));
             assert!(stdout.contains("EPOLL-OK"), "{}", text(&out));
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
+            assert!(denied(&out), "{}", text(&out));
             assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
 
@@ -2630,7 +2378,7 @@ mod macos {
         // SIGTRAP (`brk`), at their default action here. Under macOS 15's
         // Seatbelt the kernel's own message for it has to be allowed
         // (`EXCEPTION_MIG_ROUTINES`): without the allowance each case ends
-        // by SIGSYS there.
+        // by the sandbox's kill there.
         #[test]
         fn test_a_fault_is_its_signal_under_each_profile() {
             use std::os::unix::process::ExitStatusExt;
@@ -2699,13 +2447,12 @@ mod macos {
         // ux_handler.c: not the host's exception port) and raises no signal,
         // here at a fault's default action, as without a sandbox (the
         // control); the routines that would hand it an exception port are
-        // denied (SIGSYS), and the API process sends no Mach message at all.
+        // denied, and the API process sends no Mach message at all.
         // On macOS 26 and 27 the filter is not consulted for the message, so
         // there the cases show what the routine does; on 15 they also show
         // the allowance.
         #[test]
         fn test_an_exception_message_of_its_own_does_nothing() {
-            use std::os::unix::process::ExitStatusExt;
             let lists = [
                 SETUP_MIG_ROUTINES, SETUP_MIG_ROUTINES_IF_DEFINED, MIG_ROUTINES, PVTIME_MIG_ROUTINES,
                 API_MIG_ROUTINES, EXCEPTION_MIG_ROUTINES,
@@ -2729,7 +2476,7 @@ mod macos {
                         "none-raise" | "setup-raise" | "run-raise" => {
                             out.status.success() && stdout.contains("MACH-MSG 0 REPLY-ID 2505\nRETCODE 5\n")
                         }
-                        _ => out.status.signal() == Some(libc::SIGSYS) && !stdout.contains("RETCODE"),
+                        _ => denied(&out) && !stdout.contains("RETCODE"),
                     };
                 if !ok {
                     failed.push(format!("{name}: {}", text(&out)));
@@ -2987,16 +2734,15 @@ mod macos {
         }
 
         // narrow() cannot be undone: after it, no extension can be issued or
-        // taken (each raises SIGSYS), and a thread cannot be created (Linux's
+        // taken (each is a denial), and a thread cannot be created (Linux's
         // VMM filter has no clone).
         #[test]
         fn test_narrowing_is_one_way() {
-            use std::os::unix::process::ExitStatusExt;
             for case in ["issue", "consume", "thread", "thread-policy"] {
                 let out = child("one_way_child", &[("WICK_TEST_CASE", case)]);
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 assert!(stdout.contains("NARROWED"), "{case}: {}", text(&out));
-                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                assert!(denied(&out), "{case}: {}", text(&out));
                 assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
             }
         }
@@ -3039,16 +2785,15 @@ mod macos {
         // server on an open socket needs, as upstream's api filter: a call
         // outside API_SYSCALLS, shared memory, an executable mapping, madvise
         // with advice other than MADV_DONTNEED and an fcntl command other
-        // than F_GETFD and F_SETFD raise SIGSYS; a file fails with an error,
+        // than F_GETFD and F_SETFD are denials; a file fails with an error,
         // as outside the chroot.
         #[test]
-        fn test_api_profile_raises_sigsys_outside_its_list() {
-            use std::os::unix::process::ExitStatusExt;
+        fn test_api_profile_denies_outside_its_list() {
             for case in ["dup", "shm", "exec", "socketpair", "madvise", "dontneed", "fcntl"] {
                 let out = child("api_child", &[("WICK_TEST_CASE", case)]);
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 assert!(stdout.contains("SETUP-OK"), "{case}: {}", text(&out));
-                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                assert!(denied(&out), "{case}: {}", text(&out));
                 assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
             }
             let out = child("api_child", &[("WICK_TEST_CASE", "allowed")]);
@@ -3057,7 +2802,7 @@ mod macos {
         }
 
         #[test]
-        #[ignore = "run by test_api_profile_raises_sigsys_outside_its_list in a separate process"]
+        #[ignore = "run by test_api_profile_denies_outside_its_list in a separate process"]
         fn api_child() {
             use std::os::unix::process::ExitStatusExt;
             // The API process is a fork made with one thread
@@ -3083,6 +2828,11 @@ mod macos {
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 // SAFETY: ends the forked child.
                 unsafe { libc::_exit(if ok { 0 } else { 101 }) };
+            }
+            // Its exit reason, which only this process may read, for
+            // [`denied`].
+            if let Some((namespace, code)) = exit_reason(pid) {
+                println!("\n{EXIT_REASON_LINE}{namespace} {code:#x}");
             }
             let mut status = 0;
             // SAFETY: our child; an out-pointer.
@@ -3253,19 +3003,18 @@ mod macos {
         // (the compatibility libc's check). Before narrow(), where Linux's
         // VMM thread is unfiltered, an anonymous one is made.
         #[test]
-        fn test_executable_mappings_raise_sigsys() {
-            use std::os::unix::process::ExitStatusExt;
+        fn test_executable_mappings_are_denials() {
             for case in ["file", "jit", "mmap", "mprotect", "blocked"] {
                 let out = child("exec_map_child", &[("WICK_TEST_CASE", case)]);
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 assert!(stdout.contains("SETUP-OK"), "{case}: {}", text(&out));
-                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                assert!(denied(&out), "{case}: {}", text(&out));
                 assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
             }
         }
 
         #[test]
-        #[ignore = "run by test_executable_mappings_raise_sigsys in a separate process"]
+        #[ignore = "run by test_executable_mappings_are_denials in a separate process"]
         fn exec_map_child() {
             const PAGE: usize = 16384;
             let anon = |prot| {
@@ -3332,7 +3081,7 @@ mod macos {
         // What the running microVM needs a thread for exists before narrow()
         // forbids making one: a timer made only after it (a hot-plugged
         // device's rate limiter, with no timer made at boot) fires, with no
-        // thread made then (a new thread would raise SIGSYS, as in
+        // thread made then (a new thread would are denials, as in
         // test_narrowing_is_one_way).
         #[test]
         fn test_threads_the_run_phase_needs_exist_before_narrow() {
@@ -3394,7 +3143,7 @@ mod macos {
         }
 
         #[test]
-        #[ignore = "run by test_denied_syscall_exits_as_seccomp in a separate process"]
+        #[ignore = "run by test_a_denied_syscall_ends_firecracker_by_the_sandboxs_kill in a separate process"]
         fn handled_child() {
             crate::signal_handler::register_signal_handlers().unwrap();
             select(Policy::Default);
@@ -3405,329 +3154,21 @@ mod macos {
             println!("CHILD-SURVIVED");
         }
 
-        /// How a SIGSYS case ended: its status (None: it hung, and was
-        /// killed), its output and error output, and how long after the
-        /// denied call.
-        struct SigsysRun {
-            status: Option<std::process::ExitStatus>,
-            stdout: String,
-            stderr: String,
-            after: std::time::Duration,
-        }
-
-        impl SigsysRun {
-            fn text(&self) -> String {
-                format!(
-                    "{:?} {:?} after the denied call\n--- stdout (last 2000 bytes)\n{}\n--- stderr\n{}",
-                    self.status,
-                    self.after,
-                    &self.stdout[self.stdout.len().saturating_sub(2000)..],
-                    self.stderr
-                )
-            }
-
-            fn code(&self) -> Option<i32> {
-                self.status.and_then(|s| s.code())
-            }
-        }
-
-        /// Runs `sigsys_lock_child` with `case`. Its standard output (where
-        /// it logs and writes metrics) is left unread until `drain` after
-        /// the denied call (never if None); the case must end within
-        /// `within` of it, or it is killed as hung.
-        fn sigsys_run(
-            case: &str,
-            drain: Option<std::time::Duration>,
-            within: std::time::Duration,
-        ) -> SigsysRun {
-            use std::io::{BufRead, Read};
-            use std::os::unix::process::CommandExt;
-            use std::process::Stdio;
-            use std::time::{Duration, Instant};
-            // A process group of its own: a hung case is killed with its
-            // fork (which, stuck in a handler, blocks every signal but
-            // SIGKILL).
-            let mut proc = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "ext::sandbox::macos::tests::sigsys_lock_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("WICK_TEST_CASE", case)
-                .process_group(0)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let (denied_tx, denied_rx) = std::sync::mpsc::channel();
-            let stderr = proc.stderr.take().unwrap();
-            let errors = std::thread::spawn(move || {
-                let mut all = String::new();
-                for line in std::io::BufReader::new(stderr).lines() {
-                    let line = line.unwrap_or_default();
-                    if line.contains("DENYING") {
-                        let _ = denied_tx.send(Instant::now());
-                    }
-                    all.push_str(&line);
-                    all.push('\n');
-                }
-                all
-            });
-            let (drain_tx, drain_rx) = std::sync::mpsc::channel::<()>();
-            let mut stdout = proc.stdout.take().unwrap();
-            let output = std::thread::spawn(move || {
-                // Unread until told, or until the case ended.
-                let _ = drain_rx.recv();
-                let mut all = Vec::new();
-                let _ = stdout.read_to_end(&mut all);
-                String::from_utf8_lossy(&all).into_owned()
-            });
-            let denied = denied_rx.recv_timeout(Duration::from_secs(60));
-            let start = denied.unwrap_or_else(|_| Instant::now());
-            let mut drain_tx = Some(drain_tx);
-            let status = loop {
-                if let Some(status) = proc.try_wait().unwrap() {
-                    break Some(status);
-                }
-                if drain.is_some_and(|d| start.elapsed() >= d) {
-                    drain_tx.take();
-                }
-                if start.elapsed() > within {
-                    // SAFETY: the case's own process group.
-                    unsafe { libc::killpg(proc.id() as libc::pid_t, libc::SIGKILL) };
-                    let _ = proc.wait();
-                    break None;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            };
-            let after = start.elapsed();
-            drop(drain_tx);
-            // The fork may outlive the case (ended by its deadline thread
-            // only after the case's process): end it too.
-            // SAFETY: as above.
-            unsafe { libc::killpg(proc.id() as libc::pid_t, libc::SIGKILL) };
-            let run = SigsysRun {
-                status,
-                stdout: output.join().unwrap(),
-                stderr: errors.join().unwrap(),
-                after,
-            };
-            assert!(denied.is_ok(), "the case did not reach its denied call: {}", run.text());
-            run
-        }
-
-        /// The metrics upstream's handler writes: the seccomp fault stored.
-        const FAULT_METRIC: &str = "\"seccomp\":{\"num_faults\":1}";
-
-        // A SIGSYS from the sandbox comes to whichever thread the kernel
-        // picks, not to the thread that made the call (as seccomp's does);
-        // here to the thread that holds the metrics lock, blocked writing
-        // metrics to a pipe nobody reads yet. Upstream's handler work
-        // (metric, log line, metrics, exit 148) must not wait on that
-        // thread: once the pipe is read, the process exits 148 and the
-        // metrics written last have the fault. A second denied call while
-        // the first is handled changes nothing.
-        #[test]
-        fn test_sigsys_does_not_wait_on_the_metrics_lock() {
-            use std::time::Duration;
-            let run = sigsys_run("metrics", Some(Duration::from_millis(500)), Duration::from_secs(20));
-            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
-            assert!(run.stdout.contains(FAULT_METRIC), "{}", run.text());
-            assert!(!run.stdout.contains("CHILD-SURVIVED"), "{}", run.text());
-        }
-
-        /// The `STAGES-NS` line `in_fork` printed for a case, by name:
-        /// nanoseconds from just before the denied call (0: not reached).
-        fn stages(run: &SigsysRun) -> std::collections::HashMap<String, u64> {
-            let line = run
-                .stdout
-                .split("STAGES-NS ")
-                .nth(1)
-                .and_then(|r| r.lines().next())
-                .unwrap_or_else(|| panic!("no stages: {}", run.text()));
-            let words: Vec<&str> = line.split_whitespace().collect();
-            words.chunks(2).map(|w| (w[0].to_owned(), w[1].parse().unwrap())).collect()
-        }
-
-        // The SIGSYS handler takes the logger's lock (upstream's handler
-        // logs), and a thread of the process may hold it (as upstream's
-        // update() does while configuring the logger). Held for good, the
-        // handler never logs, and SIGSYS_DEADLINE ends the process with
-        // exit 148 all the same: the wait on the lock is bounded by the
-        // deadline, which starts when the waiter wakes and cannot end
-        // before. No bound on how late: that is the host's scheduling.
-        #[test]
-        fn test_sigsys_deadline_bounds_a_wait_on_the_logger_lock() {
-            use std::time::Duration;
-            let run = sigsys_run("logger-held", Some(Duration::ZERO), SIGSYS_DEADLINE + Duration::from_secs(20));
-            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
-            assert!(!run.stdout.contains("Shutting down VM"), "the handler logged: {}", run.text());
-            let at = stages(&run);
-            assert!(at["woken"] > 0 && at["released"] == 0, "{at:?}: {}", run.text());
-            let waited = Duration::from_nanos(at["exited"] - at["woken"]);
-            assert!(waited >= SIGSYS_DEADLINE, "exit {waited:?} after the waiter woke: {at:?}");
-        }
-
-        // Released once the waiter has woken (the deadline then has all of
-        // its time left), the lock lets the handler's work through: its log
-        // line, the fault counted, exit 148. A run without them prints when
-        // each stage came, so a host that kept the process off its CPUs
-        // for the deadline says so.
-        #[test]
-        fn test_sigsys_handler_logs_once_the_logger_lock_is_released() {
-            use std::time::Duration;
-            let run = sigsys_run("logger", Some(Duration::ZERO), Duration::from_secs(20));
-            let at = stages(&run);
-            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{at:?}: {}", run.text());
-            assert!(at["released"] >= at["woken"] && at["woken"] > 0, "{at:?}: {}", run.text());
-            assert!(
-                run.stdout.contains("Shutting down VM after the host sandbox denied a system call."),
-                "{at:?}: {}",
-                run.text()
-            );
-            assert!(run.stdout.contains(FAULT_METRIC), "{at:?}: {}", run.text());
-        }
-
-        // A thread's panic (upstream's hook writes metrics, then aborts)
-        // while a SIGSYS is handled, with the metrics lock held as above:
-        // the process ends, by the sandbox's exit code or the abort,
-        // whichever comes first (as on Linux, where both run at once), and
-        // does not hang.
-        #[test]
-        fn test_sigsys_during_a_panic_ends_the_process() {
-            use std::os::unix::process::ExitStatusExt;
-            use std::time::Duration;
-            let run = sigsys_run("panic", Some(Duration::from_millis(500)), Duration::from_secs(20));
-            let status = run.status.unwrap_or_else(|| panic!("hung: {}", run.text()));
-            assert!(
-                status.code() == Some(crate::FcExitCode::BadSyscall as i32)
-                    || status.signal() == Some(libc::SIGABRT),
-                "{}",
-                run.text()
-            );
-        }
-
-        // If upstream's handler work cannot finish (the thread that holds
-        // the metrics lock is blocked writing to a pipe nobody reads, and
-        // the handler's own metrics would wait behind it), the process exits
-        // 148 by SIGSYS_DEADLINE, without that work: the log line and
-        // metrics nobody was reading. On Linux the handler waits as long
-        // as the write blocks.
-        #[test]
-        fn test_sigsys_exits_by_its_deadline() {
-            use std::time::Duration;
-            let run = sigsys_run("undrained", None, SIGSYS_DEADLINE + Duration::from_secs(20));
-            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
-            assert!(run.after >= SIGSYS_DEADLINE, "{}", run.text());
-            assert!(!run.stdout.contains(FAULT_METRIC), "{}", run.text());
-        }
-
-        // That exit (forward_sigsys's _exit, the waiter not woken) drains
-        // a FIFO's overflow first: a reader of the log or metrics FIFO gets
-        // all Firecracker wrote, as Linux's FIFO holds it (ext::fifo).
-        #[test]
-        fn test_a_sigsys_exit_drains_a_fifos_overflow() {
-            use std::time::{Duration, Instant};
-
-            use crate::ext::fifo::tests::{fifo, lines, read_exactly, reader};
-            let (_dir, path) = fifo("sigsys");
-            let r = reader(&path);
-            let written = path.with_extension("written");
-            let reading = std::thread::spawn(move || {
-                // Not before the child filled the FIFO and its overflow: a
-                // reader from the start would let every write into the FIFO.
-                let deadline = Instant::now() + Duration::from_secs(60);
-                while !written.exists() {
-                    assert!(Instant::now() < deadline, "the child did not fill the FIFO");
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                read_exactly(&r, 30000)
-            });
-            let run = sigsys_run(&format!("brokenpipe-fifo={}", path.display()), Some(Duration::ZERO), Duration::from_secs(20));
-            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
-            assert!(reading.join().unwrap() == lines(0..300), "the lines came back otherwise: {}", run.text());
-        }
-
-        // If the waiter cannot be woken (its pipe broken), the signal's
-        // handler exits 148 at once, without upstream's handler work.
-        #[test]
-        fn test_sigsys_without_its_waiter_exits_at_once() {
-            use std::time::Duration;
-            let run = sigsys_run("brokenpipe", Some(Duration::ZERO), Duration::from_secs(20));
-            assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
-            assert!(!run.stdout.contains(FAULT_METRIC), "{}", run.text());
-            assert!(run.after < SIGSYS_DEADLINE, "{}", run.text());
-        }
-
-        /// The "free" case `runs` times: each run's stages (`STAGES-NS`),
-        /// from just before the denied call, printed as each run ends and as a
-        /// distribution at the end. Each run must end as upstream's handler
-        /// ends it (the bad-syscall code, the fault counted), by the stage
-        /// timing: the waiter woken and the process gone, with the denying
-        /// thread run no longer than the process.
-        fn sigsys_free_runs(runs: usize) -> Vec<[std::time::Duration; 5]> {
-            use std::time::Duration;
-            let mut all = Vec::new();
-            for _ in 0..runs {
-                let run = sigsys_run("free", Some(Duration::ZERO), Duration::from_secs(20));
-                assert_eq!(run.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", run.text());
-                assert!(run.stdout.contains(FAULT_METRIC), "{}", run.text());
-                let line = run
-                    .stdout
-                    .split("STAGES-NS ")
-                    .nth(1)
-                    .and_then(|r| r.lines().next())
-                    .unwrap_or_else(|| panic!("{}", run.text()))
-                    .to_owned();
-                let ns: Vec<u64> = line.split_whitespace().skip(1).step_by(2).map(|n| n.parse().unwrap()).collect();
-                let [returned, forwarded, woken, exited, last_run, _released] = ns[..] else { panic!("{line}") };
-                eprintln!("sigsys stages: {line}");
-                assert!(
-                    returned > 0 && forwarded > 0 && woken >= forwarded && exited >= woken,
-                    "{line}\n{}",
-                    run.text()
-                );
-                assert!(last_run <= exited, "the denying thread ran on past the exit: {line}");
-                all.push([returned, forwarded, woken, exited, last_run].map(Duration::from_nanos));
-            }
-            for (i, name) in ["returned", "forwarded", "woken", "exited", "denying thread's last run"].iter().enumerate() {
-                let mut v: Vec<_> = all.iter().map(|s| s[i]).collect();
-                v.sort();
-                eprintln!("sigsys {name}: median {:?}, longest {:?} ({runs} runs)", v[runs / 2], v[runs - 1]);
-            }
-            all
-        }
-
-        // What the product guarantees: a denied call ends the process with
-        // upstream's handler work done (its exit code, the fault counted),
-        // within SIGSYS_DEADLINE of the call, the denying thread running on
-        // no longer than the process. Each run's stages and their
-        // distribution are printed every time (CI runs it alone with
-        // --nocapture), so a slow run says where the time went; they are
-        // SIGSYS_DEADLINE's measurement.
-        #[test]
-        fn test_sigsys_handler_work_ends_the_process_within_its_deadline() {
-            for stages in sigsys_free_runs(20) {
-                assert!(stages[3] <= SIGSYS_DEADLINE, "{stages:?}");
-            }
-        }
-
         /// A system call number the kernel has no entry for (macOS has
-        /// `SYS_MAXSYSCALL` 558): xnu's `unix_syscall` runs `nosys` for it
-        /// (bsd/dev/arm/systemcalls.c), which fails with ENOSYS and signals
-        /// the calling thread (bsd/kern/subr_xxx.c, `psignal_uthread`).
+        /// `SYS_MAXSYSCALL` 558): xnu's `unix_syscall` checks it with the
+        /// sandbox as SYS_invalid (63) and, let through, runs `nosys` for it
+        /// (bsd/dev/arm/systemcalls.c :112, :161), which fails with ENOSYS
+        /// and signals the calling thread (bsd/kern/subr_xxx.c,
+        /// `psignal_uthread`).
         const UNKNOWN_SYSCALL: u16 = 1000;
 
-        // With the sandbox, a call the kernel has no number for raises
-        // SIGSYS on the calling thread itself (the kernel's, not the
-        // sandbox's: Seatbelt lets it through), and Firecracker exits as for
-        // any denied call, as upstream's filters trap a number they do not
-        // list.
+        // With the sandbox, a call the kernel has no number for is a denial,
+        // as upstream's filters trap a number they do not list: no list has
+        // SYS_invalid, as which the kernel checks it.
         #[test]
-        fn test_an_unknown_syscall_number_exits_as_a_denied_one() {
+        fn test_an_unknown_syscall_number_is_a_denial() {
             let out = child("unknown_syscall_child", &[("WICK_TEST_POLICY", "default")]);
-            assert_eq!(out.status.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", text(&out));
+            assert!(denied(&out), "{}", text(&out));
         }
 
         // Without the sandbox (--no-seccomp) the same call fails with ENOSYS
@@ -3740,7 +3181,7 @@ mod macos {
         }
 
         #[test]
-        #[ignore = "run by the test_an_unknown_syscall_number_* tests in a separate process"]
+        #[ignore = "run by test_an_unknown_syscall_number_is_a_denial and test_an_unknown_syscall_number_without_the_sandbox_fails_with_enosys in a separate process"]
         fn unknown_syscall_child() {
             crate::signal_handler::register_signal_handlers().unwrap();
             let none = std::env::var("WICK_TEST_POLICY").unwrap() == "none";
@@ -3758,36 +3199,31 @@ mod macos {
             println!("ENOSYS-AND-ALIVE");
         }
 
-        /// Runs `ending_child` with `case`, "<who>-<how>": the thread
-        /// `who` (`first`, the process's first thread; `other`, one it
-        /// made; `none`, as `other` with no denied call) makes a denied
-        /// call and at once ends the process `how`. `diagother` and
-        /// `diagfirst` are `none` with [`diagnose_sigsys`] in place of the
-        /// sandbox's handler, SIGSYS blocked on the first thread (and the
-        /// sandbox's own, made by it) or on the other.
-        fn ending(case: &str) -> std::process::Output {
-            child("ending_child", &[("WICK_TEST_CASE", case)])
+        /// Runs `ending_child` with `case`, "<who>-<how>": the thread `who`
+        /// (`denier`, after a denied call; `none`, with no denied call) ends
+        /// the process `how`, in the run phase.
+        fn ending(case: &str) -> (std::process::Output, Option<ExitReason>) {
+            child_reason("ending_child", &[("WICK_TEST_CASE", case)])
         }
 
         const HOWS: [&str; 5] = ["abort", "panic", "fault", "exit", "trap"];
 
+        /// The metrics upstream's handler writes for a seccomp fault.
+        const FAULT_METRIC: &str = "\"seccomp\":{\"num_faults\":1}";
+
         /// A failed case's output, with what Seatbelt reported for its
-        /// process (the fork, whose pid is the case's `CHILD-PID` line): the
-        /// kernel logs each call it denies by its number or name
-        /// ("deny(1) syscall-unix 39"), which the signal does not carry.
-        /// Read from the log store here, since a CI step that reads it
-        /// after all the tests has thousands of other tests' lines. Not
-        /// every denied call has a line: the kernel leaves out a report it
-        /// takes for a duplicate (ten test processes that each had
-        /// getppid denied left two lines, macOS 27.2), so no line is not
-        /// no denied call; `diagnose_sigsys` is what names the call.
+        /// process (the case's `CHILD-PID` line): the kernel logs each call
+        /// it denies by its number or name ("deny(1) syscall-unix 39"), with
+        /// the threads' stacks, which the exit does not carry. Read from the
+        /// log store here, since a CI step that reads it after all the tests
+        /// has thousands of other tests' lines. Not every denied call has a
+        /// line: the kernel leaves out a report it takes for a duplicate.
         fn text_and_denials(out: &std::process::Output) -> String {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let Some(pid) = stdout.lines().find_map(|l| l.strip_prefix("CHILD-PID ")) else {
-                return format!("{}
---- Seatbelt's reports: no CHILD-PID line", text(out));
+                return format!("{}\n--- Seatbelt's reports: no CHILD-PID line", text(out));
             };
-            let predicate = format!("sender == \"Sandbox\" AND eventMessage CONTAINS \"({pid}) \"");
+            let predicate = format!("eventMessage CONTAINS \"Sandbox: \" AND eventMessage CONTAINS \"({pid}) \"");
             // A report reaches the store after the call it is for: read
             // until one is there, 10 s at most (a case with no denied call
             // has none).
@@ -3797,14 +3233,10 @@ mod macos {
                     .args(["show", "--last", "5m", "--style", "compact", "--predicate", &predicate])
                     .output();
                 let lines = match &log {
-                    Ok(log) => String::from_utf8_lossy(&log.stdout)
-                        .lines()
-                        .filter(|l| l.contains("Sandbox: "))
-                        .map(|l| format!("{l}\n"))
-                        .collect::<String>(),
+                    Ok(log) => String::from_utf8_lossy(&log.stdout).into_owned(),
                     Err(e) => break format!("/usr/bin/log: {e}"),
                 };
-                if !lines.is_empty() {
+                if lines.contains("Sandbox: ") {
                     break lines;
                 }
                 if start.elapsed() > std::time::Duration::from_secs(10) {
@@ -3815,61 +3247,60 @@ mod macos {
             format!("{}\n--- Seatbelt's reports for process {pid}\n{reports}", text(out))
         }
 
-        // The thread whose call the sandbox denied runs on with the call
-        // failed, and what it does next would end Firecracker before the
-        // waiter has (an abort, a panic, a fault upstream's handler exits
-        // on, exit, a trap): each of those ends asks first whether a call
-        // was denied, so Firecracker ends as for the denied call, with
-        // upstream's log line and metrics and nothing of the other end, as
-        // on Linux, where that thread runs nothing after its trapped call.
-        // (Without the asking each case ended the other way: 20 runs of 20
-        // each.)
+        // The thread whose call the sandbox denied does nothing after it:
+        // whatever it would have done next (an abort, a panic, a fault
+        // upstream's handler exits on, exit, a trap) never runs, and the
+        // process ends by the kernel's kill, with none of that end's output.
+        // On Linux too that thread runs nothing after its trapped call;
+        // there the process exits 148 with upstream's log line and fault
+        // metric, here it ends by SIGKILL (docs/COMPATIBILITY.md). (Under
+        // the earlier action, SIGSYS to the process, the thread ran on, and
+        // each of these ends needed a check of its own.)
         #[test]
         fn test_a_denied_calls_thread_cannot_end_firecracker_another_way() {
+            use std::os::unix::process::ExitStatusExt;
             // Every case runs, and each one that fails is reported.
             let mut failed = Vec::new();
-            for who in ["first", "other"] {
-                for how in HOWS {
-                    let case = format!("{who}-{how}");
-                    let out = ending(&case);
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let mut wrong = Vec::new();
-                    if out.status.code() != Some(crate::FcExitCode::BadSyscall as i32) {
-                        wrong.push("not exit 148".to_owned());
-                    }
-                    for needed in ["the host sandbox denied a system call", FAULT_METRIC] {
-                        if !stdout.contains(needed) {
-                            wrong.push(format!("no {needed:?}"));
-                        }
-                    }
-                    for other in [
-                        "Firecracker panicked",
-                        "intercepting signal 10",
-                        "intercepting signal 11",
-                        "\"panic_count\":1",
-                    ] {
-                        if stdout.contains(other) {
-                            wrong.push(format!("{other:?}"));
-                        }
-                    }
-                    if !wrong.is_empty() {
-                        failed.push(format!("{case}: {}: {}", wrong.join(", "), text_and_denials(&out)));
+            for how in HOWS {
+                let case = format!("denier-{how}");
+                let (out, reason) = ending(&case);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let mut wrong = Vec::new();
+                if out.status.signal() != Some(libc::SIGKILL) || !sandbox_kill(reason) {
+                    wrong.push(format!("not the sandbox's kill: reason {reason:x?}"));
+                }
+                for other in [
+                    "Firecracker panicked",
+                    "intercepting signal",
+                    "\"panic_count\":1",
+                    "AFTER-THE-DENIED-CALL",
+                    "CHILD-SURVIVED",
+                ] {
+                    if stdout.contains(other) {
+                        wrong.push(format!("{other:?}"));
                     }
                 }
+                if !wrong.is_empty() {
+                    failed.push(format!("{case}: {}: {}", wrong.join(", "), text_and_denials(&out)));
+                }
             }
-            assert!(failed.is_empty(), "{} of 10 cases:\n{}", failed.len(), failed.join("\n=====\n"));
+            assert!(failed.is_empty(), "{} of 5 cases:\n{}", failed.len(), failed.join("\n=====\n"));
         }
 
-        // With no denied call each of those ends is what it was: the
-        // signal's default action or upstream's handler, the panic hook,
-        // exit's code.
+        // With no denied call each of those ends is what it is on Linux,
+        // in the run phase: the signal's default action or upstream's
+        // handler, the panic hook, exit's code. A panic's abort() ends the
+        // process by SIGABRT with run-phase `sigaction` denied: Firecracker
+        // has no SIGABRT handler, so the reset to the default action that
+        // Linux's filter allows (`rt_sigaction` for SIGABRT only, and Apple's
+        // `__abort` makes too, Libc stdlib/FreeBSD/abort.c) is never reached.
         #[test]
         fn test_the_other_ends_are_unchanged_without_a_denied_call() {
             use std::os::unix::process::ExitStatusExt;
             // Every case runs, and each one that fails is reported.
             let mut failed = Vec::new();
             for how in HOWS {
-                let out = ending(&format!("none-{how}"));
+                let (out, _) = ending(&format!("none-{how}"));
                 let (code, signal) = (out.status.code(), out.status.signal());
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let ok = match how {
@@ -3882,116 +3313,21 @@ mod macos {
                     _ => signal == Some(libc::SIGTRAP),
                 };
                 if !ok || stdout.contains(FAULT_METRIC) {
-                    // Which call was denied, and where: the case again with
-                    // SIGSYS taken by the thread that ends the process
-                    // (`diagother`) and by the first thread (`diagfirst`),
-                    // each printing the call it was in (`diagnose_sigsys`).
-                    let diagnosis: String = ["diagother", "diagfirst"]
-                        .iter()
-                        .map(|who| format!("\n--- {who}-{how}\n{}", text(&ending(&format!("{who}-{how}")))))
-                        .collect();
-                    failed.push(format!("{how}: {}{diagnosis}", text_and_denials(&out)));
+                    failed.push(format!("{how}: {}", text_and_denials(&out)));
                 }
             }
             assert!(failed.is_empty(), "{} of 5 cases:\n{}", failed.len(), failed.join("\n=====\n"));
         }
 
-        /// A SIGSYS handler for a case that should have had no denied call:
-        /// prints the thread that took the signal and the call it was in,
-        /// and ends the process with 99. The signal is the process's, and
-        /// the kernel gives it to the first thread that does not block it,
-        /// so the case blocks it on the threads that are not looked at.
-        /// The thread's registers at the signal: x16 is the call's number
-        /// in libsystem's stubs (negative: a Mach trap), the instruction
-        /// before pc is `svc 0x80` if it was in a call, x0 and the carry
-        /// flag are the call's result (carry set: x0 is the errno; EINTR
-        /// for a wait the signal interrupted, which is not the denied
-        /// call). Then pc, lr and the stack's return addresses by symbol.
-        /// A diagnosis: it formats and symbolizes in a signal handler.
-        extern "C" fn diagnose_sigsys(_: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
-            use std::fmt::Write as _;
-            struct Line([u8; 512], usize);
-            impl std::fmt::Write for Line {
-                fn write_str(&mut self, s: &str) -> std::fmt::Result {
-                    let n = s.len().min(self.0.len() - self.1);
-                    self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
-                    self.1 += n;
-                    Ok(())
-                }
-            }
-            // SAFETY: the handler's arguments, as the kernel passes them to
-            // an SA_SIGINFO handler on arm64; the instruction before pc is
-            // mapped text when pc is.
-            unsafe {
-                let state = &(*(*ctx.cast::<libc::ucontext_t>()).uc_mcontext).__ss;
-                let (pc, lr) = (state.__pc, state.__lr);
-                let before = if pc >= 4 { (pc as *const u32).sub(1).read_unaligned() } else { 0 };
-                let mut line = Line([0; 512], 0);
-                let _ = writeln!(
-                    line,
-                    "DIAG SIGSYS code {} pid {} taken by the {} thread: x16 {} in_svc {} x0 {} carry {} pc {pc:#x} lr {lr:#x}",
-                    (*info).si_code,
-                    (*info).si_pid,
-                    if RECEIVER.load(Ordering::Acquire) == libc::pthread_self() as usize { "first" } else { "other" },
-                    state.__x[16].cast_signed(),
-                    before == 0xd400_1001,
-                    state.__x[0].cast_signed(),
-                    (state.__cpsr >> 29) & 1,
-                );
-                libc::write(1, line.0.as_ptr().cast(), line.1);
-                let mut frames = [std::ptr::null_mut::<libc::c_void>(); 34];
-                frames[0] = pc as *mut libc::c_void;
-                frames[1] = lr as *mut libc::c_void;
-                let n = libc::backtrace(frames[2..].as_mut_ptr(), 32);
-                libc::backtrace_symbols_fd(frames.as_ptr(), n + 2, 1);
-                libc::_exit(99);
-            }
-        }
-
-        // The diagnosis the test above runs for a case that fails names
-        // the denied call and its thread: getppid (39) here, made by the
-        // other thread, or by it while the first thread takes the signal
-        // inside its wait for that thread (not in the denied call: it
-        // shows the wait, on macOS 27 ulock_wait, 515, interrupted, x0 -4).
-        #[test]
-        fn test_the_diagnosis_of_an_unexpected_sigsys_names_the_call() {
-            for (who, expected) in [
-                ("diagother", "taken by the other thread: x16 39 in_svc true"),
-                ("diagfirst", "taken by the first thread: x16 "),
-            ] {
-                let out = child(
-                    "ending_child",
-                    &[("WICK_TEST_CASE", &format!("{who}-wait")), ("WICK_TEST_DIAG_DENIES", "1")],
-                );
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                assert!(out.status.code() == Some(99) && stdout.contains(expected), "{who}: {}", text(&out));
-                assert!(who != "diagother" || stdout.contains("getppid"), "{who}: {}", text(&out));
-            }
-        }
-
-        /// Blocks or unblocks SIGSYS on the calling thread.
-        fn mask_sigsys(how: libc::c_int) {
-            // SAFETY: a set of one valid signal.
-            unsafe {
-                let mut set: libc::sigset_t = 0;
-                libc::sigaddset(&mut set, libc::SIGSYS);
-                assert_eq!(libc::pthread_sigmask(how, &set, std::ptr::null_mut()), 0);
-            }
-        }
-
         #[test]
         #[ignore = "run by the tests of a denied call's thread ending the process"]
         fn ending_child() {
-            let case = std::env::var("WICK_TEST_CASE").unwrap();
-            in_fork(move || ending_case(&case));
-        }
-
-        fn ending_case(case: &str) {
             use std::os::fd::FromRawFd;
 
             use crate::logger::{LOGGER, METRICS, StoreMetric};
+            let case = std::env::var("WICK_TEST_CASE").unwrap();
             let (who, how) = case.split_once('-').unwrap();
-            let how = how.to_owned();
+            let (denies, how) = (who == "denier", how.to_owned());
             // For the parent's read of Seatbelt's reports (`text_and_denials`).
             // SAFETY: no arguments.
             println!("CHILD-PID {}", unsafe { libc::getpid() });
@@ -4008,119 +3344,47 @@ mod macos {
                 let _ = METRICS.write();
                 std::process::abort();
             }));
-            // The threads the sandbox makes inherit the mask.
-            if who == "diagother" {
-                mask_sigsys(libc::SIG_BLOCK);
-            }
             select(Policy::Default);
             apply().unwrap();
-            let diagnosis = who.starts_with("diag");
-            if diagnosis {
-                // SAFETY: a zeroed sigaction with a handler of its kind.
-                unsafe {
-                    let mut act: libc::sigaction = std::mem::zeroed();
-                    act.sa_sigaction = diagnose_sigsys as *const () as usize;
-                    act.sa_flags = libc::SA_SIGINFO;
-                    assert_eq!(libc::sigaction(libc::SIGSYS, &act, std::ptr::null_mut()), 0);
-                }
-            }
-            let denies = matches!(who, "first" | "other") || std::env::var_os("WICK_TEST_DIAG_DENIES").is_some();
-            let blocks = match who {
-                "diagother" => Some(libc::SIG_UNBLOCK),
-                "diagfirst" => Some(libc::SIG_BLOCK),
-                _ => None,
-            };
+            // A line logged in the setup phase, as Firecracker logs its start:
+            // the log's first local time reads the time zone (libc's
+            // `localtime_r` -> `tzsetwall_basic`, which calls `access`), once.
+            crate::logger::error_unrestricted!("setup");
+            // The thread is made before narrow(), which ends making them.
+            let (go, ready) = std::sync::mpsc::channel::<()>();
             let act = move || {
-                if let Some(how) = blocks {
-                    mask_sigsys(how);
-                }
+                let _ = ready.recv();
                 if denies {
-                    // SAFETY: no arguments; denied, which raises SIGSYS.
+                    // SAFETY: no arguments; denied.
                     unsafe { libc::getppid() };
+                    println!("AFTER-THE-DENIED-CALL");
                 }
                 match how.as_str() {
                     // SAFETY: ends the process.
                     "abort" => unsafe { libc::abort() },
-                    "panic" => panic!("after a denied call"),
+                    "panic" => panic!("in the run phase"),
                     // SAFETY: a write to address 0, which faults.
                     "fault" => unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) },
                     // SAFETY: ends the process, through its atexit handlers.
                     "exit" => unsafe { libc::exit(7) },
-                    // No end: the diagnosis's own test.
-                    "wait" => std::thread::sleep(std::time::Duration::from_secs(5)),
                     // SAFETY: a breakpoint trap, as libdispatch's for a
                     // Mach call that failed.
                     _ => unsafe { std::arch::asm!("brk #1") },
                 }
             };
-            if who == "first" {
-                act();
-            } else {
-                let _ = std::thread::spawn(act).join();
-            }
+            let thread = std::thread::spawn(act);
+            narrow().unwrap();
+            go.send(()).unwrap();
+            let _ = thread.join();
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
         }
 
-        // xnu keeps a caught signal's sender in the process and zeroes it
-        // when a signal is delivered, so the sandbox's SIGSYS comes with no
-        // sender if another signal is delivered first: here SIGINT, pending
-        // with it while both are blocked, and taken first as the lower
-        // number. Firecracker still ends as for the denied call. (Read as
-        // another process's SIGSYS, upstream's handler exited with its
-        // unexpected-error code, 2.)
-        #[test]
-        fn test_a_denied_calls_signal_without_its_sender_is_still_the_sandboxs() {
-            let out = child("senderless_child", &[]);
-            assert_eq!(out.status.code(), Some(crate::FcExitCode::BadSyscall as i32), "{}", text(&out));
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(stdout.contains("the host sandbox denied a system call"), "{}", text(&out));
-            assert!(stdout.contains(FAULT_METRIC), "{}", text(&out));
-        }
-
-        #[test]
-        #[ignore = "run by test_a_denied_calls_signal_without_its_sender_is_still_the_sandboxs"]
-        fn senderless_child() {
-            in_fork(|| {
-                use std::os::fd::FromRawFd;
-
-                use crate::logger::{LOGGER, METRICS};
-                extern "C" fn nothing(_: libc::c_int) {}
-                crate::signal_handler::register_signal_handlers().unwrap();
-                let _ = LOGGER.init();
-                // SAFETY: a new descriptor of standard output, owned here.
-                let out = unsafe { std::fs::File::from_raw_fd(libc::dup(1)) };
-                METRICS.init(std::io::LineWriter::new(crate::ext::fifo::plain(out))).unwrap();
-                // SAFETY: a handler for SIGINT that does nothing.
-                unsafe {
-                    let mut act: libc::sigaction = std::mem::zeroed();
-                    act.sa_sigaction = nothing as *const () as usize;
-                    libc::sigaction(libc::SIGINT, &act, std::ptr::null_mut());
-                }
-                select(Policy::Default);
-                apply().unwrap();
-                // SAFETY: a set of the two signals for this thread; the
-                // denied call's SIGSYS and then SIGINT pend on it, blocked,
-                // and are taken as they are unblocked, SIGINT first.
-                unsafe {
-                    let mut set: libc::sigset_t = std::mem::zeroed();
-                    libc::sigemptyset(&mut set);
-                    libc::sigaddset(&mut set, libc::SIGSYS);
-                    libc::sigaddset(&mut set, libc::SIGINT);
-                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-                    libc::getppid();
-                    libc::pthread_kill(libc::pthread_self(), libc::SIGINT);
-                    libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-                }
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                println!("CHILD-SURVIVED");
-            });
-        }
-
         /// Runs `body` in a fork of this process and ends as the fork ends:
         /// the fork's only thread, which `body` runs on, is then the
-        /// process's first, the one the kernel gives a process's signal to
-        /// if it does not block it (xnu `get_signalthread`).
+        /// process's first. The fork's exit reason, which only this process
+        /// may read, goes to standard output as [`child_run`] writes it, for
+        /// [`denied`].
         fn in_fork(body: impl FnOnce()) -> ! {
             // SAFETY: the fork runs `body` and ends; this process waits.
             match unsafe { libc::fork() } {
@@ -4131,31 +3395,14 @@ mod macos {
                     unsafe { libc::_exit(0) }
                 }
                 pid => {
+                    if let Some((namespace, code)) = exit_reason(pid) {
+                        println!("\n{EXIT_REASON_LINE}{namespace} {code:#x}");
+                    }
                     let mut status = 0;
                     // SAFETY: the fork's pid; ends this process as the fork
                     // ended (by its code, or its signal's default action).
                     unsafe {
                         libc::waitpid(pid, &mut status, 0);
-                        let page = RUN_ON.load(Ordering::Acquire);
-                        if !page.is_null() && (*page).load(Ordering::Acquire) != 0 {
-                            (*page.add(STAGE_EXITED)).store(now_ns(), Ordering::Release);
-                            let at = |slot: usize| (*page.add(slot)).load(Ordering::Acquire);
-                            let ran = at(1);
-                            println!("RUN-ON-NS {}", ran.saturating_sub(at(0)));
-                            // Each stage from just before the denied call (0:
-                            // not reached). The signal may come before the
-                            // call returns.
-                            let since = |slot: usize| at(slot).saturating_sub(at(STAGE_CALLED));
-                            println!(
-                                "STAGES-NS returned {} forwarded {} woken {} exited {} last-run {} released {}",
-                                since(0),
-                                since(SigsysStage::Forwarded as usize),
-                                since(SigsysStage::Woken as usize),
-                                since(STAGE_EXITED),
-                                since(1),
-                                since(STAGE_RELEASED)
-                            );
-                        }
                         if libc::WIFEXITED(status) {
                             libc::_exit(libc::WEXITSTATUS(status));
                         }
@@ -4165,199 +3412,6 @@ mod macos {
                     }
                 }
             }
-        }
-
-        /// Blocks SIGSYS in the calling thread.
-        fn block_sigsys() {
-            // SAFETY: a set of one signal, for this thread.
-            unsafe {
-                let mut set: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut set);
-                libc::sigaddset(&mut set, libc::SIGSYS);
-                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-            }
-        }
-
-        /// Writes to standard output until it is full (nobody reads it yet).
-        fn fill_stdout() {
-            // SAFETY: standard output's flags, set back after.
-            unsafe {
-                let flags = libc::fcntl(1, libc::F_GETFL);
-                libc::fcntl(1, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                let chunk = [b'.'; 4096];
-                while libc::write(1, chunk.as_ptr().cast(), chunk.len()) > 0 {}
-                libc::fcntl(1, libc::F_SETFL, flags);
-            }
-        }
-
-        /// A page the fork and this process share: when the denied call
-        /// returned (slot 0), the last time the denying thread ran after it
-        /// (1), the SIGSYS path's stages (`SigsysStage`, 2 and 3), when
-        /// this process saw the fork's exit ([`STAGE_EXITED`]) and the time
-        /// just before the call ([`STAGE_CALLED`]), and when a case released
-        /// the lock it held ([`STAGE_RELEASED`])
-        /// (nanoseconds of CLOCK_MONOTONIC_RAW).
-        static RUN_ON: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicU64> =
-            std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-        /// The slot of the fork's exit on [`RUN_ON`]'s page.
-        const STAGE_EXITED: usize = 4;
-        /// The slot of the time just before the denied call.
-        const STAGE_CALLED: usize = 5;
-        /// The slot of the time a case released the lock it held.
-        const STAGE_RELEASED: usize = 6;
-
-        fn now_ns() -> u64 {
-            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            // SAFETY: plain call; the clock is the same in every process.
-            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
-            u64::try_from(ts.tv_sec).unwrap() * 1_000_000_000 + u64::try_from(ts.tv_nsec).unwrap()
-        }
-
-        #[test]
-        #[ignore = "run by the test_sigsys_* tests in a separate process"]
-        fn sigsys_lock_child() {
-            let case = std::env::var("WICK_TEST_CASE").unwrap();
-            // SAFETY: an anonymous shared page, kept for the process.
-            let page = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    4096,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED | libc::MAP_ANON,
-                    -1,
-                    0,
-                )
-            };
-            assert_ne!(page, libc::MAP_FAILED);
-            RUN_ON.store(page.cast(), Ordering::Release);
-            SIGSYS_STAGES.store(page.cast(), Ordering::Release);
-            in_fork(move || sigsys_case(&case));
-        }
-
-        fn sigsys_case(case: &str) {
-            use std::os::fd::FromRawFd;
-            use std::time::Duration;
-
-            use crate::logger::{LOGGER, METRICS, StoreMetric};
-            crate::signal_handler::register_signal_handlers().unwrap();
-            let _ = LOGGER.init();
-            // Logs (with no target) and metrics go to standard output.
-            // SAFETY: a new descriptor of standard output, owned here.
-            let out = unsafe { std::fs::File::from_raw_fd(libc::dup(1)) };
-            METRICS.init(std::io::LineWriter::new(crate::ext::fifo::plain(out))).unwrap();
-            // "<case>-fifo=<path>": 300 lines into that FIFO first, the
-            // overflow beyond its own buffer held with the relay stopped (only
-            // the exit's drain moves it), then <path>.written made; after the
-            // sandbox, the reader's first bytes awaited.
-            let (case, fifo) = match case.split_once("-fifo=") {
-                Some((case, path)) => {
-                    use std::io::Write;
-                    let path = std::path::Path::new(path);
-                    let out = crate::utils::open_file_nonblock(path).unwrap();
-                    let mut w = &out;
-                    for i in 0..300 {
-                        w.write_all(&crate::ext::fifo::tests::line(i)).unwrap();
-                    }
-                    assert!(out.pause_relay() > 0, "nothing in the overflow");
-                    std::fs::write(path.with_extension("written"), b"").unwrap();
-                    (case, Some(out))
-                }
-                None => (case, None),
-            };
-            if case == "panic" {
-                // Upstream's hook (firecracker/src/main.rs), with the abort
-                // of its panic = "abort".
-                std::panic::set_hook(Box::new(|info| {
-                    crate::logger::error_unrestricted!("Firecracker {}", info);
-                    METRICS.vmm.panic_count.store(1);
-                    let _ = METRICS.write();
-                    std::process::abort();
-                }));
-            }
-            select(Policy::Default);
-            apply().unwrap();
-            if case == "brokenpipe" {
-                // The waiter's pipe, with no reader: the signal's handler
-                // cannot wake it.
-                let (r, w) = waiter_pipe().unwrap();
-                // SAFETY: the read end, made just above.
-                unsafe { libc::close(r) };
-                WAITER_PIPE.store(w, Ordering::Release);
-            }
-            if let Some(out) = &fifo {
-                out.wait_reader();
-            }
-            let panics = case == "panic";
-            let free = case == "free";
-            // The stages are printed for these cases too (in_fork).
-            let stamped = free || case.starts_with("logger");
-            // The offender blocks SIGSYS for itself: the sandbox's signal
-            // then goes to the first thread, which holds the lock.
-            let offender = std::thread::spawn(move || {
-                block_sigsys();
-                std::thread::sleep(Duration::from_millis(200));
-                eprintln!("DENYING");
-                if stamped {
-                    let page = RUN_ON.load(Ordering::Acquire);
-                    // SAFETY: the shared page sigsys_lock_child mapped.
-                    unsafe { (*page.add(STAGE_CALLED)).store(now_ns(), Ordering::Release) };
-                }
-                // SAFETY: no arguments; denied, which raises SIGSYS.
-                unsafe { libc::getppid() };
-                if !free && stamped {
-                    let page = RUN_ON.load(Ordering::Acquire);
-                    // SAFETY: the shared page sigsys_lock_child mapped.
-                    unsafe { (*page).store(now_ns(), Ordering::Release) };
-                }
-                if free {
-                    // How long this thread runs on, until the exit.
-                    let page = RUN_ON.load(Ordering::Acquire);
-                    // SAFETY: the shared page sigsys_lock_child mapped.
-                    unsafe {
-                        (*page).store(now_ns(), Ordering::Release);
-                        loop {
-                            (*page.add(1)).store(now_ns(), Ordering::Release);
-                        }
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(100));
-                // SAFETY: as above: a second one while the first is handled.
-                unsafe { libc::getppid() };
-                if panics {
-                    panic!("a thread's panic while a SIGSYS is handled");
-                }
-            });
-            match case {
-                "free" | "brokenpipe" => {}
-                "metrics" | "undrained" | "panic" => {
-                    fill_stdout();
-                    let _ = METRICS.write();
-                }
-                "logger" | "logger-held" => {
-                    let guard = LOGGER.0.write().unwrap();
-                    if case == "logger-held" {
-                        // Held until the deadline ends the process.
-                        loop {
-                            std::thread::sleep(Duration::from_secs(60));
-                        }
-                    }
-                    // Until the waiter has woken: the deadline has started.
-                    let page = SIGSYS_STAGES.load(Ordering::Acquire);
-                    // SAFETY: the shared page sigsys_lock_child mapped.
-                    while unsafe { (*page.add(SigsysStage::Woken as usize)).load(Ordering::Acquire) } == 0 {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    let run_on = RUN_ON.load(Ordering::Acquire);
-                    // SAFETY: as above.
-                    unsafe { (*run_on.add(STAGE_RELEASED)).store(now_ns(), Ordering::Release) };
-                    drop(guard);
-                }
-                other => panic!("{other}"),
-            }
-            let _ = offender.join();
-            std::thread::sleep(Duration::from_secs(5));
-            println!("CHILD-SURVIVED");
         }
 
         #[test]
@@ -4399,7 +3453,7 @@ mod macos {
         }
 
         #[test]
-        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        #[ignore = "run by test_unlisted_syscalls_are_denials in a separate process"]
         fn exec_child() {
             select(Policy::Default);
             apply().unwrap();
@@ -4411,14 +3465,13 @@ mod macos {
         // An IP socket is made after narrow() (socket is decided by
         // system-socket, which Seatbelt does not consult for an IP socket:
         // test_system_socket_is_not_consulted_for_these), and connecting it
-        // raises SIGSYS.
+        // is a denial.
         #[test]
         fn test_ip_sockets_are_made_but_not_used() {
-            use std::os::unix::process::ExitStatusExt;
             let out = child("ip_socket_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(stdout.contains("MADE"), "{}", text(&out));
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
+            assert!(denied(&out), "{}", text(&out));
             assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
 
@@ -4532,7 +3585,7 @@ mod macos {
 
         // IP networking: on Linux socket(AF_INET) is outside every filter.
         #[test]
-        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        #[ignore = "run by test_unlisted_syscalls_are_denials in a separate process"]
         fn tcp_child() {
             select(Policy::Default);
             apply().unwrap();
@@ -4542,7 +3595,7 @@ mod macos {
         }
 
         #[test]
-        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        #[ignore = "run by test_unlisted_syscalls_are_denials in a separate process"]
         fn udp_child() {
             select(Policy::Default);
             apply().unwrap();
@@ -4554,29 +3607,27 @@ mod macos {
         // A running microVM's VMM may punch holes (discard, Linux's
         // fallocate in the VMM filter) and restore the terminal on shutdown
         // (TCSETS); another driver request, here simulating terminal input
-        // (TIOCSTI), raises SIGSYS, as an ioctl outside the filter's requests
+        // (TIOCSTI), is a denial, as an ioctl outside the filter's requests
         // does on Linux.
         #[test]
         fn test_run_phase_ioctls_and_holes() {
             run_child("run_phase_child", &[]);
-            use std::os::unix::process::ExitStatusExt;
             let out = child("other_ioctl_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(stdout.contains("NARROWED"), "{}", text(&out));
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
+            assert!(denied(&out), "{}", text(&out));
         }
 
         // Shared memory after narrow(): the memfds this process makes, an
         // ordinary one and a 2 MiB huge page one (guest memory for a
         // vhost-user device on huge pages), are created; a name of another
-        // process raises SIGSYS.
+        // process is a denial.
         #[test]
         fn test_own_memfds_are_made_after_narrow() {
-            use std::os::unix::process::ExitStatusExt;
             let out = child("memfd_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(stdout.contains("MEMFDS-OK"), "{}", text(&out));
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
+            assert!(denied(&out), "{}", text(&out));
             assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
 
@@ -4597,7 +3648,7 @@ mod macos {
             println!("MEMFDS-OK");
             use std::io::Write;
             std::io::stdout().flush().unwrap();
-            // Another process's memfd name: the default rule, SIGSYS.
+            // Another process's memfd name: the default rule, a denial.
             let other = std::ffi::CString::new(format!("{}1.0", libc::HUGE_MEMFD_PREFIX)).unwrap();
             // SAFETY: a plain call.
             unsafe { libc::shm_open(other.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
@@ -4606,21 +3657,20 @@ mod macos {
         }
 
         // fcntl: after narrow(), the commands of FCNTL_COMMANDS run and any
-        // other one raises SIGSYS, as upstream's fcntl rules trap every
+        // other one is a denial, as upstream's fcntl rules trap every
         // command but F_SETFD and F_ADD_SEALS (Seatbelt's system-fcntl,
         // which checks every command).
         #[test]
-        fn test_fcntl_commands_outside_the_list_raise_sigsys() {
-            use std::os::unix::process::ExitStatusExt;
+        fn test_fcntl_commands_outside_the_list_are_denials() {
             let out = child("fcntl_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(stdout.contains("LISTED-OK"), "{}", text(&out));
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
+            assert!(denied(&out), "{}", text(&out));
             assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
 
         #[test]
-        #[ignore = "run by test_fcntl_commands_outside_the_list_raise_sigsys in a separate process"]
+        #[ignore = "run by test_fcntl_commands_outside_the_list_are_denials in a separate process"]
         fn fcntl_child() {
             use std::os::fd::AsRawFd;
             let file = std::fs::File::open("/dev/null").unwrap();
@@ -4867,16 +3917,15 @@ mod macos {
         }
 
         // Starting a vmnet interface is part of building the microVM: its
-        // service lookup succeeds before narrow() and raises SIGSYS after
+        // service lookup succeeds before narrow() and is a denial after
         // it; no other service is looked up in either phase.
         #[test]
         fn test_vmnet_lookup_is_setups_only() {
-            use std::os::unix::process::ExitStatusExt;
             for case in ["vmnet", "other"] {
                 let out = child("lookup_child", &[("WICK_TEST_CASE", case)]);
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 assert_eq!(stdout.contains("SETUP-LOOKUP-OK"), case == "vmnet", "{case}: {}", text(&out));
-                assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                assert!(denied(&out), "{case}: {}", text(&out));
                 assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
             }
         }
@@ -4949,7 +3998,7 @@ mod macos {
                 Ok(_) => println!("STARTED"),
                 Err(err) => println!("REFUSED {err}"),
             }
-            // SIGSYS's handler runs on a thread of its own: time for it.
+            // Time for a denial's kill to land.
             std::thread::sleep(std::time::Duration::from_secs(2));
             println!("CHILD-SURVIVED");
         }
@@ -4958,7 +4007,7 @@ mod macos {
         // no bind or listen. A socket bound before narrow() (its name gone)
         // cannot listen after it.
         #[test]
-        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        #[ignore = "run by test_unlisted_syscalls_are_denials in a separate process"]
         fn listen_after_narrow_child() {
             let path = std::env::temp_dir().join(format!("wick-bind-{}", std::process::id()));
             select(Policy::Default);
@@ -4998,14 +4047,13 @@ mod macos {
         // filter lets open its TAP: after narrow() a Unix socket binds
         // where setup could bind one (the jail, its network, or outside a
         // jail the operator's path: RUN_DENIED_OPERATIONS, run_rule), an IP
-        // socket raises SIGSYS, a stream socket bound then cannot listen,
+        // socket is a denial, a stream socket bound then cannot listen,
         // a path outside the jail fails with EPERM (the file rule's, as a
         // file there), and at a stale socket's path platform::net::bind
         // fails with EADDRINUSE (replacing it would remove a name) and the
         // process runs on.
         #[test]
         fn test_unix_bind_after_narrow_is_where_setup_binds() {
-            use std::os::unix::process::ExitStatusExt;
             let base = std::env::temp_dir()
                 .canonicalize()
                 .unwrap()
@@ -5030,7 +4078,7 @@ mod macos {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 assert!(stdout.contains("SETUP-BIND-OK"), "{case}: {}", text(&out));
                 if case == "free-ip" {
-                    assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                    assert!(denied(&out), "{case}: {}", text(&out));
                     assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
                 } else if case == "datagram-outside" {
                     // The file rule decides a socket file outside the jail,
@@ -5043,7 +4091,7 @@ mod macos {
                         out.status
                     );
                 } else if case == "stream" {
-                    assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case}: {}", text(&out));
+                    assert!(denied(&out), "{case}: {}", text(&out));
                     assert!(stdout.contains("LATE-BIND-OK") && !stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
                 } else {
                     let late = if case.ends_with("-stale") { "STALE-REFUSED" } else { "LATE-BIND-OK" };
@@ -5139,18 +4187,17 @@ mod macos {
         // sees and signals no other process. Here its sandbox holds it:
         // information about another process fails (EPERM; Seatbelt's default
         // rule does not cover it, the profile's explicit rule does), and a
-        // signal to one raises SIGSYS (the test's own process stands for any
+        // signal to one is a denial (the test's own process stands for any
         // other).
         #[test]
         fn test_no_other_process_in_reach() {
-            use std::os::unix::process::ExitStatusExt;
             let me = std::process::id().to_string();
             let out = child("other_pid_info_child", &[("WICK_TEST_OTHER_PID", &me)]);
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(out.status.success() && stdout.contains("OTHER-DENIED"), "{}", text(&out));
             let out = child("other_pid_signal_child", &[("WICK_TEST_OTHER_PID", &me)]);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{}", text(&out));
+            assert!(denied(&out), "{}", text(&out));
             assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
 
@@ -5202,7 +4249,7 @@ mod macos {
         }
 
         #[test]
-        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        #[ignore = "run by test_unlisted_syscalls_are_denials in a separate process"]
         fn unlisted_child() {
             select(Policy::Default);
             apply().unwrap();
@@ -5213,7 +4260,7 @@ mod macos {
         }
 
         #[test]
-        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        #[ignore = "run by test_unlisted_syscalls_are_denials in a separate process"]
         fn unlisted_trap_child() {
             unsafe extern "C" {
                 // <mach/mach_init.h>: the task's own port, what mach_task_self() reads.
@@ -5232,7 +4279,7 @@ mod macos {
         }
 
         #[test]
-        #[ignore = "run by test_unlisted_syscalls_raise_sigsys in a separate process"]
+        #[ignore = "run by test_unlisted_syscalls_are_denials in a separate process"]
         fn unlisted_mig_child() {
             unsafe extern "C" {
                 static mach_task_self_: libc::mach_port_t;
@@ -5282,7 +4329,6 @@ mod macos {
         // neither read is in the profile.
         #[test]
         fn test_thread_reads_are_pv_times_only() {
-            use std::os::unix::process::ExitStatusExt;
             let offered = kvm_ioctls::pv_time_offered();
             for case in ["reads", "thread_set_state", "thread_policy_set", "thread_suspend"] {
                 let out = child("thread_read_child", &[("WICK_TEST_CASE", case)]);
@@ -5292,7 +4338,7 @@ mod macos {
                     assert!(out.status.success(), "{case}: {}", text(&out));
                     assert!(stdout.contains("READS-OK"), "{case}: {}", text(&out));
                 } else {
-                    assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{case} (PV time offered: {offered}): {}", text(&out));
+                    assert!(denied(&out), "{case} (PV time offered: {offered}): {}", text(&out));
                     assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
                 }
             }
@@ -5575,7 +4621,7 @@ mod macos {
             let (_a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
             // A file the profile does not allow fails with an error, as a
             // path outside the chroot does on Linux (IP networking and program
-            // execution raise SIGSYS: test_unlisted_syscalls_raise_sigsys).
+            // execution are denials: test_unlisted_syscalls_are_denials).
             println!("CHILD-OK");
         }
 
@@ -5741,14 +4787,14 @@ mod macos {
         }
 
         // Each call of UNFILTERED_SYSCALLS, with an argument this profile
-        // denies, after narrow() and in a jail: it raises SIGSYS, or fails
+        // denies, after narrow() and in a jail: it is a denial, or fails
         // with EPERM, as its Limit says, and runs once the rule named is
         // lifted (an allow rule for its operation, or for its number). The
         // ones nothing decides run. The calls that remove a name also with
         // the names a running microVM removes, which they remove unlifted
-        // (ALLOWED_NAMES), and others, which raise SIGSYS (DENIED_NAMES). A
-        // call whose number Seatbelt checks on this major (Skip) raises
-        // SIGSYS by its number whatever is lifted, unless SYSCALLS has it.
+        // (ALLOWED_NAMES), and others, which are denials (DENIED_NAMES). A
+        // call whose number Seatbelt checks on this major (Skip) is denied
+        // by its number whatever is lifted, unless SYSCALLS has it.
         #[test]
         fn test_unfiltered_syscalls_are_limited_by_their_rule() {
             use std::os::unix::process::ExitStatusExt;
@@ -5880,17 +4926,15 @@ mod macos {
                 let signal = out.status.signal();
                 let ret = stdout.lines().find_map(|l| l.strip_prefix("RET ")).unwrap_or("none");
                 let allowed = ALLOWED_NAMES.iter().any(|(_, names)| names.contains(lift));
-                let denied = DENIED_NAMES.iter().any(|(_, names)| names.contains(lift));
+                let denied_name = DENIED_NAMES.iter().any(|(_, names)| names.contains(lift));
                 let ok = stdout.contains("NARROWED")
                     && match (limit, *lift) {
                         // The kernel's nosys raises it (ABSENT).
                         _ if absent(name, major) => signal == Some(libc::SIGSYS),
-                        _ if *by_number => signal == Some(libc::SIGSYS),
+                        _ if *by_number => denied(out),
                         _ if allowed => out.status.success() && ret == "ok 0" && stdout.contains("SURVIVED"),
-                        _ if denied => signal == Some(libc::SIGSYS),
-                        (Limit::Signal(_) | Limit::Number | Limit::Default, "0") => {
-                            signal == Some(libc::SIGSYS)
-                        }
+                        _ if denied_name => denied(out),
+                        (Limit::Signal(_) | Limit::Number | Limit::Default, "0") => denied(out),
                         (Limit::Error(_), "0") => {
                             out.status.success() && ret == format!("err {}", libc::EPERM)
                         }

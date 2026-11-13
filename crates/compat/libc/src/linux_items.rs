@@ -78,8 +78,9 @@ pub mod wick_mm {
     static EXEC_DENIED: AtomicUsize = AtomicUsize::new(0);
 
     /// From now on, [`super::mmap`] and [`super::mprotect`] call `hook` when
-    /// asked for `PROT_EXEC` (the hook raises `SIGSYS`); if it returns, the
-    /// call fails with `EPERM`. As the Windows compatibility libc's.
+    /// asked for `PROT_EXEC` (the hook ends the process as a denied call);
+    /// if it returns, the call fails with `EPERM`. As the Windows
+    /// compatibility libc's.
     pub fn deny_exec(hook: extern "C" fn(c_int)) {
         EXEC_DENIED.store(hook as usize, Ordering::Release);
     }
@@ -104,11 +105,12 @@ pub mod wick_mm {
     static ADVICE_ALLOWED: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
     /// From now on, [`super::madvise`] calls `hook` for any advice but
-    /// `allowed` (the hook raises `SIGSYS`); if it returns, the call fails
-    /// with `EPERM`. The check of upstream's `api` filter, which allows
-    /// `madvise` with `MADV_DONTNEED` only, for the API process
-    /// (`vmm::ext::api_process`). Only calls through this crate are checked:
-    /// the system libraries' own (libmalloc's) and a raw system call are not.
+    /// `allowed` (the hook ends the process as a denied call); if it
+    /// returns, the call fails with `EPERM`. The check of upstream's `api`
+    /// filter, which allows `madvise` with `MADV_DONTNEED` only, for the API
+    /// process (`vmm::ext::api_process`). Only calls through this crate are
+    /// checked: the system libraries' own (libmalloc's) and a raw system
+    /// call are not.
     pub fn allow_only_advice(allowed: c_int, hook: extern "C" fn(c_int)) {
         ADVICE_ALLOWED.store(allowed, Ordering::Release);
         ADVICE_DENIED.store(hook as usize, Ordering::Release);
@@ -503,7 +505,7 @@ fn file_under(addr: u64) -> bool {
 /// macOS has no advice of these numbers, so they must not be passed on.
 ///
 /// Other advice is passed through. Advice [`wick_mm::allow_only_advice`]
-/// denies raises `SIGSYS`.
+/// denies ends the process as a denied call.
 ///
 /// # Safety
 /// Same contract as `madvise(2)`.

@@ -2,12 +2,14 @@
 # Copyright 2026 toollyst contributors.
 # SPDX-License-Identifier: Apache-2.0
 """What Seatbelt's `(with send-signal SIGKILL)` does to a denied call, on
-this macOS major: a probe for how a denied call could end Firecracker
-(docs/COMPATIBILITY.md, "A denied call ends Firecracker with the bad-syscall
-exit code"), run by CI's macos-seatbelt job on macOS 15 and 26, where no guest
-runs and no Mac of ours is. It decides nothing in the
-product; it prints, and exits 1 only if the action does not do what macOS
-27.2 measured.
+this macOS major: the action every denial of wick's sandbox ends Firecracker
+by (docs/COMPATIBILITY.md, "A denied call ends Firecracker with the
+bad-syscall exit code"), alone, with a one-rule profile and no wick code. Run
+by CI's macos-seatbelt job on macOS 15 and 26 beside the sandbox's own test of
+it (`test_a_denied_call_never_returns_to_its_thread`), so that a failure there
+can be told apart as Seatbelt's or wick's; it passed on both in CI run
+43497862443 (87d0328). It prints, and exits 1 only if the action does not do
+what macOS 27.2 measured.
 
     python3 -I tools/macos/seatbelt-kill-probe.py [--runs N]
 

@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 12 Nov 2026 23:12:44 +0900
+Subject: [PATCH] macos: SIGSYS's handler leaves the kernel's own SIGSYS for a
+ missing call to its ENOSYS
+
+xnu signals SIGSYS to the calling thread for a system call number it has
+no entry for (bsd/kern/subr_xxx.c nosys), where Linux fails the call with
+ENOSYS and no signal; upstream's handler would take it for a bad syscall.
+On macOS the handler is registered through
+vmm::ext::sandbox::set_sigsys_handler, which leaves that SIGSYS to the
+call's ENOSYS and gives any other SIGSYS to upstream's handler. A call
+the host sandbox denies raises no SIGSYS: the kernel ends the process
+inside the call.
+
+Test: test_an_unknown_syscall_number_without_the_sandbox_fails_with_enosys.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vmm/src/signal_handler.rs | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/vmm/src/signal_handler.rs b/src/vmm/src/signal_handler.rs
+index 5100dd301d9fda408988edc7613810fd5ce1957d..7d9ca61344ca3479a1e3d400b6cbbd2fa0368865 100644
+--- a/src/vmm/src/signal_handler.rs
++++ b/src/vmm/src/signal_handler.rs
+@@ -167,6 +167,13 @@ pub fn register_signal_handlers() -> vmm_sys_util::errno::Result<()> {
+     // register a signal handler which will be called in the current thread and will interrupt
+     // whatever work is done on the current thread, so we have to keep in mind that the registered
+     // signal handler must only do async-signal-safe operations.
++    // wick: on macOS the kernel signals SIGSYS itself for a call number it has no entry for
++    // (xnu's nosys), where Linux fails the call with ENOSYS: the handler is registered
++    // behind vmm::ext::sandbox::set_sigsys_handler, which leaves that SIGSYS to the call's
++    // ENOSYS and gives any other to this handler.
++    #[cfg(target_os = "macos")]
++    crate::ext::sandbox::set_sigsys_handler(sigsys_handler)?;
++    #[cfg(not(target_os = "macos"))]
+     register_signal_handler(SIGSYS, sigsys_handler)?;
+     register_signal_handler(SIGBUS, sigbus_handler)?;
+     register_signal_handler(SIGSEGV, sigsegv_handler)?;
