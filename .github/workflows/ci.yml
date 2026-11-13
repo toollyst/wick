@@ -200,6 +200,10 @@ jobs:
       # Firecracker booted with huge_pages None and Transparent, its guest
       # memory after the shell and after a guest's tmpfs work (GUESTRAM
       # lines; VMMGUEST in the windows job's vmm-memory-record.py --boot).
+      # Then, under the runner's own setting, what a 1 GiB guest that touched
+      # 64 MiB is charged after a full and a diff snapshot, and what a
+      # restore from the full snapshot's file is charged (anon and the page
+      # cache, in a cgroup each; GUESTSNAP lines; VMMSNAP in the windows job).
       - name: Guest RAM by the host's THP setting (records)
         run: |
           python3 -I tools/linux/guest-ram-record.py --selftest
@@ -220,6 +224,8 @@ jobs:
               || echo "::warning::guest-ram-record.py did not finish under $setting"
           done
           echo "$was" | sudo tee "$thp" >/dev/null
+          sudo python3 -I tools/linux/guest-ram-record.py --snapshot "$fc" "$RUNNER_TEMP/boot-test" \
+            || echo "::warning::guest-ram-record.py --snapshot did not finish"
           sudo rmdir /sys/fs/cgroup/wick-grain || true
           sudo ip link del wickgr0
       # A host without /dev/nitro_enclaves: the start of an enclave is refused,
@@ -1286,6 +1292,17 @@ jobs:
               --boot "$RUNNER_TEMP/vmmmem-guest" \
               build/cargo_target/release/firecracker.exe 1 2 16; then
             echo "::warning::vmm-memory-record.py --boot: no record of a booted guest on this runner"
+          fi
+          # What the host's reads of guest memory for a snapshot commit: a
+          # 1 GiB guest that touched 64 MiB, after a full and a diff
+          # snapshot, and a restore from the full snapshot's file (VMMSNAP
+          # lines; GUESTSNAP in the linux-boot job). Today libc commits the
+          # lazy pages of every buffer a write takes, and a private file
+          # mapping is read in whole: the record prints what that costs
+          # before it is changed.
+          if ! python -I ../../tools/windows/vmm-memory-record.py --snapshot "$RUNNER_TEMP/vmmmem-guest" \
+              build/cargo_target/release/firecracker.exe; then
+            echo "::warning::vmm-memory-record.py --snapshot: no record of a snapshot on this runner"
           fi
           # Which WHP call leaves every vCPU thread of that booted guest 48
           # to 52 KiB deep (run 43397419784's VMMSTACK lines: the stale

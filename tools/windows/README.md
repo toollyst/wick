@@ -149,6 +149,20 @@
   (11616 and 5632 KiB in two cases of one PC run at 9af0b63), so a line of
   their own gives each case's.
 
+  With `--snapshot <dir>` it prints VMMSNAP lines instead: a 1 GiB guest
+  with dirty page tracking touches 64 MiB, is paused for a full snapshot,
+  resumed to touch 128 pages more and paused for a diff snapshot, and a new
+  Firecracker loads the full snapshot with the File backend. After each
+  step: the guest memory committed and resident, the process's private
+  bytes (what a Job Object's memory limit counts), and for a snapshot how
+  long it took and its file's size and allocated bytes. Linux's for the same
+  guest and steps are `tools/linux/guest-ram-record.py --snapshot`'s
+  (GUESTSNAP lines). CI's windows and linux-boot jobs run both:
+
+  ```
+  python -I tools\windows\vmm-memory-record.py --snapshot C:\wbt lib\firecracker\build\cargo_target\release\firecracker.exe
+  ```
+
 CI builds the binaries on every push and uploads them as the artifact
 `wick-windows-x86_64-<commit>`: `lib/firecracker/build/cargo_target/release/firecracker.exe`,
 `firecracker.pdb` (its symbols, for `vmm-memory-record.py --boot`),

@@ -78,6 +78,24 @@ besides the VMMMEM lines:
               the same guest and work are tools/linux/guest-ram-record.py's
               (GUESTRAM lines)
 
+The third mode prints VMMSNAP lines: what the host's reads of guest memory
+for a snapshot commit, and what a restore from the snapshot's file commits,
+beside Linux's GUESTSNAP lines (tools/linux/guest-ram-record.py --snapshot:
+the same guest, steps and work):
+
+    python -I tools/windows/vmm-memory-record.py --snapshot <dir> <firecracker.exe>
+
+One microVM of SNAP_MIB with dirty page tracking, 1 vCPU and no network
+interface, driven through its API socket (with Windows' own curl.exe): after
+the shell; after SNAP_WORK (64 MiB of tmpfs); paused, after a full snapshot;
+resumed, after SNAP_MORE (128 pages of a sparse tmpfs file); paused, after a
+diff snapshot. Then a new Firecracker loads the full snapshot with the File
+backend, and the lines follow the load and the restored guest's shell. Each
+line gives the guest memory as VMMGUEST does (committed, resident, by grain)
+and the process's private bytes (PrivateUsage: its commit charge, what a Job
+Object's memory limit counts); a snapshot's line gives how long the request
+took and the file's size and allocated bytes.
+
 After the cases, VMMGROW lines say which allocations the per-vCPU growth is
 in: the allocations of each kind grouped by size (and mark), with their
 number and resident memory in the case with the fewest vCPUs and in the one
@@ -116,6 +134,14 @@ GUEST_MAC = "06:00:ac:10:00:02"
 GUEST_WORK = ("mount -t tmpfs tmpfs /tmp; dd if=/dev/zero of=/tmp/dense bs=1M count=32 2>/dev/null; i=0; "
               "while [ $i -lt 32 ]; do dd if=/dev/zero of=/tmp/sparse bs=4096 count=1 seek=$((i*512)) "
               "conv=notrunc 2>/dev/null; i=$((i+1)); done; echo WICK-$((6*7))-WORKED")
+# The snapshot record's guest and work, word for word guest-ram-record.py's
+# (its selftest compares): a guest of 1 GiB that touches 64 MiB, then 128
+# pages more, one at each 64 KiB of a sparse file.
+SNAP_MIB = 1024
+SNAP_WORK = ("mount -t tmpfs tmpfs /tmp; dd if=/dev/zero of=/tmp/dense bs=1M count=64 2>/dev/null; "
+             "echo WICK-$((6*7))-WORKED")
+SNAP_MORE = ("i=0; while [ $i -lt 128 ]; do dd if=/dev/urandom of=/tmp/sparse bs=4096 count=1 seek=$((i*16)) "
+             "conv=notrunc 2>/dev/null; i=$((i+1)); done; echo WICK-$((6*7))-MORE")
 GRANULE, HUGE = 64 << 10, 2 << 20
 THREAD_SUSPEND_RESUME, THREAD_GET_CONTEXT, THREAD_QUERY_LIMITED_INFORMATION = 0x2, 0x8, 0x800
 # CONTEXT on x86-64 (winnt.h): 1232 bytes, 16-byte aligned; ContextFlags at
@@ -163,6 +189,14 @@ class MBI(ctypes.Structure):
 
 class WSEX(ctypes.Structure):
     _fields_ = [("VirtualAddress", ctypes.c_void_p), ("VirtualAttributes", ctypes.c_size_t)]
+
+
+class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+    _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+        (name, ctypes.c_size_t) for name in (
+            "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+            "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage",
+            "PrivateUsage")]
 
 
 class THREADENTRY32(ctypes.Structure):
@@ -215,6 +249,10 @@ def bind():
     k32.GetThreadContext.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
     k32.LocalFree.restype = ctypes.c_void_p
     k32.LocalFree.argtypes = [ctypes.c_void_p]
+    k32.GetCompressedFileSizeW.restype = wintypes.DWORD
+    k32.GetCompressedFileSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+    psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX),
+                                           wintypes.DWORD]
     return k32, psapi, ntdll
 
 
@@ -1093,6 +1131,154 @@ def run_boot_case(binds, firecracker, vcpus, work, system, kernel, rootfs, chain
         proc.wait()
 
 
+def private_usage(k32, psapi, pid):
+    """The process's private bytes (PrivateUsage), or None."""
+    handle = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+    if not handle:
+        return None
+    try:
+        counters = PROCESS_MEMORY_COUNTERS_EX()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            return None
+        return counters.PrivateUsage
+    finally:
+        k32.CloseHandle(handle)
+
+
+def snapshot_line(binds, pid):
+    guest = guest_memory(binds[0], binds[1], pid)
+    private = private_usage(binds[0], binds[1], pid)
+    return ((guest_line(guest) if guest else "no guest memory found")
+            + f"; the process's private bytes {private // 1024 if private is not None else '?'} KiB")
+
+
+def file_text(k32, path):
+    """A file's size and the bytes allocated to it (GetCompressedFileSizeW:
+    a sparse file's holes are not counted)."""
+    high = wintypes.DWORD()
+    low = k32.GetCompressedFileSizeW(path, ctypes.byref(high))
+    allocated = (high.value << 32) | low
+    return f"file {os.path.getsize(path) >> 20} MiB, allocated {allocated >> 20} MiB"
+
+
+# Windows' own curl, which connects to an AF_UNIX path; a curl earlier on
+# PATH (Git's, in CI's bash steps) may not.
+CURL = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "curl.exe")
+
+
+def api(sock, method, path, body=None, seconds=600):
+    """One request to Firecracker's API socket: (HTTP status, body)."""
+    args = [CURL, "-s", "-m", str(seconds), "-o", "-", "-w", " %{http_code}", "--unix-socket", sock,
+            "-X", method, f"http://localhost{path}"]
+    if body is not None:
+        args += ["-H", "Content-Type: application/json", "--data-binary", json.dumps(body)]
+    out = subprocess.run(args, capture_output=True, text=True, check=False).stdout.rstrip()
+    text, _, code = out.rpartition(" ")
+    return (int(code) if code.isdigit() else 0), text
+
+
+def api_ok(sock, method, path, body=None):
+    status, text = api(sock, method, path, body)
+    if not 200 <= status < 300:
+        raise RuntimeError(f"{method} {path} -> {status} {text[:300]}")
+    return text
+
+
+def wait_api(sock, proc, seconds=10):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and proc.poll() is None:
+        if api(sock, "GET", "/", seconds=2)[0] == 200:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def run_snapshot_case(binds, firecracker, work, kernel, rootfs):
+    """The VMMSNAP lines; False when a guest does not reach its shell."""
+    k32 = binds[0]
+    tag = f"VMMSNAP mem={SNAP_MIB} MiB vcpus=1"
+    config = os.path.join(work, "snap-config.json")
+    with open(config, "w", encoding="utf-8") as f:
+        json.dump({"boot-source": {"kernel_image_path": kernel, "boot_args": BOOT_ARGS},
+                   "machine-config": {"vcpu_count": 1, "mem_size_mib": SNAP_MIB, "track_dirty_pages": True},
+                   "drives": [{"drive_id": "rootfs", "path_on_host": rootfs, "is_root_device": True,
+                               "is_read_only": True}]}, f)
+    full_mem, full_state = os.path.join(work, "full.mem"), os.path.join(work, "full.state")
+    diff_mem, diff_state = os.path.join(work, "diff.mem"), os.path.join(work, "diff.state")
+    procs = []
+
+    def start(n, args):
+        sock = os.path.join(work, f"api-{n}.sock")
+        out, err = os.path.join(work, f"snap-serial-{n}.txt"), os.path.join(work, f"snap-stderr-{n}.txt")
+        with open(out, "wb") as o, open(err, "wb") as e:
+            proc = subprocess.Popen([firecracker, "--api-sock", sock] + args, stdin=subprocess.PIPE, stdout=o, stderr=e)
+        procs.append(proc)
+        return proc, Console(proc, out), sock, out, err
+
+    def tail(*paths):
+        lines = []
+        for path in paths:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines += [line.strip() for line in f.read().splitlines()[-4:]]
+        return " | ".join(lines)
+
+    try:
+        proc, console, sock, out, err = start(1, ["--config-file", config])
+        started = time.monotonic()
+        if not wait_api(sock, proc) or not console.wait(r"WICK-42-UP", 300, again="echo WICK-$((6*7))-UP"):
+            print(f"{tag}: no shell (exit {proc.poll()}): {tail(out, err)}")
+            return False
+        print(f"{tag} after the shell ({time.monotonic() - started:.1f} s): {snapshot_line(binds, proc.pid)}")
+        console.send(SNAP_WORK)
+        if not console.wait(r"WICK-42-WORKED", 120):
+            print(f"{tag} after the work: the guest did not finish it")
+            return True
+        print(f"{tag} after the work: {snapshot_line(binds, proc.pid)}")
+        api_ok(sock, "PATCH", "/vm", {"state": "Paused"})
+        started = time.monotonic()
+        api_ok(sock, "PUT", "/snapshot/create",
+               {"snapshot_type": "Full", "snapshot_path": full_state, "mem_file_path": full_mem})
+        took = time.monotonic() - started
+        print(f"{tag} paused, after the full snapshot ({took:.2f} s; {file_text(k32, full_mem)}): "
+              f"{snapshot_line(binds, proc.pid)}")
+        api_ok(sock, "PATCH", "/vm", {"state": "Resumed"})
+        console.send(SNAP_MORE)
+        if not console.wait(r"WICK-42-MORE", 120):
+            print(f"{tag} after the second work: the guest did not finish it")
+            return True
+        print(f"{tag} resumed, after the second work: {snapshot_line(binds, proc.pid)}")
+        api_ok(sock, "PATCH", "/vm", {"state": "Paused"})
+        started = time.monotonic()
+        api_ok(sock, "PUT", "/snapshot/create",
+               {"snapshot_type": "Diff", "snapshot_path": diff_state, "mem_file_path": diff_mem})
+        took = time.monotonic() - started
+        print(f"{tag} paused, after the diff snapshot ({took:.2f} s; {file_text(k32, diff_mem)}): "
+              f"{snapshot_line(binds, proc.pid)}")
+        proc.kill()
+        proc.wait()
+        proc, console, sock, out, err = start(2, [])
+        if not wait_api(sock, proc):
+            print(f"{tag} load: no API socket (exit {proc.poll()}): {tail(out, err)}")
+            return False
+        started = time.monotonic()
+        api_ok(sock, "PUT", "/snapshot/load", {"snapshot_path": full_state, "resume_vm": True,
+                                              "mem_backend": {"backend_type": "File", "backend_path": full_mem}})
+        took = time.monotonic() - started
+        print(f"{tag} restored, after the load ({took:.2f} s): {snapshot_line(binds, proc.pid)}")
+        started = time.monotonic()
+        if console.wait(r"WICK-42-UP", 60, again="echo WICK-$((6*7))-UP"):
+            print(f"{tag} restored, after the shell ({time.monotonic() - started:.1f} s): "
+                  f"{snapshot_line(binds, proc.pid)}")
+        else:
+            print(f"{tag} restored: no shell (exit {proc.poll()}): {tail(out, err)}")
+        return True
+    finally:
+        for proc in procs:
+            proc.kill()
+            proc.wait()
+
+
 def selftest():
     """The parts that need no Windows."""
     assert kernel_elf()[:4] == b"\x7fELF"
@@ -1185,6 +1371,12 @@ def selftest():
     assert guest_line(counts) == ("committed 196 KiB, resident 8 KiB; first accesses by grain: 64 KiB blocks 4, "
                                   "4 KiB pages 2 (today), 2 MiB ranges 3"), guest_line(counts)
     assert "WICK-$((6*7))-WORKED" in GUEST_WORK and "WICK-42-WORKED" not in GUEST_WORK
+    assert "WICK-$((6*7))-WORKED" in SNAP_WORK and "WICK-$((6*7))-MORE" in SNAP_MORE
+    # psapi.h: two DWORDs and nine SIZE_Ts (80 bytes on x64), PrivateUsage last.
+    word, size = ctypes.sizeof(wintypes.DWORD), ctypes.sizeof(ctypes.c_size_t)
+    assert ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX) == 2 * word + 9 * size
+    assert PROCESS_MEMORY_COUNTERS_EX.PrivateUsage.offset == 2 * word + 8 * size
+    assert CURL.lower().replace("/", "\\").endswith("\\system32\\curl.exe")
     print("vmm-memory-record.py: selftest ok")
 
 
@@ -1196,8 +1388,11 @@ def main(args):
         if not MAP:
             raise SystemExit(f"VMMMEM: {args[1]} is not a linker's map with symbols")
         args = args[2:]
+    snapshot = None
     if args and args[0] == "--boot":
         boot, args = os.path.abspath(args[1]), args[2:]
+    elif args and args[0] == "--snapshot":
+        snapshot, args = os.path.abspath(args[1]), args[2:]
     if not args:
         raise SystemExit(__doc__)
     if os.name != "nt":
@@ -1205,6 +1400,13 @@ def main(args):
     firecracker = os.path.abspath(args[0])
     counts = [int(a) for a in args[1:]] or [1, 2, 16]
     binds = bind()
+    if snapshot is not None:
+        os.makedirs(snapshot, exist_ok=True)
+        kernel, rootfs = asset(snapshot, KERNEL_NAME), asset(snapshot, ROOTFS_NAME)
+        with tempfile.TemporaryDirectory(prefix="wick-vmmsnap-") as work:
+            if not run_snapshot_case(binds, firecracker, work, kernel, rootfs):
+                raise SystemExit("VMMSNAP: a guest did not boot to its shell")
+        return
     system = system_dir_device(binds[0])
     results = {}
     with tempfile.TemporaryDirectory(prefix="wick-vmmmem-") as work:

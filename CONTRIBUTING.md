@@ -328,6 +328,10 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   The second is upstream Firecracker booted with `huge_pages` None and
   Transparent, its guest memory after the shell and after a guest's tmpfs
   work (GUESTRAM lines), as `vmm-memory-record.py --boot` prints Windows'.
+  With `--snapshot`, the second prints what a 1 GiB guest that touched
+  64 MiB is charged after a full and a diff snapshot and after a restore
+  from the full snapshot's file, anon and page cache (GUESTSNAP lines), as
+  `vmm-memory-record.py --snapshot` prints Windows' (VMMSNAP lines).
   Records: they print, and fail only when KVM or the guest does not get
   through.
 - Upstream tests left out on purpose: `test_licenses.py::test_for_valid_licenses`
