@@ -1130,7 +1130,10 @@ jobs:
           # delivers an interrupt, a #GP or a #DF (whether the event being
           # delivered is shown, and what giving back does); the LVT timer
           # in xAPIC mode by MMIO and written by the host in x2APIC mode;
-          # E's emulation of the TSC-deadline write in a loop. In the
+          # E's emulation of the TSC-deadline write in a loop; each timer
+          # mode written by MMIO in xAPIC mode (f), and TSC-deadline mode
+          # through the APIC page in x2APIC mode, with what WHP's timer does
+          # then and the page's cost (g). In the
           # debug build and in a release build, as Firecracker runs.
           alone whp::vcpu::fpu_tests::test_gp_exits_for_option_e_on_record
           alone whp::vcpu::fpu_tests::test_gp_exits_for_option_e_on_record --release

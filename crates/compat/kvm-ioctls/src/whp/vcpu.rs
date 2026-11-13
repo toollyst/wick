@@ -6229,6 +6229,15 @@ mod fpu_tests {
     ///   `WHvX64RegisterApicId`, in xAPIC mode and in x2APIC mode, as
     ///   `tscdeadline::deadline_interrupt` takes the destination from the
     ///   page in the xAPIC format (`>> 24`);
+    /// - f: with EXTD clear, the guest's MMIO write of the LVT timer in each
+    ///   mode (one-shot, masked, periodic, TSC-deadline) and its read, since
+    ///   c's TSC-deadline write read back as the reset value, its vector
+    ///   lost: what an xAPIC-mode guest of option E would get;
+    /// - g: with EXTD set, the LVT timer in TSC-deadline mode with no initial
+    ///   count written through `KVM_SET_LAPIC` (which c found taken, and
+    ///   the guest's RDMSR then reads mode 10), the guest spinning for 5 s:
+    ///   whether WHP's own timer raised the vector or counts, the guest's
+    ///   read after, and the page's cost a write against the register's;
     /// - d: E's path for the TSC-deadline write: 1000 WRMSRs of 0x832 in
     ///   TSC-deadline mode in a guest loop, each exception exit answered
     ///   with the registers read (one call) and the LVT timer written in
@@ -6558,6 +6567,26 @@ mod fpu_tests {
                 vcpu.set_regs(&kvm_regs { rip: RDMSR_AT, rsp: 0x9000, rflags: 2, rcx: 0x802, ..Default::default() }).unwrap();
                 let (line, _) = raw_once(&mut vcpu);
                 say(format!("c: EXTD clear: the guest's RDMSR 0x802 (the x2APIC ID): {line}"));
+                // f: the guest's MMIO write of each timer mode in xAPIC
+                // mode, and its read: whether only the TSC-deadline mode is
+                // dropped, and whole (the vector too), as an xAPIC-mode
+                // guest of option E would write it.
+                let svr = vcpu.get_lapic().map(|l| format!("{:#x}", u32::from_le_bytes(std::array::from_fn(|i| l.regs[0xF0 + i] as u8))));
+                say(format!("f: EXTD clear: the spurious vector register after the guest's MMIO write of 0x1ff: {}", svr.unwrap_or_else(|e| format!("not read: errno {}", e.errno()))));
+                for value in [0x00ECu32, 0x1_00EC, 0x2_00EC, 0x4_00EC, 0x00ED] {
+                    let mut code = vec![0xBB, 0x00, 0x00, 0xE0, 0xFE, 0xC7, 0x83, 0x20, 0x03, 0x00, 0x00];
+                    code.extend_from_slice(&value.to_le_bytes());
+                    code.extend_from_slice(&[0x8B, 0x83, 0x20, 0x03, 0x00, 0x00, 0xE6, PORT as u8, 0xEB, 0xFE]);
+                    put(m, PROGRAM, &code);
+                    vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+                    let (line, _) = raw_once(&mut vcpu);
+                    say(format!(
+                        "f: EXTD clear: the guest's MMIO write of the LVT timer {value:#x} and its read: {line}; the guest read {:#x}; \
+                         KVM_GET_LAPIC's LVT timer {}",
+                        vcpu.get_regs().unwrap().rax,
+                        lvtt_of(&vcpu)
+                    ));
+                }
                 done(vcpu, vm, m);
             }
         }
@@ -6602,6 +6631,57 @@ mod fpu_tests {
                 say(format!(
                     "c: EXTD set: KVM_SET_LAPIC with the LVT timer 0x400ec: {set}; WHvX64RegisterApicLvtTimer {register}; \
                      KVM_GET_LAPIC's {lapic}; the guest's RDMSR 0x832: {guest}"
+                ));
+                // g: the LVT timer in TSC-deadline mode through the page,
+                // as option E could write its substitute (the guest's read
+                // keeps mode 10): unmasked, no initial count, the guest
+                // spinning with interrupts off until the 5 s kick; whether
+                // WHP's own timer raised the vector (IRR) or counts; and
+                // what writing the page costs, against the register.
+                let set = vcpu.get_lapic().and_then(|mut l| {
+                    for (at, v) in [(0x320usize, 0x4_00ECu32), (0x380, 0)] {
+                        for (i, b) in v.to_le_bytes().into_iter().enumerate() {
+                            l.regs[at + i] = b as std::os::raw::c_char;
+                        }
+                    }
+                    vcpu.set_lapic(&l)
+                });
+                put(m, PROGRAM, &[0xEB, 0xFE]);
+                vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+                let (line, _) = raw_once(&mut vcpu);
+                let regs = vcpu.lapic_page().map(|(p, _)| {
+                    let r = |at: usize| u32::from_le_bytes(p[at..at + 4].try_into().unwrap());
+                    format!(
+                        "LVT timer {:#x}, initial count {:#x}, current count {:#x}, vector 0xec in the IRR {}, in the ISR {}",
+                        r(0x320),
+                        r(0x380),
+                        r(0x390),
+                        r(0x270) >> 12 & 1,
+                        r(0x170) >> 12 & 1
+                    )
+                });
+                say(format!(
+                    "g: EXTD set: KVM_SET_LAPIC with the LVT timer 0x400ec and no initial count: {}; the guest spun: {line}; then {}",
+                    set.map_or_else(|e| format!("refused: errno {}", e.errno()), |()| "taken".to_string()),
+                    regs.unwrap_or_else(|e| format!("not read: errno {}", e.errno()))
+                ));
+                let guest = guest_reads(&mut vcpu);
+                say(format!("g: EXTD set: then the guest's RDMSR 0x832: {guest}"));
+                const PAIRS: u32 = 1000;
+                let start = std::time::Instant::now();
+                for _ in 0..PAIRS {
+                    let l = vcpu.get_lapic().unwrap();
+                    vcpu.set_lapic(&l).unwrap();
+                }
+                let page = start.elapsed().as_secs_f64() * 1e6 / f64::from(PAIRS);
+                let start = std::time::Instant::now();
+                for _ in 0..PAIRS {
+                    ffi::set_register(vcpu.part(), vcpu.vp(), whv::WHvX64RegisterApicLvtTimer, ffi::reg64(0xEC)).unwrap();
+                }
+                let register = start.elapsed().as_secs_f64() * 1e6 / f64::from(PAIRS);
+                say(format!(
+                    "g: the LVT timer written through the page (KVM_GET_LAPIC and KVM_SET_LAPIC, which reads the page first) \
+                     {page:.3} us a write, through WHvX64RegisterApicLvtTimer {register:.3} us, {PAIRS} each"
                 ));
                 // The APIC ID register as the backend reads it (the legacy
                 // page, `lapic_page`, which `tscdeadline::deadline_interrupt`
