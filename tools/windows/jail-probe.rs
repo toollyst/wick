@@ -1028,19 +1028,24 @@ fn check(c: &str) -> String {
         // reach: `denied` when it can neither open it nor make it, with
         // Windows's two answers, else `allowed`.
         "namespace" => {
-            let mut t = std::ptr::null_mut();
+            // GetCurrentProcessToken(): a pseudo-handle with TOKEN_QUERY
+            // (Microsoft Learn), which queries without opening the token, as
+            // `privileges` does: on CI's runner, whose jailer is elevated, a
+            // jailed process's OpenProcessToken of its own token is denied
+            // (run 43428124115, "namespace:0 unknown: Access is denied").
+            let t = -4isize as HANDLE;
             let mut buf = [0u64; 32];
             let mut len = 0u32;
             let mut medium = std::ptr::null_mut();
             let name = wide("wick-cgroup");
-            // SAFETY: our own token (TOKEN_QUERY, TokenUser: a pointer to
-            // the SID first); NUL-terminated strings and out-pointers.
+            // SAFETY: our own token (TokenUser: a pointer to the SID first);
+            // NUL-terminated strings and out-pointers.
             unsafe {
-                if OpenProcessToken(GetCurrentProcess(), 0x8, &mut t) == 0
-                    || GetTokenInformation(t, 1, buf.as_mut_ptr().cast(), 256, &mut len) == 0
-                    || ConvertStringSidToSidW(wide("S-1-16-8192").as_ptr(), &mut medium) == 0
-                {
-                    return format!("unknown: {}", std::io::Error::last_os_error());
+                if GetTokenInformation(t, 1, buf.as_mut_ptr().cast(), 256, &mut len) == 0 {
+                    return format!("unknown: GetTokenInformation(TokenUser): {}", std::io::Error::last_os_error());
+                }
+                if ConvertStringSidToSidW(wide("S-1-16-8192").as_ptr(), &mut medium) == 0 {
+                    return format!("unknown: ConvertStringSidToSidW: {}", std::io::Error::last_os_error());
                 }
                 let mut boundary = CreateBoundaryDescriptorW(name.as_ptr(), 0);
                 if boundary.is_null()
