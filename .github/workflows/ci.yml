@@ -466,6 +466,21 @@ jobs:
             ${{ runner.temp }}/unit/tests.tsv
           if-no-files-found: warn
           retention-days: 14
+      # Why a test's terminal could not be opened (run 43435331370: posix_openpt
+      # failed in 3 children of test_unfiltered_syscalls_are_limited_by_their_rule).
+      # XNU prints "reached max_retries" when two openers raced for one minor
+      # past vn_open_auth's 10 retries (vfs_vnops.c), and "ptmx_get_ioctl
+      # failed due to ptmx_max limit" at the limit (tty_ptmx.c). On macOS 27.2
+      # these kernel printfs reach the unified log (32 processes opening
+      # terminals at once: 36 posix_openpt failures with errno -6, 36 "reached
+      # max_retries error -6" lines); on the runners' 15 and 26 that is
+      # unverified, so an empty result there proves nothing. It prints and
+      # never decides the job.
+      - name: Terminal allocation reports
+        if: failure()
+        run: |
+          /usr/bin/log show --last 30m --style compact \
+            --predicate 'process == "kernel" AND (eventMessage CONTAINS "max_retries" OR eventMessage CONTAINS "ptmx_max")' || true
 
   # Seatbelt differs between macOS majors (which system calls' numbers it
   # skips when a rule allows their operation: UNFILTERED_SYSCALLS and
@@ -544,6 +559,13 @@ jobs:
         run: |
           /usr/bin/log show --last 20m --style compact --predicate 'sender == "Sandbox"' |
             grep -E 'Sandbox: vmm-[0-9a-f]+\(' | grep -v ' allow ' || true
+      # Why a test's terminal could not be opened: the macos job's step of the
+      # same name says what it looks for, and that an empty result proves nothing.
+      - name: Terminal allocation reports
+        if: failure()
+        run: |
+          /usr/bin/log show --last 30m --style compact \
+            --predicate 'process == "kernel" AND (eventMessage CONTAINS "max_retries" OR eventMessage CONTAINS "ptmx_max")' || true
 
   # A minute of each fuzz target (fuzz/, CONTRIBUTING.md "Fuzzing"): they
   # build, their seeds pass, and a minute of new inputs finds nothing. Long
