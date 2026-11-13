@@ -26,6 +26,13 @@ use super::whv;
 use super::whv::{WHV_PARTITION_HANDLE, WHV_REGISTER_NAME};
 
 use super::ffi;
+
+#[cfg(test)]
+thread_local! {
+    /// The local APIC emulation mode a record test's VM is made with on
+    /// this thread, in place of xAPIC (`test_an_x2apic_partition_on_record`).
+    pub(crate) static APIC_MODE_FOR_TESTS: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
 use super::guest_mem::{self, Slot};
 use super::irqchip::Irqchip;
 use super::vcpu::{VcpuFd, VcpuShared};
@@ -543,10 +550,14 @@ fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
         // and no rule for its entries (`test_msr_action_list_on_record`
         // prints which indices this host's set-up takes).
         // Emulate the local APIC in WHP, in the mode the guest's CPUID is
-        // made to agree with (`apicmode`: an xAPIC, so no x2APIC bit).
+        // made to agree with (`apicmode`: an xAPIC, so no x2APIC bit). A
+        // record test may ask for another mode on its thread
+        // (`APIC_MODE_FOR_TESTS`).
         let apic_mode: i32 = match super::apicmode::PARTITION {
             super::apicmode::LocalApic::XApic => whv::WHvX64LocalApicEmulationModeXApic,
         };
+        #[cfg(test)]
+        let apic_mode: i32 = APIC_MODE_FOR_TESTS.get().unwrap_or(apic_mode);
         // SAFETY: an i32 property value for LocalApicEmulationMode.
         unsafe {
             ffi::set_partition_property(

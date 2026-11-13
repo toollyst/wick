@@ -1025,6 +1025,15 @@ jobs:
           # allows that WHP refuses fails the test by name; then each gated
           # flag in the table and in the guest's own CPUID.
           alone whp::vcpu::fpu_tests::test_cr4_bits_kvm_takes_are_taken_by_whp
+          # Before an x2APIC partition (X2APICREC, LAPICFMT lines): whether
+          # WHP makes one; APIC_BASE and the guest's switch to x2APIC; each
+          # x2APIC register MSR, done or #GP and by whom; a self-IPI, an IPI
+          # through the ICR, the APIC timer, the TSC-deadline timer and an
+          # injected MSI, each to its end; KVM_GET/SET_LAPIC there; and the
+          # local APIC's state in both WHP formats (the legacy one the
+          # backend reads, InterruptControllerState2) with an interrupt
+          # pending, on that partition and on an xAPIC one.
+          alone whp::vcpu::fpu_tests::test_an_x2apic_partition_on_record
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # What each call of the backend commits of its thread's stack

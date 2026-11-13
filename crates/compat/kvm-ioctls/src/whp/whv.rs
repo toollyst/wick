@@ -311,6 +311,40 @@ pub(crate) unsafe fn WHvGetVirtualProcessorRegisters(
     }
 }
 
+/// `WHvGetVirtualProcessorState` from `winhvplatform.dll`, loaded at first
+/// use. Only the x2APIC record reads the local APIC's state with it
+/// (`WHvVirtualProcessorStateTypeInterruptControllerState2`, against the
+/// format the backend reads today); the backend does not.
+///
+/// # Safety
+/// As the Windows function.
+#[cfg(test)]
+pub(crate) unsafe fn WHvGetVirtualProcessorState(
+    partition: WHV_PARTITION_HANDLE,
+    vpindex: u32,
+    statetype: WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+    buffer: *mut core::ffi::c_void,
+    buffersizeinbytes: u32,
+    byteswritten: *mut u32,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(
+        WHV_PARTITION_HANDLE,
+        u32,
+        WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+        *mut core::ffi::c_void,
+        u32,
+        *mut u32,
+    ) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvGetVirtualProcessorState")) {
+        // SAFETY: the address of `WHvGetVirtualProcessorState`, whose signature `F` is.
+        Some(p) => unsafe {
+            std::mem::transmute::<usize, F>(p)(partition, vpindex, statetype, buffer, buffersizeinbytes, byteswritten)
+        },
+        None => unavailable(Dll::Platform),
+    }
+}
+
 /// `WHvGetVirtualProcessorXsaveState` from `winhvplatform.dll`, loaded at first use.
 ///
 /// # Safety

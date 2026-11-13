@@ -5052,6 +5052,295 @@ mod fpu_tests {
         }
     }
 
+    /// The local APIC state of `vp` in both of WHP's formats, as lines: the
+    /// one the backend reads (`WHvGetVirtualProcessorInterruptControllerState`,
+    /// which Learn calls deprecated, "a legacy format that packs the
+    /// interrupt-request, in-service, and trigger-mode vectors differently
+    /// from the standard external state format and does not include the
+    /// processor priority register") and the standard one
+    /// (`WHvGetVirtualProcessorState` of
+    /// `WHvVirtualProcessorStateTypeInterruptControllerState2`): each call's
+    /// HRESULT and size, the words `KVM_GET_LAPIC` carries at ID, TPR, PPR,
+    /// SVR, ICR and LVT timer, the ISR, TMR and IRR words, and the
+    /// offsets in the first KiB where the two differ.
+    fn lapic_formats(what: &str, part: whv::WHV_PARTITION_HANDLE, vp: u32) -> Vec<String> {
+        let mut legacy = vec![0u8; 4096];
+        let mut legacy_size = 0u32;
+        // SAFETY: an output buffer of the size passed.
+        let legacy_hres = unsafe {
+            whv::WHvGetVirtualProcessorInterruptControllerState(part, vp, legacy.as_mut_ptr().cast(), 4096, &mut legacy_size)
+        };
+        let mut need = 0u32;
+        // SAFETY: a zero-sized query of the size needed.
+        let _ = unsafe {
+            whv::WHvGetVirtualProcessorState(
+                part,
+                vp,
+                whv::WHvVirtualProcessorStateTypeInterruptControllerState2,
+                std::ptr::null_mut(),
+                0,
+                &mut need,
+            )
+        };
+        let mut two = vec![0u8; (need as usize).max(4096)];
+        let mut two_size = 0u32;
+        // SAFETY: an output buffer of the size passed.
+        let two_hres = unsafe {
+            whv::WHvGetVirtualProcessorState(
+                part,
+                vp,
+                whv::WHvVirtualProcessorStateTypeInterruptControllerState2,
+                two.as_mut_ptr().cast(),
+                u32::try_from(two.len()).unwrap(),
+                &mut two_size,
+            )
+        };
+        let word = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let eight = |b: &[u8], at: usize| (0..8).map(|i| format!("{:#x}", word(b, at + i * 16))).collect::<Vec<_>>().join(" ");
+        let mut lines = vec![format!(
+            "LAPICFMT {what}: legacy HRESULT {:#010x}, {legacy_size} bytes; InterruptControllerState2 HRESULT {:#010x}, {two_size} bytes (asked for {need})",
+            legacy_hres.cast_unsigned(),
+            two_hres.cast_unsigned()
+        )];
+        for (at, name) in [(0x20, "ID"), (0x30, "version"), (0x80, "TPR"), (0xA0, "PPR"), (0xF0, "SVR"), (0x300, "ICR low"), (0x310, "ICR high"), (0x320, "LVT timer")] {
+            lines.push(format!("LAPICFMT {what}: {name} ({at:#x}): legacy {:#x}, State2 {:#x}", word(&legacy, at), word(&two, at)));
+        }
+        for (at, name) in [(0x100, "ISR"), (0x180, "TMR"), (0x200, "IRR")] {
+            lines.push(format!("LAPICFMT {what}: {name} ({at:#x}..): legacy [{}], State2 [{}]", eight(&legacy, at), eight(&two, at)));
+        }
+        let differ: Vec<String> = (0..0x400).step_by(4).filter(|&at| word(&legacy, at) != word(&two, at)).map(|at| format!("{at:#x}")).collect();
+        lines.push(format!("LAPICFMT {what}: the formats differ at {differ:?}"));
+        lines
+    }
+
+    /// A record (X2APICREC lines) of what a partition whose local APIC WHP
+    /// emulates as an x2APIC (`WHvX64LocalApicEmulationModeX2Apic`) gives a
+    /// guest, for the choice between it and today's xAPIC partition (a
+    /// Linux guest's KVM snapshot holds an x2APIC, APIC_BASE 0xfee00d00):
+    /// - whether the partition is made, and APIC_BASE before and after the
+    ///   guest sets x2APIC mode (WRMSR 0x1b of 0xfee00d00), through RDMSR
+    ///   and KVM_GET_SREGS, and KVM_SET_SREGS of 0xfee00d00;
+    /// - for each x2APIC register MSR the guest reads or writes (ID 0x802,
+    ///   version 0x803, SVR 0x80f, TPR 0x808, LVT timer 0x832, TMICT 0x838,
+    ///   TDCR 0x83e): done or #GP, the value read, and whether the access
+    ///   came to the backend (an MSR exit) or WHP answered it;
+    /// - interrupts: a self-IPI (0x83f), a fixed IPI to itself through the
+    ///   ICR (0x830), the APIC timer in one-shot mode and HLT, the
+    ///   TSC-deadline timer (LVT 0x40000|vector, WRMSR 0x6e0) and HLT, and an
+    ///   MSI the backend injects: the exits until the program's end, the
+    ///   handler's `out 0x81` for each interrupt taken, its EOI by WRMSR
+    ///   0x80b;
+    /// - KVM_GET_LAPIC in x2APIC mode: the ID (0x20), version (0x30), SVR
+    ///   (0xf0), LVT timer (0x320) and ICR (0x300, 0x310) words, to compare
+    ///   with KVM's format (Linux v6.1 lapic.c `kvm_apic_state_fixup`:
+    ///   without KVM_X2APIC_API_USE_32BIT_IDS the x2APIC ID is kept as an
+    ///   xAPIC ID, shifted to bits 24-31; the ICR's high half at 0x310), and
+    ///   KVM_SET_LAPIC of what it read, read back.
+    ///
+    /// - the local APIC's state in both of WHP's formats (`lapic_formats`)
+    ///   with an interrupt pending, here and on an xAPIC partition, first.
+    ///
+    /// Each program step must reach its end (`out 0x80`); the rest is
+    /// printed, not asserted.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_an_x2apic_partition_on_record() {
+        {
+            // An xAPIC partition, its APIC on and interrupts off, then
+            // vector 0x41 requested and pending.
+            let (vm, mut vcpu, m) = mmio_guest(&[APIC_ON[..APIC_ON.len() - 1].to_vec(), vec![0xE6, PORT as u8, 0xEB, 0xFE]].concat());
+            let mut reads = 0;
+            let end = one_run(&mut vcpu, &[], &mut reads);
+            vcpu.shared.inner.inject_msi(0xFEE0_0000, 0x41);
+            for l in lapic_formats(&format!("xAPIC partition (run: {end})"), vcpu.part(), vcpu.vp()) {
+                eprintln!("X2APICREC {l}");
+            }
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+        const VECTOR: u32 = 0x41;
+        const HANDLER: u64 = 0x7A00;
+        const PROGRAM: u64 = 0x7B00;
+        let mut lines = Vec::new();
+        super::super::vm::APIC_MODE_FOR_TESTS.set(Some(whv::WHvX64LocalApicEmulationModeX2Apic));
+        let made = super::super::VmFd::create();
+        super::super::vm::APIC_MODE_FOR_TESTS.set(None);
+        let vm = match made {
+            Ok(vm) => vm,
+            Err(e) => {
+                eprintln!("X2APICREC the x2APIC partition is not made: errno {} (the whp: line above has the HRESULT)", e.errno());
+                return;
+            }
+        };
+        lines.push("the x2APIC partition is made".to_string());
+        let m = guest();
+        probes(m);
+        let wrmsr = |index: u32, value: u64| {
+            let mut b = vec![0xB9];
+            b.extend_from_slice(&index.to_le_bytes()); // mov ecx, index
+            b.push(0xB8);
+            b.extend_from_slice(&(value as u32).to_le_bytes()); // mov eax, low
+            b.push(0xBA);
+            b.extend_from_slice(&((value >> 32) as u32).to_le_bytes()); // mov edx, high
+            b.extend_from_slice(&[0x0F, 0x30]); // wrmsr
+            b
+        };
+        // The handler: `out 0x81, al`, EOI through the x2APIC MSR, return.
+        put(
+            m,
+            HANDLER,
+            &[
+                vec![0x50, 0x51, 0x52, 0xE6, 0x81], // push rax, rcx, rdx; out 0x81, al
+                wrmsr(0x80B, 0),
+                vec![0x5A, 0x59, 0x58, 0x48, 0xCF], // pop rdx, rcx, rax; iretq
+            ]
+            .concat(),
+        );
+        let gate = (HANDLER & 0xFFFF) | (8 << 16) | (0x8E << 40) | (((HANDLER >> 16) & 0xFFFF) << 48);
+        put(m, IDT + u64::from(VECTOR) * 16, &gate.to_le_bytes());
+        put(m, IDT + u64::from(VECTOR) * 16 + 8, &(HANDLER >> 32).to_le_bytes());
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        // The supported CPUID: WHP never sees the table (every guest CPUID
+        // is an exit the backend answers), so what WHP does with a guest's
+        // EXTD below is the partition's alone; a table with x2APIC is
+        // refused on today's xAPIC partitions (`apicmode`).
+        vcpu.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
+        start(&vcpu);
+        let mut s = vcpu.get_sregs().unwrap();
+        (s.idt.base, s.idt.limit) = (IDT, (u64::from(VECTOR) * 16 + 15) as u16);
+        vcpu.set_sregs(&s).unwrap();
+        lines.push(format!("APIC_BASE through KVM_GET_SREGS at the start: {:#x}", vcpu.get_sregs().unwrap().apic_base));
+
+        let came = || MSR_INTERCEPTS.with(std::cell::Cell::get);
+        let msr = |vcpu: &mut VcpuFd, what: &str, index: u32, write: Option<u64>| -> String {
+            let before = came();
+            let (how, r) = match write {
+                Some(v) => probe(vcpu, WRMSR_AT, v & 0xFFFF_FFFF, u64::from(index), v >> 32),
+                None => probe(vcpu, RDMSR_AT, 0, u64::from(index), 0),
+            };
+            let value = (r.rdx << 32) | (r.rax & 0xFFFF_FFFF);
+            let by = if came() > before { "the backend (an MSR exit)" } else { "WHP" };
+            match write {
+                Some(v) => format!("WRMSR {index:#x} ({what}) of {v:#x}: {how}, answered by {by}"),
+                None => format!("RDMSR {index:#x} ({what}): {how}, {value:#x}, answered by {by}"),
+            }
+        };
+        lines.push(msr(&mut vcpu, "APIC_BASE", 0x1B, None));
+        lines.push(msr(&mut vcpu, "APIC_BASE, x2APIC on", 0x1B, Some(0xFEE0_0D00)));
+        lines.push(msr(&mut vcpu, "APIC_BASE", 0x1B, None));
+        lines.push(format!("APIC_BASE through KVM_GET_SREGS after: {:#x}", vcpu.get_sregs().unwrap().apic_base));
+        let mut s = vcpu.get_sregs().unwrap();
+        s.apic_base = 0xFEE0_0D00;
+        lines.push(format!("KVM_SET_SREGS with APIC_BASE 0xfee00d00: {:?}", vcpu.set_sregs(&s).map_err(|e| e.errno())));
+        lines.push(msr(&mut vcpu, "ID", 0x802, None));
+        lines.push(msr(&mut vcpu, "version", 0x803, None));
+        lines.push(msr(&mut vcpu, "SVR", 0x80F, None));
+        lines.push(msr(&mut vcpu, "SVR, enabled", 0x80F, Some(0x1FF)));
+        lines.push(msr(&mut vcpu, "TPR", 0x808, Some(0)));
+        lines.push(msr(&mut vcpu, "TPR", 0x808, None));
+        lines.push(msr(&mut vcpu, "TDCR", 0x83E, Some(0xB)));
+        lines.push(msr(&mut vcpu, "TDCR", 0x83E, None));
+
+        // Interrupts, each a program to its `out 0x80`.
+        let end = [0xE6, PORT as u8, 0xEB, 0xFE];
+        let programs: Vec<(&str, Vec<u8>)> = vec![
+            ("a self-IPI (0x83f)", [vec![0xFB], wrmsr(0x83F, u64::from(VECTOR)), vec![0x90, 0x90], end.to_vec()].concat()),
+            ("a fixed IPI to itself through the ICR (0x830, destination 0)", [vec![0xFB], wrmsr(0x830, u64::from(VECTOR)), vec![0x90, 0x90], end.to_vec()].concat()),
+            (
+                "the APIC timer, one shot of 0x10000 counts, and HLT",
+                [vec![0xFB], wrmsr(0x832, u64::from(VECTOR)), wrmsr(0x838, 0x1_0000), vec![0xF4], end.to_vec()].concat(),
+            ),
+            (
+                "the TSC-deadline timer (LVT 0x40000|vector, WRMSR 0x6e0 of the TSC plus 0x1000000) and HLT",
+                [
+                    vec![0xFB],
+                    wrmsr(0x838, 0),
+                    wrmsr(0x832, 0x4_0000 | u64::from(VECTOR)),
+                    vec![
+                        0x0F, 0x31, // rdtsc
+                        0x05, 0x00, 0x00, 0x00, 0x01, // add eax, 0x1000000
+                        0x83, 0xD2, 0x00, // adc edx, 0
+                        0xB9, 0xE0, 0x06, 0x00, 0x00, // mov ecx, 0x6e0
+                        0x0F, 0x30, // wrmsr
+                        0xF4, // hlt
+                    ],
+                    end.to_vec(),
+                ]
+                .concat(),
+            ),
+            ("an MSI the backend injects, then HLT", [vec![0xFB, 0xF4], end.to_vec()].concat()),
+        ];
+        for (name, code) in &programs {
+            put(m, PROGRAM, code);
+            vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let mut reads = 0;
+            let mut exits = Vec::new();
+            if name.starts_with("an MSI") {
+                vcpu.shared.inner.inject_msi(0xFEE0_0000, VECTOR);
+            }
+            while exits.len() < 8 {
+                let line = one_run(&mut vcpu, &[], &mut reads);
+                let done = line.starts_with("out 0x80") || line == "EINTR" || line.starts_with("run failed") || line == "InternalError";
+                exits.push(line);
+                if done {
+                    break;
+                }
+            }
+            drop(watchdog);
+            vcpu.set_kvm_immediate_exit(0);
+            lines.push(format!("{name}: exits {exits:?}"));
+            assert!(exits.last().unwrap().starts_with("out 0x80"), "{name}: the program did not reach its end: {exits:?}");
+        }
+
+        // KVM_GET_LAPIC in x2APIC mode, and KVM_SET_LAPIC of it.
+        let word = |page: &kvm_bindings::kvm_lapic_state, offset: usize| {
+            u32::from_le_bytes(std::array::from_fn(|i| page.regs[offset + i].cast_unsigned()))
+        };
+        match vcpu.get_lapic() {
+            Ok(page) => {
+                lines.push(format!(
+                    "KVM_GET_LAPIC: ID {:#x}, version {:#x}, SVR {:#x}, LVT timer {:#x}, ICR {:#x} {:#x}",
+                    word(&page, 0x20),
+                    word(&page, 0x30),
+                    word(&page, 0xF0),
+                    word(&page, 0x320),
+                    word(&page, 0x300),
+                    word(&page, 0x310)
+                ));
+                let set = vcpu.set_lapic(&page).map_err(|e| e.errno());
+                let back = vcpu.get_lapic().map(|b| b.regs == page.regs).map_err(|e| e.errno());
+                lines.push(format!("KVM_SET_LAPIC of it: {set:?}; read back the same: {back:?}"));
+            }
+            Err(e) => lines.push(format!("KVM_GET_LAPIC: errno {}", e.errno())),
+        }
+        // Both state formats, with vector VECTOR pending (interrupts off,
+        // the vCPU not run after the request).
+        let mut r = vcpu.get_regs().unwrap();
+        r.rflags = 2;
+        vcpu.set_regs(&r).unwrap();
+        vcpu.shared.inner.inject_msi(0xFEE0_0000, VECTOR);
+        lines.extend(lapic_formats("x2APIC partition", vcpu.part(), vcpu.vp()));
+        for l in &lines {
+            eprintln!("X2APICREC {l}");
+        }
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
     /// Record A of lazy-ram-options.md (COMMITTEST lines; no WHP): what
     /// `VirtualAlloc(MEM_COMMIT)` of reserved memory takes for 4 KiB,
     /// 64 KiB and 2 MiB (64 of each, the median, least and most), what the
