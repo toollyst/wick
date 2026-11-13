@@ -15,7 +15,7 @@ use kvm_bindings::{
 use super::exit::{KVM_UID, PV_TIME_FEATURES, PV_TIME_ST};
 use super::pvtime::tests::{PC, PSTATE, RAM, X9, mmio_values, new_vcpu, vm_with_code};
 use super::regs::{
-    Bmap, FW_REGS, PSCI_VERSION_0_2, PSCI_VERSION_1_0, PSCI_VERSION_1_1, PSCI_VERSION_ID, reg_size, workaround_id,
+    Bmap, FW_REGS, PSCI_VERSION_0_2, PSCI_VERSION_1_0, PSCI_VERSION_1_1, PSCI_VERSION_ID, reg_size, sys_id, workaround_id,
 };
 use super::trng;
 use crate::{VcpuExit, VcpuFd};
@@ -406,8 +406,9 @@ fn saved(vcpu: &VcpuFd) -> Vec<(u64, Vec<u8>)> {
 
 // KVM's firmware pseudo-registers (Linux 6.1 hypercalls.c): the seven are
 // in the register list in kvm_arm_fw_reg_ids' order; a new VM's values are
-// PSCI 1.1, each workaround level NOT_AVAIL (what SMCCC_ARCH_FEATURES
-// answers for them here), and every service's bit (kvm_arm_init_hypercalls);
+// PSCI 1.1, each workaround level the host's (what goes with
+// SMCCC_ARCH_FEATURES' answer: test_the_arch_workarounds_answer_as_kvm_on_this_cpu),
+// and every service's bit (kvm_arm_init_hypercalls);
 // they are the VM's (written by one vCPU, read by another); a bitmap takes
 // any subset of its bits and no other bit (EINVAL), a workaround level only
 // one the host gives (EINVAL); an id of another size or number is ENOENT.
@@ -420,8 +421,9 @@ fn test_firmware_registers_are_listed_and_kept_as_kvms() {
     let ids = list.as_slice();
     let first = ids.iter().position(|id| *id == PSCI_VERSION_ID).expect("the PSCI version is not listed");
     assert_eq!(ids[first..first + 7], FW_REGS);
+    let [w1, w2, w3] = [1, 2, 3].map(|n| read(&vcpus[0], workaround_id(n)));
     for vcpu in &vcpus {
-        assert_eq!(FW_REGS.map(|id| read(vcpu, id)), [PSCI_VERSION_1_1, 0, 0, 0, 1, 1, 3]);
+        assert_eq!(FW_REGS.map(|id| read(vcpu, id)), [PSCI_VERSION_1_1, w1, w2, w3, 1, 1, 3]);
     }
 
     let (std, std_hyp, vendor) = (Bmap::Std.id(), Bmap::StdHyp.id(), Bmap::VendorHyp.id());
@@ -436,21 +438,100 @@ fn test_firmware_registers_are_listed_and_kept_as_kvms() {
     assert_eq!(write(&vcpus[1], std, 1), Ok(8));
     assert_eq!(read(&vcpus[0], std), 1);
 
-    for n in [1, 3] {
+    // A workaround level takes NOT_AVAIL on any host, and nothing is kept
+    // of the write: the register reads the host's level still. A bit
+    // outside the level (and, for WORKAROUND_2, its enabled bit) is EINVAL.
+    for (n, level) in [(1, w1), (2, w2), (3, w3)] {
         assert_eq!(write(&vcpus[0], workaround_id(n), 0), Ok(8));
-        assert_eq!(write(&vcpus[0], workaround_id(n), 1), Err(libc::EINVAL));
+        assert_eq!(read(&vcpus[1], workaround_id(n)), level);
+        for bad in [0x20, 1 << 32, 0x10] {
+            assert_eq!(write(&vcpus[0], workaround_id(n), bad), Err(libc::EINVAL), "{n} {bad:#x}");
+        }
     }
-    for (value, result) in [(0, Ok(8)), (1, Ok(8)), (2, Err(libc::EINVAL)), (3, Err(libc::EINVAL)), (0x10, Err(libc::EINVAL))] {
-        assert_eq!(write(&vcpus[0], workaround_id(2), value), result, "{value:#x}");
-    }
-    // Nothing is kept of a workaround write.
-    assert_eq!(read(&vcpus[0], workaround_id(2)), 0);
 
     let mut buf = [0u8; 8];
     for id in [workaround_id(4), vendor + 1, std & !KVM_REG_SIZE_MASK | KVM_REG_SIZE_U32] {
         assert_eq!(vcpus[0].get_one_reg(id, &mut buf).unwrap_err().errno(), libc::ENOENT, "{id:#x}");
         assert_eq!(vcpus[0].set_one_reg(id, &buf).unwrap_err().errno(), libc::ENOENT, "{id:#x}");
     }
+}
+
+fn sysctl(name: &std::ffi::CStr) -> Option<i32> {
+    let mut value = 0i32;
+    let mut len = std::mem::size_of::<i32>();
+    // SAFETY: a 4-byte value and its length; the name is NUL-terminated.
+    let ret = unsafe {
+        libc::sysctlbyname(name.as_ptr(), std::ptr::from_mut(&mut value).cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    (ret == 0).then_some(value)
+}
+
+// SMCCC_ARCH_FEATURES of ARM_SMCCC_ARCH_WORKAROUND_1, _2 and _3 answers by
+// the host CPU's Spectre state as Linux decides it, and each firmware
+// register's level goes with its answer, as KVM's two functions give them
+// (hypercalls.c kvm_hvc_call_handler beside get_kernel_wa_level). The host
+// CPU's side is checked against macOS's own record of the CPU
+// (`hw.optional.arm.FEAT_CSV2`, `FEAT_SSBS`): a CPU with CSV2 is unaffected
+// by Spectre v2 (answer 1, level NOT_REQUIRED); no Mac's core is on
+// Linux's Spectre v4 safe list and none has firmware to ask, so
+// WORKAROUND_2 is NOT_SUPPORTED with or without SSBS (level NOT_AVAIL).
+// A register takes its level and none above. The calls themselves return
+// as KVM's entry code returns them (hyp-entry.S el1_sync): X0 and X1 0, X2
+// and X3 untouched.
+#[test]
+fn test_the_arch_workarounds_answer_as_kvm_on_this_cpu() {
+    const WORKAROUNDS: [u32; 3] = [0x8000_8000, 0x8000_7fff, 0x8000_3fff];
+    let mut calls: Vec<Vec<u32>> =
+        WORKAROUNDS.iter().map(|id| call3(SMCCC_ARCH_FEATURES, [1 << 32 | u64::from(*id), 6, 7], 0..4)).collect();
+    calls.extend(WORKAROUNDS.iter().map(|id| call3(*id, [5, 6, 7], 0..4)));
+    // Its neighbour is no call, and no feature.
+    calls.push(call3(0x8000_8001, [5, 6, 7], 0..4));
+    calls.push(call3(SMCCC_ARCH_FEATURES, [0x8000_8001, 6, 7], 0..4));
+    let (vm, _) = vm_with_code(&program(&calls), 0);
+    let vcpu = new_vcpu(&vm, 0);
+    let levels = [1, 2, 3].map(|n| read(&vcpu, workaround_id(n)));
+    // MIDR_EL1, ID_AA64PFR0_EL1 (CSV2 59:56), ID_AA64PFR1_EL1 (SSBS 7:4),
+    // ID_AA64MMFR1_EL1 (ECBHB 63:60), ID_AA64ISAR2_EL1 (CLRBHB 31:28): what
+    // the answers below are decided from, for the record of a run.
+    let ids = [0xc000, 0xc020, 0xc021, 0xc039, 0xc032].map(|r| {
+        let mut buf = [0u8; 8];
+        vcpu.get_one_reg(sys_id(r), &mut buf).map(|_| u64::from_le_bytes(buf)).ok()
+    });
+    println!("MIDR, ID_AA64PFR0, ID_AA64PFR1, ID_AA64MMFR1, ID_AA64ISAR2: {ids:x?}");
+    for (n, level) in (1u64..).zip(levels) {
+        assert_eq!(write(&vcpu, workaround_id(n), level), Ok(8), "WORKAROUND_{n} at its level {level}");
+        // WORKAROUND_2's levels are narrowed to NOT_AVAIL (0, 1) and
+        // NOT_REQUIRED (2, 3): the first above NOT_AVAIL is 2.
+        let above = if n == 2 && level == 0 { 2 } else { level + 1 };
+        assert_eq!(write(&vcpu, workaround_id(n), above), Err(libc::EINVAL), "WORKAROUND_{n} above {level}");
+        assert_eq!(write(&vcpu, workaround_id(n), 0), Ok(8), "WORKAROUND_{n} at NOT_AVAIL");
+    }
+    let v = mmio_values(vcpu, 4 * 8);
+    let answers = [v[0], v[4], v[8]];
+    println!("SMCCC_ARCH_FEATURES of WORKAROUND_1, _2, _3: {answers:x?}; levels {levels:?}");
+    for (n, (answer, level)) in (1usize..).zip(answers.iter().zip(levels)) {
+        assert_eq!(v[4 * (n - 1) + 1..4 * n], [0, 0, 0], "WORKAROUND_{n}'s X1 to X3");
+        // get_kernel_wa_level beside kvm_hvc_call_handler.
+        let goes_with = match (n, *answer) {
+            (_, NOT_SUPPORTED) => 0,
+            (1 | 3, 0) => 1,
+            (1 | 3, 1) => 2,
+            (2, 2) => 3,
+            _ => panic!("WORKAROUND_{n}: answer {answer:#x}"),
+        };
+        assert_eq!(level, goes_with, "WORKAROUND_{n}: answer {answer:#x}");
+    }
+    let csv2 = sysctl(c"hw.optional.arm.FEAT_CSV2").expect("hw.optional.arm.FEAT_CSV2");
+    println!("hw.optional.arm.FEAT_CSV2 {csv2}, FEAT_SSBS {:?}", sysctl(c"hw.optional.arm.FEAT_SSBS"));
+    assert_eq!(answers[0], if csv2 == 1 { 1 } else { NOT_SUPPORTED }, "WORKAROUND_1 with FEAT_CSV2 {csv2}");
+    assert_eq!(answers[1], NOT_SUPPORTED, "WORKAROUND_2");
+    // BHB is never mitigated or unaffected where v2 is vulnerable.
+    assert!(answers[0] != NOT_SUPPORTED || answers[2] == NOT_SUPPORTED, "{answers:x?}");
+    for answer in v[12..24].chunks(4) {
+        assert_eq!(answer, [0, 0, 6, 7], "a workaround call");
+    }
+    assert_eq!(v[24..28], [NOT_SUPPORTED, 0, 0, 0]);
+    assert_eq!(v[28..32], [NOT_SUPPORTED, 0, 0, 0]);
 }
 
 const SMCCC_ARCH_FEATURES: u32 = 0x8000_0001;
@@ -562,7 +643,7 @@ fn test_a_snapshots_registers_restore_the_firmware_registers() {
     };
     let kept: Vec<u64> =
         state.iter().filter(|(id, _)| FW_REGS.contains(id)).map(|(_, v)| u64::from_le_bytes(v[..8].try_into().unwrap())).collect();
-    assert_eq!(kept, [PSCI_VERSION_1_0, 0, 0, 0, 0, 1, 1]);
+    assert_eq!((kept[0], &kept[4..]), (PSCI_VERSION_1_0, &[0, 1, 1][..]));
 
     let code = program(&[
         call(0x8400_0000, 0, 0..1),
@@ -572,10 +653,14 @@ fn test_a_snapshots_registers_restore_the_firmware_registers() {
     ]);
     let (vm, _) = vm_with_code(&code, 0);
     let vcpu = new_vcpu(&vm, 0);
-    assert_eq!(FW_REGS.map(|id| read(&vcpu, id)), [PSCI_VERSION_1_1, 0, 0, 0, 1, 1, 3]);
+    // The workaround levels are the host's in both VMs: the saved ones are
+    // taken, being no higher.
+    let [w1, w2, w3] = [1, 2, 3].map(|n| read(&vcpu, workaround_id(n)));
+    assert_eq!(kept[1..4], [w1, w2, w3]);
+    assert_eq!(FW_REGS.map(|id| read(&vcpu, id)), [PSCI_VERSION_1_1, w1, w2, w3, 1, 1, 3]);
     for (id, value) in &state {
         vcpu.set_one_reg(*id, value).unwrap_or_else(|e| panic!("{id:#x}: {e}"));
     }
-    assert_eq!(FW_REGS.map(|id| read(&vcpu, id)), [PSCI_VERSION_1_0, 0, 0, 0, 0, 1, 1]);
+    assert_eq!(FW_REGS.map(|id| read(&vcpu, id)), [PSCI_VERSION_1_0, w1, w2, w3, 0, 1, 1]);
     assert_eq!(mmio_values(vcpu, 7), [PSCI_VERSION_1_0, NOT_SUPPORTED, 0, 0, 0, 1, NOT_SUPPORTED]);
 }

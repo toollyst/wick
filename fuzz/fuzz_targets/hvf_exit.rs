@@ -176,6 +176,9 @@ fn step(s: &Step, debug: &mut DebugRegs, reference: &mut Reference) {
                 0x8400_0012 | 0xc400_0012 => Psci::SystemReset2,
                 0x8000_0000 => Psci::SmcccVersion,
                 0x8000_0001 => Psci::SmcccArchFeatures,
+                // ARM_SMCCC_ARCH_WORKAROUND_1, _2, _3 (include/linux/arm-smccc.h:
+                // the architecture's fast SMC32 calls 0x8000, 0x7fff, 0x3fff).
+                0x8000_8000 | 0x8000_7fff | 0x8000_3fff => Psci::ArchWorkaround,
                 0x8600_ff01 => Psci::VendorHypUid,
                 0x8600_0000 => Psci::KvmFeatures,
                 0x8600_0001 => Psci::KvmPtp,

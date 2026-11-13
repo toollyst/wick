@@ -100,13 +100,18 @@ fn test_a_snapshot_keeps_the_firmware_registers() {
     // Upstream saves every register KVM_GET_REG_LIST names and writes each
     // back at the restore. KVM's list has its seven firmware registers, so
     // a microVM given PSCI 1.0, no TRNG and no KVM_PTP keeps them over a
-    // snapshot; here too.
+    // snapshot; here too. The three workaround levels are the host CPU's
+    // (kvm-ioctls' test_the_arch_workarounds_answer_as_kvm_on_this_cpu):
+    // the same in every VM of this host, so a saved one is taken back.
+    let levels;
     let state = {
         let mut vm = setup_vm_with_memory(0x1000);
         let mut vcpu = KvmVcpu::new(0, &vm).unwrap();
         vm.setup_irqchip(1).unwrap();
         vcpu.init(&[]).unwrap();
-        assert_eq!(firmware_regs(&vcpu), [PSCI_1_1, 0, 0, 0, 1, 1, 3]);
+        let new = firmware_regs(&vcpu);
+        levels = [new[1], new[2], new[3]];
+        assert_eq!(new, [PSCI_1_1, levels[0], levels[1], levels[2], 1, 1, 3]);
         for (id, value) in [(FIRMWARE_REGS[0], PSCI_1_0), (FIRMWARE_REGS[4], 0), (FIRMWARE_REGS[6], 1)] {
             vcpu.fd.set_one_reg(id, &value.to_le_bytes()).unwrap();
         }
@@ -114,8 +119,9 @@ fn test_a_snapshot_keeps_the_firmware_registers() {
         vcpu.save_state().unwrap()
     };
     let saved: Vec<u64> = state.regs.iter().filter(|r| FIRMWARE_REGS.contains(&r.id)).map(|r| r.value()).collect();
-    assert_eq!(saved, [PSCI_1_0, 0, 0, 0, 0, 1, 1]);
-    assert_eq!(restored_firmware_regs(&state), [PSCI_1_0, 0, 0, 0, 0, 1, 1]);
+    let kept = [PSCI_1_0, levels[0], levels[1], levels[2], 0, 1, 1];
+    assert_eq!(saved, kept);
+    assert_eq!(restored_firmware_regs(&state), kept);
 
     // A state without them, which is what every build before the list named
     // them saved (the PSCI version included): it restores, and the VM has a
@@ -132,5 +138,5 @@ fn test_a_snapshot_keeps_the_firmware_registers() {
         older.regs.push(reg);
     }
     assert_eq!(older.regs.len() + 7, state.regs.len());
-    assert_eq!(restored_firmware_regs(&older), [PSCI_1_1, 0, 0, 0, 1, 1, 3]);
+    assert_eq!(restored_firmware_regs(&older), [PSCI_1_1, levels[0], levels[1], levels[2], 1, 1, 3]);
 }

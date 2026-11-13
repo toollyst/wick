@@ -623,7 +623,17 @@ fn read_reg(hv: hv_vcpu_t, id: u64, out: &mut [u8]) -> Result<()> {
                 Reg::Aarch32Spsr => {}
                 // A new VM's; the VM's own is read in get_reg_now.
                 Reg::PsciVersion => v = regs::PSCI_VERSION_1_1,
-                Reg::Workaround(_) => v = firmware::WORKAROUND_LEVEL,
+                // The host's, from the registers of this vCPU, which is
+                // a new one's when the reset values are probed.
+                Reg::Workaround(n) => {
+                    let id = |r: u16| {
+                        let mut v = 0;
+                        // A register this Hypervisor.framework does not
+                        // have reads as 0, as `id_reg` gives it.
+                        if hv_vcpu_get_sys_reg(hv, r, &mut v) == HV_SUCCESS { v } else { 0 }
+                    };
+                    v = firmware::HostCpu::read(id).workaround_level(n);
+                }
                 Reg::Bmap(bmap) => v = bmap.features(),
                 // A new vCPU's: the lock clear, as KVM resets it.
                 Reg::OsLock => v = exit::OSLSR_RESET,
@@ -693,7 +703,7 @@ impl VcpuFd {
     fn fw_reg(&self, reg: Reg) -> Result<Option<u64>> {
         Ok(Some(match reg {
             Reg::PsciVersion => self.vm()?.psci_version.load(Ordering::Relaxed),
-            Reg::Workaround(_) => firmware::WORKAROUND_LEVEL,
+            Reg::Workaround(n) => self.host_cpu()?.workaround_level(n),
             Reg::Bmap(bmap) => self.vm()?.smccc_features.lock().unwrap()[bmap as usize],
             _ => return Ok(None),
         }))
@@ -704,8 +714,10 @@ impl VcpuFd {
     fn set_fw_reg(&self, reg: Reg, v: u64) -> Result<()> {
         match reg {
             Reg::PsciVersion => self.set_psci_version(v),
-            Reg::Workaround(n) if firmware::workaround_accepts(n, v, firmware::WORKAROUND_LEVEL) => Ok(()),
-            Reg::Workaround(_) => err(libc::EINVAL),
+            Reg::Workaround(n) => {
+                let level = self.host_cpu()?.workaround_level(n);
+                if firmware::workaround_accepts(n, v, level) { Ok(()) } else { err(libc::EINVAL) }
+            }
             Reg::Bmap(bmap) => {
                 let vm = self.vm()?;
                 let mut features = vm.smccc_features.lock().unwrap();
@@ -1006,6 +1018,21 @@ impl VcpuFd {
             let mut buf = [0u8; 8];
             buf.copy_from_slice(&v[..8]);
             u64::from_le_bytes(buf) & !hidden
+        }))
+    }
+
+    /// The host CPU's registers that say what Spectre v2, v4 and BHB are to
+    /// it (`firmware::HostCpu`): the host's values, whatever the VM's ID
+    /// registers were set to, as KVM answers by the host's state.
+    fn host_cpu(&self) -> Result<firmware::HostCpu> {
+        let vm = self.vm()?;
+        let reset = vm.reset_regs.get_or_init(probe_reset_regs).as_ref().map_err(|e| Error::new(*e))?;
+        Ok(firmware::HostCpu::read(|r| {
+            reset.get(&regs::sys_id(r)).map_or(0, |v| {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&v[..8]);
+                u64::from_le_bytes(buf)
+            })
         }))
     }
 
@@ -1410,6 +1437,18 @@ impl VcpuFd {
         // looked at (hypercalls.c kvm_hvc_call_handler: `val[4] =
         // {SMCCC_RET_NOT_SUPPORTED}`, `if (!kvm_hvc_call_allowed()) goto out`).
         let features = *self.vm()?.smccc_features.lock().unwrap();
+        // A guest's own call of ARCH_WORKAROUND_1, _2 or _3 never reaches
+        // KVM's handler: the hypervisor's entry answers it at once
+        // (arch/arm64/kvm/hyp/hyp-entry.S el1_sync: "The workaround has
+        // already been applied on the host, so let's quickly get back to
+        // the guest"), whatever SMCCC_ARCH_FEATURES says of it: X0 is 0,
+        // and X1, which that code uses, is 0 too ("We don't bother
+        // restoring x1"); X2 and X3 are the guest's.
+        if call == Psci::ArchWorkaround {
+            self.set_reg(hv, HV_REG_X0, 0)?;
+            self.set_reg(hv, HV_REG_X0 + 1, 0)?;
+            return Ok(None);
+        }
         let words = match call {
             _ if !firmware::allowed(call, &features) => Some([PSCI_RET_NOT_SUPPORTED as u64, 0, 0, 0]),
             Psci::SmcccVersion => Some([exit::SMCCC_VERSION_1_1, 0, 0, 0]),
@@ -1421,17 +1460,16 @@ impl VcpuFd {
             // The number of bits is W1 (`u32 num_bits = smccc_get_arg1()`).
             Psci::TrngRnd32 => Some(trng::rnd(32, x1 as u32, trng::host_entropy)),
             Psci::TrngRnd64 => Some(trng::rnd(64, x1 as u32, trng::host_entropy)),
-            // PV time's calls; no SMCCC_ARCH_WORKAROUND_* is implemented:
-            // the guest relies on what its CPU features say, as on a host
-            // whose firmware has none.
-            Psci::SmcccArchFeatures => Some([
-                pvtime::arch_feature(x1 as u32)
-                    .filter(|_| firmware::pv_time_reported(&features))
-                    .unwrap_or(PSCI_RET_NOT_SUPPORTED as u64),
-                0,
-                0,
-                0,
-            ]),
+            // The feature asked about is a u32 (`feature =
+            // smccc_get_arg1(vcpu)`): the three workarounds by the host
+            // CPU's Spectre state, PV time's calls by their bit.
+            Psci::SmcccArchFeatures => {
+                let answer = match exit::arch_workaround(x1) {
+                    Some(n) => self.host_cpu()?.workaround_feature(n),
+                    None => pvtime::arch_feature(x1 as u32).filter(|_| firmware::pv_time_reported(&features)),
+                };
+                Some([answer.unwrap_or(PSCI_RET_NOT_SUPPORTED as u64), 0, 0, 0])
+            }
             Psci::VendorHypUid => Some(exit::KVM_UID),
             // The vendor bitmap itself (`val[0] = smccc_feat->vendor_hyp_bmap`).
             Psci::KvmFeatures => Some([features[regs::Bmap::VendorHyp as usize], 0, 0, 0]),
@@ -1526,7 +1564,8 @@ impl VcpuFd {
                 PSCI_RET_INTERNAL_FAILURE
             }
             Psci::NotSupported => PSCI_RET_NOT_SUPPORTED,
-            Psci::SmcccVersion
+            Psci::ArchWorkaround
+            | Psci::SmcccVersion
             | Psci::TrngVersion
             | Psci::TrngFeatures
             | Psci::TrngGetUuid

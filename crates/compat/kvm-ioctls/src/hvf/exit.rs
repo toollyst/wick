@@ -294,6 +294,8 @@ pub enum Psci {
     TrngRnd32,
     /// TRNG_RND64: X1 the number of bits, at most 192.
     TrngRnd64,
+    /// ARM_SMCCC_ARCH_WORKAROUND_1, _2 or _3 called itself.
+    ArchWorkaround,
     /// SMCCC_VERSION.
     SmcccVersion,
     /// SMCCC_ARCH_FEATURES: X1 a function id.
@@ -317,6 +319,18 @@ pub const SMCCC_VERSION_1_1: u64 = 0x1_0001;
 /// ARM_SMCCC_VENDOR_HYP_UID_KVM_REG_0..3: KVM's vendor hypervisor UID.
 pub const KVM_UID: [u64; 4] = [0xb66f_b428, 0xe911_c52e, 0x564b_caa9, 0x743a_004d];
 
+/// Which of ARM_SMCCC_ARCH_WORKAROUND_1, _2 and _3 the low 32 bits of
+/// `id` name (include/linux/arm-smccc.h: fast SMC32 calls of the
+/// architecture's, functions 0x8000, 0x7fff and 0x3fff).
+pub fn arch_workaround(id: u64) -> Option<u8> {
+    match id as u32 {
+        0x8000_8000 => Some(1),
+        0x8000_7fff => Some(2),
+        0x8000_3fff => Some(3),
+        _ => None,
+    }
+}
+
 impl Psci {
     /// The call `x0` names; only its low 32 bits are the function id.
     pub fn decode(x0: u64) -> Psci {
@@ -338,6 +352,7 @@ impl Psci {
             super::trng::RND64 => Psci::TrngRnd64,
             0x8000_0000 => Psci::SmcccVersion,
             0x8000_0001 => Psci::SmcccArchFeatures,
+            id if arch_workaround(u64::from(id)).is_some() => Psci::ArchWorkaround,
             0x8600_ff01 => Psci::VendorHypUid,
             0x8600_0000 => Psci::KvmFeatures,
             0x8600_0001 => Psci::KvmPtp,
@@ -468,6 +483,13 @@ mod tests {
             assert_eq!(Psci::decode(id), call, "{id:#x}");
         }
         assert_eq!(Psci::decode(0x8000_0000), Psci::SmcccVersion);
+        for (id, n) in [(0x8000_8000u64, 1), (0x8000_7fff, 2), (0x8000_3fff, 3), (0xffff_ffff_8000_8000, 1)] {
+            assert_eq!((Psci::decode(id), arch_workaround(id)), (Psci::ArchWorkaround, Some(n)), "{id:#x}");
+        }
+        // Neither an SMC64 form nor a neighbour.
+        for id in [0xc000_8000u64, 0x8000_8001, 0x8000_7ffe, 0x8000_4000] {
+            assert_eq!((Psci::decode(id), arch_workaround(id)), (Psci::NotSupported, None), "{id:#x}");
+        }
         assert_eq!(Psci::decode(0x8600_ff01), Psci::VendorHypUid);
         assert_eq!(Psci::decode(0x8600_0001), Psci::KvmPtp);
         assert_eq!(Psci::decode(0xc500_0020), Psci::PvTimeFeatures);

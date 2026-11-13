@@ -128,6 +128,7 @@ no-hvf compat-kvm-ioctls hvf::smccc_tests::test_cpu_off_leaves_the_registers_kvm
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_firmware_registers_are_listed_and_kept_as_kvms
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_psci_1_1_system_reset2_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_psci_calls_return_as_kvms
+no-hvf compat-kvm-ioctls hvf::smccc_tests::test_the_arch_workarounds_answer_as_kvm_on_this_cpu
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_trng_calls_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::vcpu::tests::test_kvm_ptp_counters
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_new_vcpu_has_kvms_reset_values
