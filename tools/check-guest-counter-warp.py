@@ -28,8 +28,8 @@
 #           clang other than the recorded one whose bytes differ or whose
 #           object has relocations. Ubuntu clang version 18.1.3 (1ubuntu1),
 #           the clang of Ubuntu 24.04 (in Docker, 2026-11-14), is such a
-#           one: 225 x86_64 bytes, not 231, and 220 aarch64 bytes, not
-#           228 (with no relocation now; without -mno-outline-atomics its
+#           one: 297 x86_64 bytes, not 307, and 268 aarch64 bytes, not
+#           276 (with no relocation now; without -mno-outline-atomics its
 #           aarch64 object called __aarch64_swp8_acq, R_AARCH64_CALL26),
 #           so CI's Linux runners cannot check the bytes and the check is
 #           not a CI step; run it on a Mac with the recorded clang.

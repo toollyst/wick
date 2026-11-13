@@ -13,7 +13,12 @@
 typedef unsigned long u64;
 /* s: [0] lock, [1] last counter, [2] last reader (CPU + 1); out: [0] max
    warp, [1] warps, [2] max forward step at a hand-over, [3] hand-overs,
-   [4] iterations. After its turn a CPU waits (at most 1000 pauses) for the
+   [4] iterations, [5] the counter at the start, [6] the last counter read.
+   The loop ends after `iterations` turns or once the counter has moved
+   more than `ticks` past its start, whichever comes first, as the kernel's
+   check_tsc_warp ends at its timeout (`ticks` 0: no time bound; 0
+   iterations: only the start is read, for the caller to learn the
+   counter's rate). After its turn a CPU waits (at most 1000 pauses) for the
    other's, so that the turns alternate. */
 static inline u64 counter(void) {
 #if defined(__x86_64__)
@@ -26,9 +31,11 @@ static inline u64 counter(void) {
     return v;
 #endif
 }
-void warp_loop(volatile u64 *s, u64 me, u64 iterations, u64 *out) {
+void warp_loop(volatile u64 *s, u64 me, u64 iterations, u64 ticks, u64 *out) {
     u64 max_warp = 0, warps = 0, max_gap = 0, handovers = 0, i;
+    u64 start = counter(), last = start;
     for (i = 0; i < iterations; i++) {
+        if (ticks && last - start > ticks) break;
         while (__atomic_exchange_n(&s[0], 1, __ATOMIC_ACQUIRE)) {
 #if defined(__x86_64__)
             __asm__ volatile("pause");
@@ -38,6 +45,7 @@ void warp_loop(volatile u64 *s, u64 me, u64 iterations, u64 *out) {
         }
         u64 prev = s[1];
         u64 now = counter();
+        last = now;
         u64 who = s[2];
         s[1] = now;
         s[2] = me;
@@ -60,4 +68,5 @@ void warp_loop(volatile u64 *s, u64 me, u64 iterations, u64 *out) {
         }
     }
     out[0] = max_warp; out[1] = warps; out[2] = max_gap; out[3] = handovers; out[4] = i;
+    out[5] = start; out[6] = last;
 }

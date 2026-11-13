@@ -16,17 +16,33 @@
 # hand-over compares two CPUs. The guest kernel runs that
 # test only when a CPU comes online, and not at all once its CPUID has
 # TSC_ADJUST; this runs it when the boot tests ask, on every host.
+# Like the kernel's, the run is bounded by time: check_tsc_warp(timeout)
+# reads the TSC at its start, sets end = start + tsc_khz * timeout (v6.1
+# tsc_sync.c:276) and stops once the TSC passes it, or after 10000000 turns
+# (:297); loop_timeout gives 2 ms, or 20 ms for a CPU alone in its package
+# (:341-343). Here the bound is BOUND_S, 2 s, with ITERATIONS kept as the
+# most turns. Not the kernel's 2 or 20 ms: the kernel's loop runs with both
+# CPUs' interrupts off, while this one runs in user space, where a nested
+# KVM runner (GitHub's) made about 10000 hand-overs a second (999971 in
+# about 100 s, CI run 43480682094); 2 s gives such a host twenty times the
+# 1000 hand-overs a measurement needs, and the fastest hosts stop at the
+# iteration count first. The counter's rate, for the bound, is measured
+# against CLOCK_MONOTONIC over 50 ms before the run (the loop called with no
+# turns reads the counter); on aarch64 that is CNTFRQ_EL0's rate, read the
+# same way rather than from the register, so both machines share one path.
 #
 # Interface (the boot tests of all three hosts call it unchanged):
 #   python3 guest-counter-warp.py [CPU_A CPU_B [ITERATIONS]]
-#     CPU_A, CPU_B  the two CPUs (default 0 1); ITERATIONS per CPU (default
-#     500000).
+#     CPU_A, CPU_B  the two CPUs (default 0 1); ITERATIONS per CPU at most
+#     (default 500000); the run also ends after BOUND_S seconds.
 #   Output: one line, then the exit status:
 #     counter-warp: pass: <counter> CPUs A and B, I iterations each,
-#       H hand-overs, largest forward step at a hand-over G ticks      exit 0
+#       H hand-overs, largest forward step at a hand-over G ticks,
+#       in R s                                                          exit 0
 #     counter-warp: FAIL: <counter> went back W ticks from CPU X to CPU Y
-#       (N warps in H hand-overs, I iterations each)                    exit 1
+#       (N warps in H hand-overs, I iterations each, in R s)            exit 1
 #     counter-warp: FAIL: ... (no measurement: the reason)              exit 2
+#   I is the turns the CPU that ran fewer took; R the seconds the run took.
 #   A run whose CPUs handed the lock over fewer than 1000 times measured
 #   nothing and exits 2, as does an unknown machine, a CPU that cannot be
 #   bound, or code that cannot be mapped.
@@ -38,12 +54,15 @@
 #   python3 -c "import base64,zlib;exec(zlib.decompress(base64.b64decode('$W'),-15))" A B
 #
 # The loop (s[0] lock, s[1] last value, s[2] last reader, CPU + 1; out: max
-# warp, warps, max forward step, hand-overs, iterations), in short:
-#   void warp_loop(volatile u64 *s, u64 me, u64 n, u64 *out) {
+# warp, warps, max forward step, hand-overs, iterations, the counter at the
+# start, the last counter read), in short:
+#   void warp_loop(volatile u64 *s, u64 me, u64 n, u64 ticks, u64 *out) {
 #     u64 max_warp = 0, warps = 0, max_gap = 0, handovers = 0, i;
+#     u64 start = counter(), last = start;
 #     for (i = 0; i < n; i++) {
+#       if (ticks && last - start > ticks) break;
 #       while (__atomic_exchange_n(&s[0], 1, __ATOMIC_ACQUIRE)) pause/yield;
-#       u64 prev = s[1], now = counter(), who = s[2];
+#       u64 prev = s[1], now = counter(), who = s[2]; last = now;
 #       s[1] = now; s[2] = me;
 #       __atomic_store_n(&s[0], 0, __ATOMIC_RELEASE);
 #       for (k = 0; k < 1000 && s[2] == me; k++) pause/yield;
@@ -53,7 +72,7 @@
 #         else max_gap = max(max_gap, now - prev);
 #       }
 #     }
-#     out[0..5] = max_warp, warps, max_gap, handovers, i;
+#     out[0..7] = max_warp, warps, max_gap, handovers, i, start, last;
 #   }
 # counter() is RDTSCP on x86_64, ISB; MRS CNTVCT_EL0 on aarch64.
 #
@@ -76,7 +95,7 @@
 # other code or data section. tools/check-guest-counter-warp.py does exactly
 # this and compares: that clang on this repo's Mac rebuilds both byte for
 # byte. Another clang may choose other instructions for the same source
-# (Ubuntu 24.04's clang 18.1.3 does, on both machines: 225 and 220
+# (Ubuntu 24.04's clang 18.1.3 does, on both machines: 297 and 268
 # bytes), so the check says SKIP (exit 3) when its clang is
 # another and differs, and when no clang is on PATH; it never passes
 # silently.
@@ -85,12 +104,15 @@ import mmap
 import os
 import sys
 import threading
+import time
 
 CODE = {
-    "x86_64": ("TSC", "4157415641554154534989c84989d14885d20f84a70000004531db4531f631db4531d24531ffeb0a0f1f840000000000f390b8010000004887074885c075f14c8b67080f01f948c1e22089c04809d0488b4f10488947084889771048c70700000000bae8030000660f1f8400000000004c8b6f104939f57507f39048ffca75f04839f10f95c24885c90f95c184ca742149ffc24c89e14829c1760c49ffc64c39d94c0f47d9eb0a4c29e04839d8480f47d849ffc74d39cf0f8575ffffffeb0b4531d231db4531f64531db4d89184d897008498958104d8950184d8948205b415c415d415e415fc3"),
-    "aarch64": ("CNTVCT_EL0", "220600b4eb031faaea031faae9031faae8031faaec031faa2d008052040000148c0500919f0102eb600500540efc5fc80d7c0fc8cfffff35ce0000b43f2003d50efc5fc80d7c0fc8cfffff358effffb50e0440f9df3f03d54fe03bd5117d8052100840f90f0400f9010800f91ffc9fc8120840f95f0201eb81000054310600f13f2003d561ffff541f0201eba0fcff5490fcffb4f0010ecbd1010fcb080500911f0209eb1082899a3f020beb31828b9adf010feb0992899a4a958a9a6b91919ad8ffff17e8031faae9031faaea031faaeb031faa6b2800a9692001a9621000f9c0035fd6"),
+    "x86_64": ("TSC", "554157415641554154534c894424f84989ca4989d10f01f948c1e2204189c34909d34d85c90f84c70000004531ff4531c04531e44531f631db4c89d8eb1b66904889c14829e94c39e14c0f47e148ffc34c39cb0f84ac0000004d85d274144889c14c29d94c39d17609e99a0000006690f390b8010000004887074885c075f1488b6f080f01f948c1e22089c04809d0488b4f10488947084889771048c70700000000bae8030000660f1f8400000000004c8b6f104939f57507f39048ffca75f04839f10f95c24885c90f95c184ca0f8479ffffff49ffc64889e94829c10f865dffffff49ffc04c39f94c0f47f9e95bffffff31db4c89d84531f64531e44531c04531ffeb034c89cb488b4c24f84c89394c8941084c8961104c897118488959204c895928488941305b415c415d415e415f5dc3"),
+    "aarch64": ("CNTVCT_EL0", "df3f03d548e03bd5c20600b4ed031faaec031faaea031faae9031faaeb031faa2f008052ee0308aa040000146b0500917f0102eb40060054830000b4d00108cb1f0203ebe80500540efc5fc80f7c10c8d0ffff35ce0000b43f2003d50efc5fc80f7c10c8d0ffff358effffb5100440f9df3f03d54ee03bd5127d8052110840f90e0400f9010800f91ffc9fc8050840f9bf0001eb81000054520600f13f2003d561ffff543f0201eb20fcff5411fcffb4d10110cb12020ecb290500913f020aeb31828a9a5f020deb52828d9a1f020eeb2a928a9a8c958c9aad91929ad4ffff17eb031faae9031faaea031faaec031faaed031faaee0308aa02000014eb0302aa8d3000a98a2401a98b2002a98e1800f9c0035fd6"),
 }
 U64 = ctypes.c_uint64
+# The run's time bound, in seconds (the header says why 2).
+BOUND_S = 2.0
 
 
 def stop(code, line):
@@ -117,9 +139,22 @@ def main(argv):
     if libc.mprotect(addr, mmap.PAGESIZE, mmap.PROT_READ | mmap.PROT_EXEC) != 0:
         stop(2, f"FAIL: the code cannot be made executable, errno {ctypes.get_errno()} (no measurement)")
     # CFUNCTYPE: the call lets go of Python's lock, so both run at once.
-    loop = ctypes.CFUNCTYPE(None, ctypes.c_void_p, U64, U64, ctypes.c_void_p)(addr)
+    loop = ctypes.CFUNCTYPE(None, ctypes.c_void_p, U64, U64, U64, ctypes.c_void_p)(addr)
     shared = (U64 * 8)()
-    outs = {c: (U64 * 5)() for c in cpus}
+
+    def read_counter():
+        out = (U64 * 7)()
+        loop(ctypes.addressof(shared), 0, 0, 0, ctypes.addressof(out))
+        return out[5], time.monotonic()
+
+    # The counter's rate against CLOCK_MONOTONIC, for the time bound.
+    c0, t0 = read_counter()
+    time.sleep(0.05)
+    c1, t1 = read_counter()
+    if c1 <= c0 or t1 <= t0:
+        stop(2, f"FAIL: {counter} did not move over {t1 - t0:.3f} s (no measurement)")
+    ticks = int((c1 - c0) / (t1 - t0) * BOUND_S)
+    outs = {c: (U64 * 7)() for c in cpus}
     errors = []
     ready = threading.Barrier(2)
 
@@ -134,13 +169,16 @@ def main(argv):
             ready.wait()
         except threading.BrokenBarrierError:
             return
-        loop(ctypes.addressof(shared), cpu + 1, n, ctypes.addressof(outs[cpu]))
+        loop(ctypes.addressof(shared), cpu + 1, n, ticks, ctypes.addressof(outs[cpu]))
 
     threads = [threading.Thread(target=run, args=(c,)) for c in cpus]
+    began = time.monotonic()
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    took = time.monotonic() - began
+    turns = min(outs[c][4] for c in cpus)
     if errors:
         stop(2, "FAIL: " + "; ".join(errors) + " (no measurement)")
     handovers = sum(outs[c][3] for c in cpus)
@@ -148,11 +186,11 @@ def main(argv):
     if warps:
         behind = max(cpus, key=lambda c: outs[c][0])
         ahead = cpus[1] if behind == cpus[0] else cpus[0]
-        stop(1, f"FAIL: {counter} went back {outs[behind][0]} ticks from CPU {ahead} to CPU {behind} ({warps} warps in {handovers} hand-overs, {n} iterations each)")
+        stop(1, f"FAIL: {counter} went back {outs[behind][0]} ticks from CPU {ahead} to CPU {behind} ({warps} warps in {handovers} hand-overs, {turns} iterations each, in {took:.2f} s)")
     if handovers < 1000:
-        stop(2, f"FAIL: CPUs {cpus[0]} and {cpus[1]} handed over {handovers} times in {n} iterations each (no measurement)")
+        stop(2, f"FAIL: CPUs {cpus[0]} and {cpus[1]} handed over {handovers} times in {turns} iterations each, in {took:.2f} s (no measurement)")
     gap = max(outs[c][2] for c in cpus)
-    stop(0, f"pass: {counter} CPUs {cpus[0]} and {cpus[1]}, {n} iterations each, {handovers} hand-overs, largest forward step at a hand-over {gap} ticks")
+    stop(0, f"pass: {counter} CPUs {cpus[0]} and {cpus[1]}, {turns} iterations each, {handovers} hand-overs, largest forward step at a hand-over {gap} ticks, in {took:.2f} s")
 
 
 if __name__ == "__main__":
