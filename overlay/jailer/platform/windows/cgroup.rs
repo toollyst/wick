@@ -16,7 +16,7 @@
 //! | `cpuset.cpus` | `cpuset.cpus` | the job's processor affinity ([`cpu_groups`]) |
 //! | `cpuset.mems` | `cpuset.mems` | every memory node of the host: nothing to bind ([`check_mems`]) |
 //! | `hugetlb.2MB.max` | `hugetlb.2MB.limit_in_bytes` | the large-page sections the jailer gives Firecracker, in all (`platform::large_pages`) |
-//! | `pids.max`, `hugetlb.<size>.max`, `hugetlb.<size>.rsvd.max`, `memory.high`, `memory.swap.max`, `memory.swap.high`, `memory.zswap.max` = `max` | `pids.max` = `max`; `hugetlb.<size>.limit_in_bytes`, `hugetlb.<size>.rsvd.limit_in_bytes`, `memory.memsw.limit_in_bytes`, `memory.soft_limit_in_bytes` = `-1` | no limit, as on Linux ([`no_limit`]); `<size>` is one an x86_64 Linux has files for ([`linux_hugetlb_size`]) |
+//! | `pids.max`, `hugetlb.<size>.max`, `hugetlb.<size>.rsvd.max`, `memory.high`, `memory.swap.max`, `memory.swap.high`, `memory.zswap.max` = `max` | `pids.max` = `max`; `hugetlb.<size>.limit_in_bytes`, `hugetlb.<size>.rsvd.limit_in_bytes`, `memory.memsw.limit_in_bytes`, `memory.soft_limit_in_bytes`, `memory.kmem.tcp.limit_in_bytes` = `-1` | no limit, as on Linux ([`no_limit`]); `<size>` is one an x86_64 Linux has files for ([`linux_hugetlb_size`]) |
 //!
 //! The CPU rate cap holds from Firecracker's start, as a cgroup's limit
 //! holds from the exec. Windows enforces the rate over its own scheduling
@@ -317,13 +317,20 @@ fn strstrip(value: &str) -> &str {
 ///   `memory.swap.high` (`swap_high_write`), `memory.zswap.max`
 ///   (`zswap_max_write`);
 /// - v1, `-1`: `hugetlb.<size>.limit_in_bytes` and `.rsvd.limit_in_bytes`
-///   (`hugetlb_cgroup_write_legacy`), `memory.memsw.limit_in_bytes` and
-///   `memory.soft_limit_in_bytes` (mm/memcontrol.c `mem_cgroup_write`).
+///   (`hugetlb_cgroup_write_legacy`), `memory.memsw.limit_in_bytes`,
+///   `memory.soft_limit_in_bytes` and `memory.kmem.tcp.limit_in_bytes`
+///   (mm/memcontrol.c `mem_cgroup_write`; the last also switches the
+///   cgroup's TCP memory accounting on, `memcg_update_tcp_max`, which has
+///   no counterpart here and limits nothing).
 ///
 /// `memory.max` and `memory.limit_in_bytes`, and `hugetlb.2MB`'s own limit,
 /// are limits Windows has, with arms of their own. A hugetlb file of a page
 /// size Linux does not have is refused before this is asked
-/// ([`linux_hugetlb_size`]). Not here: `memory.min`
+/// ([`linux_hugetlb_size`]). The same files, words and sizes rule as the
+/// macOS backend's `no_limit` (its sizes are aarch64's). Not here:
+/// `memory.kmem.limit_in_bytes`, whose write fails in v6.1
+/// (`mem_cgroup_write`, `_KMEM`: `-EOPNOTSUPP`); a number, also one the
+/// kernel would clamp to no limit; and `memory.min`
 /// and `memory.low`, whose default is 0; their `max` protects all of a
 /// cgroup's memory, which is no absence of a limit.
 fn no_limit(version: u8, file: &str, value: &str) -> bool {
@@ -345,7 +352,10 @@ fn no_limit(version: u8, file: &str, value: &str) -> bool {
         1 => {
             (file == "pids.max" && value == "max")
                 || (value == "-1"
-                    && (matches!(file, "memory.memsw.limit_in_bytes" | "memory.soft_limit_in_bytes")
+                    && (matches!(
+                        file,
+                        "memory.memsw.limit_in_bytes" | "memory.soft_limit_in_bytes" | "memory.kmem.tcp.limit_in_bytes"
+                    )
                         || hugetlb(".limit_in_bytes")
                         || hugetlb(".rsvd.limit_in_bytes")))
         }
@@ -358,6 +368,13 @@ fn no_limit(version: u8, file: &str, value: &str) -> bool {
 fn impossible(version: u8, file: &str) -> Option<&'static str> {
     let controller = file.split('.').next().unwrap_or("");
     Some(match (version, controller) {
+        (_, "memory") => {
+            "a Job Object's memory limit is a hard limit only (memory.max, v1: memory.limit_in_bytes): \
+             Windows has no reclaim threshold, protection or swap limit for a job, so of the other \
+             memory limits only \"no limit\" is accepted (memory.high, memory.swap.max, memory.swap.high, \
+             memory.zswap.max = max; v1: memory.memsw.limit_in_bytes, memory.soft_limit_in_bytes, \
+             memory.kmem.tcp.limit_in_bytes = -1)"
+        }
         (_, "pids") => {
             "a cgroup's pids.max counts threads as well as processes, and Windows cannot limit a \
              process's threads (the system starts thread-pool threads in every process); only \
@@ -702,6 +719,7 @@ mod tests {
             "hugetlb.2MB.rsvd.limit_in_bytes",
             "memory.memsw.limit_in_bytes",
             "memory.soft_limit_in_bytes",
+            "memory.kmem.tcp.limit_in_bytes",
             "memory.limit_in_bytes",
         ];
         for f in v1 {
@@ -887,13 +905,63 @@ mod tests {
         }
     }
 
+    // Of a limit Windows lacks only "no limit" is accepted: the same files
+    // with anything that would restrict, the other cgroup version's word or
+    // file name, a protection, a file the kernel refuses to write, each
+    // with the reason, which says so. The cases of the macOS backend's
+    // `test_only_no_limit_is_accepted_of_a_limit_macos_lacks`, but for
+    // hugetlb (`test_hugetlb_page_sizes_are_linuxs`,
+    // `test_hugetlb_2mb_limits_the_large_page_broker`: Windows has a limit
+    // for 2 MiB pages).
+    #[test]
+    fn test_only_no_limit_is_accepted_of_a_limit_windows_lacks() {
+        for (v, p, why) in [
+            (2, "pids.max=10", "only pids.max=max"),
+            (1, "pids.max=0", "only pids.max=max"),
+            (2, "pids.max=-1", "only pids.max=max"),
+            (2, "pids.max=", "only pids.max=max"),
+            (2, "pids.max=MAX", "only pids.max=max"),
+            (2, "pids.max=4194304", "only pids.max=max"),
+            (2, "pids.current=max", "only pids.max=max"),
+            (2, "memory.high=1048576", "hard limit only"),
+            (2, "memory.high=-1", "hard limit only"),
+            (2, "memory.high=9223372036854775807", "hard limit only"),
+            (1, "memory.high=max", "hard limit only"),
+            (2, "memory.swap.max=0", "hard limit only"),
+            (2, "memory.swap.high=1048576", "hard limit only"),
+            (2, "memory.zswap.max=0", "hard limit only"),
+            (1, "memory.swap.max=max", "hard limit only"),
+            (1, "memory.memsw.limit_in_bytes=1048576", "hard limit only"),
+            (1, "memory.memsw.limit_in_bytes=max", "hard limit only"),
+            (2, "memory.memsw.limit_in_bytes=-1", "hard limit only"),
+            (1, "memory.soft_limit_in_bytes=1048576", "hard limit only"),
+            (1, "memory.kmem.tcp.limit_in_bytes=1048576", "hard limit only"),
+            (2, "memory.kmem.tcp.limit_in_bytes=-1", "hard limit only"),
+            // Its write fails on Linux v6.1 (-EOPNOTSUPP).
+            (1, "memory.kmem.limit_in_bytes=-1", "hard limit only"),
+            // Protections, not limits: 0 is their default, max the largest.
+            (2, "memory.min=0", "hard limit only"),
+            (2, "memory.low=0", "hard limit only"),
+            (2, "memory.min=max", "hard limit only"),
+            (2, "memory.low=max", "hard limit only"),
+            // The other version's name of the limit Windows has.
+            (2, "memory.limit_in_bytes=1048576", "hard limit only"),
+            (1, "memory.max=1048576", "hard limit only"),
+            (2, "hugetlb.2MB.rsvd.max=2097152", "only max, -1"),
+            (2, "hugetlb.2MB.current=max", "only max, -1"),
+            (2, "hugetlb.max=max", "only max, -1"),
+        ] {
+            let reason = reason(v, p);
+            assert!(reason.contains(why), "v{v} {p}: {reason}");
+            assert!(reason.contains("only"), "v{v} {p}: {reason}");
+        }
+        assert!(reason(2, "memory.high=1048576").contains("only \"no limit\" is accepted"));
+    }
+
     #[test]
     fn test_other_files_are_unsupported() {
         for (v, p) in [
             (2, "cpu.max.burst=1000"),
-            (2, "memory.high=1048576"),
-            (2, "memory.limit_in_bytes=1048576"),
-            (1, "memory.max=1048576"),
             (1, "cpu.weight=100"),
             (2, "cpu.shares=1024"),
             (2, "blkio.weight=100"),
