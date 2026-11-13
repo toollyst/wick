@@ -343,18 +343,23 @@ namespace Wick {
 
         public string Sh(string cmd) { return Sh(cmd, 60000, true); }
 
-        // Fails if the guest kernel logged a stall, a BUG, an oops or a
-        // warning: a WARN()'s report, "WARNING: CPU: <n> PID: <pid> at ..."
-        // (Linux v6.1 kernel/panic.c, __warn), and a stack dump's "Call
-        // Trace:" (arch/x86/kernel/dumpstack.c; arm64's is "Call trace:").
-        // Not any line with "WARNING:" in it: the kernel's own notices use
-        // the word, such as the SRSO one a guest prints on an AMD Zen 3 host
-        // whose IBPB it cannot tell flushes branch types
-        // (arch/x86/kernel/cpu/bugs.c, srso_select_mitigation; the same
-        // under KVM before Linux 6.7, upstream's test_vulnerabilities.py),
-        // which failed 16 stages on CI's EPYC 7763 runner, run 43428124115.
+        // The guest's health patterns (tools/guest-health.txt, the x86_64
+        // guest's and `all`), as grep's -e arguments; set by the script
+        // before any stage (Read-GuestHealth).
+        public static string HealthGrep;
+
+        // Fails if the guest kernel's log has a line with any pattern of
+        // tools/guest-health.txt, the file the Linux and macOS boot tests
+        // read too, which names for each the source that prints it: a
+        // stall, a BUG, an oops, a WARN()'s report ("WARNING: CPU: ...",
+        // not any line with "WARNING:" in it, as the SRSO notice a guest
+        // prints on an AMD Zen 3 host, which failed 16 stages on CI's EPYC
+        // 7763 runner, run 43428124115), a stack dump, and the x86 reports
+        // only a VMM's fault makes (an MSR refused, an unknown NMI, TSCs
+        // apart, an interrupt nothing asked for, an AP not started).
         public void Healthy() {
-            string out1 = Sh("dmesg | grep -E 'rcu: INFO|self-detected stall|soft lockup|hung_task|BUG:|Oops|WARNING: CPU:|Call Trace:' | head -5; true");
+            if (string.IsNullOrEmpty(HealthGrep)) throw new Failure("no guest health patterns read (tools/guest-health.txt)");
+            string out1 = Sh("dmesg | grep -F " + HealthGrep + " | head -5; true");
             if (out1.Length > 0) throw new Failure("guest kernel reports:\n    " + out1);
         }
 
@@ -1592,6 +1597,37 @@ function Base-Config([int]$vcpus, [int]$mem = 256, [string]$bootArgs = $BootArgs
 # an API socket, returned as the `ApiSock` note property and waited for.
 # -LogPath gives Firecracker another --log-path (a named pipe) than the
 # stage's file.
+# The patterns of tools/guest-health.txt for the guest `$arch`, read as the
+# file's header says, by the rules tools/linux/boot-test.sh's guest_health
+# and tools/macos/boot-test.py's read it with: a line that is empty or
+# starts with '#' is a comment; any other is "<arch> <pattern>", <arch> one
+# of all, x86_64, aarch64 (case counts), <pattern> the rest, not empty, no
+# space at either end, and no tab, CR or single quote in the line. Any
+# other line stops the run, naming it; so does a file with no pattern for
+# `$arch`. The lines are split at LF alone, as the others split them (the
+# repository keeps the file LF: .gitattributes).
+function Read-GuestHealth([string]$path, [string]$arch) {
+    Check (Test-Path -LiteralPath $path) "no $path, the guest's health patterns (the kit has it as tools\guest-health.txt)"
+    $text = [IO.File]::ReadAllText($path, (New-Object Text.UTF8Encoding($false)))
+    $patterns = @()
+    $n = 0
+    foreach ($line in $text.Split([char]10)) {
+        $n++
+        if ($line.Length -eq 0 -or $line[0] -ceq '#') { continue }
+        $sp = $line.IndexOf(' ')
+        $name = if ($sp -ge 0) { $line.Substring(0, $sp) } else { $line }
+        $pattern = if ($sp -ge 0) { $line.Substring($sp + 1) } else { '' }
+        if ($sp -lt 0 -or $pattern.Length -eq 0 -or $pattern -cne $pattern.Trim(' ') -or
+            $line.IndexOfAny([char[]]@([char]9, [char]13, [char]39)) -ge 0 -or
+            @('all', 'x86_64', 'aarch64') -cnotcontains $name) {
+            Fail "${path}:${n}: not a comment or <arch> <pattern>: $($line -replace "`r", '\r' -replace "`t", '\t')"
+        }
+        if ($name -ceq 'all' -or $name -ceq $arch) { $patterns += $pattern }
+    }
+    Check ($patterns.Count -gt 0) "$path has no pattern for $arch"
+    return ,$patterns
+}
+
 # A socket's path in $SockDir, for a name within the bound the start
 # checked the directory against ($SockName bytes). Every caller passes a
 # string constant, so the bound is the longest of them, read from this
@@ -3755,6 +3791,27 @@ if ($SelfTest) {
             Check ($none.Contains('not in the print')) "a print without the fields: $none"
             return 'Stuck guest: a vCPU''s RIP, IF, mp_state, LAPIC timer, IRR and ISR and the VM clock read from snapshot-editor''s print'
         }
+        health = {
+            # tools/guest-health.txt read as the Linux and macOS boot tests
+            # read it, and each kind of line they refuse refused here too,
+            # naming its line.
+            $real = Read-GuestHealth (Join-Path (Split-Path -Parent $PSScriptRoot) 'guest-health.txt') 'x86_64'
+            Check ($real -ccontains 'WARNING: CPU:' -and $real -ccontains 'Call Trace:' -and $real -cnotcontains 'Call trace:') "the x86_64 patterns of tools/guest-health.txt: $($real -join ' | ')"
+            $f = Join-Path $dir 'health.txt'
+            $write = { param($t) [IO.File]::WriteAllText($f, $t, (New-Object Text.UTF8Encoding($false))) }
+            & $write "# a comment`n`nall one`nx86_64 two words`naarch64 three`n"
+            $got = Read-GuestHealth $f 'x86_64'
+            Check (($got -join '|') -ceq 'one|two words') "a good file read as: $($got -join '|')"
+            foreach ($bad in @(@("all one`r`nall two`r`n", 1), @("all one`nall`ttab`n", 2), @("all one`nall it's`n", 2), @("all one`nALL two`n", 2),
+                    @("all one`nall`n", 2), @("all one`nall  two`n", 2), @("all one`nall two `n", 2), @("all one`nriscv two`n", 2), @("aarch64 one`n", 0))) {
+                & $write $bad[0]
+                $why = 'read'
+                try { Read-GuestHealth $f 'x86_64' | Out-Null } catch { $why = $_.Exception.Message }
+                $want = if ($bad[1] -gt 0) { "${f}:$($bad[1]): not a comment" } else { 'has no pattern for x86_64' }
+                Check ($why.Contains($want)) "$(($bad[0]) -replace "`r", '\r' -replace "`t", '\t' -replace "`n", '\n'): $why"
+            }
+            return "Guest health: tools/guest-health.txt read ($($real.Count) x86_64 patterns), and 9 malformed files refused, each naming its line"
+        }
         socknames = {
             # Every socket name of the stages within the bound the start
             # takes (a name over it once failed the cli stage on the PC),
@@ -3865,6 +3922,11 @@ foreach ($s in $selected + $left) {
     if (-not $Stages.Contains($s)) { throw "unknown stage '$s'; stages: all, $(@($Stages.Keys) -join ', ')" }
 }
 $selected = @($selected | Where-Object { $left -notcontains $_ })
+
+# The guest's health, which every stage checks before a reset
+# (Wick.Vm.Healthy): tools/guest-health.txt's x86_64 and `all` patterns.
+$healthPatterns = Read-GuestHealth (Join-Path (Split-Path -Parent $PSScriptRoot) 'guest-health.txt') 'x86_64'
+[Wick.Vm]::HealthGrep = ($healthPatterns | ForEach-Object { "-e '$_'" }) -join ' '
 
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $WorkDir = (Resolve-Path $WorkDir).Path

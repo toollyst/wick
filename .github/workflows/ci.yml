@@ -791,6 +791,7 @@ jobs:
             lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe
             winprobe.exe
             tools/windows/boot-test.ps1
+            tools/guest-health.txt
             tools/windows/jailer-test.ps1
             tools/windows/jail-probe.exe
             tools/windows/jail-parent.exe

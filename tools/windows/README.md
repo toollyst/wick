@@ -158,7 +158,8 @@ the target directory absolute: a relative one stays in every path cargo
 gives the linker as `..\..`, which took link.exe past 260 characters on a
 PC, LNK1104), `winprobe.exe`, and in `tools/windows/`
 `boot-test.ps1`, `jailer-test.ps1` with `jail-probe.exe` and `jail-parent.exe` built,
-`job-freeze-probe.ps1`, `memory-partition-probe.exe`, `vmm-memory-record.py` and this file, at those
+`job-freeze-probe.ps1`, `memory-partition-probe.exe`, `vmm-memory-record.py` and this file, with
+`tools/guest-health.txt` (the guest's health patterns `boot-test.ps1` reads), at those
 paths. The kit needs no Rust.
 
 ## Checking the scripts before Windows
@@ -277,9 +278,12 @@ the firmware, and nothing else installed: the script is Windows PowerShell 5.1.
 ## What the boot test checks
 
 Every stage that needs a guest boots its own VM; before each guest reset the guest kernel log
-must be free of RCU stalls, soft lockups, hung tasks, BUGs, oopses,
-`WARN()` reports (`WARNING: CPU:`) and stack dumps (`Call Trace:`), and the reset must end Firecracker
-with exit status 0. A kernel notice that only uses the word (`WARNING: See ...` of SRSO on an
+must have no line with a pattern of `tools/guest-health.txt` (its `all` and `x86_64` lines, read by
+the rules the Linux and macOS boot tests read it with; a malformed line stops the run, naming
+it): RCU stalls, soft lockups, hung tasks, BUGs, oopses, `WARN()` reports (`WARNING: CPU:`),
+stack dumps (`Call Trace:`), and the x86 reports only a VMM's fault makes (an MSR access refused,
+an NMI of no source, TSCs apart, an interrupt nothing asked for, an AP that did not start), and
+the reset must end Firecracker with exit status 0. A kernel notice that only uses the word (`WARNING: See ...` of SRSO on an
 AMD host) is not a warning of the guest's health. A stage's PASS line is the one summary it
 returns; a stage that leaves any other value unread fails as a script error naming it
 (`-SelfTest`'s `summary` case).

@@ -3,8 +3,8 @@
 #
 # What a guest kernel prints when its health fails: the boot tests fail a
 # guest whose dmesg has a line with any of these before each reset
-# (tools/linux/boot-test.sh, tools/macos/boot-test.py; tools/windows/
-# boot-test.ps1 has the x86_64 rule of its own until it reads this file). The guest kernel is upstream's CI kernel, Linux v6.1 (6.1.188);
+# (tools/linux/boot-test.sh, tools/macos/boot-test.py,
+# tools/windows/boot-test.ps1). The guest kernel is upstream's CI kernel, Linux v6.1 (6.1.188);
 # each pattern names the source that prints it. Every string either guest
 # kernel has (strings of vmlinux-6.1.188, x86_64 and aarch64) that contains
 # one of these is such a report, so a healthy guest prints none of them.
@@ -52,6 +52,55 @@ all WARNING: workqueue cpumask
 # dump_backtrace ("Call trace:").
 x86_64 Call Trace:
 aarch64 Call trace:
+# x86 reports of what only a VMM's fault makes a guest print: each is in
+# the x86_64 guest's strings, and in Linux v6.1.188 at the place named; on
+# KVM, with the CPUID, MSRs, interrupts and clocks KVM gives, a healthy
+# guest never prints one.
+# A non-_safe RDMSR or WRMSR that took #GP: arch/x86/mm/extable.c
+# ex_handler_msr (150, 157). The kernel reads only MSRs its CPUID or the
+# architecture says are there, so a #GP is the VMM refusing one it gave.
+x86_64 unchecked MSR access error
+# An NMI no handler claims: arch/x86/kernel/nmi.c unknown_nmi_error (338).
+# A VMM's guest gets NMIs only from its VMM, which sends none unasked.
+x86_64 Uhhuh. NMI received for unknown reason
+# The hard-lockup detector: kernel/watchdog_hld.c watchdog_overflow_callback
+# (142): a CPU took no timer interrupt for the watchdog's period.
+x86_64 Watchdog detected hard LOCKUP
+# vCPUs whose TSCs disagree: arch/x86/kernel/tsc_sync.c
+# check_tsc_sync_source (407, 410; its "passed" line is pr_debug), and an
+# IA32_TSC_ADJUST that changed behind the kernel or differs between CPUs
+# (tsc_verify_tsc_adjust 75, tsc_store_and_check_tsc_adjust 221). KVM
+# keeps a VM's TSCs in step (kvm_synchronize_tsc) and each vCPU's
+# TSC_ADJUST as written.
+x86_64 TSC warp between CPUs
+x86_64 TSC warped randomly between CPUs
+x86_64 TSC ADJUST differs
+# The local APIC timer's calibration against the clock failed:
+# arch/x86/kernel/apic/apic.c calibrate_APIC_clock (1021).
+x86_64 APIC timer disabled due to verification failure
+# The spurious vector delivered: apic.c handle_spurious_interrupt (2209,
+# "should never happen"); an interrupt of a vector nothing was given:
+# arch/x86/kernel/irq.c common_interrupt (257); an interrupt line
+# that fires and no handler takes, disabled after 100000 (kernel/irq/
+# spurious.c __report_bad_irq, 202); an interrupt left pending in IRR at
+# the APIC's set-up (apic.c apic_pending_intr_clear, 1565). Each is an
+# interrupt the VMM raised that no device of the guest asked for.
+x86_64 Spurious APIC interrupt (vector 0xFF)
+x86_64 No irq handler for vector
+x86_64 nobody cared
+x86_64 APIC: Stale IRR
+# An application processor that INIT and SIPI did not start:
+# arch/x86/kernel/smpboot.c native_cpu_up (1249), and the IPI's delivery
+# status (wakeup_secondary_cpu_via_nmi 842, 844; _via_init 956, 958). (smpboot.c's "CPU %u didn't
+# die..." of a CPU taken offline has a quote, which a pattern cannot.)
+x86_64 do_boot_cpu failed
+x86_64 APIC delivery error
+x86_64 APIC never delivered
+# Local APICs of two versions: apic.c generic_processor_info (2540); and
+# PMU MSRs that do not read back as written: arch/x86/events/core.c
+# check_hw_exists (324). Both are the VMM's answers.
+x86_64 BIOS bug: APIC version mismatch
+x86_64 the BIOS has corrupted hw-PMU resources
 # arm64 notices a VMM's fault prints: boot registers x1-x3 not zero
 # (arch/arm64/kernel/setup.c setup_arch), and a timer interrupt whose
 # trigger the device tree gives wrong (drivers/clocksource/arm_arch_timer.c
