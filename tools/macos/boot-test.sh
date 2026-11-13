@@ -18,8 +18,8 @@
 #
 # Stages (default: all, in this order): boot smp block vsock net vmnet
 # snapshot snapshot-permissions diff uffd hugepages pci vhost-user
-# vhost-user-hotplug devices balloon restores api-process cli tools no-seccomp
-# memory-hotplug cpu-templates pvtime (PV steal time: on macOS 27 its figures,
+# vhost-user-hotplug devices balloon restores api-process cli machine-config tools
+# no-seccomp memory-hotplug cpu-templates pvtime (PV steal time: on macOS 27 its figures,
 # elsewhere that it is not offered). vmnet uses vmnet-shared (NAT); older macOS
 # releases need root for vmnet.framework.
 # The guest images are cached in ~/Library/Caches/wick/boot-test; results and

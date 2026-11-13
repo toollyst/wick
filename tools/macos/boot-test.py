@@ -1801,6 +1801,75 @@ class FifoReader:
         self.thread.join(5)
 
 
+def stage_machine_config(ctx):
+    """Out of memory at InstanceStart under an address-space limit, as
+    upstream's test_api_machine_config checks it (the limit set from outside
+    with prlimit there, which macOS has no form of: a process sets only its
+    own limits; the test stays [impossible]): Firecracker started with
+    RLIMIT_AS set before its exec, which XNU applies to the new image's map
+    (bsd/kern/kern_exec.c `vm_map_set_size_limit`) and enforces on every
+    mapping (osfmk/vm/vm_map.c `vm_map_enter`: KERN_NO_SPACE, ENOMEM). Every
+    macOS process starts with about 466 GiB of address space (the shared
+    cache's reservation, against a few MiB on Linux), and XNU refuses a limit
+    below a map's size (kern_resource.c `dosetrlimit`: EINVAL) and at exec
+    keeps no limit at all if the new map is larger, so the limit is this
+    process's size plus 1 GiB (upstream's: 1e9 bytes), and the run proves
+    it holds: a 256 MiB guest boots under it, a 2048 MiB one does not, and
+    the same 2048 MiB guest boots without it."""
+    import errno
+    import resource
+    # Upstream's text with the host libc's for ENOMEM: musl's (upstream's
+    # build on Linux) is "Out of memory", macOS's "Cannot allocate memory".
+    line = f"Invalid Memory Configuration: Cannot create mmap region: {os.strerror(errno.ENOMEM)} (os error 12)"
+    vsz = int(subprocess.run(["ps", "-o", "vsz=", "-p", str(os.getpid())], capture_output=True,
+                             text=True, check=True).stdout) * 1024
+    # The fork's map is this process's, so the limit is above it at the exec.
+    limit = vsz + (1 << 30)
+
+    def capped():
+        resource.setrlimit(resource.RLIMIT_AS, (limit, resource.RLIM_INFINITY))
+
+    def start(name, mem, preexec, patch=None):
+        vm = ctx.vm(name, [], preexec=preexec)
+        cfg = config(ctx, mem=mem)
+        vm.api("PUT", "/boot-source", cfg["boot-source"])
+        vm.api("PUT", "/drives/rootfs", cfg["drives"][0])
+        vm.api("PUT", "/machine-config", cfg["machine-config"])
+        if patch is not None:
+            vm.api("PATCH", "/machine-config", {"mem_size_mib": patch})
+        return vm
+
+    def refused(vm, what):
+        r = vm.api("PUT", "/actions", {"action_type": "InstanceStart"}, expect=(400,))
+        # Upstream's test matches the text anywhere in the error (re.search).
+        check(line in (r or {}).get("fault_message", ""), f"{what}: InstanceStart answered {r}, not {line!r}")
+        vm.kill()
+
+    done = []
+    vm = start("mc-limit-256", 256, capped)
+    vm.api("PUT", "/actions", {"action_type": "InstanceStart"})
+    vm.shell()
+    vm.kill()
+    done.append("256 MiB boots under the limit")
+    # Upstream's case: a size no address space holds, PATCHed in.
+    refused(start("mc-limit-huge", 256, capped, patch=(1 << 64) - 1), "mem_size_mib 2^64-1 under the limit")
+    done.append("2^64-1 MiB refused with upstream's message (macOS's text for ENOMEM)")
+    # Not asserted, said: the same size with no limit (no address space
+    # holds 2^64-1 MiB, limited or not).
+    vm = start("mc-nolimit-huge", 256, None, patch=(1 << 64) - 1)
+    r = vm.api("PUT", "/actions", {"action_type": "InstanceStart"}, expect=(204, 400))
+    vm.kill()
+    done.append(f"(without the limit 2^64-1 MiB: {r.get('fault_message') if r else 'started'})")
+    refused(start("mc-limit-2048", 2048, capped), "2048 MiB under the limit")
+    vm = start("mc-nolimit-2048", 2048, None)
+    vm.api("PUT", "/actions", {"action_type": "InstanceStart"})
+    vm.shell()
+    vm.kill()
+    done.append("2048 MiB refused with it and boots without it")
+    return f"RLIMIT_AS {limit >> 20} MiB (this process's {vsz >> 20} MiB + 1 GiB) set before the exec: " + \
+        ", ".join(done)
+
+
 def stage_cli(ctx):
     """Firecracker's own command line: exit codes, --module, the start time
     flags, the logger and metrics on FIFOs, --boot-timer."""
@@ -2512,6 +2581,7 @@ STAGES = {
     "restores": stage_restores,
     "api-process": stage_api_process,
     "cli": stage_cli,
+    "machine-config": stage_machine_config,
     "tools": stage_tools,
     "no-seccomp": stage_no_seccomp,
     "memory-hotplug": stage_memory_hotplug,

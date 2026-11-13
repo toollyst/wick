@@ -18,10 +18,14 @@
 
 # The test caps Firecracker's address space from outside with prlimit(2)
 # (RLIMIT_AS). macOS has no prlimit: a process reads and sets only its own
-# resource limits. Nor does it take an address-space limit at all (measured
-# with setrlimit on the process itself: a 64 MiB RLIMIT_AS is refused, the
-# limit stays unlimited, and a 1 GiB mapping succeeds). wick_macos's prlimit
-# raises ENOSYS rather than pretend.
+# resource limits, and wick_macos's prlimit raises ENOSYS rather than
+# pretend. macOS does enforce RLIMIT_AS (XNU bsd/kern/kern_resource.c
+# `dosetrlimit` -> osfmk/vm/vm_map.c `vm_map_set_size_limit`; `vm_map_enter`
+# then fails a mapping past it with ENOMEM), but every process starts with
+# about 466 GiB of address space (the shared cache's reservation), and a
+# limit below a process's current size is refused (EINVAL), so the test's
+# 1e9 bytes cannot be set at all. The same out-of-memory path, under a limit
+# set before Firecracker's exec, is boot-test's `machine-config` stage.
 all impossible integration_tests/functional/test_api.py::test_api_machine_config
 
 # --parent-cgroup: on Linux a parent cgroup bounds a group of jails
