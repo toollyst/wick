@@ -1283,21 +1283,16 @@ fn msr_segment_base(index: u32) -> Option<WHV_REGISTER_NAME> {
     }
 }
 
-/// The machine-check MSRs: IA32_MCG_CAP, _STATUS and _CTL (0x179 to 0x17b)
-/// and the registers of 32 banks (0x400 to 0x47f). KVM keeps them for each
-/// vCPU (x86.c, `get_msr_mce` and `set_msr_mce`, 32 banks by default), and
-/// upstream saves 0x400 to 0x47f of every guest whose CPUID has MCE
+/// The machine-check MSRs (the P5 pair, IA32_MCG_CAP, _STATUS and _CTL, 32
+/// banks' CTL2 and four registers each), which the vCPU keeps as KVM keeps
+/// them ([`super::mce`]): `KVM_GET_MSRS` and `KVM_SET_MSRS` have them, and
+/// a write KVM refuses ends the call there (`VcpuFd::set_msrs`). Upstream
+/// saves 0x400 to 0x47f of every guest whose CPUID has MCE
 /// (cpu_config/x86_64/cpuid/common.rs, `msrs_to_save_by_cpuid`), which is
-/// every guest. No WHP register holds them, so `KVM_GET_MSRS` reads them
-/// as 0 and `KVM_SET_MSRS` drops them, as before the calls ended at an MSR
-/// kept nowhere: with these taken for such, the call ended at 0x400 and no
-/// vCPU's state could be saved (CI run 43392627996: vmm's
-/// `test_vcpu_save_state_events` got an error for the saved state, and its
-/// panic with the vCPU still running took the test process down). What a
-/// guest itself reads and writes of them is WHP's; a snapshot does not
-/// carry it.
+/// every guest: a call that ended at 0x400 failed every vCPU's save (CI run
+/// 43392627996, vmm's `test_vcpu_save_state_events`).
 fn mce_msr(index: u32) -> bool {
-    matches!(index, 0x179..=0x17b | 0x400..=0x47f)
+    super::mce::is_mce(index)
 }
 
 /// Whether `KVM_GET_MSRS` and `KVM_SET_MSRS` have `index` here: an MSR with
@@ -1305,8 +1300,8 @@ fn mce_msr(index: u32) -> bool {
 /// IA32_TSC_DEADLINE, [`KVM_SOFTWARE_MSRS`]), or one of KVM's that a
 /// partition has only on some hosts ([`LISTED_WHERE_PRESENT`], the MTRRs),
 /// which stays as it was where the partition lacks it: read as 0, a write
-/// dropped (Firecracker's boot writes IA32_MTRR_DEF_TYPE on every host),
-/// as the machine-check MSRs do on every host ([`mce_msr`]).
+/// dropped (Firecracker's boot writes IA32_MTRR_DEF_TYPE on every host);
+/// or a machine-check MSR, kept by the vCPU ([`mce_msr`]).
 ///
 /// Any other MSR is one this backend keeps nowhere, so a value written to
 /// it would reach no guest: it ends the call, as an MSR KVM does not have
@@ -1396,6 +1391,9 @@ pub(crate) fn msr_index_list() -> Result<MsrList> {
         super::pvclock::MSR_WALL_CLOCK, super::pvclock::MSR_SYSTEM_TIME,
         // IA32_TSC_DEADLINE (tscdeadline).
         super::tscdeadline::MSR_TSC_DEADLINE,
+        // IA32_MCG_STATUS and IA32_MCG_CTL, in KVM's emulated list
+        // (x86.c, `emulated_msrs_all`) and kept by the vCPU (mce).
+        super::mce::MCG_STATUS, super::mce::MCG_CTL,
     ]
     .into_iter()
     // KVM's others that this partition keeps (the MTRRs are not listed),
@@ -1470,7 +1468,8 @@ mod tests {
         }
         // KVM's other machine-check MSRs, and what is past the banks.
         assert!(has_msr(0x179) && has_msr(0x17a) && has_msr(0x17b));
-        assert!(!has_msr(0x480) && !has_msr(0x3ff));
+        assert!(has_msr(0) && has_msr(1) && has_msr(0x280) && has_msr(0x29f));
+        assert!(!has_msr(0x480) && !has_msr(0x3ff) && !has_msr(0x2a0));
     }
 
     #[test]

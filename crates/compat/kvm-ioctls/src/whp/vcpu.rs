@@ -174,6 +174,8 @@ pub(crate) struct VcpuShared {
     /// keep them ([`regs::software_msr`]), as KVM keeps them.
     tsc_adjust: AtomicU64,
     misc_enable: AtomicU64,
+    /// The machine-check MSRs, as KVM keeps them for each vCPU (`mce`).
+    mce: Mutex<super::mce::Mce>,
     /// Bumped by every write of `IA32_TSC_DEADLINE`, so that a timer armed
     /// by an earlier write cannot fire for a later one.
     deadline_gen: AtomicU64,
@@ -319,6 +321,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         tsc_deadline: AtomicU64::new(0),
         tsc_adjust: AtomicU64::new(0),
         misc_enable: AtomicU64::new(0),
+        mce: Mutex::new(super::mce::Mce::default()),
         deadline_gen: AtomicU64::new(0),
         deadline_fired: AtomicU64::new(0),
         debug: Mutex::new(super::debug::State::default()),
@@ -789,9 +792,18 @@ impl VcpuFd {
 
     pub fn get_msrs(&self, msrs: &mut Msrs) -> Result<usize> {
         let n = regs::get_msrs(self.part(), self.vp(), msrs)?;
-        // The kvm-clock MSRs and IA32_TSC_DEADLINE are this backend's (see
-        // `pvclock`, `tscdeadline`).
-        for e in msrs.as_mut_slice().iter_mut().take(n) {
+        let mce = self.shared.mce.lock().unwrap();
+        // The kvm-clock MSRs, IA32_TSC_DEADLINE and the machine-check MSRs
+        // are this backend's (see `pvclock`, `tscdeadline`, `mce`); a read
+        // KVM refuses ends the call there, as in `__msr_io`.
+        for (i, e) in msrs.as_mut_slice().iter_mut().take(n).enumerate() {
+            if super::mce::is_mce(e.index) {
+                match mce.get(e.index, true) {
+                    Some(v) => e.data = v,
+                    None => return Ok(i),
+                }
+                continue;
+            }
             match e.index {
                 pvclock::MSR_SYSTEM_TIME => e.data = self.shared.system_time_msr.load(Ordering::Acquire),
                 pvclock::MSR_WALL_CLOCK => e.data = self.shared.inner.pvclock.lock().unwrap().wall_msr,
@@ -803,7 +815,27 @@ impl VcpuFd {
         Ok(n)
     }
     pub fn set_msrs(&self, msrs: &Msrs) -> Result<usize> {
-        let n = regs::set_msrs(self.part(), self.vp(), msrs)?;
+        // As KVM's `__msr_io`: the entries up to the first one refused are
+        // written, a machine-check MSR's write refused as `set_msr_mce`
+        // refuses it (`mce`), and nothing after it.
+        // The machine-check ones are kept only for the entries the call
+        // wrote (`n`), so that a call WHP ends earlier keeps none after it.
+        let entries = msrs.as_slice();
+        let mut mce = self.shared.mce.lock().unwrap();
+        let mut trial = mce.clone();
+        let mut count = 0;
+        for e in entries {
+            if !regs::has_msr(e.index) || (super::mce::is_mce(e.index) && !trial.set(e.index, e.data, true, false)) {
+                break;
+            }
+            count += 1;
+        }
+        let head = Msrs::from_entries(&entries[..count]).map_err(|_| super::Error::new(libc::EINVAL))?;
+        let n = regs::set_msrs(self.part(), self.vp(), &head)?;
+        for e in entries.iter().take(n).filter(|e| super::mce::is_mce(e.index)) {
+            mce.set(e.index, e.data, true, false);
+        }
+        drop(mce);
         for e in msrs.as_slice().iter().take(n) {
             if e.index == MSR_TSC_DEADLINE {
                 self.write_tsc_deadline(e.data)?;
@@ -2016,6 +2048,27 @@ impl VcpuFd {
         // SAFETY: the access-info bitfield overlaps the u32.
         let (is_write, value) = super::exit::msr_access(unsafe { m.AccessInfo.AsUINT32 }, m.Rax, m.Rdx);
         let index = m.MsrNumber;
+        if super::mce::is_mce(index) {
+            // As KVM's `set_msr_mce` and `get_msr_mce` for the guest. KVM
+            // lets a guest write a bank's STATUS other than 0 only with
+            // HWCR's McStatusWrEn on an AMD guest (`can_set_mci_status`);
+            // this backend keeps no HWCR, so never: as KVM with HWCR at its
+            // reset value, 0.
+            let mut mce = self.shared.mce.lock().unwrap();
+            let answer = if is_write { mce.set(index, value, false, false).then_some(None) } else { mce.get(index, false).map(Some) };
+            drop(mce);
+            return match answer {
+                Some(None) => regs::set_rip(self.part(), self.vp(), rip_after),
+                Some(Some(v)) => regs::set_msr_result(self.part(), self.vp(), v, rip_after),
+                // #GP(0), RIP left at the instruction, as KVM's refusal.
+                None => super::ffi::set_register(
+                    self.part(),
+                    self.vp(),
+                    whv::WHvRegisterPendingInterruption,
+                    super::ffi::reg64(super::debug::pending_gp()),
+                ),
+            };
+        }
         if is_write {
             if index == MSR_TSC_DEADLINE {
                 self.write_tsc_deadline(value)?;
@@ -3961,6 +4014,53 @@ mod fpu_tests {
                 assert_eq!((got.map(|g| g.0).ok(), set.ok()), (Some(0), Some(0)), "{index:#x}: an MSR kept nowhere ends the call");
             }
         }
+
+        // The machine-check MSRs (`mce`): what a guest's RDMSR gets and
+        // its WRMSR does, whether each came to the backend, and what
+        // KVM_GET_MSRS reads after; KVM's answer in each line. On record:
+        // whether these reach the backend is WHP's.
+        for (index, write, kvm) in [
+            (0x179u32, 32u64, "rdmsr 32, wrmsr #GP"),
+            (0x17a, 0x5, "rdmsr 0, wrmsr kept: 0x5"),
+            (0x17b, 0, "rdmsr #GP, wrmsr #GP"),
+            (0x400, u64::MAX, "rdmsr 0, wrmsr kept: all ones"),
+            (0x401, 0xbe00_0000_0000_0000, "rdmsr 0, wrmsr #GP (non-zero STATUS without McStatusWrEn)"),
+            (0x402, 0x1234, "rdmsr 0, wrmsr kept: 0x1234"),
+            (0x47f, 0x7, "rdmsr 0, wrmsr kept: 0x7"),
+            (0x280, 0, "rdmsr #GP, wrmsr #GP (no CMCI)"),
+            (0x0, 0, "rdmsr 0, wrmsr #GP"),
+            (0xc001_0015, 1 << 18, "HWCR: rdmsr KVM's msr_hwcr, wrmsr of McStatusWrEn kept"),
+        ] {
+            let before = MSR_INTERCEPTS.with(std::cell::Cell::get);
+            let (read, r) = probe(&mut vcpu, RDMSR_AT, 0, u64::from(index), 0);
+            let read_came = MSR_INTERCEPTS.with(std::cell::Cell::get) - before;
+            let value = (r.rdx << 32) | (r.rax & 0xFFFF_FFFF);
+            let before = MSR_INTERCEPTS.with(std::cell::Cell::get);
+            let (wrote, _) = probe(&mut vcpu, WRMSR_AT, write & 0xFFFF_FFFF, u64::from(index), write >> 32);
+            let write_came = MSR_INTERCEPTS.with(std::cell::Cell::get) - before;
+            let mut one = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry { index, ..Default::default() }]).unwrap();
+            let after = vcpu.get_msrs(&mut one).map(|n| (n, one.as_slice()[0].data));
+            eprintln!(
+                "TMPLTEST mce msr {index:#x}: a guest's rdmsr: {read}, value {value:#x}, intercepts {read_came}; its wrmsr of \
+                 {write:#x}: {wrote}, intercepts {write_came}; KVM_GET_MSRS after {after:x?} (KVM: {kvm})"
+            );
+        }
+        // The VMM's writes and reads of them, which are the backend's own:
+        // what KVM's `set_msr_mce` keeps, a refused write ending the call.
+        let entries = [(0x17a, 0x5), (0x400, u64::MAX), (0x401, 0xbe00_0000_0000_0000), (0x402, 0x1234), (0x404, 0x99)];
+        let msrs = Msrs::from_entries(
+            &entries.map(|(index, data)| kvm_bindings::kvm_msr_entry { index, data, ..Default::default() }),
+        )
+        .unwrap();
+        assert_eq!(vcpu.set_msrs(&msrs).unwrap(), 4, "a bank's CTL other than 0 or all ones ends KVM_SET_MSRS");
+        let mut back = Msrs::from_entries(
+            &[0x179, 0x17a, 0x17b, 0x400, 0x401, 0x402, 0x404, 0x280]
+                .map(|index| kvm_bindings::kvm_msr_entry { index, ..Default::default() }),
+        )
+        .unwrap();
+        assert_eq!(vcpu.get_msrs(&mut back).unwrap(), 8);
+        let values: Vec<u64> = back.as_slice().iter().map(|e| e.data).collect();
+        assert_eq!(values, [32, 0x5, 0, u64::MAX, 0xbe00_0000_0000_0000, 0x1234, 0, 0]);
 
         drop(vcpu);
         drop(vm);

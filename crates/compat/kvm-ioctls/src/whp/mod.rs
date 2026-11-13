@@ -35,6 +35,7 @@ mod exit;
 mod ffi;
 mod guest_mem;
 mod irqchip;
+mod mce;
 mod pvclock;
 mod regs;
 mod tscdeadline;
