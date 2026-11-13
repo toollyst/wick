@@ -193,6 +193,15 @@ pub mod wick_mm {
     /// `MADV_HUGEPAGE`: a transparent huge page of x86-64 Linux.
     pub const HUGE_PAGE: usize = super::HUGE_PAGE;
 
+    /// Splits `[addr, addr + len)`, memory a host read takes, into runs that
+    /// read as zeros without being touched (lazy memory not committed) and
+    /// runs to read as they are: `f(start, len, zeros)` for each in order.
+    /// So that a read of guest RAM the guest never touched commits nothing,
+    /// as Linux maps its zero page for it.
+    pub fn zero_runs(addr: usize, len: usize, f: impl FnMut(usize, usize, bool)) {
+        super::zero_runs(addr, len, f);
+    }
+
     /// Ends the process for memory that could not be committed
     /// ([`Access::Exhausted`]), as the cgroup OOM killer ends the VMM.
     pub fn out_of_memory(addr: usize, err: u32) -> ! {
@@ -564,6 +573,7 @@ fn to_placeholder(t: &mut Table, base: usize) -> bool {
     }
     if r.lazy {
         lazy_remove(base, r.len);
+        touched_remove(base);
         r.lazy = false;
     }
     r.kind = Kind::Placeholder;
@@ -577,6 +587,7 @@ fn release(t: &mut Table, base: usize) -> bool {
     let r = t.remove(&base).unwrap();
     if r.lazy {
         lazy_remove(base, r.len);
+        touched_remove(base);
     }
     // SAFETY: frees our allocation, view or placeholder.
     let ok = unsafe {
@@ -672,6 +683,7 @@ fn split_lazy(t: &mut Table, base: usize, start: usize, end: usize, prot: PAGE_P
         r.kind = Kind::Private { file: None };
         r.lazy = true;
         lazy_add(a, b - a, prot);
+        touched_add(a, b - a);
     }
     true
 }
@@ -870,6 +882,169 @@ fn lazy_within(start: usize, len: usize) -> Vec<(usize, usize, PAGE_PROTECTION_F
             (a < b).then(|| (a, b - a, p))
         })
         .collect()
+}
+
+/// The pages of each lazy allocation that may be committed: a bit a page,
+/// set when [`commit`] commits one and cleared before one is decommitted.
+/// A hint for [`zero_runs`] only, which reads a page whose bit is set as it
+/// is (a page wrongly set is committed by the read, as it was before) and
+/// asks `VirtualQuery` and [`LAZY`] about a page whose bit is clear before it
+/// takes the page as zeros (a page wrongly clear costs a query): a wrong bit
+/// costs time, never data. Keyed by the allocation's base; `(len, bits)`.
+static TOUCHED: std::sync::RwLock<BTreeMap<usize, Arc<Touched>>> = std::sync::RwLock::new(BTreeMap::new());
+
+#[derive(Debug)]
+struct Touched {
+    len: usize,
+    bits: std::boxed::Box<[std::sync::atomic::AtomicU64]>,
+}
+
+impl Touched {
+    fn new(len: usize) -> Self {
+        let words = len.div_ceil(PAGE).div_ceil(64);
+        Touched { len, bits: (0..words).map(|_| std::sync::atomic::AtomicU64::new(0)).collect() }
+    }
+
+    fn get(&self, page: usize) -> bool {
+        self.bits[page / 64].load(std::sync::atomic::Ordering::Acquire) & (1 << (page % 64)) != 0
+    }
+
+    /// Sets (or clears) the bits of pages `[from, to)`.
+    fn mark(&self, from: usize, to: usize, set: bool) {
+        let mut i = from;
+        while i < to {
+            let n = (64 - i % 64).min(to - i);
+            let mask = if n == 64 { u64::MAX } else { ((1u64 << n) - 1) << (i % 64) };
+            if set {
+                self.bits[i / 64].fetch_or(mask, std::sync::atomic::Ordering::AcqRel);
+            } else {
+                self.bits[i / 64].fetch_and(!mask, std::sync::atomic::Ordering::AcqRel);
+            }
+            i += n;
+        }
+    }
+}
+
+/// A new lazy allocation at `base`: no page committed.
+fn touched_add(base: usize, len: usize) {
+    TOUCHED.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(base, Arc::new(Touched::new(len)));
+}
+
+/// The lazy allocation at `base` is gone, or no longer lazy.
+fn touched_remove(base: usize) {
+    TOUCHED.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&base);
+}
+
+/// Sets (or clears) the bits of the pages `[start, start + len)` overlaps,
+/// in whichever lazy allocations it lies.
+fn touched_mark(start: usize, len: usize, set: bool) {
+    let end = start.saturating_add(len);
+    let map = TOUCHED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if map.is_empty() {
+        return;
+    }
+    let first = map.range(..=start).next_back().map_or(start, |(b, _)| *b);
+    for (&b, t) in map.range(first..end) {
+        let (s, e) = (start.max(b), end.min(b + t.len));
+        if s < e {
+            t.mark((s - b) / PAGE, (e - b).div_ceil(PAGE), set);
+        }
+    }
+}
+
+/// Splits `[addr, addr + len)` into runs and calls `f(start, len, zeros)` for
+/// each in order: `zeros` for a run of lazy memory that is accessible and not
+/// committed, which reads as zeros, and which a host read can take as zeros
+/// without touching it (a touch would commit and charge it, where Linux maps
+/// its zero page for a read and charges nothing: mm/memory.c
+/// `do_anonymous_page`); not `zeros` for everything else, which the caller
+/// reads as it is (committed memory; memory that is not lazy; `PROT_NONE`
+/// lazy memory and holes, which fault as on Linux). A page that another
+/// thread commits during the call may be called zeros: what a read that came
+/// before that thread's write gives.
+pub(crate) fn zero_runs(addr: usize, len: usize, mut f: impl FnMut(usize, usize, bool)) {
+    let end = addr.saturating_add(len);
+    if len == 0 {
+        return;
+    }
+    let mut cur: Option<(usize, usize, bool)> = None;
+    let mut push = |s: usize, e: usize, zeros: bool| {
+        if s >= e {
+            return;
+        }
+        match &mut cur {
+            Some((_, ce, cz)) if *ce == s && *cz == zeros => *ce = e,
+            _ => {
+                if let Some((cs, ce, cz)) = cur.take() {
+                    f(cs, ce - cs, cz);
+                }
+                cur = Some((s, e, zeros));
+            }
+        }
+    };
+    {
+        let map = TOUCHED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut at = addr;
+        while at < end {
+            let found = map.range(..=at).next_back().filter(|(b, t)| at < **b + t.len);
+            let Some((&b, t)) = found else {
+                // Not lazy memory, up to the next lazy allocation.
+                let next = map.range(at + 1..).next().map_or(end, |(b, _)| (*b).min(end));
+                push(at, next, false);
+                at = next;
+                continue;
+            };
+            let stop = end.min(b + t.len);
+            while at < stop {
+                let next = (at - at % PAGE + PAGE).min(stop);
+                if t.get((at - b) / PAGE) {
+                    push(at, next, false);
+                    at = next;
+                    continue;
+                }
+                // Pages whose bits are clear, asked about.
+                let mut q = next;
+                while q < stop && !t.get((q - b) / PAGE) {
+                    q = (q + PAGE).min(stop);
+                }
+                confirm(at, q, b, t, &mut push);
+                at = q;
+            }
+        }
+    }
+    if let Some((cs, ce, cz)) = cur {
+        f(cs, ce - cs, cz);
+    }
+}
+
+/// [`zero_runs`] for `[s, e)`, whose bits in the lazy allocation at `b` are
+/// clear: what is committed is read (and its bits set again), what is not is
+/// zeros where [`LAZY`] has it with a protection that reads.
+fn confirm(s: usize, e: usize, b: usize, t: &Touched, push: &mut impl FnMut(usize, usize, bool)) {
+    let mut at = s;
+    while at < e {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            push(at, e, false);
+            return;
+        }
+        let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(e) - at;
+        if mbi.State == MEM_COMMIT {
+            t.mark((at - b) / PAGE, (at + run - b).div_ceil(PAGE), true);
+            push(at, at + run, false);
+        } else {
+            let mut p = at;
+            for (ls, ln, prot) in lazy_within(at, run) {
+                push(p, ls, false);
+                push(ls, ls + ln, prot != PAGE_NOACCESS);
+                p = ls + ln;
+            }
+            push(p, at + run, false);
+        }
+        at += run;
+    }
 }
 
 /// What an access to `addr` found ([`wick_mm::commit_on_access`]).
@@ -1093,6 +1268,17 @@ fn protect_lazy(t: &mut Table, b: usize, s: usize, e: usize, wprot: PAGE_PROTECT
 }
 
 fn commit(base: usize, len: usize, prot: PAGE_PROTECTION_FLAGS, replace: bool) -> bool {
+    let done = commit_now(base, len, prot, replace);
+    // Before the caller (and so the guest or the thread that faulted) can
+    // write the pages: a page whose bit is clear is asked about, so a bit set
+    // late would cost a query, not data; set here, it costs nothing.
+    if done && !replace {
+        touched_mark(base, len, true);
+    }
+    done
+}
+
+fn commit_now(base: usize, len: usize, prot: PAGE_PROTECTION_FLAGS, replace: bool) -> bool {
     let flags = if replace {
         MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER
     } else {
@@ -1310,6 +1496,7 @@ fn fill(
     if lazy {
         t.get_mut(&base).unwrap().lazy = true;
         lazy_add(base, len, wprot);
+        touched_add(base, len);
     }
     if flags & MAP_POPULATE != 0 && prot != PROT_NONE {
         let range = WIN32_MEMORY_RANGE_ENTRY {
@@ -1755,6 +1942,9 @@ pub unsafe fn mmap(
                 })
                 .map(|(b, _)| *b);
             if let Some(b) = inside {
+                // Cleared first: a bit set after that is a page committed
+                // since, which the hint must not lose.
+                touched_mark(base, len, false);
                 // SAFETY: decommits part of our allocation.
                 unsafe { VirtualFree(base as *mut c_void, len, MEM_DECOMMIT) };
                 let r = t.get_mut(&b).unwrap();
@@ -1838,6 +2028,7 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
         match r.kind {
             Kind::Placeholder | Kind::Large { .. } => unreachable!("carved or refused"),
             Kind::Private { .. } => {
+                touched_mark(s, e - s, false);
                 // SAFETY: decommits part of our allocation.
                 unsafe { VirtualFree(s as *mut c_void, e - s, MEM_DECOMMIT) };
                 lazy_remove(s, e - s);
@@ -2016,6 +2207,7 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<us
     // A section is committed when it is touched, as the userfaultfd fills it.
     if r.lazy {
         lazy_remove(start, len);
+        touched_remove(start);
         r.lazy = false;
     }
     Ok(alias)
@@ -2198,6 +2390,8 @@ unsafe fn discard_private(b: usize, s: usize, e: usize, file: Option<&(Arc<Owned
             at += run;
             continue;
         }
+        // Cleared first, as for a fixed mapping over lazy memory.
+        touched_mark(at, run, false);
         // SAFETY: drops the pages of our private memory.
         unsafe { VirtualFree(at as *mut c_void, run, MEM_DECOMMIT) };
         // Lazy memory gets zero pages again at its next access.
@@ -2360,6 +2554,86 @@ mod tests {
             assert_eq!(*((m + 2 * PAGE) as *const u8), 0);
             assert_eq!(munmap(m as *mut c_void, 4 * PAGE), 0);
         }
+    }
+
+    fn runs(addr: usize, len: usize) -> Vec<(usize, usize, bool)> {
+        let mut v = Vec::new();
+        zero_runs(addr, len, |s, n, z| v.push((s, n, z)));
+        v
+    }
+
+    fn touched_bit(addr: usize) -> Option<bool> {
+        let map = TOUCHED.read().unwrap();
+        let (b, t) = map.range(..=addr).next_back().filter(|(b, t)| addr < **b + t.len)?;
+        Some(t.get((addr - b) / PAGE))
+    }
+
+    /// `zero_runs` names the pages of lazy memory a host read can take as
+    /// zeros without touching them: the accessible ones not committed. What
+    /// was written, what is `PROT_NONE` or unmapped (a read faults, as on
+    /// Linux) and memory that is not lazy are read as they are; nothing is
+    /// committed by the call; the hint's bits follow commits and discards,
+    /// and a wrong bit either way changes no answer.
+    #[test]
+    fn test_zero_runs_are_the_untouched_pages_of_lazy_memory() {
+        let _serial = serial();
+        let len = 1 << 20;
+        let p = map(0, len, PROT_READ | PROT_WRITE, ANON | MAP_NORESERVE, -1, 0);
+        let at = |i: usize| p + i * PAGE;
+        assert_eq!(runs(p + 100, 16 * PAGE), [(p + 100, 16 * PAGE, true)], "untouched");
+        // SAFETY: our mapping.
+        unsafe {
+            *(at(3) as *mut u8) = 3;
+            *(at(10) as *mut u8) = 10;
+        }
+        assert_eq!((touched_bit(at(3)), touched_bit(at(4))), (Some(true), Some(false)), "the commit set the bit");
+        let want = [
+            (p + 100, at(3) - p - 100, true),
+            (at(3), PAGE, false),
+            (at(4), 6 * PAGE, true),
+            (at(10), PAGE, false),
+            (at(11), p + 100 + 16 * PAGE - at(11), true),
+        ];
+        assert_eq!(runs(p + 100, 16 * PAGE), want);
+        assert_eq!(committed(p, len), 2 * PAGE, "the call committed memory");
+        // A bit wrongly clear: asked about, read as it is, set again.
+        touched_mark(at(10), PAGE, false);
+        assert_eq!(runs(p + 100, 16 * PAGE), want, "a clear bit lost data");
+        assert_eq!(touched_bit(at(10)), Some(true));
+        // A bit wrongly set: read as it is (a read would commit it, as before).
+        touched_mark(at(20), PAGE, true);
+        assert_eq!(runs(at(20), PAGE), [(at(20), PAGE, false)]);
+        touched_mark(at(20), PAGE, false);
+        assert_eq!(runs(at(20), PAGE), [(at(20), PAGE, true)]);
+        // Discarded: zeros again.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { madvise(at(3) as *mut c_void, PAGE, MADV_DONTNEED) }, 0);
+        assert_eq!(touched_bit(at(3)), Some(false));
+        assert_eq!(runs(at(3), PAGE), [(at(3), PAGE, true)]);
+        // PROT_NONE and a hole: read, so that the read faults.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { mprotect(at(12) as *mut c_void, 2 * PAGE, PROT_NONE) }, 0);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { munmap(at(15) as *mut c_void, PAGE) }, 0);
+        assert_eq!(
+            runs(at(11), 6 * PAGE),
+            [(at(11), PAGE, true), (at(12), 2 * PAGE, false), (at(14), PAGE, true), (at(15), PAGE, false), (at(16), PAGE, true)]
+        );
+        assert_eq!(committed(p, len), PAGE);
+        // Memory that is not lazy, and memory this module did not map.
+        let q = map(0, 4 * PAGE, PROT_READ | PROT_WRITE, ANON, -1, 0);
+        assert_eq!(runs(q, 4 * PAGE), [(q, 4 * PAGE, false)]);
+        let heap = std::vec![0u8; 3 * PAGE];
+        assert_eq!(runs(heap.as_ptr() as usize, heap.len()), [(heap.as_ptr() as usize, heap.len(), false)]);
+        // Across lazy memory's end into other memory.
+        assert_eq!(runs(at(255), 2 * PAGE).first(), Some(&(at(255), PAGE, true)));
+        // SAFETY: our mappings.
+        unsafe {
+            assert_eq!(munmap(q as *mut c_void, 4 * PAGE), 0);
+            assert_eq!(munmap(p as *mut c_void, len), 0);
+        }
+        assert_eq!(touched_bit(p), None, "the hint outlived its allocation");
+        assert_eq!(runs(p, PAGE), [(p, PAGE, false)]);
     }
 
     fn state(addr: usize) -> u32 {
