@@ -1905,6 +1905,45 @@ def stage_cli(ctx):
     done.append(f"start time metrics {start} us, {cpu} CPU us (of {wall} us); logger and metrics on FIFOs, "
                 "and the microVM goes on once their readers went")
 
+    # SIGTERM, SIGINT and SIGQUIT, at their default action as upstream leaves
+    # them, end Firecracker by the signal, and a reader that holds the log
+    # FIFO without having read it yet then reads every line: Linux's FIFO
+    # holds them all (64 KiB); macOS's holds 8 KiB and Firecracker the rest,
+    # which its handler moves into the FIFO as the reader takes it, before it
+    # ends by the same signal (inside the sandbox's run phase here).
+    import select
+    line = b'The API server received a Get request on "/machine-config"'
+    ends = []
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGQUIT):
+        if signal.getsignal(sig) == signal.SIG_IGN:
+            # Inherited ignored (a background job of a shell without job
+            # control): Firecracker would inherit it ignored too.
+            ends.append(f"{sig.name} NOT RUN (ignored in this run's process)")
+            continue
+        path = os.path.join(ctx.sock, f"end-{sig.name.lower()}.fifo")
+        os.mkfifo(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            vm = ctx.vm(f"cli-end-{sig.name.lower()}", ["--log-path", path, "--level", "Info"], config(ctx))
+            vm.shell()
+            for _ in range(150):
+                vm.api("GET", "/machine-config")
+            vm.proc.send_signal(sig)
+            data = b""
+            deadline = time.time() + 20
+            while data.count(line) < 150 and time.time() < deadline:
+                if select.select([fd], [], [], 0.1)[0]:
+                    data += os.read(fd, 65536)
+            code = vm.wait_exit(20)
+        finally:
+            os.close(fd)
+        check(code == -sig, f"{sig.name}: exit status {code}, not the signal's ({vm.exit_reason()})")
+        check(data.count(line) == 150 and len(data) > 8192,
+              f"{sig.name}: {data.count(line)} of 150 request lines in {len(data)} bytes read after the signal")
+        vm.kill()
+        ends.append(f"{sig.name} {len(data)} bytes")
+    done.append("a log FIFO read only after a terminating signal has every line, and Firecracker ends by the signal: " + ", ".join(ends))
+
     # A caller that passes macOS's own CLOCK_MONOTONIC (the wall clock since
     # the boot) instead: the metric is off by what the two clocks differ by,
     # as it is on Linux for a start time that is not the clock's. Behind the

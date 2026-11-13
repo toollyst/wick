@@ -26,11 +26,14 @@
 //! stops for the API process's fork, gone from the kernel's count of threads
 //! when [`before_fork`] returns, and runs again after it ([`after_fork`]). A
 //! write of up to 4096 bytes (Linux's `PIPE_BUF`) is taken whole or not at
-//! all. Only the overflow can be lost at an abrupt end (`SIGKILL`, and
-//! `SIGTERM`, `SIGINT`, `SIGQUIT`, which Firecracker leaves at their default
-//! action): what Linux would still hold for a reader more than the FIFO's
-//! own buffer behind. An orderly end (`exit`, the panic hook, upstream's
-//! signal handlers) drains it first ([`drain`]).
+//! all. Only the overflow can be lost, and only at `SIGKILL`: what Linux
+//! would still hold for a reader more than the FIFO's own buffer behind.
+//! An orderly end (`exit`, the panic hook, upstream's signal handlers)
+//! drains it first ([`drain`]). So does an end by `SIGTERM`, `SIGINT` or
+//! `SIGQUIT`, which upstream leaves at their default action and on Linux
+//! end Firecracker with its bytes in the FIFO: once a FIFO is open, a
+//! handler drains and then ends Firecracker by the same signal at its
+//! default action, so its parent reads the wait status Linux gives.
 //!
 //! Windows: the path names a pipe its reader made, and Firecracker is the
 //! pipe's client. Such a pipe ends with its reader, and a write to it then
@@ -275,6 +278,17 @@ mod macos {
     impl<T> Drop for Held<'_, T> {
         fn drop(&mut self) {
             self.lock.owner.store(0, Ordering::Release);
+            // An ending signal that came while this thread held a lock.
+            end::deferred();
+        }
+    }
+
+    impl<T> Held<'_, T> {
+        /// The release alone, for the check [`Drop`] itself makes
+        /// (`relay::held_by_this_thread`).
+        fn release_quietly(self) {
+            self.lock.owner.store(0, Ordering::Release);
+            std::mem::forget(self);
         }
     }
 
@@ -307,6 +321,11 @@ mod macos {
         /// signal handler on a thread interrupted inside it).
         fn lock(&self) -> Option<Held<'_, T>> {
             self.acquire(None)
+        }
+
+        /// Whether the calling thread holds it.
+        fn mine(&self) -> bool {
+            self.owner.load(Ordering::Acquire) == me()
         }
 
         /// As [`Self::lock`], but `None` too if another thread still holds
@@ -681,6 +700,12 @@ mod macos {
     /// still lists 10 s after its join is an error, and the split fails
     /// by it. [`after_fork`] starts the relay again.
     pub fn before_fork() -> io::Result<()> {
+        // The three signals this module handles wait until [`after_fork`]:
+        // one that came to the child (a terminal's, sent to the whole
+        // process group) before it has its default action again would run
+        // the handler there, which writes the child's copies of
+        // Firecracker's bytes.
+        end::hold();
         relay::stop()
     }
 
@@ -696,9 +721,13 @@ mod macos {
     pub fn after_fork(in_child: bool) -> io::Result<()> {
         if in_child {
             relay::forget_in_child();
+            end::default_in_child();
+            end::release();
             Ok(())
         } else {
-            relay::restart()
+            let restarted = relay::restart();
+            end::release();
+            restarted
         }
     }
 
@@ -718,6 +747,169 @@ mod macos {
             total.fetch_add(fifo.queued.load(Ordering::Acquire), Ordering::Relaxed);
         });
         total.into_inner()
+    }
+
+    /// The end by `SIGTERM`, `SIGINT` or `SIGQUIT`. Upstream handles none of
+    /// them, so each ends Firecracker at once (signal(7): their default
+    /// action), and on Linux what it wrote is in the FIFO for a reader that
+    /// holds it. Here the overflow is Firecracker's own memory: a handler
+    /// moves it into the FIFO as the orderly ends do ([`super::drain`]) and
+    /// then ends Firecracker by the same signal at its default action, so
+    /// its parent's `wait` reads what Linux's does (ended by that signal;
+    /// `SIGQUIT` with its core, where cores are on).
+    ///
+    /// Installed at the first FIFO's open and only over the default action:
+    /// a signal that is ignored stays ignored (nohup(1); a shell's
+    /// background job; the jail's stand-in for a PID namespace,
+    /// `ext::jail::DROPPED_IN_PID_NS`), as on Linux, and without a FIFO
+    /// nothing is installed.
+    mod end {
+        use super::*;
+
+        pub(super) const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT];
+        /// The signal that came while its thread held an overflow's lock
+        /// (inside a write) or the list's: that thread's drain would skip
+        /// the FIFO it was writing to, so the end waits for the lock's
+        /// release ([`deferred`]), a few instructions on. 0: none.
+        static DEFERRED: AtomicI32 = AtomicI32::new(0);
+        /// The signal Firecracker is ending by; 0 before. A second one
+        /// that reaches another thread meanwhile leaves the first to end
+        /// it, as on Linux the first ends it.
+        static ENDING: AtomicI32 = AtomicI32::new(0);
+        /// The signals [`install`] put its handler on, a bit each.
+        static INSTALLED: AtomicU64 = AtomicU64::new(0);
+        /// The calling thread's signal mask before [`hold`] (macOS's
+        /// `sigset_t` is 32 bits); `NOT_HELD` otherwise.
+        static HELD: AtomicU64 = AtomicU64::new(NOT_HELD);
+        const NOT_HELD: u64 = u64::MAX;
+
+        /// Blocks the three signals on the calling thread, the only one
+        /// (a fork is next), until [`release`].
+        pub(super) fn hold() {
+            // SAFETY: a set of three valid signals, and the old mask written.
+            unsafe {
+                let mut set: libc::sigset_t = 0;
+                for sig in SIGNALS {
+                    libc::sigaddset(&mut set, sig);
+                }
+                let mut old: libc::sigset_t = 0;
+                if libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) == 0 {
+                    // A second hold without a release keeps the first's mask.
+                    let _ = HELD.compare_exchange(NOT_HELD, u64::from(old), Ordering::AcqRel, Ordering::Acquire);
+                }
+            }
+        }
+
+        /// The mask [`hold`] found, again: a signal that waited is taken
+        /// now, by the handler in Firecracker and by its default action in
+        /// the child.
+        pub(super) fn release() {
+            let old = HELD.swap(NOT_HELD, Ordering::AcqRel);
+            if let Ok(old) = libc::sigset_t::try_from(old) {
+                // SAFETY: a mask this thread had.
+                unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+            }
+        }
+
+        pub(super) fn install() -> io::Result<()> {
+            for sig in SIGNALS {
+                // SAFETY: zeroed sigactions, read and then written for a
+                // signal number of the list; the handler is async-signal-safe.
+                unsafe {
+                    let mut old: libc::sigaction = std::mem::zeroed();
+                    if libc::sigaction(sig, std::ptr::null(), &mut old) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if old.sa_sigaction != libc::SIG_DFL {
+                        continue;
+                    }
+                    let mut act: libc::sigaction = std::mem::zeroed();
+                    act.sa_sigaction = on_signal as *const () as usize;
+                    // A handler that returns (the end deferred, or left to
+                    // an earlier signal's) disturbs no system call.
+                    act.sa_flags = libc::SA_RESTART;
+                    // The three block one another, and nothing else: not
+                    // SIGSYS, which the first thread keeps taking
+                    // (`ext::sandbox`).
+                    for other in SIGNALS {
+                        libc::sigaddset(&mut act.sa_mask, other);
+                    }
+                    if libc::sigaction(sig, &act, std::ptr::null_mut()) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    INSTALLED.fetch_or(1 << sig, Ordering::AcqRel);
+                }
+            }
+            Ok(())
+        }
+
+        /// In a fork's child (the API process): the default action again
+        /// for the signals [`install`] took. The child has none of
+        /// Firecracker's bytes to move ([`relay::forget_in_child`]), and
+        /// its sandbox is not Firecracker's: a signal ends it at once, as
+        /// before.
+        pub(super) fn default_in_child() {
+            let installed = INSTALLED.swap(0, Ordering::AcqRel);
+            for sig in SIGNALS {
+                if installed & (1 << sig) != 0 {
+                    // SAFETY: a zeroed sigaction with the default action.
+                    unsafe {
+                        let mut act: libc::sigaction = std::mem::zeroed();
+                        act.sa_sigaction = libc::SIG_DFL;
+                        libc::sigaction(sig, &act, std::ptr::null_mut());
+                    }
+                }
+            }
+        }
+
+        extern "C" fn on_signal(sig: libc::c_int) {
+            // SAFETY: this thread's errno, kept for the code interrupted.
+            let saved = unsafe { *libc::__error() };
+            if relay::held_by_this_thread(Instant::now() + DRAIN_STALL) {
+                DEFERRED.store(sig, Ordering::Release);
+            } else {
+                finish(sig);
+            }
+            // SAFETY: as above.
+            unsafe { *libc::__error() = saved };
+        }
+
+        /// Called at every release of a lock: ends Firecracker by the
+        /// signal that waited for it.
+        pub(super) fn deferred() {
+            // While this thread holds another lock still, the end waits
+            // for that one's release.
+            if DEFERRED.load(Ordering::Acquire) != 0 && !relay::held_by_this_thread(Instant::now() + DRAIN_STALL) {
+                let sig = DEFERRED.swap(0, Ordering::AcqRel);
+                if sig != 0 {
+                    finish(sig);
+                }
+            }
+        }
+
+        /// Drains, then ends the process by `sig` at its default action.
+        /// Async-signal-safe: the drain, `sigaction`, `pthread_sigmask`,
+        /// `pthread_kill`.
+        fn finish(sig: libc::c_int) {
+            if ENDING.compare_exchange(0, sig, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                return;
+            }
+            super::drain();
+            // SAFETY: the default action for `sig`, unblocked on this
+            // thread (it is blocked inside its handler, and on the relay's
+            // thread always), then `sig` to this thread: the kernel ends
+            // the process by it before `raise` returns.
+            unsafe {
+                let mut act: libc::sigaction = std::mem::zeroed();
+                act.sa_sigaction = libc::SIG_DFL;
+                libc::sigaction(sig, &act, std::ptr::null_mut());
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, sig);
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                libc::raise(sig);
+            }
+        }
     }
 
     /// The thread that moves overflows into their FIFOs.
@@ -804,6 +996,7 @@ mod macos {
                 if unsafe { libc::atexit(at_exit) } != 0 {
                     return Err(io::Error::other("atexit refused the FIFO drain"));
                 }
+                super::end::install()?;
             }
             Ok(relay)
         }
@@ -956,6 +1149,22 @@ mod macos {
                     f(&fifo);
                 }
             }
+        }
+
+        /// Whether the calling thread holds the list's lock or an
+        /// overflow's: a signal handler's question, on a thread it may have
+        /// interrupted inside a write or a registration. Allocates nothing.
+        pub(super) fn held_by_this_thread(until: Instant) -> bool {
+            let Some(relay) = RELAY.get() else { return false };
+            if relay.fifos.mine() {
+                return true;
+            }
+            // Another thread's at `until` still: not this thread's.
+            let Some(list) = relay.fifos.lock_until(until) else { return false };
+            let held = list.iter().filter_map(Weak::upgrade).any(|fifo| fifo.ring.mine());
+            // Released without the look for a deferred end, which asks this.
+            list.release_quietly();
+            held
         }
 
         pub(super) fn wake() {
@@ -1478,6 +1687,177 @@ pub(crate) mod tests {
         std::io::stdout().flush().unwrap();
         // SAFETY: ends this process at once.
         unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+    }
+
+    /// The default action for the three signals, whatever this process
+    /// inherited (a shell's background job ignores SIGINT and SIGQUIT).
+    fn default_ending_signals() {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT] {
+            // SAFETY: the default action for a signal of the list.
+            unsafe { libc::signal(sig, libc::SIG_DFL) };
+        }
+    }
+
+    // SIGTERM, SIGINT and SIGQUIT, which upstream leaves at their default
+    // action, end Firecracker by the signal, and a reader that holds the
+    // FIFO reads everything written: on Linux it is all in the FIFO; on
+    // macOS a handler moves the overflow into it first, then ends the
+    // process by the same signal (the wait status is the signal's).
+    #[test]
+    fn test_a_terminating_signal_leaves_the_reader_every_line() {
+        use std::os::unix::process::ExitStatusExt;
+        for (name, sig) in [("term", libc::SIGTERM), ("int", libc::SIGINT), ("quit", libc::SIGQUIT)] {
+            let (_dir, path) = fifo(name);
+            let r = reader(&path);
+            let mut c = child("child_writes_then_waits_for_a_signal", &path);
+            let mut out = out_lines(&mut c);
+            until(&mut out, "WICK-WRITTEN");
+            // SAFETY: the child's pid.
+            assert_eq!(unsafe { libc::kill(out.child.id().cast_signed(), sig) }, 0);
+            assert!(read_exactly(&r, 30000) == lines(0..300), "{name}: the lines came back otherwise");
+            assert_eq!(wait_child(out.child).signal(), Some(sig), "{name}");
+        }
+    }
+
+    #[test]
+    #[ignore = "run by test_a_terminating_signal_leaves_the_reader_every_line"]
+    fn child_writes_then_waits_for_a_signal() {
+        default_ending_signals();
+        let mut out = open_file_nonblock(&child_path()).unwrap();
+        for i in 0..300 {
+            out.write_all(&line(i)).unwrap();
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(out.pause_relay(), 30000 - fifo_buffer() / 100 * 100);
+        println!("WICK-WRITTEN");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    // The signal comes to a thread that is inside a write to the FIFO (it
+    // holds the overflow's lock, and a drain there would skip that FIFO):
+    // the end waits for the write, then drains and ends by the signal.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_a_terminating_signal_inside_a_write_ends_after_the_write() {
+        use std::os::unix::process::ExitStatusExt;
+        let (_dir, path) = fifo("inside");
+        let r = reader(&path);
+        let mut c = child("child_is_signalled_inside_a_write", &path);
+        let mut out = out_lines(&mut c);
+        until(&mut out, "WICK-WRITTEN");
+        assert!(read_exactly(&r, 30000) == lines(0..300), "the lines came back otherwise");
+        until(&mut out, "WICK-STILL-INSIDE");
+        assert_eq!(wait_child(out.child).signal(), Some(libc::SIGTERM));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_a_terminating_signal_inside_a_write_ends_after_the_write"]
+    fn child_is_signalled_inside_a_write() {
+        default_ending_signals();
+        let out = child_fills();
+        out.wait_reader();
+        out.holding(|| {
+            // SAFETY: SIGTERM to this thread, taken before raise returns.
+            unsafe { libc::raise(libc::SIGTERM) };
+            // The handler returned: the write goes on.
+            println!("WICK-STILL-INSIDE");
+            std::io::stdout().flush().unwrap();
+        });
+        // The lock's release ended the process.
+        println!("WICK-SURVIVED");
+        std::io::stdout().flush().unwrap();
+    }
+
+    // A signal that is ignored when the FIFO is opened stays ignored (nohup,
+    // a background job, the jail's stand-in for a PID namespace), and the
+    // API process, forked with the FIFO open, has the default action again:
+    // it holds none of Firecracker's bytes, and its sandbox is its own. The
+    // three are blocked from before the fork until then, so that none runs
+    // the handler in the fork.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_ending_signals_keep_what_they_were_and_a_fork_gets_the_default() {
+        let (_dir, path) = fifo("kept");
+        let _r = reader(&path);
+        let mut c = child("child_reports_its_ending_signals", &path);
+        let mut out = out_lines(&mut c);
+        assert_eq!(until(&mut out, "WICK-SIGNALS"), "term=ignored int=handled quit=handled fork=ignored,default,default blocked=3->0 here=0");
+        assert!(wait_child(out.child).success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_ending_signals_keep_what_they_were_and_a_fork_gets_the_default"]
+    fn child_reports_its_ending_signals() {
+        fn action(sig: libc::c_int) -> &'static str {
+            // SAFETY: a zeroed sigaction, read for a valid signal.
+            let act = unsafe {
+                let mut act: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(sig, std::ptr::null(), &mut act);
+                act.sa_sigaction
+            };
+            match act {
+                libc::SIG_DFL => "default",
+                libc::SIG_IGN => "ignored",
+                _ => "handled",
+            }
+        }
+        /// How many of the three the calling thread blocks.
+        fn blocked() -> usize {
+            // SAFETY: the calling thread's mask, read.
+            unsafe {
+                let mut set: libc::sigset_t = 0;
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut set);
+                [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT].iter().filter(|s| libc::sigismember(&set, **s) == 1).count()
+            }
+        }
+        default_ending_signals();
+        // SAFETY: SIGTERM ignored, as nohup leaves SIGHUP.
+        unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        let _out = open_file_nonblock(&child_path()).unwrap();
+        let here = format!(
+            "term={} int={} quit={}",
+            action(libc::SIGTERM),
+            action(libc::SIGINT),
+            action(libc::SIGQUIT)
+        );
+        super::before_fork().unwrap();
+        let mut fds = [0; 2];
+        // SAFETY: a pipe for the fork's answer; the fork resets, reports
+        // and ends.
+        let forked = unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                let before = blocked();
+                super::after_fork(true).unwrap();
+                // SIGTERM was not this module's: it stays ignored.
+                let all = format!(
+                    "{},{},{} blocked={before}->{}",
+                    action(libc::SIGTERM),
+                    action(libc::SIGINT),
+                    action(libc::SIGQUIT),
+                    blocked()
+                );
+                libc::write(fds[1], all.as_ptr().cast(), all.len());
+                libc::_exit(0);
+            }
+            libc::close(fds[1]);
+            let mut buf = [0u8; 128];
+            let n = libc::read(fds[0], buf.as_mut_ptr().cast(), buf.len());
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+            String::from_utf8_lossy(&buf[..usize::try_from(n).unwrap_or(0)]).into_owned()
+        };
+        super::after_fork(false).unwrap();
+        let forked = format!("{forked} here={}", blocked());
+        println!("WICK-SIGNALS {here} fork={forked}");
+        std::io::stdout().flush().unwrap();
     }
 
     static HANDLER_OUT: std::sync::OnceLock<super::OutFile> = std::sync::OnceLock::new();
