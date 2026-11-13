@@ -17,6 +17,21 @@
 # comment at test_pid_suspend_binding). CI's "Jailer unit tests" step runs
 # both as root, as does `sudo env RUST_TEST_THREADS=1 <jailer test binary>`.
 #
+# Root only, among vmm's tests: two cases of
+# ext::sandbox::macos::tests::test_unfiltered_syscalls_are_limited_by_their_rule,
+# pid_suspend and pid_resume with their rule lifted (the cases that show the
+# rule is what refuses them). Run by a plain user each prints
+# "<call> lifted: NOT RUN: as a plain user it waits on taskgated, ..." to
+# standard error and the test passes without them, for the reason above (the
+# comment at the test). The same two calls with the rule in place run for
+# every user: the sandbox refuses them before taskgated is asked. No CI step
+# runs vmm's tests as root (check-unit-tests.py and the macos-seatbelt job
+# run them as the runner's user), so CI does not run the two lifted cases;
+# as root, with no NOT RUN line:
+# `sudo <vmm test binary> --exact
+# ext::sandbox::macos::tests::test_unfiltered_syscalls_are_limited_by_their_rule
+# --nocapture`.
+#
 # Format: <kind> <crate> <test path>, below a comment that gives the reason.
 # <crate> is a name of check-unit-tests.py's: the package, or compat-<name> for
 # crates/compat/<name>. kind:
