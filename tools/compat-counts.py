@@ -41,6 +41,21 @@ impossible ones. Untested (❔) and not done yet rows count against it.
 --check FILE fails when a block between FILE's markers
 (<!-- compat-progress:begin --> ... end, <!-- compat-counts:begin --> ...
 end) is not what this makes of FILE; --write FILE replaces them.
+
+Both also check what a feature cell says of an upstream test against that
+host's differences file (the legend's rule), and fail on:
+  - a test named plainly (no kind in brackets), which the legend reads as
+    "passes on Linux, not listed", while the host's file lists it as a whole
+    (by its function, or by its file);
+  - a test given a kind in brackets that the host's file does not list it
+    with (any mode, for macOS: a [root] entry is a user-mode one).
+A kind applies to the run of test names it follows, `test_a`, `test_b` and
+`test_c` [kind], and may carry a note, [bug: VMM memory]. An entry for some
+parameters of a function (`test_x[...]`) leaves a plain mention alone, as
+the other parameters may pass, and so does a mention of a test the same
+cell names with a kind elsewhere (a cell describing what the test checks).
+A name is an upstream test if the Linux baseline or a differences file has
+it.
 """
 
 import argparse
@@ -391,6 +406,91 @@ def table():
     return "\n".join(lines) + "\n"
 
 
+# A run of backquoted test names (`a`, `b` and `c`) and the kind in brackets
+# after it, if any: [kind] or [kind: a note].
+NAME_RUN = re.compile(
+    r"(`test_[A-Za-z0-9_]+`(?:(?:,\s*|\s+and\s+|,\s+and\s+)`test_[A-Za-z0-9_]+`)*)"
+    r"(?:\s*\[([a-z0-9-]+)(?::[^\]]*)?\])?"
+)
+NAME = re.compile(r"`(test_[A-Za-z0-9_]+)`")
+
+
+def function(nodeid):
+    """The test function a node id or an entry names, or None for a whole file."""
+    if "::" not in nodeid:
+        return None
+    return nodeid.rsplit("::", 1)[1].split("[", 1)[0]
+
+
+def listings(entries, linux):
+    """{function: (kinds of entries naming it whole, kinds of entries naming some parameters)}."""
+    file_of = defaultdict(set)
+    for nodeid in linux:
+        if function(nodeid):
+            file_of[function(nodeid)].add(module(nodeid))
+    whole, partly = defaultdict(set), defaultdict(set)
+    for entry, kind, _ in entries:
+        if entry.startswith("failure:"):
+            continue
+        name = function(entry)
+        if name is None:
+            for f, files in file_of.items():
+                if entry in files:
+                    whole[f].add(kind)
+        elif "[" in entry.rsplit("::", 1)[1]:
+            partly[name].add(kind)
+        else:
+            whole[name].add(kind)
+    return whole, partly
+
+
+def cell_findings(text):
+    """What a feature cell says of an upstream test that its host's differences file does not."""
+    linux = baseline()
+    hosts = {"macOS": macos_entries(), "Windows": windows_entries()}
+    upstream = {function(n) for n in linux if function(n)}
+    for entries in hosts.values():
+        upstream |= {function(e) for e, _, _ in entries if not e.startswith("failure:") and function(e)}
+    lists = {}
+    for host, entries in hosts.items():
+        # A plain name is the counts' mode (all, user); a kind may be any mode's.
+        plain = [e for e in entries if host != "macOS" or e[2] in ("all", MACOS_MODE)]
+        lists[host] = (listings(plain, linux), listings(entries, linux))
+    out = []
+    header, area = None, None
+    for n, line in enumerate(text.splitlines(), 1):
+        if line.startswith("## "):
+            area, header = line[3:].strip(), None
+            continue
+        if not line.startswith("|"):
+            header = None
+            continue
+        cells = [c.strip() for c in line.replace("\\|", "\0").strip().strip("|").split("|")]
+        if header is None:
+            header = cells
+            continue
+        if area in NOT_FEATURES or not all(h in header for h in HOSTS) or all(set(c) <= set("-: ") for c in cells):
+            continue
+        for host in HOSTS:
+            cell = cells[header.index(host)]
+            ((whole, partly), (any_whole, any_partly)) = lists[host]
+            runs = [(NAME.findall(m.group(1)), m.group(2)) for m in NAME_RUN.finditer(cell)]
+            kinded = {t for names, kind in runs if kind for t in names}
+            for names, kind in runs:
+                for t in names:
+                    if t not in upstream:
+                        continue
+                    if kind is None:
+                        if t in whole and t not in kinded:
+                            out.append(f"docs line {n} ({host}): `{t}` is named plainly (passes, not listed), but "
+                                       f"the host's file lists it as {'/'.join(sorted(whole[t]))}")
+                    elif kind not in any_whole.get(t, set()) | any_partly.get(t, set()):
+                        listed = sorted(any_whole.get(t, set()) | any_partly.get(t, set()))
+                        out.append(f"docs line {n} ({host}): `{t}` [{kind}], but the host's file lists it as "
+                                   f"{'/'.join(listed) if listed else 'nothing'}")
+    return list(dict.fromkeys(out))
+
+
 def embedded(text, begin, end, path):
     try:
         head, rest = text.split(begin, 1)
@@ -411,7 +511,13 @@ def main():
     group.add_argument("--check", type=Path, metavar="FILE", help="fail if FILE's embedded table is stale")
     group.add_argument("--write", type=Path, metavar="FILE", help="replace FILE's embedded table")
     args = ap.parse_args()
+    if args.check or args.write:
+        findings = cell_findings((args.check or args.write).read_text(encoding="utf-8"))
+        for f in findings:
+            print(f"{args.check or args.write}: {f}", file=sys.stderr)
     if args.check:
+        if findings:
+            return 1
         text = args.check.read_text(encoding="utf-8")
         for begin, end, out in blocks(text):
             _, body, _ = embedded(text, begin, end, args.check)
@@ -427,7 +533,7 @@ def main():
             head, _, tail = embedded(text, begin, end, args.write)
             text = f"{head}{begin}\n{out}{end}{tail}"
         args.write.write_text(text, encoding="utf-8")
-        return 0
+        return 1 if findings else 0
     sys.stdout.write(table())
     return 0
 
