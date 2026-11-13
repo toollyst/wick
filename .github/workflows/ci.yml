@@ -995,6 +995,12 @@ jobs:
           # WHvAdviseGpaRange(Populate) of committed guest RAM nothing has
           # touched, with the guest's first write to each of 512 pages
           # populated and not.
+          # Which special register value of a Linux guest's KVM snapshot
+          # WHP refuses (SREGSREC lines): run 43442912128's linux-snapshot
+          # stage was refused 0xc0350005 for CR0, CR4, EFER and APIC_BASE
+          # 0xfee00d00 (x2APIC) set in one call; each alone, CR4's bits
+          # alone, both APIC modes, and the x2APIC bit of CPUID.
+          alone whp::vcpu::fpu_tests::test_a_linux_guests_special_registers_on_record
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # What each call of the backend commits of its thread's stack

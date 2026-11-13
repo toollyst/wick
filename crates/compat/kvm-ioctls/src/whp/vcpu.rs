@@ -4368,6 +4368,91 @@ mod fpu_tests {
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
     }
 
+    /// A record (SREGSREC lines) for CI run 43442912128's linux-snapshot
+    /// stage, where WHP refused (0xc0350005, an invalid parameter) the
+    /// special registers of a Linux guest's snapshot made on KVM: CR0
+    /// 0x80050033, CR4 0x370eb0, EFER 0xd01, APIC_BASE 0xfee00d00 (bit 10:
+    /// x2APIC enabled), the GDT's limit 0x7f and the IDT's 0xfff, set in
+    /// one call. Which value WHP refuses, on a vCPU in long mode: each of
+    /// CR0, EFER and CR4 alone, then each bit of that CR4 beyond the
+    /// vCPU's alone; APIC_BASE with xAPIC (0xfee00900) and with x2APIC
+    /// (0xfee00d00); then the snapshot's whole set through KVM_SET_SREGS,
+    /// with each APIC_BASE. With the x2APIC bit of CPUID leaf 1 (ECX bit
+    /// 21) as the host has it and as the backend's supported CPUID gives
+    /// it, and the partition's local APIC mode (xAPIC, `vm.rs`). Each
+    /// refusal's HRESULT is on the `whp:` line before it. Printed, not
+    /// asserted.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_linux_guests_special_registers_on_record() {
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        let (part, vp) = (vcpu.part(), vcpu.vp());
+        let one = |name: whv::WHV_REGISTER_NAME, value: u64| match super::super::ffi::set_registers(
+            part,
+            vp,
+            &[name],
+            &[super::super::ffi::reg64(value)],
+        ) {
+            Ok(()) => "taken".to_string(),
+            Err(e) => format!("refused (errno {})", e.errno()),
+        };
+        let mut lines = Vec::new();
+        let host = core::arch::x86_64::__cpuid(1).ecx >> 21 & 1;
+        let given = regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .unwrap()
+            .as_slice()
+            .iter()
+            .find(|e| e.function == 1)
+            .map_or(2, |e| e.ecx >> 21 & 1);
+        lines.push(format!(
+            "x2APIC in CPUID leaf 1: the host {host}, the backend's supported CPUID {given}; the partition's local APIC: xAPIC"
+        ));
+        let base = vcpu.get_sregs().unwrap();
+        lines.push(format!("the vCPU in long mode: CR0 {:#x} CR4 {:#x} EFER {:#x} APIC_BASE {:#x}", base.cr0, base.cr4, base.efer, base.apic_base));
+        lines.push(format!("CR0 0x80050033: {}", one(whv::WHvX64RegisterCr0, 0x8005_0033)));
+        lines.push(format!("EFER 0xd01: {}", one(whv::WHvX64RegisterEfer, 0xd01)));
+        for bit in 0..32 {
+            let b = 1u64 << bit;
+            if 0x37_0eb0 & b != 0 && base.cr4 & b == 0 {
+                let r = one(whv::WHvX64RegisterCr4, base.cr4 | b);
+                lines.push(format!("CR4 bit {bit} ({:#x}) alone: {r}", base.cr4 | b));
+                let _ = one(whv::WHvX64RegisterCr4, base.cr4);
+            }
+        }
+        lines.push(format!("CR4 0x370eb0: {}", one(whv::WHvX64RegisterCr4, 0x37_0eb0)));
+        lines.push(format!("APIC_BASE 0xfee00900 (xAPIC): {}", one(whv::WHvX64RegisterApicBase, 0xFEE0_0900)));
+        lines.push(format!("APIC_BASE 0xfee00d00 (x2APIC): {}", one(whv::WHvX64RegisterApicBase, 0xFEE0_0D00)));
+        for apic_base in [0xFEE0_0D00u64, 0xFEE0_0900] {
+            let mut s = base;
+            (s.cr0, s.cr4, s.efer, s.apic_base) = (0x8005_0033, 0x37_0eb0, 0xd01, apic_base);
+            (s.gdt.limit, s.idt.limit) = (0x7f, 0xfff);
+            let r = match vcpu.set_sregs(&s) {
+                Ok(()) => "taken".to_string(),
+                Err(e) => format!("refused (errno {})", e.errno()),
+            };
+            lines.push(format!("the snapshot's set through KVM_SET_SREGS with APIC_BASE {apic_base:#x}: {r}"));
+        }
+        for l in &lines {
+            eprintln!("SREGSREC {l}");
+        }
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
     /// Record A of lazy-ram-options.md (COMMITTEST lines; no WHP): what
     /// `VirtualAlloc(MEM_COMMIT)` of reserved memory takes for 4 KiB,
     /// 64 KiB and 2 MiB (64 of each, the median, least and most), what the
