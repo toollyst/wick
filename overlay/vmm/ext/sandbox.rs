@@ -247,8 +247,10 @@ mod macos {
         // measured: denied, the microVM stopped with SIGSYS). getrusage
         // reports on the process itself or its children only.
         "getrusage",
-        // rt_sigaction, rt_sigprocmask, rt_sigreturn, sigaltstack, tkill.
-        "sigaction", "sigprocmask", "__pthread_sigmask", "sigreturn", "sigaltstack",
+        // rt_sigprocmask, rt_sigreturn, sigaltstack, tkill. Not
+        // rt_sigaction: upstream's filters allow it only for SIGABRT, which
+        // Seatbelt cannot check, so it is setup's (SETUP_SYSCALLS).
+        "sigprocmask", "__pthread_sigmask", "sigreturn", "sigaltstack",
         "__pthread_kill",
         // exit, exit_group: a thread's exit, a worker thread parking, a panic.
         "exit", "bsdthread_terminate", "__disable_threadsignal", "workq_open", "workq_kernreturn",
@@ -479,6 +481,16 @@ mod macos {
         // holds (test_openers_of_a_stale_name_take_turns). Once narrowed a
         // bind replaces nothing and takes no turn.
         "flock",
+        // rt_sigaction, which upstream's filters allow in the run phase
+        // only for SIGABRT (libc's abort resets its handler): Seatbelt has
+        // no check of a call's arguments, so a running microVM sets no
+        // signal action at all (test_a_run_phase_sigaction_is_a_denial).
+        // Apple's abort() resets SIGABRT only after a handler of it
+        // returned, and Firecracker sets none, so a panic still ends by
+        // SIGABRT (test_the_other_ends_are_unchanged_without_a_denied_call).
+        // What ends Firecracker by a signal's default action has it put
+        // back by the kernel (ext::fifo's SA_RESETHAND).
+        "sigaction",
     ];
 
     /// The Mach traps a running microVM may make (`MSC_<name>`, XNU's
@@ -655,8 +667,10 @@ mod macos {
         "psynch_cvwait", "psynch_cvclrprepost", "ulock_wait", "ulock_wake", "ulock_wait2",
         // getrandom, clock_gettime, gettid.
         "getentropy", "gettimeofday", "thread_selfid",
-        // rt_sigaction, rt_sigprocmask, rt_sigreturn, sigaltstack, tkill.
-        "sigaction", "sigprocmask", "__pthread_sigmask", "sigreturn", "sigaltstack",
+        // rt_sigprocmask, rt_sigreturn, sigaltstack, tkill. Not
+        // rt_sigaction, as in SYSCALLS: the API process's handlers are set
+        // before its profile.
+        "sigprocmask", "__pthread_sigmask", "sigreturn", "sigaltstack",
         "__pthread_kill",
         // exit, exit_group: a thread's exit, a panic.
         "exit", "bsdthread_terminate", "__disable_threadsignal", "abort_with_payload",
@@ -2354,6 +2368,39 @@ mod macos {
             assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
         }
 
+        // Once narrowed, setting a signal's action is a denial, SIGABRT's
+        // default too: upstream's run-phase filters allow `rt_sigaction`
+        // only for SIGABRT (libc's abort resets its handler), and Seatbelt
+        // cannot check a call's arguments, so `sigaction` is setup's only
+        // (SETUP_SYSCALLS). Before narrowing it is allowed. Apple's abort()
+        // resets SIGABRT only when a handler of it returned (Libc
+        // stdlib/FreeBSD/abort.c `__abort`), and Firecracker sets none, so
+        // a run-phase panic still ends by SIGABRT
+        // (`test_the_other_ends_are_unchanged_without_a_denied_call`). The
+        // API process's: `test_api_profile_denies_outside_its_list`.
+        #[test]
+        fn test_a_run_phase_sigaction_is_a_denial() {
+            let out = child("sigaction_child", &[]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("SETUP-OK"), "{}", text(&out));
+            assert!(denied(&out), "{}", text(&out));
+            assert!(!stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_a_run_phase_sigaction_is_a_denial in a separate process"]
+        fn sigaction_child() {
+            select(Policy::Default);
+            apply().unwrap();
+            // SAFETY: the default action of a valid signal.
+            assert_ne!(unsafe { libc::signal(libc::SIGABRT, libc::SIG_DFL) }, libc::SIG_ERR);
+            println!("SETUP-OK");
+            narrow().unwrap();
+            // SAFETY: as above; denied.
+            unsafe { libc::signal(libc::SIGABRT, libc::SIG_DFL) };
+            println!("CHILD-SURVIVED");
+        }
+
         // A handled signal that lands while a thread is blocked in a
         // cancellation point (the vCPU kick, SIGRTMIN here as upstream sends
         // it, with upstream's flags: no SA_RESTART) makes the call fail with
@@ -2426,13 +2473,9 @@ mod macos {
                     }
                     _ => apply_api().unwrap(),
                 }
-                // SAFETY: the default action again where `apply` put the
-                // sandbox's handlers; then a store to address 0, which
+                // SAFETY: a valid buffer; then a store to address 0, which
                 // faults, or a breakpoint trap.
                 unsafe {
-                    for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGTRAP] {
-                        libc::signal(sig, libc::SIG_DFL);
-                    }
                     libc::write(1, c"SANDBOXED\n".as_ptr().cast(), 10);
                     if how == "fault" {
                         std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1);
@@ -2560,10 +2603,6 @@ mod macos {
                     // The control: the same message without a sandbox.
                     "none" => {}
                     _ => apply_api().unwrap(),
-                }
-                for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGTRAP] {
-                    // SAFETY: as above, where `apply` put the sandbox's handlers.
-                    unsafe { libc::signal(sig, libc::SIG_DFL) };
                 }
                 // SAFETY: a valid buffer.
                 unsafe { libc::write(1, c"SANDBOXED\n".as_ptr().cast(), 10) };
@@ -2793,12 +2832,12 @@ mod macos {
         // as outside the chroot.
         #[test]
         fn test_api_profile_denies_outside_its_list() {
-            for case in ["dup", "shm", "exec", "socketpair", "madvise", "dontneed", "fcntl"] {
+            for case in ["dup", "shm", "exec", "socketpair", "madvise", "dontneed", "fcntl", "sigaction"] {
                 let out = child("api_child", &[("WICK_TEST_CASE", case)]);
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 assert!(stdout.contains("SETUP-OK"), "{case}: {}", text(&out));
                 assert!(denied(&out), "{case}: {}", text(&out));
-                assert!(!stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
+                assert!(!stdout.contains("CALL-RETURNED"), "{case}: {}", text(&out));
             }
             let out = child("api_child", &[("WICK_TEST_CASE", "allowed")]);
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2990,13 +3029,24 @@ mod macos {
                 "fcntl" => unsafe {
                     libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&a), libc::F_GETFL);
                 },
+                // A handler set, even SIGABRT's default (SETUP_SYSCALLS).
+                // SAFETY: a zeroed sigaction, the default action of a valid
+                // signal.
+                "sigaction" => unsafe {
+                    let act: libc::sigaction = std::mem::zeroed();
+                    libc::sigaction(libc::SIGABRT, &act, std::ptr::null_mut());
+                },
                 _ => {
                     let mut fds = [0; 2];
                     // SAFETY: a two-element output buffer.
                     unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
                 }
             }
-            // Seatbelt signals the process, not the thread.
+            // A denied call does not return here (the sandbox's kill). The
+            // profile has no sleep: a call that returned would be denied
+            // next, hence the line first.
+            println!("CALL-RETURNED");
+            std::io::stdout().flush().unwrap();
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
         }
