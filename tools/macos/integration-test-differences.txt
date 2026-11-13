@@ -182,19 +182,20 @@ all impossible integration_tests/functional/test_uffd.py::test_unbinded_socket
 # it as root. Not yet run with --jailer.
 user root integration_tests/functional/test_serial_io.py::test_serial_dos
 
-# The guest's cache hierarchy is the host's, which Firecracker on Linux
-# reads in /sys/devices/system/cpu/cpu0/cache and gives the guest in its
-# device tree (arch::aarch64::cache_info). macOS has no such directory:
-# Firecracker logs "No L1 caches found in sysfs" and the guest has no cache
-# entries (`grep: /sys/devices/system/cpu/cpu0/cache/index*/level: No such
-# file or directory`). To do: the host's caches from sysctl (hw.perflevel*),
-# and the test's host side read the same way.
-all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_ON-HTT_OFF-1-kvm]
-all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_ON-HTT_OFF-2-kvm]
-all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_ON-HTT_OFF-16-kvm]
-all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_OFF-HTT_OFF-1-kvm]
-all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_OFF-HTT_OFF-2-kvm]
-all bug integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_OFF-HTT_OFF-16-kvm]
+# 16 vCPUs: the test compares the guest's caches with those of the host's
+# CPUs 0 to 15 (its host side greps /sys/devices/system/cpu/cpu{0..15}/
+# cache, which tools/macos/integration/wick_macos.py reads from macOS's
+# sources). An M1 Pro has 10 CPUs, so cpu10 to cpu15 are not found, as on a
+# Linux host with 10. Its CPUs 2 to 9 are Performance cores, whose number of
+# sets and line size macOS does not give: Hypervisor.framework has one cache
+# geometry, the CCSIDR_EL1 every vCPU reads, which is its Efficiency cores'
+# (cpu0's, the caches Firecracker gives the guest, as Linux gives cpu0's).
+# On a Mac with 16 CPUs or more the Performance cores remain, and their
+# caches are not cpu0's, which every vCPU has: on a Linux host whose CPUs
+# differ the test fails as well. With 1 and 2
+# vCPUs the test passes (macOS 27.2).
+all impossible integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_ON-HTT_OFF-16-kvm]
+all impossible integration_tests/functional/test_topology.py::test_cache_topology[vmlinux-6.1.188-PCI_OFF-HTT_OFF-16-kvm]
 
 # Skipped off x86_64 by upstream (SMT is configured only on x86; pvclock;
 # cpuid and rdmsr), and the Linux results are x86_64's.

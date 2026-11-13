@@ -17,6 +17,8 @@ pub mod api_process;
 pub mod fifo;
 pub mod jail;
 pub mod sandbox;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod sysfs;
 pub mod vcpu_thread;
 #[cfg(all(test, target_os = "macos"))]
 mod snapshot_vcpu_tests;

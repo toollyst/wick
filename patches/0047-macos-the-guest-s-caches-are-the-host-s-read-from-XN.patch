@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Fri, 13 Nov 2026 22:34:00 +0900
+Subject: [PATCH] macos: the guest's caches are the host's, read from XNU and
+ Hypervisor.framework
+
+Firecracker gives the guest the host's caches in its device tree, which
+it reads in /sys/devices/system/cpu/cpu0/cache (cache_info.rs). macOS has
+no sysfs: Firecracker logged "No L1 caches found in sysfs" and the guest
+had no cache entries ("cacheinfo: Unable to detect cache hierarchy for
+CPU 0").
+
+On macOS readln_special reads each file from wick's ext::sysfs instead
+(overlay/vmm/ext/sysfs.rs), in sysfs's format: the leaves of the vCPU's
+CLIDR_EL1, sizes from XNU's hw.l1dcachesize, hw.l1icachesize and
+hw.l2cachesize, the number of sets and the line size from the vCPU's
+CCSIDR_EL1 (hv_vcpu_config_get_ccsidr_el1_sys_reg_values; no sysctl
+gives them), checked against XNU's size, and the CPUs sharing a level
+from hw.cacheconfig. Linux's code path is unchanged.
+
+Upstream test it unlocks: test_cache_topology with 1 and 2 vCPUs, PCI on
+and off (macOS 27.2, M1 Pro: L1 data 64K, 128 sets, 64-byte lines; L1
+instruction 128K, 256 sets; L2 4096K, 2048 sets, 128-byte lines, shared
+by cpu0 and cpu1, as the host's Efficiency cluster).
+
+Still different:
+- The caches are those of the lowest performance level, which XNU's
+  top-level hw.* report (bsd/kern/kern_mib.c sysctl_hw_generic) and whose
+  geometry Hypervisor.framework gives every vCPU; Linux reads cpu0's. On
+  the M1 Pro cpu0 is of that level (IODeviceTree cluster-type "E").
+- With 16 vCPUs the test still fails: the M1 Pro has 10 CPUs, and macOS
+  gives no geometry for a Performance core's caches.
+- override_clidr cannot change the guest's CLIDR_EL1: Hypervisor.framework
+  has no register for it (hv_vcpu_types.h), so its read fails and it warns
+  and leaves it, as upstream does on a KVM that cannot read it. The guest
+  reads the hardware's (0x81000023 on the M1 Pro: L1 separate, L2 unified,
+  as the device tree says; LoC 1, where KVM from 6.10 would write 2).
+---
+ src/vmm/src/arch/aarch64/cache_info.rs | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/vmm/src/arch/aarch64/cache_info.rs b/src/vmm/src/arch/aarch64/cache_info.rs
+index 4c934626f1b548a848341c1690f7e10369699431..995c1c74d25167f16108cdd9a05fab0ff5d033ed 100644
+--- a/src/vmm/src/arch/aarch64/cache_info.rs
++++ b/src/vmm/src/arch/aarch64/cache_info.rs
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use std::path::{Path, PathBuf};
++// wick: fs is not used on macOS (readln_special).
++#[cfg_attr(target_os = "macos", allow(unused_imports))]
+ use std::{fs, io};
+ 
+ use crate::logger::warn;
+@@ -207,12 +209,22 @@ impl CacheType {
+     }
+ }
+ 
++#[cfg(not(target_os = "macos"))]
+ #[cfg_attr(test, allow(unused))]
+ fn readln_special<T: AsRef<Path>>(file_path: &T) -> Result<String, CacheInfoError> {
+     let line = fs::read_to_string(file_path)?;
+     Ok(line.trim_end().to_string())
+ }
+ 
++// wick: macOS has no sysfs; the host's caches are read from XNU and
++// Hypervisor.framework, in sysfs's format (ext::sysfs).
++#[cfg(target_os = "macos")]
++#[cfg_attr(test, allow(unused))]
++fn readln_special<T: AsRef<Path>>(file_path: &T) -> Result<String, CacheInfoError> {
++    let path = file_path.as_ref().to_string_lossy();
++    Ok(crate::ext::sysfs::read(&path)?.trim_end().to_string())
++}
++
+ fn to_bytes(cache_size_pretty: &mut String) -> Result<u32, CacheInfoError> {
+     match cache_size_pretty.pop() {
+         Some('K') => Ok(cache_size_pretty.parse::<u32>().map_err(|err| {

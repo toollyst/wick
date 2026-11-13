@@ -1675,12 +1675,136 @@ class _ProcFdOs:
         return os.open(proc_fd_path(int(m[1]), int(m[2])) if m else path, flags, mode, **kwargs)
 
 
+_CACHE_GREP = re.compile(r"^grep \. /sys/devices/system/cpu/cpu\{0\.\.(\d+)\}/cache/index\*/\{([a-z_,]+)\} \|sort$")
+
+
+def _hvf_cache_registers():
+    """CLIDR_EL1 and the data and instruction CCSIDR_EL1 of each level that
+    Hypervisor.framework gives a vCPU (hv_vcpu_config.h), read without a VM,
+    as Firecracker reads them (overlay/vmm/ext/sysfs.rs)."""
+    hv = ctypes.CDLL("/System/Library/Frameworks/Hypervisor.framework/Hypervisor")
+    hv.hv_vcpu_config_create.restype = ctypes.c_void_p
+    hv.hv_vcpu_config_get_feature_reg.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)]
+    hv.hv_vcpu_config_get_ccsidr_el1_sys_reg_values.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                                                 ctypes.POINTER(ctypes.c_uint64)]
+    _libsystem.os_release.argtypes = [ctypes.c_void_p]
+    config = hv.hv_vcpu_config_create()
+    if not config:
+        raise OSError("Hypervisor.framework: no vCPU configuration")
+    try:
+        clidr, mmfr2 = ctypes.c_uint64(), ctypes.c_uint64()
+        ccsidr = [(ctypes.c_uint64 * 8)(), (ctypes.c_uint64 * 8)()]
+        # hv_feature_reg_t: CLIDR_EL1 10, ID_AA64MMFR2_EL1 6; hv_cache_type_t:
+        # data 0, instruction 1.
+        for ret, what in ((hv.hv_vcpu_config_get_feature_reg(config, 10, ctypes.byref(clidr)), "CLIDR_EL1"),
+                          (hv.hv_vcpu_config_get_feature_reg(config, 6, ctypes.byref(mmfr2)), "ID_AA64MMFR2_EL1"),
+                          (hv.hv_vcpu_config_get_ccsidr_el1_sys_reg_values(config, 0, ccsidr[0]), "CCSIDR_EL1"),
+                          (hv.hv_vcpu_config_get_ccsidr_el1_sys_reg_values(config, 1, ccsidr[1]), "CCSIDR_EL1")):
+            if ret != 0:
+                raise OSError(f"Hypervisor.framework {what}: {ret:#x}")
+    finally:
+        _libsystem.os_release(config)
+    return clidr.value, (mmfr2.value >> 20) & 0xF != 0, [list(ccsidr[0]), list(ccsidr[1])]
+
+
+def _ccsidr_geometry(value, ccidx):
+    """Sets, ways and line size of a CCSIDR_EL1 (Arm ARM: NumSets 55:32 and
+    Associativity 23:3 with FEAT_CCIDX, else 27:13 and 12:3)."""
+    if ccidx:
+        sets, ways = (value >> 32) & 0xFFFFFF, (value >> 3) & 0x1FFFFF
+    else:
+        sets, ways = (value >> 13) & 0x7FFF, (value >> 3) & 0x3FF
+    return sets + 1, ways + 1, 1 << ((value & 7) + 4)
+
+
+def _host_cpu_caches():
+    """Linux's /sys/devices/system/cpu/cpu<N>/cache/index<M>/* for each CPU
+    of this Mac, from macOS's sources: {cpu: [{name: value or None}]}, None
+    where macOS does not say.
+
+    Each CPU's kind is its IODeviceTree node's `cluster-type` (cpus/cpu<N>,
+    `logical-cpu-id` N), the performance level of that name
+    (hw.perflevel<L>.name, "Efficiency" for E) gives its cache sizes (the
+    test reads no sharing). The leaves are those
+    of the vCPU's CLIDR_EL1, in Linux's order (data, then instruction). The
+    number of sets and line size are the vCPU's CCSIDR_EL1, the one geometry
+    Hypervisor.framework has: a CPU whose sizes are not that geometry's (a
+    Performance core's, on an M1 Pro) has none."""
+    import plistlib  # pylint: disable=import-outside-toplevel
+    tree = plistlib.loads(subprocess.run(["/usr/sbin/ioreg", "-p", "IODeviceTree", "-r", "-n", "cpus", "-d", "2",
+                                          "-l", "-a"], check=True, capture_output=True, timeout=60).stdout)
+    nodes = [n for n in tree[0]["IORegistryEntryChildren"] if "logical-cpu-id" in n]
+    levels = {_sysctl(f"hw.perflevel{i}.name")[0]: i for i in range(int(_sysctl("hw.nperflevels")))}
+    clidr, ccidx, ccsidr = _hvf_cache_registers()
+    # CLIDR_EL1's Ctype: the leaves of a level, and which CCSIDR_EL1 (data
+    # 0, instruction 1) describes each.
+    ctypes_ = {1: [("Instruction", 1)], 2: [("Data", 0)], 3: [("Data", 0), ("Instruction", 1)], 4: [("Unified", 0)]}
+    shape = []
+    for level in range(1, 8):
+        ctype = (clidr >> (3 * (level - 1))) & 7
+        if ctype == 0:
+            break
+        shape += [(level, kind, which) for kind, which in ctypes_[ctype]]
+    caches = {}
+    for n in nodes:
+        perflevel = levels[n["cluster-type"].rstrip(b"\0").decode()]
+        leaves = []
+        for level, kind, which in shape:
+            name = {(1, "Data"): "l1dcachesize", (1, "Instruction"): "l1icachesize",
+                    (2, "Unified"): "l2cachesize"}.get((level, kind))
+            size = int(_sysctl(f"hw.perflevel{perflevel}.{name}")) if name else None
+            sets, ways, line = _ccsidr_geometry(ccsidr[which][level - 1], ccidx)
+            known = size is not None and sets * ways * line == size
+            leaves.append({"level": str(level), "type": kind,
+                           "size": None if size is None else f"{size >> 10}K",
+                           "coherency_line_size": str(line) if known else None,
+                           "number_of_sets": str(sets) if known else None})
+        caches[n["logical-cpu-id"]] = leaves
+    return caches
+
+
+class _CacheSysfsSubprocess:
+    """test_topology's `subprocess`, but its host-side `grep . /sys/.../cpu{0..N}/
+    cache/index*/{...} |sort` reads _host_cpu_caches: the lines grep prints for
+    the files there are, and grep's message on stderr for each file there is
+    not (a CPU past the Mac's, a value macOS does not give), then sorted by
+    the host's sort, as the shell's pipe does."""
+
+    def __getattr__(self, name):
+        return getattr(subprocess, name)
+
+    @staticmethod
+    def run(cmd, *args, **kwargs):
+        m = _CACHE_GREP.match(cmd) if isinstance(cmd, str) else None
+        if m is None:
+            return subprocess.run(cmd, *args, **kwargs)  # pylint: disable=subprocess-run-check
+        caches = _host_cpu_caches()
+        lines, errors = [], []
+        for cpu in range(int(m[1]) + 1):
+            base = f"/sys/devices/system/cpu/cpu{cpu}/cache"
+            if cpu not in caches:
+                errors.append(f"grep: {base}/index*/{{{m[2]}}}: No such file or directory")
+                continue
+            for index, leaf in enumerate(caches[cpu]):
+                for name in m[2].split(","):
+                    if leaf.get(name) is None:
+                        errors.append(f"grep: {base}/index{index}/{name}: not given on macOS")
+                    else:
+                        lines.append(f"{base}/index{index}/{name}:{leaf[name]}\n")
+        out = subprocess.run(["sort"], input="".join(lines), capture_output=True, text=True, check=True)
+        result = subprocess.CompletedProcess(cmd, out.returncode, out.stdout, "".join(e + "\n" for e in errors))
+        if kwargs.get("check"):
+            result.check_returncode()
+        return result
+
+
 def pytest_runtest_setup(item):
     """test_pmem reads RssAnon from /proc, which macOS does not have: its
     helper reads it as `rss_anon_kib` does. test_serial_io opens Firecracker's
     terminal through /proc/<pid>/fd/0: its `os.open` opens it by its device
-    (_ProcFdOs). A test of NOISE_ONLY_PINNING runs unpinned
-    (`set_cpu_affinity`)."""
+    (_ProcFdOs). test_topology reads the host's caches in /sys: its
+    `subprocess` reads them from macOS's sources (_CacheSysfsSubprocess). A
+    test of NOISE_ONLY_PINNING runs unpinned (`set_cpu_affinity`)."""
     global _unpinned_test  # pylint: disable=global-statement
     _unpinned_test = item if item.nodeid.split("[", 1)[0] in NOISE_ONLY_PINNING else None
     module = getattr(item, "module", None)
@@ -1688,6 +1812,9 @@ def pytest_runtest_setup(item):
         module.outside_rssanon = _outside_rssanon
     if module is not None and module.__name__.endswith("test_serial_io") and getattr(module, "os", None) is os:
         module.os = _ProcFdOs()
+    if module is not None and module.__name__.endswith("test_topology") \
+            and getattr(module, "subprocess", None) is subprocess:
+        module.subprocess = _CacheSysfsSubprocess()
     # A diagnostic run's readings (WICK_IT_DIAG_MEMORY): the test modules
     # that import get_stable_rss_mem by name.
     if module is not None and ("WICK_IT_DIAG_MEMORY" in DIAGNOSTIC or RSS_LESS) \
