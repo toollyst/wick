@@ -6222,6 +6222,9 @@ mod fpu_tests {
     ///   swapping a page's mapping for a writable one (`WHvUnmapGpaRange`
     ///   then `WHvMapGpaRange`), each one's time.
     ///
+    /// Then a guest write to memory WHP maps read only, without and with
+    /// the `GpaAccessFaultExit` exit ([`guest_writes_to_read_only_memory`]).
+    ///
     /// Linux's lines for the same steps are tools/linux/guest-ram-grain.c's
     /// (LINUXGRAIN read steps). Printed, not asserted, but for each step
     /// reaching its end.
@@ -6402,7 +6405,131 @@ mod fpu_tests {
             assert_eq!(libc::munmap(lazy, LAZY_LEN), 0);
             assert_eq!(libc::munmap(m.cast(), MEM), 0);
         }
+        for l in guest_writes_to_read_only_memory() {
+            eprintln!("ZEROREAD {l}");
+        }
         assert!(wrong.iter().all(|w| w.starts_with("a write to a zero-mapped page")), "{wrong:#?}");
+    }
+
+    /// ZEROREAD's lines on a guest write to memory WHP maps read only, on a
+    /// partition without and then with the `GpaAccessFaultExit` extended
+    /// exit (Learn, WHV_EXTENDED_VM_EXITS: "WHvRunVpExitReasonMemoryAccess
+    /// supported for second-level page faults"), where WHP offers it: a
+    /// page mapped read only outside any slot (a zero page at the guest's
+    /// addresses) and a `KVM_MEM_READONLY` slot (Firecracker's read-only
+    /// pmem, devices/virtio/pmem/device.rs), whose write KVM gives
+    /// Firecracker as an MMIO exit (v6.1 virt/kvm/kvm_main.c
+    /// `__gfn_to_pfn_memslot` refuses a write to a read-only slot with
+    /// KVM_PFN_ERR_RO_FAULT, which x86 handles as emulated MMIO). For each,
+    /// a read then a write by the guest: the WHP run calls' exits (reason,
+    /// address, access type) and what `run` gave.
+    fn guest_writes_to_read_only_memory() -> Vec<String> {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PROGRAM: u64 = 0xB000;
+        // Both in the 2 MiB page at 2 MiB, which the tables map below; the
+        // read-only slot's pages are the test mapping's at its address.
+        const ZERO_GPA: u64 = 0x30_0000;
+        const RO_GPA: u64 = 0x34_0000;
+        const GPA_ACCESS_FAULT_EXIT: u64 = 1 << 14;
+        let mut lines = Vec::new();
+        let mut offered = 0u64;
+        let mut n = 0u32;
+        // SAFETY: a u64 output buffer of the size passed.
+        let hres = unsafe { whv::WHvGetCapability(whv::WHvCapabilityCodeExtendedVmExits, (&raw mut offered).cast(), 8, &mut n) };
+        lines.push(format!(
+            "ExtendedVmExits offered {:#010x} {offered:#x}: GpaAccessFaultExit {}",
+            hres.cast_unsigned(),
+            offered >> 14 & 1
+        ));
+        for extra in [0, GPA_ACCESS_FAULT_EXIT] {
+            let with = if extra == 0 { "without GpaAccessFaultExit" } else { "with GpaAccessFaultExit" };
+            if extra & offered != extra {
+                lines.push(format!("{with}: not offered, not run"));
+                continue;
+            }
+            super::super::vm::EXTRA_EXITS_FOR_TESTS.set(extra);
+            let made = super::super::VmFd::create();
+            super::super::vm::EXTRA_EXITS_FOR_TESTS.set(0);
+            let vm = match made {
+                Ok(vm) => vm,
+                Err(e) => {
+                    lines.push(format!("{with}: the partition is not made: errno {}", e.errno()));
+                    continue;
+                }
+            };
+            let m = guest();
+            put(m, 0x3008, &(0x20_0000u64 | 0x83).to_le_bytes());
+            // `mov al, [addr]; out; mov byte [addr], 1; out`, per address.
+            let access = |addr: u32| {
+                let mut b = vec![0x8A, 0x04, 0x25];
+                b.extend_from_slice(&addr.to_le_bytes());
+                b.extend_from_slice(&[0xE6, PORT as u8, 0xC6, 0x04, 0x25]);
+                b.extend_from_slice(&addr.to_le_bytes());
+                b.extend_from_slice(&[0x01, 0xE6, PORT as u8]);
+                b
+            };
+            put(m, PROGRAM, &[access(ZERO_GPA as u32), access(RO_GPA as u32), vec![0xF4, 0xEB, 0xFD]].concat());
+            // SAFETY: the memory stays mapped while the VM has it.
+            unsafe {
+                vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                    slot: 0,
+                    flags: 0,
+                    guest_phys_addr: 0,
+                    memory_size: 0x30_0000,
+                    userspace_addr: m as u64,
+                })
+            }
+            .unwrap();
+            // SAFETY: as above: the slot's pages are the test's mapping.
+            unsafe {
+                vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                    slot: 1,
+                    flags: kvm_bindings::KVM_MEM_READONLY,
+                    guest_phys_addr: RO_GPA,
+                    memory_size: 4096,
+                    userspace_addr: m as u64 + RO_GPA,
+                })
+            }
+            .unwrap();
+            let mut vcpu = vm.create_vcpu(0).unwrap();
+            // SAFETY: allocates a committed page, released below.
+            let zero = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+            assert!(!zero.is_null());
+            // SAFETY: the page stays allocated while mapped; unmapped below.
+            let mapped = unsafe { whv::WHvMapGpaRange(vcpu.part(), zero, ZERO_GPA, 4096, whv::WHvMapGpaRangeFlagRead) };
+            lines.push(format!("{with}: the zero page mapped read only: HRESULT {:#010x}", mapped.cast_unsigned()));
+            start(&vcpu);
+            vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+            for name in [
+                "the guest's read of the zero page",
+                "its write of the zero page",
+                "its read of the KVM_MEM_READONLY slot",
+                "its write of the KVM_MEM_READONLY slot",
+            ] {
+                super::super::ffi::trace::begin();
+                let what = run_a_step(&mut vcpu);
+                let calls = super::super::ffi::trace::end();
+                let exits: Vec<String> = calls
+                    .iter()
+                    .filter_map(|c| c.exit.map(|e| format!("reason {e:#x} ({})", c.detail)))
+                    .collect();
+                lines.push(format!("{with}: {name}: the run gave [{what}]; WHP's exits {exits:?}"));
+                if !what.ends_with(&format!("IoOut {PORT:#x}")) {
+                    lines.push(format!("{with}: the steps after it are not run"));
+                    break;
+                }
+            }
+            // SAFETY: the range mapped above.
+            unsafe { whv::WHvUnmapGpaRange(vcpu.part(), ZERO_GPA, 4096) };
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: the test's memory, no VM left using it.
+            unsafe {
+                VirtualFree(zero, 0, MEM_RELEASE);
+                assert_eq!(libc::munmap(m.cast(), MEM), 0);
+            }
+        }
+        lines
     }
 
     // String port I/O and device memory with a second operand in RAM, as

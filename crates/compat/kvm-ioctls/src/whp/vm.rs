@@ -37,6 +37,10 @@ thread_local! {
     /// The MSRs a record test's VM made on this thread has in its MSR
     /// action list, both actions Exit (`test_an_x2apic_partition_on_record`).
     pub(crate) static MSR_ACTIONS_FOR_TESTS: std::cell::Cell<&'static [u32]> = const { std::cell::Cell::new(&[]) };
+    /// Extended VM exits a record test's VM made on this thread asks for
+    /// beyond the backend's, where WHP offers them
+    /// (`test_a_guest_read_of_untouched_ram_on_record`: GpaAccessFaultExit).
+    pub(crate) static EXTRA_EXITS_FOR_TESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 use super::guest_mem::{self, Slot};
 use super::irqchip::{Irqchip, MsiRoutes};
@@ -750,6 +754,8 @@ fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
             supported = 0;
         }
         let exits_bits = super::debug::extended_vm_exits(supported);
+        #[cfg(test)]
+        let exits_bits = exits_bits | (EXTRA_EXITS_FOR_TESTS.get() & supported);
         // SAFETY: a u64 value for ExtendedVmExits.
         unsafe {
             ffi::set_partition_property(
