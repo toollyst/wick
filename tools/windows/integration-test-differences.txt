@@ -219,11 +219,11 @@ impossible integration_tests/functional/test_net.py::test_multi_queue_unsupporte
 
 # Firecracker's memory beyond its guest's goes just above the tests' 5 MiB
 # (5.0 to 5.6 MiB), most with 16 vCPUs. The excess is the cost of a vCPU:
-# about 137 KiB on Windows against 26.7 on Linux (test_cpuid's rows, CI run
-# 43397419784). By its parts (vmm-memory-record.py --boot, VMMMEM and
-# VMMGROW lines of a PC's traced boot at 861d365, 1 and 16 vCPUs; a debug
-# build, until CI's release record replaces the figures):
-# - its thread's stack, 52.0 KiB, of which 36 are WHP's own stack use inside
+# about 105 KiB on Windows against 26.7 on Linux (test_cpuid's rows, CI run
+# 43397419784). By its parts (vmm-memory-record.py --boot, VMMGROW lines
+# for 1 and 16 vCPUs of the release build, CI run 43435331370 on an AMD
+# EPYC 7763; in brackets a debug build's on a PC at 861d365, 137 KiB):
+# - its thread's stack, 50.7 KiB (52.0), of which 36 are WHP's own stack use inside
 #   WHvRunVirtualProcessor on a lazy-RAM memory exit: the guest's first
 #   write on that vCPU into guest RAM that is reserved, not yet committed
 #   (test_the_stack_each_whp_call_commits_on_record, its MAP_NORESERVE step:
@@ -234,10 +234,11 @@ impossible integration_tests/functional/test_net.py::test_multi_queue_unsupporte
 #   (memory.max, overcommit, the balloon); guest RAM committed up front
 #   would make no exit and change those. A measured difference with its
 #   cause, not a fault;
-# - heap, 62.1 KiB, in later segments of the process heap: owner not named
-#   yet (the next record walks the heap);
-# - other private memory, 22.9 KiB: three 12 KiB allocations (12.0) and the
-#   thread's TEB (8.0).
+# - heap, 32.3 KiB (62.1), most of it in later segments of the process
+#   heap: owner not named yet (test_the_heap_a_vcpu_takes_on_record walks
+#   the heaps);
+# - other private memory, 21.9 KiB (22.9): three 12 KiB allocations (12.0)
+#   and the thread's TEB (8.5).
 # Listed as bugs while the heap's part is unexplained; upstream's budget
 # stays as it is.
 bug integration_tests/functional/test_cpu_all.py::test_all_vcpus_online
