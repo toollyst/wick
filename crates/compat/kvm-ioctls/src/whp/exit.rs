@@ -454,9 +454,70 @@ pub fn mmio_step(e: Emulated, answered: usize) -> MmioStep {
     }
 }
 
+/// The interrupt shadow (`WHvRegisterInterruptState` bit 0) a vCPU is to
+/// have after the VMM finished an instruction that exited, as KVM leaves it
+/// (Linux v6.1): an instruction KVM skips ends any shadow
+/// (`skip_emulated_instruction`, arch/x86/kvm/vmx/vmx.c:1636,
+/// `__svm_skip_emulated_instruction`, svm/svm.c:403), and one its emulator
+/// finishes leaves the instruction's own shadow, MOV SS's or POP SS's,
+/// none for any other (`toggle_interruptibility`, x86.c:8263-8280, at the
+/// writeback, x86.c:8955). `had`: the exit's `ExecutionState`
+/// `InterruptShadow`; `loads_ss`: the instruction is a MOV SS or POP SS
+/// ([`loads_ss`]). `None` when the state already is that (no WHP call);
+/// else the shadow to write. Not as KVM: two MOV SS in a row, whose second
+/// KVM leaves with no shadow; WHP keeps no kind of shadow to tell them by.
+pub fn shadow_after(had: bool, loads_ss: bool) -> Option<bool> {
+    if had == loads_ss { None } else { Some(loads_ss) }
+}
+
+/// Whether the instruction in `bytes` (the exit's instruction bytes) is a
+/// MOV SS (`8E /2`) or, outside 64-bit code, POP SS (`17`), after its
+/// legacy prefixes and, in 64-bit code, a REX prefix: the instructions that
+/// open a shadow of their own (Intel SDM vol. 2, MOV and POP).
+pub fn loads_ss(bytes: &[u8], long_mode_code: bool) -> bool {
+    let mut i = 0;
+    while i < bytes.len() && matches!(bytes[i], 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3) {
+        i += 1;
+    }
+    if long_mode_code && i < bytes.len() && bytes[i] & 0xF0 == 0x40 {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(0x8E) => bytes.get(i + 1).is_some_and(|modrm| modrm >> 3 & 7 == 2),
+        Some(0x17) => !long_mode_code,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_the_shadow_after_a_finished_instruction_is_kvms() {
+        // STI's shadow, then a MOV, CPUID, OUT...: ended.
+        assert_eq!(shadow_after(true, false), Some(false));
+        // No shadow, an instruction without one: nothing to write.
+        assert_eq!(shadow_after(false, false), None);
+        // MOV SS from a device: its own shadow.
+        assert_eq!(shadow_after(false, true), Some(true));
+        assert_eq!(shadow_after(true, true), None);
+    }
+
+    #[test]
+    fn test_mov_ss_and_pop_ss_are_told_from_the_bytes() {
+        assert!(loads_ss(&[0x8E, 0x14, 0x25, 0, 0, 0x60, 0], true), "mov ss, [0x600000]");
+        assert!(loads_ss(&[0x66, 0x8E, 0x10], true), "with an operand-size prefix");
+        assert!(loads_ss(&[0x48, 0x8E, 0x10], true), "with REX.W in 64-bit code");
+        assert!(!loads_ss(&[0x48, 0x8E, 0x10], false), "0x48 is DEC EAX outside 64-bit code");
+        assert!(!loads_ss(&[0x8E, 0x18], true), "mov ds, [rax]");
+        assert!(!loads_ss(&[0x8B, 0x04, 0x25, 0, 0, 0x60, 0], true), "mov eax, [0x600000]");
+        assert!(loads_ss(&[0x17], false), "pop ss");
+        assert!(!loads_ss(&[0x17], true), "no POP SS in 64-bit code");
+        assert!(!loads_ss(&[], true));
+        assert!(!loads_ss(&[0x66, 0x67], true));
+        assert!(!loads_ss(&[0x8E], true), "no ModRM byte");
+    }
 
     // The device reads of an MMIO instruction, kept between its exits and
     // answered in order when it is emulated again from its exit, as the run

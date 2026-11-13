@@ -6,8 +6,10 @@
 //! length, a port access's direction, size and kind, a memory access's
 //! direction, an MSR access and the value it writes, the `RAX` an `IN`
 //! leaves, the CPUID bits that follow CR4, the hypercall answered (at
-//! the privilege level and operand size the exit context gives), and a
-//! string instruction's addressing and segment checks.
+//! the privilege level and operand size the exit context gives), a
+//! string instruction's addressing and segment checks, and the interrupt
+//! shadow an instruction the VMM finished leaves (MOV SS / POP SS from its
+//! bytes).
 //! Checked against a reference written here from the x86 architecture (the
 //! Intel SDM: port I/O sizes, 32-bit register writes zero-extending,
 //! `WRMSR` taking `EDX:EAX`, CPUID's OSXSAVE and OSPKE) and KVM's hypercall
@@ -19,8 +21,8 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use wick_fuzz::whp_exit::{
     CodeMode, Hypercall, PortAccess, Segment, SegmentFault, SegmentView, code_mode, cpl, cpuid_ecx, hypercall, hypercall_rax,
-    in_result, ins_read_ahead, instruction_length, linearize, long_mode_code, memory_write, msr_access, port_access,
-    string_addressing, string_advance, string_count, string_offset,
+    in_result, ins_read_ahead, instruction_length, linearize, loads_ss, long_mode_code, memory_write, msr_access, port_access,
+    shadow_after, string_addressing, string_advance, string_count, string_offset,
 };
 
 #[derive(Arbitrary, Debug)]
@@ -32,6 +34,7 @@ enum Exit {
     Hypercall { nr: u64, a0: u64, a1: u64, state: u16, cs: u16 },
     String { bytes: Vec<u8>, long: bool, default_32: bool, reg: u64, rcx: u64, size: u8, rep: bool, down: bool },
     Linear { state: u16, rflags: u64, cs: u16, seg: u8, base: u64, limit: u32, attributes: u16, offset: u64, size: u16, write: bool, la57: bool },
+    Shadow { bytes: Vec<u8>, long: bool, had: bool },
 }
 
 #[derive(Arbitrary, Debug)]
@@ -140,6 +143,8 @@ fn check(e: &Exit) {
             assert!(n >= 1 && n * size <= 1024, "{n} elements of {size}");
             assert!(n as u64 <= count.max(1));
         }
+        // Checked by `check_shadow`.
+        Exit::Shadow { .. } => {}
         Exit::Linear { state, rflags, cs, seg, base, limit, attributes, offset, size, write, la57 } => {
             // KVM's emulator modes (x86.c, `init_emulate_ctxt`) and its
             // segment checks (emulate.c, `__linearize`), against the Intel
@@ -203,10 +208,38 @@ fn check(e: &Exit) {
     }
 }
 
+/// The reference for an instruction's own shadow: after the legacy
+/// prefixes (and a REX prefix in 64-bit code), `8E /2` or, outside 64-bit
+/// code, `17` (Intel SDM vol. 2, MOV and POP).
+fn opens_shadow(bytes: &[u8], long: bool) -> bool {
+    const LEGACY: [u8; 11] = [0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3];
+    let rest: Vec<u8> = bytes.iter().copied().skip_while(|b| LEGACY.contains(b)).collect();
+    let rest = if long && rest.first().is_some_and(|b| (0x40..=0x4F).contains(b)) { &rest[1..] } else { &rest[..] };
+    match rest {
+        [0x8E, modrm, ..] => (modrm >> 3) & 7 == 2,
+        [0x17, ..] => !long,
+        _ => false,
+    }
+}
+
+fn check_shadow(e: &Exit) {
+    if let Exit::Shadow { bytes, long, had } = e {
+        let own = loads_ss(bytes, *long);
+        assert_eq!(own, opens_shadow(bytes, *long), "{bytes:02x?}");
+        // KVM: the shadow after is the instruction's own; nothing to write
+        // when it already is.
+        match shadow_after(*had, own) {
+            None => assert_eq!(*had, own),
+            Some(after) => assert_eq!(after, own),
+        }
+    }
+}
+
 fuzz_target!(|input: Input| {
     assert!(instruction_length(input.bitfield) <= 15);
     assert_eq!(instruction_length(input.bitfield), u64::from(input.bitfield & 15));
     for e in &input.exits {
         check(e);
+        check_shadow(e);
     }
 });

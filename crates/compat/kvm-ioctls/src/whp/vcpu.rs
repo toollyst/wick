@@ -1525,6 +1525,10 @@ impl VcpuFd {
                 }
 
                 whv::WHvRunVpExitReasonX64IoPortAccess => {
+                    // Each way below finishes the instruction (or, for a
+                    // REP string, an element of it, after which KVM's
+                    // emulator ends the shadow too).
+                    self.end_shadow(&ctx.VpContext, false)?;
                     // SAFETY: the union arm matches the exit reason.
                     let io = unsafe { ctx.Anonymous.IoPortAccess };
                     // SAFETY: the access-info bitfield overlaps the u32.
@@ -1650,6 +1654,7 @@ impl VcpuFd {
                 whv::WHvRunVpExitReasonX64Cpuid => {
                     // SAFETY: the union arm matches the exit reason.
                     let c = unsafe { ctx.Anonymous.CpuidAccess };
+                    self.end_shadow(&ctx.VpContext, false)?;
                     self.handle_cpuid(&c, rip + instr_len)?;
                     continue;
                 }
@@ -1657,6 +1662,7 @@ impl VcpuFd {
                 whv::WHvRunVpExitReasonX64MsrAccess => {
                     // SAFETY: the union arm matches the exit reason.
                     let m = unsafe { ctx.Anonymous.MsrAccess };
+                    self.end_shadow(&ctx.VpContext, false)?;
                     self.handle_msr(&m, rip + instr_len)?;
                     continue;
                 }
@@ -1668,6 +1674,7 @@ impl VcpuFd {
                     let (state, cs) = unsafe { (ctx.VpContext.ExecutionState.AsUINT16, ctx.VpContext.Cs.Anonymous.Attributes) };
                     let wide = super::exit::long_mode_code(state, cs);
                     let result = self.kvm_hypercall(h.Rax, h.Rbx, h.Rcx, wide, super::exit::cpl(state));
+                    self.end_shadow(&ctx.VpContext, false)?;
                     regs::set_gpr_rax_rip(part, vp, super::exit::hypercall_rax(result, wide), rip + instr_len)?;
                     continue;
                 }
@@ -1742,6 +1749,22 @@ impl VcpuFd {
         }
     }
 
+    /// Leaves the interrupt shadow as KVM leaves it after an instruction the
+    /// VMM finished ([`super::exit::shadow_after`]): a WHP call only when
+    /// the exit had a shadow (the instruction right after STI or MOV SS) or
+    /// the instruction loads SS, so that an interrupt requested meanwhile
+    /// is taken at the next entry, before the next instruction.
+    fn end_shadow(&self, vpctx: &whv::WHV_VP_EXIT_CONTEXT, loads_ss: bool) -> Result<()> {
+        // SAFETY: the 16-bit view of the execution state's bit fields.
+        let had = unsafe { vpctx.ExecutionState.AsUINT16 } >> 12 & 1 == 1;
+        let Some(shadow) = super::exit::shadow_after(had, loads_ss) else {
+            return Ok(());
+        };
+        let (part, vp) = (self.part(), self.vp());
+        let state = super::ffi::as_u64(&super::ffi::get_register(part, vp, whv::WHvRegisterInterruptState)?);
+        super::ffi::set_register(part, vp, whv::WHvRegisterInterruptState, super::ffi::reg64((state & !1) | u64::from(shadow)))
+    }
+
     /// Emulates the MMIO instruction of an exit (`vpctx`, `mem`), its device
     /// reads before `reads` answered with their data. Returns the exit to
     /// report to Firecracker, or `None` if the instruction finished with
@@ -1770,7 +1793,16 @@ impl VcpuFd {
                 emulate::Outcome::Read { addr, len, .. } => super::exit::Emulated::Read { addr, len },
                 emulate::Outcome::Write { .. } => super::exit::Emulated::Write,
             };
-            match super::exit::mmio_step(ended, reads.len()) {
+            let step = super::exit::mmio_step(ended, reads.len());
+            if matches!(step, super::exit::MmioStep::Done | super::exit::MmioStep::Write) {
+                // The instruction is finished: its shadow, as KVM's
+                // emulator leaves it.
+                let bytes = &mem.InstructionBytes[..usize::from(mem.InstructionByteCount).min(16)];
+                // SAFETY: plain 16-bit views of the exit context's bit fields.
+                let (state, cs) = unsafe { (vpctx.ExecutionState.AsUINT16, vpctx.Cs.Anonymous.Attributes) };
+                self.end_shadow(vpctx, super::exit::loads_ss(bytes, super::exit::long_mode_code(state, cs)))?;
+            }
+            match step {
                 super::exit::MmioStep::Done => {
                     self.shared.device_writes.lock().unwrap().append(&mut more);
                     return Ok(None);
@@ -4371,7 +4403,14 @@ mod fpu_tests {
     ///   taken after the instruction, with its data: the handler's `out`
     ///   has the device's byte in AL, and the program goes on after it,
     ///   with no second read (before, the instruction re-executed in the
-    ///   guest and the data went to whichever device read came first);
+    ///   guest and the data went to whichever device read came first). The
+    ///   read is the instruction right after STI, in its interrupt shadow,
+    ///   which ends with the instruction as KVM ends it (`end_shadow`; on
+    ///   kit f35e353 the shadow was left and the interrupt came one
+    ///   instruction late, after the `out 0x80`);
+    /// - likewise an interrupt pending when STI runs, with a CPUID (which
+    ///   the run finishes) or an OUT (which the run returns) in STI's
+    ///   shadow: taken right after it, before the `out 0x80`;
     /// - MOVSD from a device to a device: one read, then one write of the
     ///   read's bytes, RSI and RDI past them (the instruction finishes in
     ///   the host from the read's exit and its write is the next exit).
@@ -4424,6 +4463,43 @@ mod fpu_tests {
         drop(vm);
         // SAFETY: as above.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+
+        // An interrupt requested while interrupts are off, then STI and an
+        // instruction the VMM finishes, in STI's shadow: a CPUID (finished
+        // within the run), an OUT (finished before the run returns it).
+        // KVM ends the shadow with the instruction (`skip_emulated_instruction`),
+        // so the interrupt is taken before the next instruction, OUT 0x80.
+        for (name, finished) in [("CPUID", vec![0x0F, 0xA2]), ("OUT 0x82", vec![0xE6, 0x82])] {
+            let program = [
+                APIC_ON[..APIC_ON.len() - 1].to_vec(), // the APIC on, interrupts still off
+                vec![0xE6, 0x83],                      // out 0x83: the test requests the interrupt
+                vec![0xFB],                            // sti
+                finished,
+                vec![0xE6, PORT as u8, 0xF4, 0xEB, 0xFD],
+            ]
+            .concat();
+            let (vm, mut vcpu, m) = mmio_guest(&program);
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let mut reads = 0;
+            let mut exits = vec![one_run(&mut vcpu, &data, &mut reads)];
+            vcpu.shared.inner.inject_msi(0xFEE0_0000, MMIO_VECTOR as u32);
+            while exits.len() < 5 && !exits.last().unwrap().starts_with("out 0x80") {
+                exits.push(one_run(&mut vcpu, &data, &mut reads));
+            }
+            drop(watchdog);
+            eprintln!("MMIOTEST an interrupt pending at STI, then {name} in its shadow: {exits:?}");
+            let expected: Vec<&str> = if name == "CPUID" {
+                vec!["out 0x83", "out 0x81", "out 0x80"]
+            } else {
+                vec!["out 0x83", "out 0x82", "out 0x81", "out 0x80"]
+            };
+            let ports: Vec<&str> = exits.iter().map(|e| &e[..e.find(" [").unwrap_or(e.len())]).collect();
+            assert_eq!(ports, expected, "{name} in STI's shadow");
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: as above.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
 
         // MOVSD from a device to a device.
         let program = [
