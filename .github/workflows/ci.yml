@@ -620,7 +620,7 @@ jobs:
           # upstream's pin (tools/devctr/poetry.lock)
           python -m pip install --quiet psutil==6.1.1
           python -I tools/windows/integration/selftest.py
-          python -m py_compile tools/windows/integration/*.py
+          python -m py_compile tools/windows/integration/*.py tools/windows/integration/netns_site/*.py
           python -m py_compile tools/windows/vmm-memory-record.py
           python -I tools/windows/vmm-memory-record.py --selftest
       # aws-lc-sys assembles its x86_64 code with NASM in release builds

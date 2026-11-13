@@ -23,6 +23,7 @@ import os
 import pathlib
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -79,12 +80,16 @@ class Guest:
         self.conn = None
         self.frames = []
         self.cond = threading.Condition()
+        # Set: the guest takes no frame (a VMM that does not read).
+        self.hold = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         self.conn, _ = self.listener.accept()
         buf = b""
         while True:
+            while self.hold.is_set():
+                time.sleep(0.01)
             try:
                 data = self.conn.recv(65536)
             except OSError:  # the host side closed the endpoint (cleanup)
@@ -127,6 +132,145 @@ def tcp_segment(src, dst, sport, dport, seq, ack, flags, payload=b""):
     pseudo = struct.pack("!4s4sBBH", src.packed, dst.packed, 0, 6, len(tcp) + len(payload))
     c = net._csum(pseudo + tcp + payload)  # pylint: disable=protected-access
     return tcp[:16] + struct.pack("!H", c) + tcp[18:] + payload
+
+
+def udp_datagram(src, dst, sport, dport, payload):
+    udp = struct.pack("!HHHH", sport, dport, 8 + len(payload), 0)
+    pseudo = struct.pack("!4s4sBBH", src.packed, dst.packed, 0, 17, 8 + len(payload))
+    c = net._csum(pseudo + udp + payload) or 0xFFFF  # pylint: disable=protected-access
+    return udp[:6] + struct.pack("!H", c) + payload
+
+
+def network_programs(tmp, ns, g, host, guest, host_mac):
+    """What a host program in the network needs (upstream's test_tap_offload,
+    test_high_ingress_traffic, test_net_change_mac_address): UDP to the
+    guest, the guest's connections to a program on the host, a transmit
+    queue that drops, and the door a program reaches them through."""
+    iface = ns.taps["tap0"]._iface  # pylint: disable=protected-access
+    eth = host_mac + Guest.MAC + b"\x08\x00"
+
+    def is_udp_to(port):
+        return lambda f: f[12:14] == b"\x08\x00" and f[23] == 17 and f[36:38] == struct.pack("!H", port)
+
+    # UDP through a forward, and the guest's answer.
+    uport = ns.forward_udp(str(guest), 81)
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.settimeout(5)
+    u.sendto(b"x", ("127.0.0.1", uport))
+    d = g.wait(is_udp_to(81))
+    check(d is not None and d[42:] == b"x" and d[26:30] == host.packed, "network: a datagram to a UDP forward reaches the guest from the host's address")
+    if d is None:
+        return
+    pseudo = struct.pack("!4s4sBBH", host.packed, guest.packed, 0, 17, len(d) - 34)
+    check(net._csum(pseudo + d[34:]) == 0, "network: its UDP checksum is right")  # pylint: disable=protected-access
+    hport, = struct.unpack("!H", d[34:36])
+    g.send(eth + ip_packet(guest, host, 17, udp_datagram(guest, host, 81, hport, b"pong")))
+    try:
+        answer = u.recvfrom(100)[0]
+    except OSError as e:
+        answer = e
+    check(answer == b"pong", f"network: the guest's answer reaches the forward's sender: {answer!r}")
+    # A datagram longer than the MTU leaves in fragments.
+    u.sendto(b"z" * 3000, ("127.0.0.1", uport))
+    parts = [g.wait(lambda f: f[12:14] == b"\x08\x00" and f[23] == 17 and f[26:30] == host.packed) for _ in range(3)]
+    ok = all(p is not None for p in parts)
+    flags = [struct.unpack("!H", p[20:22])[0] for p in parts] if ok else []
+    check(ok and flags == [0x2000, 0x2000 | 185, 370] and sum(len(p) - 34 for p in parts) == 3008,
+          f"network: a 3000-byte datagram is three fragments: {[hex(x) for x in flags]}")
+    # UDP to a port of the host's nobody has: ICMP port unreachable.
+    g.send(eth + ip_packet(guest, host, 17, udp_datagram(guest, host, 4000, 9, b"?")))
+    r = g.wait(lambda f: f[12:14] == b"\x08\x00" and f[23] == 1 and f[34] == 3)
+    check(r is not None and r[35] == 3, "network: UDP to a closed port of the host is answered with port unreachable")
+
+    def connect_from_guest(port, gport, payload):
+        """The guest opens a connection to host:port and sends `payload`;
+        the SYN's answer."""
+        g.send(eth + ip_packet(guest, host, 6, tcp_segment(guest, host, gport, port, 5000, 0, 0x02)))
+        answer = g.wait(lambda f: f[23] == 6 and f[36:38] == struct.pack("!H", gport) and f[47] & 0x16)
+        if answer is not None and answer[47] == 0x12:
+            hseq, = struct.unpack("!I", answer[38:42])
+            g.send(eth + ip_packet(guest, host, 6, tcp_segment(guest, host, gport, port, 5001, hseq + 1, 0x18, payload)))
+        return answer
+
+    # A port of the host's that a program listens on, and one nobody does.
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    srv.settimeout(5)
+    iface.listeners[4444] = ("127.0.0.1", srv.getsockname()[1])
+    answer = connect_from_guest(4444, 40000, b"from guest")
+    check(answer is not None and answer[47] == 0x12, "network: the guest's SYN to a listened port gets SYN|ACK")
+    try:
+        conn, _ = srv.accept()
+        conn.settimeout(5)
+        got = conn.recv(100)
+        conn.sendall(b"to guest")
+    except OSError as e:
+        got = e
+    check(got == b"from guest", f"network: the guest's bytes reach the program that listens: {got!r}")
+    data = g.wait(lambda f: f[23] == 6 and f[54:] == b"to guest")
+    check(data is not None, "network: the program's bytes reach the guest")
+    answer = connect_from_guest(4445, 40001, b"")
+    check(answer is not None and answer[47] & 0x04, "network: the guest's SYN to a port nobody listens on gets a reset")
+
+    # A program in the network: Python with the door's sockets.
+    env = dict(os.environ, WICK_NETNS_DOOR=ns.door_path.read_text(encoding="ascii"),
+               PYTHONPATH=os.path.join(os.path.dirname(os.path.abspath(__file__)), "netns_site"))
+    # upstream's host_tools/udp_offload.py: UDP_SEGMENT, then a datagram.
+    code = ("import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+            "s.setsockopt(17, 103, 1400)\ns.sendto(b'y' * 3000, ('192.168.0.2', 82))\n")
+    done = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60, check=False)
+    sizes = [len(f) - 42 for f in (g.wait(is_udp_to(82)) for _ in range(3)) if f is not None]
+    check(done.returncode == 0 and sizes == [1400, 1400, 200],
+          f"network: a program's UDP_SEGMENT datagram reaches the guest in segments: {sizes} {done.stderr.strip()}")
+    # upstream's test_net_config_space.py server: bound to the host's address.
+    code = ("import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.bind(('192.168.0.1', 4446))\n"
+            "s.listen(1)\nprint('listening', flush=True)\nc, _ = s.accept()\nprint(c.recv(100).decode(), flush=True)\n")
+    with subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True) as prog:
+        first = prog.stdout.readline()
+        answer = connect_from_guest(4446, 40002, b"hi host") if first == "listening\n" else None
+        second = prog.stdout.readline() if answer is not None and answer[47] == 0x12 else ""
+        try:
+            prog.wait(10)
+        except subprocess.TimeoutExpired:
+            prog.kill()
+        check(first == "listening\n" and second == "hi host\n",
+              f"network: a program bound to the host's address takes the guest's connection: {first!r} {second!r} {prog.stderr.read().strip()}")
+    deadline = time.time() + 5
+    while 4446 in iface.listeners and time.time() < deadline:
+        time.sleep(0.05)
+    check(4446 not in iface.listeners, "network: what a program listened on ends with the program")
+    # iperf3's arguments through a forward for TCP and UDP.
+    both = ns.forward_both(str(guest), 5201)
+    args = hosttools.iperf3_args(["-c", "192.168.0.2", "-u", "-V", "-b", "1000000000", "-t", "30"],
+                                 lambda ip, port: both if (ip, port) == ("192.168.0.2", 5201) else 0)
+    check(args == ["-c", "127.0.0.1", "-u", "-V", "-b", "1000000000", "-t", "30", "-p", str(both)], f"iperf3's arguments: {args}")
+    u.sendto(b"i", ("127.0.0.1", both))
+    check(g.wait(is_udp_to(5201)) is not None, "network: one port number leads to the guest's for UDP (and TCP)")
+
+    # A transmit queue of 5 and a guest that takes nothing: frames are
+    # dropped, and the interface works when the guest reads again.
+    ns.taps["tap0"].set_tx_queue_len(5)
+    g.hold.set()
+    # Straight from the stack, 5.6 MB: more than the endpoint's socket
+    # holds, and nothing is left in a socket of the test's afterwards.
+    for _ in range(4000):
+        iface.send_udp(guest, 30000, 81, b"q" * 1400)
+    check(iface.tx_dropped > 0 and len(iface.tx_queue) <= 5,
+          f"network: a full transmit queue drops ({iface.tx_dropped} dropped, {len(iface.tx_queue)} queued)")
+    g.hold.clear()
+    deadline = time.time() + 10
+    while iface.tx_queue and time.time() < deadline:
+        time.sleep(0.05)
+    check(not iface.tx_queue, "network: the queue empties once the guest reads")
+    echo = b"\x08\x00\x00\x00\x12\x35\x00\x01" + b"wick"
+    echo = echo[:2] + struct.pack("!H", net._csum(echo)) + echo[4:]  # pylint: disable=protected-access
+    g.send(eth + ip_packet(guest, host, 1, echo))
+    reply = g.wait(lambda f: f[12:14] == b"\x08\x00" and f[23] == 1 and f[34] == 0 and f[38:40] == b"\x12\x35")
+    check(reply is not None, "network: the interface answers after its queue was full")
+    u.close()
+    srv.close()
 
 
 def network(tmp):
@@ -174,7 +318,9 @@ def network(tmp):
     client.close()
     fin = g.wait(lambda f: f[23] == 6 and f[47] & 0x01)
     check(fin is not None, "network: closing the forward sends a FIN")
+    network_programs(tmp, ns, g, host, guest, host_mac)
     ns.cleanup()
+    check(not ns.door_path.exists(), "network: the door goes with the network")
 
 
 def host_tools():

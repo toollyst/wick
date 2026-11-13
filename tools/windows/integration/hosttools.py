@@ -246,7 +246,88 @@ def screen(args):
     return child.wait()
 
 
-TOOLS = ("ps", "pgrep", "pidof", "dmesg", "socat", *E2FSPROGS)
+def iperf3_args(args, forward):
+    """iperf3's arguments with its server, an address in a network, replaced
+    by the forward for it: `-c <guest>` becomes `-c 127.0.0.1 -p <port>`,
+    `forward(guest, port)` giving the port on 127.0.0.1 that leads to the
+    guest's port (`-p`, or iperf3's 5201) for TCP and UDP both."""
+    args = list(args)
+    if "-c" not in args or args.index("-c") + 1 >= len(args):
+        raise ValueError("iperf3 in a network: only a client (-c <address>) is run through a forward")
+    port = 5201
+    if "-p" in args:
+        i = args.index("-p")
+        port = int(args[i + 1])
+        del args[i : i + 2]
+    at = args.index("-c") + 1
+    local = forward(args[at], port)
+    args[at] = "127.0.0.1"
+    return args + ["-p", str(local)]
+
+
+def _door(netns, request):
+    """One request to a network's door (wick_windows_net.py)."""
+    import json  # pylint: disable=import-outside-toplevel
+    import socket  # pylint: disable=import-outside-toplevel
+
+    path = pathlib.Path(os.environ["WICK_IT_ROOT"]) / "netns" / (netns + ".door")
+    with socket.create_connection(("127.0.0.1", int(path.read_text(encoding="ascii"))), timeout=30) as conn:
+        conn.sendall((json.dumps(request) + "\n").encode())
+        reply = json.loads(conn.makefile("r", encoding="utf-8").readline())
+    if "error" in reply:
+        raise OSError(f"network {netns}: {reply['error']}")
+    return reply
+
+
+def ip(args):
+    """`ip netns exec <ns> <program> ...`: Linux runs the program in the
+    network namespace. A Windows network is a directory of endpoints with
+    its stack in the test session's process, so the program runs on the
+    host and reaches the network through its door:
+
+    - `python3`: this Python, its sockets asking the door
+      (netns_site/sitecustomize.py);
+    - `iperf3 -c <guest>`: the host's iperf3.exe, sent to the forward for
+      the guest's port.
+
+    Any other program, and any other `ip` command, is refused: there is no
+    namespace to run it in and no link to configure."""
+    import shutil  # pylint: disable=import-outside-toplevel
+
+    if args[:2] != ["netns", "exec"] or len(args) < 4:
+        print(f"ip {' '.join(args)}: on Windows only `ip netns exec <network> python3|iperf3 ...` is run "
+              "(tools/windows/integration/hosttools.py)", file=sys.stderr)
+        return 1
+    netns, program, rest = args[2], args[3], args[4:]
+    door = pathlib.Path(os.environ["WICK_IT_ROOT"]) / "netns" / (netns + ".door")
+    if not door.exists():
+        print(f"ip netns exec {netns}: no such network in this session ({door})", file=sys.stderr)
+        return 1
+    if program in ("python3", "python"):
+        env = dict(os.environ)
+        site = str(pathlib.Path(__file__).resolve().parent / "netns_site")
+        env["PYTHONPATH"] = site + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env["WICK_NETNS_DOOR"] = door.read_text(encoding="ascii")
+        return subprocess.call([sys.executable, *rest], env=env)
+    if program == "iperf3":
+        exe = shutil.which("iperf3")
+        if exe is None:
+            print("ip netns exec: iperf3 is not on PATH: the test sends its traffic with the host's iperf3 "
+                  "(tools/windows/README.md, the integration tests' needs)", file=sys.stderr)
+            return 127
+        try:
+            rest = iperf3_args(rest, lambda guest, port: _door(
+                netns, {"op": "forward", "proto": "both", "ip": guest, "port": port})["port"])
+        except (ValueError, OSError) as e:
+            print(f"ip netns exec {netns} iperf3: {e}", file=sys.stderr)
+            return 1
+        return subprocess.call([exe, *rest])
+    print(f"ip netns exec {netns} {program}: a Windows network is a directory of endpoints, and only python3 "
+          "and iperf3 are run through its door (tools/windows/integration/hosttools.py)", file=sys.stderr)
+    return 1
+
+
+TOOLS = ("ps", "pgrep", "pidof", "dmesg", "socat", "ip", *E2FSPROGS)
 
 # Cargo: upstream's tests that build Firecracker themselves (test_fuzzing,
 # test_gdb, test_instrumented_firecracker) build for Linux's musl target.
@@ -281,7 +362,7 @@ def main():
     if tool in E2FSPROGS:
         return e2fsprogs(tool, args)
     return {"ps": ps, "pgrep": pgrep, "pidof": pidof, "dmesg": dmesg, "socat": socat,
-            "procstatus": procstatus, "screen": screen}[tool](args)
+            "procstatus": procstatus, "screen": screen, "ip": ip}[tool](args)
 
 
 if __name__ == "__main__":

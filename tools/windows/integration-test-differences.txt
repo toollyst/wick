@@ -196,11 +196,15 @@ bug integration_tests/functional/test_instrumented_firecracker.py::test_log_inst
 # A host program in the test's network: udp_offload.py sending UDP (with
 # UDP_SEGMENT) to the guest, iperf3 sending UDP to it, a TCP server the guest
 # connects to. A Windows network is a directory of endpoints (docs/PORTING.md
-# row 6); the harness's host side (wick_windows_net.py) answers ARP and ICMP
-# and carries TCP connections the host opens to the guest, and nothing else
-# yet. To do: UDP from a host program to the guest, a forward from the
-# network's host address to a program on the host, and a TAP's transmit
-# queue length as the endpoint's socket buffer.
+# row 6), so the program runs on the host and reaches the network through
+# the door of the harness's host side (wick_windows_net.py; hosttools.py's
+# `ip netns exec`; netns_site/sitecustomize.py for a Python program's
+# sockets): UDP to the guest, the guest's connections to a port a program
+# listens on at the host's address, one port for iperf3's TCP and UDP, and a
+# queue of frames for the guest of the TAP's length that drops when full.
+# selftest.py checks each against a stand-in for the guest, on CI. The three
+# tests themselves have not run since (they need WHP, and iperf3.exe on the
+# host for the second): listed until one run has them.
 bug integration_tests/functional/test_net.py::test_tap_offload
 bug integration_tests/functional/test_net.py::test_high_ingress_traffic
 bug integration_tests/functional/test_net_config_space.py::test_net_change_mac_address

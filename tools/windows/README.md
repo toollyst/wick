@@ -250,6 +250,8 @@ checkout with the release build, not the kit, and:
   `integration\setup-artifacts.ps1` (needs WSL with squashfs-tools and
   e2fsprogs);
 - Git for Windows's bash (or its path in `WICK_IT_BASH`);
+- for `test_high_ingress_traffic`, an `iperf3.exe` on `PATH` (the test sends
+  its traffic with the host's iperf3; without one the test fails saying so);
 - rustup's Rust, its `cargo` first on `PATH` (a cargo from elsewhere, such as
   Chocolatey's, fails with "can't find crate for core"), and Visual Studio's
   C++ build tools: `test_fuzzing.py`, `test_gdb.py` and
