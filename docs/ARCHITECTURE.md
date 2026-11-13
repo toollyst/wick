@@ -117,7 +117,9 @@ firecracker binary, vmm   (upstream source + patches/)
    would otherwise keep the old pages.
 5. **wick features go through the extension point.** Upstream calls `vmm::ext`
    from a few fixed places, and `wick-ext` implements the features
-   (`PUT /extensions/{name}`, the config file's `extensions` section).
+   (`PUT /extensions/{name}`, the config file's `extensions` section). It has
+   none yet: every extension request is refused as unknown and nothing is
+   attached at boot (`crates/ext`, `test_unknown_extension_is_rejected`).
 6. **No pretending.** If a host lacks a facility, wick builds the same
    semantics itself: io_uring → worker-thread queues, seccomp-BPF → Seatbelt,
    SSBD → `PSTATE.SSBS`, holes APFS fills → restored with `F_PUNCHHOLE`, TAP →
