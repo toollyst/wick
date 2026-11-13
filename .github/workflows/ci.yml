@@ -897,7 +897,11 @@ jobs:
           # it (TOOLTEST lines), with the test of how it reads its arguments.
           out=$("$RUNNER_TEMP/jail-parent-test.exe" --include-ignored --nocapture --test-threads=1 2>&1) || true
           printf '%s\n' "$out"
-          if ! grep -q "test result: ok. 2 passed" <<<"$out"; then
+          # Every test of the binary must pass (it holds the shared value
+          # tests too, so their number is not fixed here), and the test
+          # against real jobs must have printed its lines.
+          if ! grep -Eq "test result: ok\. [1-9][0-9]* passed; 0 failed" <<<"$out" \
+              || ! grep -q "^TOOLTEST " <<<"$out"; then
             echo "::error::jail-parent's tests did not pass"
             failed=1
           fi
