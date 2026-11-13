@@ -1462,7 +1462,10 @@ mod tests {
     fn test_an_irqfd_write_of_another_process_is_raised_by_the_irqfd_thread() {
         // A handle made from the descriptor, as another process (a
         // vhost-user backend) has it, counts its writes in the descriptor:
-        // the irqfd thread raises them.
+        // the irqfd thread raises them, a thread hand-off after the write
+        // where KVM's irqfd_wakeup raises any writer's inline (the kernel's
+        // eventfd is one object for every process). Prints how long the
+        // SPI took to be pending after each kind of write.
         with_created_vcpu(&[41], |vm| {
             let evt = EventFd::new(EFD_NONBLOCK).unwrap();
             vm.register_irqfd(&evt, 9).unwrap();
@@ -1474,7 +1477,37 @@ mod tests {
                 "the irqfd thread did not raise another process's write in 10 s"
             );
             assert!(within(Duration::from_secs(10), || evt.read().is_err()), "the count was not taken");
+            let clear = || {
+                // SAFETY: plain call; GICD_ICPENDR1 is write-1-to-clear.
+                check(unsafe { hv_gic_set_distributor_reg(0x284, 1 << (41 - 32)) }).unwrap();
+                assert!(!spi_pending(41));
+            };
+            let us = |writer: &EventFd| {
+                let mut v: Vec<u128> = (0..200)
+                    .map(|_| {
+                        clear();
+                        let t = Instant::now();
+                        writer.write(1).unwrap();
+                        assert!(within(Duration::from_secs(10), || spi_pending(41)));
+                        t.elapsed().as_micros()
+                    })
+                    .collect();
+                v.sort_unstable();
+                (v[v.len() / 2], v[v.len() * 9 / 10], v[v.len() - 1])
+            };
+            let (inline, handed) = (us(&evt), us(&other));
+            eprintln!(
+                "write to pending, 200 each (median, 90th, max us): this process {inline:?}, another process's handle {handed:?}; load {:.1}",
+                load()
+            );
         });
+    }
+
+    fn load() -> f64 {
+        let mut avg = [0f64; 1];
+        // SAFETY: one double written.
+        unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
+        avg[0]
     }
 
     #[test]
