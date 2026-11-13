@@ -100,9 +100,9 @@ pub fn cpu_rate(quota: u64, period: u64, cpus: u64) -> Result<u32, &'static str>
 //   the least limit along the path holds, and no limit is refused for being
 //   above its parent's. A nested job is held by each job above it the same
 //   way (Microsoft Learn, "Nested Jobs"): nothing is computed;
-// - the CPU quota and the cpuset: [`rate_under_parent`], [`cpus_under_parent`],
-//   against what the levels above come to ([`rate_of_levels`],
-//   [`cpus_of_levels`]).
+// - the CPU quota and the cpuset: [`rate_under_levels`], [`cpus_under_parent`],
+//   against what the levels above come to (exactly, for the rate:
+//   [`exact_rate`]; [`cpus_of_levels`]).
 
 /// The private namespace of the parent cgroups' jobs: its name, which is
 /// also the name of its boundary. The boundary holds the account's SID and
@@ -155,21 +155,50 @@ pub fn parent_job_names(parent: &str) -> Result<Vec<String>, &'static str> {
     Ok(names)
 }
 
+/// Why a share under a parent cannot be computed: the levels' caps make a
+/// fraction whose terms do not fit in 128 bits. Eight capped levels never
+/// do (a share's largest term is 10000 to the ninth power, below 2^128);
+/// more can, when their caps share no factor with 10000.
+pub const RATE_TOO_DEEP: &str = "CPU caps on more levels above than the share under them can be computed exactly for";
+
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// What the levels of a parent come to, exactly, from each level's own
+/// hard cap, the top first (`None`: a level without one): `num / den`
+/// hundredths of a percent of the host's processors, in lowest terms;
+/// `None` when no level has a cap. A job's rate is a share of what the
+/// job above it has, so the levels multiply: a level of 4166 under one of
+/// 6000 comes to 2499.6, which neither 2499 nor 2500 is.
+fn exact_rate(caps: &[Option<u32>]) -> Result<Option<(u128, u128)>, &'static str> {
+    let mut rate: Option<(u128, u128)> = None;
+    for &cap in caps.iter().flatten() {
+        let (num, den) = match rate {
+            None => (u128::from(cap), 1),
+            Some((num, den)) => (
+                num.checked_mul(u128::from(cap)).ok_or(RATE_TOO_DEEP)?,
+                den.checked_mul(10_000).ok_or(RATE_TOO_DEEP)?,
+            ),
+        };
+        let g = gcd(num, den).max(1);
+        rate = Some((num / g, den / g));
+    }
+    Ok(rate)
+}
+
 /// The CPU rate, of the host's processors, that the levels of a parent come
 /// to, from each level's own hard cap, the top first (`None`: a level
-/// without one). A job's rate is a share of what the job above it has, so
-/// the levels multiply; on Linux it is the cgroup's `hierarchical_quota`
+/// without one): the product of the shares ([`exact_rate`]), rounded down
+/// once; on Linux it is the cgroup's `hierarchical_quota`
 /// (kernel/sched/core.c, `tg_cfs_schedulable_down`). `None` when no level
-/// has a cap. Rounded down and never 0.
-pub fn rate_of_levels(caps: &[Option<u32>]) -> Option<u32> {
-    let mut rate: Option<u64> = None;
-    for &cap in caps.iter().flatten() {
-        rate = Some(match rate {
-            None => u64::from(cap),
-            Some(above) => (above * u64::from(cap) / 10_000).max(1),
-        });
-    }
-    rate.map(|rate| u32::try_from(rate.min(10_000)).unwrap())
+/// has a cap. What a job below is given is computed against the exact
+/// product ([`rate_under_levels`]), not against this.
+pub fn rate_of_levels(caps: &[Option<u32>]) -> Result<Option<u32>, &'static str> {
+    Ok(exact_rate(caps)?.map(|(num, den)| u32::try_from((num / den).min(10_000)).unwrap()))
 }
 
 /// The processors the levels of a parent come to, from each level's own
@@ -241,13 +270,33 @@ pub const RATE_ABOVE_PARENT: &str = "a CPU quota above the parent cgroup's (cgro
 /// rate given to the job is the jail's share of the parent's, rounded down
 /// and never 0.
 pub fn rate_under_parent(version: u8, asked: u32, parent: u32) -> Result<u32, &'static str> {
-    if parent == 0 {
+    rate_under_levels(version, asked, &[Some(parent)])
+}
+
+/// [`rate_under_parent`] under the levels whose hard caps are `caps`, the
+/// top first (`None`: a level without one): `asked` itself when no level
+/// has a cap. The share is that of what the levels come to exactly
+/// ([`exact_rate`]), rounded down: the most a nested job can be given
+/// without the product of the shares down to it going above `asked`.
+/// Against the levels' product rounded down first (2499 for 2499.6) the
+/// share came out above it (1250 of the host gave 5002 of 2499, which is
+/// 1250.3 of the host under 6000 and 4166; CI run 43403250054, jail-parent's
+/// `test_a_write_to_a_level_reaches_the_processes_running_below`).
+///
+/// cgroup v1's refusal compares `asked` with the parent's quota, which the
+/// levels' product is within one hundredth of a percent below when each
+/// level was given its share by this rule: so a quota is above the
+/// parent's when it is above the product rounded up.
+pub fn rate_under_levels(version: u8, asked: u32, caps: &[Option<u32>]) -> Result<u32, &'static str> {
+    let Some((num, den)) = exact_rate(caps)? else { return Ok(asked) };
+    if num == 0 {
         return Err("a parent cgroup with a CPU rate of 0");
     }
-    if version == 1 && asked > parent {
+    let asked_den = u128::from(asked).checked_mul(den).ok_or(RATE_TOO_DEEP)?;
+    if version == 1 && asked_den - den >= num {
         return Err(RATE_ABOVE_PARENT);
     }
-    let share = u64::from(asked.min(parent)) * 10_000 / u64::from(parent);
+    let share = if asked_den >= num { 10_000 } else { asked_den.checked_mul(10_000).ok_or(RATE_TOO_DEEP)? / num };
     Ok(u32::try_from(share.clamp(1, 10_000)).unwrap())
 }
 
@@ -339,6 +388,15 @@ pub struct Held {
     pub cpus: Option<Vec<(u16, u64)>>,
 }
 
+/// What the levels above a job come to: the hard cap of each, the top
+/// first (`None`: a level without one), whose product is taken exactly
+/// ([`rate_under_levels`]), and their processors (`cpus_of_levels`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Above {
+    pub caps: Vec<Option<u32>>,
+    pub cpus: Option<Vec<(u16, u64)>>,
+}
+
 /// A job below the level that is written: its name, what it was asked for
 /// and what it holds now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,8 +434,8 @@ fn cpus_union(a: &[(u16, u64)], b: &[(u16, u64)]) -> Vec<(u16, u64)> {
 /// The writes that give the level `name` what it is now asked for and every
 /// job below it what Linux would give it then, in an order in which no job
 /// has, at any moment, more than Linux gave it before or gives it after.
-/// `above`: what the levels above come to (`rate_of_levels`,
-/// `cpus_of_levels`). `now`: what the level's job holds.
+/// `above`: what the levels above come to. `now`: what the level's job
+/// holds.
 ///
 /// What each job is to hold is worked out from the top down, each against
 /// what the jobs above it come to, by the rule of its own cgroup version
@@ -410,7 +468,7 @@ fn cpus_union(a: &[(u16, u64)], b: &[(u16, u64)]) -> Vec<(u16, u64)> {
 /// A set that only narrows, or only widens, is never wider than Linux gave
 /// before or gives after; one that moves has both for the time between the
 /// two passes, and never a processor that is in neither.
-pub fn rewrite(above: &Held, name: &str, asked: &Asked, now: &Held, below: &[Below]) -> Result<(Vec<Step>, Vec<Held>), String> {
+pub fn rewrite(above: &Above, name: &str, asked: &Asked, now: &Held, below: &[Below]) -> Result<(Vec<Step>, Vec<Held>), String> {
     // The jobs, the level first, each after the job above it.
     let mut jobs: Vec<(&str, &Asked, &Held)> = vec![(name, asked, now)];
     jobs.extend(below.iter().map(|b| (b.name.as_str(), &b.asked, &b.now)));
@@ -421,7 +479,7 @@ pub fn rewrite(above: &Held, name: &str, asked: &Asked, now: &Held, below: &[Bel
     }
     // What each job is to hold, and what it then comes to with those above.
     let mut held: Vec<Held> = vec![Held::default(); jobs.len()];
-    let mut comes_to: Vec<Held> = vec![Held::default(); jobs.len()];
+    let mut comes_to: Vec<Above> = vec![Above::default(); jobs.len()];
     for &i in &order {
         let (job, asked, _) = jobs[i];
         let up = if i == 0 {
@@ -434,17 +492,18 @@ pub fn rewrite(above: &Held, name: &str, asked: &Asked, now: &Held, below: &[Bel
         let refused = |why: &str| {
             if i == 0 { format!("{job}: {why}") } else { format!("{job}, below {name}: {why} (Linux fails the write to the level above)") }
         };
-        held[i].rate = match (asked.rate, up.rate) {
-            (None, _) => None,
-            (Some(rate), None) => Some(rate),
-            (Some(rate), Some(up)) => Some(rate_under_parent(asked.version, rate, up).map_err(&refused)?),
+        held[i].rate = match asked.rate {
+            None => None,
+            Some(rate) => Some(rate_under_levels(asked.version, rate, &up.caps).map_err(&refused)?),
         };
         held[i].cpus = match (&asked.cpus, &up.cpus) {
             (None, _) => None,
             (Some(cpus), None) => Some(cpus.clone()),
             (Some(cpus), Some(up)) => Some(cpus_under_parent(asked.version, cpus, up).map_err(&refused)?),
         };
-        comes_to[i] = Held { rate: rate_of_levels(&[up.rate, held[i].rate]), cpus: held[i].cpus.clone().or(up.cpus) };
+        let mut caps = up.caps;
+        caps.push(held[i].rate);
+        comes_to[i] = Above { caps, cpus: held[i].cpus.clone().or(up.cpus) };
     }
     // What each job holds as the writes go.
     let same = |a: &Option<Vec<(u16, u64)>>, b: &Option<Vec<(u16, u64)>>| a.as_ref().map(|c| cpus_union(c, &[])) == b.as_ref().map(|c| cpus_union(c, &[]));
@@ -532,20 +591,38 @@ mod tests {
     // the one above), the processors narrow.
     #[test]
     fn test_levels_come_to_linuxs_hierarchical_values() {
-        assert_eq!(rate_of_levels(&[]), None);
-        assert_eq!(rate_of_levels(&[None, None]), None);
-        assert_eq!(rate_of_levels(&[Some(5000)]), Some(5000));
+        assert_eq!(rate_of_levels(&[]), Ok(None));
+        assert_eq!(rate_of_levels(&[None, None]), Ok(None));
+        assert_eq!(rate_of_levels(&[Some(5000)]), Ok(Some(5000)));
         // Half the host, then half of that: a quarter of the host.
-        assert_eq!(rate_of_levels(&[Some(5000), Some(5000)]), Some(2500));
-        assert_eq!(rate_of_levels(&[None, Some(5000), None, Some(10_000)]), Some(5000));
-        assert_eq!(rate_of_levels(&[Some(1), Some(1)]), Some(1));
+        assert_eq!(rate_of_levels(&[Some(5000), Some(5000)]), Ok(Some(2500)));
+        assert_eq!(rate_of_levels(&[None, Some(5000), None, Some(10_000)]), Ok(Some(5000)));
+        // A hundredth of a percent of a hundredth: rounded down once.
+        assert_eq!(rate_of_levels(&[Some(1), Some(1)]), Ok(Some(0)));
         // A level asked for a quarter of the host under one of half is
         // given half of it (`rate_under_parent`), and the two come to the
         // quarter again: a jail under them is measured against that.
         let level = rate_under_parent(2, 2500, 5000).unwrap();
-        assert_eq!(rate_of_levels(&[Some(5000), Some(level)]), Some(2500));
-        assert_eq!(rate_under_parent(1, 1250, 2500).unwrap(), 5000);
-        assert_eq!(rate_under_parent(1, 5000, 2500).unwrap_err(), RATE_ABOVE_PARENT);
+        assert_eq!(rate_of_levels(&[Some(5000), Some(level)]), Ok(Some(2500)));
+        assert_eq!(rate_under_levels(1, 1250, &[Some(5000), Some(level)]).unwrap(), 5000);
+        assert_eq!(rate_under_levels(1, 5000, &[Some(5000), Some(level)]).unwrap_err(), RATE_ABOVE_PARENT);
+        assert_eq!(rate_under_levels(1, 1250, &[None, None]).unwrap(), 1250, "no level with a cap: the jail's own");
+        // Under 6000, a level asked for 2500 is given 4166, and the two
+        // come to 2499.6 of the host: a jail asked for 1250 is given 5000,
+        // which is 1249.8 of it; 5001 would be 1250.05. Rounded down
+        // first, the levels came to 2499 and the jail was given 5002, which
+        // is 1250.3 (CI run 43403250054).
+        let level = rate_under_parent(2, 2500, 6000).unwrap();
+        assert_eq!(level, 4166);
+        assert_eq!(rate_of_levels(&[Some(6000), Some(level)]), Ok(Some(2499)));
+        assert_eq!(rate_under_levels(2, 1250, &[Some(6000), Some(level)]).unwrap(), 5000);
+        assert_eq!(rate_under_parent(2, 1250, 2499).unwrap(), 5002);
+        // cgroup v1: the level's own 2500 is not above it, 2501 is.
+        assert_eq!(rate_under_levels(1, 2500, &[Some(6000), Some(level)]).unwrap(), 10_000);
+        assert_eq!(rate_under_levels(1, 2501, &[Some(6000), Some(level)]).unwrap_err(), RATE_ABOVE_PARENT);
+        // More levels than 128 bits hold the product of, without a common
+        // factor with 10000: refused, not rounded.
+        assert_eq!(rate_under_levels(2, 1, &[Some(9999); 10]).unwrap_err(), RATE_TOO_DEEP);
 
         assert_eq!(cpus_of_levels(&[]), None);
         assert_eq!(cpus_of_levels(&[None]), None);
@@ -626,6 +703,7 @@ mod tests {
     // (cgroup v2): the lowest quota, and the processors in common with
     // those above, or those above's.
     fn linux(above: &Held, name: &str, asked: &Asked, below: &[Below]) -> Vec<Held> {
+        // `above`: the levels above as Linux has them (their lowest quota).
         let mut names = vec![(name, asked)];
         names.extend(below.iter().map(|b| (b.name.as_str(), &b.asked)));
         names
@@ -649,9 +727,10 @@ mod tests {
             .collect()
     }
 
-    // What every job has while the jobs hold `held`: the product of the
-    // shares down to it, and its processors within those above.
-    fn windows(above: &Held, names: &[&str], held: &[Held]) -> Vec<Held> {
+    // What every job has while the jobs hold `held`: the shares down to it
+    // (their product, exactly: `exact_rate`), and its processors within
+    // those above.
+    fn windows(above: &Above, names: &[&str], held: &[Held]) -> Vec<Above> {
         names
             .iter()
             .map(|job| {
@@ -659,7 +738,7 @@ mod tests {
                 let mut path: Vec<usize> = (0..names.len()).filter(|&i| *job == names[i] || job.starts_with(&format!("{}/", names[i]))).collect();
                 path.sort_by_key(|&i| names[i].len());
                 for i in path {
-                    has.rate = rate_of_levels(&[has.rate, held[i].rate]);
+                    has.caps.push(held[i].rate);
                     if let Some(cpus) = &held[i].cpus {
                         if let Some(up) = &has.cpus {
                             assert_eq!(cpus_under_parent(1, cpus, up).as_deref(), Ok(cpus.as_slice()), "{job}: {cpus:x?} is not within the job above's {up:x?}");
@@ -680,11 +759,21 @@ mod tests {
         }
     }
 
+    // Whether shares whose product is `caps` come to at most `most`
+    // hundredths of a percent of the host, and to more than `least`.
+    fn at_most(caps: &[Option<u32>], most: u32) -> bool {
+        exact_rate(caps).unwrap().is_none_or(|(num, den)| num <= u128::from(most) * den)
+    }
+    fn above_least(caps: &[Option<u32>], least: u32) -> bool {
+        exact_rate(caps).unwrap().is_some_and(|(num, den)| num > u128::from(least) * den)
+    }
+
     // The order of the writes: at every write no job has more CPU than
-    // Linux gave it before or gives it after (a share is rounded down, so
-    // within a hundredth of a percent), nor a processor Linux gave it
+    // Linux gave it before or gives it after, nor a processor Linux gave it
     // neither before nor after, nor processors outside the job above's;
-    // and when the writes are done every job has what Linux gives it.
+    // and when the writes are done every job has what Linux gives it: its
+    // shares' product exactly at most Linux's quota and less than a
+    // hundredth of a percent below it (a share is rounded down).
     #[test]
     fn test_a_write_to_a_level_reaches_every_job_below_in_a_safe_order() {
         let job = |name: &str, rate, cpus: Option<u64>| Below {
@@ -713,13 +802,20 @@ mod tests {
             level(Some(10_000), Some(0b1110)),
             level(Some(3000), Some(0b1111)),
         ];
-        for above in [Held::default(), Held { rate: Some(6000), cpus: Some(vec![(0, 0b0111)]) }] {
+        // Above `t`: no level; a level of 6000; a level of 6000 with one
+        // given 4166 for 2500 under it (2499.6 of the host: Linux's 2500).
+        let three = Some(vec![(0, 0b0111)]);
+        for (above, up) in [
+            (Above::default(), Held::default()),
+            (Above { caps: vec![Some(6000)], cpus: three.clone() }, Held { rate: Some(6000), cpus: three.clone() }),
+            (Above { caps: vec![Some(6000), Some(4166)], cpus: three.clone() }, Held { rate: Some(2500), cpus: three.clone() }),
+        ] {
             // Made with the first setting, then written each other one.
             let mut asked = settings[0].clone();
             let (_, mut held) = rewrite(&above, "t", &asked, &Held::default(), &below).unwrap();
             for to in &settings {
-                let before = linux(&above, "t", &asked, &below);
-                let after = linux(&above, "t", to, &below);
+                let before = linux(&up, "t", &asked, &below);
+                let after = linux(&up, "t", to, &below);
                 let now: Vec<Below> = below.iter().zip(&held[1..]).map(|(b, now)| Below { now: now.clone(), ..b.clone() }).collect();
                 let (steps, last) = rewrite(&above, "t", to, &held[0], &now).unwrap();
                 for step in &steps {
@@ -732,16 +828,21 @@ mod tests {
                             (Some(a), Some(b)) => a.max(b),
                             _ => 10_000,
                         };
-                        assert!(has.rate.unwrap_or(10_000) <= most.max(1), "{}: {has:?} above {most} at {step:?}, to {to:?}", names[i]);
+                        assert!(at_most(&has.caps, most), "{}: {has:?} above {most} at {step:?}, to {to:?}", names[i]);
                         assert!(within(&has.cpus, &before[i].cpus, &after[i].cpus), "{}: {has:?} at {step:?}, to {to:?}", names[i]);
                     }
                 }
                 assert_eq!(held, last, "to {to:?}");
                 for (i, has) in windows(&above, &names, &held).iter().enumerate() {
                     assert_eq!(has.cpus, after[i].cpus, "{}: to {to:?}", names[i]);
-                    match (has.rate, after[i].rate) {
-                        (Some(has), Some(linux)) => assert!(has <= linux.max(1) && has + 4 >= linux, "{}: {has} for {linux}, to {to:?}", names[i]),
-                        (has, linux) => assert_eq!(has, linux, "{}: to {to:?}", names[i]),
+                    match after[i].rate {
+                        Some(linux) => assert!(
+                            at_most(&has.caps, linux) && above_least(&has.caps, linux - 1),
+                            "{}: {:?} for {linux}, to {to:?}",
+                            names[i],
+                            rate_of_levels(&has.caps)
+                        ),
+                        None => assert_eq!(exact_rate(&has.caps), Ok(None), "{}: to {to:?}", names[i]),
                     }
                 }
                 // The same setting again writes nothing.
@@ -764,17 +865,17 @@ mod tests {
         };
         let below = [v1("t//vm-1", Some(4000), 0b0011)];
         let level = |rate, mask| Asked { version: 1, rate, cpus: Some(vec![(0, mask)]) };
-        rewrite(&Held::default(), "t", &level(Some(5000), 0b0111), &Held::default(), &below).unwrap();
-        let quota = rewrite(&Held::default(), "t", &level(Some(3000), 0b0111), &Held::default(), &below).unwrap_err();
+        rewrite(&Above::default(), "t", &level(Some(5000), 0b0111), &Held::default(), &below).unwrap();
+        let quota = rewrite(&Above::default(), "t", &level(Some(3000), 0b0111), &Held::default(), &below).unwrap_err();
         assert!(quota.starts_with("t//vm-1, below t: ") && quota.contains(RATE_ABOVE_PARENT), "{quota}");
-        let cpus = rewrite(&Held::default(), "t", &level(Some(5000), 0b0001), &Held::default(), &below).unwrap_err();
+        let cpus = rewrite(&Above::default(), "t", &level(Some(5000), 0b0001), &Held::default(), &below).unwrap_err();
         assert!(cpus.starts_with("t//vm-1, below t: ") && cpus.contains(CPUS_OUTSIDE_PARENT), "{cpus}");
         // The level's own write against the levels above it.
-        let above = Held { rate: Some(2000), cpus: None };
+        let above = Above { caps: vec![Some(2000)], cpus: None };
         let own = rewrite(&above, "t", &level(Some(5000), 0b0111), &Held::default(), &[]).unwrap_err();
         assert!(own.starts_with("t: ") && own.contains(RATE_ABOVE_PARENT), "{own}");
         let orphan = [v1("t/a//vm-1", None, 0b1)];
-        let lost = rewrite(&Held::default(), "t", &level(None, 0b1), &Held::default(), &orphan).unwrap_err();
+        let lost = rewrite(&Above::default(), "t", &level(None, 0b1), &Held::default(), &orphan).unwrap_err();
         assert!(lost.contains("the job above it is not among those below t"), "{lost}");
     }
 

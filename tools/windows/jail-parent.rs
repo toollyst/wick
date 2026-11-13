@@ -75,7 +75,7 @@ use std::io::Read;
 
 use cgroup_values::{
     DEFAULT_PERIOD_US, PARENT_JOB_PREFIX, PARENT_NAMESPACE, cpu_groups, cpu_rate, cpus_of_levels, parent_job_names,
-    parent_namespace_sddl, parse_list, rate_of_levels, rewrite, strstrip, trusted_parent, ASKED_BYTES, Asked, Below, Held, Step,
+    parent_namespace_sddl, parse_list, rate_of_levels, rewrite, strstrip, trusted_parent, ASKED_BYTES, Above, Asked, Below, Held, Step,
     asked_name, parent_lock_name,
 };
 
@@ -763,7 +763,8 @@ fn run(name: &str, version: u8, cgroups: &[String]) -> Result<Vec<HANDLE>, Strin
     // asked for and holds.
     let caps = above.iter().map(|&job| hard_cap(job)).collect::<Result<Vec<_>, _>>()?;
     let sets = above.iter().map(|&job| processors(job)).collect::<Result<Vec<_>, _>>()?;
-    let up = Held { rate: rate_of_levels(&caps), cpus: if above.is_empty() { None } else { cpus_of_levels(&sets) } };
+    let up = Above { caps, cpus: if above.is_empty() { None } else { cpus_of_levels(&sets) } };
+    let up_rate = rate_of_levels(&up.caps).map_err(|why| format!("--name {name}: {why}"))?;
     let now = if made { Held::default() } else { holds(job, &was)? };
     let mut below = Vec::new();
     let mut below_jobs = Vec::new();
@@ -805,7 +806,7 @@ fn run(name: &str, version: u8, cgroups: &[String]) -> Result<Vec<HANDLE>, Strin
         // SAFETY: the handles opened above.
         unsafe { CloseHandle(below_job) };
     }
-    match (asked.rate, up.rate) {
+    match (asked.rate, up_rate) {
         (None, _) => println!("jail-parent: {name}: no CPU cap of its own"),
         (Some(rate), None) => println!("jail-parent: {name}: CPU rate {rate} of 10000 of the host's processors"),
         (Some(rate), Some(up)) => {
@@ -865,7 +866,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cgroup_values::{CPUS_OUTSIDE_PARENT, RATE_ABOVE_PARENT, jail_job_name, rate_under_parent};
+    use cgroup_values::{CPUS_OUTSIDE_PARENT, RATE_ABOVE_PARENT, jail_job_name, rate_under_levels, rate_under_parent};
 
     /// A job below a level as a jailer makes a jail's: named, with what it
     /// was asked for beside it (`None`: without), and no values yet, which
@@ -1105,12 +1106,20 @@ mod tests {
         expect("lowered to 4000", [Some(4000), share(2500, 4000), share(1250, 2500), share(4000, 4000)]);
         let raised = write(&top, &[quota(6000)]).map(|_| ());
         println!("TOOLTEST live: the top raised to 6000: {raised:?}; {}", state(&p1, &p2));
-        expect("raised to 6000", [Some(6000), share(2500, 6000), share(1250, 2500), share(4000, 6000)]);
+        // The level is given 4166 of 6000 for its 2500, and the two come
+        // to 2499.6 of the host, not 2500: the jail's share is of that
+        // (`rate_under_levels`), 5000, where one of 2500 is 5000 too and
+        // one of the levels' 2499 rounded down was 5002, above the 1250
+        // asked for (CI run 43403250054).
+        let level = share(2500, 6000);
+        let jail = Some(rate_under_levels(2, 1250, &[Some(6000), level]).unwrap());
+        assert_eq!(jail, Some(5000));
+        expect("raised to 6000", [Some(6000), level, jail, share(4000, 6000)]);
 
         // cgroup v1: the jail that asked for 4000 cannot follow 3000.
         let refused = write(&top, &[quota(3000)]).map(|_| ());
         println!("TOOLTEST live: the top to 3000, under which a cgroup v1 jail asked for 4000: {refused:?}; {}", state(&p1, &p2));
-        expect("refused at 3000", [Some(6000), share(2500, 6000), share(1250, 2500), share(4000, 6000)]);
+        expect("refused at 3000", [Some(6000), level, jail, share(4000, 6000)]);
         if !refused.as_ref().is_err_and(|why| why.contains(RATE_ABOVE_PARENT) && why.ends_with("nothing was written")) {
             failures.borrow_mut().push(format!("the top to 3000 over a v1 jail that asked for 4000: {refused:?}"));
         }

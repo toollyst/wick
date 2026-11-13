@@ -112,7 +112,7 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::cgroup_values::{
-    ASKED_BYTES, Asked, PARENT_JOB_PREFIX, PARENT_NAMESPACE, asked_name, cpus_of_levels, cpus_under_parent, jail_job_name, parent_job_names, parent_lock_name, parent_namespace_sddl, rate_of_levels, rate_under_parent,
+    ASKED_BYTES, Asked, PARENT_JOB_PREFIX, PARENT_NAMESPACE, asked_name, cpus_of_levels, cpus_under_parent, jail_job_name, parent_job_names, parent_lock_name, parent_namespace_sddl, rate_under_levels,
     trusted_parent,
 };
 use super::{GroupAffinity, HostError, Limits, SessionLock, Sid, last_error, sid_string, token_info, user_sid, wide};
@@ -499,8 +499,8 @@ impl Parent {
     /// The jail's limits as its job under this parent takes them: the CPU
     /// rate as a share of what the parent's levels come to and the
     /// processors within theirs, by Linux's rule for the cgroup version
-    /// (`cgroup_values::rate_under_parent`, `cpus_under_parent`,
-    /// `rate_of_levels`, `cpus_of_levels`), which refuses with cgroup v1
+    /// (`cgroup_values::rate_under_levels`, `cpus_under_parent`,
+    /// `cpus_of_levels`), which refuses with cgroup v1
     /// what Windows would narrow without a word. A limit the jail does not
     /// ask for, or no level of the parent has, is left as it is; the memory
     /// limit is the jail's own under any parent, as on Linux.
@@ -509,9 +509,9 @@ impl Parent {
         let mut out = limits.clone();
         if let Some(asked) = limits.cpu_rate {
             let caps = self.jobs.iter().map(hard_cap).collect::<io::Result<Vec<_>>>().map_err(|e| fail("CPU rate", e))?;
-            if let Some(parent) = rate_of_levels(&caps) {
+            if caps.iter().any(Option::is_some) {
                 let file = if self.version == 1 { "cpu.cfs_quota_us" } else { "cpu.max" };
-                let rate = rate_under_parent(self.version, asked, parent)
+                let rate = rate_under_levels(self.version, asked, &caps)
                     .map_err(|why| HostError::CgroupValue(format!("{file} under --parent-cgroup {}", self.name), why))?;
                 out.cpu_rate = Some(rate);
             }
@@ -714,6 +714,7 @@ pub(crate) fn processors(job: &OwnedHandle) -> io::Result<Option<Vec<(u16, u64)>
 
 #[cfg(test)]
 mod tests {
+    use super::super::cgroup_values::rate_under_parent;
     use super::super::tests::{Held, held_process, set_job};
     use super::*;
     use windows_sys::Win32::System::JobObjects::{
