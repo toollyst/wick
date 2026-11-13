@@ -328,7 +328,11 @@ tools/fuzz.sh -t 3600 -j 4 vnet_offload
 
 `tools/fuzz.sh --toolchain` names the pinned nightly the targets build with;
 cargo-fuzz comes from `cargo install cargo-fuzz --locked`. CI runs every
-target for a minute on Linux and macOS (`uffd_protocol` on macOS only), and
+target for a minute on Linux, macOS and Windows (`uffd_protocol` on macOS
+only; `hvf_exit` not on Windows, where a source it compiles calls
+`getentropy`, which the Windows POSIX layer does not have). On Windows the
+script runs from Git Bash and needs Visual Studio's "C++ AddressSanitizer"
+component, whose runtime DLL it finds and puts on `PATH`. And
 `tools/fuzz.sh` fails when a target of `fuzz/Cargo.toml` is run on no host
 without a reason in its `not_run()`. An input that fails is saved in
 `fuzz/artifacts/<target>/`, and

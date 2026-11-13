@@ -9,12 +9,15 @@
 #   -t SECONDS  how long each target runs (default 60)
 #   -j JOBS     libFuzzer worker processes per target (default 1)
 #   TARGET      the targets to run (default: every target this host runs;
-#               uffd_protocol is macOS only)
+#               uffd_protocol is macOS only, and hvf_exit is not run on
+#               Windows)
 #   --list      print the targets this host runs
 #   --toolchain print the nightly toolchain the targets build with
 #
 # Needs the pinned nightly toolchain (--toolchain; rustup installs it on first
-# use) and cargo-fuzz (`cargo install cargo-fuzz --locked`). The corpus grows in
+# use) and cargo-fuzz (`cargo install cargo-fuzz --locked`). On Windows (from
+# Git Bash) it also needs Visual Studio's "C++ AddressSanitizer" component,
+# whose runtime DLL the targets load. The corpus grows in
 # fuzz/corpus/<target>, starting from fuzz/seeds/<target> where there is one;
 # a crash is saved in fuzz/artifacts/<target> and fails the run, which then
 # prints the command that reproduces it.
@@ -25,16 +28,57 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 TOOLCHAIN="${WICK_FUZZ_TOOLCHAIN:-nightly-2026-11-01}"
 FUZZ_DIR="$WICK_ROOT/fuzz"
 
+# Windows, from Git Bash or MSYS2.
+on_windows() {
+    case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
 # The targets this host runs; with `all`, those of every host.
+# hvf_exit is not built on Windows: the source it compiles beside the exit
+# decoding (crates/compat/kvm-ioctls/src/hvf/trng.rs) calls getentropy, which
+# wick's POSIX layer for Windows does not have, as nothing in a Windows build
+# calls it. The decoding is the same code on every host, and runs on Linux
+# and macOS.
 host_targets() {
     echo vnet_segment
     echo vnet_offload
-    echo hvf_exit
+    if [[ "${1:-}" == all ]] || ! on_windows; then
+        echo hvf_exit
+    fi
     echo whp_irqchip
     echo whp_exit
     if [[ "${1:-}" == all || "$(uname -s)" == Darwin ]]; then
         echo uffd_protocol
     fi
+}
+
+# Windows: the targets are built with AddressSanitizer, whose runtime is a
+# DLL of Visual Studio's (clang_rt.asan_dynamic-x86_64.dll) that is on no
+# PATH outside a developer prompt. Found through vswhere and put on PATH; a
+# host without it is refused here, where the target would otherwise fail to
+# start with the loader's dialog.
+asan_runtime_on_path() {
+    local dll=clang_rt.asan_dynamic-x86_64.dll vswhere vs dir
+    local IFS=:
+    for dir in $PATH; do
+        [[ -f "$dir/$dll" ]] && return 0
+    done
+    unset IFS
+    # vswhere's own, fixed place (Microsoft: "vswhere is included with the
+    # installer as of Visual Studio 2017 version 15.2 and later, and can be
+    # found at %ProgramFiles(x86)%\Microsoft Visual Studio\Installer").
+    vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+    [[ -x "$vswhere" ]] || die "$dll is not on PATH and vswhere.exe is not at $vswhere: install Visual Studio's C++ AddressSanitizer component"
+    vs="$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.ASAN -property installationPath | tr -d '\r')"
+    [[ -n "$vs" ]] || die "no Visual Studio with the C++ AddressSanitizer component (Microsoft.VisualStudio.Component.VC.ASAN): the fuzz targets need its $dll"
+    dir="$(find "$(cygpath -u "$vs")/VC/Tools/MSVC" -path '*/bin/Hostx64/x64/'"$dll" -print 2>/dev/null | sort | tail -1)"
+    [[ -n "$dir" ]] || die "$dll not found under $vs/VC/Tools/MSVC"
+    PATH="$(dirname "$dir"):$PATH"
+    export PATH
+    echo "AddressSanitizer runtime: $dir"
 }
 
 # Targets of fuzz/Cargo.toml no host runs, one per line: the name, then why.
@@ -58,7 +102,10 @@ check_targets() {
 target_args() {
     case "$1" in
     # A virtio-net header and a frame of up to the device's 65550 bytes.
-    vnet_segment) echo "-max_len=65560 -dict=$FUZZ_DIR/vnet_segment.dict" ;;
+    # The dictionary's path is relative, as the corpus's: the script runs
+    # the targets from the repository's root, and a Windows program is not
+    # given a path of Git Bash's.
+    vnet_segment) echo "-max_len=65560 -dict=fuzz/vnet_segment.dict" ;;
     vnet_offload) echo "-max_len=4096" ;;
     # A sequence of vCPU exits, about 40 bytes each.
     hvf_exit) echo "-max_len=4096" ;;
@@ -104,7 +151,13 @@ if [[ "$(uname -s)" == Darwin ]]; then
 fi
 
 cd "$WICK_ROOT"
-cargo "+$TOOLCHAIN" fuzz build --fuzz-dir fuzz
+if on_windows; then
+    asan_runtime_on_path
+    # One by one: hvf_exit and uffd_protocol are not built here.
+    while read -r t; do cargo "+$TOOLCHAIN" fuzz build --fuzz-dir fuzz "$t"; done < <(host_targets)
+else
+    cargo "+$TOOLCHAIN" fuzz build --fuzz-dir fuzz
+fi
 
 for t in "${targets[@]}"; do
     args="$(target_args "$t")"

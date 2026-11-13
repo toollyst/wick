@@ -515,14 +515,19 @@ jobs:
 
   # A minute of each fuzz target (fuzz/, CONTRIBUTING.md "Fuzzing"): they
   # build, their seeds pass, and a minute of new inputs finds nothing. Long
-  # runs are local (tools/fuzz.sh -t SECONDS). uffd_protocol is macOS only.
+  # runs are local (tools/fuzz.sh -t SECONDS). uffd_protocol is macOS only;
+  # on Windows the script runs from Git Bash, finds Visual Studio's
+  # AddressSanitizer runtime, and leaves hvf_exit out (its host_targets).
   fuzz:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, macos-latest]
+        runner: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

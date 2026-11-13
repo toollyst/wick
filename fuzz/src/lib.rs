@@ -32,13 +32,17 @@ extern crate self as kvm_bindings;
 
 /// The exit decoding of the Hypervisor.framework backend
 /// (`crates/compat/kvm-ioctls/src/hvf/exit.rs`), compiled from its source (it
-/// uses nothing but `core`), so it is fuzzed on any host.
+/// uses nothing but `core`), so it is fuzzed on any host but Windows, where
+/// `trng`, which it names, does not build (tools/fuzz.sh, `host_targets`).
+#[cfg(not(windows))]
 #[path = "../../crates/compat/kvm-ioctls/src/hvf/exit.rs"]
 pub mod hvf_exit;
 
 /// The SMCCC TRNG service's numbers and answers
 /// (`crates/compat/kvm-ioctls/src/hvf/trng.rs`), which the exit decoding
 /// names as `super::trng`; compiled from its source.
+/// It calls `getentropy`, which wick's POSIX layer for Windows does not have.
+#[cfg(not(windows))]
 #[allow(dead_code)]
 #[path = "../../crates/compat/kvm-ioctls/src/hvf/trng.rs"]
 mod trng;
