@@ -26,7 +26,9 @@
 # networks' host side), socat (the vsock tests' host side) and iperf3 (the
 # network tests' host side), as upstream's container has them, from Homebrew
 # (brew install squashfs e2fsprogs screen zig coreutils libslirp pkg-config
-# socat iperf3). A missing one stops the run before any test.
+# socat iperf3). A missing one stops the run before any test, but for
+# coreutils: without it the wrappers in tools/macos/integration/bin exit 127
+# when a test calls truncate or du, and only those tests fail.
 #
 # OUT (default build/integration-tests/<time>) gets the pytest JSON report
 # (test-report.json; upstream's per-test test_results directory beside it, in
