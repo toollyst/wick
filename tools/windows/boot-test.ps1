@@ -3084,7 +3084,13 @@ function Stage-LinuxSnapshot {
         $until = [DateTime]::UtcNow.AddSeconds(10)
         while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
         Check ($vm.Exited -and $vm.ExitCode -ne 0) "Firecracker after a refused load ($status $out): $($vm.ExitReason())"
-        return "REFUSED at the load: $status $out; Firecracker exits, as after any failed load. Snapshot made by: $made"
+        # What the backend said of it: the WHP call and register a refusal
+        # of the vCPU state comes from (`whp:` lines, ffi::hr_of), which the
+        # API's error, an errno, does not name.
+        $vm.Drain(5000)
+        $said = $vm.Output + "`n" + (Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue)
+        $whp = @($said -split "`n" | Where-Object { $_ -match 'whp:' } | ForEach-Object { $_.Trim() } | Select-Object -First 5)
+        return "REFUSED at the load: $status $out; Firecracker exits, as after any failed load. Snapshot made by: $made. The backend's lines: $(if ($whp.Count) { $whp -join ' | ' } else { 'none' })"
     }
     $vm.Shell(60000)
     $out = $vm.Sh('echo alive $((6*7))')
