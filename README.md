@@ -182,7 +182,7 @@ The short version; the [full roadmap](docs/ROADMAP.md) has the status of every r
 <summary><b>Is this a fork of Firecracker?</b></summary>
 
 Not in the usual sense. Upstream lives unmodified in a submodule at a release tag, and wick applies a small patch
-series on top: about 2,000 changed lines, most of them a `cfg` block or a call into an interface. Everything else is
+series on top: about 2,200 added lines in 84 files, most of them a `cfg` block or a call into an interface. Everything else is
 new code in its own crates. Following a new upstream release is a rebase of that series, not a merge of two diverged
 trees.
 
