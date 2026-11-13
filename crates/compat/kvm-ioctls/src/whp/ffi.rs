@@ -292,7 +292,7 @@ pub(crate) fn run_vp(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<WHV_RUN_VP_E
     // SAFETY: all-zero is a valid exit context.
     let mut ctx = Exit(unsafe { std::mem::zeroed() });
     #[cfg(any(test, feature = "whp-trace"))]
-    let before = trace::stack();
+    let before = trace::start();
     #[cfg(any(test, feature = "whp-trace"))]
     let faults = libc::wick_mm::host_faults_on_this_thread().0;
     // SAFETY: valid output buffer of the given size.
@@ -355,7 +355,8 @@ impl Drop for OwnedHandle {
 #[cfg(any(test, feature = "whp-trace"))]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod trace {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::time::Instant;
 
     use super::{WHV_REGISTER_NAME, WHV_REGISTER_VALUE};
 
@@ -374,6 +375,109 @@ pub(crate) mod trace {
         pub exit: Option<i32>,
         /// What else the call is known by ([`exit_detail`] for a run).
         pub detail: String,
+        /// When a timed call ([`start`]) began, and when each call ended.
+        pub began: Option<Instant>,
+        pub ended: Instant,
+        /// The first-chance exceptions raised on the thread since its
+        /// previous traced call ended ([`count_exceptions`]): within this call, as no
+        /// code of ours between two calls raises one but the lazy-RAM
+        /// faults the memory module resolves before any later handler.
+        pub raised: Raised,
+    }
+
+    /// First-chance exceptions counted on a thread by [`count_exceptions`]'
+    /// handler: C++ exceptions (`0xE06D7363`, MSVC's `_CxxThrowException`)
+    /// and the others, with the last other code.
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    pub(crate) struct Raised {
+        pub cxx: u32,
+        pub other: u32,
+        pub last_other: u32,
+    }
+
+    impl Raised {
+        fn since(self, earlier: Raised) -> Raised {
+            Raised {
+                cxx: self.cxx - earlier.cxx,
+                other: self.other - earlier.other,
+                last_other: if self.other != earlier.other { self.last_other } else { 0 },
+            }
+        }
+
+        /// `N C++, M other (last 0x..)`, or empty for none.
+        pub(crate) fn text(self) -> String {
+            match (self.cxx, self.other) {
+                (0, 0) => String::new(),
+                (c, 0) => format!("{c} C++ (0xe06d7363)"),
+                (c, o) => format!("{c} C++ (0xe06d7363), {o} other (last {:#010x})", self.last_other),
+            }
+        }
+
+        pub(crate) fn add(self, other: Raised) -> Raised {
+            Raised {
+                cxx: self.cxx + other.cxx,
+                other: self.other + other.other,
+                last_other: if other.other != 0 { other.last_other } else { self.last_other },
+            }
+        }
+    }
+
+    /// The fields of `EXCEPTION_RECORD` and `EXCEPTION_POINTERS` read here.
+    #[repr(C)]
+    struct ExceptionRecord {
+        code: u32,
+    }
+    #[repr(C)]
+    struct ExceptionPointers {
+        record: *const ExceptionRecord,
+        _context: *mut core::ffi::c_void,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AddVectoredExceptionHandler(
+            first: u32,
+            handler: unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
+        ) -> *mut core::ffi::c_void;
+    }
+
+    thread_local! {
+        static RAISED: Cell<Raised> = const { Cell::new(Raised { cxx: 0, other: 0, last_other: 0 }) };
+        static LAST_RAISED: Cell<Raised> = const { Cell::new(Raised { cxx: 0, other: 0, last_other: 0 }) };
+        static STARTED: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    /// Counts each first-chance exception on its thread and lets it go on
+    /// (`EXCEPTION_CONTINUE_SEARCH`): last in the chain, so what a handler
+    /// before it resolves is not counted.
+    unsafe extern "system" fn counter(info: *mut ExceptionPointers) -> i32 {
+        // SAFETY: the system passes a valid EXCEPTION_POINTERS with its record.
+        let code = unsafe { (*(*info).record).code };
+        RAISED.set({
+            let r = RAISED.get();
+            if code == 0xE06D_7363 {
+                Raised { cxx: r.cxx + 1, ..r }
+            } else {
+                Raised { other: r.other + 1, last_other: code, ..r }
+            }
+        });
+        0
+    }
+
+    /// Installs [`counter`] once in the process.
+    pub(crate) fn count_exceptions() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            // SAFETY: a handler that only counts; never removed.
+            let h = unsafe { AddVectoredExceptionHandler(0, counter) };
+            assert!(!h.is_null(), "AddVectoredExceptionHandler failed");
+        });
+    }
+
+    /// [`stack`] for a call that is also timed: its line gives how long it
+    /// took.
+    pub(crate) fn start() -> usize {
+        STARTED.set(Some(Instant::now()));
+        stack()
     }
 
     /// How a call the emulator makes through its callbacks, within
@@ -394,14 +498,22 @@ pub(crate) mod trace {
             let registers = if registers.is_empty() { String::new() } else { format!(": {}", registers.join(", ")) };
             let exit = self.exit.map_or(String::new(), |e| format!(", exit reason {e:#x}"));
             let detail = if self.detail.is_empty() { String::new() } else { format!(" ({})", self.detail) };
+            let took = self.micros().map_or(String::new(), |us| format!(", {us:.1} us"));
+            let raised = self.raised.text();
+            let raised = if raised.is_empty() { raised } else { format!(", first-chance exceptions {raised}") };
             format!(
-                "{}(vp {}{registers}) HRESULT {:#010x}{exit}{detail}, stack {} -> {} KiB",
+                "{}(vp {}{registers}) HRESULT {:#010x}{exit}{detail}, stack {} -> {} KiB{took}{raised}",
                 self.call,
                 self.vp,
                 self.hres.cast_unsigned(),
                 self.before / 1024,
                 self.after / 1024
             )
+        }
+
+        /// How long a timed call took, in microseconds.
+        pub(crate) fn micros(&self) -> Option<f64> {
+            self.began.map(|b| self.ended.duration_since(b).as_secs_f64() * 1e6)
         }
 
         /// Whether the call was made within another traced one ([`NESTED`]).
@@ -473,8 +585,11 @@ pub(crate) mod trace {
         base - limit
     }
 
-    /// From here the calling thread's WHP calls are kept.
+    /// From here the calling thread's WHP calls are kept, with the
+    /// first-chance exceptions raised during each ([`count_exceptions`]).
     pub(crate) fn begin() {
+        count_exceptions();
+        LAST_RAISED.set(RAISED.get());
         CALLS.set(Some(Vec::new()));
     }
 
@@ -512,6 +627,10 @@ pub(crate) mod trace {
         detail: impl FnOnce() -> String,
     ) {
         let after = stack();
+        let ended = Instant::now();
+        let began = STARTED.take();
+        let now = RAISED.get();
+        let raised = now.since(LAST_RAISED.replace(now));
         #[cfg(feature = "whp-trace")]
         let print = after >= before + GREW;
         #[cfg(not(feature = "whp-trace"))]
@@ -530,6 +649,9 @@ pub(crate) mod trace {
             after,
             exit,
             detail: detail(),
+            began,
+            ended,
+            raised,
         };
         if print {
             let thread = std::thread::current();

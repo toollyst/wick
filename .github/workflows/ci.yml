@@ -907,7 +907,15 @@ jobs:
           # vCPU threads from 16 or 20 to 52 KiB on a PC returned a memory
           # access exit (9af0b63's traced boot); each run call's line names
           # the access, and the thread's own faults on lazy RAM the
-          # exception handler resolved within it. Asserted for every step: no
+          # exception handler resolved within it. Each step's STACKTIME
+          # line: its run calls' time, the first-chance exceptions raised
+          # within WHP calls (C++ ones are WinHvPlatform's own), and for the
+          # memory exits of lazy RAM each one's time in the run call and in
+          # the backend's commit, with what 4096 of them (a 256 MiB guest)
+          # come to; and a step after WHvAdviseGpaRange(Populate) of
+          # reserved-only guest RAM (STACKTEST populate: its HRESULT, the
+          # host memory's state and the commit charge after it), whose run
+          # calls say whether the write still exits. Asserted for every step: no
           # WHP call of the vCPU's thread fails, and the thread's stack
           # stays within 40 KiB (16 to 24 measured without a refused call,
           # 52 with one, in that run) but for those printed.

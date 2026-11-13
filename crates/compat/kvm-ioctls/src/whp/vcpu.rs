@@ -3200,6 +3200,121 @@ mod fpu_tests {
         format!("exits {}", exits.join(", "))
     }
 
+    /// The time and exceptions of a step of
+    /// [`test_the_stack_each_whp_call_commits_on_record`] (`took`
+    /// microseconds, its WHP calls `calls`): the run calls' time; the
+    /// first-chance exceptions raised within WHP calls (a C++ exception is
+    /// WinHvPlatform's own, thrown and caught); and, for the memory exits of
+    /// guest RAM that is mapped (lazy RAM not yet committed), each one's
+    /// run call and the backend's time before the next run call (the
+    /// commit), and what that comes to for a 256 MiB guest touching all of
+    /// its RAM in the 64 KiB blocks the backend commits.
+    fn step_time(calls: &[super::super::ffi::trace::Call], took: f64) -> String {
+        let runs: Vec<(usize, &super::super::ffi::trace::Call)> =
+            calls.iter().enumerate().filter(|(_, c)| c.micros().is_some()).collect();
+        let in_runs: f64 = runs.iter().filter_map(|(_, c)| c.micros()).sum();
+        let raised = calls.iter().fold(super::super::ffi::trace::Raised::default(), |a, c| a.add(c.raised));
+        let raised = if raised.text().is_empty() { "none".to_string() } else { raised.text() };
+        let mut line = format!(
+            "the step {took:.1} us, {} run calls {in_runs:.1} us of it; first-chance exceptions within WHP calls: {raised}",
+            runs.len()
+        );
+        let lazy: Vec<(f64, f64)> = runs
+            .iter()
+            .filter(|(_, c)| c.exit == Some(whv::WHvRunVpExitReasonMemoryAccess) && !c.detail.contains("unmapped"))
+            .filter_map(|&(i, c)| {
+                let next = calls[i + 1..].iter().find_map(|n| n.began)?;
+                Some((c.micros()?, next.duration_since(c.ended).as_secs_f64() * 1e6))
+            })
+            .collect();
+        if !lazy.is_empty() {
+            let n = lazy.len() as f64;
+            let (run, ours) = (lazy.iter().map(|l| l.0).sum::<f64>() / n, lazy.iter().map(|l| l.1).sum::<f64>() / n);
+            line += &format!(
+                "; {} memory exits of mapped guest RAM: each {run:.1} us in its run call (entry, the guest's access, \
+                 the exit) and {ours:.1} us in the backend before the next (the commit); 4096 of them, a 256 MiB \
+                 guest touching all its RAM in 64 KiB blocks: {:.1} ms",
+                lazy.len(),
+                4096.0 * (run + ours) / 1000.0
+            );
+        }
+        line
+    }
+
+    /// `WHvAdviseGpaRange(Populate)` for a write to the 64 KiB of guest RAM
+    /// at `gpa`, whose host memory at `host` is reserved, not committed:
+    /// its HRESULT, the host memory's state after it (`VirtualQuery`), and
+    /// the process's commit charge before and after (`PagefileUsage`).
+    fn populate_on_record(part: whv::WHV_PARTITION_HANDLE, host: usize, gpa: u64) -> String {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Counters {
+            cb: u32,
+            page_faults: u32,
+            peak_working_set: usize,
+            working_set: usize,
+            quota_peak_paged: usize,
+            quota_paged: usize,
+            quota_peak_non_paged: usize,
+            quota_non_paged: usize,
+            pagefile: usize,
+            peak_pagefile: usize,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn K32GetProcessMemoryInfo(process: windows_sys::Win32::Foundation::HANDLE, counters: *mut Counters, cb: u32) -> i32;
+        }
+        let charge = || {
+            let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, ..Default::default() };
+            // SAFETY: an output buffer of the size given.
+            let ok = unsafe {
+                K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb)
+            };
+            if ok != 0 { Some(c.pagefile) } else { None }
+        };
+        let state = || {
+            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+            let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            let n = unsafe {
+                windows_sys::Win32::System::Memory::VirtualQuery(host as *const _, &mut mbi, std::mem::size_of_val(&mbi))
+            };
+            match (n, mbi.State) {
+                (0, _) => "not queried".to_string(),
+                (_, windows_sys::Win32::System::Memory::MEM_COMMIT) => format!("committed, {} KiB of it", mbi.RegionSize / 1024),
+                (_, windows_sys::Win32::System::Memory::MEM_RESERVE) => format!("reserved, {} KiB of it", mbi.RegionSize / 1024),
+                (_, s) => format!("state {s:#x}"),
+            }
+        };
+        let (was, charged) = (state(), charge());
+        let range = whv::WHV_MEMORY_RANGE_ENTRY { GuestAddress: gpa, SizeInBytes: 0x1_0000 };
+        let advice = whv::WHV_ADVISE_GPA_RANGE_POPULATE {
+            Flags: whv::WHV_ADVISE_GPA_RANGE_POPULATE_FLAGS { AsUINT32: 0 },
+            AccessType: whv::WHvMemoryAccessWrite,
+        };
+        // SAFETY: one range and an advice buffer of the size given.
+        let hres = unsafe {
+            whv::WHvAdviseGpaRange(
+                part,
+                &range,
+                1,
+                whv::WHvAdviseGpaRangeCodePopulate,
+                (&raw const advice).cast(),
+                std::mem::size_of_val(&advice) as u32,
+            )
+        };
+        let (now, after) = (state(), charge());
+        let delta = match (charged, after) {
+            (Some(a), Some(b)) => format!("{:+} KiB", (b as i64 - a as i64) / 1024),
+            _ => "not read".to_string(),
+        };
+        format!(
+            "WHvAdviseGpaRange(Populate, a write, no flags) of the 64 KiB at {gpa:#x}: HRESULT {:#010x}; its host \
+             memory {was} before, {now} after; the process's commit charge {delta}",
+            hres.cast_unsigned()
+        )
+    }
+
     /// What a vCPU thread's stack may have committed after any step of
     /// [`test_the_stack_each_whp_call_commits_on_record`], in bytes. Run
     /// 43392627996 (this test build, Windows Server 2025): a step that made
@@ -3231,7 +3346,9 @@ mod fpu_tests {
                 .spawn_scoped(scope, || {
                     let before = super::super::ffi::trace::stack();
                     super::super::ffi::trace::begin();
+                    let began = std::time::Instant::now();
                     let what = run_a_step(vcpu);
+                    let took = began.elapsed().as_secs_f64() * 1e6;
                     let calls = super::super::ffi::trace::end();
                     let after = super::super::ffi::trace::stack();
                     let (faults, deepest) = libc::wick_mm::host_faults_on_this_thread();
@@ -3256,6 +3373,7 @@ mod fpu_tests {
                             eprintln!("STACKCALL {thread}, {name}: #{} {}", i + 1, c.line());
                         }
                     }
+                    eprintln!("STACKTIME {thread}, {name}: {}", step_time(&calls, took));
                     let mut wrong: Vec<String> =
                         calls.iter().filter(|c| c.hres != 0).map(|c| format!("{thread}, {name}: {}", c.line())).collect();
                     if after > STACK_BOUND {
@@ -3306,8 +3424,10 @@ mod fpu_tests {
         const MMIO_READ: &str = "an MMIO read (the emulator), the thread's first exit";
         const LAZY_RAM: &str = "a write to each of four 64 KiB blocks of MAP_NORESERVE guest RAM at 8 MiB, \
                                 which nothing touched before, the thread's first exits";
+        const POPULATED: &str = "a write to a 64 KiB block of MAP_NORESERVE guest RAM at 8.25 MiB that \
+                                 WHvAdviseGpaRange was asked to populate first";
         // Steps printed, whose stack is not bounded (a failed call still is wrong).
-        const RECORDED: [&str; 3] = [FRESH_PAGES, MMIO_READ, LAZY_RAM];
+        const RECORDED: [&str; 4] = [FRESH_PAGES, MMIO_READ, LAZY_RAM, POPULATED];
         // The lazy slot: 2 MiB at 8 MiB, committed by nothing before the guest.
         const LAZY_GPA: u64 = 0x80_0000;
         const LAZY_LEN: usize = 2 << 20;
@@ -3428,6 +3548,14 @@ mod fpu_tests {
                     0xFF, 0xC9, // dec ecx
                     0x75, 0xF3, // jnz to the mov
                 ],
+            ),
+            // Whether WHP's Populate advice commits guest RAM that is only
+            // reserved, ahead of the guest, and so spares it the exit
+            // (Microsoft Learn, WHvAdviseGpaRange: it "commits the backing
+            // memory for the specified ranges ahead of access"). Printed.
+            (
+                POPULATED,
+                vec![0xC6, 0x04, 0x25, 0x00, 0x00, 0x84, 0x00, 0x01], // mov byte [0x840000], 1
             ),
             (
                 "the local APIC enabled through its page (spurious vector register 0x1ff)",
@@ -3570,6 +3698,9 @@ mod fpu_tests {
 
         let mut wrong = Vec::new();
         for (name, _) in &steps {
+            if *name == POPULATED {
+                eprintln!("STACKTEST populate: {}", populate_on_record(vcpu.part(), lazy as usize + 0x4_0000, LAZY_GPA + 0x4_0000));
+            }
             let of_the_step = if name.starts_with("INIT") {
                 // The application processor's thread is in its run, waiting
                 // for its start, while the boot processor sends it.
