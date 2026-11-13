@@ -399,7 +399,10 @@ mod tests {
     }
 
     /// A limit below the count, `limit` (from the variable): the next
-    /// descriptor fails at once.
+    /// descriptor fails at once. Nothing is warmed up here: a refused
+    /// `socket`, the process's first, makes no handle, Winsock's own
+    /// included (it is started after the check; run 43354233496 found it
+    /// started before, 5 handles).
     fn below(limit: u64) {
         assert_eq!(nofile_limit(), (limit, limit), "getrlimit");
         let mut ends: [c_int; 2] = [0; 2];

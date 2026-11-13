@@ -132,8 +132,10 @@ pub fn close(fd: RawFd) -> bool {
 /// through Winsock, as Microsoft requires; other handles with
 /// `DuplicateHandle`. `EMFILE` past the no-file limit ([`super::nofile`]).
 pub fn dup(fd: RawFd) -> std::io::Result<RawFd> {
-    super::net::startup();
+    // Before Winsock is started: its first start makes handles of its own,
+    // and a refused call makes none.
     super::nofile::check(1)?;
+    super::net::startup();
     // SAFETY: an all-zero `WSAPROTOCOL_INFOW` is valid.
     let mut info: WSAPROTOCOL_INFOW = unsafe { std::mem::zeroed() };
     // SAFETY: duplicates a socket of this process into this process.

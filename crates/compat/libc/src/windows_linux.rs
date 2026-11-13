@@ -514,14 +514,16 @@ pub(crate) fn socket_fd(s: ws::SOCKET, fits: fn(ws::SOCKET) -> Option<c_int>) ->
 /// # Safety
 /// No requirements; `unsafe` like the libc function.
 pub unsafe fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int {
-    wick_wsa_startup();
     let Some(family) = to_winsock_family(domain) else {
         set_errno(crate::EAFNOSUPPORT);
         return -1;
     };
+    // Before Winsock is started: its first start makes handles of its own
+    // (5, CI run 43354233496), and a refused call makes none.
     if !crate::wick_nofile::room(1) {
         return -1;
     }
+    wick_wsa_startup();
     let base = ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
     let mut flags = WSA_FLAG_OVERLAPPED;
     if ty & SOCK_CLOEXEC != 0 {
@@ -603,10 +605,11 @@ pub unsafe fn listen(fd: c_int, backlog: c_int) -> c_int {
 /// # Safety
 /// `addr` and `len` may be null; otherwise as for `accept(2)`.
 pub unsafe fn accept(fd: c_int, addr: *mut crate::sockaddr, len: *mut u32) -> c_int {
-    wick_wsa_startup();
+    // Before Winsock is started, as in `socket`.
     if !crate::wick_nofile::room(1) {
         return -1;
     }
+    wick_wsa_startup();
     // SAFETY: an all-zero storage is valid.
     let mut s: sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut n = c_int::try_from(std::mem::size_of_val(&s)).unwrap();
