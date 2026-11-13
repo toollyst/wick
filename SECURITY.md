@@ -112,8 +112,9 @@ upstream Firecracker and its jailer.
   jailed VMM uses Unix socket endpoints in the jail or in the directory `--netns` names, the jail's network.
   vmnet is the host's network, so it is refused with `--netns`. Without `--netns`, vmnet's bridged mode, and every
   mode before macOS 26, needs root, which a jailed VMM does not have; shared and host mode on macOS 26 need only
-  the virtualization entitlement (`vmnet_network_create`), and have not yet been run in a jail (`jailer-test vmnet`
-  and `vmnet-guest`, written, need root). A vmnet interface is started only while the microVM is built: its start
+  the virtualization entitlement (`vmnet_network_create`): a jailed Firecracker starts both (`jailer-test vmnet`, as
+  root in CI's macos job on macOS 26.7.2, e7de455, no guest); a jailed guest on vmnet (`jailer-test vmnet-guest`)
+  is written, not yet run. A vmnet interface is started only while the microVM is built: its start
   talks to NetworkSharing (a root daemon) over XPC, which the narrowed sandbox does not allow, so one hot-plugged
   into a running microVM is refused with an API error (`test_vmnet_hotplug_after_narrow_is_refused`). Firecracker starts as root and enters the jail before anything else
   runs (dyld cannot start a program inside a chroot), from a root-owned copy of the binary outside the jail.
