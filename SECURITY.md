@@ -223,7 +223,7 @@ upstream Firecracker and its jailer.
   (`test_a_denied_call_in_the_api_process_ends_firecracker_as_its_own`,
   `test_an_api_process_that_exits_148_ends_firecracker_as_its_own`). A compromised API process that says so
   falsely can do no more than end Firecracker, which it can do anyway by ending the link. In a jail the two share the jail's memory and CPU limits, so together they stay within
-  them (`test_limits_are_shared_with_the_api_process`; the jailer-test stage needs root). On Windows the same is
+  them (`test_limits_are_shared_with_the_api_process`; `jailer-test limits`, as root in CI's macos job on macOS 26.7.2, e7de455: a jetsam limit of 300 MiB split 268 + 32 for the API process, a CPU limit of 75% split 74 + 1). On Windows the same is
   in place without a fork: the API process is a second process from Firecracker's binary, made by Firecracker
   before its sandbox is set, or by the jailer in a jail on the jail's token and in its Job Object, with its end of
   the link and a handle to Firecracker inherited; it has the whole mitigation profile from its start, before it
