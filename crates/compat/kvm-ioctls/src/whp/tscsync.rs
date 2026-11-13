@@ -115,7 +115,9 @@ impl TscSync {
         out
     }
 
-    /// The vCPU whose offset is the current generation's.
+    /// The vCPU whose offset is the current generation's (for the tests;
+    /// the backend keeps the vCPU that [`TscWrite::Matched`] names).
+    #[cfg(test)]
     pub fn reference(&self) -> Option<u32> {
         self.reference
     }
