@@ -322,11 +322,31 @@ class Vm:
         except subprocess.TimeoutExpired:
             raise Failure(f"VMM did not exit within {timeout}s ({self.exit_reason()})")
 
+    # What the guest kernel reports when its health fails (Linux v6.1, the
+    # guest's): an RCU stall (`rcu: INFO`, `self-detected stall`), a soft
+    # lockup, a hung task, a BUG, an oops; a WARN()'s report, "WARNING: CPU:
+    # <n> PID: <pid> at ..." (kernel/panic.c `__warn`, both of its forms);
+    # the stack dump each of those prints, arm64's "Call trace:"
+    # (arch/arm64/kernel/stacktrace.c `dump_backtrace`; x86's is "Call
+    # Trace:"); and the three other "WARNING:" lines the guest kernel has
+    # (its strings) that a VMM's fault prints: boot registers x1-x3 not zero
+    # (arch/arm64/kernel/setup.c `setup_arch`), a timer interrupt the device
+    # tree gives a bad trigger (drivers/clocksource/arm_arch_timer.c
+    # `check_ppi_trigger`: "arch_timer: WARNING: Invalid trigger" and "Please
+    # fix your firmware"), and CPU masks that disagree (kernel/workqueue.c
+    # `wq_calc_node_cpumask`). Not any line with "WARNING:" in it: the
+    # kernel's own notices use the word too, as arm64's Spectre-BHB notice
+    # on unprivileged eBPF (arch/arm64/kernel/proton-pack.c, "WARNING: %s"),
+    # or x86's SRSO notice under KVM on an AMD host, which boot-test.ps1
+    # met; the guest's EFI and file system notices cannot appear here (no
+    # EFI, a squashfs root).
+    HEALTH = ("rcu: INFO|self-detected stall|soft lockup|hung_task|BUG:|Oops|WARNING: CPU:|Call trace:"
+              "|WARNING: x1-x3 nonzero|arch_timer: WARNING:|WARNING: workqueue cpumask")
+
     def healthy(self):
-        """Fails if the guest kernel logged a stall, a BUG or an oops."""
-        _, out = self.sh(
-            "dmesg | grep -E 'rcu: INFO|self-detected stall|soft lockup|hung_task|BUG:|Oops|WARNING:|Call trace' | head -5; true"
-        )
+        """Fails if the guest kernel logged a stall, a BUG, an oops or a
+        warning (HEALTH)."""
+        _, out = self.sh(f"dmesg | grep -E '{self.HEALTH}' | head -5; true")
         check(not out, f"guest kernel reports:\n    {out}")
 
     def reboot(self):
