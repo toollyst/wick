@@ -992,6 +992,14 @@ jobs:
           # WHP delivers an interrupt before an unfinished MMIO instruction
           # runs again.
           alone whp::vcpu::fpu_tests::test_split_mmio_accesses_and_an_interrupt_at_reentry_on_record
+          # Why MMIOTEST's interrupt requested after a device read's exit was
+          # taken one instruction late on the PC (MMIOSHADOW lines): the
+          # read is in STI's interrupt shadow; for a read, a CPUID and an
+          # OUT right after STI, and a read one NOP after it, the shadow at
+          # the exit, then the instruction finished as the host does, an
+          # interrupt requested, and the next exits with the shadow left and
+          # with it cleared.
+          alone whp::vcpu::fpu_tests::test_the_interrupt_shadow_after_a_host_finished_instruction_on_record
           # Records A and B of the lazy-RAM chunk (COMMITTEST, POPULATETEST
           # lines): VirtualAlloc(MEM_COMMIT) by size and the backend's
           # commit_on_access, with the host's first write a page after; and

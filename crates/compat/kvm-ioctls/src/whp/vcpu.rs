@@ -4553,6 +4553,108 @@ mod fpu_tests {
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
     }
 
+    /// A record (MMIOSHADOW lines) for the PC's MMIOTEST failure on
+    /// f35e353: an interrupt requested after the exit of `mov eax,
+    /// [device]` was taken after the next instruction (`out 0x80`), not at
+    /// the entry after the host finished the read, where KVM takes it. The
+    /// read is the instruction after `sti` (the end of `APIC_ON`), so it is
+    /// in STI's interrupt shadow (Intel SDM vol. 3 "Interruptibility state":
+    /// blocking by STI lasts until the instruction after STI completes),
+    /// which WHP keeps in `WHvRegisterInterruptState` bit 0 and reports in
+    /// the exit's `ExecutionState.InterruptShadow` (bit 12). If finishing
+    /// the instruction in the host leaves the shadow set, the entry blocks
+    /// the interrupt for one more instruction. KVM clears the shadow when
+    /// it finishes an instruction (Linux v6.1): the emulator's writeback
+    /// calls `toggle_interruptibility` with the instruction's own shadow,
+    /// none for a MOV (arch/x86/kvm/x86.c:8263-8280, 8955), which a device
+    /// read reaches from `complete_emulated_mmio` (x86.c:11034); an
+    /// instruction skipped rather than emulated clears it in
+    /// `skip_emulated_instruction` (vmx/vmx.c:1636) and
+    /// `__svm_skip_emulated_instruction` (svm/svm.c:403).
+    ///
+    /// With WHP's own calls, for an MMIO read, a CPUID and an `out` right
+    /// after `sti`, and for an MMIO read one `nop` after it (no shadow):
+    /// the shadow at the exit (exit context and register), then the
+    /// instruction finished as the host does (RIP past it; the read's RAX),
+    /// an interrupt requested (`inject_msi`), and the next exits, once with
+    /// the shadow as the exit left it and once with it cleared first.
+    /// Printed, not asserted, but for each case's own end.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_the_interrupt_shadow_after_a_host_finished_instruction_on_record() {
+        use super::super::ffi;
+        // (name, the code after APIC_ON up to the exit, its length, the
+        // exit's RAX if the host gives one)
+        let cases: [(&str, Vec<u8>, u64, Option<u64>); 4] = [
+            ("an MMIO read right after sti", READ_DEVICE.to_vec(), 7, Some(0x1122_3344)),
+            ("an MMIO read one nop after sti", [vec![0x90], READ_DEVICE.to_vec()].concat(), 7, Some(0x1122_3344)),
+            ("CPUID right after sti", vec![0x0F, 0xA2], 2, None),
+            ("an out to port 0x82 right after sti", vec![0xE6, 0x82], 2, None),
+        ];
+        let exit_line = |c: &whv::WHV_RUN_VP_EXIT_CONTEXT| -> String {
+            match c.ExitReason {
+                // SAFETY: the union arm matches the exit reason.
+                whv::WHvRunVpExitReasonX64IoPortAccess => format!("port {:#x}", unsafe { c.Anonymous.IoPortAccess.PortNumber }),
+                whv::WHvRunVpExitReasonMemoryAccess => format!("memory access, RIP {:#x}", c.VpContext.Rip),
+                r => format!("exit reason {r:#x}, RIP {:#x}", c.VpContext.Rip),
+            }
+        };
+        for (name, code, len, rax) in cases {
+            for clear in [false, true] {
+                let program = [APIC_ON.to_vec(), code.clone(), vec![0xE6, PORT as u8, 0xF4, 0xEB, 0xFD]].concat();
+                let (vm, vcpu, m) = mmio_guest(&program);
+                let (part, vp) = (vcpu.part(), vcpu.vp());
+                let first = ffi::run_vp(part, vp).unwrap();
+                // SAFETY: the 16-bit view of the execution state's bit fields.
+                let at_exit = unsafe { first.VpContext.ExecutionState.AsUINT16 } >> 12 & 1;
+                let register = ffi::get_register(part, vp, whv::WHvRegisterInterruptState).map(|v| ffi::as_u64(&v));
+                let rip = first.VpContext.Rip + len;
+                match rax {
+                    Some(rax) => regs::set_gpr_rax_rip(part, vp, rax, rip).unwrap(),
+                    None => regs::set_rip(part, vp, rip).unwrap(),
+                }
+                let after_rip = ffi::get_register(part, vp, whv::WHvRegisterInterruptState).map(|v| ffi::as_u64(&v));
+                if clear {
+                    let state = after_rip.as_ref().copied().unwrap_or(0);
+                    ffi::set_register(part, vp, whv::WHvRegisterInterruptState, ffi::reg64(state & !1)).unwrap();
+                }
+                vcpu.shared.inner.inject_msi(0xFEE0_0000, MMIO_VECTOR as u32);
+                let mut next = Vec::new();
+                for _ in 0..3 {
+                    match ffi::run_vp(part, vp) {
+                        Ok(c) => {
+                            next.push(exit_line(&c));
+                            if c.ExitReason != whv::WHvRunVpExitReasonX64IoPortAccess {
+                                break;
+                            }
+                            // SAFETY: the union arm matches the exit reason.
+                            let port = unsafe { c.Anonymous.IoPortAccess.PortNumber };
+                            regs::set_rip(part, vp, c.VpContext.Rip + 2).unwrap();
+                            if port == PORT {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            next.push(format!("run failed, errno {}", e.errno()));
+                            break;
+                        }
+                    }
+                }
+                eprintln!(
+                    "MMIOSHADOW {name}: the exit {}, its ExecutionState.InterruptShadow {at_exit}, WHvRegisterInterruptState {register:?}, \
+                     after RIP set {after_rip:?}; the shadow {}; then {next:?} (the handler's port is 0x81)",
+                    exit_line(&first),
+                    if clear { "cleared" } else { "left" }
+                );
+                assert!(next.iter().any(|l| l == "port 0x80"), "{name}: the guest did not reach its out 0x80: {next:?}");
+                drop(vcpu);
+                drop(vm);
+                // SAFETY: the test's mapping, no VM left using it.
+                assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+            }
+        }
+    }
+
     /// A record (SREGSREC lines) for CI run 43442912128's linux-snapshot
     /// stage, where WHP refused (0xc0350005, an invalid parameter) the
     /// special registers of a Linux guest's snapshot made on KVM: CR0
