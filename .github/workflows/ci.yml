@@ -1124,6 +1124,16 @@ jobs:
           # the backend, or an exception exit, that #GP given back), the
           # timer's other writes, and such a WRMSR's cost in a loop.
           alone whp::vcpu::fpu_tests::test_gp_exits_on_an_x2apic_partition_on_record
+          # Option E's records before its code (X2E0REC lines): this
+          # runner's processor (an Intel runner answers whether E holds
+          # there); a #GP's error code given back; a #GP while WHP
+          # delivers an interrupt, a #GP or a #DF (whether the event being
+          # delivered is shown, and what giving back does); the LVT timer
+          # in xAPIC mode by MMIO and written by the host in x2APIC mode;
+          # E's emulation of the TSC-deadline write in a loop. In the
+          # debug build and in a release build, as Firecracker runs.
+          alone whp::vcpu::fpu_tests::test_gp_exits_for_option_e_on_record
+          alone whp::vcpu::fpu_tests::test_gp_exits_for_option_e_on_record --release
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # The lazy-RAM grain (LAZYGRAIN lines): guest RAM mapped as

@@ -6144,6 +6144,511 @@ mod fpu_tests {
         }
     }
 
+    /// The records E0 of option E (agent-state's x2apic-e-plan.md), before
+    /// its code: an x2APIC partition whose #GPs leave the hypervisor
+    /// (ExceptionExit, vector 13 in the exception exit bitmap), each case
+    /// driven by `WHvRunVirtualProcessor` alone, so each exit's context is
+    /// read as WHP gave it (X2E0REC lines). Printed:
+    /// - e: the host's processor (CPUID vendor, brand, leaf 1 EAX), so a
+    ///   run on an Intel host answers whether E holds there;
+    /// - b: a #GP with an error code (DS loaded with a selector past the
+    ///   GDT's limit; INT 0x41 past the IDT's limit), and what the guest's
+    ///   handler finds when it is given back with the exit's error code;
+    /// - a: a #GP raised while WHP delivers an event: an external interrupt
+    ///   past the IDT's limit; a #GP past it (a #DF on a processor); and
+    ///   then the #DF past it too (a triple fault): the exit's execution
+    ///   state (InterruptionPending) and `WHvRegisterPendingInterruption`,
+    ///   so whether the event being delivered is shown (KVM merges two
+    ///   faults as `kvm_multiple_exception` does, Linux v6.1
+    ///   arch/x86/kvm/x86.c:697-712); what giving back the #GP alone does,
+    ///   and the #DF KVM would make of two contributory faults;
+    /// - c: with APIC_BASE.EXTD clear, the guest's MMIO write of the LVT
+    ///   timer in TSC-deadline mode and its read back, and an x2APIC MSR's
+    ///   RDMSR; with EXTD set, the LVT timer written by the host through
+    ///   `WHvX64RegisterApicLvtTimer` and through `KVM_SET_LAPIC`, read back
+    ///   both ways and by the guest's RDMSR; and vCPU 1's APIC ID register
+    ///   in the page the backend reads (`lapic_page`) and in
+    ///   `WHvX64RegisterApicId`, in xAPIC mode and in x2APIC mode, as
+    ///   `tscdeadline::deadline_interrupt` takes the destination from the
+    ///   page in the xAPIC format (`>> 24`);
+    /// - d: E's path for the TSC-deadline write: 1000 WRMSRs of 0x832 in
+    ///   TSC-deadline mode in a guest loop, each exception exit answered
+    ///   with the registers read (one call) and the LVT timer written in
+    ///   one-shot mode with RIP past the WRMSR (one call), the least of 3
+    ///   runs a WRMSR.
+    ///
+    /// Nothing is asserted but the test's own setup. CI runs it in a debug
+    /// and in a release build.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_gp_exits_for_option_e_on_record() {
+        use super::super::ffi;
+        const GP: u64 = 13;
+        const DF: u64 = 8;
+        const DF_AT: u64 = 0x7860;
+        const PROGRAM: u64 = 0x7A00;
+        const LOOP_AT: u64 = 0x7900;
+        const ROUNDS: u32 = 1000;
+        let build = if cfg!(debug_assertions) { "debug build" } else { "release build" };
+        let say = |l: String| eprintln!("X2E0REC {build}: {l}");
+
+        /// An x2APIC partition with ExceptionExit and vector 13 in its
+        /// exception exit bitmap; the probes' guest with a #DF handler
+        /// (`out 0x88`) and the local APIC's page mapped; an IDT of
+        /// `vectors` gates; the vCPU in long mode, after the guest's own
+        /// write of APIC_BASE.EXTD if `extd`.
+        fn e0_vm(extd: bool, vectors: u64) -> std::result::Result<(super::super::VmFd, VcpuFd, *mut u8), String> {
+            super::super::vm::APIC_MODE_FOR_TESTS.set(Some(whv::WHvX64LocalApicEmulationModeX2Apic));
+            super::super::vm::EXTRA_EXITS_FOR_TESTS.set(1 << 2);
+            let made = super::super::VmFd::create();
+            super::super::vm::EXTRA_EXITS_FOR_TESTS.set(0);
+            super::super::vm::APIC_MODE_FOR_TESTS.set(None);
+            let vm = made.map_err(|e| format!("the partition is not made: errno {}", e.errno()))?;
+            let m = guest();
+            probes(m);
+            put(m, DF_AT, &[0xE6, 0x88, 0xEB, 0xFE]);
+            let gate = (DF_AT & 0xFFFF) | (8 << 16) | (0x8E << 40) | (((DF_AT >> 16) & 0xFFFF) << 48);
+            put(m, IDT + DF * 16, &gate.to_le_bytes());
+            put(m, IDT + DF * 16 + 8, &(DF_AT >> 32).to_le_bytes());
+            // The local APIC's page at 0xfee00000, a 2 MiB page.
+            put(m, 0x2018, &(0xA000u64 | 3).to_le_bytes());
+            put(m, 0xA000 + 0x1F7 * 8, &(0xFEE0_0000u64 | 0x83).to_le_bytes());
+            let region = kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: MEM as u64,
+                userspace_addr: m as u64,
+            };
+            // SAFETY: the memory stays mapped while the VM has it.
+            unsafe { vm.set_user_memory_region(region) }.map_err(|e| format!("the slot is refused: errno {}", e.errno()))?;
+            let mut vcpu = vm.create_vcpu(0).map_err(|e| format!("the vCPU is not made: errno {}", e.errno()))?;
+            vcpu.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
+            let value: u64 = 1 << GP;
+            // SAFETY: a u64 value for ExceptionExitBitmap; no vCPU runs.
+            unsafe { ffi::set_partition_property(vcpu.part(), whv::WHvPartitionPropertyCodeExceptionExitBitmap, &value) }
+                .map_err(|e| format!("ExceptionExitBitmap {value:#x} refused: errno {}", e.errno()))?;
+            start(&vcpu);
+            let mut s = vcpu.get_sregs().unwrap();
+            (s.idt.base, s.idt.limit) = (IDT, u16::try_from(vectors * 16 - 1).unwrap());
+            vcpu.set_sregs(&s).unwrap();
+            if extd {
+                vcpu.set_regs(&kvm_regs { rip: WRMSR_AT, rsp: 0x9000, rflags: 2, rax: 0xFEE0_0D00, rcx: 0x1B, ..Default::default() }).unwrap();
+                let end = run_once(&mut vcpu);
+                if end != "exit IoOut port 0x80" {
+                    return Err(format!("the guest's WRMSR of APIC_BASE 0xfee00d00 ended by {end}"));
+                }
+            }
+            Ok((vm, vcpu, m))
+        }
+
+        /// One `WHvRunVirtualProcessor`, kicked after 5 s: the exit as a
+        /// line (an exception's details, the execution state and
+        /// `WHvRegisterPendingInterruption` after it) and an exception
+        /// exit's vector and error code.
+        fn raw_once(vcpu: &mut VcpuFd) -> (String, Option<(u8, u32)>) {
+            let (part, vp) = (vcpu.part(), vcpu.vp());
+            let watchdog = super::Watchdog::arm(vcpu);
+            let ran = ffi::run_vp(part, vp);
+            drop(watchdog);
+            vcpu.set_kvm_immediate_exit(0);
+            let ctx = match ran {
+                Ok(c) => c,
+                Err(e) => return (format!("run failed, errno {}", e.errno()), None),
+            };
+            let mut exception = None;
+            let what = match ctx.ExitReason {
+                whv::WHvRunVpExitReasonException => {
+                    // SAFETY: the union arm matches the exit reason; the
+                    // information's bit field overlaps the u32.
+                    let (ex, info) = unsafe { (ctx.Anonymous.VpException, ctx.Anonymous.VpException.ExceptionInfo.AsUINT32) };
+                    exception = Some((ex.ExceptionType, ex.ErrorCode));
+                    format!(
+                        "an exception exit: vector {}, error code {:#x} (ErrorCodeValid {}, SoftwareException {}), parameter \
+                         {:#x}, instruction bytes {:02x?}",
+                        ex.ExceptionType,
+                        ex.ErrorCode,
+                        info & 1,
+                        info >> 1 & 1,
+                        ex.ExceptionParameter,
+                        &ex.InstructionBytes[..usize::from(ex.InstructionByteCount).min(16)]
+                    )
+                }
+                // SAFETY: as above.
+                whv::WHvRunVpExitReasonX64IoPortAccess => format!("out {:#x}", unsafe { ctx.Anonymous.IoPortAccess.PortNumber }),
+                // SAFETY: as above.
+                whv::WHvRunVpExitReasonX64MsrAccess => format!("an MSR exit of {:#x}", unsafe { ctx.Anonymous.MsrAccess.MsrNumber }),
+                reason => format!("exit reason {reason:#x}"),
+            };
+            // SAFETY: a plain 16-bit view of the execution state's bit field.
+            let state = unsafe { ctx.VpContext.ExecutionState.AsUINT16 };
+            let pending = match ffi::get_register(part, vp, whv::WHvRegisterPendingInterruption) {
+                Ok(v) => format!("{:#x}", ffi::as_u64(&v)),
+                Err(e) => format!("not read: errno {}", e.errno()),
+            };
+            (
+                format!(
+                    "{what} (RIP {:#x}, CPL {}, InterruptionPending {}, InterruptShadow {}; PendingInterruption {pending})",
+                    ctx.VpContext.Rip,
+                    state & 3,
+                    state >> 6 & 1,
+                    state >> 12 & 1
+                ),
+                exception,
+            )
+        }
+
+        /// The event given back for an exception: pending, a hardware
+        /// exception (type 3), its error code if it has one (bit 4).
+        fn event(vector: u64, code: Option<u32>) -> u64 {
+            1 | (3 << 1) | (u64::from(code.is_some()) << 4) | (vector << 16) | (u64::from(code.unwrap_or(0)) << 32)
+        }
+
+        fn give(vcpu: &VcpuFd, event: u64) -> String {
+            match ffi::set_register(vcpu.part(), vcpu.vp(), whv::WHvRegisterPendingInterruption, ffi::reg64(event)) {
+                Ok(()) => format!("PendingInterruption {event:#x} set"),
+                Err(e) => format!("PendingInterruption {event:#x} refused: errno {}", e.errno()),
+            }
+        }
+
+        /// The error code and RIP on a handler's stack.
+        fn frame(vcpu: &VcpuFd, m: *mut u8) -> String {
+            let rsp = vcpu.get_regs().unwrap().rsp;
+            if rsp + 16 > MEM as u64 {
+                return format!("RSP {rsp:#x} outside the guest's memory");
+            }
+            // SAFETY: within the test's mapping.
+            let (code, rip) = unsafe { (*(m.add(rsp as usize) as *const u64), *(m.add(rsp as usize + 8) as *const u64)) };
+            format!("the handler's frame: error code {code:#x}, RIP {rip:#x}")
+        }
+
+        fn lvtt_of(vcpu: &VcpuFd) -> String {
+            match vcpu.get_lapic() {
+                Ok(l) => {
+                    let b: Vec<u8> = l.regs[0x320..0x324].iter().map(|&c| c as u8).collect();
+                    format!("{:#x}", u32::from_le_bytes(b.try_into().unwrap()))
+                }
+                Err(e) => format!("not read: errno {}", e.errno()),
+            }
+        }
+
+        fn timer_register(vcpu: &VcpuFd) -> String {
+            match ffi::get_register(vcpu.part(), vcpu.vp(), whv::WHvX64RegisterApicLvtTimer) {
+                Ok(v) => format!("{:#x}", ffi::as_u64(&v)),
+                Err(e) => format!("not read: errno {}", e.errno()),
+            }
+        }
+
+        fn done(vcpu: VcpuFd, vm: super::super::VmFd, m: *mut u8) {
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+
+        // e: the host's processor.
+        {
+            use core::arch::x86_64::__cpuid;
+            let l0 = __cpuid(0);
+            let vendor: Vec<u8> = [l0.ebx, l0.edx, l0.ecx].iter().flat_map(|r| r.to_le_bytes()).collect();
+            let brand: Vec<u8> = (0x8000_0002u32..=0x8000_0004)
+                .flat_map(|leaf| {
+                    let r = __cpuid(leaf);
+                    [r.eax, r.ebx, r.ecx, r.edx]
+                })
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            let l1 = __cpuid(1).eax;
+            let mut offered = 0u64;
+            let mut n = 0u32;
+            // SAFETY: a u64 output buffer of the size passed.
+            let hres = unsafe { whv::WHvGetCapability(whv::WHvCapabilityCodeExtendedVmExits, (&raw mut offered).cast(), 8, &mut n) };
+            say(format!(
+                "e: host {} \"{}\", leaf 1 EAX {l1:#x} (family {:#x}, model {:#x}, stepping {}); ExtendedVmExits {:#010x} \
+                 {offered:#x}: ExceptionExit {}",
+                String::from_utf8_lossy(&vendor),
+                String::from_utf8_lossy(&brand).trim_matches(char::from(0)).trim(),
+                ((l1 >> 8) & 0xF) + if (l1 >> 8) & 0xF == 0xF { (l1 >> 20) & 0xFF } else { 0 },
+                ((l1 >> 4) & 0xF) | if matches!((l1 >> 8) & 0xF, 6 | 0xF) { (l1 >> 12) & 0xF0 } else { 0 },
+                l1 & 0xF,
+                hres.cast_unsigned(),
+                offered >> 2 & 1
+            ));
+            if offered & (1 << 2) == 0 {
+                say("ExceptionExit not offered: nothing else is run".to_string());
+                return;
+            }
+        }
+
+        // b: error codes.
+        match e0_vm(true, 14) {
+            Err(e) => say(format!("b: {e}")),
+            Ok((vm, mut vcpu, m)) => {
+                for (what, code) in [
+                    ("mov ds of selector 0x1234 (past the GDT's limit)", &[0x66, 0xB8, 0x34, 0x12, 0x8E, 0xD8][..]),
+                    ("int 0x41 (past the IDT's limit of 14 gates)", &[0xCD, 0x41][..]),
+                ] {
+                    let mut p = code.to_vec();
+                    p.extend_from_slice(&[0xE6, PORT as u8, 0xEB, 0xFE]);
+                    put(m, PROGRAM, &p);
+                    vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+                    let (first, ex) = raw_once(&mut vcpu);
+                    let mut l = format!("b: {what}: {first}");
+                    if let Some((13, code)) = ex {
+                        let given = give(&vcpu, event(GP, Some(code)));
+                        let (next, _) = raw_once(&mut vcpu);
+                        l += &format!("; given back with its error code ({given}): {next}");
+                        if next.starts_with("out 0x8d") {
+                            l += &format!("; {}", frame(&vcpu, m));
+                        }
+                    }
+                    say(l);
+                }
+                done(vcpu, vm, m);
+            }
+        }
+
+        // a: an external interrupt past the IDT's limit.
+        match e0_vm(true, 14) {
+            Err(e) => say(format!("a, an external interrupt: {e}")),
+            Ok((vm, mut vcpu, m)) => {
+                // The local APIC on (WRMSR 0x80f of 0x1ff), `out 0x80`; then
+                // `sti; jmp $`.
+                put(
+                    m,
+                    PROGRAM,
+                    &[0xB9, 0x0F, 0x08, 0, 0, 0xB8, 0xFF, 0x01, 0, 0, 0x31, 0xD2, 0x0F, 0x30, 0xE6, PORT as u8, 0xFB, 0xEB, 0xFE],
+                );
+                vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+                let (first, _) = raw_once(&mut vcpu);
+                if first.starts_with(&format!("out {PORT:#x}")) {
+                    regs::set_rip(vcpu.part(), vcpu.vp(), PROGRAM + 16).unwrap();
+                    vm.signal_msi(kvm_bindings::kvm_msi { address_lo: 0xFEE0_0000, data: 0x41, ..Default::default() }).unwrap();
+                    let (second, ex) = raw_once(&mut vcpu);
+                    let mut l = format!("a: vector 0x41 requested, the guest's IDT 14 gates long: {second}");
+                    if let Some((13, code)) = ex {
+                        let given = give(&vcpu, event(GP, Some(code)));
+                        let (next, _) = raw_once(&mut vcpu);
+                        l += &format!("; the #GP given back alone ({given}): {next}");
+                        if next.starts_with("out 0x8d") {
+                            l += &format!("; {}", frame(&vcpu, m));
+                        }
+                    }
+                    say(l);
+                } else {
+                    say(format!("a: the local APIC not turned on: {first}"));
+                }
+                done(vcpu, vm, m);
+            }
+        }
+
+        // a: a #GP past the IDT's limit, and then a #DF past it.
+        for (case, vectors) in [("a: #GP's gate past the IDT's limit (13 gates, #DF's among them)", 13u64), ("a: #GP's and #DF's gates past it (8 gates)", 8)] {
+            match e0_vm(true, vectors) {
+                Err(e) => say(format!("{case}: {e}")),
+                Ok((vm, mut vcpu, m)) => {
+                    vcpu.set_regs(&kvm_regs { rip: WRMSR_AT, rsp: 0x9000, rflags: 2, rax: 0x4_0041, rcx: 0x832, ..Default::default() })
+                        .unwrap();
+                    let (first, ex) = raw_once(&mut vcpu);
+                    let mut l = format!("{case}: WRMSR 0x832 of 0x40041: {first}");
+                    if let Some((13, code)) = ex {
+                        let given = give(&vcpu, event(GP, Some(code)));
+                        let (second, ex) = raw_once(&mut vcpu);
+                        l += &format!("; the #GP given back ({given}): {second}");
+                        if let Some((13, _)) = ex {
+                            // Two contributory faults: KVM makes them a #DF.
+                            let given = give(&vcpu, event(DF, Some(0)));
+                            let (third, ex) = raw_once(&mut vcpu);
+                            l += &format!("; a #DF given ({given}): {third}");
+                            if third.starts_with("out 0x88") {
+                                l += &format!("; {}", frame(&vcpu, m));
+                            } else if ex.is_some() {
+                                l += " (KVM's answer: a triple fault, KVM_EXIT_SHUTDOWN)";
+                            }
+                        } else if second.starts_with("out 0x88") {
+                            l += &format!("; {}", frame(&vcpu, m));
+                        }
+                    }
+                    say(l);
+                    done(vcpu, vm, m);
+                }
+            }
+        }
+
+        // c: EXTD clear.
+        match e0_vm(false, 14) {
+            Err(e) => say(format!("c, EXTD clear: {e}")),
+            Ok((vm, mut vcpu, m)) => {
+                // mov ebx, 0xfee00000; the spurious vector register 0x1ff;
+                // the LVT timer 0x400ec; mov eax, [rbx + 0x320].
+                put(
+                    m,
+                    PROGRAM,
+                    &[
+                        0xBB, 0x00, 0x00, 0xE0, 0xFE, 0xC7, 0x83, 0xF0, 0x00, 0x00, 0x00, 0xFF, 0x01, 0x00, 0x00, 0xC7, 0x83, 0x20,
+                        0x03, 0x00, 0x00, 0xEC, 0x00, 0x04, 0x00, 0x8B, 0x83, 0x20, 0x03, 0x00, 0x00, 0xE6, PORT as u8, 0xEB, 0xFE,
+                    ],
+                );
+                vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+                let (line, _) = raw_once(&mut vcpu);
+                say(format!(
+                    "c: EXTD clear: the guest's MMIO write of the LVT timer 0x400ec and its read: {line}; the guest read {:#x}; \
+                     KVM_GET_LAPIC's LVT timer {}",
+                    vcpu.get_regs().unwrap().rax,
+                    lvtt_of(&vcpu)
+                ));
+                vcpu.set_regs(&kvm_regs { rip: RDMSR_AT, rsp: 0x9000, rflags: 2, rcx: 0x802, ..Default::default() }).unwrap();
+                let (line, _) = raw_once(&mut vcpu);
+                say(format!("c: EXTD clear: the guest's RDMSR 0x802 (the x2APIC ID): {line}"));
+                done(vcpu, vm, m);
+            }
+        }
+
+        // c: EXTD set, the LVT timer written by the host.
+        match e0_vm(true, 14) {
+            Err(e) => say(format!("c, EXTD set: {e}")),
+            Ok((vm, mut vcpu, m)) => {
+                vcpu.set_regs(&kvm_regs { rip: WRMSR_AT, rsp: 0x9000, rflags: 2, rax: 0x1FF, rcx: 0x80F, ..Default::default() }).unwrap();
+                let (on, _) = raw_once(&mut vcpu);
+                say(format!("c: EXTD set: the guest's WRMSR 0x80f of 0x1ff: {on}"));
+                let guest_reads = |vcpu: &mut VcpuFd| {
+                    vcpu.set_regs(&kvm_regs { rip: RDMSR_AT, rsp: 0x9000, rflags: 2, rcx: 0x832, ..Default::default() }).unwrap();
+                    let (line, _) = raw_once(vcpu);
+                    let r = vcpu.get_regs().unwrap();
+                    format!("{line}, EDX:EAX {:#x}", (r.rdx << 32) | (r.rax & 0xFFFF_FFFF))
+                };
+                for value in [0x4_00ECu64, 0x1_00EC, 0x00EC] {
+                    let set = match ffi::set_register(vcpu.part(), vcpu.vp(), whv::WHvX64RegisterApicLvtTimer, ffi::reg64(value)) {
+                        Ok(()) => "taken".to_string(),
+                        Err(e) => format!("refused: errno {}", e.errno()),
+                    };
+                    let (register, lapic) = (timer_register(&vcpu), lvtt_of(&vcpu));
+                    let guest = guest_reads(&mut vcpu);
+                    say(format!(
+                        "c: EXTD set: WHvX64RegisterApicLvtTimer of {value:#x}: {set}; read back {register}; KVM_GET_LAPIC's LVT \
+                         timer {lapic}; the guest's RDMSR 0x832: {guest}"
+                    ));
+                }
+                let set = vcpu.get_lapic().and_then(|mut l| {
+                    for (i, b) in 0x4_00ECu32.to_le_bytes().into_iter().enumerate() {
+                        l.regs[0x320 + i] = b as std::os::raw::c_char;
+                    }
+                    vcpu.set_lapic(&l)
+                });
+                let set = match set {
+                    Ok(()) => "taken".to_string(),
+                    Err(e) => format!("refused: errno {}", e.errno()),
+                };
+                let (register, lapic) = (timer_register(&vcpu), lvtt_of(&vcpu));
+                let guest = guest_reads(&mut vcpu);
+                say(format!(
+                    "c: EXTD set: KVM_SET_LAPIC with the LVT timer 0x400ec: {set}; WHvX64RegisterApicLvtTimer {register}; \
+                     KVM_GET_LAPIC's {lapic}; the guest's RDMSR 0x832: {guest}"
+                ));
+                // The APIC ID register as the backend reads it (the legacy
+                // page, `lapic_page`, which `tscdeadline::deadline_interrupt`
+                // takes the destination from as `>> 24`) on vCPU 1, in xAPIC
+                // mode and after APIC_BASE.EXTD is set by the host.
+                match vm.create_vcpu(1) {
+                    Err(e) => say(format!("c: vCPU 1 not made: errno {}", e.errno())),
+                    Ok(one) => {
+                        let id = |v: &VcpuFd| {
+                            let page = v.lapic_page().map(|(p, _)| format!("{:#x}", u32::from_le_bytes(p[0x20..0x24].try_into().unwrap())));
+                            let register = ffi::get_register(v.part(), v.vp(), whv::WHvX64RegisterApicId).map(|r| format!("{:#x}", ffi::as_u64(&r)));
+                            let base = ffi::get_register(v.part(), v.vp(), whv::WHvX64RegisterApicBase).map(|r| format!("{:#x}", ffi::as_u64(&r)));
+                            format!(
+                                "APIC_BASE {}, the legacy page's ID register {}, WHvX64RegisterApicId {}",
+                                base.unwrap_or_else(|e| format!("not read: errno {}", e.errno())),
+                                page.unwrap_or_else(|e| format!("not read: errno {}", e.errno())),
+                                register.unwrap_or_else(|e| format!("not read: errno {}", e.errno()))
+                            )
+                        };
+                        let before = id(&one);
+                        let set = ffi::set_register(one.part(), one.vp(), whv::WHvX64RegisterApicBase, ffi::reg64(0xFEE0_0C00))
+                            .map_or_else(|e| format!("refused: errno {}", e.errno()), |()| "taken".to_string());
+                        say(format!("c: vCPU 1 in xAPIC mode: {before}; APIC_BASE 0xfee00c00 (EXTD) written by the host: {set}; then {}", id(&one)));
+                        drop(one);
+                    }
+                }
+                done(vcpu, vm, m);
+            }
+        }
+
+        // d: E's path for the TSC-deadline write.
+        match e0_vm(true, 14) {
+            Err(e) => say(format!("d: {e}")),
+            Ok((vm, mut vcpu, m)) => {
+                vcpu.set_regs(&kvm_regs { rip: WRMSR_AT, rsp: 0x9000, rflags: 2, rax: 0x1FF, rcx: 0x80F, ..Default::default() }).unwrap();
+                let _ = raw_once(&mut vcpu);
+                let mut code = vec![0xBB];
+                code.extend_from_slice(&ROUNDS.to_le_bytes());
+                code.extend_from_slice(&[0xB9, 0x32, 0x08, 0x00, 0x00, 0xB8, 0xEC, 0x00, 0x04, 0x00]);
+                code.extend_from_slice(&[0x31, 0xD2, 0x0F, 0x30, 0xFF, 0xCB, 0x75, 0xEE, 0xE6, PORT as u8, 0xEB, 0xFE]);
+                put(m, LOOP_AT, &code);
+                let (part, vp) = (vcpu.part(), vcpu.vp());
+                let mut best = f64::MAX;
+                let (mut exits, mut end) = (0u32, String::new());
+                for _ in 0..3 {
+                    vcpu.set_regs(&kvm_regs { rip: LOOP_AT, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+                    let watchdog = super::Watchdog::arm(&vcpu);
+                    let t = std::time::Instant::now();
+                    exits = 0;
+                    end = loop {
+                        if vcpu.shared.immediate_exit.load(Ordering::SeqCst) != 0 {
+                            break "none within 5 s (kicked)".to_string();
+                        }
+                        let ctx = match ffi::run_vp(part, vp) {
+                            Ok(c) => c,
+                            Err(e) => break format!("run failed, errno {}", e.errno()),
+                        };
+                        match ctx.ExitReason {
+                            whv::WHvRunVpExitReasonException => {
+                                // SAFETY: plain zeroed register values.
+                                let mut v: [whv::WHV_REGISTER_VALUE; 3] = unsafe { std::mem::zeroed() };
+                                let names = [whv::WHvX64RegisterRcx, whv::WHvX64RegisterRax, whv::WHvX64RegisterRdx];
+                                if let Err(e) = ffi::get_registers(part, vp, &names, &mut v) {
+                                    break format!("the registers not read, errno {}", e.errno());
+                                }
+                                let (rcx, rax) = (ffi::as_u64(&v[0]), ffi::as_u64(&v[1]));
+                                if rcx != 0x832 {
+                                    break format!("a #GP at another WRMSR, ECX {rcx:#x}");
+                                }
+                                let one_shot = rax & 0xFFFF_FFFF & !(0b11 << 17);
+                                let names = [whv::WHvX64RegisterApicLvtTimer, whv::WHvX64RegisterRip];
+                                if let Err(e) = ffi::set_registers(part, vp, &names, &[ffi::reg64(one_shot), ffi::reg64(ctx.VpContext.Rip + 2)]) {
+                                    break format!("the LVT timer and RIP not written, errno {}", e.errno());
+                                }
+                                exits += 1;
+                                if exits > 2 * ROUNDS {
+                                    break "more exits than WRMSRs".to_string();
+                                }
+                            }
+                            whv::WHvRunVpExitReasonX64IoPortAccess => {
+                                // SAFETY: the union arm matches the exit reason.
+                                let port = unsafe { ctx.Anonymous.IoPortAccess.PortNumber };
+                                break if port == PORT { "the loop's end".to_string() } else { format!("out {port:#x}") };
+                            }
+                            reason => break format!("exit reason {reason:#x} at RIP {:#x}", ctx.VpContext.Rip),
+                        }
+                    };
+                    best = best.min(t.elapsed().as_secs_f64() * 1e6 / f64::from(ROUNDS));
+                    drop(watchdog);
+                    vcpu.set_kvm_immediate_exit(0);
+                    if end != "the loop's end" {
+                        break;
+                    }
+                }
+                say(format!(
+                    "d: E's path: {ROUNDS} WRMSRs 0x832 of 0x400ec in a guest loop, each exception exit answered by the registers \
+                     read and the LVT timer (one-shot) and RIP written: the least of 3 runs {best:.3} us a WRMSR, {exits} exception \
+                     exits, ended by {end}; the LVT timer after: {}",
+                    timer_register(&vcpu)
+                ));
+                done(vcpu, vm, m);
+            }
+        }
+    }
+
     /// Record A of lazy-ram-options.md (COMMITTEST lines; no WHP): what
     /// `VirtualAlloc(MEM_COMMIT)` of reserved memory takes for 4 KiB,
     /// 64 KiB and 2 MiB (64 of each, the median, least and most), what the
