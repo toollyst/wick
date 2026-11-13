@@ -7,8 +7,10 @@
 //! kernel is done here in user space:
 //! - MMIO: data aborts are decoded into `VcpuExit::MmioRead`/`MmioWrite`;
 //!   `ioeventfd` writes are matched before returning to the caller;
-//! - interrupts: Hypervisor.framework's GICv3 (`hv_gic_*`, macOS 15+); `irqfd`s are
-//!   served by a thread that turns eventfd writes into `hv_gic_set_spi`;
+//! - interrupts: Hypervisor.framework's GICv3 (`hv_gic_*`, macOS 15+); an
+//!   `irqfd` written by a thread of this process raises its SPI or MSI in that
+//!   thread, as KVM's does, and one written by another process (a vhost-user
+//!   backend) is raised by a thread that reads the eventfd;
 //! - PSCI 0.2 (`HVC`/`SMC`) for CPU on/off, system off and reset;
 //! - `WFI` waits in user space until the virtual timer deadline or a wake-up;
 //! - the virtual timer interrupt is made pending in the redistributor on

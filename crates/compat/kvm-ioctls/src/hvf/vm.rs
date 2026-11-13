@@ -19,7 +19,7 @@ use kvm_bindings::{
     kvm_userspace_memory_region, kvm_vcpu_init,
 };
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+use vmm_sys_util::eventfd::{ConsumerId, EFD_NONBLOCK, EventFd};
 
 use super::device::{DeviceFd, DeviceKind};
 use super::ffi::*;
@@ -132,10 +132,21 @@ fn host_page_size() -> u64 {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
 }
 
+/// An irqfd: the VM's handle of the eventfd, and the consumer that raises
+/// its interrupt when a thread of this process writes it.
 #[derive(Debug)]
 struct IrqFd {
     fd: EventFd,
     gsi: u32,
+    consumer: ConsumerId,
+}
+
+impl Drop for IrqFd {
+    /// The VM is going away: a consumer left behind (one running now, which
+    /// may be what drops the VM) finds no VM and leaves the write counted.
+    fn drop(&mut self) {
+        self.fd.try_remove_consumer(self.consumer);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -699,9 +710,11 @@ impl VmInner {
         self.vtimer_gen.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Waits for irqfds and injects their interrupts. The thread holds the VM
-    /// only while it handles events, so dropping the `VmFd` (which stops and
-    /// joins it) releases the VM at once.
+    /// Waits for irqfds and injects their interrupts: the writes made through
+    /// a handle of another process (a vhost-user backend's), which the
+    /// consumer of [`VmFd::register_irqfd`] does not see. The thread holds
+    /// the VM only while it handles events, so dropping the `VmFd` (which
+    /// stops and joins it) releases the VM at once.
     fn irqfd_thread(epoll: Arc<Epoll>, vm: Weak<VmInner>) {
         let mut events = vec![EpollEvent::default(); 64];
         loop {
@@ -1051,28 +1064,65 @@ impl VmFd {
     }
 
     /// Raises the interrupt routed to `gsi` whenever `fd` is written.
+    ///
+    /// As KVM's irqfd does, a write by a thread of this process raises it in
+    /// that thread, before the write returns: KVM hooks the eventfd's wait
+    /// queue and injects an SPI there (Linux v6.1 virt/kvm/eventfd.c
+    /// `irqfd_wakeup`, arch/arm64/kvm/vgic/vgic-irqfd.c
+    /// `kvm_arch_set_irq_inatomic`), and here the eventfd's consumer does
+    /// ([`EventFd::add_consumer`]). Hypervisor.framework's `hv_gic_set_spi`
+    /// and `hv_gic_send_msi` are the VM's, not a vCPU's: unlike the calls
+    /// that take a vCPU, their documentation sets no thread they must be
+    /// called from (hv_gic.h, macOS 27.2 SDK). A write through a handle of
+    /// another process (a vhost-user backend's) is counted in the
+    /// descriptor, where the irqfd thread finds it and raises it.
+    ///
+    /// The consumer takes the locks of [`VmInner::inject`]: `irq`, then
+    /// `deferred_spis`, `vcpus` and a vCPU's `power`, each after the one
+    /// before or alone, the order the rest of the backend takes them in. No
+    /// thread writes an eventfd while holding one of them (the backend's
+    /// own writes are the ioeventfds', under `ioevents`, and its stop
+    /// event's, under none), and none of them is held while a consumer is
+    /// removed ([`Self::unregister_irqfd`]), which waits for its runs.
+    ///
+    /// An eventfd already registered with this VM fails with `EBUSY`, as on
+    /// KVM (`kvm_irqfd_assign`).
     pub fn register_irqfd(&self, fd: &EventFd, gsi: u32) -> Result<()> {
         self.fd.check()?;
+        let id = fd_identity(fd.as_raw_fd())?;
         let clone = fd.try_clone().map_err(io_err)?;
         let raw = clone.as_raw_fd();
-        self.inner
-            .irq
-            .lock()
-            .unwrap()
-            .irqfds
-            .insert(raw, IrqFd { fd: clone, gsi });
+        let mut irq = self.inner.irq.lock().unwrap();
+        if irq.irqfds.keys().any(|r| fd_identity(*r).ok() == Some(id)) {
+            return err(libc::EBUSY);
+        }
+        let vm = Arc::downgrade(&self.inner);
+        let consumer = fd.add_consumer(Box::new(move || match vm.upgrade() {
+            Some(vm) if !vm.stop.load(Ordering::Acquire) => {
+                vm.inject(gsi);
+                true
+            }
+            _ => false,
+        }));
+        irq.irqfds.insert(raw, IrqFd { fd: clone, gsi, consumer });
+        drop(irq);
         if let Err(e) = self.inner.epoll.ctl(
             ControlOperation::Add,
             raw,
             EpollEvent::new(EventSet::IN, raw as u64),
         ) {
-            self.inner.irq.lock().unwrap().irqfds.remove(&raw);
+            let removed = self.inner.irq.lock().unwrap().irqfds.remove(&raw);
+            if let Some(irqfd) = removed {
+                irqfd.fd.remove_consumer(irqfd.consumer);
+            }
             return Err(io_err(e));
         }
         Ok(())
     }
 
-    /// Removes an irqfd registered with [`Self::register_irqfd`].
+    /// Removes an irqfd registered with [`Self::register_irqfd`]. Once it
+    /// returns, a write of the eventfd raises nothing, as KVM's deassignment
+    /// waits for the injections under way (`kvm_irqfd_deassign`).
     pub fn unregister_irqfd(&self, fd: &EventFd, gsi: u32) -> Result<()> {
         self.fd.check()?;
         let id = fd_identity(fd.as_raw_fd())?;
@@ -1089,7 +1139,10 @@ impl VmFd {
             .inner
             .epoll
             .ctl(ControlOperation::Delete, raw, EpollEvent::default());
-        irq.irqfds.remove(&raw);
+        let irqfd = irq.irqfds.remove(&raw).expect("found above");
+        // Not under `irq`, which a running consumer may wait for.
+        drop(irq);
+        irqfd.fd.remove_consumer(irqfd.consumer);
         Ok(())
     }
 
@@ -1349,6 +1402,168 @@ mod tests {
         vm.get_preferred_target(&mut kvi).unwrap();
         vcpu.vcpu_init(&kvi).unwrap();
         (vm, gic, vcpu)
+    }
+
+    /// Runs `body` on the thread of the VM's vCPU 0 once its first run made
+    /// it, with SPIs `edges` edge-triggered (`GICD_ICFGR`), as Firecracker's
+    /// device tree makes a virtio device's.
+    fn with_created_vcpu(edges: &[u32], body: impl FnOnce(VmFd) + Send + 'static) {
+        let (vm, _gic, mut vcpu) = vm_with_gic();
+        let edges = edges.to_vec();
+        std::thread::spawn(move || {
+            vcpu.set_kvm_immediate_exit(1);
+            assert_eq!(vcpu.run().unwrap_err().errno(), libc::EINTR);
+            for intid in edges {
+                let reg = 0xc00 + 4 * (intid / 16);
+                let mut v = 0;
+                // SAFETY: plain calls with a valid output.
+                check(unsafe { hv_gic_get_distributor_reg(reg, &mut v) }).unwrap();
+                v |= 2 << (2 * (intid % 16));
+                // SAFETY: as above.
+                check(unsafe { hv_gic_set_distributor_reg(reg, v) }).unwrap();
+            }
+            body(vm);
+            drop(vcpu);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Waits up to `limit` for `done`.
+    fn within(limit: Duration, done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !done() {
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
+
+    #[test]
+    fn test_an_irqfd_write_raises_its_spi_before_it_returns() {
+        // As KVM's irqfd, which injects an SPI in the writer's thread
+        // (virt/kvm/eventfd.c irqfd_wakeup): with the irqfd thread stopped,
+        // the write itself has made the SPI pending, and taken the count.
+        with_created_vcpu(&[40], |mut vm| {
+            let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+            vm.register_irqfd(&evt, 8).unwrap();
+            vm.inner.stop_evt.write(1).unwrap();
+            vm.threads.remove(0).join().unwrap();
+            assert!(!spi_pending(40));
+            evt.write(1).unwrap();
+            assert!(spi_pending(40), "the write returned before its SPI was raised");
+            assert_eq!(evt.read().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        });
+    }
+
+    #[test]
+    fn test_an_irqfd_write_of_another_process_is_raised_by_the_irqfd_thread() {
+        // A handle made from the descriptor, as another process (a
+        // vhost-user backend) has it, counts its writes in the descriptor:
+        // the irqfd thread raises them.
+        with_created_vcpu(&[41], |vm| {
+            let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+            vm.register_irqfd(&evt, 9).unwrap();
+            // SAFETY: a new descriptor of the eventfd, owned by the handle.
+            let other = unsafe { EventFd::from_raw_fd(libc::dup(evt.as_raw_fd())) };
+            other.write(1).unwrap();
+            assert!(
+                within(Duration::from_secs(10), || spi_pending(41)),
+                "the irqfd thread did not raise another process's write in 10 s"
+            );
+            assert!(within(Duration::from_secs(10), || evt.read().is_err()), "the count was not taken");
+        });
+    }
+
+    #[test]
+    fn test_an_unregistered_irqfd_raises_nothing() {
+        with_created_vcpu(&[42], |vm| {
+            let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+            vm.register_irqfd(&evt, 10).unwrap();
+            vm.unregister_irqfd(&evt, 10).unwrap();
+            assert_eq!(vm.unregister_irqfd(&evt, 10).unwrap_err().errno(), libc::ENOENT);
+            evt.write(1).unwrap();
+            assert!(!spi_pending(42));
+            assert_eq!(evt.read().unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn test_an_eventfd_is_one_irqfd_of_a_vm() {
+        // kvm_irqfd_assign: "This fd is used for another irq already."
+        let (vm, _gic, _vcpu) = vm_with_gic();
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        vm.register_irqfd(&evt, 8).unwrap();
+        assert_eq!(vm.register_irqfd(&evt, 9).unwrap_err().errno(), libc::EBUSY);
+        assert_eq!(vm.register_irqfd(&evt.try_clone().unwrap(), 8).unwrap_err().errno(), libc::EBUSY);
+        vm.unregister_irqfd(&evt, 8).unwrap();
+        vm.register_irqfd(&evt, 9).unwrap();
+    }
+
+    #[test]
+    fn test_irqfd_writes_registrations_and_the_irqfd_thread_do_not_wait_for_each_other() {
+        // Writers raising interrupts in their threads, registrations coming
+        // and going, writes through another process's handle that the irqfd
+        // thread reads under the VM's `irq` lock, and a thread that holds
+        // `irq` and `vcpus` as the backend does: none may wait for another
+        // forever. A removal under `irq` (which a running consumer waits
+        // for) or a consumer called under the eventfd's own lock (which the
+        // irqfd thread takes under `irq`) deadlocks here.
+        // The threads are not scoped: a deadlocked one is left behind, and
+        // the test fails by its name rather than waiting for it.
+        with_created_vcpu(&[43], |vm| {
+            let vm = Arc::new(vm);
+            let evt = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+            // SAFETY: a new descriptor of the eventfd, owned by the handle.
+            let other = unsafe { EventFd::from_raw_fd(libc::dup(evt.as_raw_fd())) };
+            let stop = Arc::new(AtomicBool::new(false));
+            let rounds = Arc::new(AtomicU64::new(0));
+            let mut threads = Vec::new();
+            for _ in 0..3 {
+                let (evt, stop) = (evt.clone(), stop.clone());
+                threads.push(std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        evt.write(1).unwrap();
+                    }
+                }));
+            }
+            let s = stop.clone();
+            threads.push(std::thread::spawn(move || {
+                while !s.load(Ordering::Relaxed) {
+                    other.write(1).unwrap();
+                }
+            }));
+            let (v, e, s) = (vm.clone(), evt.clone(), stop.clone());
+            threads.push(std::thread::spawn(move || {
+                while !s.load(Ordering::Relaxed) {
+                    let _irq = v.inner.irq.lock().unwrap();
+                    let _vcpus = v.inner.vcpus.lock().unwrap();
+                    let _ = e.read();
+                }
+            }));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (v, e, r) = (vm.clone(), evt.clone(), rounds.clone());
+            std::thread::spawn(move || {
+                for _ in 0..2000 {
+                    v.register_irqfd(&e, 11).unwrap();
+                    v.unregister_irqfd(&e, 11).unwrap();
+                    r.fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = tx.send(());
+            });
+            let ended = rx.recv_timeout(Duration::from_secs(60)).is_ok();
+            assert!(
+                ended,
+                "registrations stopped after {} of 2000 rounds: a lock order deadlock",
+                rounds.load(Ordering::Relaxed)
+            );
+            stop.store(true, Ordering::Relaxed);
+            for t in threads {
+                t.join().unwrap();
+            }
+        });
     }
 
     #[test]
