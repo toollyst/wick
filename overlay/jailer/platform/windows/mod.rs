@@ -1907,9 +1907,12 @@ struct GroupAffinity {
 }
 
 /// The UI limits of a jail's job: every one a Job Object has
-/// (`JOBOBJECT_BASIC_UI_RESTRICTIONS`). A job that sets any is not nested in
-/// another job nor another in it, which is why a parent job, a
-/// `--parent-cgroup`, is refused (cgroup.rs, `PARENT_NOT_DONE`).
+/// (`JOBOBJECT_BASIC_UI_RESTRICTIONS`). Microsoft Learn says a job that sets
+/// any is not nested in another job nor another in it ("Nested Jobs",
+/// `AssignProcessToJobObject`); Windows Server 2025 (build 26100) nests it
+/// both ways all the same (`test_a_jails_job_under_a_parent_job_on_record`,
+/// `test_nested_jobs_on_record`, CI run 43359525691). Older builds are not
+/// measured.
 const JAIL_UI_LIMITS: u32 = JOB_OBJECT_UILIMIT_DESKTOP
     | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
     | JOB_OBJECT_UILIMIT_EXITWINDOWS
@@ -3115,27 +3118,42 @@ mod tests {
         if ok == 0 { Err(last_error().raw_os_error().unwrap_or(0)) } else { Ok(()) }
     }
 
-    /// Why a named `--parent-cgroup` is refused (cgroup.rs,
-    /// `PARENT_NOT_DONE`): a process in a job, as a jail under a parent job
-    /// would be, cannot join the job the jailer makes for a jail, which sets
-    /// UI limits; a job that sets none takes it, nested in the first
-    /// (Microsoft Learn, "Nested Jobs" and `AssignProcessToJobObject`).
+    /// On record, for the design of `--parent-cgroup` (refused meanwhile:
+    /// cgroup.rs, `PARENT_NOT_DONE`): whether a process in a job, as a jail
+    /// under a parent job would be, joins the job the jailer makes for a
+    /// jail, which sets UI limits. Microsoft Learn says it does not: "the
+    /// jobs are nested by default if the system can form a valid job
+    /// hierarchy and neither job sets UI limits" ("Nested Jobs"), and the
+    /// job a process already in one joins "cannot have UI limits set"
+    /// (`AssignProcessToJobObject`). Windows Server 2025, build 26100, took
+    /// it, nested (CI run 43359525691: `Ok(())`), so the sentence is not
+    /// asserted: the NESTTEST line, with the build it is of, is each run's
+    /// answer. What must hold on any build: the process is in the jail's
+    /// job exactly when Windows said so, still in its parent, and a job
+    /// that sets no UI limits nests.
     #[test]
-    #[ignore = "run alone by CI's windows job, after the kit is uploaded"]
-    fn test_a_jails_job_does_not_nest() {
+    #[ignore = "a record of what a jail's job does under a parent job, run alone by CI's windows job"]
+    fn test_a_jails_job_under_a_parent_job_on_record() {
         let parent = plain_job(None);
         let p = held_process();
         assign(&parent, &p).unwrap();
         let jail = job(&Limits::default()).unwrap();
-        let refused = assign(&jail, &p);
-        println!("NESTTEST a jail's job for a process of a parent job: {refused:?}");
-        assert!(refused.is_err(), "a jail's job took a process that is in another job");
-        assert!(!in_job(p.process.as_raw_handle(), Some(&jail)));
-        // The control: the same order nests a job that sets no UI limits.
-        let inner = plain_job(None);
-        assign(&inner, &p).unwrap();
+        let nested = assign(&jail, &p);
+        let windows = std::process::Command::new("cmd")
+            .args(["/c", "ver"])
+            .output()
+            .map_or_else(|e| format!("ver: {e}"), |o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        println!("NESTTEST a jail's job for a process of a parent job: {nested:?} ({windows})");
+        assert_eq!(in_job(p.process.as_raw_handle(), Some(&jail)), nested.is_ok());
         assert!(in_job(p.process.as_raw_handle(), Some(&parent)));
-        assert!(in_job(p.process.as_raw_handle(), Some(&inner)));
+        // The control, with a process of its own: the same order nests a
+        // job that sets no UI limits.
+        let q = held_process();
+        assign(&parent, &q).unwrap();
+        let inner = plain_job(None);
+        assign(&inner, &q).unwrap();
+        assert!(in_job(q.process.as_raw_handle(), Some(&parent)));
+        assert!(in_job(q.process.as_raw_handle(), Some(&inner)));
     }
 
     /// On record, no check of the product: what Windows does with the jobs

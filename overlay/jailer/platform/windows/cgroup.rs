@@ -57,19 +57,22 @@ use crate::platform::{self, FreezerState, FreezerVersion, HostError, Limits};
 /// which the operator sets, bound every jail under it together. On Windows
 /// that is a Job Object that holds the jails' jobs: a process in a job can
 /// be put in a second job, nested in the first, whose limits then bound it
-/// too (Microsoft Learn, "Nested Jobs"). But "the jobs are nested by default
-/// if the system can form a valid job hierarchy and neither job sets UI
-/// limits" (the same page), and a process already in a job joins only a job
-/// that "cannot have UI limits set" (`AssignProcessToJobObject`): every
-/// jail's job sets them (`platform::job`,
-/// `test_a_jails_job_does_not_nest`). Taking them off the jail's job is a
-/// change to the jail's isolation that is not decided, so no parent job is
-/// made or joined, and the flag is refused rather than accepted without
-/// effect.
+/// too (Microsoft Learn, "Nested Jobs"). The same page says "the jobs are
+/// nested by default if the system can form a valid job hierarchy and
+/// neither job sets UI limits", and `AssignProcessToJobObject` that a
+/// process already in a job joins only a job that "cannot have UI limits
+/// set", which every jail's job does (`platform::job`). Windows Server 2025
+/// (build 26100) nests a jail's job under a parent all the same, and bounds
+/// two jobs by their parent's memory limit together
+/// (`test_a_jails_job_under_a_parent_job_on_record`,
+/// `test_nested_jobs_on_record`: CI run 43359525691); Windows 10, 11 and
+/// Server 2022 are not measured. The parent job itself (who makes it and
+/// keeps it: a job's name does not outlive its handles) is designed and not
+/// built, so no parent job is made or joined, and the flag is refused
+/// rather than accepted without effect.
 pub(crate) const PARENT_NOT_DONE: &str = "not done yet: a parent cgroup that bounds a group of \
-    jails is on Windows a Job Object that holds the jails' jobs, and Windows nests no job that sets \
-    UI limits, which every jail's job does; leave --parent-cgroup out, and each jail's own --cgroup \
-    limits still apply";
+    jails is on Windows a Job Object that holds the jails' jobs, which the jailer does not make or \
+    join yet; leave --parent-cgroup out, and each jail's own --cgroup limits still apply";
 
 /// Refuses a `--parent-cgroup` named on the jailer's command line (`args`,
 /// the program first; Firecracker's arguments, after `--`, are not the

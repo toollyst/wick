@@ -809,13 +809,15 @@ jobs:
             echo "::error::$t did not pass alone"
             failed=1
           fi
-          # The jailer's two tests of nested Job Objects (no WHP in them):
-          # why a named --parent-cgroup is refused, which must hold, and
-          # the record of what nesting does (NESTTEST lines).
+          # The jailer's two records of nested Job Objects (no WHP in them),
+          # for the design of --parent-cgroup: whether a jail's job, which
+          # sets UI limits, nests under a parent job (Microsoft Learn says
+          # no; Windows Server 2025 build 26100 did, run 43359525691: the
+          # line names the build), and what nesting does (NESTTEST lines).
           # With them, the hugetlb page sizes test for its HUGETLBTEST line:
           # whether this runner's processor has 1 GiB pages, which decides
           # which of the test's two 1GB halves ran.
-          for t in test_a_jails_job_does_not_nest test_nested_jobs_on_record \
+          for t in test_a_jails_job_under_a_parent_job_on_record test_nested_jobs_on_record \
               test_hugetlb_page_sizes_are_linuxs; do
             out=$(cargo test --locked -p jailer -- \
               --include-ignored --nocapture --test-threads=1 "$t" 2>&1) || true
