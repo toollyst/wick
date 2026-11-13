@@ -4392,6 +4392,7 @@ mod fpu_tests {
         while exits.len() < 40 {
             let (line, more) = match vcpu.run() {
                 Ok(VcpuExit::IoOut(PORT, _)) => ("the end".to_string(), false),
+                Ok(VcpuExit::IoOut(FAULT_PORT, data)) => (fault_line(data), false),
                 Ok(VcpuExit::IoOut(port, data)) => (format!("out {port:#x} {data:02x?}"), true),
                 Ok(VcpuExit::IoIn(port, data)) => {
                     answer(data);
@@ -4402,7 +4403,7 @@ mod fpu_tests {
                     (format!("read {address:#x} x{}", data.len()), true)
                 }
                 Ok(VcpuExit::MmioWrite(address, data)) => (format!("write {address:#x} {data:02x?}"), true),
-                Ok(VcpuExit::Shutdown) => ("Shutdown".to_string(), false),
+                Ok(VcpuExit::Shutdown) => ("Shutdown (a triple fault)".to_string(), false),
                 Ok(_) => ("(another)".to_string(), false),
                 Err(e) if e.errno() == libc::EINTR => ("none within 5 s (kicked)".to_string(), false),
                 Err(e) => (format!("run failed, errno {}", e.errno()), false),
@@ -4429,17 +4430,44 @@ mod fpu_tests {
 
     /// Where the MMIO tests' guest code starts, and the vector and handler
     /// of the interrupt they take: the handler does `out 0x81, al`, writes
-    /// the local APIC's EOI (RBX holds its base) and returns.
+    /// the local APIC's EOI (at 0xFEE000B0, RBX kept) and returns.
     const MMIO_PROGRAM: u64 = 0xB000;
     const MMIO_HANDLER: u64 = 0xB800;
     const MMIO_IDT: u64 = 0x5000;
     const MMIO_VECTOR: u64 = 0x41;
+    /// Where the MMIO tests' exception gates (vectors 0-31) go: each does
+    /// `out FAULT_PORT, <vector>` over and over, so a fault the test did
+    /// not mean names itself instead of ending as a triple fault (a
+    /// `Shutdown` exit, after which the vector is lost). A test that
+    /// handles an exception writes its own gate over its vector's.
+    const MMIO_FAULTS: u64 = 0xBC00;
+    const FAULT_PORT: u16 = 0x8F;
+
+    /// A fault gate's `out`, as a line: the exception's vector and name.
+    fn fault_line(data: &[u8]) -> String {
+        let vector = data.first().copied().unwrap_or(0xff);
+        let name = match vector {
+            0 => "#DE",
+            1 => "#DB",
+            3 => "#BP",
+            6 => "#UD",
+            8 => "#DF",
+            12 => "#SS",
+            13 => "#GP",
+            14 => "#PF",
+            17 => "#AC",
+            18 => "#MC",
+            _ => "",
+        };
+        format!("fault: exception {vector} {name}")
+    }
 
     /// A VM of the MMIO tests: `guest()`'s memory, a device's 2 MiB at
     /// 6 MiB (no slot backs it), RAM from 2 to 4 MiB mapped and the 2 MiB
     /// above it a device's too (from 4 MiB, where the slot ends), the local
     /// APIC's page, an IDT with `MMIO_VECTOR`'s gate, and `program` at
-    /// `MMIO_PROGRAM`; the vCPU in long mode there.
+    /// `MMIO_PROGRAM`, each exception's gate a `MMIO_FAULTS` stub; the
+    /// vCPU in long mode there.
     fn mmio_guest(program: &[u8]) -> (super::super::VmFd, VcpuFd, *mut u8) {
         let vm = super::super::VmFd::create().unwrap();
         let m = guest();
@@ -4449,14 +4477,28 @@ mod fpu_tests {
         q(0x3018, 0x60_0000 | 0x83);
         q(0x2018, 0xA000 | 3);
         q(0xA000 + 0x1f7 * 8, 0xFEE0_0000 | 0x83);
+        for vector in 0..32u64 {
+            let stub = MMIO_FAULTS + vector * 8;
+            // mov al, vector; out FAULT_PORT, al; jmp to the out
+            put(m, stub, &[0xB0, vector as u8, 0xE6, FAULT_PORT as u8, 0xEB, 0xFC]);
+            q(MMIO_IDT + vector * 16, (stub & 0xffff) | (8 << 16) | (0x8E << 40));
+            q(MMIO_IDT + vector * 16 + 8, 0);
+        }
         q(MMIO_IDT + MMIO_VECTOR * 16, (MMIO_HANDLER & 0xffff) | (8 << 16) | (0x8E << 40));
         q(MMIO_IDT + MMIO_VECTOR * 16 + 8, 0);
         put(
             m,
             MMIO_HANDLER,
+            // RBX is the handler's own: an instruction before the interrupt
+            // may have changed it (CPUID writes EBX; on a PC at 4999ff6 the
+            // EOI went to the vendor string's address, a #PF with no gate
+            // for it, and the guest triple faulted).
             &[
                 0xE6, 0x81, // out 0x81, al
+                0x53, // push rbx
+                0xBB, 0x00, 0x00, 0xE0, 0xFE, // mov ebx, 0xFEE00000
                 0xC7, 0x83, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov dword [rbx + 0xB0], 0 (EOI)
+                0x5B, // pop rbx
                 0x48, 0xCF, // iretq
             ],
         );
@@ -4502,8 +4544,11 @@ mod fpu_tests {
                 format!("read {address:#x} x{}", data.len())
             }
             Ok(VcpuExit::MmioWrite(address, data)) => format!("write {address:#x} {data:02x?}"),
+            Ok(VcpuExit::IoOut(FAULT_PORT, data)) => fault_line(data),
             Ok(VcpuExit::IoOut(port, data)) => format!("out {port:#x} {data:02x?}"),
             Ok(VcpuExit::InternalError) => "InternalError".to_string(),
+            Ok(VcpuExit::Shutdown) => "Shutdown (a triple fault)".to_string(),
+            Ok(VcpuExit::Hlt) => "Hlt".to_string(),
             Ok(_) => "(another)".to_string(),
             Err(e) if e.errno() == libc::EINTR => "EINTR".to_string(),
             Err(e) => format!("run failed, errno {}", e.errno()),
@@ -4615,6 +4660,15 @@ mod fpu_tests {
             };
             let ports: Vec<&str> = exits.iter().map(|e| &e[..e.find(" [").unwrap_or(e.len())]).collect();
             assert_eq!(ports, expected, "{name} in STI's shadow");
+            if name == "CPUID" {
+                // EAX was 0 at `out 0x83`; CPUID leaf 0 sets it to the
+                // highest basic leaf. The handler's AL is the program's AL
+                // at its end: the CPUID finished before the interrupt, as
+                // KVM's skip_emulated_instruction ends the shadow after it.
+                let al = |e: &str| e.rsplit_once(" [").map(|(_, d)| d.trim_end_matches(']').to_string());
+                assert_ne!(al(&exits[2]).as_deref(), Some("00"), "CPUID leaf 0 left EAX 0: the check proves nothing: {exits:?}");
+                assert_eq!(al(&exits[1]), al(&exits[2]), "the interrupt came before the CPUID finished: {exits:?}");
+            }
             drop(vcpu);
             drop(vm);
             // SAFETY: as above.
