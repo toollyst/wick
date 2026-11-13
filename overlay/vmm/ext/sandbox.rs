@@ -4282,7 +4282,8 @@ mod macos {
 
         /// The families of [`test_system_socket_is_not_consulted_for_these`]:
         /// name, domain, type, protocol, and whether Seatbelt consulted
-        /// `system-socket` when one was made on macOS 27.2.
+        /// `system-socket` when one was made (the same on each of
+        /// [`SOCKET_MEASURED_MAJORS`]).
         const SOCKET_DOMAINS: &[(&str, i32, i32, i32, bool)] = &[
             ("AF_UNIX", libc::AF_UNIX, libc::SOCK_STREAM, 0, false),
             ("AF_INET", libc::AF_INET, libc::SOCK_STREAM, 0, false),
@@ -4291,18 +4292,22 @@ mod macos {
             ("AF_SYSTEM", libc::AF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL, true),
         ];
 
+        /// The majors [`SOCKET_DOMAINS`] was measured on: 27.2 on a Mac, 15.8.2
+        /// and 26.7.2 on CI's runners (macos-seatbelt, run 43433573394).
+        const SOCKET_MEASURED_MAJORS: &[u32] = &[15, 26, 27];
+
         // Why an IP socket is still made after narrow(): the kernel asks the
         // MAC policies about every socket made, whatever its family
         // (xnu-12377.1.9 bsd/kern/uipc_syscalls.c socket_common calls
         // mac_socket_check_create, security/mac_socket.c, with the domain),
         // but Sandbox.kext does not consult `system-socket` for a Unix or IP
         // one: under `(deny system-socket)` they are made, a routing and a
-        // kernel control socket fail with EPERM. Measured on macOS 27.2;
-        // this sentinel fails there if that changes (a macOS that consults
-        // it for IP sockets lets the run phase refuse them when made, as
-        // Linux's filters refuse socket(AF_INET)), and on another major
-        // prints what it finds (CI runs it on macOS 15 and 26 with
-        // --nocapture).
+        // kernel control socket fail with EPERM. Measured on macOS 15, 26 and
+        // 27 (SOCKET_MEASURED_MAJORS); this sentinel fails on them if that
+        // changes (a macOS that consults it for IP sockets lets the run
+        // phase refuse them when made, as Linux's filters refuse
+        // socket(AF_INET)), and on another major prints what it finds (CI
+        // runs it with --nocapture).
         #[test]
         fn test_system_socket_is_not_consulted_for_these() {
             let major = macos_major();
@@ -4319,7 +4324,7 @@ mod macos {
                 println!("macOS {major}, under (deny system-socket): {line}");
                 found.push((*name, made, *consulted));
             }
-            if major != 27 {
+            if !SOCKET_MEASURED_MAJORS.contains(&major) {
                 println!("macOS {major} is not measured: printed only");
                 return;
             }
@@ -4327,7 +4332,7 @@ mod macos {
                 assert_eq!(
                     made,
                     !consulted,
-                    "macOS 27: Seatbelt {} system-socket for {name} now; if it consults it for IP sockets, \
+                    "macOS {major}: Seatbelt {} system-socket for {name} now; if it consults it for IP sockets, \
                      the run phase can refuse them when made (RUN_DENIED_OPERATIONS), as Linux's filters \
                      refuse socket(AF_INET); update SOCKET_DOMAINS and COMPATIBILITY.md's Argument checks\n{}",
                     if made { "skips" } else { "consults" },

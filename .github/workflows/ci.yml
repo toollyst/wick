@@ -500,8 +500,8 @@ jobs:
           cargo test --locked -p vmm --lib \
             ext::sandbox::macos::tests::test_sigsys_handler_work_ends_the_process_within_its_deadline \
             -- --exact --nocapture
-          # Which socket families Seatbelt consults system-socket for: measured
-          # on macOS 27.2 only, so on these majors it prints what it finds.
+          # Which socket families Seatbelt consults system-socket for, alone
+          # and with --nocapture so that each major's findings are in the log.
           cargo test --locked -p vmm --lib \
             ext::sandbox::macos::tests::test_system_socket_is_not_consulted_for_these \
             -- --exact --nocapture
