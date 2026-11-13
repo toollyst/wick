@@ -16,7 +16,7 @@
 //! | `cpuset.cpus` | `cpuset.cpus` | the job's processor affinity ([`cpu_groups`]) |
 //! | `cpuset.mems` | `cpuset.mems` | every memory node of the host: nothing to bind ([`check_mems`]) |
 //! | `hugetlb.2MB.max` | `hugetlb.2MB.limit_in_bytes` | the large-page sections the jailer gives Firecracker, in all (`platform::large_pages`) |
-//! | `pids.max`, `hugetlb.<size>.max`, `hugetlb.<size>.rsvd.max`, `memory.high`, `memory.swap.max`, `memory.swap.high`, `memory.zswap.max` = `max` | `pids.max` = `max`; `hugetlb.<size>.limit_in_bytes`, `hugetlb.<size>.rsvd.limit_in_bytes`, `memory.memsw.limit_in_bytes`, `memory.soft_limit_in_bytes` = `-1` | no limit, as on Linux ([`no_limit`]) |
+//! | `pids.max`, `hugetlb.<size>.max`, `hugetlb.<size>.rsvd.max`, `memory.high`, `memory.swap.max`, `memory.swap.high`, `memory.zswap.max` = `max` | `pids.max` = `max`; `hugetlb.<size>.limit_in_bytes`, `hugetlb.<size>.rsvd.limit_in_bytes`, `memory.memsw.limit_in_bytes`, `memory.soft_limit_in_bytes` = `-1` | no limit, as on Linux ([`no_limit`]); `<size>` is one an x86_64 Linux has files for ([`linux_hugetlb_size`]) |
 //!
 //! The CPU rate cap holds from Firecracker's start, as a cgroup's limit
 //! holds from the exec. Windows enforces the rate over its own scheduling
@@ -195,6 +195,11 @@ impl CgroupConfigurationBuilder {
                     Some(value.parse().map_err(|_| bad("not a number of bytes"))?)
                 };
             }
+            // A page size Linux has no hugetlb files for: the write fails
+            // there (no such file), at any value.
+            (_, f) if hugetlb_size(f).is_some_and(|size| !linux_hugetlb_size(size, host_gb_pages())) => {
+                return Err(bad(NO_SUCH_PAGE_SIZE));
+            }
             // A limit file at the value that sets no limit: nothing to
             // enforce, so nothing is accepted without effect.
             (version, f) if no_limit(version, f, &value) => {}
@@ -258,7 +263,36 @@ const CAP_AND_WEIGHT: &str = "a Job Object takes a CPU rate cap (cpu.max) or a C
 const MEMS_BIND: &str = "Windows cannot bind a process's memory to NUMA nodes; only a list of every \
                          memory node of the host, which binds nothing, is accepted";
 
+const NO_SUCH_PAGE_SIZE: &str = "an x86_64 Linux host has no hugetlb files for this page size (only 2MB, and \
+                                 1GB where the processor has 1 GiB pages), so the write fails there";
+
 use crate::platform::freezer_values::{READ_ONLY, STATE_VALUES};
+
+/// The page size a `hugetlb.<size>.<what>` file names.
+fn hugetlb_size(file: &str) -> Option<&str> {
+    file.strip_prefix("hugetlb.")?.split_once('.').map(|(size, _)| size)
+}
+
+/// Whether an x86_64 Linux host has hugetlb cgroup files for the page size
+/// `size`, spelled as the files spell it. Linux v6.1 makes a cgroup's files
+/// per huge page size the kernel has (mm/hugetlb_cgroup.c
+/// `hugetlb_cgroup_file_init`: `for_each_hstate`; `mem_fmt` writes the size
+/// as `2MB`, `1GB`), and x86_64 has two: 2 MiB always (mm/hugetlb.c
+/// `hugetlb_init`: `hugetlb_add_hstate(HUGETLB_PAGE_ORDER)`), and 1 GiB where
+/// the processor has 1 GiB pages (arch/x86/mm/hugetlbpage.c
+/// `gigantic_pages_init` and `arch_hugetlb_valid_size`:
+/// `boot_cpu_has(X86_FEATURE_GBPAGES)`). A file of any other size does not
+/// exist, and the jailer's write to it fails.
+fn linux_hugetlb_size(size: &str, gb_pages: bool) -> bool {
+    size == "2MB" || (size == "1GB" && gb_pages)
+}
+
+/// Whether the processor has 1 GiB pages: Linux's `X86_FEATURE_GBPAGES`,
+/// CPUID.80000001H:EDX bit 26 (arch/x86/include/asm/cpufeatures.h, word 1).
+fn host_gb_pages() -> bool {
+    let leaf = 0x8000_0001;
+    std::arch::x86_64::__cpuid(0x8000_0000).eax >= leaf && std::arch::x86_64::__cpuid(leaf).edx & (1 << 26) != 0
+}
 
 /// A value as Linux's cgroup files take it: they strip the white space
 /// around what is written before they parse it (`strstrip`, lib/string.c,
@@ -287,7 +321,9 @@ fn strstrip(value: &str) -> &str {
 ///   `memory.soft_limit_in_bytes` (mm/memcontrol.c `mem_cgroup_write`).
 ///
 /// `memory.max` and `memory.limit_in_bytes`, and `hugetlb.2MB`'s own limit,
-/// are limits Windows has, with arms of their own. Not here: `memory.min`
+/// are limits Windows has, with arms of their own. A hugetlb file of a page
+/// size Linux does not have is refused before this is asked
+/// ([`linux_hugetlb_size`]). Not here: `memory.min`
 /// and `memory.low`, whose default is 0; their `max` protects all of a
 /// cgroup's memory, which is no absence of a limit.
 fn no_limit(version: u8, file: &str, value: &str) -> bool {
@@ -338,7 +374,7 @@ fn impossible(version: u8, file: &str) -> Option<&'static str> {
         }
         (_, "hugetlb") => {
             "the host's large pages are 2 MiB: only hugetlb.2MB.max (v1: hugetlb.2MB.limit_in_bytes) \
-             limits them; pages of another size have no limit to set (only max, -1)"
+             limits them; 1 GiB pages and reservations have no limit to set (only max, -1)"
         }
         (2, "rdma") => "Windows has no limit on a job's RDMA resources",
         (2, "misc") => "Windows has no counterpart for the misc controller's resources",
@@ -646,9 +682,7 @@ mod tests {
         let v2 = [
             "pids.max",
             "hugetlb.2MB.max",
-            "hugetlb.1GB.max",
             "hugetlb.2MB.rsvd.max",
-            "hugetlb.1GB.rsvd.max",
             "memory.high",
             "memory.swap.max",
             "memory.swap.high",
@@ -665,9 +699,7 @@ mod tests {
         }
         let v1 = [
             "hugetlb.2MB.limit_in_bytes",
-            "hugetlb.1GB.limit_in_bytes",
             "hugetlb.2MB.rsvd.limit_in_bytes",
-            "hugetlb.1GB.rsvd.limit_in_bytes",
             "memory.memsw.limit_in_bytes",
             "memory.soft_limit_in_bytes",
             "memory.limit_in_bytes",
@@ -690,7 +722,6 @@ mod tests {
             (2, "memory.swap.high=1048576"),
             (2, "memory.zswap.max=0"),
             (2, "hugetlb.2MB.rsvd.max=2097152"),
-            (2, "hugetlb.1GB.max=1073741824"),
             (1, "memory.memsw.limit_in_bytes=1048576"),
             (1, "memory.soft_limit_in_bytes=1048576"),
             (1, "hugetlb.2MB.rsvd.limit_in_bytes=2097152"),
@@ -721,6 +752,60 @@ mod tests {
         assert_eq!(limits(2, &["memory.max= 1048576\n"]).unwrap().memory_bytes, Some(1 << 20));
     }
 
+    // A hugetlb file is taken only for a page size an x86_64 Linux has
+    // files for: 2MB, and 1GB where the processor has 1 GiB pages. Any other
+    // size is refused at every value, as the write to the missing file
+    // fails on Linux; the reason is not one of Windows.
+    #[test]
+    fn test_hugetlb_page_sizes_are_linuxs() {
+        assert_eq!(hugetlb_size("hugetlb.2MB.max"), Some("2MB"));
+        assert_eq!(hugetlb_size("hugetlb.1GB.rsvd.limit_in_bytes"), Some("1GB"));
+        assert_eq!(hugetlb_size("hugetlb..max"), Some(""));
+        assert_eq!(hugetlb_size("hugetlb.max"), None);
+        assert_eq!(hugetlb_size("memory.2MB.max"), None);
+        for gb_pages in [false, true] {
+            assert!(linux_hugetlb_size("2MB", gb_pages));
+            assert_eq!(linux_hugetlb_size("1GB", gb_pages), gb_pages);
+            // Other architectures' sizes, other spellings, no size.
+            for size in ["64KB", "32MB", "512MB", "16GB", "4KB", "2mb", "2M", "2MiB", "2097152", "1G", ""] {
+                assert!(!linux_hugetlb_size(size, gb_pages), "{size}");
+            }
+        }
+        let no_such_size = |version: u8, prop: &str| match limits(version, &[prop]) {
+            Err(JailerError::Host(HostError::CgroupValue(cg, why))) => {
+                assert_eq!(cg, prop);
+                assert_eq!(why, NO_SUCH_PAGE_SIZE);
+            }
+            other => panic!("{prop}: {other:?}"),
+        };
+        for size in ["64KB", "32MB", "16GB", "2mb", "2M", ""] {
+            for what in ["max=max", "rsvd.max=max", "max=2097152", "max= max\n"] {
+                no_such_size(2, &format!("hugetlb.{size}.{what}"));
+            }
+            for what in ["limit_in_bytes=-1", "rsvd.limit_in_bytes=-1", "limit_in_bytes=2097152"] {
+                no_such_size(1, &format!("hugetlb.{size}.{what}"));
+            }
+        }
+        // 1 GiB pages, by this processor.
+        let v2 = ["hugetlb.1GB.max=max", "hugetlb.1GB.rsvd.max= max\n"];
+        let v1 = ["hugetlb.1GB.limit_in_bytes=-1", "hugetlb.1GB.rsvd.limit_in_bytes=-1"];
+        if host_gb_pages() {
+            assert_eq!(limits(2, &v2).unwrap(), Limits::default());
+            assert_eq!(limits(1, &v1).unwrap(), Limits::default());
+            // A limit on them is one Windows cannot set.
+            assert!(reason(2, "hugetlb.1GB.max=1073741824").contains("2 MiB"));
+            assert!(reason(1, "hugetlb.1GB.limit_in_bytes=1073741824").contains("2 MiB"));
+        } else {
+            for p in v2 {
+                no_such_size(2, p);
+            }
+            for p in v1 {
+                no_such_size(1, p);
+            }
+            no_such_size(2, "hugetlb.1GB.max=1073741824");
+        }
+    }
+
     #[test]
     fn test_io_is_refused() {
         assert!(reason(2, "io.max=8:0 rbps=1048576").contains("major:minor"));
@@ -734,7 +819,6 @@ mod tests {
     fn test_hugetlb_2mb_limits_the_large_page_broker() {
         assert_eq!(limits(2, &["hugetlb.2MB.max=1073741824"]).unwrap().large_page_bytes, Some(1 << 30));
         assert_eq!(limits(1, &["hugetlb.2MB.limit_in_bytes=1073741824"]).unwrap().large_page_bytes, Some(1 << 30));
-        assert!(reason(2, "hugetlb.1GB.max=1073741824").contains("2 MiB"));
         assert_eq!(limits(2, &["hugetlb.2MB.max=max"]).unwrap(), Limits::default());
         assert_eq!(limits(1, &["hugetlb.2MB.limit_in_bytes=-1"]).unwrap(), Limits::default());
     }
