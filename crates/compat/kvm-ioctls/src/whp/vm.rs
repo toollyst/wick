@@ -1327,6 +1327,21 @@ mod tests {
         // SAFETY: a buffer of the size passed.
         let hres = unsafe { whv::WHvGetCapability(whv::WHvCapabilityCodeProcessorXsaveFeatures, (&raw mut offered).cast(), 8, &mut n) };
         eprintln!("XSAVEFEAT offered (capability): HRESULT {:#010x}, {offered:#x} ({})", hres.cast_unsigned(), named(offered));
+        // What `from_cpuid` makes of the host's own CPUID, against what WHP
+        // offers: a partition given the table of an untemplated guest
+        // should lose nothing.
+        let host = super::super::xsave_features::from_cpuid(|function, index| {
+            let r = core::arch::x86_64::__cpuid_count(function, index);
+            Some([r.eax, r.ebx, r.ecx, r.edx])
+        });
+        eprintln!(
+            "XSAVEFEAT from the host's CPUID: {host:#x}; offered and not from CPUID: {:#x} ({}); from CPUID and not offered: \
+             {:#x} ({})",
+            offered & !host,
+            named(offered & !host),
+            host & !offered,
+            named(host & !offered)
+        );
         let get = |part: WHV_PARTITION_HANDLE| {
             let (mut value, mut n) = (0u64, 0u32);
             // SAFETY: a buffer of the size passed.
