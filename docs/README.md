@@ -39,7 +39,8 @@ tools/                    everything you run by hand or in CI (below)
   vhost-user-blk/         a vhost-user-blk backend for the boot, jailer and integration tests
 fuzz/                     fuzz targets for wick's own code (a crate of its own, CONTRIBUTING.md "Fuzzing")
 docs/                     these pages
-.github/workflows/        ci.yml (every push and pull request), release.yml (tags v*)
+.github/workflows/        ci.yml (every push and pull request), release.yml (tags v*),
+                          linux-restore-repro.yml (by hand: restores of a Linux smp snapshot)
 ```
 
 Cargo always runs in `lib/firecracker`. Upstream's workspace is the only workspace: its patched manifest lists

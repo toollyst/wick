@@ -316,7 +316,12 @@ the runner image (`macos-15`) is GitHub's and changes over time.
 - `tools/linux/boot-test.sh` runs the first stages of
   `tools/windows/boot-test.ps1` on Linux: it boots upstream's CI guest with the musl release binary (seccomp filters on
   every thread) and checks serial I/O, SMP, the Async (io_uring) block engine
-  and vsock.
+  and vsock. Its `restores` stage, not part of a full run, restores the smp
+  snapshot many times, each in a new process, against resumes in the same
+  process, and records per round when the shell answers, Firecracker's page
+  faults and the guest's interrupts and timers (with `WICK_KVM_TRACE=1` and
+  sudo, KVM's trace events too); `.github/workflows/linux-restore-repro.yml`
+  runs it on GitHub's runner, by hand.
 - `tools/linux/jailer-cgroup-check.py` measures, as root in the Linux CI, what
   upstream's jailer does with the freezer and devices cgroup options (v1
   `freezer.state` and `devices.*` on mounted v1 hierarchies, v2

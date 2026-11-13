@@ -13,8 +13,19 @@
 # (tools/guest-health.txt, the macOS boot test's rule).
 #
 #   tools/linux/boot-test.sh [--firecracker PATH] [--workdir DIR]
-#                            [--stage all|boot|smp|block|vsock] [--timeout SEC]
-#                            [--seccomp yes|no|auto]
+#                            [--stage all|boot|smp|block|vsock|restores] [--timeout SEC]
+#                            [--seccomp yes|no|auto] [--snapshots K] [--rounds R]
+#
+# `restores` (not in `all`) looks for the late answer of a restored smp guest
+# (agent-state's linux-restore-late-answer): K snapshots of the smp guest,
+# each resumed twice in the same process (the control: no new process, no
+# memory file) and restored R times, each restore in a new process; per
+# round, how long the shell takes to answer, whether it answers without more
+# input, Firecracker's minor and major page faults over the first 5 s, the
+# guest's interrupt counts and per-CPU timer state against those of the
+# snapshot's source and how much of the memory file is cached; with
+# WICK_KVM_TRACE=1 and passwordless sudo, KVM's trace events of each round
+# too (kept for a late one and the first of each kind).
 #
 # Needs: Linux x86_64 with read/write access to /dev/kvm, curl, python3 (the
 # host end of vsock), md5sum, and internet access for the first run (kernel
@@ -47,6 +58,8 @@ workdir="${XDG_CACHE_HOME:-$HOME/.cache}/wick-boot-test"
 stage="all"
 timeout=120
 seccomp=auto
+snapshots=3
+rounds=10
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --firecracker) fc="$2"; shift 2 ;;
@@ -54,11 +67,13 @@ while [[ $# -gt 0 ]]; do
         --stage) stage="$2"; shift 2 ;;
         --timeout) timeout="$2"; shift 2 ;;
         --seccomp) seccomp="$2"; shift 2 ;;
-        -h|--help) sed -n '4,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --snapshots) snapshots="$2"; shift 2 ;;
+        --rounds) rounds="$2"; shift 2 ;;
+        -h|--help) sed -n '4,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
-case "$stage" in all|boot|smp|block|vsock) ;; *) echo "unknown stage: $stage" >&2; exit 2 ;; esac
+case "$stage" in all|boot|smp|block|vsock|restores) ;; *) echo "unknown stage: $stage" >&2; exit 2 ;; esac
 case "$seccomp" in yes|no|auto) ;; *) echo "--seccomp is yes, no or auto" >&2; exit 2 ;; esac
 
 source "$(dirname "${BASH_SOURCE[0]}")/../common.sh"
@@ -479,6 +494,169 @@ EOF
         stop_guest
     fi
     finish_vm
+fi
+
+if [[ "$stage" == restores ]]; then
+    echo "[restores] the smp snapshot restored $rounds times from each of $snapshots snapshots, each in a new process: when the shell answers, the interrupts and timers of each CPU"
+    # KVM's trace events per restore (tracefs, root), kept for a late
+    # restore and the first of each snapshot.
+    trace=""
+    if [[ "${WICK_KVM_TRACE:-0}" == 1 ]] && sudo -n true 2>/dev/null; then
+        for t in /sys/kernel/tracing /sys/kernel/debug/tracing; do
+            sudo test -d "$t/events/kvm" && { trace="$t"; break; }
+        done
+        [[ -n "$trace" ]] || die "WICK_KVM_TRACE=1 but no tracefs with kvm events"
+        sudo sh -c "echo 0 >$trace/tracing_on; echo 65536 >$trace/buffer_size_kb; echo >$trace/set_event; echo 1 >$trace/events/kvm/enable"
+    fi
+    {
+        echo "kernel: $(uname -r)"
+        for m in kvm kvm_amd kvm_intel; do
+            [[ -d /sys/module/$m/parameters ]] || continue
+            for f in /sys/module/$m/parameters/*; do
+                echo "$m.$(basename "$f")=$(cat "$f" 2>/dev/null || echo '?')"
+            done
+        done
+        echo "tracing: ${trace:-off}"
+    } >"$results/restores-host.txt"
+    # The guest's interrupt counts and per-CPU timer state, between
+    # CAP-BEGIN-<tag> and CAP-END-<tag> lines; capture TAG FILE writes them
+    # to FILE.
+    capture() {
+        local mark
+        mark="$(vm_mark)"
+        vm_send "echo CAP-BEGIN-$1; cat /proc/interrupts; grep -E '^cpu: |expires_next|tick_stopped|idle_active|nohz_mode|idle_calls|idle_sleeps|next_event|^Tick Device|^Clock Event Device' /proc/timer_list; echo CAP-END-$1"
+        if wait_for "$mark" "^CAP-END-$1\$" 10000 >/dev/null; then
+            tail -c +"$((mark + 1))" "$VM_DIR/console.txt" | tr -d '\r' | sed -n "/^CAP-BEGIN-$1\$/,/^CAP-END-$1\$/p" >"$2"
+        else
+            echo "no capture" >"$2"
+        fi
+    }
+    # The per-CPU counts of the named interrupts in AFTER less those in BASE.
+    irq_delta() {
+        python3 - "$1" "$2" <<'EOF'
+import sys
+def counts(path):
+    lines = [l for l in open(path) if l.strip() and not l.startswith("CAP-")]
+    if not lines or not lines[0].split()[0].startswith("CPU"):
+        return None
+    ncpu = len(lines[0].split())
+    out = {}
+    for l in lines[1:]:
+        f = l.split()
+        if f and f[0].endswith(":") and len(f) > ncpu:
+            try:
+                out[f[0][:-1]] = [int(x) for x in f[1:1 + ncpu]]
+            except ValueError:
+                pass
+    return out
+b, a = counts(sys.argv[1]), counts(sys.argv[2])
+if not a or not b:
+    print("no counts"); sys.exit()
+parts = []
+for k in ("LOC", "RES", "CAL", "TLB", "HYP", "SPU", "ERR", "4"):
+    if k in a and k in b:
+        parts.append(k + "=" + "/".join(str(x - y) for x, y in zip(a[k], b[k])))
+print(" ".join(parts))
+EOF
+    }
+    # Firecracker's minor and major page faults so far (/proc/<pid>/stat
+    # fields 10 and 12; its name has no space).
+    faults() { awk '{ print $10, $12 }' "/proc/$VM_PID/stat" 2>/dev/null || echo "? ?"; }
+    # answer_round NAME BASE FAULTS0 CACHED: sends the command and reports
+    # when the shell answered, Firecracker's page faults over the first 5 s
+    # (from FAULTS0, "minor major"), the guest's interrupts since BASE and,
+    # traced, keeps KVM's events of a late round and of each snapshot's first
+    # round of each kind (FIRST=1).
+    answer_round() {
+        local name="$1" base="$2" f0="$3" cached="$4" first="$5" t0 ms f5 outcome delta tag
+        tag="$(printf '%s' "$name" | tr -c 'A-Za-z0-9.' '_')"
+        mark="$(vm_mark)"
+        t0="$(date +%s%N)"
+        vm_send 'echo RESTORED=$(echo $((6*7)))'
+        if wait_for "$mark" '^RESTORED=42' 5000 >/dev/null; then
+            outcome="answered"
+        fi
+        ms=$((($(date +%s%N) - t0) / 1000000))
+        # The faults over the first 5 s, an answer or not.
+        while (($(date +%s%N) - t0 < 5000000000)); do sleep 0.1; done
+        f5="$(faults)"
+        if [[ -z "${outcome:-}" ]]; then
+            if wait_for "$mark" '^RESTORED=42' 30000 >/dev/null; then
+                outcome="LATE, answered without input"
+            else
+                vm_send ''
+                if wait_for "$mark" 'RESTORED=42' 5000 >/dev/null; then
+                    outcome="LATE, answered after an empty line"
+                else
+                    outcome="LATE, no answer"
+                fi
+            fi
+            ms=$((($(date +%s%N) - t0) / 1000000))
+        fi
+        capture after "$VM_DIR/capture-$tag.txt"
+        delta="$(irq_delta "$base" "$VM_DIR/capture-$tag.txt")"
+        if [[ -n "$trace" ]]; then
+            sudo sh -c "echo 0 >$trace/tracing_on"
+            if [[ "$outcome" != answered || "$first" == 1 ]]; then
+                # Read as root, written as the user (the results are the user's).
+                # shellcheck disable=SC2024
+                sudo cat "$trace/trace" >"$VM_DIR/kvm-trace-$tag.txt"
+            fi
+        fi
+        [[ "$outcome" == answered ]] || late=$((late + 1))
+        total=$((total + 1))
+        check "$name: shell answers within 5 s" "$([[ "$outcome" == answered ]] && echo 1 || echo 0)" \
+            "$outcome in $ms ms; faults over 5 s (minor major): $(python3 -c 'import sys; a, b = sys.argv[1].split(), sys.argv[2].split(); print(" ".join(str(int(y) - int(x)) if x.isdigit() and y.isdigit() else "?" for x, y in zip(a, b)))' "$f0" "$f5"); since the snapshot, per CPU: $delta; memory file cached: $cached"
+    }
+    late=0 total=0
+    for ((s = 1; s <= snapshots; s++)); do
+        snap_state="$results/restores-$s.state" snap_mem="$results/restores-$s.mem"
+        vm_start "restores-$s" "$(base_config 2)" "$results/restores-$s.sock"
+        if ! start_shell; then finish_vm; continue; fi
+        # As the smp stage: work on CPU 1, then both, then the prompt.
+        get_value ON1 'taskset -c 1 sh -c "echo ok"' >/dev/null
+        counter_warp "snapshot $s's source"
+        capture base "$results/restores-$s-base.txt"
+        code="$(api PATCH /vm '{"state": "Paused"}')"
+        [[ "$code" == 204 ]] && code="$(api PUT /snapshot/create "{\"snapshot_type\": \"Full\", \"snapshot_path\": \"$snap_state\", \"mem_file_path\": \"$snap_mem\"}")"
+        check "snapshot $s taken" "$([[ "$code" == 204 ]] && echo 1 || echo 0)" "$code"
+        # The control: the same guest resumed in the same process, twice
+        # (its memory stays the process's own, no file), paused again in
+        # between.
+        for ((c = 1; c <= 2; c++)); do
+            [[ "$code" == 204 ]] || break
+            [[ "$c" == 1 ]] || code="$(api PATCH /vm '{"state": "Paused"}')"
+            [[ -n "$trace" ]] && sudo sh -c "echo >$trace/trace; echo 1 >$trace/tracing_on"
+            f0="$(faults)"
+            code="$(api PATCH /vm '{"state": "Resumed"}')"
+            if [[ "$code" != 204 ]]; then
+                check "resume $s.c$c in the same process" 0 "$code"
+                [[ -n "$trace" ]] && sudo sh -c "echo 0 >$trace/tracing_on"
+                break
+            fi
+            answer_round "resume $s.c$c (same process)" "$results/restores-$s-base.txt" "$f0" "-" "$([[ $c == 1 ]] && echo 1)"
+        done
+        finish_vm
+        [[ -f "$snap_mem" ]] || continue
+        for ((r = 1; r <= rounds; r++)); do
+            cached="$(fincore -n -o RES,SIZE "$snap_mem" 2>/dev/null | tr -s ' ' | sed 's/^ //' || echo '?')"
+            [[ -n "$trace" ]] && sudo sh -c "echo >$trace/trace; echo 1 >$trace/tracing_on"
+            vm_start "restores-$s-$r" "" "$results/restores-$s-$r.sock"
+            code="$(api PUT /snapshot/load "{\"snapshot_path\": \"$snap_state\", \"mem_backend\": {\"backend_type\": \"File\", \"backend_path\": \"$snap_mem\"}, \"resume_vm\": true}")"
+            if [[ "$code" != 204 ]]; then
+                check "restore $s.$r loaded" 0 "$code"
+                [[ -n "$trace" ]] && sudo sh -c "echo 0 >$trace/tracing_on"
+                finish_vm
+                continue
+            fi
+            # From the process's start: the restore's own faults count.
+            answer_round "restore $s.$r (new process)" "$results/restores-$s-base.txt" "0 0" "$cached" "$([[ $r == 1 ]] && echo 1)"
+            finish_vm
+        done
+        rm -f "$snap_state" "$snap_mem"
+    done
+    VM_NAME=restores
+    check "late answers" "$([[ "$late" == 0 ]] && echo 1 || echo 0)" "$late of $total rounds"
 fi
 
 # --- report ------------------------------------------------------------------
