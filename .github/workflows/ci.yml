@@ -484,6 +484,18 @@ jobs:
           done
           echo "$failed of 20 runs failed"
           [[ $failed -eq 0 ]]
+      # The FIFO relay's stop before the API process's fork reads the
+      # kernel's list of thread ids with a proc_info flavor of xnu's private
+      # header (PROC_PIDLISTTHREADIDS, overlay/vmm/ext/fifo.rs), and the fork
+      # counts threads with another: both run on each major here, where the
+      # macos job has one. The test binary is the one the steps above built;
+      # one test thread, as check-unit-tests.py runs them; none makes a VM.
+      - name: FIFO relay and API process tests
+        if: success() || failure()
+        working-directory: lib/firecracker
+        run: |
+          cargo test --locked -p vmm --lib "ext::fifo" -- --test-threads=1
+          cargo test --locked -p vmm --lib "ext::api_process" -- --test-threads=1
       # What the sandbox denied the test processes (vmm-<hash>), for a
       # failure above: the kernel reports a denied call by its number
       # ("deny(1) syscall-unix 117"), SIGSYS or not.
