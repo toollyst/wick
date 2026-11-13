@@ -1906,6 +1906,19 @@ struct GroupAffinity {
     reserved: [u16; 3],
 }
 
+/// The UI limits of a jail's job: every one a Job Object has
+/// (`JOBOBJECT_BASIC_UI_RESTRICTIONS`). A job that sets any is not nested in
+/// another job nor another in it, which is why a parent job, a
+/// `--parent-cgroup`, is refused (cgroup.rs, `PARENT_NOT_DONE`).
+const JAIL_UI_LIMITS: u32 = JOB_OBJECT_UILIMIT_DESKTOP
+    | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+    | JOB_OBJECT_UILIMIT_EXITWINDOWS
+    | JOB_OBJECT_UILIMIT_GLOBALATOMS
+    | JOB_OBJECT_UILIMIT_HANDLES
+    | JOB_OBJECT_UILIMIT_READCLIPBOARD
+    | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+    | JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
+
 /// A Job Object with the cgroup limits: Firecracker dies with the jailer
 /// (kill on close) and has no UI access.
 fn job(limits: &Limits) -> Result<OwnedHandle, HostError> {
@@ -1961,16 +1974,7 @@ fn job(limits: &Limits) -> Result<OwnedHandle, HostError> {
         std::mem::size_of_val(&info),
         "the job's limits",
     )?;
-    let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
-        UIRestrictionsClass: JOB_OBJECT_UILIMIT_DESKTOP
-            | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
-            | JOB_OBJECT_UILIMIT_EXITWINDOWS
-            | JOB_OBJECT_UILIMIT_GLOBALATOMS
-            | JOB_OBJECT_UILIMIT_HANDLES
-            | JOB_OBJECT_UILIMIT_READCLIPBOARD
-            | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
-            | JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
-    };
+    let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS { UIRestrictionsClass: JAIL_UI_LIMITS };
     set(
         JobObjectBasicUIRestrictions,
         (&raw const ui).cast(),
@@ -3021,5 +3025,306 @@ mod tests {
         assert_eq!(grants(sid_a), (false, false));
         assert_eq!(grants(sid_b), (false, true));
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A suspended process of this user's (cmd.exe, never resumed) for a job
+    /// to hold; ended when dropped.
+    struct Held {
+        process: OwnedHandle,
+        _thread: OwnedHandle,
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            // SAFETY: our suspended child.
+            unsafe { TerminateProcess(self.process.as_raw_handle(), 1) };
+        }
+    }
+
+    fn held_process() -> Held {
+        use windows_sys::Win32::System::Threading::{CreateProcessW, STARTUPINFOW};
+        let exe = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("cmd.exe");
+        let mut cmd = wide("cmd.exe");
+        // SAFETY: plain data.
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap();
+        // SAFETY: plain data.
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: NUL-terminated application path and command line.
+        let ok = unsafe {
+            CreateProcessW(
+                wide(&exe).as_ptr(),
+                cmd.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                CREATE_SUSPENDED | CREATE_NO_WINDOW,
+                std::ptr::null(),
+                std::ptr::null(),
+                &si,
+                &mut pi,
+            )
+        };
+        assert_ne!(ok, 0, "{}", last_error());
+        // SAFETY: handles CreateProcess gave us.
+        unsafe {
+            Held { process: OwnedHandle::from_raw_handle(pi.hProcess), _thread: OwnedHandle::from_raw_handle(pi.hThread) }
+        }
+    }
+
+    /// A job without limits, named or not.
+    fn plain_job(name: Option<&str>) -> OwnedHandle {
+        let name = name.map(wide);
+        // SAFETY: no security attributes; a NUL-terminated name or none.
+        let h = unsafe { CreateJobObjectW(std::ptr::null(), name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr())) };
+        assert!(!h.is_null(), "{}", last_error());
+        // SAFETY: a handle we own.
+        unsafe { OwnedHandle::from_raw_handle(h) }
+    }
+
+    /// Puts the process in the job; the Windows error code when refused.
+    fn assign(job: &OwnedHandle, p: &Held) -> Result<(), i32> {
+        // SAFETY: handles we own.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), p.process.as_raw_handle()) } == 0 {
+            return Err(last_error().raw_os_error().unwrap_or(0));
+        }
+        Ok(())
+    }
+
+    /// Whether the process is in the job (`None`: in any job).
+    fn in_job(process: HANDLE, job: Option<&OwnedHandle>) -> bool {
+        use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+        let mut result = 0;
+        // SAFETY: handles we own (or the current process), an out-parameter.
+        let ok = unsafe { IsProcessInJob(process, job.map_or(std::ptr::null_mut(), |j| j.as_raw_handle()), &mut result) };
+        assert_ne!(ok, 0, "{}", last_error());
+        result != 0
+    }
+
+    /// Sets a job information class; the Windows error code when refused.
+    fn set_job<T>(job: &OwnedHandle, class: i32, info: &T) -> Result<(), i32> {
+        // SAFETY: a structure of the size passed, for this class.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                class,
+                std::ptr::from_ref(info).cast(),
+                u32::try_from(std::mem::size_of::<T>()).unwrap(),
+            )
+        };
+        if ok == 0 { Err(last_error().raw_os_error().unwrap_or(0)) } else { Ok(()) }
+    }
+
+    /// Why a named `--parent-cgroup` is refused (cgroup.rs,
+    /// `PARENT_NOT_DONE`): a process in a job, as a jail under a parent job
+    /// would be, cannot join the job the jailer makes for a jail, which sets
+    /// UI limits; a job that sets none takes it, nested in the first
+    /// (Microsoft Learn, "Nested Jobs" and `AssignProcessToJobObject`).
+    #[test]
+    #[ignore = "run alone by CI's windows job, after the kit is uploaded"]
+    fn test_a_jails_job_does_not_nest() {
+        let parent = plain_job(None);
+        let p = held_process();
+        assign(&parent, &p).unwrap();
+        let jail = job(&Limits::default()).unwrap();
+        let refused = assign(&jail, &p);
+        println!("NESTTEST a jail's job for a process of a parent job: {refused:?}");
+        assert!(refused.is_err(), "a jail's job took a process that is in another job");
+        assert!(!in_job(p.process.as_raw_handle(), Some(&jail)));
+        // The control: the same order nests a job that sets no UI limits.
+        let inner = plain_job(None);
+        assign(&inner, &p).unwrap();
+        assert!(in_job(p.process.as_raw_handle(), Some(&parent)));
+        assert!(in_job(p.process.as_raw_handle(), Some(&inner)));
+    }
+
+    /// On record, no check of the product: what Windows does with the jobs
+    /// a parent cgroup would be made of, for the design of `--parent-cgroup`
+    /// (which the jailer refuses meanwhile). One NESTTEST line each.
+    #[test]
+    #[ignore = "a record of what nested Job Objects do, run alone by CI's windows job"]
+    fn test_nested_jobs_on_record() {
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation, OpenJobObjectW,
+            QueryInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::GetProcessAffinityMask;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn VirtualAllocEx(
+                process: HANDLE,
+                address: *const std::ffi::c_void,
+                size: usize,
+                kind: u32,
+                protect: u32,
+            ) -> *mut std::ffi::c_void;
+        }
+        const MEM_COMMIT_RESERVE: u32 = 0x3000;
+        const PAGE_READWRITE: u32 = 4;
+        const JOB_OBJECT_ASSIGN_PROCESS_AND_QUERY: u32 = 0x1 | 0x4;
+        const MIB: usize = 1 << 20;
+        let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS { UIRestrictionsClass: JAIL_UI_LIMITS };
+        let query = |job: &OwnedHandle, class: i32, out: *mut std::ffi::c_void, size: usize| {
+            // SAFETY: a structure of the size passed, for this class.
+            let ok = unsafe {
+                QueryInformationJobObject(job.as_raw_handle(), class, out, u32::try_from(size).unwrap(), std::ptr::null_mut())
+            };
+            if ok == 0 { Err(last_error().raw_os_error().unwrap_or(0)) } else { Ok(()) }
+        };
+        let limits = |flags: u32, memory: usize, affinity: usize| {
+            // SAFETY: plain data.
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = flags;
+            info.BasicLimitInformation.Affinity = affinity;
+            info.JobMemoryLimit = memory;
+            info
+        };
+        let commit = |p: &Held, bytes: usize| {
+            // SAFETY: our suspended child; the system chooses the address.
+            let at = unsafe {
+                VirtualAllocEx(p.process.as_raw_handle(), std::ptr::null(), bytes, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+            };
+            if at.is_null() { Err(last_error().raw_os_error().unwrap_or(0)) } else { Ok(()) }
+        };
+        let affinity = |p: &Held| {
+            let (mut own, mut system) = (0usize, 0usize);
+            // SAFETY: our child; out-parameters.
+            let ok = unsafe { GetProcessAffinityMask(p.process.as_raw_handle(), &mut own, &mut system) };
+            if ok == 0 { Err(last_error().raw_os_error().unwrap_or(0)) } else { Ok(own) }
+        };
+
+        // Whether this process, and so each process it starts, is in a job
+        // already (a job of CI's runner, a terminal's): the jailer under it.
+        // SAFETY: the pseudo-handle of this process.
+        let this = unsafe { GetCurrentProcess() };
+        println!("NESTTEST this process is in a job: {}", in_job(this, None));
+        let p = held_process();
+        let inherited = in_job(p.process.as_raw_handle(), None);
+        let r = assign(&job(&Limits::default()).unwrap(), &p);
+        println!("NESTTEST a new process (in a job at its start: {inherited}) into a jail's job: {r:?}");
+        drop(p);
+
+        // UI limits set once the jobs are nested, on the inner and on the
+        // outer job.
+        let (outer, inner, p) = (plain_job(None), plain_job(None), held_process());
+        let nested = assign(&outer, &p).and_then(|()| assign(&inner, &p));
+        let on_inner = set_job(&inner, JobObjectBasicUIRestrictions, &ui);
+        // SAFETY: plain data.
+        let mut back: JOBOBJECT_BASIC_UI_RESTRICTIONS = unsafe { std::mem::zeroed() };
+        let read = query(&inner, JobObjectBasicUIRestrictions, (&raw mut back).cast(), std::mem::size_of_val(&back));
+        let on_outer = set_job(&outer, JobObjectBasicUIRestrictions, &ui);
+        println!(
+            "NESTTEST UI limits after nesting ({nested:?}): on the inner job {on_inner:?} (read back {read:?} {:#x}), on the outer job {on_outer:?}",
+            back.UIRestrictionsClass
+        );
+        drop(p);
+
+        // UI limits on the outer job only, set before anything is in it.
+        let (outer, inner, p) = (plain_job(None), plain_job(None), held_process());
+        let set = set_job(&outer, JobObjectBasicUIRestrictions, &ui);
+        let first = assign(&outer, &p);
+        let second = assign(&inner, &p);
+        println!("NESTTEST an outer job with UI limits ({set:?}): the process into it {first:?}, then into a job without {second:?}");
+        drop(p);
+
+        // A parent's memory limit over two jobs under it: 64 MiB, 40 MiB
+        // committed in a process of each.
+        let parent = plain_job(None);
+        let set = set_job(&parent, JobObjectExtendedLimitInformation, &limits(JOB_OBJECT_LIMIT_JOB_MEMORY, 64 * MIB, 0));
+        let (ja, jb, pa, pb) = (plain_job(None), plain_job(None), held_process(), held_process());
+        let nested = assign(&parent, &pa)
+            .and_then(|()| assign(&ja, &pa))
+            .and_then(|()| assign(&parent, &pb))
+            .and_then(|()| assign(&jb, &pb));
+        let (first, second) = (commit(&pa, 40 * MIB), commit(&pb, 40 * MIB));
+        // SAFETY: plain data.
+        let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        let read = query(&parent, JobObjectBasicAccountingInformation, (&raw mut acct).cast(), std::mem::size_of_val(&acct));
+        // SAFETY: plain data.
+        let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let read_ext = query(&parent, JobObjectExtendedLimitInformation, (&raw mut ext).cast(), std::mem::size_of_val(&ext));
+        println!(
+            "NESTTEST a parent's 64 MiB memory limit ({set:?}) over two jobs ({nested:?}): 40 MiB in the first {first:?}, in the second {second:?}; the parent counts {} active processes ({read:?}), peak {} MiB ({read_ext:?})",
+            acct.ActiveProcesses,
+            ext.PeakJobMemoryUsed / MIB
+        );
+        // The control: the same two commits with no limit on the parent.
+        let parent = plain_job(None);
+        let (ja, jb, pa, pb) = (plain_job(None), plain_job(None), held_process(), held_process());
+        let nested = assign(&parent, &pa)
+            .and_then(|()| assign(&ja, &pa))
+            .and_then(|()| assign(&parent, &pb))
+            .and_then(|()| assign(&jb, &pb));
+        println!(
+            "NESTTEST the same with no limit on the parent ({nested:?}): {:?}, {:?}",
+            commit(&pa, 40 * MIB),
+            commit(&pb, 40 * MIB)
+        );
+        drop((pa, pb));
+
+        // Affinity: a job under a parent on processor 0, asked for
+        // processor 1 (no subset), then for 0 and 1 (wider).
+        if std::thread::available_parallelism().map_or(1, std::num::NonZero::get) >= 2 {
+            let (parent, inner, p) = (plain_job(None), plain_job(None), held_process());
+            let set = set_job(&parent, JobObjectExtendedLimitInformation, &limits(JOB_OBJECT_LIMIT_AFFINITY, 0, 0b01));
+            let nested = assign(&parent, &p).and_then(|()| assign(&inner, &p));
+            let under = affinity(&p);
+            let other = set_job(&inner, JobObjectExtendedLimitInformation, &limits(JOB_OBJECT_LIMIT_AFFINITY, 0, 0b10));
+            let after_other = affinity(&p);
+            let wider = set_job(&inner, JobObjectExtendedLimitInformation, &limits(JOB_OBJECT_LIMIT_AFFINITY, 0, 0b11));
+            let after_wider = affinity(&p);
+            println!(
+                "NESTTEST a parent on processor 0 ({set:?}, nested {nested:?}): the process's mask {under:x?}; the inner job asked for processor 1: {other:?}, mask {after_other:x?}; for 0 and 1: {wider:?}, mask {after_wider:x?}"
+            );
+        } else {
+            println!("NESTTEST affinity: one processor, not measured");
+        }
+
+        // CPU rate: a hard cap of half on the parent and on the job under
+        // it, set and read back (what the two caps give is not timed here).
+        let (parent, inner, p) = (plain_job(None), plain_job(None), held_process());
+        let nested = assign(&parent, &p).and_then(|()| assign(&inner, &p));
+        // SAFETY: plain data.
+        let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+        cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+        cpu.Anonymous.CpuRate = 5000;
+        let on_parent = set_job(&parent, JobObjectCpuRateControlInformation, &cpu);
+        let on_inner = set_job(&inner, JobObjectCpuRateControlInformation, &cpu);
+        // SAFETY: plain data.
+        let mut back: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+        let read = query(&inner, JobObjectCpuRateControlInformation, (&raw mut back).cast(), std::mem::size_of_val(&back));
+        // SAFETY: the CpuRate arm, which the flags set select.
+        let rate = unsafe { back.Anonymous.CpuRate };
+        println!(
+            "NESTTEST a CPU cap of 5000 on a parent {on_parent:?} and on the job under it {on_inner:?} (nested {nested:?}): the inner job reads back {rate} ({read:?})"
+        );
+        drop(p);
+
+        // A named job: made twice, opened by name, and whether the name
+        // outlives the last handle while a process is in the job.
+        let name = format!("Local\\wick-nesttest-{}", std::process::id());
+        let open = || {
+            // SAFETY: a NUL-terminated name.
+            let h = unsafe { OpenJobObjectW(JOB_OBJECT_ASSIGN_PROCESS_AND_QUERY, 0, wide(&name).as_ptr()) };
+            if h.is_null() {
+                return Err(last_error().raw_os_error().unwrap_or(0));
+            }
+            // SAFETY: a handle we own.
+            Ok(unsafe { OwnedHandle::from_raw_handle(h) })
+        };
+        let first = plain_job(Some(&name));
+        let second = plain_job(Some(&name));
+        // CreateJobObject of an existing name opens it and says so.
+        let again = last_error().raw_os_error();
+        let opened = open().map(drop);
+        let p = held_process();
+        let assigned = assign(&first, &p);
+        drop((first, second));
+        let held_by_a_process = open().map(drop);
+        drop(p);
+        let empty = open().map(drop);
+        println!(
+            "NESTTEST a named job: made again {again:?}, opened by name {opened:?}; a process in it {assigned:?}; opened with no handle left and the process in it {held_by_a_process:?}; after the process ended {empty:?}"
+        );
     }
 }

@@ -175,6 +175,10 @@ function Stage-Refuse {
         # A page size an x86_64 Linux has no hugetlb files for: refused at
         # the value that sets no limit too, as the write fails there.
         'hugetlb.64KB.max=max'           = @('--cgroup', 'hugetlb.64KB.max=max', '--cgroup-version', '2')
+        # A named parent cgroup, where upstream reads it: with --cgroup, and
+        # with cgroup v2 and no --cgroup.
+        '--parent-cgroup with --cgroup'  = @('--parent-cgroup', 'tenants', '--cgroup', 'memory.max=1073741824', '--cgroup-version', '2')
+        '--parent-cgroup alone, v2'      = @('--parent-cgroup', 'tenants', '--cgroup-version', '2')
     }
     # docs/PORTING.md row 8: each controller Windows has no counterpart for
     # is refused with the reason (the message says "refused on Windows: why").
@@ -206,8 +210,9 @@ function Stage-Refuse {
         if ($reasoned.Contains($k)) { Check ($r[1] -match 'is refused on Windows: \S') "${k}: refused without its reason: $($r[1])" }
         if ($k -eq 'hugetlb.64KB.max=max') { Check ($r[1].Contains('--cgroup hugetlb.64KB.max=max: an x86_64 Linux host has no hugetlb files for this page size')) "${k}: refused without its reason: $($r[1])" }
         if ($k -eq 'fsize') { Check ($r[1].Contains('--resource-limit fsize is not supported on Windows: Windows cannot limit the size of the files a process writes')) "${k}: refused without its reason: $($r[1])" }
+        if ($k -like '--parent-cgroup*') { Check ($r[1].Contains('--parent-cgroup is not supported on Windows: not done yet: a parent cgroup that bounds a group of jails')) "${k}: refused without its reason: $($r[1])" }
     }
-    "--netns of a missing directory, fsize=, an unsupported cgroup file, a hugetlb page size Linux does not have and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
+    "--netns of a missing directory, fsize=, an unsupported cgroup file, a hugetlb page size Linux does not have, a named --parent-cgroup and $($reasoned.Count) cgroup controllers Windows cannot enforce are refused before Firecracker starts, each with its reason"
 }
 
 Add-Type -Namespace WickJailerTest -Name Numa -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool GetNumaHighestNodeNumber(ref uint n);'

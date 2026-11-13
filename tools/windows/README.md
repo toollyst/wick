@@ -7,7 +7,8 @@
 - `jailer-test.ps1`: the jailer on WHP hardware, the counterpart of
   `tools/macos/jailer-test.py`. Stages without a guest: `refuse` (what
   Windows cannot enforce is refused, each cgroup controller and resource
-  limit with its reason), `freeze` (upstream's freezer files next to the
+  limit with its reason, and a named `--parent-cgroup`, which the jailer
+  does not do yet), `freeze` (upstream's freezer files next to the
   jail: a jail frozen and thawed through `freezer.state` and through
   `cgroup.freeze` and `cgroup.events`, invalid values restored, the jail
   unable to write its control file, the jailer's death ending a frozen jail,

@@ -86,12 +86,24 @@ impossible integration_tests/security/test_jail.py::test_arbitrary_usocket_locat
 # (overlay/jailer/platform/windows/cgroup.rs); a weight Windows cannot give
 # (cpu.shares=2 is below its range) is refused, never accepted without effect.
 impossible integration_tests/security/test_jail.py::test_cgroups
-impossible integration_tests/security/test_jail.py::test_cgroups_custom_parent
 impossible integration_tests/security/test_jail.py::test_node_cgroups
 impossible integration_tests/security/test_jail.py::test_cgroups_without_numa
 impossible integration_tests/security/test_jail.py::test_v1_default_cgroups
-impossible integration_tests/security/test_jail.py::test_cgroups_parent_cgroup_but_no_cgroup
 impossible integration_tests/security/test_jail.py::test_cgroupsv2_written_only_once
+
+# --parent-cgroup: the two tests make the parent as a directory under
+# /sys/fs/cgroup (cgroups_info.new_cgroup, cgroup.subtree_control) and read
+# the jail's cgroup files below it (check_cgroups_v1, check_cgroups_v2).
+# Windows has no cgroup file system, so they cannot pass there whatever the
+# jailer does with a parent: that is what "impossible" says of them. What a
+# parent cgroup is for, one limit over a group of jails, is not impossible on
+# Windows (a Job Object that holds the jails' jobs) and is not done yet: the
+# jailer refuses a --parent-cgroup named on its command line, as the tests
+# name one, rather than accept it without effect
+# (overlay/jailer/platform/windows/cgroup.rs, PARENT_NOT_DONE;
+# docs/COMPATIBILITY.md, `--parent-cgroup`).
+impossible integration_tests/security/test_jail.py::test_cgroups_custom_parent
+impossible integration_tests/security/test_jail.py::test_cgroups_parent_cgroup_but_no_cgroup
 
 # Bind mounts into the jail (mount --bind of the kernel and rootfs) and
 # their propagation: Windows has no mount namespaces, and bind mounts only as

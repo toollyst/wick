@@ -29,7 +29,13 @@
 //! NUMA memory binding (`cpuset.mems` short of every node), exclusive CPUs
 //! and the rest. Every other property is refused too, never accepted
 //! without effect. Windows has no cgroup hierarchy, so the v2 hierarchy is a
-//! path that does not exist: there is no parent cgroup to join.
+//! path that does not exist: there is no parent cgroup to join. A
+//! `--parent-cgroup` the operator names is refused ([`refuse_named_parent`]):
+//! on Linux it bounds a group of jails together, which on Windows is a job
+//! that holds the jails' jobs, and the jailer makes and joins none yet
+//! ([`PARENT_NOT_DONE`]). Upstream's default parent, the exec file's name, is
+//! accepted and places nothing, as on Linux when no such parent was made
+//! beforehand.
 //!
 //! The freezer is upstream's files next to the jail, kept by the jailer
 //! (`platform::freezer`); as on Linux, `freezer.state=FROZEN|THAWED` is the
@@ -41,6 +47,52 @@ use std::path::{Path, PathBuf};
 
 use crate::JailerError;
 use crate::platform::{self, FreezerState, FreezerVersion, HostError, Limits};
+
+/// Why a `--parent-cgroup` on the command line is refused. It opens and
+/// ends as macOS's text does, so the two hosts refuse alike; the middle is
+/// Windows's.
+///
+/// On Linux the jail's cgroup is `<base>/<parent>/<id>` (upstream's
+/// cgroup.rs, `CgroupV1::new`, `CgroupV2::new`), and the parent's own limits,
+/// which the operator sets, bound every jail under it together. On Windows
+/// that is a Job Object that holds the jails' jobs: a process in a job can
+/// be put in a second job, nested in the first, whose limits then bound it
+/// too (Microsoft Learn, "Nested Jobs"). But "the jobs are nested by default
+/// if the system can form a valid job hierarchy and neither job sets UI
+/// limits" (the same page), and a process already in a job joins only a job
+/// that "cannot have UI limits set" (`AssignProcessToJobObject`): every
+/// jail's job sets them (`platform::job`,
+/// `test_a_jails_job_does_not_nest`). Taking them off the jail's job is a
+/// change to the jail's isolation that is not decided, so no parent job is
+/// made or joined, and the flag is refused rather than accepted without
+/// effect.
+pub(crate) const PARENT_NOT_DONE: &str = "not done yet: a parent cgroup that bounds a group of \
+    jails is on Windows a Job Object that holds the jails' jobs, and Windows nests no job that sets \
+    UI limits, which every jail's job does; leave --parent-cgroup out, and each jail's own --cgroup \
+    limits still apply";
+
+/// Refuses a `--parent-cgroup` named on the jailer's command line (`args`,
+/// the program first; Firecracker's arguments, after `--`, are not the
+/// jailer's). Upstream reads the parent only where the builder is made: with
+/// `--cgroup`, or with `--cgroup-version 2` and no `--cgroup` (env.rs), so
+/// this runs there; with v1 and no `--cgroup` upstream ignores the parent,
+/// and so does Windows. The flag cannot be refused by its value: upstream
+/// defaults it to the exec file's name, so every start has one, and the
+/// default is accepted. No value can be `--parent-cgroup`: upstream's parser
+/// takes no value that starts with `--`. The same rule as macOS's
+/// (overlay/jailer/platform/macos/cgroup.rs).
+fn refuse_named_parent<S: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = S>) -> Result<(), JailerError> {
+    let named = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .skip(1)
+        .take_while(|a| a != "--")
+        .any(|a| a == "--parent-cgroup");
+    if named {
+        return Err(HostError::Unsupported("parent-cgroup", PARENT_NOT_DONE).into());
+    }
+    Ok(())
+}
 
 /// The (absent) cgroup v2 hierarchy on Windows.
 const NO_HIERARCHY: &str = r"\\?\GLOBALROOT\wick-no-cgroup-hierarchy";
@@ -61,6 +113,7 @@ pub struct CgroupConfigurationBuilder {
 
 impl CgroupConfigurationBuilder {
     pub fn new(ver: u8, _proc_mounts_path: &str) -> Result<Self, JailerError> {
+        refuse_named_parent(std::env::args_os())?;
         match ver {
             1 | 2 => {
                 platform::set_cgroup_version(if ver == 1 { FreezerVersion::V1 } else { FreezerVersion::V2 });
@@ -972,6 +1025,31 @@ mod tests {
                 "{p}"
             );
         }
+    }
+
+    // A parent the operator names is refused, with the reason; the default
+    // parent (none named) is accepted; a `--parent-cgroup` among
+    // Firecracker's arguments is not the jailer's. The same cases as macOS's
+    // test of this name.
+    #[test]
+    fn test_parent_cgroup_is_refused() {
+        let jailer = ["jailer", "--id", "a", "--cgroup-version", "2"];
+        let with = |extra: &[&'static str]| refuse_named_parent(jailer.iter().chain(extra));
+        match with(&["--parent-cgroup", "tenants"]) {
+            Err(JailerError::Host(HostError::Unsupported("parent-cgroup", why))) => assert_eq!(why, PARENT_NOT_DONE),
+            other => panic!("{other:?}"),
+        }
+        // The default's own value, named, is refused too: naming it is the
+        // operator's intent.
+        let text = with(&["--cgroup", "memory.max=1G", "--parent-cgroup", "firecracker"]).unwrap_err().to_string();
+        assert!(text.starts_with("--parent-cgroup is not supported on Windows: not done yet: a parent cgroup that bounds"), "{text}");
+        assert!(text.contains("leave --parent-cgroup out, and each jail's own --cgroup limits still apply"), "{text}");
+        with(&[]).unwrap();
+        with(&["--cgroup", "memory.max=1G"]).unwrap();
+        with(&["--", "--parent-cgroup", "x"]).unwrap();
+        // The builder itself, as upstream makes it (this test binary's
+        // arguments name no parent).
+        CgroupConfigurationBuilder::new(2, "").unwrap();
     }
 
     #[test]

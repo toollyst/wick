@@ -802,6 +802,18 @@ jobs:
             echo "::error::$t did not pass alone"
             failed=1
           fi
+          # The jailer's two tests of nested Job Objects (no WHP in them):
+          # why a named --parent-cgroup is refused, which must hold, and
+          # the record of what nesting does (NESTTEST lines).
+          for t in test_a_jails_job_does_not_nest test_nested_jobs_on_record; do
+            out=$(cargo test --locked -p jailer -- \
+              --include-ignored --nocapture --test-threads=1 "$t" 2>&1) || true
+            printf '%s\n' "$out"
+            if ! grep -q "test result: ok. 1 passed" <<<"$out"; then
+              echo "::error::$t did not pass alone"
+              failed=1
+            fi
+          done
           exit $failed
       # wick-os's standard input on a console (a hidden console of its own,
       # made for a child process): ignored in the crate step above so that a
