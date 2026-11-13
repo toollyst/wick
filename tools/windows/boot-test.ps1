@@ -694,6 +694,23 @@ namespace Wick {
         }
     }
 
+    // WHvGetCapability (WinHvPlatform.dll; Microsoft Learn, WHvGetCapability),
+    // for the host's line: the capabilities a guest's clock and timer rest on.
+    public static class Whp {
+        [DllImport("WinHvPlatform.dll")]
+        static extern int WHvGetCapability(int code, out ulong value, uint size, out uint written);
+        // The value, or null with `why` the HRESULT or the exception.
+        public static ulong? Capability(int code, out string why) {
+            why = null;
+            try {
+                ulong v; uint n;
+                int hr = WHvGetCapability(code, out v, 8, out n);
+                if (hr < 0) { why = string.Format("HRESULT 0x{0:x8}", hr); return null; }
+                return v;
+            } catch (Exception e) { why = e.GetType().Name + ": " + e.Message; return null; }
+        }
+    }
+
     public static class Util {
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         static extern uint GetCompressedFileSizeW(string path, out uint high);
@@ -1666,6 +1683,7 @@ function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api, [st
     }
     $vm | Add-Member -NotePropertyName ApiSock -NotePropertyValue $sock
     $vm | Add-Member -NotePropertyName LogPath -NotePropertyValue $logPath
+    $vm | Add-Member -NotePropertyName StageName -NotePropertyValue $name
     return $vm
 }
 
@@ -1714,9 +1732,123 @@ function Wait-Shell($vm) {
         if (-not $f) { throw }
         $why = $f.Message
         if ($WhpUnavailable) { $why = "Windows Hypervisor Platform not available: $WhpUnavailable. Firecracker: $why" }
+        elseif (-not $vm.Exited) { $why += "`n" + (Get-StuckState $vm) }
         Fail "kernel did not reach init: $why"
     }
     $vm.Shell(60000)
+}
+
+# What a guest that stopped before init was doing, for the failure's
+# message. On CI's EPYC 9V45 runner (run 43435331370) every stage's guest
+# stopped about 0.3 s into its boot, its log's timestamps standing still,
+# the SMP ones at "Booting SMP configuration": a clock that stopped and an
+# interrupt that was lost look the same from the console. So the VM, if it
+# has an API socket, is paused and snapshotted twice a second apart, each
+# state read with snapshot-editor (info-vmstate vm-state, kept as
+# stuck-<n>-vm-state.txt in the stage's directory), and the message gets:
+# the VM clock and the guest TSC between the two (kvm_clock_data's clock,
+# and host_tsc, which the backend fills with the guest TSC at that clock);
+# for each vCPU its RIP and whether it moved, RFLAGS.IF, mp_state (an AP
+# INIT and SIPI never reached stays 1, UNINITIALIZED, or 2,
+# INIT_RECEIVED), its local APIC's timer (LVT timer, 0x320: masked, mode;
+# initial count, 0x380; current count, 0x390; divide, 0x3e0) and the
+# highest vector in its IRR (0x200) and ISR (0x100): one pending, not in
+# service, with IF set, is an interrupt the guest did not get. The guest's
+# MSRs (TSC, TSC deadline, kvm-clock's) are not in snapshot-editor's
+# print. Anything that fails here is said in the message instead.
+function Get-StuckState($vm) {
+    if (-not $vm.ApiSock) { return '  (no API socket: the stuck guest''s state was not read)' }
+    $name = $vm.StageName
+    $dir = Join-Path $Results $name
+    $states = @()
+    $ticks = @()
+    try {
+        $editor = Find-Tool 'snapshot-editor.exe'
+        foreach ($k in 1, 2) {
+            if ($k -eq 2) { Start-Sleep -Seconds 1 }
+            $state = Join-Path $dir "stuck-$k.state"
+            $mem = Join-Path $Scratch "$name-stuck-$k.mem"
+            Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+            $ticks += [Diagnostics.Stopwatch]::GetTimestamp()
+            Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $state; mem_file_path = $mem }) | Out-Null
+            Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Resumed' } | Out-Null
+            Remove-Item -Force -LiteralPath $mem -ErrorAction SilentlyContinue
+            $r = Invoke-Exe $editor @('info-vmstate', 'vm-state', '--vmstate-path', $state)
+            Set-Content -Encoding UTF8 (Join-Path $dir "stuck-$k-vm-state.txt") $r[1]
+            Check ($r[0] -eq 0) "snapshot-editor info-vmstate vm-state: exit $($r[0])"
+            $states += ,(Read-VmStateDump $r[1])
+        }
+    } catch {
+        return "  (the stuck guest's state was not read: $($_.Exception.Message))"
+    }
+    return (Format-StuckState $states[0] $states[1] (($ticks[1] - $ticks[0]) / [double][Diagnostics.Stopwatch]::Frequency))
+}
+
+# The fields Get-StuckState prints, from snapshot-editor's Debug print of a
+# MicrovmState: Clock and Tsc (or $null), and Vcpus, each with Rip, Rflags,
+# MpState and Lapic (the 1024 bytes of kvm_lapic_state), each $null where
+# the print has none.
+function Read-VmStateDump([string]$text) {
+    $one = {
+        param($pattern, $in)
+        $m = [regex]::Match($in, $pattern)
+        if ($m.Success) { [UInt64]::Parse($m.Groups[1].Value) } else { $null }
+    }
+    $clock = & $one '(?m)^\s*clock: (\d+),\s*$' $text
+    $tsc = & $one '(?m)^\s*host_tsc: (\d+),\s*$' $text
+    $vcpus = @()
+    $parts = [regex]::Split($text, 'VcpuState \{')
+    foreach ($part in ($parts | Select-Object -Skip 1)) {
+        $lapic = $null
+        $m = [regex]::Match($part, 'kvm_lapic_state \{\s*regs: \[([-\d,\s]*)\]')
+        if ($m.Success) {
+            $lapic = [byte[]]@($m.Groups[1].Value -split '[,\s]+' | Where-Object { $_ } | ForEach-Object { [byte]([int]$_ -band 0xff) })
+            if ($lapic.Length -ne 1024) { $lapic = $null }
+        }
+        $vcpus += ,@{
+            Rip = & $one '(?m)^\s*rip: (\d+),' $part
+            Rflags = & $one '(?m)^\s*rflags: (\d+),' $part
+            MpState = & $one 'kvm_mp_state \{\s*mp_state: (\d+),' $part
+            Lapic = $lapic
+        }
+    }
+    return @{ Clock = $clock; Tsc = $tsc; Vcpus = $vcpus }
+}
+
+# The lines of Get-StuckState from two states `$a` and `$b` read
+# `$seconds` apart on the host.
+function Format-StuckState($a, $b, [double]$seconds) {
+    $u32 = { param($l, $o) [BitConverter]::ToUInt32($l, $o) }
+    $top = {
+        param($l, $base)
+        for ($i = 7; $i -ge 0; $i--) {
+            $w = [BitConverter]::ToUInt32($l, $base + 0x10 * $i)
+            for ($bit = 31; $bit -ge 0; $bit--) { if ($w -band ([UInt32]1 -shl $bit)) { return '0x{0:x2}' -f (32 * $i + $bit) } }
+        }
+        return 'none'
+    }
+    $lines = @()
+    $clock = if ($null -ne $a.Clock -and $null -ne $b.Clock) { '{0:N1} ms' -f (([double]$b.Clock - [double]$a.Clock) / 1e6) } else { 'not in the print' }
+    $tsc = if ($null -ne $a.Tsc -and $null -ne $b.Tsc) { '{0:N0} ticks' -f ([double]$b.Tsc - [double]$a.Tsc) } else { 'not in the print' }
+    $lines += ('  stuck guest, two snapshots {0:N2} s apart: VM clock +{1}, guest TSC +{2}' -f $seconds, $clock, $tsc)
+    for ($i = 0; $i -lt [math]::Max($a.Vcpus.Count, $b.Vcpus.Count); $i++) {
+        $x = $a.Vcpus[$i]; $y = $b.Vcpus[$i]
+        if (-not $x -or -not $y) { $lines += "  vCPU ${i}: in one state only"; continue }
+        $rip = if ($null -ne $y.Rip) { '0x{0:x}' -f $y.Rip } else { '?' }
+        $moved = if ($null -ne $x.Rip -and $null -ne $y.Rip) { if ($x.Rip -eq $y.Rip) { 'the same in both' } else { 'from 0x{0:x}' -f $x.Rip } } else { '?' }
+        $intr = if ($null -ne $y.Rflags) { ($y.Rflags -shr 9) -band 1 } else { '?' }
+        $line = "  vCPU ${i}: rip $rip ($moved), IF $intr, mp_state $($y.MpState)"
+        if ($y.Lapic) {
+            $lvt = & $u32 $y.Lapic 0x320
+            $mode = @('one-shot', 'periodic', 'TSC-deadline', 'reserved')[[int](($lvt -shr 17) -band 3)]
+            $masked = if ($lvt -band 0x10000) { 'masked' } else { 'unmasked' }
+            $line += ('; LVT timer 0x{0:x} ({1}, {2}, vector 0x{3:x2}), initial count {4}, current {5} (first state {6}), divide 0x{7:x}; IRR highest {8}, ISR highest {9}' -f $lvt, $mode, $masked, ($lvt -band 0xff), (& $u32 $y.Lapic 0x380), (& $u32 $y.Lapic 0x390), $(if ($x.Lapic) { & $u32 $x.Lapic 0x390 } else { '?' }), (& $u32 $y.Lapic 0x3e0), (& $top $y.Lapic 0x200), (& $top $y.Lapic 0x100))
+        } else {
+            $line += '; no local APIC in the print'
+        }
+        $lines += $line
+    }
+    return ($lines -join "`n")
 }
 
 # Saves the guest kernel log of a stage (for the report), best effort.
@@ -3597,6 +3729,34 @@ if ($SelfTest) {
             } finally { $tcp.Close(); $relay.Stop(); $stub.Dispose() }
             return 'Relay: TCP to a Unix socket and back'
         }
+        stuck = {
+            # Get-StuckState's reading of snapshot-editor's print, on a
+            # stand-in of its Debug layout: an AP in TSC-deadline mode with
+            # the local timer's vector pending and not in service.
+            $dump = {
+                param([UInt64]$clock, [UInt64]$tsc, [UInt64]$rip)
+                $regs = New-Object int[] 1024
+                $regs[0x320] = -20; $regs[0x322] = 4      # LVT timer 0x000400ec
+                $regs[0x271] = 0x10                         # IRR bit 0xec
+                $regs[0x390] = [int]($clock % 100)
+                $t = @('MicrovmState {', '    vm_state: VmState {', '        clock: kvm_clock_data {', "            clock: $clock,", '            flags: 0,',
+                    "            host_tsc: $tsc,", '        },', '    },', '    vcpu_states: [', '        VcpuState {', '            lapic: kvm_lapic_state {', '                regs: [')
+                $t += @($regs | ForEach-Object { "                    $_," })
+                $t += @('                ],', '            },', '            mp_state: kvm_mp_state {', '                mp_state: 1,', '            },',
+                    '            regs: kvm_regs {', '                rax: 0,', "                rip: $rip,", '                rflags: 514,', '            },', '        },', '    ],', '}')
+                return ($t -join "`n")
+            }
+            $a = Read-VmStateDump (& $dump 1000000 5000 4096)
+            $b = Read-VmStateDump (& $dump 2000000 10000 4096)
+            Check ($a.Clock -eq 1000000 -and $b.Tsc -eq 10000 -and $a.Vcpus.Count -eq 1 -and $a.Vcpus[0].Lapic.Length -eq 1024) "the stand-in read as clock $($a.Clock), TSC $($b.Tsc), $($a.Vcpus.Count) vCPUs"
+            $text = Format-StuckState $a $b 1.0
+            foreach ($want in @('rip 0x1000 (the same in both)', 'IF 1', 'mp_state 1', 'LVT timer 0x400ec (TSC-deadline, unmasked, vector 0xec)', 'IRR highest 0xec', 'ISR highest none')) {
+                Check ($text.Contains($want)) "no '$want' in: $text"
+            }
+            $none = Format-StuckState (Read-VmStateDump 'nothing') (Read-VmStateDump 'nothing') 1.0
+            Check ($none.Contains('not in the print')) "a print without the fields: $none"
+            return 'Stuck guest: a vCPU''s RIP, IF, mp_state, LAPIC timer, IRR and ISR and the VM clock read from snapshot-editor''s print'
+        }
         socknames = {
             # Every socket name of the stages within the bound the start
             # takes (a name over it once failed the cli stage on the PC),
@@ -3752,6 +3912,16 @@ $feature = try {
 } catch { 'unknown (run as administrator to check)' }
 $WhpUnavailable = [Wick.Whp]::Unavailable()
 $whpState = if ($WhpUnavailable) { "NOT available: $WhpUnavailable" } else { 'available' }
+# WHP's capabilities the guest's clock and timer rest on (WHV_CAPABILITY_CODE:
+# ProcessorVendor 0x1000, ProcessorFeatures 0x1001, ProcessorXsaveFeatures
+# 0x1003, ProcessorClockFrequency 0x1004, InterruptClockFrequency 0x1005).
+$whpCaps = @()
+foreach ($cap in @(@(0x1000, 'vendor (0 AMD, 1 Intel, 2 Hygon)', 'x'), @(0x1001, 'processor features', 'x'), @(0x1003, 'XSAVE features', 'x'),
+        @(0x1004, 'processor clock', 'Hz'), @(0x1005, 'interrupt clock', 'Hz'))) {
+    $why = $null
+    $v = [Wick.Whp]::Capability($cap[0], [ref]$why)
+    $whpCaps += if ($null -eq $v) { "$($cap[1]) $why" } elseif ($cap[2] -eq 'Hz') { "$($cap[1]) $v Hz" } else { "$($cap[1]) 0x{0:x}" -f $v }
+}
 $hostInfo = @(
     "firecracker: $Fc", "version: $version",
     "windows: $($os.Caption) $($os.Version) build $($os.BuildNumber).$ubr",
@@ -3761,6 +3931,7 @@ $hostInfo = @(
     "hypervisor present: $($cs.HypervisorPresent)",
     "virtualization firmware enabled: $($cpu.VirtualizationFirmwareEnabled)",
     "WHP: $whpState",
+    "WHP capabilities: $($whpCaps -join '; ')",
     "powershell: $($PSVersionTable.PSVersion)",
     "kernel: $Prefix/$KernelName", "rootfs: $Prefix/$RootfsName",
     "results: $Results", "sockets: $SockDir"
@@ -3768,6 +3939,7 @@ $hostInfo = @(
 $hostInfo | Set-Content -Encoding UTF8 (Join-Path $Results 'host.txt')
 Write-Step "Windows: $($os.Caption) build $($os.BuildNumber).$ubr"
 Write-Step "Windows Hypervisor Platform: $whpState"
+Write-Step "WHP capabilities: $($whpCaps -join '; ')"
 
 $Kernel = Get-Asset $KernelName
 $Rootfs = Get-Asset $RootfsName

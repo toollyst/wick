@@ -268,6 +268,16 @@ AMD host) is not a warning of the guest's health. A stage's PASS line is the one
 returns; a stage that leaves any other value unread fails as a script error naming it
 (`-SelfTest`'s `summary` case).
 
+A guest that does not reach init, in a VM with an API socket, is paused and snapshotted twice a
+second apart before the stage fails, and the failure adds what the two states hold (kept as
+`stuck-<n>-vm-state.txt`, snapshot-editor's `info-vmstate vm-state`): how far the VM clock and
+the guest TSC moved, and for each vCPU its RIP and whether it moved, RFLAGS.IF, `mp_state`, its
+local APIC timer (LVT, initial and current count, divide) and the highest vector pending (IRR) and
+in service (ISR). That tells a stopped clock from a lost interrupt or an AP that never started
+(every stage on CI's AMD EPYC 9V45 runner stopped so, run 43435331370). The host line
+(`host.txt`, and the run's first lines) names WHP's processor vendor, features, XSAVE features
+and processor and interrupt clock frequencies.
+
 | Stage | Checks |
 |---|---|
 | `boot` | 1 vCPU: kernel reaches init, serial output and input (stdin is a pipe), `x86_64`, 1 CPU, memory size, CPUID hypervisor bit, the local timer in TSC-deadline mode (`lapic-deadline`), the guest clock advances with the host's (PASS in one run on a PC at 9af0b63 (AMD Ryzen 9 7900, Windows 11 Pro build 26300.9711): 36.6 s; the guest reports "Speculative Return Stack Overflow: Mitigation: safe RET" and no `WARNING: CPU:` line) |

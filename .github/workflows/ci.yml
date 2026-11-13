@@ -1342,6 +1342,14 @@ jobs:
           $root = (Get-Location).Path
           $unread = @()
           $found = @(Get-Item -Path "$env:WBT\results-*.zip" -ErrorAction SilentlyContinue)
+          # A boot test that was cancelled or timed out leaves its results
+          # directory unzipped, each stage's console log in it (run
+          # 43435331370 lost them all this way): those are taken as they are.
+          foreach ($d in Get-ChildItem -Directory -Path "$env:WBT\results-*" -ErrorAction SilentlyContinue) {
+            if (-not (Test-Path -LiteralPath "$($d.FullName).zip")) {
+              $found += @(Get-ChildItem -Recurse -File -Path $d.FullName -Include *.txt, *.log -ErrorAction SilentlyContinue -ErrorVariable +walk)
+            }
+          }
           foreach ($d in Get-ChildItem -Directory -Path "$env:WJT*" -ErrorAction SilentlyContinue) {
             $found += @(Get-ChildItem -Recurse -File -Path $d.FullName -Include *.txt, *.log -ErrorAction SilentlyContinue -ErrorVariable +walk)
           }
