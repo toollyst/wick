@@ -5262,19 +5262,36 @@ mod fpu_tests {
     /// - the local APIC's state in both of WHP's formats (`lapic_formats`)
     ///   with an interrupt pending, here and on an xAPIC partition, first.
     ///
-    /// Each program step must reach its end (`out 0x80`); the rest is
-    /// printed, not asserted.
+    /// Each line is printed as it is made. A program step that does not
+    /// reach its end (`out 0x80`) is printed with where it stopped (a
+    /// fault's vector, the instruction it was raised at and the registers;
+    /// or the RIP a kick found), its timers are disarmed and the next step
+    /// goes on: nothing here is asserted but the test's own setup. Both
+    /// formats are read with the interrupt just requested and again after
+    /// the vCPU ran (interrupts off), as WHP may show a request in the IRR
+    /// only once the processor ran. Also printed: whether WHP offers its
+    /// own TSC-deadline timer (`TscDeadlineTmrSupport`), which partitions
+    /// are made without (`tscdeadline`), and what the guest's write of a
+    /// TSC-deadline LVT timer entry does on the x2APIC partition.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_an_x2apic_partition_on_record() {
         {
             // An xAPIC partition, its APIC on and interrupts off, then
             // vector 0x41 requested and pending.
-            let (vm, mut vcpu, m) = mmio_guest(&[APIC_ON[..APIC_ON.len() - 1].to_vec(), vec![0xE6, PORT as u8, 0xEB, 0xFE]].concat());
+            // Read once right after the request and once after the vCPU
+            // ran again (interrupts still off, to its `out 0x84`): whether
+            // WHP shows a requested interrupt in the IRR before the
+            // processor next runs.
+            let (vm, mut vcpu, m) = mmio_guest(&[APIC_ON[..APIC_ON.len() - 1].to_vec(), vec![0xE6, PORT as u8, 0xE6, 0x84, 0xEB, 0xFE]].concat());
             let mut reads = 0;
             let end = one_run(&mut vcpu, &[], &mut reads);
             vcpu.shared.inner.inject_msi(0xFEE0_0000, 0x41);
-            for l in lapic_formats(&format!("xAPIC partition (run: {end})"), vcpu.part(), vcpu.vp()) {
+            for l in lapic_formats(&format!("xAPIC partition, requested, not run since (run: {end})"), vcpu.part(), vcpu.vp()) {
+                eprintln!("X2APICREC {l}");
+            }
+            let after = one_run(&mut vcpu, &[], &mut reads);
+            for l in lapic_formats(&format!("xAPIC partition, requested, then run (run: {after})"), vcpu.part(), vcpu.vp()) {
                 eprintln!("X2APICREC {l}");
             }
             drop(vcpu);
@@ -5285,7 +5302,9 @@ mod fpu_tests {
         const VECTOR: u32 = 0x41;
         const HANDLER: u64 = 0x7A00;
         const PROGRAM: u64 = 0x7B00;
-        let mut lines = Vec::new();
+        // Each line is printed as it is made, so a later step that fails
+        // or hangs leaves the earlier ones.
+        let say = |l: String| eprintln!("X2APICREC {l}");
         super::super::vm::APIC_MODE_FOR_TESTS.set(Some(whv::WHvX64LocalApicEmulationModeX2Apic));
         let made = super::super::VmFd::create();
         super::super::vm::APIC_MODE_FOR_TESTS.set(None);
@@ -5296,7 +5315,31 @@ mod fpu_tests {
                 return;
             }
         };
-        lines.push("the x2APIC partition is made".to_string());
+        say("the x2APIC partition is made".to_string());
+        // Whether this host's WHP offers its own TSC-deadline timer
+        // (`TscDeadlineTmrSupport`, bank 1 bit 17), which every partition
+        // is made without (`tscdeadline`).
+        {
+            let mut cap = whv::WHV_PROCESSOR_FEATURES_BANKS::default();
+            let mut written = 0u32;
+            // SAFETY: an output buffer of the size passed.
+            let hres = unsafe {
+                whv::WHvGetCapability(
+                    whv::WHvCapabilityCodeProcessorFeaturesBanks,
+                    (&raw mut cap).cast(),
+                    u32::try_from(core::mem::size_of_val(&cap)).unwrap(),
+                    &mut written,
+                )
+            };
+            // SAFETY: plain data.
+            let bank1 = unsafe { cap.Anonymous.AsUINT64[1] };
+            say(format!(
+                "WHvGetCapability(ProcessorFeaturesBanks): HRESULT {:#010x}, {} banks, TscDeadlineTmrSupport {}",
+                hres.cast_unsigned(),
+                cap.BanksCount,
+                bank1 >> 17 & 1
+            ));
+        }
         let m = guest();
         probes(m);
         let wrmsr = |index: u32, value: u64| {
@@ -5342,7 +5385,7 @@ mod fpu_tests {
         let mut s = vcpu.get_sregs().unwrap();
         (s.idt.base, s.idt.limit) = (IDT, (u64::from(VECTOR) * 16 + 15) as u16);
         vcpu.set_sregs(&s).unwrap();
-        lines.push(format!("APIC_BASE through KVM_GET_SREGS at the start: {:#x}", vcpu.get_sregs().unwrap().apic_base));
+        say(format!("APIC_BASE through KVM_GET_SREGS at the start: {:#x}", vcpu.get_sregs().unwrap().apic_base));
 
         let came = || MSR_INTERCEPTS.with(std::cell::Cell::get);
         let msr = |vcpu: &mut VcpuFd, what: &str, index: u32, write: Option<u64>| -> String {
@@ -5358,21 +5401,26 @@ mod fpu_tests {
                 None => format!("RDMSR {index:#x} ({what}): {how}, {value:#x}, answered by {by}"),
             }
         };
-        lines.push(msr(&mut vcpu, "APIC_BASE", 0x1B, None));
-        lines.push(msr(&mut vcpu, "APIC_BASE, x2APIC on", 0x1B, Some(0xFEE0_0D00)));
-        lines.push(msr(&mut vcpu, "APIC_BASE", 0x1B, None));
-        lines.push(format!("APIC_BASE through KVM_GET_SREGS after: {:#x}", vcpu.get_sregs().unwrap().apic_base));
+        say(msr(&mut vcpu, "APIC_BASE", 0x1B, None));
+        say(msr(&mut vcpu, "APIC_BASE, x2APIC on", 0x1B, Some(0xFEE0_0D00)));
+        say(msr(&mut vcpu, "APIC_BASE", 0x1B, None));
+        say(format!("APIC_BASE through KVM_GET_SREGS after: {:#x}", vcpu.get_sregs().unwrap().apic_base));
         let mut s = vcpu.get_sregs().unwrap();
         s.apic_base = 0xFEE0_0D00;
-        lines.push(format!("KVM_SET_SREGS with APIC_BASE 0xfee00d00: {:?}", vcpu.set_sregs(&s).map_err(|e| e.errno())));
-        lines.push(msr(&mut vcpu, "ID", 0x802, None));
-        lines.push(msr(&mut vcpu, "version", 0x803, None));
-        lines.push(msr(&mut vcpu, "SVR", 0x80F, None));
-        lines.push(msr(&mut vcpu, "SVR, enabled", 0x80F, Some(0x1FF)));
-        lines.push(msr(&mut vcpu, "TPR", 0x808, Some(0)));
-        lines.push(msr(&mut vcpu, "TPR", 0x808, None));
-        lines.push(msr(&mut vcpu, "TDCR", 0x83E, Some(0xB)));
-        lines.push(msr(&mut vcpu, "TDCR", 0x83E, None));
+        say(format!("KVM_SET_SREGS with APIC_BASE 0xfee00d00: {:?}", vcpu.set_sregs(&s).map_err(|e| e.errno())));
+        say(msr(&mut vcpu, "ID", 0x802, None));
+        say(msr(&mut vcpu, "version", 0x803, None));
+        say(msr(&mut vcpu, "SVR", 0x80F, None));
+        say(msr(&mut vcpu, "SVR, enabled", 0x80F, Some(0x1FF)));
+        say(msr(&mut vcpu, "TPR", 0x808, Some(0)));
+        say(msr(&mut vcpu, "TPR", 0x808, None));
+        say(msr(&mut vcpu, "TDCR", 0x83E, Some(0xB)));
+        say(msr(&mut vcpu, "TDCR", 0x83E, None));
+        say(msr(&mut vcpu, "LVT timer, one-shot", 0x832, Some(u64::from(VECTOR))));
+        say(msr(&mut vcpu, "LVT timer, TSC-deadline mode", 0x832, Some(0x4_0000 | u64::from(VECTOR))));
+        say(msr(&mut vcpu, "LVT timer", 0x832, None));
+        say(msr(&mut vcpu, "IA32_TSC_DEADLINE, 0", 0x6E0, Some(0)));
+        say(msr(&mut vcpu, "IA32_TSC_DEADLINE", 0x6E0, None));
 
         // Interrupts, each a program to its `out 0x80`.
         let end = [0xE6, PORT as u8, 0xEB, 0xFE];
@@ -5422,8 +5470,35 @@ mod fpu_tests {
             }
             drop(watchdog);
             vcpu.set_kvm_immediate_exit(0);
-            lines.push(format!("{name}: exits {exits:?}"));
-            assert!(exits.last().unwrap().starts_with("out 0x80"), "{name}: the program did not reach its end: {exits:?}");
+            say(format!("{name}: exits {exits:?}"));
+            if exits.last().unwrap().starts_with("out 0x80") {
+                continue;
+            }
+            // Not to its end: where it stopped, then the next step on a
+            // vCPU with no timer left armed. The #GP handler (`probes`)
+            // spins at its `out`, so the frame is the fault's: RSP was
+            // 0x9000, so the error code is at 0x8fd0 and RIP at 0x8fd8.
+            let r = vcpu.get_regs().unwrap();
+            let fault = exits.iter().any(|e| e.starts_with("out 0x8d") || e.starts_with("out 0x86"));
+            let at = if fault {
+                let rip = u64::from_le_bytes(bytes_at::<8>(m, 0x8FD8));
+                format!(
+                    "a fault ({}): RIP pushed {rip:#x} (the program's byte {:#x}, {:02x?}), error code {:#x}, RAX {:#x} RCX {:#x} RDX {:#x}",
+                    if exits.iter().any(|e| e.starts_with("out 0x8d")) { "#GP" } else { "#UD" },
+                    rip.wrapping_sub(PROGRAM),
+                    if rip < MEM as u64 - 2 { bytes_at::<2>(m, rip) } else { [0xEE; 2] },
+                    u64::from_le_bytes(bytes_at::<8>(m, 0x8FD0)),
+                    r.rax,
+                    r.rcx,
+                    r.rdx
+                )
+            } else {
+                format!("RIP {:#x} (the program's byte {:#x}), RFLAGS {:#x}", r.rip, r.rip.wrapping_sub(PROGRAM), r.rflags)
+            };
+            say(format!("{name}: did not reach its end; stopped at {at}"));
+            say(msr(&mut vcpu, "IA32_TSC_DEADLINE, disarmed", 0x6E0, Some(0)));
+            say(msr(&mut vcpu, "TMICT, stopped", 0x838, Some(0)));
+            say(msr(&mut vcpu, "LVT timer, masked", 0x832, Some(0x1_0000 | u64::from(VECTOR))));
         }
 
         // KVM_GET_LAPIC in x2APIC mode, and KVM_SET_LAPIC of it.
@@ -5432,7 +5507,7 @@ mod fpu_tests {
         };
         match vcpu.get_lapic() {
             Ok(page) => {
-                lines.push(format!(
+                say(format!(
                     "KVM_GET_LAPIC: ID {:#x}, version {:#x}, SVR {:#x}, LVT timer {:#x}, ICR {:#x} {:#x}",
                     word(&page, 0x20),
                     word(&page, 0x30),
@@ -5443,9 +5518,9 @@ mod fpu_tests {
                 ));
                 let set = vcpu.set_lapic(&page).map_err(|e| e.errno());
                 let back = vcpu.get_lapic().map(|b| b.regs == page.regs).map_err(|e| e.errno());
-                lines.push(format!("KVM_SET_LAPIC of it: {set:?}; read back the same: {back:?}"));
+                say(format!("KVM_SET_LAPIC of it: {set:?}; read back the same: {back:?}"));
             }
-            Err(e) => lines.push(format!("KVM_GET_LAPIC: errno {}", e.errno())),
+            Err(e) => say(format!("KVM_GET_LAPIC: errno {}", e.errno())),
         }
         // Both state formats, with vector VECTOR pending (interrupts off,
         // the vCPU not run after the request).
@@ -5453,9 +5528,17 @@ mod fpu_tests {
         r.rflags = 2;
         vcpu.set_regs(&r).unwrap();
         vcpu.shared.inner.inject_msi(0xFEE0_0000, VECTOR);
-        lines.extend(lapic_formats("x2APIC partition", vcpu.part(), vcpu.vp()));
-        for l in &lines {
-            eprintln!("X2APICREC {l}");
+        for l in lapic_formats("x2APIC partition, requested, not run since", vcpu.part(), vcpu.vp()) {
+            say(l);
+        }
+        put(m, PROGRAM, &[0xE6, 0x84, 0xEB, 0xFE]);
+        vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+        let watchdog = super::Watchdog::arm(&vcpu);
+        let after = one_run(&mut vcpu, &[], &mut 0);
+        drop(watchdog);
+        vcpu.set_kvm_immediate_exit(0);
+        for l in lapic_formats(&format!("x2APIC partition, requested, then run (run: {after})"), vcpu.part(), vcpu.vp()) {
+            say(l);
         }
         drop(vcpu);
         drop(vm);
