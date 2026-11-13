@@ -782,15 +782,24 @@ mod tests {
         tap.set_vnet_hdr_size(12).unwrap();
         let mut switch = UnixStream::connect(&tap.endpoint.path).unwrap();
         switch.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        // The switch reads until the tap is gone, so the connection is
-        // not full for long; a frame it cannot take at all is dropped, as
-        // in the product, and is not in `delivered`.
+        // The switch reads to the end of the stream, so the connection is
+        // not full for long. `write_iovec` here is as fast as the loop
+        // goes, with no guest in between, so the reading thread can fall
+        // behind: a frame the full connection cannot take at all is
+        // dropped, as in the product ([`Endpoint::send`] and the module
+        // docs), and is not in `delivered` (run 43323860314: 19929 of 20000; run 43318983352:
+        // all 20000). The tap's side is shut down for writing before the
+        // tap goes, so everything the connection took is read first
+        // (`end` is how the stream ended, `rest` the bytes after the last
+        // whole frame): `frames - delivered` are then the dropped ones,
+        // and their writes, which sent nothing, are in the average.
         let reader = std::thread::spawn(move || {
             let mut chunk = vec![0u8; 64 << 10];
             let mut bytes = 0usize;
             loop {
                 match switch.read(&mut chunk) {
-                    Ok(0) | Err(_) => return bytes,
+                    Ok(0) => return (bytes, "end of stream".to_string()),
+                    Err(err) => return (bytes, format!("{err}")),
                     Ok(n) => bytes += n,
                 }
             }
@@ -809,10 +818,17 @@ mod tests {
             tap.endpoint.check_open().unwrap();
         }
         let check = start.elapsed();
+        let connected = tap.endpoint.conn.is_some();
+        if let Some(conn) = tap.endpoint.conn.as_ref() {
+            conn.shutdown(std::net::Shutdown::Write).unwrap();
+        }
+        let (bytes, end) = reader.join().unwrap();
         drop(tap);
-        let delivered = reader.join().unwrap() / (4 + 1514);
         println!(
-            "TAPCHECK frames={N} delivered={delivered} write_iovec_ns={} check_ns={} (per call, test profile)",
+            "TAPCHECK frames={N} delivered={} rest={} end=\"{end}\" connected={connected} \
+             write_iovec_ns={} check_ns={} (per call, test profile)",
+            bytes / (4 + 1514),
+            bytes % (4 + 1514),
             write.as_nanos() / u128::from(N),
             check.as_nanos() / u128::from(N),
         );
