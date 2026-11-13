@@ -267,21 +267,28 @@ def heap_bases(k32, ntdll, handle):
     return (set(struct.unpack(f"<{count}Q", raw)) if raw else set()), peb
 
 
-# An NT heap's later segments start with a _HEAP_SEGMENT: its signature
-# 0xFFEEFFEE at offset 0x10 and its heap's address at 0x18 (x86-64; the
-# public symbols of ntdll, as WinDbg's `dt ntdll!_HEAP_SEGMENT` prints
-# them). The heap's first segment is the heap itself, with the same header.
+# An NT heap's later segments start with a _HEAP_SEGMENT (x86-64, the
+# public symbols of ntdll; Vergilius Project, Windows 11 24H2 x64,
+# _HEAP_SEGMENT, 0x70 bytes): SegmentSignature 0xFFEEFFEE at 0x10,
+# SegmentListEntry (a LIST_ENTRY) at 0x18, Heap at 0x28, BaseAddress at
+# 0x30. The heap's first segment is the heap itself, with the same header.
+# Read at 0x18 before, the heap was the list's link, which names no heap: a
+# later segment was counted as other private memory (the 1024 KiB "private"
+# allocation of the boot records, the heap's size, which grew 27 to 50 KiB a
+# vCPU).
 HEAP_SEGMENT_SIGNATURE = 0xFFEEFFEE
+HEAP_SEGMENT_HEADER = 0x38
 
 
-def heap_of_segment(header, heaps):
-    """The heap a private allocation is a segment of, from the allocation's
-    first 0x20 bytes, or None: the signature, and a heap of the process."""
-    if not header or len(header) < 0x20:
+def heap_of_segment(header, heaps, base):
+    """The heap a private allocation at `base` is a segment of, from its
+    first `HEAP_SEGMENT_HEADER` bytes, or None: the signature, a heap of the
+    process, and the segment's own base address."""
+    if not header or len(header) < HEAP_SEGMENT_HEADER:
         return None
     signature, = struct.unpack_from("<I", header, 0x10)
-    heap, = struct.unpack_from("<Q", header, 0x18)
-    return heap if signature == HEAP_SEGMENT_SIGNATURE and heap in heaps else None
+    heap, segment_base = struct.unpack_from("<QQ", header, 0x28)
+    return heap if signature == HEAP_SEGMENT_SIGNATURE and heap in heaps and segment_base == base else None
 
 
 def allocations(k32, psapi, handle):
@@ -358,9 +365,10 @@ def measure(k32, psapi, ntdll, pid, system):
                 what = "stacks"
             elif kind == MEM_PRIVATE and base in heaps:
                 what = "heaps"
-            elif kind == MEM_PRIVATE and heap_of_segment(read(k32, handle, base, 0x20), heaps) is not None:
+            elif kind == MEM_PRIVATE and (owner := heap_of_segment(read(k32, handle, base, HEAP_SEGMENT_HEADER),
+                                                                   heaps, base)) is not None:
                 what = "heaps"
-                path = f"(a later segment of the heap at {heap_of_segment(read(k32, handle, base, 0x20), heaps):#x})"
+                path = f"(a later segment of the heap at {owner:#x})"
             elif kind == MEM_PRIVATE:
                 what = "private"
                 held = sum(1 for t in tebs if base <= t < base + size)
@@ -1042,10 +1050,14 @@ def selftest():
     assert symbol_text("abcdefgh", 4000, 8) == "abcdefgh"
     assert symbol_text("ab\0\ua390\u3000", 6, 8) == "ab"
     # A heap's later segment: the signature and a heap of the process.
-    header = bytes(0x10) + struct.pack("<IIQ", HEAP_SEGMENT_SIGNATURE, 0, 0x1b935590000)
-    assert heap_of_segment(header, {0x1b935590000}) == 0x1b935590000
-    assert heap_of_segment(header, {0x5000}) is None and heap_of_segment(bytes(0x20), {0}) is None
-    assert heap_of_segment(None, {0}) is None and heap_of_segment(header[:0x18], {0x1b935590000}) is None
+    # SegmentListEntry's links (to the heap's SegmentList, at 0x120 into it) name no heap.
+    heap, base = 0x1b935590000, 0x1b935a00000
+    header = bytes(0x10) + struct.pack("<IIQQQQ", HEAP_SEGMENT_SIGNATURE, 0, heap + 0x120, heap + 0x120, heap, base)
+    assert len(header) == HEAP_SEGMENT_HEADER
+    assert heap_of_segment(header, {heap}, base) == heap
+    assert heap_of_segment(header, {0x5000}, base) is None and heap_of_segment(header, {heap}, base + 0x10000) is None
+    assert heap_of_segment(bytes(HEAP_SEGMENT_HEADER), {0}, 0) is None
+    assert heap_of_segment(None, {0}, 0) is None and heap_of_segment(header[:0x30], {heap}, base) is None
     # What grows: a second stack-sized private allocation per vCPU, a heap segment that fills.
     # The image's rows differ too, and are left out.
     one = [(40 << 10, "private", 0x1000, 64 << 10, ""), (96 << 10, "heaps", 0x2000, 1 << 20, "(a later segment of the heap at 0x9000)"),
