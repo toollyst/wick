@@ -5282,7 +5282,11 @@ mod fpu_tests {
     /// only once the processor ran. Also printed: whether WHP offers its
     /// own TSC-deadline timer (`TscDeadlineTmrSupport`), which partitions
     /// are made without (`tscdeadline`), and what the guest's write of a
-    /// TSC-deadline LVT timer entry does on the x2APIC partition.
+    /// TSC-deadline LVT timer entry does on the x2APIC partition; the exits
+    /// WHP offers (`ExtendedVmExits`: its APIC write traps); this host's
+    /// own CPUID (TSC-deadline and x2APIC in leaf 1, the hypervisor's
+    /// frequency MSRs); and `WHvX64RegisterTscDeadline` read on the
+    /// partition.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_an_x2apic_partition_on_record() {
@@ -5348,6 +5352,39 @@ mod fpu_tests {
                 hres.cast_unsigned(),
                 cap.BanksCount,
                 bank1 >> 17 & 1
+            ));
+            // The exits WHP can be asked for: the APIC write traps it has
+            // (Learn, WHV_EXTENDED_VM_EXITS: LINT0, LINT1, SVR, LDR, DFR;
+            // none for the LVT timer).
+            let mut exits = 0u64;
+            // SAFETY: a u64 output buffer of the size passed.
+            let hres = unsafe { whv::WHvGetCapability(whv::WHvCapabilityCodeExtendedVmExits, (&raw mut exits).cast(), 8, &mut written) };
+            let names = [
+                "X64CpuidExit", "X64MsrExit", "ExceptionExit", "X64RdtscExit", "X64ApicSmiExitTrap", "HypercallExit",
+                "X64ApicInitSipiExitTrap", "X64ApicWriteLint0ExitTrap", "X64ApicWriteLint1ExitTrap", "X64ApicWriteSvrExitTrap",
+                "UnknownSynicConnection", "RetargetUnknownVpciDevice", "X64ApicWriteLdrExitTrap", "X64ApicWriteDfrExitTrap",
+                "GpaAccessFaultExit",
+            ];
+            let set: Vec<&str> = names.iter().enumerate().filter(|(i, _)| exits >> i & 1 != 0).map(|(_, n)| *n).collect();
+            say(format!("WHvGetCapability(ExtendedVmExits): HRESULT {:#010x}, {exits:#x}: {set:?}", hres.cast_unsigned()));
+            // What this host's own partition is given by its hypervisor: on
+            // a PC the root partition, on a cloud runner a guest of Hyper-V
+            // (whether Hyper-V offers its guests the TSC-deadline timer, and
+            // the frequency MSRs Linux reads the APIC timer's rate from on
+            // Hyper-V, arch/x86/kernel/cpu/mshyperv.c:355-366 at v6.1).
+            use core::arch::x86_64::__cpuid;
+            let leaf1 = __cpuid(1).ecx;
+            let hv = __cpuid(0x4000_0000);
+            let vendor: Vec<u8> = [hv.ebx, hv.ecx, hv.edx].iter().flat_map(|r| r.to_le_bytes()).collect();
+            let privileges = if hv.eax >= 0x4000_0003 { Some(__cpuid(0x4000_0003)) } else { None };
+            say(format!(
+                "this host's own CPUID: leaf 1 ECX TSC-deadline (bit 24) {}, x2APIC (bit 21) {}; hypervisor {:?}; \
+                 leaf 0x40000003 AccessFrequencyMsrs (EAX bit 11) {:?}, frequencies available (EDX bit 8) {:?}",
+                leaf1 >> 24 & 1,
+                leaf1 >> 21 & 1,
+                String::from_utf8_lossy(&vendor),
+                privileges.map(|p| p.eax >> 11 & 1),
+                privileges.map(|p| p.edx >> 8 & 1)
             ));
         }
         let m = guest();
@@ -5431,6 +5468,16 @@ mod fpu_tests {
         say(msr(&mut vcpu, "LVT timer", 0x832, None));
         say(msr(&mut vcpu, "IA32_TSC_DEADLINE, 0", 0x6E0, Some(0)));
         say(msr(&mut vcpu, "IA32_TSC_DEADLINE", 0x6E0, None));
+        // The register a WHP TSC-deadline timer's deadline would be saved
+        // and restored through (WinHvPlatformDefs.h's
+        // WHvX64RegisterTscDeadline, 0x2095), on this partition made
+        // without the timer.
+        say(format!(
+            "WHvX64RegisterTscDeadline: {:?}",
+            super::super::ffi::get_register(vcpu.part(), vcpu.vp(), whv::WHvX64RegisterTscDeadline)
+                .map(|v| super::super::ffi::as_u64(&v))
+                .map_err(|e| e.errno())
+        ));
 
         // Interrupts, each a program to its `out 0x80`.
         let end = [0xE6, PORT as u8, 0xEB, 0xFE];

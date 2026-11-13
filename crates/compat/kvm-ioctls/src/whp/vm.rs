@@ -1478,7 +1478,10 @@ mod tests {
     // it, on a partition of its own with one vCPU. The backend sets no list
     // (`configure`): on a Windows 11 PC, build 26300, the set-up refused
     // every architectural MSR tried, IA32_MCG_CAP and IA32_MCG_STATUS
-    // among them, with 0xc0350006. Printed, not asserted.
+    // among them, with 0xc0350006. Then the same on a partition whose local
+    // APIC is an x2APIC, for its LVT timer, initial count and EOI MSRs (an
+    // exit for the LVT timer would let the backend give a guest the
+    // TSC-deadline mode WHP's x2APIC refuses). Printed, not asserted.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_msr_action_list_on_record() {
@@ -1527,6 +1530,50 @@ mod tests {
             unsafe { whv::WHvDeletePartition(part) };
         }
         eprintln!("MSRACTION taken at the set-up: {taken:x?}");
+        // On a partition whose local APIC is an x2APIC: the LVT timer
+        // (0x832), the initial count (0x838) and EOI (0x80b), which an exit
+        // could let the backend give the TSC-deadline mode WHP's x2APIC
+        // refuses with #GP (X2APICREC); IA32_TSC_DEADLINE and an index taken
+        // above, for comparison.
+        for index in [0x832u32, 0x838, 0x80b, 0x6e0, 0x4b56_4d00] {
+            let Ok(part) = ffi::create_partition() else {
+                eprintln!("MSRACTION x2APIC partition {index:#x}: no partition");
+                continue;
+            };
+            let one = 1u32;
+            let mode = whv::WHvX64LocalApicEmulationModeX2Apic;
+            let entry = whv::WHV_MSR_ACTION_ENTRY {
+                Index: index,
+                ReadAction: whv::WHvMsrActionExit as u8,
+                WriteAction: whv::WHvMsrActionExit as u8,
+                Reserved: 0,
+            };
+            // SAFETY: a u32 property value, an i32 mode, then one MSR action
+            // entry, of the sizes passed.
+            let (count, apic, set) = unsafe {
+                (
+                    whv::WHvSetPartitionProperty(part, whv::WHvPartitionPropertyCodeProcessorCount, (&raw const one).cast(), 4),
+                    whv::WHvSetPartitionProperty(part, whv::WHvPartitionPropertyCodeLocalApicEmulationMode, (&raw const mode).cast(), 4),
+                    whv::WHvSetPartitionProperty(
+                        part,
+                        whv::WHvPartitionPropertyCodeMsrActionList,
+                        (&raw const entry).cast(),
+                        u32::try_from(std::mem::size_of_val(&entry)).unwrap(),
+                    ),
+                )
+            };
+            // SAFETY: the partition made above.
+            let setup = unsafe { whv::WHvSetupPartition(part) };
+            eprintln!(
+                "MSRACTION x2APIC partition {index:#x}: ProcessorCount {:#010x}, x2APIC mode {:#010x}, list set {:#010x}, set-up {:#010x}",
+                count.cast_unsigned(),
+                apic.cast_unsigned(),
+                set.cast_unsigned(),
+                setup.cast_unsigned()
+            );
+            // SAFETY: the partition made above.
+            unsafe { whv::WHvDeletePartition(part) };
+        }
     }
 
     // A vCPU's XSAVE state is read and written whole on every host: into
