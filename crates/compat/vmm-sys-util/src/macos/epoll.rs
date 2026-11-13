@@ -32,6 +32,13 @@ use std::sync::Mutex;
 
 pub use crate::epoll_types::{ControlOperation, EpollEvent, EventSet, epoll_event};
 
+thread_local! {
+    /// The calling thread's kevents and map of a descriptor to its slot, for
+    /// [`Epoll::wait`], kept between waits.
+    static SCRATCH: std::cell::RefCell<(Vec<libc::kevent>, HashMap<RawFd, usize>)> =
+        std::cell::RefCell::new((Vec::new(), HashMap::new()));
+}
+
 /// An epoll instance backed by a kqueue.
 #[derive(Debug)]
 pub struct Epoll {
@@ -308,12 +315,41 @@ impl Epoll {
 
     /// Waits up to `timeout` milliseconds (`-1`: forever) and fills `events`.
     /// Returns the number of events written.
+    ///
+    /// Allocates nothing once its thread has waited with as much room
+    /// before, as Linux's `epoll_wait` writes into the caller's array: the
+    /// kevents and the map of a descriptor to its slot are the thread's,
+    /// kept between waits ([`SCRATCH`]). A wait on every event loop pass
+    /// that allocated and freed them (16 KiB for the event manager's 256
+    /// events) left libmalloc's small zone with dirty pages it kept
+    /// (`test_a_wait_allocates_nothing`).
     pub fn wait(&self, timeout: i32, events: &mut [EpollEvent]) -> io::Result<usize> {
         if events.is_empty() {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
+        SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+            Ok(mut scratch) => {
+                let (fired, slot_of) = &mut *scratch;
+                self.wait_with(timeout, events, fired, slot_of)
+            }
+            // Not reached: nothing a wait calls waits again. Fresh ones then.
+            Err(_) => self.wait_with(timeout, events, &mut Vec::new(), &mut HashMap::new()),
+        })
+    }
+
+    fn wait_with(
+        &self,
+        timeout: i32,
+        events: &mut [EpollEvent],
+        fired: &mut Vec<libc::kevent>,
+        slot_of: &mut HashMap<RawFd, usize>,
+    ) -> io::Result<usize> {
         // A descriptor can fire two filters, so ask for twice as many kevents.
-        let mut fired = vec![kevent_for(0, 0, 0); events.len() * 2];
+        let room = events.len() * 2;
+        if fired.len() < room {
+            fired.resize(room, kevent_for(0, 0, 0));
+        }
+        slot_of.clear();
         let ts;
         let ts_ptr = if timeout < 0 {
             ptr::null()
@@ -331,7 +367,7 @@ impl Epoll {
                 ptr::null(),
                 0,
                 fired.as_mut_ptr(),
-                i32::try_from(fired.len()).unwrap_or(i32::MAX),
+                i32::try_from(room).unwrap_or(i32::MAX),
                 ts_ptr,
             )
         };
@@ -341,7 +377,6 @@ impl Epoll {
 
         let interests = self.interests.lock().unwrap();
         let mut count = 0usize;
-        let mut slot_of: HashMap<RawFd, usize> = HashMap::new();
         for ev in fired.iter().take(usize::try_from(ret).unwrap_or(0)) {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let fd = ev.ident as RawFd;
@@ -484,6 +519,54 @@ mod tests {
         assert_eq!(epoll.wait(0, &mut ready).unwrap(), 1);
         evt.read().unwrap();
         assert_eq!(epoll.wait(0, &mut ready).unwrap(), 0);
+    }
+
+    /// Counts the calling thread's allocations, for
+    /// [`test_a_wait_allocates_nothing`].
+    struct Counting;
+    thread_local! {
+        static ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    // SAFETY: the system allocator's, with a count beside it.
+    unsafe impl std::alloc::GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+            // SAFETY: the caller's layout.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            // SAFETY: a block of this allocator, with its layout.
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    // A wait allocates nothing once its thread has waited before, as
+    // Linux's epoll_wait writes into the caller's array. It allocated its
+    // kevent array (twice the caller's room: 16 KiB for the event manager's
+    // 256 events) and a map on every call, and the VMM's event loop waits
+    // thousands of times a second under vsock traffic: libmalloc's small
+    // zone kept the pages those frees left dirty, the VMM's memory over
+    // upstream's 5 MiB budget (docs/COMPATIBILITY.md, VMM memory besides
+    // the guest).
+    #[test]
+    fn test_a_wait_allocates_nothing() {
+        let epoll = Epoll::new().unwrap();
+        let evts: Vec<EventFd> = (0..3).map(|_| EventFd::new(EFD_NONBLOCK).unwrap()).collect();
+        for (i, evt) in evts.iter().enumerate() {
+            epoll
+                .ctl(ControlOperation::Add, evt.as_raw_fd(), EpollEvent::new(EventSet::IN, i as u64))
+                .unwrap();
+            evt.write(1).unwrap();
+        }
+        let mut ready = [EpollEvent::default(); 256];
+        assert_eq!(epoll.wait(0, &mut ready).unwrap(), 3);
+        let before = ALLOCATIONS.with(std::cell::Cell::get);
+        for _ in 0..100 {
+            assert_eq!(epoll.wait(0, &mut ready).unwrap(), 3);
+        }
+        assert_eq!(ALLOCATIONS.with(std::cell::Cell::get) - before, 0, "allocations in 100 waits");
     }
 
     #[test]
