@@ -837,8 +837,10 @@ pub mod ssbd {
     const MODE_DEFAULT: u8 = 0;
     static MODE: AtomicU8 = AtomicU8::new(MODE_DEFAULT);
 
-    /// Whether the CPU has `FEAT_SSBS` (Apple M2 and later; not M1, nor the
-    /// virtual machines of hosted CI runners).
+    /// Whether the CPU has `FEAT_SSBS`, as macOS reports it
+    /// (`hw.optional.arm.FEAT_SSBS`: 1 on an M1 Pro with macOS 27.2, where
+    /// `test_ssbd` sets and reads `PSTATE.SSBS`; not on the virtual machines
+    /// of hosted CI runners).
     pub(super) fn supported() -> bool {
         let mut v: c_int = 0;
         let mut len = core::mem::size_of::<c_int>();
@@ -1529,6 +1531,22 @@ mod tests {
         assert!(!ssbd::bypass_allowed());
         // Threads started afterwards have the mitigation too.
         assert!(!std::thread::spawn(ssbd::bypass_allowed).join().unwrap());
+        // And a process forked afterwards (Firecracker's API process), as a
+        // child task inherits it on Linux: in its first thread and in one
+        // it starts.
+        // SAFETY: the child reads a register, starts one thread and exits.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                let here = ssbd::bypass_allowed();
+                let there = std::thread::spawn(ssbd::bypass_allowed).join().unwrap_or(true);
+                libc::_exit(c_int::from(here) | c_int::from(there) << 1);
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "{status:#x}");
+        }
     }
 
     #[test]
