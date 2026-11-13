@@ -2174,6 +2174,43 @@ impl VcpuFd {
     }
 }
 
+/// The record tests' kick of a vCPU whose `run` has not come back 5 s
+/// after [`Watchdog::arm`]: a thread that waits on a channel and sets the
+/// immediate exit when the wait times out. Dropping it ends the wait at
+/// once and joins the thread. (The thread polled a flag every 10 ms
+/// before, and joining it held each run for that sleep: the ~10.5 ms a
+/// step of the stack record took on a PC at 03f4bfe, all but tens of
+/// microseconds of it the test's own wait.)
+#[cfg(test)]
+pub(crate) struct Watchdog {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl Watchdog {
+    pub(crate) fn arm(vcpu: &VcpuFd) -> Self {
+        let (stop, wait) = std::sync::mpsc::channel::<()>();
+        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
+        let thread = std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(std::time::Duration::from_secs(5)) {
+                kicker.set_kvm_immediate_exit(1);
+            }
+        });
+        Watchdog { stop: Some(stop), thread: Some(thread) }
+    }
+}
+
+#[cfg(test)]
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(t) = self.thread.take() {
+            t.join().unwrap();
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// The MSR intercepts this thread's runs have answered: a record test
@@ -2503,21 +2540,9 @@ mod bp_tests {
 
     /// One `run`, kicked after 5 s if it has not returned, as a line.
     fn run_once(vcpu: &mut VcpuFd) -> String {
-        let done = Arc::new(AtomicBool::new(false));
-        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
-        let watch = Arc::clone(&done);
-        let watchdog = std::thread::spawn(move || {
-            for _ in 0..500 {
-                if watch.load(Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            kicker.set_kvm_immediate_exit(1);
-        });
+        let watchdog = super::Watchdog::arm(vcpu);
         let line = describe(vcpu.run());
-        done.store(true, Ordering::SeqCst);
-        watchdog.join().unwrap();
+        drop(watchdog);
         if line == "kicked" { "no exit within 5 s (kicked)".to_string() } else { line }
     }
 
@@ -2777,7 +2802,6 @@ mod bp_tests {
 mod fpu_tests {
     use super::*;
     use kvm_bindings::{kvm_segment, Xsave};
-    use std::sync::atomic::AtomicBool;
 
     const MEM: usize = 4 << 20;
     const GDT: u64 = 0x4000;
@@ -2889,18 +2913,7 @@ mod fpu_tests {
 
     /// One `run`, kicked after 5 s if it has not returned, as a line.
     fn run_once(vcpu: &mut VcpuFd) -> String {
-        let done = Arc::new(AtomicBool::new(false));
-        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
-        let watch = Arc::clone(&done);
-        let watchdog = std::thread::spawn(move || {
-            for _ in 0..500 {
-                if watch.load(Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            kicker.set_kvm_immediate_exit(1);
-        });
+        let watchdog = super::Watchdog::arm(vcpu);
         let line = match vcpu.run() {
             Ok(VcpuExit::IoOut(port, _)) => format!("exit IoOut port {port:#x}"),
             Ok(VcpuExit::Shutdown) => "exit Shutdown".to_string(),
@@ -2908,8 +2921,7 @@ mod fpu_tests {
             Err(e) if e.errno() == libc::EINTR => "no exit within 5 s (kicked)".to_string(),
             Err(e) => format!("run failed, errno {}", e.errno()),
         };
-        done.store(true, Ordering::SeqCst);
-        watchdog.join().unwrap();
+        drop(watchdog);
         line
     }
 
@@ -3125,18 +3137,7 @@ mod fpu_tests {
     /// One `run` as a line; a guest that does not come back is kicked
     /// after 5 s.
     fn run_to_a_line(vcpu: &mut VcpuFd) -> String {
-        let done = Arc::new(AtomicBool::new(false));
-        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
-        let watch = Arc::clone(&done);
-        let watchdog = std::thread::spawn(move || {
-            for _ in 0..500 {
-                if watch.load(Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            kicker.set_kvm_immediate_exit(1);
-        });
+        let watchdog = super::Watchdog::arm(vcpu);
         let line = match vcpu.run() {
             Ok(VcpuExit::IoOut(port, _)) => format!("exit IoOut port {port:#x}"),
             Ok(VcpuExit::MmioRead(address, _)) => format!("exit MmioRead {address:#x}"),
@@ -3146,8 +3147,7 @@ mod fpu_tests {
             Err(e) if e.errno() == libc::EINTR => "no exit within 5 s (kicked)".to_string(),
             Err(e) => format!("run failed, errno {}", e.errno()),
         };
-        done.store(true, Ordering::SeqCst);
-        watchdog.join().unwrap();
+        drop(watchdog);
         vcpu.set_kvm_immediate_exit(0);
         line
     }
@@ -3157,18 +3157,7 @@ mod fpu_tests {
     /// 5 s after the first run began), as the exits the test saw. An `IN`
     /// and an MMIO read are answered with zeros.
     fn run_a_step(vcpu: &mut VcpuFd) -> String {
-        let done = Arc::new(AtomicBool::new(false));
-        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
-        let watch = Arc::clone(&done);
-        let watchdog = std::thread::spawn(move || {
-            for _ in 0..500 {
-                if watch.load(Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            kicker.set_kvm_immediate_exit(1);
-        });
+        let watchdog = super::Watchdog::arm(vcpu);
         let mut exits = Vec::new();
         while exits.len() < 12 {
             let (line, more) = match vcpu.run() {
@@ -3194,8 +3183,7 @@ mod fpu_tests {
                 break;
             }
         }
-        done.store(true, Ordering::SeqCst);
-        watchdog.join().unwrap();
+        drop(watchdog);
         vcpu.set_kvm_immediate_exit(0);
         format!("exits {}", exits.join(", "))
     }
@@ -3921,6 +3909,11 @@ mod fpu_tests {
         let mut vcpus: Vec<VcpuFd> = (0..N).map(|i| vm.create_vcpu(i as u64).unwrap()).collect();
         for v in &vcpus {
             start(v);
+            // Runnable, so each runs its code: vCPUs 1 to 3 are made waiting
+            // for a SIPI, as KVM makes an AP (`regs::startup_suspend`), and
+            // at 03f4bfe ran nothing (each run kicked after 5 s), which
+            // made the first-run and MMIO rows vCPU 0's divided by four.
+            v.set_mp_state(kvm_bindings::kvm_mp_state { mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE }).unwrap();
         }
         let created = room.take();
         eprintln!("HEAPTEST after create_vcpu of {N}: {}", created.line());
@@ -3976,6 +3969,9 @@ mod fpu_tests {
         for e in &exits {
             eprintln!("HEAPTEST {e}");
         }
+        // The rows are each vCPU's only if each ran its code to its `out`.
+        let ran = |e: &String| e.contains("first run exit IoOut") && e.ends_with("exit IoOut port 0x80");
+        assert!(exits.iter().all(ran), "a vCPU did not run its code, so the rows are not per vCPU: {exits:#?}");
         drop(vcpus);
         drop(vm);
         // SAFETY: the test's mapping, no VM left using it.
@@ -3989,18 +3985,7 @@ mod fpu_tests {
     /// that `KVM_GET_REGS` gives at it. At most 40 exits, and a kick 5 s
     /// after the first run began.
     fn exits_with_their_bytes(vcpu: &mut VcpuFd, feed: &mut std::collections::VecDeque<Vec<u8>>, registers: bool) -> Vec<String> {
-        let done = Arc::new(AtomicBool::new(false));
-        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
-        let watch = Arc::clone(&done);
-        let watchdog = std::thread::spawn(move || {
-            for _ in 0..500 {
-                if watch.load(Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            kicker.set_kvm_immediate_exit(1);
-        });
+        let watchdog = super::Watchdog::arm(vcpu);
         let mut answer = |data: &mut [u8]| {
             let given = feed.pop_front().unwrap_or_default();
             for (i, b) in data.iter_mut().enumerate() {
@@ -4037,8 +4022,7 @@ mod fpu_tests {
                 break;
             }
         }
-        done.store(true, Ordering::SeqCst);
-        watchdog.join().unwrap();
+        drop(watchdog);
         vcpu.set_kvm_immediate_exit(0);
         exits
     }
