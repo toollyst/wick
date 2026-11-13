@@ -31,6 +31,8 @@ pub const MIN_HDR_LEN: usize = 10;
 
 /// `VIRTIO_NET_HDR_F_NEEDS_CSUM`.
 pub const F_NEEDS_CSUM: u8 = 1;
+/// `VIRTIO_NET_HDR_F_DATA_VALID`.
+pub const F_DATA_VALID: u8 = 2;
 /// `VIRTIO_NET_HDR_GSO_NONE`.
 pub const GSO_NONE: u8 = 0;
 /// `VIRTIO_NET_HDR_GSO_TCPV4`.

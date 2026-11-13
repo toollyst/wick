@@ -152,7 +152,7 @@ Add an interface to `vm.json`:
 ```
 
 Firecracker logs the network vmnet picked, with the host's address on it: `vmnet: network 192.168.64.1/24`, for
-example. In the guest, give `eth0` another address on that network:
+example, and whether frames carry virtio-net headers with TSO (macOS 15.4 and later) or are plain. In the guest, give `eth0` another address on that network:
 
 ```console
 # ip addr add 192.168.64.77/24 dev eth0 && ip link set eth0 up

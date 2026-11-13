@@ -14,13 +14,22 @@
 //!   `vmnet_start_interface`, which needs root (or the
 //!   `com.apple.vm.networking` entitlement).
 //!
-//! Frames are plain Ethernet frames. vmnet reports arriving packets through a
-//! callback on a dispatch queue; the callback writes to a pipe whose read end
-//! is the interface's pollable descriptor.
+//! Frames are plain Ethernet frames, or, from macOS 15.4 on, Ethernet frames
+//! behind a 12-byte virtio-net header ([`Interface::vnet`]): vmnet's
+//! virtio-header mode (`vmnet_enable_virtio_header_key`, vmnet.h, macOS
+//! 15.4), with TCP segmentation offload (`vmnet_enable_tso_key`, macOS 11),
+//! where vmnet takes the guest's TCP superframes and coalesces what it
+//! delivers (`vmm::platform::vnet`'s `tx_offload` and `rx_offload` say what
+//! is handed over and what the guest is given). The key is looked up at run
+//! time, so the binary still loads before 15.4, where frames stay plain.
+//! vmnet reports arriving packets through a callback on a dispatch queue;
+//! the callback writes to a pipe whose read end is the interface's pollable
+//! descriptor.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs::File;
 use std::io::{self, Read};
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::ptr::{self, null, null_mut};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -40,6 +49,10 @@ const VMNET_INTERFACE_PACKETS_AVAILABLE: u32 = 1;
 /// How long to wait for vmnet to start or stop an interface.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The size of the header in front of each frame in virtio-header mode
+/// (`struct virtio_net_hdr_v1`; vmnet.h, `vmnet_max_packet_size_key`).
+pub const VNET_HDR_LEN: usize = 12;
+
 #[repr(C)]
 struct VmPktDesc {
     vm_pkt_size: usize,
@@ -55,6 +68,8 @@ unsafe extern "C" {
     static vmnet_mac_address_key: *const c_char;
     static vmnet_mtu_key: *const c_char;
     static vmnet_max_packet_size_key: *const c_char;
+    static vmnet_start_address_key: *const c_char;
+    static vmnet_enable_tso_key: *const c_char;
 
     fn vmnet_start_interface(
         desc: XpcObject,
@@ -88,6 +103,7 @@ unsafe extern "C" {
         count: usize,
     ) -> XpcObject;
     fn xpc_dictionary_set_uint64(dict: XpcObject, key: *const c_char, value: u64);
+    fn xpc_dictionary_set_bool(dict: XpcObject, key: *const c_char, value: bool);
     fn xpc_dictionary_set_string(dict: XpcObject, key: *const c_char, value: *const c_char);
     fn xpc_dictionary_get_uint64(dict: XpcObject, key: *const c_char) -> u64;
     fn xpc_dictionary_get_string(dict: XpcObject, key: *const c_char) -> *const c_char;
@@ -136,13 +152,32 @@ fn network_api() -> Option<&'static NetworkApi> {
     .as_ref()
 }
 
-/// The network of a mode, shared by every interface of the process.
-fn network(api: &NetworkApi, mode: u32) -> io::Result<NetworkRef> {
+/// `vmnet_enable_virtio_header_key` (vmnet.h, macOS 15.4), looked up at run
+/// time: `None` before 15.4.
+fn virtio_header_key() -> Option<*const c_char> {
+    static KEY: OnceLock<Option<usize>> = OnceLock::new();
+    KEY.get_or_init(|| {
+        // SAFETY: dlsym with a NUL-terminated name.
+        let p = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"vmnet_enable_virtio_header_key".as_ptr(),
+            )
+        };
+        // SAFETY: the symbol is a `const char * const` (vmnet.h).
+        (!p.is_null()).then(|| unsafe { *p.cast::<*const c_char>() } as usize)
+    })
+    .map(|key| key as *const c_char)
+}
+
+/// The network of a mode, shared by every interface of the process, with its
+/// IPv4 subnet and mask.
+fn network(api: &NetworkApi, mode: u32) -> io::Result<(NetworkRef, Ipv4Addr, Ipv4Addr)> {
     // The networks live as long as the process; stored as addresses.
-    static NETWORKS: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
+    static NETWORKS: Mutex<Vec<(u32, usize, Ipv4Addr, Ipv4Addr)>> = Mutex::new(Vec::new());
     let mut nets = NETWORKS.lock().unwrap();
-    if let Some((_, net)) = nets.iter().find(|(m, _)| *m == mode) {
-        return Ok(*net as NetworkRef);
+    if let Some((_, net, subnet, mask)) = nets.iter().find(|(m, ..)| *m == mode) {
+        return Ok((*net as NetworkRef, *subnet, *mask));
     }
     let mut status = 0;
     // SAFETY: plain calls; the configuration is released once used.
@@ -162,11 +197,12 @@ fn network(api: &NetworkApi, mode: u32) -> io::Result<NetworkRef> {
     let mut mask = libc::in_addr { s_addr: 0 };
     // SAFETY: a valid network and two output addresses.
     unsafe { (api.get_ipv4_subnet)(net, &mut subnet, &mut mask) };
-    let subnet = std::net::Ipv4Addr::from(u32::from_be(subnet.s_addr));
-    let prefix = u32::from_be(mask.s_addr).count_ones();
+    let subnet = Ipv4Addr::from(u32::from_be(subnet.s_addr));
+    let mask = Ipv4Addr::from(u32::from_be(mask.s_addr));
+    let prefix = mask.to_bits().count_ones();
     crate::logger::info!("vmnet: network {subnet}/{prefix} (mode {mode})");
-    nets.push((mode, net as usize));
-    Ok(net)
+    nets.push((mode, net as usize, subnet, mask));
+    Ok((net, subnet, mask))
 }
 
 /// errno for a `vmnet_return_t`.
@@ -276,6 +312,9 @@ struct Params {
     mtu: u64,
     max_packet_size: u64,
     mac: Option<String>,
+    /// The gateway's (the host's) address, as vmnet reports it
+    /// (`vmnet_start_interface`).
+    start_address: Option<String>,
 }
 
 type StartBlock = Block<Completion<(u32, Params)>>;
@@ -288,10 +327,12 @@ extern "C" fn start_done(block: *mut StartBlock, status: u32, params: XpcObject)
         unsafe {
             out.mtu = xpc_dictionary_get_uint64(params, vmnet_mtu_key);
             out.max_packet_size = xpc_dictionary_get_uint64(params, vmnet_max_packet_size_key);
-            let mac = xpc_dictionary_get_string(params, vmnet_mac_address_key);
-            if !mac.is_null() {
-                out.mac = Some(CStr::from_ptr(mac).to_string_lossy().into_owned());
-            }
+            let string = |key| {
+                let value = xpc_dictionary_get_string(params, key);
+                (!value.is_null()).then(|| CStr::from_ptr(value).to_string_lossy().into_owned())
+            };
+            out.mac = string(vmnet_mac_address_key);
+            out.start_address = string(vmnet_start_address_key);
         }
     }
     // SAFETY: vmnet passes the block it was given, which outlives the call.
@@ -350,6 +391,12 @@ pub struct Interface {
     pub max_packet_size: u64,
     /// The MAC address vmnet chose for the interface.
     pub mac: Option<String>,
+    /// Frames carry a [`VNET_HDR_LEN`]-byte virtio-net header, with TSO on:
+    /// macOS 15.4 and later.
+    pub vnet: bool,
+    /// The host's own addresses on the link that vmnet reports
+    /// ([`Interface::host_addresses`]).
+    host: Vec<IpAddr>,
 }
 
 impl std::fmt::Debug for Interface {
@@ -358,6 +405,8 @@ impl std::fmt::Debug for Interface {
             .field("mtu", &self.mtu)
             .field("max_packet_size", &self.max_packet_size)
             .field("mac", &self.mac)
+            .field("vnet", &self.vnet)
+            .field("host", &self.host)
             .finish_non_exhaustive()
     }
 }
@@ -402,16 +451,31 @@ impl Interface {
             mtu: 0,
             max_packet_size: 0,
             mac: None,
+            vnet: false,
+            host: Vec::new(),
         };
+        let vnet_key = virtio_header_key();
 
         let done: Completion<(u32, Params)> = Arc::default();
         let mut block = Block::new(start_done as *const c_void, done.clone());
         // SAFETY: an empty dictionary.
         let desc = unsafe { xpc_dictionary_create(null(), null(), 0) };
+        if let Some(key) = vnet_key {
+            // Both directions at once: with the header, vmnet takes the
+            // guest's TCP superframes only with TSO, and with TSO it
+            // coalesces what it delivers (both measured on macOS 27.2).
+            // SAFETY: setting keys of a dictionary owned here.
+            unsafe {
+                xpc_dictionary_set_bool(desc, key, true);
+                xpc_dictionary_set_bool(desc, vmnet_enable_tso_key, true);
+            }
+        }
+        let mut subnet = None;
         let started = (|| {
             let raw = match (mode, network_api()) {
                 (Mode::Shared | Mode::Host, Some(api)) => {
-                    let net = network(api, mode.value())?;
+                    let (net, address, _) = network(api, mode.value())?;
+                    subnet = Some(address);
                     // SAFETY: valid network, dictionary, queue and block.
                     unsafe { (api.start_with_network)(net, desc, queue, block.as_ptr()) }
                 }
@@ -461,6 +525,26 @@ impl Interface {
         iface.mtu = params.mtu;
         iface.max_packet_size = params.max_packet_size;
         iface.mac = params.mac;
+        iface.vnet = vnet_key.is_some();
+        let start = params
+            .start_address
+            .as_deref()
+            .and_then(|s| s.parse::<Ipv4Addr>().ok());
+        iface.host = match (mode, subnet, start) {
+            (Mode::Bridged(_), ..) => Vec::new(),
+            (_, Some(address), _) | (_, None, Some(address)) => vec![IpAddr::V4(address)],
+            _ => Vec::new(),
+        };
+        crate::logger::info!(
+            "vmnet: {} (mtu {}, the host's address on the link {:?})",
+            if iface.vnet {
+                "virtio-net headers with TSO"
+            } else {
+                "plain frames (virtio-net headers need macOS 15.4)"
+            },
+            iface.mtu,
+            iface.host
+        );
 
         // SAFETY: valid interface, queue and block; the block lives in `iface`.
         let status = unsafe {
@@ -505,16 +589,26 @@ impl Interface {
         Ok((count > 0).then_some(desc.vm_pkt_size))
     }
 
-    /// Writes one frame.
-    pub fn write(&self, frame: &[u8]) -> io::Result<()> {
-        let mut iov = libc::iovec {
-            iov_base: frame.as_ptr().cast_mut().cast(),
-            iov_len: frame.len(),
-        };
+    /// Writes one frame; in virtio-header mode ([`Interface::vnet`]) behind
+    /// `hdr`, or a zeroed header (a complete frame) if `None`.
+    pub fn write(&self, hdr: Option<&[u8; VNET_HDR_LEN]>, frame: &[u8]) -> io::Result<()> {
+        let zero = [0u8; VNET_HDR_LEN];
+        let hdr = hdr.unwrap_or(&zero);
+        let mut iov = [
+            libc::iovec {
+                iov_base: hdr.as_ptr().cast_mut().cast(),
+                iov_len: VNET_HDR_LEN,
+            },
+            libc::iovec {
+                iov_base: frame.as_ptr().cast_mut().cast(),
+                iov_len: frame.len(),
+            },
+        ];
+        let skip = usize::from(!self.vnet);
         let mut desc = VmPktDesc {
-            vm_pkt_size: frame.len(),
-            vm_pkt_iov: &mut iov,
-            vm_pkt_iovcnt: 1,
+            vm_pkt_size: iov[skip..].iter().map(|v| v.iov_len).sum(),
+            vm_pkt_iov: iov[skip..].as_mut_ptr(),
+            vm_pkt_iovcnt: if self.vnet { 2 } else { 1 },
             vm_flags: 0,
         };
         let mut count = 1;
@@ -527,6 +621,19 @@ impl Interface {
             return Err(io::Error::from_raw_os_error(libc::ENOBUFS));
         }
         Ok(())
+    }
+
+    /// The host's own addresses on the interface's link, as vmnet reports
+    /// them when the interface starts: in shared and host mode the gateway's
+    /// IPv4 address, which is the host's on vmnet's bridge (vmnet.h,
+    /// `vmnet_start_address_key`: "used as the gateway address"; the network
+    /// API's `vmnet_network_get_ipv4_subnet` gave 192.168.64.1 on macOS
+    /// 27.2, the address the boot tests bind on the host). None in bridged
+    /// mode, and no IPv6 address: vmnet reports none, and the host's
+    /// interfaces cannot be listed once the sandbox is narrowed (getifaddrs
+    /// reads a routing sysctl, which it denies).
+    pub fn host_addresses(&self) -> &[IpAddr] {
+        &self.host
     }
 }
 

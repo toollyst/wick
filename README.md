@@ -71,7 +71,7 @@ wick removes that limit without forking Firecracker in the usual sense:
 | SMP | 1 and 2 vCPUs, work runs on each, the guest clock agrees between them |
 | virtio-blk, Sync and Async engines | Async keeps io_uring's submission/completion model on worker threads, `F_FULLFSYNC` |
 | vsock | Host → guest `CONNECT`, guest → host `<uds>_<port>`, over MMIO and PCI |
-| virtio-net | vmnet (`vmnet-shared`, `vmnet-host`, `vmnet-br-<if>`) or a Unix datagram endpoint, with TUN's checksum, TSO and UFO in user space |
+| virtio-net | vmnet (`vmnet-shared`, `vmnet-host`, `vmnet-br-<if>`) or a Unix datagram endpoint, with TUN's checksum, TSO and UFO in user space; from macOS 15.4 vmnet takes the guest's TCP superframes and hands it coalesced ones, with virtio-net headers, as a TAP does |
 | PCI with MSI-X | `--enable-pci`, through a GICv2m MSI frame (Apple's GIC has no ITS) |
 | Snapshots | Full and diff, restore in another process, `snapshot-editor rebase`, with PCI |
 | userfaultfd (`Uffd` memory backend) | The kernel side of userfaultfd, rebuilt in user space |

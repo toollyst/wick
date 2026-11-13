@@ -374,6 +374,38 @@ def guest_health(arch, path=GUEST_HEALTH):
     return patterns
 
 
+NET_FEATURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "virtio-net-features.txt")
+NET_CONFIGS = ("plain", "mac", "mtu", "mac+mtu")
+
+
+def net_features(configuration, path=NET_FEATURES):
+    """The features a guest's virtio-net device ends up with for an
+    interface of `configuration`, from tools/virtio-net-features.txt, read
+    as its header says; a line that is not a comment or `<configuration>
+    <bits>` is an error naming it."""
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    found = None
+    for n, line in enumerate(text.split("\n"), 1):
+        if line == "" or line.startswith("#"):
+            continue
+        name, sep, bits = line.partition(" ")
+        if not sep or name not in NET_CONFIGS or len(bits) != 64 or set(bits) - {"0", "1"}:
+            raise Failure(f"{path}:{n}: not a comment or <configuration> <bits>: {line!r}")
+        if name == configuration:
+            found = bits
+    check(found is not None, f"{path}: no line for {configuration}")
+    return found
+
+
+def check_net_features(vm, configuration="mac"):
+    """The guest's eth0 has the features tools/virtio-net-features.txt
+    gives for its interface's configuration."""
+    _, got = vm.sh("cat /sys/class/net/eth0/device/features")
+    want = net_features(configuration)
+    check(got == want, f"virtio-net features {got}, want {want} ({configuration}, tools/virtio-net-features.txt)")
+
+
 def config(ctx, vcpus=1, mem=256, drives=(), **extra):
     cfg = {
         "boot-source": {"kernel_image_path": ctx.kernel, "boot_args": BOOT_ARGS},
@@ -780,6 +812,7 @@ def stage_net(ctx):
     try:
         vm.shell()
         guest_net_up(vm, GUEST_IP)
+        check_net_features(vm)
         _, out = vm.sh(f"ping -c 3 -i 0.3 -W 3 {HOST_IP}")
         check(" 0% packet loss" in out, f"ping: {out}")
         _, out = vm.sh(f"ping -c 2 -s 1400 -W 3 {HOST_IP}")
@@ -793,7 +826,8 @@ def stage_net(ctx):
     check(not switch.bad, f"bad frames from the guest: {switch.bad[:3]}")
     c = switch.counts
     check(c["arp"] >= 1 and c["icmp"] >= 5 and c["udp"] >= 1, f"switch saw {c}")
-    return f"Unix datagram endpoint: ARP, ICMP (1400 B), UDP echo, checksums valid ({c}); {rates}"
+    return (f"Unix datagram endpoint: ARP, ICMP (1400 B), UDP echo, checksums valid ({c}); {rates}; "
+            f"virtio-net features as tools/virtio-net-features.txt")
 
 
 # 1 MiB/s: a bucket of 128 KiB refilled every 125 ms (upstream's token bucket:
@@ -864,10 +898,17 @@ def stage_vmnet(ctx):
     vm = ctx.vm("vmnet", [], cfg)
     m = vm.wait_for(r"vmnet: network (\d+\.\d+\.\d+)\.(\d+)/24", 20)
     net, gw = m.group(1), f"{m.group(1)}.{m.group(2)}"
+    # vmnet's virtio-header mode with TSO from macOS 15.4 (vmnet.h,
+    # vmnet_enable_virtio_header_key), plain frames before.
+    offload = vmnet_offload_expected()
+    mode = vm.wait_for(r"vmnet: (virtio-net headers with TSO|plain frames)", 20).group(1)
+    check((mode == "virtio-net headers with TSO") == offload,
+          f"vmnet mode {mode!r} on macOS {platform.mac_ver()[0]} (headers from 15.4)")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     vm.shell()
     guest_net_up(vm, f"{net}.77")
+    check_net_features(vm)
     deadline = time.time() + 15
     while True:  # the host's bridge address appears once the guest uses it
         try:
@@ -888,9 +929,19 @@ def stage_vmnet(ctx):
 
     t = threading.Thread(target=serve, daemon=True)
     t.start()
+    stats = "cat /sys/class/net/eth0/statistics/rx_bytes /sys/class/net/eth0/statistics/rx_packets"
+    _, before = vm.sh(stats)
     _, out = vm.sh(f"socat -u TCP:{gw}:{port} - | md5sum", timeout=60)
+    _, after = vm.sh(stats)
     t.join(10)
     check(out.split()[0] == hashlib.md5(payload).hexdigest(), f"TCP 8 MiB host->guest md5 {out!r}")
+    (b0, p0), (b1, p1) = (map(int, x.split()) for x in (before, after))
+    # The guest's average received frame: over an Ethernet frame of the MTU
+    # only if it was given TCP superframes (GSO), as a TAP gives a guest
+    # with GUEST_TSO4 the host's GRO and TSO frames.
+    avg = (b1 - b0) / max(p1 - p0, 1)
+    check((avg > 1514) == offload, f"host->guest: {p1 - p0} frames of {avg:.0f} bytes on average, "
+                                   f"{'superframes' if offload else 'none over 1514'} expected")
     # Guest to host: segmentation and checksum offload on the transmit side.
     got = {}
 
@@ -916,7 +967,15 @@ def stage_vmnet(ctx):
     _, out = vm.sh(f"ping -c 2 -W 3 {gw}")
     check(" 0% packet loss" in out, f"ping gateway: {out}")
     vm.reboot()
-    return f"vmnet-shared: TCP 8 MiB each way, ping {gw}"
+    return (f"vmnet-shared ({mode}): TCP 8 MiB each way (host->guest frames of {avg:.0f} bytes on average), "
+            f"ping {gw}, virtio-net features as tools/virtio-net-features.txt")
+
+
+def vmnet_offload_expected():
+    """Whether vmnet carries virtio-net headers with TSO here: macOS 15.4
+    and later (vmnet.h, vmnet_enable_virtio_header_key)."""
+    version = tuple(int(x) for x in platform.mac_ver()[0].split(".")[:2])
+    return version >= (15, 4)
 
 
 def stage_snapshot(ctx, pci=False):

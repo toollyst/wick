@@ -1,0 +1,33 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The features a guest's virtio-net device ends up with: what the guest
+# reads from /sys/class/net/<if>/device/features, the same on every host.
+# The boot tests' net stages compare it with the guest's
+# (tools/macos/boot-test.py; tools/windows/boot-test.ps1 may read it too).
+# The guest kernel is upstream's CI kernel, Linux v6.1.
+#
+# Each line is the bits both sides keep:
+# - offered by Firecracker's net device (src/vmm/src/devices/virtio/net/
+#   device.rs, Net::new_with_tap, v1.18.0): CSUM (0), GUEST_CSUM (1),
+#   GUEST_TSO4 (7), GUEST_TSO6 (8), GUEST_UFO (10), HOST_TSO4 (11),
+#   HOST_TSO6 (12), HOST_UFO (14), MRG_RXBUF (15), RING_EVENT_IDX (29),
+#   VERSION_1 (32) always; MTU (3) with an "mtu" in the interface's
+#   configuration; MAC (5) with a "guest_mac";
+# - taken by the guest's driver: every one of those device bits is in
+#   VIRTNET_FEATURES (drivers/net/virtio_net.c, v6.1, :4033 to :4045), and
+#   the transport keeps RING_EVENT_IDX and VERSION_1
+#   (drivers/virtio/virtio_ring.c vring_transport_features, :2703 to :2726).
+# The guest prints dev->features, a u64, one character per bit from bit 0,
+# '1' or '0', 64 in all (drivers/virtio/virtio.c features_show, :47 to :61).
+#
+# Format, read the same way by every reader:
+# - a line that is empty, or whose first character is '#', is a comment;
+# - any other line is <configuration><one space><bits>: <configuration> is
+#   the interface's optional fields, "plain", "mac", "mtu" or "mac+mtu",
+#   and <bits> is 64 characters, each '0' or '1', bit 0 first;
+# - any other line is an error: the reader stops and names the line.
+plain 1100000110111011000000000000010010000000000000000000000000000000
+mac 1100010110111011000000000000010010000000000000000000000000000000
+mtu 1101000110111011000000000000010010000000000000000000000000000000
+mac+mtu 1101010110111011000000000000010010000000000000000000000000000000

@@ -3,7 +3,12 @@
 
 //! [`TapDevice`] on macOS: a vmnet.framework interface or a Unix datagram
 //! endpoint (see [`crate::platform::net`] for the names), carrying plain
-//! Ethernet frames; the virtio-net header is handled by [`vnet`].
+//! Ethernet frames; the virtio-net header is handled by [`vnet`]. A vmnet
+//! interface in virtio-header mode (macOS 15.4 and later,
+//! [`vmnet::Interface::vnet`]) carries a header too: the guest's TCP
+//! superframes are handed over with theirs ([`vnet::tx_offload`]), and what
+//! vmnet delivers is given to the guest as a TAP gives it
+//! ([`vnet::rx_offload`], [`vnet::rx_segment`]).
 //!
 //! In a jail given a network (`--netns`, [`crate::ext::jail::netns`]),
 //! endpoints named without `/` are made in the network's directory, which
@@ -25,6 +30,7 @@
 //! kernel's file check on this directory (another uid) and the sender's
 //! own sandbox profile (the same uid).
 
+use std::collections::VecDeque;
 use std::ffi::{CStr, OsStr};
 use std::fmt;
 use std::io;
@@ -51,6 +57,10 @@ const SNDBUF: c_int = 1 << 20;
 const RCVBUF: c_int = 4 << 20;
 /// Most interfaces a `%d` name is tried with.
 const MAX_UNITS: u32 = 1 << 15;
+/// The largest frame read from vmnet in virtio-header mode: the most the
+/// net device takes (upstream's `MAX_BUFFER_SIZE`, 65562 bytes); vmnet's
+/// coalesced frames were at most 65238 bytes (macOS 27.2).
+const RX_ROOM: usize = 65562;
 
 unsafe extern "C" {
     /// Sets the calling thread's working directory to `fd`, or back to the
@@ -534,7 +544,7 @@ impl Backend {
     fn send(&mut self, frame: &[u8]) -> io::Result<()> {
         match self {
             Backend::Endpoint(ep) => ep.send(frame),
-            Backend::Vmnet(iface) => iface.write(frame),
+            Backend::Vmnet(iface) => iface.write(None, frame),
         }
     }
 }
@@ -554,6 +564,12 @@ pub struct Tap {
     /// The frame being written, and the segments made of it.
     tx: Vec<u8>,
     scratch: Vec<u8>,
+    /// vmnet in virtio-header mode: the packet being read, the frames made
+    /// of a superframe the guest's offloads do not take, waiting to be
+    /// read, and the frames dropped as a TAP is never given them.
+    rx: Vec<u8>,
+    pending: VecDeque<(VnetHdr, Vec<u8>)>,
+    dropped: u64,
 }
 
 /// What an interface name refers to.
@@ -706,6 +722,9 @@ impl Tap {
             offload: AtomicU32::new(0),
             tx: Vec::new(),
             scratch: Vec::new(),
+            rx: Vec::new(),
+            pending: VecDeque::new(),
+            dropped: 0,
         })
     }
 
@@ -714,8 +733,10 @@ impl Tap {
         &self.name
     }
 
-    /// See [`TapDevice::set_offload`]. The host never hands the guest
-    /// offloaded frames, which every setting allows.
+    /// See [`TapDevice::set_offload`]. The host hands the guest offloaded
+    /// frames only from vmnet in virtio-header mode, and then only those the
+    /// flags allow ([`vnet::rx_offload`]); otherwise complete frames, which
+    /// every setting allows.
     pub fn set_offload(&self, flags: c_uint) -> Result<(), TapError> {
         vnet::check_offload(flags).map_err(TapError::SetOffloadFlags)?;
         self.offload.store(flags, Ordering::Relaxed);
@@ -743,14 +764,27 @@ impl Tap {
         }
         let (hdr, frame) = self.tx.split_at_mut(hdr_len);
         let hdr = VnetHdr::parse(hdr).ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        if let Backend::Vmnet(iface) = &self.backend
+            && iface.vnet
+            && vnet::tx_offload(&hdr, frame)? == vnet::Tx::Offload
+        {
+            let mut out = [0u8; vmnet::VNET_HDR_LEN];
+            hdr.write(&mut out);
+            iface.write(Some(&out), frame)?;
+            return Ok(total);
+        }
         let backend = &mut self.backend;
         vnet::segment(&hdr, frame, &mut self.scratch, &mut |seg| backend.send(seg))?;
         Ok(total)
     }
 
-    /// See [`TapDevice::read_iovec`]. The header is zeroed: a complete
-    /// frame, no offloads.
+    /// See [`TapDevice::read_iovec`]. The header is zeroed (a complete
+    /// frame, no offloads), but from vmnet in virtio-header mode
+    /// ([`Tap::read_vnet`]).
     pub fn read_iovec(&mut self, buffer: &mut [libc::iovec]) -> io::Result<usize> {
+        if matches!(&self.backend, Backend::Vmnet(iface) if iface.vnet) {
+            return self.read_vnet(buffer);
+        }
         let hdr_len = self.hdr_len.load(Ordering::Relaxed);
         let mut skip = hdr_len;
         let mut first = 0;
@@ -781,6 +815,96 @@ impl Tap {
             None => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
         }
     }
+
+    /// A frame from vmnet in virtio-header mode, given as a TAP gives it
+    /// ([`vnet::rx_offload`]): one frame with its header, or the next of the
+    /// frames a superframe was split into ([`vnet::rx_segment`]); a frame a
+    /// TAP is never given is dropped, counted and logged, and the next one
+    /// read.
+    fn read_vnet(&mut self, buffer: &mut [libc::iovec]) -> io::Result<usize> {
+        let hdr_len = self.hdr_len.load(Ordering::Relaxed);
+        let offloads = self.offload.load(Ordering::Relaxed);
+        loop {
+            if let Some((hdr, frame)) = self.pending.pop_front() {
+                return copy_out(buffer, hdr_len, &hdr, &frame);
+            }
+            let size = vmnet::VNET_HDR_LEN + RX_ROOM;
+            self.rx.resize(size, 0);
+            let mut iov = [libc::iovec {
+                iov_base: self.rx.as_mut_ptr().cast(),
+                iov_len: size,
+            }];
+            let Some(n) = self.backend.recv(&mut iov)? else {
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+            };
+            let Backend::Vmnet(iface) = &mut self.backend else {
+                unreachable!("read_vnet of an endpoint");
+            };
+            let mtu = usize::try_from(iface.mtu).unwrap_or(usize::MAX);
+            let host = iface.host_addresses();
+            let (theirs, frame) = self.rx[..n].split_at_mut(vmnet::VNET_HDR_LEN.min(n));
+            let data_valid = theirs.first().is_some_and(|flags| flags & vnet::F_DATA_VALID != 0);
+            match vnet::rx_offload(frame, data_valid, mtu, offloads, &|a| host.contains(&a)) {
+                vnet::Rx::Frame(hdr) => return copy_out(buffer, hdr_len, &hdr, frame),
+                vnet::Rx::Segment => {
+                    let pending = &mut self.pending;
+                    vnet::rx_segment(frame, mtu, offloads, &mut self.scratch, &mut |hdr, seg| {
+                        pending.push_back((*hdr, seg.to_vec()));
+                        Ok(())
+                    })?;
+                }
+                vnet::Rx::Drop => {
+                    self.dropped += 1;
+                    let count = self.dropped.to_string();
+                    if count.starts_with('1') && count[1..].chars().all(|c| c == '0') {
+                        crate::logger::warn!(
+                            "{}: dropped a {}-byte frame vmnet delivered that a TAP is never given (over \
+                             the MTU {mtu}, not a TCP superframe with a checksum vmnet or this side \
+                             checked); {} so far",
+                            self.name,
+                            frame.len(),
+                            self.dropped
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Writes a header of `hdr_len` bytes (`hdr`, then zeros) and `frame` into
+/// `buffer`, as the TUN driver's read does (`tun_put_user`, drivers/net/
+/// tun.c, v6.1): EINVAL if the header does not fit (:2108); a frame longer
+/// than the rest is cut, and the length is still the whole one (:2152,
+/// :2160).
+fn copy_out(
+    buffer: &mut [libc::iovec],
+    hdr_len: usize,
+    hdr: &VnetHdr,
+    frame: &[u8],
+) -> io::Result<usize> {
+    if buffer.iter().map(|iov| iov.iov_len).sum::<usize>() < hdr_len {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let total = hdr_len + frame.len();
+    let mut head = vec![0u8; hdr_len];
+    hdr.write(&mut head);
+    let mut parts = [head.as_slice(), frame];
+    for iov in buffer.iter() {
+        let mut at = 0;
+        while at < iov.iov_len {
+            let Some(part) = parts.iter_mut().find(|p| !p.is_empty()) else {
+                return Ok(total);
+            };
+            let n = part.len().min(iov.iov_len - at);
+            // SAFETY: the iovec names memory the caller lets us write; `at + n`
+            // is within it.
+            unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), iov.iov_base.cast::<u8>().add(at), n) };
+            *part = &part[n..];
+            at += n;
+        }
+    }
+    Ok(total)
 }
 
 impl TapDevice for Tap {
@@ -1210,5 +1334,53 @@ mod tests {
         }
         assert!(!sim.pop_rx_packet(&mut buf));
         assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn test_copy_out_writes_the_header_and_frame_across_buffers() {
+        let hdr = VnetHdr {
+            flags: vnet::F_NEEDS_CSUM,
+            gso_type: vnet::GSO_TCPV4,
+            hdr_len: 66,
+            gso_size: 1448,
+            csum_start: 34,
+            csum_offset: 16,
+        };
+        let frame: Vec<u8> = (0..100u8).collect();
+        let mut want = vec![0u8; 12];
+        hdr.write(&mut want);
+        want.extend_from_slice(&frame);
+        // Buffers that split the header and the frame anywhere.
+        for split in [1, 5, 12, 13, 50] {
+            let mut a = vec![0xaa; split];
+            let mut b = vec![0xaa; 200];
+            let mut iovs = [
+                libc::iovec {
+                    iov_base: a.as_mut_ptr().cast(),
+                    iov_len: a.len(),
+                },
+                libc::iovec {
+                    iov_base: b.as_mut_ptr().cast(),
+                    iov_len: b.len(),
+                },
+            ];
+            assert_eq!(copy_out(&mut iovs, 12, &hdr, &frame).unwrap(), 112);
+            let mut got = a.clone();
+            got.extend_from_slice(&b[..112 - split]);
+            assert_eq!(got, want, "split {split}");
+            assert!(b[112 - split..].iter().all(|&x| x == 0xaa));
+        }
+        // Cut where the buffers end, the whole length returned, as
+        // tun_put_user does; a buffer shorter than the header is refused.
+        let mut a = vec![0u8; 40];
+        let mut iovs = [libc::iovec {
+            iov_base: a.as_mut_ptr().cast(),
+            iov_len: a.len(),
+        }];
+        assert_eq!(copy_out(&mut iovs, 12, &hdr, &frame).unwrap(), 112);
+        assert_eq!(a, want[..40]);
+        iovs[0].iov_len = 11;
+        let err = copy_out(&mut iovs, 12, &hdr, &frame).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
     }
 }

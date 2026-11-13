@@ -33,7 +33,7 @@ and the [roadmap](ROADMAP.md) say what is in place. This page says what each bac
 | `async_io::AsyncIo` | io_uring | worker threads, `F_FULLFSYNC`; io_uring's submission and completion model, restrictions and queue limits (`macos/async_io.rs`) | `platform::async_io::tests`, `boot-test block` | the same file as macOS, on the compatibility `libc` |
 | `fs` (`keep_holes`, `SparseWriter`, `StatIds`) | ext4/tmpfs holes | `SEEK_HOLE` recorded, holes punched again with `F_PUNCHHOLE` after the flush (APFS fills them) | `platform::fs::tests`, `boot-test diff` | the same file as macOS; NTFS's 64 KiB sparse units are checked after each restore |
 | `net::TapDevice` | TAP | vmnet (`vmnet.rs`; root for bridged mode, and before macOS 26) or a Unix datagram endpoint (`net.rs`) | `platform::net::tests`, `boot-test net`, `boot-test vmnet` | a Unix stream endpoint, QEMU `-netdev stream` framing (`windows/net.rs`) |
-| `vnet` (TUN's virtio-net header) | the kernel | shared, OS-independent: checksum, TSO, UFO | `platform::vnet::tests`, fuzz `vnet_segment`, `vnet_offload` | shared |
+| `vnet` (TUN's virtio-net header) | the kernel | shared, OS-independent: checksum, TSO, UFO; the checks of a TAP's write and the header a TAP's read gives, for a backend that takes and gives headers (vmnet from macOS 15.4) | `platform::vnet::tests`, fuzz `vnet_segment`, `vnet_offload` | shared |
 
 ## The jailer's primitives (`overlay/jailer/platform`)
 

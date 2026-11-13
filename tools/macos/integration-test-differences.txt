@@ -240,18 +240,17 @@ all arch integration_tests/functional/test_gdb.py::test_gdb_connects
 # network) sets UDP_SEGMENT, Linux's UDP segmentation offload, on its
 # socket, so that the host's stack hands the TAP a datagram whose checksum
 # is left to the device, which only a TAP Firecracker set TUN_F_CSUM on
-# takes. macOS's UDP has no such option (netinet/udp.h: UDP_NOCKSUM only)
-# and the call fails (measured, clean tree: "[Errno 42] Protocol not
-# available"), before anything reaches Firecracker. Nor does Firecracker's
-# endpoint take an offloaded frame from the host: it carries plain
-# Ethernet frames, read as complete with a zeroed virtio-net header
-# (overlay/vmm/platform/macos/net.rs set_offload, read_iovec: "The host
-# never hands the guest offloaded frames"). macOS has such frames in
-# vmnet (vmnet.h: vmnet_enable_virtio_header_key, vmnet_enable_tso_key,
-# vmnet_enable_checksum_offload_key), which wick does not ask for. To do:
-# an endpoint that takes the host's offloaded frames, and a host program
-# in the harness's network that sends one.
-all bug integration_tests/functional/test_net.py::test_tap_offload
+# takes. macOS's UDP has no such option: netinet/udp.h has UDP_NOCKSUM
+# only, and XNU's udp_ctloutput refuses any other option with ENOPROTOOPT
+# (bsd/netinet/udp_usrreq.c, xnu-12377.1.9, :1179 to :1180; measured on
+# macOS 27.2: "[Errno 42] Protocol not available"), before anything
+# reaches Firecracker. So the host program cannot run on macOS. The device
+# side the test is about, a host stack's frame whose checksum is left to
+# the guest, is given by vmnet from macOS 15.4 (vmnet.h,
+# vmnet_enable_virtio_header_key; vnet::rx_offload: the host's own frames
+# with NEEDS_CSUM, as a TAP with TUN_F_CSUM; boot-test vmnet); the Unix
+# datagram endpoint the harness uses carries plain frames.
+all impossible integration_tests/functional/test_net.py::test_tap_offload
 
 # The test sizes a balloon from the RSS it measures (test_balloon.py:
 # 256 MiB minus get_resident_memory minus 50 MiB), so that the guest runs out
