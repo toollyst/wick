@@ -230,8 +230,8 @@ are Unix stream endpoints that listen for a host switch to connect, each frame p
 themselves, waiting for QEMU to connect, so they need an adapter that connects to both; the switch that has run
 against the endpoint is the boot test's own.
 
-The Windows build has booted guests on one Windows 11 PC so far ([PORTING.md](PORTING.md) lists the stages that
-have run there), so the results of a run on other hardware are genuinely useful: please [open an issue](https://github.com/toollyst/wick/issues/new/choose)
+The Windows build has booted guests on one Windows 11 PC and on CI's AMD EPYC 7763 runner so far ([PORTING.md](PORTING.md) lists the stages that
+have run there; on CI's EPYC 9V45 and Intel runners no guest reached init: COMPATIBILITY.md, Host CPU), so the results of a run on other hardware are genuinely useful: please [open an issue](https://github.com/toollyst/wick/issues/new/choose)
 with the zip the script writes.
 
 ## When something goes wrong
