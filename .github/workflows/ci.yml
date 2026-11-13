@@ -970,6 +970,27 @@ jobs:
           # non-canonical RSI; a REP INSW written in one write that faults
           # on the page above, RDI and RCX unmoved.
           alone whp::vcpu::fpu_tests::test_string_io_checks_and_flags_as_kvm
+          # An MMIO read's instruction finished in the host at the next run,
+          # before any entry and before a kick, as KVM's complete_userspace_io
+          # (asserted; MMIOTEST lines): kicked, it returns EINTR with EAX the
+          # device's data and RIP past it, and the device read once; an
+          # interrupt requested between is taken after it; MOVSD from a
+          # device to a device is one read, then one write.
+          alone whp::vcpu::fpu_tests::test_an_mmio_read_finishes_in_the_host_at_the_next_run
+          # On record (MMIOREC lines): the device reads of an 8-byte access
+          # across two pages of a device and across RAM and a device (KVM
+          # asks for each page's part), and, with WHP's own calls, whether
+          # WHP delivers an interrupt before an unfinished MMIO instruction
+          # runs again.
+          alone whp::vcpu::fpu_tests::test_split_mmio_accesses_and_an_interrupt_at_reentry_on_record
+          # Records A and B of the lazy-RAM chunk (COMMITTEST, POPULATETEST
+          # lines): VirtualAlloc(MEM_COMMIT) by size and the backend's
+          # commit_on_access, with the host's first write a page after; and
+          # WHvAdviseGpaRange(Populate) of committed guest RAM nothing has
+          # touched, with the guest's first write to each of 512 pages
+          # populated and not.
+          alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
+          alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # What each call of the backend commits of its thread's stack
           # (STACKTEST lines), each on a thread of its own: which one leaves
           # a vCPU's thread 48 to 52 KiB deep, as the boot record of run

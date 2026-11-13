@@ -12,8 +12,9 @@
 //!   string/`rep` I/O goes through the instruction emulator ([`super::emulate`]);
 //! - **MMIO**: the instruction is decoded by the emulator; I/O APIC accesses
 //!   and matching `ioeventfd`s are consumed here, everything else becomes
-//!   `VcpuExit::Mmio*`. A read is completed on the instruction's re-execution,
-//!   exactly as KVM does;
+//!   `VcpuExit::Mmio*`. A read's instruction is finished in the host at the
+//!   next run, with Firecracker's data, before the guest is entered or a
+//!   kick looked at, as KVM's `complete_userspace_io` finishes it;
 //! - **CPUID** and **MSR** intercepts are answered from the per-vCPU CPUID
 //!   table Firecracker installed and from the register mapping in
 //!   [`super::regs`];
@@ -75,16 +76,27 @@ impl std::fmt::Debug for KvmRunPage {
     }
 }
 
-/// A read deferred to the instruction's re-execution.
-#[derive(Debug, Clone, Copy)]
+/// A read whose data Firecracker gives at the next run, which completes
+/// it before anything else (KVM's `complete_userspace_io`).
 enum Pending {
-    /// An MMIO read: completed by the emulator on re-execution.
-    Mmio,
+    /// An MMIO read: the instruction is emulated again from its exit, with
+    /// this read's data and the reads' before it, and finishes in the host.
+    Mmio(Box<MmioRead>),
     /// A port-I/O `IN`: completed directly by writing `RAX` and advancing.
     PioIn { len: usize, rip_after: u64, rax: u64 },
     /// An `INS`: the elements Firecracker put in the string buffer are
     /// written to the guest's memory at the next run.
     StringIn(StringIn),
+}
+
+/// An MMIO instruction waiting for a device read's data: its exit's
+/// contexts, the device reads already answered, and the one asked for.
+struct MmioRead {
+    vpctx: whv::WHV_VP_EXIT_CONTEXT,
+    mem: whv::WHV_MEMORY_ACCESS_CONTEXT,
+    reads: Vec<emulate::DeviceRead>,
+    addr: u64,
+    len: usize,
 }
 
 /// An `INS` waiting for its data (`VcpuFd::string_io`).
@@ -1289,12 +1301,23 @@ impl VcpuFd {
             }
         }
 
-        // Complete a read deferred from the previous exit.
-        let mut mmio_completion = false;
+        // Complete a read deferred from the previous exit, before any entry
+        // and before a kick is looked at, as KVM's KVM_RUN runs
+        // `complete_userspace_io` before its `immediate_exit` check.
         let mut ram_retries = 0u32;
-        if let Some(pending) = self.shared.pending.lock().unwrap().take() {
+        let pending = self.shared.pending.lock().unwrap().take();
+        if let Some(pending) = pending {
             match pending {
-                Pending::Mmio => mmio_completion = true,
+                Pending::Mmio(read) => {
+                    let MmioRead { vpctx, mem, mut reads, addr, len } = *read;
+                    let mut data = [0u8; 8];
+                    // SAFETY: Firecracker's `len` (at most 8) bytes in the scratch.
+                    unsafe { std::ptr::copy_nonoverlapping(scratch, data.as_mut_ptr(), len) };
+                    reads.push(emulate::DeviceRead { addr, len, data });
+                    if let Some(exit) = self.emulate_mmio(&vpctx, &mem, reads, scratch)? {
+                        return Ok(exit);
+                    }
+                }
                 Pending::StringIn(ins) => self.complete_string_in(&ins)?,
                 Pending::PioIn {
                     len,
@@ -1467,10 +1490,9 @@ impl VcpuFd {
                             );
                         }
                     }
-                    if let Some(exit) = self.mmio(&ctx.VpContext, &mem, scratch, mmio_completion)? {
+                    if let Some(exit) = self.emulate_mmio(&ctx.VpContext, &mem, Vec::new(), scratch)? {
                         return Ok(exit);
                     }
-                    mmio_completion = false;
                     continue;
                 }
 
@@ -1569,40 +1591,76 @@ impl VcpuFd {
         }
     }
 
-    /// Handles an MMIO intercept. Returns the exit to report to Firecracker, or
-    /// `None` if the access was consumed (I/O APIC or `ioeventfd`).
-    fn mmio(
+    /// Emulates the MMIO instruction of an exit (`vpctx`, `mem`), its device
+    /// reads before `reads` answered with their data. Returns the exit to
+    /// report to Firecracker, or `None` if the instruction finished with
+    /// nothing for it (an I/O APIC access, an `ioeventfd`'s write, guest
+    /// RAM). A device read past `reads` that the irqchip does not answer
+    /// is asked of Firecracker (`VcpuExit::MmioRead`) and the instruction
+    /// waits for the next run ([`Pending::Mmio`]), which finishes it in the
+    /// host before entering the guest.
+    fn emulate_mmio(
         &self,
         vpctx: &whv::WHV_VP_EXIT_CONTEXT,
         mem: &whv::WHV_MEMORY_ACCESS_CONTEXT,
+        mut reads: Vec<emulate::DeviceRead>,
         scratch: *mut u8,
-        completion: bool,
     ) -> Result<Option<VcpuExit<'_>>> {
         let part = self.part();
         let vp = self.vp();
         let ram = self.shared.inner.ram();
-        let mut more = Vec::new();
-        let outcome = emulate::mmio(part, vp, vpctx, mem, scratch, completion, ram, &mut more)?;
-        self.shared.device_writes.lock().unwrap().append(&mut more);
-        match outcome {
-            emulate::Outcome::Completed | emulate::Outcome::Failed => Ok(None),
-            emulate::Outcome::Write { addr, len, .. } => Ok(self.device_write(addr, len, scratch)),
-            emulate::Outcome::Read { addr, len, .. } => {
-                let mut chip = self.shared.inner.irqchip.lock().unwrap();
-                if chip.mmio_handles(addr) {
-                    let buf = unsafe { slice_mut(scratch, len) };
-                    chip.mmio_read(addr, buf);
-                    drop(chip);
-                    // Re-run the emulator with the data now in the scratch.
-                    let _ = emulate::mmio(part, vp, vpctx, mem, scratch, true, ram, &mut more)?;
+        loop {
+            let mut more = Vec::new();
+            let outcome = emulate::mmio(part, vp, vpctx, mem, scratch, &reads, ram, &mut more)?;
+            match outcome {
+                emulate::Outcome::Completed => {
                     self.shared.device_writes.lock().unwrap().append(&mut more);
                     return Ok(None);
                 }
-                drop(chip);
-                // Defer to the instruction's re-execution with Firecracker's data.
-                *self.shared.pending.lock().unwrap() = Some(Pending::Mmio);
-                let buf = unsafe { slice_mut(scratch, len) };
-                Ok(Some(VcpuExit::MmioRead(addr, buf)))
+                // The instruction had device reads answered and cannot
+                // finish: entering the guest would run it again and ask the
+                // devices again. Refused, as KVM's emulator failure is an
+                // internal error.
+                emulate::Outcome::Failed if !reads.is_empty() => {
+                    super::ffi::report(
+                        log::Level::Error,
+                        &format!("whp: the MMIO instruction at {:#x} did not finish after its device reads", vpctx.Rip),
+                    );
+                    return Ok(Some(VcpuExit::InternalError));
+                }
+                emulate::Outcome::Failed => return Ok(None),
+                emulate::Outcome::Mismatch { asked, given } => {
+                    super::ffi::report(
+                        log::Level::Error,
+                        &format!(
+                            "whp: the MMIO instruction at {:#x} asked for a read of {} bytes at {:#x} where the data \
+                             given was for {} bytes at {:#x}",
+                            vpctx.Rip, asked.1, asked.0, given.1, given.0
+                        ),
+                    );
+                    return Ok(Some(VcpuExit::InternalError));
+                }
+                emulate::Outcome::Write { addr, len, .. } => {
+                    self.shared.device_writes.lock().unwrap().append(&mut more);
+                    return Ok(self.device_write(addr, len, scratch));
+                }
+                // Device writes before an aborted read are not kept: the
+                // emulation that finishes the instruction makes them again.
+                emulate::Outcome::Read { addr, len, .. } => {
+                    let mut chip = self.shared.inner.irqchip.lock().unwrap();
+                    if chip.mmio_handles(addr) {
+                        let mut data = [0u8; 8];
+                        chip.mmio_read(addr, &mut data[..len]);
+                        drop(chip);
+                        reads.push(emulate::DeviceRead { addr, len, data });
+                        continue;
+                    }
+                    drop(chip);
+                    *self.shared.pending.lock().unwrap() =
+                        Some(Pending::Mmio(Box::new(MmioRead { vpctx: *vpctx, mem: *mem, reads, addr, len })));
+                    let buf = unsafe { slice_mut(scratch, len) };
+                    return Ok(Some(VcpuExit::MmioRead(addr, buf)));
+                }
             }
         }
     }
@@ -3229,11 +3287,12 @@ mod fpu_tests {
         line
     }
 
-    /// `WHvAdviseGpaRange(Populate)` for a write to the 64 KiB of guest RAM
-    /// at `gpa`, whose host memory at `host` is reserved, not committed:
-    /// its HRESULT, the host memory's state after it (`VirtualQuery`), and
-    /// the process's commit charge before and after (`PagefileUsage`).
-    fn populate_on_record(part: whv::WHV_PARTITION_HANDLE, host: usize, gpa: u64) -> String {
+    /// `WHvAdviseGpaRange(Populate)` for a write to the `size` bytes of
+    /// guest RAM at `gpa`, whose host memory is at `host`: its HRESULT, the
+    /// host memory's state before and after it (`VirtualQuery`), and the
+    /// process's commit charge (`PagefileUsage`) and working set before
+    /// and after.
+    fn populate_on_record(part: whv::WHV_PARTITION_HANDLE, host: usize, gpa: u64, size: u64) -> String {
         #[repr(C)]
         #[derive(Default)]
         struct Counters {
@@ -3258,7 +3317,7 @@ mod fpu_tests {
             let ok = unsafe {
                 K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb)
             };
-            if ok != 0 { Some(c.pagefile) } else { None }
+            if ok != 0 { Some((c.pagefile, c.working_set)) } else { None }
         };
         let state = || {
             // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
@@ -3275,7 +3334,7 @@ mod fpu_tests {
             }
         };
         let (was, charged) = (state(), charge());
-        let range = whv::WHV_MEMORY_RANGE_ENTRY { GuestAddress: gpa, SizeInBytes: 0x1_0000 };
+        let range = whv::WHV_MEMORY_RANGE_ENTRY { GuestAddress: gpa, SizeInBytes: size };
         let advice = whv::WHV_ADVISE_GPA_RANGE_POPULATE {
             Flags: whv::WHV_ADVISE_GPA_RANGE_POPULATE_FLAGS { AsUINT32: 0 },
             AccessType: whv::WHvMemoryAccessWrite,
@@ -3293,12 +3352,17 @@ mod fpu_tests {
         };
         let (now, after) = (state(), charge());
         let delta = match (charged, after) {
-            (Some(a), Some(b)) => format!("{:+} KiB", (b as i64 - a as i64) / 1024),
+            (Some(a), Some(b)) => format!(
+                "{:+} KiB, its working set {:+} KiB",
+                (b.0 as i64 - a.0 as i64) / 1024,
+                (b.1 as i64 - a.1 as i64) / 1024
+            ),
             _ => "not read".to_string(),
         };
         format!(
-            "WHvAdviseGpaRange(Populate, a write, no flags) of the 64 KiB at {gpa:#x}: HRESULT {:#010x}; its host \
+            "WHvAdviseGpaRange(Populate, a write, no flags) of the {} KiB at {gpa:#x}: HRESULT {:#010x}; its host \
              memory {was} before, {now} after; the process's commit charge {delta}",
+            size / 1024,
             hres.cast_unsigned()
         )
     }
@@ -3687,7 +3751,7 @@ mod fpu_tests {
         let mut wrong = Vec::new();
         for (name, _) in &steps {
             if *name == POPULATED {
-                eprintln!("STACKTEST populate: {}", populate_on_record(vcpu.part(), lazy as usize + 0x4_0000, LAZY_GPA + 0x4_0000));
+                eprintln!("STACKTEST populate: {}", populate_on_record(vcpu.part(), lazy as usize + 0x4_0000, LAZY_GPA + 0x4_0000, 0x1_0000));
             }
             let of_the_step = if name.starts_with("INIT") {
                 // The application processor's thread is in its run, waiting
@@ -4025,6 +4089,440 @@ mod fpu_tests {
         drop(watchdog);
         vcpu.set_kvm_immediate_exit(0);
         exits
+    }
+
+    /// Where the MMIO tests' guest code starts, and the vector and handler
+    /// of the interrupt they take: the handler does `out 0x81, al`, writes
+    /// the local APIC's EOI (RBX holds its base) and returns.
+    const MMIO_PROGRAM: u64 = 0xB000;
+    const MMIO_HANDLER: u64 = 0xB800;
+    const MMIO_IDT: u64 = 0x5000;
+    const MMIO_VECTOR: u64 = 0x41;
+
+    /// A VM of the MMIO tests: `guest()`'s memory, a device's 2 MiB at
+    /// 6 MiB (no slot backs it), RAM from 2 to 4 MiB mapped and the 2 MiB
+    /// above it a device's too (from 4 MiB, where the slot ends), the local
+    /// APIC's page, an IDT with `MMIO_VECTOR`'s gate, and `program` at
+    /// `MMIO_PROGRAM`; the vCPU in long mode there.
+    fn mmio_guest(program: &[u8]) -> (super::super::VmFd, VcpuFd, *mut u8) {
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
+        q(0x3008, 0x20_0000 | 0x83);
+        q(0x3010, 0x40_0000 | 0x83);
+        q(0x3018, 0x60_0000 | 0x83);
+        q(0x2018, 0xA000 | 3);
+        q(0xA000 + 0x1f7 * 8, 0xFEE0_0000 | 0x83);
+        q(MMIO_IDT + MMIO_VECTOR * 16, (MMIO_HANDLER & 0xffff) | (8 << 16) | (0x8E << 40));
+        q(MMIO_IDT + MMIO_VECTOR * 16 + 8, 0);
+        put(
+            m,
+            MMIO_HANDLER,
+            &[
+                0xE6, 0x81, // out 0x81, al
+                0xC7, 0x83, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov dword [rbx + 0xB0], 0 (EOI)
+                0x48, 0xCF, // iretq
+            ],
+        );
+        put(m, MMIO_PROGRAM, program);
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        let mut s = vcpu.get_sregs().unwrap();
+        (s.idt.base, s.idt.limit) = (MMIO_IDT, 0xfff);
+        vcpu.set_sregs(&s).unwrap();
+        vcpu.set_regs(&kvm_regs { rip: MMIO_PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+        (vm, vcpu, m)
+    }
+
+    /// The local APIC enabled (RBX its base, spurious vector register
+    /// 0x1ff) and interrupts on: the start of a program that takes
+    /// `MMIO_VECTOR`.
+    const APIC_ON: [u8; 16] = [
+        0xBB, 0x00, 0x00, 0xE0, 0xFE, // mov ebx, 0xFEE00000
+        0xC7, 0x83, 0xF0, 0x00, 0x00, 0x00, 0xFF, 0x01, 0x00, 0x00, // mov dword [rbx + 0xF0], 0x1ff
+        0xFB, // sti
+    ];
+    /// `mov eax, [0x600000]`: a device read of 4 bytes.
+    const READ_DEVICE: [u8; 7] = [0x8B, 0x04, 0x25, 0x00, 0x00, 0x60, 0x00];
+
+    /// What a run returned, as a line, with an MMIO read answered with
+    /// `answer`'s bytes and counted in `reads`.
+    fn one_run(vcpu: &mut VcpuFd, answer: &[u8], reads: &mut usize) -> String {
+        match vcpu.run() {
+            Ok(VcpuExit::MmioRead(address, data)) => {
+                *reads += 1;
+                for (i, b) in data.iter_mut().enumerate() {
+                    *b = answer.get(i).copied().unwrap_or(0xEE);
+                }
+                format!("read {address:#x} x{}", data.len())
+            }
+            Ok(VcpuExit::MmioWrite(address, data)) => format!("write {address:#x} {data:02x?}"),
+            Ok(VcpuExit::IoOut(port, data)) => format!("out {port:#x} {data:02x?}"),
+            Ok(VcpuExit::InternalError) => "InternalError".to_string(),
+            Ok(_) => "(another)".to_string(),
+            Err(e) if e.errno() == libc::EINTR => "EINTR".to_string(),
+            Err(e) => format!("run failed, errno {}", e.errno()),
+        }
+    }
+
+    /// An MMIO read's instruction is finished at the next run before the
+    /// guest is entered and before a kick is looked at, as KVM's KVM_RUN
+    /// runs `complete_userspace_io` before its `immediate_exit` check
+    /// (Linux v6.1 arch/x86/kvm/x86.c, `kvm_arch_vcpu_ioctl_run`):
+    /// - a run with the immediate exit set returns `EINTR` with the
+    ///   instruction done: EAX holds the device's data and RIP is past it;
+    ///   the run after goes on to the next instruction, and the device was
+    ///   asked once (before, the kick lost the data and the instruction ran
+    ///   again, asking the device a second time);
+    /// - an interrupt requested between the read's exit and the next run is
+    ///   taken after the instruction, with its data: the handler's `out`
+    ///   has the device's byte in AL, and the program goes on after it,
+    ///   with no second read (before, the instruction re-executed in the
+    ///   guest and the data went to whichever device read came first);
+    /// - MOVSD from a device to a device: one read, then one write of the
+    ///   read's bytes, RSI and RDI past them (the instruction finishes in
+    ///   the host from the read's exit and its write is the next exit).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_an_mmio_read_finishes_in_the_host_at_the_next_run() {
+        let data = [0x44, 0x33, 0x22, 0x11];
+        // Kicked.
+        let program = [READ_DEVICE.to_vec(), vec![0xE6, PORT as u8, 0xEB, 0xFE]].concat();
+        let (vm, mut vcpu, m) = mmio_guest(&program);
+        let watchdog = super::Watchdog::arm(&vcpu);
+        let mut reads = 0;
+        let first = one_run(&mut vcpu, &data, &mut reads);
+        vcpu.set_kvm_immediate_exit(1);
+        let kicked = one_run(&mut vcpu, &data, &mut reads);
+        let r = vcpu.get_regs().unwrap();
+        vcpu.set_kvm_immediate_exit(0);
+        let then = one_run(&mut vcpu, &data, &mut reads);
+        drop(watchdog);
+        eprintln!(
+            "MMIOTEST kicked: {first}; the kicked run {kicked}, EAX {:#x}, RIP {:#x}; then {then}; device reads {reads}",
+            r.rax & 0xffff_ffff,
+            r.rip
+        );
+        assert_eq!(first, "read 0x600000 x4");
+        assert_eq!(kicked, "EINTR");
+        assert_eq!((r.rax & 0xffff_ffff, r.rip), (0x1122_3344, MMIO_PROGRAM + READ_DEVICE.len() as u64));
+        assert_eq!(then, "out 0x80 [44]");
+        assert_eq!(reads, 1);
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+
+        // An interrupt requested between the exit and the next run.
+        let program = [APIC_ON.to_vec(), READ_DEVICE.to_vec(), vec![0xE6, PORT as u8, 0xF4, 0xEB, 0xFD]].concat();
+        let (vm, mut vcpu, m) = mmio_guest(&program);
+        let watchdog = super::Watchdog::arm(&vcpu);
+        let mut reads = 0;
+        let mut exits = vec![one_run(&mut vcpu, &data, &mut reads)];
+        vcpu.shared.inner.inject_msi(0xFEE0_0000, MMIO_VECTOR as u32);
+        for _ in 0..2 {
+            exits.push(one_run(&mut vcpu, &data, &mut reads));
+        }
+        drop(watchdog);
+        eprintln!("MMIOTEST an interrupt between: {exits:?}; device reads {reads}");
+        assert_eq!(exits, ["read 0x600000 x4", "out 0x81 [44]", "out 0x80 [44]"]);
+        assert_eq!(reads, 1);
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+
+        // MOVSD from a device to a device.
+        let program = [
+            vec![0xBE, 0x00, 0x00, 0x60, 0x00], // mov esi, 0x600000
+            vec![0xBF, 0x00, 0x10, 0x60, 0x00], // mov edi, 0x601000
+            vec![0xFC, 0xA5],                   // cld; movsd
+            vec![0xE6, PORT as u8, 0xEB, 0xFE],
+        ]
+        .concat();
+        let (vm, mut vcpu, m) = mmio_guest(&program);
+        let watchdog = super::Watchdog::arm(&vcpu);
+        let mut reads = 0;
+        let exits: Vec<String> = (0..3).map(|_| one_run(&mut vcpu, &data, &mut reads)).collect();
+        let r = vcpu.get_regs().unwrap();
+        drop(watchdog);
+        eprintln!("MMIOTEST MOVSD device to device: {exits:?}; RSI {:#x} RDI {:#x}", r.rsi, r.rdi);
+        // AL is untouched: the program's OUT has the 0 RAX began with.
+        assert_eq!(exits, ["read 0x600000 x4", "write 0x601000 [44, 33, 22, 11]", "out 0x80 [00]"]);
+        assert_eq!((r.rsi, r.rdi), (0x60_0004, 0x60_1004));
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
+    /// On record (MMIOREC lines), what this backend's devices are asked for
+    /// an access that KVM splits (`emulator_read_write`: at a page
+    /// boundary, each part of a device's an exit of its own, its
+    /// `mmio_fragments`), and what WHP does at an entry with an interrupt
+    /// pending and an MMIO instruction not finished:
+    /// - an 8-byte read across two pages of a device (0x600ffc): KVM asks
+    ///   for 4 bytes at 0x600ffc, then 4 at 0x601000;
+    /// - an 8-byte read across RAM and a device (0x3ffffc, the slot ends at
+    ///   4 MiB): KVM reads the RAM's 4 bytes itself and asks the device for
+    ///   4 at 0x400000;
+    /// - with WHP's own calls, not the backend's run: after the memory exit
+    ///   of `mov eax, [0x600000]` with interrupts on, an interrupt is
+    ///   requested and the vCPU entered again without the instruction
+    ///   finished, as the backend did before it finished an MMIO read in
+    ///   the host: whether the next exit is the handler's `out 0x81`
+    ///   (WHP delivers the interrupt before the instruction runs again) or
+    ///   the same memory exit.
+    ///
+    /// Each guest is asserted only to reach its end within six exits.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_split_mmio_accesses_and_an_interrupt_at_reentry_on_record() {
+        let answers: [[u8; 8]; 3] = [[0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7], [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7], [0xC0; 8]];
+        for (name, address) in [("across two pages of a device", 0x60_0FFCu32), ("across RAM and a device", 0x3F_FFFC)] {
+            let mut program = vec![0x48, 0x8B, 0x04, 0x25]; // mov rax, [address]
+            program.extend_from_slice(&address.to_le_bytes());
+            program.extend_from_slice(&[0xE6, PORT as u8, 0xEB, 0xFE]);
+            let (vm, mut vcpu, m) = mmio_guest(&program);
+            put(m, 0x3F_FFFC, &[0x01, 0x02, 0x03, 0x04]);
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let mut reads = 0;
+            let mut exits = Vec::new();
+            while exits.len() < 6 {
+                let answer = answers[reads.min(2)];
+                let line = one_run(&mut vcpu, &answer, &mut reads);
+                let end = line.starts_with("out 0x80") || line == "EINTR" || line.starts_with("run failed") || line == "InternalError";
+                exits.push(line);
+                if end {
+                    break;
+                }
+            }
+            let r = vcpu.get_regs().unwrap();
+            drop(watchdog);
+            eprintln!("MMIOREC an 8-byte read {name} ({address:#x}): {exits:?}; RAX {:#018x}", r.rax);
+            assert!(exits.last().unwrap().starts_with("out 0x80"), "{name}: {exits:?}");
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+
+        // WHP's own calls.
+        let program = [APIC_ON.to_vec(), READ_DEVICE.to_vec(), vec![0xE6, PORT as u8, 0xF4, 0xEB, 0xFD]].concat();
+        let (vm, vcpu, m) = mmio_guest(&program);
+        let exit_line = |c: &whv::WHV_RUN_VP_EXIT_CONTEXT| -> String {
+            match c.ExitReason {
+                // SAFETY: the union arm matches the exit reason.
+                whv::WHvRunVpExitReasonMemoryAccess => {
+                    format!("memory access at {:#x}, RIP {:#x}", unsafe { c.Anonymous.MemoryAccess.Gpa }, c.VpContext.Rip)
+                }
+                // SAFETY: as above.
+                whv::WHvRunVpExitReasonX64IoPortAccess => {
+                    format!("port {:#x}, RIP {:#x}", unsafe { c.Anonymous.IoPortAccess.PortNumber }, c.VpContext.Rip)
+                }
+                r => format!("exit reason {r:#x}, RIP {:#x}", c.VpContext.Rip),
+            }
+        };
+        let mut lines = Vec::new();
+        match super::super::ffi::run_vp(vcpu.part(), vcpu.vp()) {
+            Ok(c) => lines.push(exit_line(&c)),
+            Err(e) => lines.push(format!("run failed, errno {}", e.errno())),
+        }
+        vcpu.shared.inner.inject_msi(0xFEE0_0000, MMIO_VECTOR as u32);
+        for _ in 0..3 {
+            match super::super::ffi::run_vp(vcpu.part(), vcpu.vp()) {
+                Ok(c) => {
+                    let line = exit_line(&c);
+                    let done = c.ExitReason != whv::WHvRunVpExitReasonX64IoPortAccess;
+                    lines.push(line);
+                    // The handler's OUT, run on past (RIP after it).
+                    if !done {
+                        let next = c.VpContext.Rip + super::super::exit::instruction_length(c.VpContext._bitfield);
+                        regs::set_rip(vcpu.part(), vcpu.vp(), next).unwrap();
+                    } else {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    lines.push(format!("run failed, errno {}", e.errno()));
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "MMIOREC WHP's entry with an interrupt requested after an MMIO exit, the instruction not finished: {lines:?} \
+             (the handler's port is 0x81; the instruction is at {:#x})",
+            MMIO_PROGRAM + APIC_ON.len() as u64
+        );
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
+    /// Record A of lazy-ram-options.md (COMMITTEST lines; no WHP): what
+    /// `VirtualAlloc(MEM_COMMIT)` of reserved memory takes for 4 KiB,
+    /// 64 KiB and 2 MiB (64 of each, the median, least and most), what the
+    /// backend's commit of `MAP_NORESERVE` memory at a first access
+    /// (`commit_on_access`, 64 KiB today) takes, and what the host's own
+    /// first write to each 4 KiB page of committed memory takes after it.
+    /// Printed, not asserted.
+    #[test]
+    #[ignore = "a record: run on Windows with --ignored --nocapture"]
+    fn test_what_a_commit_takes_by_size_on_record() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const N: usize = 64;
+        let spread = |mut t: Vec<f64>| {
+            t.sort_by(f64::total_cmp);
+            format!("median {:.1} us (least {:.1}, most {:.1})", t[t.len() / 2], t[0], t[t.len() - 1])
+        };
+        let mut lines = Vec::new();
+        for size in [4usize << 10, 64 << 10, 2 << 20] {
+            // SAFETY: a reservation of the process's own, released below.
+            let base = unsafe { VirtualAlloc(std::ptr::null(), size * N, MEM_RESERVE, PAGE_READWRITE) }.cast::<u8>();
+            assert!(!base.is_null());
+            let mut commit = Vec::new();
+            let mut touch = Vec::new();
+            for i in 0..N {
+                // SAFETY: within the reservation.
+                let at = unsafe { base.add(i * size) };
+                let t = std::time::Instant::now();
+                // SAFETY: as above.
+                let p = unsafe { VirtualAlloc(at.cast(), size, MEM_COMMIT, PAGE_READWRITE) };
+                commit.push(t.elapsed().as_secs_f64() * 1e6);
+                assert!(!p.is_null());
+                let t = std::time::Instant::now();
+                for page in (0..size).step_by(4096) {
+                    // SAFETY: committed above.
+                    unsafe { at.add(page).write_volatile(1) };
+                }
+                touch.push(t.elapsed().as_secs_f64() * 1e6 / (size / 4096) as f64);
+            }
+            // SAFETY: the reservation made above.
+            assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
+            lines.push(format!(
+                "{} KiB: the commit {}; the host's first write to a page after it {}",
+                size / 1024,
+                spread(commit),
+                spread(touch)
+            ));
+        }
+        // The backend's path for lazy guest RAM.
+        let len = 64 * 0x1_0000;
+        // SAFETY: anonymous memory for the test, unmapped below.
+        let lazy = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(lazy, libc::MAP_FAILED);
+        let mut times = Vec::new();
+        let mut outcomes = std::collections::BTreeSet::new();
+        for i in 0..64 {
+            let t = std::time::Instant::now();
+            let a = libc::wick_mm::commit_on_access(lazy as usize + i * 0x1_0000, true);
+            times.push(t.elapsed().as_secs_f64() * 1e6);
+            outcomes.insert(match a {
+                libc::wick_mm::Access::Committed => "committed",
+                libc::wick_mm::Access::NotLazy => "not lazy",
+                libc::wick_mm::Access::Exhausted(_) => "exhausted",
+            });
+        }
+        // SAFETY: the mapping made above.
+        assert_eq!(unsafe { libc::munmap(lazy, len) }, 0);
+        lines.push(format!("the backend's commit_on_access of MAP_NORESERVE memory, 64 first accesses: {} ({outcomes:?})", spread(times)));
+        for l in &lines {
+            eprintln!("COMMITTEST {l}");
+        }
+    }
+
+    /// Record B of lazy-ram-options.md (POPULATETEST lines): whether
+    /// `WHvAdviseGpaRange(Populate)` of committed guest RAM that nothing has
+    /// touched maps it ahead of the guest, and so spares the guest's first
+    /// write to each page the fault WHP takes for it inside the run call
+    /// (14.5 us a page on a PC at 03f4bfe): its HRESULT, the working set
+    /// and commit charge it moves, and the run call of a guest writing each
+    /// 4 KiB page of 2 MiB that was populated, against 2 MiB that was not
+    /// (that one first). Printed, not asserted.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_populate_of_committed_guest_ram_on_record() {
+        const GPA: u64 = 0xA0_0000;
+        const LEN: usize = 4 << 20;
+        let touch = |at: u32| {
+            let mut b = vec![0xBF];
+            b.extend_from_slice(&at.to_le_bytes()); // mov edi, at
+            b.extend_from_slice(&[
+                0xB9, 0x00, 0x02, 0x00, 0x00, // mov ecx, 512
+                0xC6, 0x07, 0x01, // mov byte [rdi], 1
+                0x81, 0xC7, 0x00, 0x10, 0x00, 0x00, // add edi, 0x1000
+                0xFF, 0xC9, // dec ecx
+                0x75, 0xF3, // jnz to the mov
+                0xE6, PORT as u8,
+            ]);
+            b
+        };
+        let program = [vec![0xE6, PORT as u8], touch(0xC0_0000), touch(0xA0_0000), vec![0xF4, 0xEB, 0xFD]].concat();
+        let (vm, mut vcpu, m) = mmio_guest(&program);
+        put(m, 0x3028, &(0xA0_0000u64 | 0x83).to_le_bytes());
+        put(m, 0x3030, &(0xC0_0000u64 | 0x83).to_le_bytes());
+        // SAFETY: anonymous memory for the test (committed: no MAP_NORESERVE), unmapped below.
+        let ram = unsafe {
+            libc::mmap(std::ptr::null_mut(), LEN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert_ne!(ram, libc::MAP_FAILED);
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 1,
+            flags: 0,
+            guest_phys_addr: GPA,
+            memory_size: LEN as u64,
+            userspace_addr: ram as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let populate = populate_on_record(vcpu.part(), ram as usize, GPA, 2 << 20);
+        let watchdog = super::Watchdog::arm(&vcpu);
+        let mut reads = 0;
+        let mut timed = Vec::new();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let line = one_run(&mut vcpu, &[], &mut reads);
+            timed.push((line, t.elapsed().as_secs_f64() * 1e6));
+        }
+        drop(watchdog);
+        eprintln!("POPULATETEST {populate}");
+        eprintln!(
+            "POPULATETEST the guest's first write to each of 512 pages: not populated (0xc00000) {} {:.1} us, \
+             {:.2} us a page; populated (0xa00000) {} {:.1} us, {:.2} us a page (the first run, {} {:.1} us, warms up)",
+            timed[1].0,
+            timed[1].1,
+            timed[1].1 / 512.0,
+            timed[2].0,
+            timed[2].1,
+            timed[2].1 / 512.0,
+            timed[0].0,
+            timed[0].1
+        );
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mappings, no VM left using them.
+        assert_eq!(unsafe { libc::munmap(ram, LEN) }, 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
     }
 
     // String port I/O and device memory with a second operand in RAM, as

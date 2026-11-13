@@ -27,9 +27,21 @@
 //!   the emulator is allowed to finish so `RIP` advances, and the captured
 //!   write is handed to Firecracker as `VcpuExit::Mmio*`/`Io*`;
 //! - a **read** has no data yet, so the callback aborts the emulation (leaving
-//!   `RIP` in place) and the access is handed to Firecracker; Firecracker fills
-//!   the buffer, the instruction re-executes, and this time the callback has
-//!   the data and the emulator finishes.
+//!   `RIP` in place) and the access is handed to Firecracker. At the vCPU's
+//!   next run, before any entry into the guest and before a kick is looked
+//!   at, the instruction is emulated again from the same exit's contexts,
+//!   now with the data of every device read it asked for, in order
+//!   ([`DeviceRead`]), and finishes in the host, as KVM's
+//!   `complete_emulated_mmio` finishes it (`kvm_arch_vcpu_ioctl_run` runs
+//!   `complete_userspace_io` before its `immediate_exit` check; Linux v6.1
+//!   arch/x86/kvm/x86.c). An instruction with a second device read (two
+//!   operands, or an access the emulator splits) exits again for it, as
+//!   KVM's does for each of its `mmio_fragments`. Before, the instruction
+//!   re-executed in the guest and the data went to the first device read
+//!   of whatever ran: an interrupt taken at the entry, or the same
+//!   instruction's first read when it had two, which then asked for its
+//!   second again on every run; and a kick before the entry lost the data,
+//!   so the device was read twice.
 //!
 //! The callbacks reach the vCPU through a `*mut EmuCtx` passed as the WHP
 //! context pointer; `EmuCtx` carries the partition/vCPU, an 8-byte data
@@ -59,6 +71,19 @@ pub(crate) enum Outcome {
     Completed,
     /// The emulator could not make progress.
     Failed,
+    /// A device read other than the one the next of the given reads was
+    /// for (the instruction's state changed between its exit and its
+    /// completion): `asked`, and what the read given was for.
+    Mismatch { asked: (u64, usize), given: (u64, usize) },
+}
+
+/// A device read of an instruction, with the data the device gave, to be
+/// handed to the emulator when it asks for the same access again.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeviceRead {
+    pub addr: u64,
+    pub len: usize,
+    pub data: [u8; 8],
 }
 
 /// State shared with the WHP emulator callbacks for one emulation attempt.
@@ -73,8 +98,13 @@ struct EmuCtx {
     exit_len: u32,
     exit_addr: u64,
     exit_mmio: bool,
-    /// Whether a read's completion data is already in `data`.
-    have_completion: bool,
+    /// The device reads already answered, handed out in order
+    /// (`reads_len` of them at `reads`; `next_read` is the next one).
+    reads: *const DeviceRead,
+    reads_len: usize,
+    next_read: usize,
+    /// A device read that did not match the next given one: what was asked.
+    mismatch: Option<(u64, usize)>,
     /// The VM's memory slots: what is RAM.
     ram: *const super::pvclock::Ram,
     /// Device writes of this instruction after its first, in order (a
@@ -139,10 +169,12 @@ fn emulator(vp: u32) -> Result<*mut core::ffi::c_void> {
     .map_err(|e| *e))
 }
 
-/// Emulates the MMIO instruction that caused `mem`. `scratch` is an 8-byte
-/// buffer holding, for a read completion, the data Firecracker supplied.
-/// `ram` is the VM's slot table; device writes after the instruction's
-/// first are added to `more`.
+/// Emulates the MMIO instruction that caused `mem`. `reads` are the device
+/// reads of the instruction already answered, in the order the emulator
+/// asks for them; a device read past them aborts the emulation
+/// ([`Outcome::Read`]). `scratch` is an 8-byte buffer that takes the first
+/// device write's data. `ram` is the VM's slot table; device writes after
+/// the instruction's first are added to `more`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mmio(
     part: WHV_PARTITION_HANDLE,
@@ -150,7 +182,7 @@ pub(crate) fn mmio(
     vpctx: &WHV_VP_EXIT_CONTEXT,
     mem: &WHV_MEMORY_ACCESS_CONTEXT,
     scratch: *mut u8,
-    have_completion: bool,
+    reads: &[DeviceRead],
     ram: &super::pvclock::Ram,
     more: &mut Vec<DeviceWrite>,
 ) -> Result<Outcome> {
@@ -163,7 +195,10 @@ pub(crate) fn mmio(
         exit_len: 0,
         exit_addr: 0,
         exit_mmio: true,
-        have_completion,
+        reads: reads.as_ptr(),
+        reads_len: reads.len(),
+        next_read: 0,
+        mismatch: None,
         ram,
         more,
     };
@@ -189,6 +224,11 @@ pub(crate) fn mmio(
 
 /// Turns the post-call context into an [`Outcome`].
 fn interpret(ctx: &EmuCtx, hres: i32) -> Outcome {
+    if let Some(asked) = ctx.mismatch {
+        // SAFETY: `next_read` < `reads_len` when a mismatch is recorded.
+        let given = unsafe { &*ctx.reads.add(ctx.next_read) };
+        return Outcome::Mismatch { asked, given: (given.addr, given.len) };
+    }
     match ctx.exit_kind {
         1 => Outcome::Write {
             addr: ctx.exit_addr,
@@ -244,11 +284,17 @@ unsafe extern "system" fn mem_cb(
         a.Data[..size].copy_from_slice(&bytes[..size]);
         return S_OK;
     }
-    if ctx.have_completion {
-        // Read completion: hand the supplied data to the emulator, once (a
-        // second device read of the instruction is a new read to ask for).
-        ctx.have_completion = false;
-        unsafe { std::ptr::copy_nonoverlapping(ctx.data, a.Data.as_mut_ptr(), size) };
+    if ctx.next_read < ctx.reads_len {
+        // A device read answered before: the same access, in the same
+        // order, as the instruction is the same from the same state.
+        // SAFETY: within the caller's slice of `reads_len` reads.
+        let given = unsafe { &*ctx.reads.add(ctx.next_read) };
+        if given.addr != a.GpaAddress || given.len != size {
+            ctx.mismatch = Some((a.GpaAddress, size));
+            return E_FAIL;
+        }
+        ctx.next_read += 1;
+        a.Data[..size].copy_from_slice(&given.data[..size]);
         S_OK
     } else {
         // Read with no data yet: abort so RIP does not advance.
