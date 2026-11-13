@@ -3750,6 +3750,238 @@ mod fpu_tests {
         assert!(wrong.is_empty(), "on a vCPU's thread: {wrong:#?}");
     }
 
+    /// What the process's heaps hold, from `HeapWalk` of each heap
+    /// (`GetProcessHeaps`) under its lock: the busy blocks' sizes and the
+    /// heaps' committed bytes (their regions' `dwCommittedSize`). Rust's
+    /// allocator on Windows is the process heap's (`HeapAlloc`).
+    struct HeapCensus {
+        heaps: usize,
+        /// (busy block size in bytes, blocks), by size.
+        busy: Vec<(u32, u64)>,
+        committed: u64,
+        /// Busy blocks past the room set aside.
+        missed: u64,
+    }
+
+    /// The room a census works in, allocated before the first: what the
+    /// census itself holds is then the same in every census, and cancels.
+    struct CensusRoom {
+        handles: Vec<windows_sys::Win32::Foundation::HANDLE>,
+        sizes: Vec<u32>,
+        results: Vec<Vec<(u32, u64)>>,
+    }
+
+    impl CensusRoom {
+        fn new(censuses: usize) -> Self {
+            CensusRoom {
+                handles: vec![std::ptr::null_mut(); 256],
+                sizes: Vec::with_capacity(1 << 19),
+                results: (0..censuses).map(|_| Vec::with_capacity(1 << 14)).collect(),
+            }
+        }
+
+        /// A census, into the next result room; nothing is allocated from a
+        /// heap while it is locked, or before the result is made.
+        fn take(&mut self) -> HeapCensus {
+            use windows_sys::Win32::System::Memory::{GetProcessHeaps, HeapLock, HeapUnlock, HeapWalk, PROCESS_HEAP_ENTRY};
+            // PROCESS_HEAP_REGION and PROCESS_HEAP_ENTRY_BUSY (winbase.h).
+            const REGION: u16 = 1;
+            const BUSY: u16 = 4;
+            // SAFETY: room for 256 handles.
+            let n = unsafe { GetProcessHeaps(256, self.handles.as_mut_ptr()) } as usize;
+            self.sizes.clear();
+            let (mut committed, mut missed) = (0u64, 0u64);
+            for &h in &self.handles[..n.min(256)] {
+                // SAFETY: a heap of this process; the walk allocates nothing.
+                unsafe {
+                    if HeapLock(h) == 0 {
+                        continue;
+                    }
+                    let mut e: PROCESS_HEAP_ENTRY = std::mem::zeroed();
+                    while HeapWalk(h, &mut e) != 0 {
+                        if e.wFlags & REGION != 0 {
+                            committed += u64::from(e.Anonymous.Region.dwCommittedSize);
+                        } else if e.wFlags & BUSY != 0 {
+                            if self.sizes.len() < self.sizes.capacity() {
+                                self.sizes.push(e.cbData);
+                            } else {
+                                missed += 1;
+                            }
+                        }
+                    }
+                    HeapUnlock(h);
+                }
+            }
+            self.sizes.sort_unstable();
+            let mut busy = self.results.pop().expect("a census more than the room was made for");
+            for &z in &self.sizes {
+                if let Some((last, c)) = busy.last_mut()
+                    && *last == z
+                {
+                    *c += 1;
+                } else if busy.len() < busy.capacity() {
+                    busy.push((z, 1));
+                } else {
+                    missed += 1;
+                }
+            }
+            HeapCensus { heaps: n, busy, committed, missed }
+        }
+    }
+
+    impl HeapCensus {
+        fn line(&self) -> String {
+            let blocks: u64 = self.busy.iter().map(|b| b.1).sum();
+            let bytes: u64 = self.busy.iter().map(|(z, c)| u64::from(*z) * c).sum();
+            format!(
+                "heaps {}, busy blocks {blocks} ({:.1} KiB), committed {:.1} KiB{}",
+                self.heaps,
+                bytes as f64 / 1024.0,
+                self.committed as f64 / 1024.0,
+                if self.missed > 0 { format!(", {} blocks not counted", self.missed) } else { String::new() }
+            )
+        }
+
+        /// What `later` holds more than `self`, for each of `n` vCPUs: the
+        /// blocks, their bytes and the committed bytes, and the sizes whose
+        /// blocks grew most in bytes (size x blocks a vCPU).
+        fn per_vcpu(&self, later: &HeapCensus, n: u64) -> String {
+            let before: std::collections::BTreeMap<u32, u64> = self.busy.iter().copied().collect();
+            let after: std::collections::BTreeMap<u32, u64> = later.busy.iter().copied().collect();
+            let mut grown: Vec<(u32, i64)> = before
+                .keys()
+                .chain(after.keys())
+                .copied()
+                .collect::<std::collections::BTreeSet<u32>>()
+                .into_iter()
+                .map(|z| (z, *after.get(&z).unwrap_or(&0) as i64 - *before.get(&z).unwrap_or(&0) as i64))
+                .filter(|(_, d)| *d != 0)
+                .collect();
+            let blocks: i64 = grown.iter().map(|g| g.1).sum();
+            let bytes: i64 = grown.iter().map(|(z, d)| i64::from(*z) * d).sum();
+            grown.sort_by_key(|(z, d)| std::cmp::Reverse(i64::from(*z) * d));
+            let top: Vec<String> =
+                grown.iter().take(16).map(|(z, d)| format!("{z} x {:.2}", *d as f64 / n as f64)).collect();
+            format!(
+                "each vCPU adds {:.2} busy blocks, {:.1} KiB of them, {:.1} KiB committed, heaps {:+}; by size \
+                 (bytes x blocks a vCPU), most bytes first: {}",
+                blocks as f64 / n as f64,
+                bytes as f64 / 1024.0 / n as f64,
+                (later.committed as f64 - self.committed as f64) / 1024.0 / n as f64,
+                later.heaps as i64 - self.heaps as i64,
+                top.join(", ")
+            )
+        }
+    }
+
+    /// A record of the process heap a vCPU takes, for the 62.1 KiB of heap
+    /// each vCPU added in a PC's traced boot at 861d365 (VMMGROW: in later
+    /// segments of the process heap), whose owner nothing named: a census
+    /// of every heap (`CensusRoom::take`) taken with the VM made, after
+    /// `create_vcpu` of 4 vCPUs, after a thread for each (made as
+    /// Firecracker makes a vCPU's, and kept until the end), after each
+    /// vCPU's first run on its thread, and after an MMIO read on each (the
+    /// emulator is made at a vCPU's first MMIO exit): HEAPTEST lines, the
+    /// growth per vCPU by block size. This is the backend's and WHP's part;
+    /// what the VMM above adds for a vCPU is not here. A debug test build:
+    /// the backend's allocations are of the same types in a release build,
+    /// WHP's are WHP's. Printed, not asserted.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_the_heap_a_vcpu_takes_on_record() {
+        const N: usize = 4;
+        const MMIO_CODE: u64 = 0x6100;
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        // A 2 MiB page at 6 MiB that no slot backs: an MMIO address.
+        put(m, 0x3018, &(0x60_0000u64 | 0x83).to_le_bytes());
+        put(
+            m,
+            MMIO_CODE,
+            &[
+                0x8B, 0x04, 0x25, 0x00, 0x00, 0x60, 0x00, // mov eax, [0x600000]
+                0xE6, PORT as u8, // out 0x80, al
+                0xEB, 0xFE, // jmp $
+            ],
+        );
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let mut room = CensusRoom::new(5);
+        // The first line on standard error made before the first census.
+        eprintln!("HEAPTEST {N} vCPUs");
+        let made = room.take();
+        eprintln!("HEAPTEST the VM made: {}", made.line());
+        let mut vcpus: Vec<VcpuFd> = (0..N).map(|i| vm.create_vcpu(i as u64).unwrap()).collect();
+        for v in &vcpus {
+            start(v);
+        }
+        let created = room.take();
+        eprintln!("HEAPTEST after create_vcpu of {N}: {}", created.line());
+        let barrier = std::sync::Barrier::new(N + 1);
+        let exits: Vec<String> = std::thread::scope(|scope| {
+            let workers: Vec<_> = vcpus
+                .iter_mut()
+                .enumerate()
+                .map(|(i, vcpu)| {
+                    let barrier = &barrier;
+                    std::thread::Builder::new()
+                        .name(format!("fc_vcpu {i}"))
+                        .stack_size(2 << 20)
+                        .spawn_scoped(scope, move || {
+                            barrier.wait();
+                            barrier.wait();
+                            let first = run_once(vcpu);
+                            barrier.wait();
+                            barrier.wait();
+                            vcpu.set_regs(&kvm_regs { rip: MMIO_CODE, rsp: 0x9000, rflags: 2, ..Default::default() })
+                                .unwrap();
+                            let mut mmio = vec![run_once(vcpu)];
+                            while mmio.len() < 3 && !mmio.last().unwrap().contains("IoOut") {
+                                mmio.push(run_once(vcpu));
+                            }
+                            barrier.wait();
+                            barrier.wait();
+                            format!("fc_vcpu {i}: first run {first}; MMIO read {}", mmio.join(", "))
+                        })
+                        .unwrap()
+                })
+                .collect();
+            barrier.wait();
+            let threads = room.take();
+            eprintln!("HEAPTEST after a thread for each: {}", threads.line());
+            barrier.wait();
+            barrier.wait();
+            let ran = room.take();
+            eprintln!("HEAPTEST after each one's first run: {}", ran.line());
+            barrier.wait();
+            barrier.wait();
+            let emulated = room.take();
+            eprintln!("HEAPTEST after an MMIO read on each: {}", emulated.line());
+            let n = N as u64;
+            eprintln!("HEAPTEST create_vcpu: {}", made.per_vcpu(&created, n));
+            eprintln!("HEAPTEST its thread: {}", created.per_vcpu(&threads, n));
+            eprintln!("HEAPTEST its first run: {}", threads.per_vcpu(&ran, n));
+            eprintln!("HEAPTEST its first MMIO exit: {}", ran.per_vcpu(&emulated, n));
+            eprintln!("HEAPTEST all of it: {}", made.per_vcpu(&emulated, n));
+            barrier.wait();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        for e in &exits {
+            eprintln!("HEAPTEST {e}");
+        }
+        drop(vcpus);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
     /// The exits of a guest until its `out 0x80`, as Firecracker sees
     /// them, each with its bytes: an `IN` and an MMIO read are answered
     /// from `feed`, in order (a read with nothing left is answered with

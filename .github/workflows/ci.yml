@@ -920,6 +920,12 @@ jobs:
           # stays within 40 KiB (16 to 24 measured without a refused call,
           # 52 with one, in that run) but for those printed.
           alone whp::vcpu::fpu_tests::test_the_stack_each_whp_call_commits_on_record
+          # The process heap a vCPU takes (HEAPTEST lines): a census of every
+          # heap with the VM made, after create_vcpu of 4, a thread for each,
+          # each one's first run and an MMIO read on each (the emulator),
+          # the growth per vCPU by block size; for the 62 KiB of heap a vCPU
+          # added in a PC's traced boot at 861d365, whose owner nothing named.
+          alone whp::vcpu::fpu_tests::test_the_heap_a_vcpu_takes_on_record
           # String port I/O (REP OUTSB, OUTSW, REP INSB, INSD, with the
           # direction flag too) and a device's memory with a second operand
           # in RAM (MOVSB either way): the exits and bytes Firecracker's
