@@ -1086,8 +1086,10 @@ jobs:
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # The lazy-RAM grain (LAZYGRAIN lines): guest RAM mapped as
-          # Firecracker's, committed 4 KiB, 64 KiB or 2 MiB at a first
-          # access; after a sparse and a dense guest step, its commit and
+          # Firecracker's, committed 4 KiB (the backend's grain), 64 KiB
+          # (the grain before) or 2 MiB (a write's under MADV_HUGEPAGE,
+          # populated) at a first access; after a sparse and a dense guest
+          # step, its commit and
           # working set and the exits' time; then WHvAdviseGpaRange(Populate)
           # of 2 MiB of committed RAM, its own time. Linux's numbers for the
           # same steps are the linux-boot job's LINUXGRAIN lines.

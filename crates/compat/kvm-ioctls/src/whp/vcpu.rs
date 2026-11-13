@@ -1662,13 +1662,23 @@ impl VcpuFd {
                     // Linux): WHP exits at the access to such a page, which
                     // re-runs once it is committed (measured), as KVM resolves
                     // the stage-2 fault through the host page.
+                    // A write's first access to a transparent huge page
+                    // (memory advised `MADV_HUGEPAGE`) commits all of it
+                    // and has WHP map it at once, as Linux's huge page fault
+                    // does (`VmInner::populate_huge_page`); a read commits
+                    // its page only (`wick_mm`: Linux's huge zero page).
                     if let Some(host) = self.shared.inner.host_addr(mem.Gpa) {
                         #[allow(clippy::cast_possible_truncation)]
                         let write = super::exit::memory_write(unsafe { mem.AccessInfo.AsUINT32 });
-                        match libc::wick_mm::commit_on_access(host as usize, write) {
-                            libc::wick_mm::Access::Committed => continue,
-                            libc::wick_mm::Access::Exhausted(err) => libc::wick_mm::out_of_memory(host as usize, err),
-                            libc::wick_mm::Access::NotLazy => {}
+                        match libc::wick_mm::commit_block_on_access(host as usize, write) {
+                            (libc::wick_mm::Access::Committed, block) => {
+                                if write && block.len() >= libc::wick_mm::HUGE_PAGE {
+                                    self.shared.inner.populate_huge_page(mem.Gpa, block);
+                                }
+                                continue;
+                            }
+                            (libc::wick_mm::Access::Exhausted(err), _) => libc::wick_mm::out_of_memory(host as usize, err),
+                            (libc::wick_mm::Access::NotLazy, _) => {}
                         }
                     }
                     // Guest RAM that is a missing userfaultfd page: WHP
@@ -3504,7 +3514,7 @@ mod fpu_tests {
     /// guest RAM that is mapped (lazy RAM not yet committed), each one's
     /// run call and the backend's time before the next run call (the
     /// commit), and what that comes to for a 256 MiB guest touching all of
-    /// its RAM in the 64 KiB blocks the backend commits.
+    /// its RAM in the 4 KiB pages the backend commits.
     fn step_time(calls: &[super::super::ffi::trace::Call], took: f64) -> String {
         let runs: Vec<(usize, &super::super::ffi::trace::Call)> =
             calls.iter().enumerate().filter(|(_, c)| c.micros().is_some()).collect();
@@ -3521,10 +3531,10 @@ mod fpu_tests {
             let (run, ours) = (lazy.iter().map(|l| l.0).sum::<f64>() / n, lazy.iter().map(|l| l.1).sum::<f64>() / n);
             line += &format!(
                 "; {} memory exits of mapped guest RAM: each {run:.1} us in its run call (entry, the guest's access, \
-                 the exit) and {ours:.1} us in the backend before the next (the commit); 4096 of them, a 256 MiB \
-                 guest touching all its RAM in 64 KiB blocks: {:.1} ms",
+                 the exit) and {ours:.1} us in the backend before the next (the commit); 65536 of them, a 256 MiB \
+                 guest touching all its RAM in 4 KiB pages: {:.1} ms",
                 lazy.len(),
-                4096.0 * (run + ours) / 1000.0
+                65536.0 * (run + ours) / 1000.0
             );
         }
         line
@@ -5550,7 +5560,7 @@ mod fpu_tests {
     /// `VirtualAlloc(MEM_COMMIT)` of reserved memory takes for 4 KiB,
     /// 64 KiB and 2 MiB (64 of each, the median, least and most), what the
     /// backend's commit of `MAP_NORESERVE` memory at a first access
-    /// (`commit_on_access`, 64 KiB today) takes, and what the host's own
+    /// (`commit_on_access`, a page where no `MADV_HUGEPAGE` is) takes, and what the host's own
     /// first write to each 4 KiB page of committed memory takes after it.
     /// Printed, not asserted.
     #[test]
@@ -5706,9 +5716,12 @@ mod fpu_tests {
     /// lazy-ram-options.md): what guest RAM mapped as Firecracker maps it
     /// (`MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`) is charged and
     /// resident after the guest touches it, and what the exits cost, when
-    /// the backend commits 4 KiB, 64 KiB (today's `LAZY_CHUNK`) or 2 MiB at
-    /// a first access (`wick_mm::record_grain`, set on this test's mappings
-    /// only). Each grain has a slot of its own, 2 MiB aligned on the host as
+    /// the backend commits 4 KiB (its grain where no `MADV_HUGEPAGE` is),
+    /// 64 KiB (its grain before) or 2 MiB (a write's, where one is) at a
+    /// first access (`wick_mm::record_grain`, set on this test's mappings
+    /// only; a guest write's 2 MiB block is populated as the backend does
+    /// for a transparent huge page, `VmInner::populate_huge_page`, so the
+    /// 2 MiB slot's numbers are `huge_pages: Transparent`'s). Each grain has a slot of its own, 2 MiB aligned on the host as
     /// a transparent huge page needs, and the guest's same two steps in it:
     /// - sparse: one byte written in each 2 MiB of 64 MiB (32 writes);
     /// - dense: a byte written in each 4 KiB page of the next 4 MiB (1024).
@@ -5923,7 +5936,7 @@ mod fpu_tests {
         drop(vcpu);
         drop(vm);
         for &p in &maps {
-            libc::wick_mm::record_grain(p, 0, 0);
+            libc::wick_mm::record_grain(p, SLOT_LEN + MIB2, 0);
             // SAFETY: the test's mapping, no VM left using it.
             assert_eq!(unsafe { libc::munmap(p as *mut _, SLOT_LEN + MIB2) }, 0);
         }

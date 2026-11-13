@@ -120,9 +120,9 @@
   the nearest symbol when `firecracker.pdb` is beside the binary, as in the
   kit), so that the calls that reached deep are named. VMMGUEST lines give
   the guest's memory after the shell and after a guest's tmpfs work: what is
-  committed and resident, and the first accesses it took at today's 64 KiB
-  commit grain against what a 4 KiB or a 2 MiB grain would take (the 64 KiB
-  blocks, 4 KiB pages and 2 MiB ranges it is in); Linux's for the same guest
+  committed and resident, and the first accesses it takes at today's 4 KiB
+  commit grain against what the 64 KiB grain before or a 2 MiB grain take
+  (the 64 KiB blocks, 4 KiB pages and 2 MiB ranges it is in); Linux's for the same guest
   and work are `tools/linux/guest-ram-record.py`'s:
 
   ```

@@ -178,8 +178,20 @@ pub mod wick_mm {
     /// hypervisor reported (WHP's memory access exit): commits the pages of
     /// lazy memory there ([`super::LAZY`]). `write`: the access was a write.
     pub fn commit_on_access(addr: usize, write: bool) -> Access {
+        super::commit_on_access(addr, write).0
+    }
+
+    /// [`commit_on_access`], with the range it committed (empty unless
+    /// [`Access::Committed`]): a page, or the transparent huge page around
+    /// `addr` in a range advised `MADV_HUGEPAGE` ([`HUGE_PAGE`]), which the
+    /// caller can have the hypervisor map at once.
+    pub fn commit_block_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize>) {
         super::commit_on_access(addr, write)
     }
+
+    /// The block a first access commits in a range advised
+    /// `MADV_HUGEPAGE`: a transparent huge page of x86-64 Linux.
+    pub const HUGE_PAGE: usize = super::HUGE_PAGE;
 
     /// Ends the process for memory that could not be committed
     /// ([`Access::Exhausted`]), as the cgroup OOM killer ends the VMM.
@@ -198,18 +210,13 @@ pub mod wick_mm {
     }
 
     /// For a record only (kvm-ioctls' LAZYGRAIN): the lazy memory at
-    /// `[addr, addr + len)` commits `grain` bytes at a first access, an
-    /// aligned block clipped to its range, instead of [`super::LAZY_CHUNK`];
-    /// `grain` 0 removes the setting. `grain` is a power of two of at least
-    /// a page. Nothing else sets it, so no mapping of Firecracker's has one.
+    /// `[addr, addr + len)` commits `grain` bytes at a first access (an
+    /// aligned block wholly inside its lazy range, else a page), as
+    /// `MADV_HUGEPAGE` sets [`HUGE_PAGE`]; `grain` 0 removes the setting
+    /// from the range. `grain` is a power of two of at least a page.
     pub fn record_grain(addr: usize, len: usize, grain: usize) {
         assert!(grain == 0 || (grain.is_power_of_two() && grain >= PAGE), "grain {grain:#x}");
-        let mut g = super::RECORD_GRAINS.lock().unwrap();
-        g.retain(|&(s, _, _)| s != addr);
-        if grain != 0 {
-            g.push((addr, len, grain));
-        }
-        super::RECORD_GRAINS_SET.store(!g.is_empty(), std::sync::atomic::Ordering::Release);
+        super::set_grain(addr, len, grain);
     }
 
     /// Calls the [`deny_exec`] hook if `prot` asks for execution.
@@ -761,24 +768,64 @@ fn make_placeholder(t: &mut Table, start: usize, end: usize) -> Result<(), c_int
 /// range (`PROT_NONE`) is committed by no access, which faults, as on Linux.
 static LAZY: Mutex<Vec<(usize, usize, PAGE_PROTECTION_FLAGS)>> = Mutex::new(Vec::new());
 
-/// How much is committed at a fault: a 64 KiB aligned block (clipped to its
-/// range), so a guest touching its memory in order takes one exit per block
-/// rather than per page.
-const LAZY_CHUNK: usize = 64 << 10;
+/// What a first access commits: a page, as Linux charges an anonymous
+/// mapping a page at a time where it uses no transparent huge page
+/// (mm/memory.c `do_anonymous_page`; a mapping not advised `MADV_HUGEPAGE`
+/// on a host whose THP mode is `madvise`, Ubuntu's kernel configuration);
+/// in a range advised `MADV_HUGEPAGE` ([`GRAINS`]), at a write, the aligned
+/// [`HUGE_PAGE`] around the access if the lazy range holds all of it, as
+/// Linux maps a huge page only where the mapping holds the aligned 2 MiB
+/// (`thp_vma_suitable_order`), and charges it whole
+/// (`__do_huge_pmd_anonymous_page`); else a page, as Linux falls back to
+/// one.
+const HUGE_PAGE: usize = 2 << 20;
 
-/// A record's grains ([`wick_mm::record_grain`]): `(start, len, grain)`.
-static RECORD_GRAINS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
-/// Whether [`RECORD_GRAINS`] has any: the commit's one look at it otherwise.
-static RECORD_GRAINS_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The grains other than a page: `MADV_HUGEPAGE`'s [`HUGE_PAGE`] (as
+/// Linux's `VM_HUGEPAGE`, kept by `mprotect` and dropped by `munmap`, a
+/// `MAP_FIXED` mapping over the range and `MADV_NOHUGEPAGE`) and a
+/// record's ([`wick_mm::record_grain`]). Sorted, disjoint
+/// `(start, len, grain)`.
+static GRAINS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+/// Whether [`GRAINS`] has any: the commit's one look at it otherwise.
+static GRAINS_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The block a first access to `addr` commits: [`LAZY_CHUNK`], or a
-/// record's grain there.
-fn lazy_chunk(addr: usize) -> usize {
-    if !RECORD_GRAINS_SET.load(std::sync::atomic::Ordering::Acquire) {
-        return LAZY_CHUNK;
+/// Sets the grain of `[start, start + len)`; 0 removes it.
+fn set_grain(start: usize, len: usize, grain: usize) {
+    let end = start.saturating_add(len);
+    let mut g = GRAINS.lock().unwrap();
+    if g.is_empty() && grain == 0 {
+        return;
     }
-    let g = RECORD_GRAINS.lock().unwrap();
-    g.iter().find(|&&(s, n, _)| s <= addr && addr < s + n).map_or(LAZY_CHUNK, |&(_, _, grain)| grain)
+    let mut out = Vec::with_capacity(g.len() + 2);
+    for &(s, n, k) in g.iter() {
+        let e = s + n;
+        if e <= start || s >= end {
+            out.push((s, n, k));
+            continue;
+        }
+        if s < start {
+            out.push((s, start - s, k));
+        }
+        if e > end {
+            out.push((end, e - end, k));
+        }
+    }
+    if grain != 0 && end > start {
+        out.push((start, end - start, grain));
+    }
+    out.sort_unstable();
+    GRAINS_SET.store(!out.is_empty(), std::sync::atomic::Ordering::Release);
+    *g = out;
+}
+
+/// The grain at `addr`: a page, or the one [`GRAINS`] sets there.
+fn lazy_grain(addr: usize) -> usize {
+    if !GRAINS_SET.load(std::sync::atomic::Ordering::Acquire) {
+        return PAGE;
+    }
+    let g = GRAINS.lock().unwrap();
+    let i = g.partition_point(|&(s, _, _)| s <= addr);
+    i.checked_sub(1).map(|i| g[i]).filter(|&(s, n, _)| addr < s + n).map_or(PAGE, |(_, _, grain)| grain)
 }
 
 /// The exit code of a VMM that reached its memory limit: what a shell shows
@@ -838,49 +885,50 @@ pub enum Access {
     Exhausted(u32),
 }
 
-fn commit_on_access(addr: usize, write: bool) -> Access {
+fn commit_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize>) {
     let found = {
         let l = LAZY.lock().unwrap();
         let i = l.partition_point(|&(s, _, _)| s <= addr);
         i.checked_sub(1).map(|i| l[i]).filter(|&(s, n, _)| addr < s + n)
     };
     let Some((s, n, prot)) = found else {
-        return Access::NotLazy;
+        return (Access::NotLazy, 0..0);
     };
     // `PROT_NONE`: the access is a fault, as Linux's to a `PROT_NONE`
-    // mapping; nothing is committed.
-    if prot == PAGE_NOACCESS {
-        return Access::NotLazy;
+    // mapping; nothing is committed. A write to memory mapped without
+    // write access is a protection fault too, committed or not, as Linux
+    // gives `SIGSEGV` for it before any page is allocated.
+    let writable = matches!(prot, PAGE_READWRITE | PAGE_EXECUTE_READWRITE);
+    if prot == PAGE_NOACCESS || (write && !writable) {
+        return (Access::NotLazy, 0..0);
     }
-    // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
-    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: as above.
-    if unsafe { VirtualQuery(addr as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
-        return Access::NotLazy;
-    }
-    if mbi.State == MEM_COMMIT {
-        // Committed since the access: another thread or vCPU committed its
-        // block first (two vCPUs touching one block: measured, the second's
-        // exit was emulated as MMIO and the guest took a bogus fault). The
-        // access runs again; a write to memory mapped without write access
-        // is a protection fault, not ours.
-        let writable = matches!(prot, PAGE_READWRITE | PAGE_EXECUTE_READWRITE);
-        return if write && !writable { Access::NotLazy } else { Access::Committed };
-    }
-    let chunk = lazy_chunk(addr);
-    let block = addr - addr % chunk;
-    let (from, to) = (block.max(s), (block + chunk).min(s + n));
+    // The block is committed whatever part of it is already: committing a
+    // committed page leaves it as it is ("an attempt to commit a page that
+    // is already committed does not cause the function to fail", Microsoft
+    // Learn, VirtualAlloc), so no `VirtualQuery` comes first. Every page
+    // of a lazy range has the range's protection (`protect_lazy`). An
+    // access to a block another thread or vCPU committed first runs again
+    // (two vCPUs touching one block: measured, the second's exit had been
+    // emulated as MMIO and the guest took a bogus fault).
+    let page = addr - addr % PAGE;
+    // A read takes a page even where huge pages are advised: Linux maps its
+    // huge zero page for a read fault there and allocates (and charges)
+    // nothing until a write (mm/huge_memory.c `do_huge_pmd_anonymous_page`,
+    // `use_zero_page`, on by default).
+    let grain = if write { lazy_grain(addr) } else { PAGE };
+    let block = addr - addr % grain;
+    let (from, to) = if block >= s && block + grain <= s + n { (block, block + grain) } else { (page, page + PAGE) };
     if commit(from, to - from, prot, false) {
-        return Access::Committed;
+        return (Access::Committed, from..to);
     }
     // SAFETY: plain call.
     let err = unsafe { GetLastError() };
-    // Another thread may have committed it meanwhile; only its page matters.
-    let page = addr - addr % PAGE;
-    if commit(page, PAGE, prot, false) {
-        Access::Committed
+    // A huge page that cannot be charged falls back to a page, as Linux's
+    // does (mm/huge_memory.c, `THP_FAULT_FALLBACK_CHARGE`).
+    if to - from > PAGE && commit(page, PAGE, prot, false) {
+        (Access::Committed, page..page + PAGE)
     } else {
-        Access::Exhausted(err)
+        (Access::Exhausted(err), 0..0)
     }
 }
 
@@ -982,7 +1030,7 @@ unsafe extern "system" fn lazy_on_exception(
     if rec.ExceptionCode == ACCESS_VIOLATION && rec.NumberParameters >= 2 {
         // [0]: 0 read, 1 write, 8 execute; [1]: the address.
         let stack = stack_committed();
-        match commit_on_access(rec.ExceptionInformation[1], rec.ExceptionInformation[0] == 1) {
+        match commit_on_access(rec.ExceptionInformation[1], rec.ExceptionInformation[0] == 1).0 {
             Access::Committed => {
                 let (n, deepest) = HOST_FAULTS.get();
                 HOST_FAULTS.set((n + 1, deepest.max(stack)));
@@ -1687,6 +1735,9 @@ pub unsafe fn mmap(
         if !base.is_multiple_of(PAGE) {
             return fail(crate::EINVAL, MAP_FAILED);
         }
+        // A new mapping, without the old one's `MADV_HUGEPAGE`, as Linux's
+        // new VMA has no `VM_HUGEPAGE`.
+        set_grain(base, len, 0);
         // Anonymous private memory over part of one private allocation, as
         // Firecracker does to plug and unplug memory slots: the old pages are
         // dropped in place. Accessible memory is recommitted zero-filled;
@@ -1776,6 +1827,7 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
     if !carve(&mut t, start, end) {
         return fail(crate::EINVAL, -1);
     }
+    set_grain(start, end - start, 0);
     for b in overlapping(&t, start, end) {
         let r = &t[&b];
         let (s, e) = (start.max(b), end.min(b + r.len));
@@ -2052,6 +2104,12 @@ unsafe fn madvise_plain(addr: *mut c_void, len: size_t, advice: c_int, done: &mu
             unmapped = true;
         }
         for (s, e) in parts {
+            // Linux's `VM_HUGEPAGE` on the range: what a first access to its
+            // lazy memory commits (`GRAINS`). Large pages are hugetlb's,
+            // which the advice does not change.
+            if (advice == MADV_HUGEPAGE || advice == MADV_NOHUGEPAGE) && !matches!(r.kind, Kind::Large { .. }) {
+                set_grain(s, e - s, if advice == MADV_HUGEPAGE { HUGE_PAGE } else { 0 });
+            }
             if advice == MADV_WILLNEED {
                 let range = WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: s as *mut c_void, NumberOfBytes: e - s };
                 // SAFETY: prefetches our mapping; advisory.
@@ -2351,7 +2409,7 @@ mod tests {
         // The lower half is still lazy and writable.
         // SAFETY: our mapping.
         unsafe { *(p as *mut u8) = 1 };
-        assert_eq!(committed(p, len), LAZY_CHUNK);
+        assert_eq!(committed(p, len), PAGE);
         // Plugged: accessible, nothing committed until touched.
         // SAFETY: our mapping.
         assert_eq!(unsafe { mprotect(slot as *mut c_void, n, PROT_READ | PROT_WRITE) }, 0);
@@ -2378,7 +2436,7 @@ mod tests {
         assert_eq!(committed(slot, n), 0);
         // SAFETY: our mapping.
         assert_eq!(unsafe { *((slot + PAGE) as *const u8) }, 0, "the discarded slot kept its data");
-        assert_eq!(committed(slot, n), LAZY_CHUNK);
+        assert_eq!(committed(slot, n), PAGE);
         // The lower half kept its byte throughout.
         // SAFETY: our mapping.
         assert_eq!(unsafe { *(p as *const u8) }, 1);
@@ -2387,41 +2445,80 @@ mod tests {
         assert!(lazy_within(p, len).is_empty());
     }
 
-    /// A record's grain (`wick_mm::record_grain`, for kvm-ioctls'
-    /// LAZYGRAIN) is the block a first access commits in its range only:
-    /// 4 KiB commits the page, 2 MiB the aligned 2 MiB clipped to the
-    /// mapping; the range beside it and the range after the setting is
-    /// removed commit `LAZY_CHUNK`.
+    /// A first access commits a page; a write in a range advised
+    /// `MADV_HUGEPAGE` the aligned 2 MiB around it if the lazy range holds
+    /// all of it, and a read there a page (Linux's huge zero page) (as
+    /// Linux maps a transparent huge page only there, mm/huge_memory.c
+    /// `thp_vma_suitable_order`), else a page; `MADV_NOHUGEPAGE`, `munmap`
+    /// and a `MAP_FIXED` mapping over the range take the advice away (Linux's
+    /// `VM_HUGEPAGE` is the VMA's), `mprotect` keeps it. A record's grain
+    /// (`wick_mm::record_grain`, kvm-ioctls' LAZYGRAIN) works the same way.
     #[test]
-    fn test_a_records_grain_is_what_a_first_access_commits() {
+    fn test_madv_hugepage_is_what_a_first_access_commits() {
         let _serial = serial();
-        let len = 8 << 20;
+        let huge = 2 << 20;
+        // 14 MiB and a page: five aligned 2 MiB blocks from `first` lie
+        // wholly inside, and the last page's block reaches past the end
+        // (the mapping starts on a 64 KiB boundary).
+        let len = (14 << 20) + PAGE;
         let p = map(0, len, PROT_READ | PROT_WRITE, ANON | MAP_NORESERVE, -1, 0);
-        let (small, large) = (p, p + (4 << 20));
-        wick_mm::record_grain(small, 2 << 20, PAGE);
-        wick_mm::record_grain(large, 4 << 20, 2 << 20);
-        assert_eq!(wick_mm::commit_on_access(small + 3 * PAGE, true), Access::Committed);
-        assert_eq!(committed(small, 2 << 20), PAGE);
-        // Beside the 4 KiB range: the default block.
-        assert_eq!(wick_mm::commit_on_access(p + (2 << 20), true), Access::Committed);
-        assert_eq!(committed(p + (2 << 20), 2 << 20), LAZY_CHUNK);
-        // The block around the access, aligned to 2 MiB in the address space.
-        let at = large + (1 << 20) + 5 * PAGE;
-        assert_eq!(wick_mm::commit_on_access(at, true), Access::Committed);
-        let block = at - at % (2 << 20);
-        let want = (block + (2 << 20)).min(p + len) - block.max(large);
-        assert_eq!(committed(large, 4 << 20), want);
-        wick_mm::record_grain(small, 0, 0);
-        wick_mm::record_grain(large, 0, 0);
-        assert!(!RECORD_GRAINS_SET.load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(wick_mm::commit_on_access(small + (1 << 20), true), Access::Committed);
-        assert_eq!(committed(small, 2 << 20), PAGE + LAZY_CHUNK);
+        let first = (p + huge).next_multiple_of(huge);
+        // Not advised: a page.
+        assert_eq!(wick_mm::commit_on_access(first + 5 * PAGE, true), Access::Committed);
+        assert_eq!(committed(p, len), PAGE);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { madvise(p as *mut c_void, len, MADV_HUGEPAGE) }, 0);
+        // A whole aligned block inside: committed whole, and reported so.
+        let at = first + huge + 7 * PAGE;
+        assert_eq!(wick_mm::commit_block_on_access(at, true), (Access::Committed, first + huge..first + 2 * huge));
+        assert_eq!(committed(first + huge, huge), huge);
+        // The block holding the mapping's last page is not wholly inside: a page.
+        let last = p + len - PAGE;
+        assert_eq!(wick_mm::commit_block_on_access(last, true), (Access::Committed, last..last + PAGE));
+        // A block partly committed already: the rest of it.
+        assert_eq!(wick_mm::commit_on_access(first + PAGE, true), Access::Committed);
+        assert_eq!(committed(first, huge), huge);
+        // A write to read-only memory: nothing committed, a fault.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { mprotect((first + 3 * huge) as *mut c_void, huge, PROT_READ) }, 0);
+        assert_eq!(wick_mm::commit_on_access(first + 3 * huge, true), Access::NotLazy, "a write to read-only memory");
+        assert_eq!(committed(first + 3 * huge, huge), 0);
+        // A read: a page, as Linux's huge zero page charges nothing.
+        assert_eq!(wick_mm::commit_block_on_access(first + 3 * huge, false), (Access::Committed, first + 3 * huge..first + 3 * huge + PAGE));
+        assert_eq!(committed(first + 3 * huge, huge), PAGE);
+        // mprotect kept the advice: writable again, a write commits the block.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { mprotect((first + 3 * huge) as *mut c_void, huge, PROT_READ | PROT_WRITE) }, 0);
+        assert_eq!(wick_mm::commit_on_access(first + 3 * huge + PAGE, true), Access::Committed);
+        assert_eq!(committed(first + 3 * huge, huge), huge);
+        // MADV_NOHUGEPAGE: a page again.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { madvise((first + 2 * huge) as *mut c_void, huge, MADV_NOHUGEPAGE) }, 0);
+        assert_eq!(wick_mm::commit_on_access(first + 2 * huge, true), Access::Committed);
+        assert_eq!(committed(first + 2 * huge, huge), PAGE);
+        // A MAP_FIXED mapping over an advised block: a page.
+        let over = map(first + 4 * huge, huge, PROT_READ | PROT_WRITE, ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
+        assert_eq!(over, first + 4 * huge);
+        assert_eq!(wick_mm::commit_on_access(over, true), Access::Committed);
+        assert_eq!(committed(over, huge), PAGE);
         // SAFETY: our mapping.
         assert_eq!(unsafe { munmap(p as *mut c_void, len) }, 0);
+        assert!(!GRAINS.lock().unwrap().iter().any(|&(s, n, _)| s < p + len && p < s + n), "munmap kept the advice");
+        // A record's grain, set and removed.
+        let q = map(0, len, PROT_READ | PROT_WRITE, ANON | MAP_NORESERVE, -1, 0);
+        let block = (q + huge).next_multiple_of(huge);
+        wick_mm::record_grain(q, len, 64 << 10);
+        assert_eq!(wick_mm::commit_on_access(block + PAGE, true), Access::Committed);
+        assert_eq!(committed(block, huge), 64 << 10);
+        wick_mm::record_grain(q, len, 0);
+        assert_eq!(wick_mm::commit_on_access(block + huge, true), Access::Committed);
+        assert_eq!(committed(block + huge, huge), PAGE);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { munmap(q as *mut c_void, len) }, 0);
     }
 
     /// Anonymous private `MAP_NORESERVE` memory gets its pages at the first
-    /// access, a 64 KiB block at a time, as Linux gives them when touched:
+    /// access, a page at a time, as Linux gives them when touched:
     /// mapped, nothing is committed; a write commits its block only; a
     /// discarded block goes back to reserved and reads zero; the guest's
     /// access (the hypervisor's report) commits as a host access does; an
@@ -2437,9 +2534,8 @@ mod tests {
         // SAFETY: our mapping.
         unsafe { *((p + (1 << 20) + 5) as *mut u8) = 7 };
         assert_eq!(state(p + (1 << 20)), MEM_COMMIT);
-        assert_eq!(state(p + (1 << 20) + LAZY_CHUNK - PAGE), MEM_COMMIT);
-        assert_eq!(state(p + (1 << 20) + LAZY_CHUNK), MEM_RESERVE, "more than the block was committed");
-        assert_eq!(state(p + (1 << 20) - PAGE), MEM_RESERVE, "more than the block was committed");
+        assert_eq!(state(p + (1 << 20) + PAGE), MEM_RESERVE, "more than the page was committed");
+        assert_eq!(state(p + (1 << 20) - PAGE), MEM_RESERVE, "more than the page was committed");
         // SAFETY: as above.
         assert_eq!(unsafe { *((p + (1 << 20) + 5) as *const u8) }, 7);
         // The guest's access, as WHP reports it.
@@ -2448,7 +2544,7 @@ mod tests {
         // Committed meanwhile (another vCPU first): run again.
         // Discarded: reserved again, zero at the next read.
         // SAFETY: our mapping.
-        assert_eq!(unsafe { madvise((p + (1 << 20)) as *mut c_void, LAZY_CHUNK, MADV_DONTNEED) }, 0);
+        assert_eq!(unsafe { madvise((p + (1 << 20)) as *mut c_void, PAGE, MADV_DONTNEED) }, 0);
         assert_eq!(state(p + (1 << 20)), MEM_RESERVE);
         // SAFETY: as above.
         assert_eq!(unsafe { *((p + (1 << 20) + 5) as *const u8) }, 0);

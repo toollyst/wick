@@ -1776,8 +1776,10 @@ mod tests {
 
     #[test]
     fn test_transparent_huge_page_advice() {
-        // As on a Linux host whose transparent huge pages are `never`: the
-        // advice is taken and the memory stays on small pages; the range is
+        // The advice is taken and the memory stays on small pages, as on a
+        // Linux host whose transparent huge pages are `never` (on Windows it
+        // also sets what a first write commits, windows_mm's
+        // `test_madv_hugepage_is_what_a_first_access_commits`); the range is
         // checked as Linux checks it.
         const LEN: usize = 1 << 20;
         // SAFETY: a fresh mapping, unmapped below.

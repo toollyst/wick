@@ -130,6 +130,9 @@ pub(crate) struct VmInner {
     /// The last `WHvRequestInterrupt` failure reported, so each kind is
     /// reported once.
     request_failure: AtomicI32,
+    /// The last `WHvAdviseGpaRange(Populate)` failure reported
+    /// ([`VmInner::populate_huge_page`]), so each is reported once.
+    populate_failure: AtomicI32,
     /// The partition's exception exits ([`Exits`]) and the condvar the
     /// vCPUs held out of the guest wait on. A leaf lock: nothing else is
     /// locked while it is held, so it is in no lock-order cycle.
@@ -191,6 +194,68 @@ impl VmInner {
             .values()
             .find(|s| gpa >= s.guest_phys && gpa < s.guest_phys + s.size)
             .map(|s| s.host + (gpa - s.guest_phys))
+    }
+
+    /// Has the hypervisor map the guest RAM whose host memory `block` is
+    /// (a transparent huge page that a guest write's first access just
+    /// committed, `wick_mm::commit_block_on_access`), clipped to the slot
+    /// that holds `gpa`, the written address: Linux's huge page fault maps
+    /// the whole 2 MiB at once (mm/huge_memory.c,
+    /// `__do_huge_pmd_anonymous_page`), where WHP would otherwise take a
+    /// fault inside the hypervisor at each 4 KiB page's first access
+    /// (LAZYGRAIN on a PC: a 2 MiB block written page by page took 3.7 ms
+    /// in its run call, a `Populate` of it 92 us). Not for a read-only slot
+    /// or one logging dirty pages, whose log would then hold the whole
+    /// block where KVM logs the pages written. Advice only: a refusal is
+    /// reported once per error code and the guest's accesses fault in as
+    /// before.
+    pub(crate) fn populate_huge_page(&self, gpa: u64, block: core::ops::Range<usize>) {
+        let range = {
+            let memory = self.memory.lock().unwrap();
+            let Some(s) = memory.values().find(|s| gpa >= s.guest_phys && gpa < s.guest_phys + s.size) else {
+                return;
+            };
+            if s.readonly || s.log_dirty {
+                return;
+            }
+            let from = (block.start as u64).max(s.host);
+            let to = (block.end as u64).min(s.host + s.size);
+            if from >= to {
+                return;
+            }
+            whv::WHV_MEMORY_RANGE_ENTRY { GuestAddress: s.guest_phys + (from - s.host), SizeInBytes: to - from }
+        };
+        let advice = whv::WHV_ADVISE_GPA_RANGE_POPULATE {
+            Flags: whv::WHV_ADVISE_GPA_RANGE_POPULATE_FLAGS { AsUINT32: 0 },
+            AccessType: whv::WHvMemoryAccessWrite,
+        };
+        #[cfg(any(test, feature = "whp-trace"))]
+        let before = ffi::trace::stack();
+        // SAFETY: one range and an advice buffer of the size given.
+        let hres = unsafe {
+            whv::WHvAdviseGpaRange(
+                self.part,
+                &range,
+                1,
+                whv::WHvAdviseGpaRangeCodePopulate,
+                (&raw const advice).cast(),
+                u32::try_from(std::mem::size_of_val(&advice)).unwrap(),
+            )
+        };
+        #[cfg(any(test, feature = "whp-trace"))]
+        ffi::trace::note("WHvAdviseGpaRange", 0, &[], None, before, hres);
+        if hres != 0 && self.populate_failure.swap(hres, Ordering::Relaxed) != hres {
+            ffi::report(
+                log::Level::Warn,
+                &format!(
+                    "whp: WHvAdviseGpaRange(Populate) of the {} KiB of guest RAM at {:#x} failed: HRESULT {:#010x}; \
+                     its pages are mapped at their first accesses instead",
+                    range.SizeInBytes / 1024,
+                    range.GuestAddress,
+                    hres as u32
+                ),
+            );
+        }
     }
 
     /// The slot table, for what the backend writes into guest RAM as KVM
@@ -640,6 +705,7 @@ impl VmInner {
             has_irqchip: AtomicBool::new(false),
             halt_wake: (Mutex::new(0), Condvar::new()),
             request_failure: AtomicI32::new(0),
+            populate_failure: AtomicI32::new(0),
             bp_window: (Mutex::new(Exits::default()), Condvar::new()),
             bp_owner: AtomicI64::new(-1),
         })

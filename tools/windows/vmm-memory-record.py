@@ -70,10 +70,11 @@ besides the VMMMEM lines:
               GUEST_WORK (a 32 MiB file and 32 sparse pages of tmpfs): what
               is committed (the job's memory limit counts it) and resident
               (Linux's Rss), and what the guest's first accesses would be at
-              each commit grain: the 64 KiB blocks committed (today's grain:
-              one first access each, a vCPU's exit or the VMM's own), the
-              4 KiB pages resident (a 4 KiB grain's) and the 2 MiB ranges
-              with any page committed (a 2 MiB grain's). Linux's figures for
+              each commit grain: the 64 KiB blocks committed (the grain
+              before), the 4 KiB pages resident (today's grain without
+              MADV_HUGEPAGE: one first access each, a vCPU's exit or the
+              VMM's own) and the 2 MiB ranges with any page committed (a
+              2 MiB grain's, huge_pages Transparent's for writes). Linux's figures for
               the same guest and work are tools/linux/guest-ram-record.py's
               (GUESTRAM lines)
 
@@ -420,7 +421,7 @@ def grain_counts(committed, resident):
 def guest_line(counts):
     """A VMMGUEST line's text for `grain_counts`' result."""
     return (f"committed {counts['committed'] // 1024} KiB, resident {counts['resident'] // 1024} KiB; first accesses "
-            f"by grain: 64 KiB blocks {counts['blocks']} (today), 4 KiB pages {counts['pages']}, "
+            f"by grain: 64 KiB blocks {counts['blocks']}, 4 KiB pages {counts['pages']} (today), "
             f"2 MiB ranges {counts['ranges']}")
 
 
@@ -1181,8 +1182,8 @@ def selftest():
     mib = 1 << 20
     counts = grain_counts([(0, GRANULE), (2 * mib - GRANULE, 2 * GRANULE), (5 * mib, PAGE)], [0, 2 * mib])
     assert counts == {"committed": 3 * GRANULE + PAGE, "resident": 2 * PAGE, "blocks": 4, "pages": 2, "ranges": 3}, counts
-    assert guest_line(counts) == ("committed 196 KiB, resident 8 KiB; first accesses by grain: 64 KiB blocks 4 (today), "
-                                  "4 KiB pages 2, 2 MiB ranges 3"), guest_line(counts)
+    assert guest_line(counts) == ("committed 196 KiB, resident 8 KiB; first accesses by grain: 64 KiB blocks 4, "
+                                  "4 KiB pages 2 (today), 2 MiB ranges 3"), guest_line(counts)
     assert "WICK-$((6*7))-WORKED" in GUEST_WORK and "WICK-42-WORKED" not in GUEST_WORK
     print("vmm-memory-record.py: selftest ok")
 
