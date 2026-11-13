@@ -114,7 +114,12 @@ mod windows {
         /// written directly.
         pub fn opened(file: File, path: &Path) -> io::Result<OutFile> {
             Ok(OutFile(match OutPipe::from_file(file, path)? {
-                Ok(pipe) => Kind::Pipe(pipe),
+                Ok(pipe) => {
+                    // A pipe made again under the name that is not taken
+                    // for the reader's (another owner's) is in the log, once.
+                    std::os::fifo::set_report(report);
+                    Kind::Pipe(pipe)
+                }
                 Err(file) => Kind::File(file),
             }))
         }
@@ -125,6 +130,12 @@ mod windows {
                 Kind::Pipe(p) => p.write(buf),
             }
         }
+    }
+
+    /// `wick_os::fifo`'s line about a pipe it did not take, through
+    /// Firecracker's logger (not rate-limited: it comes once).
+    fn report(line: &str) {
+        crate::logger::warn_unrestricted!("{line}");
     }
 
     /// `file` as an [`OutFile`] written directly, whatever it is (tests

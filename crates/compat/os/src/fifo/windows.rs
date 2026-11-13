@@ -4,18 +4,52 @@
 //! The named pipe behind [`super::Queue`], and the relay.
 //!
 //! [`OutPipe`] is the client end of the pipe a path names, made
-//! non-blocking, with the overflow. Windows gives a client handle nothing
-//! to wait on for room in the pipe, nor for a pipe of a name to be made
-//! (`WaitNamedPipe` fails at once while no pipe of the name exists), so the
-//! relay thread looks: every [`PERIOD`] while bytes wait and nothing moves,
-//! every millisecond while they move. It sleeps while nothing waits. A
-//! write moves what waits too, before it queues behind it.
+//! non-blocking, with the overflow: the reader made the pipe
+//! (`CreateNamedPipe`) and Firecracker opened it by its name (`CreateFile`).
+//! The relay thread waits for two things, and Windows gives a pipe's client
+//! nothing to wait on for either (Microsoft Learn, read 2026-11-13):
+//!
+//! - A pipe of the name made again. `WaitNamedPipe` waits for a free
+//!   instance of a pipe that exists: "If no instances of the specified
+//!   named pipe exist, the WaitNamedPipe function returns immediately,
+//!   regardless of the time-out value" (WaitNamedPipeA). The connection
+//!   that can be waited for, an overlapped `ConnectNamedPipe`, is the
+//!   server's, the reader's here.
+//! - Room in the reader's pipe. Nothing signals it. The one wait there is
+//!   is a write itself, on a blocking-wait handle: it "cannot succeed until
+//!   sufficient space is created in the buffer by a thread reading from the
+//!   other end of the pipe" (Named Pipe Type, Read, and Wait Modes), and
+//!   with overlapped I/O its completion sets an event (Synchronous and
+//!   Overlapped Pipe I/O). The relay cannot use it. The wait mode is the
+//!   pipe end's, shared by every handle to it (libc's
+//!   `test_pipe_wait_mode_is_shared_by_duplicated_handles`), and a client
+//!   has one end ("after it is opened, the named pipe instance cannot be
+//!   opened by another client", CreateFileW), so the writers' writes, whose
+//!   results as non-blocking ones are measured ([`super::Pipe`]), would
+//!   wait as well. And a write that waits must be cancelled when the
+//!   `OutPipe` is dropped or the process ends: CancelIoEx's page gives a
+//!   cancelled operation's status (`ERROR_OPERATION_ABORTED`) and not how
+//!   many of its bytes the reader had taken, so a byte could reach the
+//!   reader twice or never.
+//!
+//! So the relay thread looks: every [`PERIOD`] while bytes wait and
+//! nothing moves, every millisecond while they move. It sleeps, on a
+//! condition variable a write signals, while nothing waits. A write moves
+//! what waits too, before it queues behind it.
 //!
 //! A new reader is a pipe of the same name whose owner is the first pipe's
 //! owner ([`owner_of`]): on Linux the next reader opens the same FIFO,
 //! which the file system's permissions guard; a Windows pipe name is free
 //! for any process once its pipe has ended, so the name alone would hand
-//! what waits to whoever makes it first.
+//! what waits to whoever makes it first. A pipe of the name that is not
+//! taken (another owner's, or one that cannot be opened or asked) is
+//! reported once, through [`set_report`]'s function (Firecracker's logger)
+//! or on standard error, and again only after a reader's pipe was taken in
+//! between. The owner is known only once the pipe is open, so the pipe is
+//! opened at the anonymous impersonation level (`SECURITY_SQOS_PRESENT`
+//! with `SECURITY_ANONYMOUS`, CreateFileW; "The server cannot impersonate
+//! or identify the client", Impersonation Levels): whoever made it learns
+//! that a client came, and nothing of Firecracker's identity.
 //!
 //! Differences from Linux that Windows leaves: bytes a reader left unread
 //! in its pipe end with that pipe (Linux keeps them for the next reader);
@@ -30,18 +64,19 @@ use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, IntoRawHandle};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE,
-    GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{GetLengthSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING, WriteFile,
+    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING, SECURITY_ANONYMOUS,
+    SECURITY_SQOS_PRESENT, WriteFile,
 };
 use windows_sys::Win32::System::Pipes::{PIPE_NOWAIT, PIPE_READMODE_BYTE, SetNamedPipeHandleState};
 
@@ -58,6 +93,25 @@ pub const DRAIN_STALL: Duration = Duration::from_secs(1);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Where a pipe that is not taken for a reader's is reported.
+static REPORT: OnceLock<fn(&str)> = OnceLock::new();
+
+/// Names the function that gets the line about a pipe of a path's name
+/// that was not taken for its reader's (Firecracker: its logger). The first
+/// call's stays; with none, the line goes to standard error. It is called
+/// by the relay thread, or by the thread of a drain, with no lock of this
+/// module held, so it may write to an [`OutPipe`] itself.
+pub fn set_report(report: fn(&str)) {
+    let _ = REPORT.set(report);
+}
+
+fn report(line: &str) {
+    match REPORT.get() {
+        Some(report) => report(line),
+        None => eprintln!("{line}"),
+    }
 }
 
 /// The client end of a reader's pipe.
@@ -160,12 +214,18 @@ struct Shared {
     /// The first pipe's owner: a later pipe of the name is the reader's
     /// only if it has the same.
     owner: Vec<u8>,
+    /// A pipe of the name was not taken and that was reported: not again
+    /// until a reader's pipe is.
+    refused: AtomicBool,
 }
 
 impl Shared {
-    /// The pipe of the path's name, if there is one now, it has a free
-    /// instance, and it is the first reader's owner's.
-    fn reopen(&self) -> Option<Client> {
+    /// The pipe of the path's name, if there is one now with a free
+    /// instance (`ERROR_FILE_NOT_FOUND` without a pipe of the name,
+    /// `ERROR_PIPE_BUSY` when "all pipe instances are currently connected",
+    /// CreateFileW) and it is the first reader's owner's. The error: why a
+    /// pipe that is there was not taken.
+    fn reopen(&self) -> Result<Option<Client>, String> {
         // SAFETY: a NUL-terminated path; no security attributes or template.
         let h = unsafe {
             CreateFileW(
@@ -174,36 +234,70 @@ impl Shared {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                0,
+                // Whoever made this pipe is not known yet: it gets nothing
+                // of the client's identity (see the module's comment).
+                SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
                 std::ptr::null_mut(),
             )
         };
         if h == INVALID_HANDLE_VALUE {
-            return None;
+            // SAFETY: plain call.
+            return match unsafe { GetLastError() } {
+                ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY => Ok(None),
+                e => Err(format!("it cannot be opened: {}", io::Error::from_raw_os_error(e.cast_signed()))),
+            };
         }
         // SAFETY: plain call.
         if unsafe { GetFileType(h) } != FILE_TYPE_PIPE {
             // SAFETY: our handle.
             unsafe { CloseHandle(h) };
-            return None;
+            return Err("it is no pipe".into());
         }
-        let client = Client::adopt(h).ok()?;
-        (owner_of(client.h).ok()? == self.owner).then_some(client)
+        let client = Client::adopt(h).map_err(|e| format!("it cannot be made non-blocking or asked its size: {e}"))?;
+        let owner = owner_of(client.h).map_err(|e| format!("its owner cannot be read: {e}"))?;
+        if owner != self.owner {
+            return Err("its owner is not the owner of the pipe Firecracker opened first".into());
+        }
+        Ok(Some(client))
     }
 
     /// One pass of the relay: a new reader's pipe taken if the last one
     /// ended, and the overflow's front moved. The bytes moved, and whether
-    /// a reader's pipe is held.
+    /// a reader's pipe is held. Nothing once the writer has gone.
     fn step(&self) -> (usize, bool) {
+        let mut refusal = None;
         let mut q = lock(&self.queue);
-        if !q.connected()
-            && let Some(client) = self.reopen()
-        {
-            q.connect(client);
+        if q.closed() {
+            return (0, false);
+        }
+        if !q.connected() {
+            match self.reopen() {
+                Ok(Some(client)) => {
+                    q.connect(client);
+                    self.refused.store(false, Ordering::Release);
+                }
+                Ok(None) => {}
+                Err(why) => {
+                    if !self.refused.swap(true, Ordering::AcqRel) {
+                        refusal = Some(why);
+                    }
+                }
+            }
         }
         let moved = q.relay();
-        self.queued.store(q.queued(), Ordering::Release);
-        (moved, q.connected())
+        let (queued, connected) = (q.queued(), q.connected());
+        self.queued.store(queued, Ordering::Release);
+        drop(q);
+        if let Some(why) = refusal {
+            // With no lock held: the line may be written to this very pipe.
+            let path = OsString::from_wide(&self.path[..self.path.len() - 1]);
+            report(&format!(
+                "The pipe {} was made again and is not taken for its reader's: {why}. The {queued} bytes that wait \
+                 for a reader of it stay in Firecracker.",
+                path.to_string_lossy()
+            ));
+        }
+        (moved, connected)
     }
 
     /// The orderly end's drain: the overflow moved while a reader takes
@@ -241,10 +335,22 @@ impl OutPipe {
         }
         let client = Client::adopt(file.into_raw_handle())?;
         let owner = owner_of(client.h)?;
+        Ok(Ok(Self::with_owner(client, path, owner)?))
+    }
+
+    /// The `OutPipe` of `client`, the pipe `path` names, whose later
+    /// readers' pipes are those `owner` owns.
+    fn with_owner(client: Client, path: &Path, owner: Vec<u8>) -> io::Result<OutPipe> {
         let path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        let shared = Arc::new(Shared { queue: Mutex::new(Queue::new(client)), queued: AtomicUsize::new(0), path, owner });
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue::new(client)),
+            queued: AtomicUsize::new(0),
+            path,
+            owner,
+            refused: AtomicBool::new(false),
+        });
         relay::register(&shared)?;
-        Ok(Ok(OutPipe(shared)))
+        Ok(OutPipe(shared))
     }
 
     /// A write with a Linux FIFO's results ([`Queue::write`]). What waits
@@ -278,9 +384,15 @@ impl OutPipe {
 
 impl Drop for OutPipe {
     /// An `OutPipe` dropped (a serial device's, with its VM) is drained
-    /// first: on Linux its bytes are in the FIFO already.
+    /// first: on Linux its bytes are in the FIFO already. Then its end of
+    /// the reader's pipe is closed, here and now, as `close` closes a
+    /// descriptor: the relay thread may hold the rest a moment longer, and
+    /// the reader must see the pipe's end when the drop returns.
     fn drop(&mut self) {
         self.0.drain();
+        let mut q = lock(&self.0.queue);
+        q.close();
+        self.0.queued.store(0, Ordering::Release);
     }
 }
 
@@ -308,6 +420,8 @@ mod relay {
         /// Set by a write that left bytes waiting.
         pending: Mutex<bool>,
         wake: Condvar,
+        /// The thread runs and the drain is registered with `atexit`.
+        started: Mutex<bool>,
     }
 
     static RELAY: OnceLock<Relay> = OnceLock::new();
@@ -323,18 +437,25 @@ mod relay {
     }
 
     pub(super) fn register(shared: &Arc<Shared>) -> io::Result<()> {
-        let mut fresh = false;
-        let relay = RELAY.get_or_init(|| {
-            fresh = true;
-            Relay { pipes: Mutex::new(Vec::new()), pending: Mutex::new(false), wake: Condvar::new() }
+        let relay = RELAY.get_or_init(|| Relay {
+            pipes: Mutex::new(Vec::new()),
+            pending: Mutex::new(false),
+            wake: Condvar::new(),
+            started: Mutex::new(false),
         });
-        if fresh {
-            std::thread::Builder::new().name("fc_fifo".into()).spawn(move || run(relay))?;
+        // A pipe is opened only with the drain registered and the thread
+        // running: an open that could make neither fails, and the next one
+        // tries again.
+        let mut started = lock(&relay.started);
+        if !*started {
             // SAFETY: a plain extern "C" fn.
             if unsafe { atexit(at_exit) } != 0 {
                 return Err(io::Error::other("atexit refused the pipe drain"));
             }
+            std::thread::Builder::new().name("fc_fifo".into()).spawn(move || run(relay))?;
+            *started = true;
         }
+        drop(started);
         let mut pipes = lock(&relay.pipes);
         pipes.retain(|p| p.strong_count() > 0);
         pipes.push(Arc::downgrade(shared));
@@ -464,6 +585,21 @@ mod tests {
         OutPipe::from_file(file, path).unwrap().expect("a pipe")
     }
 
+    /// As [`open`], had the pipe opened first been `owner`'s (a SID's
+    /// bytes).
+    fn open_as_if_owned_by(path: &Path, owner: Vec<u8>) -> OutPipe {
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let client = Client::adopt(file.into_raw_handle()).unwrap();
+        OutPipe::with_owner(client, path, owner).unwrap()
+    }
+
+    /// The lines [`set_report`]'s function got in this process.
+    static REPORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn keep_report(line: &str) {
+        lock(&REPORTS).push(line.to_owned());
+    }
+
     /// Line `i`: 100 bytes, its number first.
     fn line(i: usize) -> Vec<u8> {
         format!("{i:099}\n").into_bytes()
@@ -553,6 +689,55 @@ mod tests {
         out.write(&line(9999)).unwrap();
         assert_eq!(out.queued(), 0, "into the reader's pipe directly");
         assert_eq!(reader.read_exactly(100), line(9999));
+    }
+
+    // A pipe made under the name by another owner than the first pipe's is
+    // not taken: nothing is written to it, what waits stays, and one line
+    // says so, however often the relay looks.
+    #[test]
+    fn test_a_pipe_of_another_owner_is_not_taken_and_is_reported_once() {
+        set_report(keep_report);
+        let p = path("owner");
+        let name = p.to_string_lossy().into_owned();
+        let reports = || lock(&REPORTS).iter().filter(|l| l.contains(&name)).cloned().collect::<Vec<_>>();
+        // The first pipe as if Everyone's (S-1-1-0): the pipes this test
+        // makes are its account's, another owner's.
+        let everyone = vec![1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        let reader = server(&p, 65536);
+        let out = open_as_if_owned_by(&p, everyone);
+        drop(reader);
+        out.write(&line(0)).unwrap();
+        assert_eq!(out.queued(), 100);
+        // No pipe of the name: nothing to report.
+        assert_eq!((out.relay_now(), reports().len()), (0, 0));
+        let other = server(&p, 65536);
+        for _ in 0..5 {
+            assert_eq!(out.relay_now(), 0);
+        }
+        let said = reports();
+        assert_eq!((out.queued(), said.len()), (100, 1), "{said:?}");
+        assert!(said[0].contains("its owner is not the owner of the pipe Firecracker opened first"), "{said:?}");
+        assert!(other.read_available(usize::MAX).is_empty(), "bytes went into another owner's pipe");
+    }
+
+    // The relay fills the reader's pipe to its last byte, whatever room
+    // the reader made: every byte written so far is there to read, as in a
+    // FIFO, while more waits than fits.
+    #[test]
+    fn test_the_relay_fills_the_pipe_to_the_byte() {
+        let p = path("fill");
+        let reader = server(&p, 4096);
+        let out = open(&p);
+        for i in 0..100 {
+            out.write(&line(i)).unwrap();
+        }
+        // 40 lines went in directly and left 96 bytes of room, less than a
+        // line: the front of the 41st is there too (a write moves what
+        // waits before it queues behind it).
+        assert_eq!((reader.available(), out.queued()), (Some(4096), 5904));
+        assert_eq!(reader.read_exactly(1001), lines(0..100)[..1001]);
+        out.relay_now();
+        assert_eq!((reader.available(), out.queued()), (Some(4096), 5904 - 1001));
     }
 
     // A write of at most 4096 bytes (PIPE_BUF) is taken whole or refused,

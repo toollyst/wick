@@ -42,7 +42,7 @@ use std::io;
 #[cfg(windows)]
 pub mod windows;
 #[cfg(windows)]
-pub use windows::{OutPipe, drain};
+pub use windows::{OutPipe, drain, set_report};
 
 /// pipe(7): what a Linux FIFO holds unread; here the reader's pipe and the
 /// overflow together.
@@ -80,12 +80,14 @@ pub struct Queue<P> {
     pipe: Option<P>,
     /// Bytes accepted and not in a reader's pipe yet, oldest first.
     ring: VecDeque<u8>,
+    /// The writer has gone ([`Queue::close`]).
+    closed: bool,
 }
 
 impl<P: Pipe> Queue<P> {
     /// The queue of a path whose reader's pipe is `pipe`.
     pub fn new(pipe: P) -> Self {
-        Queue { pipe: Some(pipe), ring: VecDeque::new() }
+        Queue { pipe: Some(pipe), ring: VecDeque::new(), closed: false }
     }
 
     /// The bytes in the overflow.
@@ -99,9 +101,27 @@ impl<P: Pipe> Queue<P> {
         self.pipe.is_some()
     }
 
-    /// A new reader's pipe, after the last one ended.
+    /// A new reader's pipe, after the last one ended. A closed queue takes
+    /// none: the pipe is dropped.
     pub fn connect(&mut self, pipe: P) {
-        self.pipe = Some(pipe);
+        if !self.closed {
+            self.pipe = Some(pipe);
+        }
+    }
+
+    /// The writer's end: its end of the reader's pipe is closed now, as a
+    /// descriptor's `close` closes it, whoever else still holds the queue,
+    /// and what waited goes with it (on Linux it stays in the FIFO; an
+    /// orderly end moves it first).
+    pub fn close(&mut self) {
+        self.closed = true;
+        self.pipe = None;
+        self.ring.clear();
+    }
+
+    /// Whether the writer has gone ([`Queue::close`]).
+    pub fn closed(&self) -> bool {
+        self.closed
     }
 
     /// The overflow's size now: a Linux FIFO's capacity less what the live
@@ -188,16 +208,24 @@ impl<P: Pipe> Queue<P> {
 
     /// Moves the front of the overflow into the reader's pipe, as much as
     /// it takes now, in pieces it can take whole. The bytes moved. A pipe
-    /// that fails is over: the bytes stay for the next reader's.
+    /// that fails, whatever the failure, is over for the queue: the bytes
+    /// it did not take stay for the next reader's (their writer was told
+    /// they were accepted, so the failure is no later write's to get).
     pub fn relay(&mut self) -> usize {
         let Some(pipe) = self.pipe.as_mut() else { return 0 };
-        let atom = Self::atom(pipe.quota());
+        // The pipe takes a piece whole or not at all and does not say how
+        // much room it has: a piece it refuses is tried at half the size,
+        // down to one byte, so that the pipe is filled to its last byte, as
+        // a FIFO's reader finds every byte written so far. (Bytes have no
+        // boundaries in a pipe: where a piece ends is nobody's to see.)
+        let mut size = Self::atom(pipe.quota());
         let mut moved = 0;
         while !self.ring.is_empty() {
             let (front, _) = self.ring.as_slices();
-            let piece = &front[..front.len().min(atom)];
+            let piece = &front[..front.len().min(size)];
             match pipe.write(piece) {
-                Ok(0) => break,
+                Ok(0) if piece.len() == 1 => break,
+                Ok(0) => size = piece.len() / 2,
                 Ok(n) => {
                     self.ring.drain(..n);
                     moved += n;
@@ -495,5 +523,52 @@ mod tests {
         assert_eq!((q.queued(), r.borrow().held.len()), (0, 0));
         q.write(&line(1)).unwrap();
         assert_eq!(read(&r, 100), line(1));
+    }
+
+    // A pipe that fails while the overflow is moved into it is over, and
+    // the bytes it did not take are the next reader's, in order, once.
+    #[test]
+    fn test_a_pipe_that_fails_under_the_relay_leaves_the_bytes_for_the_next() {
+        for gone in [false, true] {
+            let (p, r) = pipe(4096);
+            let mut q = Queue::new(p);
+            for i in 0..100 {
+                q.write(&line(i)).unwrap();
+            }
+            // 40 lines in the pipe (96 bytes free), 60 waiting; the reader
+            // takes 1000 bytes and the relay fills the pipe again, to the
+            // byte.
+            let mut got = read(&r, 1000);
+            assert_eq!((q.relay(), q.queued(), r.borrow().held.len()), (1096, 4904, 4096));
+            got.extend(read(&r, usize::MAX));
+            if gone {
+                r.borrow_mut().closed = true;
+            } else {
+                r.borrow_mut().fail = Some(5);
+            }
+            assert_eq!((q.relay(), q.queued(), q.connected()), (0, 4904, false), "gone: {gone}");
+            let (p, r) = pipe(65536);
+            q.connect(p);
+            assert_eq!((q.relay(), q.queued()), (4904, 0));
+            got.extend(read(&r, usize::MAX));
+            assert!(got == (0..100).flat_map(line).collect::<Vec<u8>>(), "gone: {gone}: the lines came back otherwise");
+        }
+    }
+
+    // A closed queue holds no pipe and no byte, takes no new pipe, and
+    // moves nothing.
+    #[test]
+    fn test_a_closed_queue_holds_nothing_and_takes_no_pipe() {
+        let (p, r) = pipe(100);
+        let mut q = Queue::new(p);
+        q.write(&line(0)).unwrap();
+        q.write(&line(1)).unwrap();
+        assert_eq!((q.queued(), q.connected(), q.closed()), (100, true, false));
+        q.close();
+        assert_eq!((q.queued(), q.connected(), q.closed()), (0, false, true));
+        let (p, r2) = pipe(4096);
+        q.connect(p);
+        assert_eq!((q.connected(), q.relay()), (false, 0));
+        assert_eq!((read(&r, usize::MAX), read(&r2, usize::MAX)), (line(0), Vec::new()));
     }
 }
