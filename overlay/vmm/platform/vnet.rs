@@ -489,7 +489,13 @@ struct L4 {
 }
 
 /// The TCP or UDP header of an IP packet that is not a fragment, if the
-/// frame holds all of it.
+/// frame holds all of it. A TCP header is at least 20 bytes (a data offset
+/// of 5 or more): Linux takes a shorter one for no TCP header at all, in
+/// GRO (`tcp_gro_receive`, net/ipv4/tcp_offload.c, v6.1, :202 to :204,
+/// which merges nothing into it), in segmentation (`tcp_gso_segment`, :71
+/// to :73, which fails, so that `validate_xmit_skb` drops the skb,
+/// net/core/dev.c :3671 to :3673 and :3703 to :3706) and on receipt
+/// (`tcp_v4_rcv`, net/ipv4/tcp_ipv4.c :1948, a bad packet).
 fn parse_l4(frame: &[u8]) -> Option<L4> {
     let l3 = parse_l3(frame)?;
     let ip = &frame[l3.off..];
@@ -506,12 +512,15 @@ fn parse_l4(frame: &[u8]) -> Option<L4> {
     let (csum_offset, len) = match l3.proto {
         IPPROTO_TCP => {
             let doff = usize::from(*frame.get(off + 12)? >> 4) * 4;
+            if doff < 20 {
+                return None;
+            }
             (16, doff)
         }
         IPPROTO_UDP => (6, 8),
         _ => return None,
     };
-    if len < 8 || off + len > end {
+    if off + len > end {
         return None;
     }
     Some(L4 {
@@ -633,11 +642,14 @@ fn superframe_mss(l4: &L4, mtu: usize) -> Option<usize> {
 ///   `DATA_VALID` has its checksum completed, since the backend need not
 ///   have left a complete one.
 /// - Other frames up to the MTU (not TCP or UDP, fragments, a UDP datagram
-///   over IPv4 without a checksum) are given as they are, with no flags.
+///   over IPv4 without a checksum, a TCP header under 20 bytes) are given
+///   as they are, with no flags.
 /// - A frame over the MTU that is not a TCP superframe whose IP length is
-///   the frame's, whose checksum the backend checked or that is correct, is
-///   [`Rx::Drop`]: a TAP is never given one, and its checksum field is not
-///   one the guest could check.
+///   the frame's, whose TCP header is at least 20 bytes, and whose checksum
+///   the backend checked or that is correct, is [`Rx::Drop`]: a TAP is
+///   never given one, and its checksum field is not one the guest could
+///   check. So every frame answered [`Rx::Segment`] is one [`rx_segment`]
+///   splits.
 pub fn rx_offload(
     frame: &mut [u8],
     data_valid: bool,
@@ -1117,6 +1129,40 @@ mod tests {
         // An MTU with no room for payload after the headers.
         let mut f = rx_tcp(false, 0x10, 40000);
         assert_eq!(rx_offload(&mut f, true, 52, ALL, &host), Rx::Drop);
+    }
+
+    /// A TCP header under 20 bytes (data offsets 0 to 4) is no TCP header to
+    /// Linux: over the MTU such a frame is no superframe and is dropped, so
+    /// it is never answered `Segment`, which `rx_segment` refuses (fuzz
+    /// `vnet_segment`'s crash in CI run 43486495448: data offset 4, IP
+    /// length 640, MTU 168, no offloads); up to the MTU it is given as it
+    /// came, with no flags, even from the host with a correct checksum.
+    #[test]
+    fn test_rx_tcp_header_under_20_bytes_is_no_tcp_header() {
+        for v6 in [false, true] {
+            let l4 = if v6 { 54 } else { 34 };
+            for doff in 0..5u8 {
+                let short = |mut f: Vec<u8>| {
+                    f[l4 + 12] = doff << 4 | 0x0f;
+                    f
+                };
+                for (mtu, offloads) in [(168, 0), (168, ALL), (MTU, 0), (MTU, ALL)] {
+                    let orig = short(rx_tcp(v6, 0x10, 40000));
+                    let mut f = orig.clone();
+                    let got = rx_offload(&mut f, true, mtu, offloads, &host);
+                    assert_eq!(got, Rx::Drop, "v6 {v6} doff {doff} mtu {mtu}");
+                    assert_eq!(f, orig);
+                }
+                let mut f = short(rx_tcp(v6, 0x10, 100));
+                fill(&mut f, 16);
+                let orig = f.clone();
+                for data_valid in [false, true] {
+                    let got = rx_offload(&mut f, data_valid, MTU, ALL, &host);
+                    assert_eq!(got, Rx::Frame(VnetHdr::default()), "v6 {v6} doff {doff}");
+                    assert_eq!(f, orig);
+                }
+            }
+        }
     }
 
     #[test]

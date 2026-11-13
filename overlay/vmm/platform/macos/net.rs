@@ -920,28 +920,38 @@ impl Tap {
             let host = iface.host_addresses();
             let (theirs, frame) = self.rx[..n].split_at_mut(vmnet::VNET_HDR_LEN.min(n));
             let data_valid = theirs.first().is_some_and(|flags| flags & vnet::F_DATA_VALID != 0);
-            match vnet::rx_offload(frame, data_valid, mtu, offloads, &|a| host.contains(&a)) {
+            let mut segments = Vec::new();
+            let kept = match vnet::rx_offload(frame, data_valid, mtu, offloads, &|a| host.contains(&a)) {
                 vnet::Rx::Frame(hdr) => return copy_out(buffer, hdr_len, &hdr, frame),
+                // All the segments or none: a superframe the kernel fails
+                // to segment is dropped whole and counted
+                // (`validate_xmit_skb`, net/core/dev.c, v6.1, :3671 to
+                // :3673 and :3703 to :3706), never a read error. rx_offload
+                // answers Segment only for what rx_segment splits
+                // (test_rx_tcp_header_under_20_bytes_is_no_tcp_header).
                 vnet::Rx::Segment => {
-                    let pending = &mut self.pending;
-                    vnet::rx_segment(frame, mtu, offloads, &mut self.scratch, &mut |hdr, seg| {
-                        pending.push_back((*hdr, seg.to_vec()));
+                    let mut keep = |hdr: &VnetHdr, seg: &[u8]| {
+                        segments.push((*hdr, seg.to_vec()));
                         Ok(())
-                    })?;
+                    };
+                    vnet::rx_segment(frame, mtu, offloads, &mut self.scratch, &mut keep).is_ok()
                 }
-                vnet::Rx::Drop => {
-                    self.dropped += 1;
-                    let count = self.dropped.to_string();
-                    if count.starts_with('1') && count[1..].chars().all(|c| c == '0') {
-                        crate::logger::warn!(
-                            "{}: dropped a {}-byte frame vmnet delivered that a TAP is never given (over \
-                             the MTU {mtu}, not a TCP superframe with a checksum vmnet or this side \
-                             checked); {} so far",
-                            self.name,
-                            frame.len(),
-                            self.dropped
-                        );
-                    }
+                vnet::Rx::Drop => false,
+            };
+            if kept {
+                self.pending.extend(segments);
+            } else {
+                self.dropped += 1;
+                let count = self.dropped.to_string();
+                if count.starts_with('1') && count[1..].chars().all(|c| c == '0') {
+                    crate::logger::warn!(
+                        "{}: dropped a {}-byte frame vmnet delivered that a TAP is never given (over \
+                         the MTU {mtu}, not a TCP superframe with a checksum vmnet or this side \
+                         checked); {} so far",
+                        self.name,
+                        frame.len(),
+                        self.dropped
+                    );
                 }
             }
         }
