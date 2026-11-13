@@ -4551,7 +4551,42 @@ mod macos {
             // SAFETY: plain calls on a descriptor this function opens.
             unsafe {
                 let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-                assert!(fd >= 0);
+                // A run on macOS 26 (CI 43435331370) saw this fail in 3 of
+                // the 16-at-a-time children of
+                // test_unfiltered_syscalls_are_limited_by_their_rule, with
+                // the errno unknown: it says why, and how many terminals
+                // the host has against its limit. In XNU (xnu-12377.1.9),
+                // ENXIO is the limit (tty_dev.c ptcopen, tty_ptmx.c
+                // ptmx_get_ioctl), and -6 (EREDRIVEOPEN, sys/errno.h) the
+                // minor two openers raced for (tty_ptmx.c ptmx_clone),
+                // returned once vn_open_auth's 10 retries run out
+                // (vfs_vnops.c).
+                if fd < 0 {
+                    let err = std::io::Error::last_os_error();
+                    let mut max: libc::c_int = 0;
+                    let mut len = size_of_val(&max);
+                    let max = if libc::sysctlbyname(
+                        c"kern.tty.ptmx_max".as_ptr(),
+                        (&raw mut max).cast(),
+                        &raw mut len,
+                        std::ptr::null_mut(),
+                        0,
+                    ) == 0
+                    {
+                        max.to_string()
+                    } else {
+                        format!("unread ({})", std::io::Error::last_os_error())
+                    };
+                    let nodes = std::fs::read_dir("/dev").map(|d| {
+                        d.filter_map(Result::ok)
+                            .filter(|e| e.file_name().as_encoded_bytes().starts_with(b"ttys"))
+                            .count()
+                    });
+                    panic!(
+                        "posix_openpt: {err} (errno {:?}); kern.tty.ptmx_max {max}; /dev/ttys* nodes: {nodes:?}",
+                        err.raw_os_error()
+                    );
+                }
                 assert_eq!(libc::grantpt(fd), 0);
                 assert_eq!(libc::unlockpt(fd), 0);
                 let name = libc::ptsname(fd);
