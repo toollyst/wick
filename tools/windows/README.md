@@ -152,8 +152,9 @@ GitHub's Windows runner has WHP and boots Linux (first seen in CI run
 every push, from the kit the `windows` job uploaded, in Windows PowerShell
 5.1 as on a PC:
 
-- `boot-test.ps1`: every stage but `foreign-snapshot`; `hugepages`, `gdb`
-  and `linux-snapshot` in steps of their own. `linux-snapshot` is given the
+- `boot-test.ps1`: `-Stage all,diff-nospace -Except hugepages`, the stages
+  of a PC's default run and `diff-nospace`; `hugepages`, `gdb` and
+  `linux-snapshot` in steps of their own. `linux-snapshot` is given the
   snapshot the `linux-boot` job of the same run made (artifact
   `linux-snapshot`). `hugepages` needs "Lock pages in memory" in a logon made after the
   right was given: the job gives it to the runner's account and runs the
@@ -216,7 +217,10 @@ the firmware, and nothing else installed: the script is Windows PowerShell 5.1.
    About ten minutes; the first run downloads 145 MB (kernel and rootfs).
    It prints PASS or FAIL per stage with the reason and ends with the path
    of `results-<time>.zip` in `%LOCALAPPDATA%\wick-boot-test`.
-   `-Stage boot,net` runs some stages; `-SelfTest` checks the script itself
+   `-Stage boot,net` runs some stages and `-Except` leaves some out; the
+   default, `all`, is every stage that needs no input or setting (not
+   `diff-nospace`, `linux-snapshot`, `foreign-snapshot`, `gdb`, each named
+   below with what it needs); `-SelfTest` checks the script itself
    in seconds, without WHP.
 
 4. **The probes.** In the same folder (`cmd /c` keeps the output plain text):
@@ -259,7 +263,7 @@ returns; a stage that leaves any other value unread fails as a script error nami
 | `cli` | exit codes 153 (bad arguments), 152 (bad `--level`), 1 (bad configuration file), without a guest; `--module`; the start time metrics of `--start-time-us`, `--start-time-cpu-us`, `--parent-cpu-time-us`; the log and the metrics on named pipes (the counterpart of a FIFO), with a pipe nobody reads and pipes whose readers leave and come back; `--boot-timer` with upstream's `/usr/local/bin/init` |
 | `tools` | `rebase-snap` and `snapshot-editor edit-memory rebase` on a sparse and a dense synthetic diff file (the dense one refused, the base untouched), without a guest; then a diff snapshot (written as a sparse file) rebased by both alike and restored; `snapshot-editor info-vmstate` `version`, `vcpu-states`, `vm-state`; the state file with the aarch64 magic or a newer version refused at the load |
 | `no-seccomp` | without `--no-seccomp` the setup-phase mitigations are in force in Firecracker and the whole profile in its API process; with it none in either. Before a boot (no guest), then with a guest running |
-| `foreign-snapshot` | a state file made on another host, given as `-ForeignState <file>` (the macOS boot test's snapshot stage makes an aarch64 one), is refused at the load and Firecracker ends. No guest |
+| `foreign-snapshot` | not in `all`: a state file made on another host, given as `-ForeignState <file>` (the macOS boot test's snapshot stage makes an aarch64 one), is refused at the load and Firecracker ends. No guest |
 | `cpu-templates` | a custom CPU template through `PUT /cpu-config` that clears MOVBE, BMI1 and ABM: the guest's `/proc/cpuinfo` loses exactly `movbe`, `bmi1` and `abm` on both vCPUs, also after a snapshot's restore and cpu1 taken offline and online (its spurious LAPIC timer interrupts counted, as in `smp`); a template that changes a CPUID leaf no host has is refused at the start with upstream's error; a template with a modifier of MSR 0x10a (as T2S and T2CL have) is refused at the start, naming the MSR. PASS in one run on a PC at 9af0b63 (AMD Ryzen 9 7900, Windows 11 Pro build 26300.9711) (8.3 s); not yet in a CI run |
 | `diff-nospace` | not in `all`: needs an elevated prompt. Upstream's `test_diff_snapshot_works_after_error` on a 512 MiB virtual disk (made, attached, formatted NTFS and mounted on a directory with `diskpart`) in place of its 512 MiB tmpfs: with 90% of the volume filled, a diff snapshot of a guest that wrote 100 MiB fails with Windows's error for a full volume (`os error 112`, where Linux says "No space left on device") and Firecracker stays; with the fill removed the next diff snapshot succeeds and restores, the 100 MiB as written. Written, not yet run |
 | `linux-snapshot` | not in `all`: a whole snapshot made on Linux x86_64 with KVM by the same Firecracker version, given as `-LinuxSnapshot <dir>` (the directory `tools/linux/make-vmstate.py` keeps as its fourth argument; CI's artifact `linux-snapshot`), is loaded and resumed on this test's copy of the same root drive (checked by SHA-256). A record, since upstream supports a snapshot only on the kind of host that made it: the result line says RESTORED (the shell answers, the clock runs, the drive is read, a reset exits 0) or REFUSED with Firecracker's error; a guest that resumed and does not go on fails the stage. Written, not yet run |

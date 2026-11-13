@@ -51,8 +51,8 @@
 #   no-seccomp  the mitigation profile on without --no-seccomp and off with
 #          it, in Firecracker and its API process, before a boot (no guest)
 #          and with a guest running
-#   foreign-snapshot  a state file made on another host (-ForeignState) is
-#          refused at the load (no guest)
+#   foreign-snapshot  (not in `all`: needs -ForeignState) a state file made
+#          on another host is refused at the load (no guest)
 #   cpu-templates  a custom CPU template through PUT /cpu-config: the CPUID
 #          bits it clears are gone from the guest on every vCPU, also after
 #          a restore; a template that changes a CPUID leaf the host lacks,
@@ -87,6 +87,12 @@
 #
 #   powershell -ExecutionPolicy Bypass -File boot-test.ps1 `
 #       [-Firecracker <firecracker.exe>] [-WorkDir <dir>] [-Stage boot,smp,...]
+#       [-Except hugepages,...]
+#
+# `all` is every stage that needs nothing but this script and the kit; the
+# others need an input or a setting (each says which) and are named. CI runs
+# `-Stage all,diff-nospace -Except hugepages` (hugepages and the rest in
+# steps of their own), so `all` is the same set on a PC and in CI.
 #
 # Needs: Windows 10 (1803 or later) or 11, x86_64, with "Windows Hypervisor
 # Platform" turned on (optionalfeatures.exe, or as administrator:
@@ -107,8 +113,12 @@
 param(
     [string]$Firecracker,
     [string]$WorkDir = (Join-Path $env:LOCALAPPDATA 'wick-boot-test'),
-    # Stage names, comma-separated or as a list; `all` runs every stage.
+    # Stage names, comma-separated or as a list; `all` runs every stage that
+    # needs no input or setting (not gdb, diff-nospace, linux-snapshot,
+    # foreign-snapshot), and may be given with others.
     [string[]]$Stage = @('all'),
+    # Stages to leave out of those -Stage names.
+    [string[]]$Except = @(),
     [int]$TimeoutSec = 120,
     # For the foreign-snapshot stage: a snapshot state file made on another
     # host (the macOS boot test's snapshot stage makes an aarch64 one).
@@ -3492,7 +3502,7 @@ $Stages = [ordered]@{
     gdb      = { Stage-Gdb }
 }
 # Stages `all` leaves out: they need what a plain kit does not have.
-$NotInAll = @('gdb', 'diff-nospace', 'linux-snapshot')
+$NotInAll = @('gdb', 'diff-nospace', 'linux-snapshot', 'foreign-snapshot')
 
 # --- run ------------------------------------------------------------------------
 
@@ -3609,11 +3619,15 @@ if ($SelfTest) {
 }
 
 # `-Stage boot,smp` reaches a -File script as one string.
-$selected = @($Stage | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-if ($selected -contains 'all') { $selected = @($Stages.Keys | Where-Object { $NotInAll -notcontains $_ }) }
-foreach ($s in $selected) {
+$names = { param($list) @($list | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+$selected = @(& $names $Stage | ForEach-Object {
+    if ($_ -eq 'all') { $Stages.Keys | Where-Object { $NotInAll -notcontains $_ } } else { $_ }
+} | Select-Object -Unique)
+$left = @(& $names $Except)
+foreach ($s in $selected + $left) {
     if (-not $Stages.Contains($s)) { throw "unknown stage '$s'; stages: all, $(@($Stages.Keys) -join ', ')" }
 }
+$selected = @($selected | Where-Object { $left -notcontains $_ })
 
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $WorkDir = (Resolve-Path $WorkDir).Path

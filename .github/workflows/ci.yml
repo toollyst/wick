@@ -1116,15 +1116,16 @@ jobs:
           Get-CimInstance Win32_ComputerSystem | Format-List Model, TotalPhysicalMemory, HypervisorPresent
           whoami /user /priv
           Get-ChildItem -Recurse -File lib, tools, winprobe.exe | Select-Object Length, FullName | Format-Table -AutoSize
-      # Every stage of `all` but hugepages (its own step below) and
-      # foreign-snapshot (it wants a state of another architecture, which no
-      # job makes: the summary says so), and diff-nospace, which needs the
-      # elevation this runner has. A stage that fails does not stop the
-      # others; the script's exit status fails the step.
+      # Every stage of `all`, as a PC's default run has them, but hugepages
+      # (its own step below), and diff-nospace, which needs the elevation
+      # this runner has. Not in `all`: foreign-snapshot (it wants a state of
+      # another architecture, which no job makes), linux-snapshot and gdb
+      # (steps of their own). A stage that fails does not stop the others;
+      # the script's exit status fails the step.
       - name: boot-test.ps1
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT `
-            -Stage boot,smp,block,vsock,net,snapshot,diff,diff-nospace,uffd,pci,restores,vhost-user,api-process,devices,balloon,cli,tools,no-seccomp,memory-hotplug,cpu-templates
+            -Stage all,diff-nospace -Except hugepages
           exit $LASTEXITCODE
       # The snapshot the linux-boot job of this run made (KVM, this commit's
       # build), loaded and resumed on WHP. A record: the stage's line says
