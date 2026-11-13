@@ -942,6 +942,14 @@ pub fn prefault(addr: u64, len: u64, write: bool) -> bool {
     // kernel's copy takes no exception this process could resolve).
     #[allow(clippy::cast_possible_truncation)]
     crate::windows_mm::prefault_lazy(addr as usize, len as usize);
+    prefault_registered(addr, len, write)
+}
+
+/// [`prefault`] of the registered pages alone: a write that takes the lazy
+/// memory of its buffer as it is (`windows_fd`'s, which reads untouched lazy
+/// pages as zeros without committing them) still has the missing pages of
+/// a userfaultfd's range filled first, as Linux's copy faults them.
+pub fn prefault_registered(addr: u64, len: u64, write: bool) -> bool {
     if REGISTERED.load(Ordering::Acquire) == 0 || len == 0 {
         return false;
     }

@@ -213,11 +213,17 @@ fn socket(fd: c_int) -> usize {
 }
 
 pub(crate) fn is_socket(fd: c_int) -> bool {
+    socket_type(fd).is_some()
+}
+
+/// The socket's type (Winsock's `SO_TYPE`: 1 stream, 2 datagram, ...), or
+/// `None` for a descriptor that is no socket.
+fn socket_type(fd: c_int) -> Option<c_int> {
     wick_wsa_startup();
     let mut ty: c_int = 0;
     let mut len: c_int = 4;
     // SAFETY: the option value is an `i32`; a non-socket fails.
-    unsafe {
+    let ok = unsafe {
         getsockopt(
             socket(fd),
             SOL_SOCKET,
@@ -225,7 +231,8 @@ pub(crate) fn is_socket(fd: c_int) -> bool {
             (&raw mut ty).cast(),
             &mut len,
         ) == 0
-    }
+    };
+    ok.then_some(ty)
 }
 
 /// Starts Winsock once, for calls on descriptors this process did not make.
@@ -697,12 +704,91 @@ fn errno() -> c_int {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
+/// Zeros for the untouched lazy memory of a write's buffer ([`from_lazy`]).
+static ZEROS: [u8; 64 << 10] = [0; 64 << 10];
+
+/// A write of `count` bytes at `buf` through `emit` (one write call of the
+/// target: a pointer and a length in, bytes written or -1 out), taking the
+/// buffer's lazy memory that was never committed as the zeros it reads as,
+/// without committing it. Linux's copy of a write's buffer maps its zero
+/// page for an untouched anonymous page and charges nothing (mm/memory.c
+/// v6.1 4088-4091, `do_anonymous_page`); here a system call fails on a page
+/// that is only reserved, and committing it charged the whole of a guest a
+/// snapshot wrote (the host-read plan's W1). The rest of the buffer is
+/// committed where lazy, as before ([`crate::windows_mm::prefault_lazy`]).
+///
+/// A buffer with no such page is one write, as before. Else a write of up
+/// to [`ZEROS`]' length, and a datagram, is one write of a copy (the zeros
+/// and the buffer's other bytes), so that it stays whole as Linux's is (a
+/// pipe's `PIPE_BUF`, a message); a longer one goes in pieces, the zeros
+/// from [`ZEROS`], each piece where the one before ended (`emit` moves its
+/// own offset), and stops at a short piece or an error, giving what was
+/// written or -1, as a short write does. Pieces are separate writes: a
+/// writer to the same file at the same time may land between them, where
+/// Linux's write of a regular file holds the inode's lock for the whole.
+fn from_lazy(fd: c_int, buf: *const c_void, count: usize, mut emit: impl FnMut(*const c_void, usize) -> ssize_t) -> ssize_t {
+    crate::wick_uffd::prefault_registered(buf as u64, count as u64, false);
+    let mut any = false;
+    crate::windows_mm::zero_runs(buf as usize, count, |_, _, zeros| any |= zeros);
+    if !any {
+        crate::windows_mm::prefault_lazy(buf as usize, count);
+        return emit(buf, count);
+    }
+    let mut runs = std::vec::Vec::new();
+    crate::windows_mm::zero_runs(buf as usize, count, |s, n, zeros| runs.push((s, n, zeros)));
+    // Winsock's SOCK_DGRAM.
+    if count <= ZEROS.len() || socket_type(fd) == Some(2) {
+        let mut copy = std::vec![0u8; count];
+        for &(s, n, zeros) in &runs {
+            if !zeros {
+                crate::windows_mm::prefault_lazy(s, n);
+                // SAFETY: `[s, s + n)` is part of the caller's buffer, valid
+                // for reads, and of `copy` at the same offset.
+                unsafe { std::ptr::copy_nonoverlapping(s as *const u8, copy.as_mut_ptr().add(s - buf as usize), n) };
+            }
+        }
+        return emit(copy.as_ptr().cast(), count);
+    }
+    let mut total = 0usize;
+    for (s, n, zeros) in runs {
+        let mut at = 0;
+        while at < n {
+            let (p, len) = if zeros {
+                (ZEROS.as_ptr().cast::<c_void>(), (n - at).min(ZEROS.len()))
+            } else {
+                crate::windows_mm::prefault_lazy(s + at, n - at);
+                ((s + at) as *const c_void, n - at)
+            };
+            let r = emit(p, len);
+            if r < 0 {
+                return if total > 0 { total as ssize_t } else { -1 };
+            }
+            total += r.unsigned_abs();
+            at += r.unsigned_abs();
+            if r.unsigned_abs() < len {
+                return total as ssize_t;
+            }
+        }
+    }
+    total as ssize_t
+}
+
 /// `write`.
 ///
 /// # Safety
 /// `buf` must be valid for `count` bytes of reads.
 pub unsafe fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
-    crate::wick_uffd::prefault(buf as u64, count as u64, false);
+    from_lazy(fd, buf, count, |buf, count| {
+        // SAFETY: a part of the caller's buffer, or a copy of it.
+        unsafe { write_now(fd, buf, count) }
+    })
+}
+
+/// [`write`] of a buffer whose pages a system call can read.
+///
+/// # Safety
+/// `buf` must be valid for `count` bytes of reads.
+unsafe fn write_now(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
     if let Some(limit) = grow_limit(fd) {
         let mut pos = 0i64;
         // SAFETY: queries the position.
@@ -780,9 +866,15 @@ pub unsafe fn pwrite(fd: c_int, buf: *const c_void, count: size_t, offset: off_t
         },
         None => count,
     };
-    crate::wick_uffd::prefault(buf as u64, count as u64, false);
     let h = handle(fd);
-    keeping_position(h, || write_handle(h, buf, count, Some(offset)))
+    let mut at = offset;
+    keeping_position(h, || {
+        from_lazy(fd, buf, count, |buf, count| {
+            let n = write_handle(h, buf, count, Some(at));
+            at += n.max(0) as i64;
+            n
+        })
+    })
 }
 
 /// The size a memfd sealed against growing may not exceed.
@@ -1688,6 +1780,106 @@ mod tests {
             .open(&p)
             .unwrap();
         (p, f)
+    }
+
+    /// W1: `write`, `pwrite` and `writev` take the lazy memory of their
+    /// buffer that was never committed as the zeros it reads as, without
+    /// committing it, as Linux's copy maps its zero page for it and charges
+    /// nothing: in pieces for a file (a buffer longer than the zeros' copy),
+    /// as one copy for a short write and through a pipe. The bytes written
+    /// are the buffer's, zeros where untouched; the memory's commit is what
+    /// the test touched, before and after.
+    #[test]
+    fn test_a_write_from_lazy_memory_commits_nothing() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, VirtualQuery};
+        const PAGES: usize = 256;
+        const PAGE: usize = 4096;
+        let len = PAGES * PAGE;
+        // SAFETY: lazy anonymous memory for the test, unmapped below.
+        let m = unsafe {
+            crate::windows_mm::mmap(
+                std::ptr::null_mut(),
+                len,
+                crate::PROT_READ | crate::PROT_WRITE,
+                crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(m, crate::MAP_FAILED);
+        let m = m as usize;
+        let mut want = std::vec![0u8; len];
+        for i in (0..PAGES).step_by(16) {
+            let at = i * PAGE + 7;
+            want[at] = u8::try_from(i / 16 + 1).unwrap();
+            // SAFETY: our mapping.
+            unsafe { *((m + at) as *mut u8) = want[at] };
+        }
+        let committed = || {
+            let (mut at, mut n) = (m, 0);
+            while at < m + len {
+                // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+                let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: as above.
+                assert_ne!(unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) }, 0);
+                let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(m + len) - at;
+                if mbi.State == MEM_COMMIT {
+                    n += run;
+                }
+                at += run;
+            }
+            n
+        };
+        assert_eq!(committed(), 16 * PAGE);
+        let (p, f) = temp("lazy-write");
+        let fd = fd_of(&f);
+        let iov = [
+            iovec { iov_base: (m + 100 * PAGE + 5) as *mut c_void, iov_len: 50 * PAGE },
+            iovec { iov_base: m as *mut c_void, iov_len: 3 * PAGE },
+        ];
+        // SAFETY: our mapping and descriptor.
+        unsafe {
+            assert_eq!(write(fd, m as *const c_void, len), len as ssize_t, "a write in pieces");
+            assert_eq!(pwrite(fd, (m + 30 * PAGE) as *const c_void, 8 * PAGE, (2 * len) as i64), (8 * PAGE) as ssize_t, "a copy");
+            assert_eq!(lseek(fd, len as i64, SEEK_SET), len as i64);
+            assert_eq!(writev(fd, iov.as_ptr(), 2), (53 * PAGE) as ssize_t);
+        }
+        assert_eq!(committed(), 16 * PAGE, "a write committed its buffer's untouched memory");
+        let mut file = std::vec::Vec::new();
+        std::io::Read::read_to_end(&mut std::fs::File::open(&p).unwrap(), &mut file).unwrap();
+        assert_eq!(&file[..len], &want[..], "write");
+        let at = 100 * PAGE + 5;
+        assert_eq!(&file[len..len + 50 * PAGE], &want[at..at + 50 * PAGE], "writev's first buffer");
+        assert_eq!(&file[len + 50 * PAGE..len + 53 * PAGE], &want[..3 * PAGE], "writev's second");
+        assert_eq!(&file[2 * len..], &want[30 * PAGE..38 * PAGE], "pwrite");
+        drop(f);
+        std::fs::remove_file(p).unwrap();
+        // Through a pipe, read on another thread.
+        let mut fds = [0; 2];
+        // SAFETY: a valid buffer.
+        assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0);
+        let reader = fds[0];
+        let got = std::thread::spawn(move || {
+            let mut b = std::vec![0u8; 12 * PAGE];
+            let mut n = 0;
+            while n < b.len() {
+                // SAFETY: our descriptor and buffer.
+                let r = unsafe { read(reader, b[n..].as_mut_ptr().cast(), b.len() - n) };
+                assert!(r > 0, "read {r}");
+                n += r.unsigned_abs();
+            }
+            b
+        });
+        // SAFETY: our mapping and descriptor.
+        assert_eq!(unsafe { write(fds[1], (m + 60 * PAGE) as *const c_void, 12 * PAGE) }, (12 * PAGE) as ssize_t);
+        assert_eq!(got.join().unwrap(), &want[60 * PAGE..72 * PAGE], "the pipe");
+        assert_eq!(committed(), 16 * PAGE);
+        // SAFETY: our descriptors and mapping.
+        unsafe {
+            close(fds[0]);
+            close(fds[1]);
+            assert_eq!(crate::windows_mm::munmap(m as *mut c_void, len), 0);
+        }
     }
 
     #[test]
