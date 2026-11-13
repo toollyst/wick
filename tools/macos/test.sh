@@ -13,6 +13,12 @@
 # cargo-nextest does): a test that keeps its VM alive cannot affect the next.
 # Prints one line per test and a summary; the exit status is non-zero if any
 # test failed. WICK_TEST_LOG=<file> keeps the output of failed tests there.
+#
+# The binaries are signed in place, in cargo's target directory, and stay
+# signed until cargo links them again: tools/macos/check-unit-tests.py,
+# which runs them unsigned as CI's runners do, then finds the tests that
+# need Hypervisor.framework passing ("listed ... (no-hvf) passes"). Touch a
+# source file of the crate (or rebuild) before an unsigned check.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ENTITLEMENTS="$ROOT/tools/macos/hypervisor.entitlements"

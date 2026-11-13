@@ -23,7 +23,9 @@ changes what the check asserts.
 The binaries run unsigned, as on CI's runners, which have no
 Hypervisor.framework: a test that creates a VM fails (`no-hvf`). On a Mac,
 tools/macos/test.sh runs them signed, each in a process of its own (one VM per
-process). Runs cargo in lib/firecracker. The jailer's tests need root and run
+process), signing them in place: after it, a binary cargo did not link
+again is still signed here (see test.sh). Runs cargo in lib/firecracker.
+The jailer's tests need root and run
 in their own CI step.
 """
 
