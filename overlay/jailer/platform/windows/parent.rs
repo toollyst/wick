@@ -1204,13 +1204,15 @@ mod tests {
         // a jailer: a namespace made here, opened by a second process
         // (this test program again, `holds_a_namespace_for_another_process`),
         // the maker's handle closed, and the namespace opened once more
-        // while the second process has it, then after it has gone. A
-        // record, not asserted yet: the first run (43385227122) opened it a
-        // second time in this one process, which Windows refuses with 52
-        // (`namespace`), and so measured nothing of two processes. If the
-        // line says the namespace does not outlast its maker's handle, the
-        // parents' jobs cannot be named in it: a jailer left after the
-        // tool would hold jobs the next jailer no longer finds.
+        // while the second process has it, then after it has gone.
+        // Windows Server 2025 (CI run 43388798760): the second process
+        // opens it; with the maker's handle closed the maker opens it
+        // again while the second process has it; with the second process
+        // gone and that handle closed it is not found (error 3). So a
+        // namespace lasts while any process has it open and goes with the
+        // last handle, as the parents' jobs in it do: asserted. Were it
+        // gone with its maker's handle, a jailer left after the tool would
+        // hold jobs the next jailer no longer finds.
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn ClosePrivateNamespace(handle: HANDLE, flags: u32) -> u8;
@@ -1255,7 +1257,12 @@ mod tests {
              ({ended:?}) and that handle closed, opened once more: {last:?}"
         );
         assert_eq!(made_answer, Ok(()));
-        assert!(second.starts_with("opened "), "the second process: {second}");
+        assert_eq!(here, Err(52), "a process opens a namespace it has a second time");
+        assert_eq!(second, "opened Ok(())", "the second process");
+        assert_ne!(closed, 0, "the maker's handle is not closed");
+        assert_eq!(third_answer, Ok(()), "a namespace another process has open is gone with its maker's handle");
+        assert_eq!(ended.ok(), Some(true), "the second process");
+        assert_eq!(last, Err(3), "a namespace nobody has open is still found");
         drop(operators);
     }
 

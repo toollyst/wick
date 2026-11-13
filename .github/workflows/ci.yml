@@ -905,9 +905,10 @@ jobs:
           # limits; a thread with a jail's token neither opens the private
           # namespace the parents' jobs are named in, nor makes one of its
           # boundary, nor opens a parent's job (and what that token may do
-          # in the session's own namespace, printed; and whether a namespace
+          # in the session's own namespace, printed; and a namespace
           # outlasts its maker's handle while a second process, the test
-          # program started again, has it open: printed). They assert the
+          # program started again, has it open, and is gone with the last
+          # handle: asserted since run 43388798760). They assert the
           # jailer's rules and print what Windows answered (PARENTTEST
           # lines). A jail's job under a parent has a name and, beside it,
           # what the jail was asked for, which the tool reads when a level
