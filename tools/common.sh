@@ -8,7 +8,12 @@ UPSTREAM_DIR="$WICK_ROOT/lib/firecracker"
 PATCHES_DIR="$WICK_ROOT/patches"
 UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/firecracker-microvm/firecracker.git}"
 # The local branch in lib/firecracker that holds the patch series as commits.
-WICK_BRANCH="wick"
+# `wick` unless the environment names another: a second worktree of the
+# wick checkout, whose lib/firecracker shares its branches with the first's,
+# exports and checks its own series from a branch of its own
+# (WICK_BRANCH=<branch> tools/patches.sh export|check) without moving `wick`.
+# CI and the main checkout never set it.
+WICK_BRANCH="${WICK_BRANCH:-wick}"
 
 die() {
     echo "error: $*" >&2

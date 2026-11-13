@@ -5,7 +5,8 @@
 # The patch series (CONTRIBUTING.md, "Changing upstream code").
 #
 #   tools/patches.sh export   write patches/ from the commits on branch `wick`
-#                             in lib/firecracker (one commit = one patch)
+#                             in lib/firecracker (one commit = one patch;
+#                             $WICK_BRANCH names another: tools/common.sh)
 #   tools/patches.sh check    patches/ is what `export` writes, every hunk
 #                             changed upstream file has a `wick:` comment, and
 #                             lib/firecracker is recorded at patches/base

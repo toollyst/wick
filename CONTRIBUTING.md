@@ -88,6 +88,13 @@ per feature, exported to `patches/`.
 After pulling changes to `patches/`, run `tools/setup.sh` again. It refuses to
 discard local commits on `wick` unless given `--force`.
 
+In a second worktree of the wick checkout, lib/firecracker shares its branches
+with the first one's, so `wick` is not that worktree's to move: put the
+series on a branch of its own there and name it in `WICK_BRANCH` for
+`tools/patches.sh` (and `tools/setup.sh`, `tools/rebase.sh`), for example
+`WICK_BRANCH=my-wick tools/patches.sh export`. The default is `wick`, which CI
+and the main checkout use; they never set the variable.
+
 ## No pretending
 
 - Never skip a feature the host lacks and report success. Implement the same
