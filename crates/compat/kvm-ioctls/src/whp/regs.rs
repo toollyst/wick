@@ -937,6 +937,14 @@ pub(crate) fn supported_cpuid(num_entries: usize) -> Result<CpuId> {
         if e.function == 1 {
             e.ecx = super::apicmode::offered_leaf1_ecx(super::apicmode::PARTITION, e.ecx);
         }
+        // TSC_ADJUST (leaf 7 EBX bit 1) on every host, as KVM offers it
+        // ("TSC_ADJUST and ARCH_CAPABILITIES are emulated in software",
+        // Linux v6.1 arch/x86/kvm/cpuid.c:648-649): the vCPU keeps the MSR
+        // where the partition does not, and a guest's write moves the TSC
+        // exactly (`VcpuFd::guest_tsc_write`).
+        if e.function == 7 && e.index == 0 {
+            e.ebx |= 1 << 1;
+        }
     }
     leaves.extend(kvm_leaves());
     if leaves.len() > num_entries {
@@ -1681,6 +1689,8 @@ mod tests {
                     assert_eq!(e.ecx & (1 << 29), 0, "MWAITX");
                     assert_eq!(e.ecx & (1 << 2), 0, "SVM");
                 }
+                // TSC_ADJUST on every host, as KVM (cpuid.c:648-649).
+                (0x7, 0) => assert_ne!(e.ebx & (1 << 1), 0, "TSC_ADJUST"),
                 _ => {}
             }
         }

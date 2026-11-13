@@ -1143,7 +1143,10 @@ jobs:
           # TSC_ADJUST offered to the guest as KVM offers it (TSCADJREC
           # lines): the CPUID bit in the host, the table and the guest; the
           # guest's RDMSR/WRMSR of 0x3b and how far a write moves its TSC;
-          # the guest's WRMSR of IA32_TSC and TSC_ADJUST after it.
+          # the guest's WRMSR of IA32_TSC and TSC_ADJUST after it. Asserted
+          # where the vCPU keeps TSC_ADJUST: both writes move the TSC
+          # exactly (read with partition time suspended); printed: how far
+          # the TSCs fell behind the host's across the write.
           alone whp::vcpu::fpu_tests::test_tsc_adjust_offered_to_the_guest_on_record
           # WHP's triggers for an MSI route (TRIGREC lines), the equivalent of
           # KVM's MSI irqfd injected in the signaller's context: created for

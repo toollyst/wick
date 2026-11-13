@@ -1077,9 +1077,8 @@ impl VcpuFd {
 
     /// Writes a [`regs::software_msr`] as KVM's `kvm_set_msr_common` does
     /// (Linux 6.12): `IA32_TSC_ADJUST` is kept only when the guest's CPUID
-    /// has TSC_ADJUST, and a guest's write moves its TSC by the change and
-    /// publishes its kvm-clock again (`adjust_tsc_offset_guest`,
-    /// `KVM_REQ_CLOCK_UPDATE`); a guest's write of `IA32_MISC_ENABLE` that
+    /// has TSC_ADJUST (a guest's write of it, which moves the TSC, is
+    /// [`Self::guest_tsc_write`]'s); a guest's write of `IA32_MISC_ENABLE` that
     /// changes a read-only PMU bit is refused with #GP and leaves EMON as it
     /// was (the MWAIT quirk is KVM's default, so MWAIT is a plain bit).
     /// Returns whether the write was taken.
@@ -1088,17 +1087,11 @@ impl VcpuFd {
         const PMU_RO_MASK: u64 = (1 << 11) | (1 << 12);
         let cell = self.software_msr(index);
         if index == regs::MSR_IA32_TSC_ADJUST {
-            if !self.guest_has_tsc_adjust() {
-                return Ok(true);
+            // A guest's write, which moves the TSC, is `guest_tsc_write`'s;
+            // a host's is taken as it is (x86.c:3618, `host_initiated`).
+            if self.guest_has_tsc_adjust() {
+                cell.store(data, Ordering::Release);
             }
-            if !host {
-                let adj = data.wrapping_sub(cell.load(Ordering::Acquire));
-                let tsc = self.register(whv::WHvX64RegisterTsc)?;
-                super::ffi::set_register(self.part(), self.vp(), whv::WHvX64RegisterTsc, super::ffi::reg64(tsc.wrapping_add(adj)))?;
-                // Published again at the next entry (`update_clock`).
-                self.shared.clock_gen.store(u64::MAX, Ordering::Release);
-            }
-            cell.store(data, Ordering::Release);
             return Ok(true);
         }
         let old = cell.load(Ordering::Acquire);
@@ -1112,6 +1105,62 @@ impl VcpuFd {
         };
         cell.store(data, Ordering::Release);
         Ok(true)
+    }
+
+    /// Whether a guest's WRMSR of `index` moves its TSC here
+    /// ([`Self::guest_tsc_write`]): where the vCPU keeps `IA32_TSC_ADJUST`,
+    /// a write of it with TSC_ADJUST in the guest's CPUID (KVM ignores one
+    /// without, x86.c:3617), and a write of `IA32_TSC`, which exits there
+    /// (`vm::tsc_write_exit`). Where the partition keeps TSC_ADJUST, WHP
+    /// makes both writes itself, as the processor does.
+    fn guest_moves_tsc(&self, index: u32) -> bool {
+        regs::software_msr(regs::MSR_IA32_TSC_ADJUST)
+            && (index == regs::MSR_IA32_TSC || index == regs::MSR_IA32_TSC_ADJUST && self.guest_has_tsc_adjust())
+    }
+
+    /// A guest's WRMSR of `IA32_TSC_ADJUST` or `IA32_TSC` where the vCPU
+    /// keeps TSC_ADJUST, as KVM makes it (Linux v6.1 x86.c): TSC_ADJUST's
+    /// write moves the TSC by its change (:3616-3627,
+    /// `adjust_tsc_offset_guest`) and has kvm-clock published again
+    /// (`KVM_REQ_CLOCK_UPDATE`; here at the next entry, `update_clock`);
+    /// the TSC's sets the TSC and adds its change to TSC_ADJUST
+    /// (:3661-3667). Exact: the TSC is read and written while partition
+    /// time stands still ([`super::vm::VmInner::with_time_stopped`]), where
+    /// a read and a write of a running TSC lost the time between them (a
+    /// 1048576-tick move came to 1031279 on the PC, 1010122 on CI's EPYC:
+    /// TSCADJREC at 43832df). The
+    /// cost is every vCPU's TSC behind the host's by the time it stood
+    /// (TSCADJREC prints it), where KVM's offset loses nothing; Linux writes
+    /// TSC_ADJUST only when a CPU's differs from the boot CPU's, or after a
+    /// failed warp test (arch/x86/kernel/tsc_sync.c:231-233, :529). `false`
+    /// if the vCPU was kicked while it waited for the vCPUs: nothing is
+    /// written, and the WRMSR is made again.
+    fn guest_tsc_write(&self, index: u32, value: u64) -> Result<bool> {
+        let shared = &self.shared;
+        let adjust = &shared.tsc_adjust;
+        let tsc = || self.register(whv::WHvX64RegisterTsc);
+        let set = |v: u64| super::ffi::set_register(self.part(), self.vp(), whv::WHvX64RegisterTsc, super::ffi::reg64(v));
+        let done = shared.inner.with_time_stopped(&shared.immediate_exit, || {
+            let now = tsc()?;
+            if index == regs::MSR_IA32_TSC_ADJUST {
+                set(now.wrapping_add(value.wrapping_sub(adjust.load(Ordering::Acquire))))?;
+                adjust.store(value, Ordering::Release);
+            } else {
+                set(value)?;
+                adjust.store(adjust.load(Ordering::Acquire).wrapping_add(value.wrapping_sub(now)), Ordering::Release);
+            }
+            Ok(())
+        });
+        match done {
+            None => Ok(false),
+            Some(r) => {
+                r?;
+                if index == regs::MSR_IA32_TSC_ADJUST {
+                    shared.clock_gen.store(u64::MAX, Ordering::Release);
+                }
+                Ok(true)
+            }
+        }
     }
 
     /// CPUID.(EAX=7,ECX=0):EBX bit 1, TSC_ADJUST, in the guest's CPUID.
@@ -2450,6 +2499,14 @@ impl VcpuFd {
                     super::ffi::reg64(super::debug::pending_gp()),
                 ),
             };
+        }
+        if is_write && self.guest_moves_tsc(index) {
+            if !self.guest_tsc_write(index, value)? {
+                // Kicked while it waited to hold the vCPUs: RIP stays at the
+                // WRMSR, which is made again at the next run.
+                return Ok(());
+            }
+            return regs::set_rip(self.part(), self.vp(), rip_after);
         }
         if is_write {
             if index == MSR_TSC_DEADLINE {
@@ -7400,7 +7457,12 @@ mod fpu_tests {
     /// change, exactly, `adjust_tsc_offset_guest`); the guest's WRMSR of
     /// IA32_TSC, whether the backend sees it, and what TSC_ADJUST reads
     /// after (KVM adds the change to it, x86.c:3664-3667); KVM_GET_MSRS of
-    /// 0x3b after. Then, for an exact move and for the TSC write's exit:
+    /// 0x3b after. Asserted where the vCPU keeps TSC_ADJUST (the partition
+    /// does not): the guest's write of TSC_ADJUST moves its TSC by exactly
+    /// the change, and its write of the TSC moves it by exactly what
+    /// TSC_ADJUST changes by, both read with partition time suspended; with
+    /// how far the vCPUs' TSCs fell behind the host's across the write
+    /// (`VmInner::with_time_stopped`'s cost). Then, for an exact move and for the TSC write's exit:
     /// `WHvX64RegisterTscVirtualOffset` read and written plus the change,
     /// with the skew it made and after a run; whether WHP offers the
     /// `TscMsrWrite` exit, and whether a guest's WRMSR 0x10 comes to the
@@ -7448,23 +7510,68 @@ mod fpu_tests {
             };
             (line, value)
         };
+        let software = regs::software_msr(regs::MSR_IA32_TSC_ADJUST);
+        // vCPU 0's TSC less vCPU 1's, read with partition time suspended:
+        // exact, as both stand still.
+        let held_skew = || {
+            let (t0, t1, _) = tscs_held(part).expect("WHvSuspendPartitionTime refused");
+            t0.wrapping_sub(t1).cast_signed()
+        };
+        // vCPU 1's TSC against the host's: the least of 9 differences,
+        // which a suspension of partition time lowers by the time it stood.
+        let behind_host = || {
+            (0..9)
+                .map(|_| {
+                    // SAFETY: RDTSC has no preconditions.
+                    let host = unsafe { core::arch::x86_64::_rdtsc() };
+                    tsc_of(part, 1).wrapping_sub(host).cast_signed()
+                })
+                .min()
+                .unwrap()
+        };
+        let hz = pvclock::tsc_hz();
         let (l, adjust) = msr(&mut v0, "TSC_ADJUST", 0x3B, None);
         lines.push(l);
         let before = tsc_skew(part);
+        let held_before = held_skew();
+        let host_before = behind_host();
         let by = 0x10_0000u64;
         let (l, _) = msr(&mut v0, "TSC_ADJUST", 0x3B, Some(adjust.wrapping_add(by)));
         lines.push(l);
+        let host_after = behind_host();
+        let held_after = held_skew();
         let after = tsc_skew(part);
+        let lag = host_before - host_after;
         lines.push(format!(
-            "vCPU 0's TSC against vCPU 1's: {before:?} before, {after:?} after (skew, read gap); moved by {} for {by} written (KVM: exactly)",
-            before.0 - after.0
+            "vCPU 0's TSC against vCPU 1's: {before:?} before, {after:?} after (skew, read gap); moved by {} for {by} written \
+             (KVM: exactly); read with partition time suspended: moved by {}; vCPU 1's TSC fell behind the host's by {lag} ticks \
+             ({:.1} us) across the write",
+            before.0 - after.0,
+            held_after - held_before,
+            lag as f64 * 1e6 / hz.max(1) as f64
         ));
+        if software {
+            assert_eq!(held_after - held_before, by.cast_signed(), "a guest's TSC_ADJUST write did not move its TSC by its change");
+        }
         lines.push(msr(&mut v0, "TSC_ADJUST", 0x3B, None).0);
         let (l, tsc) = msr(&mut v0, "TSC", 0x10, None);
         lines.push(l);
         let target = tsc.wrapping_add(0x1000_0000);
+        let (_, adjust_before) = msr(&mut v0, "TSC_ADJUST", 0x3B, None);
+        let held_before = held_skew();
         lines.push(msr(&mut v0, "TSC", 0x10, Some(target)).0);
-        lines.push(format!("{} (KVM: the earlier value plus the change, about 0x1000_0000)", msr(&mut v0, "TSC_ADJUST after the guest's TSC write", 0x3B, None).0));
+        let held_after = held_skew();
+        let (l, adjust_after) = msr(&mut v0, "TSC_ADJUST after the guest's TSC write", 0x3B, None);
+        let change = adjust_after.wrapping_sub(adjust_before).cast_signed();
+        lines.push(format!(
+            "{l} (KVM: the earlier value plus the change, about 0x1000_0000): changed by {change:#x}; vCPU 0's TSC against \
+             vCPU 1's, read with partition time suspended, moved by {:#x} (KVM: the same)",
+            held_after - held_before
+        ));
+        if software {
+            assert_eq!(held_after - held_before, change, "a guest's TSC write moved its TSC by other than its TSC_ADJUST's change");
+            assert!(change > 0 && change <= 0x1000_0000, "a guest's TSC write of 0x1000_0000 ahead changed TSC_ADJUST by {change:#x}");
+        }
         let mut host = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry { index: 0x3B, ..Default::default() }]).unwrap();
         let n = v0.get_msrs(&mut host).unwrap();
         lines.push(format!("KVM_GET_MSRS of 0x3b: {n} entries, {:#x}", host.as_slice()[0].data));

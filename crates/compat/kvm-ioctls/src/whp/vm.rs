@@ -450,6 +450,38 @@ impl VmInner {
         true
     }
 
+    /// Runs `f` with every vCPU out of the guest and held there, and the
+    /// partition's time suspended (`WHvSuspendPartitionTime`, which Learn
+    /// says no running vCPU allows), then resumes time and lets the vCPUs
+    /// go: a vCPU's TSC read and written meanwhile moves by exactly what is
+    /// written, every TSC standing still, as KVM moves a TSC by changing its
+    /// offset (`adjust_tsc_offset_guest`). Every vCPU's TSC loses the time it
+    /// stood against the host's, as one: no skew between them. `None`, with
+    /// nothing done, if `immediate_exit` (the caller's vCPU's) is set while
+    /// it waits for another holder (a #BP window, a change of gdb's).
+    /// Called from a vCPU's run loop, out of the guest; takes the
+    /// `bp_window` lock only to change the holder.
+    pub(crate) fn with_time_stopped<T>(&self, immediate_exit: &AtomicU8, f: impl FnOnce() -> Result<T>) -> Option<Result<T>> {
+        if !self.take_exits(OWNER_ALL, Some(immediate_exit)) {
+            return None;
+        }
+        super::vcpu::hold_vcpus(self, None);
+        // SAFETY: the VM's partition.
+        let hres = unsafe { whv::WHvSuspendPartitionTime(self.part) };
+        let result = ffi::hr_of("WHvSuspendPartitionTime", hres, || "for a guest's write of its TSC".into()).and_then(|()| {
+            let done = f();
+            // SAFETY: the VM's partition, whose time this call suspended.
+            let hres = unsafe { whv::WHvResumePartitionTime(self.part) };
+            done.and_then(|v| ffi::hr_of("WHvResumePartitionTime", hres, String::new).map(|()| v))
+        });
+        let (lock, cv) = &self.bp_window;
+        let exits = lock.lock().unwrap();
+        self.bp_owner.store(-1, Ordering::SeqCst);
+        drop(exits);
+        cv.notify_all();
+        Some(result)
+    }
+
     /// Sets gdb's exception exits to `bitmap`: with every vCPU held out of
     /// the guest for the write, or, while a #BP window or another change
     /// has them, at its end (which writes gdb's under the same lock).
@@ -555,7 +587,7 @@ impl VmFd {
         // 32 KiB of stack for good (`regs::probe_partition`).
         super::regs::probe_partition()?;
         let part = make_partition()?;
-        let inner = VmInner::setup(part).inspect_err(|_| {
+        let inner = tsc_write_exit(part).and_then(|()| VmInner::setup(part)).inspect_err(|_| {
             // SAFETY: cleans up the partition we just created on failure.
             unsafe { whv::WHvDeletePartition(part) };
         })?;
@@ -566,6 +598,35 @@ impl VmFd {
         })
     }
 }
+
+/// Where the vCPU keeps `IA32_TSC_ADJUST` ([`super::regs::software_msr`]:
+/// a partition that does not, as on AMD hosts), a guest's WRMSR of
+/// `IA32_TSC` is made to exit (`WHV_X64_MSR_EXIT_BITMAP` TscMsrWrite, bit
+/// 1), so that the backend adds its change to TSC_ADJUST as KVM does (Linux
+/// v6.1 x86.c:3661-3667, `VcpuFd::guest_tsc_write`); WHP would make the
+/// write itself and leave TSC_ADJUST as it was. Set once the partition is
+/// set up, as the probe of the registers needs a partition of [`configure`]'s
+/// own (measured: the set is taken then on the PC and on CI's EPYC,
+/// `test_tsc_adjust_offered_to_the_guest_on_record`). A host that refuses it
+/// fails the VM, naming it, rather than leaving TSC_ADJUST behind.
+fn tsc_write_exit(part: WHV_PARTITION_HANDLE) -> Result<()> {
+    if !super::regs::software_msr(super::regs::MSR_IA32_TSC_ADJUST) {
+        return Ok(());
+    }
+    let mut bitmap = 0u64;
+    let mut written = 0u32;
+    // SAFETY: a u64 output buffer of the size passed.
+    let hres = unsafe {
+        whv::WHvGetPartitionProperty(part, whv::WHvPartitionPropertyCodeX64MsrExitBitmap, (&raw mut bitmap).cast(), 8, &mut written)
+    };
+    ffi::hr_of("WHvGetPartitionProperty", hres, || "X64MsrExitBitmap".into())?;
+    let with = bitmap | TSC_MSR_WRITE;
+    // SAFETY: a u64 value for X64MsrExitBitmap.
+    unsafe { ffi::set_partition_property(part, whv::WHvPartitionPropertyCodeX64MsrExitBitmap, &with) }
+}
+
+/// `WHV_X64_MSR_EXIT_BITMAP`'s TscMsrWrite.
+const TSC_MSR_WRITE: u64 = 1 << 1;
 
 /// Which of `names` a partition configured as a VM's ([`configure`]) lets
 /// vCPU 0 read and write back: a throwaway partition with no memory, made
