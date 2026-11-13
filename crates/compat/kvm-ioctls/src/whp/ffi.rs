@@ -198,7 +198,7 @@ pub(crate) fn get_registers(
     debug_assert_eq!(names.len(), values.len());
     let mut room = Room::new(values.len());
     let aligned = room.slice();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "whp-trace"))]
     let before = trace::stack();
     // SAFETY: both arrays have `names.len()` elements; `Aligned` is a
     // `WHV_REGISTER_VALUE` aligned as WHP requires.
@@ -211,7 +211,7 @@ pub(crate) fn get_registers(
             aligned.as_mut_ptr().cast(),
         )
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "whp-trace"))]
     trace::note("WHvGetVirtualProcessorRegisters", vp, names, None, before, hres);
     hr_of("WHvGetVirtualProcessorRegisters", hres, || format!("vp {vp}: {}", registers(names, None)))?;
     for (v, a) in values.iter_mut().zip(aligned.iter()) {
@@ -233,7 +233,7 @@ pub(crate) fn set_registers(
     for (a, v) in aligned.iter_mut().zip(values) {
         *a = Aligned(*v);
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "whp-trace"))]
     let before = trace::stack();
     // SAFETY: both arrays have `names.len()` elements, aligned (`Aligned`).
     let hres = unsafe {
@@ -245,7 +245,7 @@ pub(crate) fn set_registers(
             aligned.as_ptr().cast(),
         )
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "whp-trace"))]
     trace::note("WHvSetVirtualProcessorRegisters", vp, names, Some(values), before, hres);
     hr_of("WHvSetVirtualProcessorRegisters", hres, || format!("vp {vp}: {}", registers(names, Some(values))))
 }
@@ -291,7 +291,7 @@ pub(crate) fn run_vp(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<WHV_RUN_VP_E
     struct Exit(WHV_RUN_VP_EXIT_CONTEXT);
     // SAFETY: all-zero is a valid exit context.
     let mut ctx = Exit(unsafe { std::mem::zeroed() });
-    #[cfg(test)]
+    #[cfg(any(test, feature = "whp-trace"))]
     let before = trace::stack();
     // SAFETY: valid output buffer of the given size.
     let hres = unsafe {
@@ -302,7 +302,7 @@ pub(crate) fn run_vp(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<WHV_RUN_VP_E
             u32::try_from(std::mem::size_of_val(&ctx.0)).unwrap(),
         )
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "whp-trace"))]
     trace::note("WHvRunVirtualProcessor", vp, &[], None, before, hres);
     hr_of("WHvRunVirtualProcessor", hres, || format!("vp {vp}"))?;
     Ok(ctx.0)
@@ -342,7 +342,14 @@ impl Drop for OwnedHandle {
 /// calls are kept as they were given and made into lines by the test, after
 /// it has read the stack for the last time, so that no line's making is in
 /// what it measures.
-#[cfg(test)]
+///
+/// With the `whp-trace` feature (a build for a record, never a release),
+/// every such call during which the thread's committed stack grew by
+/// [`trace::GREW`] or more is also printed on standard error as it
+/// returns, a `WHPTRACE` line: which call it is that commits a booted
+/// guest's vCPU thread's stack, which the record test's steps do not show.
+#[cfg(any(test, feature = "whp-trace"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod trace {
     use std::cell::RefCell;
 
@@ -382,6 +389,12 @@ pub(crate) mod trace {
             )
         }
     }
+
+    /// What a call must commit of its thread's stack for a `WHPTRACE`
+    /// line: the first refused call on a thread commits 32 KiB (CI run
+    /// 43392627996), any other at most 4 (run 43397419784).
+    #[cfg(feature = "whp-trace")]
+    pub(crate) const GREW: usize = 16 * 1024;
 
     thread_local! {
         /// The calls of this thread since [`begin`]; none kept before it.
@@ -426,6 +439,20 @@ pub(crate) mod trace {
         hres: i32,
     ) {
         let after = stack();
+        #[cfg(feature = "whp-trace")]
+        if after >= before + GREW {
+            let call = Call {
+                call,
+                vp,
+                names: names.to_vec(),
+                values: values.map(|v| v.iter().map(super::as_u64).collect()),
+                hres,
+                before,
+                after,
+            };
+            let thread = std::thread::current();
+            eprintln!("WHPTRACE thread '{}': {}", thread.name().unwrap_or("(unnamed)"), call.line());
+        }
         CALLS.with_borrow_mut(|calls| {
             if let Some(calls) = calls {
                 calls.push(Call {

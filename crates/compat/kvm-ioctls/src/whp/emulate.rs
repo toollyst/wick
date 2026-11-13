@@ -264,12 +264,12 @@ unsafe extern "system" fn get_regs_cb(
 ) -> i32 {
     // SAFETY: context is the EmuCtx; the arrays have `count` elements.
     let ctx = unsafe { &*(context as *const EmuCtx) };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "whp-trace"))]
     let before = super::ffi::trace::stack();
     let hres = unsafe {
         whv::WHvGetVirtualProcessorRegisters(ctx.part, ctx.vp, names, count, values)
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "whp-trace"))]
     super::ffi::trace::note(
         "the emulator's WHvGetVirtualProcessorRegisters",
         ctx.vp,
@@ -290,12 +290,12 @@ unsafe extern "system" fn set_regs_cb(
 ) -> i32 {
     // SAFETY: context is the EmuCtx; the arrays have `count` elements.
     let ctx = unsafe { &*(context as *const EmuCtx) };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "whp-trace"))]
     let before = super::ffi::trace::stack();
     let hres = unsafe {
         whv::WHvSetVirtualProcessorRegisters(ctx.part, ctx.vp, names, count, values)
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "whp-trace"))]
     super::ffi::trace::note(
         "the emulator's WHvSetVirtualProcessorRegisters",
         ctx.vp,

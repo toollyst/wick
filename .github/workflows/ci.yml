@@ -1020,6 +1020,28 @@ jobs:
               build/cargo_target/release/firecracker.exe 1 2 16; then
             echo "::warning::vmm-memory-record.py --boot: no record of a booted guest on this runner"
           fi
+          # Which WHP call leaves every vCPU thread of that booted guest 48
+          # to 52 KiB deep (run 43397419784's VMMSTACK lines: the stale
+          # frames of an exception WinHvPlatform throws and catches within
+          # WHvSetVirtualProcessorRegisters, called from the run loop; no
+          # step of the record test above commits more than 24 KiB): a
+          # debug build with kvm-ioctls' whp-trace feature, whose backend
+          # prints each WHP call during which its thread's committed stack
+          # grew by 16 KiB or more (WHPTRACE lines, in the record), booted
+          # once with 1 vCPU. In a target directory of its own, so that the
+          # binaries above are left as they are. kvm-ioctls is named by its
+          # package id: the upstream crate of the same name and version is
+          # in the lock file too.
+          kvm=$(cargo pkgid --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml)
+          if CARGO_TARGET_DIR=build/whp-trace cargo build --locked -p firecracker -p "$kvm" --features kvm-ioctls/whp-trace; then
+            if ! python -I ../../tools/windows/vmm-memory-record.py --boot "$RUNNER_TEMP/vmmmem-guest" \
+                build/whp-trace/debug/firecracker.exe 1; then
+              echo "::warning::vmm-memory-record.py --boot with the whp-trace build: no record of a booted guest"
+            fi
+          else
+            echo "::error::firecracker did not build with kvm-ioctls' whp-trace feature"
+            failed=1
+          fi
           exit $failed
       # wick-os's standard input on a console (a hidden console of its own,
       # made for a child process): ignored in the crate step above so that a

@@ -233,7 +233,7 @@ impl VmInner {
     /// so it is reported on standard error, once per error code.
     pub(crate) fn inject_msi(&self, address: u64, data: u32) {
         let control = super::irqchip::interrupt_control(address, data);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "whp-trace"))]
         let before = ffi::trace::stack();
         // SAFETY: a valid interrupt control of its size.
         let hres = unsafe {
@@ -243,7 +243,7 @@ impl VmInner {
                 u32::try_from(std::mem::size_of_val(&control)).unwrap(),
             )
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "whp-trace"))]
         ffi::trace::note("WHvRequestInterrupt", control.Destination, &[], None, before, hres);
         if hres != 0 && self.request_failure.swap(hres, Ordering::Relaxed) != hres {
             ffi::report(

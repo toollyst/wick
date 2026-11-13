@@ -1009,7 +1009,7 @@ impl VcpuFd {
     fn lapic_page(&self) -> Result<(Box<[u8; LAPIC_PAGE]>, u32)> {
         let mut page = Box::new([0u8; LAPIC_PAGE]);
         let mut written = 0u32;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "whp-trace"))]
         let before = super::ffi::trace::stack();
         // SAFETY: valid output buffer of the given size.
         let hres = unsafe {
@@ -1021,7 +1021,7 @@ impl VcpuFd {
                 &mut written,
             )
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "whp-trace"))]
         super::ffi::trace::note("WHvGetVirtualProcessorInterruptControllerState", self.vp(), &[], None, before, hres);
         super::ffi::hr_of("WHvGetVirtualProcessorInterruptControllerState", hres, || format!("vp {}", self.vp()))?;
         // Anything shorter is not the register page this conversion assumes.
@@ -1050,13 +1050,13 @@ impl VcpuFd {
         for (dst, src) in page.iter_mut().zip(klapic.regs.iter()) {
             *dst = *src as u8;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "whp-trace"))]
         let before = super::ffi::trace::stack();
         // SAFETY: the register page is valid for `size` bytes.
         let hres = unsafe {
             whv::WHvSetVirtualProcessorInterruptControllerState(self.part(), self.vp(), page.as_ptr().cast(), size)
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "whp-trace"))]
         super::ffi::trace::note("WHvSetVirtualProcessorInterruptControllerState", self.vp(), &[], None, before, hres);
         super::ffi::hr_of("WHvSetVirtualProcessorInterruptControllerState", hres, || format!("vp {}", self.vp()))
     }
@@ -3264,10 +3264,23 @@ mod fpu_tests {
                 ]
                 .concat(),
             ),
+            // Read back after the step (a STACKTEST line): run 43397419784's
+            // TSC-deadline step, right after the one-shot one, got no
+            // interrupt, and its deadline was not armed: the backend took
+            // the LVT timer for one-shot with a count (TMICT 0x100000 left
+            // by the step before), which is how a TSC-deadline entry reads
+            // if WHP keeps no such mode. KVM clears TMICT when the timer
+            // enters TSC-deadline mode (lapic.c, apic_update_lvtt).
+            (
+                "the LVT timer set to TSC-deadline mode after the one-shot count",
+                [apic.to_vec(), apic_write(0x320, 0x4_0000 | VECTOR as u32)].concat(),
+            ),
+            // TMICT cleared first, as KVM's switch to the mode leaves it.
             (
                 "the TSC-deadline timer (WRMSR 0x6e0, the TSC plus 0x10000000) and HLT, ended by its interrupt",
                 [
                     apic.to_vec(),
+                    apic_write(0x380, 0),
                     apic_write(0x320, 0x4_0000 | VECTOR as u32),
                     vec![
                         0x0F, 0x31, // rdtsc
@@ -3354,6 +3367,21 @@ mod fpu_tests {
             } else {
                 a_step_with_its_calls(&mut vcpu, "fc_vcpu 0", name)
             };
+            if name.starts_with("the LVT timer set to TSC-deadline mode") {
+                let page = vcpu.get_lapic().unwrap();
+                let reg = |offset: usize| {
+                    u32::from_le_bytes(std::array::from_fn(|i| page.regs[offset + i].cast_unsigned()))
+                };
+                eprintln!(
+                    "STACKTEST the LVT timer after the guest wrote {:#x} (TSC-deadline mode), a one-shot count of 0x100000 run out before: \
+                     LVTT {:#x}, TMICT {:#x}, TMCCT {:#x}; the backend takes it for TSC-deadline mode: {}",
+                    0x4_0000 | VECTOR as u32,
+                    reg(0x320),
+                    reg(0x380),
+                    reg(0x390),
+                    super::super::tscdeadline::deadline_mode(reg(0x320), reg(0x380))
+                );
+            }
             wrong.extend(of_the_step);
         }
 

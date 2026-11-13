@@ -20,6 +20,11 @@ bench = false
 # partition is made with exception exits (src/whp/debug.rs). No effect on
 # Linux or macOS.
 gdb = []
+# A build for CI's record, never a release: on Windows the backend prints on
+# standard error each WHP call during which the calling thread's committed
+# stack grew by 16 KiB or more (WHPTRACE lines; src/whp/ffi.rs, `trace`). No
+# effect on Linux or macOS.
+whp-trace = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Same source as the crates.io 0.25.0 release (src/ is identical, checked 2026-11-09).

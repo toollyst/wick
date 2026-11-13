@@ -941,6 +941,14 @@ def run_boot_case(binds, firecracker, vcpus, work, system, kernel, rootfs, chain
                             if "whp:" in line or ":WARN:" in line or ":ERROR:" in line]
         print(f"{tag} Firecracker's own reports: {len(reports)} lines with whp:, :WARN: or :ERROR:"
               + "".join(f" | {line.strip()[:200]}" for line in reports[:5]))
+        # A build with kvm-ioctls' whp-trace feature prints each WHP call
+        # that committed 16 KiB or more of its thread's stack; any other
+        # build prints none (0 lines).
+        with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+            traces = [line.strip() for line in f.read().splitlines() if line.startswith("WHPTRACE")]
+        print(f"{tag} WHPTRACE lines: {len(traces)}")
+        for line in traces[:64]:
+            print(f"{tag} {line[:800]}")
         return kinds
     finally:
         proc.kill()
