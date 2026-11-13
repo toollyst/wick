@@ -611,7 +611,7 @@ jobs:
       # The two rebase tools' tests. The five skipped write their diff file
       # without marking it sparse (holes by set_len or seeks, which NTFS
       # allocates as zeros); both tools refuse such a file on Windows rather
-      # than copy its zeros over the base (patches/0037), so these fail
+      # than copy its zeros over the base (patches/0036), so these fail
       # with that refusal.
       - name: rebase-snap and snapshot-editor tests
         working-directory: lib/firecracker

@@ -2607,7 +2607,7 @@ function Invoke-Rebase([string]$tool, [string]$base, [string]$diff) {
 
 # rebase-snap and snapshot-editor, the counterpart of the macOS stage: on a
 # diff file NTFS keeps holes in (sparse) and one it does not (refused, the
-# base untouched: patches/0037), both without a guest; then on a diff
+# base untouched: patches/0036), both without a guest; then on a diff
 # snapshot of a 2 vCPU guest, with snapshot-editor's info-vmstate commands
 # and Firecracker's refusal of a state file of another architecture or
 # snapshot version.
