@@ -108,7 +108,7 @@ on all three hosts, over a small per-host "confined directory" layer:
 Firecracker's 2020 objection. It also avoids what vhost-user costs wick:
 
 - the backend maps all of guest memory, and guest memory must become a shared memfd/section. On Windows a shared
-  section is not charged to the Job memory limit [meas: `jailer-test.ps1 sections`; a probe of Windows sandbox mechanisms on Windows Server 2022 build 20348, 2026-11-10; the probe is not in the repository];
+  section is not charged to the Job memory limit [meas: `jailer-test.ps1 sections`; a probe of Windows sandbox mechanisms on Windows Server 2022 build 20348, 2026-11-10; the probe is not in the repository], and is counted against `memory.max` only by the jailer's poll since c351646 (SECURITY.md);
 - handles must be passed between two mutually-distrusting sandboxed processes. On Windows a jailed process cannot
   push handles to its peer, and pulling needs `PROCESS_DUP_HANDLE`, which amounts to full control of the peer
   [meas: a probe of Windows sandbox mechanisms on Windows Server 2022 build 20348, 2026-11-10; the probe is not in the repository; docs/PORTING.md row 14][doc];
