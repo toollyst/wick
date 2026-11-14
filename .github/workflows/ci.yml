@@ -1215,7 +1215,9 @@ jobs:
           # Option E-ii: the held LVT timer write against an MSI inside its
           # window, vCPU 1's IPIs, its own expired timer and 2000 MSIs from
           # another thread, every interrupt taken; and its cost with 0, 1
-          # and 15 other vCPUs (X2HOLD and X2HOLDREC lines). Records a and
+          # and 15 other vCPUs, a record the watchdog's 5 s may end (X2HOLD
+          # and X2HOLDREC lines; run 43627299415: 8.5 ms a write with 15
+          # others on this runner's 4 logical processors). Records a and
           # a2: an MSI in every window, one vector (merges counted, and the
           # windows after which requests came back together) and a vector
           # each (a request in flight at a window followed to its taking).

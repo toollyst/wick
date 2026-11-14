@@ -6626,7 +6626,13 @@ mod fpu_tests {
     /// - e: the cost of a held write, 1000 in a loop, with 0, 1 and 15 other
     ///   vCPUs halted with interrupts on (a Linux guest on KVM made 2 such
     ///   writes a vCPU in its boot and none idle: GUESTAPIC, CI's Linux boot
-    ///   step at acdec89), printed (X2HOLDREC);
+    ///   step at acdec89), printed (X2HOLDREC). A record of the cost, not a
+    ///   bound on it: the watchdog's 5 s ends a loop that has not made its
+    ///   1000 writes by then, and the line says how many it made (CI run
+    ///   43627299415, an AMD EPYC 9V45 runner with 4 logical processors:
+    ///   586 writes with 15 others, 8.5 ms a write, where the test failed);
+    ///   asserted: the writes were taken, the run neither failing nor
+    ///   faulting, and at least one made;
     /// - f: 2000 MSIs injected from another thread, each once the last was
     ///   taken, against vCPU 0's loop: every one taken.
     ///
@@ -7087,11 +7093,14 @@ mod fpu_tests {
                 halted.push(thread.join().unwrap());
             }
             let writes = read(LOOPS);
+            let bound = writes < COST_WRITES && exits.last().map(String::as_str) == Some("EINTR");
             eprintln!(
-                "X2HOLDREC e: {writes} held LVT timer writes with {others} other vCPUs halted: {took:?}, {} us a write; exits {exits:?}",
+                "X2HOLDREC e: {writes} held LVT timer writes with {others} other vCPUs halted{}: {took:?}, {} us a write; exits {exits:?}",
+                if bound { format!(", ended by the watchdog's 5 s before the {COST_WRITES}th") } else { String::new() },
                 took.as_micros() / u128::from(writes.max(1))
             );
-            if writes != COST_WRITES {
+            let ended = exits.last().is_some_and(|e| e.starts_with("out 0x86") || e == "EINTR");
+            if writes == 0 || !ended || (writes != COST_WRITES && !bound) {
                 wrong.push(format!("e ({others} others): {writes} writes, exits {exits:?}"));
             }
             drop((halted, zero, vm));
