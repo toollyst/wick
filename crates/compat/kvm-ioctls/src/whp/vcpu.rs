@@ -1172,7 +1172,8 @@ impl VcpuFd {
     /// mode, as on the processor and in KVM.
     fn read_tsc_deadline(&self) -> Result<u64> {
         let (page, _) = self.lapic_page()?;
-        Ok(if tscdeadline::page_in_deadline_mode(&page[..]) {
+        let apic_base = self.register(whv::WHvX64RegisterApicBase)?;
+        Ok(if tscdeadline::page_in_deadline_mode(&page[..], apic_base) {
             self.shared.tsc_deadline.load(Ordering::SeqCst)
         } else {
             0
@@ -1195,7 +1196,23 @@ impl VcpuFd {
             return Ok(());
         }
         let (page, _) = self.lapic_page()?;
-        if !tscdeadline::page_in_deadline_mode(&page[..]) {
+        let apic_base = self.register(whv::WHvX64RegisterApicBase)?;
+        if tscdeadline::lost_xapic_deadline(&page[..], apic_base) {
+            super::ffi::report(
+                log::Level::Error,
+                &format!(
+                    "whp: vCPU {}'s IA32_TSC_DEADLINE write refused: its local APIC is in xAPIC mode, where WHP drops \
+                     the guest's write of the LVT timer entry that selects TSC-deadline mode and with it the vector \
+                     (the entry is {:#x}), so the timer's interrupt would never come. KVM takes that write in either \
+                     mode; here a guest in TSC-deadline mode needs x2APIC mode (Linux turns it on when CPUID offers \
+                     x2APIC, unless booted with nox2apic)",
+                    self.vp(),
+                    u32::from_le_bytes(page[0x320..0x324].try_into().unwrap())
+                ),
+            );
+            return err(libc::ENOTSUP);
+        }
+        if !tscdeadline::page_in_deadline_mode(&page[..], apic_base) {
             return Ok(());
         }
         shared.tsc_deadline.store(value, Ordering::SeqCst);
@@ -6313,7 +6330,7 @@ mod fpu_tests {
                 ffi::set_register(one.part(), one.vp(), whv::WHvX64RegisterApicBase, ffi::reg64(0xFEE0_0C00)).unwrap();
             }
             enable(&zero, None);
-            enable(&one, Some(vector));
+            enable(&one, Some(if x2apic { vector | 0x4_0000 } else { vector }));
             one.write_tsc_deadline(1).unwrap();
             let mut reads = 0;
             let watchdog = super::Watchdog::arm(&one);
