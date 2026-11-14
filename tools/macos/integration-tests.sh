@@ -64,7 +64,12 @@
 # 5's closeallfiles() polls every descriptor up to it at each command
 # (misc.c), 35 ms a command at 1048576 against 4 at 256, and the harness's
 # screen flush then races (test_firecracker_kill_by_pid). A hard limit
-# under 4096 stops the run.
+# under 4096 stops the run. devtool's other limits: no core files
+# (--ulimit core=0; here `ulimit -c 0`, soft and hard, macOS's default soft
+# limit being 0 already), and memlock=-1:-1, which macOS's default is
+# already (`launchctl limit memlock`: unlimited, unlimited) and which
+# nothing in the suite or Firecracker uses (no mlock; vm.rs only names
+# mlock2 in a comment), so it is left as it is.
 #
 # A run needs WICK_IT_FREE_GIB (default 20) GiB free; a selection of tests
 # that session-peak-kib shows to need less may ask for less.
@@ -316,13 +321,13 @@ cp "$out/provenance.txt" "$out/pytest.log"
 pytest=("$ROOT/build/integration/venv/bin/python" -m pytest -p wick_macos --binary-dir "$bin"
     "--json-report-file=$out/test_results/test-report.json" --continue-on-collection-errors "$@")
 [[ -x "$ROOT/build/integration/venv/bin/python" ]] || die "no Python environment: tools/macos/integration/venv.sh"
-# Upstream's descriptor limit (the header).
+# Upstream's descriptor and core limits (the header).
 (ulimit -n 4096) 2>/dev/null || die "cannot set RLIMIT_NOFILE to 4096 (upstream's devtool runs pytest with nofile=4096:4096): the hard limit is $(ulimit -Hn)"
 set +e
 if [[ $mode == jailer ]]; then
-    (ulimit -n 4096 && cd "$ROOT/lib/firecracker/tests" && sudo env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
+    (ulimit -n 4096 && ulimit -c 0 && cd "$ROOT/lib/firecracker/tests" && sudo env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
 else
-    (ulimit -n 4096 && cd "$ROOT/lib/firecracker/tests" && env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
+    (ulimit -n 4096 && ulimit -c 0 && cd "$ROOT/lib/firecracker/tests" && env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
 fi
 status=${PIPESTATUS[0]}
 set -e
