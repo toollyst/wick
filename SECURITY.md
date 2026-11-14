@@ -161,7 +161,8 @@ upstream Firecracker and its jailer.
   hot-plugged again (`test_a_hotplugged_endpoint_frees_its_name_when_it_goes`, `test_a_dropped_endpoint_frees_its_name`).
   The narrowed sandbox allows that one operation: `file-write-unlink` of sockets (`vnode-type SOCKET`, required
   together with the directory in one `require-all`) under the directory of endpoints named without a path: the jail's
-  own directory of its network, or outside a jail and a network the user's `firecracker-net`. Nothing else there (not
+  own directory of its network, the network given without the jailer (`WICK_NETNS`), or outside a jail and a network the
+  user's `firecracker-net`. Nothing else there (not
   a regular file, not the directory itself) and no socket elsewhere (`test_unfiltered_syscalls_are_limited_by_their_rule`,
   on macOS 15 and 26 in CI's macos-seatbelt job and on 27). What it opens to a compromised VMM: in a jail, the removal
   of its own endpoints only, as its directory there is its own; outside a jail, of other microVMs' endpoints of the

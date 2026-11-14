@@ -572,8 +572,10 @@ mod imp {
                         lock_netns(&dir).map_err(|e| JailError::Netns(value.clone(), e))?;
                         NETNS.set((path, dir)).expect("the jail is entered once");
                     }
+                    // The profile names the network, whose sockets a running
+                    // microVM removes as its devices go (sandbox unlink_rule).
                     // SAFETY: called first thing in main, with one thread.
-                    unsafe { crate::ext::sandbox::prepare(None, None) }.map_err(JailError::Sandbox)
+                    unsafe { crate::ext::sandbox::prepare(None, self::netns()) }.map_err(JailError::Sandbox)
                 }
             };
         };

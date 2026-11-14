@@ -896,8 +896,11 @@ mod macos {
     ///   when the guest activates a device; a timer made for a hot-plugged
     ///   device's rate limiter, where Linux's filter allows `timerfd_create`);
     /// - the sockets in its directory of endpoints, those named without a
-    ///   path: the jail's own directory of its network (`netns`), or outside
-    ///   a jail without one the user's (`platform::net::user_endpoint_dir`).
+    ///   path: the jail's own directory of its network (`netns`), or the
+    ///   network Firecracker is given without the jailer (`WICK_NETNS`, also
+    ///   `netns`: `test_a_hotplugged_endpoint_in_a_network_without_the_jail_frees_its_name`),
+    ///   or outside a jail without one the user's
+    ///   (`platform::net::user_endpoint_dir`).
     ///   A net device that goes removes its endpoint's socket file
     ///   (`platform::net`'s `Drop`), as closing a TAP frees its name on
     ///   Linux, so that a device refused after its endpoint opened, or
@@ -4192,7 +4195,6 @@ mod macos {
         // in that directory, whose sockets the profile lets a running
         // microVM remove, so its drop removes it and the microVM runs on.
         #[test]
-        #[ignore = "fails until the profile of a network without the jail names its directory (the next commit)"]
         fn test_a_hotplugged_endpoint_in_a_network_without_the_jail_frees_its_name() {
             let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
             let net = dir.as_path().canonicalize().unwrap().join("instance");
