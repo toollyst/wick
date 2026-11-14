@@ -4716,6 +4716,21 @@ mod fpu_tests {
         mmio_guest_with(program, |_| {})
     }
 
+    /// The supported CPUID with TSC_DEADLINE (leaf 1 ECX bit 24), as
+    /// Firecracker gives every guest (src/vmm/src/cpu_config/x86_64/cpuid/
+    /// normalize.rs, `set_bit(&mut leaf_1.result.ecx, 24, true)`): the
+    /// supported table is the host's, and an AMD processor has no
+    /// TSC-deadline timer, so it leaves the bit out there. Without it a
+    /// guest's LVT timer entry keeps one mode bit, as KVM keeps it
+    /// (`gp::lvtt_write`), and has no TSC-deadline mode.
+    fn cpuid_with_tsc_deadline() -> CpuId {
+        let mut c = regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap();
+        for e in c.as_mut_slice().iter_mut().filter(|e| e.function == 1) {
+            e.ecx |= 1 << 24;
+        }
+        c
+    }
+
     /// [`mmio_guest`], with `prepare` run on the guest's memory once it is
     /// written and before the VM maps it.
     fn mmio_guest_with(program: &[u8], prepare: impl FnOnce(*mut u8)) -> (super::super::VmFd, VcpuFd, *mut u8) {
@@ -5503,6 +5518,11 @@ mod fpu_tests {
     ///   the IDT cut below #DF's too, a triple fault (`Shutdown`), as KVM's
     ///   `kvm_multiple_exception`.
     ///
+    /// The CPUID has TSC_DEADLINE as Firecracker's has it
+    /// ([`cpuid_with_tsc_deadline`]): without it the entry keeps one mode
+    /// bit, as KVM's does (PC step 14c-1 at acdec89, a Ryzen 9 7900: the
+    /// guest's RDMSR read 0xec and its TMICT write counted down).
+    ///
     /// Printed too (TSCDLTEST lines), not asserted: the initial count
     /// register written in TSC-deadline mode and read back (WRMSR 0x838,
     /// RDMSR 0x839: KVM ignores the write, lapic.c 2195-2196).
@@ -5536,7 +5556,7 @@ mod fpu_tests {
         let halt = [0xFB, 0xF4, 0xEB, 0xFD]; // sti; hlt; jmp to the hlt
         let run = |program: Vec<u8>, idt_gates: Option<u64>| {
             let (vm, mut vcpu, m) = mmio_guest(&program);
-            vcpu.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
+            vcpu.set_cpuid2(&cpuid_with_tsc_deadline()).unwrap();
             put(m, GATE, &[0xB0, 0xEC, 0xE6, 0x82, 0xEB, 0xFE]);
             put(m, MMIO_IDT + 0xEC * 16, &((GATE & 0xffff) | (8 << 16) | (0x8E << 40)).to_le_bytes());
             put(m, MMIO_IDT + 0xEC * 16 + 8, &0u64.to_le_bytes());
@@ -5686,7 +5706,7 @@ mod fpu_tests {
         let taken = format!("out 0x82 [{V:02x}]");
         let vm_with = |program: &[u8], gate: &[u8]| {
             let (vm, vcpu, m) = mmio_guest(program);
-            vcpu.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
+            vcpu.set_cpuid2(&cpuid_with_tsc_deadline()).unwrap();
             put(m, GATE, gate);
             put(m, MMIO_IDT + u64::from(V) * 16, &((GATE & 0xffff) | (8 << 16) | (0x8E << 40)).to_le_bytes());
             put(m, MMIO_IDT + u64::from(V) * 16 + 8, &0u64.to_le_bytes());
@@ -5717,9 +5737,13 @@ mod fpu_tests {
             assert_eq!(hres, 0, "the page's set");
         };
 
-        // The rounds, each the vCPU halted with interrupts on.
+        // The rounds, each the vCPU halted with interrupts on. `out 0x84`
+        // once its APIC is on: an interrupt requested before is dropped, as
+        // KVM drops a fixed interrupt to a software-disabled APIC
+        // (`__apic_accept_irq`; PC step 14a at acdec89, the warm-up MSI
+        // injected before the guest ran: EINTR).
         let gate = [&push[..], &wrmsr(0x80B, 0), &[0xB0, V, 0xE6, 0x82], &pop_iret].concat();
-        let (vm, mut zero, m) = vm_with(&[on.clone(), vec![0xFB, 0xF4, 0xEB, 0xFD]].concat(), &gate);
+        let (vm, mut zero, m) = vm_with(&[on.clone(), vec![0xE6, 0x84, 0xFB, 0xF4, 0xEB, 0xFD]].concat(), &gate);
         // vCPU 1: a fixed IPI of V to APIC 0 (ICR 0x4000 | V, EDX 0), `out
         // 0x83`, again.
         put(m, IPI_PROGRAM, &[wrmsr(0x830, 0x4000 | u32::from(V)), vec![0xE6, 0x83, 0xEB, 0xEE]].concat());
@@ -5727,7 +5751,7 @@ mod fpu_tests {
         // Runnable: an AP is made waiting for a SIPI, as KVM makes one
         // (`regs::startup_suspend`), and would run nothing.
         one.set_mp_state(kvm_bindings::kvm_mp_state { mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE }).unwrap();
-        one.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
+        one.set_cpuid2(&cpuid_with_tsc_deadline()).unwrap();
         one.set_sregs(&zero.get_sregs().unwrap()).unwrap();
         one.set_regs(&kvm_regs { rip: IPI_PROGRAM, rsp: 0x8800, rflags: 2, ..Default::default() }).unwrap();
         ffi::set_register(one.part(), one.vp(), whv::WHvX64RegisterApicBase, ffi::reg64(0xFEE0_0C00)).unwrap();
@@ -5738,6 +5762,12 @@ mod fpu_tests {
         one.set_lapic(&l).unwrap();
         let inner = Arc::clone(&zero.shared.inner);
         let inject = || inner.inject_msi(MSI, u32::from(V));
+        let mut reads = 0;
+        let watchdog = super::Watchdog::arm(&zero);
+        let on_line = one_run(&mut zero, &[], &mut reads);
+        drop(watchdog);
+        zero.set_kvm_immediate_exit(0);
+        assert!(on_line.starts_with("out 0x84"), "the guest did not turn its APIC on: {on_line}");
         inject();
         let warm = run_to_taken(&mut zero);
         eprintln!("X2RMWREC the guest's first interrupt (x2APIC on, SVR 0x1ff, STI, HLT): {warm}");
