@@ -891,6 +891,19 @@ jobs:
           rustc --edition 2021 --test -o "$RUNNER_TEMP/jail-parent-test.exe" tools/windows/jail-parent.rs
           "$RUNNER_TEMP/jail-parent-test.exe"
           rustc --edition 2021 -O -o tools/windows/memory-partition-probe.exe tools/windows/memory-partition-probe.rs
+      # The x2APIC record build, for boot-test.ps1 x2apic (the windows-guest
+      # job and a PC): a release Firecracker with kvm-ioctls'
+      # whp-x2apic-record feature, whose partitions are x2APICs on AMD hosts
+      # as option E makes them, before the product turns them on
+      # (vm::X2APIC_PARTITIONS). In a target directory of its own, so that
+      # the kit's product binaries are left as they are; kvm-ioctls named by
+      # its package id, as the whp-trace build names it.
+      - name: Build the x2APIC record Firecracker
+        if: success() || failure()
+        working-directory: lib/firecracker
+        run: |
+          kvm=$(cargo pkgid --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml)
+          CARGO_TARGET_DIR=build/x2apic cargo build --locked --release -p firecracker -p "$kvm" --features kvm-ioctls/whp-x2apic-record
       # Firecracker's gdb stub (upstream's test_gdb builds it), for
       # boot-test.ps1 gdb on a WHP machine. Built right before the kit's
       # upload, after every step before it that builds the workspace's
@@ -907,6 +920,16 @@ jobs:
           cargo build --locked -p firecracker --features gdb
           grep -c -a gdb_socket_path build/cargo_target/debug/firecracker.exe \
             || { echo "::error::debug firecracker.exe has no gdb_socket_path: not the gdb build"; exit 1; }
+      # No product binary of the kit is a build with a record-only feature
+      # of kvm-ioctls (whp-trace, whp-x2apic-record), and the x2APIC record
+      # build is one, which shows the check finds its line.
+      - name: No record-only feature in the kit's product binaries
+        if: success() || failure()
+        run: |
+          r=lib/firecracker/build/cargo_target/release
+          tools/check-record-features.sh "$r/firecracker.exe" "$r/jailer.exe" "$r/snapshot-editor.exe" "$r/rebase-snap.exe" \
+            lib/firecracker/build/cargo_target/debug/firecracker.exe \
+            --has whp-x2apic-record lib/firecracker/build/x2apic/release/firecracker.exe
       # For validation on Windows hardware with WHP (tools/windows/boot-test.ps1,
       # jailer-test.ps1): everything the stages need, at the paths they look in.
       - name: Upload Windows binaries
@@ -923,6 +946,7 @@ jobs:
             lib/firecracker/build/cargo_target/release/rebase-snap.exe
             lib/firecracker/build/cargo_target/release/examples/uffd_on_demand_handler.exe
             lib/firecracker/build/cargo_target/debug/firecracker.exe
+            lib/firecracker/build/x2apic/release/firecracker.exe
             lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe
             winprobe.exe
             tools/windows/boot-test.ps1
@@ -1575,6 +1599,22 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage linux-snapshot `
             -LinuxSnapshot "$env:RUNNER_TEMP\linux-snapshot"
           exit $LASTEXITCODE
+      # Option E's x2APIC partition on this AMD runner, through the kit's
+      # x2APIC record build (kvm-ioctls' whp-x2apic-record; the product's
+      # partitions stay xAPICs, vm::X2APIC_PARTITIONS): the guest in x2APIC
+      # mode with its local timers in TSC-deadline mode, each LVT timer
+      # write the backend's held page write (option E-ii), then CPU 1
+      # offline and online after boot and after a snapshot restore. Five
+      # runs, each its own guests; a PC runs it ten times.
+      - name: boot-test.ps1 x2apic
+        if: success() || failure()
+        run: |
+          $failed = 0
+          foreach ($i in 1..5) {
+            powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage x2apic
+            if ($LASTEXITCODE -ne 0) { $failed++ }
+          }
+          if ($failed) { Write-Host "::error::boot-test.ps1 x2apic failed in $failed of 5 runs"; exit 1 }
       # The guest files are the boot test's (-Assets). pidns, bindlink,
       # sections and hugepages have steps of their own.
       - name: jailer-test.ps1

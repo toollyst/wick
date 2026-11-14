@@ -726,8 +726,12 @@ fn make_partition() -> Result<(WHV_PARTITION_HANDLE, super::apicmode::LocalApic)
 /// stages), so every host's partitions stay xAPICs and the guest is not
 /// offered x2APIC, as before option E; the x2APIC code runs only in the
 /// tests that ask for it on their thread (`X2APIC_PARTITION_FOR_TESTS`).
-/// No switch turns it on: this line does, with the records named.
-const X2APIC_PARTITIONS: bool = false;
+/// No switch turns it on in the product: this line does, with the records
+/// named. A build with kvm-ioctls' `whp-x2apic-record` feature, CI's and a
+/// PC's record build for `boot-test.ps1 x2apic` and never a release
+/// (`tools/check-record-features.sh` fails one that has it), makes them as
+/// option E does, and says so once (`measured_local_apic`).
+const X2APIC_PARTITIONS: bool = cfg!(feature = "whp-x2apic-record");
 
 /// The local APIC this host's partitions emulate: an xAPIC
 /// ([`X2APIC_PARTITIONS`]), or for a test that asks, [`measured_local_apic`].
@@ -763,6 +767,18 @@ fn measured_local_apic() -> super::apicmode::LocalApic {
                 ),
             );
         }
+        #[cfg(feature = "whp-x2apic-record")]
+        ffi::report(
+            log::Level::Warn,
+            &format!(
+                "whp: a whp-x2apic-record build, never a release: this host's partitions emulate {}, as option E \
+                 makes them (vm::X2APIC_PARTITIONS)",
+                match apic {
+                    super::apicmode::LocalApic::X2Apic => "an x2APIC",
+                    super::apicmode::LocalApic::XApic => "an xAPIC",
+                }
+            ),
+        );
         apic
     })
 }

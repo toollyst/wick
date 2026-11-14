@@ -25,6 +25,13 @@ gdb = []
 # stack grew by 16 KiB or more (WHPTRACE lines; src/whp/ffi.rs, `trace`). No
 # effect on Linux or macOS.
 whp-trace = []
+# A build for CI's and a PC's record, never a release: on Windows the
+# partitions are made as option E makes them, x2APICs on AMD hosts
+# (src/whp/vm.rs, `X2APIC_PARTITIONS`), for boot-test.ps1's x2apic stage
+# before the product turns them on, and the first VM says so on standard
+# error. tools/check-record-features.sh fails a release or the CI kit's
+# product binaries that have it. No effect on Linux or macOS.
+whp-x2apic-record = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Same source as the crates.io 0.25.0 release (src/ is identical, checked 2026-11-09).

@@ -89,6 +89,15 @@ jobs:
         run: tools/check-dependencies.sh
       - name: Build, sign and package
         run: tools/package-release.sh "$TAG" dist
+      # No manifest turns on a record-only feature of kvm-ioctls (whp-trace,
+      # whp-x2apic-record: CI's records, never a release), and no binary
+      # built holds the line a build with one has.
+      - name: No record-only feature in the release
+        run: |
+          source tools/common.sh
+          bins=()
+          for bin in "${MACOS_RELEASE_BINS[@]}"; do bins+=("lib/firecracker/build/cargo_target/release/$bin"); done
+          tools/check-record-features.sh "${bins[@]}"
       # From the archive, unpacked afresh: every binary of the list
       # (tools/common.sh), its signature, the entitlement on exactly those
       # that create a VM, its version, and its SBOM.

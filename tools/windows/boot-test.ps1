@@ -77,6 +77,12 @@
 #          boot, 512 MiB plugged, seen in MemTotal and used, then unplugged
 #          (the commit charge and private working set go down) and plugged
 #          again
+#   x2apic (not in `all`: needs the x2APIC record build, kvm-ioctls'
+#          whp-x2apic-record feature, which CI's kit has) option E's x2APIC
+#          partition on an AMD host: the guest in x2APIC mode with its local
+#          timers in TSC-deadline mode, through the backend's held LVT timer
+#          write, then the smp stage on it (CPU 1 offline and online, after
+#          boot and after a snapshot restore)
 #   gdb    (not in `all`: needs a Firecracker built with the gdb feature and
 #          a gdb) upstream's debug kernel under gdb: a hardware breakpoint at
 #          start_kernel, the kernel's bytes read through the stub's address
@@ -133,6 +139,10 @@ param(
     # PATH, then MSYS2's in C:\msys64\{ucrt64,mingw64}\bin).
     [string]$GdbFirecracker,
     [string]$Gdb,
+    # For the x2apic stage (not part of `all`): a Firecracker built with
+    # kvm-ioctls' whp-x2apic-record feature (default: the kit's
+    # lib\firecracker\build\x2apic\release\firecracker.exe).
+    [string]$X2ApicFirecracker,
     # Checks the harness itself against stand-ins for Firecracker's sockets
     # (no WHP, no downloads) and exits.
     [switch]$SelfTest
@@ -2097,8 +2107,10 @@ function Test-CounterWarp($vm, [string]$when) {
     return ($line -replace '^counter-warp: pass: ', '')
 }
 
-function Stage-Smp {
-    $vm = Start-Vm 'smp' (Base-Config 2) -Api
+# `$Name`: the results' and scratch directories' name (the x2apic stage's
+# run of it has its own).
+function Stage-Smp([string]$Name = 'smp') {
+    $vm = Start-Vm $Name (Base-Config 2) -Api
     Wait-Shell $vm
     $online = $vm.Sh('cat /sys/devices/system/cpu/online')
     Check ($online -eq '0-1') "online CPUs '$online'"
@@ -2122,17 +2134,17 @@ function Stage-Smp {
     $warp = Test-CounterWarp $vm 'after the boot'
     $spurious = Test-CpuOfflineOnline $vm 'after boot'
     # The same in a microVM restored from a snapshot, in a new process.
-    $dir = Join-Path $Scratch 'smp'
+    $dir = Join-Path $Scratch $Name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $state = Join-Path $dir 'vm.state'
     $mem = Join-Path $dir 'vm.mem'
     Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
     Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $state; mem_file_path = $mem }) | Out-Null
-    Save-Dmesg $vm 'smp'
+    Save-Dmesg $vm $Name
     $vm.Kill()
     # Its MSR lines are all in by now: the pumps are joined.
     $msrsBooted = Get-UnkeptMsrs $vm
-    $vm = Start-Vm 'smp-restored' $null -Api
+    $vm = Start-Vm "$Name-restored" $null -Api
     Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
         snapshot_path = $state
         mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = $mem }
@@ -2144,7 +2156,7 @@ function Stage-Smp {
     # first, in the guest health check.
     $warpRestored = Test-CounterWarp $vm 'after a snapshot restore'
     $spuriousRestored = Test-CpuOfflineOnline $vm 'after a snapshot restore'
-    Save-Dmesg $vm 'smp-restored'
+    Save-Dmesg $vm "$Name-restored"
     $vm.Reboot()
     $vm.Drain(2000)
     $msrs = Get-UnkeptMsrs $vm
@@ -3736,6 +3748,36 @@ function Get-GdbBytes([string]$text, [string]$marker) {
 # Whether this gdb reaches the socket by its path (`target remote <path>`) is
 # tried first and reported; otherwise it goes
 # through a TCP relay (Wick.Relay).
+# Option E's x2APIC partition, on the record build that makes it (the
+# product's partitions stay xAPICs until vm::X2APIC_PARTITIONS): the build
+# says so on its standard error, the guest switches its APIC routing to
+# x2APIC and runs its local timers in TSC-deadline mode, whose LVT timer
+# writes the backend makes held (option E-ii); then the smp stage with it.
+function Stage-X2Apic {
+    $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $fc = if ($X2ApicFirecracker) { (Resolve-Path $X2ApicFirecracker).Path } else { Join-Path $root 'lib\firecracker\build\x2apic\release\firecracker.exe' }
+    Check (Test-Path $fc) "no x2APIC record build at $fc (cargo build --release -p firecracker -p <kvm-ioctls' package id> --features kvm-ioctls/whp-x2apic-record, or pass -X2ApicFirecracker)"
+    $saved = $script:Fc
+    $script:Fc = $fc
+    try {
+        $vm = Start-Vm 'x2apic' (Base-Config 2) -Api
+        Wait-Shell $vm
+        $routing = $vm.Sh("dmesg | grep -o 'Switched APIC routing to [^.]*'; true")
+        $deadline = $vm.Sh('grep -c "Clock Event Device: lapic-deadline" /proc/timer_list; true')
+        $vm.Healthy()
+        Save-Dmesg $vm 'x2apic'
+        $vm.Reboot()
+        $vm.Drain(2000)
+        $said = $vm.Output + "`n" + (Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue)
+        $build = [regex]::Match($said, 'whp: a whp-x2apic-record build[^\r\n]*').Value
+        Check ($build -match 'emulate an x2APIC') "not an x2APIC partition (this host is not AMD, or $fc is not the record build): '$build'"
+        Check ($routing -match 'x2apic') "the guest's APIC routing: '$routing' (no x2APIC mode)"
+        Check ($deadline -eq '2') "local timers in TSC-deadline mode (/proc/timer_list): '$deadline' of 2 vCPUs"
+        $smp = Stage-Smp 'x2apic-smp'
+    } finally { $script:Fc = $saved }
+    return "x2APIC partition ($build): $routing, local timers in TSC-deadline mode on 2 vCPUs; smp on it: $smp"
+}
+
 function Stage-Gdb {
     $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     $fc = if ($GdbFirecracker) { (Resolve-Path $GdbFirecracker).Path } else { Join-Path $root 'lib\firecracker\build\cargo_target\debug\firecracker.exe' }
@@ -3956,10 +3998,11 @@ $Stages = [ordered]@{
     'diff-nospace' = { Stage-DiffNoSpace }
     'linux-snapshot' = { Stage-LinuxSnapshot }
     'memory-hotplug' = { Stage-MemoryHotplug }
+    x2apic   = { Stage-X2Apic }
     gdb      = { Stage-Gdb }
 }
 # Stages `all` leaves out: they need what a plain kit does not have.
-$NotInAll = @('gdb', 'diff-nospace', 'linux-snapshot', 'foreign-snapshot')
+$NotInAll = @('gdb', 'diff-nospace', 'linux-snapshot', 'foreign-snapshot', 'x2apic')
 
 # --- run ------------------------------------------------------------------------
 

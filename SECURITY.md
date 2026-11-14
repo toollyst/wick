@@ -444,7 +444,10 @@ upstream Firecracker and its jailer.
   on Windows): a denial of service of the guest on itself, under the jail's CPU limit, which reaches no other VM and
   not the host, as a KVM guest that loops on an exiting instruction slows only its own VM. No rate limit is added, as
   KVM has none. The lock is taken after the hold, and a requester holds it only for its one WHP call and waits on
-  nothing else meanwhile, so the hold adds no lock-order cycle.
+  nothing else meanwhile, so the hold adds no lock-order cycle. CI's x2APIC record build (kvm-ioctls'
+  `whp-x2apic-record`), which turns option E on for `boot-test.ps1 x2apic`, is never shipped:
+  `tools/check-record-features.sh` fails the release workflow and CI's kit if a product binary holds its line or a
+  manifest turns it on.
 - **Side channels** between VMs on the same host follow upstream's
   [production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md)
   guidance on Linux; the equivalent guidance for macOS and Windows hosts is not written yet.
