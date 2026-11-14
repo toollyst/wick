@@ -858,7 +858,7 @@ mod macos {
             syscall_rule(),
             operation_rule(),
             run_rule(root, netns)?,
-            unlink_rule(root, std::process::id())?
+            unlink_rule(root, netns, std::process::id())?
         ))
     }
 
@@ -889,29 +889,45 @@ mod macos {
 
     /// The names a running microVM may remove (`unlink`, `unlinkat`; also
     /// `rmdir` and the old name of `rename`, which Seatbelt decides by the
-    /// same operation, `file-write-unlink`), after [`narrow`]: its own
-    /// eventfds' and timers' FIFOs only, which vmm-sys-util names
-    /// `.eventfd-<pid>-<n>` and the compatibility libc `.timerfd-<pid>-<n>`
-    /// in the temporary directory and remove once open (an eventfd made when
-    /// the guest activates a device; a timer made for a hot-plugged device's
-    /// rate limiter, where Linux's filter allows `timerfd_create`). Any other
-    /// name is a denial, as upstream's
-    /// filters have no `unlink` (Linux's eventfd and tap have no name): a
-    /// network endpoint's socket is left behind when the device goes, as
-    /// the API socket is, and the next bind at the path replaces a stale one
+    /// same operation, `file-write-unlink`), after [`narrow`]:
+    /// - its own eventfds' and timers' FIFOs, which vmm-sys-util names
+    ///   `.eventfd-<pid>-<n>` and the compatibility libc `.timerfd-<pid>-<n>`
+    ///   in the temporary directory and remove once open (an eventfd made
+    ///   when the guest activates a device; a timer made for a hot-plugged
+    ///   device's rate limiter, where Linux's filter allows `timerfd_create`);
+    /// - the sockets in its directory of endpoints, those named without a
+    ///   path: the jail's own directory of its network (`netns`), or outside
+    ///   a jail without one the user's (`platform::net::user_endpoint_dir`).
+    ///   A net device that goes removes its endpoint's socket file
+    ///   (`platform::net`'s `Drop`), as closing a TAP frees its name on
+    ///   Linux, so that a device refused after its endpoint opened, or
+    ///   unplugged, leaves the name free to hot-plug again. Sockets there
+    ///   only (`vnode-type SOCKET`, required with the directory): no other
+    ///   file there, not the directory itself, no socket elsewhere
+    ///   (`test_unfiltered_syscalls_are_limited_by_their_rule`'s cases
+    ///   `endpoint`, `free-net`, `net-file`, `net-dir`, `net-socket`,
+    ///   `free-net-file`, `free-endpoint`). A jail without a network gets
+    ///   none: its endpoints are named by paths.
+    ///
+    /// Any other name is a denial, as upstream's filters have no `unlink`
+    /// (Linux's eventfd and tap have no name): an endpoint at a path stays
+    /// when its device goes in a running microVM, and the next bind at the
+    /// path while a microVM is built replaces a stale one
     /// (`platform::net::bind`); a running microVM may not remove it or any
     /// other socket (a compromised unjailed VMM would reach the user's other
-    /// sockets). The file rule's other operations are unchanged. Seatbelt
-    /// matches the real path, so the directory is given by its: in a jail
-    /// (`root`), its `/tmp` (the jailer's `TMPDIR`) by its path outside;
-    /// outside a jail, the temporary directory.
+    /// sockets; in the directory of endpoints it reaches only other
+    /// microVMs' endpoints, which the same user's VMMs share as they share
+    /// that directory). The file rule's other operations are unchanged.
+    /// Seatbelt matches the real path, so each directory is given by its: in
+    /// a jail (`root`), its `/tmp` (the jailer's `TMPDIR`) by its path
+    /// outside; outside a jail, the temporary directory.
     ///
     /// Memfds take no name a microVM removes: their shared memory objects
     /// are `shm_rule`'s (`shm_unlink` is decided by `ipc-posix-shm*`), and
     /// the compatibility libc's `memfd_create`, which makes a file, is not
     /// called by Firecracker.
     #[allow(unexpected_cfgs)]
-    fn unlink_rule(root: Option<&Path>, pid: u32) -> Result<String, SandboxError> {
+    fn unlink_rule(root: Option<&Path>, netns: Option<&Path>, pid: u32) -> Result<String, SandboxError> {
         let tmp = std::env::temp_dir();
         let tmp = match root {
             Some(root) => {
@@ -933,6 +949,24 @@ mod macos {
             let fifo = quoted(&tmp.join(format!("{prefix}{pid}-")), "FIFO")?;
             rule.push_str(&format!(
                 "(allow file-write-unlink (require-all {narrowed} (vnode-type FIFO) (prefix \"{fifo}\")))\n"
+            ));
+        }
+        let endpoints = match (root, netns) {
+            (_, Some(netns)) => Some(netns.to_owned()),
+            // Made as the profile is (`profile_for`). Without one (its lookup
+            // failed), no endpoint is named without a path, so none goes.
+            (None, None) => match crate::platform::net::user_endpoint_dir() {
+                Ok(dir) => Some(dir.canonicalize().map_err(|err| {
+                    SandboxError::Install(format!("the directory of endpoints {dir:?}: {err}"))
+                })?),
+                Err(_) => None,
+            },
+            (Some(_), None) => None,
+        };
+        if let Some(dir) = endpoints {
+            let dir = quoted(&dir, "directory of endpoints")?;
+            rule.push_str(&format!(
+                "(allow file-write-unlink (require-all {narrowed} (vnode-type SOCKET) (subpath \"{dir}\")))\n"
             ));
         }
         Ok(rule)
@@ -4110,7 +4144,6 @@ mod macos {
         // narrowed sandbox replaces no stale name). The device is made as
         // the hot-plug makes it (Net::new).
         #[test]
-        #[ignore = "fails until an endpoint removes its socket file when it goes (the next commit)"]
         fn test_a_hotplugged_endpoint_frees_its_name_when_it_goes() {
             let out = child("endpoint_drop_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -5117,31 +5150,50 @@ mod macos {
                 }
             }
             std::fs::remove_dir_all(&base).unwrap();
+            // What the cases left in the user's directory of endpoints.
+            let mark = format!("{}-", base.file_name().unwrap().to_str().unwrap());
+            for entry in std::fs::read_dir(crate::platform::net::user_endpoint_dir().unwrap()).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name().to_str().is_some_and(|n| n.starts_with(&mark)) {
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
             assert!(failures.is_empty(), "{}", failures.join("\n"));
         }
 
         /// The names a running microVM removes, by the calls that remove them
         /// (cases of `unfiltered_child`): in a jail, an eventfd's and a
-        /// timer's FIFO in its /tmp, a memfd's shared memory object and a
-        /// huge page one's; outside a jail, an eventfd's FIFO in the
-        /// temporary directory.
-        const ALLOWED_NAMES: &[(&str, &[&str])] =
-            &[("unlink unlinkat", &["fifo", "free-fifo", "timer"]), ("shm_unlink", &["memfd", "huge"])];
+        /// timer's FIFO in its /tmp, a network endpoint's socket in the
+        /// jail's network, a memfd's shared memory object and a huge page
+        /// one's; outside a jail, an eventfd's FIFO in the temporary
+        /// directory and an endpoint's socket in the user's directory of
+        /// endpoints.
+        const ALLOWED_NAMES: &[(&str, &[&str])] = &[
+            ("unlink unlinkat", &["fifo", "free-fifo", "timer", "endpoint", "free-net"]),
+            ("shm_unlink", &["memfd", "huge"]),
+        ];
 
         /// Names a running microVM does not remove: a file in the jail, a
-        /// file at an eventfd FIFO's name, a network endpoint's socket in
-        /// the jail's network and a socket elsewhere in the jail, a FIFO
-        /// with another process's eventfd or timer name, and outside a jail
-        /// a file in the temporary directory and an endpoint's socket at a
+        /// file at an eventfd FIFO's name, a socket elsewhere in the jail,
+        /// with and without a network, a file that is not a socket in the
+        /// jail's network and the network's directory itself, a FIFO with
+        /// another process's eventfd or timer name, and outside a jail a
+        /// file in the temporary directory, a file that is not a socket in
+        /// the user's directory of endpoints and an endpoint's socket at a
         /// path of the operator's choosing. (A name outside the jail is the
         /// unlifted case.)
-        const DENIED_NAMES: &[(&str, &[&str])] = &[(
-            "unlink unlinkat",
-            &[
-                "inside", "fifo-name", "endpoint", "socket", "fifo-other", "timer-other", "free-file",
-                "free-endpoint",
-            ],
-        )];
+        const DENIED_NAMES: &[(&str, &[&str])] = &[
+            (
+                "unlink unlinkat",
+                &[
+                    "inside", "fifo-name", "socket", "net-socket", "net-file", "fifo-other", "timer-other",
+                    "free-file", "free-net-file", "free-endpoint",
+                ],
+            ),
+            // By unlinkat's AT_REMOVEDIR, rmdir's: unlink of a directory
+            // fails in the kernel (EPERM) before the sandbox decides.
+            ("unlinkat", &["net-dir"]),
+        ];
 
         /// A POSIX IPC name of this test process's case `i` (31 bytes at most).
         fn ipc_name(i: usize) -> String {
@@ -5199,6 +5251,9 @@ mod macos {
                 path
             };
             let free_tmp = std::env::temp_dir().canonicalize().unwrap();
+            let free_net = crate::platform::net::user_endpoint_dir().unwrap();
+            std::fs::create_dir_all(&free_net).unwrap();
+            let free_net = free_net.canonicalize().unwrap();
             let victim = match lift.as_str() {
                 "inside" => jail.join(format!("inside-{tag}")),
                 "fifo" => fifo(&jail.join("tmp"), vmm_sys_util::eventfd::FIFO_PREFIX, pid),
@@ -5210,6 +5265,17 @@ mod macos {
                 "fifo-other" => fifo(&jail.join("tmp"), vmm_sys_util::eventfd::FIFO_PREFIX, other as u32),
                 "endpoint" => socket(base.join("net").join(format!("e-{n}"))),
                 "socket" => socket(base.join(format!("s-{n}"))),
+                "net-socket" => socket(base.join(format!("ns-{n}"))),
+                "net-file" => file(base.join("net").join(format!("f-{n}"))),
+                // The directory itself (`rmdir`'s operation, by unlinkat's
+                // AT_REMOVEDIR).
+                "net-dir" => base.join("net"),
+                // Named after the test's directory, which the test removes
+                // them by.
+                "free-net" => socket(free_net.join(format!("{}-fn-{n}", base.file_name().unwrap().to_str().unwrap()))),
+                "free-net-file" => {
+                    file(free_net.join(format!("{}-fnf-{n}", base.file_name().unwrap().to_str().unwrap())))
+                }
                 "free-fifo" => fifo(&free_tmp, vmm_sys_util::eventfd::FIFO_PREFIX, pid),
                 // At a path the operator names, as boot-test's net stage does.
                 "free-endpoint" => socket(free_tmp.join(format!("wick-ep-{pid}-{n}"))),
@@ -5286,7 +5352,9 @@ mod macos {
                 (true, _) => unreachable!(),
             };
             let profile = match lift.as_str() {
-                "endpoint" => profile_for(Some(&jail), Some(&base.join("net"))),
+                "endpoint" | "net-socket" | "net-file" | "net-dir" => {
+                    profile_for(Some(&jail), Some(&base.join("net")))
+                }
                 l if l.starts_with("free-") => profile_for(None, None),
                 _ => profile_for(Some(&jail), None),
             };
@@ -5312,6 +5380,7 @@ mod macos {
                 "open" | "open_nocancel" => [p(&outside), 0, 0, 0, 0, 0, 0, 0],
                 "openat" | "openat_nocancel" => [cwd, p(&outside), 0, 0, 0, 0, 0, 0],
                 "unlink" => [p(&victim), 0, 0, 0, 0, 0, 0, 0],
+                "unlinkat" if lift == "net-dir" => [cwd, p(&victim), libc::AT_REMOVEDIR as usize, 0, 0, 0, 0, 0],
                 "unlinkat" => [cwd, p(&victim), 0, 0, 0, 0, 0, 0],
                 "link" => [p(&inside), p(&second), 0, 0, 0, 0, 0, 0],
                 "linkat" => [cwd, p(&inside), cwd, p(&second), 0, 0, 0, 0],

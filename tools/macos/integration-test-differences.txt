@@ -242,8 +242,15 @@ all impossible integration_tests/functional/test_net.py::test_multi_queue_unsupp
 # open. On macOS Firecracker makes its endpoint itself (it binds the name, in
 # the jail's network or its temporary directory, docs/PORTING.md row 6), so
 # any free name opens: the device is attached to nothing, and the hot-plug
-# succeeds. To do: open only an endpoint the operator made.
+# succeeds. To do: open only an endpoint the operator made. This entry
+# predates upstream's commit bd54922b7 (2026-09-15), which made the test first plug
+# tap1 with dmb_size_mib, refused, and then tap1 again: there both variants
+# failed earlier, the refused device's socket file making tap1 EADDRINUSE,
+# until a device that goes removed its endpoint's file
+# (test_a_hotplugged_endpoint_frees_its_name_when_it_goes); the restored
+# variant reaches this step too since.
 all row-6 integration_tests/functional/test_hotplug.py::test_hotplug_net[booted-kvm-NO_CPU_TMPL-True-vmlinux-6.1.188]
+all row-6 integration_tests/functional/test_hotplug.py::test_hotplug_net[restored-kvm-NO_CPU_TMPL-True-vmlinux-6.1.188]
 
 # The test takes away the jail directory's write permission and expects
 # Firecracker, the jail's user, to fail writing the snapshot. As root (the

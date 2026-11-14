@@ -154,6 +154,19 @@ upstream Firecracker and its jailer.
   talks to NetworkSharing (a root daemon) over XPC, which the narrowed sandbox does not allow, so one hot-plugged
   into a running microVM is refused with an API error (`test_vmnet_hotplug_after_narrow_is_refused`). Firecracker starts as root and enters the jail before anything else
   runs (dyld cannot start a program inside a chroot), from a root-owned copy of the binary outside the jail.
+- **macOS: a running microVM may remove the sockets in its directory of endpoints.** Upstream's filters have no
+  `unlink`: a TAP has no name, and closing it frees the interface's name (drivers/net/tun.c, v6.1,
+  `tun_chr_close`). Here an endpoint is a socket file, so a net device that goes (unplugged, or hot-plugged and then
+  refused by the API after its endpoint opened) removes the file it bound, by its inode, and the name can be
+  hot-plugged again (`test_a_hotplugged_endpoint_frees_its_name_when_it_goes`, `test_a_dropped_endpoint_frees_its_name`).
+  The narrowed sandbox allows that one operation: `file-write-unlink` of sockets (`vnode-type SOCKET`, required
+  together with the directory in one `require-all`) under the directory of endpoints named without a path: the jail's
+  own directory of its network, or outside a jail and a network the user's `firecracker-net`. Nothing else there (not
+  a regular file, not the directory itself) and no socket elsewhere (`test_unfiltered_syscalls_are_limited_by_their_rule`,
+  on macOS 15 and 26 in CI's macos-seatbelt job and on 27). What it opens to a compromised VMM: in a jail, the removal
+  of its own endpoints only, as its directory there is its own; outside a jail, of other microVMs' endpoints of the
+  same user, which that user's unjailed VMM can already reach (it runs as the user). A jail without a network gets no
+  such rule, and an endpoint at a path stays when its device goes.
 - **macOS jailer: a root supervisor per jail, for the freezer.** macOS has no cgroup freezer, so every jail gets a
   supervisor: a fork of the jailer made just before the exec, which stays root (`pid_suspend` needs root), in a
   session of its own, chrooted to `/var/empty`, with only its standard descriptors (standard error is

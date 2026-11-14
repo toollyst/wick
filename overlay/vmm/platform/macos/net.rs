@@ -37,6 +37,7 @@ use std::io;
 use std::mem;
 use std::os::raw::{c_int, c_uint};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -321,10 +322,13 @@ fn bind_at(sock: &OwnedFd, path: &Path, own: bool) -> io::Result<()> {
             if ret == 0 {
                 return Err(io::Error::from_raw_os_error(libc::EBUSY));
             }
-            if io::Error::last_os_error().raw_os_error() != Some(libc::ECONNREFUSED) {
-                return Err(err);
+            match io::Error::last_os_error().raw_os_error() {
+                Some(libc::ECONNREFUSED) => std::fs::remove_file(path)?,
+                // Removed since by the endpoint that had it, as it went
+                // (Drop): the name is free.
+                Some(libc::ENOENT) => {}
+                _ => return Err(err),
             }
-            std::fs::remove_file(path)?;
             try_bind()
         }
         other => other,
@@ -415,6 +419,12 @@ struct Endpoint {
     dir_path: Option<PathBuf>,
     /// In a jail: who may be a peer. Elsewhere any sender is one.
     switch: Option<Switch>,
+    /// The socket file it bound (device and inode), which it removes when
+    /// it goes ([`Drop`]).
+    bound: (u64, u64),
+    /// Named without a path, so in the directory of endpoints, whose
+    /// sockets a running microVM may remove (`ext::sandbox` unlink_rule).
+    named: bool,
     /// Where frames from the guest go: every host-side socket that sent a
     /// datagram here (in a jail: of the switch's).
     peers: Vec<Peer>,
@@ -450,13 +460,19 @@ impl Endpoint {
             Some((dir_path, fd)) if jail => Some(Switch::of(dir_path, fd)?),
             _ => None,
         };
-        in_dir(fd, || bind_at(&sock, path, fd.is_some()))?;
+        let bound = in_dir(fd, || {
+            bind_at(&sock, path, fd.is_some())?;
+            let meta = std::fs::symlink_metadata(path)?;
+            Ok((meta.dev(), meta.ino()))
+        })?;
         Ok(Endpoint {
             sock,
             path: path.to_owned(),
             dir: fd,
             dir_path: dir.map(|(p, _)| p.to_owned()),
             switch,
+            bound,
+            named: false,
             peers: Vec::new(),
             refused: 0,
             refused_senders: Vec::new(),
@@ -630,12 +646,48 @@ impl Endpoint {
     }
 }
 
-// No `Drop`: the socket file stays when the device goes, as the API socket
-// does, and the next bind at the path replaces it while the microVM is
-// built (`bind`, `test_stale_endpoint_replaced`). A running microVM may not
-// remove a socket: upstream's filters have no `unlink`, and the host sandbox
-// lets the run phase remove only this process's eventfd and timer FIFOs
-// (`vmm::ext::sandbox`); a device hot-plugged at a stale path is refused.
+/// A device that goes frees its interface's name, as closing a TAP does on
+/// Linux (drivers/net/tun.c, v6.1: `tun_chr_close`, whose `__tun_detach`
+/// unregisters a TAP nobody made persistent): the endpoint removes the
+/// socket file it bound, and only that one: a file at the name that is not
+/// it (another's, put there after) is left alone
+/// (`test_a_dropped_endpoint_frees_its_name`). The file is looked at and
+/// removed while the socket is still open, so to any other opener the name
+/// is in use until it is gone (`bind`). A running microVM removes only an
+/// endpoint named without a path, in the directory whose sockets its sandbox
+/// lets it remove (`ext::sandbox` unlink_rule: a refused or unplugged
+/// hot-plugged device, `test_a_hotplugged_endpoint_frees_its_name_when_it_goes`);
+/// one at a path stays, and the next bind at the path while a microVM is
+/// built replaces it. A process that ends without dropping its devices (a
+/// kill) leaves its files too: the next opener of the name replaces a stale
+/// one while its microVM is built (`test_stale_endpoint_replaced`), and the
+/// jailer removes a dead jail's at the next start of its id
+/// (jailer `test_a_second_jail_of_one_id_is_refused_and_the_first_keeps_its_endpoint`).
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        if crate::ext::sandbox::narrowed() && !(self.named && run_may_remove_endpoints()) {
+            return;
+        }
+        // In a jail's own directory, the openers' turn (`bind_at`).
+        let _turn = self
+            .dir
+            .map(|_| OWN_DIR_TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let _ = in_dir(self.dir, || {
+            let meta = std::fs::symlink_metadata(&self.path)?;
+            if meta.file_type().is_socket() && (meta.dev(), meta.ino()) == self.bound {
+                std::fs::remove_file(&self.path)?;
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Whether a running microVM's sandbox lets it remove the sockets of its
+/// directory of endpoints (`ext::sandbox` unlink_rule, which names that
+/// directory): with a network, or outside a jail.
+fn run_may_remove_endpoints() -> bool {
+    network().is_some() || crate::ext::jail::root().is_none()
+}
 
 #[derive(Debug)]
 enum Backend {
@@ -763,10 +815,14 @@ fn open_endpoint(
 ) -> Result<(String, Endpoint), TapError> {
     // In a jail the network is the jail's own directory in it.
     let jail = crate::ext::jail::root().is_some();
-    let open = |name: &str| match (dir, network) {
-        (Some(dir), Some(fd)) => Endpoint::open(Path::new(name), Some((dir, fd)), jail),
-        (Some(dir), None) => Endpoint::open(&dir.join(name), None, false),
-        (None, _) => Endpoint::open(Path::new(name), None, false),
+    let open = |name: &str| {
+        let mut ep = match (dir, network) {
+            (Some(dir), Some(fd)) => Endpoint::open(Path::new(name), Some((dir, fd)), jail),
+            (Some(dir), None) => Endpoint::open(&dir.join(name), None, false),
+            (None, _) => Endpoint::open(Path::new(name), None, false),
+        }?;
+        ep.named = dir.is_some();
+        Ok(ep)
     };
     let failed = |err: io::Error, name: &str| match err.raw_os_error() {
         Some(libc::ENAMETOOLONG) => TapError::InvalidIfname,
@@ -1218,10 +1274,9 @@ mod tests {
         let name = dir.as_path().join("ep0");
         assert_eq!(tap.if_name_as_str(), name.to_str().unwrap());
         assert!(name.exists());
-        // The name stays when the endpoint goes (the run phase may not
-        // remove a socket); the next bind replaces it.
+        // The name goes with the endpoint, and opens again.
         drop(tap);
-        assert!(name.exists());
+        assert!(!name.exists());
         drop(Tap::open_named(path.to_str().unwrap()).unwrap());
 
         let long = format!("/{}", "x".repeat(200));
@@ -1247,11 +1302,11 @@ mod tests {
         // A live one is busy, as a TAP opened twice.
         let busy = Tap::open_named(&name).unwrap_err();
         assert!(matches!(&busy, TapError::IfreqExecuteError(e, _) if e.raw_os_error() == Some(libc::EBUSY)), "{busy:?}");
-        // Left behind by an ended VM, replaced by the next.
+        // Gone with its device, as a TAP's name with its close.
         drop(tap);
-        assert!(path.exists());
+        assert!(!path.exists());
         drop(Tap::open_named(&name).unwrap());
-        std::fs::remove_file(&path).unwrap();
+        assert!(!path.exists());
     }
 
     // A device that goes frees its interface's name, as closing a TAP does
@@ -1261,7 +1316,6 @@ mod tests {
     // another put at the name after (its own socket, a regular file) is
     // left alone.
     #[test]
-    #[ignore = "fails until an endpoint removes its socket file when it goes (the next commit)"]
     fn test_a_dropped_endpoint_frees_its_name() {
         use std::os::unix::net::UnixDatagram;
         let name = format!("fcfree{}", std::process::id());
@@ -1403,7 +1457,7 @@ mod tests {
         let busy = Endpoint::open(Path::new("tap0"), Some((&net, dir.as_fd())), false).unwrap_err();
         assert_eq!(busy.raw_os_error(), Some(libc::EBUSY));
         drop(ep);
-        assert!(net.join("tap0").exists());
+        assert!(!net.join("tap0").exists());
         std::fs::remove_dir_all(&net).unwrap();
     }
 
@@ -1430,7 +1484,10 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
         assert!(own.join("tap0").exists());
         drop(ep);
-        // tap0 is now a stale name: of 8 openers at once, one replaces it.
+        assert!(!own.join("tap0").exists());
+        // A stale name, left by a VMM that ended without its drop: of 8
+        // openers at once, one replaces it.
+        in_dir(Some(dir.as_fd()), || bind_at(&dgram_socket()?, Path::new("tap0"), true)).unwrap();
         let start = Arc::new(Barrier::new(8));
         let results: Vec<_> = (0..8)
             .map(|_| {

@@ -1108,10 +1108,10 @@ mod tests {
         // An interface named without a path is an endpoint there.
         let tap = crate::platform::net::Tap::open_named("tap0").unwrap();
         assert!(want.join("tap0").exists());
-        // The socket file stays when the device goes, as the API socket
-        // does (platform::net, test_stale_endpoint_replaced).
+        // The socket file goes with the device, as a TAP's name with its
+        // close (platform::net, test_a_dropped_endpoint_frees_its_name).
         drop(tap);
-        assert!(want.join("tap0").exists());
+        assert!(!want.join("tap0").exists());
         println!("NETNS-ALONE-OK");
     }
 
