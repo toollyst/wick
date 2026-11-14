@@ -426,6 +426,11 @@ enum Kind {
         _section: Arc<Owned>,
         file: Option<Arc<Owned>>,
         charge: Option<Arc<Charge>>,
+        /// A released userfaultfd range's alias of the section, handed over
+        /// by [`uffd_unalias`] while the view has discarded pages
+        /// ([`STALE`]), which are zeroed through it at their first access;
+        /// unmapped with the view.
+        alias: Option<usize>,
     },
     /// Anonymous private memory on large pages of `page` bytes
     /// (`MAP_HUGETLB`): committed and locked when mapped, never a
@@ -688,6 +693,9 @@ fn to_placeholder(t: &mut Table, base: usize) -> bool {
     if matches!(r.kind, Kind::View { charge: Some(_), .. }) {
         charge_remove(base);
     }
+    if matches!(r.kind, Kind::View { .. }) {
+        unalias(base, r.len, &r.kind);
+    }
     r.kind = Kind::Placeholder;
     r.holes.clear();
     r.noaccess.clear();
@@ -703,6 +711,9 @@ fn release(t: &mut Table, base: usize) -> bool {
     }
     if matches!(r.kind, Kind::View { charge: Some(_), .. }) {
         charge_remove(base);
+    }
+    if matches!(r.kind, Kind::View { .. }) {
+        unalias(base, r.len, &r.kind);
     }
     // SAFETY: frees our allocation, view or placeholder.
     let ok = unsafe {
@@ -1205,9 +1216,15 @@ fn commit_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize
     // huge zero page for a read fault there and allocates (and charges)
     // nothing until a write (mm/huge_memory.c `do_huge_pmd_anonymous_page`,
     // `use_zero_page`, on by default).
+    if let Some(access) = resolve_stale(page, prot) {
+        let range = if access == Access::Committed { page..page + PAGE } else { 0..0 };
+        return (access, range);
+    }
     let grain = if write { lazy_grain(addr) } else { PAGE };
     let block = addr - addr % grain;
-    let (from, to) = if block >= s && block + grain <= s + n { (block, block + grain) } else { (page, page + PAGE) };
+    // Never a block over a discarded page, which is zeroed before it opens.
+    let whole = block >= s && block + grain <= s + n && stale_within(block, grain).is_empty();
+    let (from, to) = if whole { (block, block + grain) } else { (page, page + PAGE) };
     if commit(from, to - from, prot, false) {
         return (Access::Committed, from..to);
     }
@@ -1251,6 +1268,15 @@ pub(crate) fn prefault_lazy(addr: usize, len: usize) {
             if mbi.State != MEM_COMMIT && !commit(at, run, prot, false) {
                 // SAFETY: plain call.
                 out_of_memory(at, unsafe { GetLastError() });
+            }
+            if mbi.State == MEM_COMMIT {
+                for (ss, sl) in stale_within(at, run) {
+                    for page in (ss..ss + sl).step_by(PAGE) {
+                        if let Some(Access::Exhausted(err)) = resolve_stale(page, prot) {
+                            out_of_memory(page, err);
+                        }
+                    }
+                }
             }
             at += run;
         }
@@ -1374,8 +1400,16 @@ fn protect_lazy(t: &mut Table, b: usize, s: usize, e: usize, wprot: PAGE_PROTECT
             return false;
         }
         let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(e) - at;
-        if mbi.State == MEM_COMMIT && !protect(at, run, wprot) {
-            return false;
+        if mbi.State == MEM_COMMIT {
+            // A discarded page stays closed until its first access zeroes
+            // it ([`STALE`]), which gives it the protection then asked for.
+            let mut p = at;
+            for (ss, sl) in stale_within(at, run).into_iter().chain([(at + run, 0)]) {
+                if ss > p && !protect(p, ss - p, wprot) {
+                    return false;
+                }
+                p = ss + sl;
+            }
         }
         at += run;
     }
@@ -1673,6 +1707,7 @@ fn fill(
             _section: section,
             file,
             charge,
+            alias: None,
         }
     };
     t.get_mut(&base).unwrap().kind = kind;
@@ -2233,8 +2268,9 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
                 if r.lazy {
                     // Its pages not committed fault already; the committed
                     // ones are made to (Windows protects no page that is only
-                    // reserved).
+                    // reserved). A discarded page's stays unopened.
                     lazy_remove(s, e - s);
+                    stale_remove(s, e - s);
                     protect_committed(s, e, PAGE_NOACCESS);
                 } else {
                     protect(s, e - s, PAGE_NOACCESS);
@@ -2451,6 +2487,7 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
         _section: section,
         file: None,
         charge: paid,
+        alias: None,
     };
     // A section is committed when it is touched, as the userfaultfd fills it.
     if r.lazy {
@@ -2484,15 +2521,130 @@ pub(crate) fn uffd_uncharge(s: usize, len: usize) {
 }
 
 /// Pages `[s, s + len)` of a userfaultfd range's reserved section that were
-/// discarded and become ordinary memory, zeroed, once the range is released:
-/// charged again first, as zeroing makes them memory again. Past the jail's
-/// limit the VMM ends as at a lazy page's commit ([`out_of_memory`], exit
-/// 137), where Linux would charge each page at its next touch.
-pub(crate) fn uffd_recharge(s: usize, len: usize) {
-    if !charge(s, len) {
-        // SAFETY: plain call.
-        out_of_memory(s, unsafe { GetLastError() });
+/// discarded and become ordinary memory once the range is released, `alias`
+/// their address in its alias: lazy, each zeroed and charged at its first
+/// access ([`STALE`]), as Linux charges the page it faults in for a zapped
+/// one at its next touch. Nothing is done unless a view of a mapping holds
+/// all of the pages.
+pub(crate) fn uffd_stale(s: usize, len: usize, alias: usize) {
+    let mut t = table().lock().unwrap();
+    if let Some((&b, r)) = t.range_mut(..=s).next_back() {
+        if matches!(r.kind, Kind::View { .. }) && s + len <= b + r.len {
+            r.lazy = true;
+            lazy_add(s, len, PAGE_READWRITE);
+            let mut m = STALE.lock().unwrap();
+            m.insert(s, (len, alias));
+            STALE_SET.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
+}
+
+/// Discarded pages of a released userfaultfd range ([`uffd_stale`]): start
+/// to `(len, the alias's address of start)`. Each is committed (a section's
+/// page cannot be decommitted: SECTREC-h), `PAGE_NOACCESS`, uncharged
+/// ([`uffd_uncharge`]), and holds what the discard left, which
+/// `DiscardVirtualMemory` does not make zeros. Its first access, by a host
+/// thread or a vCPU (WHP keeps the host's protection, so a vCPU's access
+/// exits to [`wick_mm::commit_on_access`]), charges it, zeroes it through the
+/// alias while it is still closed, and opens it ([`resolve_stale`]): no
+/// thread or vCPU sees what was there. Taken after the table's lock and
+/// before [`CHARGES`].
+static STALE: Mutex<BTreeMap<usize, (usize, usize)>> = Mutex::new(BTreeMap::new());
+/// Whether [`STALE`] has any: the access path's one look at it otherwise.
+static STALE_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The runs of `[s, s + len)` that are [`STALE`].
+fn stale_within(s: usize, len: usize) -> Vec<(usize, usize)> {
+    if !STALE_SET.load(std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
+    let e = s.saturating_add(len);
+    let m = STALE.lock().unwrap();
+    let first = m.range(..=s).next_back().map_or(s, |(b, _)| *b);
+    m.range(first..e)
+        .filter_map(|(&b, &(n, _))| {
+            let (a, z) = (s.max(b), e.min(b + n));
+            (a < z).then_some((a, z - a))
+        })
+        .collect()
+}
+
+/// Takes `[s, s + len)` out of [`STALE`].
+fn stale_cut(m: &mut BTreeMap<usize, (usize, usize)>, s: usize, len: usize) {
+    let e = s.saturating_add(len);
+    let first = m.range(..=s).next_back().map_or(s, |(b, _)| *b);
+    let hit: Vec<(usize, usize, usize)> =
+        m.range(first..e).filter(|(&b, &(n, _))| b < e && s < b + n).map(|(&b, &(n, a))| (b, n, a)).collect();
+    for (b, n, a) in hit {
+        m.remove(&b);
+        if b < s {
+            m.insert(b, (s - b, a));
+        }
+        if e < b + n {
+            m.insert(e, (b + n - e, a + (e - b)));
+        }
+    }
+    STALE_SET.store(!m.is_empty(), std::sync::atomic::Ordering::Release);
+}
+
+/// `[s, s + len)` is unmapped: none of it is [`STALE`] any longer.
+fn stale_remove(s: usize, len: usize) {
+    if STALE_SET.load(std::sync::atomic::Ordering::Acquire) {
+        stale_cut(&mut STALE.lock().unwrap(), s, len);
+    }
+}
+
+/// The first access to `page` if it is [`STALE`]: charged, zeroed through
+/// the alias while still closed, then given `prot`. `None` if it is not.
+fn resolve_stale(page: usize, prot: PAGE_PROTECTION_FLAGS) -> Option<Access> {
+    if !STALE_SET.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let mut m = STALE.lock().unwrap();
+    let (&b, &(_, alias)) = m.range(..=page).next_back().filter(|(b, (n, _))| page < **b + n)?;
+    if !charge(page, PAGE) {
+        // SAFETY: plain call.
+        return Some(Access::Exhausted(unsafe { GetLastError() }));
+    }
+    // SAFETY: the alias of the page: the userfaultfd's until it is released,
+    // then the view's ([`uffd_unalias`]), unmapped only once its pages are
+    // out of `STALE` (taken out under this lock, `unalias`).
+    unsafe { std::ptr::write_bytes((alias + (page - b)) as *mut u8, 0, PAGE) };
+    if !protect(page, PAGE, prot) {
+        // Unmapped meanwhile: the access faults, as on Linux.
+        return Some(Access::NotLazy);
+    }
+    stale_cut(&mut m, page, PAGE);
+    drop(m);
+    touched_mark(page, PAGE, true);
+    Some(Access::Committed)
+}
+
+/// The view at `base` (`len` bytes, `kind`) is going: its pages out of
+/// [`STALE`], then the alias it was handed, if any, unmapped.
+fn unalias(base: usize, len: usize, kind: &Kind) {
+    stale_remove(base, len);
+    if let Kind::View { alias: Some(alias), .. } = kind {
+        // SAFETY: unmaps the alias view made by `uffd_alias`.
+        unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: *alias as *mut c_void }, 0) };
+    }
+}
+
+/// A userfaultfd range `[start, start + len)` is released, its alias at
+/// `alias` ([`uffd_alias`]) no longer the userfaultfd's: handed to the view
+/// if the view has discarded pages still to zero ([`STALE`]), which keeps it
+/// until it goes, else unmapped now.
+pub(crate) fn uffd_unalias(start: usize, len: usize, alias: usize) {
+    let mut t = table().lock().unwrap();
+    if !stale_within(start, len).is_empty() {
+        if let Some(Kind::View { alias: kept @ None, .. }) = t.get_mut(&start).map(|r| &mut r.kind) {
+            *kept = Some(alias);
+            return;
+        }
+    }
+    drop(t);
+    // SAFETY: unmaps the alias view.
+    unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, 0) };
 }
 
 /// The bytes of the charge registered for the view at `view` that are
@@ -2539,11 +2691,6 @@ pub(crate) fn uffd_lazy(s: usize, len: usize) {
     }
 }
 
-/// Unmaps an alias made by [`uffd_alias`].
-pub(crate) fn uffd_unalias(alias: usize) {
-    // SAFETY: unmaps the alias view.
-    unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, 0) };
-}
 
 /// `madvise`. Discarding registered userfaultfd memory makes the pages of
 /// what was discarded missing again (`wick_uffd::discarding`), as on Linux.

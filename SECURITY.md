@@ -277,7 +277,8 @@ upstream Firecracker and its jailer.
   its charge when the handler fills it, and a fill past `memory.max` fails with `ENOMEM`, as Linux's `UFFDIO_COPY`
   does when the memory cgroup refuses the page (`test_a_fill_past_the_job_limit_fails_with_enomem`, which passed in
   CI run 43534301411). A page discarded with `MADV_DONTNEED` (a balloon inflation, free page reporting) gives its
-  charge back, as the memory cgroup uncharges it, and a refill charges it again; its section page stays committed
+  charge back, as the memory cgroup uncharges it, and a refill charges it again (or, once the range is unregistered,
+  its first access, which zeroes it before it opens); its section page stays committed
   (a SEC_RESERVE page cannot be decommitted), host commit that is neither memory nor the job's
   (`test_registered_memory_is_charged_as_it_is_filled`; not yet run on Windows). Still not charged: memfds and
   sections made around wick.

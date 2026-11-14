@@ -420,9 +420,11 @@ fn with_memory(range: &Range, addr: u64, len: u64) -> Vec<(u64, u64)> {
 
 /// Missing pages `[s, s + len)` of `range`, whose alias is at `alias` and
 /// which starts at `base`, become ordinary memory: those with memory
-/// (filled once, then discarded) read zeros, as Linux gives, and are made
-/// accessible; those never filled, in a reserved section, become lazy
-/// memory (`windows_mm::uffd_lazy`).
+/// (filled once, then discarded) read zeros, as Linux gives: in a reserved
+/// section zeroed and charged at their first access
+/// (`windows_mm::uffd_stale`), elsewhere zeroed and made accessible now;
+/// those never filled, in a reserved section, become lazy memory
+/// (`windows_mm::uffd_lazy`).
 fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io::Result<()> {
     let runs = with_memory(range, s, len);
     let mut at = s;
@@ -432,15 +434,17 @@ fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io
             crate::windows_mm::uffd_lazy(at as usize, (a - at) as usize);
         }
         if l > 0 {
-            // Discarded, so its charge was given back (`discarding`): charged
-            // again before it is zeroed, which makes it memory again.
-            #[allow(clippy::cast_possible_truncation)]
             if range.reserved.load(Ordering::Acquire) {
-                crate::windows_mm::uffd_recharge(a as usize, l as usize);
+                // Discarded, its charge given back (`discarding`): lazy, zeroed
+                // and charged at its first access, as Linux charges the page
+                // it faults in for a zapped one at its next touch.
+                #[allow(clippy::cast_possible_truncation)]
+                crate::windows_mm::uffd_stale(a as usize, l as usize, (alias + (a - base)) as usize);
+            } else {
+                // SAFETY: the alias of registered memory.
+                unsafe { ptr::write_bytes((alias + (a - base)) as *mut u8, 0, l as usize) };
+                protect(a, l, true)?;
             }
-            // SAFETY: the alias of registered memory.
-            unsafe { ptr::write_bytes((alias + (a - base)) as *mut u8, 0, l as usize) };
-            protect(a, l, true)?;
         }
         at = a + l;
     }
@@ -858,7 +862,10 @@ fn destroy(ctx: usize) {
         REGISTERED.fetch_sub(1, Ordering::AcqRel);
         let alias = r.alias.swap(0, Ordering::AcqRel);
         if alias != 0 {
-            crate::windows_mm::uffd_unalias(alias as usize);
+            // Kept with the mapping while its discarded pages are still to
+            // be zeroed through it (`windows_mm::uffd_stale`).
+            #[allow(clippy::cast_possible_truncation)]
+            crate::windows_mm::uffd_unalias(s as usize, (e - s) as usize, alias as usize);
         }
         wake(s, e - s);
     }
@@ -1168,10 +1175,10 @@ mod tests {
     /// committed and charged; a discarded page's charge is given back, as
     /// the memory cgroup uncharges it, and its commit stays (a section's
     /// page cannot be decommitted: SECTREC-h, error 87); a refill charges it
-    /// again; once unregistered, the discarded page, zeroed, is charged
-    /// again, and a page never filled is committed and charged at its first
-    /// access, a read included, as a shmem page is; the charge goes with
-    /// the mapping. Before, the whole section was committed at the
+    /// again; once unregistered, the discarded page is zeroed and charged at
+    /// its first access, and a page never filled is committed and charged at
+    /// its first access, both a read included, as a shmem page is; the
+    /// charge goes with the mapping. Before, the whole section was committed at the
     /// registration and charged to no job.
     #[test]
     fn test_registered_memory_is_charged_as_it_is_filled() {
@@ -1211,12 +1218,15 @@ mod tests {
         assert_eq!(unsafe { crate::madvise((mem + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
         assert_eq!(charged(), 4 * PAGE as usize, "a page discarded twice");
         unregister(ctx, mem, len).unwrap();
-        // The discarded page, made ordinary zeroed memory, is charged again.
-        assert_eq!(charged(), 5 * PAGE as usize, "the discarded page's charge at the unregister");
+        // The discarded page is charged at its first access, as Linux
+        // charges the page it faults in then, not at the unregister.
+        assert_eq!(charged(), 4 * PAGE as usize, "the discarded page's charge at the unregister");
         // SAFETY: ordinary memory now: the discarded page reads zeros, and
         // a page never filled is committed at its read.
         unsafe {
             assert_eq!(*((mem + PAGE) as *const u8), 0);
+            assert_eq!(charged(), 5 * PAGE as usize, "the discarded page's charge at its first read");
+            assert!(std::slice::from_raw_parts((mem + PAGE) as *const u8, PAGE as usize).iter().all(|&b| b == 0));
             assert_eq!(*((mem + 3 * PAGE + 9) as *const u8), 0x5a);
             assert_eq!(*((mem + 20 * PAGE) as *const u8), 0);
             *((mem + 21 * PAGE) as *mut u8) = 1;
