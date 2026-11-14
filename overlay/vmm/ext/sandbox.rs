@@ -4190,6 +4190,54 @@ mod macos {
             println!("CHILD-SURVIVED");
         }
 
+        // A name in use hot-plugged again is busy (EBUSY), as a second
+        // TUNSETIFF on a TAP another file holds (drivers/net/tun.c, v6.1,
+        // tun_attach :769 to :771): upstream's test_hotplug_net expects
+        // "Resource busy" for a device that reuses another's TAP. A stale
+        // name, which the run phase does not replace, stays EADDRINUSE.
+        #[test]
+        #[ignore = "fails until a running microVM's bind tells a name in use from a stale one (the next commit)"]
+        fn test_a_hotplugged_name_in_use_is_busy() {
+            let pid = std::process::id().to_string();
+            let out = child("endpoint_busy_child", &[("WICK_TEST_CASE", &pid)]);
+            // The stale name the child could not remove.
+            let _ = std::fs::remove_file(crate::platform::net::user_endpoint_dir().unwrap().join(format!("fchs{pid}")));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(stdout.contains("BUSY") && stdout.contains("STALE-IN-USE"), "{}", text(&out));
+            assert!(stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_a_hotplugged_name_in_use_is_busy in a separate process"]
+        fn endpoint_busy_child() {
+            use crate::platform::net::{Tap, TapError};
+            let pid = std::env::var("WICK_TEST_CASE").unwrap();
+            let (name, stale) = (format!("fchb{pid}"), format!("fchs{pid}"));
+            let dir = crate::platform::net::user_endpoint_dir().unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            // A socket file nobody receives on: a killed VMM's.
+            drop(std::os::unix::net::UnixDatagram::bind(dir.join(&stale)).unwrap());
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            let first = Tap::open_named(&name).unwrap();
+            let code = |r: Result<Tap, TapError>| match r {
+                Err(TapError::IfreqExecuteError(e, _)) => e.raw_os_error(),
+                _ => None,
+            };
+            if code(Tap::open_named(&name)) == Some(libc::EBUSY) {
+                println!("BUSY");
+            }
+            if code(Tap::open_named(&stale)) == Some(libc::EADDRINUSE) {
+                println!("STALE-IN-USE");
+            }
+            drop(first);
+            // Time for a denial's kill to land.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            println!("CHILD-SURVIVED");
+        }
+
         // The same in a network given without the jailer (WICK_NETNS, as
         // the user-mode harness's stand-in jailer gives it): the endpoint is
         // in that directory, whose sockets the profile lets a running
