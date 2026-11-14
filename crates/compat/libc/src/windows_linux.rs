@@ -130,6 +130,9 @@ unsafe extern "C" {
     pub fn ioctl(fd: c_int, request: Ioctl, ...) -> c_int;
 }
 
+/// `ioctl` request: set or clear `O_NONBLOCK` (Linux's value, both
+/// architectures: include/uapi/asm-generic/ioctls.h).
+pub const FIONBIO: Ioctl = 0x5421;
 /// Block device ioctl: logical sector size.
 pub const BLKSSZGET: Ioctl = 0x1268;
 /// Block device ioctl: physical sector size.

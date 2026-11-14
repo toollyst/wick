@@ -1999,6 +1999,44 @@ mod tests {
         to_fd(f.as_raw_handle())
     }
 
+    /// `ioctl(FIONBIO)` sets and clears `O_NONBLOCK` as Linux's does (v6.1
+    /// fs/ioctl.c:341-361 `ioctl_fionbio`, reached for any descriptor from
+    /// `do_vfs_ioctl`, 788: the open file's `f_flags`), so `F_GETFL` shows
+    /// it, on a pipe and on a socket, and the descriptor's calls stop
+    /// waiting: a read of the empty pipe fails with `EAGAIN`.
+    #[test]
+    #[ignore = "written before ioctl(FIONBIO), which it tests; fails until it lands"]
+    fn test_fionbio_sets_and_clears_o_nonblocking() {
+        let mut fds = [0 as c_int; 2];
+        // SAFETY: two descriptors' room.
+        assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: plain call.
+        let sock = unsafe { crate::socket(crate::AF_INET, crate::SOCK_STREAM, 0) };
+        assert!(sock >= 0);
+        for fd in [fds[0], sock] {
+            for on in [1, 0, 1] {
+                let mut arg: c_int = on;
+                // SAFETY: `FIONBIO` takes an `int`.
+                let r = unsafe { crate::ioctl(fd, crate::FIONBIO, &raw mut arg) };
+                let error = std::io::Error::last_os_error();
+                assert_eq!(r, 0, "ioctl(FIONBIO, {on}) of {fd}: {error}");
+                // SAFETY: plain call.
+                let flags = unsafe { fcntl(fd, F_GETFL) };
+                assert_eq!(flags & O_NONBLOCK, if on == 1 { O_NONBLOCK } else { 0 }, "F_GETFL of {fd} after FIONBIO {on}");
+            }
+        }
+        let mut b = [0u8; 1];
+        // SAFETY: the pipe's read end, non-blocking now.
+        let n = unsafe { read(fds[0], b.as_mut_ptr().cast(), 1) };
+        assert_eq!((n, std::io::Error::last_os_error().raw_os_error()), (-1, Some(crate::EAGAIN)));
+        // SAFETY: our descriptors.
+        unsafe {
+            close(fds[0]);
+            close(fds[1]);
+            close(sock);
+        }
+    }
+
     /// A blocking pipe's read into mapped memory it cannot write, and its
     /// write from mapped memory it cannot read, go through a copy
     /// ([`read_through_copy`], [`write_through_copy`]) and fail with

@@ -239,7 +239,13 @@ semantics on Win32. The details are in the comments of each
   `O_NONBLOCK`, memfd seal sections) is keyed by the fd value. A duplicate of
   the handle and `CompareObjectHandles` check that the fd still names the same
   object (`dup` copies the state, `close` removes it); state of fds that std
-  closed is swept when the table grows.
+  closed is swept when the table grows. Not yet: a socket made non-blocking
+  through wick_os (`set_nonblocking`, `ioctlsocket`) is not `O_NONBLOCK` to
+  the libc, and `ioctl(FIONBIO)` is `ENOTTY`, where Linux's `FIONBIO` sets
+  `O_NONBLOCK` in the open file's flags (v6.1 fs/ioctl.c:341-361
+  `ioctl_fionbio`) and its std's `set_nonblocking` is that `ioctl`; tests
+  written before the fix: `test_fionbio_sets_and_clears_o_nonblocking`,
+  `test_a_socket_made_non_blocking_by_wick_os_is_o_nonblocking_to_the_libc`.
 - **epoll = IOCP (the `polling` crate).** Sockets use AFD polls; eventfds,
   consoles and other waitable handles use wait packets that complete on the
   IOCP. Level-triggered is the default and `ONE_SHOT` is supported. Sockets
