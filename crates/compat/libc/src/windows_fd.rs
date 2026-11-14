@@ -68,7 +68,7 @@ use windows_sys::Win32::Foundation::{
     HANDLE_FLAG_INHERIT, SetHandleInformation, SetLastError,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    FIONBIO, SO_TYPE, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, closesocket, getsockopt,
+    FIONBIO, FIONREAD, SO_TYPE, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, closesocket, getsockopt,
     ioctlsocket, recv, send,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -83,7 +83,7 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Pipes::{
-    CreatePipe, PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_WAIT, SetNamedPipeHandleState,
+    CreatePipe, PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_WAIT, PeekNamedPipe, SetNamedPipeHandleState,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -432,6 +432,13 @@ pub mod wick_fd {
         table().lock().unwrap().remove(&fd);
     }
 
+    /// Whether `fd` is `O_NONBLOCK` as this library knows it (`fcntl`'s
+    /// `F_SETFL`, `SOCK_NONBLOCK`), without making it an entry.
+    pub(crate) fn nonblocking(fd: c_int) -> bool {
+        let mut map = table().lock().unwrap();
+        live(&mut map, fd) && map[&fd].flags.load(Ordering::Relaxed) & crate::O_NONBLOCK != 0
+    }
+
     /// The status flags (`O_NONBLOCK`) of `fd`'s open file.
     pub(crate) fn flags(fd: c_int) -> Arc<AtomicI32> {
         let mut map = table().lock().unwrap();
@@ -686,14 +693,180 @@ fn before_call() {
     });
 }
 
-/// `read`.
+/// Whether a call on `fd` may wait without end: not a regular file's
+/// (`FILE_TYPE_DISK`), and not `O_NONBLOCK` as this library knows it. A
+/// socket made non-blocking past this library (wick_os's `ioctlsocket`) is
+/// taken as blocking: its calls on mapped memory go through a buffer of
+/// their own, a copy more, and never hold a discard
+/// ([`crate::windows_mm::copying`]).
+fn may_block(fd: c_int) -> bool {
+    // SAFETY: plain call; a closed descriptor's call fails after.
+    if !is_socket(fd) && unsafe { GetFileType(handle(fd)) } == FILE_TYPE_DISK {
+        return false;
+    }
+    !wick_fd::nonblocking(fd)
+}
+
+/// Whether a read of `fd` returns at once, with what has arrived: bytes
+/// waiting on a socket (`FIONREAD`) or in a pipe (`PeekNamedPipe`). Such a
+/// read on mapped memory is counted in flight ([`read`]) rather than made
+/// through a copy: vsock's reads, on sockets made non-blocking through
+/// wick_os ([`may_block`]), come when its event loop finds them readable.
+/// A second reader of the same descriptor taking the bytes first leaves
+/// this read waiting, and a discard of its buffer with it, until more come.
+fn has_data(fd: c_int) -> bool {
+    if is_socket(fd) {
+        let mut n = 0u32;
+        // SAFETY: `FIONREAD` takes a `u32`.
+        return unsafe { ioctlsocket(socket(fd), FIONREAD, &mut n) } == 0 && n > 0;
+    }
+    let mut avail = 0u32;
+    // SAFETY: plain calls; the peek reads nothing.
+    unsafe {
+        GetFileType(handle(fd)) == FILE_TYPE_PIPE
+            && PeekNamedPipe(handle(fd), std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) != 0
+            && avail > 0
+    }
+}
+
+std::thread_local! {
+    /// This thread's buffer for the calls through a copy, kept between them.
+    static COPY: core::cell::Cell<std::vec::Vec<u8>> = const { core::cell::Cell::new(std::vec::Vec::new()) };
+}
+
+/// Runs `f` on `n` bytes of this thread's [`COPY`] (taken out while `f`
+/// runs, so that a call within `f` gets a buffer of its own).
+fn with_copy<T>(n: usize, f: impl FnOnce(&mut [u8]) -> T) -> T {
+    let mut v = COPY.take();
+    if v.len() < n {
+        v.resize(n, 0);
+    }
+    let r = f(&mut v[..n]);
+    COPY.set(v);
+    r
+}
+
+/// The most a call through a buffer of its own moves at once
+/// ([`read_through_copy`], [`write_through_copy`]): a read of a pipe or a
+/// socket gives what has arrived, so a shorter read is one Linux gives too;
+/// a write goes on in pieces of this size.
+const COPY_MAX: usize = 1 << 20;
+
+/// A read on a descriptor that may wait without end ([`may_block`]) into
+/// mapped memory: into a buffer of its own, copied into the caller's after,
+/// as the guest's own access, which faults missing and lazy pages in. A
+/// discard of the caller's buffer meanwhile ([`crate::windows_mm::copying`])
+/// neither waits for the call nor fails it, as Linux's copy faults the page
+/// in again. The buffer's pages are faulted in first and asked about
+/// ([`crate::windows_mm::accessible`]), so that one Linux's copy would fail
+/// fails with `EFAULT` before the call takes anything.
+///
+/// # Safety
+/// `buf` must be valid for `count` bytes of writes.
+unsafe fn read_through_copy(buf: *mut c_void, count: usize, call: impl FnOnce(*mut c_void, usize) -> ssize_t) -> ssize_t {
+    let n = count.min(COPY_MAX);
+    crate::wick_uffd::prefault(buf as u64, n as u64, true);
+    if !crate::windows_mm::accessible(buf as usize, n, true) {
+        set_errno(crate::EFAULT);
+        return -1;
+    }
+    with_copy(n, |copy| {
+        before_call();
+        let r = call(copy.as_mut_ptr().cast(), n);
+        if r > 0 {
+            // SAFETY: `r` bytes of `copy` were read, and the caller's buffer
+            // holds `n >= r`.
+            unsafe { std::ptr::copy_nonoverlapping(copy.as_ptr(), buf.cast::<u8>(), r.unsigned_abs()) };
+        }
+        r
+    })
+}
+
+/// A write on a descriptor that may wait without end ([`may_block`]) from
+/// mapped memory: from a copy of the caller's buffer, made as the guest's
+/// own access (the untouched lazy memory as the zeros it reads as, without
+/// committing it, as [`from_lazy`]), in pieces of up to [`COPY_MAX`], each
+/// one `emit`, stopping at a short piece or an error as a short write does.
+/// A part of the buffer Linux's copy would fail (not readable once faulted
+/// in) fails the write with `EFAULT`, or ends it short after what was
+/// written.
+///
+/// # Safety
+/// `buf` must be valid for `count` bytes of reads.
+unsafe fn write_through_copy(buf: *const c_void, count: usize, emit: impl FnMut(*const c_void, usize) -> ssize_t) -> ssize_t {
+    // SAFETY: the caller's contract.
+    with_copy(count.min(COPY_MAX), |copy| unsafe { write_from_copy(buf, count, copy, emit) })
+}
+
+/// [`write_through_copy`] through `copy`.
+///
+/// # Safety
+/// `buf` must be valid for `count` bytes of reads.
+unsafe fn write_from_copy(buf: *const c_void, count: usize, copy: &mut [u8], mut emit: impl FnMut(*const c_void, usize) -> ssize_t) -> ssize_t {
+    let mut total = 0usize;
+    while total < count {
+        let n = (count - total).min(COPY_MAX);
+        let at = buf as usize + total;
+        crate::wick_uffd::prefault_registered(at as u64, n as u64, false);
+        let mut runs = std::vec::Vec::new();
+        crate::windows_mm::zero_runs(at, n, |s, l, zeros| runs.push((s, l, zeros)));
+        for (s, l, zeros) in runs {
+            let piece = &mut copy[s - at..s - at + l];
+            if zeros {
+                piece.fill(0);
+                continue;
+            }
+            crate::windows_mm::prefault_lazy(s, l);
+            if !crate::windows_mm::accessible(s, l, false) {
+                set_errno(crate::EFAULT);
+                return if total > 0 { total as ssize_t } else { -1 };
+            }
+            // SAFETY: `[s, s + l)` is part of the caller's buffer, readable.
+            unsafe { std::ptr::copy_nonoverlapping(s as *const u8, piece.as_mut_ptr(), l) };
+        }
+        before_call();
+        let r = emit(copy.as_ptr().cast(), n);
+        if r < 0 {
+            return if total > 0 { total as ssize_t } else { -1 };
+        }
+        total += r.unsigned_abs();
+        if r.unsigned_abs() < n {
+            break;
+        }
+    }
+    total as ssize_t
+}
+
+/// `read`. Into mapped memory, a call that ends (a regular file's, an
+/// `O_NONBLOCK` descriptor's, one with bytes waiting: [`has_data`]) is
+/// counted in flight on its buffer ([`crate::windows_mm::copying`]), and one
+/// that may wait without end reads through a buffer of its own
+/// ([`read_through_copy`]).
 ///
 /// # Safety
 /// `buf` must be valid for `count` bytes of writes.
 pub unsafe fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
+    let mapped = crate::windows_mm::mapped(buf as usize, count);
+    if mapped && may_block(fd) && !has_data(fd) {
+        // SAFETY: `read_now` gets the copy, valid for its length.
+        let call = |b, n| unsafe { read_now(fd, b, n) };
+        // SAFETY: the caller's contract.
+        return unsafe { read_through_copy(buf, count, call) };
+    }
+    // From before the prefault to the call's end.
+    let _call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
     // Windows fails a read into missing userfaultfd pages; Linux waits.
     crate::wick_uffd::prefault(buf as u64, count as u64, true);
     before_call();
+    // SAFETY: the caller's contract.
+    unsafe { read_now(fd, buf, count) }
+}
+
+/// [`read`] into a buffer whose pages a system call can write.
+///
+/// # Safety
+/// `buf` must be valid for `count` bytes of writes.
+unsafe fn read_now(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
     if let Some(timer) = crate::windows_time::lookup(fd) {
         // SAFETY: the caller's contract.
         let b = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), count) };
@@ -749,6 +922,7 @@ static ZEROS: [u8; 64 << 10] = [0; 64 << 10];
 /// Linux's write of a regular file holds the inode's lock for the whole.
 fn from_lazy(fd: c_int, buf: *const c_void, count: usize, mut emit: impl FnMut(*const c_void, usize) -> ssize_t) -> ssize_t {
     crate::wick_uffd::prefault_registered(buf as u64, count as u64, false);
+    before_call();
     let mut any = false;
     crate::windows_mm::zero_runs(buf as usize, count, |_, _, zeros| any |= zeros);
     if !any {
@@ -794,15 +968,24 @@ fn from_lazy(fd: c_int, buf: *const c_void, count: usize, mut emit: impl FnMut(*
     total as ssize_t
 }
 
-/// `write`.
+/// `write`. From mapped memory, a call that ends is counted in flight on
+/// its buffer ([`crate::windows_mm::copying`]), and one that may wait
+/// without end writes from a copy ([`write_through_copy`]).
 ///
 /// # Safety
 /// `buf` must be valid for `count` bytes of reads.
 pub unsafe fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
-    from_lazy(fd, buf, count, |buf, count| {
+    let emit = |buf, count| {
         // SAFETY: a part of the caller's buffer, or a copy of it.
         unsafe { write_now(fd, buf, count) }
-    })
+    };
+    let mapped = crate::windows_mm::mapped(buf as usize, count);
+    if mapped && may_block(fd) {
+        // SAFETY: the caller's contract.
+        return unsafe { write_through_copy(buf, count, emit) };
+    }
+    let _call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
+    from_lazy(fd, buf, count, emit)
 }
 
 /// [`write`] of a buffer whose pages a system call can read.
@@ -857,16 +1040,36 @@ fn keeping_position(h: HANDLE, f: impl FnOnce() -> ssize_t) -> ssize_t {
     r
 }
 
-/// `pread`.
+/// `pread`, as [`read`] for mapped memory.
 ///
 /// # Safety
 /// `buf` must be valid for `count` bytes of writes.
 pub unsafe fn pread(fd: c_int, buf: *mut c_void, count: size_t, offset: off_t) -> ssize_t {
+    let mapped = crate::windows_mm::mapped(buf as usize, count);
+    if mapped && may_block(fd) && !has_data(fd) {
+        // SAFETY: `pread_now` gets the copy, valid for its length.
+        let call = |b, n| unsafe { pread_now(fd, b, n, offset) };
+        // SAFETY: the caller's contract.
+        return unsafe { read_through_copy(buf, count, call) };
+    }
+    let _call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
+    crate::wick_uffd::prefault(buf as u64, count as u64, true);
+    before_call();
+    // SAFETY: the caller's contract.
+    unsafe { pread_now(fd, buf, count, offset) }
+}
+
+/// [`pread`] into a buffer whose pages a system call can write, not counted
+/// in flight: for `windows_mm`, which holds its table, filling its own
+/// memory.
+///
+/// # Safety
+/// `buf` must be valid for `count` bytes of writes.
+pub(crate) unsafe fn pread_now(fd: c_int, buf: *mut c_void, count: size_t, offset: off_t) -> ssize_t {
     if offset < 0 {
         set_errno(crate::EINVAL);
         return -1;
     }
-    crate::wick_uffd::prefault(buf as u64, count as u64, true);
     let h = handle(fd);
     keeping_position(h, || read_handle(h, buf, count, Some(offset)))
 }
@@ -889,13 +1092,18 @@ pub unsafe fn pwrite(fd: c_int, buf: *const c_void, count: size_t, offset: off_t
     };
     let h = handle(fd);
     let mut at = offset;
-    keeping_position(h, || {
-        from_lazy(fd, buf, count, |buf, count| {
-            let n = write_handle(h, buf, count, Some(at));
-            at += n.max(0) as i64;
-            n
-        })
-    })
+    let emit = |buf, count| {
+        let n = write_handle(h, buf, count, Some(at));
+        at += n.max(0) as i64;
+        n
+    };
+    let mapped = crate::windows_mm::mapped(buf as usize, count);
+    if mapped && may_block(fd) {
+        // SAFETY: the caller's contract.
+        return keeping_position(h, || unsafe { write_through_copy(buf, count, emit) });
+    }
+    let _call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
+    keeping_position(h, || from_lazy(fd, buf, count, emit))
 }
 
 /// The size a memfd sealed against growing may not exceed.
@@ -1789,6 +1997,46 @@ mod tests {
 
     fn fd_of(f: &std::fs::File) -> c_int {
         to_fd(f.as_raw_handle())
+    }
+
+    /// A blocking pipe's read into mapped memory it cannot write, and its
+    /// write from mapped memory it cannot read, go through a copy
+    /// ([`read_through_copy`], [`write_through_copy`]) and fail with
+    /// `EFAULT` before the call, as Linux's copy fails them (v6.1
+    /// fs/pipe.c `pipe_read`: `copy_page_to_iter` short, `-EFAULT`, the
+    /// pipe's bytes left in it), not in a fault of the copy: the bytes stay
+    /// in the pipe, and a read into a buffer of the heap then takes them.
+    #[test]
+    fn test_a_copy_through_unusable_mapped_memory_is_efault() {
+        let mut fds = [0 as c_int; 2];
+        // SAFETY: two descriptors' room.
+        assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        let len = 64 * 1024;
+        // SAFETY: new anonymous mappings.
+        let (ro, none) = unsafe {
+            (
+                crate::mmap(std::ptr::null_mut(), len, crate::PROT_READ, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0),
+                crate::mmap(std::ptr::null_mut(), len, crate::PROT_NONE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0),
+            )
+        };
+        assert!(ro != crate::MAP_FAILED && none != crate::MAP_FAILED);
+        let data = [7u8; 4];
+        // SAFETY: the pipe's ends; the buffers as above.
+        unsafe {
+            assert_eq!(write(wr, data.as_ptr().cast(), 4), 4);
+            let r = read(rd, ro, 4);
+            assert_eq!((r, std::io::Error::last_os_error().raw_os_error()), (-1, Some(crate::EFAULT)), "a read into read-only memory");
+            let w = write(wr, none, 4);
+            assert_eq!((w, std::io::Error::last_os_error().raw_os_error()), (-1, Some(crate::EFAULT)), "a write from PROT_NONE memory");
+            let mut got = [0u8; 8];
+            assert_eq!(read(rd, got.as_mut_ptr().cast(), 8), 4, "the bytes left in the pipe");
+            assert_eq!(got[..4], data);
+            crate::munmap(ro, len);
+            crate::munmap(none, len);
+            close(rd);
+            close(wr);
+        }
     }
 
     fn temp(name: &str) -> (std::path::PathBuf, std::fs::File) {

@@ -284,13 +284,13 @@ upstream Firecracker and its jailer.
   and its charge with it, so that what the jail is charged is never less than the host commit it holds
   (`test_registered_memory_is_charged_as_it_is_filled`; not yet run on Windows); the cost is the memory.max row's
   difference (such pages counted on top of live memory until their chunk goes), which reclaim at the limit is to
-  close. A page discarded while a system call copies it (a guest that balloons a buffer a device is still using) would
-  fail that call, where Linux's copy faults the page in again, and the device that one request (the `mem_backend: Uffd`
-  row). Firecracker does not reach it: its devices' system calls and the balloon's discards run on one thread, the
-  main thread's event loop (the row gives upstream's lines). It is open for other users of the compat libc, and for
-  reclaim at the limit, which is to discard from a vCPU thread and comes after the fix (a discard that waits for the
-  calls in flight on its range; `test_a_discard_waits_for_a_read_in_flight_on_its_range`, written before it). What
-  would fail is the guest's own request in its own VMM; the host and other VMs are not reached.
+  close. A page discarded while a system call copies it (a guest that balloons a buffer a device is still using)
+  would fail that call, where Linux's copy faults the page in again: so a discard waits for the calls in flight on its
+  range, and a call that may wait without end (a blocking socket's or pipe's) copies through a buffer of its own, so
+  that no discard waits on it (the `mem_backend: Uffd` row;
+  `test_a_discard_waits_for_a_read_in_flight_on_its_range`, `test_a_blocking_read_does_not_hold_a_discard`; not yet
+  run on Windows). Firecracker never met it, its devices' calls and the balloon's discards running on one thread; the
+  wait is for reclaim at the limit, which is to discard from a vCPU thread, and other users of the compat libc.
 
   Sections made around wick (a compromised Firecracker's) are counted by the jailer
   (overlay/jailer/platform/windows/commit.rs): every 1 ms, over the job's processes, private commit plus section

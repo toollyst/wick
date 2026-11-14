@@ -68,7 +68,8 @@ use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FlushViewOfFile, MEM_COMMIT, MEM_DECOMMIT, MEM_PRESERVE_PLACEHOLDER,
     MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
     MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_EXECUTE_READ,
-    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
+    PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS,
+    PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
     PrefetchVirtualMemory, UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect,
     VirtualQuery, WIN32_MEMORY_RANGE_ENTRY,
 };
@@ -1488,9 +1489,11 @@ fn fill_from_file(base: usize, len: usize, file: HANDLE, off: i64) -> bool {
     let fd = crate::windows_fd::to_fd_pub(file);
     let mut done = 0usize;
     while done < len {
-        // SAFETY: the destination is our committed, writable memory.
+        // SAFETY: the destination is our committed, writable memory. Not
+        // counted in flight ([`InFlight`]): the caller holds the table, and
+        // no discard reaches this memory before the call returns.
         let n = unsafe {
-            crate::windows_fd::pread(
+            crate::windows_fd::pread_now(
                 fd,
                 (base + done) as *mut c_void,
                 len - done,
@@ -2126,6 +2129,9 @@ pub unsafe fn mmap(
     {
         return fail(crate::EINVAL, MAP_FAILED);
     }
+    // A mapping over memory discards it: it waits for the system calls in
+    // flight on the range ([`InFlight`]).
+    let _discard = (flags & MAP_FIXED != 0).then(|| discard_waiting(addr as usize, len.div_ceil(PAGE) * PAGE));
     if flags & MAP_HUGETLB != 0 {
         return match map_large(addr, len, prot, flags) {
             Ok(p) => p,
@@ -2944,12 +2950,137 @@ pub(crate) fn uffd_lazy(s: usize, len: usize) {
 }
 
 
+/// The system calls in flight that copy memory of this module's mappings,
+/// and the discards waiting for them. The kernel's copy of a system call
+/// cannot fault a page in here, so a page discarded after the call's
+/// prefault and before its copy reaches it fails the call, where Linux's
+/// copy faults the page in again (v6.1 mm/userfaultfd.c `handle_userfault`,
+/// mm/memory.c `do_anonymous_page`) and completes. A call that ends (a
+/// regular file's, an `O_NONBLOCK` descriptor's: `windows_fd::read`,
+/// `write`, `pread`, `pwrite`) is counted on its buffer's range from before
+/// its prefault to its end ([`copying`]); a discard of an overlapping range
+/// (`MADV_DONTNEED`, `MADV_FREE`, a `MAP_FIXED` mapping over it, as
+/// Firecracker's `discard_range` does for a private file mapping) waits for
+/// it ([`discard_waiting`]), and a call that starts while a discard of its
+/// range waits waits for that discard, so a stream of calls cannot hold a
+/// discard off. A call that can wait without end (a blocking socket's or
+/// pipe's) goes through a buffer of its own instead (`windows_fd`), so no
+/// discard waits on it. A userfaultfd handler in the same process that
+/// discards a range a call is waiting on it to fill would wait for that
+/// call (Firecracker's handler is another process).
+struct InFlight {
+    calls: Vec<(usize, usize)>,
+    discards: Vec<(usize, usize)>,
+}
+
+static IN_FLIGHT: Mutex<InFlight> = Mutex::new(InFlight { calls: Vec::new(), discards: Vec::new() });
+static IN_FLIGHT_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn any_overlaps(ranges: &[(usize, usize)], s: usize, e: usize) -> bool {
+    ranges.iter().any(|&(a, z)| a < e && s < z)
+}
+
+fn forget(ranges: &mut Vec<(usize, usize)>, range: (usize, usize)) {
+    if let Some(i) = ranges.iter().position(|&r| r == range) {
+        ranges.swap_remove(i);
+    }
+}
+
+/// A system call in flight on `[.0, .1)` ([`copying`]), until dropped.
+pub(crate) struct Copying(usize, usize);
+
+impl Drop for Copying {
+    fn drop(&mut self) {
+        forget(&mut IN_FLIGHT.lock().unwrap().calls, (self.0, self.1));
+        IN_FLIGHT_CHANGED.notify_all();
+    }
+}
+
+/// A discard of `[.0, .1)` that no call in flight overlaps
+/// ([`discard_waiting`]), until dropped.
+pub(crate) struct Discarding(usize, usize);
+
+impl Drop for Discarding {
+    fn drop(&mut self) {
+        forget(&mut IN_FLIGHT.lock().unwrap().discards, (self.0, self.1));
+        IN_FLIGHT_CHANGED.notify_all();
+    }
+}
+
+/// Counts a system call copying `[addr, addr + len)` in flight ([`InFlight`]),
+/// once no discard of an overlapping range waits.
+pub(crate) fn copying(addr: usize, len: usize) -> Copying {
+    let (s, e) = (addr, addr.saturating_add(len));
+    let mut f = IN_FLIGHT.lock().unwrap();
+    while any_overlaps(&f.discards, s, e) {
+        f = IN_FLIGHT_CHANGED.wait(f).unwrap();
+    }
+    f.calls.push((s, e));
+    Copying(s, e)
+}
+
+/// Waits until no system call copying memory of `[addr, addr + len)` is in
+/// flight ([`InFlight`]); calls on the range wait while the result lives.
+fn discard_waiting(addr: usize, len: usize) -> Discarding {
+    let (s, e) = (addr, addr.saturating_add(len));
+    let mut f = IN_FLIGHT.lock().unwrap();
+    f.discards.push((s, e));
+    while any_overlaps(&f.calls, s, e) {
+        f = IN_FLIGHT_CHANGED.wait(f).unwrap();
+    }
+    Discarding(s, e)
+}
+
+/// Whether any of `[addr, addr + len)` is memory this module mapped, the
+/// only memory a discard reaches ([`InFlight`]).
+pub(crate) fn mapped(addr: usize, len: usize) -> bool {
+    let end = addr.saturating_add(len);
+    // The regions do not overlap: the last one starting below `end` ends
+    // last of those.
+    len != 0 && table().lock().unwrap().range(..end).next_back().is_some_and(|(b, r)| b + r.len > addr)
+}
+
+/// Whether a system call could write (`write`) or read all of `[addr,
+/// addr + len)` once its pages are faulted in (`wick_uffd::prefault`):
+/// committed, not a guard page, with a protection that allows it. A call
+/// made through a buffer of its own (`windows_fd`) asks, after the prefault
+/// and before the call, so that a buffer Linux's copy would fail with
+/// `EFAULT` fails so here, and not in a fault of the copy to or from it.
+pub(crate) fn accessible(addr: usize, len: usize, write: bool) -> bool {
+    let end = addr.saturating_add(len);
+    let mut at = addr;
+    while at < end {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: queries this process's memory.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            return false;
+        }
+        let p = mbi.Protect;
+        let writes = [PAGE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY];
+        let reads = [PAGE_READONLY, PAGE_EXECUTE_READ];
+        let base = p & 0xff;
+        let ok = mbi.State == MEM_COMMIT
+            && p & PAGE_GUARD == 0
+            && (writes.contains(&base) || (!write && reads.contains(&base)));
+        if !ok {
+            return false;
+        }
+        at = mbi.BaseAddress as usize + mbi.RegionSize;
+    }
+    true
+}
+
 /// `madvise`. Discarding registered userfaultfd memory makes the pages of
 /// what was discarded missing again (`wick_uffd::discarding`), as on Linux.
+/// A discard waits for the system calls in flight on its range
+/// ([`InFlight`]).
 ///
 /// # Safety
 /// Same contract as `madvise(2)`.
 pub unsafe fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
+    let _discard = (advice == MADV_DONTNEED || advice == MADV_FREE)
+        .then(|| discard_waiting(addr as usize, len.div_ceil(PAGE) * PAGE));
     if (advice == MADV_DONTNEED || advice == MADV_FREE) && crate::wick_uffd::active() {
         let end = (addr as usize).saturating_add(len.div_ceil(PAGE) * PAGE);
         return crate::wick_uffd::discarding(addr as u64, (end - addr as usize) as u64, |done| {

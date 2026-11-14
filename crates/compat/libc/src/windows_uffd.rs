@@ -1485,13 +1485,14 @@ mod tests {
     /// regular file's read, whose call cannot block for ever, is counted in
     /// flight on its range, and the discard waits for it. The window is
     /// [`crate::windows_fd::BEFORE_CALL`]: it starts the discard and gives it
-    /// 50 ms. Asserted: the read returns its 16 bytes, and the discard ends
-    /// after it, leaving the pages missing again.
+    /// 50 ms. Asserted: the discard is still waiting at the window's end, the
+    /// read returns its 16 bytes, and the discard then leaves the pages
+    /// missing again.
     #[test]
-    #[ignore = "written before the in-flight count, which it tests; fails until it lands"]
     fn test_a_discard_waits_for_a_read_in_flight_on_its_range() {
-        use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
         let (ctx, user) = create(0, false, true).unwrap();
         let len = 64 * 1024;
         let mem = map(len);
@@ -1502,33 +1503,38 @@ mod tests {
         let f = std::fs::File::open(&path).unwrap();
         let fd = crate::windows_fd::to_fd_pub(std::os::windows::io::AsRawHandle::as_raw_handle(&f));
         let (go, went) = mpsc::channel::<()>();
+        let done = Arc::new(AtomicBool::new(false));
+        let ended = done.clone();
         let discarder = std::thread::spawn(move || {
             went.recv().unwrap();
             // SAFETY: the test's registered mapping.
             let r = unsafe { crate::madvise(mem as *mut c_void, len, crate::MADV_DONTNEED) };
-            (r, Instant::now())
+            ended.store(true, Ordering::Release);
+            r
         });
+        let held = Arc::new(AtomicBool::new(false));
+        let seen = held.clone();
         crate::windows_fd::BEFORE_CALL.with(|h| {
             *h.borrow_mut() = Some(Box::new(move || {
                 go.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(50));
+                seen.store(!done.load(Ordering::Acquire), Ordering::Release);
             }));
         });
         // SAFETY: a valid descriptor and registered memory.
         let n = unsafe { crate::read(fd, (mem + 8) as *mut c_void, 16) };
-        let read_at = Instant::now();
         let error = std::io::Error::last_os_error();
         crate::windows_fd::BEFORE_CALL.with(|h| *h.borrow_mut() = None);
-        let (discarded, discarded_at) = discarder.join().unwrap();
+        let discarded = discarder.join().unwrap();
+        let held = held.load(Ordering::Acquire);
         std::println!(
-            "INFLIGHT a file's read with a discard of its buffer started in its window: {n} ({error}); the discard {discarded}, \
-             {} the read",
-            if discarded_at >= read_at { "after" } else { "before" }
+            "INFLIGHT a file's read with a discard of its buffer started in its window: {n} ({error}); \
+             the discard waiting at the window's end: {held}; the discard: {discarded}"
         );
         assert_eq!(handler.join().unwrap()[0], proto::EVENT_PAGEFAULT);
+        assert!(held, "the discard did not wait for the read in flight");
         assert_eq!(n, 16, "the read failed: {error}");
         assert_eq!(discarded, 0);
-        assert!(discarded_at >= read_at, "the discard did not wait for the read in flight");
         assert!(is_missing(mem + 8), "the discard did not happen");
         drop(f);
         let _ = std::fs::remove_file(&path);
@@ -1545,9 +1551,9 @@ mod tests {
     /// waits until it is done, at most 2 s; the pipe's writer writes 100 ms
     /// later. Asserted: the discard ended in the window, and the read returns
     /// the writer's 16 bytes, which the buffer then holds (its page faulted
-    /// in again, filled, and written over).
+    /// in before the call, discarded, faulted in again at the copy, filled,
+    /// and written over: two faults served).
     #[test]
-    #[ignore = "written before the in-flight count, which it tests; fails until it lands"]
     fn test_a_blocking_read_does_not_hold_a_discard() {
         use std::sync::mpsc;
         use std::time::Duration;
@@ -1555,7 +1561,7 @@ mod tests {
         let len = 64 * 1024;
         let mem = map(len);
         register(ctx, mem, len as u64).unwrap();
-        let handler = std::thread::spawn(move || serve_one(user, ctx, 0x11));
+        let handler = std::thread::spawn(move || [serve_one(user, ctx, 0x11), serve_one(user, ctx, 0x11)]);
         let mut fds = [0 as c_int; 2];
         // SAFETY: two descriptors' room.
         assert_eq!(unsafe { crate::pipe(fds.as_mut_ptr()) }, 0);
@@ -1591,7 +1597,8 @@ mod tests {
         assert_eq!(writer.join().unwrap(), 16);
         assert_eq!(window, Some(Some(0)), "the discard was held by a read that can block");
         assert_eq!(n, 16, "the read failed: {error}");
-        assert_eq!(handler.join().unwrap()[0], proto::EVENT_PAGEFAULT);
+        let events = handler.join().unwrap();
+        assert_eq!([events[0][0], events[1][0]], [proto::EVENT_PAGEFAULT; 2]);
         // SAFETY: read into, after the fill.
         unsafe {
             assert_eq!(*((mem + 8) as *const u8), 0x33);
