@@ -414,23 +414,6 @@ user root integration_tests/security/test_jail.py::test_exec_destination_path_is
 # "Too many open files" for the same errno.
 all impossible integration_tests/security/test_jail.py::test_negative_no_file_limit
 
-# --new-pid-ns without --daemonize: the launcher forks Firecracker and exits,
-# as Linux's jailer does in that mode (env.rs exec_into_new_pid_ns: clone,
-# write the pid file, exit(0)); the launcher is screen's window process, the
-# leader of its terminal's session. Under 4096 descriptors, upstream's run
-# condition (tools/macos/integration-tests.sh), the test's screen commands no
-# longer race the launcher's exit (with the 1048576 a terminal gave the
-# harness before, screen 5's closeallfiles took 35 ms a command and `logfile
-# flush` lost the session). It fails instead with "Failed to start vCPUs": the
-# leader's exit revokes the terminal, Firecracker's standard input too (xnu
-# bsd/kern/kern_exit.c :2436 to :2476), and XNU's F_SETFL of O_NONBLOCK on it
-# fails with ENOTTY (bsd/kern/kern_descrip.c :3003, bsd/vfs/vfs_vnops.c
-# :1782), where Linux's succeeds on a hung-up terminal (fs/fcntl.c setfl).
-# Firecracker's log: "Cannot set non block for the terminal. Error(25)" (run
-# mac9-screen-4096c).
-all bug integration_tests/security/test_jail.py::test_firecracker_kill_by_pid[kvm-PCI_OFF-True-False-vmlinux-6.1.188]
-all bug integration_tests/security/test_jail.py::test_firecracker_kill_by_pid[kvm-PCI_ON-True-False-vmlinux-6.1.188]
-
 # Not an entry, a residual to watch for: screen's terminal. XNU can give two
 # terminals opened at the same moment the same minor (xnu-12377.1.9
 # bsd/kern/tty_ptmx.c ptmx_clone); the loser's open fails with EREDRIVEOPEN,

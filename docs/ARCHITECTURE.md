@@ -69,7 +69,8 @@ firecracker binary, vmm   (upstream source + patches/)
             Linux : re-exports the original crate from the same git tag (micro_http:
                     a git revision), unchanged
             macOS : libc and vmm-sys-util are the original plus the Linux-only items
-                    on macOS facilities; memfd, userfaultfd and kvm-ioctls are the same
+                    on macOS facilities (and vmm-sys-util's terminal, whose
+                    set_non_block takes a revoked terminal as Linux's hung-up one); memfd, userfaultfd and kvm-ioctls are the same
                     API on macOS facilities (kvm-ioctls → Hypervisor.framework);
                     kvm-bindings, vm-memory, event-manager, vhost and micro_http are
                     the original crate
