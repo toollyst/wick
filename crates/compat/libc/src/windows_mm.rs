@@ -2729,6 +2729,18 @@ pub(crate) fn uffd_swap_chunk(view: usize, len: usize, alias: usize) -> bool {
     true
 }
 
+/// Called in the middle of a chunk's move, between the copy and the swap:
+/// for tests (`test_the_jailers_count_does_not_rise_during_a_move`).
+#[cfg(test)]
+pub(crate) static MOVE_HOOK: Mutex<Option<fn()>> = Mutex::new(None);
+
+/// The move budget decommitted (`on` false) or committed again, for tests;
+/// whether there is one. Not written yet: there is none.
+#[cfg(test)]
+pub(crate) fn uffd_budget_for_tests(_on: bool) -> bool {
+    false
+}
+
 /// The parts of `[s, s + len)` in each region of the table, in order (the
 /// whole of it if none holds it): a commit or protection change stays
 /// within one view.

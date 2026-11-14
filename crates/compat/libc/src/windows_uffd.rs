@@ -1110,6 +1110,28 @@ pub fn active() -> bool {
     REGISTERED.load(Ordering::Acquire) != 0
 }
 
+/// What a reclaim did ([`reclaim_at_touch`]): the chunks it moved, the
+/// live pages it copied, the bytes of dead pages it gave back (their
+/// section commit and their charge), and the chunks it passed over for a
+/// system call in flight on them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Reclaimed {
+    pub chunks: usize,
+    pub copied: usize,
+    pub freed: usize,
+    pub skipped: usize,
+}
+
+/// Reclaims at least `need` bytes of dead pages at a refused charge, as
+/// Linux's memory cgroup reclaims before it refuses one (v6.1
+/// mm/memcontrol.c, `try_charge_memcg`, `try_to_free_mem_cgroup_pages`
+/// before `mem_cgroup_oom`). Not written yet: reclaims nothing, and only
+/// the tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn reclaim_at_touch(_need: usize) -> Reclaimed {
+    Reclaimed::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1477,6 +1499,358 @@ mod tests {
         unsafe { ws::closesocket(sock(user)) };
     }
 
+    /// Runs the child test `child` (this module's, `#[ignore]`d) in a
+    /// process of its own, in a job that may commit `limit` bytes if one is
+    /// given (set before the child registers anything: it sleeps 300 ms
+    /// first): its exit status and output.
+    fn run_child(child: &str, limit: Option<usize>) -> (Option<i32>, std::string::String) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        let name = std::format!("{}::{child}", module_path!().split_once("::").unwrap().1);
+        let process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name.as_str(), "--ignored", "--nocapture"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut job = ptr::null_mut();
+        if let Some(limit) = limit {
+            // SAFETY: a new unnamed job.
+            job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+            assert!(!job.is_null());
+            // SAFETY: plain data.
+            let mut l: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            l.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+            l.JobMemoryLimit = limit;
+            // SAFETY: a structure of the size passed; the child's handle.
+            unsafe {
+                #[allow(clippy::cast_possible_truncation)]
+                let size = std::mem::size_of_val(&l) as u32;
+                assert_ne!(SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const l).cast(), size), 0);
+                use std::os::windows::io::AsRawHandle;
+                assert_ne!(AssignProcessToJobObject(job, process.as_raw_handle()), 0, "{}", io::Error::last_os_error());
+            }
+        }
+        let out = process.wait_with_output().unwrap();
+        if !job.is_null() {
+            // SAFETY: our job handle.
+            unsafe { CloseHandle(job) };
+        }
+        let text = std::format!("{}{}", std::string::String::from_utf8_lossy(&out.stdout), std::string::String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("running 1 test"), "the child {name} ran no test (status {}): {text}", out.status);
+        (out.status.code(), text)
+    }
+
+    const CHUNK: u64 = 2 << 20;
+
+    /// The reclaim tests' start, in a child under a job limit: 128 MiB
+    /// registered and filled with 0x5a 1 MiB at a time until the job
+    /// refuses, then every other page of its first 8 chunks discarded (8
+    /// MiB of dead pages, no chunk whole, so each keeps its section commit
+    /// and charge, as (A) has them). The range and the bytes filled.
+    fn fill_to_the_limit_and_discard_in_part() -> (usize, c_int, u64, u64) {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len: u64 = 128 << 20;
+        // SAFETY: a new anonymous mapping, committed at first touch.
+        let mem = unsafe {
+            crate::mmap(
+                ptr::null_mut(),
+                len as usize,
+                crate::PROT_READ | crate::PROT_WRITE,
+                crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, crate::MAP_FAILED);
+        let mem = mem as u64;
+        register(ctx, mem, len).unwrap();
+        let mib = std::vec![0x5au8; 1 << 20];
+        let mut done = 0;
+        loop {
+            assert!(done < len, "128 MiB filled under the limit");
+            // SAFETY: `mib` holds 1 MiB.
+            match unsafe { copy(ctx, mib.as_ptr(), mem + done, 1 << 20, false) } {
+                Ok(n) => done += n,
+                Err((e, _)) => {
+                    assert_eq!(e, crate::ENOMEM);
+                    break;
+                }
+            }
+        }
+        assert!(done >= 8 * CHUNK + (8 << 20), "only {} MiB filled", done >> 20);
+        std::println!("filled {} MiB", done >> 20);
+        for p in (0..8 * CHUNK).step_by(2 * PAGE as usize) {
+            // SAFETY: registered memory of ours.
+            assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        }
+        (ctx, user, mem, done)
+    }
+
+    /// The pages of the first 8 chunks: the discarded ones missing, the
+    /// others still 0x5a.
+    fn the_live_pages_read_back(mem: u64) {
+        for p in (0..8 * CHUNK).step_by(PAGE as usize) {
+            if (p / PAGE).is_multiple_of(2) {
+                assert!(is_missing(mem + p), "{p:#x} is not missing");
+            } else {
+                // SAFETY: a filled page.
+                assert_eq!(unsafe { *((mem + p + 9) as *const u8) }, 0x5a, "{p:#x}");
+            }
+        }
+    }
+
+    /// A fill refused at the job's limit while partly discarded chunks hold
+    /// dead pages (their section commit and charge, as (A) keeps them)
+    /// reclaims them first and succeeds, as Linux's memory cgroup reclaims
+    /// before it refuses a charge (v6.1 mm/memcontrol.c `try_charge_memcg`:
+    /// `try_to_free_mem_cgroup_pages` before `mem_cgroup_oom`; there the
+    /// discarded pages were freed at the discard already). The live pages
+    /// read back, the discarded ones are missing, and a fill past what the
+    /// dead pages gave back is still `ENOMEM`. Before, the fill was refused
+    /// with 8 MiB of dead pages charged.
+    #[test]
+    #[ignore = "fails until the reclaim at the limit is written (the next commit)"]
+    fn test_a_fill_at_the_limit_reclaims_partly_discarded_chunks() {
+        let (code, text) = run_child("reclaim_fill_child", Some(96 << 20));
+        assert!(text.contains("filled 4096 KiB more"), "the fill was not reclaimed for: {text}");
+        assert!(text.contains("refused with ENOMEM after"), "the limit did not hold past the dead pages: {text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_fill_at_the_limit_reclaims_partly_discarded_chunks in a job of its own"]
+    fn reclaim_fill_child() {
+        let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
+        let page = std::vec![0x5au8; PAGE as usize];
+        let fill_pages = |from: u64, most: u64| -> (u64, Option<c_int>) {
+            let mut n = 0;
+            while n < most {
+                // SAFETY: `page` holds a page.
+                match unsafe { copy(ctx, page.as_ptr(), mem + from + n, PAGE, false) } {
+                    Ok(k) => n += k,
+                    Err((e, _)) => return (n, Some(e)),
+                }
+            }
+            (n, None)
+        };
+        let (more, _) = fill_pages(done, 4 << 20);
+        std::println!("filled {} KiB more", more >> 10);
+        assert_eq!(more, 4 << 20, "a fill at the limit was refused with 8 MiB of dead pages charged");
+        the_live_pages_read_back(mem);
+        // Past what the dead pages gave back (8 MiB less the 4 just
+        // filled, and a little of the job's room left before them).
+        let (rest, refused) = fill_pages(done + more, 16 << 20);
+        std::println!("refused with {} after {} KiB more", if refused == Some(crate::ENOMEM) { "ENOMEM" } else { "no error" }, rest >> 10);
+        assert_eq!(refused, Some(crate::ENOMEM));
+        assert!(rest < (4 << 20) + (1 << 20), "{} KiB filled past the dead pages", rest >> 10);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+        let _ = ctx;
+    }
+
+    /// A first touch of lazy memory refused at the job's limit reclaims the
+    /// dead pages of partly discarded chunks first, and the access goes on,
+    /// where it ended the process with 137 before: Linux reclaims before
+    /// its out-of-memory kill (as above).
+    #[test]
+    #[ignore = "fails until the reclaim at the limit is written (the next commit)"]
+    fn test_a_lazy_touch_at_the_limit_reclaims_before_it_ends_the_vmm() {
+        let (code, text) = run_child("reclaim_touch_child", Some(96 << 20));
+        assert!(text.contains("touched 4096 KiB"), "the touch was not reclaimed for (status {code:?}): {text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_lazy_touch_at_the_limit_reclaims_before_it_ends_the_vmm in a job of its own"]
+    fn reclaim_touch_child() {
+        let (_ctx, user, mem, _) = fill_to_the_limit_and_discard_in_part();
+        // SAFETY: a new anonymous mapping, committed at first touch.
+        let lazy = unsafe {
+            crate::mmap(
+                ptr::null_mut(),
+                16 << 20,
+                crate::PROT_READ | crate::PROT_WRITE,
+                crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(lazy, crate::MAP_FAILED);
+        for p in (0..4usize << 20).step_by(PAGE as usize) {
+            // SAFETY: our mapping; the first touch commits the page.
+            unsafe { core::ptr::write_volatile((lazy as *mut u8).add(p), 1) };
+        }
+        std::println!("touched 4096 KiB");
+        the_live_pages_read_back(mem);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// A chunk moved by the reclaim while a host thread reads and writes
+    /// its live pages, 100 rounds: the thread's writes are all kept, it
+    /// never sees another value, and nothing faults for good. Each round
+    /// discards the chunk's even pages, moves the chunk (its live pages
+    /// copied into a new section, which both views then map: the dead
+    /// pages' commit and charge given back), and fills the even pages
+    /// again for the next.
+    #[test]
+    #[ignore = "fails until the reclaim at the limit is written (the next commit)"]
+    fn test_a_moved_chunk_reads_and_writes_through() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 2 * CHUNK;
+        let mem = map(len as usize);
+        register(ctx, mem, len).unwrap();
+        let data = std::vec![0x5au8; len as usize];
+        // SAFETY: `data` holds `len` bytes.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, len, true) }.unwrap(), len);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut round = 0u64;
+                while !stop.load(Ordering::Acquire) {
+                    round += 1;
+                    for p in (PAGE..CHUNK).step_by(2 * PAGE as usize) {
+                        let at = (mem + p + 64) as *mut u64;
+                        // SAFETY: a live page of the registered range.
+                        unsafe {
+                            core::ptr::write_volatile(at, round ^ p);
+                            assert_eq!(core::ptr::read_volatile(at), round ^ p, "a write to {p:#x} was lost");
+                        }
+                    }
+                }
+                round
+            })
+        };
+        let mut moved = 0;
+        for _ in 0..100 {
+            for p in (0..CHUNK).step_by(2 * PAGE as usize) {
+                // SAFETY: registered memory of ours.
+                assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+            }
+            let r = reclaim_at_touch(PAGE as usize);
+            moved += r.chunks;
+            assert_eq!(committed(mem, CHUNK), CHUNK / 2, "the moved chunk holds its live pages only");
+            for p in (0..CHUNK).step_by(2 * PAGE as usize) {
+                assert_eq!(zeropage(ctx, mem + p, PAGE, true).unwrap(), PAGE);
+            }
+        }
+        stop.store(true, Ordering::Release);
+        let rounds = writer.join().expect("the writer failed");
+        assert_eq!(moved, 100, "a reclaim did not move the chunk");
+        assert!(rounds > 100, "the writer ran {rounds} rounds");
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// The jailer's count of this process (overlay/jailer/platform/windows
+    /// commit.rs): private commit plus section commit less the committed,
+    /// private, `PAGE_NOACCESS` memory that pays for sections (the cover),
+    /// no more than the section commit.
+    fn jailers_count() -> u64 {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        #[repr(C)]
+        #[derive(Default)]
+        struct Counters {
+            cb: u32,
+            page_faults: u32,
+            sizes: [usize; 10],
+            shared_commit: u64,
+        }
+        use windows_sys::Win32::System::ProcessStatus::K32GetProcessMemoryInfo;
+        let mut c = Counters { cb: u32::try_from(std::mem::size_of::<Counters>()).unwrap(), ..Counters::default() };
+        // SAFETY: this process's pseudo handle and a structure of the size
+        // given (PROCESS_MEMORY_COUNTERS_EX2, which begins as the type the
+        // binding names).
+        assert_ne!(unsafe { K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), (&raw mut c).cast(), c.cb) }, 0);
+        let (private, shared) = (c.sizes[8] as u64, c.shared_commit);
+        let (mut at, mut cover) = (0usize, 0u64);
+        loop {
+            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+            let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            if unsafe { VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+                break;
+            }
+            if m.State == MEM_COMMIT && m.Type == MEM_PRIVATE && m.Protect == PAGE_NOACCESS {
+                cover += m.RegionSize as u64;
+            }
+            match (m.BaseAddress as usize).checked_add(m.RegionSize) {
+                Some(next) if next > at => at = next,
+                _ => break,
+            }
+        }
+        private + shared - cover.min(shared)
+    }
+
+    /// The jailer's count taken in the middle of a move
+    /// (`windows_mm::MOVE_HOOK`, between the copy and the swap).
+    static DURING: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    fn count_during_the_move() {
+        DURING.store(jailers_count(), Ordering::SeqCst);
+    }
+
+    /// While a chunk is moved both sections hold its live pages; the move
+    /// budget, committed private `PAGE_NOACCESS` memory made at the first
+    /// registration (`windows_mm::uffd_budget`), is cover for them, so the
+    /// jailer's count, taken in the middle of the move, is no higher than
+    /// before it, and a VMM at its limit is not ended for a reclaim. Without
+    /// the budget block (decommitted for the test) the same move raises the
+    /// count by its live pages: the budget is what holds it.
+    #[test]
+    #[ignore = "fails until the reclaim at the limit is written (the next commit)"]
+    fn test_the_jailers_count_does_not_rise_during_a_move() {
+        let (code, text) = run_child("move_count_child", None);
+        assert!(text.contains("with the budget: "), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_the_jailers_count_does_not_rise_during_a_move in a process of its own"]
+    fn move_count_child() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 2 * CHUNK;
+        let mem = map(len as usize);
+        register(ctx, mem, len).unwrap();
+        let data = std::vec![0x5au8; len as usize];
+        // SAFETY: `data` holds `len` bytes.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, len, true) }.unwrap(), len);
+        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = Some(count_during_the_move);
+        let moved = |budget: bool| -> (u64, u64) {
+            assert!(crate::windows_mm::uffd_budget_for_tests(budget), "no move budget was made");
+            for p in (0..CHUNK).step_by(2 * PAGE as usize) {
+                // SAFETY: registered memory of ours.
+                assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+            }
+            DURING.store(u64::MAX, Ordering::SeqCst);
+            let before = jailers_count();
+            let r = reclaim_at_touch(PAGE as usize);
+            let during = DURING.load(Ordering::SeqCst);
+            assert_eq!(r.chunks, 1, "no chunk was moved");
+            assert_ne!(during, u64::MAX, "the move's hook did not run");
+            for p in (0..CHUNK).step_by(2 * PAGE as usize) {
+                assert_eq!(zeropage(ctx, mem + p, PAGE, true).unwrap(), PAGE);
+            }
+            (before, during)
+        };
+        let (before, during) = moved(true);
+        std::println!("with the budget: {before} before the move, {during} during it");
+        assert!(during <= before + (64 << 10), "the count rose by {} KiB during a move", (during - before) >> 10);
+        let (before, during) = moved(false);
+        std::println!("without it: {before} before the move, {during} during it");
+        assert!(during >= before + (512 << 10), "without the budget the count rose by {} KiB only", during.saturating_sub(before) >> 10);
+        assert!(crate::windows_mm::uffd_budget_for_tests(true));
+        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = None;
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
     #[test]
     fn test_prefault_before_system_calls() {
         let (ctx, user) = create(0, false, true).unwrap();
@@ -1734,51 +2108,6 @@ mod tests {
         assert_eq!(wake_range(ctx, mem + 64 * 1024, PAGE), Err(crate::ENOENT));
         // SAFETY: as above.
         unsafe { ws::closesocket(sock(user)) };
-    }
-
-    /// Runs the child test `child` (this module's, `#[ignore]`d) in a
-    /// process of its own, in a job that may commit `limit` bytes if one is
-    /// given (set before the child registers anything: it sleeps 300 ms
-    /// first): its exit status and output.
-    fn run_child(child: &str, limit: Option<usize>) -> (Option<i32>, std::string::String) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JobObjectExtendedLimitInformation, SetInformationJobObject,
-        };
-        let name = std::format!("{}::{child}", module_path!().split_once("::").unwrap().1);
-        let process = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name.as_str(), "--ignored", "--nocapture"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut job = ptr::null_mut();
-        if let Some(limit) = limit {
-            // SAFETY: a new unnamed job.
-            job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-            assert!(!job.is_null());
-            // SAFETY: plain data.
-            let mut l: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-            l.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
-            l.JobMemoryLimit = limit;
-            // SAFETY: a structure of the size passed; the child's handle.
-            unsafe {
-                #[allow(clippy::cast_possible_truncation)]
-                let size = std::mem::size_of_val(&l) as u32;
-                assert_ne!(SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const l).cast(), size), 0);
-                use std::os::windows::io::AsRawHandle;
-                assert_ne!(AssignProcessToJobObject(job, process.as_raw_handle()), 0, "{}", io::Error::last_os_error());
-            }
-        }
-        let out = process.wait_with_output().unwrap();
-        if !job.is_null() {
-            // SAFETY: our job handle.
-            unsafe { CloseHandle(job) };
-        }
-        let text = std::format!("{}{}", std::string::String::from_utf8_lossy(&out.stdout), std::string::String::from_utf8_lossy(&out.stderr));
-        assert!(text.contains("running 1 test"), "the child {name} ran no test (status {}): {text}", out.status);
-        (out.status.code(), text)
     }
 
     /// Set by the hook of the test below and its thread.
