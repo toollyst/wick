@@ -284,7 +284,11 @@ upstream Firecracker and its jailer.
   and its charge with it, so that what the jail is charged is never less than the host commit it holds
   (`test_registered_memory_is_charged_as_it_is_filled`; passed in CI run 43545368906, 305a806, and each saved run since). At the limit such pages are
   reclaimed before a charge is refused, as Linux's memory cgroup reclaims: their chunks are moved into new sections
-  and their commit and charge given back (the memory.max row). A move holds its live pages in two sections for its
+  and their commit and charge given back (the memory.max row). Not before a commit made at once (`MAP_POPULATE`, a
+  private file mapping's read, a `MAP_FIXED` recommit, a discard of private memory that is not lazy, a committing
+  `mprotect`) or an allocation of the VMM's own (its heap, a thread's stack): those are refused at the limit with no
+  reclaim first (`ENOMEM`, or the process ends), not done yet; the limit holds either way. A move holds its live
+  pages in two sections for its
   time; a 2 MiB move budget of private `PAGE_NOACCESS` commit, made at the first registration, is the cover the
   jailer's count takes off for them, so the count, and the bound it enforces, stays exact during a move
   (`test_the_jailers_count_does_not_rise_during_a_move`; not yet run on Windows). A page discarded while a system
