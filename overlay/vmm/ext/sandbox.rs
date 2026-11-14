@@ -4187,6 +4187,59 @@ mod macos {
             println!("CHILD-SURVIVED");
         }
 
+        // The same in a network given without the jailer (WICK_NETNS, as
+        // the user-mode harness's stand-in jailer gives it): the endpoint is
+        // in that directory, whose sockets the profile lets a running
+        // microVM remove, so its drop removes it and the microVM runs on.
+        #[test]
+        #[ignore = "fails until the profile of a network without the jail names its directory (the next commit)"]
+        fn test_a_hotplugged_endpoint_in_a_network_without_the_jail_frees_its_name() {
+            let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+            let net = dir.as_path().canonicalize().unwrap().join("instance");
+            std::fs::create_dir(&net).unwrap();
+            let out = child("endpoint_netns_drop_child", &[("WICK_NETNS", net.to_str().unwrap())]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(stdout.contains("FREED") && stdout.contains("AGAIN"), "{}", text(&out));
+            assert!(stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
+            assert!(!net.join("tap1").exists());
+        }
+
+        #[test]
+        #[ignore = "run by test_a_hotplugged_endpoint_in_a_network_without_the_jail_frees_its_name in a separate process"]
+        fn endpoint_netns_drop_child() {
+            let net = std::path::PathBuf::from(std::env::var_os("WICK_NETNS").unwrap());
+            let dev = |id: &str| {
+                crate::devices::virtio::net::Net::new(
+                    id.into(),
+                    "tap1",
+                    None,
+                    Default::default(),
+                    Default::default(),
+                    None,
+                )
+            };
+            // As Firecracker's main: the network, then the profile (prepare).
+            crate::ext::jail::enter().unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            drop(dev("first").unwrap());
+            if !net.join("tap1").exists() {
+                println!("FREED");
+            }
+            match dev("again") {
+                Ok(d) => {
+                    println!("AGAIN");
+                    drop(d);
+                }
+                Err(err) => println!("REFUSED {err}"),
+            }
+            // Time for a denial's kill to land.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            println!("CHILD-SURVIVED");
+        }
+
         // Listening on a Unix socket is setup's only: Linux's VMM filter has
         // no bind or listen. A socket bound before narrow() (its name gone)
         // cannot listen after it.
