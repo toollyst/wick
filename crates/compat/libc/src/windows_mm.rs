@@ -2808,28 +2808,71 @@ pub(crate) fn uffd_budget_for_tests(on: bool) -> bool {
     }
 }
 
+/// Calls `f(start, len)` for each committed run of `[s, s + len)`, in
+/// order, allocating nothing (the reclaim's walk: [`uffd_move_chunk`]).
+pub(crate) fn for_each_committed(s: usize, len: usize, mut f: impl FnMut(usize, usize)) {
+    let (mut at, e) = (s, s + len);
+    while at < e {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            break;
+        }
+        let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(e) - at;
+        if mbi.State == MEM_COMMIT {
+            f(at, run);
+        }
+        at += run;
+    }
+}
+
+/// Calls `f(start, len)` for each run of `[s, s + len)` that is committed
+/// and for which `pick(page)` holds, page by page, in order.
+fn for_each_picked(s: usize, len: usize, pick: &dyn Fn(usize) -> bool, mut f: impl FnMut(usize, usize)) {
+    for_each_committed(s, len, |a, n| {
+        let mut run: Option<usize> = None;
+        for at in (a..a + n).step_by(PAGE) {
+            match (pick(at), run) {
+                (true, None) => run = Some(at),
+                (false, Some(r)) => {
+                    f(r, at - r);
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(r) = run {
+            f(r, a + n - r);
+        }
+    });
+}
+
 /// Moves the chunk `[view, view + len)` of a registered userfaultfd range,
 /// whose alias is at `alias`, into a new reserved section, to give back the
-/// section commit and the charge of its dead pages (missing, but committed:
-/// discarded inside a chunk not discarded whole, `wick_uffd::discarding`):
-/// the reclaim at the memory limit (`wick_uffd::reclaim_at_touch`), as
-/// Linux's memory cgroup reclaims before it refuses a charge. `live` and
-/// `dead` are the chunk's runs, as offsets from `view`. The caller holds the
-/// userfaultfd's lock and a discard's guard on the chunk (no system call is
-/// copying it: [`try_discard`]) and has marked it moving, so that a host
-/// thread's or a vCPU's access to it waits for the move
-/// (`wick_uffd::fault`). The live pages are committed in the new section
-/// through a view of its own, closed to the guest's view (`PAGE_NOACCESS`,
-/// which WHP honours), copied from the alias, and the new section put in
-/// the place of the old one in both views ([`uffd_swap_chunk`]'s steps), so
-/// that the old one, and its commit, goes with its last view; the dead
-/// pages' charge is given back ([`uncharge`]), the live pages' kept (it is
-/// indexed by the view's offset, which does not move). The dead pages are
-/// not committed in the new section: missing, they fault as missing.
-/// `false`, nothing changed, if the chunk is not one of [`uffd_alias`]'s or
-/// the new section cannot be made or committed; a failure once a view is
-/// unmapped ends the VMM, named ([`out_of_memory`]).
-pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, live: &[(usize, usize)], dead: &[(usize, usize)]) -> bool {
+/// section commit and the charge of its dead pages (committed and
+/// `missing(page)`: discarded inside a chunk not discarded whole,
+/// `wick_uffd::discarding`): the reclaim at the memory limit
+/// (`wick_uffd::reclaim_at_touch`), as Linux's memory cgroup reclaims before
+/// it refuses a charge. The caller holds the userfaultfd's lock (so the
+/// missing pages and the commit do not change) and a discard's guard on the
+/// chunk (no system call is copying it: [`try_discard`]) and has marked it
+/// moving, so that a host thread's or a vCPU's access to it waits for the
+/// move (`wick_uffd::fault`). The live pages are committed in the new
+/// section through a view of its own, closed to the guest's view
+/// (`PAGE_NOACCESS`, which WHP honours), copied from the alias, and the new
+/// section put in the place of the old one in both views
+/// ([`uffd_swap_chunk`]'s steps), so that the old one, and its commit, goes
+/// with its last view; the missing pages' charge is given back
+/// ([`uncharge`]: the dead ones', and none for those never filled), the live
+/// pages' kept (it is indexed by the view's offset, which does not move).
+/// The dead pages are not committed in the new section: missing, they fault
+/// as missing. The bytes of live pages copied and of dead pages given back,
+/// or `None`, nothing changed, if the chunk is not one of [`uffd_alias`]'s
+/// or the new section cannot be made or committed; a failure once a view is
+/// unmapped ends the VMM, named ([`out_of_memory`]). Allocates nothing: it
+/// runs at the limit.
+pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &dyn Fn(usize) -> bool) -> Option<(usize, usize)> {
     let t = table().lock().unwrap();
     match t.get(&view) {
         Some(r)
@@ -2837,42 +2880,50 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, live: &[(us
                 && r.holes.is_empty()
                 && !r.lazy
                 && matches!(r.kind, Kind::View { _section: None, charge: Some(_), file: None, alias: None }) => {}
-        _ => return false,
+        _ => return None,
     }
-    let Some(section) = reserved_section(len) else {
-        return false;
-    };
+    let live = |at: usize| !missing(at);
+    let mut dead = 0;
+    for_each_picked(view, len, missing, |_, n| dead += n);
+    let section = reserved_section(len)?;
     // SAFETY: maps our new section, anywhere.
     let tmp = unsafe { MapViewOfFile3(section.0, proc(), std::ptr::null(), 0, len, 0, PAGE_READWRITE, std::ptr::null_mut(), 0) }
         .Value as usize;
     if tmp == 0 {
-        return false;
+        return None;
     }
     let unmap_tmp = || {
         // SAFETY: unmaps the view made here.
         unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: tmp as *mut c_void }, 0) };
     };
-    if !live.iter().all(|&(o, n)| commit_now(tmp + o, n, PAGE_READWRITE, false)) {
+    let mut committed = true;
+    for_each_picked(view, len, &live, |a, n| committed &= commit_now(tmp + (a - view), n, PAGE_READWRITE, false));
+    if !committed {
         unmap_tmp();
-        return false;
+        return None;
     }
     let protect_live = |prot| {
-        live.iter().all(|&(o, n)| {
+        let mut ok = true;
+        for_each_picked(view, len, &live, |a, n| {
             let mut old = 0;
             // SAFETY: changes the protection of the chunk's committed pages.
-            unsafe { VirtualProtect((view + o) as *const c_void, n, prot, &mut old) != 0 }
-        })
+            ok &= unsafe { VirtualProtect(a as *const c_void, n, prot, &mut old) != 0 };
+        });
+        ok
     };
     if !protect_live(PAGE_NOACCESS) {
         protect_live(PAGE_READWRITE);
         unmap_tmp();
-        return false;
+        return None;
     }
-    for &(o, n) in live {
+    let mut copied = 0;
+    for_each_picked(view, len, &live, |a, n| {
+        let o = a - view;
         // SAFETY: the chunk's live pages, through its alias, into the new
         // section's view; no thread or vCPU writes them meanwhile.
         unsafe { std::ptr::copy_nonoverlapping((alias + o) as *const u8, (tmp + o) as *mut u8, n) };
-    }
+        copied += n;
+    });
     #[cfg(test)]
     if let Some(hook) = *MOVE_HOOK.lock().unwrap() {
         hook();
@@ -2882,7 +2933,7 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, live: &[(us
     if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
         protect_live(PAGE_READWRITE);
         unmap_tmp();
-        return false;
+        return None;
     }
     let swapped = view_into(&section, alias, len)
         // SAFETY: unmaps the chunk's guest view, keeping its placeholder.
@@ -2894,10 +2945,23 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, live: &[(us
     }
     unmap_tmp();
     drop(t);
-    for &(o, n) in dead {
-        uncharge(view + o, n);
+    // The missing pages' charge: the dead pages' (a page never filled has
+    // none, and its decommit changes nothing).
+    let mut run: Option<usize> = None;
+    for at in (view..view + len).step_by(PAGE) {
+        match (missing(at), run) {
+            (true, None) => run = Some(at),
+            (false, Some(r)) => {
+                uncharge(r, at - r);
+                run = None;
+            }
+            _ => {}
+        }
     }
-    true
+    if let Some(r) = run {
+        uncharge(r, view + len - r);
+    }
+    Some((copied, dead))
 }
 
 /// The parts of `[s, s + len)` in each region of the table, in order (the
@@ -3194,14 +3258,43 @@ pub(crate) fn copying(addr: usize, len: usize) -> Copying {
 
 /// A guard as [`discard_waiting`]'s, if no system call copying memory of
 /// `[addr, addr + len)` is in flight now; `None` without waiting if one is.
+/// Allocates nothing (the reclaim's: [`reserve_discards`]): with no room
+/// left for a guard, `None` as for a call in flight.
 pub(crate) fn try_discard(addr: usize, len: usize) -> Option<Discarding> {
     let (s, e) = (addr, addr.saturating_add(len));
     let mut f = IN_FLIGHT.lock().unwrap();
-    if any_overlaps(&f.calls, s, e) {
+    if any_overlaps(&f.calls, s, e) || f.discards.len() == f.discards.capacity() {
         return None;
     }
     f.discards.push((s, e));
     Some(Discarding(s, e))
+}
+
+/// [`discard_waiting`], allocating nothing (the reclaim's at a touch:
+/// [`reserve_discards`]): `None`, without waiting, with no room left for a
+/// guard.
+pub(crate) fn discard_waiting_within(addr: usize, len: usize) -> Option<Discarding> {
+    let (s, e) = (addr, addr.saturating_add(len));
+    let mut f = IN_FLIGHT.lock().unwrap();
+    if f.discards.len() == f.discards.capacity() {
+        return None;
+    }
+    f.discards.push((s, e));
+    while any_overlaps(&f.calls, s, e) {
+        f = IN_FLIGHT_CHANGED.wait(f).unwrap();
+    }
+    Some(Discarding(s, e))
+}
+
+/// The discard guards a reclaim may hold, reserved when a userfaultfd range
+/// is registered: two (a fill's pass and a touch's wait) and the discards
+/// of up to 62 other threads at once, which may then grow the list as they
+/// did; whether the room is there.
+pub(crate) fn reserve_discards() -> bool {
+    const ROOM: usize = 64;
+    let mut f = IN_FLIGHT.lock().unwrap();
+    let more = ROOM.saturating_sub(f.discards.capacity() - f.discards.len());
+    more == 0 || f.discards.try_reserve(more).is_ok()
 }
 
 /// Whether this thread is in a system call counted in flight

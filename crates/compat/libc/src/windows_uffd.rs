@@ -708,6 +708,10 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     let Some(range) = RANGES.iter().find(|r| r.start.load(Ordering::Acquire) == 0) else {
         return Err(errno_err(crate::ENOMEM));
     };
+    // The reclaim's working memory for every chunk registered with this one,
+    // reserved now, so that a reclaim at the limit allocates nothing.
+    let chunks = usize::try_from(len.div_ceil(crate::windows_mm::UFFD_CHUNK as u64)).unwrap_or(usize::MAX);
+    reserve_reclaim(registered_chunks().saturating_add(chunks))?;
     let pages = len / PAGE;
     // Residency decides what is missing.
     let mut resident = std::vec![0u8; pages as usize];
@@ -1180,24 +1184,81 @@ impl Reclaimed {
     }
 }
 
-/// A chunk with dead pages ([`chunks_with_dead_pages`]): its guest view, its
-/// length, its alias, and its live and dead runs as offsets from the view.
-struct Dead {
+/// A chunk with dead pages ([`find_candidates`]): its guest view, its
+/// length, its alias, and the bytes of its dead pages.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
     view: usize,
     len: usize,
     alias: usize,
-    live: Vec<(usize, usize)>,
-    dead: Vec<(usize, usize)>,
-    bytes: usize,
+    dead: usize,
 }
 
-/// The chunks (`windows_mm::UFFD_CHUNK`) of reserved ranges, every page
-/// registered, that hold dead pages: missing (discarded) but committed, a
-/// section page and a charge each (a chunk discarded whole has none:
+/// The reclaim's working memory, reserved when a range is registered
+/// ([`reserve_reclaim`]) for every chunk registered then, so that a reclaim
+/// allocates nothing: it runs when the job has refused commit, where a heap
+/// that must grow would end the process instead (Linux's reclaim takes no
+/// memory on that path either; `test_a_reclaim_allocates_nothing`).
+/// `CANDIDATES` is a reclaim's list, under [`LOCK`]; `TOUCH_SKIPPED` the
+/// chunks a touch's reclaim passed over and waits for, under its own lock,
+/// which one touch's wait holds ([`reclaim_at_touch`]).
+static CANDIDATES: Mutex<Vec<Candidate>> = Mutex::new(Vec::new());
+static TOUCH_SKIPPED: Mutex<Vec<Candidate>> = Mutex::new(Vec::new());
+
+/// Reserves the reclaim's working memory for `chunks` chunks registered at
+/// once ([`CANDIDATES`], [`TOUCH_SKIPPED`]) and room for its discard guards
+/// (`windows_mm::reserve_discards`): `ENOMEM` if it cannot be had, as a
+/// registration whose memory cannot be charged is refused.
+fn reserve_reclaim(chunks: usize) -> io::Result<()> {
+    for list in [&CANDIDATES, &TOUCH_SKIPPED] {
+        let mut l = list.lock().unwrap();
+        if l.capacity() < chunks {
+            let more = chunks - l.len();
+            l.try_reserve_exact(more).map_err(|_| errno_err(crate::ENOMEM))?;
+        }
+    }
+    if crate::windows_mm::reserve_discards() {
+        Ok(())
+    } else {
+        Err(errno_err(crate::ENOMEM))
+    }
+}
+
+/// The chunks (`windows_mm::UFFD_CHUNK`) of the registered ranges, as
+/// [`reserve_reclaim`] counts them: whole and part chunks of each range.
+fn registered_chunks() -> usize {
+    let chunk = crate::windows_mm::UFFD_CHUNK as u64;
+    RANGES
+        .iter()
+        .filter(|r| r.start.load(Ordering::Acquire) != 0)
+        .map(|r| usize::try_from((r.end.load(Ordering::Acquire) - r.start.load(Ordering::Acquire)).div_ceil(chunk)).unwrap_or(usize::MAX))
+        .sum()
+}
+
+/// Whether the page at `at` of `range` (whose first page is at `s`) is
+/// missing: for a committed page, dead.
+fn missing_at(range: &Range, s: u64, at: usize) -> bool {
+    Range::test(&range.missing, (at as u64 - s) / PAGE)
+}
+
+/// The bytes of the dead pages of `[view, view + len)` in `range` (whose
+/// first page is at `s`): committed and missing.
+fn dead_bytes(range: &Range, s: u64, view: usize, len: usize) -> usize {
+    let mut dead = 0;
+    crate::windows_mm::for_each_committed(view, len, |a, n| {
+        dead += (a..a + n).step_by(PAGE as usize).filter(|&at| missing_at(range, s, at)).count() * PAGE as usize;
+    });
+    dead
+}
+
+/// Fills `out` (cleared first, never grown: the chunks past its capacity are
+/// left out) with the chunks of reserved ranges, every page registered,
+/// that hold dead pages: missing (discarded) but committed, a section page
+/// and a charge each (a chunk discarded whole has none:
 /// `windows_mm::uffd_swap_chunk`), the most dead first. Under [`LOCK`].
-fn chunks_with_dead_pages() -> Vec<Dead> {
+fn find_candidates(out: &mut Vec<Candidate>) {
+    out.clear();
     let chunk = crate::windows_mm::UFFD_CHUNK as u64 / PAGE;
-    let mut out = Vec::new();
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::Acquire);
         if s == 0 || !r.reserved.load(Ordering::Acquire) {
@@ -1210,84 +1271,83 @@ fn chunks_with_dead_pages() -> Vec<Dead> {
             if !(c..c_end).all(|p| Range::test(&r.tracked, p)) {
                 continue;
             }
-            let view = s + c * PAGE;
-            let (mut live, mut dead) = (Vec::new(), Vec::new());
-            let push = |runs: &mut Vec<(usize, usize)>, at: u64| {
-                #[allow(clippy::cast_possible_truncation)]
-                let o = (at - view) as usize;
-                match runs.last_mut() {
-                    Some((ro, rn)) if *ro + *rn == o => *rn += PAGE as usize,
-                    _ => runs.push((o, PAGE as usize)),
-                }
-            };
             #[allow(clippy::cast_possible_truncation)]
-            for (a, l) in crate::windows_mm::committed_runs(view as usize, ((c_end - c) * PAGE) as usize) {
-                for at in (a as u64..(a + l) as u64).step_by(PAGE as usize) {
-                    if Range::test(&r.missing, (at - s) / PAGE) {
-                        push(&mut dead, at);
-                    } else {
-                        push(&mut live, at);
-                    }
-                }
-            }
-            let bytes = dead.iter().map(|r| r.1).sum();
-            if bytes > 0 {
+            let (view, len) = ((s + c * PAGE) as usize, ((c_end - c) * PAGE) as usize);
+            let dead = dead_bytes(r, s, view, len);
+            if dead > 0 && out.len() < out.capacity() {
                 #[allow(clippy::cast_possible_truncation)]
-                out.push(Dead { view: view as usize, len: ((c_end - c) * PAGE) as usize, alias: (alias + c * PAGE) as usize, live, dead, bytes });
+                out.push(Candidate { view, len, alias: (alias + c * PAGE) as usize, dead });
             }
         }
     }
-    out.sort_by_key(|d| core::cmp::Reverse(d.bytes));
-    out
+    // Unstable: a stable sort takes a buffer.
+    out.sort_unstable_by_key(|d| core::cmp::Reverse(d.dead));
+}
+
+/// The range a chunk's view is in, and that range's first page.
+fn range_of_view(view: usize) -> Option<(&'static Range, u64)> {
+    find(view as u64).map(|(r, _)| (r, r.start.load(Ordering::Acquire)))
 }
 
 /// The moves made, for the record (RECLAIMREC): each one's live pages
-/// copied and its time in microseconds, the first 4096.
-static MOVES: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+/// copied (high 32 bits) and its time in microseconds (low 32), the first
+/// [`MOVES_KEPT`]; fixed, as the reclaim allocates nothing.
+const MOVES_KEPT: usize = 4096;
+static MOVES: [AtomicU64; MOVES_KEPT] = [const { AtomicU64::new(0) }; MOVES_KEPT];
+static MOVES_MADE: AtomicUsize = AtomicUsize::new(0);
 /// The accesses that waited for a move ([`fault`]), and how long in all.
 static MOVE_WAITS: AtomicU64 = AtomicU64::new(0);
 static MOVE_WAITED_US: AtomicU64 = AtomicU64::new(0);
 
 /// Moves one chunk (`windows_mm::uffd_move_chunk`), marked moving for its
 /// time: an access to it meanwhile waits in [`fault`] until the mark goes
-/// (the waiters of its missing pages wait on for their fill). Under
-/// [`LOCK`], with a discard's guard on the chunk.
-fn move_chunk(d: &Dead) -> Reclaimed {
+/// (the waiters of its missing pages wait on for their fill). Its dead
+/// pages are its committed pages missing now (`d.dead` is what
+/// [`find_candidates`] counted). Under [`LOCK`], with a discard's guard on
+/// the chunk.
+fn move_chunk(d: &Candidate) -> Reclaimed {
+    let Some((range, s)) = range_of_view(d.view) else {
+        return Reclaimed::default();
+    };
     MOVING_END.store((d.view + d.len) as u64, Ordering::SeqCst);
     MOVING_START.store(d.view as u64, Ordering::SeqCst);
     let t = std::time::Instant::now();
-    let moved = crate::windows_mm::uffd_move_chunk(d.view, d.len, d.alias, &d.live, &d.dead);
+    let moved = crate::windows_mm::uffd_move_chunk(d.view, d.len, d.alias, &|at| missing_at(range, s, at));
     let us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
     MOVING_START.store(0, Ordering::SeqCst);
     MOVING_END.store(0, Ordering::SeqCst);
-    if !moved {
+    let Some((copied, freed)) = moved else {
         return Reclaimed::default();
+    };
+    let copied = copied / PAGE as usize;
+    let n = MOVES_MADE.fetch_add(1, Ordering::Relaxed);
+    if n < MOVES_KEPT {
+        MOVES[n].store((copied as u64) << 32 | us.min(u64::from(u32::MAX)), Ordering::Relaxed);
     }
-    let copied = d.live.iter().map(|r| r.1).sum::<usize>() / PAGE as usize;
-    let mut m = MOVES.lock().unwrap();
-    if m.len() < 4096 {
-        m.push((copied, us));
-    }
-    Reclaimed { chunks: 1, copied, freed: d.bytes, skipped: 0 }
+    Reclaimed { chunks: 1, copied, freed, skipped: 0 }
 }
 
 /// One pass over `chunks` until `need` bytes are given back: a chunk with a
-/// system call in flight on it is passed over (`windows_mm::try_discard`),
-/// and returned. Under [`LOCK`].
-fn reclaim_pass(need: usize, chunks: Vec<Dead>) -> (Reclaimed, Vec<Dead>) {
-    let (mut r, mut skipped) = (Reclaimed::default(), Vec::new());
+/// system call in flight on it is passed over (`windows_mm::try_discard`)
+/// and, if `skipped` is given, kept there (never grown). Under [`LOCK`].
+fn reclaim_pass(need: usize, chunks: &[Candidate], mut skipped: Option<&mut Vec<Candidate>>) -> Reclaimed {
+    let mut r = Reclaimed::default();
     for d in chunks {
         if r.freed >= need {
             break;
         }
         let Some(_guard) = crate::windows_mm::try_discard(d.view, d.len) else {
-            skipped.push(d);
+            r.skipped += 1;
+            if let Some(s) = skipped.as_deref_mut() {
+                if s.len() < s.capacity() {
+                    s.push(*d);
+                }
+            }
             continue;
         };
-        r.add(move_chunk(&d));
+        r.add(move_chunk(d));
     }
-    r.skipped = skipped.len();
-    (r, skipped)
+    r
 }
 
 /// The reclaim of a fill refused at the limit (under [`LOCK`], which the
@@ -1297,7 +1357,11 @@ fn reclaim_pass(need: usize, chunks: Vec<Dead>) -> (Reclaimed, Vec<Dead>) {
 /// handler sends only once this one is answered, so the wait would not end;
 /// the fill is refused instead (`ENOMEM`), as it was before.
 fn reclaim_for_a_fill(need: usize) -> Reclaimed {
-    reclaim_pass(need.max(crate::windows_mm::UFFD_CHUNK), chunks_with_dead_pages()).0
+    let mut c = CANDIDATES.lock().unwrap();
+    find_candidates(&mut c);
+    let r = reclaim_pass(need.max(crate::windows_mm::UFFD_CHUNK), &c, None);
+    c.clear();
+    r
 }
 
 /// Reclaims at least `need` bytes of dead pages (a chunk's worth at least)
@@ -1309,34 +1373,50 @@ fn reclaim_for_a_fill(need: usize) -> Reclaimed {
 /// `prefault_lazy`), by a host thread or a vCPU. The chunks holding dead
 /// pages are moved into new sections, the most dead first
 /// (`windows_mm::uffd_move_chunk`). Those passed over for a system call in
-/// flight on them are waited for once, without [`LOCK`] (the call may be
-/// in its prefault, waiting for a fill that needs it), and tried again;
-/// never by a thread in a call itself (its own call would be among them,
-/// `windows_mm::in_a_call`) or one holding [`LOCK`] (which reclaims
+/// flight on them are waited for, one at a time and without [`LOCK`] (the
+/// call may be in its prefault, waiting for a fill that needs it), and
+/// moved; never by a thread in a call itself (its own call would be among
+/// them, `windows_mm::in_a_call`) or one holding [`LOCK`] (which reclaims
 /// nothing). The calls end: only calls that do are counted (`windows_fd`).
+/// Allocates nothing ([`CANDIDATES`]).
 pub(crate) fn reclaim_at_touch(need: usize) -> Reclaimed {
     if HOLDS_LOCK.get() || REGISTERED.load(Ordering::Acquire) == 0 {
         return Reclaimed::default();
     }
     let need = need.max(crate::windows_mm::UFFD_CHUNK);
-    let guard = lock();
-    let (mut r, skipped) = reclaim_pass(need, chunks_with_dead_pages());
-    drop(guard);
-    if r.freed >= need || skipped.is_empty() || crate::windows_mm::in_a_call() {
-        return r;
+    let wait = !crate::windows_mm::in_a_call();
+    // The skipped list is one touch's at a time: a second touch waits here
+    // for the first's waits, which end as the calls end.
+    let mut skipped = wait.then(|| TOUCH_SKIPPED.lock().unwrap());
+    if let Some(s) = skipped.as_deref_mut() {
+        s.clear();
     }
-    let waited: Vec<_> = skipped.iter().map(|d| (d.view, crate::windows_mm::discard_waiting(d.view, d.len))).collect();
-    let _guard = lock();
-    for d in chunks_with_dead_pages() {
+    let mut r = {
+        let _guard = lock();
+        let mut c = CANDIDATES.lock().unwrap();
+        find_candidates(&mut c);
+        let r = reclaim_pass(need, &c, skipped.as_deref_mut());
+        c.clear();
+        r
+    };
+    let Some(s) = skipped else {
+        return r;
+    };
+    for d in s.iter() {
         if r.freed >= need {
             break;
         }
-        if waited.iter().any(|(v, _)| *v == d.view) {
-            r.add(move_chunk(&d));
+        let Some(_waited) = crate::windows_mm::discard_waiting_within(d.view, d.len) else {
+            continue;
+        };
+        let _guard = lock();
+        // Its dead pages again: the chunk may have changed meanwhile (moved
+        // by a fill's reclaim, filled, unregistered).
+        if range_of_view(d.view).is_some_and(|(range, s)| dead_bytes(range, s, d.view, d.len) > 0) {
+            r.add(move_chunk(d));
         }
     }
     r.skipped = 0;
-    drop(waited);
     r
 }
 
@@ -1344,7 +1424,16 @@ pub(crate) fn reclaim_at_touch(need: usize) -> Reclaimed {
 /// microseconds; the accesses that waited for one and their microseconds.
 #[cfg(test)]
 pub(crate) fn moves_on_record() -> (Vec<(usize, u64)>, u64, u64) {
-    (MOVES.lock().unwrap().clone(), MOVE_WAITS.load(Ordering::Relaxed), MOVE_WAITED_US.load(Ordering::Relaxed))
+    let n = MOVES_MADE.load(Ordering::Relaxed).min(MOVES_KEPT);
+    let moves = MOVES[..n]
+        .iter()
+        .map(|m| {
+            let v = m.load(Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation)]
+            ((v >> 32) as usize, v & u64::from(u32::MAX))
+        })
+        .collect();
+    (moves, MOVE_WAITS.load(Ordering::Relaxed), MOVE_WAITED_US.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]
@@ -2024,7 +2113,6 @@ mod tests {
     /// their chunks with no allocation on the reclaiming thread. In a
     /// process of its own (a reclaim takes any chunk of the process).
     #[test]
-    #[ignore = "fails until the reclaim allocates nothing (the next commit)"]
     fn test_a_reclaim_allocates_nothing() {
         let (code, text) = run_child("reclaim_allocations_child", None);
         assert!(text.contains("allocations: touch 0, fill 0"), "{text}");
