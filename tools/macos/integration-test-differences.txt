@@ -286,45 +286,59 @@ all impossible integration_tests/functional/test_net.py::test_tap_offload
 # restore_from_snapshot when it resumes one (framework/microvm.py
 # wait_for_ssh_up), and each starts its server in the guest over ssh.
 
-# The test sizes a balloon from the RSS it measures (test_balloon.py:
-# 256 MiB minus get_resident_memory minus 50 MiB), so that the guest runs out
-# of memory when it dirties 128 MiB, and with deflate_on_oom the balloon
-# deflates. Every MiB the reading holds beyond the guest's memory is a MiB
-# more the guest has free (upstream tuned this sizing three times for guests
-# a few MiB smaller, upstream's commits 214314d30, 80abdb211, 4f3d8cd27). On
-# macOS the guest does not run out of memory ("Balloon did not deflate";
-# both variants in m2-parts2, d706d9a). The variant without deflate_on_oom passes. Measured
-# in the diagnostic run m2-kpf (33b9eec, the guest's /proc/kpageflags): the
-# guest has 31,532 of its 65,024 RAM pages in use (123 MiB, its reserved
-# memory among them) and they fill 7,939 16 KiB frames (124 MiB): the
-# host's 16 KiB pages add 0.7%, so they are not the cause (upstream's
-# aarch64 CI hosts run 4 KiB pages: CONFIG_ARM64_4K_PAGES=y in the Amazon
-# Linux 2 5.10 and 2023 6.1 and 6.18 aarch64 kernels' configs). The reading
-# has left out the dyld shared cache's part since (get_resident_memory, as
-# the memory monitor counts it apart: the memory entry above); it keeps the
-# VMM's own part, as Linux's VmRSS keeps Firecracker's own pages. In the
-# diagnostic runs at c0cf9ee, with deflate_on_oom (balloon MiB, the guest's
-# MemAvailable after the inflation in brackets): m2-less-cache, the reading
-# without the shared cache's part, PCI_ON 63 (126) did not deflate, PCI_OFF
-# 65 (121) did; m2-less-vmm, without the own part too, PCI_ON 67 (123) and
-# PCI_OFF 70 (122) both did; m2-kpf, the full reading, 58 to 60, neither. So
-# it passes when the VMM's own part is about 2 MiB or less; it is 4.3 to
-# 4.8 MiB (the memory entry above has what holds it). A run where it passes
-# before that part comes down passes at the margin, by luck: the entry stays
-# until then. At the margin: both passed in mac1-vsock-balloon-ff84c70
-# (ff84c70) with the VMM's own part unchanged, 4.62 and 4.36 MiB
-# (memory-parts.jsonl); the balloon deflated from 62 to 59 and from 65 to
-# 61 MiB (the tests' "size before/after" lines, test-report.json).
-# Ten runs of each, one at a time (mac9-deflate-on-knobs-1 to -10 and
-# mac9-deflate-on-noknobs-1 to -10, alternating, and mac9-deflate-off-noknobs-1
-# to -10, at 8540847, load 12 to 21): PCI_ON 9 of 10 passed, and 8 of 10 with
-# libmalloc's configuration on a test-only branch (the VMM's own part 4.64 to
-# 4.78 MiB, and 4.03 to 4.09 with it), PCI_OFF 6 of 10. The outcome does not
-# follow the balloon the reading sized: runs failed at 64, 65, 66 and 67 MiB
-# and passed at 63 to 68 MiB, and a balloon that deflated gave back 1 to
-# 6 MiB. So the guest is at the edge of running out of memory, and the
-# 0.6 MiB the configuration takes off the VMM's part does not decide which
-# side it lands on.
+# The test sizes a balloon from its first reading R (test_balloon.py: 256 MiB
+# minus get_resident_memory minus 50 MiB), runs fillmem 128 in the guest (it
+# goes on after ssh's 1 s timeout, which drops only the local client of the
+# ControlMaster) and, 5 s later, wants the balloon smaller. A guest deflates
+# on OOM only: Linux v6.1's driver registers an OOM notifier for
+# VIRTIO_BALLOON_F_DEFLATE_ON_OOM (drivers/virtio/virtio_balloon.c :927-930)
+# that gives back VIRTIO_BALLOON_OOM_NR_PAGES, 256 pages (:30, :834-844), per
+# out_of_memory() call, which runs the notifiers before it picks a victim
+# (mm/oom_kill.c :1114); the free page shrinker is for FREE_PAGE_HINT only
+# (virtio_balloon.c :895-922), which the test does not turn on. So the guest
+# must run out of memory: fillmem's 128 MiB must exceed what the guest has
+# available after the inflation. The variant without deflate_on_oom passes.
+# Measured, six diagnostic runs (mac9-dfd-b, at d1fae5e with the guest's
+# /proc/meminfo and /proc/vmstat read after the inflation and after fillmem,
+# load 14 to 18): MemAvailable after the inflation 122.5 to 126.8 MiB; fillmem
+# succeeded every time, the guest reclaiming 55 to 63 MiB of page cache;
+# oom_kill 0; balloon_deflate 0 pages in the three failures and 256 or 512 in
+# the three passes (one or two out_of_memory() calls at the end). The guest
+# does not run out of memory, so it has nothing to deflate; the device sees
+# what it sends. In Linux CI (run 43605802557, x86_64, its x86 guest) R is 112
+# to 118 MiB, the balloon 91 to 97 MiB, and it deflates 34 to 38 MiB, so about
+# 93 MiB was available there; ten runs of each here (mac9-deflate-on-knobs-1
+# to -10 and mac9-deflate-on-noknobs-1 to -10, alternating, and
+# mac9-deflate-off-noknobs-1 to -10, at 8540847, load 12 to 21): PCI_ON 9 of
+# 10 passed, 8 of 10 with libmalloc's configuration on a test-only branch (the
+# VMM's own part 4.64 to 4.78 MiB, and 4.03 to 4.09 with it), PCI_OFF 6 of 10,
+# R 142 to 147 MiB, the balloon 63 to 68 MiB and the outcome not following it:
+# a coin toss at a margin of a few MiB. What R holds on this aarch64 guest
+# (mac9-touched-1, six microVMs: the guest's pages in use by /proc/kpageflags,
+# and the pages it wrote, the non-zero 4 KiB pages of a full snapshot's memory
+# file): about 4.6 MiB of VMM; 123.2 MiB of guest pages in use, 123.7 MiB in
+# 16 KiB frames, so the host's 16 KiB pages add 0.5 MiB; 8.5 to 10.7 MiB of
+# frames all free but written, the same in 4 KiB pages, which a Linux host
+# holds too; the guest's page cache, about 55 MiB, in use but reclaimable; and
+# about 4 MiB of frames with no page in use and none written. A read is enough
+# to make this host hold a page (mac9-readonly-1: the guest read 128.3 and
+# 133.7 MiB of its free frames through /proc/kcore, writing nothing, and R
+# rose 119.8 and 123.2 MiB): XNU has no shared zero page for anonymous memory,
+# an absent page is a zero-fill fault whatever the access (xnu-12377.121.6
+# osfmk/vm/vm_fault.c :6176, VM_PAGE_GRAB_ZERO_FILL :6241-6244), where Linux
+# maps the zero page for a read (mm/memory.c :4088; KVM faults without
+# FOLL_WRITE on a read, virt/kvm/kvm_main.c hva_to_pfn_slow :2514-2546) and
+# Rss leaves it out (fs/proc/task_mmu.c smaps_pte_entry). The ~4 MiB set is
+# not split between pages read and pages zeroed and freed. So the part of R a
+# Linux host would not hold is at most about 5 MiB: about 1.2 MiB of VMM
+# (Linux CI's own part in this test 3.26 to 3.52 MiB) and up to the ~4 MiB
+# set; it makes the balloon that much smaller and the guest's MemAvailable
+# that much larger. Not measured: the same guest on a Linux aarch64 host,
+# where by these numbers it would be a few MiB short of 128 MiB and deflate by
+# a few MiB; that run decides whether the cause is this host's part (then the
+# zero-fill part is a difference of the host and the VMM's part goes with the
+# memory entry above) or upstream's sizing for aarch64 guests. Listed until
+# then.
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_ON-True-kvm]
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_OFF-True-kvm]
 
