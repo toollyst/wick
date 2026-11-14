@@ -1168,6 +1168,12 @@ jobs:
           # a triple fault; and a KVM local APIC state in x2APIC mode.
           alone whp::vcpu::fpu_tests::test_the_x2apic_lvt_timer_in_tsc_deadline_mode_as_kvm
           alone whp::vcpu::fpu_tests::test_a_kvm_lapic_state_in_x2apic_mode_restores
+          # The APIC page's read-modify-write (the x2APIC LVT timer in
+          # TSC-deadline mode) against interrupts requested meanwhile: an
+          # MSI and an IPI between its get and set, and 2000 MSIs from
+          # another thread against the guest's writes (X2RMWREC lines).
+          alone whp::vcpu::fpu_tests::test_a_page_set_loses_no_requested_interrupt
+          alone whp::vcpu::fpu_tests::test_a_page_set_loses_no_requested_interrupt --release
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # The lazy-RAM grain (LAZYGRAIN lines): guest RAM mapped as

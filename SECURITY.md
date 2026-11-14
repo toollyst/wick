@@ -374,7 +374,10 @@ upstream Firecracker and its jailer.
   does. KVM intercepts every #GP the same way when `enable_vmware_backdoor` is set (Linux v6.1
   arch/x86/kvm/vmx/vmx.c 791, 5091-5103). The decode and the merge are unit-tested on every host (fuzz crate
   `whp_gp`); the storm's isolation (another vCPU's rate, the API's latency, the job's CPU accounting) is not
-  measured yet, and nothing of it has run on Windows yet.
+  measured yet, and nothing of it has run on Windows yet. Its LVT timer write in TSC-deadline mode is a get and a
+  set of the vCPU's own APIC register page (WHP's register refuses that mode): an interrupt requested between them
+  and lost would stall only this guest's device or IPI, never reach another VM or the host;
+  `test_a_page_set_loses_no_requested_interrupt` shows whether one is kept (not yet run on Windows).
 - **Side channels** between VMs on the same host follow upstream's
   [production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md)
   guidance on Linux; the equivalent guidance for macOS and Windows hosts is not written yet.

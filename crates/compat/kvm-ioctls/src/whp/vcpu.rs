@@ -1985,10 +1985,17 @@ impl VcpuFd {
     /// the timer, zeroes the initial count and the deadline, as
     /// `apic_update_lvtt` (Linux v6.1 arch/x86/kvm/lapic.c 1583-1599). The
     /// entry is written through `WHvX64RegisterApicLvtTimer` and read back;
-    /// a value WHP does not keep that way is written through the APIC
-    /// register page (KVM_SET_LAPIC's way, which keeps TSC-deadline mode:
-    /// X2E0REC g, CI run 43528910212: the guest's RDMSR then read
-    /// 0x400ec), and one it keeps neither way fails the vCPU, named.
+    /// a value WHP does not keep that way, which is every TSC-deadline-mode
+    /// value (the register refuses 0x400ec with errno 87 once EXTD is set
+    /// and takes 0x100ec and 0xec: X2E0REC c, CI runs 43521200989 and
+    /// 43524342863), is written through the APIC register page
+    /// (KVM_SET_LAPIC's way, which keeps TSC-deadline mode: X2E0REC g, CI
+    /// run 43528910212: the guest's RDMSR then read 0x400ec), and one it
+    /// keeps neither way fails the vCPU, named. The page's get and set are
+    /// a read-modify-write of the whole APIC while an irqfd's writer, the
+    /// MSI hook or another vCPU may request an interrupt of this one:
+    /// `test_a_page_set_loses_no_requested_interrupt` shows whether one
+    /// requested between them is kept.
     fn write_x2apic_lvtt(&self, eax: u32) -> Result<()> {
         let (part, vp) = (self.part(), self.vp());
         let sw_enabled = self.register(whv::WHvX64RegisterApicSpurious)? & (1 << 8) != 0;
@@ -2010,8 +2017,12 @@ impl VcpuFd {
         }
         let (mut page, size) = self.lapic_page()?;
         page[0x320..0x324].copy_from_slice(&value.to_le_bytes());
+        #[cfg(any(test, feature = "whp-trace"))]
+        let before = super::ffi::trace::stack();
         // SAFETY: the register page is valid for `size` bytes.
         let hres = unsafe { whv::WHvSetVirtualProcessorInterruptControllerState(part, vp, page.as_ptr().cast(), size) };
+        #[cfg(any(test, feature = "whp-trace"))]
+        super::ffi::trace::note("WHvSetVirtualProcessorInterruptControllerState", vp, &[], None, before, hres);
         super::ffi::hr_of("WHvSetVirtualProcessorInterruptControllerState", hres, || format!("vp {vp}"))?;
         if kept(self)? {
             return Ok(());
@@ -5559,6 +5570,269 @@ mod fpu_tests {
         let (got_id, ldr, lvtt) = (word(&back, 0x20), word(&back, 0xd0), word(&back, 0x320));
         eprintln!("X2LAPICTEST WHvX64RegisterApicId {id:#x}; KVM_GET_LAPIC: ID {got_id:#x}, LDR {ldr:#x}, LVT timer {lvtt:#x}");
         assert_eq!((id, got_id, ldr, lvtt), (1, 0x100_0000, 0x2, 0x4_00ec));
+    }
+
+    /// The APIC register page's read-modify-write that writes an x2APIC
+    /// LVT timer entry in TSC-deadline mode (`write_x2apic_lvtt`: WHP's
+    /// register refuses that mode, errno 87, X2E0REC c in CI runs
+    /// 43521200989 and 43524342863, so on an x2APIC partition the page is
+    /// the only way) loses no interrupt requested of the vCPU, on a host
+    /// whose partitions are x2APICs. An interrupt requested between the
+    /// page's get and its set would be lost if WHP kept it in the page,
+    /// and an irqfd's writer, the MSI hook or another vCPU's IPI may
+    /// request one at any time. Vector 0xe1, whose gate EOIs (WRMSR 0x80b)
+    /// and does `out 0x82`; vCPU 0 halted with interrupts on, stopped at
+    /// its last exit while each case's steps are made, then run:
+    /// - control: an MSI injected (`inject_msi`, the irqfd writer's call),
+    ///   no page set;
+    /// - the MSI, then the page's get and set (the LVT timer 0x400e0);
+    /// - the page's get, the MSI injected from another thread, the set of
+    ///   the page as read before it: the race's own order;
+    /// - the page's get, vCPU 1 run to its fixed IPI of 0xe1 to APIC 0
+    ///   (WRMSR 0x830, which WHP takes itself), the set: an IPI there;
+    /// - the MSI, then `write_x2apic_lvtt(0x400e0)` itself (the run loop's
+    ///   path, the page set counted by the trace).
+    ///
+    /// Each case 50 rounds, a round's interrupt taken (`out 0x82 [e1]`)
+    /// before its run is kicked after 5 s; a case stops at its first lost
+    /// one. And concurrently, the run loop's own path against a writer: the
+    /// guest writing 0x400e0 to the LVT timer in a loop (each a #GP exit
+    /// and a page read-modify-write), another thread injecting 2000 MSIs,
+    /// each after the last was taken (its gate counts them). Asserted: every
+    /// interrupt requested is taken. Printed (X2RMWREC lines), with both of
+    /// WHP's formats of the page read after the first request of each case
+    /// (`lapic_formats`), so where WHP keeps a request shows.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_page_set_loses_no_requested_interrupt() {
+        use super::super::apicmode::LocalApic;
+        use super::super::ffi;
+        const V: u8 = 0xE1;
+        const GATE: u64 = 0xB900;
+        const IPI_PROGRAM: u64 = 0xBA00;
+        const TAKEN: u64 = 0x7200;
+        const LOOPS: u64 = 0x7208;
+        const MSI: u64 = 0xFEE0_0000;
+        const LVTT: u32 = 0x4_00E0;
+        const ROUNDS: usize = 50;
+        const REQUESTS: u32 = 2000;
+        if super::super::vm::host_local_apic() != LocalApic::X2Apic {
+            eprintln!("X2RMWREC this host's partitions are xAPICs: no x2APIC partition to test");
+            return;
+        }
+        let imm = |v: u32| v.to_le_bytes();
+        let wrmsr = |ecx: u32, eax: u32| [&[0xB9][..], &imm(ecx), &[0xB8], &imm(eax), &[0x31, 0xD2, 0x0F, 0x30]].concat();
+        // rdmsr 0x1b; or eax, 0xc00; wrmsr; then SVR 0x1ff.
+        let on = [&[0xB9][..], &imm(0x1B), &[0x0F, 0x32, 0x0D], &imm(0xC00), &[0x0F, 0x30], &wrmsr(0x80F, 0x1FF)].concat();
+        let push = [0x50u8, 0x51, 0x52];
+        let pop_iret = [0x5Au8, 0x59, 0x58, 0x48, 0xCF];
+        let taken = format!("out 0x82 [{V:02x}]");
+        let vm_with = |program: &[u8], gate: &[u8]| {
+            let (vm, vcpu, m) = mmio_guest(program);
+            vcpu.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
+            put(m, GATE, gate);
+            put(m, MMIO_IDT + u64::from(V) * 16, &((GATE & 0xffff) | (8 << 16) | (0x8E << 40)).to_le_bytes());
+            put(m, MMIO_IDT + u64::from(V) * 16 + 8, &0u64.to_le_bytes());
+            (vm, vcpu, m)
+        };
+        // Runs `v` until the gate's `out 0x82`, a kick after 5 s, or a
+        // fifth exit; the last exit.
+        let run_to_taken = |v: &mut VcpuFd| {
+            let watchdog = super::Watchdog::arm(v);
+            let mut reads = 0;
+            let mut exits = Vec::new();
+            loop {
+                let e = one_run(v, &[], &mut reads);
+                let end = e == taken || e == "EINTR" || e.starts_with("fault") || e.contains("fail") || exits.len() >= 4;
+                exits.push(e);
+                if end {
+                    break;
+                }
+            }
+            drop(watchdog);
+            v.set_kvm_immediate_exit(0);
+            exits.join(", ")
+        };
+        let set_page = |v: &VcpuFd, page: &mut [u8], size: u32| {
+            page[0x320..0x324].copy_from_slice(&LVTT.to_le_bytes());
+            // SAFETY: the register page, valid for `size` bytes.
+            let hres = unsafe { whv::WHvSetVirtualProcessorInterruptControllerState(v.part(), v.vp(), page.as_ptr().cast(), size) };
+            assert_eq!(hres, 0, "the page's set");
+        };
+
+        // The rounds, each the vCPU halted with interrupts on.
+        let gate = [&push[..], &wrmsr(0x80B, 0), &[0xB0, V, 0xE6, 0x82], &pop_iret].concat();
+        let (vm, mut zero, m) = vm_with(&[on.clone(), vec![0xFB, 0xF4, 0xEB, 0xFD]].concat(), &gate);
+        // vCPU 1: a fixed IPI of V to APIC 0 (ICR 0x4000 | V, EDX 0), `out
+        // 0x83`, again.
+        put(m, IPI_PROGRAM, &[wrmsr(0x830, 0x4000 | u32::from(V)), vec![0xE6, 0x83, 0xEB, 0xEE]].concat());
+        let mut one = vm.create_vcpu(1).unwrap();
+        // Runnable: an AP is made waiting for a SIPI, as KVM makes one
+        // (`regs::startup_suspend`), and would run nothing.
+        one.set_mp_state(kvm_bindings::kvm_mp_state { mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE }).unwrap();
+        one.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
+        one.set_sregs(&zero.get_sregs().unwrap()).unwrap();
+        one.set_regs(&kvm_regs { rip: IPI_PROGRAM, rsp: 0x8800, rflags: 2, ..Default::default() }).unwrap();
+        ffi::set_register(one.part(), one.vp(), whv::WHvX64RegisterApicBase, ffi::reg64(0xFEE0_0C00)).unwrap();
+        let mut l = one.get_lapic().unwrap();
+        for (i, b) in 0x1ffu32.to_le_bytes().into_iter().enumerate() {
+            l.regs[0xf0 + i] = b as std::os::raw::c_char;
+        }
+        one.set_lapic(&l).unwrap();
+        let inner = Arc::clone(&zero.shared.inner);
+        let inject = || inner.inject_msi(MSI, u32::from(V));
+        inject();
+        let warm = run_to_taken(&mut zero);
+        eprintln!("X2RMWREC the guest's first interrupt (x2APIC on, SVR 0x1ff, STI, HLT): {warm}");
+        assert!(warm.ends_with(&taken), "the guest took no interrupt: the test has no guest ({warm})");
+        let cases = [
+            "control, no page set",
+            "the MSI, then the page's get and set",
+            "the page's get, the MSI from another thread, the page's set",
+            "the page's get, vCPU 1's IPI, the page's set",
+            "the MSI, then write_x2apic_lvtt",
+        ];
+        let mut lost = Vec::new();
+        for (case, name) in cases.iter().enumerate() {
+            let (mut delivered, mut page_sets) = (0usize, 0usize);
+            let mut first_lost = None;
+            for round in 0..ROUNDS {
+                let formats = |what: &str| {
+                    if round == 0 {
+                        for line in lapic_formats(&format!("X2RMWREC {name}: {what}"), zero.part(), zero.vp()) {
+                            eprintln!("{line}");
+                        }
+                    }
+                };
+                match case {
+                    0 => {
+                        inject();
+                        formats("after the MSI");
+                    }
+                    1 => {
+                        inject();
+                        formats("after the MSI");
+                        let (mut page, size) = zero.lapic_page().unwrap();
+                        set_page(&zero, &mut page[..], size);
+                    }
+                    2 => {
+                        let (mut page, size) = zero.lapic_page().unwrap();
+                        std::thread::scope(|s| {
+                            s.spawn(inject);
+                        });
+                        formats("after the MSI, the page read before it");
+                        set_page(&zero, &mut page[..], size);
+                    }
+                    3 => {
+                        let (mut page, size) = zero.lapic_page().unwrap();
+                        let mut reads = 0;
+                        let watchdog = super::Watchdog::arm(&one);
+                        let sent = one_run(&mut one, &[], &mut reads);
+                        drop(watchdog);
+                        one.set_kvm_immediate_exit(0);
+                        assert!(sent.starts_with("out 0x83"), "{name}: vCPU 1's IPI: {sent}");
+                        formats("after the IPI, the page read before it");
+                        set_page(&zero, &mut page[..], size);
+                    }
+                    _ => {
+                        inject();
+                        formats("after the MSI");
+                        ffi::trace::begin();
+                        let written = zero.write_x2apic_lvtt(LVTT);
+                        page_sets += ffi::trace::end()
+                            .iter()
+                            .filter(|c| c.call == "WHvSetVirtualProcessorInterruptControllerState")
+                            .count();
+                        written.unwrap();
+                    }
+                }
+                let end = run_to_taken(&mut zero);
+                if end.ends_with(&taken) {
+                    delivered += 1;
+                } else {
+                    first_lost = Some(format!("round {round}'s was not: {end}"));
+                    break;
+                }
+            }
+            let sets = if case == 4 { format!("; the page set {page_sets} times") } else { String::new() };
+            eprintln!(
+                "X2RMWREC {name}: {delivered} of the {} interrupts requested taken{sets}{}",
+                first_lost.as_ref().map_or(ROUNDS, |_| delivered + 1),
+                first_lost.as_ref().map_or(String::new(), |l| format!("; {l}"))
+            );
+            if first_lost.is_some() {
+                lost.push(*name);
+            }
+        }
+        drop(one);
+        drop(zero);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+
+        // Concurrently: the guest's LVT timer writes in a loop (each a #GP
+        // exit and the page's read-modify-write; `inc dword [LOOPS]`), the
+        // MSIs from another thread, the gate counting them (`lock inc dword
+        // [TAKEN]`, EOI, IRETQ).
+        let count = [0xF0u8, 0xFF, 0x04, 0x25, 0x00, 0x72, 0x00, 0x00];
+        let gate = [&push[..], &count, &wrmsr(0x80B, 0), &pop_iret].concat();
+        let program = [on, vec![0xFB], wrmsr(0x832, LVTT), vec![0xFF, 0x04, 0x25, 0x08, 0x72, 0x00, 0x00, 0xEB, 0xE9]].concat();
+        let (vm, mut vcpu, m) = vm_with(&program, &gate);
+        let at = m as usize;
+        // SAFETY: guest memory, mapped until the end; the guest writes it.
+        let read = move |off: u64| unsafe { std::ptr::read_volatile((at + off as usize) as *const u32) };
+        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
+        let inner = Arc::clone(&vcpu.shared.inner);
+        let writer = std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            while read(LOOPS) < 10 && begun.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::yield_now();
+            }
+            let (mut requested, mut lost) = (0u32, 0u32);
+            if read(LOOPS) >= 10 {
+                while requested < REQUESTS && lost < 3 {
+                    let before = read(TAKEN);
+                    inner.inject_msi(MSI, u32::from(V));
+                    requested += 1;
+                    let asked = std::time::Instant::now();
+                    while read(TAKEN) == before {
+                        if asked.elapsed() > std::time::Duration::from_secs(1) {
+                            lost += 1;
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+            let (loops, took) = (read(LOOPS), begun.elapsed());
+            kicker.set_kvm_immediate_exit(1);
+            (requested, lost, loops, took)
+        });
+        let mut reads = 0;
+        let mut exits = Vec::new();
+        loop {
+            let e = one_run(&mut vcpu, &[], &mut reads);
+            let end = e == "EINTR" || exits.len() >= 4;
+            exits.push(e);
+            if end {
+                break;
+            }
+        }
+        let (requested, lost_now, loops, took) = writer.join().unwrap();
+        vcpu.set_kvm_immediate_exit(0);
+        let delivered = read(TAKEN);
+        eprintln!(
+            "X2RMWREC concurrently: {requested} MSIs injected from another thread, {delivered} taken, {lost_now} not taken \
+             within 1 s; the guest's LVT timer writes (each a page read-modify-write) {loops}, in {took:?}; the vCPU's \
+             exits {exits:?}"
+        );
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        assert!(lost.is_empty(), "interrupts lost to a page set: {lost:?}");
+        assert!(loops >= 10, "the guest's loop did not run: {exits:?}");
+        assert_eq!((requested, delivered, lost_now), (REQUESTS, REQUESTS, 0), "the concurrent MSIs");
     }
 
     /// The local APIC state of `vp` in both of WHP's formats, as lines: the
