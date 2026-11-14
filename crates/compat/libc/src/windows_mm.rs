@@ -489,12 +489,15 @@ fn ranges_remove(v: &mut Ranges, off: usize, len: usize) {
     *v = out;
 }
 
-/// The parts of [off, off + len) that are in `v`.
+/// The parts of [off, off + len) that are in `v`. A part's length is worked
+/// out only once it is known not to be empty: `then_some` would work it out
+/// first, and a range wholly before `off` would overflow (a panic in a debug
+/// build).
 fn ranges_within(v: &Ranges, off: usize, len: usize) -> Ranges {
     v.iter()
         .filter_map(|&(o, l)| {
             let (s, e) = (o.max(off), (o + l).min(off + len));
-            (s < e).then_some((s, e - s))
+            (s < e).then(|| (s, e - s))
         })
         .collect()
 }
@@ -2786,7 +2789,14 @@ static STALE: Mutex<BTreeMap<usize, (usize, usize)>> = Mutex::new(BTreeMap::new(
 /// Whether [`STALE`] has any: the access path's one look at it otherwise.
 static STALE_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The runs of `[s, s + len)` that are [`STALE`].
+/// The runs of `[s, s + len)` that are [`STALE`]. On the vectored exception
+/// handler's path ([`commit_on_access`]), where a panic ends the process
+/// (Rust aborts a panic that would unwind out of an `extern "system"`
+/// function): the run before `s`, which may end before it, is measured only
+/// once it is known to reach into `[s, e)` (`then`, not `then_some`, which
+/// works out `z - a` first: PC step 14f, a debug build aborted with "attempt
+/// to subtract with overflow" at the first access to a wholly discarded
+/// chunk).
 fn stale_within(s: usize, len: usize) -> Vec<(usize, usize)> {
     if !STALE_SET.load(std::sync::atomic::Ordering::Acquire) {
         return Vec::new();
@@ -2797,7 +2807,7 @@ fn stale_within(s: usize, len: usize) -> Vec<(usize, usize)> {
     m.range(first..e)
         .filter_map(|(&b, &(n, _))| {
             let (a, z) = (s.max(b), e.min(b + n));
-            (a < z).then_some((a, z - a))
+            (a < z).then(|| (a, z - a))
         })
         .collect()
 }
@@ -3208,6 +3218,30 @@ pub unsafe fn msync(addr: *mut c_void, len: size_t, flags: c_int) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A run that ends before the range asked about is not in it, and its
+    // length is not worked out (`then_some` did, and a debug build panicked
+    // with an overflow: in `stale_within`, under the vectored exception
+    // handler, that ended the process; PC step 14f).
+    #[test]
+    fn test_a_run_before_the_range_asked_about_is_not_in_it() {
+        assert_eq!(ranges_within(&std::vec![(0, 0x1000), (0x3000, 0x1000)], 0x2000, 0x1000), Ranges::new());
+        assert_eq!(ranges_within(&std::vec![(0, 0x1000), (0x2000, 0x2000)], 0x3000, 0x2000), std::vec![(0x3000, 0x1000)]);
+        // STALE runs in the first 64 KiB, which no mapping can have (Windows
+        // allocates nothing below 0x10000), so the access path of the other
+        // tests never finds them.
+        {
+            let mut m = STALE.lock().unwrap();
+            m.insert(0x1000, (0x1000, 0));
+            m.insert(0x4000, (0x1000, 0));
+            STALE_SET.store(true, std::sync::atomic::Ordering::Release);
+        }
+        let between = stale_within(0x3000, 0x1000);
+        let into = stale_within(0x4800, 0x1000);
+        stale_remove(0x1000, 0x4000);
+        assert_eq!(between, std::vec![]);
+        assert_eq!(into, std::vec![(0x4800, 0x800)]);
+    }
 
     /// The tests below place mappings at addresses they freed a moment
     /// before, and check that freed ranges are no longer mapped: another
