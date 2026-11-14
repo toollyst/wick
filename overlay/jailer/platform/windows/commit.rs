@@ -16,7 +16,8 @@
 //! the jailer counts them, and ends the jail as the memory cgroup's OOM kill
 //! ends a cgroup's process, with 137:
 //!
-//! - **The count**, every millisecond (a high-resolution waitable timer):
+//! - **The count**, every millisecond (a high-resolution waitable timer on
+//!   a 1 ms schedule, [`PollTimer`]):
 //!   over the job's processes (`JobObjectBasicProcessIdList`), private commit
 //!   plus section commit (`PROCESS_MEMORY_COUNTERS_EX2`: `PrivateUsage`,
 //!   `SharedCommitUsage`, "the current shared commit usage", Microsoft Learn),
@@ -50,13 +51,20 @@
 //!   uncounted.
 //!
 //! What remains, against Linux (memcontrol.c, `try_charge_memcg`, charges
-//! each page before it is mapped): a time window. Between two polls a
-//! jailed process can take host commit beyond `memory.max` (a 4 GiB section
-//! in 27.8 us, SECTREC-e c) and is ended at the next poll, about 1 ms (the timer's median interval,
-//! `test_the_poll_timer_ticks_about_every_millisecond`, COMMITTIMER). A
-//! process that swaps its cover for usable private commit between two reads
-//! of the cover holds up to twice `memory.max` of usable memory until the
-//! next read, within 100 ms. Windows tells no user-mode process of a
+//! each page before it is mapped): a time window. Between two polls a jailed
+//! process can take host commit beyond `memory.max` (a 4 GiB section in 27.8
+//! us, SECTREC-e c) and is ended after the next poll: the window from a
+//! section's creation to a jail that can take no more: to the next poll
+//! (every 1 ms on a schedule: COMMITTIMER, not yet run with it), that poll's
+//! count with the cover read again (160-185 us), `TerminateJobObject` (265 us
+//! in one run, 7740 us in another) and the processes' end after it (876-979
+//! us): 1374 us and 9830 us in all on the PC at df0bf87 (COMMITPOLL, debug
+//! and release, one run each); what a process commits during the call and
+//! after it, and the call's own time over 50 rounds, alone and after a freeze
+//! of the job, is TERMREC's (`test_terminating_a_jail_on_record`, not yet
+//! run). A process that swaps its cover for usable private commit between two
+//! reads of the cover holds up to twice `memory.max` of usable memory until
+//! the next read, within 100 ms. Windows tells no user-mode process of a
 //! section's creation (`ObRegisterCallbacks` takes process, thread and
 //! desktop handles only: Learn, `OB_OPERATION_REGISTRATION`).
 //!
@@ -403,25 +411,52 @@ fn duplicate(h: HANDLE) -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(out) })
 }
 
-/// The poll's timer: a high-resolution waitable timer, due in [`POLL`] and
-/// then every [`POLL`].
-fn poll_timer() -> io::Result<OwnedHandle> {
-    // SAFETY: no attributes, no name.
-    let timer = unsafe {
-        CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
-    };
-    if timer.is_null() {
-        return Err(io::Error::last_os_error());
+/// The poll's timer: a high-resolution waitable timer, due at a schedule
+/// of one tick every [`POLL`] from its start, each tick set once the one
+/// before was taken ([`PollTimer::arm`]) as a relative wait to its due
+/// time. Windows' periodic timer, due every [`POLL`] by itself, ticked
+/// 1.5 ms apart (median; least 1.02 ms, greatest 2.0 ms: COMMITTIMER on the
+/// PC at df0bf87, debug and release), as a period counted from each tick's
+/// late expiry would; the schedule makes up for a late tick with a shorter
+/// wait to the next. A tick missed while a poll ran long is not made up:
+/// the next poll is at once, and the schedule goes on from it.
+struct PollTimer {
+    timer: OwnedHandle,
+    next: Instant,
+}
+
+impl PollTimer {
+    fn new() -> io::Result<PollTimer> {
+        // SAFETY: no attributes, no name.
+        let timer = unsafe {
+            CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+        };
+        if timer.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the timer just made.
+        let timer = unsafe { OwnedHandle::from_raw_handle(timer) };
+        let mut t = PollTimer { timer, next: Instant::now() };
+        t.arm()?;
+        Ok(t)
     }
-    // SAFETY: the timer just made.
-    let timer = unsafe { OwnedHandle::from_raw_handle(timer) };
-    let period = i32::try_from(POLL.as_millis()).unwrap();
-    let due = -i64::from(period) * 10_000;
-    // SAFETY: our timer; relative due time, then every period, no routine.
-    if unsafe { SetWaitableTimer(timer.as_raw_handle(), &due, period, None, std::ptr::null(), 0) } == 0 {
-        return Err(io::Error::last_os_error());
+
+    /// Sets the timer due at the schedule's next tick: [`POLL`] after the
+    /// last one's due time, or at once if that is past.
+    fn arm(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        self.next += POLL;
+        if self.next < now {
+            self.next = now;
+        }
+        // Relative, in 100 ns units, negative; at least one.
+        let due = -i64::try_from((self.next - now).as_nanos() / 100).unwrap_or(i64::MAX).max(1);
+        // SAFETY: our timer; once, no routine.
+        if unsafe { SetWaitableTimer(self.timer.as_raw_handle(), &due, 0, None, std::ptr::null(), 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
-    Ok(timer)
 }
 
 /// Counts the jail of `job` against `limit` bytes until `firecracker` ends,
@@ -440,7 +475,7 @@ pub(super) fn watch(
     sections_counted().map_err(io::Error::other)?;
     let job = duplicate(job)?;
     let firecracker = duplicate(firecracker)?;
-    let timer = poll_timer()?;
+    let mut timer = PollTimer::new()?;
     let mut jail = Jail {
         job,
         limit,
@@ -455,12 +490,14 @@ pub(super) fn watch(
         past: None,
     };
     std::thread::Builder::new().name("memory.max".into()).spawn(move || {
-        let waits = [timer.as_raw_handle(), firecracker.as_raw_handle()];
+        let waits = [timer.timer.as_raw_handle(), firecracker.as_raw_handle()];
         loop {
             // SAFETY: two handles this thread holds.
             let r = unsafe { WaitForMultipleObjects(2, waits.as_ptr(), 0, INFINITE) };
             let result = match r.wrapping_sub(WAIT_OBJECT_0) {
-                0 => jail.poll(),
+                // The next tick is set before the poll, so that the poll's
+                // time is in the wait.
+                0 => timer.arm().map_err(|e| format!("setting the next poll: {e}")).and_then(|()| jail.poll()),
                 1 => return None,
                 _ => Err(format!("waiting for the next poll: {}", io::Error::last_os_error())),
             };
@@ -562,27 +599,61 @@ mod tests {
         self_check().unwrap();
     }
 
-    // The poll's timer ticks about every POLL on this host: 500 ticks of
-    // `poll_timer`, their intervals' least, median, 99th percentile and
-    // greatest printed (COMMITTIMER), the median asserted within 2 ms, the
-    // window the docs give ("about 1 ms"). A timer that fell back to the
-    // system's default tick would be about 15.6 ms.
+    // The poll's timer ticks every POLL on this host: 500 ticks of
+    // `PollTimer`, armed after each as the poll arms it; their intervals'
+    // least, median, 99th percentile and greatest printed (COMMITTIMER), with
+    // Windows' periodic timer of the same period beside them (the control:
+    // 1.5 ms median on the PC at df0bf87). Asserted: the 500 ticks take at
+    // most 550 ms (a mean interval within 10% of POLL), the window the docs
+    // give ("every 1 ms"). A timer that fell back to the system's default
+    // tick would be about 15.6 ms.
     #[test]
     fn test_the_poll_timer_ticks_about_every_millisecond() {
-        let timer = poll_timer().unwrap();
-        let mut last = Instant::now();
-        let mut gaps = Vec::with_capacity(500);
-        for _ in 0..500 {
+        let ticks = |wait: &mut dyn FnMut()| {
+            let start = Instant::now();
+            let mut last = start;
+            let mut gaps = Vec::with_capacity(500);
+            for _ in 0..500 {
+                wait();
+                let now = Instant::now();
+                gaps.push(now.duration_since(last).as_micros());
+                last = now;
+            }
+            let total = last.duration_since(start).as_millis();
+            gaps.sort_unstable();
+            (total, gaps[0], gaps[250], gaps[495], gaps[499])
+        };
+        let mut timer = PollTimer::new().unwrap();
+        let (total, least, median, p99, most) = ticks(&mut || {
             // SAFETY: our timer.
-            assert_eq!(unsafe { WaitForSingleObject(timer.as_raw_handle(), 1000) }, WAIT_OBJECT_0);
-            let now = Instant::now();
-            gaps.push(now.duration_since(last).as_micros());
-            last = now;
-        }
-        gaps.sort_unstable();
-        let (least, median, p99, most) = (gaps[0], gaps[250], gaps[495], gaps[499]);
-        println!("COMMITTIMER 500 ticks of the poll's timer: least {least} us, median {median} us, 99th percentile {p99} us, greatest {most} us");
-        assert!(median <= 2000, "the poll's timer ticks every {median} us (median), not about every 1 ms");
+            assert_eq!(unsafe { WaitForSingleObject(timer.timer.as_raw_handle(), 1000) }, WAIT_OBJECT_0);
+            timer.arm().unwrap();
+        });
+        // The control: one periodic timer, due every POLL by itself.
+        // SAFETY: no attributes, no name.
+        let periodic = unsafe {
+            OwnedHandle::from_raw_handle(CreateWaitableTimerExW(
+                std::ptr::null(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS,
+            ))
+        };
+        let period = i32::try_from(POLL.as_millis()).unwrap();
+        let due = -i64::from(period) * 10_000;
+        // SAFETY: our timer; relative due time, then every period.
+        assert_ne!(unsafe { SetWaitableTimer(periodic.as_raw_handle(), &due, period, None, std::ptr::null(), 0) }, 0);
+        let control = ticks(&mut || {
+            // SAFETY: our timer.
+            assert_eq!(unsafe { WaitForSingleObject(periodic.as_raw_handle(), 1000) }, WAIT_OBJECT_0);
+        });
+        println!(
+            "COMMITTIMER 500 ticks of the poll's timer in {total} ms: least {least} us, median {median} us, 99th percentile \
+             {p99} us, greatest {most} us; Windows' periodic timer of {period} ms, the control: 500 ticks in {} ms, least {} us, \
+             median {} us, 99th percentile {} us, greatest {} us",
+            control.0, control.1, control.2, control.3, control.4
+        );
+        assert!(total <= 550, "500 ticks of the poll's timer took {total} ms, not about 500 (every 1 ms)");
     }
 
     // A section given to a process of the jail is counted, and one past the
@@ -627,6 +698,185 @@ mod tests {
         }
         assert_eq!(code, Some(KILLED), "48 MiB of sections under a limit 32 MiB above the process");
         assert!(ended.is_some(), "the jail ended, not by the count");
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MapViewOfFile(section: HANDLE, access: u32, high: u32, low: u32, bytes: usize) -> *mut c_void;
+        fn VirtualAlloc(address: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
+        fn QueryThreadCycleTime(thread: HANDLE, cycles: *mut u64) -> i32;
+        fn GetCurrentThread() -> HANDLE;
+    }
+
+    /// The environment variable that gives [`commits_until_ended`] its
+    /// shared page's section handle (hexadecimal; the test's child only).
+    const TERMREC_PAGE: &str = "WICK_TEST_TERMREC_PAGE";
+
+    /// The child of [`test_terminating_a_jail_on_record`]: commits 64 KiB at a
+    /// time, as fast as it can, up to 1 GiB, writing the bytes committed so
+    /// far to the shared page after each, then spins until it is ended.
+    /// Without the page (any other run of the tests) it returns at once.
+    #[test]
+    #[ignore = "run by test_terminating_a_jail_on_record, in a job of its own"]
+    fn commits_until_ended() {
+        let Some(h) = std::env::var(TERMREC_PAGE).ok().and_then(|v| usize::from_str_radix(&v, 16).ok()) else {
+            return;
+        };
+        // SAFETY: the inherited section of a page; FILE_MAP_ALL_ACCESS.
+        let page = unsafe { MapViewOfFile(h as HANDLE, 0xf001f, 0, 0, 4096) };
+        assert!(!page.is_null());
+        // SAFETY: the view is a page, aligned; the parent reads it the same way.
+        let done = unsafe { &*page.cast::<AtomicU64>() };
+        let mut total = 0u64;
+        while total < 1 << 30 {
+            // SAFETY: new memory, the system chooses where.
+            if unsafe { VirtualAlloc(std::ptr::null(), 64 << 10, 0x3000, PAGE_READWRITE) }.is_null() {
+                break;
+            }
+            total += 64 << 10;
+            done.store(total, Ordering::Release);
+        }
+        loop {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// This thread's cycles.
+    fn cycles() -> u64 {
+        let mut c = 0;
+        // SAFETY: this thread's pseudo-handle and an out-parameter.
+        unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
+        c
+    }
+
+    // What ending a jail costs and lets through (TERMREC lines), for the
+    // window memory.max's count leaves: the time from a poll's decision to a
+    // jail that can take no more commit. COMMITPOLL on the PC at df0bf87
+    // gave TerminateJobObject 265 us in one run and 7740 us in another. 50
+    // rounds of each kind, a job of its own each:
+    // - held: a suspended process holding a 48 MiB section (COMMITPOLL's);
+    // - committing: a process committing 64 KiB at a time as fast as it can
+    //   (commits_until_ended), ended once it committed 16 MiB;
+    // each ended by TerminateJobObject alone, and by a freeze of the job
+    // (the freezer's JobFreeze) and then TerminateJobObject. Printed per
+    // kind: each call's wall time and this thread's cycles in it (the call
+    // working, against waiting or preempted: the cycles given as time at
+    // this thread's rate, measured first), the commit the process made
+    // during the freeze, during TerminateJobObject and from its return to
+    // the process's end, and the time from its return to the end; least,
+    // median and greatest. A record: nothing is asserted but that every
+    // process ended with 137.
+    #[test]
+    #[ignore = "a record of 200 terminations (TERMREC); CI's jailer loop and the PC run it"]
+    fn test_terminating_a_jail_on_record() {
+        use super::super::freezer::{Job, JobFreeze};
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // This thread's cycles per microsecond, from a 20 ms spin.
+        let (t, c) = (Instant::now(), cycles());
+        while t.elapsed() < Duration::from_millis(20) {
+            std::hint::spin_loop();
+        }
+        // Cycles per millisecond.
+        let rate = (cycles() - c) * 1000 / u64::try_from(t.elapsed().as_micros()).unwrap().max(1);
+        let us = |d: Duration| u64::try_from(d.as_micros()).unwrap();
+        // The shared page: an inheritable section.
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap(),
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        // SAFETY: a pagefile-backed section of a page, no name.
+        let section = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE | SEC_COMMIT, 0, 4096, std::ptr::null()) };
+        assert!(!section.is_null(), "{}", io::Error::last_os_error());
+        // SAFETY: our section; FILE_MAP_ALL_ACCESS.
+        let page = unsafe { MapViewOfFile(section, 0xf001f, 0, 0, 4096) };
+        assert!(!page.is_null());
+        // SAFETY: as the child's.
+        let done = unsafe { &*page.cast::<AtomicU64>() };
+        let median = |v: &mut Vec<u64>| {
+            v.sort_unstable();
+            (v[0], v[v.len() / 2], v[v.len() - 1])
+        };
+        for kind in ["held", "committing"] {
+            for freeze in [false, true] {
+                let (mut call, mut cpu, mut frozen, mut during_freeze, mut during, mut after, mut to_end) =
+                    (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+                for _ in 0..50 {
+                    // SAFETY: an unnamed job.
+                    let job = unsafe { OwnedHandle::from_raw_handle(CreateJobObjectW(std::ptr::null(), std::ptr::null())) };
+                    let (process, _held, _child) = if kind == "held" {
+                        let p = held_process();
+                        // SAFETY: handles we own.
+                        assert_ne!(unsafe { AssignProcessToJobObject(job.as_raw_handle(), p.process.as_raw_handle()) }, 0);
+                        give_section(&p, 48 * MIB);
+                        (duplicate(p.process.as_raw_handle()).unwrap(), Some(p), None)
+                    } else {
+                        done.store(0, Ordering::Release);
+                        let child = std::process::Command::new(std::env::current_exe().unwrap())
+                            .args(["--exact", "platform::windows::commit::tests::commits_until_ended", "--ignored", "--nocapture"])
+                            .env(TERMREC_PAGE, format!("{:x}", section as usize))
+                            .stdout(std::process::Stdio::null())
+                            .spawn()
+                            .unwrap();
+                        let h = child.as_raw_handle();
+                        // SAFETY: handles we own.
+                        assert_ne!(unsafe { AssignProcessToJobObject(job.as_raw_handle(), h) }, 0);
+                        let t = Instant::now();
+                        while done.load(Ordering::Acquire) < 16 * MIB {
+                            assert!(t.elapsed() < Duration::from_secs(10), "the child did not commit 16 MiB");
+                            std::hint::spin_loop();
+                        }
+                        (duplicate(h).unwrap(), None, Some(child))
+                    };
+                    let at = done.load(Ordering::Acquire);
+                    if freeze {
+                        let t = Instant::now();
+                        Job(job.as_raw_handle()).set(true).unwrap();
+                        frozen.push(us(t.elapsed()));
+                    }
+                    let at_freeze = done.load(Ordering::Acquire);
+                    let (t, c) = (Instant::now(), cycles());
+                    // SAFETY: our job.
+                    assert_ne!(unsafe { TerminateJobObject(job.as_raw_handle(), KILLED) }, 0, "{}", io::Error::last_os_error());
+                    let (returned, c2) = (Instant::now(), cycles());
+                    let at_return = done.load(Ordering::Acquire);
+                    // SAFETY: our handle of the process.
+                    assert_eq!(unsafe { WaitForSingleObject(process.as_raw_handle(), 10_000) }, WAIT_OBJECT_0);
+                    let end = Instant::now();
+                    let mut code = 0;
+                    // SAFETY: as above.
+                    unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) };
+                    assert_eq!(code, KILLED);
+                    let at_end = done.load(Ordering::Acquire);
+                    call.push(us(returned.duration_since(t)));
+                    cpu.push((c2 - c) * 1000 / rate.max(1));
+                    during_freeze.push((at_freeze - at) >> 10);
+                    during.push((at_return - at_freeze) >> 10);
+                    after.push((at_end - at_return) >> 10);
+                    to_end.push(us(end.duration_since(returned)));
+                }
+                let f = if freeze {
+                    let (a, b, c) = median(&mut frozen);
+                    let (d, e, g) = median(&mut during_freeze);
+                    format!("the freeze {a}/{b}/{c} us, committed during it {d}/{e}/{g} KiB; ")
+                } else {
+                    String::new()
+                };
+                let (a, b, c) = median(&mut call);
+                let (d, e, g) = median(&mut cpu);
+                let (h, i, j) = median(&mut during);
+                let (k, l, m) = median(&mut after);
+                let (n, o, q) = median(&mut to_end);
+                println!(
+                    "TERMREC {kind}, {}: 50 rounds, least/median/greatest: {f}TerminateJobObject {a}/{b}/{c} us, this \
+                     thread's cycles in it as time {d}/{e}/{g} us; committed during it {h}/{i}/{j} KiB, from its return to \
+                     the end {k}/{l}/{m} KiB; from its return to the process's end {n}/{o}/{q} us",
+                    if freeze { "frozen first" } else { "TerminateJobObject alone" }
+                );
+            }
+        }
+        println!("TERMREC this thread's rate: {} cycles per us", rate / 1000);
     }
 
     // Charge pages (committed PAGE_NOACCESS private memory) pay for section

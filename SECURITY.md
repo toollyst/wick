@@ -301,7 +301,7 @@ upstream Firecracker and its jailer.
   (`jailer-test.ps1 sections`, `test_a_section_past_the_limit_ends_the_jail_with_137`,
   `test_charge_pages_pay_for_the_sections_they_cover`; not yet run on Windows). A process of the job the jailer
   cannot open or read ends the jail the same way. What a compromised Firecracker can still do:
-  - **Take host commit past the limit for up to one poll**, about 1 ms (the poll's timer: `test_the_poll_timer_ticks_about_every_millisecond`, not yet run on Windows): Windows tells no user-mode process of a
+  - **Take host commit past the limit until the jail is ended after the next poll**: the window from a section's creation to a jail that can take no more: to the next poll (every 1 ms on a schedule: COMMITTIMER, not yet run with it), that poll's count with the cover read again (160-185 us), `TerminateJobObject` (265 us in one run, 7740 us in another) and the processes' end after it (876-979 us): 1374 us and 9830 us in all on the PC at df0bf87 (COMMITPOLL, debug and release, one run each); what a process commits during the call and after it, and the call's own time over 50 rounds, alone and after a freeze of the job, is TERMREC's (`test_terminating_a_jail_on_record`, not yet run) (`test_the_poll_timer_ticks_about_every_millisecond`, `test_a_section_past_the_limit_ends_the_jail_with_137`). Windows tells no user-mode process of a
     section's creation and charges it to no job or quota (SECTREC-a, and SECTREC-e quota and shared, PC b4717ec,
     `test_section_memory_and_a_charge_for_it_on_record`; `ObRegisterCallbacks` takes process, thread and desktop
     handles only, Microsoft Learn, `OB_OPERATION_REGISTRATION`), and a 4 GiB section is made in 27.8 us
