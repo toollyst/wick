@@ -1895,6 +1895,376 @@ mod tests {
         (ctx, user, mem, done)
     }
 
+    /// The process's private commit (`PROCESS_MEMORY_COUNTERS_EX.PrivateUsage`),
+    /// which the job's memory limit counts.
+    fn private_commit() -> usize {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Counters {
+            cb: u32,
+            page_faults: u32,
+            sizes: [usize; 10],
+        }
+        let mut c = Counters { cb: u32::try_from(std::mem::size_of::<Counters>()).unwrap(), ..Counters::default() };
+        // SAFETY: this process's pseudo handle and a structure of the size
+        // given (PROCESS_MEMORY_COUNTERS_EX).
+        let ok = unsafe {
+            windows_sys::Win32::System::ProcessStatus::K32GetProcessMemoryInfo(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                (&raw mut c).cast(),
+                c.cb,
+            )
+        };
+        assert_ne!(ok, 0);
+        c.sizes[8]
+    }
+
+    /// Takes every 4 KiB of the job's room left, each page a commit of its
+    /// own so that the caller can give it back a page at a time; the pages.
+    fn take_every_page() -> std::vec::Vec<usize> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let mut held = std::vec::Vec::with_capacity(1 << 16);
+        while held.len() < held.capacity() {
+            // SAFETY: new private memory of ours.
+            let p = unsafe { VirtualAlloc(ptr::null(), PAGE as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+            if p.is_null() {
+                break;
+            }
+            held.push(p as usize);
+        }
+        held
+    }
+
+    /// Gives back one page [`take_every_page`] took.
+    fn give_back_a_page(held: &mut std::vec::Vec<usize>) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        let p = held.pop().expect("a page held");
+        // SAFETY: a page of ours.
+        unsafe { VirtualFree(p as *mut c_void, 0, MEM_RELEASE) };
+    }
+
+    /// VIEWCHARGE: what mapping a view of a pagefile-backed section takes of
+    /// the process's private commit, which the job's memory limit counts
+    /// (Learn, JOBOBJECT_EXTENDED_LIMIT_INFORMATION: JobMemoryLimit is "the
+    /// limit for the virtual memory that can be committed for the job",
+    /// with no list of what counts; that a view's page tables count is
+    /// measured, not documented): a, under 1 GiB, a section of 64 KiB, 2 MiB
+    /// and 16 MiB, `SEC_RESERVE` and `SEC_COMMIT`, read-write and read-only:
+    /// the section, a view anywhere, a second view, a view into a
+    /// placeholder, all three unmapped; b, at the job's limit with all its
+    /// room taken a page at a time, then given back 4 KiB at a time: whether
+    /// a 2 MiB `SEC_RESERVE` view is mapped anywhere and into a
+    /// placeholder, the error, and what the map took. On Windows Server
+    /// 2022 20348 (fc-win): 4 KiB a 2 MiB view and 32 KiB a 16 MiB one (a
+    /// page table a 2 MiB), in every case, given back at the unmap; at the
+    /// limit, error 1455 with no room, a view anywhere with 4 KiB, a view
+    /// into a placeholder made apart from any other mapping from 8 KiB in
+    /// one run and 12 KiB in another (a page directory's page as well). It is why the reclaim's move could not start at a real job
+    /// limit (CI run 43640510155). Printed, not asserted, but for the
+    /// children ending well.
+    #[test]
+    #[ignore = "a record: run alone on Windows with --ignored --nocapture"]
+    fn test_what_a_view_mapping_charges_on_record() {
+        let (code, text) = run_child("view_charge_child", Some(1 << 30));
+        std::eprintln!("{text}");
+        assert_eq!(code, Some(0), "{text}");
+        let (code, text) = run_child("view_limit_child", Some(96 << 20));
+        std::eprintln!("{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_what_a_view_mapping_charges_on_record in a job of its own"]
+    fn view_charge_child() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEM_RELEASE, MapViewOfFile3,
+            PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile, VirtualAlloc2, VirtualFree,
+        };
+        // SAFETY: this process's pseudo handle.
+        let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+        let kib = |a: usize, b: usize| (b as i64 - a as i64) / 1024;
+        for len in [64usize << 10, 2 << 20, 16 << 20] {
+            for (kind, flag) in [("SEC_RESERVE", SEC_RESERVE), ("SEC_COMMIT", SEC_COMMIT)] {
+                let p0 = private_commit();
+                #[allow(clippy::cast_possible_truncation)]
+                // SAFETY: a new pagefile-backed section.
+                let sec = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, ptr::null(), PAGE_READWRITE | flag, 0, len as u32, ptr::null()) };
+                assert!(!sec.is_null());
+                let p1 = private_commit();
+                for (access, prot) in [("read-write", PAGE_READWRITE), ("read-only", PAGE_READONLY)] {
+                    let a = private_commit();
+                    // SAFETY: maps our section anywhere.
+                    let v1 = unsafe { MapViewOfFile3(sec, me, ptr::null(), 0, len, 0, prot, ptr::null_mut(), 0) };
+                    let b = private_commit();
+                    // SAFETY: as above.
+                    let v2 = unsafe { MapViewOfFile3(sec, me, ptr::null(), 0, len, 0, prot, ptr::null_mut(), 0) };
+                    let c = private_commit();
+                    // SAFETY: reserves a placeholder of ours.
+                    let ph = unsafe { VirtualAlloc2(me, ptr::null(), len, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, ptr::null_mut(), 0) };
+                    let d = private_commit();
+                    // SAFETY: maps our section into our placeholder.
+                    let v3 = unsafe { MapViewOfFile3(sec, me, ph, 0, len, MEM_REPLACE_PLACEHOLDER, prot, ptr::null_mut(), 0) };
+                    let e = private_commit();
+                    assert!(!v1.Value.is_null() && !v2.Value.is_null() && v3.Value == ph);
+                    // SAFETY: the views mapped here.
+                    unsafe {
+                        UnmapViewOfFile(v1);
+                        UnmapViewOfFile(v2);
+                        UnmapViewOfFile(v3);
+                    }
+                    let f = private_commit();
+                    std::println!(
+                        "VIEWCHARGE a {} KiB {kind} {access}: the section {:+} KiB, a view anywhere {:+} KiB, a second view {:+} KiB, \
+                         a placeholder {:+} KiB, a view into it {:+} KiB; after the three unmapped {:+} KiB",
+                        len >> 10,
+                        kib(p0, p1),
+                        kib(a, b),
+                        kib(b, c),
+                        kib(c, d),
+                        kib(d, e),
+                        kib(a, f)
+                    );
+                    // SAFETY: the placeholder the view left.
+                    unsafe { VirtualFree(ph, 0, MEM_RELEASE) };
+                }
+                // SAFETY: our section's handle.
+                unsafe { CloseHandle(sec) };
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "run by test_what_a_view_mapping_charges_on_record in a job of its own"]
+    fn view_limit_child() {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
+            MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE, SEC_RESERVE, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2, VirtualFree,
+        };
+        const STEPS: [usize; 12] = [0, 4, 8, 12, 16, 24, 32, 64, 256, 1024, 2048, 4096];
+        // SAFETY: this process's pseudo handle.
+        let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+        // Made, and the results' room kept, before the room is taken: at
+        // the limit nothing may allocate, nor print (a stack that grows
+        // there cannot: test_a_stack_that_grows_at_the_limit_on_record).
+        // SAFETY: new pagefile-backed sections and placeholders.
+        let made: std::vec::Vec<_> = (0..STEPS.len())
+            .map(|_| unsafe {
+                (
+                    CreateFileMappingW(INVALID_HANDLE_VALUE, ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, 2 << 20, ptr::null()),
+                    CreateFileMappingW(INVALID_HANDLE_VALUE, ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, 2 << 20, ptr::null()),
+                    VirtualAlloc2(me, ptr::null(), 2 << 20, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, ptr::null_mut(), 0),
+                )
+            })
+            .collect();
+        assert!(made.iter().all(|m| !m.0.is_null() && !m.1.is_null() && !m.2.is_null()));
+        let mut results = [(0usize, false, 0u32, 0i64, false, 0u32); STEPS.len()];
+        let mut held = take_every_page();
+        let taken = held.len();
+        let mut given = 0;
+        for (i, &room) in STEPS.iter().enumerate() {
+            while given < room {
+                give_back_a_page(&mut held);
+                given += 4;
+            }
+            let a = private_commit();
+            // SAFETY: maps our section anywhere.
+            let v = unsafe { MapViewOfFile3(made[i].0, me, ptr::null(), 0, 2 << 20, 0, PAGE_READWRITE, ptr::null_mut(), 0) };
+            // SAFETY: plain call.
+            let e1 = if v.Value.is_null() { unsafe { GetLastError() } } else { 0 };
+            let b = private_commit();
+            // SAFETY: maps our section into our placeholder.
+            let w = unsafe { MapViewOfFile3(made[i].1, me, made[i].2, 0, 2 << 20, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, ptr::null_mut(), 0) };
+            // SAFETY: plain call.
+            let e2 = if w.Value == made[i].2 { 0 } else { unsafe { GetLastError() } };
+            results[i] = (room, !v.Value.is_null(), e1, (b as i64 - a as i64) / 1024, w.Value == made[i].2, e2);
+            // SAFETY: the views mapped here.
+            unsafe {
+                if !v.Value.is_null() {
+                    UnmapViewOfFile(v);
+                }
+                if w.Value == made[i].2 {
+                    UnmapViewOfFile2(me, w, MEM_PRESERVE_PLACEHOLDER);
+                }
+            }
+        }
+        while !held.is_empty() {
+            give_back_a_page(&mut held);
+        }
+        std::println!("VIEWCHARGE b: the job's room taken, {taken} pages, then given back 4 KiB at a time");
+        for (room, any, e1, took, ph, e2) in results {
+            std::println!(
+                "VIEWCHARGE b room {room} KiB: a 2 MiB view anywhere {} (took {took:+} KiB), into a placeholder {}",
+                if any { "mapped".into() } else { std::format!("refused, error {e1}") },
+                if ph { "mapped".into() } else { std::format!("refused, error {e2}") }
+            );
+        }
+        for (s1, s2, ph) in made {
+            // SAFETY: ours.
+            unsafe {
+                CloseHandle(s1);
+                CloseHandle(s2);
+                VirtualFree(ph, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    /// MOVEROOM: the room the reclaim's move needs at the job's limit: the
+    /// reclaim tests' start (8 chunks with half their pages dead), then all
+    /// the room taken a page at a time and a fill's reclaim
+    /// (`reclaim_for_a_fill`) tried with 0 KiB of room, then 4 KiB more each
+    /// time, until it moves a chunk: how many chunks each try moved, the
+    /// bytes it freed and what the process's private commit did. On Windows
+    /// Server 2022 20348 (fc-win): none with no room (the move's map of its
+    /// new section's view refused, 1455), 2 chunks and 2 MiB with 4 KiB:
+    /// one page table, its own view's (the alias's and the guest view's
+    /// swaps give back what they take). Printed, not asserted, but for the
+    /// child ending well.
+    #[test]
+    #[ignore = "a record: run alone on Windows with --ignored --nocapture"]
+    fn test_the_room_a_move_needs_on_record() {
+        let (code, text) = run_child("move_room_child", Some(96 << 20));
+        std::eprintln!("{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_the_room_a_move_needs_on_record in a job of its own"]
+    fn move_room_child() {
+        let (ctx, user, _mem, _) = fill_to_the_limit_and_discard_in_part();
+        let mut tries = [(0usize, Reclaimed::default(), 0i64); 16];
+        let mut held = take_every_page();
+        let taken = held.len();
+        let mut n = 0;
+        while n < tries.len() {
+            let before = private_commit();
+            let r = {
+                let _guard = lock();
+                reclaim_for_a_fill(PAGE as usize)
+            };
+            tries[n] = (n * 4, r, (private_commit() as i64 - before as i64) / 1024);
+            n += 1;
+            if r.chunks > 0 || held.is_empty() {
+                break;
+            }
+            give_back_a_page(&mut held);
+        }
+        while !held.is_empty() {
+            give_back_a_page(&mut held);
+        }
+        std::println!("MOVEROOM the job's room taken, {taken} pages, then given back 4 KiB at a time");
+        for (room, r, delta) in &tries[..n] {
+            std::println!("MOVEROOM room {room} KiB: {} chunks moved, {} KiB freed, private commit {delta:+} KiB", r.chunks, r.freed >> 10);
+        }
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+        let _ = ctx;
+    }
+
+    /// The calling thread's stack from its TEB (x86-64): its base, the
+    /// lowest committed address, the reserve's low end (DeallocationStack,
+    /// 0x1478) and the stack guarantee (GuaranteedStackBytes, 0x1748).
+    fn stack_of_this_thread() -> (usize, usize, usize, u32) {
+        let (base, limit, reserve, guarantee): (usize, usize, usize, u32);
+        // SAFETY: reads of the thread's own TEB.
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, gs:[0x8]",
+                "mov {1}, gs:[0x10]",
+                "mov {2}, gs:[0x1478]",
+                "mov {3:e}, gs:[0x1748]",
+                out(reg) base,
+                out(reg) limit,
+                out(reg) reserve,
+                out(reg) guarantee,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        (base, limit, reserve, guarantee)
+    }
+
+    /// 64 KiB of stack, a page a frame: a thread whose stack must grow.
+    #[inline(never)]
+    fn deep(n: usize) -> u8 {
+        let a = core::hint::black_box([n as u8; 4096]);
+        if n == 0 { a[7] } else { a[9].wrapping_add(deep(n - 1)) }
+    }
+
+    /// STACKZERO: a thread whose stack must grow at the job's limit, the
+    /// room taken a page at a time, against the same thread with room
+    /// (the control) and a stack overflowed with room (its reserve used
+    /// up): how each child ended, and the threads' stacks from their TEB
+    /// before. Learn, "Thread Stack Size": the system commits stack pages
+    /// as needed "until either the stack reaches the reserved size minus
+    /// one page (which is used as a guard page to prevent stack overflow)
+    /// or the system is so low on memory that the operation fails"; both
+    /// raise STATUS_STACK_OVERFLOW. On Windows Server 2022 20348 (fc-win):
+    /// the thread at the limit ended its process with 0xC00000FD, 32 KiB of
+    /// its stack committed, where Linux charges a stack page as any other
+    /// and its memory cgroup's out-of-memory kill ends the process (137).
+    /// Printed, not asserted, but for the control ending well.
+    #[test]
+    #[ignore = "a record: run alone on Windows with --ignored --nocapture"]
+    fn test_a_stack_that_grows_at_the_limit_on_record() {
+        for (child, limit) in [("stack_at_the_limit_child", Some(96 << 20)), ("stack_with_room_child", None), ("stack_overflowed_child", None)] {
+            let (code, text) = run_child(child, limit);
+            #[allow(clippy::cast_sign_loss)]
+            let ended = code.map_or_else(|| "no exit code".into(), |c| std::format!("{:#x}", c as u32));
+            std::eprintln!("STACKZERO {child}: ended with {ended}; {}", text.trim().replace('\n', " | "));
+            if child == "stack_with_room_child" {
+                assert_eq!(code, Some(0), "{text}");
+            }
+        }
+    }
+
+    fn a_thread_that_goes_deep(go_at_once: bool, depth: usize) -> (std::thread::JoinHandle<u8>, std::sync::mpsc::Sender<()>) {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (said, heard) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            let (base, limit, reserve, guarantee) = stack_of_this_thread();
+            std::println!(
+                "the thread's stack: {} KiB committed of a {} KiB reserve, a guarantee of {guarantee} bytes",
+                (base - limit) >> 10,
+                (base - reserve) >> 10
+            );
+            said.send(()).unwrap();
+            if !go_at_once {
+                rx.recv().unwrap();
+            }
+            deep(depth)
+        });
+        heard.recv().unwrap();
+        (t, tx)
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_that_grows_at_the_limit_on_record in a job of its own"]
+    fn stack_at_the_limit_child() {
+        let (t, go) = a_thread_that_goes_deep(false, 16);
+        let held = take_every_page();
+        go.send(()).unwrap();
+        let _ = t.join();
+        drop(held);
+        std::println!("the thread at the limit went 64 KiB deep and the process went on");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_that_grows_at_the_limit_on_record"]
+    fn stack_with_room_child() {
+        let (t, _go) = a_thread_that_goes_deep(true, 16);
+        assert_eq!(t.join().map(|_| ()).ok(), Some(()));
+        std::println!("the thread with room went 64 KiB deep");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_that_grows_at_the_limit_on_record"]
+    fn stack_overflowed_child() {
+        let (t, _go) = a_thread_that_goes_deep(true, usize::MAX);
+        let _ = t.join();
+        std::println!("the unbounded thread came back");
+    }
+
     /// The pages of the first 8 chunks: the discarded ones missing, the
     /// others still 0x5a.
     fn the_live_pages_read_back(mem: u64) {

@@ -304,7 +304,8 @@ upstream Firecracker and its jailer.
   Not before a commit made at once (`MAP_POPULATE`, a
   private file mapping's read, a `MAP_FIXED` recommit, a discard of private memory that is not lazy, a committing
   `mprotect`) or an allocation of the VMM's own (its heap, a thread's stack): those are refused at the limit with no
-  reclaim first (`ENOMEM`, or the process ends), not done yet; the limit holds either way. A move holds its live
+  reclaim first (`ENOMEM`, or the process ends: a thread whose stack must grow ends it with `STATUS_STACK_OVERFLOW`,
+  not 137, `test_a_stack_that_grows_at_the_limit_on_record`), not done yet; the limit holds either way. A move holds its live
   pages in two sections for its
   time; a 2 MiB move budget of private `PAGE_NOACCESS` commit, made at the first registration, is the cover the
   jailer's count takes off for them, so the count, and the bound it enforces, stays exact during a move
