@@ -666,6 +666,26 @@ fn write_handle(h: HANDLE, buf: *const c_void, count: usize, at: Option<i64>) ->
     total as ssize_t
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// The one test seam of the calls that copy guest memory: when set, run
+    /// on the calling thread once the buffer's pages are faulted in and
+    /// right before the system call (the window in which a discard of the
+    /// buffer fails the call, docs/COMPATIBILITY.md, the `mem_backend: Uffd`
+    /// row).
+    pub(crate) static BEFORE_CALL: std::cell::RefCell<Option<std::boxed::Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs [`BEFORE_CALL`] in a test build; nothing otherwise.
+fn before_call() {
+    #[cfg(test)]
+    BEFORE_CALL.with(|hook| {
+        if let Some(f) = hook.borrow_mut().as_mut() {
+            f();
+        }
+    });
+}
+
 /// `read`.
 ///
 /// # Safety
@@ -673,6 +693,7 @@ fn write_handle(h: HANDLE, buf: *const c_void, count: usize, at: Option<i64>) ->
 pub unsafe fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
     // Windows fails a read into missing userfaultfd pages; Linux waits.
     crate::wick_uffd::prefault(buf as u64, count as u64, true);
+    before_call();
     if let Some(timer) = crate::windows_time::lookup(fd) {
         // SAFETY: the caller's contract.
         let b = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), count) };

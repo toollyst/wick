@@ -1478,6 +1478,133 @@ mod tests {
         unsafe { ws::closesocket(sock(user)) };
     }
 
+    /// A discard (`MADV_DONTNEED`) of a read's buffer, made by another
+    /// thread after the read faulted the buffer in and before its system
+    /// call, waits for the read, as Linux's read completes into a page its
+    /// copy faults in again (mm/userfaultfd.c `handle_userfault`): a
+    /// regular file's read, whose call cannot block for ever, is counted in
+    /// flight on its range, and the discard waits for it. The window is
+    /// [`crate::windows_fd::BEFORE_CALL`]: it starts the discard and gives it
+    /// 50 ms. Asserted: the read returns its 16 bytes, and the discard ends
+    /// after it, leaving the pages missing again.
+    #[test]
+    #[ignore = "written before the in-flight count, which it tests; fails until it lands"]
+    fn test_a_discard_waits_for_a_read_in_flight_on_its_range() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 64 * 1024;
+        let mem = map(len);
+        register(ctx, mem, len as u64).unwrap();
+        let handler = std::thread::spawn(move || serve_one(user, ctx, 0x11));
+        let path = std::env::temp_dir().join(std::format!("wick-uffd-inflight-{}", std::process::id()));
+        std::fs::write(&path, [0x22u8; 16]).unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        let fd = crate::windows_fd::to_fd_pub(std::os::windows::io::AsRawHandle::as_raw_handle(&f));
+        let (go, went) = mpsc::channel::<()>();
+        let discarder = std::thread::spawn(move || {
+            went.recv().unwrap();
+            // SAFETY: the test's registered mapping.
+            let r = unsafe { crate::madvise(mem as *mut c_void, len, crate::MADV_DONTNEED) };
+            (r, Instant::now())
+        });
+        crate::windows_fd::BEFORE_CALL.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                go.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+            }));
+        });
+        // SAFETY: a valid descriptor and registered memory.
+        let n = unsafe { crate::read(fd, (mem + 8) as *mut c_void, 16) };
+        let read_at = Instant::now();
+        let error = std::io::Error::last_os_error();
+        crate::windows_fd::BEFORE_CALL.with(|h| *h.borrow_mut() = None);
+        let (discarded, discarded_at) = discarder.join().unwrap();
+        std::println!(
+            "INFLIGHT a file's read with a discard of its buffer started in its window: {n} ({error}); the discard {discarded}, \
+             {} the read",
+            if discarded_at >= read_at { "after" } else { "before" }
+        );
+        assert_eq!(handler.join().unwrap()[0], proto::EVENT_PAGEFAULT);
+        assert_eq!(n, 16, "the read failed: {error}");
+        assert_eq!(discarded, 0);
+        assert!(discarded_at >= read_at, "the discard did not wait for the read in flight");
+        assert!(is_missing(mem + 8), "the discard did not happen");
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+        // SAFETY: as above.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// A read that can block for ever (a blocking pipe's) is not counted in
+    /// flight, so that a discard never waits on it, and reads through a
+    /// buffer of its own, copied into the caller's afterwards as a guest
+    /// access is made, so that a discard of the caller's buffer meanwhile
+    /// cannot fail it, as Linux's copy faults the page in again. The
+    /// window ([`crate::windows_fd::BEFORE_CALL`]) starts the discard and
+    /// waits until it is done, at most 2 s; the pipe's writer writes 100 ms
+    /// later. Asserted: the discard ended in the window, and the read returns
+    /// the writer's 16 bytes, which the buffer then holds (its page faulted
+    /// in again, filled, and written over).
+    #[test]
+    #[ignore = "written before the in-flight count, which it tests; fails until it lands"]
+    fn test_a_blocking_read_does_not_hold_a_discard() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 64 * 1024;
+        let mem = map(len);
+        register(ctx, mem, len as u64).unwrap();
+        let handler = std::thread::spawn(move || serve_one(user, ctx, 0x11));
+        let mut fds = [0 as c_int; 2];
+        // SAFETY: two descriptors' room.
+        assert_eq!(unsafe { crate::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        let (go, went) = mpsc::channel::<()>();
+        let (done, discarded) = mpsc::channel::<c_int>();
+        std::thread::spawn(move || {
+            went.recv().unwrap();
+            // SAFETY: the test's registered mapping.
+            let r = unsafe { crate::madvise(mem as *mut c_void, len, crate::MADV_DONTNEED) };
+            let _ = done.send(r);
+        });
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let data = [0x33u8; 16];
+            // SAFETY: the pipe's write end and a buffer of 16 bytes.
+            unsafe { crate::write(wr, data.as_ptr().cast(), 16) }
+        });
+        let in_window = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = in_window.clone();
+        crate::windows_fd::BEFORE_CALL.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                go.send(()).unwrap();
+                *seen.lock().unwrap() = Some(discarded.recv_timeout(Duration::from_secs(2)).ok());
+            }));
+        });
+        // SAFETY: the pipe's read end and registered memory.
+        let n = unsafe { crate::read(rd, (mem + 8) as *mut c_void, 16) };
+        let error = std::io::Error::last_os_error();
+        crate::windows_fd::BEFORE_CALL.with(|h| *h.borrow_mut() = None);
+        let window = *in_window.lock().unwrap();
+        std::println!("INFLIGHT a blocking pipe's read with a discard of its buffer in its window: {n} ({error}); the discard in the window: {window:?}");
+        assert_eq!(writer.join().unwrap(), 16);
+        assert_eq!(window, Some(Some(0)), "the discard was held by a read that can block");
+        assert_eq!(n, 16, "the read failed: {error}");
+        assert_eq!(handler.join().unwrap()[0], proto::EVENT_PAGEFAULT);
+        // SAFETY: read into, after the fill.
+        unsafe {
+            assert_eq!(*((mem + 8) as *const u8), 0x33);
+            assert_eq!(*(mem as *const u8), 0x11, "the page was not filled again");
+        }
+        // SAFETY: the pipe's ends; closes the user end.
+        unsafe {
+            crate::close(rd);
+            crate::close(wr);
+            ws::closesocket(sock(user));
+        }
+    }
+
     /// Two registrations side by side, of two userfaultfds (as two tests'
     /// mappings, or two of Firecracker's, can be): a run of missing pages
     /// goes on across the boundary, but nothing is reported past the span
