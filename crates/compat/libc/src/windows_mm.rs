@@ -387,6 +387,30 @@ fn charge(base: usize, len: usize) -> bool {
     true
 }
 
+/// Gives back the charge of the pages of `[base, base + len)` that lie in
+/// charged views ([`Charge`]): their charge pages are decommitted, which
+/// returns a page of the job's count and of the private commit each
+/// (UFFDCHUNK c, CI run 43528910212), as the memory cgroup uncharges a page
+/// that is freed. Decommitting a page that is not committed is no error
+/// (Learn, VirtualFree: "The function does not fail if you attempt to
+/// decommit an uncommitted page").
+fn uncharge(base: usize, len: usize) {
+    if !CHARGES_SET.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let end = base.saturating_add(len);
+    let m = CHARGES.lock().unwrap();
+    let first = m.range(..=base).next_back().map_or(base, |(v, _)| *v);
+    for (&v, (n, c)) in m.range(first..end) {
+        let (s, e) = (base.max(v), end.min(v + n));
+        if s >= e {
+            continue;
+        }
+        // SAFETY: decommits pages of our reservation, never accessed.
+        unsafe { VirtualFree((c.base + (s - v)) as *mut c_void, e - s, MEM_DECOMMIT) };
+    }
+}
+
 #[derive(Debug)]
 enum Kind {
     Placeholder,
@@ -2448,6 +2472,27 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
 /// the commit is refused (the job's memory limit).
 pub(crate) fn uffd_commit(s: usize, len: usize) -> bool {
     commit(s, len, PAGE_NOACCESS, false)
+}
+
+/// Pages `[s, s + len)` of a userfaultfd range's reserved section whose
+/// memory was discarded (`wick_uffd::discarding`): their charge is given
+/// back ([`uncharge`]), as Linux uncharges a page `MADV_DONTNEED` frees;
+/// their section pages stay committed (SEC_RESERVE: SECTREC-h). A refill
+/// charges them again ([`uffd_commit`]).
+pub(crate) fn uffd_uncharge(s: usize, len: usize) {
+    uncharge(s, len);
+}
+
+/// Pages `[s, s + len)` of a userfaultfd range's reserved section that were
+/// discarded and become ordinary memory, zeroed, once the range is released:
+/// charged again first, as zeroing makes them memory again. Past the jail's
+/// limit the VMM ends as at a lazy page's commit ([`out_of_memory`], exit
+/// 137), where Linux would charge each page at its next touch.
+pub(crate) fn uffd_recharge(s: usize, len: usize) {
+    if !charge(s, len) {
+        // SAFETY: plain call.
+        out_of_memory(s, unsafe { GetLastError() });
+    }
 }
 
 /// The bytes of the charge registered for the view at `view` that are

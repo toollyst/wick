@@ -432,6 +432,12 @@ fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io
             crate::windows_mm::uffd_lazy(at as usize, (a - at) as usize);
         }
         if l > 0 {
+            // Discarded, so its charge was given back (`discarding`): charged
+            // again before it is zeroed, which makes it memory again.
+            #[allow(clippy::cast_possible_truncation)]
+            if range.reserved.load(Ordering::Acquire) {
+                crate::windows_mm::uffd_recharge(a as usize, l as usize);
+            }
             // SAFETY: the alias of registered memory.
             unsafe { ptr::write_bytes((alias + (a - base)) as *mut u8, 0, l as usize) };
             protect(a, l, true)?;
@@ -769,8 +775,9 @@ pub fn wake_range(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
 /// Wraps a `MADV_DONTNEED` of `[start, start + len)`: `discard` runs on the
 /// memory that is not registered and reports the pieces it reached (all of
 /// the mapped memory, or what it reached before an error); the registered
-/// pages of those pieces are missing again, their memory discarded, and a
-/// remove event is queued for each piece (with `EVENT_REMOVE`). Pages the
+/// pages of those pieces are missing again, their memory discarded and, in
+/// a reserved section, their charge given back (`windows_mm::uffd_uncharge`),
+/// and a remove event is queued for each piece (with `EVENT_REMOVE`). Pages the
 /// discard did not reach keep their contents, as on Linux when it stops at
 /// an error.
 pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)>) -> c_int) -> c_int {
@@ -815,6 +822,10 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
                 // Filling a missing page writes all of it: its content can go.
                 // SAFETY: the alias of registered memory.
                 unsafe { DiscardVirtualMemory((alias + (a - s)) as *mut c_void, l as usize) };
+                // And its charge, as the memory cgroup uncharges the page; a
+                // refill charges it again (`uffd_commit`).
+                #[allow(clippy::cast_possible_truncation)]
+                crate::windows_mm::uffd_uncharge(a as usize, l as usize);
             }
             if remove {
                 post(ctx, [proto::EVENT_REMOVE, from, to, 0]);
@@ -1154,11 +1165,13 @@ mod tests {
     /// allocates to the memory cgroup (v6.1 mm/userfaultfd.c,
     /// `mcopy_atomic_pte`, `mem_cgroup_charge` at :205): at the registration
     /// only the resident page is committed and charged; each page filled is
-    /// committed and charged; a discarded page keeps its commit and charge
-    /// (a section's page cannot be decommitted: SECTREC-h, error 87); once
-    /// unregistered, a page never filled is committed and charged at its
-    /// first access, a read included, as a shmem page is; the charge goes
-    /// with the mapping. Before, the whole section was committed at the
+    /// committed and charged; a discarded page's charge is given back, as
+    /// the memory cgroup uncharges it, and its commit stays (a section's
+    /// page cannot be decommitted: SECTREC-h, error 87); a refill charges it
+    /// again; once unregistered, the discarded page, zeroed, is charged
+    /// again, and a page never filled is committed and charged at its first
+    /// access, a read included, as a shmem page is; the charge goes with
+    /// the mapping. Before, the whole section was committed at the
     /// registration and charged to no job.
     #[test]
     fn test_registered_memory_is_charged_as_it_is_filled() {
@@ -1187,8 +1200,19 @@ mod tests {
         // SAFETY: our mapping.
         assert_eq!(unsafe { crate::madvise((mem + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
         assert!(is_missing(mem + PAGE));
-        assert_eq!(charged(), 5 * PAGE as usize, "a discarded page's charge");
+        // Its charge given back, as the memcg uncharges a page MADV_DONTNEED
+        // frees (its section page stays committed: SECTREC-h).
+        assert_eq!(charged(), 4 * PAGE as usize, "a discarded page's charge");
+        assert_eq!(committed(mem, len), 5 * PAGE);
+        // Filled again, charged again; discarded again, given back again.
+        assert_eq!(zeropage(ctx, mem + PAGE, PAGE, true).unwrap(), PAGE);
+        assert_eq!(charged(), 5 * PAGE as usize, "a refilled page's charge");
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::madvise((mem + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        assert_eq!(charged(), 4 * PAGE as usize, "a page discarded twice");
         unregister(ctx, mem, len).unwrap();
+        // The discarded page, made ordinary zeroed memory, is charged again.
+        assert_eq!(charged(), 5 * PAGE as usize, "the discarded page's charge at the unregister");
         // SAFETY: ordinary memory now: the discarded page reads zeros, and
         // a page never filled is committed at its read.
         unsafe {
