@@ -61,8 +61,10 @@
 //!
 //! Hosts without `SharedCommitUsage` (Learn: Windows 10 22H2 or Windows 11
 //! 22H2, each with the September 2023 cumulative update, and later; no server
-//! is listed, and the count is proved on the host before it is relied on):
-//! the job's limit alone, with a warning saying so.
+//! is listed): `memory.max` is refused when the jailer reads it
+//! (`cgroup`, [`sections_counted`]), before any jail is made, as a limit the
+//! jailer cannot enforce. The count is proved on the host ([`self_check`]),
+//! not inferred from its build.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -255,6 +257,12 @@ pub(super) fn self_check() -> Result<(), String> {
     Ok(())
 }
 
+/// Whether this host can count sections ([`self_check`], once a process).
+pub(crate) fn sections_counted() -> Result<(), String> {
+    static CHECKED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    CHECKED.get_or_init(self_check).clone()
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct Count {
     private: u64,
@@ -377,24 +385,11 @@ fn duplicate(h: HANDLE) -> io::Result<OwnedHandle> {
 
 /// Counts the jail of `job` against `limit` bytes until `firecracker` ends,
 /// and ends the jail with 137 past it. `large`: the bytes of large pages the
-/// jailer gave (`large_pages`). `Ok(None)`, after a warning, on a host where
-/// the count cannot be taken (the job's limit holds alone there); `Err` if
-/// the watch cannot be started on a host where it can.
-pub(super) fn watch(
-    job: HANDLE,
-    firecracker: HANDLE,
-    limit: u64,
-    large: Option<Arc<AtomicU64>>,
-) -> io::Result<Option<JoinHandle<()>>> {
-    if let Err(why) = self_check() {
-        eprintln!(
-            "jailer: warning: memory.max={limit} bounds only the jail's private commit on this host, not its sections \
-             (SECURITY.md): {why}. Counting sections needs PROCESS_MEMORY_COUNTERS_EX2.SharedCommitUsage, which \
-             Microsoft Learn gives for Windows 10 22H2 and Windows 11 22H2 with the September 2023 cumulative update and \
-             later builds."
-        );
-        return Ok(None);
-    }
+/// jailer gave (`large_pages`). `Err` if the count cannot be taken or
+/// started: the caller ends the jail. A host that cannot count sections had
+/// `memory.max` refused before (`cgroup`, [`sections_counted`]).
+pub(super) fn watch(job: HANDLE, firecracker: HANDLE, limit: u64, large: Option<Arc<AtomicU64>>) -> io::Result<JoinHandle<()>> {
+    sections_counted().map_err(io::Error::other)?;
     let job = duplicate(job)?;
     let firecracker = duplicate(firecracker)?;
     // SAFETY: no attributes, no name.
@@ -446,7 +441,7 @@ pub(super) fn watch(
                 return;
             }
         }
-    }).map(Some)
+    })
 }
 
 #[cfg(test)]
@@ -531,7 +526,7 @@ mod tests {
     fn test_a_section_past_the_limit_ends_the_jail_with_137() {
         let (job, p) = jail();
         let limit = of(&p) + 32 * MIB;
-        let w = watch(job.as_raw_handle(), p.process.as_raw_handle(), limit, None).unwrap().unwrap();
+        let w = watch(job.as_raw_handle(), p.process.as_raw_handle(), limit, None).unwrap();
         give_section(&p, 16 * MIB);
         assert_eq!(ends_within(&p, 250), None, "16 MiB of sections under a limit 32 MiB above the process ended it");
         let t = Instant::now();
@@ -554,7 +549,7 @@ mod tests {
         assert!(!at.is_null(), "{}", io::Error::last_os_error());
         assert!(cover(p.process.as_raw_handle()) >= 48 * MIB);
         let limit = of(&p) + 16 * MIB;
-        let w = watch(job.as_raw_handle(), p.process.as_raw_handle(), limit, None).unwrap().unwrap();
+        let w = watch(job.as_raw_handle(), p.process.as_raw_handle(), limit, None).unwrap();
         give_section(&p, 48 * MIB);
         assert_eq!(ends_within(&p, 250), None, "48 MiB of sections paid by 48 MiB of charge pages were counted");
         give_section(&p, 32 * MIB);
@@ -568,7 +563,7 @@ mod tests {
         let (job, p) = jail();
         let limit = of(&p) + 16 * MIB;
         let given = Arc::new(AtomicU64::new(48 * MIB));
-        let w = watch(job.as_raw_handle(), p.process.as_raw_handle(), limit, Some(given)).unwrap().unwrap();
+        let w = watch(job.as_raw_handle(), p.process.as_raw_handle(), limit, Some(given)).unwrap();
         give_section(&p, 48 * MIB);
         assert_eq!(ends_within(&p, 250), None, "48 MiB given as large pages were counted");
         give_section(&p, 32 * MIB);

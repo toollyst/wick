@@ -10,7 +10,7 @@
 //!
 //! | cgroup v2 | cgroup v1 | Job Object |
 //! |---|---|---|
-//! | `memory.max` | `memory.limit_in_bytes` | job memory limit (commit; the job's processes fail to allocate past it) |
+//! | `memory.max` | `memory.limit_in_bytes` | job memory limit (commit; the job's processes fail to allocate past it) and the jailer's count of sections, 137 past it (`platform::commit`); refused on a host where sections cannot be counted |
 //! | `cpu.max` (`<quota> [<period>]`) | `cpu.cfs_quota_us`, `cpu.cfs_period_us` | CPU rate hard cap, `quota / period` CPUs of all the host's, from Firecracker's start |
 //! | `cpu.weight`, `cpu.weight.nice` | `cpu.shares` | weight-based CPU rate control: the Windows weight (1 to 9) whose share is nearest ([`cpu_weight`]) |
 //! | `cpuset.cpus` | `cpuset.cpus` | the job's processor affinity ([`cpu_groups`]) |
@@ -61,6 +61,9 @@ pub struct CgroupConfigurationBuilder {
     v1_period_us: Option<u64>,
     /// `freezer.state` (v1) at the start.
     freezer: Option<FreezerState>,
+    /// Whether the host can count the jail's memory in sections, which a
+    /// memory limit needs (`platform::commit`); a test gives its own.
+    sections_counted: fn() -> Result<(), String>,
 }
 
 impl CgroupConfigurationBuilder {
@@ -78,6 +81,7 @@ impl CgroupConfigurationBuilder {
                     v1_quota_us: None,
                     v1_period_us: None,
                     freezer: None,
+                    sections_counted: platform::commit::sections_counted,
                 })
             }
             _ => Err(JailerError::CgroupInvalidVersion(ver.to_string())),
@@ -119,6 +123,10 @@ impl CgroupConfigurationBuilder {
                     if bytes == 0 {
                         return Err(bad("a limit of 0 bytes"));
                     }
+                    // A Job Object charges private commit only; without the
+                    // jailer's count of sections the limit would be a weaker
+                    // one under the same name: refused.
+                    (self.sections_counted)().map_err(|why| HostError::SectionsUncounted(cg(), why))?;
                     Some(bytes)
                 };
             }
@@ -504,6 +512,35 @@ mod tests {
             }
             other => panic!("{prop}: {other:?}"),
         }
+    }
+
+    // A memory limit needs the jailer's count of sections (platform::commit):
+    // on a host that cannot take it (the check's failure given here) the
+    // limit is refused, naming why, before any jail is made; "no limit" is
+    // still taken, and a host that can count takes the limit.
+    #[test]
+    fn test_a_memory_limit_is_refused_where_sections_cannot_be_counted() {
+        let with = |version: u8, prop: &str, check: fn() -> Result<(), String>| {
+            let mut b = CgroupConfigurationBuilder::new(version, "").unwrap();
+            b.sections_counted = check;
+            let (f, v) = prop.split_once('=').unwrap();
+            b.add_cgroup_property(f.into(), v.into(), "id", Path::new("fc")).map(|()| b.build().limits.memory_bytes)
+        };
+        let cannot = || Err("GetProcessMemoryInfo refuses PROCESS_MEMORY_COUNTERS_EX2 (injected)".to_string());
+        for (version, prop) in [(2, "memory.max=33554432"), (1, "memory.limit_in_bytes=33554432")] {
+            match with(version, prop, cannot) {
+                Err(JailerError::Host(HostError::SectionsUncounted(cg, why))) => {
+                    assert_eq!(cg, prop);
+                    assert!(why.contains("(injected)"), "{why}");
+                    let line = HostError::SectionsUncounted(cg, why).to_string();
+                    assert!(line.contains("SharedCommitUsage") && line.contains("September 2023"), "{line}");
+                }
+                other => panic!("{prop} on a host that cannot count sections: {other:?}"),
+            }
+            assert_eq!(with(version, prop, || Ok(())).unwrap(), Some(32 << 20));
+        }
+        assert_eq!(with(2, "memory.max=max", cannot).unwrap(), None);
+        assert_eq!(with(1, "memory.limit_in_bytes=-1", cannot).unwrap(), None);
     }
 
     #[test]

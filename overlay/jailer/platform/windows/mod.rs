@@ -149,7 +149,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub(crate) mod cgroup_values;
-mod commit;
+pub(crate) mod commit;
 mod console;
 mod freezer;
 mod large_pages;
@@ -285,6 +285,14 @@ pub enum HostError {
     ImpossibleCgroup(String, &'static str),
     #[error("--cgroup {0}: {1}")]
     CgroupValue(String, &'static str),
+    #[error(
+        "--cgroup {0} is refused on this host: the jailer cannot count the jail's memory in sections here ({1}), \
+         so memory.max would bound its private memory only. Counting sections needs \
+         PROCESS_MEMORY_COUNTERS_EX2.SharedCommitUsage, which Microsoft Learn gives for Windows 10 22H2 and \
+         Windows 11 22H2 with the September 2023 cumulative update and later. The jailer never accepts a limit \
+         it cannot enforce."
+    )]
+    SectionsUncounted(String, String),
     #[error("--parent-cgroup {0:?}: {1}")]
     Parent(String, String),
     #[error(
@@ -2425,8 +2433,7 @@ fn exec(
     let memory = match limits.memory_bytes {
         Some(limit) => {
             let large = broker.as_ref().map(large_pages::Broker::given);
-            commit::watch(job.as_raw_handle(), fc_process, limit, large)
-                .map_err(|e| kill("the count of the jail's memory", e))?
+            Some(commit::watch(job.as_raw_handle(), fc_process, limit, large).map_err(|e| kill("the count of the jail's memory", e))?)
         }
         None => None,
     };

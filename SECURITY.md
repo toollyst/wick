@@ -325,8 +325,9 @@ upstream Firecracker and its jailer.
     pages; not done.
   - **On a host without `SharedCommitUsage`** (Microsoft Learn gives `PROCESS_MEMORY_COUNTERS_EX2` for Windows 10
     22H2 and Windows 11 22H2, each with the September 2023 cumulative update, and later; no server is listed), the
-    jailer cannot count sections; it proves the count on each host before it starts a jail, and where it fails it
-    says so in a warning and keeps the job's limit alone.
+    jailer cannot count sections, so `memory.max` is refused there: the jailer proves the count on the host (a
+    section made and counted) when it reads the limit, and stops before any jail is made, naming the cause
+    (`test_a_memory_limit_is_refused_where_sections_cannot_be_counted`).
 - **Windows jailer: the handle limit holds only in the jailed process.** Upstream's jailer limits Firecracker to
   2048 descriptors by default (`RLIMIT_NOFILE`), and the kernel enforces it. Windows has no per-process handle limit
   to set: a process's pool quota is accepted and ignored (200,000 handles made after a 1 MiB paged-pool quota,
