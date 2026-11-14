@@ -6690,7 +6690,22 @@ mod fpu_tests {
     /// - b: vCPU 1, on its own thread, sends 2000 fixed IPIs of 0xe1 to
     ///   vCPU 0 (WRMSR 0x830, WHP's own), each once the one before was
     ///   taken or a bound of spins passed (counted lost), against vCPU 0's
-    ///   loop: none lost;
+    ///   loop: none lost. With X2HOLDSEQ, the record that tells a loss
+    ///   from a late IPI and a merge (CI run 43640510155 had "1 not taken
+    ///   within the spin bound", which a late IPI merged with the next one
+    ///   would give as well): each IPI's number is written before it is
+    ///   sent and the gate keeps the number current when it takes one
+    ///   (one IPI merged into the next leaves its number out, one taken
+    ///   late keeps it); an IPI not taken within the bound is waited for
+    ///   16 times as long again before the next is sent, and is printed as
+    ///   taken late, after how many more spins, or never; each IPI's send
+    ///   is timed (RDTSC, one clock for the partition's vCPUs) with vCPU
+    ///   0's loop count then, and vCPU 0 times each of its writes (RDTSC
+    ///   before and after the WRMSR, inside which the hold is), so an IPI
+    ///   not taken in time is placed against the writes around it; and
+    ///   vCPU 0's IRR and ISR for 0xe1 are read at the end, at both places
+    ///   a page may have them (16 bytes a word, KVM's; 4 bytes a word,
+    ///   WHP's legacy page);
     /// - c: vCPU 0's own one-shot APIC timer expired before the write (TMICT
     ///   1, divide by 1, interrupts off, a spin): its interrupt, pending in
     ///   the page the write reads, is taken once interrupts are on, as KVM
@@ -7025,27 +7040,71 @@ mod fpu_tests {
             unmap(m);
         }
 
-        // b: vCPU 1's IPIs against vCPU 0's loop.
+        // b: vCPU 1's IPIs against vCPU 0's loop, with X2HOLDSEQ's record
+        // (clang -target x86_64-linux-gnu -c, the .text sections):
+        // SEQ (0x7220), the number of the IPI last sent; RING, the number current at
+        // each taking (by TAKEN, a u32 each); SEND_TSC and SEND_LOOPS, each
+        // IPI's send time and vCPU 0's loop count then (by number less
+        // one); LATE, for an IPI not taken within the bound, the spins more
+        // it took plus one, or u32::MAX for never; WIN, vCPU 0's TSC before
+        // and after each write (by its loop count, 32768 of them).
         {
-            let (vm, mut zero, m) = vm_with(&lvt_loop);
-            let read = reader(m);
-            // mov ebx, [TAKEN]; the IPI; lock inc [SENT]; mov ecx, 1 << 24;
-            // spin until [TAKEN] moves or ecx runs out (lock inc [LOST]);
-            // again until [SENT] is IPIS; out 0x83.
-            let ipi = [
-                &[0x8Bu8, 0x1C, 0x25, 0x00, 0x72, 0x00, 0x00][..],
-                &wrmsr(0x830, 0x4000 | u32::from(V)),
-                &[0xF0, 0xFF, 0x04, 0x25, 0x10, 0x72, 0x00, 0x00],
-                &[0xB9],
-                &imm(1 << 24),
-                &[0x3B, 0x1C, 0x25, 0x00, 0x72, 0x00, 0x00, 0x75, 0x0E, 0xF3, 0x90, 0xFF, 0xC9, 0x75, 0xF1],
-                &[0xF0, 0xFF, 0x04, 0x25, 0x18, 0x72, 0x00, 0x00],
-                &[0x81, 0x3C, 0x25, 0x10, 0x72, 0x00, 0x00],
-                &imm(IPIS),
-                &[0x72, 0xBA, 0xE6, 0x83, 0xEB, 0xFE],
+            const RING: u64 = 0x10_0000;
+            const SEND_TSC: u64 = 0x10_4000;
+            const SEND_LOOPS: u64 = 0x10_8000;
+            const LATE: u64 = 0x10_C000;
+            const WIN: u64 = 0x18_0000;
+            // sti; then: mov ebx, [LOOPS]; and ebx, 0x7fff; shl ebx, 4;
+            // rdtsc into [WIN + rbx]; the LVT timer write; rdtsc into
+            // [WIN + rbx + 8]; inc dword [LOOPS]; again.
+            let lvt_loop_b = [
+                on.clone(),
+                vec![0xFB],
+                vec![
+                    0x8B, 0x1C, 0x25, 0x08, 0x72, 0x00, 0x00, 0x81, 0xE3, 0xFF, 0x7F, 0x00, 0x00, 0xC1, 0xE3, 0x04, 0x0F, 0x31,
+                    0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09, 0xD0, 0x48, 0x89, 0x83, 0x00, 0x00, 0x18, 0x00, 0xB9, 0x32, 0x08, 0x00,
+                    0x00, 0xB8, 0xE0, 0x00, 0x04, 0x00, 0x31, 0xD2, 0x0F, 0x30, 0x0F, 0x31, 0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09,
+                    0xD0, 0x48, 0x89, 0x83, 0x08, 0x00, 0x18, 0x00, 0xFF, 0x04, 0x25, 0x08, 0x72, 0x00, 0x00, 0xEB, 0xB9,
+                ],
             ]
             .concat();
-            assert_eq!(ipi.len(), 74, "the IPI program's jumps are for 74 bytes");
+            let (vm, mut zero, m) = vm_with(&lvt_loop_b);
+            // push rax, rcx, rdx; mov eax, [TAKEN]; and eax, 0x7ff; mov ecx,
+            // [SEQ]; mov [RING + rax * 4], ecx; lock inc dword [TAKEN]; EOI;
+            // pop; iretq.
+            put(
+                m,
+                GATE,
+                &[
+                    0x50, 0x51, 0x52, 0x8B, 0x04, 0x25, 0x00, 0x72, 0x00, 0x00, 0x25, 0xFF, 0x07, 0x00, 0x00, 0x8B, 0x0C, 0x25,
+                    0x20, 0x72, 0x00, 0x00, 0x89, 0x0C, 0x85, 0x00, 0x00, 0x10, 0x00, 0xF0, 0xFF, 0x04, 0x25, 0x00, 0x72, 0x00,
+                    0x00, 0xB9, 0x0B, 0x08, 0x00, 0x00, 0x31, 0xC0, 0x31, 0xD2, 0x0F, 0x30, 0x5A, 0x59, 0x58, 0x48, 0xCF,
+                ],
+            );
+            let read = reader(m);
+            let read64 = |off: u64| u64::from(read(off)) | u64::from(read(off + 4)) << 32;
+            // mov eax, [SENT]; inc eax; mov [SEQ], eax; mov ebx, [TAKEN];
+            // lea esi, [rax - 1]; and esi, 0x7ff; [SEND_LOOPS + rsi * 4] =
+            // [LOOPS]; [SEND_TSC + rsi * 8] = rdtsc; the IPI; lock inc
+            // [SENT]; mov ecx, 1 << 24; spin until [TAKEN] moves or ecx runs
+            // out (lock inc [LOST]; then mov ecx, 1 << 28, spin again: moved,
+            // [LATE + rsi * 4] = (1 << 28) + 1 - ecx; ran out, u32::MAX);
+            // again until [SENT] is IPIS; out 0x83.
+            let ipi = [
+                0x8Bu8, 0x04, 0x25, 0x10, 0x72, 0x00, 0x00, 0xFF, 0xC0, 0x89, 0x04, 0x25, 0x20, 0x72, 0x00, 0x00, 0x8B, 0x1C,
+                0x25, 0x00, 0x72, 0x00, 0x00, 0x8D, 0x70, 0xFF, 0x81, 0xE6, 0xFF, 0x07, 0x00, 0x00, 0x8B, 0x0C, 0x25, 0x08,
+                0x72, 0x00, 0x00, 0x89, 0x0C, 0xB5, 0x00, 0x80, 0x10, 0x00, 0x0F, 0x31, 0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09,
+                0xD0, 0x48, 0x89, 0x04, 0xF5, 0x00, 0x40, 0x10, 0x00, 0xB9, 0x30, 0x08, 0x00, 0x00, 0xB8, 0xE1, 0x40, 0x00,
+                0x00, 0x31, 0xD2, 0x0F, 0x30, 0xF0, 0xFF, 0x04, 0x25, 0x10, 0x72, 0x00, 0x00, 0xB9, 0x00, 0x00, 0x00, 0x01,
+                0x3B, 0x1C, 0x25, 0x00, 0x72, 0x00, 0x00, 0x75, 0x3D, 0xF3, 0x90, 0xFF, 0xC9, 0x75, 0xF1, 0xF0, 0xFF, 0x04,
+                0x25, 0x18, 0x72, 0x00, 0x00, 0xB9, 0x00, 0x00, 0x00, 0x10, 0x3B, 0x1C, 0x25, 0x00, 0x72, 0x00, 0x00, 0x75,
+                0x13, 0xF3, 0x90, 0xFF, 0xC9, 0x75, 0xF1, 0xC7, 0x04, 0xB5, 0x00, 0xC0, 0x10, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+                0xEB, 0x0E, 0xBA, 0x01, 0x00, 0x00, 0x10, 0x29, 0xCA, 0x89, 0x14, 0xB5, 0x00, 0xC0, 0x10, 0x00, 0x81, 0x3C,
+                0x25, 0x10, 0x72, 0x00, 0x00, 0xD0, 0x07, 0x00, 0x00, 0x0F, 0x82, 0x4F, 0xFF, 0xFF, 0xFF, 0xE6, 0x83, 0xEB,
+                0xFE,
+            ];
+            assert_eq!(IPIS, 2000, "the IPI program compares [SENT] with 2000");
+            assert_eq!(ipi.len(), 181, "the IPI program's jumps are for 181 bytes");
             put(m, IPI_PROGRAM, &ipi);
             let mut one = ap(&vm, &zero, 1, IPI_PROGRAM, true);
             let mut kicker = VcpuFd { shared: Arc::clone(&zero.shared), own: None };
@@ -7074,6 +7133,50 @@ mod fpu_tests {
                 "X2HOLD b: vCPU 1 sent {sent} IPIs, {taken} taken, {lost} not taken within the spin bound, in {took:?}; \
                  vCPU 0's writes {loops}; vCPU 1's exits {sent_exits:?}, vCPU 0's {exits:?}"
             );
+            // X2HOLDSEQ: which numbers were taken, late, or never.
+            let ring: Vec<u32> = (0..u64::from(taken.min(2048))).map(|i| read(RING + i * 4)).collect();
+            let mut times = vec![0u32; IPIS as usize + 2];
+            for &n in &ring {
+                if let Some(t) = times.get_mut(n as usize) {
+                    *t += 1;
+                }
+            }
+            let left_out: Vec<u32> = (1..=sent.min(IPIS)).filter(|&n| times[n as usize] == 0).collect();
+            let twice: Vec<u32> = (1..=sent.min(IPIS)).filter(|&n| times[n as usize] > 1).collect();
+            let late: Vec<(u32, u32)> = (1..=sent.min(IPIS)).map(|n| (n, read(LATE + u64::from(n - 1) * 4))).filter(|&(_, l)| l != 0).collect();
+            // vCPU 0's IRR and ISR bit for 0xe1 (word 7, bit 1).
+            let lapic = zero.get_lapic().unwrap();
+            let bit = |off: usize| (lapic.regs[off] as u8) & 0x2 != 0;
+            eprintln!(
+                "X2HOLDSEQ b: {sent} sent, {taken} taken; numbers left out of the gate's ring {left_out:?}, taken twice {twice:?}; \
+                 not taken within the bound {}: {}; at the end vCPU 0's IRR for 0xe1 {} at 0x270 (16 bytes a word), {} at 0x21c \
+                 (4 bytes a word), ISR {} at 0x170, {} at 0x11c",
+                late.len(),
+                late.iter()
+                    .map(|&(n, l)| if l == u32::MAX { format!("#{n} never within 2^28 more spins") } else { format!("#{n} taken after {} more spins", l - 1) })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                bit(0x270),
+                bit(0x21c),
+                bit(0x170),
+                bit(0x11c)
+            );
+            // Each IPI not taken in time, against vCPU 0's writes around its
+            // send (TSC ticks from the send: before and after each WRMSR).
+            for &(n, _) in late.iter().take(8) {
+                let i = u64::from(n - 1);
+                let (at, l) = (read64(SEND_TSC + i * 8), read(SEND_LOOPS + i * 4));
+                let around: Vec<String> = (l.saturating_sub(2)..l.saturating_add(3).min(loops))
+                    .map(|w| {
+                        let e = WIN + u64::from(w & 0x7fff) * 16;
+                        let (b, a) = (read64(e), read64(e + 8));
+                        #[allow(clippy::cast_possible_wrap)]
+                        let rel = |t: u64| t.wrapping_sub(at) as i64;
+                        format!("write {w}: {:+}..{:+}{}", rel(b), rel(a), if b <= at && at <= a { " (the send inside it)" } else { "" })
+                    })
+                    .collect();
+                eprintln!("X2HOLDSEQ b: #{n} sent at vCPU 0's loop {l}; vCPU 0's writes around it, in TSC ticks from the send: {}", around.join("; "));
+            }
             if sent != IPIS || taken != IPIS || lost != 0 || loops < 10 {
                 wrong.push(format!("b: {sent} sent, {taken} taken, {lost} lost, {loops} writes"));
             }
