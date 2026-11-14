@@ -5792,6 +5792,84 @@ mod fpu_tests {
         assert_eq!((id, got_id, ldr, lvtt), (1, 0x100_0000, 0x2, 0x4_00ec));
     }
 
+    /// Option E-ii's audit of the interrupt sources inside WHP, on record:
+    /// a partition as `vm::configure` makes it, an xAPIC and (on an AMD
+    /// host, `X2APIC_PARTITION_FOR_TESTS`) an x2APIC, has neither a PMU
+    /// (`WHvPartitionPropertyCodeProcessorPerfmonFeatures`, `PmuSupport`,
+    /// bit 0) nor the synthetic interrupt controller or synthetic timers
+    /// (`WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks`, bank 0's
+    /// `AccessSynicRegs` bit 4, `AccessSyntheticTimerRegs` bit 5,
+    /// `DirectSyntheticTimers` bit 22: WinHvPlatformDefs.h), so none of
+    /// them can raise an interrupt of a vCPU while the APIC page is read and
+    /// set (the E-ii design: the page's get and set with every requester
+    /// held off). Printed with what the host offers (`WHvGetCapability` of
+    /// the same codes) and the property calls' HRESULTs (X2HOLDREC lines);
+    /// asserted, the partition's bits off.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_partition_has_no_pmu_or_synthetic_interrupts_on_record() {
+        use super::super::apicmode::LocalApic;
+        const PMU: u64 = 1;
+        const SYNIC: u64 = 1 << 4;
+        const STIMERS: u64 = 1 << 5;
+        const DIRECT_STIMERS: u64 = 1 << 22;
+        let mut sources = Vec::new();
+        for x2apic in [false, true] {
+            super::super::vm::X2APIC_PARTITION_FOR_TESTS.set(x2apic);
+            if x2apic && super::super::vm::host_local_apic() != LocalApic::X2Apic {
+                eprintln!("X2HOLDREC not an AMD host: no x2APIC partition to read");
+                continue;
+            }
+            let kind = if x2apic { "x2APIC" } else { "xAPIC" };
+            let vm = super::super::VmFd::create().unwrap();
+            let v = vm.create_vcpu(0).unwrap();
+            let read = |code: i32, cap: bool| -> (i32, [u64; 2]) {
+                let mut out = [0u64; 2];
+                let mut written = 0u32;
+                let size = u32::try_from(core::mem::size_of_val(&out)).unwrap();
+                // SAFETY: an output buffer of the size passed.
+                let hres = unsafe {
+                    if cap {
+                        whv::WHvGetCapability(code, out.as_mut_ptr().cast(), size, &mut written)
+                    } else {
+                        whv::WHvGetPartitionProperty(v.part(), code, out.as_mut_ptr().cast(), size, &mut written)
+                    }
+                };
+                (hres, out)
+            };
+            let (perf_cap_hr, perf_cap) = read(whv::WHvCapabilityCodeProcessorPerfmonFeatures, true);
+            let (perf_hr, perf) = read(whv::WHvPartitionPropertyCodeProcessorPerfmonFeatures, false);
+            // WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS: the count and a reserved
+            // word, then bank 0.
+            let (syn_cap_hr, syn_cap) = read(whv::WHvCapabilityCodeSyntheticProcessorFeaturesBanks, true);
+            let (syn_hr, syn) = read(whv::WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks, false);
+            let (offered, given) = (syn_cap[1], syn[1]);
+            eprintln!(
+                "X2HOLDREC {kind} partition: perfmon offered {:#x} ({perf_cap_hr:#010x}), given {:#x} ({perf_hr:#010x}); \
+                 synthetic features banks offered {:#x}: bank 0 {offered:#x} ({syn_cap_hr:#010x}), given {:#x}: bank 0 \
+                 {given:#x} ({syn_hr:#010x}); given: PMU {}, SynIC {}, synthetic timers {}, direct synthetic timers {}",
+                perf_cap[0],
+                perf[0],
+                syn_cap[0] & 0xffff_ffff,
+                syn[0] & 0xffff_ffff,
+                perf[0] & PMU != 0,
+                given & SYNIC != 0,
+                given & STIMERS != 0,
+                given & DIRECT_STIMERS != 0,
+            );
+            if perf_hr < 0 || perf[0] & PMU != 0 {
+                sources.push(format!("{kind}: a PMU ({perf_hr:#010x}, {:#x})", perf[0]));
+            }
+            if syn_hr < 0 || given & (SYNIC | STIMERS | DIRECT_STIMERS) != 0 {
+                sources.push(format!("{kind}: synthetic interrupts ({syn_hr:#010x}, bank 0 {given:#x})"));
+            }
+            drop(v);
+            drop(vm);
+        }
+        super::super::vm::X2APIC_PARTITION_FOR_TESTS.set(false);
+        assert!(sources.is_empty(), "interrupt sources inside WHP, or unread: {sources:?}");
+    }
+
     /// The APIC register page's get and set lose an interrupt requested of
     /// the vCPU between them, and the guest's x2APIC LVT timer write in
     /// TSC-deadline mode (`write_x2apic_lvtt`: WHP's register refuses that

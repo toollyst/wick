@@ -1177,6 +1177,9 @@ jobs:
           # fault; and a KVM local APIC state in x2APIC mode.
           alone whp::vcpu::fpu_tests::test_the_x2apic_lvt_timer_in_tsc_deadline_mode_is_refused
           alone whp::vcpu::fpu_tests::test_a_kvm_lapic_state_in_x2apic_mode_restores
+          # Option E-ii's audit: no PMU, SynIC or synthetic timers on a
+          # partition as the backend makes it, xAPIC and x2APIC (X2HOLDREC).
+          alone whp::vcpu::fpu_tests::test_a_partition_has_no_pmu_or_synthetic_interrupts_on_record
           # The APIC page's get and set against interrupts requested
           # meanwhile: an MSI and an IPI between them lost (PC step 15a at
           # 305a806), the reason the run loop never sets the page; and the
