@@ -4041,6 +4041,34 @@ if ($SelfTest) {
             Check ($longest -lt 4095) "a piece of W is $longest bytes"
             return "Guest TSC check: tools/guest-counter-warp.py ($($want.Length) bytes) sent as $($b64.Length) base64 characters in $([Math]::Ceiling($b64.Length / 2000)) lines, which inflate back to it"
         }
+        serial = {
+            # A guest command's output is the serial console's alone: a
+            # stand-in for Firecracker (a PowerShell loop) answers each
+            # command on stdout, with a line on stderr between two of its
+            # lines, as the WHP backend's whp: lines came while CPU 1 came
+            # online (PC 16i at df0bf87). Sh gives the two stdout lines and
+            # not the stderr one, which Output (the log's) still has.
+            $standIn = @'
+while ($null -ne ($l = [Console]::In.ReadLine())) {
+    if ($l -match 'RC=\$\?:(K\d+Z)') {
+        [Console]::Out.WriteLine('before'); [Console]::Out.Flush()
+        Start-Sleep -Milliseconds 300
+        [Console]::Error.WriteLine("whp: a line of Firecracker's own"); [Console]::Error.Flush()
+        Start-Sleep -Milliseconds 300
+        [Console]::Out.WriteLine('after'); [Console]::Out.WriteLine('RC=0:' + $Matches[1]); [Console]::Out.Flush()
+    }
+}
+'@
+            $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($standIn))
+            $ps = Join-Path $PSHOME 'powershell.exe'
+            $vm = New-Object Wick.Vm($ps, "-NoProfile -NonInteractive -EncodedCommand $enc", (Join-Path $dir 'serial.log'))
+            try {
+                $out = $vm.Sh('true', 20000, $true)
+                Check ($out -ceq "before`nafter") "the command's output: '$($out -replace "`n", ' | ')'"
+                Check ($vm.Output.Contains("whp: a line of Firecracker's own")) "the stderr line is not in the output Firecracker's log keeps"
+            } finally { $vm.Kill() }
+            return "Serial: a guest command's output is the serial console's; Firecracker's stderr line in the middle of it is in the log only"
+        }
         socknames = {
             # Every socket name of the stages within the bound the start
             # takes (a name over it once failed the cli stage on the PC),
