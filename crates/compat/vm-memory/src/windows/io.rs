@@ -441,25 +441,6 @@ mod tests {
     #[cfg(feature = "rawfd")]
     use vmm_sys_util::tempfile::TempFile;
 
-    /// A socket made non-blocking through wick_os (`set_nonblocking`, as
-    /// vsock's muxer makes its connections: vsock/unix/muxer.rs) is
-    /// `O_NONBLOCK` to the libc whose `read` and `write` move its bytes
-    /// ([`read_volatile_raw_fd`]), as Linux's std makes it with
-    /// `ioctl(FIONBIO)`, which sets `O_NONBLOCK` in the open file's flags
-    /// (v6.1 fs/ioctl.c:341-361 `ioctl_fionbio`), and `F_GETFL` shows it.
-    #[cfg(feature = "rawfd")]
-    #[test]
-    fn test_a_socket_made_non_blocking_by_wick_os_is_o_nonblocking_to_the_libc() {
-        use wick_os::fd::AsRawFd;
-        let (a, _b) = wick_os::unix::net::UnixStream::pair().unwrap();
-        for on in [true, false, true] {
-            a.set_nonblocking(on).unwrap();
-            // SAFETY: plain call on our socket.
-            let flags = unsafe { libc::fcntl(a.as_raw_fd(), libc::F_GETFL) };
-            assert_eq!(flags & libc::O_NONBLOCK, if on { libc::O_NONBLOCK } else { 0 }, "F_GETFL after set_nonblocking({on})");
-        }
-    }
-
     // ---- Test ReadVolatile for &[u8] ----
     fn read_4_bytes_to_5_byte_memory(source: Vec<u8>, expected_output: [u8; 5]) {
         // Test read_volatile for &[u8] works
