@@ -4,7 +4,8 @@
 //! The user-space interrupt controller: the I/O APIC, the two 8259 PICs and
 //! the 8254 PIT that KVM provides in the kernel.
 //!
-//! The local APIC is WHP's (`WHvX64LocalApicEmulationModeXApic`). What is here
+//! The local APIC is WHP's (an x2APIC on AMD hosts, an xAPIC elsewhere:
+//! `apicmode`). What is here
 //! is everything in front of it:
 //! - the **I/O APIC** at `0xFEC0_0000`: the guest programs its 24 redirection
 //!   entries over MMIO; when a GSI is raised (by an `irqfd` or `set_irq_line`)

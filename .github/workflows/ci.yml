@@ -1162,6 +1162,11 @@ jobs:
           # An expired TSC deadline's interrupt is its own vCPU's in x2APIC
           # mode too (the APIC ID by the mode: X2E0REC c's vCPU 1 line).
           alone whp::vcpu::fpu_tests::test_a_deadline_interrupt_goes_to_its_own_vcpu_in_x2apic_mode
+          # The x2APIC partition (AMD): the guest's TSC-deadline LVT timer
+          # write finished from its #GP exit, its read, its interrupt, a
+          # masked entry's none, and a #GP given back, merged into a #DF and
+          # a triple fault.
+          alone whp::vcpu::fpu_tests::test_the_x2apic_lvt_timer_in_tsc_deadline_mode_as_kvm
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # The lazy-RAM grain (LAZYGRAIN lines): guest RAM mapped as

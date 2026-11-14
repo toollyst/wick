@@ -1294,7 +1294,7 @@ impl VcpuFd {
     pub fn set_cpuid2(&self, cpuid: &CpuId) -> Result<()> {
         let table = cpuid.as_slice();
         let leaf1 = table.iter().find(|e| e.function == 1).map(|e| e.ecx);
-        if super::apicmode::refuses_leaf1_ecx(super::apicmode::PARTITION, leaf1) {
+        if super::apicmode::refuses_leaf1_ecx(self.shared.inner.apic, leaf1) {
             super::ffi::report(
                 log::Level::Error,
                 "whp: KVM_SET_CPUID2 refused: the CPUID offers x2APIC (leaf 1 ECX bit 21), and this partition's local \
@@ -2523,7 +2523,7 @@ impl VcpuFd {
                 // A table without leaf 1 answers with WHP's default, the
                 // host's: its x2APIC bit is not the partition's either.
                 if function == 1 {
-                    ecx = super::apicmode::offered_leaf1_ecx(super::apicmode::PARTITION, ecx);
+                    ecx = super::apicmode::offered_leaf1_ecx(self.shared.inner.apic, ecx);
                 }
             }
             (0xd, 0) => {
@@ -5281,8 +5281,10 @@ mod fpu_tests {
     /// The guest's x2APIC as KVM's for a guest whose CPUID lacks it, the
     /// only CPUID this backend's xAPIC partition keeps (`apicmode`; CI run
     /// 43452122814, where an Intel runner's guests were offered x2APIC and
-    /// froze):
-    /// - the supported CPUID has no x2APIC (leaf 1 ECX bit 21);
+    /// froze). The VMs are xAPIC partitions, as on a host other than AMD:
+    /// - the supported CPUID has no x2APIC (leaf 1 ECX bit 21) on such a
+    ///   host (on AMD, whose partitions are x2APICs, it has, and the tables
+    ///   here are the supported one less the bit);
     /// - `KVM_SET_CPUID2` of a table with it is refused (`ENOTSUP`) and
     ///   keeps nothing;
     /// - with the supported table, and with a table that has no leaf 1
@@ -5305,19 +5307,29 @@ mod fpu_tests {
         const BASE_BEFORE: u64 = 0x7108;
         const BASE_AFTER: u64 = 0x7110;
         const LEAF1_ECX: u64 = 0x7118;
+        use super::super::apicmode::LocalApic;
         let x2apic = super::super::apicmode::LEAF1_ECX_X2APIC;
         let supported = regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap();
         let leaf1 = supported.as_slice().iter().find(|e| e.function == 1).map(|e| e.ecx).unwrap();
         let host = core::arch::x86_64::__cpuid(1).ecx;
+        let partitions = super::super::vm::host_local_apic();
         eprintln!(
-            "X2APICTEST leaf 1 ECX x2APIC: the host {}, the supported CPUID {}",
+            "X2APICTEST leaf 1 ECX x2APIC: the host {}, the supported CPUID {}, this host's partitions {partitions:?}",
             host & x2apic != 0,
             leaf1 & x2apic != 0
         );
-        assert_eq!(leaf1 & x2apic, 0, "the supported CPUID offers x2APIC on an xAPIC partition");
+        // On a host whose partitions are xAPICs the supported CPUID has no
+        // x2APIC; on one whose are x2APICs it has, and this test makes its
+        // VMs xAPICs, as those hosts' are, with the supported table less
+        // the bit.
+        assert_eq!(leaf1 & x2apic != 0, partitions == LocalApic::X2Apic, "the supported CPUID against the partitions' APIC");
+        let mut without: Vec<_> = supported.as_slice().to_vec();
+        for e in without.iter_mut().filter(|e| e.function == 1) {
+            e.ecx &= !x2apic;
+        }
         let leaf_d: Vec<_> = supported.as_slice().iter().filter(|e| e.function == 0xd).copied().collect();
         let tables: [(&str, Vec<kvm_bindings::kvm_cpuid_entry2>); 2] =
-            [("the supported table", supported.as_slice().to_vec()), ("a table without leaf 1", leaf_d)];
+            [("the supported table", without), ("a table without leaf 1", leaf_d)];
         for (name, table) in tables {
             let a = |addr: u64| (addr as u32).to_le_bytes();
             let mut program = vec![0xB9, 0x1B, 0x00, 0x00, 0x00, 0x0F, 0x32]; // mov ecx, 0x1b; rdmsr
@@ -5334,7 +5346,9 @@ mod fpu_tests {
             program.extend([0x89, 0x0C, 0x25]); // mov [LEAF1_ECX], ecx
             program.extend(a(LEAF1_ECX));
             program.extend([0xE6, PORT as u8, 0xEB, 0xFE]);
+            super::super::vm::APIC_MODE_FOR_TESTS.set(Some(whv::WHvX64LocalApicEmulationModeXApic));
             let (vm, mut vcpu, m) = mmio_guest(&program);
+            super::super::vm::APIC_MODE_FOR_TESTS.set(None);
             let mut handler = vec![0x48, 0x83, 0xC4, 0x08, 0x48, 0x83, 0x04, 0x24, 0x02, 0x48, 0xFF, 0x04, 0x25]; // add rsp, 8; add qword [rsp], 2; inc qword [GP_COUNT]
             handler.extend(a(GP_COUNT));
             handler.extend([0x48, 0xCF]); // iretq
@@ -5377,6 +5391,109 @@ mod fpu_tests {
             // SAFETY: the test's mapping, no VM left using it.
             assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
         }
+    }
+
+    /// The x2APIC partition's LVT timer in TSC-deadline mode, as KVM's
+    /// (`gp`, `tscdeadline`), on a host whose partitions are x2APICs (AMD;
+    /// elsewhere the test says so and passes). Each case a VM of its own,
+    /// with the supported CPUID (x2APIC and TSC_DEADLINE), the guest at CPL
+    /// 0 turning x2APIC mode on (APIC_BASE |= EXTD) and its APIC on (SVR
+    /// 0x1ff by WRMSR 0x80F):
+    /// - WRMSR 0x832 of 0x400ec, which WHP refuses with #GP and the backend
+    ///   takes from the #GP exit: no #GP reaches the guest, its RDMSR 0x832
+    ///   reads 0x400ec (KVM's value), and a TSC deadline a little ahead,
+    ///   with interrupts on, raises vector 0xec (its gate's `out 0x82`);
+    /// - the same entry masked (0x500ec): no interrupt (the run kicked
+    ///   after 5 s), as KVM's `kvm_apic_local_deliver` raises none;
+    /// - WRMSR 0x832 in xAPIC mode (EXTD clear): the guest's own #GP
+    ///   (its gate's fault line), as KVM's `kvm_x2apic_msr_write` gives;
+    /// - the same with the IDT cut below #GP's gate: the #GP raised
+    ///   delivering it is merged into a #DF (#DF's gate runs), and with
+    ///   the IDT cut below #DF's too, a triple fault (`Shutdown`), as KVM's
+    ///   `kvm_multiple_exception`.
+    ///
+    /// Printed too (TSCDLTEST lines), not asserted: the initial count
+    /// register written in TSC-deadline mode and read back (WRMSR 0x838,
+    /// RDMSR 0x839: KVM ignores the write, lapic.c 2195-2196).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_the_x2apic_lvt_timer_in_tsc_deadline_mode_as_kvm() {
+        use super::super::apicmode::LocalApic;
+        const GATE: u64 = 0xB900;
+        const LVTT_READ: u64 = 0x7100;
+        const TMCCT_READ: u64 = 0x7108;
+        if super::super::vm::host_local_apic() != LocalApic::X2Apic {
+            eprintln!("TSCDLTEST this host's partitions are xAPICs: no x2APIC partition to test");
+            return;
+        }
+        let imm = |v: u32| v.to_le_bytes();
+        let wrmsr = |ecx: u32, eax: u32| [&[0xB9][..], &imm(ecx), &[0xB8], &imm(eax), &[0x31, 0xD2, 0x0F, 0x30]].concat();
+        // mov ecx, ecx; rdmsr; mov [at], eax
+        let rdmsr = |ecx: u32, at: u64| [&[0xB9][..], &imm(ecx), &[0x0F, 0x32, 0x89, 0x04, 0x25], &imm(at as u32)].concat();
+        // rdmsr 0x1b; or eax, 0xc00; wrmsr
+        let x2apic_on = [&[0xB9][..], &imm(0x1B), &[0x0F, 0x32, 0x0D], &imm(0xC00), &[0x0F, 0x30]].concat();
+        // rdtsc; rax = edx:eax + 0x10000; rdx = rax >> 32; wrmsr 0x6e0
+        let deadline_ahead = [
+            &[0x0F, 0x31, 0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09, 0xD0, 0x48, 0x05][..],
+            &imm(0x1_0000),
+            &[0x48, 0x89, 0xC2, 0x48, 0xC1, 0xEA, 0x20, 0xB9],
+            &imm(0x6E0),
+            &[0x0F, 0x30],
+        ]
+        .concat();
+        let halt = [0xFB, 0xF4, 0xEB, 0xFD]; // sti; hlt; jmp to the hlt
+        let run = |program: Vec<u8>, idt_gates: Option<u64>| {
+            let (vm, mut vcpu, m) = mmio_guest(&program);
+            vcpu.set_cpuid2(&regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap()).unwrap();
+            put(m, GATE, &[0xB0, 0xEC, 0xE6, 0x82, 0xEB, 0xFE]);
+            put(m, MMIO_IDT + 0xEC * 16, &((GATE & 0xffff) | (8 << 16) | (0x8E << 40)).to_le_bytes());
+            put(m, MMIO_IDT + 0xEC * 16 + 8, &0u64.to_le_bytes());
+            if let Some(gates) = idt_gates {
+                let mut s = vcpu.get_sregs().unwrap();
+                s.idt.limit = u16::try_from(gates * 16 - 1).unwrap();
+                vcpu.set_sregs(&s).unwrap();
+            }
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let mut reads = 0;
+            let mut exits = Vec::new();
+            while exits.len() < 10 && !exits.last().is_some_and(|e: &String| e.starts_with("out") || e.starts_with("fault") || e.contains("fail") || e == "EINTR" || e.starts_with("Shutdown")) {
+                exits.push(one_run(&mut vcpu, &[], &mut reads));
+            }
+            drop(watchdog);
+            vcpu.set_kvm_immediate_exit(0);
+            let r = |at: u64| u64::from_le_bytes(bytes_at::<8>(m, at));
+            let read = (r(LVTT_READ), r(TMCCT_READ));
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+            (exits, read)
+        };
+        let on = [x2apic_on.clone(), wrmsr(0x80F, 0x1FF)].concat();
+        // TSC-deadline mode, read back, the initial count written and read,
+        // a deadline ahead, interrupts on.
+        let (exits, (lvtt, tmcct)) = run(
+            [on.clone(), wrmsr(0x832, 0x4_00EC), rdmsr(0x832, LVTT_READ), wrmsr(0x838, 0x10_0000), rdmsr(0x839, TMCCT_READ), deadline_ahead.clone(), halt.to_vec()].concat(),
+            None,
+        );
+        eprintln!("TSCDLTEST TSC-deadline mode: exits {exits:?}; the guest's RDMSR 0x832 {lvtt:#x}; TMICT 0x100000 written in that mode, TMCCT read {tmcct:#x}");
+        assert_eq!(exits.last().map(String::as_str), Some("out 0x82 [ec]"), "the deadline's interrupt");
+        assert_eq!(lvtt & 0xffff_ffff, 0x4_00EC, "the guest's read of its LVT timer entry");
+        // Masked: no interrupt.
+        let (exits, _) = run([on.clone(), wrmsr(0x832, 0x5_00EC), deadline_ahead.clone(), halt.to_vec()].concat(), None);
+        eprintln!("TSCDLTEST masked: exits {exits:?}");
+        assert_eq!(exits.last().map(String::as_str), Some("EINTR"), "a masked entry raised an interrupt");
+        // xAPIC mode: the guest's #GP.
+        let (exits, _) = run([wrmsr(0x832, 0x4_00EC), vec![0xE6, PORT as u8, 0xEB, 0xFE]].concat(), None);
+        eprintln!("TSCDLTEST xAPIC mode: exits {exits:?}");
+        assert!(exits.last().is_some_and(|e| e.starts_with("fault: exception 13")), "no #GP in xAPIC mode");
+        // #GP's gate past the IDT: a #DF; #DF's too: a triple fault.
+        let (exits, _) = run([wrmsr(0x832, 0x4_00EC), vec![0xE6, PORT as u8, 0xEB, 0xFE]].concat(), Some(13));
+        eprintln!("TSCDLTEST #GP's gate past the IDT's limit: exits {exits:?}");
+        assert!(exits.last().is_some_and(|e| e.starts_with("fault: exception 8")), "no #DF");
+        let (exits, _) = run([wrmsr(0x832, 0x4_00EC), vec![0xE6, PORT as u8, 0xEB, 0xFE]].concat(), Some(8));
+        eprintln!("TSCDLTEST #GP's and #DF's gates past it: exits {exits:?}");
+        assert!(exits.last().is_some_and(|e| e.starts_with("Shutdown")), "no triple fault");
     }
 
     /// The local APIC state of `vp` in both of WHP's formats, as lines: the

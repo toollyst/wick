@@ -10,8 +10,10 @@
 //! partition was made with exception exits (`ExtendedVmExits` bit 2,
 //! `ExceptionExit`, set before `WHvSetupPartition`) and the exception's bit
 //! is in the partition's `ExceptionExitBitmap`. The partition is made with
-//! exception exits only with this crate's `gdb` feature (Firecracker's
-//! `gdb`), so a build without it is exactly as before ([`extended_vm_exits`]).
+//! #DB and #BP exits only with this crate's `gdb` feature (Firecracker's
+//! `gdb`), so a build without it has none of gdb's ([`extended_vm_exits`]);
+//! an x2APIC partition has exception exits in every build, for #GP alone
+//! (`gp`, `vm::configure`), which gdb's bitmap is written over.
 //!
 //! What differs from KVM:
 //! - the bitmap is the partition's, where KVM's guest debug is per vCPU

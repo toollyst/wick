@@ -126,6 +126,8 @@ impl Drop for IrqFd {
 #[derive(Debug)]
 pub(crate) struct VmInner {
     pub(crate) part: WHV_PARTITION_HANDLE,
+    /// The partition's local APIC ([`host_local_apic`]).
+    pub(crate) apic: super::apicmode::LocalApic,
     memory: Mutex<HashMap<u32, Slot>>,
     ioevents: RwLock<Vec<IoEvent>>,
     irqfds: Mutex<Vec<IrqFd>>,
@@ -185,6 +187,9 @@ pub(crate) struct VmInner {
 /// the cause read from the code and QEMU's note).
 #[derive(Debug, Default)]
 struct Exits {
+    /// The partition's own, always in the bitmap: #GP on an x2APIC
+    /// partition (`gp`), none on an xAPIC one.
+    base: u64,
     /// gdb's, from the last `KVM_SET_GUEST_DEBUG`.
     gdb: u64,
     /// What the partition has, if known.
@@ -441,6 +446,7 @@ impl VmInner {
     /// Writes `bitmap` as the partition's exception exits, unless it has
     /// them. The caller has every vCPU out of the guest ([`Exits`]).
     fn write_exits(&self, exits: &mut Exits, bitmap: u64) -> Result<()> {
+        let bitmap = bitmap | exits.base;
         if exits.written == Some(bitmap) {
             return Ok(());
         }
@@ -509,7 +515,7 @@ impl VmInner {
         {
             let mut exits = lock.lock().unwrap();
             exits.gdb = bitmap;
-            if self.bp_owner.load(Ordering::SeqCst) >= 0 || exits.written == Some(bitmap) {
+            if self.bp_owner.load(Ordering::SeqCst) >= 0 || exits.written == Some(bitmap | exits.base) {
                 return Ok(());
             }
         }
@@ -605,8 +611,8 @@ impl VmFd {
         // a partition keeps, whose refused calls cost the calling thread
         // 32 KiB of stack for good (`regs::probe_partition`).
         super::regs::probe_partition()?;
-        let part = make_partition()?;
-        let inner = tsc_write_exit(part).and_then(|()| VmInner::setup(part)).inspect_err(|_| {
+        let (part, apic) = make_partition()?;
+        let inner = tsc_write_exit(part).and_then(|()| VmInner::setup(part, apic)).inspect_err(|_| {
             // SAFETY: cleans up the partition we just created on failure.
             unsafe { whv::WHvDeletePartition(part) };
         })?;
@@ -653,7 +659,7 @@ const TSC_MSR_WRITE: u64 = 1 << 1;
 /// cannot make one: an answer of none would make every VM of the process
 /// keep those MSRs nowhere without a word.
 pub(crate) fn probe_registers(names: &[WHV_REGISTER_NAME]) -> Result<Vec<bool>> {
-    let part = make_partition()?;
+    let (part, _) = make_partition()?;
     // SAFETY: vCPU 0 of the partition just configured.
     let vp = ffi::hr_of("WHvCreateVirtualProcessor", unsafe { whv::WHvCreateVirtualProcessor(part, 0, 0) }, || {
         "vp 0".into()
@@ -673,18 +679,46 @@ pub(crate) fn probe_registers(names: &[WHV_REGISTER_NAME]) -> Result<Vec<bool>> 
 
 /// A new partition, configured as every VM's and set up ([`configure`]);
 /// deleted again if that fails.
-fn make_partition() -> Result<WHV_PARTITION_HANDLE> {
+fn make_partition() -> Result<(WHV_PARTITION_HANDLE, super::apicmode::LocalApic)> {
     let part = ffi::create_partition()?;
-    configure(part).inspect_err(|_| {
+    let apic = configure(part).inspect_err(|_| {
         // SAFETY: the partition made above, which nothing else has.
         unsafe { whv::WHvDeletePartition(part) };
     })?;
-    Ok(part)
+    Ok((part, apic))
+}
+
+/// The local APIC this host's partitions emulate (`apicmode::partition_for`
+/// its CPUID vendor): an x2APIC on AMD, an xAPIC elsewhere, which is said
+/// once, with why.
+pub(crate) fn host_local_apic() -> super::apicmode::LocalApic {
+    static APIC: std::sync::OnceLock<super::apicmode::LocalApic> = std::sync::OnceLock::new();
+    *APIC.get_or_init(|| {
+        let leaf = core::arch::x86_64::__cpuid(0);
+        let mut vendor = [0u8; 12];
+        vendor[..4].copy_from_slice(&leaf.ebx.to_le_bytes());
+        vendor[4..8].copy_from_slice(&leaf.edx.to_le_bytes());
+        vendor[8..].copy_from_slice(&leaf.ecx.to_le_bytes());
+        let apic = super::apicmode::partition_for(&vendor);
+        if apic == super::apicmode::LocalApic::XApic {
+            ffi::report(
+                log::Level::Warn,
+                &format!(
+                    "whp: this host's processor is {}: its partitions emulate an xAPIC, with no x2APIC mode, and the \
+                     supported CPUID offers no x2APIC (KVM offers it on any host). The x2APIC partition, whose \
+                     TSC-deadline LVT timer write the backend finishes from a #GP exit, is measured on AMD hosts \
+                     only (X2E0REC, GPEXITREC)",
+                    String::from_utf8_lossy(&vendor)
+                ),
+            );
+        }
+        apic
+    })
 }
 
 /// Sets a new partition's properties and sets it up, as every VM's. Each
 /// WHP call that fails is reported by name and HRESULT ([`ffi::hr_of`]).
-fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
+fn configure(part: WHV_PARTITION_HANDLE) -> Result<super::apicmode::LocalApic> {
         // Processor count must be set before the partition is set up.
         let count = u32::try_from(MAX_VCPUS).unwrap();
         // SAFETY: a u32 property value for ProcessorCount.
@@ -773,14 +807,22 @@ fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
         // and no rule for its entries (`test_msr_action_list_on_record`
         // prints which indices this host's set-up takes).
         // Emulate the local APIC in WHP, in the mode the guest's CPUID is
-        // made to agree with (`apicmode`: an xAPIC, so no x2APIC bit). A
-        // record test may ask for another mode on its thread
-        // (`APIC_MODE_FOR_TESTS`).
-        let apic_mode: i32 = match super::apicmode::PARTITION {
+        // made to agree with (`apicmode`: an x2APIC on AMD hosts, an xAPIC
+        // elsewhere). A record test may ask for a mode on its thread
+        // (`APIC_MODE_FOR_TESTS`), and makes its partition's exception
+        // exits itself.
+        let apic = host_local_apic();
+        let apic_mode: i32 = match apic {
             super::apicmode::LocalApic::XApic => whv::WHvX64LocalApicEmulationModeXApic,
+            super::apicmode::LocalApic::X2Apic => whv::WHvX64LocalApicEmulationModeX2Apic,
         };
         #[cfg(test)]
-        let apic_mode: i32 = APIC_MODE_FOR_TESTS.get().unwrap_or(apic_mode);
+        let (apic_mode, apic) = match APIC_MODE_FOR_TESTS.get() {
+            Some(mode) if mode == whv::WHvX64LocalApicEmulationModeX2Apic => (mode, super::apicmode::LocalApic::X2Apic),
+            Some(mode) => (mode, super::apicmode::LocalApic::XApic),
+            None => (apic_mode, apic),
+        };
+        let record = record_partition();
         // SAFETY: an i32 property value for LocalApicEmulationMode.
         unsafe {
             ffi::set_partition_property(
@@ -833,7 +875,24 @@ fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
         {
             supported = 0;
         }
-        let exits_bits = super::debug::extended_vm_exits(supported);
+        let mut exits_bits = super::debug::extended_vm_exits(supported);
+        // An x2APIC partition exits on the guest's #GP (`gp`): without
+        // exception exits its guest's TSC-deadline LVT timer write would be
+        // a #GP, so a host that does not offer them fails the VM, named.
+        if apic == super::apicmode::LocalApic::X2Apic && !record {
+            if supported & super::debug::EXITS_EXCEPTION == 0 {
+                ffi::report(
+                    log::Level::Error,
+                    &format!(
+                        "whp: this host's WHP offers no exception exits (ExtendedVmExits {supported:#x}, ExceptionExit \
+                         bit 2), which its x2APIC partition needs to finish the guest's TSC-deadline LVT timer write \
+                         (a #GP from WHP's x2APIC)"
+                    ),
+                );
+                return err(libc::ENOTSUP);
+            }
+            exits_bits |= super::debug::EXITS_EXCEPTION;
+        }
         #[cfg(test)]
         let exits_bits = exits_bits | (EXTRA_EXITS_FOR_TESTS.get() & supported);
         // SAFETY: a u64 value for ExtendedVmExits.
@@ -865,16 +924,42 @@ fn configure(part: WHV_PARTITION_HANDLE) -> Result<()> {
         ffi::hr_of("WHvSetPartitionProperty", hres, || "CpuidExitList".into())?;
         // SAFETY: completes partition setup.
         let hres = unsafe { whv::WHvSetupPartition(part) };
-        ffi::hr_of("WHvSetupPartition", hres, String::new)
+        ffi::hr_of("WHvSetupPartition", hres, String::new)?;
+        // The #GP exit, before any vCPU runs ([`Exits`]: changed only with
+        // every vCPU out of the guest).
+        if apic == super::apicmode::LocalApic::X2Apic && !record {
+            // SAFETY: a u64 value for ExceptionExitBitmap; no vCPU exists.
+            unsafe {
+                ffi::set_partition_property(part, whv::WHvPartitionPropertyCodeExceptionExitBitmap, &GP_EXIT)?;
+            }
+        }
+        Ok(apic)
+}
+
+/// The exception exit bitmap's #GP (`gp`).
+const GP_EXIT: u64 = 1 << super::gp::GP_VECTOR;
+
+/// Whether this thread's VMs are a record test's, made in the local APIC
+/// mode it asked for and with the exception exits it sets itself
+/// (`APIC_MODE_FOR_TESTS`).
+fn record_partition() -> bool {
+    #[cfg(test)]
+    return APIC_MODE_FOR_TESTS.get().is_some();
+    #[cfg(not(test))]
+    false
 }
 
 impl VmInner {
     /// The state of a VM whose partition `part` is configured and set up
     /// ([`make_partition`]).
-    fn setup(part: WHV_PARTITION_HANDLE) -> Result<VmInner> {
+    fn setup(part: WHV_PARTITION_HANDLE, apic: super::apicmode::LocalApic) -> Result<VmInner> {
         let stop_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(io_err)?;
+        // A record test's x2APIC partition has no #GP exit of the
+        // backend's (`configure`).
+        let base = if apic == super::apicmode::LocalApic::X2Apic && !record_partition() { GP_EXIT } else { 0 };
         Ok(VmInner {
             part,
+            apic,
             memory: Mutex::new(HashMap::new()),
             ioevents: RwLock::new(Vec::new()),
             irqfds: Mutex::new(Vec::new()),
@@ -892,7 +977,7 @@ impl VmInner {
             halt_wake: (Mutex::new(0), Condvar::new()),
             request_failure: AtomicI32::new(0),
             populate_failure: AtomicI32::new(0),
-            bp_window: (Mutex::new(Exits::default()), Condvar::new()),
+            bp_window: (Mutex::new(Exits { base, written: (base != 0).then_some(base), ..Exits::default() }), Condvar::new()),
             bp_owner: AtomicI64::new(-1),
         })
     }

@@ -366,6 +366,15 @@ upstream Firecracker and its jailer.
   ([CONTRIBUTING.md](CONTRIBUTING.md#fuzzing)), as do the interrupt controller the WHP run loop hands a
   guest's port and MMIO accesses to (`whp_irqchip`) and the WHP run loop's decoding of a vCPU exit (`whp_exit`). The run loops' own steps, which call Hypervisor.framework
   (`hv_vcpu_run`) or WHP, are not fuzzed.
+- **The WHP x2APIC partition's #GP exit (AMD hosts).** Every guest #GP, at any privilege level, leaves the
+  hypervisor to the vCPU's run loop (`gp`), so a guest can make such exits at will (a ring-3 privileged
+  instruction). The handler decodes at most 15 bytes from the exit context and reads at most three of the vCPU's own
+  registers; it takes no lock another vCPU or the VMM's thread waits on, and neither allocates nor logs, so a storm
+  of them costs that vCPU's thread, which runs under the jail's CPU limit like any guest work, as a guest's busy loop
+  does. KVM intercepts every #GP the same way when `enable_vmware_backdoor` is set (Linux v6.1
+  arch/x86/kvm/vmx/vmx.c 791, 5091-5103). The decode and the merge are unit-tested on every host (fuzz crate
+  `whp_gp`); the storm's isolation (another vCPU's rate, the API's latency, the job's CPU accounting) is not
+  measured yet, and nothing of it has run on Windows yet.
 - **Side channels** between VMs on the same host follow upstream's
   [production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md)
   guidance on Linux; the equivalent guidance for macOS and Windows hosts is not written yet.
