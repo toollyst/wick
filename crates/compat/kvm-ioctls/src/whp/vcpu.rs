@@ -4713,6 +4713,12 @@ mod fpu_tests {
     /// `MMIO_PROGRAM`, each exception's gate a `MMIO_FAULTS` stub; the
     /// vCPU in long mode there.
     fn mmio_guest(program: &[u8]) -> (super::super::VmFd, VcpuFd, *mut u8) {
+        mmio_guest_with(program, |_| {})
+    }
+
+    /// [`mmio_guest`], with `prepare` run on the guest's memory once it is
+    /// written and before the VM maps it.
+    fn mmio_guest_with(program: &[u8], prepare: impl FnOnce(*mut u8)) -> (super::super::VmFd, VcpuFd, *mut u8) {
         let vm = super::super::VmFd::create().unwrap();
         let m = guest();
         let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
@@ -4747,6 +4753,7 @@ mod fpu_tests {
             ],
         );
         put(m, MMIO_PROGRAM, program);
+        prepare(m);
         let region = kvm_bindings::kvm_userspace_memory_region {
             slot: 0,
             flags: 0,
@@ -5840,6 +5847,185 @@ mod fpu_tests {
         assert!(lost.is_empty(), "interrupts lost to a page set: {lost:?}");
         assert!(loops >= 10, "the guest's loop did not run: {exits:?}");
         assert_eq!((requested, delivered, lost_now), (REQUESTS, REQUESTS, 0), "the concurrent MSIs");
+    }
+
+    /// A 2 MiB chunk of userfaultfd-registered guest RAM discarded whole,
+    /// its section swapped (`libc::windows_mm::uffd_swap_chunk`), while a
+    /// vCPU and a host thread use it: neither ever sees memory that is not
+    /// the handler's fill or the writer's own, and the writer's write reads
+    /// back. The guest's RAM (4 MiB) registered before the VM maps it, as
+    /// Firecracker registers it; a handler thread fills each faulted page
+    /// with qwords `0xF << 60 | round`; the host writer writes `0xA << 60 |
+    /// seq` to the first qword of pages of the chunk and reads it back
+    /// (checked when no discard overlapped the two); the guest, asked by
+    /// round through a mailbox, reads every page's first qword of the chunk
+    /// (GPA 2-4 MiB) and counts those that are neither (`bad`), and the
+    /// least fill round it saw. Each of `ROUNDS` rounds: the fill round set,
+    /// the scan asked for, and the chunk discarded at once, racing the scan
+    /// and the writer; then `bad` 0 and the least round at least the one
+    /// before. Last, with the writer stopped, a discard and a scan that see
+    /// only this round's fill. Asserted; SWAPSTRESS lines.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_chunk_swapped_under_a_vcpu_and_a_host_writer_keeps_their_memory() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        const MAILBOX: u64 = 0x7000;
+        const CHUNK: u64 = 2 << 20;
+        const ROUNDS: u64 = 100;
+        const FILL: u64 = 0xF << 60;
+        const WRITE: u64 = 0xA << 60;
+        // The scan (see the doc), at MMIO_PROGRAM; `out 0x85` after each,
+        // `out 0x86` once the mailbox says to quit.
+        const SCAN: [u8; 147] = [
+            0x48, 0x8B, 0x04, 0x25, 0x28, 0x70, 0x00, 0x00, 0x48, 0x85, 0xC0, 0x74, 0x04, 0xE6, 0x86, 0xEB, 0xFC, 0x48,
+            0x8B, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00, 0x48, 0x3B, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00, 0x74, 0xDD, 0xBB,
+            0x00, 0x00, 0x20, 0x00, 0x31, 0xC9, 0x45, 0x31, 0xC0, 0x48, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF, 0x48, 0x8B,
+            0x33, 0x48, 0x89, 0xF7, 0x48, 0xC1, 0xEF, 0x3C, 0x83, 0xFF, 0x0F, 0x75, 0x0C, 0x89, 0xF7, 0x48, 0x39, 0xD7,
+            0x73, 0x12, 0x48, 0x89, 0xFA, 0xEB, 0x0D, 0x83, 0xFF, 0x0A, 0x75, 0x05, 0x49, 0xFF, 0xC0, 0xEB, 0x03, 0x48,
+            0xFF, 0xC1, 0x48, 0x81, 0xC3, 0x00, 0x10, 0x00, 0x00, 0x48, 0x81, 0xFB, 0x00, 0x00, 0x40, 0x00, 0x72, 0xC8,
+            0x48, 0x89, 0x0C, 0x25, 0x10, 0x70, 0x00, 0x00, 0x48, 0x89, 0x14, 0x25, 0x18, 0x70, 0x00, 0x00, 0x4C, 0x89,
+            0x04, 0x25, 0x20, 0x70, 0x00, 0x00, 0x48, 0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00, 0xE6, 0x85, 0xE9, 0x6D,
+            0xFF, 0xFF, 0xFF,
+        ];
+        let say = |l: String| eprintln!("SWAPSTRESS {l}");
+        let mut uffd = None;
+        let (vm, vcpu, m) = mmio_guest_with(&SCAN, |m| {
+            // The mailbox resident (written), so it is not missing.
+            put(m, MAILBOX, &[0u8; 64]);
+            let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+            libc::wick_uffd::register(ctx, m as u64, MEM as u64).unwrap();
+            uffd = Some((ctx, user));
+        });
+        let (ctx, user) = uffd.unwrap();
+        let at = m as usize;
+        let chunk = at as u64 + CHUNK;
+        // SAFETY: guest memory, mapped until the end.
+        let mailbox = move |i: u64| unsafe { &*((at + (MAILBOX + 8 * i) as usize) as *const AtomicU64) };
+        let fill_round = Arc::new(AtomicU64::new(0));
+        // Odd while a discard runs.
+        let discards = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        // The handler: each page fault filled with this round's qwords.
+        let handler = {
+            let fill_round = Arc::clone(&fill_round);
+            std::thread::spawn(move || {
+                let mut faults = 0u64;
+                let mut rec = [0u8; libc::wick_uffd::proto::RECORD];
+                loop {
+                    let mut got = 0;
+                    while got < rec.len() {
+                        // SAFETY: a buffer of the length given.
+                        let n = unsafe { libc::read(user, rec[got..].as_mut_ptr().cast(), rec.len() - got) };
+                        if n <= 0 {
+                            return faults;
+                        }
+                        got += n.unsigned_abs();
+                    }
+                    let word = |i: usize| u64::from_le_bytes(rec[i * 8..i * 8 + 8].try_into().unwrap());
+                    if word(0) != libc::wick_uffd::proto::EVENT_PAGEFAULT {
+                        continue;
+                    }
+                    let page = word(1) & !0xfff;
+                    let v = FILL | fill_round.load(Ordering::SeqCst);
+                    let data: Vec<u8> = std::iter::repeat_n(v.to_le_bytes(), 512).flatten().collect();
+                    // SAFETY: a page-sized buffer; EEXIST if another fill came first.
+                    let _ = unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), page, 4096, true) };
+                    faults += 1;
+                }
+            })
+        };
+        // The host writer.
+        let writer = {
+            let (discards, stop) = (Arc::clone(&discards), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let (mut writes, mut lost) = (0u64, Vec::new());
+                let mut seq = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    seq += 1;
+                    let page = chunk + (seq * 37 % 512) * 4096;
+                    let before = discards.load(Ordering::SeqCst);
+                    let v = WRITE | seq;
+                    // SAFETY: guest RAM, mapped until the end; a missing page
+                    // faults and waits for the handler's fill.
+                    let back = unsafe {
+                        std::ptr::write_volatile(page as *mut u64, v);
+                        std::ptr::read_volatile(page as *const u64)
+                    };
+                    writes += 1;
+                    if before % 2 == 0 && discards.load(Ordering::SeqCst) == before && back != v && lost.len() < 8 {
+                        lost.push(format!("{:#x}: wrote {v:#x}, read {back:#x}", page - chunk));
+                    }
+                }
+                (writes, lost)
+            })
+        };
+        // The vCPU, scanning when asked.
+        let runner = std::thread::spawn(move || {
+            let mut vcpu = vcpu;
+            let mut reads = 0;
+            loop {
+                let e = one_run(&mut vcpu, &[], &mut reads);
+                if !e.starts_with("out 0x85") {
+                    return e;
+                }
+            }
+        });
+        let discard = || {
+            discards.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: the chunk of guest RAM, discarded.
+            let r = unsafe { libc::madvise(chunk as *mut libc::c_void, CHUNK as usize, libc::MADV_DONTNEED) };
+            discards.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(r, 0, "the chunk's discard");
+        };
+        // A scan of round `r`, asked for, with the chunk discarded at once if
+        // `race`: (bad, least fill round, the writer's values seen).
+        let scan = |r: u64, race: bool| {
+            fill_round.store(r, Ordering::SeqCst);
+            mailbox(0).store(r, Ordering::SeqCst);
+            if race {
+                discard();
+            }
+            let asked = std::time::Instant::now();
+            while mailbox(1).load(Ordering::SeqCst) != r {
+                assert!(asked.elapsed() < std::time::Duration::from_secs(20), "round {r}: the guest's scan did not end");
+                std::thread::yield_now();
+            }
+            (mailbox(2).load(Ordering::SeqCst), mailbox(3).load(Ordering::SeqCst), mailbox(4).load(Ordering::SeqCst))
+        };
+        let begun = std::time::Instant::now();
+        let mut problems = Vec::new();
+        let mut written = 0;
+        for r in 1..=ROUNDS {
+            let (bad, least, seen) = scan(r, true);
+            written += seen;
+            if bad != 0 || least < r - 1 {
+                problems.push(format!("round {r}: {bad} pages neither filled nor written, least fill round {least}"));
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        let (writes, lost) = writer.join().unwrap();
+        // Alone: a discard, then a scan that sees this round's fill only.
+        discard();
+        let (bad, least, seen) = scan(ROUNDS + 1, false);
+        say(format!(
+            "{ROUNDS} rounds in {:?}: the guest saw the writer's values {written} times, the writer wrote {writes} times, \
+             its write not read back {} times {lost:?}; problems {problems:?}; alone: bad {bad}, least round {least}, the \
+             writer's values {seen}",
+            begun.elapsed(),
+            lost.len()
+        ));
+        mailbox(5).store(1, Ordering::SeqCst);
+        let end = runner.join().unwrap();
+        // SAFETY: closes the user end: the handler's receive ends.
+        unsafe { libc::close(user) };
+        let faults = handler.join().unwrap();
+        say(format!("the vCPU's last exit {end}; the handler filled {faults} faults"));
+        assert!(problems.is_empty() && lost.is_empty(), "{problems:?} {lost:?}");
+        assert_eq!((bad, least, seen), (0, ROUNDS + 1, 0), "the scan alone");
+        assert!(end.starts_with("out 0x86"), "the vCPU ended with {end}");
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
     }
 
     /// The local APIC state of `vp` in both of WHP's formats, as lines: the

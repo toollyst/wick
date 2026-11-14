@@ -1174,6 +1174,10 @@ jobs:
           # another thread against the guest's writes (X2RMWREC lines).
           alone whp::vcpu::fpu_tests::test_a_page_set_loses_no_requested_interrupt
           alone whp::vcpu::fpu_tests::test_a_page_set_loses_no_requested_interrupt --release
+          # A 2 MiB chunk of userfaultfd guest RAM swapped (discarded
+          # whole) under a vCPU's scan and a host writer, 100 rounds
+          # (SWAPSTRESS lines).
+          alone whp::vcpu::fpu_tests::test_a_chunk_swapped_under_a_vcpu_and_a_host_writer_keeps_their_memory
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # The lazy-RAM grain (LAZYGRAIN lines): guest RAM mapped as
