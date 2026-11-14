@@ -184,10 +184,16 @@ namespace Wick {
     }
 
     // A Firecracker process: its serial console (stdout) and stderr collected
-    // as they come and copied to a log file, its stdin a pipe.
+    // as they come and copied to a log file, its stdin a pipe. The guest's
+    // command output (Sh) is the serial console's alone: Firecracker's own
+    // lines on stderr (the WHP backend's whp: lines among them) can come at
+    // any time, while a command runs too (PC 16i at df0bf87: vCPU 1's MSR
+    // lines in the output of the command that brought CPU 1 online), and
+    // are no part of what the guest printed. Output and WaitFor see both.
     public class Vm {
         Process p;
         StringBuilder text = new StringBuilder();
+        StringBuilder serial = new StringBuilder();
         StreamWriter log;
         Thread outPump, errPump;
         int seq;
@@ -224,14 +230,16 @@ namespace Wick {
             }
             outPump = new Thread(Pump);
             outPump.IsBackground = true;
-            outPump.Start(p.StandardOutput.BaseStream);
+            outPump.Start(new object[] { p.StandardOutput.BaseStream, true });
             errPump = new Thread(Pump);
             errPump.IsBackground = true;
-            errPump.Start(p.StandardError.BaseStream);
+            errPump.Start(new object[] { p.StandardError.BaseStream, false });
         }
 
         void Pump(object o) {
-            var s = (Stream)o;
+            var args = (object[])o;
+            var s = (Stream)args[0];
+            bool isSerial = (bool)args[1];
             var buf = new byte[65536];
             var dec = Encoding.UTF8.GetDecoder();
             var chars = new char[65536];
@@ -242,6 +250,7 @@ namespace Wick {
                     string t = new string(chars, 0, c).Replace("\r", "");
                     lock (text) {
                         text.Append(t);
+                        if (isSerial) serial.Append(t);
                         try { log.Write(t); } catch (Exception) { }
                         Monitor.PulseAll(text);
                     }
@@ -254,6 +263,9 @@ namespace Wick {
 
         public string Output { get { lock (text) { return text.ToString(); } } }
         public int Length { get { lock (text) { return text.Length; } } }
+        // The serial console's output alone, and its length.
+        public string SerialOutput { get { lock (text) { return serial.ToString(); } } }
+        public int SerialLength { get { lock (text) { return serial.Length; } } }
         public bool Exited { get { return p.HasExited; } }
         public int ExitCode { get { return p.ExitCode; } }
 
@@ -280,11 +292,20 @@ namespace Wick {
 
         // The first match of `pattern` in the output from offset `start`.
         public Match WaitFor(string pattern, int ms, int start) {
+            return WaitIn(text, pattern, ms, start);
+        }
+
+        // The same in the serial console's output alone.
+        public Match WaitForSerial(string pattern, int ms, int start) {
+            return WaitIn(serial, pattern, ms, start);
+        }
+
+        Match WaitIn(StringBuilder from, string pattern, int ms, int start) {
             var re = new Regex(pattern, RegexOptions.Multiline);
             var until = DateTime.UtcNow.AddMilliseconds(ms);
             lock (text) {
                 while (true) {
-                    var m = re.Match(text.ToString(), Math.Min(start, text.Length));
+                    var m = re.Match(from.ToString(), Math.Min(start, from.Length));
                     if (m.Success) return m;
                     bool dead = p.HasExited && !outPump.IsAlive && !errPump.IsAlive;
                     if (dead) throw new Failure("waiting for /" + pattern + "/: Firecracker " + ExitReason());
@@ -301,10 +322,10 @@ namespace Wick {
         public void Shell(int ms) {
             var until = DateTime.UtcNow.AddMilliseconds(ms);
             while (true) {
-                int mark = Length;
+                int mark = SerialLength;
                 try {
                     Send("echo READY-$((20+22))");
-                    WaitFor("^READY-42$", 2000, mark);
+                    WaitForSerial("^READY-42$", 2000, mark);
                     break;
                 } catch (Failure) {
                     if (p.HasExited || DateTime.UtcNow > until) throw;
@@ -320,10 +341,10 @@ namespace Wick {
         public int Sh(string cmd, int ms, bool mustSucceed, out string output) {
             seq++;
             string tag = "K" + seq + "Z";
-            int mark = Length;
+            int mark = SerialLength;
             Send(cmd + "; echo RC=$?:" + tag);
-            var m = WaitFor("^(.*?)RC=(\\d+):" + tag + "$", ms, mark);
-            string all = Output;
+            var m = WaitForSerial("^(.*?)RC=(\\d+):" + tag + "$", ms, mark);
+            string all = SerialOutput;
             string region = all.Substring(mark, m.Index - mark);
             // The tty's echo of the command line comes first.
             string echo = "echo RC=$?:" + tag + "\n";
@@ -2109,6 +2130,8 @@ function Stage-Smp {
     Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $state; mem_file_path = $mem }) | Out-Null
     Save-Dmesg $vm 'smp'
     $vm.Kill()
+    # Its MSR lines are all in by now: the pumps are joined.
+    $msrsBooted = Get-UnkeptMsrs $vm
     $vm = Start-Vm 'smp-restored' $null -Api
     Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
         snapshot_path = $state
@@ -2126,7 +2149,7 @@ function Stage-Smp {
     $vm.Drain(2000)
     $msrs = Get-UnkeptMsrs $vm
     Remove-Item $state, $mem -ErrorAction SilentlyContinue
-    return "2 vCPUs online, work runs on each, clock agrees across vCPUs, TSCs agree (after boot: $warp; after the restore: $warpRestored), CPU 1 offline and online 3 times then working, after boot and after a snapshot restore (spurious LAPIC timer interrupts: $spurious, $spuriousRestored), reset exits 0; MSRREC the MSRs the backend does not keep that the restored guest reached: $msrs"
+    return "2 vCPUs online, work runs on each, clock agrees across vCPUs, TSCs agree (after boot: $warp; after the restore: $warpRestored), CPU 1 offline and online 3 times then working, after boot and after a snapshot restore (spurious LAPIC timer interrupts: $spurious, $spuriousRestored), reset exits 0; MSRREC the MSRs the backend does not keep that the booted guest reached: $msrsBooted; that the restored guest reached: $msrs"
 }
 
 function Stage-Block {
