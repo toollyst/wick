@@ -11,7 +11,7 @@ rootfs; on Windows, by [`tools/windows/boot-test.ps1`](../tools/windows/boot-tes
 | --- | --- | --- |
 | M1 | [Foundation](#m1-foundation) | done |
 | M2 | [macOS: Hypervisor.framework, aarch64 guests](#m2-macos-hypervisorframework-aarch64-guests) | in progress: the GDB stub is left |
-| M3 | [Windows: first boot on real hardware](#m3-windows-first-boot-on-real-hardware) | in progress: the four stages outside `all` on the PC at one commit, and At a glance's hugepages and seccomp rows, are left |
+| M3 | [Windows: first boot on real hardware](#m3-windows-first-boot-on-real-hardware) | in progress: `foreign-snapshot` and `diff-nospace` (elevated) on the PC at the commit of a run that passes `all`, `gdb` and `linux-snapshot` (as at b4717ec), and At a glance's hugepages and seccomp rows, are left |
 | M4 | [Linux: upstream parity](#m4-linux-upstream-parity) | in progress |
 | M5 | [Security parity: the jailer on every host](#m5-security-parity-the-jailer-on-every-host) | in progress |
 | M6 | [Images everywhere](#m6-images-everywhere) | planned |
@@ -79,11 +79,14 @@ What is left on macOS: upstream's own gdb test, which its aarch64 debug kernel k
 **Done when** `tools/windows/boot-test.ps1` passes every stage on a real Windows PC with the Windows Hypervisor
 Platform, and the Windows column of [At a glance](#at-a-glance) says "works" for each row it covers.
 
-**Not done yet, by its own terms.** All 20 stages of `boot-test.ps1 all` passed on the PC at 4999ff6, 43832df and
-87d0328, but the four stages `all` leaves out (`tools/windows/boot-test.ps1`, `$NotInAll`) have not passed on the
-PC at one recent commit: `gdb` last passed there on kit 7952d31 and `foreign-snapshot` on kit 8d577b7,
-`diff-nospace` (elevated) has passed only in CI (run 43442912128, 861d365), and `linux-snapshot` has run only in
-CI's windows-guest job. And At a glance's Windows column describes the hugepages and seccomp rows rather than
+**Not done yet, by its own terms.** All 20 stages of `boot-test.ps1 all` passed on the PC at 4999ff6, 43832df,
+87d0328, b4717ec and 305a806, and at b4717ec `gdb` (through a TCP relay, as MSYS2's gdb 18.1 does not reach a Unix
+socket by its path) and `linux-snapshot` with CI run 43516077140's artifact (REFUSED at the load, `KVM_SET_CPUID2`)
+passed there too (unelevated; PC step 13d at b4717ec). Of the four stages `all` leaves out
+(`tools/windows/boot-test.ps1`, `$NotInAll`), `foreign-snapshot` last passed on the PC on kit 8d577b7 (it needs a
+state file made on another host) and `diff-nospace` (elevated) has passed only in CI (run 43442912128, 861d365, and
+the windows-guest jobs of 14 saved runs from 43486495448, 3393774, to 43620205345, d460d92, an Intel one among them:
+43601688987). And At a glance's Windows column describes the hugepages and seccomp rows rather than
 saying "works". M3 is done when one PC run at a single commit passes `all`, `diff-nospace` elevated, `gdb`,
 `foreign-snapshot` and `linux-snapshot` with CI's artifact (a refusal it records counts as the stage passing, as
 its row in docs/COMPATIBILITY.md says), and those two rows say "works" for what the run covered.
