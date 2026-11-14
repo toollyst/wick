@@ -282,9 +282,12 @@ upstream Firecracker and its jailer.
   (`test_a_wholly_discarded_chunk_gives_its_section_commit_back`, passed in CI run 43545368906, 305a806). A page discarded in a chunk not discarded whole
   (balloon inflation's scattered pages) keeps its section page committed (a SEC_RESERVE page cannot be decommitted)
   and its charge with it, so that what the jail is charged is never less than the host commit it holds
-  (`test_registered_memory_is_charged_as_it_is_filled`; passed in CI run 43545368906, 305a806, and each saved run since). At the limit such pages are
-  reclaimed before a charge is refused, as Linux's memory cgroup reclaims: their chunks are moved into new sections
-  and their commit and charge given back (the memory.max row). Not before a commit made at once (`MAP_POPULATE`, a
+  (`test_registered_memory_is_charged_as_it_is_filled`; passed in CI run 43545368906, 305a806, and each saved run since). A reclaim of
+  such pages before a charge is refused at the limit, as Linux's memory cgroup reclaims, moving their chunks into new
+  sections, is written but does not work yet on a real job limit: the move's own map of a view of its new section
+  is refused with `ERROR_COMMITMENT_LIMIT` when the job has no room (CI run 43640510155), so at the limit a fill is
+  refused and a lazy touch ends the VMM with 137, the dead pages still charged; not done yet (the memory.max row).
+  Not before a commit made at once (`MAP_POPULATE`, a
   private file mapping's read, a `MAP_FIXED` recommit, a discard of private memory that is not lazy, a committing
   `mprotect`) or an allocation of the VMM's own (its heap, a thread's stack): those are refused at the limit with no
   reclaim first (`ENOMEM`, or the process ends), not done yet; the limit holds either way. A move holds its live
@@ -298,8 +301,8 @@ upstream Firecracker and its jailer.
   `mem_backend: Uffd` row;
   `test_a_discard_waits_for_a_read_in_flight_on_its_range`, `test_a_blocking_read_does_not_hold_a_discard`; passed
   in CI runs 43612093006, 8ff63d4, and 43616040593, 5e3727d). Firecracker never met it, its devices' calls and the balloon's discards running on one thread; the
-  wait is for the reclaim at the limit, which moves chunks on whichever thread touched memory there (a vCPU's among
-  them), and other users of the compat libc.
+  wait is for the reclaim at the limit, which would move chunks on whichever thread touched memory there (a vCPU's
+  among them; not working yet at a real job limit), and other users of the compat libc.
 
   Sections made around wick (a compromised Firecracker's) are counted by the jailer
   (overlay/jailer/platform/windows/commit.rs): every 1 ms, over the job's processes, private commit plus section

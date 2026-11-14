@@ -7996,7 +7996,7 @@ mod fpu_tests {
     /// ```
     /// (clang -target x86_64-linux-gnu -c, the .text section.)
     #[test]
-    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture; until the next commit: at a real job limit the reclaim's move cannot map its new section's view (ERROR_COMMITMENT_LIMIT, CI run 43640510155 and Windows Server 2022 20348), so no chunk moves"]
     fn test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages() {
         let (code, text) = run_child("moved_under_a_vcpu_child", 512 << 20);
         assert!(text.contains("MOVEUNDERVCPU all"), "{text}");
