@@ -10948,7 +10948,11 @@ mod fpu_tests {
     ///   that RDMSR came to the backend. A guest's read of 0x10a that
     ///   comes to the backend can be given a vCPU's own value, as KVM
     ///   keeps one (`vcpu->arch.arch_capabilities`); one WHP answers
-    ///   cannot.
+    ///   cannot. Asserted: 0x10a and 2 end both calls; 0xce and 0x8b, which
+    ///   the vCPU keeps as KVM does (`kvmmsr::Kept`), are one entry each,
+    ///   and the guest's RDMSR and WRMSR of them are KVM's (CI run
+    ///   43631245976 at 25bbec9 showed them so, and failed on this test's
+    ///   older assertion that they end the call).
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_what_a_cpu_template_changes_on_record() {
@@ -11067,8 +11071,28 @@ mod fpu_tests {
                  value {value:#x}, intercepts at the backend {read_came}; its wrmsr of that value: {wrote}, intercepts \
                  {write_came}"
             );
-            if matches!(index, 0x10a | 0xce | 0x8b | 0x2) {
-                assert_eq!((got.map(|g| g.0).ok(), set.ok()), (Some(0), Some(0)), "{index:#x}: an MSR kept nowhere ends the call");
+            let calls = (got.map(|g| g.0).ok(), set.ok());
+            match index {
+                // KVM has no case for MSR 2 (`ignore_msrs` off: x86.c
+                // `kvm_get_msr_ignored_check`, `kvm_set_msr_ignored_check`),
+                // and keeps 0x10a per vCPU where no WHP register holds it
+                // (the Static CPU templates row): both end the call here.
+                0x10a | 0x2 => assert_eq!(calls, (Some(0), Some(0)), "{index:#x}: an MSR kept nowhere ends the call"),
+                // KVM's host-initiated access to PLATFORM_INFO (v6.1
+                // x86.c:4208-4213; a write of 0, without CPUID_FAULT, while
+                // CPUID faulting is off, x86.c:3832-3838) and UCODE_REV
+                // (x86.c:3993-3995, 3560-3563), which the vCPU keeps
+                // (`kvmmsr::Kept`): one entry each.
+                0xce | 0x8b => assert_eq!(calls, (Some(1), Some(1)), "{index:#x}: KVM_GET_MSRS and KVM_SET_MSRS, as KVM's host access"),
+                _ => {}
+            }
+            // The guest's: PLATFORM_INFO read (guest_can_read_msr_platform_info
+            // is true by default, x86.c:12406) and its write #GP
+            // (x86.c:3832-3836); UCODE_REV read and its write dropped
+            // (x86.c:3560-3563). Each the value the host set, 0.
+            if matches!(index, 0xce | 0x8b) {
+                let write = if index == 0xce { "#GP" } else { "done" };
+                assert_eq!((how.as_str(), value, wrote.as_str()), ("done", 0, write), "{index:#x}: a guest's rdmsr and wrmsr, as KVM's");
             }
         }
 
