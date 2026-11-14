@@ -53,6 +53,52 @@ thread_local! {
     /// cost, which its record sets against today's
     /// (`test_a_first_touch_of_lazy_ram_by_way_on_record`).
     pub(crate) static POPULATE_ONLY_HUGE_PAGES_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What this thread's holds of the VM's vCPUs cost, summed over them
+    /// (`VmInner::with_time_stopped`, `vcpu::hold_vcpus`): a record test
+    /// zeroes it and reads it around a guest's held writes (X2HOLDREC e).
+    pub(crate) static HOLD_COST: std::cell::Cell<HoldCost> = const { std::cell::Cell::new(HoldCost::ZERO) };
+}
+
+/// The cost of holds of a VM's vCPUs, split ([`HOLD_COST`]): the holds,
+/// and the nanoseconds of each step of [`VmInner::with_time_stopped`]
+/// (taking the exception exits; every other vCPU out of the guest; the
+/// partition time's suspend and resume; the caller's work; the release),
+/// and of the wait for the vCPUs out of the guest, how many of them were
+/// in their run call when it looked, the cancels it made and the sleeps it
+/// took between them.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HoldCost {
+    pub holds: u64,
+    pub take_ns: u64,
+    pub out_ns: u64,
+    pub time_ns: u64,
+    pub work_ns: u64,
+    pub release_ns: u64,
+    pub in_run: u64,
+    pub cancels: u64,
+    pub sleeps: u64,
+}
+
+#[cfg(test)]
+impl HoldCost {
+    pub(crate) const ZERO: HoldCost =
+        HoldCost { holds: 0, take_ns: 0, out_ns: 0, time_ns: 0, work_ns: 0, release_ns: 0, in_run: 0, cancels: 0, sleeps: 0 };
+
+    /// Adds `f`'s change to this thread's [`HOLD_COST`].
+    pub(crate) fn add(f: impl FnOnce(&mut HoldCost)) {
+        HOLD_COST.with(|c| {
+            let mut v = c.get();
+            f(&mut v);
+            c.set(v);
+        });
+    }
+}
+
+/// Nanoseconds since `t`, for [`HoldCost`].
+#[cfg(test)]
+fn ns_since(t: std::time::Instant) -> u64 {
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 use super::guest_mem::{self, Slot};
 use super::irqchip::{Irqchip, MsiRoutes};
@@ -509,23 +555,53 @@ impl VmInner {
     /// Called from a vCPU's run loop, out of the guest; takes the
     /// `bp_window` lock only to change the holder.
     pub(crate) fn with_time_stopped<T>(&self, immediate_exit: &AtomicU8, f: impl FnOnce() -> Result<T>) -> Option<Result<T>> {
+        #[cfg(test)]
+        let begun = std::time::Instant::now();
         if !self.take_exits(OWNER_ALL, Some(immediate_exit)) {
             return None;
         }
+        #[cfg(test)]
+        let (taken, out) = (ns_since(begun), std::time::Instant::now());
         super::vcpu::hold_vcpus(self, None);
+        #[cfg(test)]
+        let (out, suspend) = (ns_since(out), std::time::Instant::now());
         // SAFETY: the VM's partition.
         let hres = unsafe { whv::WHvSuspendPartitionTime(self.part) };
+        #[cfg(test)]
+        let (mut time, mut work) = (ns_since(suspend), 0);
         let result = ffi::hr_of("WHvSuspendPartitionTime", hres, || "to hold the VM's vCPUs (a guest's TSC or LVT timer write)".into()).and_then(|()| {
+            #[cfg(test)]
+            let working = std::time::Instant::now();
             let done = f();
+            #[cfg(test)]
+            let resume = {
+                work = ns_since(working);
+                std::time::Instant::now()
+            };
             // SAFETY: the VM's partition, whose time this call suspended.
             let hres = unsafe { whv::WHvResumePartitionTime(self.part) };
+            #[cfg(test)]
+            {
+                time += ns_since(resume);
+            }
             done.and_then(|v| ffi::hr_of("WHvResumePartitionTime", hres, String::new).map(|()| v))
         });
+        #[cfg(test)]
+        let release = std::time::Instant::now();
         let (lock, cv) = &self.bp_window;
         let exits = lock.lock().unwrap();
         self.bp_owner.store(-1, Ordering::SeqCst);
         drop(exits);
         cv.notify_all();
+        #[cfg(test)]
+        HoldCost::add(|c| {
+            c.holds += 1;
+            c.take_ns += taken;
+            c.out_ns += out;
+            c.time_ns += time;
+            c.work_ns += work;
+            c.release_ns += ns_since(release);
+        });
         Some(result)
     }
 

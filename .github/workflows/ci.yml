@@ -1217,12 +1217,21 @@ jobs:
           # another thread, every interrupt taken; and its cost with 0, 1
           # and 15 other vCPUs, a record the watchdog's 5 s may end (X2HOLD
           # and X2HOLDREC lines; run 43627299415: 8.5 ms a write with 15
-          # others on this runner's 4 logical processors). Records a and
-          # a2: an MSI in every window, one vector (merges counted, and the
-          # windows after which requests came back together) and a vector
-          # each (a request in flight at a window followed to its taking).
+          # others on this runner's 4 logical processors), split by the
+          # hold's steps (X2HOLDREC e split), with 3 others too. Records a
+          # and a2: an MSI in every window, one vector (merges, and the
+          # windows that found it pending in the page's IRR, read 4 bytes
+          # a word apart as the legacy page keeps it) and a vector each (a
+          # request in flight at a window followed to its taking).
           alone whp::vcpu::fpu_tests::test_a_held_lvt_timer_write_loses_no_interrupt
           alone whp::vcpu::fpu_tests::test_a_held_lvt_timer_write_loses_no_interrupt --release
+          # Option E-ii's interrupt latency (X2LATREC lines): where the
+          # legacy page keeps the IRR and ISR; the entries and microseconds
+          # from a request's return to its taking, with held writes and
+          # with an OUT loop's controls; a TMICT write in TSC-deadline mode;
+          # which LVT timer writes WHP refuses with a #GP.
+          alone whp::vcpu::fpu_tests::test_a_held_lvt_timer_writes_interrupt_latency_on_record
+          alone whp::vcpu::fpu_tests::test_a_held_lvt_timer_writes_interrupt_latency_on_record --release
           # A 2 MiB chunk of userfaultfd guest RAM swapped (discarded
           # whole) under a vCPU's scan and a host writer, 100 rounds
           # (SWAPSTRESS lines).
