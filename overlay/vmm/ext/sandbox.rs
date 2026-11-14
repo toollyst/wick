@@ -4196,7 +4196,6 @@ mod macos {
         // "Resource busy" for a device that reuses another's TAP. A stale
         // name, which the run phase does not replace, stays EADDRINUSE.
         #[test]
-        #[ignore = "fails until a running microVM's bind tells a name in use from a stale one (the next commit)"]
         fn test_a_hotplugged_name_in_use_is_busy() {
             let pid = std::process::id().to_string();
             let out = child("endpoint_busy_child", &[("WICK_TEST_CASE", &pid)]);
@@ -4428,8 +4427,13 @@ mod macos {
             assert_eq!(bind(&dir, "early").0, 0, "{}", std::io::Error::last_os_error());
             println!("SETUP-BIND-OK");
             if case.ends_with("-stale") {
-                // A process that died left its socket file at the path.
-                assert_eq!(bind(&dir, "late").0, 0, "{}", std::io::Error::last_os_error());
+                // A process that died left its socket file at the path: a
+                // socket bound and closed (one still open is in use, EBUSY:
+                // test_a_hotplugged_name_in_use_is_busy).
+                let (ret, fd) = bind(&dir, "late");
+                assert_eq!(ret, 0, "{}", std::io::Error::last_os_error());
+                // SAFETY: the descriptor bound above, owned by nothing else.
+                unsafe { libc::close(fd) };
             }
             narrow().unwrap();
             println!("NARROWED");

@@ -274,8 +274,10 @@ pub(crate) fn dgram_socket() -> io::Result<OwnedFd> {
 /// Once the sandbox is narrowed (a device hot-plugged into a running
 /// microVM), a stale socket file is not replaced: removing it is setup's
 /// (`vmm::ext::sandbox`'s unlink rule), so the bind fails with
-/// `EADDRINUSE`, which the API reports, and the microVM runs on; that bind
-/// replaces nothing, so it takes no turn.
+/// `EADDRINUSE`, which the API reports, and the microVM runs on; a name in
+/// use is still `EBUSY`, as a TAP opened twice
+/// (`test_a_hotplugged_name_in_use_is_busy`); that bind replaces nothing,
+/// so it takes no turn.
 pub(crate) fn bind(sock: &OwnedFd, path: &Path) -> io::Result<()> {
     bind_at(sock, path, false)
 }
@@ -312,15 +314,18 @@ fn bind_at(sock: &OwnedFd, path: &Path, own: bool) -> io::Result<()> {
     };
     match try_bind() {
         Err(err) if err.raw_os_error() == Some(libc::EADDRINUSE) => {
-            if crate::ext::sandbox::narrowed() {
-                return Err(err);
-            }
             let probe = dgram_socket()?;
             // SAFETY: connect with a valid address.
             let ret =
                 unsafe { libc::connect(probe.as_raw_fd(), std::ptr::from_ref(&addr).cast(), len) };
             if ret == 0 {
                 return Err(io::Error::from_raw_os_error(libc::EBUSY));
+            }
+            // A running microVM replaces no stale name (removing it is
+            // setup's): a name in use is busy as above, a stale one fails
+            // the bind (`test_a_hotplugged_name_in_use_is_busy`).
+            if crate::ext::sandbox::narrowed() {
+                return Err(err);
             }
             match io::Error::last_os_error().raw_os_error() {
                 Some(libc::ECONNREFUSED) => std::fs::remove_file(path)?,
