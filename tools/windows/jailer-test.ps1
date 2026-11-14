@@ -191,9 +191,22 @@ function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(),
     $vm
 }
 
+# Waits until the guest's shell answers, as boot-test.ps1's Shell does, then
+# clears its prompt. Input typed before the shell runs is echoed by the tty
+# at once and read later, so the shell's first prompt ("# ") then comes before
+# the next answer on its line, where Sh looks for the answer at a line's
+# start: run 43528910212's cpu stage, boot 4 under cpu.max=25000 100000,
+# echoed PS1=, the mount and the command, then printed "can't access tty",
+# then "# Q35a8af2Q35a8af" (its answer, 2, behind the prompt), half a second
+# after "Run /bin/sh" not being enough for the shell to start.
 function Wait-Shell($vm) {
     Check ($vm.WaitFor('Run /bin/sh', 60)) "the jailed guest did not reach init: $(($vm.Text() -split "`n" | Select-Object -Last 5) -join ' | ')"
-    Start-Sleep -Milliseconds 500
+    $until = [DateTime]::Now.AddSeconds(60)
+    while ($true) {
+        $vm.Send('echo READY-$((20+22))')
+        if ($vm.WaitFor('(?m)^READY-42\r?$', 2)) { break }
+        Check ((-not $vm.P.HasExited) -and [DateTime]::Now -lt $until) "the jailed guest's shell did not answer within 60 s of init: $(($vm.Text() -split "`n" | Select-Object -Last 5) -join ' | ')"
+    }
     $vm.Send('PS1=')
     # reboot (systemd's) needs /proc.
     $vm.Send('mount -t proc proc /proc')
