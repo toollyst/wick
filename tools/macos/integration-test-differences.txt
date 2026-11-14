@@ -273,6 +273,19 @@ all arch integration_tests/functional/test_gdb.py::test_gdb_connects
 # datagram endpoint the harness uses carries plain frames.
 all impossible integration_tests/functional/test_net.py::test_tap_offload
 
+# Not an entry: no upstream test meets it. A host program's datagram for
+# the guest (a UDP forward, tools/macos/integration/netns-preload.c) goes
+# to the link-layer address the guest's own frames showed since its
+# endpoint was bound (tools/macos/integration/netns-slirp.c udp_to_guest,
+# forget), and one for a guest that has sent none yet is dropped, where
+# Linux's host asks by ARP and holds it (Linux v6.1 net/core/neighbour.c
+# __neigh_event_send :1243, the neighbour's arp_queue). Each upstream test
+# that sends UDP to the guest (test_net.py's test_high_ingress_traffic and
+# test_tap_offload, test_rate_limiter.py's UDP) reaches it by ssh first:
+# Microvm.start waits for ssh when the microVM has an interface, and
+# restore_from_snapshot when it resumes one (framework/microvm.py
+# wait_for_ssh_up), and each starts its server in the guest over ssh.
+
 # The test sizes a balloon from the RSS it measures (test_balloon.py:
 # 256 MiB minus get_resident_memory minus 50 MiB), so that the guest runs out
 # of memory when it dirties 128 MiB, and with deflate_on_oom the balloon
