@@ -1081,7 +1081,10 @@ mod tests {
     // an opener's turn waited for the jailer's lock, which the stand-in did
     // not hold), as the jailer's network runs only under root
     // (`jailer-test netns`); this needs none. The ACL is the jailer's alone:
-    // the stand-in's jail is of the network owner's uid.
+    // the stand-in's jail is of the network owner's uid. The stand-in's
+    // python writes nothing into the source tree (-B: no bytecode; CI runs
+    // this test as root, and a root-owned __pycache__ there failed the
+    // harness step's py_compile as the runner's user, run 43640510155).
     #[test]
     fn test_the_stand_in_jailer_arranges_a_network_as_the_jailer_does() {
         use std::os::unix::fs::PermissionsExt;
@@ -1094,9 +1097,24 @@ mod tests {
             print(os.environ['WICK_NETNS'])\n";
         let stand_in = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../tools/macos/integration/jailer");
         assert!(stand_in.is_file(), "{stand_in:?}");
+        // Every name under the stand-in's directory, with its owner and
+        // modification time: the same after the test.
+        fn tree(dir: &Path, out: &mut Vec<(PathBuf, u32, i64, i64)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                out.push((path.clone(), meta.uid(), meta.mtime(), meta.mtime_nsec()));
+                if meta.is_dir() {
+                    tree(&path, out);
+                }
+            }
+        }
+        let sources = stand_in.parent().unwrap().to_owned();
+        let mut before = Vec::new();
+        tree(&sources, &mut before);
         let join = |net: &Path| {
             let out = std::process::Command::new("python3")
-                .args(["-I", "-c", JOIN])
+                .args(["-I", "-B", "-c", JOIN])
                 .arg(&stand_in)
                 .arg(net)
                 .output()
@@ -1152,6 +1170,9 @@ mod tests {
         assert_eq!(state(&sub), (0o700, both.clone(), true));
         assert_eq!(state(&sn.join("a")), (0o700, both, true));
         drop((live, lock, fc));
+        let mut after = Vec::new();
+        tree(&sources, &mut after);
+        assert_eq!(after, before, "the stand-in's run changed the source tree");
     }
 
     // Two jails given one network: each has a directory of its own in it,

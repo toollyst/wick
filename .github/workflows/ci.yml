@@ -445,6 +445,20 @@ jobs:
           path: build/jailer-test/
           if-no-files-found: warn
           retention-days: 14
+      # What the steps run as root (the jailer's unit tests, the jailer
+      # scenarios) left in the source tree: nothing of root's, or the steps
+      # after, as the runner's user, cannot write there (run 43640510155: a
+      # root-owned tools/macos/integration/__pycache__ failed py_compile).
+      # build/ (the scenarios' logs) and the cargo target are outputs.
+      - name: No root-owned files in the source tree
+        if: success() || failure()
+        run: |
+          left=$(find . \( -path ./build -o -path ./lib/firecracker/build \) -prune -o -user 0 -print)
+          if [ -n "$left" ]; then
+            echo "root-owned files in the source tree after the root steps:"
+            echo "$left"
+            exit 1
+          fi
       # A state file made on Linux x86_64 by this run's linux-boot job is
       # refused here with upstream's error, before a VM is made (so it needs
       # no Hypervisor.framework). When linux-boot has failed there is no file:

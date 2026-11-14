@@ -325,7 +325,11 @@ pytest=("$ROOT/build/integration/venv/bin/python" -m pytest -p wick_macos --bina
 (ulimit -n 4096) 2>/dev/null || die "cannot set RLIMIT_NOFILE to 4096 (upstream's devtool runs pytest with nofile=4096:4096): the hard limit is $(ulimit -Hn)"
 set +e
 if [[ $mode == jailer ]]; then
-    (ulimit -n 4096 && ulimit -c 0 && cd "$ROOT/lib/firecracker/tests" && sudo env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
+    # As root nothing is written into the source tree: no bytecode, no
+    # pytest cache (a root-owned __pycache__ or .pytest_cache there would
+    # stop the user's own runs and py_compile from writing).
+    (ulimit -n 4096 && ulimit -c 0 && cd "$ROOT/lib/firecracker/tests" &&
+        sudo env PYTHONDONTWRITEBYTECODE=1 "${env_args[@]}" "${pytest[@]}" -p no:cacheprovider) 2>&1 | tee -a "$out/pytest.log"
 else
     (ulimit -n 4096 && ulimit -c 0 && cd "$ROOT/lib/firecracker/tests" && env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
 fi

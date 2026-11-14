@@ -50,7 +50,10 @@ spec = importlib.util.spec_from_file_location("bt", os.path.join(os.environ["ROO
 bt = importlib.util.module_from_spec(spec); spec.loader.exec_module(bt)
 bt.fetch(sys.argv[1], bt.KERNEL); bt.fetch(sys.argv[1], bt.ROOTFS)
 PY
-exec sudo python3 -I "$ROOT/tools/macos/jailer-test.py" \
+# -B: root writes no bytecode into the source tree (jailer-test.py imports
+# boot-test.py and jailer-cgroup-test.py by path), which would leave a
+# root-owned __pycache__ the user's own runs then cannot write.
+exec sudo python3 -I -B "$ROOT/tools/macos/jailer-test.py" \
     --jailer "$TARGET_DIR/$PROFILE/jailer" \
     --firecracker "$TARGET_DIR/$PROFILE/firecracker" \
     --uffd-handler "$TARGET_DIR/$PROFILE/examples/uffd_on_demand_handler" \
