@@ -423,7 +423,9 @@ enum Kind {
     /// `charge`: for anonymous shared memory, the commit that pays for its
     /// pages ([`Charge`]).
     View {
-        _section: Arc<Owned>,
+        /// None for a userfaultfd range's chunk, whose section handle is
+        /// closed once its views are mapped ([`uffd_alias`]).
+        _section: Option<Arc<Owned>>,
         file: Option<Arc<Owned>>,
         charge: Option<Arc<Charge>>,
         /// A released userfaultfd range's alias of the section, handed over
@@ -1704,7 +1706,7 @@ fn fill(
             None
         };
         Kind::View {
-            _section: section,
+            _section: Some(section),
             file,
             charge,
             alias: None,
@@ -2378,8 +2380,9 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
 /// bit 0) keep their content; the others read as zeros.
 ///
 /// With the exception handler (as anonymous shared memory, [`fill`]) the
-/// section is reserved (`SEC_RESERVE`, the second value returned) and
-/// charged ([`Charge`], registered for the view at `start`): the resident
+/// section is reserved (`SEC_RESERVE`, the second value returned), one per
+/// [`UFFD_CHUNK`] ([`uffd_alias_chunked`]), and charged ([`Charge`], one
+/// registered for each chunk's view): the resident
 /// pages are committed here with their charge, and every other page when
 /// it is filled ([`uffd_commit`]), as Linux charges the page a
 /// `UFFDIO_COPY` allocates to the memory cgroup (v6.1 mm/userfaultfd.c,
@@ -2397,11 +2400,14 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
                 && r.noaccess.is_empty() => {}
         _ => return Err(crate::EINVAL),
     }
+    if lazy_handler() {
+        return uffd_alias_chunked(&mut t, start, len, resident).map(|alias| (alias, true));
+    }
     let hi = u32::try_from((len as u64) >> 32).unwrap();
     #[allow(clippy::cast_possible_truncation)]
     let lo = len as u32;
-    let reserved = lazy_handler();
-    let reserve = if reserved { SEC_RESERVE } else { 0 };
+    let reserved = false;
+    let reserve = 0;
     // SAFETY: creates a pagefile-backed section.
     let s = unsafe {
         CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | reserve, hi, lo, std::ptr::null())
@@ -2484,7 +2490,7 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
     }
     let r = t.get_mut(&start).unwrap();
     r.kind = Kind::View {
-        _section: section,
+        _section: Some(section),
         file: None,
         charge: paid,
         alias: None,
@@ -2498,6 +2504,237 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
     Ok((alias, reserved))
 }
 
+/// The grain of a userfaultfd range's reserved section ([`uffd_alias`]):
+/// one section per 2 MiB chunk, the block a balloon's free page reporting
+/// gives back on x86 (v6.1 mm/page_reporting.c, `pageblock_order`), so that
+/// a chunk discarded whole can give its section commit back
+/// ([`uffd_swap_chunk`]), which a section's pages cannot (SECTREC-h).
+pub(crate) const UFFD_CHUNK: usize = 2 << 20;
+
+/// A new reserved (`SEC_RESERVE`) pagefile-backed section of `len` bytes.
+fn reserved_section(len: usize) -> Option<Owned> {
+    let hi = u32::try_from((len as u64) >> 32).unwrap();
+    #[allow(clippy::cast_possible_truncation)]
+    let lo = len as u32;
+    // SAFETY: creates a pagefile-backed section.
+    let s = unsafe {
+        CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_RESERVE, hi, lo, std::ptr::null())
+    };
+    (!s.is_null()).then(|| Owned(s))
+}
+
+/// Maps `section` (`len` bytes, from its start) into the placeholder of the
+/// same size at `at`; whether it is.
+fn view_into(section: &Owned, at: usize, len: usize) -> bool {
+    // SAFETY: maps our section over our placeholder.
+    let v = unsafe {
+        MapViewOfFile3(
+            section.0,
+            proc(),
+            at as *const c_void,
+            0,
+            len,
+            MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    v.Value as usize == at
+}
+
+/// Splits the placeholder at `base` into the placeholders of `chunks`
+/// (offset, len), in order: how many were split off (all of them but the
+/// last when it is done).
+fn split_into(base: usize, chunks: &[(usize, usize)]) -> usize {
+    chunks
+        .iter()
+        .take(chunks.len().saturating_sub(1))
+        .take_while(|&&(o, n)| {
+            // SAFETY: splits our placeholder ("To split a placeholder into
+            // two placeholders", Learn, VirtualFree).
+            unsafe { VirtualFree((base + o) as *mut c_void, n, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0 }
+        })
+        .count()
+}
+
+/// [`uffd_alias`] with the exception handler: the mapping moved into one
+/// reserved section per [`UFFD_CHUNK`] (the last one shorter if the length
+/// is not a multiple), each mapped into a placeholder of the mapping's and
+/// one of the alias's, its handle closed then (the views keep the section:
+/// "Mapped views of a file mapping object maintain internal references to
+/// the object", Learn, CreateFileMappingW), so no handle is held for it
+/// (UFFDCHUNK b, CI run 43528910212: 1 GiB as 512 chunks in 5.43 us a
+/// chunk, commit and paged pool as one section's, handles +0). Each chunk
+/// is a view of the table's, with a charge of its own ([`Charge`]). WHP
+/// maps the guest's range over the views in one call (UFFDCHUNK a).
+fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) -> Result<usize, c_int> {
+    let chunks: Vec<(usize, usize)> = (0..len).step_by(UFFD_CHUNK).map(|o| (o, UFFD_CHUNK.min(len - o))).collect();
+    // SAFETY: reserves address space of our own, as a placeholder.
+    let alias = unsafe {
+        VirtualAlloc2(proc(), std::ptr::null(), len, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0)
+    } as usize;
+    if alias == 0 {
+        return Err(crate::ENOMEM);
+    }
+    let mut sections = Vec::with_capacity(chunks.len());
+    let mut charges = Vec::with_capacity(chunks.len());
+    // Undoes the alias's views and placeholders (a placeholder not split
+    // off is freed at its own start, a later chunk's) and the charges.
+    let undo = |mapped: usize, charged: usize| {
+        for (i, &(o, _)) in chunks.iter().enumerate() {
+            // SAFETY: frees the alias's view or placeholder made here.
+            unsafe {
+                if i < mapped {
+                    UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: (alias + o) as *mut c_void }, 0);
+                } else {
+                    VirtualFree((alias + o) as *mut c_void, 0, MEM_RELEASE);
+                }
+            }
+        }
+        for &(o, _) in &chunks[..charged] {
+            charge_remove(start + o);
+        }
+    };
+    if split_into(alias, &chunks) + 1 != chunks.len() {
+        undo(0, 0);
+        return Err(crate::ENOMEM);
+    }
+    for &(o, n) in &chunks {
+        let Some(section) = reserved_section(n) else {
+            undo(sections.len(), charges.len());
+            return Err(crate::ENOMEM);
+        };
+        if !view_into(&section, alias + o, n) {
+            undo(sections.len(), charges.len());
+            return Err(crate::ENOMEM);
+        }
+        sections.push(section);
+        let Some(c) = charge_add(start + o, n) else {
+            undo(sections.len(), charges.len());
+            return Err(crate::ENOMEM);
+        };
+        charges.push(c);
+    }
+    // The resident pages: their charge, then the section's pages through the
+    // alias, a chunk at a time (a commit stays within one view), then their
+    // content.
+    let mut i = 0;
+    while i < resident.len() {
+        if resident[i] & 1 == 0 {
+            i += 1;
+            continue;
+        }
+        let first = i;
+        while i < resident.len() && resident[i] & 1 != 0 && (i == first || !(i * PAGE).is_multiple_of(UFFD_CHUNK)) {
+            i += 1;
+        }
+        let (off, n) = (first * PAGE, (i - first) * PAGE);
+        if !charge(start + off, n) || !commit_now(alias + off, n, PAGE_READWRITE, false) {
+            undo(sections.len(), charges.len());
+            return Err(crate::ENOMEM);
+        }
+        // SAFETY: resident pages of the mapping, into the alias.
+        unsafe { std::ptr::copy_nonoverlapping((start + off) as *const u8, (alias + off) as *mut u8, n) };
+    }
+    // SAFETY: gives the private allocation back as a placeholder.
+    if unsafe { VirtualFree(start as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        undo(sections.len(), charges.len());
+        return Err(crate::EINVAL);
+    }
+    let r = t.remove(&start).unwrap();
+    if r.lazy {
+        lazy_remove(start, len);
+        touched_remove(start);
+    }
+    // From here the private memory is gone: a failure leaves the chunks as
+    // placeholders of the table's.
+    let split = split_into(start, &chunks);
+    let mut mapped = 0;
+    if split + 1 == chunks.len() {
+        while mapped < chunks.len() && view_into(&sections[mapped], start + chunks[mapped].0, chunks[mapped].1) {
+            mapped += 1;
+        }
+    }
+    if mapped < chunks.len() {
+        for (k, &(o, n)) in chunks.iter().enumerate().take(split + 1) {
+            if k < mapped {
+                // SAFETY: unmaps a view made here, keeping its placeholder.
+                unsafe {
+                    UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: (start + o) as *mut c_void }, MEM_PRESERVE_PLACEHOLDER)
+                };
+            }
+            t.insert(start + o, Region::new(if k < split { n } else { len - o }, Kind::Placeholder));
+        }
+        undo(sections.len(), charges.len());
+        return Err(crate::ENOMEM);
+    }
+    drop(sections);
+    for (&(o, n), c) in chunks.iter().zip(charges) {
+        t.insert(start + o, Region::new(n, Kind::View { _section: None, file: None, charge: Some(c), alias: None }));
+    }
+    Ok(alias)
+}
+
+/// A chunk `[view, view + len)` of a registered userfaultfd range, all of it
+/// discarded and missing (`wick_uffd::discarding`), whose alias is at
+/// `alias`: a new, empty reserved section put in its place in both views,
+/// so that the old one, and its commit, goes with its last view, and its
+/// charge given back ([`uncharge`]), as Linux frees the pages. The views
+/// keep their addresses: WHP follows the host's (UFFDCHUNK a, CI run
+/// 43528910212: the guest read the new section with no remap, its writes
+/// landed there and were in the dirty bitmap), and a vCPU's access while
+/// a view is a placeholder is a memory access exit, which waits as for any
+/// missing page. 8.7 us a swap (UFFDCHUNK b). `false`, nothing changed, if
+/// the chunk is not one of [`uffd_alias`]'s or no section can be made; a
+/// failure once a view is unmapped ends the VMM, named, as a commit past
+/// the host's limit does ([`out_of_memory`]).
+pub(crate) fn uffd_swap_chunk(view: usize, len: usize, alias: usize) -> bool {
+    let t = table().lock().unwrap();
+    match t.get(&view) {
+        Some(r)
+            if r.len == len
+                && r.holes.is_empty()
+                && !r.lazy
+                && matches!(r.kind, Kind::View { _section: None, charge: Some(_), file: None, alias: None }) => {}
+        _ => return false,
+    }
+    let Some(section) = reserved_section(len) else {
+        return false;
+    };
+    // SAFETY: unmaps the chunk's alias view, keeping its placeholder; the
+    // guest's view keeps the old section until it is unmapped too.
+    if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        return false;
+    }
+    let swapped = view_into(&section, alias, len)
+        // SAFETY: unmaps the chunk's guest view, keeping its placeholder.
+        && unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } != 0
+        && view_into(&section, view, len);
+    if !swapped {
+        // SAFETY: plain call.
+        out_of_memory(view, unsafe { GetLastError() });
+    }
+    drop(t);
+    uncharge(view, len);
+    true
+}
+
+/// The parts of `[s, s + len)` in each region of the table, in order (the
+/// whole of it if none holds it): a commit or protection change stays
+/// within one view.
+fn region_pieces(s: usize, len: usize) -> Vec<(usize, usize)> {
+    let t = table().lock().unwrap();
+    let e = s + len;
+    let v: Vec<(usize, usize)> = overlapping(&t, s, e)
+        .into_iter()
+        .map(|b| (s.max(b), e.min(b + t[&b].len)))
+        .filter(|(a, z)| a < z)
+        .map(|(a, z)| (a, z - a))
+        .collect();
+    if v.is_empty() { std::vec![(s, len)] } else { v }
+}
+
 /// Commits the pages `[s, s + len)` of a userfaultfd range's reserved
 /// section ([`uffd_alias`]) through its view at their address, with no
 /// access and their charge first, before they are filled through the alias
@@ -2508,7 +2745,7 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
 /// write read back through A once A was opened). `false` if the charge or
 /// the commit is refused (the job's memory limit).
 pub(crate) fn uffd_commit(s: usize, len: usize) -> bool {
-    commit(s, len, PAGE_NOACCESS, false)
+    region_pieces(s, len).into_iter().all(|(a, n)| commit(a, n, PAGE_NOACCESS, false))
 }
 
 /// Pages `[s, s + len)` of a userfaultfd range's reserved section whose
@@ -2528,12 +2765,14 @@ pub(crate) fn uffd_uncharge(s: usize, len: usize) {
 /// all of the pages.
 pub(crate) fn uffd_stale(s: usize, len: usize, alias: usize) {
     let mut t = table().lock().unwrap();
-    if let Some((&b, r)) = t.range_mut(..=s).next_back() {
-        if matches!(r.kind, Kind::View { .. }) && s + len <= b + r.len {
+    let e = s + len;
+    for b in overlapping(&t, s, e) {
+        let r = t.get_mut(&b).unwrap();
+        let (a, z) = (s.max(b), e.min(b + r.len));
+        if matches!(r.kind, Kind::View { .. }) && a < z {
             r.lazy = true;
-            lazy_add(s, len, PAGE_READWRITE);
-            let mut m = STALE.lock().unwrap();
-            m.insert(s, (len, alias));
+            lazy_add(a, z - a, PAGE_READWRITE);
+            STALE.lock().unwrap().insert(a, (z - a, alias + (a - s)));
             STALE_SET.store(true, std::sync::atomic::Ordering::Release);
         }
     }
@@ -2634,17 +2873,23 @@ fn unalias(base: usize, len: usize, kind: &Kind) {
 /// `alias` ([`uffd_alias`]) no longer the userfaultfd's: handed to the view
 /// if the view has discarded pages still to zero ([`STALE`]), which keeps it
 /// until it goes, else unmapped now.
-pub(crate) fn uffd_unalias(start: usize, len: usize, alias: usize) {
+/// `reserved`: the alias is one view per [`UFFD_CHUNK`], else one view.
+pub(crate) fn uffd_unalias(start: usize, len: usize, alias: usize, reserved: bool) {
+    let step = if reserved { UFFD_CHUNK } else { len };
     let mut t = table().lock().unwrap();
-    if !stale_within(start, len).is_empty() {
-        if let Some(Kind::View { alias: kept @ None, .. }) = t.get_mut(&start).map(|r| &mut r.kind) {
-            *kept = Some(alias);
-            return;
+    for o in (0..len).step_by(step) {
+        let n = step.min(len - o);
+        if !stale_within(start + o, n).is_empty() {
+            if let Some(Kind::View { alias: kept @ None, .. }) =
+                t.get_mut(&(start + o)).filter(|r| r.len == n).map(|r| &mut r.kind)
+            {
+                *kept = Some(alias + o);
+                continue;
+            }
         }
+        // SAFETY: unmaps an alias view made by `uffd_alias`.
+        unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: (alias + o) as *mut c_void }, 0) };
     }
-    drop(t);
-    // SAFETY: unmaps the alias view.
-    unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, 0) };
 }
 
 /// The bytes of the charge registered for the view at `view` that are
@@ -2683,10 +2928,13 @@ pub(crate) fn committed_runs(s: usize, len: usize) -> Vec<(usize, usize)> {
 /// unmapped since is left alone).
 pub(crate) fn uffd_lazy(s: usize, len: usize) {
     let mut t = table().lock().unwrap();
-    if let Some((&b, r)) = t.range_mut(..=s).next_back() {
-        if matches!(r.kind, Kind::View { .. }) && s + len <= b + r.len {
+    let e = s + len;
+    for b in overlapping(&t, s, e) {
+        let r = t.get_mut(&b).unwrap();
+        let (a, z) = (s.max(b), e.min(b + r.len));
+        if matches!(r.kind, Kind::View { .. }) && a < z {
             r.lazy = true;
-            lazy_add(s, len, PAGE_READWRITE);
+            lazy_add(a, z - a, PAGE_READWRITE);
         }
     }
 }

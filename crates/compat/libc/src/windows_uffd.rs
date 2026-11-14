@@ -451,12 +451,27 @@ fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io
     Ok(())
 }
 
+/// Changes the protection of committed registered memory, a view at a time
+/// (`VirtualProtect` stays within one allocation; a reserved section is a
+/// view per chunk, `windows_mm::UFFD_CHUNK`).
 fn protect(addr: u64, len: u64, accessible: bool) -> io::Result<()> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     let prot = if accessible { PAGE_READWRITE } else { PAGE_NOACCESS };
-    let mut old = 0;
-    // SAFETY: changes the protection of registered memory only.
-    if unsafe { VirtualProtect(addr as *mut c_void, len as usize, prot, &mut old) } == 0 {
-        return Err(io::Error::last_os_error());
+    let (mut at, end) = (addr as usize, (addr + len) as usize);
+    while at < end {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(end) - at;
+        let mut old = 0;
+        // SAFETY: changes the protection of registered memory only.
+        if unsafe { VirtualProtect(at as *mut c_void, run, prot, &mut old) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        at += run;
     }
     Ok(())
 }
@@ -819,6 +834,26 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
                 continue;
             }
             let (from, to) = (s + first * PAGE, s + last * PAGE);
+            // Whole chunks of a reserved section, all registered: a new
+            // section in their place, the old one's commit given back
+            // (`windows_mm::uffd_swap_chunk`); they then have no memory for
+            // the runs below.
+            if r.reserved.load(Ordering::Acquire) {
+                let chunk = crate::windows_mm::UFFD_CHUNK as u64 / PAGE;
+                let pages = (e - s) / PAGE;
+                let mut c = first.div_ceil(chunk) * chunk;
+                while c < last {
+                    let c_end = (c + chunk).min(pages);
+                    if c_end > last {
+                        break;
+                    }
+                    if (c..c_end).all(|p| Range::test(&r.tracked, p)) {
+                        #[allow(clippy::cast_possible_truncation)]
+                        crate::windows_mm::uffd_swap_chunk((s + c * PAGE) as usize, ((c_end - c) * PAGE) as usize, (alias + c * PAGE) as usize);
+                    }
+                    c += chunk;
+                }
+            }
             let mut runs = Vec::new();
             for_each_missing(from, to - from, |a, l| runs.extend(with_memory(r, a, l)));
             for (a, l) in runs {
@@ -865,7 +900,7 @@ fn destroy(ctx: usize) {
             // Kept with the mapping while its discarded pages are still to
             // be zeroed through it (`windows_mm::uffd_stale`).
             #[allow(clippy::cast_possible_truncation)]
-            crate::windows_mm::uffd_unalias(s as usize, (e - s) as usize, alias as usize);
+            crate::windows_mm::uffd_unalias(s as usize, (e - s) as usize, alias as usize, r.reserved.load(Ordering::Acquire));
         }
         wake(s, e - s);
     }
@@ -1236,6 +1271,83 @@ mod tests {
         // SAFETY: our mapping.
         assert_eq!(unsafe { crate::munmap(mem as *mut c_void, len as usize) }, 0);
         assert!(crate::windows_mm::charged(mem as usize).is_none(), "the charge outlived the mapping");
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// A discard of whole 2 MiB chunks of registered memory gives their
+    /// section commit back, as Linux frees the pages `MADV_DONTNEED` zaps
+    /// (a balloon's free page reporting gives 2 MiB blocks: v6.1
+    /// mm/page_reporting.c, `pageblock_order`): the registration maps one
+    /// section per chunk (`windows_mm::UFFD_CHUNK`), and a chunk discarded
+    /// whole has a new, empty section put in its place in both views
+    /// (UFFDCHUNK b: 8.7 us; WHP follows the host's address, UFFDCHUNK a).
+    /// Two chunks and a part, filled by one copy across them (the fill split
+    /// at each chunk's views): chunk 0 and half of chunk 1 discarded; chunk
+    /// 0 then has no page committed, chunk 1 keeps its section's (its
+    /// discarded half's charge given back, as any discarded page's); each
+    /// discarded page is missing again and a refill reads back; the last,
+    /// partial chunk discarded whole has none committed either; the charge
+    /// follows each step.
+    #[test]
+    fn test_a_wholly_discarded_chunk_gives_its_section_commit_back() {
+        const CHUNK: u64 = 2 << 20;
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 2 * CHUNK + 16 * PAGE;
+        let mem = map(len as usize);
+        register(ctx, mem, len).unwrap();
+        assert!(range_of(ctx, mem, len).unwrap().reserved.load(Ordering::Acquire), "the section is not reserved");
+        #[allow(clippy::cast_possible_truncation)]
+        let charged = || -> u64 {
+            [mem, mem + CHUNK, mem + 2 * CHUNK]
+                .iter()
+                .map(|&c| crate::windows_mm::charged(c as usize).expect("no charge for a chunk") as u64)
+                .sum()
+        };
+        let data = std::vec![0x5au8; len as usize];
+        // SAFETY: `data` holds `len` bytes.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, len, true) }.unwrap(), len);
+        assert_eq!(committed(mem, len), len);
+        assert_eq!(charged(), len);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::madvise(mem as *mut c_void, (CHUNK + CHUNK / 2) as usize, crate::MADV_DONTNEED) }, 0);
+        assert_eq!(committed(mem, CHUNK), 0, "a chunk discarded whole keeps its section commit");
+        assert_eq!(committed(mem + CHUNK, CHUNK), CHUNK, "a chunk discarded in part");
+        assert_eq!(charged(), len - CHUNK - CHUNK / 2);
+        for at in [mem, mem + CHUNK - PAGE, mem + CHUNK, mem + CHUNK + CHUNK / 2 - PAGE] {
+            assert!(is_missing(at), "{:#x} is not missing", at - mem);
+        }
+        assert!(!is_missing(mem + CHUNK + CHUNK / 2));
+        // A refill of chunk 0, through its new section.
+        let seven = std::vec![7u8; PAGE as usize];
+        // SAFETY: a page-sized buffer.
+        assert_eq!(unsafe { copy(ctx, seven.as_ptr(), mem + 5 * PAGE, PAGE, true) }.unwrap(), PAGE);
+        // SAFETY: a filled page.
+        assert_eq!(unsafe { *((mem + 5 * PAGE + 9) as *const u8) }, 7);
+        assert_eq!(committed(mem, CHUNK), PAGE);
+        assert_eq!(charged(), len - CHUNK - CHUNK / 2 + PAGE);
+        // SAFETY: a page of chunk 1 not discarded.
+        assert_eq!(unsafe { *((mem + CHUNK + CHUNK / 2) as *const u8) }, 0x5a);
+        // The last chunk, of 16 pages, discarded whole.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::madvise((mem + 2 * CHUNK) as *mut c_void, 16 * PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        assert_eq!(committed(mem + 2 * CHUNK, 16 * PAGE), 0, "the last chunk discarded whole");
+        assert_eq!(charged(), CHUNK / 2 + PAGE);
+        unregister(ctx, mem, len).unwrap();
+        // SAFETY: our mapping, unregistered: every page reads, the
+        // discarded ones as zeros.
+        unsafe {
+            assert_eq!(*((mem + 6 * PAGE) as *const u8), 0);
+            assert_eq!(*((mem + CHUNK) as *const u8), 0);
+            assert_eq!(*((mem + 2 * CHUNK + 3 * PAGE) as *const u8), 0);
+            assert_eq!(*((mem + 5 * PAGE) as *const u8), 7);
+            assert_eq!(*((mem + 2 * CHUNK - PAGE) as *const u8), 0x5a);
+        }
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::munmap(mem as *mut c_void, len as usize) }, 0);
+        for c in [mem, mem + CHUNK, mem + 2 * CHUNK] {
+            assert!(crate::windows_mm::charged(c as usize).is_none(), "a chunk's charge outlived the mapping");
+        }
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }

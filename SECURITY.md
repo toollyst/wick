@@ -278,8 +278,10 @@ upstream Firecracker and its jailer.
   does when the memory cgroup refuses the page (`test_a_fill_past_the_job_limit_fails_with_enomem`, which passed in
   CI run 43534301411). A page discarded with `MADV_DONTNEED` (a balloon inflation, free page reporting) gives its
   charge back, as the memory cgroup uncharges it, and a refill charges it again (or, once the range is unregistered,
-  its first access, which zeroes it before it opens); its section page stays committed
-  (a SEC_RESERVE page cannot be decommitted), host commit that is neither memory nor the job's
+  its first access, which zeroes it before it opens). A 2 MiB chunk discarded whole (the section is one per chunk)
+  gets a new, empty section, so its commit goes too (`test_a_wholly_discarded_chunk_gives_its_section_commit_back`);
+  a page discarded in a chunk not discarded whole keeps its section page committed (a SEC_RESERVE page cannot be
+  decommitted), host commit that is neither memory nor the job's
   (`test_registered_memory_is_charged_as_it_is_filled`; not yet run on Windows). Still not charged: memfds and
   sections made around wick.
 - **Windows jailer: the handle limit holds only in the jailed process.** Upstream's jailer limits Firecracker to
