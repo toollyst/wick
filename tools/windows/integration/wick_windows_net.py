@@ -313,6 +313,12 @@ class _Iface:
                 self.conn = None
                 with self.tx_ready:
                     self.tx_queue.clear()
+                # The carrier went: the neighbours go with it, as Linux
+                # drops a TAP's when its file is closed (v6.1
+                # drivers/net/tun.c:680, netif_carrier_off; net/ipv4/arp.c
+                # 1284-1296, neigh_carrier_down), so a guest that binds the
+                # endpoint again with another MAC is ARPed for.
+                self.neighbours.clear()
                 s.close()
                 for flow in list(self.flows.values()):
                     flow.close()
