@@ -209,7 +209,11 @@ namespace Wick {
         int seq;
         static readonly Encoding NoBom = new UTF8Encoding(false);
 
+        // The executable's file name, which the handle record names.
+        string exeName;
+
         public Vm(string exe, string args, string logPath) {
+            exeName = Path.GetFileName(exe);
             log = new StreamWriter(logPath, false, new UTF8Encoding(false));
             log.AutoFlush = true;
             var psi = new ProcessStartInfo(exe, args);
@@ -394,9 +398,30 @@ namespace Wick {
             if (out1.Length > 0) throw new Failure("guest kernel reports:\n    " + out1);
         }
 
+        // The handles of the process (Firecracker, or a stage's helper) and
+        // of its children (Firecracker's API process), read once,
+        // at the VM's end (Reboot or Kill) while they still run: the record
+        // for the jailer's no-file bound (NOFILEREC, Handles). Never fails
+        // the stage.
+        public string HandleRecord;
+
+        void TakeHandles() {
+            if (HandleRecord != null) return;
+            try {
+                if (p.HasExited) { HandleRecord = "ended before it was read"; return; }
+                var sb = new StringBuilder(exeName).Append(": ").Append(Handles.Record(p.Id));
+                foreach (int child in Handles.Children(p.Id))
+                    sb.Append("; its child ").Append(child).Append(": ").Append(Handles.Record(child));
+                HandleRecord = sb.ToString();
+            } catch (Exception e) {
+                HandleRecord = "unread: " + e.GetType().Name + ": " + e.Message;
+            }
+        }
+
         // Checks the guest's health and resets it; Firecracker exits with 0.
         public void Reboot() {
             Healthy();
+            TakeHandles();
             Send("reboot -ff");
             if (!p.WaitForExit(30000)) throw new Failure("Firecracker did not exit within 30 s of the guest reset (" + ExitReason() + ")");
             p.WaitForExit();
@@ -413,6 +438,7 @@ namespace Wick {
         }
 
         public void Kill() {
+            TakeHandles();
             try { if (!p.HasExited) p.Kill(); } catch (InvalidOperationException) { } catch (System.ComponentModel.Win32Exception) { }
             p.WaitForExit(5000);
             outPump.Join(2000);
@@ -1124,6 +1150,141 @@ namespace Wick {
             flooding = false;
             t.Join(2000);
             conn.Dispose();
+        }
+    }
+
+    // A process's kernel handles, for the jailer's no-file bound (NOFILEREC,
+    // the --resource-limit row of docs/COMPATIBILITY.md): how many it holds
+    // and the most it held (NtQueryInformationProcess ProcessHandleCount, 20,
+    // whose 8-byte form is PROCESS_HANDLE_INFORMATION: HandleCount, then
+    // HandleCountHighWatermark), and how many of each object type
+    // (ProcessHandleInformation, 51: PROCESS_HANDLE_SNAPSHOT_INFORMATION, a
+    // count, a reserved word, then 40-byte entries whose ObjectTypeIndex is
+    // at 28). Neither class is on Microsoft Learn: their layouts are
+    // System Informer's phnt (ntpsapi.h); a status other than 0 is printed,
+    // not guessed past. A type's name is NtQueryObject's
+    // ObjectTypeInformation (2) of a duplicate of one of its handles: Learn's
+    // PUBLIC_OBJECT_TYPE_INFORMATION, a UNICODE_STRING first. The time the
+    // class-51 read took is printed with it: the cost of a poll that would
+    // read it.
+    public static class Handles {
+        const uint PROCESS_DUP_HANDLE = 0x0040, PROCESS_QUERY_INFORMATION = 0x0400, DUPLICATE_SAME_ACCESS = 2;
+        const int STATUS_INFO_LENGTH_MISMATCH = unchecked((int)0xC0000004);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool DuplicateHandle(IntPtr fromProcess, IntPtr from, IntPtr toProcess, out IntPtr to, uint access, bool inherit, uint options);
+        [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr p, int cls, IntPtr buf, int len, out int ret);
+        [DllImport("ntdll.dll")] static extern int NtQueryObject(IntPtr h, int cls, IntPtr buf, int len, out int ret);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32FirstW(IntPtr s, ref Entry e);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32NextW(IntPtr s, ref Entry e);
+
+        // PROCESSENTRY32W (tlhelp32.h).
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct Entry {
+            public uint dwSize, cntUsage, th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID, cntThreads, th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+        }
+
+        // Type indices are the system's for its boot: a name found once
+        // stays.
+        static readonly Dictionary<int, string> names = new Dictionary<int, string>();
+
+        // The processes whose parent is `pid` (the API process of a
+        // Firecracker started with --api-sock).
+        public static List<int> Children(int pid) {
+            var found = new List<int>();
+            IntPtr s = CreateToolhelp32Snapshot(2, 0); // TH32CS_SNAPPROCESS
+            if (s == IntPtr.Zero || s == new IntPtr(-1)) return found;
+            try {
+                var e = new Entry();
+                e.dwSize = (uint)Marshal.SizeOf(typeof(Entry));
+                for (bool ok = Process32FirstW(s, ref e); ok; ok = Process32NextW(s, ref e))
+                    if (e.th32ParentProcessID == (uint)pid && e.th32ProcessID != (uint)pid) found.Add((int)e.th32ProcessID);
+            } finally { CloseHandle(s); }
+            return found;
+        }
+
+        static string TypeName(IntPtr process, IntPtr handle) {
+            IntPtr dup;
+            if (!DuplicateHandle(process, handle, GetCurrentProcess(), out dup, 0, false, DUPLICATE_SAME_ACCESS)) return null;
+            IntPtr buf = Marshal.AllocHGlobal(4096);
+            try {
+                int ret;
+                if (NtQueryObject(dup, 2, buf, 4096, out ret) != 0) return null;
+                int bytes = (ushort)Marshal.ReadInt16(buf, 0);
+                return Marshal.PtrToStringUni(Marshal.ReadIntPtr(buf, IntPtr.Size), bytes / 2);
+            } finally {
+                Marshal.FreeHGlobal(buf);
+                CloseHandle(dup);
+            }
+        }
+
+        // "N handles, the most P; by type in U us: File a, Event b, ...", or
+        // why a part could not be read.
+        public static string Record(int pid) {
+            IntPtr p = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE, false, pid);
+            if (p == IntPtr.Zero) return "process " + pid + " cannot be opened: error " + Marshal.GetLastWin32Error();
+            IntPtr buf = IntPtr.Zero;
+            try {
+                var sb = new StringBuilder();
+                IntPtr two = Marshal.AllocHGlobal(8);
+                try {
+                    int ret;
+                    int st = NtQueryInformationProcess(p, 20, two, 8, out ret);
+                    if (st == 0) sb.Append(Marshal.ReadInt32(two, 0)).Append(" handles, the most ").Append(Marshal.ReadInt32(two, 4));
+                    else sb.Append("handle count and its most unread (status 0x").Append(st.ToString("x8")).Append(")");
+                } finally { Marshal.FreeHGlobal(two); }
+                int len = 1 << 16, got = 0, status;
+                var sw = Stopwatch.StartNew();
+                while (true) {
+                    buf = Marshal.AllocHGlobal(len);
+                    status = NtQueryInformationProcess(p, 51, buf, len, out got);
+                    if (status != STATUS_INFO_LENGTH_MISMATCH) break;
+                    Marshal.FreeHGlobal(buf);
+                    buf = IntPtr.Zero;
+                    len = Math.Max(len * 2, got + 4096);
+                }
+                sw.Stop();
+                if (status != 0) return sb.Append("; by type unread (status 0x").Append(status.ToString("x8")).Append(")").ToString();
+                long n = Marshal.ReadIntPtr(buf, 0).ToInt64();
+                var counts = new Dictionary<int, int>();
+                var some = new Dictionary<int, List<IntPtr>>();
+                for (long i = 0; i < n && 16 + (i + 1) * 40 <= got; i++) {
+                    int at = (int)(16 + i * 40);
+                    int type = Marshal.ReadInt32(buf, at + 28);
+                    int c;
+                    counts.TryGetValue(type, out c);
+                    counts[type] = c + 1;
+                    List<IntPtr> l;
+                    if (!some.TryGetValue(type, out l)) { l = new List<IntPtr>(); some[type] = l; }
+                    if (l.Count < 3) l.Add(Marshal.ReadIntPtr(buf, at));
+                }
+                var parts = new List<KeyValuePair<int, int>>(counts);
+                parts.Sort((a, b) => b.Value != a.Value ? b.Value.CompareTo(a.Value) : a.Key.CompareTo(b.Key));
+                sb.Append("; by type (").Append(n).Append(" entries, read in ")
+                  .Append((sw.ElapsedTicks * 1000000L / Stopwatch.Frequency)).Append(" us):");
+                bool first = true;
+                foreach (var kv in parts) {
+                    string name;
+                    if (!names.TryGetValue(kv.Key, out name)) {
+                        foreach (var h in some[kv.Key]) { name = TypeName(p, h); if (name != null) break; }
+                        if (name != null) names[kv.Key] = name;
+                    }
+                    sb.Append(first ? " " : ", ").Append(name ?? ("type " + kv.Key)).Append(' ').Append(kv.Value);
+                    first = false;
+                }
+                return sb.ToString();
+            } finally {
+                if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf);
+                CloseHandle(p);
+            }
         }
     }
 
@@ -4281,6 +4442,7 @@ New-Item -ItemType Directory -Force -Path $SockDir | Out-Null
 $Scratch = Join-Path $WorkDir "scratch-$stamp"
 New-Item -ItemType Directory -Force -Path $Scratch | Out-Null
 $Summary = New-Object System.Collections.ArrayList
+$HandleRecs = New-Object System.Collections.ArrayList
 $Vms = @()
 
 Write-Host 'wick boot test (Windows)'
@@ -4344,6 +4506,14 @@ foreach ($name in $selected) {
         }
     } finally {
         foreach ($vm in $Vms) { $vm.Kill() }
+        # NOFILEREC: each process's handles at its end, read by Kill or
+        # Reboot (Wick.Handles).
+        foreach ($vm in $Vms) {
+            if ($vm -is [Wick.Vm] -and $vm.HandleRecord) {
+                $which = if ($vm.StageName -and $vm.StageName -ne $name) { "$name/$($vm.StageName)" } else { $name }
+                [void]$HandleRecs.Add("NOFILEREC $which`: $($vm.HandleRecord)")
+            }
+        }
         $Vms = @()
     }
     $color = if ($result -eq 'PASS') { 'Green' } else { 'Red' }
@@ -4367,6 +4537,29 @@ foreach ($n in $NotImplemented) { $lines += "N/A   {0}: {1}" -f $n[0], $n[1] }
 $failed = @($Summary | Where-Object { $_.Result -eq 'FAIL' }).Count
 $lines += ''
 $lines += "$($Summary.Count - $failed) passed, $failed failed"
+# The record for the jailer's no-file bound (the --resource-limit row of
+# docs/COMPATIBILITY.md): every process's handles at its end, and the most
+# any Firecracker and any API process held, with the stage.
+if ($HandleRecs.Count -gt 0) {
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $most = @{}
+    foreach ($r in $HandleRecs) {
+        # Firecracker's records only: a stage's helper (the uffd handler,
+        # the vhost-user backend) is no jailed process.
+        if ($r -notmatch '^NOFILEREC ([^:]+): firecracker\.exe: ') { continue }
+        $stage = $Matches[1]
+        foreach ($m in [regex]::Matches($r, '(: firecracker\.exe|; its child \d+): (\d+) handles, the most (\d+)')) {
+            $who = if ($m.Groups[1].Value -like '*firecracker*') { 'Firecracker' } else { 'a child (the API process)' }
+            $peak = [int]$m.Groups[3].Value
+            if (-not $most.ContainsKey($who) -or $most[$who][0] -lt $peak) { $most[$who] = @($peak, $stage) }
+        }
+    }
+    $lines += ''
+    $lines += $HandleRecs
+    foreach ($who in @('Firecracker', 'a child (the API process)')) {
+        if ($most.ContainsKey($who)) { $lines += "NOFILEREC the most handles $who held: $($most[$who][0]) ($($most[$who][1])); elevated: $elevated" }
+    }
+}
 $full = $lines + @('', 'Details:')
 foreach ($s in $Summary) { $full += "[$($s.Result)] $($s.Stage)"; $full += "    $($s.Detail)" }
 $full | Set-Content -Encoding UTF8 (Join-Path $Results 'summary.txt')

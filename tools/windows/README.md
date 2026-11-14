@@ -360,6 +360,15 @@ The results folder holds, per stage, the VM config, the serial console, the
 Firecracker log at debug level and the guest kernel log, plus `host.txt`
 (Windows build, CPU, WHP state) and `summary.txt`.
 
+After the summary, NOFILEREC lines record, for the jailer's no-file bound
+(docs/COMPATIBILITY.md, `--resource-limit no-file=`), each process's handles at
+its end (read before the guest reset or the kill): Firecracker's and its API
+process's count, the most each held (`NtQueryInformationProcess`
+ProcessHandleCount) and the count by object type (ProcessHandleInformation),
+with the time that read took; then the most any Firecracker and any API
+process held, the stage, and whether the run was elevated. A record never
+fails a stage.
+
 If WHP is not usable, every stage fails with the reason the script found
 before starting, for example "the Windows hypervisor is not running".
 

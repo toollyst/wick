@@ -14,3 +14,6 @@ pub mod signal;
 pub mod sock_ctrl_msg;
 pub mod tempdir;
 pub mod terminal;
+
+#[cfg(test)]
+mod nofilerec;

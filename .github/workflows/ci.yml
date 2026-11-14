@@ -1370,6 +1370,17 @@ jobs:
           alone fifo::windows::tests::test_a_pipe_opened_again_gives_its_maker_no_identity
           k=../../crates/compat/std/Cargo.toml
           alone tests::test_a_pipe_opened_by_path_gives_its_maker_no_identity
+          # NOFILEREC, for the jailer's no-file bound: the handles each kind
+          # of descriptor wick's POSIX layer makes adds, by object type
+          # (NtQueryInformationProcess ProcessHandleInformation); that read's
+          # cost at this process's count and 10,000 and 100,000 handles
+          # more; whether it and ProcessHandleCount read another process with
+          # the jailer's access; and whether this runner's process is
+          # elevated (the PC runs it unelevated). boot-test.ps1 prints the
+          # handles of each stage's Firecracker and API process at their end
+          # and the most each held (NOFILEREC lines after its summary).
+          k=../../crates/compat/vmm-sys-util/Cargo.toml
+          alone windows::nofilerec::test_the_handles_each_descriptor_makes_on_record
           t=platform::windows::net::tests::test_descriptor_check_cost_on_record
           out=$(cargo test --locked -p vmm --lib -- \
             --include-ignored --exact --nocapture --test-threads=1 "$t" 2>&1) || true
