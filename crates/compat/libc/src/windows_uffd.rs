@@ -421,7 +421,7 @@ fn with_memory(range: &Range, addr: u64, len: u64) -> Vec<(u64, u64)> {
 /// Missing pages `[s, s + len)` of `range`, whose alias is at `alias` and
 /// which starts at `base`, become ordinary memory: those with memory
 /// (filled once, then discarded) read zeros, as Linux gives: in a reserved
-/// section zeroed and charged at their first access
+/// section zeroed at their first access
 /// (`windows_mm::uffd_stale`), elsewhere zeroed and made accessible now;
 /// those never filled, in a reserved section, become lazy memory
 /// (`windows_mm::uffd_lazy`).
@@ -435,9 +435,9 @@ fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io
         }
         if l > 0 {
             if range.reserved.load(Ordering::Acquire) {
-                // Discarded, its charge given back (`discarding`): lazy, zeroed
-                // and charged at its first access, as Linux charges the page
-                // it faults in for a zapped one at its next touch.
+                // Discarded, its commit and charge kept (`discarding`): lazy,
+                // zeroed at its first access, as Linux gives a zapped page as
+                // zeros at its next touch.
                 #[allow(clippy::cast_possible_truncation)]
                 crate::windows_mm::uffd_stale(a as usize, l as usize, (alias + (a - base)) as usize);
             } else {
@@ -794,9 +794,10 @@ pub fn wake_range(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
 /// Wraps a `MADV_DONTNEED` of `[start, start + len)`: `discard` runs on the
 /// memory that is not registered and reports the pieces it reached (all of
 /// the mapped memory, or what it reached before an error); the registered
-/// pages of those pieces are missing again, their memory discarded and, in
-/// a reserved section, their charge given back (`windows_mm::uffd_uncharge`),
-/// and a remove event is queued for each piece (with `EVENT_REMOVE`). Pages the
+/// pages of those pieces are missing again, their memory discarded, a whole
+/// 2 MiB chunk of a reserved section given a new section and its commit and
+/// charge given back (`windows_mm::uffd_swap_chunk`), and a remove event is
+/// queued for each piece (with `EVENT_REMOVE`). Pages the
 /// discard did not reach keep their contents, as on Linux when it stops at
 /// an error.
 pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)>) -> c_int) -> c_int {
@@ -861,10 +862,14 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
                 // Filling a missing page writes all of it: its content can go.
                 // SAFETY: the alias of registered memory.
                 unsafe { DiscardVirtualMemory((alias + (a - s)) as *mut c_void, l as usize) };
-                // And its charge, as the memory cgroup uncharges the page; a
-                // refill charges it again (`uffd_commit`).
-                #[allow(clippy::cast_possible_truncation)]
-                crate::windows_mm::uffd_uncharge(a as usize, l as usize);
+                // Its charge stays, as its section page does (a section's
+                // page cannot be decommitted: SECTREC-h): the charge pays for
+                // the host commit, so that the job and the jailer's count
+                // (private commit plus section commit less the charge) agree
+                // and neither refuses a VMM whose live memory is under
+                // memory.max. Where Linux would uncharge it, this counts it
+                // until its chunk is discarded whole (`uffd_swap_chunk`, which
+                // gives both back) or unmapped.
             }
             if remove {
                 post(ctx, [proto::EVENT_REMOVE, from, to, 0]);
@@ -1207,12 +1212,12 @@ mod tests {
     /// allocates to the memory cgroup (v6.1 mm/userfaultfd.c,
     /// `mcopy_atomic_pte`, `mem_cgroup_charge` at :205): at the registration
     /// only the resident page is committed and charged; each page filled is
-    /// committed and charged; a discarded page's charge is given back, as
-    /// the memory cgroup uncharges it, and its commit stays (a section's
-    /// page cannot be decommitted: SECTREC-h, error 87); a refill charges it
-    /// again; once unregistered, the discarded page is zeroed and charged at
-    /// its first access, and a page never filled is committed and charged at
-    /// its first access, both a read included, as a shmem page is; the
+    /// committed and charged; a discarded page keeps its commit (a
+    /// section's page cannot be decommitted: SECTREC-h, error 87) and with it
+    /// its charge, which pays for that commit, where Linux uncharges it; a
+    /// refill charges it once; once unregistered, the discarded page is
+    /// zeroed at its first access, and a page never filled is committed and
+    /// charged at its first access, a read included, as a shmem page is; the
     /// charge goes with the mapping. Before, the whole section was committed at the
     /// registration and charged to no job.
     #[test]
@@ -1242,25 +1247,25 @@ mod tests {
         // SAFETY: our mapping.
         assert_eq!(unsafe { crate::madvise((mem + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
         assert!(is_missing(mem + PAGE));
-        // Its charge given back, as the memcg uncharges a page MADV_DONTNEED
-        // frees (its section page stays committed: SECTREC-h).
-        assert_eq!(charged(), 4 * PAGE as usize, "a discarded page's charge");
+        // Its charge kept, as its section page stays committed (SECTREC-h):
+        // the charge pays for the host commit a page holds, so that no layer
+        // counts more than wick's charge (in a chunk discarded whole both go,
+        // `test_a_wholly_discarded_chunk_gives_its_section_commit_back`).
+        assert_eq!(charged(), 5 * PAGE as usize, "a discarded page's charge");
         assert_eq!(committed(mem, len), 5 * PAGE);
-        // Filled again, charged again; discarded again, given back again.
+        // Filled again and discarded again: charged once.
         assert_eq!(zeropage(ctx, mem + PAGE, PAGE, true).unwrap(), PAGE);
         assert_eq!(charged(), 5 * PAGE as usize, "a refilled page's charge");
         // SAFETY: our mapping.
         assert_eq!(unsafe { crate::madvise((mem + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
-        assert_eq!(charged(), 4 * PAGE as usize, "a page discarded twice");
+        assert_eq!(charged(), 5 * PAGE as usize, "a page discarded twice");
         unregister(ctx, mem, len).unwrap();
-        // The discarded page is charged at its first access, as Linux
-        // charges the page it faults in then, not at the unregister.
-        assert_eq!(charged(), 4 * PAGE as usize, "the discarded page's charge at the unregister");
+        assert_eq!(charged(), 5 * PAGE as usize, "the discarded page's charge at the unregister");
         // SAFETY: ordinary memory now: the discarded page reads zeros, and
         // a page never filled is committed at its read.
         unsafe {
             assert_eq!(*((mem + PAGE) as *const u8), 0);
-            assert_eq!(charged(), 5 * PAGE as usize, "the discarded page's charge at its first read");
+            assert_eq!(charged(), 5 * PAGE as usize, "the discarded page's charge after its first read");
             assert!(std::slice::from_raw_parts((mem + PAGE) as *const u8, PAGE as usize).iter().all(|&b| b == 0));
             assert_eq!(*((mem + 3 * PAGE + 9) as *const u8), 0x5a);
             assert_eq!(*((mem + 20 * PAGE) as *const u8), 0);
@@ -1284,8 +1289,8 @@ mod tests {
     /// (UFFDCHUNK b: 8.7 us; WHP follows the host's address, UFFDCHUNK a).
     /// Two chunks and a part, filled by one copy across them (the fill split
     /// at each chunk's views): chunk 0 and half of chunk 1 discarded; chunk
-    /// 0 then has no page committed, chunk 1 keeps its section's (its
-    /// discarded half's charge given back, as any discarded page's); each
+    /// 0 then has no page committed nor charged, chunk 1 keeps its section's
+    /// pages and their charge, its discarded half's included; each
     /// discarded page is missing again and a refill reads back; the last,
     /// partial chunk discarded whole has none committed either; the charge
     /// follows each step.
@@ -1313,7 +1318,9 @@ mod tests {
         assert_eq!(unsafe { crate::madvise(mem as *mut c_void, (CHUNK + CHUNK / 2) as usize, crate::MADV_DONTNEED) }, 0);
         assert_eq!(committed(mem, CHUNK), 0, "a chunk discarded whole keeps its section commit");
         assert_eq!(committed(mem + CHUNK, CHUNK), CHUNK, "a chunk discarded in part");
-        assert_eq!(charged(), len - CHUNK - CHUNK / 2);
+        // Chunk 0's charge goes with its section; chunk 1's discarded half
+        // keeps its charge, as it keeps its section pages.
+        assert_eq!(charged(), len - CHUNK);
         for at in [mem, mem + CHUNK - PAGE, mem + CHUNK, mem + CHUNK + CHUNK / 2 - PAGE] {
             assert!(is_missing(at), "{:#x} is not missing", at - mem);
         }
@@ -1325,14 +1332,14 @@ mod tests {
         // SAFETY: a filled page.
         assert_eq!(unsafe { *((mem + 5 * PAGE + 9) as *const u8) }, 7);
         assert_eq!(committed(mem, CHUNK), PAGE);
-        assert_eq!(charged(), len - CHUNK - CHUNK / 2 + PAGE);
+        assert_eq!(charged(), len - CHUNK + PAGE);
         // SAFETY: a page of chunk 1 not discarded.
         assert_eq!(unsafe { *((mem + CHUNK + CHUNK / 2) as *const u8) }, 0x5a);
         // The last chunk, of 16 pages, discarded whole.
         // SAFETY: our mapping.
         assert_eq!(unsafe { crate::madvise((mem + 2 * CHUNK) as *mut c_void, 16 * PAGE as usize, crate::MADV_DONTNEED) }, 0);
         assert_eq!(committed(mem + 2 * CHUNK, 16 * PAGE), 0, "the last chunk discarded whole");
-        assert_eq!(charged(), CHUNK / 2 + PAGE);
+        assert_eq!(charged(), CHUNK + PAGE);
         unregister(ctx, mem, len).unwrap();
         // SAFETY: our mapping, unregistered: every page reads, the
         // discarded ones as zeros.

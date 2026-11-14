@@ -276,13 +276,14 @@ upstream Firecracker and its jailer.
   The userfaultfd restore's section is charged the same way: reserved at the registration, each page committed with
   its charge when the handler fills it, and a fill past `memory.max` fails with `ENOMEM`, as Linux's `UFFDIO_COPY`
   does when the memory cgroup refuses the page (`test_a_fill_past_the_job_limit_fails_with_enomem`, which passed in
-  CI run 43534301411). A page discarded with `MADV_DONTNEED` (a balloon inflation, free page reporting) gives its
-  charge back, as the memory cgroup uncharges it, and a refill charges it again (or, once the range is unregistered,
-  its first access, which zeroes it before it opens). A 2 MiB chunk discarded whole (the section is one per chunk)
-  gets a new, empty section, so its commit goes too (`test_a_wholly_discarded_chunk_gives_its_section_commit_back`);
-  a page discarded in a chunk not discarded whole keeps its section page committed (a SEC_RESERVE page cannot be
-  decommitted), host commit that is neither memory nor the job's
-  (`test_registered_memory_is_charged_as_it_is_filled`; not yet run on Windows). Still not charged: memfds and
+  CI run 43534301411). A 2 MiB chunk discarded whole with `MADV_DONTNEED` (free page reporting; the section is one
+  per chunk) gets a new, empty section, so its commit and charge go
+  (`test_a_wholly_discarded_chunk_gives_its_section_commit_back`). A page discarded in a chunk not discarded whole
+  (balloon inflation's scattered pages) keeps its section page committed (a SEC_RESERVE page cannot be decommitted)
+  and its charge with it, so that what the jail is charged is never less than the host commit it holds
+  (`test_registered_memory_is_charged_as_it_is_filled`; not yet run on Windows); the cost is the memory.max row's
+  difference (such pages counted on top of live memory until their chunk goes), which reclaim at the limit is to
+  close. Still not charged: memfds and
   sections made around wick.
 - **Windows jailer: the handle limit holds only in the jailed process.** Upstream's jailer limits Firecracker to
   2048 descriptors by default (`RLIMIT_NOFILE`), and the kernel enforces it. Windows has no per-process handle limit

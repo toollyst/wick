@@ -2748,21 +2748,13 @@ pub(crate) fn uffd_commit(s: usize, len: usize) -> bool {
     region_pieces(s, len).into_iter().all(|(a, n)| commit(a, n, PAGE_NOACCESS, false))
 }
 
-/// Pages `[s, s + len)` of a userfaultfd range's reserved section whose
-/// memory was discarded (`wick_uffd::discarding`): their charge is given
-/// back ([`uncharge`]), as Linux uncharges a page `MADV_DONTNEED` frees;
-/// their section pages stay committed (SEC_RESERVE: SECTREC-h). A refill
-/// charges them again ([`uffd_commit`]).
-pub(crate) fn uffd_uncharge(s: usize, len: usize) {
-    uncharge(s, len);
-}
 
 /// Pages `[s, s + len)` of a userfaultfd range's reserved section that were
 /// discarded and become ordinary memory once the range is released, `alias`
-/// their address in its alias: lazy, each zeroed and charged at its first
-/// access ([`STALE`]), as Linux charges the page it faults in for a zapped
-/// one at its next touch. Nothing is done unless a view of a mapping holds
-/// all of the pages.
+/// their address in its alias: lazy, each zeroed at its first access
+/// ([`STALE`]), as Linux gives a zapped page as zeros at its next touch; its
+/// charge, kept with its commit (`wick_uffd::discarding`), is made sure of
+/// then. Nothing is done unless a view of a mapping holds all of the pages.
 pub(crate) fn uffd_stale(s: usize, len: usize, alias: usize) {
     let mut t = table().lock().unwrap();
     let e = s + len;
@@ -2780,11 +2772,13 @@ pub(crate) fn uffd_stale(s: usize, len: usize, alias: usize) {
 
 /// Discarded pages of a released userfaultfd range ([`uffd_stale`]): start
 /// to `(len, the alias's address of start)`. Each is committed (a section's
-/// page cannot be decommitted: SECTREC-h), `PAGE_NOACCESS`, uncharged
-/// ([`uffd_uncharge`]), and holds what the discard left, which
+/// page cannot be decommitted: SECTREC-h), `PAGE_NOACCESS`, still charged
+/// (`wick_uffd::discarding` keeps a charge while its page's commit stays),
+/// and holds what the discard left, which
 /// `DiscardVirtualMemory` does not make zeros. Its first access, by a host
 /// thread or a vCPU (WHP keeps the host's protection, so a vCPU's access
-/// exits to [`wick_mm::commit_on_access`]), charges it, zeroes it through the
+/// exits to [`wick_mm::commit_on_access`]), makes sure of its charge (a no-op
+/// for a page still charged), zeroes it through the
 /// alias while it is still closed, and opens it ([`resolve_stale`]): no
 /// thread or vCPU sees what was there. Taken after the table's lock and
 /// before [`CHARGES`].
