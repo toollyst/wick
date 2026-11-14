@@ -61,6 +61,13 @@ pub mod whp_exit;
 #[path = "../../crates/compat/kvm-ioctls/src/whp/apicmode.rs"]
 pub mod whp_apicmode;
 
+/// What the WHP backend does with a guest #GP on its x2APIC partition
+/// (`crates/compat/kvm-ioctls/src/whp/gp.rs`), compiled from its source (it
+/// uses nothing but `core`) so its tests run on every host.
+#[allow(unreachable_pub, dead_code)]
+#[path = "../../crates/compat/kvm-ioctls/src/whp/gp.rs"]
+pub mod whp_gp;
+
 /// The CR4 values the WHP backend's `KVM_SET_SREGS` takes, as KVM decides
 /// them (`crates/compat/kvm-ioctls/src/whp/cr4.rs`), compiled from its
 /// source (it uses nothing but `core`) so its tests run on every host.

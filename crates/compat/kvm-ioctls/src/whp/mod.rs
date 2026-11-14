@@ -34,6 +34,7 @@ mod cr4;
 mod debug;
 mod emulate;
 mod exit;
+mod gp;
 mod ffi;
 mod guest_mem;
 mod irqchip;

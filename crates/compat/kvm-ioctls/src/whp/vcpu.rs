@@ -1811,69 +1811,174 @@ impl VcpuFd {
 
                 whv::WHvRunVpExitReasonUnrecoverableException => return Ok(VcpuExit::Shutdown),
 
-                // #DB or #BP for the gdb stub (only a partition made with
-                // the `gdb` feature has exception exits).
-                #[cfg(feature = "gdb")]
+                // A guest #GP on an x2APIC partition (`gp`), or #DB or #BP
+                // for the gdb stub (a partition made with the `gdb`
+                // feature).
                 whv::WHvRunVpExitReasonException => {
                     // SAFETY: the union arm matches the exit reason.
                     let ex = unsafe { ctx.Anonymous.VpException };
-                    let mut state = self.shared.debug.lock().unwrap();
-                    if let Some(mut w) = state.window.take() {
-                        let vector = ex.ExceptionType;
-                        // The linear address DR0 compares: RIP in 64-bit
-                        // code (every IA-32e handler), CS's base plus RIP
-                        // otherwise.
-                        // SAFETY: plain 16-bit views of the exit context's bit fields.
-                        let (mode, cs) = unsafe { (ctx.VpContext.ExecutionState.AsUINT16, ctx.VpContext.Cs.Anonymous.Attributes) };
-                        let at = if super::exit::long_mode_code(mode, cs) {
-                            rip
-                        } else {
-                            ctx.VpContext.Cs.Base.wrapping_add(rip) & 0xFFFF_FFFF
-                        };
-                        // The sequence of a window's exits, for the tests on a
-                        // WHP machine (`bp_tests`).
-                        #[cfg(test)]
-                        eprintln!(
-                            "BPTEST window exit: vector {vector}, RIP {rip:#x} (linear {at:#x}), error code {:#x}, \
-                             parameter {:#x}; delivering vector {} to handler {:?}, faults intercepted {:#x}",
-                            ex.ErrorCode,
-                            ex.ExceptionParameter,
-                            w.vector,
-                            w.handler.map(|h| format!("{h:#x}")),
-                            w.faults
-                        );
-                        if vector == super::debug::DB_VECTOR && w.handler == Some(at) {
-                            // The delivery reached its handler: the window's
-                            // end. The guest goes on into the handler.
+                    #[cfg(feature = "gdb")]
+                    {
+                        let mut state = self.shared.debug.lock().unwrap();
+                        if let Some(mut w) = state.window.take() {
+                            let vector = ex.ExceptionType;
+                            // The linear address DR0 compares: RIP in 64-bit
+                            // code (every IA-32e handler), CS's base plus RIP
+                            // otherwise.
+                            // SAFETY: plain 16-bit views of the exit context's bit fields.
+                            let (mode, cs) = unsafe { (ctx.VpContext.ExecutionState.AsUINT16, ctx.VpContext.Cs.Anonymous.Attributes) };
+                            let at = if super::exit::long_mode_code(mode, cs) {
+                                rip
+                            } else {
+                                ctx.VpContext.Cs.Base.wrapping_add(rip) & 0xFFFF_FFFF
+                            };
+                            // The sequence of a window's exits, for the tests on a
+                            // WHP machine (`bp_tests`).
+                            #[cfg(test)]
+                            eprintln!(
+                                "BPTEST window exit: vector {vector}, RIP {rip:#x} (linear {at:#x}), error code {:#x}, \
+                                 parameter {:#x}; delivering vector {} to handler {:?}, faults intercepted {:#x}",
+                                ex.ErrorCode,
+                                ex.ExceptionParameter,
+                                w.vector,
+                                w.handler.map(|h| format!("{h:#x}")),
+                                w.faults
+                            );
+                            if vector == super::debug::DB_VECTOR && w.handler == Some(at) {
+                                // The delivery reached its handler: the window's
+                                // end. The guest goes on into the handler.
+                                self.shared.close_window(&w)?;
+                                continue;
+                            }
+                            if vector < 64 && w.faults & (1u64 << vector) != 0 {
+                                // The delivery faulted: a round for that fault.
+                                let round = self.window_round(&mut w, vector);
+                                state.window = Some(w);
+                                round?;
+                                continue;
+                            }
+                            // Anything else (a #DB elsewhere: the guest's own
+                            // TF or breakpoint): the window ends, and the exit
+                            // is gdb's as any other.
                             self.shared.close_window(&w)?;
-                            continue;
                         }
-                        if vector < 64 && w.faults & (1u64 << vector) != 0 {
-                            // The delivery faulted: a round for that fault.
-                            let round = self.window_round(&mut w, vector);
-                            state.window = Some(w);
-                            round?;
-                            continue;
+                        // A #GP is the run loop's, below.
+                        if ex.ExceptionType != super::gp::GP_VECTOR {
+                            let dr7 = state.hw.map_or(0, |(_, dr7)| dr7);
+                            let Some(arch) = super::debug::debug_exit(ex.ExceptionType, rip, ex.ExceptionParameter, dr7)
+                            else {
+                                return Ok(VcpuExit::InternalError);
+                            };
+                            if ex.ExceptionType == super::debug::DB_VECTOR && super::debug::at_hw_breakpoint(rip, &state) {
+                                state.resume_rf = true;
+                            }
+                            return Ok(VcpuExit::Debug(arch));
                         }
-                        // Anything else (a #DB elsewhere: the guest's own
-                        // TF or breakpoint): the window ends, and the exit
-                        // is gdb's as any other.
-                        self.shared.close_window(&w)?;
                     }
-                    let dr7 = state.hw.map_or(0, |(_, dr7)| dr7);
-                    let Some(arch) = super::debug::debug_exit(ex.ExceptionType, rip, ex.ExceptionParameter, dr7)
-                    else {
+                    if ex.ExceptionType != super::gp::GP_VECTOR {
                         return Ok(VcpuExit::InternalError);
-                    };
-                    if ex.ExceptionType == super::debug::DB_VECTOR && super::debug::at_hw_breakpoint(rip, &state) {
-                        state.resume_rf = true;
                     }
-                    return Ok(VcpuExit::Debug(arch));
+                    match self.gp_exit(&ctx.VpContext, &ex)? {
+                        Some(exit) => return Ok(exit),
+                        None => continue,
+                    }
                 }
 
                 _ => return Ok(VcpuExit::InternalError),
             }
         }
+    }
+
+    /// A guest #GP that WHP handed the run loop (`gp`): the guest's x2APIC
+    /// write of the LVT timer entry is finished as KVM finishes it
+    /// ([`Self::write_x2apic_lvtt`]); any other #GP goes back to the guest,
+    /// merged with the event WHP was delivering ([`super::gp::give_back`]),
+    /// or ends as a triple fault (`VcpuExit::Shutdown`). Per vCPU only: the
+    /// exit context and this vCPU's registers, no lock another vCPU or the
+    /// VMM's thread waits on, no allocation and no log line, so that a
+    /// guest's storm of #GPs costs only its own vCPU's thread, under the
+    /// jail's CPU limit like any guest work.
+    fn gp_exit(&self, vpctx: &whv::WHV_VP_EXIT_CONTEXT, ex: &whv::WHV_VP_EXCEPTION_CONTEXT) -> Result<Option<VcpuExit<'static>>> {
+        let (part, vp) = (self.part(), self.vp());
+        // SAFETY: plain 16-bit views of the exit context's bit fields.
+        let (state, cs) = unsafe { (vpctx.ExecutionState.AsUINT16, vpctx.Cs.Anonymous.Attributes) };
+        let cpl = super::exit::cpl(state);
+        // `WHV_X64_VP_EXECUTION_STATE.InterruptionPending`, bit 6.
+        let delivering = state >> 6 & 1 == 1;
+        let long = super::exit::long_mode_code(state, cs);
+        let bytes = &ex.InstructionBytes[..usize::from(ex.InstructionByteCount).min(ex.InstructionBytes.len())];
+        if super::gp::may_emulate(cpl, delivering, bytes, long) {
+            let apic_base = self.register(whv::WHvX64RegisterApicBase)?;
+            #[allow(clippy::cast_possible_truncation)]
+            let (ecx, eax) = (self.register(whv::WHvX64RegisterRcx)? as u32, self.register(whv::WHvX64RegisterRax)? as u32);
+            let x2apic = apic_base & tscdeadline::APIC_BASE_EXTD != 0;
+            if let super::gp::Decision::LvttWrite { length, eax } = super::gp::decide(cpl, delivering, bytes, long, x2apic, ecx, eax) {
+                self.write_x2apic_lvtt(eax)?;
+                self.end_shadow(vpctx, false)?;
+                regs::set_rip(part, vp, vpctx.Rip + u64::from(length))?;
+                return Ok(None);
+            }
+        }
+        let pending = if delivering {
+            super::ffi::as_u64(&super::ffi::get_register(part, vp, whv::WHvRegisterPendingInterruption)?)
+        } else {
+            0
+        };
+        match super::gp::give_back(pending, ex.ErrorCode) {
+            super::gp::GiveBack::Event(event) => {
+                super::ffi::set_register(part, vp, whv::WHvRegisterPendingInterruption, super::ffi::reg64(event))?;
+                Ok(None)
+            }
+            super::gp::GiveBack::Shutdown => Ok(Some(VcpuExit::Shutdown)),
+        }
+    }
+
+    /// The guest's x2APIC write of the LVT timer entry (MSR 0x832's low 32
+    /// bits `eax`), which WHP refuses in TSC-deadline mode, as KVM's
+    /// `kvm_lapic_reg_write` takes it (`gp::lvtt_write`): the entry gets
+    /// KVM's value, and a change into or out of TSC-deadline mode cancels
+    /// the timer, zeroes the initial count and the deadline, as
+    /// `apic_update_lvtt` (Linux v6.1 arch/x86/kvm/lapic.c 1583-1599). The
+    /// entry is written through `WHvX64RegisterApicLvtTimer` and read back;
+    /// a value WHP does not keep that way is written through the APIC
+    /// register page (KVM_SET_LAPIC's way, which keeps TSC-deadline mode:
+    /// X2E0REC g, CI run 43528910212: the guest's RDMSR then read
+    /// 0x400ec), and one it keeps neither way fails the vCPU, named.
+    fn write_x2apic_lvtt(&self, eax: u32) -> Result<()> {
+        let (part, vp) = (self.part(), self.vp());
+        let sw_enabled = self.register(whv::WHvX64RegisterApicSpurious)? & (1 << 8) != 0;
+        let deadline_cpuid = cpuid_has(&self.shared.cpuid.lock().unwrap(), 1, 0, 2, 24);
+        let value = super::gp::lvtt_write(eax, sw_enabled, deadline_cpuid);
+        #[allow(clippy::cast_possible_truncation)]
+        let old = self.register(whv::WHvX64RegisterApicLvtTimer)? as u32;
+        if super::gp::tsc_deadline_mode(old) != super::gp::tsc_deadline_mode(value) {
+            let shared = &self.shared;
+            shared.deadline_gen.fetch_add(1, Ordering::SeqCst);
+            shared.deadline_fired.store(0, Ordering::SeqCst);
+            shared.inner.deadlines.disarm(vp);
+            shared.tsc_deadline.store(0, Ordering::SeqCst);
+            super::ffi::set_register(part, vp, whv::WHvX64RegisterApicInitCount, super::ffi::reg64(0))?;
+        }
+        let kept = |this: &Self| -> Result<bool> { Ok(this.register(whv::WHvX64RegisterApicLvtTimer)? as u32 == value) };
+        if super::ffi::set_register(part, vp, whv::WHvX64RegisterApicLvtTimer, super::ffi::reg64(u64::from(value))).is_ok() && kept(self)? {
+            return Ok(());
+        }
+        let (mut page, size) = self.lapic_page()?;
+        page[0x320..0x324].copy_from_slice(&value.to_le_bytes());
+        // SAFETY: the register page is valid for `size` bytes.
+        let hres = unsafe { whv::WHvSetVirtualProcessorInterruptControllerState(part, vp, page.as_ptr().cast(), size) };
+        super::ffi::hr_of("WHvSetVirtualProcessorInterruptControllerState", hres, || format!("vp {vp}"))?;
+        if kept(self)? {
+            return Ok(());
+        }
+        super::ffi::report(
+            log::Level::Error,
+            &format!(
+                "whp: vCPU {vp}'s x2APIC write of the LVT timer entry ({value:#x}) was kept neither through \
+                 WHvX64RegisterApicLvtTimer nor through the APIC register page: its timer would not be the guest's"
+            ),
+        );
+        err(libc::EIO)
     }
 
     /// Leaves the interrupt shadow as KVM leaves it after an instruction the
@@ -6171,13 +6276,15 @@ mod fpu_tests {
                 l.regs[at + i] = b as std::os::raw::c_char;
             }
         };
-        // Software-enabled; for vCPU 1 the timer one-shot with no count, as
-        // the page shows TSC-deadline mode, at `vector`.
-        let enable = |v: &VcpuFd, vector: Option<u32>| {
+        // Software-enabled; for vCPU 1 the timer in TSC-deadline mode at
+        // `vector`: in x2APIC mode as written (KVM_SET_LAPIC keeps the mode
+        // in WHP's entry: X2E0REC g), in xAPIC mode as WHP shows it there
+        // (one-shot with no count, `tscdeadline::deadline_mode`).
+        let enable = |v: &VcpuFd, lvtt: Option<u32>| {
             let mut l = v.get_lapic().unwrap();
             set(&mut l, 0xf0, 0x1ff);
-            if let Some(vector) = vector {
-                set(&mut l, 0x320, vector);
+            if let Some(lvtt) = lvtt {
+                set(&mut l, 0x320, lvtt);
                 set(&mut l, 0x380, 0);
             }
             v.set_lapic(&l).unwrap();

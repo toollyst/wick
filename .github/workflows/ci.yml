@@ -694,9 +694,9 @@ jobs:
       # (fuzz/src/lib.rs: hvf/exit.rs, whp/exit.rs, ...) with their own
       # unit tests, on every host: the WHP run loop's MMIO read bookkeeping
       # (whp_exit::tests), the WHP backend's TSC matching
-      # (whp_tscsync::tests), its CPUID x2APIC rule (whp_apicmode::tests)
-      # and KVM's CR4 rule (whp_cr4::tests) are checked on Linux and macOS
-      # too.
+      # (whp_tscsync::tests), its CPUID x2APIC rule (whp_apicmode::tests),
+      # its #GP exit's decode and merge (whp_gp::tests) and KVM's CR4 rule
+      # (whp_cr4::tests) are checked on Linux and macOS too.
       - name: The fuzzed modules' unit tests
         run: cargo test --manifest-path fuzz/Cargo.toml --lib
       - name: Fuzz each target for 60 seconds
