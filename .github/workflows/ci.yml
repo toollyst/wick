@@ -1295,6 +1295,14 @@ jobs:
           # vCPU runs fails.
           alone whp::vcpu::fpu_tests::test_tsc_matching_and_partition_time_on_record
           alone whp::vcpu::fpu_tests::test_restored_vcpus_take_one_tsc_offset_as_kvm
+          # The MSRs a guest reaches that WHP hands the backend, answered as
+          # KVM v6.1 answers a Firecracker guest (MSRTEST lines: a guest's
+          # RDMSR and WRMSR of each, its value or #GP(0)); and those KVM
+          # keeps for each vCPU, listed, read and written through
+          # KVM_GET_MSRS and KVM_SET_MSRS, carried by a restore, refused as
+          # KVM refuses.
+          alone whp::vcpu::fpu_tests::test_the_msrs_a_guest_reaches_are_answered_as_kvm
+          alone whp::vcpu::fpu_tests::test_the_msrs_kvm_keeps_restore_as_kvm
           # TSC_ADJUST offered to the guest as KVM offers it (TSCADJREC
           # lines): the CPUID bit in the host, the table and the guest; the
           # guest's RDMSR/WRMSR of 0x3b and how far a write moves its TSC;

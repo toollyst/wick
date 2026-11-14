@@ -55,6 +55,15 @@ pub(crate) type Ram = Mutex<HashMap<u32, Slot>>;
 pub(crate) const MSR_WALL_CLOCK: u32 = 0x4b56_4d00;
 /// `MSR_KVM_SYSTEM_TIME_NEW`.
 pub(crate) const MSR_SYSTEM_TIME: u32 = 0x4b56_4d01;
+/// `MSR_KVM_WALL_CLOCK` and `MSR_KVM_SYSTEM_TIME`, kvm-clock's first pair,
+/// which KVM answers as the new pair with no PV CPUID enforcement (Linux
+/// v6.1 arch/x86/kvm/x86.c 3689-3714, 4086-4109): the same wall clock and
+/// the same per-vCPU time info. Not as KVM: vCPU 0's write of the old
+/// system time turns KVM's master clock off (`boot_vcpu_runs_old_kvmclock`,
+/// x86.c 2302-2327), and its time info then lacks PVCLOCK_TSC_STABLE_BIT;
+/// here it keeps it, as for the new pair (the Guest MSRs row).
+pub(crate) const MSR_WALL_CLOCK_OLD: u32 = 0x11;
+pub(crate) const MSR_SYSTEM_TIME_OLD: u32 = 0x12;
 /// `KVM_FEATURE_CLOCKSOURCE2`.
 pub(crate) const FEATURE_CLOCKSOURCE2: u32 = 1 << 3;
 /// `KVM_FEATURE_CLOCKSOURCE_STABLE_BIT`.

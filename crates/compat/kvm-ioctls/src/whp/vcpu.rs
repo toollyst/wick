@@ -233,6 +233,9 @@ pub(crate) struct VcpuShared {
     tsc_adjust_base: AtomicU64,
     /// The machine-check MSRs, as KVM keeps them for each vCPU (`mce`).
     mce: Mutex<super::mce::Mce>,
+    /// The other MSRs KVM keeps for a vCPU that no WHP register holds
+    /// (`kvmmsr::Kept`).
+    kept: Mutex<super::kvmmsr::Kept>,
     /// Bumped by every write of `IA32_TSC_DEADLINE`, so that a timer armed
     /// by an earlier write cannot fire for a later one.
     deadline_gen: AtomicU64,
@@ -496,6 +499,10 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         misc_enable: AtomicU64::new(0),
         tsc_adjust_base: AtomicU64::new(0),
         mce: Mutex::new(super::mce::Mce::default()),
+        kept: Mutex::new(super::kvmmsr::Kept::new(
+            regs::host_vendor(),
+            core::arch::x86_64::__cpuid(0x8000_0001).ecx >> 9 & 1 == 1,
+        )),
         deadline_gen: AtomicU64::new(0),
         deadline_fired: AtomicU64::new(0),
         debug: Mutex::new(super::debug::State::default()),
@@ -1013,10 +1020,14 @@ impl VcpuFd {
 
     pub fn get_msrs(&self, msrs: &mut Msrs) -> Result<usize> {
         let n = regs::get_msrs(self.part(), self.vp(), msrs)?;
+        let vendor = regs::host_vendor();
+        let guest = self.msr_guest();
         let mce = self.shared.mce.lock().unwrap();
-        // The kvm-clock MSRs, IA32_TSC_DEADLINE and the machine-check MSRs
-        // are this backend's (see `pvclock`, `tscdeadline`, `mce`); a read
-        // KVM refuses ends the call there, as in `__msr_io`.
+        let kept = *self.shared.kept.lock().unwrap();
+        // The kvm-clock MSRs, IA32_TSC_DEADLINE, the machine-check MSRs and
+        // the others KVM keeps for a vCPU are this backend's (see `pvclock`,
+        // `tscdeadline`, `mce`, `kvmmsr`); a read KVM refuses ends the call
+        // there, as in `__msr_io`.
         for (i, e) in msrs.as_mut_slice().iter_mut().take(n).enumerate() {
             if super::mce::is_mce(e.index) {
                 match mce.get(e.index, true) {
@@ -1026,10 +1037,21 @@ impl VcpuFd {
                 continue;
             }
             match e.index {
-                pvclock::MSR_SYSTEM_TIME => e.data = self.shared.system_time_msr.load(Ordering::Acquire),
-                pvclock::MSR_WALL_CLOCK => e.data = self.shared.inner.pvclock.lock().unwrap().wall_msr,
+                pvclock::MSR_SYSTEM_TIME | pvclock::MSR_SYSTEM_TIME_OLD => {
+                    e.data = self.shared.system_time_msr.load(Ordering::Acquire);
+                }
+                pvclock::MSR_WALL_CLOCK | pvclock::MSR_WALL_CLOCK_OLD => {
+                    e.data = self.shared.inner.pvclock.lock().unwrap().wall_msr;
+                }
                 MSR_TSC_DEADLINE => e.data = self.read_tsc_deadline()?,
-                i if regs::software_msr(i) => e.data = self.software_msr(i).load(Ordering::Acquire),
+                index if regs::software_msr(index) => e.data = self.software_msr(index).load(Ordering::Acquire),
+                index if regs::has_msr(index) && super::kvmmsr::host_has(vendor, index, &super::kvmmsr::Guest { osvw: true, ..guest }) => {
+                    // OSVW without OSVW in the vCPU's CPUID ends the call, as KVM's.
+                    match kept.host_get(vendor, index, &guest) {
+                        Some(v) => e.data = v,
+                        None => return Ok(i),
+                    }
+                }
                 _ => {}
             }
         }
@@ -1038,24 +1060,53 @@ impl VcpuFd {
     pub fn set_msrs(&self, msrs: &Msrs) -> Result<usize> {
         // As KVM's `__msr_io`: the entries up to the first one refused are
         // written, a machine-check MSR's write refused as `set_msr_mce`
-        // refuses it (`mce`), and nothing after it.
-        // The machine-check ones are kept only for the entries the call
-        // wrote (`n`), so that a call WHP ends earlier keeps none after it.
+        // refuses it (`mce`), one of `kvmmsr::Kept`'s as KVM's refuses it
+        // (or as this backend must, said), and nothing after it.
+        // The machine-check ones and `Kept`'s are kept only for the entries
+        // the call wrote (`n`), so that a call WHP ends earlier keeps none
+        // after it.
         let entries = msrs.as_slice();
+        let vendor = regs::host_vendor();
+        let guest = self.msr_guest();
+        let ram = |gpa: u64, len: u64| self.guest_ram(gpa, len);
         let mut mce = self.shared.mce.lock().unwrap();
+        let mut kept = self.shared.kept.lock().unwrap();
         let mut trial = mce.clone();
+        let mut trial_kept = *kept;
         let mut count = 0;
         for e in entries {
             if !regs::has_msr(e.index) || (super::mce::is_mce(e.index) && !trial.set(e.index, e.data, true, false)) {
                 break;
             }
+            match trial_kept.host_set(vendor, e.index, e.data, &guest, &ram) {
+                None | Some(super::kvmmsr::HostSet::Taken) => {}
+                Some(super::kvmmsr::HostSet::Refused) => break,
+                Some(super::kvmmsr::HostSet::Unsupported(what)) => {
+                    super::ffi::report(
+                        log::Level::Error,
+                        &format!(
+                            "whp: vCPU {}'s KVM_SET_MSRS of {:#x} ({:#x}) refused, where KVM takes it: {what} \
+                             (docs/COMPATIBILITY.md, the Guest MSRs row)",
+                            self.vp(),
+                            e.index,
+                            e.data
+                        ),
+                    );
+                    break;
+                }
+            }
             count += 1;
         }
         let head = Msrs::from_entries(&entries[..count]).map_err(|_| super::Error::new(libc::EINVAL))?;
         let n = regs::set_msrs(self.part(), self.vp(), &head)?;
-        for e in entries.iter().take(n).filter(|e| super::mce::is_mce(e.index)) {
-            mce.set(e.index, e.data, true, false);
+        for e in entries.iter().take(n) {
+            if super::mce::is_mce(e.index) {
+                mce.set(e.index, e.data, true, false);
+            } else {
+                let _ = kept.host_set(vendor, e.index, e.data, &guest, &ram);
+            }
         }
+        drop(kept);
         drop(mce);
         for e in msrs.as_slice().iter().take(n) {
             if e.index == regs::MSR_IA32_TSC {
@@ -1075,6 +1126,100 @@ impl VcpuFd {
             self.shared.tsc_adjust_base.store(now, Ordering::Release);
         }
         Ok(n)
+    }
+
+    /// Whether `len` bytes at `gpa` are guest RAM in one memory slot, as
+    /// KVM's `kvm_gfn_to_hva_cache_init` finds them (`kvmmsr`'s checks).
+    fn guest_ram(&self, gpa: u64, len: u64) -> bool {
+        let inner = &self.shared.inner;
+        len > 0
+            && gpa.checked_add(len - 1).is_some_and(|last| {
+                matches!((inner.host_addr(gpa), inner.host_addr(last)), (Some(a), Some(b)) if b - a == len - 1)
+            })
+    }
+
+    /// What `kvmmsr::answer` reads of the guest's CPUID (the vCPU's last
+    /// `KVM_SET_CPUID2`), of the vCPU's MSRs, and of the host, each as its
+    /// field says: the host facts KVM reads that a Windows process cannot
+    /// (docs/COMPATIBILITY.md, the Guest MSRs row) as KVM on a host with
+    /// LFENCE_RDTSC (every AMD processor with SSE2, Linux v6.1
+    /// arch/x86/kernel/cpu/amd.c 959-971), without LBR virtualization or
+    /// TSC scaling for its guests (`lbrv`, `tsc_scaling`, wick having no
+    /// nested SVM), without nested VMX, and without CONFIG_SCHED_INFO (no
+    /// steal time).
+    fn msr_guest(&self) -> super::kvmmsr::Guest {
+        let table = self.shared.cpuid.lock().unwrap();
+        let leaf = |function: u32, index: u32| {
+            table
+                .iter()
+                .find(|e| e.function == function && (e.flags & kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX == 0 || e.index == index))
+                .map_or((0, 0, 0, 0), |e| (e.eax, e.ebx, e.ecx, e.edx))
+        };
+        let bit = |v: u32, n: u32| v >> n & 1 == 1;
+        let host7 = core::arch::x86_64::__cpuid_count(7, 0);
+        let host_ext8 = core::arch::x86_64::__cpuid(0x8000_0008);
+        let (_, v_ebx, v_ecx, v_edx) = leaf(0, 0);
+        let has_leaf1 = table.iter().any(|e| e.function == 1);
+        let (l1_eax, _, l1_ecx, l1_edx) = leaf(1, 0);
+        let (_, l7_ebx, l7_ecx, l7_edx) = leaf(7, 0);
+        let (d0_eax, _, _, d0_edx) = leaf(0xd, 0);
+        let (d1_eax, _, _, _) = leaf(0xd, 1);
+        let (_, _, e1_ecx, e1_edx) = leaf(0x8000_0001, 0);
+        let (e8_eax, e8_ebx, _, _) = leaf(0x8000_0008, 0);
+        let (_, _, _, ea_edx) = leaf(0x8000_000a, 0);
+        let (hv_eax, _, _, _) = leaf(0x4000_0001, 0);
+        // `guest_cpuid_family`/`_model` (cpuid.h:128-150, x86_family/x86_model).
+        let family_model = has_leaf1.then(|| {
+            let base = l1_eax >> 8 & 0xf;
+            let family = if base == 0xf { base + (l1_eax >> 20 & 0xff) } else { base };
+            let model = (l1_eax >> 4 & 0xf) | if family >= 6 { (l1_eax >> 16 & 0xf) << 4 } else { 0 };
+            (family, model)
+        });
+        // `cpuid_query_maxphyaddr` (cpuid.c): 36 without leaf 0x8000_0008.
+        let maxphyaddr = if e8_eax & 0xff == 0 { 36 } else { e8_eax & 0xff };
+        // XFEATURE_MASK_USER_DYNAMIC, XTILEDATA (bit 18), of the guest's XCR0.
+        let xcr0 = u64::from(d0_eax) | (u64::from(d0_edx) << 32);
+        let kept = *self.shared.kept.lock().unwrap();
+        super::kvmmsr::Guest {
+            intel_guest: (v_ebx, v_edx, v_ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e),
+            amd_or_hygon_guest: super::exit::guest_vendor_amd_or_hygon(v_ebx, v_ecx, v_edx),
+            family_model,
+            vmx: bit(l1_ecx, 5),
+            pdcm: bit(l1_ecx, 15),
+            ds: bit(l1_edx, 21),
+            tsc_adjust: bit(l7_ebx, 1),
+            sgx: bit(l7_ebx, 2),
+            mpx: bit(l7_ebx, 14),
+            waitpkg: bit(l7_ecx, 5) && bit(host7.ecx, 5),
+            rdpid: bit(l7_ecx, 22),
+            sgx_lc: bit(l7_ecx, 30),
+            spec_ctrl: bit(l7_edx, 26),
+            arch_capabilities: bit(l7_edx, 29),
+            xsaves: bit(d1_eax, 3),
+            xfd: bit(d1_eax, 4),
+            osvw: bit(e1_ecx, 9),
+            rdtscp: bit(e1_edx, 27),
+            amd_ibpb: bit(e8_ebx, 12),
+            amd_ibrs: bit(e8_ebx, 14),
+            amd_stibp: bit(e8_ebx, 15),
+            amd_ssbd: bit(e8_ebx, 24),
+            virt_ssbd: bit(e8_ebx, 25),
+            tscratemsr: bit(ea_edx, 4),
+            hyperv: hv_eax == 0x3123_7648,
+            guest_xfd_mask: xcr0 & (1 << 18),
+            reserved_gpa_bits: if maxphyaddr >= 64 { 0 } else { !0u64 << maxphyaddr },
+            arch_capabilities_value: 0,
+            platform_info: kept.platform_info,
+            perf_capabilities: 0,
+            host_lfence_rdtsc: regs::host_vendor() == super::kvmmsr::Vendor::Amd,
+            host_ibpb: bit(host7.edx, 26) || bit(host_ext8.ebx, 12),
+            host_mpx: bit(host7.ebx, 14) && regs::host_xfeatures().0 & 0x18 == 0x18,
+            host_lbrv: false,
+            host_tsc_scaling: false,
+            nested: false,
+            host_sched_info: false,
+            bus_lock_detect: bit(l7_ecx, 24) && bit(host7.ecx, 24),
+        }
     }
 
     /// The vCPU's copy of a [`regs::software_msr`].
@@ -1270,14 +1415,14 @@ impl VcpuFd {
         let inner = &self.shared.inner;
         let now = || inner.irqchip.lock().unwrap().clock().clock;
         match index {
-            pvclock::MSR_SYSTEM_TIME => {
+            pvclock::MSR_SYSTEM_TIME | pvclock::MSR_SYSTEM_TIME_OLD => {
                 self.shared.system_time_msr.store(value, Ordering::Release);
                 let generation = inner.pvclock.lock().unwrap().generation;
                 self.shared.clock_gen.store(generation, Ordering::Release);
                 pvclock::system_time(&inner.pvclock, self.part(), self.vp(), value, inner.ram(), now)?;
                 Ok(true)
             }
-            pvclock::MSR_WALL_CLOCK => {
+            pvclock::MSR_WALL_CLOCK | pvclock::MSR_WALL_CLOCK_OLD => {
                 pvclock::wall_clock(&inner.pvclock, value, inner.ram(), now());
                 Ok(true)
             }
@@ -2670,11 +2815,12 @@ impl VcpuFd {
 
     /// Answers an MSR intercept. WHP only exits for MSRs it does not model.
     /// An x2APIC register's MSR outside x2APIC mode is #GP(0), as KVM's
-    /// (`apicmode::x2apic_msr_exit`). Any other MSR the backend does not
-    /// keep is read as 0 and its write ignored, as KVM does only with
-    /// `ignore_msrs`, which is off by default (KVM gives #GP(0) for an MSR
-    /// it has no case for): not KVM's yet (docs/COMPATIBILITY.md, the Guest
-    /// MSRs row).
+    /// (`apicmode::x2apic_msr_exit`). Any other is answered as KVM v6.1
+    /// answers a Firecracker guest (`kvm_msr`, from `kvmmsr::answer`):
+    /// kept, read as a constant, ignored, or #GP(0) for an MSR KVM has no
+    /// case for (`ignore_msrs` off), each #GP named (`say_gp_msr`); one
+    /// KVM delegates to a part the backend lacks fails the vCPU, named
+    /// (docs/COMPATIBILITY.md, the Guest MSRs row).
     fn handle_msr(
         &self,
         m: &whv::WHV_X64_MSR_ACCESS_CONTEXT,
@@ -2754,35 +2900,116 @@ impl VcpuFd {
             }
             return regs::set_rip(self.part(), self.vp(), rip_after);
         }
-        if is_write {
-            if index == MSR_TSC_DEADLINE {
+        if index == MSR_TSC_DEADLINE {
+            if is_write {
                 self.write_tsc_deadline(value)?;
-            } else if regs::software_msr(index) {
-                if !self.write_software_msr(index, value, false)? {
-                    // #GP(0), RIP left at the WRMSR, as KVM's refused write.
-                    return super::ffi::set_register(
-                        self.part(),
-                        self.vp(),
-                        whv::WHvRegisterPendingInterruption,
-                        super::ffi::reg64(super::debug::pending_gp()),
-                    );
-                }
-            } else if !self.write_kvm_msr(index, value)? {
-                say_unkept_msr(self.vp(), index, Some(value));
+                return regs::set_rip(self.part(), self.vp(), rip_after);
             }
-            regs::set_rip(self.part(), self.vp(), rip_after)
-        } else {
-            let value = match index {
-                pvclock::MSR_SYSTEM_TIME => self.shared.system_time_msr.load(Ordering::Acquire),
-                pvclock::MSR_WALL_CLOCK => self.shared.inner.pvclock.lock().unwrap().wall_msr,
-                MSR_TSC_DEADLINE => self.read_tsc_deadline()?,
-                i if regs::software_msr(i) => self.software_msr(i).load(Ordering::Acquire),
-                _ => {
-                    say_unkept_msr(self.vp(), index, None);
-                    0
+            return regs::set_msr_result(self.part(), self.vp(), self.read_tsc_deadline()?, rip_after);
+        }
+        if regs::software_msr(index) {
+            if !is_write {
+                return regs::set_msr_result(self.part(), self.vp(), self.software_msr(index).load(Ordering::Acquire), rip_after);
+            }
+            if !self.write_software_msr(index, value, false)? {
+                // #GP(0), RIP left at the WRMSR, as KVM's refused write.
+                return self.give_gp();
+            }
+            return regs::set_rip(self.part(), self.vp(), rip_after);
+        }
+        self.kvm_msr(index, is_write.then_some(value), rip_after)
+    }
+
+    /// #GP(0) for the instruction at RIP, left there, as KVM's
+    /// `kvm_complete_insn_gp` of a refused MSR access.
+    fn give_gp(&self) -> Result<()> {
+        super::ffi::set_register(self.part(), self.vp(), whv::WHvRegisterPendingInterruption, super::ffi::reg64(super::debug::pending_gp()))
+    }
+
+    /// A guest's RDMSR (`write` None) or WRMSR of `index`, an MSR none of
+    /// the backend's own (x2APIC, machine-check, TSC, TSC deadline, TSC_ADJUST
+    /// and MISC_ENABLE where the vCPU keeps them) and no WHP register, as KVM
+    /// answers it ([`super::kvmmsr::answer`]): a constant, a dropped write, a
+    /// value the vCPU keeps ([`super::kvmmsr::Kept`]), kvm-clock, or #GP(0)
+    /// where KVM's default gives it, with a `whp:` line ([`say_gp_msr`]).
+    /// One KVM keeps whose effect the backend cannot make (a value the
+    /// processor or the host acts on, or one WHP keeps in a register and
+    /// handed over all the same) fails the vCPU, named (`EIO`), rather than
+    /// be kept with no effect.
+    fn kvm_msr(&self, index: u32, write: Option<u64>, rip_after: u64) -> Result<()> {
+        use super::kvmmsr::{Answer, Delegate, Write};
+        let vendor = regs::host_vendor();
+        let guest = self.msr_guest();
+        let fail = |what: &str| {
+            super::ffi::report(
+                log::Level::Error,
+                &format!(
+                    "whp: vCPU {}'s {} of MSR {index:#x}{} reached the backend, which {what}: KVM's answer would be \
+                     made up here (docs/COMPATIBILITY.md, the Guest MSRs row)",
+                    self.vp(),
+                    if write.is_some() { "WRMSR" } else { "RDMSR" },
+                    write.map_or(String::new(), |v| format!(" ({v:#x})")),
+                ),
+            );
+            err(libc::EIO)
+        };
+        let gp = || {
+            say_gp_msr(self.vp(), index, write);
+            self.give_gp()
+        };
+        match super::kvmmsr::answer(vendor, index, write, &guest) {
+            Answer::Read(v) => regs::set_msr_result(self.part(), self.vp(), v, rip_after),
+            Answer::Ignore => regs::set_rip(self.part(), self.vp(), rip_after),
+            Answer::Gp => gp(),
+            Answer::State(key, check) => {
+                let mut kept = self.shared.kept.lock().unwrap();
+                match write {
+                    None => match kept.guest_read(key) {
+                        Some(v) => {
+                            drop(kept);
+                            regs::set_msr_result(self.part(), self.vp(), v, rip_after)
+                        }
+                        None => {
+                            drop(kept);
+                            fail(&format!("keeps nowhere ({key:?}: its effect is the processor's or the host's)"))
+                        }
+                    },
+                    Some(data) => {
+                        let efer = self.register(whv::WHvX64RegisterEfer)?;
+                        let ram = |gpa: u64, len: u64| self.guest_ram(gpa, len);
+                        let done = kept.guest_write(key, check, data, efer & (1 << 12) != 0, &ram);
+                        drop(kept);
+                        match done {
+                            Write::Taken => regs::set_rip(self.part(), self.vp(), rip_after),
+                            Write::Gp => gp(),
+                            Write::NotKept => fail(&format!("keeps nowhere ({key:?}: its effect is the processor's or the host's)")),
+                        }
+                    }
                 }
-            };
-            regs::set_msr_result(self.part(), self.vp(), value, rip_after)
+            }
+            Answer::Delegated(Delegate::KvmClock(_)) => match write {
+                Some(v) => {
+                    self.write_kvm_msr(index, v)?;
+                    regs::set_rip(self.part(), self.vp(), rip_after)
+                }
+                None => {
+                    let v = match index {
+                        pvclock::MSR_SYSTEM_TIME | pvclock::MSR_SYSTEM_TIME_OLD => self.shared.system_time_msr.load(Ordering::Acquire),
+                        _ => self.shared.inner.pvclock.lock().unwrap().wall_msr,
+                    };
+                    regs::set_msr_result(self.part(), self.vp(), v, rip_after)
+                }
+            },
+            Answer::Delegated(d) => fail(&format!(
+                "does not answer: it is {} ({d:?})",
+                match d {
+                    Delegate::WhpRegister | Delegate::Mtrr | Delegate::Tsc | Delegate::TscAdjust | Delegate::MiscEnable => {
+                        "one WHP keeps in a register and was to answer itself"
+                    }
+                    Delegate::Ibpb => "a command to the processor (an IBPB), which a Windows process cannot give",
+                    _ => "a subsystem this backend does not have",
+                }
+            )),
         }
     }
 }
@@ -2801,7 +3028,7 @@ thread_local! {
     static PAGE_WINDOW: std::cell::RefCell<Option<PageWindowHook>> = const { std::cell::RefCell::new(None) };
 }
 
-/// How many MSRs [`say_unkept_msr`] names in a process: a guest probing
+/// How many MSRs [`say_gp_msr`] names in a process: a guest probing
 /// MSRs in a loop makes one line each, up to this, then one more.
 const UNKEPT_NAMED: usize = 64;
 
@@ -2836,28 +3063,27 @@ fn unkept_line(seen: &mut Vec<(u32, bool)>, index: u32, write: bool) -> Unkept {
     }
 }
 
-/// Names, once a process, an MSR access that exited to the backend for an
-/// MSR neither WHP nor the backend keeps (`value`: the write's, or a read),
-/// which is read as 0 or its write ignored, where KVM gives #GP(0) for an
-/// MSR it has no case for (`ignore_msrs` off, Linux v6.1 x86.c 143,
-/// 1866-1876, 1911-1923): the record for the Guest MSRs row, which MSRs a
-/// guest's boot and upstream's tests reach this way, and a `whp:` line for
-/// the gap where it happens. At most [`UNKEPT_NAMED`] lines and one more.
-fn say_unkept_msr(vp: u32, index: u32, value: Option<u64>) {
+/// Says that a guest's RDMSR (`value` None) or WRMSR of `index` got
+/// #GP(0), as KVM gives a Firecracker guest it: an MSR KVM has no case for
+/// (`ignore_msrs` off, Linux v6.1 x86.c 143, 1866-1876, 1911-1923), or a
+/// write its case refuses (`kvmmsr::answer`). The record for the Guest
+/// MSRs row (`boot-test.ps1`'s MSRREC: which MSRs a guest's boot and
+/// upstream's tests reach this way), and a `whp:` line where it happens,
+/// as a guest that meets one is told nothing else. At most
+/// [`UNKEPT_NAMED`] lines and one more.
+fn say_gp_msr(vp: u32, index: u32, value: Option<u64>) {
     static SEEN: std::sync::Mutex<Vec<(u32, bool)>> = std::sync::Mutex::new(Vec::new());
     let said = unkept_line(&mut SEEN.lock().unwrap(), index, value.is_some());
     let line = match (said, value) {
         (Unkept::Said, _) => return,
-        (Unkept::Past, _) => format!(
-            "whp: more than {UNKEPT_NAMED} MSR accesses the backend does not keep: those past them are not named"
-        ),
+        (Unkept::Past, _) => format!("whp: more than {UNKEPT_NAMED} MSR accesses given #GP(0): those past them are not named"),
         (Unkept::First, Some(v)) => format!(
-            "whp: an MSR the backend does not keep: vCPU {vp}'s WRMSR of {index:#x} ({v:#x}) is ignored, where KVM \
-             gives #GP(0) for an MSR it has no case for (docs/COMPATIBILITY.md, the Guest MSRs row)"
+            "whp: vCPU {vp}'s WRMSR of {index:#x} ({v:#x}) is #GP(0), as KVM gives it a Firecracker guest \
+             (docs/COMPATIBILITY.md, the Guest MSRs row)"
         ),
         (Unkept::First, None) => format!(
-            "whp: an MSR the backend does not keep: vCPU {vp}'s RDMSR of {index:#x} reads 0, where KVM gives #GP(0) \
-             for an MSR it has no case for (docs/COMPATIBILITY.md, the Guest MSRs row)"
+            "whp: vCPU {vp}'s RDMSR of {index:#x} is #GP(0), as KVM gives it a Firecracker guest \
+             (docs/COMPATIBILITY.md, the Guest MSRs row)"
         ),
     };
     super::ffi::report(log::Level::Warn, &line);
@@ -11818,7 +12044,7 @@ mod lapic_format_tests {
     }
 
     #[test]
-    fn test_an_unkept_msr_is_named_once_and_the_names_are_bounded() {
+    fn test_a_gp_msr_is_named_once_and_the_names_are_bounded() {
         use super::{UNKEPT_NAMED, Unkept, unkept_line};
         let mut seen = Vec::new();
         assert_eq!(unkept_line(&mut seen, 0xc001_0015, false), Unkept::First);

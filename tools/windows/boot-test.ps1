@@ -1951,12 +1951,12 @@ function Format-StuckState($a, $b, [double]$seconds) {
     return ($lines -join "`n")
 }
 
-# The MSR accesses of a stage that exited to the backend for an MSR neither
-# WHP nor the backend keeps (read as 0 or the write ignored, where KVM gives
-# #GP(0): the Guest MSRs row of docs/COMPATIBILITY.md), from the backend's
-# "an MSR the backend does not keep" lines on stderr: the record of which
-# MSRs a Linux guest reaches that way (MSRREC). After the VM has exited.
-function Get-UnkeptMsrs($vm) {
+# The MSR accesses of a stage that exited to the backend and were given
+# #GP(0), as KVM gives them a Firecracker guest (the Guest MSRs row of
+# docs/COMPATIBILITY.md), from the backend's "is #GP(0), as KVM gives it"
+# lines on stderr: the record of which MSRs a Linux guest probes that KVM
+# has no case for (MSRREC). After the VM has exited.
+function Get-GpMsrs($vm) {
     $said = $vm.Output + "`n" + (Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue)
     $seen = [ordered]@{}
     foreach ($m in [regex]::Matches($said, "vCPU \d+'s (RDMSR|WRMSR) of (0x[0-9a-f]+)(?: \((0x[0-9a-f]+)\))?")) {
@@ -1965,7 +1965,7 @@ function Get-UnkeptMsrs($vm) {
             $seen[$key] = if ($m.Groups[3].Success) { "$key ($($m.Groups[3].Value))" } else { $key }
         }
     }
-    $more = if ($said -match 'MSR accesses the backend does not keep: those past them are not named') { ', and more not named' } else { '' }
+    $more = if ($said -match 'MSR accesses given #GP\(0\): those past them are not named') { ', and more not named' } else { '' }
     if ($seen.Count -eq 0) { return 'none' }
     return (@($seen.Values) -join ', ') + $more
 }
@@ -2055,8 +2055,8 @@ function Stage-Boot {
     Save-Dmesg $vm 'boot'
     $vm.Reboot()
     $vm.Drain(2000)
-    $msrs = Get-UnkeptMsrs $vm
-    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0; SRSO: {2}; MSRREC the MSRs the backend does not keep that the guest reached: {3}" -f $dt, $host_dt, (($srso -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | '), $msrs)
+    $msrs = Get-GpMsrs $vm
+    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0; SRSO: {2}; MSRREC the MSRs the guest reached that are #GP(0), as on KVM: {3}" -f $dt, $host_dt, (($srso -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | '), $msrs)
 }
 
 # CPU 1 taken offline and back online three times, then work on it: on x86
@@ -2143,7 +2143,7 @@ function Stage-Smp([string]$Name = 'smp') {
     Save-Dmesg $vm $Name
     $vm.Kill()
     # Its MSR lines are all in by now: the pumps are joined.
-    $msrsBooted = Get-UnkeptMsrs $vm
+    $msrsBooted = Get-GpMsrs $vm
     $vm = Start-Vm "$Name-restored" $null -Api
     Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
         snapshot_path = $state
@@ -2159,9 +2159,9 @@ function Stage-Smp([string]$Name = 'smp') {
     Save-Dmesg $vm "$Name-restored"
     $vm.Reboot()
     $vm.Drain(2000)
-    $msrs = Get-UnkeptMsrs $vm
+    $msrs = Get-GpMsrs $vm
     Remove-Item $state, $mem -ErrorAction SilentlyContinue
-    return "2 vCPUs online, work runs on each, clock agrees across vCPUs, TSCs agree (after boot: $warp; after the restore: $warpRestored), CPU 1 offline and online 3 times then working, after boot and after a snapshot restore (spurious LAPIC timer interrupts: $spurious, $spuriousRestored), reset exits 0; MSRREC the MSRs the backend does not keep that the booted guest reached: $msrsBooted; that the restored guest reached: $msrs"
+    return "2 vCPUs online, work runs on each, clock agrees across vCPUs, TSCs agree (after boot: $warp; after the restore: $warpRestored), CPU 1 offline and online 3 times then working, after boot and after a snapshot restore (spurious LAPIC timer interrupts: $spurious, $spuriousRestored), reset exits 0; MSRREC the MSRs that are #GP(0), as on KVM, that the booted guest reached: $msrsBooted; that the restored guest reached: $msrs"
 }
 
 function Stage-Block {

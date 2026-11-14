@@ -135,6 +135,11 @@ dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `
   `PROT_NONE` reservation, which the libc layer refused for large pages, so `hugepages` could not have passed.
   Fixed (docs/PORTING.md, row 10); a jailed Firecracker, whose token can have no privilege enabled, gets its large
   pages from the jailer (`test_hugetlb_through_the_broker`), and `hugepages` passes there, unjailed and jailed.
+- Guest MSRs: every MSR WHP hands the backend is answered as KVM v6.1 answers a Firecracker guest, #GP(0) where KVM
+  has no case for it, and the values KVM keeps for each vCPU are listed, read and written by `KVM_GET_MSRS` and
+  `KVM_SET_MSRS` and carried by a snapshot (not yet run on Windows). Left, each stated in docs/COMPATIBILITY.md's
+  Guest MSRs row: the PMU (KVM's AMD guest has four counters, here off), CPUID faulting, steal time, and an exit
+  for MTRRCAP and the variable MTRRs, which WHP answers with 16 pairs to KVM's 8.
 - Next: the stages written since, on that machine.
 - Not done: Nitro Enclaves (docs/COMPATIBILITY.md, `GET`, `PUT /enclave`). AWS documents Windows Server parents for
   enclaves and nested Hyper-V, which WHP needs, on instance types that are in both lists, so a Windows host can meet

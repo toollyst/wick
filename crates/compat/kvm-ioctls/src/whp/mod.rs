@@ -39,6 +39,7 @@ mod gp;
 mod ffi;
 mod guest_mem;
 mod irqchip;
+mod kvmmsr;
 mod mce;
 mod pvclock;
 mod regs;

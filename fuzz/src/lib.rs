@@ -68,6 +68,14 @@ pub mod whp_apicmode;
 #[path = "../../crates/compat/kvm-ioctls/src/whp/gp.rs"]
 pub mod whp_gp;
 
+/// KVM's answer to a guest's and the VMM's MSR accesses that no WHP
+/// register holds, as the WHP backend gives it
+/// (`crates/compat/kvm-ioctls/src/whp/kvmmsr.rs`), compiled from its source
+/// (it uses nothing but `core`) so its tests run on every host.
+#[allow(unreachable_pub, dead_code)]
+#[path = "../../crates/compat/kvm-ioctls/src/whp/kvmmsr.rs"]
+pub mod whp_kvmmsr;
+
 /// The CR4 values the WHP backend's `KVM_SET_SREGS` takes, as KVM decides
 /// them (`crates/compat/kvm-ioctls/src/whp/cr4.rs`), compiled from its
 /// source (it uses nothing but `core`) so its tests run on every host.

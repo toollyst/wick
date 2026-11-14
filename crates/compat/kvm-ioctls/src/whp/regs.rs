@@ -1021,6 +1021,18 @@ pub(crate) fn mask_unsupported(e: &mut kvm_bindings::kvm_cpuid_entry2) {
             // ECX: SVM, IBS, SKINIT, WDT, PERFCTR_CORE, PERFCTR_NB, MWAITX.
             e.ecx &= !bits(&[2, 10, 12, 13, 23, 24, 29]);
         }
+        (0x8000_0008, _) => {
+            // EBX: VIRT_SSBD. KVM offers it on a host with AMD_SSBD or
+            // LS_CFG_SSBD (Linux v6.1 arch/x86/kvm/svm/svm.c 4888-4891) and
+            // applies the guest's VIRT_SPEC_CTRL.SSBD to the host while the
+            // guest runs (svm.c 3973-3981); a Windows process can apply
+            // nothing to the host, so the MSR is #GP here, as KVM gives it
+            // to a guest without the bit (svm.c 2786-2792, 2946-2955), and
+            // the bit is not offered (the Guest MSRs row). A guest keeps
+            // SSBD through IA32_SPEC_CTRL (AMD_SSBD, bit 24), which Linux
+            // prefers where both are offered.
+            e.ebx &= !bits(&[25]);
+        }
         _ => {}
     }
     // The APIC ID of the host processor the query ran on: no vCPU's, and not
@@ -1204,15 +1216,18 @@ const LISTED_WHERE_PRESENT: &[(u32, WHV_REGISTER_NAME)] = &[
 /// The MTRRs, which KVM gets and sets (kvm_mtrr_get_msr, kvm_mtrr_set_msr)
 /// without listing them, and Firecracker's boot sets IA32_MTRR_DEF_TYPE of
 /// (create_boot_msr_entries: enabled, write-back): the WHP register of
-/// each, where WHP has one (16 variable pairs, the fixed ranges).
+/// each, where WHP has one (the fixed ranges, and of WHP's 16 variable
+/// pairs KVM's 8, KVM_NR_VAR_MTRR: Linux v6.1
+/// arch/x86/include/asm/kvm_host.h:151, `msr_mtrr_valid` mtrr.c:30, so
+/// `KVM_GET_MSRS` and `KVM_SET_MSRS` end at 0x210 to 0x21f as KVM's do).
 fn mtrr_register(index: u32) -> Option<WHV_REGISTER_NAME> {
     #[allow(clippy::cast_possible_wrap)]
     let n = |base: WHV_REGISTER_NAME, k: u32| base + k as WHV_REGISTER_NAME;
     Some(match index {
         0x2ff => whv::WHvX64RegisterMsrMtrrDefType,
         // IA32_MTRR_PHYSBASEn at 0x200 + 2n, IA32_MTRR_PHYSMASKn after it.
-        0x200..=0x21f if index.is_multiple_of(2) => n(whv::WHvX64RegisterMsrMtrrPhysBase0, (index - 0x200) / 2),
-        0x200..=0x21f => n(whv::WHvX64RegisterMsrMtrrPhysMask0, (index - 0x201) / 2),
+        0x200..=0x20f if index.is_multiple_of(2) => n(whv::WHvX64RegisterMsrMtrrPhysBase0, (index - 0x200) / 2),
+        0x200..=0x20f => n(whv::WHvX64RegisterMsrMtrrPhysMask0, (index - 0x201) / 2),
         0x250 => whv::WHvX64RegisterMsrMtrrFix64k00000,
         0x258 => whv::WHvX64RegisterMsrMtrrFix16k80000,
         0x259 => whv::WHvX64RegisterMsrMtrrFix16kA0000,
@@ -1244,7 +1259,7 @@ pub(crate) fn software_msr(index: u32) -> bool {
 /// The candidates of [`LISTED_WHERE_PRESENT`] and the MTRRs.
 fn candidates() -> Vec<(u32, WHV_REGISTER_NAME)> {
     let mut all = LISTED_WHERE_PRESENT.to_vec();
-    for index in (0x200..=0x21f).chain([0x250, 0x258, 0x259, 0x2ff]).chain(0x268..=0x26f) {
+    for index in (0x200..=0x20f).chain([0x250, 0x258, 0x259, 0x2ff]).chain(0x268..=0x26f) {
         all.push((index, mtrr_register(index).unwrap()));
     }
     all
@@ -1316,13 +1331,28 @@ fn mce_msr(index: u32) -> bool {
     super::mce::is_mce(index) && !super::mce::whp_answers(index)
 }
 
+/// The host's vendor, which picks KVM's vendor module: AMD's for an AMD or
+/// Hygon processor (`kvm_amd`), Intel's for any other (`kvm_intel`).
+pub(crate) fn host_vendor() -> super::kvmmsr::Vendor {
+    let leaf = core::arch::x86_64::__cpuid(0);
+    if super::exit::guest_vendor_amd_or_hygon(leaf.ebx, leaf.ecx, leaf.edx) {
+        super::kvmmsr::Vendor::Amd
+    } else {
+        super::kvmmsr::Vendor::Intel
+    }
+}
+
 /// Whether `KVM_GET_MSRS` and `KVM_SET_MSRS` have `index` here: an MSR with
 /// a WHP register or a segment's base, one the vCPU keeps (kvm-clock's two,
 /// IA32_TSC_DEADLINE, [`KVM_SOFTWARE_MSRS`]), or one of KVM's that a
 /// partition has only on some hosts ([`LISTED_WHERE_PRESENT`], the MTRRs),
 /// which stays as it was where the partition lacks it: read as 0, a write
 /// dropped (Firecracker's boot writes IA32_MTRR_DEF_TYPE on every host);
-/// or a machine-check MSR, kept by the vCPU ([`mce_msr`]).
+/// or a machine-check MSR, kept by the vCPU ([`mce_msr`]); or one of the
+/// others KVM keeps for a vCPU that no WHP register holds, kept by the vCPU
+/// ([`super::kvmmsr::Kept`]: their host-initiated access, with OSVW taken
+/// as offered here and checked against the vCPU's CPUID by the vCPU), and
+/// kvm-clock's old pair (0x11, 0x12), which KVM answers as the new.
 ///
 /// Any other MSR is one this backend keeps nowhere, so a value written to
 /// it would reach no guest: it ends the call, as an MSR KVM does not have
@@ -1335,8 +1365,13 @@ pub(crate) fn has_msr(index: u32) -> bool {
         || mce_msr(index)
         || matches!(
             index,
-            super::pvclock::MSR_WALL_CLOCK | super::pvclock::MSR_SYSTEM_TIME | super::tscdeadline::MSR_TSC_DEADLINE
+            super::pvclock::MSR_WALL_CLOCK
+                | super::pvclock::MSR_SYSTEM_TIME
+                | super::pvclock::MSR_WALL_CLOCK_OLD
+                | super::pvclock::MSR_SYSTEM_TIME_OLD
+                | super::tscdeadline::MSR_TSC_DEADLINE
         )
+        || super::kvmmsr::host_has(host_vendor(), index, &super::kvmmsr::Guest { osvw: true, ..Default::default() })
 }
 
 /// Reads MSRs into `msrs`, from the WHP registers they map to, up to the
@@ -1407,8 +1442,10 @@ pub(crate) fn msr_index_list() -> Result<MsrList> {
         0x1b, 0x10, 0x174, 0x175, 0x176, 0x277,
         0xc000_0081, 0xc000_0082, 0xc000_0083, 0xc000_0084,
         0xc000_0102,
-        // kvm-clock (pvclock).
+        // kvm-clock (pvclock), the new pair and the old, as KVM's
+        // `emulated_msrs_all` lists them.
         super::pvclock::MSR_WALL_CLOCK, super::pvclock::MSR_SYSTEM_TIME,
+        super::pvclock::MSR_WALL_CLOCK_OLD, super::pvclock::MSR_SYSTEM_TIME_OLD,
         // IA32_TSC_DEADLINE (tscdeadline).
         super::tscdeadline::MSR_TSC_DEADLINE,
         // IA32_MCG_CTL and HWCR, in KVM's emulated list (x86.c,
@@ -1427,6 +1464,9 @@ pub(crate) fn msr_index_list() -> Result<MsrList> {
             .map(|&(i, _)| i)
             .filter(|i| KVM_SOFTWARE_MSRS.contains(i) || partition_msrs().iter().any(|&(p, _)| p == *i)),
     )
+    // Those KVM keeps for a vCPU and lists that no WHP register holds,
+    // kept by the vCPU (`kvmmsr::listed`).
+    .chain(super::kvmmsr::listed(host_vendor()))
     .collect();
     MsrList::from_entries(&indices).map_err(|_| super::Error::new(libc::EINVAL))
 }
@@ -1453,13 +1493,14 @@ mod tests {
     fn test_mtrr_registers() {
         assert_eq!(mtrr_register(0x200), Some(whv::WHvX64RegisterMsrMtrrPhysBase0));
         assert_eq!(mtrr_register(0x201), Some(whv::WHvX64RegisterMsrMtrrPhysMask0));
-        assert_eq!(mtrr_register(0x21e), Some(whv::WHvX64RegisterMsrMtrrPhysBaseF));
-        assert_eq!(mtrr_register(0x21f), Some(whv::WHvX64RegisterMsrMtrrPhysMaskF));
+        assert_eq!(mtrr_register(0x20e), Some(whv::WHvX64RegisterMsrMtrrPhysBase7));
+        assert_eq!(mtrr_register(0x20f), Some(whv::WHvX64RegisterMsrMtrrPhysMask7));
         assert_eq!(mtrr_register(0x20b), Some(whv::WHvX64RegisterMsrMtrrPhysMask5));
         assert_eq!(mtrr_register(0x268), Some(whv::WHvX64RegisterMsrMtrrFix4kC0000));
         assert_eq!(mtrr_register(0x26f), Some(whv::WHvX64RegisterMsrMtrrFix4kF8000));
         assert_eq!(mtrr_register(0x2ff), Some(whv::WHvX64RegisterMsrMtrrDefType));
-        for none in [0x1ff, 0x220, 0x251, 0x25a, 0x267, 0x270, 0xfe] {
+        // KVM's 8 variable pairs only (KVM_NR_VAR_MTRR), of WHP's 16.
+        for none in [0x1ff, 0x210, 0x211, 0x21e, 0x21f, 0x220, 0x251, 0x25a, 0x267, 0x270, 0xfe] {
             assert_eq!(mtrr_register(none), None, "{none:#x}");
         }
         assert_eq!(MISC_ENABLE_REGISTER, 0x20A0);
@@ -1497,11 +1538,13 @@ mod tests {
 
     #[test]
     fn test_msrs_kept_nowhere_end_the_call() {
-        for kept_nowhere in [2, 3, 4, 0x10a, 0xce, 0x8b] {
+        for kept_nowhere in [2, 3, 4, 0x10a, 0x4b56_4d08, 0xc001_1234, 0x210, 0x21f] {
             assert!(!has_msr(kept_nowhere), "{kept_nowhere:#x}");
         }
         let boot = [0x174, 0x175, 0x176, 0xc000_0081, 0xc000_0083, 0xc000_0102, 0xc000_0084, 0xc000_0082, 0x10, 0x1a0, 0x2ff];
-        for kept in boot.into_iter().chain([0x4b56_4d00, 0x4b56_4d01, 0x6e0, 0x3b, 0x48, 0xc000_0100, 0xc000_0080]) {
+        // The vCPU's own (`kvmmsr::Kept`), and kvm-clock's old pair, too.
+        let own = [0xce, 0x8b, 0x34, 0x9e, 0x140, 0x1fc, 0x4b56_4d02, 0x4b56_4d03, 0x4b56_4d05, 0x11, 0x12];
+        for kept in boot.into_iter().chain([0x4b56_4d00, 0x4b56_4d01, 0x6e0, 0x3b, 0x48, 0xc000_0100, 0xc000_0080]).chain(own) {
             assert!(has_msr(kept), "{kept:#x}");
         }
     }

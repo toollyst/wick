@@ -1866,13 +1866,17 @@ mod tests {
     // among them, with 0xc0350006. Then the same on a partition whose local
     // APIC is an x2APIC, for its LVT timer, initial count and EOI MSRs (an
     // exit for the LVT timer would let the backend give a guest the
-    // TSC-deadline mode WHP's x2APIC refuses). Printed, not asserted.
+    // TSC-deadline mode WHP's x2APIC refuses). MTRRCAP (0xfe) and the first
+    // variable-range MTRR (0x200) are tried for the MTRR count, which WHP
+    // answers and KVM sets at 8 (KVM_NR_VAR_MTRR, Linux v6.1
+    // arch/x86/include/asm/kvm_host.h): an exit for them would let the
+    // backend answer as KVM (the Guest MSRs row). Printed, not asserted.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_msr_action_list_on_record() {
-        let indices: [u32; 20] = [
+        let indices: [u32; 22] = [
             0x179, 0x17a, 0x400, 0x10, 0x1b, 0x3a, 0x8b, 0x174, 0x277, 0x6e0, 0xc000_0080, 0xc000_0081, 0xc000_0102,
-            0xc001_0010, 0xc001_0015, 0xc001_0114, 0xc001_001f, 0xc001_1020, 0x4b56_4d00, 0x4000_0000,
+            0xc001_0010, 0xc001_0015, 0xc001_0114, 0xc001_001f, 0xc001_1020, 0x4b56_4d00, 0x4000_0000, 0xfe, 0x200,
         ];
         let mut taken = Vec::new();
         for index in indices {
