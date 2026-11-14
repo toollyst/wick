@@ -1236,6 +1236,12 @@ jobs:
           # whole) under a vCPU's scan and a host writer, 100 rounds
           # (SWAPSTRESS lines).
           alone whp::vcpu::fpu_tests::test_a_chunk_swapped_under_a_vcpu_and_a_host_writer_keeps_their_memory
+          # The same chunk moved by the reclaim at a job's memory limit (its
+          # live pages copied into a new section) under the guest's reads,
+          # 20 rounds in a child held at the limit: no value lost, every
+          # round moved, the dirty log keeps the pages written before each
+          # move (MOVEUNDERVCPU lines).
+          alone whp::vcpu::fpu_tests::test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # The lazy-RAM grain (LAZYGRAIN lines): guest RAM mapped as

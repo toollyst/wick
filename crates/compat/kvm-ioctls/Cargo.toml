@@ -60,3 +60,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Memory",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The tests' children in a job with a memory limit (whp/vcpu.rs, run_child).
+windows-sys = { version = "0.61.2", features = ["Win32_System_JobObjects"] }

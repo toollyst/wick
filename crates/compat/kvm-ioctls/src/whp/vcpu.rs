@@ -7917,6 +7917,231 @@ mod fpu_tests {
         assert!(wrong.is_empty(), "{wrong:?}");
     }
 
+    /// Runs the child test `child` (this module's, `#[ignore]`d) in a
+    /// process of its own, in a job that may commit `limit` bytes (set
+    /// before the child maps anything: it sleeps 300 ms first): its exit
+    /// status and output.
+    fn run_child(child: &str, limit: usize) -> (Option<i32>, String) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        let name = format!("{}::{child}", module_path!().split_once("::").unwrap().1);
+        let process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name.as_str(), "--ignored", "--nocapture"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // SAFETY: a new unnamed job.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!job.is_null());
+        // SAFETY: plain data.
+        let mut l: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        l.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+        l.JobMemoryLimit = limit;
+        let size = u32::try_from(std::mem::size_of_val(&l)).unwrap();
+        // SAFETY: a structure of the size passed; the child's handle.
+        unsafe {
+            assert_ne!(SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const l).cast(), size), 0);
+            assert_ne!(AssignProcessToJobObject(job, process.as_raw_handle()), 0, "{}", std::io::Error::last_os_error());
+        }
+        let out = process.wait_with_output().unwrap();
+        // SAFETY: our job handle.
+        unsafe { CloseHandle(job) };
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("running 1 test"), "the child {name} ran no test (status {}): {text}", out.status);
+        (out.status.code(), text)
+    }
+
+    /// The WHP twin of libc's `test_a_moved_chunk_reads_and_writes_through`:
+    /// a 2 MiB chunk of userfaultfd-registered guest RAM moved into a new
+    /// section by the reclaim at the job's memory limit
+    /// (`libc::windows_mm::uffd_move_chunk`) while the guest reads its live
+    /// pages: the guest never sees a value it did not write, and the dirty
+    /// log keeps the pages the guest wrote before the move (WHP follows the
+    /// host's address, UFFDCHUNK a; the bitmap is per GPA). In a child under
+    /// a job limit, held at the limit by commit made and never touched, so
+    /// that a fill there is refused and reclaims (`reclaim_for_a_fill`).
+    /// The guest (at `MMIO_PROGRAM`, RAM 2-4 MiB registered, the mailbox at
+    /// 0x7000 resident): over and over, each odd page of the chunk checked
+    /// against the value it last wrote (r8; a mismatch counts in r9), and,
+    /// in mode 1, written with the next; after each pass r9, r8 and the
+    /// pass count to the mailbox; mode 3 ends it with `out 0x86`. Each of
+    /// `ROUNDS` rounds: mode 1 and the dirty log cleared, two passes; mode
+    /// 2 (reads only), two passes; the chunk's even pages discarded (dead:
+    /// committed and charged, as a balloon's scattered pages are); a fill of
+    /// one of them at the limit, which moves the chunk under the guest's
+    /// reads; the move seen (an even page no longer committed); every odd
+    /// page dirty; the other even pages filled again (the move gave their
+    /// charge back). Asserted: no bad value, every round moved, no dirty
+    /// page lost. MOVEUNDERVCPU lines.
+    ///
+    /// ```text
+    ///     xor r8d, r8d; xor r9d, r9d
+    /// top: mov rax, [0x7000]; cmp rax, 3; je quit; mov ebx, 0x201000
+    /// scan: mov rcx, [rbx]; cmp rcx, r8; je same; inc r9
+    /// same: cmp rax, 1; jne next; lea rdx, [r8 + 1]; mov [rbx], rdx
+    /// next: add rbx, 0x2000; cmp rbx, 0x400000; jb scan
+    ///     cmp rax, 1; jne counted; inc r8
+    /// counted: mov [0x7010], r9; mov [0x7018], r8; lock inc qword [0x7008]; jmp top
+    /// quit: out 0x86, al; jmp quit
+    /// ```
+    /// (clang -target x86_64-linux-gnu -c, the .text section.)
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages() {
+        let (code, text) = run_child("moved_under_a_vcpu_child", 512 << 20);
+        assert!(text.contains("MOVEUNDERVCPU all"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages in a job of its own"]
+    fn moved_under_a_vcpu_child() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
+        };
+        const MAILBOX: u64 = 0x7000;
+        const CHUNK: u64 = 2 << 20;
+        const PAGE: u64 = 4096;
+        const ROUNDS: u64 = 20;
+        const PROGRAM: [u8; 105] = [
+            0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00, 0x48, 0x83, 0xF8, 0x03, 0x74,
+            0x51, 0xBB, 0x00, 0x10, 0x20, 0x00, 0x48, 0x8B, 0x0B, 0x4C, 0x39, 0xC1, 0x74, 0x03, 0x49, 0xFF, 0xC1, 0x48, 0x83,
+            0xF8, 0x01, 0x75, 0x07, 0x49, 0x8D, 0x50, 0x01, 0x48, 0x89, 0x13, 0x48, 0x81, 0xC3, 0x00, 0x20, 0x00, 0x00, 0x48,
+            0x81, 0xFB, 0x00, 0x00, 0x40, 0x00, 0x72, 0xD8, 0x48, 0x83, 0xF8, 0x01, 0x75, 0x03, 0x49, 0xFF, 0xC0, 0x4C, 0x89,
+            0x0C, 0x25, 0x10, 0x70, 0x00, 0x00, 0x4C, 0x89, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00, 0xF0, 0x48, 0xFF, 0x04, 0x25,
+            0x08, 0x70, 0x00, 0x00, 0xEB, 0xA1, 0xE6, 0x86, 0xEB, 0xFC,
+        ];
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut uffd = None;
+        let (vm, vcpu, m) = mmio_guest_with(&PROGRAM, |m| {
+            // The mailbox resident (written), so it is not missing.
+            put(m, MAILBOX, &[0u8; 64]);
+            let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+            libc::wick_uffd::register(ctx, m as u64, MEM as u64).unwrap();
+            uffd = Some((ctx, user));
+        });
+        let (ctx, user) = uffd.unwrap();
+        // The slot again, with its dirty log on.
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: m as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
+        let at = m as usize;
+        let chunk = at as u64 + CHUNK;
+        // SAFETY: guest memory, mapped until the end.
+        let mailbox = move |i: u64| unsafe { &*((at + (MAILBOX + 8 * i) as usize) as *const AtomicU64) };
+        // The chunk filled with zeros: the guest's first value.
+        assert_eq!(libc::wick_uffd::zeropage(ctx, chunk, CHUNK, true), Ok(CHUNK));
+        let runner = std::thread::spawn(move || {
+            let mut vcpu = vcpu;
+            let mut reads = 0;
+            one_run(&mut vcpu, &[], &mut reads)
+        });
+        let passes = |n: u64| {
+            let from = mailbox(1).load(Ordering::SeqCst);
+            let asked = std::time::Instant::now();
+            while mailbox(1).load(Ordering::SeqCst) < from + n {
+                assert!(asked.elapsed() < std::time::Duration::from_secs(20), "the guest's passes did not go on");
+                std::thread::yield_now();
+            }
+        };
+        let committed = |a: u64| {
+            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            assert_ne!(unsafe { VirtualQuery(a as *const core::ffi::c_void, &mut mbi, std::mem::size_of_val(&mbi)) }, 0);
+            mbi.State == MEM_COMMIT
+        };
+        let discard_even = || {
+            for p in (0..CHUNK).step_by(2 * PAGE as usize) {
+                // SAFETY: registered guest memory of ours.
+                assert_eq!(unsafe { libc::madvise((chunk + p) as *mut libc::c_void, PAGE as usize, libc::MADV_DONTNEED) }, 0);
+            }
+        };
+        let fill_even = |from: u64| {
+            for p in (from..CHUNK).step_by(2 * PAGE as usize) {
+                assert_eq!(libc::wick_uffd::zeropage(ctx, chunk + p, PAGE, true), Ok(PAGE), "the fill of {p:#x}");
+            }
+        };
+        // (moved, the dirty odd pages lost, the guest's bad values) by round.
+        let mut rounds: Vec<(bool, u64, u64)> = Vec::with_capacity(ROUNDS as usize + 1);
+        let mut round = |at_the_limit: bool| {
+            mailbox(0).store(1, Ordering::SeqCst);
+            vm.get_dirty_log(0, MEM).unwrap();
+            passes(2);
+            mailbox(0).store(2, Ordering::SeqCst);
+            passes(2);
+            discard_even();
+            assert!(committed(chunk + 2 * PAGE), "a discarded page inside the chunk keeps its commit until a reclaim");
+            // The first even page's fill: at the limit, refused until the
+            // reclaim has moved the chunk.
+            assert_eq!(libc::wick_uffd::zeropage(ctx, chunk, PAGE, true), Ok(PAGE), "the first fill (at the limit: {at_the_limit})");
+            let moved = !committed(chunk + 2 * PAGE);
+            let dirty = vm.get_dirty_log(0, MEM).unwrap();
+            let first = CHUNK / PAGE;
+            let lost = (first..2 * first).filter(|p| p % 2 == 1).filter(|&p| dirty[(p / 64) as usize] & (1 << (p % 64)) == 0).count() as u64;
+            fill_even(2 * PAGE);
+            rounds.push((moved, lost, mailbox(2).load(Ordering::SeqCst)));
+        };
+        // A round before the limit: the heap's blocks for these calls made.
+        round(false);
+        // Held at the limit: commit made until the job refuses it, then
+        // pages down to 4 KiB, never touched.
+        let mut ballast: Vec<(usize, usize)> = Vec::with_capacity(100_000);
+        for size in [64 << 20, 1 << 20, 64 << 10, 4 << 10] {
+            loop {
+                if ballast.len() == ballast.capacity() {
+                    break;
+                }
+                // SAFETY: a new allocation of our own, never accessed.
+                let b = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+                if b.is_null() {
+                    break;
+                }
+                ballast.push((b as usize, size));
+            }
+        }
+        let held: usize = ballast.iter().map(|b| b.1).sum();
+        for _ in 0..ROUNDS {
+            round(true);
+        }
+        for (b, _) in ballast.drain(..) {
+            // SAFETY: our ballast.
+            unsafe { VirtualFree(b as *mut core::ffi::c_void, 0, MEM_RELEASE) };
+        }
+        mailbox(0).store(3, Ordering::SeqCst);
+        let end = runner.join().unwrap();
+        let at_limit = &rounds[1..];
+        let moved = at_limit.iter().filter(|r| r.0).count();
+        let lost: u64 = at_limit.iter().map(|r| r.1).sum();
+        let bad = mailbox(2).load(Ordering::SeqCst);
+        eprintln!(
+            "MOVEUNDERVCPU {} of {ROUNDS} rounds at the limit moved the chunk under the guest's reads ({} MiB held as ballast); dirty odd pages lost {lost}; the guest's bad values {bad} after {} passes; before the limit: moved {}; the vCPU's last exit {end}",
+            moved,
+            held >> 20,
+            mailbox(1).load(Ordering::SeqCst),
+            rounds[0].0,
+        );
+        // SAFETY: closes the user end.
+        unsafe { libc::close(user) };
+        assert_eq!((moved, lost, bad), (ROUNDS as usize, 0, 0), "{rounds:?}");
+        assert!(end.starts_with("out 0x86"), "the vCPU ended with {end}");
+        eprintln!("MOVEUNDERVCPU all {ROUNDS} rounds moved, nothing lost");
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
     /// The local APIC state of `vp` in both of WHP's formats, as lines: the
     /// one the backend reads (`WHvGetVirtualProcessorInterruptControllerState`,
     /// which Learn calls deprecated, "a legacy format that packs the
