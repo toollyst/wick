@@ -510,8 +510,12 @@ def counter_warp(vm, when):
                     timeout=180, ok=False)
     lines = [line for line in out.splitlines() if line.startswith("counter-warp: ")]
     line = lines[-1] if lines else f"no counter-warp line (exit {rc}): {out!r}"
-    check(rc == 0 and line.startswith("counter-warp: pass: "), f"the vCPUs' counters {when}: {line}")
-    return line[len("counter-warp: pass: "):]
+    # The record line (the two counters' offset from the least steps at a
+    # hand-over each way): shown with the result; it decides nothing.
+    records = [r for r in out.splitlines() if r.startswith("counter-record: ")]
+    record = f"; {records[-1][len('counter-'):]}" if records else ""
+    check(rc == 0 and line.startswith("counter-warp: pass: "), f"the vCPUs' counters {when}: {line}{record}")
+    return line[len("counter-warp: pass: "):] + record
 
 
 def stage_smp(ctx):

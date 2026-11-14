@@ -360,12 +360,49 @@ impl VcpuShared {
             let value = tsc(reference.index)?.wrapping_sub(moved);
             super::ffi::set_register(part, self.index, whv::WHvX64RegisterTsc, super::ffi::reg64(value))
         })();
+        if copied.is_ok() && log::log_enabled!(log::Level::Debug) {
+            self.log_matched_tscs(reference.index, suspend);
+        }
         if suspend {
             // SAFETY: the VM's partition, whose time this call suspended.
             let hres = unsafe { whv::WHvResumePartitionTime(part) };
             super::ffi::hr_of("WHvResumePartitionTime", hres, String::new)?;
         }
         copied
+    }
+
+    /// The record of a match ([`Self::take_offset_of`]), at debug level only
+    /// (the boot test's log; KVM's counterpart is its `kvm_write_tsc_offset`
+    /// trace event): in the window partition time stands still for the copy,
+    /// the reference vCPU's TSC, this vCPU's, and the reference's again (two
+    /// equal reads of it: time stood still, so the difference is exact), and
+    /// each one's TSC virtual offset (`WHvX64RegisterTscVirtualOffset`, where
+    /// WHP lets it be read), so that two vCPUs whose TSCs differ after a
+    /// boot can be told apart from a copy that was not exact.
+    fn log_matched_tscs(&self, reference: u32, suspended: bool) {
+        let part = self.part;
+        let read = |vp: u32, name| {
+            super::ffi::quietly(|| super::ffi::get_register(part, vp, name))
+                .map_or_else(|e| format!("not readable ({e})"), |v| super::ffi::as_u64(&v).to_string())
+        };
+        let (first, own, again) = (
+            read(reference, whv::WHvX64RegisterTsc),
+            read(self.index, whv::WHvX64RegisterTsc),
+            read(reference, whv::WHvX64RegisterTsc),
+        );
+        let apart = match (first.parse::<u64>(), own.parse::<u64>()) {
+            (Ok(a), Ok(b)) => format!("{:+}", i128::from(b) - i128::from(a)),
+            _ => "?".to_string(),
+        };
+        log::debug!(
+            "whp: TSC matching: vCPU {} took vCPU {reference}'s offset, partition time {}: TSCs {first} (vCPU {reference}), {own} (vCPU {}), {again} (vCPU {reference} again), {apart} ticks apart; TSC virtual offsets {} (vCPU {reference}), {} (vCPU {})",
+            self.index,
+            if suspended { "suspended" } else { "standing still" },
+            self.index,
+            read(reference, whv::WHvX64RegisterTscVirtualOffset),
+            read(self.index, whv::WHvX64RegisterTscVirtualOffset),
+            self.index,
+        );
     }
 
     /// KVM's kick: `immediate_exit` is already set; makes a run in flight,
@@ -11179,6 +11216,111 @@ mod fpu_tests {
         let mut m = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry { index: 0x10, ..Default::default() }]).unwrap();
         assert_eq!(vcpu.get_msrs(&mut m).unwrap(), 1);
         m.as_slice()[0].data
+    }
+
+    /// HOSTWARP, the control for the guests' TSC warp check
+    /// (tools/guest-counter-warp.py) on the same kind of host: its loop, the
+    /// kernel's `check_tsc_warp` algorithm (v6.1 arch/x86/kernel/tsc_sync.c:
+    /// 267-321) with the turns alternating, run natively between two host
+    /// threads pinned to two logical CPUs (0 and 1, 0 and the middle one, 0
+    /// and the last), five rounds of at most 500000 turns or 0.1 s each, as
+    /// the guest's: the hand-overs, the warps and the most a TSC went back,
+    /// and the least step at a hand-over each way, from which the offset
+    /// between the two CPUs' TSCs follows (the guest script's record:
+    /// `D = (to_b - to_a) / 2`). A warp in a guest with none here points at
+    /// the backend's TSC offsets; one here is the host's own. Printed only.
+    #[test]
+    #[ignore = "a record: run alone with --ignored --nocapture"]
+    fn test_the_hosts_tscs_against_each_other_on_record() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+        fn counter() -> u64 {
+            let mut aux = 0u32;
+            // SAFETY: RDTSCP, which every x86_64 host WHP runs on has.
+            unsafe { core::arch::x86_64::__rdtscp(&mut aux) }
+        }
+        // (warps, most back, hand-overs, least step to this CPU, turns)
+        fn turns(lock: &AtomicBool, last: &AtomicU64, who: &AtomicU64, me: u64, bound: u64) -> (u64, u64, u64, i64, u64) {
+            let (mut warps, mut back, mut handovers, mut least, mut i) = (0u64, 0u64, 0u64, i64::MAX, 0u64);
+            let start = counter();
+            let mut now = start;
+            while i < 500_000 && now - start <= bound {
+                while lock.swap(true, Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                let prev = last.load(Ordering::Relaxed);
+                now = counter();
+                let from = who.load(Ordering::Relaxed);
+                last.store(now, Ordering::Relaxed);
+                who.store(me, Ordering::Relaxed);
+                lock.store(false, Ordering::Release);
+                let mut k = 0;
+                while k < 1000 && who.load(Ordering::Relaxed) == me {
+                    std::hint::spin_loop();
+                    k += 1;
+                }
+                if from != me && from != 0 {
+                    handovers += 1;
+                    #[allow(clippy::cast_possible_wrap)]
+                    let step = now.wrapping_sub(prev) as i64;
+                    least = least.min(step);
+                    if prev > now {
+                        warps += 1;
+                        back = back.max(prev - now);
+                    }
+                }
+                i += 1;
+            }
+            (warps, back, handovers, least, i)
+        }
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        if cpus < 2 {
+            eprintln!("HOSTWARP one logical CPU: nothing to compare");
+            return;
+        }
+        // The TSC's rate, for the 0.1 s bound.
+        let (c0, t0) = (counter(), std::time::Instant::now());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        let bound = ((counter() - c0) as f64 / t0.elapsed().as_secs_f64() * 0.1) as u64;
+        let mut pairs = vec![(0, 1), (0, cpus / 2), (0, cpus - 1)];
+        pairs.dedup();
+        for (a, b) in pairs {
+            if a == b || b >= 64 {
+                continue;
+            }
+            for round in 1..=5 {
+                let (lock, last, who) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+                let ready = Arc::new(std::sync::Barrier::new(2));
+                let run = |cpu: usize| {
+                    let (lock, last, who, ready) = (Arc::clone(&lock), Arc::clone(&last), Arc::clone(&who), Arc::clone(&ready));
+                    std::thread::spawn(move || {
+                        // SAFETY: this thread's pseudo handle; one CPU of the
+                        // process's.
+                        let pinned = unsafe { SetThreadAffinityMask(GetCurrentThread(), 1usize << cpu) } != 0;
+                        ready.wait();
+                        (pinned, turns(&lock, &last, &who, cpu as u64 + 1, bound))
+                    })
+                };
+                let (ta, tb) = (run(a), run(b));
+                let ((pa, ra), (pb, rb)) = (ta.join().unwrap(), tb.join().unwrap());
+                let say = |least: i64| if least == i64::MAX { "none".to_string() } else { least.to_string() };
+                let ahead = if ra.3 == i64::MAX || rb.3 == i64::MAX {
+                    "?".to_string()
+                } else {
+                    format!("{:+}", (i128::from(rb.3) - i128::from(ra.3)) as f64 / 2.0)
+                };
+                eprintln!(
+                    "HOSTWARP CPUs {a} and {b} (pinned {pa} {pb}), round {round}: {} turns, {} hand-overs, {} warps (most {} ticks back), least step to CPU {a} {} ticks, to CPU {b} {}: CPU {b}'s TSC {ahead} ticks ahead of CPU {a}'s",
+                    ra.4.min(rb.4),
+                    ra.2 + rb.2,
+                    ra.0 + rb.0,
+                    ra.1.max(rb.1),
+                    say(ra.3),
+                    say(rb.3),
+                );
+            }
+        }
     }
 
     /// A record (TSCSYNC lines) of what WHP does with the vCPUs' TSCs, for

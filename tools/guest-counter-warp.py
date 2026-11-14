@@ -34,12 +34,25 @@
 # turns reads the counter); on aarch64 that is CNTFRQ_EL0's rate, read the
 # same way rather than from the register, so both machines share one path.
 #
+# The record: before its verdict line, a line of its own,
+#   counter-record: least step at a hand-over to CPU A S ticks, to CPU B T
+#     ticks: CPU B's counter about D ticks ahead of CPU A's, the hand-over
+#     about L ticks
+# (signed: a warp's step is negative; "none" for a direction with no
+# hand-over). With the hand-over's least latency L alike both ways and
+# CPU B's counter D ahead of CPU A's, the least step to B is about L + D
+# and to A about L - D, so D = (T - S) / 2 and L = (T + S) / 2: an offset
+# between the two counters is measured on every run, warp or not. A
+# record only; it decides nothing.
+#
 # Interface (the boot tests of all three hosts call it unchanged):
 #   python3 guest-counter-warp.py [CPU_A CPU_B [ITERATIONS]]
 #     CPU_A, CPU_B  the two CPUs (default 0 1); ITERATIONS per CPU at most
 #     (default 500000); the run also ends after BOUND_S seconds.
-#   Output: an empty line and one line (so the line starts the console's
-#   line, whatever prompts stand before it), then the exit status:
+#   Output: once the loop ran, an empty line and the record line
+#   (counter-record:, above); then an empty line and one verdict line (so
+#   each starts the console's line, whatever prompts stand before it),
+#   then the exit status:
 #     counter-warp: pass: <counter> CPUs A and B, I iterations each,
 #       H hand-overs, largest forward step at a hand-over G ticks,
 #       in R s                                                          exit 0
@@ -100,9 +113,9 @@
 # this and compares: that clang on this repo's Mac rebuilds both byte for
 # byte. Another clang may choose other instructions for the same source
 # (Ubuntu 24.04's clang 18.1.3 does, on both machines: 297 and 268
-# bytes), so the check says SKIP (exit 3) when its clang is
-# another and differs, and when no clang is on PATH; it never passes
-# silently.
+# bytes for the loop before its least step, 307 and 276 here then), so
+# the check says SKIP (exit 3) when its clang is another and differs, and
+# when no clang is on PATH; it never passes silently.
 import ctypes
 import mmap
 import os
@@ -111,8 +124,8 @@ import threading
 import time
 
 CODE = {
-    "x86_64": ("TSC", "554157415641554154534c894424f84989ca4989d10f01f948c1e2204189c34909d34d85c90f84c70000004531ff4531c04531e44531f631db4c89d8eb1b66904889c14829e94c39e14c0f47e148ffc34c39cb0f84ac0000004d85d274144889c14c29d94c39d17609e99a0000006690f390b8010000004887074885c075f1488b6f080f01f948c1e22089c04809d0488b4f10488947084889771048c70700000000bae8030000660f1f8400000000004c8b6f104939f57507f39048ffca75f04839f10f95c24885c90f95c184ca0f8479ffffff49ffc64889e94829c10f865dffffff49ffc04c39f94c0f47f9e95bffffff31db4c89d84531f64531e44531c04531ffeb034c89cb488b4c24f84c89394c8941084c8961104c897118488959204c895928488941305b415c415d415e415f5dc3"),
-    "aarch64": ("CNTVCT_EL0", "df3f03d548e03bd5c20600b4ed031faaec031faaea031faae9031faaeb031faa2f008052ee0308aa040000146b0500917f0102eb40060054830000b4d00108cb1f0203ebe80500540efc5fc80f7c10c8d0ffff35ce0000b43f2003d50efc5fc80f7c10c8d0ffff358effffb5100440f9df3f03d54ee03bd5127d8052110840f90e0400f9010800f91ffc9fc8050840f9bf0001eb81000054520600f13f2003d561ffff543f0201eb20fcff5411fcffb4d10110cb12020ecb290500913f020aeb31828a9a5f020deb52828d9a1f020eeb2a928a9a8c958c9aad91929ad4ffff17eb031faae9031faaea031faaec031faaed031faaee0308aa02000014eb0302aa8d3000a98a2401a98b2002a98e1800f9c0035fd6"),
+    "x86_64": ("TSC", "554157415641554154534c894424f84989ca4989d149bbffffffffffffff7f0f01f948c1e2204189c04909d04d85c90f84df0000004531e448c74424f0000000004531ed4531ff4531f64c89c0eb14904c39e94c0f47e949ffc64d39ce0f84c40000004d85d2741a4889c14c29c14c39d1760fe9b20000000f1f840000000000f390b8010000004887074885c075f1488b6f080f01f948c1e22089c04809d0488b4f10488947084889771048c70700000000bae8030000660f1f840000000000488b5f104839f37507f39048ffca75f04839f10f95c24885c90f95c184ca0f8473ffffff49ffc74889c14829e94c39d94c0f4cd94889c14829e90f8350ffffff48ff4424f04829c54c39e54c0f47e5e943ffffff4531f64c89c04531ff4531ed31d24531e4eb084d89ce488b5424f0488b4c24f84c8921488951084c8969104c8979184c8971204c894128488941304c8959385b415c415d415e415f5dc3"),
+    "aarch64": ("CNTVCT_EL0", "df3f03d548e03bd5020700b4ed031faaeb031faaea031faae9031faaec031faa0e00f09230008052ef0308aa060000145f020aeb4a828a9a8c0500919f0102eb40060054830000b4f10108cb3f0203ebe80500540ffc5fc8107c11c8d1ffff35cf0000b43f2003d50ffc5fc8107c11c8d1ffff358fffffb5110440f9df3f03d54fe03bd5057d8052120840f90f0400f9010800f91ffc9fc8060840f9df0001eb81000054a50400f13f2003d561ffff545f0201eb20fcff5412fcffb4f20111eb290500915f020eeb4eb28e9af20111eb02fbff5431020fcb6b0500913f020deb2d828d9ad5ffff17ec031faae9031faaea031faaeb031faaed031faa0e00f092ef0308aa02000014ec0302aa8d2c00a98a2401a98c2002a98f3803a9c0035fd6"),
 }
 U64 = ctypes.c_uint64
 # The run's time bound, in seconds (the header says why 2).
@@ -125,6 +138,21 @@ def stop(code, line):
     # look for the line at its start.
     print("\ncounter-warp: " + line, flush=True)
     sys.exit(code)
+
+
+def record(cpus, outs):
+    # The least signed step at a hand-over to each CPU (out[7]), and what
+    # they give (the header's record).
+    least = {}
+    for c in cpus:
+        v = outs[c][7]
+        v = v - (1 << 64) if v >= 1 << 63 else v
+        least[c] = None if v == (1 << 63) - 1 else v
+    a, b = cpus
+    said = ", ".join(f"to CPU {c} {least[c]} ticks" if least[c] is not None else f"to CPU {c} none" for c in cpus)
+    if least[a] is not None and least[b] is not None:
+        said += f": CPU {b}'s counter about {(least[b] - least[a]) / 2:g} ticks ahead of CPU {a}'s, the hand-over about {(least[b] + least[a]) / 2:g} ticks"
+    print("\ncounter-record: least step at a hand-over " + said, flush=True)
 
 
 def main(argv):
@@ -150,7 +178,7 @@ def main(argv):
     shared = (U64 * 8)()
 
     def read_counter():
-        out = (U64 * 7)()
+        out = (U64 * 8)()
         loop(ctypes.addressof(shared), 0, 0, 0, ctypes.addressof(out))
         return out[5], time.monotonic()
 
@@ -161,7 +189,7 @@ def main(argv):
     if c1 <= c0 or t1 <= t0:
         stop(2, f"FAIL: {counter} did not move over {t1 - t0:.3f} s (no measurement)")
     ticks = int((c1 - c0) / (t1 - t0) * BOUND_S)
-    outs = {c: (U64 * 7)() for c in cpus}
+    outs = {c: (U64 * 8)() for c in cpus}
     errors = []
     ready = threading.Barrier(2)
 
@@ -190,6 +218,7 @@ def main(argv):
         stop(2, "FAIL: " + "; ".join(errors) + " (no measurement)")
     handovers = sum(outs[c][3] for c in cpus)
     warps = sum(outs[c][1] for c in cpus)
+    record(cpus, outs)
     if warps:
         behind = max(cpus, key=lambda c: outs[c][0])
         ahead = cpus[1] if behind == cpus[0] else cpus[0]

@@ -13,7 +13,11 @@
 typedef unsigned long u64;
 /* s: [0] lock, [1] last counter, [2] last reader (CPU + 1); out: [0] max
    warp, [1] warps, [2] max forward step at a hand-over, [3] hand-overs,
-   [4] iterations, [5] the counter at the start, [6] the last counter read.
+   [4] iterations, [5] the counter at the start, [6] the last counter read,
+   [7] the least step at a hand-over to this CPU, signed (a warp is
+   negative; INT64_MAX with no hand-over), for the record: with the
+   hand-over's least latency L alike both ways and this CPU's counter d
+   ahead of the other's, it is about L + d, the other CPU's L - d.
    The loop ends after `iterations` turns or once the counter has moved
    more than `ticks` past its start, whichever comes first, as the kernel's
    check_tsc_warp ends at its timeout (`ticks` 0: no time bound; 0
@@ -33,6 +37,7 @@ static inline u64 counter(void) {
 }
 void warp_loop(volatile u64 *s, u64 me, u64 iterations, u64 ticks, u64 *out) {
     u64 max_warp = 0, warps = 0, max_gap = 0, handovers = 0, i;
+    long min_step = 0x7fffffffffffffffL;
     u64 start = counter(), last = start;
     for (i = 0; i < iterations; i++) {
         if (ticks && last - start > ticks) break;
@@ -59,6 +64,7 @@ void warp_loop(volatile u64 *s, u64 me, u64 iterations, u64 ticks, u64 *out) {
         }
         if (who != me && who != 0) {
             handovers++;
+            if ((long)(now - prev) < min_step) min_step = (long)(now - prev);
             if (prev > now) {
                 warps++;
                 if (prev - now > max_warp) max_warp = prev - now;
@@ -68,5 +74,5 @@ void warp_loop(volatile u64 *s, u64 me, u64 iterations, u64 ticks, u64 *out) {
         }
     }
     out[0] = max_warp; out[1] = warps; out[2] = max_gap; out[3] = handovers; out[4] = i;
-    out[5] = start; out[6] = last;
+    out[5] = start; out[6] = last; out[7] = (u64)min_step;
 }

@@ -348,7 +348,11 @@ print(base64.b64encode(c.compress(open(sys.argv[1], "rb").read()) + c.flush()).d
     mark="$(vm_mark)"
     vm_send "python3 -c \"import base64,zlib;exec(zlib.decompress(base64.b64decode('\$W'),-15))\" 0 1"
     line="$(wait_for "$mark" '^counter-warp: ' 120000 || true)"
-    check "vCPU TSCs agree ($1)" "$([[ "$line" == "counter-warp: pass: "* ]] && echo 1 || echo 0)" "${line:-no answer within 120 s}"
+    # The record line before it (the two TSCs' offset from the least steps
+    # at a hand-over each way): shown, and it decides nothing.
+    local record
+    record="$(tail -c +"$((mark + 1))" "$VM_DIR/console.txt" | tr -d '\r' | grep -m1 -E '^counter-record: ' || true)"
+    check "vCPU TSCs agree ($1)" "$([[ "$line" == "counter-warp: pass: "* ]] && echo 1 || echo 0)" "${line:-no answer within 120 s}${record:+; ${record#counter-}}"
 }
 
 stop_guest() {

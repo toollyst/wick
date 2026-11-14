@@ -1294,6 +1294,12 @@ jobs:
           # save and restore rounds into new VMs, and a host write while a
           # vCPU runs fails.
           alone whp::vcpu::fpu_tests::test_tsc_matching_and_partition_time_on_record
+          # HOSTWARP, the control for the guests' TSC warp check: its loop
+          # natively between two of this host's logical CPUs (0 and 1, 0
+          # and the middle one, 0 and the last), five rounds each: warps,
+          # the most back, and the offset between the two TSCs from the
+          # least step at a hand-over each way. Printed only.
+          alone whp::vcpu::fpu_tests::test_the_hosts_tscs_against_each_other_on_record
           alone whp::vcpu::fpu_tests::test_restored_vcpus_take_one_tsc_offset_as_kvm
           # The MSRs a guest reaches that WHP hands the backend, answered as
           # KVM v6.1 answers a Firecracker guest (MSRTEST lines: a guest's

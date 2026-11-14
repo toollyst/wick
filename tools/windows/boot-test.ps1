@@ -2264,8 +2264,26 @@ function Test-CounterWarp($vm, [string]$when) {
     $out = ''
     $rc = $vm.Sh("python3 -c `"import base64,zlib;exec(zlib.decompress(base64.b64decode('`$W'),-15))`" 0 1", 120000, $false, [ref]$out)
     $line = @($out -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -like 'counter-warp: *' }) | Select-Object -Last 1
-    Check ($rc -eq 0 -and $line -like 'counter-warp: pass: *') "the vCPUs' TSCs $when (tools/guest-counter-warp.py, exit $rc): $out"
-    return ($line -replace '^counter-warp: pass: ', '')
+    # The records, which decide nothing: the guest's (the two TSCs' offset
+    # from the least steps at a hand-over each way) and the backend's (each
+    # vCPU's TSC matching at the boot or the restore, from the debug log).
+    $record = @($out -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -like 'counter-record: *' }) | Select-Object -Last 1
+    $matching = Get-TscMatching $vm
+    Check ($rc -eq 0 -and $line -like 'counter-warp: pass: *') "the vCPUs' TSCs $when (tools/guest-counter-warp.py, exit $rc): $out; TSCCOPY $matching"
+    $numbers = $line -replace '^counter-warp: pass: ', ''
+    if ($record) { $numbers += '; ' + ($record -replace '^counter-', '') }
+    return "$numbers; TSCCOPY $matching"
+}
+
+# The backend's TSC matching lines of a VM so far (its debug log: "whp: TSC
+# matching: ..."), each vCPU that took another's offset at the boot or a
+# restore, as one line; 'none' without one. Read while the VM runs (the
+# logger writes each line whole), best effort.
+function Get-TscMatching($vm) {
+    $log = try { Get-Content -Raw $vm.LogPath -ErrorAction Stop } catch { '' }
+    $seen = @([regex]::Matches("$log", 'whp: TSC matching: [^\r\n]*') | ForEach-Object { $_.Value -replace '^whp: TSC matching: ', '' })
+    if ($seen.Count -eq 0) { return 'none' }
+    return ($seen -join ' | ')
 }
 
 # `$Name`: the results' and scratch directories' name (the x2apic stage's
