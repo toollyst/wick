@@ -2617,9 +2617,10 @@ mod tests {
         unsafe { ws::closesocket(sock(user)) };
     }
 
-    /// Set by the hook of the test below and its thread.
+    /// Set by the hooks of the two tests below and their threads.
     static HELD: AtomicBool = AtomicBool::new(false);
     static RELEASED: AtomicBool = AtomicBool::new(false);
+    static READ_NOW: AtomicBool = AtomicBool::new(false);
 
     /// Waits, for up to 20 s, until `flag` is set.
     fn wait_for(flag: &AtomicBool, what: &str) {
@@ -2677,6 +2678,61 @@ mod tests {
         EXCEPTION_HOOK.store(0, Ordering::SeqCst);
         std::println!("read back {got:#x}");
         assert_eq!(got, 0xab);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// [`windows_mm::MOVE_HOOK`]'s: lets the reader read the moving chunk
+    /// and waits until its fault's handler is held.
+    fn read_during_the_move() {
+        READ_NOW.store(true, Ordering::SeqCst);
+        wait_for(&HELD, "the reader's fault during the move");
+    }
+
+    /// The same for a live page of a chunk being moved: the access faults
+    /// while the chunk is closed for the move and its handler looks once
+    /// the move is over (not moving, not missing): the access runs again
+    /// and reads the page's content. Before the fix the process ended
+    /// with an access violation. In a process of its own.
+    #[test]
+    fn test_a_host_access_that_faulted_during_a_move_runs_again() {
+        let (code, text) = run_child("late_handler_move_child", None);
+        assert!(text.contains("read back 0x5a"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_host_access_that_faulted_during_a_move_runs_again in a process of its own"]
+    fn late_handler_move_child() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 2 * CHUNK;
+        let mem = map(len as usize);
+        register(ctx, mem, len).unwrap();
+        let data = std::vec![0x5au8; len as usize];
+        // SAFETY: `data` holds `len` bytes.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, len, true) }.unwrap(), len);
+        for p in (0..CHUNK).step_by(2 * PAGE as usize) {
+            // SAFETY: registered memory of ours.
+            assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        }
+        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = Some(read_during_the_move);
+        EXCEPTION_HOOK.store(hold_the_handler as fn() as usize, Ordering::SeqCst);
+        let reader = std::thread::spawn(move || {
+            wait_for(&READ_NOW, "the move");
+            // SAFETY: a live page of the registered range, closed for the
+            // move; the read faults, and its handler is held until the move
+            // is over.
+            unsafe { core::ptr::read_volatile((mem + PAGE + 5) as *const u8) }
+        });
+        let r = reclaim_at_touch(PAGE as usize);
+        assert_eq!(r.chunks, 1, "no chunk was moved");
+        assert!(!is_moving(mem + PAGE) && !is_missing(mem + PAGE));
+        RELEASED.store(true, Ordering::SeqCst);
+        let got = reader.join().expect("the reader failed");
+        EXCEPTION_HOOK.store(0, Ordering::SeqCst);
+        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = None;
+        std::println!("read back {got:#x}");
+        assert_eq!(got, 0x5a);
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
