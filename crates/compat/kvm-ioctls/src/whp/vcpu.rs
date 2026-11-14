@@ -6153,7 +6153,7 @@ mod fpu_tests {
     /// 43521200989: vCPU 1's read `0x1000000` in xAPIC mode and `0x1` once
     /// EXTD was set), so reading it in the xAPIC format (`>> 24`) sent
     /// vCPU 1's interrupt to APIC 0. On an x2APIC partition, a VM for each
-    /// mode of vCPU 1, both vCPUs halted with interrupts on: a deadline
+    /// mode of vCPU 1 (made runnable), both vCPUs halted with interrupts on: a deadline
     /// already reached on vCPU 1 raises the LVT timer's vector, which vCPU
     /// 1 takes (its gate's `out 0x82` of the vector) and vCPU 0 does not
     /// (its run is kicked after 5 s). Seen by the guest taking it, as WHP
@@ -6193,6 +6193,11 @@ mod fpu_tests {
             q(MMIO_IDT + u64::from(vector) * 16, (GATE & 0xffff) | (8 << 16) | (0x8E << 40));
             q(MMIO_IDT + u64::from(vector) * 16 + 8, 0);
             let mut one = vm.create_vcpu(1).unwrap();
+            // Runnable: an AP is made waiting for a SIPI, as KVM makes one
+            // (`regs::startup_suspend`; Linux v6.1 x86.c 11839-11842), and
+            // takes no interrupt there; at f300dc7 its run entered no guest
+            // and was kicked after 5 s (CI run 43534301411).
+            one.set_mp_state(kvm_bindings::kvm_mp_state { mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE }).unwrap();
             // vCPU 0's state (long mode, the IDT) before EXTD: KVM_SET_SREGS
             // writes APIC_BASE.
             one.set_sregs(&zero.get_sregs().unwrap()).unwrap();
