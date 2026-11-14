@@ -86,6 +86,38 @@ fn test_nonblocking() {
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
 }
 
+// A socket made non-blocking and then closed is closed: its peer reads the
+// end, as on Linux, where close drops the last reference to the open file
+// and the peer's read returns 0. A socket pair's end and an accepted
+// connection (the vsock muxer's and the network endpoint's), each set
+// non-blocking before it is dropped; the peer's read waits at most 5 s.
+// CI run 43616040593 (5e3727d): the muxer's and the endpoint's peers never
+// saw the close, and vsock's handshake timed out.
+#[test]
+#[ignore = "fails until wick-os closes through the compat libc (the next commit)"]
+fn test_a_socket_made_non_blocking_and_closed_ends_its_peers_stream() {
+    let ends_at_the_peer = |what: &str, a: UnixStream, mut b: UnixStream| {
+        a.set_nonblocking(true).unwrap();
+        a.set_nonblocking(false).unwrap();
+        a.set_nonblocking(true).unwrap();
+        drop(a);
+        b.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 1];
+        match b.read(&mut buf) {
+            Ok(0) => {}
+            other => panic!("{what}: the peer read {other:?}, not the end of the stream"),
+        }
+    };
+    let (a, b) = UnixStream::pair().unwrap();
+    ends_at_the_peer("a pair's end", a, b);
+    let path = temp_path("closed-nonblocking.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let client = UnixStream::connect(&path).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    ends_at_the_peer("an accepted connection", server, client);
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn test_socket_values_that_are_no_descriptor() {
     // Kernel handles (multiples of 4 in 32 bits) are descriptors, as is
