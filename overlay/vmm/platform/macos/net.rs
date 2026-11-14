@@ -1330,6 +1330,55 @@ mod tests {
         std::fs::remove_dir_all(&net).unwrap();
     }
 
+    // An endpoint opens in a jail's own directory of its network while the
+    // directory's lock is held on another open of it, as the jailer holds
+    // it for the jail's life (and Firecracker without the jailer): before,
+    // the opener's turn waited for that lock 10 s and failed, so no jailed
+    // interface opened. Openers there still take turns: 8 threads on one
+    // stale name, one gets it and the others EBUSY.
+    #[test]
+    #[ignore = "fails until openers in a jail's own directory take turns in the process (the next commit)"]
+    fn test_an_endpoint_opens_in_a_directory_its_jail_holds_locked() {
+        use std::os::fd::AsFd;
+        use std::sync::{Arc, Barrier};
+
+        let net = user_endpoint_dir().unwrap().join(format!("lk{}", std::process::id()));
+        let own = net.join("jail");
+        std::fs::create_dir_all(&own).unwrap();
+        let held = std::fs::File::open(&own).unwrap();
+        // SAFETY: a descriptor owned here.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let dir: &'static OwnedFd = Box::leak(Box::new(OwnedFd::from(std::fs::File::open(&own).unwrap())));
+        let started = std::time::Instant::now();
+        let ep = Endpoint::open(Path::new("tap0"), Some((&own, dir.as_fd())), true).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(own.join("tap0").exists());
+        drop(ep);
+        // tap0 is now a stale name: of 8 openers at once, one replaces it.
+        let start = Arc::new(Barrier::new(8));
+        let results: Vec<_> = (0..8)
+            .map(|_| {
+                let (start, own) = (start.clone(), own.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    Endpoint::open(Path::new("tap0"), Some((&own, dir.as_fd())), true)
+                        .map(|ep| {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            drop(ep);
+                        })
+                        .map_err(|e| e.raw_os_error())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let got = results.iter().filter(|r| r.is_ok()).count();
+        assert!(got >= 1 && results.iter().all(|r| r.is_ok() || *r == Err(Some(libc::EBUSY))), "{results:?}");
+        drop(held);
+        std::fs::remove_dir_all(&net).unwrap();
+    }
+
     // A jail's endpoint, in the jail's own directory of a network: its
     // peers are the sockets directly in the network directory that the
     // directory's owner owns (the operator's switch). Any other sender is

@@ -1068,6 +1068,93 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains(&who(54321))), "{lines:?}");
     }
 
+    // The user-mode harness's stand-in for the jailer
+    // (tools/macos/integration/jailer, `join_netns`) arranges a jail's
+    // network as `network_for_jail` does, so that the harness runs
+    // Firecracker in the jailer's arrangement: `<dir>/<id>`, mode 0700, a
+    // dead jail's sockets removed and nothing else, a live jail's refused
+    // busy and left as it is, and one lock that says the jail lives: the
+    // jailer's, which Firecracker inherits, or, given the directory without
+    // the jailer, Firecracker's own (vmm's
+    // test_a_network_without_the_jail_is_one_firecrackers), which the
+    // stand-in leaves to it. The two drifted apart once unseen (b05cd23d:
+    // an opener's turn waited for the jailer's lock, which the stand-in did
+    // not hold), as the jailer's network runs only under root
+    // (`jailer-test netns`); this needs none. The ACL is the jailer's alone:
+    // the stand-in's jail is of the network owner's uid.
+    #[test]
+    #[ignore = "fails until the stand-in arranges a jail's network as the jailer does (the next commit)"]
+    fn test_the_stand_in_jailer_arranges_a_network_as_the_jailer_does() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixDatagram;
+        const JOIN: &str = "import importlib.machinery, importlib.util, os, sys\n\
+            loader = importlib.machinery.SourceFileLoader('stand_in', sys.argv[1])\n\
+            module = importlib.util.module_from_spec(importlib.util.spec_from_loader('stand_in', loader))\n\
+            loader.exec_module(module)\n\
+            module.join_netns(sys.argv[2], 'a')\n\
+            print(os.environ['WICK_NETNS'])\n";
+        let stand_in = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../tools/macos/integration/jailer");
+        assert!(stand_in.is_file(), "{stand_in:?}");
+        let join = |net: &Path| {
+            let out = std::process::Command::new("python3")
+                .args(["-I", "-c", JOIN])
+                .arg(&stand_in)
+                .arg(net)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            (out.status.success(), text, String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+        // What a jail's directory is: its mode, its names, and whether a
+        // lock on it is held (on another open of it).
+        let state = |own: &Path| {
+            let mode = std::fs::metadata(own).unwrap().permissions().mode() & 0o7777;
+            let mut names: Vec<_> =
+                std::fs::read_dir(own).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            names.sort();
+            let probe = File::open(own).unwrap();
+            // SAFETY: a descriptor owned here.
+            let held = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0;
+            (mode, names, held)
+        };
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let base = dir.as_path().canonicalize().unwrap();
+        let (jn, sn) = (base.join("jailer"), base.join("stand-in"));
+        for net in [&jn, &sn] {
+            // A dead jail's leftovers: a socket nobody receives on and a
+            // file, in a directory of mode 0755.
+            let own = net.join("a");
+            std::fs::create_dir_all(&own).unwrap();
+            std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+            drop(UnixDatagram::bind(own.join("tap0")).unwrap());
+            std::fs::write(own.join("keep"), b"").unwrap();
+        }
+        // SAFETY: no arguments.
+        let me = unsafe { libc::geteuid() };
+        let (sub, lock) = network_for_jail(&jn, "a", me).unwrap();
+        let (ok, given, err) = join(&sn);
+        assert!(ok, "{err}");
+        assert_eq!((sub.as_path(), Path::new(&given)), (jn.join("a").as_path(), sn.join("a").as_path()));
+        let keep = vec!["keep".to_owned()];
+        assert_eq!(state(&sub), (0o700, keep.clone(), true), "the jailer's");
+        assert_eq!(state(&sn.join("a")), (0o700, keep.clone(), false), "the stand-in's, before Firecracker");
+        // Firecracker's lock, as lock_netns takes it, for its life.
+        let fc = File::open(sn.join("a")).unwrap();
+        // SAFETY: a descriptor owned here.
+        assert_eq!(unsafe { libc::flock(fc.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        // A second jail of the id while the first lives, with an endpoint:
+        // refused busy, nothing touched.
+        let live: Vec<_> = [&jn, &sn].map(|net| UnixDatagram::bind(net.join("a/tap1")).unwrap()).into();
+        let err = network_for_jail(&jn, "a", me).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBUSY), "{err}");
+        let (ok, _, err) = join(&sn);
+        assert!(!ok && err.contains("busy") && err.contains("EBUSY"), "{err}");
+        let both = vec!["keep".to_owned(), "tap1".to_owned()];
+        assert_eq!(state(&sub), (0o700, both.clone(), true));
+        assert_eq!(state(&sn.join("a")), (0o700, both, true));
+        drop((live, lock, fc));
+    }
+
     // Two jails given one network: each has a directory of its own in it,
     // which grants the other's uid nothing, and the network directory
     // itself lets a jail pass through and write to the switch's sockets,

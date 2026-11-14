@@ -1093,6 +1093,50 @@ mod tests {
         println!("NETNS-ALONE-OK");
     }
 
+    // A network directory given without the jailer is Firecracker's alone,
+    // as the jailer makes a jail's (its lock held for Firecracker's life):
+    // Firecracker holds its lock, and a Firecracker given it while another
+    // holds it is refused at start, busy.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "fails until Firecracker given WICK_NETNS without the jailer takes its lock (the next commit)"]
+    fn test_a_network_without_the_jail_is_one_firecrackers() {
+        use std::os::fd::AsRawFd;
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let path = dir.as_path().canonicalize().unwrap();
+        let out = run_child("netns_locked_child", &[(NETNS_ENV, path.to_str().unwrap())]);
+        assert!(out.contains("NETNS-LOCKED-OK"), "{out}");
+        // Another Firecracker's lock, held here.
+        let first = std::fs::File::open(&path).unwrap();
+        // SAFETY: a descriptor owned here; does not block.
+        assert_eq!(unsafe { libc::flock(first.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let out = run_child("netns_busy_child", &[(NETNS_ENV, path.to_str().unwrap())]);
+        assert!(out.contains("NETNS-BUSY-REFUSED"), "{out}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_a_network_without_the_jail_is_one_firecrackers in a separate process"]
+    fn netns_locked_child() {
+        use std::os::fd::AsRawFd;
+        let want = std::path::PathBuf::from(std::env::var_os(NETNS_ENV).unwrap());
+        enter().unwrap();
+        let other = std::fs::File::open(&want).unwrap();
+        // SAFETY: a descriptor owned here; does not block.
+        let ret = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!((ret, std::io::Error::last_os_error().raw_os_error()), (-1, Some(libc::EWOULDBLOCK)));
+        println!("NETNS-LOCKED-OK");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_a_network_without_the_jail_is_one_firecrackers in a separate process"]
+    fn netns_busy_child() {
+        let err = enter().unwrap_err();
+        assert!(matches!(err, JailError::Netns(..)) && err.to_string().contains("busy"), "{err}");
+        println!("NETNS-BUSY-REFUSED");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "run by test_netns_without_the_jail in a separate process"]
