@@ -56,6 +56,16 @@
 #     integration_tests/functional/test_snapshot_basic.py::test_negative_snapshot_permissions \
 #     integration_tests/functional/test_api_server.py::test_api_socket_in_use
 #
+# pytest runs with at most 4096 descriptors (RLIMIT_NOFILE, soft and hard),
+# upstream's own run condition: `devtool test` starts its container with
+# --ulimit nofile=4096:4096 (lib/firecracker/tools/devtool, run_devctr's
+# callers), as tools/linux/devctr.sh does. A larger inherited limit (a
+# terminal, an IDE: 1048576 is common) is not upstream's environment: screen
+# 5's closeallfiles() polls every descriptor up to it at each command
+# (misc.c), 35 ms a command at 1048576 against 4 at 256, and the harness's
+# screen flush then races (test_firecracker_kill_by_pid). A hard limit
+# under 4096 stops the run.
+#
 # A run needs WICK_IT_FREE_GIB (default 20) GiB free; a selection of tests
 # that session-peak-kib shows to need less may ask for less.
 #
@@ -306,11 +316,13 @@ cp "$out/provenance.txt" "$out/pytest.log"
 pytest=("$ROOT/build/integration/venv/bin/python" -m pytest -p wick_macos --binary-dir "$bin"
     "--json-report-file=$out/test_results/test-report.json" --continue-on-collection-errors "$@")
 [[ -x "$ROOT/build/integration/venv/bin/python" ]] || die "no Python environment: tools/macos/integration/venv.sh"
+# Upstream's descriptor limit (the header).
+(ulimit -n 4096) 2>/dev/null || die "cannot set RLIMIT_NOFILE to 4096 (upstream's devtool runs pytest with nofile=4096:4096): the hard limit is $(ulimit -Hn)"
 set +e
 if [[ $mode == jailer ]]; then
-    (cd "$ROOT/lib/firecracker/tests" && sudo env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
+    (ulimit -n 4096 && cd "$ROOT/lib/firecracker/tests" && sudo env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
 else
-    (cd "$ROOT/lib/firecracker/tests" && env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
+    (ulimit -n 4096 && cd "$ROOT/lib/firecracker/tests" && env "${env_args[@]}" "${pytest[@]}") 2>&1 | tee -a "$out/pytest.log"
 fi
 status=${PIPESTATUS[0]}
 set -e

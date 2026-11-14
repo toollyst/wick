@@ -416,17 +416,18 @@ all impossible integration_tests/security/test_jail.py::test_negative_no_file_li
 
 # --new-pid-ns without --daemonize: the launcher forks Firecracker and exits,
 # as Linux's jailer does in that mode (env.rs exec_into_new_pid_ns: clone,
-# write the pid file, exit(0)), and screen ends the session when the process
-# it started exits (upstream says so: microvm.py spawn, "the screen process
-# will exit"). The test's start_screen_process sends `screen -X colon
-# "logfile flush 0"` after `screen -ls` finds the session: a race with the
-# launcher's exit on every host. Measured here with the stand-in launching a
-# script (no guest): `screen -dmS` returned after 117 ms, `screen -ls` found
-# the session at 235 ms, the flush at 328 ms got "No screen session found",
-# and the session was gone at 416 ms; without --new-pid-ns the same flush
-# succeeds. Each screen 5.0.2 command takes about 100 ms here; that Linux
-# passes says its screen commands finish before its jailer exits there
-# (inferred: no Linux host to time it on).
+# write the pid file, exit(0)); the launcher is screen's window process, the
+# leader of its terminal's session. Under 4096 descriptors, upstream's run
+# condition (tools/macos/integration-tests.sh), the test's screen commands no
+# longer race the launcher's exit (with the 1048576 a terminal gave the
+# harness before, screen 5's closeallfiles took 35 ms a command and `logfile
+# flush` lost the session). It fails instead with "Failed to start vCPUs": the
+# leader's exit revokes the terminal, Firecracker's standard input too (xnu
+# bsd/kern/kern_exit.c :2436 to :2476), and XNU's F_SETFL of O_NONBLOCK on it
+# fails with ENOTTY (bsd/kern/kern_descrip.c :3003, bsd/vfs/vfs_vnops.c
+# :1782), where Linux's succeeds on a hung-up terminal (fs/fcntl.c setfl).
+# Firecracker's log: "Cannot set non block for the terminal. Error(25)" (run
+# mac9-screen-4096c).
 all bug integration_tests/security/test_jail.py::test_firecracker_kill_by_pid[kvm-PCI_OFF-True-False-vmlinux-6.1.188]
 all bug integration_tests/security/test_jail.py::test_firecracker_kill_by_pid[kvm-PCI_ON-True-False-vmlinux-6.1.188]
 
