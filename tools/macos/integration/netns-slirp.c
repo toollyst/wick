@@ -12,7 +12,9 @@
 // endpoint is `<name>` there for a VMM without a jail, and `<id>/<name>`,
 // in the jail's own directory, under the jailer; a test's network holds one
 // microVM, so the one directory that has the name is taken. It attaches to
-// the endpoint (an empty datagram) whenever one is bound there anew. The
+// the endpoint (an empty datagram) whenever one is bound there anew, having
+// forgotten the interface's neighbours, as Linux forgets a TAP's when the
+// VMM that held it lets it go (forget). The
 // test reaches the guest through a forward: what `ip netns exec <ns> ssh
 // <guest>` does on Linux, a Unix socket here that leads to <guest>:<port>.
 //
@@ -76,6 +78,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glib.h>
 #include <poll.h>
 #include <signal.h>
 #include <libslirp.h>
@@ -128,6 +131,7 @@ struct iface {
     int fd;                  // the host's socket, bound at .host-<name>
     struct sockaddr_un vmm;  // the VMM's endpoint, relative to the network (the working directory): <name> or <id>/<name>
     ino_t attached;          // the endpoint attached to (its inode), 0: none
+    ino_t forgot;            // the endpoint the neighbours were forgotten for (forget)
     int txqueuelen;          // what a test asked for (0: not asked)
     uint64_t dropped;        // frames for the VMM dropped: its endpoint was full
 };
@@ -436,9 +440,75 @@ static int bound(struct iface *i) {
     return ok;
 }
 
+// An endpoint bound anew is a TAP whose carrier went and came back: the VMM
+// that held it closed it (a microVM's end, or an update of the device, which
+// drops the old device before it makes the new: vmm_config/net.rs
+// `NetBuilder::build`), and Linux then forgets the TAP's neighbours
+// (drivers/net/tun.c `__tun_detach`: netif_carrier_off once no queue is
+// attached; net/ipv4/arp.c `arp_netdev_event`: NETDEV_CHANGE without a
+// carrier calls net/core/neighbour.c `neigh_carrier_down`, which drops every
+// entry of the device but the permanent ones), so the next guest is asked
+// for by ARP, whatever its link-layer address. libslirp keeps its ARP table
+// for its life: an entry is replaced only by ARP input and never ages
+// (src/arp_table.c `arp_table_add`, `arp_table_search`; if_encap4 asks only
+// on a miss), and no call of its empties it, so a guest of a new address on
+// a reused network got the frames of the address before and never answered
+// (test_net_change_mac_address, then every test on its network). Each stack
+// is made to forget through its own input: gratuitous ARPs for addresses of
+// 0.0.0.0/8, which no guest has and no frame goes to, fill every slot
+// (`arp_table_add` gives a new address the next slot in turn, ARP_TABLE_SIZE
+// of them: 16 in 4.9.0), new addresses each time (one it has is only
+// updated), and the table is read back (`slirp_neighbor_info`): a libslirp
+// whose table this does not empty stops this process, rather than send to
+// the guest of before. The guest's address this process keeps itself (UDP
+// forwards, the programs stack's) is forgotten too, and learnt again from
+// the guest's frames: a UDP forward's datagram for a guest that has sent
+// none yet is dropped, as for the network's first guest (udp_to_guest),
+// where Linux would ask by ARP and hold it.
+#define FORGET_FILL 256
+
+static uint32_t forget_seq;
+
+static void forget_stack(struct iface *i, Slirp *s) {
+    if (!s) return;
+    for (int k = 0; k < FORGET_FILL; k++) {
+        uint32_t a = htonl(1 + forget_seq++ % 0xfffffeu); // 0.0.0.1 to 0.255.255.254
+        uint8_t arp[42] = {0};
+        memset(arp, 0xff, 6);
+        arp[12] = 0x08, arp[13] = 0x06;                      // ARP
+        arp[14] = 0, arp[15] = 1, arp[16] = 0x08, arp[17] = 0; // Ethernet, IPv4
+        arp[18] = 6, arp[19] = 4, arp[20] = 0, arp[21] = 1;    // request
+        memcpy(arp + 28, &a, 4);
+        memcpy(arp + 38, &a, 4); // gratuitous: sender and target the same
+        slirp_input(s, arp, sizeof arp);
+    }
+    char *info = slirp_neighbor_info(s), *line = info, *nl;
+    for (; line && (nl = strchr(line, '\n')); line = nl + 1) {
+        char table[8], mac[18], ip[46];
+        struct in_addr at;
+        *nl = 0;
+        if (sscanf(line, "%7s %17s %45s", table, mac, ip) == 3 && strcmp(table, "ARP") == 0 &&
+            inet_pton(AF_INET, ip, &at) == 1 && (ntohl(at.s_addr) >> 24) != 0) {
+            fprintf(stderr, "netns-slirp %s: the neighbour %s (%s) is still known after the endpoint was bound anew\n",
+                    i->name, ip, mac);
+            exit(1);
+        }
+    }
+    g_free(info);
+}
+
+static void forget(struct iface *i) {
+    forget_stack(i, i->net.slirp);
+    forget_stack(i, i->progs.slirp);
+    memset(i->seen_mac, 0, sizeof i->seen_mac);
+    memset(i->guest_mac, 0, sizeof i->guest_mac);
+    i->guest_ip.s_addr = 0;
+}
+
 // Attaches to the endpoint when one is bound there anew (a VMM's first, or
-// one bound again after an update of the device or a restore): the VMM
-// sends its frames to whoever sent it a datagram.
+// one bound again after an update of the device or a restore), its
+// neighbours forgotten first (forget): the VMM sends its frames to whoever
+// sent it a datagram, so none of the new guest's comes before.
 static void attach(struct iface *i) {
     struct stat st;
     locate(i);
@@ -447,6 +517,10 @@ static void attach(struct iface *i) {
         return;
     }
     if (st.st_ino == i->attached) return;
+    if (st.st_ino != i->forgot) {
+        forget(i);
+        i->forgot = st.st_ino;
+    }
     if (sendto(i->fd, "", 0, 0, (struct sockaddr *)&i->vmm, sizeof i->vmm) == 0)
         i->attached = st.st_ino;
 }

@@ -171,6 +171,76 @@ for bad in (lambda: socket.socket().connect(("10.9.9.9", 1)), lambda: socket.soc
           f"off the network: ENETUNREACH and EADDRNOTAVAIL: {out!r}")
 
 
+def new_guest(dev, host, path, ctl):
+    """A guest behind an endpoint bound anew, with a link-layer address of
+    its own (a microVM on a reused network after one whose guest changed
+    its address, as test_net_change_mac_address leaves it): the host side
+    has forgotten its neighbours, as Linux forgets a TAP's when its carrier
+    goes with the VMM that held it (drivers/net/tun.c `__tun_detach`,
+    net/ipv4/arp.c `arp_netdev_event`, net/core/neighbour.c
+    `neigh_carrier_down`), so it asks for the guest's address before
+    sending to it, and its frames reach the new address: TCP through a
+    forward and UDP through a UDP forward."""
+    mac = bytes.fromhex("060504030201")
+
+    def to_guest(ethertype, want):
+        """The next frame of `ethertype` that `want` takes; none of the
+        frames before it may go to the guest's address of before."""
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            f = dev.recv(2048)
+            check(f[0:6] != GUEST_MAC, f"a frame for the guest's address of before: {f[:42].hex()}")
+            if f[12:14] == ethertype and want(f):
+                return f
+        raise SystemExit(f"FAIL: no {ethertype.hex()} frame")
+
+    err, at = request(ctl, f"ufwd {GUEST_IP} 5202")
+    check(err == 0, f"ufwd: {err}")
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    a, p = at.split(":")
+    u.sendto(b"early", (a, int(p)))  # before the guest has sent a frame: no address to send it to
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.connect(path)  # the forward to the guest's port 22: a SYN for the guest
+    f = to_guest(b"\x08\x06", lambda f: True)
+    check(f[0:6] == b"\xff" * 6 and struct.unpack("!H", f[20:22])[0] == 1 and socket.inet_ntoa(f[38:42]) == GUEST_IP,
+          f"the first frame for a guest bound anew is an ARP request for its address: {f[:42].hex()}")
+    host_mac, host_ip = f[22:28], f[28:32]
+    arp = (host_mac + mac + b"\x08\x06" + struct.pack("!HHBBH", 1, 0x0800, 6, 4, 2) + mac
+           + socket.inet_aton(GUEST_IP) + host_mac + host_ip)
+    dev.sendto(arp, host)
+    r = to_guest(b"\x08\x00", lambda f: f[23] == 6 and f[36:38] == struct.pack("!H", 22) and f[47] & 0x02)
+    check(r[0:6] == mac, f"the SYN goes to the guest's new address: {r[0:6].hex()}")
+    conn.close()
+    u.sendto(b"ping", (a, int(p)))
+    r = to_guest(b"\x08\x00", lambda f: f[23] == 17 and f[36:38] == struct.pack("!H", 5202))
+    check(r[0:6] == mac and r[42:46] == b"ping",
+          f"a UDP forward's datagram goes to the guest's new address once it has sent a frame: {r[:46].hex()}")
+    u.close()
+    return mac
+
+
+def listener(dev, host, host_mac, mac, ctl, fwd, preload, port):
+    """A host program's listener the guest at `mac` connects to: the
+    programs stack's answer goes to that address."""
+    srv = program(preload, ctl, fwd, f"""
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(({HOST_IP!r}, {port}))
+s.listen(1)
+print("listening", flush=True)
+c, a = s.accept()
+c.close()
+s.close()
+""")
+    check(srv.stdout.readline().strip() == "listening", f"a listener at port {port}")
+    dev.sendto(host_mac + mac + b"\x08\x00" + ip_packet(6, tcp(40001, port, 2000, 0, 0x02)), host)
+    r = frame_of(dev, b"\x08\x00",
+                 lambda f: f[23] == 6 and f[34:36] == struct.pack("!H", port) and f[47] & 0x12 == 0x12)
+    check(r[0:6] == mac, f"the listener's SYN-ACK goes to the guest's address: {r[0:6].hex()}")
+    srv.kill()
+    srv.communicate()
+
+
 def main():
     helper = sys.argv[1]
     preload = sys.argv[2] if len(sys.argv) > 2 else None
@@ -215,6 +285,15 @@ def main():
         check(request(ctl, "used tap0") == (0, "0"), "tap0 free once its endpoint closed")
         # Bound again (an update of the device, a restore): attached again.
         dev, host = endpoint(net, "tap0")
+        mac = new_guest(dev, host, path, ctl)
+        if preload:
+            listener(dev, host, host_mac, mac, ctl, fwd, preload, 4445)
+            # Bound again by a guest of the same address: the programs stack
+            # forgot it with the rest, and is told it again.
+            dev.close()
+            os.unlink(os.path.join(net, "tap0"))
+            dev, host = endpoint(net, "tap0")
+            listener(dev, host, host_mac, mac, ctl, fwd, preload, 4446)
         dev.close()
         p.stdin.close()
         check(p.wait(10) == 0, "the host side ends with its owner's pipe")
