@@ -254,7 +254,9 @@ semantics on Win32. The details are in the comments of each
   (CI run 43616040593: vsock's handshake and the network endpoint;
   `test_a_socket_made_non_blocking_and_closed_ends_its_peers_stream`). A
   descriptor with state that another library closes (Rust std's own
-  sockets, which take no `ioctl` here) keeps its object until the sweep.
+  sockets, which take no `ioctl` here) keeps its object until the sweep;
+  a question makes no state: `F_GETFL` reads the flags without an entry
+  (`test_f_getfl_makes_no_state_that_outlives_a_close_past_the_library`).
 - **epoll = IOCP (the `polling` crate).** Sockets use AFD polls; eventfds,
   consoles and other waitable handles use wait packets that complete on the
   IOCP. Level-triggered is the default and `ONE_SHOT` is supported. Sockets

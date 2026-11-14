@@ -435,8 +435,17 @@ pub mod wick_fd {
     /// Whether `fd` is `O_NONBLOCK` as this library knows it (`fcntl`'s
     /// `F_SETFL`, `SOCK_NONBLOCK`), without making it an entry.
     pub(crate) fn nonblocking(fd: c_int) -> bool {
+        status_flags(fd) & crate::O_NONBLOCK != 0
+    }
+
+    /// The status flags of `fd`'s open file as this library knows them (0
+    /// for a descriptor it has no entry for), without making it an entry:
+    /// an entry holds a handle of the object, which would keep it open past
+    /// a close made without this library (`F_GETFL`;
+    /// `test_f_getfl_makes_no_state_that_outlives_a_close_past_the_library`).
+    pub(crate) fn status_flags(fd: c_int) -> c_int {
         let mut map = table().lock().unwrap();
-        live(&mut map, fd) && map[&fd].flags.load(Ordering::Relaxed) & crate::O_NONBLOCK != 0
+        if live(&mut map, fd) { map[&fd].flags.load(Ordering::Relaxed) } else { 0 }
     }
 
     /// The status flags (`O_NONBLOCK`) of `fd`'s open file.
@@ -1643,7 +1652,9 @@ fn fcntl_impl(fd: c_int, cmd: c_int, arg: usize) -> c_int {
                 set_errno(crate::EBADF);
                 return -1;
             }
-            O_RDWR | wick_fd::flags(fd).load(Ordering::Relaxed)
+            // Read, not made: a question leaves no entry (and no handle of
+            // the object) behind, as Linux's reads `f_flags`.
+            O_RDWR | wick_fd::status_flags(fd)
         }
         F_SETFL => set_nonblocking(fd, arg & O_NONBLOCK != 0),
         F_DUPFD | F_DUPFD_CLOEXEC => dup_inherit(fd, cmd == F_DUPFD),
@@ -2055,7 +2066,6 @@ mod tests {
     /// handle of its own, which kept the write end open until the table's
     /// sweep.
     #[test]
-    #[ignore = "fails until F_GETFL reads without making an entry (the next commit)"]
     fn test_f_getfl_makes_no_state_that_outlives_a_close_past_the_library() {
         let (mut r, mut w): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
         // SAFETY: two handles' room; a pipe of our own.
