@@ -1215,7 +1215,10 @@ jobs:
           # Option E-ii: the held LVT timer write against an MSI inside its
           # window, vCPU 1's IPIs, its own expired timer and 2000 MSIs from
           # another thread, every interrupt taken; and its cost with 0, 1
-          # and 15 other vCPUs (X2HOLD and X2HOLDREC lines).
+          # and 15 other vCPUs (X2HOLD and X2HOLDREC lines). Records a and
+          # a2: an MSI in every window, one vector (merges counted, and the
+          # windows after which requests came back together) and a vector
+          # each (a request in flight at a window followed to its taking).
           alone whp::vcpu::fpu_tests::test_a_held_lvt_timer_write_loses_no_interrupt
           alone whp::vcpu::fpu_tests::test_a_held_lvt_timer_write_loses_no_interrupt --release
           # A 2 MiB chunk of userfaultfd guest RAM swapped (discarded

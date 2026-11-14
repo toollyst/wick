@@ -2054,7 +2054,7 @@ impl VcpuFd {
             #[cfg(test)]
             PAGE_WINDOW.with(|w| {
                 if let Some(hook) = w.borrow_mut().as_mut() {
-                    hook();
+                    hook(&page);
                 }
             });
             self.put_lapic_page(&page, size)?;
@@ -2787,13 +2787,18 @@ impl VcpuFd {
     }
 }
 
+/// [`PAGE_WINDOW`]'s hook.
+#[cfg(test)]
+type PageWindowHook = Box<dyn FnMut(&[u8; LAPIC_PAGE])>;
+
 #[cfg(test)]
 thread_local! {
     /// Option E-ii's one test seam: when set, run on the vCPU's thread
     /// between the APIC page's get and set of a held LVT timer write
-    /// (`write_x2apic_lvtt`), with every requester held off
+    /// (`write_x2apic_lvtt`), with every requester held off, with the page
+    /// to be set (its IRR and ISR the get's)
     /// (`test_a_held_lvt_timer_write_loses_no_interrupt`).
-    static PAGE_WINDOW: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+    static PAGE_WINDOW: std::cell::RefCell<Option<PageWindowHook>> = const { std::cell::RefCell::new(None) };
 }
 
 /// How many MSRs [`say_unkept_msr`] names in a process: a guest probing
@@ -6158,7 +6163,29 @@ mod fpu_tests {
     /// - a: the window itself: [`PAGE_WINDOW`], the one test seam, runs
     ///   between the page's get and set, and starts a thread that injects
     ///   an MSI then (`inject_msi`, the irqfd writer's call), 2 ms before
-    ///   the set; 50 such writes, every MSI taken;
+    ///   the set, in a window where every MSI requested before was taken
+    ///   (so no two are pending at once: one vector's requests merge in its
+    ///   IRR bit, as on any APIC); 50 such writes, every MSI taken, the run
+    ///   ended by the 50th's being taken, not by the 20 s bound;
+    /// - a1 (X2HOLDREC a, a record with two assertions): an MSI requested
+    ///   in each of 50 windows, whether or not the one before was taken, its
+    ///   thread making the request itself under the request lock as
+    ///   `request_interrupt` does, so that it can count the requests made
+    ///   while an earlier one was pending (merges at most). Printed: the
+    ///   writes a second; the windows after which more than one request
+    ///   came in before the next (the lock is free only between a set and
+    ///   the next write's hold, so blocked requests land together: PC step
+    ///   17a, release, 48 of 50 taken); the windows where a request that
+    ///   came back was neither taken nor in the page's IRR or ISR (in
+    ///   flight in the hypervisor). Asserted: taken and merged at most
+    ///   cover what was asked, and no interrupt pends once the guest is
+    ///   stopped beyond those;
+    /// - a2 (X2HOLDREC a2): the same with a vector of its own for each
+    ///   window's MSI (0x90 to 0xc1, each gate counting its own), so that
+    ///   none can merge and each request in flight at a window can be
+    ///   followed: taken after the set (the hypervisor kept it outside the
+    ///   page, and the set did not clobber it: printed) or never (option
+    ///   E-ii's loss, H2). Asserted: every one taken;
     /// - b: vCPU 1, on its own thread, sends 2000 fixed IPIs of 0xe1 to
     ///   vCPU 0 (WRMSR 0x830, WHP's own), each once the one before was
     ///   taken or a bound of spins passed (counted lost), against vCPU 0's
@@ -6273,7 +6300,18 @@ mod fpu_tests {
         };
         let mut wrong: Vec<String> = Vec::new();
 
-        // a: an MSI requested inside the window.
+        // The IRR and ISR bits of vector `v` in an APIC page.
+        let irr = |page: &[u8; LAPIC_PAGE], v: u8| {
+            let at = 0x200 + usize::from(v / 32) * 0x10;
+            u32::from_le_bytes(page[at..at + 4].try_into().unwrap()) >> (v % 32) & 1 == 1
+        };
+        let isr = |page: &[u8; LAPIC_PAGE], v: u8| {
+            let at = 0x100 + usize::from(v / 32) * 0x10;
+            u32::from_le_bytes(page[at..at + 4].try_into().unwrap()) >> (v % 32) & 1 == 1
+        };
+
+        // a: an MSI requested inside the window, once every one before it
+        // was taken.
         {
             let (vm, mut zero, m) = vm_with(&lvt_loop);
             let read = reader(m);
@@ -6281,8 +6319,9 @@ mod fpu_tests {
             let requested = Arc::new(AtomicU64::new(0));
             let (hook_inner, hook_requested) = (Arc::clone(&inner), Arc::clone(&requested));
             PAGE_WINDOW.with(|w| {
-                *w.borrow_mut() = Some(Box::new(move || {
-                    if hook_requested.load(Ordering::SeqCst) < u64::from(WINDOWS) {
+                *w.borrow_mut() = Some(Box::new(move |_| {
+                    let asked = hook_requested.load(Ordering::SeqCst);
+                    if asked < u64::from(WINDOWS) && u64::from(read(TAKEN)) == asked {
                         let i = Arc::clone(&hook_inner);
                         std::thread::spawn(move || i.inject_msi(MSI, u32::from(V)));
                         hook_requested.fetch_add(1, Ordering::SeqCst);
@@ -6294,12 +6333,92 @@ mod fpu_tests {
             let watch_requested = Arc::clone(&requested);
             let watcher = std::thread::spawn(move || {
                 let begun = Instant::now();
-                while begun.elapsed() < Duration::from_secs(20)
-                    && !(watch_requested.load(Ordering::SeqCst) >= u64::from(WINDOWS) && u64::from(read(TAKEN)) >= u64::from(WINDOWS))
-                {
+                let done = || watch_requested.load(Ordering::SeqCst) >= u64::from(WINDOWS) && u64::from(read(TAKEN)) >= u64::from(WINDOWS);
+                while begun.elapsed() < Duration::from_secs(20) && !done() {
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                let bound = !done();
                 // The last ones' time to be taken.
+                std::thread::sleep(Duration::from_millis(50));
+                kicker.set_kvm_immediate_exit(1);
+                (read(TAKEN), read(LOOPS), begun.elapsed(), bound)
+            });
+            let exits = run_until(&mut zero, None);
+            let (taken, loops, took, bound) = watcher.join().unwrap();
+            PAGE_WINDOW.with(|w| *w.borrow_mut() = None);
+            let asked = requested.load(Ordering::SeqCst);
+            eprintln!(
+                "X2HOLD a: {asked} MSIs requested inside the page's window, each once the one before was taken, {taken} taken; \
+                 the guest's writes {loops}, in {took:?}{}; exits {exits:?}",
+                if bound { ", ended by the 20 s bound" } else { "" }
+            );
+            if asked < u64::from(WINDOWS) || u64::from(taken) != asked || bound || exits.last().map(String::as_str) != Some("EINTR") {
+                wrong.push(format!("a: {asked} requested, {taken} taken, ended by the bound {bound}, exits {exits:?}"));
+            }
+            drop((inner, zero, vm));
+            unmap(m);
+        }
+
+        // A request as `request_interrupt` makes it (under the request
+        // lock, for reading), with `under` run once the lock is held and
+        // before the request: the record parts' threads.
+        let request = |inner: &VmInner, v: u8, under: &dyn Fn()| -> i32 {
+            let control = super::super::irqchip::interrupt_control(MSI, u32::from(v));
+            let _held = inner.requests.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            under();
+            // SAFETY: a valid interrupt control of its size.
+            unsafe { whv::WHvRequestInterrupt(inner.part, &control, u32::try_from(std::mem::size_of_val(&control)).unwrap()) }
+        };
+
+        // a1: an MSI requested in each window (X2HOLDREC a).
+        {
+            let (vm, mut zero, m) = vm_with(&lvt_loop);
+            let read = reader(m);
+            let inner = Arc::clone(&zero.shared.inner);
+            // Requested, came back, made while one before was pending, and
+            // what the windows saw: windows after which more than one came
+            // back before the next, windows with one back, not taken and in
+            // neither IRR nor ISR; the count back at the last window.
+            let counts: Arc<[AtomicU64; 6]> = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
+            let (asked_i, back_i, merged_i, together_i, inflight_i, last_i) = (0, 1, 2, 3, 4, 5);
+            let (hook_inner, hook_counts) = (Arc::clone(&inner), Arc::clone(&counts));
+            PAGE_WINDOW.with(|w| {
+                *w.borrow_mut() = Some(Box::new(move |page| {
+                    let c = &hook_counts;
+                    let back = c[back_i].load(Ordering::SeqCst);
+                    if back.saturating_sub(c[last_i].swap(back, Ordering::SeqCst)) > 1 {
+                        c[together_i].fetch_add(1, Ordering::SeqCst);
+                    }
+                    // At the WRMSR's exit the vCPU is in the loop, never in
+                    // the gate (an interrupt gate, which writes no LVT and
+                    // EOIs before its IRETQ): every interrupt delivered was
+                    // counted, and the vector's ISR bit is clear.
+                    if back > u64::from(read(TAKEN)) && !irr(page, V) && !isr(page, V) {
+                        c[inflight_i].fetch_add(1, Ordering::SeqCst);
+                    }
+                    if c[asked_i].load(Ordering::SeqCst) < u64::from(WINDOWS) {
+                        let (i, tc) = (Arc::clone(&hook_inner), Arc::clone(c));
+                        std::thread::spawn(move || {
+                            let pending = || {
+                                if tc[back_i].load(Ordering::SeqCst) > u64::from(read(TAKEN)) {
+                                    tc[merged_i].fetch_add(1, Ordering::SeqCst);
+                                }
+                            };
+                            assert_eq!(request(&i, V, &pending), 0, "the record's WHvRequestInterrupt");
+                            tc[back_i].fetch_add(1, Ordering::SeqCst);
+                        });
+                        c[asked_i].fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }));
+            });
+            let mut kicker = VcpuFd { shared: Arc::clone(&zero.shared), own: None };
+            let watch = Arc::clone(&counts);
+            let watcher = std::thread::spawn(move || {
+                let begun = Instant::now();
+                while begun.elapsed() < Duration::from_secs(20) && watch[back_i].load(Ordering::SeqCst) < u64::from(WINDOWS) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 std::thread::sleep(Duration::from_millis(50));
                 kicker.set_kvm_immediate_exit(1);
                 (read(TAKEN), read(LOOPS), begun.elapsed())
@@ -6307,10 +6426,103 @@ mod fpu_tests {
             let exits = run_until(&mut zero, None);
             let (taken, loops, took) = watcher.join().unwrap();
             PAGE_WINDOW.with(|w| *w.borrow_mut() = None);
-            let asked = requested.load(Ordering::SeqCst);
-            eprintln!("X2HOLD a: {asked} MSIs requested inside the page's window, {taken} taken; the guest's writes {loops}, in {took:?}; exits {exits:?}");
-            if asked < u64::from(WINDOWS) || u64::from(taken) != asked || exits.last().map(String::as_str) != Some("EINTR") {
-                wrong.push(format!("a: {asked} requested, {taken} taken, exits {exits:?}"));
+            let (page, _) = zero.lapic_page().unwrap();
+            let pending_at_end = u64::from(irr(&page, V));
+            let n = |i: usize| counts[i].load(Ordering::SeqCst);
+            let (asked, back, merged) = (n(asked_i), n(back_i), n(merged_i));
+            eprintln!(
+                "X2HOLDREC a: {asked} MSIs requested, one in each window, {back} came back, {taken} taken, {merged} made while one \
+                 before was pending (merged at most), {pending_at_end} pending once the guest stopped; the guest's writes {loops}, \
+                 in {took:?}, {} a second; windows after which more than one request came back before the next: {}; windows with \
+                 a request back, not taken, in neither IRR nor ISR: {}; exits {exits:?}",
+                u128::from(loops) * 1_000_000 / took.as_micros().max(1),
+                n(together_i),
+                n(inflight_i)
+            );
+            if back != u64::from(WINDOWS) || u64::from(taken) + merged + pending_at_end < asked {
+                wrong.push(format!("a1: {asked} requested, {back} back, {taken} taken, {merged} merged at most, {pending_at_end} pending"));
+            }
+            drop((inner, zero, vm));
+            unmap(m);
+        }
+
+        // a2: a vector of its own for each window's MSI (X2HOLDREC a2).
+        {
+            const FIRST: u8 = 0x90;
+            const COUNTS: u64 = 0x7400;
+            const GATES: u64 = 0xD000;
+            let (vm, mut zero, m) = vm_with(&lvt_loop);
+            for k in 0..WINDOWS {
+                let (v, gate_at) = (FIRST + u8::try_from(k).unwrap(), GATES + u64::from(k) * 0x20);
+                let counter = u32::try_from(COUNTS + u64::from(k) * 4).unwrap();
+                // push rax, rcx, rdx; lock inc dword [counter]; EOI; pop; iretq.
+                let gate = [&[0x50u8, 0x51, 0x52, 0xF0, 0xFF, 0x04, 0x25][..], &counter.to_le_bytes(), &wrmsr(0x80B, 0), &[0x5A, 0x59, 0x58, 0x48, 0xCF]].concat();
+                assert!(gate.len() <= 0x20);
+                put(m, gate_at, &gate);
+                put(m, MMIO_IDT + u64::from(v) * 16, &((gate_at & 0xffff) | (8 << 16) | (0x8E << 40)).to_le_bytes());
+                put(m, MMIO_IDT + u64::from(v) * 16 + 8, &0u64.to_le_bytes());
+            }
+            let read = reader(m);
+            let inner = Arc::clone(&zero.shared.inner);
+            // Requested, and by window: came back, and in flight at a window
+            // (back, not taken, in neither IRR nor ISR); a bit each.
+            let (asked, back, inflight) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+            let (hook_inner, h_asked, h_back, h_inflight) = (Arc::clone(&inner), Arc::clone(&asked), Arc::clone(&back), Arc::clone(&inflight));
+            PAGE_WINDOW.with(|w| {
+                *w.borrow_mut() = Some(Box::new(move |page| {
+                    let came = h_back.load(Ordering::SeqCst);
+                    for k in 0..WINDOWS {
+                        let v = FIRST + u8::try_from(k).unwrap();
+                        // As in a1, the vector's ISR bit is clear here.
+                        if came >> k & 1 == 1 && read(COUNTS + u64::from(k) * 4) == 0 && !irr(page, v) && !isr(page, v) {
+                            h_inflight.fetch_or(1 << k, Ordering::SeqCst);
+                        }
+                    }
+                    let k = h_asked.load(Ordering::SeqCst);
+                    if k < u64::from(WINDOWS) {
+                        let (i, b) = (Arc::clone(&hook_inner), Arc::clone(&h_back));
+                        std::thread::spawn(move || {
+                            assert_eq!(request(&i, FIRST + u8::try_from(k).unwrap(), &|| {}), 0, "the record's WHvRequestInterrupt");
+                            b.fetch_or(1 << k, Ordering::SeqCst);
+                        });
+                        h_asked.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }));
+            });
+            let mut kicker = VcpuFd { shared: Arc::clone(&zero.shared), own: None };
+            let w_back = Arc::clone(&back);
+            let all = (1u64 << WINDOWS) - 1;
+            let watcher = std::thread::spawn(move || {
+                let begun = Instant::now();
+                let taken = || (0..WINDOWS).filter(|&k| read(COUNTS + u64::from(k) * 4) > 0).count();
+                while begun.elapsed() < Duration::from_secs(20) && (w_back.load(Ordering::SeqCst) != all || taken() < WINDOWS as usize) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                kicker.set_kvm_immediate_exit(1);
+                (read(LOOPS), begun.elapsed())
+            });
+            let exits = run_until(&mut zero, None);
+            let (loops, took) = watcher.join().unwrap();
+            PAGE_WINDOW.with(|w| *w.borrow_mut() = None);
+            let (page, _) = zero.lapic_page().unwrap();
+            let in_flight = inflight.load(Ordering::SeqCst);
+            let taken_k = |k: u32| read(COUNTS + u64::from(k) * 4) > 0;
+            let never: Vec<u32> = (0..WINDOWS).filter(|&k| !taken_k(k)).collect();
+            let later = (0..WINDOWS).filter(|&k| in_flight >> k & 1 == 1 && taken_k(k)).count();
+            let lost_in_flight = (0..WINDOWS).filter(|&k| in_flight >> k & 1 == 1 && !taken_k(k)).count();
+            let pending: Vec<u32> = never.iter().copied().filter(|&k| irr(&page, FIRST + u8::try_from(k).unwrap())).collect();
+            eprintln!(
+                "X2HOLDREC a2: {} MSIs requested, a vector each, {} came back, {} taken; in flight at a window (back, not taken, in \
+                 neither IRR nor ISR) and taken after the set: {later}; in flight and never taken: {lost_in_flight}; never taken \
+                 {never:?}, of them pending once the guest stopped {pending:?}; the guest's writes {loops}, in {took:?}; exits {exits:?}",
+                asked.load(Ordering::SeqCst),
+                back.load(Ordering::SeqCst).count_ones(),
+                WINDOWS as usize - never.len()
+            );
+            if back.load(Ordering::SeqCst) != all || !never.is_empty() {
+                wrong.push(format!("a2: never taken {never:?} (pending at the end {pending:?}), in flight and never taken {lost_in_flight}"));
             }
             drop((inner, zero, vm));
             unmap(m);
@@ -6413,9 +6625,14 @@ mod fpu_tests {
             let (vm, mut zero, m) = vm_with(&program);
             let read = reader(m);
             let stop = Arc::new(AtomicBool::new(false));
-            let idlers: Vec<_> = (1..=others)
-                .map(|id| {
-                    let mut v = ap(&vm, &zero, id, HALT_PROGRAM, false);
+            // Every vCPU made before any runs: a vCPU's creation matches its
+            // TSC to vCPU 0's, which suspends partition time, and WHP
+            // refuses that while a vCPU runs (WHV_E_INVALID_VP_STATE: PC step
+            // 17a, when vCPU 2 was made with vCPU 1 halted in the guest).
+            let made: Vec<_> = (1..=others).map(|id| ap(&vm, &zero, id, HALT_PROGRAM, false)).collect();
+            let idlers: Vec<_> = made
+                .into_iter()
+                .map(|mut v| {
                     let stop = Arc::clone(&stop);
                     let mut kick = VcpuFd { shared: Arc::clone(&v.shared), own: None };
                     let thread = std::thread::spawn(move || {
