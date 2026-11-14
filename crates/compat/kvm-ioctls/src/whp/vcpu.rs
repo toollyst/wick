@@ -7976,8 +7976,13 @@ mod fpu_tests {
     /// one of them at the limit, which moves the chunk under the guest's
     /// reads; the move seen (an even page no longer committed); every odd
     /// page dirty; the other even pages filled again (the move gave their
-    /// charge back). Asserted: no bad value, every round moved, no dirty
-    /// page lost. MOVEUNDERVCPU lines.
+    /// charge back). Then `ROUNDS` more in which the guest writes through
+    /// the move: mode 1 kept during the discard and the fill, and two
+    /// passes after the move, so that a write made while the chunk was
+    /// closed and copied that did not reach the new section (WHP letting it
+    /// into the old one after the guest's view was closed) is a bad value
+    /// at the next pass. Asserted: no bad value, every round moved, no
+    /// dirty page lost. MOVEUNDERVCPU lines.
     ///
     /// ```text
     ///     xor r8d, r8d; xor r9d, r9d
@@ -8074,19 +8079,27 @@ mod fpu_tests {
             }
         };
         // (moved, the dirty odd pages lost, the guest's bad values) by round.
-        let mut rounds: Vec<(bool, u64, u64)> = Vec::with_capacity(ROUNDS as usize + 1);
-        let mut round = |at_the_limit: bool| {
+        let mut rounds: Vec<(bool, u64, u64)> = Vec::with_capacity(2 * ROUNDS as usize + 1);
+        // A round; `writing`: the guest writes through the move (mode 1).
+        let mut round = |at_the_limit: bool, writing: bool| {
             mailbox(0).store(1, Ordering::SeqCst);
             vm.get_dirty_log(0, MEM).unwrap();
             passes(2);
-            mailbox(0).store(2, Ordering::SeqCst);
-            passes(2);
+            if !writing {
+                mailbox(0).store(2, Ordering::SeqCst);
+                passes(2);
+            }
             discard_even();
             assert!(committed(chunk + 2 * PAGE), "a discarded page inside the chunk keeps its commit until a reclaim");
             // The first even page's fill: at the limit, refused until the
             // reclaim has moved the chunk.
             assert_eq!(libc::wick_uffd::zeropage(ctx, chunk, PAGE, true), Ok(PAGE), "the first fill (at the limit: {at_the_limit})");
             let moved = !committed(chunk + 2 * PAGE);
+            if writing {
+                // Each odd page checked against the guest's last write to
+                // it, the ones made during the move among them.
+                passes(2);
+            }
             let dirty = vm.get_dirty_log(0, MEM).unwrap();
             let first = CHUNK / PAGE;
             let lost = (first..2 * first).filter(|p| p % 2 == 1).filter(|&p| dirty[(p / 64) as usize] & (1 << (p % 64)) == 0).count() as u64;
@@ -8094,7 +8107,7 @@ mod fpu_tests {
             rounds.push((moved, lost, mailbox(2).load(Ordering::SeqCst)));
         };
         // A round before the limit: the heap's blocks for these calls made.
-        round(false);
+        round(false, false);
         // Held at the limit: commit made until the job refuses it, then
         // pages down to 4 KiB, never touched.
         let mut ballast: Vec<(usize, usize)> = Vec::with_capacity(100_000);
@@ -8112,8 +8125,10 @@ mod fpu_tests {
             }
         }
         let held: usize = ballast.iter().map(|b| b.1).sum();
-        for _ in 0..ROUNDS {
-            round(true);
+        for writing in [false, true] {
+            for _ in 0..ROUNDS {
+                round(true, writing);
+            }
         }
         for (b, _) in ballast.drain(..) {
             // SAFETY: our ballast.
@@ -8123,20 +8138,25 @@ mod fpu_tests {
         let end = runner.join().unwrap();
         let at_limit = &rounds[1..];
         let moved = at_limit.iter().filter(|r| r.0).count();
+        let moved_writing = at_limit[ROUNDS as usize..].iter().filter(|r| r.0).count();
         let lost: u64 = at_limit.iter().map(|r| r.1).sum();
         let bad = mailbox(2).load(Ordering::SeqCst);
+        // The guest's bad values when the reading rounds ended.
+        let bad_reading = at_limit[ROUNDS as usize - 1].2;
         eprintln!(
-            "MOVEUNDERVCPU {} of {ROUNDS} rounds at the limit moved the chunk under the guest's reads ({} MiB held as ballast); dirty odd pages lost {lost}; the guest's bad values {bad} after {} passes; before the limit: moved {}; the vCPU's last exit {end}",
+            "MOVEUNDERVCPU {} of {} rounds at the limit moved the chunk ({} of {ROUNDS} under the guest's reads, {moved_writing} of {ROUNDS} under its writes; {} MiB held as ballast); dirty odd pages lost {lost}; the guest's bad values {bad} after {} passes ({bad_reading} after the reading rounds); before the limit: moved {}; the vCPU's last exit {end}",
             moved,
+            2 * ROUNDS,
+            moved - moved_writing,
             held >> 20,
             mailbox(1).load(Ordering::SeqCst),
             rounds[0].0,
         );
         // SAFETY: closes the user end.
         unsafe { libc::close(user) };
-        assert_eq!((moved, lost, bad), (ROUNDS as usize, 0, 0), "{rounds:?}");
+        assert_eq!((moved, lost, bad), (2 * ROUNDS as usize, 0, 0), "{rounds:?}");
         assert!(end.starts_with("out 0x86"), "the vCPU ended with {end}");
-        eprintln!("MOVEUNDERVCPU all {ROUNDS} rounds moved, nothing lost");
+        eprintln!("MOVEUNDERVCPU all {} rounds moved, reading and writing, nothing lost", 2 * ROUNDS);
         drop(vm);
         // SAFETY: the test's mapping, no VM left using it.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
