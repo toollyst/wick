@@ -1361,9 +1361,11 @@ jobs:
           # what the jail was asked for, which the tool reads when a level
           # above is written. And memory.max's count of sections
           # (platform::commit), alone for its COMMITPOLL line: how long after
-          # a section past the limit was given the jail ended with 137.
+          # a section past the limit was given the jail ended with 137, in
+          # its parts; and the poll's timer's intervals (COMMITTIMER).
           for t in test_a_jails_job_under_a_parent_job_on_record test_nested_jobs_on_record \
               test_a_section_past_the_limit_ends_the_jail_with_137 \
+              test_the_poll_timer_ticks_about_every_millisecond \
               test_hugetlb_page_sizes_are_linuxs \
               test_a_parent_bounds_its_jails_together test_a_parent_lasts_while_a_jail_holds_it \
               test_a_jail_under_a_parent_has_linuxs_cpus_and_rate \

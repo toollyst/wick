@@ -52,7 +52,8 @@
 //! What remains, against Linux (memcontrol.c, `try_charge_memcg`, charges
 //! each page before it is mapped): a time window. Between two polls a
 //! jailed process can take host commit beyond `memory.max` (a 4 GiB section
-//! in 27.8 us, SECTREC-e c) and is ended at the next poll, about 1 ms. A
+//! in 27.8 us, SECTREC-e c) and is ended at the next poll, about 1 ms (the timer's median interval,
+//! `test_the_poll_timer_ticks_about_every_millisecond`, COMMITTIMER). A
 //! process that swaps its cover for usable private commit between two reads
 //! of the cover holds up to twice `memory.max` of usable memory until the
 //! next read, within 100 ms. Windows tells no user-mode process of a
@@ -284,6 +285,20 @@ struct Process {
     read_at: Option<u64>,
 }
 
+/// When a jail past its limit was ended, the parts of the window for the
+/// record (COMMITPOLL): the poll that counted it past the limit began
+/// (`seen`), its count again with the cover read (`counted`), and
+/// `TerminateJobObject` came back (`terminated`); with the polls made from
+/// the first (`first`) to the last.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Ended {
+    pub first: Option<Instant>,
+    pub seen: Instant,
+    pub counted: Instant,
+    pub terminated: Instant,
+    pub polls: u64,
+}
+
 struct Jail {
     job: OwnedHandle,
     limit: u64,
@@ -294,6 +309,9 @@ struct Jail {
     walks: u64,
     longest_walk: Duration,
     before: Option<(Instant, u64)>,
+    first: Option<Instant>,
+    /// The poll past the limit: its start, and the end of its count.
+    past: Option<(Instant, Instant)>,
 }
 
 impl Jail {
@@ -340,6 +358,7 @@ impl Jail {
     /// One poll: `Err` with the line to end the jail with.
     fn poll(&mut self) -> Result<(), String> {
         let now = Instant::now();
+        self.first.get_or_insert(now);
         self.polls += 1;
         let walk = self.walked.is_none_or(|t| now.duration_since(t) >= WALK);
         let mut c = self.count(walk)?;
@@ -348,6 +367,7 @@ impl Jail {
             c = self.count(true)?;
         }
         if c.total() > self.limit {
+            self.past = Some((now, Instant::now()));
             let before = self.before.map_or_else(
                 || "no poll before it".to_string(),
                 |(t, n)| format!("the poll before, {} us earlier, counted {n}", now.duration_since(t).as_micros()),
@@ -383,15 +403,9 @@ fn duplicate(h: HANDLE) -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(out) })
 }
 
-/// Counts the jail of `job` against `limit` bytes until `firecracker` ends,
-/// and ends the jail with 137 past it. `large`: the bytes of large pages the
-/// jailer gave (`large_pages`). `Err` if the count cannot be taken or
-/// started: the caller ends the jail. A host that cannot count sections had
-/// `memory.max` refused before (`cgroup`, [`sections_counted`]).
-pub(super) fn watch(job: HANDLE, firecracker: HANDLE, limit: u64, large: Option<Arc<AtomicU64>>) -> io::Result<JoinHandle<()>> {
-    sections_counted().map_err(io::Error::other)?;
-    let job = duplicate(job)?;
-    let firecracker = duplicate(firecracker)?;
+/// The poll's timer: a high-resolution waitable timer, due in [`POLL`] and
+/// then every [`POLL`].
+fn poll_timer() -> io::Result<OwnedHandle> {
     // SAFETY: no attributes, no name.
     let timer = unsafe {
         CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
@@ -407,6 +421,26 @@ pub(super) fn watch(job: HANDLE, firecracker: HANDLE, limit: u64, large: Option<
     if unsafe { SetWaitableTimer(timer.as_raw_handle(), &due, period, None, std::ptr::null(), 0) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(timer)
+}
+
+/// Counts the jail of `job` against `limit` bytes until `firecracker` ends,
+/// and ends the jail with 137 past it. `large`: the bytes of large pages the
+/// jailer gave (`large_pages`). `Err` if the count cannot be taken or
+/// started: the caller ends the jail. A host that cannot count sections had
+/// `memory.max` refused before (`cgroup`, [`sections_counted`]). The thread
+/// gives the window's parts ([`Ended`]) when it ended the jail past the
+/// limit.
+pub(super) fn watch(
+    job: HANDLE,
+    firecracker: HANDLE,
+    limit: u64,
+    large: Option<Arc<AtomicU64>>,
+) -> io::Result<JoinHandle<Option<Ended>>> {
+    sections_counted().map_err(io::Error::other)?;
+    let job = duplicate(job)?;
+    let firecracker = duplicate(firecracker)?;
+    let timer = poll_timer()?;
     let mut jail = Jail {
         job,
         limit,
@@ -417,6 +451,8 @@ pub(super) fn watch(job: HANDLE, firecracker: HANDLE, limit: u64, large: Option<
         walks: 0,
         longest_walk: Duration::ZERO,
         before: None,
+        first: None,
+        past: None,
     };
     std::thread::Builder::new().name("memory.max".into()).spawn(move || {
         let waits = [timer.as_raw_handle(), firecracker.as_raw_handle()];
@@ -425,7 +461,7 @@ pub(super) fn watch(job: HANDLE, firecracker: HANDLE, limit: u64, large: Option<
             let r = unsafe { WaitForMultipleObjects(2, waits.as_ptr(), 0, INFINITE) };
             let result = match r.wrapping_sub(WAIT_OBJECT_0) {
                 0 => jail.poll(),
-                1 => return,
+                1 => return None,
                 _ => Err(format!("waiting for the next poll: {}", io::Error::last_os_error())),
             };
             if let Err(line) = result {
@@ -438,7 +474,14 @@ pub(super) fn watch(job: HANDLE, firecracker: HANDLE, limit: u64, large: Option<
                     // SAFETY: our duplicate of Firecracker's handle.
                     unsafe { TerminateProcess(firecracker.as_raw_handle(), KILLED) };
                 }
-                return;
+                let terminated = Instant::now();
+                return jail.past.map(|(seen, counted)| Ended {
+                    first: jail.first,
+                    seen,
+                    counted,
+                    terminated,
+                    polls: jail.polls,
+                });
             }
         }
     })
@@ -519,9 +562,36 @@ mod tests {
         self_check().unwrap();
     }
 
+    // The poll's timer ticks about every POLL on this host: 500 ticks of
+    // `poll_timer`, their intervals' least, median, 99th percentile and
+    // greatest printed (COMMITTIMER), the median asserted within 2 ms, the
+    // window the docs give ("about 1 ms"). A timer that fell back to the
+    // system's default tick would be about 15.6 ms.
+    #[test]
+    fn test_the_poll_timer_ticks_about_every_millisecond() {
+        let timer = poll_timer().unwrap();
+        let mut last = Instant::now();
+        let mut gaps = Vec::with_capacity(500);
+        for _ in 0..500 {
+            // SAFETY: our timer.
+            assert_eq!(unsafe { WaitForSingleObject(timer.as_raw_handle(), 1000) }, WAIT_OBJECT_0);
+            let now = Instant::now();
+            gaps.push(now.duration_since(last).as_micros());
+            last = now;
+        }
+        gaps.sort_unstable();
+        let (least, median, p99, most) = (gaps[0], gaps[250], gaps[495], gaps[499]);
+        println!("COMMITTIMER 500 ticks of the poll's timer: least {least} us, median {median} us, 99th percentile {p99} us, greatest {most} us");
+        assert!(median <= 2000, "the poll's timer ticks every {median} us (median), not about every 1 ms");
+    }
+
     // A section given to a process of the jail is counted, and one past the
     // limit ends the jail with 137 at the next poll; a section within it does
-    // not.
+    // not. Printed (COMMITPOLL): the window from the section given to the
+    // process's end, in its parts: making and giving the section, to the
+    // poll that counted it past the limit, that poll's count with the cover
+    // read again before the kill, TerminateJobObject, and the process's end
+    // as this test sees it; with the polls' mean interval.
     #[test]
     fn test_a_section_past_the_limit_ends_the_jail_with_137() {
         let (job, p) = jail();
@@ -531,10 +601,32 @@ mod tests {
         assert_eq!(ends_within(&p, 250), None, "16 MiB of sections under a limit 32 MiB above the process ended it");
         let t = Instant::now();
         give_section(&p, 32 * MIB);
+        let given = Instant::now();
         let code = ends_within(&p, 1000);
-        println!("COMMITPOLL a section past the limit: the jail ended {} us after it was given", t.elapsed().as_micros());
+        let observed = Instant::now();
+        let ended = w.join().unwrap();
+        let us = |a: Instant, b: Instant| b.saturating_duration_since(a).as_micros();
+        match ended {
+            Some(e) => {
+                let mean = e.first.map_or(0, |f| us(f, e.seen) / u128::from(e.polls.saturating_sub(1).max(1)));
+                println!(
+                    "COMMITPOLL a section past the limit: the jail ended {} us after it was given: the section made and \
+                     given {} us; to the poll that counted it past the limit {} us; that poll's count, the cover read \
+                     again, {} us; TerminateJobObject {} us; to the process's end as the test saw it {} us; {} polls, \
+                     {mean} us apart on average",
+                    us(t, observed),
+                    us(t, given),
+                    us(given, e.seen),
+                    us(e.seen, e.counted),
+                    us(e.counted, e.terminated),
+                    us(e.terminated, observed),
+                    e.polls,
+                );
+            }
+            None => println!("COMMITPOLL a section past the limit: the count did not end the jail ({} us)", us(t, observed)),
+        }
         assert_eq!(code, Some(KILLED), "48 MiB of sections under a limit 32 MiB above the process");
-        w.join().unwrap();
+        assert!(ended.is_some(), "the jail ended, not by the count");
     }
 
     // Charge pages (committed PAGE_NOACCESS private memory) pay for section
