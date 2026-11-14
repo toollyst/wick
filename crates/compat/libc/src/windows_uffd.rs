@@ -1971,6 +1971,114 @@ mod tests {
         unsafe { ws::closesocket(sock(user)) };
     }
 
+    /// The test binary's allocator: the system's, counting the allocations
+    /// a thread makes while [`COUNTING_ALLOCATIONS`] is set on it
+    /// (`test_a_reclaim_allocates_nothing`).
+    struct Counting;
+
+    std::thread_local! {
+        static COUNTING_ALLOCATIONS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+        static ALLOCATIONS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    }
+
+    // SAFETY: the system allocator's calls, as they are; the count is a
+    // thread-local cell, which allocates nothing.
+    unsafe impl std::alloc::GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            if COUNTING_ALLOCATIONS.with(core::cell::Cell::get) {
+                ALLOCATIONS.with(|a| a.set(a.get() + 1));
+            }
+            // SAFETY: the caller's contract.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            // SAFETY: the caller's contract.
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+            if COUNTING_ALLOCATIONS.with(core::cell::Cell::get) {
+                ALLOCATIONS.with(|a| a.set(a.get() + 1));
+            }
+            // SAFETY: the caller's contract.
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+
+    /// The allocations `f` makes on this thread, and its result.
+    fn allocations_of<T>(f: impl FnOnce() -> T) -> (u64, T) {
+        ALLOCATIONS.with(|a| a.set(0));
+        COUNTING_ALLOCATIONS.with(|c| c.set(true));
+        let r = f();
+        COUNTING_ALLOCATIONS.with(|c| c.set(false));
+        (ALLOCATIONS.with(core::cell::Cell::get), r)
+    }
+
+    /// A reclaim allocates nothing: it runs when the job has refused commit,
+    /// where a heap that must grow would end the process instead (Linux's
+    /// reclaim takes no memory on that path either). A fill's reclaim, and
+    /// a touch's that passes over a chunk with a call in flight on it and
+    /// then waits for that call (held 200 ms by another thread), each move
+    /// their chunks with no allocation on the reclaiming thread. In a
+    /// process of its own (a reclaim takes any chunk of the process).
+    #[test]
+    #[ignore = "fails until the reclaim allocates nothing (the next commit)"]
+    fn test_a_reclaim_allocates_nothing() {
+        let (code, text) = run_child("reclaim_allocations_child", None);
+        assert!(text.contains("allocations: touch 0, fill 0"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_reclaim_allocates_nothing in a process of its own"]
+    fn reclaim_allocations_child() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 3 * CHUNK;
+        let mem = map(len as usize);
+        register(ctx, mem, len).unwrap();
+        let data = std::vec![0x5au8; len as usize];
+        // SAFETY: `data` holds `len` bytes.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, len, true) }.unwrap(), len);
+        let discard_even = |chunk: u64| {
+            for p in (0..CHUNK).step_by(2 * PAGE as usize) {
+                // SAFETY: registered memory of ours.
+                assert_eq!(unsafe { crate::madvise((mem + chunk * CHUNK + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+            }
+        };
+        discard_even(0);
+        discard_even(1);
+        // A call in flight on the first chunk, for 200 ms.
+        let held = std::sync::Arc::new(AtomicBool::new(false));
+        let caller = {
+            let held = held.clone();
+            std::thread::spawn(move || {
+                #[allow(clippy::cast_possible_truncation)]
+                let call = crate::windows_mm::copying(mem as usize, PAGE as usize);
+                held.store(true, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                drop(call);
+            })
+        };
+        while !held.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let (touch, r) = allocations_of(|| reclaim_at_touch(PAGE as usize));
+        caller.join().unwrap();
+        assert_eq!(r.chunks, 2, "the touch's reclaim moved {r:?}");
+        discard_even(2);
+        let (fill, r) = allocations_of(|| {
+            let _lock = lock();
+            reclaim_for_a_fill(PAGE as usize)
+        });
+        assert_eq!(r.chunks, 1, "the fill's reclaim moved {r:?}");
+        std::println!("allocations: touch {touch}, fill {fill}");
+        assert_eq!((touch, fill), (0, 0));
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
     /// The jailer's count of this process (overlay/jailer/platform/windows
     /// commit.rs): private commit plus section commit less the committed,
     /// private, `PAGE_NOACCESS` memory that pays for sections (the cover),
