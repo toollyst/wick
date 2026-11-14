@@ -6,7 +6,8 @@
 # after a restore only once more input came; run 43528972093 of this workflow
 # found the cause, input that came while the guest's console printk had the
 # UART's interrupts masked, never signalled by vm-superio 0.8.1, fixed by
-# patches/0049): the smp snapshot restored
+# patches/0049; run 43539122286 at bbd8f2c: 0 of 126 rounds late): the smp
+# snapshot restored
 # many times, each in a new process, against resumes in the same process,
 # with the guest's interrupts and timers, Firecracker's page faults and KVM's
 # trace events per round (tools/linux/boot-test.sh --stage restores). A
