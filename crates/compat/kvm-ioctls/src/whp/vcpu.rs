@@ -2628,9 +2628,13 @@ impl VcpuFd {
         Ok(super::ffi::as_u64(&super::ffi::get_register(self.part(), self.vp(), name)?))
     }
 
-    /// Answers an MSR intercept. WHP only exits for MSRs it does not model, so
-    /// an unknown read returns 0 and an unknown write is ignored, as KVM does
-    /// with `ignore_msrs`.
+    /// Answers an MSR intercept. WHP only exits for MSRs it does not model.
+    /// An x2APIC register's MSR outside x2APIC mode is #GP(0), as KVM's
+    /// (`apicmode::x2apic_msr_exit`). Any other MSR the backend does not
+    /// keep is read as 0 and its write ignored, as KVM does only with
+    /// `ignore_msrs`, which is off by default (KVM gives #GP(0) for an MSR
+    /// it has no case for): not KVM's yet (docs/COMPATIBILITY.md, the Guest
+    /// MSRs row).
     fn handle_msr(
         &self,
         m: &whv::WHV_X64_MSR_ACCESS_CONTEXT,
@@ -2641,6 +2645,31 @@ impl VcpuFd {
         // SAFETY: the access-info bitfield overlaps the u32.
         let (is_write, value) = super::exit::msr_access(unsafe { m.AccessInfo.AsUINT32 }, m.Rax, m.Rdx);
         let index = m.MsrNumber;
+        // An x2APIC register's MSR (`apicmode::x2apic_msr_exit`): #GP(0)
+        // outside x2APIC mode, RIP left at the instruction, as KVM's; in
+        // x2APIC mode WHP's own, so an exit fails the vCPU, named.
+        if super::apicmode::X2APIC_MSRS.contains(&index) {
+            let apic_base = self.register(whv::WHvX64RegisterApicBase)?;
+            if super::apicmode::x2apic_msr_exit(index, apic_base) == Some(super::apicmode::X2ApicMsrExit::Gp) {
+                return super::ffi::set_register(
+                    self.part(),
+                    self.vp(),
+                    whv::WHvRegisterPendingInterruption,
+                    super::ffi::reg64(super::debug::pending_gp()),
+                );
+            }
+            super::ffi::report(
+                log::Level::Error,
+                &format!(
+                    "whp: vCPU {}'s {} of x2APIC MSR {index:#x} in x2APIC mode (APIC_BASE {apic_base:#x}) exited to \
+                     the backend, where WHP's x2APIC answers it itself (GPEXITREC): the backend has no value of the \
+                     guest's APIC for it, and fails the vCPU rather than make one up",
+                    self.vp(),
+                    if is_write { "WRMSR" } else { "RDMSR" }
+                ),
+            );
+            return err(libc::EIO);
+        }
         if super::mce::whp_answers(index) {
             // Measured to be answered by WHP itself, with no exit; one that
             // exits is answered as KVM would from the vCPU's value, which
@@ -5606,6 +5635,54 @@ mod fpu_tests {
         let (exits, _) = run([wrmsr(0x832, 0x4_00EC), vec![0xE6, PORT as u8, 0xEB, 0xFE]].concat(), Some(8));
         eprintln!("TSCDLTEST #GP's and #DF's gates past it: exits {exits:?}");
         assert!(exits.last().is_some_and(|e| e.starts_with("Shutdown")), "no triple fault");
+    }
+
+    /// A guest's `RDMSR` or `WRMSR` of an x2APIC register's MSR (0x800 to
+    /// 0x8ff) on the product's partition, an xAPIC (`vm::X2APIC_PARTITIONS`),
+    /// is the guest's own #GP, as KVM's `kvm_x2apic_msr_read` and
+    /// `kvm_x2apic_msr_write` give it outside x2APIC mode
+    /// (`apicmode::x2apic_msr_exit`): WHP hands each to the backend as an
+    /// MSR exit, which had answered it as an unknown MSR, the write ignored
+    /// and the read 0 (TSCDLTEST, PC step 15b at 305a806). Each access a VM
+    /// of its own, the instruction then `out 0x80`; the guest's fault line
+    /// for vector 13, and the instruction not done (its RIP's `out` never
+    /// reached). Printed (X2MSRGP lines).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_an_x2apic_msr_outside_x2apic_mode_is_a_gp_as_kvm() {
+        let imm = |v: u32| v.to_le_bytes();
+        let wrmsr = |ecx: u32, eax: u32| [&[0xB9][..], &imm(ecx), &[0xB8], &imm(eax), &[0x31, 0xD2, 0x0F, 0x30]].concat();
+        let rdmsr = |ecx: u32| [&[0xB9][..], &imm(ecx), &[0x0F, 0x32]].concat();
+        let cases: [(&str, Vec<u8>); 5] = [
+            ("WRMSR 0x832 of 0x400ec (the LVT timer, TSC-deadline mode)", wrmsr(0x832, 0x4_00EC)),
+            ("WRMSR 0x80b of 0 (EOI)", wrmsr(0x80B, 0)),
+            ("WRMSR 0x830 of 0x40ec (a self-IPI by the ICR)", wrmsr(0x830, 0x40EC)),
+            ("RDMSR 0x802 (the ID)", rdmsr(0x802)),
+            ("RDMSR 0x8ff (the range's last)", rdmsr(0x8FF)),
+        ];
+        let mut wrong = Vec::new();
+        for (name, instruction) in cases {
+            super::super::vm::APIC_MODE_FOR_TESTS.set(Some(whv::WHvX64LocalApicEmulationModeXApic));
+            let (vm, mut vcpu, m) = mmio_guest(&[instruction, vec![0xE6, PORT as u8, 0xEB, 0xFE]].concat());
+            super::super::vm::APIC_MODE_FOR_TESTS.set(None);
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let mut reads = 0;
+            let mut exits = Vec::new();
+            while exits.len() < 5 && !exits.last().is_some_and(|e: &String| e.starts_with("out") || e.starts_with("fault") || e.contains("fail") || e == "EINTR") {
+                exits.push(one_run(&mut vcpu, &[], &mut reads));
+            }
+            drop(watchdog);
+            vcpu.set_kvm_immediate_exit(0);
+            eprintln!("X2MSRGP {name}: exits {exits:?}");
+            if !exits.last().is_some_and(|e| e.starts_with("fault: exception 13")) {
+                wrong.push(name);
+            }
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+        assert!(wrong.is_empty(), "no #GP for {wrong:?}");
     }
 
     /// A local APIC state in KVM's x2APIC-mode format restores and reads

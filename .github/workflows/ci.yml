@@ -1115,6 +1115,11 @@ jobs:
           # EXTD a #GP, as KVM's for a guest whose CPUID lacks the bit (run
           # 43452122814: an Intel runner's guests offered x2APIC froze).
           alone whp::vcpu::fpu_tests::test_a_guest_without_x2apic_in_its_cpuid_is_refused_x2apic_as_kvm
+          # An x2APIC register's MSR (0x800-0x8ff) read or written outside
+          # x2APIC mode is the guest's #GP, as KVM's, on the product's xAPIC
+          # partition (X2MSRGP lines; PC step 15b at 305a806: a WRMSR of
+          # 0x832 was ignored).
+          alone whp::vcpu::fpu_tests::test_an_x2apic_msr_outside_x2apic_mode_is_a_gp_as_kvm
           # KVM's CR4 rule against what WHP takes (CR4TEST lines): each CR4
           # bit KVM knows, alone, through KVM_SET_SREGS with the supported
           # CPUID; a bit the rule refuses is EINVAL before WHP, and one it

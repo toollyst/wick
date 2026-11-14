@@ -78,9 +78,70 @@ pub fn refuses_leaf1_ecx(apic: LocalApic, ecx: Option<u32>) -> bool {
     }
 }
 
+/// The x2APIC registers' MSRs, KVM's `APIC_BASE_MSR ... APIC_BASE_MSR +
+/// 0xff` (Linux v6.1 arch/x86/kvm/x86.c 3611, 4058).
+pub const X2APIC_MSRS: core::ops::RangeInclusive<u32> = 0x800..=0x8ff;
+
+/// IA32_APIC_BASE's EXTD: x2APIC mode.
+const APIC_BASE_EXTD: u64 = 1 << 10;
+
+/// What the run loop does with a guest's `RDMSR` or `WRMSR` of an x2APIC
+/// register's MSR that WHP handed it as an MSR exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X2ApicMsrExit {
+    /// #GP(0), the instruction not done: the local APIC is not in x2APIC
+    /// mode (APIC_BASE.EXTD clear), where KVM's `kvm_x2apic_msr_read` and
+    /// `kvm_x2apic_msr_write` return 1 (`!apic_x2apic_mode(apic)`, v6.1
+    /// arch/x86/kvm/lapic.c 2961-2962, 2972-2973) and `kvm_emulate_rdmsr`
+    /// and `kvm_emulate_wrmsr` inject #GP(0) for it (`kvm_complete_insn_gp`,
+    /// x86.c 748-756, from x86.c 2016-2040 and 2041-2064); `ignore_msrs`
+    /// (off by default, x86.c 143) never masks it, as it masks only
+    /// `KVM_MSR_RET_INVALID`, an MSR KVM has no case for
+    /// (`kvm_get_msr_ignored_check`, `kvm_set_msr_ignored_check`, x86.c
+    /// 1866-1876, 1911-1923). On an xAPIC partition
+    /// (every product partition) that is every such access: WHP exits for
+    /// them (GPEXITREC, APIC_BASE.EXTD clear: reason 0x1000) and the
+    /// backend had answered them as an unknown MSR, the write ignored and
+    /// the read 0 (TSCDLTEST, PC step 15b at 305a806: the guest's WRMSR
+    /// 0x832 in xAPIC mode went on to its next instruction).
+    Gp,
+    /// In x2APIC mode, where WHP's x2APIC answers every such access itself,
+    /// with no exit (GPEXITREC, APIC_BASE.EXTD set: 0 MSR exits): an exit is
+    /// one the backend has no answer for, and the vCPU fails, named, rather
+    /// than give the guest an APIC register's value it does not have.
+    Unanswered,
+}
+
+/// The run loop's answer to an MSR exit for `index` with APIC_BASE
+/// `apic_base` ([`X2ApicMsrExit`]), or `None` for an MSR that is not an
+/// x2APIC register's.
+pub fn x2apic_msr_exit(index: u32, apic_base: u64) -> Option<X2ApicMsrExit> {
+    if !X2APIC_MSRS.contains(&index) {
+        return None;
+    }
+    Some(if apic_base & APIC_BASE_EXTD == 0 { X2ApicMsrExit::Gp } else { X2ApicMsrExit::Unanswered })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_an_x2apic_msr_outside_x2apic_mode_is_a_gp_as_kvm() {
+        // xAPIC mode (enabled, BSP), x2APIC mode, disabled.
+        let (xapic, x2apic, off) = (0xfee0_0900u64, 0xfee0_0d00u64, 0xfee0_0100u64);
+        for index in [0x800u32, 0x802, 0x80b, 0x80f, 0x830, 0x832, 0x838, 0x839, 0x83f, 0x8ff] {
+            assert_eq!(x2apic_msr_exit(index, xapic), Some(X2ApicMsrExit::Gp), "{index:#x}");
+            assert_eq!(x2apic_msr_exit(index, off), Some(X2ApicMsrExit::Gp), "{index:#x}, APIC disabled");
+            assert_eq!(x2apic_msr_exit(index, x2apic), Some(X2ApicMsrExit::Unanswered), "{index:#x}");
+        }
+        // Not an x2APIC register's: APIC_BASE itself, the TSC deadline, the
+        // MSRs either side of the range, kvmclock.
+        for index in [0x1bu32, 0x6e0, 0x7ff, 0x900, 0x4b56_4d01, 0xc000_0080] {
+            assert_eq!(x2apic_msr_exit(index, xapic), None, "{index:#x}");
+            assert_eq!(x2apic_msr_exit(index, x2apic), None, "{index:#x}");
+        }
+    }
 
     #[test]
     fn test_an_xapic_partition_never_offers_x2apic() {
