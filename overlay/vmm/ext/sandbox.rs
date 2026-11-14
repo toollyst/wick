@@ -844,8 +844,9 @@ mod macos {
     pub fn profile_for(root: Option<&Path>, netns: Option<&Path>) -> Result<String, SandboxError> {
         // The user's directory of endpoints, which a net device hot-plugged
         // into a running microVM opens in outside a jail and a network:
-        // found and made now, as the run phase denies its lookup (confstr
-        // calls geteuid) and mkdir.
+        // found and made now with this instance's directory in it, as the
+        // sandbox denies mkdir once applied and the run phase the lookup
+        // (confstr calls geteuid).
         crate::platform::net::find_user_endpoint_dir(root.is_none() && netns.is_none());
         let files = match root {
             Some(root) => files_in_jail(root, netns)?,
@@ -4159,7 +4160,7 @@ mod macos {
         #[ignore = "run by test_a_hotplugged_endpoint_frees_its_name_when_it_goes in a separate process"]
         fn endpoint_drop_child() {
             let name = format!("fchp{}", std::process::id());
-            let path = crate::platform::net::user_endpoint_dir().unwrap().join(&name);
+            let path = crate::platform::net::user_endpoint_dir().unwrap().join(crate::logger::DEFAULT_INSTANCE_ID).join(&name);
             let _ = std::fs::remove_file(&path);
             let net = |id: &str| {
                 crate::devices::virtio::net::Net::new(
@@ -4190,6 +4191,49 @@ mod macos {
             println!("CHILD-SURVIVED");
         }
 
+        // A device hot-plugged into a running microVM by a Firecracker that
+        // is not root opens the operator's interface: whether it may make
+        // one (its effective uid) was read while the microVM was built, as
+        // the run phase denies geteuid (upstream's filter has none), where
+        // the open asked then and the sandbox ended Firecracker
+        // (test_hotplug_net, run mac9-rule-b).
+        #[test]
+        fn test_a_hotplugged_interface_asks_no_uid() {
+            let pid = std::process::id().to_string();
+            let out = child("endpoint_uid_child", &[("WICK_TEST_CASE", &pid)]);
+            let entry = crate::platform::net::user_endpoint_dir().unwrap().join(format!("fcuid{pid}"));
+            let _ = std::fs::remove_file(entry);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(stdout.contains("OPENED") && stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_a_hotplugged_interface_asks_no_uid in a separate process"]
+        fn endpoint_uid_child() {
+            // SAFETY: no arguments.
+            assert_ne!(unsafe { libc::geteuid() }, 0, "as a user: root may make any name");
+            let name = format!("fcuid{}", std::env::var("WICK_TEST_CASE").unwrap());
+            let dir = crate::platform::net::user_endpoint_dir().unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            // The operator's interface: the switch's socket in the network.
+            let _ = std::fs::remove_file(dir.join(&name));
+            let _switch = std::os::unix::net::UnixDatagram::bind(dir.join(&name)).unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            match crate::platform::net::tests_as::real(|| crate::platform::net::Tap::open_named(&name)) {
+                Ok(tap) => {
+                    println!("OPENED");
+                    drop(tap);
+                }
+                Err(err) => println!("REFUSED {err}"),
+            }
+            // Time for a denial's kill to land.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            println!("CHILD-SURVIVED");
+        }
+
         // A name in use hot-plugged again is busy (EBUSY), as a second
         // TUNSETIFF on a TAP another file holds (drivers/net/tun.c, v6.1,
         // tun_attach :769 to :771): upstream's test_hotplug_net expects
@@ -4200,7 +4244,9 @@ mod macos {
             let pid = std::process::id().to_string();
             let out = child("endpoint_busy_child", &[("WICK_TEST_CASE", &pid)]);
             // The stale name the child could not remove.
-            let _ = std::fs::remove_file(crate::platform::net::user_endpoint_dir().unwrap().join(format!("fchs{pid}")));
+            let _ = std::fs::remove_file(
+                crate::platform::net::user_endpoint_dir().unwrap().join(crate::logger::DEFAULT_INSTANCE_ID).join(format!("fchs{pid}")),
+            );
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(out.status.success(), "{}", text(&out));
             assert!(stdout.contains("BUSY") && stdout.contains("STALE-IN-USE"), "{}", text(&out));
@@ -4213,7 +4259,7 @@ mod macos {
             use crate::platform::net::{Tap, TapError};
             let pid = std::env::var("WICK_TEST_CASE").unwrap();
             let (name, stale) = (format!("fchb{pid}"), format!("fchs{pid}"));
-            let dir = crate::platform::net::user_endpoint_dir().unwrap();
+            let dir = crate::platform::net::user_endpoint_dir().unwrap().join(crate::logger::DEFAULT_INSTANCE_ID);
             std::fs::create_dir_all(&dir).unwrap();
             // A socket file nobody receives on: a killed VMM's.
             drop(std::os::unix::net::UnixDatagram::bind(dir.join(&stale)).unwrap());

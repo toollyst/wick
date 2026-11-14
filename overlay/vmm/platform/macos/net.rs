@@ -95,20 +95,144 @@ fn network() -> Option<(&'static Path, BorrowedFd<'static>)> {
     Some((crate::ext::jail::netns()?, crate::ext::jail::netns_dir()?))
 }
 
-/// The directory of endpoints named without `/`: the jail's network (by its
-/// path outside the jail), or `firecracker-net` in the user's temporary
-/// directory.
+/// Whether this Firecracker may make an interface nobody made, as root may
+/// make a TAP on Linux (CAP_NET_ADMIN): its effective uid is 0, read once
+/// while the microVM is built ([`find_user_endpoint_dir`]), as a running
+/// microVM may not call geteuid (upstream's filter has none) and a device
+/// hot-plugged then asks (`test_a_hotplugged_interface_asks_no_uid`). Unit
+/// tests run with that right by default, as upstream's run as root; the
+/// tests of the refusal take it away, and [`tests_as::real`] asks the
+/// process ([`tests_as`]).
+fn may_create() -> bool {
+    #[cfg(test)]
+    if let Some(creator) = tests_as::CREATOR.with(std::cell::Cell::get) {
+        return creator;
+    }
+    #[cfg(test)]
+    if !tests_as::REAL.with(std::cell::Cell::get) {
+        return true;
+    }
+    euid() == 0
+}
+
+/// This process's effective uid, read once.
+fn euid() -> libc::uid_t {
+    static EUID: std::sync::OnceLock<libc::uid_t> = std::sync::OnceLock::new();
+    // SAFETY: no arguments.
+    *EUID.get_or_init(|| unsafe { libc::geteuid() })
+}
+
+/// Whether this Firecracker is jailed: given a network (`--netns`) or in a
+/// chroot jail. A test may say so for its thread ([`tests_as`]).
+fn jailed() -> bool {
+    #[cfg(test)]
+    if let Some(jailed) = tests_as::JAILED.with(std::cell::Cell::get) {
+        return jailed;
+    }
+    network().is_some() || crate::ext::jail::root().is_some()
+}
+
+/// What the unit tests run this thread's opens as: without the creator's
+/// right ([`may_create`]), or as a jailed Firecracker ([`jailed`]).
+#[cfg(test)]
+pub(crate) mod tests_as {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static CREATOR: Cell<Option<bool>> = const { Cell::new(None) };
+        pub(super) static JAILED: Cell<Option<bool>> = const { Cell::new(None) };
+        pub(super) static REAL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Runs `f` with this thread's opens made with the process's own right
+    /// to make an interface (its effective uid), as Firecracker's are.
+    pub(crate) fn real<T>(f: impl FnOnce() -> T) -> T {
+        let before = REAL.with(|c| c.replace(true));
+        let out = f();
+        REAL.with(|c| c.set(before));
+        out
+    }
+
+    /// Runs `f` with this thread's opens made as a user who is not root.
+    pub(crate) fn user<T>(f: impl FnOnce() -> T) -> T {
+        let before = CREATOR.with(|c| c.replace(Some(false)));
+        let out = f();
+        CREATOR.with(|c| c.set(before));
+        out
+    }
+
+    /// Runs `f` with this thread's opens made as a jailed Firecracker's.
+    pub(crate) fn jailed<T>(f: impl FnOnce() -> T) -> T {
+        let before = JAILED.with(|c| c.replace(Some(true)));
+        let out = f();
+        JAILED.with(|c| c.set(before));
+        out
+    }
+}
+
+/// The directory of this instance's endpoints named without `/`: the jail's
+/// own directory in its network (by its path outside the jail), or, without
+/// a network, `<id>` in `firecracker-net` in the user's temporary directory
+/// (`<id>` Firecracker's `--id`). Either way the network directory, where
+/// the operator's switch makes the interfaces ([`operator_made`]), is its
+/// parent.
 pub fn endpoint_dir() -> io::Result<PathBuf> {
     if let Some((path, _)) = network() {
         return Ok(path.to_owned());
     }
-    let dir = user_endpoint_dir()?;
-    // Made by the time the sandbox is in place (find_user_endpoint_dir); a
-    // running microVM may not make a directory (mkdir is setup's).
+    let id = crate::logger::INSTANCE_ID.get().map_or(crate::logger::DEFAULT_INSTANCE_ID, String::as_str);
+    let dir = user_endpoint_dir()?.join(id);
+    // Made as the sandbox's profile is ([`find_user_endpoint_dir`]): the
+    // sandbox denies mkdir from the time it is applied.
     if !dir.is_dir() {
         std::fs::create_dir_all(&dir)?;
     }
     Ok(dir)
+}
+
+/// Whether the operator made the interface `name`: a socket `name` directly
+/// in the network directory, the parent of this instance's directory `dir`
+/// (reached through `network` in a jail), owned by the network directory's
+/// owner or root. No jail can make a name in the network directory (the
+/// jailer's permissions on it, docs/PORTING.md row 6), so a jail cannot make
+/// its own interface. The operator's switch makes it, and its socket there is
+/// the one the endpoint takes as its peer, as on Linux the operator makes a
+/// TAP (`ip tuntap add`) and Firecracker opens it.
+fn operator_made(dir: &Path, network: Option<BorrowedFd<'_>>, name: &str) -> io::Result<bool> {
+    let stat = |path: &Path| -> io::Result<libc::stat> {
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        // SAFETY: plain data, filled by fstatat.
+        let mut st: libc::stat = unsafe { mem::zeroed() };
+        let at = network.map_or(libc::AT_FDCWD, |fd| fd.as_raw_fd());
+        // SAFETY: a directory descriptor (or AT_FDCWD) and a NUL-terminated
+        // path; no link followed at its last name.
+        if unsafe { libc::fstatat(at, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(st)
+    };
+    let (parent, entry) = match network {
+        Some(_) => (PathBuf::from(".."), Path::new("..").join(name)),
+        None => {
+            let parent = dir.parent().ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+            (parent.to_owned(), parent.join(name))
+        }
+    };
+    let owner = stat(&parent)?.st_uid;
+    match stat(&entry) {
+        Ok(st) => Ok(st.st_mode & libc::S_IFMT == libc::S_IFSOCK && (st.st_uid == owner || st.st_uid == 0)),
+        Err(err) if err.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// The refusal of an interface this Firecracker may not open: EPERM, as
+/// TUNSETIFF's for a name that is no TAP of the caller's without
+/// CAP_NET_ADMIN (Linux v6.1 drivers/net/tun.c tun_set_iff :2781,
+/// tun_not_capable :577), so upstream's text; why is logged.
+fn refuse(name: &str, why: fmt::Arguments<'_>) -> TapError {
+    crate::logger::warn!("net: {name:?} refused: {why}");
+    TapError::IfreqExecuteError(io::Error::from_raw_os_error(libc::EPERM), name.to_owned())
 }
 
 /// `firecracker-net` in the user's temporary directory (not made here):
@@ -135,12 +259,18 @@ pub fn user_endpoint_dir() -> io::Result<PathBuf> {
 }
 
 /// Finds the user's directory of endpoints ([`user_endpoint_dir`]), and
-/// makes it if `make`, while nothing denies it: called as the sandbox's
-/// profile is made. An error is kept, and given to each opener of a bare
-/// name as before.
+/// makes it and this instance's in it ([`endpoint_dir`]) if `make` (the
+/// profile is for them: outside a jail and a network), while nothing
+/// denies it: called as the sandbox's profile is made, before it is applied
+/// (the sandbox denies mkdir; the instance's `--id` is known by then), so
+/// that a device hot-plugged into a running microVM finds them
+/// (`test_a_bare_name_hotplugged_without_a_network_opens`). An error is
+/// kept, and given to each opener of a bare name as before.
 pub fn find_user_endpoint_dir(make: bool) {
-    if let (Ok(dir), true) = (user_endpoint_dir(), make) {
-        let _ = std::fs::create_dir_all(dir);
+    // The right to make an interface, which an open asks (may_create).
+    euid();
+    if make {
+        let _ = endpoint_dir();
     }
 }
 
@@ -788,6 +918,17 @@ fn parse_name(if_name: &str) -> Result<Target, TapError> {
         return Err(invalid());
     }
     if if_name.contains('/') {
+        // A wick extension: the endpoint the caller named, made where it
+        // says. Not in a jail, whose interfaces are the operator's only.
+        if jailed() {
+            return Err(refuse(
+                if_name,
+                format_args!(
+                    "a path name is for a Firecracker without a jail; a jailed one opens only the \
+                     interfaces of its network"
+                ),
+            ));
+        }
         return Ok(Target::Endpoint {
             dir: None,
             network: None,
@@ -802,6 +943,12 @@ fn parse_name(if_name: &str) -> Result<Target, TapError> {
         || name.contains(|c: char| c == ':' || c.is_whitespace())
     {
         return Err(invalid());
+    }
+    if network().is_none() && crate::ext::jail::root().is_some() {
+        return Err(refuse(
+            name,
+            format_args!("a jail without a network (--netns) has no interfaces but vmnet's"),
+        ));
     }
     let dir = endpoint_dir().map_err(TapError::OpenTun)?;
     Ok(Target::Endpoint {
@@ -833,6 +980,30 @@ fn open_endpoint(
         Some(libc::ENAMETOOLONG) => TapError::InvalidIfname,
         _ => TapError::IfreqExecuteError(err, name.to_owned()),
     };
+    // A name without a path: the operator's interface, unless this
+    // Firecracker may make one ([`may_create`]); a unit name is always one
+    // to make, as on Linux.
+    if let Some(dir) = dir
+        && !may_create()
+    {
+        let network_dir = dir.parent().unwrap_or(dir);
+        if name.contains("%d") {
+            return Err(refuse(
+                name,
+                format_args!("a unit name (%d) is made, and only root makes an interface; the network's switch makes `X` in {network_dir:?}"),
+            ));
+        }
+        if !operator_made(dir, network, name).map_err(|e| failed(e, name))? {
+            return Err(refuse(
+                name,
+                format_args!(
+                    "no interface {name:?} in {network_dir:?}: the network's switch makes it (bind its socket \
+                     {:?} before configuring the interface)",
+                    network_dir.join(name)
+                ),
+            ));
+        }
+    }
     if !name.contains("%d") {
         return open(name)
             .map(|ep| (name.to_owned(), ep))
@@ -1230,6 +1401,8 @@ pub mod simulator {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::cast_possible_truncation)]
+    use std::os::unix::fs::FileTypeExt;
+
     use super::simulator::*;
     use super::*;
 
@@ -1269,6 +1442,135 @@ mod tests {
             parse_name("/tmp/x.sock"),
             Ok(Target::Endpoint { dir: None, .. })
         ));
+    }
+
+    /// The refusal of a name, as Linux's TUNSETIFF refuses one without
+    /// CAP_NET_ADMIN (drivers/net/tun.c tun_set_iff :2781): EPERM, in
+    /// upstream's text.
+    fn refused(got: Result<Tap, TapError>, name: &str) {
+        match got {
+            Err(err @ TapError::IfreqExecuteError(..)) => {
+                let TapError::IfreqExecuteError(ref e, ref n) = err else { unreachable!() };
+                assert_eq!((e.raw_os_error(), n.as_str()), (Some(libc::EPERM), name), "{err}");
+                let text = crate::devices::virtio::net::NetError::TapOpen(err).to_string();
+                assert_eq!(
+                    text,
+                    format!(
+                        "Open tap device failed: Error while creating ifreq structure: Operation not permitted \
+                         (os error 1). Invalid TUN/TAP Backend provided by {name}. Check our documentation on \
+                         setting up the network devices."
+                    )
+                );
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+
+    /// The operator's entry for `name`: the switch's socket, directly in the
+    /// network directory (outside a jail, the user's directory of
+    /// endpoints, the parent of this instance's).
+    fn operator_entry(name: &str) -> (std::os::unix::net::UnixDatagram, PathBuf) {
+        let path = user_endpoint_dir().unwrap().join(name);
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        (std::os::unix::net::UnixDatagram::bind(&path).unwrap(), path)
+    }
+
+    /// This instance's directory of endpoints outside a jail.
+    fn instance_dir() -> PathBuf {
+        user_endpoint_dir().unwrap().join(crate::logger::DEFAULT_INSTANCE_ID)
+    }
+
+    // As a user, a name the operator did not make is refused, as a TAP that
+    // does not exist is for a user on Linux, and nothing is made; one the
+    // operator made opens, its endpoint in this instance's own directory.
+    #[test]
+    fn test_only_the_operators_interface_opens() {
+        let name = format!("fcop{}", std::process::id());
+        let _ = std::fs::remove_file(user_endpoint_dir().unwrap().join(&name));
+        tests_as::user(|| refused(Tap::open_named(&name), &name));
+        assert!(!instance_dir().join(&name).exists());
+        assert!(!user_endpoint_dir().unwrap().join(&name).exists());
+        let (switch, entry) = operator_entry(&name);
+        let tap = tests_as::user(|| Tap::open_named(&name)).unwrap();
+        assert_eq!(tap.if_name_as_str(), name);
+        let endpoint = instance_dir().join(&name);
+        assert!(std::fs::symlink_metadata(&endpoint).unwrap().file_type().is_socket());
+        // The switch reaches it there.
+        switch.send_to(b"", &endpoint).unwrap();
+        // Gone with its device; the operator's interface stays.
+        drop(tap);
+        assert!(!endpoint.exists());
+        assert!(entry.exists());
+        std::fs::remove_file(&entry).unwrap();
+    }
+
+    // What is not a socket is no entry, however named: a file, a directory,
+    // and a symbolic link to the operator's socket.
+    #[test]
+    fn test_an_entry_is_a_socket() {
+        let dir = user_endpoint_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid = std::process::id();
+        let (file, folder, link, target) =
+            (format!("fcf{pid}"), format!("fcd{pid}"), format!("fcl{pid}"), format!("fct{pid}"));
+        std::fs::write(dir.join(&file), b"").unwrap();
+        std::fs::create_dir_all(dir.join(&folder)).unwrap();
+        let (_switch, target_path) = operator_entry(&target);
+        let _ = std::fs::remove_file(dir.join(&link));
+        std::os::unix::fs::symlink(&target_path, dir.join(&link)).unwrap();
+        for name in [&file, &folder, &link] {
+            tests_as::user(|| refused(Tap::open_named(name), name));
+            assert!(!instance_dir().join(name).exists(), "{name}");
+        }
+        std::fs::remove_file(dir.join(&file)).unwrap();
+        std::fs::remove_dir(dir.join(&folder)).unwrap();
+        std::fs::remove_file(dir.join(&link)).unwrap();
+        std::fs::remove_file(&target_path).unwrap();
+    }
+
+    // A unit name (`%d`) is always one to make, as on Linux: refused for a
+    // user, made for root, in this instance's directory.
+    #[test]
+    fn test_a_unit_name_is_made_only_by_the_creator() {
+        let name = format!("fcu{}x%d", std::process::id() % 100_000);
+        tests_as::user(|| refused(Tap::open_named(&name), &name));
+        let tap = Tap::open_named(&name).unwrap();
+        let made = instance_dir().join(tap.if_name_as_str());
+        assert!(made.exists(), "{made:?}");
+        drop(tap);
+        assert!(!made.exists(), "{made:?}");
+    }
+
+    // Root makes a name nobody made, as root makes a TAP on Linux; it is
+    // attached to nothing until a switch attaches.
+    #[test]
+    fn test_the_creator_makes_a_name_nobody_made() {
+        let name = format!("fcmk{}", std::process::id());
+        let _ = std::fs::remove_file(user_endpoint_dir().unwrap().join(&name));
+        let tap = Tap::open_named(&name).unwrap();
+        let made = instance_dir().join(&name);
+        assert!(made.exists());
+        assert!(!user_endpoint_dir().unwrap().join(&name).exists());
+        drop(tap);
+        assert!(!made.exists());
+    }
+
+    // A path name is for an unjailed Firecracker: in a jail it is refused,
+    // whatever it names, and nothing is made (a jail's names are the
+    // operator's interfaces only).
+    #[test]
+    fn test_a_jail_opens_no_path_name() {
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let abs = dir.as_path().join("x");
+        for name in [abs.to_str().unwrap(), "../x", "a/b", "./x", "x/"] {
+            tests_as::jailed(|| refused(Tap::open_named(name), name));
+        }
+        assert!(!abs.exists());
+        // Unjailed, the same absolute path opens.
+        let tap = Tap::open_named(abs.to_str().unwrap()).unwrap();
+        assert!(abs.exists());
+        drop(tap);
     }
 
     #[test]
@@ -1435,7 +1737,7 @@ mod tests {
         use std::os::fd::AsFd;
         use std::os::unix::net::UnixDatagram;
 
-        let net = endpoint_dir().unwrap().join(format!("net-{}", std::process::id()));
+        let net = user_endpoint_dir().unwrap().join(format!("net-{}", std::process::id()));
         std::fs::create_dir_all(&net).unwrap();
         let dir: &'static OwnedFd = Box::leak(Box::new(OwnedFd::from(std::fs::File::open(&net).unwrap())));
         let mut ep = Endpoint::open(Path::new("tap0"), Some((&net, dir.as_fd())), false).unwrap();
@@ -1530,7 +1832,7 @@ mod tests {
         use std::os::fd::AsFd;
         use std::os::unix::net::UnixDatagram;
 
-        let net = endpoint_dir().unwrap().join(format!("jn{}", std::process::id()));
+        let net = user_endpoint_dir().unwrap().join(format!("jn{}", std::process::id()));
         let (a, b) = (net.join("a"), net.join("b"));
         for dir in [&a, &b] {
             std::fs::create_dir_all(dir).unwrap();

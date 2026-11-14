@@ -7,11 +7,16 @@
 // Firecracker binds its interface `<name>` there (vmm::platform::net), and
 // behind each one this process is the host, a user-space IP stack (libslirp)
 // whose address is the one the test gives its TAP (`ifconfig tap0
-// 192.168.0.1/30 up`), bound at `.host-<name>` directly in the directory,
-// by its real path (a jailed VMM takes only such sockets as peers). The
-// endpoint is `<name>` there for a VMM without a jail, and `<id>/<name>`,
-// in the jail's own directory, under the jailer; a test's network holds one
-// microVM, so the one directory that has the name is taken. It attaches to
+// 192.168.0.1/30 up`), bound at `<name>` directly in the directory, by its
+// real path: that socket is the interface, which Firecracker opens only if
+// the network's owner made it, as Linux's opens only a TAP that exists
+// (`ip tuntap add`), and the one sender a jailed VMM's endpoint takes as its
+// peer. The endpoint is `<id>/<name>`, in the VMM's own directory of the
+// network (the jailer's, or the stand-in's, tools/macos/integration/jailer);
+// a test's network holds one microVM per interface: the first directory
+// found with the name is attached to, and another VMM's endpoint of the name
+// is refused and said once (Linux: a second TUNSETIFF on a TAP in use is
+// EBUSY, drivers/net/tun.c tun_attach). It attaches to
 // the endpoint (an empty datagram) whenever one is bound there anew, having
 // forgotten the interface's neighbours, as Linux forgets a TAP's when the
 // VMM that held it lets it go (forget). The
@@ -128,8 +133,9 @@ struct iface {
     uint8_t guest_mac[6];    // last told to the programs stack
     struct in_addr guest_ip;
     uint8_t seen_mac[6];     // the guest's, from its last frame (0: none yet)
-    int fd;                  // the host's socket, bound at .host-<name>
-    struct sockaddr_un vmm;  // the VMM's endpoint, relative to the network (the working directory): <name> or <id>/<name>
+    int fd;                  // the host's socket, bound at <name>: the interface
+    struct sockaddr_un vmm;  // the VMM's endpoint, relative to the network (the working directory): <id>/<name>
+    ino_t refused;           // the last other endpoint of the name said to be refused (locate)
     ino_t attached;          // the endpoint attached to (its inode), 0: none
     ino_t forgot;            // the endpoint the neighbours were forgotten for (forget)
     int txqueuelen;          // what a test asked for (0: not asked)
@@ -422,15 +428,20 @@ static int live(const char *path) {
 
 // Where the VMM's endpoint of the interface is, relative to the network
 // (this process's working directory, so that a jail's 36-character id does
-// not have to fit a socket address after the network's path): `<name>`, or
-// `<id>/<name>` in the directory of the VMM that has it bound. A VMM leaves
-// its endpoint's socket file when it ends (vmm::platform::net), and a
-// network used again holds the directories of the VMMs before, each id's
-// own: an endpoint nobody receives on is not one to attach to.
+// not have to fit a socket address after the network's path): `<id>/<name>`
+// in the directory of the VMM that has it bound. A VMM leaves its
+// endpoint's socket file when it ends (vmm::platform::net), and a network
+// used again holds the directories of the VMMs before, each id's own: an
+// endpoint nobody receives on is not one to attach to. The one attached to
+// stays while a VMM receives on it; another VMM's live endpoint of the name
+// is refused, and said once.
 static void locate(struct iface *i) {
     struct stat st;
-    snprintf(i->vmm.sun_path, sizeof i->vmm.sun_path, "%s", i->name);
-    if (lstat(i->name, &st) == 0) return;
+    if (i->attached && stat(i->vmm.sun_path, &st) == 0 && st.st_ino == i->attached && live(i->vmm.sun_path)) {
+        // Still there: any other endpoint of the name is a second VMM's.
+    } else {
+        i->vmm.sun_path[0] = 0;
+    }
     DIR *d = opendir(".");
     if (!d) return;
     struct dirent *e;
@@ -438,9 +449,13 @@ static void locate(struct iface *i) {
         char path[sizeof i->vmm.sun_path];
         if (e->d_type != DT_DIR || e->d_name[0] == '.') continue;
         if ((size_t)snprintf(path, sizeof path, "%s/%s", e->d_name, i->name) >= sizeof path) continue;
-        if (lstat(path, &st) == 0 && S_ISSOCK(st.st_mode) && live(path)) {
+        if (lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode) || !live(path)) continue;
+        if (!i->vmm.sun_path[0]) {
             strcpy(i->vmm.sun_path, path);
-            break;
+        } else if (strcmp(path, i->vmm.sun_path) != 0 && st.st_ino != i->refused) {
+            fprintf(stderr, "netns-slirp %s: %s refused: the interface is attached to %s already\n", i->name, path,
+                    i->vmm.sun_path);
+            i->refused = st.st_ino;
         }
     }
     closedir(d);
@@ -643,8 +658,8 @@ static void request(int conn, char *line) {
         i->vmm.sun_len = sizeof i->vmm;
         i->vmm.sun_family = AF_UNIX;
         struct sockaddr_un h = {.sun_len = sizeof h, .sun_family = AF_UNIX};
-        snprintf(i->vmm.sun_path, sizeof i->vmm.sun_path, "%s", a);
-        if ((size_t)snprintf(h.sun_path, sizeof h.sun_path, "%s/.host-%s", net, a) >= sizeof h.sun_path) {
+        i->vmm.sun_path[0] = 0;
+        if ((size_t)snprintf(h.sun_path, sizeof h.sun_path, "%s/%s", net, a) >= sizeof h.sun_path) {
             reply(conn, ENAMETOOLONG, NULL);
             return;
         }

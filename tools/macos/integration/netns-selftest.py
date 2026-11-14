@@ -5,9 +5,12 @@
     python3 tools/macos/integration/netns-selftest.py NETNS_SLIRP [NETNS_PRELOAD]
 
 Starts a network's host side (netns-slirp) on a directory, adds interfaces
-as the framework's TAPs, binds one in the directory as Firecracker does
-(vmm::platform::net, a Unix datagram endpoint) and plays the guest: the
-host side attaches to the endpoint, ARP and ICMP echo to the host address
+as the framework's TAPs (each the host side's socket of its name directly
+in the directory, which Firecracker opens only if it is there), binds one
+in a VMM's own directory of the network as Firecracker does
+(vmm::platform::net, a Unix datagram endpoint at <id>/<name>) and plays the
+guest: the host side attaches to the endpoint, a second VMM's endpoint of
+the name is refused, ARP and ICMP echo to the host address
 get their answers, the interface shows used while bound and free once
 closed, an endpoint bound again is attached to again (an update of the
 device, a restore), a forward reaches only a guest address on an
@@ -23,6 +26,7 @@ import errno
 import os
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -50,20 +54,28 @@ def csum(b):
     return ~s & 0xFFFF
 
 
-def endpoint(net, name):
-    """Firecracker's side: an endpoint bound in the network, by its name in
-    the directory (as the VMM binds it there); the host side's attach is
-    its first datagram."""
+def bind_in(net, vm, name):
+    """An endpoint bound in the VMM `vm`'s own directory of the network, by
+    its name there (as Firecracker binds it, through the directory)."""
+    os.makedirs(os.path.join(net, vm), exist_ok=True)
     dev = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     cwd = os.getcwd()
-    os.chdir(net)
+    os.chdir(os.path.join(net, vm))
     try:
         dev.bind(name)
     finally:
         os.chdir(cwd)
+    return dev
+
+
+def endpoint(net, name, vm="vm"):
+    """Firecracker's side: an endpoint bound at <vm>/<name> in the network;
+    the host side's attach is its first datagram, from the interface's
+    socket directly in the network directory."""
+    dev = bind_in(net, vm, name)
     dev.settimeout(3)
     data, peer = dev.recvfrom(64)
-    check(data == b"" and peer == os.path.join(os.path.realpath(net), f".host-{name}"),
+    check(data == b"" and peer == os.path.join(os.path.realpath(net), name),
           f"attach to {name}: {data!r} from {peer!r}")
     return dev, peer
 
@@ -244,23 +256,18 @@ s.close()
 def stale_then_new(net):
     """A network used again: VMMs in directories of their own (each jail's
     id, as the jailer and the stand-in make them) leave their endpoints'
-    socket files when they end; the next VMM's endpoint is attached to, not
-    a dead one's."""
-    os.unlink(os.path.join(net, "tap0"))
+    socket files when they end (vm's, closed above, among them); the next
+    VMM's endpoint is attached to, not a dead one's."""
     for vm in [f"old{k}" for k in range(4)]:
-        os.makedirs(os.path.join(net, vm))
-        dead = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        dead.bind(os.path.join(net, vm, "tap0"))
-        dead.close()
-    os.makedirs(os.path.join(net, "new"))
-    dev = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    dev.bind(os.path.join(net, "new", "tap0"))
+        bind_in(net, vm, "tap0").close()
+    dev = bind_in(net, "new", "tap0")
     dev.settimeout(3)
     try:
-        data, _ = dev.recvfrom(64)
+        data, peer = dev.recvfrom(64)
     except TimeoutError:
-        data = None
-    check(data == b"", "a VMM's endpoint in a network that held others' dead ones was not attached to")
+        data = peer = None
+    check(data == b"" and peer == os.path.join(os.path.realpath(net), "tap0"),
+          f"a VMM's endpoint in a network that held others' dead ones was not attached to: {data!r} from {peer!r}")
     dev.close()
 
 
@@ -276,6 +283,8 @@ def main():
         check(p.stdout.readline().strip() == "ready", "the host side did not start")
         check(request(ctl, "hello") == (0, "netns-slirp 1"), "hello")
         check(request(ctl, f"add tap0 {HOST_IP}/30") == (0, ""), "add tap0")
+        check(stat.S_ISSOCK(os.lstat(os.path.join(net, "tap0")).st_mode),
+              "the interface tap0 is the host side's socket directly in the network directory")
         check(request(ctl, "add tap0 10.0.0.1/30")[0] == 17, "a second tap0 is EEXIST")
         check(request(ctl, "add bare")[0] == 0, "a TAP without an address")
         check(request(ctl, "used tap0") == (0, "0"), "tap0 unused")
@@ -284,6 +293,16 @@ def main():
         check(request(ctl, "stats tap0") == (0, "txqueuelen 5 dropped 0"), "stats: the length, no drops")
         dev, host = endpoint(net, "tap0")
         check(request(ctl, "used tap0") == (0, "1"), "tap0 used")
+        # A second VMM's endpoint of the name: never attached to.
+        second = bind_in(net, "vm2", "tap0")
+        second.settimeout(0.5)
+        try:
+            got = second.recvfrom(64)
+        except TimeoutError:
+            got = None
+        check(got is None, f"a second VMM's endpoint of tap0 was attached to: {got!r}")
+        second.close()
+        os.unlink(os.path.join(net, "vm2", "tap0"))
         arp = (b"\xff" * 6 + GUEST_MAC + b"\x08\x06" + struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) + GUEST_MAC
                + socket.inet_aton(GUEST_IP) + b"\0" * 6 + socket.inet_aton(HOST_IP))
         dev.sendto(arp, host)
@@ -304,7 +323,7 @@ def main():
         if preload:
             programs(dev, host, host_mac, ctl, fwd, preload)
         dev.close()
-        os.unlink(os.path.join(net, "tap0"))
+        os.unlink(os.path.join(net, "vm", "tap0"))
         check(request(ctl, "used tap0") == (0, "0"), "tap0 free once its endpoint closed")
         # Bound again (an update of the device, a restore): attached again.
         dev, host = endpoint(net, "tap0")
@@ -314,7 +333,7 @@ def main():
             # Bound again by a guest of the same address: the programs stack
             # forgot it with the rest, and is told it again.
             dev.close()
-            os.unlink(os.path.join(net, "tap0"))
+            os.unlink(os.path.join(net, "vm", "tap0"))
             dev, host = endpoint(net, "tap0")
             listener(dev, host, host_mac, mac, ctl, fwd, preload, 4446)
         dev.close()

@@ -222,6 +222,12 @@ upstream Firecracker and its jailer.
   Use one uid per jail, as upstream advises. So that a switch started or restarted after a jail is reachable,
   the jails' uids are granted write, and nothing else, on every file made directly in the network directory, not on
   sockets alone: keep nothing there but the switch's sockets (`test_each_jail_has_a_network_directory_of_its_own`).
+  A jail opens only the interfaces of its network: a name without `/` only if the switch's socket of that name is
+  directly in the network directory, owned by its owner or root, which no jail can make there (a jail of uid 0 may
+  make one in its own directory, as root may make a TAP on Linux); and no path name, wherever it points
+  (`test_only_the_operators_interface_opens`, `test_a_jail_opens_no_path_name`; `jailer-test netns`, root, not run
+  yet). A jail can tell which names exist directly in the network directory (it may look at their metadata, not
+  list the directory), as a namespace's members see its interfaces on Linux.
 - **Windows jailer: one network directory's jails are separated in code; the elevated stage has run on CI only.** On
   Linux two Firecrackers in one network namespace cannot reach each other's TAP: a TAP is its owner's, and a second
   attach is refused (drivers/net/tun.c, `tun_not_capable`, `tun_attach`). On Windows the network directory granted

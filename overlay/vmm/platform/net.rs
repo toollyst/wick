@@ -87,6 +87,9 @@ pub use super::backend::net::simulator;
 /// the microVM is built (the sandbox narrows it as it ends).
 #[cfg(target_os = "macos")]
 pub use super::backend::net::{find_user_endpoint_dir, user_endpoint_dir};
+/// What the unit tests open interfaces as (a user, a jailed Firecracker).
+#[cfg(all(target_os = "macos", test))]
+pub(crate) use super::backend::net::tests_as;
 /// Binding an endpoint's socket (`ext::sandbox`'s tests: what a narrowed
 /// microVM may bind).
 #[cfg(all(target_os = "macos", test))]

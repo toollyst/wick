@@ -141,7 +141,8 @@ On Linux, a network interface is a TAP device, as upstream documents. A Mac has 
 | `vmnet-shared` | NAT to the host's networks (vmnet.framework) |
 | `vmnet-host` | The host and other VMs on the same host-only network |
 | `vmnet-br-<if>` | Bridged to the host interface `<if>`, for example `vmnet-br-en0` |
-| a path, or a name without `/` | A Unix datagram endpoint that a host-side switch exchanges plain Ethernet frames with |
+| a name without `/` | An interface your host-side switch made: its Unix datagram socket of that name in the network directory, with which Firecracker's endpoint exchanges plain Ethernet frames |
+| a path (not in a jail) | A Unix datagram endpoint Firecracker makes at that path, for a switch to attach to (a wick extension) |
 
 Add an interface to `vm.json`:
 
@@ -162,6 +163,19 @@ example, and whether frames carry virtio-net headers with TSO (macOS 15.4 and la
 Bridged mode, and every mode before macOS 26, needs root for vmnet.framework; a Unix datagram endpoint never does.
 A vmnet interface is configured before the microVM starts: one hot-plugged into a running microVM is refused (the
 sandbox does not let a running VMM start one); a Unix datagram endpoint can be hot-plugged.
+
+A name without `/` opens only if your switch has made it, as Linux's Firecracker opens only a TAP that exists.
+Before you configure `host_dev_name` = `X` (or hot-plug it), your switch binds its Unix datagram socket `X` directly
+in the network directory `N`; Firecracker's endpoint is then `N/<id>/X`, which your switch sends to (an empty
+datagram attaches it). Without the jailer `N` is `$DARWIN_USER_TEMP_DIR/firecracker-net/` (`getconf
+DARWIN_USER_TEMP_DIR`) and `<id>` Firecracker's `--id`, `anonymous-instance` by default; under the jailer it is
+the `--netns` directory and the jail's id (section 6). A name your switch has not made is refused with upstream's
+"Open tap device failed: Error while creating ifreq structure: Operation not permitted (os error 1). Invalid
+TUN/TAP Backend provided by X. ...", and Firecracker's log says what to make: `net: "X" refused: no interface "X"
+in N: the network's switch makes it`. As root Firecracker may make a name nobody made (and a unit name such as
+`tap%d`, only then), attached to nothing until a switch attaches, as root may make a TAP. If you ran wick before
+this: make your switch bind `N/X` first, and look for the endpoint under `N/<id>/` also without a jail; vmnet
+names are unchanged, and a path name still makes the endpoint you named, without a jail.
 
 ## 6. Run it jailed (macOS)
 
@@ -198,12 +212,17 @@ when they name every CPU and memory node; a limit macOS does not have, such as `
 processes; each jail's own `--cgroup` limits apply). Networking inside a jail is a Unix datagram endpoint, since the sandbox denies IP networking, and the
 jailed Firecracker is not root, which vmnet's bridged mode (and every mode before macOS 26) needs; vmnet-shared
 and vmnet-host on macOS 26 need no root, and a jailed Firecracker starts them (`jailer-test vmnet`; a jailed guest
-on one has not been run yet); with `--netns` vmnet is refused. The endpoint is in the jail, or in
-the jail's network: `--netns DIR` names a directory you made, the network. Each jail given it has a directory of its
-own inside, `DIR/<id>/`, made by the jailer, where a `host_dev_name` without `/` is then made: `DIR/<id>/<name>`.
-Your host-side switch binds its own sockets directly in `DIR`, by the directory's real path (an endpoint takes
-frames only from such sockets, owned by `DIR`'s owner or root), and sends to `DIR/<id>/<name>`, or to
-`<id>/<name>` from `DIR` when that path is longer than a socket address holds. Keep nothing in `DIR` but
+on one has not been run yet); with `--netns` vmnet is refused. The endpoint is in
+the jail's network: `--netns DIR` names a directory you made, the network (a jail without `--netns` has no
+interfaces but vmnet's, and a path name is refused in a jail). Each jail given it has a directory of its
+own inside, `DIR/<id>/`, made by the jailer, where the endpoint of an interface `<name>` is made: `DIR/<id>/<name>`.
+The interface is your host-side switch's socket `DIR/<name>`, bound directly in `DIR` by the directory's real path
+before Firecracker opens it (Firecracker opens only such an interface, owned by `DIR`'s owner or root, and its
+endpoint takes frames only from such sockets); the switch sends to `DIR/<id>/<name>`, or to
+`<id>/<name>` from `DIR` when that path is longer than a socket address holds. Not done yet: two jails of one network
+that open one name each get an endpoint, and your switch chooses which one it attaches to, where Linux refuses the
+second open of a TAP with "Resource busy"; the second's API call succeeds and its guest gets no frames, so give
+each Firecracker names of its own. Keep nothing in `DIR` but
 your switch's sockets: the jailer lets the jails' uids send to (write) what is made directly there. Jails given one `DIR` are in one
 network and reach each other only through your switch; give each jail a uid of its own.
 [SECURITY.md](../SECURITY.md) has how each control is held.

@@ -61,14 +61,15 @@ class JailedVm(bt.Vm):
     """A Firecracker process started by the jailer, its console on a pipe."""
 
     def __init__(self, ctx, name, jail, jailer_args=(), fc_args=(), config=None, wait_api=True,
-                 pass_fds=()):
+                 pass_fds=(), uid=None):
         self.ctx = ctx
         self.name = name
         self.jail = jail
         self.log_path = os.path.join(ctx.out, f"{name}.log")
         self.api_sock = jail.host("/run/firecracker.socket")
         cmd = [ctx.jailer, "--id", jail.id, "--exec-file", ctx.firecracker,
-               "--uid", str(UID), "--gid", str(GID), "--chroot-base-dir", ctx.base]
+               "--uid", str(UID if uid is None else uid), "--gid", str(GID if uid is None else uid),
+               "--chroot-base-dir", ctx.base]
         cmd += list(jailer_args)
         cmd += ["--", "--api-sock", "/run/firecracker.socket"] + list(fc_args)
         if config is not None:
@@ -864,11 +865,12 @@ def stage_cpu(ctx):
 class Network:
     """A network (--netns): a directory the operator made. Each jail given
     it has its endpoints in a directory of its own there, <path>/<jail id>/.
-    Behind each (jail id, interface name) of `endpoints`, a host socket
-    directly in the directory, bound by its real path as an operator's
-    switch binds (an endpoint takes only such sockets as peers), that
+    Behind each (jail id, interface name) of `endpoints`, the interface: a
+    host socket of the name directly in the directory, bound by its real
+    path as an operator's switch binds it (Firecracker opens only such an
+    interface, and its endpoint takes only such sockets as peers), that
     attaches to that endpoint once it is there, answers ARP and ICMP echo
-    for its address and records every frame it gets."""
+    for its address and records every frame it gets. One jail per name."""
 
     def __init__(self, path, host_ip, endpoints):
         import socket as so
@@ -879,6 +881,8 @@ class Network:
         self.frames = []
         self.stop = False
         self.hosts = {}
+        names = [name for _, name in endpoints]
+        assert len(set(names)) == len(names), f"one jail per interface name: {endpoints}"
         for jail_id, name in endpoints:
             sock = so.socket(so.AF_UNIX, so.SOCK_DGRAM)
             sock.bind(self.host(jail_id, name))
@@ -886,9 +890,9 @@ class Network:
             self.hosts[jail_id, name] = sock
             bt.threading.Thread(target=self._host, args=(sock, self.endpoint(jail_id, name)), daemon=True).start()
 
-    def host(self, jail_id, name):
-        """The path of the host socket behind an endpoint."""
-        return os.path.join(self.path, f"h-{jail_id}-{name}")
+    def host(self, jail_id, name):  # pylint: disable=unused-argument
+        """The path of the host socket behind an endpoint: the interface."""
+        return os.path.join(self.path, name)
 
     def endpoint(self, jail_id, name):
         """The path of a jail's endpoint."""
@@ -1132,6 +1136,29 @@ def stage_netns(ctx):
         r = vm.api("PUT", "/network-interfaces/eth1", {"iface_id": "eth1", "host_dev_name": "tap0"},
                    expect=(400,))
         check("os error 16" in json.dumps(r), f"tap0 twice in one jail: {r}")
+        # Only the network's interfaces open: a name the switch did not make
+        # is refused, as a TAP that does not exist is for a jailed user on
+        # Linux; and so is every path name, wherever it points (a jail's
+        # names are its network's), with nothing made where it points.
+        others = [os.path.join(net_a.path, "x"), "../../x", "../netns-a/x", "x/y",
+                  os.path.join(spaces["b"].path, "netns-b", "x")]
+        for name in ["tapnobody"] + others:
+            r = vm.api("PUT", "/network-interfaces/eth2", {"iface_id": "eth2", "host_dev_name": name},
+                       expect=(400,))
+            check("Operation not permitted (os error 1)" in json.dumps(r) and f"provided by {name}" in json.dumps(r),
+                  f"{name} in a jail: {r}")
+        for made in [os.path.join(net_a.path, "x"), os.path.join(net_a.path, "netns-a", "x"),
+                     os.path.join(net_a.path, "netns-refuse", "tapnobody"), os.path.join(spaces["b"].path, "netns-b", "x")]:
+            check(not os.path.exists(made), f"a refused name made {made}")
+        vm.kill()
+        # A jail of uid 0 makes a name nobody made, as a jail of uid 0 makes
+        # a TAP on Linux (CAP_NET_ADMIN): in its own directory, attached to
+        # nothing.
+        jail = Jail(ctx, "netns-root")
+        vm = JailedVm(ctx, "netns-root", jail, ["--netns", net_a.path], uid=0)
+        vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "tapnobody"}, expect=(204,))
+        check(os.path.exists(os.path.join(net_a.path, "netns-root", "tapnobody")), "uid 0's tapnobody not made")
+        check(not os.path.exists(os.path.join(net_a.path, "tapnobody")), "uid 0 made a name in the network directory")
         vm.kill()
         for vm in vms.values():
             vm.reboot()
@@ -1155,7 +1182,8 @@ def stage_netns(ctx):
             "a third jail in a's network reaches a's host from its own directory; a second jail of a's id: busy, "
             "a keeps its network; another uid: EACCES on a's endpoint (send, remove, bind) and in the network "
             "directory; the jail's uid outside a sandbox: its frame dropped by a's endpoint; a forged switch "
-            "address: answered (stated as not stopped); vmnet and a busy name refused; a dead jail's endpoint "
+            "address: answered (stated as not stopped); vmnet, a busy name, a name the switch did not make and "
+            "path names refused (EPERM, nothing made), uid 0's jail makes one; a dead jail's endpoint "
             "removed at its id's next start; a file refused")
 
 

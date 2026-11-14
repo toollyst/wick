@@ -1083,13 +1083,15 @@ mod tests {
     }
 
     // A network without the jail: Firecracker started in it (as `ip netns
-    // exec` does on Linux) makes its endpoints there; a relative path or a
+    // exec` does on Linux), given its own directory in the network as the
+    // jailer gives it, makes its endpoints there; a relative path or a
     // missing directory fails at start.
     #[cfg(target_os = "macos")]
     #[test]
     fn test_netns_without_the_jail() {
         let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let path = dir.as_path().canonicalize().unwrap();
+        let path = dir.as_path().canonicalize().unwrap().join("instance");
+        std::fs::create_dir(&path).unwrap();
         let out = run_child("netns_alone_child", &[(NETNS_ENV, path.to_str().unwrap())]);
         assert!(out.contains("NETNS-ALONE-OK"), "{out}");
         for bad in ["relative", "/nonexistent/net"] {
@@ -1107,13 +1109,30 @@ mod tests {
         assert!(std::env::var_os(NETNS_ENV).is_none());
         assert_eq!(netns(), Some(want.as_path()));
         assert!(netns_dir().is_some());
+        use crate::platform::net::{Tap, TapError};
         // An interface named without a path is an endpoint there.
-        let tap = crate::platform::net::Tap::open_named("tap0").unwrap();
+        let tap = Tap::open_named("tap0").unwrap();
         assert!(want.join("tap0").exists());
         // The socket file goes with the device, as a TAP's name with its
         // close (platform::net, test_a_dropped_endpoint_frees_its_name).
         drop(tap);
         assert!(!want.join("tap0").exists());
+        // As a user: only the interface the network's switch made, its
+        // socket directly in the network directory, the parent; and no
+        // path name, this Firecracker being in a network.
+        let eperm = |got: Result<Tap, TapError>| {
+            matches!(got, Err(TapError::IfreqExecuteError(e, _)) if e.raw_os_error() == Some(libc::EPERM))
+        };
+        crate::platform::net::tests_as::user(|| {
+            assert!(eperm(Tap::open_named("tap1")));
+            let _switch = std::os::unix::net::UnixDatagram::bind(want.parent().unwrap().join("tap1")).unwrap();
+            drop(Tap::open_named("tap1").unwrap());
+            assert!(!want.join("tap1").exists());
+            let outside = want.parent().unwrap().join("x");
+            assert!(eperm(Tap::open_named(outside.to_str().unwrap())));
+            assert!(eperm(Tap::open_named("../x")));
+            assert!(!outside.exists());
+        });
         println!("NETNS-ALONE-OK");
     }
 
