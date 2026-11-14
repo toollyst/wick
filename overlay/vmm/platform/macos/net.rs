@@ -241,7 +241,8 @@ pub(crate) fn dgram_socket() -> io::Result<OwnedFd> {
 /// and openers of `name%d` each get a unit of their own. Without the turns
 /// two openers could both find the file stale, and one remove the socket
 /// the other had just bound (`test_openers_of_a_stale_name_take_turns`: 1
-/// opener of 8 got the name, 6 `EADDRINUSE` and 1 `ENOENT`). The lock is
+/// opener of 8 got the name, 6 `EADDRINUSE` and 1 `ENOENT`); in a jail's
+/// own directory of its network the turns are [`OWN_DIR_TURN`]'s. The lock is
 /// the directory's open file, released however its holder ends; an opener
 /// waits for it at most [`TURN_WAIT`] and then fails, naming the directory,
 /// so that a stuck holder cannot hold Firecracker's start for ever.
@@ -252,11 +253,29 @@ pub(crate) fn dgram_socket() -> io::Result<OwnedFd> {
 /// `EADDRINUSE`, which the API reports, and the microVM runs on; that bind
 /// replaces nothing, so it takes no turn.
 pub(crate) fn bind(sock: &OwnedFd, path: &Path) -> io::Result<()> {
+    bind_at(sock, path, false)
+}
+
+/// The turns of openers in a jail's own directory of its network, which is
+/// this process's alone: the jailer holds its lock (an flock of the
+/// directory) for Firecracker's life, and Firecracker in a network without
+/// the jailer takes it at its start (`ext::jail::enter`), so another
+/// process given the directory is refused it (EBUSY). A turn on the
+/// directory's own flock would wait for that lock, held on another open of
+/// the directory (an flock is the open file's), until it fails; so the
+/// openers there, this process's threads, take turns on this.
+static OWN_DIR_TURN: Mutex<()> = Mutex::new(());
+
+/// [`bind`]; `own`: `path` is in the jail's own directory of its network
+/// ([`OWN_DIR_TURN`]), relative to it.
+fn bind_at(sock: &OwnedFd, path: &Path, own: bool) -> io::Result<()> {
     let (addr, len) = sockaddr(path)?;
-    let _turn = if crate::ext::sandbox::narrowed() {
-        None
+    let (_turn, _own_turn) = if crate::ext::sandbox::narrowed() {
+        (None, None)
+    } else if own {
+        (None, Some(OWN_DIR_TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)))
     } else {
-        Some(DirTurn::take(path, TURN_WAIT)?)
+        (Some(DirTurn::take(path, TURN_WAIT)?), None)
     };
     let try_bind = || {
         // SAFETY: bind with a valid address.
@@ -408,7 +427,7 @@ impl Endpoint {
             Some((dir_path, fd)) if jail => Some(Switch::of(dir_path, fd)?),
             _ => None,
         };
-        in_dir(fd, || bind(&sock, path))?;
+        in_dir(fd, || bind_at(&sock, path, fd.is_some()))?;
         Ok(Endpoint {
             sock,
             path: path.to_owned(),
@@ -1337,7 +1356,6 @@ mod tests {
     // interface opened. Openers there still take turns: 8 threads on one
     // stale name, one gets it and the others EBUSY.
     #[test]
-    #[ignore = "fails until openers in a jail's own directory take turns in the process (the next commit)"]
     fn test_an_endpoint_opens_in_a_directory_its_jail_holds_locked() {
         use std::os::fd::AsFd;
         use std::sync::{Arc, Barrier};

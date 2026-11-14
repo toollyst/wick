@@ -1083,7 +1083,6 @@ mod tests {
     // (`jailer-test netns`); this needs none. The ACL is the jailer's alone:
     // the stand-in's jail is of the network owner's uid.
     #[test]
-    #[ignore = "fails until the stand-in arranges a jail's network as the jailer does (the next commit)"]
     fn test_the_stand_in_jailer_arranges_a_network_as_the_jailer_does() {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixDatagram;

@@ -329,6 +329,26 @@ mod imp {
         Ok((path, unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
+    /// Takes the lock on a network directory given without the jailer, as
+    /// the jailer takes it on a jail's (jailer/platform/macos
+    /// `network_for_jail`) for Firecracker's life: the directory is then
+    /// this process's alone, another given it refused with EBUSY, and its
+    /// openers take turns in this process (`platform::net`'s
+    /// `OWN_DIR_TURN`). Held by the descriptor, which lives as long as the
+    /// process.
+    pub(super) fn lock_netns(dir: &OwnedFd) -> Result<(), Error> {
+        // SAFETY: a descriptor owned by the caller; does not block.
+        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let err = Error::last_os_error();
+        Err(if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Error::new(err.kind(), "busy: another Firecracker has this directory of the network (EBUSY)")
+        } else {
+            err
+        })
+    }
+
     pub fn cpu_limit() -> Option<u8> {
         CPU_LIMIT.get().copied()
     }
@@ -548,7 +568,9 @@ mod imp {
                     if let Some(value) = netns {
                         // SAFETY: called first thing in main, with one thread.
                         unsafe { std::env::remove_var(NETNS_ENV) };
-                        NETNS.set(open_netns(&value)?).expect("the jail is entered once");
+                        let (path, dir) = open_netns(&value)?;
+                        lock_netns(&dir).map_err(|e| JailError::Netns(value.clone(), e))?;
+                        NETNS.set((path, dir)).expect("the jail is entered once");
                     }
                     // SAFETY: called first thing in main, with one thread.
                     unsafe { crate::ext::sandbox::prepare(None, None) }.map_err(JailError::Sandbox)
@@ -1099,7 +1121,6 @@ mod tests {
     // holds it is refused at start, busy.
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "fails until Firecracker given WICK_NETNS without the jailer takes its lock (the next commit)"]
     fn test_a_network_without_the_jail_is_one_firecrackers() {
         use std::os::fd::AsRawFd;
         let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
