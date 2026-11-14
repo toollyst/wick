@@ -373,8 +373,19 @@ unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
         // [0]: 0 read, 1 write, 8 execute; [1]: the address.
         let addr = rec.ExceptionInformation[1] as u64;
-        if is_missing(addr) && fault(addr, rec.ExceptionInformation[0] == 1) {
+        let write = rec.ExceptionInformation[0] == 1;
+        if is_missing(addr) && fault(addr, write) {
             // Re-run the access.
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // Registered memory that faulted while missing and is accessible
+        // by now (filled before this handler looked: the thread preempted
+        // in between): the access runs again, as Linux's fault returns for
+        // it when it finds the page no longer missing (v6.1
+        // mm/userfaultfd.c, `userfaultfd_must_wait`). Not an execution (8):
+        // guest RAM is never executable here.
+        #[allow(clippy::cast_possible_truncation)]
+        if rec.ExceptionInformation[0] != 8 && find(addr).is_some() && crate::windows_mm::accessible(addr as usize, 1, write) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -1800,7 +1811,6 @@ mod tests {
     /// process of its own (the hook holds every access violation's
     /// handler).
     #[test]
-    #[ignore = "fails until the handler runs such an access again (the next commit)"]
     fn test_a_host_access_that_faulted_before_its_fill_runs_again() {
         let (code, text) = run_child("late_handler_fill_child", None);
         assert!(text.contains("read back 0xab"), "{text}");
