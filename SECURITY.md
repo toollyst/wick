@@ -416,8 +416,8 @@ upstream Firecracker and its jailer.
   ([CONTRIBUTING.md](CONTRIBUTING.md#fuzzing)), as do the interrupt controller the WHP run loop hands a
   guest's port and MMIO accesses to (`whp_irqchip`) and the WHP run loop's decoding of a vCPU exit (`whp_exit`). The run loops' own steps, which call Hypervisor.framework
   (`hv_vcpu_run`) or WHP, are not fuzzed.
-- **The WHP x2APIC partition's #GP exit (option E, AMD hosts; in the code, off in the product until
-  `test_a_page_set_loses_no_requested_interrupt` is on record, so no product partition has it yet).** On one, every guest #GP, at any privilege level, leaves the
+- **The WHP x2APIC partition's #GP exit (option E, AMD hosts; in the code, off in the product until it has a TSC-deadline
+  timer that loses no interrupt, so no product partition has it yet).** On one, every guest #GP, at any privilege level, leaves the
   hypervisor to the vCPU's run loop (`gp`), so a guest can make such exits at will (a ring-3 privileged
   instruction). The handler decodes at most 15 bytes from the exit context and reads at most three of the vCPU's own
   registers; it takes no lock another vCPU or the VMM's thread waits on, and neither allocates nor logs, so a storm
@@ -425,10 +425,11 @@ upstream Firecracker and its jailer.
   does. KVM intercepts every #GP the same way when `enable_vmware_backdoor` is set (Linux v6.1
   arch/x86/kvm/vmx/vmx.c 791, 5091-5103). The decode and the merge are unit-tested on every host (fuzz crate
   `whp_gp`); the storm's isolation (another vCPU's rate, the API's latency, the job's CPU accounting) is not
-  measured yet, and nothing of it has run on Windows yet. Its LVT timer write in TSC-deadline mode is a get and a
-  set of the vCPU's own APIC register page (WHP's register refuses that mode): an interrupt requested between them
-  and lost would stall only this guest's device or IPI, never reach another VM or the host;
-  `test_a_page_set_loses_no_requested_interrupt` shows whether one is kept (not yet run on Windows).
+  measured yet, and nothing of it has run on Windows yet. Its LVT timer write in TSC-deadline mode is refused, the vCPU
+  failing: WHP's register refuses that mode, and the APIC register page's get and set, the one other way, lose an
+  interrupt requested between them (PC step 15a at 305a806,
+  `test_a_page_set_loses_interrupts_and_the_lvt_timer_write_makes_none`), which would stall only this guest, never
+  reach another VM or the host; the run loop never sets the page.
 - **Side channels** between VMs on the same host follow upstream's
   [production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md)
   guidance on Linux; the equivalent guidance for macOS and Windows hosts is not written yet.

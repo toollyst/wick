@@ -23,12 +23,14 @@
 //!
 //! Option E makes a partition's local APIC an x2APIC, as KVM's, on an AMD
 //! host ([`partition_for`]); the product's partitions stay xAPICs on every
-//! host until `test_a_page_set_loses_no_requested_interrupt` is on record
-//! (`vm::X2APIC_PARTITIONS`), and only tests make x2APIC ones. There, WHP's x2APIC answers the guest's x2APIC register
-//! accesses itself but for the LVT timer's TSC-deadline mode, which the
-//! backend finishes from a #GP exit (`gp`; option E of the x2APIC plan,
+//! host (`vm::X2APIC_PARTITIONS`), and only tests make x2APIC ones. There,
+//! WHP's x2APIC answers the guest's x2APIC register accesses itself but for
+//! the LVT timer's TSC-deadline mode, which WHP refuses with #GP and the
+//! backend takes from the #GP exit (`gp`; option E of the x2APIC plan,
 //! measured on AMD hosts only: CI's EPYC runners and a PC's Ryzen 9 7900,
-//! X2E0REC and GPEXITREC). The supported CPUID offers x2APIC there, whatever the host
+//! X2E0REC and GPEXITREC), and refuses for now: the one way WHP keeps that
+//! mode, the APIC register page's get and set, loses an interrupt
+//! requested between them (X2RMWREC, PC step 15a at 305a806). The supported CPUID offers x2APIC there, whatever the host
 //! has, and `KVM_SET_CPUID2` takes a table with or without it. On any
 //! other host (Intel, Hygon) the partition stays an xAPIC until a run
 //! there measures option E: the supported CPUID never offers x2APIC and a

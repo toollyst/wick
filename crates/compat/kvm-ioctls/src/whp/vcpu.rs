@@ -1434,7 +1434,14 @@ impl VcpuFd {
     /// LVT timer entry is written as given, TSC-deadline mode included,
     /// which WHP keeps from this page in x2APIC mode (X2E0REC g): a
     /// snapshot made on KVM (APIC_BASE 0xfee00d00, LVT timer 0x400ec)
-    /// restores as it was.
+    /// restores as it was. The page's get and set here lose an interrupt
+    /// requested between them (X2RMWREC), as KVM's `kvm_apic_set_state`
+    /// replaces every register, the requests (IRR) too, with the caller's
+    /// (`memcpy`, Linux v6.1 arch/x86/kvm/lapic.c 2760), so one requested
+    /// after the caller's `KVM_GET_LAPIC` is lost there too; Firecracker
+    /// sets a vCPU's local APIC before it first runs (`set_lint`) and at a
+    /// restore, before it resumes. The run loop never sets the page
+    /// ([`Self::write_x2apic_lvtt`]).
     pub fn set_lapic(&self, klapic: &kvm_lapic_state) -> Result<()> {
         let (mut page, size) = self.lapic_page()?;
         for (dst, src) in page.iter_mut().zip(klapic.regs.iter()) {
@@ -1984,18 +1991,25 @@ impl VcpuFd {
     /// KVM's value, and a change into or out of TSC-deadline mode cancels
     /// the timer, zeroes the initial count and the deadline, as
     /// `apic_update_lvtt` (Linux v6.1 arch/x86/kvm/lapic.c 1583-1599). The
-    /// entry is written through `WHvX64RegisterApicLvtTimer` and read back;
-    /// a value WHP does not keep that way, which is every TSC-deadline-mode
-    /// value (the register refuses 0x400ec with errno 87 once EXTD is set
-    /// and takes 0x100ec and 0xec: X2E0REC c, CI runs 43521200989 and
-    /// 43524342863), is written through the APIC register page
-    /// (KVM_SET_LAPIC's way, which keeps TSC-deadline mode: X2E0REC g, CI
-    /// run 43528910212: the guest's RDMSR then read 0x400ec), and one it
-    /// keeps neither way fails the vCPU, named. The page's get and set are
-    /// a read-modify-write of the whole APIC while an irqfd's writer, the
-    /// MSI hook or another vCPU may request an interrupt of this one:
-    /// `test_a_page_set_loses_no_requested_interrupt` shows whether one
-    /// requested between them is kept.
+    /// entry is written through `WHvX64RegisterApicLvtTimer` and read back,
+    /// and a value WHP does not keep that way fails the vCPU (`ENOTSUP`),
+    /// named: that is every TSC-deadline-mode value (the register refuses
+    /// 0x400ec with errno 87 once EXTD is set and takes 0x100ec and 0xec:
+    /// X2E0REC c, CI runs 43521200989 and 43524342863), so option E's
+    /// x2APIC partition has no TSC-deadline timer yet, and its partitions
+    /// are tests' only (`vm::X2APIC_PARTITIONS`).
+    ///
+    /// The one other way WHP keeps that mode, the APIC register page's get
+    /// and set (KVM_SET_LAPIC's, X2E0REC g, CI run 43528910212), is never
+    /// taken while the guest runs: it is a read-modify-write of the whole
+    /// APIC, and an interrupt requested between the get and the set is lost
+    /// (X2RMWREC, PC step 15a at 305a806, a Ryzen 9 7900: an MSI injected
+    /// from another thread and vCPU 1's IPI, each lost at its first round),
+    /// while an irqfd's writer, the MSI hook or another vCPU may request one
+    /// at any time. A guest that hangs is worse than one that fails, so this
+    /// function has no page set at all, and
+    /// `test_a_page_set_loses_interrupts_and_the_lvt_timer_write_makes_none`
+    /// asserts both: the loss, and that this write sets no page.
     fn write_x2apic_lvtt(&self, eax: u32) -> Result<()> {
         let (part, vp) = (self.part(), self.vp());
         let sw_enabled = self.register(whv::WHvX64RegisterApicSpurious)? & (1 << 8) != 0;
@@ -2015,26 +2029,16 @@ impl VcpuFd {
         if super::ffi::set_register(part, vp, whv::WHvX64RegisterApicLvtTimer, super::ffi::reg64(u64::from(value))).is_ok() && kept(self)? {
             return Ok(());
         }
-        let (mut page, size) = self.lapic_page()?;
-        page[0x320..0x324].copy_from_slice(&value.to_le_bytes());
-        #[cfg(any(test, feature = "whp-trace"))]
-        let before = super::ffi::trace::stack();
-        // SAFETY: the register page is valid for `size` bytes.
-        let hres = unsafe { whv::WHvSetVirtualProcessorInterruptControllerState(part, vp, page.as_ptr().cast(), size) };
-        #[cfg(any(test, feature = "whp-trace"))]
-        super::ffi::trace::note("WHvSetVirtualProcessorInterruptControllerState", vp, &[], None, before, hres);
-        super::ffi::hr_of("WHvSetVirtualProcessorInterruptControllerState", hres, || format!("vp {vp}"))?;
-        if kept(self)? {
-            return Ok(());
-        }
         super::ffi::report(
             log::Level::Error,
             &format!(
-                "whp: vCPU {vp}'s x2APIC write of the LVT timer entry ({value:#x}) was kept neither through \
-                 WHvX64RegisterApicLvtTimer nor through the APIC register page: its timer would not be the guest's"
+                "whp: vCPU {vp}'s x2APIC write of the LVT timer entry ({value:#x}) is refused: \
+                 WHvX64RegisterApicLvtTimer does not keep it (TSC-deadline mode is refused there in x2APIC mode, \
+                 X2E0REC c), and the APIC register page's get and set, the one other way, lose an interrupt \
+                 requested between them (X2RMWREC, PC step 15a at 305a806): the guest's timer would not be its own"
             ),
         );
-        err(libc::EIO)
+        err(libc::ENOTSUP)
     }
 
     /// Leaves the interrupt shadow as KVM leaves it after an instruction the
@@ -5527,21 +5531,23 @@ mod fpu_tests {
         assert_eq!(enabled, Err(libc::ENOTSUP), "a deadline with the vector lost and the APIC enabled");
     }
 
-    /// The x2APIC partition's LVT timer in TSC-deadline mode, as KVM's
-    /// (`gp`, `tscdeadline`), on an AMD host's x2APIC partition made as the
-    /// product's will be (`X2APIC_PARTITION_FOR_TESTS`; elsewhere the test
-    /// says so and passes). Each case a VM of its own,
-    /// with the supported CPUID (x2APIC and TSC_DEADLINE), the guest at CPL
-    /// 0 turning x2APIC mode on (APIC_BASE |= EXTD) and its APIC on (SVR
-    /// 0x1ff by WRMSR 0x80F):
-    /// - WRMSR 0x832 of 0x400ec, which WHP refuses with #GP and the backend
-    ///   takes from the #GP exit: no #GP reaches the guest, its RDMSR 0x832
-    ///   reads 0x400ec (KVM's value), and a TSC deadline a little ahead,
-    ///   with interrupts on, raises vector 0xec (its gate's `out 0x82`);
-    /// - the same entry masked (0x500ec): no interrupt (the run kicked
-    ///   after 5 s), as KVM's `kvm_apic_local_deliver` raises none;
+    /// The x2APIC partition's LVT timer in TSC-deadline mode is refused,
+    /// and outside x2APIC mode the write is a #GP as KVM's, on an AMD host's
+    /// x2APIC partition made as option E makes one
+    /// (`X2APIC_PARTITION_FOR_TESTS`; elsewhere the test says so and
+    /// passes). Each case a VM of its own, with the supported CPUID (x2APIC
+    /// and TSC_DEADLINE), the guest at CPL 0 turning x2APIC mode on
+    /// (APIC_BASE |= EXTD) and its APIC on (SVR 0x1ff by WRMSR 0x80F):
+    /// - WRMSR 0x832 of 0x400ec, which WHP refuses with #GP and its
+    ///   register refuses too: the vCPU fails (`ENOTSUP`) and no APIC page
+    ///   is set (`write_x2apic_lvtt`: the page's get and set lose an
+    ///   interrupt requested between them, X2RMWREC, PC step 15a at
+    ///   305a806); before, the page took it and the guest's RDMSR read
+    ///   0x400ec and its deadline's interrupt came (PC step 15b);
+    /// - the same entry masked (0x500ec): the same;
     /// - WRMSR 0x832 in xAPIC mode (EXTD clear): the guest's own #GP
-    ///   (its gate's fault line), as KVM's `kvm_x2apic_msr_write` gives;
+    ///   (its gate's fault line), as KVM's `kvm_x2apic_msr_write` gives
+    ///   (`apicmode::x2apic_msr_exit`; PC step 15b: the write was ignored);
     /// - the same with the IDT cut below #GP's gate: the #GP raised
     ///   delivering it is merged into a #DF (#DF's gate runs), and with
     ///   the IDT cut below #DF's too, a triple fault (`Shutdown`), as KVM's
@@ -5550,14 +5556,11 @@ mod fpu_tests {
     /// The CPUID has TSC_DEADLINE as Firecracker's has it
     /// ([`cpuid_with_tsc_deadline`]): without it the entry keeps one mode
     /// bit, as KVM's does (PC step 14c-1 at acdec89, a Ryzen 9 7900: the
-    /// guest's RDMSR read 0xec and its TMICT write counted down).
-    ///
-    /// Printed too (TSCDLTEST lines), not asserted: the initial count
-    /// register written in TSC-deadline mode and read back (WRMSR 0x838,
-    /// RDMSR 0x839: KVM ignores the write, lapic.c 2195-2196).
+    /// guest's RDMSR read 0xec and its TMICT write counted down), and the
+    /// register takes it. Printed (TSCDLTEST lines).
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
-    fn test_the_x2apic_lvt_timer_in_tsc_deadline_mode_as_kvm() {
+    fn test_the_x2apic_lvt_timer_in_tsc_deadline_mode_is_refused() {
         use super::super::apicmode::LocalApic;
         const GATE: u64 = 0xB900;
         const LVTT_READ: u64 = 0x7100;
@@ -5611,19 +5614,20 @@ mod fpu_tests {
             (exits, read)
         };
         let on = [x2apic_on.clone(), wrmsr(0x80F, 0x1FF)].concat();
-        // TSC-deadline mode, read back, the initial count written and read,
-        // a deadline ahead, interrupts on.
-        let (exits, (lvtt, tmcct)) = run(
-            [on.clone(), wrmsr(0x832, 0x4_00EC), rdmsr(0x832, LVTT_READ), wrmsr(0x838, 0x10_0000), rdmsr(0x839, TMCCT_READ), deadline_ahead.clone(), halt.to_vec()].concat(),
-            None,
-        );
-        eprintln!("TSCDLTEST TSC-deadline mode: exits {exits:?}; the guest's RDMSR 0x832 {lvtt:#x}; TMICT 0x100000 written in that mode, TMCCT read {tmcct:#x}");
-        assert_eq!(exits.last().map(String::as_str), Some("out 0x82 [ec]"), "the deadline's interrupt");
-        assert_eq!(lvtt & 0xffff_ffff, 0x4_00EC, "the guest's read of its LVT timer entry");
-        // Masked: no interrupt.
-        let (exits, _) = run([on.clone(), wrmsr(0x832, 0x5_00EC), deadline_ahead.clone(), halt.to_vec()].concat(), None);
-        eprintln!("TSCDLTEST masked: exits {exits:?}");
-        assert_eq!(exits.last().map(String::as_str), Some("EINTR"), "a masked entry raised an interrupt");
+        // TSC-deadline mode, read back, a deadline ahead, interrupts on: the
+        // vCPU fails at the write, with no page set; masked, the same.
+        let refused = format!("run failed, errno {}", libc::ENOTSUP);
+        for (name, entry) in [("TSC-deadline mode", 0x4_00EC), ("masked", 0x5_00EC)] {
+            super::super::ffi::trace::begin();
+            let (exits, (lvtt, _)) =
+                run([on.clone(), wrmsr(0x832, entry), rdmsr(0x832, LVTT_READ), deadline_ahead.clone(), halt.to_vec()].concat(), None);
+            let page_sets =
+                super::super::ffi::trace::end().iter().filter(|c| c.call == "WHvSetVirtualProcessorInterruptControllerState").count();
+            eprintln!("TSCDLTEST {name} ({entry:#x}): exits {exits:?}; APIC page sets {page_sets}; the guest's RDMSR 0x832 {lvtt:#x}");
+            assert_eq!(exits.last(), Some(&refused), "{name}: the write was not refused");
+            assert_eq!(page_sets, 0, "{name}: the APIC page was set");
+            assert_eq!(lvtt, 0, "{name}: the guest went on past the write");
+        }
         // xAPIC mode: the guest's #GP.
         let (exits, _) = run([wrmsr(0x832, 0x4_00EC), vec![0xE6, PORT as u8, 0xEB, 0xFE]].concat(), None);
         eprintln!("TSCDLTEST xAPIC mode: exits {exits:?}");
@@ -5723,19 +5727,18 @@ mod fpu_tests {
         assert_eq!((id, got_id, ldr, lvtt), (1, 0x100_0000, 0x2, 0x4_00ec));
     }
 
-    /// The APIC register page's read-modify-write that writes an x2APIC
-    /// LVT timer entry in TSC-deadline mode (`write_x2apic_lvtt`: WHP's
-    /// register refuses that mode, errno 87, X2E0REC c in CI runs
-    /// 43521200989 and 43524342863, so on an x2APIC partition the page is
-    /// the only way) loses no interrupt requested of the vCPU, on an AMD
-    /// host's x2APIC partition made as the product's will be
-    /// (`X2APIC_PARTITION_FOR_TESTS`; the product's partitions are xAPICs
-    /// until this test is on record, `vm::X2APIC_PARTITIONS`). An interrupt requested between the
-    /// page's get and its set would be lost if WHP kept it in the page,
-    /// and an irqfd's writer, the MSI hook or another vCPU's IPI may
-    /// request one at any time. Vector 0xe1, whose gate EOIs (WRMSR 0x80b)
-    /// and does `out 0x82`; vCPU 0 halted with interrupts on, stopped at
-    /// its last exit while each case's steps are made, then run:
+    /// The APIC register page's get and set lose an interrupt requested of
+    /// the vCPU between them, and the guest's x2APIC LVT timer write in
+    /// TSC-deadline mode (`write_x2apic_lvtt`: WHP's register refuses that
+    /// mode, errno 87, X2E0REC c in CI runs 43521200989 and 43524342863)
+    /// sets no page, on an AMD host's x2APIC partition made as option E
+    /// makes one (`X2APIC_PARTITION_FOR_TESTS`; no product partition is
+    /// one, `vm::X2APIC_PARTITIONS`). An irqfd's writer, the MSI hook or
+    /// another vCPU's IPI may request an interrupt at any time, so a page
+    /// set while the guest runs would hang it. Vector 0xe1, whose gate
+    /// EOIs (WRMSR 0x80b) and does `out 0x82`; vCPU 0 halted with
+    /// interrupts on, stopped at its last exit while each case's steps are
+    /// made, then run:
     /// - control: an MSI injected (`inject_msi`, the irqfd writer's call),
     ///   no page set;
     /// - the MSI, then the page's get and set (the LVT timer 0x400e0);
@@ -5744,31 +5747,30 @@ mod fpu_tests {
     /// - the page's get, vCPU 1 run to its fixed IPI of 0xe1 to APIC 0
     ///   (WRMSR 0x830, which WHP takes itself), the set: an IPI there;
     /// - the MSI, then `write_x2apic_lvtt(0x400e0)` itself (the run loop's
-    ///   path, the page set counted by the trace).
+    ///   path), counting the page sets in the trace.
     ///
     /// Each case 50 rounds, a round's interrupt taken (`out 0x82 [e1]`)
     /// before its run is kicked after 5 s; a case stops at its first lost
-    /// one. And concurrently, the run loop's own path against a writer: the
-    /// guest writing 0x400e0 to the LVT timer in a loop (each a #GP exit
-    /// and a page read-modify-write), another thread injecting 2000 MSIs,
-    /// each after the last was taken (its gate counts them). Asserted: every
-    /// interrupt requested is taken. Printed (X2RMWREC lines), with both of
-    /// WHP's formats of the page read after the first request of each case
-    /// (`lapic_formats`), so where WHP keeps a request shows.
+    /// one. Asserted: the control and the MSI before the get keep every
+    /// interrupt; the MSI and the IPI between the get and the set are lost
+    /// at their first round (PC step 15a at 305a806, a Ryzen 9 7900, debug
+    /// and release builds alike; if WHP ever keeps them, the reason for
+    /// `write_x2apic_lvtt`'s refusal is gone and the test says so); and
+    /// `write_x2apic_lvtt` is refused (`ENOTSUP`), sets no page, and every
+    /// MSI is taken. Printed (X2RMWREC lines), with both of WHP's formats of
+    /// the page read after the first request of each case
+    /// (`lapic_formats`).
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
-    fn test_a_page_set_loses_no_requested_interrupt() {
+    fn test_a_page_set_loses_interrupts_and_the_lvt_timer_write_makes_none() {
         use super::super::apicmode::LocalApic;
         use super::super::ffi;
         const V: u8 = 0xE1;
         const GATE: u64 = 0xB900;
         const IPI_PROGRAM: u64 = 0xBA00;
-        const TAKEN: u64 = 0x7200;
-        const LOOPS: u64 = 0x7208;
         const MSI: u64 = 0xFEE0_0000;
         const LVTT: u32 = 0x4_00E0;
         const ROUNDS: usize = 50;
-        const REQUESTS: u32 = 2000;
         super::super::vm::X2APIC_PARTITION_FOR_TESTS.set(true);
         if super::super::vm::host_local_apic() != LocalApic::X2Apic {
             eprintln!("X2RMWREC not an AMD host, where option E's x2APIC partition is measured: nothing to test");
@@ -5907,7 +5909,7 @@ mod fpu_tests {
                             .iter()
                             .filter(|c| c.call == "WHvSetVirtualProcessorInterruptControllerState")
                             .count();
-                        written.unwrap();
+                        assert_eq!(written.map_err(|e| e.errno()), Err(libc::ENOTSUP), "write_x2apic_lvtt was not refused");
                     }
                 }
                 let end = run_to_taken(&mut zero);
@@ -5927,76 +5929,26 @@ mod fpu_tests {
             if first_lost.is_some() {
                 lost.push(*name);
             }
+            assert_eq!(page_sets, 0, "{name}: write_x2apic_lvtt set the APIC page");
         }
+        // `inject` holds the VM too (its `inner`): the partition, and its
+        // mapping of `m`, last until it goes (PC step 15a at 305a806: the
+        // test's next VM was refused its memory, errno 87, a process's one
+        // partition with memory mapped being this one).
+        drop(inner);
         drop(one);
         drop(zero);
         drop(vm);
         // SAFETY: the test's mapping, no VM left using it.
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
-
-        // Concurrently: the guest's LVT timer writes in a loop (each a #GP
-        // exit and the page's read-modify-write; `inc dword [LOOPS]`), the
-        // MSIs from another thread, the gate counting them (`lock inc dword
-        // [TAKEN]`, EOI, IRETQ).
-        let count = [0xF0u8, 0xFF, 0x04, 0x25, 0x00, 0x72, 0x00, 0x00];
-        let gate = [&push[..], &count, &wrmsr(0x80B, 0), &pop_iret].concat();
-        let program = [on, vec![0xFB], wrmsr(0x832, LVTT), vec![0xFF, 0x04, 0x25, 0x08, 0x72, 0x00, 0x00, 0xEB, 0xE9]].concat();
-        let (vm, mut vcpu, m) = vm_with(&program, &gate);
-        let at = m as usize;
-        // SAFETY: guest memory, mapped until the end; the guest writes it.
-        let read = move |off: u64| unsafe { std::ptr::read_volatile((at + off as usize) as *const u32) };
-        let mut kicker = VcpuFd { shared: Arc::clone(&vcpu.shared), own: None };
-        let inner = Arc::clone(&vcpu.shared.inner);
-        let writer = std::thread::spawn(move || {
-            let begun = std::time::Instant::now();
-            while read(LOOPS) < 10 && begun.elapsed() < std::time::Duration::from_secs(10) {
-                std::thread::yield_now();
-            }
-            let (mut requested, mut lost) = (0u32, 0u32);
-            if read(LOOPS) >= 10 {
-                while requested < REQUESTS && lost < 3 {
-                    let before = read(TAKEN);
-                    inner.inject_msi(MSI, u32::from(V));
-                    requested += 1;
-                    let asked = std::time::Instant::now();
-                    while read(TAKEN) == before {
-                        if asked.elapsed() > std::time::Duration::from_secs(1) {
-                            lost += 1;
-                            break;
-                        }
-                        std::hint::spin_loop();
-                    }
-                }
-            }
-            let (loops, took) = (read(LOOPS), begun.elapsed());
-            kicker.set_kvm_immediate_exit(1);
-            (requested, lost, loops, took)
-        });
-        let mut reads = 0;
-        let mut exits = Vec::new();
-        loop {
-            let e = one_run(&mut vcpu, &[], &mut reads);
-            let end = e == "EINTR" || exits.len() >= 4;
-            exits.push(e);
-            if end {
-                break;
-            }
-        }
-        let (requested, lost_now, loops, took) = writer.join().unwrap();
-        vcpu.set_kvm_immediate_exit(0);
-        let delivered = read(TAKEN);
-        eprintln!(
-            "X2RMWREC concurrently: {requested} MSIs injected from another thread, {delivered} taken, {lost_now} not taken \
-             within 1 s; the guest's LVT timer writes (each a page read-modify-write) {loops}, in {took:?}; the vCPU's \
-             exits {exits:?}"
+        assert_eq!(
+            lost,
+            [cases[2], cases[3]],
+            "the cases that lost an interrupt: the control, the MSI before the get and write_x2apic_lvtt keep \
+             every one, and an MSI or IPI between the page's get and set is lost (PC step 15a at 305a806); if \
+             WHP now keeps those, the reason for write_x2apic_lvtt's refusal is gone: say so at \
+             vm::X2APIC_PARTITIONS"
         );
-        drop(vcpu);
-        drop(vm);
-        // SAFETY: the test's mapping, no VM left using it.
-        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
-        assert!(lost.is_empty(), "interrupts lost to a page set: {lost:?}");
-        assert!(loops >= 10, "the guest's loop did not run: {exits:?}");
-        assert_eq!((requested, delivered, lost_now), (REQUESTS, REQUESTS, 0), "the concurrent MSIs");
     }
 
     /// A 2 MiB chunk of userfaultfd-registered guest RAM discarded whole,

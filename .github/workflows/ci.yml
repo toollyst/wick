@@ -1172,17 +1172,17 @@ jobs:
           # is refused (DEADLINEOFF line).
           alone whp::vcpu::fpu_tests::test_a_deadline_written_with_the_apic_software_disabled_is_taken
           # The x2APIC partition (AMD): the guest's TSC-deadline LVT timer
-          # write finished from its #GP exit, its read, its interrupt, a
-          # masked entry's none, and a #GP given back, merged into a #DF and
-          # a triple fault; and a KVM local APIC state in x2APIC mode.
-          alone whp::vcpu::fpu_tests::test_the_x2apic_lvt_timer_in_tsc_deadline_mode_as_kvm
+          # write refused (the vCPU fails, no APIC page set), masked too;
+          # outside x2APIC mode a #GP, merged into a #DF and a triple
+          # fault; and a KVM local APIC state in x2APIC mode.
+          alone whp::vcpu::fpu_tests::test_the_x2apic_lvt_timer_in_tsc_deadline_mode_is_refused
           alone whp::vcpu::fpu_tests::test_a_kvm_lapic_state_in_x2apic_mode_restores
-          # The APIC page's read-modify-write (the x2APIC LVT timer in
-          # TSC-deadline mode) against interrupts requested meanwhile: an
-          # MSI and an IPI between its get and set, and 2000 MSIs from
-          # another thread against the guest's writes (X2RMWREC lines).
-          alone whp::vcpu::fpu_tests::test_a_page_set_loses_no_requested_interrupt
-          alone whp::vcpu::fpu_tests::test_a_page_set_loses_no_requested_interrupt --release
+          # The APIC page's get and set against interrupts requested
+          # meanwhile: an MSI and an IPI between them lost (PC step 15a at
+          # 305a806), the reason the run loop never sets the page; and the
+          # LVT timer write refused with no page set (X2RMWREC lines).
+          alone whp::vcpu::fpu_tests::test_a_page_set_loses_interrupts_and_the_lvt_timer_write_makes_none
+          alone whp::vcpu::fpu_tests::test_a_page_set_loses_interrupts_and_the_lvt_timer_write_makes_none --release
           # A 2 MiB chunk of userfaultfd guest RAM swapped (discarded
           # whole) under a vCPU's scan and a host writer, 100 rounds
           # (SWAPSTRESS lines).

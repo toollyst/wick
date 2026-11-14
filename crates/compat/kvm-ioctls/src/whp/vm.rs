@@ -695,17 +695,21 @@ fn make_partition() -> Result<(WHV_PARTITION_HANDLE, super::apicmode::LocalApic)
 }
 
 /// Whether the partitions are made as [`measured_local_apic`] says (an
-/// x2APIC on AMD hosts): not yet. An x2APIC partition's LVT timer write in
-/// TSC-deadline mode is a get and a set of the whole APIC register page
-/// (`VcpuFd::write_x2apic_lvtt`: WHP's register refuses that mode, X2E0REC
-/// c), and an interrupt an irqfd, the MSI hook or another vCPU requests
-/// between the two would be lost if WHP kept it in the page: a guest that
-/// hangs, not one that fails. Until
-/// `test_a_page_set_loses_no_requested_interrupt` (X2RMWREC) is on record
-/// with none lost, every host's partitions stay xAPICs and the guest is not
-/// offered x2APIC, as before option E; the x2APIC code runs only in the
-/// tests that ask for it on their thread (`X2APIC_PARTITION_FOR_TESTS`).
-/// No switch turns it on: this line does, with the record's runs named.
+/// x2APIC on AMD hosts): not yet. An x2APIC partition has no TSC-deadline
+/// timer: WHP's register refuses the LVT timer entry in that mode
+/// (X2E0REC c), and the APIC register page's get and set, the one other
+/// way, lose an interrupt an irqfd, the MSI hook or another vCPU requests
+/// between the two (X2RMWREC, PC step 15a at 305a806, a Ryzen 9 7900),
+/// which would hang the guest; so `VcpuFd::write_x2apic_lvtt` sets no page
+/// and refuses the write (`ENOTSUP`, the vCPU fails, named), and a Linux
+/// guest, which uses the TSC-deadline timer when its CPUID has it, would
+/// fail at boot here. Until option E has a TSC-deadline timer that loses
+/// no interrupt (a partition whose processor features offer one, or the
+/// page's get and set with every requester held off: not done yet), every
+/// host's partitions stay xAPICs and the guest is not offered x2APIC, as
+/// before option E; the x2APIC code runs only in the tests that ask for it
+/// on their thread (`X2APIC_PARTITION_FOR_TESTS`). No switch turns it on:
+/// this line does, with the records named.
 const X2APIC_PARTITIONS: bool = false;
 
 /// The local APIC this host's partitions emulate: an xAPIC
