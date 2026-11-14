@@ -113,9 +113,18 @@ pub(crate) fn adopt_socket(s: usize, fits: fn(usize) -> Option<RawFd>) -> std::i
 }
 
 /// Closes a descriptor: a socket with `closesocket`, any other handle with
-/// `CloseHandle`. Returns whether it was closed.
+/// `CloseHandle`. Returns whether it was closed. The compat libc's state of
+/// the descriptor goes first (`wick_fd::detach`, as the libc's own `close`
+/// does): its entry, made when `set_nonblocking` (net.rs) set the
+/// socket's `O_NONBLOCK` through the libc's `ioctl(FIONBIO)`, holds a
+/// handle of the object of its own, which kept a socket open past its
+/// `closesocket` so that its peer never read the end (Microsoft Learn,
+/// DuplicateHandle: for sockets it "interferes with internal reference
+/// counting on the underlying object";
+/// `test_a_socket_made_non_blocking_and_closed_ends_its_peers_stream`).
 pub fn close(fd: RawFd) -> bool {
     super::net::startup();
+    libc::wick_fd::detach(fd);
     // SAFETY: closes the caller's descriptor.
     unsafe {
         if closesocket(socket(fd)) == 0 {

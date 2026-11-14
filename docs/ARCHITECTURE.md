@@ -246,6 +246,14 @@ semantics on Win32. The details are in the comments of each
   that `ioctl`, as Linux's std's is, so `F_GETFL` shows it
   (`test_fionbio_sets_and_clears_o_nonblocking`,
   `test_a_socket_made_non_blocking_by_wick_os_is_o_nonblocking_to_the_libc`).
+  The duplicate holds the object open, so whoever closes a descriptor that
+  has state removes the state first: the libc's `close`, and wick_os's,
+  which closes its own sockets; a socket wick_os made non-blocking stayed
+  open past its `closesocket` otherwise, its peer never reading the end
+  (CI run 43616040593: vsock's handshake and the network endpoint;
+  `test_a_socket_made_non_blocking_and_closed_ends_its_peers_stream`). A
+  descriptor with state that another library closes (Rust std's own
+  sockets, which take no `ioctl` here) keeps its object until the sweep.
 - **epoll = IOCP (the `polling` crate).** Sockets use AFD polls; eventfds,
   consoles and other waitable handles use wait packets that complete on the
   IOCP. Level-triggered is the default and `ONE_SHOT` is supported. Sockets

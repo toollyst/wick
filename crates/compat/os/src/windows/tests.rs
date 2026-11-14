@@ -94,7 +94,6 @@ fn test_nonblocking() {
 // CI run 43616040593 (5e3727d): the muxer's and the endpoint's peers never
 // saw the close, and vsock's handshake timed out.
 #[test]
-#[ignore = "fails until wick-os closes through the compat libc (the next commit)"]
 fn test_a_socket_made_non_blocking_and_closed_ends_its_peers_stream() {
     let ends_at_the_peer = |what: &str, a: UnixStream, mut b: UnixStream| {
         a.set_nonblocking(true).unwrap();
