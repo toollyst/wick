@@ -1231,6 +1231,41 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    // A device that goes frees its interface's name, as closing a TAP does
+    // on Linux (drivers/net/tun.c, v6.1: tun_chr_close, __tun_detach
+    // unregisters a TAP nobody made persistent): the endpoint removes the
+    // socket file it bound, by a bare name and by a path alike. A file
+    // another put at the name after (its own socket, a regular file) is
+    // left alone.
+    #[test]
+    #[ignore = "fails until an endpoint removes its socket file when it goes (the next commit)"]
+    fn test_a_dropped_endpoint_frees_its_name() {
+        use std::os::unix::net::UnixDatagram;
+        let name = format!("fcfree{}", std::process::id());
+        let path = endpoint_dir().unwrap().join(&name);
+        let _ = std::fs::remove_file(&path);
+        drop(Tap::open_named(&name).unwrap());
+        assert!(!path.exists(), "a bare name's socket file stayed");
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let at = dir.as_path().join("ep");
+        drop(Tap::open_named(at.to_str().unwrap()).unwrap());
+        assert!(!at.exists(), "a path's socket file stayed");
+        // Replaced by another while open: a socket, then a regular file.
+        let tap = Tap::open_named(&name).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let other = UnixDatagram::bind(&path).unwrap();
+        drop(tap);
+        assert!(path.exists(), "another's socket at the name was removed");
+        drop(other);
+        std::fs::remove_file(&path).unwrap();
+        let tap = Tap::open_named(&name).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"x").unwrap();
+        drop(tap);
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        std::fs::remove_file(&path).unwrap();
+    }
+
     /// Openers of one name at once, on a socket file a VM that ended left:
     /// one gets it and every other one EBUSY, as a second TUNSETIFF on a TAP
     /// another file holds (drivers/net/tun.c, v6.1, tun_attach :769 to :771);

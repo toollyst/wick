@@ -4057,6 +4057,98 @@ mod macos {
             println!("CHILD-SURVIVED");
         }
 
+        // A net device named without a path hot-plugged into a running
+        // microVM outside a jail and a network opens its endpoint in the
+        // user's directory of endpoints, and the microVM runs on: finding
+        // that directory (confstr's _CS_DARWIN_USER_TEMP_DIR) calls geteuid,
+        // which the run phase denies, as upstream's filter has no geteuid,
+        // so the hot-plug ended Firecracker by the sandbox's kill.
+        #[test]
+        #[ignore = "fails until the user's directory of endpoints is found while the microVM is built (the next commit)"]
+        fn test_a_bare_name_hotplugged_without_a_network_opens() {
+            let out = child("endpoint_hotplug_child", &[]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(stdout.contains("OPENED") && stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_a_bare_name_hotplugged_without_a_network_opens in a separate process"]
+        fn endpoint_hotplug_child() {
+            let name = format!("fchq{}", std::process::id());
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            let net = crate::devices::virtio::net::Net::new(
+                "hotplugged".into(),
+                &name,
+                None,
+                Default::default(),
+                Default::default(),
+                None,
+            );
+            match net {
+                Ok(_) => println!("OPENED"),
+                Err(err) => println!("REFUSED {err}"),
+            }
+            // Time for a denial's kill to land.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            println!("CHILD-SURVIVED");
+        }
+
+        // A net device hot-plugged into a running microVM and then dropped
+        // (refused by the API after its endpoint opened, as a device with
+        // dmb_size_mib is on a transport without it, upstream's
+        // test_hotplug_net; or unplugged) frees its interface's name, as
+        // closing a TAP does on Linux: the same name hot-plugged again opens,
+        // where the socket file the first left made it EADDRINUSE (the
+        // narrowed sandbox replaces no stale name). The device is made as
+        // the hot-plug makes it (Net::new).
+        #[test]
+        #[ignore = "fails until an endpoint removes its socket file when it goes (the next commit)"]
+        fn test_a_hotplugged_endpoint_frees_its_name_when_it_goes() {
+            let out = child("endpoint_drop_child", &[]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(stdout.contains("FREED") && stdout.contains("AGAIN"), "{}", text(&out));
+            assert!(stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_a_hotplugged_endpoint_frees_its_name_when_it_goes in a separate process"]
+        fn endpoint_drop_child() {
+            let name = format!("fchp{}", std::process::id());
+            let path = crate::platform::net::user_endpoint_dir().unwrap().join(&name);
+            let _ = std::fs::remove_file(&path);
+            let net = |id: &str| {
+                crate::devices::virtio::net::Net::new(
+                    id.into(),
+                    &name,
+                    None,
+                    Default::default(),
+                    Default::default(),
+                    None,
+                )
+            };
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            drop(net("first").unwrap());
+            if !path.exists() {
+                println!("FREED");
+            }
+            match net("again") {
+                Ok(dev) => {
+                    println!("AGAIN");
+                    drop(dev);
+                }
+                Err(err) => println!("REFUSED {err}"),
+            }
+            // Time for a denial's kill to land.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            println!("CHILD-SURVIVED");
+        }
+
         // Listening on a Unix socket is setup's only: Linux's VMM filter has
         // no bind or listen. A socket bound before narrow() (its name gone)
         // cannot listen after it.
