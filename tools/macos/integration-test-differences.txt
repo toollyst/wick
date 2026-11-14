@@ -315,6 +315,16 @@ all impossible integration_tests/functional/test_net.py::test_tap_offload
 # (ff84c70) with the VMM's own part unchanged, 4.62 and 4.36 MiB
 # (memory-parts.jsonl); the balloon deflated from 62 to 59 and from 65 to
 # 61 MiB (the tests' "size before/after" lines, test-report.json).
+# Ten runs of each, one at a time (mac9-deflate-on-knobs-1 to -10 and
+# mac9-deflate-on-noknobs-1 to -10, alternating, and mac9-deflate-off-noknobs-1
+# to -10, at 8540847, load 12 to 21): PCI_ON 9 of 10 passed, and 8 of 10 with
+# libmalloc's configuration on a test-only branch (the VMM's own part 4.64 to
+# 4.78 MiB, and 4.03 to 4.09 with it), PCI_OFF 6 of 10. The outcome does not
+# follow the balloon the reading sized: runs failed at 64, 65, 66 and 67 MiB
+# and passed at 63 to 68 MiB, and a balloon that deflated gave back 1 to
+# 6 MiB. So the guest is at the edge of running out of memory, and the
+# 0.6 MiB the configuration takes off the VMM's part does not decide which
+# side it lands on.
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_ON-True-kvm]
 all bug integration_tests/functional/test_balloon.py::test_deflate_on_oom[vmlinux-6.1.188-PCI_OFF-True-kvm]
 
