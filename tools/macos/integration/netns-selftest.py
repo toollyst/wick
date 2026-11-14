@@ -241,6 +241,29 @@ s.close()
     srv.communicate()
 
 
+def stale_then_new(net):
+    """A network used again: VMMs in directories of their own (each jail's
+    id, as the jailer and the stand-in make them) leave their endpoints'
+    socket files when they end; the next VMM's endpoint is attached to, not
+    a dead one's."""
+    os.unlink(os.path.join(net, "tap0"))
+    for vm in [f"old{k}" for k in range(4)]:
+        os.makedirs(os.path.join(net, vm))
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        dead.bind(os.path.join(net, vm, "tap0"))
+        dead.close()
+    os.makedirs(os.path.join(net, "new"))
+    dev = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    dev.bind(os.path.join(net, "new", "tap0"))
+    dev.settimeout(3)
+    try:
+        data, _ = dev.recvfrom(64)
+    except TimeoutError:
+        data = None
+    check(data == b"", "a VMM's endpoint in a network that held others' dead ones was not attached to")
+    dev.close()
+
+
 def main():
     helper = sys.argv[1]
     preload = sys.argv[2] if len(sys.argv) > 2 else None
@@ -295,6 +318,7 @@ def main():
             dev, host = endpoint(net, "tap0")
             listener(dev, host, host_mac, mac, ctl, fwd, preload, 4446)
         dev.close()
+        stale_then_new(net)
         p.stdin.close()
         check(p.wait(10) == 0, "the host side ends with its owner's pipe")
     finally:

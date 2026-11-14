@@ -408,10 +408,25 @@ static void drain(struct iface *i) {
     }
 }
 
+// Whether a VMM receives on the socket at `path` (a datagram connect to a
+// socket file nobody has bound fails, ECONNREFUSED).
+static int live(const char *path) {
+    struct sockaddr_un u = {.sun_len = sizeof u, .sun_family = AF_UNIX};
+    if (strlen(path) >= sizeof u.sun_path) return 0;
+    strcpy(u.sun_path, path);
+    int probe = socket(AF_UNIX, SOCK_DGRAM, 0);
+    int ok = connect(probe, (struct sockaddr *)&u, sizeof u) == 0;
+    close(probe);
+    return ok;
+}
+
 // Where the VMM's endpoint of the interface is, relative to the network
 // (this process's working directory, so that a jail's 36-character id does
 // not have to fit a socket address after the network's path): `<name>`, or
-// `<id>/<name>` in the directory of the jail that has it.
+// `<id>/<name>` in the directory of the VMM that has it bound. A VMM leaves
+// its endpoint's socket file when it ends (vmm::platform::net), and a
+// network used again holds the directories of the VMMs before, each id's
+// own: an endpoint nobody receives on is not one to attach to.
 static void locate(struct iface *i) {
     struct stat st;
     snprintf(i->vmm.sun_path, sizeof i->vmm.sun_path, "%s", i->name);
@@ -423,7 +438,7 @@ static void locate(struct iface *i) {
         char path[sizeof i->vmm.sun_path];
         if (e->d_type != DT_DIR || e->d_name[0] == '.') continue;
         if ((size_t)snprintf(path, sizeof path, "%s/%s", e->d_name, i->name) >= sizeof path) continue;
-        if (lstat(path, &st) == 0 && S_ISSOCK(st.st_mode)) {
+        if (lstat(path, &st) == 0 && S_ISSOCK(st.st_mode) && live(path)) {
             strcpy(i->vmm.sun_path, path);
             break;
         }
