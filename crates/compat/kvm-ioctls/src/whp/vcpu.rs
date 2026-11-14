@@ -2751,6 +2751,16 @@ impl VcpuFd {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Option E-ii's one test seam: when set, run on the vCPU's thread
+    /// between the APIC page's get and set of a held LVT timer write
+    /// (`write_x2apic_lvtt`), with every requester held off
+    /// (`test_a_held_lvt_timer_write_loses_no_interrupt`). Not called yet:
+    /// the write is refused until E-ii is written.
+    static PAGE_WINDOW: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// How many MSRs [`say_unkept_msr`] names in a process: a guest probing
 /// MSRs in a loop makes one line each, up to this, then one more.
 const UNKEPT_NAMED: usize = 64;
@@ -6092,6 +6102,358 @@ mod fpu_tests {
              WHP now keeps those, the reason for write_x2apic_lvtt's refusal is gone: say so at \
              vm::X2APIC_PARTITIONS"
         );
+    }
+
+    /// Option E-ii (the E design: the APIC page's get and set with every
+    /// requester held off): a guest's x2APIC LVT timer write in
+    /// TSC-deadline mode is taken and loses no interrupt, on an AMD host's
+    /// x2APIC partition (`X2APIC_PARTITION_FOR_TESTS`; elsewhere the test
+    /// says so and passes). Vector 0xe1, whose gate counts (`lock inc
+    /// [TAKEN]`), EOIs and returns; vCPU 0's guest writes 0x400e0 to the LVT
+    /// timer in a loop (each write a #GP exit and a held page write), with
+    /// interrupts on. Each part a VM of its own:
+    /// - a: the window itself: [`PAGE_WINDOW`], the one test seam, runs
+    ///   between the page's get and set, and starts a thread that injects
+    ///   an MSI then (`inject_msi`, the irqfd writer's call), 2 ms before
+    ///   the set; 50 such writes, every MSI taken;
+    /// - b: vCPU 1, on its own thread, sends 2000 fixed IPIs of 0xe1 to
+    ///   vCPU 0 (WRMSR 0x830, WHP's own), each once the one before was
+    ///   taken or a bound of spins passed (counted lost), against vCPU 0's
+    ///   loop: none lost;
+    /// - c: vCPU 0's own one-shot APIC timer expired before the write (TMICT
+    ///   1, divide by 1, interrupts off, a spin): its interrupt, pending in
+    ///   the page the write reads, is taken once interrupts are on, as KVM
+    ///   keeps a pending timer interrupt across `apic_update_lvtt`'s cancel;
+    /// - e: the cost of a held write, 1000 in a loop, with 0, 1 and 15 other
+    ///   vCPUs halted with interrupts on (idle CPUs: the NOHZ path's two
+    ///   writes per idle period, kernel/time/tick-oneshot.c 27-41, each cost
+    ///   this), printed (X2HOLDREC);
+    /// - f: 2000 MSIs injected from another thread, each once the last was
+    ///   taken, against vCPU 0's loop: every one taken.
+    ///
+    /// An event WHP is delivering when the #GP is raised never reaches the
+    /// page path: `gp::decide` gives such a #GP back (its `delivering` rule,
+    /// unit-tested in fuzz `whp_gp`). Today's backend refuses the write
+    /// (`ENOTSUP`, f42dd60): the test fails at part a's first write until
+    /// E-ii is written.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_held_lvt_timer_write_loses_no_interrupt() {
+        use super::super::apicmode::LocalApic;
+        use super::super::ffi;
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        const V: u8 = 0xE1;
+        const GATE: u64 = 0xB900;
+        const IPI_PROGRAM: u64 = 0xBA00;
+        const HALT_PROGRAM: u64 = 0xBB00;
+        const TAKEN: u64 = 0x7200;
+        const LOOPS: u64 = 0x7208;
+        const SENT: u64 = 0x7210;
+        const LOST: u64 = 0x7218;
+        const MSI: u64 = 0xFEE0_0000;
+        const LVTT: u32 = 0x4_00E0;
+        const WINDOWS: u32 = 50;
+        const IPIS: u32 = 2000;
+        const MSIS: u32 = 2000;
+        const COST_WRITES: u32 = 1000;
+        super::super::vm::X2APIC_PARTITION_FOR_TESTS.set(true);
+        if super::super::vm::host_local_apic() != LocalApic::X2Apic {
+            eprintln!("X2HOLD not an AMD host, where option E's x2APIC partition is measured: nothing to test");
+            return;
+        }
+        let imm = |v: u32| v.to_le_bytes();
+        let wrmsr = |ecx: u32, eax: u32| [&[0xB9][..], &imm(ecx), &[0xB8], &imm(eax), &[0x31, 0xD2, 0x0F, 0x30]].concat();
+        // rdmsr 0x1b; or eax, 0xc00; wrmsr; then SVR 0x1ff.
+        let on = [&[0xB9][..], &imm(0x1B), &[0x0F, 0x32, 0x0D], &imm(0xC00), &[0x0F, 0x30], &wrmsr(0x80F, 0x1FF)].concat();
+        // push rax, rcx, rdx; lock inc dword [TAKEN]; EOI; pop; iretq.
+        let gate = [
+            &[0x50u8, 0x51, 0x52][..],
+            &[0xF0, 0xFF, 0x04, 0x25, 0x00, 0x72, 0x00, 0x00],
+            &wrmsr(0x80B, 0),
+            &[0x5A, 0x59, 0x58, 0x48, 0xCF],
+        ]
+        .concat();
+        // sti; then the LVT timer write and inc dword [LOOPS], again.
+        let lvt_loop = [on.clone(), vec![0xFB], wrmsr(0x832, LVTT), vec![0xFF, 0x04, 0x25, 0x08, 0x72, 0x00, 0x00, 0xEB, 0xE9]].concat();
+        let vm_with = |program: &[u8]| {
+            let (vm, vcpu, m) = mmio_guest(program);
+            vcpu.set_cpuid2(&cpuid_with_tsc_deadline()).unwrap();
+            put(m, GATE, &gate);
+            put(m, MMIO_IDT + u64::from(V) * 16, &((GATE & 0xffff) | (8 << 16) | (0x8E << 40)).to_le_bytes());
+            put(m, MMIO_IDT + u64::from(V) * 16 + 8, &0u64.to_le_bytes());
+            put(m, HALT_PROGRAM, &[0xFB, 0xF4, 0xEB, 0xFD]);
+            (vm, vcpu, m)
+        };
+        let reader = |m: *mut u8| {
+            let at = m as usize;
+            // SAFETY: guest memory, mapped while the test's VM has it; the
+            // guest writes it.
+            move |off: u64| unsafe { std::ptr::read_volatile((at + usize::try_from(off).unwrap()) as *const u32) }
+        };
+        // A vCPU of `vm` runnable at `rip`, with vCPU 0's special registers
+        // and the CPUID; x2APIC mode on (`x2apic`).
+        let ap = |vm: &super::super::VmFd, zero: &VcpuFd, id: u64, rip: u64, x2apic: bool| {
+            let v = vm.create_vcpu(id).unwrap();
+            v.set_mp_state(kvm_bindings::kvm_mp_state { mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE }).unwrap();
+            v.set_cpuid2(&cpuid_with_tsc_deadline()).unwrap();
+            v.set_sregs(&zero.get_sregs().unwrap()).unwrap();
+            v.set_regs(&kvm_regs { rip, rsp: 0x8800 - id * 0x40, rflags: 2, ..Default::default() }).unwrap();
+            if x2apic {
+                ffi::set_register(v.part(), v.vp(), whv::WHvX64RegisterApicBase, ffi::reg64(0xFEE0_0C00)).unwrap();
+                let mut l = v.get_lapic().unwrap();
+                for (i, b) in 0x1ffu32.to_le_bytes().into_iter().enumerate() {
+                    l.regs[0xf0 + i] = b as std::os::raw::c_char;
+                }
+                v.set_lapic(&l).unwrap();
+            }
+            v
+        };
+        // Runs `v` until a kick (EINTR), a failure or `out` `port`; the exits.
+        let run_until = |v: &mut VcpuFd, port: Option<u16>| {
+            let mut reads = 0;
+            let mut exits = Vec::new();
+            loop {
+                let e = one_run(v, &[], &mut reads);
+                let end = e == "EINTR" || e.contains("fail") || e.starts_with("fault") || port.is_some_and(|p| e.starts_with(&format!("out {p:#x}"))) || exits.len() >= 8;
+                exits.push(e);
+                if end {
+                    break;
+                }
+            }
+            v.set_kvm_immediate_exit(0);
+            exits
+        };
+        let unmap = |m: *mut u8| {
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        };
+        let mut wrong: Vec<String> = Vec::new();
+
+        // a: an MSI requested inside the window.
+        {
+            let (vm, mut zero, m) = vm_with(&lvt_loop);
+            let read = reader(m);
+            let inner = Arc::clone(&zero.shared.inner);
+            let requested = Arc::new(AtomicU64::new(0));
+            let (hook_inner, hook_requested) = (Arc::clone(&inner), Arc::clone(&requested));
+            PAGE_WINDOW.with(|w| {
+                *w.borrow_mut() = Some(Box::new(move || {
+                    if hook_requested.load(Ordering::SeqCst) < u64::from(WINDOWS) {
+                        let i = Arc::clone(&hook_inner);
+                        std::thread::spawn(move || i.inject_msi(MSI, u32::from(V)));
+                        hook_requested.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }));
+            });
+            let mut kicker = VcpuFd { shared: Arc::clone(&zero.shared), own: None };
+            let watch_requested = Arc::clone(&requested);
+            let watcher = std::thread::spawn(move || {
+                let begun = Instant::now();
+                while begun.elapsed() < Duration::from_secs(20)
+                    && !(watch_requested.load(Ordering::SeqCst) >= u64::from(WINDOWS) && u64::from(read(TAKEN)) >= u64::from(WINDOWS))
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // The last ones' time to be taken.
+                std::thread::sleep(Duration::from_millis(50));
+                kicker.set_kvm_immediate_exit(1);
+                (read(TAKEN), read(LOOPS), begun.elapsed())
+            });
+            let exits = run_until(&mut zero, None);
+            let (taken, loops, took) = watcher.join().unwrap();
+            PAGE_WINDOW.with(|w| *w.borrow_mut() = None);
+            let asked = requested.load(Ordering::SeqCst);
+            eprintln!("X2HOLD a: {asked} MSIs requested inside the page's window, {taken} taken; the guest's writes {loops}, in {took:?}; exits {exits:?}");
+            if asked < u64::from(WINDOWS) || u64::from(taken) != asked || exits.last().map(String::as_str) != Some("EINTR") {
+                wrong.push(format!("a: {asked} requested, {taken} taken, exits {exits:?}"));
+            }
+            drop((inner, zero, vm));
+            unmap(m);
+        }
+
+        // b: vCPU 1's IPIs against vCPU 0's loop.
+        {
+            let (vm, mut zero, m) = vm_with(&lvt_loop);
+            let read = reader(m);
+            // mov ebx, [TAKEN]; the IPI; lock inc [SENT]; mov ecx, 1 << 24;
+            // spin until [TAKEN] moves or ecx runs out (lock inc [LOST]);
+            // again until [SENT] is IPIS; out 0x83.
+            let ipi = [
+                &[0x8Bu8, 0x1C, 0x25, 0x00, 0x72, 0x00, 0x00][..],
+                &wrmsr(0x830, 0x4000 | u32::from(V)),
+                &[0xF0, 0xFF, 0x04, 0x25, 0x10, 0x72, 0x00, 0x00],
+                &[0xB9],
+                &imm(1 << 24),
+                &[0x3B, 0x1C, 0x25, 0x00, 0x72, 0x00, 0x00, 0x75, 0x0E, 0xF3, 0x90, 0xFF, 0xC9, 0x75, 0xF1],
+                &[0xF0, 0xFF, 0x04, 0x25, 0x18, 0x72, 0x00, 0x00],
+                &[0x81, 0x3C, 0x25, 0x10, 0x72, 0x00, 0x00],
+                &imm(IPIS),
+                &[0x72, 0xBA, 0xE6, 0x83, 0xEB, 0xFE],
+            ]
+            .concat();
+            assert_eq!(ipi.len(), 74, "the IPI program's jumps are for 74 bytes");
+            put(m, IPI_PROGRAM, &ipi);
+            let mut one = ap(&vm, &zero, 1, IPI_PROGRAM, true);
+            let mut kicker = VcpuFd { shared: Arc::clone(&zero.shared), own: None };
+            let sender = std::thread::spawn(move || {
+                let begun = Instant::now();
+                let watchdog = super::Watchdog::arm(&one);
+                let mut exits = Vec::new();
+                let mut reads = 0;
+                while begun.elapsed() < Duration::from_secs(60) {
+                    let e = one_run(&mut one, &[], &mut reads);
+                    let end = e.starts_with("out 0x83") || e == "EINTR" || e.contains("fail") || e.starts_with("fault");
+                    exits.push(e);
+                    if end {
+                        break;
+                    }
+                }
+                drop(watchdog);
+                std::thread::sleep(Duration::from_millis(50));
+                kicker.set_kvm_immediate_exit(1);
+                (exits, begun.elapsed(), one)
+            });
+            let exits = run_until(&mut zero, None);
+            let (sent_exits, took, one) = sender.join().unwrap();
+            let (sent, taken, lost, loops) = (read(SENT), read(TAKEN), read(LOST), read(LOOPS));
+            eprintln!(
+                "X2HOLD b: vCPU 1 sent {sent} IPIs, {taken} taken, {lost} not taken within the spin bound, in {took:?}; \
+                 vCPU 0's writes {loops}; vCPU 1's exits {sent_exits:?}, vCPU 0's {exits:?}"
+            );
+            if sent != IPIS || taken != IPIS || lost != 0 || loops < 10 {
+                wrong.push(format!("b: {sent} sent, {taken} taken, {lost} lost, {loops} writes"));
+            }
+            drop((one, zero, vm));
+            unmap(m);
+        }
+
+        // c: the vCPU's own timer, expired before the write.
+        {
+            let program = [
+                on.clone(),
+                vec![0xFA],
+                wrmsr(0x83E, 0xB),
+                wrmsr(0x832, u32::from(V)),
+                wrmsr(0x838, 1),
+                [&[0xB9][..], &imm(0x10_0000), &[0xF3, 0x90, 0xFF, 0xC9, 0x75, 0xFA]].concat(),
+                wrmsr(0x832, LVTT),
+                vec![0xFB, 0x90, 0x90, 0xE6, 0x85, 0xEB, 0xFE],
+            ]
+            .concat();
+            let (vm, mut zero, m) = vm_with(&program);
+            let read = reader(m);
+            let watchdog = super::Watchdog::arm(&zero);
+            let exits = run_until(&mut zero, Some(0x85));
+            drop(watchdog);
+            let taken = read(TAKEN);
+            eprintln!("X2HOLD c: the one-shot timer expired before the write: exits {exits:?}; its interrupt taken {taken} times");
+            if exits.last().is_none_or(|e| !e.starts_with("out 0x85")) || taken != 1 {
+                wrong.push(format!("c: exits {exits:?}, taken {taken}"));
+            }
+            drop((zero, vm));
+            unmap(m);
+        }
+
+        // e: the cost, with 0, 1 and 15 other vCPUs halted.
+        for others in [0u64, 1, 15] {
+            // The writes, counted in [LOOPS], to COST_WRITES; out 0x86.
+            let program = [
+                on.clone(),
+                wrmsr(0x832, LVTT),
+                vec![0xFF, 0x04, 0x25, 0x08, 0x72, 0x00, 0x00, 0x81, 0x3C, 0x25, 0x08, 0x72, 0x00, 0x00],
+                imm(COST_WRITES).to_vec(),
+                vec![0x72, 0xDE, 0xE6, 0x86, 0xEB, 0xFE],
+            ]
+            .concat();
+            let (vm, mut zero, m) = vm_with(&program);
+            let read = reader(m);
+            let stop = Arc::new(AtomicBool::new(false));
+            let idlers: Vec<_> = (1..=others)
+                .map(|id| {
+                    let mut v = ap(&vm, &zero, id, HALT_PROGRAM, false);
+                    let stop = Arc::clone(&stop);
+                    let mut kick = VcpuFd { shared: Arc::clone(&v.shared), own: None };
+                    let thread = std::thread::spawn(move || {
+                        let mut reads = 0;
+                        while !stop.load(Ordering::SeqCst) {
+                            let _ = one_run(&mut v, &[], &mut reads);
+                            v.set_kvm_immediate_exit(0);
+                        }
+                        v
+                    });
+                    (thread, move || kick.set_kvm_immediate_exit(1))
+                })
+                .collect();
+            let watchdog = super::Watchdog::arm(&zero);
+            let begun = Instant::now();
+            let exits = run_until(&mut zero, Some(0x86));
+            let took = begun.elapsed();
+            drop(watchdog);
+            stop.store(true, Ordering::SeqCst);
+            let mut halted = Vec::new();
+            for (thread, mut kick) in idlers {
+                kick();
+                halted.push(thread.join().unwrap());
+            }
+            let writes = read(LOOPS);
+            eprintln!(
+                "X2HOLDREC e: {writes} held LVT timer writes with {others} other vCPUs halted: {took:?}, {} us a write; exits {exits:?}",
+                took.as_micros() / u128::from(writes.max(1))
+            );
+            if writes != COST_WRITES {
+                wrong.push(format!("e ({others} others): {writes} writes, exits {exits:?}"));
+            }
+            drop((halted, zero, vm));
+            unmap(m);
+        }
+
+        // f: MSIs from another thread against the loop.
+        {
+            let (vm, mut zero, m) = vm_with(&lvt_loop);
+            let read = reader(m);
+            let inner = Arc::clone(&zero.shared.inner);
+            let mut kicker = VcpuFd { shared: Arc::clone(&zero.shared), own: None };
+            let writer = std::thread::spawn(move || {
+                let begun = Instant::now();
+                while read(LOOPS) < 10 && begun.elapsed() < Duration::from_secs(10) {
+                    std::thread::yield_now();
+                }
+                let (mut requested, mut lost) = (0u32, 0u32);
+                if read(LOOPS) >= 10 {
+                    while requested < MSIS && lost < 3 {
+                        let before = read(TAKEN);
+                        inner.inject_msi(MSI, u32::from(V));
+                        requested += 1;
+                        let asked = Instant::now();
+                        while read(TAKEN) == before {
+                            if asked.elapsed() > Duration::from_secs(1) {
+                                lost += 1;
+                                break;
+                            }
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
+                let out = (requested, lost, read(TAKEN), read(LOOPS), begun.elapsed());
+                kicker.set_kvm_immediate_exit(1);
+                drop(inner);
+                out
+            });
+            let exits = run_until(&mut zero, None);
+            let (requested, lost, taken, loops, took) = writer.join().unwrap();
+            eprintln!(
+                "X2HOLD f: {requested} MSIs injected from another thread, {taken} taken, {lost} not taken within 1 s; the \
+                 guest's held writes {loops}, in {took:?}; exits {exits:?}"
+            );
+            if (requested, taken, lost) != (MSIS, MSIS, 0) || loops < 10 {
+                wrong.push(format!("f: {requested} requested, {taken} taken, {lost} lost, {loops} writes"));
+            }
+            drop((zero, vm));
+            unmap(m);
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
     }
 
     /// A 2 MiB chunk of userfaultfd-registered guest RAM discarded whole,
