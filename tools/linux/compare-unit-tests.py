@@ -20,8 +20,8 @@ their line numbers, which the patches move). It fails when:
 - a crate upstream's build compiles is not compiled by wick's at the same
   version with the same features (the dependency graph moved under
   upstream's code), unless tools/linux/dependency-moves.txt moves that crate
-  to wick's version for a security advisory (an entry that matches no unit
-  fails too).
+  to wick's version for a security advisory or a backported upstream commit
+  (an entry that matches no unit fails too).
 
 Prints a table per package, the problems found, and writes the same as
 Markdown to --summary (e.g. $GITHUB_STEP_SUMMARY).
@@ -85,7 +85,7 @@ def compiled_units(build_json):
 
 
 def dependency_moves():
-    """(crate, upstream version) -> (wick version, advisory), from
+    """(crate, upstream version) -> (wick version, reason), from
     dependency-moves.txt."""
     path = Path(__file__).with_name("dependency-moves.txt")
     moves = {}
@@ -103,7 +103,8 @@ def compare_builds(up_out, wk_out, problems, notes):
 
     The compatibility crates add a unit of the same name (the wrapper) next to
     the original crate; a match with either is enough. A crate moved for an
-    advisory (dependency-moves.txt) matches at wick's version. Returns the
+    advisory or a backported upstream commit (dependency-moves.txt) matches
+    at wick's version. Returns the
     number of upstream units checked."""
     checked = 0
     moves = dependency_moves()

@@ -187,7 +187,9 @@ An advisory is fixed by moving to a fixed version of the crate (`cargo update
 -p <crate>` in lib/firecracker, then amend the lockfile patch, and list the
 move with its advisory in `tools/linux/dependency-moves.txt`, which the
 Linux unit-test comparison checks), not by ignoring it. An `ignore` entry is accepted only for an advisory upstream
-ignores in its own `deny.toml`, with upstream's reason. A new git source or a
+ignores in its own `deny.toml`, with upstream's reason. A crate moved by a
+backported upstream commit (patches/0049's vm-superio 0.8.2) is listed there
+too, with the commit (`upstream-<commit>`). A new git source or a
 second version of a crate needs an entry in `tools/deny.toml` that says why.
 
 ## Releases

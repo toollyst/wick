@@ -1,13 +1,20 @@
 # Copyright 2026 toollyst contributors.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Crates wick's lockfile (patch 0014) moves to another version than
-# upstream's Cargo.lock has, each for a security advisory, as
-# CONTRIBUTING.md ("Dependencies") requires: an advisory is fixed by moving
-# to a fixed version, not by ignoring it. tools/linux/compare-unit-tests.py
-# then matches upstream's unit of <crate> <from> with wick's of <crate> <to>
-# (same target, same features), and fails when an entry matches no unit.
+# Crates wick's lockfile moves to another version than upstream's
+# Cargo.lock has, each for a reason named in the entry:
+# - a security advisory (patch 0014), as CONTRIBUTING.md ("Dependencies")
+#   requires: an advisory is fixed by moving to a fixed version, not by
+#   ignoring it;
+# - an upstream commit after the release that moves the crate, backported
+#   by a patch (named as upstream-<commit>, the patch in patches/).
+# tools/linux/compare-unit-tests.py then matches upstream's unit of
+# <crate> <from> with wick's of <crate> <to> (same target, same features),
+# and fails when an entry matches no unit.
 #
-# Format: <crate> <upstream version> <wick version> <advisory>
+# Format: <crate> <upstream version> <wick version> <reason>
 
 rustix 1.1.4 1.1.6 RUSTSEC-2026-0486
+# patches/0049: upstream's 18b08295a82a ("chore(deps): bump vm-superio to
+# v0.8.2"), the serial interrupt for input that came while IER was masked.
+vm-superio 0.8.1 0.8.2 upstream-18b08295a82a
