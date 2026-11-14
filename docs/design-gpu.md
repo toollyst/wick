@@ -256,7 +256,7 @@ when allocating a host-backed memory resource" [D].
 
 **R9. Host memory exhaustion through GPU allocations.**
 - The DXGI budget is advisory ([QueryVideoMemoryInfo](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/ns-dxgi1_4-dxgi_query_video_memory_info) [D]).
-- Windows sections are not charged to the Job (measured: `jailer-test.ps1 sections` before the jailer counted them); the jailer's 1 ms count of `SharedCommitUsage` ends a jail past `memory.max` (SECURITY.md, "`memory.max` bounds memory in sections at the jailer's next count"), so a GPU allocation in a section is bounded the same way, within a poll.
+- Windows sections are not charged to the Job (measured: `jailer-test.ps1 sections` before the jailer counted them); the jailer's 1 ms count of `SharedCommitUsage` ends a jail past `memory.max` (SECURITY.md, "`memory.max` bounds memory in sections at the jailer's next count"), so a GPU allocation in a section is bounded the same way, once the jail is ended after the next poll.
 - `VKR_HEAP_MEMORY_PERCENT` "doesn't enforce" (`vkr_physical_device.c` [S]).
 - Metal's `recommendedMaxWorkingSetSize` is advisory [D].
 - **All hosts:**

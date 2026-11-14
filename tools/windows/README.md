@@ -28,8 +28,9 @@
   given are accepted and held; the jailed probe's own opens are not refused,
   which records what is left to the jailer's supervision and fails once it
   bounds them), `sections`
-  (`memory.max` against sections: fails today, as a Job Object does not
-  charge them), `daemonize`, `handles` (a handle the jailer inherited is not
+  (`memory.max` against sections: private memory is denied at the job's
+  limit, pagefile-backed sections end the jail with 137 at the jailer's
+  next count, temporary-file sections are allowed), `daemonize`, `handles` (a handle the jailer inherited is not
   open in the jail), `pidns` (no process, thread or console of anyone else;
   needs a console: run with other stages, the script runs it alone in a
   console of its own, `<WorkDir>-pidns`, as CI's step does), `handoff` (a handle and a socket held by a jailed process
