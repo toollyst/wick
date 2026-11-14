@@ -1920,6 +1920,25 @@ function Format-StuckState($a, $b, [double]$seconds) {
     return ($lines -join "`n")
 }
 
+# The MSR accesses of a stage that exited to the backend for an MSR neither
+# WHP nor the backend keeps (read as 0 or the write ignored, where KVM gives
+# #GP(0): the Guest MSRs row of docs/COMPATIBILITY.md), from the backend's
+# "an MSR the backend does not keep" lines on stderr: the record of which
+# MSRs a Linux guest reaches that way (MSRREC). After the VM has exited.
+function Get-UnkeptMsrs($vm) {
+    $said = $vm.Output + "`n" + (Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue)
+    $seen = [ordered]@{}
+    foreach ($m in [regex]::Matches($said, "vCPU \d+'s (RDMSR|WRMSR) of (0x[0-9a-f]+)(?: \((0x[0-9a-f]+)\))?")) {
+        $key = "$($m.Groups[1].Value) $($m.Groups[2].Value)"
+        if (-not $seen.Contains($key)) {
+            $seen[$key] = if ($m.Groups[3].Success) { "$key ($($m.Groups[3].Value))" } else { $key }
+        }
+    }
+    $more = if ($said -match 'MSR accesses the backend does not keep: those past them are not named') { ', and more not named' } else { '' }
+    if ($seen.Count -eq 0) { return 'none' }
+    return (@($seen.Values) -join ', ') + $more
+}
+
 # Saves the guest kernel log of a stage (for the report), best effort.
 function Save-Dmesg($vm, [string]$name) {
     try {
@@ -2004,7 +2023,9 @@ function Stage-Boot {
     $srso = $vm.Sh('cat /sys/devices/system/cpu/vulnerabilities/spec_rstack_overflow 2>/dev/null; dmesg | grep -m2 "Speculative Return Stack Overflow" | sed "s/^.*] //"; true')
     Save-Dmesg $vm 'boot'
     $vm.Reboot()
-    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0; SRSO: {2}" -f $dt, $host_dt, (($srso -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | '))
+    $vm.Drain(2000)
+    $msrs = Get-UnkeptMsrs $vm
+    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0; SRSO: {2}; MSRREC the MSRs the backend does not keep that the guest reached: {3}" -f $dt, $host_dt, (($srso -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | '), $msrs)
 }
 
 # CPU 1 taken offline and back online three times, then work on it: on x86
@@ -2102,8 +2123,10 @@ function Stage-Smp {
     $spuriousRestored = Test-CpuOfflineOnline $vm 'after a snapshot restore'
     Save-Dmesg $vm 'smp-restored'
     $vm.Reboot()
+    $vm.Drain(2000)
+    $msrs = Get-UnkeptMsrs $vm
     Remove-Item $state, $mem -ErrorAction SilentlyContinue
-    return "2 vCPUs online, work runs on each, clock agrees across vCPUs, TSCs agree (after boot: $warp; after the restore: $warpRestored), CPU 1 offline and online 3 times then working, after boot and after a snapshot restore (spurious LAPIC timer interrupts: $spurious, $spuriousRestored), reset exits 0"
+    return "2 vCPUs online, work runs on each, clock agrees across vCPUs, TSCs agree (after boot: $warp; after the restore: $warpRestored), CPU 1 offline and online 3 times then working, after boot and after a snapshot restore (spurious LAPIC timer interrupts: $spurious, $spuriousRestored), reset exits 0; MSRREC the MSRs the backend does not keep that the restored guest reached: $msrs"
 }
 
 function Stage-Block {

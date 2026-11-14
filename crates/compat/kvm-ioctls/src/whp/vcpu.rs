@@ -2731,8 +2731,8 @@ impl VcpuFd {
                         super::ffi::reg64(super::debug::pending_gp()),
                     );
                 }
-            } else {
-                self.write_kvm_msr(index, value)?;
+            } else if !self.write_kvm_msr(index, value)? {
+                say_unkept_msr(self.vp(), index, Some(value));
             }
             regs::set_rip(self.part(), self.vp(), rip_after)
         } else {
@@ -2741,11 +2741,76 @@ impl VcpuFd {
                 pvclock::MSR_WALL_CLOCK => self.shared.inner.pvclock.lock().unwrap().wall_msr,
                 MSR_TSC_DEADLINE => self.read_tsc_deadline()?,
                 i if regs::software_msr(i) => self.software_msr(i).load(Ordering::Acquire),
-                _ => 0,
+                _ => {
+                    say_unkept_msr(self.vp(), index, None);
+                    0
+                }
             };
             regs::set_msr_result(self.part(), self.vp(), value, rip_after)
         }
     }
+}
+
+/// How many MSRs [`say_unkept_msr`] names in a process: a guest probing
+/// MSRs in a loop makes one line each, up to this, then one more.
+const UNKEPT_NAMED: usize = 64;
+
+/// What [`unkept_line`] says of an access.
+#[derive(Debug, PartialEq, Eq)]
+enum Unkept {
+    /// The first access of its kind (the MSR, read or written): named.
+    First,
+    /// The first past [`UNKEPT_NAMED`]: the line that says the rest are not
+    /// named.
+    Past,
+    /// Said before, or past the bound.
+    Said,
+}
+
+/// Whether the access of `index` (a write if `write`) is new to `seen`,
+/// the accesses named so far, which it joins.
+fn unkept_line(seen: &mut Vec<(u32, bool)>, index: u32, write: bool) -> Unkept {
+    if seen.contains(&(index, write)) {
+        return Unkept::Said;
+    }
+    match seen.len() {
+        n if n < UNKEPT_NAMED => {
+            seen.push((index, write));
+            Unkept::First
+        }
+        n if n == UNKEPT_NAMED => {
+            seen.push((u32::MAX, false));
+            Unkept::Past
+        }
+        _ => Unkept::Said,
+    }
+}
+
+/// Names, once a process, an MSR access that exited to the backend for an
+/// MSR neither WHP nor the backend keeps (`value`: the write's, or a read),
+/// which is read as 0 or its write ignored, where KVM gives #GP(0) for an
+/// MSR it has no case for (`ignore_msrs` off, Linux v6.1 x86.c 143,
+/// 1866-1876, 1911-1923): the record for the Guest MSRs row, which MSRs a
+/// guest's boot and upstream's tests reach this way, and a `whp:` line for
+/// the gap where it happens. At most [`UNKEPT_NAMED`] lines and one more.
+fn say_unkept_msr(vp: u32, index: u32, value: Option<u64>) {
+    static SEEN: std::sync::Mutex<Vec<(u32, bool)>> = std::sync::Mutex::new(Vec::new());
+    let said = unkept_line(&mut SEEN.lock().unwrap(), index, value.is_some());
+    let line = match (said, value) {
+        (Unkept::Said, _) => return,
+        (Unkept::Past, _) => format!(
+            "whp: more than {UNKEPT_NAMED} MSR accesses the backend does not keep: those past them are not named"
+        ),
+        (Unkept::First, Some(v)) => format!(
+            "whp: an MSR the backend does not keep: vCPU {vp}'s WRMSR of {index:#x} ({v:#x}) is ignored, where KVM \
+             gives #GP(0) for an MSR it has no case for (docs/COMPATIBILITY.md, the Guest MSRs row)"
+        ),
+        (Unkept::First, None) => format!(
+            "whp: an MSR the backend does not keep: vCPU {vp}'s RDMSR of {index:#x} reads 0, where KVM gives #GP(0) \
+             for an MSR it has no case for (docs/COMPATIBILITY.md, the Guest MSRs row)"
+        ),
+    };
+    super::ffi::report(log::Level::Warn, &line);
 }
 
 /// The record tests' kick of a vCPU whose `run` has not come back 5 s
@@ -10884,5 +10949,23 @@ mod lapic_format_tests {
         assert_eq!(super::x2apic_ldr(15), 0x8000);
         assert_eq!(super::x2apic_ldr(16), 0x1_0001);
         assert_eq!(super::x2apic_ldr(35), 0x2_0008);
+    }
+
+    #[test]
+    fn test_an_unkept_msr_is_named_once_and_the_names_are_bounded() {
+        use super::{UNKEPT_NAMED, Unkept, unkept_line};
+        let mut seen = Vec::new();
+        assert_eq!(unkept_line(&mut seen, 0xc001_0015, false), Unkept::First);
+        assert_eq!(unkept_line(&mut seen, 0xc001_0015, false), Unkept::Said, "the same read again");
+        assert_eq!(unkept_line(&mut seen, 0xc001_0015, true), Unkept::First, "its write is another access");
+        for index in 1..u32::try_from(UNKEPT_NAMED).unwrap() - 1 {
+            assert_eq!(unkept_line(&mut seen, index, false), Unkept::First, "{index:#x}");
+        }
+        assert_eq!(seen.len(), UNKEPT_NAMED);
+        assert_eq!(unkept_line(&mut seen, 0x9999, false), Unkept::Past, "the first past the bound");
+        for index in 0x1_0000..0x1_0100 {
+            assert_eq!(unkept_line(&mut seen, index, true), Unkept::Said, "past the bound: {index:#x}");
+        }
+        assert_eq!(seen.len(), UNKEPT_NAMED + 1, "what is kept stays bounded");
     }
 }
