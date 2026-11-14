@@ -273,6 +273,43 @@ def network_programs(tmp, ns, g, host, guest, host_mac):
     srv.close()
 
 
+def network_rebound(ns, g, host, guest, host_mac):
+    """The endpoint's VMM goes and another binds it, its guest at the same
+    address with another MAC (upstream's test_net_change_mac_address on a
+    network that is used again): the host side forgets the neighbours it
+    had and ARPs for the address before it sends, as Linux drops a TAP's
+    neighbour entries when its carrier goes (v6.1 drivers/net/tun.c:680,
+    __tun_detach's netif_carrier_off; net/ipv4/arp.c:1284-1296,
+    NETDEV_CHANGE's neigh_carrier_down). Kept, the old MAC took the frames,
+    and the new guest's ssh was lost (24cef0d on macOS)."""
+    path = ns.path / "tap0"
+    g.conn.close()
+    g.listener.close()
+    deadline = time.time() + 5
+    while ns.is_used() and time.time() < deadline:
+        time.sleep(0.05)
+    check(not ns.is_used(), "network: the host side lets the endpoint go when its VMM does")
+    path.unlink()
+    g2 = Guest(str(path))
+    deadline = time.time() + 5
+    while g2.conn is None and time.time() < deadline:
+        time.sleep(0.05)
+    check(g2.conn is not None, "network: the host side connects to the endpoint bound again")
+    if g2.conn is None:
+        return
+    mac = bytes.fromhex("060000000003")
+    uport = ns.forward_udp(str(guest), 82)
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.sendto(b"y", ("127.0.0.1", uport))
+    who = g2.wait(lambda f: f[12:14] == b"\x08\x06" and f[20:22] == b"\x00\x01" and f[38:42] == guest.packed)
+    check(who is not None, "network: after the endpoint was bound again, the host ARPs for the guest before it sends")
+    arp = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 2, mac, guest.packed, host_mac, host.packed)
+    g2.send(host_mac + mac + b"\x08\x06" + arp)
+    d = g2.wait(lambda f: f[12:14] == b"\x08\x00" and f[23] == 17 and f[36:38] == struct.pack("!H", 82))
+    check(d is not None and d[:6] == mac, "network: the datagram goes to the guest's new MAC")
+    u.close()
+
+
 def network(tmp):
     os.environ["WICK_IT_ROOT"] = tmp
     host, guest = ipaddress.ip_address("192.168.0.1"), ipaddress.ip_address("192.168.0.2")
@@ -319,6 +356,7 @@ def network(tmp):
     fin = g.wait(lambda f: f[23] == 6 and f[47] & 0x01)
     check(fin is not None, "network: closing the forward sends a FIN")
     network_programs(tmp, ns, g, host, guest, host_mac)
+    network_rebound(ns, g, host, guest, host_mac)
     ns.cleanup()
     check(not ns.door_path.exists(), "network: the door goes with the network")
 
