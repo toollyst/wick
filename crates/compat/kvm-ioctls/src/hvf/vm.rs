@@ -2738,19 +2738,41 @@ mod tests {
             later.sort_unstable();
             later
         };
+        // The user idle level the kernel scales every leeway by while the
+        // rounds run (timer_call_slop: `adjval += (adjval * level) >> 7`;
+        // machdep.user_idle_level, 0 to 128, bsd/kern/kern_sysctl.c),
+        // recorded with the figures, before and after.
+        let idle_level = || {
+            let mut level: libc::c_int = -1;
+            let mut len = std::mem::size_of::<libc::c_int>();
+            // SAFETY: a NUL-terminated name, an int and its length.
+            let ret = unsafe {
+                libc::sysctlbyname(
+                    c"machdep.user_idle_level".as_ptr(),
+                    (&raw mut level).cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if ret == 0 { level } else { -1 }
+        };
+        let level_before = idle_level();
         let without = rounds(&mut vcpu);
         // SAFETY: no arguments.
         super::super::latency::vcpu_thread(unsafe { libc::pthread_self() }).unwrap();
         let with = rounds(&mut vcpu);
+        let levels = format!("machdep.user_idle_level {level_before} before, {} after", idle_level());
         println!(
             "a guest's {DUE:?} WFI, later than a NOTE_CRITICAL timer by (us, sorted): on the thread as it is, median {} \
-             {without:?}; as a vCPU thread, median {} {with:?}",
+             {without:?}; as a vCPU thread, median {} {with:?}; {levels}",
             without[ROUNDS / 2],
             with[ROUNDS / 2]
         );
         assert!(
             with[ROUNDS / 2] < 3000,
-            "as a vCPU thread the guest ran again a median {} us after the control: {with:?} (without the tier: {without:?})",
+            "as a vCPU thread the guest ran again a median {} us after the control: {with:?} (without the tier: {without:?}; \
+             {levels})",
             with[ROUNDS / 2]
         );
     }

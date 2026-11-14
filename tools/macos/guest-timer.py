@@ -8,7 +8,9 @@ Boots upstream's CI kernel and rootfs as boot-test's boot stage does (no
 root) and runs, in the guest, python3's time.sleep (clock_nanosleep) 500
 times for 1 ms and 50 times for 20 ms. Printed: how much longer than asked
 each kind of sleep took (median, p90, p99 and maximum, in microseconds),
-and the host's load average before and after.
+and the host's load average and machdep.user_idle_level (0 to 128: macOS
+scales every timer leeway by 1 + level/128 while the user is idle,
+osfmk/kern/timer_call.c timer_call_slop) before and after.
 
 A sleeping guest waits in WFI for its virtual timer, inside hv_vcpu_run on
 its vCPU thread, and macOS fires that wait late by the thread's latency
@@ -28,6 +30,7 @@ tools/macos/boot-test.sh once to fetch them).
 """
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -46,6 +49,14 @@ run(50, 0.02)
 "'''
 
 
+def host_state():
+    """Prints the host's load average and user idle level."""
+    level = subprocess.run(["/usr/sbin/sysctl", "-n", "machdep.user_idle_level"], capture_output=True,
+                           text=True, check=False).stdout.strip() or "unreadable"
+    print("guest-timer: host load average", " ".join(f"{x:.1f}" for x in os.getloadavg()),
+          "machdep.user_idle_level", level)
+
+
 def main():
     if len(sys.argv) not in (2, 3):
         sys.exit(__doc__)
@@ -62,12 +73,12 @@ def main():
         vm = ctx.vm("timer", [], bt.config(ctx, vcpus=vcpus))
         vm.wait_for(r"Run /bin/sh as init process", 60)
         vm.shell()
-        print("guest-timer: host load average", " ".join(f"{x:.1f}" for x in os.getloadavg()))
+        host_state()
         _, res = vm.sh(PROBE, timeout=120)
         for line in res.splitlines():
             if "GUEST" in line:
                 print("guest-timer:", line[line.index("GUEST"):])
-        print("guest-timer: host load average", " ".join(f"{x:.1f}" for x in os.getloadavg()))
+        host_state()
     finally:
         ctx.cleanup()
 
