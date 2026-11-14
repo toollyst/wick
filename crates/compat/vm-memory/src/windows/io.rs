@@ -449,7 +449,6 @@ mod tests {
     /// (v6.1 fs/ioctl.c:341-361 `ioctl_fionbio`), and `F_GETFL` shows it.
     #[cfg(feature = "rawfd")]
     #[test]
-    #[ignore = "written before wick_os's set_nonblocking goes through the libc; fails until it does"]
     fn test_a_socket_made_non_blocking_by_wick_os_is_o_nonblocking_to_the_libc() {
         use wick_os::fd::AsRawFd;
         let (a, _b) = wick_os::unix::net::UnixStream::pair().unwrap();

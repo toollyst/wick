@@ -8,11 +8,11 @@ windows-sys. Upstream's own entries are unchanged.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- Cargo.lock | 448 ++++++++++++++++++++++++++++++++++++++++++++---------
- 1 file changed, 373 insertions(+), 75 deletions(-)
+ Cargo.lock | 449 ++++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 374 insertions(+), 75 deletions(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 6bf958a681c8b301a64d420c707a5b8d49e735fd..4735be4c4ca8875b7a054e58f6d199e9c25058a4 100644
+index 6bf958a681c8b301a64d420c707a5b8d49e735fd..8fcbd32dd77e6c1cf4f30bba352747519be119fa 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -8,7 +8,7 @@ version = "0.1.0"
@@ -825,7 +825,7 @@ index 6bf958a681c8b301a64d420c707a5b8d49e735fd..4735be4c4ca8875b7a054e58f6d199e9
   "serde",
   "serde_derive",
  ]
-@@ -1775,6 +2052,27 @@ dependencies = [
+@@ -1775,6 +2052,28 @@ dependencies = [
   "unicode-ident",
  ]
  
@@ -840,6 +840,7 @@ index 6bf958a681c8b301a64d420c707a5b8d49e735fd..4735be4c4ca8875b7a054e58f6d199e9
 +name = "wick-os"
 +version = "0.1.0"
 +dependencies = [
++ "libc 0.2.189",
 + "windows-sys",
 +]
 +

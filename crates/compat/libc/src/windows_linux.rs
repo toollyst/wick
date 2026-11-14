@@ -13,7 +13,9 @@
 //!   with `ENOSYS`;
 //! - `prctl`: `PR_GET_SECCOMP` is 0 (no seccomp filter); other options fail
 //!   with `EINVAL`, as unknown options do on Linux;
-//! - `ioctl` fails with `ENOTTY`: Windows paths use `DeviceIoControl`;
+//! - `ioctl`: `FIONBIO` sets or clears `O_NONBLOCK` as `fcntl(F_SETFL)`
+//!   does (Linux's fs/ioctl.c `ioctl_fionbio`); other requests fail with
+//!   `ENOTTY`: Windows paths use `DeviceIoControl`;
 //! - `fallocate`: punching holes and zeroing ranges with sparse files and
 //!   `FSCTL_SET_ZERO_DATA`, allocation by writing zeros into holes;
 //! - sockets take descriptors and Linux numbers (`AF_INET6` is 10), over
@@ -112,10 +114,27 @@ extern "C" fn wick_compat_prctl(option: c_int) -> c_int {
 /// The `ioctl` request type (glibc's).
 pub type Ioctl = c_ulong;
 
+// Windows passes variadic arguments like fixed ones on x86_64 and arm64, so
+// the variadic `ioctl` binds to a fixed-argument function, as `fcntl` does.
 #[unsafe(no_mangle)]
-extern "C" fn wick_compat_ioctl(_fd: c_int, _request: Ioctl) -> c_int {
-    set_errno(crate::ENOTTY);
-    -1
+extern "C" fn wick_compat_ioctl(fd: c_int, request: Ioctl, arg: usize) -> c_int {
+    if request != FIONBIO {
+        set_errno(crate::ENOTTY);
+        return -1;
+    }
+    // Linux's `do_vfs_ioctl` takes `FIONBIO` for any open descriptor
+    // (v6.1 fs/ioctl.c:788) and reads its `int` with `get_user` (`EFAULT`).
+    if !crate::windows_fd::is_open(fd) {
+        set_errno(crate::EBADF);
+        return -1;
+    }
+    // SAFETY: `FIONBIO`'s argument points to the caller's `int`; a null
+    // pointer is `EFAULT`.
+    let Some(&on) = (unsafe { (arg as *const c_int).as_ref() }) else {
+        set_errno(crate::EFAULT);
+        return -1;
+    };
+    crate::windows_fd::set_nonblocking(fd, on != 0)
 }
 
 unsafe extern "C" {
@@ -125,7 +144,8 @@ unsafe extern "C" {
     /// `prctl`: see the module documentation.
     #[link_name = "wick_compat_prctl"]
     pub fn prctl(option: c_int, ...) -> c_int;
-    /// `ioctl`: fails with `ENOTTY` (see the module documentation).
+    /// `ioctl`: `FIONBIO`; other requests fail with `ENOTTY` (see the
+    /// module documentation).
     #[link_name = "wick_compat_ioctl"]
     pub fn ioctl(fd: c_int, request: Ioctl, ...) -> c_int;
 }

@@ -13,7 +13,7 @@ through Firecracker's logger as well.
  1 file changed, 1 insertion(+)
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 4c7dbd01188feab1d6f7b67bb531778b6386738d..bec2ed55da69f049b432f17bf998b2171b56763d 100644
+index ffe9f036d3c90e0df9a1cf654908b4e3e25ed46d..02f9293e232d0bf099dfca796956f009ecd18453 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -959,6 +959,7 @@ dependencies = [

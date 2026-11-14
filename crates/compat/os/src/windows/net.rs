@@ -22,11 +22,11 @@ use std::time::Duration;
 use std::{fmt, mem, ptr};
 
 use windows_sys::Win32::Networking::WinSock::{
-    AF_UNIX, FIONBIO, INVALID_SOCKET, SD_BOTH, SD_RECEIVE, SD_SEND, SIO_AF_UNIX_GETPEERPID,
+    AF_UNIX, INVALID_SOCKET, SD_BOTH, SD_RECEIVE, SD_SEND, SIO_AF_UNIX_GETPEERPID,
     SO_ERROR, SO_RCVTIMEO, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR,
     SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSADATA, WSAGetLastError,
     WSAIoctl, WSASocketW, WSAStartup, accept, bind, connect, getpeername, getsockname, getsockopt,
-    MSG_PEEK, ioctlsocket, listen, recv, send, setsockopt, shutdown,
+    MSG_PEEK, listen, recv, send, setsockopt, shutdown,
 };
 
 use super::fd::{
@@ -216,10 +216,18 @@ fn timeout(fd: SOCKET, opt: i32) -> io::Result<Option<Duration>> {
     Ok((ms != 0).then(|| Duration::from_millis(u64::from(ms))))
 }
 
+/// Non-blocking mode, as Linux's std sets it: `ioctl(FIONBIO)`, here the
+/// compat libc's, which sets the socket's mode (`ioctlsocket`) and its
+/// `O_NONBLOCK` together, so that `F_GETFL` shows it and the libc's `read`
+/// and `write` on it know, as Linux's `FIONBIO` sets the open file's
+/// `O_NONBLOCK` (v6.1 fs/ioctl.c:341-361 `ioctl_fionbio`).
 fn set_nonblocking(fd: SOCKET, on: bool) -> io::Result<()> {
-    let mut arg = u32::from(on);
-    // SAFETY: `FIONBIO` takes a `u32`.
-    cvt(unsafe { ioctlsocket(fd, FIONBIO, &mut arg) })?;
+    let fd = super::fd::from_socket(fd);
+    let mut arg = libc::c_int::from(on);
+    // SAFETY: `FIONBIO` takes a pointer to an `int`.
+    if unsafe { libc::ioctl(fd, libc::FIONBIO, &raw mut arg) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 

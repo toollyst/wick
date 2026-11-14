@@ -19,7 +19,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 6556a8f2808529cc0f02fea6b451e8fbad96a5cc..4c7dbd01188feab1d6f7b67bb531778b6386738d 100644
+index ca37d40c878e88804b0e70aaeedd8c092c294b75..ffe9f036d3c90e0df9a1cf654908b4e3e25ed46d 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -2074,6 +2074,7 @@ dependencies = [
@@ -27,9 +27,9 @@ index 6556a8f2808529cc0f02fea6b451e8fbad96a5cc..4c7dbd01188feab1d6f7b67bb531778b
  version = "0.1.0"
  dependencies = [
 + "gdbstub",
+  "libc 0.2.189",
   "windows-sys",
  ]
- 
 diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
 index 7d6d670e06fa44f3f3eff418ff448fce689c55a4..784efa2c87b3d30a683114f93dae8d9e66fb21c8 100644
 --- a/src/vmm/Cargo.toml

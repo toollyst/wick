@@ -9,9 +9,7 @@
 //! number of handles of the process, from `WICK_NO_FILE`, which the Windows
 //! jailer sets; a call that would make descriptors past it fails with
 //! `EMFILE` (`WSAEMFILE`, the compat libc's `EMFILE`) before it makes
-//! anything. This crate does not depend on the compat libc (and wick-std
-//! depends on this crate only), so it reads the variable the same way here,
-//! once.
+//! anything. This crate reads the variable the same way, once.
 
 use std::ffi::OsStr;
 use std::io;

@@ -19,7 +19,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  4 files changed, 41 insertions(+), 1 deletion(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 461066c9f26930348a4c08f7944a56ac413bd48c..e2987d317f825629781d914a98f0e71aabc5c7ee 100644
+index fc80150e0de7c4f7bcecba9bbe40b6a187583b21..2e806b9c8c74539a08a6fd2f17c65b431653f8c0 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -1380,6 +1380,7 @@ dependencies = [

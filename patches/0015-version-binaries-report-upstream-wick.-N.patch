@@ -48,7 +48,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  13 files changed, 67 insertions(+), 9 deletions(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 4735be4c4ca8875b7a054e58f6d199e9c25058a4..186d0b2d85d7539f2dcf946c4709670b895bfa61 100644
+index 8fcbd32dd77e6c1cf4f30bba352747519be119fa..dc4cef5ed1582a3799f35ded2e46349e9fa8e354 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -671,6 +671,7 @@ dependencies = [
@@ -91,7 +91,7 @@ index 4735be4c4ca8875b7a054e58f6d199e9c25058a4..186d0b2d85d7539f2dcf946c4709670b
  ]
  
  [[package]]
-@@ -2073,6 +2078,13 @@ dependencies = [
+@@ -2074,6 +2079,13 @@ dependencies = [
   "wick-os",
  ]
  

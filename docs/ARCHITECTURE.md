@@ -239,13 +239,13 @@ semantics on Win32. The details are in the comments of each
   `O_NONBLOCK`, memfd seal sections) is keyed by the fd value. A duplicate of
   the handle and `CompareObjectHandles` check that the fd still names the same
   object (`dup` copies the state, `close` removes it); state of fds that std
-  closed is swept when the table grows. Not yet: a socket made non-blocking
-  through wick_os (`set_nonblocking`, `ioctlsocket`) is not `O_NONBLOCK` to
-  the libc, and `ioctl(FIONBIO)` is `ENOTTY`, where Linux's `FIONBIO` sets
-  `O_NONBLOCK` in the open file's flags (v6.1 fs/ioctl.c:341-361
-  `ioctl_fionbio`) and its std's `set_nonblocking` is that `ioctl`; tests
-  written before the fix: `test_fionbio_sets_and_clears_o_nonblocking`,
-  `test_a_socket_made_non_blocking_by_wick_os_is_o_nonblocking_to_the_libc`.
+  closed is swept when the table grows. `ioctl(FIONBIO)` and
+  `fcntl(F_SETFL)` set a socket's or pipe's wait mode and its `O_NONBLOCK`
+  together, as Linux's set the open file's `f_flags` (v6.1
+  fs/ioctl.c:341-361 `ioctl_fionbio`), and wick_os's `set_nonblocking` is
+  that `ioctl`, as Linux's std's is, so `F_GETFL` shows it
+  (`test_fionbio_sets_and_clears_o_nonblocking`,
+  `test_a_socket_made_non_blocking_by_wick_os_is_o_nonblocking_to_the_libc`).
 - **epoll = IOCP (the `polling` crate).** Sockets use AFD polls; eventfds,
   consoles and other waitable handles use wait packets that complete on the
   IOCP. Level-triggered is the default and `ONE_SHOT` is supported. Sockets
@@ -303,7 +303,8 @@ semantics on Win32. The details are in the comments of each
 - **Linux-only `libc`.** Windows has no Linux system calls, so `syscall` fails
   with `EINVAL` for `arch_prctl` (like a kernel without the XSTATE permission
   interface; WHP configures the partition) and `ENOSYS` otherwise. `ioctl` is
-  `ENOTTY` (Windows paths use `DeviceIoControl`); `fallocate` is implemented
+  `FIONBIO` (above) and `ENOTTY` for every other request (Windows paths use
+  `DeviceIoControl`); `fallocate` is implemented
   with sparse files and `FSCTL_SET_ZERO_DATA`, `lseek(SEEK_DATA/SEEK_HOLE)`
   with allocated ranges. Socket functions use Linux address families
   (`AF_INET6`=10), and `getsockopt(SO_DOMAIN)` and friends are built on

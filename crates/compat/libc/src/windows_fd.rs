@@ -694,11 +694,12 @@ fn before_call() {
 }
 
 /// Whether a call on `fd` may wait without end: not a regular file's
-/// (`FILE_TYPE_DISK`), and not `O_NONBLOCK` as this library knows it. A
-/// socket made non-blocking past this library (wick_os's `ioctlsocket`) is
-/// taken as blocking: its calls on mapped memory go through a buffer of
-/// their own, a copy more, and never hold a discard
-/// ([`crate::windows_mm::copying`]).
+/// (`FILE_TYPE_DISK`), and not `O_NONBLOCK` as this library knows it
+/// (`fcntl`, `ioctl(FIONBIO)`, `SOCK_NONBLOCK`, wick_os's `set_nonblocking`).
+/// A socket made non-blocking past this library (Rust std's own
+/// `TcpStream::set_nonblocking`, `ioctlsocket`) is taken as blocking: its
+/// calls on mapped memory go through a buffer of their own, a copy more,
+/// and never hold a discard ([`crate::windows_mm::copying`]).
 fn may_block(fd: c_int) -> bool {
     // SAFETY: plain call; a closed descriptor's call fails after.
     if !is_socket(fd) && unsafe { GetFileType(handle(fd)) } == FILE_TYPE_DISK {
@@ -710,8 +711,8 @@ fn may_block(fd: c_int) -> bool {
 /// Whether a read of `fd` returns at once, with what has arrived: bytes
 /// waiting on a socket (`FIONREAD`) or in a pipe (`PeekNamedPipe`). Such a
 /// read on mapped memory is counted in flight ([`read`]) rather than made
-/// through a copy: vsock's reads, on sockets made non-blocking through
-/// wick_os ([`may_block`]), come when its event loop finds them readable.
+/// through a copy, as an event loop's read of a descriptor it found
+/// readable is, whatever its mode ([`may_block`]).
 /// A second reader of the same descriptor taking the bytes first leaves
 /// this read waiting, and a discard of its buffer with it, until more come.
 fn has_data(fd: c_int) -> bool {
@@ -1549,6 +1550,11 @@ pub unsafe fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
     newfd
 }
 
+/// Whether `fd` names an open handle.
+pub(crate) fn is_open(fd: c_int) -> bool {
+    inherits(fd).is_some()
+}
+
 fn inherits(fd: c_int) -> Option<bool> {
     let mut flags = 0u32;
     // SAFETY: plain call.
@@ -1556,6 +1562,50 @@ fn inherits(fd: c_int) -> Option<bool> {
         return None;
     }
     Some(flags & HANDLE_FLAG_INHERIT != 0)
+}
+
+/// Sets or clears `O_NONBLOCK` on `fd`: the wait mode of a socket
+/// (`FIONBIO`) or a pipe end (`PIPE_NOWAIT`), and the flag `F_GETFL` reads,
+/// as Linux's `fcntl(F_SETFL)` and `ioctl(FIONBIO)` set the open file's
+/// `f_flags` (v6.1 fs/fcntl.c `setfl`, fs/ioctl.c:341-361 `ioctl_fionbio`).
+pub(crate) fn set_nonblocking(fd: c_int, nonblock: bool) -> c_int {
+    if is_socket(fd) {
+        let mut on = u32::from(nonblock);
+        // SAFETY: `FIONBIO` takes a `u32`.
+        if unsafe { ioctlsocket(socket(fd), FIONBIO, &mut on) } != 0 {
+            wsa_errno();
+            return -1;
+        }
+    } else {
+        // SAFETY: plain call.
+        if unsafe { GetFileType(handle(fd)) } == FILE_TYPE_PIPE {
+            // The wait mode belongs to the pipe end, so duplicates
+            // and inherited copies of the handle share it, as
+            // Linux's O_NONBLOCK is the open file description's
+            // (test_pipe_wait_mode_is_shared_by_duplicated_handles,
+            // test_pipe_wait_mode_is_shared_with_a_child_process).
+            let mode = PIPE_READMODE_BYTE | if nonblock { PIPE_NOWAIT } else { PIPE_WAIT };
+            // SAFETY: changes the mode of the caller's pipe handle.
+            if unsafe {
+                SetNamedPipeHandleState(
+                    handle(fd),
+                    &mode,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                return raw_failed();
+            }
+        }
+    }
+    let flags = wick_fd::flags(fd);
+    if nonblock {
+        flags.fetch_or(O_NONBLOCK, Ordering::Relaxed);
+    } else {
+        flags.fetch_and(!O_NONBLOCK, Ordering::Relaxed);
+    }
+    0
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -1595,48 +1645,7 @@ fn fcntl_impl(fd: c_int, cmd: c_int, arg: usize) -> c_int {
             }
             O_RDWR | wick_fd::flags(fd).load(Ordering::Relaxed)
         }
-        F_SETFL => {
-            let nonblock = arg & O_NONBLOCK != 0;
-            if is_socket(fd) {
-                let mut on = u32::from(nonblock);
-                // SAFETY: `FIONBIO` takes a `u32`.
-                if unsafe { ioctlsocket(socket(fd), FIONBIO, &mut on) } != 0 {
-                    wsa_errno();
-                    return -1;
-                }
-            } else {
-                // SAFETY: plain call.
-                if unsafe { GetFileType(handle(fd)) } == FILE_TYPE_PIPE {
-                    // The wait mode belongs to the pipe end, so duplicates
-                    // and inherited copies of the handle share it, as
-                    // Linux's O_NONBLOCK is the open file description's
-                    // (test_pipe_wait_mode_is_shared_by_duplicated_handles,
-                    // test_pipe_wait_mode_is_shared_with_a_child_process).
-                    let mode = PIPE_READMODE_BYTE | if nonblock { PIPE_NOWAIT } else { PIPE_WAIT };
-                    // SAFETY: changes the mode of the caller's pipe handle.
-                    if unsafe {
-                        SetNamedPipeHandleState(
-                            handle(fd),
-                            &mode,
-                            std::ptr::null(),
-                            std::ptr::null(),
-                        )
-                    } == 0
-                    {
-                        return raw_failed();
-                    }
-                }
-            }
-            let flags = wick_fd::flags(fd);
-            let mut v = flags.load(Ordering::Relaxed);
-            v = if nonblock {
-                v | O_NONBLOCK
-            } else {
-                v & !O_NONBLOCK
-            };
-            flags.store(v, Ordering::Relaxed);
-            0
-        }
+        F_SETFL => set_nonblocking(fd, arg & O_NONBLOCK != 0),
         F_DUPFD | F_DUPFD_CLOEXEC => dup_inherit(fd, cmd == F_DUPFD),
         _ => {
             set_errno(crate::EINVAL);
@@ -2005,7 +2014,6 @@ mod tests {
     /// it, on a pipe and on a socket, and the descriptor's calls stop
     /// waiting: a read of the empty pipe fails with `EAGAIN`.
     #[test]
-    #[ignore = "written before ioctl(FIONBIO), which it tests; fails until it lands"]
     fn test_fionbio_sets_and_clears_o_nonblocking() {
         let mut fds = [0 as c_int; 2];
         // SAFETY: two descriptors' room.
