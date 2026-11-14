@@ -6152,21 +6152,21 @@ mod fpu_tests {
     /// page holds an x2APIC-mode vCPU's ID as it is (X2E0REC c, CI run
     /// 43521200989: vCPU 1's read `0x1000000` in xAPIC mode and `0x1` once
     /// EXTD was set), so reading it in the xAPIC format (`>> 24`) sent
-    /// vCPU 1's interrupt to APIC 0. On an x2APIC partition, vCPU 1 in each
-    /// mode in turn, a deadline already reached raises the LVT timer's
-    /// vector, a different one each time: it is pending in vCPU 1's IRR and
-    /// not in vCPU 0's.
+    /// vCPU 1's interrupt to APIC 0. On an x2APIC partition, a VM for each
+    /// mode of vCPU 1, both vCPUs halted with interrupts on: a deadline
+    /// already reached on vCPU 1 raises the LVT timer's vector, which vCPU
+    /// 1 takes (its gate's `out 0x82` of the vector) and vCPU 0 does not
+    /// (its run is kicked after 5 s). Seen by the guest taking it, as WHP
+    /// shows no requested interrupt in the IRR of its page, before or after
+    /// a run (X2APICREC's "requested" lines; CI run 43528910212 read
+    /// neither vCPU's IRR set here).
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_a_deadline_interrupt_goes_to_its_own_vcpu_in_x2apic_mode() {
         use super::super::ffi;
-        super::super::vm::APIC_MODE_FOR_TESTS.set(Some(whv::WHvX64LocalApicEmulationModeX2Apic));
-        let made = super::super::VmFd::create();
-        super::super::vm::APIC_MODE_FOR_TESTS.set(None);
-        let vm = made.unwrap();
-        let zero = vm.create_vcpu(0).unwrap();
-        let one = vm.create_vcpu(1).unwrap();
-        let put = |l: &mut kvm_lapic_state, at: usize, v: u32| {
+        // Each vector's gate: `mov al, vector; out 0x82, al; jmp $`.
+        const GATE: u64 = 0xB900;
+        let set = |l: &mut kvm_lapic_state, at: usize, v: u32| {
             for (i, b) in v.to_le_bytes().into_iter().enumerate() {
                 l.regs[at + i] = b as std::os::raw::c_char;
             }
@@ -6175,30 +6175,54 @@ mod fpu_tests {
         // the page shows TSC-deadline mode, at `vector`.
         let enable = |v: &VcpuFd, vector: Option<u32>| {
             let mut l = v.get_lapic().unwrap();
-            put(&mut l, 0xf0, 0x1ff);
+            set(&mut l, 0xf0, 0x1ff);
             if let Some(vector) = vector {
-                put(&mut l, 0x320, vector);
-                put(&mut l, 0x380, 0);
+                set(&mut l, 0x320, vector);
+                set(&mut l, 0x380, 0);
             }
             v.set_lapic(&l).unwrap();
         };
-        let pending = |v: &VcpuFd, vector: u32| {
-            let (p, _) = v.lapic_page().unwrap();
-            let at = 0x200 + 0x10 * (vector as usize / 32);
-            u32::from_le_bytes(p[at..at + 4].try_into().unwrap()) & (1 << (vector % 32)) != 0
-        };
-        enable(&zero, None);
-        for (x2apic, vector) in [(false, 0xec), (true, 0xed)] {
+        for (x2apic, vector) in [(false, 0xecu32), (true, 0xed)] {
+            // sti; hlt; jmp to the hlt
+            super::super::vm::APIC_MODE_FOR_TESTS.set(Some(whv::WHvX64LocalApicEmulationModeX2Apic));
+            let (vm, mut zero, m) = mmio_guest(&[0xFB, 0xF4, 0xEB, 0xFD]);
+            super::super::vm::APIC_MODE_FOR_TESTS.set(None);
+            let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
+            #[allow(clippy::cast_possible_truncation)]
+            put(m, GATE, &[0xB0, vector as u8, 0xE6, 0x82, 0xEB, 0xFE]);
+            q(MMIO_IDT + u64::from(vector) * 16, (GATE & 0xffff) | (8 << 16) | (0x8E << 40));
+            q(MMIO_IDT + u64::from(vector) * 16 + 8, 0);
+            let mut one = vm.create_vcpu(1).unwrap();
+            // vCPU 0's state (long mode, the IDT) before EXTD: KVM_SET_SREGS
+            // writes APIC_BASE.
+            one.set_sregs(&zero.get_sregs().unwrap()).unwrap();
+            one.set_regs(&kvm_regs { rip: MMIO_PROGRAM, rsp: 0x8800, rflags: 2, ..Default::default() }).unwrap();
             if x2apic {
                 ffi::set_register(one.part(), one.vp(), whv::WHvX64RegisterApicBase, ffi::reg64(0xFEE0_0C00)).unwrap();
             }
+            enable(&zero, None);
             enable(&one, Some(vector));
             one.write_tsc_deadline(1).unwrap();
-            let (to_zero, to_one) = (pending(&zero, vector), pending(&one, vector));
+            let mut reads = 0;
+            let watchdog = super::Watchdog::arm(&one);
+            let by_one = one_run(&mut one, &[], &mut reads);
+            drop(watchdog);
+            one.set_kvm_immediate_exit(0);
+            let watchdog = super::Watchdog::arm(&zero);
+            let by_zero = one_run(&mut zero, &[], &mut reads);
+            drop(watchdog);
+            zero.set_kvm_immediate_exit(0);
+            let taken = format!("out 0x82 [{vector:02x}]");
+            eprintln!("DEADLINEID x2APIC mode {x2apic}: vector {vector:#x}: vCPU 1's run {by_one}; vCPU 0's run {by_zero}");
             assert!(
-                to_one && !to_zero,
-                "x2APIC mode {x2apic}: vector {vector:#x} pending in vCPU 0's IRR: {to_zero}, in vCPU 1's: {to_one}"
+                by_one == taken && by_zero != taken,
+                "x2APIC mode {x2apic}: vector {vector:#x}: vCPU 1's run {by_one}, vCPU 0's run {by_zero}"
             );
+            drop(one);
+            drop(zero);
+            drop(vm);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
         }
     }
 
