@@ -28,9 +28,11 @@
 //! the LVT timer's TSC-deadline mode, which WHP refuses with #GP and the
 //! backend takes from the #GP exit (`gp`; option E of the x2APIC plan,
 //! measured on AMD hosts only: CI's EPYC runners and a PC's Ryzen 9 7900,
-//! X2E0REC and GPEXITREC), and refuses for now: the one way WHP keeps that
-//! mode, the APIC register page's get and set, loses an interrupt
-//! requested between them (X2RMWREC, PC step 15a at 305a806). The supported CPUID offers x2APIC there, whatever the host
+//! X2E0REC and GPEXITREC) through the one way WHP keeps that mode, the
+//! APIC register page's get and set, which loses an interrupt requested
+//! between them (X2RMWREC, PC step 15a at 305a806), so the backend makes
+//! it with every requester held off (option E-ii,
+//! `VcpuFd::write_x2apic_lvtt`). The supported CPUID offers x2APIC there, whatever the host
 //! has, and `KVM_SET_CPUID2` takes a table with or without it. On any
 //! other host (Intel, Hygon) the partition stays an xAPIC until a run
 //! there measures option E: the supported CPUID never offers x2APIC and a

@@ -181,6 +181,17 @@ pub(crate) struct VmInner {
     /// guest: a vCPU's index (its #BP window), [`OWNER_ALL`] (a change of
     /// gdb's), -1 nobody. Read by every entry.
     pub(crate) bp_owner: AtomicI64,
+    /// Held (read) by every host-side interrupt request
+    /// ([`VmInner::request_interrupt`], the one `WHvRequestInterrupt` call:
+    /// irqfds, the MSI hook, the I/O APIC, the PIT, the TSC-deadline
+    /// timers, INIT and SIPI, NMIs), and (write) by a guest's held LVT
+    /// timer write (`VcpuFd::write_x2apic_lvtt`), between the APIC page's
+    /// get and set, so that no request lands between them and is lost
+    /// (X2RMWREC): one made meanwhile waits and lands after the set. Taken
+    /// after the exception exits' ownership ([`VmInner::with_time_stopped`]),
+    /// and a reader holds nothing else and waits on nothing, so it is in no
+    /// lock-order cycle.
+    pub(crate) requests: RwLock<()>,
 }
 
 /// The partition's exception exits (`ExceptionExitBitmap`), which are
@@ -424,9 +435,14 @@ impl VmInner {
         self.wake_halted();
     }
 
-    /// `WHvRequestInterrupt` of an MSI address/data pair; its HRESULT.
+    /// `WHvRequestInterrupt` of an MSI address/data pair; its HRESULT. Under
+    /// the request lock ([`VmInner::requests`], read), so that it waits for
+    /// a held LVT timer write's page set.
     pub(crate) fn request_interrupt(&self, address: u64, data: u32) -> i32 {
         let control = super::irqchip::interrupt_control(address, data);
+        // A poisoned lock guards no data (`()`): its holder panicked between
+        // a page's get and set, and the vCPU failed with it.
+        let _held = self.requests.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(any(test, feature = "whp-trace"))]
         let before = ffi::trace::stack();
         // SAFETY: a valid interrupt control of its size.
@@ -499,7 +515,7 @@ impl VmInner {
         super::vcpu::hold_vcpus(self, None);
         // SAFETY: the VM's partition.
         let hres = unsafe { whv::WHvSuspendPartitionTime(self.part) };
-        let result = ffi::hr_of("WHvSuspendPartitionTime", hres, || "for a guest's write of its TSC".into()).and_then(|()| {
+        let result = ffi::hr_of("WHvSuspendPartitionTime", hres, || "to hold the VM's vCPUs (a guest's TSC or LVT timer write)".into()).and_then(|()| {
             let done = f();
             // SAFETY: the VM's partition, whose time this call suspended.
             let hres = unsafe { whv::WHvResumePartitionTime(self.part) };
@@ -695,21 +711,22 @@ fn make_partition() -> Result<(WHV_PARTITION_HANDLE, super::apicmode::LocalApic)
 }
 
 /// Whether the partitions are made as [`measured_local_apic`] says (an
-/// x2APIC on AMD hosts): not yet. An x2APIC partition has no TSC-deadline
-/// timer: WHP's register refuses the LVT timer entry in that mode
-/// (X2E0REC c), and the APIC register page's get and set, the one other
-/// way, lose an interrupt an irqfd, the MSI hook or another vCPU requests
-/// between the two (X2RMWREC, PC step 15a at 305a806, a Ryzen 9 7900),
-/// which would hang the guest; so `VcpuFd::write_x2apic_lvtt` sets no page
-/// and refuses the write (`ENOTSUP`, the vCPU fails, named), and a Linux
-/// guest, which uses the TSC-deadline timer when its CPUID has it, would
-/// fail at boot here. Until option E has a TSC-deadline timer that loses
-/// no interrupt (a partition whose processor features offer one, or the
-/// page's get and set with every requester held off: not done yet), every
-/// host's partitions stay xAPICs and the guest is not offered x2APIC, as
-/// before option E; the x2APIC code runs only in the tests that ask for it
-/// on their thread (`X2APIC_PARTITION_FOR_TESTS`). No switch turns it on:
-/// this line does, with the records named.
+/// x2APIC on AMD hosts): not yet. An x2APIC partition's TSC-deadline timer
+/// is the backend's held page write (option E-ii,
+/// `VcpuFd::write_x2apic_lvtt`): WHP's register refuses the LVT timer entry
+/// in that mode (X2E0REC c), and the APIC register page's get and set, the
+/// one other way, lose an interrupt an irqfd, the MSI hook or another vCPU
+/// requests between the two (X2RMWREC, PC step 15a at 305a806, a Ryzen 9
+/// 7900), so the write holds the VM's other vCPUs, its time and its
+/// interrupt requests (`VmInner::requests`) around the page's get and set.
+/// That is not yet run on Windows (`test_a_held_lvt_timer_write_loses_no_interrupt`,
+/// `test_the_x2apic_lvt_timer_in_tsc_deadline_mode_is_taken`,
+/// `test_a_page_set_loses_interrupts_and_the_held_lvt_timer_write_none`),
+/// nor a Linux guest booted on it (`boot-test.ps1 smp` and the snapshot
+/// stages), so every host's partitions stay xAPICs and the guest is not
+/// offered x2APIC, as before option E; the x2APIC code runs only in the
+/// tests that ask for it on their thread (`X2APIC_PARTITION_FOR_TESTS`).
+/// No switch turns it on: this line does, with the records named.
 const X2APIC_PARTITIONS: bool = false;
 
 /// The local APIC this host's partitions emulate: an xAPIC
@@ -1013,6 +1030,7 @@ impl VmInner {
             populate_failure: AtomicI32::new(0),
             bp_window: (Mutex::new(Exits { base, written: (base != 0).then_some(base), ..Exits::default() }), Condvar::new()),
             bp_owner: AtomicI64::new(-1),
+            requests: RwLock::new(()),
         })
     }
 }

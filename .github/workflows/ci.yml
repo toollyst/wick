@@ -1172,20 +1172,28 @@ jobs:
           # is refused (DEADLINEOFF line).
           alone whp::vcpu::fpu_tests::test_a_deadline_written_with_the_apic_software_disabled_is_taken
           # The x2APIC partition (AMD): the guest's TSC-deadline LVT timer
-          # write refused (the vCPU fails, no APIC page set), masked too;
-          # outside x2APIC mode a #GP, merged into a #DF and a triple
-          # fault; and a KVM local APIC state in x2APIC mode.
-          alone whp::vcpu::fpu_tests::test_the_x2apic_lvt_timer_in_tsc_deadline_mode_is_refused
+          # write taken by one held APIC page set, its deadline's interrupt
+          # coming, masked kept with none; outside x2APIC mode a #GP,
+          # merged into a #DF and a triple fault; and a KVM local APIC
+          # state in x2APIC mode.
+          alone whp::vcpu::fpu_tests::test_the_x2apic_lvt_timer_in_tsc_deadline_mode_is_taken
           alone whp::vcpu::fpu_tests::test_a_kvm_lapic_state_in_x2apic_mode_restores
           # Option E-ii's audit: no PMU, SynIC or synthetic timers on a
           # partition as the backend makes it, xAPIC and x2APIC (X2HOLDREC).
           alone whp::vcpu::fpu_tests::test_a_partition_has_no_pmu_or_synthetic_interrupts_on_record
           # The APIC page's get and set against interrupts requested
           # meanwhile: an MSI and an IPI between them lost (PC step 15a at
-          # 305a806), the reason the run loop never sets the page; and the
-          # LVT timer write refused with no page set (X2RMWREC lines).
-          alone whp::vcpu::fpu_tests::test_a_page_set_loses_interrupts_and_the_lvt_timer_write_makes_none
-          alone whp::vcpu::fpu_tests::test_a_page_set_loses_interrupts_and_the_lvt_timer_write_makes_none --release
+          # 305a806), the reason the run loop sets the page only held; and
+          # the held LVT timer write, one page set a write, losing none
+          # (X2RMWREC lines).
+          alone whp::vcpu::fpu_tests::test_a_page_set_loses_interrupts_and_the_held_lvt_timer_write_none
+          alone whp::vcpu::fpu_tests::test_a_page_set_loses_interrupts_and_the_held_lvt_timer_write_none --release
+          # Option E-ii: the held LVT timer write against an MSI inside its
+          # window, vCPU 1's IPIs, its own expired timer and 2000 MSIs from
+          # another thread, every interrupt taken; and its cost with 0, 1
+          # and 15 other vCPUs (X2HOLD and X2HOLDREC lines).
+          alone whp::vcpu::fpu_tests::test_a_held_lvt_timer_write_loses_no_interrupt
+          alone whp::vcpu::fpu_tests::test_a_held_lvt_timer_write_loses_no_interrupt --release
           # A 2 MiB chunk of userfaultfd guest RAM swapped (discarded
           # whole) under a vCPU's scan and a host writer, 100 rounds
           # (SWAPSTRESS lines).
