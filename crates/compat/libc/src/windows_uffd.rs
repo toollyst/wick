@@ -352,10 +352,25 @@ pub fn wake(start: u64, len: u64) {
     }
 }
 
+/// Called first in [`on_exception`] at an access violation, for tests: it
+/// holds the handler between the fault and its checks
+/// (`test_a_host_access_that_faulted_before_its_fill_runs_again`). An
+/// `fn()` as a `usize`, 0 for none.
+#[cfg(test)]
+static EXCEPTION_HOOK: AtomicUsize = AtomicUsize::new(0);
+
 unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
     let rec = unsafe { &*(*info).ExceptionRecord };
     if rec.ExceptionCode == ACCESS_VIOLATION && rec.NumberParameters >= 2 {
+        #[cfg(test)]
+        {
+            let hook = EXCEPTION_HOOK.load(Ordering::SeqCst);
+            if hook != 0 {
+                // SAFETY: only `fn()` values are stored.
+                unsafe { core::mem::transmute::<usize, fn()>(hook)() };
+            }
+        }
         // [0]: 0 read, 1 write, 8 execute; [1]: the address.
         let addr = rec.ExceptionInformation[1] as u64;
         if is_missing(addr) && fault(addr, rec.ExceptionInformation[0] == 1) {
@@ -1707,6 +1722,116 @@ mod tests {
         assert_eq!(register(ctx, mem, 64 * 1024).unwrap_err().raw_os_error(), Some(crate::EBUSY));
         assert_eq!(wake_range(ctx, mem + 64 * 1024, PAGE), Err(crate::ENOENT));
         // SAFETY: as above.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// Runs the child test `child` (this module's, `#[ignore]`d) in a
+    /// process of its own, in a job that may commit `limit` bytes if one is
+    /// given (set before the child registers anything: it sleeps 300 ms
+    /// first): its exit status and output.
+    fn run_child(child: &str, limit: Option<usize>) -> (Option<i32>, std::string::String) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        let name = std::format!("{}::{child}", module_path!().split_once("::").unwrap().1);
+        let process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name.as_str(), "--ignored", "--nocapture"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut job = ptr::null_mut();
+        if let Some(limit) = limit {
+            // SAFETY: a new unnamed job.
+            job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+            assert!(!job.is_null());
+            // SAFETY: plain data.
+            let mut l: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            l.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+            l.JobMemoryLimit = limit;
+            // SAFETY: a structure of the size passed; the child's handle.
+            unsafe {
+                #[allow(clippy::cast_possible_truncation)]
+                let size = std::mem::size_of_val(&l) as u32;
+                assert_ne!(SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const l).cast(), size), 0);
+                use std::os::windows::io::AsRawHandle;
+                assert_ne!(AssignProcessToJobObject(job, process.as_raw_handle()), 0, "{}", io::Error::last_os_error());
+            }
+        }
+        let out = process.wait_with_output().unwrap();
+        if !job.is_null() {
+            // SAFETY: our job handle.
+            unsafe { CloseHandle(job) };
+        }
+        let text = std::format!("{}{}", std::string::String::from_utf8_lossy(&out.stdout), std::string::String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("running 1 test"), "the child {name} ran no test (status {}): {text}", out.status);
+        (out.status.code(), text)
+    }
+
+    /// Set by the hook of the test below and its thread.
+    static HELD: AtomicBool = AtomicBool::new(false);
+    static RELEASED: AtomicBool = AtomicBool::new(false);
+
+    /// Waits, for up to 20 s, until `flag` is set.
+    fn wait_for(flag: &AtomicBool, what: &str) {
+        let t = std::time::Instant::now();
+        while !flag.load(Ordering::SeqCst) {
+            assert!(t.elapsed() < std::time::Duration::from_secs(20), "{what} did not happen");
+            std::thread::yield_now();
+        }
+    }
+
+    /// [`EXCEPTION_HOOK`]'s: says the handler is held and holds it until
+    /// the test releases it.
+    fn hold_the_handler() {
+        HELD.store(true, Ordering::SeqCst);
+        wait_for(&RELEASED, "the release of the handler");
+    }
+
+    /// A host thread's access that faulted on a missing page whose fill
+    /// ends before the exception handler looks at the page (the thread
+    /// preempted between the fault and the handler, or the handler slow):
+    /// the access runs again and reads the fill, as Linux's fault, which
+    /// finds the page present, returns and the access runs again. Before
+    /// the fix the handler, finding the page not missing, passed the
+    /// exception on and the process ended with an access violation. In a
+    /// process of its own (the hook holds every access violation's
+    /// handler).
+    #[test]
+    #[ignore = "fails until the handler runs such an access again (the next commit)"]
+    fn test_a_host_access_that_faulted_before_its_fill_runs_again() {
+        let (code, text) = run_child("late_handler_fill_child", None);
+        assert!(text.contains("read back 0xab"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_host_access_that_faulted_before_its_fill_runs_again in a process of its own"]
+    fn late_handler_fill_child() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 64 * 1024;
+        let mem = map(len);
+        register(ctx, mem, len as u64).unwrap();
+        assert!(is_missing(mem + PAGE));
+        EXCEPTION_HOOK.store(hold_the_handler as fn() as usize, Ordering::SeqCst);
+        let reader = std::thread::spawn(move || {
+            // SAFETY: registered memory; the read faults, and its handler
+            // is held until the page is filled.
+            unsafe { core::ptr::read_volatile((mem + PAGE + 5) as *const u8) }
+        });
+        wait_for(&HELD, "the reader's fault");
+        let data = std::vec![0xabu8; PAGE as usize];
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem + PAGE, PAGE, true) }.unwrap(), PAGE);
+        assert!(!is_missing(mem + PAGE));
+        RELEASED.store(true, Ordering::SeqCst);
+        let got = reader.join().expect("the reader failed");
+        EXCEPTION_HOOK.store(0, Ordering::SeqCst);
+        std::println!("read back {got:#x}");
+        assert_eq!(got, 0xab);
+        // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
 }
