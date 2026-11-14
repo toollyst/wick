@@ -284,7 +284,9 @@ upstream Firecracker and its jailer.
   and its charge with it, so that what the jail is charged is never less than the host commit it holds
   (`test_registered_memory_is_charged_as_it_is_filled`; not yet run on Windows); the cost is the memory.max row's
   difference (such pages counted on top of live memory until their chunk goes), which reclaim at the limit is to
-  close.
+  close. A page discarded while a system call copies it (a guest that balloons a buffer a device is still using) fails
+  that call, where Linux's copy faults the page in again: the device fails that one request (the `mem_backend: Uffd`
+  row). What fails is the guest's own request in its own VMM; the host and other VMs are not reached.
 
   Sections made around wick (a compromised Firecracker's) are counted by the jailer
   (overlay/jailer/platform/windows/commit.rs): every 1 ms, over the job's processes, private commit plus section
