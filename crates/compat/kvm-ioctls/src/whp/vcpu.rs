@@ -6091,7 +6091,13 @@ mod fpu_tests {
     /// each write, with a `whp:` line. Each case a VM of its own with the
     /// supported CPUID: the instructions, then the last RDMSR's EDX:EAX
     /// stored at 0x7100 and `out 0x80`; a #GP is the guest's fault line for
-    /// vector 13. The AMD rows only on an AMD host. Printed (MSRTEST lines).
+    /// vector 13. The AMD rows only on an AMD host. Printed (MSRTEST lines),
+    /// with the MSR exits the backend answered: an access WHP answers
+    /// itself, with no exit, is WHP's, which no table here changes: those
+    /// the Guest MSRs row states as WHP's are held to WHP's answer
+    /// (VM_HSAVE_PA, whose RDMSR and WRMSR WHP gives #GP(0) on CI's EPYC
+    /// 9V74, CI run 43635691697; VIRT_SPEC_CTRL, #GP(0) as KVM's), every
+    /// other to KVM's, whoever answered.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_the_msrs_a_guest_reaches_are_answered_as_kvm() {
@@ -6110,6 +6116,15 @@ mod fpu_tests {
         };
         let host_osvw = core::arch::x86_64::__cpuid(0x8000_0001).ecx >> 9 & 1 == 1;
         let both = |a: Vec<u8>, b: Vec<u8>| [a, b].concat();
+        // The MSRs WHP answers itself (no exit) and its answer, stated in
+        // the Guest MSRs row.
+        let whps = |name: &str| -> Option<Want> {
+            if name.starts_with("RDMSR VM_HSAVE_PA") || name.starts_with("WRMSR VM_HSAVE_PA") || name.starts_with("RDMSR VIRT_SPEC_CTRL") {
+                Some(Want::Gp)
+            } else {
+                None
+            }
+        };
         let mut cases: Vec<(&str, Vec<u8>, Want)> = vec![
             ("RDMSR PLATFORM_INFO (0xce): no CPUID_FAULT", rd(0xce), Want::Value(0)),
             ("WRMSR PLATFORM_INFO (0xce)", wr(0xce, 0), Want::Gp),
@@ -6159,9 +6174,11 @@ mod fpu_tests {
             let watchdog = super::Watchdog::arm(&vcpu);
             let mut reads = 0;
             let mut exits = Vec::new();
+            let before = MSR_INTERCEPTS.with(std::cell::Cell::get);
             while exits.len() < 8 && !exits.last().is_some_and(|e: &String| e.starts_with("out") || e.starts_with("fault") || e.contains("fail") || e == "EINTR") {
                 exits.push(one_run(&mut vcpu, &[], &mut reads));
             }
+            let came = MSR_INTERCEPTS.with(std::cell::Cell::get) - before;
             drop(watchdog);
             vcpu.set_kvm_immediate_exit(0);
             let got = match exits.last() {
@@ -6169,9 +6186,22 @@ mod fpu_tests {
                 Some(e) if e.starts_with("out") => Some(Want::Value(u64::from_le_bytes(bytes_at::<8>(m, 0x7100)))),
                 _ => None,
             };
-            eprintln!("MSRTEST {name}: {got:x?} (KVM: {want:x?}); exits {exits:?}");
-            if got.as_ref() != Some(&want) {
-                wrong.push(format!("{name}: {got:x?}, KVM {want:x?}"));
+            // The case's MSR accesses: one each, two where it reads back.
+            let accesses = 1 + u64::from(name.ends_with(", RDMSR"));
+            eprintln!("MSRTEST {name}: {got:x?} (KVM: {want:x?}); MSR exits at the backend {came} of {accesses}; exits {exits:?}");
+            match whps(name) {
+                // WHP's own, stated: its answer, and no exit.
+                Some(whp) if came == 0 => {
+                    if got.as_ref() != Some(&whp) {
+                        wrong.push(format!("{name}: WHP's own (no exit), {got:x?}, where the Guest MSRs row states {whp:x?}"));
+                    }
+                }
+                // Answered by WHP or the backend: KVM's answer either way.
+                _ if got.as_ref() != Some(&want) => {
+                    let who = if came < accesses { "WHP answered (unstated)" } else { "the backend answered" };
+                    wrong.push(format!("{name}: {got:x?}, KVM {want:x?}; {who}"));
+                }
+                _ => {}
             }
             drop(vcpu);
             drop(vm);
@@ -6194,7 +6224,14 @@ mod fpu_tests {
     /// for an MSR the snapshot lacks; and the call ends, as KVM's, at a
     /// value KVM refuses (POLL_CONTROL 2) and at one the backend cannot
     /// have (PLATFORM_INFO with CPUID_FAULT, STEAL_TIME enabled), each
-    /// named on standard error.
+    /// named on standard error. The VM's memory is mapped first, as a
+    /// restore's is before its vCPUs' state is set: KVM's `KVM_SET_MSRS` of
+    /// PV_EOI_EN enabled ends the call where its page is in no memory slot
+    /// (v6.1 lapic.c `kvm_lapic_set_pv_eoi`: `kvm_gfn_to_hva_cache_init`,
+    /// -EFAULT), as the backend's does (`kvmmsr`'s check); without it the
+    /// call ended there, at 6 of 9 (CI run 43635691697). Each call's count,
+    /// where it stopped, and each value read are printed (MSRKEEP lines)
+    /// before they are asserted.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_the_msrs_kvm_keeps_restore_as_kvm() {
@@ -6208,6 +6245,16 @@ mod fpu_tests {
         }
         assert!(!listed.contains(&0x4b56_4d03), "STEAL_TIME listed");
         let vm = super::super::VmFd::create().unwrap();
+        let mem = guest();
+        let region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: MEM as u64,
+            userspace_addr: mem as u64,
+        };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe { vm.set_user_memory_region(region) }.unwrap();
         let zero = vm.create_vcpu(0).unwrap();
         let one = vm.create_vcpu(1).unwrap();
         zero.set_cpuid2(&cpuid_with_tsc_deadline()).unwrap();
@@ -6218,8 +6265,17 @@ mod fpu_tests {
         let read = |v: &VcpuFd, indices: &[u32]| {
             let mut m = entries(&indices.iter().map(|&i| (i, 0)).collect::<Vec<_>>());
             let n = v.get_msrs(&mut m).unwrap();
+            let got: Vec<(u32, u64)> = m.as_slice()[..n.min(indices.len())].iter().map(|e| (e.index, e.data)).collect();
+            eprintln!("MSRKEEP vCPU {}'s KVM_GET_MSRS of {indices:x?}: {n} read, {got:x?}", v.vp());
             assert_eq!(n, indices.len(), "KVM_GET_MSRS of {indices:x?} ended at {n}");
             m.as_slice().iter().map(|e| e.data).collect::<Vec<_>>()
+        };
+        // KVM_SET_MSRS of `pairs`: the entries taken, printed with the one
+        // it stopped at.
+        let set = |v: &VcpuFd, pairs: &[(u32, u64)]| {
+            let n = v.set_msrs(&entries(pairs)).unwrap();
+            eprintln!("MSRKEEP vCPU {}'s KVM_SET_MSRS of {pairs:x?}: {n} taken, stopped at {:x?}", v.vp(), pairs.get(n));
+            n
         };
         // At creation: KVM's, but PLATFORM_INFO's CPUID_FAULT.
         let fresh = read(&zero, &[0x9e, 0x4b56_4d05, 0xce, 0x140, 0x34, 0x1fc, 0x4b56_4d02]);
@@ -6229,21 +6285,21 @@ mod fpu_tests {
         }
         // A snapshot's restore: written, read back; vCPU 1 has its own.
         let saved = [(0x34, 3), (0x9e, 0xa_0000), (0xce, 0), (0x140, 0), (0x1fc, 0x55), (0x4b56_4d02, 0x7001), (0x4b56_4d04, 0x7201), (0x4b56_4d06, 0xf3), (0x4b56_4d05, 0)];
-        let m = entries(&saved);
-        assert_eq!(zero.set_msrs(&m).unwrap(), saved.len());
+        assert_eq!(set(&zero, &saved), saved.len(), "the restore's KVM_SET_MSRS");
         let indices: Vec<u32> = saved.iter().map(|&(i, _)| i).collect();
         assert_eq!(read(&zero, &indices), saved.iter().map(|&(_, d)| d).collect::<Vec<_>>(), "restored");
         assert_eq!(read(&one, &[0x34, 0x9e, 0x4b56_4d05]), [0, 0x3_0000, 1], "vCPU 1's own");
         // A snapshot made before these were kept: none of them in it.
-        let before = entries(&[(0x174, 0x10), (0x1a0, 1)]);
-        assert_eq!(one.set_msrs(&before).unwrap(), 2);
+        assert_eq!(set(&one, &[(0x174, 0x10), (0x1a0, 1)]), 2, "a restore without them");
         assert_eq!(read(&one, &[0x9e, 0x4b56_4d05, 0xce]), [0x3_0000, 1, 0], "KVM's values left");
         // Refused: as KVM, and where the backend cannot have the value.
         for (index, data) in [(0x4b56_4d05, 2), (0xce, 1 << 31), (0x4b56_4d03, 0x7001)] {
-            let m = entries(&[(0x1fc, 0x66), (index, data)]);
-            assert_eq!(one.set_msrs(&m).unwrap(), 1, "{index:#x} of {data:#x} was taken");
+            assert_eq!(set(&one, &[(0x1fc, 0x66), (index, data)]), 1, "{index:#x} of {data:#x} was taken");
         }
-        assert_eq!(one.set_msrs(&entries(&[(0x4b56_4d03, 0x7000)])).unwrap(), 1, "STEAL_TIME off is taken");
+        assert_eq!(set(&one, &[(0x4b56_4d03, 0x7000)]), 1, "STEAL_TIME off is taken");
+        drop((zero, one, vm));
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(mem.cast(), MEM) }, 0);
     }
 
     /// A local APIC state in KVM's x2APIC-mode format restores and reads
@@ -11617,10 +11673,18 @@ mod fpu_tests {
             // The guest's: PLATFORM_INFO read (guest_can_read_msr_platform_info
             // is true by default, x86.c:12406) and its write #GP
             // (x86.c:3832-3836); UCODE_REV read and its write dropped
-            // (x86.c:3560-3563). Each the value the host set, 0.
-            if matches!(index, 0xce | 0x8b) {
+            // (x86.c:3560-3563). Each the value the host set, 0, where the
+            // access comes to the backend. UCODE_REV's WHP answers itself
+            // on CI's EPYC 9V74 (no exit: its read 0xffffffff, CI run
+            // 43635691697) and on the PC, the Guest MSRs row's stated
+            // difference: then its read and write are done, the value
+            // WHP's, on record.
+            if index == 0xce || (index == 0x8b && read_came + write_came > 0) {
                 let write = if index == 0xce { "#GP" } else { "done" };
                 assert_eq!((how.as_str(), value, wrote.as_str()), ("done", 0, write), "{index:#x}: a guest's rdmsr and wrmsr, as KVM's");
+                assert_eq!((read_came, write_came), (1, 1), "{index:#x}: the guest's rdmsr and wrmsr came to the backend");
+            } else if index == 0x8b {
+                assert_eq!((how.as_str(), wrote.as_str()), ("done", "done"), "0x8b: a guest's rdmsr and wrmsr, WHP's");
             }
         }
 
