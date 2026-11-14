@@ -83,10 +83,10 @@ pub type Tap = super::backend::net::Tap;
 #[doc(hidden)]
 pub use super::backend::net::simulator;
 
-/// Where endpoints named without `/` are made outside a jail (the sandbox
-/// lets a running microVM remove their sockets).
+/// Where endpoints named without `/` are made outside a jail, found while
+/// the microVM is built (the sandbox narrows it as it ends).
 #[cfg(target_os = "macos")]
-pub use super::backend::net::user_endpoint_dir;
+pub use super::backend::net::{find_user_endpoint_dir, user_endpoint_dir};
 /// Binding an endpoint's socket (`ext::sandbox`'s tests: what a narrowed
 /// microVM may bind).
 #[cfg(all(target_os = "macos", test))]

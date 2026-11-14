@@ -102,22 +102,45 @@ pub fn endpoint_dir() -> io::Result<PathBuf> {
         return Ok(path.to_owned());
     }
     let dir = user_endpoint_dir()?;
-    std::fs::create_dir_all(&dir)?;
+    // Made by the time the sandbox is in place (find_user_endpoint_dir); a
+    // running microVM may not make a directory (mkdir is setup's).
+    if !dir.is_dir() {
+        std::fs::create_dir_all(&dir)?;
+    }
     Ok(dir)
 }
 
 /// `firecracker-net` in the user's temporary directory (not made here):
-/// where endpoints named without `/` are made outside a jail.
+/// where endpoints named without `/` are made outside a jail. Found once,
+/// before the sandbox is in place ([`find_user_endpoint_dir`]): confstr's
+/// `_CS_DARWIN_USER_TEMP_DIR` calls geteuid, which the sandbox denies a
+/// running microVM (upstream's filter has no geteuid), and a device
+/// hot-plugged into one looks the directory up
+/// (`test_a_bare_name_hotplugged_without_a_network_opens`).
 pub fn user_endpoint_dir() -> io::Result<PathBuf> {
-    let mut buf = vec![0u8; usize::try_from(libc::PATH_MAX).unwrap()];
-    // SAFETY: confstr into a buffer of the given size.
-    let len = unsafe { libc::confstr(CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr().cast(), buf.len()) };
-    if len == 0 || len > buf.len() {
-        return Err(io::Error::last_os_error());
+    static DIR: std::sync::OnceLock<Result<PathBuf, i32>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let mut buf = vec![0u8; usize::try_from(libc::PATH_MAX).unwrap()];
+        // SAFETY: confstr into a buffer of the given size.
+        let len = unsafe { libc::confstr(CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr().cast(), buf.len()) };
+        if len == 0 || len > buf.len() {
+            return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL));
+        }
+        let dir = CStr::from_bytes_until_nul(&buf).map_err(|_| libc::EINVAL)?;
+        Ok(Path::new(OsStr::from_bytes(dir.to_bytes())).join("firecracker-net"))
+    })
+    .clone()
+    .map_err(io::Error::from_raw_os_error)
+}
+
+/// Finds the user's directory of endpoints ([`user_endpoint_dir`]), and
+/// makes it if `make`, while nothing denies it: called as the sandbox's
+/// profile is made. An error is kept, and given to each opener of a bare
+/// name as before.
+pub fn find_user_endpoint_dir(make: bool) {
+    if let (Ok(dir), true) = (user_endpoint_dir(), make) {
+        let _ = std::fs::create_dir_all(dir);
     }
-    let dir =
-        CStr::from_bytes_until_nul(&buf).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-    Ok(Path::new(OsStr::from_bytes(dir.to_bytes())).join("firecracker-net"))
 }
 
 /// How long an opener waits for its turn in a directory ([`bind`]): far

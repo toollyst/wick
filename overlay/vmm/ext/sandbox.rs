@@ -842,6 +842,11 @@ mod macos {
     /// The profile for a process in the jail at `root` (`None`: no jail),
     /// with the jail's network `netns` if it has one.
     pub fn profile_for(root: Option<&Path>, netns: Option<&Path>) -> Result<String, SandboxError> {
+        // The user's directory of endpoints, which a net device hot-plugged
+        // into a running microVM opens in outside a jail and a network:
+        // found and made now, as the run phase denies its lookup (confstr
+        // calls geteuid) and mkdir.
+        crate::platform::net::find_user_endpoint_dir(root.is_none() && netns.is_none());
         let files = match root {
             Some(root) => files_in_jail(root, netns)?,
             None => FILES_ANYWHERE.to_owned(),
@@ -4060,11 +4065,11 @@ mod macos {
         // A net device named without a path hot-plugged into a running
         // microVM outside a jail and a network opens its endpoint in the
         // user's directory of endpoints, and the microVM runs on: finding
-        // that directory (confstr's _CS_DARWIN_USER_TEMP_DIR) calls geteuid,
-        // which the run phase denies, as upstream's filter has no geteuid,
-        // so the hot-plug ended Firecracker by the sandbox's kill.
+        // that directory (confstr's _CS_DARWIN_USER_TEMP_DIR) calls geteuid
+        // and making it calls mkdir, which the run phase denies (upstream's
+        // filter has neither), so the hot-plug ended Firecracker by the
+        // sandbox's kill: both are done as the profile is made.
         #[test]
-        #[ignore = "fails until the user's directory of endpoints is found while the microVM is built (the next commit)"]
         fn test_a_bare_name_hotplugged_without_a_network_opens() {
             let out = child("endpoint_hotplug_child", &[]);
             let stdout = String::from_utf8_lossy(&out.stdout);
