@@ -334,19 +334,20 @@ function Invoke-ParentTool([string]$Arguments) {
     @($p.ExitCode, "$($p.StandardOutput.ReadToEnd()) $($err.Result)")
 }
 
-# docs/PORTING.md row 8: --parent-cgroup. A parent made with jail-parent,
-# 256 MiB and processor 0, and jails under it, each allowed 1 GiB of its own:
+# docs/PORTING.md row 8: --parent-cgroup. A parent made with jail-parent on
+# processor 0, and jails under it, each allowed 1 GiB of its own. A parent's
+# memory limit is refused for now (the tool refuses memory.max with a
+# limit; the jailer refuses a jail under a parent that has one: its jails'
+# sections are counted against their own memory.max only, docs/COMPATIBILITY.md):
 # - the first commits 200 MiB and runs on processor 0 though it asked for 0
 #   and 1 (cgroup v2: the processors it has in common with its parent);
-# - the second, while the first holds its memory, is stopped short of 200
-#   MiB: the parent's limit bounds the two together;
+# - the second commits 200 MiB too while the first holds its own;
 # - cgroup v1 refuses a jail that asks for processor 1 (not in its parent's);
 # - with the tool ended and the first jail still running, a jail that names
-#   the parent with cgroup v2 and no --cgroup joins it and is bounded by it:
-#   a jailer keeps the parent of its jail;
-# - a level under the parent (`<parent>/inner`, 100 MiB, made with the tool
-#   while the parent's is running): a jail under it is stopped short of 150
-#   MiB, the least limit along the path, and runs on the parent's processor;
+#   the parent with cgroup v2 and no --cgroup joins it, on its processor: a
+#   jailer keeps the parent of its jail;
+# - a level under the parent (`<parent>/inner`, made with the tool while the
+#   parent's is running): a jail under it runs on the parent's processor;
 #   the tool refuses, for cgroup v1, a level on a processor its parent has
 #   not; a write of the processors of the parent that is there is taken, as
 #   Linux takes a write to cpuset.cpus at any time: a jail that asks for
@@ -363,7 +364,9 @@ function Stage-Parent {
     Check ($cpus -ge 2) "needs 2 processors, the host has $cpus"
     $name = "wjt-$PID"
     $probe = Get-Probe
-    $psi = New-Object Diagnostics.ProcessStartInfo((Get-ParentTool), "--name $name --cgroup memory.max=268435456 --cgroup cpuset.cpus=0")
+    $r = Invoke-ParentTool "--name $name --cgroup memory.max=268435456 --cgroup cpuset.cpus=0"
+    Check ($r[0] -eq 1 -and $r[1].Contains('memory.max=268435456: refused on Windows for now')) "the tool did not refuse a parent's memory limit: exit $($r[0]): $($r[1])"
+    $psi = New-Object Diagnostics.ProcessStartInfo((Get-ParentTool), "--name $name --cgroup memory.max=max --cgroup cpuset.cpus=0")
     $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
     $holder = [Diagnostics.Process]::Start($psi)
     $first = $null
@@ -376,7 +379,7 @@ function Stage-Parent {
         $jail = @('--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--parent-cgroup', $name)
         $own = @('--cgroup', 'memory.max=1073741824')
 
-        # A level under the parent, before any jail takes the parent's memory.
+        # A level under the parent, before any jail runs under it.
         $r = Invoke-ParentTool "--name $name/bad --cgroup-version 1 --cgroup cpuset.cpus=1"
         Check ($r[0] -eq 1 -and $r[1].Contains("CPUs outside the parent cgroup's")) "cgroup v1: a level on processor 1 under a parent on processor 0 was not refused by the tool: exit $($r[0]): $($r[1])"
         $r = Invoke-ParentTool "--name $name --cgroup cpuset.cpus=0-1"
@@ -385,15 +388,14 @@ function Stage-Parent {
         Check ($r[1] -match 'affinity:0 allowed 0x3 of ') "a jail that asked for processors 0-1 under the parent written to 0-1: exit $($r[0]): $($r[1])"
         $r = Invoke-ParentTool "--name $name --cgroup cpuset.cpus=0"
         Check ($r[0] -eq 0 -and $r[1] -match "${name}: opened") "the tool did not write the parent's processors back: exit $($r[0]): $($r[1])"
-        $psi2 = New-Object Diagnostics.ProcessStartInfo((Get-ParentTool), "--name $name/inner --cgroup memory.max=104857600")
+        $psi2 = New-Object Diagnostics.ProcessStartInfo((Get-ParentTool), "--name $name/inner --cgroup memory.max=max")
         $psi2.UseShellExecute = $false; $psi2.RedirectStandardInput = $true; $psi2.RedirectStandardOutput = $true; $psi2.CreateNoWindow = $true
         $inner = [Diagnostics.Process]::Start($psi2)
         $said = ''
         while ($null -ne ($line = $inner.StandardOutput.ReadLine())) { $said += "$line; "; if ($line -match 'held until') { break } }
         Check ($said -match "${name}: opened" -and $said -match "${name}/inner: made" -and $said -match 'held until') "jail-parent did not open the parent and make the level under it: $said"
         $r = Invoke-Jailer (@('--id', 'level', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--parent-cgroup', "$name/inner", '--cgroup-version', '2') + $own + @('--', 'private:150', 'affinity:0')) 60000
-        Check ($r[1] -match 'private:150 denied after (\d+)' -and [int]$Matches[1] -le 100) "a jail under a level of 100 MiB under the parent of 256: exit $($r[0]): $($r[1])"
-        $level = [int]$Matches[1]
+        Check ($r[1] -match 'private:150 allowed 150') "a jail under a level under the parent, its own memory.max 1 GiB: exit $($r[0]): $($r[1])"
         Check ($r[1] -match 'affinity:0 allowed 0x1 of ') "a jail under a level without processors of its own, under a parent on processor 0: $($r[1])"
         $inner.StandardInput.Close()
         Check ($inner.WaitForExit(10000)) 'jail-parent did not end with its standard input (the level)'
@@ -408,12 +410,11 @@ function Stage-Parent {
             Start-Sleep -Milliseconds 200
             $text = (Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join ''
         }
-        Check ($text -match 'private:200 allowed 200') "the first jail's 200 MiB under a parent of 256: $text"
+        Check ($text -match 'private:200 allowed 200') "the first jail's 200 MiB under the parent: $text"
         Check ($text -match 'affinity:0 allowed 0x1 of ') "the first jail asked for processors 0-1 under a parent on processor 0 (cgroup v2: processor 0): $text"
 
         $r = Invoke-Jailer (@('--id', 'second') + $jail + @('--cgroup-version', '2') + $own + @('--', 'private:200')) 60000
-        Check ($r[1] -match 'private:200 denied after (\d+)' -and [int]$Matches[1] -le 60) "the second jail under the parent of 256 MiB, 200 held by the first: exit $($r[0]): $($r[1])"
-        $second = [int]$Matches[1]
+        Check ($r[1] -match 'private:200 allowed 200') "the second jail's 200 MiB under the parent, 200 held by the first: exit $($r[0]): $($r[1])"
 
         $r = Invoke-Jailer (@('--id', 'v1') + $jail + @('--cgroup-version', '1', '--cgroup', 'cpuset.cpus=1', '--', 'affinity:0'))
         Check ($r[0] -ne 0 -and $r[1].Contains("CPUs outside the parent cgroup's")) "cgroup v1, processor 1 under a parent on processor 0, was not refused: exit $($r[0]): $($r[1])"
@@ -422,9 +423,8 @@ function Stage-Parent {
         $holder.StandardInput.Close()
         Check ($holder.WaitForExit(10000)) 'jail-parent did not end with its standard input'
         Check (-not $first.HasExited) "the first jail ended before the tool: $text"
-        $r = Invoke-Jailer (@('--id', 'joins') + $jail + @('--cgroup-version', '2', '--', 'private:200')) 60000
-        Check ($r[1] -match 'private:200 denied after (\d+)' -and [int]$Matches[1] -le 60) "with the tool ended and a jail left, a jail that joins the parent (v2, no --cgroup): exit $($r[0]): $($r[1])"
-        $joined = [int]$Matches[1]
+        $r = Invoke-Jailer (@('--id', 'joins') + $jail + @('--cgroup-version', '2', '--', 'affinity:0')) 60000
+        Check ($r[1] -match 'affinity:0 allowed 0x1 of ') "with the tool ended and a jail left, a jail that joins the parent (v2, no --cgroup), on the parent's processor 0: exit $($r[0]): $($r[1])"
 
         # A jailed process and a parent's name: the parents' namespace is
         # neither opened nor made by it (asserted); what it may do in the
@@ -447,7 +447,7 @@ function Stage-Parent {
         $made = $Matches[1]
         $r = Invoke-Jailer (@('--id', 'unfooled', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--parent-cgroup', $taken, '--cgroup-version', '2', '--cgroup', 'memory.max=1073741824', '--', 'affinity:0'))
         Check ($r[0] -eq 0 -and $r[1] -match 'affinity:0 allowed') "a jail given a parent whose name a jailed process used in the session's namespace did not start: exit $($r[0]): $($r[1])"
-        "a parent of 256 MiB on processor 0 (jail-parent): a jail under a level of 100 MiB under it stopped after $level MiB, on processor 0; the tool refused a cgroup v1 level on processor 1 and a change of the parent's processors; the first jail took 200 MiB and ran on processor 0 of the 0-1 it asked for; the second stopped after $second MiB; cgroup v1 refused processor 1; with the tool ended, a jail joining the parent stopped after $joined MiB; a jailed process and the parents' namespace: $reach; a job of a parent's name in the session's namespace: $made, and a jail given that parent started"
+        "a parent on processor 0 (jail-parent; its memory limit refused): a jail under a level under it ran on processor 0; the tool refused a cgroup v1 level on processor 1 and a change of the parent's processors; the first jail took 200 MiB and ran on processor 0 of the 0-1 it asked for, the second took 200 MiB too; cgroup v1 refused processor 1; with the tool ended, a jail joining the parent ran on processor 0; a jailed process and the parents' namespace: $reach; a job of a parent's name in the session's namespace: $made, and a jail given that parent started"
     } finally {
         Stop-Jailers @($first, $squat)
         if (-not $holder.HasExited) { $holder.Kill() }

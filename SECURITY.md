@@ -317,7 +317,9 @@ upstream Firecracker and its jailer.
     the count leaves out as it leaves out a file's (Linux reclaims page cache at `memory.max` rather than ending the
     process); a memfd is shmem on Linux, charged. To close it: a charge at first touch, as for wick's anonymous
     shared memory; not done.
-  - **Under a parent cgroup**, sections are counted against each jail's own `memory.max`, not the parent's.
+  - **Under a parent cgroup**, a memory limit on the parent is refused, by the operator's tool and the jailer
+    (`test_a_parent_with_a_memory_limit_is_refused`): sections are counted against each jail's own `memory.max`, not
+    a parent's, so a parent's limit would be weaker than its name. Counting a parent's jails together is to come.
   - **Large pages**: the count takes off the bytes of large-page sections the jailer gave (hugetlb's on Linux,
     bounded by `hugetlb.2MB.max`), on the reading that `SharedCommitUsage` counts a large-page section as any
     pagefile-backed one; not measured. If it does not, up to `hugetlb.2MB.max` of other sections go uncounted. To

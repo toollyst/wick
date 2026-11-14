@@ -1368,6 +1368,7 @@ jobs:
               test_the_poll_timer_ticks_about_every_millisecond \
               test_hugetlb_page_sizes_are_linuxs \
               test_a_parent_bounds_its_jails_together test_a_parent_lasts_while_a_jail_holds_it \
+              test_a_parent_with_a_memory_limit_is_refused \
               test_a_jail_under_a_parent_has_linuxs_cpus_and_rate \
               test_a_parent_made_below_medium_integrity_is_refused \
               test_a_parent_of_several_levels_bounds_by_each \

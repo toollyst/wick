@@ -19,7 +19,10 @@
 //! jail's processes are put in it and then in the jail's own job, which is
 //! thereby nested in it: Windows bounds a nested job by its parent's memory
 //! limit, CPU rate and processors (Microsoft Learn, "Nested Jobs"; measured
-//! on Windows Server 2025 build 26100, `test_nested_jobs_on_record`). A
+//! on Windows Server 2025 build 26100, `test_nested_jobs_on_record`). The
+//! memory limit is refused at any level ([`PARENT_MEMORY_REFUSED`]): a job
+//! charges private commit only, and the jails' sections are counted against
+//! each jail's own `memory.max` (`commit`), not a parent's. A
 //! parent of several levels (`a/b`, as upstream's own test names one) is a
 //! job for each level, `...-a` and `...-a/b`: a process is put in them from
 //! the top down, so each is nested in the one above, and every level's
@@ -105,8 +108,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
-    JOB_OBJECT_LIMIT_AFFINITY, JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
-    JobObjectBasicLimitInformation, JobObjectCpuRateControlInformation, JobObjectGroupInformationEx, OpenJobObjectW,
+    JOB_OBJECT_LIMIT_AFFINITY, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicLimitInformation,
+    JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation, JobObjectGroupInformationEx, OpenJobObjectW,
     QueryInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -504,8 +508,17 @@ impl Parent {
     /// what Windows would narrow without a word. A limit the jail does not
     /// ask for, or no level of the parent has, is left as it is; the memory
     /// limit is the jail's own under any parent, as on Linux.
+    ///
+    /// A level with a memory limit is refused ([`PARENT_MEMORY_REFUSED`]).
     pub(crate) fn limits(&self, limits: &Limits) -> Result<Limits, HostError> {
         let fail = |what: &str, e: io::Error| HostError::Parent(self.name.clone(), format!("its jobs' {what} could not be read: {e}"));
+        let names = parent_job_names(&self.name).unwrap_or_default();
+        for (i, job) in self.jobs.iter().enumerate() {
+            if let Some(bytes) = memory_limit(job).map_err(|e| fail("memory limits", e))? {
+                let level = names.get(i).map_or(self.name.as_str(), |n| n.strip_prefix(PARENT_JOB_PREFIX).unwrap_or(n));
+                return Err(HostError::Parent(self.name.clone(), format!("{level} has a memory limit ({bytes} bytes): {PARENT_MEMORY_REFUSED}")));
+            }
+        }
         let mut out = limits.clone();
         if let Some(asked) = limits.cpu_rate {
             let caps = self.jobs.iter().map(hard_cap).collect::<io::Result<Vec<_>>>().map_err(|e| fail("CPU rate", e))?;
@@ -673,6 +686,28 @@ fn query<T>(job: &OwnedHandle, class: i32) -> io::Result<T> {
     if ok == 0 { Err(last_error()) } else { Ok(info) }
 }
 
+/// Why a parent's memory limit is refused: what Windows would make of it is
+/// less than Linux's.
+pub(crate) const PARENT_MEMORY_REFUSED: &str = "a parent cgroup's memory limit is refused on Windows for now: a Job Object \
+     charges its jails' private commit only, and their memory in sections is counted by each jail's jailer against that \
+     jail's own memory.max (overlay/jailer/platform/windows/commit.rs), not against a parent's, so the parent's limit \
+     would bound less than Linux's, which charges every page to every level above it. Each jail's own memory.max holds \
+     it; a parent takes memory.max=max (v1: memory.limit_in_bytes=-1) only. The jailer never accepts a limit it cannot \
+     enforce";
+
+/// The job's memory limit (a job's or a process's), if it has one.
+pub(crate) fn memory_limit(job: &OwnedHandle) -> io::Result<Option<usize>> {
+    let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = query(job, JobObjectExtendedLimitInformation)?;
+    let flags = info.BasicLimitInformation.LimitFlags;
+    Ok(if flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0 {
+        Some(info.JobMemoryLimit)
+    } else if flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0 {
+        Some(info.ProcessMemoryLimit)
+    } else {
+        None
+    })
+}
+
 /// The job's CPU rate hard cap, in hundredths of a percent of the host's
 /// processors, or `None` when it has none (no rate control, or a weight).
 pub(crate) fn hard_cap(job: &OwnedHandle) -> io::Result<Option<u32>> {
@@ -717,9 +752,6 @@ mod tests {
     use super::super::cgroup_values::rate_under_parent;
     use super::super::tests::{Held, held_process, set_job};
     use super::*;
-    use windows_sys::Win32::System::JobObjects::{
-        JOB_OBJECT_LIMIT_JOB_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    };
     use windows_sys::Win32::System::Threading::GetProcessAffinityMask;
 
     const MIB: usize = 1 << 20;
@@ -821,8 +853,10 @@ mod tests {
         (p, job, entered)
     }
 
-    // The rule a parent cgroup is for: its memory limit bounds the jails
-    // under it together. A parent of 64 MiB, two jails whose own limit is
+    // What Windows does with a parent job's memory limit: it bounds the
+    // private commit of the jails under it together (the jailer refuses such
+    // a parent meanwhile, `test_a_parent_with_a_memory_limit_is_refused`,
+    // as their sections are not counted against it). A parent of 64 MiB, two jails whose own limit is
     // 48 MiB each (jobs as the jailer makes them, UI limits and all): 40
     // MiB fits in the first and is refused in the second, which alone
     // would have had the room. The first jailer makes the parent, the
@@ -860,6 +894,28 @@ mod tests {
         assert!(Parent::of(&plan(&name, 2, true, false)).unwrap().is_some_and(|p| !p.created));
         assert!(Parent::of(&plan(&fresh("none"), 2, true, false)).unwrap().is_none());
         assert!(Parent::of(&plan(&fresh("none"), 2, false, true)).unwrap().is_none(), "the default parent is never made");
+    }
+
+    // A parent with a memory limit, at any level, is refused when a jail's
+    // job would be made under it, naming the level and why; the same parent
+    // without the limit takes the jail.
+    #[test]
+    #[ignore = "makes named jobs: run alone by CI's windows job, with --nocapture"]
+    fn test_a_parent_with_a_memory_limit_is_refused() {
+        let top = fresh("memory");
+        let both = format!("{top}/lower");
+        let parent = Parent::of(&plan(&both, 2, true, true)).unwrap().unwrap();
+        let (first, second) = (tool(&top), tool(&both));
+        let jail = Limits { memory_bytes: Some(48 << 20), ..Limits::default() };
+        for (level, job) in [("the top level", &first), ("the lower level", &second)] {
+            set_job(job, JobObjectExtendedLimitInformation, &extended(JOB_OBJECT_LIMIT_JOB_MEMORY, 64 * MIB, 0)).unwrap();
+            let refused = parent.jail_job(&jail).map(|_| ()).map_err(|e| e.to_string());
+            println!("PARENTTEST a jail under a parent whose {level} has a memory limit of 64 MiB: {refused:?}");
+            let refused = refused.unwrap_err();
+            assert!(refused.contains("has a memory limit (67108864 bytes)") && refused.ends_with(PARENT_MEMORY_REFUSED), "{refused}");
+            set_job(job, JobObjectExtendedLimitInformation, &extended(0, 0, 0)).unwrap();
+        }
+        assert!(parent.jail_job(&jail).is_ok(), "the parent without a memory limit did not take the jail");
     }
 
     // What keeps a parent: the tool while it runs, and every jailer while
@@ -1024,6 +1080,12 @@ mod tests {
         assert!(low.0.is_err() && low.1.is_ok(), "the lower level's limit did not hold: {low:?}");
         assert!(high.0.is_err() && high.1.is_ok(), "the top level's limit did not hold the two together: {high:?}");
         drop((pa, pb));
+        // The jailer refuses a parent with a memory limit
+        // (`test_a_parent_with_a_memory_limit_is_refused`): taken off for
+        // the rate and processors below, which it computes.
+        for job in [&first, &second] {
+            set_job(job, JobObjectExtendedLimitInformation, &extended(0, 0, 0)).unwrap();
+        }
 
         // The CPU rate, as the operator's tool writes a level's: a share of
         // what the levels above come to.
@@ -1052,10 +1114,8 @@ mod tests {
         assert_eq!(parent(2).limits(&asking(None, Some(4000))).unwrap().cpu_rate, Some(10_000));
 
         if std::thread::available_parallelism().map_or(1, std::num::NonZero::get) >= 2 {
-            set_job(&first, JobObjectExtendedLimitInformation, &extended(JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_AFFINITY, 64 * MIB, 0b11))
-                .unwrap();
-            set_job(&second, JobObjectExtendedLimitInformation, &extended(JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_AFFINITY, 32 * MIB, 0b10))
-                .unwrap();
+            set_job(&first, JobObjectExtendedLimitInformation, &extended(JOB_OBJECT_LIMIT_AFFINITY, 0, 0b11)).unwrap();
+            set_job(&second, JobObjectExtendedLimitInformation, &extended(JOB_OBJECT_LIMIT_AFFINITY, 0, 0b10)).unwrap();
             let asked = asking(Some(vec![(0, 0b01)]), None);
             let v1 = parent(1).limits(&asked);
             let given = parent(2).limits(&asked).unwrap();

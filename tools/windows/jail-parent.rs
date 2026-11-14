@@ -18,14 +18,18 @@
 //!   version 1:               memory.limit_in_bytes  cpu.cfs_quota_us  cpu.cfs_period_us  cpuset.cpus
 //! ```
 //!
-//! A parent's limits bound its jails together: the memory limit their sum
-//! (commit), the CPU cap their sum, the processors every one of them.
+//! A parent's limits bound its jails together: the CPU cap their sum, the
+//! processors every one of them. A memory limit is refused for now
+//! (`memory.max=max` is taken): a parent's job would charge its jails'
+//! private commit only, their sections being counted against each jail's own
+//! `memory.max` by its jailer, which refuses a jail under a parent that has
+//! one.
 //!
 //! A parent of several levels (`a/b`) is a job for each level, each under
 //! the one above. The tool makes the levels that are missing, the top
 //! first, without limits, as `mkdir -p` does, writes the limits named to
 //! the last, and holds them all. Every level's limits hold what is under
-//! it: memory the least limit along the path, and the CPU cap and the
+//! it: the CPU cap and the
 //! processors by Linux's rule for the cgroup version against what the
 //! levels above come to (cgroup v1 refuses a quota above them and
 //! processors outside theirs; v2 takes the lower quota and the processors
@@ -318,6 +322,14 @@ fn set<T>(job: HANDLE, class: i32, info: &T, len: usize, what: &str) -> Result<(
     Ok(())
 }
 
+/// Why a parent takes no memory limit (the jailer's `PARENT_MEMORY_REFUSED`,
+/// overlay/jailer/platform/windows/parent.rs, which refuses a jail under a
+/// parent that has one).
+const MEMORY_REFUSED: &str = "refused on Windows for now: a parent's Job Object would charge its jails' private commit \
+     only, and their memory in sections is counted by each jail's jailer against that jail's own memory.max, not against \
+     a parent's, so the limit would bound less than Linux's; each jail's own memory.max holds it, and a parent takes \
+     memory.max=max (v1: memory.limit_in_bytes=-1) only";
+
 /// The limits the command line names, as a job takes them.
 #[derive(Default, Debug, PartialEq)]
 struct Wanted {
@@ -341,7 +353,7 @@ fn parse(version: u8, cgroups: &[String]) -> Result<Wanted, String> {
                     None
                 } else {
                     match value.parse::<usize>() {
-                        Ok(bytes) if bytes > 0 => Some(bytes),
+                        Ok(bytes) if bytes > 0 => return Err(bad(MEMORY_REFUSED)),
                         _ => return Err(bad("not a number of bytes above 0")),
                     }
                 });
@@ -1162,9 +1174,14 @@ mod tests {
     fn test_parse() {
         let of = |version, list: &[&str]| parse(version, &list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
         assert_eq!(
-            of(2, &["memory.max=67108864", "cpu.max=50000 100000", "cpuset.cpus=0-1,3"]).unwrap(),
-            Wanted { memory: Some(Some(64 << 20)), quota: Some(Some(50_000)), period: Some(100_000), cpus: Some(vec![0, 1, 3]) }
+            of(2, &["memory.max=max", "cpu.max=50000 100000", "cpuset.cpus=0-1,3"]).unwrap(),
+            Wanted { memory: Some(None), quota: Some(Some(50_000)), period: Some(100_000), cpus: Some(vec![0, 1, 3]) }
         );
+        // A parent's memory limit, refused with the reason (the jailer
+        // refuses a jail under a parent that has one).
+        for (version, cg) in [(2, "memory.max=67108864"), (1, "memory.limit_in_bytes=67108864")] {
+            assert_eq!(of(version, &[cg]), Err(format!("--cgroup {cg}: {MEMORY_REFUSED}")));
+        }
         assert_eq!(of(2, &["memory.max=max", "cpu.max=max"]).unwrap(), Wanted { memory: Some(None), quota: Some(None), ..Wanted::default() });
         assert_eq!(
             of(1, &["memory.limit_in_bytes=-1", "cpu.cfs_quota_us=25000", "cpu.cfs_period_us=50000"]).unwrap(),
