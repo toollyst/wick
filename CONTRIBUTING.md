@@ -368,6 +368,14 @@ compiles wick's sources directly, so upstream's workspace does not change.
 | `whp_irqchip` | `crates/compat/kvm-ioctls/src/whp/irqchip.rs` (built on any host) | any sequence of the port and MMIO accesses the WHP run loop hands it (PICs, ELCR, PIT, speaker port, I/O APIC), interrupt lines, MSI routes, PIT state from a snapshot file, and a snapshot at any point | a VM restored from the snapshot saves the same state and answers every later access as the original does (but for what follows the host clock); each MSI's interrupt request carries its vector and destination |
 | `whp_exit` | `crates/compat/kvm-ioctls/src/whp/exit.rs` (built on any host) | the fields of a sequence of WHP vCPU exits, which the guest controls | a reference written from the x86 architecture (the Intel SDM: port I/O sizes, 32-bit register writes zero-extending, `WRMSR` taking `EDX:EAX`, CPUID's OSXSAVE and OSPKE) and KVM's hypercall ABI: instruction length, port and memory access direction, size and kind, MSR accesses, the `RAX` an `IN` leaves, the hypercall answered (`-KVM_EPERM` from any privilege level but 0, the low 32 bits outside 64-bit code, as KVM) |
 
+The crate's library also compiles, from their sources, WHP backend modules
+that use nothing but `core`, so that their unit tests run on every host:
+`whp_apicmode` (the CPUID x2APIC rule, the x2APIC MSRs' #GP), `whp_gp` (the
+#GP exit's decode and merge), `whp_cr4` and `whp_tscsync` (fuzz/src/lib.rs).
+CI's fuzz job runs those tests and the targets' modules' on Linux, macOS and
+Windows (`cargo test --manifest-path fuzz/Cargo.toml --lib`) before the
+targets; "fuzz `whp_gp`" in the other docs names such a module's tests.
+
 ```sh
 tools/fuzz.sh                          # every target this host runs, 60 s each
 tools/fuzz.sh -t 3600 -j 4 vnet_offload
