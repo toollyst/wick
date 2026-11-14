@@ -34,6 +34,12 @@ thread_local! {
     /// The local APIC emulation mode a record test's VM is made with on
     /// this thread, in place of xAPIC (`test_an_x2apic_partition_on_record`).
     pub(crate) static APIC_MODE_FOR_TESTS: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    /// Whether this thread's VMs and supported CPUID are the product's as
+    /// they will be once its partitions are x2APICs on AMD hosts
+    /// (`host_local_apic`, `X2APIC_PARTITIONS`): the partition configured
+    /// as the product's, #GP exits included, unlike a record's
+    /// (`APIC_MODE_FOR_TESTS`).
+    pub(crate) static X2APIC_PARTITION_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The MSRs a record test's VM made on this thread has in its MSR
     /// action list, both actions Exit (`test_an_x2apic_partition_on_record`).
     pub(crate) static MSR_ACTIONS_FOR_TESTS: std::cell::Cell<&'static [u32]> = const { std::cell::Cell::new(&[]) };
@@ -688,10 +694,34 @@ fn make_partition() -> Result<(WHV_PARTITION_HANDLE, super::apicmode::LocalApic)
     Ok((part, apic))
 }
 
-/// The local APIC this host's partitions emulate (`apicmode::partition_for`
-/// its CPUID vendor): an x2APIC on AMD, an xAPIC elsewhere, which is said
-/// once, with why.
+/// Whether the partitions are made as [`measured_local_apic`] says (an
+/// x2APIC on AMD hosts): not yet. An x2APIC partition's LVT timer write in
+/// TSC-deadline mode is a get and a set of the whole APIC register page
+/// (`VcpuFd::write_x2apic_lvtt`: WHP's register refuses that mode, X2E0REC
+/// c), and an interrupt an irqfd, the MSI hook or another vCPU requests
+/// between the two would be lost if WHP kept it in the page: a guest that
+/// hangs, not one that fails. Until
+/// `test_a_page_set_loses_no_requested_interrupt` (X2RMWREC) is on record
+/// with none lost, every host's partitions stay xAPICs and the guest is not
+/// offered x2APIC, as before option E; the x2APIC code runs only in the
+/// tests that ask for it on their thread (`X2APIC_PARTITION_FOR_TESTS`).
+/// No switch turns it on: this line does, with the record's runs named.
+const X2APIC_PARTITIONS: bool = false;
+
+/// The local APIC this host's partitions emulate: an xAPIC
+/// ([`X2APIC_PARTITIONS`]), or for a test that asks, [`measured_local_apic`].
 pub(crate) fn host_local_apic() -> super::apicmode::LocalApic {
+    #[cfg(test)]
+    if X2APIC_PARTITION_FOR_TESTS.get() {
+        return measured_local_apic();
+    }
+    if X2APIC_PARTITIONS { measured_local_apic() } else { super::apicmode::LocalApic::XApic }
+}
+
+/// The local APIC option E is measured with on this host
+/// (`apicmode::partition_for` its CPUID vendor): an x2APIC on AMD, an xAPIC
+/// elsewhere, which is said once, with why, when the partitions are made so.
+fn measured_local_apic() -> super::apicmode::LocalApic {
     static APIC: std::sync::OnceLock<super::apicmode::LocalApic> = std::sync::OnceLock::new();
     *APIC.get_or_init(|| {
         let leaf = core::arch::x86_64::__cpuid(0);
@@ -700,7 +730,7 @@ pub(crate) fn host_local_apic() -> super::apicmode::LocalApic {
         vendor[4..8].copy_from_slice(&leaf.edx.to_le_bytes());
         vendor[8..].copy_from_slice(&leaf.ecx.to_le_bytes());
         let apic = super::apicmode::partition_for(&vendor);
-        if apic == super::apicmode::LocalApic::XApic {
+        if X2APIC_PARTITIONS && apic == super::apicmode::LocalApic::XApic {
             ffi::report(
                 log::Level::Warn,
                 &format!(

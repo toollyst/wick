@@ -21,8 +21,10 @@
 //! (`kvm_set_apic_base`, arch/x86/kvm/x86.c:475-492: X2APIC_ENABLE is a
 //! reserved bit otherwise).
 //!
-//! A partition's local APIC is an x2APIC, as KVM's, on an AMD host
-//! ([`partition_for`]): WHP's x2APIC answers the guest's x2APIC register
+//! Option E makes a partition's local APIC an x2APIC, as KVM's, on an AMD
+//! host ([`partition_for`]); the product's partitions stay xAPICs on every
+//! host until `test_a_page_set_loses_no_requested_interrupt` is on record
+//! (`vm::X2APIC_PARTITIONS`), and only tests make x2APIC ones. There, WHP's x2APIC answers the guest's x2APIC register
 //! accesses itself but for the LVT timer's TSC-deadline mode, which the
 //! backend finishes from a #GP exit (`gp`; option E of the x2APIC plan,
 //! measured on AMD hosts only: CI's EPYC runners and a PC's Ryzen 9 7900,

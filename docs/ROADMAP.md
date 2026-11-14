@@ -121,7 +121,7 @@ dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `
   refused inside an AppContainer (`E_ACCESSDENIED`) but works for a process on a restricted token below medium integrity
   that has no access to the user's files ([M5](#m5-security-parity-the-jailer-on-every-host)).
 - What the hardware runs found, each fixed and covered by its stage: the guest's CPUID (KVM's supported set, no
-  MWAIT or nested virtualisation; no x2APIC while the partition's local APIC is an xAPIC, where KVM offers it on any host; OSXSAVE, OSPKE and the XSAVE sizes from the vCPU's state at each CPUID exit; the TSC
+  MWAIT or nested virtualisation; no x2APIC while the partition's local APIC is an xAPIC, where KVM offers it on any host (option E's x2APIC partition for AMD hosts is in the code and off in the product until `test_a_page_set_loses_no_requested_interrupt` is on record); OSXSAVE, OSPKE and the XSAVE sizes from the vCPU's state at each CPUID exit; the TSC
   deadline timer, which WHP's xAPIC lacks, now emulated as KVM does), the speculation-control MSRs, kvm-clock and KVM's hypercalls
   (the guest no longer calibrates its TSC against the PIT), one instruction emulator per vCPU thread (a shared one
   corrupted a 2 vCPU guest's memory), irqfds cleared through their eventfd, an epoll nested in another (the vsock

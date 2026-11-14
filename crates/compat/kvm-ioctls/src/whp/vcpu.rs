@@ -5321,9 +5321,10 @@ mod fpu_tests {
     /// only CPUID this backend's xAPIC partition keeps (`apicmode`; CI run
     /// 43452122814, where an Intel runner's guests were offered x2APIC and
     /// froze). The VMs are xAPIC partitions, as on a host other than AMD:
-    /// - the supported CPUID has no x2APIC (leaf 1 ECX bit 21) on such a
-    ///   host (on AMD, whose partitions are x2APICs, it has, and the tables
-    ///   here are the supported one less the bit);
+    /// - the supported CPUID has no x2APIC (leaf 1 ECX bit 21), as every
+    ///   host's partitions are xAPICs (`vm::X2APIC_PARTITIONS`; once AMD
+    ///   hosts' are x2APICs it has it there, and the tables here are the
+    ///   supported one less the bit);
     /// - `KVM_SET_CPUID2` of a table with it is refused (`ENOTSUP`) and
     ///   keeps nothing;
     /// - with the supported table, and with a table that has no leaf 1
@@ -5433,8 +5434,9 @@ mod fpu_tests {
     }
 
     /// The x2APIC partition's LVT timer in TSC-deadline mode, as KVM's
-    /// (`gp`, `tscdeadline`), on a host whose partitions are x2APICs (AMD;
-    /// elsewhere the test says so and passes). Each case a VM of its own,
+    /// (`gp`, `tscdeadline`), on an AMD host's x2APIC partition made as the
+    /// product's will be (`X2APIC_PARTITION_FOR_TESTS`; elsewhere the test
+    /// says so and passes). Each case a VM of its own,
     /// with the supported CPUID (x2APIC and TSC_DEADLINE), the guest at CPL
     /// 0 turning x2APIC mode on (APIC_BASE |= EXTD) and its APIC on (SVR
     /// 0x1ff by WRMSR 0x80F):
@@ -5461,8 +5463,9 @@ mod fpu_tests {
         const GATE: u64 = 0xB900;
         const LVTT_READ: u64 = 0x7100;
         const TMCCT_READ: u64 = 0x7108;
+        super::super::vm::X2APIC_PARTITION_FOR_TESTS.set(true);
         if super::super::vm::host_local_apic() != LocalApic::X2Apic {
-            eprintln!("TSCDLTEST this host's partitions are xAPICs: no x2APIC partition to test");
+            eprintln!("TSCDLTEST not an AMD host, where option E's x2APIC partition is measured: nothing to test");
             return;
         }
         let imm = |v: u32| v.to_le_bytes();
@@ -5536,8 +5539,8 @@ mod fpu_tests {
     }
 
     /// A local APIC state in KVM's x2APIC-mode format restores and reads
-    /// back as on KVM (`get_lapic`, `set_lapic`), on a host whose
-    /// partitions are x2APICs: vCPU 1 with APIC_BASE 0xfee00c00 by
+    /// back as on KVM (`get_lapic`, `set_lapic`), on an AMD host's x2APIC
+    /// partition (`X2APIC_PARTITION_FOR_TESTS`): vCPU 1 with APIC_BASE 0xfee00c00 by
     /// `KVM_SET_SREGS`, then `KVM_SET_LAPIC` with the ID in KVM's legacy
     /// format (0x1000000), SVR 0x1ff and the LVT timer 0x400ec: WHP's x2APIC
     /// ID register reads 1, `KVM_GET_LAPIC` gives the ID 0x1000000, the
@@ -5547,8 +5550,9 @@ mod fpu_tests {
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_a_kvm_lapic_state_in_x2apic_mode_restores() {
         use super::super::apicmode::LocalApic;
+        super::super::vm::X2APIC_PARTITION_FOR_TESTS.set(true);
         if super::super::vm::host_local_apic() != LocalApic::X2Apic {
-            eprintln!("X2LAPICTEST this host's partitions are xAPICs: no x2APIC partition to test");
+            eprintln!("X2LAPICTEST not an AMD host, where option E's x2APIC partition is measured: nothing to test");
             return;
         }
         let vm = super::super::VmFd::create().unwrap();
@@ -5576,8 +5580,10 @@ mod fpu_tests {
     /// LVT timer entry in TSC-deadline mode (`write_x2apic_lvtt`: WHP's
     /// register refuses that mode, errno 87, X2E0REC c in CI runs
     /// 43521200989 and 43524342863, so on an x2APIC partition the page is
-    /// the only way) loses no interrupt requested of the vCPU, on a host
-    /// whose partitions are x2APICs. An interrupt requested between the
+    /// the only way) loses no interrupt requested of the vCPU, on an AMD
+    /// host's x2APIC partition made as the product's will be
+    /// (`X2APIC_PARTITION_FOR_TESTS`; the product's partitions are xAPICs
+    /// until this test is on record, `vm::X2APIC_PARTITIONS`). An interrupt requested between the
     /// page's get and its set would be lost if WHP kept it in the page,
     /// and an irqfd's writer, the MSI hook or another vCPU's IPI may
     /// request one at any time. Vector 0xe1, whose gate EOIs (WRMSR 0x80b)
@@ -5616,8 +5622,9 @@ mod fpu_tests {
         const LVTT: u32 = 0x4_00E0;
         const ROUNDS: usize = 50;
         const REQUESTS: u32 = 2000;
+        super::super::vm::X2APIC_PARTITION_FOR_TESTS.set(true);
         if super::super::vm::host_local_apic() != LocalApic::X2Apic {
-            eprintln!("X2RMWREC this host's partitions are xAPICs: no x2APIC partition to test");
+            eprintln!("X2RMWREC not an AMD host, where option E's x2APIC partition is measured: nothing to test");
             return;
         }
         let imm = |v: u32| v.to_le_bytes();

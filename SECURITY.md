@@ -366,7 +366,8 @@ upstream Firecracker and its jailer.
   ([CONTRIBUTING.md](CONTRIBUTING.md#fuzzing)), as do the interrupt controller the WHP run loop hands a
   guest's port and MMIO accesses to (`whp_irqchip`) and the WHP run loop's decoding of a vCPU exit (`whp_exit`). The run loops' own steps, which call Hypervisor.framework
   (`hv_vcpu_run`) or WHP, are not fuzzed.
-- **The WHP x2APIC partition's #GP exit (AMD hosts).** Every guest #GP, at any privilege level, leaves the
+- **The WHP x2APIC partition's #GP exit (option E, AMD hosts; in the code, off in the product until
+  `test_a_page_set_loses_no_requested_interrupt` is on record, so no product partition has it yet).** On one, every guest #GP, at any privilege level, leaves the
   hypervisor to the vCPU's run loop (`gp`), so a guest can make such exits at will (a ring-3 privileged
   instruction). The handler decodes at most 15 bytes from the exit context and reads at most three of the vCPU's own
   registers; it takes no lock another vCPU or the VMM's thread waits on, and neither allocates nor logs, so a storm
