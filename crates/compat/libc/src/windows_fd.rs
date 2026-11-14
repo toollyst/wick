@@ -2045,6 +2045,35 @@ mod tests {
         }
     }
 
+    /// `F_GETFL` reads a descriptor's status flags and makes no state: Linux
+    /// reads the open file's `f_flags` and changes nothing (v6.1
+    /// fs/fcntl.c `do_fcntl`, `F_GETFL`). A descriptor this library never
+    /// had state for, asked and then closed past it (with `CloseHandle`, as
+    /// Rust std closes its own sockets and files), is closed: a pipe's
+    /// write end, after which the read end finds the pipe broken. Before
+    /// the fix the question made a table entry ([`wick_fd`]) holding a
+    /// handle of its own, which kept the write end open until the table's
+    /// sweep.
+    #[test]
+    #[ignore = "fails until F_GETFL reads without making an entry (the next commit)"]
+    fn test_f_getfl_makes_no_state_that_outlives_a_close_past_the_library() {
+        let (mut r, mut w): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: two handles' room; a pipe of our own.
+        assert_ne!(unsafe { CreatePipe(&mut r, &mut w, std::ptr::null(), 0) }, 0);
+        // SAFETY: plain call on the write end's descriptor.
+        assert_eq!(unsafe { fcntl(to_fd(w), F_GETFL) } & O_NONBLOCK, 0);
+        // SAFETY: closes our write end, past this library.
+        assert_ne!(unsafe { CloseHandle(w) }, 0);
+        let mut avail = 0u32;
+        // SAFETY: our read end; a count only.
+        let peeked = unsafe { PeekNamedPipe(r, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) };
+        // SAFETY: plain call.
+        let err = if peeked == 0 { unsafe { GetLastError() } } else { 0 };
+        // SAFETY: our read end.
+        unsafe { CloseHandle(r) };
+        assert_eq!((peeked, err), (0, ERROR_BROKEN_PIPE), "the write end is still open after its close");
+    }
+
     /// A blocking pipe's read into mapped memory it cannot write, and its
     /// write from mapped memory it cannot read, go through a copy
     /// ([`read_through_copy`], [`write_through_copy`]) and fail with
