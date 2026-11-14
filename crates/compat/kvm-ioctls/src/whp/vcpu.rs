@@ -5809,6 +5809,172 @@ mod fpu_tests {
         assert!(wrong.is_empty(), "no #GP for {wrong:?}");
     }
 
+    /// The guest's RDMSR and WRMSR of the MSRs no WHP register holds are
+    /// answered as KVM answers a Firecracker guest's (`kvmmsr`, Linux v6.1
+    /// arch/x86/kvm/x86.c `kvm_get_msr_common`/`kvm_set_msr_common` and
+    /// svm/svm.c `svm_get_msr`/`svm_set_msr`, the PMU off): the MSRs of the
+    /// PC's MSRREC (step 16i at df0bf87: OSVW, DE_CFG, NB_CFG, AMD's RAPL,
+    /// the K7 counters) and KVM's other cases a guest may reach, each with
+    /// the value KVM gives, the write KVM keeps, or #GP(0) where KVM's
+    /// default gives it. Before, the backend read each as 0 and dropped
+    /// each write, with a `whp:` line. Each case a VM of its own with the
+    /// supported CPUID: the instructions, then the last RDMSR's EDX:EAX
+    /// stored at 0x7100 and `out 0x80`; a #GP is the guest's fault line for
+    /// vector 13. The AMD rows only on an AMD host. Printed (MSRTEST lines).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_the_msrs_a_guest_reaches_are_answered_as_kvm() {
+        #[derive(Debug, PartialEq)]
+        enum Want {
+            Gp,
+            Value(u64),
+        }
+        let imm = |v: u32| v.to_le_bytes();
+        #[allow(clippy::cast_possible_truncation)]
+        let wr = |ecx: u32, v: u64| [&[0xB9][..], &imm(ecx), &[0xB8], &imm(v as u32), &[0xBA], &imm((v >> 32) as u32), &[0x0F, 0x30]].concat();
+        let rd = |ecx: u32| [&[0xB9][..], &imm(ecx), &[0x0F, 0x32]].concat();
+        let amd = {
+            let leaf = core::arch::x86_64::__cpuid(0);
+            (leaf.ebx, leaf.edx, leaf.ecx) == (0x6874_7541, 0x6974_6e65, 0x444d_4163)
+        };
+        let host_osvw = core::arch::x86_64::__cpuid(0x8000_0001).ecx >> 9 & 1 == 1;
+        let both = |a: Vec<u8>, b: Vec<u8>| [a, b].concat();
+        let mut cases: Vec<(&str, Vec<u8>, Want)> = vec![
+            ("RDMSR PLATFORM_INFO (0xce): no CPUID_FAULT", rd(0xce), Want::Value(0)),
+            ("WRMSR PLATFORM_INFO (0xce)", wr(0xce, 0), Want::Gp),
+            ("WRMSR MISC_FEATURES_ENABLES (0x140) of 1, CPUID faulting", wr(0x140, 1), Want::Gp),
+            ("WRMSR MISC_FEATURES_ENABLES (0x140) of 0, RDMSR", both(wr(0x140, 0), rd(0x140)), Want::Value(0)),
+            ("WRMSR POWER_CTL (0x1fc) of 0x55, RDMSR", both(wr(0x1fc, 0x55), rd(0x1fc)), Want::Value(0x55)),
+            ("RDMSR SMI_COUNT (0x34)", rd(0x34), Want::Value(0)),
+            ("WRMSR SMI_COUNT (0x34)", wr(0x34, 0), Want::Gp),
+            ("RDMSR SMBASE (0x9e)", rd(0x9e), Want::Gp),
+            ("RDMSR POLL_CONTROL (0x4b564d05)", rd(0x4b56_4d05), Want::Value(1)),
+            ("WRMSR POLL_CONTROL (0x4b564d05) of 2", wr(0x4b56_4d05, 2), Want::Gp),
+            ("WRMSR ASYNC_PF_EN (0x4b564d02) of 0x10", wr(0x4b56_4d02, 0x10), Want::Gp),
+            ("WRMSR ASYNC_PF_EN (0x4b564d02) of 0x7009, RDMSR", both(wr(0x4b56_4d02, 0x7009), rd(0x4b56_4d02)), Want::Value(0x7009)),
+            ("WRMSR PV_EOI_EN (0x4b564d04) of 0x7203, unaligned", wr(0x4b56_4d04, 0x7203), Want::Gp),
+            ("WRMSR PV_EOI_EN (0x4b564d04) of 0x7201, RDMSR", both(wr(0x4b56_4d04, 0x7201), rd(0x4b56_4d04)), Want::Value(0x7201)),
+            ("WRMSR STEAL_TIME (0x4b564d03) of 0x7001", wr(0x4b56_4d03, 0x7001), Want::Gp),
+            ("RDMSR ASYNC_PF_ACK (0x4b564d07)", rd(0x4b56_4d07), Want::Value(0)),
+            ("RDMSR RAPL_POWER_UNIT (0x606, Intel's)", rd(0x606), Want::Value(0)),
+            ("RDMSR 0xc0011234 (no KVM case)", rd(0xc001_1234), Want::Gp),
+            ("WRMSR 0xc0011234 (no KVM case)", wr(0xc001_1234, 0), Want::Gp),
+            ("WRMSR the old wall clock (0x11) of 0x7300, RDMSR", both(wr(0x11, 0x7300), rd(0x11)), Want::Value(0x7300)),
+            ("WRMSR the old system time (0x12) of 0x7400, RDMSR", both(wr(0x12, 0x7400), rd(0x12)), Want::Value(0x7400)),
+        ];
+        if amd {
+            cases.extend([
+                ("RDMSR OSVW_ID_LENGTH (0xc0010140)", rd(0xc001_0140), Want::Value(if host_osvw { 4 } else { 3 })),
+                ("RDMSR OSVW_STATUS (0xc0010141)", rd(0xc001_0141), Want::Value(0)),
+                ("RDMSR DE_CFG (0xc0011029)", rd(0xc001_1029), Want::Value(0)),
+                ("WRMSR DE_CFG (0xc0011029) of 2, RDMSR", both(wr(0xc001_1029, 2), rd(0xc001_1029)), Want::Value(2)),
+                ("WRMSR DE_CFG (0xc0011029) of 4", wr(0xc001_1029, 4), Want::Gp),
+                ("WRMSR NB_CFG (0xc001001f) of 0x400000000000, RDMSR", both(wr(0xc001_001f, 0x4000_0000_0000), rd(0xc001_001f)), Want::Value(0)),
+                ("RDMSR AMD's RAPL_POWER_UNIT (0xc0010299)", rd(0xc001_0299), Want::Gp),
+                ("RDMSR AMD's PKG_ENERGY_STATUS (0xc001029b)", rd(0xc001_029b), Want::Gp),
+                ("RDMSR K7_EVNTSEL0 (0xc0010000)", rd(0xc001_0000), Want::Value(0)),
+                ("WRMSR K7_PERFCTR3 (0xc0010007) of 0xffff, RDMSR", both(wr(0xc001_0007, 0xffff), rd(0xc001_0007)), Want::Value(0)),
+                ("RDMSR VM_HSAVE_PA (0xc0010117)", rd(0xc001_0117), Want::Value(0)),
+                ("WRMSR VM_HSAVE_PA (0xc0010117) of 0x1008", wr(0xc001_0117, 0x1008), Want::Gp),
+                ("RDMSR VIRT_SPEC_CTRL (0xc001011f), no VIRT_SSBD", rd(0xc001_011f), Want::Gp),
+                ("RDMSR F15H_IC_CFG (0xc0011021)", rd(0xc001_1021), Want::Value(0)),
+            ]);
+        }
+        let store = [0x89u8, 0x04, 0x25, 0x00, 0x71, 0x00, 0x00, 0x89, 0x14, 0x25, 0x04, 0x71, 0x00, 0x00, 0xE6, PORT as u8, 0xEB, 0xFE];
+        let mut wrong = Vec::new();
+        for (name, instructions, want) in cases {
+            let (vm, mut vcpu, m) = mmio_guest(&[instructions, store.to_vec()].concat());
+            vcpu.set_cpuid2(&cpuid_with_tsc_deadline()).unwrap();
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let mut reads = 0;
+            let mut exits = Vec::new();
+            while exits.len() < 8 && !exits.last().is_some_and(|e: &String| e.starts_with("out") || e.starts_with("fault") || e.contains("fail") || e == "EINTR") {
+                exits.push(one_run(&mut vcpu, &[], &mut reads));
+            }
+            drop(watchdog);
+            vcpu.set_kvm_immediate_exit(0);
+            let got = match exits.last() {
+                Some(e) if e.starts_with("fault: exception 13") => Some(Want::Gp),
+                Some(e) if e.starts_with("out") => Some(Want::Value(u64::from_le_bytes(bytes_at::<8>(m, 0x7100)))),
+                _ => None,
+            };
+            eprintln!("MSRTEST {name}: {got:x?} (KVM: {want:x?}); exits {exits:?}");
+            if got.as_ref() != Some(&want) {
+                wrong.push(format!("{name}: {got:x?}, KVM {want:x?}"));
+            }
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+        assert!(wrong.is_empty(), "not as KVM: {wrong:#?}");
+    }
+
+    /// `KVM_GET_MSR_INDEX_LIST`, `KVM_GET_MSRS` and `KVM_SET_MSRS` of the
+    /// MSRs KVM keeps for a vCPU that no WHP register holds (`kvmmsr::Kept`):
+    /// listed as KVM lists them (SMI_COUNT, SMBASE, PLATFORM_INFO,
+    /// MISC_FEATURES_ENABLES, POWER_CTL, UCODE_REV, the paravirtual MSRs but
+    /// STEAL_TIME; VM_HSAVE_PA on AMD, FEAT_CTL on Intel), read at KVM's
+    /// values at vCPU creation (SMBASE 0x30000, POLL_CONTROL 1, UCODE_REV
+    /// 0x01000065 on AMD; PLATFORM_INFO 0, without CPUID_FAULT), written and
+    /// read back as a snapshot's restore writes them, on a second vCPU too
+    /// (each vCPU its own); a restore that has none of them (a snapshot made
+    /// before they were kept) leaves KVM's values, as KVM leaves a vCPU's
+    /// for an MSR the snapshot lacks; and the call ends, as KVM's, at a
+    /// value KVM refuses (POLL_CONTROL 2) and at one the backend cannot
+    /// have (PLATFORM_INFO with CPUID_FAULT, STEAL_TIME enabled), each
+    /// named on standard error.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_the_msrs_kvm_keeps_restore_as_kvm() {
+        let amd = core::arch::x86_64::__cpuid(0).ebx == 0x6874_7541;
+        let listed = regs::msr_index_list().unwrap();
+        let listed = listed.as_slice();
+        let mut want: Vec<u32> = vec![0x34, 0x9e, 0xce, 0x140, 0x1fc, 0x8b, 0x4b56_4d02, 0x4b56_4d04, 0x4b56_4d05, 0x4b56_4d06, 0x4b56_4d07];
+        want.push(if amd { 0xc001_0117 } else { 0x3a });
+        for i in &want {
+            assert!(listed.contains(i), "{i:#x} not in KVM_GET_MSR_INDEX_LIST");
+        }
+        assert!(!listed.contains(&0x4b56_4d03), "STEAL_TIME listed");
+        let vm = super::super::VmFd::create().unwrap();
+        let zero = vm.create_vcpu(0).unwrap();
+        let one = vm.create_vcpu(1).unwrap();
+        zero.set_cpuid2(&cpuid_with_tsc_deadline()).unwrap();
+        one.set_cpuid2(&cpuid_with_tsc_deadline()).unwrap();
+        let entries = |pairs: &[(u32, u64)]| {
+            Msrs::from_entries(&pairs.iter().map(|&(index, data)| kvm_bindings::kvm_msr_entry { index, data, ..Default::default() }).collect::<Vec<_>>()).unwrap()
+        };
+        let read = |v: &VcpuFd, indices: &[u32]| {
+            let mut m = entries(&indices.iter().map(|&i| (i, 0)).collect::<Vec<_>>());
+            let n = v.get_msrs(&mut m).unwrap();
+            assert_eq!(n, indices.len(), "KVM_GET_MSRS of {indices:x?} ended at {n}");
+            m.as_slice().iter().map(|e| e.data).collect::<Vec<_>>()
+        };
+        // At creation: KVM's, but PLATFORM_INFO's CPUID_FAULT.
+        let fresh = read(&zero, &[0x9e, 0x4b56_4d05, 0xce, 0x140, 0x34, 0x1fc, 0x4b56_4d02]);
+        assert_eq!(fresh, [0x3_0000, 1, 0, 0, 0, 0, 0], "at creation");
+        if amd {
+            assert_eq!(read(&zero, &[0x8b]), [0x0100_0065], "UCODE_REV at creation on AMD");
+        }
+        // A snapshot's restore: written, read back; vCPU 1 has its own.
+        let saved = [(0x34, 3), (0x9e, 0xa_0000), (0xce, 0), (0x140, 0), (0x1fc, 0x55), (0x4b56_4d02, 0x7001), (0x4b56_4d04, 0x7201), (0x4b56_4d06, 0xf3), (0x4b56_4d05, 0)];
+        let m = entries(&saved);
+        assert_eq!(zero.set_msrs(&m).unwrap(), saved.len());
+        let indices: Vec<u32> = saved.iter().map(|&(i, _)| i).collect();
+        assert_eq!(read(&zero, &indices), saved.iter().map(|&(_, d)| d).collect::<Vec<_>>(), "restored");
+        assert_eq!(read(&one, &[0x34, 0x9e, 0x4b56_4d05]), [0, 0x3_0000, 1], "vCPU 1's own");
+        // A snapshot made before these were kept: none of them in it.
+        let before = entries(&[(0x174, 0x10), (0x1a0, 1)]);
+        assert_eq!(one.set_msrs(&before).unwrap(), 2);
+        assert_eq!(read(&one, &[0x9e, 0x4b56_4d05, 0xce]), [0x3_0000, 1, 0], "KVM's values left");
+        // Refused: as KVM, and where the backend cannot have the value.
+        for (index, data) in [(0x4b56_4d05, 2), (0xce, 1 << 31), (0x4b56_4d03, 0x7001)] {
+            let m = entries(&[(0x1fc, 0x66), (index, data)]);
+            assert_eq!(one.set_msrs(&m).unwrap(), 1, "{index:#x} of {data:#x} was taken");
+        }
+        assert_eq!(one.set_msrs(&entries(&[(0x4b56_4d03, 0x7000)])).unwrap(), 1, "STEAL_TIME off is taken");
+    }
+
     /// A local APIC state in KVM's x2APIC-mode format restores and reads
     /// back as on KVM (`get_lapic`, `set_lapic`), on an AMD host's x2APIC
     /// partition (`X2APIC_PARTITION_FOR_TESTS`): vCPU 1 with APIC_BASE 0xfee00c00 by

@@ -1690,6 +1690,10 @@ mod tests {
                     assert_eq!(e.ecx & (1 << 29), 0, "MWAITX");
                     assert_eq!(e.ecx & (1 << 2), 0, "SVM");
                 }
+                // VIRT_SSBD: no VIRT_SPEC_CTRL here (the Guest MSRs row).
+                (0x8000_0008, _) => assert_eq!(e.ebx & (1 << 25), 0, "VIRT_SSBD"),
+                // No steal time (KVM_FEATURE_STEAL_TIME, bit 5).
+                (0x4000_0001, _) => assert_eq!(e.eax & (1 << 5), 0, "STEAL_TIME"),
                 // TSC_ADJUST on every host, as KVM (cpuid.c:648-649).
                 (0x7, 0) => assert_ne!(e.ebx & (1 << 1), 0, "TSC_ADJUST"),
                 _ => {}
