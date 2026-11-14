@@ -77,7 +77,7 @@ The same as upstream Firecracker's
 | Jailer: network namespace | upstream | Seatbelt denies IP networking to every Firecracker; `--netns <dir>` names the jail's network, a directory of endpoints the operator made, where Firecracker makes its network endpoints (each jail's are in a directory of its own there, `<dir>/<id>/`, which only that jail and the directory's owner or root reach, as a TAP is its owner's: `test_each_jail_has_a_network_directory_of_its_own`, `test_a_second_jail_of_one_id_is_refused_and_the_first_keeps_its_endpoint`; an endpoint sends frames only to the switch's sockets, directly in `<dir>`: `test_a_jails_endpoint_takes_only_the_switch_as_a_peer`; two jails of one uid are kept apart by the profile alone, see below), and the sandbox lets a jail with a network reach Unix sockets only in its own directory there, directly in `<dir>` and in the jail (`test_jail_network_profile_limits_sockets`, `test_endpoint_in_network_directory`, `jailer-test netns`) | **in place:** `--netns <dir>` names the jail's network, a directory of endpoints the operator made, where Firecracker makes its network endpoints (in the jail's own directory in it, `<dir>\<id>`, which only that jail and the operator reach: no other jail can connect to its endpoints, delete them or take their names, as a TAP is its owner's on Linux, and a second jail of a running id is refused as busy; `test_the_network_directory_grants_no_jail`, `test_each_jail_has_a_network_directory_of_its_own`, `test_a_second_jail_of_one_id_is_refused_and_the_first_keeps_its_endpoint`: written, compiled and unit-tested on CI; `jailer-test.ps1 netns`, the elevated stage, and `jailer-test.ps1 netguest` passed with this layout in CI run 43442912128, 861d365, elevated), and the jail's copy of Firecracker gets no IP networking at all: Windows Filtering Platform block filters on its application id at every connect, bind, listen and accept layer, IPv4 and IPv6, in a session that ends with the jailer. Needs an elevated jailer (adding a filter is an administrator's right, as `setns` needs root); refused loudly without one. An AppContainer was not usable: WHP refuses to run inside one (`jailer-test.ps1 netns`, `refuse`) |
 | Jailer: uid/gid | upstream | **in place:** dropped right after the chroot, checked that root cannot be regained (`jailer-test jail`, `test_enter_needs_root`) | **in place:** a restricted token below medium integrity, without the user's SID and with a random SID per jail: no access to the user's files, another jail, or other processes, and, since the jail's integrity level is above low, no access from a plain low-integrity process of the same user either (`jailer-test.ps1 isolation`, `low`); no privilege but traversal (`test_tokens_keep_only_traversal`): below medium integrity no privilege can be enabled, "Lock pages in memory" included, so a jailed Firecracker cannot map large pages itself; the jailer makes them for it, as sections no larger in all than `hugetlb.2MB.max` (`jailer-test.ps1 hugepages`, docs/PORTING.md row 10) |
 | Jailer: PID namespace | upstream | in place in every jail: the sandbox keeps every other process out of Firecracker's reach (no process information, no signal); `--new-pid-ns` gives upstream's process tree and drops the signals a namespace's init does not get from outside; the pid is the host's (`test_no_other_process_in_reach`, `jailer-test pidns`) | **in place** in every jail: no process or thread outside the jail opens to Firecracker, a process snapshot shows it none, and it is not on the jailer's console (no console control events or typed input; the jailer relays the console); `--new-pid-ns` returns as upstream's jailer does. Whether a pid is in use still shows (`jailer-test.ps1 pidns`) |
-| Jailer: cgroups (memory, CPU) | upstream | memory **in place** (jetsam limit, killed at the limit as by the OOM killer); CPU **in place** (`cpu.max` / `cpu.cfs_quota_us` → a kernel CPU limit on the whole VMM, throttled once it used its share of each second); `cpuset` naming every CPU and memory node accepted (no restriction), as is a limit macOS does not have set to no limit (`pids.max=max`, `memory.high=max`, ...); the freezer through upstream's files next to the jail, kept by a root supervisor per jail (below); other controllers, and those limits with a number, refused, each with its reason (`jailer-test limits`, `jailer-test memory`, `jailer-test cpu`, `jailer-test freeze`, `test_cpu_limit_holds`, `test_other_controllers_are_refused`, `test_no_limit_values_are_accepted`, `test_only_no_limit_is_accepted_of_a_limit_macos_lacks`) | CPU **in place** through a Job Object (CPU rate hard cap from Firecracker's start or a CPU weight); memory **not in place**: the Job Object's memory limit holds private memory only, and memory in sections escapes it (see below; `jailer-test.ps1 sections` fails); `cpuset.cpus` as the job's affinity; the freezer through upstream's files next to the jail, kept by the jailer, which freezes the job (below); other controllers refused with the reason (`jailer-test.ps1 limits`, `jailer-test.ps1 cpu`, `jailer-test.ps1 cpuset`, `jailer-test.ps1 weight`, `jailer-test.ps1 refuse`, `jailer-test.ps1 freeze`) |
+| Jailer: cgroups (memory, CPU) | upstream | memory **in place** (jetsam limit, killed at the limit as by the OOM killer); CPU **in place** (`cpu.max` / `cpu.cfs_quota_us` → a kernel CPU limit on the whole VMM, throttled once it used its share of each second); `cpuset` naming every CPU and memory node accepted (no restriction), as is a limit macOS does not have set to no limit (`pids.max=max`, `memory.high=max`, ...); the freezer through upstream's files next to the jail, kept by a root supervisor per jail (below); other controllers, and those limits with a number, refused, each with its reason (`jailer-test limits`, `jailer-test memory`, `jailer-test cpu`, `jailer-test freeze`, `test_cpu_limit_holds`, `test_other_controllers_are_refused`, `test_no_limit_values_are_accepted`, `test_only_no_limit_is_accepted_of_a_limit_macos_lacks`) | CPU **in place** through a Job Object (CPU rate hard cap from Firecracker's start or a CPU weight); memory **in place, with a window**: the Job Object's memory limit holds private memory, and the jailer counts sections every 1 ms and ends the jail with 137 past the limit (see below; `jailer-test.ps1 sections`, not yet run on Windows); `cpuset.cpus` as the job's affinity; the freezer through upstream's files next to the jail, kept by the jailer, which freezes the job (below); other controllers refused with the reason (`jailer-test.ps1 limits`, `jailer-test.ps1 cpu`, `jailer-test.ps1 cpuset`, `jailer-test.ps1 weight`, `jailer-test.ps1 refuse`, `jailer-test.ps1 freeze`) |
 
 The sandbox is installed where upstream installs its seccomp filters and keeps upstream's flags: on by default, off
 with `--no-seccomp`. On macOS a process may lift its own CPU limit and the allow-list is what denies that, so a
@@ -255,11 +255,12 @@ upstream Firecracker and its jailer.
   parent's limits, as the compatibility table says of a parent's life. A job the jailer did not make is still joined only when the
   operator, the administrators or the system own it and it is not labelled below medium
   (`test_a_parent_made_below_medium_integrity_is_refused`).
-- **Windows jailer: `memory.max` does not bound memory in sections.** The jailer sets `memory.max` as a Job Object
-  memory limit, which charges private memory only. Sections (pagefile-backed, or of a file: wick's memfd is a
-  temporary file's) are not charged to the job, and the jail's token does not stop a process making them: under
-  `memory.max` of 32 MiB a jailed process stops after 30 MiB of private memory but maps and writes 256 MiB of
-  each kind of section (`jailer-test.ps1 sections`, measured elevated on Windows Server 2022; with 4 GiB of
+- **Windows jailer: `memory.max` bounds memory in sections at the jailer's next count, not at once.** The jailer
+  sets `memory.max` as a Job Object memory limit, which charges private memory only. Sections (pagefile-backed, or
+  of a file: wick's memfd is a temporary file's) are not charged to the job, and the jail's token does not stop a
+  process making them: under a job limit of 32 MiB a jailed process stopped after 30 MiB of private memory but
+  mapped and wrote 256 MiB of each kind of section (`jailer-test.ps1 sections` before the count, measured elevated
+  on Windows Server 2022; with 4 GiB of
   sections the host's commit grew by 4.1 GiB while the job's peak stayed at 9 MiB; the same on Windows 11 build
   26300, elevated, kit 7952d31, 2026-11-13: private memory denied after 30 MiB, 256 MiB of each kind of section
   allowed). A memory partition tied to the job does not charge sections either: under a partition of 256 MiB,
@@ -283,8 +284,49 @@ upstream Firecracker and its jailer.
   and its charge with it, so that what the jail is charged is never less than the host commit it holds
   (`test_registered_memory_is_charged_as_it_is_filled`; not yet run on Windows); the cost is the memory.max row's
   difference (such pages counted on top of live memory until their chunk goes), which reclaim at the limit is to
-  close. Still not charged: memfds and
-  sections made around wick.
+  close.
+
+  Sections made around wick (a compromised Firecracker's) are counted by the jailer
+  (overlay/jailer/platform/windows/commit.rs): every 1 ms, over the job's processes, private commit plus section
+  commit (`PROCESS_MEMORY_COUNTERS_EX2.SharedCommitUsage`, which counts a section for whoever holds a handle or a
+  view of it, a closed handle with a view kept included: SECTREC-e shared, PC b4717ec), less the committed
+  `PAGE_NOACCESS` private memory that pays for wick's own sections (no more than the section commit) and the large
+  pages the jailer gave; past `memory.max` the jail is ended with 137 and the jailer names the count
+  (`jailer-test.ps1 sections`, `test_a_section_past_the_limit_ends_the_jail_with_137`,
+  `test_charge_pages_pay_for_the_sections_they_cover`; not yet run on Windows). A process of the job the jailer
+  cannot open or read ends the jail the same way. What a compromised Firecracker can still do:
+  - **Take host commit past the limit for up to one poll**, about 1 ms: Windows tells no user-mode process of a
+    section's creation and charges it to no job or quota (SECTREC-a, and SECTREC-e quota and shared, PC b4717ec,
+    `test_section_memory_and_a_charge_for_it_on_record`; `ObRegisterCallbacks` takes process, thread and desktop
+    handles only, Microsoft Learn, `OB_OPERATION_REGISTRATION`), and a 4 GiB section is made in 27.8 us
+    (SECTREC-e c). Linux charges each page before it is mapped (v6.1 mm/memcontrol.c, `try_charge_memcg`). An OS
+    limit; RAM touched in the window is bounded by how fast the process writes.
+  - **Hold up to twice `memory.max` of usable memory for up to 100 ms**, by freeing the `PAGE_NOACCESS` commit the
+    count took off and committing as much usable private memory between two reads of it (they come every 100 ms,
+    whenever a process's private commit falls below its last read, and before any kill). Host commit is bounded by
+    twice `memory.max` at all times: what is taken off is commit the job charged. To close it, the read on every
+    poll, which costs about 0.8 ms for a jail laid out as Firecracker's (SECTREC-d, PC 2be20a5): not done.
+  - **Move commit out of the jail through a peer that pulls handles**: a userfaultfd handler or a vhost-user
+    backend that receives descriptors pulls the handles a jailed sender offers (`sock_ctrl_msg`, `FLAG_PULL`), and
+    a section's commit then counts for the peer (SECTREC-e: the charge follows the holder). On Linux a shmem page
+    stays charged to the cgroup that faulted it, whoever holds the descriptor (v6.1 mm/shmem.c). Bounded today by
+    when the peers receive (the userfaultfd handshake, vhost-user's memory-table messages) and by their receive
+    room (descriptors past it are closed). To close it: the receiving side refuses a pagefile-backed section from a
+    sender in another job unless its protocol carries one, and counts what it took; not done.
+  - **Guest memory backed by a memfd** (with vhost-user devices) is a temporary file's section, page cache, which
+    the count leaves out as it leaves out a file's (Linux reclaims page cache at `memory.max` rather than ending the
+    process); a memfd is shmem on Linux, charged. To close it: a charge at first touch, as for wick's anonymous
+    shared memory; not done.
+  - **Under a parent cgroup**, sections are counted against each jail's own `memory.max`, not the parent's.
+  - **Large pages**: the count takes off the bytes of large-page sections the jailer gave (hugetlb's on Linux,
+    bounded by `hugetlb.2MB.max`), on the reading that `SharedCommitUsage` counts a large-page section as any
+    pagefile-backed one; not measured. If it does not, up to `hugetlb.2MB.max` of other sections go uncounted. To
+    settle it: `jailer-test.ps1 hugepages` reading the jailed process's `SharedCommitUsage` with the guest on large
+    pages; not done.
+  - **On a host without `SharedCommitUsage`** (Microsoft Learn gives `PROCESS_MEMORY_COUNTERS_EX2` for Windows 10
+    22H2 and Windows 11 22H2, each with the September 2023 cumulative update, and later; no server is listed), the
+    jailer cannot count sections; it proves the count on each host before it starts a jail, and where it fails it
+    says so in a warning and keeps the job's limit alone.
 - **Windows jailer: the handle limit holds only in the jailed process.** Upstream's jailer limits Firecracker to
   2048 descriptors by default (`RLIMIT_NOFILE`), and the kernel enforces it. Windows has no per-process handle limit
   to set: a process's pool quota is accepted and ignored (200,000 handles made after a 1 MiB paged-pool quota,

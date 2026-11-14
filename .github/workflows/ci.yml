@@ -1350,8 +1350,11 @@ jobs:
           # jailer's rules and print what Windows answered (PARENTTEST
           # lines). A jail's job under a parent has a name and, beside it,
           # what the jail was asked for, which the tool reads when a level
-          # above is written.
+          # above is written. And memory.max's count of sections
+          # (platform::commit), alone for its COMMITPOLL line: how long after
+          # a section past the limit was given the jail ended with 137.
           for t in test_a_jails_job_under_a_parent_job_on_record test_nested_jobs_on_record \
+              test_a_section_past_the_limit_ends_the_jail_with_137 \
               test_hugetlb_page_sizes_are_linuxs \
               test_a_parent_bounds_its_jails_together test_a_parent_lasts_while_a_jail_holds_it \
               test_a_jail_under_a_parent_has_linuxs_cpus_and_rate \
@@ -1552,29 +1555,19 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir $env:WJT -Assets $env:WBT `
             -Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,daemonize,handles,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,uffd,vhost-user
           exit $LASTEXITCODE
-      # A known gap, as an expected failure: memory.max does not bound
-      # memory in sections (docs/COMPATIBILITY.md, the memory.max row's
-      # Windows cell, 🔴 not done yet; W2, the user's decision). The stage
-      # asserts the goal and fails today; this step passes only when it
-      # fails with exactly that result (the private-memory control held
-      # within 32 MiB, and both kinds of section took all 256 MiB) and
-      # nothing else failed or was left mapped, and says so. Any other
-      # result fails it, the gap closing among them, which the docs must
-      # then follow.
-      - name: jailer-test.ps1 sections (known gap, expected to fail)
+      # memory.max and sections (docs/COMPATIBILITY.md, the memory.max row's
+      # Windows cell; SECURITY.md, W2): the job refuses private memory, the
+      # jailer's count ends a jail whose pagefile-backed sections pass the
+      # limit with 137 at the next 1 ms poll, and temporary-file sections
+      # (page cache) are allowed. Its own step, with its own work directory,
+      # so that its result reads apart from the other stages'.
+      - name: jailer-test.ps1 sections
         if: success() || failure()
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir "$env:WJT-sections" -Assets $env:WBT -Stage sections
-          $lines = @(Get-Content "$env:WJT-sections\summary.txt" -ErrorAction SilentlyContinue)
-          $gap = @($lines | Where-Object { $_ -match '^FAIL  sections: memory\.max=32 MiB holds private memory \(denied after \d+ MiB\) but not: sections: sections:256 allowed 256 \(exit 0\); filesections: filesections:256 allowed 256 \(exit 0\)$' })
-          $drives = @($lines | Where-Object { $_ -eq 'PASS  drives: every jail drive was removed' })
-          $failed = @($lines | Where-Object { $_.StartsWith('FAIL') })
-          if ($gap.Count -eq 1 -and $drives.Count -eq 1 -and $failed.Count -eq 1) {
-            Write-Host "::notice::sections: the known gap, as documented: memory.max does not bound sections (docs/COMPATIBILITY.md, memory.max row, Windows: not done yet). W2: user decision pending."
-            exit 0
-          }
-          Write-Host "::error::sections: not the documented known gap (or the gap closed: update docs/COMPATIBILITY.md and this step): $($lines -join ' | ')"
-          exit 1
+          $code = $LASTEXITCODE
+          Get-Content "$env:WJT-sections\summary.txt" -ErrorAction SilentlyContinue
+          exit $code
       # pidns types into its console and reads it, and a step has none: the
       # script runs in a console of its own, as in a PowerShell window, and
       # its output is the summary it writes.
@@ -1702,7 +1695,6 @@ jobs:
           $out += 'boot-test.ps1 prints its stages in its step and keeps them in the results archive of the artifact.'
           $out += ''
           $out += 'Known gaps, steps that pass only on their documented failure (a green job is not "everything passes"):'
-          $out += '- jailer-test.ps1 sections: memory.max does not bound memory in sections (docs/COMPATIBILITY.md, memory.max row; W2, the user''s decision).'
           $out += '- jailer-test.ps1 bindlink: no bindlink.dll on this image, so no bind links (test_jailer_bind_mount_propagation impossible here); with the DLL the stage''s result counts.'
           $out += ''
           $out += 'Not run here, the PC''s: the jailer unelevated (this token is elevated), Windows 11 (this is Windows Server),'

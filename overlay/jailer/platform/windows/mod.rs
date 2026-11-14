@@ -51,7 +51,10 @@
 //! - **cgroups are a Job Object** ([`cgroup`](super::cgroup)): job memory
 //!   limit, CPU rate hard cap (from Firecracker's start, as a cgroup's
 //!   limit holds from the exec) or CPU weight, processor affinity; the job
-//!   kills Firecracker when the jailer goes and limits its UI access.
+//!   kills Firecracker when the jailer goes and limits its UI access. The
+//!   job's memory limit charges private commit only, so the jailer counts
+//!   the jail's sections too, every millisecond, and ends the jail with 137
+//!   past `memory.max` ([`commit`]).
 //! - **The freezer** ([`freezer`]): upstream's cgroup freezer files next to
 //!   the jail's root, for every jail, kept by the jailer, which freezes and
 //!   thaws the job as a whole.
@@ -146,6 +149,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub(crate) mod cgroup_values;
+mod commit;
 mod console;
 mod freezer;
 mod large_pages;
@@ -2415,6 +2419,17 @@ fn exec(
         freezer.killed(&f);
         return Err(kill("the jail's freezer", io::Error::other(f.to_string())));
     }
+    // memory.max for what the job does not charge, sections: the jailer
+    // counts the jail's memory every millisecond from before it runs until
+    // Firecracker ends, and ends the jail with 137 past the limit (`commit`).
+    let memory = match limits.memory_bytes {
+        Some(limit) => {
+            let large = broker.as_ref().map(large_pages::Broker::given);
+            commit::watch(job.as_raw_handle(), fc_process, limit, large)
+                .map_err(|e| kill("the count of the jail's memory", e))?
+        }
+        None => None,
+    };
     for p in std::iter::once(&fc).chain(api_process.as_ref()) {
         // SAFETY: the suspended main thread.
         if unsafe { ResumeThread(p.thread.as_raw_handle()) } == u32::MAX {
@@ -2466,6 +2481,11 @@ fn exec(
         freezer.killed(&f);
         // SAFETY: the jail's job.
         unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
+    }
+    // The count ends with Firecracker; its handle to the job goes with it,
+    // so that the job's last handle, below, ends what is left of the jail.
+    if let Some(count) = memory {
+        let _ = count.join();
     }
     let mut code = 1u32;
     // SAFETY: our child, ended.

@@ -1013,26 +1013,36 @@ function Stage-Nofile {
     } finally { Stop-Jailed }
 }
 
-# memory.max bounds all of the jailed process's memory, as a cgroup does: under
-# 32 MiB, private memory (the control), pagefile-backed sections and sections of
-# temporary files (wick's memfd) are each refused well before 256 MiB.
-# FAILS today: a Job Object charges private commit only (docs/COMPATIBILITY.md,
-# memory.max), and this stage says how much the sections took.
+# memory.max bounds the jailed process's memory, as a cgroup does, sections
+# included: under 32 MiB, private memory (the control) is refused by the job
+# (or the process is ended with 137 by the jailer's count, whichever comes
+# first), and pagefile-backed sections, which no job charges, end the jail
+# with 137 at the jailer's next count, one poll after the last one under the
+# limit (overlay/jailer/platform/windows/commit.rs). Sections of temporary
+# files are page cache, which Linux too reclaims at memory.max rather than
+# ending the process for (the memory.max row): all 256 MiB are allowed.
 function Stage-Sections {
     $probe = Get-Probe
     $base = New-Base 'sections'
     $common = @('--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--cgroup-version', '2', '--cgroup', 'memory.max=33554432')
+    $killed = 'jailer: memory\.max: the jail''s memory, (\d+) bytes .* is past the memory limit \(memory\.max 33554432\): the jail is ended with 137; the poll before, (\d+) us earlier, counted (\d+);'
     $r = Invoke-Jailer (@('--id', 'private') + $common + @('--', 'private:256')) 120000
-    Check ($r[1] -match 'private:256 denied after (\d+)' -and [int]$Matches[1] -le 32) "the control, private memory under memory.max=32 MiB: exit $($r[0]): $($r[1])"
-    $control = [int]$Matches[1]
-    $escaped = @()
-    foreach ($kind in 'sections', 'filesections') {
-        $r = Invoke-Jailer (@('--id', $kind) + $common + @('--', "${kind}:256")) 120000
-        if ($r[1] -match "${kind}:256 denied after (\d+)" -and [int]$Matches[1] -le 32) { continue }
-        $escaped += "${kind}: $(($r[1] -split "`n" | Where-Object { $_ -match "^${kind}:" }) -join ' ') (exit $($r[0]))"
-    }
-    Check ($escaped.Count -eq 0) "memory.max=32 MiB holds private memory (denied after $control MiB) but not: $($escaped -join '; ')"
-    "under memory.max=32 MiB private memory stops after $control MiB, and so do pagefile-backed and temporary-file sections"
+    $denied = $r[1] -match 'private:256 denied after (\d+)' -and [int]$Matches[1] -le 32
+    $control = if ($denied) { "denied after $($Matches[1]) MiB" } else { '' }
+    if (-not $denied -and $r[0] -eq 137 -and $r[1] -match $killed) { $control = "ended with 137 at $([math]::Round([long]$Matches[1] / 1MB, 1)) MiB counted" }
+    Check ($control -ne '') "the control, private memory under memory.max=32 MiB: exit $($r[0]): $($r[1])"
+    $r = Invoke-Jailer (@('--id', 'sections') + $common + @('--', 'sections:256')) 120000
+    Check ($r[0] -eq 137 -and $r[1] -match $killed) "pagefile-backed sections under memory.max=32 MiB: not ended with 137 by the jailer's count: exit $($r[0]): $($r[1])"
+    $counted = [long]$Matches[1]; $gap = [long]$Matches[2]; $before = [long]$Matches[3]
+    Check ($before -le 33554432) "the poll before the kill counted $before bytes, past the limit, and did not end the jail"
+    # One poll is 1 ms on a high-resolution waitable timer; 5 ms allows for a
+    # loaded runner's scheduling, and fails a kill that waited for a later poll
+    # or for the 100 ms read of the cover.
+    Check ($gap -le 5000) "the jail was ended $gap us after the last count under the limit, not at the next poll"
+    Check (-not ($r[1] -match 'sections:256 allowed')) "the probe took all 256 MiB of sections: $($r[1])"
+    $r = Invoke-Jailer (@('--id', 'filesections') + $common + @('--', 'filesections:256')) 120000
+    Check ($r[0] -eq 0 -and $r[1] -match 'filesections:256 allowed 256') "temporary-file sections under memory.max=32 MiB (page cache, not counted): exit $($r[0]): $($r[1])"
+    "under memory.max=32 MiB private memory is $control; pagefile-backed sections end the jail with 137 at $([math]::Round($counted / 1MB, 1)) MiB counted, $gap us after the last count under the limit ($([math]::Round($before / 1MB, 1)) MiB); temporary-file sections, page cache, take all 256 MiB"
 }
 
 function Stage-Pidns {

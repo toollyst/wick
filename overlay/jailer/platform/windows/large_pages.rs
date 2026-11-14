@@ -16,8 +16,9 @@
 //!
 //! As on Linux, where huge pages come from a pool an administrator reserved
 //! and the hugetlb controller limits them (not `memory.max`), the sections
-//! are not charged to the jail's job, and the jailer refuses past the jail's
-//! `hugetlb.2MB.max` (the sizes it gave, in all). That limit is the pool:
+//! are not charged to the jail's job nor to the jailer's count of the jail's
+//! memory (`commit`, which takes the bytes given off), and the jailer refuses
+//! past the jail's `hugetlb.2MB.max` (the sizes it gave, in all). That limit is the pool:
 //! Windows has no pool an administrator reserved, so large pages are taken
 //! from the host's free physical memory, not pageable and outside the job's
 //! memory limit, and a jail without a `hugetlb.2MB.max` gets no broker (a
@@ -27,6 +28,8 @@
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use windows_sys::Win32::Foundation::{
@@ -51,6 +54,9 @@ pub(super) struct Broker {
     reply_read: OwnedHandle,
     reply_write: OwnedHandle,
     limit: Option<u64>,
+    /// The bytes given so far, which the jailer's count of the jail's
+    /// memory takes off its section commit (`commit`).
+    given: Arc<AtomicU64>,
 }
 
 /// Whether this process may make large-page sections: its token holds
@@ -120,12 +126,18 @@ impl Broker {
         // Firecracker's ends only.
         inheritable(&request_write)?;
         inheritable(&reply_read)?;
-        Ok(Some(Broker { request_read, request_write, reply_read, reply_write, limit }))
+        Ok(Some(Broker { request_read, request_write, reply_read, reply_write, limit, given: Arc::default() }))
     }
 
     /// The value of [`ENV`] for Firecracker.
     pub(super) fn child_value(&self) -> String {
         format!("{},{}", self.request_write.as_raw_handle() as usize, self.reply_read.as_raw_handle() as usize)
+    }
+
+    /// The bytes given so far: counted before a section reaches
+    /// Firecracker, and given back if it does not.
+    pub(super) fn given(&self) -> Arc<AtomicU64> {
+        self.given.clone()
     }
 
     /// The handles Firecracker inherits.
@@ -137,11 +149,10 @@ impl Broker {
     /// into) until it closes its end. Firecracker's ends are closed here: it
     /// has its own.
     pub(super) fn serve(self, process: HANDLE) -> JoinHandle<()> {
-        let Broker { request_read, request_write, reply_read, reply_write, limit } = self;
+        let Broker { request_read, request_write, reply_read, reply_write, limit, given } = self;
         drop((request_write, reply_read));
         let process = process as usize;
         std::thread::spawn(move || {
-            let mut given = 0u64;
             loop {
                 let mut request = [0u8; 8];
                 let mut n = 0u32;
@@ -154,12 +165,15 @@ impl Broker {
                     return;
                 }
                 let len = u64::from_le_bytes(request);
-                let (handle, err) = match section(len, given, limit, process as HANDLE) {
-                    Ok(h) => {
-                        given += len;
-                        (h, 0)
+                // Counted as given before Firecracker holds it, so that the
+                // jail's count never sees it as a section of its own.
+                let before = given.fetch_add(len, Ordering::AcqRel);
+                let (handle, err) = match section(len, before, limit, process as HANDLE) {
+                    Ok(h) => (h, 0),
+                    Err(e) => {
+                        given.fetch_sub(len, Ordering::AcqRel);
+                        (0, e)
                     }
-                    Err(e) => (0, e),
                 };
                 let mut reply = [0u8; 12];
                 reply[..8].copy_from_slice(&handle.to_le_bytes());

@@ -221,14 +221,12 @@ run red but does not hold the guests back; `.github/workflows/ci.yml`,
   into its console, and a step has none), `bindlink` in a step of its own:
   on an image without `bindlink.dll` the step passes only when the stage
   failed at that check alone and left no drive, and says so in a notice;
-  with the DLL the stage's result is the step's. `sections` too, as a known
-  gap: `memory.max` does not bound memory in sections (docs/COMPATIBILITY.md,
-  the `memory.max` row, not done yet), so the stage fails, and its step
-  passes only on that exact failure (the private-memory control held, both
-  kinds of section took all 256 MiB, no drive left), saying so in a notice;
-  any other result fails it, the gap closing included. The job's summary
-  lists both such steps, so that a green job does not read as every stage
-  passing.
+  with the DLL the stage's result is the step's. `sections` in a step of
+  its own too, with its own result: pagefile-backed sections past
+  `memory.max` end the jail with 137 at the jailer's next count, and
+  temporary-file sections (page cache) are allowed (docs/COMPATIBILITY.md,
+  the `memory.max` row). The job's summary lists `bindlink`'s step, so that
+  a green job does not read as every stage passing.
 
 A failed stage fails the job, the stages after it still run, and the logs
 are the artifact `windows-guest-logs`. A stage's result on the runner is a

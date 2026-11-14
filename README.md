@@ -232,7 +232,7 @@ That is the goal, and it is not negotiable: every control Firecracker has on Lin
 Hardware virtualization and the minimal device model are the same on every host, and the VMM process is already
 confined by Seatbelt on macOS and by a process mitigation profile on Windows. Upstream's jailer runs on both with
 native backends — on Windows the jail as a drive and a restricted token, the Job Object for CPU and private memory
-(memory in sections is not bounded yet), the mitigation profile, `--daemonize` and `--netns` (a directory of
+(memory in sections bounded by the jailer's count every millisecond), the mitigation profile, `--daemonize` and `--netns` (a directory of
 endpoints as the jail's network, and no IP for the jail through the Windows Filtering Platform).
 [SECURITY.md](SECURITY.md) lists each control, per host, with what is done and what is not.
 
