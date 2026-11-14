@@ -15,6 +15,7 @@
 # Format: <crate> <upstream version> <wick version> <reason>
 
 rustix 1.1.4 1.1.6 RUSTSEC-2026-0486
-# patches/0049: upstream's 18b08295a82a ("chore(deps): bump vm-superio to
-# v0.8.2"), the serial interrupt for input that came while IER was masked.
+# patches/0049: upstream's commit 18b08295a82a ("chore(deps): bump
+# vm-superio to v0.8.2"), the serial interrupt for input that came while
+# IER was masked.
 vm-superio 0.8.1 0.8.2 upstream-18b08295a82a
