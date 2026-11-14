@@ -472,8 +472,26 @@ def memory_maps(self, grouped=True):
     the sum, 6.89 MiB against 2.27 + 4.48. Upstream's Firecracker is a static
     binary on Linux, its libc inside its own text. XNU splits a large
     mapping of memory into regions of at most 128 MiB (ANON_CHUNK_SIZE);
-    adjacent regions alike in everything but their object are one mapping
-    here, as Linux merges such areas into one.
+    adjacent regions alike in everything but their object and its share mode
+    are one mapping here, as Linux merges such areas into one: the share mode
+    is a state of the object's pages, not of the mapping (fresh pages that
+    replaced a piece of guest memory are SM_EMPTY among SM_TRUESHARED ones,
+    which Hypervisor.framework holds), and Linux's merge does not look at it
+    (v6.1 mm/mmap.c is_mergeable_vma, is_mergeable_anon_vma). A shared
+    mapping stays apart, as Linux's VM_SHARED keeps its area apart: XNU's
+    mmap makes a MAP_SHARED mapping VM_INHERIT_SHARE, a private one
+    VM_INHERIT_DEFAULT (bsd/kern/kern_mman.c mmap), and that is compared
+    (memory-selftest.py's punch and share checks).
+    A walk is one proc_pidinfo call per region, each a lookup of its own
+    under the map's lock (XNU osfmk/vm/bsd_vm.c fill_procregioninfo), so it
+    is no snapshot: a region replaced between two calls (a balloon's discard
+    of guest memory, mmap MAP_FIXED over pages across the regions the walk
+    already passed) comes back starting before the walk's position, and the
+    regions would no longer be adjacent where the guest memory is one. Such
+    a walk is taken again, up to WALKS times in a row, then refused loudly
+    (memory-selftest.py's churn check: before, 221 of 330 walks split the
+    64 MiB under such replacements; a monitor's sample of a balloon test
+    read 25 MiB of guest pages as the VMM's own that way).
     """
     if grouped:
         raise NotImplementedError("grouped memory maps")
@@ -481,7 +499,23 @@ def memory_maps(self, grouped=True):
         return _memory_maps(self)
 
 
+# Walks of a process's regions taken before _memory_maps gives up on a
+# consistent one.
+_WALKS = 100
+
+
 def _memory_maps(self):
+    """The mappings of a consistent walk (memory_maps)."""
+    for _ in range(_WALKS):
+        maps = _walk_regions(self)
+        if maps is not None:
+            return maps
+    raise RuntimeError(f"pid {self.pid}: its regions changed during each of {_WALKS} walks in a row")
+
+
+def _walk_regions(self):
+    """One walk of the regions: the mappings, or None when a region came
+    back starting before the walk's position (the map changed during it)."""
     page = os.sysconf("SC_PAGE_SIZE")
     lo, hi = _shared_cache()
     maps, addr, last = [], 0, None
@@ -495,12 +529,14 @@ def _memory_maps(self):
                 raise psutil.NoSuchProcess(self.pid)
             break
         r = info.info
+        if r.address < addr:
+            return None
         addr = r.address + r.size
         if r.user_tag == _FOOTPRINT_REGION_TAG:
             continue
         in_cache = lo <= r.address < hi
         path = info.path.decode(errors="replace")
-        kind = (r.protection, r.max_protection, r.share_mode, r.user_tag, path, in_cache)
+        kind = (r.protection, r.max_protection, r.inheritance, r.user_tag, path, in_cache)
         if last and last[0] == kind and maps[-1].addr + maps[-1].size == r.address:
             maps[-1].size += r.size
             maps[-1].present += r.pages_resident * page

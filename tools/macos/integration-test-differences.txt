@@ -115,6 +115,27 @@ all arch integration_tests/functional/test_api.py::test_send_ctrl_alt_del
 # (microvm.py kill, check_samples): a test that kills one inside its body
 # stops there, and its steps after that kill did not run, untested rather
 # than passed.
+# Guest memory a balloon's discard split is counted as guest memory again.
+# The discard maps fresh pages over the range (the compatibility libc's
+# MADV_DONTNEED). The harness read the guest region in pieces two ways:
+# the fresh pages are SM_EMPTY among the SM_TRUESHARED ones
+# Hypervisor.framework holds, and it kept regions of another share mode
+# apart; and its walk of the regions, one proc_pidinfo lookup each (XNU
+# osfmk/vm/bsd_vm.c fill_procregioninfo), met a region replaced between
+# two lookups, which came back starting before the walk's position. So
+# upstream's size rule (memory.py is_guest_mem) knew none of the pieces,
+# and the guest's pages in them counted as the VMM's own: 29.2 to 31.2 MiB
+# in 4 of 84 microVMs of test_reinflate_balloon, test_deflate_on_oom,
+# test_memory_scrub and test_device_reset (runs mac9-split-1 to -6, with
+# and without the libmalloc configuration alike; mac9-raw3-1 showed the
+# walk's overlap of 768 KiB, and a second walk one 256 MiB region). It
+# merges as Linux merges the areas, by everything but the share mode, a
+# shared mapping apart, and takes a walk that met a change again
+# (memory-selftest.py's punch, churn and share checks): 0 of 112 microVMs
+# of those four tests over 5 MiB after, at most 4.78 MiB (mac9-fixed-1 to -8).
+# Only the count was wrong: the guest reads its pages and the host the same
+# ones after a discard (test_madvise_dontneed_replaces_guest_pages,
+# `boot-test balloon`).
 # excused: at least 19 (run m2-parts2 at d706d9a): pass their own assertions up to the memory budget of the VMM's own part, which fails them in the teardown or, in 5, at a kill inside the test, whose later steps then did not run (test_vsock_transport_reset_h2g, all four, before their restore; test_vsock_transport_reset_g2h[PCI_ON-2vcpu] after 2 of its 5 restores)
 all bug failure:host_tools.memory.MemoryUsageExceededError
 

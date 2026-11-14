@@ -18,8 +18,16 @@ harness (wick_macos) reads it as upstream's tests would read a Firecracker:
   checks);
 - each of memory_maps' mappings counts its present and its compressed pages
   (`rss` = `present` + `swapped`), and the helper's 64 MiB are in one;
+- after the helper maps fresh pages over a MiB in their middle (as a
+  balloon's discard of guest memory does), the 64 MiB are still one mapping,
+  whose piece of no pages has another share mode (SM_EMPTY);
+- while a thread of the helper maps fresh pages over one 64 KiB piece after
+  another, every walk of the regions finds the 64 MiB as one mapping (a
+  walk is one proc_pidinfo call per region, so a replacement between two
+  calls is taken again, not read as a split);
 - after the helper replaces the 64 MiB with fresh pages (mmap MAP_FIXED, as
-  wick's MADV_DONTNEED of private memory does), both readings fall by them.
+  wick's MADV_DONTNEED of private memory does), both readings fall by them;
+- a shared mapping over their last MiB is a mapping apart.
 
 With --wait-compressed, the helper first waits, up to SECONDS, for the host
 to compress at least half of the 64 MiB (nothing here makes memory pressure:
@@ -70,6 +78,37 @@ for line in sys.stdin:
     if line.strip() == "replace":
         new = lib.mmap(addr, SIZE, PROT, FLAGS | 0x10, -1, 0)  # MAP_FIXED
         print("replaced" if new == addr else f"mmap failed {ctypes.get_errno()}", flush=True)
+    elif line.strip() == "punch":
+        # Fresh pages over one MiB in the middle, as a balloon's discard of
+        # guest memory: a piece of no pages among written ones.
+        at = addr + SIZE // 2
+        new = lib.mmap(at, 1 << 20, PROT, FLAGS | 0x10, -1, 0)  # MAP_FIXED
+        print("punched" if new == at else f"mmap failed {ctypes.get_errno()}", flush=True)
+    elif line.strip() == "churn":
+        # Fresh pages over pieces of 5 pages, one after another from a
+        # thread, each across the boundaries earlier ones left, as a
+        # balloon's discards come while the monitor walks the regions.
+        import threading
+        stop = threading.Event()
+        def churn():
+            k, piece = 0, 5 * page
+            while not stop.is_set():
+                at = addr + ((k * 7919) % ((SIZE - piece) // page)) * page
+                lib.mmap(at, piece, PROT, FLAGS | 0x10, -1, 0)  # MAP_FIXED
+                k += 1
+        t = threading.Thread(target=churn, daemon=True)
+        t.start()
+        print("churning", flush=True)
+        sys.stdin.readline()
+        stop.set()
+        t.join()
+        print("still", flush=True)
+    elif line.strip() == "share":
+        # A shared mapping over the last MiB: Linux's VM_SHARED, a mapping of
+        # its own.
+        at = addr + SIZE - (1 << 20)
+        new = lib.mmap(at, 1 << 20, PROT, mmap.MAP_SHARED | mmap.MAP_ANON | 0x10, -1, 0)  # MAP_FIXED
+        print("shared" if new == at else f"mmap failed {ctypes.get_errno()}", flush=True)
     else:
         break
 """.replace("@SIZE@", str(SIZE))
@@ -153,6 +192,31 @@ def main():
             check("compressed: the mapping's rss still counts the 64 MiB", cregion is not None and cregion.rss >= SIZE,
                   f"{cregion.rss >> 10 if cregion else None} KiB")
             rss, info, region = crss, cinfo, cregion
+        helper.stdin.write("punch\n")
+        helper.stdin.flush()
+        check("punch: the helper mapped fresh pages over a MiB in the middle", helper.stdout.readline().strip() == "punched",
+              "mmap MAP_FIXED")
+        maps = w.memory_maps(proc, grouped=False)
+        pieces = [(hex(m.addr), m.size >> 10, m.share_mode) for m in maps if m.addr < addr + SIZE and m.addr + m.size > addr]
+        region = next((m for m in maps if m.addr <= addr < m.addr + m.size), None)
+        check("punch: the 64 MiB are still one mapping, as Linux merges the areas (the piece's share mode differs)",
+              region is not None and region.addr == addr and region.size == SIZE, f"pieces {pieces}")
+        helper.stdin.write("churn\n")
+        helper.stdin.flush()
+        check("churn: the helper maps fresh pieces from a thread", helper.stdout.readline().strip() == "churning", "")
+        walks, bad = 0, []
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            maps = w.memory_maps(proc, grouped=False)
+            walks += 1
+            region = next((m for m in maps if m.addr <= addr < m.addr + m.size), None)
+            if not (region and region.addr == addr and region.size == SIZE):
+                bad.append([(hex(m.addr), m.size >> 10) for m in maps if m.addr < addr + SIZE and m.addr + m.size > addr])
+        helper.stdin.write("\n")
+        helper.stdin.flush()
+        helper.stdout.readline()
+        check("churn: every walk while pieces are replaced finds the 64 MiB as one mapping",
+              walks > 0 and not bad, f"{len(bad)} of {walks} walks split it; the first: {bad[0] if bad else None}")
         helper.stdin.write("replace\n")
         helper.stdin.flush()
         check("replace: the helper mapped fresh pages", helper.stdout.readline().strip() == "replaced", "mmap MAP_FIXED")
@@ -165,6 +229,15 @@ def main():
               f"the 64 MiB held {region.swapped >> 10} KiB compressed")
         check("replaced: the mapping holds nothing", rregion is not None and rregion.rss < MIB,
               f"{rregion.rss >> 10 if rregion else None} KiB")
+        helper.stdin.write("share\n")
+        helper.stdin.flush()
+        check("share: the helper mapped shared pages over the last MiB", helper.stdout.readline().strip() == "shared",
+              "mmap MAP_SHARED MAP_FIXED")
+        maps = w.memory_maps(proc, grouped=False)
+        region = next((m for m in maps if m.addr <= addr < m.addr + m.size), None)
+        check("share: a shared piece is a mapping apart, as Linux's VM_SHARED is",
+              region is not None and region.addr == addr and region.size == SIZE - MIB,
+              f"{(hex(region.addr), region.size >> 10) if region else None}")
     finally:
         helper.kill()
         helper.wait()
