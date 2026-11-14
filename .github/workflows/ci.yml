@@ -1638,20 +1638,32 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage linux-snapshot `
             -LinuxSnapshot "$env:RUNNER_TEMP\linux-snapshot"
           exit $LASTEXITCODE
-      # Option E's x2APIC partition on this AMD runner, through the kit's
+      # Option E's x2APIC partition on an AMD runner, through the kit's
       # x2APIC record build (kvm-ioctls' whp-x2apic-record; the product's
       # partitions stay xAPICs, vm::X2APIC_PARTITIONS): the guest in x2APIC
       # mode with its local timers in TSC-deadline mode, each LVT timer
       # write the backend's held page write (option E-ii), then CPU 1
       # offline and online after boot and after a snapshot restore. Five
-      # runs, each its own guests; a PC runs it ten times.
+      # runs, each its own guests; a PC runs it ten times. Option E makes
+      # x2APIC partitions on AMD hosts only: on another runner (the job's
+      # are AMD or Intel) the stage ends not applicable, exit code 3, with
+      # the host's vendor and the build's line, which this step accepts
+      # only where its own look at the processor finds no AMD one, once,
+      # as a notice; on an AMD runner 3 is a failure.
       - name: boot-test.ps1 x2apic
         if: success() || failure()
         run: |
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          Write-Host "the runner's processor: $($cpu.Manufacturer), $($cpu.Name.Trim())"
           $failed = 0
           foreach ($i in 1..5) {
             powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage x2apic
-            if ($LASTEXITCODE -ne 0) { $failed++ }
+            $code = $LASTEXITCODE
+            if ($code -eq 3 -and $cpu.Manufacturer -ne 'AuthenticAMD') {
+              Write-Host "::notice::boot-test.ps1 x2apic is not applicable on this $($cpu.Manufacturer) runner: option E makes x2APIC partitions on AMD hosts only (the stage's line above)"
+              exit 0
+            }
+            if ($code -ne 0) { $failed++ }
           }
           if ($failed) { Write-Host "::error::boot-test.ps1 x2apic failed in $failed of 5 runs"; exit 1 }
       # The guest files are the boot test's (-Assets). pidns, bindlink,

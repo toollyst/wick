@@ -82,7 +82,8 @@
 #          partition on an AMD host: the guest in x2APIC mode with its local
 #          timers in TSC-deadline mode, through the backend's held LVT timer
 #          write, then the smp stage on it (CPU 1 offline and online, after
-#          boot and after a snapshot restore)
+#          boot and after a snapshot restore); on a host that is not AMD,
+#          where option E makes no x2APIC partition, N/A (exit code 3)
 #   gdb    (not in `all`: needs a Firecracker built with the gdb feature and
 #          a gdb) upstream's debug kernel under gdb: a hardware breakpoint at
 #          start_kernel, the kernel's bytes read through the stub's address
@@ -191,6 +192,13 @@ namespace Wick {
     // A failed check: the message is the reason the summary shows.
     public class Failure : Exception {
         public Failure(string message) : base(message) { }
+    }
+
+    // A stage that cannot run on this host, by design (the x2apic stage on
+    // a host that is not AMD): the summary's N/A, and exit code 3 when no
+    // stage failed.
+    public class NotApplicable : Failure {
+        public NotApplicable(string message) : base(message) { }
     }
 
     // A Firecracker process: its serial console (stdout) and stderr collected
@@ -1782,6 +1790,7 @@ function Find-Firecracker {
 }
 
 function Fail([string]$why) { throw (New-Object Wick.Failure $why) }
+function Not-Applicable([string]$why) { throw (New-Object Wick.NotApplicable $why) }
 function Check([bool]$ok, [string]$why) { if (-not $ok) { Fail $why } }
 
 # A stage's summary: what its block returns, which must be one string. A
@@ -3949,7 +3958,14 @@ function Stage-X2Apic {
         $vm.Drain(2000)
         $said = $vm.Output + "`n" + (Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue)
         $build = [regex]::Match($said, 'whp: a whp-x2apic-record build[^\r\n]*').Value
-        Check ($build -match 'emulate an x2APIC') "not an x2APIC partition (this host is not AMD, or $fc is not the record build): '$build'"
+        # Option E makes x2APIC partitions on AMD hosts only
+        # (apicmode::partition_for): elsewhere the build says its
+        # partitions are xAPICs, and the stage cannot run.
+        $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+        if ($build -match 'emulate an xAPIC' -and $cpu.Manufacturer -ne 'AuthenticAMD') {
+            Not-Applicable "not applicable on this host ($($cpu.Manufacturer), $($cpu.Name.Trim())): option E makes x2APIC partitions on AMD hosts only; the build's line: '$build'"
+        }
+        Check ($build -match 'emulate an x2APIC') "not an x2APIC partition (this host is $($cpu.Manufacturer), or $fc is not the record build): '$build'"
         Check ($routing -match 'x2apic') "the guest's APIC routing: '$routing' (no x2APIC mode)"
         Check ($deadline -eq '2') "local timers in TSC-deadline mode (/proc/timer_list): '$deadline' of 2 vCPUs"
         $smp = Stage-Smp 'x2apic-smp'
@@ -4519,6 +4535,7 @@ foreach ($name in $selected) {
     } catch {
         $result = 'FAIL'
         $f = Get-Failure $_
+        if ($f -is [Wick.NotApplicable]) { $result = 'N/A' }
         $detail = if ($f) { $f.Message } else {
             "script error: $($_.Exception.GetType().Name): $($_.Exception.Message) $($_.InvocationInfo.PositionMessage)"
         }
@@ -4534,7 +4551,7 @@ foreach ($name in $selected) {
         }
         $Vms = @()
     }
-    $color = if ($result -eq 'PASS') { 'Green' } else { 'Red' }
+    $color = switch ($result) { 'PASS' { 'Green' } 'N/A' { 'Yellow' } default { 'Red' } }
     Write-Host ("   {0} ({1:N1} s): {2}" -f $result, $sw.Elapsed.TotalSeconds, $detail) -ForegroundColor $color
     [void]$Summary.Add([pscustomobject]@{ Result = $result; Stage = $name; Detail = $detail })
 }
@@ -4553,8 +4570,9 @@ if ($NotImplemented.Count -gt 0) {
 }
 foreach ($n in $NotImplemented) { $lines += "N/A   {0}: {1}" -f $n[0], $n[1] }
 $failed = @($Summary | Where-Object { $_.Result -eq 'FAIL' }).Count
+$notApplicable = @($Summary | Where-Object { $_.Result -eq 'N/A' }).Count
 $lines += ''
-$lines += "$($Summary.Count - $failed) passed, $failed failed"
+$lines += "$($Summary.Count - $failed - $notApplicable) passed, $failed failed" + $(if ($notApplicable) { ", $notApplicable not applicable on this host" } else { '' })
 # The record for the jailer's no-file bound (the --resource-limit row of
 # docs/COMPATIBILITY.md): every process's handles at its end, and the most
 # any Firecracker and any API process held, with the stage.
@@ -4601,4 +4619,8 @@ try {
     Write-Host "logs: $Results   <- zip this folder and send it back (Compress-Archive: $($_.Exception.Message))"
 }
 if ($failed -gt 0) { exit 1 }
+# A stage this host cannot run, by design, and none failed: 3, which a
+# caller accepts only where it knows the host is such a one (CI's x2apic
+# step checks the vendor itself).
+if ($notApplicable -gt 0) { exit 3 }
 exit 0
