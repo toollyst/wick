@@ -5440,6 +5440,49 @@ mod fpu_tests {
         }
     }
 
+    /// A CPU going offline writes a deadline with its APIC software-disabled
+    /// and its LVT timer entry masked with vector 0 (Linux v6.1
+    /// arch/x86/kernel/smpboot.c 1690, `native_cpu_disable`'s
+    /// `apic_soft_disable`: apic/apic.c 1181 and 1216-1218; then, idle until
+    /// it is dead, `lapic_next_deadline`, 483-494). On an xAPIC-mode vCPU the
+    /// write is taken (`IA32_TSC_DEADLINE` through `KVM_SET_MSRS`, the same
+    /// path as the guest's WRMSR exit), as KVM takes it and raises nothing;
+    /// with the APIC enabled the same entry is refused still, the case of a
+    /// write of the mode that WHP dropped with its vector
+    /// (`tscdeadline::lost_xapic_deadline`). Refused, the first ended a VMM
+    /// in `boot-test.ps1 smp`'s CPU offline and online cycles (PC step 14g at
+    /// acdec89).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_deadline_written_with_the_apic_software_disabled_is_taken() {
+        let (vm, vcpu, m) = mmio_guest(&[0xF4]);
+        let lapic = |svr: u32, lvtt: u32| {
+            let mut l = vcpu.get_lapic().unwrap();
+            for (at, v) in [(0xf0, svr), (0x320, lvtt)] {
+                for (i, b) in v.to_le_bytes().into_iter().enumerate() {
+                    l.regs[at + i] = b as std::os::raw::c_char;
+                }
+            }
+            vcpu.set_lapic(&l).unwrap();
+        };
+        // Far ahead, so that nothing fires while the test runs.
+        let deadline = || {
+            let msrs = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry { index: 0x6E0, data: 1 << 62, ..Default::default() }]).unwrap();
+            vcpu.set_msrs(&msrs).map_err(|e| e.errno())
+        };
+        lapic(0xff, 0x1_0000);
+        let disabled = deadline();
+        lapic(0x1ff, 0x1_0000);
+        let enabled = deadline();
+        eprintln!("DEADLINEOFF the entry 0x10000: APIC software-disabled {disabled:?}, enabled {enabled:?}");
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        assert_eq!(disabled, Ok(1), "a deadline written with the APIC software-disabled");
+        assert_eq!(enabled, Err(libc::ENOTSUP), "a deadline with the vector lost and the APIC enabled");
+    }
+
     /// The x2APIC partition's LVT timer in TSC-deadline mode, as KVM's
     /// (`gp`, `tscdeadline`), on an AMD host's x2APIC partition made as the
     /// product's will be (`X2APIC_PARTITION_FOR_TESTS`; elsewhere the test

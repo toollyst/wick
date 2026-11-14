@@ -1162,6 +1162,10 @@ jobs:
           # An expired TSC deadline's interrupt is its own vCPU's in x2APIC
           # mode too (the APIC ID by the mode: X2E0REC c's vCPU 1 line).
           alone whp::vcpu::fpu_tests::test_a_deadline_interrupt_goes_to_its_own_vcpu_in_x2apic_mode
+          # A deadline written with the APIC software-disabled (a CPU going
+          # offline) is taken; with the vector lost and the APIC enabled it
+          # is refused (DEADLINEOFF line).
+          alone whp::vcpu::fpu_tests::test_a_deadline_written_with_the_apic_software_disabled_is_taken
           # The x2APIC partition (AMD): the guest's TSC-deadline LVT timer
           # write finished from its #GP exit, its read, its interrupt, a
           # masked entry's none, and a #GP given back, merged into a #DF and

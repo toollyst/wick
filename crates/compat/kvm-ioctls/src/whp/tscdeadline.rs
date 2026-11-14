@@ -57,8 +57,10 @@
 //! [`deadline_interrupt`]). In xAPIC mode WHP drops that write, the entry
 //! keeping its value before it (X2E0REC f, CI run 43528910212, on an
 //! x2APIC partition as on an xAPIC one); a deadline written while the entry
-//! so kept has no valid vector would arm a timer whose interrupt never
-//! comes, and is refused, named, instead ([`lost_xapic_deadline`]).
+//! so kept has no valid vector and the APIC is software-enabled would arm a
+//! timer whose interrupt never comes, and is refused, named, instead
+//! ([`lost_xapic_deadline`]); with the APIC software-disabled (a CPU going
+//! offline) no interrupt is due, on KVM either, and the write is taken.
 
 use std::collections::HashMap;
 use std::io;
@@ -161,14 +163,28 @@ pub(crate) fn deadline_interrupt(page: &[u8], apic_base: u64) -> Option<(u32, u8
 }
 
 /// Whether a guest's non-zero `IA32_TSC_DEADLINE` write on a vCPU in xAPIC
-/// mode would arm a timer whose interrupt never comes: the entry reads as
-/// TSC-deadline mode ([`deadline_mode`]'s inference) with no valid vector,
-/// as it does when WHP dropped the guest's write that selected the mode and
-/// with it the vector (the entry before it the reset value, masked with
-/// vector 0). Such a write is refused, loudly, where it would otherwise
-/// leave the guest without its timer.
+/// mode would arm a timer whose interrupt never comes: the APIC software-
+/// enabled and the entry read as TSC-deadline mode ([`deadline_mode`]'s
+/// inference) with no valid vector, as it does when WHP dropped the guest's
+/// write that selected the mode and with it the vector (the entry before it
+/// the reset value, masked with vector 0). Such a write is refused, loudly,
+/// where it would otherwise leave the guest without its timer.
+///
+/// A software-disabled APIC takes no timer interrupt on KVM either (its LVT
+/// entries masked, `kvm_apic_local_deliver` raises none), and a guest writes
+/// a deadline there: a CPU going offline masks its LVT timer entry with
+/// vector 0 and disables its APIC (Linux v6.1 arch/x86/kernel/smpboot.c
+/// 1690, `native_cpu_disable`'s `apic_soft_disable`; apic/apic.c 1181 and
+/// 1216-1218) and then, idle until it is dead, may program its next event
+/// (`lapic_next_deadline`, apic.c 483-494). That write is taken and raises
+/// nothing ([`deadline_interrupt`]), as KVM's ignores it (`0x10000` is
+/// one-shot mode there). Refused, it ended a VMM whose guest took a CPU
+/// offline (`boot-test.ps1 smp`, PC step 14g at acdec89).
 pub(crate) fn lost_xapic_deadline(page: &[u8], apic_base: u64) -> bool {
-    apic_base & APIC_BASE_EXTD == 0 && page_in_deadline_mode(page, apic_base) && (reg(page, APIC_LVTT) & 0xff) < 16
+    apic_base & APIC_BASE_EXTD == 0
+        && reg(page, APIC_SVR) & SVR_ENABLED != 0
+        && page_in_deadline_mode(page, apic_base)
+        && (reg(page, APIC_LVTT) & 0xff) < 16
 }
 
 /// How long until a guest TSC at `tsc` reaches `deadline`, at `hz`. Rounded
@@ -430,6 +446,11 @@ mod tests {
         assert!(!lost_xapic_deadline(&page(0x1ff, LVT_MASKED, 7, 0), XAPIC));
         // x2APIC mode is never the inference's.
         assert!(!lost_xapic_deadline(&x2apic_page(0x1ff, LVT_MASKED, 0, 0), X2APIC));
+        // A CPU going offline: its APIC software-disabled and the entry
+        // masked with vector 0 (Linux's apic_soft_disable); a deadline then
+        // raises nothing, on KVM as here, and is taken.
+        assert!(!lost_xapic_deadline(&page(0x0ff, LVT_MASKED, 0, 0), XAPIC));
+        assert!(!lost_xapic_deadline(&page(0x00f, LVT_MASKED, 0, 1), XAPIC));
     }
 
     #[test]
