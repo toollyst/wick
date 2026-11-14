@@ -50,6 +50,13 @@ const LAPIC_REGS: usize = 1024;
 /// the run loop, so the wait is bounded (see the `X64Halt` exit).
 const HALT_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 
+/// The logical destination register of x2APIC ID `id`: its cluster (bits
+/// 31:4 of the ID) in bits 31:16, one bit of its 16 in bits 15:0, as KVM's
+/// `kvm_apic_calc_x2apic_ldr` (Linux v6.1 arch/x86/kvm/lapic.c 363-366).
+fn x2apic_ldr(id: u32) -> u32 {
+    ((id >> 4) << 16) | (1 << (id & 0xf))
+}
+
 /// Whether a CPUID table has a flag (leaf, sub-leaf, register: 1 EBX,
 /// 2 ECX, 3 EDX; bit), its entry found as the guest's CPUID exit finds it
 /// (`handle_cpuid`); a leaf the table lacks has none, as KVM's
@@ -1398,9 +1405,18 @@ impl VcpuFd {
         Ok((page, written))
     }
 
-    /// Reads the local APIC registers.
+    /// Reads the local APIC registers. In x2APIC mode the ID register is
+    /// given in KVM's legacy format, the x2APIC ID in bits 31:24, as KVM
+    /// gives it to a VMM that has not enabled `KVM_CAP_X2APIC_API`, which
+    /// Firecracker does not (`kvm_apic_state_fixup`, Linux v6.1
+    /// arch/x86/kvm/lapic.c 2692-2730); WHP's page holds the 32-bit ID as
+    /// it is (X2E0REC c).
     pub fn get_lapic(&self) -> Result<kvm_lapic_state> {
-        let (page, _) = self.lapic_page()?;
+        let (mut page, _) = self.lapic_page()?;
+        if self.register(whv::WHvX64RegisterApicBase)? & tscdeadline::APIC_BASE_EXTD != 0 {
+            let id = u32::from_le_bytes(page[0x20..0x24].try_into().unwrap());
+            page[0x20..0x24].copy_from_slice(&(id << 24).to_le_bytes());
+        }
         let mut state = kvm_lapic_state {
             regs: [0; LAPIC_REGS],
         };
@@ -1411,11 +1427,23 @@ impl VcpuFd {
     }
 
     /// Writes the local APIC registers; the rest of the page WHP keeps is
-    /// written back as it was.
+    /// written back as it was. In x2APIC mode (APIC_BASE, as `KVM_SET_SREGS`
+    /// left it) the ID register is taken in KVM's legacy format (bits 31:24)
+    /// and the logical destination register made from it, as KVM's
+    /// `kvm_apic_state_fixup` makes them (`kvm_apic_calc_x2apic_ldr`). The
+    /// LVT timer entry is written as given, TSC-deadline mode included,
+    /// which WHP keeps from this page in x2APIC mode (X2E0REC g): a
+    /// snapshot made on KVM (APIC_BASE 0xfee00d00, LVT timer 0x400ec)
+    /// restores as it was.
     pub fn set_lapic(&self, klapic: &kvm_lapic_state) -> Result<()> {
         let (mut page, size) = self.lapic_page()?;
         for (dst, src) in page.iter_mut().zip(klapic.regs.iter()) {
             *dst = *src as u8;
+        }
+        if self.register(whv::WHvX64RegisterApicBase)? & tscdeadline::APIC_BASE_EXTD != 0 {
+            let id = u32::from_le_bytes(page[0x20..0x24].try_into().unwrap()) >> 24;
+            page[0x20..0x24].copy_from_slice(&id.to_le_bytes());
+            page[0xd0..0xd4].copy_from_slice(&x2apic_ldr(id).to_le_bytes());
         }
         #[cfg(any(test, feature = "whp-trace"))]
         let before = super::ffi::trace::stack();
@@ -5494,6 +5522,43 @@ mod fpu_tests {
         let (exits, _) = run([wrmsr(0x832, 0x4_00EC), vec![0xE6, PORT as u8, 0xEB, 0xFE]].concat(), Some(8));
         eprintln!("TSCDLTEST #GP's and #DF's gates past it: exits {exits:?}");
         assert!(exits.last().is_some_and(|e| e.starts_with("Shutdown")), "no triple fault");
+    }
+
+    /// A local APIC state in KVM's x2APIC-mode format restores and reads
+    /// back as on KVM (`get_lapic`, `set_lapic`), on a host whose
+    /// partitions are x2APICs: vCPU 1 with APIC_BASE 0xfee00c00 by
+    /// `KVM_SET_SREGS`, then `KVM_SET_LAPIC` with the ID in KVM's legacy
+    /// format (0x1000000), SVR 0x1ff and the LVT timer 0x400ec: WHP's x2APIC
+    /// ID register reads 1, `KVM_GET_LAPIC` gives the ID 0x1000000, the
+    /// logical destination 0x2 (KVM's `kvm_apic_calc_x2apic_ldr` of 1) and
+    /// the LVT timer 0x400ec.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_kvm_lapic_state_in_x2apic_mode_restores() {
+        use super::super::apicmode::LocalApic;
+        if super::super::vm::host_local_apic() != LocalApic::X2Apic {
+            eprintln!("X2LAPICTEST this host's partitions are xAPICs: no x2APIC partition to test");
+            return;
+        }
+        let vm = super::super::VmFd::create().unwrap();
+        let _zero = vm.create_vcpu(0).unwrap();
+        let one = vm.create_vcpu(1).unwrap();
+        let mut s = one.get_sregs().unwrap();
+        s.apic_base = 0xFEE0_0C00;
+        one.set_sregs(&s).unwrap();
+        let word = |l: &kvm_lapic_state, at: usize| u32::from_le_bytes(std::array::from_fn(|i| l.regs[at + i].cast_unsigned()));
+        let mut l = one.get_lapic().unwrap();
+        for (at, v) in [(0x20usize, 0x100_0000u32), (0xf0, 0x1ff), (0x320, 0x4_00ec)] {
+            for (i, b) in v.to_le_bytes().into_iter().enumerate() {
+                l.regs[at + i] = b as std::os::raw::c_char;
+            }
+        }
+        one.set_lapic(&l).unwrap();
+        let id = super::super::ffi::as_u64(&super::super::ffi::get_register(one.part(), one.vp(), whv::WHvX64RegisterApicId).unwrap());
+        let back = one.get_lapic().unwrap();
+        let (got_id, ldr, lvtt) = (word(&back, 0x20), word(&back, 0xd0), word(&back, 0x320));
+        eprintln!("X2LAPICTEST WHvX64RegisterApicId {id:#x}; KVM_GET_LAPIC: ID {got_id:#x}, LDR {ldr:#x}, LVT timer {lvtt:#x}");
+        assert_eq!((id, got_id, ldr, lvtt), (1, 0x100_0000, 0x2, 0x4_00ec));
     }
 
     /// The local APIC state of `vp` in both of WHP's formats, as lines: the
@@ -10237,5 +10302,18 @@ mod fpu_tests {
             // SAFETY: the test's mapping, no VM left using it.
             assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod lapic_format_tests {
+    #[test]
+    fn test_the_x2apic_ldr_is_kvms() {
+        // kvm_apic_calc_x2apic_ldr: cluster in 31:16, one bit of 16.
+        assert_eq!(super::x2apic_ldr(0), 0x1);
+        assert_eq!(super::x2apic_ldr(1), 0x2);
+        assert_eq!(super::x2apic_ldr(15), 0x8000);
+        assert_eq!(super::x2apic_ldr(16), 0x1_0001);
+        assert_eq!(super::x2apic_ldr(35), 0x2_0008);
     }
 }
