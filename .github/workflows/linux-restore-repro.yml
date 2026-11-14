@@ -3,7 +3,10 @@
 #
 # Looks for the late answer of a restored smp guest on GitHub's Linux runner
 # (CI runs 43486495448 and 43521200989: the shell answered its first command
-# after a restore only once more input came): the smp snapshot restored
+# after a restore only once more input came; run 43528972093 of this workflow
+# found the cause, input that came while the guest's console printk had the
+# UART's interrupts masked, never signalled by vm-superio 0.8.1, fixed by
+# patches/0049): the smp snapshot restored
 # many times, each in a new process, against resumes in the same process,
 # with the guest's interrupts and timers, Firecracker's page faults and KVM's
 # trace events per round (tools/linux/boot-test.sh --stage restores). A

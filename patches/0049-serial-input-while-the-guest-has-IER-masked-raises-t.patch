@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Sat, 14 Nov 2026 09:43:02 +0900
+Subject: [PATCH] serial: input while the guest has IER masked raises the
+ interrupt (vm-superio 0.8.2)
+
+A backport of upstream's commits 18b08295a82a ("chore(deps): bump
+vm-superio to v0.8.2") and 4a28969f6994 ("test: cover serial input
+during a console printk flood"), onto v1.18.0, for every host.
+
+A 16550's interrupt line is pending AND enabled. Linux's 8250 console
+masks IER for every printk and, restoring it, relies on the UART to
+raise RX again for input that came meanwhile (v6.1
+drivers/tty/serial/8250/8250_port.c serial8250_console_write: "The
+receive handling will happen properly because the receive ready bit
+will still be set"). vm-superio 0.8.1 raised RDA only when a byte was
+enqueued (serial.rs enqueue_raw_bytes, received_data_interrupt) and an
+IER write only stored the value. So input that arrived in the masked
+window stayed in the FIFO until the next byte came.
+
+This is what made a restored smp guest's first command wait for the
+next input on wick's Linux CI (runs 43486495448, 43521200989,
+43528910212):
+- Each restore in a new process loads a new VMGenID. About 11 ms after
+  the resume the guest prints "random: crng reseeded due to virtual
+  machine fork" (v6.1 drivers/char/random.c add_vmfork_randomness), which
+  keeps IER masked for about 1.3 ms. That is when the harness sends its
+  command.
+- In the reproducer (boot-test.sh --stage restores, run 43528972093),
+  2 of 36 restores were late, 0 of 6 same-process resumes, which print
+  nothing.
+- KVM's trace of a late one: IER written 0 at 11.156 ms and 5 at
+  12.482 ms, then no serial interrupt for 35 s, until the next line.
+  Then the guest read both lines' 32 bytes at once.
+
+vm-superio 0.8.2 re-evaluates the pending interrupts on an IER write. It
+raises RDA when the FIFO is not empty, and THRE, the THR being always
+empty in the model. Guest-visible: Linux's start-up probe
+(serial8250_do_startup) no longer marks the port UART_BUG_TXEN, and
+sends from the THRE interrupt. Upstream Firecracker ships the same.
+vm-superio has no non-dev dependencies, so the crate builds unchanged on
+Linux, macOS and Windows.
+
+Tests:
+- New, wick's, need no guest and run on every host:
+  - devices::legacy::serial::tests::test_input_while_ier_is_masked_is_signalled_when_ier_comes_back
+  - devices::legacy::serial::tests::test_enabling_the_thr_empty_interrupt_raises_it
+  Both fail on 0.8.1 ("no interrupt for the waiting input", "no
+  interrupt for the empty THR") and pass on 0.8.2 (macOS 27.2).
+- Upstream's test_serial_input_during_console_printk (both variants), on
+  macOS 27.2: 10 of 10 trials lost on 0.8.1, passes on 0.8.2.
+  test_serial_io.py passes as before otherwise (test_serial_dos needs
+  root).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                                    |  4 +-
+ src/vmm/Cargo.toml                            |  3 +-
+ src/vmm/src/devices/legacy/serial.rs          | 62 +++++++++++++
+ .../functional/test_serial_io.py              | 92 +++++++++++++++++++
+ 4 files changed, 158 insertions(+), 3 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index bec2ed55da69f049b432f17bf998b2171b56763d..6b62dabef649ac74e446764dcbcd987fa86a54a2 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1923,9 +1923,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "vm-superio"
+-version = "0.8.1"
++version = "0.8.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "69c376a9b84afdf97bddd2628096cf3554208b2a676cf06b4532e0f433a54e02"
++checksum = "503041e3dca68fbd5425c04e4c2ad63c57a31da5b6eb13aaafbcaaf2b9cdc74f"
+ 
+ [[package]]
+ name = "vmm"
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index 784efa2c87b3d30a683114f93dae8d9e66fb21c8..9856e2d2cbdfadb742b0ae2db50adbb0830958c4 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -60,7 +60,8 @@ vm-memory = { version = "0.18.0", features = [
+   "backend-mmap",
+   "backend-bitmap",
+ ] }
+-vm-superio = "0.8.1"
++# wick: 0.8.2 (upstream 18b08295a82a): an IER write raises an interrupt that is pending.
++vm-superio = "0.8.2"
+ vmm-sys-util = { version = "0.15.0", features = ["with-serde"] }
+ zerocopy = { version = "0.8.50" }
+ 
+diff --git a/src/vmm/src/devices/legacy/serial.rs b/src/vmm/src/devices/legacy/serial.rs
+index 88be201f7fa487406a639f0774c19b8901bc2fbe..97b5501a1d3459aa596a1a10a98da829458ddefb 100644
+--- a/src/vmm/src/devices/legacy/serial.rs
++++ b/src/vmm/src/devices/legacy/serial.rs
+@@ -483,6 +483,68 @@ mod tests {
+         assert_eq!(invalid_reads_after_2, invalid_reads_after);
+     }
+ 
++    // wick: a 16550's interrupt line is pending AND enabled, so input that arrives while the
++    // driver has IER masked raises the interrupt when IER comes back. Linux's 8250 console masks
++    // IER for every printk and relies on that (8250_port.c, serial8250_console_write); with
++    // vm-superio 0.8.1 such input stayed in the FIFO until the next byte came (a restored
++    // guest's "crng reseeded due to virtual machine fork" printk against the first command).
++    fn serial_with_interrupt() -> (SerialDevice, EventFdTrigger) {
++        let intr_evt = EventFdTrigger::new(EventFd::new(libc::EFD_NONBLOCK).unwrap());
++        let intr = intr_evt.try_clone().unwrap();
++        let serial = SerialDevice {
++            serial: Serial::with_events(
++                intr_evt,
++                SerialEventsWrapper {
++                    buffer_ready_event_fd: None,
++                },
++                test_serial_out_sink(),
++            ),
++            input: None::<std::io::Stdin>,
++        };
++        (serial, intr)
++    }
++
++    #[test]
++    fn test_input_while_ier_is_masked_is_signalled_when_ier_comes_back() {
++        const DATA: u64 = 0;
++        const IER: u64 = 1;
++        const IIR: u64 = 2;
++        const IER_RDI_RLSI: u8 = 0x05; // what the 8250 driver leaves in IER, read in CI's traces
++        let (mut serial, intr) = serial_with_interrupt();
++        serial.write(0, IER, &[IER_RDI_RLSI]);
++        // A printk: the console saves IER, clears it, writes, then restores it.
++        serial.write(0, IER, &[0]);
++        serial.serial.raw_input(b"x").unwrap();
++        assert!(intr.read().is_err(), "an interrupt while IER is masked");
++        serial.write(0, IER, &[IER_RDI_RLSI]);
++        assert_eq!(
++            intr.read().ok(),
++            Some(1),
++            "no interrupt for the waiting input"
++        );
++        let mut v = [0u8; 1];
++        serial.read(0, IIR, &mut v);
++        assert_eq!(v[0] & 0x0f, 0x04, "IIR does not name received data");
++        serial.read(0, DATA, &mut v);
++        assert_eq!(v[0], b'x');
++    }
++
++    // wick: and enabling the THR-empty interrupt raises it, the THR being always empty here, so
++    // Linux's start-up probe (8250_port.c, serial8250_do_startup) no longer marks the port
++    // UART_BUG_TXEN.
++    #[test]
++    fn test_enabling_the_thr_empty_interrupt_raises_it() {
++        const IER: u64 = 1;
++        const IIR: u64 = 2;
++        const IER_THRI: u8 = 0x02;
++        let (mut serial, intr) = serial_with_interrupt();
++        serial.write(0, IER, &[IER_THRI]);
++        assert_eq!(intr.read().ok(), Some(1), "no interrupt for the empty THR");
++        let mut v = [0u8; 1];
++        serial.read(0, IIR, &mut v);
++        assert_eq!(v[0] & 0x0f, 0x02, "IIR does not name the empty THR");
++    }
++
+     #[test]
+     fn test_restore_from_state() {
+         let mut serial = SerialDevice::new(None, test_serial_out_sink(), None).unwrap();
+diff --git a/tests/integration_tests/functional/test_serial_io.py b/tests/integration_tests/functional/test_serial_io.py
+index 83013cca16dca74840fd64b3fc3acc5b1b7b315c..00768b5ac5a9336e6184d9a3b2c9e4f407421e3f 100644
+--- a/tests/integration_tests/functional/test_serial_io.py
++++ b/tests/integration_tests/functional/test_serial_io.py
+@@ -5,6 +5,7 @@
+ import fcntl
+ import os
+ import platform
++import re
+ import signal
+ import termios
+ import time
+@@ -141,6 +142,97 @@ def test_serial_console_login(uvm):
+     serial.rx("uid=0(root) gid=0(root) groups=0(root)")
+ 
+ 
++# A printk line from the flood below, as it lands in the screen log:
++# "[   12.345678] xxxx...\r\r\n". serial8250_console_write() emits a message
++# atomically under the port lock, so such a line is never split, but it can
++# land in the middle of a line the shell is writing.
++KMSG_LINE_RE = re.compile(r"\[ *\d+\.\d+\] x+\r*\n")
++
++# Length of each flood message. Anything comfortably larger than the 16-byte
++# FIFO keeps IER masked for several character times per message.
++KMSG_MSG_LEN = 200
++
++
++# wick: upstream 4a28969f6994, with vm-superio 0.8.2 (18b08295a82a).
++@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
++def test_serial_input_during_console_printk(uvm):
++    """
++    Serial input must not be lost while the guest writes to the console.
++
++    serial8250_console_write() masks the UART interrupts for the duration of a
++    printk and restores IER afterwards, relying on the UART to re-assert the RX
++    interrupt if data arrived meanwhile. Flood the console with printk messages
++    so that IER is masked most of the time, and check that input injected from
++    the host still reaches the shell.
++    """
++    vm = uvm
++    vm.help.enable_console()
++    vm.spawn(serial_out_path=None)
++    vm.memory_monitor = None
++    # 1 vCPU: the vCPU writing the printk is the one that has to take the RX
++    # interrupt, which is the configuration the console tests use.
++    vm.basic_config(vcpu_count=1)
++    vm.add_net_iface()
++    vm.start()
++
++    serial = Serial(vm)
++    serial.open()
++    serial.rx(vm.distro.shell_prompt)
++
++    # Lift the per-fd rate limit on /dev/kmsg, then flood the console from the
++    # background. Each message keeps IER masked for its whole console write.
++    vm.ssh.check_output("echo on > /proc/sys/kernel/printk_devkmsg")
++    vm.ssh.check_output(
++        f'nohup sh -c \'msg=$(head -c {KMSG_MSG_LEN} /dev/zero | tr "\\0" x); '
++        "while :; do echo $msg; done > /dev/kmsg' >/dev/null 2>&1 </dev/null &"
++    )
++    # Let the flood get going before injecting input.
++    time.sleep(0.5)
++
++    # Serial.rx_char() reads a single byte per poll() and cannot keep up with
++    # the flood, so read the screen log in chunks instead, starting from its
++    # current end.
++    log_fd = os.open(vm.screen_log, os.O_RDONLY)
++    os.lseek(log_fd, 0, os.SEEK_END)
++
++    def rx_until(token, timeout):
++        """Read the console until token shows up outside the printk lines."""
++        buf = ""
++        deadline = time.time() + timeout
++        while time.time() < deadline:
++            chunk = os.read(log_fd, 1 << 16)
++            if not chunk:
++                time.sleep(0.05)
++                continue
++            buf += chunk.decode("utf-8", errors="ignore")
++            if token in KMSG_LINE_RE.sub("", buf):
++                return True
++            # Keep the tail only. A printk line is shorter than 512 bytes, so
++            # the token cannot straddle more than that.
++            buf = buf[-4096:]
++        return False
++
++    trials = 10
++    lost = []
++    try:
++        for i in range(trials):
++            # The echoed command line reads `echo pi''ng<i>`, so `ping<i>` in
++            # the output can only come from the command being executed.
++            serial.tx(f"echo pi''ng{i}")
++            # Under the flood the shell is slow, but a few seconds is plenty.
++            # No output at all means the input never reached the guest.
++            if not rx_until(f"ping{i}", timeout=5):
++                lost.append(i)
++    finally:
++        os.close(log_fd)
++        # Stop the flood rather than leave a vCPU spinning on printk through
++        # teardown, where it only adds host load for whatever test runs next to
++        # this one.
++        vm.ssh.run("pkill -f 'while :'")
++
++    assert not lost, f"guest lost serial input in {len(lost)}/{trials} trials: {lost}"
++
++
+ def get_total_mem_size(pid):
+     """Get total memory usage for a process."""
+     cmd = f"pmap {pid} | tail -n 1 | sed 's/^ //' | tr -s ' ' | cut -d' ' -f2"

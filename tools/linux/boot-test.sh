@@ -17,7 +17,9 @@
 #                            [--seccomp yes|no|auto] [--snapshots K] [--rounds R]
 #
 # `restores` (not in `all`) looks for the late answer of a restored smp guest
-# (agent-state's linux-restore-late-answer): K snapshots of the smp guest,
+# (input that came while the guest's printk of the new VMGenID had the UART's
+# interrupts masked, which vm-superio 0.8.1 never signalled: patches/0049):
+# K snapshots of the smp guest,
 # each resumed twice in the same process (the control: no new process, no
 # memory file) and restored R times, each restore in a new process; per
 # round, how long the shell takes to answer, whether it answers without more
@@ -69,7 +71,7 @@ while [[ $# -gt 0 ]]; do
         --seccomp) seccomp="$2"; shift 2 ;;
         --snapshots) snapshots="$2"; shift 2 ;;
         --rounds) rounds="$2"; shift 2 ;;
-        -h|--help) sed -n '4,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '4,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done

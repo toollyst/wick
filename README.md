@@ -42,7 +42,7 @@ runs on Linux with KVM. If you build on Firecracker, your laptop needs a Linux V
 wick removes that limit without forking Firecracker in the usual sense:
 
 - **Upstream stays upstream.** `lib/firecracker` is the official repository at a release tag. wick changes it
-  through 48 small patches (about 2,400 lines in 87 files), each marked with a `wick:` comment. Everything
+  through 49 small patches (about 2,400 lines in 88 files), each marked with a `wick:` comment. Everything
   else is new code outside the submodule.
 - **Same API, same meaning.** Tools that drive Firecracker work unchanged: the binary is still called `firecracker`,
   and the API, the config file, the snapshot format and the vsock convention mean the same on all three hosts.
