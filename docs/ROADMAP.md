@@ -140,6 +140,10 @@ dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `
   `KVM_SET_MSRS` and carried by a snapshot (not yet run on Windows). Left, each stated in docs/COMPATIBILITY.md's
   Guest MSRs row: the PMU (KVM's AMD guest has four counters, here off), CPUID faulting, steal time, and an exit
   for MTRRCAP and the variable MTRRs, which WHP answers with 16 pairs to KVM's 8.
+- Memory at `memory.max` under a userfaultfd restore: pages discarded inside a 2 MiB chunk are reclaimed before a
+  charge is refused, as Linux's memory cgroup reclaims, by moving their chunks into new sections (not yet run on
+  Windows). Left, each stated in docs/COMPATIBILITY.md's `memory.max` row: the discarded pages of a released range,
+  and a reclaim before a refused allocation of the VMM's own (its heap, a thread's stack).
 - Next: the stages written since, on that machine.
 - Not done: Nitro Enclaves (docs/COMPATIBILITY.md, `GET`, `PUT /enclave`). AWS documents Windows Server parents for
   enclaves and nested Hyper-V, which WHP needs, on instance types that are in both lists, so a Windows host can meet

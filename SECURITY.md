@@ -282,15 +282,20 @@ upstream Firecracker and its jailer.
   (`test_a_wholly_discarded_chunk_gives_its_section_commit_back`, passed in CI run 43545368906, 305a806). A page discarded in a chunk not discarded whole
   (balloon inflation's scattered pages) keeps its section page committed (a SEC_RESERVE page cannot be decommitted)
   and its charge with it, so that what the jail is charged is never less than the host commit it holds
-  (`test_registered_memory_is_charged_as_it_is_filled`; passed in CI run 43545368906, 305a806, and each saved run since); the cost is the memory.max row's
-  difference (such pages counted on top of live memory until their chunk goes), which reclaim at the limit is to
-  close. A page discarded while a system call copies it (a guest that balloons a buffer a device is still using)
-  would fail that call, where Linux's copy faults the page in again: so a discard waits for the calls in flight on its
-  range, and a call that may wait without end (a blocking socket's or pipe's) copies through a buffer of its own, so
-  that no discard waits on it (the `mem_backend: Uffd` row;
+  (`test_registered_memory_is_charged_as_it_is_filled`; passed in CI run 43545368906, 305a806, and each saved run since). At the limit such pages are
+  reclaimed before a charge is refused, as Linux's memory cgroup reclaims: their chunks are moved into new sections
+  and their commit and charge given back (the memory.max row). A move holds its live pages in two sections for its
+  time; a 2 MiB move budget of private `PAGE_NOACCESS` commit, made at the first registration, is the cover the
+  jailer's count takes off for them, so the count, and the bound it enforces, stays exact during a move
+  (`test_the_jailers_count_does_not_rise_during_a_move`; not yet run on Windows). A page discarded while a system
+  call copies it (a guest that balloons a buffer a device is still using) would fail that call, where Linux's copy
+  faults the page in again: so a discard waits for the calls in flight on its range, and a call that may wait without
+  end (a blocking socket's or pipe's) copies through a buffer of its own, so that no discard waits on it (the
+  `mem_backend: Uffd` row;
   `test_a_discard_waits_for_a_read_in_flight_on_its_range`, `test_a_blocking_read_does_not_hold_a_discard`; passed
   in CI runs 43612093006, 8ff63d4, and 43616040593, 5e3727d). Firecracker never met it, its devices' calls and the balloon's discards running on one thread; the
-  wait is for reclaim at the limit, which is to discard from a vCPU thread, and other users of the compat libc.
+  wait is for the reclaim at the limit, which moves chunks on whichever thread touched memory there (a vCPU's among
+  them), and other users of the compat libc.
 
   Sections made around wick (a compromised Firecracker's) are counted by the jailer
   (overlay/jailer/platform/windows/commit.rs): every 1 ms, over the job's processes, private commit plus section

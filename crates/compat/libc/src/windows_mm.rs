@@ -1222,7 +1222,12 @@ fn commit_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize
     // huge zero page for a read fault there and allocates (and charges)
     // nothing until a write (mm/huge_memory.c `do_huge_pmd_anonymous_page`,
     // `use_zero_page`, on by default).
-    if let Some(access) = resolve_stale(page, prot) {
+    if let Some(mut access) = resolve_stale(page, prot) {
+        // Refused at the limit: dead pages reclaimed first, as Linux's
+        // memory cgroup reclaims before it refuses (`wick_uffd::reclaim_at_touch`).
+        if matches!(access, Access::Exhausted(_)) && crate::wick_uffd::reclaim_at_touch(PAGE).freed > 0 {
+            access = resolve_stale(page, prot).unwrap_or(Access::NotLazy);
+        }
         let range = if access == Access::Committed { page..page + PAGE } else { 0..0 };
         return (access, range);
     }
@@ -1239,6 +1244,10 @@ fn commit_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize
     // A huge page that cannot be charged falls back to a page, as Linux's
     // does (mm/huge_memory.c, `THP_FAULT_FALLBACK_CHARGE`).
     if to - from > PAGE && commit(page, PAGE, prot, false) {
+        (Access::Committed, page..page + PAGE)
+    } else if crate::wick_uffd::reclaim_at_touch(PAGE).freed > 0 && commit(page, PAGE, prot, false) {
+        // Refused at the limit: committed once dead pages were reclaimed, as
+        // Linux's memory cgroup reclaims before its out-of-memory kill.
         (Access::Committed, page..page + PAGE)
     } else {
         (Access::Exhausted(err), 0..0)
@@ -1271,7 +1280,13 @@ pub(crate) fn prefault_lazy(addr: usize, len: usize) {
                 break;
             }
             let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(end) - at;
-            if mbi.State != MEM_COMMIT && !commit(at, run, prot, false) {
+            // Refused at the limit: dead pages reclaimed first, then again
+            // (`wick_uffd::reclaim_at_touch`; a thread in a call counted in
+            // flight, `copying`, waits there for no other call).
+            if mbi.State != MEM_COMMIT
+                && !commit(at, run, prot, false)
+                && !(crate::wick_uffd::reclaim_at_touch(run).freed > 0 && commit(at, run, prot, false))
+            {
                 // SAFETY: plain call.
                 out_of_memory(at, unsafe { GetLastError() });
             }
@@ -1279,7 +1294,11 @@ pub(crate) fn prefault_lazy(addr: usize, len: usize) {
                 for (ss, sl) in stale_within(at, run) {
                     for page in (ss..ss + sl).step_by(PAGE) {
                         if let Some(Access::Exhausted(err)) = resolve_stale(page, prot) {
-                            out_of_memory(page, err);
+                            if !(crate::wick_uffd::reclaim_at_touch(PAGE).freed > 0
+                                && resolve_stale(page, prot) == Some(Access::Committed))
+                            {
+                                out_of_memory(page, err);
+                            }
                         }
                     }
                 }
@@ -2578,6 +2597,11 @@ fn split_into(base: usize, chunks: &[(usize, usize)]) -> usize {
 /// is a view of the table's, with a charge of its own ([`Charge`]). WHP
 /// maps the guest's range over the views in one call (UFFDCHUNK a).
 fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) -> Result<usize, c_int> {
+    // The move budget, charged at the first registration as a page filled
+    // is: refused, the registration fails as one that cannot be charged.
+    if !uffd_budget() {
+        return Err(crate::ENOMEM);
+    }
     let chunks: Vec<(usize, usize)> = (0..len).step_by(UFFD_CHUNK).map(|o| (o, UFFD_CHUNK.min(len - o))).collect();
     // SAFETY: reserves address space of our own, as a placeholder.
     let alias = unsafe {
@@ -2729,16 +2753,151 @@ pub(crate) fn uffd_swap_chunk(view: usize, len: usize, alias: usize) -> bool {
     true
 }
 
+/// The move budget: one [`UFFD_CHUNK`] of private commit, `PAGE_NOACCESS`
+/// and never touched, made at the first registration of a reserved
+/// userfaultfd range ([`uffd_alias_chunked`]) and kept for the process. A
+/// chunk's move ([`uffd_move_chunk`]) holds its live pages in two sections
+/// for the copy's time, up to a chunk more of section commit; to the
+/// jailer's count (overlay/jailer/platform/windows commit.rs: private
+/// commit plus section commit, less the committed private `PAGE_NOACCESS`
+/// memory that pays for sections, no more than the section commit) the
+/// budget is cover for it, so the count does not rise during a move and a
+/// VMM at its limit is not ended for a reclaim
+/// (`test_the_jailers_count_does_not_rise_during_a_move`). The job charges
+/// it once, at the registration: 2 MiB of memory.max as commit, no RAM (the
+/// memory.max row).
+static UFFD_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Makes the move budget ([`UFFD_BUDGET`]) if there is none; whether there
+/// is one (the job may refuse its commit). Called under the table's lock.
+fn uffd_budget() -> bool {
+    if UFFD_BUDGET.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return true;
+    }
+    // SAFETY: a new allocation of our own, committed, never accessed.
+    let b = unsafe {
+        VirtualAlloc2(proc(), std::ptr::null(), UFFD_CHUNK, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS, std::ptr::null_mut(), 0)
+    };
+    if b.is_null() {
+        return false;
+    }
+    UFFD_BUDGET.store(b as usize, std::sync::atomic::Ordering::Release);
+    true
+}
+
 /// Called in the middle of a chunk's move, between the copy and the swap:
 /// for tests (`test_the_jailers_count_does_not_rise_during_a_move`).
 #[cfg(test)]
 pub(crate) static MOVE_HOOK: Mutex<Option<fn()>> = Mutex::new(None);
 
 /// The move budget decommitted (`on` false) or committed again, for tests;
-/// whether there is one. Not written yet: there is none.
+/// whether there is one and the change was made.
 #[cfg(test)]
-pub(crate) fn uffd_budget_for_tests(_on: bool) -> bool {
-    false
+pub(crate) fn uffd_budget_for_tests(on: bool) -> bool {
+    let b = UFFD_BUDGET.load(std::sync::atomic::Ordering::Acquire);
+    if b == 0 {
+        return false;
+    }
+    // SAFETY: the budget's own pages.
+    unsafe {
+        if on {
+            !VirtualAlloc2(proc(), b as *const c_void, UFFD_CHUNK, MEM_COMMIT, PAGE_NOACCESS, std::ptr::null_mut(), 0).is_null()
+        } else {
+            VirtualFree(b as *mut c_void, UFFD_CHUNK, MEM_DECOMMIT) != 0
+        }
+    }
+}
+
+/// Moves the chunk `[view, view + len)` of a registered userfaultfd range,
+/// whose alias is at `alias`, into a new reserved section, to give back the
+/// section commit and the charge of its dead pages (missing, but committed:
+/// discarded inside a chunk not discarded whole, `wick_uffd::discarding`):
+/// the reclaim at the memory limit (`wick_uffd::reclaim_at_touch`), as
+/// Linux's memory cgroup reclaims before it refuses a charge. `live` and
+/// `dead` are the chunk's runs, as offsets from `view`. The caller holds the
+/// userfaultfd's lock and a discard's guard on the chunk (no system call is
+/// copying it: [`try_discard`]) and has marked it moving, so that a host
+/// thread's or a vCPU's access to it waits for the move
+/// (`wick_uffd::fault`). The live pages are committed in the new section
+/// through a view of its own, closed to the guest's view (`PAGE_NOACCESS`,
+/// which WHP honours), copied from the alias, and the new section put in
+/// the place of the old one in both views ([`uffd_swap_chunk`]'s steps), so
+/// that the old one, and its commit, goes with its last view; the dead
+/// pages' charge is given back ([`uncharge`]), the live pages' kept (it is
+/// indexed by the view's offset, which does not move). The dead pages are
+/// not committed in the new section: missing, they fault as missing.
+/// `false`, nothing changed, if the chunk is not one of [`uffd_alias`]'s or
+/// the new section cannot be made or committed; a failure once a view is
+/// unmapped ends the VMM, named ([`out_of_memory`]).
+pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, live: &[(usize, usize)], dead: &[(usize, usize)]) -> bool {
+    let t = table().lock().unwrap();
+    match t.get(&view) {
+        Some(r)
+            if r.len == len
+                && r.holes.is_empty()
+                && !r.lazy
+                && matches!(r.kind, Kind::View { _section: None, charge: Some(_), file: None, alias: None }) => {}
+        _ => return false,
+    }
+    let Some(section) = reserved_section(len) else {
+        return false;
+    };
+    // SAFETY: maps our new section, anywhere.
+    let tmp = unsafe { MapViewOfFile3(section.0, proc(), std::ptr::null(), 0, len, 0, PAGE_READWRITE, std::ptr::null_mut(), 0) }
+        .Value as usize;
+    if tmp == 0 {
+        return false;
+    }
+    let unmap_tmp = || {
+        // SAFETY: unmaps the view made here.
+        unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: tmp as *mut c_void }, 0) };
+    };
+    if !live.iter().all(|&(o, n)| commit_now(tmp + o, n, PAGE_READWRITE, false)) {
+        unmap_tmp();
+        return false;
+    }
+    let protect_live = |prot| {
+        live.iter().all(|&(o, n)| {
+            let mut old = 0;
+            // SAFETY: changes the protection of the chunk's committed pages.
+            unsafe { VirtualProtect((view + o) as *const c_void, n, prot, &mut old) != 0 }
+        })
+    };
+    if !protect_live(PAGE_NOACCESS) {
+        protect_live(PAGE_READWRITE);
+        unmap_tmp();
+        return false;
+    }
+    for &(o, n) in live {
+        // SAFETY: the chunk's live pages, through its alias, into the new
+        // section's view; no thread or vCPU writes them meanwhile.
+        unsafe { std::ptr::copy_nonoverlapping((alias + o) as *const u8, (tmp + o) as *mut u8, n) };
+    }
+    #[cfg(test)]
+    if let Some(hook) = *MOVE_HOOK.lock().unwrap() {
+        hook();
+    }
+    // SAFETY: unmaps the chunk's alias view, keeping its placeholder; the
+    // guest's view keeps the old section until it is unmapped too.
+    if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        protect_live(PAGE_READWRITE);
+        unmap_tmp();
+        return false;
+    }
+    let swapped = view_into(&section, alias, len)
+        // SAFETY: unmaps the chunk's guest view, keeping its placeholder.
+        && unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } != 0
+        && view_into(&section, view, len);
+    if !swapped {
+        // SAFETY: plain call.
+        out_of_memory(view, unsafe { GetLastError() });
+    }
+    unmap_tmp();
+    drop(t);
+    for &(o, n) in dead {
+        uncharge(view + o, n);
+    }
+    true
 }
 
 /// The parts of `[s, s + len)` in each region of the table, in order (the
@@ -3003,6 +3162,7 @@ pub(crate) struct Copying(usize, usize);
 
 impl Drop for Copying {
     fn drop(&mut self) {
+        IN_CALL.set(IN_CALL.get() - 1);
         forget(&mut IN_FLIGHT.lock().unwrap().calls, (self.0, self.1));
         IN_FLIGHT_CHANGED.notify_all();
     }
@@ -3028,12 +3188,37 @@ pub(crate) fn copying(addr: usize, len: usize) -> Copying {
         f = IN_FLIGHT_CHANGED.wait(f).unwrap();
     }
     f.calls.push((s, e));
+    IN_CALL.set(IN_CALL.get() + 1);
     Copying(s, e)
+}
+
+/// A guard as [`discard_waiting`]'s, if no system call copying memory of
+/// `[addr, addr + len)` is in flight now; `None` without waiting if one is.
+pub(crate) fn try_discard(addr: usize, len: usize) -> Option<Discarding> {
+    let (s, e) = (addr, addr.saturating_add(len));
+    let mut f = IN_FLIGHT.lock().unwrap();
+    if any_overlaps(&f.calls, s, e) {
+        return None;
+    }
+    f.discards.push((s, e));
+    Some(Discarding(s, e))
+}
+
+/// Whether this thread is in a system call counted in flight
+/// ([`copying`]): a reclaim it starts must not wait for calls in flight
+/// (`wick_uffd::reclaim_at_touch`), its own among them.
+pub(crate) fn in_a_call() -> bool {
+    IN_CALL.get() != 0
+}
+
+std::thread_local! {
+    /// The calls in flight this thread counts ([`Copying`]).
+    static IN_CALL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Waits until no system call copying memory of `[addr, addr + len)` is in
 /// flight ([`InFlight`]); calls on the range wait while the result lives.
-fn discard_waiting(addr: usize, len: usize) -> Discarding {
+pub(crate) fn discard_waiting(addr: usize, len: usize) -> Discarding {
     let (s, e) = (addr, addr.saturating_add(len));
     let mut f = IN_FLIGHT.lock().unwrap();
     f.discards.push((s, e));

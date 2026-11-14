@@ -1371,6 +1371,13 @@ jobs:
           # placeholders (time, the host's commit, pools, handles) and 100
           # swaps of a chunk. Its guest's side (a) is in the WHP step.
           alone windows_sectrec::test_chunked_sections_and_a_charge_decommit_on_record
+          # RECLAIMREC, the reclaim at the memory limit's cost (it runs only
+          # there): in a child under a job limit, partly discarded chunks
+          # moved into new sections while a fill goes on past the limit and a
+          # host thread reads them: the chunks moved, the live pages each
+          # copied and its microseconds, the reads that waited for a move, and
+          # the private and section commit before and after.
+          alone wick_uffd::tests::test_the_reclaims_cost_on_record
           # What Windows' cycle counters count (CPUCYCLEREC lines), for the
           # CPU clocks: a PC read the thread's QueryThreadCycleTime at 1.32 x
           # the TSC while spinning and the process's at 1.01 x. The thread's
