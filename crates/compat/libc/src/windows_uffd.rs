@@ -1219,8 +1219,12 @@ mod tests {
             JobObjectExtendedLimitInformation, SetInformationJobObject,
         };
         let exe = std::env::current_exe().unwrap();
+        // The child's name as libtest knows it: this module is the crate's
+        // `wick_uffd` (lib.rs's `#[path]`), not its file's name (CI run
+        // 43528910212 ran "windows_uffd::tests::fill_limit_child": no test).
+        let name = std::format!("{}::fill_limit_child", module_path!().split_once("::").unwrap().1);
         let child = std::process::Command::new(exe)
-            .args(["--exact", "windows_uffd::tests::fill_limit_child", "--ignored", "--nocapture"])
+            .args(["--exact", name.as_str(), "--ignored", "--nocapture"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -1245,7 +1249,8 @@ mod tests {
         let text = std::format!("{}{}", std::string::String::from_utf8_lossy(&out.stdout), std::string::String::from_utf8_lossy(&out.stderr));
         // SAFETY: our job handle.
         unsafe { CloseHandle(job) };
-        assert!(text.contains("registered 256 MiB"), "{text}");
+        assert!(text.contains("running 1 test"), "the child {name} ran no test (status {}): {text}", out.status);
+        assert!(text.contains("registered 256 MiB"), "the child did not register (status {}): {text}", out.status);
         assert!(text.contains("refused with ENOMEM after"), "the job's limit did not hold: {text}");
         assert!(text.contains("test result: ok. 1 passed"), "{text}");
     }
