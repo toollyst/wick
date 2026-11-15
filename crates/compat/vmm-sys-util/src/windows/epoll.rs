@@ -1849,4 +1849,83 @@ mod tests {
         drop(outer);
         drop(inner);
     }
+
+    const WAITABLE_CHILD_ENV: &str = "WICK_TEST_WAITABLE_CHILD";
+    const WAITABLE_ROUNDS: u64 = 20_000;
+
+    /// The child of [`test_an_eventfd_deleted_as_its_wait_fires_is_not_waited_on_once_closed`]:
+    /// an eventfd added, written and deleted at once and then closed, round
+    /// after round, while another thread waits on the instance.
+    #[test]
+    #[ignore = "the child of test_an_eventfd_deleted_as_its_wait_fires_is_not_waited_on_once_closed"]
+    fn deleted_waitable_child() {
+        if std::env::var_os(WAITABLE_CHILD_ENV).is_none() {
+            return;
+        }
+        let epoll = std::sync::Arc::new(Epoll::new().unwrap());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (epoll, stop) = (epoll.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut events = [EpollEvent::default(); 8];
+                let mut waits = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    epoll.wait(5, &mut events).unwrap();
+                    waits += 1;
+                }
+                waits
+            })
+        };
+        let begun = std::time::Instant::now();
+        for r in 0..WAITABLE_ROUNDS {
+            let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+            epoll
+                .ctl(ControlOperation::Add, evt.as_raw_fd(), EpollEvent::new(EventSet::IN, r))
+                .unwrap();
+            evt.write(1).unwrap();
+            // A spin of a varying length, so that the delete meets the
+            // pool's callback at each of its steps.
+            for _ in 0..(r % 64) * 16 {
+                std::hint::spin_loop();
+            }
+            epoll
+                .ctl(ControlOperation::Delete, evt.as_raw_fd(), EpollEvent::default())
+                .unwrap();
+            drop(evt);
+        }
+        stop.store(true, Ordering::SeqCst);
+        let waits = watcher.join().unwrap();
+        println!(
+            "WAITABLE {WAITABLE_ROUNDS} eventfds added, written, deleted and closed in {:?} under {waits} waits",
+            begun.elapsed()
+        );
+    }
+
+    /// An eventfd deleted from an instance while the thread pool's wait on
+    /// it fires, and then closed, is not waited on after its close:
+    /// polling's waitable source is a `RegisterWaitForSingleObject` wait,
+    /// and a handle "closed while the wait is still pending" is undefined
+    /// (Learn, RegisterWaitForSingleObject); the pool raises
+    /// STATUS_THREADPOOL_HANDLE_EXCEPTION (0xc000070a), which ended the
+    /// kvm-ioctls unit tests in CI run 43676869163 (5306da51) in
+    /// `test_irqfd_writes_registrations_and_the_watcher_do_not_wait_for_each_other`.
+    /// Linux's EPOLL_CTL_DEL leaves nothing behind (fs/eventpoll.c
+    /// ep_remove). In a child, as the end is the process's.
+    #[test]
+    #[ignore = "until the next commit"]
+    fn test_an_eventfd_deleted_as_its_wait_fires_is_not_waited_on_once_closed() {
+        if std::env::var_os(WAITABLE_CHILD_ENV).is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "windows::epoll::tests::deleted_waitable_child", "--ignored", "--nocapture"])
+            .env(WAITABLE_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        let line = text.lines().find(|l| l.starts_with("WAITABLE")).unwrap_or("no WAITABLE line");
+        eprintln!("{line}; the child's exit {:?}", out.status.code().map(|c| format!("{:#x}", c.cast_unsigned())));
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    }
 }
