@@ -331,14 +331,17 @@ upstream Firecracker and its jailer.
   refused until the charge is taken again (`test_a_move_whose_room_is_taken_owes_its_charge`); a bounded
   difference from Linux, which uncharged at the discard. The reclaim runs on its own thread with its 64 KiB stack
   committed at creation, so it grows no stack at the limit; the touching thread's own path to it is 8528 bytes deep
-  on record (RECLAIMSTACK), which a thread whose stack has less committed below its frame cannot grow at the limit
-  (STACKZERO, below). The line that ends a VMM at the limit (`out_of_memory`) is written after 256 KiB of commit set
+  on record (RECLAIMSTACK); a thread whose stack has less committed below its frame, and cannot grow it at the limit,
+  ends the VMM with 137 (below). The line that ends a VMM at the limit (`out_of_memory`) is written after 256 KiB of commit set
   aside for it is given back, so its stack can grow.
   Not before a commit made at once (`MAP_POPULATE`, a
   private file mapping's read, a `MAP_FIXED` recommit, a discard of private memory that is not lazy, a committing
   `mprotect`) or an allocation of the VMM's own (its heap, a thread's stack): those are refused at the limit with no
-  reclaim first (`ENOMEM`, or the process ends: a thread whose stack must grow ends it with `STATUS_STACK_OVERFLOW`,
-  not 137, `test_a_stack_that_grows_at_the_limit_on_record`), not done yet; the limit holds either way. A move holds its live
+  reclaim first (`ENOMEM`, or the process ends: a thread whose stack must grow ends it with 137 and a line, its
+  refused commit told from a stack used up by the thread's TEB in an unhandled-exception filter, which bypasses
+  Windows Error Reporting on purpose, as an end at the limit is not a crash; a stack used up still reaches it,
+  `test_a_stack_that_must_grow_at_the_limit_ends_with_137`, `test_a_stack_overflow_at_the_reserves_end_is_still_one`),
+  not done yet for the reclaim; the limit holds either way. A move holds its live
   pages in two sections for its
   time; a 2 MiB move budget of private `PAGE_NOACCESS` commit, made at the first registration, is the cover the
   jailer's count takes off for them, so the count, and the bound it enforces, stays exact during a move

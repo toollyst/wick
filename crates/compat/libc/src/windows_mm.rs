@@ -1426,7 +1426,8 @@ unsafe extern "system" fn lazy_on_exception(
     windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH
 }
 
-/// Installs [`lazy_on_exception`] once; whether it is in place.
+/// Installs [`lazy_on_exception`] once, and [`stack_filter`] with it;
+/// whether the handler is in place.
 fn lazy_handler() -> bool {
     static INSTALLED: OnceLock<bool> = OnceLock::new();
     *INSTALLED.get_or_init(|| {
@@ -1435,10 +1436,116 @@ fn lazy_handler() -> bool {
             VirtualAlloc2(proc(), std::ptr::null(), RESCUE_LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, std::ptr::null_mut(), 0)
         };
         RESCUE.store(rescue as usize, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: the filter stays for the process; the one it replaces is
+        // called for what it does not take.
+        let previous = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(stack_filter)) };
+        PREVIOUS_FILTER.store(previous.map_or(0, |f| f as usize), std::sync::atomic::Ordering::SeqCst);
         // SAFETY: first in the chain; the handler stays for the process.
         !unsafe { windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(lazy_on_exception)) }
             .is_null()
     })
+}
+
+/// The unhandled-exception filter [`stack_filter`] replaced, called for
+/// what it does not take; 0 for none.
+static PREVIOUS_FILTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `STATUS_STACK_OVERFLOW`.
+const STACK_OVERFLOW: i32 = 0xC000_00FD_u32.cast_signed();
+
+/// How much of a thread's stack reserve is left below its committed part
+/// before the stack is used up, at most, when a stack overflow is the
+/// reserve's end: the thread's stack guarantee (`SetThreadStackGuarantee`,
+/// the TEB's GuaranteedStackBytes) and its guard page, with a margin of
+/// three pages. More left is a commit the system refused ([`stack_filter`]).
+fn reserve_at_its_end(guarantee: usize) -> usize {
+    guarantee.next_multiple_of(PAGE).max(PAGE) + 4 * PAGE
+}
+
+/// The calling thread's stack from its TEB (x86-64): the lowest committed
+/// address (StackLimit, `gs:[0x10]`), the reserve's low end
+/// (DeallocationStack, `gs:[0x1478]`) and the stack guarantee
+/// (GuaranteedStackBytes, `gs:[0x1748]`).
+#[cfg(target_arch = "x86_64")]
+fn this_threads_stack() -> (usize, usize, usize) {
+    let (limit, reserve, guarantee): (usize, usize, u32);
+    // SAFETY: reads of the thread's own TEB.
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, gs:[0x10]",
+            "mov {1}, gs:[0x1478]",
+            "mov {2:e}, gs:[0x1748]",
+            out(reg) limit,
+            out(reg) reserve,
+            out(reg) guarantee,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    (limit, reserve, guarantee as usize)
+}
+
+/// A thread's stack that could not grow because the job's memory limit (or
+/// the host's commit limit) refused its next page ends the VMM as the
+/// limit's other ends do (exit 137, [`out_of_memory`]), where it would end
+/// with `STATUS_STACK_OVERFLOW` (0xC00000FD: STACKZERO,
+/// `test_a_stack_that_grows_at_the_limit_on_record`). Learn, "Thread Stack
+/// Size": the system commits stack pages "until either the stack reaches
+/// the reserved size minus one page ... or the system is so low on memory
+/// that the operation fails"; both raise the same exception, and the
+/// thread's TEB tells them apart: at the reserve's end little of it is
+/// left below the committed part ([`reserve_at_its_end`]), at a refused
+/// commit the rest of the reserve is.
+///
+/// The unhandled-exception filter, so that a frame handler that takes a
+/// stack overflow (`_resetstkoflw`) still does; Rust's own vectored handler
+/// has printed "has overflowed its stack" by then, which this line
+/// follows. Given back first: the commit set aside for the limit's end
+/// ([`RESCUE`]), so that the line and the exit have room. The process then
+/// ends with `TerminateProcess` at once, bypassing Windows Error Reporting
+/// on purpose: an end at the memory limit is not a crash (Linux's
+/// out-of-memory kill leaves no core either); a stack overflow at the
+/// reserve's end, and every other exception, go on to the filter this one
+/// replaced, or to Windows' own handling (a crash dump, `0xC00000FD`).
+unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    // SAFETY: the system passes valid exception pointers.
+    let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    #[cfg(target_arch = "x86_64")]
+    if code == STACK_OVERFLOW {
+        let (limit, reserve, guarantee) = this_threads_stack();
+        let left = limit.saturating_sub(reserve);
+        if left > reserve_at_its_end(guarantee) {
+            let rescue = RESCUE.swap(0, std::sync::atomic::Ordering::SeqCst);
+            if rescue != 0 {
+                // SAFETY: frees the block set aside for this.
+                unsafe { VirtualFree(rescue as *mut c_void, 0, MEM_RELEASE) };
+            }
+            say_at_the_limit(format_args!(
+                "wick: a thread's stack could not grow: the memory limit (the jail's memory.max, or the host's commit \
+                 limit) refused its next page with {} KiB of its reserve left (its guarantee {guarantee} bytes); the VMM \
+                 ends, as the cgroup OOM killer ends it on Linux (exit {OOM_EXIT}), not as a stack overflow",
+                left >> 10
+            ));
+            // SAFETY: ends this process at once, as SIGKILL does.
+            unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), OOM_EXIT) };
+            unreachable!("the process ended");
+        }
+        #[cfg(test)]
+        say_at_the_limit(format_args!(
+            "STACKFILTER a stack overflow at the reserve's end: {} KiB of the reserve left, the guarantee {guarantee} bytes; \
+             passed on",
+            left >> 10
+        ));
+    }
+    match PREVIOUS_FILTER.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH,
+        f => {
+            // SAFETY: the filter SetUnhandledExceptionFilter returned, of
+            // this signature.
+            let f: windows_sys::Win32::System::Diagnostics::Debug::LPTOP_LEVEL_EXCEPTION_FILTER = unsafe { core::mem::transmute(f) };
+            // SAFETY: the system's exception pointers, passed on.
+            f.map_or(windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH, |f| unsafe { f(info) })
+        }
+    }
 }
 
 /// `mprotect` of `[s, e)`, in the lazy region at `b`: committed pages get

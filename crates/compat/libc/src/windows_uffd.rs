@@ -2609,7 +2609,11 @@ mod tests {
     /// the thread at the limit ended its process with 0xC00000FD, 32 KiB of
     /// its stack committed, where Linux charges a stack page as any other
     /// and its memory cgroup's out-of-memory kill ends the process (137).
-    /// Printed, not asserted, but for the control ending well.
+    /// Its children map no lazy memory, so the stack filter that ends such a
+    /// process with 137 is not in place (`windows_mm::stack_filter`,
+    /// `test_a_stack_that_must_grow_at_the_limit_ends_with_137`): the record
+    /// of what Windows does by itself. Printed, not asserted, but for the
+    /// control ending well.
     #[test]
     #[ignore = "a record: run alone on Windows with --ignored --nocapture"]
     fn test_a_stack_that_grows_at_the_limit_on_record() {
@@ -2669,6 +2673,199 @@ mod tests {
         let (t, _go) = a_thread_that_goes_deep(true, usize::MAX);
         let _ = t.join();
         std::println!("the unbounded thread came back");
+    }
+
+    /// Which kind of thread a stack test runs on: one of Rust's
+    /// (`std::thread`, whose stack guarantee Rust sets), one made with
+    /// `CreateThread` as a system DLL or the reclaim makes one (no
+    /// guarantee set), and a thread of the process's thread pool
+    /// (`TrySubmitThreadpoolCallback`), which the system makes.
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        Rust,
+        CreateThread,
+        Pool,
+    }
+
+    /// Runs `body` on a thread of `kind`: it prints its stack (from its
+    /// TEB), says it is ready, waits for the go, and goes `depth` frames
+    /// deep ([`deep`]); the go, and a receiver told when it came back.
+    fn a_thread_of(kind: Kind, depth: usize) -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>) {
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (ready, heard) = std::sync::mpsc::channel::<()>();
+        let (back, came_back) = std::sync::mpsc::channel::<()>();
+        let body: std::boxed::Box<dyn FnOnce() + Send> = std::boxed::Box::new(move || {
+            let (base, limit, reserve, guarantee) = stack_of_this_thread();
+            std::println!(
+                "the {kind:?} thread's stack: {} KiB committed of a {} KiB reserve, a guarantee of {guarantee} bytes",
+                (base - limit) >> 10,
+                (base - reserve) >> 10
+            );
+            ready.send(()).unwrap();
+            wait.recv().unwrap();
+            core::hint::black_box(deep(depth));
+            let _ = back.send(());
+        });
+        let raw = std::boxed::Box::into_raw(std::boxed::Box::new(body)).cast::<c_void>();
+        unsafe extern "system" fn start(raw: *mut c_void) -> u32 {
+            // SAFETY: the box made above, given to this thread alone.
+            let body = unsafe { std::boxed::Box::from_raw(raw.cast::<std::boxed::Box<dyn FnOnce() + Send>>()) };
+            body();
+            0
+        }
+        unsafe extern "system" fn pooled(_: windows_sys::Win32::System::Threading::PTP_CALLBACK_INSTANCE, raw: *mut c_void) {
+            // SAFETY: as `start`.
+            unsafe { start(raw) };
+        }
+        match kind {
+            Kind::Rust => {
+                let raw = raw as usize;
+                std::thread::spawn(move || {
+                    // SAFETY: the box made above.
+                    unsafe { start(raw as *mut c_void) };
+                });
+            }
+            Kind::CreateThread => {
+                // SAFETY: a thread of ours with the default stack.
+                let t = unsafe { windows_sys::Win32::System::Threading::CreateThread(ptr::null(), 0, Some(start), raw, 0, ptr::null_mut()) };
+                assert!(!t.is_null());
+            }
+            Kind::Pool => {
+                // SAFETY: the process's default pool runs the callback once.
+                assert_ne!(unsafe { windows_sys::Win32::System::Threading::TrySubmitThreadpoolCallback(Some(pooled), raw, ptr::null()) }, 0);
+            }
+        }
+        heard.recv().unwrap();
+        (go, came_back)
+    }
+
+    /// A mapping committed at first touch, so that the lazy-memory handler,
+    /// and the stack filter with it, are in place (`windows_mm::lazy_handler`),
+    /// as in a VMM with guest memory.
+    fn lazy_memory_is_mapped() {
+        // SAFETY: a new anonymous mapping, committed at first touch.
+        let p = unsafe {
+            crate::mmap(ptr::null_mut(), 1 << 20, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE, -1, 0)
+        };
+        assert_ne!(p, crate::MAP_FAILED);
+    }
+
+    /// A thread whose stack must grow when the job's limit has no room left
+    /// ends the process as the limit's other ends do, with 137 and the line
+    /// that says so (`windows_mm::stack_filter`), where it ended with
+    /// `STATUS_STACK_OVERFLOW` (STACKZERO), on each kind of thread
+    /// ([`Kind`]); Linux's memory cgroup ends a process whose stack page
+    /// cannot be charged with its out-of-memory kill.
+    #[test]
+    fn test_a_stack_that_must_grow_at_the_limit_ends_with_137() {
+        for child in ["stack_at_the_limit_rust_child", "stack_at_the_limit_createthread_child", "stack_at_the_limit_pool_child"] {
+            let (code, text) = run_child(child, Some(96 << 20));
+            std::eprintln!("STACK137 {child}: {code:?}; {}", text.trim().replace('\n', " | "));
+            assert!(text.contains("wick: a thread's stack could not grow"), "{child}: {text}");
+            assert_eq!(code, Some(137), "{child}: {text}");
+        }
+    }
+
+    fn stack_at_the_limit(kind: Kind) {
+        lazy_memory_is_mapped();
+        make_the_slack_region();
+        let (go, came_back) = a_thread_of(kind, 32);
+        let held = no_room_left();
+        go.send(()).unwrap();
+        let _ = came_back.recv_timeout(std::time::Duration::from_secs(10));
+        drop(held);
+        std::println!("the {kind:?} thread at the limit went 128 KiB deep and the process went on");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_that_must_grow_at_the_limit_ends_with_137 in a job of its own"]
+    fn stack_at_the_limit_rust_child() {
+        stack_at_the_limit(Kind::Rust);
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_that_must_grow_at_the_limit_ends_with_137 in a job of its own"]
+    fn stack_at_the_limit_createthread_child() {
+        stack_at_the_limit(Kind::CreateThread);
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_that_must_grow_at_the_limit_ends_with_137 in a job of its own"]
+    fn stack_at_the_limit_pool_child() {
+        stack_at_the_limit(Kind::Pool);
+    }
+
+    /// A stack overflow at the reserve's end is still one, with the stack
+    /// filter in place: passed on (its test line, STACKFILTER, with how
+    /// much of the reserve was left and the thread's guarantee), it ends the
+    /// process with `STATUS_STACK_OVERFLOW` (0xC00000FD) as before, through
+    /// Windows' own handling (Windows Error Reporting), on each kind of
+    /// thread ([`Kind`]), with room left.
+    #[test]
+    fn test_a_stack_overflow_at_the_reserves_end_is_still_one() {
+        for child in ["stack_overflow_rust_child", "stack_overflow_createthread_child", "stack_overflow_pool_child"] {
+            let (code, text) = run_child(child, None);
+            std::eprintln!("STACKEND {child}: {code:?}; {}", text.trim().replace('\n', " | "));
+            assert!(text.contains("STACKFILTER a stack overflow at the reserve's end"), "{child}: {text}");
+            assert_eq!(code, Some(0xC000_00FD_u32.cast_signed()), "{child}: {text}");
+        }
+    }
+
+    fn stack_overflow(kind: Kind) {
+        lazy_memory_is_mapped();
+        let (go, came_back) = a_thread_of(kind, usize::MAX);
+        go.send(()).unwrap();
+        let _ = came_back.recv_timeout(std::time::Duration::from_secs(10));
+        std::println!("the {kind:?} thread's unbounded recursion came back");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_overflow_at_the_reserves_end_is_still_one"]
+    fn stack_overflow_rust_child() {
+        stack_overflow(Kind::Rust);
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_overflow_at_the_reserves_end_is_still_one"]
+    fn stack_overflow_createthread_child() {
+        stack_overflow(Kind::CreateThread);
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_overflow_at_the_reserves_end_is_still_one"]
+    fn stack_overflow_pool_child() {
+        stack_overflow(Kind::Pool);
+    }
+
+    /// An unhandled exception the stack filter does not take goes to the
+    /// filter it replaced: one set before the lazy-memory handler came is
+    /// called for an exception no handler takes, and ends the process its
+    /// own way (exit 7, its line).
+    #[test]
+    fn test_the_filter_the_stack_filter_replaced_is_called() {
+        let (code, text) = run_child("filter_replaced_child", None);
+        assert!(text.contains("the earlier filter: exception 0xe0001234"), "{text}");
+        assert_eq!(code, Some(7), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_the_filter_the_stack_filter_replaced_is_called"]
+    fn filter_replaced_child() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{EXCEPTION_POINTERS, RaiseException, SetUnhandledExceptionFilter};
+        unsafe extern "system" fn earlier(info: *const EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system's exception pointers.
+            let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+            crate::windows_mm::say_at_the_limit(format_args!("the earlier filter: exception {:#x}", code.cast_unsigned()));
+            // SAFETY: ends this process.
+            unsafe { windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), 7) };
+            0
+        }
+        // SAFETY: the filter stays for the process.
+        unsafe { SetUnhandledExceptionFilter(Some(earlier)) };
+        lazy_memory_is_mapped();
+        // SAFETY: an exception no handler takes.
+        unsafe { RaiseException(0xE000_1234, 0, 0, ptr::null()) };
+        std::println!("the exception was taken");
     }
 
     /// The pages of the first 8 chunks: the discarded ones missing, the
