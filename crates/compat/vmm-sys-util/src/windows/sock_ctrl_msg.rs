@@ -1311,7 +1311,7 @@ mod tests {
         let section = sealed_section(1 << 16);
         let (c, mut d) = UnixStream::pair().unwrap();
         s.send_with_fds(
-            &[[b'D'].as_ref()],
+            &[b"D".as_slice()],
             &[file.as_raw_fd(), evt.as_raw_fd(), section.as_raw_fd(), c.as_raw_fd()],
         )
         .unwrap();
@@ -1386,7 +1386,7 @@ mod tests {
         let (c, mut d) = UnixStream::pair().unwrap();
         let before = PUSHED_TO_NAMED.load(std::sync::atomic::Ordering::SeqCst);
         s.send_with_fds(
-            &[[b'D'].as_ref()],
+            &[b"D".as_slice()],
             &[file.as_raw_fd(), evt.as_raw_fd(), section.as_raw_fd(), c.as_raw_fd()],
         )
         .unwrap();
