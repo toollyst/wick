@@ -86,7 +86,7 @@ pub use super::backend::net::simulator;
 /// Where endpoints named without `/` are made outside a jail, found while
 /// the microVM is built (the sandbox narrows it as it ends).
 #[cfg(target_os = "macos")]
-pub use super::backend::net::{find_user_endpoint_dir, user_endpoint_dir};
+pub use super::backend::net::{find_user_endpoint_dir, may_create, user_endpoint_dir};
 /// What the unit tests open interfaces as (a user, a jailed Firecracker).
 #[cfg(all(target_os = "macos", test))]
 pub(crate) use super::backend::net::tests_as;

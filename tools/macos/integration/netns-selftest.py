@@ -6,7 +6,8 @@
 
 Starts a network's host side (netns-slirp) on a directory, adds interfaces
 as the framework's TAPs (each the host side's socket of its name directly
-in the directory, which Firecracker opens only if it is there), binds one
+in the directory, which Firecracker opens only if it is there, with the
+interface's lock file `<name>.lock` beside it), binds one
 in a VMM's own directory of the network as Firecracker does
 (vmm::platform::net, a Unix datagram endpoint at <id>/<name>) and plays the
 guest: the host side attaches to the endpoint, a second VMM's endpoint of
@@ -285,6 +286,10 @@ def main():
         check(request(ctl, f"add tap0 {HOST_IP}/30") == (0, ""), "add tap0")
         check(stat.S_ISSOCK(os.lstat(os.path.join(net, "tap0")).st_mode),
               "the interface tap0 is the host side's socket directly in the network directory")
+        lock = os.lstat(os.path.join(net, "tap0.lock"))
+        check(stat.S_ISREG(lock.st_mode) and stat.S_IMODE(lock.st_mode) == 0o444,
+              "tap0's lock file is beside it, a regular file anyone may open (0444), which makes the "
+              f"interface one VMM's at a time: mode {stat.filemode(lock.st_mode)}")
         check(request(ctl, "add tap0 10.0.0.1/30")[0] == 17, "a second tap0 is EEXIST")
         check(request(ctl, "add bare")[0] == 0, "a TAP without an address")
         check(request(ctl, "used tap0") == (0, "0"), "tap0 unused")

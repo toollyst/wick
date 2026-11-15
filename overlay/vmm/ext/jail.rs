@@ -1117,16 +1117,23 @@ mod tests {
         // close (platform::net, test_a_dropped_endpoint_frees_its_name).
         drop(tap);
         assert!(!want.join("tap0").exists());
+        // And its lock file, which this Firecracker (with the creator's
+        // right) made, goes with it.
+        assert!(!want.parent().unwrap().join("tap0.lock").exists());
         // As a user: only the interface the network's switch made, its
-        // socket directly in the network directory, the parent; and no
-        // path name, this Firecracker being in a network.
+        // socket directly in the network directory, the parent, with its
+        // lock file; and no path name, this Firecracker being in a network.
         let eperm = |got: Result<Tap, TapError>| {
             matches!(got, Err(TapError::IfreqExecuteError(e, _)) if e.raw_os_error() == Some(libc::EPERM))
         };
         crate::platform::net::tests_as::user(|| {
             assert!(eperm(Tap::open_named("tap1")));
             let _switch = std::os::unix::net::UnixDatagram::bind(want.parent().unwrap().join("tap1")).unwrap();
+            assert!(eperm(Tap::open_named("tap1")), "an interface without its lock file");
+            std::fs::write(want.parent().unwrap().join("tap1.lock"), b"").unwrap();
             drop(Tap::open_named("tap1").unwrap());
+            // The operator's lock file stays.
+            assert!(want.parent().unwrap().join("tap1.lock").exists());
             assert!(!want.join("tap1").exists());
             let outside = want.parent().unwrap().join("x");
             assert!(eperm(Tap::open_named(outside.to_str().unwrap())));

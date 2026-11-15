@@ -31,7 +31,7 @@
 //! own sandbox profile (the same uid).
 
 use std::collections::VecDeque;
-use std::ffi::{CStr, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
 use std::io;
 use std::mem;
@@ -103,7 +103,7 @@ fn network() -> Option<(&'static Path, BorrowedFd<'static>)> {
 /// tests run with that right by default, as upstream's run as root; the
 /// tests of the refusal take it away, and [`tests_as::real`] asks the
 /// process ([`tests_as`]).
-fn may_create() -> bool {
+pub fn may_create() -> bool {
     #[cfg(test)]
     if let Some(creator) = tests_as::CREATOR.with(std::cell::Cell::get) {
         return creator;
@@ -115,11 +115,55 @@ fn may_create() -> bool {
     euid() == 0
 }
 
-/// This process's effective uid, read once.
+/// This process's credentials, read once while the microVM is built
+/// ([`find_user_endpoint_dir`]): its effective uid, and the groups it is in
+/// (its effective group and the supplementary ones the kernel's credential
+/// holds, as Linux's `in_egroup_p` asks), as a running microVM may not ask
+/// (upstream's filter has neither geteuid nor getgroups).
+struct Creds {
+    euid: libc::uid_t,
+    groups: Vec<libc::gid_t>,
+}
+
+fn creds() -> &'static Creds {
+    static CREDS: std::sync::OnceLock<Creds> = std::sync::OnceLock::new();
+    CREDS.get_or_init(|| {
+        // SAFETY: no arguments.
+        let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let mut groups = vec![egid];
+        // SAFETY: a count query (no buffer), then a buffer of that many.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if let Ok(len) = usize::try_from(count)
+            && len > 0
+        {
+            let mut more: Vec<libc::gid_t> = vec![0; len];
+            // SAFETY: a buffer of `count` entries.
+            let got = unsafe { libc::getgroups(count, more.as_mut_ptr()) };
+            if let Ok(got) = usize::try_from(got) {
+                more.truncate(got);
+                groups.extend(more);
+            }
+        }
+        Creds { euid, groups }
+    })
+}
+
+/// This process's effective uid ([`creds`]).
 fn euid() -> libc::uid_t {
-    static EUID: std::sync::OnceLock<libc::uid_t> = std::sync::OnceLock::new();
-    // SAFETY: no arguments.
-    *EUID.get_or_init(|| unsafe { libc::geteuid() })
+    #[cfg(test)]
+    if let Some((euid, _)) = tests_as::CREDS.with(|c| c.borrow().clone()) {
+        return euid;
+    }
+    creds().euid
+}
+
+/// Whether this process is in the group `gid` ([`creds`]).
+fn in_group(gid: libc::gid_t) -> bool {
+    #[cfg(test)]
+    if let Some((_, groups)) = tests_as::CREDS.with(|c| c.borrow().clone()) {
+        return groups.contains(&gid);
+    }
+    creds().groups.contains(&gid)
 }
 
 /// Whether this Firecracker is jailed: given a network (`--netns`) or in a
@@ -142,6 +186,31 @@ pub(crate) mod tests_as {
         pub(super) static CREATOR: Cell<Option<bool>> = const { Cell::new(None) };
         pub(super) static JAILED: Cell<Option<bool>> = const { Cell::new(None) };
         pub(super) static REAL: Cell<bool> = const { Cell::new(false) };
+        pub(super) static CREDS: std::cell::RefCell<Option<(libc::uid_t, Vec<libc::gid_t>)>> =
+            const { std::cell::RefCell::new(None) };
+        pub(super) static AFTER_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs `f` with `between` run once in this thread's next take of an
+    /// interface's lock, between its open and its look at the name
+    /// ([`super::IfaceLock::take`]): where another's removal or replacement
+    /// of the file can fall.
+    pub(crate) fn after_lock<T>(between: impl FnOnce() + 'static, f: impl FnOnce() -> T) -> T {
+        AFTER_LOCK.with(|c| *c.borrow_mut() = Some(Box::new(between)));
+        let out = f();
+        AFTER_LOCK.with(|c| *c.borrow_mut() = None);
+        out
+    }
+
+    /// Runs `f` with this thread's opens judged as the effective uid
+    /// `euid` in `groups` would be ([`super::capable`]); the kernel's own
+    /// check of the open is still this process's.
+    pub(crate) fn creds<T>(euid: libc::uid_t, groups: &[libc::gid_t], f: impl FnOnce() -> T) -> T {
+        let before = CREDS.with(|c| c.replace(Some((euid, groups.to_vec()))));
+        let out = f();
+        CREDS.with(|c| *c.borrow_mut() = before);
+        out
     }
 
     /// Runs `f` with this thread's opens made with the process's own right
@@ -226,6 +295,196 @@ fn operator_made(dir: &Path, network: Option<BorrowedFd<'_>>, name: &str) -> io:
     }
 }
 
+/// Whether this Firecracker may open the interface whose lock file has the
+/// status `st`, by Linux's rule for a TAP (v6.1 drivers/net/tun.c
+/// `tun_not_capable` :577 to :585, which `tun_set_iff` asks before it
+/// attaches, :2750): one with an owner (TUNSETOWNER) opens only for that
+/// effective uid, one with a group (TUNSETGROUP) only for a member of it,
+/// one with both only for both, one with neither for anyone, and any of
+/// them for root (CAP_NET_ADMIN). The lock file says which by its mode, so
+/// that the kernel's permission check on the open is the owner's check:
+/// readable by others (0444) it has neither; else readable by its owner
+/// (0400) its owner is the interface's, readable by its group (0040) its
+/// group is. Only "both" (0440) asks more than the kernel's check, which
+/// lets the owner or a member in: that is decided here.
+fn capable(st: &libc::stat) -> bool {
+    let mode = st.st_mode & 0o777;
+    if euid() == 0 || mode & 0o004 != 0 {
+        return true;
+    }
+    let owner = mode & 0o400 != 0;
+    let group = mode & 0o040 != 0;
+    !((owner && euid() != st.st_uid) || (group && !in_group(st.st_gid)))
+}
+
+/// The status of `path` relative to `at` (`AT_FDCWD`: as given), its last
+/// name not followed.
+fn lstat_at(at: RawFd, path: &CStr) -> io::Result<libc::stat> {
+    // SAFETY: plain data, filled by fstatat.
+    let mut st: libc::stat = unsafe { mem::zeroed() };
+    // SAFETY: a directory descriptor (or AT_FDCWD) and a NUL-terminated path.
+    if unsafe { libc::fstatat(at, path.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// The status of the file `fd` is open on.
+fn fstat_fd(fd: &OwnedFd) -> io::Result<libc::stat> {
+    // SAFETY: plain data, filled by fstat.
+    let mut st: libc::stat = unsafe { mem::zeroed() };
+    // SAFETY: a descriptor we own.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// The interface `name` in use: EBUSY, as a second TUNSETIFF on a TAP
+/// another file holds (drivers/net/tun.c, v6.1, `tun_attach` :769 to :771).
+fn busy(name: &str) -> TapError {
+    TapError::IfreqExecuteError(io::Error::from_raw_os_error(libc::EBUSY), name.to_owned())
+}
+
+/// Whether `err` is [`busy`]'s.
+fn is_busy(err: &TapError) -> bool {
+    matches!(err, TapError::IfreqExecuteError(e, _) if e.raw_os_error() == Some(libc::EBUSY))
+}
+
+/// What makes an interface one opener's, as an attached TAP is (a second
+/// open is `EBUSY`, `tun_attach`): an exclusive lock on its lock file
+/// `<name>.lock`, beside the switch's socket `<name>` directly in the
+/// network directory, held for the device's life. The kernel arbitrates it
+/// (open(2) with `O_EXLOCK | O_NONBLOCK`, xnu bsd/vfs/vfs_syscalls.c
+/// `open1`: an flock(2) lock taken in the open, so no flock call, which
+/// upstream's VMM filter has not, in the run phase a hot-plug opens in), and
+/// it goes with the descriptor however Firecracker ends, a kill too. The
+/// operator's switch makes the file, mode 0444 for an interface anyone may
+/// open, 0400 owned by the uid it is for, 0040 with the group it is for, or
+/// 0440 with both ([`capable`]); no jail can make, replace or change it, as
+/// no jail makes a name in the network directory (`ext::sandbox`
+/// files_in_jail). A creator ([`may_create`]) opening a name without one
+/// makes it, 0644 (writable by its owner: what tells a creator's from the
+/// operator's, which are read-only), and removes it when the device goes,
+/// as a TAP root made without TUNSETPERSIST goes at its close.
+struct IfaceLock {
+    fd: OwnedFd,
+    /// The network's descriptor in a jail, where `path` is relative.
+    at: Option<BorrowedFd<'static>>,
+    path: CString,
+    /// A creator's, removed when the device goes.
+    made: bool,
+}
+
+impl fmt::Debug for IfaceLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IfaceLock").field("path", &self.path).field("made", &self.made).finish_non_exhaustive()
+    }
+}
+
+impl IfaceLock {
+    /// Takes the lock of the interface `name` of the network whose
+    /// directory is the parent of `dir` (reached through `network` in a
+    /// jail): `EBUSY` if another holds it ([`busy`]), `EPERM` in upstream's
+    /// text ([`refuse`]) if this Firecracker may not open the interface
+    /// ([`capable`]) or there is no lock file and it may not make one.
+    fn take(dir: &Path, network: Option<BorrowedFd<'static>>, name: &str) -> Result<Self, TapError> {
+        let file = format!("{name}.lock");
+        let path = match network {
+            Some(_) => Path::new("..").join(&file),
+            None => dir.parent().unwrap_or(dir).join(&file),
+        };
+        let shown = dir.parent().unwrap_or(dir).join(&file);
+        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| TapError::InvalidIfname)?;
+        let at = network.map_or(libc::AT_FDCWD, |fd| fd.as_raw_fd());
+        let creator = may_create();
+        let mut flags = libc::O_RDONLY | libc::O_EXLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        if creator {
+            flags |= libc::O_CREAT;
+        }
+        // SAFETY: a directory descriptor (or AT_FDCWD), a NUL-terminated
+        // path and a mode for a file made.
+        let fd = unsafe { libc::openat(at, c.as_ptr(), flags, libc::c_uint::from(0o644u16)) };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            return Err(match err.raw_os_error() {
+                // Held: busy, unless this Firecracker could not have it
+                // anyway, as tun_set_iff asks tun_not_capable first.
+                Some(libc::EAGAIN) => match lstat_at(at, &c) {
+                    Ok(st) if !capable(&st) => refuse(name, format_args!("{shown:?} is another's interface")),
+                    _ => busy(name),
+                },
+                Some(libc::ENOENT) => refuse(
+                    name,
+                    format_args!(
+                        "no interface lock {shown:?}: the network's switch makes it beside its socket, and only \
+                         root makes an interface nobody made"
+                    ),
+                ),
+                Some(libc::EACCES) => refuse(
+                    name,
+                    format_args!("{shown:?} opens for its owner or its group only: the interface is another's"),
+                ),
+                Some(libc::ELOOP) => refuse(name, format_args!("{shown:?} is a link")),
+                // A socket (or a FIFO's like) opens as no file.
+                Some(libc::EOPNOTSUPP) => refuse(name, format_args!("{shown:?} is not a regular file")),
+                Some(libc::EPERM) => refuse(name, format_args!("{shown:?} is no interface lock (the sandbox's rule)")),
+                _ => TapError::IfreqExecuteError(err, name.to_owned()),
+            });
+        }
+        // SAFETY: a descriptor just opened, ours.
+        let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        let failed = |err: io::Error| TapError::IfreqExecuteError(err, name.to_owned());
+        let st = fstat_fd(&fd).map_err(failed)?;
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(refuse(name, format_args!("{shown:?} is not a regular file")));
+        }
+        #[cfg(test)]
+        if let Some(between) = tests_as::AFTER_LOCK.with(|c| c.borrow_mut().take()) {
+            between();
+        }
+        // The lock is on the file the name is: one removed or replaced
+        // after this open found it is another opener's to have.
+        let named = lstat_at(at, &c).ok().map(|n| (n.st_dev, n.st_ino));
+        if st.st_nlink == 0 || named != Some((st.st_dev, st.st_ino)) {
+            return Err(busy(name));
+        }
+        if !capable(&st) {
+            return Err(refuse(name, format_args!("{shown:?} is another's interface")));
+        }
+        Ok(IfaceLock {
+            fd,
+            at: network,
+            path: c,
+            made: creator && st.st_mode & 0o200 != 0,
+        })
+    }
+}
+
+/// A creator's lock file goes with its device, while the lock is still
+/// held, and only the file the lock is on (by its device and inode), so
+/// that a later opener finds no name left and never a half state: an
+/// opener that found the name before it went fails with `EBUSY` (the lock,
+/// then the identity check of [`IfaceLock::take`]), one after makes it
+/// anew. A running microVM's sandbox lets a creator remove only such files
+/// (`ext::sandbox` unlink_rule: `.lock` files in the network directory
+/// writable by their owner).
+impl Drop for IfaceLock {
+    fn drop(&mut self) {
+        if !self.made {
+            return;
+        }
+        let at = self.at.map_or(libc::AT_FDCWD, |fd| fd.as_raw_fd());
+        if let (Ok(named), Ok(own)) = (lstat_at(at, &self.path), fstat_fd(&self.fd))
+            && (named.st_dev, named.st_ino) == (own.st_dev, own.st_ino)
+        {
+            // SAFETY: a directory descriptor (or AT_FDCWD) and a
+            // NUL-terminated path.
+            unsafe { libc::unlinkat(at, self.path.as_ptr(), 0) };
+        }
+    }
+}
+
 /// The refusal of an interface this Firecracker may not open: EPERM, as
 /// TUNSETIFF's for a name that is no TAP of the caller's without
 /// CAP_NET_ADMIN (Linux v6.1 drivers/net/tun.c tun_set_iff :2781,
@@ -267,8 +526,9 @@ pub fn user_endpoint_dir() -> io::Result<PathBuf> {
 /// (`test_a_bare_name_hotplugged_without_a_network_opens`). An error is
 /// kept, and given to each opener of a bare name as before.
 pub fn find_user_endpoint_dir(make: bool) {
-    // The right to make an interface, which an open asks (may_create).
-    euid();
+    // The right to make an interface, and who may open which (may_create,
+    // capable), which an open asks.
+    creds();
     if make {
         let _ = endpoint_dir();
     }
@@ -560,6 +820,9 @@ struct Endpoint {
     /// Named without a path, so in the directory of endpoints, whose
     /// sockets a running microVM may remove (`ext::sandbox` unlink_rule).
     named: bool,
+    /// The interface's lock ([`IfaceLock`]), for an endpoint named without
+    /// a path: held until the endpoint has gone (dropped after it).
+    lock: Option<IfaceLock>,
     /// Where frames from the guest go: every host-side socket that sent a
     /// datagram here (in a jail: of the switch's).
     peers: Vec<Peer>,
@@ -608,6 +871,7 @@ impl Endpoint {
             switch,
             bound,
             named: false,
+            lock: None,
             peers: Vec::new(),
             refused: 0,
             refused_senders: Vec::new(),
@@ -967,18 +1231,23 @@ fn open_endpoint(
 ) -> Result<(String, Endpoint), TapError> {
     // In a jail the network is the jail's own directory in it.
     let jail = crate::ext::jail::root().is_some();
+    let failed = |err: io::Error, name: &str| match err.raw_os_error() {
+        Some(libc::ENAMETOOLONG) => TapError::InvalidIfname,
+        _ => TapError::IfreqExecuteError(err, name.to_owned()),
+    };
     let open = |name: &str| {
+        // The interface's lock first ([`IfaceLock`]): a busy one is left
+        // before anything of it is touched.
+        let lock = dir.map(|dir| IfaceLock::take(dir, network, name)).transpose()?;
         let mut ep = match (dir, network) {
             (Some(dir), Some(fd)) => Endpoint::open(Path::new(name), Some((dir, fd)), jail),
             (Some(dir), None) => Endpoint::open(&dir.join(name), None, false),
             (None, _) => Endpoint::open(Path::new(name), None, false),
-        }?;
+        }
+        .map_err(|e| failed(e, name))?;
         ep.named = dir.is_some();
-        Ok(ep)
-    };
-    let failed = |err: io::Error, name: &str| match err.raw_os_error() {
-        Some(libc::ENAMETOOLONG) => TapError::InvalidIfname,
-        _ => TapError::IfreqExecuteError(err, name.to_owned()),
+        ep.lock = lock;
+        Ok::<_, TapError>(ep)
     };
     // A name without a path: the operator's interface, unless this
     // Firecracker may make one ([`may_create`]); a unit name is always one
@@ -1005,9 +1274,7 @@ fn open_endpoint(
         }
     }
     if !name.contains("%d") {
-        return open(name)
-            .map(|ep| (name.to_owned(), ep))
-            .map_err(|e| failed(e, name));
+        return open(name).map(|ep| (name.to_owned(), ep));
     }
     for unit in 0..MAX_UNITS {
         let candidate = name.replacen("%d", &unit.to_string(), 1);
@@ -1016,8 +1283,8 @@ fn open_endpoint(
         }
         match open(&candidate) {
             Ok(ep) => return Ok((candidate, ep)),
-            Err(err) if err.raw_os_error() == Some(libc::EBUSY) => continue,
-            Err(err) => return Err(failed(err, &candidate)),
+            Err(err) if is_busy(&err) => continue,
+            Err(err) => return Err(err),
         }
     }
     Err(TapError::IfreqExecuteError(
@@ -1468,12 +1735,44 @@ mod tests {
 
     /// The operator's entry for `name`: the switch's socket, directly in the
     /// network directory (outside a jail, the user's directory of
-    /// endpoints, the parent of this instance's).
+    /// endpoints, the parent of this instance's), and the interface's lock
+    /// file beside it, mode 0444 (anyone's: [`lock_file`]).
     fn operator_entry(name: &str) -> (std::os::unix::net::UnixDatagram, PathBuf) {
         let path = user_endpoint_dir().unwrap().join(name);
         let _ = std::fs::remove_file(&path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        lock_file(name, 0o444);
         (std::os::unix::net::UnixDatagram::bind(&path).unwrap(), path)
+    }
+
+    /// The lock file of the interface `name` in the user's directory of
+    /// endpoints, made anew with `mode` (the operator's: [`IfaceLock`]).
+    fn lock_file(name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = user_endpoint_dir().unwrap().join(format!("{name}.lock"));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    /// The interface `name` busy, in upstream's text: EBUSY, as a second
+    /// TUNSETIFF on a TAP another file holds.
+    fn busy_text(got: Result<Tap, TapError>, name: &str) {
+        match got {
+            Err(err @ TapError::IfreqExecuteError(..)) => {
+                let text = crate::devices::virtio::net::NetError::TapOpen(err).to_string();
+                assert_eq!(
+                    text,
+                    format!(
+                        "Open tap device failed: Error while creating ifreq structure: Resource busy (os error \
+                         16). Invalid TUN/TAP Backend provided by {name}. Check our documentation on setting up \
+                         the network devices."
+                    )
+                );
+            }
+            other => panic!("{name}: {other:?}"),
+        }
     }
 
     /// This instance's directory of endpoints outside a jail.
@@ -1498,11 +1797,187 @@ mod tests {
         assert!(std::fs::symlink_metadata(&endpoint).unwrap().file_type().is_socket());
         // The switch reaches it there.
         switch.send_to(b"", &endpoint).unwrap();
-        // Gone with its device; the operator's interface stays.
+        // Gone with its device; the operator's interface stays, its lock
+        // file too.
         drop(tap);
         assert!(!endpoint.exists());
         assert!(entry.exists());
+        let lock = user_endpoint_dir().unwrap().join(format!("{name}.lock"));
+        assert!(lock.exists());
         std::fs::remove_file(&entry).unwrap();
+        std::fs::remove_file(&lock).unwrap();
+    }
+
+    // An interface has one holder at a time, as a TAP: a second open, by
+    // another process or this one, is EBUSY in upstream's text
+    // (drivers/net/tun.c, v6.1, tun_attach :769 to :771), arbitrated by the
+    // kernel (the lock file's lock), and the name opens again once its
+    // holder is gone, a SIGKILLed one too.
+    #[test]
+    fn test_an_interface_held_is_busy_until_its_holder_goes() {
+        use std::io::BufRead;
+        let name = format!("fcbz{}", std::process::id());
+        let (_switch, entry) = operator_entry(&name);
+        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::macos::net::tests::iface_holder_child", "--ignored", "--nocapture"])
+            .env("WICK_TEST_CASE", &name)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(holder.stdout.take().unwrap()).lines();
+        // libtest may print the test's name on the line first.
+        let held = lines.find(|l| l.as_ref().is_ok_and(|l| l.contains("HELD") || l.contains("FAILED")));
+        let held = held.unwrap().unwrap();
+        assert!(held.ends_with("HELD"), "{held}");
+        tests_as::user(|| busy_text(Tap::open_named(&name), &name));
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        let tap = tests_as::user(|| Tap::open_named(&name)).unwrap();
+        // And this process's second open.
+        tests_as::user(|| busy_text(Tap::open_named(&name), &name));
+        drop(tap);
+        tests_as::user(|| Tap::open_named(&name)).unwrap();
+        std::fs::remove_file(&entry).unwrap();
+        std::fs::remove_file(user_endpoint_dir().unwrap().join(format!("{name}.lock"))).unwrap();
+    }
+
+    #[test]
+    #[ignore = "run by test_an_interface_held_is_busy_until_its_holder_goes in a separate process"]
+    fn iface_holder_child() {
+        let name = std::env::var("WICK_TEST_CASE").unwrap();
+        match tests_as::user(|| Tap::open_named(&name)) {
+            Ok(tap) => {
+                println!("HELD");
+                std::thread::sleep(std::time::Duration::from_secs(600));
+                drop(tap);
+            }
+            Err(err) => println!("FAILED {err}"),
+        }
+    }
+
+    // Who may open an interface is its lock file's mode and owner, as a
+    // TAP's owner and group (TUNSETOWNER, TUNSETGROUP) say on Linux
+    // (drivers/net/tun.c, v6.1, tun_not_capable :577): the kernel's check
+    // of the open refuses a uid the file is not for, and the rest of
+    // tun_not_capable's rule (an owner and a group both: both needed) is
+    // capable's. A refusal is EPERM in upstream's text. Here the file is
+    // this user's, so another uid is the one the check is made as
+    // (tests_as::creds); what the kernel refuses another uid is in
+    // test_the_lock_file_is_the_owner_check and `jailer-test netns`.
+    #[test]
+    fn test_an_interface_opens_for_whom_its_lock_file_says() {
+        // SAFETY: no arguments.
+        let (me, my_group) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let (other, other_group) = (me + 1, my_group + 1);
+        let name = format!("fcow{}", std::process::id());
+        let (_switch, entry) = operator_entry(&name);
+        let opens = |mode: u32, euid: u32, groups: &[u32]| {
+            lock_file(&name, mode);
+            tests_as::user(|| tests_as::creds(euid, groups, || Tap::open_named(&name)))
+        };
+        // Anyone's.
+        drop(opens(0o444, other, &[other_group]).unwrap());
+        // The owner's: this uid, not another; root, whoever owns it.
+        drop(opens(0o400, me, &[]).unwrap());
+        refused(opens(0o400, other, &[my_group]), &name);
+        drop(opens(0o400, 0, &[]).unwrap());
+        // Owner and group both: only both.
+        drop(opens(0o440, me, &[my_group]).unwrap());
+        refused(opens(0o440, me, &[other_group]), &name);
+        refused(opens(0o440, other, &[my_group]), &name);
+        drop(opens(0o440, 0, &[]).unwrap());
+        std::fs::remove_file(&entry).unwrap();
+        std::fs::remove_file(user_endpoint_dir().unwrap().join(format!("{name}.lock"))).unwrap();
+    }
+
+    // tun_not_capable's rule, case by case, as capable reads a lock file's
+    // status: for each of no owner and no group, an owner, a group, and
+    // both, the uids and groups it opens for (the group alone cannot be had
+    // through the kernel here: a file's owner is judged by its owner bits,
+    // and a user can give a file no other owner).
+    #[test]
+    fn test_capable_is_tun_not_capables_rule() {
+        let (owner, group) = (501, 20);
+        let st = |mode: u16| {
+            // SAFETY: plain data.
+            let mut st: libc::stat = unsafe { mem::zeroed() };
+            st.st_mode = libc::S_IFREG | mode;
+            st.st_uid = owner;
+            st.st_gid = group;
+            st
+        };
+        let can = |mode: u16, euid: u32, groups: &[u32]| tests_as::creds(euid, groups, || capable(&st(mode)));
+        for (euid, groups) in [(owner, &[][..]), (600, &[group][..]), (600, &[][..]), (0, &[][..])] {
+            assert!(can(0o444, euid, groups), "unowned, {euid} {groups:?}");
+        }
+        assert!(can(0o400, owner, &[]) && !can(0o400, 600, &[group]) && can(0o400, 0, &[]));
+        assert!(can(0o040, 600, &[group]) && !can(0o040, owner, &[]) && can(0o040, 0, &[]));
+        assert!(can(0o440, owner, &[group]) && !can(0o440, owner, &[]) && !can(0o440, 600, &[group]));
+        assert!(can(0o440, 0, &[]));
+    }
+
+    // The kernel's check is the owner's: a lock file this user may not read
+    // (another's, as far as the kernel is concerned) is refused, EPERM in
+    // upstream's text, whoever the capable check would let in.
+    #[test]
+    fn test_the_lock_file_is_the_owner_check() {
+        let name = format!("fcnr{}", std::process::id());
+        let (_switch, entry) = operator_entry(&name);
+        lock_file(&name, 0o000);
+        tests_as::user(|| refused(Tap::open_named(&name), &name));
+        assert!(!instance_dir().join(&name).exists());
+        std::fs::remove_file(&entry).unwrap();
+        std::fs::remove_file(user_endpoint_dir().unwrap().join(format!("{name}.lock"))).unwrap();
+    }
+
+    // A network directory this Firecracker may not search fails the open
+    // with its errno (EACCES), in upstream's text for TUNSETIFF's errors,
+    // where on Linux an unreachable network fails earlier, in the jailer's
+    // setns of the namespace's file; in a jail the jailer lets the jail's
+    // uid search the directory (its ACL), so it is outside one.
+    #[test]
+    fn test_a_network_that_cannot_be_searched_fails_with_its_errno() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let net = dir.as_path().join("n");
+        std::fs::create_dir_all(net.join("inst")).unwrap();
+        std::fs::set_permissions(&net, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let got = tests_as::user(|| open_endpoint(Some(&net.join("inst")), None, "x"));
+        std::fs::set_permissions(&net, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let Err(err) = got else { panic!("opened") };
+        assert_eq!(
+            crate::devices::virtio::net::NetError::TapOpen(err).to_string(),
+            "Open tap device failed: Error while creating ifreq structure: Permission denied (os error 13). \
+             Invalid TUN/TAP Backend provided by x. Check our documentation on setting up the network devices."
+        );
+    }
+
+    // An interface without its lock file is none the operator made: EPERM,
+    // as is a lock file that is a link (to a lock file too), a directory or
+    // a socket.
+    #[test]
+    fn test_an_interface_needs_its_lock_file() {
+        let dir = user_endpoint_dir().unwrap();
+        let name = format!("fcnl{}", std::process::id());
+        let (_switch, entry) = operator_entry(&name);
+        let lock = dir.join(format!("{name}.lock"));
+        let other = lock_file(&format!("{name}o"), 0o444);
+        std::fs::remove_file(&lock).unwrap();
+        tests_as::user(|| refused(Tap::open_named(&name), &name));
+        std::os::unix::fs::symlink(&other, &lock).unwrap();
+        tests_as::user(|| refused(Tap::open_named(&name), &name));
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        tests_as::user(|| refused(Tap::open_named(&name), &name));
+        std::fs::remove_dir(&lock).unwrap();
+        let sock = std::os::unix::net::UnixDatagram::bind(&lock).unwrap();
+        tests_as::user(|| refused(Tap::open_named(&name), &name));
+        drop(sock);
+        std::fs::remove_file(&lock).unwrap();
+        assert!(!instance_dir().join(&name).exists());
+        std::fs::remove_file(&entry).unwrap();
+        std::fs::remove_file(&other).unwrap();
     }
 
     // What is not a socket is no entry, however named: a file, a directory,
@@ -1527,6 +2002,7 @@ mod tests {
         std::fs::remove_dir(dir.join(&folder)).unwrap();
         std::fs::remove_file(dir.join(&link)).unwrap();
         std::fs::remove_file(&target_path).unwrap();
+        std::fs::remove_file(dir.join(format!("{target}.lock"))).unwrap();
     }
 
     // A unit name (`%d`) is always one to make, as on Linux: refused for a
@@ -1543,17 +2019,89 @@ mod tests {
     }
 
     // Root makes a name nobody made, as root makes a TAP on Linux; it is
-    // attached to nothing until a switch attaches.
+    // attached to nothing until a switch attaches. Its lock file, made with
+    // it (writable by its owner: a creator's), goes with it, as a TAP root
+    // made without TUNSETPERSIST goes at its close, so that nothing of the
+    // name is left; while it is held the name is busy.
     #[test]
     fn test_the_creator_makes_a_name_nobody_made() {
         let name = format!("fcmk{}", std::process::id());
+        let lock = user_endpoint_dir().unwrap().join(format!("{name}.lock"));
         let _ = std::fs::remove_file(user_endpoint_dir().unwrap().join(&name));
+        let _ = std::fs::remove_file(&lock);
         let tap = Tap::open_named(&name).unwrap();
         let made = instance_dir().join(&name);
         assert!(made.exists());
         assert!(!user_endpoint_dir().unwrap().join(&name).exists());
+        let mode = std::fs::metadata(&lock).unwrap().mode();
+        assert_eq!(mode & 0o200, 0o200, "{mode:o}");
+        busy_text(Tap::open_named(&name), &name);
         drop(tap);
         assert!(!made.exists());
+        assert!(!lock.exists());
+    }
+
+    // A lock file replaced between an opener's open and its look at the
+    // name (a switch that makes its interface anew; another creator's
+    // removal) is not that opener's: it fails with EBUSY, and the next
+    // opener gets the interface by the file there now, so that two never
+    // hold one name.
+    #[test]
+    fn test_a_lock_file_replaced_under_an_opener_is_not_its() {
+        let name = format!("fcrp{}", std::process::id());
+        let (_switch, entry) = operator_entry(&name);
+        let lock = user_endpoint_dir().unwrap().join(format!("{name}.lock"));
+        let replace = {
+            let lock = lock.clone();
+            move || {
+                let new = lock.with_extension("new");
+                std::fs::write(&new, b"").unwrap();
+                std::fs::rename(&new, &lock).unwrap();
+            }
+        };
+        tests_as::user(|| busy_text(tests_as::after_lock(replace, || Tap::open_named(&name)), &name));
+        let tap = tests_as::user(|| Tap::open_named(&name)).unwrap();
+        drop(tap);
+        std::fs::remove_file(&entry).unwrap();
+        std::fs::remove_file(&lock).unwrap();
+    }
+
+    // Creators that open and drop one name at once, as many as can: each
+    // gets the interface or EBUSY, never anything else, and never two hold
+    // it at once, however the removal of the lock file a holder made falls
+    // between another's open and its lock (the identity check of
+    // IfaceLock::take); nothing of the name is left after.
+    #[test]
+    fn test_creators_racing_a_lock_files_removal_never_both_hold_it() {
+        use std::sync::atomic::AtomicUsize;
+        let name = format!("fcrc{}", std::process::id());
+        let lock = user_endpoint_dir().unwrap().join(format!("{name}.lock"));
+        let _ = std::fs::remove_file(&lock);
+        let holders = AtomicUsize::new(0);
+        let (opened, busy) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..300 {
+                        match Tap::open_named(&name) {
+                            Ok(tap) => {
+                                assert_eq!(holders.fetch_add(1, Ordering::SeqCst), 0, "two holders");
+                                opened.fetch_add(1, Ordering::Relaxed);
+                                holders.fetch_sub(1, Ordering::SeqCst);
+                                drop(tap);
+                            }
+                            Err(err) if is_busy(&err) => {
+                                busy.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(err) => panic!("{err}"),
+                        }
+                    }
+                });
+            }
+        });
+        assert!(opened.load(Ordering::Relaxed) > 0 && busy.load(Ordering::Relaxed) > 0);
+        assert!(!lock.exists());
+        assert!(!instance_dir().join(&name).exists());
     }
 
     // A path name is for an unjailed Firecracker: in a jail it is refused,

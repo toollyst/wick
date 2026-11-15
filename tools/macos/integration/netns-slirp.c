@@ -11,7 +11,8 @@
 // real path: that socket is the interface, which Firecracker opens only if
 // the network's owner made it, as Linux's opens only a TAP that exists
 // (`ip tuntap add`), and the one sender a jailed VMM's endpoint takes as its
-// peer. The endpoint is `<id>/<name>`, in the VMM's own directory of the
+// peer; beside it `<name>.lock`, the interface's lock file, which makes it
+// one VMM's at a time (EBUSY for a second, as a TAP in use). The endpoint is `<id>/<name>`, in the VMM's own directory of the
 // network (the jailer's, or the stand-in's, tools/macos/integration/jailer);
 // a test's network holds one microVM per interface: the first directory
 // found with the name is attached to, and another VMM's endpoint of the name
@@ -84,6 +85,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <glib.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <libslirp.h>
@@ -675,6 +677,29 @@ static void request(int conn, char *line) {
             reply(conn, e, NULL);
             return;
         }
+        // The interface's lock file beside it, anyone's (mode 0444), as a
+        // TAP `ip tuntap add` makes without an owner: Firecracker holds its
+        // lock while the interface is its, so a second opener gets EBUSY
+        // (vmm::platform::net IfaceLock), and opens nothing without it.
+        char lock[PATH_MAX];
+        if ((size_t)snprintf(lock, sizeof lock, "%s/%s.lock", net, a) >= sizeof lock) {
+            close(i->fd);
+            unlink(h.sun_path);
+            reply(conn, ENAMETOOLONG, NULL);
+            return;
+        }
+        unlink(lock);
+        int lf = open(lock, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0444);
+        if (lf < 0 || fchmod(lf, 0444) != 0) {
+            int e = errno;
+            if (lf >= 0)
+                close(lf);
+            close(i->fd);
+            unlink(h.sun_path);
+            reply(conn, e, NULL);
+            return;
+        }
+        close(lf);
         if (n == 2) {
             // A TAP without an address: frames go nowhere.
             nifaces++;

@@ -16,7 +16,10 @@ snapshot keeps them, and a microVM restored in another jail resolves them
 in its own jail, as it does in a chroot. What needs root (chroot,
 the jail's uid and gid, cgroups) is the jailer's own and is tested in the
 `jailer` mode; asking for a cgroup here fails, as a jailer that cannot set one
-does.
+does. So is the jailer's refusal of a network directory the jail's uid owns
+(network_open_to_others): here the jail's uid is the user's, who owns the
+network, so this stand-in cannot apply it (the jailer's unit test
+test_the_jailer_refuses_a_network_others_may_write, and `jailer-test netns`).
 """
 
 import ctypes

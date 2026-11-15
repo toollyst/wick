@@ -238,6 +238,8 @@ mod acl {
     pub const READ_EXTATTRIBUTES: c_int = 1 << 9;
     pub const WRITE_EXTATTRIBUTES: c_int = 1 << 10;
     pub const READ_SECURITY: c_int = 1 << 11;
+    pub const WRITE_SECURITY: c_int = 1 << 12;
+    pub const CHANGE_OWNER: c_int = 1 << 13;
     pub const ENTRY_FILE_INHERIT: c_int = 1 << 5;
     pub const ENTRY_ONLY_INHERIT: c_int = 1 << 8;
 
@@ -259,6 +261,9 @@ mod acl {
         pub fn acl_add_flag_np(set: Set, flag: c_int) -> c_int;
         pub fn acl_set_flagset_np(obj: *mut c_void, set: Set) -> c_int;
         pub fn mbr_uid_to_uuid(uid: u32, uuid: *mut u8) -> c_int;
+        pub fn acl_get_tag_type(entry: Entry, tag: *mut c_int) -> c_int;
+        pub fn acl_get_perm_np(set: Set, perm: c_int) -> c_int;
+        pub fn acl_get_flag_np(set: Set, flag: c_int) -> c_int;
     }
 }
 
@@ -333,6 +338,15 @@ pub(crate) fn network_for_jail(dir: &Path, id: &str, uid: u32) -> io::Result<(Pa
     if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\0']) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{id:?} names no directory")));
     }
+    if let Some(why) = network_open_to_others(dir, uid)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "the network {dir:?} is not the operator's alone ({why}): a jail could make its own interfaces \
+                 there; only the operator's switch makes names in it"
+            ),
+        ));
+    }
     let sub = dir.join(id);
     let c_sub = CString::new(sub.as_os_str().as_bytes()).map_err(io::Error::other)?;
     // SAFETY: a NUL-terminated path.
@@ -398,6 +412,95 @@ pub(crate) fn network_for_jail(dir: &Path, id: &str, uid: u32) -> io::Result<(Pa
         }
     }
     Ok((sub, lock))
+}
+
+/// Why someone other than the network directory's owner, the jail's uid
+/// among them, could make, remove or replace names in `dir`, if anyone
+/// could: the operator's switch makes the interfaces there (their sockets
+/// and lock files, `vmm::platform::net`), and Firecracker opens only what is
+/// there, as on Linux the jail's uid makes no TAP (it has no CAP_NET_ADMIN)
+/// and opens the operator's. So the directory may not be the jail's uid's
+/// (but for a jail of uid 0, root's, which may make a TAP), nor writable by
+/// its group or others, nor have an ACL entry that lets another than its
+/// owner add a file or a directory, remove one, or change who may (the
+/// jail's uid's own entries this jailer replaces with its own, which give
+/// it no such right)
+/// (`test_the_jailer_refuses_a_network_others_may_write`). The jail's
+/// sandbox lets it make no name there either (`vmm::ext::sandbox`
+/// files_in_jail, `test_a_jail_reaches_only_lock_files_in_its_network`).
+fn network_open_to_others(dir: &Path, uid: u32) -> io::Result<Option<String>> {
+    let meta = std::fs::metadata(dir)?;
+    if uid != 0 && meta.uid() == uid {
+        return Ok(Some(format!("it is the jail's uid {uid}'s")));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Ok(Some(format!("its group or others may write it: mode {:o}", meta.mode() & 0o7777)));
+    }
+    let c_path = CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: a NUL-terminated path; a null ACL is none.
+    let list = unsafe { acl::acl_get_file(c_path.as_ptr(), acl::TYPE_EXTENDED) };
+    if list.is_null() {
+        let err = io::Error::last_os_error();
+        return if err.raw_os_error() == Some(libc::ENOENT) { Ok(None) } else { Err(err) };
+    }
+    // The owner's entries, and the jail's uid's, which this jailer takes
+    // back and writes anew (`write_acl`), are not another's.
+    let (mut owner, mut jail) = ([0u8; 16], [0u8; 16]);
+    // SAFETY: 16-byte uuid_t's.
+    let found = unsafe {
+        acl::mbr_uid_to_uuid(meta.uid(), owner.as_mut_ptr()) == 0 && acl::mbr_uid_to_uuid(uid, jail.as_mut_ptr()) == 0
+    };
+    if !found {
+        // SAFETY: the ACL read above.
+        unsafe { acl::acl_free(list) };
+        return Err(io::Error::other(format!("no UUID for uid {} or {uid}", meta.uid())));
+    }
+    let mut why = None;
+    let mut entry: acl::Entry = std::ptr::null_mut();
+    let mut id = acl::FIRST_ENTRY;
+    // SAFETY: entries of a valid ACL, read only; each qualifier is freed.
+    while why.is_none() && unsafe { acl::acl_get_entry(list, id, &mut entry) } == 0 {
+        id = acl::NEXT_ENTRY;
+        let (mut tag, mut perms, mut flags) = (0, std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: an entry of the ACL; its sets are the entry's own.
+        let read = unsafe {
+            acl::acl_get_tag_type(entry, &mut tag) == 0
+                && acl::acl_get_permset(entry, &mut perms) == 0
+                && acl::acl_get_flagset_np(entry, &mut flags) == 0
+        };
+        if !read {
+            why = Some("its ACL cannot be read".to_owned());
+            break;
+        }
+        // SAFETY: the entry's flag set.
+        if tag != acl::EXTENDED_ALLOW || unsafe { acl::acl_get_flag_np(flags, acl::ENTRY_ONLY_INHERIT) } == 1 {
+            continue;
+        }
+        let writes = [acl::ADD_FILE, acl::APPEND_DATA, acl::DELETE_CHILD, acl::WRITE_SECURITY, acl::CHANGE_OWNER]
+            .into_iter()
+            // SAFETY: the entry's permission set.
+            .any(|perm| unsafe { acl::acl_get_perm_np(perms, perm) } == 1);
+        if !writes {
+            continue;
+        }
+        // SAFETY: as above.
+        let qualifier = unsafe { acl::acl_get_qualifier(entry) };
+        let owners = !qualifier.is_null() && {
+            // SAFETY: a guid_t (16 bytes), freed after.
+            let who = unsafe { std::slice::from_raw_parts(qualifier.cast::<u8>(), 16) };
+            who == owner || who == jail
+        };
+        if !qualifier.is_null() {
+            // SAFETY: allocated by acl_get_qualifier.
+            unsafe { acl::acl_free(qualifier) };
+        }
+        if !owners {
+            why = Some("its ACL lets another than its owner make, remove or give names in it".to_owned());
+        }
+    }
+    // SAFETY: the ACL read above.
+    unsafe { acl::acl_free(list) };
+    Ok(why)
 }
 
 /// Removes the sockets in the directory `dir` is open on (`path`, for the
@@ -927,6 +1030,46 @@ mod tests {
     use super::*;
 
     #[test]
+    // A network others may make names in is refused before anything of the
+    // jail is made there: one the jail's uid owns (but root's jail), one its
+    // group or others may write, one whose ACL lets another uid add a name;
+    // an ACL entry only for what is made later, or for the owner, and a
+    // jail of uid 0 are not refusals. Only the operator's switch makes the
+    // interfaces (vmm::platform::net), so no jail can make its own.
+    fn test_the_jailer_refuses_a_network_others_may_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let net = dir.as_path().canonicalize().unwrap().join("n");
+        std::fs::create_dir(&net).unwrap();
+        // SAFETY: no arguments.
+        let me = unsafe { libc::geteuid() };
+        let mode = |m: u32| std::fs::set_permissions(&net, std::fs::Permissions::from_mode(m)).unwrap();
+        let refused = |uid: u32, what: &str| {
+            let err = network_for_jail(&net, "a", uid).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{what}: {err}");
+            assert!(err.to_string().contains("not the operator's alone"), "{what}: {err}");
+            assert!(!net.join("a").exists(), "{what}");
+        };
+        mode(0o755);
+        refused(me, "the jail's uid's");
+        for m in [0o775, 0o757, 0o777] {
+            mode(m);
+            refused(54321, &format!("mode {m:o}"));
+        }
+        mode(0o755);
+        write_acl(&net, None, &[(54329, &[acl::ADD_FILE], &[])]).unwrap();
+        refused(54321, "an ACL letting another uid add a name");
+        write_acl(&net, None, &[(54329, &[acl::DELETE_CHILD], &[])]).unwrap();
+        refused(54321, "an ACL letting another uid remove a name");
+        write_acl(&net, None, &[(54329, &[acl::ADD_FILE], &[acl::ENTRY_FILE_INHERIT, acl::ENTRY_ONLY_INHERIT])])
+            .unwrap();
+        drop(network_for_jail(&net, "a", 54321).unwrap());
+        write_acl(&net, None, &[(me, &[acl::ADD_FILE, acl::DELETE_CHILD], &[])]).unwrap();
+        drop(network_for_jail(&net, "b", 54321).unwrap());
+        drop(network_for_jail(&net, "c", 0).unwrap());
+    }
+
+    #[test]
     fn test_netns_needs_an_existing_directory() {
         // Nothing there, or not a directory: the jailer fails, as setns on a
         // file that is not a network namespace does.
@@ -1146,9 +1289,10 @@ mod tests {
             drop(UnixDatagram::bind(own.join("tap0")).unwrap());
             std::fs::write(own.join("keep"), b"").unwrap();
         }
-        // SAFETY: no arguments.
-        let me = unsafe { libc::geteuid() };
-        let (sub, lock) = network_for_jail(&jn, "a", me).unwrap();
+        // The jailer's jail is another uid's than the network's owner (it
+        // refuses the owner's: network_open_to_others); the stand-in, as the
+        // user, can give none but the user's.
+        let (sub, lock) = network_for_jail(&jn, "a", 54321).unwrap();
         let (ok, given, err) = join(&sn);
         assert!(ok, "{err}");
         assert_eq!((sub.as_path(), Path::new(&given)), (jn.join("a").as_path(), sn.join("a").as_path()));
@@ -1162,7 +1306,7 @@ mod tests {
         // A second jail of the id while the first lives, with an endpoint:
         // refused busy, nothing touched.
         let live: Vec<_> = [&jn, &sn].map(|net| UnixDatagram::bind(net.join("a/tap1")).unwrap()).into();
-        let err = network_for_jail(&jn, "a", me).unwrap_err();
+        let err = network_for_jail(&jn, "a", 54321).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EBUSY), "{err}");
         let (ok, _, err) = join(&sn);
         assert!(!ok && err.contains("busy") && err.contains("EBUSY"), "{err}");

@@ -777,6 +777,12 @@ mod macos {
     /// A regular expression for a profile that matches the names directly in
     /// the directory `path` (absolute), and nothing below them.
     fn names_directly_in(path: &Path, what: &str) -> Result<String, SandboxError> {
+        names_directly_in_ending(path, "", what)
+    }
+
+    /// [`names_directly_in`], of the names that end in `suffix` (escaped
+    /// as the path is).
+    fn names_directly_in_ending(path: &Path, suffix: &str, what: &str) -> Result<String, SandboxError> {
         let path = path
             .to_str()
             .filter(|r| r.starts_with('/') && !r.contains(['\0', '\n', '"']))
@@ -788,7 +794,69 @@ mod macos {
             }
             regex.push(c);
         }
-        Ok(format!("(regex #\"{}/[^/]+$\")", regex.trim_end_matches('/')))
+        let mut end = String::new();
+        for c in suffix.chars() {
+            if "\\.^$*+?()[]{}|".contains(c) {
+                end.push('\\');
+            }
+            end.push(c);
+        }
+        Ok(format!("(regex #\"{}/[^/]+{end}$\")", regex.trim_end_matches('/')))
+    }
+
+    /// The network directory whose interfaces' lock files
+    /// (`platform::net`'s `IfaceLock`, `<name>.lock` directly in it) this
+    /// process opens: its jail's network's (`netns`'s parent), or outside a
+    /// jail and a network the user's directory of endpoints. A jail without
+    /// a network has no interfaces but vmnet's.
+    fn lock_network(root: Option<&Path>, netns: Option<&Path>) -> Result<Option<std::path::PathBuf>, SandboxError> {
+        Ok(match (root, netns) {
+            (_, Some(netns)) => Some(
+                netns
+                    .parent()
+                    .ok_or_else(|| SandboxError::Install(format!("network path {netns:?}")))?
+                    .to_owned(),
+            ),
+            (None, None) => match crate::platform::net::user_endpoint_dir() {
+                Ok(dir) => Some(dir.canonicalize().map_err(|err| {
+                    SandboxError::Install(format!("the directory of endpoints {dir:?}: {err}"))
+                })?),
+                Err(_) => None,
+            },
+            (Some(_), None) => None,
+        })
+    }
+
+    /// The rule of the interfaces' lock files (`platform::net`'s
+    /// `IfaceLock`), in both phases, as a device hot-plugged into a running
+    /// microVM opens its interface then, as Linux's VMM filter lets it open
+    /// its TAP: in a jail a regular file `<name>.lock` directly in the
+    /// network directory ([`lock_network`]) may be read, and nothing else
+    /// there (a link at such a name is decided by its target's path: a file
+    /// that is no lock file stays a denial). Its lock (`O_EXLOCK`, which
+    /// asks Seatbelt's `file-lock`, xnu `open1`'s `mac_file_check_lock`)
+    /// needs no rule: no rule names `file-lock`, and Seatbelt lets it on
+    /// what the file rules let open (measured, on each major CI runs:
+    /// `test_a_jail_reaches_only_lock_files_in_its_network`; a rule denying
+    /// `file-lock` refuses it, EPERM, measured under sandbox-exec). A
+    /// creator ([`crate::platform::net::may_create`]) in a jail may also
+    /// make one (`file-write-create`); outside a jail the file rule lets it
+    /// already. Removing its own is [`unlink_rule`]'s.
+    fn lock_rule(root: Option<&Path>, netns: Option<&Path>) -> Result<String, SandboxError> {
+        let Some(network) = lock_network(root, netns)? else {
+            return Ok(String::new());
+        };
+        let locks = names_directly_in_ending(&network, ".lock", "network")?;
+        let mut rule = String::new();
+        if root.is_some() {
+            rule.push_str(&format!(
+                "(allow file-read-data file-read-metadata (require-all (vnode-type REGULAR-FILE) {locks}))\n"
+            ));
+            if crate::platform::net::may_create() {
+                rule.push_str(&format!("(allow file-write-create (require-all (vnode-type REGULAR-FILE) {locks}))\n"));
+            }
+        }
+        Ok(rule)
     }
 
     /// File rule in a jail: only the jail directory, by its path outside the
@@ -854,10 +922,11 @@ mod macos {
         };
         let profile = PROFILE.replacen("(deny default)\n", &default_rule(), 1);
         Ok(format!(
-            "{profile}{}{}{}{files}{}{}{DENIED_CALL_RULE}",
+            "{profile}{}{}{}{files}{}{}{}{DENIED_CALL_RULE}",
             shm_rule(std::process::id()),
             syscall_rule(),
             operation_rule(),
+            lock_rule(root, netns)?,
             run_rule(root, netns)?,
             unlink_rule(root, netns, std::process::id())?
         ))
@@ -971,6 +1040,18 @@ mod macos {
             let dir = quoted(&dir, "directory of endpoints")?;
             rule.push_str(&format!(
                 "(allow file-write-unlink (require-all {narrowed} (vnode-type SOCKET) (subpath \"{dir}\")))\n"
+            ));
+        }
+        // A creator's interface lock files, which go with their devices
+        // (`platform::net`'s IfaceLock): the `.lock` files directly in the
+        // network directory that their owner may write (`file-mode`: every
+        // bit given set, measured), which the operator's never are.
+        if crate::platform::net::may_create()
+            && let Some(network) = lock_network(root, netns)?
+        {
+            let locks = names_directly_in_ending(&network, ".lock", "network")?;
+            rule.push_str(&format!(
+                "(allow file-write-unlink (require-all (vnode-type REGULAR-FILE) {locks} (file-mode #o0200)))\n"
             ));
         }
         Ok(rule)
@@ -4201,11 +4282,16 @@ mod macos {
         fn test_a_hotplugged_interface_asks_no_uid() {
             let pid = std::process::id().to_string();
             let out = child("endpoint_uid_child", &[("WICK_TEST_CASE", &pid)]);
-            let entry = crate::platform::net::user_endpoint_dir().unwrap().join(format!("fcuid{pid}"));
-            let _ = std::fs::remove_file(entry);
+            let dir = crate::platform::net::user_endpoint_dir().unwrap();
+            let _ = std::fs::remove_file(dir.join(format!("fcuid{pid}")));
+            let _ = std::fs::remove_file(dir.join(format!("fcuid{pid}.lock")));
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(out.status.success(), "{}", text(&out));
             assert!(stdout.contains("OPENED") && stdout.contains("CHILD-SURVIVED"), "{}", text(&out));
+            // And one nobody made is refused, EPERM in upstream's text, and
+            // the microVM runs on.
+            assert!(stdout.contains("UNMADE-REFUSED"), "{}", text(&out));
+            assert!(!dir.join(format!("fcun{pid}.lock")).exists());
         }
 
         #[test]
@@ -4216,9 +4302,14 @@ mod macos {
             let name = format!("fcuid{}", std::env::var("WICK_TEST_CASE").unwrap());
             let dir = crate::platform::net::user_endpoint_dir().unwrap();
             std::fs::create_dir_all(&dir).unwrap();
-            // The operator's interface: the switch's socket in the network.
+            // The operator's interface: the switch's socket in the network,
+            // and its lock file, anyone's.
             let _ = std::fs::remove_file(dir.join(&name));
             let _switch = std::os::unix::net::UnixDatagram::bind(dir.join(&name)).unwrap();
+            let lock = dir.join(format!("{name}.lock"));
+            std::fs::write(&lock, b"").unwrap();
+            std::fs::set_permissions(&lock, std::os::unix::fs::PermissionsExt::from_mode(0o444)).unwrap();
+            let unmade = format!("fcun{}", std::env::var("WICK_TEST_CASE").unwrap());
             select(Policy::Default);
             apply().unwrap();
             narrow().unwrap();
@@ -4228,6 +4319,227 @@ mod macos {
                     drop(tap);
                 }
                 Err(err) => println!("REFUSED {err}"),
+            }
+            let expected = format!(
+                "Open tap device failed: Error while creating ifreq structure: Operation not permitted (os \
+                 error 1). Invalid TUN/TAP Backend provided by {unmade}. Check our documentation on setting up \
+                 the network devices."
+            );
+            match crate::platform::net::tests_as::real(|| crate::platform::net::Tap::open_named(&unmade)) {
+                Err(err) => {
+                    let text = crate::devices::virtio::net::NetError::TapOpen(err).to_string();
+                    if text == expected {
+                        println!("UNMADE-REFUSED");
+                    } else {
+                        println!("UNMADE {text}");
+                    }
+                }
+                Ok(_) => println!("UNMADE OPENED"),
+            }
+            // Time for a denial's kill to land.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            println!("CHILD-SURVIVED");
+        }
+
+        // A socket's file gives no descriptor, whatever the open asks, so an
+        // interface's lock cannot be the operator's socket itself (an flock
+        // needs a descriptor): its own lock file is. Measured on each major
+        // CI runs (the macos-seatbelt job runs these tests on macOS 15 and
+        // 26): EOPNOTSUPP for every flag that opens a file without reading
+        // it, ENOTDIR for O_SEARCH. Not in xnu's public source (vn_open_auth
+        // has no such check in xnu-12377.121.6): the file system's open.
+        #[test]
+        fn test_a_socket_vnode_gives_no_descriptor() {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+            let path = dir.as_path().join("s");
+            let _sock = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+            let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+            for (what, flags, errno) in [
+                ("O_RDONLY", libc::O_RDONLY, libc::EOPNOTSUPP),
+                ("O_EVTONLY", libc::O_EVTONLY, libc::EOPNOTSUPP),
+                ("O_EVTONLY|O_NOFOLLOW", libc::O_EVTONLY | libc::O_NOFOLLOW, libc::EOPNOTSUPP),
+                ("O_SYMLINK", libc::O_SYMLINK, libc::EOPNOTSUPP),
+                ("O_SYMLINK|O_EVTONLY", libc::O_SYMLINK | libc::O_EVTONLY, libc::EOPNOTSUPP),
+                ("O_EXEC", libc::O_EXEC, libc::EOPNOTSUPP),
+                ("O_SEARCH", libc::O_SEARCH, libc::ENOTDIR),
+            ] {
+                // SAFETY: a NUL-terminated path.
+                let fd = unsafe { libc::open(c.as_ptr(), flags) };
+                let got = std::io::Error::last_os_error().raw_os_error();
+                if fd >= 0 {
+                    // SAFETY: a descriptor just opened.
+                    unsafe { libc::close(fd) };
+                }
+                assert_eq!((fd, got), (-1, Some(errno)), "{what}");
+            }
+        }
+
+        // In a jail, of what is directly in its network's directory only an
+        // interface's lock file (`<name>.lock`, a regular file) opens and
+        // locks, in both phases (a device hot-plugged into a running microVM
+        // opens its interface then); nothing else there is reached: a file
+        // that is no lock file, a link named as a lock file to it (decided
+        // by its target's path), and no name is made there (a lock file, a
+        // file, a socket) or changed (a lock file's mode), whatever the
+        // directory's permissions (here the user's, mode 0777), so that no
+        // jail makes or forges an interface: only the operator makes names
+        // there. A creator (root) jail makes and removes its own lock files
+        // (writable by their owner) and still no other file. Outside a
+        // jail, an flock on a directory, as the openers' turn takes one
+        // while the microVM is built, is allowed by the file rule's
+        // file-lock (measured here, as no rule names file-lock outside the
+        // lock files).
+        #[test]
+        fn test_a_jail_reaches_only_lock_files_in_its_network() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+            let base = dir.as_path().canonicalize().unwrap();
+            let (jail, net) = (base.join("jail"), base.join("n"));
+            std::fs::create_dir_all(&jail).unwrap();
+            std::fs::create_dir_all(net.join("j1")).unwrap();
+            std::fs::set_permissions(&net, std::fs::Permissions::from_mode(0o777)).unwrap();
+            for (name, mode) in [("a.lock", 0o444), ("b.lock", 0o444), ("secret", 0o644)] {
+                std::fs::write(net.join(name), b"x").unwrap();
+                std::fs::set_permissions(net.join(name), std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            std::os::unix::fs::symlink(net.join("secret"), net.join("l.lock")).unwrap();
+            let base_s = base.to_str().unwrap();
+            for case in ["user", "creator", "free"] {
+                let out = child("lock_reach_child", &[("WICK_TEST_CASE", case), ("WICK_TEST_DIR", base_s)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(out.status.success(), "{case}: {}", text(&out));
+                assert!(stdout.contains("CHILD-SURVIVED"), "{case}: {}", text(&out));
+                let expect: &[&str] = match case {
+                    "user" => &[
+                        "setup lock 0", "setup secret 1", "setup link 1", "setup create-lock 1",
+                        "setup create-file 1", "setup bind 1", "setup chmod 1", "setup unlink-lock 1",
+                        "run lock 0", "run secret 1", "run link 1", "run create-lock 1", "run create-file 1",
+                        "run bind 1",
+                    ],
+                    "creator" => &[
+                        "setup lock 0", "setup secret 1", "setup link 1", "setup create-lock 0",
+                        "setup create-file 1", "setup unlink-lock 1",
+                        "run lock 0", "run secret 1", "run link 1", "run create-lock 0", "run create-file 1",
+                        "run unlink-made 0",
+                    ],
+                    _ => &["setup flock-dir 0"],
+                };
+                for line in expect {
+                    // libtest may print the test's name on the first line.
+                    let found = stdout.lines().any(|l| l == *line || l.ends_with(&format!(" {line}")));
+                    assert!(found, "{case}: no {line:?}: {}", text(&out));
+                }
+            }
+            // Nothing was made in the network, and its files are as they were.
+            let mut names: Vec<_> =
+                std::fs::read_dir(&net).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            names.sort();
+            assert_eq!(names, ["a.lock", "b.lock", "j1", "l.lock", "secret"]);
+            let mode = std::fs::metadata(net.join("a.lock")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o444);
+        }
+
+        #[test]
+        #[ignore = "run by test_a_jail_reaches_only_lock_files_in_its_network in a separate process"]
+        fn lock_reach_child() {
+            let case = std::env::var("WICK_TEST_CASE").unwrap();
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let base = std::path::PathBuf::from(std::env::var("WICK_TEST_DIR").unwrap());
+            let (jail, net) = (base.join("jail"), base.join("n"));
+            let profile = match case.as_str() {
+                "user" => crate::platform::net::tests_as::user(|| profile_for(Some(&jail), Some(&net.join("j1")))),
+                "creator" => profile_for(Some(&jail), Some(&net.join("j1"))),
+                _ => profile_for(None, None),
+            };
+            COMPILED
+                .set((Compiled::here(&profile.unwrap()).unwrap(), Compiled::here(&api_profile()).unwrap()))
+                .unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            // 0, or 1 for EPERM (the sandbox's refusal), or the errno.
+            let res = |r: i32| -> i32 {
+                if r >= 0 {
+                    return 0;
+                }
+                match std::io::Error::last_os_error().raw_os_error().unwrap() {
+                    libc::EPERM => 1,
+                    e => e,
+                }
+            };
+            let path = |name: &str| CString::new(net.join(name).as_os_str().as_bytes()).unwrap();
+            let open = |name: &str, flags: i32| {
+                // SAFETY: a NUL-terminated path and a mode.
+                let fd = unsafe { libc::open(path(name).as_ptr(), flags, 0o644 as libc::c_uint) };
+                let r = res(fd);
+                if fd >= 0 {
+                    // SAFETY: a descriptor just opened.
+                    unsafe { libc::close(fd) };
+                }
+                r
+            };
+            let locked = libc::O_RDONLY | libc::O_EXLOCK | libc::O_NONBLOCK;
+            if case == "free" {
+                let d = CString::new(base.as_os_str().as_bytes()).unwrap();
+                // SAFETY: a NUL-terminated path; a descriptor then flocked.
+                let r = unsafe {
+                    let fd = libc::open(d.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+                    let r = libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB);
+                    libc::close(fd);
+                    r
+                };
+                println!("setup flock-dir {}", res(r));
+                println!("CHILD-SURVIVED");
+                return;
+            }
+            for phase in ["setup", "run"] {
+                if phase == "run" {
+                    narrow().unwrap();
+                }
+                println!("{phase} lock {}", open("a.lock", locked));
+                println!("{phase} secret {}", open("secret", libc::O_RDONLY));
+                println!("{phase} link {}", open("l.lock", libc::O_RDONLY));
+                let made = format!("{phase}.lock");
+                println!("{phase} create-lock {}", open(&made, locked | libc::O_CREAT));
+                println!("{phase} create-file {}", open(&format!("{phase}-file"), libc::O_RDONLY | libc::O_CREAT));
+                if case == "user" {
+                    let r = match std::os::unix::net::UnixDatagram::bind(net.join(format!("{phase}-sock"))) {
+                        Ok(_) => 0,
+                        Err(e) if e.raw_os_error() == Some(libc::EPERM) => 1,
+                        Err(e) => e.raw_os_error().unwrap(),
+                    };
+                    println!("{phase} bind {r}");
+                }
+                if phase == "setup" {
+                    // Changing an operator's lock file, or removing it: the
+                    // run phase's denial of these is the kill (its rules).
+                    // SAFETY: a NUL-terminated path; a descriptor then
+                    // changed.
+                    let r = unsafe {
+                        let fd = libc::open(path("b.lock").as_ptr(), libc::O_RDONLY);
+                        let r = libc::fchmod(fd, 0o666);
+                        libc::close(fd);
+                        r
+                    };
+                    if case == "user" {
+                        println!("{phase} chmod {}", res(r));
+                    }
+                    // SAFETY: a NUL-terminated path.
+                    println!("{phase} unlink-lock {}", res(unsafe { libc::unlink(path("b.lock").as_ptr()) }));
+                }
+                if case == "creator" && phase == "run" {
+                    // Its own, made writable by its owner, goes; made in the
+                    // setup phase and this one.
+                    for made in ["setup.lock", "run.lock"] {
+                        // SAFETY: a NUL-terminated path.
+                        let r = res(unsafe { libc::unlink(path(made).as_ptr()) });
+                        if made == "run.lock" {
+                            println!("run unlink-made {r}");
+                        }
+                    }
+                }
             }
             // Time for a denial's kill to land.
             std::thread::sleep(std::time::Duration::from_secs(2));

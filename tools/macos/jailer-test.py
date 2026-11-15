@@ -870,7 +870,9 @@ class Network:
     path as an operator's switch binds it (Firecracker opens only such an
     interface, and its endpoint takes only such sockets as peers), that
     attaches to that endpoint once it is there, answers ARP and ICMP echo
-    for its address and records every frame it gets. One jail per name."""
+    for its address and records every frame it gets; beside it the
+    interface's lock file `<name>.lock`, anyone's (0444), which makes the
+    interface one Firecracker's at a time. One jail per name."""
 
     def __init__(self, path, host_ip, endpoints):
         import socket as so
@@ -886,9 +888,30 @@ class Network:
         for jail_id, name in endpoints:
             sock = so.socket(so.AF_UNIX, so.SOCK_DGRAM)
             sock.bind(self.host(jail_id, name))
+            self.lock(name, 0o444)
             sock.settimeout(0.2)
             self.hosts[jail_id, name] = sock
             bt.threading.Thread(target=self._host, args=(sock, self.endpoint(jail_id, name)), daemon=True).start()
+
+    def lock(self, name, mode, uid=0, gid=0):
+        """Makes the lock file of the interface `name`, owned by `uid` and
+        `gid` with `mode`: who may open it (vmm::platform::net IfaceLock:
+        0444 anyone, 0400 its owner, 0040 its group, 0440 both)."""
+        path = os.path.join(self.path, f"{name}.lock")
+        if os.path.lexists(path):
+            os.unlink(path)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+        os.close(fd)
+
+    def iface(self, name, mode, uid=0, gid=0):
+        """An interface nobody attaches to: its socket and its lock file."""
+        import socket as so
+        sock = so.socket(so.AF_UNIX, so.SOCK_DGRAM)
+        sock.bind(self.host(None, name))
+        self.lock(name, mode, uid, gid)
+        self.hosts[None, name] = sock
 
     def host(self, jail_id, name):  # pylint: disable=unused-argument
         """The path of the host socket behind an endpoint: the interface."""
@@ -1123,19 +1146,49 @@ def stage_netns(ctx):
               "injection is not stopped (SECURITY.md, the --netns cell); correct them")
         c.reboot()
 
-        # In a network, vmnet (the host's own) is refused; a name in use in
-        # the jail's own directory is busy, as a busy TAP; a name another
-        # jail of the network uses is free (each jail's names are its own:
-        # the stated difference from one Linux namespace).
+        # In a network, vmnet (the host's own) is refused; a name another
+        # jail of the network holds is busy, EBUSY in upstream's text, as a
+        # second TUNSETIFF on a TAP in use (drivers/net/tun.c, v6.1,
+        # tun_attach), where before it opened an endpoint the switch never
+        # attached to, and the holder keeps it; a name in use in the jail
+        # itself is busy too.
+        busy_text = ("Open tap device failed: Error while creating ifreq structure: Resource busy (os error 16). "
+                     "Invalid TUN/TAP Backend provided by tap0. Check our documentation on setting up the network "
+                     "devices.")
         jail = Jail(ctx, "netns-refuse")
         vm = JailedVm(ctx, "netns-refuse", jail, ["--netns", net_a.path])
         r = vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "vmnet-shared"},
                    expect=(400,))
         check("not the jail's" in json.dumps(r), f"vmnet-shared: {r}")
-        vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "tap0"}, expect=(204,))
-        r = vm.api("PUT", "/network-interfaces/eth1", {"iface_id": "eth1", "host_dev_name": "tap0"},
+        r = vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "tap0"},
                    expect=(400,))
-        check("os error 16" in json.dumps(r), f"tap0 twice in one jail: {r}")
+        check(busy_text in json.dumps(r), f"a second jail on jail a's tap0: {r}")
+        _, out = a.sh("ping -c 2 -i 0.3 -W 3 10.0.1.1")
+        check(" 0% packet loss" in out, f"jail a after a second jail asked for its tap0: {out}")
+        net_a.iface("tapdup", 0o444)
+        vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "tapdup"}, expect=(204,))
+        r = vm.api("PUT", "/network-interfaces/eth1", {"iface_id": "eth1", "host_dev_name": "tapdup"},
+                   expect=(400,))
+        check("os error 16" in json.dumps(r), f"tapdup twice in one jail: {r}")
+        # Who may open an interface is its lock file's owner and mode, as a
+        # TAP's TUNSETOWNER and TUNSETGROUP (tun_not_capable): another uid's
+        # (0400) and another group's (0040) are refused, EPERM in upstream's
+        # text; the jail's uid's and its group's open.
+        for name, mode, uid, gid, opens in (("tapother", 0o400, UID + 1, GID, False),
+                                            ("tapgroup", 0o040, 0, GID + 1, False),
+                                            ("tapmine", 0o400, UID, GID, True),
+                                            ("tapours", 0o040, 0, GID, True)):
+            net_a.iface(name, mode, uid, gid)
+            want = (204,) if opens else (400,)
+            r = vm.api("PUT", f"/network-interfaces/{name}", {"iface_id": name, "host_dev_name": name}, expect=want)
+            check(opens or ("Operation not permitted (os error 1)" in json.dumps(r)
+                            and f"provided by {name}" in json.dumps(r)), f"{name} ({mode:o} {uid}:{gid}): {r}")
+        # The jail cannot change a lock file, nor make or remove one: the
+        # network directory is the operator's (the jailer refuses one the
+        # jail's uid owns or others may write; the sandbox makes no name
+        # there).
+        check(oct(os.stat(os.path.join(net_a.path, "tap0.lock")).st_mode & 0o777) == oct(0o444),
+              "tap0's lock file changed")
         # Only the network's interfaces open: a name the switch did not make
         # is refused, as a TAP that does not exist is for a jailed user on
         # Linux; and so is every path name, wherever it points (a jail's
@@ -1159,6 +1212,17 @@ def stage_netns(ctx):
         vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "tapnobody"}, expect=(204,))
         check(os.path.exists(os.path.join(net_a.path, "netns-root", "tapnobody")), "uid 0's tapnobody not made")
         check(not os.path.exists(os.path.join(net_a.path, "tapnobody")), "uid 0 made a name in the network directory")
+        # Its lock file, made with it: root's, writable by its owner (a
+        # creator's, removed when the device goes).
+        made = os.lstat(os.path.join(net_a.path, "tapnobody.lock"))
+        check(made.st_uid == 0 and made.st_mode & 0o200, f"uid 0's tapnobody.lock: {made}")
+        vm.kill()
+        # A killed creator leaves its lock file, as it leaves its endpoints;
+        # the next creator of the name takes it and removes it when its
+        # device goes.
+        jail = Jail(ctx, "netns-root2")
+        vm = JailedVm(ctx, "netns-root2", jail, ["--netns", net_a.path], uid=0)
+        vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "tapnobody"}, expect=(204,))
         vm.kill()
         for vm in vms.values():
             vm.reboot()
@@ -1182,8 +1246,10 @@ def stage_netns(ctx):
             "a third jail in a's network reaches a's host from its own directory; a second jail of a's id: busy, "
             "a keeps its network; another uid: EACCES on a's endpoint (send, remove, bind) and in the network "
             "directory; the jail's uid outside a sandbox: its frame dropped by a's endpoint; a forged switch "
-            "address: answered (stated as not stopped); vmnet, a busy name, a name the switch did not make and "
-            "path names refused (EPERM, nothing made), uid 0's jail makes one; a dead jail's endpoint "
+            "address: answered (stated as not stopped); vmnet refused; another jail's tap0 busy (EBUSY), a "
+            "busy name in the jail too; lock files of another uid and group refused, the jail's own uid's and "
+            "group's opened; a name the switch did not make and "
+            "path names refused (EPERM, nothing made), uid 0's jail makes one with its lock file; a dead jail's endpoint "
             "removed at its id's next start; a file refused")
 
 

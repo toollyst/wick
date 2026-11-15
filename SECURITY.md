@@ -168,6 +168,10 @@ upstream Firecracker and its jailer.
   of its own endpoints only, as its directory there is its own; outside a jail, of other microVMs' endpoints of the
   same user, which that user's unjailed VMM can already reach (it runs as the user). A jail without a network gets no
   such rule, and an endpoint at a path stays when its device goes.
+  A Firecracker that may make an interface (root) may also remove the `.lock` files directly in the network directory
+  that their owner may write, the ones a creator makes (an operator's are read-only), so that a lock file it made goes
+  with its device; it removes only the one its lock is on, by its identity
+  (`test_the_creator_makes_a_name_nobody_made`, `test_a_jail_reaches_only_lock_files_in_its_network`).
 - **macOS jailer: a root supervisor per jail, for the freezer.** macOS has no cgroup freezer, so every jail gets a
   supervisor: a fork of the jailer made just before the exec, which stays root (`pid_suspend` needs root), in a
   session of its own, chrooted to `/var/empty`, with only its standard descriptors (standard error is
@@ -221,13 +225,22 @@ upstream Firecracker and its jailer.
   network directory's owner is trusted for that network, as whoever holds CAP_NET_ADMIN in a namespace is on Linux.
   Use one uid per jail, as upstream advises. So that a switch started or restarted after a jail is reachable,
   the jails' uids are granted write, and nothing else, on every file made directly in the network directory, not on
-  sockets alone: keep nothing there but the switch's sockets (`test_each_jail_has_a_network_directory_of_its_own`).
+  sockets alone: keep nothing there but the switch's sockets and their lock files
+  (`test_each_jail_has_a_network_directory_of_its_own`; a jail's write right on a lock file changes nothing, as its
+  content is not read, and no jail may change its mode: `test_a_jail_reaches_only_lock_files_in_its_network`).
   A jail opens only the interfaces of its network: a name without `/` only if the switch's socket of that name is
-  directly in the network directory, owned by its owner or root, which no jail can make there (a jail of uid 0 may
-  make one in its own directory, as root may make a TAP on Linux); and no path name, wherever it points
-  (`test_only_the_operators_interface_opens`, `test_a_jail_opens_no_path_name`; `jailer-test netns`, root, not run
-  yet). A jail can tell which names exist directly in the network directory (it may look at their metadata, not
-  list the directory), as a namespace's members see its interfaces on Linux.
+  directly in the network directory, owned by its owner or root, with the interface's lock file beside it, which
+  no jail can make there (the sandbox lets a jail read lock files there and make nothing:
+  `test_a_jail_reaches_only_lock_files_in_its_network`; the jailer refuses a network directory the jail's uid
+  owns or that its group, others or another uid's ACL entry may write: `test_the_jailer_refuses_a_network_others_may_write`;
+  a jail of uid 0 may make one, its endpoint in its own directory and its lock file in the network directory, as
+  root may make a TAP on Linux); and no path name, wherever it points (`test_only_the_operators_interface_opens`,
+  `test_a_jail_opens_no_path_name`; `jailer-test netns`, root, not run yet). An interface is one Firecracker's at a
+  time, a second open failing with `EBUSY` (the lock file's lock, which the kernel arbitrates), and the lock file's
+  owner and mode say which uids and groups may open it, as a TAP's owner and group do (docs/COMPATIBILITY.md, Net
+  hotplug), so a jail cannot take another jail's interface, nor hold one against the jail it was made for. A jail
+  can tell which names exist directly in the network directory (it may look at their metadata, not list the
+  directory), as a namespace's members see its interfaces on Linux.
 - **Windows jailer: one network directory's jails are separated in code; the elevated stage has run on CI only.** On
   Linux two Firecrackers in one network namespace cannot reach each other's TAP: a TAP is its owner's, and a second
   attach is refused (drivers/net/tun.c, `tun_not_capable`, `tun_attach`). On Windows the network directory granted
