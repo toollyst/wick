@@ -141,10 +141,9 @@ dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `
   Guest MSRs row: the PMU (KVM's AMD guest has four counters, here off), CPUID faulting, steal time, and an exit
   for MTRRCAP and the variable MTRRs, which WHP answers with 16 pairs to KVM's 8.
 - Memory at `memory.max` under a userfaultfd restore: a reclaim of the pages discarded inside a 2 MiB chunk
-  before a charge is refused, as Linux's memory cgroup reclaims, by moving their chunks into new sections, is
-  written but does not work yet on a real job limit: the move's own view map is refused with
-  `ERROR_COMMITMENT_LIMIT` when the job has no room (CI run 43640510155), so a fill there is refused and a lazy
-  touch ends with 137, as before; not done yet. Left, each stated in docs/COMPATIBILITY.md's `memory.max` row: the discarded pages of a released range,
+  before a charge is refused, as Linux's memory cgroup reclaims, by moving their chunks into new sections, with no
+  room left in the job: each move gives back part of its own dead pages' charge for its maps first (Windows Server
+  2022 20348; MOVEUNDERVCPU needs WHP: CI). A charge a move could not take back owes up to 12 KiB, stated. Left, each stated in docs/COMPATIBILITY.md's `memory.max` row: the discarded pages of a released range,
   a reclaim before a refused allocation of the VMM's own (its heap, a thread's stack), and before a commit made at
   once that is refused (`MAP_POPULATE`, a private file mapping's read, a `MAP_FIXED` recommit, a discard of private
   memory that is not lazy, a committing `mprotect`), which fails with `ENOMEM` today: not done yet.

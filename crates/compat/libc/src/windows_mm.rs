@@ -355,8 +355,13 @@ fn charge_add(view: usize, len: usize) -> Option<Arc<Charge>> {
     Some(c)
 }
 
-/// The view at `view` is gone: its charge is released with its last holder.
+/// The view at `view` is gone: its charge is released with its last holder,
+/// and a charge its pages owed ([`OWED`]) goes with it.
 fn charge_remove(view: usize) {
+    let len = CHARGES.lock().unwrap().get(&view).map(|(n, _)| *n);
+    if let Some(len) = len {
+        forget_owed(view, len);
+    }
     let mut m = CHARGES.lock().unwrap();
     m.remove(&view);
     CHARGES_SET.store(!m.is_empty(), std::sync::atomic::Ordering::Release);
@@ -1315,17 +1320,54 @@ pub(crate) fn prefault_lazy(addr: usize, len: usize) {
 static RESCUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const RESCUE_LEN: usize = 256 << 10;
 
+/// A line on standard error written at the memory limit, where nothing may
+/// allocate and a thread's stack may not grow (a stack that must grow there
+/// ends the process with `STATUS_STACK_OVERFLOW`:
+/// `test_a_stack_that_grows_at_the_limit_on_record`): formatted into a
+/// fixed buffer on the stack (512 bytes, the rest cut) and written with one
+/// `WriteFile`, no lock and no allocation, where `eprintln!` takes the
+/// standard error's lock and formats through it.
+pub(crate) fn say_at_the_limit(line: core::fmt::Arguments) {
+    struct Buffer {
+        bytes: [u8; 512],
+        len: usize,
+    }
+    impl core::fmt::Write for Buffer {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.bytes.len() - 1 - self.len);
+            self.bytes[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.len += n;
+            Ok(())
+        }
+    }
+    let mut b = Buffer { bytes: [0; 512], len: 0 };
+    let _ = core::fmt::write(&mut b, line);
+    b.bytes[b.len] = b'\n';
+    let mut written = 0;
+    // SAFETY: the process's standard error handle (an invalid one fails the
+    // call) and our buffer.
+    unsafe {
+        windows_sys::Win32::Storage::FileSystem::WriteFile(
+            windows_sys::Win32::System::Console::GetStdHandle(windows_sys::Win32::System::Console::STD_ERROR_HANDLE),
+            b.bytes.as_ptr(),
+            u32::try_from(b.len + 1).unwrap_or(0),
+            &mut written,
+            std::ptr::null_mut(),
+        )
+    };
+}
+
 fn out_of_memory(addr: usize, err: u32) -> ! {
     let rescue = RESCUE.swap(0, std::sync::atomic::Ordering::SeqCst);
     if rescue != 0 {
         // SAFETY: frees the block set aside for this.
         unsafe { VirtualFree(rescue as *mut c_void, 0, MEM_RELEASE) };
     }
-    std::eprintln!(
+    say_at_the_limit(format_args!(
         "wick: guest memory: committing the pages at {addr:#x} failed with error {err}: the memory limit \
          (the jail's memory.max, or the host's commit limit) is reached; the VMM ends, as the cgroup OOM \
          killer ends it on Linux (exit {OOM_EXIT})"
-    );
+    ));
     // SAFETY: ends this process at once, as SIGKILL does.
     unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), OOM_EXIT) };
     unreachable!("the process ended");
@@ -2748,6 +2790,7 @@ pub(crate) fn uffd_swap_chunk(view: usize, len: usize, alias: usize) -> bool {
         // SAFETY: plain call.
         out_of_memory(view, unsafe { GetLastError() });
     }
+    forget_owed(view, len);
     drop(t);
     uncharge(view, len);
     true
@@ -2783,6 +2826,101 @@ fn uffd_budget() -> bool {
     }
     UFFD_BUDGET.store(b as usize, std::sync::atomic::Ordering::Release);
     true
+}
+
+/// Run by a move just after it gave up its dead pages' charge for its maps
+/// and before its first map: for a test of another commit taking that room
+/// (`test_a_move_whose_room_is_taken_owes_its_charge`).
+#[cfg(test)]
+pub(crate) static AFTER_DEAD_UNCHARGED: Mutex<Option<fn()>> = Mutex::new(None);
+
+/// Where a move's view of its new section was mapped, the last one: for
+/// the record of its alignment (`test_a_chunk_with_one_dead_page_at_the_limit`).
+#[cfg(test)]
+pub(crate) static LAST_MOVE_VIEW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many moves were not made once begun ([`uffd_move_chunk`]: their new
+/// section's view not mapped, its live pages not committed or closed, the
+/// alias not unmapped); the line is printed for the first 16, every 1024th
+/// after and every one that leaves a charge owed, as a reclaim at the limit
+/// can be tried at every touch.
+static MOVE_MAPS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The most of the job's commit a move's maps take: its new section's view
+/// mapped anywhere took 4 KiB a 2 MiB view, one page table, and a view into
+/// a placeholder made apart 8 to 12 KiB, more page tables
+/// (`test_what_a_view_mapping_charges_on_record`, VIEWCHARGE, measured on
+/// Windows Server 2022 20348, not documented; the move's swaps into the
+/// alias's and the guest view's placeholders give back what they take,
+/// MOVEROOM). A move gives back this much of its chunk's dead pages' charge
+/// before its first map, all of it if the chunk has less, and the rest once
+/// it is made.
+const MOVE_ROOM: usize = 3 * PAGE;
+
+/// The dead pages ([`MOVE_ROOM`] at most, a page each) whose charge a move
+/// gave back for its maps and could not take again, when it was not made
+/// and another commit had taken that room meanwhile (a host thread's heap,
+/// another process of the job): owed. Their section commit stays, so the
+/// job's limit and the jailer's count are each that much below what the
+/// process holds (12 KiB at most). At most one chunk owes at a time:
+/// while one does, no other chunk is moved ([`uffd_move_chunk`]) and every
+/// userfaultfd commit first takes the owed charge again ([`uffd_commit`]),
+/// refused (`ENOMEM`, the reclaim then moving the owing chunk) if it cannot;
+/// the owing chunk's move, made, frees the pages. 0 for none. Taken after
+/// the table's lock and before [`CHARGES`].
+static OWED: Mutex<[usize; MOVE_ROOM / PAGE]> = Mutex::new([0; MOVE_ROOM / PAGE]);
+/// Whether [`OWED`] holds a page: a commit's one look at it otherwise.
+static OWES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Takes the owed charge ([`OWED`]) again, a page at a time. Whether
+/// nothing is owed now.
+fn settle_owed(owed: &mut [usize; MOVE_ROOM / PAGE]) -> bool {
+    for p in owed.iter_mut().filter(|p| **p != 0) {
+        if charge(*p, PAGE) {
+            *p = 0;
+        }
+    }
+    let none = owed.iter().all(|&p| p == 0);
+    OWES.store(!none, std::sync::atomic::Ordering::Release);
+    none
+}
+
+/// The pages of `[view, view + len)` owe nothing ([`OWED`]): their view is
+/// gone or their chunk was discarded whole, its charge given back. Under
+/// the table's lock, so that no other memory takes their addresses before.
+fn forget_owed(view: usize, len: usize) {
+    if !OWES.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let mut owed = OWED.lock().unwrap();
+    for p in owed.iter_mut().filter(|p| (view..view + len).contains(*p)) {
+        *p = 0;
+    }
+    OWES.store(owed.iter().any(|&p| p != 0), std::sync::atomic::Ordering::Release);
+}
+
+/// The chunk that owes its dead pages' charge ([`OWED`]), if one does: an
+/// address in it.
+pub(crate) fn owing() -> Option<usize> {
+    OWED.lock().unwrap().iter().copied().find(|&p| p != 0)
+}
+
+/// Whether a charged view ([`CHARGES`]) holds `at`, for tests.
+#[cfg(test)]
+pub(crate) fn charged_view_at_for_tests(at: usize) -> bool {
+    CHARGES.lock().unwrap().range(..=at).next_back().is_some_and(|(v, (n, _))| at < v + n)
+}
+
+/// How many moves were not made ([`MOVE_MAPS_REFUSED`]), for tests.
+#[cfg(test)]
+pub(crate) fn moves_refused_for_tests() -> u64 {
+    MOVE_MAPS_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The owed charge's bytes, for tests.
+#[cfg(test)]
+pub(crate) fn owed_bytes() -> usize {
+    OWED.lock().unwrap().iter().filter(|&&p| p != 0).count() * PAGE
 }
 
 /// Called in the middle of a chunk's move, between the copy and the swap:
@@ -2863,15 +3001,30 @@ fn for_each_picked(s: usize, len: usize, pick: &dyn Fn(usize) -> bool, mut f: im
 /// (`PAGE_NOACCESS`, which WHP honours), copied from the alias, and the new
 /// section put in the place of the old one in both views
 /// ([`uffd_swap_chunk`]'s steps), so that the old one, and its commit, goes
-/// with its last view; the missing pages' charge is given back
-/// ([`uncharge`]: the dead ones', and none for those never filled), the live
-/// pages' kept (it is indexed by the view's offset, which does not move).
-/// The dead pages are not committed in the new section: missing, they fault
-/// as missing. The bytes of live pages copied and of dead pages given back,
-/// or `None`, nothing changed, if the chunk is not one of [`uffd_alias`]'s
-/// or the new section cannot be made or committed; a failure once a view is
-/// unmapped ends the VMM, named ([`out_of_memory`]). Allocates nothing: it
-/// runs at the limit.
+/// with its last view; the dead pages' charge is given back ([`uncharge`]),
+/// [`MOVE_ROOM`] of it before the first map, as the room the maps take of
+/// the job's commit, and the rest once the move is made; the live pages'
+/// is kept (it is indexed by the view's offset, which does not move). The
+/// dead pages are not committed in the new section: missing, they fault as
+/// missing. The bytes of live pages copied and of dead pages given back, or
+/// `None`, nothing changed but a charge owed ([`OWED`]), if the chunk is
+/// not one of [`uffd_alias`]'s, has no dead pages, is not the chunk that
+/// owes while one does, or the new section cannot be made, mapped or
+/// committed (one line on standard error); a failure once a view is
+/// unmapped ends the VMM, named ([`out_of_memory`]).
+///
+/// What the job's limit and the jailer's count (overlay/jailer/platform/
+/// windows commit.rs: private commit plus section commit, less the
+/// committed private `PAGE_NOACCESS` memory, no more than the section
+/// commit) see, for a chunk of L live and D dead bytes, R = D or
+/// [`MOVE_ROOM`] if less: the job's count falls by R before the first map
+/// and rises by the maps' page tables (4 KiB on record), so it does not rise
+/// past where it was; at the end it is D below. The jailer's falls by R
+/// too (a charge page is private commit and cover: the cover then is the
+/// section commit, as the move budget, [`UFFD_BUDGET`], covers the new
+/// section's L), and at the end is D below. What the process holds peaks at
+/// L more for the copy's time (both sections), which the move budget pays
+/// for in both counts. Allocates nothing: it runs at the limit.
 pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &dyn Fn(usize) -> bool) -> Option<(usize, usize)> {
     let t = table().lock().unwrap();
     match t.get(&view) {
@@ -2885,21 +3038,83 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
     let live = |at: usize| !missing(at);
     let mut dead = 0;
     for_each_picked(view, len, missing, |_, n| dead += n);
+    // A chunk with no dead pages is no candidate (`find_candidates`): it
+    // would give back nothing, and has no room to give for its maps.
+    if dead == 0 {
+        return None;
+    }
+    let mut owed = OWED.lock().unwrap();
+    let owes = owed.iter().any(|&p| p != 0);
+    // While a chunk owes its dead pages' charge, no other is moved.
+    if owes && !owed.iter().any(|&p| p != 0 && (view..view + len).contains(&p)) {
+        return None;
+    }
     let section = reserved_section(len)?;
+    // The room the maps take of the job's commit ([`MOVE_ROOM`]), which at
+    // the limit there is none of else (CI run 43640510155: no move was made
+    // there): given back from the chunk's dead pages' charge first, as Linux
+    // uncharged those pages at the discard. The jailer's count does not
+    // move with it: a charge page is cover there, so the private commit and
+    // the cover fall together, and the old section's pages are still
+    // counted until it goes. A chunk that owes has given it already.
+    if !owes {
+        let mut room = 0;
+        for_each_picked(view, len, missing, |a, n| {
+            for p in (a..a + n).step_by(PAGE) {
+                if room < owed.len() {
+                    uncharge(p, PAGE);
+                    owed[room] = p;
+                    room += 1;
+                }
+            }
+        });
+        OWES.store(true, std::sync::atomic::Ordering::Release);
+    }
+    #[cfg(test)]
+    if let Some(hook) = *AFTER_DEAD_UNCHARGED.lock().unwrap() {
+        hook();
+    }
+    // A move not made takes that charge again; if another commit holds the
+    // room now, it is owed ([`OWED`]), which the line says.
+    let mut not_made = |what: &str, err: u32| {
+        let settled = settle_owed(&mut owed);
+        let n = MOVE_MAPS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 16 || n.is_multiple_of(1024) || !settled {
+            say_at_the_limit(format_args!(
+                "wick: reclaim: the move of the chunk at {view:#x} could not {what} (error {err}) with its dead pages' charge \
+                 given back for its maps: the chunk is left as it was, its dead pages' charge {}; the commit that needed the \
+                 reclaim goes on or is refused, as without it ({} such moves)",
+                if settled {
+                    "taken again"
+                } else {
+                    "not taken again (another commit holds the room): owed, every userfaultfd commit takes it again first and \
+                     no other chunk moves until it is"
+                },
+                n + 1
+            ));
+        }
+    };
     // SAFETY: maps our new section, anywhere.
     let tmp = unsafe { MapViewOfFile3(section.0, proc(), std::ptr::null(), 0, len, 0, PAGE_READWRITE, std::ptr::null_mut(), 0) }
         .Value as usize;
     if tmp == 0 {
+        // SAFETY: plain call.
+        not_made("map its new section", unsafe { GetLastError() });
         return None;
     }
-    let unmap_tmp = || {
+    #[cfg(test)]
+    LAST_MOVE_VIEW.store(tmp, std::sync::atomic::Ordering::Relaxed);
+    let mut unmap_tmp = |what: &str| {
+        // SAFETY: plain call.
+        let err = unsafe { GetLastError() };
         // SAFETY: unmaps the view made here.
         unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: tmp as *mut c_void }, 0) };
+        not_made(what, err);
     };
     let mut committed = true;
     for_each_picked(view, len, &live, |a, n| committed &= commit_now(tmp + (a - view), n, PAGE_READWRITE, false));
     if !committed {
-        unmap_tmp();
+        unmap_tmp("commit its live pages in the new section");
         return None;
     }
     let protect_live = |prot| {
@@ -2913,7 +3128,7 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
     };
     if !protect_live(PAGE_NOACCESS) {
         protect_live(PAGE_READWRITE);
-        unmap_tmp();
+        unmap_tmp("close its live pages");
         return None;
     }
     let mut copied = 0;
@@ -2932,7 +3147,7 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
     // guest's view keeps the old section until it is unmapped too.
     if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
         protect_live(PAGE_READWRITE);
-        unmap_tmp();
+        unmap_tmp("unmap its alias");
         return None;
     }
     let swapped = view_into(&section, alias, len)
@@ -2943,13 +3158,17 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
         // SAFETY: plain call.
         out_of_memory(view, unsafe { GetLastError() });
     }
-    unmap_tmp();
-    drop(t);
-    // The missing pages' charge: the dead pages' (a page never filled has
-    // none, and its decommit changes nothing).
+    // SAFETY: unmaps the view made here.
+    unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: tmp as *mut c_void }, 0) };
+    // Made: the old section and its dead pages are gone with its last view;
+    // the rest of their charge given back (the live pages' kept: it is
+    // indexed by the view's offset, which does not move), and nothing owed.
+    // The dead pages are not committed in the new section, so they are found
+    // as missing: those never filled have no charge, which is no error to
+    // give back (Learn, VirtualFree).
     let mut run: Option<usize> = None;
-    for at in (view..view + len).step_by(PAGE) {
-        match (missing(at), run) {
+    for at in (view..view + len).step_by(PAGE).chain(core::iter::once(view + len)) {
+        match (at < view + len && missing(at), run) {
             (true, None) => run = Some(at),
             (false, Some(r)) => {
                 uncharge(r, at - r);
@@ -2958,9 +3177,10 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
             _ => {}
         }
     }
-    if let Some(r) = run {
-        uncharge(r, view + len - r);
-    }
+    *owed = [0; MOVE_ROOM / PAGE];
+    OWES.store(false, std::sync::atomic::Ordering::Release);
+    drop(owed);
+    drop(t);
     Some((copied, dead))
 }
 
@@ -2988,7 +3208,15 @@ fn region_pieces(s: usize, len: usize) -> Vec<(usize, usize)> {
 /// `PAGE_NOACCESS` through A, B read committed and `PAGE_READWRITE`, B's
 /// write read back through A once A was opened). `false` if the charge or
 /// the commit is refused (the job's memory limit).
+///
+/// A charge owed ([`OWED`]) is taken again first: refused, so is the commit.
 pub(crate) fn uffd_commit(s: usize, len: usize) -> bool {
+    if OWES.load(std::sync::atomic::Ordering::Acquire) {
+        let _t = table().lock().unwrap();
+        if !settle_owed(&mut OWED.lock().unwrap()) {
+            return false;
+        }
+    }
     region_pieces(s, len).into_iter().all(|(a, n)| commit(a, n, PAGE_NOACCESS, false))
 }
 

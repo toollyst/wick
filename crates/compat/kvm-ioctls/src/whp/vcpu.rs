@@ -8079,8 +8079,11 @@ mod fpu_tests {
     /// pages: the guest never sees a value it did not write, and the dirty
     /// log keeps the pages the guest wrote before the move (WHP follows the
     /// host's address, UFFDCHUNK a; the bitmap is per GPA). In a child under
-    /// a job limit, held at the limit by commit made and never touched, so
-    /// that a fill there is refused and reclaims (`reclaim_for_a_fill`).
+    /// a job limit, held at the limit by commit made and never touched, to
+    /// the last 4 KiB (no room left: in CI run 43640510155, before a move
+    /// gave back part of its dead pages' charge for its own maps, 0 of the
+    /// 40 rounds moved), so that a fill
+    /// there is refused and reclaims (`reclaim_for_a_fill`).
     /// The guest (at `MMIO_PROGRAM`, RAM 2-4 MiB registered, the mailbox at
     /// 0x7000 resident): over and over, each odd page of the chunk checked
     /// against the value it last wrote (r8; a mismatch counts in r9), and,
@@ -8112,7 +8115,7 @@ mod fpu_tests {
     /// ```
     /// (clang -target x86_64-linux-gnu -c, the .text section.)
     #[test]
-    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture; until the next commit: at a real job limit the reclaim's move cannot map its new section's view (ERROR_COMMITMENT_LIMIT, CI run 43640510155 and Windows Server 2022 20348), so no chunk moves"]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages() {
         let (code, text) = run_child("moved_under_a_vcpu_child", 512 << 20);
         assert!(text.contains("MOVEUNDERVCPU all"), "{text}");

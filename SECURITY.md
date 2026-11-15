@@ -297,10 +297,18 @@ upstream Firecracker and its jailer.
   (balloon inflation's scattered pages) keeps its section page committed (a SEC_RESERVE page cannot be decommitted)
   and its charge with it, so that what the jail is charged is never less than the host commit it holds
   (`test_registered_memory_is_charged_as_it_is_filled`; passed in CI run 43545368906, 305a806, and each saved run since). A reclaim of
-  such pages before a charge is refused at the limit, as Linux's memory cgroup reclaims, moving their chunks into new
-  sections, is written but does not work yet on a real job limit: the move's own map of a view of its new section
-  is refused with `ERROR_COMMITMENT_LIMIT` when the job has no room (CI run 43640510155), so at the limit a fill is
-  refused and a lazy touch ends the VMM with 137, the dead pages still charged; not done yet (the memory.max row).
+  such pages before a charge is refused at the limit, as Linux's memory cgroup reclaims, moves their chunks into new
+  sections, and works with no room left in the job: each move gives back the charge of up to 12 KiB of its own dead
+  pages for its maps first (their page tables take commit: VIEWCHARGE), and a chunk with one dead page is room enough
+  (`test_a_chunk_with_one_dead_page_at_the_limit`; the memory.max row, on Windows Server 2022 20348). Where another
+  commit takes that room before the move maps, the move is not made and the chunk owes the charge: the job then holds
+  up to 12 KiB more than it is charged, for one chunk at a time, said on standard error, with every userfaultfd fill
+  refused until the charge is taken again (`test_a_move_whose_room_is_taken_owes_its_charge`); a bounded
+  difference from Linux, which uncharged at the discard. The reclaim runs on its own thread with its 64 KiB stack
+  committed at creation, so it grows no stack at the limit; the touching thread's own path to it is 8528 bytes deep
+  on record (RECLAIMSTACK), which a thread whose stack has less committed below its frame cannot grow at the limit
+  (STACKZERO, below). The line that ends a VMM at the limit (`out_of_memory`) is written after 256 KiB of commit set
+  aside for it is given back, so its stack can grow.
   Not before a commit made at once (`MAP_POPULATE`, a
   private file mapping's read, a `MAP_FIXED` recommit, a discard of private memory that is not lazy, a committing
   `mprotect`) or an allocation of the VMM's own (its heap, a thread's stack): those are refused at the limit with no

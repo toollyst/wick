@@ -1217,11 +1217,234 @@ fn reserve_reclaim(chunks: usize) -> io::Result<()> {
             l.try_reserve_exact(more).map_err(|_| errno_err(crate::ENOMEM))?;
         }
     }
-    if crate::windows_mm::reserve_discards() {
-        Ok(())
-    } else {
-        Err(errno_err(crate::ENOMEM))
+    if !crate::windows_mm::reserve_discards() {
+        return Err(errno_err(crate::ENOMEM));
     }
+    start_the_reclaimer()
+}
+
+/// The reclaim's own thread's stack, committed whole when it is made
+/// (`CreateThread` without `STACK_SIZE_PARAM_IS_A_RESERVATION` takes the
+/// size as the commit: Learn, CreateThread, `dwStackSize`), so that the
+/// reclaim never grows a stack at the limit, where a stack that must grow
+/// ends the process with `STATUS_STACK_OVERFLOW`
+/// (`test_a_stack_that_grows_at_the_limit_on_record`). Learn, CreateThread:
+/// "If this flag is not specified, dwStackSize specifies the commit size";
+/// the record test reads the stack's committed region with `VirtualQuery`
+/// at the thread's start. At least four times the deepest a reclaim took on
+/// record, rounded up: 8592 bytes, a fill's and a touch's with no room
+/// left, a debug build on Windows Server 2022 20348
+/// (`test_the_reclaimers_stack_on_record`, which fails past a quarter).
+const RECLAIMER_STACK: usize = 64 << 10;
+
+/// A reclaim asked of [`reclaimer`], by a thread that holds [`LOCK`] for it
+/// and waits for the answer: a fill's pass ([`reclaim_for_a_fill`]), a
+/// touch's pass, with the list of the chunks it passes over
+/// ([`reclaim_at_touch`]), or one chunk's move.
+#[derive(Clone, Copy)]
+enum Ask {
+    None,
+    Fill(usize),
+    Touch(usize, *mut Vec<Candidate>),
+    Move(Candidate),
+    /// For `test_an_ask_of_a_reclaimer_that_has_ended_aborts`: the
+    /// reclaimer returns, its thread ends.
+    #[cfg(test)]
+    End,
+}
+
+/// The request and its answer, between a thread that asks and [`reclaimer`].
+struct Mailbox {
+    ask: Ask,
+    answer: Reclaimed,
+    /// For `test_a_reclaim_allocates_nothing`: the reclaimer counts its
+    /// allocations while it answers, and gives the count back.
+    #[cfg(test)]
+    count: bool,
+    #[cfg(test)]
+    allocations: u64,
+}
+
+// SAFETY: the list pointer in `Ask::Touch` is used only by the reclaimer
+// while the thread that owns it waits for the answer.
+unsafe impl Send for Mailbox {}
+
+static MAILBOX: Mutex<Mailbox> = Mutex::new(Mailbox {
+    ask: Ask::None,
+    answer: Reclaimed { chunks: 0, copied: 0, freed: 0, skipped: 0 },
+    #[cfg(test)]
+    count: false,
+    #[cfg(test)]
+    allocations: 0,
+});
+/// The events a request is made and answered with (auto-reset), and
+/// whether [`reclaimer`] runs.
+static ASKED: AtomicUsize = AtomicUsize::new(0);
+static ANSWERED: AtomicUsize = AtomicUsize::new(0);
+static RECLAIMER: Once = Once::new();
+static RECLAIMER_RUNS: AtomicBool = AtomicBool::new(false);
+/// [`reclaimer`]'s thread handle, which is signalled if it ends.
+static RECLAIMER_THREAD: AtomicUsize = AtomicUsize::new(0);
+
+/// Starts [`reclaimer`] once, at the first registration: `ENOMEM` if its
+/// stack's commit or its events cannot be had, as a registration whose
+/// reclaim could not run is refused.
+fn start_the_reclaimer() -> io::Result<()> {
+    use windows_sys::Win32::System::Threading::{CreateEventW, CreateThread};
+    RECLAIMER.call_once(|| {
+        // SAFETY: unnamed auto-reset events, not signalled.
+        let (asked, answered) = unsafe { (CreateEventW(ptr::null(), 0, 0, ptr::null()), CreateEventW(ptr::null(), 0, 0, ptr::null())) };
+        if asked.is_null() || answered.is_null() {
+            return;
+        }
+        ASKED.store(asked as usize, Ordering::Release);
+        ANSWERED.store(answered as usize, Ordering::Release);
+        // SAFETY: a thread of ours that runs for the process; its stack's
+        // size is its commit.
+        let t = unsafe { CreateThread(ptr::null(), RECLAIMER_STACK, Some(reclaimer), ptr::null(), 0, ptr::null_mut()) };
+        if !t.is_null() {
+            // Kept for the process: an asker waits on it too.
+            RECLAIMER_THREAD.store(t as usize, Ordering::Release);
+            RECLAIMER_RUNS.store(true, Ordering::Release);
+        }
+    });
+    if RECLAIMER_RUNS.load(Ordering::Acquire) { Ok(()) } else { Err(errno_err(crate::ENOMEM)) }
+}
+
+/// The reclaim's thread: each request answered on a stack committed whole
+/// ([`RECLAIMER_STACK`]), under the [`LOCK`] its asker holds for it.
+unsafe extern "system" fn reclaimer(_: *mut c_void) -> u32 {
+    use windows_sys::Win32::System::Threading::{INFINITE, SetEvent, WaitForSingleObject};
+    #[cfg(test)]
+    paint_the_stack();
+    // The asker holds the lock: a reclaim a fault here would start takes
+    // nothing ([`reclaim_at_touch`]).
+    HOLDS_LOCK.set(true);
+    loop {
+        // SAFETY: our event.
+        unsafe { WaitForSingleObject(ASKED.load(Ordering::Acquire) as HANDLE, INFINITE) };
+        let mut m = MAILBOX.lock().unwrap();
+        #[cfg(test)]
+        tests::COUNTING_ALLOCATIONS.with(|c| c.set(m.count));
+        #[cfg(test)]
+        tests::ALLOCATIONS.with(|a| a.set(0));
+        m.answer = match m.ask {
+            Ask::None => Reclaimed::default(),
+            Ask::Fill(need) => fill_pass(need),
+            // SAFETY: the asker's list, which it does not touch until the
+            // answer (`Mailbox`).
+            Ask::Touch(need, skipped) => touch_pass(need, unsafe { skipped.as_mut() }),
+            Ask::Move(d) => move_again(&d),
+            #[cfg(test)]
+            Ask::End => return 0,
+        };
+        m.ask = Ask::None;
+        #[cfg(test)]
+        {
+            tests::COUNTING_ALLOCATIONS.with(|c| c.set(false));
+            m.allocations = tests::ALLOCATIONS.with(core::cell::Cell::get);
+        }
+        drop(m);
+        // SAFETY: our event.
+        unsafe { SetEvent(ANSWERED.load(Ordering::Acquire) as HANDLE) };
+    }
+}
+
+/// Asks [`reclaimer`] for `ask` and waits for the answer; the caller holds
+/// [`LOCK`] (which so serialises the asks). Shallow on the caller's stack:
+/// a lock, two event calls. The wait is for the answer or the reclaimer's
+/// end, which would leave the asker waiting for good: the process is
+/// aborted then, named. The reclaimer does not return (a panic there
+/// aborts the process, `panic = "abort"`, and a panic would not unwind
+/// out of an `extern "system"` function either), so that end is the test's
+/// only (`test_an_ask_of_a_reclaimer_that_has_ended_aborts`).
+fn ask_the_reclaimer(ask: Ask) -> Reclaimed {
+    use windows_sys::Win32::System::Threading::{INFINITE, SetEvent, WaitForMultipleObjects};
+    if !RECLAIMER_RUNS.load(Ordering::Acquire) {
+        return Reclaimed::default();
+    }
+    {
+        let mut m = MAILBOX.lock().unwrap();
+        m.ask = ask;
+        #[cfg(test)]
+        {
+            m.count = tests::COUNTING_ALLOCATIONS.with(core::cell::Cell::get);
+        }
+    }
+    let both = [ANSWERED.load(Ordering::Acquire) as HANDLE, RECLAIMER_THREAD.load(Ordering::Acquire) as HANDLE];
+    // SAFETY: our event and thread handles.
+    let woken = unsafe {
+        SetEvent(ASKED.load(Ordering::Acquire) as HANDLE);
+        WaitForMultipleObjects(2, both.as_ptr(), 0, INFINITE)
+    };
+    if woken != 0 {
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "wick: reclaim: the reclaim's thread has ended (wait {woken:#x}), so no reclaim can be answered: aborting"
+        ));
+        std::process::abort();
+    }
+    let m = MAILBOX.lock().unwrap();
+    #[cfg(test)]
+    tests::ALLOCATIONS.with(|a| a.set(a.get() + m.allocations));
+    m.answer
+}
+
+/// The reclaimer's stack, painted below where it starts, for the record of
+/// how deep a reclaim goes (`test_the_reclaimers_stack_on_record`).
+#[cfg(test)]
+const PAINT: u8 = 0xA5;
+#[cfg(test)]
+static PAINTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static STACK_BASE: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+#[inline(never)]
+fn paint_the_stack() {
+    let (base, limit): (usize, usize);
+    // SAFETY: reads of the thread's own TEB.
+    unsafe { core::arch::asm!("mov {0}, gs:[0x8]", "mov {1}, gs:[0x10]", out(reg) base, out(reg) limit, options(nostack, readonly, preserves_flags)) };
+    let here = core::hint::black_box(&base) as *const usize as usize;
+    let top = (here - 4096) & !15;
+    // SAFETY: the thread's own committed stack below its frames.
+    unsafe { core::ptr::write_bytes(limit as *mut u8, PAINT, top - limit) };
+    PAINTED.store(limit, Ordering::Release);
+    STACK_BASE.store(base, Ordering::Release);
+    // What `VirtualQuery` says is committed from the thread's lowest
+    // committed page up, before it is used.
+    // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+    let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+    // SAFETY: as above.
+    let n = unsafe { windows_sys::Win32::System::Memory::VirtualQuery(limit as *const c_void, &mut mbi, core::mem::size_of_val(&mbi)) };
+    let committed = if n != 0 && mbi.State == windows_sys::Win32::System::Memory::MEM_COMMIT { mbi.RegionSize } else { 0 };
+    STACK_QUERIED.store(committed, Ordering::Release);
+}
+
+/// The reclaimer's stack committed at its start, by `VirtualQuery`.
+#[cfg(test)]
+static STACK_QUERIED: AtomicUsize = AtomicUsize::new(0);
+
+/// What `VirtualQuery` found committed of the reclaimer's stack at its
+/// start (`test_the_reclaimers_stack_on_record`).
+#[cfg(test)]
+pub(crate) fn reclaimer_stack_queried() -> usize {
+    STACK_QUERIED.load(Ordering::Acquire)
+}
+
+/// The most of the reclaimer's stack used so far, and its committed size
+/// (`test_the_reclaimers_stack_on_record`).
+#[cfg(test)]
+pub(crate) fn reclaimer_stack() -> (usize, usize) {
+    let (limit, base) = (PAINTED.load(Ordering::Acquire), STACK_BASE.load(Ordering::Acquire));
+    if limit == 0 {
+        return (0, 0);
+    }
+    let mut at = limit;
+    // SAFETY: the reclaimer's committed stack, read while it waits.
+    while at < base && unsafe { core::ptr::read_volatile(at as *const u8) } == PAINT {
+        at += 1;
+    }
+    (base - at, base - limit)
 }
 
 /// The chunks (`windows_mm::UFFD_CHUNK`) of the registered ranges, as
@@ -1255,9 +1478,12 @@ fn dead_bytes(range: &Range, s: u64, view: usize, len: usize) -> usize {
 /// left out) with the chunks of reserved ranges, every page registered,
 /// that hold dead pages: missing (discarded) but committed, a section page
 /// and a charge each (a chunk discarded whole has none:
-/// `windows_mm::uffd_swap_chunk`), the most dead first. Under [`LOCK`].
+/// `windows_mm::uffd_swap_chunk`), the most dead first; a chunk with none
+/// is never one. While a chunk owes its dead pages' charge
+/// (`windows_mm::OWED`), only that one. Under [`LOCK`].
 fn find_candidates(out: &mut Vec<Candidate>) {
     out.clear();
+    let owing = crate::windows_mm::owing();
     let chunk = crate::windows_mm::UFFD_CHUNK as u64 / PAGE;
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::Acquire);
@@ -1273,6 +1499,9 @@ fn find_candidates(out: &mut Vec<Candidate>) {
             }
             #[allow(clippy::cast_possible_truncation)]
             let (view, len) = ((s + c * PAGE) as usize, ((c_end - c) * PAGE) as usize);
+            if owing.is_some_and(|p| !(view..view + len).contains(&p)) {
+                continue;
+            }
             let dead = dead_bytes(r, s, view, len);
             if dead > 0 && out.len() < out.capacity() {
                 #[allow(clippy::cast_possible_truncation)]
@@ -1357,11 +1586,36 @@ fn reclaim_pass(need: usize, chunks: &[Candidate], mut skipped: Option<&mut Vec<
 /// handler sends only once this one is answered, so the wait would not end;
 /// the fill is refused instead (`ENOMEM`), as it was before.
 fn reclaim_for_a_fill(need: usize) -> Reclaimed {
+    ask_the_reclaimer(Ask::Fill(need))
+}
+
+/// [`reclaim_for_a_fill`]'s pass, on [`reclaimer`].
+fn fill_pass(need: usize) -> Reclaimed {
     let mut c = CANDIDATES.lock().unwrap();
     find_candidates(&mut c);
     let r = reclaim_pass(need.max(crate::windows_mm::UFFD_CHUNK), &c, None);
     c.clear();
     r
+}
+
+/// [`reclaim_at_touch`]'s first pass, on [`reclaimer`].
+fn touch_pass(need: usize, skipped: Option<&mut Vec<Candidate>>) -> Reclaimed {
+    let mut c = CANDIDATES.lock().unwrap();
+    find_candidates(&mut c);
+    let r = reclaim_pass(need, &c, skipped);
+    c.clear();
+    r
+}
+
+/// A chunk [`reclaim_at_touch`] passed over and waited for, moved if it
+/// still holds dead pages (it may have changed meanwhile: moved by a
+/// fill's reclaim, filled, unregistered), on [`reclaimer`].
+fn move_again(d: &Candidate) -> Reclaimed {
+    if range_of_view(d.view).is_some_and(|(range, s)| dead_bytes(range, s, d.view, d.len) > 0) {
+        move_chunk(d)
+    } else {
+        Reclaimed::default()
+    }
 }
 
 /// Reclaims at least `need` bytes of dead pages (a chunk's worth at least)
@@ -1393,11 +1647,8 @@ pub(crate) fn reclaim_at_touch(need: usize) -> Reclaimed {
     }
     let mut r = {
         let _guard = lock();
-        let mut c = CANDIDATES.lock().unwrap();
-        find_candidates(&mut c);
-        let r = reclaim_pass(need, &c, skipped.as_deref_mut());
-        c.clear();
-        r
+        let list = skipped.as_deref_mut().map_or(ptr::null_mut(), |s| s as *mut Vec<Candidate>);
+        ask_the_reclaimer(Ask::Touch(need, list))
     };
     let Some(s) = skipped else {
         return r;
@@ -1410,11 +1661,7 @@ pub(crate) fn reclaim_at_touch(need: usize) -> Reclaimed {
             continue;
         };
         let _guard = lock();
-        // Its dead pages again: the chunk may have changed meanwhile (moved
-        // by a fill's reclaim, filled, unregistered).
-        if range_of_view(d.view).is_some_and(|(range, s)| dead_bytes(range, s, d.view, d.len) > 0) {
-            r.add(move_chunk(d));
-        }
+        r.add(ask_the_reclaimer(Ask::Move(*d)));
     }
     r.skipped = 0;
     r
@@ -1856,7 +2103,26 @@ mod tests {
     /// MiB of dead pages, no chunk whole, so each keeps its section commit
     /// and charge, as (A) has them). The range and the bytes filled.
     fn fill_to_the_limit_and_discard_in_part() -> (usize, c_int, u64, u64) {
+        let (ctx, user, mem, done) = fill_to_the_limit();
+        assert!(done >= 8 * CHUNK + (8 << 20), "only {} MiB filled", done >> 20);
+        for p in (0..8 * CHUNK).step_by(2 * PAGE as usize) {
+            // SAFETY: registered memory of ours.
+            assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        }
+        (ctx, user, mem, done)
+    }
+
+    /// 128 MiB registered and filled with 0x5a 1 MiB at a time until the
+    /// job refuses: the range and the bytes filled.
+    fn fill_to_the_limit() -> (usize, c_int, u64, u64) {
+        fill_to_the_limit_from(0)
+    }
+
+    /// [`fill_to_the_limit`], the fill begun `from` bytes in: the pages
+    /// before are never filled.
+    fn fill_to_the_limit_from(from: u64) -> (usize, c_int, u64, u64) {
         std::thread::sleep(std::time::Duration::from_millis(300));
+        make_the_slack_region();
         let (ctx, user) = create(0, false, true).unwrap();
         let len: u64 = 128 << 20;
         // SAFETY: a new anonymous mapping, committed at first touch.
@@ -1874,7 +2140,7 @@ mod tests {
         let mem = mem as u64;
         register(ctx, mem, len).unwrap();
         let mib = std::vec![0x5au8; 1 << 20];
-        let mut done = 0;
+        let mut done = from;
         loop {
             assert!(done < len, "128 MiB filled under the limit");
             // SAFETY: `mib` holds 1 MiB.
@@ -1886,12 +2152,7 @@ mod tests {
                 }
             }
         }
-        assert!(done >= 8 * CHUNK + (8 << 20), "only {} MiB filled", done >> 20);
         std::println!("filled {} MiB", done >> 20);
-        for p in (0..8 * CHUNK).step_by(2 * PAGE as usize) {
-            // SAFETY: registered memory of ours.
-            assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
-        }
         (ctx, user, mem, done)
     }
 
@@ -1935,12 +2196,88 @@ mod tests {
         held
     }
 
+    /// A region of 2 MiB reserved, its first page committed (so its page
+    /// table is there) before the limit is reached, for [`no_room_left`]'s
+    /// last pages: a page that `VirtualAlloc` refuses at the limit, as a new
+    /// allocation needs a page table too, may still be committed where one
+    /// is, as a fill's page in a mapped view is (on Windows Server 2022
+    /// 20348, fc-win: a fill made with every `VirtualAlloc` of a page
+    /// refused). Its base, and the pages past the first committed.
+    static SLACK: AtomicUsize = AtomicUsize::new(0);
+    static SLACK_TAKEN: AtomicUsize = AtomicUsize::new(0);
+
+    fn make_the_slack_region() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        // SAFETY: new memory of ours.
+        let p = unsafe { VirtualAlloc(ptr::null(), CHUNK as usize, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!p.is_null());
+        // SAFETY: the first page of the region just reserved.
+        assert!(!unsafe { VirtualAlloc(p, PAGE as usize, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        SLACK.store(p as usize, Ordering::SeqCst);
+    }
+
+    /// Commits the slack region's pages ([`SLACK`]) one at a time until the
+    /// job refuses; how many.
+    fn take_the_slack() -> usize {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+        let base = SLACK.load(Ordering::SeqCst);
+        if base == 0 {
+            return 0;
+        }
+        let mut n = SLACK_TAKEN.load(Ordering::SeqCst);
+        while (n + 2) * (PAGE as usize) <= CHUNK as usize {
+            // SAFETY: a page of our region.
+            if unsafe { VirtualAlloc((base + (n + 1) * PAGE as usize) as *const c_void, PAGE as usize, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+                break;
+            }
+            n += 1;
+        }
+        SLACK_TAKEN.store(n, Ordering::SeqCst);
+        n
+    }
+
+    /// Gives back what [`take_the_slack`] took.
+    fn give_back_the_slack() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        let (base, n) = (SLACK.load(Ordering::SeqCst), SLACK_TAKEN.swap(0, Ordering::SeqCst));
+        if base != 0 && n != 0 {
+            // SAFETY: pages of our region.
+            unsafe { VirtualFree((base + PAGE as usize) as *mut c_void, n * PAGE as usize, MEM_DECOMMIT) };
+        }
+    }
+
     /// Gives back one page [`take_every_page`] took.
     fn give_back_a_page(held: &mut std::vec::Vec<usize>) {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
         let p = held.pop().expect("a page held");
         // SAFETY: a page of ours.
         unsafe { VirtualFree(p as *mut c_void, 0, MEM_RELEASE) };
+    }
+
+    /// No room left in the job (the lesson of CI run 43640510155: a reclaim
+    /// that moved with room left was never tried where it runs): this
+    /// thread's stack grown first (a stack that must grow at the limit ends
+    /// the process: `test_a_stack_that_grows_at_the_limit_on_record`), then
+    /// every page of the job's room taken ([`take_every_page`]), said on
+    /// standard error without allocating. The pages, to give back.
+    fn no_room_left() -> std::vec::Vec<usize> {
+        core::hint::black_box(deep(32));
+        let held = take_every_page();
+        let slack = take_the_slack();
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "room left before the reclaim: 0 KiB ({} pages taken, and {slack} where a page table was)",
+            held.len()
+        ));
+        held
+    }
+
+    /// Gives back every page [`take_every_page`] took, and the slack
+    /// region's ([`take_the_slack`]).
+    fn give_back_every_page(held: &mut std::vec::Vec<usize>) {
+        give_back_the_slack();
+        while !held.is_empty() {
+            give_back_a_page(held);
+        }
     }
 
     /// VIEWCHARGE: what mapping a view of a pagefile-backed section takes of
@@ -2116,11 +2453,12 @@ mod tests {
     /// (`reclaim_for_a_fill`) tried with 0 KiB of room, then 4 KiB more each
     /// time, until it moves a chunk: how many chunks each try moved, the
     /// bytes it freed and what the process's private commit did. On Windows
-    /// Server 2022 20348 (fc-win): none with no room (the move's map of its
-    /// new section's view refused, 1455), 2 chunks and 2 MiB with 4 KiB:
-    /// one page table, its own view's (the alias's and the guest view's
-    /// swaps give back what they take). Printed, not asserted, but for the
-    /// child ending well.
+    /// Server 2022 20348 (fc-win), before a move gave back part of its dead
+    /// pages' charge for its maps (fc102ff6): none with no room (the move's
+    /// map of its new section's view refused, 1455), 2 chunks and 2 MiB with
+    /// 4 KiB: one page table, its own view's (the alias's and the guest
+    /// view's swaps give back what they take); since, 2 chunks and 2 MiB
+    /// with 0 KiB. Printed, not asserted, but for the child ending well.
     #[test]
     #[ignore = "a record: run alone on Windows with --ignored --nocapture"]
     fn test_the_room_a_move_needs_on_record() {
@@ -2182,6 +2520,32 @@ mod tests {
             );
         }
         (base, limit, reserve, guarantee)
+    }
+
+    const STACK_PAINT: u8 = 0x5c;
+
+    /// This thread's stack grown 128 KiB below here and painted from its
+    /// lowest committed byte to 256 bytes below here: the painted range.
+    #[inline(never)]
+    fn paint_below_here() -> (usize, usize) {
+        core::hint::black_box(deep(32));
+        let (_, limit, _, _) = stack_of_this_thread();
+        let here = core::hint::black_box(&limit) as *const usize as usize;
+        let top = (here - 256) & !15;
+        // SAFETY: the thread's own committed stack below its frames.
+        unsafe { core::ptr::write_bytes(limit as *mut u8, STACK_PAINT, top - limit) };
+        (limit, top)
+    }
+
+    /// How far below the top of [`paint_below_here`]'s range the paint was
+    /// written over.
+    fn used_below((limit, top): (usize, usize)) -> usize {
+        let mut at = limit;
+        // SAFETY: the thread's own committed stack.
+        while at < top && unsafe { core::ptr::read_volatile(at as *const u8) } == STACK_PAINT {
+            at += 1;
+        }
+        top - at
     }
 
     /// 64 KiB of stack, a page a frame: a thread whose stack must grow.
@@ -2286,11 +2650,13 @@ mod tests {
     /// discarded pages were freed at the discard already). The live pages
     /// read back, the discarded ones are missing, and a fill past what the
     /// dead pages gave back is still `ENOMEM`. Before, the fill was refused
-    /// with 8 MiB of dead pages charged.
+    /// with 8 MiB of dead pages charged. With no room left in the job
+    /// ([`no_room_left`]): in CI run 43640510155 no move was made there, its
+    /// map refused (`test_the_room_a_move_needs_on_record`).
     #[test]
-    #[ignore = "until the next commit: at a real job limit the reclaim's move cannot map its new section's view (ERROR_COMMITMENT_LIMIT, CI run 43640510155 and Windows Server 2022 20348), so no chunk moves"]
     fn test_a_fill_at_the_limit_reclaims_partly_discarded_chunks() {
         let (code, text) = run_child("reclaim_fill_child", Some(96 << 20));
+        assert!(text.contains("room left before the reclaim: 0 KiB"), "{text}");
         assert!(text.contains("filled 4096 KiB more"), "the fill was not reclaimed for: {text}");
         assert!(text.contains("refused with ENOMEM after"), "the limit did not hold past the dead pages: {text}");
         assert_eq!(code, Some(0), "{text}");
@@ -2301,6 +2667,7 @@ mod tests {
     fn reclaim_fill_child() {
         let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
         let page = std::vec![0x5au8; PAGE as usize];
+        let held = no_room_left();
         let fill_pages = |from: u64, most: u64| -> (u64, Option<c_int>) {
             let mut n = 0;
             while n < most {
@@ -2322,6 +2689,7 @@ mod tests {
         std::println!("refused with {} after {} KiB more", if refused == Some(crate::ENOMEM) { "ENOMEM" } else { "no error" }, rest >> 10);
         assert_eq!(refused, Some(crate::ENOMEM));
         assert!(rest < (4 << 20) + (2 << 20), "{} KiB filled past the dead pages", rest >> 10);
+        drop(held);
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
         let _ = ctx;
@@ -2330,11 +2698,12 @@ mod tests {
     /// A first touch of lazy memory refused at the job's limit reclaims the
     /// dead pages of partly discarded chunks first, and the access goes on,
     /// where it ended the process with 137 before: Linux reclaims before
-    /// its out-of-memory kill (as above).
+    /// its out-of-memory kill (as above). With no room left in the job
+    /// ([`no_room_left`]).
     #[test]
-    #[ignore = "until the next commit: at a real job limit the reclaim's move cannot map its new section's view (ERROR_COMMITMENT_LIMIT, CI run 43640510155 and Windows Server 2022 20348), so no chunk moves"]
     fn test_a_lazy_touch_at_the_limit_reclaims_before_it_ends_the_vmm() {
         let (code, text) = run_child("reclaim_touch_child", Some(96 << 20));
+        assert!(text.contains("room left before the reclaim: 0 KiB"), "{text}");
         assert!(text.contains("touched 4096 KiB"), "the touch was not reclaimed for (status {code:?}): {text}");
         assert_eq!(code, Some(0), "{text}");
     }
@@ -2355,12 +2724,403 @@ mod tests {
             )
         };
         assert_ne!(lazy, crate::MAP_FAILED);
+        let held = no_room_left();
         for p in (0..4usize << 20).step_by(PAGE as usize) {
             // SAFETY: our mapping; the first touch commits the page.
             unsafe { core::ptr::write_volatile((lazy as *mut u8).add(p), 1) };
         }
         std::println!("touched 4096 KiB");
+        drop(held);
         the_live_pages_read_back(mem);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// The pages [`take_the_room_given_up`] takes, room for them made
+    /// before (the hook runs at the limit, where nothing may allocate), and
+    /// whether it has run (it takes the room once).
+    static ROOM_TAKEN: Mutex<std::vec::Vec<usize>> = Mutex::new(std::vec::Vec::new());
+    static ROOM_TAKEN_ONCE: AtomicBool = AtomicBool::new(false);
+
+    /// Another commit taking the room a move just made by giving back part
+    /// of its dead pages' charge (`windows_mm::AFTER_DEAD_UNCHARGED`), the
+    /// first time only: all the job has.
+    fn take_the_room_given_up() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if ROOM_TAKEN_ONCE.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut held = ROOM_TAKEN.lock().unwrap();
+        while held.len() < held.capacity() {
+            // SAFETY: new private memory of ours.
+            let p = unsafe { VirtualAlloc(ptr::null(), PAGE as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+            if p.is_null() {
+                break;
+            }
+            held.push(p as usize);
+        }
+    }
+
+    /// One page filled at `at`: "made", "ENOMEM" or "another errno".
+    fn fill_a_page(ctx: usize, at: u64) -> &'static str {
+        let page = [0x5au8; PAGE as usize];
+        // SAFETY: `page` holds a page.
+        match unsafe { copy(ctx, page.as_ptr(), at, PAGE, false) } {
+            Ok(_) => "made",
+            Err((e, _)) if e == crate::ENOMEM => "ENOMEM",
+            Err(_) => "another errno",
+        }
+    }
+
+    /// A move whose room another commit takes between the giving back of
+    /// part of its dead pages' charge (12 KiB, `windows_mm::MOVE_ROOM`) and
+    /// its first map (`windows_mm::AFTER_DEAD_UNCHARGED`), with no room left
+    /// in the job ([`no_room_left`]): its map is refused, the charge cannot
+    /// be taken again, and the chunk owes it (`windows_mm::OWED`), said in
+    /// one line on standard error; the chunk as it was. While it owes, the
+    /// job's limit and the jailer's count are 12 KiB below what the process
+    /// holds, no more: no other chunk is moved, so the fill that needed the
+    /// reclaim is refused (`ENOMEM`), and so is the next. Once the other
+    /// commit gives its room back, the next fill takes the owed charge again
+    /// first (nothing owed then) and goes on through the reclaim, its moves
+    /// made: 4 MiB filled, the live pages read back, the discarded ones
+    /// missing.
+    #[test]
+    fn test_a_move_whose_room_is_taken_owes_its_charge() {
+        let (code, text) = run_child("room_taken_child", Some(96 << 20));
+        assert!(text.contains("room left before the reclaim: 0 KiB"), "{text}");
+        assert!(
+            text.contains("could not map its new section (error 1455) with its dead pages' charge given back for its maps"),
+            "no line for the refused map: {text}"
+        );
+        assert!(text.contains("not taken again (another commit holds the room): owed"), "{text}");
+        assert!(text.contains("while owed: the fill ENOMEM, 12 KiB owed; again ENOMEM, 12 KiB owed"), "{text}");
+        assert!(text.contains("the room given back: 0 KiB owed, the fill made: 4096 KiB"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_move_whose_room_is_taken_owes_its_charge in a job of its own"]
+    fn room_taken_child() {
+        let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
+        ROOM_TAKEN.lock().unwrap().reserve_exact(4096);
+        let mut held = no_room_left();
+        *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = Some(take_the_room_given_up);
+        let first = fill_a_page(ctx, mem + done);
+        let owed = crate::windows_mm::owed_bytes();
+        let again = fill_a_page(ctx, mem + done);
+        let still = crate::windows_mm::owed_bytes();
+        *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = None;
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "while owed: the fill {first}, {} KiB owed; again {again}, {} KiB owed",
+            owed >> 10,
+            still >> 10
+        ));
+        {
+            let mut t = ROOM_TAKEN.lock().unwrap();
+            while !t.is_empty() {
+                give_back_a_page(&mut t);
+            }
+        }
+        let mut n = 0;
+        while n < 4 << 20 {
+            if fill_a_page(ctx, mem + done + n) != "made" {
+                break;
+            }
+            n += PAGE;
+        }
+        let owed = crate::windows_mm::owed_bytes();
+        give_back_every_page(&mut held);
+        std::println!("the room given back: {} KiB owed, the fill made: {} KiB", owed >> 10, n >> 10);
+        the_live_pages_read_back(mem);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// A chunk with one dead page, the least a move gives back for its maps
+    /// (4 KiB, where its new section's view mapped anywhere took 4 KiB on
+    /// record, VIEWCHARGE, and one into a placeholder made apart up to 12),
+    /// with no room left in the job ([`no_room_left`]): a fill's reclaim
+    /// moves it or fails cleanly (its charge taken again, nothing owed);
+    /// which one, what the fill then got, what the move did to the process's
+    /// private commit, and where its view was mapped (its offset in 2 MiB),
+    /// printed; then chunks with 2, 3 and 4 dead pages the same way. Before
+    /// the discards, at the same limit with no dead page
+    /// anywhere, the reclaim moves nothing and tries no move: a chunk with no
+    /// dead pages is never a candidate. Nothing is owed, no other chunk is
+    /// moved, and the live pages read back.
+    #[test]
+    fn test_a_chunk_with_one_dead_page_at_the_limit() {
+        let (code, text) = run_child("one_dead_page_child", Some(96 << 20));
+        std::eprintln!("{text}");
+        assert!(text.contains("no dead page: the fill ENOMEM, 0 moves made, 0 tried"), "{text}");
+        assert!(text.contains("ONEDEAD 1 dead page(s): "), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_chunk_with_one_dead_page_at_the_limit in a job of its own"]
+    fn one_dead_page_child() {
+        let (ctx, user, mem, done) = fill_to_the_limit();
+        let moves = || moves_on_record().0.len();
+        let mut held = no_room_left();
+        let (m0, refused0) = (moves(), crate::windows_mm::moves_refused_for_tests());
+        let none = fill_a_page(ctx, mem + done);
+        let (m1, refused1) = (moves(), crate::windows_mm::moves_refused_for_tests());
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "no dead page: the fill {none}, {} moves made, {} tried",
+            m1 - m0,
+            (m1 - m0) as u64 + refused1 - refused0
+        ));
+        give_back_every_page(&mut held);
+        // Chunk k - 1 with k dead pages (its odd pages from 1), each tried
+        // with no room left.
+        let mut wrong = std::vec::Vec::new();
+        for k in 1..=4u64 {
+            let chunk = mem + (k - 1) * CHUNK;
+            for i in 0..k {
+                // SAFETY: registered memory of ours.
+                assert_eq!(unsafe { crate::madvise((chunk + (2 * i + 1) * PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+            }
+            let mut held = no_room_left();
+            let (m1, refused1) = (moves(), crate::windows_mm::moves_refused_for_tests());
+            let before = private_commit();
+            let one = fill_a_page(ctx, mem + done + k * PAGE);
+            let after = private_commit();
+            let (m2, refused2) = (moves(), crate::windows_mm::moves_refused_for_tests());
+            let owed = crate::windows_mm::owed_bytes();
+            let view = crate::windows_mm::LAST_MOVE_VIEW.load(Ordering::Relaxed);
+            give_back_every_page(&mut held);
+            std::println!(
+                "ONEDEAD {k} dead page(s): the fill {one}, {} moves made, {} not made, {} KiB owed; the process's private \
+                 commit {:+} KiB over the fill; the move's view at {view:#x}, {:#x} into its 2 MiB",
+                m2 - m1,
+                refused2 - refused1,
+                owed >> 10,
+                (after as i64 - before as i64) / 1024,
+                view % CHUNK as usize
+            );
+            // The chunks with dead pages now: this one, and those before it
+            // not moved yet.
+            if owed != 0 || m2 - m1 > usize::try_from(k).unwrap() {
+                wrong.push(k);
+            }
+            for p in (0..CHUNK).step_by(PAGE as usize) {
+                if p % (2 * PAGE) == PAGE && p < (2 * k + 1) * PAGE {
+                    assert!(is_missing(chunk + p), "{k}: {p:#x} is not missing");
+                } else {
+                    // SAFETY: a filled page.
+                    assert_eq!(unsafe { *((chunk + p + 9) as *const u8) }, 0x5a, "{k}: {p:#x}");
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "a charge owed with no other commit, or a chunk with no dead pages moved, for {wrong:?}");
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+        let _ = ctx;
+    }
+
+    /// The room a move gives back for its maps is its dead pages' charge,
+    /// not its missing pages': a chunk whose first half was never filled
+    /// (missing, no commit and no charge) and whose last page is dead, with
+    /// no room left in the job ([`no_room_left`]), is moved by a fill's
+    /// reclaim, the fill made with what it gave back, nothing owed; the
+    /// pages read back as they were.
+    #[test]
+    fn test_a_chunk_whose_dead_pages_lie_above_unfilled_ones_moves() {
+        let (code, text) = run_child("dead_above_unfilled_child", Some(96 << 20));
+        assert!(text.contains("dead above unfilled: the fill made, 1 moves made, 0 not made, 0 KiB owed"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_chunk_whose_dead_pages_lie_above_unfilled_ones_moves in a job of its own"]
+    fn dead_above_unfilled_child() {
+        let (ctx, user, mem, done) = fill_to_the_limit_from(CHUNK / 2);
+        let last = mem + CHUNK - PAGE;
+        // SAFETY: registered memory of ours.
+        assert_eq!(unsafe { crate::madvise(last as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        let mut held = no_room_left();
+        let (m1, refused1) = (moves_on_record().0.len(), crate::windows_mm::moves_refused_for_tests());
+        let fill = fill_a_page(ctx, mem + done);
+        let (m2, refused2) = (moves_on_record().0.len(), crate::windows_mm::moves_refused_for_tests());
+        let owed = crate::windows_mm::owed_bytes();
+        give_back_every_page(&mut held);
+        std::println!(
+            "dead above unfilled: the fill {fill}, {} moves made, {} not made, {} KiB owed",
+            m2 - m1,
+            refused2 - refused1,
+            owed >> 10
+        );
+        for p in (0..CHUNK).step_by(PAGE as usize) {
+            if p < CHUNK / 2 || mem + p == last {
+                assert!(is_missing(mem + p), "{p:#x} is not missing");
+            } else {
+                // SAFETY: a filled page.
+                assert_eq!(unsafe { *((mem + p + 9) as *const u8) }, 0x5a, "{p:#x}");
+            }
+        }
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// A charge owed (`windows_mm::OWED`, as in
+    /// [`test_a_move_whose_room_is_taken_owes_its_charge`]) goes with its
+    /// range: once the range is unregistered and unmapped, nothing is owed,
+    /// before any commit; memory committed at the same address afterwards
+    /// is no charged view's, and a fill of another range is made, with no
+    /// charge taken for the old one's pages.
+    #[test]
+    fn test_an_owed_charge_goes_with_its_range() {
+        let (code, text) = run_child("owed_goes_child", Some(96 << 20));
+        assert!(text.contains("owed: 12 KiB; unregistered and unmapped: 0 KiB owed; the same address committed, charged false; another fill made"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_an_owed_charge_goes_with_its_range in a job of its own"]
+    fn owed_goes_child() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
+        ROOM_TAKEN.lock().unwrap().reserve_exact(4096);
+        let mut held = no_room_left();
+        *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = Some(take_the_room_given_up);
+        let _ = fill_a_page(ctx, mem + done);
+        *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = None;
+        let owed = crate::windows_mm::owed_bytes();
+        {
+            let mut t = ROOM_TAKEN.lock().unwrap();
+            while !t.is_empty() {
+                give_back_a_page(&mut t);
+            }
+        }
+        give_back_every_page(&mut held);
+        // Registered before the old range's addresses are free: a range
+        // stays in the table, unregistered, until its userfaultfd is closed.
+        // SAFETY: a new anonymous mapping, committed at first touch (the
+        // job is near its limit).
+        let other = unsafe {
+            crate::mmap(
+                ptr::null_mut(),
+                CHUNK as usize,
+                crate::PROT_READ | crate::PROT_WRITE,
+                crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(other, crate::MAP_FAILED);
+        let other = other as u64;
+        register(ctx, other, CHUNK).unwrap();
+        unregister(ctx, mem, 128 << 20).unwrap();
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::munmap(mem as *mut c_void, 128 << 20) }, 0);
+        let after = crate::windows_mm::owed_bytes();
+        // SAFETY: new memory of ours, where the range was if it is free.
+        let at = unsafe { VirtualAlloc(mem as *const c_void, 1 << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        assert_eq!(at as u64, mem, "the range's address was not free again");
+        let charged = crate::windows_mm::charged_view_at_for_tests(mem as usize);
+        let made = fill_a_page(ctx, other);
+        std::println!(
+            "owed: {} KiB; unregistered and unmapped: {} KiB owed; the same address committed, charged {charged}; another fill {made}",
+            owed >> 10,
+            after >> 10
+        );
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// An ask of a reclaimer whose thread has ended (`Ask::End`, the test's
+    /// only way to end it) does not wait for good: the asker's wait is for
+    /// the answer or the thread's end (`ask_the_reclaimer`), and the process
+    /// is aborted with a named line.
+    #[test]
+    fn test_an_ask_of_a_reclaimer_that_has_ended_aborts() {
+        let (code, text) = run_child("ended_reclaimer_child", None);
+        assert!(text.contains("wick: reclaim: the reclaim's thread has ended"), "{text}");
+        assert_eq!(code, Some(0xC000_0409_u32.cast_signed()), "not aborted: {text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_an_ask_of_a_reclaimer_that_has_ended_aborts in a process of its own"]
+    fn ended_reclaimer_child() {
+        let (ctx, _user) = create(0, false, true).unwrap();
+        let mem = map(CHUNK as usize);
+        register(ctx, mem, CHUNK).unwrap();
+        let _lock = lock();
+        let r = ask_the_reclaimer(Ask::End);
+        std::println!("answered: {r:?}");
+    }
+
+    /// How deep the reclaim's thread goes (`reclaimer`, its stack painted
+    /// below where it starts and committed whole, `RECLAIMER_STACK`): the
+    /// most of it a fill's reclaim and a touch's used, with no room left in
+    /// the job, against its committed size; and the most of a host thread's
+    /// stack committed when the lazy-memory handler took its touch there
+    /// (`wick_mm::host_faults_on_this_thread`), the faulting thread's own
+    /// frames up to the hand-off, and how deep that path went below the
+    /// touching frame (the thread's stack painted first). Printed
+    /// (RECLAIMSTACK); asserted that the reclaimer's stack was committed
+    /// whole at its start (`VirtualQuery`) and it used no more than a
+    /// quarter of it.
+    #[test]
+    #[ignore = "a record: run alone on Windows with --ignored --nocapture"]
+    fn test_the_reclaimers_stack_on_record() {
+        let (code, text) = run_child("reclaimer_stack_child", Some(96 << 20));
+        for line in text.lines().filter(|l| l.starts_with("RECLAIMSTACK")) {
+            std::eprintln!("{line}");
+        }
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_the_reclaimers_stack_on_record in a job of its own"]
+    fn reclaimer_stack_child() {
+        let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
+        let page = std::vec![0x5au8; PAGE as usize];
+        // SAFETY: a new anonymous mapping, committed at first touch.
+        let lazy = unsafe {
+            crate::mmap(ptr::null_mut(), 4 << 20, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE, -1, 0)
+        };
+        assert_ne!(lazy, crate::MAP_FAILED);
+        let mut held = no_room_left();
+        let mut n = 0;
+        while n < 2 << 20 {
+            // SAFETY: `page` holds a page.
+            match unsafe { copy(ctx, page.as_ptr(), mem + done + n, PAGE, false) } {
+                Ok(k) => n += k,
+                Err(_) => break,
+            }
+        }
+        let after_fill = reclaimer_stack();
+        // This thread's committed stack below here painted: how deep the
+        // touch's path goes on the touching thread (the lazy-memory
+        // handler, the commit, the hand-off to the reclaimer).
+        let painted = paint_below_here();
+        for p in (0..4usize << 20).step_by(PAGE as usize) {
+            // SAFETY: our mapping; the first touch commits the page.
+            unsafe { core::ptr::write_volatile((lazy as *mut u8).add(p), 1) };
+        }
+        let path = used_below(painted);
+        let after_touch = reclaimer_stack();
+        let (faults, deepest) = crate::windows_mm::wick_mm::host_faults_on_this_thread();
+        give_back_every_page(&mut held);
+        let (moves, _, _) = moves_on_record();
+        std::println!(
+            "RECLAIMSTACK {} chunks moved; the reclaimer's stack: {} bytes used by the fills' reclaims, {} by the touches' too, \
+             of {} committed ({} by VirtualQuery at its start); this thread's {faults} lazy touches, their path {path} bytes \
+             deep below the touching frame (of {} painted), its stack {deepest} bytes committed at the deepest",
+            moves.len(),
+            after_fill.0,
+            after_touch.0,
+            after_touch.1,
+            reclaimer_stack_queried(),
+            painted.1 - painted.0
+        );
+        assert!(reclaimer_stack_queried() >= RECLAIMER_STACK, "the reclaimer's stack was not committed whole");
+        assert!(after_touch.0 > 0 && after_touch.0 <= after_touch.1 / 4, "the reclaimer used {after_touch:?}");
+        assert!(path < painted.1 - painted.0, "the touch's path went past the painted stack");
+        let _ = ctx;
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
@@ -2374,9 +3134,9 @@ mod tests {
     /// again for the next. In a process of its own: a reclaim takes any
     /// registered chunk of the process with discarded pages, so it would
     /// move the chunks of the crate's other tests, running on other threads.
-    /// The moves are made with room left under no job limit: at a real
-    /// job limit the move cannot map its new section's view yet (CI run
-    /// 43640510155).
+    /// The moves are made under no job limit; at one, with no room left,
+    /// `test_a_fill_at_the_limit_reclaims_partly_discarded_chunks` and the
+    /// others at the limit move chunks.
     #[test]
     fn test_a_moved_chunk_reads_and_writes_through() {
         let (code, text) = run_child("moved_chunk_child", None);
@@ -2441,8 +3201,8 @@ mod tests {
     struct Counting;
 
     std::thread_local! {
-        static COUNTING_ALLOCATIONS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
-        static ALLOCATIONS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+        pub(super) static COUNTING_ALLOCATIONS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+        pub(super) static ALLOCATIONS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
     }
 
     // SAFETY: the system allocator's calls, as they are; the count is a
@@ -2487,8 +3247,8 @@ mod tests {
     /// then waits for that call (held 200 ms by another thread), each move
     /// their chunks with no allocation on the reclaiming thread. In a
     /// process of its own (a reclaim takes any chunk of the process).
-    /// Its moves are made with room left: at a real job limit the move
-    /// cannot map its new section's view yet (CI run 43640510155).
+    /// Its moves are made under no job limit (the reclaimer's asks are the
+    /// same at one).
     #[test]
     fn test_a_reclaim_allocates_nothing() {
         let (code, text) = run_child("reclaim_allocations_child", None);
@@ -2599,9 +3359,21 @@ mod tests {
     /// before it, and a VMM at its limit is not ended for a reclaim. Without
     /// the budget block (decommitted for the test) the same move raises the
     /// count by its live pages: the budget is what holds it.
+    /// With no room left in the job at each move ([`no_room_left`]), where
+    /// the move gives back 12 KiB of its dead pages' charge before its maps
+    /// (`windows_mm::MOVE_ROOM`; a charge page is private commit and cover,
+    /// so the count falls by it, and the maps' page tables, 4 KiB a view,
+    /// take back part): the count during the move is below what it was
+    /// before by no more than that (64 KiB allowed, against the 1 MiB of
+    /// dead pages the chunk holds: it never counts a chunk's dead pages as
+    /// gone before they are). The count needs `PROCESS_MEMORY_COUNTERS_EX2`'s
+    /// `SharedCommitUsage` (Windows 10 or 11 22H2 with the September 2023
+    /// update and later): on a host without it the jailer refuses
+    /// memory.max (`test_a_memory_limit_is_refused_where_sections_cannot_be_counted`),
+    /// and the child says so and fails, naming it.
     #[test]
     fn test_the_jailers_count_does_not_rise_during_a_move() {
-        let (code, text) = run_child("move_count_child", None);
+        let (code, text) = run_child("move_count_child", Some(256 << 20));
         assert!(text.contains("with the budget: "), "{text}");
         assert_eq!(code, Some(0), "{text}");
     }
@@ -2609,6 +3381,24 @@ mod tests {
     #[test]
     #[ignore = "run by test_the_jailers_count_does_not_rise_during_a_move in a process of its own"]
     fn move_count_child() {
+        {
+            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE, SEC_COMMIT};
+            let before = jailers_count();
+            // SAFETY: a new pagefile-backed section of 1 MiB, closed below.
+            let s = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, 1 << 20, ptr::null()) };
+            assert!(!s.is_null());
+            let with = jailers_count();
+            // SAFETY: ours.
+            unsafe { CloseHandle(s) };
+            assert!(
+                with >= before + (1 << 20),
+                "this host gives no SharedCommitUsage (PROCESS_MEMORY_COUNTERS_EX2: Windows 10 or 11 22H2 with the September \
+                 2023 update and later): a 1 MiB section moved the count from {before} to {with}; the jailer refuses \
+                 memory.max here (test_a_memory_limit_is_refused_where_sections_cannot_be_counted), and its count during a \
+                 move cannot be read"
+            );
+        }
         let (ctx, user) = create(0, false, true).unwrap();
         let len = 2 * CHUNK;
         let mem = map(len as usize);
@@ -2624,9 +3414,11 @@ mod tests {
                 assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
             }
             DURING.store(u64::MAX, Ordering::SeqCst);
+            let mut held = no_room_left();
             let before = jailers_count();
             let r = reclaim_at_touch(PAGE as usize);
             let during = DURING.load(Ordering::SeqCst);
+            give_back_every_page(&mut held);
             assert_eq!(r.chunks, 1, "no chunk was moved");
             assert_ne!(during, u64::MAX, "the move's hook did not run");
             for p in (0..CHUNK).step_by(2 * PAGE as usize) {
@@ -2637,6 +3429,7 @@ mod tests {
         let (before, during) = moved(true);
         std::println!("with the budget: {before} before the move, {during} during it");
         assert!(during <= before + (64 << 10), "the count rose by {} KiB during a move", (during - before) >> 10);
+        assert!(during + (64 << 10) >= before, "the count fell by {} KiB during a move, before the dead pages went", (before - during) >> 10);
         let (before, during) = moved(false);
         std::println!("without it: {before} before the move, {during} during it");
         assert!(during >= before + (512 << 10), "without the budget the count rose by {} KiB only", during.saturating_sub(before) >> 10);
@@ -2657,7 +3450,7 @@ mod tests {
     /// commit) and section commit before and after. Printed; asserted only
     /// that the fill went on.
     #[test]
-    #[ignore = "a record, run alone on Windows with --ignored --nocapture; until the next commit: at a real job limit the reclaim's move cannot map its new section's view (ERROR_COMMITMENT_LIMIT, CI run 43640510155 and Windows Server 2022 20348), so no chunk moves"]
+    #[ignore = "a record: run alone on Windows with --ignored --nocapture (CI's WHP step)"]
     fn test_the_reclaims_cost_on_record() {
         let (code, text) = run_child("reclaim_record_child", Some(96 << 20));
         for line in text.lines().filter(|l| l.starts_with("RECLAIMREC")) {
@@ -2703,6 +3496,7 @@ mod tests {
             })
         };
         let page = std::vec![0x5au8; PAGE as usize];
+        let held = no_room_left();
         let mut more = 0;
         while more < 8 << 20 {
             // SAFETY: `page` holds a page.
@@ -2713,6 +3507,7 @@ mod tests {
         }
         stop.store(true, Ordering::Release);
         let reads = reader.join().unwrap();
+        drop(held);
         let after = counts();
         let (moves, waits, waited) = moves_on_record();
         let mut us: Vec<u64> = moves.iter().map(|m| m.1).collect();
