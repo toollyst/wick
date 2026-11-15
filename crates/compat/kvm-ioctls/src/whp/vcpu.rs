@@ -6096,8 +6096,13 @@ mod fpu_tests {
     /// itself, with no exit, is WHP's, which no table here changes: those
     /// the Guest MSRs row states as WHP's are held to WHP's answer
     /// (VM_HSAVE_PA, whose RDMSR and WRMSR WHP gives #GP(0) on CI's EPYC
-    /// 9V74, CI run 43635691697; VIRT_SPEC_CTRL, #GP(0) as KVM's), every
-    /// other to KVM's, whoever answered.
+    /// 9V74, CI run 43635691697; VIRT_SPEC_CTRL, #GP(0) as KVM's;
+    /// PLATFORM_INFO's RDMSR on Intel, which WHP answers with the host's
+    /// value, 0x5080000001700 on CI's Xeon Platinum 8573C in CI run
+    /// 43644168355: held to a value without CPUID_FAULT, bit 31, which the
+    /// backend does not give a guest), every other to KVM's, whoever
+    /// answered. Every case runs, and the test fails at the end with the
+    /// list of those not as held.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_the_msrs_a_guest_reaches_are_answered_as_kvm() {
@@ -6105,6 +6110,8 @@ mod fpu_tests {
         enum Want {
             Gp,
             Value(u64),
+            /// WHP's value, the host's, without CPUID_FAULT (bit 31).
+            NoCpuidFault,
         }
         let imm = |v: u32| v.to_le_bytes();
         #[allow(clippy::cast_possible_truncation)]
@@ -6121,6 +6128,8 @@ mod fpu_tests {
         let whps = |name: &str| -> Option<Want> {
             if name.starts_with("RDMSR VM_HSAVE_PA") || name.starts_with("WRMSR VM_HSAVE_PA") || name.starts_with("RDMSR VIRT_SPEC_CTRL") {
                 Some(Want::Gp)
+            } else if !amd && name.starts_with("RDMSR PLATFORM_INFO") {
+                Some(Want::NoCpuidFault)
             } else {
                 None
             }
@@ -6192,7 +6201,11 @@ mod fpu_tests {
             match whps(name) {
                 // WHP's own, stated: its answer, and no exit.
                 Some(whp) if came == 0 => {
-                    if got.as_ref() != Some(&whp) {
+                    let held = match (&whp, &got) {
+                        (Want::NoCpuidFault, Some(Want::Value(v))) => v & 1 << 31 == 0,
+                        _ => got.as_ref() == Some(&whp),
+                    };
+                    if !held {
                         wrong.push(format!("{name}: WHP's own (no exit), {got:x?}, where the Guest MSRs row states {whp:x?}"));
                     }
                 }
@@ -11884,7 +11897,15 @@ mod fpu_tests {
     ///   the vCPU keeps as KVM does (`kvmmsr::Kept`), are one entry each,
     ///   and the guest's RDMSR and WRMSR of them are KVM's (CI run
     ///   43631245976 at 25bbec9 showed them so, and failed on this test's
-    ///   older assertion that they end the call).
+    ///   older assertion that they end the call), but where WHP answers
+    ///   the guest's read itself, the Guest MSRs row's stated differences:
+    ///   UCODE_REV's, and PLATFORM_INFO's on Intel (CI run 43644168355, a
+    ///   Xeon Platinum 8573C: the host's value, held to one without
+    ///   CPUID_FAULT, its write still #GP at the backend).
+    ///
+    /// Every row runs; the test fails at the end with the list of those
+    /// not as held (CI run 43644168355 stopped at the first, so the rows
+    /// after PLATFORM_INFO were not seen on Intel).
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_what_a_cpu_template_changes_on_record() {
@@ -11912,6 +11933,16 @@ mod fpu_tests {
         let vendor: Vec<u8> = [v.ebx, v.edx, v.ecx].iter().flat_map(|r| r.to_le_bytes()).collect();
         let fms = __cpuid(1).eax;
         eprintln!("TMPLTEST host: {} family/model/stepping {fms:#x}", String::from_utf8_lossy(&vendor));
+        let amd = vendor == b"AuthenticAMD";
+        // Every row runs; those not as held are listed at the end.
+        let mut wrong: Vec<String> = Vec::new();
+        macro_rules! check {
+            ($held:expr, $($why:tt)*) => {
+                if !$held {
+                    wrong.push(format!($($why)*));
+                }
+            };
+        }
 
         // CPUID.
         let supported = regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap();
@@ -11927,8 +11958,8 @@ mod fpu_tests {
             }
             let refused = vcpu.set_cpuid2(&CpuId::from_entries(&no_avx).unwrap());
             eprintln!("TMPLTEST cpuid 0xd.0 without AVX, which this host has: KVM_SET_CPUID2 {refused:?}");
-            assert!(refused.is_err(), "a table without AVX was taken");
-            assert!(vcpu.get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap().as_slice().is_empty(), "the refused table was kept");
+            check!(refused.is_err(), "a table without AVX was taken");
+            check!(vcpu.get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES).unwrap().as_slice().is_empty(), "the refused table was kept");
         }
         // Bits flipped in each leaf: in 0xd.0, components the host does
         // not have (bit 8, a supervisor one, and bit 61), which leaves out
@@ -11956,8 +11987,13 @@ mod fpu_tests {
                 e.ebx ^ b,
                 e.ecx ^ c
             );
-            assert_eq!(how, "done", "cpuid {function:#x}.{index}");
-            assert_eq!((a, d), (e.eax, e.edx), "cpuid {function:#x}.{index}: EAX and EDX are the table's");
+            check!(how == "done", "cpuid {function:#x}.{index}: {how}");
+            check!(
+                (a, d) == (e.eax, e.edx),
+                "cpuid {function:#x}.{index}: EAX and EDX {a:#x} {d:#x}, not the table's {:#x} {:#x}",
+                e.eax,
+                e.edx
+            );
         }
 
         // What WHP lets a guest enable: each group of components the
@@ -12009,13 +12045,13 @@ mod fpu_tests {
                 // `kvm_get_msr_ignored_check`, `kvm_set_msr_ignored_check`),
                 // and keeps 0x10a per vCPU where no WHP register holds it
                 // (the Static CPU templates row): both end the call here.
-                0x10a | 0x2 => assert_eq!(calls, (Some(0), Some(0)), "{index:#x}: an MSR kept nowhere ends the call"),
+                0x10a | 0x2 => check!(calls == (Some(0), Some(0)), "{index:#x}: an MSR kept nowhere ends the call: {calls:?}"),
                 // KVM's host-initiated access to PLATFORM_INFO (v6.1
                 // x86.c:4208-4213; a write of 0, without CPUID_FAULT, while
                 // CPUID faulting is off, x86.c:3832-3838) and UCODE_REV
                 // (x86.c:3993-3995, 3560-3563), which the vCPU keeps
                 // (`kvmmsr::Kept`): one entry each.
-                0xce | 0x8b => assert_eq!(calls, (Some(1), Some(1)), "{index:#x}: KVM_GET_MSRS and KVM_SET_MSRS, as KVM's host access"),
+                0xce | 0x8b => check!(calls == (Some(1), Some(1)), "{index:#x}: KVM_GET_MSRS and KVM_SET_MSRS, as KVM's host access: {calls:?}"),
                 _ => {}
             }
             // The guest's: PLATFORM_INFO read (guest_can_read_msr_platform_info
@@ -12026,13 +12062,31 @@ mod fpu_tests {
             // on CI's EPYC 9V74 (no exit: its read 0xffffffff, CI run
             // 43635691697) and on the PC, the Guest MSRs row's stated
             // difference: then its read and write are done, the value
-            // WHP's, on record.
-            if index == 0xce || (index == 0x8b && read_came + write_came > 0) {
+            // WHP's, on record. PLATFORM_INFO's read WHP answers itself on
+            // Intel (no exit: the host's value, 0x5080000001700 on CI's
+            // Xeon Platinum 8573C, CI run 43644168355), the row's stated
+            // difference: held to a value without CPUID_FAULT (bit 31),
+            // which the backend does not give a guest; its write still
+            // comes to the backend, #GP.
+            if index == 0xce && !amd && read_came == 0 {
+                check!(
+                    how == "done" && value & 1 << 31 == 0 && wrote == "#GP" && write_came == 1,
+                    "0xce: WHP's own read (no exit) {how}, value {value:#x} (CPUID_FAULT {}), where the Guest MSRs row states a \
+                     value without CPUID_FAULT; the write {wrote}, {write_came} at the backend (the row: #GP, at the backend)",
+                    value >> 31 & 1
+                );
+            } else if index == 0xce || (index == 0x8b && read_came + write_came > 0) {
                 let write = if index == 0xce { "#GP" } else { "done" };
-                assert_eq!((how.as_str(), value, wrote.as_str()), ("done", 0, write), "{index:#x}: a guest's rdmsr and wrmsr, as KVM's");
-                assert_eq!((read_came, write_came), (1, 1), "{index:#x}: the guest's rdmsr and wrmsr came to the backend");
+                check!(
+                    (how.as_str(), value, wrote.as_str()) == ("done", 0, write),
+                    "{index:#x}: a guest's rdmsr and wrmsr, as KVM's (done, 0, {write}): {how}, {value:#x}, {wrote}"
+                );
+                check!(
+                    (read_came, write_came) == (1, 1),
+                    "{index:#x}: the guest's rdmsr and wrmsr came to the backend: {read_came}, {write_came} of 1, 1"
+                );
             } else if index == 0x8b {
-                assert_eq!((how.as_str(), wrote.as_str()), ("done", "done"), "0x8b: a guest's rdmsr and wrmsr, WHP's");
+                check!((how.as_str(), wrote.as_str()) == ("done", "done"), "0x8b: a guest's rdmsr and wrmsr, WHP's (done, done): {how}, {wrote}");
             }
         }
 
@@ -12095,21 +12149,24 @@ mod fpu_tests {
             &entries.map(|(index, data)| kvm_bindings::kvm_msr_entry { index, data, ..Default::default() }),
         )
         .unwrap();
-        assert_eq!(vcpu.set_msrs(&msrs).unwrap(), 3, "a bank's CTL other than 0 or all ones ends KVM_SET_MSRS");
+        let n = vcpu.set_msrs(&msrs).unwrap();
+        check!(n == 3, "a bank's CTL other than 0 or all ones ends KVM_SET_MSRS: {n} of 4 set");
         let mut back = Msrs::from_entries(
             &[0x17b, 0x400, 0x401, 0x402, 0x404, 0x280].map(|index| kvm_bindings::kvm_msr_entry { index, ..Default::default() }),
         )
         .unwrap();
-        assert_eq!(vcpu.get_msrs(&mut back).unwrap(), 6);
+        let n = vcpu.get_msrs(&mut back).unwrap();
+        check!(n == 6, "the banks' KVM_GET_MSRS: {n} of 6");
         let values: Vec<u64> = back.as_slice().iter().map(|e| e.data).collect();
-        assert_eq!(values, [0, u64::MAX, 0xbe00_0000_0000_0000, 0x1234, 0, 0]);
+        check!(values == [0, u64::MAX, 0xbe00_0000_0000_0000, 0x1234, 0, 0], "the banks read back {values:x?}");
         // IA32_MCG_CAP and IA32_MCG_STATUS, which WHP keeps: both calls end
         // at them (`mce::whp_answers`).
         for index in [0x179, 0x17a] {
             let one = || Msrs::from_entries(&[kvm_bindings::kvm_msr_entry { index, data: 0, ..Default::default() }]).unwrap();
-            assert_eq!(vcpu.get_msrs(&mut one()).unwrap(), 0, "{index:#x}: KVM_GET_MSRS");
-            assert_eq!(vcpu.set_msrs(&one()).unwrap(), 0, "{index:#x}: KVM_SET_MSRS");
+            let (got, set) = (vcpu.get_msrs(&mut one()).unwrap(), vcpu.set_msrs(&one()).unwrap());
+            check!((got, set) == (0, 0), "{index:#x}: KVM_GET_MSRS and KVM_SET_MSRS end at it: {got}, {set}");
         }
+        assert!(wrong.is_empty(), "TMPLTEST not as held: {wrong:#?}");
 
         drop(vcpu);
         drop(vm);
