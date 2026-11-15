@@ -1333,7 +1333,8 @@ jobs:
           alone whp::vcpu::fpu_tests::test_a_held_lvt_timer_writes_interrupt_latency_on_record --release
           # A 2 MiB chunk of userfaultfd guest RAM swapped (discarded
           # whole) under a vCPU's scan and a host writer, 100 rounds
-          # (SWAPSTRESS lines).
+          # (SWAPSTRESS lines; a page read wrong, its "round N: page" line:
+          # its value, the events around its read, the vCPU's exits).
           alone whp::vcpu::fpu_tests::test_a_chunk_swapped_under_a_vcpu_and_a_host_writer_keeps_their_memory
           # The same chunk moved by the reclaim at a job's memory limit (its
           # live pages copied into a new section) under the guest's reads and

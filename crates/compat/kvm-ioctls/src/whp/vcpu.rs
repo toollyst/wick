@@ -1997,12 +1997,18 @@ impl VcpuFd {
                     if libc::wick_uffd::active()
                         && let Some(host) = self.shared.inner.host_addr(mem.Gpa)
                     {
+                        #[cfg(test)]
+                        let came = exit_ring::stamp();
                         // SAFETY: the access-info bitfield overlaps the u32.
                         let write = super::exit::memory_write(unsafe { mem.AccessInfo.AsUINT32 });
                         if libc::wick_uffd::fault(host, write) {
+                            #[cfg(test)]
+                            exit_ring::note(came, mem.Gpa, exit_ring::FAULTED, ram_retries);
                             ram_retries = 0;
                             continue;
                         }
+                        #[cfg(test)]
+                        exit_ring::note(came, mem.Gpa, exit_ring::RERUN, ram_retries);
                         ram_retries += 1;
                         if ram_retries < 1_000_000 {
                             std::thread::yield_now();
@@ -3160,6 +3166,73 @@ impl Drop for Watchdog {
         if let Some(t) = self.thread.take() {
             t.join().unwrap();
         }
+    }
+}
+
+/// For a record (SWAPSTRESS): the run loop's memory access exits at guest
+/// RAM that is userfaultfd-registered, each kept with a test's clock (an
+/// `AtomicU64` the test bumps at each of its own events, [`CLOCK`] its
+/// address) read as the exit came and once it was handled, its GPA, and
+/// what the backend did: the page faulted and filled or waited for
+/// ([`FAULTED`]), or not missing at the check, the access run again
+/// ([`RERUN`]). Nothing is kept while [`CLOCK`] is 0: two relaxed atomic
+/// loads an exit.
+#[cfg(test)]
+pub(crate) mod exit_ring {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// How many exits are kept, the last ones.
+    pub(crate) const LEN: usize = 1 << 14;
+    /// `wick_uffd::fault` was true: the page was missing, its fault
+    /// queued and waited for (or its chunk's move waited for).
+    pub(crate) const FAULTED: u64 = 1;
+    /// `wick_uffd::fault` was false: the page was not missing at the
+    /// check, so the access runs again (a fill between the exit and the
+    /// check).
+    pub(crate) const RERUN: u64 = 2;
+    /// The address of the test's clock, 0 for no record.
+    pub(crate) static CLOCK: AtomicUsize = AtomicUsize::new(0);
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ENTRY: [AtomicU64; 4] = [ZERO; 4];
+    static RING: [[AtomicU64; 4]; LEN] = [ENTRY; LEN];
+
+    /// The clock now, 0 while no record is kept.
+    pub(crate) fn stamp() -> u64 {
+        match CLOCK.load(Ordering::Relaxed) {
+            0 => 0,
+            // SAFETY: the test keeps its clock alive while CLOCK holds it.
+            at => unsafe { &*(at as *const AtomicU64) }.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Keeps an exit at `gpa` that came at clock `came` and was handled
+    /// as `what` ([`FAULTED`], [`RERUN`]) after `retries` runs again.
+    pub(crate) fn note(came: u64, gpa: u64, what: u64, retries: u32) {
+        if CLOCK.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let i = usize::try_from(NEXT.fetch_add(1, Ordering::Relaxed)).unwrap() % LEN;
+        let e = &RING[i];
+        e[0].store(came, Ordering::Relaxed);
+        e[1].store(stamp(), Ordering::Relaxed);
+        e[2].store(gpa, Ordering::Relaxed);
+        e[3].store(what | u64::from(retries) << 8, Ordering::Relaxed);
+    }
+
+    /// The exits kept, oldest first: (clock as it came, clock once
+    /// handled, GPA, what, runs again before it).
+    pub(crate) fn kept() -> Vec<(u64, u64, u64, u64, u64)> {
+        let next = usize::try_from(NEXT.load(Ordering::SeqCst)).unwrap();
+        (next.saturating_sub(LEN)..next)
+            .map(|i| {
+                let e = &RING[i % LEN];
+                let w = e[3].load(Ordering::Relaxed);
+                (e[0].load(Ordering::Relaxed), e[1].load(Ordering::Relaxed), e[2].load(Ordering::Relaxed), w & 0xff, w >> 8)
+            })
+            .collect()
     }
 }
 
@@ -7370,6 +7443,20 @@ mod fpu_tests {
     /// and the writer; then `bad` 0 and the least round at least the one
     /// before. Last, with the writer stopped, a discard and a scan that see
     /// only this round's fill. Asserted; SWAPSTRESS lines.
+    ///
+    /// The record of a page that is neither (SWAPSTRESS "round N: page"
+    /// lines, for the first 3 such rounds): a clock in the mailbox, bumped
+    /// by the handler as each fill begins and ends (with `copy`'s result)
+    /// and by the discard as it begins and ends, each event kept; the guest
+    /// reads the clock just before and after each page's read and keeps,
+    /// for the round's first bad page, its GPA, the qword, the clock before
+    /// and after, the page read again and the clock after that; the writer
+    /// keeps its last value for each page. Printed with the round's fill
+    /// value, the clock and the discard counter at the ask and at the
+    /// scan's end, the events around the read and the page's own in the
+    /// round, and the vCPU's memory access exits of the round
+    /// ([`super::exit_ring`]): at the page, around the read, and how many
+    /// ran again because their page was not missing at the check.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_a_chunk_swapped_under_a_vcpu_and_a_host_writer_keeps_their_memory() {
@@ -7379,24 +7466,44 @@ mod fpu_tests {
         const ROUNDS: u64 = 100;
         const FILL: u64 = 0xF << 60;
         const WRITE: u64 = 0xA << 60;
+        // The mailbox's qwords: 0 the round asked, 1 the round scanned, 2
+        // bad, 3 the least fill round, 4 the writer's values seen, 5 quit;
+        // of the round's first bad page, 6 its GPA, 7 its qword, 8 and 9 the
+        // clock before and after the read, 10 the page read again, 11 the
+        // clock after that; 15 the clock.
+        const CLOCK: u64 = 15;
+        // The events kept, by clock (all of them: about 2 a fault).
+        const EVENTS: usize = 1 << 17;
+        // Event kinds, in an event's top byte: a fill begun and its end
+        // (made, EEXIST, refused), a discard begun and ended.
+        const FILL_BEGUN: u64 = 1;
+        const FILLED: u64 = 2;
+        const FILL_EEXIST: u64 = 3;
+        const FILL_REFUSED: u64 = 4;
+        const DISCARD_BEGUN: u64 = 5;
+        const DISCARD_ENDED: u64 = 6;
         // The scan (see the doc), at MMIO_PROGRAM; `out 0x85` after each,
         // `out 0x86` once the mailbox says to quit.
-        const SCAN: [u8; 147] = [
+        const SCAN: [u8; 231] = [
             0x48, 0x8B, 0x04, 0x25, 0x28, 0x70, 0x00, 0x00, 0x48, 0x85, 0xC0, 0x74, 0x04, 0xE6, 0x86, 0xEB, 0xFC, 0x48,
             0x8B, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00, 0x48, 0x3B, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00, 0x74, 0xDD, 0xBB,
-            0x00, 0x00, 0x20, 0x00, 0x31, 0xC9, 0x45, 0x31, 0xC0, 0x48, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF, 0x48, 0x8B,
-            0x33, 0x48, 0x89, 0xF7, 0x48, 0xC1, 0xEF, 0x3C, 0x83, 0xFF, 0x0F, 0x75, 0x0C, 0x89, 0xF7, 0x48, 0x39, 0xD7,
-            0x73, 0x12, 0x48, 0x89, 0xFA, 0xEB, 0x0D, 0x83, 0xFF, 0x0A, 0x75, 0x05, 0x49, 0xFF, 0xC0, 0xEB, 0x03, 0x48,
-            0xFF, 0xC1, 0x48, 0x81, 0xC3, 0x00, 0x10, 0x00, 0x00, 0x48, 0x81, 0xFB, 0x00, 0x00, 0x40, 0x00, 0x72, 0xC8,
-            0x48, 0x89, 0x0C, 0x25, 0x10, 0x70, 0x00, 0x00, 0x48, 0x89, 0x14, 0x25, 0x18, 0x70, 0x00, 0x00, 0x4C, 0x89,
-            0x04, 0x25, 0x20, 0x70, 0x00, 0x00, 0x48, 0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00, 0xE6, 0x85, 0xE9, 0x6D,
-            0xFF, 0xFF, 0xFF,
+            0x00, 0x00, 0x20, 0x00, 0x31, 0xC9, 0x45, 0x31, 0xC0, 0x48, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF, 0x4C, 0x8B,
+            0x0C, 0x25, 0x78, 0x70, 0x00, 0x00, 0x48, 0x8B, 0x33, 0x4C, 0x8B, 0x14, 0x25, 0x78, 0x70, 0x00, 0x00, 0x48,
+            0x89, 0xF7, 0x48, 0xC1, 0xEF, 0x3C, 0x83, 0xFF, 0x0F, 0x75, 0x0C, 0x89, 0xF7, 0x48, 0x39, 0xD7, 0x73, 0x52,
+            0x48, 0x89, 0xFA, 0xEB, 0x4D, 0x83, 0xFF, 0x0A, 0x75, 0x05, 0x49, 0xFF, 0xC0, 0xEB, 0x43, 0x48, 0x85, 0xC9,
+            0x75, 0x3B, 0x48, 0x89, 0x1C, 0x25, 0x30, 0x70, 0x00, 0x00, 0x48, 0x89, 0x34, 0x25, 0x38, 0x70, 0x00, 0x00,
+            0x4C, 0x89, 0x0C, 0x25, 0x40, 0x70, 0x00, 0x00, 0x4C, 0x89, 0x14, 0x25, 0x48, 0x70, 0x00, 0x00, 0x48, 0x8B,
+            0x3B, 0x48, 0x89, 0x3C, 0x25, 0x50, 0x70, 0x00, 0x00, 0x48, 0x8B, 0x3C, 0x25, 0x78, 0x70, 0x00, 0x00, 0x48,
+            0x89, 0x3C, 0x25, 0x58, 0x70, 0x00, 0x00, 0x48, 0xFF, 0xC1, 0x48, 0x81, 0xC3, 0x00, 0x10, 0x00, 0x00, 0x48,
+            0x81, 0xFB, 0x00, 0x00, 0x40, 0x00, 0x0F, 0x82, 0x74, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0x0C, 0x25, 0x10, 0x70,
+            0x00, 0x00, 0x48, 0x89, 0x14, 0x25, 0x18, 0x70, 0x00, 0x00, 0x4C, 0x89, 0x04, 0x25, 0x20, 0x70, 0x00, 0x00,
+            0x48, 0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00, 0xE6, 0x85, 0xE9, 0x19, 0xFF, 0xFF, 0xFF,
         ];
         let say = |l: String| eprintln!("SWAPSTRESS {l}");
         let mut uffd = None;
         let (vm, vcpu, m) = mmio_guest_with(&SCAN, |m| {
             // The mailbox resident (written), so it is not missing.
-            put(m, MAILBOX, &[0u8; 64]);
+            put(m, MAILBOX, &[0u8; 128]);
             let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
             libc::wick_uffd::register(ctx, m as u64, MEM as u64).unwrap();
             uffd = Some((ctx, user));
@@ -7406,13 +7513,24 @@ mod fpu_tests {
         let chunk = at as u64 + CHUNK;
         // SAFETY: guest memory, mapped until the end.
         let mailbox = move |i: u64| unsafe { &*((at + (MAILBOX + 8 * i) as usize) as *const AtomicU64) };
+        let events: Arc<Vec<AtomicU64>> = Arc::new((0..EVENTS).map(|_| AtomicU64::new(0)).collect());
+        // An event: the clock bumped, the event kept at its old value.
+        let event = {
+            let events = Arc::clone(&events);
+            move |kind: u64, round: u64, gpa: u64| {
+                let n = mailbox(CLOCK).fetch_add(1, Ordering::SeqCst);
+                events[usize::try_from(n).unwrap() % EVENTS].store(kind << 56 | round << 32 | gpa, Ordering::SeqCst);
+            }
+        };
+        let last_written: Arc<Vec<AtomicU64>> = Arc::new((0..512).map(|_| AtomicU64::new(0)).collect());
+        super::exit_ring::CLOCK.store(std::ptr::from_ref(mailbox(CLOCK)) as usize, Ordering::SeqCst);
         let fill_round = Arc::new(AtomicU64::new(0));
         // Odd while a discard runs.
         let discards = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         // The handler: each page fault filled with this round's qwords.
         let handler = {
-            let fill_round = Arc::clone(&fill_round);
+            let (fill_round, event) = (Arc::clone(&fill_round), event.clone());
             std::thread::spawn(move || {
                 let mut faults = 0u64;
                 let mut rec = [0u8; libc::wick_uffd::proto::RECORD];
@@ -7431,23 +7549,32 @@ mod fpu_tests {
                         continue;
                     }
                     let page = word(1) & !0xfff;
-                    let v = FILL | fill_round.load(Ordering::SeqCst);
+                    let round = fill_round.load(Ordering::SeqCst);
+                    let v = FILL | round;
                     let data: Vec<u8> = std::iter::repeat_n(v.to_le_bytes(), 512).flatten().collect();
+                    event(FILL_BEGUN, round, page - at as u64);
                     // SAFETY: a page-sized buffer; EEXIST if another fill came first.
-                    let _ = unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), page, 4096, true) };
+                    let r = unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), page, 4096, true) };
+                    let kind = match r {
+                        Ok(_) => FILLED,
+                        Err((e, _)) if e == libc::EEXIST => FILL_EEXIST,
+                        Err(_) => FILL_REFUSED,
+                    };
+                    event(kind, round, page - at as u64);
                     faults += 1;
                 }
             })
         };
         // The host writer.
         let writer = {
-            let (discards, stop) = (Arc::clone(&discards), Arc::clone(&stop));
+            let (discards, stop, last_written) = (Arc::clone(&discards), Arc::clone(&stop), Arc::clone(&last_written));
             std::thread::spawn(move || {
                 let (mut writes, mut lost) = (0u64, Vec::new());
                 let mut seq = 0u64;
                 while !stop.load(Ordering::SeqCst) {
                     seq += 1;
-                    let page = chunk + (seq * 37 % 512) * 4096;
+                    let index = seq * 37 % 512;
+                    let page = chunk + index * 4096;
                     let before = discards.load(Ordering::SeqCst);
                     let v = WRITE | seq;
                     // SAFETY: guest RAM, mapped until the end; a missing page
@@ -7456,6 +7583,7 @@ mod fpu_tests {
                         std::ptr::write_volatile(page as *mut u64, v);
                         std::ptr::read_volatile(page as *const u64)
                     };
+                    last_written[usize::try_from(index).unwrap()].store(v, Ordering::Relaxed);
                     writes += 1;
                     if before % 2 == 0 && discards.load(Ordering::SeqCst) == before && back != v && lost.len() < 8 {
                         lost.push(format!("{:#x}: wrote {v:#x}, read {back:#x}", page - chunk));
@@ -7475,43 +7603,100 @@ mod fpu_tests {
                 }
             }
         });
-        let discard = || {
+        let discard = |r: u64| {
             discards.fetch_add(1, Ordering::SeqCst);
+            event(DISCARD_BEGUN, r, 0);
             // SAFETY: the chunk of guest RAM, discarded.
-            let r = unsafe { libc::madvise(chunk as *mut libc::c_void, CHUNK as usize, libc::MADV_DONTNEED) };
+            let ret = unsafe { libc::madvise(chunk as *mut libc::c_void, CHUNK as usize, libc::MADV_DONTNEED) };
+            event(DISCARD_ENDED, r, 0);
             discards.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(r, 0, "the chunk's discard");
+            assert_eq!(ret, 0, "the chunk's discard");
         };
         // A scan of round `r`, asked for, with the chunk discarded at once if
-        // `race`: (bad, least fill round, the writer's values seen).
+        // `race`: (bad, least fill round, the writer's values seen), and the
+        // clock and the discard counter at the ask and once it was seen.
         let scan = |r: u64, race: bool| {
             fill_round.store(r, Ordering::SeqCst);
+            let asked = (mailbox(CLOCK).load(Ordering::SeqCst), discards.load(Ordering::SeqCst));
             mailbox(0).store(r, Ordering::SeqCst);
             if race {
-                discard();
+                discard(r);
             }
-            let asked = std::time::Instant::now();
+            let begun = std::time::Instant::now();
             while mailbox(1).load(Ordering::SeqCst) != r {
-                assert!(asked.elapsed() < std::time::Duration::from_secs(20), "round {r}: the guest's scan did not end");
+                assert!(begun.elapsed() < std::time::Duration::from_secs(20), "round {r}: the guest's scan did not end");
                 std::thread::yield_now();
             }
-            (mailbox(2).load(Ordering::SeqCst), mailbox(3).load(Ordering::SeqCst), mailbox(4).load(Ordering::SeqCst))
+            let seen = (mailbox(CLOCK).load(Ordering::SeqCst), discards.load(Ordering::SeqCst));
+            ((mailbox(2).load(Ordering::SeqCst), mailbox(3).load(Ordering::SeqCst), mailbox(4).load(Ordering::SeqCst)), asked, seen)
+        };
+        let named = |e: u64| {
+            let (kind, round, gpa) = (e >> 56, e >> 32 & 0xff_ffff, e & 0xffff_ffff);
+            match kind {
+                FILL_BEGUN => format!("fill of {gpa:#x} begun (round {round})"),
+                FILLED => format!("{gpa:#x} filled (round {round})"),
+                FILL_EEXIST => format!("{gpa:#x}'s fill EEXIST (round {round})"),
+                FILL_REFUSED => format!("{gpa:#x}'s fill refused (round {round})"),
+                DISCARD_BEGUN => format!("discard begun (round {round})"),
+                DISCARD_ENDED => format!("discard ended (round {round})"),
+                _ => format!("{e:#x}"),
+            }
+        };
+        // The record of round `r`'s first bad page (see the doc).
+        let record = |r: u64, asked: (u64, u64), seen: (u64, u64)| {
+            let q = |i: u64| mailbox(i).load(Ordering::SeqCst);
+            let (gpa, value, before, after, again, after_again) = (q(6), q(7), q(8), q(9), q(10), q(11));
+            let event_at = |c: u64| events[usize::try_from(c).unwrap() % EVENTS].load(Ordering::SeqCst);
+            let around: Vec<String> = (before.saturating_sub(6)..(after_again + 6).min(seen.0))
+                .map(|c| format!("{c}: {}", named(event_at(c))))
+                .collect();
+            let own: Vec<String> = (asked.0..seen.0)
+                .filter(|&c| event_at(c) >> 56 <= FILL_REFUSED && event_at(c) & 0xffff_ffff == gpa)
+                .map(|c| format!("{c}: {}", named(event_at(c))))
+                .collect();
+            let exits: Vec<_> = super::exit_ring::kept().into_iter().filter(|e| e.0 >= asked.0 && e.0 < seen.0).collect();
+            let reruns = exits.iter().filter(|e| e.3 == super::exit_ring::RERUN).count();
+            let line = |e: &(u64, u64, u64, u64, u64)| {
+                let what = if e.3 == super::exit_ring::RERUN { "not missing, run again" } else { "faulted" };
+                format!("{:#x} came {} handled {} {what} after {} runs again", e.2, e.0, e.1, e.4)
+            };
+            let at_page: Vec<String> = exits.iter().filter(|e| e.2 & !0xfff == gpa).map(line).collect();
+            let near: Vec<String> =
+                exits.iter().filter(|e| e.1 + 4 >= before && e.0 <= after_again + 4).take(16).map(line).collect();
+            let index = usize::try_from((gpa.wrapping_sub(CHUNK)) / 4096).unwrap_or(usize::MAX);
+            let written = last_written.get(index).map_or(0, |w| w.load(Ordering::SeqCst));
+            format!(
+                "round {r}: page {gpa:#x} read {value:#x} between clock {before} and {after}, read again {again:#x} by \
+                 clock {after_again}; the round's fill {:#x}; the writer's last value there {written:#x}; at the ask \
+                 clock {} discards {}, at the scan's end clock {} discards {}; events around the read {around:?}; the \
+                 page's events in the round {own:?}; the vCPU's exits in the round {}, {reruns} of them run again \
+                 (their page not missing at the check); at the page {at_page:?}; around the read {near:?}",
+                FILL | r,
+                asked.0,
+                asked.1,
+                seen.0,
+                seen.1,
+                exits.len()
+            )
         };
         let begun = std::time::Instant::now();
         let mut problems = Vec::new();
         let mut written = 0;
         for r in 1..=ROUNDS {
-            let (bad, least, seen) = scan(r, true);
+            let ((bad, least, seen), asked, ended) = scan(r, true);
             written += seen;
             if bad != 0 || least < r - 1 {
                 problems.push(format!("round {r}: {bad} pages neither filled nor written, least fill round {least}"));
+                if bad != 0 && problems.len() <= 3 {
+                    say(record(r, asked, ended));
+                }
             }
         }
         stop.store(true, Ordering::SeqCst);
         let (writes, lost) = writer.join().unwrap();
         // Alone: a discard, then a scan that sees this round's fill only.
-        discard();
-        let (bad, least, seen) = scan(ROUNDS + 1, false);
+        discard(ROUNDS + 1);
+        let ((bad, least, seen), _, _) = scan(ROUNDS + 1, false);
         say(format!(
             "{ROUNDS} rounds in {:?}: the guest saw the writer's values {written} times, the writer wrote {writes} times, \
              its write not read back {} times {lost:?}; problems {problems:?}; alone: bad {bad}, least round {least}, the \
@@ -7524,6 +7709,7 @@ mod fpu_tests {
         // SAFETY: closes the user end: the handler's receive ends.
         unsafe { libc::close(user) };
         let faults = handler.join().unwrap();
+        super::exit_ring::CLOCK.store(0, Ordering::SeqCst);
         say(format!("the vCPU's last exit {end}; the handler filled {faults} faults"));
         assert!(problems.is_empty() && lost.is_empty(), "{problems:?} {lost:?}");
         assert_eq!((bad, least, seen), (0, ROUNDS + 1, 0), "the scan alone");
