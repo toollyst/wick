@@ -1821,7 +1821,9 @@ mod tests {
         let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "platform::macos::net::tests::iface_holder_child", "--ignored", "--nocapture"])
             .env("WICK_TEST_CASE", &name)
-            .stdin(std::process::Stdio::null())
+            // Its end of this pipe closes with this process, however it
+            // ends, and the holder with it (no child left behind).
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
@@ -1848,8 +1850,10 @@ mod tests {
         let name = std::env::var("WICK_TEST_CASE").unwrap();
         match tests_as::user(|| Tap::open_named(&name)) {
             Ok(tap) => {
+                use std::io::Read;
                 println!("HELD");
-                std::thread::sleep(std::time::Duration::from_secs(600));
+                // Held until the parent's end of stdin closes.
+                let _ = std::io::stdin().read(&mut [0u8]);
                 drop(tap);
             }
             Err(err) => println!("FAILED {err}"),
