@@ -19,7 +19,9 @@ every backend and every gap. This page is the summary.
 
 **How to read the evidence.** Each 🟢, 🟡 and 🔴 cell names what shows it:
 
-- `boot-test <stage>` is a stage of [`tools/macos/boot-test.sh`](../tools/macos/boot-test.sh) on a Mac.
+- `boot-test <stage>` is a stage of [`tools/macos/boot-test.sh`](../tools/macos/boot-test.sh) on a Mac, run by the
+  user (under sudo it refuses to start, since it would build as root; before macOS 26 the vmnet stage alone runs as
+  root, through sudo, and its results are given back to the user).
   `boot-test.ps1 <stage>` is a stage of [`tools/windows/boot-test.ps1`](../tools/windows/boot-test.ps1) on a PC
   with the Windows Hypervisor Platform (WHP).
 - `jailer-test <stage>` is [`tools/macos/jailer-test.sh`](../tools/macos/jailer-test.sh): run by the user, it builds

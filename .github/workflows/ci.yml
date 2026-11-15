@@ -459,6 +459,31 @@ jobs:
             echo "$left"
             exit 1
           fi
+      # The scenario scripts build as the user and ask for sudo themselves for
+      # what needs root: run under sudo, each refuses to start before it
+      # builds (not_as_root, tools/common.sh), so that no root-owned file is
+      # left in the build directories the user's own builds share (a root
+      # batch's `sudo tools/macos/boot-test.sh vmnet` once left 283 there,
+      # and the user's next jailer-test build failed with "Permission denied").
+      - name: The scenario scripts refuse to run as root
+        if: success() || failure()
+        run: |
+          before=$(find build lib/firecracker/build -user 0 2>/dev/null | wc -l)
+          for script in tools/macos/boot-test.sh tools/macos/jailer-test.sh tools/macos/integration-tests.sh; do
+            if out=$(sudo "$script" 2>&1); then
+              echo "$script ran under sudo: $out"
+              exit 1
+            fi
+            case "$out" in
+              *"refuses to run as root"*) ;;
+              *) echo "$script under sudo failed without the refusal: $out"; exit 1 ;;
+            esac
+          done
+          after=$(find build lib/firecracker/build -user 0 2>/dev/null | wc -l)
+          if [ "$after" != "$before" ]; then
+            echo "root-owned files in the build directories went from $before to $after"
+            exit 1
+          fi
       # A state file made on Linux x86_64 by this run's linux-boot job is
       # refused here with upstream's error, before a VM is made (so it needs
       # no Hypervisor.framework). When linux-boot has failed there is no file:
