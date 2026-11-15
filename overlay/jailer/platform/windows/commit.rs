@@ -535,6 +535,24 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
+    /// The tests that stand on the count need a host whose
+    /// `SharedCommitUsage` moves with a section ([`self_check`]); on one
+    /// without, each says so, naming the build and where it does run, so
+    /// that the failure is not read as a regression: the jailer refuses
+    /// memory.max there (`test_a_memory_limit_on_this_host`, cgroup.rs).
+    fn on_a_counting_host() {
+        if let Err(why) = self_check() {
+            panic!(
+                "not a regression: this host, Windows {}, cannot run this test: its SharedCommitUsage does not move \
+                 with a section ({why}). PROCESS_MEMORY_COUNTERS_EX2's SharedCommitUsage is in Windows 10 and 11 22H2 \
+                 with the September 2023 update and later (Learn); measured in CI's Windows Server 2025 (26100) and the \
+                 PC's Windows 11, absent in Windows Server 2022 (20348, fc-win). Here the jailer refuses memory.max, \
+                 named (test_a_memory_limit_on_this_host); this test runs in CI and on the PC",
+                super::super::freezer::windows_build()
+            );
+        }
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn VirtualAllocEx(process: HANDLE, address: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
@@ -596,7 +614,7 @@ mod tests {
     // Learn's range).
     #[test]
     fn test_shared_commit_is_counted_on_this_host() {
-        self_check().unwrap();
+        on_a_counting_host();
     }
 
     // The poll's timer ticks every POLL on this host: 500 ticks of
@@ -665,6 +683,7 @@ mod tests {
     // as this test sees it; with the polls' mean interval.
     #[test]
     fn test_a_section_past_the_limit_ends_the_jail_with_137() {
+        on_a_counting_host();
         let (job, p) = jail();
         let limit = of(&p) + 32 * MIB;
         let w = watch(job.as_raw_handle(), p.process.as_raw_handle(), limit, None).unwrap();
@@ -883,6 +902,7 @@ mod tests {
     // commit: covered sections are not counted twice, uncovered ones are.
     #[test]
     fn test_charge_pages_pay_for_the_sections_they_cover() {
+        on_a_counting_host();
         let (job, p) = jail();
         // SAFETY: our suspended child; the system chooses the address.
         let at = unsafe {
@@ -902,6 +922,7 @@ mod tests {
     // Large pages the jailer gave are hugetlb's, not memory.max's.
     #[test]
     fn test_large_pages_given_are_not_counted() {
+        on_a_counting_host();
         let (job, p) = jail();
         let limit = of(&p) + 16 * MIB;
         let given = Arc::new(AtomicU64::new(48 * MIB));

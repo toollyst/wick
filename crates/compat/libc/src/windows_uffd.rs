@@ -3369,8 +3369,8 @@ mod tests {
     /// gone before they are). The count needs `PROCESS_MEMORY_COUNTERS_EX2`'s
     /// `SharedCommitUsage` (Windows 10 or 11 22H2 with the September 2023
     /// update and later): on a host without it the jailer refuses
-    /// memory.max (`test_a_memory_limit_is_refused_where_sections_cannot_be_counted`),
-    /// and the child says so and fails, naming it.
+    /// memory.max (`test_a_memory_limit_on_this_host`), and the child says
+    /// so and fails, naming the build and where the test runs.
     #[test]
     fn test_the_jailers_count_does_not_rise_during_a_move() {
         let (code, text) = run_child("move_count_child", Some(256 << 20));
@@ -3391,13 +3391,27 @@ mod tests {
             let with = jailers_count();
             // SAFETY: ours.
             unsafe { CloseHandle(s) };
-            assert!(
-                with >= before + (1 << 20),
-                "this host gives no SharedCommitUsage (PROCESS_MEMORY_COUNTERS_EX2: Windows 10 or 11 22H2 with the September \
-                 2023 update and later): a 1 MiB section moved the count from {before} to {with}; the jailer refuses \
-                 memory.max here (test_a_memory_limit_is_refused_where_sections_cannot_be_counted), and its count during a \
-                 move cannot be read"
-            );
+            if with < before + (1 << 20) {
+                use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+                use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+                // SAFETY: an all-zero OSVERSIONINFOW with its size is valid.
+                let mut vi: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+                vi.dwOSVersionInfoSize = u32::try_from(std::mem::size_of::<OSVERSIONINFOW>()).unwrap();
+                // SAFETY: plain call.
+                unsafe { RtlGetVersion(&mut vi) };
+                panic!(
+                    "not a regression: this host, Windows {}.{}.{}, cannot run this test: its SharedCommitUsage does not \
+                     move with a section (a 1 MiB section moved the count from {before} to {with}). \
+                     PROCESS_MEMORY_COUNTERS_EX2's SharedCommitUsage is in Windows 10 and 11 22H2 with the September 2023 \
+                     update and later (Learn); measured in CI's Windows Server 2025 (26100) and the PC's Windows 11, absent \
+                     in Windows Server 2022 (20348, fc-win). Here the jailer refuses memory.max, named \
+                     (test_a_memory_limit_on_this_host), so its count during a move cannot be read; this test runs in CI \
+                     and on the PC",
+                    vi.dwMajorVersion,
+                    vi.dwMinorVersion,
+                    vi.dwBuildNumber
+                );
+            }
         }
         let (ctx, user) = create(0, false, true).unwrap();
         let len = 2 * CHUNK;

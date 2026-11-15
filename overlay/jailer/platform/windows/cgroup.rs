@@ -495,8 +495,13 @@ fn host_highest_node() -> u32 {
 mod tests {
     use super::*;
 
+    /// The limits the builder makes of `props` on a host that counts
+    /// sections (the check given as passed: the parse is what these tests
+    /// are for; what this host's check gives is
+    /// `test_a_memory_limit_on_this_host`'s).
     fn limits(version: u8, props: &[&str]) -> Result<Limits, JailerError> {
         let mut b = CgroupConfigurationBuilder::new(version, "")?;
+        b.sections_counted = || Ok(());
         for p in props {
             let (f, v) = p.split_once('=').unwrap();
             b.add_cgroup_property(f.into(), v.into(), "id", Path::new("fc"))?;
@@ -541,6 +546,34 @@ mod tests {
         }
         assert_eq!(with(2, "memory.max=max", cannot).unwrap(), None);
         assert_eq!(with(1, "memory.limit_in_bytes=-1", cannot).unwrap(), None);
+    }
+
+    // On this host: a memory limit is taken where its count of sections
+    // works ([`platform::commit::sections_counted`]), and refused, naming
+    // SharedCommitUsage, where it does not (Windows Server 2022, 20348);
+    // "no limit" is taken on both. Which it was printed (MEMLIMIT).
+    #[test]
+    fn test_a_memory_limit_on_this_host() {
+        let host = |version: u8, prop: &str| {
+            let mut b = CgroupConfigurationBuilder::new(version, "").unwrap();
+            let (f, v) = prop.split_once('=').unwrap();
+            b.add_cgroup_property(f.into(), v.into(), "id", Path::new("fc")).map(|()| b.build().limits.memory_bytes)
+        };
+        let counted = platform::commit::sections_counted();
+        println!("MEMLIMIT sections counted on this host: {counted:?}");
+        for (version, prop) in [(2, "memory.max=33554432"), (1, "memory.limit_in_bytes=33554432")] {
+            match (&counted, host(version, prop)) {
+                (Ok(()), Ok(bytes)) => assert_eq!(bytes, Some(32 << 20), "{prop}"),
+                (Err(_), Err(JailerError::Host(HostError::SectionsUncounted(cg, why)))) => {
+                    assert_eq!(cg, prop);
+                    let line = HostError::SectionsUncounted(cg, why).to_string();
+                    assert!(line.contains("SharedCommitUsage"), "{line}");
+                }
+                (c, other) => panic!("{prop} with the host's check {c:?}: {other:?}"),
+            }
+        }
+        assert_eq!(host(2, "memory.max=max").unwrap(), None);
+        assert_eq!(host(1, "memory.limit_in_bytes=-1").unwrap(), None);
     }
 
     #[test]
