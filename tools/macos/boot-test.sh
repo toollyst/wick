@@ -107,6 +107,8 @@ spec = importlib.util.spec_from_file_location("bt", os.path.join(os.environ["ROO
 bt = importlib.util.module_from_spec(spec); spec.loader.exec_module(bt)
 bt.fetch(sys.argv[1], bt.KERNEL); bt.fetch(sys.argv[1], bt.ROOTFS)
 PY
+# The run's directory is yours, made before root's stage writes in it.
+mkdir -p "$OUT"
 echo "boot-test: the vmnet stage runs as root on macOS $major (vmnet.framework needs it before 26): sudo asks" >&2
 sudo python3 -I -B "$ROOT/tools/macos/boot-test.py" "${args[@]}" --out "$OUT/vmnet" vmnet || status=$?
 sudo chown -R "$(id -u):$(id -g)" "$OUT/vmnet"

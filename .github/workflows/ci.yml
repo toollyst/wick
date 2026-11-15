@@ -590,6 +590,55 @@ jobs:
   # measure every major wick supports (README: macOS 15 and later) on GitHub's
   # runner image of each; a major the table lacks fails naming it and what it
   # measured.
+  # tools/macos/boot-test.sh before macOS 26, where vmnet.framework needs root:
+  # the script builds as the user and runs the vmnet stage alone through sudo
+  # (root's python3, the system's 3.9 here), then gives its results back to
+  # the user. macos-latest is macOS 26, where nothing asks for root, so this
+  # path runs here, on macOS 15. The runner has no Hypervisor.framework, so
+  # the stage itself fails (that is not what is checked): what is checked is
+  # that its root step ran (boot-test.py under sudo reached the stage), that
+  # its results are the user's, and that no root-owned file is left in the
+  # build directories or the source tree.
+  macos-15-root-vmnet:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - run: tools/setup.sh
+      - name: boot-test.sh's vmnet stage as root, before macOS 26
+        run: |
+          sudo python3 --version
+          set +e
+          tools/macos/boot-test.sh vmnet > "$RUNNER_TEMP/vmnet.log" 2>&1
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/vmnet.log"
+          if [ "$rc" = 0 ]; then
+            echo "the vmnet stage passed on a runner without Hypervisor.framework"
+            exit 1
+          fi
+          grep -q "the vmnet stage runs as root on macOS 15" "$RUNNER_TEMP/vmnet.log"
+          grep -q "^== vmnet" "$RUNNER_TEMP/vmnet.log"
+          out=$(ls -dt build/boot-test/*/vmnet | head -1)
+          cat "$out/summary.txt"
+          grep -q "^FAIL  vmnet: " "$out/summary.txt"
+          if [ -n "$(find "$out" ! -user "$(id -u)" -print)" ]; then
+            echo "the root step's results are not the user's:"
+            find "$out" ! -user "$(id -u)" -print
+            exit 1
+          fi
+          left=$(find . -user 0 -print)
+          if [ -n "$left" ]; then
+            echo "root-owned files left:"
+            echo "$left"
+            exit 1
+          fi
+
   macos-seatbelt:
     strategy:
       fail-fast: false

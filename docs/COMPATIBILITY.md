@@ -21,7 +21,9 @@ every backend and every gap. This page is the summary.
 
 - `boot-test <stage>` is a stage of [`tools/macos/boot-test.sh`](../tools/macos/boot-test.sh) on a Mac, run by the
   user (under sudo it refuses to start, since it would build as root; before macOS 26 the vmnet stage alone runs as
-  root, through sudo, and its results are given back to the user).
+  root, through sudo, and its results are given back to the user: CI's `macos-15-root-vmnet` job runs that path on
+  macOS 15, where the stage itself fails for want of Hypervisor.framework; the stage's own run as root before 26 is
+  the user's, not run yet).
   `boot-test.ps1 <stage>` is a stage of [`tools/windows/boot-test.ps1`](../tools/windows/boot-test.ps1) on a PC
   with the Windows Hypervisor Platform (WHP).
 - `jailer-test <stage>` is [`tools/macos/jailer-test.sh`](../tools/macos/jailer-test.sh): run by the user, it builds
