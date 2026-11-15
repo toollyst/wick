@@ -364,15 +364,18 @@ fn is_busy(err: &TapError) -> bool {
 /// 0440 with both ([`capable`]); no jail can make, replace or change it, as
 /// no jail makes a name in the network directory (`ext::sandbox`
 /// files_in_jail). A creator ([`may_create`]) opening a name without one
-/// makes it, 0644 (writable by its owner: what tells a creator's from the
-/// operator's, which are read-only), and removes it when the device goes,
-/// as a TAP root made without TUNSETPERSIST goes at its close.
+/// makes it, 0644 (O_CREAT|O_EXCL: only a file its own open made is its),
+/// and removes it when the device goes, as a TAP root made without
+/// TUNSETPERSIST goes at its close; a lock file that was there it leaves,
+/// whatever its mode, and a killed creator's stays: the next opener takes
+/// it as it is, and a user's open of the name is still refused for want of
+/// the switch's socket.
 struct IfaceLock {
     fd: OwnedFd,
     /// The network's descriptor in a jail, where `path` is relative.
     at: Option<BorrowedFd<'static>>,
     path: CString,
-    /// A creator's, removed when the device goes.
+    /// Made by this open (O_CREAT|O_EXCL), removed when the device goes.
     made: bool,
 }
 
@@ -397,14 +400,42 @@ impl IfaceLock {
         let shown = dir.parent().unwrap_or(dir).join(&file);
         let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| TapError::InvalidIfname)?;
         let at = network.map_or(libc::AT_FDCWD, |fd| fd.as_raw_fd());
-        let creator = may_create();
-        let mut flags = libc::O_RDONLY | libc::O_EXLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        if creator {
-            flags |= libc::O_CREAT;
-        }
-        // SAFETY: a directory descriptor (or AT_FDCWD), a NUL-terminated
-        // path and a mode for a file made.
-        let fd = unsafe { libc::openat(at, c.as_ptr(), flags, libc::c_uint::from(0o644u16)) };
+        let flags = libc::O_RDONLY | libc::O_EXLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let open = |flags: c_int| {
+            // SAFETY: a directory descriptor (or AT_FDCWD), a NUL-terminated
+            // path and a mode for a file made.
+            unsafe { libc::openat(at, c.as_ptr(), flags, libc::c_uint::from(0o644u16)) }
+        };
+        // A creator makes the file if there is none, and only a file this
+        // open made is its own to remove (`made`), whatever its mode: one
+        // that is there is another's (the operator's, or a killed
+        // creator's) and stays. xnu makes the file and then takes the lock
+        // (bsd/vfs/vfs_syscalls.c open1, xnu-12377.121.6: vn_open_auth
+        // :4965, the lock :5008 to :5030): a creator whose lock is then
+        // taken by another opener first fails busy, the file left to that
+        // opener, which found it there (not made), so no two openers ever
+        // both made one.
+        let mut made = false;
+        let fd = if may_create() {
+            let fd = open(flags | libc::O_CREAT | libc::O_EXCL);
+            if fd >= 0 {
+                made = true;
+                fd
+            } else if io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+                let fd = open(flags);
+                // Gone between the two opens: its holder's device went
+                // just then, so the name was in use (busy, as the openers
+                // of a TAP that is being closed get).
+                if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+                    return Err(busy(name));
+                }
+                fd
+            } else {
+                fd
+            }
+        } else {
+            open(flags)
+        };
         if fd < 0 {
             let err = io::Error::last_os_error();
             return Err(match err.raw_os_error() {
@@ -452,12 +483,7 @@ impl IfaceLock {
         if !capable(&st) {
             return Err(refuse(name, format_args!("{shown:?} is another's interface")));
         }
-        Ok(IfaceLock {
-            fd,
-            at: network,
-            path: c,
-            made: creator && st.st_mode & 0o200 != 0,
-        })
+        Ok(IfaceLock { fd, at: network, path: c, made })
     }
 }
 
@@ -466,9 +492,10 @@ impl IfaceLock {
 /// that a later opener finds no name left and never a half state: an
 /// opener that found the name before it went fails with `EBUSY` (the lock,
 /// then the identity check of [`IfaceLock::take`]), one after makes it
-/// anew. A running microVM's sandbox lets a creator remove only such files
-/// (`ext::sandbox` unlink_rule: `.lock` files in the network directory
-/// writable by their owner).
+/// anew. Only a file this open made is removed (`made`). A running
+/// microVM's sandbox lets a creator remove at most `.lock` files in the
+/// network directory writable by their owner (`ext::sandbox` unlink_rule),
+/// an outer bound: the decision is the O_EXCL create's.
 impl Drop for IfaceLock {
     fn drop(&mut self) {
         if !self.made {
@@ -1294,6 +1321,16 @@ fn open_endpoint(
 }
 
 impl Tap {
+    /// Whether this interface's lock file was made by its open (a test's
+    /// look at [`IfaceLock`]): `None` without one.
+    #[cfg(test)]
+    fn lock_made(&self) -> Option<bool> {
+        match &self.backend {
+            Backend::Endpoint(ep) => ep.lock.as_ref().map(|l| l.made),
+            Backend::Vmnet(_) => None,
+        }
+    }
+
     /// See [`TapDevice::open_named`].
     pub fn open_named(if_name: &str) -> Result<Tap, TapError> {
         let (name, backend) = match parse_name(if_name)? {
@@ -1848,7 +1885,9 @@ mod tests {
     #[ignore = "run by test_an_interface_held_is_busy_until_its_holder_goes in a separate process"]
     fn iface_holder_child() {
         let name = std::env::var("WICK_TEST_CASE").unwrap();
-        match tests_as::user(|| Tap::open_named(&name)) {
+        let open = || Tap::open_named(&name);
+        let got = if std::env::var("WICK_TEST_AS").as_deref() == Ok("creator") { open() } else { tests_as::user(open) };
+        match got {
             Ok(tap) => {
                 use std::io::Read;
                 println!("HELD");
@@ -2074,7 +2113,10 @@ mod tests {
     // gets the interface or EBUSY, never anything else, and never two hold
     // it at once, however the removal of the lock file a holder made falls
     // between another's open and its lock (the identity check of
-    // IfaceLock::take); nothing of the name is left after.
+    // IfaceLock::take). A creator whose file another opener locked first
+    // (xnu makes the file, then locks it) fails busy and the file is that
+    // opener's, which found it (not made): so after, no lock file is left,
+    // or one nobody holds, which the next creator opens and leaves.
     #[test]
     fn test_creators_racing_a_lock_files_removal_never_both_hold_it() {
         use std::sync::atomic::AtomicUsize;
@@ -2089,6 +2131,7 @@ mod tests {
                     for _ in 0..300 {
                         match Tap::open_named(&name) {
                             Ok(tap) => {
+                                assert!(tap.lock_made().is_some());
                                 assert_eq!(holders.fetch_add(1, Ordering::SeqCst), 0, "two holders");
                                 opened.fetch_add(1, Ordering::Relaxed);
                                 holders.fetch_sub(1, Ordering::SeqCst);
@@ -2104,8 +2147,68 @@ mod tests {
             }
         });
         assert!(opened.load(Ordering::Relaxed) > 0 && busy.load(Ordering::Relaxed) > 0);
-        assert!(!lock.exists());
         assert!(!instance_dir().join(&name).exists());
+        if lock.exists() {
+            let tap = Tap::open_named(&name).unwrap();
+            assert_eq!(tap.lock_made(), Some(false));
+            drop(tap);
+            assert!(lock.exists());
+            std::fs::remove_file(&lock).unwrap();
+        }
+    }
+
+    // A lock file that is there is not the creator's to remove, whatever its
+    // mode: an operator's made with `touch` (0644, writable by its owner)
+    // opens for anyone, root's Firecracker too, and stays when the device
+    // goes, so the next jail still finds the operator's interface.
+    #[test]
+    fn test_a_creator_leaves_an_operators_lock_file() {
+        let name = format!("fcol{}", std::process::id());
+        let (_switch, entry) = operator_entry(&name);
+        let lock = lock_file(&name, 0o644);
+        let tap = Tap::open_named(&name).unwrap();
+        assert_eq!(tap.lock_made(), Some(false));
+        drop(tap);
+        assert!(lock.exists());
+        tests_as::user(|| drop(Tap::open_named(&name).unwrap()));
+        std::fs::remove_file(&entry).unwrap();
+        std::fs::remove_file(&lock).unwrap();
+    }
+
+    // A killed creator leaves its lock file, as it leaves its endpoints:
+    // nobody's then, it stays; a user's open of the name is still refused
+    // (EPERM: no switch's socket), and the next creator opens it as it is
+    // and leaves it when its device goes.
+    #[test]
+    fn test_a_killed_creators_lock_file_stays_and_is_nobodys() {
+        use std::io::BufRead;
+        let name = format!("fckc{}", std::process::id());
+        let lock = user_endpoint_dir().unwrap().join(format!("{name}.lock"));
+        let _ = std::fs::remove_file(&lock);
+        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::macos::net::tests::iface_holder_child", "--ignored", "--nocapture"])
+            .env("WICK_TEST_CASE", &name)
+            .env("WICK_TEST_AS", "creator")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(holder.stdout.take().unwrap()).lines();
+        let held = lines.find(|l| l.as_ref().is_ok_and(|l| l.contains("HELD") || l.contains("FAILED")));
+        let held = held.unwrap().unwrap();
+        assert!(held.ends_with("HELD"), "{held}");
+        assert!(lock.exists());
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        assert!(lock.exists());
+        tests_as::user(|| refused(Tap::open_named(&name), &name));
+        let tap = Tap::open_named(&name).unwrap();
+        assert_eq!(tap.lock_made(), Some(false));
+        drop(tap);
+        assert!(lock.exists());
+        std::fs::remove_file(&lock).unwrap();
+        // The killed holder's endpoint, which it left.
+        let _ = std::fs::remove_file(instance_dir().join(&name));
     }
 
     // A path name is for an unjailed Firecracker: in a jail it is refused,

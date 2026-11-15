@@ -223,9 +223,11 @@ endpoint takes frames only from such sockets); the switch sends to `DIR/<id>/<na
 interface's lock file `DIR/<name>.lock`, a regular file (Firecracker opens no interface without one): Firecracker
 holds its lock while the interface is its, so a second Firecracker that opens the name gets "Resource busy", as
 Linux refuses the second open of a TAP in use. Its mode and owner say who may open the interface, as a TAP's owner
-and group do: mode 0444 for anyone, 0400 owned by the uid it is for (`ip tuntap add ... user`), 0040 with the
-group it is for (`group`), 0440 with both; keep it read-only (a lock file its owner may write is one root
-Firecracker made, and removes). `DIR` must be yours alone: the jailer refuses one the jail's uid owns or that your
+and group do: `install -m 0444 /dev/null DIR/<name>.lock` for anyone, `install -m 0400 -o <uid> /dev/null ...` for
+the uid it is for (`ip tuntap add ... user`), `install -m 0040 -g <group> /dev/null ...` for a group (`group`),
+`install -m 0440 -o <uid> -g <group> /dev/null ...` for both; any mode with the others-read bit (`touch`'s 0644
+too) is anyone's. Make it anew when your switch makes the interface (a root Firecracker killed while it held a
+name it made can leave one there). `DIR` must be yours alone: the jailer refuses one the jail's uid owns or that your
 group, others or another uid's ACL entry may write. Keep nothing in `DIR` but
 your switch's sockets: the jailer lets the jails' uids send to (write) what is made directly there. Jails given one `DIR` are in one
 network and reach each other only through your switch; give each jail a uid of its own.

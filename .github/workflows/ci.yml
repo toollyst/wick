@@ -594,11 +594,12 @@ jobs:
   # the script builds as the user and runs the vmnet stage alone through sudo
   # (root's python3, the system's 3.9 here), then gives its results back to
   # the user. macos-latest is macOS 26, where nothing asks for root, so this
-  # path runs here, on macOS 15. The runner has no Hypervisor.framework, so
-  # the stage itself fails (that is not what is checked): what is checked is
-  # that its root step ran (boot-test.py under sudo reached the stage), that
-  # its results are the user's, and that no root-owned file is left in the
-  # build directories or the source tree.
+  # path runs here, on macOS 15. The runner has no Hypervisor.framework
+  # (kern.hv_support 0), so the stage itself fails there, an expected and
+  # asserted outcome (were the framework there, the stage must pass); what
+  # the job is for is that the root step ran (boot-test.py under sudo
+  # reached the stage), that its results are the user's, and that no
+  # root-owned file is left in the build directories or the source tree.
   macos-15-root-vmnet:
     runs-on: macos-15
     timeout-minutes: 40
@@ -618,15 +619,25 @@ jobs:
           rc=$?
           set -e
           cat "$RUNNER_TEMP/vmnet.log"
-          if [ "$rc" = 0 ]; then
-            echo "the vmnet stage passed on a runner without Hypervisor.framework"
-            exit 1
-          fi
           grep -q "the vmnet stage runs as root on macOS 15" "$RUNNER_TEMP/vmnet.log"
           grep -q "^== vmnet" "$RUNNER_TEMP/vmnet.log"
           out=$(ls -dt build/boot-test/*/vmnet | head -1)
           cat "$out/summary.txt"
-          grep -q "^FAIL  vmnet: " "$out/summary.txt"
+          hv=$(sysctl -n kern.hv_support)
+          if [ "$hv" = 0 ]; then
+            # Expected: no Hypervisor.framework, so no VM and the stage fails.
+            echo "expected: the vmnet stage fails here, kern.hv_support $hv (no Hypervisor.framework on this runner)"
+            if [ "$rc" = 0 ] || ! grep -q "^FAIL  vmnet: " "$out/summary.txt"; then
+              echo "the vmnet stage did not fail as it must without Hypervisor.framework (exit $rc)"
+              exit 1
+            fi
+          else
+            # With the framework the stage must pass.
+            if [ "$rc" != 0 ] || ! grep -q "^PASS  vmnet: " "$out/summary.txt"; then
+              echo "the vmnet stage failed with Hypervisor.framework there (exit $rc)"
+              exit 1
+            fi
+          fi
           if [ -n "$(find "$out" ! -user "$(id -u)" -print)" ]; then
             echo "the root step's results are not the user's:"
             find "$out" ! -user "$(id -u)" -print

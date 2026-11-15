@@ -1043,9 +1043,13 @@ mod macos {
             ));
         }
         // A creator's interface lock files, which go with their devices
-        // (`platform::net`'s IfaceLock): the `.lock` files directly in the
+        // (`platform::net`'s IfaceLock). The product's own decision is the
+        // open's: a creator removes only a file its open made (O_CREAT|
+        // O_EXCL), never one that was there, whatever its mode
+        // (`test_a_creator_leaves_an_operators_lock_file`). This rule is the
+        // sandbox's outer bound around it: the `.lock` files directly in the
         // network directory that their owner may write (`file-mode`: every
-        // bit given set, measured), which the operator's never are.
+        // bit given set, measured), which a creator's are (0644).
         if crate::platform::net::may_create()
             && let Some(network) = lock_network(root, netns)?
         {

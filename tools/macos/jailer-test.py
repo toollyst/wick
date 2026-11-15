@@ -1217,9 +1217,9 @@ def stage_netns(ctx):
         made = os.lstat(os.path.join(net_a.path, "tapnobody.lock"))
         check(made.st_uid == 0 and made.st_mode & 0o200, f"uid 0's tapnobody.lock: {made}")
         vm.kill()
-        # A killed creator leaves its lock file, as it leaves its endpoints;
-        # the next creator of the name takes it and removes it when its
-        # device goes.
+        # A killed creator leaves its lock file, as it leaves its endpoints,
+        # and it is then nobody's: the next creator of the name opens it as
+        # it is and leaves it.
         jail = Jail(ctx, "netns-root2")
         vm = JailedVm(ctx, "netns-root2", jail, ["--netns", net_a.path], uid=0)
         vm.api("PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "tapnobody"}, expect=(204,))

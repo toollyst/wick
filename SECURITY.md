@@ -169,9 +169,11 @@ upstream Firecracker and its jailer.
   same user, which that user's unjailed VMM can already reach (it runs as the user). A jail without a network gets no
   such rule, and an endpoint at a path stays when its device goes.
   A Firecracker that may make an interface (root) may also remove the `.lock` files directly in the network directory
-  that their owner may write, the ones a creator makes (an operator's are read-only), so that a lock file it made goes
-  with its device; it removes only the one its lock is on, by its identity
-  (`test_the_creator_makes_a_name_nobody_made`, `test_a_jail_reaches_only_lock_files_in_its_network`).
+  that their owner may write, the sandbox's outer bound, so that a lock file it made goes with its device; it removes
+  only one its own open made (`O_CREAT|O_EXCL`), the one its lock is on, by its identity, never one that was there,
+  whatever its mode (`test_the_creator_makes_a_name_nobody_made`, `test_a_creator_leaves_an_operators_lock_file`,
+  `test_a_jail_reaches_only_lock_files_in_its_network`). A killed creator's lock file stays, nobody's, as its
+  endpoints do (`test_a_killed_creators_lock_file_stays_and_is_nobodys`).
 - **macOS jailer: a root supervisor per jail, for the freezer.** macOS has no cgroup freezer, so every jail gets a
   supervisor: a fork of the jailer made just before the exec, which stays root (`pid_suspend` needs root), in a
   session of its own, chrooted to `/var/empty`, with only its standard descriptors (standard error is
