@@ -806,6 +806,50 @@ mod tests {
         assert_eq!(unsafe { ptr::read_volatile(mem) }, 1);
     }
 
+    /// `MADV_FREE` (macOS's 5) of registered pages is served as Linux serves
+    /// it: v6.12 mm/madvise.c `madvise_vma_behavior` sends `case MADV_FREE:`
+    /// with `MADV_DONTNEED` to `madvise_dontneed_free`, which calls
+    /// `userfaultfd_remove(vma, start, end)` for both, so the handler gets a
+    /// REMOVE event for the range and the pages are missing afterwards.
+    #[test]
+    #[ignore = "fails until MADV_FREE of registered pages goes through discarding()"]
+    fn test_madv_free_of_registered_pages_posts_a_remove_event() {
+        let ps = page();
+        let uffd = UffdBuilder::new()
+            .non_blocking(true)
+            .require_features(FeatureFlags::EVENT_REMOVE)
+            .create()
+            .unwrap();
+        let mem = map(4 * ps);
+        uffd.register(mem.cast(), 4 * ps).unwrap();
+        let src = vec![1u8; 4 * ps];
+        // SAFETY: four registered pages.
+        unsafe { uffd.copy(src.as_ptr().cast(), mem.cast(), 4 * ps, true) }.unwrap();
+        // SAFETY: pages of the mapping above.
+        assert_eq!(
+            unsafe { libc::madvise(mem.add(ps).cast(), 2 * ps, libc::MADV_FREE) },
+            0
+        );
+        match uffd.read_event().unwrap() {
+            Some(Event::Remove { start, end }) => {
+                assert_eq!(start as usize, mem as usize + ps);
+                assert_eq!(end as usize, mem as usize + 3 * ps);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Missing again: a copy fills them (it fails with EEXIST on a
+        // present page).
+        let two = vec![2u8; 2 * ps];
+        // SAFETY: two registered pages.
+        let n = unsafe { uffd.copy(two.as_ptr().cast(), mem.add(ps).cast(), 2 * ps, true) };
+        assert_eq!(n.unwrap(), 2 * ps);
+        // SAFETY: present.
+        assert_eq!(unsafe { ptr::read_volatile(mem.add(ps)) }, 2);
+        // SAFETY: present, untouched by the madvise.
+        assert_eq!(unsafe { ptr::read_volatile(mem) }, 1);
+        uffd.unregister(mem.cast(), 4 * ps).unwrap();
+    }
+
     #[test]
     fn test_unsupported_feature_and_errors() {
         let e = UffdBuilder::new()

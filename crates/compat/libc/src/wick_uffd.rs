@@ -1851,19 +1851,19 @@ mod tests {
         -(e as i64)
     }
 
+    /// The variable that tells a test it runs in a process of its own.
+    const CHILD: &str = "WICK_UFFD_TEST_ALONE";
+
     /// Runs test `name` again in a process of its own (this binary, that
-    /// test only) and checks that it passed there; true in that process,
-    /// which goes on with the test.
-    fn in_own_process(name: &str) -> bool {
-        const CHILD: &str = "WICK_UFFD_TEST_ALONE";
-        if std::env::var_os(CHILD).is_some() {
-            return true;
-        }
+    /// test only, ignored or not), with `env` added: `Err` with its status
+    /// and output if it did not pass there.
+    fn run_alone(name: &str, env: &[(&str, &str)]) -> Result<(), std::string::String> {
         let child = {
             let _spawning = crate::timerfd::spawning();
             std::process::Command::new(std::env::current_exe().unwrap())
-                .args([name, "--exact", "--test-threads=1", "--nocapture"])
+                .args([name, "--exact", "--include-ignored", "--test-threads=1", "--nocapture"])
                 .env(CHILD, "1")
+                .envs(env.iter().copied())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -1876,7 +1876,22 @@ mod tests {
             std::string::String::from_utf8_lossy(&out.stdout),
             std::string::String::from_utf8_lossy(&out.stderr)
         );
-        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+        if out.status.success() && text.contains("1 passed") {
+            Ok(())
+        } else {
+            Err(text)
+        }
+    }
+
+    /// Runs test `name` again in a process of its own and checks that it
+    /// passed there; true in that process, which goes on with the test.
+    fn in_own_process(name: &str) -> bool {
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        if let Err(text) = run_alone(name, &[]) {
+            panic!("{text}");
+        }
         false
     }
 
@@ -2040,6 +2055,436 @@ mod tests {
         assert_eq!(zeropage(a, mem + ps, ps, true), Err((libc::ENOENT, 0)));
         register(a, next, ps).unwrap();
         close(&[ua, ub]);
+    }
+
+    /// How registered memory is replaced: unmapped and mapped again in the
+    /// hole, or mapped over with `MAP_FIXED`.
+    #[derive(Clone, Copy, Debug)]
+    enum Replace {
+        UnmapThenMap,
+        MapFixedOver,
+    }
+
+    /// Two pages registered with a fresh userfaultfd `a`, the first filled
+    /// (`0x5a`), then replaced by new memory at the same addresses, as
+    /// [`Replace`] says, through the compatibility calls. Linux's registration
+    /// belongs to the vma (`vm_userfaultfd_ctx`) and goes with it: munmap
+    /// removes the vma (mm/vma.c, v6.12, `do_vmi_align_munmap` :1332, through
+    /// `vms_gather_munmap_vmas` :1180, which calls fs/userfaultfd.c
+    /// `userfaultfd_unmap_prep` at :1267), and `MAP_FIXED` unmaps what it
+    /// maps over first (mm/mmap.c, v6.12, `__mmap_region` :1361, the same
+    /// `vms_gather_munmap_vmas` at :1386), so the new memory is not
+    /// registered. Run in a process of its own, as the holes test:
+    /// nothing else may map in the hole. Returns (a, its user end, b, its
+    /// user end, a's channel, the memory).
+    fn replaced(how: Replace) -> (usize, c_int, usize, c_int, c_int, u64) {
+        let (a, ua) = create(0, false, true).unwrap();
+        let (b, ub) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(2);
+        let chan = channel(ua);
+        let data = std::vec![0x5au8; ps as usize];
+        register(a, mem, 2 * ps).unwrap();
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        // SAFETY: the test's own mapping, replaced at the same addresses;
+        // nothing else maps in this process meanwhile.
+        unsafe {
+            if let Replace::UnmapThenMap = how {
+                assert_eq!(crate::linux_items::munmap(mem as *mut _, (2 * ps) as usize), 0);
+            }
+            let p = crate::linux_items::mmap(
+                mem as *mut _,
+                (2 * ps) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            );
+            assert_eq!(p as u64, mem, "{how:?}");
+        }
+        (a, ua, b, ub, chan, mem)
+    }
+
+    const REPLACES: [Replace; 2] = [Replace::UnmapThenMap, Replace::MapFixedOver];
+
+    /// The cases of [`REPLACES`] test `name` runs here. In the test's own
+    /// process: none; each case runs in a process of its own (nothing else
+    /// may map in the hole), all of them, and the test fails naming every
+    /// case that failed, with its output. In a case's process: that case.
+    fn replace_cases(name: &str) -> Vec<Replace> {
+        const CASE: &str = "WICK_UFFD_REPLACE";
+        if let Some(case) = std::env::var_os(CASE) {
+            return REPLACES.into_iter().filter(|how| case.to_str() == Some(std::format!("{how:?}").as_str())).collect();
+        }
+        let failed: Vec<std::string::String> = REPLACES
+            .iter()
+            .filter_map(|how| {
+                let case = std::format!("{how:?}");
+                run_alone(name, &[(CASE, &case)]).err().map(|text| std::format!("{case}: {text}"))
+            })
+            .collect();
+        assert!(failed.is_empty(), "{} of {} cases failed:\n{}", failed.len(), REPLACES.len(), failed.join("\n"));
+        Vec::new()
+    }
+
+    /// The new memory is in no registration: not missing, and a fill there
+    /// is `ENOENT`, as Linux's for a destination in no registered vma
+    /// (mm/userfaultfd.c, v6.12: `mfill_atomic` :700 takes the vma with
+    /// `uffd_mfill_lock` :733, which is `ENOENT` at :113 when
+    /// `validate_dst_vma` finds no userfaultfd on it, :34).
+    #[test]
+    #[ignore = "fails until munmap and MAP_FIXED over registered memory remove its registration"]
+    fn test_memory_replaced_while_registered_is_in_no_registration() {
+        let ps = page_size();
+        for how in replace_cases("wick_uffd::tests::test_memory_replaced_while_registered_is_in_no_registration") {
+            let (a, ua, _b, ub, chan, mem) = replaced(how);
+            assert!(!is_missing(mem) && !is_missing(mem + ps), "{how:?}: the new memory is registered");
+            assert_eq!(zeropage(a, mem + ps, ps, true), Err((libc::ENOENT, 0)), "{how:?}");
+            close(&[chan, ua, ub]);
+        }
+    }
+
+    /// The new memory registers anew, with the same userfaultfd or another:
+    /// Linux's new vma has no userfaultfd (mm/mmap.c, v6.12, `__mmap_region`
+    /// takes the old vmas out at :1386 and makes a new one with
+    /// `vm_area_alloc` at :1435), and `userfaultfd_register` refuses only a
+    /// vma another userfaultfd has (fs/userfaultfd.c, v6.12, :1363 to :1366).
+    #[test]
+    #[ignore = "fails until munmap and MAP_FIXED over registered memory remove its registration"]
+    fn test_memory_replaced_while_registered_registers_anew() {
+        let ps = page_size();
+        let data = std::vec![0x5au8; ps as usize];
+        for how in replace_cases("wick_uffd::tests::test_memory_replaced_while_registered_registers_anew") {
+            // Its userfaultfd again: both pages are missing, and a fill lands
+            // in the new memory, not in the pages the old one had.
+            let (a, ua, _b, ub, chan, mem) = replaced(how);
+            register(a, mem, 2 * ps).unwrap();
+            assert!(is_missing(mem) && is_missing(mem + ps), "{how:?}: the new pages are not missing");
+            // SAFETY: `data` holds a page.
+            assert_eq!(unsafe { copy(a, data.as_ptr(), mem + ps, ps, true) }, Ok(ps), "{how:?}");
+            // SAFETY: filled just now, in the new memory.
+            let got = unsafe { ptr::read_volatile((mem + ps) as *const u8) };
+            assert_eq!(got, 0x5a, "{how:?}: the fill did not reach the new memory");
+            assert_eq!(unregister(a, mem, 2 * ps), Ok(()));
+            close(&[chan, ua, ub]);
+            // Another userfaultfd: Linux registers the new memory.
+            let (_a, ua, b, ub, chan, mem) = replaced(how);
+            register(b, mem, 2 * ps).unwrap_or_else(|e| panic!("{how:?}: another userfaultfd's register: {e}"));
+            assert!(is_missing(mem) && is_missing(mem + ps), "{how:?}");
+            assert_eq!(unregister(b, mem, 2 * ps), Ok(()));
+            close(&[chan, ua, ub]);
+        }
+    }
+
+    /// A discard of the new memory is an ordinary one: its pages hold zeros
+    /// and stay accessible, as Linux's `MADV_DONTNEED` of memory no
+    /// userfaultfd has (mm/madvise.c, v6.12: `madvise_dontneed_free` :880
+    /// goes on past `userfaultfd_remove` :894, which returns true for a vma
+    /// with no userfaultfd, fs/userfaultfd.c :777 to :779, and
+    /// `madvise_dontneed_single_vma` zaps the pages, :846). It must not take
+    /// the replaced range's slot for it.
+    #[test]
+    #[ignore = "fails until munmap and MAP_FIXED over registered memory remove its registration"]
+    fn test_a_discard_of_memory_replaced_while_registered_is_ordinary() {
+        let ps = page_size();
+        for how in replace_cases("wick_uffd::tests::test_a_discard_of_memory_replaced_while_registered_is_ordinary") {
+            let (_a, ua, _b, ub, chan, mem) = replaced(how);
+            // SAFETY: the new memory, read and writable.
+            unsafe { ptr::write_volatile(mem as *mut u8, 7) };
+            // SAFETY: the new memory.
+            let r = unsafe { crate::linux_items::madvise(mem as *mut _, (2 * ps) as usize, libc::MADV_DONTNEED) };
+            assert_eq!(r, 0);
+            assert!(!is_missing(mem) && !is_missing(mem + ps), "{how:?}: the discard made the new memory missing");
+            // SAFETY: not missing, so accessible.
+            assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0, "{how:?}");
+            close(&[chan, ua, ub]);
+        }
+    }
+
+    /// A mapping made where registered memory was unmapped, before its
+    /// userfaultfd is released, keeps its protection through the release.
+    /// Firecracker unmaps its guest memory that way at teardown: the guest
+    /// regions' drop (lib/firecracker/src/vmm/src/vstate/memory.rs:308) runs
+    /// when `VmCommon` drops `guest_memory` (vstate/vm.rs:84), before its
+    /// `uffd` (:95), and another thread may map the hole meanwhile (a new
+    /// thread's stack guard, a `PROT_NONE` reservation). On Linux the
+    /// registration goes with the unmapped vma (mm/vma.c
+    /// `do_vmi_align_munmap` :1332), and the release walks only the vmas
+    /// this userfaultfd has (mm/userfaultfd.c, v6.12,
+    /// `userfaultfd_release_all` :1918 to :1924: a vma of another context, or
+    /// none, is skipped), changing no protection, so the new mapping is left
+    /// as it was. In a process of its own, as the holes test: another test's
+    /// thread could map into the hole before the `MAP_FIXED`, which would
+    /// then replace that memory; and the hole is made only once the serving
+    /// thread has answered a request, its start's mappings made.
+    #[test]
+    #[ignore = "fails until munmap and MAP_FIXED over registered memory remove its registration"]
+    fn test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is() {
+        if !in_own_process("wick_uffd::tests::test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is") {
+            return;
+        }
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(2);
+        register(ctx, mem, 2 * ps).unwrap();
+        assert!(is_missing(mem) && is_missing(mem + ps));
+        let chan = channel(user);
+        // SAFETY: the test's own mapping, unmapped by this libc's munmap as
+        // Firecracker's drop unmaps it, then a reservation in its place, made
+        // by the system's call as a thread's stack guard is.
+        unsafe {
+            assert_eq!(crate::linux_items::munmap(mem as *mut _, (2 * ps) as usize), 0);
+            let p = libc::mmap(
+                mem as *mut _,
+                (2 * ps) as usize,
+                libc::PROT_NONE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_eq!(p as u64, mem);
+        }
+        close(&[chan, user]);
+        // The release is the serving thread's, once it sees the close.
+        let until = Instant::now() + Duration::from_secs(10);
+        while slots(mem, mem + 2 * ps).next().is_some() {
+            assert!(Instant::now() < until, "the userfaultfd was not released in 10 s");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let prot = (prot_of(mem), prot_of(mem + ps));
+        // SAFETY: the reservation made above.
+        unsafe { libc::munmap(mem as *mut _, (2 * ps) as usize) };
+        assert_eq!(prot, (libc::PROT_NONE, libc::PROT_NONE), "the release changed the new mapping's protection");
+    }
+
+    /// The current protection of the page at `addr` (`PROT_*` bits).
+    fn prot_of(addr: u64) -> c_int {
+        const VM_REGION_BASIC_INFO_64: c_int = 9;
+        let (mut at, mut size, mut object) = (addr, 0u64, 0);
+        let mut info = [0 as c_int; 16];
+        let mut count = 9u32;
+        // SAFETY: valid output buffers, as `mapped_entries`.
+        let kr = unsafe {
+            mach_vm_region(
+                mach_task_self_,
+                &mut at,
+                &mut size,
+                VM_REGION_BASIC_INFO_64,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut object,
+            )
+        };
+        assert!(kr == 0 && at <= addr && addr < at + size, "no entry at {addr:#x}");
+        info[0] & (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC)
+    }
+
+    const RW: c_int = libc::PROT_READ | libc::PROT_WRITE;
+
+    fn mprotect(addr: u64, len: u64, prot: c_int) {
+        // SAFETY: the test's own mapping.
+        assert_eq!(unsafe { crate::linux_items::mprotect(addr as *mut _, len as usize, prot) }, 0);
+    }
+
+    /// As Linux, where mprotect leaves a userfaultfd registration as it is
+    /// (mm/mprotect.c changes the vma's protection, not `vm_userfaultfd_ctx`)
+    /// and an access its protection allows to a missing page faults to the
+    /// userfaultfd:
+    /// a virtio-mem slot unplugged (`PROT_NONE`) and plugged (`PROT_READ |
+    /// PROT_WRITE`) after a restore from a userfaultfd (vstate/memory.rs
+    /// `protect`; persist.rs `guest_memory_from_uffd` registers every region,
+    /// the hotplug one too) keeps its missing pages missing: inaccessible to
+    /// the host, so the VMM's own access faults to the handler, where before
+    /// it read zeros and a later copy overwrote what it wrote.
+    #[test]
+    #[ignore = "fails until mprotect of registered memory keeps missing pages missing"]
+    fn test_mprotect_of_registered_missing_pages_keeps_them_missing() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(2);
+        let data = std::vec![0x5au8; ps as usize];
+        register(a, mem, 2 * ps).unwrap();
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        mprotect(mem, 2 * ps, libc::PROT_NONE);
+        mprotect(mem, 2 * ps, RW);
+        assert!(is_missing(mem + ps));
+        assert_eq!(prot_of(mem + ps) & RW, 0, "mprotect made a missing page accessible");
+        // The filled page has what was asked.
+        assert_eq!(prot_of(mem) & RW, RW);
+        // SAFETY: filled and readable.
+        assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0x5a);
+        assert_eq!(unregister(a, mem, 2 * ps), Ok(()));
+        close(&[ua]);
+    }
+
+    /// Reads the next event from the userfaultfd's user end `user` and fills
+    /// the page it names with `fill`; returns the event.
+    fn serve_one(user: c_int, ctx: usize, fill: u8) -> [u64; 4] {
+        let mut event = [0u8; proto::RECORD];
+        assert!(read_full(user, &mut event), "the userfaultfd closed");
+        let w = words(&event);
+        let ps = page_size();
+        let page = std::vec![fill; ps as usize];
+        // SAFETY: `page` holds a page.
+        assert_eq!(unsafe { copy(ctx, page.as_ptr(), w[1] - w[1] % ps, ps, true) }, Ok(ps));
+        w
+    }
+
+    /// Firecracker's memory hotplug after a restore from a userfaultfd, in
+    /// the compatibility calls it makes: the whole region registered
+    /// (persist.rs `guest_memory_from_uffd`), an unplugged slot made
+    /// `PROT_NONE` (vm.rs `register_memory_region`, `slot.protect(true)`), a
+    /// plugged page read through the handler, the slot plugged
+    /// (`protect(false)`) and read through the handler, then unplugged again
+    /// (discarded, `MADV_DONTNEED`, with its remove event, and `PROT_NONE`),
+    /// its pages missing again, and plugged again. The name and the steps
+    /// are the Windows backend's test of the same path. Before each read the
+    /// page must be missing and inaccessible, so a page a call opened fails
+    /// here rather than reading zeros with no event to serve.
+    #[test]
+    #[ignore = "fails until mprotect of registered memory keeps missing pages missing"]
+    fn test_plug_after_a_uffd_restore() {
+        let (ctx, user) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let ps = page_size();
+        let slot_len = 4 * ps;
+        let mem = map(8);
+        register(ctx, mem, 2 * slot_len).unwrap();
+        let unplugged = mem + slot_len;
+        mprotect(unplugged, slot_len, libc::PROT_NONE);
+        let read_through_the_handler = |addr: u64, fill: u8| {
+            assert!(is_missing(addr), "{addr:#x} is not missing");
+            assert_eq!(prot_of(addr) & RW, 0, "{addr:#x} is missing but accessible: a read would see zeros");
+            let reader = std::thread::spawn(move || {
+                // SAFETY: registered memory; the read waits for the fill.
+                unsafe { ptr::read_volatile(addr as *const u8) }
+            });
+            let event = serve_one(user, ctx, fill);
+            assert_eq!((event[0], event[1]), (proto::EVENT_PAGEFAULT, addr));
+            assert_eq!(reader.join().unwrap(), fill);
+        };
+        read_through_the_handler(mem + 3 * ps, 0x61);
+        mprotect(unplugged, slot_len, RW);
+        read_through_the_handler(unplugged + 3 * ps, 0x62);
+        // Unplug: discarded, then closed; its pages missing again.
+        // SAFETY: registered memory of the test's.
+        let r = unsafe { crate::linux_items::madvise(unplugged as *mut _, slot_len as usize, libc::MADV_DONTNEED) };
+        assert_eq!(r, 0);
+        let mut removed = [0u8; proto::RECORD];
+        assert!(read_full(user, &mut removed));
+        assert_eq!(words(&removed)[..3], [proto::EVENT_REMOVE, unplugged, unplugged + slot_len]);
+        mprotect(unplugged, slot_len, libc::PROT_NONE);
+        assert!(is_missing(unplugged + 3 * ps));
+        // Plugged again: a fault to the handler again.
+        mprotect(unplugged, slot_len, RW);
+        read_through_the_handler(unplugged + 3 * ps, 0x63);
+        assert_eq!(unregister(ctx, mem, 2 * slot_len), Ok(()));
+        close(&[user]);
+    }
+
+    /// A filled page made inaccessible and accessible again is not missing:
+    /// its data stays, as on Linux.
+    #[test]
+    fn test_mprotect_of_a_filled_page_does_not_make_it_missing() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(1);
+        let data = std::vec![0x5au8; ps as usize];
+        register(a, mem, ps).unwrap();
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        mprotect(mem, ps, libc::PROT_NONE);
+        assert!(!is_missing(mem));
+        mprotect(mem, ps, RW);
+        assert!(!is_missing(mem));
+        // SAFETY: filled and readable.
+        assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0x5a);
+        assert_eq!(unregister(a, mem, ps), Ok(()));
+        close(&[ua]);
+    }
+
+    /// The protection asked of a missing page is the one it has once filled:
+    /// by a copy, by a zero page, and after a discard made it missing again
+    /// and a copy filled it, as Linux's pages take their vma's protection.
+    #[test]
+    #[ignore = "fails until mprotect of registered memory keeps missing pages missing"]
+    fn test_a_filled_page_takes_the_protection_asked_while_it_was_missing() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(2);
+        let data = std::vec![0x5au8; ps as usize];
+        register(a, mem, 2 * ps).unwrap();
+        mprotect(mem, 2 * ps, libc::PROT_READ);
+        assert_eq!(prot_of(mem) & RW, 0, "a missing page became accessible");
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        assert_eq!(prot_of(mem) & RW, libc::PROT_READ, "copy");
+        assert_eq!(zeropage(a, mem + ps, ps, true), Ok(ps));
+        assert_eq!(prot_of(mem + ps) & RW, libc::PROT_READ, "zeropage");
+        // SAFETY: the test's mapping.
+        let r = unsafe { crate::linux_items::madvise(mem as *mut _, ps as usize, libc::MADV_DONTNEED) };
+        assert_eq!(r, 0);
+        assert!(is_missing(mem));
+        assert_eq!(prot_of(mem) & RW, 0);
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        assert_eq!(prot_of(mem) & RW, libc::PROT_READ, "copy after a discard");
+        assert_eq!(unregister(a, mem, 2 * ps), Ok(()));
+        close(&[ua]);
+    }
+
+    /// Unregistered, a missing page gets the protection asked of it, as a
+    /// Linux page has its vma's once no userfaultfd has it.
+    #[test]
+    #[ignore = "fails until mprotect of registered memory keeps missing pages missing"]
+    fn test_an_unregistered_page_takes_the_protection_asked_while_it_was_missing() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(1);
+        register(a, mem, ps).unwrap();
+        mprotect(mem, ps, libc::PROT_READ);
+        assert_eq!(unregister(a, mem, ps), Ok(()));
+        assert_eq!(prot_of(mem) & RW, libc::PROT_READ);
+        close(&[ua]);
+    }
+
+    /// `MADV_FREE` of registered pages makes them missing, as Linux's does once
+    /// it frees them (mm/madvise.c `madvise_free_single_vma`: a freed page's
+    /// entry is cleared, and the next access faults to the userfaultfd);
+    /// freeing at once is one of the outcomes Linux allows. Passed to macOS
+    /// as it is, its `MADV_FREE` (5) frees lazily and the page reads zeros
+    /// later with no fault.
+    #[test]
+    #[ignore = "fails until MADV_FREE of registered pages goes through discarding()"]
+    fn test_madv_free_of_registered_pages_makes_them_missing() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(1);
+        let data = std::vec![0x5au8; ps as usize];
+        register(a, mem, ps).unwrap();
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        // SAFETY: the test's mapping.
+        let r = unsafe { crate::linux_items::madvise(mem as *mut _, ps as usize, libc::MADV_FREE) };
+        assert_eq!(r, 0);
+        assert!(is_missing(mem), "MADV_FREE left a registered page present");
+        assert_eq!(unregister(a, mem, ps), Ok(()));
+        close(&[ua]);
+    }
+
+    /// An unregister of part of a range leaves the rest registered.
+    #[test]
+    fn test_a_partial_unregister_keeps_the_rest_registered() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(3);
+        register(a, mem, 3 * ps).unwrap();
+        assert_eq!(unregister(a, mem + ps, ps), Ok(()));
+        assert!(is_missing(mem) && !is_missing(mem + ps) && is_missing(mem + 2 * ps));
+        assert_eq!(zeropage(a, mem + 2 * ps, ps, true), Ok(ps));
+        assert_eq!(unregister(a, mem, 3 * ps), Ok(()));
+        close(&[ua]);
     }
 
     /// Not Linux's: a private file mapping is registered, where Linux's

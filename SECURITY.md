@@ -522,6 +522,25 @@ upstream Firecracker and its jailer.
   jail that can make pipes could, once the first reader has gone, take the log or metrics another jail of the same
   user wrote meanwhile (up to 64 KiB), if it knows the name. Run each jail's pipes under names the others cannot
   guess, or run tenants under different accounts.
+- **macOS: userfaultfd memory calls not yet as Linux's; fix in progress.** On memory a userfaultfd has registered
+  (`mem_backend` `Uffd`), `mprotect` makes missing pages accessible: a virtio-mem slot plugged after such a restore
+  lets the VMM's own accesses (its device emulation) read zeros the handler never filled, and a later fill overwrite
+  what the VMM wrote; the guest's own accesses still go to the handler, as only a fill maps a page into stage 2
+  (`libc::wick_guest`). The effect is on the integrity of guest data in plugged memory, not on the host's isolation.
+  `MADV_FREE` of registered pages posts no remove event, and memory mapped over registered memory stays in its
+  registration. Firecracker uses no `MADV_FREE` and maps nothing over registered memory; it unmaps registered guest
+  memory only when the VM is torn down, while the VM's userfaultfd is still open (the guest regions' drop,
+  lib/firecracker/src/vmm/src/vstate/memory.rs:308, `guest_memory` dropped before `uffd`, vstate/vm.rs:84 and :95);
+  the guest's paths (`libc::wick_guest`, the HVF backend) reach neither; as read from the code. Until that userfaultfd
+  is released the unmapped range stays registered, and its release then makes the range's old missing pages read-write
+  on whatever is mapped there by then in the same process, such as another thread's new stack guard or a `PROT_NONE`
+  reservation (measured: a `PROT_NONE` mapping made in the hole was read-write after the release,
+  `test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is`, ignored until the munmap fix); the
+  window is from `guest_memory`'s drop to `uffd`'s (vstate/vm.rs:84 to :95), or longer while something else holds the
+  userfaultfd, such as the handler. Each has its test, ignored until its fix (docs/ARCHITECTURE.md, "Memory calls on
+  registered memory": `test_plug_after_a_uffd_restore`, `test_madv_free_of_registered_pages_makes_them_missing`,
+  `test_memory_replaced_while_registered_is_in_no_registration`,
+  `test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is`).
 - **macOS: a call Firecracker's own sandbox denies ends it by SIGKILL, not exit 148.** On Linux the seccomp trap's
   SIGSYS runs upstream's handler, which logs the bad system call, counts `seccomp.num_faults` and exits 148.
   Seatbelt has no action that traps the calling thread, and a signal the process can catch let the denying thread
