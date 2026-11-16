@@ -27,6 +27,7 @@ Each package's output is kept in DIR (default: a temporary directory) as
 """
 
 import argparse
+import importlib.util
 import os
 import pathlib
 import re
@@ -62,7 +63,16 @@ STARTED = re.compile(r"^test (.+?) \.\.\. (?!ok\b|FAILED\b|ignored\b)")
 DIED = re.compile(r"process didn't exit successfully: .*\((exit code: [^)]*|signal: [^)]*)\)")
 # cargo's line before each test binary's output.
 SECTION = re.compile(r"^\s+(Running|Doc-tests) ")
-SUMMARY = re.compile(r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;")
+
+
+def reader():
+    """tools/libtest-results.py, the one reader of a test binary's results
+    (as tools/linux/compare-unit-tests.py and tools/macos/check-unit-tests.py
+    load it)."""
+    spec = importlib.util.spec_from_file_location("libtest_results", ROOT / "tools" / "libtest-results.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def results_of(output):
@@ -75,15 +85,16 @@ def results_of(output):
     in CI run 43881982686 the child's "test ...::api_process_child ... ok"
     came after the parent's "... ignored" line for that name, and the
     parent's own result for the test that ran the child, which libtest
-    writes after "... ", was in no line. So, in each binary's section: the
-    first result of a name is the parent's (a child's comes after the
-    parent began); a name in the parent's list of failures, the one just
-    before its "test result:" line, failed, whatever line said otherwise; a
-    test the parent began with no result of its own passed, when that and
-    the rest add up to the counts of the parent's "test result:" line. If
-    they do not, the section is named: its results cannot be told from
-    what was written.
+    writes after "... ", was in no line. So each binary's section (cargo's
+    "Running" or "Doc-tests" line) is read as its own process gave it, by
+    libtest-results.py's `section_results` (the first result of a name is
+    the parent's, a name in the parent's failures list failed, a test begun
+    with no result of its own passed if that adds up to the parent's "test
+    result:" counts); a section whose lines do not add up is named, its
+    tests begun with no result left with none. A name in two binaries of a
+    package: a failure in either is the test's result.
     """
+    section_results = reader().section_results
     results = {}
     unknown = []
     sections = [[]]
@@ -92,45 +103,11 @@ def results_of(output):
             sections.append([])
         sections[-1].append(line)
     for lines in sections:
-        found = {}
-        begun = []
-        for line in lines:
-            m = RESULT.match(line)
-            if m:
-                found.setdefault(m.group(1).removesuffix(" - should panic"), m.group(2))
-                continue
-            m = STARTED.match(line)
-            if m:
-                begun.append(m.group(1).removesuffix(" - should panic"))
-        last = max((i for i, line in enumerate(lines) if SUMMARY.match(line)), default=None)
-        if last is not None:
-            # The parent's failures: "failures:", then one indented name a
-            # line, then a blank line, just before its summary.
-            names = []
-            i = last - 1
-            while i >= 0 and not lines[i].strip():
-                i -= 1
-            while i >= 0 and lines[i].startswith("    ") and lines[i].strip():
-                names.append(lines[i].strip())
-                i -= 1
-            if i >= 0 and lines[i].strip() == "failures:":
-                for name in names:
-                    found[name] = "FAILED"
-            for name in begun:
-                found.setdefault(name, "ok")
-            passed, failed, ignored = (int(x) for x in SUMMARY.match(lines[last]).groups())
-            n = {"ok": 0, "FAILED": 0, "ignored": 0}
-            for r in found.values():
-                n[r] += 1
-            if (n["ok"], n["FAILED"], n["ignored"]) != (passed, failed, ignored):
-                head = next((line.strip() for line in lines if SECTION.match(line)), "the first test binary")
-                unknown.append(
-                    f"{head}: libtest counted {passed} passed, {failed} failed, {ignored} ignored, "
-                    f"its lines {n['ok']}, {n['FAILED']}, {n['ignored']}"
-                )
+        found, _, problem = section_results(lines)
+        if problem:
+            head = next((line.strip() for line in lines if SECTION.match(line)), "the first test binary")
+            unknown.append(f"{head}: {problem}")
         for name, r in found.items():
-            # The same name in two test binaries of a package: a failure
-            # in either is the test's result.
             if results.get(name) != "FAILED":
                 results[name] = r
     return results, unknown
