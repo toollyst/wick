@@ -78,6 +78,7 @@ The same as upstream Firecracker's
 | Jailer: uid/gid | upstream | **in place:** dropped right after the chroot, checked that root cannot be regained (`jailer-test jail`, `test_enter_needs_root`) | **in place:** a restricted token below medium integrity, without the user's SID and with a random SID per jail: no access to the user's files, another jail, or other processes, and, since the jail's integrity level is above low, no access from a plain low-integrity process of the same user either (`jailer-test.ps1 isolation`, `low`); no privilege but traversal (`test_tokens_keep_only_traversal`): below medium integrity no privilege can be enabled, "Lock pages in memory" included, so a jailed Firecracker cannot map large pages itself; the jailer makes them for it, as sections no larger in all than `hugetlb.2MB.max` (`jailer-test.ps1 hugepages`, docs/PORTING.md row 10) |
 | Jailer: PID namespace | upstream | in place in every jail: the sandbox keeps every other process out of Firecracker's reach (no process information, no signal); `--new-pid-ns` gives upstream's process tree and drops the signals a namespace's init does not get from outside; the pid is the host's (`test_no_other_process_in_reach`, `jailer-test pidns`) | **in place** in every jail: no process or thread outside the jail opens to Firecracker, a process snapshot shows it none, and it is not on the jailer's console (no console control events or typed input; the jailer relays the console); `--new-pid-ns` returns as upstream's jailer does. Whether a pid is in use still shows (`jailer-test.ps1 pidns`) |
 | Jailer: cgroups (memory, CPU) | upstream | memory **in place** (jetsam limit, killed at the limit as by the OOM killer); CPU **in place** (`cpu.max` / `cpu.cfs_quota_us` → a kernel CPU limit on the whole VMM, throttled once it used its share of each second); `cpuset` naming every CPU and memory node accepted (no restriction), as is a limit macOS does not have set to no limit (`pids.max=max`, `memory.high=max`, ...); the freezer through upstream's files next to the jail, kept by a root supervisor per jail (below); other controllers, and those limits with a number, refused, each with its reason (`jailer-test limits`, `jailer-test memory`, `jailer-test cpu`, `jailer-test freeze`, `test_cpu_limit_holds`, `test_other_controllers_are_refused`, `test_no_limit_values_are_accepted`, `test_only_no_limit_is_accepted_of_a_limit_macos_lacks`) | CPU **in place** through a Job Object (CPU rate hard cap from Firecracker's start or a CPU weight); memory **in place, with a window**: the Job Object's memory limit holds private memory, and the jailer counts sections every 1 ms and ends the jail with 137 past the limit (see below; `jailer-test.ps1 sections`, passed in CI run 43545368906, 305a806, and each saved run since, and on the PC at 305a806 and df0bf87); `cpuset.cpus` as the job's affinity; the freezer through upstream's files next to the jail, kept by the jailer, which freezes the job (below); other controllers refused with the reason (`jailer-test.ps1 limits`, `jailer-test.ps1 cpu`, `jailer-test.ps1 cpuset`, `jailer-test.ps1 weight`, `jailer-test.ps1 refuse`, `jailer-test.ps1 freeze`) |
+| Heap allocator | musl's mallocng (upstream's release is built for `*-unknown-linux-musl`): no type isolation | libmalloc with `MallocMaxMagazines=1` and `MallocSpaceEfficient=1`, the jailer's environment or Firecracker's own start again before `main`; on macOS 27 (xzone) one pointer bucket instead of four, so not weaker than Linux and weaker than macOS's default (below, Heap) | the process heap, unchanged |
 
 The sandbox is installed where upstream installs its seccomp filters and keeps upstream's flags: on by default, off
 with `--no-seccomp`. On macOS a process may lift its own CPU limit and the allow-list is what denies that, so a
@@ -131,6 +132,43 @@ is a denial in every profile (`test_an_exception_message_of_its_own_does_nothing
 in each profile (`test_a_fault_is_its_signal_under_each_profile`). On macOS 15.8.2 both tests, and the fault and
 trap cases of `test_the_other_ends_are_unchanged_without_a_denied_call`, pass with the allowance (CI run 43403250054,
 job `macos-seatbelt (macos-15)`, at 2ef0ff6), where those cases had ended 148 without it (run 43396747298).
+
+### Heap
+
+Firecracker's release on Linux is built against musl (`*-unknown-linux-musl`), whose allocator, mallocng, has no
+type isolation: allocations of one size class share the same groups, whatever they hold. On macOS Firecracker runs
+libmalloc with `MallocMaxMagazines=1` and `MallocSpaceEfficient=1` (`vmm::ext::malloc_config`), which upstream's
+5 MiB budget for the VMM's own memory needs (docs/COMPATIBILITY.md, VMM memory besides the guest). libmalloc reads
+both from the environment once, as libSystem starts and before any of the program's code (`_malloc_initialize`,
+libmalloc-812 malloc.c), and no entitlement or API lets a program choose them otherwise. So the jailer puts them in
+the environment it execs Firecracker with, and Firecracker launched without them starts again with them: an
+initializer of the binary, before `main`, with no thread and no descriptor of its own, execs its own executable
+(`proc_pidpath`) with the same arguments and the two variables added. A variable set to another value is refused,
+naming the value needed (exit 152, upstream's bad-configuration code), and a failed exec ends Firecracker with its
+error: it never runs without them. Anyone who could replace the executable between the two starts could already
+replace it before the first; a jailed Firecracker, which runs a root-owned copy, never starts again.
+
+What it gives up, on libmalloc-812 (macOS 27), which runs its xzone allocator by default on Apple silicon
+(malloc_config.c, `_malloc_should_enable_xzone`): `MallocMaxMagazines=1` also makes the pointer buckets one instead
+of four (xzone_malloc.c, `override_ptr_bucket_count`). xzone picks the bucket of an allocation that carries no type
+by a hash of its call site (malloc_type_internal.h, `malloc_callsite_fallback_type_descriptor`), and Rust's carry
+none: the release binary calls `malloc` from 1102 places in 442 functions (Rust's allocator inlined, or
+`__rust_alloc`, which tail-calls it, and the C code linked in; `objdump -d` of the binary at this commit). With four
+buckets the objects of those call sites and libSystem's own allocations are spread over four sets of chunks that
+never share memory; with one they share one. A use-after-free in the VMM can then reach an object from any call
+site of its size class, as on Linux it can. This is weaker than
+macOS's default for a process and not weaker than Firecracker on Linux. The rest of xzone is kept; what
+`MallocSpaceEfficient=1` changes is how much freed memory it keeps (no deferred reclaim, no huge cache, segments
+given back: libmalloc's own report of its configuration, `MallocReportConfig`). libmalloc-657 and -792 (macOS 15
+and 26) run the magazine allocator, which has no buckets; there the two variables only make one magazine and give
+freed memory back (`Max Magazines: 1`, `Aggressive Madvise: 1` in the same report).
+
+The configuration is checked on each launch: libmalloc's report on a direct launch, without the variables (two
+reports, the second with them) and with them (one) (`test_a_direct_launch_starts_again_with_libmallocs_configuration`,
+`test_a_launch_with_the_configuration_runs_without_starting_again`), another value refused before any of
+Firecracker's code runs (`test_another_value_is_refused`, `ext::malloc_config` unit tests), the jailer's environment
+(`test_firecracker_gets_libmallocs_configuration_from_the_jailer`) and the jailed Firecracker's own (`jailer-test
+jail`).
 
 Every planned mechanism above has been measured on its host with a probe
 ([`tools/windows/winprobe.c`](tools/windows/winprobe.c) on Windows); the [roadmap](docs/ROADMAP.md), milestone M5,

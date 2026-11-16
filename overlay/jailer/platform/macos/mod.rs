@@ -29,6 +29,9 @@ const JAIL_CPU_ENV: &str = "WICK_JAIL_CPU";
 const JAIL_MEMORY_ENV: &str = "WICK_JAIL_MEMORY";
 /// `vmm::ext::jail::PID_NS_ENV`.
 const JAIL_PID_NS_ENV: &str = "WICK_JAIL_PID_NS";
+/// libmalloc's variables Firecracker runs with (`vmm::ext::malloc_config::MALLOC_ENV`):
+/// set here, Firecracker does not start again to set them itself.
+const MALLOC_ENV: [(&str, &str); 2] = [("MallocMaxMagazines", "1"), ("MallocSpaceEfficient", "1")];
 /// Firecracker's temporary directory in the jail. On macOS eventfds are
 /// unlinked FIFOs and memfds unlinked files (crates/compat), made in the
 /// temporary directory; on Linux both are kernel objects, so upstream's jail
@@ -755,6 +758,7 @@ fn exec(
     if NEW_PID_NS.load(std::sync::atomic::Ordering::Relaxed) {
         env.push(CString::new(format!("{JAIL_PID_NS_ENV}=1")).expect("no NUL"));
     }
+    env.extend(malloc_env());
     // The jail's own directory in its network, and the lock on it, which
     // Firecracker inherits and holds for its life.
     let mut network_lock = None;
@@ -775,6 +779,13 @@ fn exec(
     replace_process(&argv, &env, network_lock.as_ref(), memory, || {
         freezer::start_supervisor(freezer).map_err(HostError::Freezer)
     })
+}
+
+/// [`MALLOC_ENV`] as environment entries.
+fn malloc_env() -> impl Iterator<Item = CString> {
+    MALLOC_ENV
+        .iter()
+        .map(|(name, value)| CString::new(format!("{name}={value}")).expect("no NUL"))
 }
 
 /// Replaces this process with `argv[0]` (`posix_spawn` with
@@ -1080,6 +1091,23 @@ mod tests {
         write_acl(&net, None, &[(me, &[acl::ADD_FILE, acl::DELETE_CHILD], &[])]).unwrap();
         drop(network_for_jail(&net, "b", 54321).unwrap());
         drop(network_for_jail(&net, "c", 0).unwrap());
+    }
+
+    #[test]
+    fn test_firecracker_gets_libmallocs_configuration_from_the_jailer() {
+        let env: Vec<CString> = malloc_env().collect();
+        assert_eq!(
+            env,
+            [c"MallocMaxMagazines=1".to_owned(), c"MallocSpaceEfficient=1".to_owned()]
+        );
+        // The same list as Firecracker's, which would otherwise start again.
+        let vmm = include_str!("../../../vmm/ext/malloc_config.rs");
+        let start = vmm.find("pub const MALLOC_ENV").unwrap();
+        let list = &vmm[start..start + vmm[start..].find("];").unwrap()];
+        for (name, value) in MALLOC_ENV {
+            assert!(list.contains(&format!("(\"{name}\", \"{value}\")")), "{name}={value}: {list}");
+        }
+        assert_eq!(list.matches("(\"").count(), MALLOC_ENV.len(), "{list}");
     }
 
     #[test]

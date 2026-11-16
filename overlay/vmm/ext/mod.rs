@@ -16,6 +16,8 @@
 pub mod api_process;
 pub mod fifo;
 pub mod jail;
+#[cfg(target_os = "macos")]
+pub mod malloc_config;
 pub mod sandbox;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod sysfs;

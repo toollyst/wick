@@ -547,6 +547,12 @@ def stage_jail(ctx):
     for path in (secret, outside):
         check(f"n{os.path.realpath(path)}" not in names and f"n{path}" not in names,
               f"Firecracker holds the jailer's descriptor for {path}")
+    # libmalloc's configuration is in the environment the jailer gave
+    # Firecracker, which then does not start again (vmm::ext::malloc_config).
+    env = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True,
+                         text=True).stdout
+    for var in ("MallocMaxMagazines=1", "MallocSpaceEfficient=1"):
+        check(f" {var}" in env, f"{var} is not in Firecracker's environment: {env!r}")
     # Inside the jail: the kernel by its jailed path.
     vm.api("PUT", "/boot-source", {"kernel_image_path": "/" + bt.KERNEL, "boot_args": bt.BOOT_ARGS})
     # Outside it: by an absolute path, by `..`, by a link planted in the jail.
@@ -557,8 +563,8 @@ def stage_jail(ctx):
     # (vsock's guest-to-host connections, a network endpoint).
     vm.api("PUT", "/vsock", {"guest_cid": 3, "uds_path": "/v.sock"})
     vm.kill()
-    return ("uid/gid, pid file, chroot, exec'd from a root-owned copy, no inherited descriptors; "
-            "outside files unreachable")
+    return ("uid/gid, pid file, chroot, exec'd from a root-owned copy, no inherited descriptors, "
+            "libmalloc's configuration; outside files unreachable")
 
 
 def daemon_pid(jail):

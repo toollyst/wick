@@ -51,3 +51,4 @@
 0049-serial-input-while-the-guest-has-IER-masked-raises-t.patch
 0050-api_server-a-request-after-the-VMM-ended-is-answered.patch
 0051-windows-the-compatibility-polling-in-the-lock-file.patch
+0052-macos-Firecracker-starts-with-libmalloc-s-configurat.patch

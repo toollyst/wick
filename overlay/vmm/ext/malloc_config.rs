@@ -1,0 +1,306 @@
+// Copyright 2026 toollyst contributors.
+// SPDX-License-Identifier: Apache-2.0
+
+//! The configuration of macOS's allocator that Firecracker runs with.
+//!
+//! On Linux, Firecracker's release is built against musl, whose allocator
+//! (mallocng) takes no configuration. macOS's libmalloc does, from the
+//! environment only, once, when libSystem starts and before any of the
+//! program's code runs (`_malloc_initialize`, libmalloc malloc.c). Its defaults
+//! spread a process's small allocations over one magazine or allocation slot
+//! per CPU (or CPU cluster) and keep freed memory for reuse; Firecracker's own
+//! memory then goes over upstream's 5 MiB budget for the VMM's part
+//! (docs/COMPATIBILITY.md, "VMM memory besides the guest"). [`MALLOC_ENV`] is
+//! what keeps it under: one magazine or slot (`MallocMaxMagazines=1`) and
+//! libmalloc's space-efficient mode, which gives freed memory back
+//! (`MallocSpaceEfficient=1`).
+//!
+//! libmalloc-812 (macOS 27) runs its xzone allocator by default on Apple
+//! silicon (malloc_config.c, `_malloc_should_enable_xzone`); there
+//! `MallocMaxMagazines=1` also puts the process's pointer-holding allocations
+//! in one bucket instead of four (xzone_malloc.c, `override_ptr_bucket_count`).
+//! musl's allocator has no such buckets, and xzone with one still keeps
+//! pure-data allocations apart from them: not weaker than Firecracker on Linux,
+//! weaker than macOS's default (SECURITY.md, "Heap"). libmalloc-657 and
+//! -792 (macOS 15 and 26) run the magazine allocator, which has no buckets.
+//!
+//! Since only the environment a program starts with counts, Firecracker
+//! starts again with it: [`before_main`], run by the binary before `main`
+//! (no thread, no descriptor of its own, nothing allocated that it keeps),
+//! execs Firecracker's own executable with the same arguments and
+//! [`MALLOC_ENV`] added when the environment lacks it. The jailer sets
+//! [`MALLOC_ENV`] itself (overlay/jailer/platform/macos), so a jailed
+//! Firecracker never execs again. A variable of [`MALLOC_ENV`] set to another
+//! value is refused, loudly: Firecracker would otherwise run over its budget,
+//! or silently drop the value given. A failed exec ends Firecracker, loudly:
+//! it never runs without [`MALLOC_ENV`].
+
+use std::ffi::{CStr, CString};
+
+/// libmalloc's variables Firecracker runs with, and their values. The jailer
+/// has the same list (overlay/jailer/platform/macos, `MALLOC_ENV`).
+pub const MALLOC_ENV: [(&str, &str); 2] =
+    [("MallocMaxMagazines", "1"), ("MallocSpaceEfficient", "1")];
+
+/// What [`before_main`] does with an environment.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// The environment has [`MALLOC_ENV`]: run.
+    Run,
+    /// Exec again with these variables (`name=value`) added.
+    Exec(Vec<CString>),
+    /// A variable of [`MALLOC_ENV`] has another value: refuse to start.
+    Refuse {
+        /// The variable.
+        name: &'static str,
+        /// The value it has.
+        value: String,
+        /// The value Firecracker needs.
+        needed: &'static str,
+    },
+}
+
+/// What to do with the environment `env` (`name=value` entries). As
+/// libmalloc's `getenv`, the first entry of a name counts.
+pub fn plan<'a>(env: impl IntoIterator<Item = &'a [u8]> + Clone) -> Plan {
+    let mut missing = Vec::new();
+    for (name, needed) in MALLOC_ENV {
+        let value = env.clone().into_iter().find_map(|entry| {
+            entry
+                .strip_prefix(name.as_bytes())
+                .and_then(|rest| rest.strip_prefix(b"="))
+        });
+        match value {
+            Some(value) if value == needed.as_bytes() => {}
+            Some(value) => {
+                return Plan::Refuse {
+                    name,
+                    value: String::from_utf8_lossy(value).into_owned(),
+                    needed,
+                };
+            }
+            None => missing.push(CString::new(format!("{name}={needed}")).expect("no NUL")),
+        }
+    }
+    if missing.is_empty() {
+        Plan::Run
+    } else {
+        Plan::Exec(missing)
+    }
+}
+
+/// The message [`before_main`] refuses with.
+pub fn refusal(name: &str, value: &str, needed: &str) -> String {
+    format!(
+        "Error: Firecracker on macOS runs with {name}={needed} (libmalloc), but the \
+         environment sets {name}={value}; unset it or set it to {needed} (see \
+         SECURITY.md, \"Heap\")\n"
+    )
+}
+
+/// Execs Firecracker again with [`MALLOC_ENV`] when its environment lacks it,
+/// and refuses one that sets it otherwise; see the module. Run by the binary
+/// before `main` (firecracker's main.rs places it in `__mod_init_func`):
+/// returns only when the environment has [`MALLOC_ENV`], and otherwise
+/// replaces the process or ends it with an error on standard error.
+#[unsafe(no_mangle)]
+pub extern "C" fn wick_malloc_config_before_main() {
+    before_main();
+}
+
+/// See [`wick_malloc_config_before_main`].
+pub fn before_main() {
+    // SAFETY: crt's environment and arguments, which nothing changes before
+    // main; each entry is a NUL-terminated string.
+    let (environ, argv) = unsafe { (*libc::_NSGetEnviron(), *libc::_NSGetArgv()) };
+    let entries = environment(environ);
+    let added = match plan(entries.iter().map(|entry| entry.to_bytes())) {
+        Plan::Run => return,
+        Plan::Exec(added) => added,
+        Plan::Refuse {
+            name,
+            value,
+            needed,
+        } => fail(&refusal(name, &value, needed), vmm_exit::BAD_CONFIGURATION),
+    };
+
+    let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is of the size given.
+    let len = unsafe {
+        libc::proc_pidpath(
+            libc::getpid(),
+            path.as_mut_ptr().cast(),
+            libc::PROC_PIDPATHINFO_MAXSIZE as u32,
+        )
+    };
+    let Ok(len @ 1..) = usize::try_from(len) else {
+        let err = std::io::Error::last_os_error();
+        fail(
+            &format!(
+                "Error: Firecracker could not find its executable to start with libmalloc's configuration: {err}\n"
+            ),
+            vmm_exit::GENERIC_ERROR,
+        );
+    };
+
+    let mut envp: Vec<*const libc::c_char> = entries.iter().map(|entry| entry.as_ptr()).collect();
+    envp.extend(added.iter().map(|entry| entry.as_ptr()));
+    envp.push(std::ptr::null());
+    // SAFETY: a NUL-terminated path (the buffer is zeroed past `len`), crt's
+    // NULL-terminated argv, and a NULL-terminated array of strings that live
+    // until the call.
+    unsafe { libc::execve(path.as_ptr().cast(), argv.cast(), envp.as_ptr()) };
+    let err = std::io::Error::last_os_error();
+    let path = String::from_utf8_lossy(&path[..len]);
+    fail(
+        &format!(
+            "Error: Firecracker could not start again with libmalloc's configuration (exec of {path}): {err}\n"
+        ),
+        vmm_exit::GENERIC_ERROR,
+    );
+}
+
+/// The entries of a NULL-terminated environment.
+fn environment(mut environ: *const *mut libc::c_char) -> Vec<&'static CStr> {
+    let mut entries = Vec::new();
+    if environ.is_null() {
+        return entries;
+    }
+    // SAFETY: a NULL-terminated array of NUL-terminated strings that live as
+    // long as the process (crt's environment, unchanged before main).
+    unsafe {
+        while !(*environ).is_null() {
+            entries.push(CStr::from_ptr(*environ));
+            environ = environ.add(1);
+        }
+    }
+    entries
+}
+
+/// Writes `message` to standard error and ends the process with `code`,
+/// before anything else of Firecracker runs.
+fn fail(message: &str, code: i32) -> ! {
+    let mut rest = message.as_bytes();
+    while !rest.is_empty() {
+        // SAFETY: a write of a live buffer to standard error.
+        let n = unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
+        let Ok(n @ 1..) = usize::try_from(n) else {
+            break;
+        };
+        rest = &rest[n..];
+    }
+    // SAFETY: ends the process; nothing of Firecracker's is running yet.
+    unsafe { libc::_exit(code) }
+}
+
+/// Firecracker's exit codes (`crate::FcExitCode`) this module ends with.
+mod vmm_exit {
+    pub const GENERIC_ERROR: i32 = crate::FcExitCode::GenericError as i32;
+    pub const BAD_CONFIGURATION: i32 = crate::FcExitCode::BadConfiguration as i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries(env: &[&'static str]) -> Vec<&'static [u8]> {
+        env.iter().map(|entry| entry.as_bytes()).collect()
+    }
+
+    #[test]
+    fn test_an_environment_without_the_variables_execs_with_both() {
+        let env = entries(&["HOME=/x", "MallocStackLogging=1"]);
+        assert_eq!(
+            plan(env.iter().copied()),
+            Plan::Exec(vec![
+                CString::new("MallocMaxMagazines=1").unwrap(),
+                CString::new("MallocSpaceEfficient=1").unwrap(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_an_environment_with_one_execs_with_the_other() {
+        let env = entries(&["MallocSpaceEfficient=1"]);
+        assert_eq!(
+            plan(env.iter().copied()),
+            Plan::Exec(vec![CString::new("MallocMaxMagazines=1").unwrap()])
+        );
+        let env = entries(&["MallocMaxMagazines=1"]);
+        assert_eq!(
+            plan(env.iter().copied()),
+            Plan::Exec(vec![CString::new("MallocSpaceEfficient=1").unwrap()])
+        );
+    }
+
+    #[test]
+    fn test_an_environment_with_both_runs() {
+        let env = entries(&["A=1", "MallocMaxMagazines=1", "MallocSpaceEfficient=1"]);
+        assert_eq!(plan(env.iter().copied()), Plan::Run);
+    }
+
+    #[test]
+    fn test_another_value_is_refused() {
+        for (env, name, value) in [
+            (&["MallocMaxMagazines=0"][..], "MallocMaxMagazines", "0"),
+            (
+                &["MallocMaxMagazines=4", "MallocSpaceEfficient=1"][..],
+                "MallocMaxMagazines",
+                "4",
+            ),
+            (
+                &["MallocMaxMagazines=1", "MallocSpaceEfficient=0"][..],
+                "MallocSpaceEfficient",
+                "0",
+            ),
+            (&["MallocSpaceEfficient="][..], "MallocSpaceEfficient", ""),
+            (&["MallocMaxMagazines=01"][..], "MallocMaxMagazines", "01"),
+        ] {
+            assert_eq!(
+                plan(entries(env).iter().copied()),
+                Plan::Refuse {
+                    name,
+                    value: value.to_string(),
+                    needed: "1"
+                },
+                "{env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_first_entry_of_a_name_counts() {
+        // As getenv, which libmalloc reads them with.
+        let env = entries(&[
+            "MallocMaxMagazines=1",
+            "MallocMaxMagazines=4",
+            "MallocSpaceEfficient=1",
+        ]);
+        assert_eq!(plan(env.iter().copied()), Plan::Run);
+        let env = entries(&[
+            "MallocMaxMagazines=4",
+            "MallocMaxMagazines=1",
+            "MallocSpaceEfficient=1",
+        ]);
+        assert!(matches!(plan(env.iter().copied()), Plan::Refuse { .. }));
+    }
+
+    #[test]
+    fn test_a_longer_name_is_another_variable() {
+        let env = entries(&["MallocMaxMagazinesX=4", "MallocSpaceEfficientY=0"]);
+        assert_eq!(
+            plan(env.iter().copied()),
+            Plan::Exec(vec![
+                CString::new("MallocMaxMagazines=1").unwrap(),
+                CString::new("MallocSpaceEfficient=1").unwrap(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_the_refusal_names_the_variable_and_the_value_needed() {
+        let message = refusal("MallocMaxMagazines", "4", "1");
+        assert!(message.contains("MallocMaxMagazines=1"), "{message}");
+        assert!(message.contains("MallocMaxMagazines=4"), "{message}");
+    }
+}

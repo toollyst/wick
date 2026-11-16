@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Sat, 14 Nov 2026 08:03:02 +0900
+Subject: [PATCH] macos: Firecracker starts with libmalloc's configuration,
+ before main
+
+libmalloc reads its configuration from the environment the program
+starts with, once, as libSystem starts and before any of the program's
+code (_malloc_initialize). Firecracker runs with MallocMaxMagazines=1
+and MallocSpaceEfficient=1 (vmm::ext::malloc_config in wick's overlay),
+which upstream's 5 MiB budget for the VMM's own memory needs on macOS.
+An initializer of the binary in __mod_init_func, written in assembly as
+the compatibility libc's is, calls
+vmm::ext::malloc_config::before_main. That function starts Firecracker
+again with the variables when the environment lacks them, refuses
+another value, and ends with an error when the exec fails.
+
+The binary's unit tests share the same initializer:
+- wick_malloc_config_tests::test_a_direct_launch_starts_again_with_libmallocs_configuration
+- test_a_launch_with_the_configuration_runs_without_starting_again
+- test_another_value_is_refused
+
+All three read libmalloc's own report (MallocReportConfig). They fail
+with the initializer left out. Linux and Windows are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/src/main.rs | 118 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 118 insertions(+)
+
+diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
+index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..04cf2df6f41a4f738e93352d9f98302aa96086bd 100644
+--- a/src/firecracker/src/main.rs
++++ b/src/firecracker/src/main.rs
+@@ -112,6 +112,19 @@ impl From<MainError> for FcExitCode {
+     }
+ }
+ 
++// wick: libmalloc on macOS reads its configuration from the environment the
++// program starts with, before any of its code runs; before main, Firecracker
++// starts again with the configuration it runs with when its environment lacks
++// it (vmm::ext::malloc_config). The initializer's pointer is written in
++// assembly, as the compatibility libc's is (crates/compat/libc).
++#[cfg(target_os = "macos")]
++core::arch::global_asm!(
++    ".section __DATA,__mod_init_func,mod_init_funcs",
++    ".p2align 3",
++    ".quad _wick_malloc_config_before_main",
++    ".text",
++);
++
+ fn main() -> ExitCode {
+     let result = main_exec();
+     if let Err(err) = result {
+@@ -823,3 +836,108 @@ mod wick_version_tests {
+         assert!(version >= semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap());
+     }
+ }
++
++// wick: Firecracker runs with libmalloc's configuration on macOS, whether the
++// jailer set it or Firecracker started again to (vmm::ext::malloc_config). This
++// test binary has the same initializer as the firecracker binary.
++#[cfg(test)]
++#[cfg(target_os = "macos")]
++mod wick_malloc_config_tests {
++    use std::process::{Command, Output};
++
++    use vmm::ext::malloc_config::MALLOC_ENV;
++
++    /// A run of this binary (`--list`: it lists its tests and exits) with
++    /// libmalloc reporting its configuration on standard error, without
++    /// `MALLOC_ENV`'s variables but those of `env`.
++    fn run(env: &[(&str, &str)]) -> Output {
++        let mut cmd = Command::new(std::env::current_exe().unwrap());
++        cmd.arg("--list")
++            .env("MallocReportConfig", "1")
++            .env("MallocDebugReport", "stderr");
++        for (name, _) in MALLOC_ENV {
++            cmd.env_remove(name);
++        }
++        cmd.envs(env.iter().copied());
++        cmd.output().unwrap()
++    }
++
++    /// The value after `key` in the last of libmalloc's reports, and how many
++    /// reports there are (one per program image the process ran).
++    fn last(report: &str, key: &str) -> (usize, String) {
++        let count = report.matches(key).count();
++        let value = report
++            .rsplit_once(key)
++            .map_or("", |(_, rest)| rest.lines().next().unwrap_or(""));
++        (count, value.trim().to_string())
++    }
++
++    /// Checks that the last image ran with `MALLOC_ENV` and returns how many
++    /// images the process ran.
++    fn assert_configured(report: &str) -> usize {
++        if report.contains("Enable Xzone Malloc: 1") {
++            // libmalloc's xzone allocator (libmalloc-812, xzone_malloc.c):
++            // MallocMaxMagazines=1 gives one slot and one pointer bucket,
++            // MallocSpaceEfficient=1 no huge cache.
++            let (images, buckets) = last(report, "Pointer Bucket Count:");
++            assert_eq!(buckets, "1", "{report}");
++            let (_, slots) = last(report, "Initial Slot Config:");
++            assert!(slots.starts_with("SINGLE/SINGLE"), "{report}");
++            let (_, huge) = last(report, "Huge Cache Size:");
++            assert_eq!(huge, "0", "{report}");
++            images
++        } else {
++            // The magazine allocator (libmalloc-657 and -792, malloc.c):
++            // MallocSpaceEfficient=1 is aggressive madvise.
++            let (images, magazines) = last(report, "Max Magazines:");
++            assert_eq!(magazines, "1", "{report}");
++            let (_, madvise) = last(report, "Aggressive Madvise:");
++            assert_eq!(madvise, "1", "{report}");
++            images
++        }
++    }
++
++    #[test]
++    fn test_a_direct_launch_starts_again_with_libmallocs_configuration() {
++        let out = run(&[]);
++        let report = String::from_utf8_lossy(&out.stderr);
++        assert!(out.status.success(), "{report}");
++        // The first image ran with libmalloc's defaults, the second with the configuration.
++        assert_eq!(assert_configured(&report), 2, "{report}");
++    }
++
++    #[test]
++    fn test_a_launch_with_the_configuration_runs_without_starting_again() {
++        // As the jailer launches Firecracker (overlay/jailer/platform/macos).
++        let out = run(&MALLOC_ENV);
++        let report = String::from_utf8_lossy(&out.stderr);
++        assert!(out.status.success(), "{report}");
++        assert_eq!(assert_configured(&report), 1, "{report}");
++        // Half of it: the other variable is added.
++        for one in MALLOC_ENV {
++            let out = run(&[one]);
++            let report = String::from_utf8_lossy(&out.stderr);
++            assert!(out.status.success(), "{report}");
++            assert_eq!(assert_configured(&report), 2, "{report}");
++        }
++    }
++
++    #[test]
++    fn test_another_value_is_refused() {
++        for (name, value) in [("MallocMaxMagazines", "4"), ("MallocSpaceEfficient", "0")] {
++            let out = run(&[(name, value)]);
++            let report = String::from_utf8_lossy(&out.stderr);
++            assert_eq!(
++                out.status.code(),
++                Some(vmm::FcExitCode::BadConfiguration as i32),
++                "{report}"
++            );
++            assert!(
++                report.contains(&format!("runs with {name}=1")) && report.contains(&format!("sets {name}={value};")),
++                "{report}"
++            );
++            // Nothing of the test binary ran: no list of tests.
++            assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
++        }
++    }
++}
