@@ -325,7 +325,10 @@ upstream Firecracker and its jailer.
   such pages before a charge is refused at the limit, as Linux's memory cgroup reclaims, moves their chunks into new
   sections, and works with no room left in the job: each move gives back the charge of up to 12 KiB of its own dead
   pages for its maps first (their page tables take commit: VIEWCHARGE), and a chunk with one dead page is room enough
-  (`test_a_chunk_with_one_dead_page_at_the_limit`; the memory.max row, on Windows Server 2022 20348). Where another
+  (`test_a_chunk_with_one_dead_page_at_the_limit`; the memory.max row, on Windows Server 2022 20348, and on Windows
+  Server 2025 in CI runs 43680983973 and 43688550565). Under a running vCPU it is not shown yet: the test of that,
+  MOVEUNDERVCPU, moved no chunk in those runs, its fill at the limit a discarded page's, which takes nothing new;
+  with a fresh page's fill since, it has not run yet (the memory.max row). Where another
   commit takes that room before the move maps, the move is not made and the chunk owes the charge: the job then holds
   up to 12 KiB more than it is charged, for one chunk at a time, said on standard error, with every userfaultfd fill
   refused until the charge is taken again (`test_a_move_whose_room_is_taken_owes_its_charge`); a bounded
@@ -345,7 +348,7 @@ upstream Firecracker and its jailer.
   pages in two sections for its
   time; a 2 MiB move budget of private `PAGE_NOACCESS` commit, made at the first registration, is the cover the
   jailer's count takes off for them, so the count, and the bound it enforces, stays exact during a move
-  (`test_the_jailers_count_does_not_rise_during_a_move`; not yet run on Windows). A page discarded while a system
+  (`test_the_jailers_count_does_not_rise_during_a_move`; passed in CI runs 43680983973 and 43688550565). A page discarded while a system
   call copies it (a guest that balloons a buffer a device is still using) would fail that call, where Linux's copy
   faults the page in again: so a discard waits for the calls in flight on its range, and a call that may wait without
   end (a blocking socket's or pipe's) copies through a buffer of its own, so that no discard waits on it (the
@@ -353,7 +356,8 @@ upstream Firecracker and its jailer.
   `test_a_discard_waits_for_a_read_in_flight_on_its_range`, `test_a_blocking_read_does_not_hold_a_discard`; passed
   in CI runs 43612093006, 8ff63d4, and 43616040593, 5e3727d). Firecracker never met it, its devices' calls and the balloon's discards running on one thread; the
   wait is for the reclaim at the limit, which would move chunks on whichever thread touched memory there (a vCPU's
-  among them; not working yet at a real job limit), and other users of the compat libc.
+  among them; at a real job limit shown on host threads, not yet under a running vCPU), and other users of the
+  compat libc.
 
   Sections made around wick (a compromised Firecracker's) are counted by the jailer
   (overlay/jailer/platform/windows/commit.rs): every 1 ms, over the job's processes, private commit plus section
