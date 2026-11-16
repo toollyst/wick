@@ -1,0 +1,32 @@
+# The phrases of a run claim in the docs: the one list tools/ci-results.py's
+# checkers read (check-claims' offline check of docs/evidence/runs.tsv, and
+# the live check of a run's own results when it comes). A sentence is a run
+# claim when it has a subject (a backquoted test_ name, or the short name a
+# results row carries as its alias, such as MOVEUNDERVCPU) and one of these.
+# A phrase not listed is no claim; a near miss is reported, so that it joins
+# a list here or is reworded. Each line: KIND<TAB>regular expression (Python,
+# case-insensitive).
+#
+# not-run: the test has not run (since the sentence was written).
+not-run	\bnot (?:yet )?run\b
+not-run	\bnot run yet\b
+not-run	\bhas not run\b
+not-run	\bnot shown yet\b
+not-run	\bwaits on (?:a|its) run\b
+# historical: ran in run N (a run's own commit may follow it in parentheses);
+# the verb says the result, or none ("ran").
+historical	\b(passed|failed|ran) in (?:CI )?runs? ([1-9]\d{10}(?: \([0-9a-f]{7,40}[^)]*\))?(?:(?:,\s+(?:and\s+)?|\s+and\s+)[1-9]\d{10}(?: \([0-9a-f]{7,40}[^)]*\))?)*)
+# near-miss: reported as a warning until this list settles (see severity).
+near-miss	\buntested\b
+near-miss	\byet to run\b
+near-miss	\bnever ran\b
+near-miss	\bnot been (?:run|tested)\b
+# severity of a near miss: warning now; error once the docs-audit after the
+# landing of this check finds no near miss left that should have been a
+# claim (main decides the flip, in the commit that changes this line).
+severity	warning
+# evidence-since: the newest CI run before the jobs uploaded their results
+# (results-<job>): a document citing a later run must have it in
+# docs/evidence/runs-index.tsv (tools/ci-results.py collect). Set, when the
+# results upload lands on main, to the run before its push's run.
+evidence-since	43790310601

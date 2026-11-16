@@ -166,7 +166,9 @@ Before pushing, run the checks of CI's patches job; none builds anything:
 
 ```sh
 tools/patches.sh check
-python3 tools/check-claims.py --strict-windows
+python3 tools/check-claims.py --strict-windows --commits origin/main..HEAD
+python3 -I tools/ci-results.py --selftest
+python3 -I -B tools/check-derived.py
 python3 -I tools/compat-counts.py --check docs/COMPATIBILITY.md
 tools/gen-windows-sources.sh --check
 python3 -I -B tools/check-unit-graph.py --fetch
@@ -179,6 +181,17 @@ same features, on x86_64 and aarch64, gnu and musl; the macOS builds must be
 their baseline in `tools/unit-graph`, which a commit that changes them
 rewrites (`--write-baseline`), so the change is in its diff. "The same units
 as upstream" is this check's result, not a commit message's claim.
+
+A sentence about a test's run (it has not run, or it passed, failed or ran
+in run N) is checked against `docs/evidence/runs.tsv`, which only
+`tools/ci-results.py collect RUN_ID` writes, from the run's `results-<job>`
+artifacts (`gh`, read-only; `--from DIR` for a PC run's results.tsv). It
+keeps only the rows of the tests the documents name, so the commit that
+first names a test in a run claim, or cites a run, also collects that run.
+Artifacts last 14 days: a run older than that can no longer be collected,
+and a document cannot cite it (the rows already collected stay, checked
+against the hash collect recorded in `docs/evidence/runs-index.tsv`). The
+phrases that make a run claim are listed in `tools/run-claims.txt`.
 
 ## Following upstream
 

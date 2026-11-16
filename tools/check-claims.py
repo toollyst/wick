@@ -68,6 +68,14 @@ an entry of that file names a tracked tool and gives a reason (audit 5: the
 table lacked tools/clean.sh and tools/check-background-loops.py, which every
 test script and CI run). The tools' helpers in subdirectories (integration/,
 vhost-user-blk/) are not tools of their own.
+Every run claim in a document is checked against the runs' results that
+tools/ci-results.py collect took into docs/evidence/runs.tsv (its readers,
+the grammar in tools/run-claims.txt): a sentence saying a test has not run,
+where a run of a later commit than the sentence's ran it (audit 5:
+MOVEUNDERVCPU "not run yet", run in CI runs 43784960688 and 43790310601,
+failed); a sentence saying a test passed, failed or ran in run N, against
+run N's rows; and a run cited after tools/run-claims.txt's evidence-since
+that the evidence does not have. A near miss of the grammar is a warning.
 A CI run's id (an 11-digit number) has one home: docs/COMPATIBILITY.md's
 rows and docs/ROADMAP.md (and the design notes); another document names the
 row. tools/run-ids-outside-home.txt counts the ones other documents still
@@ -92,6 +100,7 @@ ROADMAP.md "Platform status", which ROADMAP has never had).
 
     tools/check-claims.py --selftest    checks the commit, heading and table checks on fakes
 """
+import importlib.util
 import os
 import re
 import subprocess
@@ -646,6 +655,17 @@ def main():
             for line in check_same_claims(name, body):
                 print(line)
                 errors += 1
+    spec = importlib.util.spec_from_file_location("ci_results", ROOT / "tools" / "ci-results.py")
+    ci_results = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ci_results)
+    claim_errors, claim_warnings = ci_results.check_run_claims(
+        ROOT, repo, {d: (ROOT / d).read_text() for d in documents})
+    for line in claim_errors:
+        print(f"error: {line}")
+        errors += 1
+    for line in claim_warnings:
+        print(f"warning: {line}")
+        warnings += 1
     outside = {d: (ROOT / d).read_text() for d in documents if d not in RUN_HOME}
     for line in check_run_ids(outside, (ROOT / RUN_RATCHET).read_text() if (ROOT / RUN_RATCHET).is_file() else ""):
         print(line)

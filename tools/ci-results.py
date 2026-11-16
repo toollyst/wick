@@ -274,6 +274,257 @@ def validate(text, name="results.tsv"):
     return errors
 
 
+# --- the evidence: docs/evidence/runs.tsv, written by collect only ---------
+
+EVIDENCE = "docs/evidence/runs.tsv"
+INDEX = "docs/evidence/runs-index.tsv"
+GRAMMAR = "tools/run-claims.txt"
+INDEX_COLUMNS = ("run", "commit", "rows_sha256", "inputs_sha256")
+RUN_ID = re.compile(r"(?<![\d.])[1-9]\d{10}(?!\d|\.\d)")
+TEST_NAMED = re.compile(r"`(test_[A-Za-z0-9_]+)`")
+ALIAS_NAMED = re.compile(r"\b[A-Z][A-Z0-9]{3,}(?:-[A-Za-z0-9]+)?\b")
+
+
+def sha256(data):
+    import hashlib
+    return hashlib.sha256(data if isinstance(data, bytes) else data.encode()).hexdigest()
+
+
+def parse_rows(text, name):
+    """The rows of a results.tsv or of the evidence file, as dicts."""
+    errors = []
+    rows = []
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if len(lines) < 2 or lines[0] != HEADER or lines[1].split("\t") != list(COLUMNS):
+        return [], [f"{name}: not a results file (header {HEADER!r} and the column names)"]
+    for n, line in enumerate(lines[2:], 3):
+        f = line.split("\t")
+        if len(f) != len(COLUMNS):
+            errors.append(f"{name}:{n}: {len(f)} fields, not {len(COLUMNS)}")
+            continue
+        rows.append(dict(zip(COLUMNS, (unescape(x) for x in f))))
+    return rows, errors
+
+
+def run_block(rows, run):
+    """A run's rows as the evidence file holds them, sorted: what its hash covers."""
+    lines = sorted("\t".join(escape(r[c]) for c in COLUMNS) for r in rows if r["run"] == run)
+    return "\n".join(lines) + "\n"
+
+
+def load_grammar(root):
+    g = {"not-run": [], "historical": [], "near-miss": [], "severity": ["warning"], "evidence-since": ["0"]}
+    for line in (root / GRAMMAR).read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            kind, _, pat = line.partition("\t")
+            if kind in ("severity", "evidence-since"):
+                g[kind] = [pat.strip()]
+            elif kind in g:
+                g[kind].append(re.compile(pat, re.I))
+            else:
+                raise SystemExit(f"{GRAMMAR}: unknown kind {kind!r}")
+    return g
+
+
+def load_evidence(root):
+    """(rows, {run: commit}, errors): the evidence file and its index, each
+    run's block checked against the hash collect recorded."""
+    ev, idx = root / EVIDENCE, root / INDEX
+    if not ev.is_file() and not idx.is_file():
+        return [], {}, []
+    rows, errors = parse_rows(ev.read_text(encoding="utf-8"), EVIDENCE) if ev.is_file() else ([], [])
+    runs = {}
+    lines = idx.read_text(encoding="utf-8").splitlines() if idx.is_file() else []
+    if not lines or lines[0].split("\t") != list(INDEX_COLUMNS):
+        return rows, runs, errors + [f"{INDEX}: its first line is not the column names"]
+    for n, line in enumerate(lines[1:], 2):
+        f = line.split("\t")
+        if len(f) != len(INDEX_COLUMNS):
+            errors.append(f"{INDEX}:{n}: {len(f)} fields")
+            continue
+        run, commit, rows_hash, _ = f
+        runs[run] = commit
+        if sha256(run_block(rows, run)) != rows_hash:
+            errors.append(f"{EVIDENCE}: run {run}'s rows are not what collect wrote (their hash differs from "
+                          f"{INDEX}:{n}): rows are written by tools/ci-results.py collect only")
+    for r in {r["run"] for r in rows} - set(runs):
+        errors.append(f"{EVIDENCE}: run {r} has rows but no line in {INDEX}")
+    return rows, runs, errors
+
+
+def doc_subjects(texts, rows):
+    """The names the documents mention that results rows can carry: test_
+    names in backquotes, and aliases some row has."""
+    aliases = {r["alias"] for r in rows if r["alias"]}
+    names = set()
+    for text in texts:
+        names |= set(TEST_NAMED.findall(text))
+        names |= {a for a in ALIAS_NAMED.findall(text) if a in aliases}
+    return names
+
+
+def row_is(row, subject):
+    return row["alias"] == subject or row["name"] == subject or row["name"].endswith("::" + subject)
+
+
+def host_family(row):
+    h = row["host"]
+    return "Windows" if h.startswith("Windows") else "macOS" if h.startswith("macOS") else "Linux"
+
+
+HOSTS = ("Linux", "macOS", "Windows")
+SCOPE_WORDS = re.compile(r"\bon (Linux|macOS|Windows)\b|\b(WHP)\b")
+
+
+def sentences(name, text):
+    """(line, sentence, hosts) of a document: a table cell's host is its
+    column's (COMPATIBILITY's Linux, macOS and Windows columns), elsewhere the
+    sentence's "on <host>" words, or every host."""
+    out = []
+    header = None
+    for n, line in enumerate(text.splitlines(), 1):
+        cells = None
+        if line.startswith("|"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if set("".join(cells)) <= set("-: "):
+                continue
+            if header is None:
+                header = cells
+                continue
+        else:
+            header = None
+        parts = [(c, header[i] if header and i < len(header) else "") for i, c in enumerate(cells)] if cells \
+            else [(line, "")]
+        for cell, column in parts:
+            col_hosts = [h for h in HOSTS if h.lower() in column.lower()]
+            for sentence in re.split(r"(?<=[.;])\s+(?=[A-Z(`])", cell):
+                words = SCOPE_WORDS.findall(sentence)
+                said = {w[0] or "Windows" for w in words}
+                hosts = col_hosts or sorted(said) or list(HOSTS)
+                out.append((n, sentence, hosts))
+    return out
+
+
+def blame_commit(repo, name, line):
+    """The commit that wrote a line of a document, or None for a line not
+    committed yet."""
+    out = subprocess.run(["git", "-C", str(repo), "blame", "--porcelain", "-L", f"{line},{line}", "--", name],
+                         capture_output=True, text=True)
+    if out.returncode != 0 or not out.stdout:
+        return None
+    c = out.stdout.split()[0]
+    return None if set(c) == {"0"} else c
+
+
+def is_ancestor(repo, a, b):
+    out = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", a, b], capture_output=True)
+    if out.returncode not in (0, 1):
+        raise SystemExit(f"ci-results: {b} (a run's commit) is not in {repo}: the evidence names a commit this clone "
+                         f"lacks")
+    return out.returncode == 0
+
+
+def check_run_claims(root, repo, documents, evidence_since=None):
+    """(errors, warnings) of the documents' run claims against the evidence:
+    a not-run claim on a test a run after the sentence ran, and a historical
+    claim against its run's rows; a run cited after evidence_since must be in
+    the evidence."""
+    g = load_grammar(root)
+    if evidence_since is None:
+        evidence_since = int(g["evidence-since"][0])
+    rows, runs, errors = load_evidence(root)
+    warnings = []
+    aliases = {r["alias"] for r in rows if r["alias"]}
+    blame_cache = {}
+    for name, text in documents.items():
+        for cited in sorted(set(RUN_ID.findall(text)), key=int):
+            if int(cited) > evidence_since and cited not in runs:
+                errors.append(f"{name} cites run {cited}, which {INDEX} does not have: "
+                              f"tools/ci-results.py collect {cited}, in the same commit")
+        for n, sentence, hosts in sentences(name, text):
+            subjects = set(TEST_NAMED.findall(sentence)) | {a for a in ALIAS_NAMED.findall(sentence) if a in aliases}
+            if not subjects:
+                if any(p.search(sentence) for p in g["near-miss"]):
+                    warnings.append(f"{name}:{n}: a near miss of a run claim (tools/run-claims.txt): {sentence[:80]}")
+                continue
+            for p in g["near-miss"]:
+                if p.search(sentence):
+                    msg = f"{name}:{n}: a near miss of a run claim (tools/run-claims.txt): {sentence[:80]}"
+                    (errors if g["severity"][0] == "error" else warnings).append(msg)
+            if any(p.search(sentence) for p in g["not-run"]):
+                ran = [r for r in rows if any(row_is(r, s) for s in subjects) and host_family(r) in hosts]
+                if ran:
+                    key = (name, n)
+                    if key not in blame_cache:
+                        blame_cache[key] = blame_commit(repo, name, n)
+                    written = blame_cache[key]
+                    after = [r for r in ran if written and is_ancestor(repo, written, r["commit"])]
+                    for r in after[:1]:
+                        errors.append(f"{name}:{n} says {r['alias'] or r['name'].rsplit('::', 1)[-1]} has not run, "
+                                      f"but run {r['run']} ({r['commit'][:8]}, {r['job']}) ran it: {r['result']}")
+            for p in g["historical"]:
+                for m in p.finditer(sentence):
+                    verb = m.group(1).lower()
+                    want = {"passed": {"pass"}, "failed": {"fail", "crash"}, "ran": RESULTS}[verb]
+                    tests = {s for s in subjects}
+                    if len(tests) != 1 and not (len(tests) == 2 and
+                                                any(r["alias"] in tests and any(row_is(r, t) for t in tests)
+                                                    for r in rows)):
+                        continue
+                    for run in RUN_ID.findall(m.group(2)):
+                        if run not in runs:
+                            continue
+                        got = [r for r in rows if r["run"] == run and any(row_is(r, s) for s in tests)
+                               and host_family(r) in hosts]
+                        if not got:
+                            errors.append(f"{name}:{n} says {' / '.join(sorted(tests))} {verb} in run {run}, "
+                                          f"which has no row for it")
+                        elif not any(r["result"] in want for r in got):
+                            errors.append(f"{name}:{n} says {' / '.join(sorted(tests))} {verb} in run {run}, "
+                                          f"which has it {', '.join(sorted({r['result'] for r in got}))}")
+    return errors, warnings
+
+
+def collect(root, run, inputs, docs):
+    """Adds run's rows (from its results-* files) to the evidence, filtered
+    to the names the documents mention, and its line to the index."""
+    texts = []
+    new = []
+    for p in inputs:
+        r, errs = parse_rows(Path(p).read_text(encoding="utf-8"), str(p))
+        if errs or validate(Path(p).read_text(encoding="utf-8"), str(p)):
+            raise SystemExit(f"collect: {p}: " + "; ".join(errs or validate(Path(p).read_text(encoding="utf-8"), str(p))))
+        new += r
+        texts.append(Path(p).read_bytes())
+    if {r["run"] for r in new} - {run}:
+        raise SystemExit(f"collect: the inputs hold rows of runs other than {run}")
+    commits = {r["commit"] for r in new}
+    if len(commits) != 1:
+        raise SystemExit(f"collect: run {run}'s rows name {len(commits)} commits")
+    commit = next(iter(commits))
+    if not is_ancestor(root, commit, "HEAD"):
+        raise SystemExit(f"collect: run {run}'s commit {commit[:12]} is not an ancestor of HEAD")
+    old, runs, errors = load_evidence(root)
+    if errors:
+        raise SystemExit("collect: the evidence does not check: " + "; ".join(errors))
+    if run in runs:
+        raise SystemExit(f"collect: run {run} is in the evidence already")
+    names = doc_subjects(docs, new + old)
+    keep = [r for r in new if any(row_is(r, s) for s in names)]
+    allrows = old + keep
+    ev, idx = root / EVIDENCE, root / INDEX
+    ev.parent.mkdir(parents=True, exist_ok=True)
+    body = "".join(run_block(allrows, r) for r in sorted({x["run"] for x in allrows}, key=int))
+    ev.write_text(HEADER + "\n" + "\t".join(COLUMNS) + "\n" + body, encoding="utf-8")
+    lines = idx.read_text(encoding="utf-8").splitlines() if idx.is_file() else ["\t".join(INDEX_COLUMNS)]
+    lines.append("\t".join((run, commits.pop(), sha256(run_block(allrows, run)),
+                            sha256(b"".join(sorted(texts))))))
+    idx.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return len(keep), len(new)
+
+
 READERS = {
     "libtest": lambda p, s: read_libtest(p),
     "pytest-json": lambda p, s: read_pytest_json(p),
@@ -341,9 +592,81 @@ def selftest():
         other = text + text.splitlines()[-1].replace("\twindows\t", "\tmacos\t") + "\n"
         expect("one job per file", len(validate(other)), 1)
         expect("header", validate("x\n")[0].endswith(f"is not {HEADER!r}"), True)
+    claims_selftest(expect)
     if fails:
         sys.exit("ci-results: selftest failed:\n  " + "\n  ".join(fails))
     print("ci-results: selftest ok")
+
+
+def claims_selftest(expect):
+    """Collect and the offline check of run claims, in a repository of their own."""
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+0000",
+           "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+0000", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def git(*args, cwd):
+        return subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+    moved = "test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages"
+    # Audit 5's finding, in the words docs/COMPATIBILITY.md's memory.max row had
+    # at 70f7b405 (its Windows cell): not run yet, while CI runs 43784960688
+    # and 43790310601, on later commits, had run it and it failed.
+    said = ("MOVEUNDERVCPU (`" + moved + "`: the chunk a vCPU reads, then writes, moved under it at the limit) needs "
+            "WHP: in CI runs 43680983973 and 43688550565 it moved 0 of 40 rounds; with a fresh page's fill since, not "
+            "run yet: it stands on the next CI or PC run.")
+    table = "| Control | Linux | macOS | Windows |\n| --- | --- | --- | --- |\n| memory.max | a | b | " + said + " |\n"
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        (repo / "tools").mkdir()
+        (repo / GRAMMAR).write_text((ROOT / GRAMMAR).read_text())
+        git("init", "-q", "-b", "main", cwd=repo)
+        (repo / "x").write_text("before")
+        git("add", "-A", cwd=repo)
+        git("commit", "-q", "-m", "before the sentence", cwd=repo)
+        before = git("rev-parse", "HEAD", cwd=repo)
+        (repo / "COMPATIBILITY.md").write_text(table)
+        git("add", "-A", cwd=repo)
+        git("commit", "-q", "-m", "the sentence", cwd=repo)
+        (repo / "x").write_text("after")
+        git("add", "x", cwd=repo)
+        git("commit", "-q", "-m", "a later commit, which the run built", cwd=repo)
+        after = git("rev-parse", "HEAD", cwd=repo)
+        docs = {"COMPATIBILITY.md": table}
+
+        def results(run, commit):
+            out = repo / f"results-{run}.tsv"
+            ctx = (run, commit, "windows", "Windows Server 2025 26100", "AMD EPYC 7763 64-Core Processor")
+            write_rows(out, ctx, "wick", "unit", read_libtest(FIXTURES / "libtest-windows-43790310601.log")
+                       + [("kvm_ioctls", "tests::test_no_doc_names_it", "pass", "")],
+                       {"whp::vcpu::fpu_tests::" + moved: "MOVEUNDERVCPU"})
+            return out
+
+        # A run of a commit before the sentence: no contradiction.
+        kept, total = collect(repo, "43688550565", [results("43688550565", before)], docs.values())
+        expect("collect keeps the rows the docs name", (kept, total), (1, 2))
+        errors, _ = check_run_claims(repo, repo, docs, 43688550565)
+        expect("a run before the sentence", errors, [])
+        # The runs after it: "not run yet" is contradicted.
+        collect(repo, "43790310601", [results("43790310601", after)], docs.values())
+        errors, _ = check_run_claims(repo, repo, docs, 43688550565)
+        expect("audit 5: MOVEUNDERVCPU said not run", errors,
+               ["COMPATIBILITY.md:3 says MOVEUNDERVCPU has not run, but run 43790310601 (" + after[:8]
+                + ", windows) ran it: fail"])
+        # Historical claims against their run's rows.
+        for text, want in (("MOVEUNDERVCPU (`" + moved + "`) failed in CI runs 43790310601 (6e561e24).", []),
+                           ("MOVEUNDERVCPU (`" + moved + "`) passed in run 43790310601.",
+                            ["h.md:1 says MOVEUNDERVCPU / " + moved + " passed in run 43790310601, which has it fail"]),
+                           ("`test_other` failed in run 43790310601.",
+                            ["h.md:1 says test_other failed in run 43790310601, which has no row for it"]),
+                           ("Seen in run 43790310601 and run 43799999999.",
+                            ["h.md cites run 43799999999, which " + INDEX + " does not have: tools/ci-results.py "
+                             "collect 43799999999, in the same commit"])):
+            errors, _ = check_run_claims(repo, repo, {"h.md": text}, 43790310601)
+            expect(f"historical: {text[:40]}", errors, want)
+        # A row edited by hand fails its run's hash.
+        ev = repo / EVIDENCE
+        ev.write_text(ev.read_text().replace("\tfail\t", "\tpass\t"))
+        expect("hand edit", any("not what collect wrote" in e for e in load_evidence(repo)[2]), True)
 
 
 def read_lines_text(text):
@@ -351,6 +674,33 @@ def read_lines_text(text):
         p = Path(tmp) / "lines.log"
         p.write_text(text)
         return read_lines(p, "selftest")
+
+
+def tracked_documents(root):
+    out = subprocess.run(["git", "-C", str(root), "ls-files", "*.md"], capture_output=True, text=True, check=True)
+    return {d: (root / d).read_text(encoding="utf-8") for d in out.stdout.split()
+            if not d.startswith("lib/") and not d.startswith("docs/design-") and (root / d).is_file()}
+
+
+def collect_cmd(run, src):
+    if not RUN.match(run):
+        raise SystemExit(f"collect: {run!r} is neither a CI run id nor local:<machine>:<time>")
+    with tempfile.TemporaryDirectory() as tmp:
+        if src is None:
+            if not run.isdigit():
+                raise SystemExit("collect: a local run comes with --from DIR")
+            got = subprocess.run(["gh", "run", "download", run, "-R", "toollyst/wick", "-p", "results-*", "-D", tmp],
+                                 capture_output=True, text=True)
+            if got.returncode != 0:
+                raise SystemExit(f"collect: gh run download {run}: {got.stderr.strip()} (artifacts last 14 days; a "
+                                 f"run older than that cannot be collected)")
+            src = tmp
+        inputs = sorted(Path(src).rglob("results.tsv")) or sorted(Path(src).rglob("*.tsv"))
+        if not inputs:
+            raise SystemExit(f"collect: no results.tsv under {src}")
+        kept, total = collect(ROOT, run, inputs, tracked_documents(ROOT).values())
+    print(f"ci-results: run {run}: {kept} of {total} rows kept (the names the documents mention) in {EVIDENCE}")
+    return 0
 
 
 def main():
@@ -370,7 +720,14 @@ def main():
                      help="the short name the docs use for a test (MOVEUNDERVCPU)")
     val = sub.add_parser("validate")
     val.add_argument("files", nargs="+")
+    col = sub.add_parser("collect", help="add a run's results to docs/evidence (the only writer)")
+    col.add_argument("run")
+    col.add_argument("--from", dest="src", metavar="DIR",
+                     help="the run's results-* files already here (a PC run's results.tsv); default: download "
+                          "them with gh (read-only)")
     a = ap.parse_args()
+    if a.cmd == "collect":
+        return collect_cmd(a.run, a.src)
     if a.cmd == "validate":
         errors = [e for f in a.files for e in validate(Path(f).read_text(encoding="utf-8"), f)]
         for e in errors:
