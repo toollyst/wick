@@ -4606,6 +4606,68 @@ mod tests {
             }
             held.push(p as usize);
         }
+        // The last pages where a page table is already, as [`no_room_left`]
+        // takes them: a `VirtualAlloc` of a page that needs a new page table
+        // needs 8 KiB, so with 4 KiB left it is refused and the room stays
+        // for the move's map, which then is made and owes nothing (OWEDREC,
+        // runs/owedrec-2022.log, the one failing run of 20 alone on 20348,
+        // run 18: "the hook took 8 KiB; private commit 98300 KiB" of a 98304
+        // KiB limit, the move made, nothing owed; the same in the failing run
+        // on 26100, owedrec-2025.log run 12). With the slack taken too,
+        // 100 of 100 alone on each (runs/owedfix3-2022.log, owedfix-2025.log),
+        // the 8 + 4 KiB case among them.
+        let before = SLACK_TAKEN.load(Ordering::SeqCst);
+        let after = take_the_slack();
+        HOOK_SLACK.store((before << 32) | after, Ordering::SeqCst);
+        // OWEDREC: what the hook found to take (nothing allocated: it runs
+        // at the limit).
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "OWEDREC the move gave back its dead pages' charge; the hook took {} KiB in pages and {} KiB where a page table was; private commit {} KiB",
+            held.len() * PAGE as usize / 1024,
+            (after - before) * PAGE as usize / 1024,
+            private_commit() / 1024
+        ));
+    }
+
+    /// The slack pages [`take_the_room_given_up`] took: the count taken
+    /// before it (high 32 bits) and after it (low).
+    static HOOK_SLACK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Gives back all [`take_the_room_given_up`] took: its pages and its
+    /// slack pages (the slack taken before it stays taken).
+    fn give_back_the_room_taken() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        {
+            let mut t = ROOM_TAKEN.lock().unwrap();
+            while !t.is_empty() {
+                give_back_a_page(&mut t);
+            }
+        }
+        let v = HOOK_SLACK.swap(0, Ordering::SeqCst);
+        let (before, after) = (v >> 32, v & 0xffff_ffff);
+        let base = SLACK.load(Ordering::SeqCst);
+        if base != 0 && after > before {
+            // SAFETY: pages of our slack region the hook committed.
+            unsafe { VirtualFree((base + (before + 1) * PAGE as usize) as *mut c_void, (after - before) * PAGE as usize, MEM_DECOMMIT) };
+            SLACK_TAKEN.store(before, Ordering::SeqCst);
+        }
+    }
+
+    /// OWEDREC: one line of [`owed_goes_child`]'s steps, without allocating
+    /// (it is said at the limit): the step, the private commit, the reclaim's
+    /// counts so far and the charge owed.
+    fn owed_step(step: &str) {
+        let c = reclaim_counts();
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "OWEDREC {step}: private commit {} KiB; reclaims asked {}, candidates {}, moves made {}, not made {}; owed {} KiB; the hook ran {}",
+            private_commit() / 1024,
+            c.asks,
+            c.candidates,
+            c.moves,
+            c.refused,
+            crate::windows_mm::owed_bytes() / 1024,
+            ROOM_TAKEN_ONCE.load(Ordering::SeqCst)
+        ));
     }
 
     /// One page filled at `at`: "made", "ENOMEM" or "another errno".
@@ -4663,12 +4725,7 @@ mod tests {
             owed >> 10,
             still >> 10
         ));
-        {
-            let mut t = ROOM_TAKEN.lock().unwrap();
-            while !t.is_empty() {
-                give_back_a_page(&mut t);
-            }
-        }
+        give_back_the_room_taken();
         let mut n = 0;
         while n < 4 << 20 {
             if fill_a_page(ctx, mem + done + n) != "made" {
@@ -4776,6 +4833,9 @@ mod tests {
     #[test]
     fn test_a_chunk_whose_dead_pages_lie_above_unfilled_ones_moves() {
         let (code, text) = run_child("dead_above_unfilled_child", Some(96 << 20));
+        for l in text.lines().filter(|l| l.starts_with("OWEDREC") || l.starts_with("room left") || l.starts_with("wick: reclaim") || l.starts_with("filled")) {
+            std::eprintln!("{l}");
+        }
         assert!(text.contains("dead above unfilled: the fill made, 1 moves made, 0 not made, 0 KiB owed"), "{text}");
         assert_eq!(code, Some(0), "{text}");
     }
@@ -4788,8 +4848,28 @@ mod tests {
         // SAFETY: registered memory of ours.
         assert_eq!(unsafe { crate::madvise(last as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
         let mut held = no_room_left();
+        owed_step("dead above unfilled, no room left");
+        {
+            // Whether the fill's page has a page table already: a committed
+            // page in its 2 MiB-aligned region (one page table maps 2 MiB).
+            let target = mem + done;
+            let region = target - target % (2 << 20);
+            let mut committed = 0;
+            let mut at = region;
+            while at < target {
+                if committed_protection(at).is_some() {
+                    committed += 1;
+                }
+                at += PAGE;
+            }
+            crate::windows_mm::say_at_the_limit(format_args!(
+                "OWEDREC the fill's page is {} KiB into its 2 MiB-aligned region, {committed} pages committed below it there; the range at {mem:#x}, the page at {target:#x}",
+                (target - region) / 1024
+            ));
+        }
         let (m1, refused1) = (moves_on_record().0.len(), crate::windows_mm::moves_refused());
         let fill = fill_a_page(ctx, mem + done);
+        owed_step("dead above unfilled, after the fill");
         let (m2, refused2) = (moves_on_record().0.len(), crate::windows_mm::moves_refused());
         let owed = crate::windows_mm::owed_bytes();
         give_back_every_page(&mut held);
@@ -4820,6 +4900,9 @@ mod tests {
     #[test]
     fn test_an_owed_charge_goes_with_its_range() {
         let (code, text) = run_child("owed_goes_child", Some(96 << 20));
+        for l in text.lines().filter(|l| l.starts_with("OWEDREC") || l.starts_with("room left") || l.starts_with("wick: reclaim")) {
+            std::eprintln!("{l}");
+        }
         assert!(text.contains("owed: 12 KiB; unregistered and unmapped: 0 KiB owed; the same address committed, charged false; another fill made"), "{text}");
         assert_eq!(code, Some(0), "{text}");
     }
@@ -4830,17 +4913,16 @@ mod tests {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
         ROOM_TAKEN.lock().unwrap().reserve_exact(4096);
+        owed_step("filled to the limit, half of 8 chunks discarded");
         let mut held = no_room_left();
+        owed_step("no room left");
         *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = Some(take_the_room_given_up);
-        let _ = fill_a_page(ctx, mem + done);
+        let fill = fill_a_page(ctx, mem + done);
         *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = None;
+        crate::windows_mm::say_at_the_limit(format_args!("OWEDREC the fill at the limit: {fill}"));
+        owed_step("after the fill");
         let owed = crate::windows_mm::owed_bytes();
-        {
-            let mut t = ROOM_TAKEN.lock().unwrap();
-            while !t.is_empty() {
-                give_back_a_page(&mut t);
-            }
-        }
+        give_back_the_room_taken();
         give_back_every_page(&mut held);
         // Registered before the old range's addresses are free: a range
         // stays in the table, unregistered, until its userfaultfd is closed.
