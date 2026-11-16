@@ -973,6 +973,8 @@ pub(crate) fn mprotect_registered(start: u64, end: u64, read: bool, write: bool,
         return Ok(done);
     }
     let _guard = lock();
+    // The registered pages, and those of them that hold memory, by range.
+    let mut live: Vec<(&'static Range, u64, u64, u64)> = Vec::new();
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::Acquire);
         let e = r.end.load(Ordering::Acquire);
@@ -980,17 +982,12 @@ pub(crate) fn mprotect_registered(start: u64, end: u64, read: bool, write: bool,
             continue;
         }
         let (a, b) = (start.max(s), end.min(e));
-        let mut tracked_run: Option<u64> = None;
-        let mut live_run: Option<u64> = None;
+        let (mut tracked_run, mut live_run): (Option<u64>, Option<u64>) = (None, None);
         let mut at = a;
         while at <= b {
             let page = (at - s) / PAGE;
             let tracked = at < b && Range::test(&r.tracked, page);
-            let live = tracked && !Range::test(&r.missing, page);
-            if tracked {
-                Range::set(&r.noread, page, !read && !write);
-                Range::set(&r.nowrite, page, !write);
-            }
+            let holds = tracked && !Range::test(&r.missing, page);
             match (tracked, tracked_run) {
                 (true, None) => tracked_run = Some(at),
                 (false, Some(t)) => {
@@ -999,15 +996,40 @@ pub(crate) fn mprotect_registered(start: u64, end: u64, read: bool, write: bool,
                 }
                 _ => {}
             }
-            match (live, live_run) {
+            match (holds, live_run) {
                 (true, None) => live_run = Some(at),
                 (false, Some(l)) => {
-                    protect_as(l, at - l, wprot).map_err(|_| crate::EACCES)?;
+                    live.push((r, s, l, at - l));
                     live_run = None;
                 }
                 _ => {}
             }
             at += PAGE;
+        }
+    }
+    // All or nothing within the registered pages: the pages with memory get
+    // the protection first; if one cannot (a protection the view does not
+    // allow, such as execute), those changed get theirs back, from the
+    // bitmaps not yet changed, and nothing is changed. Linux changes a vma
+    // whole or not at all (mm/mprotect.c, `mprotect_fixup`), and a failure
+    // leaves the vmas before it changed: so do the spans `mprotect` does
+    // after these.
+    for (n, &(_, _, l, len)) in live.iter().enumerate() {
+        if protect_as(l, len, wprot).is_err() {
+            for &(r, s, l, len) in &live[..n] {
+                r.by_prot(s, l, len, |a, k, prot| {
+                    let _ = protect_as(a, k, prot);
+                });
+            }
+            return Err(crate::EACCES);
+        }
+    }
+    for &(a, len) in &done {
+        let Some((r, _)) = find(a) else { continue };
+        let s = r.start.load(Ordering::Acquire);
+        for page in (a - s) / PAGE..(a + len - s) / PAGE {
+            Range::set(&r.noread, page, !read && !write);
+            Range::set(&r.nowrite, page, !write);
         }
     }
     Ok(done)
@@ -2107,6 +2129,43 @@ mod tests {
         // Plugged again: a userfault again.
         mprotect_of(unplugged, slot_len, crate::PROT_READ | crate::PROT_WRITE).unwrap();
         read_through_the_handler(unplugged + 7 * PAGE, 0x63);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// The protection of a committed page, from `VirtualQuery`.
+    fn page_protection(addr: u64) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        assert_ne!(unsafe { VirtualQuery(addr as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) }, 0);
+        mbi.Protect
+    }
+
+    /// An `mprotect` of registered memory that cannot be done changes none of
+    /// its pages: here an executable protection, which the views of a
+    /// range's sections do not allow (`EACCES`). The filled pages keep the
+    /// protection they had, and a missing page filled afterwards takes the
+    /// one given before, not the refused one.
+    #[test]
+    fn test_a_refused_mprotect_of_registered_memory_changes_nothing() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let mem = map_noreserve(64 << 10);
+        register(ctx, mem, 64 << 10).unwrap();
+        let page = std::vec![0x5au8; PAGE as usize];
+        for p in [0, 2] {
+            // SAFETY: `page` holds a page.
+            unsafe { copy(ctx, page.as_ptr(), mem + p * PAGE, PAGE, false) }.unwrap();
+        }
+        mprotect_of(mem, 4 * PAGE, crate::PROT_READ).unwrap();
+        assert_eq!(page_protection(mem), PAGE_READONLY);
+        let refused = mprotect_of(mem, 4 * PAGE, crate::PROT_READ | crate::PROT_WRITE | crate::PROT_EXEC).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(crate::EACCES), "{refused}");
+        assert_eq!((page_protection(mem), page_protection(mem + 2 * PAGE)), (PAGE_READONLY, PAGE_READONLY));
+        // SAFETY: `page` holds a page.
+        unsafe { copy(ctx, page.as_ptr(), mem + PAGE, PAGE, false) }.unwrap();
+        assert_eq!(page_protection(mem + PAGE), PAGE_READONLY);
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
