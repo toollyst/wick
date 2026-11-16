@@ -625,22 +625,28 @@ jobs:
           fi
       # A state file made on Linux x86_64 by this run's linux-boot job is
       # refused here with upstream's error, before a VM is made (so it needs
-      # no Hypervisor.framework). When linux-boot has failed there is no file:
-      # the download fails (the action's error for a name that is not there),
-      # the test after it is skipped, and the job fails; the steps before and
-      # after are not held back.
+      # no Hypervisor.framework). Not run, said so, when linux-boot did not
+      # succeed and so made no state file (run 43790310601: its setup could
+      # not fetch upstream): that job's own failure is the cause, and it keeps
+      # the run red. A missing state file from a linux-boot that succeeded
+      # fails here. The steps before and after are not held back.
       - name: Download the state file made on Linux
         # Runs after an earlier step's failure too: each step answers its own question.
         if: (success() || failure()) && steps.build.outcome == 'success'
         id: vmstate
+        continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: linux-vmstate
           path: ${{ runner.temp }}/linux-vmstate
       - name: A snapshot made on Linux x86_64 is refused
-        if: (success() || failure()) && steps.build.outcome == 'success' && steps.vmstate.outcome == 'success'
+        if: (success() || failure()) && steps.build.outcome == 'success'
         working-directory: lib/firecracker
         run: |
+          if [ "${{ steps.vmstate.outcome }}" != success ] && [ "${{ needs.linux-boot.result }}" != success ]; then
+            echo "::warning::foreign-snapshot-test.py not run: linux-boot ${{ needs.linux-boot.result }}, so it produced no state file"
+            exit 0
+          fi
           cargo build --locked -p snapshot-editor
           cat "$RUNNER_TEMP/linux-vmstate/linux-x86_64.txt"
           python3 -I ../../tools/macos/foreign-snapshot-test.py build/cargo_target/debug/firecracker \
