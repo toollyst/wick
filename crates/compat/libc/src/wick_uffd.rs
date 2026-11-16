@@ -98,7 +98,7 @@
 //! the system call alone. The backend's stage-2 hook takes its own lock
 //! under [`LOCK`] and waits for nothing there.
 //!
-//! A userfaultfd is one end of a socket pair. Events are [`RECORD`]-byte
+//! A userfaultfd is one end of a socket pair. Events are [`RECORD`](proto::RECORD)-byte
 //! records read from it ([`proto`]). Another process holding the descriptor
 //! sends its requests over a private channel it sets up through it; a thread
 //! per userfaultfd serves them.

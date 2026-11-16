@@ -568,6 +568,20 @@ jobs:
       - name: Clippy
         working-directory: lib/firecracker
         run: cargo clippy --locked -p vmm -p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings
+      # A broken intra-doc link in wick's code fails here: the compatibility
+      # crates, wick-ext and wick-version are wick's whole, so the lint is
+      # denied for each; in vmm and the jailer, wick's modules (overlay/) deny
+      # it themselves and upstream's keep upstream's warnings. A link to an
+      # item built on another host only (a `windows` module) is plain text.
+      - name: Rustdoc links
+        if: (success() || failure()) && steps.build.outcome == 'success'
+        working-directory: lib/firecracker
+        run: |
+          for c in ../../crates/compat/*/ ../../crates/ext/ ../../crates/version/; do
+            RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" \
+              cargo doc --locked --no-deps --manifest-path "$c/Cargo.toml"
+          done
+          cargo doc --locked --no-deps -p vmm -p firecracker -p jailer
       # As upstream on a Linux host without /dev/nitro_enclaves (linux-boot
       # runs the same script there).
       - name: Nitro Enclave refused without the device

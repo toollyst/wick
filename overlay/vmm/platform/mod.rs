@@ -10,9 +10,13 @@
 //!
 //! | Interface | Linux | macOS | Windows |
 //! |---|---|---|---|
-//! | [`async_io`] | io_uring | worker threads, `pread`/`pwrite`/`F_FULLFSYNC` | the macOS worker threads, `FlushFileBuffers` |
-//! | [`fs`] | (holes kept by the file system) | holes restored with `F_PUNCHHOLE` | sparse files, holes restored and checked |
-//! | [`net`] | TUN/TAP | vmnet.framework, or a Unix datagram endpoint; [`vnet`] header handling | a Unix stream endpoint (QEMU framing); [`vnet`] header handling |
+//! | [`async_io`](crate::platform::async_io) | io_uring | worker threads, `pread`/`pwrite`/`F_FULLFSYNC` | the macOS worker threads, `FlushFileBuffers` |
+//! | [`fs`](crate::platform::fs) | (holes kept by the file system) | holes restored with `F_PUNCHHOLE` | sparse files, holes restored and checked |
+//! | [`net`](crate::platform::net) | TUN/TAP | vmnet.framework, or a Unix datagram endpoint; [`vnet`](crate::platform::vnet) header handling | a Unix stream endpoint (QEMU framing); [`vnet`](crate::platform::vnet) header handling |
+
+// A broken documentation link in wick's code fails `cargo doc` (CI's macOS
+// rustdoc step); upstream's modules keep upstream's lint levels.
+#![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod async_io;
 pub mod fs;

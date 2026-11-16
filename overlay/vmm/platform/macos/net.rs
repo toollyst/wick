@@ -101,8 +101,8 @@ fn network() -> Option<(&'static Path, BorrowedFd<'static>)> {
 /// microVM may not call geteuid (upstream's filter has none) and a device
 /// hot-plugged then asks (`test_a_hotplugged_interface_asks_no_uid`). Unit
 /// tests run with that right by default, as upstream's run as root; the
-/// tests of the refusal take it away, and [`tests_as::real`] asks the
-/// process ([`tests_as`]).
+/// tests of the refusal take it away, and `tests_as::real` asks the
+/// process (`tests_as`).
 pub fn may_create() -> bool {
     #[cfg(test)]
     if let Some(creator) = tests_as::CREATOR.with(std::cell::Cell::get) {
@@ -167,7 +167,7 @@ fn in_group(gid: libc::gid_t) -> bool {
 }
 
 /// Whether this Firecracker is jailed: given a network (`--netns`) or in a
-/// chroot jail. A test may say so for its thread ([`tests_as`]).
+/// chroot jail. A test may say so for its thread (`tests_as`).
 fn jailed() -> bool {
     #[cfg(test)]
     if let Some(jailed) = tests_as::JAILED.with(std::cell::Cell::get) {
@@ -531,16 +531,16 @@ fn refuse(name: &str, why: fmt::Arguments<'_>) -> TapError {
 /// hot-plugged into one looks the directory up
 /// (`test_a_bare_name_hotplugged_without_a_network_opens`).
 ///
-/// In the crate's own tests only, [`TEST_ENDPOINT_DIR`] names another
+/// In the crate's own tests only, `TEST_ENDPOINT_DIR` names another
 /// directory: tools/macos/check-unit-tests.py gives each test binary an empty
 /// one and fails on what is left in it but the files listed in
 /// tools/macos/unit-test-litter.txt (two of upstream's tests leak their
 /// devices), so that no run fills the user's directory and new litter fails.
 /// Without it a test process uses `fcnet-test-<pid>` in the same temporary
-/// directory, removed when the process exits ([`test_dir::remove_at_exit`];
+/// directory, removed when the process exits (`test_dir::remove_at_exit`;
 /// tools/clean.sh removes one whose process is gone), never the user's
 /// `firecracker-net`; a test that runs the test binary again gives it its
-/// own directory in [`TEST_ENDPOINT_DIR`] (`platform::net::test_binary`).
+/// own directory in `TEST_ENDPOINT_DIR` (`platform::net::test_binary`).
 pub fn user_endpoint_dir() -> io::Result<PathBuf> {
     static DIR: std::sync::OnceLock<Result<PathBuf, i32>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {

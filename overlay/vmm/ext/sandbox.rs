@@ -9,7 +9,7 @@
 //!
 //! | Firecracker flag        | Linux                 | macOS                                   | Windows                                   |
 //! |-------------------------|-----------------------|-----------------------------------------|-------------------------------------------|
-//! | (default)               | built-in BPF filters  | built-in Seatbelt profile ([`PROFILE`]) | process mitigation profile ([`windows`])  |
+//! | (default)               | built-in BPF filters  | built-in Seatbelt profile ([`PROFILE`]) | process mitigation profile (`windows`, built on Windows only)  |
 //! | `--no-seccomp`          | no filters            | no sandbox                              | no sandbox                                |
 //! | `--seccomp-filter FILE` | the given BPF filters | refused (BPF cannot be enforced)        | refused (BPF cannot be enforced)          |
 //!

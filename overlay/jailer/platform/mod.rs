@@ -31,13 +31,17 @@
 //! hand-over mark (any other binary would run unjailed as root).
 //!
 //! Windows has no chroot, no user switch for a non-elevated jailer and no
-//! exec; its backend ([`windows`]) makes the jail's root a drive of its own
+//! exec; its backend (`windows`, built on Windows only) makes the jail's root a drive of its own
 //! (upstream's absolute paths resolve inside it), confines Firecracker with a
 //! restricted low integrity token in place of `uid:gid` and with a Job Object
 //! in place of cgroups, and starts it, waits for it and exits with its
 //! status. Upstream's Unix-only steps around those (file modes and owners,
 //! resource limits, daemonizing) go through the same backend on Windows
 //! (patch 0019).
+
+// A broken documentation link in wick's code fails `cargo doc` (CI's macOS
+// rustdoc step); upstream's modules keep upstream's lint levels.
+#![deny(rustdoc::broken_intra_doc_links)]
 
 #[cfg(target_os = "macos")]
 mod macos;

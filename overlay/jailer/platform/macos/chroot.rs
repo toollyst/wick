@@ -9,6 +9,10 @@
 //! inside a chroot on macOS, and Firecracker enters the same jail itself
 //! before anything else.
 
+// A broken documentation link in wick's code fails `cargo doc` (CI's macOS
+// rustdoc step); upstream's modules keep upstream's lint levels.
+#![deny(rustdoc::broken_intra_doc_links)]
+
 use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::OwnedFd;

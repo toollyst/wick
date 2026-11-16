@@ -13,6 +13,10 @@
 //!
 //! See `docs/ARCHITECTURE.md`.
 
+// A broken documentation link in wick's code fails `cargo doc` (CI's macOS
+// rustdoc step); upstream's modules keep upstream's lint levels.
+#![deny(rustdoc::broken_intra_doc_links)]
+
 pub mod api_process;
 pub mod fifo;
 pub mod jail;

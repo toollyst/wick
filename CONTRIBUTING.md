@@ -528,7 +528,8 @@ without a reason in its `not_run()`. An input that fails is saved in
   makes, for every host column it touches, not only that the other columns
   did not change.
 - Run the checks CI runs: `tools/patches.sh check`, the build and clippy for your host, the compatibility crates'
-  tests (`.github/workflows/ci.yml` has the exact commands), and `tools/check-dependencies.sh` if you changed a
-  `Cargo.toml` or `Cargo.lock`.
+  tests, on macOS `cargo doc` with broken intra-doc links denied in wick's code (the "Rustdoc links" step; a link
+  to an item built on another host only is written as plain text) (`.github/workflows/ci.yml` has the exact
+  commands), and `tools/check-dependencies.sh` if you changed a `Cargo.toml` or `Cargo.lock`.
 
 By contributing, you agree that your work is licensed under the project's license (Apache-2.0).

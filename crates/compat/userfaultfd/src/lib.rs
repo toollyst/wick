@@ -5,7 +5,7 @@
 //!
 //! - Linux: the original crate, re-exported as is.
 //! - macOS and Windows: the same API and semantics, on the userfaultfd kernel
-//!   side in wick's `libc` (`libc::wick_uffd`). See [`macos`], [`windows`]
+//!   side in wick's `libc` (`libc::wick_uffd`). See [`macos`], `windows` (built on Windows only)
 //!   and `docs/ARCHITECTURE.md`.
 //! - Other hosts: the API Firecracker uses; creating a userfaultfd fails
 //!   until the host has a backend (`docs/ROADMAP.md`).

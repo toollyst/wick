@@ -30,10 +30,12 @@ pub use linux_items::{getsockopt, madvise, mincore, mmap, mprotect, munmap, sysc
 /// `mmap` knows to map it in huge pages (docs/PORTING.md row 10).
 #[cfg(target_os = "macos")]
 pub const HUGE_MEMFD_PREFIX: &str = "/fcmH.";
-/// The kernel side of userfaultfd (a wick API, not part of `libc`).
+// The kernel side of userfaultfd (a wick API, not part of `libc`): its
+// documentation is the module's own, whose links resolve inside it.
 #[cfg(target_os = "macos")]
 pub mod wick_uffd;
-/// The hypervisor backend's hooks on guest memory (a wick API, not part of `libc`).
+// The hypervisor backend's hooks on guest memory (a wick API, not part of
+// `libc`): its documentation is the module's own, as `wick_uffd`'s.
 #[cfg(target_os = "macos")]
 pub mod wick_guest;
 // CLOCK_MONOTONIC as Linux has it: the explicit re-export takes precedence

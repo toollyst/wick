@@ -33,6 +33,10 @@
 //! is accepted and places nothing, as on Linux when no such parent was made
 //! beforehand.
 
+// A broken documentation link in wick's code fails `cargo doc` (CI's macOS
+// rustdoc step); upstream's modules keep upstream's lint levels.
+#![deny(rustdoc::broken_intra_doc_links)]
+
 use std::path::{Path, PathBuf};
 
 use crate::JailerError;

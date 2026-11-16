@@ -71,6 +71,7 @@ tools/setup.sh                          # after cloning and after pulling change
 cd lib/firecracker
 cargo build -p firecracker              # build
 cargo clippy -p vmm -p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings
+cargo doc --no-deps -p vmm -p firecracker -p jailer  # wick's modules (overlay/) deny broken doc links; ci.yml's "Rustdoc links" step also checks crates/
 cd ../..
 
 tools/macos/test.sh                     # upstream's vmm unit tests with Hypervisor.framework (macOS); a blocked test child's stacks only with WICK_TEST_STACKS=1, as sample can raise the Developer Tools dialog

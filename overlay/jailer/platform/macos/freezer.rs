@@ -108,7 +108,7 @@
 //!   stays frozen until root kills the jail, and nothing thaws it through the
 //!   file. It holds an exclusive lock (`flock`) on the jail's directory while
 //!   it keeps the files, so a reader tells a kept file from a stale one
-//!   ([`maintained`]);
+//!   (the tests' `maintained`);
 //! - if it cannot freeze a process of the jail, or fails otherwise, it kills
 //!   the jail rather than leave a request undone.
 //!
