@@ -4235,8 +4235,65 @@ mod tests {
             let ok = unsafe { QueryInformationJobObject(ptr::null_mut(), JobObjectBasicLimitInformation, (&raw mut l).cast(), core::mem::size_of_val(&l) as u32, ptr::null_mut()) };
             std::println!("the child's immediate job: query {ok}, limit flags {:#x}", l.LimitFlags);
         }
+        // FILTERREC: the error mode asked of the child, in place of the one
+        // it inherited, and the filters' frames said.
+        if let Some(mode) = std::env::var("WICK_TEST_ERROR_MODE").ok().and_then(|m| m.parse::<u32>().ok()) {
+            // SAFETY: plain call.
+            unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode(mode) };
+        }
+        if std::env::var_os("WICK_TEST_FILTER_FRAMES").is_some() {
+            crate::windows_mm::SAY_FILTER_FRAMES.store(true, Ordering::SeqCst);
+        }
+        if std::env::var_os("WICK_TEST_FAIL_FAST").is_some() {
+            crate::windows_mm::FAIL_FAST.store(true, Ordering::SeqCst);
+        }
         // SAFETY: plain call.
         std::println!("the child's error mode: {:#x}", unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode() });
+    }
+
+    /// FILTERREC: the thread a pool's first callback ran on (0 before).
+    static POOLED_ON: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// FILTERREC, a record: how an unhandled exception on a thread pool's
+    /// thread ends, by the child's error mode (0, the system's default;
+    /// 2, `SEM_NOGPFAULTERRORBOX`, which Learn's SetErrorMode says makes
+    /// "the system not invoke Windows Error Reporting", and with which
+    /// UnhandledExceptionFilter "returns control to the exception handler,
+    /// which is free to take any appropriate action"; 3, as CI's runner
+    /// gives its children), for a stack overflow at the reserve's end and
+    /// an access violation, each child alone (no job): its end, the frames
+    /// the filters were called from (FILTERFRAMES), and, where the process
+    /// went on, the thread the pool's next callback ran on and that
+    /// thread's stack (its guard page). With STACKENDHOST's host part.
+    #[test]
+    #[ignore = "a record, run by hand and by CI's WHP step"]
+    fn test_how_a_pool_threads_unhandled_exception_ends_on_record() {
+        stack_end_host_record();
+        for (child, env) in [
+            ("stack_overflow_pool_child", &[][..]),
+            ("unhandled_pool_child", &[("WICK_TEST_FAULT", "av"), ("WICK_TEST_LAZY", "1")][..]),
+        ] {
+            for mode in ["0", "2", "3"] {
+                let mut e = env.to_vec();
+                e.push(("WICK_TEST_ERROR_MODE", mode));
+                e.push(("WICK_TEST_FILTER_FRAMES", "1"));
+                let (code, text, ended) = run_child_watched(child, &e, false);
+                std::eprintln!("FILTERREC {child} error mode {mode}: {code:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
+            }
+            // The end the filters would give by RaiseFailFastException: by
+            // error mode alone, and in a job of the jailer's limits.
+            for (mode, jailed) in [("0", false), ("3", false), ("0", true)] {
+                let mut e = env.to_vec();
+                e.push(("WICK_TEST_ERROR_MODE", mode));
+                e.push(("WICK_TEST_FAIL_FAST", "1"));
+                let (code, text, ended) = run_child_watched(child, &e, jailed);
+                std::eprintln!(
+                    "FILTERREC {child} fail-fast, error mode {mode}{}: {code:?} after {ended:?}; {}",
+                    if jailed { ", in a job as the jailer's" } else { "" },
+                    text.trim().replace('\n', " | ")
+                );
+            }
+        }
     }
 
     /// Runs `body` on a new thread of `kind` and waits for it by the
@@ -4266,6 +4323,8 @@ mod tests {
         unsafe extern "system" fn pooled(_: PTP_CALLBACK_INSTANCE, raw: *mut c_void) {
             // SAFETY: the pair boxed below, given to this callback alone.
             let (said, body) = *unsafe { std::boxed::Box::from_raw(raw.cast::<Started>()) };
+            // SAFETY: plain call.
+            POOLED_ON.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, Ordering::SeqCst);
             said.send(()).unwrap();
             drop(said);
             body(Kind::Pool);
@@ -4273,6 +4332,25 @@ mod tests {
         unsafe extern "system" fn next(_: PTP_CALLBACK_INSTANCE, tx: *mut c_void) {
             // SAFETY: the sender boxed below, given to this callback alone.
             let tx = unsafe { std::boxed::Box::from_raw(tx.cast::<std::sync::mpsc::Sender<()>>()) };
+            {
+                use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualQuery};
+                // SAFETY: plain call.
+                let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+                let (_, limit, reserve, guarantee) = stack_of_this_thread();
+                // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our stack.
+                let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+                // SAFETY: as above, the page below the committed part.
+                let q = unsafe { VirtualQuery((limit - PAGE as usize) as *const c_void, &mut mbi, core::mem::size_of_val(&mbi)) };
+                std::println!(
+                    "FILTERREC the next callback ran on thread {me} (the first ran on {}); its stack: {} KiB of the reserve left below \
+                     the committed part, the page below it state {:#x} protection {:#x} (a guard page: {}), its guarantee {guarantee}",
+                    POOLED_ON.load(Ordering::SeqCst),
+                    (limit - reserve) >> 10,
+                    if q == 0 { 0 } else { mbi.State },
+                    if q == 0 { 0 } else { mbi.Protect },
+                    q != 0 && mbi.Protect & PAGE_GUARD != 0
+                );
+            }
             let _ = tx.send(());
         }
         match kind {

@@ -1638,13 +1638,65 @@ fn stack_137_frames() {
 /// One STACK137FRAMES line: frame `i` at `a`, as an offset in this
 /// executable (its base `own`), else in the module it lies in, else bare.
 fn say_frame(i: usize, a: usize, own: usize) {
+    say_frame_as("STACK137FRAMES", i, a, own);
+}
+
+/// [`say_frame`] under the record name `tag`.
+fn say_frame_as(tag: &str, i: usize, a: usize, own: usize) {
     let mut name = [0u8; 64];
     if a >= own && a - own < 64 << 20 {
-        say_at_the_limit(format_args!("STACK137FRAMES {i} image+{:#x}", a - own));
+        say_at_the_limit(format_args!("{tag} {i} image+{:#x}", a - own));
     } else if let Some((at, len)) = module_of(a, &mut name) {
-        say_at_the_limit(format_args!("STACK137FRAMES {i} {}+{:#x} ({a:#x})", Ascii(&name[..len]), a - at));
+        say_at_the_limit(format_args!("{tag} {i} {}+{:#x} ({a:#x})", Ascii(&name[..len]), a - at));
     } else {
-        say_at_the_limit(format_args!("STACK137FRAMES {i} {a:#x}"));
+        say_at_the_limit(format_args!("{tag} {i} {a:#x}"));
+    }
+}
+
+/// FILTERREC, set by a test's child: [`stack_filter`] and [`last_filter`]
+/// say the frames they were called from (FILTERFRAMES), so that the
+/// record names who called the unhandled-exception filters and so who
+/// takes the exception once they return.
+#[cfg(test)]
+pub(crate) static SAY_FILTER_FRAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// FILTERREC, set by a test's child: the filters end the process with
+/// `RaiseFailFastException` given the exception's own record and context
+/// (Learn: it "bypasses all exception handlers (frame or vector based)",
+/// terminates the process and invokes Windows Error Reporting "if Windows
+/// Error Reporting is enabled"), for the record of the end that gives: its
+/// exit status, with and without `SEM_NOGPFAULTERRORBOX`, in a job of the
+/// jailer's limits or not.
+#[cfg(test)]
+pub(crate) static FAIL_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`FAIL_FAST`]'s end, if it is set.
+#[cfg(test)]
+fn fail_fast_for_the_record(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) {
+    if FAIL_FAST.load(std::sync::atomic::Ordering::SeqCst) {
+        say_at_the_limit(format_args!("FILTERREC RaiseFailFastException with the exception's record"));
+        // SAFETY: the system's exception pointers.
+        unsafe { windows_sys::Win32::System::Diagnostics::Debug::RaiseFailFastException((*info).ExceptionRecord, (*info).ContextRecord, 0) };
+    }
+}
+
+/// FILTERREC: the frames above the filter that calls this, as
+/// [`stack_137_frames`] says them, under FILTERFRAMES with `which` first.
+#[cfg(test)]
+fn filter_frames(which: &str) {
+    unsafe extern "C" {
+        static __ImageBase: u8;
+    }
+    if !SAY_FILTER_FRAMES.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    say_at_the_limit(format_args!("FILTERFRAMES {which}"));
+    let mut frames = [core::ptr::null_mut::<c_void>(); 24];
+    // SAFETY: room for 24 addresses.
+    let n = unsafe { windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(0, 24, frames.as_mut_ptr(), core::ptr::null_mut()) };
+    let base = core::ptr::addr_of!(__ImageBase) as usize;
+    for (i, f) in frames[..usize::from(n)].iter().enumerate() {
+        say_frame_as("FILTERFRAMES", i, *f as usize, base);
     }
 }
 
@@ -1871,6 +1923,10 @@ unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::
                 if jailed { "in a job that dies on unhandled exceptions, the process ends" } else { "Windows Error Reporting ends the process" }
             ));
         }
+        #[cfg(test)]
+        filter_frames("stack_filter, a stack overflow at the reserve's end");
+        #[cfg(test)]
+        fail_fast_for_the_record(info);
         if !jailed {
             // Windows Error Reporting ends it, with its dump, as Linux's
             // SIGSEGV default action ends it with a core.
@@ -2016,6 +2072,10 @@ unsafe extern "system" fn last_filter(info: *const windows_sys::Win32::System::D
             }
         ));
     }
+    #[cfg(test)]
+    filter_frames("last_filter");
+    #[cfg(test)]
+    fail_fast_for_the_record(info);
     // SAFETY: the system's exception pointers, passed on.
     let r = unsafe { call_filter(replaced, info) };
     if r != windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH || !jailed {
