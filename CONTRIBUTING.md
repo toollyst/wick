@@ -120,7 +120,12 @@ and the main checkout use; they never set the variable.
   branch commit followed by `main's <hash>` for the same change. Another
   project's commit is cited with the project's name in its clause
   (`virtiofsd 1.14.0 (a8b65ed`), upstream Firecracker's as
-  `upstream's commits <hash>, ...`. A probe that once showed something is
+  `upstream's commits <hash>, ...`. In every document (but the design notes,
+  `docs/design-*.md`, which name the tests they propose), a repository path
+  must exist (here or in upstream's tree), and a table row's code span writes
+  a `|` with a backslash before it; in every document and source comment, a
+  heading cited as `SECURITY.md, "Heap"` must be one of that document's
+  headings, bold labels or table rows. A probe that once showed something is
   not a test; the claim waits until the product does it and a test in the
   repository shows it.
 - A number in a doc says how it was measured. On a loaded machine, measure

@@ -51,7 +51,21 @@ it. The check needs the whole history: in a shallow clone it is an error
 ("history too shallow"), never a pass. `--repo PATH` names the clone to ask
 when the files are a copy outside it.
 
-    tools/check-claims.py --selftest    checks the commit check on a fake repository
+Every document (any tracked .md outside lib/ but the design notes,
+docs/design-*.md, which name the tests they propose) is also checked for:
+- the tests it names in backquotes, as above;
+- the repository paths it names in backquotes or links (`tools/...`,
+  `overlay/...`, `crates/...`, `docs/...`, `patches/...`, `fuzz/...`,
+  `.github/...`): each must exist here or in upstream's tree (lib/firecracker);
+- a table row with a `|` inside a code span that has no backslash before
+  it, which GitHub takes as a cell's end (audit 2: the Full snapshot row's
+  `MAP_PRIVATE | MAP_NORESERVE`).
+Every heading a document or a source comment cites as `<DOC>.md, "<heading>"`
+(or without the comma) must be one of that document's headings, bold labels
+or table rows' first cells, or a part of one (audit 5: boot-test.ps1 cited
+ROADMAP.md "Platform status", which ROADMAP has never had).
+
+    tools/check-claims.py --selftest    checks the commit, heading and table checks on fakes
 """
 import os
 import re
@@ -79,6 +93,78 @@ EVIDENCE = re.compile(
     r"`[^`]*(boot-test|jailer-test|test_[a-z0-9_]+|ext::[a-z_:]+|cargo test|integration-tests|"
     r"unit-tests|compare-[a-z-]+)[^`]*`"
 )
+
+
+# Documents a heading citation may name, by the name it uses.
+HEADING_DOCS = {"SECURITY.md": "SECURITY.md", "CONTRIBUTING.md": "CONTRIBUTING.md", "README.md": "README.md",
+                "COMPATIBILITY.md": "docs/COMPATIBILITY.md", "PORTING.md": "docs/PORTING.md",
+                "ARCHITECTURE.md": "docs/ARCHITECTURE.md", "ROADMAP.md": "docs/ROADMAP.md",
+                "getting-started.md": "docs/getting-started.md"}
+HEADING_CITED = re.compile(r"\b(" + "|".join(re.escape(d) for d in HEADING_DOCS) + r'),?\s+"([^"]{3,160})"')
+# A comment marker that continues a quoted heading on the next source line.
+COMMENT_BREAK = re.compile(r"\s*\n\s*(?:#|//+!?|<#|--)?\s*")
+REPO_PATH = re.compile(r"(?:`|\]\()(?:\.\./)*((?:tools|overlay|crates|docs|patches|fuzz|\.github)/[^\s`)*<>{}$|]+)")
+# Backquoted names of the form test_* that are not tests: upstream's results
+# directory (tests/conftest.py).
+NOT_TESTS = {"test_results"}
+
+
+def plain(text):
+    """A heading or label without markdown emphasis and code marks."""
+    return re.sub(r"\s+", " ", re.sub(r"[`*_]", "", text)).strip().rstrip(".:")
+
+
+def headings(text):
+    """What a citation may name in a document: its headings, bold labels and
+    table rows' first cells, plain."""
+    out = {plain(h.lstrip("#")) for h in re.findall(r"^#+\s+(.+)$", text, re.M)}
+    out |= {plain(b) for b in re.findall(r"\*\*([^*\n]+)\*\*", text)}
+    out |= {plain(c) for c in re.findall(r"^\|\s*([^|\n]+?)\s*\|", text, re.M)}
+    return {h for h in out if h}
+
+
+def check_headings(sources, docs):
+    """Errors for the heading citations in `sources` ((name, text) pairs)
+    that name no heading of `docs` ({cited name: text})."""
+    names = {d: headings(t) for d, t in docs.items()}
+    errors = []
+    for name, text in sources:
+        for m in HEADING_CITED.finditer(text):
+            doc, cited = m.group(1), plain(COMMENT_BREAK.sub(" ", m.group(2)))
+            if doc not in names or not cited:
+                continue
+            if any(cited == h or cited in h for h in names[doc]):
+                continue
+            errors.append(f"error: {name}:{text.count(chr(10), 0, m.start()) + 1} cites {doc} \"{cited}\", "
+                          f"which is no heading, bold label or table row of {HEADING_DOCS[doc]}")
+    return errors
+
+
+def check_table_pipes(name, text):
+    """Errors for table rows of `text` with an unescaped `|` in a code span."""
+    errors = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.startswith("|"):
+            continue
+        for span in re.findall(r"`([^`]+)`", line.replace("\\|", "")):
+            if "|" in span:
+                errors.append(f"error: {name}:{n} has `{span[:40]}` in a table row: its `|` ends the cell "
+                              f"on GitHub (write `\\|`)")
+    return errors
+
+
+def check_paths(name, text, roots):
+    """Errors for the repository paths `text` names that exist under none of
+    `roots`."""
+    errors = []
+    for n, line in enumerate(text.splitlines(), 1):
+        for m in REPO_PATH.finditer(line):
+            if line[m.end():m.end() + 1] in ("*", "<", "{", "$"):
+                continue  # a pattern (`docs/design-*.md`), not a path
+            path = re.sub(r":\d+(-\d+)?$", "", re.sub(r"#.*$", "", m.group(1).rstrip(".,;:")))
+            if not any((root / path).exists() for root in roots):
+                errors.append(f"error: {name}:{n} names {path}, which is not in the tree (nor upstream's)")
+    return errors
 
 
 def cells(path):
@@ -293,6 +379,30 @@ def selftest():
         assert len(errors) == 1 and errors[0].startswith("error: history too shallow"), errors
         errors = check_commits(Path(tmp) / "none", [("fake.md", doc)])
         assert len(errors) == 1 and "is not a git repository" in errors[0], errors
+    # Audit 5's finding: tools/windows/boot-test.ps1 cited a ROADMAP heading
+    # that does not exist, in a comment whose quote went on to the next line.
+    roadmap = "# Roadmap\n\n## At a glance\n\n## M3. Windows: first boot\n"
+    security = "## Heap\n\n- **Windows jailer: `memory.max` bounds memory in sections.** text\n"
+    src = ('# What upstream does that wick does not do on Windows yet\n# (docs/ROADMAP.md, "Platform\n'
+           '# status"); listed in the summary.\n'
+           '// (SECURITY.md, "Heap") and (SECURITY.md, "`memory.max` bounds memory in sections")\n'
+           '(ROADMAP.md "At a glance")\n')
+    errors = check_headings([("boot-test.ps1", src)], {"ROADMAP.md": roadmap, "SECURITY.md": security})
+    assert errors == ['error: boot-test.ps1:2 cites ROADMAP.md "Platform status", which is no heading, bold label '
+                      'or table row of docs/ROADMAP.md'], errors
+    # Audit 2's finding (4cd9571): the Full snapshot row's code span split the cell.
+    table = ("| Row | macOS |\n| --- | --- |\n| Full snapshot | `MAP_PRIVATE | MAP_NORESERVE` |\n"
+             "| Fixed | `MAP_PRIVATE \\| MAP_NORESERVE` |\n\nProse `a | b` is no table.\n")
+    errors = check_table_pipes("COMPATIBILITY.md", table)
+    assert len(errors) == 1 and errors[0].startswith("error: COMPATIBILITY.md:3 has `MAP_PRIVATE | MAP_NORESERVE`"), \
+        errors
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "tools").mkdir()
+        (Path(tmp) / "tools" / "clean.sh").write_text("")
+        errors = check_paths("x.md", "`tools/clean.sh`, [l](../tools/clean.sh#x), `tools/gone.sh:12`, "
+                             "`docs/design-*.md`\n",
+                             (Path(tmp),))
+        assert errors == ["error: x.md:1 names tools/gone.sh, which is not in the tree (nor upstream's)"], errors
     print("check-claims: selftest ok")
 
 
@@ -321,9 +431,13 @@ def main():
                             and word not in named_stages[script]:
                         print(f"error: {name}:{n} names `{quoted}`, but {script} has no stage {word}")
                         errors += 1
-    known = known_tests()
-    for name in NAMING:
-        for n, line in enumerate((ROOT / name).read_text().splitlines(), 1):
+    known = known_tests() | NOT_TESTS
+    tracked = git(repo, "ls-files").stdout.split()
+    documents = [d for d in tracked if d.endswith(".md") and not d.startswith("lib/")
+                 and not re.match(r"docs/design-", d) and (ROOT / d).is_file()]
+    for name in sorted(set(NAMING) | set(documents)):
+        text = (ROOT / name).read_text()
+        for n, line in enumerate(text.splitlines(), 1):
             for quoted in NAMED.findall(line):
                 for test in re.findall(r"\b(test_[a-z0-9_]+)", quoted):
                     # `test_api_profile_*`: a prefix.
@@ -331,6 +445,16 @@ def main():
                         continue
                     print(f"error: {name}:{n} names {test}, which no source, test file or baseline defines")
                     errors += 1
+        for line in check_paths(name, text, (ROOT, ROOT / "lib" / "firecracker")) + check_table_pipes(name, text):
+            print(line)
+            errors += 1
+    # This file's own fixtures cite headings that do not exist on purpose.
+    commented = [d for d in tracked if not d.startswith("lib/") and (ROOT / d).is_file()
+                 and d.endswith((".md", ".rs", ".py", ".sh", ".ps1", ".yml", ".txt")) and d != "tools/check-claims.py"]
+    docs = {cited: (ROOT / path).read_text() for cited, path in HEADING_DOCS.items()}
+    for line in check_headings([(d, (ROOT / d).read_text(errors="replace")) for d in commented], docs):
+        print(line)
+        errors += 1
     for name in FILES:
         for n, column, text in cells(ROOT / name):
             claim = CLAIM.search(text)

@@ -97,9 +97,9 @@ check)
         fi
     done < <(series)
 
-    # The documents that count the series say what it is: "N small patches
-    # (... in M files)" in README.md, "N feature patches touching M files"
-    # in docs/ARCHITECTURE.md.
+    # The documents that count the series say what it is: README.md's
+    # "N small patches (... in M files)" and docs/ARCHITECTURE.md's
+    # "N feature patches touching M files".
     n="$(series | wc -l | tr -d ' ')"
     m="$("$0" list | wc -l | tr -d ' ')"
     for doc in README.md docs/ARCHITECTURE.md; do
