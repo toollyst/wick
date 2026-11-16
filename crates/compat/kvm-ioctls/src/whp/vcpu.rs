@@ -2025,6 +2025,12 @@ impl VcpuFd {
         // and before a kick is looked at, as KVM's KVM_RUN runs
         // `complete_userspace_io` before its `immediate_exit` check.
         let mut ram_retries = 0u32;
+        // The host pages this run call's last two commits answered for:
+        // an exit at one of them again asks the commit whether the page is
+        // there already (`commit_block_on_access_again`), so that a page
+        // WHP keeps exiting on is counted toward `RAM_RETRY_BOUND`; a first
+        // access asks nothing more. Two: an access across a page boundary.
+        let mut ram_committed = [u64::MAX; 2];
         let pending = self.shared.pending.lock().unwrap().take();
         if let Some(pending) = pending {
             match pending {
@@ -2191,7 +2197,12 @@ impl VcpuFd {
                     //   it before the re-run, as Linux's fault maps what it
                     //   charged (`VmInner::populate_committed`); a read
                     //   commits its page only and leaves it to WHP's fault
-                    //   (`wick_mm`: Linux's huge zero page);
+                    //   (`wick_mm`: Linux's huge zero page). A page the
+                    //   commit finds there already (committed before, asked
+                    //   at an exit at one of the last two pages this run
+                    //   call committed; a released page resolved before)
+                    //   re-runs counted, as a page KVM's `hva_to_pfn` finds
+                    //   present;
                     // - a missing userfaultfd page: WHP honours its host
                     //   PAGE_NOACCESS and exits at the access, which re-runs
                     //   once the handler filled it (`wick_uffd::fault`), as
@@ -2219,6 +2230,8 @@ impl VcpuFd {
                         #[cfg(test)]
                         let came = exit_ring::stamp();
                         let mut block = 0..0;
+                        let page = host & !0xfff;
+                        let again = ram_committed.contains(&page);
                         let next = loop {
                             let next = super::exit::ram_access(
                                 readonly,
@@ -2226,11 +2239,17 @@ impl VcpuFd {
                                 libc::wick_uffd::active(),
                                 ram_retries,
                                 || {
-                                    let answer = match libc::wick_mm::commit_block_on_access(host as usize, write) {
+                                    let commit = if again {
+                                        libc::wick_mm::commit_block_on_access_again
+                                    } else {
+                                        libc::wick_mm::commit_block_on_access
+                                    };
+                                    let answer = match commit(host as usize, write) {
                                         (libc::wick_mm::Access::Committed, b) => {
                                             block = b;
                                             super::exit::RamCommit::Committed
                                         }
+                                        (libc::wick_mm::Access::Present, _) => super::exit::RamCommit::Present,
                                         (libc::wick_mm::Access::Exhausted(err), _) => super::exit::RamCommit::Exhausted(err),
                                         (libc::wick_mm::Access::NotLazy, _) => super::exit::RamCommit::NotLazy,
                                     };
@@ -2264,6 +2283,9 @@ impl VcpuFd {
                                 }
                                 #[cfg(test)]
                                 super::ffi::trace::split_lazy(looked_up, committing, populating);
+                                if !again {
+                                    ram_committed = [page, ram_committed[0]];
+                                }
                                 ram_retries = 0;
                                 continue;
                             }
@@ -11196,6 +11218,7 @@ mod fpu_tests {
             times.push(t.elapsed().as_secs_f64() * 1e6);
             outcomes.insert(match a {
                 libc::wick_mm::Access::Committed => "committed",
+                libc::wick_mm::Access::Present => "present",
                 libc::wick_mm::Access::NotLazy => "not lazy",
                 libc::wick_mm::Access::Exhausted(_) => "exhausted",
             });
@@ -12783,7 +12806,15 @@ mod fpu_tests {
     /// - a page the host refuses that the look is made to call allowed
     ///   (`FORCE_SETTLED`): `EFAULT` after `RAM_RETRY_BOUND` runs again, the
     ///   "kept exiting" line, and the wall time of the million (RAMEXIT
-    ///   kept exiting).
+    ///   kept exiting);
+    /// - a committed page of lazy writable memory (`MAP_NORESERVE`, written
+    ///   by the host first) that WHP keeps exiting on, its slot's GPA
+    ///   unmapped from the partition behind the slot's back: the commit
+    ///   finds it present at the second exit, and the run fails with
+    ///   `EFAULT` after `RAM_RETRY_BOUND` runs again, the "kept exiting"
+    ///   line (RAMEXIT lazy kept exiting; before: each exit's commit
+    ///   answered committed and started the count again, re-run without
+    ///   end).
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_a_guest_ram_access_exit_is_decided_as_kvms() {
@@ -12794,6 +12825,7 @@ mod fpu_tests {
         const RO_SLOT: u64 = 0x34_0000;
         const RO_LAZY_SLOT: u64 = 0x36_0000;
         const UFFD_SLOT: u64 = 0x38_0000;
+        const LAZY_SLOT: u64 = 0x3A_0000;
         static FILL_AT: AtomicU64 = AtomicU64::new(0);
         static FILL_CTX: AtomicU64 = AtomicU64::new(0);
         let say = |l: String| eprintln!("RAMEXIT {l}");
@@ -12933,6 +12965,35 @@ mod fpu_tests {
         assert_eq!((got, regs.rip), (efault, PROGRAM));
         assert_eq!(n, u64::from(super::super::exit::RAM_RETRY_BOUND));
         assert!(line.contains("a page the host allows kept exiting"), "{line}");
+        // A committed lazy page WHP keeps exiting on: the GPA of its slot
+        // (a page, slot 4) unmapped from the partition, the slot kept.
+        let lazy_rw = mapping(libc::MAP_NORESERVE);
+        // SAFETY: the test's lazy memory, writable: committed by the write.
+        unsafe { core::ptr::write_volatile(lazy_rw as *mut u8, 0x77) };
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 4,
+                flags: 0,
+                guest_phys_addr: LAZY_SLOT,
+                memory_size: 4096,
+                userspace_addr: lazy_rw,
+            })
+        }
+        .unwrap();
+        // SAFETY: unmaps the page this VM mapped for slot 4.
+        assert_eq!(unsafe { whv::WHvUnmapGpaRange(vcpu.part(), LAZY_SLOT, 4096) }, 0);
+        reruns();
+        RAM_LINE.lock().unwrap().clear();
+        let t = std::time::Instant::now();
+        let (got, regs) = run(&mut vcpu, m, &load(LAZY_SLOT));
+        let took = t.elapsed();
+        let n = reruns();
+        let line = RAM_LINE.lock().unwrap().clone();
+        say(format!("lazy kept exiting: {got}, {n} runs again in {} ms, RIP {:#x}; the line: {line}", took.as_millis(), regs.rip));
+        assert_eq!((got, regs.rip), (format!("errno {}", libc::EFAULT), PROGRAM));
+        assert_eq!(n, u64::from(super::super::exit::RAM_RETRY_BOUND));
+        assert!(line.contains("the guest's read of RAM at 0x3a0000") && line.contains("a page the host allows kept exiting"), "{line}");
         drop(vcpu);
         drop(vm);
         // SAFETY: closes the user end; the test's memory, no VM left using it.
@@ -12941,6 +13002,7 @@ mod fpu_tests {
             assert_eq!(libc::munmap(m.cast(), MEM), 0);
             assert_eq!(libc::munmap(registered as *mut _, 0x1_0000), 0);
             assert_eq!(libc::munmap(lazy as *mut _, 0x1_0000), 0);
+            assert_eq!(libc::munmap(lazy_rw as *mut _, 0x1_0000), 0);
         }
     }
 

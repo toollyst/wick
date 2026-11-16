@@ -452,8 +452,11 @@ semantics on Win32. The details are in the comments of each
     lets an access that cannot concern a record skip the lock. It gives no false "none" for a page that matters:
     the release publishes its record before `destroy` wakes the threads waiting on the range's missing pages, which
     run their access again and find it.
-  - **Lock order:** the userfaultfd's `LOCK`, the region table, `RELEASED`, `CHARGES`. The release does
-    not take the region table: `mprotect` and `munmap` ask `released_overlaps` for a view a record holds.
+  - **Lock order:** the userfaultfd's `LOCK`, the region table, `RELEASED`, then `CHARGES` or `LAZY` (the lazy
+    ranges), each a leaf: nothing is taken while either is held, and neither is held with the other. The release
+    does not take the region table: `mprotect` and `munmap` ask `released_overlaps` for a view a record holds. The
+    WHP run loop's settled look takes `LOCK`, the table, `RELEASED` and `LAZY` in that order
+    (`wick_mm::settled_access`).
   - A released chunk is not a candidate of the reclaim at the memory limit, so its discarded pages keep their charge
     until each is touched or unmapped, where Linux freed them at the discard (the `memory.max` row of
     docs/COMPATIBILITY.md).

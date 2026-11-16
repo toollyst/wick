@@ -8833,6 +8833,29 @@ mod tests {
         assert_eq!(code, Some(0), "{text}");
     }
 
+    /// A released range's pending page, resolved by its first access
+    /// (`Committed`), is `Present` to the commit after, nothing committed,
+    /// read or written: the page another access resolved before, which
+    /// WHP's run loop then counts toward its bound (`RAM_RETRY_BOUND`)
+    /// where `Committed` started the count again. RELPRESENT line.
+    #[test]
+    fn test_a_released_page_resolved_before_is_present_to_the_commit() {
+        use crate::windows_mm::{wick_mm::commit_on_access, Access};
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 64 * 1024;
+        let mem = map(len);
+        register(ctx, mem, len as u64).unwrap();
+        unregister(ctx, mem, len as u64).unwrap();
+        let page = (mem + PAGE) as usize;
+        let first = commit_on_access(page, false);
+        let read = commit_on_access(page, false);
+        let written = commit_on_access(page, true);
+        std::eprintln!("RELPRESENT first {first:?}, then read {read:?}, written {written:?}");
+        assert_eq!((first, read, written), (Access::Committed, Access::Present, Access::Present));
+        release(ctx, user);
+        assert_eq!(munmap_of(mem, len as u64), 0);
+    }
+
     #[test]
     #[ignore = "run by test_a_host_access_that_faulted_on_a_released_page_resolved_meanwhile_runs_again in a process of its own"]
     fn late_handler_released_child() {

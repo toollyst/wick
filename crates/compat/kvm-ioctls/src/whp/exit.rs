@@ -503,8 +503,12 @@ pub fn loads_ss(bytes: &[u8], long_mode_code: bool) -> bool {
 /// (`wick_mm::commit_block_on_access`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RamCommit {
-    /// Committed (or resolved), now or by another thread: run again.
+    /// Committed (or resolved) now: run again.
     Committed,
+    /// Nothing committed: the page was there already and allows the access
+    /// (`wick_mm::Access::Present`), as `hva_to_pfn` finds the host page
+    /// present: run again (counted).
+    Present,
     /// Refused at the memory limit, even after a reclaim: the VMM ends.
     Exhausted(u32),
     /// Not lazy memory, nor a released range's pending page.
@@ -543,14 +547,15 @@ pub enum RamExit {
     AnotherPass,
     /// The host refuses the access: the run fails with `EFAULT`.
     Refused,
-    /// [`RAM_RETRY_BOUND`] times in a row the page was allowed or
+    /// [`RAM_RETRY_BOUND`] times in a row the page was present, allowed or
     /// resolvable and the access exited again: the run fails with `EFAULT`.
     KeptExiting,
 }
 
 /// How many times in a row an access may be run again or asked again for
 /// one exit's page that the host allows ([`RamExit::RunAgain`],
-/// [`RamExit::AnotherPass`]) before the run fails.
+/// [`RamExit::AnotherPass`]; a page the commit found present,
+/// [`RamCommit::Present`], runs again so) before the run fails.
 pub const RAM_RETRY_BOUND: u32 = 1_000_000;
 
 /// Decides a memory access exit at a guest RAM address, in KVM's order for
@@ -566,7 +571,10 @@ pub const RAM_RETRY_BOUND: u32 = 1_000_000;
 ///    `KVM_PFN_ERR_RO_FAULT` (:2705 to :2709) and `kvm_handle_bad_page`
 ///    `RET_PF_EMULATE` (mmu.c :3159 to :3160), an MMIO exit;
 /// 2. the commit of lazy memory or of a released page (KVM's
-///    `hva_to_pfn`, kvm_main.c :2649, faulting the host page in);
+///    `hva_to_pfn`, kvm_main.c :2649, faulting the host page in); a page it
+///    finds present (committed before, nothing committed now) runs again,
+///    counted, as the page `hva_to_pfn` finds present is mapped and the
+///    guest re-entered;
 /// 3. the userfaultfd's wait for a fill or a move (the same fault reaching
 ///    `handle_userfault`);
 /// 4. the page as a whole: resolvable now, another pass; allowed, run
@@ -589,6 +597,8 @@ pub fn ram_access(
     }
     match commit() {
         RamCommit::Committed => return RamExit::Committed,
+        RamCommit::Present if retries >= RAM_RETRY_BOUND => return RamExit::KeptExiting,
+        RamCommit::Present => return RamExit::RunAgain,
         RamCommit::Exhausted(err) => return RamExit::OutOfMemory(err),
         RamCommit::NotLazy => {}
     }
@@ -611,7 +621,7 @@ mod tests {
     /// it asked (`c` commit, `f` fault, `s` the settled look).
     #[test]
     fn test_a_ram_access_is_decided_in_kvms_order() {
-        use RamCommit::{Committed, Exhausted, NotLazy};
+        use RamCommit::{Committed, Exhausted, NotLazy, Present};
         use RamSettled::{Allowed, Refused, Resolvable};
         /// KVM's answer, readonly, write, userfaultfd, retries, commit,
         /// fault, settled, ours, the steps asked.
@@ -623,6 +633,10 @@ mod tests {
             ("the same without a userfaultfd", true, true, false, 0, NotLazy, false, Refused, RamExit::Mmio, ""),
             ("a read of a read-only slot is faulted in as any (hva_to_pfn)", true, false, false, 0, Committed, false, Refused, RamExit::Committed, "c"),
             ("hva_to_pfn faults the lazy page in", false, true, true, 0, Committed, false, Refused, RamExit::Committed, "c"),
+            ("hva_to_pfn finds the page present: mapped, re-run, counted", false, true, true, 0, Present, false, Refused, RamExit::RunAgain, "c"),
+            ("present, yet exiting a million times: EFAULT", false, false, false, RAM_RETRY_BOUND, Present, false, Allowed, RamExit::KeptExiting, "c"),
+            ("present just below the bound: run again", false, true, false, RAM_RETRY_BOUND - 1, Present, false, Allowed, RamExit::RunAgain, "c"),
+            ("a store to a read-only slot over a present page: MMIO", true, true, true, RAM_RETRY_BOUND, Present, false, Allowed, RamExit::Mmio, ""),
             ("the memory cgroup's OOM kill at the charge", false, true, false, 0, Exhausted(1455), false, Refused, RamExit::OutOfMemory(1455), "c"),
             ("handle_userfault waits for the fill", false, false, true, 0, NotLazy, true, Refused, RamExit::Faulted, "cf"),
             ("no userfaultfd: fault() is not asked", false, false, false, 0, NotLazy, true, Allowed, RamExit::RunAgain, "cs"),

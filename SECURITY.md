@@ -574,8 +574,13 @@ has the per-control details and results.
   them again, one the host allows runs again, one it refuses fails the run with `EFAULT` and a line naming the
   address and the access (`test_a_page_changed_between_a_vcpus_looks_is_settled_as_it_is_now`, Windows Server 2022
   20348 and 2025 26100). A page the host allows that keeps exiting fails the run so after a million runs again in a
-  row, said as such. `test_a_guest_ram_access_exit_is_decided_as_kvms` asserts each case and the runs again it
-  took on WHP (not run here: its first run is CI's). What stays: an emulated instruction's other operand in RAM is
+  row, said as such. Until the follow-up (found by reading, review of this fix), a page the commit found there
+  already, lazy memory committed before or a released page resolved before, started the count again at each exit,
+  the commit answering committed, and ran again without end; the commit now answers it present and it is counted
+  (`test_a_lazy_page_committed_before_is_present_when_asked_again`,
+  `test_a_released_page_resolved_before_is_present_to_the_commit`, Windows Server 2022 20348 and 2025 26100).
+  `test_a_guest_ram_access_exit_is_decided_as_kvms` asserts each case and the runs again it took on WHP, the
+  committed lazy page among them (not run here: its first run is CI's). What stays: an emulated instruction's other operand in RAM is
   still copied by the host on the vCPU thread, and a page the host refuses there ends the VMM with 0xC0000005
   (docs/COMPATIBILITY.md, `mem_size_mib`).
 

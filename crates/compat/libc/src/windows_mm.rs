@@ -195,7 +195,18 @@ pub mod wick_mm {
     /// `addr` in a range advised `MADV_HUGEPAGE` ([`HUGE_PAGE`]), which the
     /// caller can have the hypervisor map at once.
     pub fn commit_block_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize>) {
-        super::commit_on_access(addr, write)
+        super::commit_access(addr, write, false)
+    }
+
+    /// [`commit_block_on_access`] for an access to a page an answer of the
+    /// caller's committed before (WHP's run loop: the same page exited
+    /// again): asks first whether lazy memory's page is committed already,
+    /// and answers [`Access::Present`] if so, where the commit would answer
+    /// [`Access::Committed`] for it having committed nothing. A system call
+    /// more than [`commit_block_on_access`], which a first access does not
+    /// pay.
+    pub fn commit_block_on_access_again(addr: usize, write: bool) -> (Access, core::ops::Range<usize>) {
+        super::commit_access(addr, write, true)
     }
 
     /// The block a first access commits in a range advised
@@ -1010,7 +1021,11 @@ fn make_placeholder(t: &mut Table, start: usize, end: usize) -> Result<(), c_int
 /// access exit for a page that is not committed (measured: the exit, then
 /// the commit, then the access re-run). Sorted, disjoint `(start, len,
 /// protection)`. Locked briefly, never while memory is touched, so a fault
-/// inside a call that holds the region table cannot deadlock on it.
+/// inside a call that holds the region table cannot deadlock on it. A leaf
+/// of the lock order (the userfaultfd's `LOCK`, the region table,
+/// [`RELEASED`], then [`CHARGES`] or this): every holder looks at or edits
+/// the list and lets go, taking no other lock meanwhile ([`settled_access`]
+/// takes it last of four).
 ///
 /// An `mprotect` keeps memory lazy ([`protect_lazy`]): the protection of a
 /// range is the one its pages get when committed, and a `PAGE_NOACCESS`
@@ -1292,12 +1307,25 @@ pub enum Access {
     NotLazy,
     /// The pages were committed now; the access can be run again.
     Committed,
+    /// Nothing was committed: the page was there already and allows the
+    /// access (a released range's page another access resolved, or, asked
+    /// with [`wick_mm::commit_block_on_access_again`], a lazy page committed
+    /// before), as Linux's fault finds the page present. The access can be
+    /// run again; a caller that sees it again and again counts it
+    /// (`RAM_RETRY_BOUND` in kvm-ioctls' WHP run loop).
+    Present,
     /// They could not be committed (the Windows error): the memory limit is
     /// reached.
     Exhausted(u32),
 }
 
 fn commit_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize>) {
+    commit_access(addr, write, false)
+}
+
+/// [`commit_on_access`]; `again`: a lazy page is looked at first, and one
+/// committed already is [`Access::Present`] (one `VirtualQuery`).
+fn commit_access(addr: usize, write: bool, again: bool) -> (Access, core::ops::Range<usize>) {
     // A released userfaultfd range's pending page ([`Record`]).
     if let Some((access, range)) = released_access(addr, write) {
         return (access, if access == Access::Committed { range } else { 0..0 });
@@ -1327,6 +1355,9 @@ fn commit_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize
     // (two vCPUs touching one block: measured, the second's exit had been
     // emulated as MMIO and the guest took a bogus fault).
     let page = addr - addr % PAGE;
+    if again && committed_page(page) {
+        return (Access::Present, 0..0);
+    }
     // A read takes a page even where huge pages are advised: Linux maps its
     // huge zero page for a read fault there and allocates (and charges)
     // nothing until a write (mm/huge_memory.c `do_huge_pmd_anonymous_page`,
@@ -1668,7 +1699,8 @@ unsafe extern "system" fn on_exception(
         #[cfg(test)]
         IN_THE_LAZY_HANDLER.set(false);
         match access {
-            Access::Committed => {
+            // Present: a released page another thread resolved meanwhile.
+            Access::Committed | Access::Present => {
                 let (n, deepest) = HOST_FAULTS.get();
                 HOST_FAULTS.set((n + 1, deepest.max(stack)));
                 return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION;
@@ -5553,10 +5585,11 @@ fn released_resolve(addr: usize, write: bool, grain: usize) -> Option<(Access, c
     // Its record (a page is pending in one record at most: a span the
     // records held before it was unmapped is forgotten in them).
     let Some(r) = records.iter_mut().find(|r| r.holds(page) && r.get(PENDING, page)) else {
-        // Resolved by another thread while this one waited for the lock: the
-        // access runs again if the page allows it now.
+        // Resolved by another access (another thread's, or this one's
+        // before): the access runs again if the page allows it now, nothing
+        // committed.
         let held = records.iter().any(|r| r.holds(page));
-        return (held && accessible(page, 1, write)).then(|| (Access::Committed, page..page + PAGE));
+        return (held && accessible(page, 1, write)).then_some((Access::Present, 0..0));
     };
     let prot = r.prot(page);
     let writable = matches!(prot, PAGE_READWRITE | PAGE_EXECUTE_READWRITE);
@@ -6704,6 +6737,44 @@ mod tests {
         // SAFETY: our mapping.
         assert_eq!(unsafe { munmap(p as *mut c_void, len) }, 0);
         assert!(lazy_within(p, len).is_empty());
+    }
+
+    /// Asked again (`wick_mm::commit_block_on_access_again`, WHP's run loop
+    /// at an exit on a page it committed before), the commit answers a lazy
+    /// page committed already `Present`, nothing committed, where the first
+    /// ask answers `Committed` for it as for a page it commits; a page not
+    /// committed (a discarded one) is committed as at a first ask; a
+    /// `PROT_NONE` page and a write to read-only memory stay the fault they
+    /// are (`NotLazy`), committed or not. LAZYAGAIN lines.
+    #[test]
+    fn test_a_lazy_page_committed_before_is_present_when_asked_again() {
+        let _serial = serial();
+        let len = 4 * PAGE;
+        let p = map(0, len, PROT_READ | PROT_WRITE, ANON | MAP_NORESERVE, -1, 0);
+        let mut said = std::vec::Vec::new();
+        let mut ask = |what: &str, got: (Access, core::ops::Range<usize>), want: (Access, core::ops::Range<usize>)| {
+            said.push(std::format!("{what}: {:?}", got.0));
+            assert_eq!(got, want, "{what}");
+        };
+        ask("first, asked again", wick_mm::commit_block_on_access_again(p, false), (Access::Committed, p..p + PAGE));
+        ask("committed, asked again", wick_mm::commit_block_on_access_again(p, true), (Access::Present, 0..0));
+        ask("committed, a first ask", wick_mm::commit_block_on_access(p, true), (Access::Committed, p..p + PAGE));
+        assert_eq!(committed(p, len), PAGE);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { madvise(p as *mut c_void, PAGE, MADV_DONTNEED) }, 0);
+        assert_eq!(committed(p, len), 0);
+        ask("discarded, asked again", wick_mm::commit_block_on_access_again(p, true), (Access::Committed, p..p + PAGE));
+        assert_eq!(committed(p, len), PAGE);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { mprotect(p as *mut c_void, PAGE, PROT_READ) }, 0);
+        ask("committed, read-only, written", wick_mm::commit_block_on_access_again(p, true), (Access::NotLazy, 0..0));
+        ask("committed, read-only, read", wick_mm::commit_block_on_access_again(p, false), (Access::Present, 0..0));
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { mprotect(p as *mut c_void, PAGE, PROT_NONE) }, 0);
+        ask("committed, PROT_NONE, read", wick_mm::commit_block_on_access_again(p, false), (Access::NotLazy, 0..0));
+        std::eprintln!("LAZYAGAIN {}", said.join("; "));
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { munmap(p as *mut c_void, len) }, 0);
     }
 
     /// A first access commits a page; a write in a range advised
