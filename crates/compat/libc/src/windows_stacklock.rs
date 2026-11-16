@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The locks of wick's memory code (the region table, the charges, the
-//! reclaim's lists and its owed charge, ...), each taken through this
+//! reclaim's lists, ...), each taken through this
 //! module, so that the stack reclaim (its design's step 3) will cover them
 //! all.
 //!

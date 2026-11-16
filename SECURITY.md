@@ -554,8 +554,9 @@ upstream Firecracker and its jailer.
   every page table of the VMM's memory is the VMM's own commit, in its job, so the VMM reaches its limit sooner by
   those tables. Firecracker's handler is a process of the operator's, which the jailer does not put in the VMM's
   cgroup.
-- **Windows: at a userfaultfd range's edge, a reclaim's move, or the swap of a chunk discarded whole, ends the VMM
-  with 137 when another thread's commit takes a view's page table room between its unmap and its map.** Both put a
+- **Windows: the first or last 2 MiB chunk of a userfaultfd range not on 2 MiB boundaries is never moved by the
+  reclaim nor given a new section when it is discarded whole, so its dead pages are not reclaimed and its
+  whole-chunk discard keeps its commit (its pages missing, or pending in a released range, all the same).** The reclaim's move and the swap of a chunk discarded whole put a
   new section in the place of a 2 MiB chunk's old one in the alias and then the guest's range, where the chunk is
   mapped as two views split at its midpoint. A view's unmap gives back the page table of each 2 MiB region only that
   view maps, and a page-directory page for each 1 GiB only it maps; its map takes them again (VIEWCOST,
@@ -564,8 +565,8 @@ upstream Firecracker and its jailer.
   the new, keeps the region's table: every step takes and gives back 0 KiB for a range on a 2 MiB boundary, as
   Firecracker places every guest memory region (src/vmm/src/vstate/memory.rs, `GUEST_MEMORY_ALIGNMENT` :42,
   `allocate_protected` :131 to :200), for any chunk of a range placed anywhere, and for a range 64 KiB past a boundary
-  but its last chunk's second view, alone in its region (-4 and +4 KiB) (VIEWCOST, asserted for every view not alone
-  in its region, on Windows Server 2022 20348 and 2025 26100). The move's own view of its new section is mapped into a slot made at
+  but its last chunk's second view, alone in its region (-4 and +4 KiB at b176e726; that chunk is not swapped since
+  review B3, below) (VIEWCOST, on Windows Server 2022 20348 and 2025 26100). The move's own view of its new section is mapped into a slot made at
   the first registration, beside two anchors that keep its regions' tables, so its map and unmap take and give 0 KiB
   (`test_a_moves_temporary_view_takes_no_commit`: +2068 KiB once for the move budget and the slot, then 0 at each
   move, a short last chunk's too). With no room left in the job and another commit taking all it can between a
@@ -574,11 +575,20 @@ upstream Firecracker and its jailer.
   `test_a_move_whose_alias_room_is_taken_is_made`, `test_a_discard_whose_guest_view_room_is_taken_is_made`, on
   20348 and 26100; with a chunk's two views swapped together, at 9dcf90d0, the map was refused and the VMM ended with 137 and
   the line "wick: guest memory: committing the pages at ... failed with error 1455"). What stays: a view alone in
-  its 2 MiB region, at the edge of a range that starts 1 MiB or more past a 2 MiB boundary or ends 1 MiB or less past
-  one, which Firecracker's regions never do (they start on a boundary and are whole MiB) but another caller's can;
-  there, its unmap gives back the table and a commit of another thread can take it before the map. wick's own
-  commits wait for the swap (it holds the region table's lock); the Rust heap, a thread's stack and Windows' own
-  allocations on other threads do not. Linux has no such step: its reclaim frees pages in place.
+  a 2 MiB region of its range, at the edge of a range that starts 1 MiB or more past a 2 MiB boundary or ends within
+  its last chunk's last view past one (a short last chunk of one view, under 128 KiB, too); its unmap would give back
+  the table, and a commit of another thread could take it before the map, which wick's own commits wait for (it
+  holds the region table's lock) and the Rust heap, a thread's stack and Windows' own allocations on other threads do
+  not. Such a chunk is refused before any step (`windows_mm::at_a_ranges_edge`), with a counted line on standard
+  error: the reclaim moves another chunk, and its whole discard drops its pages in place, as a partial discard does,
+  keeping their commit and charge until the chunk is unmapped
+  (`test_a_chunk_at_a_ranges_edge_is_neither_moved_nor_swapped`, on Windows Server 2022 20348 and 2025 26100; before
+  review B3 it was swapped, and ended the VMM with 137 if another commit took the room). The job and the jail's count
+  then read that chunk's dead pages more than Linux's memory.current, within `memory.max`: a stated difference from
+  Linux, whose reclaim frees pages in place, for such ranges only. Firecracker's guest memory is never one (it starts
+  on a 2 MiB boundary and is whole MiB), and wick's mmap places an anonymous private mapping of a multiple of 2 MiB on
+  a 2 MiB boundary (`test_a_whole_2_mib_anonymous_mapping_is_placed_on_a_2_mib_boundary`), so such a range is one of
+  another length, or one placed by a hint or `MAP_FIXED` (making such a chunk movable is review B4's, owed).
 - **Without the jailer, the VMM runs as the user who started it** on macOS and Windows: an escape from the VM and
   then the VMM lands as that user (files are then not limited, as on Linux without the jailer).
 - **macOS jailer: no namespaces in the kernel.** macOS has no network or PID namespaces (XNU's system calls,
@@ -770,9 +780,12 @@ upstream Firecracker and its jailer.
   discarded whole, never past `memory.max`, as each was charged within it
   (`test_a_scattered_discard_keeps_its_charge_and_its_refill_takes_none`, on Windows Server 2022 20348). A reclaim of
   such pages before a charge is refused at the limit, as Linux's memory cgroup reclaims, moves their chunks into new
-  sections, and works with no room left in the job: each move gives back the charge of up to 12 KiB of its own dead
-  pages for its maps first (a view mapped anywhere took commit for its page tables, VIEWCHARGE; mapped into the move
-  slot and swapped a view at a time they take none, but at a range's edge, above), and a chunk with one dead page is room enough
+  sections, and works with no room left in the job: a move's maps take none (its view of the new section mapped into the
+  move slot, the chunk's views swapped one at a time, above; a view mapped anywhere took commit for its page tables,
+  VIEWCHARGE, and a move gave back 12 KiB of its dead pages' charge for them first until review B3), and a chunk with
+  one dead page moves; the fill it was for is made, but where its charge page is the first committed in its 2 MiB
+  region, which takes a page table too, 8 KiB where the move gave back 4, and is refused, as Linux charges a fault's
+  page table to the memory cgroup (v6.1 include/asm-generic/pgalloc.h :8 and :85)
   (`test_a_chunk_with_one_dead_page_at_the_limit`; the memory.max row, on Windows Server 2022 20348, and on Windows
   Server 2025 in CI runs 43680983973 and 43688550565). Under a running vCPU it is not shown yet: the test of that,
   MOVEUNDERVCPU, moved no chunk in those runs, its fill at the limit a discarded page's, which takes nothing new;
@@ -786,15 +799,14 @@ upstream Firecracker and its jailer.
   under a move, and passed in both, every round moved at the limit and no value lost, its marks printed at e6c08999;
   at 112 KiB, in CI's windows job at 80589c69, 112 KiB committed below that frame after the first run, from 4, and
   MOVEUNDERVCPU 40 of 40 rounds moved at the limit, no value lost, its deepest mark 47.2 KiB again). An interim until the stack reclaim (the memory.max row); it covers no other thread: the
-  userfaultfd serve thread's stack, refused inside ntdll's heap code at the limit, still ends the VMM with 137. Where the move's
-  map is refused once it gave that charge back and another commit has taken the room meanwhile, the move is not made
-  and the chunk owes the charge (the map into the move slot needs no room, so only a test's refusal, `REFUSE_SLOT_MAP`,
-  reaches this now): the job then holds
-  up to 12 KiB more than it is charged, for one chunk at a time, said on standard error, with every userfaultfd fill
-  refused until the charge is taken again (`test_a_move_whose_room_is_taken_owes_its_charge`); a bounded
-  difference from Linux, which uncharged at the discard. The reclaim runs on its own thread with its 64 KiB stack
-  committed at creation, so it grows no stack at the limit; the touching thread's own path to it is 8528 bytes deep
-  on record (RECLAIMSTACK); a thread whose stack has less committed below its frame, and cannot grow it at the limit,
+  userfaultfd serve thread's stack, refused inside ntdll's heap code at the limit, still ends the VMM with 137. A move
+  that Windows refuses a step of before its first unmap (its new section, its view's map into the slot, its live
+  pages' commit or closing, its alias's first unmap) is not made and leaves the chunk and its charge as they were,
+  said on standard error, and the reclaim goes on to the next chunk; with none, the commit that needed it is refused
+  as without a reclaim (`test_a_move_not_made_leaves_its_chunk_as_it_was`; each step refused by the test, on
+  Windows Server 2022 20348 and 2025 26100). The reclaim runs on its own thread with its 64 KiB stack
+  committed at creation, so it grows no stack at the limit; the touching thread's own path to it is 8976 bytes deep
+  on record (RECLAIMSTACK, Windows Server 2022 20348 and 2025 26100); a thread whose stack has less committed below its frame, and cannot grow it at the limit,
   ends the VMM with 137 (below), but while a reclaim is under way: a move holds its new section's commit until its
   end, and a thread holding none of wick's memory locks whose stack page is refused in its middle waits for the
   move's end or the reclaim's, at most 1 s, makes its guard pages again as `_resetstkoflw` does, and goes on

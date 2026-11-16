@@ -1441,7 +1441,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
                     }
                     if (c..c_end).all(|p| Range::test(&r.tracked, p)) {
                         #[allow(clippy::cast_possible_truncation)]
-                        crate::windows_mm::uffd_swap_chunk((s + c * PAGE) as usize, ((c_end - c) * PAGE) as usize, (alias + c * PAGE) as usize);
+                        crate::windows_mm::uffd_swap_chunk((s + c * PAGE) as usize, ((c_end - c) * PAGE) as usize, (alias + c * PAGE) as usize, (s as usize, e as usize));
                     }
                     c += chunk;
                 }
@@ -2197,11 +2197,9 @@ fn dead_bytes(range: &Range, s: u64, view: usize, len: usize) -> usize {
 /// that hold dead pages: missing (discarded) but committed, a section page
 /// and a charge each (a chunk discarded whole has none:
 /// `windows_mm::uffd_swap_chunk`), the most dead first; a chunk with none
-/// is never one. While a chunk owes its dead pages' charge
-/// (`windows_mm::OWED`), only that one. Under [`LOCK`].
+/// is never one. Under [`LOCK`].
 fn find_candidates(out: &mut Vec<Candidate>) {
     out.clear();
-    let owing = crate::windows_mm::owing();
     let chunk = crate::windows_mm::UFFD_CHUNK as u64 / PAGE;
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::Acquire);
@@ -2223,9 +2221,6 @@ fn find_candidates(out: &mut Vec<Candidate>) {
             }
             #[allow(clippy::cast_possible_truncation)]
             let (view, len) = ((s + c * PAGE) as usize, ((c_end - c) * PAGE) as usize);
-            if owing.is_some_and(|p| !(view..view + len).contains(&p)) {
-                continue;
-            }
             let dead = dead_bytes(r, s, view, len);
             if dead > 0 && out.len() < out.capacity() {
                 #[allow(clippy::cast_possible_truncation)]
@@ -2308,7 +2303,9 @@ fn move_chunk(d: &Candidate) -> Reclaimed {
     MOVING_END.store((d.view + d.len) as u64, Ordering::SeqCst);
     MOVING_START.store(d.view as u64, Ordering::SeqCst);
     let t = std::time::Instant::now();
-    let moved = crate::windows_mm::uffd_move_chunk(d.view, d.len, d.alias, &|at| missing_at(range, s, at));
+    #[allow(clippy::cast_possible_truncation)]
+    let span = (s as usize, range.end.load(Ordering::Acquire) as usize);
+    let moved = crate::windows_mm::uffd_move_chunk(d.view, d.len, d.alias, span, &|at| missing_at(range, s, at));
     let us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
     MOVING_START.store(0, Ordering::SeqCst);
     MOVING_END.store(0, Ordering::SeqCst);
@@ -2458,6 +2455,18 @@ pub(crate) fn moves_on_record() -> (Vec<(usize, u64)>, u64, u64) {
 mod tests {
     use super::*;
 
+    /// Asserts that a range the test moves or swaps chunks of starts on a
+    /// 2 MiB boundary, where mmap places a mapping of a multiple of 2 MiB
+    /// (`windows_mm::new_placeholder_aligned`) and Firecracker its guest
+    /// memory: a chunk at a range's edge is neither moved nor swapped
+    /// (`windows_mm::at_a_ranges_edge`), so a placement regression fails
+    /// here, by name, not as a refused move.
+    #[track_caller]
+    fn on_a_boundary(mem: u64) {
+        assert!(mem.is_multiple_of(CHUNK), "the range at {mem:#x} is {} KiB past a 2 MiB boundary", (mem % CHUNK) >> 10);
+    }
+
+    #[track_caller]
     fn map(len: usize) -> u64 {
         // SAFETY: a new anonymous mapping.
         let p = unsafe {
@@ -2471,6 +2480,9 @@ mod tests {
             )
         };
         assert_ne!(p, crate::MAP_FAILED);
+        if len.is_multiple_of(CHUNK as usize) {
+            on_a_boundary(p as u64);
+        }
         p as u64
     }
 
@@ -3157,15 +3169,23 @@ mod tests {
     /// at each chunk's views): chunk 0 and half of chunk 1 discarded; chunk
     /// 0 then has no page committed nor charged, chunk 1 keeps its section's
     /// pages and their charge, its discarded half's included; each
-    /// discarded page is missing again and a refill reads back; the last,
-    /// partial chunk discarded whole has none committed either; the charge
-    /// follows each step.
+    /// discarded page is missing again and a refill reads back; the charge
+    /// follows each step. The range starts on a 2 MiB boundary, as
+    /// Firecracker's guest memory does; its last, partial chunk of 16 pages,
+    /// one view alone in its 2 MiB region at the range's edge, is not given a
+    /// new section when discarded whole (`windows_mm::at_a_ranges_edge`,
+    /// review B3): its pages are missing all the same, and keep their commit
+    /// and charge until the range is unmapped.
     #[test]
     fn test_a_wholly_discarded_chunk_gives_its_section_commit_back() {
         const CHUNK: u64 = 2 << 20;
         let (ctx, user) = create(0, false, true).unwrap();
         let len = 2 * CHUNK + 16 * PAGE;
-        let mem = map(len as usize);
+        let at = fresh_gib(1) + (64 << 20);
+        // SAFETY: a new anonymous mapping at a free address.
+        let mem = unsafe { crate::mmap(at as *mut c_void, len as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0) };
+        assert_eq!(mem as usize, at, "the range's address");
+        let mem = mem as u64;
         register(ctx, mem, len).unwrap();
         assert!(range_of(ctx, mem, len).unwrap().reserved.load(Ordering::Acquire), "the section is not reserved");
         #[allow(clippy::cast_possible_truncation)]
@@ -3201,11 +3221,14 @@ mod tests {
         assert_eq!(charged(), len - CHUNK + PAGE);
         // SAFETY: a page of chunk 1 not discarded.
         assert_eq!(unsafe { *((mem + CHUNK + CHUNK / 2) as *const u8) }, 0x5a);
-        // The last chunk, of 16 pages, discarded whole.
+        // The last chunk, of 16 pages, discarded whole: at the range's edge.
+        let refused = crate::windows_mm::edge_refused_for_tests();
         // SAFETY: our mapping.
         assert_eq!(unsafe { crate::madvise((mem + 2 * CHUNK) as *mut c_void, 16 * PAGE as usize, crate::MADV_DONTNEED) }, 0);
-        assert_eq!(committed(mem + 2 * CHUNK, 16 * PAGE), 0, "the last chunk discarded whole");
-        assert_eq!(charged(), CHUNK + PAGE);
+        assert_eq!(crate::windows_mm::edge_refused_for_tests(), refused + 1, "the last chunk's swap, at the range's edge");
+        assert!((0..16).all(|p| is_missing(mem + 2 * CHUNK + p * PAGE)), "the last chunk's pages");
+        assert_eq!(committed(mem + 2 * CHUNK, 16 * PAGE), 16 * PAGE, "the last chunk discarded in place");
+        assert_eq!(charged(), CHUNK + PAGE + 16 * PAGE);
         unregister(ctx, mem, len).unwrap();
         // SAFETY: our mapping, unregistered: every page reads, the
         // discarded ones as zeros.
@@ -3378,6 +3401,7 @@ mod tests {
     /// refuses, then every other page of its first 8 chunks discarded (8
     /// MiB of dead pages, no chunk whole, so each keeps its section commit
     /// and charge, as (A) has them). The range and the bytes filled.
+    #[track_caller]
     fn fill_to_the_limit_and_discard_in_part() -> (usize, c_int, u64, u64) {
         let (ctx, user, mem, done) = fill_to_the_limit();
         assert!(done >= 8 * CHUNK + (8 << 20), "only {} MiB filled", done >> 20);
@@ -3390,6 +3414,7 @@ mod tests {
 
     /// 128 MiB registered and filled with 0x5a 1 MiB at a time until the
     /// job refuses: the range and the bytes filled.
+    #[track_caller]
     fn fill_to_the_limit() -> (usize, c_int, u64, u64) {
         fill_to_the_limit_from(0)
     }
@@ -3405,12 +3430,14 @@ mod tests {
     /// [`fill_to_the_limit`], the fill begun `from` bytes in: the pages
     /// before are never filled. A fill refused at the limit is `ENOMEM`
     /// in this process from here ([`REFUSED_FILL_IS_ENOMEM`]).
+    #[track_caller]
     fn fill_to_the_limit_from(from: u64) -> (usize, c_int, u64, u64) {
         fill_to_the_limit_at(0, from)
     }
 
     /// [`fill_to_the_limit_from`], the range mapped at `at` if it is not 0
     /// (a free address of a 64 KiB boundary, [`fresh_gib`]).
+    #[track_caller]
     fn fill_to_the_limit_at(at: usize, from: u64) -> (usize, c_int, u64, u64) {
         REFUSED_FILL_IS_ENOMEM.store(true, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -3431,6 +3458,9 @@ mod tests {
         assert_ne!(mem, crate::MAP_FAILED);
         assert!(at == 0 || mem as usize == at, "the range at {mem:p}, asked at {at:#x}");
         let mem = mem as u64;
+        if at == 0 {
+            on_a_boundary(mem);
+        }
         register(ctx, mem, len).unwrap();
         let mib = std::vec![0x5au8; 1 << 20];
         let mut done = from;
@@ -5483,89 +5513,18 @@ mod tests {
         unsafe { ws::closesocket(sock(user)) };
     }
 
-    /// The pages [`take_the_room_given_up`] takes, room for them made
-    /// before (the hook runs at the limit, where nothing may allocate), and
-    /// whether it has run (it takes the room once).
-    static ROOM_TAKEN: Mutex<std::vec::Vec<usize>> = Mutex::new(std::vec::Vec::new());
-    static ROOM_TAKEN_ONCE: AtomicBool = AtomicBool::new(false);
-
-    /// Another commit taking the room a move just made by giving back part
-    /// of its dead pages' charge (`windows_mm::AFTER_DEAD_UNCHARGED`), the
-    /// first time only: all the job has.
-    fn take_the_room_given_up() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-        if ROOM_TAKEN_ONCE.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let mut held = ROOM_TAKEN.lock().unwrap();
-        while held.len() < held.capacity() {
-            // SAFETY: new private memory of ours.
-            let p = unsafe { VirtualAlloc(ptr::null(), PAGE as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
-            if p.is_null() {
-                break;
-            }
-            held.push(p as usize);
-        }
-        // The last pages where a page table is already, as [`no_room_left`]
-        // takes them: a `VirtualAlloc` of a page that needs a new page table
-        // needs 8 KiB, so with 4 KiB left it is refused and the room stays
-        // for the move's map, which then is made and owes nothing (OWEDREC:
-        // the one failing run of 20 alone on Windows Server 2022 20348 and the
-        // one of 20 on 2025 26100 both said "the hook took 8 KiB; private
-        // commit 98300 KiB" of a 98304 KiB limit, the move made, nothing
-        // owed). With the slack taken too, 100 of 100 alone on each, the
-        // 8 + 4 KiB case among them (0f751bc1's message).
-        let before = SLACK_TAKEN.load(Ordering::SeqCst);
-        let after = take_the_slack();
-        HOOK_SLACK.store((before << 32) | after, Ordering::SeqCst);
-        // OWEDREC: what the hook found to take (nothing allocated: it runs
-        // at the limit).
-        crate::windows_mm::say_at_the_limit(format_args!(
-            "OWEDREC the move gave back its dead pages' charge; the hook took {} KiB in pages and {} KiB where a page table was; private commit {} KiB",
-            held.len() * PAGE as usize / 1024,
-            (after - before) * PAGE as usize / 1024,
-            private_commit() / 1024
-        ));
-    }
-
-    /// The slack pages [`take_the_room_given_up`] took: the count taken
-    /// before it (high 32 bits) and after it (low).
-    static HOOK_SLACK: AtomicUsize = AtomicUsize::new(0);
-
-    /// Gives back all [`take_the_room_given_up`] took: its pages and its
-    /// slack pages (the slack taken before it stays taken).
-    fn give_back_the_room_taken() {
-        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
-        {
-            let mut t = ROOM_TAKEN.lock().unwrap();
-            while !t.is_empty() {
-                give_back_a_page(&mut t);
-            }
-        }
-        let v = HOOK_SLACK.swap(0, Ordering::SeqCst);
-        let (before, after) = (v >> 32, v & 0xffff_ffff);
-        let base = SLACK.load(Ordering::SeqCst);
-        if base != 0 && after > before {
-            // SAFETY: pages of our slack region the hook committed.
-            unsafe { VirtualFree((base + (before + 1) * PAGE as usize) as *mut c_void, (after - before) * PAGE as usize, MEM_DECOMMIT) };
-            SLACK_TAKEN.store(before, Ordering::SeqCst);
-        }
-    }
-
-    /// OWEDREC: one line of [`owed_goes_child`]'s steps, without allocating
-    /// (it is said at the limit): the step, the private commit, the reclaim's
-    /// counts so far and the charge owed.
-    fn owed_step(step: &str) {
+    /// LIMITREC: one line of a reclaim test's steps, without allocating (it
+    /// is said at the limit): the step, the private commit and the reclaim's
+    /// counts so far.
+    fn limit_step(step: &str) {
         let c = reclaim_counts();
         crate::windows_mm::say_at_the_limit(format_args!(
-            "OWEDREC {step}: private commit {} KiB; reclaims asked {}, candidates {}, moves made {}, not made {}; owed {} KiB; the hook ran {}",
+            "LIMITREC {step}: private commit {} KiB; reclaims asked {}, candidates {}, moves made {}, not made {}",
             private_commit() / 1024,
             c.asks,
             c.candidates,
             c.moves,
-            c.refused,
-            crate::windows_mm::owed_bytes() / 1024,
-            ROOM_TAKEN_ONCE.load(Ordering::SeqCst)
+            c.refused
         ));
     }
 
@@ -5576,7 +5535,7 @@ mod tests {
         let tmp = m[2];
         crate::windows_mm::say_at_the_limit(format_args!(
             "MOVEREC {what} {fill}: the move ended at step {} (1 map refused, 2 commit, 3 close, 4 alias unmap, 5 made); private commit KiB: \
-             start {}, dead charge given back {}, temporary view mapped {}, live pages committed {}, copied {}, views swapped {}, \
+             start {}, before its first map {}, temporary view mapped {}, live pages committed {}, copied {}, views swapped {}, \
              temporary view unmapped {}; the temporary view at {tmp:#x}, {} KiB into its 2 MiB, spanning {} 2 MiB regions, {} pages \
              committed in the region below its start outside it, {} in the one above its end",
             m[9],
@@ -5605,69 +5564,142 @@ mod tests {
         }
     }
 
-    /// A move whose room another commit takes between the giving back of
-    /// part of its dead pages' charge (12 KiB, `windows_mm::MOVE_ROOM`) and
-    /// its first map (`windows_mm::AFTER_DEAD_UNCHARGED`), with no room left
-    /// in the job ([`no_room_left`]), and whose map is then refused: the
-    /// charge cannot be taken again, and the chunk owes it
-    /// (`windows_mm::OWED`), said in one line on standard error; the chunk
-    /// as it was. The map into the move slot needs no room, so the refusal
-    /// is a test's (`windows_mm::REFUSE_SLOT_MAP`); with the room taken and
-    /// no refusal the move is made
-    /// ([`test_a_move_whose_guest_view_room_is_taken_is_made`]). While it
-    /// owes, the job's limit and the jailer's count are 12 KiB below what the
-    /// process holds, no more, and no other chunk is moved, so the fill that
-    /// needed the reclaim is refused (`ENOMEM`). The next fill cannot take
-    /// the owed charge again either (the room is still taken), and its
-    /// reclaim moves the owing chunk, which the slot's map lets it make with
-    /// no room: nothing owed then, and the fill made (before the slot its map
-    /// was refused again and the fill `ENOMEM`). Once the other commit gives
-    /// its room back, the fills go on through the reclaim, its moves made:
-    /// 4 MiB filled, the live pages read back, the discarded ones missing.
+    /// A chunk's commit and charge, for [`move_not_made_child`]: its pages
+    /// committed and its charge's.
+    fn chunk_state(chunk: u64) -> (u64, u64) {
+        (committed(chunk, CHUNK), crate::windows_mm::charged(chunk as usize).unwrap_or(0) as u64)
+    }
+
+    /// A move not made leaves its chunk exactly as it was, its charge whole
+    /// (`windows_mm::uffd_move_chunk`): with no room left in the job
+    /// ([`no_room_left`]), each step a move can be refused at
+    /// (`windows_mm::REFUSE_MOVE_STEP`: its new section not made, its view's
+    /// map into the move slot, its alias's first view's unmap) is refused
+    /// once at a fill's reclaim. With the one chunk holding dead pages the
+    /// fill is refused (`ENOMEM`), the chunk's commit and charge as before,
+    /// one move not made, none made, a line on standard error for each; the
+    /// next fill, nothing refused, moves it and is made, its dead pages'
+    /// commit and charge given back. With two such chunks and the map
+    /// refused, the next candidate's move is made and the fill with it: one
+    /// chunk as it was, the other moved. Nothing is ever owed: a move takes
+    /// nothing before its first map (review B3; before, it gave back 12 KiB
+    /// of its dead pages' charge for its maps and owed it if another commit
+    /// took that room and the move was not made). The pages read back.
     #[test]
-    fn test_a_move_whose_room_is_taken_owes_its_charge() {
-        let (code, text) = run_child("room_taken_child", Some(96 << 20));
-        assert!(text.contains("room left before the reclaim: 0 KiB"), "{text}");
-        assert!(
-            text.contains("could not map its new section (error 0) with its dead pages' charge given back for its maps"),
-            "no line for the refused map: {text}"
-        );
-        assert!(text.contains("not taken again (another commit holds the room): owed"), "{text}");
-        assert!(text.contains("while owed: the fill ENOMEM, 12 KiB owed; again made, 0 KiB owed"), "{text}");
-        assert!(text.contains("the room given back: 0 KiB owed, the fill made: 4096 KiB"), "{text}");
+    fn test_a_move_not_made_leaves_its_chunk_as_it_was() {
+        let (code, text) = run_child("move_not_made_child", Some(96 << 20));
+        for l in text.lines().filter(|l| l.starts_with("NOTMADE") || l.starts_with("wick: reclaim") || l.starts_with("filled")) {
+            std::eprintln!("{l}");
+        }
+        for what in ["make its new section", "map its new section", "unmap its alias"] {
+            let said = std::format!("could not {what} (error ");
+            assert!(
+                text.lines().any(|l| l.contains(&said) && l.contains("): the chunk is left as it was, its charge whole")),
+                "no line for {what}: {text}"
+            );
+        }
+        for step in 1..=3 {
+            assert!(
+                text.contains(&std::format!("NOTMADE one candidate, step {step} refused: the fill ENOMEM, 0 moves made, 1 not made, the chunk as it was")),
+                "step {step}: {text}"
+            );
+        }
+        assert!(text.contains("NOTMADE one candidate, nothing refused: the fill made, 1 moves made, 0 not made, the chunk moved"), "{text}");
+        assert!(text.contains("NOTMADE two candidates, the map refused: the fill made, 1 moves made, 1 not made, 1 as it was, 1 moved"), "{text}");
         assert_eq!(code, Some(0), "{text}");
     }
 
     #[test]
-    #[ignore = "run by test_a_move_whose_room_is_taken_owes_its_charge in a job of its own"]
-    fn room_taken_child() {
-        let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
-        ROOM_TAKEN.lock().unwrap().reserve_exact(4096);
-        let mut held = no_room_left();
-        *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = Some(take_the_room_given_up);
-        crate::windows_mm::REFUSE_SLOT_MAP.store(true, Ordering::SeqCst);
-        let first = fill_a_page(ctx, mem + done);
-        let owed = crate::windows_mm::owed_bytes();
-        let again = fill_a_page(ctx, mem + done);
-        let still = crate::windows_mm::owed_bytes();
-        *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = None;
-        crate::windows_mm::say_at_the_limit(format_args!(
-            "while owed: the fill {first}, {} KiB owed; again {again}, {} KiB owed",
-            owed >> 10,
-            still >> 10
-        ));
-        give_back_the_room_taken();
-        let mut n = 0;
-        while n < 4 << 20 {
-            if fill_a_page(ctx, mem + done + PAGE + n) != "made" {
-                break;
+    #[ignore = "run by test_a_move_not_made_leaves_its_chunk_as_it_was in a job of its own"]
+    fn move_not_made_child() {
+        let (ctx, user, mem, done) = fill_to_the_limit();
+        let moves = || moves_on_record().0.len();
+        let dead = |chunk: u64| {
+            for p in (PAGE..CHUNK).step_by(2 * PAGE as usize) {
+                // SAFETY: registered memory of ours.
+                assert_eq!(unsafe { crate::madvise((chunk + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
             }
-            n += PAGE;
+        };
+        let read_back = |chunk: u64| {
+            for p in (0..CHUNK).step_by(PAGE as usize) {
+                if (p / PAGE) % 2 == 1 {
+                    assert!(is_missing(chunk + p), "{chunk:#x}: {p:#x} is not missing");
+                } else {
+                    // SAFETY: a filled page.
+                    assert_eq!(unsafe { *((chunk + p + 9) as *const u8) }, 0x5a, "{chunk:#x}: {p:#x}");
+                }
+            }
+        };
+        let mut next = mem + done;
+        // One candidate: the first chunk, every other page dead.
+        dead(mem);
+        let before = chunk_state(mem);
+        assert_eq!(before.0, CHUNK, "the chunk's dead pages keep their commit");
+        for step in 1..=3usize {
+            let mut held = no_room_left();
+            let (m1, r1) = (moves(), crate::windows_mm::moves_refused());
+            crate::windows_mm::REFUSE_MOVE_STEP.store(step, Ordering::SeqCst);
+            let fill = fill_a_page(ctx, next);
+            let reached = crate::windows_mm::REFUSE_MOVE_STEP.swap(0, Ordering::SeqCst) == 0;
+            let (m2, r2) = (moves(), crate::windows_mm::moves_refused());
+            give_back_every_page(&mut held);
+            let after = chunk_state(mem);
+            assert!(reached, "step {step}: the refusal was not reached");
+            crate::windows_mm::say_at_the_limit(format_args!(
+                "NOTMADE one candidate, step {step} refused: the fill {fill}, {} moves made, {} not made, the chunk {}; its commit \
+                 and charge {:#x} {:#x} -> {:#x} {:#x}",
+                m2 - m1,
+                r2 - r1,
+                if after == before { "as it was" } else { "changed" },
+                before.0,
+                before.1,
+                after.0,
+                after.1
+            ));
+            read_back(mem);
         }
-        let owed = crate::windows_mm::owed_bytes();
+        let mut held = no_room_left();
+        let (m1, r1) = (moves(), crate::windows_mm::moves_refused());
+        let fill = fill_a_page(ctx, next);
+        let (m2, r2) = (moves(), crate::windows_mm::moves_refused());
         give_back_every_page(&mut held);
-        std::println!("the room given back: {} KiB owed, the fill made: {} KiB", owed >> 10, n >> 10);
-        the_live_pages_read_back(mem);
+        let after = chunk_state(mem);
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "NOTMADE one candidate, nothing refused: the fill {fill}, {} moves made, {} not made, the chunk {}; its commit and \
+             charge {:#x} {:#x} -> {:#x} {:#x}",
+            m2 - m1,
+            r2 - r1,
+            if after == (CHUNK / 2, before.1 - CHUNK / 2) { "moved" } else { "not moved as expected" },
+            before.0,
+            before.1,
+            after.0,
+            after.1
+        ));
+        read_back(mem);
+        next += PAGE;
+        // Two candidates, the next two chunks; the first move's map refused.
+        let (a, b) = (mem + CHUNK, mem + 2 * CHUNK);
+        dead(a);
+        dead(b);
+        let before = [chunk_state(a), chunk_state(b)];
+        let mut held = no_room_left();
+        let (m1, r1) = (moves(), crate::windows_mm::moves_refused());
+        crate::windows_mm::REFUSE_MOVE_STEP.store(2, Ordering::SeqCst);
+        let fill = fill_a_page(ctx, next);
+        let reached = crate::windows_mm::REFUSE_MOVE_STEP.swap(0, Ordering::SeqCst) == 0;
+        let (m2, r2) = (moves(), crate::windows_mm::moves_refused());
+        give_back_every_page(&mut held);
+        let after = [chunk_state(a), chunk_state(b)];
+        assert!(reached, "two candidates: the refusal was not reached");
+        let same = (0..2).filter(|&i| after[i] == before[i]).count();
+        let moved = (0..2).filter(|&i| after[i] == (CHUNK / 2, before[i].1 - CHUNK / 2)).count();
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "NOTMADE two candidates, the map refused: the fill {fill}, {} moves made, {} not made, {same} as it was, {moved} moved",
+            m2 - m1,
+            r2 - r1
+        ));
+        read_back(a);
+        read_back(b);
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
@@ -5720,31 +5752,17 @@ mod tests {
         ));
     }
 
-    /// Whether a 2 MiB region that `[a, z)` touches holds no other part of
-    /// the range `[s, e)`: a view's unmap there, with the rest of the range
-    /// mapped, gives back the region's page table.
-    fn alone_in_a_region(a: usize, z: usize, s: usize, e: usize) -> bool {
-        let c = CHUNK as usize;
-        (a - a % c..z).step_by(c).any(|r| r.max(s) >= a && (r + c).min(e) <= z)
-    }
-
-    /// VIEWCOST's assertion for the chunk at `chunk` of the range `[mem,
-    /// mem + len)`, whose alias is at `alias`: each view's unmap and map,
+    /// VIEWCOST's assertion for a chunk swapped: each view's unmap and map,
     /// made while the chunk's other view (old or new) maps its 2 MiB region,
-    /// take and give no page table, in the alias and the guest's view, but
-    /// for a view alone in a 2 MiB region of its range ([`alone_in_a_region`]:
-    /// a range's edge 1 MiB or more short of a 2 MiB boundary), not asserted.
-    fn assert_halves_cost_nothing(what: &str, chunk: usize, mem: usize, len: usize, alias: usize) {
+    /// take and give no page table, in the alias and the guest's view (a
+    /// chunk with a view alone in a 2 MiB region of its range is not
+    /// swapped: `windows_mm::at_a_ranges_edge`).
+    fn assert_halves_cost_nothing(what: &str) {
         let v = viewcost_steps();
-        let h = crate::windows_mm::chunk_half(CHUNK as usize);
-        let c = CHUNK as usize;
-        for (k, (side, base)) in [("the alias's", alias), ("the guest view's", mem)].into_iter().enumerate() {
-            let at = base + (chunk - mem);
-            for (i, (a, z)) in [(at, at + h), (at + h, at + c)].into_iter().enumerate() {
-                if !alone_in_a_region(a, z, base, base + len) {
-                    assert_eq!(v[4 * k + 2 * i], Some(0), "{what}: {side} view {i}'s unmap: {v:?}");
-                    assert_eq!(v[4 * k + 2 * i + 1], Some(0), "{what}: {side} view {i}'s map: {v:?}");
-                }
+        for (k, side) in ["the alias's", "the guest view's"].into_iter().enumerate() {
+            for i in 0..2 {
+                assert_eq!(v[4 * k + 2 * i], Some(0), "{what}: {side} view {i}'s unmap: {v:?}");
+                assert_eq!(v[4 * k + 2 * i + 1], Some(0), "{what}: {side} view {i}'s map: {v:?}");
             }
         }
     }
@@ -5763,11 +5781,14 @@ mod tests {
     /// what the unmap gave is room another commit can take
     /// (`test_a_move_whose_guest_view_room_is_taken_is_made`). Asserted: the
     /// moves and swaps are made, each view's unmap and map takes no page
-    /// table ([`assert_halves_cost_nothing`]), but for a view alone in a
-    /// 2 MiB region of its range: the last chunk's second view of a range
-    /// whose end is 1 MiB or less past a 2 MiB boundary; and the move's view
-    /// of its new section, in the move slot, takes none at its map and gives
-    /// none back at its unmap.
+    /// table ([`assert_halves_cost_nothing`]), and the move's view of its
+    /// new section, in the move slot, takes none at its map and gives none
+    /// back at its unmap; but a chunk with a view alone in a 2 MiB region of
+    /// its range (`windows_mm::at_a_ranges_edge`: the last chunk's second
+    /// view of a range 64 KiB past a boundary, whose unmap gave back the
+    /// region's table, -4 KiB, and whose map took it, +4, before review B3)
+    /// is neither moved nor swapped, each refusal counted and said, the
+    /// chunk's pages as they were and then missing.
     #[test]
     #[ignore = "a record: run alone on Windows with --ignored --nocapture (CI's WHP step)"]
     fn test_what_a_chunks_view_swap_costs_on_record() {
@@ -5820,6 +5841,32 @@ mod tests {
                     let what = std::format!("{case}, a {n}-chunk range, {pos} chunk");
                     // SAFETY: registered memory of ours.
                     assert_eq!(unsafe { crate::madvise((chunk + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+                    let a = alias + (c * CHUNK) as usize;
+                    if crate::windows_mm::at_a_ranges_edge(chunk as usize, CHUNK as usize, a, mem as usize, (mem + len) as usize) {
+                        let e0 = crate::windows_mm::edge_refused_for_tests();
+                        let r = reclaim_at_touch(PAGE as usize);
+                        let e1 = crate::windows_mm::edge_refused_for_tests();
+                        assert_eq!((r.chunks, e1 - e0), (0, 1), "{what}: the move at the range's edge");
+                        for p in (0..16).chain(CHUNK / PAGE - 16..CHUNK / PAGE) {
+                            if p == 1 {
+                                assert!(is_missing(chunk + PAGE), "{what}: the dead page");
+                            } else {
+                                // SAFETY: a filled page.
+                                assert_eq!(unsafe { *((chunk + p * PAGE) as *const u8) }, 0x5a, "{what}: page {p}");
+                            }
+                        }
+                        // SAFETY: registered memory of ours, the chunk whole.
+                        assert_eq!(unsafe { crate::madvise(chunk as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED) }, 0);
+                        let e2 = crate::windows_mm::edge_refused_for_tests();
+                        assert_eq!(crate::windows_mm::VIEWREC[9].load(Ordering::SeqCst), 0, "{what}: the swap at the range's edge");
+                        assert_eq!(e2 - e1, 1, "{what}: the swap at the range's edge");
+                        assert!((0..CHUNK).step_by(PAGE as usize).all(|p| is_missing(chunk + p)), "{what}: the discarded chunk's pages");
+                        crate::windows_mm::say_at_the_limit(format_args!(
+                            "VIEWCOST {what}: at the range's edge, neither moved nor swapped; its commit {:#x} kept",
+                            committed(chunk, CHUNK)
+                        ));
+                        continue;
+                    }
                     let r = reclaim_at_touch(PAGE as usize);
                     assert_eq!(r.chunks, 1, "{what}: the move");
                     let m: [usize; 12] = core::array::from_fn(|i| crate::windows_mm::MOVEREC[i].load(Ordering::SeqCst));
@@ -5834,14 +5881,14 @@ mod tests {
                             (m[8] as i64 - m[7] as i64) / 1024
                         ),
                     );
-                    assert_halves_cost_nothing(&std::format!("{what}, the move"), chunk as usize, mem as usize, len as usize, alias);
+                    assert_halves_cost_nothing(&std::format!("{what}, the move"));
                     assert_eq!((m[3] as i64 - m[1] as i64, m[8] as i64 - m[7] as i64), (0, 0), "{what}: the move's view in the slot, its map and unmap");
                     // SAFETY: registered memory of ours, the chunk whole.
                     assert_eq!(unsafe { crate::madvise(chunk as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED) }, 0);
                     assert_eq!(crate::windows_mm::VIEWREC[9].load(Ordering::SeqCst), 2, "{what}: the swap");
                     assert_ne!(crate::windows_mm::VIEWREC[8].load(Ordering::SeqCst), 0, "{what}: the swap");
                     viewcost_line(&what, chunk as usize, alias + (c * CHUNK) as usize, format_args!(""));
-                    assert_halves_cost_nothing(&std::format!("{what}, the swap"), chunk as usize, mem as usize, len as usize, alias);
+                    assert_halves_cost_nothing(&std::format!("{what}, the swap"));
                     crate::windows_mm::VIEWREC[9].store(0, Ordering::SeqCst);
                 }
                 // SAFETY: closes the user end, then unmaps our mapping.
@@ -5851,6 +5898,139 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A chunk with a view alone in a 2 MiB region of its range
+    /// (`windows_mm::at_a_ranges_edge`), whose swap would give back that
+    /// region's page table at the view's unmap and need it again at its map,
+    /// is neither moved nor swapped until review B4: refused before any
+    /// step, counted, and said on standard error. A 2-chunk range 64 KiB
+    /// past a 2 MiB boundary (its last chunk's second view alone in the
+    /// region past it), the first and last 16 pages of each chunk filled:
+    /// a dead page in the last chunk, the reclaim moves nothing, its pages as
+    /// they were and its commit and charge kept; a dead page in the first
+    /// chunk too, the reclaim moves that one only; the last chunk discarded
+    /// whole is not swapped, its pages missing and their commit and charge
+    /// kept (a partial discard's, until the chunk is unmapped), the first
+    /// discarded whole is, its commit gone; the last chunk filled again and
+    /// the range unregistered, its released chunk discarded whole is not
+    /// swapped either (`windows_mm::released_swap`) and reads zeros. The
+    /// edge's arithmetic beside it: a range on a 2 MiB boundary of whole
+    /// chunks has no such chunk, a short last chunk of one view (64 KiB)
+    /// does, and a range starting 1 MiB or more past a boundary its first.
+    #[test]
+    fn test_a_chunk_at_a_ranges_edge_is_neither_moved_nor_swapped() {
+        let (code, text) = run_child("edge_child", None);
+        for l in text.lines().filter(|l| l.starts_with("EDGE") || l.starts_with("wick: reclaim")) {
+            std::eprintln!("{l}");
+        }
+        assert!(text.contains("has a view alone in a 2 MiB region at its range's edge, whose swap would need a page table between its unmap and its map: not moved"), "{text}");
+        assert!(text.contains("at its range's edge, whose swap would need a page table between its unmap and its map: not swapped for a new section at its discard; its pages are discarded in place"), "{text}");
+        assert!(text.contains("not swapped for a new section at its discard; its pages are closed and discarded in place"), "{text}");
+        assert!(text.contains("EDGE done"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_chunk_at_a_ranges_edge_is_neither_moved_nor_swapped in a process of its own"]
+    fn edge_child() {
+        use crate::windows_mm::{at_a_ranges_edge, charged, edge_refused_for_tests};
+        let c = CHUNK as usize;
+        let m = 1 << 30;
+        // The arithmetic: (view, len, alias, start, end).
+        assert!(!at_a_ranges_edge(m, c, 3 * m, m, m + 2 * c), "whole chunks on a boundary, the first");
+        assert!(!at_a_ranges_edge(m + c, c, 3 * m + c, m, m + 2 * c), "whole chunks on a boundary, the last");
+        assert!(at_a_ranges_edge(m + c, 64 << 10, 3 * m + c, m, m + c + (64 << 10)), "a short last chunk of one view");
+        assert!(!at_a_ranges_edge(m + c, c / 2, 3 * m + c, m, m + c + c / 2), "a short last chunk of two views in its region");
+        assert!(at_a_ranges_edge(m + (1 << 20), c, 3 * m, m + (1 << 20), m + (1 << 20) + 2 * c), "a range 1 MiB past a boundary, its first");
+        assert!(at_a_ranges_edge(m + (64 << 10), c, 3 * m, m + (64 << 10), m + (64 << 10) + c), "a range 64 KiB past, its only chunk");
+        assert!(at_a_ranges_edge(m, c, 3 * m + (64 << 10), m, m + c), "an alias 64 KiB past");
+        let page = [0x5au8; PAGE as usize];
+        let at = fresh_gib(1) + (64 << 20) + (64 << 10);
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 2 * CHUNK;
+        // SAFETY: a new anonymous mapping, committed at first touch.
+        let mem = unsafe {
+            crate::mmap(at as *mut c_void, len as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE, -1, 0)
+        };
+        assert_eq!(mem as usize, at);
+        let mem = mem as u64;
+        register(ctx, mem, len).unwrap();
+        let alias = range_of_view(mem as usize).unwrap().0.alias.load(Ordering::Acquire) as usize;
+        let (first, last) = (mem, mem + CHUNK);
+        assert!(!at_a_ranges_edge(first as usize, c, alias, mem as usize, (mem + len) as usize), "the first chunk");
+        assert!(at_a_ranges_edge(last as usize, c, alias + c, mem as usize, (mem + len) as usize), "the last chunk");
+        let pages = || (0..16).chain(CHUNK / PAGE - 16..CHUNK / PAGE);
+        for chunk in [first, last] {
+            for p in pages() {
+                // SAFETY: `page` holds a page.
+                unsafe { copy(ctx, page.as_ptr(), chunk + p * PAGE, PAGE, false) }.unwrap();
+            }
+        }
+        let filled = |chunk: u64, dead: &[u64]| {
+            for p in pages() {
+                if dead.contains(&p) {
+                    assert!(is_missing(chunk + p * PAGE), "{chunk:#x}: page {p} not missing");
+                } else {
+                    // SAFETY: a filled page.
+                    assert_eq!(unsafe { *((chunk + p * PAGE) as *const u8) }, 0x5a, "{chunk:#x}: page {p}");
+                }
+            }
+        };
+        let state = |chunk: u64| (committed(chunk, CHUNK), charged(chunk as usize).unwrap_or(0));
+        // A dead page in the last chunk.
+        // SAFETY: registered memory of ours.
+        assert_eq!(unsafe { crate::madvise((last + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        let before = state(last);
+        let e0 = edge_refused_for_tests();
+        let r = reclaim_at_touch(PAGE as usize);
+        let e1 = edge_refused_for_tests();
+        std::println!("EDGE the last chunk with a dead page: {} moved, {} refused at the edge, its commit and charge {before:x?} -> {:x?}", r.chunks, e1 - e0, state(last));
+        assert_eq!((r.chunks, e1 - e0), (0, 1));
+        assert_eq!(state(last), before, "the last chunk's commit and charge");
+        filled(last, &[1]);
+        // A dead page in the first chunk too: that one moves.
+        // SAFETY: registered memory of ours.
+        assert_eq!(unsafe { crate::madvise((first + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        let r = reclaim_at_touch(PAGE as usize);
+        let e2 = edge_refused_for_tests();
+        std::println!("EDGE then the first with one: {} moved, {} refused at the edge", r.chunks, e2 - e1);
+        assert_eq!(r.chunks, 1, "the first chunk's move");
+        assert_eq!(state(last), before, "the last chunk's commit and charge");
+        filled(first, &[1]);
+        filled(last, &[1]);
+        // Each discarded whole.
+        // SAFETY: registered memory of ours, the last chunk whole.
+        assert_eq!(unsafe { crate::madvise(last as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED) }, 0);
+        let e3 = edge_refused_for_tests();
+        let kept = state(last);
+        std::println!("EDGE the last chunk discarded whole: {} refused at the edge, its commit and charge {kept:x?}", e3 - e2);
+        assert_eq!(e3 - e2, 1);
+        assert_eq!(kept, before, "the last chunk's commit and charge, discarded in place");
+        assert!((0..CHUNK).step_by(PAGE as usize).all(|p| is_missing(last + p)), "the last chunk's pages");
+        // SAFETY: registered memory of ours, the first chunk whole.
+        assert_eq!(unsafe { crate::madvise(first as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED) }, 0);
+        assert_eq!(edge_refused_for_tests(), e3, "the first chunk's swap");
+        assert_eq!(committed(first, CHUNK), 0, "the first chunk's commit after its swap");
+        // The last chunk filled again, then released and discarded whole.
+        for p in pages() {
+            // SAFETY: `page` holds a page.
+            unsafe { copy(ctx, page.as_ptr(), last + p * PAGE, PAGE, false) }.unwrap();
+        }
+        unregister(ctx, mem, len).unwrap();
+        // SAFETY: our mapping, released, its last chunk whole.
+        assert_eq!(unsafe { crate::madvise(last as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED) }, 0);
+        let e4 = edge_refused_for_tests();
+        // SAFETY: our mapping, released.
+        let (b0, b1) = unsafe { (ptr::read_volatile(last as *const u8), ptr::read_volatile((last + CHUNK - PAGE) as *const u8)) };
+        std::println!("EDGE the released last chunk discarded whole: {} refused at the edge, its first and last page read {b0:#x} {b1:#x}", e4 - e3);
+        assert_eq!((e4 - e3, b0, b1), (1, 0, 0));
+        // SAFETY: closes the user end, then unmaps our mapping.
+        unsafe {
+            ws::closesocket(sock(user));
+            assert_eq!(crate::munmap(mem as *mut c_void, len as usize), 0);
+        }
+        std::println!("EDGE done");
     }
 
     /// A chunk's two views (`windows_mm::chunk_views`, split at 1 MiB) are
@@ -5955,6 +6135,7 @@ mod tests {
     /// A new anonymous private mapping of `len` bytes, every page written
     /// with `fill`, registered with a new userfaultfd and unregistered from
     /// `[from, to)` (offsets): a released range there.
+    #[track_caller]
     fn released_of(len: u64, fill: u8, from: u64, to: u64) -> (u64, c_int, usize) {
         // SAFETY: a new anonymous mapping, written whole.
         let mem = unsafe {
@@ -5963,6 +6144,9 @@ mod tests {
             ptr::write_bytes(m.cast::<u8>(), fill, len as usize);
             m as u64
         };
+        if len.is_multiple_of(CHUNK) {
+            on_a_boundary(mem);
+        }
         let (ctx, user) = create(0, false, true).unwrap();
         register(ctx, mem, len).unwrap();
         assert!(range_of_view(mem as usize).is_some_and(|(r, _)| r.reserved.load(Ordering::Acquire)), "not a chunked range");
@@ -6488,13 +6672,13 @@ mod tests {
     /// VMM ended with 137 (fails on 9dcf90d0).
     #[test]
     fn test_a_move_whose_guest_view_room_is_taken_is_made() {
-        view_room_taken("guest_view_room_taken_child", "VIEWROOM the fill made, 1 moves made, 0 not made, 0 KiB owed");
+        view_room_taken("guest_view_room_taken_child", "VIEWROOM the fill made, 1 moves made, 0 not made");
     }
 
     /// The same with the alias's view (`windows_mm::BETWEEN_ALIAS_UNMAP_AND_MAP`).
     #[test]
     fn test_a_move_whose_alias_room_is_taken_is_made() {
-        view_room_taken("alias_room_taken_child", "VIEWROOM the fill made, 1 moves made, 0 not made, 0 KiB owed");
+        view_room_taken("alias_room_taken_child", "VIEWROOM the fill made, 1 moves made, 0 not made");
     }
 
     /// The same with the swap of a registered chunk discarded whole
@@ -6550,10 +6734,9 @@ mod tests {
         let alias = range_of_view(mem as usize).map_or(0, |(r, _)| r.alias.load(Ordering::Acquire) as usize);
         viewcost_line("the hook's move", mem as usize, alias, format_args!(""));
         crate::windows_mm::say_at_the_limit(format_args!(
-            "VIEWROOM the fill {fill}, {} moves made, {} not made, {} KiB owed",
+            "VIEWROOM the fill {fill}, {} moves made, {} not made",
             m2 - m1,
-            refused2 - refused1,
-            crate::windows_mm::owed_bytes() >> 10
+            refused2 - refused1
         ));
         give_back_the_room(&mut held);
         for p in (0..CHUNK).step_by(PAGE as usize) {
@@ -6739,6 +6922,7 @@ mod tests {
         };
         assert_ne!(mem, crate::MAP_FAILED);
         let mem = mem as u64;
+        on_a_boundary(mem);
         register(ctx, mem, CHUNK).unwrap();
         let page = [0x5au8; PAGE as usize];
         for p in [0, PAGE, half, half + PAGE] {
@@ -6773,18 +6957,24 @@ mod tests {
         std::println!("MOVINGHALVES done");
     }
 
-    /// A chunk with one dead page, the least a move gives back for its maps
-    /// (4 KiB, where its new section's view mapped anywhere took 4 KiB on
-    /// record, VIEWCHARGE, and one into a placeholder made apart up to 12),
-    /// with no room left in the job ([`no_room_left`]): a fill's reclaim
-    /// moves it or fails cleanly (its charge taken again, nothing owed);
-    /// which one, what the fill then got, what the move did to the process's
-    /// private commit, and where its view was mapped (its offset in 2 MiB),
-    /// printed; then chunks with 2, 3 and 4 dead pages the same way. Before
-    /// the discards, at the same limit with no dead page
-    /// anywhere, the reclaim moves nothing and tries no move: a chunk with no
-    /// dead pages is never a candidate. Nothing is owed, no other chunk is
-    /// moved, and the live pages read back.
+    /// A chunk with one dead page, the least a move gives back, with no room
+    /// left in the job ([`no_room_left`]): a fill's reclaim moves it (its
+    /// maps take no room: the move slot and the views swapped one at a time)
+    /// or fails cleanly (the chunk and its charge as they were); which one,
+    /// what the fill then got, what the move did to the process's private
+    /// commit, and where its view was mapped (its offset in 2 MiB), printed;
+    /// then chunks with 2, 3 and 4 dead pages the same way. Before the
+    /// discards, at the same limit with no dead page anywhere, the reclaim
+    /// moves nothing and tries no move: a chunk with no dead pages is never
+    /// a candidate. Each fill's reclaim makes one move, on a range on a 2 MiB
+    /// boundary, and the fill is made, but for one dead page when the fill's
+    /// charge page is the first committed in its 2 MiB region: that commit
+    /// takes a page table too, 8 KiB, where the move gave back 4 (as Linux
+    /// charges a fault's page table to the memory cgroup with its page,
+    /// v6.1 include/asm-generic/pgalloc.h :8 and :85, `GFP_PGTABLE_USER`
+    /// with `__GFP_ACCOUNT`), so the fill is refused (`ENOMEM`), as before
+    /// review B3; asserted so, where before only the line's presence was,
+    /// which let a move not made pass. The live pages read back.
     #[test]
     fn test_a_chunk_with_one_dead_page_at_the_limit() {
         let (code, text) = run_child("one_dead_page_child", Some(96 << 20));
@@ -6818,27 +7008,35 @@ mod tests {
                 // SAFETY: registered memory of ours.
                 assert_eq!(unsafe { crate::madvise((chunk + (2 * i + 1) * PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
             }
+            // Whether the fill's charge page is the first committed in its
+            // 2 MiB region of the charge's reservation: its commit then takes
+            // a page table too, 8 KiB in all.
+            #[allow(clippy::cast_possible_truncation)]
+            let cp = crate::windows_mm::charge_page_of((mem + done + k * PAGE) as usize).expect("no charge page") as u64;
+            let region = cp - cp % CHUNK;
+            let fresh = (region..region + CHUNK).step_by(PAGE as usize).all(|p| p == cp || committed_protection(p).is_none());
             let mut held = no_room_left();
             let (m1, refused1) = (moves(), crate::windows_mm::moves_refused());
             let before = private_commit();
             let one = fill_a_page(ctx, mem + done + k * PAGE);
             let after = private_commit();
             let (m2, refused2) = (moves(), crate::windows_mm::moves_refused());
-            let owed = crate::windows_mm::owed_bytes();
             let view = crate::windows_mm::LAST_MOVE_VIEW.load(Ordering::Relaxed);
             give_back_every_page(&mut held);
             std::println!(
-                "ONEDEAD {k} dead page(s): the fill {one}, {} moves made, {} not made, {} KiB owed; the process's private \
-                 commit {:+} KiB over the fill; the move's view at {view:#x}, {:#x} into its 2 MiB",
+                "ONEDEAD {k} dead page(s): the fill {one}, {} moves made, {} not made; the process's private \
+                 commit {:+} KiB over the fill; the move's view at {view:#x}, {:#x} into its 2 MiB; the fill's charge \
+                 page the first in its 2 MiB region {fresh}",
                 m2 - m1,
                 refused2 - refused1,
-                owed >> 10,
                 (after as i64 - before as i64) / 1024,
                 view % CHUNK as usize
             );
-            // The chunks with dead pages now: this one, and those before it
-            // not moved yet.
-            if owed != 0 || m2 - m1 > usize::try_from(k).unwrap() {
+            // The one chunk with dead pages now: this one (those before it
+            // moved in their rounds), moved; the fill made, but where one
+            // dead page's 4 KiB is less than the fill takes with its charge
+            // page's page table.
+            if m2 - m1 != 1 || !(one == "made" || (one == "ENOMEM" && k == 1 && fresh)) {
                 wrong.push(k);
             }
             for p in (0..CHUNK).step_by(PAGE as usize) {
@@ -6850,28 +7048,27 @@ mod tests {
                 }
             }
         }
-        assert!(wrong.is_empty(), "a charge owed with no other commit, or a chunk with no dead pages moved, for {wrong:?}");
+        assert!(wrong.is_empty(), "the fill not made, or not one move made, for {wrong:?}");
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
         let _ = ctx;
     }
 
-    /// The room a move gives back for its maps is its dead pages' charge,
-    /// not its missing pages': a chunk whose first half was never filled
-    /// (missing, no commit and no charge) and whose last page is dead, with
-    /// no room left in the job ([`no_room_left`]), is moved by a fill's
-    /// reclaim, the fill made with what it gave back, nothing owed; the
-    /// pages read back as they were.
+    /// What a move gives back is its dead pages' charge, not its missing
+    /// pages': a chunk whose first half was never filled (missing, no commit
+    /// and no charge) and whose last page is dead, with no room left in the
+    /// job ([`no_room_left`]), is moved by a fill's reclaim, the fill made
+    /// with what it gave back; the pages read back as they were.
     #[test]
     fn test_a_chunk_whose_dead_pages_lie_above_unfilled_ones_moves() {
         let (code, text) = run_child("dead_above_unfilled_child", Some(96 << 20));
         for l in text
             .lines()
-            .filter(|l| l.starts_with("OWEDREC") || l.starts_with("MOVEREC") || l.starts_with("room left") || l.starts_with("wick: reclaim") || l.starts_with("filled"))
+            .filter(|l| l.starts_with("LIMITREC") || l.starts_with("MOVEREC") || l.starts_with("room left") || l.starts_with("wick: reclaim") || l.starts_with("filled"))
         {
             std::eprintln!("{l}");
         }
-        assert!(text.contains("dead above unfilled: the fill made, 1 moves made, 0 not made, 0 KiB owed"), "{text}");
+        assert!(text.contains("dead above unfilled: the fill made, 1 moves made, 0 not made"), "{text}");
         assert_eq!(code, Some(0), "{text}");
     }
 
@@ -6883,7 +7080,7 @@ mod tests {
         // SAFETY: registered memory of ours.
         assert_eq!(unsafe { crate::madvise(last as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
         let mut held = no_room_left();
-        owed_step("dead above unfilled, no room left");
+        limit_step("dead above unfilled, no room left");
         {
             // Whether the fill's page has a page table already: a committed
             // page in its 2 MiB-aligned region (one page table maps 2 MiB).
@@ -6898,7 +7095,7 @@ mod tests {
                 at += PAGE;
             }
             crate::windows_mm::say_at_the_limit(format_args!(
-                "OWEDREC the fill's page is {} KiB into its 2 MiB-aligned region, {committed} pages committed below it there; the range at {mem:#x}, the page at {target:#x}",
+                "LIMITREC the fill's page is {} KiB into its 2 MiB-aligned region, {committed} pages committed below it there; the range at {mem:#x}, the page at {target:#x}",
                 (target - region) / 1024
             ));
             // Its charge page ([`windows_mm::charge_page_of`]): committed
@@ -6916,23 +7113,17 @@ mod tests {
                 at += PAGE;
             }
             crate::windows_mm::say_at_the_limit(format_args!(
-                "OWEDREC the fill's charge page at {cp:#x}, {} KiB into its 2 MiB-aligned region, {in_region} other pages committed in that region",
+                "LIMITREC the fill's charge page at {cp:#x}, {} KiB into its 2 MiB-aligned region, {in_region} other pages committed in that region",
                 (cp - cregion) / 1024
             ));
         }
         let (m1, refused1) = (moves_on_record().0.len(), crate::windows_mm::moves_refused());
         let fill = fill_a_page(ctx, mem + done);
-        owed_step("dead above unfilled, after the fill");
+        limit_step("dead above unfilled, after the fill");
         moverec_line("dead above unfilled, the fill", fill);
         let (m2, refused2) = (moves_on_record().0.len(), crate::windows_mm::moves_refused());
-        let owed = crate::windows_mm::owed_bytes();
         give_back_every_page(&mut held);
-        std::println!(
-            "dead above unfilled: the fill {fill}, {} moves made, {} not made, {} KiB owed",
-            m2 - m1,
-            refused2 - refused1,
-            owed >> 10
-        );
+        std::println!("dead above unfilled: the fill {fill}, {} moves made, {} not made", m2 - m1, refused2 - refused1);
         for p in (0..CHUNK).step_by(PAGE as usize) {
             if p < CHUNK / 2 || mem + p == last {
                 assert!(is_missing(mem + p), "{p:#x} is not missing");
@@ -6941,76 +7132,6 @@ mod tests {
                 assert_eq!(unsafe { *((mem + p + 9) as *const u8) }, 0x5a, "{p:#x}");
             }
         }
-        // SAFETY: closes the user end.
-        unsafe { ws::closesocket(sock(user)) };
-    }
-
-    /// A charge owed (`windows_mm::OWED`, as in
-    /// [`test_a_move_whose_room_is_taken_owes_its_charge`], its map refused
-    /// by the test) goes with its
-    /// range: once the range is unregistered and unmapped, nothing is owed,
-    /// before any commit; memory committed at the same address afterwards
-    /// is no charged view's, and a fill of another range is made, with no
-    /// charge taken for the old one's pages.
-    #[test]
-    fn test_an_owed_charge_goes_with_its_range() {
-        let (code, text) = run_child("owed_goes_child", Some(96 << 20));
-        for l in text.lines().filter(|l| l.starts_with("OWEDREC") || l.starts_with("room left") || l.starts_with("wick: reclaim")) {
-            std::eprintln!("{l}");
-        }
-        assert!(text.contains("owed: 12 KiB; unregistered and unmapped: 0 KiB owed; the same address committed, charged false; another fill made"), "{text}");
-        assert_eq!(code, Some(0), "{text}");
-    }
-
-    #[test]
-    #[ignore = "run by test_an_owed_charge_goes_with_its_range in a job of its own"]
-    fn owed_goes_child() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-        let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
-        ROOM_TAKEN.lock().unwrap().reserve_exact(4096);
-        owed_step("filled to the limit, half of 8 chunks discarded");
-        let mut held = no_room_left();
-        owed_step("no room left");
-        *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = Some(take_the_room_given_up);
-        crate::windows_mm::REFUSE_SLOT_MAP.store(true, Ordering::SeqCst);
-        let fill = fill_a_page(ctx, mem + done);
-        *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = None;
-        crate::windows_mm::say_at_the_limit(format_args!("OWEDREC the fill at the limit: {fill}"));
-        owed_step("after the fill");
-        let owed = crate::windows_mm::owed_bytes();
-        give_back_the_room_taken();
-        give_back_every_page(&mut held);
-        // Registered before the old range's addresses are free: a range
-        // stays in the table, unregistered, until its userfaultfd is closed.
-        // SAFETY: a new anonymous mapping, committed at first touch (the
-        // job is near its limit).
-        let other = unsafe {
-            crate::mmap(
-                ptr::null_mut(),
-                CHUNK as usize,
-                crate::PROT_READ | crate::PROT_WRITE,
-                crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(other, crate::MAP_FAILED);
-        let other = other as u64;
-        register(ctx, other, CHUNK).unwrap();
-        unregister(ctx, mem, 128 << 20).unwrap();
-        // SAFETY: our mapping.
-        assert_eq!(unsafe { crate::munmap(mem as *mut c_void, 128 << 20) }, 0);
-        let after = crate::windows_mm::owed_bytes();
-        // SAFETY: new memory of ours, where the range was if it is free.
-        let at = unsafe { VirtualAlloc(mem as *const c_void, 1 << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
-        assert_eq!(at as u64, mem, "the range's address was not free again");
-        let charged = crate::windows_mm::charged_view_at_for_tests(mem as usize);
-        let made = fill_a_page(ctx, other);
-        std::println!(
-            "owed: {} KiB; unregistered and unmapped: {} KiB owed; the same address committed, charged {charged}; another fill {made}",
-            owed >> 10,
-            after >> 10
-        );
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
@@ -7106,6 +7227,10 @@ mod tests {
             painted.1 - painted.0
         );
         assert!(reclaimer_stack_queried() >= RECLAIMER_STACK, "the reclaimer's stack was not committed whole");
+        // 2 MiB filled and 4 MiB touched past the limit, each chunk giving
+        // back 1 MiB: 6 moves at least (before review B3 neither was
+        // asserted, and a fill refused ended the loop unsaid).
+        assert!(n == 2 << 20 && moves.len() >= 6, "{} KiB filled, {} chunks moved", n >> 10, moves.len());
         assert!(after_touch.0 > 0 && after_touch.0 <= after_touch.1 / 4, "the reclaimer used {after_touch:?}");
         assert!(path < painted.1 - painted.0, "the touch's path went past the painted stack");
         let _ = ctx;
@@ -7949,14 +8074,12 @@ mod tests {
     /// before it, and a VMM at its limit is not ended for a reclaim. Without
     /// the budget block (decommitted for the test) the same move raises the
     /// count by its live pages: the budget is what holds it.
-    /// With no room left in the job at each move ([`no_room_left`]), where
-    /// the move gives back 12 KiB of its dead pages' charge before its maps
-    /// (`windows_mm::MOVE_ROOM`; a charge page is private commit and cover,
-    /// so the count falls by it, and the maps' page tables, 4 KiB a view,
-    /// take back part): the count during the move is below what it was
-    /// before by no more than that (64 KiB allowed, against the 1 MiB of
-    /// dead pages the chunk holds: it never counts a chunk's dead pages as
-    /// gone before they are). The count needs `PROCESS_MEMORY_COUNTERS_EX2`'s
+    /// With no room left in the job at each move ([`no_room_left`]): the
+    /// count during the move is below what it was before by no more than 64
+    /// KiB, against the 1 MiB of dead pages the chunk holds (it never counts
+    /// a chunk's dead pages as gone before they are; a move gives none of
+    /// their charge back before it is made, since review B3, where it gave
+    /// back 12 KiB before its maps). The count needs `PROCESS_MEMORY_COUNTERS_EX2`'s
     /// `SharedCommitUsage` (Windows 10 or 11 22H2 with the September 2023
     /// update and later): on a host without it the jailer refuses
     /// memory.max (`test_a_memory_limit_on_this_host`), and the child says
@@ -8132,7 +8255,11 @@ mod tests {
             "RECLAIMREC private commit {} KiB before, {} KiB after; section commit {} KiB before, {} KiB after",
             before.0, after.0, before.1, after.1
         );
-        assert!(more >= 4 << 20, "{} KiB filled past the limit", more >> 10);
+        // 8 chunks with 1 MiB of dead pages each: the fill of up to 8 MiB
+        // past the limit moves every one (8172 KiB filled on record, the
+        // rest the fills' own page tables); before review B3 only the 4 MiB
+        // was asserted, which half the moves refused would have passed.
+        assert!(more >= 4 << 20 && moves.len() == 8, "{} KiB filled past the limit, {} chunks moved", more >> 10, moves.len());
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
