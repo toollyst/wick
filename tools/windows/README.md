@@ -120,7 +120,10 @@
 
   With `--boot <dir>` the guest is upstream's CI kernel and root file system
   (downloaded into `<dir>` when not there; the ones `boot-test.ps1` boots),
-  with a network interface: every vCPU runs. Besides the VMMMEM lines it
+  with a network interface: every vCPU runs. `--check-stacks <saved output>`
+  then fails (exit 1) when a vCPU thread has less than kvm-ioctls'
+  `RUN_STACK` of its stack committed from its base (CI's windows job runs
+  it on the `--boot` output; it needs no Windows). Besides the VMMMEM lines it
   prints each thread's stack (VMMSTACK lines: reserved, committed, resident,
   how deep) and, for the deepest and the median thread of each kind, the
   return addresses on its stack's resident pages (module and offset, with

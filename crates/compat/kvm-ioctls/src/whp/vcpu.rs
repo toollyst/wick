@@ -1951,8 +1951,25 @@ impl VcpuFd {
         Ok(())
     }
 
-    /// Runs the vCPU until the next exit.
+    /// Runs the vCPU until the next exit. The first run on a thread first
+    /// commits [`RUN_STACK`] of the thread's stack below the frame that
+    /// called it ([`commit_run_stack`]).
     pub fn run(&mut self) -> Result<VcpuExit<'_>> {
+        if !RUN_STACK_COMMITTED.get() {
+            RUN_STACK_COMMITTED.set(true);
+            // The frame the measure is from: a local of this one, the
+            // caller's frame just above it.
+            #[cfg(test)]
+            let call = {
+                let here = 0u8;
+                std::hint::black_box(&raw const here) as usize
+            };
+            let bottom = commit_run_stack();
+            #[cfg(test)]
+            super::ffi::trace::low::filled(call, bottom, bottom + RUN_STACK);
+            #[cfg(not(test))]
+            let _ = bottom;
+        }
         #[cfg(feature = "gdb")]
         let shared = Arc::clone(&self.shared);
         let exit = self.run_loop();
@@ -3269,6 +3286,85 @@ impl VcpuFd {
     }
 }
 
+/// How much of a vCPU thread's stack is committed below the frame that
+/// calls [`VcpuFd::run`], before the thread's first run call: the depth
+/// below the run call, not from the stack's base, so a caller's own frames
+/// above it do not count against it.
+///
+/// Why: inside `WHvRunVirtualProcessor`, WHP's handling of some exits
+/// throws and catches C++ exceptions (wil's `ResultException`), whose
+/// dispatch grows the thread's stack; a booted guest's first memory exit
+/// for guest RAM not committed yet took a vCPU thread's committed stack
+/// from 20 to 56 KiB in one run call, with two first-chance C++ exceptions
+/// within it (STACKCALL, CI run 43833851623). A stack page Windows commits
+/// as the thread first touches it, from the job's memory limit: at the
+/// limit that commit is refused, inside WHP, where nothing of wick's can
+/// make room first, and the VMM ends with 137 (the stack filter's line;
+/// MOVEUNDERVCPU, CI run 43881982686: refused at 52 KiB committed from 8,
+/// inside WHP's first run call at the limit). Committed here, at the
+/// thread's first run, at boot or restore and far from the limit, a
+/// committed stack page stays committed for the thread's life, so WHP's
+/// growth within this depth asks no commit at the limit.
+///
+/// How much: twice the deepest low mark seen below the call (the record
+/// build's measure, `ffi::trace::low`, in MOVEUNDERVCPU's RUNREC lines and
+/// STACKCALL's), rounded up to 16 KiB, never under 96 KiB; the tests that
+/// print the mark say a mark over half of this in a RUNSTACK line (an
+/// assertion once this is set from recorded marks). 96 is the floor until
+/// a mark is on record: the deepest growth seen within WHP's calls was
+/// 36 KiB (STACKCALL, above, 20 to 56), with the run loop's own frames
+/// below the call besides. The overflow's own room, the thread's guarantee
+/// (20 KiB, std's `SetThreadStackGuarantee`), is beyond it.
+///
+/// The release build's own check: CI's booted release Firecracker fails its
+/// stage when a vCPU thread has less than this committed from its stack's
+/// base (`tools/windows/vmm-memory-record.py --check-stacks` on its VMMSTACK
+/// lines; its RUN_STACK_KIB is this, `tools/check-derived.py`).
+///
+/// What it costs: each vCPU thread holds this much of committed stack below
+/// its run call from its first run, resident too (the probe touches each
+/// page): about 110 KiB from the stack's base, the call 13 to 16 KiB below
+/// it, where a booted guest's held 48 to 52 KiB (VMMSTACK, CI run
+/// 43881982686; the VMM memory row of docs/COMPATIBILITY.md).
+///
+/// If the commit is refused at the first run (a job already at its limit
+/// when the VMM boots or restores), the stack filter ends the VMM with 137
+/// and its line naming the thread, as any stack that could not grow at the
+/// limit does (`windows_mm::stack_filter`).
+///
+/// Not the fix: the real one answers a refused stack page with a reclaim
+/// from the stack filter, the guard re-armed and the faulting instruction
+/// continued, in wick's frames or a system DLL's (the stack reclaim's step
+/// 3); until its tests pass inside WHP's run call, this stays. No other
+/// thread is covered by it: the userfaultfd serve thread's stack, whose
+/// page was refused inside ntdll's heap code at the limit
+/// (`RtlpAllocateHeap`, under `destroy`), still ends the VMM with 137
+/// there, as any thread's that must grow at the limit does (SECURITY.md,
+/// Not at parity yet).
+pub(crate) const RUN_STACK: usize = 96 << 10;
+
+thread_local! {
+    /// Whether this thread has committed [`RUN_STACK`] ([`VcpuFd::run`]).
+    static RUN_STACK_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Commits [`RUN_STACK`] of the calling thread's stack below the caller's
+/// frame, and returns the lowest address of the frame that did. A frame of
+/// that size: the compiler's stack probe (`__chkstk`) touches each of its
+/// pages in order, top down, as any growth does, so each is committed
+/// through the guard page, and stays committed. In the record build the
+/// frame is filled with `ffi::trace::low::PATTERN`, from which the low
+/// mark is read; otherwise it is not written.
+#[inline(never)]
+fn commit_run_stack() -> usize {
+    #[cfg(test)]
+    let frame = [super::ffi::trace::low::PATTERN; RUN_STACK / 8];
+    #[cfg(not(test))]
+    let frame = core::mem::MaybeUninit::<[u64; RUN_STACK / 8]>::uninit();
+    std::hint::black_box(&frame);
+    frame.as_ptr() as usize
+}
+
 /// [`PAGE_WINDOW`]'s hook.
 #[cfg(test)]
 type PageWindowHook = Box<dyn FnMut(&[u8; LAPIC_PAGE])>;
@@ -4396,7 +4492,8 @@ mod fpu_tests {
                     let before = stack_committed();
                     let what = step(vcpu);
                     let after = stack_committed();
-                    eprintln!("STACKTEST {name}: {what}; the thread's stack: {before} KiB committed before, {after} after");
+                    let low = super::super::ffi::trace::low::mark().map_or(String::new(), |m| format!("; {m}"));
+                    eprintln!("STACKTEST {name}: {what}; the thread's stack: {before} KiB committed before, {after} after{low}");
                 })
                 .unwrap();
         });
@@ -4658,19 +4755,51 @@ mod fpu_tests {
     /// below the second: a thread past it has had a call refused, or a new
     /// path as deep as that. A bound on this backend's own behaviour (no
     /// call WHP refuses is made on a vCPU's thread), not the tests' budget.
+    /// Since the first run commits [`RUN_STACK`] below the call, it bounds
+    /// what the thread used, measured from the stack's base as the
+    /// committed stack was: its low mark's depth from the base, rounded up
+    /// to a page ([`used_from_base`]).
     const STACK_BOUND: usize = 40 << 10;
+
+    /// How much of the calling thread's stack it has used, from its base,
+    /// in bytes: its low mark's depth (`ffi::trace::low`), rounded up to a
+    /// page as a committed stack is, on a thread that has run; else, and
+    /// for a mark past the pre-committed frame, what is committed.
+    fn used_from_base() -> usize {
+        match super::super::ffi::trace::low::mark() {
+            Some(m) if !m.past => m.from_base.next_multiple_of(4096),
+            _ => super::super::ffi::trace::stack(),
+        }
+    }
+
+    /// Says a low mark over half of [`RUN_STACK`] below the run call, where
+    /// the margin its size keeps is gone, in one line that cannot be missed
+    /// (`who` names the thread or step). Printed, not asserted: no mark is
+    /// on record yet, and the commit that sets [`RUN_STACK`] from the
+    /// recorded marks makes it an assertion.
+    fn say_if_over_half(who: &str, m: super::super::ffi::trace::low::Mark) {
+        if m.past || m.below_call > RUN_STACK / 2 {
+            eprintln!(
+                "RUNSTACK over half: {} KiB below the run call ({who}: {m}), over half of the {} KiB committed below it; \
+                 raise RUN_STACK by its rule",
+                m.below_call.div_ceil(1024),
+                RUN_STACK / 1024
+            );
+        }
+    }
 
     /// [`run_a_step`] on a thread of its own, made as Firecracker makes a
     /// vCPU's (its name, 2 MiB of stack reserved), with the WHP calls the
     /// thread made (`ffi::trace`): one STACKTEST line of what the thread's
     /// stack had committed before and after the step, and one STACKCALL
-    /// line for each call (past 40 calls, for those that left more of the
-    /// stack committed than they found, or failed). The calls the emulator
-    /// makes through its callbacks are lines of their own and are not
-    /// added to the stack within WHP calls, which the emulator's call they
-    /// are made in already counts (`trace::Call::nested`). Returns what is
-    /// wrong with the step: each WHP call that failed, and a stack
-    /// committed past [`STACK_BOUND`].
+    /// line for each call (past 40 calls, for those that took the thread
+    /// deeper than the calls before, by its low mark, or failed). The calls
+    /// the emulator makes through its callbacks are lines of their own and
+    /// are not added to the stack within WHP calls, which the emulator's
+    /// call they are made in already counts (`trace::Call::nested`).
+    /// Returns what is wrong with the step: each WHP call that failed, and a
+    /// stack used past [`STACK_BOUND`] ([`used_from_base`]); a low mark over
+    /// half of [`RUN_STACK`] is said ([`say_if_over_half`]).
     fn a_step_with_its_calls(vcpu: &mut VcpuFd, thread: &str, name: &str) -> Vec<String> {
         std::thread::scope(|scope| {
             std::thread::Builder::new()
@@ -4684,25 +4813,47 @@ mod fpu_tests {
                     let took = began.elapsed().as_secs_f64() * 1e6;
                     let calls = super::super::ffi::trace::end();
                     let after = super::super::ffi::trace::stack();
+                    let used = used_from_base();
+                    let low = super::super::ffi::trace::low::mark();
                     let (faults, deepest) = libc::wick_mm::host_faults_on_this_thread();
-                    let grew = |c: &super::super::ffi::trace::Call| c.after > c.before;
-                    let by_calls: usize = calls.iter().filter(|c| !c.nested()).map(|c| c.after - c.before).sum();
+                    // How much deeper a call took the thread than the
+                    // calls before it: its low mark against the one before
+                    // (the run loop's frames between two calls are in it,
+                    // shallower than WHP's after its first call), or, with
+                    // no mark, its committed stack.
+                    let mut last = 0;
+                    let deeper: Vec<usize> = calls
+                        .iter()
+                        .map(|c| match c.low {
+                            Some(m) if !m.past => {
+                                let d = m.below_call.saturating_sub(last);
+                                last = last.max(m.below_call);
+                                d
+                            }
+                            _ => c.after - c.before,
+                        })
+                        .collect();
+                    let grew = |i: usize| deeper[i] > 0;
+                    let by_calls: usize = calls.iter().zip(&deeper).filter(|(c, _)| !c.nested()).map(|(_, d)| d).sum();
                     eprintln!(
                         "STACKTEST {thread}, {name}: {what}; the thread's stack: {} KiB committed before, {} after, \
-                         {} of them within WHP calls; {} WHP calls ({} of them the emulator's, within its own), \
-                         {} left more committed, {} failed; the thread's own accesses to lazy guest RAM that \
-                         the exception handler committed: {faults} (the stack at most {} KiB committed at its entry)",
+                         {} KiB used from its base ({}), {} KiB of it deeper within WHP calls; {} WHP calls ({} of \
+                         them the emulator's, within its own), {} went deeper, {} failed; the thread's own accesses \
+                         to lazy guest RAM that the exception handler committed: {faults} (the stack at most {} KiB \
+                         committed at its entry)",
                         before / 1024,
                         after / 1024,
+                        used / 1024,
+                        low.map_or("no run call".to_string(), |m| m.to_string()),
                         by_calls / 1024,
                         calls.len(),
                         calls.iter().filter(|c| c.nested()).count(),
-                        calls.iter().filter(|c| grew(c)).count(),
+                        (0..calls.len()).filter(|&i| grew(i)).count(),
                         calls.iter().filter(|c| c.hres != 0).count(),
                         deepest / 1024
                     );
                     for (i, c) in calls.iter().enumerate() {
-                        if i < 40 || grew(c) || c.hres != 0 {
+                        if i < 40 || grew(i) || c.hres != 0 {
                             eprintln!("STACKCALL {thread}, {name}: #{} {}", i + 1, c.line());
                         }
                     }
@@ -4715,12 +4866,15 @@ mod fpu_tests {
                     if !what.ends_with(&format!("IoOut {PORT:#x}")) {
                         wrong.push(format!("{thread}, {name}: the step did not reach its end: {what}"));
                     }
-                    if after > STACK_BOUND {
+                    if used > STACK_BOUND {
                         wrong.push(format!(
-                            "{thread}, {name}: {} KiB of the stack committed, over {}",
-                            after / 1024,
+                            "{thread}, {name}: {} KiB of the stack used from its base, over {}",
+                            used / 1024,
                             STACK_BOUND / 1024
                         ));
+                    }
+                    if let Some(m) = low {
+                        say_if_over_half(&format!("{thread}, {name}"), m);
                     }
                     wrong
                 })
@@ -4755,7 +4909,11 @@ mod fpu_tests {
     /// no WHP call of the vCPU's thread fails (IA32_XSS is read only where
     /// the partition keeps it, and which registers it keeps is found out
     /// when the VM is made, not on this thread), and the thread's stack
-    /// stays within [`STACK_BOUND`].
+    /// stays within [`STACK_BOUND`] (used from its base: since the first
+    /// run commits [`RUN_STACK`] below the call, each STACKCALL line also
+    /// gives the thread's low mark after the call, the depth below the run
+    /// call it has written, and a RUNSTACK line says any step's mark over
+    /// half of [`RUN_STACK`] below the run call, the margin its size keeps).
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_the_stack_each_whp_call_commits_on_record() {
@@ -5055,9 +5213,10 @@ mod fpu_tests {
             } else {
                 a_step_with_its_calls(&mut vcpu, "fc_vcpu 0", name)
             };
-            // A record, not bounded: a failed call still is wrong.
+            // A record, not bounded by STACK_BOUND: a failed call still is
+            // wrong.
             let of_the_step: Vec<String> = if RECORDED.contains(name) {
-                of_the_step.into_iter().filter(|w| !w.contains(" KiB of the stack committed, over ")).collect()
+                of_the_step.into_iter().filter(|w| !w.contains(" KiB of the stack used from its base, over ")).collect()
             } else {
                 of_the_step
             };
@@ -8850,6 +9009,58 @@ mod fpu_tests {
         (out.status.code(), text)
     }
 
+    /// A vCPU thread's first run commits its stack [`RUN_STACK`] below the
+    /// frame that called `run` (the depth below the call, not from the
+    /// stack's base): on a fresh thread made as Firecracker makes a vCPU's
+    /// (its name, 2 MiB of stack reserved), the TEB's `StackLimit` after
+    /// the first run, whose guest exits at once (`out 0x80`), is at least
+    /// [`RUN_STACK`] below a local of the frame that called it, where
+    /// before the run it was not. A RUNSTACK line gives both and the
+    /// thread's low mark. Without the commit the first run left the stack
+    /// committed 16 to 24 KiB from its base (STACKTEST, CI run
+    /// 43392627996), so the test fails there.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_vcpu_threads_stack_is_committed_before_its_first_run() {
+        let program = [0xE6, PORT as u8, 0xEB, 0xFC]; // out 0x80, al; jmp to the out
+        let (vm, mut fd, m) = mmio_guest(&program);
+        let vcpu = &mut fd;
+        let (exit, call, base, before, after, low) = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("fc_vcpu 0".to_string())
+                .stack_size(2 << 20)
+                .spawn_scoped(scope, move || {
+                    let here = 0u8;
+                    let call = std::hint::black_box(&raw const here) as usize;
+                    let (base, before) = super::super::ffi::trace::low::base_and_limit();
+                    let watchdog = super::Watchdog::arm(vcpu);
+                    let exit = matches!(vcpu.run(), Ok(VcpuExit::IoOut(PORT, _)));
+                    drop(watchdog);
+                    let (_, after) = super::super::ffi::trace::low::base_and_limit();
+                    (exit, call, base, before, after, super::super::ffi::trace::low::mark())
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+        eprintln!(
+            "RUNSTACK the frame that called run {} KiB below the stack's base; the stack committed to {} KiB below that \
+             frame before the first run, to {} KiB below it after; {}",
+            (base - call) / 1024,
+            call.saturating_sub(before) / 1024,
+            call.saturating_sub(after) / 1024,
+            low.map_or("no low mark".to_string(), |m| m.to_string())
+        );
+        assert!(exit, "the guest's out 0x80 did not come back");
+        assert!(call - before < RUN_STACK, "a fresh thread had its stack committed that deep already: nothing measured");
+        assert!(after <= call - RUN_STACK, "committed less than {} KiB below the frame that called run", RUN_STACK / 1024);
+        assert!(low.is_some_and(|m| !m.past), "{low:?}");
+        drop(fd);
+        drop(vm);
+        // SAFETY: the test's mapping, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+    }
+
     /// The WHP twin of libc's `test_a_moved_chunk_reads_and_writes_through`:
     /// a 2 MiB chunk of userfaultfd-registered guest RAM moved into a new
     /// section by the reclaim at the job's memory limit
@@ -8887,7 +9098,12 @@ mod fpu_tests {
     /// into the old one after the guest's view was closed) is a bad value
     /// at the next pass. Asserted: no bad value, every round moved, no
     /// dirty page lost, no reclaim asked by a dead page's fill.
-    /// MOVEUNDERVCPU lines, one a round with its reclaim counts.
+    /// MOVEUNDERVCPU lines, one a round with its reclaim counts, and one of
+    /// the vCPU thread's deepest low mark below its run call (RUNREC), with
+    /// a RUNSTACK line if it is over half of [`RUN_STACK`]. In CI run 43881982686,
+    /// before the vCPU thread's stack was committed at its first run, the
+    /// child ended with 137 inside WHP's first run call at the limit, its
+    /// stack refused at 52 KiB committed (from 8).
     ///
     /// ```text
     ///     xor r8d, r8d; xor r9d, r9d
@@ -9108,6 +9324,17 @@ mod fpu_tests {
         mailbox(0).store(3, Ordering::SeqCst);
         let end = runner.join().unwrap();
         runrec();
+        // How deep the vCPU's thread went below its first run call, all
+        // rounds: within half of what its first run committed.
+        let low = super::super::ffi::trace::runrec::deepest_low();
+        eprintln!(
+            "MOVEUNDERVCPU the vCPU thread's deepest: {} ({} KiB committed below the call at its first run)",
+            low.map_or("no run call recorded".to_string(), |m| m.to_string()),
+            RUN_STACK / 1024
+        );
+        if let Some(m) = low {
+            say_if_over_half("MOVEUNDERVCPU's vCPU thread", m);
+        }
         let at_limit = &rounds[1..];
         let moved = at_limit.iter().filter(|r| r.0).count();
         let moved_writing = at_limit[ROUNDS as usize..].iter().filter(|r| r.0).count();

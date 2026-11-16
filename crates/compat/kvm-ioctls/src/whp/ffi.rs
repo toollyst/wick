@@ -354,13 +354,18 @@ impl Drop for OwnedHandle {
 /// commits a stack's pages as they are first touched and keeps them). The
 /// calls are kept as they were given and made into lines by the test, after
 /// it has read the stack for the last time, so that no line's making is in
-/// what it measures.
+/// what it measures. A thread that has run a vCPU has its stack committed
+/// `vcpu::RUN_STACK` below its first run call before that call, so there
+/// the committed stack grows no more within that depth, and the measure is
+/// the low mark ([`trace::low`]), each call's after it.
 ///
 /// With the `whp-trace` feature (a build for a record, never a release),
 /// every such call during which the thread's committed stack grew by
 /// [`trace::GREW`] or more is also printed on standard error as it
 /// returns, a `WHPTRACE` line: which call it is that commits a booted
 /// guest's vCPU thread's stack, which the record test's steps do not show.
+/// Since the run stack's pre-commit, a vCPU thread's call shows there only
+/// when it goes past `vcpu::RUN_STACK` below the run call.
 #[cfg(any(test, feature = "whp-trace"))]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod trace {
@@ -392,6 +397,12 @@ pub(crate) mod trace {
         /// code of ours between two calls raises one but the lazy-RAM
         /// faults the memory module resolves before any later handler.
         pub raised: Raised,
+        /// The thread's stack low mark after the call ([`low::mark`]), on
+        /// a thread that has run: its committed stack (`before`, `after`)
+        /// is committed below the run call before the first run, so this
+        /// is what tells how deep a call went.
+        #[cfg(test)]
+        pub low: Option<low::Mark>,
     }
 
     /// First-chance exceptions counted on a thread by [`count_exceptions`]'
@@ -522,8 +533,12 @@ pub(crate) mod trace {
             let took = self.micros().map_or(String::new(), |us| format!(", {us:.1} us"));
             let raised = self.raised.text();
             let raised = if raised.is_empty() { raised } else { format!(", first-chance exceptions {raised}") };
+            #[cfg(test)]
+            let low = self.low.map_or(String::new(), |m| format!(", {m}"));
+            #[cfg(not(test))]
+            let low = "";
             format!(
-                "{}(vp {}{registers}) HRESULT {:#010x}{exit}{detail}, stack {} -> {} KiB{took}{raised}",
+                "{}(vp {}{registers}) HRESULT {:#010x}{exit}{detail}, stack {} -> {} KiB committed{low}{took}{raised}",
                 self.call,
                 self.vp,
                 self.hres.cast_unsigned(),
@@ -659,6 +674,104 @@ pub(crate) mod trace {
         base - limit
     }
 
+    /// The record build's measure of a vCPU thread's stack below its first
+    /// run call (the frame `VcpuFd::run` commits, `vcpu::commit_run_stack`,
+    /// is filled with [`low::PATTERN`] there): how deep the thread has
+    /// written below that call, which its committed stack no longer tells
+    /// (it is committed to `vcpu::RUN_STACK` below the call before the
+    /// first run). The size of that frame is twice the deepest mark seen,
+    /// rounded up to 16 KiB, and never under 96 KiB.
+    #[cfg(test)]
+    pub(crate) mod low {
+        use std::cell::Cell;
+
+        /// What the frame is filled with: `"wickwick"`.
+        pub(crate) const PATTERN: u64 = u64::from_le_bytes(*b"wickwick");
+
+        std::thread_local! {
+            /// (the address of a local of the first run call's frame, the
+            /// filled frame's lowest address, the lowest 8 bytes found
+            /// written so far); all 0 on a thread that has not run.
+            static FRAME: Cell<(usize, usize, usize)> = const { Cell::new((0, 0, 0)) };
+        }
+
+        /// The thread's low mark ([`mark`]).
+        #[derive(Clone, Copy, Debug)]
+        pub(crate) struct Mark {
+            /// How far below the first run call's frame the thread's stack
+            /// has been written, in bytes: below the lowest 8 bytes that do
+            /// not hold the pattern. Where the whole frame was written
+            /// (`past`), how far below it the stack is committed.
+            pub below_call: usize,
+            /// The same measured from the stack's base (`StackBase`), as
+            /// the committed stack was before the frame was committed.
+            pub from_base: usize,
+            /// Whether the thread wrote the frame's lowest 8 bytes: it may
+            /// have gone deeper, past the frame, where the committed stack
+            /// is the measure again.
+            pub past: bool,
+        }
+
+        /// The first run call on this thread filled `[bottom, top)` with
+        /// [`PATTERN`]; `call` is a local of its frame.
+        pub(crate) fn filled(call: usize, bottom: usize, top: usize) {
+            FRAME.set((call, bottom, top));
+        }
+
+        /// The lowest the thread has written below its first run call so
+        /// far, or `None` before its first run: the frame scanned up from
+        /// its lowest address to the first 8 bytes that do not hold the
+        /// pattern (each scan stops at the mark before it, which only goes
+        /// down). A page only read, never written (a stack probe's, of a
+        /// frame whose lowest part nothing writes), is not seen; a function
+        /// that calls another writes its return address at its frame's
+        /// lowest bytes, so only a leaf function's frame can hide so.
+        pub(crate) fn mark() -> Option<Mark> {
+            let (call, bottom, low) = FRAME.get();
+            if call == 0 {
+                return None;
+            }
+            let mut at = bottom;
+            // SAFETY: reads of this thread's own committed stack, below its
+            // live frames: the frame `filled` was given, which stays
+            // committed (a stack's pages stay committed for its life).
+            while at < low && unsafe { core::ptr::read_volatile(at as *const u64) } == PATTERN {
+                at += 8;
+            }
+            FRAME.set((call, bottom, at));
+            let (base, limit) = base_and_limit();
+            let past = at == bottom;
+            let deepest = if past { limit } else { at };
+            Some(Mark { below_call: call - deepest, from_base: base - deepest, past })
+        }
+
+        /// The TEB's `StackBase` and `StackLimit` (`gs:[8]`, `gs:[0x10]`).
+        pub(crate) fn base_and_limit() -> (usize, usize) {
+            let (base, limit): (usize, usize);
+            // SAFETY: two reads of the thread's own TEB.
+            unsafe {
+                core::arch::asm!(
+                    "mov {0}, gs:[0x8]",
+                    "mov {1}, gs:[0x10]",
+                    out(reg) base,
+                    out(reg) limit,
+                    options(nostack, readonly, preserves_flags)
+                );
+            }
+            (base, limit)
+        }
+
+        impl core::fmt::Display for Mark {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                if self.past {
+                    write!(f, "the stack's low mark past its pre-committed frame: committed {} KiB below the run call", self.below_call / 1024)
+                } else {
+                    write!(f, "the stack's low mark {:.1} KiB below the run call", self.below_call as f64 / 1024.0)
+                }
+            }
+        }
+    }
+
     /// From here the calling thread's WHP calls are kept, with the
     /// first-chance exceptions raised during each ([`count_exceptions`]).
     pub(crate) fn begin() {
@@ -712,15 +825,18 @@ pub(crate) mod trace {
         }
         let now = RAISED.get();
         let raised = now.since(LAST_RAISED.replace(now));
+        let keep = CALLS.with_borrow(Option::is_some);
+        // Scanned only for a record, after the call's end was taken.
+        #[cfg(test)]
+        let low = if keep || (exit.is_some() && runrec::recorded()) { low::mark() } else { None };
         #[cfg(test)]
         if let Some(e) = exit {
-            runrec::run_returned(before, after, hres, e, raised);
+            runrec::run_returned(before, after, hres, e, raised, low);
         }
         #[cfg(feature = "whp-trace")]
         let print = after >= before + GREW;
         #[cfg(not(feature = "whp-trace"))]
         let print = false;
-        let keep = CALLS.with_borrow(Option::is_some);
         if !print && !keep {
             return;
         }
@@ -737,6 +853,8 @@ pub(crate) mod trace {
             began,
             ended,
             raised,
+            #[cfg(test)]
+            low,
         };
         if print {
             let thread = std::thread::current();
@@ -754,7 +872,9 @@ pub(crate) mod trace {
     /// RUNREC, for a test: one thread's `WHvRunVirtualProcessor` calls, each
     /// with its exit (reason, and for a memory access its GPA and access
     /// info), the thread's committed stack before and after it (the TEB's
-    /// `StackBase - StackLimit`, [`stack`]), the moves made so far
+    /// `StackBase - StackLimit`, [`stack`]) and its low mark below the run
+    /// call after it ([`low::mark`]: the committed stack is committed below
+    /// the call before the first run), the moves made so far
     /// (`wick_uffd::reclaim_counts`), and the first-chance C++ exceptions
     /// (`0xE06D7363`) raised on the thread within it, the first two of them
     /// with their thrown type (MSVC's `ThrowInfo`: its first catchable
@@ -762,7 +882,8 @@ pub(crate) mod trace {
     /// and the first 48 bytes of the thrown object (for wil's
     /// `ResultException`, the `FailureInfo` with its HRESULT). Kept: the
     /// first [`FIRST`] calls, then each call whose stack ended deeper than
-    /// any before it or that is the first after a move. A fixed array under
+    /// any before it (committed, or by its low mark) or that is the first
+    /// after a move. A fixed array under
     /// a mutex: nothing is allocated where it is written, so the record
     /// runs at the memory limit too. Which exit grows a vCPU thread's stack
     /// inside WHP, and whether WHP's C++ exceptions are thrown in it, is
@@ -777,6 +898,7 @@ pub(crate) mod trace {
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU32, Ordering};
 
+        use super::low::Mark;
         use super::{ExceptionRecord, Raised, stack};
 
         /// Calls kept whatever they did.
@@ -814,6 +936,8 @@ pub(crate) mod trace {
             pub moves: u64,
             pub raised: Raised,
             pub thrown: [Thrown; 2],
+            /// The stack's low mark after the call (`low::mark`).
+            pub low: Option<Mark>,
         }
 
         struct Rec {
@@ -823,6 +947,8 @@ pub(crate) mod trace {
             runs: u32,
             deepest: usize,
             last_moves: u64,
+            /// The deepest low mark after any run call (`low::mark`).
+            deepest_low: Option<Mark>,
             len: usize,
             kept: [Run; KEPT],
         }
@@ -838,10 +964,11 @@ pub(crate) mod trace {
             moves: 0,
             raised: Raised { cxx: 0, other: 0, last_other: 0 },
             thrown: [NONE; 2],
+            low: None,
         };
 
         static REC: Mutex<Rec> =
-            Mutex::new(Rec { at_start: 0, runs: 0, deepest: 0, last_moves: 0, len: 0, kept: [EMPTY; KEPT] });
+            Mutex::new(Rec { at_start: 0, runs: 0, deepest: 0, last_moves: 0, deepest_low: None, len: 0, kept: [EMPTY; KEPT] });
         /// The thread recorded (its ID), 0 for none.
         static THREAD: AtomicU32 = AtomicU32::new(0);
 
@@ -857,7 +984,7 @@ pub(crate) mod trace {
             unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
         }
 
-        fn recorded() -> bool {
+        pub(super) fn recorded() -> bool {
             THREAD.load(Ordering::Relaxed) == this_thread()
         }
 
@@ -973,7 +1100,7 @@ pub(crate) mod trace {
         }
 
         /// A run call returned on this thread: kept as [`runrec`] says.
-        pub(super) fn run_returned(before: usize, after: usize, hres: i32, exit: i32, raised: Raised) {
+        pub(super) fn run_returned(before: usize, after: usize, hres: i32, exit: i32, raised: Raised, low: Option<Mark>) {
             if !recorded() {
                 return;
             }
@@ -982,15 +1109,25 @@ pub(crate) mod trace {
             let moves = libc::wick_uffd::reclaim_counts().moves;
             let mut r = REC.lock().unwrap();
             r.runs += 1;
-            let deeper = after > r.deepest;
+            let lower = low.is_some_and(|m| r.deepest_low.is_none_or(|d| m.below_call > d.below_call));
+            let deeper = after > r.deepest || lower;
             let moved = moves != r.last_moves;
             r.deepest = r.deepest.max(after);
+            if lower {
+                r.deepest_low = low;
+            }
             r.last_moves = moves;
             if (r.runs as usize <= FIRST || deeper || moved) && r.len < KEPT {
                 let i = r.len;
-                r.kept[i] = Run { n: r.runs, exit, hres, gpa, info, before, after, moves, raised, thrown };
+                r.kept[i] = Run { n: r.runs, exit, hres, gpa, info, before, after, moves, raised, thrown, low };
                 r.len += 1;
             }
+        }
+
+        /// The deepest low mark the recorded thread's run calls left
+        /// (`low::mark`), `None` before its first run.
+        pub(crate) fn deepest_low() -> Option<Mark> {
+            REC.lock().unwrap().deepest_low
         }
 
         /// A line built on the stack and written to stderr in one call:
@@ -1053,7 +1190,11 @@ pub(crate) mod trace {
                     2 => write!(l, "port I/O"),
                     e => write!(l, "exit reason {e:#x}"),
                 };
-                let _ = write!(l, "; the stack {} -> {} KiB; moves so far {}; first-chance ", c.before / 1024, c.after / 1024, c.moves);
+                let _ = write!(l, "; the stack {} -> {} KiB committed", c.before / 1024, c.after / 1024);
+                if let Some(m) = c.low {
+                    let _ = write!(l, ", {m}");
+                }
+                let _ = write!(l, "; moves so far {}; first-chance ", c.moves);
                 let _ = match (c.raised.cxx, c.raised.other) {
                     (0, 0) => write!(l, "none"),
                     (x, 0) => write!(l, "{x} C++ (0xe06d7363)"),

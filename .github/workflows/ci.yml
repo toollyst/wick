@@ -1718,8 +1718,16 @@ jobs:
           # only fill and 0 of 40 moved), and counted on the guest's chunk
           # (MOVEUNDERVCPU lines, "round N:" with the reclaim's counts; in
           # run 43640510155, before a move gave back part of its dead
-          # pages' charge for its own maps, 0 of 40 moved).
+          # pages' charge for its own maps, 0 of 40 moved). Its vCPU
+          # thread's stack low mark below its run call (RUNREC lines, and
+          # the MOVEUNDERVCPU line of the deepest), within half of what the
+          # first run commits: in runs 43784960688 to 43881982686, before
+          # the first run committed it, the child ended with 137, the
+          # thread's stack refused inside WHP's run call at the limit.
           alone whp::vcpu::fpu_tests::test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages
+          # A vCPU thread's first run commits its stack 96 KiB below the
+          # frame that called it (RUNSTACK line).
+          alone whp::vcpu::fpu_tests::test_a_vcpu_threads_stack_is_committed_before_its_first_run
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
           alone whp::vcpu::fpu_tests::test_populate_of_committed_guest_ram_on_record
           # The lazy-RAM grain (LAZYGRAIN lines): guest RAM mapped as
@@ -2023,10 +2031,23 @@ jobs:
           # allocations grow with each vCPU (VMMGROW lines). A Linux guest
           # boots on the runner (run 43377614564); should one not, the
           # lines say how far it came and the step notes it with a warning.
+          # Its output is kept: every vCPU thread of the release build must
+          # have at least kvm-ioctls' RUN_STACK of its stack committed from
+          # the base (the first run commits it below the run call), which
+          # --check-stacks reads from the VMMSTACK lines; an error if one
+          # has less, a warning if no guest booted to give the lines.
           if ! python -I ../../tools/windows/vmm-memory-record.py --map "$RUNNER_TEMP/firecracker.map" \
               --boot "$RUNNER_TEMP/vmmmem-guest" \
-              build/cargo_target/release/firecracker.exe 1 2 16; then
+              build/cargo_target/release/firecracker.exe 1 2 16 | tee "$RUNNER_TEMP/vmmmem-boot.log"; then
             echo "::warning::vmm-memory-record.py --boot: no record of a booted guest on this runner"
+          fi
+          stacks=0
+          python -I ../../tools/windows/vmm-memory-record.py --check-stacks "$RUNNER_TEMP/vmmmem-boot.log" || stacks=$?
+          if [ "$stacks" = 1 ]; then
+            echo "::error::a vCPU thread of the release Firecracker has less than RUN_STACK committed (VMMSTACK RUNSTACK)"
+            failed=1
+          elif [ "$stacks" != 0 ]; then
+            echo "::warning::vmm-memory-record.py --check-stacks: no vCPU thread's stack line to check"
           fi
           # What the host's reads of guest memory for a snapshot commit: a
           # 1 GiB guest that touched 64 MiB, after a full and a diff

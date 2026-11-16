@@ -14,7 +14,10 @@ Here:
   patches/*.patch's added lines), rounded to the hundred as written;
 - docs/PORTING.md row 1's "N system calls, N Mach traps and N MIG routines":
   the entries of SYSCALLS, MACH_TRAPS and MIG_ROUTINES in
-  overlay/vmm/ext/sandbox.rs.
+  overlay/vmm/ext/sandbox.rs;
+- tools/windows/vmm-memory-record.py's RUN_STACK_KIB: kvm-ioctls'
+  `vcpu::RUN_STACK` (crates/compat/kvm-ioctls/src/whp/vcpu.rs, `N << 10`),
+  what the release build's vCPU threads are checked against.
 A document that no longer says the number at all fails too, so the check
 cannot pass by the sentence going away. A number a run measured is not one
 of these: it names its run (docs drift kind a), not the tree.
@@ -75,14 +78,31 @@ def check(root):
             elif int(got) != want:
                 errors.append(f"docs/PORTING.md row 1 says {got} {what}, but {name} in overlay/vmm/ext/sandbox.rs "
                               f"has {want}")
+    rust = root / "crates/compat/kvm-ioctls/src/whp/vcpu.rs"
+    tool = root / "tools/windows/vmm-memory-record.py"
+    if rust.exists() or tool.exists():
+        r = rust.exists() and re.search(r"^pub\(crate\) const RUN_STACK: usize = (\d+) << 10;", rust.read_text(), re.M)
+        t = tool.exists() and re.search(r"^RUN_STACK_KIB = (\d+)$", tool.read_text(), re.M)
+        if not r:
+            errors.append(f"{rust.relative_to(root)} no longer says \"pub(crate) const RUN_STACK: usize = N << 10;\"")
+        elif not t:
+            errors.append(f"{tool.relative_to(root)} no longer says \"RUN_STACK_KIB = N\"")
+        elif r.group(1) != t.group(1):
+            errors.append(f"vmm-memory-record.py's RUN_STACK_KIB is {t.group(1)}, kvm-ioctls' RUN_STACK {r.group(1)} KiB")
     return errors
 
 
 def selftest():
     tmp = tempfile.TemporaryDirectory()
 
-    def tree(readme, porting, syscalls, patches):
+    def tree(readme, porting, syscalls, patches, run_stack=None):
         d = Path(tempfile.mkdtemp(dir=tmp.name))
+        if run_stack is not None:
+            (d / "crates/compat/kvm-ioctls/src/whp").mkdir(parents=True)
+            (d / "tools/windows").mkdir(parents=True)
+            (d / "crates/compat/kvm-ioctls/src/whp/vcpu.rs").write_text(
+                f"/// doc\npub(crate) const RUN_STACK: usize = {run_stack[0]} << 10;\n")
+            (d / "tools/windows/vmm-memory-record.py").write_text(f"PAGE = 4096\nRUN_STACK_KIB = {run_stack[1]}\n")
         (d / "patches").mkdir()
         (d / "overlay/vmm/ext").mkdir(parents=True)
         (d / "docs").mkdir()
@@ -106,6 +126,9 @@ def selftest():
         # A table that grew without the row.
         ("stale syscall count", tree("(about 100 lines in 1 files)", row.format(3), 4, [100]), 1),
         ("sentence gone", tree("small patches", row.format(3), 3, [100]), 1),
+        # RUN_STACK raised in the Rust and not in the tool that checks it.
+        ("run stack apart", tree("(about 100 lines in 1 files)", row.format(3), 3, [100], (112, 96)), 1),
+        ("run stack same", tree("(about 100 lines in 1 files)", row.format(3), 3, [100], (96, 96)), 0),
     ]
     fails = 0
     for name, root, want in cases:

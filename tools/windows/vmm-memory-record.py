@@ -110,6 +110,18 @@ The offsets are symbolized again anywhere with the PDB beside the binary:
 `llvm-symbolizer --relative-address -f -C -e firecracker.exe 0x<offset>`.
 A value that only looks like a return address is listed too: the chain is
 read by a person. `--selftest` checks the parts that need no Windows.
+
+    python -I tools/windows/vmm-memory-record.py --check-stacks <output>
+
+reads the VMMSTACK thread lines of a `--boot` run's saved output (CI's,
+timestamps and all) and fails (exit 1) when a vCPU thread ('fc_vcpu N') has
+less than RUN_STACK_KIB of its stack committed from its base, naming each
+such thread and its size: the release build's own check that a vCPU
+thread's first run committed its stack (kvm-ioctls' `vcpu::RUN_STACK`,
+committed below the run call, whose own depth comes on top; this cannot
+see the call, so it asks for RUN_STACK_KIB from the base). Exit 2 when the
+output has no vCPU thread's line (no guest booted), 0 when every one has it.
+Needs no Windows.
 """
 
 import ctypes
@@ -126,6 +138,13 @@ from ctypes import wintypes
 
 PAGE = 4096
 GUEST_MIB = 128
+# kvm-ioctls' whp::vcpu::RUN_STACK, in KiB (tools/check-derived.py checks
+# that the two say the same): what a vCPU thread's first run commits below
+# its run call.
+RUN_STACK_KIB = 96
+# A VMMSTACK thread line of a vCPU thread, anywhere in a line (CI's log
+# puts a timestamp first).
+VCPU_STACK = re.compile(r"VMMSTACK vcpus=(\d+) thread='(fc_vcpu \d+)' tid=\d+ reserved \d+ KiB, committed (\d+) KiB")
 # Upstream's CI artifacts, as tools/windows/boot-test.ps1 has them.
 S3 = "https://s3.amazonaws.com/spec.ccfc.min"
 PREFIX = "firecracker-ci/20261105-6ea6634994fa-0/x86_64"
@@ -1429,7 +1448,41 @@ def selftest():
     assert ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX) == 2 * word + 9 * size
     assert PROCESS_MEMORY_COUNTERS_EX.PrivateUsage.offset == 2 * word + 8 * size
     assert CURL.lower().replace("/", "\\").endswith("\\system32\\curl.exe")
+    # VMMSTACK lines of CI's windows job at b55b2673 (before the run stack's
+    # commit), with the log's timestamps: 52 and 48 KiB are short.
+    before = ("2026-11-16T14:36:01.1Z VMMSTACK vcpus=1 thread='fc_vcpu 0' tid=3144 reserved 2048 KiB, committed 52 KiB, "
+              "resident 52 KiB, lowest resident page 52 KiB deep, stack pointer 15.6 KiB deep\n"
+              "2026-11-16T14:36:01.2Z VMMSTACK vcpus=16 thread='fc_vcpu 0' tid=3364 reserved 2048 KiB, committed 48 KiB, "
+              "resident 48 KiB, lowest resident page 48 KiB deep, stack pointer 14.8 KiB deep\n"
+              "2026-11-16T14:36:01.3Z VMMSTACK vcpus=16 thread='fc_api' tid=1 reserved 1024 KiB, committed 12 KiB, "
+              "resident 12 KiB, lowest resident page 12 KiB deep, stack pointer 3.0 KiB deep\n")
+    assert short_run_stacks(before) == (2, ["vcpus=1 'fc_vcpu 0' 52 KiB", "vcpus=16 'fc_vcpu 0' 48 KiB"]), short_run_stacks(before)
+    after = before.replace("committed 52 KiB", "committed 112 KiB").replace("committed 48 KiB", "committed 110 KiB")
+    assert short_run_stacks(after) == (2, []), short_run_stacks(after)
+    assert short_run_stacks("VMMMEM boot: a guest did not boot to its shell") == (0, [])
     print("vmm-memory-record.py: selftest ok")
+
+
+def short_run_stacks(text):
+    """(the vCPU threads' lines found, those with less than RUN_STACK_KIB
+    committed as "vcpus=N 'fc_vcpu M' K KiB") of a `--boot` run's output."""
+    found = VCPU_STACK.findall(text)
+    return len(found), [f"vcpus={v} {name!r} {kib} KiB" for v, name, kib in found if int(kib) < RUN_STACK_KIB]
+
+
+def check_stacks(path):
+    """`--check-stacks`: the exit status, after its line."""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        found, short = short_run_stacks(f.read())
+    if not found:
+        print(f"VMMSTACK RUNSTACK: no vCPU thread's stack line in {path}")
+        return 2
+    if short:
+        print(f"VMMSTACK RUNSTACK: {len(short)} of {found} vCPU threads have less than {RUN_STACK_KIB} KiB of "
+              f"stack committed from the base (the first run commits RUN_STACK below its call): " + "; ".join(short))
+        return 1
+    print(f"VMMSTACK RUNSTACK: every vCPU thread ({found}) has {RUN_STACK_KIB} KiB or more committed from the base")
+    return 0
 
 
 def main(args):
@@ -1499,5 +1552,7 @@ if __name__ == "__main__":
             out.write(kernel_elf())
     elif len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         selftest()
+    elif len(sys.argv) > 2 and sys.argv[1] == "--check-stacks":
+        sys.exit(check_stacks(sys.argv[2]))
     else:
         main(sys.argv[1:])
