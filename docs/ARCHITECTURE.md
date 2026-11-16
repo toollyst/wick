@@ -149,6 +149,12 @@ against Linux v6.12:
 | `read`, `write`, `recv`, `send`, ... into or out of registered memory | the copy faults to the userfaultfd and waits (for a userfaultfd made with `user_mode_only(false)`) | the buffer's missing pages are faulted in first (`prefault`), and again on `EFAULT` | `test_system_calls_wait_for_missing_pages` |
 | `UFFDIO_UNREGISTER` of part of a range | the vma is split and the rest stays registered (fs/userfaultfd.c `userfaultfd_unregister` :1413) | the same; a fill whose destination holds an unregistered page is `ENOENT`, as Linux's destination must lie in one registered vma (mm/userfaultfd.c `validate_dst_vma` :23 to :37) | `test_a_partial_unregister_keeps_the_rest_registered`, `test_a_fill_of_an_unregistered_page_is_enoent` |
 
+On Windows (`windows_uffd`, `windows_mm`), not yet for `munmap` and `mmap(MAP_FIXED)`: both change the mapping and
+leave the range registered, where Linux's registration goes with the vma (the row above). The consequences, with
+their tests (ignored until the fix), are in SECURITY.md, "Not at parity yet"; the same test names as macOS's. A
+fill whose destination holds an unregistered page (the last row) is not yet `ENOENT` on Windows either
+(`test_a_fill_of_an_unregistered_page_is_enoent`, ignored with them).
+
 ## Hypervisors
 
 | | Linux | macOS | Windows |

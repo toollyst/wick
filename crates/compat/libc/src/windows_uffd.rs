@@ -4609,13 +4609,12 @@ mod tests {
         // The last pages where a page table is already, as [`no_room_left`]
         // takes them: a `VirtualAlloc` of a page that needs a new page table
         // needs 8 KiB, so with 4 KiB left it is refused and the room stays
-        // for the move's map, which then is made and owes nothing (OWEDREC,
-        // runs/owedrec-2022.log, the one failing run of 20 alone on 20348,
-        // run 18: "the hook took 8 KiB; private commit 98300 KiB" of a 98304
-        // KiB limit, the move made, nothing owed; the same in the failing run
-        // on 26100, owedrec-2025.log run 12). With the slack taken too,
-        // 100 of 100 alone on each (runs/owedfix3-2022.log, owedfix-2025.log),
-        // the 8 + 4 KiB case among them.
+        // for the move's map, which then is made and owes nothing (OWEDREC:
+        // the one failing run of 20 alone on Windows Server 2022 20348 and the
+        // one of 20 on 2025 26100 both said "the hook took 8 KiB; private
+        // commit 98300 KiB" of a 98304 KiB limit, the move made, nothing
+        // owed). With the slack taken too, 100 of 100 alone on each, the
+        // 8 + 4 KiB case among them (0f751bc1's message).
         let before = SLACK_TAKEN.load(Ordering::SeqCst);
         let after = take_the_slack();
         HOOK_SLACK.store((before << 32) | after, Ordering::SeqCst);
@@ -6661,5 +6660,623 @@ mod tests {
         let missing = unsafe { DeleteFileW(wide(&path).as_ptr()) };
         std::eprintln!("SOCKPATH DeleteFileW of a missing name: {missing} (error {})", io::Error::last_os_error().raw_os_error().unwrap_or(0));
         assert!(!path.exists());
+    }
+
+    // ---- munmap and MAP_FIXED of registered memory (the macOS backend's
+    // tests of the same names; Linux's registration belongs to the vma and
+    // goes with it: mm/vma.c, v6.12, `do_vmi_align_munmap` :1332, through
+    // `vms_gather_munmap_vmas` :1180 and fs/userfaultfd.c
+    // `userfaultfd_unmap_prep` :1267; `MAP_FIXED` unmaps what it maps over
+    // first, mm/mmap.c `__mmap_region` :1361 and :1386). Each runs in a child
+    // of its own (nothing else may map in the holes), whose checks are all
+    // made and each failure said ("UNMAPCHECK fail: ..."), the copies that
+    // may end the process last, under a watchdog.
+
+    /// The checks of one child: each failure said as it is found, all of
+    /// them asserted at the end.
+    struct Checks(std::vec::Vec<std::string::String>);
+
+    impl Checks {
+        fn new() -> Self {
+            Checks(std::vec::Vec::new())
+        }
+
+        fn check(&mut self, ok: bool, what: impl core::fmt::Display) {
+            if !ok {
+                std::println!("UNMAPCHECK fail: {what}");
+                self.0.push(std::format!("{what}"));
+            }
+        }
+
+        fn done(self) {
+            std::println!("UNMAPCHECK done, {} failed", self.0.len());
+            assert!(self.0.is_empty(), "{} checks failed: {:?}", self.0.len(), self.0);
+        }
+    }
+
+    /// Ends the child with exit code 3 and a line after `secs`: a wait that
+    /// would hang it.
+    fn watchdog(secs: u64) {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            std::println!("WATCHDOG {secs} s passed: the child is ended");
+            std::process::exit(3);
+        });
+    }
+
+    /// Waits up to 10 s for `cond`; whether it held.
+    fn holds_within(cond: impl Fn() -> bool) -> bool {
+        let t = std::time::Instant::now();
+        while !cond() {
+            if t.elapsed() > std::time::Duration::from_secs(10) {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
+    }
+
+    const UNMAP_LEN: u64 = 64 << 10;
+
+    /// The two kinds of registered memory ([`on_both_kinds`]): a fresh
+    /// mapping of [`UNMAP_LEN`] bytes of `kind`.
+    fn map_of(kind: &str) -> u64 {
+        if kind == "reserved" { map_noreserve(UNMAP_LEN as usize) } else { map(UNMAP_LEN as usize) }
+    }
+
+    const MEM_KINDS: [&str; 2] = ["ordinary", "reserved"];
+
+    fn munmap_of(at: u64, len: u64) -> c_int {
+        // SAFETY: memory of the test's own, through this libc.
+        unsafe { crate::munmap(at as *mut c_void, len as usize) }
+    }
+
+    /// An anonymous private mapping of `len` bytes at `at` with `MAP_FIXED`,
+    /// through this libc: its address, or `MAP_FAILED` as a u64.
+    fn map_fixed(at: u64, len: u64, prot: c_int) -> u64 {
+        // SAFETY: the test's own addresses.
+        (unsafe { crate::mmap(at as *mut c_void, len as usize, prot, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_FIXED, -1, 0) }) as u64
+    }
+
+    /// The state and protection of each page of `[at, at + len)`
+    /// (`VirtualQuery`).
+    fn states(at: u64, len: u64) -> std::vec::Vec<(u32, u32)> {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        (at..at + len)
+            .step_by(PAGE as usize)
+            .map(|a| {
+                // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+                let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: as above.
+                unsafe { VirtualQuery(a as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) };
+                (mbi.State, mbi.Protect)
+            })
+            .collect()
+    }
+
+    fn page_of(b: u8) -> std::vec::Vec<u8> {
+        std::vec![b; PAGE as usize]
+    }
+
+    /// A mapping made where registered memory was unmapped, before its
+    /// userfaultfd is released, keeps its state and protection through the
+    /// release: on Linux the registration went with the unmapped vma, and
+    /// the release walks only the vmas its userfaultfd has (mm/userfaultfd.c,
+    /// v6.12, `userfaultfd_release_all` :1918 to :1924), changing nothing
+    /// else. Firecracker unmaps its guest memory so at teardown
+    /// (vstate/memory.rs:308, before the VM's `uffd`, vstate/vm.rs:84 and
+    /// :95), and another thread may map in the hole meanwhile: here this
+    /// libc's `mmap` of a `PROT_NONE` reservation, and the system's own
+    /// (`VirtualAlloc`, committed `PAGE_NOACCESS`, as a thread's stack guard
+    /// is made). For both kinds of registered memory, pages missing and
+    /// filled.
+    #[test]
+    fn test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is() {
+        let (code, text, _) = run_child_in_jobs("release_after_unmap_child", &[], &[]);
+        for l in text.lines().filter(|l| l.starts_with("UNMAP")) {
+            std::eprintln!("{l}");
+        }
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is in a process of its own"]
+    fn release_after_unmap_child() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, VirtualAlloc, VirtualFree};
+        watchdog(60);
+        let mut c = Checks::new();
+        for kind in MEM_KINDS {
+            for how in ["this libc's mmap PROT_NONE", "VirtualAlloc PAGE_NOACCESS"] {
+                let (ctx, user) = create(0, false, true).unwrap();
+                let mem = map_of(kind);
+                register(ctx, mem, UNMAP_LEN).unwrap();
+                // SAFETY: a page.
+                assert_eq!(unsafe { copy(ctx, page_of(0x5a).as_ptr(), mem, PAGE, true) }, Ok(PAGE));
+                assert_eq!(munmap_of(mem, UNMAP_LEN), 0, "{kind}");
+                let made = if how.starts_with("VirtualAlloc") {
+                    // SAFETY: the hole, reserved and committed by the system's call.
+                    unsafe { VirtualAlloc(mem as *const c_void, UNMAP_LEN as usize, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS) as u64 }
+                } else {
+                    map_fixed(mem, UNMAP_LEN, crate::PROT_NONE)
+                };
+                if made != mem {
+                    std::println!("UNMAP {kind}, {how}: the hole was not mapped ({made:#x}, {})", io::Error::last_os_error());
+                    c.check(false, std::format!("{kind}, {how}: the hole could not be mapped"));
+                    release(ctx, user);
+                    continue;
+                }
+                let before = states(mem, 4 * PAGE);
+                release(ctx, user);
+                let after = states(mem, 4 * PAGE);
+                std::println!("UNMAP {kind}, {how}: (state, protection) of its first 4 pages before the release {before:x?}, after {after:x?}");
+                c.check(before == after, std::format!("{kind}, {how}: the release changed the new mapping: {before:x?} -> {after:x?}"));
+                if how.starts_with("VirtualAlloc") {
+                    // SAFETY: the reservation made above.
+                    unsafe { VirtualFree(mem as *mut c_void, 0, MEM_RELEASE) };
+                } else {
+                    assert_eq!(munmap_of(mem, UNMAP_LEN), 0);
+                }
+            }
+        }
+        c.done();
+    }
+
+    /// Registered memory unmapped while its userfaultfd is open leaves no
+    /// registration behind (the registration went with the vma; a fill
+    /// where no registered vma is is `ENOENT`, mm/userfaultfd.c, v6.12,
+    /// `uffd_mfill_lock` :113, `validate_dst_vma` :34). Part of a range: the
+    /// unmapped page is in no registration and stays unmapped, the
+    /// userfaultfd's release included (an access to it is the process's
+    /// fault, as an access where Linux has no vma); the rest is as it was.
+    /// All of it: nothing is left of the range. For both kinds.
+    #[test]
+    #[ignore = "fails until munmap and MAP_FIXED of registered memory remove its registration on Windows (SECURITY.md, Not at parity yet)"]
+    fn test_memory_unmapped_while_registered_leaves_no_registration_behind() {
+        let (code, text, _) = run_child_in_jobs("unmapped_leaves_nothing_child", &[], &[]);
+        for l in text.lines().filter(|l| l.starts_with("UNMAP") || l.starts_with("WATCHDOG")) {
+            std::eprintln!("{l}");
+        }
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_memory_unmapped_while_registered_leaves_no_registration_behind in a process of its own"]
+    fn unmapped_leaves_nothing_child() {
+        use crate::windows_mm::wick_mm::{Access, commit_on_access};
+        watchdog(60);
+        let mut c = Checks::new();
+        for kind in MEM_KINDS {
+            // Part: its second page.
+            let (ctx, user) = create(0, false, true).unwrap();
+            let mem = map_of(kind);
+            register(ctx, mem, UNMAP_LEN).unwrap();
+            assert_eq!(munmap_of(mem + PAGE, PAGE), 0, "{kind}");
+            c.check(!is_missing(mem + PAGE), std::format!("{kind}, part: the unmapped page is still registered (missing)"));
+            let z = zeropage(ctx, mem + PAGE, PAGE, true);
+            c.check(z == Err((crate::ENOENT, 0)), std::format!("{kind}, part: a fill of the unmapped page: {z:?}"));
+            c.check(is_missing(mem), std::format!("{kind}, part: the page left mapped is no longer missing"));
+            // SAFETY: a page.
+            let f = unsafe { copy(ctx, page_of(0x5a).as_ptr(), mem, PAGE, true) };
+            c.check(f == Ok(PAGE), std::format!("{kind}, part: a fill of the page left mapped: {f:?}"));
+            if f == Ok(PAGE) {
+                // SAFETY: filled just now.
+                c.check(unsafe { ptr::read_volatile(mem as *const u8) } == 0x5a, std::format!("{kind}, part: the filled page"));
+            }
+            release(ctx, user);
+            #[allow(clippy::cast_possible_truncation)]
+            let a = commit_on_access((mem + PAGE) as usize, false);
+            std::println!("UNMAP {kind}, part: after the release, a first access to the unmapped page: {a:?}; its state {:x?}", states(mem + PAGE, PAGE));
+            c.check(
+                matches!(a, Access::NotLazy) && !host_readable(mem + PAGE),
+                std::format!("{kind}, part: after the release the unmapped page is opened: {a:?}, {:x?}", states(mem + PAGE, PAGE)),
+            );
+            assert_eq!(munmap_of(mem, UNMAP_LEN), 0);
+            // All of it, a page filled, the userfaultfd still open.
+            let (ctx, user) = create(0, false, true).unwrap();
+            let mem = map_of(kind);
+            register(ctx, mem, UNMAP_LEN).unwrap();
+            // SAFETY: a page.
+            assert_eq!(unsafe { copy(ctx, page_of(0x5a).as_ptr(), mem, PAGE, true) }, Ok(PAGE));
+            assert_eq!(munmap_of(mem, UNMAP_LEN), 0, "{kind}");
+            c.check(find(mem).is_none() && find(mem + PAGE).is_none(), std::format!("{kind}, all: the unmapped range is still held"));
+            let z = zeropage(ctx, mem + PAGE, PAGE, true);
+            std::println!("UNMAP {kind}, all: a zero page into the unmapped range: {z:?}");
+            c.check(z == Err((crate::ENOENT, 0)), std::format!("{kind}, all: a fill of the unmapped range: {z:?}"));
+            release(ctx, user);
+        }
+        c.done();
+    }
+
+    /// How registered memory is replaced: unmapped and mapped again in the
+    /// hole, or mapped over with `MAP_FIXED` (the macOS backend's
+    /// `Replace`).
+    const REPLACE_CASE: &str = "WICK_UFFD_REPLACE";
+
+    /// [`UNMAP_LEN`] bytes registered with a fresh userfaultfd `a` (of the
+    /// kind `WICK_UFFD_KIND` names), the first page filled with 0x5a, then
+    /// replaced by new read-write memory at the same address as
+    /// [`REPLACE_CASE`] says, through this libc. Returns (a, its user end,
+    /// another userfaultfd b, its user end, the memory).
+    fn replaced() -> (usize, c_int, usize, c_int, u64) {
+        let how = std::env::var("WICK_UFFD_REPLACE").unwrap();
+        let kind = std::env::var("WICK_UFFD_KIND").unwrap();
+        let (a, ua) = create(0, false, true).unwrap();
+        let (b, ub) = create(0, false, true).unwrap();
+        let mem = map_of(&kind);
+        register(a, mem, UNMAP_LEN).unwrap();
+        // SAFETY: a page.
+        assert_eq!(unsafe { copy(a, page_of(0x5a).as_ptr(), mem, PAGE, true) }, Ok(PAGE));
+        if how == "UnmapThenMap" {
+            assert_eq!(munmap_of(mem, UNMAP_LEN), 0);
+        }
+        let p = map_fixed(mem, UNMAP_LEN, crate::PROT_READ | crate::PROT_WRITE);
+        std::println!("UNMAP replaced ({how}, {kind}): the new mapping at {p:#x} (the old at {mem:#x}): {}", if p == mem { "made".into() } else { std::format!("{}", io::Error::last_os_error()) });
+        assert_eq!(p, mem, "{how}, {kind}: the new mapping");
+        (a, ua, b, ub, mem)
+    }
+
+    /// Runs `child` once for each replacement and kind, in a process of its
+    /// own each; asserts that every one ended with 0, naming those that did
+    /// not with their lines.
+    fn replace_cases(child: &str) {
+        let mut failed = std::vec::Vec::new();
+        for how in ["UnmapThenMap", "MapFixedOver"] {
+            for kind in MEM_KINDS {
+                let (code, text, _) = run_child_in_jobs(child, &[(REPLACE_CASE, how), ("WICK_UFFD_KIND", kind)], &[]);
+                for l in text.lines().filter(|l| l.starts_with("UNMAP") || l.starts_with("WATCHDOG") || l.starts_with("wick:")) {
+                    std::eprintln!("{how}, {kind}: {l}");
+                }
+                if code != Some(0) {
+                    failed.push(std::format!("{how}, {kind}: exit {code:x?}"));
+                }
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    /// The new memory is in no registration: not missing, an access there is
+    /// no userfault, and a fill there is `ENOENT`, as Linux's for a
+    /// destination in no registered vma (mm/userfaultfd.c, v6.12:
+    /// `mfill_atomic` :700, `uffd_mfill_lock` :733, `ENOENT` at :113 when
+    /// `validate_dst_vma` finds no userfaultfd on it, :34). The copy, which
+    /// ended the process with an access violation on fc-win
+    /// (as a probe on fc-win first found), last.
+    #[test]
+    #[ignore = "fails until munmap and MAP_FIXED of registered memory remove its registration on Windows (SECURITY.md, Not at parity yet)"]
+    fn test_memory_replaced_while_registered_is_in_no_registration() {
+        replace_cases("replaced_no_registration_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_memory_replaced_while_registered_is_in_no_registration in processes of its own"]
+    fn replaced_no_registration_child() {
+        watchdog(60);
+        let mut c = Checks::new();
+        let (a, _ua, _b, _ub, mem) = replaced();
+        if let Some((r, _)) = find(mem) {
+            let alias = r.alias.load(Ordering::Acquire);
+            std::println!(
+                "UNMAP the old range's alias at [{alias:#x}, {:#x}), the page a fill of {:#x} writes through at {:#x}",
+                alias + (r.end.load(Ordering::Acquire) - r.start.load(Ordering::Acquire)),
+                mem + PAGE,
+                alias + PAGE
+            );
+        }
+        c.check(!is_missing(mem) && !is_missing(mem + PAGE), "the new memory is missing");
+        // An access fault there, as the handler sees it, on a thread of its
+        // own: a userfault waits for a fill that never comes.
+        let faulted = std::thread::spawn(move || fault(mem + 3 * PAGE, false));
+        let waited = !holds_within(|| faulted.is_finished());
+        std::println!("UNMAP an access fault on the new memory: {}", if waited { "waits as a userfault (10 s)" } else { "no userfault" });
+        c.check(!waited, "an access fault on the new memory waits as a userfault");
+        std::println!("UNMAP a zero page into the new memory follows");
+        let z = zeropage(a, mem + PAGE, PAGE, true);
+        std::println!("UNMAP a zero page into the new memory: {z:?}; the page now {:x?}", states(mem + PAGE, PAGE));
+        c.check(z == Err((crate::ENOENT, 0)), std::format!("a zero page into the new memory: {z:?}"));
+        std::println!("UNMAP the copy into the new memory follows");
+        // SAFETY: a page.
+        let f = unsafe { copy(a, page_of(0x77).as_ptr(), mem + 2 * PAGE, PAGE, true) };
+        std::println!("UNMAP the copy into the new memory: {f:?}; the page now {:x?}", states(mem + 2 * PAGE, PAGE));
+        c.check(f == Err((crate::ENOENT, 0)), std::format!("a copy into the new memory: {f:?}"));
+        c.done();
+    }
+
+    /// The new memory registers anew, with the same userfaultfd or another
+    /// (Linux's new vma has no userfaultfd: mm/mmap.c, v6.12,
+    /// `__mmap_region` :1386 and `vm_area_alloc` :1435; `userfaultfd_register`
+    /// refuses only a vma another userfaultfd has, fs/userfaultfd.c :1363 to
+    /// :1366), and a fill lands in the new memory.
+    #[test]
+    #[ignore = "fails until munmap and MAP_FIXED of registered memory remove its registration on Windows (SECURITY.md, Not at parity yet)"]
+    fn test_memory_replaced_while_registered_registers_anew() {
+        replace_cases("replaced_registers_anew_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_memory_replaced_while_registered_registers_anew in processes of its own"]
+    fn replaced_registers_anew_child() {
+        watchdog(60);
+        let mut c = Checks::new();
+        let (a, _ua, b, _ub, mem) = replaced();
+        let again = register(a, mem, UNMAP_LEN);
+        c.check(again.is_ok(), std::format!("its userfaultfd's register of the new memory: {again:?}"));
+        if again.is_ok() {
+            c.check(is_missing(mem) && is_missing(mem + PAGE), "the new pages are not missing");
+            // SAFETY: a page.
+            let f = unsafe { copy(a, page_of(0x77).as_ptr(), mem + PAGE, PAGE, true) };
+            c.check(f == Ok(PAGE), std::format!("a fill of the new memory: {f:?}"));
+            if f == Ok(PAGE) {
+                // SAFETY: filled just now.
+                let got = unsafe { ptr::read_volatile((mem + PAGE) as *const u8) };
+                c.check(got == 0x77, std::format!("the fill did not reach the new memory: {got:#x}"));
+            }
+            c.check(unregister(a, mem, UNMAP_LEN).is_ok(), "the unregister");
+        }
+        let other = register(b, mem, UNMAP_LEN);
+        c.check(other.is_ok(), std::format!("another userfaultfd's register of the new memory: {other:?}"));
+        c.done();
+    }
+
+    /// A discard of the new memory is an ordinary one: its pages read zeros
+    /// and stay accessible, as Linux's `MADV_DONTNEED` of memory no
+    /// userfaultfd has (mm/madvise.c, v6.12, `madvise_dontneed_free` :880,
+    /// fs/userfaultfd.c :777 to :779, `madvise_dontneed_single_vma` :846).
+    #[test]
+    #[ignore = "fails until munmap and MAP_FIXED of registered memory remove its registration on Windows (SECURITY.md, Not at parity yet)"]
+    fn test_a_discard_of_memory_replaced_while_registered_is_ordinary() {
+        replace_cases("replaced_discard_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_discard_of_memory_replaced_while_registered_is_ordinary in processes of its own"]
+    fn replaced_discard_child() {
+        watchdog(60);
+        let mut c = Checks::new();
+        let (_a, _ua, _b, _ub, mem) = replaced();
+        // SAFETY: the new memory, read-write.
+        unsafe { ptr::write_volatile(mem as *mut u8, 7) };
+        // SAFETY: the new memory.
+        c.check(unsafe { crate::madvise(mem as *mut c_void, 2 * PAGE as usize, crate::MADV_DONTNEED) } == 0, "the discard");
+        c.check(!is_missing(mem) && !is_missing(mem + PAGE), "the discard made the new memory missing");
+        c.check(host_readable(mem), std::format!("the discarded new memory is closed: {:x?}", states(mem, PAGE)));
+        if host_readable(mem) {
+            // SAFETY: readable.
+            c.check(unsafe { ptr::read_volatile(mem as *const u8) } == 0, "the discarded page is not zeros");
+        }
+        c.done();
+    }
+
+    /// A thread waiting on a page whose memory is mapped over waits on (no
+    /// event or wake comes of the unmapping without
+    /// `UFFD_FEATURE_EVENT_UNMAP`) until its userfaultfd's `UFFDIO_WAKE`,
+    /// which checks the range only (fs/userfaultfd.c, v6.12,
+    /// `userfaultfd_wake` :1545 to :1575), or its release, which wakes every
+    /// waiter (`userfaultfd_release` :873); it then runs its access again,
+    /// here on new memory, which it reads.
+    #[test]
+    #[ignore = "fails until munmap and MAP_FIXED of registered memory remove its registration on Windows (SECURITY.md, Not at parity yet)"]
+    fn test_a_waiter_on_memory_mapped_over_is_woken_by_its_userfaultfd() {
+        let (code, text, _) = run_child_in_jobs("waiter_mapped_over_child", &[], &[]);
+        for l in text.lines().filter(|l| l.starts_with("UNMAP") || l.starts_with("WATCHDOG")) {
+            std::eprintln!("{l}");
+        }
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_waiter_on_memory_mapped_over_is_woken_by_its_userfaultfd in a process of its own"]
+    fn waiter_mapped_over_child() {
+        watchdog(60);
+        let mut c = Checks::new();
+        for kind in MEM_KINDS {
+            let (ctx, user) = create(0, false, true).unwrap();
+            let mem = map_of(kind);
+            register(ctx, mem, UNMAP_LEN).unwrap();
+            let waiter = |at: u64| {
+                std::thread::spawn(move || {
+                    assert!(fault(at, false), "not missing");
+                    // SAFETY: the memory mapped over it, readable.
+                    unsafe { ptr::read_volatile(at as *const u8) }
+                })
+            };
+            let (first, second) = (waiter(mem), waiter(mem + PAGE));
+            let waiting = |at: u64| WAITERS.iter().any(|w| w.page.load(Ordering::SeqCst) == at);
+            assert!(holds_within(|| waiting(mem) && waiting(mem + PAGE)), "{kind}: the waiters");
+            assert_eq!(map_fixed(mem, UNMAP_LEN, crate::PROT_READ | crate::PROT_WRITE), mem, "{kind}");
+            // SAFETY: the new memory, read-write.
+            unsafe { ptr::write_bytes(mem as *mut u8, 7, 2 * PAGE as usize) };
+            c.check(find(mem).is_none(), std::format!("{kind}: the memory mapped over is still registered"));
+            c.check(!first.is_finished() && !second.is_finished(), std::format!("{kind}: a waiter went on with no wake"));
+            let w = wake_range(ctx, mem, PAGE);
+            c.check(w == Ok(()), std::format!("{kind}: UFFDIO_WAKE of the first page: {w:?}"));
+            let woke = holds_within(|| first.is_finished());
+            c.check(woke, std::format!("{kind}: the wake did not wake the first waiter"));
+            c.check(!second.is_finished(), std::format!("{kind}: the wake of one page woke the other"));
+            release(ctx, user);
+            let woke2 = holds_within(|| second.is_finished());
+            c.check(woke2, std::format!("{kind}: the release did not wake the second waiter"));
+            if woke {
+                c.check(first.join().unwrap() == 7, std::format!("{kind}: the first read"));
+            }
+            if woke2 {
+                c.check(second.join().unwrap() == 7, std::format!("{kind}: the second read"));
+            }
+            if !(woke && woke2) {
+                std::println!("UNMAP {kind}: a waiter was left waiting; the child ends here");
+                c.done();
+                return;
+            }
+            assert_eq!(munmap_of(mem, UNMAP_LEN), 0);
+        }
+        c.done();
+    }
+
+    /// A thread waiting on a page whose memory is unmapped, once its
+    /// userfaultfd wakes it, runs its access again and takes the process's
+    /// own fault, as on Linux, where the address has no vma: here an access
+    /// violation no handler takes, which ends the child (0xC0000005).
+    #[test]
+    #[ignore = "fails until munmap and MAP_FIXED of registered memory remove its registration on Windows (SECURITY.md, Not at parity yet)"]
+    fn test_a_waiter_on_unmapped_memory_takes_its_own_fault_once_woken() {
+        for kind in MEM_KINDS {
+            let (code, text, _) = run_child_in_jobs("waiter_unmapped_child", &[("WICK_UFFD_KIND", kind)], &[]);
+            for l in text.lines().filter(|l| l.starts_with("UNMAP") || l.starts_with("WATCHDOG")) {
+                std::eprintln!("{kind}: {l}");
+            }
+            assert_eq!(code, Some(0xC000_0005_u32.cast_signed()), "{kind}: {text}");
+        }
+    }
+
+    #[test]
+    #[ignore = "run by test_a_waiter_on_unmapped_memory_takes_its_own_fault_once_woken in a process of its own"]
+    fn waiter_unmapped_child() {
+        watchdog(20);
+        let kind = std::env::var("WICK_UFFD_KIND").unwrap();
+        let (ctx, _user) = create(0, false, true).unwrap();
+        let mem = map_of(&kind);
+        register(ctx, mem, UNMAP_LEN).unwrap();
+        let _reader = std::thread::spawn(move || {
+            // SAFETY: registered memory: the read waits, then runs again.
+            unsafe { ptr::read_volatile(mem as *const u8) }
+        });
+        assert!(holds_within(|| WAITERS.iter().any(|w| w.page.load(Ordering::SeqCst) == mem)), "the waiter");
+        assert_eq!(munmap_of(mem, UNMAP_LEN), 0);
+        let w = wake_range(ctx, mem, PAGE);
+        std::println!("UNMAP UFFDIO_WAKE of the unmapped page: {w:?}");
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let again = WAITERS.iter().any(|w| w.page.load(Ordering::SeqCst) == mem);
+        std::println!("UNMAP 5 s after the wake the reader is {}", if again { "waiting again on the unmapped page" } else { "not waiting" });
+        std::process::exit(4);
+    }
+
+    /// Memory mapped over one page of a registered range and registered
+    /// again by the same userfaultfd is filled in the new memory.
+    #[test]
+    #[ignore = "fails until a slot holds only registered pages on Windows (SECURITY.md, Not at parity yet: MAP_FIXED over part of a registered mapping is EINVAL)"]
+    fn test_a_page_mapped_over_and_registered_again_is_filled_in_the_new_memory() {
+        let (code, text, _) = run_child_in_jobs("page_mapped_over_child", &[], &[]);
+        for l in text.lines().filter(|l| l.starts_with("UNMAP") || l.starts_with("WATCHDOG")) {
+            std::eprintln!("{l}");
+        }
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_page_mapped_over_and_registered_again_is_filled_in_the_new_memory in a process of its own"]
+    fn page_mapped_over_child() {
+        watchdog(60);
+        let mut c = Checks::new();
+        for kind in MEM_KINDS {
+            let (ctx, user) = create(0, false, true).unwrap();
+            let mem = map_of(kind);
+            register(ctx, mem, UNMAP_LEN).unwrap();
+            // SAFETY: a page.
+            assert_eq!(unsafe { copy(ctx, page_of(0x11).as_ptr(), mem, PAGE, true) }, Ok(PAGE));
+            let p = map_fixed(mem + PAGE, PAGE, crate::PROT_READ | crate::PROT_WRITE);
+            let err = io::Error::last_os_error();
+            std::println!("UNMAP {kind}: MAP_FIXED over one registered page: {p:#x} ({})", if p == mem + PAGE { "made".into() } else { std::format!("{err}") });
+            c.check(p == mem + PAGE, std::format!("{kind}: MAP_FIXED over one registered page: {err}"));
+            if p == mem + PAGE {
+                c.check(!is_missing(mem + PAGE) && !is_missing(mem), std::format!("{kind}: missing after the MAP_FIXED"));
+                let z = zeropage(ctx, mem + PAGE, PAGE, true);
+                c.check(z == Err((crate::ENOENT, 0)), std::format!("{kind}: a fill of the new page: {z:?}"));
+                let r = register(ctx, mem + PAGE, PAGE);
+                c.check(r.is_ok(), std::format!("{kind}: the register of the new page: {r:?}"));
+                if r.is_ok() {
+                    c.check(is_missing(mem + PAGE), std::format!("{kind}: the new page is not missing"));
+                    // SAFETY: a page.
+                    let f = unsafe { copy(ctx, page_of(0x77).as_ptr(), mem + PAGE, PAGE, true) };
+                    c.check(f == Ok(PAGE), std::format!("{kind}: the fill of the new page: {f:?}"));
+                    // SAFETY: filled pages.
+                    unsafe {
+                        c.check(ptr::read_volatile((mem + PAGE) as *const u8) == 0x77, std::format!("{kind}: the fill did not reach the new memory"));
+                        c.check(ptr::read_volatile(mem as *const u8) == 0x11, std::format!("{kind}: the first page changed"));
+                    }
+                }
+            }
+            release(ctx, user);
+            assert_eq!(munmap_of(mem, UNMAP_LEN), 0);
+        }
+        c.done();
+    }
+
+    /// A munmap or a `MAP_FIXED` mapping that cuts a huge page of a
+    /// registered huge page range is `EINVAL` with nothing changed (Linux
+    /// refuses to split a hugetlb vma off a huge page boundary, mm/vma.c,
+    /// v6.12, `__split_vma` :377 to :378, called by `vms_gather_munmap_vmas`
+    /// at :1209 and :1230); on the boundaries, the huge pages leave the
+    /// registration.
+    #[test]
+    #[ignore = "no registered huge page on Windows (docs/COMPATIBILITY.md, the mem_backend Uffd row: a huge page mapping is not registered)"]
+    fn test_a_cut_of_a_registered_huge_page_is_einval() {
+        let (code, text, _) = run_child_in_jobs("huge_cut_child", &[], &[]);
+        for l in text.lines().filter(|l| l.starts_with("UNMAP") || l.starts_with("WATCHDOG")) {
+            std::eprintln!("{l}");
+        }
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_cut_of_a_registered_huge_page_is_einval in a process of its own"]
+    fn huge_cut_child() {
+        const HUGE: u64 = 2 << 20;
+        watchdog(60);
+        let mut c = Checks::new();
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 2 * HUGE;
+        // SAFETY: a huge page mapping of this libc.
+        let mem = unsafe {
+            crate::mmap(
+                ptr::null_mut(),
+                len as usize,
+                crate::PROT_READ | crate::PROT_WRITE,
+                crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_HUGETLB | crate::MAP_HUGE_2MB,
+                -1,
+                0,
+            )
+        } as u64;
+        let err = io::Error::last_os_error();
+        std::println!("UNMAP the huge page mapping: {}", if mem == crate::MAP_FAILED as u64 { std::format!("{err}") } else { std::format!("{mem:#x}") });
+        assert_ne!(mem, crate::MAP_FAILED as u64, "the huge page mapping: {err}");
+        let r = register(ctx, mem, len);
+        std::println!("UNMAP the register of the huge page mapping: {r:?}");
+        c.check(r.is_ok(), std::format!("the register of a huge page mapping: {r:?}"));
+        if r.is_ok() {
+            c.check(munmap_of(mem + PAGE, PAGE) == -1 && io::Error::last_os_error().raw_os_error() == Some(crate::EINVAL), "munmap of a page inside");
+            c.check(map_fixed(mem + HUGE - PAGE, 2 * PAGE, crate::PROT_READ | crate::PROT_WRITE) == crate::MAP_FAILED as u64, "MAP_FIXED across a huge page boundary");
+            for off in [0, PAGE, HUGE - PAGE, HUGE, len - PAGE] {
+                c.check(is_missing(mem + off), std::format!("{off:#x}: changed by a refused call"));
+            }
+            c.check(munmap_of(mem + HUGE, HUGE) == 0, "munmap of the second huge page");
+            c.check(is_missing(mem) && !is_missing(mem + HUGE), "the second huge page is still registered");
+            let z = zeropage(ctx, mem + HUGE, HUGE, true);
+            c.check(z == Err((crate::ENOENT, 0)), std::format!("a fill of the unmapped huge page: {z:?}"));
+        }
+        release(ctx, user);
+        c.done();
+    }
+
+    /// A fill whose destination holds a page in no registration is
+    /// `ENOENT` for the whole call, nothing filled (mm/userfaultfd.c, v6.12,
+    /// `validate_dst_vma` :23 to :37, `uffd_mfill_lock` :113: the
+    /// destination must lie in one vma this userfaultfd has; an unregister
+    /// of a page in the middle splits the vma).
+    #[test]
+    #[ignore = "fails until munmap and MAP_FIXED of registered memory remove its registration on Windows (SECURITY.md, Not at parity yet)"]
+    fn test_a_fill_of_an_unregistered_page_is_enoent() {
+        for kind in MEM_KINDS {
+            let (ctx, user) = create(0, false, true).unwrap();
+            let mem = map_of(kind);
+            register(ctx, mem, UNMAP_LEN).unwrap();
+            assert_eq!(unregister(ctx, mem + PAGE, PAGE), Ok(()));
+            let data = std::vec![0x5au8; 3 * PAGE as usize];
+            // SAFETY: `data` holds three pages.
+            let f = unsafe { copy(ctx, data.as_ptr(), mem, 3 * PAGE, true) };
+            let still = is_missing(mem);
+            release(ctx, user);
+            assert_eq!(munmap_of(mem, UNMAP_LEN), 0);
+            assert_eq!(f, Err((crate::ENOENT, 0)), "{kind}: the fill across the unregistered page");
+            assert!(still, "{kind}: the page before it was filled");
+        }
     }
 }

@@ -617,6 +617,33 @@ upstream Firecracker and its jailer.
   event, where Linux takes it as `MADV_DONTNEED` for the userfaultfd. Firecracker uses no `MADV_FREE`, as read from
   the code. Its tests are ignored until the fix (docs/ARCHITECTURE.md, "Memory calls on registered memory":
   `test_madv_free_of_registered_pages_makes_them_missing`, `test_madv_free_of_registered_pages_posts_a_remove_event`).
+- **Windows: `munmap` and `mmap(MAP_FIXED)` of userfaultfd-registered memory leave the registration; fix in
+  progress.** On Linux the registration belongs to the vma and goes with it (mm/vma.c, v6.12, `do_vmi_align_munmap`
+  :1332; mm/mmap.c `__mmap_region` :1361). On Windows both calls change the mapping and leave the range registered
+  over memory that is gone or new, so:
+  - a fill (`UFFDIO_COPY`, `UFFDIO_ZEROPAGE`) into memory mapped anew where registered memory was ends the VMM with
+    an access violation (0xC0000005), where Linux's is `ENOENT`: the page is committed at the address, now the new
+    mapping, and then written through the old range's alias, whose page was never committed
+    (`test_memory_replaced_while_registered_is_in_no_registration`);
+  - unmapped memory is opened: a fill into a page unmapped from a registered range fills it, and once the
+    userfaultfd is released, the first access to such a page commits it read-write, where Linux's is the process's
+    `SIGSEGV` (`test_memory_unmapped_while_registered_leaves_no_registration_behind`);
+  - an access fault on memory mapped anew is taken as a userfault and waits for a fill that never comes, and a
+    thread waiting on a page that is then unmapped waits again once woken
+    (`test_memory_replaced_while_registered_is_in_no_registration`,
+    `test_a_waiter_on_unmapped_memory_takes_its_own_fault_once_woken`);
+  - memory mapped anew cannot be registered (`EBUSY`), and its discard makes it missing and closed
+    (`test_memory_replaced_while_registered_registers_anew`,
+    `test_a_discard_of_memory_replaced_while_registered_is_ordinary`,
+    `test_a_waiter_on_memory_mapped_over_is_woken_by_its_userfaultfd`).
+  A fill whose destination holds a page unregistered from the middle of a range fills the pages before it, where
+  Linux's is `ENOENT` with nothing filled (`test_a_fill_of_an_unregistered_page_is_enoent`), and `MAP_FIXED` over
+  part of a registered mapping is `EINVAL`, where Linux maps it
+  (`test_a_page_mapped_over_and_registered_again_is_filled_in_the_new_memory`). A release after all of a range was
+  unmapped leaves a mapping made in the hole as it is (`test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is`,
+  passing). Firecracker's teardown unmaps its registered guest memory whole while its userfaultfd is open
+  (vstate/memory.rs:308, before the VM's `uffd`, vstate/vm.rs:84 and :95), and fills after that would come from its
+  handler. The failing tests are ignored until the fix, each citing this entry.
 - **macOS: a call Firecracker's own sandbox denies ends it by SIGKILL, not exit 148.** On Linux the seccomp trap's
   SIGSYS runs upstream's handler, which logs the bad system call, counts `seccomp.num_faults` and exits 148.
   Seatbelt has no action that traps the calling thread, and a signal the process can catch let the denying thread
