@@ -2280,9 +2280,10 @@ pub struct ReclaimCounts {
     pub refused: u64,
     /// The address of the chunk moved last (its guest view), 0 for none.
     pub last_moved: usize,
-    /// Stack pages the job's limit refused during a reclaim and had after
-    /// a wait for its next step (`windows_mm::stack_page_after_the_reclaim`).
-    pub stack_pages_after_a_wait: u64,
+    /// Stack pages the job's limit refused and had on the handler's retry,
+    /// after a wait for the reclaim's next step or not
+    /// (`windows_mm::stack_page_after_the_reclaim`).
+    pub stack_pages_had_again: u64,
 }
 
 /// The reclaim's counts so far: read-only, for a record of what it did
@@ -2296,7 +2297,7 @@ pub fn reclaim_counts() -> ReclaimCounts {
         moves: MOVES_MADE.load(Ordering::Relaxed) as u64,
         refused: crate::windows_mm::moves_refused(),
         last_moved: LAST_MOVED.load(Ordering::Relaxed),
-        stack_pages_after_a_wait: crate::windows_mm::stack_pages_after_a_wait(),
+        stack_pages_had_again: crate::windows_mm::stack_pages_had_again(),
     }
 }
 
@@ -4240,6 +4241,10 @@ mod tests {
         Again,
         /// The reclaim's own thread goes 128 KiB deep in the move's middle.
         Reclaimer,
+        /// As `Ends`, but the handler of the refused page, before it reads
+        /// the reclaim's state, lets the move go and waits until the
+        /// reclaim's answer is given ([`let_the_reclaim_end`]).
+        Late,
     }
 
     static MOVE_HELD: AtomicBool = AtomicBool::new(false);
@@ -4261,6 +4266,17 @@ mod tests {
     fn deep_on_the_reclaimer() {
         MOVE_HELD.store(true, Ordering::SeqCst);
         core::hint::black_box(deep(32));
+    }
+
+    /// [`windows_mm::STACK_HANDLER_HOOK`]'s: in the handler of the refused
+    /// page, before it reads the reclaim's state, the held move is let go
+    /// and the reclaim's answer waited for: the refusal came in the move's
+    /// middle, the handler finds the reclaim over.
+    fn let_the_reclaim_end() {
+        MOVE_GO.store(true, Ordering::SeqCst);
+        while reclaim_in_flight().is_some() {
+            std::thread::yield_now();
+        }
     }
 
     /// Waits for `n` waits of a refused stack page to have begun.
@@ -4290,6 +4306,9 @@ mod tests {
         }
         *crate::windows_mm::MOVE_HOOK.lock().unwrap() = Some(if mode == DuringMove::Reclaimer { deep_on_the_reclaimer } else { hold_the_move });
         crate::windows_mm::REFUSE_STACK_RETRY.store(mode == DuringMove::Again, Ordering::SeqCst);
+        if mode == DuringMove::Late {
+            crate::windows_mm::STACK_HANDLER_HOOK.store(let_the_reclaim_end as fn() as usize, Ordering::SeqCst);
+        }
         // Both threads made before the limit, the toucher's stack grown.
         let deep_one = std::thread::Builder::new()
             .name("wick-stack-wait".into())
@@ -4325,9 +4344,9 @@ mod tests {
         give_back_every_page(&mut held);
         *crate::windows_mm::MOVE_HOOK.lock().unwrap() = None;
         std::println!(
-            "DURINGMOVE {mode:?}: {} chunk moved; the deep thread came back ({v}); {} stack page(s) had after a wait",
+            "DURINGMOVE {mode:?}: {} chunk moved; the deep thread came back ({v}); {} stack page(s) had on the retry",
             r.chunks,
-            crate::windows_mm::stack_pages_after_a_wait()
+            crate::windows_mm::stack_pages_had_again()
         );
         assert_eq!(r.chunks, 1);
         // SAFETY: closes the user end.
@@ -4363,6 +4382,29 @@ mod tests {
     #[ignore = "run by test_a_stack_page_refused_during_a_move_is_had_once_it_ends in a job of its own"]
     fn stack_during_a_move_ends_child() {
         stack_during_a_move(DuringMove::Ends);
+    }
+
+    /// A stack page refused in a move's middle whose handler reads the
+    /// reclaim's state only after the reclaim's answer was given (the
+    /// dispatch between the refusal and that read, held open by
+    /// [`let_the_reclaim_end`]) is had: the handler asks for the page once
+    /// more, with no wait, whenever the commit was refused, so the room the
+    /// move gave back is found; before, it found no reclaim under way and
+    /// the process ended with 137.
+    #[test]
+    fn test_a_stack_page_refused_as_the_reclaim_ends_is_had() {
+        let (code, text) = run_child("stack_during_a_move_late_child", Some(96 << 20));
+        std::eprintln!("STACKWAIT late: {code:?}; {}", during_move_lines(&text));
+        assert!(text.contains("DURINGMOVE Late: 1 chunk moved; the deep thread came back"), "{text}");
+        assert!(text.lines().any(|l| l.starts_with("STACKWAIT the retry alone (no wait)") && l.ends_with("the page had")), "{text}");
+        assert!(!text.contains("wick: a thread's stack could not grow"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_page_refused_as_the_reclaim_ends_is_had in a job of its own"]
+    fn stack_during_a_move_late_child() {
+        stack_during_a_move(DuringMove::Late);
     }
 
     /// A thread that holds one of wick's memory locks (`RELEASED`, as

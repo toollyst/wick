@@ -1672,13 +1672,22 @@ std::thread_local! {
     static STACK_WAIT: core::cell::Cell<StackWait> = const { core::cell::Cell::new(StackWait::NoReclaim) };
 }
 
-/// Stack pages had after a wait for the reclaim ([`stack_page_after_the_reclaim`]).
-static STACK_PAGES_AFTER_A_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Stack pages a refused commit had on the retry ([`stack_page_after_the_reclaim`]), after a wait or not.
+static STACK_PAGES_HAD_AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Tests: a thread is in [`stack_page_after_the_reclaim`]'s wait now (the
 /// count of those that began one).
 #[cfg(test)]
 pub(crate) static STACK_WAITS_BEGUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tests: called once (it is taken as it runs) in
+/// [`stack_page_after_the_reclaim`] after the refused commit is told from
+/// the reserve's end and before the reclaim's state is read: the window
+/// between the refusal and that read
+/// (`test_a_stack_page_refused_as_the_reclaim_ends_is_had`). An `fn()` as a
+/// `usize`, 0 for none.
+#[cfg(test)]
+pub(crate) static STACK_HANDLER_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Tests: the retry after the wait is refused as at the limit, for the
 /// line of a page refused again after a reclaim that ended
@@ -1686,17 +1695,31 @@ pub(crate) static STACK_WAITS_BEGUN: std::sync::atomic::AtomicU64 = std::sync::a
 #[cfg(test)]
 pub(crate) static REFUSE_STACK_RETRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Stack pages had after a wait for the reclaim so far.
-pub(crate) fn stack_pages_after_a_wait() -> u64 {
-    STACK_PAGES_AFTER_A_WAIT.load(std::sync::atomic::Ordering::Relaxed)
+/// Stack pages a refused commit had on the retry so far.
+pub(crate) fn stack_pages_had_again() -> u64 {
+    STACK_PAGES_HAD_AGAIN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A stack page the job's limit refused while the reclaim moves a chunk:
-/// the thread waits once for the reclaim's next step and asks for the page
-/// once more; whether it has it, and the access that overflowed runs again.
-/// For the vectored handler ([`lazy_on_exception`]), first in the chain, at
-/// `STATUS_STACK_OVERFLOW`; every other case goes on as before, to
+/// A stack page the job's limit refused: asked for once more, after a wait
+/// for the reclaim's next step while the reclaim moves a chunk; whether it
+/// is had, and the access that overflowed runs again. For the vectored
+/// handler ([`lazy_on_exception`]), first in the chain, at
+/// `STATUS_STACK_OVERFLOW`; a page not had goes on as before, to
 /// [`stack_filter`] and its 137, with [`STACK_WAIT`] saying why.
+///
+/// The retry is made for every refused commit (not the reserve's end) with
+/// [`STACK_WAIT_ROOM`] under this frame, with a reclaim under way or not:
+/// the refusal and this handler's read of the reclaim's state are not one
+/// instant, and a page refused in the last move's middle whose handler
+/// reads the state after the reclaim's answer was given finds no reclaim
+/// under way with the room already back
+/// (`test_a_stack_page_refused_as_the_reclaim_ends_is_had`, where it ended
+/// with 137). With no room the retry changes nothing, and it takes no lock
+/// and allocates nothing, so it is made on a thread that may not wait too
+/// (a lock held, the reclaim's own). It cannot loop: one retry per overflow
+/// exception, the access run again only when the page was had (so on
+/// committed stack); a refused retry goes to the filter, which ends the
+/// VMM, and a later page is a new exception.
 ///
 /// Why: a move gives a chunk's dead pages back only at its end, and holds
 /// its new section's commit before (`uffd_move_chunk`), so a thread whose
@@ -1736,10 +1759,12 @@ pub(crate) fn stack_pages_after_a_wait() -> u64 {
 /// faulting address, the guarantee), so the access runs again on committed
 /// stack, and the next growth goes through the new guard pages as any
 /// other. One wait and one retry: a refusal of the retry ends the VMM with
-/// 137, its line saying it waited ([`StackWait::Waited`]).
+/// 137, its line saying it waited ([`StackWait::Waited`]); with no reclaim
+/// under way the line is as before.
 ///
 /// The wait and the retry allocate nothing and take no lock; their stack is
-/// STACKWAIT's, under [`STACK_WAIT_ROOM`].
+/// STACKWAIT's, under [`STACK_WAIT_ROOM`] (the retry alone, and the wait
+/// with it).
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 fn stack_page_after_the_reclaim() -> bool {
@@ -1748,30 +1773,40 @@ fn stack_page_after_the_reclaim() -> bool {
     if limit.saturating_sub(reserve) <= reserve_at_its_end(guarantee) {
         return false;
     }
-    let Some(seen) = crate::wick_uffd::reclaim_in_flight() else {
-        return false;
-    };
-    let here = core::ptr::addr_of!(seen) as usize;
-    let held = crate::windows_stacklock::held_here();
+    #[cfg(test)]
+    {
+        let hook = STACK_HANDLER_HOOK.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if hook != 0 {
+            // SAFETY: only `fn()` values are stored.
+            unsafe { core::mem::transmute::<usize, fn()>(hook)() };
+        }
+    }
+    let reclaim = crate::wick_uffd::reclaim_in_flight();
+    let here = core::ptr::addr_of!(reclaim) as usize;
     let left = here.saturating_sub(limit);
-    let not = if crate::wick_uffd::on_the_reclaimer() {
-        Some(StackWait::Reclaimer)
-    } else if held != 0 {
-        Some(StackWait::Held(held))
-    } else if left < STACK_WAIT_ROOM {
-        Some(StackWait::Room(left))
-    } else {
-        None
-    };
-    if let Some(not) = not {
-        STACK_WAIT.set(not);
+    if left < STACK_WAIT_ROOM {
+        STACK_WAIT.set(if reclaim.is_some() { StackWait::Room(left) } else { StackWait::NoReclaim });
         return false;
     }
+    let held = crate::windows_stacklock::held_here();
+    // No wait (the retry alone) on the reclaim's own thread or one holding
+    // one of wick's memory locks, and with no reclaim under way.
+    let not = match reclaim {
+        None => Some(StackWait::NoReclaim),
+        Some(_) if crate::wick_uffd::on_the_reclaimer() => Some(StackWait::Reclaimer),
+        Some(_) if held != 0 => Some(StackWait::Held(held)),
+        Some(_) => None,
+    };
     #[cfg(test)]
     let paint = stack_wait_paint(limit, here);
-    #[cfg(test)]
-    STACK_WAITS_BEGUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let (ended, us) = crate::wick_uffd::wait_for_the_reclaim(seen, STACK_WAIT_BOUND);
+    let waited = match (not, reclaim) {
+        (None, Some(seen)) => {
+            #[cfg(test)]
+            STACK_WAITS_BEGUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(crate::wick_uffd::wait_for_the_reclaim(seen, STACK_WAIT_BOUND))
+        }
+        _ => None,
+    };
     let mut guard = guarantee.next_multiple_of(PAGE);
     if guard != 0 {
         guard += PAGE;
@@ -1792,12 +1827,16 @@ fn stack_page_after_the_reclaim() -> bool {
                 && VirtualProtect(at as *const c_void, guard, PAGE_READWRITE | PAGE_GUARD, &mut old) != 0
         };
     #[cfg(test)]
-    stack_wait_record(paint, here, left, us, ended, had);
+    stack_wait_record(paint, here, left, waited, had);
     if had {
-        STACK_PAGES_AFTER_A_WAIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STACK_PAGES_HAD_AGAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return true;
     }
-    STACK_WAIT.set(StackWait::Waited(us, ended));
+    STACK_WAIT.set(match (waited, not) {
+        (Some((ended, us)), _) => StackWait::Waited(us, ended),
+        (None, Some(not)) => not,
+        (None, None) => StackWait::NoReclaim,
+    });
     false
 }
 
@@ -1813,26 +1852,32 @@ fn stack_wait_paint(limit: usize, here: usize) -> usize {
     limit
 }
 
-/// STACKWAIT (tests): the stack the wait and the retry used under
-/// [`stack_page_after_the_reclaim`]'s frame (from `here`, the lowest byte
-/// no longer painted), of `left`; the wait's microseconds, whether the
-/// reclaim's step ended it, and whether the page was had. Written after the
-/// measure, without allocating.
+/// STACKWAIT (tests): the stack the retry, and the wait before it if any,
+/// used under [`stack_page_after_the_reclaim`]'s frame (from `here`, the
+/// lowest byte no longer painted), of `left`; the wait's microseconds and
+/// whether the reclaim's step ended it, or that there was none; and whether
+/// the page was had. Written after the measure, without allocating.
 #[cfg(all(test, target_arch = "x86_64"))]
 #[inline(never)]
-fn stack_wait_record(low: usize, here: usize, left: usize, us: u64, ended: bool, had: bool) {
+fn stack_wait_record(low: usize, here: usize, left: usize, waited: Option<(bool, u64)>, had: bool) {
     let top = here - 512;
     let mut a = low;
     // SAFETY: as `stack_wait_paint`'s range; reads only.
     while a < top && unsafe { core::ptr::read_volatile(a as *const u8) } == 0xc3 {
         a += 1;
     }
-    say_at_the_limit(format_args!(
-        "STACKWAIT the wait and the retry used {} B under the handler's frame, of {left} B left there; waited {us} us, {}; the page {}",
-        here - a,
-        if ended { "the reclaim's step seen" } else { "the bound reached" },
-        if had { "had" } else { "refused again" }
-    ));
+    let used = here - a;
+    match waited {
+        Some((ended, us)) => say_at_the_limit(format_args!(
+            "STACKWAIT the wait and the retry used {used} B under the handler's frame, of {left} B left there; waited {us} us, {}; the page {}",
+            if ended { "the reclaim's step seen" } else { "the bound reached" },
+            if had { "had" } else { "refused again" }
+        )),
+        None => say_at_the_limit(format_args!(
+            "STACKWAIT the retry alone (no wait) used {used} B under the handler's frame, of {left} B left there; the page {}",
+            if had { "had" } else { "refused again" }
+        )),
+    }
 }
 
 /// The calling thread's stack from its TEB (x86-64): the lowest committed

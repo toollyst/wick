@@ -780,7 +780,9 @@ upstream Firecracker and its jailer.
   ends the VMM with 137 (below), but while a reclaim is under way: a move holds its new section's commit until its
   end, and a thread holding none of wick's memory locks whose stack page is refused in its middle waits for the
   move's end or the reclaim's, at most 1 s, makes its guard pages again as `_resetstkoflw` does, and goes on
-  (`test_a_stack_page_refused_during_a_move_is_had_once_it_ends`; a thread holding such a lock does not wait, as the
+  (`test_a_stack_page_refused_during_a_move_is_had_once_it_ends`; every refused stack commit is asked for once more,
+  with no wait where none is allowed, so a page refused in a move's middle whose handler runs after the reclaim's
+  end has the room back: `test_a_stack_page_refused_as_the_reclaim_ends_is_had`; a thread holding such a lock does not wait, as the
   reclaim takes them, nor does the reclaim's own: `test_a_stack_page_refused_with_a_lock_held_is_not_waited_for`,
   `test_the_reclaimers_own_stack_page_is_not_waited_for`; a refusal after the wait ends with 137, its line saying
   it waited: `test_a_stack_page_refused_again_after_the_wait_ends_with_137`,
