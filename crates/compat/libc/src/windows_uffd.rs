@@ -4589,6 +4589,273 @@ mod tests {
         unsafe { ws::closesocket(sock(user)) };
     }
 
+    /// Closes the user end of `ctx` and waits until its serve thread has
+    /// released it (`destroy` gives up the kernel end last). A bound for a
+    /// failure only.
+    fn release(ctx: usize, user: c_int) {
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+        let t = std::time::Instant::now();
+        while CTXS[ctx].fd.load(Ordering::SeqCst) >= 0 {
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "the userfaultfd was not released");
+            std::thread::yield_now();
+        }
+    }
+
+    /// A range of four pages registered, its page 0 filled, page 1 filled
+    /// and discarded, pages 2 and 3 never filled: released, so that page 1
+    /// is a discarded page to zero at its first access and pages 2 and 3
+    /// are lazy. Its address.
+    fn released_with_pending_pages(fill: u8) -> u64 {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let mem = map(4 * PAGE as usize);
+        register(ctx, mem, 4 * PAGE).unwrap();
+        let data = std::vec![fill; 2 * PAGE as usize];
+        // SAFETY: `data` holds two pages.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, 2 * PAGE, true) }.unwrap(), 2 * PAGE);
+        // SAFETY: registered memory of ours.
+        assert_eq!(unsafe { crate::madvise((mem + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        release(ctx, user);
+        mem
+    }
+
+    /// A page discarded while registered reads zeros once its userfaultfd is
+    /// released, all of it, at every read, and takes a write; a page never
+    /// filled reads zeros and takes a write; a filled page keeps its data;
+    /// as Linux's released range, whose zapped and never-faulted pages are
+    /// anonymous memory's zero-filled pages (a control for the released
+    /// ranges' records, design-released-ranges.md).
+    #[test]
+    fn test_a_stale_page_read_after_release_reads_zeros() {
+        let mem = released_with_pending_pages(0x5a);
+        // SAFETY: our mapping, released: ordinary memory.
+        unsafe {
+            for _ in 0..2 {
+                assert!(std::slice::from_raw_parts((mem + PAGE) as *const u8, PAGE as usize).iter().all(|&b| b == 0), "the discarded page");
+                assert!(std::slice::from_raw_parts((mem + 2 * PAGE) as *const u8, PAGE as usize).iter().all(|&b| b == 0), "a page never filled");
+            }
+            assert_eq!(*((mem + 9) as *const u8), 0x5a, "the filled page");
+            *((mem + PAGE + 9) as *mut u8) = 7;
+            *((mem + 3 * PAGE + 9) as *mut u8) = 8;
+            assert_eq!((*((mem + PAGE + 9) as *const u8), *((mem + 3 * PAGE + 9) as *const u8)), (7, 8));
+        }
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::munmap(mem as *mut c_void, 4 * PAGE as usize) }, 0);
+    }
+
+    /// Two threads touching one page of a released range at once, each
+    /// writing at its own offset, both keep their writes: the page is
+    /// resolved once (a discarded page zeroed once, a page never filled
+    /// committed once), as Linux faults a page in once under its page table
+    /// lock. For the discarded page and for a page never filled, 200 rounds
+    /// each (a control for the released ranges' records).
+    #[test]
+    fn test_a_page_touched_by_two_threads_after_release_keeps_both_writes() {
+        for round in 0..200u32 {
+            let mem = released_with_pending_pages(0x5a);
+            for page in [1u64, 2] {
+                let at = mem + page * PAGE;
+                let go = std::sync::Arc::new(std::sync::Barrier::new(2));
+                let threads: std::vec::Vec<_> = [(0u64, 0x11u8), (8, 0x22)]
+                    .into_iter()
+                    .map(|(off, v)| {
+                        let go = go.clone();
+                        std::thread::spawn(move || {
+                            go.wait();
+                            // SAFETY: our mapping, released.
+                            unsafe { core::ptr::write_volatile((at + off) as *mut u8, v) };
+                        })
+                    })
+                    .collect();
+                for t in threads {
+                    t.join().expect("a toucher failed");
+                }
+                // SAFETY: as above.
+                let got = unsafe { (*(at as *const u8), *((at + 8) as *const u8)) };
+                assert_eq!(got, (0x11, 0x22), "round {round}, page {page}: a write was lost");
+            }
+            // SAFETY: our mapping.
+            assert_eq!(unsafe { crate::munmap(mem as *mut c_void, 4 * PAGE as usize) }, 0);
+        }
+    }
+
+    /// An unregister of part of a range leaves that part's discarded and
+    /// never-filled pages as released ones (zeros at their first access,
+    /// then ordinary memory) and the rest registered: its missing pages
+    /// still missing and filled through the userfaultfd (a control for the
+    /// released ranges' records).
+    #[test]
+    fn test_a_partial_unregister_keeps_its_pages_pending() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 12 * PAGE;
+        let mem = map(len as usize);
+        register(ctx, mem, len).unwrap();
+        let data = std::vec![0x5au8; 8 * PAGE as usize];
+        // SAFETY: `data` holds eight pages.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, 8 * PAGE, true) }.unwrap(), 8 * PAGE);
+        for page in [2u64, 5] {
+            // SAFETY: registered memory of ours.
+            assert_eq!(unsafe { crate::madvise((mem + page * PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        }
+        // Pages 4 to 9: 4 filled, 5 discarded, 6 and 7 filled, 8 and 9 never filled.
+        unregister(ctx, mem + 4 * PAGE, 6 * PAGE).unwrap();
+        // SAFETY: the unregistered part: ordinary memory.
+        unsafe {
+            assert_eq!(*((mem + 4 * PAGE) as *const u8), 0x5a);
+            assert!(std::slice::from_raw_parts((mem + 5 * PAGE) as *const u8, PAGE as usize).iter().all(|&b| b == 0), "the discarded page");
+            assert!(std::slice::from_raw_parts((mem + 8 * PAGE) as *const u8, PAGE as usize).iter().all(|&b| b == 0), "a page never filled");
+            *((mem + 9 * PAGE) as *mut u8) = 3;
+            assert_eq!(*((mem + 9 * PAGE) as *const u8), 3);
+        }
+        // The rest is still registered: page 2 and pages 10 and 11 missing.
+        assert!(is_missing(mem + 2 * PAGE) && is_missing(mem + 10 * PAGE) && is_missing(mem + 11 * PAGE));
+        assert!(!is_missing(mem + 5 * PAGE) && !is_missing(mem + 8 * PAGE));
+        let seven = std::vec![7u8; PAGE as usize];
+        // SAFETY: a page-sized buffer.
+        assert_eq!(unsafe { copy(ctx, seven.as_ptr(), mem + 10 * PAGE, PAGE, true) }.unwrap(), PAGE);
+        // SAFETY: a filled page.
+        assert_eq!(unsafe { *((mem + 10 * PAGE + 9) as *const u8) }, 7);
+        release(ctx, user);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::munmap(mem as *mut c_void, len as usize) }, 0);
+    }
+
+    /// Ranges registered and released while other threads touch the pending
+    /// pages of those released before: records freed and taken again under
+    /// touching threads (design-released-ranges.md, the reader protocol).
+    /// One thread makes 200 ranges of 4 pages (`released_with_pending_pages`,
+    /// filled with the round's byte) and unmaps the one of two rounds
+    /// before; four threads touch the pending pages of the ranges still
+    /// mapped, each its own pages, and check that a page reads zeros before
+    /// their write and their write after it; the filled pages keep their
+    /// round's byte. In a process of its own (the slots and records are
+    /// the process's).
+    #[test]
+    fn test_released_records_reused_under_touching_threads() {
+        let (code, text) = run_child("released_reuse_child", None);
+        assert!(text.contains("REUSE 200 rounds"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_released_records_reused_under_touching_threads in a process of its own"]
+    fn released_reuse_child() {
+        // The ranges still mapped: (address, round), and whether the maker is done.
+        let mapped = std::sync::Arc::new(std::sync::RwLock::new(std::vec::Vec::<(u64, u8)>::new()));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let touchers: std::vec::Vec<_> = (0..4u64)
+            .map(|me| {
+                let (mapped, done) = (mapped.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut touched = std::collections::BTreeSet::new();
+                    while !done.load(Ordering::SeqCst) {
+                        let ranges = mapped.read().unwrap();
+                        for &(mem, round) in ranges.iter() {
+                            // Pages 1 to 3 are pending; each toucher writes
+                            // its own byte of them, at offset 64 * me.
+                            for page in 1..4u64 {
+                                let at = mem + page * PAGE + 64 * me;
+                                // SAFETY: a mapped page of a released range.
+                                unsafe {
+                                    // By range too: a new range may be mapped where an old one was.
+                                    if touched.insert((at, round)) {
+                                        assert_eq!(core::ptr::read_volatile(at as *const u8), 0, "a pending page was not zeros");
+                                        core::ptr::write_volatile(at as *mut u8, round);
+                                    }
+                                    assert_eq!(core::ptr::read_volatile(at as *const u8), round, "a write was lost");
+                                }
+                            }
+                        }
+                        drop(ranges);
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        for round in 0..200u32 {
+            #[allow(clippy::cast_possible_truncation)]
+            let fill = (round % 250 + 1) as u8;
+            let mem = released_with_pending_pages(fill);
+            let mut ranges = mapped.write().unwrap();
+            ranges.push((mem, fill));
+            if ranges.len() > 2 {
+                let (old, old_fill) = ranges.remove(0);
+                // SAFETY: a filled page of ours.
+                assert_eq!(unsafe { *(old as *const u8) }, old_fill, "a filled page changed");
+                // SAFETY: our mapping, which no toucher reads now.
+                assert_eq!(unsafe { crate::munmap(old as *mut c_void, 4 * PAGE as usize) }, 0);
+            }
+        }
+        done.store(true, Ordering::SeqCst);
+        for t in touchers {
+            t.join().expect("a toucher failed");
+        }
+        std::println!("REUSE 200 rounds");
+    }
+
+    /// The released ranges' records are as many as the slots, one taken at
+    /// each register (design-released-ranges.md): with 64 ranges released
+    /// and their pending pages still mapped, a 65th register is refused with
+    /// `ENOMEM` and changes nothing, as Linux refuses a register whose vma
+    /// split would pass `vm.max_map_count` (mm/mmap.c `split_vma`); their
+    /// pages read as before. In a process of its own.
+    #[test]
+    #[ignore = "until the released ranges' records"]
+    fn test_released_records_past_the_table_refuse_a_register() {
+        let (code, text) = run_child("released_table_child", None);
+        assert!(text.contains("TABLE the 65th register: ENOMEM"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    /// A record is freed when its last pending page is unmapped: with the
+    /// table full, an unmap of half of one released range (its discarded
+    /// page) keeps the record, and the register is still refused; an unmap
+    /// of the rest frees it, and the register is made. In a process of its
+    /// own.
+    #[test]
+    #[ignore = "until the released ranges' records"]
+    fn test_release_then_munmap_frees_the_record() {
+        let (code, text) = run_child("released_table_child", None);
+        assert!(text.contains("TABLE after half unmapped: ENOMEM"), "{text}");
+        assert!(text.contains("TABLE after the rest unmapped: registered"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_released_records_past_the_table_refuse_a_register and test_release_then_munmap_frees_the_record in a process of its own"]
+    fn released_table_child() {
+        let held: std::vec::Vec<u64> = (0..MAX_RANGES).map(|_| released_with_pending_pages(0x5a)).collect();
+        let try_one = |what: &str| {
+            let (ctx, user) = create(0, false, true).unwrap();
+            let mem = map(4 * PAGE as usize);
+            let r = register(ctx, mem, 4 * PAGE);
+            let said = match &r {
+                Ok(()) => "registered".into(),
+                Err(e) if e.raw_os_error() == Some(crate::ENOMEM) => "ENOMEM".into(),
+                Err(e) => std::format!("{e}"),
+            };
+            std::println!("TABLE {what}: {said}");
+            release(ctx, user);
+            // SAFETY: our mapping.
+            assert_eq!(unsafe { crate::munmap(mem as *mut c_void, 4 * PAGE as usize) }, 0);
+        };
+        try_one("the 65th register");
+        // Nothing changed: each range's pages read as they did.
+        for &mem in &held[1..] {
+            // SAFETY: our mappings, released.
+            unsafe {
+                assert_eq!(*((mem + 9) as *const u8), 0x5a);
+                assert_eq!(*((mem + PAGE + 9) as *const u8), 0);
+            }
+        }
+        // SAFETY: our mapping: pages 0 and 1 (the discarded one) of the first.
+        assert_eq!(unsafe { crate::munmap(held[0] as *mut c_void, 2 * PAGE as usize) }, 0);
+        try_one("after half unmapped");
+        // SAFETY: the rest of it.
+        assert_eq!(unsafe { crate::munmap((held[0] + 2 * PAGE) as *mut c_void, 2 * PAGE as usize) }, 0);
+        try_one("after the rest unmapped");
+    }
+
     /// The jailer's count of this process (overlay/jailer/platform/windows
     /// commit.rs): private commit plus section commit less the committed,
     /// private, `PAGE_NOACCESS` memory that pays for sections (the cover),
