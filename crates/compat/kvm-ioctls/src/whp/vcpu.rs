@@ -8366,11 +8366,18 @@ mod fpu_tests {
         let runner = std::thread::Builder::new()
             .name("vcpu-runner".into())
             .spawn(move || {
+                // RUNREC: this thread's run calls (test-only record).
+                super::super::ffi::trace::runrec::begin();
                 let mut vcpu = vcpu;
                 let mut reads = 0;
                 one_run(&mut vcpu, &[], &mut reads)
             })
             .unwrap();
+        // The record so far, printed as it comes (nothing allocated, so at
+        // the limit too), so that a child that ends at the limit has
+        // printed what came before.
+        let mut runrec_from = 0;
+        let mut runrec = move || runrec_from = super::super::ffi::trace::runrec::print(runrec_from);
         let passes = |n: u64| {
             let from = mailbox(1).load(Ordering::SeqCst);
             let asked = std::time::Instant::now();
@@ -8461,6 +8468,17 @@ mod fpu_tests {
         };
         // A round before the limit: the heap's blocks for these calls made.
         round(false, false, &mut || {});
+        runrec();
+        // The record's printing at the limit needs stack this thread may
+        // not have committed yet (its line is built on the stack): 32 KiB
+        // of it committed here, before the limit (a committed stack page
+        // stays committed).
+        #[inline(never)]
+        fn commit_stack() {
+            let a = [0u8; 32 << 10];
+            std::hint::black_box(&a);
+        }
+        commit_stack();
         // Held at the limit: commit made until the job refuses it, then
         // pages down to 4 KiB, never touched.
         let mut ballast: Vec<(usize, usize)> = Vec::with_capacity(100_000);
@@ -8488,6 +8506,7 @@ mod fpu_tests {
                     assert_ne!(unsafe { VirtualFree((spare + given_back * PAGE as usize) as *mut core::ffi::c_void, PAGE as usize, MEM_DECOMMIT) }, 0);
                     given_back += 1;
                 });
+                runrec();
             }
         }
         for (b, _) in ballast.drain(..) {
@@ -8496,6 +8515,7 @@ mod fpu_tests {
         }
         mailbox(0).store(3, Ordering::SeqCst);
         let end = runner.join().unwrap();
+        runrec();
         let at_limit = &rounds[1..];
         let moved = at_limit.iter().filter(|r| r.0).count();
         let moved_writing = at_limit[ROUNDS as usize..].iter().filter(|r| r.0).count();

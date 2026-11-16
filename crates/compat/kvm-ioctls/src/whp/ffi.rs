@@ -306,6 +306,13 @@ pub(crate) fn run_vp(part: WHV_PARTITION_HANDLE, vp: u32) -> Result<WHV_RUN_VP_E
             u32::try_from(std::mem::size_of_val(&ctx.0)).unwrap(),
         )
     };
+    #[cfg(test)]
+    if ctx.0.ExitReason == whv::WHvRunVpExitReasonMemoryAccess {
+        // SAFETY: the union arm matches the exit reason; the access-info
+        // bitfield overlaps the u32.
+        let (gpa, info) = unsafe { (ctx.0.Anonymous.MemoryAccess.Gpa, ctx.0.Anonymous.MemoryAccess.AccessInfo.AsUINT32) };
+        trace::runrec::memory_exit(gpa, info);
+    }
     #[cfg(any(test, feature = "whp-trace"))]
     trace::note_exit("WHvRunVirtualProcessor", vp, &[], None, before, hres, Some(ctx.0.ExitReason), || {
         trace::exit_detail(&ctx.0, faults)
@@ -428,6 +435,11 @@ pub(crate) mod trace {
     #[repr(C)]
     struct ExceptionRecord {
         code: u32,
+        flags: u32,
+        record: *const ExceptionRecord,
+        address: usize,
+        parameters: u32,
+        information: [usize; 15],
     }
     #[repr(C)]
     struct ExceptionPointers {
@@ -454,6 +466,11 @@ pub(crate) mod trace {
     unsafe extern "system" fn counter(info: *mut ExceptionPointers) -> i32 {
         // SAFETY: the system passes a valid EXCEPTION_POINTERS with its record.
         let code = unsafe { (*(*info).record).code };
+        #[cfg(test)]
+        if code == 0xE06D_7363 {
+            // SAFETY: as above.
+            runrec::thrown(unsafe { &*(*info).record });
+        }
         RAISED.set({
             let r = RAISED.get();
             if code == 0xE06D_7363 {
@@ -479,6 +496,8 @@ pub(crate) mod trace {
     /// took.
     pub(crate) fn start() -> usize {
         STARTED.set(Some(Instant::now()));
+        #[cfg(test)]
+        runrec::call_starts();
         stack()
     }
 
@@ -693,6 +712,10 @@ pub(crate) mod trace {
         }
         let now = RAISED.get();
         let raised = now.since(LAST_RAISED.replace(now));
+        #[cfg(test)]
+        if let Some(e) = exit {
+            runrec::run_returned(before, after, hres, e, raised);
+        }
         #[cfg(feature = "whp-trace")]
         let print = after >= before + GREW;
         #[cfg(not(feature = "whp-trace"))]
@@ -725,6 +748,331 @@ pub(crate) mod trace {
                     calls.push(call);
                 }
             });
+        }
+    }
+
+    /// RUNREC, for a test: one thread's `WHvRunVirtualProcessor` calls, each
+    /// with its exit (reason, and for a memory access its GPA and access
+    /// info), the thread's committed stack before and after it (the TEB's
+    /// `StackBase - StackLimit`, [`stack`]), the moves made so far
+    /// (`wick_uffd::reclaim_counts`), and the first-chance C++ exceptions
+    /// (`0xE06D7363`) raised on the thread within it, the first two of them
+    /// with their thrown type (MSVC's `ThrowInfo`: its first catchable
+    /// type's `TypeDescriptor` name, read from the throwing module's image)
+    /// and the first 48 bytes of the thrown object (for wil's
+    /// `ResultException`, the `FailureInfo` with its HRESULT). Kept: the
+    /// first [`FIRST`] calls, then each call whose stack ended deeper than
+    /// any before it or that is the first after a move. A fixed array under
+    /// a mutex: nothing is allocated where it is written, so the record
+    /// runs at the memory limit too. Which exit grows a vCPU thread's stack
+    /// inside WHP, and whether WHP's C++ exceptions are thrown in it, is
+    /// what it answers (design-stack-reclaim.md 13.3).
+    #[cfg(test)]
+    pub(crate) mod runrec {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use super::{ExceptionRecord, Raised, stack};
+
+        /// Calls kept whatever they did.
+        const FIRST: usize = 48;
+        /// Calls kept in all.
+        const KEPT: usize = 160;
+
+        /// A C++ exception thrown within a run call.
+        #[derive(Clone, Copy)]
+        pub(crate) struct Thrown {
+            /// Where it was raised (`ExceptionAddress`: `RaiseException`'s
+            /// caller in KERNELBASE).
+            pub at: usize,
+            /// The NUL-terminated mangled name of the thrown type, 0 if
+            /// the `ThrowInfo` was not as expected.
+            pub type_name: usize,
+            /// The thrown object's size by its `CatchableType`, and its
+            /// first 12 32-bit words (as many as its size has).
+            pub size: u32,
+            pub words: [u32; 12],
+        }
+
+        const NONE: Thrown = Thrown { at: 0, type_name: 0, size: 0, words: [0; 12] };
+
+        /// One run call.
+        #[derive(Clone, Copy)]
+        pub(crate) struct Run {
+            pub n: u32,
+            pub exit: i32,
+            pub hres: i32,
+            pub gpa: u64,
+            pub info: u32,
+            pub before: usize,
+            pub after: usize,
+            pub moves: u64,
+            pub raised: Raised,
+            pub thrown: [Thrown; 2],
+        }
+
+        struct Rec {
+            /// The stack committed when the record began, before the first
+            /// run call.
+            at_start: usize,
+            runs: u32,
+            deepest: usize,
+            last_moves: u64,
+            len: usize,
+            kept: [Run; KEPT],
+        }
+
+        const EMPTY: Run = Run {
+            n: 0,
+            exit: 0,
+            hres: 0,
+            gpa: 0,
+            info: 0,
+            before: 0,
+            after: 0,
+            moves: 0,
+            raised: Raised { cxx: 0, other: 0, last_other: 0 },
+            thrown: [NONE; 2],
+        };
+
+        static REC: Mutex<Rec> =
+            Mutex::new(Rec { at_start: 0, runs: 0, deepest: 0, last_moves: 0, len: 0, kept: [EMPTY; KEPT] });
+        /// The thread recorded (its ID), 0 for none.
+        static THREAD: AtomicU32 = AtomicU32::new(0);
+
+        std::thread_local! {
+            static THROWN: core::cell::Cell<[Thrown; 2]> = const { core::cell::Cell::new([NONE; 2]) };
+            static THROWN_N: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+            /// The memory exit of the call that just returned: (GPA, info).
+            static MEMORY: core::cell::Cell<(u64, u32)> = const { core::cell::Cell::new((0, 0)) };
+        }
+
+        fn this_thread() -> u32 {
+            // SAFETY: plain call.
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+        }
+
+        fn recorded() -> bool {
+            THREAD.load(Ordering::Relaxed) == this_thread()
+        }
+
+        /// From here the calling thread's run calls are recorded (one
+        /// thread per process).
+        pub(crate) fn begin() {
+            super::count_exceptions();
+            let mut r = REC.lock().unwrap();
+            r.at_start = stack();
+            r.last_moves = libc::wick_uffd::reclaim_counts().moves;
+            THREAD.store(this_thread(), Ordering::SeqCst);
+        }
+
+        /// A traced call begins on this thread: no C++ exception of it yet.
+        pub(crate) fn call_starts() {
+            if recorded() {
+                THROWN_N.set(0);
+            }
+        }
+
+        /// A memory-access exit's GPA and access info, for the record of
+        /// the call that returned it.
+        pub(crate) fn memory_exit(gpa: u64, info: u32) {
+            if recorded() {
+                MEMORY.set((gpa, info));
+            }
+        }
+
+        /// The first-chance handler's part: a C++ exception on the
+        /// recorded thread, its type and first words kept (the first two of
+        /// a call). Reads only the exception's parameters and the throwing
+        /// image's `ThrowInfo` chain, which MSVC's `_CxxThrowException`
+        /// passes (`0x19930520`, the object, the `ThrowInfo`, the image
+        /// base: four parameters on x86-64); anything else keeps no type.
+        pub(super) fn thrown(rec: &ExceptionRecord) {
+            if !recorded() {
+                return;
+            }
+            let n = THROWN_N.get();
+            THROWN_N.set(n + 1);
+            if n >= 2 {
+                return;
+            }
+            let mut t = Thrown { at: rec.address, ..NONE };
+            let [magic, object, info, base, ..] = rec.information;
+            // The throwing image's extent, by the module that holds `base`
+            // (GetModuleHandleExW by address, then its SizeOfImage): every
+            // offset below is followed only inside it, so a record not as
+            // expected is a missing type, never a fault in this handler.
+            let image = || {
+                use windows_sys::Win32::System::LibraryLoader::{
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    GetModuleHandleExW,
+                };
+                let mut m = core::ptr::null_mut();
+                // SAFETY: looks up the module at an address; no reference
+                // taken.
+                let ok = unsafe {
+                    GetModuleHandleExW(
+                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        base as *const u16,
+                        &mut m,
+                    )
+                };
+                if ok == 0 || m as usize != base {
+                    return None;
+                }
+                // SAFETY: a loaded image's DOS and NT headers:
+                // e_lfanew at 0x3c, OptionalHeader.SizeOfImage at NT+0x50.
+                let size = unsafe {
+                    let nt = base + *((base + 0x3c) as *const u32) as usize;
+                    *((nt + 0x50) as *const u32) as usize
+                };
+                Some(base..base + size)
+            };
+            let in_image = |r: &core::ops::Range<usize>, at: usize, len: usize| at >= r.start && at + len <= r.end;
+            if rec.parameters == 4
+                && magic == 0x1993_0520
+                && object != 0
+                && let Some(img) = image()
+                && in_image(&img, info, 16)
+            {
+                // SAFETY: MSVC's x86-64 ThrowInfo, of the throwing image:
+                // attributes, pmfnUnwind, pForwardCompat, pCatchableTypeArray
+                // (32-bit image offsets); the array: its count, then the
+                // offsets of its CatchableTypes; a CatchableType: properties,
+                // pType, a PMD (12 bytes), sizeOrOffset, copyFunction; a
+                // TypeDescriptor: its vtable and a spare pointer, then the
+                // name. Each read is inside the image (checked); the object
+                // is live while the exception is dispatched.
+                unsafe {
+                    let rva = |at: usize| base.wrapping_add_signed(*(at as *const i32) as isize);
+                    let array = rva(info + 12);
+                    if in_image(&img, array, 8) && *(array as *const i32) > 0 {
+                        let catchable = rva(array + 4);
+                        if in_image(&img, catchable, 24) {
+                            let descriptor = rva(catchable + 4);
+                            if in_image(&img, descriptor, 17) {
+                                t.type_name = descriptor + 16;
+                                t.size = *((catchable + 20) as *const u32);
+                            }
+                        }
+                    }
+                    let words = (t.size as usize / 4).min(12);
+                    for (i, w) in t.words.iter_mut().enumerate().take(words) {
+                        *w = *((object + 4 * i) as *const u32);
+                    }
+                }
+            }
+            let mut all = THROWN.get();
+            all[n] = t;
+            THROWN.set(all);
+        }
+
+        /// A run call returned on this thread: kept as [`runrec`] says.
+        pub(super) fn run_returned(before: usize, after: usize, hres: i32, exit: i32, raised: Raised) {
+            if !recorded() {
+                return;
+            }
+            let (gpa, info) = if exit == 1 { MEMORY.take() } else { (0, 0) };
+            let thrown = if THROWN_N.get() == 0 { [NONE; 2] } else { THROWN.get() };
+            let moves = libc::wick_uffd::reclaim_counts().moves;
+            let mut r = REC.lock().unwrap();
+            r.runs += 1;
+            let deeper = after > r.deepest;
+            let moved = moves != r.last_moves;
+            r.deepest = r.deepest.max(after);
+            r.last_moves = moves;
+            if (r.runs as usize <= FIRST || deeper || moved) && r.len < KEPT {
+                let i = r.len;
+                r.kept[i] = Run { n: r.runs, exit, hres, gpa, info, before, after, moves, raised, thrown };
+                r.len += 1;
+            }
+        }
+
+        /// A line built on the stack and written to stderr in one call:
+        /// nothing is allocated, so it can be printed at the memory limit
+        /// (a line longer than the buffer is cut).
+        struct Line {
+            buf: [u8; 2048],
+            len: usize,
+        }
+
+        impl core::fmt::Write for Line {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let n = s.len().min(self.buf.len() - self.len);
+                self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+                self.len += n;
+                Ok(())
+            }
+        }
+
+        impl Line {
+            const fn new() -> Self {
+                Line { buf: [0; 2048], len: 0 }
+            }
+
+            fn put(&mut self) {
+                use std::io::Write as _;
+                if self.len == self.buf.len() {
+                    self.len -= 1;
+                }
+                self.buf[self.len] = b'\n';
+                // Unbuffered; a line lost to a full pipe is not worth a
+                // failure here.
+                let _ = std::io::stderr().write_all(&self.buf[..=self.len]);
+                self.len = 0;
+            }
+        }
+
+        /// Prints the record from its `from`th kept call to stderr, a line a
+        /// call (and first a line of the stack before the first call), with
+        /// nothing allocated, so it runs at the memory limit; returns how
+        /// many calls are kept now, the next `from`.
+        pub(crate) fn print(from: usize) -> usize {
+            use core::fmt::Write as _;
+            let r = REC.lock().unwrap();
+            let mut l = Line::new();
+            if from == 0 {
+                let _ = write!(l, "RUNREC before the first run call: the stack {} KiB committed", r.at_start / 1024);
+                l.put();
+            }
+            for c in &r.kept[from.min(r.len)..r.len] {
+                let _ = write!(l, "RUNREC run {}: HRESULT {:#010x}, ", c.n, c.hres.cast_unsigned());
+                let _ = match c.exit {
+                    1 => write!(
+                        l,
+                        "a memory access ({} of {:#x}{})",
+                        ["read", "write", "execute", "access type 3"][(c.info & 3) as usize],
+                        c.gpa,
+                        if c.info & 4 != 0 { ", GPA unmapped" } else { "" }
+                    ),
+                    2 => write!(l, "port I/O"),
+                    e => write!(l, "exit reason {e:#x}"),
+                };
+                let _ = write!(l, "; the stack {} -> {} KiB; moves so far {}; first-chance ", c.before / 1024, c.after / 1024, c.moves);
+                let _ = match (c.raised.cxx, c.raised.other) {
+                    (0, 0) => write!(l, "none"),
+                    (x, 0) => write!(l, "{x} C++ (0xe06d7363)"),
+                    (x, o) => write!(l, "{x} C++ (0xe06d7363), {o} other (last {:#010x})", c.raised.last_other),
+                };
+                for (i, t) in c.thrown.iter().take((c.raised.cxx as usize).min(2)).enumerate() {
+                    let _ = write!(l, "{}", if i == 0 { "; thrown: " } else { "; " });
+                    if t.type_name == 0 {
+                        let _ = write!(l, "not an MSVC throw as expected");
+                    } else {
+                        // SAFETY: a TypeDescriptor's NUL-terminated name, in
+                        // an image checked when it was kept, which stays
+                        // loaded (WinHvPlatform.dll's or its callee's).
+                        let name = unsafe { std::ffi::CStr::from_ptr(t.type_name as *const core::ffi::c_char) };
+                        let _ = l.write_str(name.to_str().unwrap_or("(a name not UTF-8)"));
+                    }
+                    let _ = write!(l, " ({} bytes, raised at {:#x}):", t.size, t.at);
+                    for w in t.words.iter().take((t.size as usize / 4).min(12)) {
+                        let _ = write!(l, " {w:08x}");
+                    }
+                }
+                l.put();
+            }
+            r.len
         }
     }
 }
