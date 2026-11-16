@@ -4762,35 +4762,40 @@ mod macos {
         #[test]
         #[ignore = "run by test_a_hotplugged_endpoint_in_a_network_without_the_jail_frees_its_name in a separate process"]
         fn endpoint_netns_drop_child() {
-            let net = std::path::PathBuf::from(std::env::var_os("WICK_NETNS").unwrap());
-            let dev = |id: &str| {
-                crate::devices::virtio::net::Net::new(
-                    id.into(),
-                    "tap1",
-                    None,
-                    Default::default(),
-                    Default::default(),
-                    None,
-                )
-            };
-            // As Firecracker's main: the network, then the profile (prepare).
-            crate::ext::jail::enter().unwrap();
-            select(Policy::Default);
-            apply().unwrap();
-            narrow().unwrap();
-            drop(dev("first").unwrap());
-            if !net.join("tap1").exists() {
-                println!("FREED");
-            }
-            match dev("again") {
-                Ok(d) => {
-                    println!("AGAIN");
-                    drop(d);
+            // In a fork of this thread, alone, as Firecracker's main thread
+            // is at jail::enter, whose profile compiler forks
+            // (`Compiled::in_child`, refused with a second thread).
+            crate::ext::api_process::one_thread::in_one_thread(|| {
+                let net = std::path::PathBuf::from(std::env::var_os("WICK_NETNS").unwrap());
+                let dev = |id: &str| {
+                    crate::devices::virtio::net::Net::new(
+                        id.into(),
+                        "tap1",
+                        None,
+                        Default::default(),
+                        Default::default(),
+                        None,
+                    )
+                };
+                // As Firecracker's main: the network, then the profile (prepare).
+                crate::ext::jail::enter().unwrap();
+                select(Policy::Default);
+                apply().unwrap();
+                narrow().unwrap();
+                drop(dev("first").unwrap());
+                if !net.join("tap1").exists() {
+                    println!("FREED");
                 }
-                Err(err) => println!("REFUSED {err}"),
-            }
-            // Time for a denial's kill to land.
-            std::thread::sleep(std::time::Duration::from_secs(2));
+                match dev("again") {
+                    Ok(d) => {
+                        println!("AGAIN");
+                        drop(d);
+                    }
+                    Err(err) => println!("REFUSED {err}"),
+                }
+                // Time for a denial's kill to land.
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            });
             println!("CHILD-SURVIVED");
         }
 

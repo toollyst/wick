@@ -1147,41 +1147,46 @@ mod tests {
     #[test]
     #[ignore = "run by test_netns_without_the_jail in a separate process"]
     fn netns_alone_child() {
-        let want = std::path::PathBuf::from(std::env::var_os(NETNS_ENV).unwrap());
-        enter().unwrap();
-        assert!(std::env::var_os(NETNS_ENV).is_none());
-        assert_eq!(netns(), Some(want.as_path()));
-        assert!(netns_dir().is_some());
-        use crate::platform::net::{Tap, TapError};
-        // An interface named without a path is an endpoint there.
-        let tap = Tap::open_named("tap0").unwrap();
-        assert!(want.join("tap0").exists());
-        // The socket file goes with the device, as a TAP's name with its
-        // close (platform::net, test_a_dropped_endpoint_frees_its_name).
-        drop(tap);
-        assert!(!want.join("tap0").exists());
-        // And its lock file, which this Firecracker (with the creator's
-        // right) made, goes with it.
-        assert!(!want.parent().unwrap().join("tap0.lock").exists());
-        // As a user: only the interface the network's switch made, its
-        // socket directly in the network directory, the parent, with its
-        // lock file; and no path name, this Firecracker being in a network.
-        let eperm = |got: Result<Tap, TapError>| {
-            matches!(got, Err(TapError::IfreqExecuteError(e, _)) if e.raw_os_error() == Some(libc::EPERM))
-        };
-        crate::platform::net::tests_as::user(|| {
-            assert!(eperm(Tap::open_named("tap1")));
-            let _switch = std::os::unix::net::UnixDatagram::bind(want.parent().unwrap().join("tap1")).unwrap();
-            assert!(eperm(Tap::open_named("tap1")), "an interface without its lock file");
-            std::fs::write(want.parent().unwrap().join("tap1.lock"), b"").unwrap();
-            drop(Tap::open_named("tap1").unwrap());
-            // The operator's lock file stays.
-            assert!(want.parent().unwrap().join("tap1.lock").exists());
-            assert!(!want.join("tap1").exists());
-            let outside = want.parent().unwrap().join("x");
-            assert!(eperm(Tap::open_named(outside.to_str().unwrap())));
-            assert!(eperm(Tap::open_named("../x")));
-            assert!(!outside.exists());
+        // In a fork of this thread, alone, as Firecracker's main thread is
+        // at enter, whose profile compiler forks (`sandbox::Compiled::in_child`,
+        // refused with a second thread).
+        crate::ext::api_process::one_thread::in_one_thread(|| {
+            let want = std::path::PathBuf::from(std::env::var_os(NETNS_ENV).unwrap());
+            enter().unwrap();
+            assert!(std::env::var_os(NETNS_ENV).is_none());
+            assert_eq!(netns(), Some(want.as_path()));
+            assert!(netns_dir().is_some());
+            use crate::platform::net::{Tap, TapError};
+            // An interface named without a path is an endpoint there.
+            let tap = Tap::open_named("tap0").unwrap();
+            assert!(want.join("tap0").exists());
+            // The socket file goes with the device, as a TAP's name with its
+            // close (platform::net, test_a_dropped_endpoint_frees_its_name).
+            drop(tap);
+            assert!(!want.join("tap0").exists());
+            // And its lock file, which this Firecracker (with the creator's
+            // right) made, goes with it.
+            assert!(!want.parent().unwrap().join("tap0.lock").exists());
+            // As a user: only the interface the network's switch made, its
+            // socket directly in the network directory, the parent, with its
+            // lock file; and no path name, this Firecracker being in a network.
+            let eperm = |got: Result<Tap, TapError>| {
+                matches!(got, Err(TapError::IfreqExecuteError(e, _)) if e.raw_os_error() == Some(libc::EPERM))
+            };
+            crate::platform::net::tests_as::user(|| {
+                assert!(eperm(Tap::open_named("tap1")));
+                let _switch = std::os::unix::net::UnixDatagram::bind(want.parent().unwrap().join("tap1")).unwrap();
+                assert!(eperm(Tap::open_named("tap1")), "an interface without its lock file");
+                std::fs::write(want.parent().unwrap().join("tap1.lock"), b"").unwrap();
+                drop(Tap::open_named("tap1").unwrap());
+                // The operator's lock file stays.
+                assert!(want.parent().unwrap().join("tap1.lock").exists());
+                assert!(!want.join("tap1").exists());
+                let outside = want.parent().unwrap().join("x");
+                assert!(eperm(Tap::open_named(outside.to_str().unwrap())));
+                assert!(eperm(Tap::open_named("../x")));
+                assert!(!outside.exists());
+            });
         });
         println!("NETNS-ALONE-OK");
     }
@@ -1211,12 +1216,15 @@ mod tests {
     #[ignore = "run by test_a_network_without_the_jail_is_one_firecrackers in a separate process"]
     fn netns_locked_child() {
         use std::os::fd::AsRawFd;
-        let want = std::path::PathBuf::from(std::env::var_os(NETNS_ENV).unwrap());
-        enter().unwrap();
-        let other = std::fs::File::open(&want).unwrap();
-        // SAFETY: a descriptor owned here; does not block.
-        let ret = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!((ret, std::io::Error::last_os_error().raw_os_error()), (-1, Some(libc::EWOULDBLOCK)));
+        // In a fork of this thread, alone, as in netns_alone_child.
+        crate::ext::api_process::one_thread::in_one_thread(|| {
+            let want = std::path::PathBuf::from(std::env::var_os(NETNS_ENV).unwrap());
+            enter().unwrap();
+            let other = std::fs::File::open(&want).unwrap();
+            // SAFETY: a descriptor owned here; does not block.
+            let ret = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!((ret, std::io::Error::last_os_error().raw_os_error()), (-1, Some(libc::EWOULDBLOCK)));
+        });
         println!("NETNS-LOCKED-OK");
     }
 
