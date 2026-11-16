@@ -19,17 +19,25 @@ The binary's unit tests share the same initializer:
 - wick_malloc_config_tests::test_a_direct_launch_starts_again_with_libmallocs_configuration
 - test_a_launch_with_the_configuration_runs_without_starting_again
 - test_another_value_is_refused
+- test_starting_again_keeps_arguments_environment_and_descriptors
+- test_a_failed_start_again_ends_firecracker_naming_why
 
-All three read libmalloc's own report (MallocReportConfig). They fail
-with the initializer left out. Linux and Windows are unchanged.
+The first four read libmalloc's own report (MallocReportConfig) and
+fail with the initializer left out. The fourth compares the arguments,
+the environment and the descriptors of a run that started again with
+one that did not (a helper test, ignored, prints them in a child). The
+fifth finds by bisection an environment that leaves the second exec
+over kern.argmax (E2BIG) and checks the exit code and the message. The
+last two fail with the exec's failure ignored or the environment's
+order changed. Linux and Windows are unchanged.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/firecracker/src/main.rs | 118 ++++++++++++++++++++++++++++++++++++
- 1 file changed, 118 insertions(+)
+ src/firecracker/src/main.rs | 318 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 318 insertions(+)
 
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
-index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..04cf2df6f41a4f738e93352d9f98302aa96086bd 100644
+index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..fb71dde13da4c18806fe7747a0e02c3dc58aac6f 100644
 --- a/src/firecracker/src/main.rs
 +++ b/src/firecracker/src/main.rs
 @@ -112,6 +112,19 @@ impl From<MainError> for FcExitCode {
@@ -52,7 +60,7 @@ index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..04cf2df6f41a4f738e93352d9f98302a
  fn main() -> ExitCode {
      let result = main_exec();
      if let Err(err) = result {
-@@ -823,3 +836,108 @@ mod wick_version_tests {
+@@ -823,3 +836,308 @@ mod wick_version_tests {
          assert!(version >= semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap());
      }
  }
@@ -159,5 +167,205 @@ index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..04cf2df6f41a4f738e93352d9f98302a
 +            // Nothing of the test binary ran: no list of tests.
 +            assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
 +        }
++    }
++
++    /// Run by `test_starting_again_keeps_arguments_environment_and_descriptors`
++    /// in a child: prints the arguments, the environment and the open
++    /// descriptors (with their inodes) it runs with, each on a line of its own
++    /// (libtest has printed the test's name without a newline).
++    #[test]
++    #[ignore = "a helper, run by another test in a child"]
++    fn helper_report_what_this_process_runs_with() {
++        println!();
++        for arg in std::env::args_os() {
++            println!("arg {arg:?}");
++        }
++        for (name, value) in std::env::vars_os() {
++            println!("env {name:?}={value:?}");
++        }
++        for fd in 0..256 {
++            // SAFETY: a stat is plain data; all zeroes is a valid one.
++            let mut st: libc::stat = unsafe { std::mem::zeroed() };
++            // SAFETY: an fstat into a stat of our own.
++            if unsafe { libc::fstat(fd, &mut st) } == 0 {
++                println!("fd {fd} {}", st.st_ino);
++            }
++        }
++    }
++
++    const HELPER_ARGS: [&str; 7] = [
++        "--ignored",
++        "--exact",
++        "--nocapture",
++        "--test-threads=1",
++        "wick_malloc_config_tests::helper_report_what_this_process_runs_with",
++        "an argument with spaces",
++        "",
++    ];
++
++    /// A run of the helper with exactly the environment `env` and this
++    /// binary open on descriptor 9 (dup2 leaves FD_CLOEXEC clear: a descriptor
++    /// a launcher passes on). Returns libmalloc's report, the lines the helper
++    /// printed with `prefix`, and the inode of the file on descriptor 9.
++    fn helper(env: &[(&str, &str)]) -> (String, String, u64) {
++        use std::os::fd::AsRawFd;
++        use std::os::unix::fs::MetadataExt;
++        use std::os::unix::process::CommandExt;
++
++        let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
++        let (raw, ino) = (file.as_raw_fd(), file.metadata().unwrap().ino());
++        let mut cmd = Command::new(std::env::current_exe().unwrap());
++        cmd.args(HELPER_ARGS)
++            .env_clear()
++            .env("MallocReportConfig", "1")
++            .env("MallocDebugReport", "stderr")
++            .envs(env.iter().copied());
++        // SAFETY: dup2 is async-signal-safe and touches no memory.
++        unsafe {
++            cmd.pre_exec(move || match libc::dup2(raw, 9) {
++                -1 => Err(std::io::Error::last_os_error()),
++                _ => Ok(()),
++            });
++        }
++        let out = cmd.output().unwrap();
++        let report = String::from_utf8_lossy(&out.stderr).into_owned();
++        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
++        assert!(out.status.success(), "{report}\n{stdout}");
++        (report, stdout, ino)
++    }
++
++    fn lines<'a>(stdout: &'a str, prefix: &str) -> Vec<&'a str> {
++        stdout.lines().filter(|l| l.starts_with(prefix)).collect()
++    }
++
++    #[test]
++    fn test_starting_again_keeps_arguments_environment_and_descriptors() {
++        let given = [("WICK_A", "1"), ("WICK_B", "two words")];
++        let (report, stdout, ino) = helper(&given);
++        // It did start again: two images, the second configured.
++        assert_eq!(assert_configured(&report), 2, "{report}");
++        // A run that did not start again (as the jailer launches it), for
++        // what any process of this binary runs with.
++        let control: Vec<(&str, &str)> = given.iter().chain(MALLOC_ENV.iter()).copied().collect();
++        let (control_report, control_stdout, _) = helper(&control);
++        assert_eq!(assert_configured(&control_report), 1, "{control_report}");
++
++        // The arguments crt gave the first image, its path first.
++        let exe = std::env::current_exe().unwrap();
++        let want: Vec<String> = std::iter::once(exe.as_os_str())
++            .chain(HELPER_ARGS.iter().map(std::ffi::OsStr::new))
++            .map(|a| format!("arg {a:?}"))
++            .collect();
++        assert_eq!(lines(&stdout, "arg "), want, "{stdout}");
++
++        // The environment the first image had when it started again, in its
++        // order, then MALLOC_ENV's variables. That is the environment given
++        // (std passes it sorted by name) and what libraries' initializers add
++        // before main in any run, as the control shows (CoreFoundation's
++        // __CF_USER_TEXT_ENCODING): nothing else is added, nothing lost.
++        let quoted = |(n, v): &(&str, &str)| {
++            format!(
++                "env {:?}={:?}",
++                std::ffi::OsStr::new(n),
++                std::ffi::OsStr::new(v)
++            )
++        };
++        let mut sorted = vec![("MallocDebugReport", "stderr"), ("MallocReportConfig", "1")];
++        sorted.extend(given);
++        sorted.sort();
++        let sorted: Vec<String> = sorted.iter().map(quoted).collect();
++        let malloc: Vec<String> = MALLOC_ENV.iter().map(quoted).collect();
++        let added_before_main: Vec<&str> = lines(&control_stdout, "env ")
++            .into_iter()
++            .filter(|l| !sorted.iter().any(|s| s == l) && !malloc.iter().any(|m| m == l))
++            .collect();
++        let want: Vec<&str> = sorted
++            .iter()
++            .map(String::as_str)
++            .chain(added_before_main)
++            .chain(malloc.iter().map(String::as_str))
++            .collect();
++        assert_eq!(
++            lines(&stdout, "env "),
++            want,
++            "{stdout}\ncontrol:\n{control_stdout}"
++        );
++
++        // The same descriptors as a run that did not start again, and the
++        // inherited one still on the same file.
++        let fds = |out: &str| -> Vec<String> {
++            lines(out, "fd ")
++                .iter()
++                .map(|l| l.split(' ').nth(1).unwrap().to_string())
++                .collect()
++        };
++        assert_eq!(
++            fds(&stdout),
++            fds(&control_stdout),
++            "{stdout}\ncontrol:\n{control_stdout}"
++        );
++        assert!(
++            stdout.lines().any(|l| l == format!("fd 9 {ino}")),
++            "{stdout}"
++        );
++    }
++
++    #[test]
++    fn test_a_failed_start_again_ends_firecracker_naming_why() {
++        // An environment that leaves less room than MALLOC_ENV's variables
++        // take under the kernel's limit on arguments and environment
++        // (kern.argmax): the first exec fits, the second fails with E2BIG.
++        // The sizes that fit are found by bisection: a run that starts again
++        // exits 0, one that does not fit at all fails to spawn, and between
++        // them lies a padding where only the second exec fails.
++        let exe = std::env::current_exe().unwrap();
++        let run = |pad: usize| {
++            Command::new(&exe)
++                .arg("--list")
++                .env_clear()
++                .env("WICK_PAD", "x".repeat(pad))
++                .output()
++        };
++        let (mut fits, mut too_big) = (0usize, 4 << 20);
++        assert!(run(fits).unwrap().status.success());
++        run(too_big).unwrap_err();
++        while too_big - fits > 1 {
++            let pad = fits + (too_big - fits) / 2;
++            match run(pad) {
++                Err(err) => {
++                    assert_eq!(err.raw_os_error(), Some(libc::E2BIG), "{err}");
++                    too_big = pad;
++                }
++                Ok(out) if out.status.success() => fits = pad,
++                Ok(out) => {
++                    let report = String::from_utf8_lossy(&out.stderr);
++                    assert_eq!(
++                        out.status.code(),
++                        Some(vmm::FcExitCode::GenericError as i32),
++                        "{report}"
++                    );
++                    let path = std::fs::canonicalize(&exe).unwrap();
++                    assert_eq!(
++                        report,
++                        format!(
++                            "Error: Firecracker could not start again with libmalloc's configuration (exec of \
++                             {}): {}\n",
++                            path.display(),
++                            std::io::Error::from_raw_os_error(libc::E2BIG)
++                        )
++                    );
++                    // Nothing of the test binary ran: no list of tests.
++                    assert!(
++                        out.stdout.is_empty(),
++                        "{}",
++                        String::from_utf8_lossy(&out.stdout)
++                    );
++                    return;
++                }
++            }
++        }
++        panic!(
++            "no padding between {fits} (starts again) and {too_big} (no spawn) fails only the second exec"
++        );
 +    }
 +}

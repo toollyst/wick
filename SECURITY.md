@@ -143,10 +143,16 @@ both from the environment once, as libSystem starts and before any of the progra
 libmalloc-812 malloc.c), and no entitlement or API lets a program choose them otherwise. So the jailer puts them in
 the environment it execs Firecracker with, and Firecracker launched without them starts again with them: an
 initializer of the binary, before `main`, with no thread and no descriptor of its own, execs its own executable
-(`proc_pidpath`) with the same arguments and the two variables added. A variable set to another value is refused,
-naming the value needed (exit 152, upstream's bad-configuration code), and a failed exec ends Firecracker with its
-error: it never runs without them. Anyone who could replace the executable between the two starts could already
-replace it before the first; a jailed Firecracker, which runs a root-owned copy, never starts again.
+(`proc_pidpath`) with crt's arguments as they are, the environment it has then (the one given, and what libraries'
+initializers add before `main` in any run: CoreFoundation's `__CF_USER_TEXT_ENCODING`) with the two variables after
+it, and every descriptor it was given (it has opened none, and an exec keeps what a launcher passed on): the binary's
+`test_starting_again_keeps_arguments_environment_and_descriptors` compares each with a run that does not start
+again. A variable set to another value is refused, naming the value needed (exit 152, upstream's bad-configuration
+code), and a failed exec ends Firecracker with exit 1 and `Error: Firecracker could not start again with libmalloc's
+configuration (exec of PATH): ERROR` on standard error, before any of its own code
+(`test_a_failed_start_again_ends_firecracker_naming_why`: an environment that leaves the second exec over
+`kern.argmax`, E2BIG): it never runs without them. Anyone who could replace the executable between the two starts
+could already replace it before the first; a jailed Firecracker, which runs a root-owned copy, never starts again.
 
 What it gives up, on libmalloc-812 (macOS 27), which runs its xzone allocator by default on Apple silicon
 (malloc_config.c, `_malloc_should_enable_xzone`): `MallocMaxMagazines=1` also makes the pointer buckets one instead
