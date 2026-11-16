@@ -1937,6 +1937,117 @@ mod tests {
         });
     }
 
+    /// Guest programs: at [`GUEST_BASE`], writes X3 to X1, then to X4 (MMIO:
+    /// the exit); at `GUEST_BASE + 16`, reads X1 into X5 and writes it to X4.
+    const STORE_THEN_LOAD: [u32; 7] = [
+        0xf9000023, // str x3, [x1]
+        0xf9000083, // str x3, [x4]
+        0x14000000, // b .
+        0xd503201f, // nop
+        0xf9400025, // ldr x5, [x1]
+        0xf9000085, // str x5, [x4]
+        0x14000000, // b .
+    ];
+
+    /// Runs the part of [`STORE_THEN_LOAD`] at `pc` with X1 `at` and X3
+    /// `value`: the exit, as the value the guest wrote to MMIO (`Ok(Some)`),
+    /// an MMIO read of `at` (`Ok(None)`) or the run's error.
+    fn access(vcpu: &mut VcpuFd, pc: u64, at: u64, value: u64) -> std::result::Result<Option<u64>, i32> {
+        for (id, v) in [(PC, pc), (PSTATE, 0x3c5), (x_reg(1), at), (x_reg(3), value), (x_reg(4), MMIO)] {
+            vcpu.set_one_reg(id, &v.to_le_bytes()).unwrap();
+        }
+        match vcpu.run() {
+            Ok(crate::VcpuExit::MmioWrite(MMIO, data)) => Ok(Some(u64::from_le_bytes(data.try_into().unwrap()))),
+            Ok(crate::VcpuExit::MmioRead(ipa, _)) if ipa == at => Ok(None),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.errno()),
+        }
+    }
+
+    /// A page a userfaultfd fills after its memory slot was removed (an
+    /// unplugged virtio-mem slot's: Firecracker removes the slot before it
+    /// protects the memory, vstate/memory.rs `update_slot`) stays out of the
+    /// guest's reach: the fill's stage-2 hook (`uffd_stage2`) changes only
+    /// the slots there are, and a removed slot's range was unmapped
+    /// (`set_user_memory_region` with no size), so the guest's read of it
+    /// exits as MMIO, as on Linux, where the address has no memory slot
+    /// (arch/arm64/kvm/mmu.c, v6.12, `kvm_handle_guest_abort` :1839 to
+    /// :1880: no hva, `io_mem_abort`). The control: a page of the slot while
+    /// it is there, filled, is read by the guest.
+    #[test]
+    fn test_a_fill_in_a_removed_slots_page_maps_nothing_for_the_guest() {
+        let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        // SAFETY: a fresh anonymous mapping, kept for the test.
+        let extra = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                (2 * page) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(extra, libc::MAP_FAILED);
+        let extra = extra as u64;
+        let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+        libc::wick_uffd::register(ctx, extra, 2 * page).unwrap();
+        let ipa = GUEST_BASE + (1 << 30);
+        let mut region = kvm_userspace_memory_region {
+            slot: 1,
+            guest_phys_addr: ipa,
+            memory_size: 2 * page,
+            userspace_addr: extra,
+            flags: 0,
+        };
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+        let data = vec![0x5au8; page as usize];
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), extra, page, true) }, Ok(page));
+        let load = GUEST_BASE + 16;
+        assert_eq!(access(&mut vcpu, load, ipa, 0), Ok(Some(0x5a5a_5a5a_5a5a_5a5a)), "the control");
+        region.memory_size = 0;
+        // SAFETY: removes the slot.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), extra + page, page, true) }, Ok(page));
+        assert_eq!(access(&mut vcpu, load, ipa + page, 0), Ok(None), "the guest read a removed slot's page");
+        // SAFETY: the test's descriptor and mapping.
+        unsafe {
+            libc::close(user);
+            libc::munmap(extra as *mut _, (2 * page) as usize);
+        }
+    }
+
+    /// A guest access to memory of a present slot that the host protection
+    /// refuses ends the run with `EFAULT`, as on Linux: mprotect invalidates
+    /// the range's secondary mappings (mm/mprotect.c, v6.12, :455 to :458),
+    /// and KVM's next stage-2 fault there takes the page through the vma
+    /// (arch/arm64/kvm/mmu.c `user_mem_abort` :1573 to :1580, virt/kvm/
+    /// kvm_main.c `hva_to_pfn` :2937, mm/gup.c `check_vma_flags`: a write
+    /// with no `VM_WRITE` :1285 to :1287, a read with no `VM_READ` :1303 to
+    /// :1305), whose refusal is `-EFAULT` from `KVM_RUN` (mmu.c :1579 to
+    /// :1580). Here the slot's stage-2 mapping keeps the slot's permissions
+    /// whatever the host protection is. The control: the same store before
+    /// the host protects the page.
+    #[test]
+    #[ignore = "fails until stage 2 follows a host mprotect of guest memory"]
+    fn test_a_guest_access_the_host_protection_refuses_is_efault() {
+        let (_vm, mut vcpu, mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        let (store, load) = (GUEST_BASE, GUEST_BASE + 16);
+        assert_eq!(access(&mut vcpu, store, GUEST_BASE + page, 7), Ok(Some(7)), "the control");
+        // SAFETY: pages of the test's mapping, not the code's.
+        unsafe {
+            assert_eq!(libc::mprotect(mem.add(page as usize), page as usize, libc::PROT_READ), 0);
+            assert_eq!(libc::mprotect(mem.add(2 * page as usize), page as usize, libc::PROT_NONE), 0);
+        }
+        assert_eq!(access(&mut vcpu, store, GUEST_BASE + page, 8), Err(libc::EFAULT), "a store to a read-only page");
+        assert_eq!(access(&mut vcpu, load, GUEST_BASE + 2 * page, 0), Err(libc::EFAULT), "a load from a PROT_NONE page");
+    }
+
     /// Guest program: writes X3 to every page from X5 to X2, adds 1 to X3,
     /// forever.
     const COUNTER: [u32; 7] =
