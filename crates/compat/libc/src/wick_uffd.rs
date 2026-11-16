@@ -1424,7 +1424,9 @@ fn realias(r: &Range, a: u64, b: u64) -> Result<(), std::string::String> {
 /// Wraps a `MADV_DONTNEED` of `[start, start + len)`: registered pages are
 /// made accessible for `discard` to zero and release them, and the pages of
 /// the pieces `discard` reports it discarded are missing again, with a
-/// remove event queued for each (with `EVENT_REMOVE`). Pieces in a huge page
+/// remove event queued for each vma they cover ([`vmas`]; with
+/// `EVENT_REMOVE`), as Linux's walk calls `userfaultfd_remove` for each vma
+/// (mm/madvise.c, v6.12, `madvise_dontneed_free` :894). Pieces in a huge page
 /// range are whole huge pages (Linux's hugetlb `MADV_DONTNEED` wants a huge
 /// page aligned start and rounds the end down); pages the discard did not
 /// reach keep their contents, as on Linux when it stops at an error.
@@ -1481,8 +1483,6 @@ pub fn discarding_or_refusing(
             continue;
         }
         let ps = r.page_size();
-        let ctx = r.ctx.load(Ordering::Acquire);
-        let remove = CTXS[ctx].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0;
         for &(a, b) in &done {
             let (a, b) = (a.max(s), b.min(e));
             if a >= b {
@@ -1505,9 +1505,6 @@ pub fn discarding_or_refusing(
                     Range::set(&r.missing, page, true);
                 }
             }
-            if first < last && remove {
-                events.push((ctx, [proto::EVENT_REMOVE, s + first * ps, s + last * ps, 0]));
-            }
         }
         // Every missing page of the range in reach is inaccessible again:
         // the ones just discarded and the ones made accessible above.
@@ -1519,6 +1516,20 @@ pub fn discarding_or_refusing(
             let _ = protect(a, l, libc::PROT_NONE);
             stage2(a, l, false);
         }
+    }
+    // One remove event a vma the discard reached, over the pieces it did,
+    // adjacent ones joined: a piece is a run of macOS map entries alike,
+    // which need not end where a vma does.
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    done.sort_unstable();
+    for (a, b) in done {
+        match spans.last_mut() {
+            Some(last) if last.1 >= a => last.1 = last.1.max(b),
+            _ => spans.push((a, b)),
+        }
+    }
+    for (a, b) in spans {
+        events.extend(vmas(a, b).into_iter().filter_map(|(ctx, x, y)| remove_event(ctx, x, y)));
     }
     if let Some((a, b)) = refused {
         events.extend(refused_event(a, b));
@@ -1540,20 +1551,60 @@ pub fn discarding_or_refusing(
 /// ask for remove events. Called with [`LOCK`] held. A refused piece is never
 /// in a huge page range (`MADV_FREE` refuses those before any event).
 fn refused_event(a: u64, b: u64) -> Option<(usize, [u64; 4])> {
-    let mut ctx = None;
-    let mut at = a;
-    while at < b {
-        let Some((r, page)) = find(at) else { break };
-        let c = r.ctx.load(Ordering::Acquire);
-        if !Range::test(&r.tracked, page) || ctx.is_some_and(|x| x != c) {
-            break;
-        }
-        ctx = Some(c);
-        at += r.page_size();
-    }
-    let ctx = ctx?;
+    let (ctx, x, y) = vmas(a, b).into_iter().next().filter(|&(_, x, _)| x == a)?;
+    remove_event(ctx, x, y)
+}
+
+/// The remove event of `[a, b)` for userfaultfd `ctx`, if it asked for remove
+/// events.
+fn remove_event(ctx: usize, a: u64, b: u64) -> Option<(usize, [u64; 4])> {
     (CTXS[ctx].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0)
-        .then_some((ctx, [proto::EVENT_REMOVE, a, at.min(b), 0]))
+        .then_some((ctx, [proto::EVENT_REMOVE, a, b, 0]))
+}
+
+/// The registered vmas Linux would have in `[a, b)`, in address order, as
+/// `(ctx, start, end)` over the whole pages there: runs of registered pages
+/// of one userfaultfd, one page size and one protection asked. A page in no
+/// registration (an unregister of part of a range splits the vma,
+/// fs/userfaultfd.c, v6.12, `userfaultfd_unregister` :1413), another
+/// userfaultfd's page or another protection asked (vmas of different
+/// contexts or flags do not merge, mm/vma.c `is_mergeable_vma` :24 and :28;
+/// an `mprotect` of part of a vma splits it, mm/mprotect.c `mprotect_fixup`
+/// :603) ends a run; adjacent ranges of one userfaultfd continue it, as
+/// Linux merges the vma of a register with its neighbour (mm/userfaultfd.c
+/// `userfaultfd_register_range`, its `vma_modify_flags_uffd` at :1860). A hugetlb vma and an ordinary one do
+/// not merge, so neither do runs of two page sizes. Called with [`LOCK`]
+/// held.
+fn vmas(a: u64, b: u64) -> Vec<(usize, u64, u64)> {
+    let mut ranges: Vec<&Range> = RANGES
+        .iter()
+        .filter(|r| {
+            let s = r.start.load(Ordering::Acquire);
+            s != 0 && s < b && a < r.end.load(Ordering::Acquire)
+        })
+        .collect();
+    ranges.sort_unstable_by_key(|r| r.start.load(Ordering::Acquire));
+    // (ctx, start, end, page size, protection asked)
+    let mut runs: Vec<(usize, u64, u64, u64, c_int)> = Vec::new();
+    for r in ranges {
+        let s = r.start.load(Ordering::Acquire);
+        let e = r.end.load(Ordering::Acquire);
+        let ps = r.page_size();
+        let ctx = r.ctx.load(Ordering::Acquire);
+        let (first, last) = ((a.max(s) - s).div_ceil(ps), (b.min(e) - s) / ps);
+        for page in first..last {
+            if !Range::test(&r.tracked, page) {
+                continue;
+            }
+            let at = s + page * ps;
+            let asked = r.asked(page);
+            match runs.last_mut() {
+                Some(run) if run.0 == ctx && run.2 == at && run.3 == ps && run.4 == asked => run.2 = at + ps,
+                _ => runs.push((ctx, at, at + ps, ps, asked)),
+            }
+        }
+    }
+    runs.into_iter().map(|(ctx, x, y, _, _)| (ctx, x, y)).collect()
 }
 
 /// Wraps a change of the mapping of `[start, start + len)` that ends what
@@ -3851,6 +3902,58 @@ mod tests {
         assert!(readable(ua) && read_full(ua, &mut rec), "no second event");
         assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem + 2 * ps, mem + 3 * ps]);
         assert_eq!(unregister(a, mem, 3 * ps), Ok(()));
+        close(&[ua]);
+    }
+
+    /// A discard posts one remove event a vma, as Linux's walk calls
+    /// `userfaultfd_remove` once for each vma it reaches (mm/madvise.c, v6.12,
+    /// `madvise_walk_vmas` :1233, its call of each vma at :1274, `madvise_dontneed_free` :894), and
+    /// none for a vma with no userfaultfd (fs/userfaultfd.c :777 to :779). The
+    /// vmas here are those Linux would have: a page unregistered from the
+    /// middle splits the vma (`userfaultfd_unregister` :1413), and so does a
+    /// protection asked of part of it (mm/mprotect.c `mprotect_fixup` :603);
+    /// two registers of adjacent memory by one userfaultfd leave one vma, as
+    /// the second merges with the first (mm/vma.c `is_mergeable_vma` :24 and
+    /// :28 hold).
+    #[test]
+    fn test_a_discard_posts_one_remove_event_a_vma() {
+        let (a, ua) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let ps = test_page_size();
+        let events = |mem: u64, len: u64| {
+            // SAFETY: the test's mapping.
+            let r = unsafe { crate::linux_items::madvise(mem as *mut _, len as usize, libc::MADV_DONTNEED) };
+            assert_eq!(r, 0);
+            let mut got = Vec::new();
+            let mut rec = [0u8; proto::RECORD];
+            while !nothing_to_read(ua) {
+                assert!(read_full(ua, &mut rec));
+                let w = words(&rec);
+                assert_eq!(w[0], proto::EVENT_REMOVE);
+                got.push((w[1] - mem, w[2] - mem));
+            }
+            got
+        };
+        // A page unregistered from the middle: two vmas registered, one not.
+        let mem = map(4);
+        register(a, mem, 4 * ps).unwrap();
+        assert_eq!(unregister(a, mem + ps, ps), Ok(()));
+        assert_eq!(events(mem, 4 * ps), [(0, ps), (2 * ps, 4 * ps)], "a page unregistered from the middle");
+        assert_eq!(unregister(a, mem, 4 * ps), Ok(()));
+        // Two registers of adjacent memory: one vma.
+        let mem = map(4);
+        register(a, mem, 2 * ps).unwrap();
+        register(a, mem + 2 * ps, 2 * ps).unwrap();
+        assert_eq!(events(mem, 4 * ps), [(0, 4 * ps)], "two registers of adjacent memory");
+        assert_eq!(unregister(a, mem, 4 * ps), Ok(()));
+        // A protection asked of the third page: three vmas.
+        let mem = map(4);
+        register(a, mem, 4 * ps).unwrap();
+        // SAFETY: the test's mapping.
+        let r = unsafe { crate::linux_items::mprotect((mem + 2 * ps) as *mut _, ps as usize, libc::PROT_READ) };
+        assert_eq!(r, 0);
+        let want = [(0, 2 * ps), (2 * ps, 3 * ps), (3 * ps, 4 * ps)];
+        assert_eq!(events(mem, 4 * ps), want, "a protection asked of the third page");
+        assert_eq!(unregister(a, mem, 4 * ps), Ok(()));
         close(&[ua]);
     }
 
