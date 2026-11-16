@@ -68,6 +68,13 @@ an entry of that file names a tracked tool and gives a reason (audit 5: the
 table lacked tools/clean.sh and tools/check-background-loops.py, which every
 test script and CI run). The tools' helpers in subdirectories (integration/,
 vhost-user-blk/) are not tools of their own.
+A CI run's id (an 11-digit number) has one home: docs/COMPATIBILITY.md's
+rows and docs/ROADMAP.md (and the design notes); another document names the
+row. tools/run-ids-outside-home.txt counts the ones other documents still
+have, per file, and the count may only go down: check-claims fails on a file
+with more than its count, on one not listed, and on one with fewer, whose
+count the same commit lowers (audit 5: bcdc22ce wrote one run's result in
+SECURITY, PORTING and COMPATIBILITY, and audit 4 one in three places).
 A claim that a build is the same is checked, not written from intent: in
 every document, and with --commits RANGE in the commit messages of a pushed
 range (CI's patches job), a sentence saying trees, binaries, builds,
@@ -135,6 +142,9 @@ SAME_BUILD = re.compile(
     r"|\b(?:Linux|macOS|Windows)(?:'s)?(?: and (?:Linux|macOS|Windows)(?:'s)?)? (?:builds? |binar(?:y|ies) )?"
     r"(?:are|is|stay|stays) unchanged\b", re.I)
 # A phrase quoted is named, not claimed ("The same units as upstream" is the check's result).
+RUN_ID = re.compile(r"(?<![\d.])[1-9]\d{10}(?!\d|\.\d)")
+RUN_HOME = {"docs/COMPATIBILITY.md", "docs/ROADMAP.md"}
+RUN_RATCHET = "tools/run-ids-outside-home.txt"
 QUOTED = re.compile(r'"[^"]*"|\u201c[^\u201d]*\u201d')
 NOT_WEAKER = re.compile(r"\bnot weaker\b", re.I)
 SOURCE_NAMED = re.compile(r"`test_\w+`|`(?:boot|jailer)-test[^`]*`|\btools/[\w/.-]+|\b[\w/.-]+\.(?:rs|py|sh|ps1|c|h)\b"
@@ -244,6 +254,30 @@ def check_same_claims(name, text):
         if m and not SOURCE_NAMED.search(flat):
             errors.append(f"error: {name}:{line_of} says \"not weaker\" without naming its evidence (a test, a tool, "
                           f"or the source it compares: file or file:line): {flat[:90]}...")
+    return errors
+
+
+def check_run_ids(texts, ratchet):
+    """texts: {document: text} outside the run facts' home. The ratchet's
+    counts may only go down."""
+    errors = []
+    allowed = {}
+    for n, line in enumerate(ratchet.splitlines(), 1):
+        if line.strip() and not line.startswith("#"):
+            path, _, count = line.rpartition(" ")
+            if not path or not count.isdigit():
+                errors.append(f"error: {RUN_RATCHET}:{n}: not \"<document> <count>\"")
+                continue
+            allowed[path] = int(count)
+    for name in sorted(set(texts) | set(allowed)):
+        have = len(RUN_ID.findall(texts.get(name, "")))
+        want = allowed.get(name, 0)
+        if have > want:
+            errors.append(f"error: {name} has {have} CI run ids, {RUN_RATCHET} allows {want}: a run's result lives in "
+                          f"docs/COMPATIBILITY.md's row (or ROADMAP), and this document names the row")
+        elif have < want:
+            errors.append(f"error: {name} has {have} CI run ids, fewer than {RUN_RATCHET}'s {want}: lower its count "
+                          f"to {have} in the same commit (it may only go down)")
     return errors
 
 
@@ -528,6 +562,16 @@ def selftest():
                                       "upstream\" is this check's result. upstream's suites, unchanged but for one "
                                       "patch, against the Windows build\n")
     assert errors == [], errors
+    # Audit 5's finding (bcdc22ce): one run's result written in SECURITY and
+    # PORTING besides COMPATIBILITY's row. A new copy fails, as does a count
+    # that dropped without the file lowered and a document not listed.
+    ratchet = "# counts\nSECURITY.md 2\ndocs/PORTING.md 1\n"
+    errors = check_run_ids({"SECURITY.md": "runs 43784960688 and 43790310601, and 43688550565",
+                            "docs/PORTING.md": "no run here, 1073741824 bytes", "README.md": "run 43497862443"}, ratchet)
+    assert [e.split(" has ")[0] for e in errors] == ["error: README.md", "error: SECURITY.md", "error: docs/PORTING.md"], \
+        errors
+    assert check_run_ids({"SECURITY.md": "runs 43784960688 and 43790310601", "docs/PORTING.md": "run 43790310601"},
+                         ratchet) == []
     print("check-claims: selftest ok")
 
 
@@ -602,6 +646,10 @@ def main():
             for line in check_same_claims(name, body):
                 print(line)
                 errors += 1
+    outside = {d: (ROOT / d).read_text() for d in documents if d not in RUN_HOME}
+    for line in check_run_ids(outside, (ROOT / RUN_RATCHET).read_text() if (ROOT / RUN_RATCHET).is_file() else ""):
+        print(line)
+        errors += 1
     for line in check_tools_table(tracked, (ROOT / "docs/README.md").read_text(),
                                   (ROOT / UNLISTED).read_text() if (ROOT / UNLISTED).is_file() else ""):
         print(line)

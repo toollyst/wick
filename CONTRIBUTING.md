@@ -134,7 +134,10 @@ and the main checkout use; they never set the variable.
   `tools/check-unit-graph.py`, and one saying "not weaker" names its test,
   tool or source; check-claims holds the documents to it, and with
   `--commits` the pushed commits' messages (CI's patches job: a red run is
-  corrected by the next commit). A number a document derives from the
+  corrected by the next commit). A CI run's result is written once, in
+  docs/COMPATIBILITY.md's row (or ROADMAP), and other documents name the
+  row: `tools/run-ids-outside-home.txt` counts the run ids each other
+  document still has, and a count may only go down. A number a document derives from the
   tree is checked too: the patch and file counts by `tools/patches.sh check`,
   COMPATIBILITY's counts by `tools/compat-counts.py`, README's line count and
   PORTING row 1's sandbox counts by `tools/check-derived.py` (a new derived
