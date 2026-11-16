@@ -1604,6 +1604,37 @@ mod tests {
         }
     }
 
+    /// The variable that tells a test it runs in a process of its own.
+    const ALONE: &str = "WICK_LINUX_ITEMS_TEST_ALONE";
+
+    /// Runs test `name` again in a process of its own (this binary, that
+    /// test only) and checks that it passed there; true in that process,
+    /// which goes on with the test.
+    fn alone(name: &str) -> bool {
+        if std::env::var_os(ALONE).is_some() {
+            return true;
+        }
+        let child = {
+            let _spawning = crate::timerfd::spawning();
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([name, "--exact", "--test-threads=1", "--nocapture"])
+                .env(ALONE, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let out = child.wait_with_output().unwrap();
+        let text = std::format!(
+            "{:?}\n{}{}",
+            out.status,
+            std::string::String::from_utf8_lossy(&out.stdout),
+            std::string::String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success() && text.contains("1 passed"), "{name} in a process of its own: {text}");
+        false
+    }
+
     #[test]
     fn test_ssbd() {
         if !ssbd::supported() {
@@ -1667,7 +1698,16 @@ mod tests {
         assert!(!std::thread::spawn(ssbd::bypass_allowed).join().unwrap());
         // And a process forked afterwards (Firecracker's API process), as a
         // child task inherits it on Linux: in its first thread and in one
-        // it starts.
+        // it starts. The fork is made in a process of its own, this test
+        // only: a thread the fork does not copy can hold a lock the child's
+        // new thread needs (std's stack overflow guard's list of threads,
+        // locked by every thread start in `set_current_info`), and the child
+        // then waits for good. Measured: among the crate's other tests the
+        // child waited in `_pthread_mutex_firstfit_lock_wait` under
+        // `set_current_info` for 9 minutes, until it was killed.
+        if !alone("linux_items::tests::test_ssbd") {
+            return;
+        }
         // SAFETY: the child reads a register, starts one thread and exits.
         unsafe {
             let pid = libc::fork();
