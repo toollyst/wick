@@ -195,6 +195,38 @@ Every planned mechanism above has been measured on its host with a probe
 ([`tools/windows/winprobe.c`](tools/windows/winprobe.c) on Windows); the [roadmap](docs/ROADMAP.md), milestone M5,
 has the per-control details and results.
 
+## Fixed defects
+
+- **Windows: a thread pool could keep a jailed process running after one of its threads used up its stack**
+  (shipped since the jailer's job got `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`, 5579ea53; fixed in 50021416 for
+  a stack used up, and for every other unhandled exception by the last unhandled-exception filter that followed it).
+  In such a job Windows Error Reporting is not called, and an unhandled exception's end is left to whoever called the
+  unhandled-exception filters. A pool thread's stack overflow, which the stack filter passed on, was taken by its
+  pool, which went on running callbacks, and the process exited 0: measured in the libc crate's test process on
+  Windows Server 2022 20348 and 2025 26100 (`test_a_stack_overflow_at_the_reserves_end_is_still_one`, its pool child
+  in a job of the jailer's limits). An access violation, an illegal instruction
+  and a software exception, continuable or not, were not taken so: each ended the process with its code on every
+  kind of thread, pool and job included (`test_an_unhandled_exception_ends_the_process_with_its_code`, run before its
+  fix). Now the stack filter, and below every filter the last one (`windows_mm::last_filter`, installed before `main`
+  in all three binaries), write a line naming the exception and, in such a job, end the process with its code; out
+  of such a job Windows Error Reporting ends it, with its dump, as before. The last filter keeps the filter it
+  replaces, the Visual C++ runtime's, and calls it after its line, so an unhandled C++ exception still ends as the
+  runtime ends it (`terminate()`, exit 0xC0000409), jailed or not
+  (`test_a_cxx_exception_nothing_catches_ends_through_the_runtimes_filter`). Per process kind:
+  - the jailer: not in such a job, so the defect did not reach it; measured with an access violation and a
+    breakpoint injected into a running jailer.exe (a remote thread), two runs each, debug and release builds, on
+    Windows Server 2022 20348: the line, then Windows Error Reporting ended it with the exception's code (0xC0000005,
+    0x80000003), and its jailed child ended with it. In both builds the last filter's `.CRT$XCU` initializer is in
+    the image's initializer table after the runtime's `pre_cpp_initialization`, and the running jailer's last filter
+    holds the runtime's `__scrt_unhandled_exception_filter` as the filter it replaced (cdb). It has pool threads at
+    rest (three `ntdll!TppWorkerThread`, cdb).
+  - the VMM (firecracker.exe in the jailer's job): its pool threads run polling's wait callbacks
+    (`RegisterWaitForSingleObject`, crates/compat/polling). Before the fix its stack filter passed an overflow on to
+    vmm-sys-util's filter, which runs the SIGSEGV handler Firecracker registers, on the overflowed stack; whether a
+    jailed VMM kept running is not measured. The binary-level measurement is not run: needs WHP's DLLs (the PC);
+    the libc and vmm-sys-util code it runs is the tests' above.
+  - the API process: the same polling callbacks on pool threads. Not run: needs WHP's DLLs (the PC).
+
 ## Not at parity yet
 
 Until these are done, **do not run untrusted multi-tenant workloads on macOS or Windows hosts.** On Linux, wick is
@@ -412,10 +444,10 @@ upstream Firecracker and its jailer.
   reclaim first (`ENOMEM`, or the process ends: a thread whose stack must grow ends it with 137 and a line, its
   refused commit told from a stack used up by the thread's TEB in an unhandled-exception filter, which bypasses
   Windows Error Reporting on purpose, as an end at the limit is not a crash; a stack used up still reaches it,
-  `test_a_stack_that_must_grow_at_the_limit_ends_with_137`; a stack used up ends the VMM with 0xC00000FD and a
-  line from the same filter, on every kind of thread, in a job of the jailer's limits too, where a thread pool took
-  the overflow and went on when the filter passed it on: `test_a_stack_overflow_at_the_reserves_end_is_still_one`,
-  on Windows Server 2022 20348 and 2025 26100),
+  `test_a_stack_that_must_grow_at_the_limit_ends_with_137`; a stack used up gets a line from the same filter and
+  ends with 0xC00000FD on every kind of thread, the filter ending it in a job of the jailer's limits and Windows
+  Error Reporting out of one: `test_a_stack_overflow_at_the_reserves_end_is_still_one`, on Windows Server 2022 20348
+  and 2025 26100; see Fixed defects below),
   not done yet for the reclaim; the limit holds either way. A move holds its live
   pages in two sections for its
   time; a 2 MiB move budget of private `PAGE_NOACCESS` commit, made at the first registration, is the cover the

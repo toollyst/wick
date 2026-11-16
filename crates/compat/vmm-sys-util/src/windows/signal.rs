@@ -979,7 +979,6 @@ mod tests {
     /// callback is queued once the first is at the fault, so it runs only
     /// if that thread went back to its pool.
     #[test]
-    #[ignore = "fails until the last unhandled-exception filter names the exception"]
     fn test_a_pool_threads_fault_goes_to_its_handler_or_ends_the_process() {
         let mut wrong = Vec::new();
         for handler in ["segv", "ill"] {

@@ -349,7 +349,14 @@ semantics on Win32. The details are in the comments of each
   QueueUserAPC2). Firecracker's vCPU kick does not depend on it: the WHP
   backend's `set_kvm_immediate_exit` cancels a run itself. Faults are caught by
   `SetUnhandledExceptionFilter` and reported with Linux `si_code` and
-  `si_addr`. Console control events are `SIGINT`, `SIGQUIT` and `SIGHUP`.
+  `si_addr`. Below every filter is a last one, installed before `main` in
+  the VMM, its API process and the jailer (`windows_mm::last_filter`): it
+  writes a line naming an exception nothing took, calls the filter it
+  replaced (the Visual C++ runtime's, installed by its startup before the
+  C++ initializers, which ends an unhandled C++ exception with
+  `terminate()`) and, in a job that dies on unhandled exceptions (the
+  jailer's; the process's immediate job is asked), ends the process with its
+  code; out of one Windows Error Reporting ends it, with its dump. Console control events are `SIGINT`, `SIGQUIT` and `SIGHUP`.
 - **mmap = placeholder virtual memory (Windows 10 1803+).** One mapping is one
   Windows allocation, tracked in a table. So that partial `munmap` and
   `MAP_FIXED` behave as on Linux, reservations are placeholders

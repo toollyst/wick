@@ -3497,18 +3497,20 @@ mod tests {
 
     /// A stack overflow at the reserve's end is still one, with the stack
     /// filter in place: the filter says so (its line, with how much of the
-    /// reserve was left, the thread and its guarantee) and ends the process
-    /// with `STATUS_STACK_OVERFLOW` (0xC00000FD) itself, on each kind of
-    /// thread ([`Kind`]), with room left; each child alone (the error mode
-    /// it inherits) and in a job as the jailer makes Firecracker's
+    /// reserve was left, the thread and its guarantee) and the process ends
+    /// with `STATUS_STACK_OVERFLOW` (0xC00000FD), on each kind of thread
+    /// ([`Kind`]), with room left; each child alone (the error mode it
+    /// inherits), where the filter passes it on and Windows Error Reporting
+    /// ends it, and in a job as the jailer makes Firecracker's
     /// (`JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`, which Learn says
     /// forces `SEM_NOGPFAULTERRORBOX` on each process of the job: Windows
     /// Error Reporting is not called, and the unhandled-exception filter's
-    /// caller handles the exception). There a pool thread's overflow, passed
-    /// on, was taken by its pool, which went on running callbacks, the
-    /// process with it (exit 0, on Windows Server 2022 20348 and 2025 26100
-    /// alike), where a Rust or `CreateThread` thread's ended the process
-    /// with 0xC00000FD. Each child waits for its thread by the thread's own
+    /// caller handles the exception), where the filter ends it itself and
+    /// says so in its line. There a pool thread's overflow, passed on, was
+    /// taken by its pool, which went on running callbacks, the process with
+    /// it (exit 0, on Windows Server 2022 20348 and 2025 26100 alike), where
+    /// a Rust or `CreateThread` thread's ended the process with 0xC00000FD.
+    /// Each child waits for its thread by the thread's own
     /// structure, with no timeout ([`stack_overflow`]): a child whose
     /// process went on says how, and ends 0.
     ///
@@ -3527,7 +3529,9 @@ mod tests {
                 let (code, text, ended) = run_child_watched(child, &[], jailed);
                 let how = if jailed { "in a job as the jailer's" } else { "alone" };
                 std::eprintln!("STACKEND {child} {how}: {code:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
-                if !text.contains("wick: a thread's stack overflowed at its reserve's end") || code != Some(0xC000_00FD_u32.cast_signed()) {
+                let said = text.contains("wick: a thread's stack overflowed at its reserve's end")
+                    && (!jailed || text.contains("in a job that dies on unhandled exceptions, the process ends with STATUS_STACK_OVERFLOW"));
+                if !said || code != Some(0xC000_00FD_u32.cast_signed()) {
                     not_ended.push(std::format!("{child} {how} ({code:?}): {text}"));
                 }
             }
@@ -3580,6 +3584,16 @@ mod tests {
             }
             // SAFETY: our handle.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+            use windows_sys::Win32::System::JobObjects::{
+                JOBOBJECT_BASIC_LIMIT_INFORMATION, JobObjectBasicLimitInformation, QueryInformationJobObject,
+            };
+            // SAFETY: plain data.
+            let mut l: JOBOBJECT_BASIC_LIMIT_INFORMATION = unsafe { core::mem::zeroed() };
+            // SAFETY: this process's job (Learn, QueryInformationJobObject:
+            // with no handle, "the immediate job of the calling process").
+            #[allow(clippy::cast_possible_truncation)]
+            let ok = unsafe { QueryInformationJobObject(ptr::null_mut(), JobObjectBasicLimitInformation, (&raw mut l).cast(), core::mem::size_of_val(&l) as u32, ptr::null_mut()) };
+            std::println!("the child's immediate job: query {ok}, limit flags {:#x}", l.LimitFlags);
         }
         // SAFETY: plain call.
         std::println!("the child's error mode: {:#x}", unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode() });
@@ -3692,7 +3706,6 @@ mod tests {
     /// action for a fault signal no handler is registered for ends a
     /// process with a core. No time is asserted.
     #[test]
-    #[ignore = "fails until the last unhandled-exception filter names the exception"]
     fn test_an_unhandled_exception_ends_the_process_with_its_code() {
         let mut not_ended = std::vec::Vec::new();
         for (fault, code) in UNHANDLED {
@@ -3705,7 +3718,9 @@ mod tests {
                         let (got, text, ended) = run_child_watched(child, &[("WICK_TEST_FAULT", fault), ("WICK_TEST_LAZY", lazy)], jailed);
                         let how = if jailed { "in a job as the jailer's" } else { "alone" };
                         std::eprintln!("UNHANDLED {child} {fault} lazy {lazy} {how}: {got:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
-                        if !text.contains(&std::format!("wick: an unhandled exception {code:#x}")) || got != Some(code.cast_signed()) {
+                        let said = text.contains(&std::format!("wick: an unhandled exception {code:#x}"))
+                            && (!jailed || text.contains("in a job that dies on unhandled exceptions, the process ends with its code"));
+                        if !said || got != Some(code.cast_signed()) {
                             not_ended.push(std::format!("{child} {fault} lazy {lazy} {how} ({got:?}): {text}"));
                         }
                     }
@@ -3713,6 +3728,94 @@ mod tests {
             }
         }
         assert!(not_ended.is_empty(), "not ended by the last filter with its line and the exception's code: {not_ended:#?}");
+    }
+
+    /// The last filter keeps the filter it replaced: in this executable,
+    /// which the Visual C++ runtime starts, the runtime's own
+    /// (`__scrt_unhandled_exception_filter`, installed by its
+    /// `pre_cpp_initialization` in `.CRT$XCAA`, before the `.CRT$XCU`
+    /// initializer that installs the last filter). LASTFILTER: where it is,
+    /// as this executable plus an offset (named with cdb and the pdb).
+    #[test]
+    fn test_the_last_filter_keeps_the_filter_it_replaced() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let replaced = crate::windows_mm::replaced_at_start();
+        let base_of = |a: usize| {
+            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+            // SAFETY: as above.
+            assert_ne!(unsafe { VirtualQuery(a as *const c_void, &mut mbi, core::mem::size_of_val(&mbi)) }, 0);
+            mbi.AllocationBase as usize
+        };
+        assert_ne!(replaced, 0, "the last filter replaced no filter");
+        let exe = base_of(test_the_last_filter_keeps_the_filter_it_replaced as *const () as usize);
+        std::eprintln!(
+            "LASTFILTER the filter the last one replaced: {replaced:#x}, {}+{:#x} (this executable at {exe:#x})",
+            if base_of(replaced) == exe { "this executable" } else { "another module" },
+            replaced - base_of(replaced)
+        );
+        assert_eq!(base_of(replaced), exe, "the filter replaced is not this executable's");
+    }
+
+    /// An MSVC C++ exception nothing catches (`unhandled_fault`'s "cxx")
+    /// reaches the last filter, which writes its line and calls the filter
+    /// it replaced, the C runtime's, which ends the process with
+    /// `terminate()`: with no terminate handler set, `abort()`
+    /// (ucrt 10.0.26100.0 misc/terminate.cpp:38-58), which with no SIGABRT
+    /// handler ends it by `__fastfail(FAST_FAIL_FATAL_APP_EXIT)`
+    /// (startup/abort.cpp:71-77), exit 0xC0000409; on each kind of thread,
+    /// alone and in a job of the jailer's limits (the last filter's own end
+    /// in such a job is not reached). CXXEND: each child's end.
+    #[test]
+    fn test_a_cxx_exception_nothing_catches_ends_through_the_runtimes_filter() {
+        let mut wrong = std::vec::Vec::new();
+        for child in ["unhandled_rust_child", "unhandled_createthread_child", "unhandled_pool_child"] {
+            for jailed in [false, true] {
+                let (got, text, ended) = run_child_watched(child, &[("WICK_TEST_FAULT", "cxx"), ("WICK_TEST_LAZY", "1")], jailed);
+                let how = if jailed { "in a job as the jailer's" } else { "alone" };
+                std::eprintln!("CXXEND {child} {how}: {got:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
+                let said = text.contains("wick: an unhandled exception 0xe06d7363")
+                    && text.contains("a C++ exception, which the filter this one replaced (the C runtime's) ends with terminate()");
+                if !said || got != Some(0xC000_0409_u32.cast_signed()) {
+                    wrong.push(std::format!("{child} {how} ({got:?}): {text}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "not ended by the runtime's filter after the last filter's line: {wrong:#?}");
+    }
+
+    /// A process in a job without `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`
+    /// nested in one with it (an operator's job around an unjailed VMM)
+    /// ends as one in no such job: the outer job's limit does not reach it.
+    /// Its immediate job's query (what the filters ask) shows no flag;
+    /// a pool thread's stack overflow and an access violation, on a pool
+    /// thread and a `CreateThread` thread, end the process with their code
+    /// through Windows Error Reporting, as with the inner job alone, where
+    /// in a job with the flag the overflow passed on was taken by the pool
+    /// ([`test_a_stack_overflow_at_the_reserves_end_is_still_one`]).
+    /// NESTJOB: each child's end, nested and with the inner job alone.
+    #[test]
+    fn test_a_job_nested_in_one_that_dies_on_unhandled_exceptions_ends_by_its_own_limits() {
+        use windows_sys::Win32::System::JobObjects::{JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE};
+        let jobs = [JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE];
+        let mut wrong = std::vec::Vec::new();
+        for (child, env) in [
+            ("stack_overflow_pool_child", &[][..]),
+            ("unhandled_pool_child", &[("WICK_TEST_FAULT", "av"), ("WICK_TEST_LAZY", "1")][..]),
+            ("unhandled_createthread_child", &[("WICK_TEST_FAULT", "av"), ("WICK_TEST_LAZY", "1")][..]),
+        ] {
+            let code: u32 = if child.starts_with("stack") { 0xC000_00FD } else { 0xC000_0005 };
+            for nested in [false, true] {
+                let (got, text, ended) = run_child_in_jobs(child, env, if nested { &jobs[..] } else { &jobs[1..] });
+                let how = if nested { "inner job (no flag) in an outer one with the flag" } else { "one job, no flag" };
+                std::eprintln!("NESTJOB {child} {how}: {got:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
+                let flags = std::format!("the child's immediate job: query 1, limit flags {JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:#x}");
+                if !text.contains(&flags) || !text.contains("Windows Error Reporting ends the process") || got != Some(code.cast_signed()) {
+                    wrong.push(std::format!("{child} {how} ({got:?}): {text}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "not ended as in a job without the flag: {wrong:#?}");
     }
 
     fn unhandled_fault(kind: Kind) {
@@ -3727,6 +3830,15 @@ mod tests {
             "raise" => unsafe { windows_sys::Win32::System::Diagnostics::Debug::RaiseException(UNHANDLED[2].1, 1 /* EXCEPTION_NONCONTINUABLE */, 0, ptr::null()) },
             // SAFETY: as above.
             "raise-continuable" => unsafe { windows_sys::Win32::System::Diagnostics::Debug::RaiseException(UNHANDLED[3].1, 0, 0, ptr::null()) },
+            // An MSVC C++ exception as the runtime's filter recognises it
+            // (ehdata.h:568, `PER_IS_MSVC_PURE_OR_NATIVE_EH`: the code, four
+            // parameters, EH_MAGIC_NUMBER1), with no object and no
+            // `ThrowInfo` (what `throw;` raises with no current exception).
+            "cxx" => {
+                let parameters = [0x1993_0520usize, 0, 0, 0];
+                // SAFETY: four parameters, as passed.
+                unsafe { windows_sys::Win32::System::Diagnostics::Debug::RaiseException(0xE06D_7363, 1, 4, parameters.as_ptr()) }
+            }
             other => panic!("no fault {other}"),
         }
     }
@@ -3797,42 +3909,55 @@ mod tests {
     /// JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`), named to the child in
     /// WICK_TEST_JOB.
     fn run_child_watched(child: &str, env: &[(&str, &str)], jailed: bool) -> (Option<i32>, std::string::String, std::time::Duration) {
+        use windows_sys::Win32::System::JobObjects::{JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE};
+        let jobs: &[u32] = if jailed { &[JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION] } else { &[] };
+        run_child_in_jobs(child, env, jobs)
+    }
+
+    /// [`run_child_watched`] in nested jobs, each with the limit flags
+    /// given, outermost first: the child is assigned to each in that order
+    /// (Learn, "Nested Jobs": a process already in a job assigned to
+    /// another makes the second a child job of the first), and is named
+    /// the innermost (WICK_TEST_JOB).
+    fn run_child_in_jobs(child: &str, env: &[(&str, &str)], jobs: &[u32]) -> (Option<i32>, std::string::String, std::time::Duration) {
         use std::io::Read;
         use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
         };
         static JOBS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let name = std::format!("{}::{child}", module_path!().split_once("::").unwrap().1);
-        let job_name = std::format!(
-            "Local\\wick-test-{}-{}",
-            std::process::id(),
-            JOBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let mut job = ptr::null_mut();
-        if jailed {
+        let mut made = std::vec::Vec::new();
+        let mut job_name = std::string::String::new();
+        for &flags in jobs {
+            job_name = std::format!(
+                "Local\\wick-test-{}-{}",
+                std::process::id(),
+                JOBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
             let wide: std::vec::Vec<u16> = job_name.encode_utf16().chain([0]).collect();
             // SAFETY: a new job of this name.
-            job = unsafe { CreateJobObjectW(ptr::null(), wide.as_ptr()) };
+            let job = unsafe { CreateJobObjectW(ptr::null(), wide.as_ptr()) };
             assert!(!job.is_null(), "{}", io::Error::last_os_error());
             // SAFETY: plain data.
             let mut l: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-            l.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            l.BasicLimitInformation.LimitFlags = flags;
             // SAFETY: a structure of the size passed.
             unsafe {
                 #[allow(clippy::cast_possible_truncation)]
                 let size = std::mem::size_of_val(&l) as u32;
                 assert_ne!(SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const l).cast(), size), 0);
             }
+            made.push(job);
         }
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command.args(["--exact", name.as_str(), "--ignored", "--nocapture"]).envs(env.iter().copied());
-        if jailed {
+        if !jobs.is_empty() {
             command.env("WICK_TEST_JOB", &job_name);
         }
         let start = std::time::Instant::now();
         let mut process = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
-        if jailed {
+        for &job in &made {
             use std::os::windows::io::AsRawHandle;
             // SAFETY: our job; the child's handle.
             assert_ne!(unsafe { AssignProcessToJobObject(job, process.as_raw_handle()) }, 0, "{}", io::Error::last_os_error());
@@ -3855,7 +3980,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         let ended = start.elapsed();
-        if !job.is_null() {
+        for job in made.into_iter().rev() {
             // SAFETY: our job handle.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
         }
