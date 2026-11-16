@@ -1247,6 +1247,8 @@ fn serve_request(ctx: usize, fd: c_int) -> bool {
 /// The serving thread of userfaultfd `ctx`: accepts request channels sent on
 /// the kernel end and serves them. Ends when every user descriptor is closed.
 fn serve(ctx: usize, kernel: c_int) {
+    #[cfg(test)]
+    tests::KIND.with(|k| k.set(tests::SERVE));
     let mut clients: Vec<c_int> = Vec::new();
     loop {
         let mut fds: Vec<WSAPOLLFD> = core::iter::once(kernel)
@@ -1481,6 +1483,8 @@ unsafe extern "system" fn reclaimer(_: *mut c_void) -> u32 {
     use windows_sys::Win32::System::Threading::{INFINITE, SetEvent, WaitForSingleObject};
     #[cfg(test)]
     paint_the_stack();
+    #[cfg(test)]
+    tests::KIND.with(|k| k.set(tests::RECLAIMER));
     // The asker holds the lock: a reclaim a fault here would start takes
     // nothing ([`reclaim_at_touch`]).
     HOLDS_LOCK.set(true);
@@ -4242,21 +4246,122 @@ mod tests {
 
     /// The test binary's allocator: the system's, counting the allocations
     /// a thread makes while [`COUNTING_ALLOCATIONS`] is set on it
-    /// (`test_a_reclaim_allocates_nothing`).
+    /// (`test_a_reclaim_allocates_nothing`), and, while [`COUNTING_KINDS`]
+    /// is set, those of every thread marked with a kind ([`KIND`]: the
+    /// userfaultfd's serve thread, the reclaimer, a test's own thread), with
+    /// where the first few were made ([`KindCount`]).
     struct Counting;
 
     std::thread_local! {
         pub(super) static COUNTING_ALLOCATIONS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
         pub(super) static ALLOCATIONS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+        /// This thread's kind for [`COUNTING_KINDS`]: 0 none, else an index
+        /// of [`KINDS`] ([`SERVE`], [`RECLAIMER`], [`CALLER`]).
+        pub(super) static KIND: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
     }
 
-    // SAFETY: the system allocator's calls, as they are; the count is a
-    // thread-local cell, which allocates nothing.
+    /// The userfaultfd's serve thread (marked in `serve`).
+    pub(super) const SERVE: u8 = 1;
+    /// The reclaim's thread (marked in `reclaimer`).
+    pub(super) const RECLAIMER: u8 = 2;
+    /// A test's own thread, as the VMM's thread that fills or touches.
+    pub(super) const CALLER: u8 = 3;
+    const KIND_NAMES: [&str; 4] = ["", "the serve thread", "the reclaimer", "the caller"];
+    /// The return addresses kept of each kind's first allocations.
+    const SITES: usize = 8;
+    const FRAMES: usize = 20;
+
+    /// What a kind's thread allocated while [`COUNTING_KINDS`] was set.
+    struct KindCount {
+        allocations: AtomicU64,
+        bytes: AtomicU64,
+        /// Return addresses of its first [`SITES`] allocations, made in the
+        /// allocator without allocating (`RtlCaptureStackBackTrace`).
+        sites: [[AtomicUsize; FRAMES]; SITES],
+    }
+
+    static COUNTING_KINDS: AtomicBool = AtomicBool::new(false);
+    static KINDS: [KindCount; 4] = [const {
+        KindCount { allocations: AtomicU64::new(0), bytes: AtomicU64::new(0), sites: [const { [const { AtomicUsize::new(0) }; FRAMES] }; SITES] }
+    }; 4];
+
+    /// Counts an allocation of `size` bytes for this thread's kind.
+    fn count_for_the_kind(size: usize) {
+        if !COUNTING_KINDS.load(Ordering::Relaxed) {
+            return;
+        }
+        let kind = usize::from(KIND.with(core::cell::Cell::get));
+        if kind == 0 {
+            return;
+        }
+        let k = &KINDS[kind];
+        let n = k.allocations.fetch_add(1, Ordering::SeqCst);
+        k.bytes.fetch_add(size as u64, Ordering::SeqCst);
+        if let Some(site) = k.sites.get(usize::try_from(n).unwrap_or(SITES)) {
+            let mut frames = [ptr::null_mut::<c_void>(); FRAMES];
+            // SAFETY: room for FRAMES addresses.
+            #[allow(clippy::cast_possible_truncation)]
+            let got = unsafe { windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(1, FRAMES as u32, frames.as_mut_ptr(), ptr::null_mut()) };
+            for (slot, f) in site.iter().zip(&frames[..usize::from(got)]) {
+                slot.store(*f as usize, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Starts counting the allocations of every marked thread, from zero.
+    fn count_the_kinds() {
+        for k in &KINDS {
+            k.allocations.store(0, Ordering::SeqCst);
+            k.bytes.store(0, Ordering::SeqCst);
+            for site in &k.sites {
+                for f in site {
+                    f.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+        COUNTING_KINDS.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops counting: each kind's allocations and bytes.
+    fn counted_kinds() -> [(u64, u64); 4] {
+        COUNTING_KINDS.store(false, Ordering::SeqCst);
+        core::array::from_fn(|i| (KINDS[i].allocations.load(Ordering::SeqCst), KINDS[i].bytes.load(Ordering::SeqCst)))
+    }
+
+    /// ALLOCS: what `what` allocated on each kind's thread, and the return
+    /// addresses of the first allocations, as offsets in this executable
+    /// for a debugger to name (`cdb -z <exe>`, `ln`). Without allocating.
+    fn say_the_allocations(what: &str, counts: &[(u64, u64); 4]) {
+        unsafe extern "C" {
+            static __ImageBase: u8;
+        }
+        let base = core::ptr::addr_of!(__ImageBase) as usize;
+        for (kind, &(n, bytes)) in counts.iter().enumerate().skip(1) {
+            crate::windows_mm::say_at_the_limit(format_args!("ALLOCS {what}: {} {n} allocations, {bytes} bytes", KIND_NAMES[kind]));
+            for (i, site) in KINDS[kind].sites.iter().enumerate().take(usize::try_from(n).unwrap_or(SITES)) {
+                for (j, f) in site.iter().enumerate() {
+                    let a = f.load(Ordering::Relaxed);
+                    if a == 0 {
+                        break;
+                    }
+                    if a >= base && a - base < 64 << 20 {
+                        crate::windows_mm::say_at_the_limit(format_args!("ALLOCSITE {} {i} {j} image+{:#x}", KIND_NAMES[kind], a - base));
+                    } else {
+                        crate::windows_mm::say_at_the_limit(format_args!("ALLOCSITE {} {i} {j} {a:#x}", KIND_NAMES[kind]));
+                    }
+                }
+            }
+        }
+    }
+
+    // SAFETY: the system allocator's calls, as they are; the counts are
+    // thread-local cells and atomics, which allocate nothing.
     unsafe impl std::alloc::GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
             if COUNTING_ALLOCATIONS.with(core::cell::Cell::get) {
                 ALLOCATIONS.with(|a| a.set(a.get() + 1));
             }
+            count_for_the_kind(layout.size());
             // SAFETY: the caller's contract.
             unsafe { std::alloc::System.alloc(layout) }
         }
@@ -4268,6 +4373,7 @@ mod tests {
             if COUNTING_ALLOCATIONS.with(core::cell::Cell::get) {
                 ALLOCATIONS.with(|a| a.set(a.get() + 1));
             }
+            count_for_the_kind(new_size);
             // SAFETY: the caller's contract.
             unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
         }
@@ -4345,6 +4451,130 @@ mod tests {
         assert_eq!(r.chunks, 1, "the fill's reclaim moved {r:?}");
         std::println!("allocations: touch {touch}, fill {fill}");
         assert_eq!((touch, fill), (0, 0));
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// The userfaultfd released at the job's limit allocates nothing: its
+    /// serve thread, from the close of the user end through `destroy`
+    /// (the missing pages made ordinary memory: lazy where never filled,
+    /// zeroed at their next access where discarded, the alias given up),
+    /// runs where a heap that must grow is refused, and where ntdll's heap
+    /// code took a stack page the job refused (STACK137FRAMES: `destroy`
+    /// growing a list of the missing runs, `RtlReAllocateHeap`); Linux's
+    /// release of a userfaultfd needs no memory: it clears each vma's flags
+    /// in place, a merge with the vma before (which may allocate) only tried
+    /// (v6.1 fs/userfaultfd.c `userfaultfd_release`, 885-899). In a job of
+    /// its own, with no room left ([`no_room_left`]).
+    #[test]
+    #[ignore = "until the next commit"]
+    fn test_a_userfaultfd_released_at_the_limit_allocates_nothing() {
+        let (code, text) = run_child("release_allocations_child", Some(96 << 20));
+        assert!(text.contains("room left before the reclaim: 0 KiB"), "{text}");
+        assert!(text.contains("ALLOCS the release at the limit: the serve thread 0 allocations"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_userfaultfd_released_at_the_limit_allocates_nothing and test_what_the_limit_paths_allocate_on_record in a job of their own"]
+    fn release_allocations_child() {
+        let (ctx, user, _mem, _done) = fill_to_the_limit_and_discard_in_part();
+        let held = no_room_left();
+        count_the_kinds();
+        // SAFETY: closes the user end: the serve thread releases the
+        // userfaultfd and ends.
+        unsafe { ws::closesocket(sock(user)) };
+        // `destroy` gives up the kernel end last. A bound for a failure only.
+        let t = std::time::Instant::now();
+        while CTXS[ctx].fd.load(Ordering::SeqCst) >= 0 {
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "the userfaultfd was not released");
+            std::thread::yield_now();
+        }
+        let counts = counted_kinds();
+        say_the_allocations("the release at the limit", &counts);
+        drop(held);
+    }
+
+    /// ALLOCS, on record: what the paths that run after the job's limit
+    /// refused allocate, on each thread they run on: a fill refused and
+    /// reclaimed for, then refused with `ENOMEM` (the caller's `copy` and
+    /// the reclaimer); a first touch of lazy memory refused and reclaimed
+    /// for (the touching thread, in the exception handler, and the
+    /// reclaimer); the userfaultfd's release (its serve thread). With the
+    /// first allocations' return addresses (ALLOCSITE), for a debugger to
+    /// name. Each in a job of its own with no room left; a child that ends
+    /// at the limit (a heap or a stack refused) is on record with its end.
+    #[test]
+    #[ignore = "a record: ALLOCS"]
+    fn test_what_the_limit_paths_allocate_on_record() {
+        for child in ["fill_allocations_child", "touch_allocations_child", "release_allocations_child"] {
+            let (code, text) = run_child(child, Some(96 << 20));
+            // Every line of the child's, its end included: a path that
+            // allocates at the limit may end the process there.
+            for line in text.lines() {
+                std::println!("{child}: {line}");
+            }
+            std::println!("{child}: exit {code:?}");
+            assert!(text.contains("room left before the reclaim: 0 KiB"), "{text}");
+        }
+    }
+
+    #[test]
+    #[ignore = "run by test_what_the_limit_paths_allocate_on_record in a job of its own"]
+    fn fill_allocations_child() {
+        let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
+        let page = std::vec![0x5au8; PAGE as usize];
+        let held = no_room_left();
+        KIND.with(|k| k.set(CALLER));
+        count_the_kinds();
+        let (mut n, mut refused) = (0, None);
+        while n < 16 << 20 {
+            // SAFETY: `page` holds a page.
+            match unsafe { copy(ctx, page.as_ptr(), mem + done + n, PAGE, false) } {
+                Ok(k) => n += k,
+                Err((e, _)) => {
+                    refused = Some(e);
+                    break;
+                }
+            }
+        }
+        let counts = counted_kinds();
+        KIND.with(|k| k.set(0));
+        say_the_allocations("fills at the limit", &counts);
+        crate::windows_mm::say_at_the_limit(format_args!("filled {} KiB, then {:?}", n >> 10, refused));
+        assert_eq!(refused, Some(crate::ENOMEM));
+        drop(held);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    #[test]
+    #[ignore = "run by test_what_the_limit_paths_allocate_on_record in a job of its own"]
+    fn touch_allocations_child() {
+        let (_ctx, user, _mem, _) = fill_to_the_limit_and_discard_in_part();
+        // SAFETY: a new anonymous mapping, committed at first touch.
+        let lazy = unsafe {
+            crate::mmap(
+                ptr::null_mut(),
+                16 << 20,
+                crate::PROT_READ | crate::PROT_WRITE,
+                crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(lazy, crate::MAP_FAILED);
+        let held = no_room_left();
+        KIND.with(|k| k.set(CALLER));
+        count_the_kinds();
+        for p in (0..4usize << 20).step_by(PAGE as usize) {
+            // SAFETY: our mapping; the first touch commits the page.
+            unsafe { core::ptr::write_volatile((lazy as *mut u8).add(p), 1) };
+        }
+        let counts = counted_kinds();
+        KIND.with(|k| k.set(0));
+        say_the_allocations("touches at the limit", &counts);
+        drop(held);
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
