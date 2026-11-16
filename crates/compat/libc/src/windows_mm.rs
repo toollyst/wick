@@ -200,11 +200,13 @@ pub mod wick_mm {
 
     /// [`commit_block_on_access`] for an access to a page an answer of the
     /// caller's committed before (WHP's run loop: the same page exited
-    /// again): asks first whether lazy memory's page is committed already,
-    /// and answers [`Access::Present`] if so, where the commit would answer
-    /// [`Access::Committed`] for it having committed nothing. A system call
-    /// more than [`commit_block_on_access`], which a first access does not
-    /// pay.
+    /// again): asks first whether what the access would commit in lazy
+    /// memory (its page; a write's 2 MiB block where `MADV_HUGEPAGE` is) is
+    /// committed already, and answers [`Access::Present`] if all of it is,
+    /// where the commit would answer [`Access::Committed`] having committed
+    /// nothing; else commits as [`commit_block_on_access`] does. A system
+    /// call more than [`commit_block_on_access`], which a first access does
+    /// not pay.
     pub fn commit_block_on_access_again(addr: usize, write: bool) -> (Access, core::ops::Range<usize>) {
         super::commit_access(addr, write, true)
     }
@@ -1323,8 +1325,9 @@ fn commit_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize
     commit_access(addr, write, false)
 }
 
-/// [`commit_on_access`]; `again`: a lazy page is looked at first, and one
-/// committed already is [`Access::Present`] (one `VirtualQuery`).
+/// [`commit_on_access`]; `again`: what a lazy access would commit (its page,
+/// or a write's block) is looked at first, and if all of it is committed
+/// already the answer is [`Access::Present`] (a `VirtualQuery` a region).
 fn commit_access(addr: usize, write: bool, again: bool) -> (Access, core::ops::Range<usize>) {
     // A released userfaultfd range's pending page ([`Record`]).
     if let Some((access, range)) = released_access(addr, write) {
@@ -1355,9 +1358,6 @@ fn commit_access(addr: usize, write: bool, again: bool) -> (Access, core::ops::R
     // (two vCPUs touching one block: measured, the second's exit had been
     // emulated as MMIO and the guest took a bogus fault).
     let page = addr - addr % PAGE;
-    if again && committed_page(page) {
-        return (Access::Present, 0..0);
-    }
     // A read takes a page even where huge pages are advised: Linux maps its
     // huge zero page for a read fault there and allocates (and charges)
     // nothing until a write (mm/huge_memory.c `do_huge_pmd_anonymous_page`,
@@ -1366,6 +1366,13 @@ fn commit_access(addr: usize, write: bool, again: bool) -> (Access, core::ops::R
     let block = addr - addr % grain;
     let whole = block >= s && block + grain <= s + n;
     let (from, to) = if whole { (block, block + grain) } else { (page, page + PAGE) };
+    // Asked again: present only if all the access would commit is: a write
+    // in a range advised `MADV_HUGEPAGE` after a read committed its page
+    // alone commits the block still, as Linux's write after the huge zero
+    // page allocates the huge page.
+    if again && committed_run(from, to - from) {
+        return (Access::Present, 0..0);
+    }
     if commit(from, to - from, prot, false) {
         return (Access::Committed, from..to);
     }
@@ -5536,6 +5543,23 @@ fn released_has_stale(s: usize, len: usize) -> bool {
     })
 }
 
+/// Whether every page of `[s, s + len)` is committed (`VirtualQuery`, a
+/// region at a time).
+fn committed_run(s: usize, len: usize) -> bool {
+    let end = s + len;
+    let mut at = s;
+    while at < end {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 || mbi.State != MEM_COMMIT {
+            return false;
+        }
+        at = mbi.BaseAddress as usize + mbi.RegionSize;
+    }
+    true
+}
+
 fn committed_page(at: usize) -> bool {
     // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -6745,7 +6769,10 @@ mod tests {
     /// ask answers `Committed` for it as for a page it commits; a page not
     /// committed (a discarded one) is committed as at a first ask; a
     /// `PROT_NONE` page and a write to read-only memory stay the fault they
-    /// are (`NotLazy`), committed or not. LAZYAGAIN lines.
+    /// are (`NotLazy`), committed or not. In a range advised
+    /// `MADV_HUGEPAGE`, a write asked again after a read committed its page
+    /// alone commits the aligned 2 MiB, and is present only once all of it
+    /// is. LAZYAGAIN lines.
     #[test]
     fn test_a_lazy_page_committed_before_is_present_when_asked_again() {
         let _serial = serial();
@@ -6772,9 +6799,26 @@ mod tests {
         // SAFETY: our mapping.
         assert_eq!(unsafe { mprotect(p as *mut c_void, PAGE, PROT_NONE) }, 0);
         ask("committed, PROT_NONE, read", wick_mm::commit_block_on_access_again(p, false), (Access::NotLazy, 0..0));
-        std::eprintln!("LAZYAGAIN {}", said.join("; "));
         // SAFETY: our mapping.
         assert_eq!(unsafe { munmap(p as *mut c_void, len) }, 0);
+        // Advised MADV_HUGEPAGE: a read commits its page alone (the huge
+        // zero page's analogue); a write to it asked again commits the
+        // aligned 2 MiB still, as Linux's write after the huge zero page
+        // allocates the huge page; asked again after that, present.
+        let huge = 2 << 20;
+        let hlen = 6 << 20;
+        let h = map(0, hlen, PROT_READ | PROT_WRITE, ANON | MAP_NORESERVE, -1, 0);
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { madvise(h as *mut c_void, hlen, MADV_HUGEPAGE) }, 0);
+        let block = (h + huge).next_multiple_of(huge);
+        let at = block + 3 * PAGE;
+        ask("huge-advised, read", wick_mm::commit_block_on_access(at, false), (Access::Committed, at..at + PAGE));
+        ask("huge-advised, read, then written asked again", wick_mm::commit_block_on_access_again(at, true), (Access::Committed, block..block + huge));
+        assert_eq!(committed(block, huge), huge);
+        ask("huge-advised, the block committed, written asked again", wick_mm::commit_block_on_access_again(at, true), (Access::Present, 0..0));
+        std::eprintln!("LAZYAGAIN {}", said.join("; "));
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { munmap(h as *mut c_void, hlen) }, 0);
     }
 
     /// A first access commits a page; a write in a range advised
