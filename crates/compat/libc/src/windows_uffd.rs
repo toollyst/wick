@@ -2720,10 +2720,14 @@ mod tests {
         match kind {
             Kind::Rust => {
                 let raw = raw as usize;
-                std::thread::spawn(move || {
-                    // SAFETY: the box made above.
-                    unsafe { start(raw as *mut c_void) };
-                });
+                // Named as Rust names a thread (`SetThreadDescription`).
+                std::thread::Builder::new()
+                    .name("wick-stack-test".into())
+                    .spawn(move || {
+                        // SAFETY: the box made above.
+                        unsafe { start(raw as *mut c_void) };
+                    })
+                    .unwrap();
             }
             Kind::CreateThread => {
                 // SAFETY: a thread of ours with the default stack.
@@ -2764,6 +2768,24 @@ mod tests {
             assert!(text.contains("wick: a thread's stack could not grow"), "{child}: {text}");
             assert_eq!(code, Some(137), "{child}: {text}");
         }
+    }
+
+    /// The line of a stack that could not grow names its thread, by its ID
+    /// and its description (which Rust sets to a thread's name), so that a
+    /// run says which thread it was (MOVEUNDERVCPU, CI runs 43784960688 and
+    /// 43790310601, did not); the ID is the one Rust's own overflow line
+    /// gives.
+    #[test]
+    #[ignore = "until the next commit"]
+    fn test_the_line_of_a_stack_that_could_not_grow_names_its_thread() {
+        let (code, text) = run_child("stack_at_the_limit_rust_child", Some(96 << 20));
+        assert_eq!(code, Some(137), "{text}");
+        let line = text.lines().find(|l| l.starts_with("wick: a thread's stack could not grow")).unwrap_or_default();
+        let rust = text
+            .lines()
+            .find_map(|l| l.split_once("thread 'wick-stack-test' (")?.1.split_once(") has overflowed").map(|(id, _)| id))
+            .expect("Rust's overflow line with the thread's ID");
+        assert!(line.contains(&std::format!("thread {rust} \"wick-stack-test\"")), "{text}");
     }
 
     fn stack_at_the_limit(kind: Kind) {
