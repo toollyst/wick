@@ -535,18 +535,17 @@ pub fn for_each_missing(start: u64, len: u64, mut f: impl FnMut(u64, u64)) {
     }
 }
 
-/// The runs of `[addr, addr + len)` of `range` that have memory: all of it,
-/// or, in a reserved section, its committed runs (an uncommitted page
-/// faults already, and has no protection to change or memory to discard).
-fn with_memory(range: &Range, addr: u64, len: u64) -> Vec<(u64, u64)> {
+/// Calls `f(start, len)` for each run of `[addr, addr + len)` of `range`
+/// that has memory, in order: all of it, or, in a reserved section, its
+/// committed runs (an uncommitted page faults already, and has no
+/// protection to change or memory to discard). Allocates nothing.
+fn with_memory(range: &Range, addr: u64, len: u64, mut f: impl FnMut(u64, u64)) {
     if !range.reserved.load(Ordering::Acquire) {
-        return std::vec![(addr, len)];
+        f(addr, len);
+        return;
     }
     #[allow(clippy::cast_possible_truncation)]
-    crate::windows_mm::committed_runs(addr as usize, len as usize)
-        .into_iter()
-        .map(|(s, l)| (s as u64, l as u64))
-        .collect()
+    crate::windows_mm::for_each_committed_run(addr as usize, len as usize, |s, l| f(s as u64, l as u64));
 }
 
 /// Missing pages `[s, s + len)` of `range`, whose alias is at `alias` and
@@ -557,9 +556,14 @@ fn with_memory(range: &Range, addr: u64, len: u64) -> Vec<(u64, u64)> {
 /// those never filled, in a reserved section, become lazy memory
 /// (`windows_mm::uffd_lazy`).
 fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io::Result<()> {
-    let runs = with_memory(range, s, len);
     let mut at = s;
-    for &(a, l) in runs.iter().chain([(s + len, 0)].iter()) {
+    let mut result = Ok(());
+    // Each run with memory, then the end; walked in place (the release runs
+    // at the job's limit, where a heap that must grow is refused).
+    let mut run = |a: u64, l: u64| {
+        if result.is_err() {
+            return;
+        }
         // Each with the protection `mprotect` gave it, which stays with the
         // memory, as a vma's does on Linux.
         if a > at {
@@ -578,18 +582,18 @@ fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io
             } else {
                 // SAFETY: the alias of registered memory.
                 unsafe { ptr::write_bytes((alias + (a - base)) as *mut u8, 0, l as usize) };
-                let mut result = Ok(());
                 range.by_prot(base, a, l, |r, n, prot| {
                     if result.is_ok() {
                         result = protect_as(r, n, prot);
                     }
                 });
-                result?;
             }
         }
         at = a + l;
-    }
-    Ok(())
+    };
+    with_memory(range, s, len, &mut run);
+    run(s + len, 0);
+    result
 }
 
 /// Changes the protection of committed registered memory, a view at a time
@@ -846,18 +850,25 @@ pub fn unregister(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
     let range = range_of(ctx, start, len)?;
     let base = range.start.load(Ordering::Acquire);
     let alias = range.alias.load(Ordering::Acquire);
-    let mut runs = Vec::new();
-    for_each_missing(start, len, |s, l| runs.push((s, l)));
+    // The missing runs, walked in place: a run is reported once the walk is
+    // past it, so its bits may change in the call.
+    let mut result = Ok(());
+    for_each_missing(start, len, |s, l| {
+        if result.is_err() {
+            return;
+        }
+        // Missing pages may hold discarded data: zeros, as Linux gives.
+        result = release_missing(range, base, alias, s, l).map_err(|e| e.raw_os_error().unwrap_or(crate::EIO));
+        if result.is_ok() {
+            for page in (s - base) / PAGE..(s + l - base) / PAGE {
+                Range::set(&range.missing, page, false);
+            }
+        }
+    });
     for page in (start - base) / PAGE..(start + len - base) / PAGE {
         Range::set(&range.tracked, page, false);
     }
-    for (s, l) in runs {
-        // Missing pages may hold discarded data: zeros, as Linux gives.
-        release_missing(range, base, alias, s, l).map_err(|e| e.raw_os_error().unwrap_or(crate::EIO))?;
-        for page in (s - base) / PAGE..(s + l - base) / PAGE {
-            Range::set(&range.missing, page, false);
-        }
-    }
+    result?;
     wake(start, len);
     Ok(())
 }
@@ -1099,9 +1110,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
                     c += chunk;
                 }
             }
-            let mut runs = Vec::new();
-            for_each_missing(from, to - from, |a, l| runs.extend(with_memory(r, a, l)));
-            for (a, l) in runs {
+            for_each_missing(from, to - from, |a, l| with_memory(r, a, l, |a, l| {
                 let _ = protect(a, l, false);
                 // Filling a missing page writes all of it: its content can go.
                 // SAFETY: the alias of registered memory.
@@ -1114,7 +1123,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
                 // memory.max. Where Linux would uncharge it, this counts it
                 // until its chunk is discarded whole (`uffd_swap_chunk`, which
                 // gives both back) or unmapped.
-            }
+            }));
             if remove {
                 post(ctx, [proto::EVENT_REMOVE, from, to, 0]);
             }
@@ -1134,14 +1143,15 @@ fn destroy(ctx: usize) {
         }
         let e = r.end.load(Ordering::Acquire);
         let alias = r.alias.load(Ordering::Acquire);
-        let mut runs = Vec::new();
-        for_each_missing(s, e - s, |a, l| runs.push((a, l)));
-        for (a, l) in runs {
+        // Walked in place (no list of the runs: this runs at the job's limit,
+        // `test_a_userfaultfd_released_at_the_limit_allocates_nothing`); a
+        // run is reported once the walk is past it.
+        for_each_missing(s, e - s, |a, l| {
             let _ = release_missing(r, s, alias, a, l);
             for page in (a - s) / PAGE..(a + l - s) / PAGE {
                 Range::set(&r.missing, page, false);
             }
-        }
+        });
         r.start.store(0, Ordering::Release);
         REGISTERED.fetch_sub(1, Ordering::AcqRel);
         let alias = r.alias.swap(0, Ordering::AcqRel);

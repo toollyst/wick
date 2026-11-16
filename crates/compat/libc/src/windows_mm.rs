@@ -3663,8 +3663,18 @@ pub(crate) fn charged(view: usize) -> Option<usize> {
 }
 
 /// The committed runs of `[s, s + len)`, as `(start, len)`.
+#[cfg(test)]
 pub(crate) fn committed_runs(s: usize, len: usize) -> Vec<(usize, usize)> {
-    let (mut out, mut at, e) = (Vec::new(), s, s + len);
+    let mut out = Vec::new();
+    for_each_committed_run(s, len, |a, n| out.push((a, n)));
+    out
+}
+
+/// Calls `f(start, len)` for each committed run of `[s, s + len)`, in
+/// order, without allocating (the userfaultfd's release runs at the job's
+/// limit: `wick_uffd::release_missing`).
+pub(crate) fn for_each_committed_run(s: usize, len: usize, mut f: impl FnMut(usize, usize)) {
+    let (mut at, e) = (s, s + len);
     while at < e {
         // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -3674,11 +3684,10 @@ pub(crate) fn committed_runs(s: usize, len: usize) -> Vec<(usize, usize)> {
         }
         let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(e) - at;
         if mbi.State == MEM_COMMIT {
-            out.push((at, run));
+            f(at, run);
         }
         at += run;
     }
-    out
 }
 
 /// Pages `[s, s + len)` of a userfaultfd range's reserved section that were
