@@ -124,7 +124,7 @@ dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `
   refused inside an AppContainer (`E_ACCESSDENIED`) but works for a process on a restricted token below medium integrity
   that has no access to the user's files ([M5](#m5-security-parity-the-jailer-on-every-host)).
 - What the hardware runs found, each fixed and covered by its stage: the guest's CPUID (KVM's supported set, no
-  MWAIT or nested virtualisation; no x2APIC while the partition's local APIC is an xAPIC, where KVM offers it on any host (option E's x2APIC partition for AMD hosts is in the code and off in the product: WHP's register refuses the TSC-deadline mode, and the APIC page's get and set lose an interrupt requested between them, PC step 15a at 305a806, so the backend makes that write with the VM's vCPUs, time and interrupt requests held (E-ii), which has not run on Windows yet; the switch comes after it has, with a Linux guest booted on it); OSXSAVE, OSPKE and the XSAVE sizes from the vCPU's state at each CPUID exit; the TSC
+  MWAIT or nested virtualisation; no x2APIC while the partition's local APIC is an xAPIC, where KVM offers it on any host (option E's x2APIC partition for AMD hosts is in the code and off in the product: WHP's register refuses the TSC-deadline mode, and the APIC page's get and set lose an interrupt requested between them, PC step 15a at 305a806, so the backend makes that write with the VM's vCPUs, time and interrupt requests held (E-ii), whose tests have passed in CI on AMD runners, with a Linux guest booted on it by a record build (`boot-test.ps1 x2apic`, 5 of 5 in CI runs 43627299415 to 43688550565; docs/COMPATIBILITY.md, Guest CPUID); the switch is not made yet); OSXSAVE, OSPKE and the XSAVE sizes from the vCPU's state at each CPUID exit; the TSC
   deadline timer, which WHP's xAPIC lacks, now emulated as KVM does), the speculation-control MSRs, kvm-clock and KVM's hypercalls
   (the guest no longer calibrates its TSC against the PIT), one instruction emulator per vCPU thread (a shared one
   corrupted a 2 vCPU guest's memory), irqfds cleared through their eventfd, an epoll nested in another (the vsock
@@ -137,7 +137,8 @@ dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `
   pages from the jailer (`test_hugetlb_through_the_broker`), and `hugepages` passes there, unjailed and jailed.
 - Guest MSRs: every MSR WHP hands the backend is answered as KVM v6.1 answers a Firecracker guest, #GP(0) where KVM
   has no case for it, and the values KVM keeps for each vCPU are listed, read and written by `KVM_GET_MSRS` and
-  `KVM_SET_MSRS` and carried by a snapshot (not yet run on Windows). Left, each stated in docs/COMPATIBILITY.md's
+  `KVM_SET_MSRS` and carried by a snapshot (MSRTEST and MSRKEEP passed in CI runs 43680983973 and 43688550565 on AMD
+  runners and 43676869163 on an Intel one). Left, each stated in docs/COMPATIBILITY.md's
   Guest MSRs row: the PMU (KVM's AMD guest has four counters, here off), CPUID faulting, steal time, and an exit
   for MTRRCAP and the variable MTRRs, which WHP answers with 16 pairs to KVM's 8.
 - Memory at `memory.max` under a userfaultfd restore: a reclaim of the pages discarded inside a 2 MiB chunk

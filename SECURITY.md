@@ -512,8 +512,9 @@ upstream Firecracker and its jailer.
   VM out of the guest, suspends the partition's time and holds off the VM's host-side interrupt requests (a
   read-write lock that every `WHvRequestInterrupt` takes to read) while it gets the page, changes the entry, sets it
   and reads it back. A guest that loops on that write therefore stalls its own VM's vCPUs and delays its own devices'
-  interrupts, for the hold's time a write (X2HOLDREC e, `test_a_held_lvt_timer_write_loses_no_interrupt`, not yet run
-  on Windows): a denial of service of the guest on itself, under the jail's CPU limit, which reaches no other VM and
+  interrupts, for the hold's time a write (X2HOLDREC e, `test_a_held_lvt_timer_write_loses_no_interrupt`, on CI's
+  4-processor AMD runners in CI runs 43680983973 and 43688550565, debug and release: 104 to 175 us a write with no
+  other vCPU, 431 to 1853 us with 3 others, 3.3 to 8.8 ms with 15): a denial of service of the guest on itself, under the jail's CPU limit, which reaches no other VM and
   not the host, as a KVM guest that loops on an exiting instruction slows only its own VM. No rate limit is added, as
   KVM has none. The lock is taken after the hold, and a requester holds it only for its one WHP call and waits on
   nothing else meanwhile, so the hold adds no lock-order cycle. CI's x2APIC record build (kvm-ioctls'
