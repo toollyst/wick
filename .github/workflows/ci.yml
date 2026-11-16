@@ -1530,6 +1530,16 @@ jobs:
           # and a page the look is made to call allowed fails the run after
           # the bound, with the time the million took.
           alone whp::vcpu::fpu_tests::test_a_guest_ram_access_exit_is_decided_as_kvms
+          # What WHP answers a VP's state gets and sets (CANCELGET lines, by
+          # HRESULT), the record behind the x2storm stage's
+          # WHV_E_INVALID_VP_STATE: after one cancel made while the VP is out
+          # of a run, and after the next run (whether a cancel is kept and
+          # refuses the calls until then); and while another thread cancels
+          # its run, cancels another VP's, suspends and resumes time, or gets
+          # and sets another VP's page, for a VP that never ran and one run
+          # to each exit, with and without a spinner on every processor.
+          # Only the calls made with nothing else are asserted.
+          alone whp::vcpu::fpu_tests::test_state_gets_against_cancels_on_record
           # Which WHP call it is that commits a vCPU thread's stack: every
           # call a thread makes, with the stack committed before and after
           # it (STACKCALL lines), for what a booting Linux guest does and

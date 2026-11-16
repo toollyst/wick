@@ -13006,6 +13006,336 @@ mod fpu_tests {
         }
     }
 
+    /// What WHP answers a vCPU's own state gets made while another thread
+    /// calls on the partition (CANCELGET lines). It is the record behind
+    /// the x2storm stage's failure (CI windows-guest, cpu.max one CPU,
+    /// storm): vCPU 3's own `WHvGetVirtualProcessorInterruptControllerState`
+    /// was refused with WHV_E_INVALID_VP_STATE (0x80370308) while vCPU 1
+    /// held the VM about 1000 times a second. `enter` makes that get
+    /// (`raise_fired_deadline`) once its run sequence is odd, and
+    /// `hold_vcpus` cancels a vCPU's run again and again while it is odd, so
+    /// a cancel of a VP that is not in a run overlaps the get. Learn
+    /// documents WHV_E_INVALID_VP_STATE only for the set, "if the virtual
+    /// processor is currently running", and nothing of a cancel made while
+    /// none runs.
+    ///
+    /// Two forms of that cause are told apart:
+    /// - overlap: a call is refused only while a cancel call runs on
+    ///   another thread;
+    /// - pending: a cancel made while the VP is out of a run is kept for
+    ///   the next run, which returns Canceled at once, and every call is
+    ///   refused until that run.
+    ///
+    /// The pending form first, for vCPU 0 after an exit and for vCPU 1, which
+    /// never ran: the calls below 20000 times each with nothing else made,
+    /// one cancel with its call returned, the calls again, one run (vCPU 1
+    /// waits for a SIPI, so a run with no cancel kept is cancelled after 2 s
+    /// by another thread), the calls again, and a second run.
+    ///
+    /// Then the overlap form. Thread B makes, in a loop, the target VP's
+    /// interrupt controller state get (the deprecated call the product
+    /// makes), `WHvGetVirtualProcessorState` with `InterruptControllerState2`,
+    /// the `IA32_APIC_BASE` get, and the sets of the interrupt controller
+    /// state and of `IA32_APIC_BASE` as they were read at the start (Learn
+    /// documents the refusal for the set). Each call's answers are counted
+    /// by HRESULT, while thread A does one thing in a loop:
+    /// - nothing (the control);
+    /// - cancels the target's run;
+    /// - cancels the other VP's run;
+    /// - suspends and resumes the partition's time (only with no VP running,
+    ///   as Learn requires);
+    /// - gets and sets the other VP's interrupt controller state.
+    ///
+    /// The target VP is in one of two states:
+    /// - it has never run (vCPU 1);
+    /// - its own thread B runs it to each exit (vCPU 0's `out 0x80` loop)
+    ///   and makes the gets out of the guest, as the run loop's handlers do.
+    ///
+    /// Every case runs once as it is, and once with a spinning thread for
+    /// each logical processor, so that B and A are preempted in their calls,
+    /// as cpu.max one CPU did. Asserted: nothing is refused with nothing
+    /// else made. The rest is printed, for the fix to be chosen by.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_state_gets_against_cancels_on_record() {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::AtomicBool;
+        const SPAN: std::time::Duration = std::time::Duration::from_millis(1500);
+        #[derive(Clone, Copy)]
+        #[repr(C, align(16))]
+        struct Value(whv::WHV_REGISTER_VALUE);
+        #[derive(Clone, Copy, PartialEq)]
+        enum Arm {
+            Nothing,
+            CancelTarget,
+            CancelOther,
+            SuspendTime,
+            OtherPage,
+        }
+        let arms = [
+            (Arm::Nothing, "nothing"),
+            (Arm::CancelTarget, "cancels the target's run"),
+            (Arm::CancelOther, "cancels the other VP's run"),
+            (Arm::SuspendTime, "suspends and resumes time"),
+            (Arm::OtherPage, "gets and sets the other VP's page"),
+        ];
+        let tally = |m: &BTreeMap<i32, u64>| {
+            m.iter().map(|(h, n)| if *h == 0 { format!("ok {n}") } else { format!("{:#010x} {n}", h.cast_unsigned()) }).collect::<Vec<_>>().join(", ")
+        };
+        // `out 0x80, al` and a jump back to it.
+        let (vm, mut zero, m) = mmio_guest(&[0xE6, 0x80, 0xEB, 0xFC]);
+        let one = vm.create_vcpu(1).unwrap();
+        let part = zero.part();
+        // Each VP's page and APIC base as they are at the start, for the
+        // sets.
+        let mut start_page = [[0u8; LAPIC_PAGE]; 2];
+        let mut start_size = [0u32; 2];
+        let mut start_base = [0u64; 2];
+        for vp in 0..2u32 {
+            let i = vp as usize;
+            // SAFETY: an output buffer of the size passed.
+            let h = unsafe {
+                whv::WHvGetVirtualProcessorInterruptControllerState(part, vp, start_page[i].as_mut_ptr().cast(), LAPIC_PAGE as u32, &mut start_size[i])
+            };
+            assert_eq!(h, 0, "vp {vp}'s page at the start");
+            start_base[i] = super::super::ffi::as_u64(&super::super::ffi::get_register(part, vp, whv::WHvX64RegisterApicBase).unwrap());
+        }
+        // B's calls on `vp`, each counted in its map: three gets, two sets.
+        let calls = |vp: u32, counts: &mut [BTreeMap<i32, u64>; 5]| {
+            let mut page = [0u8; LAPIC_PAGE];
+            let mut written = 0u32;
+            // SAFETY: an output buffer of the size passed.
+            let h = unsafe {
+                whv::WHvGetVirtualProcessorInterruptControllerState(part, vp, page.as_mut_ptr().cast(), LAPIC_PAGE as u32, &mut written)
+            };
+            *counts[0].entry(h).or_default() += 1;
+            let mut two = [0u8; 4096];
+            // SAFETY: as above.
+            let h = unsafe {
+                whv::WHvGetVirtualProcessorState(
+                    part,
+                    vp,
+                    whv::WHvVirtualProcessorStateTypeInterruptControllerState2,
+                    two.as_mut_ptr().cast(),
+                    u32::try_from(two.len()).unwrap(),
+                    &mut written,
+                )
+            };
+            *counts[1].entry(h).or_default() += 1;
+            let name = whv::WHvX64RegisterApicBase;
+            let mut value = Value(super::super::ffi::reg64(0));
+            // SAFETY: one name and one 16-aligned value.
+            let h = unsafe { whv::WHvGetVirtualProcessorRegisters(part, vp, &name, 1, std::ptr::addr_of_mut!(value).cast()) };
+            *counts[2].entry(h).or_default() += 1;
+            let i = vp as usize;
+            // SAFETY: the page read at the start, of the size WHP gave.
+            let h = unsafe { whv::WHvSetVirtualProcessorInterruptControllerState(part, vp, start_page[i].as_ptr().cast(), start_size[i]) };
+            *counts[3].entry(h).or_default() += 1;
+            let value = Value(super::super::ffi::reg64(start_base[i]));
+            // SAFETY: one name and one 16-aligned value.
+            let h = unsafe { whv::WHvSetVirtualProcessorRegisters(part, vp, &name, 1, std::ptr::addr_of!(value).cast()) };
+            *counts[4].entry(h).or_default() += 1;
+        };
+        let described = |counts: &[BTreeMap<i32, u64>; 5]| {
+            format!(
+                "interrupt controller state get: {}; State2 get: {}; APIC_BASE get: {}; interrupt controller state set: {}; \
+                 APIC_BASE set: {}",
+                tally(&counts[0]),
+                tally(&counts[1]),
+                tally(&counts[2]),
+                tally(&counts[3]),
+                tally(&counts[4])
+            )
+        };
+        let refused = |counts: &[BTreeMap<i32, u64>; 5]| counts.iter().any(|c| c.keys().any(|h| *h != 0));
+        let mut failed_control = Vec::new();
+
+        // The pending form. vCPU 0 is first run to an exit, out of the guest
+        // as a run loop's handler is.
+        let first = super::super::ffi::quietly(|| match zero.run() {
+            Ok(VcpuExit::IoOut(0x80, _)) => "out 0x80".to_string(),
+            Ok(e) => format!("{e:?}"),
+            Err(e) => format!("errno {}", e.errno()),
+        });
+        assert_eq!(first, "out 0x80", "vCPU 0's guest");
+        // One run of `vp`, made directly: its HRESULT, exit reason and time,
+        // and whether the watchdog had to cancel it after 2 s.
+        let raw_run = |vp: u32| {
+            let done = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                let watchdog = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    while !done.load(Ordering::SeqCst) {
+                        if t.elapsed() > std::time::Duration::from_secs(2) {
+                            // SAFETY: the VM's partition and VP.
+                            unsafe { whv::WHvCancelRunVirtualProcessor(part, vp, 0) };
+                            return true;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    false
+                });
+                // SAFETY: an exit context of the size passed.
+                let mut ctx: whv::WHV_RUN_VP_EXIT_CONTEXT = unsafe { std::mem::zeroed() };
+                let t = std::time::Instant::now();
+                // SAFETY: as above.
+                let h = unsafe {
+                    whv::WHvRunVirtualProcessor(part, vp, std::ptr::addr_of_mut!(ctx).cast(), u32::try_from(std::mem::size_of_val(&ctx)).unwrap())
+                };
+                let took = t.elapsed();
+                done.store(true, Ordering::SeqCst);
+                let dog = watchdog.join().unwrap();
+                format!(
+                    "HRESULT {:#010x}, exit reason {:#x}, in {} us{}",
+                    h.cast_unsigned(),
+                    ctx.ExitReason,
+                    took.as_micros(),
+                    if dog { " (the watchdog's cancel)" } else { "" }
+                )
+            })
+        };
+        let some_calls = |vp: u32| {
+            let mut counts: [BTreeMap<i32, u64>; 5] = Default::default();
+            super::super::ffi::quietly(|| {
+                for _ in 0..20_000 {
+                    calls(vp, &mut counts);
+                }
+            });
+            counts
+        };
+        for (vp, state) in [(0u32, "after an exit"), (1, "never run")] {
+            let before = some_calls(vp);
+            // SAFETY: the VM's partition and VP.
+            let cancel = unsafe { whv::WHvCancelRunVirtualProcessor(part, vp, 0) };
+            let after_cancel = some_calls(vp);
+            let run = raw_run(vp);
+            let after_run = some_calls(vp);
+            let again = raw_run(vp);
+            let line = format!(
+                "CANCELGET pending, target {vp} ({state}): with nothing made: {}; one cancel ({:#010x}), its call returned: {}; \
+                 one run: {run}; after it: {}; a second run: {again}",
+                described(&before),
+                cancel.cast_unsigned(),
+                described(&after_cancel),
+                described(&after_run)
+            );
+            eprintln!("{line}");
+            if refused(&before) {
+                failed_control.push(line);
+            }
+        }
+
+        let stop = AtomicBool::new(false);
+        for load in [false, true] {
+            let spin = AtomicBool::new(load);
+            std::thread::scope(|s| {
+                let spinners = if load { std::thread::available_parallelism().map_or(4, |n| n.get()) } else { 0 };
+                for _ in 0..spinners {
+                    s.spawn(|| {
+                        while spin.load(Ordering::Relaxed) {
+                            std::hint::spin_loop();
+                        }
+                    });
+                }
+                for running in [false, true] {
+                    // The target and the other VP.
+                    let (target, other) = if running { (0u32, 1u32) } else { (1, 0) };
+                    for (arm, arm_name) in arms {
+                        if running && arm == Arm::SuspendTime {
+                            continue;
+                        }
+                        stop.store(false, Ordering::Relaxed);
+                        let mut counts: [BTreeMap<i32, u64>; 5] = Default::default();
+                        let mut runs: BTreeMap<String, u64> = BTreeMap::new();
+                        let mut rounds = 0u64;
+                        let a = s.spawn({
+                            let stop = &stop;
+                            move || {
+                                let mut answers: BTreeMap<i32, u64> = BTreeMap::new();
+                                let mut page = [0u8; LAPIC_PAGE];
+                                while !stop.load(Ordering::Relaxed) {
+                                    // SAFETY: the VM's partition and VPs; the page buffer is as large as passed.
+                                    let h = unsafe {
+                                        match arm {
+                                            Arm::Nothing => {
+                                                std::thread::yield_now();
+                                                continue;
+                                            }
+                                            Arm::CancelTarget => whv::WHvCancelRunVirtualProcessor(part, target, 0),
+                                            Arm::CancelOther => whv::WHvCancelRunVirtualProcessor(part, other, 0),
+                                            Arm::SuspendTime => {
+                                                let h = whv::WHvSuspendPartitionTime(part);
+                                                if h == 0 {
+                                                    whv::WHvResumePartitionTime(part)
+                                                } else {
+                                                    h
+                                                }
+                                            }
+                                            Arm::OtherPage => {
+                                                let mut size = 0u32;
+                                                let h = whv::WHvGetVirtualProcessorInterruptControllerState(
+                                                    part,
+                                                    other,
+                                                    page.as_mut_ptr().cast(),
+                                                    LAPIC_PAGE as u32,
+                                                    &mut size,
+                                                );
+                                                if h == 0 {
+                                                    whv::WHvSetVirtualProcessorInterruptControllerState(part, other, page.as_ptr().cast(), size)
+                                                } else {
+                                                    h
+                                                }
+                                            }
+                                        }
+                                    };
+                                    *answers.entry(h).or_default() += 1;
+                                }
+                                answers
+                            }
+                        });
+                        let begun = std::time::Instant::now();
+                        super::super::ffi::quietly(|| {
+                            while begun.elapsed() < SPAN {
+                                if running {
+                                    let e = match zero.run() {
+                                        Ok(VcpuExit::IoOut(0x80, _)) => "out 0x80".to_string(),
+                                        Ok(e) => format!("{e:?}"),
+                                        Err(e) => format!("errno {}", e.errno()),
+                                    };
+                                    *runs.entry(e).or_default() += 1;
+                                }
+                                calls(target, &mut counts);
+                                rounds += 1;
+                            }
+                        });
+                        stop.store(true, Ordering::Relaxed);
+                        let answers = a.join().unwrap();
+                        let line = format!(
+                            "CANCELGET overlap, target {} ({}), {}, A {arm_name}: {rounds} rounds; {}; A's calls: {}{}",
+                            target,
+                            if running { "run by B to each exit" } else { "never run" },
+                            if load { "a spinner on every processor" } else { "unloaded" },
+                            described(&counts),
+                            if arm == Arm::Nothing { "none".to_string() } else { tally(&answers) },
+                            if running { format!("; B's runs: {runs:?}") } else { String::new() },
+                        );
+                        eprintln!("{line}");
+                        if arm == Arm::Nothing && refused(&counts) {
+                            failed_control.push(line);
+                        }
+                    }
+                }
+                spin.store(false, Ordering::Relaxed);
+            });
+        }
+        drop(one);
+        drop(zero);
+        drop(vm);
+        // SAFETY: the test's memory, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        assert!(failed_control.is_empty(), "a get was refused with nothing else made: {failed_control:?}");
+    }
+
     // String port I/O and device memory with a second operand in RAM, as
     // Firecracker's devices see them and as the guest's memory and
     // registers are left. Asserted, each as KVM does it (Linux v6.1
