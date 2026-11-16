@@ -125,7 +125,10 @@ and the main checkout use; they never set the variable.
   must exist (here or in upstream's tree), and a table row's code span writes
   a `|` with a backslash before it; in every document and source comment, a
   heading cited as `SECURITY.md, "Heap"` must be one of that document's
-  headings, bold labels or table rows. A number a document derives from the
+  headings, bold labels or table rows. A new tool (a script or program
+  directly in `tools/` or its host directories) gets a row in docs/README.md's
+  tools table, or a line in `tools/README-unlisted.txt` saying why not (what
+  runs it); check-claims fails on one in neither. A number a document derives from the
   tree is checked too: the patch and file counts by `tools/patches.sh check`,
   COMPATIBILITY's counts by `tools/compat-counts.py`, README's line count and
   PORTING row 1's sandbox counts by `tools/check-derived.py` (a new derived

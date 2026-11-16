@@ -60,6 +60,14 @@ docs/design-*.md, which name the tests they propose) is also checked for:
 - a table row with a `|` inside a code span that has no backslash before
   it, which GitHub takes as a cell's end (audit 2: the Full snapshot row's
   `MAP_PRIVATE | MAP_NORESERVE`).
+Every tool (a .sh, .py, .ps1, .c or .rs file directly in tools/,
+tools/linux/, tools/macos/ or tools/windows/) is in docs/README.md's tools
+table (linked from a row) or in tools/README-unlisted.txt with why it is
+not, and not in both;
+an entry of that file names a tracked tool and gives a reason (audit 5: the
+table lacked tools/clean.sh and tools/check-background-loops.py, which every
+test script and CI run). The tools' helpers in subdirectories (integration/,
+vhost-user-blk/) are not tools of their own.
 Every heading a document or a source comment cites as `<DOC>.md, "<heading>"`
 (or without the comma) must be one of that document's headings, bold labels
 or table rows' first cells, or a part of one (audit 5: boot-test.ps1 cited
@@ -107,6 +115,9 @@ REPO_PATH = re.compile(r"(?:`|\]\()(?:\.\./)*((?:tools|overlay|crates|docs|patch
 # Backquoted names of the form test_* that are not tests: upstream's results
 # directory (tests/conftest.py).
 NOT_TESTS = {"test_results"}
+TOOL = re.compile(r"^tools/(?:(?:linux|macos|windows)/)?[^/]+\.(?:sh|py|ps1|c|rs)$")
+TABLE_TOOL = re.compile(r"\]\(\.\./(tools/[^)#\s]+)\)")
+UNLISTED = "tools/README-unlisted.txt"
 
 
 def plain(text):
@@ -164,6 +175,29 @@ def check_paths(name, text, roots):
             path = re.sub(r":\d+(-\d+)?$", "", re.sub(r"#.*$", "", m.group(1).rstrip(".,;:")))
             if not any((root / path).exists() for root in roots):
                 errors.append(f"error: {name}:{n} names {path}, which is not in the tree (nor upstream's)")
+    return errors
+
+
+def check_tools_table(tracked, readme, unlisted):
+    """Every tool is in docs/README.md's table (linked from a row) or in
+    tools/README-unlisted.txt ("path reason"), in one of the two."""
+    errors = []
+    tools = {t for t in tracked if TOOL.match(t)}
+    table = {t for line in readme.splitlines() if line.startswith("|") for t in TABLE_TOOL.findall(line)}
+    listed = set()
+    for n, line in enumerate(unlisted.splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        path, _, why = line.partition(" ")
+        if not why.strip():
+            errors.append(f"error: {UNLISTED}:{n} lists {path} without saying why it is not in the table")
+        if path not in tools:
+            errors.append(f"error: {UNLISTED}:{n} lists {path}, which is no tool in the tree")
+        elif path in table:
+            errors.append(f"error: {UNLISTED}:{n} lists {path}, which docs/README.md's table has: one home")
+        listed.add(path)
+    for t in sorted(tools - table - listed):
+        errors.append(f"error: {t} is in neither docs/README.md's tools table nor {UNLISTED} (with why)")
     return errors
 
 
@@ -403,6 +437,22 @@ def selftest():
                              "`docs/design-*.md`\n",
                              (Path(tmp),))
         assert errors == ["error: x.md:1 names tools/gone.sh, which is not in the tree (nor upstream's)"], errors
+    # Audit 5's finding (4120524e): the tools table lacked tools/clean.sh and
+    # tools/check-background-loops.py.
+    tracked = ["tools/setup.sh", "tools/patches.sh", "tools/clean.sh", "tools/check-background-loops.py", "tools/common.sh",
+               "tools/macos/boot-test.py", "tools/macos/integration/wick_macos.py", "tools/deny.toml"]
+    readme = "| Tool | What |\n| --- | --- |\n| [`tools/setup.sh`](../tools/setup.sh) | x |\n" \
+             "| [`tools/patches.sh`](../tools/patches.sh) | y |\n"
+    unlisted = ("# why\ntools/common.sh sourced by the shell tools\ntools/macos/boot-test.py\n"
+                "tools/gone.py run by nothing\ntools/setup.sh twice\n")
+    errors = check_tools_table(tracked, readme, unlisted)
+    assert errors == [
+        f"error: {UNLISTED}:3 lists tools/macos/boot-test.py without saying why it is not in the table",
+        f"error: {UNLISTED}:4 lists tools/gone.py, which is no tool in the tree",
+        f"error: {UNLISTED}:5 lists tools/setup.sh, which docs/README.md's table has: one home",
+        f"error: tools/check-background-loops.py is in neither docs/README.md's tools table nor {UNLISTED} (with why)",
+        f"error: tools/clean.sh is in neither docs/README.md's tools table nor {UNLISTED} (with why)",
+    ], errors
     print("check-claims: selftest ok")
 
 
@@ -468,6 +518,10 @@ def main():
                 errors += 1
             else:
                 warnings += 1
+    for line in check_tools_table(tracked, (ROOT / "docs/README.md").read_text(),
+                                  (ROOT / UNLISTED).read_text() if (ROOT / UNLISTED).is_file() else ""):
+        print(line)
+        errors += 1
     print(f"check-claims: {errors} errors, {warnings} warnings")
     return 1 if errors else 0
 
