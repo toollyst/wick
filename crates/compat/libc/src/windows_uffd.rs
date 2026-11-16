@@ -2798,6 +2798,13 @@ mod tests {
             core::hint::black_box(deep(depth));
             let _ = back.send(());
         });
+        on_a_thread_of(kind, body);
+        heard.recv().unwrap();
+        (go, came_back)
+    }
+
+    /// Runs `body` on a new thread of `kind`.
+    fn on_a_thread_of(kind: Kind, body: std::boxed::Box<dyn FnOnce() + Send>) {
         let raw = std::boxed::Box::into_raw(std::boxed::Box::new(body)).cast::<c_void>();
         unsafe extern "system" fn start(raw: *mut c_void) -> u32 {
             // SAFETY: the box made above, given to this thread alone.
@@ -2831,8 +2838,6 @@ mod tests {
                 assert_ne!(unsafe { windows_sys::Win32::System::Threading::TrySubmitThreadpoolCallback(Some(pooled), raw, ptr::null()) }, 0);
             }
         }
-        heard.recv().unwrap();
-        (go, came_back)
     }
 
     /// A mapping committed at first touch, so that the lazy-memory handler,
@@ -2926,7 +2931,7 @@ mod tests {
     fn test_a_stack_overflow_at_the_reserves_end_is_still_one() {
         stack_end_host_record();
         for child in ["stack_overflow_rust_child", "stack_overflow_createthread_child", "stack_overflow_pool_child"] {
-            let (code, text, ended) = run_child_watched(child);
+            let (code, text, ended) = run_child_watched(child, &[]);
             std::eprintln!("STACKEND {child}: {code:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
             assert!(text.contains("STACKFILTER a stack overflow at the reserve's end"), "{child}: {text}");
             assert_eq!(code, Some(0xC000_00FD_u32.cast_signed()), "{child}: {text}");
@@ -2974,12 +2979,13 @@ mod tests {
     /// [`run_child`] without a job, which also says when the child ended,
     /// and, if it still runs 12 s after its start, what holds it
     /// (STACKENDHOST).
-    fn run_child_watched(child: &str) -> (Option<i32>, std::string::String, std::time::Duration) {
+    fn run_child_watched(child: &str, env: &[(&str, &str)]) -> (Option<i32>, std::string::String, std::time::Duration) {
         use std::io::Read;
         let name = std::format!("{}::{child}", module_path!().split_once("::").unwrap().1);
         let start = std::time::Instant::now();
         let mut process = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name.as_str(), "--ignored", "--nocapture"])
+            .envs(env.iter().copied())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -3052,6 +3058,95 @@ mod tests {
     #[ignore = "run by test_a_stack_overflow_at_the_reserves_end_is_still_one"]
     fn stack_overflow_pool_child() {
         stack_overflow(Kind::Pool);
+    }
+
+    /// A host thread's first access to lazy memory near its stack reserve's
+    /// end is either served or a stack overflow at the reserve's end, said
+    /// as one: never a silent end. The access is served on the thread's own
+    /// stack (`windows_mm::lazy_on_exception`, below the exception
+    /// dispatcher's frames), and its commit takes the region table, whose
+    /// probe commits 16 KiB more below that (`windows_stacklock`), so near
+    /// the reserve's end the probe meets the end inside the handler: the
+    /// stack overflow then raised there must be dispatched as any other,
+    /// Rust's "has overflowed its stack" line, the stack filter's
+    /// STACKFILTER line (the reserve's end, passed on) and 0xC00000FD. A
+    /// child per case: a thread recurses until 64, 60, ... 4 KiB are left
+    /// above its reserve's low end (DeallocationStack), then reads a lazy
+    /// page; a Rust thread (a 20 KiB guarantee) and a `CreateThread` thread
+    /// (none; a pool thread's stack is the same, and its overflow's end on
+    /// Windows Server 2025 is a question of its own). Asserted per case:
+    /// the read served and the child ended 0, or the overflow said, as
+    /// above; and for each kind, that some case met the reserve's end in
+    /// the handler's commit (STACKASK says where the overflow was raised),
+    /// so that the window is tested, not only its edges.
+    #[test]
+    fn test_a_lazy_touch_at_the_reserves_end_is_a_loud_overflow() {
+        let mut in_the_handler = [false; 2];
+        for (k, kind) in ["rust", "createthread"].into_iter().enumerate() {
+            for left in (1..=16).rev().map(|n| n * 4) {
+                let left_kib = std::format!("{left}");
+                let child = std::format!("lazy_at_the_reserves_end_{kind}_child");
+                let (code, text, _) = run_child_watched(&child, &[("WICK_TEST_LEFT_KIB", left_kib.as_str())]);
+                std::eprintln!("LAZYEND {kind} at {left} KiB left: {code:?}; {}", text.trim().replace('\n', " | "));
+                let served = code == Some(0) && text.contains("LAZYEND the read gave 0");
+                let loud = code == Some(0xC000_00FD_u32.cast_signed())
+                    && text.contains("has overflowed its stack")
+                    && text.contains("STACKFILTER a stack overflow at the reserve's end");
+                assert!(served || loud, "{kind} at {left} KiB left: neither served nor an overflow said as one ({code:?}): {text}");
+                in_the_handler[k] |= loud && text.contains("raised in the lazy handler's commit");
+            }
+        }
+        assert!(in_the_handler.iter().all(|&b| b), "no case met the reserve's end in the lazy handler's commit (rust, createthread): {in_the_handler:?}");
+    }
+
+    /// Recurses until `left` bytes are left above `reserve`, then reads the
+    /// lazy page at `mem`, saying so before and after, without allocating.
+    #[inline(never)]
+    fn down_to_then_read(left: usize, reserve: usize, mem: u64) -> u8 {
+        let pad = core::hint::black_box([0u8; 256]);
+        let here = core::ptr::addr_of!(pad) as usize;
+        let v = if here - reserve > left {
+            down_to_then_read(left, reserve, mem)
+        } else {
+            crate::windows_mm::say_at_the_limit(format_args!("LAZYEND reading at {} B above the reserve's end", here - reserve));
+            // SAFETY: a lazy page of ours, never touched.
+            let v = unsafe { core::ptr::read_volatile(mem as *const u8) };
+            crate::windows_mm::say_at_the_limit(format_args!("LAZYEND the read gave {v}"));
+            v
+        };
+        v.wrapping_add(core::hint::black_box(&pad)[0])
+    }
+
+    fn lazy_at_the_reserves_end(kind: Kind) {
+        let left = std::env::var("WICK_TEST_LEFT_KIB").unwrap().parse::<usize>().unwrap() << 10;
+        // SAFETY: a new anonymous mapping, committed at first touch (lazy).
+        let mem = unsafe {
+            crate::mmap(ptr::null_mut(), 1 << 20, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE, -1, 0)
+        };
+        assert_ne!(mem, crate::MAP_FAILED);
+        let mem = mem as u64;
+        let (done, came_back) = std::sync::mpsc::channel::<u8>();
+        on_a_thread_of(
+            kind,
+            std::boxed::Box::new(move || {
+                let (_, _, reserve, _) = stack_of_this_thread();
+                let _ = done.send(down_to_then_read(left, reserve, mem));
+            }),
+        );
+        let v = came_back.recv_timeout(std::time::Duration::from_secs(60)).expect("the thread neither came back nor ended the process");
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    #[ignore = "run by test_a_lazy_touch_at_the_reserves_end_is_a_loud_overflow"]
+    fn lazy_at_the_reserves_end_rust_child() {
+        lazy_at_the_reserves_end(Kind::Rust);
+    }
+
+    #[test]
+    #[ignore = "run by test_a_lazy_touch_at_the_reserves_end_is_a_loud_overflow"]
+    fn lazy_at_the_reserves_end_createthread_child() {
+        lazy_at_the_reserves_end(Kind::CreateThread);
     }
 
     /// An unhandled exception the stack filter does not take goes to the

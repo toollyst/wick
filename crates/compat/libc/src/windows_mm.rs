@@ -1383,6 +1383,13 @@ std::thread_local! {
     static HOST_FAULTS: std::cell::Cell<(u64, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Whether this thread is in [`lazy_on_exception`]'s commit of a lazy
+    /// page: STACKASK says so of a stack overflow raised there.
+    static IN_THE_LAZY_HANDLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// How much of the calling thread's stack is committed, in bytes: the
 /// TEB's `StackBase` less its `StackLimit` (`NT_TIB`, at `gs:[8]` and
 /// `gs:[0x10]` on x86-64); 0 elsewhere.
@@ -1423,7 +1430,12 @@ unsafe extern "system" fn lazy_on_exception(
     if rec.ExceptionCode == ACCESS_VIOLATION && rec.NumberParameters >= 2 {
         // [0]: 0 read, 1 write, 8 execute; [1]: the address.
         let stack = stack_committed();
-        match commit_on_access(rec.ExceptionInformation[1], rec.ExceptionInformation[0] == 1).0 {
+        #[cfg(test)]
+        IN_THE_LAZY_HANDLER.set(true);
+        let access = commit_on_access(rec.ExceptionInformation[1], rec.ExceptionInformation[0] == 1).0;
+        #[cfg(test)]
+        IN_THE_LAZY_HANDLER.set(false);
+        match access {
             Access::Committed => {
                 let (n, deepest) = HOST_FAULTS.get();
                 HOST_FAULTS.set((n + 1, deepest.max(stack)));
@@ -1461,7 +1473,7 @@ fn stack_ask_record(fault_rsp: usize, fault_addr: usize) {
     say_at_the_limit(format_args!(
         "STACKASK committed below the faulting rsp {} B, below the faulting address {} B, the dispatcher's frames {} B, left under the handler {} B, \
          guarantee {guarantee} B, reserve left {} KiB; the page at StackLimit {:#x}/{:#x}, below it {:#x}/{:#x} \
-         (state/protection; {} B committed there)",
+         (state/protection; {} B committed there){}",
         fault_rsp.saturating_sub(limit),
         fault_addr.saturating_sub(limit),
         fault_rsp.saturating_sub(here),
@@ -1472,6 +1484,7 @@ fn stack_ask_record(fault_rsp: usize, fault_addr: usize) {
         below.State,
         below.Protect,
         if below.State == MEM_COMMIT { below.RegionSize } else { 0 },
+        if IN_THE_LAZY_HANDLER.get() { "; raised in the lazy handler's commit" } else { "" },
     ));
 }
 
