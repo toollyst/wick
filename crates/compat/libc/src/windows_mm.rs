@@ -2590,6 +2590,23 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
         return fail(crate::EINVAL, -1);
     }
     let end = start + len.div_ceil(PAGE) * PAGE;
+    if !covered(&table().lock().unwrap(), start, end) {
+        return fail(crate::ENOMEM, -1);
+    }
+    // Registered userfaultfd memory keeps each page's protection in its
+    // range, given to its pages that hold memory and to its missing ones
+    // when they are filled (`wick_uffd::mprotect_registered`); the spans done
+    // are left alone here. Before the table: the userfaultfd lock comes first.
+    let registered = match crate::wick_uffd::mprotect_registered(
+        start as u64,
+        end as u64,
+        prot & PROT_READ != 0,
+        prot & PROT_WRITE != 0,
+        wprot,
+    ) {
+        Ok(done) => done,
+        Err(errno) => return fail(errno, -1),
+    };
     let mut t = table().lock().unwrap();
     if !covered(&t, start, end) {
         return fail(crate::ENOMEM, -1);
@@ -2599,7 +2616,7 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
     }
     for b in overlapping(&t, start, end) {
         let r = &t[&b];
-        let (s, e) = (start.max(b), end.min(b + r.len));
+        let (rs, re) = (start.max(b), end.min(b + r.len));
         match r.kind {
             Kind::Placeholder => {
                 if prot != PROT_NONE {
@@ -2610,7 +2627,7 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
                 }
             }
             Kind::Large { page, wprot: old, .. } => {
-                if !(s - b).is_multiple_of(page) || !(e - b).is_multiple_of(page) {
+                if !(rs - b).is_multiple_of(page) || !(re - b).is_multiple_of(page) {
                     return fail(crate::EINVAL, -1);
                 }
                 // Windows changes no large page's protection (`Kind::Large`):
@@ -2620,45 +2637,69 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
                 }
             }
             Kind::Private { .. } | Kind::View { .. } => {
-                if !r.mapped_in(s - b, e - s) {
+                if !r.mapped_in(rs - b, re - rs) {
                     return fail(crate::ENOMEM, -1);
                 }
-                // Lazy memory stays lazy: its pages not committed get the
-                // protection when they are.
-                if r.lazy {
-                    if !protect_lazy(&mut t, b, s, e, wprot) {
-                        return fail(crate::EACCES, -1);
-                    }
-                    continue;
-                }
-                let r = &t[&b];
-                let decommitted = ranges_within(&r.noaccess, s - b, e - s);
-                if prot != PROT_NONE {
-                    // Mapped `PROT_NONE` parts get their (zero) pages now.
-                    for &(o, l) in &decommitted {
-                        if !commit(b + o, l, wprot, false) {
-                            return fail(crate::ENOMEM, -1);
-                        }
-                    }
-                    let r = t.get_mut(&b).unwrap();
-                    ranges_remove(&mut r.noaccess, s - b, e - s);
-                    if !protect(s, e - s, wprot) {
-                        return fail(crate::EACCES, -1);
-                    }
-                } else {
-                    // Decommitted parts already fault; protect the rest.
-                    let mut at = s;
-                    for (o, l) in decommitted.into_iter().chain([(e - b, 0)]) {
-                        if b + o > at && !protect(at, b + o - at, wprot) {
+                for (s, e) in spans_outside(rs, re, &registered) {
+                    // Lazy memory stays lazy: its pages not committed get the
+                    // protection when they are.
+                    if t[&b].lazy {
+                        if !protect_lazy(&mut t, b, s, e, wprot) {
                             return fail(crate::EACCES, -1);
                         }
-                        at = b + o + l;
+                        continue;
+                    }
+                    let r = &t[&b];
+                    let decommitted = ranges_within(&r.noaccess, s - b, e - s);
+                    if prot != PROT_NONE {
+                        // Mapped `PROT_NONE` parts get their (zero) pages now.
+                        for &(o, l) in &decommitted {
+                            if !commit(b + o, l, wprot, false) {
+                                return fail(crate::ENOMEM, -1);
+                            }
+                        }
+                        let r = t.get_mut(&b).unwrap();
+                        ranges_remove(&mut r.noaccess, s - b, e - s);
+                        if !protect(s, e - s, wprot) {
+                            return fail(crate::EACCES, -1);
+                        }
+                    } else {
+                        // Decommitted parts already fault; protect the rest.
+                        let mut at = s;
+                        for (o, l) in decommitted.into_iter().chain([(e - b, 0)]) {
+                            if b + o > at && !protect(at, b + o - at, wprot) {
+                                return fail(crate::EACCES, -1);
+                            }
+                            at = b + o + l;
+                        }
                     }
                 }
             }
         }
     }
     0
+}
+
+/// The parts of `[s, e)` outside every span of `done` (start, length).
+fn spans_outside(s: usize, e: usize, done: &[(u64, u64)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut at = s;
+    let mut inside: Vec<(usize, usize)> = done
+        .iter()
+        .map(|&(a, l)| (a as usize, (a + l) as usize))
+        .filter(|&(a, z)| a < e && z > s)
+        .collect();
+    inside.sort_unstable();
+    for (a, z) in inside {
+        if a > at {
+            out.push((at, a));
+        }
+        at = at.max(z);
+    }
+    if at < e {
+        out.push((at, e));
+    }
+    out
 }
 
 /// Moves the anonymous private mapping `[start, start + len)` (all of one
@@ -3445,7 +3486,7 @@ pub(crate) fn uffd_commit(s: usize, len: usize) -> bool {
 /// ([`STALE`]), as Linux gives a zapped page as zeros at its next touch; its
 /// charge, kept with its commit (`wick_uffd::discarding`), is made sure of
 /// then. Nothing is done unless a view of a mapping holds all of the pages.
-pub(crate) fn uffd_stale(s: usize, len: usize, alias: usize) {
+pub(crate) fn uffd_stale(s: usize, len: usize, alias: usize, prot: PAGE_PROTECTION_FLAGS) {
     let mut t = table().lock().unwrap();
     let e = s + len;
     for b in overlapping(&t, s, e) {
@@ -3453,7 +3494,7 @@ pub(crate) fn uffd_stale(s: usize, len: usize, alias: usize) {
         let (a, z) = (s.max(b), e.min(b + r.len));
         if matches!(r.kind, Kind::View { .. }) && a < z {
             r.lazy = true;
-            lazy_add(a, z - a, PAGE_READWRITE);
+            lazy_add(a, z - a, prot);
             STALE.lock().unwrap().insert(a, (z - a, alias + (a - s)));
             STALE_SET.store(true, std::sync::atomic::Ordering::Release);
         }
@@ -3618,7 +3659,7 @@ pub(crate) fn committed_runs(s: usize, len: usize) -> Vec<(usize, usize)> {
 /// unregistered page at its fault.
 /// Nothing is done unless a view of a mapping holds all of the pages (one
 /// unmapped since is left alone).
-pub(crate) fn uffd_lazy(s: usize, len: usize) {
+pub(crate) fn uffd_lazy(s: usize, len: usize, prot: PAGE_PROTECTION_FLAGS) {
     let mut t = table().lock().unwrap();
     let e = s + len;
     for b in overlapping(&t, s, e) {
@@ -3626,7 +3667,7 @@ pub(crate) fn uffd_lazy(s: usize, len: usize) {
         let (a, z) = (s.max(b), e.min(b + r.len));
         if matches!(r.kind, Kind::View { .. }) && a < z {
             r.lazy = true;
-            lazy_add(a, z - a, PAGE_READWRITE);
+            lazy_add(a, z - a, prot);
         }
     }
 }

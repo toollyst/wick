@@ -63,7 +63,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     EXCEPTION_POINTERS,
 };
 use windows_sys::Win32::System::Memory::{
-    DiscardVirtualMemory, PAGE_NOACCESS, PAGE_READWRITE, VirtualProtect,
+    DiscardVirtualMemory, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
 };
 use windows_sys::Win32::System::Threading::{
     CreateSemaphoreW, INFINITE, ReleaseSemaphore, Sleep, WaitForSingleObject,
@@ -127,6 +127,12 @@ struct Range {
     missing: AtomicPtr<AtomicU64>,
     /// One bit per page: the page is registered (cleared by unregister).
     tracked: AtomicPtr<AtomicU64>,
+    /// One bit per page: its protection (`mprotect`) denies reads, and so
+    /// every access (`PROT_NONE`).
+    noread: AtomicPtr<AtomicU64>,
+    /// One bit per page: its protection denies writes (`PROT_READ`, or
+    /// `PROT_NONE`).
+    nowrite: AtomicPtr<AtomicU64>,
 }
 
 impl Range {
@@ -139,6 +145,48 @@ impl Range {
             reserved: AtomicBool::new(false),
             missing: AtomicPtr::new(ptr::null_mut()),
             tracked: AtomicPtr::new(ptr::null_mut()),
+            noread: AtomicPtr::new(ptr::null_mut()),
+            nowrite: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    /// The protection `mprotect` gave `page`, as Windows' (read-write until
+    /// one is given).
+    fn prot(&self, page: u64) -> PAGE_PROTECTION_FLAGS {
+        if Self::test(&self.noread, page) {
+            PAGE_NOACCESS
+        } else if Self::test(&self.nowrite, page) {
+            PAGE_READONLY
+        } else {
+            PAGE_READWRITE
+        }
+    }
+
+    /// Whether `page`'s protection denies the access (a write if `write`):
+    /// then it is no userfault.
+    fn denies(&self, page: u64, write: bool) -> bool {
+        Self::test(&self.noread, page) || (write && Self::test(&self.nowrite, page))
+    }
+
+    /// Calls `f(start, len, prot)` for each run of `[s, s + len)` (pages of
+    /// this range, whose first page is at `base`) of one protection.
+    fn by_prot(&self, base: u64, s: u64, len: u64, mut f: impl FnMut(u64, u64, PAGE_PROTECTION_FLAGS)) {
+        let mut run: Option<(u64, PAGE_PROTECTION_FLAGS)> = None;
+        let mut at = s;
+        while at < s + len {
+            let prot = self.prot((at - base) / PAGE);
+            match run {
+                Some((_, p)) if p == prot => {}
+                Some((r, p)) => {
+                    f(r, at - r, p);
+                    run = Some((at, prot));
+                }
+                None => run = Some((at, prot)),
+            }
+            at += PAGE;
+        }
+        if let Some((r, p)) = run {
+            f(r, s + len - r, p);
         }
     }
 
@@ -357,6 +405,14 @@ pub fn fault(addr: u64, write: bool) -> bool {
     if !Range::test(&range.tracked, page) || !Range::test(&range.missing, page) {
         return false;
     }
+    // An access its protection denies is the access fault, not a userfault:
+    // Linux checks the vma's protection first (v6.1 arch/x86/mm/fault.c,
+    // `do_user_addr_fault`: `access_error` at :1410, before
+    // `handle_mm_fault` at :1428, where `do_anonymous_page` hands a missing
+    // page to userfaultfd).
+    if range.denies(page, write) {
+        return false;
+    }
     let page_addr = range.start.load(Ordering::Acquire) + page * PAGE;
     // Claim a waiter slot.
     let slot = loop {
@@ -504,9 +560,11 @@ fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io
     let runs = with_memory(range, s, len);
     let mut at = s;
     for &(a, l) in runs.iter().chain([(s + len, 0)].iter()) {
+        // Each with the protection `mprotect` gave it, which stays with the
+        // memory, as a vma's does on Linux.
         if a > at {
             #[allow(clippy::cast_possible_truncation)]
-            crate::windows_mm::uffd_lazy(at as usize, (a - at) as usize);
+            range.by_prot(base, at, a - at, |r, n, prot| crate::windows_mm::uffd_lazy(r as usize, n as usize, prot));
         }
         if l > 0 {
             if range.reserved.load(Ordering::Acquire) {
@@ -514,11 +572,19 @@ fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io
                 // zeroed at its first access, as Linux gives a zapped page as
                 // zeros at its next touch.
                 #[allow(clippy::cast_possible_truncation)]
-                crate::windows_mm::uffd_stale(a as usize, l as usize, (alias + (a - base)) as usize);
+                range.by_prot(base, a, l, |r, n, prot| {
+                    crate::windows_mm::uffd_stale(r as usize, n as usize, (alias + (r - base)) as usize, prot);
+                });
             } else {
                 // SAFETY: the alias of registered memory.
                 unsafe { ptr::write_bytes((alias + (a - base)) as *mut u8, 0, l as usize) };
-                protect(a, l, true)?;
+                let mut result = Ok(());
+                range.by_prot(base, a, l, |r, n, prot| {
+                    if result.is_ok() {
+                        result = protect_as(r, n, prot);
+                    }
+                });
+                result?;
             }
         }
         at = a + l;
@@ -530,8 +596,12 @@ fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io
 /// (`VirtualProtect` stays within one allocation; a reserved section is a
 /// view per chunk, `windows_mm::UFFD_CHUNK`).
 fn protect(addr: u64, len: u64, accessible: bool) -> io::Result<()> {
+    protect_as(addr, len, if accessible { PAGE_READWRITE } else { PAGE_NOACCESS })
+}
+
+/// [`protect`] with the protection `prot`.
+fn protect_as(addr: u64, len: u64, prot: PAGE_PROTECTION_FLAGS) -> io::Result<()> {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let prot = if accessible { PAGE_READWRITE } else { PAGE_NOACCESS };
     let (mut at, end) = (addr as usize, (addr + len) as usize);
     while at < end {
         // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
@@ -729,6 +799,8 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     range.reserved.store(reserved, Ordering::Release);
     let missing = alloc_bitmap(pages, false);
     let tracked = alloc_bitmap(pages, true);
+    range.noread.store(alloc_bitmap(pages, false), Ordering::Release);
+    range.nowrite.store(alloc_bitmap(pages, false), Ordering::Release);
     range.end.store(end, Ordering::Release);
     range.ctx.store(ctx, Ordering::Release);
     range.alias.store(alias, Ordering::Release);
@@ -830,7 +902,16 @@ fn fill(
         return Err((crate::ENOMEM, 0));
     }
     fill((alias + (dst - base)) as *mut u8, bytes as usize);
-    protect(dst, bytes, true).map_err(|e| (e.raw_os_error().unwrap_or(crate::EIO), 0))?;
+    // Each page with the protection `mprotect` gave it (one filled while
+    // `PROT_NONE` stays closed, as Linux's copy fills a page of a
+    // `PROT_NONE` vma).
+    let mut result = Ok(());
+    range.by_prot(base, dst, bytes, |r, n, prot| {
+        if result.is_ok() {
+            result = protect_as(r, n, prot);
+        }
+    });
+    result.map_err(|e| (e.raw_os_error().unwrap_or(crate::EIO), 0))?;
     for page in first..first + n {
         Range::set(&range.missing, page, false);
     }
@@ -874,6 +955,62 @@ pub fn wake_range(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
     range_of(ctx, start, len)?;
     wake(start, len);
     Ok(())
+}
+
+/// `mprotect` of the registered pages of `[start, end)` (page aligned) to
+/// `prot` (Windows' `wprot`, `mprotect`'s `prot` given as `read`/`write`):
+/// each page's protection is kept in its range, and given now to the
+/// pages that hold their memory (filled, not missing); a missing page,
+/// reserved or closed, takes it when it is filled ([`fill`]), and an access
+/// it denies is no userfault ([`fault`]), as Linux's `mprotect` changes the
+/// vma's protection and leaves its pages as they are. The registered spans
+/// done, for `mprotect` to leave alone; `Err(errno)` if a protection could
+/// not be given. Under [`LOCK`], which `mprotect` takes before the region
+/// table, as `register` and the fills do.
+pub(crate) fn mprotect_registered(start: u64, end: u64, read: bool, write: bool, wprot: PAGE_PROTECTION_FLAGS) -> Result<Vec<(u64, u64)>, c_int> {
+    let mut done = Vec::new();
+    if REGISTERED.load(Ordering::Acquire) == 0 {
+        return Ok(done);
+    }
+    let _guard = lock();
+    for r in RANGES.iter() {
+        let s = r.start.load(Ordering::Acquire);
+        let e = r.end.load(Ordering::Acquire);
+        if s == 0 || start >= e || s >= end {
+            continue;
+        }
+        let (a, b) = (start.max(s), end.min(e));
+        let mut tracked_run: Option<u64> = None;
+        let mut live_run: Option<u64> = None;
+        let mut at = a;
+        while at <= b {
+            let page = (at - s) / PAGE;
+            let tracked = at < b && Range::test(&r.tracked, page);
+            let live = tracked && !Range::test(&r.missing, page);
+            if tracked {
+                Range::set(&r.noread, page, !read && !write);
+                Range::set(&r.nowrite, page, !write);
+            }
+            match (tracked, tracked_run) {
+                (true, None) => tracked_run = Some(at),
+                (false, Some(t)) => {
+                    done.push((t, at - t));
+                    tracked_run = None;
+                }
+                _ => {}
+            }
+            match (live, live_run) {
+                (true, None) => live_run = Some(at),
+                (false, Some(l)) => {
+                    protect_as(l, at - l, wprot).map_err(|_| crate::EACCES)?;
+                    live_run = None;
+                }
+                _ => {}
+            }
+            at += PAGE;
+        }
+    }
+    Ok(done)
 }
 
 /// Wraps a `MADV_DONTNEED` of `[start, start + len)`: `discard` runs on the
@@ -1503,6 +1640,12 @@ fn find_candidates(out: &mut Vec<Candidate>) {
             if !(c..c_end).all(|p| Range::test(&r.tracked, p)) {
                 continue;
             }
+            // A move maps the new section's view read-write: a live page
+            // `mprotect` closed (`PROT_NONE`, `PROT_READ`) would be open
+            // until its protection is given back, so its chunk is not moved.
+            if (c..c_end).any(|p| !Range::test(&r.missing, p) && r.prot(p) != PAGE_READWRITE) {
+                continue;
+            }
             #[allow(clippy::cast_possible_truncation)]
             let (view, len) = ((s + c * PAGE) as usize, ((c_end - c) * PAGE) as usize);
             if owing.is_some_and(|p| !(view..view + len).contains(&p)) {
@@ -1881,11 +2024,11 @@ mod tests {
     /// again, a page's first access is a userfault, filled by the handler;
     /// a page filled while `PROT_NONE` is filled, and keeps its protection
     /// until it is changed; a `PROT_READ` page's read is a userfault too.
-    /// Today Windows refuses the call with `EACCES`, as `VirtualProtect`
-    /// changes committed pages only (Learn: "If the state of any page in the
-    /// specified region is not committed, the function fails").
+    /// `VirtualProtect` changes committed pages only (Learn: "If the state of
+    /// any page in the specified region is not committed, the function
+    /// fails"), so a missing page's protection is kept in its range
+    /// (`mprotect_registered`) until it is filled.
     #[test]
-    #[ignore = "until the next commit"]
     fn test_mprotect_of_registered_missing_pages_keeps_them_missing() {
         let (ctx, user) = create(0, false, true).unwrap();
         let len = 4 << 20;
@@ -1931,10 +2074,9 @@ mod tests {
     /// `slot.protect(true)`), a plugged one read through the handler, the
     /// slot plugged (`protect(false)`) and read through the handler, then
     /// unplugged again (discarded, `MADV_DONTNEED`, and `PROT_NONE`), its
-    /// pages missing again. Today the first `protect(true)` fails with
-    /// `EACCES`, so such a restore fails where Linux's succeeds.
+    /// pages missing again. Before the per-page protection, the first
+    /// `protect(true)` failed with `EACCES`, and so did the restore.
     #[test]
-    #[ignore = "until the next commit"]
     fn test_plug_after_a_uffd_restore() {
         let (ctx, user) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
         let slot_len: u64 = 2 << 20;
@@ -1969,6 +2111,42 @@ mod tests {
         unsafe { ws::closesocket(sock(user)) };
     }
 
+    /// The reclaim at the memory limit moves no chunk holding a live page
+    /// `mprotect` closed: a move maps the chunk's new view read-write, which
+    /// would open that page until its protection is given back. Two chunks
+    /// with dead pages (every other page discarded): with a live page of the
+    /// second made `PROT_READ`, only the first is a candidate; read-write
+    /// again, both are.
+    #[test]
+    fn test_a_chunk_with_a_closed_live_page_is_not_moved() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let chunk = crate::windows_mm::UFFD_CHUNK as u64;
+        let mem = map_noreserve(2 * chunk as usize);
+        register(ctx, mem, 2 * chunk).unwrap();
+        let page = std::vec![0x5au8; PAGE as usize];
+        for p in (0..2 * chunk).step_by(PAGE as usize) {
+            // SAFETY: `page` holds a page.
+            unsafe { copy(ctx, page.as_ptr(), mem + p, PAGE, false) }.unwrap();
+        }
+        for p in (0..2 * chunk).step_by(2 * PAGE as usize) {
+            // SAFETY: registered memory of ours.
+            assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        }
+        let candidates = || {
+            let _guard = lock();
+            let mut c = Vec::with_capacity(256);
+            find_candidates(&mut c);
+            c.iter().map(|d| d.view as u64).filter(|v| (mem..mem + 2 * chunk).contains(v)).collect::<Vec<_>>()
+        };
+        assert_eq!(candidates().len(), 2, "both chunks hold dead pages");
+        mprotect_of(mem + chunk + PAGE, PAGE, crate::PROT_READ).unwrap();
+        assert_eq!(candidates(), std::vec![mem], "the chunk with a read-only live page is not moved");
+        mprotect_of(mem + chunk + PAGE, PAGE, crate::PROT_READ | crate::PROT_WRITE).unwrap();
+        assert_eq!(candidates().len(), 2);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
     /// An access its protection denies to a missing page of registered
     /// memory is the access fault (SIGSEGV on Linux; here the process ends
     /// with `STATUS_ACCESS_VIOLATION`), not a userfault: Linux checks the
@@ -1979,7 +2157,6 @@ mod tests {
     /// userfaultfd). A read of a `PROT_NONE` page, and a write of a
     /// `PROT_READ` one, each in a child whose handler would say any event.
     #[test]
-    #[ignore = "until the next commit"]
     fn test_a_registered_page_its_protection_denies_is_no_userfault() {
         for child in ["denied_read_child", "denied_write_child"] {
             let (code, text) = run_child(child, None);
