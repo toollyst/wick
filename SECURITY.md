@@ -297,8 +297,8 @@ upstream Firecracker and its jailer.
   no jail can make there (the sandbox lets a jail read lock files there and make nothing:
   `test_a_jail_reaches_only_lock_files_in_its_network`; the jailer refuses a network directory the jail's uid
   owns or that its group, others or another uid's ACL entry may write: `test_the_jailer_refuses_a_network_others_may_write`,
-  which failed in CI run 43688550565 as root on macOS 26, its first case asking a refusal for root's own uid, which
-  the rule exempts (a test defect, fixed in f50fd8bc, not yet run as root), so no run shows the refusal yet
+  which passed as root on macOS 26 in CI runs 43784960688 and 43790310601 (it had failed in run 43688550565 for a
+  test defect, its first case asking a refusal for root's own uid, which the rule exempts, fixed in f50fd8bc)
   (docs/COMPATIBILITY.md, Net hotplug);
   a jail of uid 0 may make one, its endpoint in its own directory and its lock file in the network directory, as
   root may make a TAP on Linux); and no path name, wherever it points (`test_only_the_operators_interface_opens`,
