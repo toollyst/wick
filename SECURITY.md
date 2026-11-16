@@ -1045,6 +1045,20 @@ upstream Firecracker and its jailer.
   parent (`test_a_denied_call_in_the_api_process_ends_firecracker_as_its_own`). Fix: a supervising parent of the
   VMM that does the same for it (the line, the metric, exit 148), proven by the same test against the VMM; it waits
   on a decision.
+- **macOS: a userfaultfd page fault event whose waiter was woken before it was read is still read.** On Linux a
+  wake (an unregister, a `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` that wakes, `UFFDIO_WAKE`, the release) takes each
+  waiting fault it wakes off the queue, read or not (v6.12 fs/userfaultfd.c `userfaultfd_wake_function` :141,
+  `__wake_userfault` :1166 to :1176), so a fault not read before its wake is never read. Here the event is a record
+  already written into the userfaultfd's socket at the fault, and the wake leaves it there. Upstream's on-demand
+  handler reads every event into a batch (examples/uffd/on_demand_handler.rs :80) and unregisters a page on its
+  remove event (:93 to :94); a fault on that page posted before the unregister and read in the next batch is
+  served with a `UFFDIO_COPY`, which is `ENOENT` (the page is in no registration), and the handler panics on that
+  error (uffd_utils.rs :169 to :187). So a guest that touches pages its balloon is inflating can end that handler
+  and, with it, its own restore (test_uffd.py :100 to :109 inflates under that handler). Read from the code, not
+  observed in a VM; it harms the VM's own handler, no other VM or the host. Fix, approved and next: a waiter mirror,
+  a page the VMM writes and each reader maps read-only, through which the reader drops a record whose waiter was
+  woken, proven by tests that land with it (a fault posted and not read, then its page unregistered, reads as no
+  event; a record posted after its wake is dropped).
 - **No per-thread filters outside Linux.** Neither macOS nor Windows filters system calls per thread. Threads of a
   process share its address space, so the union of upstream's filters applies process-wide, and the API server,
   whose separate filter is a real boundary, moves into a process of its own. On macOS that is in place: the API
