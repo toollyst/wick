@@ -2030,22 +2030,393 @@ mod tests {
     /// with no `VM_WRITE` :1285 to :1287, a read with no `VM_READ` :1303 to
     /// :1305), whose refusal is `-EFAULT` from `KVM_RUN` (mmu.c :1579 to
     /// :1580). Here the slot's stage-2 mapping keeps the slot's permissions
-    /// whatever the host protection is. The control: the same store before
-    /// the host protects the page.
+    /// whatever the host protection is. After an mprotect back the same
+    /// accesses work again, as Linux's next fault maps the page with what the
+    /// vma now allows. The control: the same store before the host protects
+    /// the page.
     #[test]
-    #[ignore = "fails until stage 2 follows a host mprotect of guest memory"]
+    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
     fn test_a_guest_access_the_host_protection_refuses_is_efault() {
         let (_vm, mut vcpu, mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
         let page = host_page_size();
         let (store, load) = (GUEST_BASE, GUEST_BASE + 16);
         assert_eq!(access(&mut vcpu, store, GUEST_BASE + page, 7), Ok(Some(7)), "the control");
         // SAFETY: pages of the test's mapping, not the code's.
-        unsafe {
-            assert_eq!(libc::mprotect(mem.add(page as usize), page as usize, libc::PROT_READ), 0);
-            assert_eq!(libc::mprotect(mem.add(2 * page as usize), page as usize, libc::PROT_NONE), 0);
-        }
+        let (one, two) = unsafe { (mem.add(page as usize), mem.add(2 * page as usize)) };
+        protect(one, page, libc::PROT_READ);
+        protect(two, page, libc::PROT_NONE);
         assert_eq!(access(&mut vcpu, store, GUEST_BASE + page, 8), Err(libc::EFAULT), "a store to a read-only page");
         assert_eq!(access(&mut vcpu, load, GUEST_BASE + 2 * page, 0), Err(libc::EFAULT), "a load from a PROT_NONE page");
+        protect(one, 2 * page, libc::PROT_READ | libc::PROT_WRITE);
+        assert_eq!(access(&mut vcpu, store, GUEST_BASE + page, 9), Ok(Some(9)), "a store after the mprotect back");
+        assert_eq!(access(&mut vcpu, load, GUEST_BASE + 2 * page, 0), Ok(Some(0)), "a load after the mprotect back");
+    }
+
+    /// Makes `[at, at + len)` of a test's memory `prot` through the compat
+    /// `mprotect`, the call Firecracker makes.
+    fn protect(at: *mut libc::c_void, len: u64, prot: c_int) {
+        // SAFETY: pages of the test's mappings.
+        assert_eq!(unsafe { libc::mprotect(at, len as usize, prot) }, 0, "mprotect {prot}");
+    }
+
+    /// Where [`extra_slot`] puts its memory slot.
+    const EXTRA: u64 = GUEST_BASE + (1 << 30);
+
+    /// A fresh anonymous mapping of `pages` host pages, every byte `fill`,
+    /// made `prot` and then put in memory slot 1 at [`EXTRA`] with `flags`.
+    /// Returns its host address.
+    fn extra_slot(vm: &VmFd, pages: u64, fill: u8, prot: c_int, flags: u32) -> u64 {
+        let len = pages * host_page_size();
+        // SAFETY: a fresh anonymous mapping, kept for the test.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(at, libc::MAP_FAILED);
+        // SAFETY: the mapping just made.
+        unsafe { std::ptr::write_bytes(at.cast::<u8>(), fill, len as usize) };
+        protect(at, len, prot);
+        let region = kvm_userspace_memory_region {
+            slot: 1,
+            guest_phys_addr: EXTRA,
+            memory_size: len,
+            userspace_addr: at as u64,
+            flags,
+        };
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+        at as u64
+    }
+
+    /// The word at host address `at`.
+    fn word(at: u64) -> u64 {
+        // SAFETY: a readable word of a test's mapping.
+        unsafe { std::ptr::read_volatile(at as *const u64) }
+    }
+
+    /// The guest executes from a page the host made `PROT_READ`, as on
+    /// Linux, where the fault takes the page for a read (mm/gup.c, v6.12,
+    /// `check_vma_flags` :1303 to :1305 pass) and an instruction fault is
+    /// given stage-2 exec whatever the vma's `VM_EXEC` (arch/arm64/kvm/mmu.c
+    /// :1662 to :1663); from a page the host made `PROT_NONE` the fetch is
+    /// refused and `KVM_RUN` ends with `EFAULT` (:1303 to :1305 refuse, mmu.c
+    /// :1579 to :1580); after an mprotect back the code runs again.
+    #[test]
+    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
+    fn test_a_guest_executes_from_a_host_read_only_page() {
+        let (_vm, mut vcpu, mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        let mut wrong = Vec::new();
+        for (prot, value, expected) in [
+            (libc::PROT_READ, 1, Ok(Some(1))),
+            (libc::PROT_NONE, 2, Err(libc::EFAULT)),
+            (libc::PROT_READ | libc::PROT_WRITE, 3, Ok(Some(3))),
+        ] {
+            protect(mem, page, prot);
+            let got = access(&mut vcpu, GUEST_BASE, GUEST_BASE + page, value);
+            if got != expected {
+                wrong.push(format!("code page {prot}: {got:?}, not {expected:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// Guest program: adds 1 to the word at X1, forever.
+    const INCREMENT: [u32; 4] = [
+        0xf9400023, // ldr x3, [x1]
+        0x91000463, // add x3, x3, #1
+        0xf9000023, // str x3, [x1]
+        0x17fffffd, // b .-12
+    ];
+
+    /// No guest store lands after a host `mprotect` returned, as on Linux,
+    /// where mprotect invalidates the range's secondary mappings before it
+    /// returns (mm/mprotect.c, v6.12, :455 to :458; KVM's notifier unmaps
+    /// stage 2 and flushes its TLB entries) and the next fault's write is
+    /// refused (mm/gup.c `check_vma_flags` :1285 to :1287): a vCPU running a
+    /// loop that increments a word, the host makes the word's page
+    /// `PROT_READ`; after that returned the word does not change over 50 ms,
+    /// and `KVM_RUN` ends with `EFAULT`. The control: the word changes over
+    /// 50 ms before the mprotect. A run that has not ended after 10 s is
+    /// kicked, and so reports `EINTR`.
+    #[test]
+    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
+    fn test_no_guest_store_lands_after_a_host_mprotect_returned() {
+        extern "C" fn nothing(_: libc::c_int) {}
+        // SAFETY: a handler that does nothing.
+        unsafe { libc::signal(libc::SIGUSR2, nothing as *const () as libc::sighandler_t) };
+        let (vm, mut vcpu, mem, _len) = vm_with_memory(1, &INCREMENT);
+        let page = host_page_size();
+        for (id, v) in [(PC, GUEST_BASE), (PSTATE, 0x3c5), (x_reg(1), GUEST_BASE + page)] {
+            vcpu.set_one_reg(id, &v.to_le_bytes()).unwrap();
+        }
+        // SAFETY: dup of the vCPU's descriptor, owned by the new handle.
+        let mut kicker = unsafe {
+            vm.create_vcpu_from_rawfd(libc::dup(std::os::unix::io::AsRawFd::as_raw_fd(&vcpu))).unwrap()
+        };
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            // SAFETY: plain call.
+            tid_tx.send(unsafe { libc::pthread_self() } as usize).unwrap();
+            vcpu.set_kvm_immediate_exit(0);
+            let ran = match vcpu.run() {
+                Ok(exit) => Ok(format!("{exit:?}")),
+                Err(e) => Err(e.errno()),
+            };
+            done_tx.send(ran).unwrap();
+        });
+        let thread = tid_rx.recv().unwrap() as libc::pthread_t;
+        let at = mem as u64 + page;
+        let started = Instant::now();
+        while word(at) == 0 && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let before = word(at);
+        std::thread::sleep(Duration::from_millis(50));
+        let control = word(at);
+        // SAFETY: the counter's page, not the code's.
+        protect(unsafe { mem.add(page as usize) }, page, libc::PROT_READ);
+        let after = word(at);
+        std::thread::sleep(Duration::from_millis(50));
+        let later = word(at);
+        let ran = done_rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| loop {
+            kicker.set_kvm_immediate_exit(1);
+            // SAFETY: a live thread of this process.
+            unsafe { libc::pthread_kill(thread, libc::SIGUSR2) };
+            if let Ok(ran) = done_rx.recv_timeout(Duration::from_millis(1)) {
+                break ran;
+            }
+        });
+        runner.join().unwrap();
+        assert!(before != 0 && control != before, "the control: the word was {before}, then {control} 50 ms later");
+        assert!(
+            after == later && ran == Err(libc::EFAULT),
+            "after the mprotect returned the word was {after}, then {later} 50 ms later; the run: {ran:?}"
+        );
+    }
+
+    /// A memory slot made over host memory that is `PROT_READ` gives the
+    /// guest that memory read-only from the start, as on Linux, where the
+    /// slot's first stage-2 fault takes the page through the vma: a load
+    /// reads it, a store is refused (mm/gup.c, v6.12, `check_vma_flags` :1285
+    /// to :1287) and `KVM_RUN` ends with `EFAULT` (arch/arm64/kvm/mmu.c :1579
+    /// to :1580). The host's page keeps its contents.
+    #[test]
+    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
+    fn test_a_slot_over_memory_mapped_read_only_starts_read_only() {
+        let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let extra = extra_slot(&vm, 1, 0x5a, libc::PROT_READ, 0);
+        let mut wrong = Vec::new();
+        let load = access(&mut vcpu, GUEST_BASE + 16, EXTRA, 0);
+        if load != Ok(Some(0x5a5a_5a5a_5a5a_5a5a)) {
+            wrong.push(format!("the load: {load:?}"));
+        }
+        let store = access(&mut vcpu, GUEST_BASE, EXTRA, 7);
+        if store != Err(libc::EFAULT) {
+            wrong.push(format!("the store: {store:?}"));
+        }
+        if word(extra) != 0x5a5a_5a5a_5a5a_5a5a {
+            wrong.push(format!("the host's page holds {:#x}", word(extra)));
+        }
+        // SAFETY: the test's mapping.
+        unsafe { libc::munmap(extra as *mut _, host_page_size() as usize) };
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// A guest store to a read-only memory slot exits as MMIO, also when the
+    /// host made the slot's memory `PROT_READ`, as on Linux, where
+    /// `kvm_handle_guest_abort` sends a write to a read-only memslot to MMIO
+    /// before it looks at the host page (arch/arm64/kvm/mmu.c, v6.12, :1839,
+    /// `io_mem_abort` :1880): the host protection's check does not come
+    /// first. A load reads the memory, and the host's page keeps its
+    /// contents.
+    #[test]
+    fn test_a_store_to_a_read_only_slot_is_still_mmio() {
+        for prot in [libc::PROT_READ | libc::PROT_WRITE, libc::PROT_READ] {
+            let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+            let extra = extra_slot(&vm, 1, 0x5a, prot, KVM_MEM_READONLY);
+            for (id, v) in [(PC, GUEST_BASE), (PSTATE, 0x3c5), (x_reg(1), EXTRA), (x_reg(3), 7), (x_reg(4), MMIO)] {
+                vcpu.set_one_reg(id, &v.to_le_bytes()).unwrap();
+            }
+            match vcpu.run() {
+                Ok(crate::VcpuExit::MmioWrite(EXTRA, data)) => assert_eq!(data, &7u64.to_le_bytes(), "prot {prot}"),
+                other => panic!("prot {prot}: {other:?}"),
+            }
+            assert_eq!(access(&mut vcpu, GUEST_BASE + 16, EXTRA, 0), Ok(Some(0x5a5a_5a5a_5a5a_5a5a)), "prot {prot}");
+            assert_eq!(word(extra), 0x5a5a_5a5a_5a5a_5a5a, "prot {prot}");
+            // SAFETY: the test's mapping.
+            unsafe { libc::munmap(extra as *mut _, host_page_size() as usize) };
+        }
+    }
+
+    /// A guest access the host protection refuses to a page a userfaultfd
+    /// has not filled posts no event, as on Linux, where GUP checks the
+    /// vma's flags (mm/gup.c, v6.12, `check_vma_flags` :1303 to :1305)
+    /// before it faults the page in (`handle_mm_fault`, which would post the
+    /// event): `KVM_RUN` ends with `EFAULT` and the userfaultfd has nothing
+    /// to read. Bounded: an event posted is answered by a fill after the
+    /// mprotect back, which lets the guest go on.
+    #[test]
+    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
+    fn test_a_refused_access_to_a_missing_page_posts_no_event() {
+        let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        // SAFETY: a fresh anonymous mapping, kept for the test.
+        let extra = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(extra, libc::MAP_FAILED);
+        let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+        libc::wick_uffd::register(ctx, extra as u64, page).unwrap();
+        let region = kvm_userspace_memory_region {
+            slot: 1,
+            guest_phys_addr: EXTRA,
+            memory_size: page,
+            userspace_addr: extra as u64,
+            flags: 0,
+        };
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+        protect(extra, page, libc::PROT_NONE);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || done_tx.send(access(&mut vcpu, GUEST_BASE + 16, EXTRA, 0)).unwrap());
+        let mut poll = libc::pollfd { fd: user, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one pollfd.
+        let posted = unsafe { libc::poll(&mut poll, 1, 2000) } > 0;
+        if posted {
+            let mut msg = [0u8; 32];
+            // SAFETY: a buffer of a message's size.
+            assert_eq!(unsafe { libc::read(user, msg.as_mut_ptr().cast(), msg.len()) }, 32);
+            protect(extra, page, libc::PROT_READ | libc::PROT_WRITE);
+            let data = vec![0u8; page as usize];
+            // SAFETY: `data` holds a page.
+            assert_eq!(unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), extra as u64, page, true) }, Ok(page));
+        }
+        let ran = done_rx.recv_timeout(Duration::from_secs(10)).expect("the guest's load did not end within 10 s");
+        runner.join().unwrap();
+        // SAFETY: the test's descriptor and mapping.
+        unsafe {
+            libc::close(user);
+            libc::munmap(extra, page as usize);
+        }
+        assert!(!posted && ran == Err(libc::EFAULT), "an event posted: {posted}; the load: {ran:?}");
+    }
+
+    /// The guest reaches no memory where the host unmapped slot memory, and
+    /// reaches the new memory the host maps there, as on Linux, where munmap
+    /// invalidates the range's secondary mappings (mm/vma.c, v6.12,
+    /// `unmap_vmas` :1095), a stage-2 fault with no vma is `EFAULT` (mm/gup.c
+    /// :1464 to :1466) and one after a new mapping takes the new vma's page.
+    /// Here Hypervisor.framework maps the physical pages behind a host range
+    /// at `hv_vm_map`, and keeps them after the host unmaps the range. The
+    /// new mapping by `MAP_FIXED`, and by an address hint, retried at most 8
+    /// times: a hint the kernel does not place there is printed ("not
+    /// placed") and the result line counts the attempts placed. The
+    /// control: the slot's page that stays.
+    #[test]
+    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
+    fn test_a_guest_reaches_new_memory_mapped_where_slot_memory_was_unmapped() {
+        let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        let extra = extra_slot(&vm, 3, 0x11, libc::PROT_READ | libc::PROT_WRITE, 0);
+        let load = GUEST_BASE + 16;
+        let new_page = |at: u64, fixed: bool, fill: u8| -> u64 {
+            let flags = libc::MAP_ANON | libc::MAP_PRIVATE | if fixed { libc::MAP_FIXED } else { 0 };
+            // SAFETY: over a hole of the test's mapping, or anywhere the kernel puts it.
+            let p = unsafe {
+                libc::mmap(at as *mut _, page as usize, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0)
+            };
+            assert_ne!(p, libc::MAP_FAILED);
+            // SAFETY: the page just mapped.
+            unsafe { std::ptr::write_bytes(p.cast::<u8>(), fill, page as usize) };
+            p as u64
+        };
+        let unmap = |at: u64| {
+            // SAFETY: a page of the test's mappings.
+            assert_eq!(unsafe { libc::munmap(at as *mut _, page as usize) }, 0);
+        };
+        assert_eq!(access(&mut vcpu, load, EXTRA, 0), Ok(Some(0x1111_1111_1111_1111)), "the control");
+        let mut wrong = Vec::new();
+        let mut check = |what: &str, got: std::result::Result<Option<u64>, i32>, expected| {
+            if got != expected {
+                wrong.push(format!("{what}: {got:?}, not {expected:?}"));
+            }
+        };
+        unmap(extra + page);
+        check("unmapped", access(&mut vcpu, load, EXTRA + page, 0), Err(libc::EFAULT));
+        assert_eq!(new_page(extra + page, true, 0x22), extra + page);
+        check("MAP_FIXED", access(&mut vcpu, load, EXTRA + page, 0), Ok(Some(0x2222_2222_2222_2222)));
+        unmap(extra + 2 * page);
+        check("unmapped again", access(&mut vcpu, load, EXTRA + 2 * page, 0), Err(libc::EFAULT));
+        let (mut placed, mut elsewhere) = (0, Vec::new());
+        for _ in 0..8 {
+            let p = new_page(extra + 2 * page, false, 0x33);
+            if p == extra + 2 * page {
+                placed += 1;
+                break;
+            }
+            println!("not placed: the hint {:#x} gave {p:#x}", extra + 2 * page);
+            elsewhere.push(p);
+        }
+        if placed == 1 {
+            check("the hint", access(&mut vcpu, load, EXTRA + 2 * page, 0), Ok(Some(0x3333_3333_3333_3333)));
+        }
+        println!("the hint: {placed} of {} attempts placed", placed + elsewhere.len());
+        for p in elsewhere {
+            unmap(p);
+        }
+        // SAFETY: the test's mapping, its pages mapped again above.
+        unsafe { libc::munmap(extra as *mut _, (3 * page) as usize) };
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// A page the host made `PROT_WRITE` alone: a guest load is `EFAULT`
+    /// (mm/gup.c, v6.12, `check_vma_flags` :1303 to :1305), a guest store
+    /// lands (:1285 passes), and then the guest reads it, as on Linux, where
+    /// the write fault maps the page readable as well as writable
+    /// (arch/arm64/kvm/mmu.c :1441 `KVM_PGTABLE_PROT_R` always, :1659 to
+    /// :1660 W); an mprotect to `PROT_WRITE` again invalidates that mapping,
+    /// and a load is `EFAULT` again.
+    #[test]
+    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
+    fn test_a_write_only_host_page_is_readable_by_the_guest_after_its_write() {
+        let (_vm, mut vcpu, mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        // SAFETY: a page of the test's mapping, not the code's.
+        let one = unsafe { mem.add(page as usize) };
+        let (store, load, at) = (GUEST_BASE, GUEST_BASE + 16, GUEST_BASE + page);
+        let mut wrong = Vec::new();
+        protect(one, page, libc::PROT_WRITE);
+        for (what, pc, value, expected) in [
+            ("the first load", load, 0, Err(libc::EFAULT)),
+            ("the store", store, 5, Ok(Some(5))),
+            ("the load after the store", load, 0, Ok(Some(5))),
+        ] {
+            let got = access(&mut vcpu, pc, at, value);
+            if got != expected {
+                wrong.push(format!("{what}: {got:?}, not {expected:?}"));
+            }
+        }
+        protect(one, page, libc::PROT_WRITE);
+        let got = access(&mut vcpu, load, at, 0);
+        if got != Err(libc::EFAULT) {
+            wrong.push(format!("the load after PROT_WRITE again: {got:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
     }
 
     /// Guest program: writes X3 to every page from X5 to X2, adds 1 to X3,

@@ -408,6 +408,46 @@ upstream Firecracker and its jailer.
   as two halves, swapped one at a time, so that the other half keeps the region's page table.
 - **Without the jailer, the VMM runs as the user who started it** on macOS and Windows: an escape from the VM and
   then the VMM lands as that user (files are then not limited, as on Linux without the jailer).
+- **macOS: stage 2 does not follow the host's protection of guest memory yet.** On Linux each stage-2 page of a
+  memslot is taken through the host's vma, so a guest access is allowed only as the host's protection allows, and an
+  `mprotect` or `munmap` of slot memory invalidates stage 2 before it returns (mm/gup.c, v6.12, `check_vma_flags`
+  :1285 to :1287 and :1303 to :1305, no vma :1464 to :1466; mm/mprotect.c :455 to :458; mm/vma.c `unmap_vmas` :1095;
+  arch/arm64/kvm/mmu.c :1579 to :1580). Hypervisor.framework maps the physical pages behind a host range at
+  `hv_vm_map`, with the slot's permissions, and the backend does not yet follow a later change of the range's
+  protection or mapping; pages the host replaces (`MADV_DONTNEED`, `MAP_FIXED`) it follows already. Each case below
+  has a test in crates/compat/kvm-ioctls/src/hvf/vm.rs, ignored until this is done, and what it measured, worst
+  first:
+  - The guest reaches slot memory the host unmapped: it read the old pages where Linux's access is `EFAULT`, and
+    kept them where the host mapped new memory at the same address by a hint
+    (`test_a_guest_reaches_new_memory_mapped_where_slot_memory_was_unmapped`: "unmapped:
+    Ok(Some(1229782938247303441)), not Err(14)", "the hint: Ok(Some(1229782938247303441)), not
+    Ok(Some(3689348814741910323))"; its `MAP_FIXED` case passes).
+  - Guest stores land on memory the host made read-only: after the `mprotect`
+    (`test_a_guest_access_the_host_protection_refuses_is_efault`: "a store to a read-only page", `Ok(Some(8))` where
+    Linux gives `Err(14)`), while a vCPU runs (`test_no_guest_store_lands_after_a_host_mprotect_returned`: "the word
+    was 91141332, then 178463532 50 ms later"), and in a slot made over read-only memory, whose host page took the
+    store (`test_a_slot_over_memory_mapped_read_only_starts_read_only`: "the store: Ok(Some(7))", "the host's page
+    holds 0x7").
+  - The guest executes from a page the host made `PROT_NONE` (`test_a_guest_executes_from_a_host_read_only_page`:
+    "code page 0: Ok(Some(2)), not Err(14)").
+  - A guest access the host refuses, to a page a userfaultfd has not filled, posts an event, which Linux does not
+    (`test_a_refused_access_to_a_missing_page_posts_no_event`: "an event posted: true; the load: Ok(Some(0))").
+  - The guest reads a page the host made `PROT_WRITE` alone before it writes it
+    (`test_a_write_only_host_page_is_readable_by_the_guest_after_its_write`: "the first load: Ok(Some(0)), not
+    Err(14)", "the load after PROT_WRITE again: Ok(Some(5))").
+
+  As Linux already: a guest store to a read-only memory slot exits as MMIO, also with the slot's memory `PROT_READ`
+  (`test_a_store_to_a_read_only_slot_is_still_mmio`). Firecracker reaches none of the cases above, as read from the
+  code: it changes the protection of guest memory only outside a live slot (virtio-mem's `update_slot`,
+  lib/firecracker/src/vmm/src/vstate/memory.rs :701, makes a slot readable and writable before it adds it and
+  `PROT_NONE` after it removes it; `register_memory_region`, vstate/vm.rs :497, protects only the slots it does not
+  add); it maps a read-only pmem's memory `PROT_READ` in a read-only slot (devices/virtio/pmem/device.rs :192 to
+  :195 and :335 to :339); it replaces hotplugged memory's pages by `MAP_FIXED` (memory.rs :797 to :808), which is
+  followed; and it unmaps guest memory at teardown, after `Vmm`'s drop has ended the vCPU threads (lib.rs :794 to
+  :798) and the VM's descriptor is dropped (`VmCommon`, vstate/vm.rs :81, before the guest memory at :84). No other
+  process can make these changes to the VMM's memory, and a compromised VMM can read and write guest memory
+  directly, so it gains nothing by them. The compatibility layer is held to Linux's behaviour all the same, so that
+  code which relies on the host's protection of guest memory behaves here as it does on Linux.
 - **macOS jailer: no namespaces in the kernel.** macOS has no network or PID namespaces (XNU's system calls,
   bsd/kern/syscalls.master, have no `unshare`, `setns` or `clone`): IP networking is denied by the sandbox; a
   jailed VMM uses Unix socket endpoints in the jail or in the directory `--netns` names, the jail's network.
