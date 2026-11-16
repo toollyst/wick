@@ -1900,8 +1900,20 @@ function Stage-Cpu([int]$Boots = 12) {
 # on A, and for each of the two loops, 10 s on A's vCPU 1:
 # - storm: the guest's own LVT timer value written back to MSR 0x832
 #   through /dev/cpu/1/msr, one WRMSR a pwrite (Linux v6.1
-#   arch/x86/kernel/msr.c msr_write: wrmsr_safe_on_cpu, writes allowed by
-#   default with a rate-limited warning, filter_write);
+#   arch/x86/kernel/msr.c msr_write: wrmsr_safe_on_cpu after filter_write).
+#   Mainline allows such writes by default with a rate-limited warning
+#   (`allow_writes = MSR_WRITES_DEFAULT`), but CI's guest kernel, upstream
+#   Firecracker's vmlinux-6.1.188 built from Amazon Linux's tree
+#   (amazonlinux/linux, microvm-kernel-6.1.188-56.393.amzn2023, as
+#   lib/firecracker/resources/rebuild.sh picks it), sets
+#   `allow_writes = MSR_WRITES_OFF` (its msr.c :51), so filter_write
+#   refuses every write with EPERM (:95) unless the command line has
+#   msr.allow_writes=on (:296 to :329): CI run 43927377548's storm died so
+#   at its first write. Before the runs the stage says what A's kernel
+#   has (X2STORMMSR: uname -r, the msr module's allow_writes, the lockdown
+#   LSM's state or its absence, the config's lockdown and X86_MSR lines)
+#   and makes one write of the value read; a write refused fails the stage
+#   there, with the errno and those values;
 # - control: a byte written to port 0x80 through /dev/port (an exit to the
 #   VMM, no hold);
 # and records: the loop's writes and the time a write; A's held writes over
@@ -1943,9 +1955,50 @@ else:
 print('DONE', tag, mode, n, '%.3f' % (time.monotonic() - t0), v.hex() or '-', flush=True)
 '@
 
+# The guest command of a loop: python3 runs $StormGuest, then the shell
+# says how it ended (`EXIT <tag> <status>`), so that a loop that dies (a
+# traceback) ends the wait for it at once ([Wait-StormLoop]).
 function Get-StormCommand([string]$mode, [int]$cpu, [int]$secs, [string]$tag) {
     $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(($StormGuest -replace "`r", '')))
-    "python3 -c `"import base64,sys;exec(base64.b64decode('$b64'))`" $mode $cpu $secs $tag"
+    "python3 -c `"import base64,sys;exec(base64.b64decode('$b64'))`" $mode $cpu $secs $tag; echo EXIT $tag `$?"
+}
+
+# The guest's own lines of `vm`'s console from `from` (a length of its
+# text) on, the last `n`, joined: the VMM's log lines (a timestamp, then
+# "[<id>:fc_") left out, which in CI run 43927377548 were all a failure
+# message quoted (A's API log) and hid the guest's traceback.
+function Get-GuestLines($vm, [int]$from, [int]$n = 6) {
+    $t = $vm.Text()
+    if ($from -gt $t.Length) { $from = 0 }
+    @($t.Substring($from) -split "`r?`n" | Where-Object { $_.Trim() -and $_ -notmatch '^\d{4}-\d\d-\d\dT[\d:.]+ \[[^\]]*:fc_' } | Select-Object -Last $n) -join ' | '
+}
+
+# Waits up to `sec` s for loop `tag` on `vm` to end (its EXIT line, which
+# comes at once when python3 dies): $null when it printed DONE and ended with
+# 0, else why not, with the guest's own lines since `from`.
+function Wait-StormLoop($vm, [string]$tag, [int]$from, [int]$sec) {
+    if (-not $vm.WaitFor("(?m)^EXIT $tag \d+", $sec)) { return "did not end in $sec s: $(Get-GuestLines $vm $from)" }
+    $t = $vm.Text()
+    $code = [regex]::Match($t, "(?m)^EXIT $tag (\d+)").Groups[1].Value
+    $done = $t -match "(?m)^DONE $tag "
+    if ($code -ne '0' -or -not $done) { return "ended with status $code$(if (-not $done) { ', no DONE line' }): $(Get-GuestLines $vm $from)" }
+    $null
+}
+
+# X2STORMMSR: what A's kernel has for an MSR write through /dev/cpu/1/msr,
+# and one write of MSR 0x832's own value: the line, and whether the write
+# was taken. sysfs and securityfs are mounted for it (init=/bin/sh mounts
+# neither); every value is said, its absence too.
+function Get-MsrWrites($vm) {
+    [void]$vm.Sh('mount -t sysfs sysfs /sys 2>/dev/null; mount -t securityfs securityfs /sys/kernel/security 2>/dev/null; echo mounted', 10)
+    $uname = $vm.Sh('uname -r', 10)
+    $allow = $vm.Sh('cat /sys/module/msr/parameters/allow_writes 2>&1 | tr "\n" " "', 10)
+    $lockdown = $vm.Sh('if test -e /sys/kernel/security/lockdown; then cat /sys/kernel/security/lockdown; else echo absent; fi 2>&1 | tr "\n" " "', 10)
+    $config = $vm.Sh('zcat /proc/config.gz 2>&1 | grep -i -E "lockdown|X86_MSR" | tr "\n" " "', 20)
+    $write = $vm.Sh('python3 -c "import os;f=os.open(\"/dev/cpu/1/msr\",os.O_RDWR);v=os.pread(f,8,0x832);os.pwrite(f,v,0x832);print(\"taken\",v.hex())" 2>&1 | tail -1', 20)
+    $dmesg = $vm.Sh('dmesg 2>&1 | grep -i -E "msr|lockdown" | tail -3 | tr "\n" " "', 10)
+    $line = "X2STORMMSR A's kernel $uname; msr allow_writes '$($allow.Trim())'; lockdown '$($lockdown.Trim())'; config '$($config.Trim())'; a write of MSR 0x832's value through /dev/cpu/1/msr: '$($write.Trim())'; dmesg '$($dmesg.Trim())'"
+    [pscustomobject]@{ Line = $line; Taken = $write -match '^taken ' }
 }
 
 # The record build's count of held LVT timer writes so far in a VM's output
@@ -1997,6 +2050,7 @@ function Stage-X2storm([int]$Runs = 5, [int]$Secs = 10) {
     $base = New-Base 'x2storm'
     $inv = [Globalization.CultureInfo]::InvariantCulture
     $rows = @()
+    $msrLine = ''
     for ($run = 1; $run -le $Runs; $run++) {
         foreach ($cap in @('', '100000 100000')) {
             $capName = if ($cap) { 'cpu.max one CPU' } else { 'no cpu.max' }
@@ -2018,19 +2072,30 @@ function Stage-X2storm([int]$Runs = 5, [int]$Secs = 10) {
                 Check ($deadline -eq '4') "A's local timers in TSC-deadline mode (/proc/timer_list): '$deadline' of 4 vCPUs"
                 $dev = $a.Sh('test -c /dev/cpu/1/msr && test -c /dev/port && echo both', 10)
                 Check ($dev -eq 'both') "A has no /dev/cpu/1/msr or /dev/port: '$dev'"
+                $msr = Get-MsrWrites $a
+                Write-Host "     $($msr.Line)"
+                if ($run -eq 1 -and -not $cap) { $msrLine = $msr.Line }
+                Check $msr.Taken "${capName}: A's kernel refused a write of MSR 0x832, so the storm cannot run: $($msr.Line)"
                 $fcA = Get-JailedFirecracker $base $ida
                 foreach ($mode in @('control', 'storm')) {
                     $tag = "$ida$mode"
                     $held0 = Get-HeldWrites $a.Text()
+                    $fromA = $a.Text().Length; $fromB = $b.Text().Length
                     $b.Send((Get-StormCommand 'tick' 0 $Secs "B$tag"))
                     $a.Send((Get-StormCommand $mode 1 $Secs "A$tag"))
                     # Inside both loops: they start once python3 has.
                     Start-Sleep -Milliseconds 1500
+                    # A loop that died at its start fails the stage now.
+                    foreach ($l in @(@($a, "A$tag", $fromA, 'A'), @($b, "B$tag", $fromB, 'B'))) {
+                        if ($l[0].Text() -match "(?m)^EXIT $($l[1]) \d+") { Check $false "${capName}, ${mode}: $($l[3])'s loop ended at its start, $(Wait-StormLoop $l[0] $l[1] $l[2] 1)" }
+                    }
                     $fcA.Refresh(); $c0 = $fcA.TotalProcessorTime; $w0 = [Diagnostics.Stopwatch]::StartNew()
                     $api = Measure-ApiGets $a.Sock ($Secs - 3)
                     $fcA.Refresh(); $used = ($fcA.TotalProcessorTime - $c0).TotalSeconds / $w0.Elapsed.TotalSeconds
-                    Check ($a.WaitFor("(?m)^DONE A$tag ", $Secs + 60)) "${capName}, ${mode}: A's loop did not end: $(($a.Text() -split "`n" | Select-Object -Last 3) -join ' | ')"
-                    Check ($b.WaitFor("(?m)^DONE B$tag ", $Secs + 60)) "${capName}, ${mode}: B's loop did not end: $(($b.Text() -split "`n" | Select-Object -Last 3) -join ' | ')"
+                    $why = Wait-StormLoop $a "A$tag" $fromA ($Secs + 60)
+                    Check ($null -eq $why) "${capName}, ${mode}: A's loop $why"
+                    $why = Wait-StormLoop $b "B$tag" $fromB ($Secs + 60)
+                    Check ($null -eq $why) "${capName}, ${mode}: B's loop $why"
                     $held = (Get-HeldWrites $a.Text()) - $held0
                     $da = [regex]::Match($a.Text(), "(?m)^DONE A$tag \S+ (\d+) ([\d.]+) (\S+)")
                     $db = [regex]::Match($b.Text(), "(?m)^DONE B$tag \S+ (\d+) ([\d.]+)")
@@ -2059,7 +2124,7 @@ function Stage-X2storm([int]$Runs = 5, [int]$Secs = 10) {
         Write-Host "     $l"
         $l
     }
-    $sum -join '; '
+    (@($msrLine) + $sum) -join '; '
 }
 
 # Row 8 of docs/PORTING.md, the freezer (overlay/jailer/platform/windows/freezer.rs):
