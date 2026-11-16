@@ -768,6 +768,32 @@ upstream Firecracker and its jailer.
   another length, or one placed by a hint or `MAP_FIXED` (making such a chunk movable is review B4's, owed).
 - **Without the jailer, the VMM runs as the user who started it** on macOS and Windows: an escape from the VM and
   then the VMM lands as that user (files are then not limited, as on Linux without the jailer).
+- **macOS: a page is charged to the memory limit once for each mapping that touched it.** The jail's memory limit
+  (`memory.max`, `memory.limit_in_bytes`) is a jetsam limit: the jailer spawns Firecracker with it, fatal when active
+  and when inactive, in whole MiB (overlay/jailer/platform/macos/mod.rs `posix_spawnattr_setjetsam_ext` :934 to
+  :939), and with the API process on, Firecracker sets its own to the limit less 32 MiB, which the API process takes
+  (overlay/vmm/ext/jail.rs :659 to :662, :540, `limit_memory` :475). A jetsam limit is a limit on the process's
+  phys_footprint ledger, and the process is killed with SIGKILL past it (xnu-12377.121.6 bsd/kern/kern_memorystatus.c
+  :261, osfmk/kern/task.c `task_set_phys_footprint_limit_internal` :7602, the ledger's limit :7649). Measured on an
+  M1 Pro, macOS 27.2, 64 MiB at a time, three rounds each the same: phys_footprint counts a page once for each
+  mapping that has touched it. Guest memory the guest wrote (Hypervisor.framework's stage 2) and the VMM then read
+  is charged 128 MiB, anonymous or a shared memory object as the compatibility memfd makes
+  (`test_anonymous_guest_memory_is_charged_once`, `test_shared_guest_memory_is_charged_once`); memory a userfaultfd
+  filled (through its alias, `wick_uffd`'s second mapping of every registered range) is charged 64 MiB at the fill,
+  64 more when the guest reads it and 64 more when the VMM reads it, 192 MiB, of which the alias's 64 are given
+  back when the userfaultfd is released (`test_a_guest_read_of_filled_pages_is_charged_once`); without a guest,
+  filled and read by the process, 128 MiB (`test_a_filled_page_is_charged_once`). A guest's write alone is charged
+  once (`test_madvise_dontneed_replaces_guest_pages` bounds it now). Linux charges a page to the memory cgroup once,
+  when it is allocated (v6.12 mm/memory.c `alloc_anon_folio` :4711, mm/shmem.c :1818; mm/memcontrol.c
+  `commit_charge` :2370 refuses a second charge), whatever then maps it, KVM's stage 2 included. So a jailed VMM is
+  killed by jetsam when the pages both its guest and it have touched (a device's queues and buffers; every page, when
+  it writes a snapshot's memory) reach half of what Linux would let them be, and a restore through a userfaultfd
+  handler at a third, while the userfaultfd is registered, for the pages the guest and the VMM both touched. The
+  four tests fail today and are listed (tools/macos/unit-test-differences.txt: the libc one as a bug, the three that
+  make a VM as no-hvf, as CI's runners make none; this Mac is where they run). The kill at the limit itself is from
+  the ledger's source above, not run with these figures (setting a jetsam limit takes root; `jailer-test memory`
+  runs the limit as root in CI's macos job, with no such factor). A fix is being designed, not done; until then,
+  give a jail's `memory.max` room for twice the guest memory the VMM will touch, three times under a userfaultfd.
 - **macOS jailer: no namespaces in the kernel.** macOS has no network or PID namespaces (XNU's system calls,
   bsd/kern/syscalls.master, have no `unshare`, `setns` or `clone`): IP networking is denied by the sandbox; a
   jailed VMM uses Unix socket endpoints in the jail or in the directory `--netns` names, the jail's network.

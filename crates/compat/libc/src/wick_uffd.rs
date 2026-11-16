@@ -4450,6 +4450,74 @@ mod tests {
         assert_ne!(names[0], names[1]);
     }
 
+    /// The process's phys_footprint, the ledger the jailer's memory limit
+    /// (a jetsam limit) is checked against.
+    fn phys_footprint() -> u64 {
+        // SAFETY: plain data filled by the call.
+        let mut info: libc::rusage_info_v4 = unsafe { core::mem::zeroed() };
+        // SAFETY: a V4 buffer for the V4 flavour.
+        let r = unsafe {
+            libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, ptr::from_mut(&mut info).cast())
+        };
+        assert_eq!(r, 0);
+        info.ri_phys_footprint
+    }
+
+    /// 64 MiB of registered memory filled with `UFFDIO_COPY` and then read
+    /// through the memory, as the VMM reads guest memory a handler filled,
+    /// is charged 64 MiB, as on Linux, whose memory cgroup charges a page
+    /// once, when it is allocated (v6.12 mm/memcontrol.c `commit_charge`
+    /// :2370 refuses a second charge), whatever then maps it. Prints the
+    /// footprint after each step (FOOTPRINT lines). Fails today, and is
+    /// listed (tools/macos/unit-test-differences.txt, bug): the page is
+    /// charged once for the alias the fill wrote it through and again for
+    /// the memory, 128 MiB (SECURITY.md, Not at parity yet, "macOS: a page
+    /// is charged to the memory limit once for each mapping that touched
+    /// it"). In a process of its own, so that no other test's memory moves
+    /// the footprint meanwhile.
+    #[test]
+    fn test_a_filled_page_is_charged_once() {
+        if !in_own_process("wick_uffd::tests::test_a_filled_page_is_charged_once") {
+            return;
+        }
+        const MIB: u64 = 64;
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let pages = (MIB << 20) / ps;
+        let mem = map(pages);
+        register(ctx, mem, pages * ps).unwrap();
+        let src = std::vec![0x5au8; ps as usize];
+        let before = phys_footprint();
+        let step = |name: &str, last: u64| {
+            let now = phys_footprint();
+            std::println!(
+                "FOOTPRINT MiB: {name}: {:+} (total {:+})",
+                (now as i64 - last as i64) >> 20,
+                (now as i64 - before as i64) >> 20
+            );
+            now
+        };
+        for i in 0..pages {
+            // SAFETY: a readable page of source.
+            assert_eq!(unsafe { copy(ctx, src.as_ptr(), mem + i * ps, ps, false) }, Ok(ps));
+        }
+        let filled = step("filled through the alias", before);
+        let mut sum = 0u64;
+        for i in 0..pages {
+            // SAFETY: filled pages of the mapping.
+            sum += u64::from(unsafe { ptr::read_volatile((mem + i * ps) as *const u8) });
+        }
+        assert_eq!(sum, 0x5a * pages);
+        let read = step("read through the memory", filled);
+        close(&[user]);
+        until("the release", || CTXS[ctx].fd.load(Ordering::SeqCst) < 0);
+        step("released (the alias gone)", read);
+        // SAFETY: the test's own mapping.
+        unsafe { libc::munmap(mem as *mut _, (pages * ps) as usize) };
+        let charged = (read - before) >> 20;
+        assert!(charged <= MIB + 4, "{MIB} MiB filled and read is charged {charged} MiB");
+    }
+
     /// A fault whose slot is released and taken by another userfaultfd's
     /// range once its waiter is registered posts nothing and runs its access
     /// again, which goes through to the memory, now in no registration.

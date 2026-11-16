@@ -2557,6 +2557,10 @@ mod tests {
         fill(&mut vcpu, len, 0x5a5a);
         let written = phys_footprint();
         assert!(written - idle >= 60 << 20, "footprint {idle} -> {written} for {MIB} MiB written");
+        // Written by the guest alone: charged once (the host's reads below
+        // are of two pages). A host read of every page charges each again:
+        // `test_anonymous_guest_memory_is_charged_once`.
+        assert!(written - idle <= (MIB as u64 + 4) << 20, "footprint {idle} -> {written} for {MIB} MiB written");
         assert_eq!(at(page), 0x5a5a);
         assert_eq!(at(len - page), 0x5a5a);
 
@@ -2573,6 +2577,7 @@ mod tests {
         assert_eq!(at(len - page), 0x1234);
         let again = phys_footprint();
         assert!(again - discarded >= 60 << 20, "footprint {discarded} -> {again} after the guest wrote again");
+        assert!(again - discarded <= (MIB as u64 + 4) << 20, "footprint {discarded} -> {again} after the guest wrote again");
         println!(
             "phys_footprint KiB: idle {}, guest wrote {MIB} MiB {}, discarded {}, guest wrote again {}",
             idle >> 10,
@@ -2580,6 +2585,192 @@ mod tests {
             discarded >> 10,
             again >> 10
         );
+    }
+
+    /// Guest program: reads every page from X1 to X2, then writes X3 to X4
+    /// (MMIO: the exit). [`FILL`] with a load for its store.
+    const READ: [u32; 6] = [0xf9400025, 0x91401021, 0xeb02003f, 0x54ffffa3, 0xf9000083, 0x14000000];
+
+    /// Runs `code`'s loop (FILL or READ, at [`GUEST_BASE`]) over `[from, to)`.
+    fn guest_pass(vcpu: &mut VcpuFd, from: u64, to: u64) {
+        for (id, v) in [(PC, GUEST_BASE), (PSTATE, 0x3c5), (x_reg(1), from), (x_reg(2), to), (x_reg(3), 0x77), (x_reg(4), MMIO)] {
+            vcpu.set_one_reg(id, &v.to_le_bytes()).unwrap();
+        }
+        match vcpu.run().unwrap() {
+            crate::VcpuExit::MmioWrite(MMIO, _) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Reads every page of `[mem, mem + len)` from the host.
+    fn host_pass(mem: u64, len: u64) -> u64 {
+        let page = host_page_size();
+        (0..len / page)
+            // SAFETY: pages of the caller's mapping.
+            .map(|i| u64::from(unsafe { std::ptr::read_volatile((mem + i * page) as *const u8) }))
+            .sum()
+    }
+
+    /// A step of [`footprint_steps`]: its name, and what it does with the
+    /// vCPU, the memory's host address, its guest address and its length.
+    type FootprintStep<'a> = (&'a str, &'a mut dyn FnMut(&mut VcpuFd, u64, u64, u64));
+
+    /// The guest memory [`footprint_steps`] makes, in MiB.
+    const FOOTPRINT_MIB: u64 = 64;
+
+    /// [`FOOTPRINT_MIB`] of guest memory in slot 1, `backing` (a fresh
+    /// mapping of it), then `steps`, each a name and an action, with the
+    /// footprint printed after each (FOOTPRINT lines). Returns what the
+    /// steps but the last `after` were charged, in MiB.
+    fn footprint_steps(
+        code: &[u32],
+        backing: impl FnOnce(usize) -> *mut libc::c_void,
+        steps: &mut [FootprintStep<'_>],
+        after: usize,
+    ) -> u64 {
+        const MIB: usize = FOOTPRINT_MIB as usize;
+        let (vm, mut vcpu, _code, _) = vm_with_memory(1, code);
+        let len = MIB << 20;
+        let mem = backing(len) as u64;
+        let ipa = GUEST_BASE + (1 << 30);
+        let region = kvm_userspace_memory_region {
+            slot: 1,
+            guest_phys_addr: ipa,
+            memory_size: len as u64,
+            userspace_addr: mem,
+            flags: 0,
+        };
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+        let mut last = phys_footprint();
+        let first = last;
+        let mut charged = 0;
+        let count = steps.len() - after;
+        for (i, (name, step)) in steps.iter_mut().enumerate() {
+            step(&mut vcpu, mem, ipa, len as u64);
+            let now = phys_footprint();
+            println!(
+                "FOOTPRINT MiB: {name}: {:+} (total {:+})",
+                (now as i64 - last as i64) >> 20,
+                (now as i64 - first as i64) >> 20
+            );
+            last = now;
+            if i + 1 == count {
+                charged = (now - first) >> 20;
+            }
+        }
+        charged
+    }
+
+    /// Whether `charged` MiB is one charge for [`FOOTPRINT_MIB`] of memory
+    /// (4 MiB over for page tables and the test's own).
+    fn charged_once(charged: u64) -> bool {
+        charged <= FOOTPRINT_MIB + 4
+    }
+
+    /// 64 MiB of guest memory a userfaultfd filled, read by the guest and
+    /// then by the host (a device's read), is charged 64 MiB, as on Linux,
+    /// whose memory cgroup charges a page once, when it is allocated (v6.12
+    /// mm/memcontrol.c `commit_charge` :2370), whatever then maps it: the
+    /// VMM, KVM's stage 2. Prints the footprint after each step (FOOTPRINT
+    /// lines). Fails today on this Mac, 192 MiB: once for the alias the fill
+    /// wrote through, once for the guest's stage 2, once for the host's
+    /// mapping (SECURITY.md, Not at parity yet, "macOS: a page is charged to
+    /// the memory limit once for each mapping that touched it"); listed as
+    /// no-hvf, since CI's runners make no VM, so this Mac is where it runs.
+    #[test]
+    fn test_a_guest_read_of_filled_pages_is_charged_once() {
+        let page = host_page_size();
+        let uffd = std::cell::Cell::new(None::<(usize, libc::c_int)>);
+        let anonymous = |len: usize| {
+            // SAFETY: a fresh anonymous mapping, kept for the test.
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
+            assert_ne!(p, libc::MAP_FAILED);
+            p
+        };
+        let data = vec![0x5au8; page as usize];
+        let charged = footprint_steps(
+            &READ,
+            anonymous,
+            &mut [
+                ("registered", &mut |_, mem, _, len| {
+                    let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+                    libc::wick_uffd::register(ctx, mem, len).unwrap();
+                    uffd.set(Some((ctx, user)));
+                }),
+                ("filled through the alias", &mut |_, mem, _, len| {
+                    let (ctx, _) = uffd.get().unwrap();
+                    for i in 0..len / page {
+                        // SAFETY: `data` holds a page.
+                        assert_eq!(unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), mem + i * page, page, false) }, Ok(page));
+                    }
+                }),
+                ("read by the guest", &mut |vcpu, _, ipa, len| guest_pass(vcpu, ipa, ipa + len)),
+                ("read by the host", &mut |_, mem, _, len| assert_eq!(host_pass(mem, len), 0x5a * (len / page))),
+                ("released (alias gone)", &mut |_, _, _, _| {
+                    let (_, user) = uffd.take().unwrap();
+                    // SAFETY: the user end.
+                    unsafe { libc::close(user) };
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }),
+            ],
+            1,
+        );
+        assert!(charged_once(charged), "{FOOTPRINT_MIB} MiB filled and read by the guest and the host is charged {charged} MiB");
+    }
+
+    /// 64 MiB of anonymous guest memory with no userfaultfd, written by the
+    /// guest, then read by the host (a device's read of guest memory), is
+    /// charged 64 MiB, as on Linux (above). Fails today on this Mac, 128
+    /// MiB: once for the guest's stage 2, once for the host's mapping;
+    /// listed as no-hvf (above).
+    #[test]
+    fn test_anonymous_guest_memory_is_charged_once() {
+        let charged = footprint_steps(
+            &FILL,
+            |len| {
+                // SAFETY: a fresh anonymous mapping, kept for the test.
+                let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE, -1, 0) };
+                assert_ne!(p, libc::MAP_FAILED);
+                p
+            },
+            &mut [
+                ("written by the guest", &mut |vcpu, _, ipa, len| guest_pass(vcpu, ipa, ipa + len)),
+                ("read by the host", &mut |_, mem, _, len| assert_eq!(host_pass(mem, len), 0x77 * (len / host_page_size()))),
+            ],
+            0,
+        );
+        assert!(charged_once(charged), "{FOOTPRINT_MIB} MiB written by the guest and read by the host is charged {charged} MiB");
+    }
+
+    /// The same for a shared memory object as the compatibility memfd makes
+    /// one: 128 MiB today on this Mac; listed as no-hvf.
+    #[test]
+    fn test_shared_guest_memory_is_charged_once() {
+        let charged = footprint_steps(
+            &FILL,
+            |len| {
+                let name = std::ffi::CString::new(format!("/fcm.{}.fp", std::process::id())).unwrap();
+                // SAFETY: a NUL-terminated name; unlinked at once.
+                let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0 as libc::c_uint) };
+                assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+                // SAFETY: as above; sizes and maps the object.
+                unsafe {
+                    libc::shm_unlink(name.as_ptr());
+                    assert_eq!(libc::ftruncate(fd, len as libc::off_t), 0);
+                    let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+                    assert_ne!(p, libc::MAP_FAILED);
+                    libc::close(fd);
+                    p
+                }
+            },
+            &mut [
+                ("written by the guest", &mut |vcpu, _, ipa, len| guest_pass(vcpu, ipa, ipa + len)),
+                ("read by the host", &mut |_, mem, _, len| assert_eq!(host_pass(mem, len), 0x77 * (len / host_page_size()))),
+            ],
+            0,
+        );
+        assert!(charged_once(charged), "{FOOTPRINT_MIB} MiB written by the guest and read by the host is charged {charged} MiB");
     }
 
     #[test]
