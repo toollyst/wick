@@ -1794,10 +1794,12 @@ fn fill(
         // section does); AWE pages (`SeLockMemoryPrivilege`); and holding
         // the vCPUs out of the guest during each fill (the device threads
         // are left). A section filled through an alias and made accessible
-        // after, as `windows_uffd` fills registered memory, is race-free,
-        // but a Job Object does not charge sections (SECURITY.md, "memory.max
-        // does not bound memory in sections"): it waits for wick's own count
-        // of the section pages a process commits against `memory.max`.
+        // after, as `windows_uffd` fills registered memory, is race-free, and
+        // can be charged a page at a time as it is filled, as `windows_uffd`
+        // charges its pages (a Job Object does not charge sections; the
+        // jailer counts them: SECURITY.md, "Windows jailer: `memory.max`
+        // bounds memory in sections at the jailer's next count, not at
+        // once"): the way left for this mapping, not done yet.
         let file = dup(handle(fd)).map(Arc::new).ok_or(crate::EBADF)?;
         if !commit(base, len, PAGE_READWRITE, true) {
             return Err(crate::ENOMEM);

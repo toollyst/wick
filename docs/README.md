@@ -81,6 +81,9 @@ tools/patches.sh export                 # after committing a change on branch `w
 tools/patches.sh check                  # what CI checks about patches/
 ```
 
+The table below is a selection: the tools a contributor runs most. Every script under `tools/` (with
+`tools/linux/`, `tools/macos/` and `tools/windows/`) says what it does in its own header.
+
 | Tool | What it does |
 | --- | --- |
 | [`tools/setup.sh`](../tools/setup.sh) | Checks out upstream at `patches/base` and applies the series as commits on branch `wick` (`--force` discards local commits) |
@@ -103,7 +106,7 @@ tools/patches.sh check                  # what CI checks about patches/
 | [`tools/windows/jailer-test.ps1`](../tools/windows/jailer-test.ps1) | The jailer's scenario tests on WHP: refused options, the freezer (a jail frozen and thawed through upstream's cgroup files), the jail's isolation, bind links into the jail, links, handles, daemonize, pidns, netns, the API process, Job Object limits, hugepages, uffd and vhost-user under the jailer ([stages](../tools/windows/README.md)) |
 | [`tools/windows/check-ps.py`](../tools/windows/check-ps.py) | Checks the Windows PowerShell scripts on macOS or Linux, before they reach Windows: compiles every `Add-Type`'s C# with Mono's `mcs` as Windows PowerShell 5.1 compiles it (C# 5), each alone and each script's together (a type defined twice), and refuses a function defined twice in one scope and a non-ASCII script without a byte order mark; not the PowerShell itself (`--selftest` tests its checks) |
 | [`tools/windows/winprobe.c`](../tools/windows/winprobe.c) | Measures the Windows mechanisms the sandbox and jailer backends use |
-| [`tools/gen-windows-sources.sh`](../tools/gen-windows-sources.sh) | Generates the Windows builds of the rust-vmm crates (`--check` in CI) |
+| [`tools/gen-windows-sources.sh`](../tools/gen-windows-sources.sh) | Generates the Windows builds of the rust-vmm crates and of `polling` (`--check` in CI) |
 | [`tools/gen-kvm-bindings-windows.sh`](../tools/gen-kvm-bindings-windows.sh) | Generates `kvm-bindings` with the Linux x86_64 layout for Windows (`--check` in CI) |
 | [`tools/package-release.sh`](../tools/package-release.sh) | Packages a macOS release in upstream's release layout, with each binary's SBOM ([`tools/sbom.py`](../tools/sbom.py) checks it against `Cargo.lock`) |
 | [`tools/check-dependencies.sh`](../tools/check-dependencies.sh) | Dependency checks: advisories, licenses, banned and duplicate crates, sources ([CONTRIBUTING.md](../CONTRIBUTING.md#dependencies)) |

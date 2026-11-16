@@ -506,7 +506,10 @@ upstream Firecracker and its jailer.
   does. KVM intercepts every #GP the same way when `enable_vmware_backdoor` is set (Linux v6.1
   arch/x86/kvm/vmx/vmx.c 791, 5091-5103). The decode and the merge are unit-tested on every host (fuzz crate
   `whp_gp`); the storm's isolation (another vCPU's rate, the API's latency, the job's CPU accounting) is not
-  measured yet, and nothing of it has run on Windows yet. Its LVT timer write in TSC-deadline mode is the one #GP that
+  measured yet. The exit path itself has run on Windows, in record builds only: GPEXITREC
+  (`test_gp_exits_on_an_x2apic_partition_on_record`, a guest's #GP exits on an x2APIC partition) and
+  `boot-test.ps1 x2apic` (a Linux guest booted on such a partition) passed on CI's AMD runners in CI runs 43680983973
+  and 43688550565. Its LVT timer write in TSC-deadline mode is the one #GP that
   does more (option E-ii): WHP's register refuses that mode, and the APIC register page's get and set, the one other
   way, lose an interrupt requested between them (PC step 15a at 305a806,
   `test_a_page_set_loses_interrupts_and_the_held_lvt_timer_write_none`), so the handler holds every other vCPU of the

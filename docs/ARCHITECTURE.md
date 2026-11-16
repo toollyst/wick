@@ -45,7 +45,7 @@ Code that is new rather than a change to an upstream file lives outside the
 submodule. The overlay modules are declared from upstream's `vmm/src/lib.rs`
 with `#[path = "../../../../../overlay/vmm/..."]`, so they are part of the vmm
 crate (`crate::` paths work) while their files belong to wick. The patches
-therefore only change existing upstream files: 50 feature patches touching 88
+therefore only change existing upstream files: 51 feature patches touching 88
 files.
 
 ## Layers
@@ -75,6 +75,9 @@ firecracker binary, vmm   (upstream source + patches/)
                     kvm-bindings, vm-memory, event-manager, vhost and micro_http are
                     the original crate
             Windows: the same API on Win32 (kvm-ioctls → Windows Hypervisor Platform)
+        polling (by path from the Windows vmm-sys-util) → crates/compat/polling
+            Linux, macOS: re-exports polling 3.11.0 (nothing of wick's uses it there)
+            Windows: polling 3.11.0's source, its waitable removal fixed (below)
 ```
 
 ## How it is built
@@ -259,7 +262,35 @@ semantics on Win32. The details are in the comments of each
   (`test_f_getfl_makes_no_state_that_outlives_a_close_past_the_library`).
 - **epoll = IOCP (the `polling` crate).** Sockets use AFD polls; eventfds,
   consoles and other waitable handles use wait packets that complete on the
-  IOCP. Level-triggered is the default and `ONE_SHOT` is supported. Sockets
+  IOCP. A waitable's removal (`EPOLL_CTL_DEL`, and a dropped instance's
+  sources) returns once the thread pool no longer waits on the handle nor
+  runs that wait's callback (`UnregisterWaitEx` with `INVALID_HANDLE_VALUE`,
+  which "waits for all callback functions to complete before returning",
+  Learn), so the handle may be closed at once, as Linux's `EPOLL_CTL_DEL`
+  leaves nothing behind (fs/eventpoll.c `ep_remove`). polling 3.11.0 returned
+  at once, and a callback already running armed a new wait on the removed
+  handle, which its owner then closed: a handle "closed while the wait is
+  still pending" is undefined (Learn, `RegisterWaitForSingleObject`), and the
+  pool ended the process with STATUS_THREADPOOL_HANDLE_EXCEPTION (0xc000070a;
+  CI run 43676869163, the kvm-ioctls tests). wick builds polling with that
+  fixed (`crates/compat/polling`, generated from 3.11.0 by
+  `tools/gen-windows-sources.sh`, the change in
+  `tools/gen-windows-sources-polling.py`;
+  `test_a_removal_returns_once_a_running_callback_has_ended`,
+  `test_a_source_removed_with_its_packet_posted_yields_nothing`,
+  `test_a_modify_racing_the_callback_leaves_no_wait_behind`,
+  `test_a_dropped_poller_leaves_no_wait_on_its_sources`, and vmm-sys-util's
+  `test_an_eventfd_deleted_as_its_wait_fires_is_not_waited_on_once_closed`;
+  on Windows Server 2022 20348 the four passed in 3 of 3 runs and each fails
+  against upstream's code, the third with 0xc000070a; the vmm-sys-util test
+  passed 5 of 5; a loop of add, signal, remove and close on polling alone,
+  no wick code, ended with 0xc000070a in 5 of 5 runs on crates.io's 3.11.0
+  and finished its 20000 rounds in 5 of 5 on wick's). The paths that remove a waitable and then close it: the irqfd watcher's
+  reconcile (an irqfd unregistered, a guest's MSI-X vector masked or
+  disabled), event-manager's removal of a subscriber's events (a device
+  reset or unplugged), the serial input removed at its end, a pipe's
+  watcher event and an epoll nested in another (vsock); each now waits for
+  at most one callback, which only posts a packet. Level-triggered is the default and `ONE_SHOT` is supported. Sockets
   also support `EDGE_TRIGGERED`: IOCP is level-triggered, so edges come from
   the edge contract that the reader reads until `EAGAIN` (the compatibility
   `libc`'s `read` and `recv` report `EAGAIN` through `wick_fd::drained`, which
@@ -276,15 +307,6 @@ semantics on Win32. The details are in the comments of each
   (`FILE_PIPE_LOCAL_INFORMATION`) follows the room left, but reads 0 while
   the reader waits in a read, when a write completes at once
   (`test_pipe_write_room_reads_0_while_a_read_waits`).
-  An open defect, not fixed yet: a waitable (an eventfd's event) removed from
-  the epoll while its wait callback runs is armed again by `polling` 3.11
-  after its removal, and once the caller closes the handle the process ends
-  with `STATUS_THREADPOOL_HANDLE_EXCEPTION` (0xc000070a). CI run 43676869163's
-  kvm-ioctls unit tests ended so, in
-  `test_irqfd_writes_registrations_and_the_watcher_do_not_wait_for_each_other`
-  (which passed in the runs before and after), and a loop of add, signal,
-  remove and close through this layer ends so on Windows Server 2022 20348
-  in 7 of 7 runs. Linux's `EPOLL_CTL_DEL` and `close` leave nothing behind.
 - **eventfd = counter + manual-reset event.** The event is signalled while the
   counter is above zero. Counter, flags and lock live in a 4 KiB paging-file
   section, with a space event (counter < MAX). Every change happens under a

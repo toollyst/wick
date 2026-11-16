@@ -909,7 +909,7 @@ jobs:
       - name: Compatibility crate tests
         working-directory: lib/firecracker
         run: |
-          for c in os std libc vmm-sys-util memfd event-manager micro-http userfaultfd; do
+          for c in os std libc polling vmm-sys-util memfd event-manager micro-http userfaultfd; do
             cargo test --locked --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
           # These two make several partitions with guest memory in one

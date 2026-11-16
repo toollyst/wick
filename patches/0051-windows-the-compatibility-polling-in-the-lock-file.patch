@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Mon, 16 Nov 2026 10:12:15 +0900
+Subject: [PATCH] windows: the compatibility polling in the lock file
+
+wick's Windows vmm-sys-util takes polling 3.11.0 from crates/compat/polling,
+whose waitable removal returns once the thread pool no longer waits on the
+handle, where the crates.io one returned at once and a wait could be left on
+a handle its owner then closed (STATUS_THREADPOOL_HANDLE_EXCEPTION). The
+crate is a workspace member and re-exports the crates.io polling on Linux
+and macOS, so both entries are locked; no new crate from crates.io.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 904351400edd0a95faf900185ac39ebf932923af..19305381c381f9b4d575d8eb85be849854dcc989 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1222,6 +1222,17 @@ version = "0.3.34"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+ 
++[[package]]
++name = "polling"
++version = "3.11.0"
++dependencies = [
++ "cfg-if",
++ "concurrent-queue",
++ "pin-project-lite",
++ "polling 3.11.0 (registry+https://github.com/rust-lang/crates.io-index)",
++ "windows-sys",
++]
++
+ [[package]]
+ name = "polling"
+ version = "3.11.0"
+@@ -1983,7 +1994,7 @@ version = "0.15.0"
+ dependencies = [
+  "bitflags 1.3.2",
+  "libc 0.2.189",
+- "polling",
++ "polling 3.11.0",
+  "vmm-sys-util 0.15.0 (git+https://github.com/rust-vmm/vmm-sys-util?tag=v0.15.0)",
+  "wick-os",
+  "windows-sys",

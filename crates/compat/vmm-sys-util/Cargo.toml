@@ -32,7 +32,8 @@ libc = "0.2.127"
 bitflags = "1.0"
 wick-os = { path = "../os" }
 libc = "0.2.127"
-polling = "3.11"
+# polling 3.11.0 with its waitable removal fixed (crates/compat/polling).
+polling = { path = "../polling" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",

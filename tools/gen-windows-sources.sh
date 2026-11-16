@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Generate the Windows builds of the rust-vmm crates that are written for
-# Unix only (src/wick-compat-<crate>/src/windows/), from the upstream source the
-# compatibility crate pins.
+# Unix only, and of polling (src/wick-compat-<crate>/src/windows/), from the
+# upstream source the compatibility crate pins.
 #
 # On Windows wick provides the Unix interfaces these crates use
 # (`wick_os::unix`, `wick_os::fd`, the compatibility libc and vmm-sys-util), so
@@ -18,6 +18,11 @@
 #   `#[cfg]` attributes only, so `cfg!(...)` keeps upstream's Windows branch.
 # - vhost: tests that expect Linux `recvmsg` behaviour expect it on Windows
 #   too, where the ScmSocket of vmm-sys-util follows it;
+# - polling: its waitable sources' removal returns once the thread pool no
+#   longer waits on the handle nor runs a callback for it, a change to
+#   src/iocp/mod.rs made by tools/gen-windows-sources-polling.py (which says
+#   why: STATUS_THREADPOOL_HANDLE_EXCEPTION after an eventfd's epoll delete
+#   and close);
 # - upstream tests that need what Windows does not have are compiled out, each
 #   listed in EXCLUDED_TESTS with the reason.
 # Nothing else changes. Linux and macOS use the upstream crate unchanged.
@@ -35,6 +40,7 @@ CRATES=(
     "micro_http   crates/compat/micro-http     7975fe0e59000e8c41cb1d58fbd39ffa102e5b27"
     "vhost        crates/compat/vhost          vhost-v0.17.0"
     "vhost-user-backend tools/vhost-user-blk/compat/vhost-user-backend 0.23.0"
+    "polling      crates/compat/polling        3.11.0"
 )
 
 # crate  file  test  reason
@@ -86,6 +92,9 @@ gen() {
             # The Windows ScmSocket receives as Linux recvmsg does, so the
             # tests expect what they expect on Linux.
             perl -pi -e 's/cfg!\(any\(target_os = "linux", target_os = "android"\)\)/cfg!(any(target_os = "linux", target_os = "android", windows))/g' "$to"
+        fi
+        if [[ "$name" == polling && "$f" == ./iocp/mod.rs ]]; then
+            python3 -I "$WICK_ROOT/tools/gen-windows-sources-polling.py" "$to" || die "polling: $f is not as 3.11.0 has it"
         fi
         if [[ "$name" == vm-memory ]]; then
             perl -0pi -e 's/#\[cfg\(all\(target_family = "windows", feature = "rawfd"\)\)\]\ncompile_error!\([^\n]*\n\n//' "$to"

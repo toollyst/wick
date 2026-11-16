@@ -1910,9 +1910,10 @@ mod tests {
     /// kvm-ioctls unit tests in CI run 43676869163 (5306da51) in
     /// `test_irqfd_writes_registrations_and_the_watcher_do_not_wait_for_each_other`.
     /// Linux's EPOLL_CTL_DEL leaves nothing behind (fs/eventpoll.c
-    /// ep_remove). In a child, as the end is the process's.
+    /// ep_remove). In a child, as the end is the process's. Fixed in
+    /// polling's removal (crates/compat/polling), which waits for the wait's
+    /// callback to end before it returns.
     #[test]
-    #[ignore = "until the next commit"]
     fn test_an_eventfd_deleted_as_its_wait_fires_is_not_waited_on_once_closed() {
         if std::env::var_os(WAITABLE_CHILD_ENV).is_some() {
             return;
