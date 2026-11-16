@@ -1,3 +1,5 @@
 tools/guest-health.txt text eol=lf
 # Cuts of real CI logs: trailing whitespace in them is data (tools/ci-results.py --selftest).
 tools/ci-results-fixtures/** -whitespace
+# Rows collect writes: a field left empty (a detail, an alias) at a line's end is a trailing tab, data.
+docs/evidence/*.tsv -whitespace
