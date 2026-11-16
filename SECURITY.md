@@ -328,6 +328,21 @@ has the per-control details and results.
 Until these are done, **do not run untrusted multi-tenant workloads on macOS or Windows hosts.** On Linux, wick is
 upstream Firecracker and its jailer.
 
+- **Windows: a userfaultfd fill past `memory.max` is refused with `ENOMEM` and the VMM goes on, where Linux kills the
+  VMM.** Measured on Linux 7.0.0-1017-gcp (Ubuntu 24.04, cgroup v2, the VMM's cgroup at memory.max 64M and
+  memory.swap.max 0, a 64 GiB registered mapping filled by a handler process with `UFFDIO_COPY`, three runs of each
+  case, the same each time): the copy the VMM's cgroup cannot charge sets off the cgroup's OOM killer, which kills
+  the VMM with SIGKILL (`memory.events` `oom_kill` 1); with the handler in the VMM's cgroup it then kills the handler
+  too (`oom_kill` 2), and with the handler in another cgroup the handler's next copy, the VMM gone, returns -1 with
+  `ENOMEM`. While the VMM lives, no copy is refused. This is what v6.1's charge path does: it reclaims, then calls
+  the OOM killer and charges again once a task was killed, and returns `-ENOMEM` only when no task can be killed
+  (mm/memcontrol.c, `try_charge_memcg` :2714 to :2743, `mem_cgroup_oom` :1891). Here a fill the job refuses after
+  the reclaim at the limit (`reclaim_for_a_fill`) returns `ENOMEM` to the handler and the VMM goes on
+  (`test_a_fill_past_the_job_limit_fails_with_enomem`). Also unlike Linux: the page table a fill needs is charged on
+  Linux to the filling process's cgroup, not the VMM's (with the handler in another cgroup the VMM was killed at
+  anon-rss 65628 kB and pgtables 65708 kB under the 64 MiB limit; with it in the VMM's, at 32816 kB and 32840 kB),
+  where here every page table of the VMM's memory is the VMM's own commit, in its job. Firecracker's handler is a
+  process of the operator's, which the jailer does not put in the VMM's cgroup.
 - **Without the jailer, the VMM runs as the user who started it** on macOS and Windows: an escape from the VM and
   then the VMM lands as that user (files are then not limited, as on Linux without the jailer).
 - **macOS jailer: no namespaces in the kernel.** macOS has no network or PID namespaces (XNU's system calls,
@@ -505,9 +520,9 @@ upstream Firecracker and its jailer.
   (`test_shared_memory_past_the_job_limit_ends_the_process`, which passed in CI run 43521200989;
   `test_anonymous_shared_memory_is_charged_at_first_touch`, which passed in a process of its own in CI run 43524342863, b85b5a4, and each saved run since). A touched page so takes twice its size of host commit and once of memory.
   The userfaultfd restore's section is charged the same way: reserved at the registration, each page committed with
-  its charge when the handler fills it, and a fill past `memory.max` fails with `ENOMEM`, as Linux's `UFFDIO_COPY`
-  does when the memory cgroup refuses the page (`test_a_fill_past_the_job_limit_fails_with_enomem`, which passed in
-  CI run 43534301411). A 2 MiB chunk discarded whole with `MADV_DONTNEED` (free page reporting; the section is one
+  its charge when the handler fills it, and a fill past `memory.max` fails with `ENOMEM` and the VMM goes on
+  (`test_a_fill_past_the_job_limit_fails_with_enomem`, which passed in CI run 43534301411), where Linux's memory
+  cgroup kills the VMM ("Not at parity yet"). A 2 MiB chunk discarded whole with `MADV_DONTNEED` (free page reporting; the section is one
   per chunk) gets a new, empty section, so its commit and charge go
   (`test_a_wholly_discarded_chunk_gives_its_section_commit_back`, passed in CI run 43545368906, 305a806). A page discarded in a chunk not discarded whole
   (balloon inflation's scattered pages) keeps its section page committed (a SEC_RESERVE page cannot be decommitted)

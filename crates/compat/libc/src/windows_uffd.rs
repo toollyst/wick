@@ -996,10 +996,11 @@ fn fill(
     }
     let bytes = n * PAGE;
     // A reserved section's pages are committed, and charged, first; the job's
-    // limit refuses with ENOMEM, as the memory cgroup refuses Linux's copy.
-    // Refused, dead pages are reclaimed first and the commit made again, as
-    // Linux's memory cgroup reclaims before it refuses the copy's charge
-    // (`reclaim_for_a_fill`).
+    // limit refuses the commit. Refused, dead pages are reclaimed first and the
+    // commit made again, as Linux's memory cgroup reclaims before anything
+    // else (`reclaim_for_a_fill`); refused still, the fill is ENOMEM and the
+    // VMM goes on, where Linux's memory cgroup kills the VMM (SECURITY.md,
+    // "Not at parity yet").
     #[allow(clippy::cast_possible_truncation)]
     if range.reserved.load(Ordering::Acquire)
         && !crate::windows_mm::uffd_commit(dst as usize, bytes as usize)
@@ -2785,9 +2786,9 @@ mod tests {
     }
 
     /// In a process whose job may commit 64 MiB, 256 MiB are registered and
-    /// filled 1 MiB at a time: a fill past the limit fails with `ENOMEM`,
-    /// as Linux's `UFFDIO_COPY` does when the memory cgroup refuses the
-    /// page's charge, and the process goes on. Before, the 256 MiB were
+    /// filled 1 MiB at a time: a fill past the limit fails with `ENOMEM` and
+    /// the process goes on, where Linux's memory cgroup kills the VMM
+    /// (SECURITY.md, "Not at parity yet"). Before, the 256 MiB were
     /// committed at the registration and no job charged them.
     #[test]
     fn test_a_fill_past_the_job_limit_fails_with_enomem() {

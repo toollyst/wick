@@ -3089,7 +3089,9 @@ fn spans_outside(s: usize, e: usize, done: &[(u64, u64)]) -> Vec<(usize, usize)>
 /// pages are committed here with their charge, and every other page when
 /// it is filled ([`uffd_commit`]), as Linux charges the page a
 /// `UFFDIO_COPY` allocates to the memory cgroup (v6.1 mm/userfaultfd.c,
-/// `mcopy_atomic_pte`: `mem_cgroup_charge` at :205, `-ENOMEM` when refused).
+/// `mcopy_atomic_pte`: `mem_cgroup_charge` at :205; at the limit the memory
+/// cgroup kills the VMM, where a fill here is `ENOMEM`: SECURITY.md, "Not at
+/// parity yet").
 /// Before, the whole section was committed here and charged to no job. A
 /// resident page is charged before the private page it is copied from is
 /// freed, so it counts twice for that moment.
