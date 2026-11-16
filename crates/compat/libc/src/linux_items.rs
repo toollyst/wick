@@ -156,7 +156,10 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
 ///   and a read of every page when it is readable);
 /// - `MAP_FIXED`: what the range holds of guest memory is unmapped from the
 ///   guest while the mapping replaces its pages, and mapped again after
-///   ([`crate::wick_guest`]);
+///   ([`crate::wick_guest`]); what it held of userfaultfd registrations goes
+///   in the same step ([`crate::wick_uffd::unmapping`]); a range that cuts a
+///   huge page mapping off its huge page boundaries is `EINVAL`
+///   ([`huge_cut_allowed`]);
 /// - `PROT_EXEC` once the host sandbox narrowed: see [`wick_mm`].
 ///
 /// # Safety
@@ -184,8 +187,12 @@ pub unsafe fn mmap(
         set_errno(libc::EINVAL);
         return libc::MAP_FAILED;
     }
+    if flags & libc::MAP_FIXED != 0 && !huge_cut_allowed(addr as u64, len as u64) {
+        set_errno(libc::EINVAL);
+        return libc::MAP_FAILED;
+    }
     // SAFETY: forwarded with the Linux-only bits removed.
-    let ptr = unsafe { mmap_replacing(addr, len, prot, flags & !(MAP_POPULATE | HUGE_FLAGS), fd, offset) };
+    let ptr = unsafe { mmap_fixed_aware(addr, len, prot, flags & !(MAP_POPULATE | HUGE_FLAGS), fd, offset) };
     if ptr != libc::MAP_FAILED {
         crate::wick_uffd::note_mapping(ptr as u64, len as u64, false);
     }
@@ -266,7 +273,7 @@ unsafe fn mmap_huge(
             return libc::MAP_FAILED;
         }
         // SAFETY: the caller's contract.
-        unsafe { mmap_replacing(addr, len, prot, flags, fd, offset) }
+        unsafe { mmap_fixed_aware(addr, len, prot, flags, fd, offset) }
     } else {
         // A reservation a huge page larger than needed, the mapping made
         // fixed at its first huge page boundary, the rest released.
@@ -308,6 +315,47 @@ unsafe fn mmap_huge(
         crate::wick_uffd::note_mapping(ptr as u64, len as u64, true);
     }
     ptr
+}
+
+/// [`mmap_replacing`], and with `MAP_FIXED` what it maps over leaves its
+/// userfaultfd registration in the same step ([`crate::wick_uffd::unmapping`]),
+/// as Linux's `MAP_FIXED` unmaps the vmas first. Not for a discard, whose
+/// `MAP_FIXED` keeps the registration (Linux's `MADV_DONTNEED` keeps the
+/// vma).
+///
+/// # Safety
+/// Same contract as `mmap(2)`.
+unsafe fn mmap_fixed_aware(
+    addr: *mut c_void,
+    len: size_t,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    offset: off_t,
+) -> *mut c_void {
+    if flags & libc::MAP_FIXED == 0 {
+        // SAFETY: the caller's contract.
+        return unsafe { libc::mmap(addr, len, prot, flags, fd, offset) };
+    }
+    crate::wick_uffd::unmapping(
+        addr as u64,
+        len as u64,
+        true,
+        // SAFETY: the caller's contract.
+        || unsafe { mmap_replacing(addr, len, prot, flags, fd, offset) },
+        |p| *p != libc::MAP_FAILED,
+    )
+}
+
+/// Whether `[start, start + len)` may be unmapped or mapped over: a range
+/// that touches a huge page mapping must start and end on huge page
+/// boundaries, as Linux refuses to split a hugetlb vma elsewhere (mm/vma.c,
+/// v6.12, `__split_vma` :377 to :378, `may_split`; munmap and `MAP_FIXED`
+/// split the vmas they cut before anything is unmapped, `vms_gather_munmap_vmas`
+/// :1209 and :1230), `EINVAL` with nothing changed.
+fn huge_cut_allowed(start: u64, len: u64) -> bool {
+    let end = start.saturating_add(len);
+    !crate::wick_uffd::touches_huge(start, end) || (start.is_multiple_of(HUGE_PAGE) && end.is_multiple_of(HUGE_PAGE))
 }
 
 /// The host's `mmap`; with `MAP_FIXED`, the guest's view of `[addr, addr +
@@ -365,21 +413,22 @@ pub(crate) fn hugetlb_file(fd: c_int) -> bool {
 
 /// `munmap`, with hugetlb's rule: a range that touches a huge page mapping
 /// must start and end on huge page boundaries (`EINVAL`, as Linux refuses
-/// to split a hugetlb mapping elsewhere). A mapping taken down is no longer
-/// huge for [`crate::wick_uffd`].
+/// to split a hugetlb mapping elsewhere, [`huge_cut_allowed`]). A mapping
+/// taken down is no longer huge for [`crate::wick_uffd`], and what it held
+/// of userfaultfd registrations goes with it, in the same step
+/// ([`crate::wick_uffd::unmapping`]).
 ///
 /// # Safety
 /// Same contract as `munmap(2)`.
 pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
-    let (start, end) = (addr as u64, (addr as u64).saturating_add(len as u64));
-    if crate::wick_uffd::touches_huge(start, end)
-        && (!start.is_multiple_of(HUGE_PAGE) || !end.is_multiple_of(HUGE_PAGE))
-    {
+    let start = addr as u64;
+    if !huge_cut_allowed(start, len as u64) {
         set_errno(libc::EINVAL);
         return -1;
     }
-    // SAFETY: the caller's contract.
-    let rc = unsafe { libc::munmap(addr, len) };
+    // SAFETY: the caller's contract; the registration of what it unmaps
+    // goes in the same step, as Linux's goes with the vma.
+    let rc = crate::wick_uffd::unmapping(start, len as u64, false, || unsafe { libc::munmap(addr, len) }, |rc| *rc == 0);
     if rc == 0 {
         crate::wick_uffd::note_mapping(start, len as u64, false);
     }

@@ -268,6 +268,22 @@ has the per-control details and results.
   (`test_a_slot_unplugged_and_plugged_again_is_filled_through_its_alias`, SIGBUS with the alias left as the remap made
   it), not in a VM. Now the alias is made read-write after the remap (`discarding`), and a fill gives the page the
   protection asked.
+- **macOS: a userfaultfd's release after its registered memory was unmapped changed whatever was mapped there since**
+  (from 6c4320c5, the compatibility `libc` with its userfaultfd, to the commit that brought
+  `libc::wick_uffd::unmapping`). `munmap`, and `mmap` with `MAP_FIXED`, left the registration in place, where Linux's
+  goes with the vma. Firecracker unmaps its registered guest memory at teardown while the VM's userfaultfd is still
+  open (the guest regions' drop, lib/firecracker/src/vmm/src/vstate/memory.rs:308, `guest_memory` dropped before
+  `uffd`, vstate/vm.rs:84 and :95), and the userfaultfd's release then made the range's old missing pages read-write
+  on whatever was mapped there by then in the same process, such as another thread's new stack guard or a `PROT_NONE`
+  reservation: measured, a `PROT_NONE` mapping made in the hole was read-write after the release
+  (`test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is`, "left: (3, 3) right: (0, 0)" before
+  the fix), not measured in a VM. The window was from `guest_memory`'s drop to `uffd`'s, or longer while the handler
+  held its copy of the userfaultfd (read from the code). The same left memory mapped over registered memory taken for
+  the old (missing pages, a discard making it missing), which no Firecracker path reaches, as read from the code. Now
+  the pages leave the registration in the same step as the change of the mapping, under the lock every change of the
+  registrations takes (`test_an_unmapping_and_its_unregistration_are_one_step`,
+  `test_memory_unmapped_while_registered_leaves_no_registration_behind`, docs/ARCHITECTURE.md, "Memory calls on
+  registered memory").
 
 ## Not at parity yet
 
@@ -596,21 +612,11 @@ upstream Firecracker and its jailer.
   jail that can make pipes could, once the first reader has gone, take the log or metrics another jail of the same
   user wrote meanwhile (up to 64 KiB), if it knows the name. Run each jail's pipes under names the others cannot
   guess, or run tenants under different accounts.
-- **macOS: userfaultfd memory calls not yet as Linux's; fix in progress.** On memory a userfaultfd has registered
-  (`mem_backend` `Uffd`), `MADV_FREE` of registered pages posts no remove event, and memory mapped over registered
-  memory stays in its registration. Firecracker uses no `MADV_FREE` and maps nothing over registered memory; it unmaps
-  registered guest memory only when the VM is torn down, while the VM's userfaultfd is still open (the guest regions'
-  drop, lib/firecracker/src/vmm/src/vstate/memory.rs:308, `guest_memory` dropped before `uffd`, vstate/vm.rs:84 and
-  :95); the guest's paths (`libc::wick_guest`, the HVF backend) reach neither; as read from the code. Until that
-  userfaultfd is released the unmapped range stays registered, and its release then makes the range's old missing
-  pages read-write on whatever is mapped there by then in the same process, such as another thread's new stack guard
-  or a `PROT_NONE` reservation (measured: a `PROT_NONE` mapping made in the hole was read-write after the release,
-  `test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is`, ignored until the munmap fix); the
-  window is from `guest_memory`'s drop to `uffd`'s (vstate/vm.rs:84 to :95), or longer while something else holds the
-  userfaultfd, such as the handler. Each has its test, ignored until its fix (docs/ARCHITECTURE.md, "Memory calls on
-  registered memory": `test_madv_free_of_registered_pages_makes_them_missing`,
-  `test_memory_replaced_while_registered_is_in_no_registration`,
-  `test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is`).
+- **macOS: `MADV_FREE` of userfaultfd-registered memory not yet as Linux's; fix in progress.** On memory a userfaultfd
+  has registered (`mem_backend` `Uffd`), `MADV_FREE` of registered pages neither makes them missing nor posts a remove
+  event, where Linux takes it as `MADV_DONTNEED` for the userfaultfd. Firecracker uses no `MADV_FREE`, as read from
+  the code. Its tests are ignored until the fix (docs/ARCHITECTURE.md, "Memory calls on registered memory":
+  `test_madv_free_of_registered_pages_makes_them_missing`, `test_madv_free_of_registered_pages_posts_a_remove_event`).
 - **macOS: a call Firecracker's own sandbox denies ends it by SIGKILL, not exit 148.** On Linux the seccomp trap's
   SIGSYS runs upstream's handler, which logs the bad system call, counts `seccomp.num_faults` and exits 148.
   Seatbelt has no action that traps the calling thread, and a signal the process can catch let the denying thread

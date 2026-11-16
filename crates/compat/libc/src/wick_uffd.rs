@@ -28,6 +28,17 @@
 //!   mprotect changes the vma and leaves its registration as it is. An access
 //!   the asked protection refuses is the process's own fault, with no event
 //!   ([`asked_allows`]), as Linux checks the vma before the userfaultfd.
+//! - `munmap`, and `mmap` with `MAP_FIXED`, of registered memory take its
+//!   pages out of the registration in the same step ([`unmapping`]), as
+//!   Linux's registration goes with the vma: the new memory, or a mapping
+//!   made later in the hole, is in no registration.
+//!
+//! The order of the locks: [`LOCK`] first, then the hypervisor backend's
+//! replace window ([`crate::wick_guest::replacing`]), which a discard
+//! ([`discarding`]) and a `MAP_FIXED` mapping ([`unmapping`]) open inside it;
+//! no path opens the window and then takes [`LOCK`], as the window holds
+//! the system call alone. The backend's stage-2 hook takes its own lock
+//! under [`LOCK`] and waits for nothing there.
 //!
 //! A userfaultfd is one end of a socket pair. Events are [`RECORD`]-byte
 //! records read from it ([`proto`]). Another process holding the descriptor
@@ -172,6 +183,9 @@ struct Ctx {
 struct Waiter {
     /// The page address; 0: free.
     page: AtomicU64,
+    /// The userfaultfd the fault was posted to: only its wakes and its
+    /// release end the wait, as Linux's waiter is on its context's queue.
+    ctx: AtomicUsize,
     woken: AtomicBool,
     /// A Mach semaphore.
     sem: AtomicU64,
@@ -187,6 +201,7 @@ static CTXS: [Ctx; MAX_CTX] = [const {
 static WAITERS: [Waiter; MAX_WAITERS] = [const {
     Waiter {
         page: AtomicU64::new(0),
+        ctx: AtomicUsize::new(usize::MAX),
         woken: AtomicBool::new(false),
         sem: AtomicU64::new(0),
     }
@@ -207,8 +222,27 @@ pub(crate) fn huge_mapping_test() -> std::sync::MutexGuard<'static, ()> {
 }
 /// Number of registered ranges (the I/O wrappers skip all work at 0).
 static REGISTERED: AtomicUsize = AtomicUsize::new(0);
-/// Serializes changes to the ranges.
+/// Serializes changes to the ranges. Taken through [`lock`]. A change that
+/// also opens the hypervisor backend's replace window (a discard, a
+/// `MAP_FIXED` mapping or an unmapping of registered memory) takes it first
+/// and the window inside it; no path opens the window first and takes it
+/// inside (the window's change is the system call alone).
 static LOCK: Mutex<()> = Mutex::new(());
+
+/// Takes [`LOCK`]. Under `cfg(test)`, a caller that finds it held first
+/// counts itself in `tests::LOCK_WAITS`, so that a test can tell, with no
+/// timing, that a thread waits for it.
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    #[cfg(test)]
+    match LOCK.try_lock() {
+        Ok(guard) => return guard,
+        Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            tests::LOCK_WAITS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    LOCK.lock().unwrap()
+}
 static INIT: Once = Once::new();
 static OLD_SIGBUS: AtomicPtr<libc::sigaction> = AtomicPtr::new(ptr::null_mut());
 static OLD_SIGSEGV: AtomicPtr<libc::sigaction> = AtomicPtr::new(ptr::null_mut());
@@ -454,13 +488,12 @@ pub fn fault(addr: u64, write: bool) -> bool {
         unsafe { libc::nanosleep(&ts, ptr::null_mut()) };
     };
     slot.woken.store(false, Ordering::SeqCst);
+    let ctx = range.ctx.load(Ordering::Acquire);
+    slot.ctx.store(ctx, Ordering::SeqCst);
     // Filled while the slot was claimed: no fault to report.
     if Range::test(&range.missing, page) && Range::test(&range.tracked, page) {
         let flags = if write { proto::FLAG_WRITE } else { 0 };
-        post(
-            range.ctx.load(Ordering::Acquire),
-            [proto::EVENT_PAGEFAULT, addr, flags, 0],
-        );
+        post(ctx, [proto::EVENT_PAGEFAULT, addr, flags, 0]);
         while !slot.woken.load(Ordering::SeqCst) {
             // SAFETY: a semaphore created at init; Mach traps are async-signal-safe.
             unsafe { semaphore_wait(slot.sem.load(Ordering::Acquire) as u32) };
@@ -470,12 +503,24 @@ pub fn fault(addr: u64, write: bool) -> bool {
     true
 }
 
-/// Wakes the threads waiting for pages in `[start, start + len)`.
+/// Wakes the threads waiting for pages in `[start, start + len)`, whichever
+/// userfaultfd they wait on.
 pub fn wake(start: u64, len: u64) {
-    let end = start.saturating_add(len);
+    wake_where(|_, page| page >= start && page < start.saturating_add(len));
+}
+
+/// Wakes the threads waiting on userfaultfd `ctx` for pages in `[start,
+/// start + len)`, as Linux's `wake_userfault` wakes its context's queue
+/// (fs/userfaultfd.c, v6.12, `userfaultfd_wake_function` :120 to :122).
+fn wake_ctx(ctx: usize, start: u64, len: u64) {
+    wake_where(|c, page| c == ctx && page >= start && page < start.saturating_add(len));
+}
+
+/// Wakes the waiters `which(ctx, page)` names.
+fn wake_where(which: impl Fn(usize, u64) -> bool) {
     for w in WAITERS.iter() {
         let page = w.page.load(Ordering::SeqCst);
-        if page != 0 && page >= start && page < end {
+        if page != 0 && which(w.ctx.load(Ordering::SeqCst), page) {
             w.woken.store(true, Ordering::SeqCst);
             // SAFETY: a semaphore created at init.
             unsafe { semaphore_signal(w.sem.load(Ordering::Acquire) as u32) };
@@ -645,7 +690,7 @@ pub fn protecting(start: u64, len: u64, prot: c_int, apply: impl Fn(u64, u64) ->
     if slots(start, end).next().is_none() {
         return apply(start, len);
     }
-    let _guard = LOCK.lock().unwrap();
+    let _guard = lock();
     for r in slots(start, end) {
         let (s, e, ps) = (r.start.load(Ordering::Acquire), r.end.load(Ordering::Acquire), r.page_size());
         if !(start.max(s) - s).is_multiple_of(ps) || !(end.min(e) - s).is_multiple_of(ps) {
@@ -722,7 +767,7 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
             libc::fcntl(user, libc::F_SETFL, fl | libc::O_NONBLOCK);
         }
     }
-    let _guard = LOCK.lock().unwrap();
+    let _guard = lock();
     let Some(index) = CTXS.iter().position(|c| {
         c.fd.compare_exchange(-1, kernel, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -916,7 +961,7 @@ fn release(r: &Range) {
 pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     let end = validate_range(start, len).map_err(errno_err)?;
     let huge = crate::linux_items::HUGE_PAGE;
-    let _guard = LOCK.lock().unwrap();
+    let _guard = lock();
     let entries = mapped_entries(start, end);
     let Some(&(first, first_end, _)) = entries.first() else {
         return Err(errno_err(libc::EINVAL));
@@ -990,6 +1035,15 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     }
     if RANGES.iter().filter(|r| r.start.load(Ordering::Acquire) == 0).count() < new.len() {
         return Err(errno_err(libc::ENOMEM));
+    }
+    // Their memory may have been unmapped or mapped over since ([`unmapping`]):
+    // the alias follows the pages there now, before anything is registered.
+    for &(r, page, _, _) in &again {
+        let at = r.start.load(Ordering::Acquire) + page * r.page_size();
+        if let Err(e) = realias(r, at, at + r.page_size()) {
+            std::eprintln!("wick: userfaultfd alias of {at:#x} cannot follow its pages to register them again ({e})");
+            return Err(errno_err(libc::ENOMEM));
+        }
     }
     let mut made: Vec<(u64, u64, u64, u64, Vec<bool>)> = Vec::new();
     let undo = |made: &[(u64, u64, u64, u64, Vec<bool>)]| {
@@ -1111,7 +1165,7 @@ fn range_of(ctx: usize, start: u64, len: u64) -> Result<&'static Range, c_int> {
 pub fn unregister(_ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
     let end = validate_range(start, len)?;
     let huge = crate::linux_items::HUGE_PAGE;
-    let _guard = LOCK.lock().unwrap();
+    let _guard = lock();
     let entries = mapped_entries(start, end);
     let Some(&(first, first_end, _)) = entries.first() else {
         return Err(libc::EINVAL);
@@ -1170,16 +1224,23 @@ fn fill(
     wake_up: bool,
     mut fill: impl FnMut(*mut u8, usize, usize),
 ) -> Result<u64, (c_int, u64)> {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = lock();
     let range = range_of(ctx, dst, len).map_err(|e| (e, 0))?;
     let base = range.start.load(Ordering::Acquire);
     let alias = range.alias.load(Ordering::Acquire);
     let ps = range.page_size();
     let first = (dst - base) / ps;
+    // A page of the destination in no registration (unregistered, or its
+    // memory unmapped or replaced) is ENOENT for the whole call, as Linux's
+    // destination must lie in one vma this userfaultfd has (mm/userfaultfd.c,
+    // v6.12, `validate_dst_vma` :34, `uffd_mfill_lock` :113).
+    if (first..first + len / ps).any(|page| !Range::test(&range.tracked, page)) {
+        return Err((libc::ENOENT, 0));
+    }
     let mut n = 0;
     while n < len / ps {
         let page = first + n;
-        if !Range::test(&range.tracked, page) || !Range::test(&range.missing, page) {
+        if !Range::test(&range.missing, page) {
             break;
         }
         n += 1;
@@ -1195,7 +1256,7 @@ fn fill(
         Range::set(&range.missing, page, false);
     }
     if wake_up {
-        wake(dst, bytes);
+        wake_ctx(ctx, dst, bytes);
     }
     if bytes < len {
         Err((libc::EAGAIN, bytes))
@@ -1231,9 +1292,45 @@ pub fn zeropage(ctx: usize, start: u64, len: u64, wake_up: bool) -> Result<u64, 
 
 /// `UFFDIO_WAKE`.
 pub fn wake_range(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
-    range_of(ctx, start, len)?;
-    wake(start, len);
+    // Linux checks the range only, not that it is registered (fs/userfaultfd.c,
+    // v6.12, `userfaultfd_wake` :1545 to :1575): a thread can wait on a page
+    // whose memory was unmapped since, and its handler can still wake it.
+    validate_range(start, len)?;
+    wake_ctx(ctx, start, len);
     Ok(())
+}
+
+/// Maps `[a, b)` of range `r` (mapped memory) over the same part of its
+/// alias, read-write: the alias, through which every fill writes, then
+/// shares the pages the range has now. A discard of private memory, and
+/// memory mapped where the range was, give the range new pages; the alias
+/// kept the old ones. The remap gives the alias the pages' protection, the
+/// one asked of them ([`protecting`]), so it is made writable again after.
+fn realias(r: &Range, a: u64, b: u64) -> Result<(), std::string::String> {
+    let s = r.start.load(Ordering::Acquire);
+    let mut at = r.alias.load(Ordering::Acquire) + (a - s);
+    let (mut cur, mut max) = (0, 0);
+    // SAFETY: maps `[a, b)` of the range, which is mapped, over the same
+    // part of its alias, which is ours.
+    let kr = unsafe {
+        mach_vm_remap(
+            mach_task_self_,
+            &mut at,
+            b - a,
+            0,
+            VM_FLAGS_FIXED_OVERWRITE,
+            mach_task_self_,
+            a,
+            0,
+            &mut cur,
+            &mut max,
+            1, // VM_INHERIT_NONE
+        )
+    };
+    if kr != 0 {
+        return Err(std::format!("mach_vm_remap: {kr}"));
+    }
+    protect(at, b - a, libc::PROT_READ | libc::PROT_WRITE).map_err(|e| std::format!("made writable: {e}"))
 }
 
 /// Wraps a `MADV_DONTNEED` of `[start, start + len)`: registered pages are
@@ -1255,7 +1352,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
     if !touches {
         return discard(&mut done);
     }
-    let _guard = LOCK.lock().unwrap();
+    let _guard = lock();
     let mut runs = Vec::new();
     for_each_missing(start, len, |s, l| runs.push((s, l)));
     for &(s, l) in &runs {
@@ -1272,7 +1369,6 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
         let ps = r.page_size();
         let ctx = r.ctx.load(Ordering::Acquire);
         let remove = CTXS[ctx].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0;
-        let alias = r.alias.load(Ordering::Acquire);
         for &(a, b) in &done {
             let (a, b) = (a.max(s), b.min(e));
             if a >= b {
@@ -1282,43 +1378,10 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
             // (`linux_items::discard_piece`): the alias, through which
             // pages are filled, must share the new ones, or a fill would go
             // to the old pages, which the alias would also keep resident.
-            let mut at = alias + (a - s);
-            let (mut cur, mut max) = (0, 0);
-            // SAFETY: maps `[a, b)` of the range, which is mapped, over the
-            // same part of its alias, which is ours.
-            let kr = unsafe {
-                mach_vm_remap(
-                    mach_task_self_,
-                    &mut at,
-                    b - a,
-                    0,
-                    VM_FLAGS_FIXED_OVERWRITE,
-                    mach_task_self_,
-                    a,
-                    0,
-                    &mut cur,
-                    &mut max,
-                    1, // VM_INHERIT_NONE
-                )
-            };
-            if kr != 0 {
+            if let Err(e) = realias(r, a, b) {
                 // The alias would fill the old pages: the next fill would
                 // corrupt the guest silently.
-                std::eprintln!(
-                    "wick: userfaultfd alias of {a:#x}+{:#x} cannot follow the discarded pages \
-                     (mach_vm_remap: {kr})",
-                    b - a
-                );
-                std::process::abort();
-            }
-            // The remap gives the alias the new pages' protection, the one
-            // asked of them ([`protecting`]), which may not be writable; the
-            // alias is written by every fill.
-            if let Err(e) = protect(alias + (a - s), b - a, libc::PROT_READ | libc::PROT_WRITE) {
-                std::eprintln!(
-                    "wick: userfaultfd alias of {a:#x}+{:#x} cannot be made writable after a discard ({e})",
-                    b - a
-                );
+                std::eprintln!("wick: userfaultfd alias of {a:#x}+{:#x} cannot follow the discarded pages ({e})", b - a);
                 std::process::abort();
             }
             // The range's whole pages inside the piece.
@@ -1346,10 +1409,102 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
     ret
 }
 
+/// Wraps a change of the mapping of `[start, start + len)` that ends what
+/// it held, `change`: a `munmap`, or an `mmap` with `MAP_FIXED`
+/// (`mapped_anew`), which `made` says was done. On Linux the registration
+/// belongs to the vma and goes with it in the same step, under the mm's
+/// lock: munmap gathers the vmas and unmaps them (mm/vma.c, v6.12,
+/// `do_vmi_align_munmap` :1332, `vms_gather_munmap_vmas` :1180, which calls
+/// fs/userfaultfd.c `userfaultfd_unmap_prep` at :1267), and `MAP_FIXED`
+/// unmaps what it maps over first (mm/mmap.c `__mmap_region` :1361, the same
+/// gathering at :1386), so the new memory is in no registration. Here, when
+/// the range touches a registered range, [`LOCK`] is taken before the change
+/// and held until the whole pages it reached are in no registration: no
+/// fill, release or other change of the ranges runs in between, which would
+/// take the new memory (or another mapping made in a hole) for the old
+/// registration's. A range with no page left registered is freed, its
+/// alias with it; otherwise the alias's part is replaced with an empty
+/// reservation, so it no longer keeps the old pages, and a register of the
+/// pages again maps the alias over the new ones ([`realias`]). With
+/// `mapped_anew`, pages that were missing are mapped into the guest's stage
+/// 2 (the backend's window, inside the change, mapped them as missing). A
+/// thread waiting on one of the pages waits on, as Linux's: its
+/// userfaultfd's wake or release ends the wait ([`wake_range`],
+/// [`destroy`]). A change that fails, or touches no registered range,
+/// changes nothing here. A range that cuts a huge page of a huge page range
+/// is refused by the callers before (`EINVAL`).
+pub fn unmapping<T>(start: u64, len: u64, mapped_anew: bool, change: impl FnOnce() -> T, made: impl Fn(&T) -> bool) -> T {
+    let host = page_size();
+    let end = start.saturating_add(len);
+    let touches = host != 0
+        && RANGES.iter().any(|r| {
+            let s = r.start.load(Ordering::Acquire);
+            s != 0 && start < r.end.load(Ordering::Acquire) && s < end
+        });
+    if !touches {
+        return change();
+    }
+    let _guard = lock();
+    let result = change();
+    if !made(&result) {
+        return result;
+    }
+    #[cfg(test)]
+    tests::unmap_hook(start, end);
+    let (from, to) = (start - start % host, end.next_multiple_of(host));
+    for r in slots(from, to) {
+        let (s, e, ps) = (r.start.load(Ordering::Acquire), r.end.load(Ordering::Acquire), r.page_size());
+        let (first, last) = ((from.max(s) - s).div_ceil(ps), (to.min(e) - s) / ps);
+        if first >= last {
+            continue;
+        }
+        let mut was_missing = Vec::new();
+        for page in first..last {
+            if Range::test(&r.tracked, page) && Range::test(&r.missing, page) {
+                was_missing.push(page);
+            }
+            Range::set(&r.missing, page, false);
+            Range::set(&r.tracked, page, false);
+        }
+        if mapped_anew {
+            for page in was_missing {
+                stage2(s + page * ps, ps, true);
+            }
+        }
+        if !any_tracked(r) {
+            release(r);
+            continue;
+        }
+        // SAFETY: the alias's part for those pages, ours; replaced with an
+        // empty reservation of the same size.
+        let alias = r.alias.load(Ordering::Acquire) + first * ps;
+        let p = unsafe {
+            libc::mmap(
+                alias as *mut _,
+                ((last - first) * ps) as usize,
+                libc::PROT_NONE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if p as u64 != alias {
+            // Only the old pages' memory is at stake: they stay held.
+            std::eprintln!(
+                "wick: userfaultfd alias of {:#x}+{:#x} keeps the pages unmapped there: {}",
+                s + first * ps,
+                (last - first) * ps,
+                io::Error::last_os_error()
+            );
+        }
+    }
+    result
+}
+
 /// Releases userfaultfd `ctx`: its ranges become ordinary memory and every
 /// waiter is woken, as when Linux releases a userfaultfd.
 fn destroy(ctx: usize) {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = lock();
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::Acquire);
         if s == 0 || r.ctx.load(Ordering::Acquire) != ctx {
@@ -1367,8 +1522,11 @@ fn destroy(ctx: usize) {
             }
         }
         release(r);
-        wake(s, e - s);
     }
+    // Every thread waiting on it, the pages of memory unmapped since
+    // included, as Linux's release wakes its whole queue (fs/userfaultfd.c,
+    // v6.12, `userfaultfd_release` :873, a range of length 0).
+    wake_where(|c, _| c == ctx);
     let fd = CTXS[ctx].fd.swap(-1, Ordering::AcqRel);
     if fd >= 0 {
         // SAFETY: the kernel end owned by the serving thread.
@@ -1935,6 +2093,31 @@ mod tests {
         size
     }
 
+    /// How many times a caller found [`LOCK`] held ([`lock`]).
+    pub(super) static LOCK_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+    /// What [`unmapping`] calls between the change of the mapping and the
+    /// unregistration, with the range: a test's own, for its own range.
+    type Hook = fn(u64, u64);
+    static UNMAP_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub(super) fn unmap_hook(start: u64, end: u64) {
+        let hook = *UNMAP_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hook) = hook {
+            hook(start, end);
+        }
+    }
+
+    /// Waits until `done`, failing after 10 s (a guard, not a measure: each
+    /// condition is one the waited-for thread sets).
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}: not in 10 s");
+            std::thread::yield_now();
+        }
+    }
+
     /// The bare calls of the module's page size in `text`, a module's source:
     /// the line of each call in its tests that is neither a method's
     /// (`r.page_size()`), nor the helper's own (`super::`, `test_`), nor in a
@@ -2358,7 +2541,6 @@ mod tests {
     /// `uffd_mfill_lock` :733, which is `ENOENT` at :113 when
     /// `validate_dst_vma` finds no userfaultfd on it, :34).
     #[test]
-    #[ignore = "fails until munmap and MAP_FIXED over registered memory remove its registration"]
     fn test_memory_replaced_while_registered_is_in_no_registration() {
         for how in replace_cases("wick_uffd::tests::test_memory_replaced_while_registered_is_in_no_registration") {
             let (a, ua, _b, ub, chan, mem) = replaced(how);
@@ -2375,7 +2557,6 @@ mod tests {
     /// `vm_area_alloc` at :1435), and `userfaultfd_register` refuses only a
     /// vma another userfaultfd has (fs/userfaultfd.c, v6.12, :1363 to :1366).
     #[test]
-    #[ignore = "fails until munmap and MAP_FIXED over registered memory remove its registration"]
     fn test_memory_replaced_while_registered_registers_anew() {
         for how in replace_cases("wick_uffd::tests::test_memory_replaced_while_registered_registers_anew") {
             // Its userfaultfd again: both pages are missing, and a fill lands
@@ -2409,7 +2590,6 @@ mod tests {
     /// `madvise_dontneed_single_vma` zaps the pages, :846). It must not take
     /// the replaced range's slot for it.
     #[test]
-    #[ignore = "fails until munmap and MAP_FIXED over registered memory remove its registration"]
     fn test_a_discard_of_memory_replaced_while_registered_is_ordinary() {
         for how in replace_cases("wick_uffd::tests::test_a_discard_of_memory_replaced_while_registered_is_ordinary") {
             let (_a, ua, _b, ub, chan, mem) = replaced(how);
@@ -2424,6 +2604,358 @@ mod tests {
             assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0, "{how:?}");
             close(&[chan, ua, ub]);
         }
+    }
+
+    /// Registered memory unmapped while its userfaultfd is open, as
+    /// Firecracker's teardown unmaps its guest memory (the guest regions'
+    /// drop, lib/firecracker/src/vmm/src/vstate/memory.rs:308, before the
+    /// VM's `uffd` is dropped, vstate/vm.rs:84 and :95), leaves no
+    /// registration behind: on Linux the registration belongs to the vma
+    /// and goes with it (mm/vma.c, v6.12, `do_vmi_align_munmap` :1332), and a
+    /// fill where no registered vma is is `ENOENT` (mm/userfaultfd.c
+    /// `uffd_mfill_lock` :113, `validate_dst_vma` :34). Part of a range: the
+    /// unmapped page is in no registration, the rest is as it was. All of
+    /// it: nothing is left of the range, and the userfaultfd's close after
+    /// it finds nothing to release. In a process of its own: no other test
+    /// may map or register in the holes meanwhile.
+    #[test]
+    fn test_memory_unmapped_while_registered_leaves_no_registration_behind() {
+        if !in_own_process("wick_uffd::tests::test_memory_unmapped_while_registered_leaves_no_registration_behind") {
+            return;
+        }
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let data = std::vec![0x5au8; ps as usize];
+        let unmap = |at: u64, len: u64| {
+            // SAFETY: pages of the test's own mapping, unmapped by this
+            // libc's munmap, as Firecracker's drop unmaps them.
+            assert_eq!(unsafe { crate::linux_items::munmap(at as *mut _, len as usize) }, 0);
+        };
+        // Part: the second of two pages.
+        let mem = map(2);
+        register(a, mem, 2 * ps).unwrap();
+        unmap(mem + ps, ps);
+        assert!(!is_missing(mem + ps), "the unmapped page is still registered");
+        assert_eq!(zeropage(a, mem + ps, ps, true), Err((libc::ENOENT, 0)), "a fill of the unmapped page");
+        assert!(is_missing(mem), "the page left mapped is no longer missing");
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        // SAFETY: filled just now.
+        assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0x5a);
+        unmap(mem, ps);
+        assert!(slots(mem, mem + 2 * ps).next().is_none(), "a range with no page left is still held");
+        // All: two pages, one filled, then the userfaultfd closed.
+        let mem = map(2);
+        register(a, mem, 2 * ps).unwrap();
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        unmap(mem, 2 * ps);
+        assert!(slots(mem, mem + 2 * ps).next().is_none(), "the unmapped range is still held");
+        assert_eq!(zeropage(a, mem + ps, ps, true), Err((libc::ENOENT, 0)));
+        close(&[ua]);
+    }
+
+    /// The race test's state, for its hook ([`race_in_the_change`]).
+    static RACE_MEM: AtomicU64 = AtomicU64::new(0);
+    static RACE_CTX: AtomicUsize = AtomicUsize::new(0);
+    static RACE_USER: AtomicI32 = AtomicI32::new(-1);
+    static RACE_HOLE: AtomicBool = AtomicBool::new(false);
+    type Filled = Result<u64, (c_int, u64)>;
+    static RACE_FILL: Mutex<Option<std::thread::JoinHandle<Filled>>> = Mutex::new(None);
+
+    /// The hook of [`test_an_unmapping_and_its_unregistration_are_one_step`]:
+    /// between the change of the mapping and the unregistration, a mapping
+    /// made in the hole (for a munmap), a handler's fill of a page the old
+    /// registration has missing, and the userfaultfd's close. Each runs on a
+    /// thread of its own, and the hook goes on once the thread is done or
+    /// waits for [`LOCK`]: with no timing, either the step holds the lock
+    /// and they run after it, or they run inside it.
+    fn race_in_the_change(start: u64, _end: u64) {
+        let mem = RACE_MEM.load(Ordering::SeqCst);
+        if start != mem {
+            return;
+        }
+        let ps = test_page_size();
+        if RACE_HOLE.load(Ordering::SeqCst) {
+            // SAFETY: the hole the munmap left, the test's own range; the
+            // system's call, as another thread's stack guard is made.
+            let p = unsafe {
+                libc::mmap(
+                    mem as *mut _,
+                    (2 * ps) as usize,
+                    libc::PROT_NONE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            assert_eq!(p as u64, mem);
+        }
+        let ctx = RACE_CTX.load(Ordering::SeqCst);
+        let waits = LOCK_WAITS.load(Ordering::SeqCst);
+        let filler = std::thread::spawn(move || {
+            let data = std::vec![0x5au8; test_page_size() as usize];
+            // SAFETY: `data` holds a page.
+            unsafe { copy(ctx, data.as_ptr(), mem + test_page_size(), test_page_size(), true) }
+        });
+        until("the fill", || filler.is_finished() || LOCK_WAITS.load(Ordering::SeqCst) > waits);
+        *RACE_FILL.lock().unwrap() = Some(filler);
+        let waits = LOCK_WAITS.load(Ordering::SeqCst);
+        close(&[RACE_USER.load(Ordering::SeqCst)]);
+        until("the release", || {
+            slots(mem, mem + 2 * ps).next().is_none() || LOCK_WAITS.load(Ordering::SeqCst) > waits
+        });
+    }
+
+    /// An unmapping of registered memory, or a `MAP_FIXED` mapping over it,
+    /// and its unregistration are one step to everything else that changes
+    /// the ranges, as Linux's registration goes with the vma under the mm's
+    /// lock ([`unmapping`]): a handler's fill of a page the old registration
+    /// had missing and the userfaultfd's release, both arriving between the
+    /// change of the mapping and the unregistration ([`race_in_the_change`]),
+    /// find no registration and leave the new memory, or a `PROT_NONE`
+    /// mapping made in the hole, as it is. Before, a fill there made the
+    /// new memory's page accessible and a release made the missing pages
+    /// read-write. In a process of its own (holes).
+    #[test]
+    fn test_an_unmapping_and_its_unregistration_are_one_step() {
+        if !in_own_process("wick_uffd::tests::test_an_unmapping_and_its_unregistration_are_one_step") {
+            return;
+        }
+        *UNMAP_HOOK.lock().unwrap() = Some(race_in_the_change);
+        let ps = test_page_size();
+        for hole in [true, false] {
+            let (ctx, user) = create(0, false, true).unwrap();
+            let mem = map(2);
+            register(ctx, mem, 2 * ps).unwrap();
+            let data = std::vec![0x11u8; ps as usize];
+            // SAFETY: `data` holds a page.
+            assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, ps, true) }, Ok(ps));
+            RACE_CTX.store(ctx, Ordering::SeqCst);
+            RACE_USER.store(user, Ordering::SeqCst);
+            RACE_HOLE.store(hole, Ordering::SeqCst);
+            RACE_MEM.store(mem, Ordering::SeqCst);
+            // SAFETY: the test's own mapping, through this libc's calls.
+            unsafe {
+                if hole {
+                    assert_eq!(crate::linux_items::munmap(mem as *mut _, (2 * ps) as usize), 0);
+                } else {
+                    let p = crate::linux_items::mmap(
+                        mem as *mut _,
+                        (2 * ps) as usize,
+                        libc::PROT_NONE,
+                        libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                        -1,
+                        0,
+                    );
+                    assert_eq!(p as u64, mem);
+                }
+            }
+            RACE_MEM.store(0, Ordering::SeqCst);
+            let filled = RACE_FILL.lock().unwrap().take().unwrap().join().unwrap();
+            until("the release", || slots(mem, mem + 2 * ps).next().is_none());
+            let prot = (prot_of(mem), prot_of(mem + ps));
+            // SAFETY: the test's own range.
+            unsafe { libc::munmap(mem as *mut _, (2 * ps) as usize) };
+            let case = if hole { "munmap, then a mapping in the hole" } else { "MAP_FIXED" };
+            assert_eq!(filled, Err((libc::ENOENT, 0)), "{case}: the fill found the old registration");
+            assert_eq!(prot, (libc::PROT_NONE, libc::PROT_NONE), "{case}: the new memory's protection changed");
+        }
+        *UNMAP_HOOK.lock().unwrap() = None;
+    }
+
+    /// A thread waiting on a page whose memory is mapped over waits on, as
+    /// Linux's (no event or wake comes of the unmapping without
+    /// `UFFD_FEATURE_EVENT_UNMAP`), until its userfaultfd's `UFFDIO_WAKE`,
+    /// which checks the range only (fs/userfaultfd.c, v6.12,
+    /// `userfaultfd_wake` :1545 to :1575), or its release, which wakes every
+    /// waiter (`userfaultfd_release` :873). The woken thread runs its access
+    /// again: here new memory is mapped there, which it reads. (On a hole it
+    /// takes the process's own fault:
+    /// `test_a_waiter_on_unmapped_memory_takes_its_own_fault_once_woken`.)
+    #[test]
+    fn test_a_waiter_on_memory_mapped_over_is_woken_by_its_userfaultfd() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(2);
+        register(ctx, mem, 2 * ps).unwrap();
+        let waiter = |at: u64| {
+            std::thread::spawn(move || {
+                // The access's fault, as the signal handler takes it.
+                assert!(fault(at, false), "not missing");
+                // SAFETY: the memory mapped over it below, readable.
+                unsafe { ptr::read_volatile(at as *const u8) }
+            })
+        };
+        let (first, second) = (waiter(mem), waiter(mem + ps));
+        let waiting = |at: u64| WAITERS.iter().any(|w| w.page.load(Ordering::SeqCst) == at);
+        until("the waiters", || waiting(mem) && waiting(mem + ps));
+        // SAFETY: the test's own mapping, mapped over through this libc.
+        let p = unsafe {
+            crate::linux_items::mmap(
+                mem as *mut _,
+                (2 * ps) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(p as u64, mem);
+        // SAFETY: the new memory, read and writable.
+        unsafe { ptr::write_bytes(mem as *mut u8, 7, (2 * ps) as usize) };
+        assert!(slots(mem, mem + 2 * ps).next().is_none(), "the memory mapped over is still registered");
+        assert!(!first.is_finished() && !second.is_finished(), "a waiter went on with no wake");
+        assert_eq!(wake_range(ctx, mem, ps), Ok(()));
+        assert_eq!(first.join().unwrap(), 7);
+        assert!(!second.is_finished(), "the wake of one page woke the other");
+        close(&[user]);
+        assert_eq!(second.join().unwrap(), 7);
+        // SAFETY: the test's own mapping.
+        unsafe { libc::munmap(mem as *mut _, (2 * ps) as usize) };
+    }
+
+    /// A thread waiting on a page whose memory is unmapped, once its
+    /// userfaultfd wakes it, runs its access again and takes the process's
+    /// own fault, as on Linux, where the address has no vma: here the
+    /// previous `SIGSEGV`/`SIGBUS` handler, which ends the child. In a child,
+    /// under an alarm (a waiter left waiting would hang it: `SIGALRM`).
+    #[test]
+    fn test_a_waiter_on_unmapped_memory_takes_its_own_fault_once_woken() {
+        const CHILD_CASE: &str = "WICK_UFFD_UNMAPPED_WAITER";
+        let name = "wick_uffd::tests::test_a_waiter_on_unmapped_memory_takes_its_own_fault_once_woken";
+        if std::env::var_os(CHILD_CASE).is_none() {
+            let out = {
+                let _spawning = crate::timerfd::spawning();
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([name, "--exact", "--include-ignored", "--test-threads=1", "--nocapture"])
+                    .env(CHILD_CASE, "1")
+                    .output()
+                    .unwrap()
+            };
+            use std::os::unix::process::ExitStatusExt;
+            let sig = out.status.signal();
+            assert!(
+                sig == Some(libc::SIGSEGV) || sig == Some(libc::SIGBUS),
+                "{:?}\n{}{}",
+                out.status,
+                std::string::String::from_utf8_lossy(&out.stdout),
+                std::string::String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        // SAFETY: plain alarm; its default action ends the child.
+        unsafe { libc::alarm(10) };
+        let (ctx, _user) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(1);
+        register(ctx, mem, ps).unwrap();
+        let reader = std::thread::spawn(move || {
+            // SAFETY: registered memory: the read waits, then runs again.
+            unsafe { ptr::read_volatile(mem as *const u8) }
+        });
+        until("the waiter", || WAITERS.iter().any(|w| w.page.load(Ordering::SeqCst) == mem));
+        // SAFETY: the test's own mapping, through this libc.
+        assert_eq!(unsafe { crate::linux_items::munmap(mem as *mut _, ps as usize) }, 0);
+        assert_eq!(wake_range(ctx, mem, ps), Ok(()));
+        let _ = reader.join();
+        std::eprintln!("the woken read of an unmapped page went on");
+    }
+
+    /// Memory mapped over one page of a registered range and registered
+    /// again by the same userfaultfd is filled in the new memory: the alias,
+    /// through which fills write, follows the pages there now ([`realias`]).
+    #[test]
+    fn test_a_page_mapped_over_and_registered_again_is_filled_in_the_new_memory() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(2);
+        register(ctx, mem, 2 * ps).unwrap();
+        let data = std::vec![0x11u8; ps as usize];
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        // SAFETY: the test's own page, mapped over through this libc.
+        let p = unsafe {
+            crate::linux_items::mmap(
+                (mem + ps) as *mut _,
+                ps as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(p as u64, mem + ps);
+        assert!(!is_missing(mem + ps) && !is_missing(mem));
+        assert_eq!(zeropage(ctx, mem + ps, ps, true), Err((libc::ENOENT, 0)));
+        register(ctx, mem + ps, ps).unwrap();
+        assert!(is_missing(mem + ps), "the new page is not missing");
+        let data = std::vec![0x77u8; ps as usize];
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem + ps, ps, true) }, Ok(ps));
+        // SAFETY: filled just now; the first page as it was.
+        unsafe {
+            assert_eq!(ptr::read_volatile((mem + ps) as *const u8), 0x77, "the fill did not reach the new memory");
+            assert_eq!(ptr::read_volatile(mem as *const u8), 0x11);
+        }
+        assert_eq!(unregister(ctx, mem, 2 * ps), Ok(()));
+        close(&[user]);
+        // SAFETY: the test's own mapping.
+        unsafe { libc::munmap(mem as *mut _, (2 * ps) as usize) };
+    }
+
+    /// A munmap or a `MAP_FIXED` mapping that cuts a huge page of a
+    /// registered huge page range is `EINVAL` with nothing changed, as Linux
+    /// refuses to split a hugetlb vma off a huge page boundary before
+    /// anything is unmapped (mm/vma.c, v6.12, `__split_vma` :377 to :378,
+    /// called by `vms_gather_munmap_vmas` at :1209 and :1230); on the
+    /// boundaries, the huge pages leave the registration.
+    #[test]
+    fn test_a_cut_of_a_registered_huge_page_is_einval() {
+        use crate::linux_items::{HUGE_PAGE, MAP_HUGETLB, MAP_HUGE_2MB};
+        let _alone = huge_mapping_test();
+        let (ctx, user) = create(0, false, true).unwrap();
+        let host = test_page_size();
+        let len = 2 * HUGE_PAGE;
+        // SAFETY: a huge page mapping of the compatibility mmap, unmapped at the end.
+        let mem = unsafe {
+            crate::linux_items::mmap(
+                ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | MAP_HUGETLB | MAP_HUGE_2MB,
+                -1,
+                0,
+            )
+        } as u64;
+        assert_ne!(mem, libc::MAP_FAILED as u64);
+        register(ctx, mem, len).unwrap();
+        // SAFETY: inside the test's huge mapping; refused before any change.
+        unsafe {
+            assert_eq!(crate::linux_items::munmap((mem + host) as *mut _, host as usize), -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL), "munmap");
+            let p = crate::linux_items::mmap(
+                (mem + HUGE_PAGE - host) as *mut _,
+                (2 * host) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_eq!(p, libc::MAP_FAILED, "MAP_FIXED across a huge page boundary");
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINVAL), "MAP_FIXED");
+        }
+        for off in [0, host, HUGE_PAGE - host, HUGE_PAGE, len - host] {
+            assert!(is_missing(mem + off), "{off:#x}: changed by a refused call");
+        }
+        // SAFETY: the second huge page, on its boundaries.
+        assert_eq!(unsafe { crate::linux_items::munmap((mem + HUGE_PAGE) as *mut _, HUGE_PAGE as usize) }, 0);
+        assert!(is_missing(mem) && !is_missing(mem + HUGE_PAGE));
+        assert_eq!(zeropage(ctx, mem + HUGE_PAGE, HUGE_PAGE, true), Err((libc::ENOENT, 0)));
+        // SAFETY: the first, the rest of the test's mapping.
+        assert_eq!(unsafe { crate::linux_items::munmap(mem as *mut _, HUGE_PAGE as usize) }, 0);
+        assert!(slots(mem, mem + len).next().is_none());
+        close(&[user]);
     }
 
     /// A mapping made where registered memory was unmapped, before its
@@ -2443,7 +2975,6 @@ mod tests {
     /// then replace that memory; and the hole is made only once the serving
     /// thread has answered a request, its start's mappings made.
     #[test]
-    #[ignore = "fails until munmap and MAP_FIXED over registered memory remove its registration"]
     fn test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is() {
         if !in_own_process("wick_uffd::tests::test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is") {
             return;
@@ -2832,6 +3363,27 @@ mod tests {
         assert_eq!(unregister(a, mem + ps, ps), Ok(()));
         assert!(is_missing(mem) && !is_missing(mem + ps) && is_missing(mem + 2 * ps));
         assert_eq!(zeropage(a, mem + 2 * ps, ps, true), Ok(ps));
+        assert_eq!(unregister(a, mem, 3 * ps), Ok(()));
+        close(&[ua]);
+    }
+
+    /// A fill whose destination holds a page in no registration is `ENOENT`
+    /// for the whole call, a page unregistered from the middle of a range
+    /// included, as Linux's destination must lie in one vma this userfaultfd
+    /// has (mm/userfaultfd.c, v6.12, `validate_dst_vma` :23 to :37,
+    /// `uffd_mfill_lock` :113): the unregister split the vma. Before, such a
+    /// page was `EEXIST`, and a fill across it filled the pages before it.
+    #[test]
+    fn test_a_fill_of_an_unregistered_page_is_enoent() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(3);
+        register(a, mem, 3 * ps).unwrap();
+        assert_eq!(unregister(a, mem + ps, ps), Ok(()));
+        assert_eq!(zeropage(a, mem + ps, ps, true), Err((libc::ENOENT, 0)), "the unregistered page");
+        assert_eq!(zeropage(a, mem, 3 * ps, true), Err((libc::ENOENT, 0)), "a fill across it");
+        assert!(is_missing(mem) && is_missing(mem + 2 * ps), "a refused fill filled a page");
+        assert_eq!(zeropage(a, mem, ps, true), Ok(ps));
         assert_eq!(unregister(a, mem, 3 * ps), Ok(()));
         close(&[ua]);
     }
