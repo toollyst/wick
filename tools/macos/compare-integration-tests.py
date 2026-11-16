@@ -30,11 +30,26 @@ An entry names a test (a test function, a file) or a failure:
 exception: every phase of it that failed (setup, call, teardown) failed with
 it. Such an entry cannot be stale for a test that passed; in a full run, a
 `bug` entry of either form that excused nothing is reported.
+
+A test entry may carry its cause, a signature, after ` ~ `:
+`<mode> <kind> <test> ~ <regex>[ @<file>:<line>]`. The regex is searched in
+the crash message of a phase that failed (pytest-json-report), and the
+location, if given, is the last traceback entry in the test's own file. A
+test listed with a signature is excused only if a failed phase matches it and
+every other failed phase matches it or a `failure:` entry; otherwise it is a
+problem that names the message and the location it failed with, so a new
+cause cannot hide under an old entry. In a full run, a signature that
+excused nothing is reported as a `bug` entry is. --suggest-signatures prints
+each listed failure's messages and locations, to write signatures from.
+
+    tools/macos/compare-integration-tests.py --selftest
 """
 
 import argparse
 import json
+import re
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -43,9 +58,9 @@ GOOD = {"passed", "skipped", "xfailed"}
 KINDS = ("bug", "arch", "root", "impossible")
 
 
-def baseline():
+def baseline(path=None):
     out = {}
-    for line in (HERE / "integration-linux-baseline.txt").read_text(encoding="utf-8").splitlines():
+    for line in (path or HERE / "integration-linux-baseline.txt").read_text(encoding="utf-8").splitlines():
         if line.strip() and not line.startswith("#"):
             outcome, nodeid = line.split(None, 1)
             out[nodeid] = outcome
@@ -61,9 +76,28 @@ def matches(nodeid, entry):
     )
 
 
-def differences(mode):
-    """(mode, entry, kind, reason) for the entries that apply to `mode`."""
-    path = HERE / "integration-test-differences.txt"
+def parse_signature(text, where):
+    """(compiled regex, (file, line) or None) of a signature's text."""
+    loc = None
+    m = re.search(r" @([\w.-]+\.py):(\d+)$", text)
+    if m:
+        loc = (m.group(1), int(m.group(2)))
+        text = text[: m.start()]
+    try:
+        return re.compile(text.strip()), loc
+    except re.error as e:
+        raise SystemExit(f"{where}: signature is not a regex ({e}): {text}")
+
+
+def signature_text(sig):
+    regex, loc = sig
+    return regex.pattern + (f" @{loc[0]}:{loc[1]}" if loc else "")
+
+
+def differences(mode, path=None):
+    """(entry, kind, reason, signature or None) for the entries that apply to
+    `mode`."""
+    path = path or HERE / "integration-test-differences.txt"
     entries, reason = [], []
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
@@ -84,9 +118,38 @@ def differences(mode):
             raise SystemExit(f"{path.name}: kind must be {', '.join(KINDS)} or row-N: {raw}")
         if not reason:
             raise SystemExit(f"{path.name}: no reason above {raw}")
+        sig = None
+        if " ~ " in entry:
+            entry, text = entry.split(" ~ ", 1)
+            if entry.strip().startswith("failure:"):
+                raise SystemExit(f"{path.name}: a failure: entry takes no signature: {raw}")
+            sig = parse_signature(text, path.name)
         if m in ("all", mode):
-            entries.append((entry.strip(), kind, " ".join(reason)))
+            entries.append((entry.strip(), kind, " ".join(reason), sig))
     return entries
+
+
+def failed_phases(test):
+    """(phase, crash message, (file, line) or None) of each phase of a test of
+    pytest-json-report that failed; the location is the last traceback entry
+    in the test's own file."""
+    own = test["nodeid"].split("::", 1)[0]
+    out = []
+    for phase in ("setup", "call", "teardown"):
+        p = test.get(phase, {})
+        if p.get("outcome") != "failed":
+            continue
+        loc = None
+        for tb in p.get("traceback") or []:
+            if tb.get("path") == own or str(tb.get("path", "")).endswith("/" + own):
+                loc = (Path(own).name, tb.get("lineno"))
+        out.append((phase, (p.get("crash") or {}).get("message", ""), loc))
+    return out
+
+
+def signature_matches(sig, message, loc):
+    regex, want = sig
+    return bool(regex.search(message)) and (want is None or want == loc)
 
 
 def main():
@@ -100,7 +163,75 @@ def main():
     )
     ap.add_argument("--summary", type=Path)
     ap.add_argument("--summary-txt", type=Path)
-    args = ap.parse_args()
+    ap.add_argument("--differences", type=Path, help=argparse.SUPPRESS)
+    ap.add_argument("--baseline", type=Path, help=argparse.SUPPRESS)
+    ap.add_argument("--suggest-signatures", action="store_true",
+                    help="print each listed failure's messages and locations, to write signatures from")
+    if sys.argv[1:] == ["--selftest"]:
+        return selftest()
+    return run(ap.parse_args())
+
+
+def selftest():
+    """The signature rules on synthetic reports (design: agent-state's
+    compare-signatures-design.md, point 5)."""
+    T = "integration_tests/functional/test_x.py"
+
+    def phase(message, line):
+        return {"outcome": "failed", "crash": {"message": message},
+                "traceback": [{"path": T, "lineno": line, "message": "in test_a"},
+                              {"path": "framework/microvm.py", "lineno": 9, "message": "in kill"}]}
+
+    def report(**ph):
+        t = {"nodeid": f"{T}::test_a", "outcome": "failed", "setup": {"outcome": "passed"},
+             "call": {"outcome": "passed"}, "teardown": {"outcome": "passed"}}
+        t.update(ph)
+        return {"tests": [t], "collectors": []}
+
+    entry = f"all row-6 {T}::test_a ~ DID NOT RAISE.*RuntimeError @test_x.py:395"
+    mem = "all bug failure:MemoryUsageExceededError"
+    cases = [
+        ("same id, listed cause", [entry], report(call=phase("Failed: DID NOT RAISE <class 'RuntimeError'>", 395)), 0),
+        ("same id, other message", [entry], report(call=phase("RemoteDisconnected: Remote end closed", 395)), 1),
+        ("same id, right message, wrong line", [entry],
+         report(call=phase("Failed: DID NOT RAISE <class 'RuntimeError'>", 401)), 1),
+        ("call matched, teardown memory error", [entry, mem],
+         report(call=phase("Failed: DID NOT RAISE <class 'RuntimeError'>", 395),
+                teardown=phase("MemoryUsageExceededError: 5.2 MiB", 12)), 0),
+        ("call matched, teardown another error", [entry, mem],
+         report(call=phase("Failed: DID NOT RAISE <class 'RuntimeError'>", 395),
+                teardown=phase("ProcessLookupError: no such process", 12)), 1),
+        ("teardown only, entry for the call", [entry, mem],
+         report(teardown=phase("MemoryUsageExceededError: 5.2 MiB", 12)), 1),
+        ("no signature: the id alone", [f"all row-6 {T}::test_a"],
+         report(call=phase("RemoteDisconnected: Remote end closed", 395)), 0),
+    ]
+    fails = 0
+    for name, entries, rep, want in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "test-report.json").write_text(json.dumps(rep))
+            (d / "status").write_text("1\n")
+            (d / "mode").write_text("user\n")
+            (d / "differences.txt").write_text("".join(f"# reason\n{e}\n\n" for e in entries))
+            (d / "baseline.txt").write_text(f"passed {T}::test_a\n")
+            ns = argparse.Namespace(out=d, full=False, summary=None, summary_txt=d / "summary.txt",
+                                    differences=d / "differences.txt", baseline=d / "baseline.txt",
+                                    suggest_signatures=False)
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                run(ns)
+            got = int((d / "summary.txt").read_text().splitlines()[1].split(", ")[1].split()[0])
+            if got != want:
+                fails += 1
+                print(f"selftest FAIL: {name}: {got} problem(s), wanted {want}")
+    if fails:
+        return 1
+    print(f"selftest: ok ({len(cases)} cases)")
+    return 0
+
+
+def run(args):
     mode = (args.out / "mode").read_text().strip() if (args.out / "mode").exists() else "user"
 
     problems = []
@@ -114,6 +245,7 @@ def main():
     report = args.out / "test-report.json"
     mac = {}
     failures = {}  # node id: the crash message of each phase that failed
+    phases = {}  # node id: failed_phases()
     uncollected = {}  # a file that failed to collect: the last line of its error
     if report.exists():
         data = json.loads(report.read_text())
@@ -123,15 +255,12 @@ def main():
                 uncollected[c["nodeid"]] = lines[-1].strip().removeprefix("E").strip() if lines else "no error text"
         for t in data["tests"]:
             mac[t["nodeid"]] = t["outcome"]
-            failures[t["nodeid"]] = [
-                (t[phase].get("crash") or {}).get("message", "")
-                for phase in ("setup", "call", "teardown")
-                if t.get(phase, {}).get("outcome") == "failed"
-            ]
+            phases[t["nodeid"]] = failed_phases(t)
+            failures[t["nodeid"]] = [msg for _, msg, _ in phases[t["nodeid"]]]
     else:
         problems.append("no test-report.json")
-    linux = baseline()
-    listed = differences(mode)
+    linux = baseline(args.baseline)
+    listed = differences(mode, args.differences)
     files = {n.split("::", 1)[0] for n in mac} | set(uncollected)
 
     def entry_for(nodeid):
@@ -154,6 +283,46 @@ def main():
                     return e
         return None
 
+    def failure_entry_for_message(msg):
+        for e in listed:
+            if e[0].startswith("failure:"):
+                exc = e[0][len("failure:"):]
+                if msg.startswith(exc + ":") or msg == exc:
+                    return e
+        return None
+
+    def explained(nodeid, e, mo):
+        """None if entry `e` (with a signature) excuses the test that did not
+        pass, else the problem. Each failed phase must match the signature
+        or a failure: entry, and one must match the signature."""
+        got = phases.get(nodeid, [])
+        sig = e[3]
+        if not got:
+            return f"{nodeid}: listed ({e[1]}) for '{signature_text(sig)}', but {mo} with no failed phase"
+        hit = False
+        for phase, msg, loc in got:
+            if signature_matches(sig, msg, loc):
+                hit = True
+            elif failure_entry_for_message(msg) is None:
+                at = f"{loc[0]}:{loc[1]}" if loc else "no line in the test's file"
+                first = msg.splitlines()[0] if msg else "no message"
+                return (f"{nodeid}: listed ({e[1]}) for '{signature_text(sig)}', but its {phase} failed with "
+                        f"'{first}' at {at}")
+        if not hit:
+            return f"{nodeid}: listed ({e[1]}) for '{signature_text(sig)}', but no phase failed so"
+        return None
+
+    if args.suggest_signatures:
+        for nodeid in sorted(phases):
+            e = entry_for(nodeid)
+            if e is None or not phases[nodeid]:
+                continue
+            print(f"{nodeid}  [{e[1]} {e[0]}" + (f" ~ {signature_text(e[3])}" if e[3] else "") + "]")
+            for phase, msg, loc in phases[nodeid]:
+                at = f" @{loc[0]}:{loc[1]}" if loc else ""
+                print(f"    {phase}: {(msg.splitlines() or [''])[0][:200]}{at}")
+        return 0
+
     excused = defaultdict(list)
     used = set()
     agree = 0
@@ -170,8 +339,12 @@ def main():
             if mo == "passed" or mo in GOOD:
                 agree += 1
             elif e:
-                used.add(e[0])
-                excused[e].append(f"{nodeid}: {mo} (Linux: {lo})")
+                why = explained(nodeid, e, mo) if e[3] else None
+                if why:
+                    problems.append(why)
+                else:
+                    used.add(e[0])
+                    excused[e].append(f"{nodeid}: {mo} (Linux: {lo})")
             else:
                 agree += 1  # what fails on Linux is not compared
             continue
@@ -181,8 +354,12 @@ def main():
                 problems.append(f"{nodeid}: passes, but listed ({e[1]}): remove the entry")
             continue
         if e:
-            used.add(e[0])
-            excused[e].append(f"{nodeid}: {mo}")
+            why = explained(nodeid, e, mo) if e[3] else None
+            if why:
+                problems.append(why)
+            else:
+                used.add(e[0])
+                excused[e].append(f"{nodeid}: {mo}")
         else:
             problems.append(f"{nodeid}: passes on Linux, {mo} on macOS")
     for nodeid, mo in sorted(mac.items()):
@@ -196,11 +373,15 @@ def main():
             if e and mo == "passed" and e[1] != "arch":
                 problems.append(f"{nodeid}: passes, but listed ({e[1]}): remove the entry")
         elif e:
-            used.add(e[0])
-            excused[e].append(f"{nodeid}: {mo} (no Linux result)")
+            why = explained(nodeid, e, mo) if e[3] else None
+            if why:
+                problems.append(why)
+            else:
+                used.add(e[0])
+                excused[e].append(f"{nodeid}: {mo} (no Linux result)")
         else:
             problems.append(f"{nodeid}: {mo} on macOS, no Linux result")
-    for entry, kind, _ in listed:
+    for entry, kind, _, sig in listed:
         module = entry.split("::", 1)[0]
         if not args.full:
             continue
@@ -212,6 +393,8 @@ def main():
             problems.append(f"entry '{entry}' ({kind}) names no test")
         elif module in files and entry not in used and kind == "bug":
             problems.append(f"entry '{entry}' (bug) matched nothing that failed")
+        elif module in files and entry not in used and sig:
+            problems.append(f"entry '{entry}' ({kind}) for '{signature_text(sig)}' excused nothing")
 
     for path, why in sorted(uncollected.items()):
         e = entry_for(path)
@@ -244,7 +427,7 @@ def main():
     for kind in sorted(by_kind):
         n = sum(len(i) for _, i in by_kind[kind])
         lines.append(f"### Listed: {kind} ({n})")
-        for (entry, _, reason), items in by_kind[kind]:
+        for (entry, _, reason, _), items in by_kind[kind]:
             lines.append(f"- `{entry}` ({len(items)}): {reason}")
         lines.append("")
     if problems:

@@ -298,7 +298,13 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   test that passes on Linux passes on macOS or is listed, with its root-caused
   reason, in `tools/macos/integration-test-differences.txt`: a wick bug (fix
   it), a Linux feature macOS does not have yet (its `docs/PORTING.md` row), an
-  x86_64-only test, or what the host cannot do (and why). Upstream's framework
+  x86_64-only test, or what the host cannot do (and why). An entry may carry
+  the failure it excuses after ` ~ ` (a regex of the crash message, and
+  `@<file>:<line>` in the test's own file): then a test that fails otherwise
+  is a problem that names its message and line, and a signature that excused
+  nothing in a full run is reported (`--suggest-signatures` prints the
+  listed failures' messages and lines; `--selftest` checks the rules, in
+  CI). Upstream's framework
   is unchanged but for one patch to `tests/conftest.py` (and one test,
   `test_api_version`, accepts the `+wick.N` version: patches/0015); the macOS host side
   (process waiting, memory maps, networks and their host side, the jailer's stand-in for

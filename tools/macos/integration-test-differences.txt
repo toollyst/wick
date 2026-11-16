@@ -15,6 +15,10 @@
 #   arch        tests of the x86_64 host (Apple silicon is aarch64; row 11)
 #   impossible  the host cannot do it; the comment says why
 #   bug         a wick bug, to fix
+# A test entry may end with its cause: `~ <regex>[ @<file>:<line>]`, the regex
+# searched in a failed phase's crash message and the line the last traceback
+# entry in the test's own file: a test that fails otherwise is then not
+# excused (tools/macos/compare-integration-tests.py says how).
 
 # The test caps Firecracker's address space from outside with prlimit(2)
 # (RLIMIT_AS). macOS has no prlimit: a process reads and sets only its own
