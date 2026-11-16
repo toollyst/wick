@@ -466,6 +466,23 @@ mod tests {
         assert!(bad.is_empty(), "locks taken without the stack probe:\n{}", bad.join("\n"));
     }
 
+    /// The lock check reads a module checked out with CRLF line endings as
+    /// it reads one with LF: a lock in the module's tests is the tests' own.
+    /// Git for Windows checks text files out with CRLF (its default
+    /// `core.autocrlf=true`), and CI's windows job, on such a checkout,
+    /// listed every `static` lock of the modules' tests (windows_mm.rs's
+    /// `LOCK`, this module's own fixtures, windows_uffd.rs's `ROOM_TAKEN`) as
+    /// unprobed, where fc-win's checkout, copied from macOS, has LF: the
+    /// tests' start was looked for as "\n#[cfg(test)]\nmod tests".
+    #[test]
+    #[ignore = "until the next commit"]
+    fn test_the_lock_check_reads_a_crlf_checkout() {
+        let lf = "static A: Mutex<()> = Mutex::new(());\n\n#[cfg(test)]\nmod tests {\n    static B: Mutex<()> = Mutex::new(());\n}\n";
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(unprobed_locks("lf", lf), ["lf:1: static A: Mutex<()> = Mutex::new(());"]);
+        assert_eq!(unprobed_locks("crlf", &crlf), ["crlf:1: static A: Mutex<()> = Mutex::new(());"]);
+    }
+
     /// Taking a lock commits no stack beyond what its own frames use, as
     /// the product takes them: a thread with only a few pages of its stack
     /// committed, at the job's limit, must not need a new stack page to
