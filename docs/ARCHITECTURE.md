@@ -411,7 +411,13 @@ semantics on Win32. The details are in the comments of each
   (`VirtualAlloc2`), shared mappings are section views (`MapViewOfFile3`) and
   private file mappings are committed and filled from the file whole when
   mapped (a fill by the page is not race-free in private memory; see
-  `windows_mm::fill`). `madvise(DONTNEED)`
+  `windows_mm::fill`). With no usable hint, an anonymous private mapping whose
+  length is a multiple of 2 MiB is reserved on a 2 MiB boundary, as Linux has
+  placed such mappings since 6.7 (v6.12 mm/mmap.c :902 to :907; not v6.1 or
+  v5.10): a placement choice, which commits nothing, so that a registered
+  userfaultfd range of such a mapping has no 2 MiB chunk at its edge
+  (`test_a_whole_2_mib_anonymous_mapping_is_placed_on_a_2_mib_boundary`).
+  `madvise(DONTNEED)`
   discards private pages. File offsets not aligned to 64 KiB, shared mappings
   past EOF, `MAP_FIXED` over part of a view and `MAP_HUGETLB` fail with the
   Linux errno.

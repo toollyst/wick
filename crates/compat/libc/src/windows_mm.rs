@@ -16,7 +16,11 @@
 //!
 //! Linux operations map onto these:
 //! - `mmap`: reserves a placeholder (or, with `MAP_FIXED`, turns what is in
-//!   the range back into one) and replaces it with the mapping. Offsets into
+//!   the range back into one) and replaces it with the mapping; with no
+//!   usable hint, an anonymous private mapping whose length is a multiple of
+//!   2 MiB is placed on a 2 MiB boundary, as Linux since 6.7 (v6.12
+//!   mm/mmap.c :902 to :907; v6.1 and v5.10 do not), anywhere if no such
+//!   address is free (`new_placeholder_aligned`). Offsets into
 //!   files must be multiples of 64 KiB, Windows' allocation granularity, and
 //!   shared file mappings must lie within the file; anything else fails with
 //!   `EINVAL`;
@@ -620,6 +624,43 @@ fn new_placeholder(addr: usize, len: usize) -> Option<usize> {
     };
     (!p.is_null()).then_some(p as usize)
 }
+
+/// A new placeholder of `len` bytes on a 2 MiB boundary ([`HUGE_PAGE`]),
+/// anywhere: where [`mmap`] puts an anonymous private mapping whose length
+/// is a multiple of 2 MiB when no hint placed it. Linux has done so since
+/// 6.7, for a length that is a multiple of the PMD size only ("Ensures that
+/// larger anonymous mappings are THP aligned": v6.12 mm/mmap.c :902 to
+/// :907, `IS_ALIGNED(len, PMD_SIZE)`); v6.1 and v5.10 place them anywhere.
+/// An address is nothing a caller may rely on: this is a placement choice
+/// with a kernel precedent, not a parity claim. It commits nothing, only
+/// moves where the reservation lands; what it buys is that such a range's
+/// 2 MiB chunks (a registered userfaultfd range's, `uffd_alias_chunked`)
+/// each fill their 2 MiB regions, so none has a view alone in a region at
+/// the range's edge. `None` if Windows has no such address free (or a
+/// test refuses it, [`REFUSE_ALIGNED_PLACEMENT`]), and the caller places it
+/// anywhere, as Linux retries without the alignment's padding (v6.12
+/// mm/huge_memory.c :1092 to :1100, `__thp_get_unmapped_area`, then
+/// `thp_get_unmapped_area_vmflags` :1125 to :1130).
+fn new_placeholder_aligned(len: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER, MemExtendedParameterAddressRequirements};
+    #[cfg(test)]
+    if REFUSE_ALIGNED_PLACEMENT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    let mut need = MEM_ADDRESS_REQUIREMENTS { LowestStartingAddress: std::ptr::null_mut(), HighestEndingAddress: std::ptr::null_mut(), Alignment: HUGE_PAGE };
+    let mut param: MEM_EXTENDED_PARAMETER = MEM_EXTENDED_PARAMETER::default();
+    param.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    param.Anonymous2.Pointer = (&raw mut need).cast();
+    // SAFETY: reserves address space, with the requirement above, which
+    // outlives the call.
+    let p = unsafe { VirtualAlloc2(proc(), std::ptr::null(), len, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &raw mut param, 1) };
+    (!p.is_null()).then_some(p as usize)
+}
+
+/// Tests: the next aligned placement ([`new_placeholder_aligned`]) is
+/// refused, as if Windows had no 2 MiB-aligned address free.
+#[cfg(test)]
+pub(crate) static REFUSE_ALIGNED_PLACEMENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The regions overlapping [start, end), by base.
 fn overlapping(t: &Table, start: usize, end: usize) -> Vec<usize> {
@@ -3115,10 +3156,19 @@ unsafe fn mmap_now(
         }
         base
     } else {
+        // A free hint is taken as it is, as Linux takes it before any
+        // alignment (v6.12 mm/huge_memory.c :1102 to :1107); then an
+        // anonymous private mapping of a multiple of 2 MiB goes on a 2 MiB
+        // boundary ([`new_placeholder_aligned`]), lazy (`MAP_NORESERVE`) or
+        // not, as its placement comes before its memory; `MAP_HUGETLB`'s
+        // large pages are placed apart ([`map_large`]), on their own
+        // boundary ("The size and alignment must be a multiple of the
+        // large-page minimum", Learn, Large-Page Support).
         let hint = addr as usize;
         let p = (hint != 0 && lead == 0 && hint.is_multiple_of(GRANULE))
             .then(|| new_placeholder(hint, len))
             .flatten()
+            .or_else(|| (anon && ty == MAP_PRIVATE && len.is_multiple_of(HUGE_PAGE)).then(|| new_placeholder_aligned(len)).flatten())
             .or_else(|| new_placeholder(0, lead + len));
         let Some(p) = p else {
             return fail(crate::ENOMEM, MAP_FAILED);
@@ -6872,6 +6922,76 @@ mod tests {
             drop(f);
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// An anonymous private mapping whose length is a multiple of 2 MiB is
+    /// placed on a 2 MiB boundary when no hint places it, as Linux since 6.7
+    /// (v6.12 mm/mmap.c :902 to :907; [`new_placeholder_aligned`]): 2, 4 and
+    /// 128 MiB, committed and `MAP_NORESERVE`; each is mapped and usable.
+    /// 3 MiB, a `MAP_SHARED` anonymous mapping of 4 MiB and a file mapping
+    /// are made with no such requirement (PLACEMENT lines say where). A free
+    /// hint 64 KiB past a boundary is taken as it is. With the aligned
+    /// reservation refused (`REFUSE_ALIGNED_PLACEMENT`), a 4 MiB mapping is
+    /// still made, anywhere.
+    #[test]
+    fn test_a_whole_2_mib_anonymous_mapping_is_placed_on_a_2_mib_boundary() {
+        let _serial = serial();
+        use std::io::Write;
+        use std::os::windows::io::AsRawHandle;
+        let mib = 1 << 20;
+        let off = |p: usize| (p % HUGE_PAGE) >> 10;
+        let touch_and_unmap = |p: usize, len: usize| {
+            // SAFETY: our mapping, unmapped here.
+            unsafe {
+                std::ptr::write_volatile(p as *mut u8, 1);
+                std::ptr::write_volatile((p + len - 1) as *mut u8, 2);
+                assert_eq!(munmap(p as *mut c_void, len), 0);
+            }
+        };
+        for (len, flags) in [(2 * mib, ANON), (4 * mib, ANON), (128 * mib, ANON), (2 * mib, ANON | MAP_NORESERVE), (128 * mib, ANON | MAP_NORESERVE)] {
+            let p = map(0, len, PROT_READ | PROT_WRITE, flags, -1, 0);
+            std::println!("PLACEMENT anonymous private {} MiB (flags {flags:#x}): {} KiB into its 2 MiB", len / mib, off(p));
+            assert!(p.is_multiple_of(HUGE_PAGE), "{} MiB, flags {flags:#x}, at {p:#x}", len / mib);
+            touch_and_unmap(p, len);
+        }
+        let p = map(0, 3 * mib, PROT_READ | PROT_WRITE, ANON, -1, 0);
+        std::println!("PLACEMENT anonymous private 3 MiB: {} KiB into its 2 MiB", off(p));
+        touch_and_unmap(p, 3 * mib);
+        let p = map(0, 4 * mib, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        std::println!("PLACEMENT anonymous shared 4 MiB: {} KiB into its 2 MiB", off(p));
+        touch_and_unmap(p, 4 * mib);
+        let path = std::env::temp_dir().join(std::format!("wick-placement-{}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+        f.write_all(&std::vec![0x11u8; 2 * mib]).unwrap();
+        let fd = crate::windows_fd::to_fd_pub(f.as_raw_handle());
+        for (what, flags) in [("private", MAP_PRIVATE), ("shared", MAP_SHARED)] {
+            let p = map(0, 2 * mib, PROT_READ | PROT_WRITE, flags, fd, 0);
+            std::println!("PLACEMENT a file's {what} 2 MiB: {} KiB into its 2 MiB", off(p));
+            // SAFETY: our mapping of the file.
+            assert_eq!(unsafe { *(p as *const u8) }, 0x11);
+            // SAFETY: our mapping.
+            assert_eq!(unsafe { munmap(p as *mut c_void, 2 * mib) }, 0);
+        }
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+        // A free hint 64 KiB past a boundary: reserved to find it, freed.
+        // SAFETY: reserves and frees address space of our own.
+        let hint = unsafe {
+            let r = VirtualAlloc2(proc(), std::ptr::null(), 8 * mib, MEM_RESERVE, PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize;
+            assert_ne!(r, 0);
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+            r.next_multiple_of(HUGE_PAGE) + GRANULE
+        };
+        let p = map(hint, 4 * mib, PROT_READ | PROT_WRITE, ANON, -1, 0);
+        std::println!("PLACEMENT a free hint {} KiB into its 2 MiB: at it {}", off(hint), p == hint);
+        assert_eq!(p, hint, "the free hint");
+        touch_and_unmap(p, 4 * mib);
+        REFUSE_ALIGNED_PLACEMENT.store(true, std::sync::atomic::Ordering::SeqCst);
+        let p = map(0, 4 * mib, PROT_READ | PROT_WRITE, ANON, -1, 0);
+        let reached = !REFUSE_ALIGNED_PLACEMENT.swap(false, std::sync::atomic::Ordering::SeqCst);
+        std::println!("PLACEMENT 4 MiB with the aligned reservation refused: made, {} KiB into its 2 MiB", off(p));
+        assert!(reached, "the refusal was not reached");
+        touch_and_unmap(p, 4 * mib);
     }
 
     #[test]
