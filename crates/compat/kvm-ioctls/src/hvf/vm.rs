@@ -468,6 +468,13 @@ static BOUND_HIGH: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static PROTECTED_PAST_BOUND: AtomicUsize = AtomicUsize::new(0);
 
+/// Tests: how long each protection hook held the memory lock, in order, and
+/// in it its protection read and its stage-2 calls ([`Follow::apply`]).
+#[cfg(test)]
+static HOOK_HELD: Mutex<Vec<[std::time::Duration; 3]>> = Mutex::new(Vec::new());
+#[cfg(test)]
+static HOOK_APPLY: Mutex<std::time::Duration> = Mutex::new(std::time::Duration::ZERO);
+
 /// Tests: run once by the next protection read (the protection hook's or a
 /// new slot's), after `wick_uffd`'s lock or count and before the memory
 /// lock, so that a test can make a whole other change there.
@@ -553,6 +560,22 @@ fn before_protection_read() {
 /// the old pages and reads no mapping (it stays out) or the new one (mapped),
 /// then the mapping's unmaps what is there and maps the new pages.
 ///
+/// The memory lock is held for the read, the pages' state and the stage-2
+/// calls, made by runs ([`Follow`]): over 1 GiB of a slot (65536 pages, each
+/// in stage 2 and with memory), optimized as Firecracker's release build,
+/// on an M1 Pro, macOS 27.2, an mprotect to `PROT_NONE` and one back held
+/// it 3.7 to 4.0 ms, and its munmap 28.9 to 30.3 ms, of which one
+/// `hv_vm_unmap` of the GiB took 25.7 to 27.0 ms; page by page it was 31 to
+/// 33 ms and 36 to 51 ms (`test_the_memory_lock_held_by_a_hook_over_a_gib`,
+/// three runs each). A vCPU that faults meanwhile waits for it, as on Linux
+/// (v6.12) a stage-2 fault takes `mmu_lock` for read (arch/arm64/kvm/mmu.c
+/// :1624, `user_mem_abort`) and the MMU notifier holds it for write over the
+/// range (virt/kvm/kvm_main.c :646, `KVM_MMU_LOCK`, kvm_mm.h :15). Not as
+/// Linux: Linux lets a waiter in between blocks of the range when the call
+/// may block (mmu.c :56 to :80, `cond_resched_rwlock_write` :76; a block is
+/// 32 MiB with 16 KiB pages, 1 GiB with 4 KiB, asm/kvm_pgtable.h :18 to
+/// :27), where this hook holds the lock for the whole call.
+///
 /// A range outside the slots' span costs two atomic loads ([`BOUND_LOW`]).
 /// Not from a signal handler (no compatibility `mmap`, `munmap` or
 /// `mprotect` is called from one), and never with the VM's memory lock
@@ -578,44 +601,143 @@ fn guest_protected(host: u64, len: u64, replaced: bool) {
         #[cfg(test)]
         before_protection_read();
         let mut guard = vm.memory.lock().unwrap();
+        #[cfg(test)]
+        let held = std::time::Instant::now();
         // Read under the memory lock (`host_protections`): the last of two
         // hooks for the same pages to store also read last.
         let prot = read();
+        #[cfg(test)]
+        let read_took = held.elapsed();
+        #[cfg(test)]
+        {
+            *HOOK_APPLY.lock().unwrap() = std::time::Duration::ZERO;
+        }
         let memory = &mut *guard;
         for slot in memory.slots.values_mut() {
             let (s, e) = (start.max(slot.host), end.min(slot.host + slot.size));
+            // The stage-2 changes, gathered by runs while the pages' state is
+            // stored, then made: one call a run, not a page.
+            let mut runs = Follow::default();
             let mut at = s;
             while at < e {
                 let ipa = slot.ipa + (at - slot.host);
                 let index = slot.page_index(ipa);
                 let missing = libc::wick_uffd::is_missing(at);
-                let mut before = if slot.mapped(index) && !missing { slot.flags(ipa) } else { 0 };
-                let mut was_mapped = slot.mapped(index);
+                let was_mapped = slot.mapped(index);
+                let before = if was_mapped && !missing { slot.flags(ipa) } else { 0 };
                 // A page being replaced gets its protection only: the
                 // window's end maps it with it (`Slot::map`).
                 let in_window = memory.replacing.iter().any(|w| ipa >= w.ipa && ipa < w.ipa + w.size);
-                if replaced && was_mapped && !in_window {
-                    // SAFETY: unmapping one page of a slot we mapped.
-                    let ret = unsafe { hv_vm_unmap(ipa, page as usize) };
-                    if ret != HV_SUCCESS {
-                        // The guest would keep pages the host may have given up.
-                        eprintln!(
-                            "wick: guest memory at {ipa:#x} cannot be unmapped after its host memory was replaced \
-                             (hv_vm_unmap: {ret:#x})"
-                        );
-                        std::process::abort();
-                    }
-                    (was_mapped, before) = (false, 0);
-                }
                 slot.prot[index] = prot[((at - start) / page) as usize];
                 slot.wrote[index / 64] &= !(1 << (index % 64));
                 if !in_window {
-                    slot.follow(at, ipa, was_mapped, before, missing);
+                    let now_mapped = slot.mapped(index);
+                    if replaced && was_mapped {
+                        // Replaced: out of stage 2 whatever it reads now,
+                        // and in again with the pages there now.
+                        runs.unmap(ipa, page);
+                        if now_mapped {
+                            runs.map(at, ipa, page);
+                        }
+                    } else {
+                        match (was_mapped, now_mapped) {
+                            (true, false) => runs.unmap(ipa, page),
+                            (false, true) => runs.map(at, ipa, page),
+                            (true, true) => {
+                                let after = if missing { 0 } else { slot.flags(ipa) };
+                                if after != before {
+                                    runs.protect(ipa, page, after, before & !after != 0);
+                                }
+                            }
+                            (false, false) => {}
+                        }
+                    }
                 }
                 at += page;
             }
+            #[cfg(test)]
+            let applied = std::time::Instant::now();
+            runs.apply(slot);
+            #[cfg(test)]
+            {
+                *HOOK_APPLY.lock().unwrap() += applied.elapsed();
+            }
         }
+        #[cfg(test)]
+        HOOK_HELD.lock().unwrap().push([held.elapsed(), read_took, *HOOK_APPLY.lock().unwrap()]);
     });
+}
+
+/// The stage-2 changes one protection hook makes to a slot, by runs of
+/// contiguous pages ([`guest_protected`]): unmapped runs (a mapping went or
+/// was replaced), mapped runs (a mapping came, or came again), and runs
+/// whose permissions change. [`Follow::apply`] makes the unmaps, then the
+/// maps (a page replaced is unmapped before it is mapped again), then the
+/// protects; all under the memory lock, each against the host's state as
+/// stored, so the order across pages changes nothing a vCPU can see: what
+/// is taken away was already the host's, and what is given the host gives.
+#[derive(Default)]
+struct Follow {
+    unmaps: Vec<(u64, u64)>,
+    maps: Vec<(u64, u64, u64)>,
+    protects: Vec<(u64, u64, hv_memory_flags_t, bool)>,
+}
+
+impl Follow {
+    fn unmap(&mut self, ipa: u64, size: u64) {
+        match self.unmaps.last_mut() {
+            Some((at, len)) if *at + *len == ipa => *len += size,
+            _ => self.unmaps.push((ipa, size)),
+        }
+    }
+
+    fn map(&mut self, host: u64, ipa: u64, size: u64) {
+        match self.maps.last_mut() {
+            Some((h, at, len)) if *at + *len == ipa && *h + *len == host => *len += size,
+            _ => self.maps.push((host, ipa, size)),
+        }
+    }
+
+    fn protect(&mut self, ipa: u64, size: u64, flags: hv_memory_flags_t, reducing: bool) {
+        match self.protects.last_mut() {
+            Some((at, len, f, r)) if *at + *len == ipa && *f == flags => {
+                *len += size;
+                *r |= reducing;
+            }
+            _ => self.protects.push((ipa, size, flags, reducing)),
+        }
+    }
+
+    /// Makes the changes to `slot`'s stage 2, with the pages' state already
+    /// stored. An unmap or a map that fails ends the process: the guest
+    /// would keep pages the host no longer has, or lose ones it has. A
+    /// protect is [`protect_stage2`]'s rule: one that takes a permission
+    /// away (in any page of the run) and fails ends the process; one that
+    /// gives and fails is the guest's next fault's error (`stale_fault`).
+    fn apply(self, slot: &Slot) {
+        for (ipa, size) in self.unmaps {
+            // SAFETY: unmapping a run of a slot we mapped.
+            let ret = unsafe { hv_vm_unmap(ipa, size as usize) };
+            if ret != HV_SUCCESS {
+                eprintln!(
+                    "wick: guest memory at {ipa:#x}+{size:#x} cannot be unmapped after its host memory went or was \
+                     replaced (hv_vm_unmap: {ret:#x})"
+                );
+                std::process::abort();
+            }
+        }
+        for (host, ipa, size) in self.maps {
+            // SAFETY: the pages' new mapping, which the hook unmaps again
+            // when it goes.
+            if let Err(e) = unsafe { slot.map_run(host, ipa, size) } {
+                eprintln!("wick: guest memory at {ipa:#x}+{size:#x} cannot be mapped to its new host memory: {e}");
+                std::process::abort();
+            }
+        }
+        for (ipa, size, flags, reducing) in self.protects {
+            let _ = protect_stage2(ipa, size, flags, reducing);
+        }
+    }
 }
 
 /// Widens the slots' span ([`BOUND_LOW`]) to `[start, end)`. Under the
@@ -668,43 +790,6 @@ impl Slot {
             }
         }
         Ok(())
-    }
-
-    /// Brings stage 2 at the host page `host` (`ipa`) to the page's
-    /// protection just stored ([`Slot::prot`]): `was_mapped` and `before`
-    /// are what it had.
-    fn follow(&self, host: u64, ipa: u64, was_mapped: bool, before: hv_memory_flags_t, missing: bool) {
-        let page = host_page_size();
-        let index = self.page_index(ipa);
-        match (was_mapped, self.mapped(index)) {
-            (true, false) => {
-                // SAFETY: unmapping one page of a slot we mapped.
-                let ret = unsafe { hv_vm_unmap(ipa, page as usize) };
-                if ret != HV_SUCCESS {
-                    // The guest would keep a page the host no longer has.
-                    eprintln!("wick: guest memory at {ipa:#x} cannot be unmapped after its host memory went (hv_vm_unmap: {ret:#x})");
-                    std::process::abort();
-                }
-            }
-            (false, true) => {
-                // SAFETY: the page's new mapping, which the hook unmaps
-                // again when it goes.
-                if let Err(e) = unsafe { self.map_run(host, ipa, page) } {
-                    eprintln!("wick: guest memory at {ipa:#x} cannot be mapped to its new host memory: {e}");
-                    std::process::abort();
-                }
-            }
-            (true, true) => {
-                let after = if missing { 0 } else { self.flags(ipa) };
-                if after != before {
-                    // A permission taken that fails ends the process; one
-                    // given that fails is the guest's next fault's error
-                    // (`stale_fault`).
-                    let _ = protect_stage2(ipa, page, after, before & !after != 0);
-                }
-            }
-            (false, false) => {}
-        }
     }
 
     /// The index of the host page holding `ipa`, which the slot holds.
@@ -3402,6 +3487,44 @@ mod tests {
         assert_eq!(PROTECTED_PAST_BOUND.load(Ordering::SeqCst), before + 1, "the control: an mprotect of slot memory");
         // SAFETY: the test's mapping.
         unsafe { libc::munmap(other, page as usize) };
+    }
+
+    /// How long the protection hook holds the memory lock over 1 GiB of a
+    /// slot whose every page is in stage 2 and has memory: an mprotect of
+    /// it to `PROT_NONE`, one back to read and write, and its munmap (the
+    /// cases of Firecracker's memory hot-unplug and teardown, where a vCPU
+    /// faulting meanwhile waits for the lock). A measurement: it prints the
+    /// figures and checks only that each call ran its hook once; run by name
+    /// in heavy.sh's timing mode.
+    #[test]
+    #[ignore = "a measurement, run by name in heavy.sh's timing mode (no clamp): the memory lock's hold by a hook over 1 GiB"]
+    fn test_the_memory_lock_held_by_a_hook_over_a_gib() {
+        let (_vm, _vcpu, mem, len) = vm_with_memory(1024, &STORE_THEN_LOAD);
+        let page = host_page_size() as usize;
+        for off in (page..len).step_by(page) {
+            // SAFETY: a page of the test's slot memory, not the code's.
+            unsafe { mem.cast::<u8>().add(off).write_volatile(1) };
+        }
+        HOOK_HELD.lock().unwrap().clear();
+        let mut calls = Vec::new();
+        for (what, prot) in [("mprotect PROT_NONE", libc::PROT_NONE), ("mprotect back", libc::PROT_READ | libc::PROT_WRITE)] {
+            let t = std::time::Instant::now();
+            protect(mem, len as u64, prot);
+            calls.push((what, t.elapsed()));
+        }
+        let t = std::time::Instant::now();
+        // SAFETY: the test's slot memory, no longer used.
+        assert_eq!(unsafe { libc::munmap(mem, len) }, 0);
+        calls.push(("munmap", t.elapsed()));
+        let held = HOOK_HELD.lock().unwrap().clone();
+        assert_eq!(held.len(), 3, "one hook a call: {held:?}");
+        for ((what, call), [held, read, apply]) in calls.iter().zip(&held) {
+            println!(
+                "{what} of 1 GiB ({} pages): the call {call:?}, the memory lock held {held:?} (the protection read \
+                 {read:?}, the stage-2 calls {apply:?})",
+                len / page
+            );
+        }
     }
 
     /// The protection hook does not wait for a vCPU that waits for pages

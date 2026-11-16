@@ -68,7 +68,7 @@
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
 #   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf).
-#   compat-kvm-ioctls: 108 tests; 34 pass, 74 fail, 0 ignored (counted again
+#   compat-kvm-ioctls: 109 tests; 34 pass, 74 fail, 1 ignored (counted again
 #   on 2026-11-17 by check-unit-tests.py --crate compat-kvm-ioctls), all
 #   no-hvf: 73 with Error(1) at hv_vm_create, and the vCPU thread's latency
 #   tier's test_a_wfi_ends_when_its_timer_is_due, which fails on a runner
