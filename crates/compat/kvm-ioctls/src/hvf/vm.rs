@@ -2170,12 +2170,40 @@ mod tests {
         // Writers raising interrupts in their threads, registrations coming
         // and going, writes through another process's handle that the irqfd
         // thread reads under the VM's `irq` lock, and a thread that holds
-        // `irq` and `vcpus` as the backend does: none may wait for another
-        // forever. A removal under `irq` (which a running consumer waits
-        // for) or a consumer called under the eventfd's own lock (which the
-        // irqfd thread takes under `irq`) deadlocks here.
+        // `irq` and `vcpus` and reads the eventfd under them: none may wait
+        // for another forever. A removal under `irq` (which a running
+        // consumer waits for) or a consumer called under the eventfd's own
+        // lock (which the irqfd thread takes under `irq`) deadlocks here.
         // The threads are not scoped: a deadlocked one is left behind, and
         // the test fails by its name rather than waiting for it.
+        //
+        // A deadlock stops the rounds; a slow round does not. So the test
+        // fails when no round has ended for STALL, not when the 2000 take
+        // long. Rounds here cost milliseconds: measured on an M1 Pro, macOS
+        // 27.2, 2000 rounds took 37 to 59 s, with a utility QoS clamp or
+        // without, and unclamped a round's wait for `irq` was a median 12 to
+        // 22 ms, at most 366 ms. That is this
+        // test's own holder with the writers: the holder keeps `irq` across
+        // its read, which takes the eventfd's value mutex
+        // (vmm-sys-util/src/macos/eventfd.rs :298), and the writers, whose
+        // writes nobody consumes between rounds, take that mutex in a loop
+        // (:196). Both are pthread mutexes, and libpthread's default policy
+        // is first fit (libpthread-539.100.4 src/types_internal.h :177 to
+        // :179), so a thread in a loop takes one again before a woken waiter
+        // runs. Measured by which threads ran: the writers with the holder,
+        // 52 to 77 s for 2000 rounds; the holder alone 0.38 s, the writers
+        // alone 0.26 s, the other process's writer alone 20 ms. The holder's
+        // own wait for the value mutex is inferred from that, not timed.
+        // The product has no such holder. `irq` is taken by `route`
+        // (inject's lookup), the irqfd thread (its read is of a registered
+        // eventfd, whose writes in this process are consumed and never take
+        // the value mutex), register and unregister, and `set_gsi_routing`.
+        // Against an interrupt storm a registration costs, measured the same
+        // way: a median 8.75 us and at most 112 us through another process's
+        // handle; a median 80 to 89 us and at most 1.5 ms against writers in
+        // this process. The consumers' write lock, a std RwLock that turns
+        // new readers away once a writer waits, took at most 42 us.
+        const STALL: Duration = Duration::from_secs(10);
         with_created_vcpu(&[43], |vm| {
             let vm = Arc::new(vm);
             let evt = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
@@ -2216,12 +2244,26 @@ mod tests {
                 }
                 let _ = tx.send(());
             });
-            let ended = rx.recv_timeout(Duration::from_secs(60)).is_ok();
-            assert!(
-                ended,
-                "registrations stopped after {} of 2000 rounds: a lock order deadlock",
-                rounds.load(Ordering::Relaxed)
-            );
+            let (mut seen, mut since) = (0, Instant::now());
+            loop {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                        "the registering thread ended after {} of 2000 rounds without finishing them",
+                        rounds.load(Ordering::Relaxed)
+                    ),
+                }
+                let now = rounds.load(Ordering::Relaxed);
+                if now != seen {
+                    (seen, since) = (now, Instant::now());
+                }
+                assert!(
+                    since.elapsed() < STALL,
+                    "registrations stopped after {now} of 2000 rounds, none ended for {} s: a lock order deadlock",
+                    since.elapsed().as_secs()
+                );
+            }
             stop.store(true, Ordering::Relaxed);
             for t in threads {
                 t.join().unwrap();
