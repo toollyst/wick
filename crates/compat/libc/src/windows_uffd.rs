@@ -3335,6 +3335,26 @@ mod tests {
         assert!(line.contains(&std::format!("thread {rust} \"wick-stack-test\"")), "{text}");
     }
 
+    /// The frames printed after the line of a stack that could not grow
+    /// (STACK137FRAMES) name the module of each frame outside this
+    /// executable with its offset in it: the exception dispatcher's frames
+    /// are ntdll's, and CI run 43823078930's `vcpu-runner` died ten frames
+    /// deep in a DLL `WHvRunVirtualProcessor` called, which the line gave
+    /// as bare addresses (randomised per boot), so it could not be named
+    /// after the run.
+    #[test]
+    #[ignore = "until STACK137FRAMES names the module of a frame"]
+    fn test_the_frames_of_a_stack_that_could_not_grow_name_their_modules() {
+        let (code, text) = run_child("stack_at_the_limit_rust_child", Some(96 << 20));
+        assert_eq!(code, Some(137), "{text}");
+        let frames: std::vec::Vec<&str> = text.lines().filter(|l| l.starts_with("STACK137FRAMES ")).collect();
+        assert!(frames.iter().any(|l| l.to_ascii_lowercase().contains(" ntdll.dll+0x")), "{text}");
+        for l in &frames {
+            let what = l.split(' ').nth(2).unwrap_or_default();
+            assert!(what.starts_with("image+0x") || what.contains(".dll+0x") || what.contains(".DLL+0x"), "a frame not named: {l}\n{text}");
+        }
+    }
+
     fn stack_at_the_limit(kind: Kind) {
         lazy_memory_is_mapped();
         make_the_slack_region();
