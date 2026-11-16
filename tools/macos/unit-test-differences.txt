@@ -72,9 +72,10 @@
 #   on 2026-11-17 by check-unit-tests.py --crate compat-kvm-ioctls), all
 #   no-hvf: 73 with Error(1) at hv_vm_create, and the vCPU thread's latency
 #   tier's test_a_wfi_ends_when_its_timer_is_due, which fails on a runner
-#   before it makes its VM, at its own requirement of a foreground process,
-#   since the runners' processes are coalesced as background ones
-#   (timer-coalescing.py's output in the same job). PV time's refusal where
+#   before it makes its VM, at its own requirement of a launcher that raised
+#   no timer coalescing, since the runners' processes are coalesced as
+#   background ones (timer-coalescing.py's output in the same job); so CI
+#   never runs it, and its figures are this Mac's. PV time's refusal where
 #   it is not offered is checked without a VM
 #   (test_the_attribute_is_enxio_where_pv_time_is_not_offered, which passes
 #   on the runners, macOS 26).

@@ -4304,12 +4304,31 @@ mod tests {
         //
         // The tier in effect is the more coalesced of the thread's and the
         // task's (osfmk/kern/thread_policy.c), so this holds only in a
-        // process that is not a background one: required first, by this
-        // thread's own 20 ms sleeps (a foreground process's end at most
-        // 10 ms late, a background one's 100 ms and more).
+        // process whose tier no launcher raised: required first, by what can
+        // be read without privilege. The effective tier itself cannot be
+        // (TASK_POLICY_STATE and THREAD_POLICY_STATE need root: task_policy.c
+        // :634 to :645, thread_policy.c :1447 to :1451, xnu-12377.1.9), so:
+        // - a QoS clamp (`taskpolicy -c`, a launcher's
+        //   posix_spawnattr_set_qos_clamp_np) caps the task's max priority at
+        //   its class's (task_policy.c :1272 to :1277; utility 20,
+        //   background and maintenance 4, sched.h :158 to :166) and raises
+        //   its latency tier to 3 for utility and below (task_policy.c
+        //   :1044 to :1045, thread_policy.c :121 to :123); a Darwin
+        //   background process (`taskpolicy -b`, PRIO_DARWIN_PROCESS: its
+        //   darwinbg makes it lowpri_cpu, task_policy.c :962 to :967) has max
+        //   priority 4 (:1250 to :1252). Every thread gets
+        //   the task's max priority (task_policy.c :1289 to :1320,
+        //   thread_policy.c :1210), which proc_pidinfo gives
+        //   (PROC_PIDTHREADID64INFO, pth_maxpriority: bsd_kern.c :1165). A
+        //   max priority under BASEPRI_DEFAULT (31) is refused; `nice`
+        //   leaves it at MAXPRI_USER (63), lowering the priority only
+        //   (task_policy.c :1270).
+        // - this thread's own 20 ms sleeps, as many as the rounds: their
+        //   median ends under 15 ms late (a process at tier 1, 5 ms of
+        //   leeway at most, 10 ms while the user is idle).
         const DUE: Duration = Duration::from_millis(20);
         const ROUNDS: usize = 21;
-        let mut sleeps: Vec<Duration> = (0..5)
+        let mut sleeps: Vec<Duration> = (0..ROUNDS)
             .map(|_| {
                 let start = Instant::now();
                 thread::sleep(DUE);
@@ -4317,15 +4336,48 @@ mod tests {
             })
             .collect();
         sleeps.sort_unstable();
-        // <sys/resource.h>.
-        const PRIO_DARWIN_PROCESS: libc::c_int = 4;
-        // SAFETY: reads this process's Darwin background state.
-        let darwin_bg = unsafe { libc::getpriority(PRIO_DARWIN_PROCESS, 0) };
+        let max_priority = {
+            // <sys/proc_info.h>: struct proc_threadinfo.
+            #[repr(C)]
+            struct ProcThreadInfo {
+                user_time: u64,
+                system_time: u64,
+                cpu_usage: i32,
+                policy: i32,
+                run_state: i32,
+                flags: i32,
+                sleep_time: i32,
+                curpri: i32,
+                priority: i32,
+                maxpriority: i32,
+                name: [u8; 64],
+            }
+            const PROC_PIDTHREADID64INFO: libc::c_int = 15;
+            unsafe extern "C" {
+                fn proc_pidinfo(pid: libc::c_int, flavor: libc::c_int, arg: u64, buf: *mut libc::c_void, size: libc::c_int) -> libc::c_int;
+                fn pthread_threadid_np(thread: libc::pthread_t, id: *mut u64) -> libc::c_int;
+            }
+            let mut id = 0u64;
+            // SAFETY: this thread and a u64 for its id.
+            assert_eq!(unsafe { pthread_threadid_np(libc::pthread_self(), &mut id) }, 0);
+            // SAFETY: plain old data, all zeroes valid.
+            let mut info: ProcThreadInfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<ProcThreadInfo>() as libc::c_int;
+            // SAFETY: this process, this thread's id, and a buffer of the size given.
+            let got = unsafe { proc_pidinfo(libc::getpid(), PROC_PIDTHREADID64INFO, id, (&raw mut info).cast(), size) };
+            assert_eq!(got, size, "proc_pidinfo PROC_PIDTHREADID64INFO");
+            info.maxpriority
+        };
+        // osfmk/kern/sched.h :163.
+        const BASEPRI_DEFAULT: i32 = 31;
         assert!(
-            darwin_bg == 0 && sleeps[2] < Duration::from_millis(15),
-            "this test needs a foreground launcher (a signed run from a terminal, tools/macos/test.sh): this \
-             process is a background one, whose timers macOS coalesces whatever its threads ask for \
-             (PRIO_DARWIN_PROCESS {darwin_bg}; 20 ms sleeps end {sleeps:?} late)"
+            max_priority >= BASEPRI_DEFAULT && sleeps[ROUNDS / 2] < Duration::from_millis(15),
+            "this test needs a launcher that raised no timer coalescing (a signed run from a terminal, \
+             tools/macos/test.sh, not under taskpolicy): this thread's max priority is {max_priority} (under \
+             {BASEPRI_DEFAULT}: a QoS clamp of utility or lower, or a Darwin background process, either of which \
+             coalesces its timers at latency tier 3 whatever its threads ask for), and its {ROUNDS} 20 ms sleeps \
+             end a median {:?} late: {sleeps:?}",
+            sleeps[ROUNDS / 2]
         );
         let (_vm, _gic, mut vcpu) = vm_with_gic_and_code(&WFI_UNTIL_DUE);
         let mut freq = 0u64;
@@ -4379,7 +4431,12 @@ mod tests {
         // SAFETY: no arguments.
         super::super::latency::vcpu_thread(unsafe { libc::pthread_self() }).unwrap();
         let with = rounds(&mut vcpu);
-        let levels = format!("machdep.user_idle_level {level_before} before, {} after", idle_level());
+        let levels = format!(
+            "machdep.user_idle_level {level_before} before, {} after; the thread's max priority {max_priority}, its \
+             20 ms sleeps a median {:?} late",
+            idle_level(),
+            sleeps[ROUNDS / 2]
+        );
         println!(
             "a guest's {DUE:?} WFI, later than a NOTE_CRITICAL timer by (us, sorted): on the thread as it is, median {} \
              {without:?}; as a vCPU thread, median {} {with:?}; {levels}",

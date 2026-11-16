@@ -21,7 +21,7 @@
 //! macOS 27.2, 20 ms waits, against a `NOTE_CRITICAL` timer in the same
 //! rounds, the user idle: a median 4.7 to 9.5 ms later than it without the
 //! tier, 1.3 to 1.7 ms with it (`test_a_wfi_ends_when_its_timer_is_due`,
-//! three runs). Only a time-constraint thread is not
+//! three runs, this Mac's alone: CI's runners have no Hypervisor.framework). Only a time-constraint thread is not
 //! coalesced at all, and a spinning guest then starves the host until the
 //! kernel demotes the thread (after 1 s, measured): not used.
 //!
