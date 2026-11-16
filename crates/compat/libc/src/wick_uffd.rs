@@ -45,7 +45,8 @@
 //! (tests/integration_tests/functional/test_uffd.py), where a range per
 //! part would run out of the [`MAX_RANGES`] slots. The cost is a byte a
 //! page (64 KiB a GiB of 16 KiB pages). A range is freed with its alias
-//! once no page of it has an owner.
+//! once no page of it has an owner; its slot keeps the arrays for the next
+//! range that fits ([`Range`]).
 //!
 //! Every change of the arrays is made under [`LOCK`]; the signal handler
 //! ([`on_signal`], [`fault`]) and the backend's stage-2 side ([`is_missing`],
@@ -54,10 +55,10 @@
 //! missing bit, and the missing bit cleared before the owner), so a reader
 //! that sees no owner never waits for a fill. The changes, in order:
 //!
-//! - register, new memory: the arrays are made (owner the userfaultfd,
-//!   missing for pages not resident), then the range is published (its start
-//!   last), then the missing pages are made `PROT_NONE` and missing in stage
-//!   2. Until then an access goes through to the memory as it is, as it did
+//! - register, new memory: a free slot's arrays are reset, or new ones
+//!   made (owner the userfaultfd, missing for pages not resident), then the
+//!   range is published in the slot's window ([`Range`]'s `gen`), then the
+//!   missing pages are made `PROT_NONE` and missing in stage 2. Until then an access goes through to the memory as it is, as it did
 //!   a moment before the register.
 //! - register, pages of a range no userfaultfd has: asked, then owner, then
 //!   missing, then `PROT_NONE` (as above).
@@ -155,8 +156,40 @@ const MAX_WAITERS: usize = 256;
 /// The protection bits a page's asked protection keeps.
 const PROT_RWX: c_int = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
 
-/// A registered range. Its arrays are never freed: the signal handler may be
-/// reading them.
+/// A slot of [`RANGES`]: a registered range, or free (`start` 0).
+///
+/// Its per-page arrays belong to the slot and are never freed: a reader
+/// without [`LOCK`] (the signal handler, [`fault`], the stage-2 side) may
+/// hold them. A range takes the free slot with the least room that fits it,
+/// whose arrays it reuses, reset while the slot is free; with none, the
+/// first free slot takes new arrays with room for the next power of two of
+/// the range's pages ([`array_capacity`]) and keeps the old ones. So what
+/// a slot holds grows with the peak of what was registered at once, not
+/// with how often: its largest arrays have room for at most twice what its
+/// largest range needs, and the ones it outgrew sum to less than those
+/// again, so a slot holds less than twice its largest arrays, less than
+/// four times what its largest range needs (less than twice for a range of
+/// a power of two pages; the least room is 64 pages, 136 bytes); in at
+/// most [`MAX_RANGES`] slots
+/// (`test_register_and_release_in_a_loop_keeps_the_array_count_flat`). A
+/// range needs a byte for the owner, a byte for the asked protection and a
+/// bit for missing a page: 136 KiB for 1 GiB of 16 KiB pages (65536, a power
+/// of two), under 272 KiB in its slot with any arrays it outgrew.
+/// Firecracker's restore registers each region of guest memory once
+/// (lib/firecracker/src/vmm/src/persist.rs :581 to :582), one slot each,
+/// fresh: on aarch64 one region, two when the memory reaches past the
+/// 64-bit MMIO gap (arch/aarch64/mod.rs `arch_memory_regions` :60 to :85);
+/// so a 1 GiB guest's userfaultfd holds 136 KiB of arrays.
+///
+/// `gen` is a sequence count that makes a reader without [`LOCK`] read the
+/// slot whole ([`lookup`]). A writer, always under [`LOCK`], records its
+/// thread in `writer`, makes `gen` odd, changes `start`, `end`, `page`,
+/// `alias` and the array pointers, and makes `gen` even again: the window
+/// holds those stores only, no allocation, lock or system call (the arrays
+/// are made and reset before it). Changes of one page's bits in a live
+/// slot (a fill, a discard, an unregister of pages, a protection) do not
+/// move it: readers act on them as they are, in the order the module doc
+/// gives.
 struct Range {
     /// 0: free.
     start: AtomicU64,
@@ -175,11 +208,15 @@ struct Range {
     /// splits it; here the range stays one alias and one set of arrays, and
     /// each page has its owner, so that any userfaultfd may register the
     /// part unregistered with no new range (see the module doc).
-    owner: AtomicPtr<AtomicU8>,
+    owner: AtomicPtr<AtomicU64>,
     /// One byte per page: the protection asked of the page (`PROT_*` bits),
     /// which a missing page gets once it is filled or no longer registered
     /// ([`protecting`]).
-    asked: AtomicPtr<AtomicU8>,
+    asked: AtomicPtr<AtomicU64>,
+    /// Odd while a writer changes the slot's fields (see above).
+    gen: AtomicU64,
+    /// The thread (`pthread_self`) whose change made `gen` odd.
+    writer: AtomicU64,
 }
 
 impl Range {
@@ -192,6 +229,8 @@ impl Range {
             missing: AtomicPtr::new(ptr::null_mut()),
             owner: AtomicPtr::new(ptr::null_mut()),
             asked: AtomicPtr::new(ptr::null_mut()),
+            gen: AtomicU64::new(0),
+            writer: AtomicU64::new(0),
         }
     }
 
@@ -200,46 +239,41 @@ impl Range {
         self.page.load(Ordering::Acquire)
     }
 
-    fn bit(map: &AtomicPtr<AtomicU64>, page: u64) -> &AtomicU64 {
-        // SAFETY: the bitmap covers every page of the range and is never freed.
-        unsafe { &*map.load(Ordering::Acquire).add((page / 64) as usize) }
-    }
-
     fn test(map: &AtomicPtr<AtomicU64>, page: u64) -> bool {
-        Self::bit(map, page).load(Ordering::SeqCst) & (1 << (page % 64)) != 0
+        bit_of(map.load(Ordering::Acquire), page).is_some_and(|w| w.load(Ordering::SeqCst) & (1 << (page % 64)) != 0)
     }
 
+    /// Under [`LOCK`], where the slot's arrays have room for every page of
+    /// its range ([`past_capacity`] otherwise).
     fn set(map: &AtomicPtr<AtomicU64>, page: u64, on: bool) {
         let mask = 1 << (page % 64);
+        let Some(w) = bit_of(map.load(Ordering::Acquire), page) else {
+            past_capacity("missing", page);
+        };
         if on {
-            Self::bit(map, page).fetch_or(mask, Ordering::SeqCst);
+            w.fetch_or(mask, Ordering::SeqCst);
         } else {
-            Self::bit(map, page).fetch_and(!mask, Ordering::SeqCst);
+            w.fetch_and(!mask, Ordering::SeqCst);
         }
     }
 
-    fn asked_byte(&self, page: u64) -> &AtomicU8 {
-        // SAFETY: one byte per page of the range, never freed.
-        unsafe { &*self.asked.load(Ordering::Acquire).add(page as usize) }
-    }
-
-    /// The protection asked of `page`.
+    /// The protection asked of `page` (none past the array's room).
     fn asked(&self, page: u64) -> c_int {
-        c_int::from(self.asked_byte(page).load(Ordering::Acquire))
+        byte_of(self.asked.load(Ordering::Acquire), page).map_or(0, |b| c_int::from(b.load(Ordering::Acquire)))
     }
 
+    /// Under [`LOCK`], as [`Self::set`].
     fn set_asked(&self, page: u64, prot: c_int) {
-        self.asked_byte(page).store((prot & PROT_RWX) as u8, Ordering::Release);
+        let Some(b) = byte_of(self.asked.load(Ordering::Acquire), page) else {
+            past_capacity("asked", page);
+        };
+        b.store((prot & PROT_RWX) as u8, Ordering::Release);
     }
 
-    fn owner_byte(&self, page: u64) -> &AtomicU8 {
-        // SAFETY: one byte per page of the range, never freed.
-        unsafe { &*self.owner.load(Ordering::Acquire).add(page as usize) }
-    }
-
-    /// The userfaultfd `page` is registered with, if any.
+    /// The userfaultfd `page` is registered with, if any (none past the
+    /// array's room).
     fn owner(&self, page: u64) -> Option<usize> {
-        let owner = self.owner_byte(page).load(Ordering::SeqCst);
+        let owner = byte_of(self.owner.load(Ordering::Acquire), page)?.load(Ordering::SeqCst);
         (owner != NONE).then_some(usize::from(owner))
     }
 
@@ -249,9 +283,96 @@ impl Range {
     }
 
     /// Registers `page` with userfaultfd `ctx`, or takes it out (`None`).
+    /// Under [`LOCK`], as [`Self::set`].
     fn set_owner(&self, page: u64, ctx: Option<usize>) {
-        self.owner_byte(page).store(ctx.map_or(NONE, |c| c as u8), Ordering::SeqCst);
+        let Some(b) = byte_of(self.owner.load(Ordering::Acquire), page) else {
+            past_capacity("owner", page);
+        };
+        b.store(ctx.map_or(NONE, |c| c as u8), Ordering::SeqCst);
     }
+
+    /// Changes the slot's fields with `change`, `gen` odd meanwhile (see the
+    /// type's doc). Under [`LOCK`]; `change` only stores.
+    fn changing(&self, change: impl FnOnce()) {
+        self.writer.store(this_thread(), Ordering::SeqCst);
+        self.gen.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        tests::window_hook();
+        change();
+        self.gen.fetch_add(1, Ordering::SeqCst);
+        self.writer.store(0, Ordering::SeqCst);
+    }
+}
+
+/// A change under [`LOCK`] of a page past its slot's array: the arrays are
+/// sized for the slot's range at its register, so this is a broken
+/// invariant, and a change dropped would lose a registration or a fill
+/// silently. Ends the process, as the alias that cannot follow a discard
+/// does ([`discarding_or_refusing`]).
+fn past_capacity(array: &str, page: u64) -> ! {
+    std::eprintln!("wick: userfaultfd page {page} is past its slot's {array} array");
+    std::process::abort();
+}
+
+/// The calling thread, as [`Range::writer`] records it. Async-signal-safe.
+fn this_thread() -> u64 {
+    // SAFETY: reads the calling thread's own identifier.
+    let me = unsafe { libc::pthread_self() };
+    me as u64
+}
+
+/// A per-page array of a slot: its first word is its capacity, the pages it
+/// has room for; then a bit a page ([`bit_of`]) or a byte a page
+/// ([`byte_of`]).
+///
+/// The one rule that makes a stale pointer harmless: every index is checked
+/// against the capacity read from the array itself, never against the
+/// slot's range. A reader without [`LOCK`] may read a slot's bounds of one
+/// range and its pointers of another (released and reused between its
+/// loads); its index then may pass the end of the array it holds. Checked
+/// so, it reads nothing there, and the slot's `gen`, which every such
+/// change moves, makes it read again ([`lookup`]). Arrays are never freed,
+/// so the capacity word itself is always there to read.
+fn array_capacity(pages: u64) -> u64 {
+    pages.max(64).next_power_of_two()
+}
+
+/// A new array of `capacity` pages, `bits` a page (1 or 8), every byte
+/// `fill`.
+fn alloc_array(capacity: u64, bits: u64, fill: u8) -> *mut AtomicU64 {
+    let word = u64::from_ne_bytes([fill; 8]);
+    let words = (capacity * bits).div_ceil(64) as usize;
+    let mut v: Vec<AtomicU64> = Vec::with_capacity(words + 1);
+    v.push(AtomicU64::new(capacity));
+    v.extend((0..words).map(|_| AtomicU64::new(word)));
+    #[cfg(test)]
+    tests::ARRAYS_MADE.fetch_add(1, Ordering::SeqCst);
+    Box::into_raw(v.into_boxed_slice()).cast()
+}
+
+/// Whether `page` is within `array`'s capacity ([`array_capacity`]'s rule).
+fn within(array: *const AtomicU64, page: u64) -> bool {
+    if array.is_null() {
+        return false;
+    }
+    // SAFETY: a slot's array, never freed; its first word is its capacity.
+    let capacity = unsafe { (*array).load(Ordering::Acquire) };
+    let ok = page < capacity;
+    #[cfg(test)]
+    tests::index_checked(page, capacity, ok);
+    ok
+}
+
+/// The word of bit array `array` that holds `page`'s bit, if it has room.
+fn bit_of(array: *const AtomicU64, page: u64) -> Option<&'static AtomicU64> {
+    // SAFETY: within the array's capacity, past its capacity word.
+    within(array, page).then(|| unsafe { &*array.add(1 + (page / 64) as usize) })
+}
+
+/// The byte of byte array `array` for `page`, if it has room.
+fn byte_of(array: *const AtomicU64, page: u64) -> Option<&'static AtomicU8> {
+    // SAFETY: within the array's capacity, past its capacity word.
+    within(array, page).then(|| unsafe { &*array.add(1).cast::<AtomicU8>().add(page as usize) })
 }
 
 /// [`Range::owner`]'s byte for a page in no registration.
@@ -656,23 +777,84 @@ fn init() -> io::Result<()> {
     result
 }
 
-/// The range and page index of `addr`, if it is registered memory.
-fn find(addr: u64) -> Option<(&'static Range, u64)> {
-    for r in RANGES.iter() {
-        let start = r.start.load(Ordering::Acquire);
-        if start != 0 && addr >= start && addr < r.end.load(Ordering::Acquire) {
-            return Some((r, (addr - start) / r.page_size()));
-        }
+/// What [`lookup`] found.
+enum Found<T> {
+    /// `addr` is in this slot's range, its page and the page's start, the
+    /// slot's `gen` when it was read, and what was read of it.
+    In(&'static Range, u64, u64, u64, T),
+    /// In no range.
+    Out,
+    /// A slot is being changed by the calling thread itself ([`Range::changing`]):
+    /// a fault inside the window, a bug or a signal that interrupted it. It
+    /// cannot wait for itself (it holds [`LOCK`], which a fill needs); the
+    /// caller takes the address for no registration of ours, and a fault for
+    /// the process's own, handed to the previous handler.
+    Mine,
+}
+
+/// Finds the registered page holding `addr` and reads it with `read(range,
+/// page)`, consistently without [`LOCK`]: each slot's `gen` is read before
+/// its fields and again after `read` (a fence between), and a change
+/// between makes the whole lookup start over. A slot that is odd (a writer
+/// in its window) is waited for, by the nanosleep [`fault`] waits with for a
+/// waiter slot; the window holds stores only, so the wait is its few
+/// stores, unless the writer's thread is preempted in it. A slot odd by the
+/// calling thread is [`Found::Mine`]. A start over needs a write of that
+/// slot that began after the first read, and two writes of one slot are
+/// separated by at least one system call outside the window (the alias's
+/// mapping at a register, its unmapping at a release), so a lookup, a few
+/// loads, starts over again only if each of its tries overlaps a window.
+/// Async-signal-safe.
+fn lookup<T>(addr: u64, read: impl Fn(&'static Range, u64) -> T) -> Found<T> {
+    // Any slot in the calling thread's own window, whichever slot `addr` is
+    // in: its writer holds [`LOCK`], so a wait of this thread for a fill
+    // would never end.
+    let me = this_thread();
+    if RANGES.iter().any(|r| r.gen.load(Ordering::SeqCst) & 1 != 0 && r.writer.load(Ordering::SeqCst) == me) {
+        return Found::Mine;
     }
-    None
+    'again: loop {
+        for r in RANGES.iter() {
+            let g1 = r.gen.load(Ordering::SeqCst);
+            if g1 & 1 != 0 {
+                let ts = libc::timespec { tv_sec: 0, tv_nsec: 100_000 };
+                // SAFETY: async-signal-safe sleep.
+                unsafe { libc::nanosleep(&ts, ptr::null_mut()) };
+                continue 'again;
+            }
+            let start = r.start.load(Ordering::Acquire);
+            #[cfg(test)]
+            tests::lookup_hook(addr, start);
+            let (end, ps) = (r.end.load(Ordering::Acquire), r.page_size());
+            let inside = start != 0 && ps != 0 && addr >= start && addr < end;
+            let found = inside.then(|| {
+                let page = (addr - start) / ps;
+                (page, start + page * ps, read(r, page))
+            });
+            core::sync::atomic::fence(Ordering::Acquire);
+            if r.gen.load(Ordering::SeqCst) != g1 {
+                continue 'again;
+            }
+            if let Some((page, at, value)) = found {
+                return Found::In(r, page, at, g1, value);
+            }
+        }
+        return Found::Out;
+    }
+}
+
+/// The range and page index of `addr`, if it is registered memory. Under
+/// [`LOCK`], where no slot changes.
+fn find(addr: u64) -> Option<(&'static Range, u64)> {
+    match lookup(addr, |_, _| ()) {
+        Found::In(r, page, ..) => Some((r, page)),
+        _ => None,
+    }
 }
 
 /// Whether `addr` is in a registered page that is missing.
 pub fn is_missing(addr: u64) -> bool {
-    match find(addr) {
-        Some((r, page)) => r.owned(page) && Range::test(&r.missing, page),
-        None => false,
-    }
+    matches!(lookup(addr, |r, page| r.owned(page) && Range::test(&r.missing, page)), Found::In(.., true))
 }
 
 /// The kinds of host access a fault can be, as Linux's arm64 fault handler
@@ -697,12 +879,17 @@ enum Access {
 /// a newer Apple processor that has it is not told apart; an execute-only
 /// page is not one Firecracker asks for. Async-signal-safe.
 fn asked_allows(addr: u64, access: Access) -> bool {
+    matches!(lookup(addr, |r, page| allows(r.asked(page), access)), Found::In(.., true))
+}
+
+/// Whether asked protection `prot` allows `access` ([`asked_allows`]).
+fn allows(prot: c_int, access: Access) -> bool {
     let need = match access {
         Access::Exec => libc::PROT_EXEC,
         Access::Write => libc::PROT_WRITE,
         Access::Read => libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
     };
-    find(addr).is_some_and(|(r, page)| r.asked(page) & need != 0)
+    prot & need != 0
 }
 
 fn post(ctx: usize, record: [u64; 4]) {
@@ -737,13 +924,11 @@ fn post(ctx: usize, record: [u64; 4]) {
 pub fn fault(addr: u64, write: bool) -> bool {
     #[cfg(test)]
     tests::fault_hook(addr);
-    let Some((range, page)) = find(addr) else {
+    let Found::In(range, page, page_addr, g1, true) =
+        lookup(addr, |r, page| r.owned(page) && Range::test(&r.missing, page))
+    else {
         return false;
     };
-    if !range.owned(page) || !Range::test(&range.missing, page) {
-        return false;
-    }
-    let page_addr = range.start.load(Ordering::Acquire) + page * range.page_size();
     // Claim a waiter slot.
     let slot = loop {
         if let Some(w) = WAITERS.iter().find(|w| {
@@ -761,13 +946,31 @@ pub fn fault(addr: u64, write: bool) -> bool {
         // SAFETY: async-signal-safe sleep.
         unsafe { libc::nanosleep(&ts, ptr::null_mut()) };
     };
+    #[cfg(test)]
+    tests::validate_hook(addr);
     slot.woken.store(false, Ordering::SeqCst);
     // Its owner, or none if an unregister or an unmapping took it out
     // meanwhile: then no fault to report, and the access runs again.
     let ctx = range.owner(page);
     slot.ctx.store(ctx.unwrap_or(usize::MAX), Ordering::SeqCst);
     // Filled, or taken out, while the slot was claimed: no fault to report.
-    if ctx.is_some() && Range::test(&range.missing, page) && range.owner(page) == ctx {
+    let report = ctx.is_some() && Range::test(&range.missing, page) && range.owner(page) == ctx;
+    #[cfg(test)]
+    tests::between_hook(addr);
+    // The slot is still the range `lookup` read, its `gen` read last, after
+    // the page's bits. A free slot's arrays are reset outside any window
+    // (by the next register, before its window), so bits read after a
+    // release may be the next range's; `gen` unchanged after them means no
+    // release had begun before them (a release is a window, which moves
+    // it), so they were this range's (`test_fault_reads_the_generation_after_the_page`).
+    // And the waiter is in [`WAITERS`] before `gen` is read (SeqCst both),
+    // against a writer's SeqCst `gen` store before it changes the slot and
+    // its wake after, which scans `WAITERS` with SeqCst loads: a waiter in
+    // the table before that store is woken; one that reads `gen` after it
+    // sees it moved, posts nothing, and its access runs again against the
+    // new state (`test_fault_validates_after_its_waiter_is_registered`).
+    let same = range.gen.load(Ordering::SeqCst) == g1;
+    if report && same {
         let ctx = ctx.unwrap_or(usize::MAX);
         let flags = if write { proto::FLAG_WRITE } else { 0 };
         post(ctx, [proto::EVENT_PAGEFAULT, addr, flags, 0]);
@@ -835,8 +1038,9 @@ fn wake_where(which: impl Fn(usize, u64) -> bool) {
 /// `_kernelrpc_mach_port_construct_trap` in `MACH_TRAPS`); a refused call
 /// would leave the fault to the previous handler, as before this rule.
 fn resolved(addr: u64, access: Access) -> bool {
-    if find(addr).is_some() && (is_missing(addr) || !asked_allows(addr, access)) {
-        return false;
+    match lookup(addr, |r, page| (r.owned(page) && Range::test(&r.missing, page)) || !allows(r.asked(page), access)) {
+        Found::In(.., true) | Found::Mine => return false,
+        Found::In(.., false) | Found::Out => {}
     }
     const VM_REGION_BASIC_INFO_64: c_int = 9;
     let (mut at, mut size, mut object) = (addr, 0u64, 0);
@@ -1003,17 +1207,18 @@ pub fn for_each_missing(start: u64, len: u64, mut f: impl FnMut(u64, u64)) {
     let mut addr = start - start % ps;
     while addr < end {
         // The page holding `addr`, the one after it, and whether it is missing.
-        let (page_start, next, missing) = match find(addr) {
-            Some((r, page)) => {
-                let (base, rps) = (r.start.load(Ordering::Acquire), r.page_size());
-                let page_start = base + page * rps;
-                let missing = r.owned(page) && Range::test(&r.missing, page);
-                (page_start, page_start + rps, missing)
-            }
+        // Each piece is read whole by `lookup`, which starts that piece over,
+        // not the walk, when its slot changed meanwhile.
+        let (page_start, next, missing) = match lookup(addr, |r, page| {
+            (r.page_size(), r.owned(page) && Range::test(&r.missing, page))
+        }) {
+            Found::In(_, _, page_start, _, (rps, missing)) => (page_start, page_start + rps, missing),
             // Unregistered memory holds no missing page: on to the next
             // range (a walk by host pages over a span as large as a
-            // `MADV_DONTNEED` may name would not end).
-            None => {
+            // `MADV_DONTNEED` may name would not end). The next start is
+            // read without the slots' `gen`: a range registered meanwhile
+            // may be passed over, as one registered just after the walk.
+            Found::Out | Found::Mine => {
                 let next = RANGES
                     .iter()
                     .map(|r| r.start.load(Ordering::Acquire))
@@ -1196,14 +1401,6 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
             CTXS[index].fd.store(-1, Ordering::Release);
         })?;
     Ok((index, user))
-}
-
-fn alloc_bitmap(pages: u64, on: bool) -> *mut AtomicU64 {
-    let words = pages.div_ceil(64) as usize;
-    let v: Vec<AtomicU64> = (0..words)
-        .map(|_| AtomicU64::new(if on { !0 } else { 0 }))
-        .collect();
-    Box::into_raw(v.into_boxed_slice()).cast()
 }
 
 /// Whether any of `[start, end)` is the alias of a registered range. A fill
@@ -1421,14 +1618,19 @@ fn any_owned(r: &Range) -> bool {
 }
 
 /// Frees slot `r`: its range is no longer registered memory and its alias
-/// goes. Its bitmaps stay (the signal handler may be reading them).
+/// goes. Its arrays stay with the slot ([`Range`]), for the next range that
+/// fits in them.
 fn release(r: &Range) {
-    let s = r.start.swap(0, Ordering::AcqRel);
+    let (s, e) = (r.start.load(Ordering::Acquire), r.end.load(Ordering::Acquire));
+    let mut alias = 0;
+    r.changing(|| {
+        r.start.store(0, Ordering::Release);
+        alias = r.alias.swap(0, Ordering::AcqRel);
+    });
     REGISTERED.fetch_sub(1, Ordering::AcqRel);
-    let alias = r.alias.swap(0, Ordering::AcqRel);
     if alias != 0 {
         // SAFETY: unmaps the alias created at register.
-        unsafe { libc::munmap(alias as *mut _, (r.end.load(Ordering::Acquire) - s) as usize) };
+        unsafe { libc::munmap(alias as *mut _, (e - s) as usize) };
     }
 }
 
@@ -1616,24 +1818,63 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         }
     }
     for (s, e, ps, alias, missing) in made {
-        let range = RANGES.iter().find(|r| r.start.load(Ordering::Acquire) == 0).unwrap();
         let pages = (e - s) / ps;
-        range.end.store(e, Ordering::Release);
-        range.page.store(ps, Ordering::Release);
-        range.alias.store(alias, Ordering::Release);
-        range.missing.store(alloc_bitmap(pages, false), Ordering::Release);
-        let owner: Vec<AtomicU8> = (0..pages).map(|_| AtomicU8::new(ctx as u8)).collect();
-        range.owner.store(Box::into_raw(owner.into_boxed_slice()).cast(), Ordering::Release);
-        let asked: Vec<AtomicU8> = (0..pages)
-            .map(|page| AtomicU8::new((protection_in(&entries, s + page * ps) & PROT_RWX) as u8))
-            .collect();
-        range.asked.store(Box::into_raw(asked.into_boxed_slice()).cast(), Ordering::Release);
-        for (page, &m) in missing.iter().enumerate() {
-            if m {
-                Range::set(&range.missing, page as u64, true);
+        // The free slot with the least room that fits, else the first free
+        // one: a small range leaves a large slot's arrays to a large range.
+        let free = || RANGES.iter().filter(|r| r.start.load(Ordering::Acquire) == 0);
+        let capacity_of = |r: &Range| {
+            let array = r.missing.load(Ordering::Acquire);
+            // SAFETY: a slot's array, never freed; its first word is its capacity.
+            if array.is_null() { 0 } else { unsafe { (*array).load(Ordering::Acquire) } }
+        };
+        let range = free()
+            .filter(|r| within(r.missing.load(Ordering::Acquire), pages - 1))
+            .min_by_key(|r| capacity_of(r))
+            .or_else(|| free().next())
+            .unwrap();
+        // The arrays are made, or the slot's reset, before the window: a
+        // free slot's arrays are read by no lookup that answers (it reads
+        // `start` 0 and goes on, or its `gen` moved since).
+        let reused = within(range.missing.load(Ordering::Acquire), pages - 1);
+        let (missing_bits, owner, asked) = if reused {
+            (range.missing.load(Ordering::Acquire), range.owner.load(Ordering::Acquire), range.asked.load(Ordering::Acquire))
+        } else {
+            let capacity = array_capacity(pages);
+            (alloc_array(capacity, 1, 0), alloc_array(capacity, 8, NONE), alloc_array(capacity, 8, 0))
+        };
+        // SAFETY: arrays made above or the slot's own, never freed.
+        let capacity = unsafe { (*missing_bits).load(Ordering::Acquire) };
+        for page in 0..capacity {
+            let (m, o, a) = if page < pages {
+                let prot = (protection_in(&entries, s + page * ps) & PROT_RWX) as u8;
+                (missing[page as usize], ctx as u8, prot)
+            } else {
+                (false, NONE, 0)
+            };
+            if let Some(w) = bit_of(missing_bits, page) {
+                let mask = 1 << (page % 64);
+                if m {
+                    w.fetch_or(mask, Ordering::SeqCst);
+                } else {
+                    w.fetch_and(!mask, Ordering::SeqCst);
+                }
+            }
+            if let Some(b) = byte_of(owner, page) {
+                b.store(o, Ordering::SeqCst);
+            }
+            if let Some(b) = byte_of(asked, page) {
+                b.store(a, Ordering::SeqCst);
             }
         }
-        range.start.store(s, Ordering::Release);
+        range.changing(|| {
+            range.end.store(e, Ordering::Release);
+            range.page.store(ps, Ordering::Release);
+            range.alias.store(alias, Ordering::Release);
+            range.missing.store(missing_bits, Ordering::Release);
+            range.owner.store(owner, Ordering::Release);
+            range.asked.store(asked, Ordering::Release);
+            range.start.store(s, Ordering::Release);
+        });
         REGISTERED.fetch_add(1, Ordering::AcqRel);
     }
     let mut runs = Vec::new();
@@ -3479,6 +3720,284 @@ mod tests {
         // SAFETY: filled above.
         assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0x5a);
         assert_eq!(unregister(a, mem, 2 * ps), Ok(()));
+        close(&[ua]);
+    }
+
+    /// The per-page arrays allocated ([`alloc_array`]): three for each slot
+    /// that a range does not fit in.
+    pub(super) static ARRAYS_MADE: AtomicUsize = AtomicUsize::new(0);
+    /// The indexes [`within`] refused, past an array's capacity.
+    static REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn index_checked(page: u64, capacity: u64, ok: bool) {
+        if page >= capacity {
+            // A check that let it through would read past the array: stop
+            // here, before the read.
+            assert!(!ok, "index {page} past the array's capacity {capacity} let through");
+            REFUSED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// One-shot hooks: a `fn()` and, for [`lookup_hook`] and
+    /// [`validate_hook`], the address it waits for.
+    static LOOKUP_HOOK: AtomicUsize = AtomicUsize::new(0);
+    static LOOKUP_AT: AtomicU64 = AtomicU64::new(0);
+    static VALIDATE_HOOK: AtomicUsize = AtomicUsize::new(0);
+    static VALIDATE_AT: AtomicU64 = AtomicU64::new(0);
+    static WINDOW_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+    fn run_once(hook: &AtomicUsize) {
+        let f = hook.swap(0, Ordering::SeqCst);
+        if f != 0 {
+            // SAFETY: set by a test from a `fn()`.
+            let f: fn() = unsafe { core::mem::transmute(f) };
+            f();
+        }
+    }
+
+    /// [`lookup`], between its read of a slot's `start` and the rest: once,
+    /// for the address armed, at the slot that starts there.
+    pub(super) fn lookup_hook(addr: u64, start: u64) {
+        let at = LOOKUP_AT.load(Ordering::SeqCst);
+        if at != 0 && addr == at && start == at && LOOKUP_AT.compare_exchange(at, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            run_once(&LOOKUP_HOOK);
+        }
+    }
+
+    /// [`fault`], once its waiter is in [`WAITERS`] and before it reads the
+    /// page's owner and validates the slot.
+    pub(super) fn validate_hook(addr: u64) {
+        let at = VALIDATE_AT.load(Ordering::SeqCst);
+        if at != 0 && addr == at && VALIDATE_AT.compare_exchange(at, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            run_once(&VALIDATE_HOOK);
+        }
+    }
+
+    static BETWEEN_HOOK: AtomicUsize = AtomicUsize::new(0);
+    static BETWEEN_AT: AtomicU64 = AtomicU64::new(0);
+
+    /// [`fault`], between its validation's reads of the page (missing,
+    /// owner) and of the slot's `gen`.
+    pub(super) fn between_hook(addr: u64) {
+        let at = BETWEEN_AT.load(Ordering::SeqCst);
+        if at != 0 && addr == at && BETWEEN_AT.compare_exchange(at, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            run_once(&BETWEEN_HOOK);
+        }
+    }
+
+    /// [`Range::changing`], with `gen` odd.
+    pub(super) fn window_hook() {
+        run_once(&WINDOW_HOOK);
+    }
+
+    /// Registers `pages` fresh pages with `ctx`, fills one, unregisters
+    /// them (the slot released) and unmaps them; the arrays made after.
+    fn round(ctx: usize, pages: u64) -> usize {
+        let ps = test_page_size();
+        let mem = map(pages);
+        register(ctx, mem, pages * ps).unwrap();
+        assert_eq!(zeropage(ctx, mem, ps, true), Ok(ps));
+        assert_eq!(unregister(ctx, mem, pages * ps), Ok(()));
+        assert_eq!(slots(mem, mem + pages * ps).count(), 0);
+        // SAFETY: the round's mapping.
+        unsafe { libc::munmap(mem as *mut _, (pages * ps) as usize) };
+        ARRAYS_MADE.load(Ordering::SeqCst)
+    }
+
+    /// A range registered and released again and again keeps the count of
+    /// arrays flat: a slot keeps its arrays, and the next range that fits
+    /// takes them again. A larger range makes the count rise once (three
+    /// arrays of the next capacity), and flat again after, for it and for
+    /// the smaller one. Rounds are counted, not timed. In a process of its
+    /// own, as it counts the process's allocations.
+    #[test]
+    fn test_register_and_release_in_a_loop_keeps_the_array_count_flat() {
+        if !in_own_process("wick_uffd::tests::test_register_and_release_in_a_loop_keeps_the_array_count_flat") {
+            return;
+        }
+        const ROUNDS: usize = 16;
+        let (a, ua) = create(0, false, true).unwrap();
+        let small: Vec<usize> = (0..ROUNDS).map(|_| round(a, 4)).collect();
+        assert_eq!(small[0], 3, "the first range made other than its three arrays: {small:?}");
+        assert!(small.iter().all(|&n| n == 3), "arrays made after each round of 4 pages: {small:?}");
+        let large: Vec<usize> = (0..ROUNDS).map(|_| round(a, 100)).collect();
+        assert!(large.iter().all(|&n| n == 6), "arrays made after each round of 100 pages: {large:?}");
+        let again: Vec<usize> = (0..ROUNDS).map(|_| round(a, 4)).collect();
+        assert!(again.iter().all(|&n| n == 6), "arrays made after each round of 4 pages again: {again:?}");
+        close(&[ua]);
+    }
+
+    /// An index past an array's capacity reads nothing ([`array_capacity`]'s
+    /// rule): the bit and byte of the last page it has room for are there,
+    /// the next are not.
+    #[test]
+    fn test_an_index_past_an_arrays_capacity_reads_nothing() {
+        let bits = alloc_array(64, 1, 0xff);
+        let bytes = alloc_array(64, 8, 7);
+        let refused = REFUSED.load(Ordering::SeqCst);
+        assert!(bit_of(bits, 63).is_some_and(|w| w.load(Ordering::SeqCst) == !0));
+        assert_eq!(byte_of(bytes, 63).map(|b| b.load(Ordering::SeqCst)), Some(7));
+        assert!(bit_of(bits, 64).is_none() && byte_of(bytes, 64).is_none());
+        assert!(byte_of(ptr::null(), 0).is_none());
+        assert!(REFUSED.load(Ordering::SeqCst) >= refused + 2);
+    }
+
+    /// The hooks' pages: the first registration's, and the second's.
+    static FIRST: AtomicU64 = AtomicU64::new(0);
+    static SECOND: AtomicU64 = AtomicU64::new(0);
+    static SECOND_CTX: AtomicUsize = AtomicUsize::new(0);
+
+    /// Releases the first registration's slot (its one page unregistered)
+    /// and registers the second's page, which takes the slot (the free slot
+    /// with room).
+    fn release_and_reuse() {
+        let ps = test_page_size();
+        let (first, second) = (FIRST.load(Ordering::SeqCst), SECOND.load(Ordering::SeqCst));
+        assert_eq!(unregister(HOOK_CTX.load(Ordering::SeqCst), first, ps), Ok(()));
+        register(SECOND_CTX.load(Ordering::SeqCst), second, ps).unwrap();
+    }
+
+    /// A reader between its reads of a slot's fields, whose slot is released
+    /// and taken by another userfaultfd's range at a higher address, starts
+    /// over and answers for the new state: its address is in no
+    /// registration. Without the slot's `gen` it would read the old start
+    /// with the new end and arrays, and find the address missing. In a
+    /// process of its own, so that the slot the second range takes is the
+    /// first's.
+    #[test]
+    fn test_a_reader_between_its_generation_reads_starts_over() {
+        if !in_own_process("wick_uffd::tests::test_a_reader_between_its_generation_reads_starts_over") {
+            return;
+        }
+        let (a, ua) = create(0, false, true).unwrap();
+        let (b, ub) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let (first, second) = (map(1), map(1));
+        let (first, second) = (first.min(second), first.max(second));
+        HOOK_CTX.store(a, Ordering::SeqCst);
+        SECOND_CTX.store(b, Ordering::SeqCst);
+        FIRST.store(first, Ordering::SeqCst);
+        SECOND.store(second, Ordering::SeqCst);
+        register(a, first, ps).unwrap();
+        assert!(is_missing(first));
+        LOOKUP_HOOK.store(release_and_reuse as fn() as usize, Ordering::SeqCst);
+        LOOKUP_AT.store(first, Ordering::SeqCst);
+        let missing = is_missing(first);
+        assert_eq!(LOOKUP_AT.load(Ordering::SeqCst), 0, "the hook did not run");
+        assert!(!missing, "a reader of the released slot found its address missing in the new range's arrays");
+        assert!(is_missing(second) && !is_missing(first));
+        assert_eq!(unregister(b, second, ps), Ok(()));
+        close(&[ua, ub]);
+    }
+
+    /// A fault whose slot is released and taken by another userfaultfd's
+    /// range once its waiter is registered posts nothing and runs its access
+    /// again, which goes through to the memory, now in no registration.
+    /// Without the validation it would post the old address to the new
+    /// range's userfaultfd and wait for a fill that never comes. In a
+    /// process of its own, as the test above.
+    #[test]
+    fn test_fault_validates_after_its_waiter_is_registered() {
+        if !in_own_process("wick_uffd::tests::test_fault_validates_after_its_waiter_is_registered") {
+            return;
+        }
+        let (a, ua) = create(0, false, true).unwrap();
+        let (b, ub) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let (first, second) = (map(1), map(1));
+        HOOK_CTX.store(a, Ordering::SeqCst);
+        SECOND_CTX.store(b, Ordering::SeqCst);
+        FIRST.store(first, Ordering::SeqCst);
+        SECOND.store(second, Ordering::SeqCst);
+        register(a, first, ps).unwrap();
+        VALIDATE_HOOK.store(release_and_reuse as fn() as usize, Ordering::SeqCst);
+        VALIDATE_AT.store(first, Ordering::SeqCst);
+        let done = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+        let d = done.clone();
+        std::thread::spawn(move || {
+            // SAFETY: registered memory; the hook releases it in the fault.
+            let v = unsafe { ptr::read_volatile(first as *const u8) };
+            d.store(u64::from(v), Ordering::SeqCst);
+        });
+        until("the faulting read", || done.load(Ordering::SeqCst) != u64::MAX);
+        assert_eq!(VALIDATE_AT.load(Ordering::SeqCst), 0, "the hook did not run");
+        assert_eq!(done.load(Ordering::SeqCst), 0);
+        assert!(nothing_to_read(ua) && nothing_to_read(ub), "an event was posted");
+        assert!(is_missing(second) && !is_missing(first));
+        assert_eq!(unregister(b, second, ps), Ok(()));
+        close(&[ua, ub]);
+    }
+
+    /// A fault whose range is released, and whose slot the same userfaultfd's
+    /// next range takes (its arrays reset before that range's window, while
+    /// the slot is free), between the validation's reads of the page and of
+    /// the slot's `gen`, posts nothing: the page read missing and the
+    /// userfaultfd's own are the new range's, and only `gen` read after them
+    /// tells. The access runs again and reads the memory, now in no
+    /// registration. In a process of its own, as the tests above.
+    #[test]
+    fn test_fault_reads_the_generation_after_the_page() {
+        if !in_own_process("wick_uffd::tests::test_fault_reads_the_generation_after_the_page") {
+            return;
+        }
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let (first, second) = (map(1), map(1));
+        HOOK_CTX.store(a, Ordering::SeqCst);
+        SECOND_CTX.store(a, Ordering::SeqCst);
+        FIRST.store(first, Ordering::SeqCst);
+        SECOND.store(second, Ordering::SeqCst);
+        register(a, first, ps).unwrap();
+        BETWEEN_HOOK.store(release_and_reuse as fn() as usize, Ordering::SeqCst);
+        BETWEEN_AT.store(first, Ordering::SeqCst);
+        let done = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+        let d = done.clone();
+        std::thread::spawn(move || {
+            // SAFETY: registered memory; the hook releases it in the fault.
+            let v = unsafe { ptr::read_volatile(first as *const u8) };
+            d.store(u64::from(v), Ordering::SeqCst);
+        });
+        until("the faulting read", || done.load(Ordering::SeqCst) != u64::MAX);
+        assert_eq!(BETWEEN_AT.load(Ordering::SeqCst), 0, "the hook did not run");
+        assert_eq!(done.load(Ordering::SeqCst), 0);
+        let mut rec = [0u8; proto::RECORD];
+        let posted = (!nothing_to_read(ua) && read_full(ua, &mut rec)).then(|| words(&rec));
+        assert_eq!(posted, None, "an event for an address the userfaultfd no longer has");
+        assert!(is_missing(second) && !is_missing(first));
+        assert_eq!(unregister(a, second, ps), Ok(()));
+        close(&[ua]);
+    }
+
+    /// A fault on the thread that is changing a slot, inside the window
+    /// (`gen` odd, [`LOCK`] held), goes to the previous handler: the lookup
+    /// answers that the slot is the thread's own, and nothing waits on
+    /// itself. Here it is a read of another range's missing page, which
+    /// would otherwise wait for a fill that needs [`LOCK`]. In a process of
+    /// its own, with the recording previous handler.
+    #[test]
+    fn test_a_fault_inside_a_writers_window_goes_to_the_previous_handler() {
+        if !in_own_process("wick_uffd::tests::test_a_fault_inside_a_writers_window_goes_to_the_previous_handler") {
+            return;
+        }
+        install_previous_handler();
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let (first, second) = (map(1), map(1));
+        FIRST.store(first, Ordering::SeqCst);
+        register(a, first, ps).unwrap();
+        CHAINED.store(0, Ordering::SeqCst);
+        fn touch() {
+            // SAFETY: the test's registered page; the previous handler makes
+            // it readable.
+            let _ = unsafe { ptr::read_volatile(FIRST.load(Ordering::SeqCst) as *const u8) };
+        }
+        WINDOW_HOOK.store(touch as fn() as usize, Ordering::SeqCst);
+        register(a, second, ps).unwrap();
+        assert_eq!(WINDOW_HOOK.load(Ordering::SeqCst), 0, "the hook did not run");
+        assert_eq!(CHAINED.load(Ordering::SeqCst), first, "the fault did not go to the previous handler");
+        assert!(nothing_to_read(ua), "an event was posted");
+        assert_eq!(unregister(a, first, ps), Ok(()));
+        assert_eq!(unregister(a, second, ps), Ok(()));
         close(&[ua]);
     }
 
