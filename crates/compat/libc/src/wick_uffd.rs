@@ -5390,12 +5390,24 @@ mod tests {
     /// again: here new memory is mapped there, which it reads. (On a hole it
     /// takes the process's own fault:
     /// `test_a_waiter_on_unmapped_memory_takes_its_own_fault_once_woken`.)
+    /// The waiters are waiting once their records are read, as a handler
+    /// knows them: a waiter holds its slot before it validates and posts,
+    /// and one whose memory is mapped over meanwhile posts nothing and runs
+    /// its access again, as an access after the mapping would on Linux
+    /// (where the mapping waits for `mmap_lock`, which the fault holds until
+    /// it is queued). The first waiter's validation is held 50 ms, so that
+    /// a test going on at the slot would map over it there.
     #[test]
     fn test_a_waiter_on_memory_mapped_over_is_woken_by_its_userfaultfd() {
+        fn hold() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let (ctx, user) = create(0, false, true).unwrap();
         let ps = test_page_size();
         let mem = map(2);
         register(ctx, mem, 2 * ps).unwrap();
+        VALIDATE_HOOK.store(hold as fn() as usize, Ordering::SeqCst);
+        VALIDATE_AT.store(mem, Ordering::SeqCst);
         let waiter = |at: u64| {
             std::thread::spawn(move || {
                 // The access's fault, as the signal handler takes it.
@@ -5405,8 +5417,9 @@ mod tests {
             })
         };
         let (first, second) = (waiter(mem), waiter(mem + ps));
-        let waiting = |at: u64| WAITERS.iter().any(|w| w.page.load(Ordering::SeqCst) == at);
-        until("the waiters", || waiting(mem) && waiting(mem + ps));
+        let mut posted = [next_record(user)[1], next_record(user)[1]];
+        posted.sort_unstable();
+        assert_eq!(posted, [mem, mem + ps], "the waiters' records");
         // SAFETY: the test's own mapping, mapped over through this libc.
         let p = unsafe {
             crate::linux_items::mmap(
