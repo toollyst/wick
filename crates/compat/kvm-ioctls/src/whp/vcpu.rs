@@ -7767,6 +7767,207 @@ mod fpu_tests {
         two
     }
 
+    /// `KVM_GET_LAPIC` and `KVM_SET_LAPIC` in KVM's layout (review R11), on
+    /// the product's partition (an xAPIC), each part a VM of its own:
+    /// - requested: with vCPU 0 out of the guest, its APIC on and
+    ///   interrupts off, 0xe1 (edge) and 0x63 (level) requested:
+    ///   `KVM_GET_LAPIC` has each IRR bit and 0x63's TMR bit in KVM's words
+    ///   16 bytes apart (Linux v6.1 arch/x86/kvm/lapic.h `REG_POS`: IRR
+    ///   0x270 bit 1 and 0x230 bit 3, TMR 0x1b0 bit 3), nothing in bytes 4
+    ///   to 15 of those words, which KVM never writes (its register page is
+    ///   zeroed, lapic.c `kvm_create_lapic`, and set 4 bytes a register),
+    ///   and PPR 0 (TPR 0, nothing in service: lapic.c `__apic_update_ppr`);
+    ///   `KVM_SET_LAPIC` of it leaves WHP's page as it was; then the guest
+    ///   takes 0xe1 and stays in its gate with no EOI: the ISR bit at 0x170
+    ///   bit 1, 0xe1 no longer requested, 0x63 still, PPR 0xe0;
+    /// - set: a request of `MMIO_VECTOR` (0x41) given through
+    ///   `KVM_SET_LAPIC`, KVM's IRR word 0x220 bit 1, as a restore gives one
+    ///   (lapic.c `kvm_apic_set_state` copies the page whole), is taken when
+    ///   the guest turns interrupts on; LVT0 and LVT1 written as
+    ///   Firecracker's `set_lint` writes them (ExtINT and NMI delivery,
+    ///   arch/x86_64/interrupts.rs) are at their architectural offsets
+    ///   (0x350, 0x360) in WHP's page and at `hv_local_interrupt_controller_state`'s
+    ///   (0x8c, 0x90) in the standard format.
+    ///
+    /// LAPICLAYOUT lines record where WHP's page (the legacy format the
+    /// backend reads, `WHvGetVirtualProcessorInterruptControllerState`) and
+    /// the standard format have each bit, WHP's PPR, and every non-zero
+    /// byte of WHP's page in bytes 4 to 15 of a register outside the IRR,
+    /// ISR and TMR words: what tells a page in WHP's layout from KVM's.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_kvm_lapic_state_is_in_kvms_layout() {
+        const MSI: u64 = 0xFEE0_0000;
+        const EDGE: u8 = 0xE1;
+        const LEVEL: u8 = 0x63;
+        const GATE: u64 = 0xB900;
+        let reg = |l: &kvm_bindings::kvm_lapic_state, at: usize| u32::from_le_bytes(std::array::from_fn(|i| l.regs[at + i].cast_unsigned()));
+        let kvm_bit = |l: &kvm_bindings::kvm_lapic_state, base: usize, v: u8| reg(l, base + usize::from(v / 32) * 16) >> (v % 32) & 1 == 1;
+        let set_reg = |l: &mut kvm_bindings::kvm_lapic_state, at: usize, value: u32| {
+            for (i, b) in value.to_le_bytes().into_iter().enumerate() {
+                l.regs[at + i] = b.cast_signed();
+            }
+        };
+        // Bytes 4 to 15 of the ISR, TMR and IRR words that are not zero.
+        let padding = |l: &kvm_bindings::kvm_lapic_state| -> Vec<usize> { (0x100..0x280).filter(|&o| o % 16 >= 4 && l.regs[o] != 0).collect() };
+        let word = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        // Every 4-byte word of `b` in `range` with bit 1 or bit 3 set.
+        let with_bits = |b: &[u8], range: std::ops::Range<usize>| -> Vec<String> {
+            range.step_by(4).filter(|&o| word(b, o) & 0b1010 != 0).map(|o| format!("{o:#x}={:#x}", word(b, o))).collect()
+        };
+        let unmap = |m: *mut u8| {
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        };
+        // Runs `v` until a kick (EINTR), a failure, a fault, `out` `port`
+        // or an eighth exit; the exits.
+        let run_until = |v: &mut VcpuFd, port: u16| {
+            let mut reads = 0;
+            let mut exits = Vec::new();
+            loop {
+                let e = one_run(v, &[], &mut reads);
+                let end = e == "EINTR" || e.contains("fail") || e.starts_with("fault") || e.starts_with(&format!("out {port:#x}")) || exits.len() >= 8;
+                exits.push(e);
+                if end {
+                    break;
+                }
+            }
+            v.set_kvm_immediate_exit(0);
+            exits
+        };
+        let mut wrong: Vec<String> = Vec::new();
+
+        // requested.
+        {
+            // The APIC on, `out 0x84` with interrupts off, then sti and a
+            // loop; EDGE's gate: `out 0x82` of it and a loop, with no EOI.
+            let (vm, mut zero, m) = mmio_guest(&[&APIC_ON[..15], &[0xE6, 0x84, 0xFB, 0xEB, 0xFE]].concat());
+            put(m, GATE, &[0xB0, EDGE, 0xE6, 0x82, 0xEB, 0xFE]);
+            put(m, MMIO_IDT + u64::from(EDGE) * 16, &((GATE & 0xffff) | (8 << 16) | (0x8E << 40)).to_le_bytes());
+            put(m, MMIO_IDT + u64::from(EDGE) * 16 + 8, &0u64.to_le_bytes());
+            let watchdog = super::Watchdog::arm(&zero);
+            let first = run_until(&mut zero, 0x84);
+            zero.shared.inner.inject_msi(MSI, u32::from(EDGE));
+            // Level (bit 15), asserted (bit 14).
+            zero.shared.inner.inject_msi(MSI, u32::from(LEVEL) | 1 << 15 | 1 << 14);
+            let (legacy, _) = zero.lapic_page().unwrap();
+            let two = state2(zero.part(), zero.vp());
+            let l1 = zero.get_lapic().unwrap();
+            zero.set_lapic(&l1).unwrap();
+            let (again, _) = zero.lapic_page().unwrap();
+            let taken = run_until(&mut zero, 0x82);
+            drop(watchdog);
+            let (legacy2, _) = zero.lapic_page().unwrap();
+            let two2 = state2(zero.part(), zero.vp());
+            let l2 = zero.get_lapic().unwrap();
+            // WHP's page in bytes 4 to 15 of a register, outside the words
+            // of the ISR, TMR and IRR in either layout (0x100 to 0x27f).
+            let stray: Vec<String> =
+                (0..LAPIC_REGS).filter(|&o| o % 16 >= 4 && !(0x100..0x280).contains(&o) && legacy[o] != 0).map(|o| format!("{o:#x}={:#x}", legacy[o])).collect();
+            eprintln!(
+                "LAPICLAYOUT requested: 0xe1 (edge) and 0x63 (level), the vCPU out of the guest with interrupts off ({first:?}): WHP's \
+                 page's words with bit 1 or 3 {:?}, its PPR (0xa0) {:#x}; the standard format's {:?}; WHP's page's other bytes \
+                 past a register's first 4 {stray:?}; KVM_GET_LAPIC IRR 0xe1 {}, 0x63 {}, TMR 0x63 {}, 0xe1 {}, PPR {:#x}, \
+                 bytes 4-15 of its IRR/ISR/TMR words not zero at {:x?}; KVM_SET_LAPIC of it left WHP's page as it was: {}",
+                with_bits(&legacy[..], 0x100..0x300),
+                word(&legacy[..], 0xa0),
+                with_bits(&two, 0x14..0x74),
+                kvm_bit(&l1, 0x200, EDGE),
+                kvm_bit(&l1, 0x200, LEVEL),
+                kvm_bit(&l1, 0x180, LEVEL),
+                kvm_bit(&l1, 0x180, EDGE),
+                reg(&l1, 0xa0),
+                padding(&l1),
+                legacy[..LAPIC_REGS] == again[..LAPIC_REGS]
+            );
+            eprintln!(
+                "LAPICLAYOUT taken: 0xe1 in its gate with no EOI ({taken:?}): WHP's page's words with bit 1 or 3 {:?}, its PPR \
+                 {:#x}; the standard format's {:?}; KVM_GET_LAPIC ISR 0xe1 {}, IRR 0xe1 {}, 0x63 {}, PPR {:#x}, bytes 4-15 not \
+                 zero at {:x?}",
+                with_bits(&legacy2[..], 0x100..0x300),
+                word(&legacy2[..], 0xa0),
+                with_bits(&two2, 0x14..0x74),
+                kvm_bit(&l2, 0x100, EDGE),
+                kvm_bit(&l2, 0x200, EDGE),
+                kvm_bit(&l2, 0x200, LEVEL),
+                reg(&l2, 0xa0),
+                padding(&l2)
+            );
+            if !first.last().is_some_and(|e| e.starts_with("out 0x84")) || !taken.last().is_some_and(|e| e.starts_with("out 0x82")) {
+                wrong.push(format!("requested: the guest's exits {first:?}, then {taken:?}"));
+            }
+            let requested = (kvm_bit(&l1, 0x200, EDGE), kvm_bit(&l1, 0x200, LEVEL), kvm_bit(&l1, 0x180, LEVEL), kvm_bit(&l1, 0x180, EDGE));
+            if requested != (true, true, true, false) || !padding(&l1).is_empty() || reg(&l1, 0xa0) != 0 {
+                wrong.push(format!(
+                    "requested: IRR 0xe1, IRR 0x63, TMR 0x63, TMR 0xe1 {requested:?} (KVM: true, true, true, false), PPR {:#x} (KVM: 0), \
+                     bytes 4-15 not zero at {:x?}",
+                    reg(&l1, 0xa0),
+                    padding(&l1)
+                ));
+            }
+            if legacy[..LAPIC_REGS] != again[..LAPIC_REGS] {
+                wrong.push("requested: KVM_SET_LAPIC of KVM_GET_LAPIC's state changed WHP's page".into());
+            }
+            let in_service = (kvm_bit(&l2, 0x100, EDGE), kvm_bit(&l2, 0x200, EDGE), kvm_bit(&l2, 0x200, LEVEL));
+            if in_service != (true, false, true) || !padding(&l2).is_empty() || reg(&l2, 0xa0) != 0xE0 {
+                wrong.push(format!(
+                    "taken: ISR 0xe1, IRR 0xe1, IRR 0x63 {in_service:?} (KVM: true, false, true), PPR {:#x} (KVM: 0xe0), bytes 4-15 \
+                     not zero at {:x?}",
+                    reg(&l2, 0xa0),
+                    padding(&l2)
+                ));
+            }
+            drop((zero, vm));
+            unmap(m);
+        }
+
+        // set.
+        {
+            // The APIC on, `out 0x84` with interrupts off, then sti and
+            // `out 0x85`; MMIO_VECTOR's handler does `out 0x81` and EOI.
+            let (vm, mut zero, m) = mmio_guest(&[&APIC_ON[..15], &[0xE6, 0x84, 0xFB, 0xE6, 0x85, 0xEB, 0xFE]].concat());
+            let watchdog = super::Watchdog::arm(&zero);
+            let first = run_until(&mut zero, 0x84);
+            let mut l = zero.get_lapic().unwrap();
+            let vector = u8::try_from(MMIO_VECTOR).unwrap();
+            let at = 0x200 + usize::from(vector / 32) * 16;
+            let irr = reg(&l, at) | 1 << (vector % 32);
+            set_reg(&mut l, at, irr);
+            // set_lint: LVT0 ExtINT, LVT1 NMI (delivery mode, bits 8-10).
+            let (lint0, lint1) = ((reg(&l, 0x350) & !0x700) | 0x700, (reg(&l, 0x360) & !0x700) | 0x400);
+            set_reg(&mut l, 0x350, lint0);
+            set_reg(&mut l, 0x360, lint1);
+            zero.set_lapic(&l).unwrap();
+            let (legacy, _) = zero.lapic_page().unwrap();
+            let two = state2(zero.part(), zero.vp());
+            let back = zero.get_lapic().unwrap();
+            let then = run_until(&mut zero, 0x85);
+            drop(watchdog);
+            let places = (word(&legacy[..], 0x350), word(&legacy[..], 0x360), word(&two, 0x8c), word(&two, 0x90));
+            eprintln!(
+                "LAPICLAYOUT set: 0x41 requested through KVM_SET_LAPIC (KVM's IRR word 0x220 bit 1), LVT0 {lint0:#x} and LVT1 \
+                 {lint1:#x} ({first:?}): WHP's page's words with bit 1 or 3 {:?}; the standard format's {:?}; LVT0 and LVT1 in \
+                 WHP's page (0x350, 0x360) and the standard format (0x8c, 0x90) {places:x?}; KVM_GET_LAPIC after: IRR 0x41 {}; \
+                 the guest then {then:?}",
+                with_bits(&legacy[..], 0x100..0x300),
+                with_bits(&two, 0x14..0x74),
+                kvm_bit(&back, 0x200, vector)
+            );
+            if !first.last().is_some_and(|e| e.starts_with("out 0x84")) {
+                wrong.push(format!("set: the guest's exits {first:?}"));
+            }
+            if places != (lint0, lint1, lint0, lint1) {
+                wrong.push(format!("set: LVT0 and LVT1 at 0x350, 0x360 and the standard format's 0x8c, 0x90 {places:x?}"));
+            }
+            if !kvm_bit(&back, 0x200, vector) || then.first().is_none_or(|e| !e.starts_with("out 0x81")) || then.last().is_none_or(|e| !e.starts_with("out 0x85")) {
+                wrong.push(format!("set: IRR 0x41 read back {}, then the guest {then:?} (KVM: out 0x81, out 0x85)", kvm_bit(&back, 0x200, vector)));
+            }
+            drop((zero, vm));
+            unmap(m);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// Option E-ii's interrupt latency and what its no-time-stop question
     /// hangs on, on record (X2LATREC lines), on an AMD host's x2APIC
     /// partition (`X2APIC_PARTITION_FOR_TESTS`; elsewhere the test says so

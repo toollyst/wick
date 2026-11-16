@@ -1681,6 +1681,12 @@ jobs:
           # which LVT timer writes WHP refuses with a #GP.
           alone whp::vcpu::fpu_tests::test_a_held_lvt_timer_writes_interrupt_latency_on_record
           alone whp::vcpu::fpu_tests::test_a_held_lvt_timer_writes_interrupt_latency_on_record --release
+          # KVM_GET_LAPIC and KVM_SET_LAPIC in KVM's layout (review R11):
+          # requested, in-service and level-triggered vectors in KVM's
+          # IRR, ISR and TMR words, PPR as KVM's, a request given through
+          # KVM_SET_LAPIC taken, set_lint's LVT0 and LVT1 in place
+          # (LAPICLAYOUT lines: where WHP's page has each bit).
+          alone whp::vcpu::fpu_tests::test_a_kvm_lapic_state_is_in_kvms_layout
           # A 2 MiB chunk of userfaultfd guest RAM swapped (discarded
           # whole) under a vCPU's scan and a host writer, 100 rounds
           # (SWAPSTRESS lines; a page read wrong, its "round N: page" line:
