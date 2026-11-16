@@ -8154,25 +8154,42 @@ mod fpu_tests {
     }
 
     /// `KVM_GET_LAPIC` and `KVM_SET_LAPIC` in KVM's layout (review R11), on
-    /// the product's partition (an xAPIC), each part a VM of its own:
+    /// the product's partition (an xAPIC), each part a VM of its own. What
+    /// KVM gives (the "(KVM: ...)" in each message) is cited from Linux
+    /// v6.1's source (arch/x86/kvm, the lines named), not measured on KVM:
     /// - requested: with vCPU 0 out of the guest, its APIC on and
     ///   interrupts off, 0xe1 (edge) and 0x63 (level) requested:
     ///   `KVM_GET_LAPIC` has each IRR bit and 0x63's TMR bit in KVM's words
-    ///   16 bytes apart (Linux v6.1 arch/x86/kvm/lapic.h `REG_POS`: IRR
-    ///   0x270 bit 1 and 0x230 bit 3, TMR 0x1b0 bit 3), nothing in bytes 4
-    ///   to 15 of those words, which KVM never writes (its register page is
-    ///   zeroed, lapic.c `kvm_create_lapic`, and set 4 bytes a register),
-    ///   and PPR 0 (TPR 0, nothing in service: lapic.c `__apic_update_ppr`);
-    ///   `KVM_SET_LAPIC` of it leaves WHP's page as it was; then the guest
-    ///   takes 0xe1 and stays in its gate with no EOI: the ISR bit at 0x170
-    ///   bit 1, 0xe1 no longer requested, 0x63 still, PPR 0xe0;
+    ///   16 bytes apart (lapic.h:147-148 `VEC_POS`, `REG_POS`: IRR 0x270
+    ///   bit 1 and 0x230 bit 3, TMR 0x1b0 bit 3; the TMR bit set for a
+    ///   level request and cleared for an edge one, lapic.c:1152-1159
+    ///   `__apic_accept_irq`; the page copied whole, lapic.c:2734
+    ///   `kvm_apic_get_state`, after x86.c:4817 syncs posted requests into
+    ///   it), nothing in bytes 4 to 15 of those words, which KVM never
+    ///   writes (its register page is zeroed, lapic.c:2582
+    ///   `kvm_create_lapic`, and set 4 bytes a register, lapic.c:74-77), and
+    ///   PPR 0 (TPR 0, nothing in service: lapic.c:776-789
+    ///   `__apic_update_ppr`); `KVM_SET_LAPIC` of it leaves WHP's page as it
+    ///   was (the backend's own round trip); then the guest takes 0xe1 and
+    ///   stays in its gate with no EOI: the ISR bit at 0x170 bit 1, 0xe1 no
+    ///   longer requested, 0x63 still (only the vector taken moves,
+    ///   lapic.c:2670 and 2685 `kvm_get_apic_interrupt`), PPR 0xe0 (its
+    ///   class, lapic.c:789);
     /// - set: a request of `MMIO_VECTOR` (0x41) given through
     ///   `KVM_SET_LAPIC`, KVM's IRR word 0x220 bit 1, as a restore gives one
-    ///   (lapic.c `kvm_apic_set_state` copies the page whole), is taken when
-    ///   the guest turns interrupts on; LVT0 and LVT1 written as
+    ///   (lapic.c:2760 `kvm_apic_set_state` copies the page whole and
+    ///   lapic.c:2781 asks for an event check at the next entry), is taken
+    ///   when the guest turns interrupts on: `sti; out 0x85`, the OUT in
+    ///   STI's interrupt shadow, exits first, then the handler's `out 0x81`
+    ///   (`in_order`, with its sources; CI's windows job at e6d9a981 ran to
+    ///   the `out 0x85` only and expected the handler first, an order no
+    ///   source gave and the shadow does not allow: the test's, not a lost
+    ///   interrupt); the control, the same guest with 0x41 requested by
+    ///   `WHvRequestInterrupt`, gives the same order; LVT0 and LVT1 written as
     ///   Firecracker's `set_lint` writes them (ExtINT and NMI delivery,
-    ///   arch/x86_64/interrupts.rs) are at their architectural offsets
-    ///   (0x350, 0x360) in WHP's page and at `hv_local_interrupt_controller_state`'s
+    ///   arch/x86_64/interrupts.rs:49-62) are at their architectural offsets
+    ///   (0x350, 0x360; Intel SDM vol. 3A, the local APIC register address
+    ///   map) in WHP's page and at `hv_local_interrupt_controller_state`'s
     ///   (0x8c, 0x90) in the standard format.
     ///
     /// LAPICLAYOUT lines record where WHP's page (the legacy format the
@@ -8222,6 +8239,20 @@ mod fpu_tests {
             exits
         };
         let mut wrong: Vec<String> = Vec::new();
+        // `sti; out 0x85` with 0x41 pending: the OUT is in STI's interrupt
+        // shadow (Intel SDM vol. 2B, STI: with IF 0 before it, maskable
+        // interrupts stay inhibited on the boundary after the next
+        // instruction), so it runs and exits first; 0x41 is taken at the
+        // next entry, its handler's `out 0x81`. KVM's order, cited, not
+        // measured (Linux v6.1 arch/x86/kvm): the OUT exits to user space
+        // with its instruction not yet skipped (x86.c:9018-9040
+        // `kvm_fast_pio_out`); the next KVM_RUN first completes it
+        // (x86.c:11170-11173, `complete_fast_pio_out` x86.c:9008-9016),
+        // whose skip ends the shadow (vmx/vmx.c:1636, svm/svm.c:403), and
+        // then injects (x86.c:10667, 10031-10036), which an STI shadow
+        // blocks (vmx/vmx.c:4926-4934 `vmx_interrupt_blocked`,
+        // svm/svm.c:3624-3648 `svm_interrupt_blocked`).
+        let in_order = |then: &[String]| then.len() == 2 && then[0].starts_with("out 0x85") && then[1].starts_with("out 0x81");
 
         // requested.
         {
@@ -8327,7 +8358,7 @@ mod fpu_tests {
             let (legacy, _) = zero.lapic_page().unwrap();
             let two = state2(zero.part(), zero.vp());
             let back = zero.get_lapic().unwrap();
-            let then = run_until(&mut zero, 0x85);
+            let then = run_until(&mut zero, 0x81);
             drop(watchdog);
             let places = (word(&legacy[..], 0x350), word(&legacy[..], 0x360), word(&two, 0x8c), word(&two, 0x90));
             eprintln!(
@@ -8345,8 +8376,25 @@ mod fpu_tests {
             if places != (lint0, lint1, lint0, lint1) {
                 wrong.push(format!("set: LVT0 and LVT1 at 0x350, 0x360 and the standard format's 0x8c, 0x90 {places:x?}"));
             }
-            if !kvm_bit(&back, 0x200, vector) || then.first().is_none_or(|e| !e.starts_with("out 0x81")) || then.last().is_none_or(|e| !e.starts_with("out 0x85")) {
-                wrong.push(format!("set: IRR 0x41 read back {}, then the guest {then:?} (KVM: out 0x81, out 0x85)", kvm_bit(&back, 0x200, vector)));
+            if !kvm_bit(&back, 0x200, vector) || !in_order(&then) {
+                wrong.push(format!("set: IRR 0x41 read back {}, then the guest {then:?} (KVM: out 0x85, out 0x81)", kvm_bit(&back, 0x200, vector)));
+            }
+            drop((zero, vm));
+            unmap(m);
+        }
+
+        // requested at sti, the control: the same guest, 0x41 requested by
+        // WHvRequestInterrupt instead of the state.
+        {
+            let (vm, mut zero, m) = mmio_guest(&[&APIC_ON[..15], &[0xE6, 0x84, 0xFB, 0xE6, 0x85, 0xEB, 0xFE]].concat());
+            let watchdog = super::Watchdog::arm(&zero);
+            let first = run_until(&mut zero, 0x84);
+            zero.shared.inner.inject_msi(MSI, u32::try_from(MMIO_VECTOR).unwrap());
+            let then = run_until(&mut zero, 0x81);
+            drop(watchdog);
+            eprintln!("LAPICLAYOUT requested at sti, the control: 0x41 by WHvRequestInterrupt ({first:?}): the guest then {then:?}");
+            if !first.last().is_some_and(|e| e.starts_with("out 0x84")) || !in_order(&then) {
+                wrong.push(format!("requested at sti: the guest's exits {first:?}, then {then:?} (KVM: out 0x85, out 0x81)"));
             }
             drop((zero, vm));
             unmap(m);
@@ -8359,9 +8407,9 @@ mod fpu_tests {
     /// compacted (`XCOMP_BV` bit 63), in bytes 464 to 511, which the
     /// processor leaves to software and WHP leaves zero, with b"wick-whp"
     /// and the layout version, 1; upstream's restore sets the XSAVE area
-    /// before the local APIC (src/vmm/src/arch/x86_64/vcpu.rs
-    /// `restore_state`), and the local APIC state that comes with it is
-    /// taken in KVM's layout when the area is marked, refused with `EINVAL`
+    /// before the local APIC (src/vmm/src/arch/x86_64/vcpu.rs:726 and 736
+    /// `restore_state`, at eaf83bb7), and the local APIC state that comes
+    /// with it is taken in KVM's layout when the area is marked, refused with `EINVAL`
     /// when it is compacted and not marked (a snapshot made by a wick build
     /// from before `KVM_GET_LAPIC` gave KVM's layout: its IRR, ISR and TMR
     /// words are WHP's, 4 bytes apart), and an area marked with a later
@@ -8374,12 +8422,19 @@ mod fpu_tests {
     ///   `KVM_SET_LAPIC` refused; the area with version 2, refused; an
     ///   area in the standard format, KVM's (x87 and SSE only, `XCOMP_BV`
     ///   0), with the bytes Linux's `KVM_GET_XSAVE` writes there (its XCR0
-    ///   mask first: v6.1 arch/x86/kernel/fpu/xstate.c
-    ///   `__copy_xstate_to_uabi_buf`), recorded (XSAVEMARK: whether WHP
+    ///   mask first; cited, not measured: v6.1 arch/x86/kernel/fpu/xstate.c:1069
+    ///   and 1113 `__copy_xstate_to_uabi_buf`, ptrace.c:1309 and 1319,
+    ///   arch/x86/include/asm/user.h:51-52), recorded (XSAVEMARK: whether WHP
     ///   takes one), and if taken its `KVM_SET_LAPIC` taken too; then the
     ///   area as saved, WHP's copy with bytes 464 to 511 zero after it, its
     ///   `KVM_SET_LAPIC` taken and 0x41 taken when the guest turns
-    ///   interrupts on.
+    ///   interrupts on: `sti; out 0x85` exits at the OUT, in STI's interrupt
+    ///   shadow, then the handler's `out 0x81` (the layout test's
+    ///   `in_order` cites the SDM and KVM's lines for this order, not
+    ///   measured on KVM; CI's windows job at e6d9a981 ran to the `out 0x85`
+    ///   only and expected the handler first, an order no source gave); the
+    ///   saved VM's guest, 0x41 requested by `WHvRequestInterrupt`, is the
+    ///   control, in the same order.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_a_restored_lapic_state_is_read_in_the_layout_its_xsave_area_names() {
@@ -8424,6 +8479,9 @@ mod fpu_tests {
         // `out 0x85`; MMIO_VECTOR's handler does `out 0x81` and EOI.
         let program = [&APIC_ON[..15], &[0xE6, 0x84, 0xFB, 0xE6, 0x85, 0xEB, 0xFE]].concat();
         let mut wrong: Vec<String> = Vec::new();
+        // The OUT after sti is in its interrupt shadow: it exits first, and
+        // 0x41 is taken at the next entry (the layout test's `in_order`).
+        let in_order = |then: &[String]| then.len() == 2 && then[0].starts_with("out 0x85") && then[1].starts_with("out 0x81");
 
         // saved.
         let (vm, mut a, m) = mmio_guest(&program);
@@ -8436,16 +8494,24 @@ mod fpu_tests {
         // SAFETY: an area of the capability's size.
         unsafe { a.get_xsave2(&mut saved) }.unwrap();
         let lapic = a.get_lapic().unwrap();
+        // The control: the saved VM's guest goes on with 0x41 requested
+        // by WHvRequestInterrupt.
+        let watchdog = super::Watchdog::arm(&a);
+        let control = run_until(&mut a, 0x81);
+        drop(watchdog);
         drop((a, vm));
         unmap(m);
         eprintln!(
             "XSAVEMARK saved ({first:?}): WHP's area XCOMP_BV {:#x}, bytes 464-511 {:02x?}; KVM_GET_XSAVE2's {:02x?}; \
-             KVM_GET_LAPIC IRR 0x41 {}",
+             KVM_GET_LAPIC IRR 0x41 {}; the guest then, the control {control:?}",
             header(&whp, 520),
             &whp[MARK],
             &bytes(&mut saved)[MARK],
             irr(&lapic)
         );
+        if !in_order(&control) {
+            wrong.push(format!("saved: the guest then, 0x41 requested by WHvRequestInterrupt {control:?} (KVM: out 0x85, out 0x81)"));
+        }
         if !first.last().is_some_and(|e| e.starts_with("out 0x84")) || !irr(&lapic) {
             wrong.push(format!("saved: the guest's exits {first:?}, IRR 0x41 {}", irr(&lapic)));
         }
@@ -8487,7 +8553,7 @@ mod fpu_tests {
         let set_marked = unsafe { b.set_xsave2(&saved) };
         let given = raw(&b);
         let taken = b.set_lapic(&lapic);
-        let then = run_until(&mut b, 0x85);
+        let then = run_until(&mut b, 0x81);
         drop(watchdog);
         drop((b, vm));
         unmap(m);
@@ -8512,8 +8578,8 @@ mod fpu_tests {
                 &given[MARK]
             ));
         }
-        if then.first().is_none_or(|e| !e.starts_with("out 0x81")) || then.last().is_none_or(|e| !e.starts_with("out 0x85")) {
-            wrong.push(format!("marked: the guest then {then:?} (KVM: out 0x81, out 0x85)"));
+        if !in_order(&then) {
+            wrong.push(format!("marked: the guest then {then:?} (KVM: out 0x85, out 0x81)"));
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }

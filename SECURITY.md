@@ -429,17 +429,6 @@ upstream Firecracker and its jailer.
   every page table of the VMM's memory is the VMM's own commit, in its job, so the VMM reaches its limit sooner by
   those tables. Firecracker's handler is a process of the operator's, which the jailer does not put in the VMM's
   cgroup.
-- **Windows: a pending interrupt in a restored local APIC state is not delivered.** A vector made pending by
-  `KVM_SET_LAPIC` (its IRR bit, written at the right word of WHP's page) is read back by `KVM_GET_LAPIC` but the
-  guest never takes it, where one made pending by `WHvRequestInterrupt` is; KVM delivers it (`kvm_apic_set_state`
-  recomputes the APIC's state and requests the event). So a snapshot taken with an interrupt pending in a vCPU's
-  IRR may lose it at restore: a virtio or timer interrupt the guest then waits for. Two tests fail on it in CI's
-  WHP step (CI's windows job at e6d9a981): `test_a_kvm_lapic_state_is_in_kvms_layout` ("set: IRR 0x41 read back
-  true, then the guest [out 0x85] (KVM: out 0x81, out 0x85)") and
-  `test_a_restored_lapic_state_is_read_in_the_layout_its_xsave_area_names` (the same end after its marked state is
-  taken); the layout itself is right both ways in their LAPICLAYOUT and XSAVEMARK lines. They stay in the WHP step
-  and fail until the fix; the cause (the test or WHP), the documentation and a fix are being worked on.
-
 - **Windows: a reclaim's move, or the swap of a chunk discarded whole, ends the VMM with 137 when another thread's
   commit takes a view's page table room between its unmap and its map.** Both put a new section in the place of a
   2 MiB chunk's old one in its two views, the alias's and then the guest's: each view is unmapped, keeping its
