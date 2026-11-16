@@ -692,10 +692,36 @@ fn write_handle(h: HANDLE, buf: *const c_void, count: usize, at: Option<i64>) ->
 std::thread_local! {
     /// The one test seam of the calls that copy guest memory: when set, run
     /// on the calling thread once the buffer's pages are faulted in and
-    /// right before the system call (the window in which a discard of the
-    /// buffer fails the call, docs/COMPATIBILITY.md, the `mem_backend: Uffd`
-    /// row).
+    /// right before the system call, a counted call already turned to its
+    /// copy (`windows_mm::Copying::copy_now`): the window in which a discard
+    /// of the buffer would fail the call (docs/COMPATIBILITY.md, the
+    /// `mem_backend: Uffd` row), and in which a reclaim's move of it waits.
     pub(crate) static BEFORE_CALL: std::cell::RefCell<Option<std::boxed::Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// A test seam: when set, run on the calling thread once the buffer's
+    /// pages are faulted in and before a counted call's turn to its copy
+    /// (`windows_mm::Copying::copy_now`), the call still in its prefault.
+    pub(crate) static BEFORE_TURN: std::cell::RefCell<Option<std::boxed::Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A counted call's turn from its prefault to its copy
+/// ([`crate::windows_mm::Copying::copy_now`]), then [`before_call`]: the
+/// buffer's pages are faulted in, and from here the reclaim does not move
+/// them under the call.
+fn copy_now(call: Option<&crate::windows_mm::Copying>) {
+    #[cfg(test)]
+    BEFORE_TURN.with(|hook| {
+        if let Some(f) = hook.borrow_mut().as_mut() {
+            f();
+        }
+    });
+    if let Some(c) = call {
+        c.copy_now();
+    }
+    before_call();
 }
 
 /// Runs [`BEFORE_CALL`] in a test build; nothing otherwise.
@@ -870,10 +896,10 @@ pub unsafe fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
         return unsafe { read_through_copy(buf, count, call) };
     }
     // From before the prefault to the call's end.
-    let _call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
+    let call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
     // Windows fails a read into missing userfaultfd pages; Linux waits.
     crate::wick_uffd::prefault(buf as u64, count as u64, true);
-    before_call();
+    copy_now(call.as_ref());
     // SAFETY: the caller's contract.
     unsafe { read_now(fd, buf, count) }
 }
@@ -936,9 +962,15 @@ static ZEROS: [u8; 64 << 10] = [0; 64 << 10];
 /// written or -1, as a short write does. Pieces are separate writes: a
 /// writer to the same file at the same time may land between them, where
 /// Linux's write of a regular file holds the inode's lock for the whole.
-fn from_lazy(fd: c_int, buf: *const c_void, count: usize, mut emit: impl FnMut(*const c_void, usize) -> ssize_t) -> ssize_t {
+fn from_lazy(
+    fd: c_int,
+    call: Option<&crate::windows_mm::Copying>,
+    buf: *const c_void,
+    count: usize,
+    mut emit: impl FnMut(*const c_void, usize) -> ssize_t,
+) -> ssize_t {
     crate::wick_uffd::prefault_registered(buf as u64, count as u64, false);
-    before_call();
+    copy_now(call);
     let mut any = false;
     crate::windows_mm::zero_runs(buf as usize, count, |_, _, zeros| any |= zeros);
     if !any {
@@ -1000,8 +1032,8 @@ pub unsafe fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
         // SAFETY: the caller's contract.
         return unsafe { write_through_copy(buf, count, emit) };
     }
-    let _call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
-    from_lazy(fd, buf, count, emit)
+    let call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
+    from_lazy(fd, call.as_ref(), buf, count, emit)
 }
 
 /// [`write`] of a buffer whose pages a system call can read.
@@ -1068,9 +1100,9 @@ pub unsafe fn pread(fd: c_int, buf: *mut c_void, count: size_t, offset: off_t) -
         // SAFETY: the caller's contract.
         return unsafe { read_through_copy(buf, count, call) };
     }
-    let _call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
+    let call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
     crate::wick_uffd::prefault(buf as u64, count as u64, true);
-    before_call();
+    copy_now(call.as_ref());
     // SAFETY: the caller's contract.
     unsafe { pread_now(fd, buf, count, offset) }
 }
@@ -1118,8 +1150,8 @@ pub unsafe fn pwrite(fd: c_int, buf: *const c_void, count: size_t, offset: off_t
         // SAFETY: the caller's contract.
         return keeping_position(h, || unsafe { write_through_copy(buf, count, emit) });
     }
-    let _call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
-    keeping_position(h, || from_lazy(fd, buf, count, emit))
+    let call = mapped.then(|| crate::windows_mm::copying(buf as usize, count));
+    keeping_position(h, || from_lazy(fd, call.as_ref(), buf, count, emit))
 }
 
 /// The size a memfd sealed against growing may not exceed.

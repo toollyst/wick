@@ -1554,12 +1554,16 @@ fn out_of_memory(addr: usize, err: u32) -> ! {
 /// killed (v6.1 mm/memcontrol.c, `try_charge_memcg` :2714 to :2743, the
 /// killer's call at :2729), and a jailed VMM's cgroup holds the VMM. The
 /// line names the fill, so that it is told from a lazy touch's
-/// ([`out_of_memory`]).
-pub(crate) fn fill_out_of_memory(dst: u64, len: u64, err: u32) -> ! {
+/// ([`out_of_memory`]), the bytes it had filled, and the chunks its reclaims
+/// passed over for system calls in their copy, waited for and moved, and
+/// how long it waited: the rest was refused with nothing reclaimable left.
+pub(crate) fn fill_out_of_memory(dst: u64, len: u64, filled: u64, err: u32, waited: usize, us: u64) -> ! {
     end_at_the_limit(format_args!(
-        "wick: userfaultfd: the fill of {len} bytes at {dst:#x} failed with error {err} after the reclaim: the \
-         memory limit (the jail's memory.max, or the host's commit limit) is reached; the VMM ends, as the \
-         cgroup OOM killer ends it on Linux at the copy it cannot charge (exit {OOM_EXIT})"
+        "wick: userfaultfd: the fill of {len} bytes at {dst:#x} failed with error {err} after the reclaim, {filled} \
+         bytes of it filled, {waited} chunks passed over for system calls copying them waited for ({us} us) and \
+         reclaimed again, nothing reclaimable left: the memory limit (the jail's memory.max, or the host's commit \
+         limit) is reached; the VMM ends, as the cgroup OOM killer ends it on Linux at the copy it cannot charge \
+         (exit {OOM_EXIT})"
     ))
 }
 
@@ -5036,8 +5040,8 @@ fn for_each_picked(s: usize, len: usize, pick: &dyn Fn(usize) -> bool, mut f: im
 /// `wick_uffd::discarding`): the reclaim at the memory limit
 /// (`wick_uffd::reclaim_at_touch`), as Linux's memory cgroup reclaims before
 /// it refuses a charge. The caller holds the userfaultfd's lock (so the
-/// missing pages and the commit do not change) and a discard's guard on the
-/// chunk (no system call is copying it: [`try_discard`]) and has marked it
+/// missing pages and the commit do not change) and a move's guard on the
+/// chunk (no system call is in its copy on it: [`try_move`]) and has marked it
 /// moving, so that a host thread's or a vCPU's access to it waits for the
 /// move (`wick_uffd::fault`). The live pages are committed in the new
 /// section through a view of its own, closed to the guest's view
@@ -6087,33 +6091,72 @@ pub(crate) fn for_each_committed_run(s: usize, len: usize, mut f: impl FnMut(usi
 }
 
 /// The system calls in flight that copy memory of this module's mappings,
-/// and the discards waiting for them. The kernel's copy of a system call
-/// cannot fault a page in here, so a page discarded after the call's
-/// prefault and before its copy reaches it fails the call, where Linux's
-/// copy faults the page in again (v6.1 mm/userfaultfd.c `handle_userfault`,
-/// mm/memory.c `do_anonymous_page`) and completes. A call that ends (a
-/// regular file's, an `O_NONBLOCK` descriptor's: `windows_fd::read`,
-/// `write`, `pread`, `pwrite`) is counted on its buffer's range from before
-/// its prefault to its end ([`copying`]); a discard of an overlapping range
-/// (`MADV_DONTNEED`, `MADV_FREE`, a `MAP_FIXED` mapping over it, as
-/// Firecracker's `discard_range` does for a private file mapping) waits for
-/// it ([`discard_waiting`]), and a call that starts while a discard of its
+/// the discards waiting for them, and the reclaim's moves. The kernel's copy
+/// of a system call cannot fault a page in here, so a page discarded after
+/// the call's prefault and before its copy reaches it fails the call, where
+/// Linux's copy faults the page in again (v6.1 mm/userfaultfd.c
+/// `handle_userfault`, mm/memory.c `do_anonymous_page`) and completes. A
+/// call that ends (a regular file's, an `O_NONBLOCK` descriptor's:
+/// `windows_fd::read`, `write`, `pread`, `pwrite`) is counted on its
+/// buffer's range from before its prefault to its end ([`copying`]), in two
+/// phases: its prefault, which faults the buffer's pages in and may wait for
+/// a userfaultfd's fills without end, and its copy, from right before its
+/// system call ([`Copying::copy_now`]) to its end, which waits for nothing
+/// of this process's.
+///
+/// A discard of an overlapping range (`MADV_DONTNEED`, `MADV_FREE`, a
+/// `MAP_FIXED` mapping over it, as Firecracker's `discard_range` does for a
+/// private file mapping) waits for the call in either phase
+/// ([`discard_waiting`]), and a call that starts while a discard of its
 /// range waits waits for that discard, so a stream of calls cannot hold a
-/// discard off. A call that can wait without end (a blocking socket's or
-/// pipe's) goes through a buffer of its own instead (`windows_fd`), so no
-/// discard waits on it. A userfaultfd handler in the same process that
-/// discards a range a call is waiting on it to fill would wait for that
-/// call (Firecracker's handler is another process).
+/// discard off. A reclaim's move of a chunk (`windows_uffd`) is held off by
+/// calls in their copy alone ([`try_move`]): a move keeps every page that is
+/// present present, so what a prefault faulted in stays there, and an
+/// access during the move waits for it; a call's turn to its copy waits
+/// while a move of its range is under way or claimed ([`claim_move`]). Both
+/// are decided under this lock, so a call never turns to its copy on a chunk
+/// whose move has begun, and a move never begins on a chunk a call copies.
+/// A call that can wait without end (a blocking socket's or pipe's) goes
+/// through a buffer of its own instead (`windows_fd`), so nothing waits on
+/// it. A userfaultfd handler in the same process that discards a range a
+/// call is waiting on it to fill would wait for that call (Firecracker's
+/// handler is another process).
 struct InFlight {
-    calls: Vec<(usize, usize)>,
+    calls: Vec<Call>,
     discards: Vec<(usize, usize)>,
+    /// The reclaim's moves under way and claimed: preallocated
+    /// ([`reserve_discards`]), as they are taken at the job's limit.
+    moves: Vec<(usize, usize)>,
+    /// The next call's number.
+    next: u64,
 }
 
-static IN_FLIGHT: ProbedMutex<InFlight> = ProbedMutex::new("IN_FLIGHT", InFlight { calls: Vec::new(), discards: Vec::new() });
+/// A system call in flight on `[s, e)`, numbered, and whether it is in its
+/// copy ([`InFlight`]).
+#[derive(Clone, Copy)]
+struct Call {
+    s: usize,
+    e: usize,
+    id: u64,
+    copy: bool,
+}
+
+static IN_FLIGHT: ProbedMutex<InFlight> =
+    ProbedMutex::new("IN_FLIGHT", InFlight { calls: Vec::new(), discards: Vec::new(), moves: Vec::new(), next: 0 });
 static IN_FLIGHT_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
 
 fn any_overlaps(ranges: &[(usize, usize)], s: usize, e: usize) -> bool {
     ranges.iter().any(|&(a, z)| a < e && s < z)
+}
+
+/// Whether a call in its copy overlaps `[s, e)`.
+fn any_copy_overlaps(calls: &[Call], s: usize, e: usize) -> bool {
+    calls.iter().any(|c| c.copy && c.s < e && s < c.e)
+}
+
+/// Whether a call in either phase overlaps `[s, e)`.
+fn any_call_overlaps(calls: &[Call], s: usize, e: usize) -> bool {
+    calls.iter().any(|c| c.s < e && s < c.e)
 }
 
 fn forget(ranges: &mut Vec<(usize, usize)>, range: (usize, usize)) {
@@ -6122,13 +6165,48 @@ fn forget(ranges: &mut Vec<(usize, usize)>, range: (usize, usize)) {
     }
 }
 
-/// A system call in flight on `[.0, .1)` ([`copying`]), until dropped.
-pub(crate) struct Copying(usize, usize);
+/// A system call in flight on `[.0, .1)`, number `.2` ([`copying`]), until
+/// dropped.
+pub(crate) struct Copying(usize, usize, u64);
+
+impl Copying {
+    /// The call's turn to its copy, right before its system call: from here
+    /// a move of a chunk its buffer overlaps is passed over (the reclaim's,
+    /// [`try_move`]) or waits for it (a fill's or a touch's, which claim the
+    /// chunk first, [`Moving::wait_for_copies`]). Waits first while a move
+    /// of an overlapping range is under way or claimed, so the copy never
+    /// runs on a chunk's view while it is a placeholder for the move's swap,
+    /// and a claim's wait is only for the calls that were in their copy when
+    /// it was made. The check and the mark are made under one lock, with the
+    /// move's check and its mark ([`try_move`], [`claim_move`]).
+    pub(crate) fn copy_now(&self) {
+        let mut f = IN_FLIGHT.lock().unwrap();
+        while any_overlaps(&f.moves, self.0, self.1) {
+            #[cfg(test)]
+            TURNS_THAT_WAITED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            f = f.wait_on(&IN_FLIGHT_CHANGED).unwrap();
+        }
+        let id = self.2;
+        if let Some(c) = f.calls.iter_mut().find(|c| c.id == id) {
+            c.copy = true;
+        }
+    }
+}
+
+/// The turns to a copy that waited for a move ([`Copying::copy_now`]), for
+/// the tests.
+#[cfg(test)]
+pub(crate) static TURNS_THAT_WAITED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 impl Drop for Copying {
     fn drop(&mut self) {
         IN_CALL.set(IN_CALL.get() - 1);
-        forget(&mut IN_FLIGHT.lock().unwrap().calls, (self.0, self.1));
+        let mut f = IN_FLIGHT.lock().unwrap();
+        let id = self.2;
+        if let Some(i) = f.calls.iter().position(|c| c.id == id) {
+            f.calls.swap_remove(i);
+        }
+        drop(f);
         IN_FLIGHT_CHANGED.notify_all();
     }
 }
@@ -6144,59 +6222,94 @@ impl Drop for Discarding {
     }
 }
 
+/// A move of `[.0, .1)` under way or claimed ([`try_move`],
+/// [`claim_move`]), until dropped: a call's turn to its copy on that range
+/// waits meanwhile ([`Copying::copy_now`]).
+pub(crate) struct Moving(usize, usize);
+
+impl Moving {
+    /// Waits until no call in its copy overlaps the claimed range. The
+    /// calls in their copy when the claim was made end on their own (only
+    /// calls that end are counted: `windows_fd`), and no call turns to its
+    /// copy on the range while the claim lives, so the wait is for those
+    /// calls' copies at most. Allocates nothing; the caller holds none of
+    /// the userfaultfd's locks.
+    pub(crate) fn wait_for_copies(&self) {
+        let mut f = IN_FLIGHT.lock().unwrap();
+        while any_copy_overlaps(&f.calls, self.0, self.1) {
+            f = f.wait_on(&IN_FLIGHT_CHANGED).unwrap();
+        }
+    }
+}
+
+impl Drop for Moving {
+    fn drop(&mut self) {
+        forget(&mut IN_FLIGHT.lock().unwrap().moves, (self.0, self.1));
+        IN_FLIGHT_CHANGED.notify_all();
+    }
+}
+
 /// Counts a system call copying `[addr, addr + len)` in flight ([`InFlight`]),
-/// once no discard of an overlapping range waits.
+/// in its prefault, once no discard of an overlapping range waits.
 pub(crate) fn copying(addr: usize, len: usize) -> Copying {
     let (s, e) = (addr, addr.saturating_add(len));
     let mut f = IN_FLIGHT.lock().unwrap();
     while any_overlaps(&f.discards, s, e) {
         f = f.wait_on(&IN_FLIGHT_CHANGED).unwrap();
     }
-    f.calls.push((s, e));
+    let id = f.next;
+    f.next += 1;
+    f.calls.push(Call { s, e, id, copy: false });
     IN_CALL.set(IN_CALL.get() + 1);
-    Copying(s, e)
+    Copying(s, e, id)
 }
 
-/// A guard as [`discard_waiting`]'s, if no system call copying memory of
-/// `[addr, addr + len)` is in flight now; `None` without waiting if one is.
-/// Allocates nothing (the reclaim's: [`reserve_discards`]): with no room
-/// left for a guard, `None` as for a call in flight.
-pub(crate) fn try_discard(addr: usize, len: usize) -> Option<Discarding> {
+/// A move's guard for `[addr, addr + len)`, if no system call copying
+/// memory of it is in its copy now (one in its prefault does not hold a
+/// move: [`InFlight`]); `None` without waiting if one is. Allocates nothing
+/// (the reclaim's: [`reserve_discards`]): with no room left for a guard,
+/// `None` as for a call in its copy.
+pub(crate) fn try_move(addr: usize, len: usize) -> Option<Moving> {
     let (s, e) = (addr, addr.saturating_add(len));
     let mut f = IN_FLIGHT.lock().unwrap();
-    if any_overlaps(&f.calls, s, e) || f.discards.len() == f.discards.capacity() {
+    if any_copy_overlaps(&f.calls, s, e) || f.moves.len() == f.moves.capacity() {
         return None;
     }
-    f.discards.push((s, e));
-    Some(Discarding(s, e))
+    f.moves.push((s, e));
+    Some(Moving(s, e))
 }
 
-/// [`discard_waiting`], allocating nothing (the reclaim's at a touch:
-/// [`reserve_discards`]): `None`, without waiting, with no room left for a
-/// guard.
-pub(crate) fn discard_waiting_within(addr: usize, len: usize) -> Option<Discarding> {
+/// Claims a move of `[addr, addr + len)` without waiting: from here no call
+/// turns to its copy on it ([`Copying::copy_now`]); the calls already in
+/// their copy are waited for with [`Moving::wait_for_copies`]. Allocates
+/// nothing ([`reserve_discards`]): `None` with no room left for a guard.
+pub(crate) fn claim_move(addr: usize, len: usize) -> Option<Moving> {
     let (s, e) = (addr, addr.saturating_add(len));
     let mut f = IN_FLIGHT.lock().unwrap();
-    if f.discards.len() == f.discards.capacity() {
+    if f.moves.len() == f.moves.capacity() {
         return None;
     }
-    f.discards.push((s, e));
-    while any_overlaps(&f.calls, s, e) {
-        f = f.wait_on(&IN_FLIGHT_CHANGED).unwrap();
-    }
-    Some(Discarding(s, e))
+    f.moves.push((s, e));
+    Some(Moving(s, e))
 }
 
-/// The discard guards a reclaim may hold, reserved when a userfaultfd range
-/// is registered: two (a fill's pass and a touch's wait) and the discards
-/// of up to 62 other threads at once, which may then grow the list as they
-/// did; whether the room is there.
+/// The room for the reclaim's guards, reserved when a userfaultfd range is
+/// registered: a pass's move, a touch's wait and a fill's claims
+/// ([`FILL_CLAIMS`]) of up to 64 threads at once, and the discards of as
+/// many threads, which may then grow the list as they did; whether the
+/// room is there.
 pub(crate) fn reserve_discards() -> bool {
     const ROOM: usize = 64;
     let mut f = IN_FLIGHT.lock().unwrap();
     let more = ROOM.saturating_sub(f.discards.capacity() - f.discards.len());
-    more == 0 || f.discards.try_reserve(more).is_ok()
+    let moves = (ROOM + FILL_CLAIMS).saturating_sub(f.moves.capacity() - f.moves.len());
+    (more == 0 || f.discards.try_reserve(more).is_ok()) && (moves == 0 || f.moves.try_reserve(moves).is_ok())
 }
+
+/// The most chunks one fill refused at the job's limit claims at once
+/// (`windows_uffd`'s fill: the chunks its reclaim passed over for calls in
+/// their copy, waited for and moved).
+pub(crate) const FILL_CLAIMS: usize = 8;
 
 /// Whether this thread is in a system call counted in flight
 /// ([`copying`]): a reclaim it starts must not wait for calls in flight
@@ -6216,7 +6329,7 @@ pub(crate) fn discard_waiting(addr: usize, len: usize) -> Discarding {
     let (s, e) = (addr, addr.saturating_add(len));
     let mut f = IN_FLIGHT.lock().unwrap();
     f.discards.push((s, e));
-    while any_overlaps(&f.calls, s, e) {
+    while any_call_overlaps(&f.calls, s, e) {
         f = f.wait_on(&IN_FLIGHT_CHANGED).unwrap();
     }
     Discarding(s, e)

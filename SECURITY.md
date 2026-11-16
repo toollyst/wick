@@ -617,9 +617,11 @@ upstream Firecracker and its jailer.
   `ENOMEM`. While the VMM lives, no copy is refused. This is what v6.1's charge path does: it reclaims, then calls
   the OOM killer and charges again once a task was killed, and returns `-ENOMEM` only when no task can be killed
   (mm/memcontrol.c, `try_charge_memcg` :2714 to :2743, `mem_cgroup_oom` :1891). Here, the same now: a fill the job
-  still refuses after the reclaim at the limit (`reclaim_for_a_fill`) ends the VMM with 137 and a line naming the
-  fill, so the handler finds its socket closed (`test_a_fill_past_the_job_limit_ends_the_vmm_with_137`; before, the
-  handler got `ENOMEM` and the VMM went on). What stays different: the page table a fill needs is charged on Linux
+  still refuses after the reclaim at the limit (`reclaim_for_a_fill`, which waits for the system calls copying the
+  chunks it passed over and reclaims again, the memory.max row) ends the VMM with 137 and a line naming the fill, the
+  bytes it filled and the chunks it waited for, so the handler finds its socket closed
+  (`test_a_fill_past_the_job_limit_ends_the_vmm_with_137`, `test_a_fill_with_nothing_reclaimable_ends_named`; before,
+  the handler got `ENOMEM` and the VMM went on). What stays different: the page table a fill needs is charged on Linux
   to the filling process's cgroup, not the VMM's (with the handler in another cgroup the VMM was killed at anon-rss
   65628 kB and pgtables 65708 kB under the 64 MiB limit; with it in the VMM's, at 32816 kB and 32840 kB), where here
   every page table of the VMM's memory is the VMM's own commit, in its job, so the VMM reaches its limit sooner by
@@ -914,7 +916,16 @@ upstream Firecracker and its jailer.
   in CI runs 43612093006, 8ff63d4, and 43616040593, 5e3727d). Firecracker never met it, its devices' calls and the balloon's discards running on one thread; the
   wait is for the reclaim at the limit, which would move chunks on whichever thread touched memory there (a vCPU's
   among them; at a real job limit shown on host threads, not yet under a running vCPU), and other users of the
-  compat libc.
+  compat libc. The reclaim's move of a chunk is held off by a call only in its copy, from right before its kernel
+  call to its end; a call in its prefault, which may wait for the handler's next fill, holds nothing, as the move
+  keeps what the prefault made present (`test_a_fill_moves_a_chunk_a_call_waits_in_its_prefault_on`), and its turn
+  to its copy waits for a move under way, decided under one lock with the move's start
+  (`test_a_call_turning_to_its_copy_waits_for_a_move`). A fill or a touch at the limit whose reclaim passed over
+  such a chunk claims it, waits for the calls in their copy without the userfaultfd's lock, and moves it; a fill
+  then goes on where it was (`test_a_fill_waits_for_a_call_in_its_copy_then_reclaims`,
+  `test_a_fill_resumes_after_its_wait`, `test_a_fill_against_a_reading_loop_is_made`, on Windows Server 2022 20348
+  and 2025 26100; each ended the VMM with 137 before, where the fill did not wait). A fill still refused with
+  nothing reclaimable left ends the VMM with 137, named (`test_a_fill_with_nothing_reclaimable_ends_named`).
 
   Sections made around wick (a compromised Firecracker's) are counted by the jailer
   (overlay/jailer/platform/windows/commit.rs): every 1 ms, over the job's processes, private commit plus section

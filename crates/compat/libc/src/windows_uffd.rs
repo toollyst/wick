@@ -1167,6 +1167,32 @@ pub fn unregister(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
 /// Fills missing pages from `dst` on with `fill(alias_dst, len)`: stops at
 /// the first page that is present. Returns the byte count; `EEXIST` if the
 /// first page is present, `EAGAIN` with the count when only some were filled.
+///
+/// A reserved section's pages are committed, and charged, first; the job's
+/// limit refuses the commit. Refused, the pages that fit are filled, a page
+/// at a time, as Linux's copy charges each page as it fills it
+/// (v6.1 mm/userfaultfd.c `__mcopy_atomic` :616 to :687, `mcopy_atomic_pte`
+/// charging one page), and dead pages are reclaimed for the rest
+/// ([`reclaim_for_a_fill`]), as Linux's memory cgroup reclaims before
+/// anything else. The chunks the reclaim passed over for system calls in
+/// their copy are claimed, so no call turns to its copy on them, the fill
+/// lets go of [`LOCK`] and waits for those calls, which end on their own,
+/// then takes it again and moves them ([`wait_and_move`]). It goes on where
+/// it was, never from the start: its own pages stay filled, and it checks
+/// again only what may have changed meanwhile, as Linux's copy finds its
+/// destination again after letting go of `mmap_lock` (:561 to :580, `retry`):
+/// the destination in no registration is `ENOENT` (:577 to :580), a page
+/// filled meanwhile stops the fill there (`EEXIST`, :639), and either
+/// answers for the pages filled before, if any (`return copied ? copied :
+/// err`, :700, which `userfaultfd_copy` gives as `EAGAIN` with the count).
+/// A reclaim that gave something back is followed by the commit again, as
+/// Linux's memory cgroup charges again after a reclaim that freed pages
+/// (mm/memcontrol.c `try_charge_memcg` :2705 to :2706). Refused still with
+/// nothing reclaimable left (a pass that gave nothing back and passed over
+/// nothing), or after [`MAX_RECLAIM_RETRIES`] waits in a row that gave
+/// nothing back, the bound Linux's memory cgroup puts on reclaims without
+/// progress before its out-of-memory kill (:2631, :2714; mm/internal.h :172),
+/// the VMM ends, named (`windows_mm::fill_out_of_memory`).
 fn fill(
     ctx: usize,
     dst: u64,
@@ -1174,11 +1200,9 @@ fn fill(
     wake_up: bool,
     mut fill: impl FnMut(*mut u8, usize),
 ) -> Result<u64, (c_int, u64)> {
-    let _guard = lock();
+    let mut guard = Some(lock());
     let range = range_of(ctx, dst, len).map_err(|e| (e, 0))?;
-    let base = range.start.load(Ordering::Acquire);
-    let alias = range.alias.load(Ordering::Acquire);
-    let first = (dst - base) / PAGE;
+    let first = (dst - range.start.load(Ordering::Acquire)) / PAGE;
     // A page of the destination in no registration (unregistered, or
     // unmapped or mapped over since): ENOENT before anything, nothing
     // filled, as Linux's destination must lie in one vma this userfaultfd
@@ -1188,66 +1212,160 @@ fn fill(
     if (first..first + len / PAGE).any(|page| !Range::test(&range.tracked, page)) {
         return Err((crate::ENOENT, 0));
     }
-    let mut n = 0;
-    while n < len / PAGE {
-        let page = first + n;
-        if !Range::test(&range.tracked, page) || !Range::test(&range.missing, page) {
-            break;
+    let pages = len / PAGE;
+    // The pages this fill filled, from `dst` on.
+    let mut done = 0u64;
+    let mut range = range;
+    let mut empty_reclaims = 0;
+    let mut waited = Waited::default();
+    let ended: c_int = loop {
+        let base = range.start.load(Ordering::Acquire);
+        let alias = range.alias.load(Ordering::Acquire);
+        let first = (dst - base) / PAGE;
+        let mut n = 0;
+        while done + n < pages {
+            let page = first + done + n;
+            if !Range::test(&range.tracked, page) || !Range::test(&range.missing, page) {
+                break;
+            }
+            n += 1;
         }
-        n += 1;
-    }
-    if n == 0 {
-        return Err((crate::EEXIST, 0));
-    }
-    let bytes = n * PAGE;
-    // A reserved section's pages are committed, and charged, first; the job's
-    // limit refuses the commit. Refused, dead pages are reclaimed first and the
-    // commit made again, as Linux's memory cgroup reclaims before anything
-    // else (`reclaim_for_a_fill`); refused still, the VMM ends, named, as
-    // Linux's memory cgroup kills it at the copy it cannot charge
-    // (`windows_mm::fill_out_of_memory`).
-    #[allow(clippy::cast_possible_truncation)]
-    if range.reserved.load(Ordering::Acquire) && !crate::windows_mm::uffd_commit(dst as usize, bytes as usize) {
-        // SAFETY: plain call.
-        let mut err = unsafe { GetLastError() };
-        let made = reclaim_for_a_fill(bytes as usize).freed > 0 && {
-            let again = crate::windows_mm::uffd_commit(dst as usize, bytes as usize);
-            if !again {
+        if n == 0 {
+            break crate::EEXIST;
+        }
+        let at = dst + done * PAGE;
+        let mut bytes = n * PAGE;
+        #[allow(clippy::cast_possible_truncation)]
+        if range.reserved.load(Ordering::Acquire) && !crate::windows_mm::uffd_commit(at as usize, bytes as usize) {
+            // The pages that fit, a page at a time.
+            let mut fits = 0;
+            while fits < bytes && crate::windows_mm::uffd_commit((at + fits) as usize, PAGE as usize) {
+                fits += PAGE;
+            }
+            if fits == 0 {
                 // SAFETY: plain call.
-                err = unsafe { GetLastError() };
+                let err = unsafe { GetLastError() };
+                let mut freed = reclaim_for_a_fill(bytes as usize, &mut waited.passed).freed;
+                let passed = waited.passed.iter().any(Option::is_some);
+                if passed {
+                    // Let go of the lock for the wait, and look again at
+                    // what may have changed once it is taken again.
+                    guard = None;
+                    let Some((g, r, again)) = wait_and_move(ctx, dst, len, &mut waited) else {
+                        break crate::ENOENT;
+                    };
+                    guard = Some(g);
+                    range = again;
+                    freed += r.freed;
+                }
+                if freed > 0 {
+                    empty_reclaims = 0;
+                    continue;
+                }
+                // Nothing reclaimable left; or waits that gave nothing back
+                // (the chunks filled or moved meanwhile), bounded.
+                empty_reclaims += 1;
+                if !passed || empty_reclaims > MAX_RECLAIM_RETRIES {
+                    #[cfg(test)]
+                    if tests::REFUSED_FILL_IS_ENOMEM.load(Ordering::SeqCst) {
+                        break crate::ENOMEM;
+                    }
+                    crate::windows_mm::fill_out_of_memory(dst, len, done * PAGE, err, waited.chunks, waited.us);
+                }
+                continue;
             }
-            again
-        };
-        if !made {
-            #[cfg(test)]
-            if tests::REFUSED_FILL_IS_ENOMEM.load(Ordering::SeqCst) {
-                return Err((crate::ENOMEM, 0));
+            bytes = fits;
+        }
+        fill((alias + (at - base)) as *mut u8, bytes as usize);
+        // Each page with the protection `mprotect` gave it (one filled while
+        // `PROT_NONE` stays closed, as Linux's copy fills a page of a
+        // `PROT_NONE` vma).
+        let mut result = Ok(());
+        range.by_prot(base, at, bytes, |r, n, prot| {
+            if result.is_ok() {
+                result = protect_as(r, n, prot);
             }
-            crate::windows_mm::fill_out_of_memory(dst, bytes, err);
+        });
+        if let Err(e) = result {
+            break e.raw_os_error().unwrap_or(crate::EIO);
         }
-    }
-    fill((alias + (dst - base)) as *mut u8, bytes as usize);
-    // Each page with the protection `mprotect` gave it (one filled while
-    // `PROT_NONE` stays closed, as Linux's copy fills a page of a
-    // `PROT_NONE` vma).
-    let mut result = Ok(());
-    range.by_prot(base, dst, bytes, |r, n, prot| {
-        if result.is_ok() {
-            result = protect_as(r, n, prot);
+        let from = first + done;
+        for page in from..from + bytes / PAGE {
+            Range::set(&range.missing, page, false);
         }
-    });
-    result.map_err(|e| (e.raw_os_error().unwrap_or(crate::EIO), 0))?;
-    for page in first..first + n {
-        Range::set(&range.missing, page, false);
-    }
-    if wake_up {
+        done += bytes / PAGE;
+        if done == pages {
+            break 0;
+        }
+    };
+    let bytes = done * PAGE;
+    if wake_up && bytes > 0 {
         wake_ctx(ctx, dst, bytes);
     }
-    if bytes < len {
-        Err((crate::EAGAIN, bytes))
-    } else {
-        Ok(bytes)
+    drop(guard);
+    match (ended, bytes) {
+        (0, _) => Ok(bytes),
+        (e, 0) => Err((e, 0)),
+        (_, n) => Err((crate::EAGAIN, n)),
     }
+}
+
+/// Linux's reclaims in a row that give nothing back before its memory
+/// cgroup's out-of-memory kill (v6.1 mm/internal.h :172).
+const MAX_RECLAIM_RETRIES: u32 = 16;
+
+/// What a fill's reclaims waited for ([`wait_and_move`]): the chunks claimed,
+/// waited for and moved, and the microseconds waited, for its line if it
+/// ends the VMM; and the chunks its last pass passed over (at most
+/// `windows_mm::FILL_CLAIMS`), the most dead first.
+#[derive(Default)]
+struct Waited {
+    chunks: usize,
+    us: u64,
+    passed: [Option<Candidate>; crate::windows_mm::FILL_CLAIMS],
+}
+
+/// A fill's wait for the chunks its reclaim passed over (`waited.passed`),
+/// with [`LOCK`] let go (the caller dropped its guard): each claimed, so no
+/// system call turns to its copy on it, the calls in their copy waited for
+/// (`windows_mm::Moving::wait_for_copies`: they end on their own, and the
+/// claim keeps new ones off), then the lock taken again and each moved if it
+/// still holds dead pages. The lock's guard and what the moves gave back;
+/// `None` if the destination is in no registration of `ctx` any more
+/// (`ENOENT`, as Linux's copy that finds no vma after letting go of
+/// `mmap_lock`, v6.1 mm/userfaultfd.c :577 to :580). Allocates nothing: the
+/// claims' room is reserved at the register (`windows_mm::reserve_discards`).
+fn wait_and_move(ctx: usize, dst: u64, len: u64, waited: &mut Waited) -> Option<(Locked, Reclaimed, &'static Range)> {
+    let mut claims: [Option<crate::windows_mm::Moving>; crate::windows_mm::FILL_CLAIMS] = Default::default();
+    for (c, d) in claims.iter_mut().zip(waited.passed.iter()) {
+        if let Some(d) = d {
+            *c = crate::windows_mm::claim_move(d.view, d.len);
+        }
+    }
+    let t = std::time::Instant::now();
+    #[cfg(test)]
+    tests::FILL_WAITS.fetch_add(1, Ordering::SeqCst);
+    for c in claims.iter().flatten() {
+        c.wait_for_copies();
+    }
+    #[cfg(test)]
+    tests::FILL_WAITED.fetch_add(1, Ordering::SeqCst);
+    waited.us += u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let guard = lock();
+    let range = range_of(ctx, dst, len).ok()?;
+    let first = (dst - range.start.load(Ordering::Acquire)) / PAGE;
+    if (first..first + len / PAGE).any(|page| !Range::test(&range.tracked, page)) {
+        return None;
+    }
+    let mut r = Reclaimed::default();
+    for (c, d) in claims.iter().zip(waited.passed.iter_mut()) {
+        if let (Some(_), Some(d)) = (c, d.take()) {
+            waited.chunks += 1;
+            r.add(ask_the_reclaimer(Ask::Move(d)));
+        }
+    }
+    drop(claims);
+    Some((guard, r, range))
 }
 
 /// `UFFDIO_COPY`: fills missing pages from `dst` on with `src`.
@@ -1867,19 +1985,23 @@ struct Candidate {
 /// memory on that path either; `test_a_reclaim_allocates_nothing`).
 /// `CANDIDATES` is a reclaim's list, under [`LOCK`]; `TOUCH_SKIPPED` the
 /// chunks a touch's reclaim passed over and waits for, under its own lock,
-/// which one touch's wait holds ([`reclaim_at_touch`]).
+/// which one touch's wait holds ([`reclaim_at_touch`]); `FILL_SKIPPED` a
+/// fill's.
 static CANDIDATES: ProbedMutex<Vec<Candidate>> = ProbedMutex::new("CANDIDATES", Vec::new());
 static TOUCH_SKIPPED: ProbedMutex<Vec<Candidate>> = ProbedMutex::new("TOUCH_SKIPPED", Vec::new());
+/// The chunks a fill's reclaim passed over, at most
+/// `windows_mm::FILL_CLAIMS`, under [`LOCK`] ([`reclaim_for_a_fill`]).
+static FILL_SKIPPED: ProbedMutex<Vec<Candidate>> = ProbedMutex::new("FILL_SKIPPED", Vec::new());
 
 /// Reserves the reclaim's working memory for `chunks` chunks registered at
 /// once ([`CANDIDATES`], [`TOUCH_SKIPPED`]) and room for its discard guards
 /// (`windows_mm::reserve_discards`): `ENOMEM` if it cannot be had, as a
 /// registration whose memory cannot be charged is refused.
 fn reserve_reclaim(chunks: usize) -> io::Result<()> {
-    for list in [&CANDIDATES, &TOUCH_SKIPPED] {
+    for (list, want) in [(&CANDIDATES, chunks), (&TOUCH_SKIPPED, chunks), (&FILL_SKIPPED, crate::windows_mm::FILL_CLAIMS)] {
         let mut l = list.lock().unwrap();
-        if l.capacity() < chunks {
-            let more = chunks - l.len();
+        if l.capacity() < want {
+            let more = want - l.len();
             l.try_reserve_exact(more).map_err(|_| errno_err(crate::ENOMEM))?;
         }
     }
@@ -1904,13 +2026,13 @@ fn reserve_reclaim(chunks: usize) -> io::Result<()> {
 const RECLAIMER_STACK: usize = 64 << 10;
 
 /// A reclaim asked of [`reclaimer`], by a thread that holds [`LOCK`] for it
-/// and waits for the answer: a fill's pass ([`reclaim_for_a_fill`]), a
-/// touch's pass, with the list of the chunks it passes over
-/// ([`reclaim_at_touch`]), or one chunk's move.
+/// and waits for the answer: a fill's pass ([`reclaim_for_a_fill`]) or a
+/// touch's ([`reclaim_at_touch`]), each with the list of the chunks it
+/// passes over, or one chunk's move.
 #[derive(Clone, Copy)]
 enum Ask {
     None,
-    Fill(usize),
+    Fill(usize, *mut Vec<Candidate>),
     Touch(usize, *mut Vec<Candidate>),
     Move(Candidate),
     /// For `test_an_ask_of_a_reclaimer_that_has_ended_aborts`: the
@@ -1931,7 +2053,7 @@ struct Mailbox {
     allocations: u64,
 }
 
-// SAFETY: the list pointer in `Ask::Touch` is used only by the reclaimer
+// SAFETY: the list pointer in `Ask::Fill` and `Ask::Touch` is used only by the reclaimer
 // while the thread that owns it waits for the answer.
 unsafe impl Send for Mailbox {}
 
@@ -2002,7 +2124,8 @@ unsafe extern "system" fn reclaimer(_: *mut c_void) -> u32 {
         reclaim_progress(true);
         m.answer = match m.ask {
             Ask::None => Reclaimed::default(),
-            Ask::Fill(need) => fill_pass(need),
+            // SAFETY: as below.
+            Ask::Fill(need, skipped) => fill_pass(need, unsafe { skipped.as_mut() }),
             // SAFETY: the asker's list, which it does not touch until the
             // answer (`Mailbox`).
             Ask::Touch(need, skipped) => touch_pass(need, unsafe { skipped.as_mut() }),
@@ -2340,7 +2463,7 @@ fn move_chunk(d: &Candidate) -> Reclaimed {
 }
 
 /// One pass over `chunks` until `need` bytes are given back: a chunk with a
-/// system call in flight on it is passed over (`windows_mm::try_discard`)
+/// system call in its copy on it is passed over (`windows_mm::try_move`)
 /// and, if `skipped` is given, kept there (never grown). Under [`LOCK`].
 fn reclaim_pass(need: usize, chunks: &[Candidate], mut skipped: Option<&mut Vec<Candidate>>) -> Reclaimed {
     let mut r = Reclaimed::default();
@@ -2348,7 +2471,7 @@ fn reclaim_pass(need: usize, chunks: &[Candidate], mut skipped: Option<&mut Vec<
         if r.freed >= need {
             break;
         }
-        let Some(_guard) = crate::windows_mm::try_discard(d.view, d.len) else {
+        let Some(_guard) = crate::windows_mm::try_move(d.view, d.len) else {
             r.skipped += 1;
             if let Some(s) = skipped.as_deref_mut() {
                 if s.len() < s.capacity() {
@@ -2363,21 +2486,31 @@ fn reclaim_pass(need: usize, chunks: &[Candidate], mut skipped: Option<&mut Vec<
 }
 
 /// The reclaim of a fill refused at the limit (under [`LOCK`], which the
-/// fill holds): one pass, and no wait for the calls in flight on a chunk it
-/// passed over. Such a call may be in its prefault, waiting for a fill
-/// (`windows_mm::copying` counts it from before its prefault) that the
-/// handler sends only once this one is answered, so the wait would not end;
-/// with no other room, the fill then ends the VMM ([`fill`]).
-fn reclaim_for_a_fill(need: usize) -> Reclaimed {
-    ask_the_reclaimer(Ask::Fill(need))
+/// fill holds): one pass, and in `passed` the chunks it passed over for
+/// system calls in their copy (at most `windows_mm::FILL_CLAIMS`, the most
+/// dead first), which the fill waits for without the lock ([`wait_and_move`]).
+/// A call in its prefault, which may be waiting for a fill that the handler
+/// sends only once this one is answered, does not hold a chunk: its move
+/// keeps what the prefault made present (`windows_mm::InFlight`), so the
+/// fill never waits for it. Allocates nothing ([`FILL_SKIPPED`]).
+fn reclaim_for_a_fill(need: usize, passed: &mut [Option<Candidate>; crate::windows_mm::FILL_CLAIMS]) -> Reclaimed {
+    let mut skipped = FILL_SKIPPED.lock().unwrap();
+    skipped.clear();
+    let list: *mut Vec<Candidate> = &mut *skipped;
+    let r = ask_the_reclaimer(Ask::Fill(need, list));
+    for (i, p) in passed.iter_mut().enumerate() {
+        *p = skipped.get(i).copied();
+    }
+    skipped.clear();
+    r
 }
 
 /// [`reclaim_for_a_fill`]'s pass, on [`reclaimer`].
-fn fill_pass(need: usize) -> Reclaimed {
+fn fill_pass(need: usize, skipped: Option<&mut Vec<Candidate>>) -> Reclaimed {
     let mut c = CANDIDATES.lock().unwrap();
     find_candidates(&mut c);
     CANDIDATES_FOUND.fetch_add(c.len() as u64, Ordering::Relaxed);
-    let r = reclaim_pass(need.max(crate::windows_mm::UFFD_CHUNK), &c, None);
+    let r = reclaim_pass(need.max(crate::windows_mm::UFFD_CHUNK), &c, skipped);
     c.clear();
     r
 }
@@ -2412,12 +2545,13 @@ fn move_again(d: &Candidate) -> Reclaimed {
 /// `prefault_lazy`), by a host thread or a vCPU. The chunks holding dead
 /// pages are moved into new sections, the most dead first
 /// (`windows_mm::uffd_move_chunk`). Those passed over for a system call in
-/// flight on them are waited for, one at a time and without [`LOCK`] (the
-/// call may be in its prefault, waiting for a fill that needs it), and
-/// moved; never by a thread in a call itself (its own call would be among
-/// them, `windows_mm::in_a_call`) or one holding [`LOCK`] (which reclaims
-/// nothing). The calls end: only calls that do are counted (`windows_fd`).
-/// Allocates nothing ([`CANDIDATES`]).
+/// its copy on them are claimed, so that no call turns to its copy on them
+/// meanwhile, waited for, one at a time and without [`LOCK`], and moved;
+/// never by a thread in a call itself (its own call could be among them,
+/// `windows_mm::in_a_call`) or one holding [`LOCK`] (which reclaims
+/// nothing). The calls end: only calls that do are counted (`windows_fd`),
+/// and a call in its prefault, which may wait for a fill, holds no chunk
+/// (`windows_mm::InFlight`). Allocates nothing ([`CANDIDATES`]).
 pub(crate) fn reclaim_at_touch(need: usize) -> Reclaimed {
     if HOLDS_LOCK.get() || REGISTERED.load(Ordering::Acquire) == 0 {
         return Reclaimed::default();
@@ -2442,9 +2576,10 @@ pub(crate) fn reclaim_at_touch(need: usize) -> Reclaimed {
         if r.freed >= need {
             break;
         }
-        let Some(_waited) = crate::windows_mm::discard_waiting_within(d.view, d.len) else {
+        let Some(claim) = crate::windows_mm::claim_move(d.view, d.len) else {
             continue;
         };
+        claim.wait_for_copies();
         let _guard = lock();
         r.add(ask_the_reclaimer(Ask::Move(*d)));
     }
@@ -3460,6 +3595,11 @@ mod tests {
     /// leaves this off.
     pub(crate) static REFUSED_FILL_IS_ENOMEM: AtomicBool = AtomicBool::new(false);
 
+    /// The waits a fill refused at the limit began and ended for the calls
+    /// in their copy on the chunks its reclaim passed over ([`wait_and_move`]).
+    pub(crate) static FILL_WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FILL_WAITED: AtomicU64 = AtomicU64::new(0);
+
     /// [`fill_to_the_limit`], the fill begun `from` bytes in: the pages
     /// before are never filled. A fill refused at the limit is `ENOMEM`
     /// in this process from here ([`REFUSED_FILL_IS_ENOMEM`]).
@@ -3496,18 +3636,32 @@ mod tests {
         }
         register(ctx, mem, len).unwrap();
         let mib = std::vec![0x5au8; 1 << 20];
+        // 1 MiB of room kept for the test's own heap and given back after the
+        // fills, as the 1 MiB fill the limit refused whole left room before
+        // a refused fill filled the pages that fit.
+        // SAFETY: a new commit of ours, freed below.
+        let spare = unsafe {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, VirtualAlloc};
+            VirtualAlloc(ptr::null(), 1 << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        };
+        assert!(!spare.is_null());
         let mut done = from;
         loop {
             assert!(done < len, "128 MiB filled under the limit");
             // SAFETY: `mib` holds 1 MiB.
             match unsafe { copy(ctx, mib.as_ptr(), mem + done, 1 << 20, false) } {
                 Ok(n) => done += n,
+                // The pages that fitted, as Linux's copy answers for the
+                // pages it filled before a charge it could not make.
+                Err((e, n)) if e == crate::EAGAIN && n > 0 => done += n,
                 Err((e, _)) => {
                     assert_eq!(e, crate::ENOMEM);
                     break;
                 }
             }
         }
+        // SAFETY: our commit above.
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(spare, 0, windows_sys::Win32::System::Memory::MEM_RELEASE) };
         std::println!("filled {} MiB", done >> 20);
         (ctx, user, mem, done)
     }
@@ -3852,7 +4006,7 @@ mod tests {
             let before = private_commit();
             let r = {
                 let _guard = lock();
-                reclaim_for_a_fill(PAGE as usize)
+                reclaim_for_a_fill(PAGE as usize, &mut Default::default())
             };
             tries[n] = (n * 4, r, (private_commit() as i64 - before as i64) / 1024);
             n += 1;
@@ -7531,7 +7685,7 @@ mod tests {
     /// A reclaim allocates nothing: it runs when the job has refused commit,
     /// where a heap that must grow would end the process instead (Linux's
     /// reclaim takes no memory on that path either). A fill's reclaim, and
-    /// a touch's that passes over a chunk with a call in flight on it and
+    /// a touch's that passes over a chunk with a call in its copy on it and
     /// then waits for that call (held 200 ms by another thread), each move
     /// their chunks with no allocation on the reclaiming thread. In a
     /// process of its own (a reclaim takes any chunk of the process).
@@ -7562,13 +7716,14 @@ mod tests {
         };
         discard_even(0);
         discard_even(1);
-        // A call in flight on the first chunk, for 200 ms.
+        // A call in its copy on the first chunk, for 200 ms.
         let held = std::sync::Arc::new(AtomicBool::new(false));
         let caller = {
             let held = held.clone();
             std::thread::spawn(move || {
                 #[allow(clippy::cast_possible_truncation)]
                 let call = crate::windows_mm::copying(mem as usize, PAGE as usize);
+                call.copy_now();
                 held.store(true, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 drop(call);
@@ -7583,7 +7738,7 @@ mod tests {
         discard_even(2);
         let (fill, r) = allocations_of(|| {
             let _lock = lock();
-            reclaim_for_a_fill(PAGE as usize)
+            reclaim_for_a_fill(PAGE as usize, &mut Default::default())
         });
         assert_eq!(r.chunks, 1, "the fill's reclaim moved {r:?}");
         std::println!("allocations: touch {touch}, fill {fill}");
@@ -10483,5 +10638,588 @@ mod tests {
         c.check(!after.is_empty() && now == after, std::format!("{kind}: the fill or the release changed the new memory: {after:x?} -> {now:x?}"));
         c.check(!host_readable(mem + PAGE), std::format!("{kind}: the new memory was opened: {now:x?}"));
         c.done();
+    }
+
+    // 1b: a chunk the fill's reclaim passes over (agent design approved by
+    // review). A counted system call is in its prefault or its copy
+    // (`windows_mm::InFlight`); only a call in its copy holds a chunk off a
+    // move, and a fill refused at the limit waits for such calls without
+    // `LOCK`, then moves the chunk and goes on where it was.
+
+    /// The 1b children's threads: each waits for its turn, made by the test
+    /// thread (no channel: nothing is allocated at the job's limit).
+    static TURN: AtomicUsize = AtomicUsize::new(0);
+    /// What a reader thread returned, and whether it is in its call's
+    /// window ([`crate::windows_fd::BEFORE_CALL`]), and let go of it.
+    static READ_RETURNED: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(i64::MIN);
+    static IN_WINDOW: AtomicBool = AtomicBool::new(false);
+    static LET_GO: AtomicBool = AtomicBool::new(false);
+    /// The reads a looping reader made ([`fill_against_a_reading_loop_child`]).
+    static READS: AtomicU64 = AtomicU64::new(0);
+    static STOP: AtomicBool = AtomicBool::new(false);
+    /// The 1b children's threads started and their stacks grown: the job's
+    /// room is taken only once all are ([`at_the_limit`]), as a thread still
+    /// starting or growing at the limit is refused its stack page.
+    static GROWN: AtomicUsize = AtomicUsize::new(0);
+
+    /// A 1b child's thread: its stack grown 128 KiB, then `prepare`, then
+    /// counted in [`GROWN`], then `f`.
+    fn grown_thread<T: Send + 'static>(prepare: impl FnOnce() + Send + 'static, f: impl FnOnce() -> T + Send + 'static) -> std::thread::JoinHandle<T> {
+        std::thread::spawn(move || {
+            core::hint::black_box(deep(32));
+            prepare();
+            GROWN.fetch_add(1, Ordering::SeqCst);
+            f()
+        })
+    }
+
+    /// Waits until `f` holds, for 20 s at most: whether it did.
+    fn until(f: impl Fn() -> bool) -> bool {
+        let t = std::time::Instant::now();
+        while !f() {
+            if t.elapsed() > std::time::Duration::from_secs(20) {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
+
+    /// The 1b children's start, in a job of 96 MiB ([`fill_to_the_limit`]):
+    /// every other page of the first chunk discarded (1 MiB of dead pages,
+    /// the only ones); the eighth chunk discarded whole (its section and its
+    /// commit given back) and its first page filled, so that a fill of its
+    /// next pages needs a page's charge each and no page table; and a file
+    /// of 64 KiB of 0x22 to read. The range, the user end, the eighth
+    /// chunk's second page (fresh: missing, never committed) and the file's
+    /// descriptor. A fill the limit refuses from here ends the process, as
+    /// the product's does ([`REFUSED_FILL_IS_ENOMEM`] is turned off by
+    /// [`at_the_limit`]).
+    fn one_dead_chunk(tag: &str) -> (usize, c_int, u64, u64, std::fs::File, c_int) {
+        let (ctx, user, mem, done) = fill_to_the_limit();
+        assert!(done >= 9 * CHUNK, "only {} MiB filled", done >> 20);
+        for p in (0..CHUNK).step_by(2 * PAGE as usize) {
+            // SAFETY: registered memory of ours.
+            assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        }
+        // SAFETY: as above.
+        assert_eq!(unsafe { crate::madvise((mem + 7 * CHUNK) as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED) }, 0);
+        assert_eq!(fill_a_page(ctx, mem + 7 * CHUNK), "made");
+        let path = std::env::temp_dir().join(std::format!("wick-1b-{tag}-{}", std::process::id()));
+        std::fs::write(&path, [0x22u8; 64 << 10]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let fd = crate::windows_fd::to_fd_pub(std::os::windows::io::AsRawHandle::as_raw_handle(&file));
+        (ctx, user, mem, mem + 7 * CHUNK + PAGE, file, fd)
+    }
+
+    /// No room left ([`no_room_left`]), once the child's `threads` threads
+    /// and a watchdog have started and grown their stacks ([`GROWN`]),
+    /// refused fills ending the process from here, and the watchdog ending
+    /// it with 3 after 60 s, said, for a wait that would never end.
+    fn at_the_limit(threads: usize) -> std::vec::Vec<usize> {
+        grown_thread(
+            || {},
+            || {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                crate::windows_mm::say_at_the_limit(format_args!("WATCHDOG the child did not end in 60 s"));
+                std::process::exit(3);
+            },
+        );
+        assert!(until(|| GROWN.load(Ordering::SeqCst) == threads + 1), "the threads did not start");
+        let held = no_room_left();
+        REFUSED_FILL_IS_ENOMEM.store(false, Ordering::SeqCst);
+        held
+    }
+
+    /// A reader of 16 bytes of `fd` at `buf`, through `pread` (counted in
+    /// flight: a regular file's), started at turn `turn`, its stack grown
+    /// first; with `park`, its call waits in its window, turned to its copy,
+    /// until [`LET_GO`] (20 s at most). Its result in [`READ_RETURNED`].
+    fn reader(fd: c_int, buf: u64, turn: usize, park: bool) -> std::thread::JoinHandle<()> {
+        grown_thread(
+            move || {
+                if park {
+                    crate::windows_fd::BEFORE_CALL.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(|| {
+                            IN_WINDOW.store(true, Ordering::SeqCst);
+                            until(|| LET_GO.load(Ordering::SeqCst));
+                        }));
+                    });
+                }
+            },
+            move || {
+                until(|| TURN.load(Ordering::SeqCst) >= turn);
+                // SAFETY: a valid descriptor and registered memory of the test's.
+                let n = unsafe { crate::pread(fd, buf as *mut c_void, 16, 0) };
+                READ_RETURNED.store(i64::try_from(n).unwrap_or(-2), Ordering::SeqCst);
+            },
+        )
+    }
+
+    /// A thread that lets the parked read go ([`LET_GO`]) `ms` after a
+    /// fill's wait has begun ([`FILL_WAITS`]).
+    fn releaser(ms: u64) -> std::thread::JoinHandle<()> {
+        grown_thread(
+            || {},
+            move || {
+                until(|| FILL_WAITS.load(Ordering::SeqCst) > 0);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                LET_GO.store(true, Ordering::SeqCst);
+            },
+        )
+    }
+
+    /// Whether 16 bytes at `at` are the file's.
+    fn read_the_file(at: u64) -> bool {
+        // SAFETY: memory of the test's, filled.
+        (0..16).all(|i| unsafe { *((at + i) as *const u8) } == 0x22)
+    }
+
+    /// The cycle a fill that waited for every call in flight would make, and
+    /// that passing them over made instead: a counted read waits in its
+    /// prefault for the handler's fill of its missing page, in a chunk whose
+    /// dead pages are the only room; the handler first fills another page,
+    /// which the limit refuses. The read's call, in its prefault, does not
+    /// hold the chunk: the fill's reclaim moves it, the fill is made, then
+    /// the read's page, and the read returns the file's bytes. Before, the
+    /// reclaim passed the chunk over, and the fill ended the VMM with 137
+    /// (its failing first, 20348 and 26100). FILLPREFAULT line, with the
+    /// fill's path below its frame on the filling thread (no wait).
+    #[test]
+    fn test_a_fill_moves_a_chunk_a_call_waits_in_its_prefault_on() {
+        let (code, text) = run_child("fill_moves_under_a_prefault_child", Some(96 << 20));
+        std::eprintln!("{}", text.lines().filter(|l| l.starts_with("FILLPREFAULT") || l.starts_with("wick:")).collect::<std::vec::Vec<_>>().join("\n"));
+        assert!(text.contains("FILLPREFAULT "), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_fill_moves_a_chunk_a_call_waits_in_its_prefault_on in a job of its own"]
+    fn fill_moves_under_a_prefault_child() {
+        let (ctx, user, mem, fresh, file, fd) = one_dead_chunk("prefault");
+        assert!(is_missing(mem), "the read's page is not missing");
+        let r = reader(fd, mem + 8, 1, false);
+        let counts = reclaim_counts();
+        let page = [0x77u8; PAGE as usize];
+        let mut buf = [0u8; proto::RECORD];
+        let mut held = at_the_limit(1);
+        TURN.store(1, Ordering::SeqCst);
+        assert!(recv_all(user, &mut buf));
+        let event = words(&buf);
+        let painted = paint_below_here();
+        // SAFETY: `page` holds a page.
+        let other = unsafe { copy(ctx, page.as_ptr(), fresh, PAGE, true) };
+        let path = used_below(painted);
+        let moved = reclaim_counts().moves - counts.moves;
+        // SAFETY: as above.
+        let own = unsafe { copy(ctx, page.as_ptr(), mem, PAGE, true) };
+        let came = until(|| READ_RETURNED.load(Ordering::SeqCst) != i64::MIN);
+        give_back_every_page(&mut held);
+        r.join().unwrap();
+        let n = READ_RETURNED.load(Ordering::SeqCst);
+        std::println!(
+            "FILLPREFAULT the read's event {:#x} at {:#x}; the other page's fill at the limit: {other:?}, {moved} chunks moved, \
+             the fill's path {path} bytes below its frame; the read's page's fill: {own:?}; the read: {n}{}",
+            event[0],
+            event[1],
+            if came { "" } else { " (not returned in 20 s)" }
+        );
+        assert_eq!([event[0], event[1] - event[1] % PAGE], [proto::EVENT_PAGEFAULT, mem]);
+        assert_eq!((other, own, moved), (Ok(PAGE), Ok(PAGE), 1));
+        assert_eq!(n, 16);
+        assert!(read_the_file(mem + 8));
+        drop(file);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// A fill refused at the limit whose reclaim passes over the one chunk
+    /// with dead pages, a counted read being in its copy on it, waits for
+    /// that read without `LOCK` (the claim keeps other calls off), then
+    /// moves the chunk and is made: the read held 300 ms in its window
+    /// ([`crate::windows_fd::BEFORE_CALL`]) and let go by the test. Before,
+    /// the fill ended the VMM with 137 (its failing first). FILLWAIT line:
+    /// how long the fill took, and its path below its frame with the wait,
+    /// against [`test_a_fill_moves_a_chunk_a_call_waits_in_its_prefault_on`]'s
+    /// without.
+    #[test]
+    fn test_a_fill_waits_for_a_call_in_its_copy_then_reclaims() {
+        let (code, text) = run_child("fill_waits_for_a_copy_child", Some(96 << 20));
+        std::eprintln!("{}", text.lines().filter(|l| l.starts_with("FILLWAIT") || l.starts_with("wick:")).collect::<std::vec::Vec<_>>().join("\n"));
+        assert!(text.contains("FILLWAIT "), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_fill_waits_for_a_call_in_its_copy_then_reclaims in a job of its own"]
+    fn fill_waits_for_a_copy_child() {
+        let (ctx, user, mem, fresh, file, fd) = one_dead_chunk("copy");
+        let r = reader(fd, mem + PAGE + 8, 1, true);
+        let releaser = releaser(300);
+        let counts = reclaim_counts();
+        let page = [0x77u8; PAGE as usize];
+        let mut held = at_the_limit(2);
+        TURN.store(1, Ordering::SeqCst);
+        assert!(until(|| IN_WINDOW.load(Ordering::SeqCst)), "the read did not reach its window");
+        let painted = paint_below_here();
+        let t = std::time::Instant::now();
+        // SAFETY: `page` holds a page.
+        let filled = unsafe { copy(ctx, page.as_ptr(), fresh, PAGE, true) };
+        let took = t.elapsed();
+        let path = used_below(painted);
+        let moved = reclaim_counts().moves - counts.moves;
+        let came = until(|| READ_RETURNED.load(Ordering::SeqCst) != i64::MIN);
+        give_back_every_page(&mut held);
+        r.join().unwrap();
+        releaser.join().unwrap();
+        let n = READ_RETURNED.load(Ordering::SeqCst);
+        std::println!(
+            "FILLWAIT the fill at the limit with the one chunk of dead pages in a read's copy: {filled:?} in {} ms, {} waits \
+             begun and {} ended, {moved} chunks moved, the fill's path {path} bytes below its frame; the read: {n}{}",
+            took.as_millis(),
+            FILL_WAITS.load(Ordering::SeqCst),
+            FILL_WAITED.load(Ordering::SeqCst),
+            if came { "" } else { " (not returned in 20 s)" }
+        );
+        assert_eq!((filled, moved), (Ok(PAGE), 1));
+        assert_eq!((FILL_WAITS.load(Ordering::SeqCst), FILL_WAITED.load(Ordering::SeqCst)), (1, 1));
+        assert!(took >= std::time::Duration::from_millis(250), "the fill did not wait for the read");
+        assert_eq!(n, 16);
+        assert!(read_the_file(mem + PAGE + 8), "the read's bytes are not in the moved chunk");
+        drop(file);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// The turn to the copy and a move's start are decided under one lock
+    /// (`windows_mm::Copying::copy_now`, `try_move`): a counted read parked
+    /// in its prefault, before its turn ([`crate::windows_fd::BEFORE_TURN`]),
+    /// a fill's reclaim moving its chunk meanwhile (the read in its prefault
+    /// does not hold it), and the read let go during the move (held by
+    /// [`crate::windows_mm::MOVE_HOOK`] until the read has waited, 20 s at
+    /// most): the read's turn waits for the move, then it reads the file's
+    /// bytes into the moved chunk. Its other order, a call in its copy and
+    /// then the move, is [`test_a_fill_waits_for_a_call_in_its_copy_then_reclaims`].
+    /// A call that starts during a move waits at its start, on the region
+    /// table the move holds. Not
+    /// failing first: before, the read waited at its start instead (the
+    /// move's guard was a discard's). TURNWAIT line, with what Windows does
+    /// with a regular file's read into reserved memory, as a chunk's view is
+    /// a placeholder for a move's swap: the copy the lock keeps from it.
+    #[test]
+    fn test_a_call_turning_to_its_copy_waits_for_a_move() {
+        let (code, text) = run_child("turn_waits_for_a_move_child", Some(96 << 20));
+        std::eprintln!("{}", text.lines().filter(|l| l.starts_with("TURNWAIT") || l.starts_with("wick:")).collect::<std::vec::Vec<_>>().join("\n"));
+        assert!(text.contains("TURNWAIT "), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    /// [`crate::windows_mm::MOVE_HOOK`]'s for
+    /// [`test_a_call_turning_to_its_copy_waits_for_a_move`]: lets the parked
+    /// read go, then holds the move until the read's turn has waited.
+    fn hold_the_move_for_a_turn() {
+        LET_GO.store(true, Ordering::SeqCst);
+        until(|| crate::windows_mm::TURNS_THAT_WAITED.load(Ordering::SeqCst) > 0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    #[ignore = "run by test_a_call_turning_to_its_copy_waits_for_a_move in a job of its own"]
+    fn turn_waits_for_a_move_child() {
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let (ctx, user, mem, fresh, file, fd) = one_dead_chunk("turn");
+        // What a regular file's read into reserved memory gives.
+        // SAFETY: a new reservation of ours, released below.
+        let reserved = unsafe { VirtualAlloc(ptr::null(), 1 << 16, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!reserved.is_null());
+        let mut got = 0u32;
+        // SAFETY: the file's handle; a reserved buffer, which the call may not write.
+        let ok = unsafe {
+            ReadFile(std::os::windows::io::AsRawHandle::as_raw_handle(&file), reserved.cast(), 16, &mut got, ptr::null_mut())
+        };
+        let error = io::Error::last_os_error();
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(reserved, 0, MEM_RELEASE) };
+        let into_reserved = std::format!("ReadFile {} with {got} bytes ({error})", if ok != 0 { "succeeded" } else { "failed" });
+        let buf = mem + PAGE + 8;
+        let r = grown_thread(
+            || {
+                crate::windows_fd::BEFORE_TURN.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(|| {
+                        IN_WINDOW.store(true, Ordering::SeqCst);
+                        until(|| LET_GO.load(Ordering::SeqCst));
+                    }));
+                });
+            },
+            move || {
+                until(|| TURN.load(Ordering::SeqCst) >= 1);
+                // SAFETY: a valid descriptor and registered memory of the test's.
+                let n = unsafe { crate::pread(fd, buf as *mut c_void, 16, 0) };
+                READ_RETURNED.store(i64::try_from(n).unwrap_or(-2), Ordering::SeqCst);
+            },
+        );
+        let page = [0x77u8; PAGE as usize];
+        let filler = grown_thread(
+            || {},
+            move || {
+                until(|| TURN.load(Ordering::SeqCst) >= 2);
+                // SAFETY: `page` holds a page.
+                unsafe { copy(ctx, page.as_ptr(), fresh, PAGE, true) }
+            },
+        );
+        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = Some(hold_the_move_for_a_turn);
+        let mut held = at_the_limit(2);
+        TURN.store(1, Ordering::SeqCst);
+        assert!(until(|| IN_WINDOW.load(Ordering::SeqCst)), "the read did not reach its turn");
+        TURN.store(2, Ordering::SeqCst);
+        let came = until(|| READ_RETURNED.load(Ordering::SeqCst) != i64::MIN);
+        give_back_every_page(&mut held);
+        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = None;
+        let filled = filler.join().unwrap();
+        r.join().unwrap();
+        let n = READ_RETURNED.load(Ordering::SeqCst);
+        let turns = crate::windows_mm::TURNS_THAT_WAITED.load(Ordering::SeqCst);
+        std::println!(
+            "TURNWAIT the read's turn to its copy during the move: {turns} turns waited; the read: {n}{}; the fill that \
+             moved: {filled:?}; a regular file's read into reserved memory: {into_reserved}",
+            if came { "" } else { " (not returned in 20 s)" }
+        );
+        assert_eq!((turns, n, filled), (1, 16, Ok(PAGE)));
+        assert!(read_the_file(mem + PAGE + 8));
+        drop(file);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// A fill whose reclaim passes over a chunk for a call in its copy,
+    /// waits for it and moves it, and is refused still with nothing
+    /// reclaimable left ends the VMM with 137 and a line that says so: the
+    /// fill's bytes and address, what it filled, the one chunk passed over,
+    /// waited for and reclaimed again. 2 MiB less a page asked, 1 MiB
+    /// reclaimable. Before, the line had no wait (its failing first).
+    #[test]
+    fn test_a_fill_with_nothing_reclaimable_ends_named() {
+        let (code, text) = run_child("fill_ends_named_child", Some(96 << 20));
+        let line = text.lines().find(|l| l.starts_with("wick: userfaultfd: the fill of "));
+        std::eprintln!("{}", line.unwrap_or("no line"));
+        assert!(
+            line.is_some_and(|l| l.contains("1 chunks passed over for system calls copying them waited for") && l.contains("nothing reclaimable left")),
+            "{text}"
+        );
+        assert_eq!(code, Some(137), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_fill_with_nothing_reclaimable_ends_named in a job of its own"]
+    fn fill_ends_named_child() {
+        let (ctx, _user, mem, fresh, _file, fd) = one_dead_chunk("named");
+        let _r = reader(fd, mem + PAGE + 8, 1, true);
+        let _releaser = releaser(100);
+        let _held = at_the_limit(2);
+        TURN.store(1, Ordering::SeqCst);
+        assert!(until(|| IN_WINDOW.load(Ordering::SeqCst)), "the read did not reach its window");
+        let r = zeropage(ctx, fresh, CHUNK - PAGE, true);
+        crate::windows_mm::say_at_the_limit(format_args!("the fill was answered: {r:?}"));
+    }
+
+    /// A fill of three pages refused at its second, while the one chunk of
+    /// dead pages is in a read's copy: it fills the first, waits, and in the
+    /// wait another thread fills the third (the room for it given back by
+    /// the test). Then the second is filled and the fill stops at the
+    /// third, answering for its two pages: `EAGAIN` with 8192, as Linux's
+    /// copy answers (v6.1 mm/userfaultfd.c `__mcopy_atomic`: the third page
+    /// `-EEXIST` at :639, `return copied ? copied : err` at :700, which
+    /// `userfaultfd_copy` gives as the count and `-EAGAIN`, fs/userfaultfd.c).
+    /// Its own first page is not taken for present (no `EEXIST`), nothing
+    /// is filled twice and no page is lost. Before, the fill ended the VMM
+    /// with 137 at its second page (its failing first).
+    #[test]
+    fn test_a_fill_resumes_after_its_wait() {
+        let (code, text) = run_child("fill_resumes_child", Some(96 << 20));
+        std::eprintln!("{}", text.lines().filter(|l| l.starts_with("FILLRESUME") || l.starts_with("wick:")).collect::<std::vec::Vec<_>>().join("\n"));
+        assert!(text.contains("FILLRESUME "), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_fill_resumes_after_its_wait in a job of its own"]
+    fn fill_resumes_child() {
+        let (ctx, user, mem, fresh, file, fd) = one_dead_chunk("resume");
+        let r = reader(fd, mem + PAGE + 8, 1, true);
+        let filler = grown_thread(
+            || {},
+            move || {
+                let three = [0xA1u8; 3 * PAGE as usize];
+                until(|| TURN.load(Ordering::SeqCst) >= 2);
+                // SAFETY: `three` holds three pages.
+                unsafe { copy(ctx, three.as_ptr(), fresh, 3 * PAGE, true) }
+            },
+        );
+        let other = [0xB3u8; PAGE as usize];
+        let mut held = at_the_limit(2);
+        // Room for one page.
+        give_back_a_page(&mut held);
+        TURN.store(1, Ordering::SeqCst);
+        assert!(until(|| IN_WINDOW.load(Ordering::SeqCst)), "the read did not reach its window");
+        TURN.store(2, Ordering::SeqCst);
+        let waiting = until(|| FILL_WAITS.load(Ordering::SeqCst) > 0);
+        // Room for the third page, and its fill by this thread, while the
+        // three-page fill waits.
+        give_back_a_page(&mut held);
+        // SAFETY: `other` holds a page.
+        let third = unsafe { copy(ctx, other.as_ptr(), fresh + 2 * PAGE, PAGE, true) };
+        LET_GO.store(true, Ordering::SeqCst);
+        let filled = filler.join().unwrap();
+        give_back_every_page(&mut held);
+        r.join().unwrap();
+        // SAFETY: the three pages, filled.
+        let bytes: [u8; 3] = core::array::from_fn(|i| unsafe { *((fresh + i as u64 * PAGE + 5) as *const u8) });
+        std::println!(
+            "FILLRESUME the three-page fill: {filled:?}; it waited: {waiting}; the third page's fill during the wait: {third:?}; \
+             the pages: {bytes:x?}; the read: {}",
+            READ_RETURNED.load(Ordering::SeqCst)
+        );
+        assert!(waiting, "the fill did not wait");
+        assert_eq!(third, Ok(PAGE));
+        assert_eq!(filled, Err((crate::EAGAIN, 2 * PAGE)));
+        assert_eq!(bytes, [0xA1, 0xA1, 0xB3]);
+        assert_eq!(READ_RETURNED.load(Ordering::SeqCst), 16);
+        drop(file);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// No livelock against a thread that keeps reading into the one chunk
+    /// of dead pages: each read held 20 ms in its copy, one after another.
+    /// A fill refused at the limit claims the chunk, so the next read's turn
+    /// to its copy waits behind it, waits for the read in its copy (20 ms
+    /// at most, that read's kernel copy and its hold), moves the chunk and is
+    /// made; the reads go on after. Before, the fill ended the VMM with 137
+    /// (its failing first). FILLLOOP line.
+    #[test]
+    fn test_a_fill_against_a_reading_loop_is_made() {
+        let (code, text) = run_child("fill_against_a_reading_loop_child", Some(96 << 20));
+        std::eprintln!("{}", text.lines().filter(|l| l.starts_with("FILLLOOP") || l.starts_with("wick:")).collect::<std::vec::Vec<_>>().join("\n"));
+        assert!(text.contains("FILLLOOP "), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_fill_against_a_reading_loop_is_made in a job of its own"]
+    fn fill_against_a_reading_loop_child() {
+        let (ctx, user, mem, fresh, file, fd) = one_dead_chunk("loop");
+        let buf = mem + PAGE + 8;
+        let looper = grown_thread(
+            || {
+                crate::windows_fd::BEFORE_CALL.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(|| {
+                        IN_WINDOW.store(true, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }));
+                });
+            },
+            move || {
+                until(|| TURN.load(Ordering::SeqCst) >= 1);
+                let mut bad = 0;
+                while !STOP.load(Ordering::SeqCst) {
+                    // SAFETY: a valid descriptor and registered memory of the test's.
+                    if unsafe { crate::pread(fd, buf as *mut c_void, 16, 0) } != 16 {
+                        bad += 1;
+                    }
+                    READS.fetch_add(1, Ordering::SeqCst);
+                }
+                bad
+            },
+        );
+        let counts = reclaim_counts();
+        let page = [0x77u8; PAGE as usize];
+        let mut held = at_the_limit(1);
+        TURN.store(1, Ordering::SeqCst);
+        assert!(until(|| READS.load(Ordering::SeqCst) >= 3), "the reads did not start");
+        let before = READS.load(Ordering::SeqCst);
+        let t = std::time::Instant::now();
+        // SAFETY: `page` holds a page.
+        let filled = unsafe { copy(ctx, page.as_ptr(), fresh, PAGE, true) };
+        let took = t.elapsed();
+        let at_fill = READS.load(Ordering::SeqCst);
+        let went_on = until(|| READS.load(Ordering::SeqCst) >= at_fill + 5);
+        STOP.store(true, Ordering::SeqCst);
+        let bad = looper.join().unwrap();
+        give_back_every_page(&mut held);
+        let moved = reclaim_counts().moves - counts.moves;
+        std::println!(
+            "FILLLOOP the fill at the limit against reads of 20 ms in their copy: {filled:?} in {} ms, {} waits, {moved} chunks \
+             moved; reads {before} before it, {} after it, {bad} not of 16 bytes",
+            took.as_millis(),
+            FILL_WAITS.load(Ordering::SeqCst),
+            READS.load(Ordering::SeqCst) - at_fill
+        );
+        assert_eq!((filled, moved, bad), (Ok(PAGE), 1, 0));
+        assert!(FILL_WAITS.load(Ordering::SeqCst) >= 1, "the fill did not wait for a read");
+        assert!(took < std::time::Duration::from_secs(1), "the fill waited {} ms", took.as_millis());
+        assert!(went_on, "the reads did not go on after the fill");
+        assert!(read_the_file(buf));
+        drop(file);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// More scattered partial unregisters of one registration than there are
+    /// slots ([`MAX_RANGES`]) all succeed and take no slot, and the pages
+    /// left registered fault and fill as before. Firecracker's on-demand
+    /// handler unregisters the range of every remove event and asserts that
+    /// it succeeds (lib/firecracker/src/firecracker/examples/uffd/
+    /// on_demand_handler.rs :93 to :94, uffd_utils.rs :133 to :144), runs
+    /// scattered as a balloon's inflation leaves them
+    /// (tests/integration_tests/functional/test_uffd.py :100 to :109); on
+    /// Linux each is a vma split, up to `vm.max_map_count`. macOS's test
+    /// of the same name, without its register of an unregistered page by
+    /// another userfaultfd (`EBUSY` here until the owner byte a page). In a
+    /// process of its own, as it counts the process's slots.
+    #[test]
+    fn test_more_scattered_unregisters_than_slots_all_succeed() {
+        let (code, text) = run_child("scattered_unregisters_child", None);
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_more_scattered_unregisters_than_slots_all_succeed in a process of its own"]
+    fn scattered_unregisters_child() {
+        let slots = || RANGES.iter().filter(|r| r.start.load(Ordering::Acquire) != 0).count();
+        let (a, ua) = create(0, false, true).unwrap();
+        let pages = 2 * MAX_RANGES as u64 + 3;
+        let mem = map((pages * PAGE) as usize);
+        register(a, mem, pages * PAGE).unwrap();
+        let used = slots();
+        // Every odd page: MAX_RANGES + 1 unregisters, each its own run.
+        for page in (1..pages).step_by(2) {
+            assert_eq!(unregister(a, mem + page * PAGE, PAGE), Ok(()), "unregister of page {page}");
+        }
+        assert_eq!(slots(), used, "the unregisters took slots");
+        for page in 0..pages {
+            assert_eq!(is_missing(mem + page * PAGE), page % 2 == 0, "page {page}");
+        }
+        // An unregistered page is no one's to fill.
+        assert_eq!(zeropage(a, mem + PAGE, PAGE, true), Err((crate::ENOENT, 0)));
+        // A page left registered faults to its userfaultfd and is filled.
+        let last = mem + (pages - 1) * PAGE;
+        let reader = std::thread::spawn(move || {
+            // SAFETY: registered memory; the read waits for the fill.
+            unsafe { ptr::read_volatile(last as *const u8) }
+        });
+        let mut rec = [0u8; proto::RECORD];
+        assert!(recv_all(ua, &mut rec), "no fault event");
+        assert_eq!(words(&rec)[..2], [proto::EVENT_PAGEFAULT, last]);
+        let data = std::vec![9u8; PAGE as usize];
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), last, PAGE, true) }, Ok(PAGE));
+        assert_eq!(reader.join().unwrap(), 9);
+        assert_eq!(zeropage(a, mem, PAGE, true), Ok(PAGE));
+        assert_eq!(unregister(a, mem, pages * PAGE), Ok(()));
+        assert_eq!(slots(), used - 1, "the range outlived its last page");
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(ua)) };
     }
 }
