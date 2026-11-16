@@ -1,8 +1,11 @@
 # The phrases of a run claim in the docs: the one list tools/ci-results.py's
 # checkers read (check-claims' offline check of docs/evidence/runs.tsv, and
 # the live check of a run's own results when it comes). A sentence is a run
-# claim when it has a subject (a backquoted test_ name, or the short name a
-# results row carries as its alias, such as MOVEUNDERVCPU) and one of these.
+# claim when it has a subject (a backquoted test_ name, which is also an
+# upstream pytest function with any parameters; the short name a results row
+# carries as its alias, such as MOVEUNDERVCPU; or a scenario stage,
+# `boot-test net`, `jailer-test.ps1 nofile`) and one of these. A sentence
+# ends at `.` or `;` outside parentheses.
 # A phrase not listed is no claim; a near miss is reported, so that it joins
 # a list here or is reworded. Each line: KIND<TAB>regular expression (Python,
 # case-insensitive).
@@ -14,8 +17,10 @@ not-run	\bhas not run\b
 not-run	\bnot shown yet\b
 not-run	\bwaits on (?:a|its) run\b
 # historical: ran in run N (a run's own commit may follow it in parentheses);
-# the verb says the result, or none ("ran").
-historical	\b(passed|failed|ran) in (?:CI )?runs? ([1-9]\d{10}(?: \([0-9a-f]{7,40}[^)]*\))?(?:(?:,\s+(?:and\s+)?|\s+and\s+)[1-9]\d{10}(?: \([0-9a-f]{7,40}[^)]*\))?)*)
+# the verb says the result, or none ("ran"); the groups are named verb and
+# runs. Also the run first: "In CI run N (commit; host): X passed".
+historical	\b(?P<verb>passed|failed|ran) in (?:CI )?runs? (?P<runs>[1-9]\d{10}(?: \([0-9a-f]{7,40}[^)]*\))?(?:(?:,\s+(?:and\s+)?|\s+and\s+)[1-9]\d{10}(?: \([0-9a-f]{7,40}[^)]*\))?)*)
+historical	\bIn (?:CI )?runs? (?P<runs>[1-9]\d{10}(?: \([0-9a-f]{7,40}[^)]*\))?)[:,][^.]*?\b(?P<verb>passed|failed|ran)\b
 # near-miss: reported as a warning until this list settles (see severity).
 near-miss	\buntested\b
 near-miss	\byet to run\b

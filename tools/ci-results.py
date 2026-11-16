@@ -310,6 +310,35 @@ INDEX_COLUMNS = ("run", "commit", "rows_sha256", "inputs_sha256")
 RUN_ID = re.compile(r"(?<![\d.])[1-9]\d{10}(?!\d|\.\d)")
 TEST_NAMED = re.compile(r"`(test_[A-Za-z0-9_]+)`")
 ALIAS_NAMED = re.compile(r"\b[A-Z][A-Z0-9]{3,}(?:-[A-Za-z0-9]+)?\b")
+# A scenario script's stage as the documents name it (`boot-test net`,
+# `jailer-test.ps1 nofile`; check-claims checks the stage exists): its rows
+# have the script as suite and the stage as name.
+STAGE_REF = re.compile(r"`(?:tools/(?:macos|windows)/)?(boot-test|jailer-test)(\.ps1|\.sh|\.py)? ([a-z][a-z0-9-]*)")
+
+
+def stage_suite(script, ext):
+    """The suite a stage's rows carry: the Windows script for `.ps1`, else
+    the macOS one (tools/macos/boot-test.sh runs boot-test.py)."""
+    return f"tools/windows/{script}.ps1" if ext == ".ps1" else f"tools/macos/{script}.py"
+
+
+def subjects(sentence, aliases):
+    """What a sentence's claim can be about: ("name", a backquoted test_ name
+    or an alias some row has) or ("stage", suite, stage). An upstream test
+    file (COMPATIBILITY's table names each) is not one: it would keep every
+    integration row of every run, and no claim is made of a whole file."""
+    out = {("name", t) for t in TEST_NAMED.findall(sentence)}
+    out |= {("name", a) for a in ALIAS_NAMED.findall(sentence) if a in aliases}
+    out |= {("stage", stage_suite(script, ext), stage) for script, ext, stage in STAGE_REF.findall(sentence)}
+    return out
+
+
+def subject_label(subject, rows=()):
+    """A subject as an error names it."""
+    if subject[0] == "stage":
+        script = subject[1].rsplit("/", 1)[-1]
+        return f"{script.removesuffix('.py')} {subject[2]}"
+    return subject[1]
 
 
 def sha256(data):
@@ -382,18 +411,26 @@ def load_evidence(root):
 
 
 def doc_subjects(texts, rows):
-    """The names the documents mention that results rows can carry: test_
-    names in backquotes, and aliases some row has."""
+    """The subjects the documents mention that results rows can carry
+    ([`subjects`])."""
     aliases = {r["alias"] for r in rows if r["alias"]}
     names = set()
     for text in texts:
-        names |= set(TEST_NAMED.findall(text))
-        names |= {a for a in ALIAS_NAMED.findall(text) if a in aliases}
+        names |= subjects(text if isinstance(text, str) else text.decode(), aliases)
     return names
 
 
 def row_is(row, subject):
-    return row["alias"] == subject or row["name"] == subject or row["name"].endswith("::" + subject)
+    """Whether results row `row` is of `subject` ([`subjects`]; a plain
+    string is a name). A name is the row's alias, its name, or its name's
+    last `::` part, with or without pytest's `[parameters]`."""
+    if isinstance(subject, str):
+        subject = ("name", subject)
+    if subject[0] == "stage":
+        return row["suite"] == subject[1] and row["name"] == subject[2]
+    s, name = subject[1], row["name"]
+    last = name.rsplit("::", 1)[-1] if "::" in name else None
+    return row["alias"] == s or name == s or last == s or (last is not None and last.startswith(s + "["))
 
 
 def host_family(row):
@@ -403,6 +440,24 @@ def host_family(row):
 
 HOSTS = ("Linux", "macOS", "Windows")
 SCOPE_WORDS = re.compile(r"\bon (Linux|macOS|Windows)\b|\b(WHP)\b")
+
+
+def split_sentences(text):
+    """`text`'s sentences: a break after `.` or `;` and spaces, before a
+    capital, `(` or a backquote, outside parentheses (a run's "(commit;
+    Host ...)" is part of its sentence)."""
+    out, depth, start = [], 0, 0
+    for m in re.finditer(r"[()]|(?<=[.;])\s+(?=[A-Z(`])", text):
+        tok = m.group(0)
+        if tok == "(":
+            depth += 1
+        elif tok == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(text[start:m.start()])
+            start = m.end()
+    out.append(text[start:])
+    return out
 
 
 def sentences(name, text):
@@ -426,7 +481,7 @@ def sentences(name, text):
             else [(line, "")]
         for cell, column in parts:
             col_hosts = [h for h in HOSTS if h.lower() in column.lower()]
-            for sentence in re.split(r"(?<=[.;])\s+(?=[A-Z(`])", cell):
+            for sentence in split_sentences(cell):
                 words = SCOPE_WORDS.findall(sentence)
                 said = {w[0] or "Windows" for w in words}
                 hosts = col_hosts or sorted(said) or list(HOSTS)
@@ -471,8 +526,8 @@ def check_run_claims(root, repo, documents, evidence_since=None):
                 errors.append(f"{name} cites run {cited}, which {INDEX} does not have: "
                               f"tools/ci-results.py collect {cited}, in the same commit")
         for n, sentence, hosts in sentences(name, text):
-            subjects = set(TEST_NAMED.findall(sentence)) | {a for a in ALIAS_NAMED.findall(sentence) if a in aliases}
-            if not subjects:
+            subs = subjects(sentence, aliases)
+            if not subs:
                 if any(p.search(sentence) for p in g["near-miss"]):
                     warnings.append(f"{name}:{n}: a near miss of a run claim (tools/run-claims.txt): {sentence[:80]}")
                 continue
@@ -481,36 +536,42 @@ def check_run_claims(root, repo, documents, evidence_since=None):
                     msg = f"{name}:{n}: a near miss of a run claim (tools/run-claims.txt): {sentence[:80]}"
                     (errors if g["severity"][0] == "error" else warnings).append(msg)
             if any(p.search(sentence) for p in g["not-run"]):
-                ran = [r for r in rows if any(row_is(r, s) for s in subjects) and host_family(r) in hosts]
+                ran = [(r, s) for r in rows for s in subs if row_is(r, s) and host_family(r) in hosts]
                 if ran:
                     key = (name, n)
                     if key not in blame_cache:
                         blame_cache[key] = blame_commit(repo, name, n)
                     written = blame_cache[key]
-                    after = [r for r in ran if written and is_ancestor(repo, written, r["commit"])]
-                    for r in after[:1]:
-                        errors.append(f"{name}:{n} says {r['alias'] or r['name'].rsplit('::', 1)[-1]} has not run, "
+                    after = [(r, s) for r, s in ran if written and is_ancestor(repo, written, r["commit"])]
+                    for r, s in after[:1]:
+                        said = subject_label(s) if s[0] == "stage" else r["alias"] or r["name"].rsplit("::", 1)[-1]
+                        errors.append(f"{name}:{n} says {said} has not run, "
                                       f"but run {r['run']} ({r['commit'][:8]}, {r['job']}) ran it: {r['result']}")
             for p in g["historical"]:
                 for m in p.finditer(sentence):
-                    verb = m.group(1).lower()
-                    want = {"passed": {"pass"}, "failed": {"fail", "crash"}, "ran": RESULTS}[verb]
-                    tests = {s for s in subjects}
-                    if len(tests) != 1 and not (len(tests) == 2 and
-                                                any(r["alias"] in tests and any(row_is(r, t) for t in tests)
+                    verb = m.group("verb").lower()
+                    tests = subs
+                    names = {t[1] for t in tests if t[0] == "name"}
+                    if len(tests) != 1 and not (len(tests) == 2 and len(names) == 2 and
+                                                any(r["alias"] in names and any(row_is(r, t) for t in tests)
                                                     for r in rows)):
                         continue
-                    for run in RUN_ID.findall(m.group(2)):
+                    for run in RUN_ID.findall(m.group("runs")):
                         if run not in runs:
                             continue
                         got = [r for r in rows if r["run"] == run and any(row_is(r, s) for s in tests)
                                and host_family(r) in hosts]
+                        said = " / ".join(sorted(subject_label(t) for t in tests))
+                        results = {r["result"] for r in got}
+                        # passed: one passed and none failed (a parametrised
+                        # test's rows); failed: one failed; ran: any row.
+                        right = {"passed": "pass" in results and not results & {"fail", "crash"},
+                                 "failed": bool(results & {"fail", "crash"}), "ran": bool(results)}[verb]
                         if not got:
-                            errors.append(f"{name}:{n} says {' / '.join(sorted(tests))} {verb} in run {run}, "
-                                          f"which has no row for it")
-                        elif not any(r["result"] in want for r in got):
-                            errors.append(f"{name}:{n} says {' / '.join(sorted(tests))} {verb} in run {run}, "
-                                          f"which has it {', '.join(sorted({r['result'] for r in got}))}")
+                            errors.append(f"{name}:{n} says {said} {verb} in run {run}, which has no row for it")
+                        elif not right:
+                            errors.append(f"{name}:{n} says {said} {verb} in run {run}, "
+                                          f"which has it {', '.join(sorted(results))}")
     return errors, warnings
 
 
@@ -668,6 +729,7 @@ def claims_selftest(expect):
         git("commit", "-q", "-m", "before the sentence", cwd=repo)
         before = git("rev-parse", "HEAD", cwd=repo)
         (repo / "COMPATIBILITY.md").write_text(table)
+        (repo / "s.md").write_text(STAGE_DOC)
         git("add", "-A", cwd=repo)
         git("commit", "-q", "-m", "the sentence", cwd=repo)
         (repo / "x").write_text("after")
@@ -706,10 +768,43 @@ def claims_selftest(expect):
                              "collect 43799999999, in the same commit"])):
             errors, _ = check_run_claims(repo, repo, {"h.md": text}, 43790310601)
             expect(f"historical: {text[:40]}", errors, want)
+        # Stages and pytest tests (docs name `boot-test vmnet`, `jailer-test
+        # freeze`, `test_api_happy_start`; rows carry the script as suite and
+        # pytest's parametrised node id), and the run-first form of a
+        # historical claim. Run 43800980377's own rows, cut.
+        mac = repo / "results-mac.tsv"
+        ctx = ("43800980377", after, "macos", "macOS 26.7.2 25G332", "Apple M2 Pro (Virtual)")
+        write_rows(mac, ctx, "wick", "stage", [("tools/macos/boot-test.py", "vmnet", "xfail", "expected: no HVF"),
+                                                ("tools/macos/jailer-test.py", "freeze", "pass", ""),
+                                                ("tools/macos/jailer-test.py", "limits", "pass", "")])
+        write_rows(mac, ctx, "wick", "integration", [
+            ("integration_tests/functional/test_api.py",
+             "integration_tests/functional/test_api.py::test_api_happy_start[kvm-PCI_ON-vmlinux-6.1.188]", "pass", ""),
+            ("integration_tests/functional/test_api.py",
+             "integration_tests/functional/test_api.py::test_api_happy_start[kvm-PCI_OFF-vmlinux-6.1.188]", "pass", ""),
+            ("integration_tests/functional/test_api.py",
+             "integration_tests/functional/test_api.py::test_drive_io_engine[kvm]", "pass", "")])
+        kept, total = collect(repo, "43800980377", [mac], {"s.md": STAGE_DOC}.values())
+        expect("collect keeps named stages and pytest tests", (kept, total), (4, 6))
+        errors, _ = check_run_claims(repo, repo, {"s.md": STAGE_DOC}, 43688550565)
+        expect("stages and pytest tests", [e[:len(w)] for e, w in zip(errors, STAGE_ERRORS)] + errors[3:],
+               STAGE_ERRORS)
         # A row edited by hand fails its run's hash.
         ev = repo / EVIDENCE
         ev.write_text(ev.read_text().replace("\tfail\t", "\tpass\t"))
         expect("hand edit", any("not what collect wrote" in e for e in load_evidence(repo)[2]), True)
+
+
+# claims_selftest's document of stage and pytest claims, and what the check
+# says of it against run 43800980377's rows there.
+STAGE_DOC = ("`jailer-test freeze` has not run yet on macOS.\n"
+             "`boot-test vmnet` failed in run 43800980377.\n"
+             "`test_api_happy_start` passed in run 43800980377.\n"
+             "In CI run 43800980377 (36ef73da; Apple M2 Pro, macOS 26.7.2): `boot-test vmnet` passed.\n"
+             "`boot-test.ps1 vmnet` has not run yet.\n")
+STAGE_ERRORS = ["s.md:1 says jailer-test freeze has not run, but run 43800980377 (",
+                "s.md:2 says boot-test vmnet failed in run 43800980377, which has it xfail",
+                "s.md:4 says boot-test vmnet passed in run 43800980377, which has it xfail"]
 
 
 def read_lines_text(text):
