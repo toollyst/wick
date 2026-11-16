@@ -416,10 +416,13 @@ mod tests {
     /// `ProbedMutex<` and `ProbedRwLock<`, still names `Mutex<` or `RwLock<`
     /// (in a `OnceLock`, a `LazyLock` or alone).
     fn unprobed_locks(file: &str, text: &str) -> std::vec::Vec<std::string::String> {
-        let product = text.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        // By lines, which end at "\n" or "\r\n" alike: a checkout may have
+        // either (`test_the_lock_check_reads_a_crlf_checkout`).
+        let lines: std::vec::Vec<&str> = text.lines().collect();
+        let tests = lines.windows(2).position(|w| w[0] == "#[cfg(test)]" && w[1].starts_with("mod tests")).unwrap_or(lines.len());
         let mut bad = std::vec::Vec::new();
         let mut in_test_item = false;
-        for (n, line) in product.lines().enumerate() {
+        for (n, line) in lines[..tests].iter().enumerate() {
             let t = line.trim_start();
             if t.starts_with("#[cfg(test)]") || t.starts_with("#[cfg(all(test") {
                 in_test_item = true;
@@ -475,7 +478,6 @@ mod tests {
     /// unprobed, where fc-win's checkout, copied from macOS, has LF: the
     /// tests' start was looked for as "\n#[cfg(test)]\nmod tests".
     #[test]
-    #[ignore = "until the next commit"]
     fn test_the_lock_check_reads_a_crlf_checkout() {
         let lf = "static A: Mutex<()> = Mutex::new(());\n\n#[cfg(test)]\nmod tests {\n    static B: Mutex<()> = Mutex::new(());\n}\n";
         let crlf = lf.replace('\n', "\r\n");
