@@ -1126,6 +1126,13 @@ impl VcpuFd {
         regs::read_xsave(self.part(), self.vp()).map(|(_, written)| written)
     }
 
+    /// The vCPU's XSAVE area as WHP gives it, before `KVM_GET_XSAVE` makes
+    /// anything of it.
+    #[cfg(test)]
+    pub(crate) fn whps_xsave_area(&self) -> Result<Vec<u8>> {
+        regs::read_xsave(self.part(), self.vp()).map(|(area, _)| area)
+    }
+
     // ---- MSRs and CPUID ----
 
     pub fn get_msrs(&self, msrs: &mut Msrs) -> Result<usize> {
@@ -8069,6 +8076,170 @@ mod fpu_tests {
             }
             drop((zero, vm));
             unmap(m);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A restore's local APIC state is read in the layout its XSAVE area
+    /// names (review R11(b)): `KVM_GET_XSAVE` marks the area WHP gives,
+    /// compacted (`XCOMP_BV` bit 63), in bytes 464 to 511, which the
+    /// processor leaves to software and WHP leaves zero, with b"wick-whp"
+    /// and the layout version, 1; upstream's restore sets the XSAVE area
+    /// before the local APIC (src/vmm/src/arch/x86_64/vcpu.rs
+    /// `restore_state`), and the local APIC state that comes with it is
+    /// taken in KVM's layout when the area is marked, refused with `EINVAL`
+    /// when it is compacted and not marked (a snapshot made by a wick build
+    /// from before `KVM_GET_LAPIC` gave KVM's layout: its IRR, ISR and TMR
+    /// words are WHP's, 4 bytes apart), and an area marked with a later
+    /// version is refused at `KVM_SET_XSAVE`; WHP is given those bytes
+    /// zero. Two VMs, vCPU 0 of each with its APIC on and interrupts off:
+    /// - saved: `MMIO_VECTOR` (0x41, KVM's IRR word 0x220) requested; WHP's
+    ///   own area is compacted with bytes 464 to 511 zero, and
+    ///   `KVM_GET_XSAVE2`'s has the mark;
+    /// - restored into the other VM: the area with no mark, then its
+    ///   `KVM_SET_LAPIC` refused; the area with version 2, refused; an
+    ///   area in the standard format, KVM's (x87 and SSE only, `XCOMP_BV`
+    ///   0), with the bytes Linux's `KVM_GET_XSAVE` writes there (its XCR0
+    ///   mask first: v6.1 arch/x86/kernel/fpu/xstate.c
+    ///   `__copy_xstate_to_uabi_buf`), recorded (XSAVEMARK: whether WHP
+    ///   takes one), and if taken its `KVM_SET_LAPIC` taken too; then the
+    ///   area as saved, WHP's copy with bytes 464 to 511 zero after it, its
+    ///   `KVM_SET_LAPIC` taken and 0x41 taken when the guest turns
+    ///   interrupts on.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_restored_lapic_state_is_read_in_the_layout_its_xsave_area_names() {
+        const MSI: u64 = 0xFEE0_0000;
+        const MARK: std::ops::Range<usize> = 464..512;
+        /// An area's bytes: its `kvm_xsave` and the `len` entries after it.
+        fn bytes(x: &mut Xsave) -> &mut [u8] {
+            let p = x.as_mut_fam_struct_ptr();
+            // SAFETY: the wrapper's `kvm_xsave` and the `len` entries after it.
+            unsafe { std::slice::from_raw_parts_mut((&raw mut (*p).xsave).cast::<u8>(), 4096 + 4 * (*p).len) }
+        }
+        let vector = u8::try_from(MMIO_VECTOR).unwrap();
+        let mut mark = [0u8; 48];
+        mark[..8].copy_from_slice(b"wick-whp");
+        mark[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let irr = |l: &kvm_bindings::kvm_lapic_state| {
+            let at = 0x200 + usize::from(vector / 32) * 16;
+            u32::from_le_bytes(std::array::from_fn(|i| l.regs[at + i].cast_unsigned())) >> (vector % 32) & 1 == 1
+        };
+        let header = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let raw = |v: &VcpuFd| regs::read_xsave(v.part(), v.vp()).unwrap().0;
+        let len = (regs::xsave_area_len() - 4096).div_ceil(4);
+        let unmap = |m: *mut u8| {
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        };
+        let run_until = |v: &mut VcpuFd, port: u16| {
+            let mut reads = 0;
+            let mut exits = Vec::new();
+            loop {
+                let e = one_run(v, &[], &mut reads);
+                let end = e == "EINTR" || e.contains("fail") || e.starts_with("fault") || e.starts_with(&format!("out {port:#x}")) || exits.len() >= 8;
+                exits.push(e);
+                if end {
+                    break;
+                }
+            }
+            v.set_kvm_immediate_exit(0);
+            exits
+        };
+        // The APIC on, `out 0x84` with interrupts off, then sti and
+        // `out 0x85`; MMIO_VECTOR's handler does `out 0x81` and EOI.
+        let program = [&APIC_ON[..15], &[0xE6, 0x84, 0xFB, 0xE6, 0x85, 0xEB, 0xFE]].concat();
+        let mut wrong: Vec<String> = Vec::new();
+
+        // saved.
+        let (vm, mut a, m) = mmio_guest(&program);
+        let watchdog = super::Watchdog::arm(&a);
+        let first = run_until(&mut a, 0x84);
+        drop(watchdog);
+        a.shared.inner.inject_msi(MSI, u32::from(vector));
+        let whp = raw(&a);
+        let mut saved = Xsave::new(len).unwrap();
+        // SAFETY: an area of the capability's size.
+        unsafe { a.get_xsave2(&mut saved) }.unwrap();
+        let lapic = a.get_lapic().unwrap();
+        drop((a, vm));
+        unmap(m);
+        eprintln!(
+            "XSAVEMARK saved ({first:?}): WHP's area XCOMP_BV {:#x}, bytes 464-511 {:02x?}; KVM_GET_XSAVE2's {:02x?}; \
+             KVM_GET_LAPIC IRR 0x41 {}",
+            header(&whp, 520),
+            &whp[MARK],
+            &bytes(&mut saved)[MARK],
+            irr(&lapic)
+        );
+        if !first.last().is_some_and(|e| e.starts_with("out 0x84")) || !irr(&lapic) {
+            wrong.push(format!("saved: the guest's exits {first:?}, IRR 0x41 {}", irr(&lapic)));
+        }
+        if header(&whp, 520) >> 63 != 1 || whp[MARK].iter().any(|&x| x != 0) {
+            wrong.push(format!(
+                "saved: WHP's area XCOMP_BV {:#x} (the rule takes it compacted), bytes 464-511 {:02x?} (the mark's room: zero)",
+                header(&whp, 520),
+                &whp[MARK]
+            ));
+        }
+        if bytes(&mut saved)[MARK] != mark {
+            wrong.push(format!("saved: KVM_GET_XSAVE2's bytes 464-511 {:02x?}, not the mark {mark:02x?}", &bytes(&mut saved)[MARK]));
+        }
+
+        // restored.
+        let (vm, mut b, m) = mmio_guest(&program);
+        let watchdog = super::Watchdog::arm(&b);
+        let first = run_until(&mut b, 0x84);
+        let mut unmarked = Xsave::new(len).unwrap();
+        bytes(&mut unmarked).copy_from_slice(bytes(&mut saved));
+        bytes(&mut unmarked)[MARK].fill(0);
+        // SAFETY: the state read above, its mark cleared.
+        let set = unsafe { b.set_xsave2(&unmarked) };
+        let refused = b.set_lapic(&lapic);
+        let mut newer = Xsave::new(len).unwrap();
+        bytes(&mut newer).copy_from_slice(bytes(&mut saved));
+        bytes(&mut newer)[MARK][8..12].copy_from_slice(&2u32.to_le_bytes());
+        // SAFETY: the state read above, a later version in its mark.
+        let set_newer = unsafe { b.set_xsave2(&newer) };
+        // KVM's: XSTATE_BV x87 and SSE, XCOMP_BV 0, Linux's sw bytes.
+        let mut kvm = Xsave::new(len).unwrap();
+        bytes(&mut kvm)[..416].copy_from_slice(&bytes(&mut saved)[..416]);
+        bytes(&mut kvm)[464..472].copy_from_slice(&regs::host_xfeatures().0.to_le_bytes());
+        bytes(&mut kvm)[512..520].copy_from_slice(&3u64.to_le_bytes());
+        // SAFETY: an area in the standard format.
+        let set_kvm = unsafe { b.set_xsave2(&kvm) };
+        let taken_kvm = set_kvm.as_ref().ok().map(|()| b.set_lapic(&lapic));
+        // SAFETY: the state read above.
+        let set_marked = unsafe { b.set_xsave2(&saved) };
+        let given = raw(&b);
+        let taken = b.set_lapic(&lapic);
+        let then = run_until(&mut b, 0x85);
+        drop(watchdog);
+        drop((b, vm));
+        unmap(m);
+        eprintln!(
+            "XSAVEMARK restored ({first:?}): no mark: KVM_SET_XSAVE2 {set:?}, KVM_SET_LAPIC {refused:?}; version 2: KVM_SET_XSAVE2 \
+             {set_newer:?}; the standard format: KVM_SET_XSAVE2 {set_kvm:?}, KVM_SET_LAPIC {taken_kvm:?}; marked: KVM_SET_XSAVE2 \
+             {set_marked:?}, WHP's bytes 464-511 after it {:02x?}, KVM_SET_LAPIC {taken:?}, the guest then {then:?}",
+            &given[MARK]
+        );
+        if set.is_err() || refused.as_ref().err().map(|e| e.errno()) != Some(libc::EINVAL) {
+            wrong.push(format!("no mark: KVM_SET_XSAVE2 {set:?} (Ok), KVM_SET_LAPIC {refused:?} (EINVAL)"));
+        }
+        if set_newer.as_ref().err().map(|e| e.errno()) != Some(libc::EINVAL) {
+            wrong.push(format!("version 2: KVM_SET_XSAVE2 {set_newer:?} (EINVAL)"));
+        }
+        if taken_kvm.as_ref().is_some_and(Result::is_err) {
+            wrong.push(format!("the standard format: KVM_SET_LAPIC after it {taken_kvm:?} (Ok)"));
+        }
+        if set_marked.is_err() || given[MARK].iter().any(|&x| x != 0) || taken.is_err() {
+            wrong.push(format!(
+                "marked: KVM_SET_XSAVE2 {set_marked:?}, WHP's bytes 464-511 {:02x?} (zero), KVM_SET_LAPIC {taken:?} (Ok)",
+                &given[MARK]
+            ));
+        }
+        if then.first().is_none_or(|e| !e.starts_with("out 0x81")) || then.last().is_none_or(|e| !e.starts_with("out 0x85")) {
+            wrong.push(format!("marked: the guest then {then:?} (KVM: out 0x81, out 0x85)"));
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }

@@ -2055,7 +2055,10 @@ mod tests {
     // record of its processor: WHP's XSAVE features (bit 27 is AMX tile:
     // WHV_PROCESSOR_XSAVE_FEATURES), CPUID leaf 0xD's sizes, and the bytes
     // WHP wrote; then what WHP does with an area three pages longer than
-    // the capability's (not asserted: no caller makes one).
+    // the capability's (not asserted: no caller makes one). WHP's own area
+    // is compacted, with bytes 464 to 511 zero; `KVM_GET_XSAVE2`'s has
+    // wick's layout mark there, and WHP is given them zero (review
+    // R11(b)).
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_xsave_state_fits_the_area_the_capability_reports() {
@@ -2099,13 +2102,29 @@ mod tests {
         // SAFETY: an area of the capability's size.
         unsafe { vcpu.get_xsave2(&mut first) }.unwrap();
         let header = |at: usize| u64::from_le_bytes(bytes_of(&first)[at..at + 8].try_into().unwrap());
+        let whp = vcpu.whps_xsave_area().unwrap();
         eprintln!(
-            "XSAVETEST a new vCPU's area: XSTATE_BV {:#x}, XCOMP_BV {:#x} (bit 63: the compacted format)",
+            "XSAVETEST a new vCPU's area: XSTATE_BV {:#x}, XCOMP_BV {:#x} (bit 63: the compacted format); bytes 464-511 \
+             WHP's {:02x?}, KVM_GET_XSAVE2's {:02x?}",
             header(512),
-            header(520)
+            header(520),
+            &whp[464..512],
+            &bytes_of(&first)[464..512]
         );
+        // The mark's room is the processor's software-available bytes
+        // (Intel SDM volume 1, 10.5.1 and 13.4.1), which WHP leaves zero,
+        // and its rule takes WHP's area for compacted (vcpu.rs
+        // `xsave_maker`): both on each host's record.
+        let whp_bv = u64::from_le_bytes(whp[520..528].try_into().unwrap());
+        assert!(whp_bv >> 63 == 1 && whp[464..512].iter().all(|&b| b == 0), "WHP's area: XCOMP_BV {whp_bv:#x}, bytes 464-511 {:02x?}", &whp[464..512]);
+        let mut mark = [0u8; 48];
+        mark[..8].copy_from_slice(b"wick-whp");
+        mark[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(bytes_of(&first)[464..512] == mark, "KVM_GET_XSAVE2's bytes 464-511: wick's mark, layout version 1");
         // SAFETY: the state just read.
         unsafe { vcpu.set_xsave2(&first) }.unwrap();
+        let given = vcpu.whps_xsave_area().unwrap();
+        assert!(given[464..512].iter().all(|&b| b == 0), "WHP was given the mark: {:02x?}", &given[464..512]);
         let mut again = Xsave::new(len).unwrap();
         // SAFETY: as above.
         unsafe { vcpu.get_xsave2(&mut again) }.unwrap();

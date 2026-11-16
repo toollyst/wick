@@ -1687,6 +1687,13 @@ jobs:
           # KVM_SET_LAPIC taken, set_lint's LVT0 and LVT1 in place
           # (LAPICLAYOUT lines: where WHP's page has each bit).
           alone whp::vcpu::fpu_tests::test_a_kvm_lapic_state_is_in_kvms_layout
+          # A restore's local APIC state read in the layout its XSAVE area
+          # names (review R11(b)): WHP's area marked by KVM_GET_XSAVE2,
+          # one without the mark refused at KVM_SET_LAPIC, a later mark
+          # version at KVM_SET_XSAVE2, a request restored with a marked
+          # area taken (XSAVEMARK lines: whether WHP takes an area in the
+          # standard format, KVM's).
+          alone whp::vcpu::fpu_tests::test_a_restored_lapic_state_is_read_in_the_layout_its_xsave_area_names
           # A 2 MiB chunk of userfaultfd guest RAM swapped (discarded
           # whole) under a vCPU's scan and a host writer, 100 rounds
           # (SWAPSTRESS lines; a page read wrong, its "round N: page" line:
