@@ -346,7 +346,8 @@ has the per-control details and results.
   (`test_madvise_dontneed_of_a_private_file_mapping_with_copied_pages_is_einval`, docs/PORTING.md). The new calls
   (`proc_info` for this process, `mincore`) run under Firecracker's run-phase profile, with `MADV_DONTNEED` and
   `MADV_FREE` of anonymous and registered memory, and the child ends by its own exit
-  (`test_discards_run_under_the_run_phase_profile`; with `mincore` out of the profile's list the sandbox kills it).
+  (`test_discards_run_under_the_run_phase_profile`, on macOS 15 and 26 as well: COMPATIBILITY's System call filter
+  row; with `mincore` out of the profile's list the sandbox kills it).
 - **macOS: a register racing a change of memory in no registration could register the memory the change then
   replaced** (to the commit that brought `unlocked_change`). Each of these calls first checks, without the
   userfaultfd's lock, whether its range touches a registered range, and runs without the lock when it does not; a

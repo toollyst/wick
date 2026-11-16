@@ -536,7 +536,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: macos-latest
     # 18.5 minutes in run 43833851623, and the unit step's second vmm run
-    # (below) adds about 5.
+    # (below) adds about 5; 21.3 with it in run 43881982686.
     timeout-minutes: 40
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
@@ -747,7 +747,8 @@ jobs:
         if: (success() || failure()) && steps.build.outcome == 'success'
         # Under the watchdog (macos-seatbelt's steps say why): about twice its
         # usual 13 minutes (8 in run 43833851623, and vmm's second run's
-        # 274 s), and inside the job's 40.
+        # 274 s; 12.1 in run 43881982686, its two vmm runs 251 and 274 s),
+        # and inside the job's 40.
         run: >-
           python3 -I tools/macos/watchdog.py 1500 --out "$RUNNER_TEMP/unit/watchdog" --
           python3 -I tools/macos/check-unit-tests.py --out "$RUNNER_TEMP/unit" --summary "$GITHUB_STEP_SUMMARY"
